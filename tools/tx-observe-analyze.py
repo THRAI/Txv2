@@ -1,23 +1,37 @@
 #!/usr/bin/env python3
-"""Summarize tx-observe replay NDJSON timing.
+"""Summarize tx-observe replay timing from NDJSON or raw txtrace.
 
-The input is the JSON stream produced by:
+The analyzer accepts either the JSON stream produced by:
 
     cargo xtask observe replay --file trace.txtrace --out json
 
-It pairs SpanBegin/SpanEnd records, aggregates syscall/drive duration, and
-prints the largest inter-record gaps. The report is deliberately text-first so
-it can be pasted into progress notes or debugging handoffs.
+or a raw `.txtrace` file via `--file`. It pairs SpanBegin/SpanEnd records,
+aggregates syscall/drive duration, and prints the largest inter-record gaps.
+The report is deliberately text-first so it can be pasted into progress notes
+or debugging handoffs.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import heapq
 import json
+import mmap
+import os
 import re
+import shutil
+import subprocess
+import struct
+import sys
+import tempfile
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
+
+ANALYZER_DECODER_VERSION = "tx-observe-analyze-derived-v3"
+PARQUET_MANIFEST = "_tx_observe_parquet.json"
+LOCK_TRACK_ID = 0xD500_0000_0000_000F
 
 DEBUG_COUNTER_NAMES = [
     "debug.vm.pmap.teardown.phase",
@@ -80,7 +94,146 @@ DEBUG_COUNTER_NAMES = [
     "debug.zone.reclaim_slot.kind",
     "debug.zone.reclaim_slot.size",
     "debug.zone.reclaim_slot.end",
+    "debug.alloc.zone.reserve",
+    "debug.alloc.zone.reserve.bucket_hit",
+    "debug.alloc.zone.reserve.bucket_miss",
+    "debug.alloc.zone.reserve.bucket_len",
+    "debug.alloc.zone.reserve.bucket_len_after",
+    "debug.alloc.zone.reserve.cpu",
+    "debug.alloc.zone.reserve.refill_slots",
+    "debug.alloc.zone.reserve.duration_ns",
+    "debug.alloc.zone.reserve.refill.duration_ns",
+    "debug.alloc.zone.bucket_refill",
+    "debug.alloc.zone.bucket_refill.slots",
+    "debug.alloc.zone.bucket_refill.len_before",
+    "debug.alloc.zone.bucket_refill.len_after",
+    "debug.alloc.zone.bucket_refill.duration_ns",
+    "debug.alloc.zone.bucket_drain.slots",
+    "debug.alloc.zone.bucket_drain.duration_ns",
+    "debug.alloc.zone.keg.source.partial",
+    "debug.alloc.zone.keg.source.empty",
+    "debug.alloc.zone.keg.new_slab",
+    "debug.alloc.zone.keg.new_slab.duration_ns",
+    "debug.alloc.zone.keg.claim",
+    "debug.alloc.zone.keg.claim.free_before",
+    "debug.alloc.zone.keg.claim.from_new_slab",
+    "debug.alloc.zone.keg.claim.duration_ns",
+    "debug.alloc.zone.keg.pop.duration_ns",
+    "debug.alloc.zone.keg.return",
+    "debug.alloc.zone.keg.return.free_before",
+    "debug.alloc.zone.keg.return.retire_candidate",
+    "debug.alloc.zone.keg.return.retired_slab",
+    "debug.alloc.zone.keg.return.retire_failed",
+    "debug.alloc.zone.keg.return.retire.duration_ns",
+    "debug.alloc.zone.keg.return.duration_ns",
+    "debug.alloc.zone.slab.bitmap_scan",
+    "debug.lock.wait_ns",
+    "debug.lock.service_ns",
+    "debug.lock.response_ns",
+    "debug.lock.spins",
+    "debug.lock.contended",
 ]
+
+ALLOC_TRACK_NAMES = {
+    0xD500_0000_0000_0001: "debug.alloc.zone.slab",
+    0xD500_0000_0000_0002: "debug.alloc.page_frame",
+    0xD500_0000_0000_0003: "debug.alloc.page_run",
+    0xD500_0000_0000_0004: "debug.alloc.vm.recipe_node",
+    0xD500_0000_0000_0005: "debug.alloc.vm.private_page_node",
+    0xD500_0000_0000_0006: "debug.alloc.pagebacked.cache",
+    0xD500_0000_0000_0007: "debug.alloc.vm.address_space",
+    0xD500_0000_0000_0008: "debug.alloc.pagebacked.container",
+    0xD500_0000_0000_0009: "debug.alloc.thread.payload",
+    0xD500_0000_0000_000A: "debug.alloc.thread.identity",
+    0xD500_0000_0000_000B: "debug.alloc.process.payload",
+    0xD500_0000_0000_000C: "debug.alloc.process.identity",
+    0xD500_0000_0000_000D: "debug.alloc.process.threads",
+    0xD500_0000_0000_000E: "debug.alloc.pidns",
+}
+
+TX_TRACE_MAGIC = 0x5254_5854
+RECORD_MAGIC = 0x5254
+SUPPORTED_HEADER_VERSION = 0
+SUPPORTED_RECORD_VERSION = 0
+SUPPORTED_RECORD_SIZE = 80
+MAX_HARTS_DAEMON = 256
+RING_HEADER_SIZE = 208
+RING_PRODUCER_OFF = 64
+RING_CONSUMER_OFF = 128
+RECORD_STRUCT = struct.Struct("<HBBBBBBHHIQQQQIHH16s8s")
+LIVE_RAW_RECORD_HEADER_BYTES = 8
+
+KIND_NAMES = {
+    0: "Nop",
+    1: "ClockSnapshot",
+    2: "TrackDescriptor",
+    3: "StringDescriptor",
+    10: "SpanBegin",
+    11: "SpanEnd",
+    12: "Instant",
+    13: "Counter",
+    14: "TrackTombstone",
+    31: "PanicMarker",
+    40: "ArgContinuation",
+}
+
+LEVEL_NAMES = {
+    0: "Boundary",
+    1: "Script",
+    2: "Drive",
+    3: "Yield",
+    4: "Step",
+    5: "Phase",
+    6: "Mutation",
+    7: "Sched",
+}
+
+PAYLOAD_NONE = 0
+PAYLOAD_SYSCALL_ENTER = 1
+PAYLOAD_SYSCALL_EXIT = 2
+PAYLOAD_DRIVE_BEGIN = 10
+PAYLOAD_DRIVE_END = 11
+PAYLOAD_STEP_OUTCOME = 12
+PAYLOAD_YIELD_BEGIN = 20
+PAYLOAD_RESUME = 21
+PAYLOAD_WAIT_SOURCE_NOTIFY = 22
+PAYLOAD_AGENT_STATE_CHANGE = 23
+PAYLOAD_TRACK_DESCRIPTOR = 30
+PAYLOAD_COUNTER_VALUE = 31
+PAYLOAD_STRING_DESCRIPTOR = 32
+PAYLOAD_CLOCK_SNAPSHOT = 33
+PAYLOAD_ARG_VALUE = 40
+PAYLOAD_MUTATION_ZONE_SIGN = 50
+PAYLOAD_MUTATION_INDEX_COMMIT = 51
+PAYLOAD_PHASE_TRANSITION = 52
+PAYLOAD_SCHED_SWITCH = 53
+PAYLOAD_PROCESS_LABEL = 54
+PAYLOAD_PROCESS_GROUP = 55
+PAYLOAD_PROCESS_FORK = 56
+PAYLOAD_PANIC = 60
+
+PAYLOAD_MIN_LENGTHS = {
+    PAYLOAD_SYSCALL_ENTER: 8,
+    PAYLOAD_SYSCALL_EXIT: 16,
+    PAYLOAD_DRIVE_BEGIN: 12,
+    PAYLOAD_DRIVE_END: 16,
+    PAYLOAD_STEP_OUTCOME: 16,
+    PAYLOAD_YIELD_BEGIN: 16,
+    PAYLOAD_RESUME: 16,
+    PAYLOAD_WAIT_SOURCE_NOTIFY: 16,
+    PAYLOAD_TRACK_DESCRIPTOR: 16,
+    PAYLOAD_COUNTER_VALUE: 16,
+    PAYLOAD_CLOCK_SNAPSHOT: 16,
+    PAYLOAD_ARG_VALUE: 16,
+    PAYLOAD_MUTATION_ZONE_SIGN: 16,
+    PAYLOAD_MUTATION_INDEX_COMMIT: 16,
+    PAYLOAD_PHASE_TRANSITION: 16,
+    PAYLOAD_SCHED_SWITCH: 16,
+    PAYLOAD_PROCESS_LABEL: 16,
+    PAYLOAD_PROCESS_GROUP: 16,
+    PAYLOAD_PROCESS_FORK: 16,
+    PAYLOAD_PANIC: 16,
+}
 
 
 def fnv1a32(text: str) -> int:
@@ -100,6 +253,358 @@ def parse_u32_id(value: Any) -> int | None:
         except ValueError:
             return None
     return None
+
+
+def parse_u64_id(value: Any) -> int | None:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value, 16) if value.startswith("0x") else int(value)
+        except ValueError:
+            return None
+    return None
+
+
+def record_ts(record: dict[str, Any]) -> int:
+    ts = parse_u64_id(record.get("ts"))
+    if ts is None:
+        raise ValueError(f"record has invalid timestamp: {record.get('ts')!r}")
+    return ts
+
+
+def record_hart(record: dict[str, Any]) -> int | None:
+    return parse_u32_id(record.get("hart"))
+
+
+def is_trace_record(record: dict[str, Any]) -> bool:
+    return record.get("kind") != "Repair" and parse_u64_id(record.get("ts")) is not None
+
+
+def timeline_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [record for record in records if is_trace_record(record)]
+
+
+def payload_u64(payload: dict[str, Any], key: str) -> int | None:
+    return parse_u64_id(payload.get(key))
+
+
+def record_order_key(record: dict[str, Any]) -> tuple[int, int, int]:
+    return (
+        record_ts(record),
+        record_hart(record) or 0,
+        parse_u64_id(record.get("seq")) or 0,
+    )
+
+
+def event_order_key(record: dict[str, Any]) -> tuple[int, int, int, int]:
+    if record.get("kind") == "Repair":
+        return (
+            (1 << 64) - 1,
+            parse_u32_id(record.get("hart")) or 0,
+            parse_u64_id(record.get("seq_around")) or 0,
+            1,
+        )
+    return (*record_order_key(record), 0)
+
+
+def _u32(data: bytes | mmap.mmap, offset: int) -> int:
+    return int.from_bytes(data[offset : offset + 4], "little")
+
+
+def _u64(data: bytes | mmap.mmap, offset: int) -> int:
+    return int.from_bytes(data[offset : offset + 8], "little")
+
+
+def _decode_comm(raw: bytes) -> list[int]:
+    return list(raw[:12])
+
+
+def repair_record(category: str, hart: int, seq_around: int, details: str) -> dict[str, Any]:
+    return {
+        "kind": "Repair",
+        "category": category,
+        "hart": hart,
+        "seq_around": seq_around,
+        "details": details,
+    }
+
+
+def decode_payload_bytes(
+    ring_hart: int,
+    seq_around: int,
+    tag: int,
+    payload_len: int,
+    payload: bytes,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    if tag == PAYLOAD_NONE:
+        return None, None
+    if payload_len > 16:
+        return None, repair_record(
+            "txtrace.repair.payload_len_exceeded",
+            ring_hart,
+            seq_around,
+            f"payload_len {payload_len} exceeds 16-byte inline buffer",
+        )
+    if tag in {PAYLOAD_AGENT_STATE_CHANGE, PAYLOAD_STRING_DESCRIPTOR}:
+        return None, None
+    required_len = PAYLOAD_MIN_LENGTHS.get(tag)
+    if required_len is None:
+        return None, None
+    if payload_len < required_len:
+        return None, repair_record(
+            "txtrace.repair.payload_tag_unknown",
+            ring_hart,
+            seq_around,
+            f"short payload for payload_tag 0x{tag:04x}: need {required_len} bytes, got {payload_len}",
+        )
+    if tag == PAYLOAD_SYSCALL_ENTER and payload_len >= 8:
+        sysno, abi, argc = struct.unpack_from("<IHH", payload)
+        return {"sysno": sysno, "abi": abi, "argc": argc}, None
+    if tag == PAYLOAD_SYSCALL_EXIT and payload_len >= 16:
+        ret, errno, result_kind = struct.unpack_from("<qiB", payload)
+        return {"ret": ret, "errno": errno, "result_kind": result_kind, "_pad": list(payload[13:16])}, None
+    if tag == PAYLOAD_DRIVE_BEGIN and payload_len >= 12:
+        op_type, mode, interrupt, has_deadline, _pad, task_id_low = struct.unpack_from("<IBBBBI", payload)
+        return {
+            "op_type": op_type,
+            "mode": mode,
+            "interrupt": interrupt,
+            "has_deadline": has_deadline,
+            "_pad": _pad,
+            "task_id_low": task_id_low,
+        }, None
+    if tag == PAYLOAD_DRIVE_END and payload_len >= 16:
+        ret, errno, result_kind = struct.unpack_from("<qiB", payload)
+        return {"ret": ret, "errno": errno, "result_kind": result_kind, "_pad": list(payload[13:16])}, None
+    if tag == PAYLOAD_STEP_OUTCOME and payload_len >= 16:
+        variant, progress_empty, progress_kind, shape_kind, errno, progress_value, _pad = struct.unpack_from(
+            "<BBBBiII", payload
+        )
+        return {
+            "variant": variant,
+            "progress_empty": progress_empty,
+            "progress_kind": progress_kind,
+            "shape_kind": shape_kind,
+            "errno": errno,
+            "progress_value": progress_value,
+            "_pad": _pad,
+        }, None
+    if tag == PAYLOAD_YIELD_BEGIN and payload_len >= 16:
+        shape_kind = payload[0]
+        task_id_low = struct.unpack_from("<I", payload, 4)[0]
+        wait_generation = struct.unpack_from("<Q", payload, 8)[0]
+        return {
+            "shape_kind": shape_kind,
+            "_pad": list(payload[1:4]),
+            "task_id_low": task_id_low,
+            "wait_generation": wait_generation,
+        }, None
+    if tag == PAYLOAD_RESUME and payload_len >= 16:
+        resume_kind, abort_reason = struct.unpack_from("<BB", payload)
+        object_id_low = struct.unpack_from("<I", payload, 4)[0]
+        wait_generation = struct.unpack_from("<Q", payload, 8)[0]
+        return {
+            "resume_kind": resume_kind,
+            "abort_reason": abort_reason,
+            "_pad": list(payload[2:4]),
+            "object_id_low": object_id_low,
+            "wait_generation": wait_generation,
+        }, None
+    if tag == PAYLOAD_WAIT_SOURCE_NOTIFY and payload_len >= 16:
+        source_id_low, mask_bits, task_id_low, wait_generation_low = struct.unpack_from("<IIII", payload)
+        return {
+            "source_id_low": source_id_low,
+            "mask_bits": mask_bits,
+            "task_id_low": task_id_low,
+            "wait_generation_low": wait_generation_low,
+        }, None
+    if tag == PAYLOAD_TRACK_DESCRIPTOR and payload_len >= 16:
+        track_id, name, track_kind = struct.unpack_from("<QIB", payload)
+        return {"track_id": track_id, "name": name, "track_kind": track_kind, "_pad": list(payload[13:16])}, None
+    if tag == PAYLOAD_COUNTER_VALUE and payload_len >= 16:
+        counter_id, _pad, value = struct.unpack_from("<IIQ", payload)
+        return {"counter_id": counter_id, "_pad": _pad, "value": value}, None
+    if tag == PAYLOAD_CLOCK_SNAPSHOT and payload_len >= 16:
+        trace_ns, wall_ns = struct.unpack_from("<QQ", payload)
+        return {"trace_ns": trace_ns, "wall_ns": wall_ns}, None
+    if tag == PAYLOAD_ARG_VALUE and payload_len >= 16:
+        key = struct.unpack_from("<I", payload)[0]
+        value_kind = payload[4]
+        value0 = struct.unpack_from("<Q", payload, 8)[0]
+        return {"key": key, "value_kind": value_kind, "_pad": list(payload[5:8]), "value0": value0}, None
+    if tag == PAYLOAD_MUTATION_ZONE_SIGN and payload_len >= 16:
+        object_id = struct.unpack_from("<Q", payload)[0]
+        kind = payload[8]
+        return {"object_id": object_id, "kind": kind, "_pad": list(payload[9:16])}, None
+    if tag == PAYLOAD_MUTATION_INDEX_COMMIT and payload_len >= 16:
+        index_id, key_low, value_object_id = struct.unpack_from("<IIQ", payload)
+        return {"index_id": index_id, "key_low": key_low, "value_object_id": value_object_id}, None
+    if tag == PAYLOAD_PHASE_TRANSITION and payload_len >= 16:
+        return {"phase_kind": payload[0], "hart_id": payload[1], "_pad": list(payload[2:16])}, None
+    if tag == PAYLOAD_SCHED_SWITCH and payload_len >= 16:
+        task_id_low, process_id_low, hart_id, kind, reason = struct.unpack_from("<IIBBB", payload)
+        return {
+            "task_id_low": task_id_low,
+            "process_id_low": process_id_low,
+            "hart_id": hart_id,
+            "kind": kind,
+            "reason": reason,
+            "_pad": list(payload[11:16]),
+        }, None
+    if tag == PAYLOAD_PROCESS_LABEL and payload_len >= 16:
+        process_id_low = struct.unpack_from("<I", payload)[0]
+        return {"process_id_low": process_id_low, "comm": _decode_comm(payload[4:16])}, None
+    if tag == PAYLOAD_PROCESS_GROUP and payload_len >= 16:
+        process_id_low, pgid_low, sid_low, _pad = struct.unpack_from("<IIII", payload)
+        return {"process_id_low": process_id_low, "pgid_low": pgid_low, "sid_low": sid_low, "_pad": _pad}, None
+    if tag == PAYLOAD_PROCESS_FORK and payload_len >= 16:
+        parent_pid_low, child_pid_low, flags, _pad = struct.unpack_from("<IIII", payload)
+        return {"parent_pid_low": parent_pid_low, "child_pid_low": child_pid_low, "_flags": flags, "_pad": _pad}, None
+    if tag == PAYLOAD_PANIC and payload_len >= 16:
+        site_name, _pad, panic_hart, flags, _pad2 = struct.unpack_from("<IIHHI", payload)
+        return {"site_name": site_name, "_pad": _pad, "panic_hart": panic_hart, "flags": flags, "_pad2": _pad2}, None
+    return None, None
+
+
+def decode_record_bytes(ring_hart: int, raw: bytes) -> dict[str, Any] | None:
+    (
+        magic,
+        version,
+        kind,
+        level,
+        _flags,
+        _arg_count,
+        _pad0,
+        hart,
+        _pad1,
+        _pad2,
+        seq,
+        ts,
+        span,
+        parent,
+        name,
+        payload_tag,
+        payload_len,
+        payload,
+        _pad3,
+    ) = RECORD_STRUCT.unpack(raw)
+    if magic != RECORD_MAGIC:
+        return repair_record(
+            "txtrace.repair.bad_magic",
+            ring_hart,
+            seq,
+            f"expected 0x{RECORD_MAGIC:04x} got 0x{magic:04x}",
+        )
+    if version != SUPPORTED_RECORD_VERSION:
+        return repair_record(
+            "txtrace.repair.version_mismatch",
+            ring_hart,
+            seq,
+            f"expected version {SUPPORTED_RECORD_VERSION} got {version}",
+        )
+    if payload_len > 16:
+        return repair_record(
+            "txtrace.repair.payload_len_exceeded",
+            ring_hart,
+            seq,
+            f"payload_len {payload_len} exceeds 16-byte inline buffer",
+        )
+    record: dict[str, Any] = {
+        "hart": hart if hart < MAX_HARTS_DAEMON else ring_hart,
+        "seq": seq,
+        "ts": ts,
+        "kind": KIND_NAMES.get(kind, "Unknown"),
+        "level": LEVEL_NAMES.get(level, "Unknown"),
+        "span": f"0x{span:x}",
+        "parent": f"0x{parent:x}",
+        "name_id": f"0x{name:x}",
+        "payload_tag": payload_tag,
+    }
+    decoded_payload, repair = decode_payload_bytes(ring_hart, seq, payload_tag, payload_len, payload)
+    if repair is not None:
+        return repair
+    if decoded_payload is not None:
+        record["payload"] = decoded_payload
+    return record
+
+
+def load_txtrace_records(path: Path, *, sort_records: bool = True) -> list[dict[str, Any]]:
+    runs: list[list[dict[str, Any]]] = []
+    with path.open("rb") as file:
+        with mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ) as data:
+            if len(data) < 72:
+                raise ValueError("txtrace header is truncated")
+            magic = _u32(data, 0)
+            version = int.from_bytes(data[4:6], "little")
+            record_size = int.from_bytes(data[10:12], "little")
+            hart_count = int.from_bytes(data[12:14], "little")
+            ring_order = data[14]
+            rings_off = _u64(data, 64)
+            if magic != TX_TRACE_MAGIC:
+                raise ValueError(f"bad txtrace magic 0x{magic:08x}")
+            if version != SUPPORTED_HEADER_VERSION:
+                raise ValueError(f"unsupported txtrace header version {version}")
+            if record_size != SUPPORTED_RECORD_SIZE:
+                raise ValueError(f"unsupported txtrace record_size {record_size}")
+            if hart_count == 0 or hart_count > MAX_HARTS_DAEMON:
+                raise ValueError(f"hart_count {hart_count} is outside [1, {MAX_HARTS_DAEMON}]")
+            if ring_order < 2 or ring_order > 24:
+                raise ValueError(f"ring_order {ring_order} is outside [2, 24]")
+            slot_count = 1 << ring_order
+            ring_data_size = RING_HEADER_SIZE + slot_count * record_size
+            required = rings_off + hart_count * ring_data_size
+            if required > len(data):
+                raise ValueError(f"trace file truncated: need {required} bytes, got {len(data)}")
+
+            for h in range(hart_count):
+                ring_base = rings_off + h * ring_data_size
+                ring = data[ring_base : ring_base + RING_HEADER_SIZE]
+                ring_hart = int.from_bytes(ring[0:2], "little")
+                producer = _u64(data, ring_base + RING_PRODUCER_OFF)
+                consumer = _u64(data, ring_base + RING_CONSUMER_OFF)
+                effective_consumer = (
+                    producer - slot_count if producer - consumer > slot_count else consumer
+                )
+                slots_base = ring_base + RING_HEADER_SIZE
+                run: list[dict[str, Any]] = []
+                cursor = effective_consumer
+                while cursor != producer:
+                    slot_idx = cursor & (slot_count - 1)
+                    slot_off = slots_base + slot_idx * record_size
+                    record = decode_record_bytes(ring_hart, data[slot_off : slot_off + record_size])
+                    if record is not None and record.get("kind") != "Nop":
+                        run.append(record)
+                    cursor += 1
+                run.sort(key=event_order_key)
+                runs.append(run)
+    if not sort_records or len(runs) <= 1:
+        return [record for run in runs for record in run]
+    return list(heapq.merge(*runs, key=event_order_key))
+
+
+def load_rawrecords(path: Path, *, sort_records: bool = True) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    record_bytes = RECORD_STRUCT.size
+    stride = LIVE_RAW_RECORD_HEADER_BYTES + record_bytes
+    with path.open("rb") as file:
+        offset = 0
+        while True:
+            chunk = file.read(stride)
+            if not chunk:
+                break
+            if len(chunk) != stride:
+                raise ValueError(
+                    f"truncated rawrecords entry at byte {offset}: need {stride} bytes, got {len(chunk)}"
+                )
+            ring_hart = int.from_bytes(chunk[0:2], "little")
+            record = decode_record_bytes(ring_hart, chunk[LIVE_RAW_RECORD_HEADER_BYTES:])
+            if record is not None and record.get("kind") != "Nop":
+                records.append(record)
+            offset += stride
+    if sort_records:
+        records.sort(key=event_order_key)
+    return records
 
 
 def fmt_ns(ns: float) -> str:
@@ -161,16 +666,27 @@ def load_names(path: Path | None, source_root: Path | None = None) -> dict[int, 
     return out
 
 
-def load_records(path: Path) -> list[dict[str, Any]]:
+def load_records(path: Path, *, sort_records: bool = True) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
-    for line in path.read_text().splitlines():
-        line = line.strip()
-        if not line.startswith("{"):
-            continue
-        record = json.loads(line)
-        if "ts" in record and "kind" in record:
+    last_key: tuple[int, int, int, int] | None = None
+    presorted = True
+    with path.open() as file:
+        for line in file:
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            record = json.loads(line)
+            if "kind" not in record:
+                continue
+            if record.get("kind") != "Repair" and "ts" not in record:
+                continue
+            key = event_order_key(record)
+            if last_key is not None and key < last_key:
+                presorted = False
+            last_key = key
             records.append(record)
-    records.sort(key=lambda r: int(r["ts"]))
+    if sort_records and not presorted:
+        records.sort(key=event_order_key)
     return records
 
 
@@ -185,12 +701,55 @@ def event_name(record: dict[str, Any], names: dict[int, str]) -> str:
     return "unknown"
 
 
+class DerivedTables:
+    def __init__(
+        self,
+        spans: list[dict[str, Any]],
+        counters: list[dict[str, int]],
+        allocation_rows: list[dict[str, Any]],
+        meta: dict[str, Any],
+        sched_intervals: list[dict[str, int]] | None = None,
+        lock_rows: list[dict[str, int]] | None = None,
+    ) -> None:
+        self.spans = spans
+        self.counters = counters
+        self.allocation_rows = allocation_rows
+        self.sched_intervals = sched_intervals or []
+        self.lock_rows = lock_rows or []
+        self.meta = meta
+
+
+class DerivedCacheResult:
+    def __init__(
+        self,
+        tables: DerivedTables,
+        path: Path | None = None,
+        hit: bool = False,
+    ) -> None:
+        self.tables = tables
+        self.path = path
+        self.hit = hit
+
+
+def span_display_name(span: dict[str, Any], names: dict[int, str]) -> str:
+    name = span.get("name")
+    if isinstance(name, str):
+        return name
+    sysno = span.get("sysno")
+    if isinstance(sysno, int):
+        return names.get(sysno, f"sys_{sysno}")
+    name_id = span.get("name_id")
+    if isinstance(name_id, int):
+        return names.get(name_id, f"name_0x{name_id:x}")
+    return "unknown"
+
+
 def describe(record: dict[str, Any], spans: dict[str, dict[str, Any]], names: dict[int, str]) -> str:
     kind = record.get("kind")
     span = record.get("span")
     if kind == "SpanEnd" and span in spans:
         info = spans[span]
-        return f"{kind} {span} {info['name']}"
+        return f"{kind} {span} {span_display_name(info, names)}"
     if kind == "SpanBegin":
         return f"{kind} {span} {event_name(record, names)}"
     if kind == "Counter":
@@ -201,56 +760,834 @@ def describe(record: dict[str, Any], spans: dict[str, dict[str, Any]], names: di
     return f"{kind} name={record.get('name_id')} span={span} parent={record.get('parent')}"
 
 
-def analyze(records: list[dict[str, Any]], names: dict[int, str], top: int) -> str:
+def build_derived_tables(
+    records: list[dict[str, Any]],
+    *,
+    dangling_span_policy: str = "exclude",
+) -> DerivedTables:
     begins: dict[str, dict[str, Any]] = {}
+    span_tasks: dict[str, tuple[int | None, int | None]] = {}
+    sched_begins: dict[str, dict[str, Any]] = {}
+    current_task_by_hart: dict[int, int] = {}
+    current_pid_by_hart: dict[int, int] = {}
+    sched_intervals: list[dict[str, int]] = []
     spans: list[dict[str, Any]] = []
-    span_by_id: dict[str, dict[str, Any]] = {}
-    counters: list[dict[str, Any]] = []
-    kinds = Counter(record.get("kind") for record in records)
+    counters: list[dict[str, int]] = []
+    allocation: list[dict[str, Any]] = []
+    lock_rows: list[dict[str, int]] = []
 
     for record in records:
         kind = record.get("kind")
         span_id = record.get("span")
+        payload = record.get("payload") or {}
+        hart = record_hart(record)
+        if record.get("payload_tag") == PAYLOAD_SCHED_SWITCH:
+            task = payload_u64(payload, "task_id_low")
+            pid = payload_u64(payload, "process_id_low")
+            sched_hart = payload_u64(payload, "hart_id")
+            event_hart = int(sched_hart if sched_hart is not None else hart or 0)
+            if kind == "SpanBegin" and isinstance(span_id, str) and task is not None:
+                sched_begins[span_id] = record
+                current_task_by_hart[event_hart] = task
+                current_pid_by_hart[event_hart] = int(pid or 0)
+            elif kind == "SpanEnd" and isinstance(span_id, str):
+                begin = sched_begins.pop(span_id, None)
+                begin_payload = (begin or {}).get("payload") or {}
+                begin_task = payload_u64(begin_payload, "task_id_low")
+                begin_pid = payload_u64(begin_payload, "process_id_low")
+                begin_hart = payload_u64(begin_payload, "hart_id")
+                if begin is not None and begin_task is not None:
+                    sched_intervals.append(
+                        {
+                            "task": begin_task,
+                            "pid": int(begin_pid or 0),
+                            "hart": int(begin_hart if begin_hart is not None else record_hart(begin) or event_hart),
+                            "begin": record_ts(begin),
+                            "end": record_ts(record),
+                            "dur": record_ts(record) - record_ts(begin),
+                        }
+                    )
+                current_task_by_hart.pop(event_hart, None)
+                current_pid_by_hart.pop(event_hart, None)
+
         if kind == "SpanBegin" and isinstance(span_id, str):
             begins[span_id] = record
+            if record.get("payload_tag") != PAYLOAD_SCHED_SWITCH and hart in current_task_by_hart:
+                span_tasks[span_id] = (
+                    current_task_by_hart.get(hart),
+                    current_pid_by_hart.get(hart),
+                )
         elif kind == "SpanEnd" and isinstance(span_id, str):
             begin = begins.pop(span_id, None)
             if begin is None:
                 continue
             payload = begin.get("payload") or {}
             sysno = payload.get("sysno")
-            name = event_name(begin, names)
-            span = {
-                "span": span_id,
-                "name": name,
-                "sysno": sysno,
-                "begin": int(begin["ts"]),
-                "end": int(record["ts"]),
-                "dur": int(record["ts"]) - int(begin["ts"]),
-                "ret": (record.get("payload") or {}).get("ret"),
-                "errno": (record.get("payload") or {}).get("errno"),
-            }
-            spans.append(span)
-            span_by_id[span_id] = span
+            task_id, process_id = span_tasks.pop(span_id, (None, None))
+            spans.append(
+                {
+                    "span": span_id,
+                    "name_id": parse_u32_id(begin.get("name_id")),
+                    "sysno": sysno,
+                    "begin": record_ts(begin),
+                    "end": record_ts(record),
+                    "dur": record_ts(record) - record_ts(begin),
+                    "begin_hart": record_hart(begin),
+                    "end_hart": record_hart(record),
+                    "task_id": task_id,
+                    "process_id": process_id,
+                    "ret": (record.get("payload") or {}).get("ret"),
+                    "errno": (record.get("payload") or {}).get("errno"),
+                    "dangling": False,
+                }
+            )
         elif kind == "Counter":
-            counters.append(record)
+            payload = record.get("payload") or {}
+            cid = payload.get("counter_id")
+            value = payload_u64(payload, "value")
+            if isinstance(cid, int) and value is not None:
+                counters.append({"ts": record_ts(record), "counter_id": cid, "value": value})
+        elif kind == "Instant" and record.get("payload_tag") == PAYLOAD_ARG_VALUE:
+            parent = parse_u64_id(record.get("parent"))
+            payload = record.get("payload") or {}
+            value = payload_u64(payload, "value0")
+            if value is None:
+                continue
+            if parent == LOCK_TRACK_ID:
+                lock_id = parse_u32_id(record.get("name_id"))
+                metric_id = parse_u32_id(payload.get("key"))
+                if lock_id is None or metric_id is None:
+                    continue
+                lock_rows.append(
+                    {
+                        "ts": record_ts(record),
+                        "hart": int(hart or 0),
+                        "lock_id": lock_id,
+                        "metric_id": metric_id,
+                        "value": value,
+                    }
+                )
+                continue
+            if parent not in ALLOC_TRACK_NAMES:
+                continue
+            allocation.append(
+                {
+                    "ts": record_ts(record),
+                    "track": ALLOC_TRACK_NAMES[parent],
+                    "name_id": parse_u32_id(record.get("name_id")),
+                    "value": value,
+                }
+            )
+
+    dangling_count = len(begins)
+    trace_tail = timeline_records(records)
+    if dangling_span_policy == "synthetic-end" and trace_tail:
+        last_ts = record_ts(trace_tail[-1])
+        last_hart = record_hart(trace_tail[-1])
+        for span_id, begin in begins.items():
+            payload = begin.get("payload") or {}
+            task_id, process_id = span_tasks.get(span_id, (None, None))
+            spans.append(
+                {
+                    "span": span_id,
+                    "name_id": parse_u32_id(begin.get("name_id")),
+                    "sysno": payload.get("sysno"),
+                    "begin": record_ts(begin),
+                    "end": last_ts,
+                    "dur": max(0, last_ts - record_ts(begin)),
+                    "begin_hart": record_hart(begin),
+                    "end_hart": last_hart,
+                    "task_id": task_id,
+                    "process_id": process_id,
+                    "ret": None,
+                    "errno": None,
+                    "dangling": True,
+                }
+            )
+
+    annotate_span_sched_migration(spans, sched_intervals)
+
+    return DerivedTables(
+        spans=spans,
+        counters=counters,
+        allocation_rows=allocation,
+        sched_intervals=sched_intervals,
+        lock_rows=lock_rows,
+        meta={
+            "schema": "tx-observe-derived-v0",
+            "decoder_version": ANALYZER_DECODER_VERSION,
+            "record_count": len(records),
+            "dangling_span_policy": dangling_span_policy,
+            "dangling_span_count": dangling_count,
+            "dangling_spans_materialized": dangling_count
+            if dangling_span_policy == "synthetic-end" and records
+            else 0,
+            "span_count": len(spans),
+            "counter_count": len(counters),
+            "allocation_row_count": len(allocation),
+            "sched_interval_count": len(sched_intervals),
+            "lock_row_count": len(lock_rows),
+        },
+    )
+
+
+def annotate_span_sched_migration(
+    spans: list[dict[str, Any]],
+    sched_intervals: list[dict[str, int]],
+) -> None:
+    intervals_by_task: dict[int, list[dict[str, int]]] = defaultdict(list)
+    for interval in sched_intervals:
+        intervals_by_task[interval["task"]].append(interval)
+    for rows in intervals_by_task.values():
+        rows.sort(key=lambda row: row["begin"])
+
+    for span in spans:
+        task_id = span.get("task_id")
+        if not isinstance(task_id, int):
+            continue
+        begin = int(span["begin"])
+        end = int(span["end"])
+        harts: list[int] = []
+        coverage = 0
+        segments = 0
+        for interval in intervals_by_task.get(task_id, []):
+            if interval["end"] <= begin:
+                continue
+            if interval["begin"] >= end:
+                break
+            overlap = min(end, interval["end"]) - max(begin, interval["begin"])
+            if overlap <= 0:
+                continue
+            segments += 1
+            coverage += overlap
+            hart = interval["hart"]
+            if hart not in harts:
+                harts.append(hart)
+        if harts:
+            span["sched_harts"] = harts
+            span["sched_segments"] = segments
+            span["sched_coverage"] = coverage
+            span["sched_migrated"] = len(harts) > 1
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def derived_cache_path(cache_dir: Path, input_hash: str, dangling_span_policy: str) -> Path:
+    name = f"{input_hash}.{ANALYZER_DECODER_VERSION}.{dangling_span_policy}.json"
+    return cache_dir / name
+
+
+def derived_tables_to_json(tables: DerivedTables, input_hash: str) -> dict[str, Any]:
+    return {
+        "meta": {**tables.meta, "input_hash": input_hash},
+        "spans": tables.spans,
+        "counters": tables.counters,
+        "allocation_rows": tables.allocation_rows,
+        "sched_intervals": tables.sched_intervals,
+        "lock_rows": tables.lock_rows,
+    }
+
+
+def derived_tables_from_json(data: dict[str, Any]) -> DerivedTables:
+    return DerivedTables(
+        spans=list(data.get("spans") or []),
+        counters=list(data.get("counters") or []),
+        allocation_rows=list(data.get("allocation_rows") or []),
+        sched_intervals=list(data.get("sched_intervals") or []),
+        lock_rows=list(data.get("lock_rows") or []),
+        meta=dict(data.get("meta") or {}),
+    )
+
+
+PARQUET_SCHEMAS = {
+    "spans.parquet": [
+        ("span", "VARCHAR"),
+        ("name_id", "UINTEGER"),
+        ("sysno", "UBIGINT"),
+        ("begin", "UBIGINT"),
+        ("end", "UBIGINT"),
+        ("dur", "UBIGINT"),
+        ("begin_hart", "UINTEGER"),
+        ("end_hart", "UINTEGER"),
+        ("task_id", "UBIGINT"),
+        ("process_id", "UBIGINT"),
+        ("ret", "BIGINT"),
+        ("errno", "BIGINT"),
+        ("dangling", "BOOLEAN"),
+        ("sched_harts", "UINTEGER[]"),
+        ("sched_segments", "UBIGINT"),
+        ("sched_coverage", "UBIGINT"),
+        ("sched_migrated", "BOOLEAN"),
+    ],
+    "counters.parquet": [
+        ("ts", "UBIGINT"),
+        ("counter_id", "UINTEGER"),
+        ("value", "UBIGINT"),
+    ],
+    "allocation_rows.parquet": [
+        ("ts", "UBIGINT"),
+        ("track", "VARCHAR"),
+        ("name_id", "UINTEGER"),
+        ("value", "UBIGINT"),
+    ],
+    "sched_intervals.parquet": [
+        ("task", "UBIGINT"),
+        ("pid", "UBIGINT"),
+        ("hart", "UINTEGER"),
+        ("begin", "UBIGINT"),
+        ("end", "UBIGINT"),
+        ("dur", "UBIGINT"),
+    ],
+    "lock_rows.parquet": [
+        ("ts", "UBIGINT"),
+        ("hart", "UINTEGER"),
+        ("lock_id", "UINTEGER"),
+        ("metric_id", "UINTEGER"),
+        ("value", "UBIGINT"),
+    ],
+}
+
+
+def duckdb_sql_string(value: Path | str) -> str:
+    text = value.as_posix() if isinstance(value, Path) else value
+    return "'" + text.replace("'", "''") + "'"
+
+
+def parquet_select_sql(
+    filename: str,
+    json_path: Path,
+    rows: list[dict[str, Any]],
+) -> str:
+    schema = PARQUET_SCHEMAS[filename]
+    select_list = ", ".join(
+        f'CAST("{column}" AS {duck_type}) AS "{column}"'
+        for column, duck_type in schema
+    )
+    if rows:
+        return f"SELECT {select_list} FROM {read_json_typed(json_path, schema)}"
+    empty_select = ", ".join(
+        f'CAST(NULL AS {duck_type}) AS "{column}"'
+        for column, duck_type in schema
+    )
+    return f"SELECT {empty_select} WHERE false"
+
+
+def duckdb_json_columns(schema: list[tuple[str, str]]) -> str:
+    fields = ", ".join(f"'{column}':'VARCHAR'" for column, _ in schema)
+    return "{" + fields + "}"
+
+
+def read_json_typed(path: Path, schema: list[tuple[str, str]]) -> str:
+    return (
+        "read_json("
+        + duckdb_sql_string(path)
+        + f", columns={duckdb_json_columns(schema)}, format='newline_delimited')"
+    )
+
+
+RECORD_SQL_SCHEMA = [
+    ("ts", "UBIGINT"),
+    ("hart", "UINTEGER"),
+    ("seq", "UBIGINT"),
+    ("kind", "VARCHAR"),
+    ("level", "VARCHAR"),
+    ("span", "VARCHAR"),
+    ("parent", "VARCHAR"),
+    ("name_id", "UINTEGER"),
+    ("payload_tag", "UINTEGER"),
+]
+
+REPAIR_SQL_SCHEMA = [
+    ("hart", "UINTEGER"),
+    ("seq_around", "UBIGINT"),
+    ("category", "VARCHAR"),
+    ("details", "VARCHAR"),
+]
+
+NAME_SQL_SCHEMA = [
+    ("id", "UINTEGER"),
+    ("name", "VARCHAR"),
+]
+
+
+def typed_select_sql(
+    json_path: Path,
+    rows: list[dict[str, Any]],
+    schema: list[tuple[str, str]],
+) -> str:
+    select_list = ", ".join(
+        f'CAST("{column}" AS {duck_type}) AS "{column}"'
+        for column, duck_type in schema
+    )
+    if rows:
+        return f"SELECT {select_list} FROM {read_json_typed(json_path, schema)}"
+    empty_select = ", ".join(
+        f'CAST(NULL AS {duck_type}) AS "{column}"'
+        for column, duck_type in schema
+    )
+    return f"SELECT {empty_select} WHERE false"
+
+
+def sql_records_rows(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for record in records:
+        if not is_trace_record(record):
+            continue
+        rows.append(
+            {
+                "ts": record_ts(record),
+                "hart": record_hart(record),
+                "seq": parse_u64_id(record.get("seq")),
+                "kind": record.get("kind"),
+                "level": record.get("level"),
+                "span": record.get("span"),
+                "parent": record.get("parent"),
+                "name_id": parse_u32_id(record.get("name_id")),
+                "payload_tag": parse_u32_id(record.get("payload_tag")),
+            }
+        )
+    return rows
+
+
+def sql_repairs_rows(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for record in records:
+        if record.get("kind") != "Repair":
+            continue
+        rows.append(
+            {
+                "hart": record_hart(record),
+                "seq_around": parse_u64_id(record.get("seq_around")),
+                "category": record.get("category"),
+                "details": record.get("details"),
+            }
+        )
+    return rows
+
+
+def sql_names_rows(names: dict[int, str]) -> list[dict[str, Any]]:
+    return [{"id": int(name_id), "name": name} for name_id, name in sorted(names.items())]
+
+
+def write_jsonl(path: Path, rows: list[dict[str, Any]], columns: list[str]) -> None:
+    with path.open("w", encoding="utf-8") as file:
+        for row in rows:
+            file.write(json.dumps({column: row.get(column) for column in columns}, separators=(",", ":")))
+            file.write("\n")
+
+
+def require_duckdb() -> str:
+    duckdb = shutil.which("duckdb")
+    if duckdb is None:
+        raise RuntimeError("duckdb CLI is required for SQL/Parquet analysis")
+    return duckdb
+
+
+def parquet_manifest_path(out_dir: Path) -> Path:
+    return out_dir / PARQUET_MANIFEST
+
+
+def parquet_manifest_matches(
+    out_dir: Path,
+    *,
+    input_hash: str,
+    dangling_span_policy: str,
+) -> bool:
+    path = parquet_manifest_path(out_dir)
+    if not path.exists():
+        return False
+    try:
+        manifest = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    if (
+        manifest.get("schema") != "tx-observe-derived-parquet-v0"
+        or manifest.get("input_hash") != input_hash
+        or manifest.get("decoder_version") != ANALYZER_DECODER_VERSION
+        or manifest.get("dangling_span_policy") != dangling_span_policy
+    ):
+        return False
+    files = manifest.get("files") or []
+    expected = set(PARQUET_SCHEMAS)
+    if set(files) != expected:
+        return False
+    return all((out_dir / filename).exists() for filename in expected)
+
+
+def write_parquet_manifest(
+    tables: DerivedTables,
+    out_dir: Path,
+    *,
+    input_hash: str,
+    dangling_span_policy: str,
+) -> None:
+    manifest = {
+        "schema": "tx-observe-derived-parquet-v0",
+        "input_hash": input_hash,
+        "decoder_version": ANALYZER_DECODER_VERSION,
+        "dangling_span_policy": dangling_span_policy,
+        "files": sorted(PARQUET_SCHEMAS),
+        "table_counts": {
+            "spans": len(tables.spans),
+            "counters": len(tables.counters),
+            "allocation_rows": len(tables.allocation_rows),
+            "sched_intervals": len(tables.sched_intervals),
+            "lock_rows": len(tables.lock_rows),
+        },
+    }
+    path = parquet_manifest_path(out_dir)
+    tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    tmp.replace(path)
+
+
+def export_derived_tables_parquet(
+    tables: DerivedTables,
+    out_dir: Path,
+    *,
+    input_hash: str | None = None,
+    dangling_span_policy: str | None = None,
+) -> list[Path]:
+    duckdb = require_duckdb()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    written: list[Path] = []
+    exports = [
+        (
+            "spans.parquet",
+            tables.spans,
+            [column for column, _ in PARQUET_SCHEMAS["spans.parquet"]],
+        ),
+        ("counters.parquet", tables.counters, [column for column, _ in PARQUET_SCHEMAS["counters.parquet"]]),
+        (
+            "allocation_rows.parquet",
+            tables.allocation_rows,
+            [column for column, _ in PARQUET_SCHEMAS["allocation_rows.parquet"]],
+        ),
+        (
+            "sched_intervals.parquet",
+            tables.sched_intervals,
+            [column for column, _ in PARQUET_SCHEMAS["sched_intervals.parquet"]],
+        ),
+        (
+            "lock_rows.parquet",
+            tables.lock_rows,
+            [column for column, _ in PARQUET_SCHEMAS["lock_rows.parquet"]],
+        ),
+    ]
+    for filename, rows, columns in exports:
+        json_path = out_dir / f"{filename}.jsonl"
+        parquet_path = out_dir / filename
+        write_jsonl(json_path, rows, columns)
+        select_sql = parquet_select_sql(filename, json_path, rows)
+        sql = f"COPY ({select_sql}) TO {duckdb_sql_string(parquet_path)} (FORMAT PARQUET);"
+        try:
+            proc = subprocess.run([duckdb, "--no-stdin", "-c", sql], capture_output=True, text=True)
+            if proc.returncode != 0:
+                raise RuntimeError(f"duckdb parquet export failed: {proc.stderr.strip() or proc.stdout.strip()}")
+            written.append(parquet_path)
+        finally:
+            json_path.unlink(missing_ok=True)
+    if input_hash is not None and dangling_span_policy is not None:
+        write_parquet_manifest(
+            tables,
+            out_dir,
+            input_hash=input_hash,
+            dangling_span_policy=dangling_span_policy,
+        )
+    return written
+
+
+def sql_format_args(fmt: str) -> list[str]:
+    if fmt == "csv":
+        return ["-csv"]
+    if fmt == "json":
+        return ["-json"]
+    return []
+
+
+def run_sql_query(
+    records: list[dict[str, Any]],
+    tables: DerivedTables,
+    names: dict[int, str],
+    query: str,
+    sql_format: str,
+) -> str:
+    duckdb = require_duckdb()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        table_defs = [
+            ("records", sql_records_rows(records), RECORD_SQL_SCHEMA),
+            ("repairs", sql_repairs_rows(records), REPAIR_SQL_SCHEMA),
+            ("spans", tables.spans, PARQUET_SCHEMAS["spans.parquet"]),
+            ("counters", tables.counters, PARQUET_SCHEMAS["counters.parquet"]),
+            ("allocation_rows", tables.allocation_rows, PARQUET_SCHEMAS["allocation_rows.parquet"]),
+            ("sched_intervals", tables.sched_intervals, PARQUET_SCHEMAS["sched_intervals.parquet"]),
+            ("lock_rows", tables.lock_rows, PARQUET_SCHEMAS["lock_rows.parquet"]),
+            ("names", sql_names_rows(names), NAME_SQL_SCHEMA),
+        ]
+        setup: list[str] = []
+        for table_name, rows, schema in table_defs:
+            json_path = tmp / f"{table_name}.jsonl"
+            columns = [column for column, _ in schema]
+            write_jsonl(json_path, rows, columns)
+            setup.append(
+                f"CREATE TEMP VIEW {table_name} AS {typed_select_sql(json_path, rows, schema)};"
+            )
+        sql = "\n".join(setup + [query])
+        proc = subprocess.run(
+            [duckdb, "--no-stdin", *sql_format_args(sql_format), "-c", sql],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"duckdb SQL query failed: {proc.stderr.strip() or proc.stdout.strip()}")
+        return proc.stdout
+
+
+def analyze_parquet_summary(parquet_dir: Path, names: dict[int, str], top: int) -> str:
+    duckdb = require_duckdb()
+    name_values = ", ".join(
+        f"({int(name_id)}, {duckdb_sql_string(name)})"
+        for name_id, name in sorted(names.items())
+    )
+    names_source = (
+        f"(VALUES {name_values}) AS t(id, name)"
+        if name_values
+        else "(SELECT NULL::UINTEGER AS id, NULL::VARCHAR AS name WHERE false)"
+    )
+    sql = f"""
+CREATE TEMP TABLE names AS
+SELECT CAST(id AS UINTEGER) AS id, CAST(name AS VARCHAR) AS name
+FROM {names_source};
+
+CREATE TEMP VIEW spans AS SELECT * FROM read_parquet({duckdb_sql_string(parquet_dir / "spans.parquet")});
+CREATE TEMP VIEW counters AS SELECT * FROM read_parquet({duckdb_sql_string(parquet_dir / "counters.parquet")});
+CREATE TEMP VIEW allocation_rows AS SELECT * FROM read_parquet({duckdb_sql_string(parquet_dir / "allocation_rows.parquet")});
+CREATE TEMP VIEW sched_intervals AS SELECT * FROM read_parquet({duckdb_sql_string(parquet_dir / "sched_intervals.parquet")});
+CREATE TEMP VIEW lock_rows AS SELECT * FROM read_parquet({duckdb_sql_string(parquet_dir / "lock_rows.parquet")});
+
+SELECT 'counts' AS section, 'spans' AS key, count(*)::VARCHAR AS n, NULL AS total_ns,
+       NULL AS p50_ns, NULL AS p99_ns, NULL AS max_ns, 0::UBIGINT AS order_ns
+FROM spans
+UNION ALL
+SELECT 'counts', 'counters', count(*)::VARCHAR, NULL, NULL, NULL, NULL, 0::UBIGINT FROM counters
+UNION ALL
+SELECT 'counts', 'allocation_rows', count(*)::VARCHAR, NULL, NULL, NULL, NULL, 0::UBIGINT FROM allocation_rows
+UNION ALL
+SELECT 'counts', 'sched_intervals', count(*)::VARCHAR, NULL, NULL, NULL, NULL, 0::UBIGINT FROM sched_intervals
+UNION ALL
+SELECT 'counts', 'lock_rows', count(*)::VARCHAR, NULL, NULL, NULL, NULL, 0::UBIGINT FROM lock_rows
+UNION ALL
+SELECT 'span_total',
+       coalesce(names.name, 'name_0x' || lower(hex(s.name_id))) AS key,
+       count(*)::VARCHAR AS n,
+       sum(s.dur)::VARCHAR AS total_ns,
+       quantile_disc(s.dur, 0.50)::VARCHAR AS p50_ns,
+       quantile_disc(s.dur, 0.99)::VARCHAR AS p99_ns,
+       max(s.dur)::VARCHAR AS max_ns,
+       sum(s.dur)::UBIGINT AS order_ns
+FROM spans s
+LEFT JOIN names ON names.id = s.name_id
+GROUP BY key
+ORDER BY section, order_ns DESC
+LIMIT {top + 4};
+"""
+    proc = subprocess.run(
+        [duckdb, "--no-stdin", "-csv", "-c", sql],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"duckdb parquet summary failed: {proc.stderr.strip() or proc.stdout.strip()}")
+
+    lines = [line for line in proc.stdout.splitlines() if line]
+    if not lines:
+        return "\nderived parquet summary: none"
+    rows = [line.split(",") for line in lines[1:]]
+    counts = {row[1]: int(row[2]) for row in rows if row[0] == "counts"}
+    out = [
+        "",
+        "derived parquet summary:",
+        (
+            f"spans={counts.get('spans', 0)} counters={counts.get('counters', 0)} "
+            f"allocation_rows={counts.get('allocation_rows', 0)} "
+            f"sched_intervals={counts.get('sched_intervals', 0)} "
+            f"lock_rows={counts.get('lock_rows', 0)}"
+        ),
+        "",
+        "by span total (parquet):",
+    ]
+    span_rows = [row for row in rows if row[0] == "span_total"][:top]
+    for _section, name, n, total_ns, p50_ns, p99_ns, max_ns, _order_ns in span_rows:
+        out.append(
+            f"{name[:40].ljust(40)} n={int(n):>6} "
+            f"total={fmt_ns(int(total_ns)):>11} "
+            f"p50={fmt_ns(int(p50_ns)):>10} "
+            f"p99={fmt_ns(int(p99_ns)):>10} "
+            f"max={fmt_ns(int(max_ns)):>10}"
+        )
+    return "\n".join(out)
+
+
+def run_python_file(
+    script: Path,
+    tables: DerivedTables,
+    input_path: Path,
+    names_path: Path | None,
+    parquet_dir: Path | None,
+) -> subprocess.CompletedProcess[str]:
+    if parquet_dir is not None:
+        table_dir = parquet_dir
+        export_derived_tables_parquet(tables, table_dir)
+        return run_python_file_with_table_dir(script, input_path, names_path, table_dir)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        table_dir = Path(tmpdir)
+        export_derived_tables_parquet(tables, table_dir)
+        return run_python_file_with_table_dir(script, input_path, names_path, table_dir)
+
+
+def run_python_file_with_table_dir(
+    script: Path,
+    input_path: Path,
+    names_path: Path | None,
+    table_dir: Path,
+) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env.update(
+        {
+            "TX_OBSERVE_TABLE_DIR": str(table_dir),
+            "TX_OBSERVE_SPANS_PARQUET": str(table_dir / "spans.parquet"),
+            "TX_OBSERVE_COUNTERS_PARQUET": str(table_dir / "counters.parquet"),
+            "TX_OBSERVE_ALLOCATION_ROWS_PARQUET": str(table_dir / "allocation_rows.parquet"),
+            "TX_OBSERVE_SCHED_INTERVALS_PARQUET": str(table_dir / "sched_intervals.parquet"),
+            "TX_OBSERVE_LOCK_ROWS_PARQUET": str(table_dir / "lock_rows.parquet"),
+            "TX_OBSERVE_INPUT": str(input_path),
+        }
+    )
+    if names_path is not None:
+        env["TX_OBSERVE_NAMES_JSON"] = str(names_path)
+    return subprocess.run([sys.executable, str(script)], capture_output=True, text=True, env=env)
+
+
+def load_or_build_derived_tables(
+    input_path: Path | None,
+    records: list[dict[str, Any]],
+    *,
+    cache_dir: Path | None = None,
+    dangling_span_policy: str = "exclude",
+) -> DerivedCacheResult:
+    if input_path is None or cache_dir is None:
+        return DerivedCacheResult(
+            build_derived_tables(records, dangling_span_policy=dangling_span_policy)
+        )
+
+    input_hash = file_sha256(input_path)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    path = derived_cache_path(cache_dir, input_hash, dangling_span_policy)
+    if path.exists():
+        try:
+            data = json.loads(path.read_text())
+            meta = data.get("meta") or {}
+            if (
+                meta.get("input_hash") == input_hash
+                and meta.get("decoder_version") == ANALYZER_DECODER_VERSION
+                and meta.get("dangling_span_policy") == dangling_span_policy
+            ):
+                return DerivedCacheResult(derived_tables_from_json(data), path=path, hit=True)
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    tables = build_derived_tables(records, dangling_span_policy=dangling_span_policy)
+    tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(derived_tables_to_json(tables, input_hash), separators=(",", ":")))
+    tmp.replace(path)
+    return DerivedCacheResult(tables, path=path, hit=False)
+
+
+def load_derived_tables_cache(
+    input_path: Path,
+    *,
+    cache_dir: Path,
+    dangling_span_policy: str,
+) -> DerivedCacheResult | None:
+    input_hash = file_sha256(input_path)
+    path = derived_cache_path(cache_dir, input_hash, dangling_span_policy)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    meta = data.get("meta") or {}
+    if (
+        meta.get("input_hash") != input_hash
+        or meta.get("decoder_version") != ANALYZER_DECODER_VERSION
+        or meta.get("dangling_span_policy") != dangling_span_policy
+    ):
+        return None
+    return DerivedCacheResult(derived_tables_from_json(data), path=path, hit=True)
+
+
+def input_arg_path(args: argparse.Namespace) -> Path:
+    if args.ndjson is not None:
+        return args.ndjson
+    if args.rawrecords is not None:
+        return args.rawrecords
+    return args.file
+
+
+def load_input_records(args: argparse.Namespace) -> list[dict[str, Any]]:
+    if args.ndjson is not None:
+        return load_records(args.ndjson, sort_records=not args.no_sort)
+    if args.rawrecords is not None:
+        return load_rawrecords(args.rawrecords, sort_records=not args.no_sort)
+    return load_txtrace_records(args.file, sort_records=not args.no_sort)
+
+
+def analyze(
+    records: list[dict[str, Any]],
+    names: dict[int, str],
+    top: int,
+    derived: DerivedTables | None = None,
+) -> str:
+    derived = derived or build_derived_tables(records)
+    spans = derived.spans
+    counters = derived.counters
+    span_by_id = {span["span"]: span for span in spans}
+    kinds = Counter(record.get("kind") for record in records)
+    trace_records = timeline_records(records)
 
     out: list[str] = []
-    if records:
+    if trace_records:
         out.append(
-            f"records={len(records)} window={fmt_ns(records[-1]['ts'] - records[0]['ts'])} "
-            f"kinds={dict(kinds)} unclosed_spans={len(begins)}"
+            f"records={len(records)} trace_records={len(trace_records)} "
+            f"window={fmt_ns(record_ts(trace_records[-1]) - record_ts(trace_records[0]))} "
+            f"kinds={dict(kinds)} unclosed_spans={derived.meta.get('dangling_span_count', 0)} "
+            f"dangling_policy={derived.meta.get('dangling_span_policy', 'exclude')} "
+            f"dangling_materialized={derived.meta.get('dangling_spans_materialized', 0)}"
         )
     else:
-        out.append("records=0")
+        out.append(
+            f"records={len(records)} trace_records=0 kinds={dict(kinds)} "
+            f"unclosed_spans={derived.meta.get('dangling_span_count', 0)} "
+            f"dangling_policy={derived.meta.get('dangling_span_policy', 'exclude')} "
+            f"dangling_materialized={derived.meta.get('dangling_spans_materialized', 0)}"
+        )
 
     grouped: dict[str, dict[str, Any]] = {}
     for span in spans:
-        key = f"{span.get('sysno')}:{span['name']}"
+        name = span_display_name(span, names)
+        key = f"{span.get('sysno')}:{name}"
         row = grouped.setdefault(
             key,
             {
-                "name": span["name"],
+                "name": name,
                 "sysno": span.get("sysno"),
                 "n": 0,
                 "sum": 0,
@@ -277,30 +1614,47 @@ def analyze(records: list[dict[str, Any]], names: dict[int, str], top: int) -> s
     out.append("")
     out.append("slowest spans:")
     for span in sorted(spans, key=lambda s: s["dur"], reverse=True)[:top]:
+        begin_hart = span.get("begin_hart")
+        end_hart = span.get("end_hart")
+        migration = (
+            ""
+            if begin_hart is None or end_hart is None
+            else f" harts={begin_hart}->{end_hart} net_migrated={str(begin_hart != end_hart).lower()}"
+        )
+        sched_harts = span.get("sched_harts")
+        if isinstance(sched_harts, list) and sched_harts:
+            migration += (
+                " sched_harts="
+                + "->".join(str(hart) for hart in sched_harts)
+                + f" sched_migrated={str(bool(span.get('sched_migrated'))).lower()}"
+            )
+        dangling = " dangling=true" if span.get("dangling") else ""
+        name = span_display_name(span, names)
         out.append(
-            f"{span['span']} {span.get('sysno')}:{span['name']} "
-            f"dur={fmt_ns(span['dur'])} ret={span.get('ret')} errno={span.get('errno')}"
+            f"{span['span']} {span.get('sysno')}:{name} "
+            f"dur={fmt_ns(span['dur'])}{migration}{dangling} ret={span.get('ret')} errno={span.get('errno')}"
         )
 
-    gaps = [
-        (int(records[i]["ts"]) - int(records[i - 1]["ts"]), records[i - 1], records[i])
-        for i in range(1, len(records))
-    ]
     out.append("")
     out.append("largest inter-record gaps:")
-    for delta, prev, cur in sorted(gaps, key=lambda g: g[0], reverse=True)[:top]:
+    prev_by_hart: dict[int | None, dict[str, Any]] = {}
+    gaps: list[tuple[int, int | None, dict[str, Any], dict[str, Any]]] = []
+    for record in trace_records:
+        hart = record_hart(record)
+        prev = prev_by_hart.get(hart)
+        if prev is not None:
+            gaps.append((record_ts(record) - record_ts(prev), hart, prev, record))
+        prev_by_hart[hart] = record
+    for delta, hart, prev, cur in heapq.nlargest(top, gaps, key=lambda g: g[0]):
+        hart_label = "?" if hart is None else str(hart)
         out.append(
-            f"dt={fmt_ns(delta)} {describe(prev, span_by_id, names)} -> "
+            f"hart={hart_label} dt={fmt_ns(delta)} {describe(prev, span_by_id, names)} -> "
             f"{describe(cur, span_by_id, names)}"
         )
 
     hist: dict[int, Counter[int]] = defaultdict(Counter)
-    for record in counters:
-        payload = record.get("payload") or {}
-        cid = payload.get("counter_id")
-        val = payload.get("value")
-        if isinstance(cid, int) and isinstance(val, int):
-            hist[cid][val] += 1
+    for row in counters:
+        hist[row["counter_id"]][row["value"]] += 1
     if hist:
         out.append("")
         out.append("counter histograms:")
@@ -325,13 +1679,13 @@ def roundtrip_points(
     points: list[tuple[int, str]] = []
     span_names: dict[str, str] = {}
     for record in records:
-        ts = int(record["ts"])
+        ts = record_ts(record)
         kind = record.get("kind")
         span_id = record.get("span")
         payload = record.get("payload") or {}
         if kind == "Counter":
             cid = payload.get("counter_id")
-            val = payload.get("value")
+            val = payload_u64(payload, "value")
             if isinstance(cid, int) and val == sysno:
                 name = names.get(cid, f"counter_0x{cid:x}")
                 if name.startswith("debug."):
@@ -453,13 +1807,13 @@ def analyze_clone_thread_phases(
             continue
         payload = record.get("payload") or {}
         cid = payload.get("counter_id")
-        tid = payload.get("value")
-        if not isinstance(cid, int) or not isinstance(tid, int):
+        tid = payload_u64(payload, "value")
+        if not isinstance(cid, int) or tid is None:
             continue
         name = names.get(cid, f"counter_0x{cid:x}")
         if name not in CLONE_THREAD_PHASES:
             continue
-        per_tid[tid][name] = int(record["ts"])
+        per_tid[tid][name] = record_ts(record)
 
     if not per_tid:
         return "\nclone_thread phases: none"
@@ -528,8 +1882,8 @@ def analyze_counter_phase_sequence(
             continue
         payload = record.get("payload") or {}
         cid = payload.get("counter_id")
-        value = payload.get("value")
-        if not isinstance(cid, int) or not isinstance(value, int):
+        value = payload_u64(payload, "value")
+        if not isinstance(cid, int) or value is None:
             continue
         name = names.get(cid, f"counter_0x{cid:x}")
         if name not in phases:
@@ -543,7 +1897,7 @@ def analyze_counter_phase_sequence(
             if current_key is None:
                 continue
             key = current_key
-        per_key[key][name] = int(record["ts"])
+        per_key[key][name] = record_ts(record)
 
     if not per_key:
         return f"\n{title} phases: none"
@@ -667,10 +2021,10 @@ def counter_rows(records: list[dict[str, Any]], names: dict[int, str]) -> list[t
             continue
         payload = record.get("payload") or {}
         cid = payload.get("counter_id")
-        value = payload.get("value")
-        if not isinstance(cid, int) or not isinstance(value, int):
+        value = payload_u64(payload, "value")
+        if not isinstance(cid, int) or value is None:
             continue
-        rows.append((int(record["ts"]), names.get(cid, f"counter_0x{cid:x}"), value))
+        rows.append((record_ts(record), names.get(cid, f"counter_0x{cid:x}"), value))
     return rows
 
 
@@ -691,12 +2045,12 @@ def analyze_futex_ops(records: list[dict[str, Any]], names: dict[int, str], top:
         elif kind == "Instant" and isinstance(parent, str) and parent in args:
             name_id = parse_u32_id(record.get("name_id"))
             if name_id in ARG_NAMES:
-                value = payload.get("value0")
-                if isinstance(value, int):
+                value = payload_u64(payload, "value0")
+                if value is not None:
                     args[parent][ARG_NAMES[name_id]] = value
         elif kind == "SpanBegin" and isinstance(parent, str):
             name = event_name(record, names)
-            task = payload.get("task_id_low")
+            task = payload_u64(payload, "task_id_low")
             if name == "drive.FutexWaitOp" and isinstance(task, int):
                 wait_tasks[parent] = task
         elif kind == "SpanEnd" and isinstance(span, str) and span in begins:
@@ -707,7 +2061,7 @@ def analyze_futex_ops(records: list[dict[str, Any]], names: dict[int, str], top:
             flags = op_raw & ~0x7F
             rows.append(
                 {
-                    "dur": int(record["ts"]) - int(begin["ts"]),
+                    "dur": record_ts(record) - record_ts(begin),
                     "span": span,
                     "op": FUTEX_OPS.get(base, f"op{base}"),
                     "op_raw": op_raw,
@@ -769,6 +2123,144 @@ def analyze_futex_ops(records: list[dict[str, Any]], names: dict[int, str], top:
     return "\n".join(out)
 
 
+def allocation_rows(
+    records: list[dict[str, Any]],
+    names: dict[int, str],
+    derived: DerivedTables | None = None,
+) -> list[tuple[int, str, str, int]]:
+    derived = derived or build_derived_tables(records)
+    rows: list[tuple[int, str, str, int]] = []
+    for row in derived.allocation_rows:
+        name_id = row.get("name_id")
+        if isinstance(name_id, int):
+            name = names.get(name_id, f"name_0x{name_id:x}")
+        else:
+            name = "unknown"
+        rows.append((int(row["ts"]), str(row["track"]), name, int(row["value"])))
+    return rows
+
+
+def analyze_allocation_tracks(
+    records: list[dict[str, Any]],
+    names: dict[int, str],
+    top: int,
+    derived: DerivedTables | None = None,
+) -> str:
+    rows = allocation_rows(records, names, derived)
+    if not rows:
+        return "\nallocation tracks: none"
+
+    grouped: dict[tuple[str, str], list[int]] = defaultdict(list)
+    for _ts, track, name, value in rows:
+        grouped[(track, name)].append(value)
+
+    out = ["", "allocation tracks:"]
+    for (track, name), values in sorted(
+        grouped.items(), key=lambda item: (sum(item[1]), len(item[1])), reverse=True
+    )[:top]:
+        total = sum(values)
+        avg = total / len(values)
+        if name.endswith(".duration_ns"):
+            out.append(
+                f"{track} {name} n={len(values):>6} total={fmt_ns(total):>11} "
+                f"avg={fmt_ns(avg):>10} p50={fmt_ns(percentile(values, 0.50)):>10} "
+                f"p95={fmt_ns(percentile(values, 0.95)):>10} "
+                f"p99={fmt_ns(percentile(values, 0.99)):>10} max={fmt_ns(max(values)):>10}"
+            )
+        else:
+            out.append(
+                f"{track} {name} n={len(values):>6} sum={total:>10} "
+                f"avg={avg:>8.1f} p50={percentile(values, 0.50):>6} "
+                f"p95={percentile(values, 0.95):>6} p99={percentile(values, 0.99):>6} "
+                f"max={max(values):>6}"
+            )
+
+    out.append("recent allocation markers:")
+    for ts, track, name, value in rows[-top:]:
+        out.append(f"  ts={ts} {track} {name} value={value}")
+    return "\n".join(out)
+
+
+def analyze_lock_metrics(
+    records: list[dict[str, Any]],
+    names: dict[int, str],
+    top: int,
+    derived: DerivedTables | None = None,
+) -> str:
+    derived = derived or build_derived_tables(records)
+    if not derived.lock_rows:
+        return "\nlock metrics: none"
+
+    metrics_by_lock: dict[int, dict[str, list[int]]] = defaultdict(lambda: defaultdict(list))
+    metric_names = {
+        fnv1a32("debug.lock.wait_ns"): "wait",
+        fnv1a32("debug.lock.service_ns"): "service",
+        fnv1a32("debug.lock.response_ns"): "response",
+        fnv1a32("debug.lock.spins"): "spins",
+        fnv1a32("debug.lock.contended"): "contended",
+    }
+    first_ts_by_lock: dict[int, int] = {}
+    last_ts_by_lock: dict[int, int] = {}
+    for row in derived.lock_rows:
+        lock_id = int(row["lock_id"])
+        metric_id = int(row["metric_id"])
+        metric_name = metric_names.get(metric_id, names.get(metric_id, f"metric_0x{metric_id:x}"))
+        metrics_by_lock[lock_id][metric_name].append(int(row["value"]))
+        ts = int(row["ts"])
+        first_ts_by_lock[lock_id] = min(first_ts_by_lock.get(lock_id, ts), ts)
+        last_ts_by_lock[lock_id] = max(last_ts_by_lock.get(lock_id, ts), ts)
+
+    def score(item: tuple[int, dict[str, list[int]]]) -> int:
+        _lock_id, metrics = item
+        values = metrics.get("response") or metrics.get("wait") or metrics.get("service") or []
+        return percentile(values, 0.99) if values else 0
+
+    out = ["", "lock metrics:"]
+    for lock_id, metrics in sorted(metrics_by_lock.items(), key=score, reverse=True)[:top]:
+        name = names.get(lock_id, f"lock_0x{lock_id:x}")
+        window = max(1, last_ts_by_lock[lock_id] - first_ts_by_lock[lock_id])
+        service = metrics.get("service", [])
+        waits = metrics.get("wait", [])
+        response = metrics.get("response", [])
+        service_sum = sum(service)
+        rho = min(0.999999, service_sum / window) if service else 0.0
+        predicted = ""
+        if service:
+            service_avg = service_sum / len(service)
+            predicted = f" rho={rho:.3f} Rq={fmt_ns(service_avg / max(1.0e-9, 1.0 - rho))}"
+        wait_summary = (
+            "wait n=0"
+            if not waits
+            else (
+                f"wait n={len(waits)} p50={fmt_ns(percentile(waits, 0.50))} "
+                f"p99={fmt_ns(percentile(waits, 0.99))} max={fmt_ns(max(waits))}"
+            )
+        )
+        service_summary = (
+            ""
+            if not service
+            else (
+                f" service p50={fmt_ns(percentile(service, 0.50))} "
+                f"p99={fmt_ns(percentile(service, 0.99))} max={fmt_ns(max(service))}"
+            )
+        )
+        response_summary = (
+            ""
+            if not response
+            else (
+                f" response p50={fmt_ns(percentile(response, 0.50))} "
+                f"p99={fmt_ns(percentile(response, 0.99))} max={fmt_ns(max(response))}"
+            )
+        )
+        spins = sum(metrics.get("spins", []))
+        contended = sum(metrics.get("contended", []))
+        out.append(
+            f"{name[:40].ljust(40)} {wait_summary}{service_summary}{response_summary} "
+            f"spins={spins} contended={contended}{predicted}"
+        )
+    return "\n".join(out)
+
+
 def analyze_sched_counters(records: list[dict[str, Any]], names: dict[int, str], top: int) -> str:
     events: list[tuple[int, str, int, int | None, int | None]] = []
     for record in records:
@@ -776,8 +2268,8 @@ def analyze_sched_counters(records: list[dict[str, Any]], names: dict[int, str],
             continue
         payload = record.get("payload") or {}
         cid = payload.get("counter_id")
-        value = payload.get("value")
-        if not isinstance(cid, int) or not isinstance(value, int):
+        value = payload_u64(payload, "value")
+        if not isinstance(cid, int) or value is None:
             continue
         name = names.get(cid, f"counter_0x{cid:x}")
         if not name.startswith("debug.sched."):
@@ -796,7 +2288,7 @@ def analyze_sched_counters(records: list[dict[str, Any]], names: dict[int, str],
             "debug.sched.stop.reason",
         }:
             task, code = decode_task_code(value)
-        events.append((int(record["ts"]), name, value, task, code))
+        events.append((record_ts(record), name, value, task, code))
 
     if not events:
         return "\nscheduler counters: none"
@@ -855,14 +2347,14 @@ def analyze_wake_hint_counters(records: list[dict[str, Any]], names: dict[int, s
             continue
         payload = record.get("payload") or {}
         cid = payload.get("counter_id")
-        value = payload.get("value")
-        if not isinstance(cid, int) or not isinstance(value, int):
+        value = payload_u64(payload, "value")
+        if not isinstance(cid, int) or value is None:
             continue
         name = names.get(cid, f"counter_0x{cid:x}")
         if name not in {"debug.wake.pending_hint", "debug.wake.drain_hint"}:
             continue
         task, code = decode_task_code(value)
-        rows.append((int(record["ts"]), name, task, code))
+        rows.append((record_ts(record), name, task, code))
 
     if not rows:
         return "\nwake hint counters: none"
@@ -1143,12 +2635,12 @@ def analyze_futex_table_counters(records: list[dict[str, Any]], names: dict[int,
             continue
         payload = record.get("payload") or {}
         cid = payload.get("counter_id")
-        value = payload.get("value")
-        if not isinstance(cid, int) or not isinstance(value, int):
+        value = payload_u64(payload, "value")
+        if not isinstance(cid, int) or value is None:
             continue
         name = names.get(cid, f"counter_0x{cid:x}")
         if name.startswith(interesting):
-            rows.append((int(record["ts"]), name, value))
+            rows.append((record_ts(record), name, value))
 
     if not rows:
         return "\nfutex table snapshots: none"
@@ -1178,15 +2670,15 @@ def analyze_wait_source_notify(records: list[dict[str, Any]], names: dict[int, s
         if record.get("kind") != "Instant":
             continue
         payload = record.get("payload") or {}
-        source = payload.get("source_id_low")
-        mask = payload.get("mask_bits")
-        task = payload.get("task_id_low")
-        generation = payload.get("wait_generation_low")
-        if not all(isinstance(v, int) for v in [source, mask, task, generation]):
+        source = payload_u64(payload, "source_id_low")
+        mask = payload_u64(payload, "mask_bits")
+        task = payload_u64(payload, "task_id_low")
+        generation = payload_u64(payload, "wait_generation_low")
+        if not all(v is not None for v in [source, mask, task, generation]):
             continue
         name_id = parse_u32_id(record.get("name_id"))
         name = names.get(name_id, f"name_0x{name_id:x}") if name_id is not None else "unknown"
-        rows.append((int(record["ts"]), source, mask, task, generation, name))
+        rows.append((record_ts(record), source, mask, task, generation, name))
 
     if not rows:
         return "\nwait-source notify list: none"
@@ -1223,8 +2715,8 @@ def analyze_futex_source_correlation(records: list[dict[str, Any]], names: dict[
         payload = record.get("payload") or {}
         if record.get("kind") == "Counter":
             cid = payload.get("counter_id")
-            value = payload.get("value")
-            if not isinstance(cid, int) or not isinstance(value, int):
+            value = payload_u64(payload, "value")
+            if not isinstance(cid, int) or value is None:
                 continue
             name = names.get(cid, f"counter_0x{cid:x}")
             prefix = next((p for p in table_prefixes if name.startswith(p)), None)
@@ -1233,7 +2725,7 @@ def analyze_futex_source_correlation(records: list[dict[str, Any]], names: dict[
             phase = prefix.removeprefix("debug.futex.").removesuffix(".")
             slot = pending[prefix]
             slot["phase"] = phase
-            slot["ts"] = int(record["ts"])
+            slot["ts"] = record_ts(record)
             if name.endswith(".sample.uaddr"):
                 slot["uaddr"] = value
             elif name.endswith(".sample.waiters"):
@@ -1248,12 +2740,12 @@ def analyze_futex_source_correlation(records: list[dict[str, Any]], names: dict[
                     snapshots.append(dict(slot))
                     pending[prefix] = {}
         elif record.get("kind") == "Instant":
-            source = payload.get("source_id_low")
-            mask = payload.get("mask_bits")
-            task = payload.get("task_id_low")
-            generation = payload.get("wait_generation_low")
-            if all(isinstance(v, int) for v in [source, mask, task, generation]):
-                notify.append((int(record["ts"]), source, mask, task, generation))
+            source = payload_u64(payload, "source_id_low")
+            mask = payload_u64(payload, "mask_bits")
+            task = payload_u64(payload, "task_id_low")
+            generation = payload_u64(payload, "wait_generation_low")
+            if all(v is not None for v in [source, mask, task, generation]):
+                notify.append((record_ts(record), source, mask, task, generation))
 
     if not snapshots and not notify:
         return "\nfutex source correlation: none"
@@ -1317,14 +2809,14 @@ def analyze_futex_wake_latency(records: list[dict[str, Any]], names: dict[int, s
     stop_timeline: list[tuple[int, int, int]] = []
 
     for record in records:
-        ts = int(record["ts"])
+        ts = record_ts(record)
         payload = record.get("payload") or {}
         if record.get("kind") == "Instant":
-            source = payload.get("source_id_low")
-            task = payload.get("task_id_low")
-            generation = payload.get("wait_generation_low")
-            mask = payload.get("mask_bits")
-            if all(isinstance(v, int) for v in [source, task, generation, mask]):
+            source = payload_u64(payload, "source_id_low")
+            task = payload_u64(payload, "task_id_low")
+            generation = payload_u64(payload, "wait_generation_low")
+            mask = payload_u64(payload, "mask_bits")
+            if all(v is not None for v in [source, task, generation, mask]):
                 notifications.append(
                     {
                         "ts": ts,
@@ -1338,8 +2830,8 @@ def analyze_futex_wake_latency(records: list[dict[str, Any]], names: dict[int, s
         if record.get("kind") != "Counter":
             continue
         cid = payload.get("counter_id")
-        value = payload.get("value")
-        if not isinstance(cid, int) or not isinstance(value, int):
+        value = payload_u64(payload, "value")
+        if not isinstance(cid, int) or value is None:
             continue
         name = names.get(cid, f"counter_0x{cid:x}")
         task, code = decode_task_code(value)
@@ -1502,12 +2994,61 @@ def analyze_futex_wake_latency(records: list[dict[str, Any]], names: dict[int, s
     return "\n".join(out)
 
 
-def main() -> int:
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--ndjson", required=True, type=Path)
+    inputs = parser.add_mutually_exclusive_group(required=True)
+    inputs.add_argument("--ndjson", type=Path)
+    inputs.add_argument("--file", type=Path, help="Read a txtrace-v0 binary trace directly")
+    inputs.add_argument("--rawrecords", type=Path, help="Read a live-drain trace.rawrecords file directly")
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument("--sql", help="Run an inline DuckDB SQL query over analyzer views")
+    actions.add_argument("--sql-file", type=Path, help="Run a DuckDB SQL query file over analyzer views")
+    actions.add_argument("--python-file", type=Path, help="Run a Python script with derived Parquet table env vars")
     parser.add_argument("--names", type=Path)
     parser.add_argument("--top", type=int, default=20)
     parser.add_argument("--roundtrip-sysno", type=int, default=173)
+    parser.add_argument(
+        "--sql-format",
+        choices=("table", "csv", "json"),
+        default="table",
+        help="Output format for --sql or --sql-file.",
+    )
+    parser.add_argument(
+        "--dangling-spans",
+        choices=("exclude", "synthetic-end"),
+        default="exclude",
+        help=(
+            "Policy for SpanBegin records without a matching SpanEnd. The "
+            "default excludes them from duration rankings; synthetic-end "
+            "materializes them at the last retained record timestamp."
+        ),
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        help=(
+            "Directory for derived span/counter/allocation tables. Cache keys "
+            "include sha256(input) and the analyzer decoder version."
+        ),
+    )
+    parser.add_argument(
+        "--parquet-dir",
+        type=Path,
+        help=(
+            "Optional directory for exported derived-table Parquet files "
+            "(spans.parquet, counters.parquet, allocation_rows.parquet, "
+            "sched_intervals.parquet, lock_rows.parquet)."
+        ),
+    )
+    parser.add_argument(
+        "--no-sort",
+        action="store_true",
+        help=(
+            "Keep replay order instead of sorting by timestamp. This is useful "
+            "for very large live-drain traces where approximate wall-level "
+            "attribution is more important than exact cross-hart ordering."
+        ),
+    )
     parser.add_argument(
         "--source-root",
         type=Path,
@@ -1517,12 +3058,89 @@ def main() -> int:
             "names. Pass /dev/null to disable source scanning."
         ),
     )
+    return parser
+
+
+def main() -> int:
+    parser = build_arg_parser()
     args = parser.parse_args()
 
-    records = load_records(args.ndjson)
+    input_path = input_arg_path(args)
     source_root = None if str(args.source_root) == "/dev/null" else args.source_root
     names = load_names(args.names, source_root)
-    print(analyze(records, names, args.top))
+    if (
+        args.parquet_dir is not None
+        and args.sql is None
+        and args.sql_file is None
+        and args.python_file is None
+        and args.cache_dir is not None
+    ):
+        input_hash = file_sha256(input_path)
+        if parquet_manifest_matches(
+            args.parquet_dir,
+            input_hash=input_hash,
+            dangling_span_policy=args.dangling_spans,
+        ):
+            print(f"parquet cache: hit {parquet_manifest_path(args.parquet_dir)}")
+            print(analyze_parquet_summary(args.parquet_dir, names, args.top))
+            return 0
+        cached = load_derived_tables_cache(
+            input_path,
+            cache_dir=args.cache_dir,
+            dangling_span_policy=args.dangling_spans,
+        )
+        if cached is not None:
+            print(f"derived cache: hit {cached.path}")
+            written = export_derived_tables_parquet(
+                cached.tables,
+                args.parquet_dir,
+                input_hash=input_hash,
+                dangling_span_policy=args.dangling_spans,
+            )
+            print("parquet export: " + " ".join(str(path) for path in written))
+            print(analyze_parquet_summary(args.parquet_dir, names, args.top))
+            return 0
+
+    records = load_input_records(args)
+    derived_result = load_or_build_derived_tables(
+        input_path,
+        records,
+        cache_dir=args.cache_dir,
+        dangling_span_policy=args.dangling_spans,
+    )
+    if derived_result.path is not None:
+        state = "hit" if derived_result.hit else "miss"
+        print(f"derived cache: {state} {derived_result.path}")
+    if args.sql is not None or args.sql_file is not None:
+        query = args.sql if args.sql is not None else args.sql_file.read_text()
+        print(run_sql_query(records, derived_result.tables, names, query, args.sql_format), end="")
+        return 0
+    if args.python_file is not None:
+        proc = run_python_file(
+            args.python_file,
+            derived_result.tables,
+            input_path,
+            args.names,
+            args.parquet_dir,
+        )
+        if proc.stdout:
+            print(proc.stdout, end="")
+        if proc.stderr:
+            print(proc.stderr, end="", file=sys.stderr)
+        return proc.returncode
+    if args.parquet_dir is not None:
+        written = export_derived_tables_parquet(
+            derived_result.tables,
+            args.parquet_dir,
+            input_hash=file_sha256(input_path),
+            dangling_span_policy=args.dangling_spans,
+        )
+        print("parquet export: " + " ".join(str(path) for path in written))
+        print(analyze_parquet_summary(args.parquet_dir, names, args.top))
+        return 0
+    print(analyze(records, names, args.top, derived_result.tables))
+    print(analyze_allocation_tracks(records, names, args.top, derived_result.tables))
+    print(analyze_lock_metrics(records, names, args.top, derived_result.tables))
     print(analyze_futex_ops(records, names, args.top))
     print(analyze_futex_table_counters(records, names, args.top))
     print(analyze_wait_source_notify(records, names, args.top))

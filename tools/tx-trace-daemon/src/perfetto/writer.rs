@@ -25,10 +25,12 @@ use crate::perfetto::span::{SpanEntry, SpanTable};
 use crate::perfetto::track::TrackRegistry;
 
 use tx_observe_types::payload::{
-    ALLOC_TRACK_PAGE_FRAME, ALLOC_TRACK_PAGE_RUN, ALLOC_TRACK_PAGEBACKED_CACHE,
-    ALLOC_TRACK_PAGEBACKED_CONTAINER, ALLOC_TRACK_VM_ADDRESS_SPACE, ALLOC_TRACK_VM_PRIVATE_PAGE_NODE,
-    ALLOC_TRACK_VM_RECIPE_NODE, ALLOC_TRACK_ZONE_SLAB, EXPLICIT_TRACK_ID_MASK,
-    EXPLICIT_TRACK_ID_PREFIX,
+    ALLOC_TRACK_LOCK, ALLOC_TRACK_PAGE_FRAME, ALLOC_TRACK_PAGE_RUN, ALLOC_TRACK_PAGEBACKED_CACHE,
+    ALLOC_TRACK_PAGEBACKED_CONTAINER, ALLOC_TRACK_PID_NAMESPACE, ALLOC_TRACK_PROCESS_IDENTITY,
+    ALLOC_TRACK_PROCESS_PAYLOAD, ALLOC_TRACK_PROCESS_THREADS, ALLOC_TRACK_THREAD_IDENTITY,
+    ALLOC_TRACK_THREAD_PAYLOAD, ALLOC_TRACK_VM_ADDRESS_SPACE,
+    ALLOC_TRACK_VM_PRIVATE_PAGE_NODE, ALLOC_TRACK_VM_RECIPE_NODE, ALLOC_TRACK_ZONE_SLAB,
+    EXPLICIT_TRACK_ID_MASK, EXPLICIT_TRACK_ID_PREFIX,
 };
 use tx_observe_types::{TxPayloadTag, TxTraceKind};
 
@@ -978,6 +980,13 @@ fn explicit_track_descriptor(track_id: u64) -> Option<(&'static str, u8)> {
         ALLOC_TRACK_PAGEBACKED_CACHE => "debug.alloc.pagebacked.cache",
         ALLOC_TRACK_VM_ADDRESS_SPACE => "debug.alloc.vm.address_space",
         ALLOC_TRACK_PAGEBACKED_CONTAINER => "debug.alloc.pagebacked.container",
+        ALLOC_TRACK_THREAD_PAYLOAD => "debug.alloc.thread.payload",
+        ALLOC_TRACK_THREAD_IDENTITY => "debug.alloc.thread.identity",
+        ALLOC_TRACK_PROCESS_PAYLOAD => "debug.alloc.process.payload",
+        ALLOC_TRACK_PROCESS_IDENTITY => "debug.alloc.process.identity",
+        ALLOC_TRACK_PROCESS_THREADS => "debug.alloc.process.threads",
+        ALLOC_TRACK_PID_NAMESPACE => "debug.alloc.pidns",
+        ALLOC_TRACK_LOCK => "debug.lock",
         _ => return None,
     };
     // Scope-shaped generic track.
