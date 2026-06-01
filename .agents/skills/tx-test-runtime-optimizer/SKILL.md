@@ -22,6 +22,9 @@ Use this skill when test runtime itself is part of the problem. Pair it with
 - Optimize general behavior: cache repeated immutable work, reduce repeated
   helper/procfs/sysfs probes, fix measured linear scans, or improve process/fd
   paths when evidence points there.
+- For long timeout investigations, maintain an ordered operation ledger before
+  running more experiments. Put scratch ledgers under `msp/debug-logs/` unless
+  the user asks for a tracked artifact.
 - Commit or otherwise isolate useful evidence-backed changes before starting a
   broader experiment. Stage explicit paths only; do not include local `msp/`
   debug notes unless the user asks.
@@ -40,8 +43,38 @@ Before running or editing anything in an existing timeout investigation:
    - last accepted bottleneck
    - hypotheses already rejected
    - next measurement that can change the decision
-4. If the next action would revisit a rejected hypothesis, stop and explain what
+4. Open or create the operation ledger for this investigation. It must list
+   accepted evidence, rejected hypotheses, committed changes, reverted
+   experiments, and the one next action that can change the decision.
+5. If the next action would revisit a rejected hypothesis, stop and explain what
    new evidence would justify reopening it.
+
+## Operation Ledger Protocol
+
+Use this protocol when the work spans multiple turns, multiple logs, or more
+than one experiment:
+
+- Start a dated ledger at
+  `msp/debug-logs/YYYY-MM-DD-<case>-operation-ledger.md`.
+- Record each significant action as one numbered row:
+  `time/order`, `action`, `files/logs`, `result`, `decision`, `next`.
+- Mark each experiment as `keep`, `revert`, `reject`, or `needs one more
+  measurement` before starting another experiment in the same area.
+- Preserve same-metric comparisons: phase, timeout, trace mode, loop count,
+  command totals, and syscall/fault counters.
+- Before re-running a command or rebuilding a rejected path, read the ledger and
+  state which previous row is being advanced or reopened.
+- Do not commit the `msp/` ledger. If a stable conclusion matters to the repo,
+  summarize it separately in `docs/progress/STATUS.md` or a tracked progress
+  note.
+
+Minimal row shape:
+
+```md
+| # | Action | Evidence | Result | Decision | Next |
+| - | ------ | -------- | ------ | -------- | ---- |
+| 1 | Ran focused witness | `target/oscomp/foo.txt` | timed out after marker | reject current hypothesis | trace post-stress |
+```
 
 ## Stop Rules
 
