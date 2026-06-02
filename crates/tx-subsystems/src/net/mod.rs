@@ -20,7 +20,10 @@ pub mod protocol;
 pub mod rtnetlink;
 pub mod structure;
 
-pub use admin::{require_net_admin, require_net_raw, NetAdminAuthority, NetRawAuthority};
+pub use admin::{
+    require_net_admin, require_net_admin_in_user_namespace, require_net_raw,
+    require_net_raw_in_user_namespace, NetAdminAuthority, NetRawAuthority,
+};
 pub use device::{
     create_bridge_for_test_or_bootstrap, create_veth_pair_for_test_or_bootstrap,
     net_device_by_devt, net_device_by_name, net_device_snapshot, register_net_devices,
@@ -61,13 +64,14 @@ pub use facade::{
     SocketShutdownOps,
 };
 pub use namespace::{
-    create_isolated_net_namespace, drive_all_net_namespace_runtimes_at,
-    drive_net_namespace_runtime_at, initial_loopback_iface, initial_net_namespace,
-    initial_net_namespace_payload, net_namespace_open_file_from_payload,
-    net_namespace_payload_from_file, NetNamespaceBridgeInfo, NetNamespaceForwardOutcome,
-    NetNamespaceIdentity, NetNamespaceLinkInfo, NetNamespacePayload, NetNamespaceRouteConfig,
-    NetNamespaceRouteDecision, NetNamespaceRouteInfo, NetNamespaceRouteKind,
-    NetNamespaceRouteSelector, NetNamespaceRuntimeOutcome, NetNamespaceSnapshot,
+    create_isolated_net_namespace, create_isolated_net_namespace_with_owner,
+    drive_all_net_namespace_runtimes_at, drive_net_namespace_runtime_at, initial_loopback_iface,
+    initial_net_namespace, initial_net_namespace_payload, initial_net_namespace_payload_with_owner,
+    net_namespace_open_file_from_payload, net_namespace_payload_from_file, NetNamespaceBridgeInfo,
+    NetNamespaceForwardOutcome, NetNamespaceIdentity, NetNamespaceLinkInfo, NetNamespacePayload,
+    NetNamespaceRouteConfig, NetNamespaceRouteDecision, NetNamespaceRouteInfo,
+    NetNamespaceRouteKind, NetNamespaceRouteSelector, NetNamespaceRuntimeOutcome,
+    NetNamespaceSnapshot,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use namespace::{create_isolated_net_namespace_for_test, reset_initial_net_namespace_for_test};
@@ -124,15 +128,15 @@ pub use rtnetlink::{
     RTM_SETLINK,
 };
 pub use structure::{
-    AcceptWireSet, AddressFamily, ConnectionKey, InitialSocketTableProxy, IpEndpoint,
-    IpLevelOptions, Ipv4Address, Ipv4MulticastGroup, KernelSockAddr, LingerOption, ListenerKey,
-    LocalEndpointKey, PacketSocketState, PollMask, ProtocolNumber, RawIcmpSocketKey, RawIcmpState,
-    RecvWireSet, SendRecvFlags, SendWireSet, SockAddrIn, SockAddrLl, SockFlags, SockShutdownCmd,
-    SocketIdentity, SocketIoState, SocketKind, SocketLevelOptions, SocketOperationalEvidence,
-    SocketOptionSet, SocketPayload, SocketProtocol, SocketReadiness, SocketRecvBytesOutcome,
-    SocketTable, SocketType, SocketWaitCarriers, Takeable, TcpLevelOptions, TcpState, UdpInner,
-    UnixDatagramState, UnixPeerCred, UnixSocketPath, UnixStreamState, UrgentEvent, ValidSocketType,
-    UNIX_SOCKET_PATH_MAX,
+    AcceptWireSet, AddressFamily, ConnectionKey, InitialSocketTableProxy, IpAddress, IpEndpoint,
+    IpLevelOptions, Ipv4Address, Ipv4MulticastGroup, Ipv6Address, KernelSockAddr, LingerOption,
+    ListenerKey, LocalEndpointKey, PacketSocketState, PollMask, ProtocolNumber, RawIcmpSocketKey,
+    RawIcmpState, RdsState, RecvWireSet, SendRecvFlags, SendWireSet, SockAddrIn, SockAddrIn6,
+    SockAddrLl, SockFlags, SockShutdownCmd, SocketIdentity, SocketIoState, SocketKind,
+    SocketLevelOptions, SocketOperationalEvidence, SocketOptionSet, SocketPayload, SocketProtocol,
+    SocketReadiness, SocketRecvBytesOutcome, SocketTable, SocketType, SocketWaitCarriers, Takeable,
+    TcpLevelOptions, TcpState, TcpTlsUlpState, UdpInner, UnixDatagramState, UnixPeerCred,
+    UnixSocketPath, UnixStreamState, UrgentEvent, ValidSocketType, UNIX_SOCKET_PATH_MAX,
 };
 
 pub(crate) fn register_zones() -> Result<(), tx_substrate::zone::ZoneError> {

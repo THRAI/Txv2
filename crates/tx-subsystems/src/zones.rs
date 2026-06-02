@@ -2,9 +2,9 @@ use crate::adapter::step_engine::{epoch, page_allocator, zone, Zone, ZoneAllocat
 use tx_hal::{console_write_str, TxPlatform};
 
 use crate::{
-    mount::{MountIdentity, MountNamespace, MountPayload},
+    mount::{MountApiFile, MountIdentity, MountNamespace, MountPayload},
     page_backed::PageContainer,
-    vfs::{DEntry, OpenFile, RNode},
+    vfs::{DEntry, FsNotifyInstance, OpenFile, RNode},
     vm::AddressSpace,
 };
 
@@ -362,6 +362,7 @@ mod mount {
         zone::register_zone_for::<MountIdentity>()?;
         zone::register_zone_for::<MountPayload>()?;
         zone::register_zone_for::<MountNamespace>()?;
+        zone::register_zone_for::<MountApiFile>()?;
         Ok(())
     }
 }
@@ -381,6 +382,7 @@ mod vfs {
         zone::register_zone_for::<DEntry>()?;
         zone::register_zone_for::<RNode>()?;
         zone::register_zone_for::<OpenFile>()?;
+        zone::register_zone_for::<FsNotifyInstance>()?;
         Ok(())
     }
 }

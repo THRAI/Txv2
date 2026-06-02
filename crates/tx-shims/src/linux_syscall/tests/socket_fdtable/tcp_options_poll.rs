@@ -1,5 +1,11 @@
 use super::*;
 
+#[repr(C)]
+struct TestTlsCryptoInfo {
+    version: u16,
+    cipher_type: u16,
+}
+
 fn dispatch_bind_listen_getsockname_round_trips_inet_addr() {
     let _setup = socket_setup();
     let (_process, ctx) = socket_ctx();
@@ -47,6 +53,136 @@ fn dispatch_bind_listen_getsockname_round_trips_inet_addr() {
     assert_eq!(u16::from_le_bytes([out[0], out[1]]), AF_INET);
     assert_eq!(u16::from_be_bytes([out[2], out[3]]), 49_101);
     assert_eq!(&out[4..8], &[127, 0, 0, 1]);
+}
+
+#[test]
+fn dispatch_tls_ulp_disconnect_rebind_listen_returns_einval() {
+    let _setup = socket_setup();
+    loopback_iface().clear_for_test_or_bootstrap();
+    let (_process, ctx) = socket_ctx();
+    let listener_fd = socket_stream(&ctx, SOCK_STREAM);
+    let listener_addr = sockaddr_in([127, 0, 0, 1], 49_118);
+
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                listener_fd as u64,
+                listener_addr.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        socket_req(NR_LISTEN, [listener_fd as u64, 1, 0, 0, 0, 0], &ctx),
+        SyscallResult::Return(0)
+    );
+
+    let client_fd = socket_stream(&ctx, SOCK_STREAM);
+    assert_eq!(
+        socket_req(
+            NR_CONNECT,
+            [
+                client_fd as u64,
+                listener_addr.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    let accepted_fd = match socket_req(NR_ACCEPT, [listener_fd as u64, 0, 0, 0, 0, 0], &ctx) {
+        SyscallResult::Return(fd) => fd,
+        other => panic!("accept failed: {other:?}"),
+    };
+
+    let ulp_name = *b"tls";
+    assert_eq!(
+        socket_req(
+            NR_SETSOCKOPT,
+            [
+                client_fd as u64,
+                IPPROTO_TCP as u64,
+                TCP_ULP as u64,
+                ulp_name.as_ptr() as u64,
+                ulp_name.len() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    let tls = TestTlsCryptoInfo {
+        version: 0x0303,
+        cipher_type: 51,
+    };
+    assert_eq!(
+        socket_req(
+            NR_SETSOCKOPT,
+            [
+                client_fd as u64,
+                SOL_TLS as u64,
+                TLS_TX as u64,
+                (&tls as *const TestTlsCryptoInfo) as u64,
+                core::mem::size_of::<TestTlsCryptoInfo>() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let unspec_addr = [0u8; SOCKADDR_IN_BYTES as usize];
+    assert_eq!(
+        socket_req(
+            NR_CONNECT,
+            [
+                client_fd as u64,
+                unspec_addr.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    let rebind_addr = sockaddr_in([127, 0, 0, 1], 49_119);
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                client_fd as u64,
+                rebind_addr.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        socket_req(NR_LISTEN, [client_fd as u64, 1, 0, 0, 0, 0], &ctx),
+        SyscallResult::Error(errno_to_i32(Errno::EINVAL))
+    );
+
+    for fd in [accepted_fd, client_fd, listener_fd] {
+        assert_eq!(
+            socket_req(NR_CLOSE, [fd as u64, 0, 0, 0, 0, 0], &ctx),
+            SyscallResult::Return(0)
+        );
+    }
 }
 
 #[test]
@@ -265,6 +401,175 @@ fn dispatch_tcp_connects_to_loopback_ephemeral_listener() {
         ),
         SyscallResult::Return(0)
     );
+}
+
+#[test]
+fn dispatch_ipv6_addrform_reset_rebinds_accepted_tcp_as_ipv4_listener() {
+    let _setup = socket_setup();
+    loopback_iface().clear_for_test_or_bootstrap();
+    let (_process, ctx) = socket_ctx();
+    let listener_fd = socket_stream6(&ctx, SOCK_STREAM);
+    let any6 = [0u8; 16];
+    let listener_addr = sockaddr_in6(any6, 49_152);
+
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                listener_fd as u64,
+                listener_addr.as_ptr() as u64,
+                SOCKADDR_IN6_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        socket_req(NR_LISTEN, [listener_fd as u64, 8, 0, 0, 0, 0], &ctx),
+        SyscallResult::Return(0)
+    );
+
+    let listener_v4_addr = sockaddr_in([127, 0, 0, 1], 49_152);
+
+    for _ in 0..4 {
+        let client_fd = socket_stream(&ctx, SOCK_STREAM);
+        assert_eq!(
+            socket_req(
+                NR_CONNECT,
+                [
+                    client_fd as u64,
+                    listener_v4_addr.as_ptr() as u64,
+                    SOCKADDR_IN_BYTES as u64,
+                    0,
+                    0,
+                    0,
+                ],
+                &ctx,
+            ),
+            SyscallResult::Return(0)
+        );
+
+        let accepted_fd = match socket_req(NR_ACCEPT, [listener_fd as u64, 0, 0, 0, 0, 0], &ctx) {
+            SyscallResult::Return(fd) => fd as u32,
+            other => panic!("accept failed: {other:?}"),
+        };
+        let optval = AF_INET as i32;
+        assert_eq!(
+            socket_req(
+                NR_SETSOCKOPT,
+                [
+                    accepted_fd as u64,
+                    SOL_IPV6 as u64,
+                    IPV6_ADDRFORM as u64,
+                    (&optval as *const i32) as u64,
+                    core::mem::size_of::<i32>() as u64,
+                    0,
+                ],
+                &ctx,
+            ),
+            SyscallResult::Return(0)
+        );
+
+        let reset_addr = [0u8; SOCKADDR_IN_BYTES as usize];
+        assert_eq!(
+            socket_req(
+                NR_CONNECT,
+                [
+                    accepted_fd as u64,
+                    reset_addr.as_ptr() as u64,
+                    SOCKADDR_IN_BYTES as u64,
+                    0,
+                    0,
+                    0,
+                ],
+                &ctx,
+            ),
+            SyscallResult::Return(0)
+        );
+
+        let rebind_addr = sockaddr_in([0, 0, 0, 0], 0);
+        assert_eq!(
+            socket_req(
+                NR_BIND,
+                [
+                    accepted_fd as u64,
+                    rebind_addr.as_ptr() as u64,
+                    SOCKADDR_IN_BYTES as u64,
+                    0,
+                    0,
+                    0,
+                ],
+                &ctx,
+            ),
+            SyscallResult::Return(0)
+        );
+        assert_eq!(
+            socket_req(NR_LISTEN, [accepted_fd as u64, 8, 0, 0, 0, 0], &ctx),
+            SyscallResult::Return(0)
+        );
+
+        let mut rebound_name = [0u8; SOCKADDR_IN_BYTES as usize];
+        let mut rebound_name_len = SOCKADDR_IN_BYTES;
+        assert_eq!(
+            socket_req(
+                NR_GETSOCKNAME,
+                [
+                    accepted_fd as u64,
+                    rebound_name.as_mut_ptr() as u64,
+                    (&mut rebound_name_len as *mut u32) as u64,
+                    0,
+                    0,
+                    0,
+                ],
+                &ctx,
+            ),
+            SyscallResult::Return(0)
+        );
+        assert_eq!(
+            u16::from_le_bytes([rebound_name[0], rebound_name[1]]),
+            AF_INET
+        );
+        let rebound_port = u16::from_be_bytes([rebound_name[2], rebound_name[3]]);
+        assert_ne!(rebound_port, 0);
+
+        let second_client_fd = socket_stream(&ctx, SOCK_STREAM);
+        let rebound_connect_addr = sockaddr_in([127, 0, 0, 1], rebound_port);
+        assert_eq!(
+            socket_req(
+                NR_CONNECT,
+                [
+                    second_client_fd as u64,
+                    rebound_connect_addr.as_ptr() as u64,
+                    SOCKADDR_IN_BYTES as u64,
+                    0,
+                    0,
+                    0,
+                ],
+                &ctx,
+            ),
+            SyscallResult::Return(0)
+        );
+        let second_accepted_fd =
+            match socket_req(NR_ACCEPT, [accepted_fd as u64, 0, 0, 0, 0, 0], &ctx) {
+                SyscallResult::Return(fd) => fd as u32,
+                other => panic!("second accept failed: {other:?}"),
+            };
+
+        for fd in [
+            second_accepted_fd,
+            second_client_fd as u32,
+            client_fd as u32,
+            accepted_fd,
+        ] {
+            assert_eq!(
+                socket_req(NR_CLOSE, [fd as u64, 0, 0, 0, 0, 0], &ctx),
+                SyscallResult::Return(0)
+            );
+        }
+    }
 }
 
 #[test]
@@ -871,6 +1176,49 @@ fn dispatch_udp_default_send_buffer_can_hold_loopback_datagram() {
 }
 
 #[test]
+fn dispatch_so_sndbufforce_clamps_large_unsigned_value() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_dgram(&ctx, SOCK_DGRAM);
+    let sndbuf = 0xffffff00u32;
+
+    assert_eq!(
+        socket_req(
+            NR_SETSOCKOPT,
+            [
+                fd as u64,
+                SOL_SOCKET as u64,
+                SO_SNDBUFFORCE as u64,
+                (&sndbuf as *const u32) as u64,
+                core::mem::size_of::<u32>() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let mut rec_sndbuf: i32 = 0;
+    let mut optlen = core::mem::size_of::<i32>() as u32;
+    assert_eq!(
+        socket_req(
+            NR_GETSOCKOPT,
+            [
+                fd as u64,
+                SOL_SOCKET as u64,
+                SO_SNDBUF as u64,
+                (&mut rec_sndbuf as *mut i32) as u64,
+                (&mut optlen as *mut u32) as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert!(rec_sndbuf >= 0);
+}
+
+#[test]
 fn dispatch_setsockopt_getsockopt_round_trips_reuseaddr() {
     let _setup = socket_setup();
     let (_process, ctx) = socket_ctx();
@@ -1103,7 +1451,24 @@ fn dispatch_iptables_legacy_sockopt_reports_empty_tables() {
             ],
             &ctx,
         ),
-        SyscallResult::Error(95)
+        SyscallResult::Error(errno_to_i32(Errno::EINVAL))
+    );
+
+    let replace = [0u8; 96];
+    assert_eq!(
+        socket_req(
+            NR_SETSOCKOPT,
+            [
+                fd as u64,
+                IPPROTO_IP as u64,
+                IPT_SO_SET_REPLACE as u64,
+                replace.as_ptr() as u64,
+                replace.len() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Error(errno_to_i32(Errno::EOPNOTSUPP))
     );
 }
 
@@ -1308,6 +1673,50 @@ fn dispatch_pselect_udp_write_ready_with_readfds_pointer() {
         SyscallResult::Return(1)
     );
     assert_eq!(readfds, 0);
+    assert_eq!(writefds, 1u64 << fd);
+}
+
+#[test]
+fn dispatch_pselect_time64_udp_write_ready_uses_pselect6_path() {
+    let _setup = socket_setup();
+    loopback_iface().clear_for_test_or_bootstrap();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_dgram(&ctx, SOCK_DGRAM);
+    let remote = sockaddr_in([127, 0, 0, 1], 49_161);
+
+    assert_eq!(
+        socket_req(
+            NR_CONNECT,
+            [
+                fd as u64,
+                remote.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let mut writefds = 1u64 << fd;
+    let mut timeout = [0u64, 0u64];
+    assert_eq!(
+        socket_req(
+            NR_PSELECT6_TIME64,
+            [
+                fd as u64 + 1,
+                0,
+                &mut writefds as *mut u64 as u64,
+                0,
+                timeout.as_mut_ptr() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(1)
+    );
     assert_eq!(writefds, 1u64 << fd);
 }
 

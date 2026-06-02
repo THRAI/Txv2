@@ -99,6 +99,7 @@ pub mod ip;
 #[cfg(feature = "proto-ipv4")]
 pub mod ipv4;
 #[cfg(feature = "proto-ipv6")]
+/// IPv6 packet parsing and emission.
 pub mod ipv6;
 #[cfg(feature = "proto-ipv6")]
 mod ipv6ext_header;

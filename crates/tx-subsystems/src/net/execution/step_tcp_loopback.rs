@@ -5,9 +5,7 @@ use crate::net::execution::step_bind::table_error_to_errno;
 use crate::net::namespace::initial_loopback_iface;
 use crate::net::packet::{NetworkPublish, NetworkPublishTarget};
 use crate::net::protocol::{LoopbackIface, PollContext};
-use crate::net::structure::{
-    ConnectionKey, IpEndpoint, Ipv4Address, SocketIdentity, SocketProtocol, TcpState,
-};
+use crate::net::structure::{ConnectionKey, IpEndpoint, SocketIdentity, SocketProtocol, TcpState};
 
 const TCP_LOOPBACK_TRANSFER_PACKET_PASSES: usize = 64;
 
@@ -68,30 +66,21 @@ pub fn step_tcp_loopback_handshake_on_iface(
         Ok(endpoints) => endpoints,
         Err(errno) => return StepOutcome::Err(errno),
     };
-    if local.addr == Ipv4Address::UNSPECIFIED || local.port == 0 {
+    if local.is_unspecified() || local.port == 0 {
         return StepOutcome::Err(Errno::EADDRNOTAVAIL);
     }
-    if remote.addr != Ipv4Address::LOOPBACK {
+    if !remote.is_loopback() {
         return StepOutcome::Err(Errno::EOPNOTSUPP);
     }
 
     let table = client_payload.socket_table();
-    let Some(listener) = table.lookup_tcp_listener_addr(remote.addr, remote.port, guard) else {
+    let Some(listener) = table.lookup_tcp_listener_dual_stack_endpoint(remote, guard) else {
         return StepOutcome::Err(Errno::ECONNREFUSED);
     };
     let Some(listener_payload) = listener.acquire_operational() else {
         return StepOutcome::Err(Errno::ECONNREFUSED);
     };
-    let listener_matches_remote = matches!(
-        listener_payload.protocol_snapshot(),
-        SocketProtocol::Tcp(TcpState::Listening {
-            local: listener_local,
-            ..
-        }) if listener_local == remote
-            || (listener_local.addr == Ipv4Address::UNSPECIFIED
-                && listener_local.port == remote.port)
-    );
-    if !listener_matches_remote {
+    if !listener_accepts_incoming(&listener_payload, remote) {
         return StepOutcome::Err(Errno::ECONNREFUSED);
     }
 
@@ -384,6 +373,8 @@ fn connecting_endpoints(protocol: &SocketProtocol) -> Result<(IpEndpoint, IpEndp
         SocketProtocol::UnixDatagram(_)
         | SocketProtocol::UnixStream(_)
         | SocketProtocol::Udp(_)
+        | SocketProtocol::Sctp(_)
+        | SocketProtocol::Rds(_)
         | SocketProtocol::RawIcmp(_)
         | SocketProtocol::NetlinkRoute(_)
         | SocketProtocol::NetlinkNetfilter(_)
@@ -398,9 +389,35 @@ fn connected_endpoints(protocol: &SocketProtocol) -> Result<(IpEndpoint, IpEndpo
         SocketProtocol::UnixDatagram(_)
         | SocketProtocol::UnixStream(_)
         | SocketProtocol::Udp(_)
+        | SocketProtocol::Sctp(_)
+        | SocketProtocol::Rds(_)
         | SocketProtocol::RawIcmp(_)
         | SocketProtocol::NetlinkRoute(_)
         | SocketProtocol::NetlinkNetfilter(_)
         | SocketProtocol::Packet(_) => Err(Errno::EOPNOTSUPP),
     }
+}
+
+fn listener_accepts_incoming(
+    listener_payload: &crate::net::structure::SocketOperationalEvidence,
+    dst: IpEndpoint,
+) -> bool {
+    let protocol = listener_payload.protocol_snapshot();
+    let v6only = listener_payload.with_options(|options| options.ip.ipv6_v6only);
+    matches!(
+        protocol,
+        SocketProtocol::Tcp(TcpState::Listening {
+            local: listener_local,
+            ..
+        }) if listener_local == dst
+            || (listener_local.same_family(dst)
+                && listener_local.is_unspecified()
+                && listener_local.port == dst.port)
+            || (!v6only
+                && listener_local.family == crate::net::structure::AddressFamily::Inet6
+                && listener_local.is_unspecified()
+                && dst.family == crate::net::structure::AddressFamily::Inet
+                && dst.is_loopback()
+                && listener_local.port == dst.port)
+    )
 }

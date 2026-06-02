@@ -296,7 +296,7 @@ fn process_tcp_event(
     }
 
     if event.flags.syn && !event.flags.ack {
-        let socket = table.lookup_tcp_listener_addr(event.dst.addr, event.dst.port, guard)?;
+        let socket = table.lookup_tcp_listener_endpoint(event.dst, guard)?;
         let payload = socket.acquire_operational()?;
         let options = payload.with_options(Clone::clone);
         let child = registry::create_connected_stream_for_accept_in_namespace(

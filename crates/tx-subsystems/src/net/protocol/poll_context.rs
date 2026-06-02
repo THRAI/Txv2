@@ -12,8 +12,9 @@ use crate::net::protocol::{
 use crate::net::structure::registry;
 use crate::net::structure::table::{SocketTable, SOCKET_TABLE};
 use crate::net::structure::{
-    ConnectionKey, IpEndpoint, Ipv4Address, RawIcmpState, RecvWireSet, SocketIdentity, SocketKind,
-    SocketProtocol, TcpBacklogEntry, TcpState, UdpInner, TCP_BACKLOG_TIMEOUT_STAGING_MILLIS,
+    AddressFamily, ConnectionKey, IpEndpoint, Ipv4Address, RawIcmpState, RecvWireSet,
+    SocketIdentity, SocketKind, SocketProtocol, TcpBacklogEntry, TcpState, UdpInner,
+    TCP_BACKLOG_TIMEOUT_STAGING_MILLIS,
 };
 
 use super::SmoltcpTcpSegment;
@@ -120,7 +121,9 @@ impl PollContext {
         if src.port == 0 || drain.datagram.dst.port == 0 || drain.datagram.payload.is_empty() {
             return None;
         }
-        if udp_ipv4_packet_len(drain.datagram.payload.len()) > usize::from(iface.mtu()) {
+        if udp_ip_packet_len(drain.datagram.dst, drain.datagram.payload.len())
+            > usize::from(iface.mtu())
+        {
             return None;
         }
 
@@ -425,15 +428,16 @@ impl PollContext {
         let dst = segment.dst_endpoint()?;
         let listener = self
             .socket_table
-            .lookup_tcp_listener_addr(dst.addr, dst.port, guard)?;
+            .lookup_tcp_listener_dual_stack_endpoint(dst, guard)?;
         let listener_payload = listener.acquire_operational()?;
-        if !listener_matches_incoming(&listener_payload.protocol_snapshot(), dst) {
+        if !listener_accepts_incoming(&listener_payload, dst) {
             return None;
         }
 
         let options = listener_payload.with_options(Clone::clone);
-        let child = registry::create_socket_in_namespace(
+        let child = registry::create_socket_in_namespace_with_family(
             SocketKind::Tcp,
+            listener_payload.family(),
             options,
             listener_payload.net_namespace(),
         )
@@ -473,9 +477,9 @@ impl PollContext {
         let dst = segment.dst_endpoint()?;
         let listener = self
             .socket_table
-            .lookup_tcp_listener_addr(dst.addr, dst.port, guard)?;
+            .lookup_tcp_listener_dual_stack_endpoint(dst, guard)?;
         let listener_payload = listener.acquire_operational()?;
-        if !listener_matches_incoming(&listener_payload.protocol_snapshot(), dst) {
+        if !listener_accepts_incoming(&listener_payload, dst) {
             return None;
         }
         let child = listener_payload.connecting_child(dst, src)?;
@@ -544,12 +548,22 @@ fn is_first_syn(segment: &SmoltcpTcpSegment) -> bool {
     segment.tcp.control == TcpControl::Syn && segment.tcp.ack_number.is_none()
 }
 
-fn listener_matches_incoming(protocol: &SocketProtocol, dst: IpEndpoint) -> bool {
+fn listener_accepts_incoming(
+    listener_payload: &crate::net::structure::SocketOperationalEvidence,
+    dst: IpEndpoint,
+) -> bool {
+    let protocol = listener_payload.protocol_snapshot();
+    let v6only = listener_payload.with_options(|options| options.ip.ipv6_v6only);
     matches!(
         protocol,
-        SocketProtocol::Tcp(TcpState::Listening { local, .. })
-            if local.port == dst.port
-                && (local.addr == dst.addr || local.addr == Ipv4Address::UNSPECIFIED)
+        SocketProtocol::Tcp(TcpState::Listening { local, .. }) if local.port == dst.port
+            && ((local.same_family(dst)
+                && (local.ip_addr() == dst.ip_addr() || local.is_unspecified()))
+                || (!v6only
+                    && local.family == AddressFamily::Inet6
+                    && local.is_unspecified()
+                    && dst.family == AddressFamily::Inet
+                    && dst.is_loopback()))
     )
 }
 
@@ -566,17 +580,23 @@ fn select_udp_packet_source(
     dst: IpEndpoint,
     iface: &LoopbackIface,
 ) -> IpEndpoint {
-    if local.addr == Ipv4Address::UNSPECIFIED && dst.addr == iface.local_ipv4() {
-        IpEndpoint::new(iface.local_ipv4(), local.port)
+    if local.is_unspecified() && dst.is_loopback() {
+        let _ = iface;
+        IpEndpoint::loopback_for_family(dst.family, local.port)
     } else {
         local
     }
 }
 
-fn udp_ipv4_packet_len(payload_len: usize) -> usize {
+fn udp_ip_packet_len(dst: IpEndpoint, payload_len: usize) -> usize {
     const IPV4_HEADER_LEN: usize = 20;
+    const IPV6_HEADER_LEN: usize = 40;
     const UDP_HEADER_LEN: usize = 8;
-    IPV4_HEADER_LEN + UDP_HEADER_LEN + payload_len
+    if dst.family == crate::net::structure::AddressFamily::Inet6 {
+        IPV6_HEADER_LEN + UDP_HEADER_LEN + payload_len
+    } else {
+        IPV4_HEADER_LEN + UDP_HEADER_LEN + payload_len
+    }
 }
 
 fn accepts_loopback_icmp_destination(iface: &LoopbackIface, dst: Ipv4Address) -> bool {
@@ -612,9 +632,9 @@ fn promote_connected_stream_and_publish_accept(
     });
     let (local, remote) = connected?;
 
-    let listener = table.lookup_tcp_listener_addr(local.addr, local.port, guard)?;
+    let listener = table.lookup_tcp_listener_dual_stack_endpoint(local, guard)?;
     let listener_payload = listener.acquire_operational()?;
-    if !listener_matches_incoming(&listener_payload.protocol_snapshot(), local) {
+    if !listener_accepts_incoming(&listener_payload, local) {
         return None;
     }
     table

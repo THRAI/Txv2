@@ -210,6 +210,24 @@ skills:
       - .agents/skills/tx-network-test-fixup/SKILL.md
     purpose: Plan, prioritize, implement, and record Linux syscall work against OSComp/LTP coverage without test-specific hardcoding.
 
+  tx-ltp-timeout-ladder:
+    sources:
+      - docs/LTP/ltp-network-syscall-progress.md
+      - docs/LTP/ltp-batches.md
+      - docs/LTP/ltp-network-deferred.md
+      - tools/oscomp-judge.py
+      - .agents/skills/tx-ltp-syscall/SKILL.md
+      - .agents/skills/tx-network-test-fixup/SKILL.md
+    purpose: Run focused LTP/OSComp QEMU tests with short timeout ladders, preserved logs, local judge scoring, and hang triage before escalating runtime.
+
+  tx-debug-logbook:
+    sources:
+      - docs/progress/STATUS.md
+      - docs/progress/README.md
+      - docs/LTP/ltp-network-syscall-progress.md
+      - .agents/skills/tx-progress-memory/SKILL.md
+    purpose: Record debug conclusions, root causes, fixes, verification, next steps, and blockers for future CI/rebase/LTP regression repair.
+
   tx-shell-syscall-fixup:
     sources:
       - docs/DEVELOPMENT.md

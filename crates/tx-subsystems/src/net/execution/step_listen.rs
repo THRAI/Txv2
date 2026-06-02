@@ -4,7 +4,9 @@ use crate::execution::{Errno, Guard, StepOutcome};
 use crate::net::checks::require::require_socket_listen_target;
 use crate::net::execution::step_bind::table_error_to_errno;
 use crate::net::execution::SOMAXCONN_STAGING;
-use crate::net::structure::{SocketIdentity, SocketProtocol, TcpState, UnixStreamState};
+use crate::net::structure::{
+    SocketIdentity, SocketKind, SocketProtocol, TcpState, UnixStreamState,
+};
 
 pub fn step_listen(
     socket: &Cap<SocketIdentity>,
@@ -26,10 +28,20 @@ pub fn step_listen(
     let Some(payload) = socket.acquire_operational() else {
         return StepOutcome::Err(Errno::ENOTCONN);
     };
-    if socket.kind == crate::net::structure::SocketKind::Tcp {
+    if socket.kind == SocketKind::Tcp && payload.with_options(|opts| opts.tcp.tls_ulp.is_some()) {
+        return StepOutcome::Err(Errno::EINVAL);
+    }
+    if socket.kind == SocketKind::Tcp {
         if let Err(error) = payload
             .socket_table()
             .listen_tcp(witness.local, socket.clone())
+        {
+            return StepOutcome::Err(table_error_to_errno(error));
+        }
+    } else if socket.kind == SocketKind::Sctp {
+        if let Err(error) = payload
+            .socket_table()
+            .listen_sctp(witness.local, socket.clone())
         {
             return StepOutcome::Err(table_error_to_errno(error));
         }
@@ -38,6 +50,13 @@ pub fn step_listen(
     let listening = payload.with_protocol_mut(|protocol| match protocol {
         SocketProtocol::Tcp(TcpState::Bound { local }) if *local == witness.local => {
             *protocol = SocketProtocol::Tcp(TcpState::Listening {
+                local: witness.local,
+                backlog_limit: witness.backlog_limit,
+            });
+            true
+        }
+        SocketProtocol::Sctp(TcpState::Bound { local }) if *local == witness.local => {
+            *protocol = SocketProtocol::Sctp(TcpState::Listening {
                 local: witness.local,
                 backlog_limit: witness.backlog_limit,
             });
@@ -53,7 +72,7 @@ pub fn step_listen(
         _ => false,
     });
     if listening {
-        if socket.kind == crate::net::structure::SocketKind::Tcp {
+        if socket.kind == SocketKind::Tcp {
             if let Some(raw_tcp) = payload.raw_tcp_socket() {
                 let _ = raw_tcp.listen_endpoint(witness.local);
             }

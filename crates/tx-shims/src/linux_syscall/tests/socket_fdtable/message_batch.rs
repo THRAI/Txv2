@@ -161,6 +161,244 @@ fn dispatch_sendmsg_recvmsg_udp_loopback_round_trips_source_addr() {
 }
 
 #[test]
+fn dispatch_inet6_udp_recvmsg_peek_preserves_datagram_and_source_addr() {
+    let _setup = socket_setup();
+    loopback_iface().clear_for_test_or_bootstrap();
+    let (_process, ctx) = socket_ctx();
+    let server_fd = socket_dgram6(&ctx, SOCK_DGRAM, IPPROTO_IP as u64);
+    let client_fd = socket_dgram6(&ctx, SOCK_DGRAM, IPPROTO_IP as u64);
+    let loopback6 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    let server_addr = sockaddr_in6(loopback6, 49_125);
+    let client_addr = sockaddr_in6(loopback6, 49_126);
+
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                server_fd as u64,
+                server_addr.as_ptr() as u64,
+                SOCKADDR_IN6_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                client_fd as u64,
+                client_addr.as_ptr() as u64,
+                SOCKADDR_IN6_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let payload = *b"hello";
+    assert_eq!(
+        socket_req(
+            NR_SENDTO,
+            [
+                client_fd as u64,
+                payload.as_ptr() as u64,
+                payload.len() as u64,
+                0,
+                server_addr.as_ptr() as u64,
+                SOCKADDR_IN6_BYTES as u64,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(payload.len() as i64)
+    );
+
+    let moved = {
+        let guard = tx_substrate::epoch::guard();
+        match step_process_loopback_pending(
+            smoltcp::time::Instant::ZERO,
+            loopback_iface(),
+            LoopbackPollBudget::default(),
+            &guard,
+        ) {
+            tx_substrate::step::StepOutcome::Done(outcome) => outcome,
+            other => panic!("unexpected loopback outcome: {other:?}"),
+        }
+    };
+    assert_udp_delivery_progress(moved.udp_bytes_moved, payload.len());
+
+    let mut peek_out = [0u8; 5];
+    let peek_iov = [TestIovec {
+        base: peek_out.as_mut_ptr() as u64,
+        len: peek_out.len() as u64,
+    }];
+    let mut source_addr = [0u8; SOCKADDR_IN6_BYTES as usize];
+    let mut peek_hdr = TestMsghdr {
+        name: source_addr.as_mut_ptr() as u64,
+        namelen: SOCKADDR_IN6_BYTES,
+        _pad0: 0,
+        iov: peek_iov.as_ptr() as u64,
+        iovlen: peek_iov.len() as u64,
+        control: 0,
+        controllen: 0,
+        flags: 0xFFFF_FFFF,
+        _pad1: 0,
+    };
+    assert_eq!(
+        socket_req(
+            NR_RECVMSG,
+            [
+                server_fd as u64,
+                (&mut peek_hdr as *mut TestMsghdr) as u64,
+                MSG_PEEK,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(payload.len() as i64)
+    );
+    assert_eq!(&peek_out, b"hello");
+    assert_eq!(peek_hdr.namelen, SOCKADDR_IN6_BYTES);
+    assert_eq!(peek_hdr.flags, 0);
+    assert_eq!(
+        u16::from_le_bytes([source_addr[0], source_addr[1]]),
+        AF_INET6
+    );
+    assert_eq!(u16::from_be_bytes([source_addr[2], source_addr[3]]), 49_126);
+    assert_eq!(&source_addr[8..24], &loopback6);
+
+    let mut recv_out = [0u8; 5];
+    let recv_iov = [TestIovec {
+        base: recv_out.as_mut_ptr() as u64,
+        len: recv_out.len() as u64,
+    }];
+    let mut recv_hdr = TestMsghdr {
+        name: 0,
+        namelen: 0,
+        _pad0: 0,
+        iov: recv_iov.as_ptr() as u64,
+        iovlen: recv_iov.len() as u64,
+        control: 0,
+        controllen: 0,
+        flags: 0,
+        _pad1: 0,
+    };
+    assert_eq!(
+        socket_req(
+            NR_RECVMSG,
+            [
+                server_fd as u64,
+                (&mut recv_hdr as *mut TestMsghdr) as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(payload.len() as i64)
+    );
+    assert_eq!(&recv_out, b"hello");
+}
+
+#[test]
+fn dispatch_inet6_udp_loopback_reaches_wildcard_bound_receiver() {
+    let _setup = socket_setup();
+    loopback_iface().clear_for_test_or_bootstrap();
+    let (_process, ctx) = socket_ctx();
+    let server_fd = socket_dgram6(&ctx, SOCK_DGRAM, IPPROTO_UDP as u64);
+    let client_fd = socket_dgram6(&ctx, SOCK_DGRAM, IPPROTO_UDP as u64);
+    let any6 = [0u8; 16];
+    let loopback6 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    let server_bind_addr = sockaddr_in6(any6, 49_127);
+    let server_connect_addr = sockaddr_in6(loopback6, 49_127);
+    let client_addr = sockaddr_in6(loopback6, 49_128);
+
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                server_fd as u64,
+                server_bind_addr.as_ptr() as u64,
+                SOCKADDR_IN6_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                client_fd as u64,
+                client_addr.as_ptr() as u64,
+                SOCKADDR_IN6_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let payload = *b"v6";
+    assert_eq!(
+        socket_req(
+            NR_SENDTO,
+            [
+                client_fd as u64,
+                payload.as_ptr() as u64,
+                payload.len() as u64,
+                0,
+                server_connect_addr.as_ptr() as u64,
+                SOCKADDR_IN6_BYTES as u64,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(payload.len() as i64)
+    );
+
+    let mut out = [0u8; 2];
+    let mut source_addr = [0u8; SOCKADDR_IN6_BYTES as usize];
+    let mut source_len = SOCKADDR_IN6_BYTES;
+    assert_eq!(
+        socket_req(
+            NR_RECVFROM,
+            [
+                server_fd as u64,
+                out.as_mut_ptr() as u64,
+                out.len() as u64,
+                0,
+                source_addr.as_mut_ptr() as u64,
+                (&mut source_len as *mut u32) as u64,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(payload.len() as i64)
+    );
+    assert_eq!(&out, b"v6");
+    assert_eq!(source_len, SOCKADDR_IN6_BYTES);
+    assert_eq!(
+        u16::from_le_bytes([source_addr[0], source_addr[1]]),
+        AF_INET6
+    );
+    assert_eq!(u16::from_be_bytes([source_addr[2], source_addr[3]]), 49_128);
+    assert_eq!(&source_addr[8..24], &loopback6);
+}
+
+#[test]
 fn dispatch_udp_sendmsg_autobinds_and_corks_msg_more() {
     let _setup = socket_setup();
     loopback_iface().clear_for_test_or_bootstrap();

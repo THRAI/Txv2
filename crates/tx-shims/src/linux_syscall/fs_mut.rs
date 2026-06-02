@@ -856,6 +856,229 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     SyscallResult::Return(to_copy as i64)
 }
 
+fn allocate_mount_api_fd<'a>(ctx: &SyscallCtx<'a>) -> Result<u32, SyscallResult> {
+    let fd = ctx.process.allocate_fd();
+    let (soft_limit, _) = ctx.process.rlimit_nofile();
+    if fd >= soft_limit {
+        Err(SyscallResult::Error(EMFILE_VALUE))
+    } else {
+        Ok(fd)
+    }
+}
+
+fn install_mount_api_fd<'a>(
+    ctx: &SyscallCtx<'a>,
+    file: Cap<mount::MountApiFile>,
+    flags: OpenFileFlags,
+) -> SyscallResult {
+    let fd = match allocate_mount_api_fd(ctx) {
+        Ok(fd) => fd,
+        Err(err) => return err,
+    };
+    let cloexec = flags.cloexec;
+    let open_file = match OpenFile::new_mount_api_cap(file, flags) {
+        Ok(open_file) => open_file,
+        Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+    };
+    let _ = ctx.process.install_fd(fd, open_file);
+    if cloexec {
+        ctx.process.set_fd_cloexec(fd, true);
+    }
+    SyscallResult::Return(fd as i64)
+}
+
+fn supported_mount_api_fstype(fstype: &[u8]) -> Option<&'static str> {
+    match fstype {
+        b"tmpfs" => Some("tmpfs"),
+        b"vfat" => Some("vfat"),
+        b"ext2" => Some("ext2"),
+        b"ext3" => Some("ext3"),
+        b"ext4" => Some("ext4"),
+        b"devfs" => Some("devfs"),
+        b"proc" => Some("proc"),
+        b"sysfs" => Some("sysfs"),
+        _ => None,
+    }
+}
+
+fn mount_api_root_dentry(mut dentry: Cap<DEntry>) -> Cap<DEntry> {
+    while let Some(parent) = dentry.parent_hint() {
+        dentry = parent;
+    }
+    dentry
+}
+
+/// `fsopen(fsname, flags)`. Linux generic ABI `__NR_fsopen = 430`.
+///
+/// This is the fd-provider slice for the Linux 5.2 mount API: it validates
+/// the fs label/flags and returns a mount-context file descriptor. The
+/// follow-up `fsconfig`/`fsmount` superblock-creation path is still deferred
+/// by `MOUNT_v1`; callers that try to drive that path currently hit the
+/// syscall dispatch default for those later syscalls.
+pub(super) async fn sys_fsopen<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let _ = core::marker::PhantomData::<P>;
+    let fsname_uaddr = args[0];
+    let flags = args[1] as u32;
+
+    if flags & !FSOPEN_CLOEXEC != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    let fsname = match read_user_cstr(&ctx.aspace, fsname_uaddr, 64) {
+        Ok(name) => name,
+        Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
+    };
+    let Some(fstype) = supported_mount_api_fstype(&fsname) else {
+        return SyscallResult::Error(ENODEV_VALUE);
+    };
+
+    let file =
+        match mount::MountApiFile::new_fs_context_cap(fstype, mount::FsContextMode::New, None) {
+            Ok(file) => file,
+            Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+        };
+    install_mount_api_fd(
+        ctx,
+        file,
+        OpenFileFlags {
+            read: true,
+            write: true,
+            cloexec: flags & FSOPEN_CLOEXEC != 0,
+            ..OpenFileFlags::default()
+        },
+    )
+}
+
+/// `fspick(dirfd, path, flags)`. Linux generic ABI `__NR_fspick = 433`.
+///
+/// Returns a reconfiguration-context fd over an already-resolved mount. Full
+/// `FSCONFIG_CMD_RECONFIGURE` handling is deliberately left to the later
+/// mount-API topology slice; this fd still behaves like a non-socket for
+/// generic fd consumers.
+pub(super) async fn sys_fspick<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let _ = core::marker::PhantomData::<P>;
+    let dirfd = args[0] as i32;
+    let path_uaddr = args[1];
+    let flags = args[2] as u32;
+    const VALID_FSPICK_FLAGS: u32 =
+        FSPICK_CLOEXEC | FSPICK_SYMLINK_NOFOLLOW | FSPICK_NO_AUTOMOUNT | FSPICK_EMPTY_PATH;
+
+    if flags & !VALID_FSPICK_FLAGS != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
+        Ok(path) => path,
+        Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
+    };
+    if path.is_empty() && flags & FSPICK_EMPTY_PATH == 0 {
+        return SyscallResult::Error(ENOENT_VALUE);
+    }
+
+    let rooted_at = match resolve_cwd_for_path(dirfd, &path, ctx) {
+        Ok(dentry) => dentry,
+        Err(errno) => return SyscallResult::Error(errno),
+    };
+    let cred = ctx.walker_cred();
+    let target = if path == b"/" {
+        mount_api_root_dentry(rooted_at)
+    } else {
+        match walk_from_process(rooted_at, &path, &cred, &ctx.process) {
+            Ok(dentry) => dentry,
+            Err(errno) => return SyscallResult::Error(errno),
+        }
+    };
+    let payload = match mount_payload_for_dentry(&target) {
+        Some(payload) => payload,
+        None => return SyscallResult::Error(ENODEV_VALUE),
+    };
+    let picked_mount = mount::mount_for_root_dentry(&target);
+    let file = match mount::MountApiFile::new_fs_context_cap(
+        payload.fstype,
+        mount::FsContextMode::Reconfigure,
+        picked_mount,
+    ) {
+        Ok(file) => file,
+        Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+    };
+    install_mount_api_fd(
+        ctx,
+        file,
+        OpenFileFlags {
+            read: true,
+            write: true,
+            cloexec: flags & FSPICK_CLOEXEC != 0,
+            ..OpenFileFlags::default()
+        },
+    )
+}
+
+/// `open_tree(dirfd, path, flags)`. Linux generic ABI `__NR_open_tree = 428`.
+///
+/// The fd-provider phase returns an O_PATH-like mount-api fd. Socket syscalls
+/// therefore report `EBADF` for this backing, matching Linux's generic-fd
+/// behaviour for `accept03`.
+pub(super) async fn sys_open_tree<P: PmapIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'_>,
+) -> SyscallResult {
+    let _ = core::marker::PhantomData::<P>;
+    let dirfd = args[0] as i32;
+    let path_uaddr = args[1];
+    let flags = args[2] as u32;
+    const VALID_OPEN_TREE_FLAGS: u32 = OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC;
+
+    if flags & !VALID_OPEN_TREE_FLAGS != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
+        Ok(path) => path,
+        Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
+    };
+    if path.is_empty() {
+        return SyscallResult::Error(ENOENT_VALUE);
+    }
+
+    let rooted_at = match resolve_cwd_for_path(dirfd, &path, ctx) {
+        Ok(dentry) => dentry,
+        Err(errno) => return SyscallResult::Error(errno),
+    };
+    let cred = ctx.walker_cred();
+    let target = if path == b"/" {
+        mount_api_root_dentry(rooted_at)
+    } else {
+        match walk_from_process(rooted_at, &path, &cred, &ctx.process) {
+            Ok(dentry) => dentry,
+            Err(errno) => return SyscallResult::Error(errno),
+        }
+    };
+    let payload = match mount_payload_for_dentry(&target) {
+        Some(payload) => payload,
+        None => return SyscallResult::Error(ENODEV_VALUE),
+    };
+    let file = match mount::MountApiFile::new_detached_mount_cap(
+        mount::MountApiFileKind::OpenTree,
+        payload,
+        target.rnode().clone(),
+        mount::MountFlags::empty(),
+    ) {
+        Ok(file) => file,
+        Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+    };
+    install_mount_api_fd(
+        ctx,
+        file,
+        OpenFileFlags {
+            cloexec: flags & OPEN_TREE_CLOEXEC != 0,
+            ..OpenFileFlags::default()
+        },
+    )
+}
+
 /// `mount(source, target, fstype, flags, data)`. Linux RV64 ABI `__NR_mount = 40`.
 ///
 /// v1: supports `MS_BIND` (bind mount) and new mounts (tmpfs/devfs/proc).

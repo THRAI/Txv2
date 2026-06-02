@@ -243,7 +243,7 @@ pub struct ProcessPayload {
 
 - **Thread roster.** `threads` is a DLL of ThreadIdentity entries. `thread_count` is a denormalized atomic for cheap "is there more than one thread" checks (used by fork, exec, exit_group); maintained atomically with DLL insert/remove.
 - **Frame.** Contains the Shared<T> slots (vm, fd_table, sig_actions, fs_context) and inline scalars (cwd, root, umask). See §3.
-- **Namespace context.** `nsproxy` is an immutable bundle of namespace references used by syscall resolve/render helpers. It owns no process topology.
+- **Namespace context.** `nsproxy` is an immutable bundle of namespace references used by syscall resolve/render helpers. It owns no process topology. The bundle also carries `user_ns`, which is the Linux capability/uid/gid authority lens for namespace-aware checks; PROCESS stores the active bundle but does not own user-namespace maps or capability semantics.
 - **Policy.** See §4.
 - **Group-directed pending.** Process-directed signals queue here. Thread-directed signals queue on each ThreadPayload's `thread_pending`.
 - **Group exit.** Coordinates exit_group and non-initiator exec's thread-group collapse. See §5.
@@ -354,9 +354,11 @@ pub struct ProcessPayload {
   per-call check sites; the cred snapshot does not yet carry the
   rlimit bundle. v3 introduces an explicit `policy: ProcessPolicy`
   field with the rlimit + scheduling-policy bundle.
-- `nsproxy: Cap<NsProxy>`. Not yet present; namespaces are flat
-  ("everyone shares the same root namespace"). v3 introduces the
-  nsproxy bundle when mount/pid/user namespaces land.
+- `nsproxy: Cap<NsProxy>`. Namespace-aware builds carry this immutable bundle
+  on the payload. Older flat-namespace paths can model it as a bundle whose
+  fields all point at init namespaces. `NAMESPACE_VIEW_v1` owns the userns,
+  pidns, mountns, and netns semantics; PROCESS owns only the pointer
+  publication on clone/unshare/setns.
 - `group_exit: GroupExit` and `leader_exit_status: AtomicOption<ExitStatus>`.
   Currently exit_group collapse is handled inline by
   `step_exit_group` without a dedicated coordination struct;
@@ -743,7 +745,9 @@ Linux has `fork(2)`, `vfork(2)`, `clone(2)`, `clone3(2)`. They all call into the
 | CLONE_CHILD_CLEARTID | ✓ | Per THREAD_RUNTIME §2.6; register addr for FUTEX_WAKE at exit |
 | CLONE_SETTLS | ✓ | HAL sets TLS register in new thread's initial state |
 | CLONE_PARENT | deferred | Phase 2 |
-| CLONE_NEWPID, CLONE_NEWNS, CLONE_NEWNET, etc. | deferred | Phase 2 (nested namespaces) |
+| CLONE_NEWUSER | deferred for clone | `unshare(CLONE_NEWUSER)` follows `NAMESPACE_VIEW_v1`; clone support must create the user namespace first and grant capabilities only inside it. |
+| CLONE_NEWNET | deferred for clone | `unshare(CLONE_NEWNET)` follows `NAMESPACE_VIEW_v1`; when combined with `CLONE_NEWUSER`, Linux creates userns first and owns the new netns by it. |
+| CLONE_NEWPID, CLONE_NEWNS, etc. | deferred | Phase 2 (nested namespaces and remaining namespace kinds) |
 | CLONE_PIDFD | deferred | Phase 2 |
 | CLONE_PTRACE, CLONE_UNTRACED | deferred | Observation subsystem |
 | CLONE_VFORK | deferred | Rare in practice |
@@ -769,7 +773,8 @@ fn step_clone_process(
 ) -> StepOutcome<Pid> {
     // Phase 1: observe
     //   - deny if caller_proc's group_exit is in progress
-    //   - check cred for CAP_SYS_ADMIN if flags request privileged namespaces (Phase 2)
+    //   - check namespace-relative authority if flags request privileged
+    //     namespaces (Phase 2; userns/netns details live in NAMESPACE_VIEW_v1)
 
     // Phase 2: upgrade
     //   - upgrade caller_proc and caller_thread to Cap (already held)

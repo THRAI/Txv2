@@ -763,6 +763,18 @@ LINT: namespace-local registries must declare whether they are authoritative for
 
 LINT: syscall implementations must separate `resolve_number`, `operate_on_identity`, and `render_number` phases.
 
+**NSVIEW-4.** Capability checks are namespace-relative. Entering or creating a child `UserNamespace` grants authority only in that user namespace, not in ancestors or globally.
+
+LINT: reject capability checks that treat membership in any child user namespace as host/global privilege.
+
+**NSVIEW-5.** Every non-user namespace records the immutable `UserNamespace` that owned it at creation. Privileged operations scoped by that namespace check capabilities in the owning user namespace.
+
+LINT: reject `NetNamespace`, `PidNamespace`, `MountNamespace`, `UtsNamespace`, `IpcNamespace`, `CgroupNamespace`, or `TimeNamespace` payloads that lack an owner-userns field once namespace-local capability checks are implemented.
+
+**NSVIEW-6.** `UserNamespace` uid/gid maps and setgroups policy are namespace state exposed through procfs projections. Map writes follow Linux write-once, offset-zero, non-overlap, and setgroups-gated `gid_map` rules.
+
+LINT: reject procfs `uid_map`, `gid_map`, or `setgroups` handlers that mutate process credentials directly, accept repeated map writes, or bypass the `setgroups=deny` gate for unprivileged `gid_map` writes.
+
 **THREAD-EXIT-MONOTONE.** Once a thread enters exiting, it cannot return to running, waiting, or stopped. `ThreadIdentity.payload.is_some()` is monotone true to false.
 
 LINT: no transition from exiting/dead to runnable states.

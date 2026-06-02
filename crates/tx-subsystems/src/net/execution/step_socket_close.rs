@@ -3,8 +3,8 @@ use tx_substrate::zone::Cap;
 use crate::execution::{Guard, StepOutcome};
 use crate::net::structure::table::SocketTable;
 use crate::net::structure::{
-    AcceptWireSet, ConnectionKey, RecvWireSet, SendWireSet, SocketIdentity, SocketProtocol,
-    TcpState, UdpInner, UnixDatagramState, UnixStreamState,
+    AcceptWireSet, ConnectionKey, RdsState, RecvWireSet, SendWireSet, SocketIdentity,
+    SocketProtocol, TcpState, UdpInner, UnixDatagramState, UnixStreamState,
 };
 
 use super::step_tcp_loopback::step_tcp_loopback_transfer;
@@ -62,6 +62,31 @@ pub fn step_socket_close(
             bindings_withdrawn += withdraw_tcp_bound_if_owner(table, socket, local, guard);
         }
         SocketProtocol::Tcp(TcpState::Init | TcpState::Closed) => {}
+        SocketProtocol::Sctp(TcpState::Bound { local }) => {
+            bindings_withdrawn += withdraw_ok(table.withdraw_sctp_bound(local));
+        }
+        SocketProtocol::Sctp(TcpState::Listening { local, .. }) => {
+            bindings_withdrawn += withdraw_ok(table.withdraw_sctp_listener(local));
+            bindings_withdrawn += withdraw_ok(table.withdraw_sctp_bound(local));
+        }
+        SocketProtocol::Sctp(TcpState::Connecting { local, remote })
+        | SocketProtocol::Sctp(TcpState::Connected { local, remote }) => {
+            if let Some(peer) =
+                table.lookup_sctp_connection(ConnectionKey::new(remote, local), guard)
+            {
+                let peer_wakes = mark_sctp_peer_closed(&peer);
+                peer_recv_woken += peer_wakes.recv_woken;
+                peer_send_woken += peer_wakes.send_woken;
+            }
+            bindings_withdrawn +=
+                withdraw_ok(table.withdraw_sctp_connection(ConnectionKey::new(local, remote)));
+            bindings_withdrawn += withdraw_sctp_bound_if_owner(table, socket, local, guard);
+        }
+        SocketProtocol::Sctp(TcpState::Init | TcpState::Closed) => {}
+        SocketProtocol::Rds(RdsState::Bound { local }) => {
+            bindings_withdrawn += withdraw_rds_bound_if_owner(table, socket, local, guard);
+        }
+        SocketProtocol::Rds(RdsState::Unbound | RdsState::Closed) => {}
         SocketProtocol::Udp(UdpInner::Bound { local }) => {
             bindings_withdrawn += withdraw_udp_bound_if_owner(table, socket, local, guard);
         }
@@ -75,11 +100,11 @@ pub fn step_socket_close(
             bindings_withdrawn += withdraw_ok(table.withdraw_raw_icmp(socket.raw()));
         }
         SocketProtocol::UnixDatagram(UnixDatagramState::Bound { local }) => {
-            bindings_withdrawn += withdraw_ok(table.withdraw_unix_bound(local));
+            bindings_withdrawn += withdraw_unix_binding_on_close(table, local);
         }
         SocketProtocol::UnixDatagram(UnixDatagramState::Connected { local, .. }) => {
             if let Some(local) = local {
-                bindings_withdrawn += withdraw_ok(table.withdraw_unix_bound(local));
+                bindings_withdrawn += withdraw_unix_binding_on_close(table, local);
             }
         }
         SocketProtocol::UnixDatagram(UnixDatagramState::ConnectedPair { peer_raw }) => {
@@ -94,7 +119,7 @@ pub fn step_socket_close(
         SocketProtocol::UnixDatagram(UnixDatagramState::Unbound) => {}
         SocketProtocol::UnixStream(UnixStreamState::Bound { local })
         | SocketProtocol::UnixStream(UnixStreamState::Listening { local, .. }) => {
-            bindings_withdrawn += withdraw_ok(table.withdraw_unix_bound(local));
+            bindings_withdrawn += withdraw_unix_binding_on_close(table, local);
         }
         SocketProtocol::UnixStream(UnixStreamState::Connected { peer_raw, .. }) => {
             if let Some(peer) = table.lookup_unix_stream_peer(socket.raw(), guard) {
@@ -187,8 +212,28 @@ fn mark_tcp_peer_closed(peer: &Cap<SocketIdentity>) -> PeerCloseWakes {
     }
 }
 
+fn mark_sctp_peer_closed(peer: &Cap<SocketIdentity>) -> PeerCloseWakes {
+    let recv_woken = peer.readiness.fire_recv(RecvWireSet::BROKEN);
+    let send_woken = peer.readiness.fire_send(SendWireSet::BROKEN);
+    PeerCloseWakes {
+        recv_woken,
+        send_woken,
+    }
+}
+
 fn withdraw_ok<T>(result: Result<T, tx_substrate::mutation::MutationError>) -> usize {
     usize::from(result.is_ok())
+}
+
+fn withdraw_unix_binding_on_close(
+    table: &SocketTable,
+    local: crate::net::structure::UnixSocketPath,
+) -> usize {
+    if local.is_abstract() {
+        withdraw_ok(table.unlink_unix_path(local))
+    } else {
+        withdraw_ok(table.withdraw_unix_bound(local))
+    }
 }
 
 fn withdraw_udp_bound_if_owner(
@@ -219,6 +264,36 @@ fn withdraw_tcp_bound_if_owner(
         return 0;
     }
     withdraw_ok(table.withdraw_tcp_bound(local))
+}
+
+fn withdraw_sctp_bound_if_owner(
+    table: &SocketTable,
+    socket: &Cap<SocketIdentity>,
+    local: crate::net::structure::IpEndpoint,
+    guard: &Guard<'_>,
+) -> usize {
+    let Some(bound) = table.lookup_sctp_bound(local, guard) else {
+        return 0;
+    };
+    if bound.raw() != socket.raw() {
+        return 0;
+    }
+    withdraw_ok(table.withdraw_sctp_bound(local))
+}
+
+fn withdraw_rds_bound_if_owner(
+    table: &SocketTable,
+    socket: &Cap<SocketIdentity>,
+    local: crate::net::structure::IpEndpoint,
+    guard: &Guard<'_>,
+) -> usize {
+    let Some(bound) = table.lookup_rds_bound(local, guard) else {
+        return 0;
+    };
+    if bound.raw() != socket.raw() {
+        return 0;
+    }
+    withdraw_ok(table.withdraw_rds_bound(local))
 }
 
 fn mark_unix_peer_broken(peer: &Cap<SocketIdentity>) {

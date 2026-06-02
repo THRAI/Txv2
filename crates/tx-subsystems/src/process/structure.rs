@@ -436,6 +436,21 @@ impl ProcessIdentity {
         self.nsproxy_cap()?.mnt_ns.clone()
     }
 
+    /// Snapshot the current user namespace cap.
+    /// Returns `None` for zombies (no payload).
+    pub fn user_namespace_cap(&self) -> Option<Cap<crate::process::nsproxy::UserNamespace>> {
+        Some(self.nsproxy_cap()?.user_ns.clone())
+    }
+
+    /// Replace the process's namespace proxy bundle, returning the previous
+    /// bundle cap. Returns `None` for zombies.
+    pub fn replace_nsproxy(
+        &self,
+        new: Cap<crate::process::nsproxy::NsProxy>,
+    ) -> Option<Cap<crate::process::nsproxy::NsProxy>> {
+        self.payload.lock().as_ref().map(|p| p.replace_nsproxy(new))
+    }
+
     /// Process short name (for `/proc/<pid>/stat`). Returns `"?"` for
     /// zombies (no payload).
     pub fn comm(&self) -> [u8; 16] {

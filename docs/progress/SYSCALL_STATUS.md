@@ -17,8 +17,9 @@ inner loop; OSComp + LTP are the correctness bar. When a syscall lands,
 record which specific OSComp/LTP test(s) closed it under "Currently
 passing" below.
 
-**Last refresh:** 2026-05-22 (mechanical syscall status refreshed after LTP
-entrypoint wiring).
+**Last refresh:** 2026-05-27 (mechanical syscall status refreshed after
+making the existing `pselect6_time64(413)` dispatch path visible to the
+status parser).
 
 ## Headline counts
 
@@ -29,9 +30,9 @@ entrypoint wiring).
 _Counts read from `crates/tx-shims/src/linux_syscall/{numbers.rs, mod.rs}`._
 _Run `cargo xtask syscall-status --regen` to refresh; `--check` to lint in CI._
 
-- **`NR_*` defined:** 194
-- **Dispatched (has a match arm):** 191
-- **Defined but not dispatched:** 3 — see list below
+- **`NR_*` defined:** 204
+- **Dispatched (has a match arm):** 203
+- **Defined but not dispatched:** 1 — see list below
 
 #### Defined but not dispatched
 
@@ -39,9 +40,7 @@ These syscalls have a `pub const NR_*` in `numbers.rs` but no match arm in `disp
 
 | `NR_*` | # | Summary |
 |---|---:|---|
-| `NR_PIDFD_OPEN` | 434 | `pidfd_open(pid, flags)` — Linux RV64. |
 | `NR_PIDFD_SEND_SIGNAL` | 424 | `pidfd_send_signal(pidfd, sig, info, flags)` — Linux RV64. |
-| `NR_PSELECT6_TIME64` | 413 | `pselect6_time64(...)`. Linux generic ABI `__NR_pselect6_time64 = 413`. |
 
 <!-- END AUTOGEN: syscall-table -->
 
@@ -61,17 +60,18 @@ number of additional LTP tests that move from skipped/failed to runnable.
 | `sendfile` / `splice` / `copy_file_range` | +15 | M (3–4w) | needs page-cache coherence path |
 | SysV IPC (`msg` / `sem` / `shm`) | +40 | L (6–10w) | new namespace-aware subsystem |
 | Network stack (full socket API) | +60 | XL (12–16w) | no subsystem exists — TCP/UDP state, sockaddr unions, sk_buff |
-| `inotify` / `fanotify` | +10 | M (~3w) | new event queue subsystem |
+| `inotify` / `fanotify` | +8 | M (~3w) | instance fds landed; watch/mark event queues pending |
 | `chroot` / `pivot_root` / `swap*` | +8 | S–M (1–2w) | `chroot` is one field; bdev-fs lands swap |
 | `seccomp` / capabilities / `keyctl` | +15 | L (6–8w) | filter bytecode + keyring |
 | `ptrace` | +20 | XL (12w+) | parallel exec context — out of scope v1 |
-| `bpf` / `perf_event_open` | +10 | XL (12w+) | out of scope v1 |
+| full `bpf` / `perf_event_open` semantics | +10 | XL (12w+) | phase-0 fd providers landed for `accept03`; full maps/programs/perf sampling out of scope v1 |
 
 **Reading the table.** Best LTP-impact-per-effort: `fork` + CLOEXEC,
 `getrlimit`/`setrlimit`, then `preadv`/`pwritev`/`fallocate`. SysV IPC and the
 network stack are larger but unlock the biggest LTP coverage jumps. `ptrace`
-and `bpf` are explicitly **out of scope for v1** — flag them and move on
-unless the user specifically chartered them.
+full `bpf`/`perf_event_open` semantics are explicitly **out of scope for v1**;
+the `accept03` fd-provider probe has a narrower phase-0 implementation that
+installs typed non-socket fds without claiming map/program or counter support.
 
 ## OSComp + LTP coverage (the gold standard)
 
@@ -105,6 +105,25 @@ family, `mkdir`/`unlink`/`rename`/`symlink`, `getdents64`, `epoll`/`futex`/
 `timerfd`/`eventfd`/`signalfd` basics, `rt_sigaction`/`procmask` basics, AIO
 core (PR-11).
 
+- 2026-05-26: `pidfd_open(434)` is dispatched and installs a pidfd-backed fd;
+  focused LTP `accept03` moved from `13/23` to `14/23` in
+  `target/oscomp/ltp-accept03-after-pidfd-open-final.txt`.
+- 2026-05-26: `memfd_create(279)` is dispatched and installs an anonymous
+  PageBacked regular-file fd; focused LTP `accept03` moved from `14/23` to
+  `15/23` in `target/oscomp/ltp-accept03-after-memfd-create.txt`, and
+  `memfd_create02` reports `10/14` in
+  `target/oscomp/ltp-memfd-create02-basic.txt`.
+- 2026-05-26: `inotify_init1(26)` and `fanotify_init(262)` are dispatched and
+  install typed fsnotify instance fds; focused LTP `accept03` moved from
+  `15/23` to `17/23` in `target/oscomp/ltp-accept03-after-fsnotify-fds.txt`,
+  and `inotify_init1_01,inotify_init1_02` report `8/8` in
+  `target/oscomp/ltp-inotify-init1-basic.txt`.
+- 2026-05-26: `fsopen(430)`, `fspick(433)`, and `open_tree(428)` are
+  dispatched as scoped new-mount-API fd providers; focused LTP `accept03`
+  moved from `17/23` to `20/23` in
+  `target/oscomp/ltp-accept03-after-mount-api-fds.txt`. Full
+  `fsconfig`/`fsmount`/`move_mount` semantics remain deferred.
+
 ### When a syscall lands
 
 Add a line under the relevant subsection naming the specific OSComp/LTP
@@ -112,14 +131,14 @@ test(s) that newly pass — e.g. *"2026-05-19: `getrlimit01`, `getrlimit02`
 pass after rlimit field landed (commit `<sha>`)"*. The skill's "Done Means"
 requires this entry before the work counts as complete.
 
-## Unwired by topic (~116 syscalls)
+## Unwired by topic (~113 syscalls)
 
-### File I/O & VFS extras (18)
+### File I/O & VFS extras (16)
 
 `preadv`, `pwritev`, `preadv2`, `pwritev2`, `sendfile`, `copy_file_range`,
 `splice`, `tee`, `sync_file_range`, `readahead`, `fallocate`,
-`name_to_handle_at`, `open_by_handle_at`, `fanotify_init` / `_mark`,
-`inotify_init1` / `_add_watch` / `_rm_watch`.
+`name_to_handle_at`, `open_by_handle_at`, `fanotify_mark`,
+`inotify_add_watch` / `_rm_watch`.
 
 ### Network — entire socket API (20)
 
@@ -138,10 +157,10 @@ requires this entry before the work counts as complete.
 `mq_open` / `_close` / `_unlink` / `_getattr` / `_setattr` / `_send` /
 `_receive` / `_timedsend` / `_timedreceive` / `_notify`.
 
-### Memory extended (8)
+### Memory extended (7)
 
 `mlock2`, `mbind`, `migrate_pages`, `get_mempolicy`, `set_mempolicy`,
-`process_vm_readv` / `_writev`, `memfd_create`.
+`process_vm_readv` / `_writev`.
 
 ### Process / sched / limits (22)
 
@@ -166,7 +185,7 @@ requires this entry before the work counts as complete.
 
 ### Misc / debug (8)
 
-`reboot`, `kexec_load`, `syslog`, `perf_event_open`, `bpf`, `ptrace`,
+`reboot`, `kexec_load`, `syslog`, full `perf_event_open`, full `bpf`, `ptrace`,
 `process_madvise`, `close_range`.
 
 ## Already-partial (existing arms returning `-ENOSYS`)
@@ -243,20 +262,18 @@ overwritten by the next `sync`. The lint variant
 
 ### Counts (from dispatch table)
 
-- `pub const NR_*` in numbers.rs: **194**
-- dispatched in mod.rs: **190** (of which async: 58, likely-stub: 0)
-- defined but not dispatched: **4**
+- `pub const NR_*` in numbers.rs: **204**
+- dispatched in mod.rs: **202** (of which async: 63, likely-stub: 0)
+- defined but not dispatched: **2**
 
-### Defined in `numbers.rs` but no dispatch arm (4)
+### Defined in `numbers.rs` but no dispatch arm (2)
 
 These have a syscall number constant but no match arm in `mod.rs`. Either wire them up or remove the constant.
 
 - `NR_IO_URING_ENTER` (nr=426)
-- `NR_PIDFD_OPEN` (nr=434)
 - `NR_PIDFD_SEND_SIGNAL` (nr=424)
-- `NR_PSELECT6` (nr=72)
 
-### Dispatched syscalls (190) — name → handler
+### Dispatched syscalls (202) — name → handler
 
 Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the heuristic flagged.
 
@@ -274,6 +291,7 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 23 | `NR_DUP` | `sys_dup` | sync |
 | 24 | `NR_DUP3` | `sys_dup3` | sync |
 | 25 | `NR_FCNTL` | `sys_fcntl` | sync |
+| 26 | `NR_INOTIFY_INIT1` | `sys_inotify_init1` | sync |
 | 29 | `NR_IOCTL` | `sys_ioctl` | sync |
 | 32 | `NR_FLOCK` | `sys_flock` | async |
 | 33 | `NR_MKNODAT` | `sys_mknodat` | async |
@@ -308,6 +326,7 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 69 | `NR_PREADV` | `sys_preadv` | async |
 | 70 | `NR_PWRITEV` | `sys_pwritev` | async |
 | 71 | `NR_SENDFILE64` | `sys_sendfile64` | async |
+| 72 | `NR_PSELECT6` | `sys_pselect6` | async |
 | 73 | `NR_PPOLL` | `sys_ppoll` | async |
 | 74 | `NR_SIGNALFD4` | `sys_signalfd4` | sync |
 | 76 | `NR_SPLICE` | `sys_splice` | sync |
@@ -347,6 +366,7 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 119 | `NR_SCHED_SETSCHEDULER` | `sys_sched_setscheduler` | sync |
 | 122 | `NR_SCHED_SETAFFINITY` | `sys_sched_setaffinity` | sync |
 | 123 | `NR_SCHED_GETAFFINITY` | `sys_sched_getaffinity` | sync |
+| 124 | `NR_SCHED_YIELD` | `sys_sched_yield` | async |
 | 129 | `NR_KILL` | `sys_kill` | sync |
 | 130 | `NR_TKILL` | `sys_tkill` | sync |
 | 131 | `NR_TGKILL` | `sys_tgkill` | sync |
@@ -431,10 +451,12 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 229 | `NR_MUNLOCK` | `sys_munlock` | async |
 | 232 | `NR_EPOLL_WAIT` | `sys_epoll_wait` | async |
 | 233 | `NR_MADVISE` | `sys_madvise` | sync |
+| 241 | `NR_PERF_EVENT_OPEN` | `sys_perf_event_open` | sync |
 | 242 | `NR_ACCEPT4` | `sys_accept4` | sync |
 | 243 | `NR_RECVMMSG` | `sys_recvmmsg` | sync |
 | 260 | `NR_WAIT4` | `sys_wait4` | async |
 | 261 | `NR_PRLIMIT64` | `sys_prlimit64` | sync |
+| 262 | `NR_FANOTIFY_INIT` | `sys_fanotify_init` | sync |
 | 264 | `NR_NAME_TO_HANDLE_AT` | `sys_name_to_handle_at` | sync |
 | 265 | `NR_OPEN_BY_HANDLE_AT` | `sys_open_by_handle_at` | sync |
 | 267 | `NR_SYNCFS` | `sys_syncfs` | async |
@@ -442,6 +464,8 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 269 | `NR_SENDMMSG` | `sys_sendmmsg` | sync |
 | 276 | `NR_RENAMEAT2` | `sys_renameat2` | async |
 | 278 | `NR_GETRANDOM` | `sys_getrandom` | sync |
+| 279 | `NR_MEMFD_CREATE` | `sys_memfd_create` | sync |
+| 280 | `NR_BPF` | `sys_bpf` | sync |
 | 282 | `NR_SIGNALFD` | `sys_signalfd` | sync |
 | 282 | `NR_USERFAULTFD` | `sys_userfaultfd` | sync |
 | 283 | `NR_MEMBARRIER` | `sys_membarrier` | sync |
@@ -451,7 +475,12 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 291 | `NR_STATX` | `sys_statx` | async |
 | 413 | `NR_PSELECT6_TIME64` | `sys_pselect6` | async |
 | 425 | `NR_IO_URING_SETUP` | `sys_io_uring_setup` | sync |
+| 428 | `NR_OPEN_TREE` | `sys_open_tree` | async |
+| 430 | `NR_FSOPEN` | `sys_fsopen` | async |
+| 433 | `NR_FSPICK` | `sys_fspick` | async |
+| 434 | `NR_PIDFD_OPEN` | `sys_pidfd_open` | sync |
 | 439 | `NR_FACCESSAT2` | `sys_faccessat2` | sync |
+| 447 | `NR_MEMFD_SECRET` | `sys_memfd_secret` | sync |
 
 <!-- END syscall-auto-table -->
 

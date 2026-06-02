@@ -5,7 +5,7 @@ use tx_substrate::mutation::{self, MutationError};
 use tx_substrate::zone::Cap;
 
 use super::identity::SocketIdentity;
-use super::types::{IpEndpoint, Ipv4Address, UnixSocketPath};
+use super::types::{AddressFamily, IpEndpoint, Ipv4Address, Ipv6Address, UnixSocketPath};
 
 const LOCAL_ENDPOINT_SLOTS: usize = 256;
 const LISTENER_SLOTS: usize = 128;
@@ -17,14 +17,18 @@ const UNIX_STREAM_PEER_SLOTS: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LocalEndpointKey {
+    pub family: AddressFamily,
     pub addr: Ipv4Address,
+    pub addr6: Ipv6Address,
     pub port: u16,
 }
 
 impl LocalEndpointKey {
     pub const fn new(endpoint: IpEndpoint) -> Self {
         Self {
+            family: endpoint.family,
             addr: endpoint.addr,
+            addr6: endpoint.addr6,
             port: endpoint.port,
         }
     }
@@ -32,18 +36,26 @@ impl LocalEndpointKey {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ConnectionKey {
+    pub local_family: AddressFamily,
     pub local_addr: Ipv4Address,
+    pub local_addr6: Ipv6Address,
     pub local_port: u16,
+    pub remote_family: AddressFamily,
     pub remote_addr: Ipv4Address,
+    pub remote_addr6: Ipv6Address,
     pub remote_port: u16,
 }
 
 impl ConnectionKey {
     pub const fn new(local: IpEndpoint, remote: IpEndpoint) -> Self {
         Self {
+            local_family: local.family,
             local_addr: local.addr,
+            local_addr6: local.addr6,
             local_port: local.port,
+            remote_family: remote.family,
             remote_addr: remote.addr,
+            remote_addr6: remote.addr6,
             remote_port: remote.port,
         }
     }
@@ -51,7 +63,9 @@ impl ConnectionKey {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ListenerKey {
+    pub local_family: AddressFamily,
     pub local_addr: Ipv4Address,
+    pub local_addr6: Ipv6Address,
     pub local_port: u16,
 }
 
@@ -66,22 +80,26 @@ pub struct UnixStreamPeerKey {
 }
 
 impl ListenerKey {
-    pub const fn exact(addr: Ipv4Address, port: u16) -> Self {
+    pub const fn exact(addr: IpEndpoint) -> Self {
         Self {
-            local_addr: addr,
-            local_port: port,
+            local_family: addr.family,
+            local_addr: addr.addr,
+            local_addr6: addr.addr6,
+            local_port: addr.port,
         }
     }
 
-    pub const fn wildcard(port: u16) -> Self {
+    pub const fn wildcard_for_family(family: AddressFamily, port: u16) -> Self {
         Self {
+            local_family: family,
             local_addr: Ipv4Address::UNSPECIFIED,
+            local_addr6: Ipv6Address::UNSPECIFIED,
             local_port: port,
         }
     }
 
     pub const fn from_endpoint(endpoint: IpEndpoint) -> Self {
-        Self::exact(endpoint.addr, endpoint.port)
+        Self::exact(endpoint)
     }
 }
 
@@ -89,6 +107,10 @@ pub struct SocketTable {
     tcp_bound: Index<LocalEndpointKey, Cap<SocketIdentity>, LOCAL_ENDPOINT_SLOTS>,
     tcp_listeners: Index<ListenerKey, Cap<SocketIdentity>, LISTENER_SLOTS>,
     tcp_connections: Index<ConnectionKey, Cap<SocketIdentity>, CONNECTION_SLOTS>,
+    sctp_bound: Index<LocalEndpointKey, Cap<SocketIdentity>, LOCAL_ENDPOINT_SLOTS>,
+    sctp_listeners: Index<ListenerKey, Cap<SocketIdentity>, LISTENER_SLOTS>,
+    sctp_connections: Index<ConnectionKey, Cap<SocketIdentity>, CONNECTION_SLOTS>,
+    rds_bound: Index<LocalEndpointKey, Cap<SocketIdentity>, LOCAL_ENDPOINT_SLOTS>,
     udp_bound: Index<LocalEndpointKey, Cap<SocketIdentity>, LOCAL_ENDPOINT_SLOTS>,
     udp_connections: Index<ConnectionKey, Cap<SocketIdentity>, CONNECTION_SLOTS>,
     raw_icmp: Index<RawIcmpSocketKey, Cap<SocketIdentity>, RAW_ICMP_SLOTS>,
@@ -103,6 +125,10 @@ impl SocketTable {
             tcp_bound: Index::new(),
             tcp_listeners: Index::new(),
             tcp_connections: Index::new(),
+            sctp_bound: Index::new(),
+            sctp_listeners: Index::new(),
+            sctp_connections: Index::new(),
+            rds_bound: Index::new(),
             udp_bound: Index::new(),
             udp_connections: Index::new(),
             raw_icmp: Index::new(),
@@ -134,6 +160,28 @@ impl SocketTable {
         Ok(())
     }
 
+    pub fn bind_sctp(
+        &self,
+        endpoint: IpEndpoint,
+        socket: Cap<SocketIdentity>,
+    ) -> Result<(), IndexError> {
+        self.sctp_bound
+            .reserve(LocalEndpointKey::new(endpoint))?
+            .commit(socket);
+        Ok(())
+    }
+
+    pub fn bind_rds(
+        &self,
+        endpoint: IpEndpoint,
+        socket: Cap<SocketIdentity>,
+    ) -> Result<(), IndexError> {
+        self.rds_bound
+            .reserve(LocalEndpointKey::new(endpoint))?
+            .commit(socket);
+        Ok(())
+    }
+
     pub fn listen_tcp(
         &self,
         endpoint: IpEndpoint,
@@ -145,12 +193,46 @@ impl SocketTable {
         Ok(())
     }
 
+    pub fn listen_sctp(
+        &self,
+        endpoint: IpEndpoint,
+        socket: Cap<SocketIdentity>,
+    ) -> Result<(), IndexError> {
+        self.sctp_listeners
+            .reserve(ListenerKey::from_endpoint(endpoint))?
+            .commit(socket);
+        Ok(())
+    }
+
     pub fn insert_tcp_connection(
         &self,
         key: ConnectionKey,
         socket: Cap<SocketIdentity>,
     ) -> Result<(), IndexError> {
         self.tcp_connections.reserve(key)?.commit(socket);
+        Ok(())
+    }
+
+    pub fn insert_sctp_connection(
+        &self,
+        key: ConnectionKey,
+        socket: Cap<SocketIdentity>,
+    ) -> Result<(), IndexError> {
+        self.sctp_connections.reserve(key)?.commit(socket);
+        Ok(())
+    }
+
+    pub fn insert_sctp_connection_pair(
+        &self,
+        first_key: ConnectionKey,
+        first_socket: Cap<SocketIdentity>,
+        second_key: ConnectionKey,
+        second_socket: Cap<SocketIdentity>,
+    ) -> Result<(), IndexError> {
+        let first = self.sctp_connections.reserve(first_key)?;
+        let second = self.sctp_connections.reserve(second_key)?;
+        first.commit(first_socket);
+        second.commit(second_socket);
         Ok(())
     }
 
@@ -224,6 +306,13 @@ impl SocketTable {
         mutation::withdraw(&self.tcp_connections, &key)
     }
 
+    pub fn withdraw_sctp_connection(
+        &self,
+        key: ConnectionKey,
+    ) -> Result<Cap<SocketIdentity>, MutationError> {
+        mutation::withdraw(&self.sctp_connections, &key)
+    }
+
     pub fn withdraw_tcp_bound(
         &self,
         endpoint: IpEndpoint,
@@ -231,11 +320,32 @@ impl SocketTable {
         mutation::withdraw(&self.tcp_bound, &LocalEndpointKey::new(endpoint))
     }
 
+    pub fn withdraw_sctp_bound(
+        &self,
+        endpoint: IpEndpoint,
+    ) -> Result<Cap<SocketIdentity>, MutationError> {
+        mutation::withdraw(&self.sctp_bound, &LocalEndpointKey::new(endpoint))
+    }
+
+    pub fn withdraw_rds_bound(
+        &self,
+        endpoint: IpEndpoint,
+    ) -> Result<Cap<SocketIdentity>, MutationError> {
+        mutation::withdraw(&self.rds_bound, &LocalEndpointKey::new(endpoint))
+    }
+
     pub fn withdraw_tcp_listener(
         &self,
         endpoint: IpEndpoint,
     ) -> Result<Cap<SocketIdentity>, MutationError> {
         mutation::withdraw(&self.tcp_listeners, &ListenerKey::from_endpoint(endpoint))
+    }
+
+    pub fn withdraw_sctp_listener(
+        &self,
+        endpoint: IpEndpoint,
+    ) -> Result<Cap<SocketIdentity>, MutationError> {
+        mutation::withdraw(&self.sctp_listeners, &ListenerKey::from_endpoint(endpoint))
     }
 
     pub fn withdraw_udp_bound(
@@ -293,12 +403,108 @@ impl SocketTable {
             .and_then(|entry| entry.value().try_clone_live())
     }
 
+    pub fn lookup_sctp_bound(
+        &self,
+        endpoint: IpEndpoint,
+        guard: &Guard<'_>,
+    ) -> Option<Cap<SocketIdentity>> {
+        self.sctp_bound
+            .lookup(&LocalEndpointKey::new(endpoint), guard)
+            .and_then(|entry| entry.value().try_clone_live())
+    }
+
+    pub fn lookup_rds_bound(
+        &self,
+        endpoint: IpEndpoint,
+        guard: &Guard<'_>,
+    ) -> Option<Cap<SocketIdentity>> {
+        self.rds_bound
+            .lookup(&LocalEndpointKey::new(endpoint), guard)
+            .and_then(|entry| entry.value().try_clone_live())
+    }
+
     pub fn lookup_tcp_listener(
         &self,
         endpoint: IpEndpoint,
         guard: &Guard<'_>,
     ) -> Option<Cap<SocketIdentity>> {
-        self.lookup_tcp_listener_addr(endpoint.addr, endpoint.port, guard)
+        self.lookup_tcp_listener_endpoint(endpoint, guard)
+    }
+
+    pub fn lookup_sctp_listener(
+        &self,
+        endpoint: IpEndpoint,
+        guard: &Guard<'_>,
+    ) -> Option<Cap<SocketIdentity>> {
+        self.lookup_sctp_listener_endpoint(endpoint, guard)
+    }
+
+    pub fn lookup_tcp_listener_endpoint(
+        &self,
+        endpoint: IpEndpoint,
+        guard: &Guard<'_>,
+    ) -> Option<Cap<SocketIdentity>> {
+        let exact = ListenerKey::from_endpoint(endpoint);
+        if let Some(entry) = self.tcp_listeners.lookup(&exact, guard) {
+            if let Some(socket) = entry.value().try_clone_live() {
+                return Some(socket);
+            }
+        }
+        let wildcard = ListenerKey::wildcard_for_family(endpoint.family, endpoint.port);
+        self.tcp_listeners
+            .lookup(&wildcard, guard)
+            .and_then(|entry| entry.value().try_clone_live())
+    }
+
+    pub fn lookup_sctp_listener_endpoint(
+        &self,
+        endpoint: IpEndpoint,
+        guard: &Guard<'_>,
+    ) -> Option<Cap<SocketIdentity>> {
+        let exact = ListenerKey::from_endpoint(endpoint);
+        if let Some(entry) = self.sctp_listeners.lookup(&exact, guard) {
+            if let Some(socket) = entry.value().try_clone_live() {
+                return Some(socket);
+            }
+        }
+        let wildcard = ListenerKey::wildcard_for_family(endpoint.family, endpoint.port);
+        self.sctp_listeners
+            .lookup(&wildcard, guard)
+            .and_then(|entry| entry.value().try_clone_live())
+    }
+
+    pub fn lookup_tcp_listener_dual_stack_endpoint(
+        &self,
+        endpoint: IpEndpoint,
+        guard: &Guard<'_>,
+    ) -> Option<Cap<SocketIdentity>> {
+        if let Some(socket) = self.lookup_tcp_listener_endpoint(endpoint, guard) {
+            return Some(socket);
+        }
+        if endpoint.family != AddressFamily::Inet {
+            return None;
+        }
+        let wildcard6 = ListenerKey::wildcard_for_family(AddressFamily::Inet6, endpoint.port);
+        self.tcp_listeners
+            .lookup(&wildcard6, guard)
+            .and_then(|entry| entry.value().try_clone_live())
+    }
+
+    pub fn lookup_sctp_listener_dual_stack_endpoint(
+        &self,
+        endpoint: IpEndpoint,
+        guard: &Guard<'_>,
+    ) -> Option<Cap<SocketIdentity>> {
+        if let Some(socket) = self.lookup_sctp_listener_endpoint(endpoint, guard) {
+            return Some(socket);
+        }
+        if endpoint.family != AddressFamily::Inet {
+            return None;
+        }
+        let wildcard6 = ListenerKey::wildcard_for_family(AddressFamily::Inet6, endpoint.port);
+        self.sctp_listeners
+            .lookup(&wildcard6, guard)
+            .and_then(|entry| entry.value().try_clone_live())
     }
 
     pub fn lookup_tcp_listener_addr(
@@ -307,16 +513,7 @@ impl SocketTable {
         port: u16,
         guard: &Guard<'_>,
     ) -> Option<Cap<SocketIdentity>> {
-        let exact = ListenerKey::exact(addr, port);
-        if let Some(entry) = self.tcp_listeners.lookup(&exact, guard) {
-            if let Some(socket) = entry.value().try_clone_live() {
-                return Some(socket);
-            }
-        }
-        let wildcard = ListenerKey::wildcard(port);
-        self.tcp_listeners
-            .lookup(&wildcard, guard)
-            .and_then(|entry| entry.value().try_clone_live())
+        self.lookup_tcp_listener_endpoint(IpEndpoint::new(addr, port), guard)
     }
 
     pub fn lookup_tcp_connection(
@@ -325,6 +522,16 @@ impl SocketTable {
         guard: &Guard<'_>,
     ) -> Option<Cap<SocketIdentity>> {
         self.tcp_connections
+            .lookup(&key, guard)
+            .and_then(|entry| entry.value().try_clone_live())
+    }
+
+    pub fn lookup_sctp_connection(
+        &self,
+        key: ConnectionKey,
+        guard: &Guard<'_>,
+    ) -> Option<Cap<SocketIdentity>> {
+        self.sctp_connections
             .lookup(&key, guard)
             .and_then(|entry| entry.value().try_clone_live())
     }
@@ -350,8 +557,10 @@ impl SocketTable {
             return Some(socket);
         }
 
-        let wildcard_local =
-            ConnectionKey::new(IpEndpoint::new(Ipv4Address::UNSPECIFIED, dst.port), src);
+        let wildcard_local = ConnectionKey::new(
+            IpEndpoint::unspecified_for_family(dst.family, dst.port),
+            src,
+        );
         if let Some(socket) = self.lookup_udp_connection(wildcard_local, guard) {
             return Some(socket);
         }
@@ -396,13 +605,33 @@ impl SocketTable {
             .snapshot_values_filter_map(guard, Cap::try_clone_live)
     }
 
+    pub fn snapshot_sctp_listeners(&self, guard: &Guard<'_>) -> Vec<Cap<SocketIdentity>> {
+        self.sctp_listeners
+            .snapshot_values_filter_map(guard, Cap::try_clone_live)
+    }
+
     pub fn snapshot_tcp_bound(&self, guard: &Guard<'_>) -> Vec<Cap<SocketIdentity>> {
         self.tcp_bound
             .snapshot_values_filter_map(guard, Cap::try_clone_live)
     }
 
+    pub fn snapshot_sctp_bound(&self, guard: &Guard<'_>) -> Vec<Cap<SocketIdentity>> {
+        self.sctp_bound
+            .snapshot_values_filter_map(guard, Cap::try_clone_live)
+    }
+
+    pub fn snapshot_rds_bound(&self, guard: &Guard<'_>) -> Vec<Cap<SocketIdentity>> {
+        self.rds_bound
+            .snapshot_values_filter_map(guard, Cap::try_clone_live)
+    }
+
     pub fn snapshot_tcp_connections(&self, guard: &Guard<'_>) -> Vec<Cap<SocketIdentity>> {
         self.tcp_connections
+            .snapshot_values_filter_map(guard, Cap::try_clone_live)
+    }
+
+    pub fn snapshot_sctp_connections(&self, guard: &Guard<'_>) -> Vec<Cap<SocketIdentity>> {
+        self.sctp_connections
             .snapshot_values_filter_map(guard, Cap::try_clone_live)
     }
 
@@ -440,7 +669,9 @@ impl SocketTable {
         self.udp_bound
             .lookup(
                 &LocalEndpointKey {
+                    family: endpoint.family,
                     addr: Ipv4Address::UNSPECIFIED,
+                    addr6: Ipv6Address::UNSPECIFIED,
                     port: endpoint.port,
                 },
                 guard,
@@ -625,6 +856,14 @@ impl InitialSocketTableProxy {
         guard: &Guard<'_>,
     ) -> Option<Cap<SocketIdentity>> {
         self.with_table(|table| table.lookup_tcp_listener(endpoint, guard))
+    }
+
+    pub fn lookup_tcp_listener_endpoint(
+        &self,
+        endpoint: IpEndpoint,
+        guard: &Guard<'_>,
+    ) -> Option<Cap<SocketIdentity>> {
+        self.with_table(|table| table.lookup_tcp_listener_endpoint(endpoint, guard))
     }
 
     pub fn lookup_tcp_listener_addr(

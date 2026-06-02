@@ -854,6 +854,52 @@ fn dispatch_unix_pathname_survives_close_until_unlink() {
 }
 
 #[test]
+fn dispatch_close_releases_abstract_unix_stream_for_seqpacket_rebind() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let path = b"\0ux_abs_rebind";
+    let addr = sockaddr_un(path);
+
+    let first_fd = socket_unix_stream(&ctx);
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                first_fd as u64,
+                addr.as_ptr() as u64,
+                SOCKADDR_UN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        socket_req(NR_CLOSE, [first_fd as u64, 0, 0, 0, 0, 0], &ctx),
+        SyscallResult::Return(0)
+    );
+
+    let second_fd = socket_unix_seqpacket(&ctx);
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                second_fd as u64,
+                addr.as_ptr() as u64,
+                SOCKADDR_UN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+}
+
+#[test]
 fn dispatch_close_releases_bound_socket_port() {
     let _setup = socket_setup();
     let (_process, ctx) = socket_ctx();

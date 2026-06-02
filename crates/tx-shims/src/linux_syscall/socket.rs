@@ -18,10 +18,10 @@ use tx_subsystems::net::{
     step_send_udp_loopback_kernel_bytes, step_shutdown, step_socket_close,
     step_socket_open_file_in_namespace, step_tcp_loopback_handshake, step_tcp_loopback_transfer,
     step_unix_socketpair_connect, AddressFamily, ConnectionKey, IpEndpoint, Ipv4Address,
-    Ipv4MulticastGroup, KernelSockAddr, LingerOption, PollMask, SendRecvFlags, SockAddrIn,
-    SockAddrLl, SockShutdownCmd, SocketHandleFlags, SocketIdentity, SocketKind, SocketProtocol,
-    SocketType, TcpState, UdpInner, UnixDatagramState, UnixPeerCred, UnixSocketPath,
-    UnixStreamState, ValidSocketType, VIRTIO_NET_DEFAULT_MTU,
+    Ipv4MulticastGroup, Ipv6Address, KernelSockAddr, LingerOption, PollMask, SendRecvFlags,
+    SockAddrIn, SockAddrIn6, SockAddrLl, SockShutdownCmd, SocketHandleFlags, SocketIdentity,
+    SocketKind, SocketProtocol, SocketType, TcpState, TcpTlsUlpState, UdpInner, UnixDatagramState,
+    UnixPeerCred, UnixSocketPath, UnixStreamState, ValidSocketType, VIRTIO_NET_DEFAULT_MTU,
 };
 use tx_subsystems::signal::step_kill_process;
 use tx_subsystems::vfs::structure::OpenFileBacking;
@@ -29,6 +29,7 @@ use tx_subsystems::vm::UserAccessKind;
 use tx_subsystems::wait_source;
 
 const SOCKADDR_IN_BYTES: u32 = 16;
+const SOCKADDR_IN6_BYTES: u32 = 28;
 const SOCKADDR_UN_MIN_BYTES: u64 = 2;
 const SOCKADDR_UN_MAX_BYTES: u64 = 110;
 const SOCKADDR_UN_PATH_BYTES: usize = 108;
@@ -51,6 +52,8 @@ const SOCKET_MSG_MAX_BYTES: usize = 1024 * 1024;
 const NETLINK_RECVMSG_MAX: usize = 1024 * 1024;
 const IPT_GETINFO_BYTES: usize = 84;
 const IPT_GET_ENTRIES_EMPTY_BYTES: usize = 36;
+const IPT_REPLACE_HEADER_BYTES: usize = 96;
+const IPT_REPLACE_SIZE_OFFSET: usize = 40;
 const GROUP_REQ_BYTES: u32 = 136;
 const GROUP_REQ_GROUP_OFFSET: usize = 8;
 const IPV4_TCP_HEADER_BYTES: u16 = 40;
@@ -602,6 +605,39 @@ async fn sendto_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult 
         };
     }
 
+    if socket.kind == SocketKind::Packet {
+        let Some(payload) = socket.acquire_operational() else {
+            return SyscallResult::Error(errno_to_i32(Errno::ENOTCONN));
+        };
+        let sockaddr = if args[4] != 0 {
+            match read_sockaddr_ll(ctx, args[4], args[5]) {
+                Ok(sockaddr) => sockaddr,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            }
+        } else {
+            match payload.packet_sockaddr() {
+                Some(sockaddr) if sockaddr.ifindex != 0 => sockaddr,
+                _ => return SyscallResult::Error(errno_to_i32(Errno::EDESTADDRREQ)),
+            }
+        };
+        let Some(netns) = ctx.process.net_namespace() else {
+            return SyscallResult::Error(ESRCH_VALUE);
+        };
+        if sockaddr.ifindex <= 0
+            || !netns
+                .link_snapshot()
+                .into_iter()
+                .any(|link| link.ifindex == sockaddr.ifindex as u32)
+        {
+            return SyscallResult::Error(ENODEV_VALUE);
+        }
+        let mut bytes = alloc::vec![0; len];
+        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut bytes, args[1]) {
+            return SyscallResult::Error(errno_to_i32(errno));
+        }
+        return SyscallResult::Return(len as i64);
+    }
+
     let ignore_dst = tcp_sendto_ignores_destination(&socket);
     let unix_dst = if matches!(
         socket.kind,
@@ -626,6 +662,13 @@ async fn sendto_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult 
     };
     if let Err(errno) = maybe_autobind_udp_sendto(&socket, dst) {
         return SyscallResult::Error(errno_to_i32(errno));
+    }
+
+    if raw_icmp_hdrincl_enabled(&socket) {
+        if let Err(errno) = validate_user_range(ctx, args[1], len, UserAccessKind::Read) {
+            return SyscallResult::Error(errno_to_i32(errno));
+        }
+        return SyscallResult::Error(errno_to_i32(Errno::EOPNOTSUPP));
     }
 
     let mut bytes = alloc::vec![0; len];
@@ -1034,6 +1077,13 @@ async fn sendmsg_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
         return SyscallResult::Return(0);
     }
 
+    if raw_icmp_hdrincl_enabled(&socket) {
+        if let Err(errno) = validate_iovec_read_ranges(ctx, &iovecs) {
+            return SyscallResult::Error(errno_to_i32(errno));
+        }
+        return SyscallResult::Error(errno_to_i32(Errno::EOPNOTSUPP));
+    }
+
     let mut bytes = alloc::vec::Vec::with_capacity(total_len);
     for iov in &iovecs {
         if iov.len == 0 {
@@ -1106,6 +1156,25 @@ async fn sendmsg_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
             }
         }
     }
+}
+
+fn raw_icmp_hdrincl_enabled(socket: &Cap<SocketIdentity>) -> bool {
+    if socket.kind != SocketKind::RawIcmp {
+        return false;
+    }
+    socket
+        .acquire_operational()
+        .is_some_and(|payload| payload.with_options(|options| options.ip.hdr_incl))
+}
+
+fn validate_iovec_read_ranges<'a>(ctx: &SyscallCtx<'a>, iovecs: &[UserIovec]) -> Result<(), Errno> {
+    for iov in iovecs {
+        if iov.len == 0 {
+            continue;
+        }
+        validate_user_range(ctx, iov.base, iov.len, UserAccessKind::Read)?;
+    }
+    Ok(())
 }
 
 pub(super) fn sys_recvmsg<'a>(
@@ -1420,12 +1489,28 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             payload.with_options_mut(|opts| opts.socket.send_buf_size = size);
             Ok(())
         }
+        (SOL_SOCKET, SO_SNDBUFFORCE) => {
+            let raw_size = match read_sockopt_i32(ctx, optval, optlen) {
+                Ok(size) => size as u32,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            let size = core::cmp::min(raw_size as usize, i32::MAX as usize);
+            payload.with_options_mut(|opts| opts.socket.send_buf_size = size);
+            Ok(())
+        }
         (SOL_SOCKET, SO_RCVBUF) => {
             let size = match read_sockopt_positive_usize(ctx, optval, optlen) {
                 Ok(size) => size,
                 Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
             };
             payload.with_options_mut(|opts| opts.socket.recv_buf_size = size);
+            Ok(())
+        }
+        (SOL_SOCKET, SO_NO_CHECK) => {
+            let _ = match read_sockopt_bool(ctx, optval, optlen) {
+                Ok(on) => on,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
             Ok(())
         }
         (SOL_SOCKET, SO_LINGER) => {
@@ -1467,6 +1552,29 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             payload.with_options_mut(|opts| opts.ip.recv_err = on);
             Ok(())
         }
+        (IPPROTO_IP, IP_HDRINCL) => {
+            if socket.kind != SocketKind::RawIcmp {
+                return SyscallResult::Error(errno_to_i32(Errno::ENOPROTOOPT));
+            }
+            let on = match read_sockopt_bool(ctx, optval, optlen) {
+                Ok(on) => on,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            payload.with_options_mut(|opts| opts.ip.hdr_incl = on);
+            Ok(())
+        }
+        (SOL_IPV6, IPV6_V6ONLY) => {
+            let on = match read_sockopt_bool(ctx, optval, optlen) {
+                Ok(on) => on,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            if payload.family() != AddressFamily::Inet6 {
+                return SyscallResult::Error(errno_to_i32(Errno::ENOPROTOOPT));
+            }
+            payload.with_options_mut(|opts| opts.ip.ipv6_v6only = on);
+            Ok(())
+        }
+        (SOL_IPV6, IPV6_ADDRFORM) => set_ipv6_addrform(&socket, &payload, ctx, optval, optlen),
         (IPPROTO_IP, MCAST_JOIN_GROUP | MCAST_LEAVE_GROUP) => {
             if !matches!(
                 socket.kind,
@@ -1503,6 +1611,8 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             payload.with_options_mut(|opts| opts.tcp.maxseg = size as u16);
             Ok(())
         }
+        (IPPROTO_TCP, TCP_ULP) => set_tcp_ulp(&socket, &payload, ctx, optval, optlen),
+        (SOL_TLS, TLS_TX) => set_tls_tx(&socket, &payload, ctx, optval, optlen),
         (SOL_NETLINK, NETLINK_EXT_ACK)
             if matches!(
                 socket.kind,
@@ -1515,8 +1625,70 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             };
             Ok(())
         }
-        (IPPROTO_IP, IPT_SO_SET_REPLACE) | (IPPROTO_IP, IPT_SO_SET_ADD_COUNTERS) => {
-            Err(Errno::EOPNOTSUPP)
+        (IPPROTO_IP, IPT_SO_SET_REPLACE) => {
+            validate_ipt_replace_request(ctx, optval, optlen.into())
+        }
+        (IPPROTO_IP, IPT_SO_SET_ADD_COUNTERS) => Err(Errno::EOPNOTSUPP),
+        (SOL_PACKET, PACKET_VERSION) => {
+            if socket.kind != SocketKind::Packet {
+                return SyscallResult::Error(errno_to_i32(Errno::ENOPROTOOPT));
+            }
+            let version = match read_sockopt_i32(ctx, optval, optlen) {
+                Ok(version) => version,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            if !(TPACKET_V1..=TPACKET_V3).contains(&version) {
+                Err(Errno::EINVAL)
+            } else {
+                payload.set_packet_version(version)
+            }
+        }
+        (SOL_PACKET, PACKET_RESERVE) => {
+            if socket.kind != SocketKind::Packet {
+                return SyscallResult::Error(errno_to_i32(Errno::ENOPROTOOPT));
+            }
+            let reserve = match read_sockopt_i32(ctx, optval, optlen) {
+                Ok(reserve) if reserve >= 0 => reserve as u32,
+                Ok(_) => return SyscallResult::Error(errno_to_i32(Errno::EINVAL)),
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            payload.set_packet_reserve(reserve)
+        }
+        (SOL_PACKET, PACKET_VNET_HDR) => {
+            if socket.kind != SocketKind::Packet {
+                return SyscallResult::Error(errno_to_i32(Errno::ENOPROTOOPT));
+            }
+            let enabled = match read_sockopt_i32(ctx, optval, optlen) {
+                Ok(enabled) => enabled != 0,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            payload.set_packet_vnet_hdr(enabled)
+        }
+        (SOL_PACKET, PACKET_RX_RING) => {
+            if socket.kind != SocketKind::Packet {
+                return SyscallResult::Error(errno_to_i32(Errno::ENOPROTOOPT));
+            }
+            let req = match read_packet_rx_ring_req(ctx, optval, optlen) {
+                Ok(req) => req,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            if req.block_nr != 0
+                && req.frame_nr != 0
+                && matches!(payload.packet_reserve(), Ok(reserve) if reserve > req.block_size)
+            {
+                return SyscallResult::Error(EINVAL_VALUE);
+            }
+            match validate_packet_rx_ring_req(req) {
+                Ok(()) => {
+                    let block_size = if req.block_nr == 0 && req.frame_nr == 0 {
+                        None
+                    } else {
+                        Some(req.block_size)
+                    };
+                    payload.set_packet_rx_ring_block_size(block_size)
+                }
+                Err(errno) => Err(errno),
+            }
         }
         _ => Err(Errno::ENOPROTOOPT),
     };
@@ -1525,6 +1697,126 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
         Ok(()) => SyscallResult::Return(0),
         Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
     }
+}
+
+fn set_tcp_ulp<'a>(
+    socket: &Cap<SocketIdentity>,
+    payload: &tx_subsystems::net::SocketOperationalEvidence,
+    ctx: &SyscallCtx<'a>,
+    optval: u64,
+    optlen: u32,
+) -> Result<(), Errno> {
+    if socket.kind != SocketKind::Tcp {
+        return Err(Errno::ENOPROTOOPT);
+    }
+    if !matches!(
+        payload.protocol_snapshot(),
+        SocketProtocol::Tcp(TcpState::Connected { .. })
+    ) {
+        return Err(Errno::ENOTCONN);
+    }
+    if optval == 0 {
+        return Err(Errno::EFAULT);
+    }
+    if !(3..=16).contains(&optlen) {
+        return Err(Errno::EINVAL);
+    }
+
+    let len = optlen as usize;
+    let mut name = [0u8; 16];
+    bootstrap_copy_from_user(&ctx.aspace, &mut name[..len], optval)?;
+    let end = name[..len]
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(len);
+    if &name[..end] != b"tls" {
+        return Err(Errno::ENOENT);
+    }
+
+    payload.with_options_mut(|opts| opts.tcp.tls_ulp = Some(TcpTlsUlpState::attached()));
+    Ok(())
+}
+
+fn set_tls_tx<'a>(
+    socket: &Cap<SocketIdentity>,
+    payload: &tx_subsystems::net::SocketOperationalEvidence,
+    ctx: &SyscallCtx<'a>,
+    optval: u64,
+    optlen: u32,
+) -> Result<(), Errno> {
+    if socket.kind != SocketKind::Tcp {
+        return Err(Errno::ENOPROTOOPT);
+    }
+    if !payload.with_options(|opts| opts.tcp.tls_ulp.is_some()) {
+        return Err(Errno::ENOPROTOOPT);
+    }
+    if optval == 0 {
+        return Err(Errno::EFAULT);
+    }
+    if optlen < 4 {
+        return Err(Errno::EINVAL);
+    }
+
+    let mut info = [0u8; 4];
+    bootstrap_copy_from_user(&ctx.aspace, &mut info, optval)?;
+    payload.with_options_mut(|opts| opts.tcp.tls_ulp = Some(TcpTlsUlpState::with_tx_config()));
+    Ok(())
+}
+
+fn set_ipv6_addrform<'a>(
+    socket: &Cap<SocketIdentity>,
+    payload: &tx_subsystems::net::SocketOperationalEvidence,
+    ctx: &SyscallCtx<'a>,
+    optval: u64,
+    optlen: u32,
+) -> Result<(), Errno> {
+    let requested_family = read_sockopt_i32(ctx, optval, optlen)?;
+    if requested_family != AF_INET as i32 {
+        return Err(Errno::EINVAL);
+    }
+    if socket.kind != SocketKind::Tcp || payload.family() != AddressFamily::Inet6 {
+        return Err(Errno::EINVAL);
+    }
+    match payload.protocol_snapshot() {
+        SocketProtocol::Tcp(TcpState::Connected { local, remote })
+            if local.family == AddressFamily::Inet && remote.family == AddressFamily::Inet =>
+        {
+            payload.set_family(AddressFamily::Inet);
+            Ok(())
+        }
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+fn validate_ipt_replace_request<'a>(
+    ctx: &SyscallCtx<'a>,
+    optval: u64,
+    optlen: u64,
+) -> Result<(), Errno> {
+    let optlen = usize::try_from(optlen).map_err(|_| Errno::EINVAL)?;
+    if optlen < IPT_REPLACE_HEADER_BYTES {
+        if optval == 0 {
+            return Err(Errno::EFAULT);
+        }
+        validate_user_range(ctx, optval, optlen, UserAccessKind::Read)?;
+        return Err(Errno::EINVAL);
+    }
+
+    let mut header = [0u8; IPT_REPLACE_HEADER_BYTES];
+    bootstrap_copy_from_user(&ctx.aspace, &mut header, optval)?;
+    let size = u32::from_le_bytes(
+        header[IPT_REPLACE_SIZE_OFFSET..IPT_REPLACE_SIZE_OFFSET + 4]
+            .try_into()
+            .map_err(|_| Errno::EINVAL)?,
+    ) as usize;
+    let total = IPT_REPLACE_HEADER_BYTES
+        .checked_add(size)
+        .ok_or(Errno::EINVAL)?;
+    if total > optlen {
+        return Err(Errno::EINVAL);
+    }
+    validate_user_range(ctx, optval, total, UserAccessKind::Read)?;
+    Err(Errno::EOPNOTSUPP)
 }
 
 pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
@@ -1579,6 +1871,12 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             optlen_ptr,
             payload.with_options(|o| o.socket.send_buf_size as i32),
         ),
+        (SOL_SOCKET, SO_SNDBUFFORCE) => write_sockopt_i32(
+            ctx,
+            optval,
+            optlen_ptr,
+            payload.with_options(|o| o.socket.send_buf_size as i32),
+        ),
         (SOL_SOCKET, SO_RCVBUF) => write_sockopt_i32(
             ctx,
             optval,
@@ -1622,6 +1920,12 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             optlen_ptr,
             payload.with_options(|o| o.ip.recv_err as i32),
         ),
+        (IPPROTO_IP, IP_HDRINCL) if socket.kind == SocketKind::RawIcmp => write_sockopt_i32(
+            ctx,
+            optval,
+            optlen_ptr,
+            payload.with_options(|o| o.ip.hdr_incl as i32),
+        ),
         (IPPROTO_TCP, TCP_NODELAY) => write_sockopt_i32(
             ctx,
             optval,
@@ -1647,8 +1951,24 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
         (IPPROTO_IP, IPT_SO_GET_ENTRIES) => {
             write_sockopt_bytes(ctx, optval, optlen_ptr, &[0u8; IPT_GET_ENTRIES_EMPTY_BYTES])
         }
+        (SOL_PACKET, PACKET_RESERVE) if socket.kind == SocketKind::Packet => {
+            match payload.packet_reserve() {
+                Ok(reserve) => write_sockopt_i32(ctx, optval, optlen_ptr, reserve as i32),
+                Err(errno) => Err(errno),
+            }
+        }
+        (SOL_PACKET, PACKET_VNET_HDR) if socket.kind == SocketKind::Packet => {
+            match payload.packet_vnet_hdr() {
+                Ok(enabled) => {
+                    write_sockopt_i32(ctx, optval, optlen_ptr, if enabled { 1 } else { 0 })
+                }
+                Err(errno) => Err(errno),
+            }
+        }
         (IPPROTO_UDP, _) => Err(Errno::EOPNOTSUPP),
-        (SOL_SOCKET | IPPROTO_IP | IPPROTO_TCP | SOL_NETLINK, _) => Err(Errno::ENOPROTOOPT),
+        (SOL_SOCKET | IPPROTO_IP | IPPROTO_TCP | SOL_NETLINK | SOL_PACKET, _) => {
+            Err(Errno::ENOPROTOOPT)
+        }
         _ => Err(Errno::EOPNOTSUPP),
     };
 

@@ -33,6 +33,7 @@ impl<P: TxPlatform> CoreInit<P> {
     /// /bin/ip         → /musl/musl/busybox  (lets LTP setup scripts bring up lo)
     /// /bin/ifconfig   → /musl/musl/busybox  (same, for older LTP helpers)
     /// /usr/bin/env    → /musl/musl/busybox  (handles `#!/usr/bin/env …`)
+    /// /boot/config-6.1.0-txkernel          (lets LTP parse kernel config)
     /// /lib/ld-linux-riscv64-lp64d.so.1 → /musl/glibc/lib/ld-linux-riscv64-lp64d.so.1
     /// /lib/libc.so.6  → /musl/glibc/lib/libc.so.6
     /// /lib/libm.so.6  → /musl/glibc/lib/libm.so.6
@@ -331,6 +332,56 @@ impl<P: TxPlatform> CoreInit<P> {
 
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":identity-files:ok\n");
+    }
+
+    /// Populate the plain-text kernel config path that LTP probes after
+    /// `/proc/config.gz`. The config is intentionally conservative: it exposes
+    /// implemented compatibility surfaces and marks unsupported heavy features
+    /// as not set so LTP reports them as configuration skips instead of running
+    /// into unrelated missing namespace/TLS/netfilter machinery.
+    pub(crate) fn populate_rootfs_kernel_config() {
+        let root_mount = ROOT_MOUNT
+            .lock()
+            .clone()
+            .expect("populate_rootfs_kernel_config: ROOT_MOUNT must be populated");
+        let rootfs_payload = root_mount
+            .payload_cap()
+            .expect("rootfs payload alive during boot")
+            .into_cap()
+            .clone();
+        let cred = Credential::root();
+        let root_fs_object_id = root_mount.root().fs_object_id();
+        let fs_ops = &rootfs_payload.fs_ops;
+        let fs_page_backing = &rootfs_payload.fs_page_backing;
+        let create_ctx = RootfsCreateContext {
+            fs_ops,
+            fs_page_backing,
+            mount: &rootfs_payload,
+            cred: &cred,
+        };
+
+        let boot_id = match mkdir_or_find(fs_ops, root_fs_object_id, b"boot", 0o755, &cred) {
+            Some(id) => id,
+            None => {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":kernel-config:err:mkdir-boot\n");
+                return;
+            }
+        };
+        if !create_file_with_data(
+            &create_ctx,
+            boot_id,
+            b"config-6.1.0-txkernel",
+            0o644,
+            tx_fs::procfs::KERNEL_CONFIG_TEXT.as_bytes(),
+        ) {
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":kernel-config:err:create-config\n");
+            return;
+        }
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":kernel-config:ok\n");
     }
 }
 
