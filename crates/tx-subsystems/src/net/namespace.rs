@@ -580,6 +580,12 @@ impl NetNamespacePayload {
             .any(|link| link.ipv4_addr == Some(addr))
     }
 
+    pub fn owns_ipv6_addr(&self, addr: Ipv6Address) -> bool {
+        self.link_snapshot()
+            .into_iter()
+            .any(|link| link.ipv6_addr == Some(addr))
+    }
+
     pub fn device_snapshot(&self) -> Vec<&'static NetDeviceRegistration> {
         let mut devices = Vec::new();
         let links = self.namespace_devices.lock();

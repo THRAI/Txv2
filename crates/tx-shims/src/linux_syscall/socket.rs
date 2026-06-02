@@ -1880,6 +1880,21 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             payload.with_options_mut(|opts| opts.ip.ipv6_v6only = on);
             Ok(())
         }
+        (SOL_IPV6, IPV6_UNICAST_HOPS) => {
+            if payload.family() != AddressFamily::Inet6 {
+                return SyscallResult::Error(errno_to_i32(Errno::ENOPROTOOPT));
+            }
+            let hops = match read_sockopt_i32(ctx, optval, optlen) {
+                Ok(hops) => hops,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            match hops {
+                -1 => payload.with_options_mut(|opts| opts.ip.ipv6_unicast_hops = 64),
+                1..=255 => payload.with_options_mut(|opts| opts.ip.ipv6_unicast_hops = hops as u8),
+                _ => return SyscallResult::Error(errno_to_i32(Errno::EINVAL)),
+            }
+            Ok(())
+        }
         (SOL_IPV6 | SOL_RAW, IPV6_CHECKSUM) => {
             set_ipv6_checksum(&socket, &payload, ctx, optval, optlen)
         }
@@ -2363,6 +2378,14 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             optlen_ptr,
             payload.with_options(|o| o.ip.ipv6_v6only as i32),
         ),
+        (SOL_IPV6, IPV6_UNICAST_HOPS) if payload.family() == AddressFamily::Inet6 => {
+            write_sockopt_i32(
+                ctx,
+                optval,
+                optlen_ptr,
+                payload.with_options(|o| o.ip.ipv6_unicast_hops as i32),
+            )
+        }
         (SOL_IPV6 | SOL_RAW, IPV6_CHECKSUM)
             if socket.kind == SocketKind::RawIcmp && payload.family() == AddressFamily::Inet6 =>
         {

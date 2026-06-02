@@ -50,7 +50,7 @@ fn require_local_bind_addr(
         }
         AddressFamily::Inet6 => {
             if endpoint.addr6 == crate::net::structure::Ipv6Address::UNSPECIFIED
-                || endpoint.addr6 == crate::net::structure::Ipv6Address::LOOPBACK
+                || payload.net_namespace().owns_ipv6_addr(endpoint.addr6)
             {
                 Ok(endpoint)
             } else {

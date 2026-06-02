@@ -20,14 +20,15 @@ Date: 2026-06-02
 
 当前最重要的小计：
 
-- 已确认通过点数：`363` = syscall-network `229` +
+- 已确认通过点数：`366` = syscall-network `229` +
   `net.ipv6_lib` `76` + `net.tcp_cmds` `37` + `net.ipv6:ping601`
-  `10` + `net.ipv6:ping602` `10` + `net.ipv6:ipneigh6_ip` `1`。
-- 已观察分母口径：`363/380` = syscall-network `229/236` +
+  `10` + `net.ipv6:ping602` `10` + `net.ipv6:ipneigh6_ip` `1` +
+  `net.ipv6:traceroute601` `3`。
+- 已观察分母口径：`366/380` = syscall-network `229/236` +
   `net.ipv6_lib` `76/77` + `net.tcp_cmds` 已计分 `37/40` +
   `net.ipv6:ping601` `10/10` + `net.ipv6:ping602` `10/10` +
-  `net.ipv6:traceroute601` `0/6` + `net.ipv6:ipneigh6_ip` `1/1`。
-- 上面的 `363/380` 仍然是 stitched/local 进度，不等于全量 LTP network
+  `net.ipv6:traceroute601` `3/6` + `net.ipv6:ipneigh6_ip` `1/1`。
+- 上面的 `366/380` 仍然是 stitched/local 进度，不等于全量 LTP network
   官方成绩；`TCONF` 和未跑模块没有计入分母。
 
 ## 总表
@@ -37,7 +38,7 @@ Date: 2026-06-02
 | socket/network syscall | `runtest/syscalls` 手动筛出的 50 个 socket/network case | 50 cases | `229/236` | split-batch 已覆盖全部 50 个 case；剩余缺口主要是架构面、镜像/用户态 wrapper、少量非核心网络 surface | 作为回归基线；细节见下面 syscall 分批表和 `docs/LTP/ltp-network-syscall-progress.md` |
 | IPv6 libc/API | `net.ipv6_lib` | 6 entries | `76/77` | 基本完成；只剩 `asapi_01` 的 `hopopt` 协议表点，属于 musl test image/libc 表缺口 | 不优先花 kernel 网络时间；除非允许重建 LTP/musl 镜像 |
 | IPv4/命令层网络 | `net.tcp_cmds` | 17 entries | 已计分 `37/40`，另有 9 项 `TCONF/skipped` | `netstat`、`iproute`、`ping01`、`ping02`、`arping01`、`ipneigh01_{arp,ip}` 已过；`traceroute01` 为 `3/6` 部分通过 | 决定 rootfs 工具面：`ss`、`tracepath`、`tcpdump`、`traceroute -T`、服务命令、netfilter/driver 广告 |
-| IPv6 命令层网络 | `net.ipv6` | 11 entries | 已计分 `21/27`，另有 7 项 `TCONF/skipped` | `ping601`、`ping602`、`ipneigh6_ip` 已过；`traceroute601` 为 `0/6`；`sendfile601`、`tcpdump601`、`tracepath601`、`dhcpd6`、`dnsmasq6`、`ip6tables`、`nft6` 目前是工具/driver TCONF | 下一步优先看 `traceroute601 -I` 的 IPv6 bind 语义；工具/driver项另列 rootfs/config backlog |
+| IPv6 命令层网络 | `net.ipv6` | 11 entries | 已计分 `24/27`，另有 7 项 `TCONF/skipped` | `ping601`、`ping602`、`ipneigh6_ip` 已过；`traceroute601 -I` 已过，`-T` 仍因 BusyBox 不支持而剩 `3/6`；`sendfile601`、`tcpdump601`、`tracepath601`、`dhcpd6`、`dnsmasq6`、`ip6tables`、`nft6` 目前是工具/driver TCONF | 下一步优先决定 rootfs/full-tool 方向：`traceroute6 -T`、`ss`、`tracepath`、`tcpdump`、服务命令和 netfilter/driver 广告 |
 | 高级网络特性 | `net.features` | 62 entries | not-run | 未开始；包含 BBR、DCCP、SCTP、TFO、VXLAN、VLAN、macvlan、macsec、GRE/GUE/FOU、Geneve、WireGuard 等 | 暂缓，等命令层/IPv6 baseline 更稳 |
 | 组播 | `net.multicast` | 4 entries | not-run | 未开始 | 暂缓 |
 | 完整 SCTP | `net.sctp` | 41 entries | not-run | 未开始；不同于 syscall witness 里的 local-only SCTP 支持 | 除非明确 charter 完整 SCTP，否则暂缓 |
@@ -158,9 +159,10 @@ boot-environment surfaces:
 
 ## 细表：`net.ipv6`
 
-小计：已计分 `21/27`，另有 7 项 `TCONF/skipped`。`ping601`、
-`ping602` 和 `ipneigh6_ip` 已经通过；`traceroute601` 是当前唯一
-已进入命令主体且失败的 IPv6 命令层语义 witness。
+小计：已计分 `24/27`，另有 7 项 `TCONF/skipped`。`ping601`、
+`ping602`、`ipneigh6_ip` 和 `traceroute601 -I` 已经通过；当前剩余的
+`traceroute601` 失分是 `-T`，因为当前 BusyBox `traceroute6` 不支持
+TCP-SYN 模式。
 
 | 测试 | 得分 | 状态 | 说明 | 证据 |
 | --- | ---: | --- | --- | --- |
@@ -169,7 +171,7 @@ boot-environment surfaces:
 | `sendfile601` | skipped | `TCONF` | IPv6 setup 完整；主体跳过在 `ss` 缺失，和 IPv4 `sendfile` 同类 rootfs 工具缺口。 | `target/oscomp/ltp-net-ipv6-command4-next-420s.txt` |
 | `tcpdump601` | skipped | `TCONF` | focused run 显示脚本 helper 有 `tst_require_drivers` warning，最终跳过在 rootfs 缺 `tcpdump`；尚未进入 AF_PACKET capture 语义。 | `target/oscomp/ltp-net-ipv6-tcpdump601-focused-240s.txt` |
 | `tracepath601` | skipped | `TCONF` | IPv6 setup 完整；跳过在 rootfs 缺 `tracepath`。 | `target/oscomp/ltp-net-ipv6-tracepath-traceroute-next-300s.txt` |
-| `traceroute601` | `0/6` | fail | ICMP-ECHO `-I` 子项失败在 `traceroute6: bind: Address family not supported by protocol`；TCP-SYN `-T` 子项仍是 BusyBox `traceroute6` 不支持 `-T`。 | `target/oscomp/ltp-net-ipv6-tracepath-traceroute-next-300s.txt` |
+| `traceroute601` | `3/6` | partial | ICMP-ECHO `-I` 子项已过：command、`80 byte` 和 1-hop regex 三项 TPASS。修复点是 raw ICMPv6 `getsockname()` 返回 IPv6 sockaddr，以及 Linux-compatible `IPV6_UNICAST_HOPS` set/get。剩余 TCP-SYN `-T` 子项仍是 BusyBox `traceroute6` 不支持 `-T`。 | fail `target/oscomp/ltp-net-ipv6-tracepath-traceroute-next-300s.txt`; mid `target/oscomp/ltp-net-ipv6-traceroute601-rawicmp6-getsockname-300s.txt`; pass-half `target/oscomp/ltp-net-ipv6-traceroute601-unicast-hops-300s.txt` |
 | `dhcpd6` | skipped | `TCONF` | IPv6 setup 完整；rootfs 缺 `dhcpd`。 | `target/oscomp/ltp-net-ipv6-services-netfilter-next-360s.txt` |
 | `dnsmasq6` | skipped | `TCONF` | IPv6 setup 完整；rootfs 缺 `dnsmasq`。 | `target/oscomp/ltp-net-ipv6-services-netfilter-next-360s.txt` |
 | `ipneigh6_ip` | `1/1` | pass | baseline 已过 stress marker 但失败 `NDISC entry 'fd00:1:1:1::1' not listed`。补上 IPv6 NDISC resolved cache/projection、单包 `ping6` builtin 安装 NDISC、以及 IPv6 `ip neigh del` 删除路径后，50 轮 add/show/delete 全部 TPASS。 | fail `target/oscomp/ltp-net-ipv6-ipneigh6-ip-focused-480s.txt`; pass `target/oscomp/ltp-net-ipv6-ipneigh6-ip-ndisc-480s.txt` |
@@ -390,10 +392,10 @@ small and choose between these blockers:
   owner is fixed; decide separately whether the `-T` subcase requires a fuller
   traceroute binary or a compatible rootfs command shim;
 - `net.ipv6` command layer: all 11 entries now have focused witnesses.
-  `ping601`, `ping602`, and `ipneigh6_ip` pass; `traceroute601` is the next
-  real semantic owner because ICMP-ECHO `-I` fails at IPv6 bind while TCP-SYN
-  `-T` remains a BusyBox command-surface gap. The remaining observed entries
-  are rootfs/tool or driver-advertisement `TCONF`.
+  `ping601`, `ping602`, `ipneigh6_ip`, and the ICMP-ECHO half of
+  `traceroute601` pass. The remaining `traceroute601` points are TCP-SYN
+  `-T`, which the bundled BusyBox `traceroute6` does not support. The other
+  observed entries are rootfs/tool or driver-advertisement `TCONF`.
 
 Useful confirmation targets after those fixes:
 
@@ -404,5 +406,5 @@ timeout 300s make oscomp-qemu-rv64 \
 
 timeout 240s make oscomp-qemu-rv64 \
   OSCOMP_GROUPS=ltp-runtest:net.ipv6:traceroute601 \
-  OSCOMP_OUT_RV=target/oscomp/ltp-net-ipv6-traceroute601-focused-240s.txt
+  OSCOMP_OUT_RV=target/oscomp/ltp-net-ipv6-traceroute601-regress-240s.txt
 ```

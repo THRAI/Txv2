@@ -7,18 +7,19 @@ use super::super::{errno_to_i32, Errno};
 use crate::linux_syscall::{
     AF_INET, AF_INET6, AF_NETLINK, AF_PACKET, AF_UNIX, EACCES_VALUE, EAGAIN_VALUE, EBADF_VALUE,
     EFAULT_VALUE, EINTR_VALUE, ENXIO_VALUE, FD_CLOEXEC, F_GETFD, F_GETFL, F_SETFL, IPPROTO_ICMP,
-    IPPROTO_IP, IPPROTO_IPV6, IPPROTO_TCP, IPPROTO_UDP, IPPROTO_UDPLITE, IPT_SO_GET_ENTRIES,
-    IPT_SO_GET_INFO, IPT_SO_SET_REPLACE, IPV6_ADDRFORM, IP_HDRINCL, IP_RECVERR, IP_TTL,
-    ITIMER_REAL, NETLINK_EXT_ACK, NETLINK_NETFILTER, NETLINK_ROUTE, NETLINK_XFRM, NR_ACCEPT,
-    NR_BIND, NR_CLOSE, NR_CONNECT, NR_DUP, NR_FCNTL, NR_GETSOCKNAME, NR_GETSOCKOPT, NR_IOCTL,
-    NR_LISTEN, NR_PIPE2, NR_PPOLL, NR_PSELECT6, NR_PSELECT6_TIME64, NR_READ, NR_RECVFROM,
-    NR_RECVMMSG, NR_RECVMSG, NR_SENDMMSG, NR_SENDMSG, NR_SENDTO, NR_SETITIMER, NR_SETSOCKOPT,
-    NR_SOCKET, NR_SOCKETPAIR, NR_WRITE, O_CLOEXEC, O_NONBLOCK, O_RDWR, PACKET_RESERVE,
-    PACKET_RX_RING, PACKET_VERSION, PACKET_VNET_HDR, SIOCDARP, SIOCGIFCONF, SIOCGIFFLAGS,
-    SIOCGIFHWADDR, SIOCGIFINDEX, SIOCGIFMTU, SIOCGIFNAME, SIOCGIFTXQLEN, SIOCSARP, SIOCSIFFLAGS,
-    SIOCSIFMTU, SOCKET_IO_MAX_INLINE, SOL_IPV6, SOL_NETLINK, SOL_PACKET, SOL_SOCKET, SOL_TLS,
-    SO_BINDTODEVICE, SO_DONTROUTE, SO_ERROR, SO_PEERCRED, SO_RCVTIMEO, SO_REUSEADDR, SO_SNDBUF,
-    SO_SNDBUFFORCE, SO_TYPE, TCP_MAXSEG, TCP_ULP, TLS_TX, TPACKET_V3, TTY_WRITE_MAX_INLINE,
+    IPPROTO_ICMPV6, IPPROTO_IP, IPPROTO_IPV6, IPPROTO_TCP, IPPROTO_UDP, IPPROTO_UDPLITE,
+    IPT_SO_GET_ENTRIES, IPT_SO_GET_INFO, IPT_SO_SET_REPLACE, IPV6_ADDRFORM, IPV6_UNICAST_HOPS,
+    IP_HDRINCL, IP_RECVERR, IP_TTL, ITIMER_REAL, NETLINK_EXT_ACK, NETLINK_NETFILTER, NETLINK_ROUTE,
+    NETLINK_XFRM, NR_ACCEPT, NR_BIND, NR_CLOSE, NR_CONNECT, NR_DUP, NR_FCNTL, NR_GETSOCKNAME,
+    NR_GETSOCKOPT, NR_IOCTL, NR_LISTEN, NR_PIPE2, NR_PPOLL, NR_PSELECT6, NR_PSELECT6_TIME64,
+    NR_READ, NR_RECVFROM, NR_RECVMMSG, NR_RECVMSG, NR_SENDMMSG, NR_SENDMSG, NR_SENDTO,
+    NR_SETITIMER, NR_SETSOCKOPT, NR_SOCKET, NR_SOCKETPAIR, NR_WRITE, O_CLOEXEC, O_NONBLOCK, O_RDWR,
+    PACKET_RESERVE, PACKET_RX_RING, PACKET_VERSION, PACKET_VNET_HDR, SIOCDARP, SIOCGIFCONF,
+    SIOCGIFFLAGS, SIOCGIFHWADDR, SIOCGIFINDEX, SIOCGIFMTU, SIOCGIFNAME, SIOCGIFTXQLEN, SIOCSARP,
+    SIOCSIFFLAGS, SIOCSIFMTU, SOCKET_IO_MAX_INLINE, SOL_IPV6, SOL_NETLINK, SOL_PACKET, SOL_SOCKET,
+    SOL_TLS, SO_BINDTODEVICE, SO_DONTROUTE, SO_ERROR, SO_PEERCRED, SO_RCVTIMEO, SO_REUSEADDR,
+    SO_SNDBUF, SO_SNDBUFFORCE, SO_TYPE, TCP_MAXSEG, TCP_ULP, TLS_TX, TPACKET_V3,
+    TTY_WRITE_MAX_INLINE,
 };
 use alloc::boxed::Box;
 use alloc::vec;
@@ -395,6 +396,17 @@ fn socket_icmp(ctx: &SyscallCtx<'static>, type_flags: u64) -> i64 {
     }
 }
 
+fn socket_icmp6(ctx: &SyscallCtx<'static>, type_flags: u64) -> i64 {
+    match socket_req(
+        NR_SOCKET,
+        [AF_INET6 as u64, type_flags, IPPROTO_ICMPV6 as u64, 0, 0, 0],
+        ctx,
+    ) {
+        SyscallResult::Return(fd) => fd,
+        other => panic!("socket(AF_INET6, ICMPV6) failed: {other:?}"),
+    }
+}
+
 fn socket_unix_stream(ctx: &SyscallCtx<'static>) -> i64 {
     match socket_req(NR_SOCKET, [AF_UNIX as u64, SOCK_STREAM, 0, 0, 0, 0], ctx) {
         SyscallResult::Return(fd) => fd,
@@ -588,6 +600,95 @@ fn dispatch_inet6_udp_bind_getsockname_round_trips_sockaddr_in6() {
     assert_eq!(u16::from_le_bytes([out[0], out[1]]), AF_INET6);
     assert_ne!(u16::from_be_bytes([out[2], out[3]]), 0);
     assert_eq!(&out[8..24], &loopback);
+}
+
+#[test]
+fn dispatch_raw_icmpv6_getsockname_reports_sockaddr_in6() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_icmp6(&ctx, SOCK_RAW);
+
+    let mut out = [0u8; SOCKADDR_IN6_BYTES as usize];
+    let mut out_len = SOCKADDR_IN6_BYTES;
+    assert_eq!(
+        socket_req(
+            NR_GETSOCKNAME,
+            [
+                fd as u64,
+                out.as_mut_ptr() as u64,
+                (&mut out_len as *mut u32) as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(out_len, SOCKADDR_IN6_BYTES);
+    assert_eq!(u16::from_le_bytes([out[0], out[1]]), AF_INET6);
+    assert_eq!(&out[8..24], &[0u8; 16]);
+}
+
+#[test]
+fn dispatch_raw_icmpv6_unicast_hops_round_trips() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_icmp6(&ctx, SOCK_RAW);
+
+    let hops: i32 = 1;
+    assert_eq!(
+        socket_req(
+            NR_SETSOCKOPT,
+            [
+                fd as u64,
+                SOL_IPV6 as u64,
+                IPV6_UNICAST_HOPS as u64,
+                (&hops as *const i32) as u64,
+                core::mem::size_of::<i32>() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let mut out: i32 = 0;
+    let mut out_len: u32 = core::mem::size_of::<i32>() as u32;
+    assert_eq!(
+        socket_req(
+            NR_GETSOCKOPT,
+            [
+                fd as u64,
+                SOL_IPV6 as u64,
+                IPV6_UNICAST_HOPS as u64,
+                (&mut out as *mut i32) as u64,
+                (&mut out_len as *mut u32) as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(out, hops);
+    assert_eq!(out_len, core::mem::size_of::<i32>() as u32);
+
+    let invalid: i32 = 0;
+    assert_eq!(
+        socket_req(
+            NR_SETSOCKOPT,
+            [
+                fd as u64,
+                SOL_IPV6 as u64,
+                IPV6_UNICAST_HOPS as u64,
+                (&invalid as *const i32) as u64,
+                core::mem::size_of::<i32>() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Error(errno_to_i32(Errno::EINVAL))
+    );
 }
 
 #[test]

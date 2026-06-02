@@ -1139,6 +1139,9 @@ pub(super) fn socket_local_endpoint(socket: &Cap<SocketIdentity>) -> Result<IpEn
         | SocketProtocol::Rds(tx_subsystems::net::RdsState::Bound { local })
         | SocketProtocol::Udp(UdpInner::Bound { local })
         | SocketProtocol::Udp(UdpInner::Connected { local, .. }) => Ok(local),
+        SocketProtocol::RawIcmp(state) if payload.family() == AddressFamily::Inet6 => Ok(
+            IpEndpoint::new_v6(state.bound_local6.unwrap_or(Ipv6Address::UNSPECIFIED), 0),
+        ),
         SocketProtocol::RawIcmp(state) => Ok(IpEndpoint::new(
             state.bound_local.unwrap_or(Ipv4Address::UNSPECIFIED),
             0,

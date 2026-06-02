@@ -262,6 +262,73 @@ fn raw_icmp_bind_records_local_addr_without_port() {
 }
 
 #[test]
+fn raw_icmpv6_bind_accepts_configured_nonloopback_ipv6() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let guard = tx_substrate::epoch::guard();
+    crate::net::reset_initial_net_namespace_for_test();
+    let ns = crate::net::create_isolated_net_namespace_for_test("raw-icmpv6-bind")
+        .expect("net namespace")
+        .payload_cap()
+        .expect("net namespace payload");
+    let auth = NetAdminAuthority::for_test_or_bootstrap();
+    let pair = create_veth_pair_for_test_or_bootstrap(VethPairConfig {
+        left: VethEndpointConfig {
+            name: "eth-icmp6-bind",
+            devt: DevT::new(96, 1),
+            mac: EthernetAddress::new([0x02, 0, 0, 0x96, 0, 1]),
+        },
+        right: VethEndpointConfig {
+            name: "veth-icmp6-bind",
+            devt: DevT::new(96, 2),
+            mac: EthernetAddress::new([0x02, 0, 0, 0x96, 0, 2]),
+        },
+        mtu: VETH_DEFAULT_MTU,
+    });
+    ns.attach_device_for_test_or_bootstrap(pair.left, None)
+        .expect("attach eth-icmp6-bind");
+    let ifindex = ns
+        .link_snapshot()
+        .iter()
+        .find(|link| link.name == "eth-icmp6-bind")
+        .expect("eth-icmp6-bind link")
+        .ifindex;
+    let local = Ipv6Address::new([0xfd, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2]);
+    ns.set_device_ipv6_addr_by_ifindex(auth, ifindex, Some(local), Some(64))
+        .expect("set iface ipv6");
+    let socket = registry::create_socket_in_namespace_with_family(
+        SocketKind::RawIcmp,
+        AddressFamily::Inet6,
+        SocketOptionSet::for_kind(SocketKind::RawIcmp),
+        ns,
+    )
+    .expect("raw icmpv6 socket");
+
+    assert_eq!(
+        step_bind(
+            &socket,
+            KernelSockAddr::V6(SockAddrIn6::new(0, local)),
+            &guard
+        ),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        socket
+            .acquire_operational()
+            .expect("payload")
+            .protocol_snapshot(),
+        SocketProtocol::RawIcmp(RawIcmpState {
+            bound_local: None,
+            bound_local6: Some(local),
+            protocol: ProtocolNumber(1),
+            icmp6_filter: [0; 8],
+        })
+    );
+}
+
+#[test]
 fn raw_icmp_wildcard_bind_accepts_ipv4_replies_to_local_addr() {
     let local = Ipv4Address::new([10, 0, 0, 2]);
     let other = Ipv4Address::new([10, 0, 0, 3]);
