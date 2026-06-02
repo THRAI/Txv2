@@ -891,6 +891,13 @@ impl RawIcmpState {
             icmp6_filter: [0; 8],
         }
     }
+
+    pub fn accepts_ipv4_reply_to(&self, dst: Ipv4Address) -> bool {
+        match self.bound_local {
+            None => true,
+            Some(local) => local == Ipv4Address::UNSPECIFIED || local == dst,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

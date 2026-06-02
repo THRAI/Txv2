@@ -94,7 +94,7 @@ impl RawIcmpSocket {
             .rx_queue
             .lock()
             .iter()
-            .map(icmpv4_echo_message_len)
+            .map(icmpv4_echo_raw_packet_len)
             .sum();
         let raw_ipv6_bytes: usize = self
             .rx_ipv6_queue
@@ -150,10 +150,12 @@ impl RawIcmpSocket {
     }
 
     pub fn ingest_rx_echo_reply(&self, packet: Icmpv4EchoPacket) -> bool {
-        let bytes = icmpv4_echo_message_len(&packet);
+        let bytes = icmpv4_echo_raw_packet_len(&packet);
         let mut rx = self.rx_queue.lock();
         let was_empty = rx.is_empty();
-        let available = self.recv_capacity.saturating_sub(echo_queue_len(&rx));
+        let available = self
+            .recv_capacity
+            .saturating_sub(rx.iter().map(icmpv4_echo_raw_packet_len).sum::<usize>());
         if bytes > available {
             return false;
         }
@@ -168,7 +170,7 @@ impl RawIcmpSocket {
             .rx_queue
             .lock()
             .iter()
-            .map(icmpv4_echo_message_len)
+            .map(icmpv4_echo_raw_packet_len)
             .sum::<usize>();
         let mut rx = self.rx_ipv6_queue.lock();
         let was_empty = echo_bytes == 0 && rx.is_empty();
@@ -191,7 +193,7 @@ impl RawIcmpSocket {
         {
             let mut rx = self.rx_queue.lock();
             if let Some(packet) = rx.front() {
-                let bytes = core::cmp::min(icmpv4_echo_message_len(packet), len);
+                let bytes = core::cmp::min(icmpv4_echo_raw_packet_len(packet), len);
                 if !peek {
                     let _ = rx.pop_front();
                 }
@@ -228,12 +230,13 @@ impl RawIcmpSocket {
         {
             let mut rx = self.rx_queue.lock();
             if let Some(packet) = rx.front() {
-                let message = build_icmpv4_echo_reply_message(packet);
-                let bytes = core::cmp::min(message.len(), out.len());
-                out[..bytes].copy_from_slice(&message[..bytes]);
+                let raw_packet = build_icmpv4_echo_reply(packet);
+                let packet_bytes = raw_packet.as_bytes();
+                let bytes = core::cmp::min(packet_bytes.len(), out.len());
+                out[..bytes].copy_from_slice(&packet_bytes[..bytes]);
                 let source = packet.src;
                 let destination = packet.dst;
-                let truncated = bytes < message.len();
+                let truncated = bytes < packet_bytes.len();
                 if !peek {
                     let _ = rx.pop_front();
                 }
@@ -272,6 +275,7 @@ impl RawIcmpSocket {
 }
 
 pub const ICMPV4_ECHO_HEADER_LEN: usize = 8;
+const IPV4_HEADER_LEN: usize = 20;
 
 pub fn parse_icmpv4_from_ipv4_bytes(packet: &[u8]) -> Icmpv4Event {
     let checksum = ChecksumCapabilities::default();
@@ -397,6 +401,10 @@ pub fn build_icmpv4_echo_reply_message(packet: &Icmpv4EchoPacket) -> Vec<u8> {
 
 pub fn icmpv4_echo_message_len(packet: &Icmpv4EchoPacket) -> usize {
     ICMPV4_ECHO_HEADER_LEN + packet.payload.len()
+}
+
+fn icmpv4_echo_raw_packet_len(packet: &Icmpv4EchoPacket) -> usize {
+    IPV4_HEADER_LEN + icmpv4_echo_message_len(packet)
 }
 
 fn build_icmpv4_echo_packet(packet: &Icmpv4EchoPacket, request: bool) -> LoopbackIpPacket {

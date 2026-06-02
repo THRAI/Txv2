@@ -262,6 +262,32 @@ fn raw_icmp_bind_records_local_addr_without_port() {
 }
 
 #[test]
+fn raw_icmp_wildcard_bind_accepts_ipv4_replies_to_local_addr() {
+    let local = Ipv4Address::new([10, 0, 0, 2]);
+    let other = Ipv4Address::new([10, 0, 0, 3]);
+
+    assert!(RawIcmpState::new(ProtocolNumber(1)).accepts_ipv4_reply_to(local));
+
+    let wildcard = RawIcmpState {
+        bound_local: Some(Ipv4Address::UNSPECIFIED),
+        bound_local6: None,
+        protocol: ProtocolNumber(1),
+        icmp6_filter: [0; 8],
+    };
+    assert!(wildcard.accepts_ipv4_reply_to(local));
+    assert!(wildcard.accepts_ipv4_reply_to(other));
+
+    let bound = RawIcmpState {
+        bound_local: Some(local),
+        bound_local6: None,
+        protocol: ProtocolNumber(1),
+        icmp6_filter: [0; 8],
+    };
+    assert!(bound.accepts_ipv4_reply_to(local));
+    assert!(!bound.accepts_ipv4_reply_to(other));
+}
+
+#[test]
 fn send_recv_flags_validate_mask() {
     let flags = SendRecvFlags::validate(
         (SendRecvFlags::MSG_DONTWAIT

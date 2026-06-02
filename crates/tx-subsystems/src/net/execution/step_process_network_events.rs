@@ -10,7 +10,7 @@ use crate::net::protocol::{Icmpv4Event, LoopbackIface};
 use crate::net::structure::registry;
 use crate::net::structure::table::SocketTable;
 use crate::net::structure::{
-    ConnectionKey, Ipv4Address, RawIcmpState, SocketAcceptEntry, SocketIdentity, SocketProtocol,
+    ConnectionKey, Ipv4Address, SocketAcceptEntry, SocketIdentity, SocketProtocol,
     TcpBacklogRetransmitOutcome,
 };
 use tx_substrate::zone::Cap;
@@ -352,9 +352,7 @@ fn process_icmp_event(
 
 fn raw_icmp_accepts_reply(protocol: &SocketProtocol, dst: Ipv4Address) -> bool {
     match protocol {
-        SocketProtocol::RawIcmp(RawIcmpState { bound_local, .. }) => {
-            bound_local.is_none_or(|local| local == dst)
-        }
+        SocketProtocol::RawIcmp(state) => state.accepts_ipv4_reply_to(dst),
         _ => false,
     }
 }

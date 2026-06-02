@@ -1838,6 +1838,18 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             payload.with_options_mut(|opts| opts.ip.recv_err = on);
             Ok(())
         }
+        (IPPROTO_IP, IP_TTL) => {
+            let ttl = match read_sockopt_i32(ctx, optval, optlen) {
+                Ok(ttl) => ttl,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            match ttl {
+                -1 => payload.with_options_mut(|opts| opts.ip.ttl = 64),
+                1..=255 => payload.with_options_mut(|opts| opts.ip.ttl = ttl as u8),
+                _ => return SyscallResult::Error(errno_to_i32(Errno::EINVAL)),
+            }
+            Ok(())
+        }
         (IPPROTO_IP, IP_HDRINCL) => {
             if socket.kind != SocketKind::RawIcmp {
                 return SyscallResult::Error(errno_to_i32(Errno::ENOPROTOOPT));
@@ -2322,6 +2334,12 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             optval,
             optlen_ptr,
             payload.with_options(|o| o.ip.recv_err as i32),
+        ),
+        (IPPROTO_IP, IP_TTL) => write_sockopt_i32(
+            ctx,
+            optval,
+            optlen_ptr,
+            payload.with_options(|o| o.ip.ttl as i32),
         ),
         (IPPROTO_IP, IP_HDRINCL) if socket.kind == SocketKind::RawIcmp => write_sockopt_i32(
             ctx,

@@ -261,13 +261,14 @@ fn loopback_pending_step_drives_raw_icmp_echo() {
     assert!(outcome.icmp_transfer_attempted >= 1);
     assert_eq!(outcome.icmp_transfer_failed, 0);
     assert_eq!(outcome.icmp_bytes_moved, request_bytes.len());
+    let raw_reply_len = 20 + request_bytes.len();
     assert_eq!(
         socket
             .acquire_operational()
             .expect("raw icmp payload")
             .io_snapshot()
             .recv_len,
-        request_bytes.len()
+        raw_reply_len
     );
 
     let mut out = std::vec![0u8; 64];
@@ -275,14 +276,10 @@ fn loopback_pending_step_drives_raw_icmp_echo() {
         StepOutcome::Done(recv) => recv,
         _ => panic!("unexpected recv outcome"),
     };
-    assert_eq!(recv.bytes, request_bytes.len());
+    assert_eq!(recv.bytes, raw_reply_len);
     assert_eq!(recv.source, Some(IpEndpoint::new(Ipv4Address::LOOPBACK, 0)));
     assert_eq!(
-        parse_icmpv4_payload(
-            Ipv4Address::LOOPBACK,
-            Ipv4Address::LOOPBACK,
-            &out[..recv.bytes]
-        ),
+        crate::net::protocol::parse_icmpv4_from_ipv4_bytes(&out[..recv.bytes]),
         Icmpv4Event::EchoReply(request.reply_packet())
     );
 }

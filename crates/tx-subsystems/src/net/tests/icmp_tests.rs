@@ -1,9 +1,10 @@
 use super::*;
 
 use crate::net::protocol::{
-    build_icmpv4_echo_reply, build_icmpv4_echo_request, parse_icmpv4_echo_payload_unchecked,
+    build_icmpv4_echo_reply, build_icmpv4_echo_request, icmpv4_echo_message_len,
+    parse_icmpv4_echo_payload_unchecked, parse_icmpv4_from_ipv4_bytes,
     parse_icmpv4_loopback_packet, parse_icmpv4_payload, parse_raw_icmpv4_echo_payload_unchecked,
-    Icmpv4EchoPacket, Icmpv4Event,
+    Icmpv4EchoPacket, Icmpv4Event, RawIcmpSocket,
 };
 
 #[test]
@@ -129,6 +130,36 @@ fn raw_icmp_send_accepts_busybox_pattern_echo_code() {
             &guard,
         ),
         StepOutcome::Done(payload.len())
+    );
+}
+
+#[test]
+fn raw_icmp_ipv4_recv_returns_ip_header_for_raw_socket() {
+    let socket = RawIcmpSocket::new(&SocketOptionSet::for_kind(SocketKind::RawIcmp));
+    let reply = Icmpv4EchoPacket {
+        src: Ipv4Address::new([10, 0, 0, 1]),
+        dst: Ipv4Address::new([10, 0, 0, 2]),
+        ident: 0x5151,
+        seq_no: 1,
+        payload: b"trace".to_vec(),
+    };
+    let expected_len = 20 + icmpv4_echo_message_len(&reply);
+
+    assert!(socket.ingest_rx_echo_reply(reply.clone()));
+    assert_eq!(
+        socket.recv_len(usize::MAX, true),
+        Some((expected_len, false))
+    );
+
+    let mut out = std::vec![0u8; expected_len];
+    let drain = socket.recv_bytes(&mut out, false).expect("raw reply");
+    assert_eq!(drain.bytes, expected_len);
+    assert_eq!(out[0] >> 4, 4);
+    assert_eq!(out[0] & 0x0f, 5);
+    assert_eq!(out[8], 64);
+    assert_eq!(
+        parse_icmpv4_from_ipv4_bytes(&out[..drain.bytes]),
+        Icmpv4Event::EchoReply(reply)
     );
 }
 
