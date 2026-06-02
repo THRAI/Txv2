@@ -1,7 +1,6 @@
 //! Authoritative recipe range index, published lock-free under EBR.
 
 use alloc::boxed::Box;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
@@ -10,6 +9,7 @@ use crate::vm::lock_metrics::{vm_spin_mutex, VmSpinMutex};
 
 use crate::execution::Guard;
 
+use super::recipe_tree::{RecipeTree, VmEntryView};
 use super::{
     AddressSpaceStats, AddressSpaceStatsDelta, MapPlacement, Prot, UfdRegistration, UserRange,
     UserVirtAddr, VmBacking, VmEntry, VmEntryError, VmEntryFlags, VmMapCommit, VmMapError,
@@ -23,6 +23,7 @@ static RECIPE_OP_TOUCHED_TOTAL: AtomicUsize = AtomicUsize::new(0);
 static RECIPE_OP_NODE_ALLOC_TOTAL: AtomicUsize = AtomicUsize::new(0);
 static RECIPE_OP_NODE_ALLOC_MAX: AtomicUsize = AtomicUsize::new(0);
 static RECIPE_NODE_ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
+static RECIPE_CHUNK_ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
 static RECIPE_RECLAIM_COUNT: AtomicUsize = AtomicUsize::new(0);
 static RECIPE_RECLAIM_TOTAL_NS: AtomicUsize = AtomicUsize::new(0);
 static RECIPE_RECLAIM_MAX_NS: AtomicUsize = AtomicUsize::new(0);
@@ -38,12 +39,15 @@ pub(in crate::vm) struct RecipeDebugTotals {
     pub op_node_alloc_total: u64,
     pub op_node_alloc_max: u64,
     pub node_alloc_count: u64,
+    pub chunk_alloc_count: u64,
     pub reclaim_count: u64,
     pub reclaim_total_ns: u64,
     pub reclaim_max_ns: u64,
     pub reclaim_node_total: u64,
     pub reclaim_node_max: u64,
 }
+
+static LAST_PUBLISH_LEAF_SPLITS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy, Debug)]
 enum RecipePublishOp {
@@ -68,402 +72,6 @@ struct RecipePublishDebug {
     duration_ns: u64,
 }
 
-#[derive(Clone, Default)]
-struct RecipeTree {
-    root: Option<Arc<RecipeNode>>,
-    len: usize,
-    vm_size: usize,
-}
-
-struct RecipeNode {
-    key: UserVirtAddr,
-    priority: u64,
-    entry: VmEntry,
-    left: Option<Arc<RecipeNode>>,
-    right: Option<Arc<RecipeNode>>,
-    subtree_len: usize,
-    subtree_vm_size: usize,
-}
-
-impl RecipeTree {
-    fn new() -> Self {
-        Self::default()
-    }
-
-    fn values_vec(&self) -> Vec<VmEntry> {
-        let mut out = Vec::new();
-        collect_values(&self.root, &mut out);
-        out
-    }
-
-    fn lookup(&self, addr: UserVirtAddr) -> Option<VmEntry> {
-        let mut cursor = self.root.as_deref();
-        let mut candidate = None;
-        while let Some(node) = cursor {
-            if node.key.as_usize() <= addr.as_usize() {
-                candidate = Some(node.entry.clone());
-                cursor = node.right.as_deref();
-            } else {
-                cursor = node.left.as_deref();
-            }
-        }
-        candidate.filter(|entry| entry.range.contains_addr(addr))
-    }
-
-    fn predecessor_entry(&self, key: UserVirtAddr) -> Option<VmEntry> {
-        let mut cursor = self.root.as_deref();
-        let mut candidate = None;
-        while let Some(node) = cursor {
-            if node.key.as_usize() <= key.as_usize() {
-                candidate = Some(node.entry.clone());
-                cursor = node.right.as_deref();
-            } else {
-                cursor = node.left.as_deref();
-            }
-        }
-        candidate
-    }
-
-    fn predecessor_entry_before(&self, key: UserVirtAddr) -> Option<VmEntry> {
-        let mut cursor = self.root.as_deref();
-        let mut candidate = None;
-        while let Some(node) = cursor {
-            if node.key.as_usize() < key.as_usize() {
-                candidate = Some(node.entry.clone());
-                cursor = node.right.as_deref();
-            } else {
-                cursor = node.left.as_deref();
-            }
-        }
-        candidate
-    }
-
-    fn successor_entry(&self, key: UserVirtAddr) -> Option<VmEntry> {
-        let mut cursor = self.root.as_deref();
-        let mut candidate = None;
-        while let Some(node) = cursor {
-            if node.key.as_usize() >= key.as_usize() {
-                candidate = Some(node.entry.clone());
-                cursor = node.left.as_deref();
-            } else {
-                cursor = node.right.as_deref();
-            }
-        }
-        candidate
-    }
-
-    fn overlapping(&self, range: UserRange) -> Vec<VmEntry> {
-        let mut out = Vec::new();
-        if let Some(entry) = self.predecessor_entry(range.start()) {
-            if entry.range.start().as_usize() < range.start().as_usize()
-                && entry.range.overlaps(range)
-            {
-                out.push(entry);
-            }
-        }
-        collect_starting_in(&self.root, range, &mut out);
-        out
-    }
-
-    fn insert_entry(&self, entry: VmEntry) -> (Self, usize) {
-        let mut touched = 0usize;
-        let root = insert_node(self.root.clone(), entry.clone(), &mut touched);
-        (
-            Self {
-                root: Some(root),
-                len: self.len + 1,
-                vm_size: self.vm_size + entry.range.len(),
-            },
-            touched,
-        )
-    }
-
-    fn remove_exact(&self, key: UserVirtAddr) -> (Self, Option<VmEntry>, usize) {
-        let mut touched = 0usize;
-        let mut removed = None;
-        let root = remove_node(self.root.clone(), key, &mut removed, &mut touched);
-        let (len, vm_size) = match &removed {
-            Some(entry) => (self.len - 1, self.vm_size - entry.range.len()),
-            None => (self.len, self.vm_size),
-        };
-        (Self { root, len, vm_size }, removed, touched)
-    }
-
-    fn replace_exact(&self, entry: VmEntry) -> Result<(Self, usize), VmMapError> {
-        let (without_existing, removed, mut touched) = self.remove_exact(entry.range.start());
-        let Some(removed) = removed else {
-            return Err(VmMapError::MissingMapping);
-        };
-        if removed.range != entry.range {
-            return Err(VmMapError::InvalidRange);
-        }
-        let (rewritten, insert_touched) = without_existing.insert_entry(entry);
-        touched += insert_touched;
-        Ok((rewritten, touched))
-    }
-}
-
-fn collect_values(root: &Option<Arc<RecipeNode>>, out: &mut Vec<VmEntry>) {
-    let Some(node) = root else {
-        return;
-    };
-    collect_values(&node.left, out);
-    out.push(node.entry.clone());
-    collect_values(&node.right, out);
-}
-
-fn collect_starting_in(root: &Option<Arc<RecipeNode>>, range: UserRange, out: &mut Vec<VmEntry>) {
-    let Some(node) = root else {
-        return;
-    };
-    if node.key.as_usize() >= range.start().as_usize() {
-        collect_starting_in(&node.left, range, out);
-    }
-    if node.key.as_usize() >= range.start().as_usize()
-        && node.key.as_usize() < range.end().as_usize()
-        && node.entry.range.overlaps(range)
-    {
-        out.push(node.entry.clone());
-    }
-    if node.key.as_usize() < range.end().as_usize() {
-        collect_starting_in(&node.right, range, out);
-    }
-}
-
-fn node_len(root: &Option<Arc<RecipeNode>>) -> usize {
-    root.as_ref().map_or(0, |node| node.subtree_len)
-}
-
-fn node_vm_size(root: &Option<Arc<RecipeNode>>) -> usize {
-    root.as_ref().map_or(0, |node| node.subtree_vm_size)
-}
-
-fn build_node(
-    key: UserVirtAddr,
-    priority: u64,
-    entry: VmEntry,
-    left: Option<Arc<RecipeNode>>,
-    right: Option<Arc<RecipeNode>>,
-) -> Arc<RecipeNode> {
-    let subtree_len = 1 + node_len(&left) + node_len(&right);
-    let subtree_vm_size = entry.range.len() + node_vm_size(&left) + node_vm_size(&right);
-    if tx_observe::current().is_none() {
-        return Arc::new(RecipeNode {
-            key,
-            priority,
-            entry,
-            left,
-            right,
-            subtree_len,
-            subtree_vm_size,
-        });
-    }
-
-    RECIPE_NODE_ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
-    let alloc_start_ns = tx_observe::clock_now_ns();
-    let node = Arc::new(RecipeNode {
-        key,
-        priority,
-        entry,
-        left,
-        right,
-        subtree_len,
-        subtree_vm_size,
-    });
-    emit_vm_recipe_allocation(b"debug.alloc.vm.recipe_node", 1);
-    emit_vm_recipe_allocation(
-        b"debug.alloc.vm.recipe_node.duration_ns",
-        tx_observe::clock_now_ns().saturating_sub(alloc_start_ns),
-    );
-    node
-}
-
-fn insert_node(
-    root: Option<Arc<RecipeNode>>,
-    entry: VmEntry,
-    touched: &mut usize,
-) -> Arc<RecipeNode> {
-    let Some(node) = root else {
-        *touched += 1;
-        return build_node(
-            entry.range.start(),
-            recipe_priority(entry.range.start()),
-            entry,
-            None,
-            None,
-        );
-    };
-
-    *touched += 1;
-    if entry.range.start().as_usize() < node.key.as_usize() {
-        let left = Some(insert_node(node.left.clone(), entry, touched));
-        let rebuilt = build_node(
-            node.key,
-            node.priority,
-            node.entry.clone(),
-            left,
-            node.right.clone(),
-        );
-        rotate_right_if_needed(rebuilt)
-    } else {
-        let right = Some(insert_node(node.right.clone(), entry, touched));
-        let rebuilt = build_node(
-            node.key,
-            node.priority,
-            node.entry.clone(),
-            node.left.clone(),
-            right,
-        );
-        rotate_left_if_needed(rebuilt)
-    }
-}
-
-fn remove_node(
-    root: Option<Arc<RecipeNode>>,
-    key: UserVirtAddr,
-    removed: &mut Option<VmEntry>,
-    touched: &mut usize,
-) -> Option<Arc<RecipeNode>> {
-    let node = root?;
-    *touched += 1;
-    if key.as_usize() < node.key.as_usize() {
-        return Some(build_node(
-            node.key,
-            node.priority,
-            node.entry.clone(),
-            remove_node(node.left.clone(), key, removed, touched),
-            node.right.clone(),
-        ));
-    }
-    if key.as_usize() > node.key.as_usize() {
-        return Some(build_node(
-            node.key,
-            node.priority,
-            node.entry.clone(),
-            node.left.clone(),
-            remove_node(node.right.clone(), key, removed, touched),
-        ));
-    }
-    *removed = Some(node.entry.clone());
-    merge_nodes(node.left.clone(), node.right.clone(), touched)
-}
-
-fn split_root_before(
-    root: Option<Arc<RecipeNode>>,
-    key: UserVirtAddr,
-    touched: &mut usize,
-) -> (Option<Arc<RecipeNode>>, Option<Arc<RecipeNode>>) {
-    let Some(node) = root else {
-        return (None, None);
-    };
-
-    *touched += 1;
-    if node.key.as_usize() < key.as_usize() {
-        let (right_left, right) = split_root_before(node.right.clone(), key, touched);
-        let left = build_node(
-            node.key,
-            node.priority,
-            node.entry.clone(),
-            node.left.clone(),
-            right_left,
-        );
-        (Some(left), right)
-    } else {
-        let (left, left_right) = split_root_before(node.left.clone(), key, touched);
-        let right = build_node(
-            node.key,
-            node.priority,
-            node.entry.clone(),
-            left_right,
-            node.right.clone(),
-        );
-        (left, Some(right))
-    }
-}
-
-fn merge_nodes(
-    left: Option<Arc<RecipeNode>>,
-    right: Option<Arc<RecipeNode>>,
-    touched: &mut usize,
-) -> Option<Arc<RecipeNode>> {
-    match (left, right) {
-        (None, None) => None,
-        (Some(node), None) | (None, Some(node)) => Some(node),
-        (Some(left), Some(right)) if left.priority <= right.priority => {
-            *touched += 1;
-            Some(build_node(
-                left.key,
-                left.priority,
-                left.entry.clone(),
-                left.left.clone(),
-                merge_nodes(left.right.clone(), Some(right), touched),
-            ))
-        }
-        (Some(left), Some(right)) => {
-            *touched += 1;
-            Some(build_node(
-                right.key,
-                right.priority,
-                right.entry.clone(),
-                merge_nodes(Some(left), right.left.clone(), touched),
-                right.right.clone(),
-            ))
-        }
-    }
-}
-
-fn rotate_right_if_needed(node: Arc<RecipeNode>) -> Arc<RecipeNode> {
-    let Some(left) = &node.left else {
-        return node;
-    };
-    if left.priority > node.priority {
-        return node;
-    }
-    build_node(
-        left.key,
-        left.priority,
-        left.entry.clone(),
-        left.left.clone(),
-        Some(build_node(
-            node.key,
-            node.priority,
-            node.entry.clone(),
-            left.right.clone(),
-            node.right.clone(),
-        )),
-    )
-}
-
-fn rotate_left_if_needed(node: Arc<RecipeNode>) -> Arc<RecipeNode> {
-    let Some(right) = &node.right else {
-        return node;
-    };
-    if right.priority > node.priority {
-        return node;
-    }
-    build_node(
-        right.key,
-        right.priority,
-        right.entry.clone(),
-        Some(build_node(
-            node.key,
-            node.priority,
-            node.entry.clone(),
-            node.left.clone(),
-            right.left.clone(),
-        )),
-        right.right.clone(),
-    )
-}
-
-fn recipe_priority(key: UserVirtAddr) -> u64 {
-    let mut x = key.as_usize() as u64;
-    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    x ^ (x >> 31)
-}
-
 /// Authoritative recipe range index.
 ///
 /// The published tree is owned by an `AtomicPtr<RecipeTree>` and reachable via
@@ -479,6 +87,8 @@ pub(in crate::vm) struct RecipeIndex {
     mutation: VmSpinMutex<()>,
     #[cfg(test)]
     last_publish_touched_entries: AtomicUsize,
+    #[cfg(test)]
+    last_publish_leaf_splits: AtomicUsize,
 }
 
 impl Drop for RecipeIndex {
@@ -516,6 +126,8 @@ impl RecipeIndex {
             mutation: vm_spin_mutex((), b"debug.lock.vm.recipe_index.mutation"),
             #[cfg(test)]
             last_publish_touched_entries: AtomicUsize::new(0),
+            #[cfg(test)]
+            last_publish_leaf_splits: AtomicUsize::new(0),
         }
     }
 
@@ -524,7 +136,7 @@ impl RecipeIndex {
         op: RecipePublishOp,
         current: &RecipeTree,
         rewrite: F,
-    ) -> Result<(VmMapCommit, usize), VmMapError>
+    ) -> Result<(VmMapCommit, usize, Option<*mut RecipeTree>), VmMapError>
     where
         F: FnOnce(
             &RecipeTree,
@@ -533,14 +145,15 @@ impl RecipeIndex {
     {
         if tx_observe::current().is_none() {
             let (rewritten, changed_pages, stats_delta, touched_entries) = rewrite(current)?;
-            self.publish(
+            let leaf_splits = LAST_PUBLISH_LEAF_SPLITS.load(Ordering::Acquire);
+            let old_tree = self.publish(
                 rewritten,
                 RecipePublishDebug {
                     op,
-                    before_len: current.len,
+                    before_len: current.len(),
                     changed_pages,
                     touched_entries,
-                    node_allocs: 0,
+                    node_allocs: leaf_splits,
                     duration_ns: 0,
                 },
             );
@@ -550,18 +163,23 @@ impl RecipeIndex {
                     stats_delta,
                 },
                 touched_entries,
+                old_tree,
             ));
         }
 
-        let before_len = current.len;
+        let before_len = current.len();
         let before_allocs = RECIPE_NODE_ALLOC_COUNT.load(Ordering::Relaxed);
+        let before_chunks = RECIPE_CHUNK_ALLOC_COUNT.load(Ordering::Relaxed);
         let start_ns = tx_observe::clock_now_ns();
         let (rewritten, changed_pages, stats_delta, touched_entries) = rewrite(current)?;
         let duration_ns = tx_observe::clock_now_ns().saturating_sub(start_ns);
         let node_allocs = RECIPE_NODE_ALLOC_COUNT
             .load(Ordering::Relaxed)
-            .saturating_sub(before_allocs);
-        self.publish(
+            .saturating_sub(before_allocs)
+            + RECIPE_CHUNK_ALLOC_COUNT
+                .load(Ordering::Relaxed)
+                .saturating_sub(before_chunks);
+        let old_tree = self.publish(
             rewritten,
             RecipePublishDebug {
                 op,
@@ -578,6 +196,7 @@ impl RecipeIndex {
                 stats_delta,
             },
             touched_entries,
+            old_tree,
         ))
     }
 
@@ -588,6 +207,8 @@ impl RecipeIndex {
             mutation: vm_spin_mutex((), b"debug.lock.vm.recipe_index.mutation"),
             #[cfg(test)]
             last_publish_touched_entries: AtomicUsize::new(0),
+            #[cfg(test)]
+            last_publish_leaf_splits: AtomicUsize::new(0),
         }
     }
 
@@ -612,6 +233,15 @@ impl RecipeIndex {
 
     pub(in crate::vm) fn lookup(&self, addr: UserVirtAddr, guard: &Guard<'_>) -> Option<VmEntry> {
         self.pinned(guard).lookup(addr)
+    }
+
+    #[allow(dead_code)]
+    pub(in crate::vm) fn lookup_view<'g>(
+        &self,
+        addr: UserVirtAddr,
+        guard: &'g Guard<'_>,
+    ) -> Option<VmEntryView<'g>> {
+        self.pinned(guard).lookup_view(addr)
     }
 
     pub(in crate::vm) fn stats(&self, guard: &Guard<'_>) -> AddressSpaceStats {
@@ -650,14 +280,17 @@ impl RecipeIndex {
 
     /// Replace the published tree with `next` and retire the old one through
     /// EBR. Requires the writer mutation lock to already be held.
-    fn publish(&self, next: RecipeTree, debug: RecipePublishDebug) {
+    fn publish(&self, next: RecipeTree, debug: RecipePublishDebug) -> Option<*mut RecipeTree> {
         #[cfg(test)]
         self.last_publish_touched_entries
             .store(debug.touched_entries, Ordering::Release);
+        #[cfg(test)]
+        self.last_publish_leaf_splits
+            .fetch_max(debug.node_allocs, Ordering::AcqRel);
         #[cfg(not(test))]
         let _ = debug.touched_entries;
         if tx_observe::current().is_some() {
-            record_recipe_publish_debug(&debug, next.len);
+            record_recipe_publish_debug(&debug, next.len());
             emit_vm_recipe_trace(
                 b"debug.vm.recipe.publish.touched_entries",
                 debug.touched_entries as i64,
@@ -667,7 +300,7 @@ impl RecipeIndex {
                 b"debug.vm.recipe.publish.before_len",
                 debug.before_len as i64,
             );
-            emit_vm_recipe_trace(b"debug.vm.recipe.publish.after_len", next.len as i64);
+            emit_vm_recipe_trace(b"debug.vm.recipe.publish.after_len", next.len() as i64);
             emit_vm_recipe_trace(
                 b"debug.vm.recipe.publish.changed_pages",
                 debug.changed_pages as i64,
@@ -684,10 +317,17 @@ impl RecipeIndex {
         let new_ptr = Box::into_raw(Box::new(next));
         let old_ptr = self.current.swap(new_ptr, Ordering::AcqRel);
         if !old_ptr.is_null() {
+            emit_vm_recipe_trace(b"debug.vm.recipe.publish.retire_old", 1);
+            return Some(old_ptr);
+        }
+        None
+    }
+
+    fn retire_published_tree(old_tree: Option<*mut RecipeTree>) {
+        if let Some(old_ptr) = old_tree {
             // SAFETY: every reader holds an epoch guard issued before its
             // load; EBR delays reclamation until those guards drop. Once
             // drained, `reclaim_recipe_tree` runs and frees the box.
-            emit_vm_recipe_trace(b"debug.vm.recipe.publish.retire_old", 1);
             let _ = unsafe { epoch::retire_raw(old_ptr as *mut u8, reclaim_recipe_tree) };
         }
     }
@@ -711,40 +351,70 @@ impl RecipeIndex {
         self.last_publish_touched_entries.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
+    pub(in crate::vm) fn debug_backend_name(&self) -> &'static str {
+        let guard = crate::vm::adapter::step_engine::guard();
+        self.pinned(&guard).backend_name()
+    }
+
+    #[cfg(test)]
+    #[cfg_attr(not(tx_vm_recipe_bplus), allow(dead_code))]
+    pub(in crate::vm) fn debug_last_publish_leaf_splits(&self) -> usize {
+        self.last_publish_leaf_splits.load(Ordering::Acquire)
+    }
+
     pub(in crate::vm) fn commit_map(
         &self,
         entry: VmEntry,
         placement: MapPlacement,
     ) -> Result<VmMapCommit, VmMapError> {
-        let _writer = self.mutation.lock();
-        // SAFETY: writer lock held, so under_writer_lock's borrow is sound.
-        let current = unsafe { self.under_writer_lock() };
-        match placement {
-            MapPlacement::RequireFree => {
-                validate_insert_free(current, &entry)?;
-                self.rewrite_with_debug(RecipePublishOp::MapRequireFree, current, |current| {
-                    let changed_pages = entry.range.page_count();
-                    let (rewritten, stats_delta, touched_entries) =
-                        insert_coalescing_adjacent(current, entry)?;
-                    Ok((rewritten, changed_pages, stats_delta, touched_entries))
-                })
-                .map(|(commit, _)| commit)
+        let result: Result<(VmMapCommit, Option<*mut RecipeTree>), VmMapError> = {
+            let _writer = self.mutation.lock();
+            // SAFETY: writer lock held, so under_writer_lock's borrow is sound.
+            let current = unsafe { self.under_writer_lock() };
+            match placement {
+                MapPlacement::RequireFree => {
+                    validate_insert_free(current, &entry)?;
+                    let (commit, _, old_tree) = self.rewrite_with_debug(
+                        RecipePublishOp::MapRequireFree,
+                        current,
+                        |current| {
+                            let changed_pages = entry.range.page_count();
+                            let (rewritten, stats_delta, touched_entries) =
+                                insert_coalescing_adjacent(current, entry)?;
+                            Ok((rewritten, changed_pages, stats_delta, touched_entries))
+                        },
+                    )?;
+                    Ok((commit, old_tree))
+                }
+                MapPlacement::FixedReplace => {
+                    let (commit, _, old_tree) = self.rewrite_with_debug(
+                        RecipePublishOp::MapFixedReplace,
+                        current,
+                        |current| rewrite_fixed(current, &entry),
+                    )?;
+                    Ok((commit, old_tree))
+                }
             }
-            MapPlacement::FixedReplace => self
-                .rewrite_with_debug(RecipePublishOp::MapFixedReplace, current, |current| {
-                    rewrite_fixed(current, &entry)
-                })
-                .map(|(commit, _)| commit),
-        }
+        };
+        let (commit, old_tree) = result?;
+        Self::retire_published_tree(old_tree);
+        Ok(commit)
     }
 
     pub(in crate::vm) fn unmap(&self, range: UserRange) -> Result<VmMapCommit, VmMapError> {
-        let _writer = self.mutation.lock();
-        let current = unsafe { self.under_writer_lock() };
-        self.rewrite_with_debug(RecipePublishOp::Unmap, current, |current| {
-            rewrite_unmap(current, range)
-        })
-        .map(|(commit, _)| commit)
+        let result: Result<(VmMapCommit, Option<*mut RecipeTree>), VmMapError> = {
+            let _writer = self.mutation.lock();
+            let current = unsafe { self.under_writer_lock() };
+            let (commit, _, old_tree) =
+                self.rewrite_with_debug(RecipePublishOp::Unmap, current, |current| {
+                    rewrite_unmap(current, range)
+                })?;
+            Ok((commit, old_tree))
+        };
+        let (commit, old_tree) = result?;
+        Self::retire_published_tree(old_tree);
+        Ok(commit)
     }
 
     pub(in crate::vm) fn protect(
@@ -753,13 +423,18 @@ impl RecipeIndex {
         prot: Prot,
     ) -> Result<VmMapCommit, VmMapError> {
         emit_vm_recipe_trace(b"debug.vm.recipe.protect.phase", 0);
-        let _writer = self.mutation.lock();
-        emit_vm_recipe_trace(b"debug.vm.recipe.protect.phase", 1);
-        let current = unsafe { self.under_writer_lock() };
-        let (commit, touched_entries) =
-            self.rewrite_with_debug(RecipePublishOp::Protect, current, |current| {
-                rewrite_protect(current, range, prot)
-            })?;
+        let result: Result<(VmMapCommit, usize, Option<*mut RecipeTree>), VmMapError> = {
+            let _writer = self.mutation.lock();
+            emit_vm_recipe_trace(b"debug.vm.recipe.protect.phase", 1);
+            let current = unsafe { self.under_writer_lock() };
+            let (commit, touched_entries, old_tree) =
+                self.rewrite_with_debug(RecipePublishOp::Protect, current, |current| {
+                    rewrite_protect(current, range, prot)
+                })?;
+            Ok((commit, touched_entries, old_tree))
+        };
+        let (commit, touched_entries, old_tree) = result?;
+        Self::retire_published_tree(old_tree);
         emit_vm_recipe_trace(b"debug.vm.recipe.protect.phase", 2);
         emit_vm_recipe_trace(
             b"debug.vm.recipe.protect.changed_pages",
@@ -778,12 +453,18 @@ impl RecipeIndex {
         range: UserRange,
         locked: bool,
     ) -> Result<VmMapCommit, VmMapError> {
-        let _writer = self.mutation.lock();
-        let current = unsafe { self.under_writer_lock() };
-        self.rewrite_with_debug(RecipePublishOp::Locked, current, |current| {
-            rewrite_locked(current, range, locked)
-        })
-        .map(|(commit, _)| commit)
+        let result: Result<(VmMapCommit, Option<*mut RecipeTree>), VmMapError> = {
+            let _writer = self.mutation.lock();
+            let current = unsafe { self.under_writer_lock() };
+            let (commit, _, old_tree) =
+                self.rewrite_with_debug(RecipePublishOp::Locked, current, |current| {
+                    rewrite_locked(current, range, locked)
+                })?;
+            Ok((commit, old_tree))
+        };
+        let (commit, old_tree) = result?;
+        Self::retire_published_tree(old_tree);
+        Ok(commit)
     }
 
     pub(in crate::vm) fn remap(
@@ -793,30 +474,44 @@ impl RecipeIndex {
         placement: VmRemapPlacement,
         destination: MapPlacement,
     ) -> Result<VmMapCommit, VmMapError> {
-        let _writer = self.mutation.lock();
-        let current = unsafe { self.under_writer_lock() };
-        let op = match placement {
-            VmRemapPlacement::Move => RecipePublishOp::RemapMove,
-            VmRemapPlacement::InPlace => RecipePublishOp::RemapInPlace,
+        let result: Result<(VmMapCommit, Option<*mut RecipeTree>), VmMapError> = {
+            let _writer = self.mutation.lock();
+            let current = unsafe { self.under_writer_lock() };
+            let op = match placement {
+                VmRemapPlacement::Move => RecipePublishOp::RemapMove,
+                VmRemapPlacement::InPlace => RecipePublishOp::RemapInPlace,
+            };
+            let (commit, _, old_tree) =
+                self.rewrite_with_debug(op, current, |current| match placement {
+                    VmRemapPlacement::Move => {
+                        rewrite_remap_disjoint(current, old_range, new_range, destination)
+                    }
+                    VmRemapPlacement::InPlace => {
+                        rewrite_remap_in_place(current, old_range, new_range)
+                    }
+                })?;
+            Ok((commit, old_tree))
         };
-        self.rewrite_with_debug(op, current, |current| match placement {
-            VmRemapPlacement::Move => {
-                rewrite_remap_disjoint(current, old_range, new_range, destination)
-            }
-            VmRemapPlacement::InPlace => rewrite_remap_in_place(current, old_range, new_range),
-        })
-        .map(|(commit, _)| commit)
+        let (commit, old_tree) = result?;
+        Self::retire_published_tree(old_tree);
+        Ok(commit)
     }
 
     pub(in crate::vm) fn replace_entry(&self, entry: VmEntry) -> Result<VmMapCommit, VmMapError> {
-        let _writer = self.mutation.lock();
-        let current = unsafe { self.under_writer_lock() };
-        self.rewrite_with_debug(RecipePublishOp::ReplaceEntry, current, |current| {
-            let (rewritten, touched_entries) = current.replace_exact(entry)?;
-            let stats_delta = stats_delta_between(current, &rewritten);
-            Ok((rewritten, 0, stats_delta, touched_entries))
-        })
-        .map(|(commit, _)| commit)
+        let result: Result<(VmMapCommit, Option<*mut RecipeTree>), VmMapError> = {
+            let _writer = self.mutation.lock();
+            let current = unsafe { self.under_writer_lock() };
+            let (commit, _, old_tree) =
+                self.rewrite_with_debug(RecipePublishOp::ReplaceEntry, current, |current| {
+                    let (rewritten, touched_entries) = current.replace_exact(entry)?;
+                    let stats_delta = stats_delta_between(current, &rewritten);
+                    Ok((rewritten, 0, stats_delta, touched_entries))
+                })?;
+            Ok((commit, old_tree))
+        };
+        let (commit, old_tree) = result?;
+        Self::retire_published_tree(old_tree);
+        Ok(commit)
     }
 
     /// PR-10 phase 3: stamp `tag` on every VMA whose range is fully
@@ -840,12 +535,18 @@ impl RecipeIndex {
         range: UserRange,
         tag: UfdRegistration,
     ) -> Result<VmMapCommit, VmMapError> {
-        let _writer = self.mutation.lock();
-        let current = unsafe { self.under_writer_lock() };
-        self.rewrite_with_debug(RecipePublishOp::UfdTag, current, |current| {
-            rewrite_tag_ufd_registration(current, range, tag)
-        })
-        .map(|(commit, _)| commit)
+        let result: Result<(VmMapCommit, Option<*mut RecipeTree>), VmMapError> = {
+            let _writer = self.mutation.lock();
+            let current = unsafe { self.under_writer_lock() };
+            let (commit, _, old_tree) =
+                self.rewrite_with_debug(RecipePublishOp::UfdTag, current, |current| {
+                    rewrite_tag_ufd_registration(current, range, tag)
+                })?;
+            Ok((commit, old_tree))
+        };
+        let (commit, old_tree) = result?;
+        Self::retire_published_tree(old_tree);
+        Ok(commit)
     }
 }
 
@@ -858,9 +559,85 @@ unsafe fn reclaim_recipe_tree(ptr: *mut u8) {
 
     let start_ns = tx_observe::clock_now_ns();
     let tree = unsafe { &*(ptr as *mut RecipeTree) };
-    let node_count = tree.len;
+    let reclaim_stats = tree.reclaim_stats();
+    let node_count = reclaim_stats.node_chunks;
     emit_vm_recipe_trace(b"debug.vm.recipe.reclaim_tree.begin", 1);
+    emit_vm_recipe_trace(
+        b"debug.vm.recipe.reclaim_tree.entries",
+        reclaim_stats.entries as i64,
+    );
     emit_vm_recipe_trace(b"debug.vm.recipe.reclaim_tree.nodes", node_count as i64);
+    emit_vm_recipe_trace(
+        b"debug.vm.recipe.reclaim_tree.child_refs",
+        reclaim_stats.copied_child_refs as i64,
+    );
+    emit_vm_recipe_trace(
+        b"debug.vm.recipe.reclaim_tree.depth",
+        reclaim_stats.tree_depth as i64,
+    );
+    emit_vm_recipe_trace(
+        b"debug.vm.recipe.reclaim_tree.leaf_count",
+        reclaim_stats.leaf_count as i64,
+    );
+    emit_vm_recipe_trace(
+        b"debug.vm.recipe.reclaim_tree.internal_count",
+        reclaim_stats.internal_count as i64,
+    );
+    emit_vm_recipe_trace(
+        b"debug.vm.recipe.reclaim_tree.internal_fanout_min",
+        reclaim_stats.internal_fanout_min as i64,
+    );
+    emit_vm_recipe_trace(
+        b"debug.vm.recipe.reclaim_tree.internal_fanout_max",
+        reclaim_stats.internal_fanout_max as i64,
+    );
+    let avg_fanout = if reclaim_stats.internal_count == 0 {
+        0
+    } else {
+        reclaim_stats.internal_fanout_total / reclaim_stats.internal_count
+    };
+    emit_vm_recipe_trace(
+        b"debug.vm.recipe.reclaim_tree.internal_fanout_avg",
+        avg_fanout as i64,
+    );
+    emit_vm_recipe_trace(
+        b"debug.vm.recipe.reclaim_tree.nonroot_internal_count",
+        reclaim_stats.nonroot_internal_count as i64,
+    );
+    emit_vm_recipe_trace(
+        b"debug.vm.recipe.reclaim_tree.nonroot_internal_fanout_min",
+        reclaim_stats.nonroot_internal_fanout_min as i64,
+    );
+    emit_vm_recipe_trace(
+        b"debug.vm.recipe.reclaim_tree.nonroot_internal_fanout_max",
+        reclaim_stats.nonroot_internal_fanout_max as i64,
+    );
+    let avg_nonroot_fanout = if reclaim_stats.nonroot_internal_count == 0 {
+        0
+    } else {
+        reclaim_stats.nonroot_internal_fanout_total / reclaim_stats.nonroot_internal_count
+    };
+    emit_vm_recipe_trace(
+        b"debug.vm.recipe.reclaim_tree.nonroot_internal_fanout_avg",
+        avg_nonroot_fanout as i64,
+    );
+    emit_vm_recipe_trace(
+        b"debug.vm.recipe.reclaim_tree.leaf_fill_min",
+        reclaim_stats.leaf_fill_min as i64,
+    );
+    emit_vm_recipe_trace(
+        b"debug.vm.recipe.reclaim_tree.leaf_fill_max",
+        reclaim_stats.leaf_fill_max as i64,
+    );
+    let avg_fill = if reclaim_stats.leaf_count == 0 {
+        0
+    } else {
+        reclaim_stats.leaf_fill_total / reclaim_stats.leaf_count
+    };
+    emit_vm_recipe_trace(
+        b"debug.vm.recipe.reclaim_tree.leaf_fill_avg",
+        avg_fill as i64,
+    );
     // SAFETY: `ptr` was last published from `Box::into_raw(Box::new(_))`.
     let _ = unsafe { Box::from_raw(ptr as *mut RecipeTree) };
     let duration_ns = tx_observe::clock_now_ns().saturating_sub(start_ns);
@@ -921,6 +698,7 @@ pub(in crate::vm) fn reset_recipe_debug_totals() {
         &RECIPE_OP_NODE_ALLOC_TOTAL,
         &RECIPE_OP_NODE_ALLOC_MAX,
         &RECIPE_NODE_ALLOC_COUNT,
+        &RECIPE_CHUNK_ALLOC_COUNT,
         &RECIPE_RECLAIM_COUNT,
         &RECIPE_RECLAIM_TOTAL_NS,
         &RECIPE_RECLAIM_MAX_NS,
@@ -940,6 +718,7 @@ pub(in crate::vm) fn recipe_debug_totals() -> RecipeDebugTotals {
         op_node_alloc_total: RECIPE_OP_NODE_ALLOC_TOTAL.load(Ordering::Relaxed) as u64,
         op_node_alloc_max: RECIPE_OP_NODE_ALLOC_MAX.load(Ordering::Relaxed) as u64,
         node_alloc_count: RECIPE_NODE_ALLOC_COUNT.load(Ordering::Relaxed) as u64,
+        chunk_alloc_count: RECIPE_CHUNK_ALLOC_COUNT.load(Ordering::Relaxed) as u64,
         reclaim_count: RECIPE_RECLAIM_COUNT.load(Ordering::Relaxed) as u64,
         reclaim_total_ns: RECIPE_RECLAIM_TOTAL_NS.load(Ordering::Relaxed) as u64,
         reclaim_max_ns: RECIPE_RECLAIM_MAX_NS.load(Ordering::Relaxed) as u64,
@@ -1107,10 +886,9 @@ fn rewrite_fixed(
     entries: &RecipeTree,
     replacement: &VmEntry,
 ) -> Result<(RecipeTree, usize, AddressSpaceStatsDelta, usize), VmMapError> {
-    let mut rewritten = entries.clone();
     let mut replaced_pages = 0;
     let mut stats_delta = stats_delta_for_insert(replacement);
-    let mut touched_entries = 0usize;
+    let mut replacements = Vec::new();
 
     for existing in entries.overlapping(replacement.range) {
         let Some(overlap) = range_intersection(existing.range, replacement.range) else {
@@ -1119,27 +897,20 @@ fn rewrite_fixed(
 
         replaced_pages += overlap.page_count();
         subtract_entry_stats(&mut stats_delta, &existing);
-        let (without_existing, removed, touched) = rewritten.remove_exact(existing.range.start());
-        debug_assert!(removed.is_some());
-        rewritten = without_existing;
-        touched_entries += touched;
         let rewrite = existing.split_for_unmap(overlap).map_err(vm_entry_error)?;
         if let Some(before) = rewrite.before {
             add_entry_stats(&mut stats_delta, &before);
-            let (next, touched) = rewritten.insert_entry(before);
-            rewritten = next;
-            touched_entries += touched;
+            replacements.push(before);
         }
         if let Some(after) = rewrite.after {
             add_entry_stats(&mut stats_delta, &after);
-            let (next, touched) = rewritten.insert_entry(after);
-            rewritten = next;
-            touched_entries += touched;
+            replacements.push(after);
         }
     }
 
-    let (rewritten, touched) = rewritten.insert_entry(replacement.clone());
-    touched_entries += touched;
+    replacements.push(replacement.clone());
+    replacements.sort_by_key(|entry| entry.range.start().as_usize());
+    let (rewritten, _, touched_entries) = entries.replace_range(replacement.range, replacements);
     Ok((
         rewritten,
         replaced_pages + replacement.range.page_count(),
@@ -1153,41 +924,14 @@ fn rewrite_unmap(
     range: UserRange,
 ) -> Result<(RecipeTree, usize, AddressSpaceStatsDelta, usize), VmMapError> {
     let mut survivors = Vec::new();
-    let mut removed_entries = 0usize;
-    let mut removed_vm_size = 0usize;
-    let mut touched_entries = 0usize;
-
-    let (left, at_or_after_start) =
-        split_root_before(entries.root.clone(), range.start(), &mut touched_entries);
-
-    let head = entries
-        .predecessor_entry(range.start())
-        .filter(|entry| entry.range.start().as_usize() < range.start().as_usize())
-        .filter(|entry| entry.range.overlaps(range));
-    let mut left = if let Some(head) = head {
-        let mut removed = None;
-        let without_head =
-            remove_node(left, head.range.start(), &mut removed, &mut touched_entries);
-        debug_assert!(removed.is_some());
-        removed_entries += 1;
-        removed_vm_size += head.range.len();
-        push_unmap_survivors(&mut survivors, &head, range)?;
-        without_head
-    } else {
-        left
-    };
-
-    let (discard, right) = split_root_before(at_or_after_start, range.end(), &mut touched_entries);
-    removed_entries += node_len(&discard);
-    removed_vm_size += node_vm_size(&discard);
-
-    let tail = entries
-        .predecessor_entry_before(range.end())
-        .filter(|entry| entry.range.start().as_usize() >= range.start().as_usize())
-        .filter(|entry| entry.range.end().as_usize() > range.end().as_usize())
-        .filter(|entry| entry.range.overlaps(range));
-    if let Some(tail) = tail {
-        push_unmap_survivors(&mut survivors, &tail, range)?;
+    let overlapping = entries.overlapping(range);
+    let removed_entries = overlapping.len();
+    let removed_vm_size = overlapping
+        .iter()
+        .map(|entry| entry.range.len())
+        .sum::<usize>();
+    for existing in &overlapping {
+        push_unmap_survivors(&mut survivors, existing, range)?;
     }
 
     if removed_entries == 0 {
@@ -1204,18 +948,7 @@ fn rewrite_unmap(
         vm_size: survivor_vm_size as isize - removed_vm_size as isize,
     };
 
-    let root = merge_nodes(left.take(), right, &mut touched_entries);
-    let mut rewritten = RecipeTree {
-        root,
-        len: entries.len - removed_entries,
-        vm_size: entries.vm_size - removed_vm_size,
-    };
-
-    for survivor in survivors {
-        let (next, touched) = rewritten.insert_entry(survivor);
-        rewritten = next;
-        touched_entries += touched;
-    }
+    let (rewritten, _, touched_entries) = entries.replace_range(range, survivors);
 
     Ok((rewritten, changed_pages, stats_delta, touched_entries))
 }
@@ -1249,10 +982,7 @@ fn rewrite_protect(
     }
     emit_vm_recipe_trace(b"debug.vm.recipe.rewrite_protect.phase", 1);
 
-    let mut rewritten = entries.clone();
-    let mut changed_pages = 0;
     let mut stats_delta = AddressSpaceStatsDelta::default();
-    let mut touched_entries = 0usize;
     let overlapping = entries.overlapping(range);
     emit_vm_recipe_trace(
         b"debug.vm.recipe.rewrite_protect.overlap_count",
@@ -1260,40 +990,65 @@ fn rewrite_protect(
     );
     emit_vm_recipe_trace(b"debug.vm.recipe.rewrite_protect.phase", 2);
 
-    for existing in overlapping {
+    if overlapping.len() == 1 {
+        let existing = &overlapping[0];
+        let overlap =
+            range_intersection(existing.range, range).ok_or(VmMapError::MissingMapping)?;
+        let changed_pages = overlap.page_count();
+        subtract_entry_stats(&mut stats_delta, existing);
+        let rewrite = existing
+            .split_for_protect(overlap, prot)
+            .map_err(vm_entry_error)?;
+        let mut replacements = Vec::new();
+        if let Some(before) = rewrite.before {
+            add_entry_stats(&mut stats_delta, &before);
+            replacements.push(before);
+        }
+        if let Some(target) = rewrite.target {
+            add_entry_stats(&mut stats_delta, &target);
+            replacements.push(target);
+        }
+        if let Some(after) = rewrite.after {
+            add_entry_stats(&mut stats_delta, &after);
+            replacements.push(after);
+        }
+        emit_vm_recipe_trace(b"debug.vm.recipe.rewrite_protect.phase", 3);
+
+        let (rewritten, removed, touched_entries) =
+            entries.replace_entry_with_entries(existing, replacements);
+        debug_assert!(removed.is_some());
+        return Ok((rewritten, changed_pages, stats_delta, touched_entries));
+    }
+
+    let mut changed_pages = 0;
+    let mut replacements = Vec::new();
+
+    for existing in overlapping.iter() {
         let Some(overlap) = range_intersection(existing.range, range) else {
             continue;
         };
 
         changed_pages += overlap.page_count();
         subtract_entry_stats(&mut stats_delta, &existing);
-        let (without_existing, removed, touched) = rewritten.remove_exact(existing.range.start());
-        debug_assert!(removed.is_some());
-        rewritten = without_existing;
-        touched_entries += touched;
         let rewrite = existing
             .split_for_protect(overlap, prot)
             .map_err(vm_entry_error)?;
         if let Some(before) = rewrite.before {
             add_entry_stats(&mut stats_delta, &before);
-            let (next, touched) = rewritten.insert_entry(before);
-            rewritten = next;
-            touched_entries += touched;
+            replacements.push(before);
         }
         if let Some(target) = rewrite.target {
             add_entry_stats(&mut stats_delta, &target);
-            let (next, touched) = rewritten.insert_entry(target);
-            rewritten = next;
-            touched_entries += touched;
+            replacements.push(target);
         }
         if let Some(after) = rewrite.after {
             add_entry_stats(&mut stats_delta, &after);
-            let (next, touched) = rewritten.insert_entry(after);
-            rewritten = next;
-            touched_entries += touched;
+            replacements.push(after);
         }
     }
     emit_vm_recipe_trace(b"debug.vm.recipe.rewrite_protect.phase", 3);
+
+    let (rewritten, _, touched_entries) = entries.replace_range(range, replacements);
 
     Ok((rewritten, changed_pages, stats_delta, touched_entries))
 }
@@ -1601,8 +1356,8 @@ fn range_is_fully_mapped(entries: &RecipeTree, range: UserRange) -> bool {
 
 fn stats_for(entries: &RecipeTree) -> AddressSpaceStats {
     AddressSpaceStats {
-        recipe_count: entries.len,
-        vm_size: entries.vm_size,
+        recipe_count: entries.len(),
+        vm_size: entries.vm_size(),
     }
 }
 
@@ -1649,6 +1404,26 @@ fn emit_vm_recipe_allocation(name: &[u8], value: u64) {
             value,
         );
     }
+}
+
+pub(super) fn record_recipe_node_alloc_for_tree() {
+    RECIPE_NODE_ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(super) fn record_recipe_chunk_alloc_for_tree() {
+    RECIPE_CHUNK_ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(super) fn record_last_publish_leaf_splits_for_tree(leaf_splits: usize) {
+    LAST_PUBLISH_LEAF_SPLITS.fetch_max(leaf_splits, Ordering::AcqRel);
+}
+
+pub(super) fn emit_vm_recipe_trace_for_tree(name: &[u8], value: i64) {
+    emit_vm_recipe_trace(name, value);
+}
+
+pub(super) fn emit_vm_recipe_allocation_for_tree(name: &[u8], value: u64) {
+    emit_vm_recipe_allocation(name, value);
 }
 
 fn find_gap_in(entries: &RecipeTree, window: UserRange, page_count: usize) -> Option<UserRange> {

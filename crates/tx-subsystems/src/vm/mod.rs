@@ -27,6 +27,9 @@ pub(crate) use pmap::TestPmap;
 #[cfg(test)]
 mod tests;
 
+#[cfg(any(test, feature = "test-support"))]
+pub use structure::recipe_tree::bench as recipe_tree_bench;
+
 pub use execution::{
     MadviseAdvice, MapReservation, MapReserveResult, NullUfdDispatch, UfdDispatch,
     UfdDispatchTarget,
@@ -97,6 +100,7 @@ pub fn dump_debug_phase_totals<P: tx_hal::ConsoleIf>() {
             ("node_alloc_total", recipe.op_node_alloc_total),
             ("node_alloc_max", recipe.op_node_alloc_max),
             ("node_alloc_count", recipe.node_alloc_count),
+            ("chunk_alloc_count", recipe.chunk_alloc_count),
         ],
     );
     let recipe_reclaim_avg_ns = if recipe.reclaim_count == 0 {

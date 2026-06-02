@@ -539,6 +539,313 @@ fn vm_recipe_sparse_unmap_splice_preserves_boundary_survivors() {
 }
 
 #[test]
+fn vm_recipe_mid_vma_protect_uses_single_splice_path() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+
+    for i in 0..2048 {
+        let entry = VmEntry::new(
+            range(0x1000 + i * 0x4000, 1),
+            Prot::NONE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        );
+        map_reserved(aspace.reserve_map(entry, MapPlacement::RequireFree))
+            .commit()
+            .expect("disjoint map commit");
+    }
+    let wide = VmEntry::new(
+        range(0x4000_0000, 16),
+        Prot::READ_WRITE,
+        VmEntryFlags::SHARED,
+        page_backing(0),
+    );
+    map_reserved(aspace.reserve_map(wide.clone(), MapPlacement::RequireFree))
+        .commit()
+        .expect("wide map");
+
+    let commit = aspace
+        .try_mprotect(range(0x4000_5000, 5), Prot::READ)
+        .expect("mid-vma protect");
+
+    assert_eq!(commit.changed_pages, 5);
+    let recipes = aspace.recipes_snapshot();
+    assert_eq!(recipes.len(), 2051);
+    for i in 0..2048 {
+        assert_eq!(
+            recipes[i],
+            VmEntry::new(
+                range(0x1000 + i * 0x4000, 1),
+                Prot::NONE,
+                VmEntryFlags::PRIVATE,
+                VmBacking::PrivateAnon,
+            )
+        );
+    }
+    let split = &recipes[2048..];
+    assert_eq!(
+        split
+            .iter()
+            .map(|entry| (entry.range, entry.prot, entry.flags))
+            .collect::<alloc::vec::Vec<_>>(),
+        alloc::vec![
+            (
+                range(0x4000_0000, 5),
+                Prot::READ_WRITE,
+                VmEntryFlags::SHARED
+            ),
+            (range(0x4000_5000, 5), Prot::READ, VmEntryFlags::SHARED),
+            (
+                range(0x4000_a000, 6),
+                Prot::READ_WRITE,
+                VmEntryFlags::SHARED
+            ),
+        ]
+    );
+    assert!(matches!(
+        split[0].backing,
+        VmBacking::Page { offset: 0, .. }
+    ));
+    match split[1].backing {
+        VmBacking::Page { offset, .. } => assert_eq!(offset, 5 * USER_PAGE_SIZE as u64),
+        _ => panic!("target backing should stay page-backed"),
+    }
+    match split[2].backing {
+        VmBacking::Page { offset, .. } => assert_eq!(offset, 10 * USER_PAGE_SIZE as u64),
+        _ => panic!("tail backing should stay page-backed"),
+    }
+    let touched = aspace.recipes.debug_last_publish_touched_entries();
+    assert!(
+        touched <= 24,
+        "mid-VMA mprotect should split/splice once instead of path-copying before/target/after independently; touched={touched}"
+    );
+}
+
+#[test]
+fn vm_recipe_lookup_view_borrows_published_entry() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let entry = VmEntry::new(
+        range(0x6000, 4),
+        Prot::READ_WRITE,
+        VmEntryFlags::SHARED,
+        page_backing(0),
+    );
+    map_reserved(aspace.reserve_map(entry.clone(), MapPlacement::RequireFree))
+        .commit()
+        .expect("initial map");
+
+    let guard = crate::vm::adapter::step_engine::guard();
+    let view = aspace
+        .recipes
+        .lookup_view(UserVirtAddr(0x7000), &guard)
+        .expect("borrowed recipe view");
+
+    assert_eq!(view.range, entry.range);
+    assert_eq!(view.prot, entry.prot);
+    assert_eq!(view.flags, entry.flags);
+    assert_eq!(view.backing, &entry.backing);
+    assert_eq!(view.ufd_registration, entry.ufd_registration);
+    assert!(view.private.is_none());
+    assert!(view.permits_fault(AccessMode::Read));
+}
+
+#[test]
+fn vm_recipe_backend_name_matches_cfg() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+
+    #[cfg(tx_vm_recipe_bplus)]
+    assert_eq!(aspace.recipes.debug_backend_name(), "bplus");
+    #[cfg(not(tx_vm_recipe_bplus))]
+    assert_eq!(aspace.recipes.debug_backend_name(), "treap");
+}
+
+#[test]
+#[cfg(tx_vm_recipe_bplus)]
+fn vm_recipe_bplus_leaf_split_preserves_lookup_order() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+
+    for i in 0..40 {
+        let entry = VmEntry::new(
+            range(0x10_0000 + i * 0x4000, 1),
+            Prot::READ,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        );
+        map_reserved(aspace.reserve_map(entry, MapPlacement::RequireFree))
+            .commit()
+            .expect("map commit");
+    }
+
+    assert_eq!(aspace.stats().recipe_count, 40);
+    assert!(aspace.recipes.debug_last_publish_leaf_splits() > 0);
+    for i in 0..40 {
+        let addr = UserVirtAddr(0x10_0000 + i * 0x4000);
+        assert_eq!(aspace.lookup(addr).expect("mapped").range, range(addr.0, 1));
+    }
+    assert_eq!(aspace.recipes_snapshot().len(), 40);
+}
+
+#[test]
+#[cfg(tx_vm_recipe_bplus)]
+fn vm_recipe_bplus_spanning_unmap_trims_boundary_leaves() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+
+    for i in 0..40 {
+        let entry = VmEntry::new(
+            range(0x20_0000 + i * 0x2000, 1),
+            Prot::READ,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        );
+        map_reserved(aspace.reserve_map(entry, MapPlacement::RequireFree))
+            .commit()
+            .expect("map commit");
+    }
+
+    let commit = aspace
+        .try_munmap(range(0x20_0000 + 8 * 0x2000, 24 * 2 - 1))
+        .expect("spanning unmap");
+
+    assert_eq!(commit.changed_pages, 24);
+    assert_eq!(aspace.stats().recipe_count, 16);
+    let snapshot = aspace.recipes_snapshot();
+    assert_eq!(snapshot.len(), 16);
+    assert_eq!(snapshot[0].range, range(0x20_0000, 1));
+    assert_eq!(snapshot[7].range, range(0x20_0000 + 7 * 0x2000, 1));
+    assert_eq!(snapshot[8].range, range(0x20_0000 + 32 * 0x2000, 1));
+    assert_eq!(snapshot[15].range, range(0x20_0000 + 39 * 0x2000, 1));
+}
+
+#[test]
+#[cfg(tx_vm_recipe_bplus)]
+fn vm_recipe_bplus_exact_boundary_unmap_preserves_neighbors() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+
+    for i in 0..24 {
+        let entry = VmEntry::new(
+            range(0x30_0000 + i * 2 * USER_PAGE_SIZE, 1),
+            Prot::READ,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        );
+        map_reserved(aspace.reserve_map(entry, MapPlacement::RequireFree))
+            .commit()
+            .expect("map commit");
+    }
+
+    let commit = aspace
+        .try_munmap(range(0x30_0000 + 8 * 2 * USER_PAGE_SIZE, 8 * 2 - 1))
+        .expect("exact-boundary unmap");
+
+    assert_eq!(commit.changed_pages, 8);
+    let snapshot = aspace.recipes_snapshot();
+    assert_eq!(snapshot.len(), 16);
+    assert_eq!(
+        snapshot[7].range,
+        range(0x30_0000 + 7 * 2 * USER_PAGE_SIZE, 1)
+    );
+    assert_eq!(
+        snapshot[8].range,
+        range(0x30_0000 + 16 * 2 * USER_PAGE_SIZE, 1)
+    );
+}
+
+#[test]
+#[cfg(tx_vm_recipe_bplus)]
+fn vm_recipe_bplus_whole_leaf_covering_unmap_drops_middle_leaf() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+
+    for i in 0..48 {
+        let entry = VmEntry::new(
+            range(0x40_0000 + i * 2 * USER_PAGE_SIZE, 1),
+            Prot::READ,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        );
+        map_reserved(aspace.reserve_map(entry, MapPlacement::RequireFree))
+            .commit()
+            .expect("map commit");
+    }
+
+    let commit = aspace
+        .try_munmap(range(0x40_0000 + 16 * 2 * USER_PAGE_SIZE, 16 * 2 - 1))
+        .expect("whole-leaf unmap");
+
+    assert_eq!(commit.changed_pages, 16);
+    let snapshot = aspace.recipes_snapshot();
+    assert_eq!(snapshot.len(), 32);
+    assert_eq!(
+        snapshot[15].range,
+        range(0x40_0000 + 15 * 2 * USER_PAGE_SIZE, 1)
+    );
+    assert_eq!(
+        snapshot[16].range,
+        range(0x40_0000 + 32 * 2 * USER_PAGE_SIZE, 1)
+    );
+}
+
+#[test]
+#[cfg(tx_vm_recipe_bplus)]
+fn vm_recipe_bplus_map_coalesces_across_leaf_boundary() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+
+    for i in 0..15 {
+        let entry = VmEntry::new(
+            range(0x50_0000 + i * 2 * USER_PAGE_SIZE, 1),
+            Prot::READ,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        );
+        map_reserved(aspace.reserve_map(entry, MapPlacement::RequireFree))
+            .commit()
+            .expect("prefix sparse map");
+    }
+    let left = VmEntry::new(
+        range(0x60_0000, 1),
+        Prot::READ_WRITE,
+        VmEntryFlags::PRIVATE,
+        VmBacking::PrivateAnon,
+    );
+    map_reserved(aspace.reserve_map(left, MapPlacement::RequireFree))
+        .commit()
+        .expect("left map");
+    let right = VmEntry::new(
+        range(0x60_2000, 1),
+        Prot::READ_WRITE,
+        VmEntryFlags::PRIVATE,
+        VmBacking::PrivateAnon,
+    );
+    map_reserved(aspace.reserve_map(right, MapPlacement::RequireFree))
+        .commit()
+        .expect("right map");
+
+    let bridge = VmEntry::new(
+        range(0x60_1000, 1),
+        Prot::READ_WRITE,
+        VmEntryFlags::PRIVATE,
+        VmBacking::PrivateAnon,
+    );
+    map_reserved(aspace.reserve_map(bridge, MapPlacement::RequireFree))
+        .commit()
+        .expect("bridge map");
+
+    assert_eq!(
+        aspace
+            .lookup(UserVirtAddr(0x60_0000))
+            .expect("merged")
+            .range,
+        range(0x60_0000, 3)
+    );
+}
+
+#[test]
 fn vm_address_space_fixed_map_replaces_overlap_and_preserves_survivors() {
     setup_host_substrate();
     let aspace = AddressSpace::new();

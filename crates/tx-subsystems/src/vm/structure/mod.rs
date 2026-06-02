@@ -9,6 +9,7 @@ mod address_space;
 mod private;
 mod range_lock;
 mod recipe;
+pub(in crate::vm) mod recipe_tree;
 mod types;
 
 pub use address_space::AddressSpace;
@@ -32,5 +33,7 @@ pub use types::{
 pub(in crate::vm) use private::{
     private_page_debug_samples, private_page_debug_totals, reset_private_page_debug_totals,
 };
-pub(in crate::vm) use recipe::{AddressSpaceStatsCell, RecipeIndex};
+pub(in crate::vm) use recipe::{
+    recipe_debug_totals, reset_recipe_debug_totals, AddressSpaceStatsCell, RecipeIndex,
+};
 pub(in crate::vm) use types::AddressSpaceStatsDelta;
