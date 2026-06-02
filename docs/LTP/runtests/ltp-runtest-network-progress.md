@@ -15,8 +15,8 @@ syscall cases from `runtest/syscalls`.
 | Module | Entries | Latest judge | Kernel-side status | Latest log |
 | --- | ---: | ---: | --- | --- |
 | `net.ipv6_lib` | 6 | `76/77` | Phase 1 kernel-side baseline complete; only `hopopt` is a musl test-image/libc table miss | `target/oscomp/ltp-net-ipv6-lib-final-lhost-hopopt-known-120s.txt` |
-| `net.tcp_cmds` | 17 | filtered `netstat`: `5/5`; filtered `iproute`: `6/6`; grouped `ping01+ping02`: `20/20`; filtered `arping01`: `1/1`; focused/pair `ipneigh01_{arp,ip}`: pass; remaining probes mostly `TCONF`, with `traceroute01` at `1/6` | command/procfs/netns baseline has clean witnesses; IPv4 ICMP, cooked AF_PACKET ARP, and neighbor delete/relearn now pass focused witnesses. The remaining filtered probes are mostly rootfs command/driver-advertising gaps (`ss`, `tracepath`, `tcpdump`, `ssh`, `dhcpd`, `dnsmasq`, `ip_tables`, `nf_tables`, `sch_teql`). The first real kernel semantic blocker exposed by the next probes is `traceroute01`: BusyBox `traceroute -I` fails `setsockopt(TTL)` with `ENOPROTOOPT`; BusyBox also lacks the `-T` mode expected by the test. | `target/oscomp/ltp-net-tcp-cmds-tracepath-traceroute-next-420s.txt` |
-| `net.ipv6` | 11 | first command probe incomplete | `ping601` starts `ping01.sh -6`, configures the local IPv4/IPv6 addresses, then makes no further progress after `initialize 'rhost' 'ltp_ns_veth1' interface`; the run was manually stopped after repeated no-output windows to avoid a blind 600s wait. Treat this as an IPv6 remote setup hang to investigate before broader `net.ipv6` command runs. | `target/oscomp/ltp-net-ipv6-ping601-ping602-next-600s.txt` |
+| `net.tcp_cmds` | 17 | filtered `netstat`: `5/5`; filtered `iproute`: `6/6`; grouped `ping01+ping02`: `20/20`; filtered `arping01`: `1/1`; focused/pair `ipneigh01_{arp,ip}`: pass; remaining probes mostly `TCONF`, with `traceroute01` at `1/6` | command/procfs/netns baseline has clean witnesses; IPv4 ICMP, cooked AF_PACKET ARP, and neighbor delete/relearn now pass focused witnesses. The remaining filtered probes are mostly rootfs command/driver-advertising gaps (`ss`, `tracepath`, `tcpdump`, `ssh`, `dhcpd`, `dnsmasq`, `ip_tables`, `nf_tables`, `sch_teql`). The first real kernel semantic blocker exposed by the next probes is `traceroute01`: focused `traceroute01` confirms BusyBox `traceroute -I` fails `setsockopt(TTL)` with `ENOPROTOOPT`; BusyBox also lacks the `-T` mode expected by the test. | `target/oscomp/ltp-net-tcp-cmds-traceroute01-focused-300s.txt` |
+| `net.ipv6` | 11 | `ping601`: `0/10` | `ping601` (`ping01.sh -6`) reaches complete local/remote IPv4+IPv6 network setup and prints the Network config. The blocker is the command body: every `ping6 -s {8..4064} fd00:1:1:1::1` fails with `sendto: Not supported`. Treat this as an IPv6 ICMP/raw send path gap, not a remote setup hang. | `target/oscomp/ltp-net-ipv6-ping601-rhost-trace-180s.txt` |
 | other `net.*` / `net_stress.*` / `can` | many | not started | defer until command/procfs/rtnetlink/netns baseline and the newly exposed command/tool gaps are triaged | - |
 
 Latest full IPv6 command:
@@ -284,6 +284,13 @@ boot-environment surfaces:
 | `dhcpd` | `TCONF`, skipped | The case reaches network setup and skips because `dhcpd` is not present. | `target/oscomp/ltp-net-tcp-cmds-services-next-600s.txt` |
 | `dnsmasq` | `TCONF`, skipped | The case reaches network setup and skips because `dnsmasq` is not present. | `target/oscomp/ltp-net-tcp-cmds-services-next-600s.txt` |
 
+## `net.ipv6` filtered ledger
+
+| Filter | Status | What it proves / why it matters | Evidence |
+| --- | --- | --- | --- |
+| `ping601` | fail, `0/10` inside `ping01.sh -6` | Native IPv6 command setup gets through netns/veth creation, remote namespace mount/sysfs setup, local and remote IPv4+IPv6 address configuration, and interface metadata reads. The case then fails every payload size because BusyBox `ping6` gets `sendto: Not supported` for `fd00:1:1:1::1`, so the next owner is IPv6 ICMP/raw send support rather than setup. | `target/oscomp/ltp-net-ipv6-ping601-rhost-trace-180s.txt` |
+| `ping602` | not run after `ping601` failure | It is expected to share the same IPv6 ping send blocker, with additional `-I`/interface behavior after the raw send path works. Do not spend a long run here before fixing or instrumenting the `ping601` `sendto` owner. | - |
+
 Implemented prerequisites observed during the `netstat` climb:
 
 - `clone(CLONE_NEWNET | CLONE_NEWNS)` and `/proc/<pid>/ns/{net,mnt}` enough for
@@ -498,9 +505,9 @@ small and choose between these blockers:
   set/get on the socket families used by BusyBox `traceroute -I`, then decide
   separately whether the `-T` subcase requires a fuller traceroute binary or a
   compatible rootfs command shim;
-- `net.ipv6` command setup: `ping601` currently stalls after
-  `initialize 'rhost' 'ltp_ns_veth1' interface`; add a short trace/debug probe
-  around remote IPv6 setup before trying a full 600s run again.
+- `net.ipv6` ICMP/raw send: `ping601` now reaches the ping body, but every
+  `ping6` send returns `EOPNOTSUPP`; instrument or implement the IPv6
+  `sendto` owner before running `ping602` or broader `net.ipv6`.
 
 Useful confirmation targets after those fixes:
 
@@ -511,5 +518,6 @@ timeout 300s make oscomp-qemu-rv64 \
 
 timeout 180s make oscomp-qemu-rv64 \
   OSCOMP_GROUPS=ltp-runtest:net.ipv6:ping601 \
-  OSCOMP_OUT_RV=target/oscomp/ltp-net-ipv6-ping601-rhost-180s.txt
+  LTP_TRACE_RUNTIME=1 \
+  OSCOMP_OUT_RV=target/oscomp/ltp-net-ipv6-ping601-sendto-180s.txt
 ```
