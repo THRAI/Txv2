@@ -1,6 +1,6 @@
 # LTP native network runtest progress
 
-Date: 2026-06-01
+Date: 2026-06-02
 
 This file tracks native LTP network runtest modules such as `runtest/net.*`,
 `runtest/net_stress.*`, and `runtest/can`. It is separate from
@@ -15,8 +15,9 @@ syscall cases from `runtest/syscalls`.
 | Module | Entries | Latest judge | Kernel-side status | Latest log |
 | --- | ---: | ---: | --- | --- |
 | `net.ipv6_lib` | 6 | `76/77` | Phase 1 kernel-side baseline complete; only `hopopt` is a musl test-image/libc table miss | `target/oscomp/ltp-net-ipv6-lib-final-lhost-hopopt-known-120s.txt` |
-| `net.tcp_cmds` | 17 | filtered `netstat`: `5/5`; filtered `iproute`: `6/6`; grouped `ping01+ping02`: `20/20`; filtered `arping01`: `1/1`; filtered `ipneigh01_{arp,ip}`: semantic blockers closed, now runtime timeout in 50-loop stress | command/procfs/netns baseline has clean witnesses; IPv4 ICMP and cooked AF_PACKET ARP pass; legacy ARP ioctls and `ip neigh` projection now reach the repeated delete/relearn loop. `/proc/net/tx_neigh` removes the former `/proc/net/arp` shell parsing hotspot, and `/proc/net/tx_neigh_ctl` removes the `ip neigh del` -> BusyBox `arp -d` fallback, but native helper/process runtime still exceeds the useful focused timeout | `target/oscomp/ltp-net-tcp-cmds-ipneigh01-ip-tx-neigh-ctl-openok-profile-285s.txt` |
-| other `net.*` / `net_stress.*` / `can` | many | not started | defer until command/procfs/rtnetlink/netns baseline is stable | - |
+| `net.tcp_cmds` | 17 | filtered `netstat`: `5/5`; filtered `iproute`: `6/6`; grouped `ping01+ping02`: `20/20`; filtered `arping01`: `1/1`; focused/pair `ipneigh01_{arp,ip}`: pass; remaining probes mostly `TCONF`, with `traceroute01` at `1/6` | command/procfs/netns baseline has clean witnesses; IPv4 ICMP, cooked AF_PACKET ARP, and neighbor delete/relearn now pass focused witnesses. The remaining filtered probes are mostly rootfs command/driver-advertising gaps (`ss`, `tracepath`, `tcpdump`, `ssh`, `dhcpd`, `dnsmasq`, `ip_tables`, `nf_tables`, `sch_teql`). The first real kernel semantic blocker exposed by the next probes is `traceroute01`: BusyBox `traceroute -I` fails `setsockopt(TTL)` with `ENOPROTOOPT`; BusyBox also lacks the `-T` mode expected by the test. | `target/oscomp/ltp-net-tcp-cmds-tracepath-traceroute-next-420s.txt` |
+| `net.ipv6` | 11 | first command probe incomplete | `ping601` starts `ping01.sh -6`, configures the local IPv4/IPv6 addresses, then makes no further progress after `initialize 'rhost' 'ltp_ns_veth1' interface`; the run was manually stopped after repeated no-output windows to avoid a blind 600s wait. Treat this as an IPv6 remote setup hang to investigate before broader `net.ipv6` command runs. | `target/oscomp/ltp-net-ipv6-ping601-ping602-next-600s.txt` |
+| other `net.*` / `net_stress.*` / `can` | many | not started | defer until command/procfs/rtnetlink/netns baseline and the newly exposed command/tool gaps are triaged | - |
 
 Latest full IPv6 command:
 
@@ -270,9 +271,18 @@ boot-environment surfaces:
 | `ping02` | pass, `10/10` inside `ping02.sh`; clean setup | `ping -I eth0` now works across the same payload matrix. The first failure was not routing or fragmentation: BusyBox `-p aa` leaves the ICMP code byte as `0xaa`, and raw ICMP send now accepts echo-shaped user payloads instead of rejecting strict-parser `Malformed` as `EINVAL`. The follow-up cleanup removed the BusyBox `ip ... nodad` setup warning and the IPv6 prefix lookup warning by pairing a rootfs `ip addr` compatibility filter with real AF_INET6 rtnetlink address add/dump/delete state. | `target/oscomp/ltp-net-tcp-cmds-ping02-nodad-ipv6addr-420s.txt` |
 | `ping01+ping02` | pass, grouped `20/20`; clean continuous setup | Exact-tag grouped execution proves `ping02` can run after `ping01` without stale route/address state. The grouped blocker was `tst_init_iface()` cleanup: BusyBox `ip route flush dev <iface>` generated `RTM_DELROUTE` messages without `NLM_F_ACK`, while txKernel returned unsolicited success acks and could not delete connected routes projected from interface addresses. Connected route deletion is now suppressible until address/link changes, and rtnetlink success acks are only sent when requested. Note: `ltp-runtest:net.tcp_cmds:ping` is not a prefix filter and selects no cases; use exact tags joined by `+`. | `target/oscomp/ltp-net-tcp-cmds-ping01-ping02-routeflush-noack-900s.txt` |
 | `arping01` | pass, `1/1` inside `arping01.sh` | BusyBox `arping -w 10 <remote> -I eth0 -fq` now gets a usable `sockaddr_ll` from `AF_PACKET` `getsockname()` and receives a cooked ARP reply for the remote veth IPv4 address. This covers link-layer address projection, packet socket bind/getname, and the minimal cooked ARP request/reply path needed by the command witness. | `target/oscomp/ltp-net-tcp-cmds-arping01-global-arp-420s.txt` |
-| `ipneigh01_arp` | partial, semantic blockers closed; timeout | Legacy `arp` command ioctl compatibility now exists for `SIOCGIFHWADDR`, `SIOCSARP`, and `SIOCDARP`, backed by namespace ARP state. The witness no longer breaks on ENOTTY and reaches the 50-loop ARP auto-creation/delete stress section. Remaining blocker is runtime: the loop exceeds LTP's 5 minute per-case timeout. | `target/oscomp/ltp-net-tcp-cmds-ipneigh01-arp-siocdarp-900s.txt` |
-| `ipneigh01_ip` | partial, semantic blockers closed; timeout | `ip neigh show` now reflects dynamic `/proc/net/arp` entries and `ip neigh del` removes the corresponding ARP entry. The former `ARP entry '10.0.0.1' not listed` failure is gone; the witness reaches the same 50-loop delete/relearn stress section and times out. | `target/oscomp/ltp-net-tcp-cmds-ipneigh01-ip-proc-neigh-show-660s.txt` |
-| remaining entries | not started | With command/control-plane probes, grouped IPv4 ping witnesses, `arping01`, and the `ipneigh01` semantic path understood, the next correctness target should stay small, but the immediate shared blocker is native LTP runtime rather than a new network semantic. | - |
+| `ipneigh01_arp` | pass, focused and pair | Legacy `arp` command ioctl compatibility exists for `SIOCGIFHWADDR`, `SIOCSARP`, and `SIOCDARP`, backed by namespace ARP state. After the `/tx-ltp/bin` applet symlink speedup, the focused `arp` witness completes cleanly, and the pair witness shows `arp` can run before `ip` without stale neighbor/netns cleanup failure. | `target/oscomp/ltp-net-tcp-cmds-ipneigh01-arp-focused-after-appletsymlink-900s.txt`; pair `target/oscomp/ltp-net-tcp-cmds-ipneigh01-pair-after-appletsymlink-900s.txt` |
+| `ipneigh01_ip` | pass, focused and after MTU forwarding fix | `ip neigh show` reflects dynamic ARP entries and `ip neigh del` removes them. The default focused witness now reaches `TPASS`; after fixing the over-broad `ip link set` shim, it still passes with judge `1/1`. | `target/oscomp/ltp-net-tcp-cmds-ipneigh01-ip-after-mtu-forward-420s.txt` |
+| `sendfile` | `TCONF`, skipped | The case reaches the standard LTP netns/veth setup and then skips before sendfile/TCP data semantics because the rootfs lacks `ss`. | `target/oscomp/ltp-net-tcp-cmds-sendfile-next-420s.txt` |
+| `tc01` | `TCONF`, skipped | The case skips immediately on `sch_teql driver not available`; this is driver/config advertisement, not qdisc behavior yet. | `target/oscomp/ltp-net-tcp-cmds-tc01-next-300s.txt` |
+| `tracepath01` | `TCONF`, skipped | The case reaches network setup and skips because `tracepath` is not present in the rootfs. | `target/oscomp/ltp-net-tcp-cmds-tracepath-traceroute-next-420s.txt` |
+| `traceroute01` | fail, `1/6` inside LTP summary | ICMP-ECHO traceroute starts but `setsockopt(TTL)` returns `ENOPROTOOPT`; the expected output pattern is missing. The TCP-SYN subcase also fails because the bundled BusyBox `traceroute` does not support `-T`. | `target/oscomp/ltp-net-tcp-cmds-tracepath-traceroute-next-420s.txt` |
+| `tcpdump` | `TCONF`, skipped | The case reaches network setup and skips because `tcpdump` is not present. It also prints a `tst_require_drivers` shell warning before setup, which should be kept separate from AF_PACKET capture semantics. | `target/oscomp/ltp-net-tcp-cmds-tcpdump-next-420s.txt` |
+| `iptables` | `TCONF`, skipped | The case reaches network setup and skips on `ip_tables driver not available`; `lsmod` also reports missing `/proc/modules`. It has not reached legacy iptables rule semantics. | `target/oscomp/ltp-net-tcp-cmds-iptables-nft-next-420s.txt` |
+| `nft` | `TCONF`, skipped | The case reaches network setup and skips on `nf_tables driver not available`; it has not reached nftables netlink rule semantics. | `target/oscomp/ltp-net-tcp-cmds-iptables-nft-next-420s.txt` |
+| `ftp` | `TCONF`, skipped | The case skips before service behavior because `ssh` is not present. Treat it as a service/remote-exec environment gap, not an FTP/TCP data-path result. | `target/oscomp/ltp-net-tcp-cmds-services-next-600s.txt` |
+| `dhcpd` | `TCONF`, skipped | The case reaches network setup and skips because `dhcpd` is not present. | `target/oscomp/ltp-net-tcp-cmds-services-next-600s.txt` |
+| `dnsmasq` | `TCONF`, skipped | The case reaches network setup and skips because `dnsmasq` is not present. | `target/oscomp/ltp-net-tcp-cmds-services-next-600s.txt` |
 
 Implemented prerequisites observed during the `netstat` climb:
 
@@ -476,28 +486,30 @@ startup/page-fault/wait/pipe churn.
 
 ## Next native network step
 
-The focused command/control probes, grouped ping witnesses, and `arping01` are
-clean, and `ipneigh01_{arp,ip}` now reaches its stress loop. The immediate next
-step is a targeted native LTP runtime reduction around repeated BusyBox/shell
-`execve`, page faults, `wait4`, `pipe2`, `dup3`, `close`, and remaining grep
-pipeline churn, then rerun the same two neighbor witnesses. Network datapath or
-neighbor-table refactors are not the right next move unless a later trace
-contradicts the current counter data.
+The focused command/control probes, grouped IPv4 ping witnesses, `arping01`,
+and focused/pair `ipneigh01_{arp,ip}` now have passing witnesses. The next
+native-network target is no longer more neighbor profiling. Keep the next work
+small and choose between these blockers:
 
-Recommended confirmation target after a speed change:
+- rootfs/tool availability for skipped `net.tcp_cmds` cases: `ss`,
+  `tracepath`, `tcpdump`, `ssh`, `dhcpd`, `dnsmasq`, plus advertised
+  `sch_teql`, `ip_tables`, `nf_tables`, and `/proc/modules` surfaces;
+- `traceroute01` kernel semantics: implement Linux-compatible `IP_TTL`
+  set/get on the socket families used by BusyBox `traceroute -I`, then decide
+  separately whether the `-T` subcase requires a fuller traceroute binary or a
+  compatible rootfs command shim;
+- `net.ipv6` command setup: `ping601` currently stalls after
+  `initialize 'rhost' 'ltp_ns_veth1' interface`; add a short trace/debug probe
+  around remote IPv6 setup before trying a full 600s run again.
+
+Useful confirmation targets after those fixes:
 
 ```sh
-timeout 420s make oscomp-qemu-rv64 \
-  OSCOMP_GROUPS=ltp-runtest:net.tcp_cmds:ipneigh01_arp+ipneigh01_ip \
-  OSCOMP_OUT_RV=target/oscomp/ltp-net-tcp-cmds-ipneigh01-speed-pass-420s.txt
+timeout 300s make oscomp-qemu-rv64 \
+  OSCOMP_GROUPS=ltp-runtest:net.tcp_cmds:traceroute01 \
+  OSCOMP_OUT_RV=target/oscomp/ltp-net-tcp-cmds-traceroute01-ttl-300s.txt
+
+timeout 180s make oscomp-qemu-rv64 \
+  OSCOMP_GROUPS=ltp-runtest:net.ipv6:ping601 \
+  OSCOMP_OUT_RV=target/oscomp/ltp-net-ipv6-ping601-rhost-180s.txt
 ```
-
-Expected purpose:
-
-- Check whether the repeated ARP delete/relearn loop can finish inside LTP's
-  default 5 minute timeout without relying on `LTP_TIMEOUT_MUL`.
-- If the loop still times out, collect per-command or syscall timing for the
-  `ping` + `arp`/`ip neigh` + `grep` loop before starting a broader network
-  refactor.
-- If both variants pass, try a broader but still filtered `net.tcp_cmds` run
-  before the full module.
