@@ -20,13 +20,13 @@ Date: 2026-06-02
 
 当前最重要的小计：
 
-- 已确认通过点数：`352` = syscall-network `229` +
+- 已确认通过点数：`362` = syscall-network `229` +
   `net.ipv6_lib` `76` + `net.tcp_cmds` `37` + `net.ipv6:ping601`
-  `10`。
-- 已观察分母口径：`352/363` = syscall-network `229/236` +
+  `10` + `net.ipv6:ping602` `10`。
+- 已观察分母口径：`362/373` = syscall-network `229/236` +
   `net.ipv6_lib` `76/77` + `net.tcp_cmds` 已计分 `37/40` +
-  `net.ipv6:ping601` `10/10`。
-- 上面的 `352/363` 仍然是 stitched/local 进度，不等于全量 LTP network
+  `net.ipv6:ping601` `10/10` + `net.ipv6:ping602` `10/10`。
+- 上面的 `362/373` 仍然是 stitched/local 进度，不等于全量 LTP network
   官方成绩；`TCONF` 和未跑模块没有计入分母。
 
 ## 总表
@@ -36,7 +36,7 @@ Date: 2026-06-02
 | socket/network syscall | `runtest/syscalls` 手动筛出的 50 个 socket/network case | 50 cases | `229/236` | split-batch 已覆盖全部 50 个 case；剩余缺口主要是架构面、镜像/用户态 wrapper、少量非核心网络 surface | 作为回归基线；细节见下面 syscall 分批表和 `docs/LTP/ltp-network-syscall-progress.md` |
 | IPv6 libc/API | `net.ipv6_lib` | 6 entries | `76/77` | 基本完成；只剩 `asapi_01` 的 `hopopt` 协议表点，属于 musl test image/libc 表缺口 | 不优先花 kernel 网络时间；除非允许重建 LTP/musl 镜像 |
 | IPv4/命令层网络 | `net.tcp_cmds` | 17 entries | 已计分 `37/40`，另有 9 项 `TCONF/skipped` | `netstat`、`iproute`、`ping01`、`ping02`、`arping01`、`ipneigh01_{arp,ip}` 已过；`traceroute01` 为 `3/6` 部分通过 | 决定 rootfs 工具面：`ss`、`tracepath`、`tcpdump`、`traceroute -T`、服务命令、netfilter/driver 广告 |
-| IPv6 命令层网络 | `net.ipv6` | 11 entries | 已确认 `10/10` | `ping601` 已过 10 个 IPv6 ping payload；`ping602` 和其余 9 项未开始 | 下一步跑 `ping602` focused，确认 `-I`/interface IPv6 ping surface |
+| IPv6 命令层网络 | `net.ipv6` | 11 entries | 已确认 `20/20` | `ping601` 和 `ping602` 均已过，各覆盖 10 个 IPv6 ping payload；其余 9 项未开始 | 下一步跑 `sendfile601` focused，确认 IPv6 sendfile/命令依赖面 |
 | 高级网络特性 | `net.features` | 62 entries | not-run | 未开始；包含 BBR、DCCP、SCTP、TFO、VXLAN、VLAN、macvlan、macsec、GRE/GUE/FOU、Geneve、WireGuard 等 | 暂缓，等命令层/IPv6 baseline 更稳 |
 | 组播 | `net.multicast` | 4 entries | not-run | 未开始 | 暂缓 |
 | 完整 SCTP | `net.sctp` | 41 entries | not-run | 未开始；不同于 syscall witness 里的 local-only SCTP 支持 | 除非明确 charter 完整 SCTP，否则暂缓 |
@@ -157,13 +157,13 @@ boot-environment surfaces:
 
 ## 细表：`net.ipv6`
 
-小计：已确认 `10/10`。`ping601` focused witness 已经通过；其余
-`net.ipv6` 命令层入口还没有开始，不计入当前分母。
+小计：已确认 `20/20`。`ping601` 和 `ping602` focused witness 已经
+通过；其余 `net.ipv6` 命令层入口还没有开始，不计入当前分母。
 
 | 测试 | 得分 | 状态 | 说明 | 证据 |
 | --- | ---: | --- | --- | --- |
 | `ping601` | `10/10` | pass | 旧 baseline 是 `sendto: Not supported`；ICMPv6 echo/SOL_RAW 修复后 trace 显示第一包 `sendto`/`recvmsg` 已通，但第二次 `recvmsg` 卡住。最终补上 `recvmsg` 的 `ITIMER_REAL`/`SIGALRM` aware wait 后，10 个 payload 全部 TPASS。 | pass `target/oscomp/ltp-net-ipv6-ping601-recvmsg-itimer-240s.txt`; trace `target/oscomp/ltp-net-ipv6-ping601-syscalltrace-240s.txt` |
-| `ping602` | not-run | not-run | 预计共享 `ping601` 的 IPv6 ping surface，另有 `-I`/interface 行为；`ping601` 过后可作为下一条 focused witness。 | - |
+| `ping602` | `10/10` | pass | baseline 到 `ping6 -I eth0 -p aa -s 8` 后失败 `sendto: Not supported`。BusyBox `-p aa` 会先把 ICMPv6 header/payload 填成 `0xaa`，再只覆盖 type/id/seq；unchecked raw ICMPv6 parser 现在接受这种 pattern-filled echo code，10 个 payload 全部 TPASS。 | baseline `target/oscomp/ltp-net-ipv6-ping602-focused-240s.txt`; pass `target/oscomp/ltp-net-ipv6-ping602-pattern-code-240s.txt` |
 | `sendfile601` | not-run | not-run | IPv6 sendfile 命令测试，尚未开始。 | - |
 | `tcpdump601` | not-run | not-run | IPv6 tcpdump 命令测试，尚未开始。 | - |
 | `tracepath601` | not-run | not-run | IPv6 tracepath 命令测试，尚未开始。 | - |
@@ -387,11 +387,11 @@ small and choose between these blockers:
 - `traceroute01` remaining command surface: the kernel-side ICMP-ECHO `-I`
   owner is fixed; decide separately whether the `-T` subcase requires a fuller
   traceroute binary or a compatible rootfs command shim;
-- `net.ipv6` ICMP/raw ping: `ping601` now passes `10/10`. The decisive trace
-  showed first `sendto` and first `recvmsg` returning 16 bytes, then a second
-  blocking `recvmsg`; `recvmsg` was missing the `ITIMER_REAL`/SIGALRM-aware wait
-  path that `recvfrom` already had. Run `ping602` next before broader
-  `net.ipv6`.
+- `net.ipv6` ICMP/raw ping: `ping601` and `ping602` now pass `20/20`.
+  `ping601` needed the `recvmsg` `ITIMER_REAL`/SIGALRM-aware wait path;
+  `ping602` additionally needed unchecked raw ICMPv6 echo parsing to accept
+  BusyBox `-p aa` pattern-filled nonzero code bytes. Run `sendfile601` next
+  before broader `net.ipv6`.
 
 Useful confirmation targets after those fixes:
 
@@ -401,6 +401,6 @@ timeout 300s make oscomp-qemu-rv64 \
   OSCOMP_OUT_RV=target/oscomp/ltp-net-tcp-cmds-traceroute01-ttl-300s.txt
 
 timeout 240s make oscomp-qemu-rv64 \
-  OSCOMP_GROUPS=ltp-runtest:net.ipv6:ping601 \
-  OSCOMP_OUT_RV=target/oscomp/ltp-net-ipv6-ping601-recvmsg-itimer-240s.txt
+  OSCOMP_GROUPS=ltp-runtest:net.ipv6:sendfile601 \
+  OSCOMP_OUT_RV=target/oscomp/ltp-net-ipv6-sendfile601-focused-240s.txt
 ```

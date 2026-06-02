@@ -258,6 +258,27 @@ fn raw_icmpv6_send_to_configured_peer_addr_returns_echo_reply() {
 }
 
 #[test]
+fn icmpv6_unchecked_parser_accepts_busybox_pattern_echo_code() {
+    let src = Ipv6Address::new([0xfd, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2]);
+    let dst = Ipv6Address::new([0xfd, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let mut payload = std::vec![0xaau8; 16];
+    payload[0] = 128;
+    payload[4..6].copy_from_slice(&0x6060u16.to_be_bytes());
+    payload[6..8].copy_from_slice(&7u16.to_be_bytes());
+
+    assert_eq!(
+        parse_icmpv6_payload_unchecked(src, dst, &payload),
+        Icmpv6Event::EchoRequest(Icmpv6EchoPacket {
+            src,
+            dst,
+            ident: 0x6060,
+            seq_no: 7,
+            payload: std::vec![0xaa; 8],
+        })
+    );
+}
+
+#[test]
 fn raw_icmpv6_unknown_peer_addr_stays_unsupported() {
     init_zones();
     let _lock = crate::test_support::EPOCH_TEST_LOCK

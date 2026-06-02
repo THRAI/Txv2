@@ -422,9 +422,6 @@ pub fn parse_icmpv6_payload_unchecked(
     if payload.len() < ICMPV6_ECHO_HEADER_LEN {
         return Icmpv6Event::Malformed;
     }
-    if payload[1] != 0 {
-        return Icmpv6Event::Unsupported;
-    }
 
     let ident = u16::from_be_bytes([payload[4], payload[5]]);
     let seq_no = u16::from_be_bytes([payload[6], payload[7]]);
