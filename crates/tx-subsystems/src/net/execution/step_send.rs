@@ -15,6 +15,7 @@ use crate::net::structure::{
     SendRecvFlags, SendWireSet, SocketIdentity, SocketKind, SocketPayload, SocketProtocol,
     TcpState, UnixDatagramState, UnixSocketPath, UnixStreamState,
 };
+use crate::net::NetAdminAuthority;
 use tx_substrate::zone::PayloadCap;
 
 pub fn step_send(
@@ -542,6 +543,7 @@ fn send_configured_icmpv6_echo(
             return StepOutcome::Err(Errno::EOPNOTSUPP)
         }
     };
+    learn_configured_icmpv6_neighbor(payload, src_addr, dst_addr);
     let reply = request.reply_packet();
     let reply_payload = build_icmpv6_echo_reply_message(&reply);
     let reply_packet = RawIpv6Packet {
@@ -560,6 +562,31 @@ fn send_configured_icmpv6_echo(
         guard,
     );
     StepOutcome::Done(bytes.len())
+}
+
+fn learn_configured_icmpv6_neighbor(
+    payload: &SocketPayload,
+    src_addr: Ipv6Address,
+    dst_addr: Ipv6Address,
+) {
+    let netns = payload.net_namespace();
+    let Some(link) = netns.link_snapshot().into_iter().find(|link| {
+        link.is_up
+            && !link.is_loopback
+            && link.ipv6_addr == Some(src_addr)
+            && ipv6_prefix_matches(src_addr, dst_addr, link.ipv6_prefix_len.unwrap_or(128))
+    }) else {
+        return;
+    };
+    let Some(peer_mac) = configured_ipv6_peer_mac(dst_addr) else {
+        return;
+    };
+    let _ = netns.install_static_ndisc_by_ifindex(
+        NetAdminAuthority::for_test_or_bootstrap(),
+        link.ifindex,
+        dst_addr,
+        peer_mac,
+    );
 }
 
 fn deliver_raw_ipv6_packet_to_table(
@@ -649,6 +676,19 @@ fn ipv6_addr_is_configured(addr: Ipv6Address) -> bool {
                 .into_iter()
                 .any(|link| link.is_up && link.ipv6_addr == Some(addr))
         })
+}
+
+fn configured_ipv6_peer_mac(addr: Ipv6Address) -> Option<crate::net::EthernetAddress> {
+    for namespace in net_namespace_payloads_snapshot() {
+        for link in namespace.link_snapshot() {
+            if link.is_up && link.ipv6_addr == Some(addr) {
+                if let Some(mac) = link.mac {
+                    return Some(mac);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn ipv6_prefix_matches(lhs: Ipv6Address, rhs: Ipv6Address, prefix_len: u8) -> bool {

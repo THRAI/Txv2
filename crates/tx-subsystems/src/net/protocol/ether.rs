@@ -15,7 +15,7 @@ use crate::net::packet::{
     demux_rx_frame_with_smoltcp, PacketDispatch, PacketSource, PacketTxReadiness, PacketTxResult,
     PacketTxSink, RxFrame,
 };
-use crate::net::structure::Ipv4Address;
+use crate::net::structure::{Ipv4Address, Ipv6Address};
 use crate::sync::SpinMutex;
 
 use super::{build_icmpv4_echo_reply, Icmpv4Event, IfaceCommon};
@@ -44,6 +44,12 @@ pub struct ArpPendingEntry {
     pub attempts: u8,
     pub next_probe_at: Instant,
     pub last_error: Option<Errno>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NdiscEntry {
+    pub mac: EthernetAddress,
+    pub expires_at: Instant,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -92,6 +98,15 @@ pub struct ArpSnapshotEntry {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NdiscSnapshotEntry {
+    pub iface_name: &'static str,
+    pub ip: Ipv6Address,
+    pub mac: Option<EthernetAddress>,
+    pub expires_at: Option<Instant>,
+    pub state: ArpSnapshotState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NetStatsSnapshot {
     pub iface_name: &'static str,
     pub rx_packets: u64,
@@ -109,6 +124,7 @@ pub struct EtherIface {
     pub ether_addr: EthernetAddress,
     arp_table: SpinMutex<BTreeMap<Ipv4Address, ArpEntry>>,
     pending_arp: SpinMutex<BTreeMap<Ipv4Address, ArpPendingEntry>>,
+    ndisc_table: SpinMutex<BTreeMap<Ipv6Address, NdiscEntry>>,
     ipv4_fragments: SpinMutex<BTreeMap<Ipv4FragmentKey, Ipv4ReassemblyEntry>>,
     next_ipv4_ident: AtomicU64,
     pub name: &'static str,
@@ -201,6 +217,7 @@ impl EtherIface {
             ether_addr,
             arp_table: SpinMutex::new(BTreeMap::new()),
             pending_arp: SpinMutex::new(BTreeMap::new()),
+            ndisc_table: SpinMutex::new(BTreeMap::new()),
             ipv4_fragments: SpinMutex::new(BTreeMap::new()),
             next_ipv4_ident: AtomicU64::new(1),
             name,
@@ -383,11 +400,27 @@ impl EtherIface {
         self.arp_table.lock().remove(&ip).is_some()
     }
 
+    pub fn install_static_ndisc(&self, ip: Ipv6Address, mac: EthernetAddress) {
+        self.ndisc_table.lock().insert(
+            ip,
+            NdiscEntry {
+                mac,
+                expires_at: Instant::from_secs(10 * 365 * 24 * 60 * 60),
+            },
+        );
+    }
+
+    pub fn remove_static_ndisc(&self, ip: Ipv6Address) -> bool {
+        self.ndisc_table.lock().remove(&ip).is_some()
+    }
+
     pub fn copy_arp_cache_from(&self, other: &EtherIface) {
         let arp_entries = other.arp_table.lock().clone();
         let pending_entries = other.pending_arp.lock().clone();
+        let ndisc_entries = other.ndisc_table.lock().clone();
         self.arp_table.lock().extend(arp_entries);
         self.pending_arp.lock().extend(pending_entries);
+        self.ndisc_table.lock().extend(ndisc_entries);
     }
 
     pub fn pending_arp_len(&self) -> usize {
@@ -430,6 +463,25 @@ impl EtherIface {
         }
 
         entries.sort_by_key(|entry| (entry.ip, entry.state.sort_key()));
+        entries
+    }
+
+    pub fn ndisc_snapshot(&self, now: Instant) -> Vec<NdiscSnapshotEntry> {
+        let mut entries = Vec::new();
+
+        for (ip, entry) in self.ndisc_table.lock().iter() {
+            if entry.expires_at > now {
+                entries.push(NdiscSnapshotEntry {
+                    iface_name: self.name,
+                    ip: *ip,
+                    mac: Some(entry.mac),
+                    expires_at: Some(entry.expires_at),
+                    state: ArpSnapshotState::Resolved,
+                });
+            }
+        }
+
+        entries.sort_by_key(|entry| entry.ip);
         entries
     }
 

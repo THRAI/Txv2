@@ -25,6 +25,10 @@ fn proc_net_arp_projection_renders_resolved_pending_and_failed_entries() {
         EthernetAddress::new([0x02, 0, 0, 0, 0, 0x10]),
         now + smoltcp::time::Duration::from_secs(60),
     );
+    iface.install_static_ndisc(
+        Ipv6Address::new([0xfd, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1]),
+        EthernetAddress::new([0x02, 0, 0, 0, 0, 0x66]),
+    );
     queue_failed_arp(
         &iface,
         local,
@@ -56,6 +60,7 @@ fn proc_net_arp_projection_renders_resolved_pending_and_failed_entries() {
     assert!(neigh.contains("192.0.2.10 dev virtp0 lladdr 02:00:00:00:00:10 REACHABLE"));
     assert!(neigh.contains("192.0.2.20 dev virtp0 lladdr 00:00:00:00:00:00 INCOMPLETE"));
     assert!(neigh.contains("192.0.2.30 dev virtp0 lladdr 00:00:00:00:00:00 FAILED"));
+    assert!(neigh.contains("fd00:1:1:1::1 dev virtp0 lladdr 02:00:00:00:00:66 REACHABLE"));
 }
 
 #[test]

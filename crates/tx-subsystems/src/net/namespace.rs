@@ -1053,6 +1053,54 @@ impl NetNamespacePayload {
         }
     }
 
+    pub fn install_static_ndisc_by_ifindex(
+        &self,
+        _authority: NetAdminAuthority,
+        ifindex: u32,
+        ip: Ipv6Address,
+        mac: EthernetAddress,
+    ) -> Result<(), Errno> {
+        let registration = self.find_device_by_ifindex(ifindex).ok_or(Errno::ENODEV)?;
+        let link = self
+            .link_snapshot()
+            .into_iter()
+            .find(|link| link.ifindex == ifindex)
+            .ok_or(Errno::ENODEV)?;
+        if link.is_loopback || link.ipv6_addr.is_none() {
+            return Err(Errno::EADDRNOTAVAIL);
+        }
+        let iface = self
+            .ensure_ether_iface_for_link(registration, link)
+            .ok_or(Errno::EADDRNOTAVAIL)?;
+        iface.install_static_ndisc(ip, mac);
+        Ok(())
+    }
+
+    pub fn delete_static_ndisc_by_ifindex(
+        &self,
+        _authority: NetAdminAuthority,
+        ifindex: u32,
+        ip: Ipv6Address,
+    ) -> Result<(), Errno> {
+        let registration = self.find_device_by_ifindex(ifindex).ok_or(Errno::ENODEV)?;
+        let link = self
+            .link_snapshot()
+            .into_iter()
+            .find(|link| link.ifindex == ifindex)
+            .ok_or(Errno::ENODEV)?;
+        if link.is_loopback || link.ipv6_addr.is_none() {
+            return Err(Errno::EADDRNOTAVAIL);
+        }
+        let iface = self
+            .ensure_ether_iface_for_link(registration, link)
+            .ok_or(Errno::EADDRNOTAVAIL)?;
+        if iface.remove_static_ndisc(ip) {
+            Ok(())
+        } else {
+            Err(Errno::ENOENT)
+        }
+    }
+
     fn ipv4_for_device(&self, registration: &'static NetDeviceRegistration) -> Option<Ipv4Address> {
         self.namespace_devices
             .lock()

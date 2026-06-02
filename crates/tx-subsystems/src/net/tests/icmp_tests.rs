@@ -203,6 +203,12 @@ fn raw_icmpv6_send_to_configured_peer_addr_returns_echo_reply() {
         .expect("attach remote veth");
     let auth = NetAdminAuthority::for_test_or_bootstrap();
     local_ns
+        .set_device_ipv4_addr_by_ifindex(auth, 2, Some(Ipv4Address::new([10, 0, 0, 2])), Some(24))
+        .expect("set local ipv4");
+    remote_ns
+        .set_device_ipv4_addr_by_ifindex(auth, 2, Some(Ipv4Address::new([10, 0, 0, 1])), Some(24))
+        .expect("set remote ipv4");
+    local_ns
         .set_device_ipv6_addr_by_ifindex(auth, 2, Some(local_ip), Some(64))
         .expect("set local ipv6");
     remote_ns
@@ -211,7 +217,7 @@ fn raw_icmpv6_send_to_configured_peer_addr_returns_echo_reply() {
 
     let raw = match crate::net::step_socket_create_in_namespace(
         ValidSocketType::validate(10, 3, 58).expect("AF_INET6 SOCK_RAW ICMPV6"),
-        local_ns,
+        local_ns.clone(),
         &guard,
     ) {
         StepOutcome::Done(socket) => socket,
@@ -240,6 +246,11 @@ fn raw_icmpv6_send_to_configured_peer_addr_returns_echo_reply() {
             &guard,
         ),
         StepOutcome::Done(request_bytes.len())
+    );
+    let neigh = crate::net::proc_net_neigh_snapshot_text_for_namespace(&local_ns);
+    assert!(
+        neigh.contains("fd00:1:1:1::1 dev icmpv6-local0 lladdr 02:00:00:00:06:01 REACHABLE"),
+        "raw ICMPv6 echo should learn NDISC neighbor: {neigh}"
     );
 
     let mut out = [0u8; 128];

@@ -12,7 +12,7 @@ use crate::net::netfilter::{
     NetfilterTarget,
 };
 use crate::net::protocol::{ArpSnapshotState, EtherIface, NetStatsSnapshot};
-use crate::net::structure::Ipv4Address;
+use crate::net::structure::{Ipv4Address, Ipv6Address};
 use crate::net::{NetNamespacePayload, NetNamespaceRouteInfo};
 
 pub fn proc_net_arp_snapshot_text(ifaces: &[&EtherIface], now: Instant) -> String {
@@ -69,6 +69,25 @@ pub fn proc_net_neigh_snapshot_text(ifaces: &[&EtherIface], now: Instant) -> Str
                 out,
                 "{} dev {} lladdr {} {}",
                 format_ipv4(entry.ip),
+                entry.iface_name,
+                mac,
+                nud
+            );
+        }
+        for entry in iface.ndisc_snapshot(now) {
+            let mac = entry
+                .mac
+                .map(format_mac)
+                .unwrap_or_else(|| String::from("00:00:00:00:00:00"));
+            let nud = match entry.state {
+                ArpSnapshotState::Resolved => "REACHABLE",
+                ArpSnapshotState::Pending => "INCOMPLETE",
+                ArpSnapshotState::Failed => "FAILED",
+            };
+            let _ = writeln!(
+                out,
+                "{} dev {} lladdr {} {}",
+                format_ipv6(entry.ip),
                 entry.iface_name,
                 mac,
                 nud
@@ -276,6 +295,55 @@ fn format_ipv4(addr: Ipv4Address) -> String {
     let [a, b, c, d] = addr.octets();
     let mut out = String::new();
     let _ = write!(out, "{a}.{b}.{c}.{d}");
+    out
+}
+
+fn format_ipv6(addr: Ipv6Address) -> String {
+    let octets = addr.octets();
+    let mut hextets = [0u16; 8];
+    for idx in 0..8 {
+        hextets[idx] = u16::from_be_bytes([octets[idx * 2], octets[idx * 2 + 1]]);
+    }
+
+    let mut best_start = None;
+    let mut best_len = 0usize;
+    let mut idx = 0usize;
+    while idx < hextets.len() {
+        if hextets[idx] != 0 {
+            idx += 1;
+            continue;
+        }
+        let start = idx;
+        while idx < hextets.len() && hextets[idx] == 0 {
+            idx += 1;
+        }
+        let len = idx - start;
+        if len >= 2 && len > best_len {
+            best_start = Some(start);
+            best_len = len;
+        }
+    }
+
+    let mut out = String::new();
+    let mut idx = 0usize;
+    while idx < hextets.len() {
+        if best_start == Some(idx) {
+            out.push_str("::");
+            idx += best_len;
+            if idx >= hextets.len() {
+                break;
+            }
+            continue;
+        }
+        if !out.is_empty() && !out.ends_with(':') {
+            out.push(':');
+        }
+        let _ = write!(out, "{:x}", hextets[idx]);
+        idx += 1;
+    }
+    if out.is_empty() {
+        out.push_str("::");
+    }
     out
 }
 

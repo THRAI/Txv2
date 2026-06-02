@@ -20,13 +20,14 @@ Date: 2026-06-02
 
 当前最重要的小计：
 
-- 已确认通过点数：`362` = syscall-network `229` +
+- 已确认通过点数：`363` = syscall-network `229` +
   `net.ipv6_lib` `76` + `net.tcp_cmds` `37` + `net.ipv6:ping601`
-  `10` + `net.ipv6:ping602` `10`。
-- 已观察分母口径：`362/373` = syscall-network `229/236` +
+  `10` + `net.ipv6:ping602` `10` + `net.ipv6:ipneigh6_ip` `1`。
+- 已观察分母口径：`363/380` = syscall-network `229/236` +
   `net.ipv6_lib` `76/77` + `net.tcp_cmds` 已计分 `37/40` +
-  `net.ipv6:ping601` `10/10` + `net.ipv6:ping602` `10/10`。
-- 上面的 `362/373` 仍然是 stitched/local 进度，不等于全量 LTP network
+  `net.ipv6:ping601` `10/10` + `net.ipv6:ping602` `10/10` +
+  `net.ipv6:traceroute601` `0/6` + `net.ipv6:ipneigh6_ip` `1/1`。
+- 上面的 `363/380` 仍然是 stitched/local 进度，不等于全量 LTP network
   官方成绩；`TCONF` 和未跑模块没有计入分母。
 
 ## 总表
@@ -36,7 +37,7 @@ Date: 2026-06-02
 | socket/network syscall | `runtest/syscalls` 手动筛出的 50 个 socket/network case | 50 cases | `229/236` | split-batch 已覆盖全部 50 个 case；剩余缺口主要是架构面、镜像/用户态 wrapper、少量非核心网络 surface | 作为回归基线；细节见下面 syscall 分批表和 `docs/LTP/ltp-network-syscall-progress.md` |
 | IPv6 libc/API | `net.ipv6_lib` | 6 entries | `76/77` | 基本完成；只剩 `asapi_01` 的 `hopopt` 协议表点，属于 musl test image/libc 表缺口 | 不优先花 kernel 网络时间；除非允许重建 LTP/musl 镜像 |
 | IPv4/命令层网络 | `net.tcp_cmds` | 17 entries | 已计分 `37/40`，另有 9 项 `TCONF/skipped` | `netstat`、`iproute`、`ping01`、`ping02`、`arping01`、`ipneigh01_{arp,ip}` 已过；`traceroute01` 为 `3/6` 部分通过 | 决定 rootfs 工具面：`ss`、`tracepath`、`tcpdump`、`traceroute -T`、服务命令、netfilter/driver 广告 |
-| IPv6 命令层网络 | `net.ipv6` | 11 entries | 已确认 `20/20` | `ping601` 和 `ping602` 均已过，各覆盖 10 个 IPv6 ping payload；其余 9 项未开始 | 下一步跑 `sendfile601` focused，确认 IPv6 sendfile/命令依赖面 |
+| IPv6 命令层网络 | `net.ipv6` | 11 entries | 已计分 `21/27`，另有 7 项 `TCONF/skipped` | `ping601`、`ping602`、`ipneigh6_ip` 已过；`traceroute601` 为 `0/6`；`sendfile601`、`tcpdump601`、`tracepath601`、`dhcpd6`、`dnsmasq6`、`ip6tables`、`nft6` 目前是工具/driver TCONF | 下一步优先看 `traceroute601 -I` 的 IPv6 bind 语义；工具/driver项另列 rootfs/config backlog |
 | 高级网络特性 | `net.features` | 62 entries | not-run | 未开始；包含 BBR、DCCP、SCTP、TFO、VXLAN、VLAN、macvlan、macsec、GRE/GUE/FOU、Geneve、WireGuard 等 | 暂缓，等命令层/IPv6 baseline 更稳 |
 | 组播 | `net.multicast` | 4 entries | not-run | 未开始 | 暂缓 |
 | 完整 SCTP | `net.sctp` | 41 entries | not-run | 未开始；不同于 syscall witness 里的 local-only SCTP 支持 | 除非明确 charter 完整 SCTP，否则暂缓 |
@@ -157,22 +158,23 @@ boot-environment surfaces:
 
 ## 细表：`net.ipv6`
 
-小计：已确认 `20/20`。`ping601` 和 `ping602` focused witness 已经
-通过；其余 `net.ipv6` 命令层入口还没有开始，不计入当前分母。
+小计：已计分 `21/27`，另有 7 项 `TCONF/skipped`。`ping601`、
+`ping602` 和 `ipneigh6_ip` 已经通过；`traceroute601` 是当前唯一
+已进入命令主体且失败的 IPv6 命令层语义 witness。
 
 | 测试 | 得分 | 状态 | 说明 | 证据 |
 | --- | ---: | --- | --- | --- |
 | `ping601` | `10/10` | pass | 旧 baseline 是 `sendto: Not supported`；ICMPv6 echo/SOL_RAW 修复后 trace 显示第一包 `sendto`/`recvmsg` 已通，但第二次 `recvmsg` 卡住。最终补上 `recvmsg` 的 `ITIMER_REAL`/`SIGALRM` aware wait 后，10 个 payload 全部 TPASS。 | pass `target/oscomp/ltp-net-ipv6-ping601-recvmsg-itimer-240s.txt`; trace `target/oscomp/ltp-net-ipv6-ping601-syscalltrace-240s.txt` |
 | `ping602` | `10/10` | pass | baseline 到 `ping6 -I eth0 -p aa -s 8` 后失败 `sendto: Not supported`。BusyBox `-p aa` 会先把 ICMPv6 header/payload 填成 `0xaa`，再只覆盖 type/id/seq；unchecked raw ICMPv6 parser 现在接受这种 pattern-filled echo code，10 个 payload 全部 TPASS。 | baseline `target/oscomp/ltp-net-ipv6-ping602-focused-240s.txt`; pass `target/oscomp/ltp-net-ipv6-ping602-pattern-code-240s.txt` |
-| `sendfile601` | not-run | not-run | IPv6 sendfile 命令测试，尚未开始。 | - |
-| `tcpdump601` | not-run | not-run | IPv6 tcpdump 命令测试，尚未开始。 | - |
-| `tracepath601` | not-run | not-run | IPv6 tracepath 命令测试，尚未开始。 | - |
-| `traceroute601` | not-run | not-run | IPv6 traceroute 命令测试，尚未开始。 | - |
-| `dhcpd6` | not-run | not-run | IPv6 DHCP daemon/service 测试，尚未开始。 | - |
-| `dnsmasq6` | not-run | not-run | IPv6 dnsmasq/service 测试，尚未开始。 | - |
-| `ipneigh6_ip` | not-run | not-run | IPv6 neighbor 命令测试，尚未开始。 | - |
-| `ip6tables` | not-run | not-run | IPv6 legacy netfilter 命令测试，尚未开始。 | - |
-| `nft6` | not-run | not-run | IPv6 nftables 命令测试，尚未开始。 | - |
+| `sendfile601` | skipped | `TCONF` | IPv6 setup 完整；主体跳过在 `ss` 缺失，和 IPv4 `sendfile` 同类 rootfs 工具缺口。 | `target/oscomp/ltp-net-ipv6-command4-next-420s.txt` |
+| `tcpdump601` | skipped | `TCONF` | focused run 显示脚本 helper 有 `tst_require_drivers` warning，最终跳过在 rootfs 缺 `tcpdump`；尚未进入 AF_PACKET capture 语义。 | `target/oscomp/ltp-net-ipv6-tcpdump601-focused-240s.txt` |
+| `tracepath601` | skipped | `TCONF` | IPv6 setup 完整；跳过在 rootfs 缺 `tracepath`。 | `target/oscomp/ltp-net-ipv6-tracepath-traceroute-next-300s.txt` |
+| `traceroute601` | `0/6` | fail | ICMP-ECHO `-I` 子项失败在 `traceroute6: bind: Address family not supported by protocol`；TCP-SYN `-T` 子项仍是 BusyBox `traceroute6` 不支持 `-T`。 | `target/oscomp/ltp-net-ipv6-tracepath-traceroute-next-300s.txt` |
+| `dhcpd6` | skipped | `TCONF` | IPv6 setup 完整；rootfs 缺 `dhcpd`。 | `target/oscomp/ltp-net-ipv6-services-netfilter-next-360s.txt` |
+| `dnsmasq6` | skipped | `TCONF` | IPv6 setup 完整；rootfs 缺 `dnsmasq`。 | `target/oscomp/ltp-net-ipv6-services-netfilter-next-360s.txt` |
+| `ipneigh6_ip` | `1/1` | pass | baseline 已过 stress marker 但失败 `NDISC entry 'fd00:1:1:1::1' not listed`。补上 IPv6 NDISC resolved cache/projection、单包 `ping6` builtin 安装 NDISC、以及 IPv6 `ip neigh del` 删除路径后，50 轮 add/show/delete 全部 TPASS。 | fail `target/oscomp/ltp-net-ipv6-ipneigh6-ip-focused-480s.txt`; pass `target/oscomp/ltp-net-ipv6-ipneigh6-ip-ndisc-480s.txt` |
+| `ip6tables` | skipped | `TCONF` | `ip6_tables driver not available`，并且 `/proc/modules` 缺失；尚未进入 legacy IPv6 iptables rule 语义。 | `target/oscomp/ltp-net-ipv6-services-netfilter-next-360s.txt` |
+| `nft6` | skipped | `TCONF` | `nf_tables driver not available`；尚未进入 nftables netlink rule 语义。 | `target/oscomp/ltp-net-ipv6-services-netfilter-next-360s.txt` |
 
 Implemented prerequisites observed during the `netstat` climb:
 
@@ -387,11 +389,11 @@ small and choose between these blockers:
 - `traceroute01` remaining command surface: the kernel-side ICMP-ECHO `-I`
   owner is fixed; decide separately whether the `-T` subcase requires a fuller
   traceroute binary or a compatible rootfs command shim;
-- `net.ipv6` ICMP/raw ping: `ping601` and `ping602` now pass `20/20`.
-  `ping601` needed the `recvmsg` `ITIMER_REAL`/SIGALRM-aware wait path;
-  `ping602` additionally needed unchecked raw ICMPv6 echo parsing to accept
-  BusyBox `-p aa` pattern-filled nonzero code bytes. Run `sendfile601` next
-  before broader `net.ipv6`.
+- `net.ipv6` command layer: all 11 entries now have focused witnesses.
+  `ping601`, `ping602`, and `ipneigh6_ip` pass; `traceroute601` is the next
+  real semantic owner because ICMP-ECHO `-I` fails at IPv6 bind while TCP-SYN
+  `-T` remains a BusyBox command-surface gap. The remaining observed entries
+  are rootfs/tool or driver-advertisement `TCONF`.
 
 Useful confirmation targets after those fixes:
 
@@ -401,6 +403,6 @@ timeout 300s make oscomp-qemu-rv64 \
   OSCOMP_OUT_RV=target/oscomp/ltp-net-tcp-cmds-traceroute01-ttl-300s.txt
 
 timeout 240s make oscomp-qemu-rv64 \
-  OSCOMP_GROUPS=ltp-runtest:net.ipv6:sendfile601 \
-  OSCOMP_OUT_RV=target/oscomp/ltp-net-ipv6-sendfile601-focused-240s.txt
+  OSCOMP_GROUPS=ltp-runtest:net.ipv6:traceroute601 \
+  OSCOMP_OUT_RV=target/oscomp/ltp-net-ipv6-traceroute601-focused-240s.txt
 ```
