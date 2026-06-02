@@ -5,12 +5,17 @@ use crate::execution::{Errno, Guard};
 use crate::net::checks::require::require_socket_write_target;
 use crate::net::delegate::net_delegate_kick_poll;
 use crate::net::execution::{socket_send_wait_token, yield_bytes_on_token, ByteStepOutcome};
-use crate::net::protocol::{RawIpv6Packet, UDP_IPV4_MAX_PAYLOAD_BYTES};
+use crate::net::namespace::{net_namespace_payloads_snapshot, NetNamespacePayload};
+use crate::net::protocol::{
+    build_icmpv6_echo_reply_message, parse_icmpv6_payload_unchecked, Icmpv6Event, RawIpv6Packet,
+    UDP_IPV4_MAX_PAYLOAD_BYTES,
+};
 use crate::net::structure::{
     AddressFamily, ConnectionKey, IpEndpoint, Ipv6Address, ProtocolNumber, RdsState, RecvWireSet,
     SendRecvFlags, SendWireSet, SocketIdentity, SocketKind, SocketPayload, SocketProtocol,
     TcpState, UnixDatagramState, UnixSocketPath, UnixStreamState,
 };
+use tx_substrate::zone::PayloadCap;
 
 pub fn step_send(
     socket: &Cap<SocketIdentity>,
@@ -238,7 +243,7 @@ pub fn step_send_to_kernel_bytes_with_poll_kick(
         return StepOutcome::Done(0);
     }
     if socket.kind == SocketKind::RawIcmp && payload.family() == AddressFamily::Inet6 {
-        return send_raw_ipv6_loopback(socket, &payload, dst, bytes, guard);
+        return send_raw_ipv6(socket, &payload, dst, bytes, guard);
     }
     if socket.kind == SocketKind::UnixStream {
         return send_unix_stream_bytes(socket, &payload, bytes, guard);
@@ -460,7 +465,7 @@ fn send_rds_packet(
     StepOutcome::Done(bytes.len())
 }
 
-fn send_raw_ipv6_loopback(
+fn send_raw_ipv6(
     _socket: &Cap<SocketIdentity>,
     payload: &SocketPayload,
     dst: Option<IpEndpoint>,
@@ -472,9 +477,6 @@ fn send_raw_ipv6_loopback(
     };
     if destination.family != AddressFamily::Inet6 {
         return StepOutcome::Err(Errno::EAFNOSUPPORT);
-    }
-    if !destination.is_loopback() && !destination.is_unspecified() {
-        return StepOutcome::Err(Errno::EOPNOTSUPP);
     }
 
     let checksum_offset = payload.with_options(|options| options.ip.ipv6_checksum);
@@ -494,7 +496,13 @@ fn send_raw_ipv6_loopback(
     let src_addr = payload
         .raw_icmp_bound_local6()
         .filter(|addr| !addr.is_unspecified())
+        .or_else(|| preferred_ipv6_source_for(&payload.net_namespace(), dst_addr))
         .unwrap_or(Ipv6Address::LOOPBACK);
+
+    if !destination.is_loopback() && !destination.is_unspecified() {
+        return send_configured_icmpv6_echo(payload, protocol, src_addr, dst_addr, bytes, guard);
+    }
+
     let packet = RawIpv6Packet {
         src: src_addr,
         dst: dst_addr,
@@ -502,6 +510,66 @@ fn send_raw_ipv6_loopback(
         payload: bytes.to_vec(),
     };
 
+    deliver_raw_ipv6_packet_to_table(
+        payload,
+        protocol,
+        dst_addr,
+        bytes.first().copied(),
+        packet,
+        guard,
+    );
+    StepOutcome::Done(bytes.len())
+}
+
+fn send_configured_icmpv6_echo(
+    payload: &SocketPayload,
+    protocol: ProtocolNumber,
+    src_addr: Ipv6Address,
+    dst_addr: Ipv6Address,
+    bytes: &[u8],
+    guard: &Guard<'_>,
+) -> ByteStepOutcome<usize> {
+    if protocol != ProtocolNumber(58) {
+        return StepOutcome::Err(Errno::EOPNOTSUPP);
+    }
+    if !ipv6_addr_is_configured(dst_addr) {
+        return StepOutcome::Err(Errno::EOPNOTSUPP);
+    }
+    let request = match parse_icmpv6_payload_unchecked(src_addr, dst_addr, bytes) {
+        Icmpv6Event::EchoRequest(request) => request,
+        Icmpv6Event::Malformed => return StepOutcome::Err(Errno::EINVAL),
+        Icmpv6Event::EchoReply(_) | Icmpv6Event::Unsupported => {
+            return StepOutcome::Err(Errno::EOPNOTSUPP)
+        }
+    };
+    let reply = request.reply_packet();
+    let reply_payload = build_icmpv6_echo_reply_message(&reply);
+    let reply_packet = RawIpv6Packet {
+        src: reply.src,
+        dst: reply.dst,
+        next_header: protocol,
+        payload: reply_payload,
+    };
+    let packet_type = reply_packet.payload.first().copied();
+    deliver_raw_ipv6_packet_to_table(
+        payload,
+        protocol,
+        reply.dst,
+        packet_type,
+        reply_packet,
+        guard,
+    );
+    StepOutcome::Done(bytes.len())
+}
+
+fn deliver_raw_ipv6_packet_to_table(
+    payload: &SocketPayload,
+    protocol: ProtocolNumber,
+    dst_addr: Ipv6Address,
+    packet_type: Option<u8>,
+    packet: RawIpv6Packet,
+    guard: &Guard<'_>,
+) {
     for target in payload.socket_table().snapshot_raw_icmp(guard) {
         if target.kind != SocketKind::RawIcmp {
             continue;
@@ -524,7 +592,7 @@ fn send_raw_ipv6_loopback(
         if protocol == ProtocolNumber(58)
             && !icmp6_filter_accepts(
                 target_payload.raw_icmp6_filter().unwrap_or([0; 8]),
-                bytes.first().copied(),
+                packet_type,
             )
         {
             continue;
@@ -533,8 +601,6 @@ fn send_raw_ipv6_loopback(
             target.readiness.fire_recv(RecvWireSet::HAS_DATA);
         }
     }
-
-    StepOutcome::Done(bytes.len())
 }
 
 fn icmp6_filter_accepts(filter: [u32; 8], packet_type: Option<u8>) -> bool {
@@ -547,6 +613,58 @@ fn icmp6_filter_accepts(filter: [u32; 8], packet_type: Option<u8>) -> bool {
     filter
         .get(word)
         .is_none_or(|word| (word & (1u32 << shift)) == 0)
+}
+
+fn preferred_ipv6_source_for(
+    net_namespace: &PayloadCap<NetNamespacePayload>,
+    dst: Ipv6Address,
+) -> Option<Ipv6Address> {
+    let mut fallback = None;
+    for link in net_namespace.link_snapshot() {
+        if !link.is_up {
+            continue;
+        }
+        let Some(addr) = link.ipv6_addr else {
+            continue;
+        };
+        if addr.is_unspecified() {
+            continue;
+        }
+        if fallback.is_none() && addr != Ipv6Address::LOOPBACK {
+            fallback = Some(addr);
+        }
+        if ipv6_prefix_matches(addr, dst, link.ipv6_prefix_len.unwrap_or(128)) {
+            return Some(addr);
+        }
+    }
+    fallback
+}
+
+fn ipv6_addr_is_configured(addr: Ipv6Address) -> bool {
+    net_namespace_payloads_snapshot()
+        .into_iter()
+        .any(|namespace| {
+            namespace
+                .link_snapshot()
+                .into_iter()
+                .any(|link| link.is_up && link.ipv6_addr == Some(addr))
+        })
+}
+
+fn ipv6_prefix_matches(lhs: Ipv6Address, rhs: Ipv6Address, prefix_len: u8) -> bool {
+    let prefix_len = prefix_len.min(128);
+    let whole_bytes = usize::from(prefix_len / 8);
+    let remaining_bits = prefix_len % 8;
+    let lhs = lhs.octets();
+    let rhs = rhs.octets();
+    if lhs[..whole_bytes] != rhs[..whole_bytes] {
+        return false;
+    }
+    if remaining_bits == 0 {
+        return true;
+    }
+    let mask = 0xffu8 << (8 - remaining_bits);
+    (lhs[whole_bytes] & mask) == (rhs[whole_bytes] & mask)
 }
 
 fn send_unix_stream_bytes(

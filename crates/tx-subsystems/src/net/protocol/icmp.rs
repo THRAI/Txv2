@@ -4,8 +4,8 @@ use alloc::vec::Vec;
 
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::wire::{
-    Icmpv4Packet, Icmpv4Repr, IpProtocol, IpRepr, Ipv4Address as SmoltcpIpv4Address, Ipv4Packet,
-    Ipv4Repr,
+    Icmpv4Packet, Icmpv4Repr, Icmpv6Packet, Icmpv6Repr, IpProtocol, IpRepr,
+    Ipv4Address as SmoltcpIpv4Address, Ipv4Packet, Ipv4Repr, Ipv6Address as SmoltcpIpv6Address,
 };
 
 use crate::net::packet::LoopbackIpPacket;
@@ -25,6 +25,23 @@ pub struct Icmpv4EchoPacket {
 pub enum Icmpv4Event {
     EchoRequest(Icmpv4EchoPacket),
     EchoReply(Icmpv4EchoPacket),
+    Unsupported,
+    Malformed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Icmpv6EchoPacket {
+    pub src: Ipv6Address,
+    pub dst: Ipv6Address,
+    pub ident: u16,
+    pub seq_no: u16,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Icmpv6Event {
+    EchoRequest(Icmpv6EchoPacket),
+    EchoReply(Icmpv6EchoPacket),
     Unsupported,
     Malformed,
 }
@@ -67,6 +84,18 @@ pub struct RawIcmpSocket {
 }
 
 impl Icmpv4EchoPacket {
+    pub fn reply_packet(&self) -> Self {
+        Self {
+            src: self.dst,
+            dst: self.src,
+            ident: self.ident,
+            seq_no: self.seq_no,
+            payload: self.payload.clone(),
+        }
+    }
+}
+
+impl Icmpv6EchoPacket {
     pub fn reply_packet(&self) -> Self {
         Self {
             src: self.dst,
@@ -383,6 +412,44 @@ fn parse_icmpv4_echo_payload_unchecked_inner(
     }
 }
 
+pub const ICMPV6_ECHO_HEADER_LEN: usize = 8;
+
+pub fn parse_icmpv6_payload_unchecked(
+    src: Ipv6Address,
+    dst: Ipv6Address,
+    payload: &[u8],
+) -> Icmpv6Event {
+    if payload.len() < ICMPV6_ECHO_HEADER_LEN {
+        return Icmpv6Event::Malformed;
+    }
+    if payload[1] != 0 {
+        return Icmpv6Event::Unsupported;
+    }
+
+    let ident = u16::from_be_bytes([payload[4], payload[5]]);
+    let seq_no = u16::from_be_bytes([payload[6], payload[7]]);
+    let packet = Icmpv6EchoPacket {
+        src,
+        dst,
+        ident,
+        seq_no,
+        payload: payload[ICMPV6_ECHO_HEADER_LEN..].to_vec(),
+    };
+    match payload[0] {
+        128 => Icmpv6Event::EchoRequest(packet),
+        129 => Icmpv6Event::EchoReply(packet),
+        _ => Icmpv6Event::Unsupported,
+    }
+}
+
+pub fn build_icmpv6_echo_request_message(packet: &Icmpv6EchoPacket) -> Vec<u8> {
+    build_icmpv6_echo_message(packet, true)
+}
+
+pub fn build_icmpv6_echo_reply_message(packet: &Icmpv6EchoPacket) -> Vec<u8> {
+    build_icmpv6_echo_message(packet, false)
+}
+
 pub fn build_icmpv4_echo_request(packet: &Icmpv4EchoPacket) -> LoopbackIpPacket {
     build_icmpv4_echo_packet(packet, true)
 }
@@ -444,6 +511,31 @@ fn build_icmpv4_echo_message(packet: &Icmpv4EchoPacket, request: bool) -> Vec<u8
     bytes
 }
 
+fn build_icmpv6_echo_message(packet: &Icmpv6EchoPacket, request: bool) -> Vec<u8> {
+    let icmp_repr = if request {
+        Icmpv6Repr::EchoRequest {
+            ident: packet.ident,
+            seq_no: packet.seq_no,
+            data: &packet.payload,
+        }
+    } else {
+        Icmpv6Repr::EchoReply {
+            ident: packet.ident,
+            seq_no: packet.seq_no,
+            data: &packet.payload,
+        }
+    };
+    let mut bytes = vec![0u8; icmp_repr.buffer_len()];
+    let mut icmp_packet = Icmpv6Packet::new_unchecked(&mut bytes);
+    icmp_repr.emit(
+        &to_smoltcp_ipv6(packet.src),
+        &to_smoltcp_ipv6(packet.dst),
+        &mut icmp_packet,
+        &ChecksumCapabilities::default(),
+    );
+    bytes
+}
+
 fn echo_queue_len(queue: &VecDeque<Icmpv4EchoPacket>) -> usize {
     queue.iter().map(icmpv4_echo_message_len).sum()
 }
@@ -459,4 +551,8 @@ fn to_smoltcp_ipv4(addr: Ipv4Address) -> SmoltcpIpv4Address {
 
 fn from_smoltcp_ipv4(addr: SmoltcpIpv4Address) -> Ipv4Address {
     Ipv4Address::new(addr.octets())
+}
+
+fn to_smoltcp_ipv6(addr: Ipv6Address) -> SmoltcpIpv6Address {
+    SmoltcpIpv6Address::from(addr.octets())
 }

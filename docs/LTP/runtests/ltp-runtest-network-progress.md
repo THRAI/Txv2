@@ -1,211 +1,79 @@
-# LTP native network runtest progress
+# LTP 网络测试进度总表
 
 Date: 2026-06-02
 
-This file tracks native LTP network runtest modules such as `runtest/net.*`,
-`runtest/net_stress.*`, and `runtest/can`. It is separate from
-`docs/LTP/ltp-network-syscall-progress.md`, which tracks the 50 socket/network
-syscall cases from `runtest/syscalls`.
+本文档回答两个问题：
 
-本文档记录原生 LTP 网络模块的进度。它不是 syscall 50 例的表，而是
-`ltp-runtest:<module>` 这一类 upstream `runtest/net.*` 模块的通过情况。
+- **总表**：LTP 网络相关测试分成哪些类型？每类现在多少分？
+- **细表**：每个类型下面具体哪些测试已经通过、部分通过、跳过或未跑？
 
-## Current status
+计分口径：
 
-| Module | Entries | Latest judge | Kernel-side status | Latest log |
-| --- | ---: | ---: | --- | --- |
-| `net.ipv6_lib` | 6 | `76/77` | Phase 1 kernel-side baseline complete; only `hopopt` is a musl test-image/libc table miss | `target/oscomp/ltp-net-ipv6-lib-final-lhost-hopopt-known-120s.txt` |
-| `net.tcp_cmds` | 17 | filtered `netstat`: `5/5`; filtered `iproute`: `6/6`; grouped `ping01+ping02`: `20/20`; filtered `arping01`: `1/1`; focused/pair `ipneigh01_{arp,ip}`: pass; remaining probes mostly `TCONF`, with `traceroute01` now `3/6` | command/procfs/netns baseline has clean witnesses; IPv4 ICMP, cooked AF_PACKET ARP, and neighbor delete/relearn now pass focused witnesses. `traceroute01 -I` kernel semantics are fixed: Linux-compatible `IP_TTL`, wildcard-bound raw ICMP reply delivery, and IPv4 raw ICMP receive with an IP header let the ICMP-ECHO subcase pass all three checks. The remaining filtered probes are mostly rootfs command/driver-advertising gaps (`ss`, `tracepath`, `tcpdump`, `ssh`, `dhcpd`, `dnsmasq`, `ip_tables`, `nf_tables`, `sch_teql`), and the remaining `traceroute01` failures are the same rootfs command-surface gap: BusyBox lacks the `-T` mode expected by the test. | `target/oscomp/ltp-net-tcp-cmds-traceroute01-rawicmp-ipheader-300s.txt` |
-| `net.ipv6` | 11 | `ping601`: `0/10` | `ping601` (`ping01.sh -6`) reaches complete local/remote IPv4+IPv6 network setup and prints the Network config. The blocker is the command body: every `ping6 -s {8..4064} fd00:1:1:1::1` fails with `sendto: Not supported`. Treat this as an IPv6 ICMP/raw send path gap, not a remote setup hang. | `target/oscomp/ltp-net-ipv6-ping601-rhost-trace-180s.txt` |
-| other `net.*` / `net_stress.*` / `can` | many | not started | defer until command/procfs/rtnetlink/netns baseline and the newly exposed command/tool gaps are triaged | - |
+- `x/y` 来自本地 `tools/oscomp-judge.py` 或 LTP case summary，是当前本地
+  进度口径，不是一次性官方全量提交分。
+- `TCONF/skipped` 表示测试因命令、驱动、配置或服务环境缺失而跳过，不放进
+  “可计分小计”的分母。
+- `not-run` 表示还没有有效 witness，不计分。
+- `dirty-tree` 表示当前未提交实验结果，只能说明调试进展，不能算通过。
+- native runner 有时会在 `PASS LTP CASE ... : 0` 后面再打印一个旧式
+  `FAIL LTP CASE ... : 0` marker；以 LTP summary 和本地 judge 为准。
 
-Latest full IPv6 command:
+当前最重要的小计：
 
-```sh
-timeout 120s make oscomp-qemu-rv64 \
-  OSCOMP_GROUPS=ltp-runtest:net.ipv6_lib \
-  OSCOMP_OUT_RV=target/oscomp/ltp-net-ipv6-lib-final-lhost-hopopt-known-120s.txt
+- 已确认通过点数：`352` = syscall-network `229` +
+  `net.ipv6_lib` `76` + `net.tcp_cmds` `37` + `net.ipv6:ping601`
+  `10`。
+- 已观察分母口径：`352/363` = syscall-network `229/236` +
+  `net.ipv6_lib` `76/77` + `net.tcp_cmds` 已计分 `37/40` +
+  `net.ipv6:ping601` `10/10`。
+- 上面的 `352/363` 仍然是 stitched/local 进度，不等于全量 LTP network
+  官方成绩；`TCONF` 和未跑模块没有计入分母。
 
-python3 tools/oscomp-judge.py \
-  target/oscomp/ltp-net-ipv6-lib-final-lhost-hopopt-known-120s.txt \
-  target/oscomp/testdata
-```
+## 总表
 
-Latest judge output:
+| 类型 | 来源 | 条目规模 | 当前得分 | 当前状态 | 下一步 |
+| --- | --- | ---: | ---: | --- | --- |
+| socket/network syscall | `runtest/syscalls` 手动筛出的 50 个 socket/network case | 50 cases | `229/236` | split-batch 已覆盖全部 50 个 case；剩余缺口主要是架构面、镜像/用户态 wrapper、少量非核心网络 surface | 作为回归基线；细节见下面 syscall 分批表和 `docs/LTP/ltp-network-syscall-progress.md` |
+| IPv6 libc/API | `net.ipv6_lib` | 6 entries | `76/77` | 基本完成；只剩 `asapi_01` 的 `hopopt` 协议表点，属于 musl test image/libc 表缺口 | 不优先花 kernel 网络时间；除非允许重建 LTP/musl 镜像 |
+| IPv4/命令层网络 | `net.tcp_cmds` | 17 entries | 已计分 `37/40`，另有 9 项 `TCONF/skipped` | `netstat`、`iproute`、`ping01`、`ping02`、`arping01`、`ipneigh01_{arp,ip}` 已过；`traceroute01` 为 `3/6` 部分通过 | 决定 rootfs 工具面：`ss`、`tracepath`、`tcpdump`、`traceroute -T`、服务命令、netfilter/driver 广告 |
+| IPv6 命令层网络 | `net.ipv6` | 11 entries | 已确认 `10/10` | `ping601` 已过 10 个 IPv6 ping payload；`ping602` 和其余 9 项未开始 | 下一步跑 `ping602` focused，确认 `-I`/interface IPv6 ping surface |
+| 高级网络特性 | `net.features` | 62 entries | not-run | 未开始；包含 BBR、DCCP、SCTP、TFO、VXLAN、VLAN、macvlan、macsec、GRE/GUE/FOU、Geneve、WireGuard 等 | 暂缓，等命令层/IPv6 baseline 更稳 |
+| 组播 | `net.multicast` | 4 entries | not-run | 未开始 | 暂缓 |
+| 完整 SCTP | `net.sctp` | 41 entries | not-run | 未开始；不同于 syscall witness 里的 local-only SCTP 支持 | 除非明确 charter 完整 SCTP，否则暂缓 |
+| NFS/RPC/TIRPC | `net.nfs`、`net.rpc_tests`、`net.tirpc_tests` | 205 entries | not-run | 未开始；依赖服务、RPC/NFS 环境 | 暂缓 |
+| 网络压力测试 | `net_stress.*` | 588 entries | not-run | 未开始；覆盖服务、坏包、interface/route/multicast/ipsec 压力 | 暂缓 |
+| CAN | `can` | 3 entries | not-run | 未开始 | 暂缓 |
 
-```text
-[ltp-musl] 76/77
-  ✓ in6_01  5/5
-  ✓ in6_02  3/3
-  ✓ getaddrinfo_01  22/22
-  ~ asapi_01  16/17
-  ✓ asapi_02  12/12
-  ✓ asapi_03  18/18
+## 细表：socket/network syscall 分批
 
-总分: 76/77
-```
+这部分来自 `runtest/syscalls`，不是 native `net.*` runtest。前 6 行覆盖
+当前跟踪的 50 个 socket/network syscall case，总分不要和后面的 focused
+重叠 witness 重复相加。
 
-Latest filtered `net.tcp_cmds:netstat` command:
+| 分批 | 包含测试 | 得分 | 状态 | 证据 |
+| --- | --- | ---: | --- | --- |
+| 基础 socket/listen/options | `socket01,socket02,listen01,getsockname01,getsockopt01,getsockopt02,setsockopt01` | `40/40` | pass | `target/oscomp/ltp-net-b1-basic.txt` |
+| 基础 send/recv | `send01,send02,sendto01,sendto02,sendto03,recv01,recvfrom01` | `35/35` | pass | `target/oscomp/ltp-net-b2-after-rds-sctp.txt` |
+| msg/mmsg | `sendmsg01,sendmsg02,sendmsg03,recvmsg01,recvmsg02,recvmsg03,sendmmsg01,sendmmsg02,recvmmsg01` | `37/38` | partial | `target/oscomp/ltp-net-b3-after-rds-sctp.txt` |
+| bind/connect/accept | `bind01,bind02,bind03,bind04,bind05,bind06,connect01,connect02,accept01,accept02,accept03,accept4_01,getpeername01` | `93/95` | partial | `target/oscomp/ltp-net-b4-after-kernel-object-fds.txt` |
+| socketpair/socketcall | `socketpair01,socketpair02,socketcall01,socketcall02,socketcall03` | `14/17` | partial | `target/oscomp/ltp-net-b5-socketpair-socketcall.txt` |
+| setsockopt tail | `setsockopt02,setsockopt03,setsockopt04,setsockopt05,setsockopt06,setsockopt07,setsockopt08,setsockopt09,setsockopt10` | `10/11` | partial | `target/oscomp/ltp-net-b6-after-tls-ulp.txt` |
 
-```sh
-timeout 300s make oscomp-qemu-rv64 \
-  OSCOMP_GROUPS=ltp-runtest:net.tcp_cmds:netstat \
-  OSCOMP_OUT_RV=target/oscomp/ltp-net-tcp-cmds-netstat-netstat-shim-300s.txt
-```
+syscall-network 小计：`229/236`。其它 focused IPv6、accept、userns、RDS、
+SCTP、TLS witness 与上面分批重叠，只作为回归证据，不额外累计到总分。
 
-Latest `netstat01` summary:
+## 细表：`net.ipv6_lib`
 
-```text
-Summary:
-passed   5
-failed   0
-broken   0
-skipped  0
-warnings 0
-PASS LTP CASE netstat : 0
-```
+小计：`76/77`。这是目前 native network 里最稳的一组。
 
-Note: the current native runtest wrapper still prints a trailing
-`FAIL LTP CASE netstat : 0` marker after the pass marker. Treat the LTP
-case summary and `PASS ... : 0` line as authoritative for this witness.
-
-Latest filtered `net.tcp_cmds:iproute` command:
-
-```sh
-timeout 420s make oscomp-qemu-rv64 \
-  OSCOMP_GROUPS=ltp-runtest:net.tcp_cmds:iproute \
-  OSCOMP_OUT_RV=target/oscomp/ltp-net-tcp-cmds-iproute-complete-420s.txt
-```
-
-Latest `ip_tests.sh` summary:
-
-```text
-Summary:
-passed   6
-failed   0
-broken   0
-skipped  0
-warnings 0
-PASS LTP CASE iproute : 0
-```
-
-Note: the current native runtest wrapper still prints a trailing
-`FAIL LTP CASE iproute : 0` marker after the pass marker. Treat the LTP
-case summary and `PASS ... : 0` line as authoritative for this witness.
-
-Latest grouped `net.tcp_cmds:ping01+ping02` command:
-
-```sh
-timeout 900s make oscomp-qemu-rv64 \
-  OSCOMP_GROUPS=ltp-runtest:net.tcp_cmds:ping01+ping02 \
-  OSCOMP_OUT_RV=target/oscomp/ltp-net-tcp-cmds-ping01-ping02-routeflush-noack-900s.txt
-```
-
-Latest grouped ping summaries:
-
-```text
-ping01:
-passed   10
-failed   0
-warnings 0
-PASS LTP CASE ping01 : 0
-
-ping02:
-passed   10
-failed   0
-warnings 0
-PASS LTP CASE ping02 : 0
-```
-
-Note: the native runner may still print a trailing
-`FAIL LTP CASE ping02 : 0` marker after the pass marker. Treat the per-case
-summary and zero-status pass marker as authoritative.
-
-Latest filtered `net.tcp_cmds:arping01` command:
-
-```sh
-timeout 420s make oscomp-qemu-rv64 \
-  OSCOMP_GROUPS=ltp-runtest:net.tcp_cmds:arping01 \
-  OSCOMP_OUT_RV=target/oscomp/ltp-net-tcp-cmds-arping01-global-arp-420s.txt
-```
-
-Latest `arping01.sh` summary:
-
-```text
-Summary:
-passed   1
-failed   0
-broken   0
-skipped  0
-warnings 0
-PASS LTP CASE arping01 : 0
-```
-
-Note: the native runner may still print a trailing
-`FAIL LTP CASE arping01 : 0` marker after the pass marker. Treat the per-case
-summary and zero-status pass marker as authoritative.
-
-Latest filtered `net.tcp_cmds:ipneigh01_arp` command:
-
-```sh
-timeout 900s make oscomp-qemu-rv64 \
-  OSCOMP_GROUPS=ltp-runtest:net.tcp_cmds:ipneigh01_arp \
-  OSCOMP_OUT_RV=target/oscomp/ltp-net-tcp-cmds-ipneigh01-arp-siocdarp-900s.txt
-```
-
-Latest `ipneigh01_arp` result:
-
-```text
-ipneigh01 1  TINFO: stress auto-creation ARP cache entry deleted with 'arp' 50 times
-Test timed out, sending SIGTERM!
-If you are running on slow machine, try exporting LTP_TIMEOUT_MUL > 1
-```
-
-Interpretation: the former `arp: SIOCDARP(priv): Not a tty` blocker is closed.
-The test now reaches the 50-iteration delete/relearn stress loop and times out
-inside the LTP per-case 5 minute timer.
-
-Latest filtered `net.tcp_cmds:ipneigh01_ip` command:
-
-```sh
-timeout 660s make oscomp-qemu-rv64 \
-  OSCOMP_GROUPS=ltp-runtest:net.tcp_cmds:ipneigh01_ip \
-  OSCOMP_OUT_RV=target/oscomp/ltp-net-tcp-cmds-ipneigh01-ip-proc-neigh-show-660s.txt
-```
-
-Latest focused runtime profile:
-
-```sh
-timeout 285s make oscomp-qemu-rv64 \
-  OSCOMP_GROUPS=ltp-runtest:net.tcp_cmds:ipneigh01_ip \
-  LTP_TRACE_RUNTIME=1 \
-  OSCOMP_OUT_RV=target/oscomp/ltp-net-tcp-cmds-ipneigh01-ip-tx-neigh-ctl-openok-profile-285s.txt
-```
-
-Latest `ipneigh01_ip` result:
-
-```text
-ipneigh01 1  TINFO: stress auto-creation ARP cache entry deleted with 'ip' 50 times
-Test timed out, sending SIGTERM!
-If you are running on slow machine, try exporting LTP_TIMEOUT_MUL > 1
-```
-
-Interpretation: the former `TFAIL: ARP entry '10.0.0.1' not listed` blocker is
-closed. `/tx-ltp/bin/ip neigh show` now reports dynamic neighbor state from the
-kernel-owned `/proc/net/tx_neigh` projection, and `ip neigh del` deletes IPv4
-neighbor state through `/proc/net/tx_neigh_ctl` before returning success. The
-latest profile shows no `neigh-del arp-d-begin` fallback markers.
-
-## `net.ipv6_lib` case ledger
-
-| Case | Score | Status | What it proves / why it matters | Evidence |
+| 测试 | 得分 | 状态 | 说明 | 证据 |
 | --- | ---: | --- | --- | --- |
-| `in6_01` | `5/5` | pass | IPv6 libc-visible structure constants and address macros are usable under the current image. | final full log |
-| `in6_02` | `3/3` | pass | Interface name/index APIs enumerate `lo` and `virtio-net0`; LTP now receives `LHOST_IFACES=virtio-net0` from the runner environment. | `target/oscomp/ltp-net-ipv6-lib-in6-02-lhost-ifaces-60s.txt` and final full log |
-| `getaddrinfo_01` | `22/22` | pass | `/etc/hosts`, `/etc/services`, IPv4/IPv6 address-family handling, and `getaddrinfo()` paths satisfy the LTP witness. | final full log |
-| `asapi_01` | `16/17` | partial | All `IPV6_CHECKSUM` socket-option subcases pass. The only miss is `getprotobyname("hopopt")`. | `target/oscomp/ltp-net-ipv6-lib-asapi01-rawv6-60s.txt`, `target/oscomp/ltp-net-ipv6-lib-asapi01-prefix-protocols-60s.txt`, and final full log |
-| `asapi_02` | `12/12` | pass | `AF_INET6` raw ICMPv6 sockets, loopback delivery, and `ICMP6_FILTER` pass the LTP filter matrix. | `target/oscomp/ltp-net-ipv6-lib-asapi02-rawv6-60s.txt` and final full log |
-| `asapi_03` | `18/18` | pass | IPv6 raw socket receive-option set/get and `recvmsg()` control-message surfaces pass, including `IPV6_PKTINFO`, `IPV6_HOPLIMIT`, `IPV6_TCLASS`, and old `IPV6_2292*` forms. | `target/oscomp/ltp-net-ipv6-lib-asapi03-rawv6-bindfix-60s.txt` and final full log |
+| `in6_01` | `5/5` | pass | IPv6 libc 可见结构体常量和地址宏可用。 | final full log |
+| `in6_02` | `3/3` | pass | `if_nameindex()` 能枚举 `lo` 和 `virtio-net0`；runner 已提供 `LHOST_IFACES=virtio-net0`。 | `target/oscomp/ltp-net-ipv6-lib-in6-02-lhost-ifaces-60s.txt` and final full log |
+| `getaddrinfo_01` | `22/22` | pass | `/etc/hosts`、`/etc/services`、IPv4/IPv6 family 和 `getaddrinfo()` 路径满足 witness。 | final full log |
+| `asapi_01` | `16/17` | partial | `IPV6_CHECKSUM` socket-option 子项都过；唯一缺口是 `getprotobyname("hopopt")`。 | `target/oscomp/ltp-net-ipv6-lib-asapi01-rawv6-60s.txt`, `target/oscomp/ltp-net-ipv6-lib-asapi01-prefix-protocols-60s.txt`, and final full log |
+| `asapi_02` | `12/12` | pass | `AF_INET6` raw ICMPv6 socket、loopback delivery、`ICMP6_FILTER` 矩阵通过。 | `target/oscomp/ltp-net-ipv6-lib-asapi02-rawv6-60s.txt` and final full log |
+| `asapi_03` | `18/18` | pass | IPv6 raw socket receive-option set/get 和 `recvmsg()` control message 通过，包括 `IPV6_PKTINFO`、`IPV6_HOPLIMIT`、`IPV6_TCLASS`、旧 `IPV6_2292*` 形式。 | `target/oscomp/ltp-net-ipv6-lib-asapi03-rawv6-bindfix-60s.txt` and final full log |
 
 ## `asapi_01` `hopopt` interpretation
 
@@ -261,35 +129,50 @@ boot-environment surfaces:
 - IPv6 receive-option set/get and ancillary control-message emission for the
   `asapi_03` matrix.
 
-## `net.tcp_cmds` filtered ledger
+## 细表：`net.tcp_cmds`
 
-| Filter | Status | What it proves / why it matters | Evidence |
-| --- | --- | --- | --- |
-| `netstat` | pass, `5/5` inside `netstat01` | Native `network.sh` setup can create/use netns+mntns, veth metadata is visible enough for LTP helpers, local and remote IPv4 setup reaches the command phase, and the command/procfs baseline for `netstat -s`, `-rn`, `-i`, `-gn`, and `-apn` returns success. | `target/oscomp/ltp-net-tcp-cmds-netstat-netstat-shim-300s.txt` |
-| `iproute` | pass, `6/6` inside `ip_tests.sh` | Native `network.sh` setup plus command-control paths now cover dummy device creation, MTU mutation, link show, loopback IPv4 alias add/show/delete, neighbor replace/show/delete, route add/show/delete via loopback gateway, and multicast address add/show/delete. The neighbor and multicast command gaps were BusyBox applet grammar limitations; the kernel also has real `RTM_NEWNEIGH` / `RTM_DELNEIGH` backing state for netlink clients. | `target/oscomp/ltp-net-tcp-cmds-iproute-complete-420s.txt` |
-| `ping01` | pass, `10/10` inside `ping01.sh` | ICMP echo works through native `network.sh` netns/veth setup across payload sizes `8 16 32 64 128 256 512 1024 2048 4064`. The large `2048` and `4064` payloads required real IPv4 fragmentation and reassembly at the Ethernet interface boundary; this confirms the default 1500 MTU path no longer rejects large ICMP packets. | `target/oscomp/ltp-net-tcp-cmds-ping01-ipv4-frag-rebuilt-600s.txt` |
-| `ping02` | pass, `10/10` inside `ping02.sh`; clean setup | `ping -I eth0` now works across the same payload matrix. The first failure was not routing or fragmentation: BusyBox `-p aa` leaves the ICMP code byte as `0xaa`, and raw ICMP send now accepts echo-shaped user payloads instead of rejecting strict-parser `Malformed` as `EINVAL`. The follow-up cleanup removed the BusyBox `ip ... nodad` setup warning and the IPv6 prefix lookup warning by pairing a rootfs `ip addr` compatibility filter with real AF_INET6 rtnetlink address add/dump/delete state. | `target/oscomp/ltp-net-tcp-cmds-ping02-nodad-ipv6addr-420s.txt` |
-| `ping01+ping02` | pass, grouped `20/20`; clean continuous setup | Exact-tag grouped execution proves `ping02` can run after `ping01` without stale route/address state. The grouped blocker was `tst_init_iface()` cleanup: BusyBox `ip route flush dev <iface>` generated `RTM_DELROUTE` messages without `NLM_F_ACK`, while txKernel returned unsolicited success acks and could not delete connected routes projected from interface addresses. Connected route deletion is now suppressible until address/link changes, and rtnetlink success acks are only sent when requested. A follow-up after changing IPv4 raw ICMP receive to include an IP header still passes grouped `20/20`, so the Linux raw-socket ABI fix did not regress BusyBox `ping`/`ping -I`. Note: `ltp-runtest:net.tcp_cmds:ping` is not a prefix filter and selects no cases; use exact tags joined by `+`. | `target/oscomp/ltp-net-tcp-cmds-ping01-ping02-rawicmp-ipheader-regress-900s.txt` |
-| `arping01` | pass, `1/1` inside `arping01.sh` | BusyBox `arping -w 10 <remote> -I eth0 -fq` now gets a usable `sockaddr_ll` from `AF_PACKET` `getsockname()` and receives a cooked ARP reply for the remote veth IPv4 address. This covers link-layer address projection, packet socket bind/getname, and the minimal cooked ARP request/reply path needed by the command witness. | `target/oscomp/ltp-net-tcp-cmds-arping01-global-arp-420s.txt` |
-| `ipneigh01_arp` | pass, focused and pair | Legacy `arp` command ioctl compatibility exists for `SIOCGIFHWADDR`, `SIOCSARP`, and `SIOCDARP`, backed by namespace ARP state. After the `/tx-ltp/bin` applet symlink speedup, the focused `arp` witness completes cleanly, and the pair witness shows `arp` can run before `ip` without stale neighbor/netns cleanup failure. | `target/oscomp/ltp-net-tcp-cmds-ipneigh01-arp-focused-after-appletsymlink-900s.txt`; pair `target/oscomp/ltp-net-tcp-cmds-ipneigh01-pair-after-appletsymlink-900s.txt` |
-| `ipneigh01_ip` | pass, focused and after MTU forwarding fix | `ip neigh show` reflects dynamic ARP entries and `ip neigh del` removes them. The default focused witness now reaches `TPASS`; after fixing the over-broad `ip link set` shim, it still passes with judge `1/1`. | `target/oscomp/ltp-net-tcp-cmds-ipneigh01-ip-after-mtu-forward-420s.txt` |
-| `sendfile` | `TCONF`, skipped | The case reaches the standard LTP netns/veth setup and then skips before sendfile/TCP data semantics because the rootfs lacks `ss`. | `target/oscomp/ltp-net-tcp-cmds-sendfile-next-420s.txt` |
-| `tc01` | `TCONF`, skipped | The case skips immediately on `sch_teql driver not available`; this is driver/config advertisement, not qdisc behavior yet. | `target/oscomp/ltp-net-tcp-cmds-tc01-next-300s.txt` |
-| `tracepath01` | `TCONF`, skipped | The case reaches network setup and skips because `tracepath` is not present in the rootfs. | `target/oscomp/ltp-net-tcp-cmds-tracepath-traceroute-next-420s.txt` |
-| `traceroute01` | fail, now `3/6` inside LTP summary | The ICMP-ECHO `-I` subcase now passes all three checks: command exit, `60 byte` output, and the one-hop output pattern. This required Linux-compatible `IP_TTL`, accepting echo replies for wildcard-bound raw ICMP sockets, and returning an IPv4 header on IPv4 raw ICMP recv so BusyBox does not misread the ICMP payload as the IP header. The remaining TCP-SYN subcase fails because the bundled BusyBox `traceroute` does not support `-T`. | `target/oscomp/ltp-net-tcp-cmds-traceroute01-rawicmp-ipheader-300s.txt` |
-| `tcpdump` | `TCONF`, skipped | The case reaches network setup and skips because `tcpdump` is not present. It also prints a `tst_require_drivers` shell warning before setup, which should be kept separate from AF_PACKET capture semantics. | `target/oscomp/ltp-net-tcp-cmds-tcpdump-next-420s.txt` |
-| `iptables` | `TCONF`, skipped | The case reaches network setup and skips on `ip_tables driver not available`; `lsmod` also reports missing `/proc/modules`. It has not reached legacy iptables rule semantics. | `target/oscomp/ltp-net-tcp-cmds-iptables-nft-next-420s.txt` |
-| `nft` | `TCONF`, skipped | The case reaches network setup and skips on `nf_tables driver not available`; it has not reached nftables netlink rule semantics. | `target/oscomp/ltp-net-tcp-cmds-iptables-nft-next-420s.txt` |
-| `ftp` | `TCONF`, skipped | The case skips before service behavior because `ssh` is not present. Treat it as a service/remote-exec environment gap, not an FTP/TCP data-path result. | `target/oscomp/ltp-net-tcp-cmds-services-next-600s.txt` |
-| `dhcpd` | `TCONF`, skipped | The case reaches network setup and skips because `dhcpd` is not present. | `target/oscomp/ltp-net-tcp-cmds-services-next-600s.txt` |
-| `dnsmasq` | `TCONF`, skipped | The case reaches network setup and skips because `dnsmasq` is not present. | `target/oscomp/ltp-net-tcp-cmds-services-next-600s.txt` |
+小计：已计分 `37/40`。另外 9 个入口目前是 `TCONF/skipped`，不计入分母。
+`ping01+ping02` 是组合回归 witness，不在 `37/40` 之外重复加分。
 
-## `net.ipv6` filtered ledger
+| 测试 | 得分 | 状态 | 说明 | 证据 |
+| --- | ---: | --- | --- | --- |
+| `netstat` | `5/5` | pass | `network.sh` setup、netns/mntns、veth 元数据、IPv4 local/remote setup 和 `/proc/net` 命令基线可用。 | `target/oscomp/ltp-net-tcp-cmds-netstat-netstat-shim-300s.txt` |
+| `iproute` | `6/6` | pass | 覆盖 dummy device、MTU、link show、loopback IPv4 alias、neighbor replace/show/delete、route add/show/delete、multicast address add/show/delete。 | `target/oscomp/ltp-net-tcp-cmds-iproute-complete-420s.txt` |
+| `ping01` | `10/10` | pass | IPv4 ICMP echo 通过 10 个 payload 大小；大包依赖 IPv4 fragmentation/reassembly。 | `target/oscomp/ltp-net-tcp-cmds-ping01-ipv4-frag-rebuilt-600s.txt` |
+| `ping02` | `10/10` | pass | `ping -I eth0` 通过同样 payload 矩阵；raw ICMP send 接受 BusyBox `-p aa` 产生的 echo-shaped payload。 | `target/oscomp/ltp-net-tcp-cmds-ping02-nodad-ipv6addr-420s.txt` |
+| `ping01+ping02` | `20/20`，不重复累计 | pass | 组合跑证明 `ping02` 可以跟在 `ping01` 后面运行，没有 stale route/address 清理问题；IPv4 raw ICMP IP-header recv 改动后仍然不回归。 | `target/oscomp/ltp-net-tcp-cmds-ping01-ping02-rawicmp-ipheader-regress-900s.txt` |
+| `arping01` | `1/1` | pass | `AF_PACKET` `getsockname()`、link-layer address projection 和 cooked ARP request/reply 足够支撑 BusyBox `arping`。 | `target/oscomp/ltp-net-tcp-cmds-arping01-global-arp-420s.txt` |
+| `ipneigh01_arp` | `1/1` | pass | 旧 `arp` ioctl 路径 `SIOCGIFHWADDR`、`SIOCSARP`、`SIOCDARP` 已通过 namespace ARP state 支撑。 | `target/oscomp/ltp-net-tcp-cmds-ipneigh01-arp-focused-after-appletsymlink-900s.txt`; pair `target/oscomp/ltp-net-tcp-cmds-ipneigh01-pair-after-appletsymlink-900s.txt` |
+| `ipneigh01_ip` | `1/1` | pass | `ip neigh show` 能看到动态 ARP entry，`ip neigh del` 能删除；MTU shim 修正后仍过。 | `target/oscomp/ltp-net-tcp-cmds-ipneigh01-ip-after-mtu-forward-420s.txt` |
+| `sendfile` | skipped | `TCONF` | setup 后因 rootfs 缺 `ss` 跳过，还没测到 sendfile/TCP data 语义。 | `target/oscomp/ltp-net-tcp-cmds-sendfile-next-420s.txt` |
+| `tc01` | skipped | `TCONF` | `sch_teql driver not available`；属于 driver/config advertisement 缺口。 | `target/oscomp/ltp-net-tcp-cmds-tc01-next-300s.txt` |
+| `tracepath01` | skipped | `TCONF` | rootfs 缺 `tracepath`。 | `target/oscomp/ltp-net-tcp-cmds-tracepath-traceroute-next-420s.txt` |
+| `traceroute01` | `3/6` | partial | ICMP-ECHO `-I` 子项已过；剩余 TCP-SYN `-T` 子项失败，因为 BusyBox `traceroute` 不支持 `-T`。 | `target/oscomp/ltp-net-tcp-cmds-traceroute01-rawicmp-ipheader-300s.txt` |
+| `tcpdump` | skipped | `TCONF` | rootfs 缺 `tcpdump`；尚未进入 AF_PACKET capture 语义。 | `target/oscomp/ltp-net-tcp-cmds-tcpdump-next-420s.txt` |
+| `iptables` | skipped | `TCONF` | `ip_tables driver not available`，且 `/proc/modules` 缺失；尚未进入 legacy iptables rule 语义。 | `target/oscomp/ltp-net-tcp-cmds-iptables-nft-next-420s.txt` |
+| `nft` | skipped | `TCONF` | `nf_tables driver not available`；尚未进入 nftables netlink rule 语义。 | `target/oscomp/ltp-net-tcp-cmds-iptables-nft-next-420s.txt` |
+| `ftp` | skipped | `TCONF` | rootfs 缺 `ssh`，属于 service/remote-exec 环境缺口。 | `target/oscomp/ltp-net-tcp-cmds-services-next-600s.txt` |
+| `dhcpd` | skipped | `TCONF` | rootfs 缺 `dhcpd`。 | `target/oscomp/ltp-net-tcp-cmds-services-next-600s.txt` |
+| `dnsmasq` | skipped | `TCONF` | rootfs 缺 `dnsmasq`。 | `target/oscomp/ltp-net-tcp-cmds-services-next-600s.txt` |
 
-| Filter | Status | What it proves / why it matters | Evidence |
-| --- | --- | --- | --- |
-| `ping601` | fail, `0/10` inside `ping01.sh -6` | Native IPv6 command setup gets through netns/veth creation, remote namespace mount/sysfs setup, local and remote IPv4+IPv6 address configuration, and interface metadata reads. The case then fails every payload size because BusyBox `ping6` gets `sendto: Not supported` for `fd00:1:1:1::1`, so the next owner is IPv6 ICMP/raw send support rather than setup. | `target/oscomp/ltp-net-ipv6-ping601-rhost-trace-180s.txt` |
-| `ping602` | not run after `ping601` failure | It is expected to share the same IPv6 ping send blocker, with additional `-I`/interface behavior after the raw send path works. Do not spend a long run here before fixing or instrumenting the `ping601` `sendto` owner. | - |
+## 细表：`net.ipv6`
+
+小计：已确认 `10/10`。`ping601` focused witness 已经通过；其余
+`net.ipv6` 命令层入口还没有开始，不计入当前分母。
+
+| 测试 | 得分 | 状态 | 说明 | 证据 |
+| --- | ---: | --- | --- | --- |
+| `ping601` | `10/10` | pass | 旧 baseline 是 `sendto: Not supported`；ICMPv6 echo/SOL_RAW 修复后 trace 显示第一包 `sendto`/`recvmsg` 已通，但第二次 `recvmsg` 卡住。最终补上 `recvmsg` 的 `ITIMER_REAL`/`SIGALRM` aware wait 后，10 个 payload 全部 TPASS。 | pass `target/oscomp/ltp-net-ipv6-ping601-recvmsg-itimer-240s.txt`; trace `target/oscomp/ltp-net-ipv6-ping601-syscalltrace-240s.txt` |
+| `ping602` | not-run | not-run | 预计共享 `ping601` 的 IPv6 ping surface，另有 `-I`/interface 行为；`ping601` 过后可作为下一条 focused witness。 | - |
+| `sendfile601` | not-run | not-run | IPv6 sendfile 命令测试，尚未开始。 | - |
+| `tcpdump601` | not-run | not-run | IPv6 tcpdump 命令测试，尚未开始。 | - |
+| `tracepath601` | not-run | not-run | IPv6 tracepath 命令测试，尚未开始。 | - |
+| `traceroute601` | not-run | not-run | IPv6 traceroute 命令测试，尚未开始。 | - |
+| `dhcpd6` | not-run | not-run | IPv6 DHCP daemon/service 测试，尚未开始。 | - |
+| `dnsmasq6` | not-run | not-run | IPv6 dnsmasq/service 测试，尚未开始。 | - |
+| `ipneigh6_ip` | not-run | not-run | IPv6 neighbor 命令测试，尚未开始。 | - |
+| `ip6tables` | not-run | not-run | IPv6 legacy netfilter 命令测试，尚未开始。 | - |
+| `nft6` | not-run | not-run | IPv6 nftables 命令测试，尚未开始。 | - |
 
 Implemented prerequisites observed during the `netstat` climb:
 
@@ -504,9 +387,11 @@ small and choose between these blockers:
 - `traceroute01` remaining command surface: the kernel-side ICMP-ECHO `-I`
   owner is fixed; decide separately whether the `-T` subcase requires a fuller
   traceroute binary or a compatible rootfs command shim;
-- `net.ipv6` ICMP/raw send: `ping601` now reaches the ping body, but every
-  `ping6` send returns `EOPNOTSUPP`; instrument or implement the IPv6
-  `sendto` owner before running `ping602` or broader `net.ipv6`.
+- `net.ipv6` ICMP/raw ping: `ping601` now passes `10/10`. The decisive trace
+  showed first `sendto` and first `recvmsg` returning 16 bytes, then a second
+  blocking `recvmsg`; `recvmsg` was missing the `ITIMER_REAL`/SIGALRM-aware wait
+  path that `recvfrom` already had. Run `ping602` next before broader
+  `net.ipv6`.
 
 Useful confirmation targets after those fixes:
 
@@ -515,8 +400,7 @@ timeout 300s make oscomp-qemu-rv64 \
   OSCOMP_GROUPS=ltp-runtest:net.tcp_cmds:traceroute01 \
   OSCOMP_OUT_RV=target/oscomp/ltp-net-tcp-cmds-traceroute01-ttl-300s.txt
 
-timeout 180s make oscomp-qemu-rv64 \
+timeout 240s make oscomp-qemu-rv64 \
   OSCOMP_GROUPS=ltp-runtest:net.ipv6:ping601 \
-  LTP_TRACE_RUNTIME=1 \
-  OSCOMP_OUT_RV=target/oscomp/ltp-net-ipv6-ping601-sendto-180s.txt
+  OSCOMP_OUT_RV=target/oscomp/ltp-net-ipv6-ping601-recvmsg-itimer-240s.txt
 ```

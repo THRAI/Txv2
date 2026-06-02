@@ -161,6 +161,92 @@ fn dispatch_sendmsg_recvmsg_udp_loopback_round_trips_source_addr() {
 }
 
 #[test]
+fn dispatch_recvmsg_empty_socket_is_interrupted_by_due_itimer() {
+    let _setup = socket_setup();
+    loopback_iface().clear_for_test_or_bootstrap();
+    let (_process, ctx) = socket_ctx();
+    let server_fd = socket_dgram(&ctx, SOCK_DGRAM);
+    let server_addr = sockaddr_in([127, 0, 0, 1], 49_105);
+    assert_eq!(
+        socket_req(
+            NR_BIND,
+            [
+                server_fd as u64,
+                server_addr.as_ptr() as u64,
+                SOCKADDR_IN_BYTES as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let timer = TestItimerval {
+        interval: TestTimeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+        value: TestTimeval {
+            tv_sec: 0,
+            tv_usec: 1,
+        },
+    };
+    assert_eq!(
+        socket_req(
+            NR_SETITIMER,
+            [
+                ITIMER_REAL as u64,
+                &timer as *const TestItimerval as u64,
+                0,
+                0,
+                0,
+                0
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    for _ in 0..1_100 {
+        let _ = <ShimsTestPmap as tx_hal::TimeIf>::read_ns();
+    }
+
+    let mut out = [0u8; 8];
+    let recv_iov = [TestIovec {
+        base: out.as_mut_ptr() as u64,
+        len: out.len() as u64,
+    }];
+    let mut recv_hdr = TestMsghdr {
+        name: 0,
+        namelen: 0,
+        _pad0: 0,
+        iov: recv_iov.as_ptr() as u64,
+        iovlen: recv_iov.len() as u64,
+        control: 0,
+        controllen: 0,
+        flags: 0,
+        _pad1: 0,
+    };
+
+    assert_eq!(
+        socket_req(
+            NR_RECVMSG,
+            [
+                server_fd as u64,
+                (&mut recv_hdr as *mut TestMsghdr) as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Error(EINTR_VALUE)
+    );
+}
+
+#[test]
 fn dispatch_inet6_udp_recvmsg_peek_preserves_datagram_and_source_addr() {
     let _setup = socket_setup();
     loopback_iface().clear_for_test_or_bootstrap();

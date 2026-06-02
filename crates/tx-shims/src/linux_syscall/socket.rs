@@ -1446,14 +1446,14 @@ fn validate_iovec_read_ranges<'a>(ctx: &SyscallCtx<'a>, iovecs: &[UserIovec]) ->
     Ok(())
 }
 
-pub(super) fn sys_recvmsg<'a>(
+pub(super) fn sys_recvmsg<'a, P: TimeIf + 'a>(
     args: [u64; 6],
     ctx: &'a SyscallCtx<'a>,
 ) -> impl core::future::Future<Output = SyscallResult> + 'a {
-    recvmsg_impl(args, ctx)
+    recvmsg_impl::<P>(args, ctx)
 }
 
-async fn recvmsg_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+async fn recvmsg_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let (file, socket) = match resolve_socket_fd(ctx, args[0] as i32) {
         Ok(pair) => pair,
         Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
@@ -1583,7 +1583,15 @@ async fn recvmsg_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
                     return SyscallResult::Error(EAGAIN_VALUE);
                 }
                 if let Some(future) = wait_on_yield_shape(shape) {
-                    let _ = future.await;
+                    if matches!(
+                        wait_on_socket_or_itimer::<P>(future, ctx.process.pid.0).await,
+                        SocketWaitWake::ItimerExpired
+                    ) {
+                        if recv_queued_len(&socket) > 0 {
+                            continue;
+                        }
+                        return SyscallResult::Error(EINTR_VALUE);
+                    }
                 } else {
                     return SyscallResult::Error(EIO_VALUE);
                 }
@@ -1690,7 +1698,7 @@ async fn recvmmsg_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
             }
             return SyscallResult::Return(received_messages as i64);
         }
-        let result = recvmsg_impl([args[0], header_ptr, flags, 0, 0, 0], ctx).await;
+        let result = recvmsg_impl::<P>([args[0], header_ptr, flags, 0, 0, 0], ctx).await;
         match result {
             SyscallResult::Return(recv) if recv >= 0 => {
                 if let Err(errno) = write_mmsghdr_len(ctx, header_ptr, recv as u32) {
@@ -1872,12 +1880,14 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             payload.with_options_mut(|opts| opts.ip.ipv6_v6only = on);
             Ok(())
         }
-        (SOL_IPV6, IPV6_CHECKSUM) => set_ipv6_checksum(&socket, &payload, ctx, optval, optlen),
+        (SOL_IPV6 | SOL_RAW, IPV6_CHECKSUM) => {
+            set_ipv6_checksum(&socket, &payload, ctx, optval, optlen)
+        }
         (
             SOL_IPV6,
-            IPV6_RECVPKTINFO | IPV6_RECVHOPLIMIT | IPV6_RECVRTHDR | IPV6_RECVHOPOPTS
-            | IPV6_RECVDSTOPTS | IPV6_RECVTCLASS | IPV6_2292PKTINFO | IPV6_2292HOPLIMIT
-            | IPV6_2292RTHDR | IPV6_2292HOPOPTS | IPV6_2292DSTOPTS,
+            IPV6_RECVPKTINFO | IPV6_RECVHOPLIMIT | IPV6_HOPLIMIT | IPV6_RECVRTHDR
+            | IPV6_RECVHOPOPTS | IPV6_RECVDSTOPTS | IPV6_RECVTCLASS | IPV6_2292PKTINFO
+            | IPV6_2292HOPLIMIT | IPV6_2292RTHDR | IPV6_2292HOPOPTS | IPV6_2292DSTOPTS,
         ) => {
             let on = match read_sockopt_bool(ctx, optval, optlen) {
                 Ok(on) => on,
@@ -2037,7 +2047,7 @@ fn set_ipv6_recv_option(
             opts.ip.ipv6_recv_pktinfo = on;
             true
         }
-        IPV6_RECVHOPLIMIT => {
+        IPV6_RECVHOPLIMIT | IPV6_HOPLIMIT => {
             opts.ip.ipv6_recv_hoplimit = on;
             true
         }
@@ -2353,7 +2363,7 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             optlen_ptr,
             payload.with_options(|o| o.ip.ipv6_v6only as i32),
         ),
-        (SOL_IPV6, IPV6_CHECKSUM)
+        (SOL_IPV6 | SOL_RAW, IPV6_CHECKSUM)
             if socket.kind == SocketKind::RawIcmp && payload.family() == AddressFamily::Inet6 =>
         {
             write_sockopt_i32(
@@ -2415,8 +2425,8 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
         }
         (IPPROTO_UDP, _) => Err(Errno::EOPNOTSUPP),
         (
-            SOL_SOCKET | IPPROTO_IP | IPPROTO_TCP | SOL_IPV6 | IPPROTO_ICMPV6 | SOL_NETLINK
-            | SOL_PACKET,
+            SOL_SOCKET | IPPROTO_IP | IPPROTO_TCP | SOL_IPV6 | SOL_RAW | IPPROTO_ICMPV6
+            | SOL_NETLINK | SOL_PACKET,
             _,
         ) => Err(Errno::ENOPROTOOPT),
         _ => Err(Errno::EOPNOTSUPP),

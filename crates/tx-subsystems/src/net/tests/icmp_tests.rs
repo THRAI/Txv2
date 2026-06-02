@@ -1,10 +1,11 @@
 use super::*;
 
 use crate::net::protocol::{
-    build_icmpv4_echo_reply, build_icmpv4_echo_request, icmpv4_echo_message_len,
-    parse_icmpv4_echo_payload_unchecked, parse_icmpv4_from_ipv4_bytes,
-    parse_icmpv4_loopback_packet, parse_icmpv4_payload, parse_raw_icmpv4_echo_payload_unchecked,
-    Icmpv4EchoPacket, Icmpv4Event, RawIcmpSocket,
+    build_icmpv4_echo_reply, build_icmpv4_echo_request, build_icmpv6_echo_request_message,
+    icmpv4_echo_message_len, parse_icmpv4_echo_payload_unchecked, parse_icmpv4_from_ipv4_bytes,
+    parse_icmpv4_loopback_packet, parse_icmpv4_payload, parse_icmpv6_payload_unchecked,
+    parse_raw_icmpv4_echo_payload_unchecked, Icmpv4EchoPacket, Icmpv4Event, Icmpv6EchoPacket,
+    Icmpv6Event, RawIcmpSocket,
 };
 
 #[test]
@@ -160,6 +161,163 @@ fn raw_icmp_ipv4_recv_returns_ip_header_for_raw_socket() {
     assert_eq!(
         parse_icmpv4_from_ipv4_bytes(&out[..drain.bytes]),
         Icmpv4Event::EchoReply(reply)
+    );
+}
+
+#[test]
+fn raw_icmpv6_send_to_configured_peer_addr_returns_echo_reply() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
+    let guard = tx_substrate::epoch::guard();
+    let local_ip = Ipv6Address::new([0xfd, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2]);
+    let remote_ip = Ipv6Address::new([0xfd, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let local_ns = crate::net::create_isolated_net_namespace_for_test("icmpv6-local")
+        .expect("local namespace")
+        .payload_cap()
+        .expect("local payload");
+    let remote_ns = crate::net::create_isolated_net_namespace_for_test("icmpv6-remote")
+        .expect("remote namespace")
+        .payload_cap()
+        .expect("remote payload");
+    let pair = create_veth_pair_for_test_or_bootstrap(VethPairConfig {
+        left: VethEndpointConfig {
+            name: "icmpv6-local0",
+            devt: DevT::new(91, 180),
+            mac: EthernetAddress::new([0x02, 0, 0, 0, 6, 0]),
+        },
+        right: VethEndpointConfig {
+            name: "icmpv6-remote0",
+            devt: DevT::new(91, 181),
+            mac: EthernetAddress::new([0x02, 0, 0, 0, 6, 1]),
+        },
+        mtu: VETH_DEFAULT_MTU,
+    });
+    local_ns
+        .attach_device_for_test_or_bootstrap(pair.left, None)
+        .expect("attach local veth");
+    remote_ns
+        .attach_device_for_test_or_bootstrap(pair.right, None)
+        .expect("attach remote veth");
+    let auth = NetAdminAuthority::for_test_or_bootstrap();
+    local_ns
+        .set_device_ipv6_addr_by_ifindex(auth, 2, Some(local_ip), Some(64))
+        .expect("set local ipv6");
+    remote_ns
+        .set_device_ipv6_addr_by_ifindex(auth, 2, Some(remote_ip), Some(64))
+        .expect("set remote ipv6");
+
+    let raw = match crate::net::step_socket_create_in_namespace(
+        ValidSocketType::validate(10, 3, 58).expect("AF_INET6 SOCK_RAW ICMPV6"),
+        local_ns,
+        &guard,
+    ) {
+        StepOutcome::Done(socket) => socket,
+        other => panic!("raw icmpv6 socket create failed: {other:?}"),
+    };
+    let raw_payload = raw.acquire_operational().expect("raw payload");
+    let mut filter = [u32::MAX; 8];
+    filter[129 / 32] &= !(1u32 << (129 % 32));
+    raw_payload
+        .set_raw_icmp6_filter(filter)
+        .expect("set echo-reply-only filter");
+    let request = Icmpv6EchoPacket {
+        src: local_ip,
+        dst: remote_ip,
+        ident: 0x6060,
+        seq_no: 7,
+        payload: b"icmpv6-peer".to_vec(),
+    };
+    let request_bytes = build_icmpv6_echo_request_message(&request);
+    assert_eq!(
+        step_send_to_kernel_bytes(
+            &raw,
+            Some(IpEndpoint::new_v6(remote_ip, 0)),
+            &request_bytes,
+            SendRecvFlags::empty(),
+            &guard,
+        ),
+        StepOutcome::Done(request_bytes.len())
+    );
+
+    let mut out = [0u8; 128];
+    let recv = match step_recv_kernel_bytes(&raw, &mut out, SendRecvFlags::empty(), &guard) {
+        StepOutcome::Done(recv) => recv,
+        other => panic!("expected icmpv6 echo reply, got {other:?}"),
+    };
+    assert_eq!(
+        parse_icmpv6_payload_unchecked(local_ip, remote_ip, &request_bytes),
+        Icmpv6Event::EchoRequest(request.clone())
+    );
+    assert_eq!(
+        parse_icmpv6_payload_unchecked(remote_ip, local_ip, &out[..recv.bytes]),
+        Icmpv6Event::EchoReply(request.reply_packet())
+    );
+}
+
+#[test]
+fn raw_icmpv6_unknown_peer_addr_stays_unsupported() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
+    let guard = tx_substrate::epoch::guard();
+    let local_ip = Ipv6Address::new([0xfd, 0, 0, 2, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2]);
+    let unknown_ip = Ipv6Address::new([0xfd, 0, 0, 2, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 99]);
+    let local_ns = crate::net::create_isolated_net_namespace_for_test("icmpv6-unknown-local")
+        .expect("local namespace")
+        .payload_cap()
+        .expect("local payload");
+    let pair = create_veth_pair_for_test_or_bootstrap(VethPairConfig {
+        left: VethEndpointConfig {
+            name: "icmpv6-unknown0",
+            devt: DevT::new(91, 182),
+            mac: EthernetAddress::new([0x02, 0, 0, 0, 6, 2]),
+        },
+        right: VethEndpointConfig {
+            name: "icmpv6-unused0",
+            devt: DevT::new(91, 183),
+            mac: EthernetAddress::new([0x02, 0, 0, 0, 6, 3]),
+        },
+        mtu: VETH_DEFAULT_MTU,
+    });
+    local_ns
+        .attach_device_for_test_or_bootstrap(pair.left, None)
+        .expect("attach local veth");
+    let auth = NetAdminAuthority::for_test_or_bootstrap();
+    local_ns
+        .set_device_ipv6_addr_by_ifindex(auth, 2, Some(local_ip), Some(64))
+        .expect("set local ipv6");
+
+    let raw = match crate::net::step_socket_create_in_namespace(
+        ValidSocketType::validate(10, 3, 58).expect("AF_INET6 SOCK_RAW ICMPV6"),
+        local_ns,
+        &guard,
+    ) {
+        StepOutcome::Done(socket) => socket,
+        other => panic!("raw icmpv6 socket create failed: {other:?}"),
+    };
+    let request = Icmpv6EchoPacket {
+        src: local_ip,
+        dst: unknown_ip,
+        ident: 0x6061,
+        seq_no: 1,
+        payload: b"unknown".to_vec(),
+    };
+    let request_bytes = build_icmpv6_echo_request_message(&request);
+
+    assert_eq!(
+        step_send_to_kernel_bytes(
+            &raw,
+            Some(IpEndpoint::new_v6(unknown_ip, 0)),
+            &request_bytes,
+            SendRecvFlags::empty(),
+            &guard,
+        ),
+        StepOutcome::Err(Errno::EOPNOTSUPP)
     );
 }
 
