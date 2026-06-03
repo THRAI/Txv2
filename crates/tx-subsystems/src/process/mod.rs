@@ -6,8 +6,11 @@
 //! fd-table land in follow-up passes.
 
 pub mod adapter;
+#[cfg(all(tx_ds_metrics, tx_ds_metrics_process))]
+pub mod ds_metrics;
 pub mod exec_prep;
 pub mod execution;
+mod lock_metrics;
 pub mod notification;
 pub mod nsproxy;
 pub mod numbers;

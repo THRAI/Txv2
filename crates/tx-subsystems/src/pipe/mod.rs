@@ -150,7 +150,7 @@ impl core::fmt::Debug for PipePayload {
 #[derive(Debug)]
 enum PipeMode {
     ByteStream,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // txdoc:vfs-full-bringup-scaffold
     Notification,
 }
 

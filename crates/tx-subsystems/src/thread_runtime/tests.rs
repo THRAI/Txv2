@@ -47,6 +47,33 @@ fn bootstrap() -> Cap<ProcessIdentity> {
     bootstrap_init_process(fresh_aspace()).expect("bootstrap init")
 }
 
+#[test]
+fn thread_runtime_lock_service_declares_sigprocmask_phase_names() {
+    let names = crate::thread_runtime::execution::THREAD_RUNTIME_LOCK_SERVICE_TRACE_NAMES;
+
+    assert!(names.contains(
+        &b"debug.lock_service.thread.payload.sigprocmask.payload_lock_wait.duration_ns".as_slice()
+    ));
+    assert!(names.contains(
+        &b"debug.lock_service.thread.payload.sigprocmask.payload_lock_held.duration_ns".as_slice()
+    ));
+    assert!(names.contains(
+        &b"debug.lock_service.thread.payload.sigprocmask.payload_cap_clone.duration_ns".as_slice()
+    ));
+    assert!(names
+        .contains(&b"debug.lock_service.thread.payload.sigprocmask.payload_missing".as_slice()));
+    assert!(names.contains(
+        &b"debug.lock_service.thread.payload.sigprocmask.mask_compute.duration_ns".as_slice()
+    ));
+    assert!(names.contains(&b"debug.lock_service.thread.payload.sigprocmask.mask_noop".as_slice()));
+    assert!(names.contains(
+        &b"debug.lock_service.thread.payload.sigprocmask.mask_store.duration_ns".as_slice()
+    ));
+    assert!(names.contains(
+        &b"debug.lock_service.thread.payload.sigprocmask.refresh.duration_ns".as_slice()
+    ));
+}
+
 fn first_thread(proc_cap: &Cap<ProcessIdentity>) -> Cap<ThreadIdentity> {
     let payload_guard = proc_cap.payload.lock();
     let payload = payload_guard.as_ref().expect("alive");

@@ -8,6 +8,7 @@ pub mod bdevfs;
 pub mod devfs;
 pub mod devpts;
 pub mod procfs;
+mod sync;
 pub mod tmpfs;
 
 pub mod tx_ext4 {

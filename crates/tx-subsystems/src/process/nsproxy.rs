@@ -20,7 +20,9 @@ use crate::ipc::sysv_msg::structure::MsgQueueIdentity;
 use crate::ipc::sysv_sem::structure::SemArrayIdentity;
 use crate::ipc::sysv_shm::structure::ShmSegmentIdentity;
 use crate::mount::MountNamespace;
-use crate::process::adapter::step_engine::{sign, Cap, SpinMutex, Zone, ZoneAllocated, ZoneError};
+use crate::process::adapter::step_engine::{
+    process_spin_mutex, sign, Cap, ProcessSpinMutex, Zone, ZoneAllocated, ZoneError,
+};
 
 // ---------------------------------------------------------------------------
 // SysV IPC key types
@@ -124,15 +126,15 @@ impl Default for IpcLimits {
 /// replaced with namespace-number `IndexTable<SysvKey, Cap<...>>`.
 pub struct IpcNamespace {
     /// SysV semaphore arrays, keyed by `key_t` (or IPC_PRIVATE id).
-    pub sysv_sem: SpinMutex<BTreeMap<SysvKey, Cap<SemArrayIdentity>>>,
+    pub sysv_sem: ProcessSpinMutex<BTreeMap<SysvKey, Cap<SemArrayIdentity>>>,
     /// SysV shared memory segments, keyed by `key_t`.
-    pub sysv_shm: SpinMutex<BTreeMap<SysvKey, Cap<ShmSegmentIdentity>>>,
+    pub sysv_shm: ProcessSpinMutex<BTreeMap<SysvKey, Cap<ShmSegmentIdentity>>>,
     /// SysV message queues, keyed by `key_t`.
-    pub sysv_msg: SpinMutex<BTreeMap<SysvKey, Cap<MsgQueueIdentity>>>,
+    pub sysv_msg: ProcessSpinMutex<BTreeMap<SysvKey, Cap<MsgQueueIdentity>>>,
     /// POSIX message queues, keyed by path name.
-    pub posix_mq: SpinMutex<BTreeMap<PosixMqName, Cap<PosixMqIdentity>>>,
+    pub posix_mq: ProcessSpinMutex<BTreeMap<PosixMqName, Cap<PosixMqIdentity>>>,
     /// Per-namespace tunable limits.
-    pub limits: SpinMutex<IpcLimits>,
+    pub limits: ProcessSpinMutex<IpcLimits>,
     /// Monotonic counter for `IPC_PRIVATE` id generation (shared across
     /// all three SysV kinds — Linux uses separate idr per kind but a
     /// shared `ipc_ids` allocator). Day-1 single atomic counter.
@@ -142,11 +144,11 @@ pub struct IpcNamespace {
 impl IpcNamespace {
     pub fn with_limits(limits: IpcLimits) -> Self {
         Self {
-            sysv_sem: SpinMutex::new(BTreeMap::new()),
-            sysv_shm: SpinMutex::new(BTreeMap::new()),
-            sysv_msg: SpinMutex::new(BTreeMap::new()),
-            posix_mq: SpinMutex::new(BTreeMap::new()),
-            limits: SpinMutex::new(limits),
+            sysv_sem: process_spin_mutex(BTreeMap::new(), b"debug.lock.process.nsproxy.sysv_sem"),
+            sysv_shm: process_spin_mutex(BTreeMap::new(), b"debug.lock.process.nsproxy.sysv_shm"),
+            sysv_msg: process_spin_mutex(BTreeMap::new(), b"debug.lock.process.nsproxy.sysv_msg"),
+            posix_mq: process_spin_mutex(BTreeMap::new(), b"debug.lock.process.nsproxy.posix_mq"),
+            limits: process_spin_mutex(limits, b"debug.lock.process.nsproxy.limits"),
             next_private_id: AtomicU32::new(0),
         }
     }

@@ -9,6 +9,7 @@ use tx_platform_adapter::platform_adapter;
 pub mod step_engine {
     use tx_substrate::zone;
 
+    pub(crate) use crate::sync::SpinMutex;
     pub use tx_substrate::epoch::{guard, Guard};
     pub use tx_substrate::step::{
         ByteProgress, DelegateRegistry, DelegateReply, DelegateState, DelegateTokenId, Errno,
@@ -21,7 +22,6 @@ pub mod step_engine {
         OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy, RetainedEntityPolicy, Weak,
         Zone, ZoneAllocated, ZoneError, ZonePolicy,
     };
-    pub use tx_substrate::SpinMutex;
 
     pub fn register_zone_for<T: ZoneAllocated>() -> Result<(), ZoneError> {
         zone::register_zone_for::<T>().map(|_| ())

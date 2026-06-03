@@ -1,12 +1,13 @@
 // Auto-extracted from `crates/tx-subsystems/src/signal/tests.rs` (2026-05-08 jumbo split).
 #![cfg_attr(test, allow(unused_imports))]
 use super::*;
+use crate::process::execution::spawn_sibling_thread_for_test;
 use crate::process::{bootstrap_init_process, ExitStatus, ProcessIdentity};
 use crate::signal::adapter::step_engine::{Cap, SignalRouting};
 use crate::signal::{
-    ast_check, default_action, select_next_signal, step_kill_process, step_sigaction, AstOutcome,
-    DefaultAction, InterruptSummary, KillOutcome, PendingSource, SaFlags, SigActionEntry,
-    SigDisposition, SignalTarget,
+    ast_check, default_action, post_group_pending_signal, select_next_signal, step_kill_process,
+    step_sigaction, AstOutcome, DefaultAction, InterruptSummary, KillOutcome, PendingSource,
+    SaFlags, SigActionEntry, SigDisposition, SignalTarget,
 };
 use crate::thread_runtime::execution::{post_signal, step_sigprocmask, SigmaskHow};
 use crate::thread_runtime::structure::ThreadIdentity;
@@ -195,13 +196,7 @@ fn select_falls_through_to_group_pending_when_thread_empty() {
     let proc_cap = fresh_init();
     let leader = leader(&proc_cap);
 
-    proc_cap
-        .payload
-        .lock()
-        .as_ref()
-        .unwrap()
-        .group_pending()
-        .post(Signum::SIGTERM);
+    assert!(post_group_pending_signal(&proc_cap, Signum::SIGTERM));
 
     assert_eq!(
         select_next_signal(&leader),
@@ -521,13 +516,7 @@ fn sigprocmask_unblock_sets_deliverable_for_group_pending() {
     let mut block = SignalMask::EMPTY;
     block.block(Signum::SIGTERM);
     let _ = step_sigprocmask(&leader, SigmaskHow::SetMask, block);
-    proc_cap
-        .payload
-        .lock()
-        .as_ref()
-        .unwrap()
-        .group_pending()
-        .post(Signum::SIGTERM);
+    assert!(post_group_pending_signal(&proc_cap, Signum::SIGTERM));
     assert!(
         !leader
             .payload
@@ -549,6 +538,80 @@ fn sigprocmask_unblock_sets_deliverable_for_group_pending() {
             .interrupt_summary()
             .deliverable_signal,
         "sigprocmask must recompute deliverability from process group-pending signals too"
+    );
+}
+
+#[test]
+fn refresh_summary_uses_group_pending_hint_for_producer_post() {
+    let _g = setup();
+    let proc_cap = fresh_init();
+    let leader = leader(&proc_cap);
+
+    let mut block = SignalMask::EMPTY;
+    block.block(Signum::SIGTERM);
+    let _ = step_sigprocmask(&leader, SigmaskHow::SetMask, block);
+
+    assert!(post_group_pending_signal(&proc_cap, Signum::SIGTERM));
+    assert!(
+        !leader
+            .payload
+            .lock()
+            .as_ref()
+            .unwrap()
+            .interrupt_summary()
+            .deliverable_signal
+    );
+
+    let _ = step_sigprocmask(&leader, SigmaskHow::SetMask, SignalMask::EMPTY);
+
+    assert!(
+        leader
+            .payload
+            .lock()
+            .as_ref()
+            .unwrap()
+            .interrupt_summary()
+            .deliverable_signal
+    );
+}
+
+#[test]
+fn post_group_pending_signal_refreshes_unmasked_thread_summary() {
+    let _g = setup();
+    let proc_cap = fresh_init();
+    let leader = leader(&proc_cap);
+
+    assert!(post_group_pending_signal(&proc_cap, Signum::SIGTERM));
+
+    assert!(
+        leader
+            .payload
+            .lock()
+            .as_ref()
+            .unwrap()
+            .interrupt_summary()
+            .deliverable_signal
+    );
+}
+
+#[test]
+fn spawned_sibling_inherits_existing_group_pending_hint() {
+    let _g = setup();
+    let proc_cap = fresh_init();
+
+    assert!(post_group_pending_signal(&proc_cap, Signum::SIGTERM));
+    let sibling = spawn_sibling_thread_for_test(&proc_cap).expect("sibling");
+
+    let _ = step_sigprocmask(&sibling, SigmaskHow::SetMask, SignalMask::EMPTY);
+
+    assert!(
+        sibling
+            .payload
+            .lock()
+            .as_ref()
+            .unwrap()
+            .interrupt_summary()
+            .deliverable_signal
     );
 }
 

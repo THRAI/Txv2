@@ -2,12 +2,12 @@ use super::*;
 
 use crate::linux_syscall::time::TimespecLayout;
 use crate::linux_syscall::{
-    IpcPermLayout, MsqidDsLayout, SembufLayout, SemidDsLayout, ShmInfoLayout, ShmidDsLayout,
-    ShminfoLayout, NR_MSGCTL, NR_MSGGET, NR_MSGRCV, NR_MSGSND, NR_SEMCTL, NR_SEMGET, NR_SEMOP,
-    NR_SEMTIMEDOP, NR_SHMAT, NR_SHMCTL, NR_SHMDT, NR_SHMGET,
+    IpcPermLayout, MsqidDsLayout, NR_MSGCTL, NR_MSGGET, NR_MSGRCV, NR_MSGSND, NR_SEMCTL, NR_SEMGET,
+    NR_SEMOP, NR_SEMTIMEDOP, NR_SHMAT, NR_SHMCTL, NR_SHMDT, NR_SHMGET, SembufLayout, SemidDsLayout,
+    ShmInfoLayout, ShmidDsLayout, ShminfoLayout,
 };
 use tx_subsystems::ipc::{sysv_msg, sysv_sem, sysv_shm};
-use tx_subsystems::vm::{Prot, VmBacking, USER_PAGE_SIZE};
+use tx_subsystems::vm::{Prot, USER_PAGE_SIZE, VmEntryBacking};
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -935,7 +935,10 @@ fn dispatch_sysv_shmat_maps_pagebacked_vma_and_shmdt_unmaps_it() {
         .expect("shmat installs VMA recipe");
     assert_eq!(entry.prot, Prot::READ_WRITE);
     assert!(entry.flags.shared);
-    assert!(matches!(entry.backing, VmBacking::Page { offset: 0, .. }));
+    assert!(matches!(
+        entry.backing_kind(),
+        VmEntryBacking::Page { offset: 0 }
+    ));
 
     let mut ds = ShmidDsLayout::default();
     assert_eq!(
@@ -964,10 +967,11 @@ fn dispatch_sysv_shmat_maps_pagebacked_vma_and_shmdt_unmaps_it() {
         )),
         SyscallResult::Return(0)
     );
-    assert!(ctx
-        .aspace
-        .lookup(tx_subsystems::vm::UserVirtAddr(USER_PAGE_SIZE))
-        .is_none());
+    assert!(
+        ctx.aspace
+            .lookup(tx_subsystems::vm::UserVirtAddr(USER_PAGE_SIZE))
+            .is_none()
+    );
 
     let mut after = ShmidDsLayout::default();
     assert_eq!(

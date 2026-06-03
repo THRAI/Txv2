@@ -328,7 +328,7 @@ impl<'a, P: PmapIf + EntropyIf + AuxvIf, I: step_engine::SubjectIdentity> StepOp
                         };
                         let prot = Prot::READ_WRITE; // simplified; real code uses READ_EXEC etc
                         let entry = VmEntry::new(range, prot, VmEntryFlags::PRIVATE,
-                            VmBacking::Page { pc: interp_pc.clone(), offset: seg.file_offset });
+                            VmBacking::Page { pc: interp_pc.clone().into(), offset: seg.file_offset });
                         match aspace.reserve_map(entry, MapPlacement::RequireFree) {
                             MapReserveResult::Reserved(r) => { let _ = r.commit(); }
                             _ => return StepOutcome::Err(step_engine::Errno::ENOMEM),

@@ -29,6 +29,7 @@ use tx_platform_adapter::platform_adapter;
     reason = "expose substrate step engine (StepOp/StepOutcome/NoProgress/ScriptCtx/SubjectIdentity), D9-A signal-wake mailbox (MailboxEvent/SignalRouting/TaskMailbox), zone role types (Cap/PayloadCap/Weak/Dead/Entity/OperationalCapExt/Zone/ZoneAllocated), EBR guard, and SpinMutex used by thread_runtime structure, execution, and tests"
 )]
 pub mod step_engine {
+    pub(crate) use crate::sync::SpinMutex;
     pub use tx_substrate::epoch::{drain_with_budget, guard, Guard};
     pub use tx_substrate::step::ProcessIdentity as PlaceholderProcessSubject;
     pub use tx_substrate::step::{
@@ -42,7 +43,6 @@ pub mod step_engine {
         OperationalCapExt, OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy,
         RetainedEntityPolicy, Weak, Zone, ZoneAllocated, ZoneError, ZonePolicy,
     };
-    pub use tx_substrate::SpinMutex;
 }
 
 #[platform_adapter(

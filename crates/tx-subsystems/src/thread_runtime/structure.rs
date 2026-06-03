@@ -126,6 +126,11 @@ pub struct ThreadPayload {
     pub(crate) signal_mask: AtomicU64,
     /// Per-thread pending-signal bitset.
     pub(crate) thread_pending: PendingSignalQueue,
+    /// Conservative summary of process-group pending signals known to
+    /// affect this thread. A zero value lets signal-mask refresh skip
+    /// the owner-process upgrade; nonzero falls back to the
+    /// authoritative `ProcessPayload.group_pending`.
+    pub(crate) group_pending_summary: AtomicU64,
     /// `InterruptSummary` packed into 8 bits, kept current by
     /// `post_signal`, `step_sigprocmask`, `step_thread_exit`, and the
     /// SIGKILL routing path. Read by `select_next_signal` /
@@ -234,6 +239,7 @@ impl ThreadPayload {
             task: SpinMutex::new(None),
             signal_mask: AtomicU64::new(0),
             thread_pending: PendingSignalQueue::new(),
+            group_pending_summary: AtomicU64::new(0),
             signal_summary: AtomicU8::new(0),
             userspace_slot: UserspaceRunSlot::new(),
             active_request: SpinMutex::new(None),
@@ -369,6 +375,16 @@ impl ThreadPayload {
     /// Borrow the per-thread pending-signal queue.
     pub fn pending(&self) -> &PendingSignalQueue {
         &self.thread_pending
+    }
+
+    /// Snapshot the conservative process-group pending hint.
+    pub(crate) fn group_pending_summary(&self) -> u64 {
+        self.group_pending_summary.load(Ordering::Acquire)
+    }
+
+    /// Replace the process-group pending hint.
+    pub(crate) fn store_group_pending_summary(&self, bits: u64) {
+        self.group_pending_summary.store(bits, Ordering::Release);
     }
 
     /// Snapshot the current interrupt summary.
