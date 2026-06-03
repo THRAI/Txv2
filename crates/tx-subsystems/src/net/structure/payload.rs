@@ -546,6 +546,13 @@ impl SocketPayload {
         became_readable
     }
 
+    pub(crate) fn record_tcp_stream_bytes(&self, payload: &[u8]) -> Option<bool> {
+        let raw_tcp = self.raw_tcp.as_ref()?;
+        let became_readable = raw_tcp.ingest_rx_bytes_unbounded(payload);
+        self.refresh_io_from_raw();
+        Some(became_readable)
+    }
+
     pub(crate) fn record_send_space(&self, bytes: usize) -> bool {
         let became_available = match &self.raw_tcp {
             Some(raw_tcp) => raw_tcp.ack_tx_bytes(bytes),

@@ -1,9 +1,10 @@
 use tx_substrate::zone::Cap;
 
 use crate::execution::{Guard, StepOutcome};
+use crate::net::namespace::net_namespace_payloads_snapshot;
 use crate::net::structure::table::SocketTable;
 use crate::net::structure::{
-    AcceptWireSet, ConnectionKey, RdsState, RecvWireSet, SendWireSet, SocketIdentity,
+    AcceptWireSet, ConnectionKey, IpEndpoint, RdsState, RecvWireSet, SendWireSet, SocketIdentity,
     SocketProtocol, TcpState, UdpInner, UnixDatagramState, UnixStreamState,
 };
 
@@ -50,9 +51,7 @@ pub fn step_socket_close(
         SocketProtocol::Tcp(TcpState::Connecting { local, remote })
         | SocketProtocol::Tcp(TcpState::Connected { local, remote }) => {
             tcp_flushed_bytes += flush_tcp_tx_before_close(socket, guard);
-            if let Some(peer) =
-                table.lookup_tcp_connection(ConnectionKey::new(remote, local), guard)
-            {
+            if let Some(peer) = lookup_tcp_peer_connection(table, remote, local, guard) {
                 let peer_wakes = mark_tcp_peer_closed(&peer);
                 peer_recv_woken += peer_wakes.recv_woken;
                 peer_send_woken += peer_wakes.send_woken;
@@ -210,6 +209,20 @@ fn mark_tcp_peer_closed(peer: &Cap<SocketIdentity>) -> PeerCloseWakes {
         recv_woken,
         send_woken,
     }
+}
+
+fn lookup_tcp_peer_connection(
+    table: &SocketTable,
+    remote: IpEndpoint,
+    local: IpEndpoint,
+    guard: &Guard<'_>,
+) -> Option<Cap<SocketIdentity>> {
+    let key = ConnectionKey::new(remote, local);
+    table.lookup_tcp_connection(key, guard).or_else(|| {
+        net_namespace_payloads_snapshot()
+            .into_iter()
+            .find_map(|namespace| namespace.socket_table().lookup_tcp_connection(key, guard))
+    })
 }
 
 fn mark_sctp_peer_closed(peer: &Cap<SocketIdentity>) -> PeerCloseWakes {

@@ -1287,6 +1287,19 @@ impl OpenFile {
         &self.backing
     }
 
+    /// `Some(&Cap<SocketIdentity>)` iff this `OpenFile` wraps a socket rnode.
+    pub fn socket_identity(&self) -> Option<&Cap<SocketIdentity>> {
+        match &self.backing {
+            OpenFileBacking::Rnode { rnode } => match rnode.backing() {
+                RNodeBacking::StructBacked {
+                    payload: StructPayload::Socket { identity },
+                } => Some(identity),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Return the anonymous-pipe endpoint carried by this file, if any.
     ///
     /// Used by process fd-table accounting so `close` / `dup` / `fork`

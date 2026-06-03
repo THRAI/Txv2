@@ -114,6 +114,7 @@ pub use project::{
     proc_net_neigh_snapshot_text_for_namespace, proc_net_netfilter_rules_text,
     proc_net_netfilter_rules_text_for_namespace, proc_net_nf_conntrack_text,
     proc_net_nf_conntrack_text_for_namespace, proc_net_route_snapshot_text,
+    proc_net_tcp_listener_process_table_text, proc_net_tcp_socket_table_text,
 };
 pub use protocol::{
     ArpEntry, EtherIface, EtherPacketSource, EtherPacketTxSink, Icmpv4EchoPacket, Icmpv4Event,

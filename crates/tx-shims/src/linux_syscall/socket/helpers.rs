@@ -33,11 +33,7 @@ pub(super) fn maybe_autobind_connect_client(
     }
 
     let remote_endpoint = remote.as_ip_endpoint();
-    let local_endpoint_base = if remote_endpoint.is_loopback() || remote_endpoint.is_unspecified() {
-        IpEndpoint::loopback_for_family(remote_endpoint.family, 0)
-    } else {
-        IpEndpoint::unspecified_for_family(remote_endpoint.family, 0)
-    };
+    let local_endpoint_base = connect_autobind_local_base(socket, remote_endpoint);
 
     for port in EPHEMERAL_PORT_START..EPHEMERAL_PORT_END {
         let local_endpoint = IpEndpoint::from_ip(local_endpoint_base.ip_addr(), port);
@@ -63,6 +59,55 @@ pub(super) fn maybe_autobind_connect_client(
         }
     }
     Err(Errno::EADDRINUSE)
+}
+
+fn connect_autobind_local_base(
+    socket: &Cap<SocketIdentity>,
+    remote_endpoint: IpEndpoint,
+) -> IpEndpoint {
+    if remote_endpoint.is_loopback() || remote_endpoint.is_unspecified() {
+        return IpEndpoint::loopback_for_family(remote_endpoint.family, 0);
+    }
+    if !matches!(socket.kind, SocketKind::Tcp | SocketKind::Sctp) {
+        return IpEndpoint::unspecified_for_family(remote_endpoint.family, 0);
+    }
+    let Some(payload) = socket.acquire_operational() else {
+        return IpEndpoint::unspecified_for_family(remote_endpoint.family, 0);
+    };
+    match remote_endpoint.ip_addr() {
+        tx_subsystems::net::structure::IpAddress::V4(dst) => payload
+            .net_namespace()
+            .best_ipv4_route(dst)
+            .and_then(|route| {
+                route.preferred_src.or_else(|| {
+                    payload
+                        .net_namespace()
+                        .link_snapshot()
+                        .into_iter()
+                        .find(|link| {
+                            link.name == route.oif_name
+                                && link.is_up
+                                && !link.is_loopback
+                                && link.ipv4_addr.is_some()
+                        })
+                        .and_then(|link| link.ipv4_addr)
+                })
+            })
+            .map_or_else(
+                || IpEndpoint::unspecified_for_family(remote_endpoint.family, 0),
+                |src| IpEndpoint::new(src, 0),
+            ),
+        tx_subsystems::net::structure::IpAddress::V6(_) => payload
+            .net_namespace()
+            .link_snapshot()
+            .into_iter()
+            .find(|link| link.is_up && !link.is_loopback && link.ipv6_addr.is_some())
+            .and_then(|link| link.ipv6_addr)
+            .map_or_else(
+                || IpEndpoint::unspecified_for_family(remote_endpoint.family, 0),
+                |src| IpEndpoint::new_v6(src, 0),
+            ),
+    }
 }
 
 pub(super) fn tcp_connect_tuple_in_use(
@@ -1096,16 +1141,15 @@ pub(super) fn write_sockaddr_endpoint<'a>(
     if invalid_socklen(len) {
         return Err(Errno::EINVAL);
     }
-    if len < out_len {
-        return Err(Errno::EINVAL);
-    }
 
     if endpoint.family == AddressFamily::Inet6 {
         let bytes = sockaddr_in6_bytes(endpoint);
-        bootstrap_copy_to_user(&ctx.aspace, sockaddr_ptr, &bytes)
+        let copy_len = core::cmp::min(len, out_len) as usize;
+        bootstrap_copy_to_user(&ctx.aspace, sockaddr_ptr, &bytes[..copy_len])
     } else {
         let bytes = sockaddr_in_bytes(endpoint);
-        bootstrap_copy_to_user(&ctx.aspace, sockaddr_ptr, &bytes)
+        let copy_len = core::cmp::min(len, out_len) as usize;
+        bootstrap_copy_to_user(&ctx.aspace, sockaddr_ptr, &bytes[..copy_len])
     }
 }
 

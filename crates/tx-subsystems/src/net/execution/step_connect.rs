@@ -1,10 +1,11 @@
-use tx_substrate::zone::Cap;
+use tx_substrate::zone::{Cap, PayloadCap};
 
 use crate::execution::{Errno, Guard, StepOutcome, WaitToken};
 use crate::net::checks::require::require_socket_connect_target;
 use crate::net::delegate::net_delegate_kick_poll;
 use crate::net::execution::step_bind::table_error_to_errno;
 use crate::net::execution::yield_on_token;
+use crate::net::namespace::{net_namespace_payloads_snapshot, NetNamespacePayload};
 use crate::net::structure::registry;
 use crate::net::structure::table::SocketTable;
 use crate::net::structure::{
@@ -64,7 +65,7 @@ pub fn step_connect(
             true
         }
         SocketProtocol::Tcp(TcpState::Bound { local }) => {
-            let selected_local = select_tcp_connect_local(*local, witness.remote);
+            let selected_local = select_tcp_connect_local(&payload, *local, witness.remote);
             *protocol = SocketProtocol::Tcp(TcpState::Connecting {
                 local: selected_local,
                 remote: witness.remote,
@@ -102,6 +103,9 @@ pub fn step_connect(
         if advanced {
             net_delegate_kick_poll();
         }
+        if let Some(outcome) = try_tcp_local_namespace_connect(socket, &payload, guard) {
+            return outcome;
+        }
         let wait = WaitToken::new(
             socket.wait_carriers.send,
             SendWireSet::SPACE.bits() | SendWireSet::BROKEN.bits(),
@@ -111,6 +115,126 @@ pub fn step_connect(
         net_delegate_kick_poll();
         StepOutcome::Done(())
     }
+}
+
+fn try_tcp_local_namespace_connect(
+    socket: &Cap<SocketIdentity>,
+    payload: &SocketOperationalEvidence,
+    guard: &Guard<'_>,
+) -> Option<StepOutcome<()>> {
+    if socket.kind != SocketKind::Tcp {
+        return None;
+    }
+
+    let (local, remote) = match payload.protocol_snapshot() {
+        SocketProtocol::Tcp(TcpState::Connecting { local, remote }) => (local, remote),
+        _ => return None,
+    };
+    if remote.is_loopback() {
+        return None;
+    }
+    if local.is_unspecified() || local.port == 0 {
+        return Some(StepOutcome::Err(Errno::EADDRNOTAVAIL));
+    }
+
+    let Some(target_namespace) = namespace_owning_endpoint(remote) else {
+        return None;
+    };
+    let target_table = target_namespace.socket_table();
+    let Some(listener) = target_table.lookup_tcp_listener_dual_stack_endpoint(remote, guard) else {
+        return Some(StepOutcome::Err(Errno::ECONNREFUSED));
+    };
+    let Some(listener_payload) = listener.acquire_operational() else {
+        return Some(StepOutcome::Err(Errno::ECONNREFUSED));
+    };
+    let listener_local = match listener_payload.protocol_snapshot() {
+        SocketProtocol::Tcp(TcpState::Listening {
+            local: listener_local,
+            ..
+        }) if tcp_listener_accepts_local_endpoint(&listener_payload, listener_local, remote) => {
+            concrete_listener_endpoint(listener_local, remote)
+        }
+        _ => return Some(StepOutcome::Err(Errno::ECONNREFUSED)),
+    };
+
+    let child_options = listener_payload.with_options(Clone::clone);
+    let child = match registry::create_connected_stream_for_accept_in_namespace_with_family(
+        listener_local,
+        local,
+        listener_local.family,
+        child_options,
+        listener_payload.net_namespace(),
+    ) {
+        Ok(child) => child,
+        Err(_) => return Some(StepOutcome::Err(Errno::ENOMEM)),
+    };
+
+    let client_key = ConnectionKey::new(local, listener_local);
+    let server_key = ConnectionKey::new(listener_local, local);
+    let client_table = payload.socket_table();
+    if let Err(error) = client_table.insert_tcp_connection(client_key, socket.clone()) {
+        return Some(StepOutcome::Err(table_error_to_errno(error)));
+    }
+    if let Err(error) = target_table.insert_tcp_connection(server_key, child.clone()) {
+        let _ = client_table.withdraw_tcp_connection(client_key);
+        return Some(StepOutcome::Err(table_error_to_errno(error)));
+    }
+
+    let entry = SocketAcceptEntry {
+        child,
+        local: listener_local,
+        peer: local,
+        unix_peer: None,
+    };
+    let Some(accept_became_ready) = listener_payload.enqueue_accept_entry(entry) else {
+        let _ = client_table.withdraw_tcp_connection(client_key);
+        let _ = target_table.withdraw_tcp_connection(server_key);
+        return Some(StepOutcome::Err(Errno::ECONNREFUSED));
+    };
+
+    payload.with_protocol_mut(|protocol| {
+        *protocol = SocketProtocol::Tcp(TcpState::Connected {
+            local,
+            remote: listener_local,
+        });
+    });
+    socket.readiness.fire_send(SendWireSet::SPACE);
+    if accept_became_ready {
+        listener.readiness.fire_accept(AcceptWireSet::HAS_PENDING);
+    }
+    Some(StepOutcome::Done(()))
+}
+
+fn namespace_owning_endpoint(remote: IpEndpoint) -> Option<PayloadCap<NetNamespacePayload>> {
+    net_namespace_payloads_snapshot()
+        .into_iter()
+        .find(|namespace| match remote.ip_addr() {
+            crate::net::structure::IpAddress::V4(addr) => namespace.owns_ipv4_addr(addr),
+            crate::net::structure::IpAddress::V6(addr) => namespace.owns_ipv6_addr(addr),
+        })
+}
+
+fn concrete_listener_endpoint(listener_local: IpEndpoint, remote: IpEndpoint) -> IpEndpoint {
+    if listener_local.is_unspecified() && listener_local.port == remote.port {
+        remote
+    } else {
+        listener_local
+    }
+}
+
+fn tcp_listener_accepts_local_endpoint(
+    listener_payload: &SocketOperationalEvidence,
+    listener_local: IpEndpoint,
+    dst: IpEndpoint,
+) -> bool {
+    let v6only = listener_payload.with_options(|options| options.ip.ipv6_v6only);
+    listener_local.port == dst.port
+        && ((listener_local.same_family(dst)
+            && (listener_local.ip_addr() == dst.ip_addr() || listener_local.is_unspecified()))
+            || (!v6only
+                && listener_local.family == crate::net::structure::AddressFamily::Inet6
+                && listener_local.is_unspecified()
+                && dst.family == crate::net::structure::AddressFamily::Inet))
 }
 
 fn step_connect_unspec(
@@ -293,7 +417,9 @@ fn step_sctp_connect(
 ) -> StepOutcome<()> {
     let local = match payload.protocol_snapshot() {
         SocketProtocol::Sctp(TcpState::Init) => unspecified_endpoint(),
-        SocketProtocol::Sctp(TcpState::Bound { local }) => select_tcp_connect_local(local, remote),
+        SocketProtocol::Sctp(TcpState::Bound { local }) => {
+            select_tcp_connect_local(payload, local, remote)
+        }
         SocketProtocol::Sctp(TcpState::Connecting { .. }) => {
             return StepOutcome::Err(Errno::EALREADY)
         }
@@ -456,10 +582,37 @@ fn udp_table_error_to_errno(error: tx_substrate::index::IndexError) -> Errno {
     }
 }
 
-fn select_tcp_connect_local(local: IpEndpoint, remote: IpEndpoint) -> IpEndpoint {
-    if local.is_unspecified() && remote.is_loopback() {
+fn select_tcp_connect_local(
+    payload: &SocketOperationalEvidence,
+    local: IpEndpoint,
+    remote: IpEndpoint,
+) -> IpEndpoint {
+    if !local.is_unspecified() {
+        local
+    } else if remote.is_loopback() {
         IpEndpoint::loopback_for_family(remote.family, local.port)
     } else {
-        local
+        select_routed_local(payload, local, remote).unwrap_or(local)
+    }
+}
+
+fn select_routed_local(
+    payload: &SocketOperationalEvidence,
+    local: IpEndpoint,
+    remote: IpEndpoint,
+) -> Option<IpEndpoint> {
+    match remote.ip_addr() {
+        crate::net::structure::IpAddress::V4(dst) => payload
+            .net_namespace()
+            .best_ipv4_route(dst)
+            .and_then(|route| route.preferred_src)
+            .map(|src| IpEndpoint::new(src, local.port)),
+        crate::net::structure::IpAddress::V6(_) => payload
+            .net_namespace()
+            .link_snapshot()
+            .into_iter()
+            .find(|link| link.is_up && !link.is_loopback && link.ipv6_addr.is_some())
+            .and_then(|link| link.ipv6_addr)
+            .map(|src| IpEndpoint::new_v6(src, local.port)),
     }
 }

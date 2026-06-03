@@ -471,6 +471,19 @@ impl ProcessIdentity {
         self.payload.lock().as_ref().and_then(|p| p.fd(idx))
     }
 
+    /// Snapshot the full fd table for procfs/tool projections.
+    ///
+    /// Returns an empty map for zombies. The returned `OpenFile` caps are
+    /// cloned out of the payload lock, so callers can inspect them without
+    /// borrowing process state.
+    pub fn open_fds(&self) -> BTreeMap<u32, Cap<crate::vfs::OpenFile>> {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.open_fds())
+            .unwrap_or_default()
+    }
+
     /// Snapshot the current working-directory `Cap<DEntry>` if one is
     /// installed on the payload. Returns `None` for zombies or
     /// processes whose cwd has never been bound (init pre-rootfs).
