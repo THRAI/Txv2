@@ -230,6 +230,7 @@ CUSTOM_BATCHES["vfs-after-lgetxattr"] = CUSTOM_BATCHES["vfs-tail"]
 
 BATCH_ORDER = [
     "submit",
+    "submit-glibc",
     "p0",
     "smoke",
     "fd-io",
@@ -250,6 +251,7 @@ BATCH_ORDER = [
 ]
 
 SUBMIT_BATCH_ALIASES = {"submit", "whitelist"}
+SUBMIT_GLIBC_BATCH_ALIASES = {"submit-glibc", "whitelist-glibc"}
 LA_SUBMIT_ARCHES = {"la64", "loongarch64", "loongarch64-qemu"}
 
 
@@ -309,21 +311,54 @@ def load_submit_cases() -> list[str]:
     stop_before = load_rust_const_string("LTP_SUBMIT_ONE_POINT_FIRST_CASE")
     if stop_before in cases:
         cases = cases[: cases.index(stop_before)]
+    cases.extend(
+        case
+        for case in load_rust_const_string("LTP_BATCH_SUBMIT_NETWORK_CASES").split("+")
+        if case
+    )
     return cases
 
 
 def load_la_submit_excluded_cases() -> set[str]:
     return {
         case
-        for case in load_rust_const_string("LTP_LA_SUBMIT_EXCLUDED_CASES").split("+")
+        for case in (
+            load_rust_const_string("LTP_LA_SUBMIT_EXCLUDED_CASES")
+            + "+"
+            + load_rust_const_string("LTP_BATCH_LA_SUBMIT_NETWORK_EXCLUDED_CASES")
+        ).split("+")
         if case
     }
 
 
-def cases_for_batch(cases: list[str], batch: str, arch: str = "") -> list[str]:
-    if batch in SUBMIT_BATCH_ALIASES:
+def load_submit_glibc_excluded_cases(arch: str) -> set[str]:
+    excluded = {
+        case
+        for case in load_rust_const_string("LTP_BATCH_SUBMIT_GLIBC_EXCLUDED_CASES").split("+")
+        if case
+    }
+    if arch in LA_SUBMIT_ARCHES:
+        excluded.update(
+            case
+            for case in load_rust_const_string(
+                "LTP_BATCH_LA_SUBMIT_GLIBC_NETWORK_EXCLUDED_CASES"
+            ).split("+")
+            if case
+        )
+    return excluded
+
+
+def cases_for_batch(
+    cases: list[str], batch: str, arch: str = "", libc: str = ""
+) -> list[str]:
+    if batch in SUBMIT_BATCH_ALIASES or batch in SUBMIT_GLIBC_BATCH_ALIASES:
+        if batch in SUBMIT_GLIBC_BATCH_ALIASES:
+            libc = "glibc"
         available = set(cases)
         la_excluded = load_la_submit_excluded_cases() if arch in LA_SUBMIT_ARCHES else set()
+        glibc_excluded = (
+            load_submit_glibc_excluded_cases(arch) if libc == "glibc" else set()
+        )
         return [
             case
             for case in load_submit_cases()
@@ -331,7 +366,7 @@ def cases_for_batch(cases: list[str], batch: str, arch: str = "") -> list[str]:
             and is_valid_case_name(case)
             and case not in SKIP_CASES
             and case not in la_excluded
-            and case_prefix(case) not in SKIP_PREFIXES
+            and case not in glibc_excluded
         ]
     if batch == "all":
         return [
@@ -352,7 +387,7 @@ def cases_for_batch(cases: list[str], batch: str, arch: str = "") -> list[str]:
     try:
         prefixes = set(BATCH_PREFIXES[batch])
     except KeyError:
-        known = ", ".join(BATCH_ORDER + ["whitelist", "all"])
+        known = ", ".join(BATCH_ORDER + ["whitelist", "whitelist-glibc", "all"])
         raise SystemExit(f"unknown LTP batch {batch!r}; known: {known}")
     return [
         case
@@ -368,6 +403,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="List OSComp/LTP syscall batches")
     parser.add_argument("--batch", default=None, help="batch name to print")
     parser.add_argument("--arch", default="", help="optional target arch for arch-specific batches")
+    parser.add_argument(
+        "--libc",
+        choices=["", "musl", "glibc"],
+        default="",
+        help="optional libc lane for submit-specific exclusions",
+    )
     parser.add_argument("--csv", action="store_true", help="print comma-separated cases")
     parser.add_argument("--list", action="store_true", help="list batch names and counts")
     parser.add_argument("--refresh", action="store_true", help="refresh case cache from sdcard")
@@ -377,13 +418,13 @@ def main() -> int:
 
     if args.list:
         for name in BATCH_ORDER:
-            selected = cases_for_batch(cases, name, args.arch)
+            selected = cases_for_batch(cases, name, args.arch, args.libc)
             print(f"{name:8s} {len(selected):4d}")
-        print(f"{'all':8s} {len(cases_for_batch(cases, 'all', args.arch)):4d}")
+        print(f"{'all':8s} {len(cases_for_batch(cases, 'all', args.arch, args.libc)):4d}")
         return 0
 
     batch = args.batch or "p0"
-    selected = cases_for_batch(cases, batch, args.arch)
+    selected = cases_for_batch(cases, batch, args.arch, args.libc)
     if args.csv:
         print(",".join(selected))
     else:

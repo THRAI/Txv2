@@ -646,7 +646,7 @@ impl SocketPayload {
         self.raw_recv_len(len, true).map(|(bytes, _)| bytes)
     }
 
-    pub(crate) fn udp_corked_send_len(&self) -> usize {
+    pub fn udp_corked_send_len(&self) -> usize {
         self.raw_udp
             .as_ref()
             .map(RawUdpSocket::corked_tx_len)

@@ -370,19 +370,34 @@ impl<I: BlockImage> Ext4Pager<I> {
     }
 
     /// Allocate a free inode in group 0, mark it used in the bitmap, and return
-    /// its number.  Panics on group-desc absence, returns `OutOfBounds` when
-    /// the bitmap is full.
+    /// its number. Returns `OutOfBounds` when every group bitmap is full.
     pub fn allocate_inode(&mut self) -> Result<InodeNo> {
-        let group = *self.groups.first().ok_or(Ext4FormatError::Corrupt)?;
-        let bitmap_block = group.inode_bitmap_block();
-        let mut bitmap = [0u8; BLOCK_SIZE];
-        self.image.read_block(bitmap_block, &mut bitmap)?;
-        let bit = BitmapView::new(&bitmap)
-            .first_zero()
-            .ok_or(Ext4FormatError::OutOfBounds)?;
-        BitmapMut::new(&mut bitmap).set(bit)?;
-        self.image.write_block(bitmap_block, &bitmap)?;
-        Ok(InodeNo::new(bit as u32 + 1))
+        if self.superblock.inodes_per_group == 0 {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        let inodes_per_group = self.superblock.inodes_per_group as u64;
+        let total_inodes = self.superblock.inodes_count as u64;
+
+        for (group_index, group) in self.groups.iter().copied().enumerate() {
+            let group_first_index = group_index as u64 * inodes_per_group;
+            if group_first_index >= total_inodes {
+                break;
+            }
+            let group_inode_count =
+                core::cmp::min(inodes_per_group, total_inodes - group_first_index);
+            let bitmap_block = group.inode_bitmap_block();
+            let mut bitmap = [0u8; BLOCK_SIZE];
+            self.image.read_block(bitmap_block, &mut bitmap)?;
+            let view = BitmapView::new(&bitmap);
+            let Some(bit) = (0..group_inode_count as usize).find(|bit| !view.is_set(*bit)) else {
+                continue;
+            };
+            BitmapMut::new(&mut bitmap).set(bit)?;
+            self.image.write_block(bitmap_block, &bitmap)?;
+            return Ok(InodeNo::new((group_first_index + bit as u64 + 1) as u32));
+        }
+
+        Err(Ext4FormatError::OutOfBounds)
     }
 
     /// Write `inode` directly into the inode table (no journal).
@@ -410,16 +425,32 @@ impl<I: BlockImage> Ext4Pager<I> {
     /// Allocate a free data block in group 0, mark it used, and return its
     /// absolute block number.
     pub fn allocate_block(&mut self) -> Result<u64> {
-        let group = *self.groups.first().ok_or(Ext4FormatError::Corrupt)?;
-        let bitmap_block = group.block_bitmap_block();
-        let mut bitmap = [0u8; BLOCK_SIZE];
-        self.image.read_block(bitmap_block, &mut bitmap)?;
-        let bit = BitmapView::new(&bitmap)
-            .first_zero()
-            .ok_or(Ext4FormatError::OutOfBounds)?;
-        BitmapMut::new(&mut bitmap).set(bit)?;
-        self.image.write_block(bitmap_block, &bitmap)?;
-        Ok(self.superblock.first_data_block as u64 + bit as u64)
+        if self.superblock.blocks_per_group == 0 {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        let blocks_per_group = self.superblock.blocks_per_group as u64;
+        let first_data_block = self.superblock.first_data_block as u64;
+        let total_blocks = core::cmp::min(self.superblock.blocks_count, self.image.total_blocks());
+
+        for (group_index, group) in self.groups.iter().copied().enumerate() {
+            let group_start = first_data_block + group_index as u64 * blocks_per_group;
+            if group_start >= total_blocks {
+                break;
+            }
+            let group_block_count = core::cmp::min(blocks_per_group, total_blocks - group_start);
+            let bitmap_block = group.block_bitmap_block();
+            let mut bitmap = [0u8; BLOCK_SIZE];
+            self.image.read_block(bitmap_block, &mut bitmap)?;
+            let view = BitmapView::new(&bitmap);
+            let Some(bit) = (0..group_block_count as usize).find(|bit| !view.is_set(*bit)) else {
+                continue;
+            };
+            BitmapMut::new(&mut bitmap).set(bit)?;
+            self.image.write_block(bitmap_block, &bitmap)?;
+            return Ok(group_start + bit as u64);
+        }
+
+        Err(Ext4FormatError::OutOfBounds)
     }
 
     /// Insert a new directory entry `(name → new_ino)` into an existing

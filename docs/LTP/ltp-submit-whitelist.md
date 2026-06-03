@@ -1,28 +1,34 @@
 # LTP Submit Whitelist Progress
 
-This file records the positive-score LTP cases included by the submit whitelist
-in `crates/tx-kernel/src/init/exec.rs::LTP_SUBMIT_CASES`.
+This file records the positive-score LTP cases tracked for the submit
+whitelist. The historical non-network set mirrors
+`crates/tx-kernel/src/init/exec.rs::LTP_SUBMIT_CASES`; socket/network cases are
+manual today, but positive-score network cases are folded into the table below
+so the whitelist ledger is complete.
 
 Source rule: collect cases with nonzero passed score from
 `docs/LTP/syscalls/ltp-*-progress.md`, excluding the overlapping
 `ltp-progress.md` p0 summary, then deduplicate by first occurrence.
-Partial-score cases are included because they still add points. The submit
-order is sorted by recorded passed score descending; ties keep source order.
+Partial-score cases are included because they still add points. The historical
+non-network submit order is sorted by recorded passed score descending; ties
+keep source order. Network rows are appended from
+`docs/ljs/LTP_NETWORK_CURRENT_SCOREBOARD_2026-06-02.md`.
 
 ## Summary
 
 | Item | Value | Note |
 | --- | ---: | --- |
-| whitelist cases | 610 | deduplicated positive-score cases |
-| stitched score | `4156/4987` | local documented score, not a single official full-run result |
-| LA recorded cases | 610 | all whitelist cases have `LA Status` / `LA Note` recorded |
-| LA stitched score | `4107/4956` | local LA documented score, not a single official full-run result |
-| LA submit whitelist cases | 594 | shared whitelist minus LA zero-score/hang/panic cases in `LTP_LA_SUBMIT_EXCLUDED_CASES` |
-| LA filtered stitched score | `4100/4915` | subtracts the excluded LA case totals |
-| active submit runner cases | RV 369 / LA 361 | runner stops before `io_uring01`; LA additionally removes active bad cases |
+| whitelist cases | 651 | 609 historical non-network rows + 42 RV network positive-score rows |
+| stitched score | `4366/5200` | local documented score summed from the table, not a single official full-run result |
+| LA recorded cases | 651 | all rows have `LA Status` / `LA Note`; LA timeout/stall rows may not have a score denominator |
+| LA recorded score | `4285/5136` | all LA rows with a score summed from the table |
+| LA submit whitelist cases | 629 | 593 LA-filtered non-network rows + 36 LA network positive-score rows |
+| LA submit stitched score | `4277/5094` | LA submit-eligible rows summed from the table |
+| active submit runner cases | RV musl 409 / RV glibc 407 / LA musl 397 / LA glibc 396 | glibc lanes apply the 2026-06-03 hang/unimplemented-lock exclusions below |
 | p0 source | excluded | p0 overlaps module batches |
 | local command | `make oscomp-local-rv64-ltp-batch LTP_BATCH=submit` | mirrors the no-`tx.oscomp.groups` submit path |
 | local LA command | `make oscomp-local-la64-ltp-batch LTP_BATCH=submit` | uses `tools/ltp-batches.py --arch la64` for the local count |
+| local glibc-only command | `make oscomp-local-rv64-ltp-batch LTP_BATCH=submit-glibc` / `make oscomp-local-la64-ltp-batch LTP_BATCH=submit-glibc` | short batch name avoids qemu cmdline truncation from explicit hundreds-case filters |
 | latest local LA submit run | `3879/4302` | 2026-05-30 before `truncate03_64` exclusion; 362 active cases completed with `#### OS COMP TEST GROUP END ltp-musl` |
 
 ## LA Submit Delta
@@ -41,6 +47,33 @@ Excluded from LA submit:
 `futex_wait03`, `pselect01`, `pselect01_64`, `fcntl34`, `fcntl34_64`,
 `mq_notify01`, `semop05`, `chmod05`, `mknod05`, `truncate03_64`.
 
+Network submit exclusions:
+
+- RV active submit excludes `bind06` and `setsockopt06`. Both have historical
+  positive focused scores, but the 2026-06-03 RV whitelist run spent several
+  minutes in them and then stalled at `setsockopt06`, so they are kept only as
+  audit rows below.
+- RV submit-glibc additionally excludes `fcntl36_64` and `fcntl36`.
+  Txv2 does not yet implement full POSIX/OFD record-lock ownership and
+  `F_SETLKW`/`F_OFD_SETLKW` blocking-wakeup semantics; the 2026-06-03 RV
+  glibc runs stopped inside the `fcntl36*` OFD/POSIX synchronization subtests
+  and did not return to the LTP runner. The musl lane still keeps the
+  historical rows for audit, but glibc submit treats these as not implemented.
+- LA active submit excludes `bind04`, `bind05`, `bind06`, `accept02`,
+  `getsockopt02`, and `setsockopt06`. `getsockopt02` still passes as an LA
+  single glibc case, but the combined LA whitelist run reaches it in
+  `ltp-glibc` after `ltp-musl` and repeatedly gets `EADDRINUSE` before
+  `trap-action-terminate`.
+- LA submit-glibc additionally excludes `bind03`. The 2026-06-03 LA full
+  whitelist run completed `ltp-musl`, reached `ltp-glibc/bind03`, reported
+  `address is in use` from 10s through 120s, then hit
+  `trap-action-terminate`. The musl lane still keeps this case.
+- `setsockopt05` is removed from the shared active submit whitelist. Focused
+  runs can pass, but repeated LA glibc full-whitelist runs on 2026-06-03 panic
+  inside this case with `memory allocation of 2097152 bytes failed`
+  (`target/oscomp/os_serial_out_la_whitelist_submit_glibc_clean.txt` and
+  `target/oscomp/os_serial_out_la_whitelist_submit_glibc_packet-send-range-fix.txt`).
+
 ## By Module
 
 | Module | Cases | Score |
@@ -50,8 +83,9 @@ Excluded from LA submit:
 | event | 43 | `439/493` |
 | fd-io | 151 | `828/1015` |
 | heavy | 11 | `18/142` |
-| ipc | 43 | `245/324` |
+| ipc | 42 | `244/322` |
 | mount | 2 | `4/7` |
+| network | 42 | `211/215` |
 | process | 64 | `311/380` |
 | sched | 17 | `73/79` |
 | signal | 22 | `561/570` |
@@ -59,7 +93,7 @@ Excluded from LA submit:
 | time | 35 | `284/304` |
 | vfs | 114 | `1023/1196` |
 | vm | 48 | `113/162` |
-| total | 610 | `4156/4987` |
+| total | 651 | `4366/5200` |
 
 ## Cases
 
@@ -150,8 +184,8 @@ Excluded from LA submit:
 | `epoll_wait02` | event | event | pass | `7/7` | pass | LA 7/7 |
 | `futex_wait05` | event | event | pass | `7/7` | pass | LA 7/7 |
 | `poll02` | event | event | pass | `7/7` | pass | LA 7/7 |
-| `fcntl36_64` | fd-io | fd-io | pass | `7/7` | fail | LA 0/1; TBROK: Test killed by SIGSEGV! |
-| `fcntl36` | fd-io | fd-io | pass | `7/7` | fail | LA 0/1; TBROK: Test killed by SIGSEGV! |
+| `fcntl36_64` | fd-io | fd-io | pass | `7/7` | fail | Not implemented for glibc submit: POSIX/OFD record-lock ownership and blocking wait semantics are incomplete. LA 0/1; TBROK: Test killed by SIGSEGV! RV musl keeps the historical audit row. |
+| `fcntl36` | fd-io | fd-io | pass | `7/7` | fail | Not implemented for glibc submit: POSIX/OFD record-lock ownership and blocking wait semantics are incomplete. LA 0/1; TBROK: Test killed by SIGSEGV! RV glibc single run timed out on 2026-06-03. |
 | `pipe2_01` | fd-io | fd-io | pass | `7/7` | partial | LA 4/5; TBROK: pipe2({-1,-1}) failed with flag(16384): EINVAL (22) |
 | `pwritev02` | fd-io | fd-io | pass | `7/7` | pass | LA 7/7 |
 | `pwritev02_64` | fd-io | fd-io | pass | `7/7` | pass | LA 7/7 |
@@ -674,3 +708,45 @@ Excluded from LA submit:
 | `munlock02` | vm | vm | pass | `1/1` | pass | LA 1/1 |
 | `sbrk01` | vm | vm | partial | `1/3` | partial | LA 1/3; TFAIL: sbrk(8192) failed: ENOMEM (12) |
 | `sbrk02` | vm | vm | pass | `1/1` | pass | LA 1/1 |
+| `socket01` | network | socket | pass | `9/9` | pass | LA 9/9 |
+| `socket02` | network | socket | pass | `4/4` | pass | LA 4/4 |
+| `listen01` | network | socket | pass | `3/3` | pass | LA 3/3 |
+| `getsockname01` | network | socket | pass | `6/6` | pass | LA 6/6 |
+| `getsockopt01` | network | socket | pass | `9/9` | pass | LA 9/9 |
+| `getsockopt02` | network | socket | pass | `1/1` | pass | LA 1/1; LA active submit excludes the glibc combined-run path after 2026-06-03 `EADDRINUSE`/`trap-action-terminate` |
+| `setsockopt01` | network | socket | pass | `8/8` | pass | LA 8/8 |
+| `send01` | network | socket | pass | `6/6` | pass | LA 6/6 |
+| `send02` | network | socket | pass | `4/4` | pass | LA 4/4 |
+| `sendto01` | network | socket | pass | `10/10` | pass | LA 10/10 |
+| `sendto02` | network | socket | pass | `1/1` | pass | LA 1/1 |
+| `sendto03` | network | socket | pass | `2/2` | pass | LA 2/2 |
+| `recv01` | network | socket | pass | `5/5` | pass | LA 5/5 |
+| `recvfrom01` | network | socket | pass | `7/7` | pass | LA 7/7 |
+| `recvmsg01` | network | socket | pass | `10/10` | pass | LA 10/10 |
+| `recvmsg02` | network | socket | pass | `1/1` | pass | LA 1/1 |
+| `recvmsg03` | network | socket | pass | `1/1` | pass | LA 1/1 |
+| `sendmmsg01` | network | socket | pass | `4/4` | pass | LA 4/4 |
+| `sendmmsg02` | network | socket | pass | `4/4` | pass | LA 4/4 |
+| `recvmmsg01` | network | socket | partial | `1/2` | partial | LA 1/2; musl wrapper SIGSEGV after first EBADF subcase |
+| `bind01` | network | socket | pass | `7/7` | pass | LA 7/7 |
+| `bind02` | network | socket | pass | `1/1` | pass | LA 1/1 |
+| `bind03` | network | socket | pass | `3/3` | pass | LA 3/3; LA submit-glibc excludes after the 2026-06-03 full whitelist run hit `EADDRINUSE` through 120s and `trap-action-terminate`; LA musl keeps it. |
+| `bind04` | network | socket | pass | `16/16` | timeout/stall | LA timeout/stall; broad b4 run stalled after first TPASS |
+| `bind05` | network | socket | pass | `14/14` | timeout/stall | LA timeout/stall; single run hit 120s timeout after first TPASS/no summary |
+| `bind06` | network | socket | pass | `1/1` | timeout/stall | RV active submit excludes this long case after the 2026-06-03 whitelist run; LA timeout/stall; single run hit 600s timeout before summary |
+| `connect01` | network | socket | pass | `7/7` | pass | LA 7/7; single refill run passed |
+| `connect02` | network | socket | pass | `1/1` | pass | LA 1/1; single refill run passed |
+| `accept01` | network | socket | pass | `5/5` | pass | LA 5/5; single refill run passed |
+| `accept02` | network | socket | pass | `1/1` | timeout/stall | LA timeout/stall; single run hit 120s timeout after first TPASS/no summary |
+| `accept03` | network | socket | partial | `22/23` | pass | LA 23/23; single refill run passed |
+| `accept4_01` | network | socket | partial | `8/9` | partial | LA 8/9; legacy socketcall accept4 variant unavailable |
+| `getpeername01` | network | socket | pass | `7/7` | pass | LA 7/7; single refill run passed |
+| `socketpair01` | network | socket | pass | `10/10` | pass | LA 10/10 |
+| `socketpair02` | network | socket | pass | `4/4` | pass | LA 4/4 |
+| `setsockopt02` | network | socket | pass | `2/2` | pass | LA 2/2 |
+| `setsockopt03` | network | socket | partial | `1/2` | partial | LA 1/2; 32-bit compat-only subcase is TCONF |
+| `setsockopt04` | network | socket | pass | `1/1` | pass | LA 1/1 |
+| `setsockopt06` | network | socket | pass | `1/1` | timeout/stall | RV active submit excludes this long/stalling case after the 2026-06-03 whitelist run; LA timeout/stall; broad b6 run hit outer 300s timeout during this case |
+| `setsockopt08` | network | socket | pass | `1/1` | pass | LA 1/1; single refill run passed |
+| `setsockopt09` | network | socket | pass | `1/1` | pass | LA 1/1; single refill run passed |
+| `setsockopt10` | network | socket | pass | `1/1` | pass | LA 1/1; single refill run passed |

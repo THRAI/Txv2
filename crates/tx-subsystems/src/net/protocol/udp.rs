@@ -12,6 +12,7 @@ use crate::net::structure::{IpEndpoint, Ipv4Address, SocketOptionSet};
 use crate::sync::SpinMutex;
 
 const MAX_UDP_PACKET_METADATA_CAPACITY: usize = 64;
+const UDP_SMOLTCP_BACKING_BYTES: usize = 2048;
 const UDP_PACKET_CAPACITY_DIVISOR: usize = 1500;
 pub const UDP_IPV4_MAX_PAYLOAD_BYTES: usize = u16::MAX as usize - 20 - 8;
 
@@ -63,11 +64,11 @@ impl RawUdpSocket {
         let send_packet_capacity = packet_capacity_for_bytes(send_capacity);
         let rx_buf = udp::PacketBuffer::new(
             vec![udp::PacketMetadata::EMPTY; recv_packet_capacity],
-            vec![0u8; recv_capacity],
+            vec![0u8; smoltcp_backing_bytes(recv_capacity)],
         );
         let tx_buf = udp::PacketBuffer::new(
             vec![udp::PacketMetadata::EMPTY; send_packet_capacity],
-            vec![0u8; send_capacity],
+            vec![0u8; smoltcp_backing_bytes(send_capacity)],
         );
         let mut socket = udp::Socket::new(rx_buf, tx_buf);
 
@@ -285,6 +286,9 @@ impl RawUdpSocket {
 
     pub fn close(&self) {
         self.socket.lock().close();
+        self.rx_datagrams.lock().clear();
+        self.tx_datagrams.lock().clear();
+        let _ = self.corked_tx.lock().take();
     }
 }
 
@@ -351,6 +355,10 @@ impl UdpTxDatagram {
 fn packet_capacity_for_bytes(bytes: usize) -> usize {
     let packet_count = bytes.div_ceil(UDP_PACKET_CAPACITY_DIVISOR);
     packet_count.clamp(1, MAX_UDP_PACKET_METADATA_CAPACITY)
+}
+
+fn smoltcp_backing_bytes(bytes: usize) -> usize {
+    bytes.clamp(1, UDP_SMOLTCP_BACKING_BYTES)
 }
 
 fn rx_payload_len(datagrams: &VecDeque<UdpRxDatagram>) -> usize {

@@ -18,7 +18,7 @@ from pathlib import Path
 ltp_ret_pat = re.compile(r"^FAIL LTP CASE\s+(\S+)\s+:\s+(-?\d+)\s*$")
 ltp_run_pat = re.compile(r"^RUN LTP CASE\s+(\S+)(?:\s+:.*)?\s*$")
 ansi_pat = re.compile(r"\x1b\[[0-9;]*m")
-ltp_status_pat = re.compile(r"\b(TPASS|TFAIL|TBROK|TCONF|TWARN):")
+ltp_status_pat = re.compile(r"\b(TPASS|TFAIL|TBROK|TCONF|TWARN)\b\s*:")
 
 # Older LTP tests in the 20240524 tree use the legacy `test.h` harness and
 # may print neither a Summary block nor TPASS/TFAIL detail lines.  The source

@@ -81,7 +81,6 @@
 
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicUsize, Ordering};
 use core::task::{Context, Poll};
 
 use alloc::sync::Arc;
@@ -107,19 +106,7 @@ use tx_subsystems::vm::{
     VmFault, USER_PAGE_SIZE,
 };
 
-static THREAD_DEBUG_MARKERS: AtomicUsize = AtomicUsize::new(0);
-const THREAD_DEBUG_MARKER_LIMIT: usize = 64;
-
-fn trace_thread_debug<P: TxPlatform>(marker: &str) {
-    if THREAD_DEBUG_MARKERS.fetch_add(1, Ordering::Relaxed) >= THREAD_DEBUG_MARKER_LIMIT {
-        return;
-    }
-    tx_hal::console_write_str::<P>("txkernel:");
-    tx_hal::console_write_str::<P>(P::BOARD);
-    tx_hal::console_write_str::<P>(":debug:thread:");
-    tx_hal::console_write_str::<P>(marker);
-    tx_hal::console_write_str::<P>("\n");
-}
+fn trace_thread_debug<P: TxPlatform>(_marker: &str) {}
 
 /// Translate the reactor's `PageFaultAccess` into the VM subsystem's
 /// `AccessMode`, which is what `VmFault` consumes. The two enums do

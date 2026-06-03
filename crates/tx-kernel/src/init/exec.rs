@@ -769,8 +769,6 @@ impl<P: TxPlatform> CoreInit<P> {
         Self::register_thread_reactor_task(thread.tid.0, task_key);
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":userspace:submitted\n");
-        Self::write_board_sentinel_prefix();
-        tx_hal::console_write_str::<P>(":debug:build:la-userloop-20260531-1\n");
 
         // The BSP userspace loop uses lock-releasing reactor polls, so a
         // forked daemon child can be submitted immediately while its parent
@@ -783,14 +781,8 @@ impl<P: TxPlatform> CoreInit<P> {
             core::sync::atomic::Ordering::Release,
         );
         super::USERSPACE_REACTOR_ACTIVE.store(true, core::sync::atomic::Ordering::Release);
-        Self::write_board_sentinel_prefix();
-        tx_hal::console_write_str::<P>(":debug:userspace:state-set\n");
         P::cancel_deadline();
-        Self::write_board_sentinel_prefix();
-        tx_hal::console_write_str::<P>(":debug:userspace:deadline-cancelled\n");
         P::enable_timer_wakeups();
-        Self::write_board_sentinel_prefix();
-        tx_hal::console_write_str::<P>(":debug:userspace:timer-enabled\n");
 
         // Drive the BSP reactor loop until init zombifies. Each
         // iteration is a `step_hart_loop_at` step: advance time, run
@@ -798,17 +790,9 @@ impl<P: TxPlatform> CoreInit<P> {
         // the step reports idle so we don't spin-wait for the next
         // userspace trap (which is the only event that resolves the
         // thread future's pending wait).
-        let mut debug_loop_iters = 0usize;
         loop {
             if init.is_zombie() {
                 break;
-            }
-            let log_loop = debug_loop_iters < 8;
-            if log_loop {
-                Self::write_board_sentinel_prefix();
-                tx_hal::console_write_str::<P>(":debug:loop:top:i=");
-                Self::write_signed_decimal(debug_loop_iters as i32);
-                tx_hal::console_write_str::<P>("\n");
             }
 
             // UART IRQ handlers cannot touch TTY state directly
@@ -819,14 +803,6 @@ impl<P: TxPlatform> CoreInit<P> {
             let had_uart = Self::drain_pending_uart_rx_into_tty() != 0;
             let had_sbi = Self::drain_sbi_console_into_tty() != 0;
             let drained_console_input = had_uart || had_sbi;
-            if log_loop {
-                Self::write_board_sentinel_prefix();
-                tx_hal::console_write_str::<P>(":debug:loop:input:uart=");
-                Self::write_signed_decimal(had_uart as i32);
-                tx_hal::console_write_str::<P>(":sbi=");
-                Self::write_signed_decimal(had_sbi as i32);
-                tx_hal::console_write_str::<P>("\n");
-            }
 
             // Drain any pending child-thread submits posted from
             // sys_clone *before* polling the reactor again. This is
@@ -840,36 +816,15 @@ impl<P: TxPlatform> CoreInit<P> {
             // The userspace trap shell returns through a longjmp-like path, so
             // do not carry a pre-entry CpuId local across reactor iterations.
             let loop_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
-            if log_loop {
-                Self::write_board_sentinel_prefix();
-                tx_hal::console_write_str::<P>(":debug:loop:before-step:i=");
-                Self::write_signed_decimal(debug_loop_iters as i32);
-                tx_hal::console_write_str::<P>("\n");
-            }
             let step = match Self::step_boot_reactor_once_concurrent(loop_cpu) {
                 Some(step) => step,
                 None => {
-                    Self::write_board_sentinel_prefix();
-                    tx_hal::console_write_str::<P>(":debug:loop:step-none\n");
                     break;
                 }
             };
-            if log_loop {
-                Self::write_board_sentinel_prefix();
-                tx_hal::console_write_str::<P>(":debug:loop:after-step:i=");
-                Self::write_signed_decimal(debug_loop_iters as i32);
-                tx_hal::console_write_str::<P>(":polled=");
-                Self::write_signed_decimal(step.stats.polled as i32);
-                tx_hal::console_write_str::<P>(":completed=");
-                Self::write_signed_decimal(step.stats.completed as i32);
-                tx_hal::console_write_str::<P>(":idle=");
-                Self::write_signed_decimal(step.should_idle() as i32);
-                tx_hal::console_write_str::<P>("\n");
-            }
             let drained_terminal_tasks = Self::drain_terminal_reactor_tasks();
             let submitted_child_after_poll =
                 Self::drain_pending_child_submits() || Self::drain_pending_timer_signal_submits();
-            debug_loop_iters = debug_loop_iters.saturating_add(1);
 
             // EBR drain. Caps retired during the task polls above
             // (e.g. `Cap<OpenFile>` from `sys_close` / process exit fd
@@ -1083,6 +1038,11 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
                 selected += 1;
                 continue;
             }
+            if let Some(filter) = group.strip_prefix("ltp-glibc:") {
+                append_filtered_ltp(&mut cmd, "glibc", filter, &ltp_args);
+                selected += 1;
+                continue;
+            }
             if let Some(filter) = group.strip_prefix("ltp:") {
                 append_filtered_ltp(&mut cmd, "musl", filter, &ltp_args);
                 selected += 1;
@@ -1146,7 +1106,10 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
 
 fn append_ltp_batch(cmd: &mut alloc::string::String, batch: &str, args: &LtpArgs<'_>) {
     match batch.trim() {
-        "submit" | "whitelist" => append_submit_ltp_runner(cmd, "musl", args),
+        "submit" | "whitelist" => append_batch_submit_ltp_runner(cmd, args),
+        "submit-glibc" | "whitelist-glibc" => {
+            append_batch_submit_ltp_runner_for_libc(cmd, "glibc", args)
+        }
         "p0" => append_filtered_ltp(cmd, "musl", LTP_P0_CASES, args),
         "smoke" => append_filtered_ltp(cmd, "musl", LTP_SMOKE_CASES, args),
         "fd-io" => append_filtered_ltp(cmd, "musl", LTP_FD_IO_CASES, args),
@@ -1265,17 +1228,12 @@ fn append_filtered_ltp(
     use core::fmt::Write as _;
 
     append_ltp_script_env(cmd, libc);
+    append_ltp_workdir(cmd, libc);
     let group = oscomp_group_label("ltp", libc);
 
-    let _ = write!(
-        cmd,
-        "; ./busybox echo \"#### OS COMP TEST GROUP START {group} ####\""
-    );
+    let _ = write!(cmd, "; echo \"#### OS COMP TEST GROUP START {group} ####\"");
     append_ltp_case_loop(cmd, libc, filter, args);
-    let _ = write!(
-        cmd,
-        "; ./busybox echo \"#### OS COMP TEST GROUP END {group} ####\""
-    );
+    let _ = write!(cmd, "; echo \"#### OS COMP TEST GROUP END {group} ####\"");
 }
 
 fn append_all_ltp(cmd: &mut alloc::string::String, args: &LtpArgs<'_>) {
@@ -1316,26 +1274,60 @@ fn append_submit_ltp_runner(cmd: &mut alloc::string::String, libc: &str, args: &
     use core::fmt::Write as _;
 
     append_ltp_script_env(cmd, libc);
+    append_ltp_workdir(cmd, libc);
     let group = oscomp_group_label("ltp", libc);
 
-    let _ = write!(
-        cmd,
-        "; ./busybox echo \"#### OS COMP TEST GROUP START {group} ####\""
-    );
+    let _ = write!(cmd, "; echo \"#### OS COMP TEST GROUP START {group} ####\"");
     append_ltp_submit_case_loop(cmd, libc, args);
-    let _ = write!(
-        cmd,
-        "; ./busybox echo \"#### OS COMP TEST GROUP END {group} ####\""
-    );
+    let _ = write!(cmd, "; echo \"#### OS COMP TEST GROUP END {group} ####\"");
+}
+
+fn append_batch_submit_ltp_runner(cmd: &mut alloc::string::String, args: &LtpArgs<'_>) {
+    append_batch_submit_ltp_runner_for_libc(cmd, "musl", args);
+    append_batch_submit_ltp_runner_for_libc(cmd, "glibc", args);
+}
+
+fn append_batch_submit_ltp_runner_for_libc(
+    cmd: &mut alloc::string::String,
+    libc: &str,
+    args: &LtpArgs<'_>,
+) {
+    use core::fmt::Write as _;
+
+    append_ltp_script_env(cmd, libc);
+    append_ltp_workdir(cmd, libc);
+    let group = oscomp_group_label("ltp", libc);
+
+    let _ = write!(cmd, "; echo \"#### OS COMP TEST GROUP START {group} ####\"");
+    append_ltp_submit_case_loop(cmd, libc, args);
+    append_ltp_submit_network_case_loop(cmd, libc, args);
+    let _ = write!(cmd, "; echo \"#### OS COMP TEST GROUP END {group} ####\"");
 }
 
 fn append_ltp_submit_case_loop(cmd: &mut alloc::string::String, libc: &str, args: &LtpArgs<'_>) {
-    append_ltp_case_loop_until_excluding(
+    append_ltp_case_loop_until_excluding_extra(
         cmd,
         libc,
         LTP_SUBMIT_CASES,
         Some(LTP_SUBMIT_ONE_POINT_FIRST_CASE),
         ltp_submit_excluded_cases(),
+        ltp_submit_glibc_excluded_cases(libc),
+        args,
+    );
+}
+
+fn append_ltp_submit_network_case_loop(
+    cmd: &mut alloc::string::String,
+    libc: &str,
+    args: &LtpArgs<'_>,
+) {
+    append_ltp_case_loop_until_excluding_extra(
+        cmd,
+        libc,
+        LTP_BATCH_SUBMIT_NETWORK_CASES,
+        None,
+        ltp_batch_submit_network_excluded_cases(),
+        ltp_batch_submit_glibc_network_excluded_cases(libc),
         args,
     );
 }
@@ -1367,7 +1359,39 @@ fn append_ltp_case_loop_until_excluding(
     excluded_cases: &str,
     args: &LtpArgs<'_>,
 ) {
+    append_ltp_case_loop_until_excluding_extra(
+        cmd,
+        libc,
+        filter,
+        stop_before_case,
+        excluded_cases,
+        "",
+        args,
+    );
+}
+
+fn append_ltp_case_loop_until_excluding_extra(
+    cmd: &mut alloc::string::String,
+    libc: &str,
+    filter: &str,
+    stop_before_case: Option<&str>,
+    excluded_cases: &str,
+    extra_excluded_cases: &str,
+    args: &LtpArgs<'_>,
+) {
     use core::fmt::Write as _;
+
+    if libc == "glibc" {
+        append_ltp_case_loop_direct(
+            cmd,
+            filter,
+            stop_before_case,
+            excluded_cases,
+            extra_excluded_cases,
+            args,
+        );
+        return;
+    }
 
     let root = oscomp_libc_root(libc);
     let _ = write!(cmd, "; for case in");
@@ -1379,7 +1403,9 @@ fn append_ltp_case_loop_until_excluding(
         if stop_before_case == Some(case) {
             break;
         }
-        if ltp_case_list_contains(excluded_cases, case) {
+        if ltp_case_list_contains(excluded_cases, case)
+            || ltp_case_list_contains(extra_excluded_cases, case)
+        {
             continue;
         }
         if !is_ltp_case_token(case) {
@@ -1425,6 +1451,68 @@ done",
     );
 }
 
+fn append_ltp_case_loop_direct(
+    cmd: &mut alloc::string::String,
+    filter: &str,
+    stop_before_case: Option<&str>,
+    excluded_cases: &str,
+    extra_excluded_cases: &str,
+    args: &LtpArgs<'_>,
+) {
+    use core::fmt::Write as _;
+
+    let _ = write!(cmd, "; for case in");
+    for case in filter.split('+') {
+        let case = case.trim();
+        if case.is_empty() || case.ends_with('_') {
+            continue;
+        }
+        if stop_before_case == Some(case) {
+            break;
+        }
+        if ltp_case_list_contains(excluded_cases, case)
+            || ltp_case_list_contains(extra_excluded_cases, case)
+        {
+            continue;
+        }
+        if !is_ltp_case_token(case) {
+            let _ = write!(cmd, "; echo \"SKIP LTP CASE {case} : invalid case token\"");
+            continue;
+        }
+        let _ = write!(cmd, " {case}");
+    }
+    let skip_pattern = LOCAL_LTP_SKIP_SHELL_PATTERN;
+    let runtime_assignment = args.shell_max_runtime_assignment("case");
+    let _ = write!(
+        cmd,
+        "; do \
+case \"$case\" in {skip_pattern}) echo \"SKIP LTP CASE $case : local skip\"; continue;; esac; \
+ltp_label=\"$case\"; \
+case \"$case\" in \
+chdir01A) set -- ltp/testcases/bin/symlink01 -T chdir01; ltp_label='symlink01 -T chdir01';; \
+chmod01A) set -- ltp/testcases/bin/symlink01 -T chmod01; ltp_label='symlink01 -T chmod01';; \
+link01) set -- ltp/testcases/bin/symlink01 -T link01; ltp_label='symlink01 -T link01';; \
+lstat01A) set -- ltp/testcases/bin/symlink01 -T lstat01; ltp_label='symlink01 -T lstat01';; \
+lstat01A_64) set -- ltp/testcases/bin/symlink01 -T lstat01_64; ltp_label='symlink01 -T lstat01_64';; \
+open01A) set -- ltp/testcases/bin/symlink01 -T open01; ltp_label='symlink01 -T open01';; \
+readlink01A) set -- ltp/testcases/bin/symlink01 -T readlink01; ltp_label='symlink01 -T readlink01';; \
+rename01A) set -- ltp/testcases/bin/symlink01 -T rename01; ltp_label='symlink01 -T rename01';; \
+rmdir03A) set -- ltp/testcases/bin/symlink01 -T rmdir03; ltp_label='symlink01 -T rmdir03';; \
+stat04) set -- ltp/testcases/bin/symlink01 -T stat04; ltp_label='symlink01 -T stat04';; \
+stat04_64) set -- ltp/testcases/bin/symlink01 -T stat04_64; ltp_label='symlink01 -T stat04_64';; \
+unlink01) set -- ltp/testcases/bin/symlink01 -T unlink01; ltp_label='symlink01 -T unlink01';; \
+*) set -- \"ltp/testcases/bin/$case\";; \
+esac; \
+{runtime_assignment} \
+echo \"RUN LTP CASE $case : $ltp_label\"; \
+if [ -n \"$ltp_max_runtime\" ]; then \"$@\" -I \"$ltp_max_runtime\"; else \"$@\"; fi; \
+ret=$?; \
+if [ $ret = 0 ]; then echo \"PASS LTP CASE $case : $ret\"; else echo \"FAIL LTP CASE $case : $ret\"; fi; \
+if [ $ret = 0 ]; then echo \"FAIL LTP CASE $case : $ret\"; fi; \
+done",
+    );
+}
+
 #[cfg(target_arch = "loongarch64")]
 fn ltp_submit_excluded_cases() -> &'static str {
     LTP_LA_SUBMIT_EXCLUDED_CASES
@@ -1432,6 +1520,38 @@ fn ltp_submit_excluded_cases() -> &'static str {
 
 #[cfg(not(target_arch = "loongarch64"))]
 fn ltp_submit_excluded_cases() -> &'static str {
+    ""
+}
+
+fn ltp_submit_glibc_excluded_cases(libc: &str) -> &'static str {
+    if libc == "glibc" {
+        LTP_BATCH_SUBMIT_GLIBC_EXCLUDED_CASES
+    } else {
+        ""
+    }
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn ltp_batch_submit_network_excluded_cases() -> &'static str {
+    LTP_BATCH_LA_SUBMIT_NETWORK_EXCLUDED_CASES
+}
+
+#[cfg(not(target_arch = "loongarch64"))]
+fn ltp_batch_submit_network_excluded_cases() -> &'static str {
+    ""
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn ltp_batch_submit_glibc_network_excluded_cases(libc: &str) -> &'static str {
+    if libc == "glibc" {
+        LTP_BATCH_LA_SUBMIT_GLIBC_NETWORK_EXCLUDED_CASES
+    } else {
+        ""
+    }
+}
+
+#[cfg(not(target_arch = "loongarch64"))]
+fn ltp_batch_submit_glibc_network_excluded_cases(_libc: &str) -> &'static str {
     ""
 }
 
@@ -1805,6 +1925,22 @@ const LTP_LA_SUBMIT_EXCLUDED_CASES: &str = "\
 gettid02+fcntl36_64+fcntl36+creat08+open10+sched_setattr01+futex_wait03+\
 pselect01+pselect01_64+fcntl34+fcntl34_64+mq_notify01+semop05+chmod05+mknod05+\
 truncate03_64";
+
+#[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
+const LTP_BATCH_LA_SUBMIT_NETWORK_EXCLUDED_CASES: &str =
+    "bind04+bind05+bind06+accept02+getsockopt02+setsockopt06";
+
+const LTP_BATCH_SUBMIT_GLIBC_EXCLUDED_CASES: &str = "fcntl36_64+fcntl36";
+
+#[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
+const LTP_BATCH_LA_SUBMIT_GLIBC_NETWORK_EXCLUDED_CASES: &str = "bind03";
+
+const LTP_BATCH_SUBMIT_NETWORK_CASES: &str = "\
+socket01+socket02+listen01+getsockname01+getsockopt01+getsockopt02+setsockopt01+send01+\
+send02+sendto01+sendto02+sendto03+recv01+recvfrom01+recvmsg01+recvmsg02+recvmsg03+\
+sendmmsg01+sendmmsg02+recvmmsg01+bind01+bind02+bind03+bind04+bind05+connect01+\
+connect02+accept01+accept02+accept03+accept4_01+getpeername01+socketpair01+socketpair02+\
+setsockopt02+setsockopt03+setsockopt04+setsockopt08+setsockopt09+setsockopt10";
 
 const LTP_SUBMIT_CASES: &str = "\
 prot_hsymlinks+epoll_ctl03+splice07+rt_sigaction01+rt_sigaction02+rt_sigaction03+access01+getpid01+\
@@ -2192,6 +2328,7 @@ fn append_oscomp_musl_script(cmd: &mut alloc::string::String, script: &str, args
         append_full_ltp_runner(cmd, args);
         return;
     }
+    append_oscomp_script_env(cmd);
     let _ = write!(cmd, "; ./busybox sh {script}");
 }
 
@@ -2215,9 +2352,29 @@ fn append_ltp_script_env(cmd: &mut alloc::string::String, libc: &str) {
     use core::fmt::Write as _;
 
     let root = oscomp_libc_root(libc);
-    let _ = write!(
-        cmd,
-        "; ./busybox mkdir -p /bin; /musl/musl/busybox --install -s /bin; export LTPROOT={root}/ltp; export PATH=/bin:/musl/glibc:/musl/musl:{root}/ltp/testcases/bin"
+    if libc == "glibc" {
+        let _ = write!(
+            cmd,
+            "; ./busybox mkdir -p /bin; /musl/musl/busybox --install -s /bin; unset LTPROOT; export PATH=/bin:/musl/glibc:/musl/musl:{root}/ltp/testcases/bin"
+        );
+    } else {
+        let _ = write!(
+            cmd,
+            "; ./busybox mkdir -p /bin; /musl/musl/busybox --install -s /bin; export LTPROOT={root}/ltp; export PATH=/bin:/musl/glibc:/musl/musl:{root}/ltp/testcases/bin"
+        );
+    }
+}
+
+fn append_ltp_workdir(cmd: &mut alloc::string::String, libc: &str) {
+    use core::fmt::Write as _;
+
+    let root = oscomp_libc_root(libc);
+    let _ = write!(cmd, "; cd {root}");
+}
+
+fn append_oscomp_script_env(cmd: &mut alloc::string::String) {
+    cmd.push_str(
+        "; /musl/musl/busybox mkdir -p /bin; /musl/musl/busybox --install -s /bin; export PATH=/bin:/musl/musl:/musl/glibc:$PATH",
     );
 }
 
@@ -2225,12 +2382,16 @@ const DEFAULT_OSCOMP_MUSL_PRE_LTP_SCRIPTS: &[(&str, &str)] = &[
     ("basic-musl", "basic_testcode.sh"),
     ("busybox-musl", "busybox_testcode.sh"),
     ("libctest-musl", "libctest_testcode.sh"),
+    ("lua-musl", "lua_testcode.sh"),
+    ("netperf-musl", "netperf_testcode.sh"),
 ];
 
 const DEFAULT_OSCOMP_GLIBC_PRE_LTP_SCRIPTS: &[(&str, &str)] = &[
     ("basic-glibc", "basic_testcode.sh"),
     ("busybox-glibc", "busybox_testcode.sh"),
     ("libctest-glibc", "libctest_testcode.sh"),
+    ("lua-glibc", "lua_testcode.sh"),
+    ("netperf-glibc", "netperf_testcode.sh"),
 ];
 
 fn oscomp_musl_script_for_group(group: &str) -> Option<&'static str> {
@@ -2261,6 +2422,7 @@ fn is_libctest_musl_group(group: &str) -> bool {
 fn append_oscomp_glibc_script(cmd: &mut alloc::string::String, script: &str) {
     use core::fmt::Write as _;
 
+    append_oscomp_script_env(cmd);
     if script == "basic_testcode.sh" {
         let _ = write!(
             cmd,
@@ -2432,12 +2594,30 @@ mod tests {
         append_filtered_ltp(&mut cmd, "musl", "socket01+getsockopt01", &LtpArgs::none());
 
         assert!(cmd.contains("#### OS COMP TEST GROUP START ltp-musl ####"));
+        assert!(
+            cmd.contains("; cd /musl/musl; echo \"#### OS COMP TEST GROUP START ltp-musl ####\"")
+        );
         assert!(cmd.contains("; for case in socket01 getsockopt01"));
         assert!(cmd.contains("RUN LTP CASE $case : $ltp_label"));
         assert!(cmd.contains("\"$@\""));
         assert!(cmd.contains("FAIL LTP CASE $case : $ret"));
         assert!(cmd.contains("#### OS COMP TEST GROUP END ltp-musl ####"));
         assert!(!cmd.contains("basic_testcode.sh"));
+    }
+
+    #[test]
+    fn filtered_glibc_ltp_uses_glibc_group_and_root() {
+        let mut cmd = String::from("cd /musl/musl");
+        append_filtered_ltp(&mut cmd, "glibc", "socket01+getsockopt01", &LtpArgs::none());
+
+        assert!(cmd.contains("#### OS COMP TEST GROUP START ltp-glibc ####"));
+        assert!(
+            cmd.contains("; cd /musl/glibc; echo \"#### OS COMP TEST GROUP START ltp-glibc ####\"")
+        );
+        assert!(cmd.contains("set -- \"ltp/testcases/bin/$case\""));
+        assert!(cmd.contains("unset LTPROOT"));
+        assert!(cmd.contains("; for case in socket01 getsockopt01"));
+        assert!(cmd.contains("#### OS COMP TEST GROUP END ltp-glibc ####"));
     }
 
     #[test]
@@ -2461,7 +2641,13 @@ mod tests {
         assert!(cmd.contains("RUN LTP CASE $case : $ltp_label"));
         assert!(cmd.contains("futex_wake03"));
         assert!(cmd.contains("setitimer01"));
+        assert!(!cmd.contains("socket01"));
+        assert!(!cmd.contains("recvmsg01"));
+        assert!(!cmd.contains("sendmsg01"));
+        assert!(!cmd.contains("setsockopt06"));
         assert!(!cmd.contains("io_uring01"));
+        assert!(cmd.contains("lua_testcode.sh"));
+        assert!(cmd.contains("netperf_testcode.sh"));
         assert!(
             cmd.find("#### OS COMP TEST GROUP END libctest-musl ####")
                 .unwrap()
@@ -2477,10 +2663,8 @@ mod tests {
                     .unwrap()
         );
         assert!(!cmd.contains("libcbench_testcode.sh"));
-        assert!(!cmd.contains("lua_testcode.sh"));
         assert!(!cmd.contains("lmbench_testcode.sh"));
         assert!(!cmd.contains("iozone_testcode.sh"));
-        assert!(!cmd.contains("netperf_testcode.sh"));
         assert!(!cmd.contains("iperf_testcode.sh"));
         assert!(!cmd.contains("cyclictest_testcode.sh"));
         assert!(!cmd.contains("; target_dir=\"ltp/testcases/bin\""));
@@ -2505,12 +2689,43 @@ mod tests {
         let mut cmd = String::from("cd /musl/musl");
         append_ltp_batch(&mut cmd, "submit", &LtpArgs::none());
 
+        assert!(cmd.contains("#### OS COMP TEST GROUP START ltp-musl ####"));
+        assert!(cmd.contains("#### OS COMP TEST GROUP START ltp-glibc ####"));
         assert!(cmd.contains("confstr01"));
         assert!(cmd.contains("futex_wake03"));
         assert!(cmd.contains("setitimer01"));
+        assert!(cmd.contains("socket01"));
+        assert!(cmd.contains("recvmsg01"));
+        let glibc_start = cmd
+            .find("#### OS COMP TEST GROUP START ltp-glibc ####")
+            .unwrap();
+        assert!(cmd[..glibc_start].contains("fcntl36_64"));
+        assert!(cmd[..glibc_start].contains("fcntl36"));
+        assert!(!cmd[glibc_start..].contains("fcntl36_64"));
+        assert!(!cmd[glibc_start..].contains("fcntl36"));
+        assert!(!cmd.contains("bind06"));
+        assert!(!cmd.contains("sendmsg01"));
+        assert!(!cmd.contains("socketcall01"));
+        assert!(!cmd.contains("setsockopt06"));
         assert!(!cmd.contains("io_uring01"));
         assert!(!cmd.contains("timerfd04"));
         assert!(!cmd.contains("; target_dir=\"ltp/testcases/bin\""));
+    }
+
+    #[test]
+    fn ltp_submit_glibc_batch_uses_glibc_only_exclusions() {
+        let mut cmd = String::from("cd /musl/musl");
+        append_ltp_batch(&mut cmd, "submit-glibc", &LtpArgs::none());
+
+        assert!(cmd.contains("#### OS COMP TEST GROUP START ltp-glibc ####"));
+        assert!(
+            cmd.contains("; cd /musl/glibc; echo \"#### OS COMP TEST GROUP START ltp-glibc ####\"")
+        );
+        assert!(!cmd.contains("#### OS COMP TEST GROUP START ltp-musl ####"));
+        assert!(!cmd.contains("fcntl36"));
+        assert!(!cmd.contains("fcntl36_64"));
+        assert!(cmd.contains("socket01"));
+        assert!(!cmd.contains("setsockopt06"));
     }
 
     #[test]
@@ -2571,11 +2786,30 @@ mod tests {
         append_oscomp_musl_script(&mut cmd, "basic_testcode.sh", &LtpArgs::none());
         append_full_libctest(&mut cmd);
 
+        assert!(cmd.contains("/musl/musl/busybox --install -s /bin"));
+        assert!(cmd.contains("export PATH=/bin:/musl/musl:/musl/glibc:$PATH"));
         assert!(cmd.contains("; ./busybox sh basic_testcode.sh"));
         assert!(
             cmd.contains("; ./busybox echo \"#### OS COMP TEST GROUP START libctest-musl ####\"")
         );
         assert!(!cmd.contains("basic_testcode.sh && ./busybox echo"));
+    }
+
+    #[test]
+    fn normal_oscomp_scripts_install_busybox_applets_for_bare_commands() {
+        let mut musl_cmd = String::from("cd /musl/musl");
+        append_oscomp_musl_script(&mut musl_cmd, "lmbench_testcode.sh", &LtpArgs::none());
+
+        assert!(musl_cmd.contains("/musl/musl/busybox --install -s /bin"));
+        assert!(musl_cmd.contains("export PATH=/bin:/musl/musl:/musl/glibc:$PATH"));
+        assert!(musl_cmd.contains("; ./busybox sh lmbench_testcode.sh"));
+
+        let mut glibc_cmd = String::from("cd /musl/musl");
+        append_oscomp_glibc_script(&mut glibc_cmd, "netperf_testcode.sh");
+
+        assert!(glibc_cmd.contains("/musl/musl/busybox --install -s /bin"));
+        assert!(glibc_cmd.contains("export PATH=/bin:/musl/musl:/musl/glibc:$PATH"));
+        assert!(glibc_cmd.contains("/musl/musl/busybox sh netperf_testcode.sh"));
     }
 
     #[test]

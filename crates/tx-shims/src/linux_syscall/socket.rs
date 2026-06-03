@@ -21,7 +21,8 @@ use tx_subsystems::net::{
     Ipv4MulticastGroup, Ipv6Address, KernelSockAddr, LingerOption, PollMask, SendRecvFlags,
     SockAddrIn, SockAddrIn6, SockAddrLl, SockShutdownCmd, SocketHandleFlags, SocketIdentity,
     SocketKind, SocketProtocol, SocketType, TcpState, TcpTlsUlpState, UdpInner, UnixDatagramState,
-    UnixPeerCred, UnixSocketPath, UnixStreamState, ValidSocketType, VIRTIO_NET_DEFAULT_MTU,
+    UnixPeerCred, UnixSocketPath, UnixStreamState, ValidSocketType, UDP_IPV4_MAX_PAYLOAD_BYTES,
+    VIRTIO_NET_DEFAULT_MTU,
 };
 use tx_subsystems::signal::step_kill_process;
 use tx_subsystems::vfs::structure::OpenFileBacking;
@@ -631,8 +632,7 @@ async fn sendto_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult 
         {
             return SyscallResult::Error(ENODEV_VALUE);
         }
-        let mut bytes = alloc::vec![0; len];
-        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut bytes, args[1]) {
+        if let Err(errno) = validate_user_range(ctx, args[1], len, UserAccessKind::Read) {
             return SyscallResult::Error(errno_to_i32(errno));
         }
         return SyscallResult::Return(len as i64);
@@ -669,6 +669,9 @@ async fn sendto_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult 
             return SyscallResult::Error(errno_to_i32(errno));
         }
         return SyscallResult::Error(errno_to_i32(Errno::EOPNOTSUPP));
+    }
+    if let Err(errno) = validate_udp_send_payload_len(&socket, len) {
+        return SyscallResult::Error(errno_to_i32(errno));
     }
 
     let mut bytes = alloc::vec![0; len];
@@ -1076,6 +1079,9 @@ async fn sendmsg_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
     if total_len == 0 {
         return SyscallResult::Return(0);
     }
+    if let Err(errno) = validate_udp_send_payload_len(&socket, total_len) {
+        return SyscallResult::Error(errno_to_i32(errno));
+    }
 
     if raw_icmp_hdrincl_enabled(&socket) {
         if let Err(errno) = validate_iovec_read_ranges(ctx, &iovecs) {
@@ -1165,6 +1171,19 @@ fn raw_icmp_hdrincl_enabled(socket: &Cap<SocketIdentity>) -> bool {
     socket
         .acquire_operational()
         .is_some_and(|payload| payload.with_options(|options| options.ip.hdr_incl))
+}
+
+fn validate_udp_send_payload_len(socket: &Cap<SocketIdentity>, len: usize) -> Result<(), Errno> {
+    if socket.kind != SocketKind::Udp {
+        return Ok(());
+    }
+    let Some(payload) = socket.acquire_operational() else {
+        return Err(Errno::ENOTCONN);
+    };
+    if payload.udp_corked_send_len().saturating_add(len) > UDP_IPV4_MAX_PAYLOAD_BYTES {
+        return Err(Errno::EMSGSIZE);
+    }
+    Ok(())
 }
 
 fn validate_iovec_read_ranges<'a>(ctx: &SyscallCtx<'a>, iovecs: &[UserIovec]) -> Result<(), Errno> {

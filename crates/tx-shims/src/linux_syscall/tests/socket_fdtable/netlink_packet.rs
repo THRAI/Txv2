@@ -214,6 +214,30 @@ fn dispatch_packet_sendto_accepts_sockaddr_ll_loopback_destination() {
 }
 
 #[test]
+fn dispatch_packet_sendto_large_invalid_payload_checks_user_range() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_packet(&ctx);
+    let addr = sockaddr_ll(ETH_P_ALL, 1);
+
+    assert_eq!(
+        socket_req(
+            NR_SENDTO,
+            [
+                fd as u64,
+                1,
+                2 * 1024 * 1024,
+                0,
+                addr.as_ptr() as u64,
+                SOCKADDR_LL_BYTES as u64,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Error(errno_to_i32(Errno::EFAULT))
+    );
+}
+
+#[test]
 fn dispatch_unprivileged_socket_denies_net_raw_families() {
     let _setup = socket_setup();
     let process = bootstrap();
