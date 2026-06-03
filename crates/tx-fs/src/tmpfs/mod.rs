@@ -620,6 +620,8 @@ impl FsOps for Tmpfs {
         meta.uid = cred.uid;
         meta.gid = cred.gid;
         meta.size = link_target.len() as u64;
+        let mut target = Vec::with_capacity(link_target.len());
+        target.extend_from_slice(link_target);
 
         let mut state = self.state.lock();
         let Some(parent_inode) = state.inodes.get_mut(&parent) else {
@@ -633,8 +635,6 @@ impl FsOps for Tmpfs {
         }
         children.insert(inline, new_id);
 
-        let mut target = Vec::with_capacity(link_target.len());
-        target.extend_from_slice(link_target);
         state.inodes.insert(
             new_id,
             TmpfsInode {
@@ -710,14 +710,17 @@ impl FsOps for Tmpfs {
         fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<alloc::boxed::Box<[u8]>, NoProgress> {
-        let state = self.state.lock();
-        let Some(inode) = state.inodes.get(&fs_object_id) else {
-            return StepOutcome::err(step_engine::Errno::ENOENT);
+        let target = {
+            let state = self.state.lock();
+            let Some(inode) = state.inodes.get(&fs_object_id) else {
+                return StepOutcome::err(step_engine::Errno::ENOENT);
+            };
+            match &inode.payload {
+                TmpfsPayload::Symlink(bytes) => bytes.clone(),
+                _ => return StepOutcome::err(step_engine::Errno::EINVAL),
+            }
         };
-        match &inode.payload {
-            TmpfsPayload::Symlink(bytes) => StepOutcome::done(bytes.clone().into_boxed_slice()),
-            _ => StepOutcome::err(step_engine::Errno::EINVAL),
-        }
+        StepOutcome::done(target.into_boxed_slice())
     }
 
     /// Materialise a `Cap<RNode>` for a non-directory, non-symlink

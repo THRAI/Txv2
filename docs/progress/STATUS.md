@@ -1,3 +1,22 @@
+- 2026-06-03 **tmpfs symlink/readlink no longer allocate under the state lock.**
+  Moved symlink target buffer construction before the tmpfs state lock and
+  moved `read_link`'s `Box<[u8]>` conversion after the lock, leaving the lock
+  to cover only inode-table validation and publication. Added a focused
+  `tmpfs_read_link_returns_target_bytes` regression for the VFS-facing symlink
+  surface. Verification: `cargo test -p tx-fs
+  tmpfs_read_link_returns_target_bytes -- --nocapture`, `cargo test -p tx-fs
+  tmpfs_materialise_rnode_for_symlink_returns_einval -- --nocapture`, and
+  `cargo test -p tx-fs tmpfs -- --nocapture` passed. The attempted
+  `RUSTFLAGS="--cfg tx_lock_metrics --cfg tx_lock_metrics_fs" cargo xtask
+  observe oscomp-live --name tmpfs-lock-stdio-putcgetc-20260603 --test
+  stdio-putcgetc --timeout 300 --source-data target/oscomp/testdata` capture
+  reached libcbench group start but produced only
+  `target/oscomp/custom-run/tmpfs-lock-stdio-putcgetc-20260603/{serial.txt,names.json,host/trace.rawrecords}`
+  with no `runtime.json` or `report.json`; treat it as unusable lock evidence,
+  not a tmpfs contention result. Next step: continue filesystem SMP repair with
+  either a smaller usable tmpfs lock-metrics workload or the next backend
+  correctness/lock-service slice.
+
 - 2026-06-03 **No-scratch B+ malloc sparse-family performance measured.**
   Ran `malloc-vm` (`sparse`, `bubble`, `big1`, `big2`) under
   `RUSTFLAGS="--cfg tx_vm_recipe_bplus"`. The clean no-observe run at

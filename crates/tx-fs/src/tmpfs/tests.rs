@@ -586,6 +586,39 @@ fn tmpfs_materialise_rnode_for_symlink_returns_einval() {
     );
 }
 
+#[test]
+fn tmpfs_read_link_returns_target_bytes() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = guard();
+    let cred = Credential::root();
+
+    let (link_id, _) =
+        match tmpfs.symlink(TMPFS_ROOT_OBJECT_ID, b"link", b"target/path", &cred, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("symlink failed: {other:?}"),
+        };
+    let (file_id, _) =
+        match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"regular", 0o100644, &cred, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("create_inode failed: {other:?}"),
+        };
+
+    let target = match <Tmpfs as FsOps>::read_link(&*tmpfs, link_id, &guard) {
+        StepOutcome::Done(target) => target,
+        other => panic!("read_link failed: {other:?}"),
+    };
+    assert_eq!(target.as_ref(), b"target/path");
+    assert_eq!(
+        <Tmpfs as FsOps>::read_link(&*tmpfs, file_id, &guard),
+        StepOutcome::Err(Errno::EINVAL)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // `step_chmod` / `step_chown` tests (Wave 3 Part 2 of the DAC + setuid
 // slice). Validate the POSIX permission rules tmpfs enforces:
