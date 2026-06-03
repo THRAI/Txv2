@@ -523,6 +523,7 @@ pub(crate) fn map_format_error(err: Ext4FormatError) -> Errno {
         }
         Ext4FormatError::OutOfBounds => Errno::ENOENT,
         Ext4FormatError::Unsupported => Errno::ENOSYS,
+        Ext4FormatError::WouldBlock => Errno::EAGAIN,
     }
 }
 

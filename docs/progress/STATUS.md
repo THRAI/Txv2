@@ -1,3 +1,23 @@
+- 2026-06-03 **ext4/FAT block bridges preserve retryable device outcomes.**
+  Continued the filesystem SMP gap audit repair stream from
+  `docs/progress/research/2026-06-03-filesystem-smp-gap-audit.md`. The
+  PageBacked in-flight/lock-shrink, bdev-fs file-backed PC, and regular-file
+  dcache gaps were already addressed in the current tree, so this slice fixed
+  the still-open ext4/FAT bridge drift: block-device `Continue`/`Yield` no
+  longer collapse into format corruption/I/O errors. `tx-ext4-format` and
+  `tx-fat-format` now expose format-level `WouldBlock`; the kernel ext4/FAT
+  errno mappings translate it to `EAGAIN`, and the `tx-fs` ext4/FAT bridges
+  map retryable block-device outcomes to that value while preserving real
+  device errors as the existing `Truncated`/`IO` cases. Added bridge tests for
+  read and write paths over fake devices returning both `Continue` and
+  `Yield`. Verification: `cargo test -p tx-fs ext4_bridge_maps_retrying --
+  --nocapture`, `cargo test -p tx-fs fat_bridge_maps_retrying -- --nocapture`,
+  `cargo check -p tx-ext4-format -q`, `cargo check -p tx-fat-format -q`,
+  `cargo check -p tx-ext4 -q`, `cargo check -p tx-fat -q`, and `cargo check
+  -p tx-fs -q` passed. Next step: the synchronous format `BlockImage` trait
+  still cannot carry the original wait-source identity, so full async ext4/FAT
+  pager conversion remains a larger interface slice.
+
 - 2026-06-03 **VM recipe attribution observes are behind narrow cfg gates.**
   Normal VM recipe captures now keep the stable publish/reclaim counters needed
   for SQL comparisons (`publish.op`, `publish.touched_entries`,
