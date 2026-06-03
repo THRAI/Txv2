@@ -10,6 +10,20 @@
   and scoped `git diff --check` passed. Next step: add the bdev-fs
   PageContainer routing correctness test before wider filesystem SMP migration.
 
+- 2026-06-03 **bdev-fs block nodes now route through file PageContainers.**
+  Added a routing regression that materialises a block-device RNode, checks its
+  PageContainer is `File`-backed, and reads bytes through bdev-fs
+  `FsPageBacking` instead of anonymous zero pages. bdev-fs now creates
+  `PageContainer::new_file_cap(...)` for block-device nodes and keeps fetched
+  frames live across the `FsPageBacking` -> PageBacked handoff using the same
+  permanent-frame convention as ext4/FAT pagers. Verification: `cargo test -p
+  tx-fs materialised_block_device_rnode_reads_through_bdevfs_page_backing --
+  --nocapture`, `cargo test -p tx-fs bdevfs -- --nocapture`, `cargo check -p
+  tx-fs -q`, `cargo test -p tx-subsystems page_backed -- --nocapture`, scoped
+  `rustfmt --edition 2024 --check`, and scoped `git diff --check` passed. Next
+  step: continue the filesystem SMP gap plan with the next PageBacked-facing
+  backend correctness slice.
+
 - 2026-06-03 **PageBacked materialization state-lock service shrunk.**
   Moved cold anon/file page frame allocation and `MapPin` acquisition out of
   the `PageContainer.state` critical section. Hot cached materialization now

@@ -44,15 +44,14 @@ use alloc::sync::Arc;
 pub mod adapter;
 
 use adapter::step_engine::{
-    self as step_engine, page_allocator, Cap, NoProgress, SpinMutex, StepOutcome, Weak, ZeroPolicy,
+    self as step_engine, Cap, NoProgress, PayloadCap, SpinMutex, StepOutcome, Weak, ZeroPolicy,
+    page_allocator,
 };
 
 use tx_subsystems::device::{self, BlockDeviceHandle, DevT};
 use tx_subsystems::execution::{Errno, Guard};
-use tx_subsystems::mount::MountPayload;
-use tx_subsystems::page_backed::{
-    AnonSwapPolicy, Frame, FsPageBacking, PageContainer, PageContainerKind,
-};
+use tx_subsystems::mount::{MountPayload, MountPayloadPin};
+use tx_subsystems::page_backed::{Frame, FsPageBacking, PageContainer};
 use tx_subsystems::vfs::{
     Credential, DirCursor, DirEntry, FsObjectId, FsOps, InodeKind, InodeMeta, RNode, RNodeBacking,
     S_IFBLK, S_IFDIR,
@@ -168,34 +167,41 @@ impl BdevFsMountPayload {
         &self,
         devt: DevT,
         reg: &device::BlockDeviceRegistration,
+        fs_object_id: FsObjectId,
+        mount: &Cap<MountPayload>,
         guard: &Guard<'_>,
     ) -> Result<Cap<PageContainer>, Errno> {
+        {
+            let mut index = self.coherence.lock();
+            if let Some(weak) = index.get(&devt) {
+                if let Some(cap) = weak.upgrade(guard) {
+                    return Ok(cap);
+                }
+                // Weak failed — PC was reclaimed. Fall through to create a
+                // new one outside the coherence lock.
+                index.remove(&devt);
+            }
+        }
+
+        let block_size = reg.ops.block_size() as u64;
+        let total_bytes = reg.ops.total_blocks().saturating_mul(block_size);
+        let new_pc = PageContainer::new_file_cap(
+            MountPayloadPin::acquire(&PayloadCap::from_cap(mount.clone())),
+            fs_object_id,
+            total_bytes,
+        )
+        .map_err(|_| Errno::ENOMEM)?;
+
         let mut index = self.coherence.lock();
         if let Some(weak) = index.get(&devt) {
             if let Some(cap) = weak.upgrade(guard) {
                 return Ok(cap);
             }
-            // Weak failed — PC was reclaimed.  Fall through to
-            // create a new one.
             index.remove(&devt);
         }
 
-        let block_size = reg.ops.block_size() as u64;
-        let total_bytes = reg.ops.total_blocks().saturating_mul(block_size);
-        let page_size = tx_subsystems::vm::USER_PAGE_SIZE as u64;
-        let page_count = total_bytes.div_ceil(page_size);
-
-        let pc = PageContainer::new_cap(
-            PageContainerKind::Anon {
-                swap_policy: AnonSwapPolicy::Reclaimable,
-            },
-            page_count,
-        )
-        .map_err(|_| Errno::ENOMEM)?;
-
-        let weak = pc.downgrade();
-        index.insert(devt, weak);
-        Ok(pc)
+        index.insert(devt, new_pc.downgrade());
+        Ok(new_pc)
     }
 }
 
@@ -343,7 +349,7 @@ impl FsOps for BdevFsMountPayload {
 
         // Per txdoc:BDEV-FS-COHERENCE-1: reuse the existing
         // PageContainer when one is still live for this devt.
-        let container = match self.get_or_create_pc(devt, reg, guard) {
+        let container = match self.get_or_create_pc(devt, reg, fs_object_id, mount, guard) {
             Ok(pc) => pc,
             Err(e) => return StepOutcome::err(e.into()),
         };
@@ -556,11 +562,7 @@ impl FsPageBacking for BdevFsMountPayload {
                     return StepOutcome::err(Errno::EIO.into());
                 }
             }
-            let _cache_pin = match owned.try_cache_pin() {
-                Ok(p) => p,
-                Err(_) => return StepOutcome::err(Errno::ENOMEM.into()),
-            };
-            drop(owned);
+            let _permanent = owned.into_permanent_frame();
             StepOutcome::done(frames[0])
         } else {
             let target_owned = match allocate_owned_page() {
@@ -611,12 +613,8 @@ impl FsPageBacking for BdevFsMountPayload {
                 drop(temp_owned);
             }
 
-            let _cache_pin = match target_owned.try_cache_pin() {
-                Ok(p) => p,
-                Err(_) => return StepOutcome::err(Errno::ENOMEM.into()),
-            };
             let target_frame = Frame::new(target_ppn);
-            drop(target_owned);
+            let _permanent = target_owned.into_permanent_frame();
             StepOutcome::done(target_frame)
         }
     }
@@ -805,16 +803,14 @@ impl FsOps for BdevFs {
             return StepOutcome::err(Errno::ENOENT.into());
         };
 
-        let block_size = reg.ops.block_size() as u64;
-        let total_bytes = reg.ops.total_blocks().saturating_mul(block_size);
-        let page_size = tx_subsystems::vm::USER_PAGE_SIZE as u64;
-        let page_count = total_bytes.div_ceil(page_size);
-
-        let container = match PageContainer::new_cap(
-            PageContainerKind::Anon {
-                swap_policy: AnonSwapPolicy::Reclaimable,
-            },
-            page_count,
+        let total_bytes = reg
+            .ops
+            .total_blocks()
+            .saturating_mul(reg.ops.block_size() as u64);
+        let container = match PageContainer::new_file_cap(
+            MountPayloadPin::acquire(&PayloadCap::from_cap(mount.clone())),
+            fs_object_id,
+            total_bytes,
         ) {
             Ok(c) => c,
             Err(_) => return StepOutcome::err(Errno::ENOMEM.into()),
@@ -1022,11 +1018,7 @@ impl FsPageBacking for BdevFs {
                     return StepOutcome::err(Errno::EIO.into());
                 }
             }
-            let _cache_pin = match owned.try_cache_pin() {
-                Ok(p) => p,
-                Err(_) => return StepOutcome::err(Errno::ENOMEM.into()),
-            };
-            drop(owned);
+            let _permanent = owned.into_permanent_frame();
             StepOutcome::done(frames[0])
         } else {
             let target_owned = match allocate_owned_page() {
@@ -1077,12 +1069,8 @@ impl FsPageBacking for BdevFs {
                 drop(temp_owned);
             }
 
-            let _cache_pin = match target_owned.try_cache_pin() {
-                Ok(p) => p,
-                Err(_) => return StepOutcome::err(Errno::ENOMEM.into()),
-            };
             let target_frame = Frame::new(target_ppn);
-            drop(target_owned);
+            let _permanent = target_owned.into_permanent_frame();
             StepOutcome::done(target_frame)
         }
     }
@@ -1218,11 +1206,7 @@ fn allocate_zeroed_page() -> StepOutcome<Frame, NoProgress> {
         None => return StepOutcome::err(Errno::ENOMEM.into()),
     };
     let ppn = owned.ppn();
-    let _pin = match owned.try_cache_pin() {
-        Ok(p) => p,
-        Err(_) => return StepOutcome::err(Errno::ENOMEM.into()),
-    };
-    drop(owned);
+    let _permanent = owned.into_permanent_frame();
     StepOutcome::done(Frame::new(ppn))
 }
 
@@ -1235,4 +1219,133 @@ fn allocate_owned_page() -> Option<
     page_allocator::reserve_frame(ZeroPolicy::Zeroed)
         .ok()
         .map(|r| r.commit())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tx_subsystems::device::{BlockDevice, BlockDeviceOps, PhysicalBlockNumber};
+    use tx_subsystems::mount::{DevId, MountOptions, SourceLabel};
+    use tx_subsystems::page_backed::{PageContainerKind, read_exact_at};
+
+    struct PatternBlockDevice;
+
+    impl BlockDeviceOps for PatternBlockDevice {
+        fn read_blocks(
+            &self,
+            block_id: PhysicalBlockNumber,
+            target: &mut [Frame],
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<(), NoProgress> {
+            for (slot, frame) in target.iter().enumerate() {
+                let mut bytes = [0u8; 16];
+                bytes[..8].copy_from_slice(b"bdevfs!\0");
+                bytes[8..16].copy_from_slice(&(block_id.as_u64() + slot as u64).to_le_bytes());
+                tx_substrate::page_allocator::testing::write_frame_bytes_for_test(
+                    frame.ppn(),
+                    0,
+                    &bytes,
+                );
+            }
+            StepOutcome::done(())
+        }
+
+        fn write_blocks(
+            &self,
+            _block_id: PhysicalBlockNumber,
+            _source: &[Frame],
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<(), NoProgress> {
+            StepOutcome::done(())
+        }
+
+        fn barrier(&self, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
+            StepOutcome::done(())
+        }
+    }
+
+    impl BlockDevice for PatternBlockDevice {
+        fn total_blocks(&self) -> u64 {
+            8
+        }
+
+        fn block_size(&self) -> u32 {
+            tx_subsystems::vm::USER_PAGE_SIZE as u32
+        }
+    }
+
+    static PATTERN_DEVICE: PatternBlockDevice = PatternBlockDevice;
+    static PATTERN_REG: device::BlockDeviceRegistration = device::BlockDeviceRegistration {
+        devt: DevT::new(8, 64),
+        name: "vdr",
+        ops: &PATTERN_DEVICE,
+    };
+    static PATTERN_REGS: &[&device::BlockDeviceRegistration] = &[&PATTERN_REG];
+
+    fn init_bdevfs_test() {
+        tx_test_support::init_host();
+        tx_subsystems::zones::register_all().expect("tx-subsystems zones");
+        match page_allocator::claim_zero_frame() {
+            Ok(_) | Err(page_allocator::AllocError::AlreadyInstalled) => {}
+            Err(error) => panic!("claim zero frame for bdevfs tests: {error:?}"),
+        }
+        device::reset_block_registry_for_test();
+        assert_eq!(
+            device::register_block_devices(PATTERN_REGS),
+            StepOutcome::Done(())
+        );
+    }
+
+    fn bdevfs_mount_payload(bdevfs: &Arc<BdevFsMountPayload>) -> Cap<MountPayload> {
+        MountPayload::new_cap(
+            bdevfs.fs_ops_arc(),
+            bdevfs.fs_page_backing_arc(),
+            None,
+            DevId::new(64),
+            MountOptions::default(),
+            "bdev",
+            SourceLabel::Static("bdevfs-test"),
+        )
+        .expect("bdevfs test mount payload")
+    }
+
+    #[test]
+    fn materialised_block_device_rnode_reads_through_bdevfs_page_backing() {
+        let _serial = crate::test_support::FS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        init_bdevfs_test();
+        let guard = step_engine::guard();
+        let bdevfs = Arc::new(BdevFsMountPayload::new());
+        let mount = bdevfs_mount_payload(&bdevfs);
+
+        let fs_object_id = match bdevfs.lookup(BDEVFS_ROOT_ID, b"vdr", &guard) {
+            StepOutcome::Done(id) => id,
+            other => panic!("lookup vdr failed: {other:?}"),
+        };
+        let meta = match bdevfs.load_inode_meta(fs_object_id, &guard) {
+            StepOutcome::Done(meta) => meta,
+            other => panic!("load_inode_meta vdr failed: {other:?}"),
+        };
+        let rnode = match bdevfs.materialise_rnode(fs_object_id, meta, &mount, &guard) {
+            StepOutcome::Done(rnode) => rnode,
+            other => panic!("materialise_rnode vdr failed: {other:?}"),
+        };
+        let RNodeBacking::PageBacked { pc } = rnode.backing() else {
+            panic!("bdevfs block devices must materialise as page-backed rnodes");
+        };
+        assert!(
+            matches!(pc.kind(), PageContainerKind::File { .. }),
+            "block-device PageContainers must route misses through bdevfs FsPageBacking"
+        );
+
+        let mut bytes = [0u8; 16];
+        match read_exact_at(pc, 0, &mut bytes, &guard) {
+            StepOutcome::Done(()) => {}
+            other => panic!("read_exact_at from bdevfs PC failed: {other:?}"),
+        }
+
+        assert_eq!(&bytes[..8], b"bdevfs!\0");
+        assert_eq!(u64::from_le_bytes(bytes[8..16].try_into().unwrap()), 0);
+    }
 }
