@@ -13,8 +13,8 @@ use crate::ipc::sysv_shm::structure::{self, IpcPerm, ShmAttach};
 use crate::process::adapter::step_engine::Cap;
 use crate::process::nsproxy::SysvKey;
 use crate::vm::{
-    AddressSpace, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntryFlags, VmMapError,
-    VmMapRequest, USER_PAGE_SIZE,
+    AddressSpace, MapPlacement, Prot, USER_PAGE_SIZE, UserRange, UserVirtAddr, VmBacking,
+    VmEntryFlags, VmMapError, VmMapRequest,
 };
 
 // ---------------------------------------------------------------------------
@@ -176,7 +176,7 @@ pub async fn script_shmat(
         (false, false) => Prot::READ_WRITE,
     };
     let backing = VmBacking::Page {
-        pc: segment.payload.page_container.clone(),
+        pc: segment.payload.page_container.clone().into(),
         offset: 0,
     };
     let request = if rounded_addr == 0 {
@@ -231,12 +231,12 @@ pub async fn script_shmdt(shmaddr: usize, aspace: &Cap<AddressSpace>) -> Result<
     if entry.range.start().as_usize() != shmaddr || !entry.flags.shared {
         return Err(Errno::EINVAL);
     }
-    let VmBacking::Page { pc: entry_pc, .. } = entry.backing else {
+    let Some((entry_pc, _)) = entry.page_backing() else {
         return Err(Errno::EINVAL);
     };
     let mut found = None;
     for segment in structure::all_shm_segments() {
-        if segment.payload.page_container != entry_pc {
+        if segment.payload.page_container != *entry_pc {
             continue;
         }
         let mut attaches = segment.payload.attaches.lock();

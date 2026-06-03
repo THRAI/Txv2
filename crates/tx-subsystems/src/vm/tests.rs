@@ -209,19 +209,17 @@ fn page_backing(offset: u64) -> VmBacking {
             },
             16,
         )
-        .expect("page container cap"),
+        .expect("page container cap")
+        .into(),
         offset,
     }
 }
 
-fn page_backing_like(backing: &VmBacking, offset: u64) -> VmBacking {
-    let VmBacking::Page { pc, .. } = backing else {
+fn page_backing_like_entry(entry: &VmEntry, offset: u64) -> VmBacking {
+    let VmBacking::Page { pc, .. } = entry.backing() else {
         panic!("expected page backing");
     };
-    VmBacking::Page {
-        pc: pc.clone(),
-        offset,
-    }
+    VmBacking::Page { pc, offset }
 }
 
 fn range(start: usize, pages: usize) -> UserRange {
@@ -299,7 +297,7 @@ fn vm_entry_split_for_unmap_preserves_survivors_and_offsets() {
             range(0x1000, 1),
             Prot::READ_WRITE,
             VmEntryFlags::PRIVATE,
-            page_backing_like(&entry.backing, 10),
+            page_backing_like_entry(&entry, 10),
         )
     );
     assert_eq!(
@@ -308,7 +306,7 @@ fn vm_entry_split_for_unmap_preserves_survivors_and_offsets() {
             range(0x4000, 1),
             Prot::READ_WRITE,
             VmEntryFlags::PRIVATE,
-            page_backing_like(&entry.backing, 10 + (3 * USER_PAGE_SIZE) as u64),
+            page_backing_like_entry(&entry, 10 + (3 * USER_PAGE_SIZE) as u64),
         )
     );
     assert_eq!(rewrite.target, None);
@@ -334,6 +332,195 @@ fn vm_entry_split_for_protect_rewrites_middle_only() {
         entry.split_for_protect(range(0x4000, 1), Prot::READ),
         Err(VmEntryError::RangeNotContained)
     );
+}
+
+#[test]
+fn vm_entry_split_without_private_pages_reuses_owner_bundle() {
+    let entry = VmEntry::new(
+        range(0x1000, 3),
+        Prot::READ_WRITE,
+        VmEntryFlags::SHARED,
+        page_backing(0),
+    );
+    let (pc, _) = entry.page_backing().expect("expected page backing");
+    let retain_before = pc.retain_count();
+    let owner_count_before = entry.debug_owner_strong_count();
+
+    let rewrite = entry
+        .split_for_protect(range(0x2000, 1), Prot::READ)
+        .expect("target is inside entry");
+
+    let before = rewrite.before.as_ref().expect("before");
+    let target = rewrite.target.as_ref().expect("target");
+    let after = rewrite.after.as_ref().expect("after");
+    let expected_owner_count = owner_count_before + 3;
+    assert_eq!(entry.debug_owner_strong_count(), expected_owner_count);
+    assert_eq!(before.debug_owner_strong_count(), expected_owner_count);
+    assert_eq!(target.debug_owner_strong_count(), expected_owner_count);
+    assert_eq!(after.debug_owner_strong_count(), expected_owner_count);
+    assert_eq!(
+        pc.retain_count(),
+        retain_before,
+        "split rewrites should copy hot metadata without retaining the heavy PageContainer cap"
+    );
+}
+
+#[test]
+fn vm_entry_split_with_private_pages_keeps_isolated_owner_bundles() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            range(0x1000, 3),
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("private map");
+    let entry = aspace.lookup(UserVirtAddr(0x1000)).expect("mapped entry");
+    let original_private = entry.private_identity().expect("private set");
+    let owner_count_before = entry.debug_owner_strong_count();
+
+    let rewrite = entry
+        .split_for_protect(range(0x2000, 1), Prot::READ)
+        .expect("target is inside entry");
+
+    let before = rewrite.before.as_ref().expect("before");
+    let target = rewrite.target.as_ref().expect("target");
+    let after = rewrite.after.as_ref().expect("after");
+    assert_eq!(
+        entry.debug_owner_strong_count(),
+        owner_count_before,
+        "private splits must not share the parent owner bundle"
+    );
+    assert_eq!(before.debug_owner_strong_count(), 1);
+    assert_eq!(target.debug_owner_strong_count(), 1);
+    assert_eq!(after.debug_owner_strong_count(), 1);
+    assert_ne!(before.private_identity(), Some(original_private));
+    assert_eq!(target.private_identity(), None);
+    assert_ne!(after.private_identity(), Some(original_private));
+}
+
+#[test]
+fn vm_entry_split_with_private_page_backing_does_not_retain_page_cap() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            range(0x1000, 3),
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            page_backing(0),
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("private map");
+    let entry = aspace.lookup(UserVirtAddr(0x1000)).expect("mapped entry");
+    let (pc, _) = entry.page_backing().expect("expected page backing");
+    let retain_before = pc.retain_count();
+
+    let rewrite = entry
+        .split_for_protect(range(0x2000, 1), Prot::READ)
+        .expect("target is inside entry");
+
+    assert!(rewrite.before.is_some());
+    assert!(rewrite.target.is_some());
+    assert!(rewrite.after.is_some());
+    assert_eq!(
+        pc.retain_count(),
+        retain_before,
+        "private page-backed splits should not retain the heavy PageContainer cap for each replacement"
+    );
+}
+
+#[test]
+fn vm_entry_clone_does_not_retain_page_backing_cap() {
+    let entry = VmEntry::new(
+        range(0x1000, 1),
+        Prot::READ,
+        VmEntryFlags::SHARED,
+        page_backing(0),
+    );
+    let (pc, _) = entry.page_backing().expect("expected page backing");
+    let retain_before = pc.retain_count();
+
+    let cloned = entry.clone();
+
+    assert_eq!(
+        pc.retain_count(),
+        retain_before,
+        "VmEntry clone should copy hot metadata without retaining the heavy PageContainer cap"
+    );
+    drop(cloned);
+    assert_eq!(pc.retain_count(), retain_before);
+}
+
+#[test]
+fn vm_entry_clone_does_not_retain_private_page_set_cap() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let entry = VmEntry::new(
+        range(0x1000, 1),
+        Prot::READ_WRITE,
+        VmEntryFlags::PRIVATE,
+        VmBacking::PrivateAnon,
+    );
+    map_reserved(aspace.reserve_map(entry, MapPlacement::RequireFree))
+        .commit()
+        .expect("private map");
+    let mapped = aspace.lookup(UserVirtAddr(0x1000)).expect("mapped entry");
+    let private = mapped.private().expect("private set");
+    let retain_before = private.retain_count();
+
+    let cloned = mapped.clone();
+
+    assert_eq!(
+        private.retain_count(),
+        retain_before,
+        "VmEntry clone should copy hot metadata without retaining the heavy PrivatePageSet cap"
+    );
+    drop(cloned);
+    assert_eq!(private.retain_count(), retain_before);
+}
+
+#[test]
+fn vm_entry_clone_shares_one_owner_handle_for_heavy_caps() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let entry = VmEntry::new(
+        range(0x1000, 1),
+        Prot::READ_WRITE,
+        VmEntryFlags::PRIVATE,
+        page_backing(0),
+    );
+    map_reserved(aspace.reserve_map(entry, MapPlacement::RequireFree))
+        .commit()
+        .expect("private page-backed map");
+    let mapped = aspace.lookup(UserVirtAddr(0x1000)).expect("mapped entry");
+    let (pc, _) = mapped.page_backing().expect("expected page backing");
+    let private = mapped.private().expect("private set");
+    let pc_retain_before = pc.retain_count();
+    let private_retain_before = private.retain_count();
+    let owner_count_before = mapped.debug_owner_strong_count();
+
+    let cloned = mapped.clone();
+
+    assert_eq!(
+        mapped.debug_owner_strong_count(),
+        owner_count_before + 1,
+        "VmEntry clone should add one shared owner-bundle reference instead of cloning each heavy capability slot"
+    );
+    assert_eq!(cloned.debug_owner_strong_count(), owner_count_before + 1);
+    assert_eq!(pc.retain_count(), pc_retain_before);
+    assert_eq!(private.retain_count(), private_retain_before);
+    drop(cloned);
+    assert_eq!(mapped.debug_owner_strong_count(), owner_count_before);
+    assert_eq!(pc.retain_count(), pc_retain_before);
+    assert_eq!(private.retain_count(), private_retain_before);
 }
 
 #[test]
@@ -363,6 +550,64 @@ fn vm_address_space_map_reservation_publishes_recipe_on_commit() {
             recipe_count: 1,
             vm_size: 2 * USER_PAGE_SIZE,
         }
+    );
+}
+
+#[test]
+fn vm_recipe_reclaim_defers_old_root_destruction_until_vm_drain() {
+    setup_host_substrate();
+    crate::vm::reset_debug_phase_totals();
+    while crate::vm::structure::drain_deferred_recipe_reclaims(usize::MAX) != 0 {}
+
+    let aspace = AddressSpace::new();
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            range(0x4000, 2),
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("initial map");
+    let before = crate::vm::structure::recipe_debug_totals();
+
+    for _ in 0..8 {
+        let _ = tx_test_support::drain_once_unbounded();
+        if crate::vm::structure::deferred_recipe_reclaim_len_for_test() != 0 {
+            break;
+        }
+    }
+
+    assert_eq!(
+        crate::vm::structure::deferred_recipe_reclaim_len_for_test(),
+        1,
+        "EBR callback should enqueue the old recipe root instead of dropping it inline"
+    );
+    let after_ebr = crate::vm::structure::recipe_debug_totals();
+    assert_eq!(
+        after_ebr.deferred_reclaim_enqueued,
+        before.deferred_reclaim_enqueued + 1
+    );
+    assert_eq!(
+        after_ebr.deferred_reclaim_drained,
+        before.deferred_reclaim_drained
+    );
+    assert_eq!(
+        after_ebr.deferred_reclaim_inline_fallback,
+        before.deferred_reclaim_inline_fallback
+    );
+
+    assert_eq!(crate::vm::drain_deferred_recipe_reclaims(1), 1);
+    assert_eq!(
+        crate::vm::structure::deferred_recipe_reclaim_len_for_test(),
+        0
+    );
+    let after_drain = crate::vm::structure::recipe_debug_totals();
+    assert_eq!(
+        after_drain.deferred_reclaim_drained,
+        after_ebr.deferred_reclaim_drained + 1
     );
 }
 
@@ -603,15 +848,15 @@ fn vm_recipe_mid_vma_protect_uses_single_splice_path() {
         ]
     );
     assert!(matches!(
-        split[0].backing,
-        VmBacking::Page { offset: 0, .. }
+        split[0].backing_kind(),
+        VmEntryBacking::Page { offset: 0 }
     ));
-    match split[1].backing {
-        VmBacking::Page { offset, .. } => assert_eq!(offset, 5 * USER_PAGE_SIZE as u64),
+    match split[1].backing_kind() {
+        VmEntryBacking::Page { offset } => assert_eq!(offset, 5 * USER_PAGE_SIZE as u64),
         _ => panic!("target backing should stay page-backed"),
     }
-    match split[2].backing {
-        VmBacking::Page { offset, .. } => assert_eq!(offset, 10 * USER_PAGE_SIZE as u64),
+    match split[2].backing_kind() {
+        VmEntryBacking::Page { offset } => assert_eq!(offset, 10 * USER_PAGE_SIZE as u64),
         _ => panic!("tail backing should stay page-backed"),
     }
     let touched = aspace.recipes.debug_last_publish_touched_entries();
@@ -644,9 +889,10 @@ fn vm_recipe_lookup_view_borrows_published_entry() {
     assert_eq!(view.range, entry.range);
     assert_eq!(view.prot, entry.prot);
     assert_eq!(view.flags, entry.flags);
-    assert_eq!(view.backing, &entry.backing);
+    assert_eq!(view.backing, entry.backing_kind());
     assert_eq!(view.ufd_registration, entry.ufd_registration);
     assert!(view.private.is_none());
+    assert!(view.page.is_some());
     assert!(view.permits_fault(AccessMode::Read));
 }
 
@@ -876,7 +1122,7 @@ fn vm_address_space_fixed_map_replaces_overlap_and_preserves_survivors() {
             range(0x1000, 1),
             Prot::READ_WRITE,
             VmEntryFlags::SHARED,
-            page_backing_like(&original.backing, 0),
+            page_backing_like_entry(&original, 0),
         ))
     );
     assert_eq!(aspace.lookup(UserVirtAddr(0x2000)), Some(replacement));
@@ -886,7 +1132,7 @@ fn vm_address_space_fixed_map_replaces_overlap_and_preserves_survivors() {
             range(0x4000, 1),
             Prot::READ_WRITE,
             VmEntryFlags::SHARED,
-            page_backing_like(&original.backing, (3 * USER_PAGE_SIZE) as u64),
+            page_backing_like_entry(&original, (3 * USER_PAGE_SIZE) as u64),
         ))
     );
     assert_eq!(
@@ -939,14 +1185,14 @@ fn vm_recipe_snapshot_reader_survives_split_rewrite_publication() {
                 range(0x1000, 1),
                 Prot::READ_WRITE,
                 VmEntryFlags::SHARED,
-                page_backing_like(&original.backing, 0),
+                page_backing_like_entry(&original, 0),
             ),
             replacement,
             VmEntry::new(
                 range(0x4000, 1),
                 Prot::READ_WRITE,
                 VmEntryFlags::SHARED,
-                page_backing_like(&original.backing, (3 * USER_PAGE_SIZE) as u64),
+                page_backing_like_entry(&original, (3 * USER_PAGE_SIZE) as u64),
             ),
         ]
     );
@@ -1092,7 +1338,7 @@ fn vm_private_anon_prot_none_allocates_private_set_only_when_made_writable() {
         aspace
             .lookup(UserVirtAddr(0x1000))
             .expect("prot-none entry")
-            .private
+            .private()
             .is_none(),
         "PROT_NONE private anon mappings should not allocate an empty private set"
     );
@@ -1106,7 +1352,7 @@ fn vm_private_anon_prot_none_allocates_private_set_only_when_made_writable() {
         aspace
             .lookup(UserVirtAddr(0x1000))
             .expect("left guard")
-            .private
+            .private()
             .is_none(),
         "left guard remains set-less"
     );
@@ -1114,7 +1360,7 @@ fn vm_private_anon_prot_none_allocates_private_set_only_when_made_writable() {
         aspace
             .lookup(UserVirtAddr(0x2000))
             .expect("writable body")
-            .private
+            .private()
             .is_some(),
         "writable private anon body gets a private set before write faults"
     );
@@ -1122,7 +1368,7 @@ fn vm_private_anon_prot_none_allocates_private_set_only_when_made_writable() {
         aspace
             .lookup(UserVirtAddr(0x4000))
             .expect("right guard")
-            .private
+            .private()
             .is_none(),
         "right guard remains set-less"
     );
@@ -1299,7 +1545,7 @@ fn vm_checks_require_fault_publication_rejects_stale_recipe_and_page() {
     );
     assert_eq!(
         super::checks::require_fault_publication(&aspace, &outcome, &materialized),
-        Ok(entry)
+        Ok(())
     );
 
     aspace
@@ -1314,6 +1560,39 @@ fn vm_checks_require_fault_publication_rejects_stale_recipe_and_page() {
     assert_eq!(
         super::checks::require_fault_publication(&aspace, &outcome, &materialized),
         Err(VmFaultError::StaleRecipe)
+    );
+}
+
+#[test]
+fn vm_checks_require_fault_publication_does_not_clone_recipe_entry() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            range(0x3000, 1),
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("map");
+    let outcome = aspace
+        .resolve_fault(VmFault::new(UserVirtAddr(0x3000), AccessMode::Read))
+        .expect("fault resolves");
+    let materialized = outcome
+        .materialize_pagebacked()
+        .expect("private anon materialization");
+    let owner_count_before = outcome.entry.debug_owner_strong_count();
+
+    super::checks::require_fault_publication(&aspace, &outcome, &materialized)
+        .expect("publication still valid");
+
+    assert_eq!(
+        outcome.entry.debug_owner_strong_count(),
+        owner_count_before,
+        "publication validation should borrow the current recipe instead of cloning its owner bundle"
     );
 }
 
@@ -1515,7 +1794,7 @@ fn address_space_cap_maps_cap_backed_page_container() {
             Prot::READ_WRITE,
             VmEntryFlags::SHARED,
             VmBacking::Page {
-                pc: pc.clone(),
+                pc: pc.clone().into(),
                 offset: USER_PAGE_SIZE as u64,
             },
         ))
@@ -1524,8 +1803,8 @@ fn address_space_cap_maps_cap_backed_page_container() {
     assert_eq!(outcome.range, range);
     let entry = aspace.lookup(range.start()).expect("mapped recipe");
     assert!(matches!(
-        entry.backing,
-        VmBacking::Page { offset, .. } if offset == USER_PAGE_SIZE as u64
+        entry.backing_kind(),
+        VmEntryBacking::Page { offset } if offset == USER_PAGE_SIZE as u64
     ));
 }
 

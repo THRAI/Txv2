@@ -288,7 +288,10 @@ pub(super) async fn sys_mmap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRes
                 Ok(pc) => pc,
                 Err(_) => return SyscallResult::Error(errno_to_i32(Errno::ENOMEM)),
             };
-            VmBacking::Page { pc, offset: 0 }
+            VmBacking::Page {
+                pc: pc.into(),
+                offset: 0,
+            }
         } else {
             VmBacking::PrivateAnon
         }
@@ -301,7 +304,10 @@ pub(super) async fn sys_mmap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRes
             None => return SyscallResult::Error(EBADF_VALUE),
         };
         match extract_page_container(&file) {
-            Some(pc) => VmBacking::Page { pc, offset },
+            Some(pc) => VmBacking::Page {
+                pc: pc.into(),
+                offset,
+            },
             None => return SyscallResult::error_from(Errno::ENODEV),
         }
     };
@@ -1001,7 +1007,7 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
             use tx_scripts::drive;
             use tx_substrate::step::Deadline;
             use tx_substrate::step::DriveMode;
-            use tx_subsystems::futex::{FutexWaitOp, FUTEX_WAKE_MASK};
+            use tx_subsystems::futex::{FUTEX_WAKE_MASK, FutexWaitOp};
 
             if uaddr == 0 {
                 return SyscallResult::error_from(Errno::EINVAL);

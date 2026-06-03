@@ -36,19 +36,20 @@ pub use execution::{
 };
 pub use pmap::{PmapMappingSnapshot, PmapPublishOutcome, PmapStats, VmPmapError};
 pub use scripts::{
-    build_aspace_from_image, populate_detached_user_range, BssTail, ImagePlan, LoadSegment,
-    ScriptError, SegmentFlags, USER_STACK_INITIAL_RESERVATION, USER_STACK_TOP_DEFAULT,
+    BssTail, ImagePlan, LoadSegment, ScriptError, SegmentFlags, USER_STACK_INITIAL_RESERVATION,
+    USER_STACK_TOP_DEFAULT, build_aspace_from_image, populate_detached_user_range,
 };
 pub use structure::{
-    AccessMode, AcquirePairResult, AcquireResult, AddressSpace, AddressSpaceStats, LockMode,
-    MapPlacement, PendingWriter, PrivateFrame, PrivateFrameIdentity, PrivateFrameSnapshot,
-    PrivateFrameState, PrivatePageError, PrivatePageSet, Prot, RangeGuard, RangeGuardPair,
-    RangeLock, UfdRegistration, UserPage, UserPageIter, UserRange, UserRangeError, UserVirtAddr,
-    VmBacking, VmEntry, VmEntryError, VmEntryFlags, VmEntryRewrite, VmFault, VmFaultError,
-    VmFaultMaterialization, VmFaultMaterializationBacking, VmFaultMaterializationStep,
-    VmFaultOutcome, VmMapCommit, VmMapError, VmMapOutcome, VmMapRequest, VmMapTarget, VmPageOff,
-    VmRemapOutcome, VmRemapPlacement, VmRemapRequest, WouldBlock, FULL_USER_V1_TOP,
-    RANGE_LOCK_RELEASE_MASK, USER_PAGE_SIZE,
+    AccessMode, AcquirePairResult, AcquireResult, AddressSpace, AddressSpaceStats,
+    FULL_USER_V1_TOP, LockMode, MapPlacement, PendingWriter, PrivateFrame, PrivateFrameIdentity,
+    PrivateFrameSnapshot, PrivateFrameState, PrivatePageError, PrivatePageSet, Prot,
+    RANGE_LOCK_RELEASE_MASK, RangeGuard, RangeGuardPair, RangeLock, USER_PAGE_SIZE,
+    UfdRegistration, UserPage, UserPageIter, UserRange, UserRangeError, UserVirtAddr, VmBacking,
+    VmCap, VmEntry, VmEntryBacking, VmEntryError, VmEntryFlags, VmEntryProtectRewrite,
+    VmEntryRewrite, VmFault, VmFaultError, VmFaultMaterialization, VmFaultMaterializationBacking,
+    VmFaultMaterializationStep, VmFaultOutcome, VmMapCommit, VmMapError, VmMapOutcome,
+    VmMapRequest, VmMapTarget, VmPageOff, VmRemapOutcome, VmRemapPlacement, VmRemapRequest,
+    WouldBlock,
 };
 pub use user_access::UserAccessKind;
 
@@ -56,6 +57,16 @@ pub fn reset_debug_phase_totals() {
     structure::reset_private_page_debug_totals();
     structure::reset_recipe_debug_totals();
     pmap::reset_pmap_debug_totals();
+}
+
+/// Drop recipe roots that EBR has already proven unreachable.
+///
+/// Recipe EBR callbacks only enqueue old immutable roots; draining here moves
+/// the potentially expensive tree destruction into explicit VM maintenance
+/// batches. Delaying the drop is conservative for reader safety because EBR has
+/// already completed before an item enters this queue.
+pub fn drain_deferred_recipe_reclaims(limit: usize) -> usize {
+    structure::drain_deferred_recipe_reclaims(limit)
 }
 
 pub fn dump_debug_phase_totals<P: tx_hal::ConsoleIf>() {
@@ -117,6 +128,12 @@ pub fn dump_debug_phase_totals<P: tx_hal::ConsoleIf>() {
             ("max_ns", recipe.reclaim_max_ns),
             ("node_total", recipe.reclaim_node_total),
             ("node_max", recipe.reclaim_node_max),
+            ("deferred_enqueued", recipe.deferred_reclaim_enqueued),
+            ("deferred_drained", recipe.deferred_reclaim_drained),
+            (
+                "deferred_inline_fallback",
+                recipe.deferred_reclaim_inline_fallback,
+            ),
         ],
     );
 

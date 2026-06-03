@@ -1,5 +1,8 @@
 //! VM public value vocabulary.
 
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+
 use crate::page_backed::{
     MaterializeAccess, MaterializedPage, MaterializedPagePin, PageCacheError, PageContainer,
     PageIndex,
@@ -12,8 +15,8 @@ use super::private::{
     PrivatePageSet, VmPageOff,
 };
 use crate::execution::WaitToken;
-use crate::vm::adapter::step_engine::{self as step_engine};
 use crate::vm::VmPmapError;
+use crate::vm::adapter::step_engine::{self as step_engine};
 
 pub const USER_PAGE_SIZE: usize = 4096;
 
@@ -267,27 +270,90 @@ impl VmEntryFlags {
     }
 }
 
+pub struct VmCap<T: 'static>(Arc<Cap<T>>);
+
+impl<T: 'static> VmCap<T> {
+    pub fn new(cap: Cap<T>) -> Self {
+        Self(Arc::new(cap))
+    }
+
+    pub fn as_cap(&self) -> &Cap<T> {
+        self.0.as_ref()
+    }
+
+    pub fn clone_cap(&self) -> Cap<T> {
+        self.as_cap().clone()
+    }
+
+    pub fn into_cap(self) -> Cap<T> {
+        match Arc::try_unwrap(self.0) {
+            Ok(cap) => cap,
+            Err(cap) => cap.as_ref().clone(),
+        }
+    }
+}
+
+impl<T: 'static> From<Cap<T>> for VmCap<T> {
+    fn from(cap: Cap<T>) -> Self {
+        Self::new(cap)
+    }
+}
+
+impl<T: 'static> Clone for VmCap<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<T: 'static> core::fmt::Debug for VmCap<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("VmCap").field(&self.as_cap()).finish()
+    }
+}
+
+impl<T: 'static> PartialEq for VmCap<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_cap() == other.as_cap()
+    }
+}
+
+impl<T: 'static> Eq for VmCap<T> {}
+
+impl<T: 'static> PartialEq<Cap<T>> for VmCap<T> {
+    fn eq(&self, other: &Cap<T>) -> bool {
+        self.as_cap() == other
+    }
+}
+
+impl<T: 'static> PartialEq<VmCap<T>> for Cap<T> {
+    fn eq(&self, other: &VmCap<T>) -> bool {
+        self == other.as_cap()
+    }
+}
+
+impl<T: 'static> core::ops::Deref for VmCap<T> {
+    type Target = Cap<T>;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_cap()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum VmBacking {
     None,
     PrivateAnon,
-    Page { pc: Cap<PageContainer>, offset: u64 },
+    Page {
+        pc: VmCap<PageContainer>,
+        offset: u64,
+    },
 }
 
-impl VmBacking {
-    fn at_range_offset(&self, delta: usize) -> Result<Self, VmEntryError> {
-        match self {
-            Self::Page { pc, offset } => Ok(Self::Page {
-                pc: pc.clone(),
-                offset: offset
-                    .checked_add(
-                        u64::try_from(delta).map_err(|_| VmEntryError::BackingOffsetOverflow)?,
-                    )
-                    .ok_or(VmEntryError::BackingOffsetOverflow)?,
-            }),
-            other => Ok(other.clone()),
-        }
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VmEntryBacking {
+    None,
+    PrivateAnon,
+    Page { offset: u64 },
 }
 
 /// Per-VMA userfaultfd registration tag (PR-10 phase 3).
@@ -315,12 +381,18 @@ pub struct UfdRegistration {
     pub mode: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
+struct VmEntryOwners {
+    page: Option<VmCap<PageContainer>>,
+    private: Option<VmCap<PrivatePageSet>>,
+}
+
+#[derive(Debug)]
 pub struct VmEntry {
     pub range: UserRange,
     pub prot: Prot,
     pub flags: VmEntryFlags,
-    pub backing: VmBacking,
+    backing: VmEntryBacking,
     /// Optional userfaultfd registration tag (PR-10 phase 3).
     ///
     /// `None` for every VMA built before phase 3 wiring or by callers
@@ -340,7 +412,7 @@ pub struct VmEntry {
     /// already detects identity changes via `range`. Skipping
     /// `private` here keeps `VmEntry::new(...) == lookup(...)`
     /// behaviour stable across the auto-allocated Cap.
-    pub private: Option<Cap<PrivatePageSet>>,
+    owners: Arc<VmEntryOwners>,
 }
 
 impl PartialEq for VmEntry {
@@ -348,24 +420,45 @@ impl PartialEq for VmEntry {
         self.range == other.range
             && self.prot == other.prot
             && self.flags == other.flags
-            && self.backing == other.backing
+            && self.same_backing(other)
             && self.ufd_registration == other.ufd_registration
     }
 }
 
 impl Eq for VmEntry {}
 
+impl Clone for VmEntry {
+    fn clone(&self) -> Self {
+        Self {
+            range: self.range,
+            prot: self.prot,
+            flags: self.flags,
+            backing: self.backing,
+            ufd_registration: self.ufd_registration,
+            owners: self.owners.clone(),
+        }
+    }
+}
+
 impl VmEntry {
     /// Construct a VmEntry without a userfaultfd registration tag and
     /// no private CoW set. Existing callers stay source-compatible.
     pub fn new(range: UserRange, prot: Prot, flags: VmEntryFlags, backing: VmBacking) -> Self {
+        let (backing, page) = match backing {
+            VmBacking::None => (VmEntryBacking::None, None),
+            VmBacking::PrivateAnon => (VmEntryBacking::PrivateAnon, None),
+            VmBacking::Page { pc, offset } => (VmEntryBacking::Page { offset }, Some(pc)),
+        };
         Self {
             range,
             prot,
             flags,
             backing,
             ufd_registration: None,
-            private: None,
+            owners: Arc::new(VmEntryOwners {
+                page,
+                private: None,
+            }),
         }
     }
 
@@ -381,8 +474,14 @@ impl VmEntry {
     /// Builder helper: return a clone of `self` with `private` replaced
     /// by `set`. Used by the mmap path on MAP_PRIVATE construction and
     /// by `fork_aspace` when populating the child.
-    pub fn with_private(mut self, set: Option<Cap<PrivatePageSet>>) -> Self {
-        self.private = set;
+    pub fn with_private<C>(mut self, set: Option<C>) -> Self
+    where
+        C: Into<VmCap<PrivatePageSet>>,
+    {
+        self.owners = Arc::new(VmEntryOwners {
+            page: self.owners.page.clone(),
+            private: set.map(Into::into),
+        });
         self
     }
 
@@ -392,6 +491,76 @@ impl VmEntry {
     pub fn with_locked(mut self, locked: bool) -> Self {
         self.flags.locked = locked;
         self
+    }
+
+    pub fn backing_kind(&self) -> VmEntryBacking {
+        self.backing
+    }
+
+    pub fn backing(&self) -> VmBacking {
+        match self.backing {
+            VmEntryBacking::None => VmBacking::None,
+            VmEntryBacking::PrivateAnon => VmBacking::PrivateAnon,
+            VmEntryBacking::Page { offset } => VmBacking::Page {
+                pc: self
+                    .owners
+                    .page
+                    .as_ref()
+                    .expect("page-backed VmEntry has PageContainer owner")
+                    .clone(),
+                offset,
+            },
+        }
+    }
+
+    pub fn page_backing(&self) -> Option<(&Cap<PageContainer>, u64)> {
+        match self.backing {
+            VmEntryBacking::Page { offset } => Some((
+                self.owners
+                    .page
+                    .as_ref()
+                    .expect("page-backed VmEntry has PageContainer owner")
+                    .as_cap(),
+                offset,
+            )),
+            VmEntryBacking::None | VmEntryBacking::PrivateAnon => None,
+        }
+    }
+
+    pub fn private(&self) -> Option<&Cap<PrivatePageSet>> {
+        self.owners.private.as_ref().map(VmCap::as_cap)
+    }
+
+    pub fn private_handle(&self) -> Option<VmCap<PrivatePageSet>> {
+        self.owners.private.clone()
+    }
+
+    pub fn private_identity(&self) -> Option<u32> {
+        self.private().map(Cap::raw)
+    }
+
+    pub fn same_backing(&self, other: &Self) -> bool {
+        match (self.backing, other.backing) {
+            (VmEntryBacking::None, VmEntryBacking::None)
+            | (VmEntryBacking::PrivateAnon, VmEntryBacking::PrivateAnon) => true,
+            (
+                VmEntryBacking::Page {
+                    offset: left_offset,
+                },
+                VmEntryBacking::Page {
+                    offset: right_offset,
+                },
+            ) => {
+                left_offset == right_offset
+                    && self.owners.page.as_ref() == other.owners.page.as_ref()
+            }
+            _ => false,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn debug_owner_strong_count(&self) -> usize {
+        Arc::strong_count(&self.owners)
     }
 
     pub fn split_for_unmap(&self, hole: UserRange) -> Result<VmEntryRewrite, VmEntryError> {
@@ -413,6 +582,18 @@ impl VmEntry {
     ) -> Result<VmEntryRewrite, VmEntryError> {
         if !self.range.contains_range(target) {
             return Err(VmEntryError::RangeNotContained);
+        }
+
+        if self.range == target {
+            return Ok(VmEntryRewrite {
+                before: None,
+                target: target_prot.map(|prot| {
+                    let mut entry = self.clone();
+                    entry.prot = prot;
+                    entry
+                }),
+                after: None,
+            });
         }
 
         let before = if self.range.start < target.start {
@@ -449,19 +630,30 @@ impl VmEntry {
             .ok_or(VmEntryError::RangeNotContained)?;
         let range = UserRange::new_aligned(start, len).map_err(VmEntryError::Range)?;
         let delta = start.0 - self.range.start.0;
+        let backing = self.backing_at_range_offset(delta)?;
+        if self.owners.private.is_none() && !(prot.write && !self.flags.shared) {
+            return Ok(Self {
+                range,
+                prot,
+                flags: self.flags,
+                backing,
+                ufd_registration: self.ufd_registration,
+                owners: self.owners.clone(),
+            });
+        }
         // Slice the private CoW set for this sub-range. Each sub-entry
         // owns a fresh Cap<PrivatePageSet> whose entries are rebased
         // to the new range start. The parent set is left intact;
         // recipe rewriters drop the parent VmEntry after publishing
         // the sub-entries, which releases the parent Cap.
-        let private = match &self.private {
+        let private = match self.owners.private.as_ref() {
             Some(parent_set) if parent_set.is_empty() => {
                 if prot.write {
-                    Some(
+                    Some(VmCap::new(
                         PrivatePageSet::new_cap()
                             .map_err(PrivatePageError::Zone)
                             .map_err(VmEntryError::Private)?,
-                    )
+                    ))
                 } else {
                     None
                 }
@@ -478,15 +670,15 @@ impl VmEntry {
                         rebase_delta,
                     )
                     .map_err(VmEntryError::Private)?;
-                Some(sliced)
+                Some(VmCap::new(sliced))
             }
             None => {
                 if prot.write && !self.flags.shared {
-                    Some(
+                    Some(VmCap::new(
                         PrivatePageSet::new_cap()
                             .map_err(PrivatePageError::Zone)
                             .map_err(VmEntryError::Private)?,
-                    )
+                    ))
                 } else {
                     None
                 }
@@ -496,7 +688,7 @@ impl VmEntry {
             range,
             prot,
             flags: self.flags,
-            backing: self.backing.at_range_offset(delta)?,
+            backing,
             // Userfaultfd tag is per-VMA and inherited verbatim across
             // split-for-unmap / split-for-protect rewrites. Phase 3
             // does not yet split the registered range on partial
@@ -504,7 +696,38 @@ impl VmEntry {
             // `-EINVAL` so every sub-entry built here carries the
             // same tag.
             ufd_registration: self.ufd_registration,
-            private,
+            owners: Arc::new(VmEntryOwners {
+                page: self.owners.page.clone(),
+                private,
+            }),
+        })
+    }
+
+    fn backing_at_range_offset(&self, delta: usize) -> Result<VmEntryBacking, VmEntryError> {
+        match self.backing {
+            VmEntryBacking::None => Ok(VmEntryBacking::None),
+            VmEntryBacking::PrivateAnon => Ok(VmEntryBacking::PrivateAnon),
+            VmEntryBacking::Page { offset } => Ok(VmEntryBacking::Page {
+                offset: offset
+                    .checked_add(
+                        u64::try_from(delta).map_err(|_| VmEntryError::BackingOffsetOverflow)?,
+                    )
+                    .ok_or(VmEntryError::BackingOffsetOverflow)?,
+            }),
+        }
+    }
+
+    pub(in crate::vm) fn with_range_preserving_owners(
+        &self,
+        range: UserRange,
+    ) -> Result<Self, VmEntryError> {
+        Ok(Self {
+            range,
+            prot: self.prot,
+            flags: self.flags,
+            backing: self.backing,
+            ufd_registration: self.ufd_registration,
+            owners: self.owners.clone(),
         })
     }
 
@@ -525,6 +748,75 @@ pub struct VmEntryRewrite {
     pub before: Option<VmEntry>,
     pub target: Option<VmEntry>,
     pub after: Option<VmEntry>,
+}
+
+impl VmEntryRewrite {
+    pub(in crate::vm) fn replacement_count(&self) -> usize {
+        usize::from(self.before.is_some())
+            + usize::from(self.target.is_some())
+            + usize::from(self.after.is_some())
+    }
+
+    pub(in crate::vm) fn replacement_vm_size(&self) -> usize {
+        self.before.as_ref().map_or(0, |entry| entry.range.len())
+            + self.target.as_ref().map_or(0, |entry| entry.range.len())
+            + self.after.as_ref().map_or(0, |entry| entry.range.len())
+    }
+
+    pub(in crate::vm) fn into_entries(self) -> Vec<VmEntry> {
+        let mut entries = Vec::with_capacity(self.replacement_count());
+        if let Some(entry) = self.before {
+            entries.push(entry);
+        }
+        if let Some(entry) = self.target {
+            entries.push(entry);
+        }
+        if let Some(entry) = self.after {
+            entries.push(entry);
+        }
+        entries
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmEntryProtectRewrite {
+    pub target: UserRange,
+    pub prot: Prot,
+}
+
+impl VmEntryProtectRewrite {
+    pub const fn new(target: UserRange, prot: Prot) -> Self {
+        Self { target, prot }
+    }
+
+    pub(in crate::vm) fn replacement_count_for(
+        self,
+        existing: &VmEntry,
+    ) -> Result<usize, VmEntryError> {
+        if !existing.range.contains_range(self.target) {
+            return Err(VmEntryError::RangeNotContained);
+        }
+        Ok(usize::from(existing.range.start < self.target.start)
+            + 1
+            + usize::from(self.target.end < existing.range.end))
+    }
+
+    pub(in crate::vm) fn replacement_vm_size_for(
+        self,
+        existing: &VmEntry,
+    ) -> Result<usize, VmEntryError> {
+        if !existing.range.contains_range(self.target) {
+            return Err(VmEntryError::RangeNotContained);
+        }
+        Ok(existing.range.len())
+    }
+
+    pub(in crate::vm) fn into_rewrite_for(
+        self,
+        existing: &VmEntry,
+    ) -> Result<VmEntryRewrite, VmEntryError> {
+        existing.split_for_protect(self.target, self.prot)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -720,7 +1012,7 @@ pub struct VmFaultOutcome {
 
 impl VmFaultOutcome {
     pub fn materialize_pagebacked_anon(&self) -> Result<VmFaultMaterialization, VmFaultError> {
-        if !matches!(self.entry.backing, VmBacking::Page { .. }) {
+        if !matches!(self.entry.backing_kind(), VmEntryBacking::Page { .. }) {
             return Err(VmFaultError::BackingMismatch);
         }
         self.materialize_pagebacked()
@@ -743,11 +1035,9 @@ impl VmFaultOutcome {
         // SHARED mappings: passthrough materialize from backing — no
         // private-page consult.
         if self.entry.flags.shared {
-            return match &self.entry.backing {
-                VmBacking::Page { pc, .. } => self.materialize_page_shared(pc, guard),
-                VmBacking::PrivateAnon | VmBacking::None => {
-                    VmFaultMaterializationStep::Err(VmFaultError::BackingMismatch)
-                }
+            return match self.entry.page_backing() {
+                Some((pc, _)) => self.materialize_page_shared(pc, guard),
+                None => VmFaultMaterializationStep::Err(VmFaultError::BackingMismatch),
             };
         }
         // PRIVATE mappings: consult `entry.private` first, then fall
@@ -812,10 +1102,10 @@ impl VmFaultOutcome {
         &self,
         guard: &crate::execution::Guard<'_>,
     ) -> VmFaultMaterializationStep {
-        let backing_kind = match &self.entry.backing {
-            VmBacking::Page { .. } => VmFaultMaterializationBacking::PageBacked,
-            VmBacking::PrivateAnon => VmFaultMaterializationBacking::PrivateAnon,
-            VmBacking::None => {
+        let backing_kind = match self.entry.backing_kind() {
+            VmEntryBacking::Page { .. } => VmFaultMaterializationBacking::PageBacked,
+            VmEntryBacking::PrivateAnon => VmFaultMaterializationBacking::PrivateAnon,
+            VmEntryBacking::None => {
                 return VmFaultMaterializationStep::Err(VmFaultError::BackingMismatch);
             }
         };
@@ -839,7 +1129,7 @@ impl VmFaultOutcome {
         //    stored private frame (RO for reads regardless of state,
         //    RW for write+Exclusive, alloc/copy/replace_if_match for
         //    write+SharedCow).
-        if let Some(set) = &self.entry.private {
+        if let Some(set) = self.entry.private() {
             if let Some(snap) = set.lookup(page_off) {
                 return match self.publish_existing_private(
                     snap,
@@ -960,8 +1250,12 @@ impl VmFaultOutcome {
         guard: &crate::execution::Guard<'_>,
     ) -> VmFaultMaterializationStep {
         emit_vm_materialize_trace(b"debug.vm.private_read_miss.phase", 0);
-        let page = match (&self.entry.backing, backing_kind) {
-            (VmBacking::Page { pc, .. }, VmFaultMaterializationBacking::PageBacked) => {
+        let page = match (
+            self.entry.page_backing(),
+            self.entry.backing_kind(),
+            backing_kind,
+        ) {
+            (Some((pc, _)), _, VmFaultMaterializationBacking::PageBacked) => {
                 emit_vm_materialize_trace(b"debug.vm.private_read_miss.backing", 2);
                 let Some(access_byte) = page_index.as_u64().checked_mul(USER_PAGE_SIZE as u64)
                 else {
@@ -1002,7 +1296,7 @@ impl VmFaultOutcome {
                     }
                 }
             }
-            (VmBacking::PrivateAnon, VmFaultMaterializationBacking::PrivateAnon) => {
+            (None, VmEntryBacking::PrivateAnon, VmFaultMaterializationBacking::PrivateAnon) => {
                 emit_vm_materialize_trace(b"debug.vm.private_read_miss.backing", 1);
                 emit_vm_materialize_trace(b"debug.vm.private_read_miss.phase", 4);
                 match materialize_zero_frame() {
@@ -1035,8 +1329,12 @@ impl VmFaultOutcome {
     ) -> VmFaultMaterializationStep {
         // Allocate a fresh private frame, copying from backing source
         // when the backing has authoritative content.
-        let new_page = match (&self.entry.backing, backing_kind) {
-            (VmBacking::Page { pc, .. }, VmFaultMaterializationBacking::PageBacked) => {
+        let new_page = match (
+            self.entry.page_backing(),
+            self.entry.backing_kind(),
+            backing_kind,
+        ) {
+            (Some((pc, _)), _, VmFaultMaterializationBacking::PageBacked) => {
                 let Some(access_byte) = page_index.as_u64().checked_mul(USER_PAGE_SIZE as u64)
                 else {
                     return VmFaultMaterializationStep::Err(VmFaultError::BackingOffsetOverflow);
@@ -1077,7 +1375,7 @@ impl VmFaultOutcome {
                 drop(source);
                 new
             }
-            (VmBacking::PrivateAnon, VmFaultMaterializationBacking::PrivateAnon) => {
+            (None, VmEntryBacking::PrivateAnon, VmFaultMaterializationBacking::PrivateAnon) => {
                 emit_vm_materialize_trace(b"debug.vm.private_anon.write_miss.phase", 0);
                 match allocate_private_materialized_page(true) {
                     Ok(page) => {
@@ -1092,7 +1390,7 @@ impl VmFaultOutcome {
         // Install into `entry.private` if a set is attached. On CAS
         // failure (someone raced and published), drop our new page and
         // ask the script to retry.
-        if let Some(set) = &self.entry.private {
+        if let Some(set) = self.entry.private() {
             emit_vm_materialize_trace(b"debug.vm.private_anon.write_miss.phase", 2);
             let cache_pin = match page_allocator::acquire_cache_pin(new_page.ppn) {
                 Ok(pin) => pin,
@@ -1168,7 +1466,7 @@ impl VmFaultOutcome {
     pub fn materialize_pagebacked_for_ufd_copy(
         &self,
     ) -> Result<VmFaultMaterialization, VmFaultError> {
-        if !matches!(self.entry.backing, VmBacking::PrivateAnon) {
+        if !matches!(self.entry.backing_kind(), VmEntryBacking::PrivateAnon) {
             return Err(VmFaultError::BackingMismatch);
         }
         let page_index = self.private_anon_page_index()?;
@@ -1188,11 +1486,11 @@ impl VmFaultOutcome {
     }
 
     pub(in crate::vm) fn backing_page_index(&self) -> Result<PageIndex, VmFaultError> {
-        let VmBacking::Page { offset, .. } = &self.entry.backing else {
+        let VmEntryBacking::Page { offset } = self.entry.backing_kind() else {
             return Err(VmFaultError::BackingMismatch);
         };
         let delta = self.recipe_page_delta()?;
-        let byte_offset = (*offset)
+        let byte_offset = offset
             .checked_add(u64::try_from(delta).map_err(|_| VmFaultError::BackingOffsetOverflow)?)
             .ok_or(VmFaultError::BackingOffsetOverflow)?;
         if !byte_offset.is_multiple_of(USER_PAGE_SIZE as u64) {
@@ -1202,7 +1500,7 @@ impl VmFaultOutcome {
     }
 
     pub(in crate::vm) fn private_anon_page_index(&self) -> Result<PageIndex, VmFaultError> {
-        if !matches!(self.entry.backing, VmBacking::PrivateAnon) {
+        if !matches!(self.entry.backing_kind(), VmEntryBacking::PrivateAnon) {
             return Err(VmFaultError::BackingMismatch);
         }
         let delta = self.recipe_page_delta()?;

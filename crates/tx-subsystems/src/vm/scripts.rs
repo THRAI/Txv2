@@ -28,16 +28,16 @@
 
 use alloc::vec::Vec;
 
-use step_engine::page_allocator;
 use step_engine::Cap;
+use step_engine::page_allocator;
 use tx_hal::PmapIf;
 
 use crate::execution::Errno;
 use crate::page_backed::PageContainer;
 use crate::vm::adapter::step_engine::{self as step_engine, ByteProgress, StepOutcome};
 use crate::vm::{
-    AddressSpace, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntry, VmEntryFlags,
-    VmFault, VmFaultError, VmMapError, VmPmapError, USER_PAGE_SIZE,
+    AddressSpace, MapPlacement, Prot, USER_PAGE_SIZE, UserRange, UserVirtAddr, VmBacking, VmEntry,
+    VmEntryFlags, VmFault, VmFaultError, VmMapError, VmPmapError,
 };
 
 /// Default initial top of the userspace stack for v1 static binaries.
@@ -507,7 +507,7 @@ fn register_load_segment(
             prot,
             VmEntryFlags::PRIVATE,
             VmBacking::Page {
-                pc: segment.backing.clone(),
+                pc: segment.backing.clone().into(),
                 offset: file_page_offset,
             },
         );
@@ -580,7 +580,7 @@ mod tests {
     use crate::page_backed::{AnonSwapPolicy, PageContainerKind};
     use crate::test_support::EPOCH_TEST_LOCK;
     use crate::vm::adapter::step_engine::StepOutcome as V3StepOutcome;
-    use crate::vm::{UserPage, USER_PAGE_SIZE};
+    use crate::vm::{USER_PAGE_SIZE, UserPage, VmEntryBacking};
     use alloc::boxed::Box;
     use alloc::vec;
     use alloc::vec::Vec;
@@ -657,7 +657,7 @@ mod tests {
         // until vDSO mapping lands; see the long comment in
         // `build_aspace_from_image`.
         assert_eq!(stack.prot, Prot::new(true, true, true));
-        assert!(matches!(stack.backing, VmBacking::PrivateAnon));
+        assert!(matches!(stack.backing_kind(), VmEntryBacking::PrivateAnon));
         assert_eq!(
             stack.range.start().as_usize() as u64,
             USER_STACK_TOP_DEFAULT - USER_STACK_INITIAL_RESERVATION
@@ -723,7 +723,7 @@ mod tests {
         assert_eq!(recipes.len(), 2);
         let load = recipes
             .iter()
-            .find(|e| matches!(e.backing, VmBacking::Page { .. }))
+            .find(|e| matches!(e.backing_kind(), VmEntryBacking::Page { .. }))
             .expect("file-backed recipe");
         assert_eq!(load.range.start().as_usize() as u64, 0x1_0000);
         assert_eq!(
@@ -761,7 +761,7 @@ mod tests {
         let bss = recipes
             .iter()
             .find(|e| {
-                matches!(e.backing, VmBacking::PrivateAnon)
+                matches!(e.backing_kind(), VmEntryBacking::PrivateAnon)
                     && e.range.start().as_usize() as u64 == 0x2_0000 + USER_PAGE_SIZE as u64
             })
             .expect("BSS-tail recipe");

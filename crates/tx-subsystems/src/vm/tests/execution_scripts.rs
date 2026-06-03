@@ -134,7 +134,7 @@ fn vm_try_mremap_moves_disjoint_range_and_preserves_source_survivors() {
             range(0x8000, 2),
             Prot::READ_WRITE,
             VmEntryFlags::SHARED,
-            page_backing_like(&original.backing, USER_PAGE_SIZE as u64),
+            page_backing_like_entry(&original, USER_PAGE_SIZE as u64),
         ))
     );
 }

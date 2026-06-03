@@ -88,24 +88,24 @@ use boot_runtime::userspace::{
     UserspaceTrapInfo,
 };
 use tx_hal::{PercpuIf, TrapIf, TxPlatform};
+use tx_shims::linux_syscall::SyscallResult;
 use tx_shims::linux_syscall::numbers::{
     FUTEX_CMD_MASK, FUTEX_WAKE, FUTEX_WAKE_BITSET, NR_CLONE, NR_FUTEX, NR_MMAP, NR_MPROTECT,
     NR_MUNMAP, NR_RT_SIGPROCMASK, NR_WRITEV,
 };
-use tx_shims::linux_syscall::SyscallResult;
-use tx_subsystems::signal::deliver_synchronous_fault;
 use tx_subsystems::signal::Signum;
-use tx_subsystems::signal::{ast_dispatch, refresh_deliverable_signal_summary, AstOutcome};
+use tx_subsystems::signal::deliver_synchronous_fault;
+use tx_subsystems::signal::{AstOutcome, ast_dispatch, refresh_deliverable_signal_summary};
 use tx_subsystems::thread_runtime::execution::prepare_userspace_entry_payload_into;
 use tx_subsystems::thread_runtime::{
-    clear_current_thread_identity, clear_current_thread_payload, clear_current_userspace_payload,
-    clear_current_userspace_thread_identity, set_current_thread_identity,
-    set_current_thread_payload, set_current_userspace_payload,
-    set_current_userspace_thread_identity, ThreadIdentity, ThreadPayload,
+    ThreadIdentity, ThreadPayload, clear_current_thread_identity, clear_current_thread_payload,
+    clear_current_userspace_payload, clear_current_userspace_thread_identity,
+    set_current_thread_identity, set_current_thread_payload, set_current_userspace_payload,
+    set_current_userspace_thread_identity,
 };
 use tx_subsystems::vm::{
-    AccessMode, AddressSpace, Prot, UserAccessKind, UserRange, UserVirtAddr, VmBacking, VmEntry,
-    VmFault, USER_PAGE_SIZE,
+    AccessMode, AddressSpace, Prot, USER_PAGE_SIZE, UserAccessKind, UserRange, UserVirtAddr,
+    VmEntry, VmEntryBacking, VmFault,
 };
 
 /// Translate the reactor's `PageFaultAccess` into the VM subsystem's
@@ -1138,12 +1138,12 @@ fn log_recipe<P: TxPlatform>(label: &str, entry: &VmEntry) {
     tx_hal::console_write_str::<P>(if entry.prot.write { "w" } else { "-" });
     tx_hal::console_write_str::<P>(if entry.prot.execute { "x" } else { "-" });
     tx_hal::console_write_str::<P>(":backing=");
-    match &entry.backing {
-        VmBacking::None => tx_hal::console_write_str::<P>("none"),
-        VmBacking::PrivateAnon => tx_hal::console_write_str::<P>("anon"),
-        VmBacking::Page { offset, .. } => {
+    match entry.backing_kind() {
+        VmEntryBacking::None => tx_hal::console_write_str::<P>("none"),
+        VmEntryBacking::PrivateAnon => tx_hal::console_write_str::<P>("anon"),
+        VmEntryBacking::Page { offset } => {
             tx_hal::console_write_str::<P>("page@0x");
-            write_hex_u64::<P>(*offset);
+            write_hex_u64::<P>(offset);
         }
     }
     tx_hal::console_write_str::<P>("\n");

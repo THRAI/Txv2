@@ -11,7 +11,7 @@
 
 use crate::vm::adapter::step_engine::{NoProgress, StepOutcome as V3StepOutcome};
 use crate::vm::adapter::wait_routing::{Channel, WaitSource};
-use crate::vm::lock_metrics::{vm_spin_mutex, VmSpinMutex};
+use crate::vm::lock_metrics::{VmSpinMutex, vm_spin_mutex};
 use alloc::sync::Arc;
 
 use crate::execution::WaitToken;

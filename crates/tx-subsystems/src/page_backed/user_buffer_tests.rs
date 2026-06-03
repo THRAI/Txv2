@@ -4,8 +4,8 @@ use crate::page_backed::adapter::step_engine::{
 };
 use crate::vfs::{FsObjectId, InodeKind, InodeMeta, OpenFile, OpenFileFlags, RNode, RNodeBacking};
 use crate::vm::{
-    AddressSpace, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntry, VmEntryFlags,
-    USER_PAGE_SIZE,
+    AddressSpace, MapPlacement, Prot, USER_PAGE_SIZE, UserRange, UserVirtAddr, VmBacking, VmEntry,
+    VmEntryFlags,
 };
 use alloc::vec;
 use alloc::vec::Vec;
@@ -72,7 +72,7 @@ impl UserBufferFixture {
             Prot::READ_WRITE,
             VmEntryFlags::SHARED,
             VmBacking::Page {
-                pc: user_pc.clone(),
+                pc: user_pc.clone().into(),
                 offset: 0,
             },
         );

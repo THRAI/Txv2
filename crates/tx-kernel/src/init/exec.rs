@@ -735,13 +735,19 @@ impl<P: TxPlatform> CoreInit<P> {
             } else {
                 Default::default()
             };
+            let vm_recipe_reclaims = if step.should_idle() {
+                tx_subsystems::vm::drain_deferred_recipe_reclaims(64)
+            } else {
+                0
+            };
 
             // Don't enter WFI if EBR reclaimed anything (reclaim callbacks
             // may have called wake_by_ref() on parked tasks, which is
             // invisible to step.should_idle() computed before the drain) or
             // if there are items still pending reclamation (need more epoch
             // advances before they can be reclaimed).
-            let ebr_active = drain_stats.reclaimed > 0 || drain_stats.remaining > 0;
+            let ebr_active =
+                drain_stats.reclaimed > 0 || drain_stats.remaining > 0 || vm_recipe_reclaims > 0;
             if step.should_idle()
                 && !submitted_child_before_poll
                 && !submitted_child_after_poll
@@ -794,6 +800,7 @@ impl<P: TxPlatform> CoreInit<P> {
                 // never reaches. This ensures EOF propagates within a
                 // few timer ticks (~20 ms) after the last writer closes.
                 let _ = step_engine::drain_with_budget(usize::MAX);
+                let _ = tx_subsystems::vm::drain_deferred_recipe_reclaims(usize::MAX);
             }
         }
 

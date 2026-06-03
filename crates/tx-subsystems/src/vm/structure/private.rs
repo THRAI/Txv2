@@ -25,9 +25,9 @@
 
 use crate::vm::adapter::step_engine::{self as step_engine};
 use crate::vm::adapter::step_engine::{Cap, Zone, ZoneAllocated, ZoneError};
-use crate::vm::lock_metrics::{vm_spin_mutex, VmSpinMutex};
+use crate::vm::lock_metrics::{VmSpinMutex, vm_spin_mutex};
 use alloc::{sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use step_engine::page_allocator::{BitmapPageAllocator, CachePin};
 use tx_hal::Ppn;
 
@@ -1093,6 +1093,7 @@ mod tests {
 
     #[test]
     fn unshared_private_installs_allocate_only_leaf_nodes() {
+        let _obs = tx_observe::testing::TestPlatform::new().init();
         reset_private_page_debug_totals();
         let set = PrivatePageSet::new();
 
@@ -1115,6 +1116,7 @@ mod tests {
 
     #[test]
     fn shared_private_tree_falls_back_to_path_copy_insert() {
+        let _obs = tx_observe::testing::TestPlatform::new().init();
         let set = PrivatePageSet::new();
         for off in 0..16 {
             set.install_if_absent(VmPageOff(off), test_private_frame())

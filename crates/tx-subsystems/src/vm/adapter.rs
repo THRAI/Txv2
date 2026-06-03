@@ -1,7 +1,7 @@
 //! Substrate / reactor adapter for vm.
 //!
 //! VM has the richest substrate surface of any subsystem so far: in
-//! addition to the standard step_v3 / zone / epoch / SpinMutex set,
+//! addition to the standard step_v3 / zone / epoch / lock-facade set,
 //! it consumes the userfaultfd-delegate plumbing (DelegateRegistry,
 //! DelegateRequest / DelegateReply, UfdAccessKind / UfdRequest /
 //! UfdReply, AbortReason, AgentCancelPolicy, TokenDropPolicy,
@@ -29,7 +29,9 @@ use tx_platform_adapter::platform_adapter;
     reason = "expose substrate step engine (including delegate-registry plumbing for userfaultfd: DelegateRequest/Reply, UfdRequest/Reply, AbortReason, AgentCancelPolicy, TokenDropPolicy, YieldShape), zone role types, EBR guard, page-allocator primitives, shootdown surface (AddressSpaceShootdownBatch, ShootdownError), TaskMailbox, and SpinMutex used by vm fault resolver, address-space ops, range-lock wait sources, and the recipe/private mapping structures"
 )]
 pub mod step_engine {
-    pub use tx_substrate::epoch::{self as epoch_mod, guard, Guard};
+    #[cfg(not(tx_lock_metrics_vm))]
+    pub(crate) use crate::sync::SpinMutex;
+    pub use tx_substrate::epoch::{self as epoch_mod, Guard, guard};
     pub use tx_substrate::page_allocator::{self, BitmapPageAllocator, CachePin, ZeroPolicy};
     pub use tx_substrate::shootdown::{AddressSpaceShootdownBatch, ShootdownError};
     pub use tx_substrate::step::{
@@ -41,12 +43,11 @@ pub mod step_engine {
     };
     pub use tx_substrate::wake::{MailboxEvent, TaskMailbox};
     pub use tx_substrate::zone::{
-        register_zone_for, reserve_for, sign, sign_for, Cap, CapProducingPolicy, CoLocatedEntity,
-        Dead, Entity, IdentRef, IdentitySlot, IsPayloadPolicy, ObserverNodePolicy,
-        OperationalCapExt, OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy,
-        RetainedEntityPolicy, Weak, Zone, ZoneAllocated, ZoneError, ZonePolicy,
+        Cap, CapProducingPolicy, CoLocatedEntity, Dead, Entity, IdentRef, IdentitySlot,
+        IsPayloadPolicy, ObserverNodePolicy, OperationalCapExt, OperationalRefExt, PayloadBinding,
+        PayloadCap, PayloadPolicy, RetainedEntityPolicy, Weak, Zone, ZoneAllocated, ZoneError,
+        ZonePolicy, register_zone_for, reserve_for, sign, sign_for,
     };
-    pub use tx_substrate::{LockMetricsOff, LockMetricsOn, SpinMutex};
 }
 
 #[platform_adapter(

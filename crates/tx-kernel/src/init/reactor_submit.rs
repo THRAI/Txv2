@@ -10,16 +10,20 @@ use super::*;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-static THREAD_REACTOR_TASKS: SpinMutex<alloc::vec::Vec<(u32, boot_runtime::TaskKey)>> =
-    SpinMutex::new(alloc::vec::Vec::new());
+static THREAD_REACTOR_TASKS: SpinMutex<alloc::vec::Vec<(u32, boot_runtime::TaskKey)>> = spin_mutex(
+    alloc::vec::Vec::new(),
+    b"debug.lock.kernel.thread_reactor_tasks",
+);
 
 struct PendingChildSubmit {
     submit_cpu: CpuId,
     child_thread: Cap<tx_subsystems::thread_runtime::ThreadIdentity>,
 }
 
-static PENDING_CHILD_SUBMITS: SpinMutex<alloc::vec::Vec<PendingChildSubmit>> =
-    SpinMutex::new(alloc::vec::Vec::new());
+static PENDING_CHILD_SUBMITS: SpinMutex<alloc::vec::Vec<PendingChildSubmit>> = spin_mutex(
+    alloc::vec::Vec::new(),
+    b"debug.lock.kernel.pending_child_submits",
+);
 
 static BENCH_CHILD_QUEUE: AtomicU64 = AtomicU64::new(0);
 static BENCH_CHILD_DRAIN: AtomicU64 = AtomicU64::new(0);
@@ -113,11 +117,17 @@ impl<P: TxPlatform> CoreInit<P> {
         if removed != 0 {
             let first = step_engine::drain_with_budget(TERMINAL_THREAD_EBR_DRAIN_BUDGET);
             let second = step_engine::drain_with_budget(TERMINAL_THREAD_EBR_DRAIN_BUDGET);
+            let vm_recipe_reclaims =
+                tx_subsystems::vm::drain_deferred_recipe_reclaims(TERMINAL_THREAD_EBR_DRAIN_BUDGET);
             emit_child_submit_marker(
                 "debug.child_submit.ebr_reclaimed",
                 first.reclaimed.saturating_add(second.reclaimed) as i64,
             );
             emit_child_submit_marker("debug.child_submit.ebr_remaining", second.remaining as i64);
+            emit_child_submit_marker(
+                "debug.child_submit.vm_recipe_reclaimed",
+                vm_recipe_reclaims as i64,
+            );
         }
         removed != 0
     }
@@ -225,7 +235,7 @@ impl<P: TxPlatform> CoreInit<P> {
                     task_payload.clone(),
                     crate::thread_future::run_thread::<P>(child_thread, task_payload),
                 ),
-                Self::userspace_thread_sched_meta_for(submit_cpu).preempted_on_submit(),
+                Self::userspace_child_thread_sched_meta_for(submit_cpu).preempted_on_submit(),
                 submit_hart,
                 &mut signal,
             )

@@ -17,9 +17,9 @@ pub(crate) use range_lock::{
 )]
 mod range_lock {
     use crate::execution::WaitToken;
+    use crate::vm::RANGE_LOCK_RELEASE_MASK;
     use crate::vm::adapter::step_engine::{NoProgress, StepOutcome, StepProgress, YieldShape};
     use crate::vm::adapter::wait_routing::{self, Channel, Mask, WaitSource};
-    use crate::vm::RANGE_LOCK_RELEASE_MASK;
     use alloc::sync::Arc;
 
     pub(crate) struct RangeLockWaitPoint {

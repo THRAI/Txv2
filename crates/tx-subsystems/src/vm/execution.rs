@@ -13,7 +13,7 @@ use tx_hal::PmapIf;
 
 use crate::execution::Guard;
 use crate::execution::WaitToken;
-use crate::page_backed::{step_fsync, PageContainerKind};
+use crate::page_backed::{PageContainerKind, step_fsync};
 use crate::vm::adapter::step_engine::{
     self as step_engine, AbortReason, AgentCancelPolicy, DelegateRegistry, DelegateReply,
     DelegateRequest, StepOutcome, StepOutcome as V3StepOutcome, TaskMailbox, TokenDropPolicy,
@@ -26,9 +26,10 @@ use crate::vm::pmap::PmapBatchPage;
 use crate::vm::structure::{PrivatePageError, PrivatePageSet};
 use crate::vm::{
     AccessMode, AddressSpace, LockMode, MapPlacement, PmapPublishOutcome, Prot, RangeGuard,
-    UserRange, UserVirtAddr, VmBacking, VmEntry, VmFault, VmFaultError, VmFaultMaterialization,
-    VmFaultMaterializationStep, VmFaultOutcome, VmMapCommit, VmMapError, VmMapOutcome,
-    VmMapRequest, VmMapTarget, VmRemapOutcome, VmRemapPlacement, VmRemapRequest, USER_PAGE_SIZE,
+    USER_PAGE_SIZE, UserRange, UserVirtAddr, VmBacking, VmEntry, VmEntryBacking, VmFault,
+    VmFaultError, VmFaultMaterialization, VmFaultMaterializationStep, VmFaultOutcome, VmMapCommit,
+    VmMapError, VmMapOutcome, VmMapRequest, VmMapTarget, VmRemapOutcome, VmRemapPlacement,
+    VmRemapRequest,
 };
 
 const PRIVATE_ANON_FAULT_BATCH_PAGES: usize = 16;
@@ -67,7 +68,7 @@ impl AddressSpace {
             return Err(VmFaultError::WouldBlock);
         };
 
-        let _entry = require_fault_publication(self, &outcome, &materialization)?;
+        require_fault_publication(self, &outcome, &materialization)?;
 
         self.pmap
             .publish_page_with_replacement(
@@ -123,7 +124,7 @@ impl AddressSpace {
         for entry in parent_recipes {
             let private = !entry.flags.shared;
             let range = entry.range;
-            if let (true, Some(parent_set)) = (private, &entry.private) {
+            if let (true, Some(parent_set)) = (private, entry.private()) {
                 let child_set = parent_set.fork_share().map_err(VmMapError::Private)?;
                 let child_entry = entry.clone().with_private(Some(child_set));
                 child.recipes.replace_entry(child_entry)?;
@@ -334,7 +335,7 @@ impl AddressSpace {
         );
         emit_vm_trace(
             b"debug.vm.fault.resolve.backing",
-            vm_backing_trace_id(&outcome.entry.backing),
+            vm_backing_trace_id(outcome.entry.backing_kind()),
         );
         emit_vm_trace(b"debug.vm.fault.resolve.phase", 2);
         Ok(FaultScriptResolve::Done(outcome))
@@ -371,12 +372,7 @@ impl AddressSpace {
         );
         emit_vm_trace(
             b"debug.vm.fault.publish.private_len",
-            outcome
-                .entry
-                .private
-                .as_ref()
-                .map(|set| set.len())
-                .unwrap_or(0) as i64,
+            outcome.entry.private().map(|set| set.len()).unwrap_or(0) as i64,
         );
         let _entry = require_fault_publication(self, outcome, &materialization)?;
         emit_vm_trace(b"debug.vm.fault.publish.phase", 3);
@@ -520,7 +516,7 @@ impl AddressSpace {
             let materialization = match outcome.materialize_pagebacked_step(&guard) {
                 VmFaultMaterializationStep::Done(materialization) => materialization,
                 VmFaultMaterializationStep::Blocked(_) | VmFaultMaterializationStep::Err(_) => {
-                    break
+                    break;
                 }
             };
             drop(guard);
@@ -937,7 +933,7 @@ impl AddressSpace {
         // `vm::scripts`). Without this, private write faults would
         // allocate pages straight into the pmap but skip the per-VmEntry
         // CoW store — fork would then have nothing to share.
-        let entry = if !entry.flags.shared && entry.prot.write && entry.private.is_none() {
+        let entry = if !entry.flags.shared && entry.prot.write && entry.private().is_none() {
             match PrivatePageSet::new_cap() {
                 Ok(set) => entry.with_private(Some(set)),
                 Err(e) => {
@@ -1062,11 +1058,11 @@ fn vm_fault_access_trace_id(access: AccessMode) -> i64 {
     }
 }
 
-fn vm_backing_trace_id(backing: &VmBacking) -> i64 {
+fn vm_backing_trace_id(backing: VmEntryBacking) -> i64 {
     match backing {
-        VmBacking::None => 0,
-        VmBacking::PrivateAnon => 1,
-        VmBacking::Page { .. } => 2,
+        VmEntryBacking::None => 0,
+        VmEntryBacking::PrivateAnon => 1,
+        VmEntryBacking::Page { .. } => 2,
     }
 }
 
@@ -1112,7 +1108,7 @@ fn private_anon_write_batch_shape(outcome: &VmFaultOutcome) -> bool {
     outcome.access == AccessMode::Write
         && !outcome.entry.flags.shared
         && outcome.entry.ufd_registration.is_none()
-        && matches!(outcome.entry.backing, VmBacking::PrivateAnon)
+        && matches!(outcome.entry.backing_kind(), VmEntryBacking::PrivateAnon)
         && outcome.entry.prot.write
         && outcome.entry.range.len() >= PRIVATE_ANON_FAULT_BATCH_MIN_VMA_BYTES
 }
@@ -1207,7 +1203,7 @@ impl AddressSpace {
             if !entry.range.overlaps(range) {
                 continue;
             }
-            let VmBacking::Page { pc, .. } = &entry.backing else {
+            let Some((pc, _)) = entry.page_backing() else {
                 continue;
             };
             if !matches!(pc.kind(), PageContainerKind::File { .. }) {

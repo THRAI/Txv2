@@ -10,7 +10,8 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use super::{
-    Prot, UfdRegistration, UserRange, UserVirtAddr, VmBacking, VmEntry, VmEntryFlags, VmMapError,
+    Prot, UfdRegistration, UserRange, UserVirtAddr, VmEntry, VmEntryBacking, VmEntryError,
+    VmEntryFlags, VmEntryProtectRewrite, VmEntryRewrite, VmMapError,
 };
 use crate::vm::adapter::step_engine::Cap;
 
@@ -63,30 +64,53 @@ impl<B: RecipeBackend> RecipeTreeWith<B> {
         self.inner.lookup(addr)
     }
 
+    pub(in crate::vm) fn lookup_ref(&self, addr: UserVirtAddr) -> Option<&VmEntry> {
+        self.inner.lookup_ref(addr)
+    }
+
     #[allow(dead_code)]
     pub(in crate::vm) fn lookup_view(&self, addr: UserVirtAddr) -> Option<VmEntryView<'_>> {
         self.inner.lookup_view(addr)
     }
 
+    #[allow(dead_code)]
     pub(in crate::vm) fn predecessor_entry(&self, key: UserVirtAddr) -> Option<VmEntry> {
         self.inner.predecessor_entry(key)
     }
 
+    pub(in crate::vm) fn predecessor_ref(&self, key: UserVirtAddr) -> Option<&VmEntry> {
+        self.inner.predecessor_ref(key)
+    }
+
+    #[allow(dead_code)]
     pub(in crate::vm) fn successor_entry(&self, key: UserVirtAddr) -> Option<VmEntry> {
         self.inner.successor_entry(key)
+    }
+
+    pub(in crate::vm) fn successor_ref(&self, key: UserVirtAddr) -> Option<&VmEntry> {
+        self.inner.successor_ref(key)
     }
 
     pub(in crate::vm) fn overlapping(&self, range: UserRange) -> Vec<VmEntry> {
         self.inner.overlapping(range)
     }
 
+    pub(in crate::vm) fn for_each_overlapping(
+        &self,
+        range: UserRange,
+        visitor: &mut dyn FnMut(&VmEntry),
+    ) {
+        self.inner.for_each_overlapping(range, visitor);
+    }
+
     pub(in crate::vm) fn insert_entry(&self, entry: VmEntry) -> (Self, usize) {
-        let (inner, touched) = self.inner.insert_entry(entry.clone());
+        let entry_len = entry.range.len();
+        let (inner, touched) = self.inner.insert_entry(entry);
         (
             Self {
                 inner,
                 len: self.len + 1,
-                vm_size: self.vm_size + entry.range.len(),
+                vm_size: self.vm_size + entry_len,
             },
             touched,
         )
@@ -127,17 +151,40 @@ impl<B: RecipeBackend> RecipeTreeWith<B> {
         range: UserRange,
         replacements: Vec<VmEntry>,
     ) -> (Self, Vec<VmEntry>, usize) {
-        let (inner, removed, touched) = self.inner.replace_range(range, replacements.clone());
-        let removed_vm_size = removed.iter().map(|entry| entry.range.len()).sum::<usize>();
+        let replacement_count = replacements.len();
         let replacement_vm_size = replacements
             .iter()
             .map(|entry| entry.range.len())
             .sum::<usize>();
+        let (inner, removed, touched) = self.inner.replace_range(range, replacements);
+        let removed_vm_size = removed.iter().map(|entry| entry.range.len()).sum::<usize>();
         (
             Self {
                 inner,
-                len: self.len - removed.len() + replacements.len(),
+                len: self.len - removed.len() + replacement_count,
                 vm_size: self.vm_size - removed_vm_size + replacement_vm_size,
+            },
+            removed,
+            touched,
+        )
+    }
+
+    pub(in crate::vm) fn replace_range_summary(
+        &self,
+        range: UserRange,
+        replacements: Vec<VmEntry>,
+    ) -> (Self, RemovedRecipeSummary, usize) {
+        let replacement_count = replacements.len();
+        let replacement_vm_size = replacements
+            .iter()
+            .map(|entry| entry.range.len())
+            .sum::<usize>();
+        let (inner, removed, touched) = self.inner.replace_range_summary(range, replacements);
+        (
+            Self {
+                inner,
+                len: self.len - removed.count + replacement_count,
+                vm_size: self.vm_size - removed.vm_size + replacement_vm_size,
             },
             removed,
             touched,
@@ -190,6 +237,81 @@ impl RecipeTreeWith<TreapRecipeIndex> {
             touched,
         )
     }
+
+    pub(in crate::vm) fn replace_entry_with_entries_summary(
+        &self,
+        existing: &VmEntry,
+        replacements: Vec<VmEntry>,
+    ) -> (Self, RemovedRecipeSummary, usize) {
+        self.replace_entry_at_with_entries_summary(existing.range.start(), replacements)
+    }
+
+    pub(in crate::vm) fn replace_entry_at_with_entries_summary(
+        &self,
+        existing_start: UserVirtAddr,
+        replacements: Vec<VmEntry>,
+    ) -> (Self, RemovedRecipeSummary, usize) {
+        let mut replacement_tree = TreapRecipeIndex { root: None };
+        let mut touched = 0usize;
+        let replacement_count = replacements.len();
+        let replacement_vm_size: usize = replacements.iter().map(|entry| entry.range.len()).sum();
+        for replacement in replacements {
+            let (next, replacement_touched) =
+                RecipeBackend::insert_entry(&replacement_tree, replacement);
+            replacement_tree = next;
+            touched += replacement_touched;
+        }
+
+        let mut removed = RemovedRecipeSummary::default();
+        let root = replace_node_with_subtree_summary(
+            self.inner.root.clone(),
+            existing_start,
+            replacement_tree.root,
+            &mut removed,
+            &mut touched,
+        );
+        let len = if removed.count > 0 {
+            self.len - 1 + replacement_count
+        } else {
+            self.len
+        };
+        let vm_size = if removed.count > 0 {
+            self.vm_size - removed.vm_size + replacement_vm_size
+        } else {
+            self.vm_size
+        };
+        (
+            Self {
+                inner: TreapRecipeIndex { root },
+                len,
+                vm_size,
+            },
+            removed,
+            touched,
+        )
+    }
+
+    pub(in crate::vm) fn replace_entry_at_with_rewrite_summary(
+        &self,
+        existing_start: UserVirtAddr,
+        rewrite: VmEntryRewrite,
+    ) -> (Self, RemovedRecipeSummary, usize) {
+        self.replace_entry_at_with_entries_summary(existing_start, rewrite.into_entries())
+    }
+
+    pub(in crate::vm) fn replace_entry_at_with_protect_summary(
+        &self,
+        existing_start: UserVirtAddr,
+        rewrite: VmEntryProtectRewrite,
+    ) -> Result<(Self, RemovedRecipeSummary, usize), VmMapError> {
+        let Some(existing) = self.inner.lookup_ref(existing_start) else {
+            return Ok((self.clone(), RemovedRecipeSummary::default(), 0));
+        };
+        let rewrite = rewrite
+            .into_rewrite_for(existing)
+            .map_err(recipe_tree_vm_entry_error)?;
+        Ok(self.replace_entry_at_with_rewrite_summary(existing_start, rewrite))
+    }
 }
 
 #[allow(dead_code)]
@@ -202,6 +324,105 @@ impl RecipeTreeWith<BPlusRecipeIndex> {
         let (rewritten, mut removed, touched) = self.replace_range(existing.range, replacements);
         (rewritten, removed.pop(), touched)
     }
+
+    pub(in crate::vm) fn replace_entry_with_entries_summary(
+        &self,
+        existing: &VmEntry,
+        replacements: Vec<VmEntry>,
+    ) -> (Self, RemovedRecipeSummary, usize) {
+        self.replace_range_summary(existing.range, replacements)
+    }
+
+    pub(in crate::vm) fn replace_entry_at_with_entries_summary(
+        &self,
+        existing_start: UserVirtAddr,
+        replacements: Vec<VmEntry>,
+    ) -> (Self, RemovedRecipeSummary, usize) {
+        let Some(existing) = self.inner.lookup_ref(existing_start) else {
+            return (self.clone(), RemovedRecipeSummary::default(), 0);
+        };
+        self.replace_range_summary(existing.range, replacements)
+    }
+
+    pub(in crate::vm) fn replace_entry_at_with_rewrite_summary(
+        &self,
+        existing_start: UserVirtAddr,
+        rewrite: VmEntryRewrite,
+    ) -> (Self, RemovedRecipeSummary, usize) {
+        if self.inner.lookup_ref(existing_start).is_none() {
+            return (self.clone(), RemovedRecipeSummary::default(), 0);
+        }
+        let replacement_count = rewrite.replacement_count();
+        let replacement_vm_size = rewrite.replacement_vm_size();
+        let mut removed = RemovedRecipeSummary::default();
+        let mut metrics = RewriteMetrics::default();
+        let root = self.inner.replace_one_entry_with_rewrite(
+            existing_start,
+            rewrite,
+            &mut removed,
+            &mut metrics,
+        );
+        if removed.count == 0 {
+            return (self.clone(), removed, 0);
+        }
+        super::recipe::record_last_publish_leaf_splits_for_tree(metrics.leaf_splits);
+        emit_bplus_rewrite_metrics(&metrics);
+        (
+            Self {
+                inner: BPlusRecipeIndex { root },
+                len: self.len - removed.count + replacement_count,
+                vm_size: self.vm_size - removed.vm_size + replacement_vm_size,
+            },
+            removed,
+            metrics.touched_entries,
+        )
+    }
+
+    pub(in crate::vm) fn replace_entry_at_with_protect_summary(
+        &self,
+        existing_start: UserVirtAddr,
+        rewrite: VmEntryProtectRewrite,
+    ) -> Result<(Self, RemovedRecipeSummary, usize), VmMapError> {
+        let Some(existing) = self.inner.lookup_ref(existing_start) else {
+            return Ok((self.clone(), RemovedRecipeSummary::default(), 0));
+        };
+        let replacement_count = rewrite
+            .replacement_count_for(existing)
+            .map_err(recipe_tree_vm_entry_error)?;
+        let replacement_vm_size = rewrite
+            .replacement_vm_size_for(existing)
+            .map_err(recipe_tree_vm_entry_error)?;
+        let mut removed = RemovedRecipeSummary::default();
+        let mut metrics = RewriteMetrics::default();
+        let root = self.inner.replace_one_entry_with_protect(
+            existing_start,
+            rewrite,
+            &mut removed,
+            &mut metrics,
+        )?;
+        if removed.count == 0 {
+            return Ok((self.clone(), removed, 0));
+        }
+        super::recipe::record_last_publish_leaf_splits_for_tree(metrics.leaf_splits);
+        emit_bplus_rewrite_metrics(&metrics);
+        Ok((
+            Self {
+                inner: BPlusRecipeIndex { root },
+                len: self.len - removed.count + replacement_count,
+                vm_size: self.vm_size - removed.vm_size + replacement_vm_size,
+            },
+            removed,
+            metrics.touched_entries,
+        ))
+    }
+}
+
+fn recipe_tree_vm_entry_error(error: VmEntryError) -> VmMapError {
+    match error {
+        VmEntryError::Range(_) | VmEntryError::RangeNotContained => VmMapError::InvalidRange,
+        VmEntryError::BackingOffsetOverflow => VmMapError::BackingOffsetOverflow,
+        VmEntryError::Private(error) => VmMapError::Private(error),
+    }
 }
 
 pub(in crate::vm) trait RecipeBackend: Clone + Default {
@@ -210,11 +431,21 @@ pub(in crate::vm) trait RecipeBackend: Clone + Default {
     fn backend_name(&self) -> &'static str;
     fn values_vec(&self) -> Vec<VmEntry>;
     fn lookup(&self, addr: UserVirtAddr) -> Option<VmEntry>;
+    fn lookup_ref(&self, addr: UserVirtAddr) -> Option<&VmEntry>;
     #[allow(dead_code)]
     fn lookup_view(&self, addr: UserVirtAddr) -> Option<VmEntryView<'_>>;
+    #[allow(dead_code)]
     fn predecessor_entry(&self, key: UserVirtAddr) -> Option<VmEntry>;
+    fn predecessor_ref(&self, key: UserVirtAddr) -> Option<&VmEntry>;
+    #[allow(dead_code)]
     fn successor_entry(&self, key: UserVirtAddr) -> Option<VmEntry>;
+    fn successor_ref(&self, key: UserVirtAddr) -> Option<&VmEntry>;
     fn overlapping(&self, range: UserRange) -> Vec<VmEntry>;
+    fn for_each_overlapping(&self, range: UserRange, visitor: &mut dyn FnMut(&VmEntry)) {
+        for entry in self.overlapping(range) {
+            visitor(&entry);
+        }
+    }
     fn insert_entry(&self, entry: VmEntry) -> (Self, usize);
     fn remove_exact(&self, key: UserVirtAddr) -> (Self, Option<VmEntry>, usize);
     fn replace_range(
@@ -222,7 +453,69 @@ pub(in crate::vm) trait RecipeBackend: Clone + Default {
         range: UserRange,
         replacements: Vec<VmEntry>,
     ) -> (Self, Vec<VmEntry>, usize);
+    fn replace_range_summary(
+        &self,
+        range: UserRange,
+        replacements: Vec<VmEntry>,
+    ) -> (Self, RemovedRecipeSummary, usize) {
+        let (next, removed, touched) = self.replace_range(range, replacements);
+        let summary = RemovedRecipeSummary::from_entries(&removed);
+        (next, summary, touched)
+    }
     fn reclaim_stats(&self) -> RecipeReclaimStats;
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(in crate::vm) struct RemovedRecipeSummary {
+    pub count: usize,
+    pub vm_size: usize,
+}
+
+impl RemovedRecipeSummary {
+    fn observe(&mut self, entry: &VmEntry) {
+        self.count += 1;
+        self.vm_size += entry.range.len();
+    }
+
+    fn from_entries(entries: &[VmEntry]) -> Self {
+        let mut summary = Self::default();
+        for entry in entries {
+            summary.observe(entry);
+        }
+        summary
+    }
+}
+
+struct RemovedRecipeRecorder<'a> {
+    entries: Option<&'a mut Vec<VmEntry>>,
+    summary: RemovedRecipeSummary,
+}
+
+impl<'a> RemovedRecipeRecorder<'a> {
+    fn collecting(entries: &'a mut Vec<VmEntry>) -> Self {
+        Self {
+            entries: Some(entries),
+            summary: RemovedRecipeSummary::default(),
+        }
+    }
+
+    fn summary_only() -> Self {
+        Self {
+            entries: None,
+            summary: RemovedRecipeSummary::default(),
+        }
+    }
+
+    fn observe(&mut self, entry: &VmEntry) {
+        self.summary.observe(entry);
+        if let Some(entries) = self.entries.as_deref_mut() {
+            entries.push(entry.clone());
+        }
+    }
+
+    fn into_summary(self) -> RemovedRecipeSummary {
+        self.summary
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -287,7 +580,8 @@ pub(in crate::vm) struct VmEntryView<'a> {
     pub range: UserRange,
     pub prot: Prot,
     pub flags: VmEntryFlags,
-    pub backing: &'a VmBacking,
+    pub backing: VmEntryBacking,
+    pub page: Option<(&'a Cap<crate::page_backed::PageContainer>, u64)>,
     pub ufd_registration: Option<UfdRegistration>,
     pub private: Option<&'a Cap<super::PrivatePageSet>>,
 }
@@ -333,30 +627,32 @@ impl RecipeBackend for TreapRecipeIndex {
         self.lookup_ref(addr).cloned()
     }
 
+    fn lookup_ref(&self, addr: UserVirtAddr) -> Option<&VmEntry> {
+        TreapRecipeIndex::lookup_ref(self, addr)
+    }
+
     fn lookup_view(&self, addr: UserVirtAddr) -> Option<VmEntryView<'_>> {
         self.lookup_ref(addr).map(view_for_entry)
     }
 
     fn predecessor_entry(&self, key: UserVirtAddr) -> Option<VmEntry> {
-        let mut cursor = self.root.as_deref();
-        let mut candidate = None;
-        while let Some(node) = cursor {
-            if node.key.as_usize() <= key.as_usize() {
-                candidate = Some(node.entry.clone());
-                cursor = node.right.as_deref();
-            } else {
-                cursor = node.left.as_deref();
-            }
-        }
-        candidate
+        self.predecessor_ref(key).cloned()
+    }
+
+    fn predecessor_ref(&self, key: UserVirtAddr) -> Option<&VmEntry> {
+        TreapRecipeIndex::predecessor_ref(self, key)
     }
 
     fn successor_entry(&self, key: UserVirtAddr) -> Option<VmEntry> {
+        self.successor_ref(key).cloned()
+    }
+
+    fn successor_ref(&self, key: UserVirtAddr) -> Option<&VmEntry> {
         let mut cursor = self.root.as_deref();
         let mut candidate = None;
         while let Some(node) = cursor {
             if node.key.as_usize() >= key.as_usize() {
-                candidate = Some(node.entry.clone());
+                candidate = Some(&node.entry);
                 cursor = node.left.as_deref();
             } else {
                 cursor = node.right.as_deref();
@@ -367,20 +663,31 @@ impl RecipeBackend for TreapRecipeIndex {
 
     fn overlapping(&self, range: UserRange) -> Vec<VmEntry> {
         let mut out = Vec::new();
-        if let Some(entry) = self.predecessor_entry(range.start()) {
+        if let Some(entry) = self.predecessor_ref(range.start()) {
             if entry.range.start().as_usize() < range.start().as_usize()
                 && entry.range.overlaps(range)
             {
-                out.push(entry);
+                out.push(entry.clone());
             }
         }
         collect_starting_in(&self.root, range, &mut out);
         out
     }
 
+    fn for_each_overlapping(&self, range: UserRange, visitor: &mut dyn FnMut(&VmEntry)) {
+        if let Some(entry) = self.predecessor_ref(range.start()) {
+            if entry.range.start().as_usize() < range.start().as_usize()
+                && entry.range.overlaps(range)
+            {
+                visitor(entry);
+            }
+        }
+        visit_starting_in(&self.root, range, visitor);
+    }
+
     fn insert_entry(&self, entry: VmEntry) -> (Self, usize) {
         let mut touched = 0usize;
-        let root = insert_node(self.root.clone(), entry.clone(), &mut touched);
+        let root = insert_node(self.root.clone(), entry, &mut touched);
         (Self { root: Some(root) }, touched)
     }
 
@@ -428,6 +735,41 @@ impl RecipeBackend for TreapRecipeIndex {
         (Self { root }, removed, touched_total)
     }
 
+    fn replace_range_summary(
+        &self,
+        range: UserRange,
+        replacements: Vec<VmEntry>,
+    ) -> (Self, RemovedRecipeSummary, usize) {
+        let mut touched_total = 0usize;
+        let (before_start, from_start) =
+            split_root_before(self.root.clone(), range.start(), &mut touched_total);
+        let (middle, after_end) = split_root_before(from_start, range.end(), &mut touched_total);
+
+        let mut removed = RemovedRecipeSummary::default();
+        let mut left = TreapRecipeIndex { root: before_start };
+        if let Some(boundary) = left.predecessor_entry(range.start()) {
+            if boundary.range.overlaps(range) {
+                removed.observe(&boundary);
+                let (next_left, _, touched) =
+                    RecipeBackend::remove_exact(&left, boundary.range.start());
+                left = next_left;
+                touched_total += touched;
+            }
+        }
+
+        summarize_treap_values(&middle, &mut removed);
+        let mut replacement_root = TreapRecipeIndex { root: None };
+        for entry in replacements {
+            let (next, touched) = RecipeBackend::insert_entry(&replacement_root, entry);
+            replacement_root = next;
+            touched_total += touched;
+        }
+
+        let joined = merge_nodes(left.root, replacement_root.root, &mut touched_total);
+        let root = merge_nodes(joined, after_end, &mut touched_total);
+        (Self { root }, removed, touched_total)
+    }
+
     fn reclaim_stats(&self) -> RecipeReclaimStats {
         RecipeReclaimStats {
             entries: node_len(&self.root),
@@ -452,6 +794,20 @@ impl TreapRecipeIndex {
         }
         candidate.filter(|entry| entry.range.contains_addr(addr))
     }
+
+    fn predecessor_ref(&self, key: UserVirtAddr) -> Option<&VmEntry> {
+        let mut cursor = self.root.as_deref();
+        let mut candidate = None;
+        while let Some(node) = cursor {
+            if node.key.as_usize() <= key.as_usize() {
+                candidate = Some(&node.entry);
+                cursor = node.right.as_deref();
+            } else {
+                cursor = node.left.as_deref();
+            }
+        }
+        candidate
+    }
 }
 
 fn collect_values(root: &Option<Arc<RecipeNode>>, out: &mut Vec<VmEntry>) {
@@ -461,6 +817,15 @@ fn collect_values(root: &Option<Arc<RecipeNode>>, out: &mut Vec<VmEntry>) {
     collect_values(&node.left, out);
     out.push(node.entry.clone());
     collect_values(&node.right, out);
+}
+
+fn summarize_treap_values(root: &Option<Arc<RecipeNode>>, out: &mut RemovedRecipeSummary) {
+    let Some(node) = root else {
+        return;
+    };
+    summarize_treap_values(&node.left, out);
+    out.observe(&node.entry);
+    summarize_treap_values(&node.right, out);
 }
 
 fn collect_starting_in(root: &Option<Arc<RecipeNode>>, range: UserRange, out: &mut Vec<VmEntry>) {
@@ -478,6 +843,28 @@ fn collect_starting_in(root: &Option<Arc<RecipeNode>>, range: UserRange, out: &m
     }
     if node.key.as_usize() < range.end().as_usize() {
         collect_starting_in(&node.right, range, out);
+    }
+}
+
+fn visit_starting_in(
+    root: &Option<Arc<RecipeNode>>,
+    range: UserRange,
+    visitor: &mut dyn FnMut(&VmEntry),
+) {
+    let Some(node) = root else {
+        return;
+    };
+    if node.key.as_usize() >= range.start().as_usize() {
+        visit_starting_in(&node.left, range, visitor);
+    }
+    if node.key.as_usize() >= range.start().as_usize()
+        && node.key.as_usize() < range.end().as_usize()
+        && node.entry.range.overlaps(range)
+    {
+        visitor(&node.entry);
+    }
+    if node.key.as_usize() < range.end().as_usize() {
+        visit_starting_in(&node.right, range, visitor);
     }
 }
 
@@ -635,6 +1022,51 @@ fn replace_node_with_subtree(
     }
 
     *replaced = Some(node.entry.clone());
+    let root = merge_nodes(node.left.clone(), replacement, touched);
+    merge_nodes(root, node.right.clone(), touched)
+}
+
+fn replace_node_with_subtree_summary(
+    root: Option<Arc<RecipeNode>>,
+    key: UserVirtAddr,
+    replacement: Option<Arc<RecipeNode>>,
+    replaced: &mut RemovedRecipeSummary,
+    touched: &mut usize,
+) -> Option<Arc<RecipeNode>> {
+    let node = root?;
+    *touched += 1;
+    if key.as_usize() < node.key.as_usize() {
+        return Some(build_node(
+            node.key,
+            node.priority,
+            node.entry.clone(),
+            replace_node_with_subtree_summary(
+                node.left.clone(),
+                key,
+                replacement,
+                replaced,
+                touched,
+            ),
+            node.right.clone(),
+        ));
+    }
+    if key.as_usize() > node.key.as_usize() {
+        return Some(build_node(
+            node.key,
+            node.priority,
+            node.entry.clone(),
+            node.left.clone(),
+            replace_node_with_subtree_summary(
+                node.right.clone(),
+                key,
+                replacement,
+                replaced,
+                touched,
+            ),
+        ));
+    }
+
+    replaced.observe(&node.entry);
     let root = merge_nodes(node.left.clone(), replacement, touched);
     merge_nodes(root, node.right.clone(), touched)
 }
@@ -809,9 +1241,10 @@ const BPLUS_INTERNAL_SEPARATOR_CAP: usize = BPLUS_INTERNAL_FANOUT - 1;
 //     root-exempt, while leaf fill and non-root internal fanout tests enforce
 //     the lower-fill floor after representative delete/trim operations.
 // [x] Persistent node storage no longer depends on heap-backed `Vec` fields.
-//     Leaves, separators, and children use fixed-capacity inline chunks; leaf
-//     entries are `Arc<VmEntry>` so rebuilding a leaf pointer-shares unchanged
-//     entries instead of deep-cloning every occupied slot.
+//     Leaves, separators, and children use fixed-capacity inline chunks. This
+//     rollback keeps the measured no-scratch Arc-entry leaf shape: replacement
+//     entries move into leaves directly, and unchanged survivors are cloned once
+//     into the replacement leaf rather than deferred through leaf indirection.
 // [x] Multi-leaf range replacement is localized and performs coalesce-on-copy
 //     repair for copied leaves and internal child groups after trims/removes.
 //     Leaf repair now rebalances only the underfull leaf plus adjacent sibling
@@ -829,16 +1262,20 @@ const BPLUS_INTERNAL_SEPARATOR_CAP: usize = BPLUS_INTERNAL_FANOUT - 1;
 //     no-regression checks.
 //
 // Latest evidence, 2026-06-02:
-// `recipe-bplus-arc-pthread-lock-20260602-124405` proved the Arc-entry leaf
-// fix removed the deep-clone regression (`bplus.copied_entries avg=0.997`), but
-// full pthread service was still `avg=1.102ms` and publish was `avg=982us`.
+// `recipe-bplus-arc-pthread-lock-20260602-124405` proved the first Arc-entry
+// leaf fix removed the deep-clone regression (`bplus.copied_entries avg=0.997`),
+// but full pthread service was still `avg=1.102ms` and publish was `avg=982us`.
 // `recipe-bplus-fanout16-pthread-lock-20260602-132000` narrows internal fanout
 // to 16, builds internal and leaf chunks directly from occupied slices, and
 // collapses single-child roots after delete rebuilds. That improved full
 // pthread service to `avg=720.8us` and publish to `avg=604.5us`
 // (`bplus.copied_child_refs avg=5.22`, `tree_depth avg=1.63`). It still loses
 // to the treap reference (`avg=645.5us`) and misses the promotion target
-// (`<=516us`), so B+ remains cfg-only.
+// (`<=516us`), so B+ remains cfg-only. Shape counters are now gated behind
+// `tx_vm_recipe_bplus_shape_metrics`; normal service comparisons keep them off
+// so treap and B+ lock measurements pay symmetric observe overhead. The former
+// per-entry Arc wrapper is gone; `tx_vm_recipe_bplus_arc_metrics` remains as a
+// no-op regression guard proving owned leaf entries do not allocate entry Arcs.
 #[derive(Clone, Default)]
 pub(in crate::vm) struct BPlusRecipeIndex {
     root: Option<Arc<BPlusNode>>,
@@ -850,7 +1287,7 @@ enum BPlusNode {
 }
 
 struct BPlusLeaf {
-    entries: InlineVec<Arc<VmEntry>, BPLUS_LEAF_CAP>,
+    entries: InlineVec<BPlusEntryRef, BPLUS_LEAF_CAP>,
     len: usize,
     vm_size: usize,
 }
@@ -866,6 +1303,20 @@ struct BPlusInternal {
 struct InlineVec<T, const N: usize> {
     entries: [Option<T>; N],
     len: usize,
+}
+
+type BPlusEntryRef = Arc<VmEntry>;
+
+#[cfg(all(test, tx_vm_recipe_bplus_arc_metrics))]
+fn reset_bplus_entry_arc_counts_for_test() {}
+
+#[cfg(all(test, tx_vm_recipe_bplus_arc_metrics))]
+fn bplus_entry_arc_clone_count_for_test() -> usize {
+    0
+}
+
+fn bplus_entry_ref_new(entry: VmEntry) -> BPlusEntryRef {
+    Arc::new(entry)
 }
 
 impl<T, const N: usize> Default for InlineVec<T, N> {
@@ -922,12 +1373,6 @@ impl<T, const N: usize> InlineVec<T, N> {
     }
 }
 
-impl<T: Clone, const N: usize> InlineVec<T, N> {
-    fn to_vec(&self) -> Vec<T> {
-        self.iter().cloned().collect()
-    }
-}
-
 impl<T, const N: usize> core::ops::Index<usize> for InlineVec<T, N> {
     type Output = T;
 
@@ -981,22 +1426,32 @@ impl RecipeBackend for BPlusRecipeIndex {
         self.lookup_ref(addr).cloned()
     }
 
+    fn lookup_ref(&self, addr: UserVirtAddr) -> Option<&VmEntry> {
+        BPlusRecipeIndex::lookup_ref(self, addr)
+    }
+
     fn lookup_view(&self, addr: UserVirtAddr) -> Option<VmEntryView<'_>> {
         self.lookup_ref(addr).map(view_for_entry)
     }
 
     fn predecessor_entry(&self, key: UserVirtAddr) -> Option<VmEntry> {
+        self.predecessor_ref(key).cloned()
+    }
+
+    fn predecessor_ref(&self, key: UserVirtAddr) -> Option<&VmEntry> {
         self.root
             .as_ref()
             .and_then(|root| bplus_predecessor(root, key))
-            .cloned()
     }
 
     fn successor_entry(&self, key: UserVirtAddr) -> Option<VmEntry> {
+        self.successor_ref(key).cloned()
+    }
+
+    fn successor_ref(&self, key: UserVirtAddr) -> Option<&VmEntry> {
         self.root
             .as_ref()
             .and_then(|root| bplus_successor(root, key))
-            .cloned()
     }
 
     fn overlapping(&self, range: UserRange) -> Vec<VmEntry> {
@@ -1005,10 +1460,14 @@ impl RecipeBackend for BPlusRecipeIndex {
         out
     }
 
+    fn for_each_overlapping(&self, range: UserRange, visitor: &mut dyn FnMut(&VmEntry)) {
+        visit_bplus_overlapping(&self.root, range, visitor);
+    }
+
     fn insert_entry(&self, entry: VmEntry) -> (Self, usize) {
         let mut metrics = RewriteMetrics::default();
         metrics.copied_entries += 1;
-        let entry = Arc::new(entry);
+        let entry = bplus_entry_ref_new(entry);
         let root = match &self.root {
             Some(root) => {
                 let height = bplus_height(root);
@@ -1046,9 +1505,86 @@ impl RecipeBackend for BPlusRecipeIndex {
         range: UserRange,
         replacements: Vec<VmEntry>,
     ) -> (Self, Vec<VmEntry>, usize) {
+        let mut removed = Vec::new();
+        let (next, _, touched) = self.replace_range_with_recorder(
+            range,
+            replacements,
+            RemovedRecipeRecorder::collecting(&mut removed),
+        );
+        (next, removed, touched)
+    }
+
+    fn replace_range_summary(
+        &self,
+        range: UserRange,
+        replacements: Vec<VmEntry>,
+    ) -> (Self, RemovedRecipeSummary, usize) {
+        self.replace_range_with_recorder(range, replacements, RemovedRecipeRecorder::summary_only())
+    }
+
+    fn reclaim_stats(&self) -> RecipeReclaimStats {
+        let mut stats = RecipeReclaimStats::default();
+        if let Some(root) = &self.root {
+            collect_bplus_reclaim_stats(root, &mut stats, true);
+            stats.tree_depth = bplus_height(root);
+        }
+        stats
+    }
+}
+
+impl BPlusRecipeIndex {
+    fn replace_one_entry_with_rewrite(
+        &self,
+        existing_start: UserVirtAddr,
+        rewrite: VmEntryRewrite,
+        removed: &mut RemovedRecipeSummary,
+        metrics: &mut RewriteMetrics,
+    ) -> Option<Arc<BPlusNode>> {
+        let Some(root) = &self.root else {
+            return None;
+        };
+        let nodes = replace_one_entry_bplus_node(root, existing_start, rewrite, removed, metrics);
+        if removed.count == 0 {
+            return self.root.clone();
+        }
+        build_bplus_root_from_level(nodes, bplus_height(root), metrics)
+    }
+
+    fn replace_one_entry_with_protect(
+        &self,
+        existing_start: UserVirtAddr,
+        rewrite: VmEntryProtectRewrite,
+        removed: &mut RemovedRecipeSummary,
+        metrics: &mut RewriteMetrics,
+    ) -> Result<Option<Arc<BPlusNode>>, VmMapError> {
+        let Some(root) = &self.root else {
+            return Ok(None);
+        };
+        let nodes = replace_one_entry_bplus_node_with_protect(
+            root,
+            existing_start,
+            rewrite,
+            removed,
+            metrics,
+        )?;
+        if removed.count == 0 {
+            return Ok(self.root.clone());
+        }
+        Ok(build_bplus_root_from_level(
+            nodes,
+            bplus_height(root),
+            metrics,
+        ))
+    }
+
+    fn replace_range_with_recorder(
+        &self,
+        range: UserRange,
+        replacements: Vec<VmEntry>,
+        mut removed: RemovedRecipeRecorder<'_>,
+    ) -> (Self, RemovedRecipeSummary, usize) {
         let mut replacements = replacements;
         replacements.sort_by_key(|entry| entry.range.start().as_usize());
-        let mut removed = Vec::new();
         let mut metrics = RewriteMetrics::default();
         let root = match &self.root {
             Some(root) => {
@@ -1078,50 +1614,43 @@ impl RecipeBackend for BPlusRecipeIndex {
         };
 
         if self.root.is_none() && root.is_none() {
-            return (Self { root: None }, removed, 0);
+            return (Self { root: None }, removed.into_summary(), 0);
         } else {
             super::recipe::record_last_publish_leaf_splits_for_tree(metrics.leaf_splits);
             emit_bplus_rewrite_metrics(&metrics);
         }
-        metrics.changed_pages = removed
-            .iter()
-            .map(|entry| entry.range.page_count())
-            .sum::<usize>();
-        (Self { root }, removed, metrics.touched_entries)
-    }
-
-    fn reclaim_stats(&self) -> RecipeReclaimStats {
-        let mut stats = RecipeReclaimStats::default();
-        if let Some(root) = &self.root {
-            collect_bplus_reclaim_stats(root, &mut stats, true);
-            stats.tree_depth = bplus_height(root);
-        }
-        stats
+        metrics.changed_pages = removed.summary.vm_size / super::USER_PAGE_SIZE;
+        (
+            Self { root },
+            removed.into_summary(),
+            metrics.touched_entries,
+        )
     }
 }
 
 fn append_leaf_chunks(
     leaves: &mut Vec<Arc<BPlusNode>>,
-    entries: Vec<Arc<VmEntry>>,
+    entries: Vec<BPlusEntryRef>,
     metrics: &mut RewriteMetrics,
 ) {
-    for (start, end) in
-        bplus_balanced_chunk_ranges(entries.len(), BPLUS_LEAF_CAP, BPLUS_LEAF_MIN_FILL)
-    {
-        let chunk = &entries[start..end];
-        if chunk.is_empty() {
+    let ranges = bplus_balanced_chunk_ranges(entries.len(), BPLUS_LEAF_CAP, BPLUS_LEAF_MIN_FILL);
+    let mut entries = entries.into_iter();
+    for (start, end) in ranges {
+        let chunk_len = end - start;
+        if chunk_len == 0 {
             continue;
         }
-        metrics.observe_leaf_fill(chunk.len());
-        metrics.touched_entries += chunk.len();
+        metrics.observe_leaf_fill(chunk_len);
+        metrics.touched_entries += chunk_len;
         metrics.allocated_nodes_or_chunks += 1;
         super::recipe::record_recipe_chunk_alloc_for_tree();
-        leaves.push(Arc::new(BPlusNode::Leaf(BPlusLeaf::from_entry_slice(
-            chunk,
+        leaves.push(Arc::new(BPlusNode::Leaf(BPlusLeaf::from_owned_entries(
+            entries.by_ref().take(chunk_len),
         ))));
     }
 }
 
+#[cfg(tx_vm_recipe_bplus_shape_metrics)]
 fn emit_bplus_rewrite_metrics(metrics: &RewriteMetrics) {
     super::recipe::emit_vm_recipe_trace_for_tree(
         b"debug.vm.recipe.bplus.allocated_chunks",
@@ -1166,13 +1695,16 @@ fn emit_bplus_rewrite_metrics(metrics: &RewriteMetrics) {
     );
 }
 
+#[cfg(not(tx_vm_recipe_bplus_shape_metrics))]
+fn emit_bplus_rewrite_metrics(_metrics: &RewriteMetrics) {}
+
 impl BPlusRecipeIndex {
     fn lookup_ref(&self, addr: UserVirtAddr) -> Option<&VmEntry> {
         let leaf = self.find_leaf(addr)?;
         let mut candidate = None;
-        for entry in leaf.entries.iter() {
+        for entry in leaf.iter() {
             if entry.range.start().as_usize() <= addr.as_usize() {
-                candidate = Some(entry.as_ref());
+                candidate = Some(entry);
             } else {
                 break;
             }
@@ -1196,12 +1728,14 @@ impl BPlusRecipeIndex {
 }
 
 impl BPlusLeaf {
-    fn from_entry_slice(entries: &[Arc<VmEntry>]) -> Self {
-        let len = entries.len();
-        let vm_size = entries.iter().map(|entry| entry.range.len()).sum();
+    fn from_owned_entries(entries: impl IntoIterator<Item = BPlusEntryRef>) -> Self {
         let mut inline_entries = InlineVec::default();
+        let mut len = 0usize;
+        let mut vm_size = 0usize;
         for entry in entries {
-            inline_entries.push(entry.clone());
+            len += 1;
+            vm_size += entry.range.len();
+            inline_entries.push(entry);
         }
         Self {
             entries: inline_entries,
@@ -1209,31 +1743,77 @@ impl BPlusLeaf {
             vm_size,
         }
     }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn iter(&self) -> BPlusLeafIter<'_> {
+        BPlusLeafIter {
+            leaf: self,
+            index: 0,
+        }
+    }
+
+    fn first(&self) -> Option<&VmEntry> {
+        self.entries.first().map(Arc::as_ref)
+    }
+
+    fn last(&self) -> Option<&VmEntry> {
+        self.entries.last().map(Arc::as_ref)
+    }
+
+    fn entry_at(&self, idx: usize) -> Option<&VmEntry> {
+        self.entry_ref_at(idx).map(Arc::as_ref)
+    }
+
+    fn entry_ref_at(&self, idx: usize) -> Option<&BPlusEntryRef> {
+        self.entries.get(idx)
+    }
+}
+
+struct BPlusLeafIter<'a> {
+    leaf: &'a BPlusLeaf,
+    index: usize,
+}
+
+impl<'a> Iterator for BPlusLeafIter<'a> {
+    type Item = &'a VmEntry;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let entry = self.leaf.entry_at(self.index)?;
+        self.index += 1;
+        Some(entry)
+    }
 }
 
 struct ReplacementCursor {
-    entries: Vec<Arc<VmEntry>>,
+    entries: Vec<BPlusEntryRef>,
     inserted: bool,
 }
 
 impl ReplacementCursor {
     fn new(entries: Vec<VmEntry>) -> Self {
         Self {
-            entries: entries.into_iter().map(Arc::new).collect(),
+            entries: entries.into_iter().map(bplus_entry_ref_new).collect(),
             inserted: false,
         }
     }
 
-    fn take_all(&mut self) -> Vec<Arc<VmEntry>> {
+    fn take_all(&mut self) -> Vec<BPlusEntryRef> {
         self.inserted = true;
         core::mem::take(&mut self.entries)
+    }
+
+    fn first_start(&self) -> Option<UserVirtAddr> {
+        self.entries.first().map(|entry| entry.range.start())
     }
 
     fn mark_inserted(&mut self) {
         self.inserted = true;
     }
 
-    fn remaining(&self) -> &[Arc<VmEntry>] {
+    fn remaining(&self) -> &[BPlusEntryRef] {
         &self.entries
     }
 }
@@ -1241,11 +1821,9 @@ impl ReplacementCursor {
 fn bplus_predecessor(node: &Arc<BPlusNode>, key: UserVirtAddr) -> Option<&VmEntry> {
     match node.as_ref() {
         BPlusNode::Leaf(leaf) => leaf
-            .entries
             .iter()
             .take_while(|entry| entry.range.start().as_usize() <= key.as_usize())
-            .last()
-            .map(Arc::as_ref),
+            .last(),
         BPlusNode::Internal(internal) => {
             let idx = child_index_for(internal.separators.iter(), key);
             let mut candidate = internal
@@ -1265,10 +1843,8 @@ fn bplus_predecessor(node: &Arc<BPlusNode>, key: UserVirtAddr) -> Option<&VmEntr
 fn bplus_successor(node: &Arc<BPlusNode>, key: UserVirtAddr) -> Option<&VmEntry> {
     match node.as_ref() {
         BPlusNode::Leaf(leaf) => leaf
-            .entries
             .iter()
-            .find(|entry| entry.range.start().as_usize() >= key.as_usize())
-            .map(Arc::as_ref),
+            .find(|entry| entry.range.start().as_usize() >= key.as_usize()),
         BPlusNode::Internal(internal) => {
             let idx = child_index_for(internal.separators.iter(), key);
             let mut candidate = internal
@@ -1296,13 +1872,24 @@ fn collect_bplus_overlapping(
     collect_bplus_overlapping_node(root, range, out);
 }
 
+fn visit_bplus_overlapping(
+    root: &Option<Arc<BPlusNode>>,
+    range: UserRange,
+    visitor: &mut dyn FnMut(&VmEntry),
+) {
+    let Some(root) = root else {
+        return;
+    };
+    visit_bplus_overlapping_node(root, range, visitor);
+}
+
 fn collect_bplus_overlapping_node(node: &Arc<BPlusNode>, range: UserRange, out: &mut Vec<VmEntry>) {
     if !bplus_node_may_overlap(node, range) {
         return;
     }
     match node.as_ref() {
         BPlusNode::Leaf(leaf) => {
-            for entry in leaf.entries.iter() {
+            for entry in leaf.iter() {
                 if entry.range.end().as_usize() <= range.start().as_usize() {
                     continue;
                 }
@@ -1310,7 +1897,7 @@ fn collect_bplus_overlapping_node(node: &Arc<BPlusNode>, range: UserRange, out: 
                     break;
                 }
                 if entry.range.overlaps(range) {
-                    out.push(entry.as_ref().clone());
+                    out.push(entry.clone());
                 }
             }
         }
@@ -1322,19 +1909,45 @@ fn collect_bplus_overlapping_node(node: &Arc<BPlusNode>, range: UserRange, out: 
     }
 }
 
+fn visit_bplus_overlapping_node(
+    node: &Arc<BPlusNode>,
+    range: UserRange,
+    visitor: &mut dyn FnMut(&VmEntry),
+) {
+    if !bplus_node_may_overlap(node, range) {
+        return;
+    }
+    match node.as_ref() {
+        BPlusNode::Leaf(leaf) => {
+            for entry in leaf.iter() {
+                if entry.range.end().as_usize() <= range.start().as_usize() {
+                    continue;
+                }
+                if entry.range.start().as_usize() >= range.end().as_usize() {
+                    break;
+                }
+                if entry.range.overlaps(range) {
+                    visitor(entry);
+                }
+            }
+        }
+        BPlusNode::Internal(internal) => {
+            for child in internal.children.iter() {
+                visit_bplus_overlapping_node(child, range, visitor);
+            }
+        }
+    }
+}
+
 fn insert_bplus_node(
     node: &Arc<BPlusNode>,
-    entry: Arc<VmEntry>,
+    entry: BPlusEntryRef,
     metrics: &mut RewriteMetrics,
 ) -> Vec<Arc<BPlusNode>> {
     match node.as_ref() {
         BPlusNode::Leaf(leaf) => {
-            let mut entries = leaf.entries.to_vec();
-            let pos = entries
-                .binary_search_by_key(&entry.range.start().as_usize(), |candidate| {
-                    candidate.range.start().as_usize()
-                })
-                .unwrap_or_else(|pos| pos);
+            let pos = bplus_leaf_index_for_start(leaf, entry.range.start());
+            let mut entries = leaf.entries.iter().cloned().collect::<Vec<_>>();
             entries.insert(pos, entry);
             bplus_leaf_nodes_from_entries(entries, metrics)
         }
@@ -1354,12 +1967,13 @@ fn remove_bplus_node(
 ) -> Vec<Arc<BPlusNode>> {
     match node.as_ref() {
         BPlusNode::Leaf(leaf) => {
-            let mut entries = leaf.entries.to_vec();
-            if let Ok(pos) = entries.binary_search_by_key(&key.as_usize(), |candidate| {
-                candidate.range.start().as_usize()
-            }) {
-                *removed = Some(entries.remove(pos).as_ref().clone());
-            }
+            let pos = bplus_leaf_index_for_start(leaf, key);
+            let mut entries = leaf.entries.iter().cloned().collect::<Vec<_>>();
+            let Some(entry) = entries.get(pos).filter(|entry| entry.range.start() == key) else {
+                return alloc::vec![node.clone()];
+            };
+            *removed = Some(entry.as_ref().clone());
+            entries.remove(pos);
             bplus_leaf_nodes_from_entries(entries, metrics)
         }
         BPlusNode::Internal(internal) => {
@@ -1370,11 +1984,143 @@ fn remove_bplus_node(
     }
 }
 
+fn replace_one_entry_bplus_node(
+    node: &Arc<BPlusNode>,
+    existing_start: UserVirtAddr,
+    rewrite: VmEntryRewrite,
+    removed: &mut RemovedRecipeSummary,
+    metrics: &mut RewriteMetrics,
+) -> Vec<Arc<BPlusNode>> {
+    match node.as_ref() {
+        BPlusNode::Leaf(leaf) => {
+            let mut entries = Vec::with_capacity(leaf.len() + rewrite.replacement_count());
+            let mut rewrite = Some(rewrite);
+
+            for idx in 0..leaf.len() {
+                let entry = leaf.entry_at(idx).expect("B+ leaf index in bounds");
+                if entry.range.start() == existing_start {
+                    removed.observe(entry);
+                    if let Some(rewrite) = rewrite.take() {
+                        push_rewrite_entries(&mut entries, rewrite, metrics);
+                    }
+                } else {
+                    entries.push(
+                        leaf.entry_ref_at(idx)
+                            .expect("B+ leaf index in bounds")
+                            .clone(),
+                    );
+                }
+            }
+
+            if removed.count == 0 {
+                return alloc::vec![node.clone()];
+            }
+            bplus_leaf_nodes_from_entries(entries, metrics)
+        }
+        BPlusNode::Internal(internal) => {
+            let idx = child_index_for(internal.separators.iter(), existing_start);
+            let child_nodes = replace_one_entry_bplus_node(
+                &internal.children[idx],
+                existing_start,
+                rewrite,
+                removed,
+                metrics,
+            );
+            if child_nodes.len() == 1
+                && Arc::ptr_eq(&child_nodes[0], &internal.children[idx])
+                && removed.count == 0
+            {
+                return alloc::vec![node.clone()];
+            }
+            bplus_internal_nodes_replacing_child(internal, idx, child_nodes, metrics)
+        }
+    }
+}
+
+fn replace_one_entry_bplus_node_with_protect(
+    node: &Arc<BPlusNode>,
+    existing_start: UserVirtAddr,
+    rewrite: VmEntryProtectRewrite,
+    removed: &mut RemovedRecipeSummary,
+    metrics: &mut RewriteMetrics,
+) -> Result<Vec<Arc<BPlusNode>>, VmMapError> {
+    match node.as_ref() {
+        BPlusNode::Leaf(leaf) => {
+            let mut entries = Vec::with_capacity(leaf.len() + BPLUS_LEAF_CAP);
+
+            for idx in 0..leaf.len() {
+                let entry = leaf.entry_at(idx).expect("B+ leaf index in bounds");
+                if entry.range.start() == existing_start {
+                    removed.observe(entry);
+                    push_protect_rewrite_entries(&mut entries, entry, rewrite, metrics)?;
+                } else {
+                    entries.push(
+                        leaf.entry_ref_at(idx)
+                            .expect("B+ leaf index in bounds")
+                            .clone(),
+                    );
+                }
+            }
+
+            if removed.count == 0 {
+                return Ok(alloc::vec![node.clone()]);
+            }
+            Ok(bplus_leaf_nodes_from_entries(entries, metrics))
+        }
+        BPlusNode::Internal(internal) => {
+            let idx = child_index_for(internal.separators.iter(), existing_start);
+            let child_nodes = replace_one_entry_bplus_node_with_protect(
+                &internal.children[idx],
+                existing_start,
+                rewrite,
+                removed,
+                metrics,
+            )?;
+            if child_nodes.len() == 1
+                && Arc::ptr_eq(&child_nodes[0], &internal.children[idx])
+                && removed.count == 0
+            {
+                return Ok(alloc::vec![node.clone()]);
+            }
+            Ok(bplus_internal_nodes_replacing_child(
+                internal,
+                idx,
+                child_nodes,
+                metrics,
+            ))
+        }
+    }
+}
+
+fn push_rewrite_entries(
+    entries: &mut Vec<BPlusEntryRef>,
+    rewrite: VmEntryRewrite,
+    metrics: &mut RewriteMetrics,
+) {
+    for entry in rewrite.into_entries() {
+        metrics.copied_entries += 1;
+        entries.push(bplus_entry_ref_new(entry));
+    }
+}
+
+fn push_protect_rewrite_entries(
+    entries: &mut Vec<BPlusEntryRef>,
+    existing: &VmEntry,
+    rewrite: VmEntryProtectRewrite,
+    metrics: &mut RewriteMetrics,
+) -> Result<(), VmMapError> {
+    let rewrite = rewrite
+        .into_rewrite_for(existing)
+        .map_err(recipe_tree_vm_entry_error)?;
+    push_rewrite_entries(entries, rewrite, metrics);
+    Ok(())
+}
+
 fn replace_range_bplus_node(
     node: &Arc<BPlusNode>,
     range: UserRange,
     replacements: &mut ReplacementCursor,
-    removed: &mut Vec<VmEntry>,
+    removed: &mut RemovedRecipeRecorder<'_>,
     metrics: &mut RewriteMetrics,
 ) -> Vec<Arc<BPlusNode>> {
     if bplus_node_before_range(node, range) {
@@ -1395,14 +2141,26 @@ fn replace_range_bplus_node(
 
     match node.as_ref() {
         BPlusNode::Leaf(leaf) => {
-            let mut entries = Vec::with_capacity(leaf.entries.len() + replacements.entries.len());
+            let mut entries = Vec::with_capacity(leaf.len() + replacements.entries.len());
             let mut changed = false;
-            for entry in leaf.entries.iter() {
+            for idx in 0..leaf.len() {
+                let entry = leaf.entry_at(idx).expect("B+ leaf index in bounds");
+                if !replacements.inserted
+                    && replacements
+                        .first_start()
+                        .is_some_and(|start| start.as_usize() < entry.range.start().as_usize())
+                {
+                    entries.extend(replacements.take_all());
+                }
                 if entry.range.overlaps(range) {
                     changed = true;
-                    removed.push(entry.as_ref().clone());
+                    removed.observe(entry);
                 } else {
-                    entries.push(entry.clone());
+                    entries.push(
+                        leaf.entry_ref_at(idx)
+                            .expect("B+ leaf index in bounds")
+                            .clone(),
+                    );
                 }
             }
             if !replacements.inserted {
@@ -1412,7 +2170,6 @@ fn replace_range_bplus_node(
                 }
                 entries.extend(replacements.take_all());
             }
-            entries.sort_by_key(|entry| entry.range.start().as_usize());
             bplus_leaf_nodes_from_entries(entries, metrics)
         }
         BPlusNode::Internal(internal) => {
@@ -1483,12 +2240,18 @@ fn bplus_child_range_for_replace(
 }
 
 fn bplus_leaf_nodes_from_entries(
-    entries: Vec<Arc<VmEntry>>,
+    entries: Vec<BPlusEntryRef>,
     metrics: &mut RewriteMetrics,
 ) -> Vec<Arc<BPlusNode>> {
     let mut leaves = Vec::new();
     append_leaf_chunks(&mut leaves, entries, metrics);
     leaves
+}
+
+fn bplus_leaf_index_for_start(leaf: &BPlusLeaf, key: UserVirtAddr) -> usize {
+    leaf.iter()
+        .take_while(|entry| entry.range.start().as_usize() < key.as_usize())
+        .count()
 }
 
 fn bplus_internal_nodes_from_children(
@@ -1571,7 +2334,7 @@ fn bplus_replacement_children_need_repair(
         return true;
     }
     child_nodes.iter().any(|child| match child.as_ref() {
-        BPlusNode::Leaf(leaf) => parent_height == 2 && leaf.entries.len() < BPLUS_LEAF_MIN_FILL,
+        BPlusNode::Leaf(leaf) => parent_height == 2 && leaf.len() < BPLUS_LEAF_MIN_FILL,
         BPlusNode::Internal(internal) => {
             parent_height > 2 && internal.children.len() < BPLUS_INTERNAL_MIN_FANOUT
         }
@@ -1586,7 +2349,7 @@ fn bplus_rebalance_leaf_children(
         return children;
     }
     let has_underfull_leaf = children.iter().any(|child| match child.as_ref() {
-        BPlusNode::Leaf(leaf) => leaf.entries.len() < BPLUS_LEAF_MIN_FILL,
+        BPlusNode::Leaf(leaf) => leaf.len() < BPLUS_LEAF_MIN_FILL,
         BPlusNode::Internal(_) => false,
     });
     if !has_underfull_leaf {
@@ -1601,7 +2364,7 @@ fn bplus_rebalance_leaf_children(
             return alloc::vec![children[idx].clone()];
         };
 
-        if leaf.entries.len() >= BPLUS_LEAF_MIN_FILL {
+        if leaf.len() >= BPLUS_LEAF_MIN_FILL {
             rebalanced.push(children[idx].clone());
             idx += 1;
             continue;
@@ -1635,7 +2398,7 @@ fn bplus_rebalance_leaf_children(
 }
 
 fn bplus_group_entry_count(children: &[Arc<BPlusNode>]) -> usize {
-    children.iter().map(|child| bplus_len(child)).sum()
+    children.iter().map(bplus_len).sum()
 }
 
 fn bplus_rebalance_internal_children(
@@ -1702,7 +2465,7 @@ fn bplus_rebalance_internal_children(
 }
 
 fn bplus_group_child_count(children: &[Arc<BPlusNode>]) -> usize {
-    children.iter().map(|child| bplus_child_count(child)).sum()
+    children.iter().map(bplus_child_count).sum()
 }
 
 fn build_bplus_root_from_level(
@@ -1739,14 +2502,14 @@ fn bplus_node_may_overlap(node: &Arc<BPlusNode>, range: UserRange) -> bool {
 
 fn bplus_first_entry(node: &Arc<BPlusNode>) -> Option<&VmEntry> {
     match node.as_ref() {
-        BPlusNode::Leaf(leaf) => leaf.entries.first().map(Arc::as_ref),
+        BPlusNode::Leaf(leaf) => leaf.first(),
         BPlusNode::Internal(internal) => internal.children.first().and_then(bplus_first_entry),
     }
 }
 
 fn bplus_last_entry(node: &Arc<BPlusNode>) -> Option<&VmEntry> {
     match node.as_ref() {
-        BPlusNode::Leaf(leaf) => leaf.entries.last().map(Arc::as_ref),
+        BPlusNode::Leaf(leaf) => leaf.last(),
         BPlusNode::Internal(internal) => internal.children.last().and_then(bplus_last_entry),
     }
 }
@@ -1756,7 +2519,7 @@ fn build_bplus_from_entries(
     previous_leaf_count: usize,
 ) -> (BPlusRecipeIndex, RewriteMetrics) {
     let copied_entries = entries.len();
-    let entries: Vec<Arc<VmEntry>> = entries.into_iter().map(Arc::new).collect();
+    let entries: Vec<BPlusEntryRef> = entries.into_iter().map(bplus_entry_ref_new).collect();
     let mut leaves = Vec::new();
     let mut metrics = RewriteMetrics {
         tree_depth: if entries.is_empty() { 0 } else { 1 },
@@ -1859,8 +2622,8 @@ impl BPlusInternal {
                 separators.push(start);
             }
         }
-        let len = children.iter().map(|child| bplus_len(child)).sum();
-        let vm_size = children.iter().map(|child| bplus_vm_size(child)).sum();
+        let len = children.iter().map(bplus_len).sum();
+        let vm_size = children.iter().map(bplus_vm_size).sum();
         Self {
             separators,
             children: inline_children,
@@ -1960,9 +2723,7 @@ fn collect_bplus_values(root: &Option<Arc<BPlusNode>>, out: &mut Vec<VmEntry>) {
 
 fn collect_bplus_values_node(node: &Arc<BPlusNode>, out: &mut Vec<VmEntry>) {
     match node.as_ref() {
-        BPlusNode::Leaf(leaf) => {
-            out.extend(leaf.entries.iter().map(|entry| entry.as_ref().clone()))
-        }
+        BPlusNode::Leaf(leaf) => out.extend(leaf.iter().cloned()),
         BPlusNode::Internal(internal) => {
             for child in internal.children.iter() {
                 collect_bplus_values_node(child, out);
@@ -1983,7 +2744,7 @@ fn child_index_for<'a>(
 
 fn bplus_first_key(node: &Arc<BPlusNode>) -> Option<UserVirtAddr> {
     match node.as_ref() {
-        BPlusNode::Leaf(leaf) => leaf.entries.first().map(|entry| entry.range.start()),
+        BPlusNode::Leaf(leaf) => leaf.first().map(|entry| entry.range.start()),
         BPlusNode::Internal(internal) => internal.children.first().and_then(bplus_first_key),
     }
 }
@@ -2022,7 +2783,7 @@ fn collect_bplus_reclaim_stats(
     is_root: bool,
 ) {
     match node.as_ref() {
-        BPlusNode::Leaf(leaf) => stats.observe_leaf(leaf.entries.len()),
+        BPlusNode::Leaf(leaf) => stats.observe_leaf(leaf.len()),
         BPlusNode::Internal(internal) => {
             stats.observe_internal(internal.children.len(), is_root);
             for child in internal.children.iter() {
@@ -2038,9 +2799,10 @@ fn view_for_entry(entry: &VmEntry) -> VmEntryView<'_> {
         range: entry.range,
         prot: entry.prot,
         flags: entry.flags,
-        backing: &entry.backing,
+        backing: entry.backing_kind(),
+        page: entry.page_backing(),
         ufd_registration: entry.ufd_registration,
-        private: entry.private.as_ref(),
+        private: entry.private(),
     }
 }
 
@@ -2095,16 +2857,26 @@ pub mod bench {
 mod tests {
     use super::bench::{run_sparse_map_unmap_bplus, run_sparse_map_unmap_treap};
     use super::*;
+    use crate::vm::VmBacking;
 
     fn range(start: usize, pages: usize) -> UserRange {
         UserRange::new_aligned(UserVirtAddr(start), pages * super::super::USER_PAGE_SIZE)
             .expect("valid range")
     }
 
+    fn bplus_test_entry_ref(
+        range: UserRange,
+        prot: Prot,
+        flags: VmEntryFlags,
+        backing: VmBacking,
+    ) -> BPlusEntryRef {
+        bplus_entry_ref_new(VmEntry::new(range, prot, flags, backing))
+    }
+
     #[test]
     fn bplus_node_storage_is_inline_not_vec() {
-        let leaf_entries_ty =
-            core::any::type_name_of_val(&BPlusLeaf::from_entry_slice(&[]).entries);
+        let empty_leaf = BPlusLeaf::from_owned_entries(core::iter::empty());
+        let leaf_entries_ty = core::any::type_name_of_val(&empty_leaf.entries);
         let internal = BPlusInternal::from_child_slice(&[], 2);
         let internal_separators_ty = core::any::type_name_of_val(&internal.separators);
         let internal_children_ty = core::any::type_name_of_val(&internal.children);
@@ -2125,19 +2897,130 @@ mod tests {
 
     #[test]
     fn bplus_leaf_entries_are_pointer_shared() {
-        let entry = Arc::new(VmEntry::new(
+        let entry = bplus_test_entry_ref(
             range(0x88_0000, 1),
             Prot::READ,
             VmEntryFlags::PRIVATE,
             VmBacking::PrivateAnon,
-        ));
-        let leaf = BPlusLeaf::from_entry_slice(&[entry]);
-        let leaf_entries_ty = core::any::type_name_of_val(&leaf.entries);
+        );
+        let leaf = BPlusLeaf::from_owned_entries(core::iter::once(entry));
+        let leaf_entry_ty =
+            core::any::type_name_of_val(leaf.entry_ref_at(0).expect("leaf carries one entry ref"));
 
         assert!(
-            leaf_entries_ty.contains("alloc::sync::Arc"),
-            "B+ leaf entries should carry Arc<VmEntry> so unchanged leaf members are pointer-shared, got {leaf_entries_ty}"
+            leaf_entry_ty.contains("alloc::sync::Arc"),
+            "B+ leaf entries should carry Arc<VmEntry> so unchanged leaf members are pointer-shared, got {leaf_entry_ty}"
         );
+    }
+
+    #[cfg(tx_vm_recipe_bplus_arc_metrics)]
+    #[test]
+    fn bplus_owned_leaf_build_does_not_clone_entry_refs() {
+        reset_bplus_entry_arc_counts_for_test();
+        let before = bplus_entry_arc_clone_count_for_test();
+        let entries = alloc::vec![
+            bplus_test_entry_ref(
+                range(0x8b_0000, 1),
+                Prot::READ,
+                VmEntryFlags::PRIVATE,
+                VmBacking::PrivateAnon,
+            ),
+            bplus_test_entry_ref(
+                range(0x8b_4000, 1),
+                Prot::READ,
+                VmEntryFlags::PRIVATE,
+                VmBacking::PrivateAnon,
+            ),
+        ];
+        let after_new = bplus_entry_arc_clone_count_for_test();
+        let mut metrics = RewriteMetrics::default();
+
+        let leaves = bplus_leaf_nodes_from_entries(entries, &mut metrics);
+
+        assert_eq!(leaves.len(), 1);
+        assert_eq!(
+            bplus_entry_arc_clone_count_for_test(),
+            after_new,
+            "owned leaf construction should move scratch entry refs into the leaf, not clone them"
+        );
+        assert_eq!(before, 0);
+    }
+
+    #[test]
+    fn replace_range_summary_matches_collecting_replace() {
+        let mut collecting = RecipeTreeWith::<DefaultRecipeIndex>::new();
+        let mut counted = RecipeTreeWith::<DefaultRecipeIndex>::new();
+        for i in 0..6 {
+            let entry = VmEntry::new(
+                range(0x8d_0000 + i * 0x4000, 1),
+                Prot::READ,
+                VmEntryFlags::PRIVATE,
+                VmBacking::PrivateAnon,
+            );
+            let (next, _) = collecting.insert_entry(entry.clone());
+            collecting = next;
+            let (next, _) = counted.insert_entry(entry);
+            counted = next;
+        }
+        let replace = range(0x8d_0000 + 2 * 0x4000, 2);
+        let replacements = alloc::vec![VmEntry::new(
+            replace,
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        )];
+        let (collecting, removed, _) = collecting.replace_range(replace, replacements.clone());
+        let (counted, removed_summary, _) = counted.replace_range_summary(replace, replacements);
+
+        assert_eq!(removed_summary.count, removed.len());
+        assert_eq!(
+            removed_summary.vm_size,
+            removed.iter().map(|entry| entry.range.len()).sum()
+        );
+        assert_eq!(counted.values_vec(), collecting.values_vec());
+        assert_eq!(counted.len(), collecting.len());
+        assert_eq!(counted.vm_size(), collecting.vm_size());
+    }
+
+    #[test]
+    fn replace_entry_summary_matches_removed_returning_replace() {
+        let mut collecting = RecipeTreeWith::<DefaultRecipeIndex>::new();
+        let mut counted = RecipeTreeWith::<DefaultRecipeIndex>::new();
+        for i in 0..6 {
+            let entry = VmEntry::new(
+                range(0x8e_0000 + i * 0x4000, 1),
+                Prot::READ,
+                VmEntryFlags::PRIVATE,
+                VmBacking::PrivateAnon,
+            );
+            let (next, _) = collecting.insert_entry(entry.clone());
+            collecting = next;
+            let (next, _) = counted.insert_entry(entry);
+            counted = next;
+        }
+        let existing = collecting
+            .lookup(UserVirtAddr(0x8e_0000 + 2 * 0x4000))
+            .expect("existing");
+        let replacements = alloc::vec![VmEntry::new(
+            existing.range,
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        )];
+
+        let (collecting, removed, _) =
+            collecting.replace_entry_with_entries(&existing, replacements.clone());
+        let (counted, removed_summary, _) =
+            counted.replace_entry_with_entries_summary(&existing, replacements);
+
+        assert_eq!(removed_summary.count, usize::from(removed.is_some()));
+        assert_eq!(
+            removed_summary.vm_size,
+            removed.as_ref().map_or(0, |entry| entry.range.len())
+        );
+        assert_eq!(counted.values_vec(), collecting.values_vec());
+        assert_eq!(counted.len(), collecting.len());
+        assert_eq!(counted.vm_size(), collecting.vm_size());
     }
 
     #[test]
@@ -2154,7 +3037,7 @@ mod tests {
             .map(|idx| {
                 let entries = (0..BPLUS_LEAF_MIN_FILL)
                     .map(|entry_idx| {
-                        Arc::new(VmEntry::new(
+                        bplus_test_entry_ref(
                             range(
                                 0x89_0000 + (idx * BPLUS_LEAF_MIN_FILL + entry_idx) * 0x4000,
                                 1,
@@ -2162,25 +3045,25 @@ mod tests {
                             Prot::READ,
                             VmEntryFlags::PRIVATE,
                             VmBacking::PrivateAnon,
-                        ))
+                        )
                     })
                     .collect::<Vec<_>>();
-                Arc::new(BPlusNode::Leaf(BPlusLeaf::from_entry_slice(&entries)))
+                Arc::new(BPlusNode::Leaf(BPlusLeaf::from_owned_entries(entries)))
             })
             .collect::<Vec<_>>();
         let internal = BPlusInternal::from_child_slice(&leaves, 2);
         let replacement_entries = (0..BPLUS_LEAF_MIN_FILL)
             .map(|entry_idx| {
-                Arc::new(VmEntry::new(
+                bplus_test_entry_ref(
                     range(0x89_0000 + (BPLUS_LEAF_MIN_FILL + entry_idx) * 0x4000, 1),
                     Prot::READ_WRITE,
                     VmEntryFlags::PRIVATE,
                     VmBacking::PrivateAnon,
-                ))
+                )
             })
             .collect::<Vec<_>>();
-        let replacement = Arc::new(BPlusNode::Leaf(BPlusLeaf::from_entry_slice(
-            &replacement_entries,
+        let replacement = Arc::new(BPlusNode::Leaf(BPlusLeaf::from_owned_entries(
+            replacement_entries,
         )));
         let mut metrics = RewriteMetrics::default();
 
@@ -2214,7 +3097,7 @@ mod tests {
             .map(|idx| {
                 let entries = (0..BPLUS_LEAF_MIN_FILL)
                     .map(|entry_idx| {
-                        Arc::new(VmEntry::new(
+                        bplus_test_entry_ref(
                             range(
                                 0x8a_0000 + (idx * BPLUS_LEAF_MIN_FILL + entry_idx) * 0x4000,
                                 1,
@@ -2222,10 +3105,10 @@ mod tests {
                             Prot::READ,
                             VmEntryFlags::PRIVATE,
                             VmBacking::PrivateAnon,
-                        ))
+                        )
                     })
                     .collect::<Vec<_>>();
-                Arc::new(BPlusNode::Leaf(BPlusLeaf::from_entry_slice(&entries)))
+                Arc::new(BPlusNode::Leaf(BPlusLeaf::from_owned_entries(entries)))
             })
             .collect::<Vec<_>>();
         let internal = BPlusInternal::from_child_slice(&leaves, 2);
@@ -2233,7 +3116,7 @@ mod tests {
             .map(|idx| {
                 let entries = (0..BPLUS_LEAF_MIN_FILL)
                     .map(|entry_idx| {
-                        Arc::new(VmEntry::new(
+                        bplus_test_entry_ref(
                             range(
                                 0x8a_0000 + (idx * BPLUS_LEAF_MIN_FILL + entry_idx) * 0x4000,
                                 1,
@@ -2241,10 +3124,10 @@ mod tests {
                             Prot::READ_WRITE,
                             VmEntryFlags::PRIVATE,
                             VmBacking::PrivateAnon,
-                        ))
+                        )
                     })
                     .collect::<Vec<_>>();
-                Arc::new(BPlusNode::Leaf(BPlusLeaf::from_entry_slice(&entries)))
+                Arc::new(BPlusNode::Leaf(BPlusLeaf::from_owned_entries(entries)))
             })
             .collect::<Vec<_>>();
         let mut metrics = RewriteMetrics::default();
@@ -2345,14 +3228,10 @@ mod tests {
         let existing = tree
             .lookup(UserVirtAddr(0x20_0000 + 3000 * 0x4000))
             .expect("existing entry");
-        let replacement = VmEntry::new(
-            existing.range,
-            Prot::READ_WRITE,
-            existing.flags,
-            existing.backing.clone(),
-        )
-        .with_ufd_registration(existing.ufd_registration)
-        .with_private(existing.private.clone());
+        let mut replacement = existing
+            .with_range_preserving_owners(existing.range)
+            .expect("same range preserves entry owners");
+        replacement.prot = Prot::READ_WRITE;
         let (rewritten, removed, touched) =
             tree.replace_range(existing.range, alloc::vec![replacement.clone()]);
 
@@ -2364,6 +3243,41 @@ mod tests {
         assert!(
             touched <= BPLUS_LEAF_CAP + 1,
             "single-leaf replacement should stay local; touched={touched}"
+        );
+    }
+
+    #[test]
+    fn bplus_single_entry_protect_descriptor_stays_local() {
+        let mut tree = RecipeTreeWith::<BPlusRecipeIndex>::new();
+        for i in 0..4096 {
+            let (next, _) = tree.insert_entry(VmEntry::new(
+                range(0x24_0000 + i * 0x4000, 1),
+                Prot::READ_WRITE,
+                VmEntryFlags::SHARED,
+                VmBacking::PrivateAnon,
+            ));
+            tree = next;
+        }
+
+        let existing = tree
+            .lookup(UserVirtAddr(0x24_0000 + 3000 * 0x4000))
+            .expect("existing entry");
+        let rewrite = VmEntryProtectRewrite::new(existing.range, Prot::READ);
+        let (rewritten, removed, touched) = tree
+            .replace_entry_at_with_protect_summary(existing.range.start(), rewrite)
+            .expect("protect descriptor applies");
+
+        assert_eq!(removed.count, 1);
+        assert_eq!(
+            rewritten
+                .lookup(existing.range.start())
+                .expect("replacement")
+                .prot,
+            Prot::READ
+        );
+        assert!(
+            touched <= BPLUS_LEAF_CAP + 1,
+            "single-entry protect descriptor should edit one leaf, not rebuild the tree; touched={touched}"
         );
     }
 
@@ -2431,10 +3345,12 @@ mod tests {
             touched <= BPLUS_LEAF_CAP + 1,
             "gap insertion should splice at the destination leaf; touched={touched}"
         );
-        assert!(rewritten
-            .values_vec()
-            .windows(2)
-            .all(|pair| pair[0].range.start().as_usize() < pair[1].range.start().as_usize()));
+        assert!(
+            rewritten
+                .values_vec()
+                .windows(2)
+                .all(|pair| pair[0].range.start().as_usize() < pair[1].range.start().as_usize())
+        );
     }
 
     #[test]
@@ -2515,6 +3431,44 @@ mod tests {
                 .expect("first survivor")
                 .range,
             range(0xc0_0000 + 12 * 0x4000, 1)
+        );
+    }
+
+    #[test]
+    fn bplus_repeated_rewrites_keep_values_stable() {
+        let mut tree = RecipeTreeWith::<BPlusRecipeIndex>::new();
+        for i in 0..48 {
+            let (next, _) = tree.insert_entry(VmEntry::new(
+                range(0xcc_0000 + i * 0x4000, 1),
+                Prot::READ,
+                VmEntryFlags::PRIVATE,
+                VmBacking::PrivateAnon,
+            ));
+            tree = next;
+        }
+
+        let key = UserVirtAddr(0xcc_0000 + 12 * 0x4000);
+        for i in 0..96 {
+            let existing = tree.lookup(key).expect("entry survives repeated rewrites");
+            let mut replacement = existing
+                .with_range_preserving_owners(existing.range)
+                .expect("same range preserves owners");
+            replacement.prot = if i % 2 == 0 {
+                Prot::READ_WRITE
+            } else {
+                Prot::READ
+            };
+            let (next, removed, _) = tree.replace_range(existing.range, alloc::vec![replacement]);
+            assert_eq!(removed.len(), 1);
+            tree = next;
+        }
+
+        assert_eq!(tree.len(), 48);
+        assert_eq!(
+            tree.lookup(key)
+                .expect("entry survives repeated rewrites")
+                .range,
+            range(0xcc_0000 + 12 * 0x4000, 1)
         );
     }
 

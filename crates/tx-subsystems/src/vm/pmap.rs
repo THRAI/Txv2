@@ -1,5 +1,5 @@
 use crate::vm::adapter::step_engine::ZoneError;
-use crate::vm::lock_metrics::{vm_spin_mutex, VmSpinMutex};
+use crate::vm::lock_metrics::{VmSpinMutex, vm_spin_mutex};
 #[cfg(test)]
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -13,7 +13,7 @@ use tx_hal::{
 
 use crate::page_backed::MaterializedPagePin;
 
-use super::{Prot, UserPage, UserRange, USER_PAGE_SIZE};
+use super::{Prot, USER_PAGE_SIZE, UserPage, UserRange};
 
 type ReserveMappingFn = fn(
     &PmapRoot,

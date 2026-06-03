@@ -43,8 +43,8 @@ use crate::execution::{Errno, Guard, WaitToken};
 use crate::page_backed::{MaterializeAccess, MaterializedPage, PageIndex};
 
 use super::structure::{
-    AccessMode, AddressSpace, UserRange, UserVirtAddr, VmBacking, VmEntry, VmFault, VmFaultOutcome,
-    USER_PAGE_SIZE,
+    AccessMode, AddressSpace, USER_PAGE_SIZE, UserRange, UserVirtAddr, VmEntry, VmEntryBacking,
+    VmFault, VmFaultOutcome,
 };
 use crate::vm::adapter::step_engine::{self as step_engine, ByteProgress, NoProgress, StepOutcome};
 
@@ -534,7 +534,7 @@ fn resolve_user_page_addr(
     emit_vm_user_trace(b"debug.vm.user.resolve.phase", 7);
     emit_vm_user_trace(
         b"debug.vm.user.resolve.backing",
-        vm_backing_trace_id(&entry.backing),
+        vm_backing_trace_id(entry.backing_kind()),
     );
     if !entry.prot.permits(kind.required_prot()) {
         emit_vm_user_trace(b"debug.vm.user.resolve.err", 3);
@@ -571,9 +571,9 @@ fn resolve_user_page_addr(
     // the entry's full prot. Failure to publish is non-fatal — we
     // still have the materialised frame in hand for *this* call. The
     // next call will re-materialise (correct but slower).
-    let publish_prot = match (&entry.backing, kind) {
-        (VmBacking::PrivateAnon, UserAccessKind::Read) => entry.prot.without_write(),
-        (VmBacking::Page { .. }, UserAccessKind::Read) if !entry.flags.shared => {
+    let publish_prot = match (entry.backing_kind(), kind) {
+        (VmEntryBacking::PrivateAnon, UserAccessKind::Read) => entry.prot.without_write(),
+        (VmEntryBacking::Page { .. }, UserAccessKind::Read) if !entry.flags.shared => {
             entry.prot.without_write()
         }
         _ => entry.prot,
@@ -605,11 +605,11 @@ fn resolve_user_page_addr(
     }
 }
 
-fn vm_backing_trace_id(backing: &VmBacking) -> i64 {
+fn vm_backing_trace_id(backing: VmEntryBacking) -> i64 {
     match backing {
-        VmBacking::None => 0,
-        VmBacking::PrivateAnon => 1,
-        VmBacking::Page { .. } => 2,
+        VmEntryBacking::None => 0,
+        VmEntryBacking::PrivateAnon => 1,
+        VmEntryBacking::Page { .. } => 2,
     }
 }
 
@@ -636,14 +636,14 @@ fn resolve_user_page(
 ) -> ResolvePageOutcome {
     emit_vm_user_trace(
         b"debug.vm.user.resolve_page.backing",
-        vm_backing_trace_id(&entry.backing),
+        vm_backing_trace_id(entry.backing_kind()),
     );
-    match &entry.backing {
-        VmBacking::None => {
+    match entry.backing_kind() {
+        VmEntryBacking::None => {
             emit_vm_user_trace(b"debug.vm.user.resolve_page.err", 1);
             ResolvePageOutcome::Err(Errno::EFAULT)
         }
-        VmBacking::PrivateAnon => {
+        VmEntryBacking::PrivateAnon => {
             emit_vm_user_trace(b"debug.vm.user.resolve_page.phase", 0);
             // Reuse the VM fault path's private-anon materialisation
             // for consistency: a fresh zeroed frame for read access,
@@ -665,7 +665,7 @@ fn resolve_user_page(
             };
             let outcome = crate::vm::structure::VmFaultOutcome {
                 page_range,
-                private_identity: entry.private.as_ref().map(|set| set.raw()),
+                private_identity: entry.private_identity(),
                 entry: entry.clone(),
                 access: kind.required_prot(),
                 pmap_materialization_deferred: true,
@@ -682,8 +682,12 @@ fn resolve_user_page(
                 }
             }
         }
-        VmBacking::Page { pc, offset } => {
+        VmEntryBacking::Page { offset } => {
             emit_vm_user_trace(b"debug.vm.user.resolve_page.phase", 3);
+            let Some((pc, _)) = entry.page_backing() else {
+                emit_vm_user_trace(b"debug.vm.user.resolve_page.err", 4);
+                return ResolvePageOutcome::Err(Errno::EFAULT);
+            };
             let entry_start = entry.range.start().as_usize();
             let delta = match page_addr.checked_sub(entry_start) {
                 Some(v) => v,
@@ -692,7 +696,7 @@ fn resolve_user_page(
                     return ResolvePageOutcome::Err(Errno::EFAULT);
                 }
             };
-            let backing_offset = match (delta as u64).checked_add(*offset) {
+            let backing_offset = match (delta as u64).checked_add(offset) {
                 Some(v) => v,
                 None => {
                     emit_vm_user_trace(b"debug.vm.user.resolve_page.err", 5);
