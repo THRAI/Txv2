@@ -1,5 +1,5 @@
 use crate::vm::adapter::step_engine::ZoneError;
-use crate::vm::lock_metrics::{VmSpinMutex, vm_spin_mutex};
+use crate::vm::lock_metrics::{vm_spin_mutex, VmSpinMutex};
 #[cfg(test)]
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -13,7 +13,7 @@ use tx_hal::{
 
 use crate::page_backed::MaterializedPagePin;
 
-use super::{Prot, USER_PAGE_SIZE, UserPage, UserRange};
+use super::{Prot, UserPage, UserRange, USER_PAGE_SIZE};
 
 type ReserveMappingFn = fn(
     &PmapRoot,
@@ -341,9 +341,11 @@ impl VmPmap {
             emit_pmap_teardown_trace(b"debug.vm.pmap.publish_batch.insert.phase", 0);
             let mapping = PmapMapping::new(page.ppn, page.prot, page.map_pin);
             emit_pmap_teardown_trace(b"debug.vm.pmap.publish_batch.insert.phase", 1);
-            let insert_start_ns = tx_observe::current()
-                .is_some()
-                .then(tx_observe::clock_now_ns);
+            let insert_start_ns = if cfg!(tx_vm_pmap_metrics) && tx_observe::current().is_some() {
+                Some(tx_observe::clock_now_ns())
+            } else {
+                None
+            };
             state.mappings.insert(page.page, mapping);
             if let Some(insert_start_ns) = insert_start_ns {
                 record_pmap_batch_insert_debug(
@@ -375,9 +377,11 @@ impl VmPmap {
         emit_pmap_teardown_trace(b"debug.vm.pmap.teardown.phase", 0);
         let mut removed = 0;
         let (start, end) = page_bounds_for_range(range);
-        let remove_start_ns = tx_observe::current()
-            .is_some()
-            .then(tx_observe::clock_now_ns);
+        let remove_start_ns = if cfg!(tx_vm_pmap_metrics) && tx_observe::current().is_some() {
+            Some(tx_observe::clock_now_ns())
+        } else {
+            None
+        };
         let (mappings, shifted) = {
             let mut state = self.state.lock();
             state.mappings.drain_range(start, end)
@@ -691,6 +695,9 @@ fn page_bounds_for_range(range: UserRange) -> (UserPage, UserPage) {
 }
 
 fn emit_pmap_teardown_trace(name: &[u8], value: i64) {
+    if !cfg!(tx_vm_pmap_metrics) {
+        return;
+    }
     if let Some(observer) = tx_observe::current() {
         observer.counter(
             tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),

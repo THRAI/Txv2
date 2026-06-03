@@ -15,8 +15,8 @@ use super::private::{
     PrivatePageSet, VmPageOff,
 };
 use crate::execution::WaitToken;
-use crate::vm::VmPmapError;
 use crate::vm::adapter::step_engine::{self as step_engine};
+use crate::vm::VmPmapError;
 
 pub const USER_PAGE_SIZE: usize = 4096;
 
@@ -1642,6 +1642,9 @@ const fn page_alloc_error(error: step_engine::page_allocator::AllocError) -> VmF
 }
 
 fn emit_vm_materialize_trace(name: &[u8], value: i64) {
+    if !cfg!(tx_vm_private_page_metrics) {
+        return;
+    }
     if let Some(observer) = tx_observe::current() {
         observer.counter(
             tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),

@@ -88,24 +88,24 @@ use boot_runtime::userspace::{
     UserspaceTrapInfo,
 };
 use tx_hal::{PercpuIf, TrapIf, TxPlatform};
-use tx_shims::linux_syscall::SyscallResult;
 use tx_shims::linux_syscall::numbers::{
     FUTEX_CMD_MASK, FUTEX_WAKE, FUTEX_WAKE_BITSET, NR_CLONE, NR_FUTEX, NR_MMAP, NR_MPROTECT,
     NR_MUNMAP, NR_RT_SIGPROCMASK, NR_WRITEV,
 };
-use tx_subsystems::signal::Signum;
+use tx_shims::linux_syscall::SyscallResult;
 use tx_subsystems::signal::deliver_synchronous_fault;
-use tx_subsystems::signal::{AstOutcome, ast_dispatch, refresh_deliverable_signal_summary};
+use tx_subsystems::signal::Signum;
+use tx_subsystems::signal::{ast_dispatch, refresh_deliverable_signal_summary, AstOutcome};
 use tx_subsystems::thread_runtime::execution::prepare_userspace_entry_payload_into;
 use tx_subsystems::thread_runtime::{
-    ThreadIdentity, ThreadPayload, clear_current_thread_identity, clear_current_thread_payload,
-    clear_current_userspace_payload, clear_current_userspace_thread_identity,
-    set_current_thread_identity, set_current_thread_payload, set_current_userspace_payload,
-    set_current_userspace_thread_identity,
+    clear_current_thread_identity, clear_current_thread_payload, clear_current_userspace_payload,
+    clear_current_userspace_thread_identity, set_current_thread_identity,
+    set_current_thread_payload, set_current_userspace_payload,
+    set_current_userspace_thread_identity, ThreadIdentity, ThreadPayload,
 };
 use tx_subsystems::vm::{
-    AccessMode, AddressSpace, Prot, USER_PAGE_SIZE, UserAccessKind, UserRange, UserVirtAddr,
-    VmEntry, VmEntryBacking, VmFault,
+    AccessMode, AddressSpace, Prot, UserAccessKind, UserRange, UserVirtAddr, VmEntry,
+    VmEntryBacking, VmFault, USER_PAGE_SIZE,
 };
 
 /// Translate the reactor's `PageFaultAccess` into the VM subsystem's
@@ -970,6 +970,9 @@ pub(crate) fn syscall_return_may_publish_wake_handoff(
 }
 
 fn emit_syscall_roundtrip_marker(sysno: u64, name: &[u8]) {
+    if !cfg!(tx_thread_roundtrip_metrics) {
+        return;
+    }
     if !matches!(
         sysno,
         tx_shims::linux_syscall::numbers::NR_GETPPID
@@ -992,6 +995,9 @@ fn emit_syscall_roundtrip_marker(sysno: u64, name: &[u8]) {
 }
 
 fn emit_thread_debug_value(name: &[u8], value: i64) {
+    if !cfg!(tx_thread_roundtrip_metrics) {
+        return;
+    }
     if let Some(observer) = tx_observe::current() {
         observer.counter(
             tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),

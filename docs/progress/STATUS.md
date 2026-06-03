@@ -18,6 +18,41 @@
   still cannot carry the original wait-source identity, so full async ext4/FAT
   pager conversion remains a larger interface slice.
 
+- 2026-06-03 **Focused pthread observe now gates broad diagnostic traffic by default.**
+  Added opt-in cfg gates for high-volume observe families that were dominating
+  pthread SMP1 captures while measuring VM recipe critical sections:
+  `tx_vm_user_access_metrics`, `tx_vm_phase_metrics`, `tx_vm_pmap_metrics`,
+  `tx_vm_private_page_metrics`, `tx_thread_roundtrip_metrics`,
+  `tx_thread_lifecycle_metrics`, `tx_sched_metrics`,
+  `tx_reactor_poll_metrics`, and `tx_futex_debug_metrics`. Default
+  recipe-focused captures keep lock rows plus stable recipe publish/reclaim
+  counters, while VM phase/user-copy/pmap/private-page markers, thread/trap
+  roundtrip markers, clone/submit/scheduler markers, reactor poll markers, and
+  futex table samples require explicit cfgs. `tx-reactor` and `tx-shims` now
+  inherit workspace lint cfg declarations so these diagnostic cfgs do not emit
+  `unexpected_cfgs` warnings. Verification:
+  `cargo check -p tx-subsystems -q`,
+  `RUSTFLAGS="--cfg tx_vm_recipe_bplus" cargo check -p tx-subsystems -q`,
+  `cargo check -p tx-reactor -q`, `cargo check -p tx-shims -q`, and
+  `RUSTFLAGS="--cfg tx_lock_metrics --cfg tx_lock_metrics_vm --cfg
+  tx_vm_recipe_bplus" cargo check -p tx-kernel -q` passed. Capture evidence:
+  `target/oscomp/custom-run/recipe-bplus-narrow-pthread-smp1-20260603-continued`
+  was complete/lossless (`raw_records=3280637`, zero lost/overwritten/repairs)
+  and brought recipe lock service back to `avg=424.016us`, `p50=315us`,
+  `p99=4.054ms`; after gating lifecycle/scheduler markers,
+  `target/oscomp/custom-run/recipe-bplus-narrow2-pthread-smp1-20260603-continued`
+  was also complete/lossless (`raw_records=2619432`, counters `236991` instead
+  of the prior `889966`) with recipe lock service `avg=372.308us`,
+  `p50=279us`, `p99=3.755ms`. The stable publish-op rows now read:
+  `Protect avg=515.315us p50=407us p99=4.075ms`, `Unmap avg=368.716us
+  p50=210us p99=3.802ms`, and `MapRequireFree avg=219.856us p50=218us
+  p99=483us`. Caveat: RV64 board HAL still emits the pre-existing
+  `tx_pmap_debug` warning in `boards/tx-hal-riscv64-qemu-virt/src/pmap/pte.rs`;
+  unrelated dirty tmpfs/chown files remain outside this observe-gating slice.
+  Next step: use the `narrow2` profile as the default recipe-lock measurement
+  profile, and only reopen the gated families for the specific lane being
+  diagnosed.
+
 - 2026-06-03 **tmpfs chown mode-bit clearing now matches LTP chown02.**
   Root cause for the observed `ltp-musl` `chown02` mode mismatch was tmpfs
   treating privileged `chown` differently from Linux: root/CAP_FOWNER preserved

@@ -130,6 +130,9 @@ static FUTEX_CANCEL_TABLE_SAMPLE: AtomicU64 = AtomicU64::new(0);
 static FUTEX_REQUEUE_TABLE_SAMPLE: AtomicU64 = AtomicU64::new(0);
 
 fn emit_futex_debug_sample(name: &[u8], value: i64, counter: &AtomicU64, every: u64) {
+    if !cfg!(tx_futex_debug_metrics) {
+        return;
+    }
     let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
     if n == 1 || n % every == 0 {
         emit_futex_debug_value(name, value);
@@ -137,11 +140,17 @@ fn emit_futex_debug_sample(name: &[u8], value: i64, counter: &AtomicU64, every: 
 }
 
 fn should_emit_futex_table_debug(counter: &AtomicU64) -> bool {
+    if !cfg!(tx_futex_debug_metrics) {
+        return false;
+    }
     let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
     n <= 32 || n % 128 == 0
 }
 
 fn emit_futex_debug_value(name: &[u8], value: i64) {
+    if !cfg!(tx_futex_debug_metrics) {
+        return;
+    }
     if let Some(observer) = tx_observe::current() {
         observer.counter(
             tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),

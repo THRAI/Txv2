@@ -242,6 +242,9 @@ pub fn hand_off_syscall(
 }
 
 fn emit_syscall_roundtrip_marker(sysno: u64, name: &[u8]) {
+    if !cfg!(tx_thread_roundtrip_metrics) {
+        return;
+    }
     if !matches!(
         sysno,
         DEBUG_SYSCALL_GETPPID

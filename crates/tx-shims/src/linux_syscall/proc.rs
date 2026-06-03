@@ -29,6 +29,9 @@ const LINUX_DEFAULT_PERSONALITY: u32 = 0;
 const PERSONALITY_QUERY: u32 = u32::MAX;
 
 fn emit_clone_marker(name: &[u8]) {
+    if !cfg!(tx_thread_lifecycle_metrics) {
+        return;
+    }
     if let Some(observer) = tx_observe::current() {
         observer.counter(
             tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),

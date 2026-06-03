@@ -738,6 +738,9 @@ pub fn step_clone_thread(
 }
 
 fn emit_clone_thread_marker(name: &[u8], value: i64) {
+    if !cfg!(tx_thread_lifecycle_metrics) {
+        return;
+    }
     if let Some(observer) = tx_observe::current() {
         observer.counter(
             tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),

@@ -181,6 +181,9 @@ fn direct_syscall_preconditions(
 }
 
 fn emit_debug_counter(name: &[u8], value: i64) {
+    if !cfg!(tx_thread_roundtrip_metrics) {
+        return;
+    }
     if let Some(observer) = tx_observe::current() {
         observer.counter(
             tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),

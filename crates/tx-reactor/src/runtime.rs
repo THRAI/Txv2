@@ -205,6 +205,9 @@ fn mailbox_scheduler_hint_code(hint: MailboxSchedulerHint) -> i64 {
 }
 
 fn emit_wake_debug(name: &[u8], task: TaskId, value: i64) {
+    if !cfg!(tx_sched_metrics) {
+        return;
+    }
     if let Some(observer) = tx_observe::current() {
         observer.counter(
             tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
@@ -215,6 +218,9 @@ fn emit_wake_debug(name: &[u8], task: TaskId, value: i64) {
 }
 
 fn emit_submit_debug(name: &[u8], task: TaskId) {
+    if !cfg!(tx_thread_lifecycle_metrics) {
+        return;
+    }
     if let Some(observer) = tx_observe::current() {
         observer.counter(
             tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
@@ -225,6 +231,9 @@ fn emit_submit_debug(name: &[u8], task: TaskId) {
 }
 
 fn emit_poll_task_debug(name: &[u8], task: TaskId) {
+    if !cfg!(tx_reactor_poll_metrics) {
+        return;
+    }
     if let Some(observer) = tx_observe::current() {
         observer.counter(
             tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
@@ -235,6 +244,9 @@ fn emit_poll_task_debug(name: &[u8], task: TaskId) {
 }
 
 fn emit_poll_duration_debug(task: TaskId, consumed_ns: u64) {
+    if !cfg!(tx_reactor_poll_metrics) {
+        return;
+    }
     if let Some(observer) = tx_observe::current() {
         let consumed_us = (consumed_ns / 1_000).min(u32::MAX as u64) as i64;
         observer.counter(

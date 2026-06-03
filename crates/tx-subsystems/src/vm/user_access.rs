@@ -43,8 +43,8 @@ use crate::execution::{Errno, Guard, WaitToken};
 use crate::page_backed::{MaterializeAccess, MaterializedPage, PageIndex};
 
 use super::structure::{
-    AccessMode, AddressSpace, USER_PAGE_SIZE, UserRange, UserVirtAddr, VmEntry, VmEntryBacking,
-    VmFault, VmFaultOutcome,
+    AccessMode, AddressSpace, UserRange, UserVirtAddr, VmEntry, VmEntryBacking, VmFault,
+    VmFaultOutcome, USER_PAGE_SIZE,
 };
 use crate::vm::adapter::step_engine::{self as step_engine, ByteProgress, NoProgress, StepOutcome};
 
@@ -614,6 +614,9 @@ fn vm_backing_trace_id(backing: VmEntryBacking) -> i64 {
 }
 
 fn emit_vm_user_trace(name: &[u8], value: i64) {
+    if !cfg!(tx_vm_user_access_metrics) {
+        return;
+    }
     if let Some(observer) = tx_observe::current() {
         observer.counter(
             tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),

@@ -19,3 +19,6 @@ tx-substrate = { path = "../tx-substrate" }
 # render a sched_switch-equivalent Gantt timeline of task-on-hart slices.
 tx-observe = { path = "../tx-observe" }
 tx-observe-types = { path = "../tx-observe-types" }
+
+[lints]
+workspace = true

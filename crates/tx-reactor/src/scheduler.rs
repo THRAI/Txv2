@@ -1561,6 +1561,9 @@ fn pack_task_stop(task: TaskId, reason: StopReason) -> i64 {
 }
 
 fn emit_sched_debug(name: &[u8], value: i64) {
+    if !cfg!(tx_sched_metrics) {
+        return;
+    }
     if let Some(observer) = tx_observe::current() {
         observer.counter(
             tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),

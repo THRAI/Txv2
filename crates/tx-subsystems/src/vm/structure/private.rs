@@ -25,9 +25,9 @@
 
 use crate::vm::adapter::step_engine::{self as step_engine};
 use crate::vm::adapter::step_engine::{Cap, Zone, ZoneAllocated, ZoneError};
-use crate::vm::lock_metrics::{VmSpinMutex, vm_spin_mutex};
+use crate::vm::lock_metrics::{vm_spin_mutex, VmSpinMutex};
 use alloc::{sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use step_engine::page_allocator::{BitmapPageAllocator, CachePin};
 use tx_hal::Ppn;
 
@@ -916,7 +916,7 @@ impl PrivatePageSet {
         off: VmPageOff,
         frame: PrivateFrame,
     ) -> Result<PrivateFrameSnapshot, PrivatePageError> {
-        if tx_observe::current().is_none() {
+        if !cfg!(tx_vm_private_page_metrics) || tx_observe::current().is_none() {
             let mut pages = self.pages.lock();
             let snap = PrivateFrameSnapshot {
                 ppn: frame.ppn,
@@ -1049,6 +1049,9 @@ impl Default for PrivatePageSet {
 }
 
 fn emit_private_page_trace(name: &[u8], value: i64) {
+    if !cfg!(tx_vm_private_page_metrics) {
+        return;
+    }
     if let Some(observer) = tx_observe::current() {
         observer.counter(
             tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
@@ -1058,6 +1061,9 @@ fn emit_private_page_trace(name: &[u8], value: i64) {
 }
 
 fn emit_private_page_allocation(name: &[u8], value: u64) {
+    if !cfg!(tx_vm_private_page_metrics) {
+        return;
+    }
     if let Some(observer) = tx_observe::current() {
         observer.allocation(
             tx_observe::AllocationTrack::VmPrivatePageNode,
