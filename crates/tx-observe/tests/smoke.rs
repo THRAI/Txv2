@@ -18,7 +18,7 @@
 use core::sync::atomic::Ordering;
 
 use tx_observe::testing::TestPlatform;
-use tx_observe_types::payload::ALLOC_TRACK_PAGE_FRAME;
+use tx_observe_types::payload::{ALLOC_TRACK_DS_METHOD, ALLOC_TRACK_PAGE_FRAME};
 use tx_observe_types::{TxPayloadTag, TxTraceKind, TxTraceLevel};
 
 #[test]
@@ -120,6 +120,26 @@ fn allocation_marker_routes_via_explicit_track_parent() {
     assert_eq!(records[0].level, TxTraceLevel::Mutation as u8);
     assert_eq!(records[0].name, 0xA110_C001);
     assert_eq!(records[0].parent, ALLOC_TRACK_PAGE_FRAME);
+    assert_eq!(records[0].payload_tag, TxPayloadTag::ArgValue as u16);
+}
+
+#[test]
+fn ds_method_metric_routes_via_explicit_track_parent() {
+    let obs = TestPlatform::new().init();
+    let emitter = obs.emitter();
+
+    emitter.ds_method_metric(
+        tx_observe::EventNameId::from_raw(0xD500_C001),
+        tx_observe::EventNameId::from_raw(0xD500_D042),
+        42,
+    );
+
+    let records = obs.records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].kind, TxTraceKind::Instant as u8);
+    assert_eq!(records[0].level, TxTraceLevel::Mutation as u8);
+    assert_eq!(records[0].name, 0xD500_C001);
+    assert_eq!(records[0].parent, ALLOC_TRACK_DS_METHOD);
     assert_eq!(records[0].payload_tag, TxPayloadTag::ArgValue as u16);
 }
 

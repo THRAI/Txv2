@@ -383,6 +383,7 @@ pub const ALLOC_TRACK_PROCESS_IDENTITY: u64 = EXPLICIT_TRACK_ID_PREFIX | 0x000C;
 pub const ALLOC_TRACK_PROCESS_THREADS: u64 = EXPLICIT_TRACK_ID_PREFIX | 0x000D;
 pub const ALLOC_TRACK_PID_NAMESPACE: u64 = EXPLICIT_TRACK_ID_PREFIX | 0x000E;
 pub const ALLOC_TRACK_LOCK: u64 = EXPLICIT_TRACK_ID_PREFIX | 0x000F;
+pub const ALLOC_TRACK_DS_METHOD: u64 = EXPLICIT_TRACK_ID_PREFIX | 0x0010;
 
 // ---------------------------------------------------------------------------
 // §8.7 Mutation payloads (L6, deferred from MVP — schemas reserved)

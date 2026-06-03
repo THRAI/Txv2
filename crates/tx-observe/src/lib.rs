@@ -215,6 +215,7 @@ pub enum AllocationTrack {
     ProcessThreads,
     PidNamespace,
     Lock,
+    DsMethod,
 }
 
 impl AllocationTrack {
@@ -238,6 +239,7 @@ impl AllocationTrack {
             Self::ProcessThreads => tx_observe_types::payload::ALLOC_TRACK_PROCESS_THREADS,
             Self::PidNamespace => tx_observe_types::payload::ALLOC_TRACK_PID_NAMESPACE,
             Self::Lock => tx_observe_types::payload::ALLOC_TRACK_LOCK,
+            Self::DsMethod => tx_observe_types::payload::ALLOC_TRACK_DS_METHOD,
         }
     }
 }
@@ -482,6 +484,42 @@ impl HartEmitter {
             TxTraceLevel::Mutation,
             AllocationTrack::Lock,
             lock,
+            metric,
+            value,
+        );
+    }
+
+    /// Emit a substrate/data-structure method metric marker. The explicit DS
+    /// method track lives in `parent`, `name` carries the method identity, and
+    /// `metric` carries the sample kind (`debug.ds.method.duration_ns`, ...).
+    pub fn ds_method_metric(&self, method: EventNameId, metric: EventNameId, value: u64) {
+        self.ds_method_metric_for_zone(method, EventNameId::from_raw(0), metric, value);
+    }
+
+    /// Emit a DS method metric with an optional zone/type identity in the
+    /// high half of the payload key. `zone.raw() == 0` means no zone scope.
+    pub fn ds_method_metric_for_zone(
+        &self,
+        method: EventNameId,
+        zone: EventNameId,
+        metric: EventNameId,
+        value: u64,
+    ) {
+        if zone.raw() != 0 {
+            const ZONE_KEY: EventNameId =
+                EventNameId::from_raw(fnv1a32(b"debug.ds.method.zone_id"));
+            self.arg_value(
+                TxTraceLevel::Mutation,
+                AllocationTrack::DsMethod,
+                method,
+                ZONE_KEY,
+                zone.raw() as u64,
+            );
+        }
+        self.arg_value(
+            TxTraceLevel::Mutation,
+            AllocationTrack::DsMethod,
+            method,
             metric,
             value,
         );
@@ -802,9 +840,9 @@ static EMITTED_COUNT: AtomicU64 = AtomicU64::new(0);
 static DUMP_THRESHOLD: AtomicU64 = AtomicU64::new(0);
 static DUMP_REQUESTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static DUMP_SHUTDOWN_FN: AtomicU64 = AtomicU64::new(0);
-
 static TRACE_OFF_REQUESTS_DUMP: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(true);
+
 /// Configure a "bounded dump" threshold for the current run.
 ///
 /// Once the global emitted-record counter exceeds `n`, the next call to

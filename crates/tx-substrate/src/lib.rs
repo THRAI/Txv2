@@ -14,6 +14,8 @@ pub mod bitmap {
 
 pub mod bus;
 
+#[cfg(tx_ds_metrics)]
+pub mod ds_metrics;
 pub mod epoch;
 pub mod index;
 pub mod mutation;

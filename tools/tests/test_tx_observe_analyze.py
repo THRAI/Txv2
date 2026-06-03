@@ -191,6 +191,18 @@ class TxObserveAnalyzeTests(unittest.TestCase):
                         "value0": 17,
                     },
                 },
+                {
+                    "kind": "Instant",
+                    "hart": 0,
+                    "ts": "195",
+                    "payload_tag": analyzer.PAYLOAD_ARG_VALUE,
+                    "parent": str(analyzer.DS_METHOD_TRACK_ID),
+                    "name_id": analyzer.fnv1a32("debug.ds.substrate.zone.reserve_for"),
+                    "payload": {
+                        "key": analyzer.fnv1a32("debug.ds.method.duration_ns"),
+                        "value0": 23,
+                    },
+                },
                 {"kind": "SpanEnd", "hart": 0, "ts": "300", "span": "0x1", "payload": {}},
             ]
             tables = analyzer.build_derived_tables(records)
@@ -205,6 +217,7 @@ class TxObserveAnalyzeTests(unittest.TestCase):
                     "allocation_rows.parquet",
                     "sched_intervals.parquet",
                     "lock_rows.parquet",
+                    "ds_method_rows.parquet",
                 },
             )
             for path in written:
@@ -264,6 +277,20 @@ class TxObserveAnalyzeTests(unittest.TestCase):
                 check=True,
                 text=True,
             ).stdout.strip()
+            ds_method_rows = subprocess.run(
+                [
+                    duckdb,
+                    "-csv",
+                    "-c",
+                    (
+                        "SELECT method_id,zone_id,metric_id,value FROM "
+                        f"read_parquet('{(out_dir / 'ds_method_rows.parquet').as_posix()}')"
+                    ),
+                ],
+                capture_output=True,
+                check=True,
+                text=True,
+            ).stdout.strip()
 
             self.assertEqual(span_rows, "span,dur\n0x1,200")
             self.assertEqual(counter_rows, "counter_id,value\n3,9")
@@ -272,6 +299,12 @@ class TxObserveAnalyzeTests(unittest.TestCase):
                 lock_rows,
                 "lock_id,metric_id,value\n"
                 f"{analyzer.fnv1a32('debug.lock.test')},{analyzer.fnv1a32('debug.lock.wait_ns')},17",
+            )
+            self.assertEqual(
+                ds_method_rows,
+                "method_id,zone_id,metric_id,value\n"
+                f"{analyzer.fnv1a32('debug.ds.substrate.zone.reserve_for')},"
+                f"NULL,{analyzer.fnv1a32('debug.ds.method.duration_ns')},23",
             )
 
     def test_export_derived_tables_writes_empty_parquet_files(self) -> None:
@@ -297,6 +330,7 @@ class TxObserveAnalyzeTests(unittest.TestCase):
                 "allocation_rows.parquet",
                 "sched_intervals.parquet",
                 "lock_rows.parquet",
+                "ds_method_rows.parquet",
             ]:
                 path = out_dir / filename
                 data = path.read_bytes()
@@ -328,6 +362,7 @@ class TxObserveAnalyzeTests(unittest.TestCase):
                 allocation_rows=[],
                 sched_intervals=[],
                 lock_rows=[],
+                ds_method_rows=[],
                 meta={},
             )
 
@@ -363,7 +398,10 @@ class TxObserveAnalyzeTests(unittest.TestCase):
             report = analyzer.analyze_parquet_summary(parquet_dir, {7: "debug.span", 3: "debug.counter"}, top=5)
 
             self.assertIn("derived parquet summary:", report)
-            self.assertIn("spans=1 counters=1 allocation_rows=0 sched_intervals=0 lock_rows=0", report)
+            self.assertIn(
+                "spans=1 counters=1 allocation_rows=0 sched_intervals=0 lock_rows=0 ds_method_rows=0",
+                report,
+            )
             self.assertIn("debug.span", report)
             self.assertIn("p50=     0.2us", report)
 
@@ -407,7 +445,10 @@ class TxObserveAnalyzeTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertIn("derived cache: hit", proc.stdout)
             self.assertIn("derived parquet summary:", proc.stdout)
-            self.assertIn("spans=1 counters=0 allocation_rows=0 sched_intervals=0 lock_rows=0", proc.stdout)
+            self.assertIn(
+                "spans=1 counters=0 allocation_rows=0 sched_intervals=0 lock_rows=0 ds_method_rows=0",
+                proc.stdout,
+            )
 
     def test_parquet_text_summary_reuses_matching_parquet_manifest(self) -> None:
         duckdb = shutil.which("duckdb")
@@ -453,7 +494,10 @@ class TxObserveAnalyzeTests(unittest.TestCase):
             self.assertIn("parquet cache: hit", proc.stdout)
             self.assertNotIn("derived cache:", proc.stdout)
             self.assertIn("derived parquet summary:", proc.stdout)
-            self.assertIn("spans=1 counters=0 allocation_rows=0 sched_intervals=0 lock_rows=0", proc.stdout)
+            self.assertIn(
+                "spans=1 counters=0 allocation_rows=0 sched_intervals=0 lock_rows=0 ds_method_rows=0",
+                proc.stdout,
+            )
 
     def test_lock_rows_are_derived_from_lock_track_arg_values(self) -> None:
         lock_id = analyzer.fnv1a32("debug.lock.process.fds")
@@ -518,6 +562,93 @@ class TxObserveAnalyzeTests(unittest.TestCase):
         self.assertIn("wait n=1", report)
         self.assertIn("service p50=0.0us", report)
         self.assertIn("rho=", report)
+
+    def test_lock_service_counters_summarize_duration_and_count_probes(self) -> None:
+        duration_id = analyzer.fnv1a32(
+            "debug.lock_service.process.payload.robust.entries.duration_ns"
+        )
+        count_id = analyzer.fnv1a32("debug.lock_service.process.payload.robust.entry_count")
+        records = [
+            {"kind": "Counter", "hart": 0, "ts": "100", "payload": {"counter_id": duration_id, "value": 80}},
+            {"kind": "Counter", "hart": 0, "ts": "120", "payload": {"counter_id": duration_id, "value": 20}},
+            {"kind": "Counter", "hart": 0, "ts": "140", "payload": {"counter_id": count_id, "value": 3}},
+        ]
+        tables = analyzer.build_derived_tables(records)
+
+        report = analyzer.analyze_lock_service_counters(
+            records,
+            {
+                duration_id: "debug.lock_service.process.payload.robust.entries.duration_ns",
+                count_id: "debug.lock_service.process.payload.robust.entry_count",
+            },
+            top=10,
+            derived=tables,
+        )
+
+        self.assertIn("lock-service counters:", report)
+        self.assertIn("robust.entries.duration_ns", report)
+        self.assertIn("duration n=2", report)
+        self.assertIn("total=      0.1us", report)
+        self.assertIn("robust.entry_count", report)
+        self.assertIn("count n=1", report)
+        self.assertIn("sum=         3", report)
+
+    def test_ds_method_rows_are_derived_from_ds_method_track_arg_values(self) -> None:
+        method_id = analyzer.fnv1a32("debug.ds.substrate.page_allocator.reserve_frame")
+        duration_id = analyzer.fnv1a32("debug.ds.method.duration_ns")
+        zone_id = analyzer.fnv1a32("tx_subsystems::process::structure::ProcessPayload")
+        records = [
+            {
+                "kind": "Instant",
+                "hart": 1,
+                "ts": "123",
+                "payload_tag": analyzer.PAYLOAD_ARG_VALUE,
+                "parent": str(analyzer.DS_METHOD_TRACK_ID),
+                "name_id": method_id,
+                "payload": {"key": analyzer.fnv1a32("debug.ds.method.zone_id"), "value0": zone_id},
+            },
+            {
+                "kind": "Instant",
+                "hart": 1,
+                "ts": "127",
+                "payload_tag": analyzer.PAYLOAD_ARG_VALUE,
+                "parent": str(analyzer.DS_METHOD_TRACK_ID),
+                "name_id": method_id,
+                "payload": {"key": duration_id, "value0": 55},
+            }
+        ]
+
+        tables = analyzer.build_derived_tables(records)
+
+        self.assertEqual(
+            tables.ds_method_rows,
+            [
+                {
+                    "ts": 127,
+                    "hart": 1,
+                    "method_id": method_id,
+                    "zone_id": zone_id,
+                    "metric_id": duration_id,
+                    "value": 55,
+                }
+            ],
+        )
+        self.assertEqual(tables.meta["ds_method_row_count"], 1)
+
+        report = analyzer.analyze_ds_method_metrics(
+            records,
+            {
+                method_id: "debug.ds.substrate.page_allocator.reserve_frame",
+                duration_id: "debug.ds.method.duration_ns",
+                zone_id: "tx_subsystems::process::structure::ProcessPayload",
+            },
+            top=1,
+            derived=tables,
+        )
+        self.assertIn("DS method metrics:", report)
+        self.assertIn("debug.ds.substrate.page_allocator.reserve_frame", report)
+        self.assertIn("ProcessPayload", report)
+        self.assertIn("duration n=1", report)
 
     def test_sched_join_detects_migration_even_when_span_starts_and_ends_on_same_hart(self) -> None:
         records = [
@@ -854,13 +985,14 @@ class TxObserveAnalyzeTests(unittest.TestCase):
                 "spans = pathlib.Path(os.environ['TX_OBSERVE_SPANS_PARQUET'])\n"
                 "sched = pathlib.Path(os.environ['TX_OBSERVE_SCHED_INTERVALS_PARQUET'])\n"
                 "locks = pathlib.Path(os.environ['TX_OBSERVE_LOCK_ROWS_PARQUET'])\n"
-                "print(spans.exists(), sched.exists(), locks.exists(), os.environ['TX_OBSERVE_INPUT'])\n"
+                "ds = pathlib.Path(os.environ['TX_OBSERVE_DS_METHOD_ROWS_PARQUET'])\n"
+                "print(spans.exists(), sched.exists(), locks.exists(), ds.exists(), os.environ['TX_OBSERVE_INPUT'])\n"
             )
 
             proc = analyzer.run_python_file(script, tables, Path("trace.txtrace"), None, durable)
 
             self.assertEqual(proc.returncode, 0)
-            self.assertEqual(proc.stdout.strip(), "True True True trace.txtrace")
+            self.assertEqual(proc.stdout.strip(), "True True True True trace.txtrace")
             self.assertTrue((durable / "spans.parquet").exists())
 
     def test_sql_mode_queries_lock_rows(self) -> None:
@@ -892,6 +1024,64 @@ class TxObserveAnalyzeTests(unittest.TestCase):
         ).strip()
 
         self.assertEqual(output, f"lock_id,metric_id,p50,max_v\n{lock_id},{wait_id},25,25")
+
+    def test_sql_mode_queries_ds_method_rows(self) -> None:
+        duckdb = shutil.which("duckdb")
+        if duckdb is None:
+            self.skipTest("duckdb CLI is required to verify SQL mode")
+        method_id = analyzer.fnv1a32("debug.ds.substrate.zone.reserve_for")
+        duration_id = analyzer.fnv1a32("debug.ds.method.duration_ns")
+        zone_id = analyzer.fnv1a32("tx_subsystems::thread_runtime::structure::ThreadPayload")
+        tables = analyzer.build_derived_tables(
+            [
+                {
+                    "kind": "Instant",
+                    "hart": 0,
+                    "ts": "100",
+                    "payload_tag": analyzer.PAYLOAD_ARG_VALUE,
+                    "parent": str(analyzer.DS_METHOD_TRACK_ID),
+                    "name_id": method_id,
+                    "payload": {"key": analyzer.fnv1a32("debug.ds.method.zone_id"), "value0": zone_id},
+                },
+                {
+                    "kind": "Instant",
+                    "hart": 0,
+                    "ts": "100",
+                    "payload_tag": analyzer.PAYLOAD_ARG_VALUE,
+                    "parent": str(analyzer.DS_METHOD_TRACK_ID),
+                    "name_id": method_id,
+                    "payload": {"key": duration_id, "value0": 25},
+                },
+                {
+                    "kind": "Instant",
+                    "hart": 0,
+                    "ts": "110",
+                    "payload_tag": analyzer.PAYLOAD_ARG_VALUE,
+                    "parent": str(analyzer.DS_METHOD_TRACK_ID),
+                    "name_id": method_id,
+                    "payload": {"key": analyzer.fnv1a32("debug.ds.method.zone_id"), "value0": zone_id},
+                },
+                {
+                    "kind": "Instant",
+                    "hart": 0,
+                    "ts": "110",
+                    "payload_tag": analyzer.PAYLOAD_ARG_VALUE,
+                    "parent": str(analyzer.DS_METHOD_TRACK_ID),
+                    "name_id": method_id,
+                    "payload": {"key": duration_id, "value0": 75},
+                },
+            ]
+        )
+
+        output = analyzer.run_sql_query(
+            [],
+            tables,
+            {},
+            "select method_id, zone_id, metric_id, quantile_disc(value, 0.50) as p50, max(value) as max_v from ds_method_rows group by method_id, zone_id, metric_id",
+            "csv",
+        ).strip()
+
+        self.assertEqual(output, f"method_id,zone_id,metric_id,p50,max_v\n{method_id},{zone_id},{duration_id},25,75")
 
     def test_action_flags_are_mutually_exclusive(self) -> None:
         parser = analyzer.build_arg_parser()

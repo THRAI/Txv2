@@ -74,10 +74,16 @@ observe ...`, `tools/tx-observe-analyze.py`, and trace-backed OSComp debugging.
   `RUSTFLAGS="--cfg tx_lock_metrics --cfg tx_lock_metrics_vm"`.
 - Existing scheduler/process/wait-source/futex helpers should remain
   structured enough to correlate with syscall spans and sched tracks.
+- DS method metrics: substrate DS method-cost probes use
+  `debug.ds.substrate.<ds>.<method>` method names and emit
+  `debug.ds.method.duration_ns` on the explicit `debug.ds.method` track.
+  Enable with the global `tx_ds_metrics` cfg plus a local DS gate such as
+  `tx_ds_metrics_page_allocator` or `tx_ds_metrics_zone`; when either gate is
+  closed the timing/emission wrapper compiles to the original body.
 - Analyzer-derived tables currently include `spans`, `counters`,
-  `allocation_rows`, `sched_intervals`, and `lock_rows`. SQL/Python analysis should query
-  those typed tables; do not materialize a wide `records.parquet` on the local
-  hot path.
+  `allocation_rows`, `sched_intervals`, `lock_rows`, and `ds_method_rows`.
+  SQL/Python analysis should query those typed tables; do not materialize a
+  wide `records.parquet` on the local hot path.
 
 ## Commands
 
@@ -128,7 +134,8 @@ observe ...`, `tools/tx-observe-analyze.py`, and trace-backed OSComp debugging.
 ## SQL/Python Notes
 
 - SQL mode exposes DuckDB views named `records`, `repairs`, `spans`,
-  `counters`, `allocation_rows`, `sched_intervals`, `lock_rows`, and `names`.
+  `counters`, `allocation_rows`, `sched_intervals`, `lock_rows`,
+  `ds_method_rows`, and `names`.
 - For trace latency percentiles, prefer `quantile_disc(value, 0.50)` and
   `quantile_disc(value, 0.99)` so p50/p99 are observed samples rather than
   interpolated values.
@@ -136,8 +143,8 @@ observe ...`, `tools/tx-observe-analyze.py`, and trace-backed OSComp debugging.
   `TX_OBSERVE_TABLE_DIR`, `TX_OBSERVE_SPANS_PARQUET`,
   `TX_OBSERVE_COUNTERS_PARQUET`, `TX_OBSERVE_ALLOCATION_ROWS_PARQUET`,
   `TX_OBSERVE_SCHED_INTERVALS_PARQUET`, `TX_OBSERVE_LOCK_ROWS_PARQUET`,
-  `TX_OBSERVE_INPUT`, and optional `TX_OBSERVE_NAMES_JSON` environment
-  variables.
+  `TX_OBSERVE_DS_METHOD_ROWS_PARQUET`, `TX_OBSERVE_INPUT`, and optional
+  `TX_OBSERVE_NAMES_JSON` environment variables.
 
 ## Checks
 

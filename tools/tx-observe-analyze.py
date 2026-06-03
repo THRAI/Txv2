@@ -29,9 +29,10 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
-ANALYZER_DECODER_VERSION = "tx-observe-analyze-derived-v3"
+ANALYZER_DECODER_VERSION = "tx-observe-analyze-derived-v5"
 PARQUET_MANIFEST = "_tx_observe_parquet.json"
 LOCK_TRACK_ID = 0xD500_0000_0000_000F
+DS_METHOD_TRACK_ID = 0xD500_0000_0000_0010
 
 DEBUG_COUNTER_NAMES = [
     "debug.vm.pmap.teardown.phase",
@@ -132,6 +133,78 @@ DEBUG_COUNTER_NAMES = [
     "debug.lock.response_ns",
     "debug.lock.spins",
     "debug.lock.contended",
+    "debug.signal.select.thread1.lock.request",
+    "debug.signal.select.thread1.lock.acquired",
+    "debug.signal.select.thread1.lock.release",
+    "debug.signal.select.owner.upgrade.request",
+    "debug.signal.select.owner.upgrade.done",
+    "debug.signal.select.owner.upgrade.miss",
+    "debug.signal.select.proc.lock.request",
+    "debug.signal.select.proc.lock.acquired",
+    "debug.signal.select.proc.lock.release",
+    "debug.signal.select.thread2.lock.request",
+    "debug.signal.select.thread2.lock.acquired",
+    "debug.signal.select.thread2.lock.release",
+    "debug.signal.select.thread_pending.hit",
+    "debug.signal.select.group_pending.hit",
+    "debug.signal.select.done",
+    "debug.lock_service.process.payload.exit_group.shm_detach.duration_ns",
+    "debug.lock_service.process.payload.exit_group.drain_fds.duration_ns",
+    "debug.lock_service.process.payload.exit_group.threads_drain.duration_ns",
+    "debug.lock_service.process.payload.exit_group.zombify_threads.duration_ns",
+    "debug.lock_service.process.payload.exit_group.drop_drained.duration_ns",
+    "debug.lock_service.process.payload.exit_group.payload_drop.duration_ns",
+    "debug.lock_service.process.payload.process_exit.shm_detach.duration_ns",
+    "debug.lock_service.process.payload.process_exit.drain_fds.duration_ns",
+    "debug.lock_service.process.payload.process_exit.drop_closed_fds.duration_ns",
+    "debug.lock_service.process.payload.process_exit.payload_drop.duration_ns",
+    "debug.lock_service.process.payload.thread_exit.threads_detach.duration_ns",
+    "debug.lock_service.process.payload.thread_exit.thread_count.duration_ns",
+    "debug.lock_service.process.payload.thread_exit.group_exit.duration_ns",
+    "debug.lock_service.process.payload.robust.head_reads.duration_ns",
+    "debug.lock_service.process.payload.robust.entries.duration_ns",
+    "debug.lock_service.process.payload.robust.pending.duration_ns",
+    "debug.lock_service.process.payload.robust.entry_count",
+    "debug.lock_service.thread.payload.sigprocmask.payload_lock_wait.duration_ns",
+    "debug.lock_service.thread.payload.sigprocmask.payload_lock_held.duration_ns",
+    "debug.lock_service.thread.payload.sigprocmask.payload_cap_clone.duration_ns",
+    "debug.lock_service.thread.payload.sigprocmask.payload_missing",
+    "debug.lock_service.thread.payload.sigprocmask.mask_compute.duration_ns",
+    "debug.lock_service.thread.payload.sigprocmask.mask_noop",
+    "debug.lock_service.thread.payload.sigprocmask.mask_store.duration_ns",
+    "debug.lock_service.thread.payload.sigprocmask.refresh.duration_ns",
+    "debug.cap.upgrade.to_cap.duration_ns",
+    "debug.cap.upgrade.to_cap.attempts",
+    "debug.cap.upgrade.to_cap.retries",
+    "debug.sigprocmask.enter",
+    "debug.sigprocmask.args",
+    "debug.sigprocmask.bad_size",
+    "debug.sigprocmask.read.err",
+    "debug.sigprocmask.read.after",
+    "debug.sigprocmask.step.after",
+    "debug.sigprocmask.step.zombie",
+    "debug.sigprocmask.mask.zombie",
+    "debug.sigprocmask.mask.after",
+    "debug.sigprocmask.write.err",
+    "debug.sigprocmask.write.after",
+    "debug.sigprocmask.return",
+    "debug.vm.user.copy_in.len",
+    "debug.vm.user.copy_in.phase",
+    "debug.vm.user.copy_in.err",
+    "debug.vm.user.copy_in.chunk",
+    "debug.vm.user.copy_in.copied",
+    "debug.vm.user.copy_in.blocked",
+    "debug.vm.user.resolve.kind",
+    "debug.vm.user.resolve.phase",
+    "debug.vm.user.resolve.err",
+    "debug.vm.user.resolve.blocked",
+    "debug.vm.user.resolve.backing",
+    "debug.vm.user.resolve_page.backing",
+    "debug.vm.user.resolve_page.err",
+    "debug.vm.user.resolve_page.phase",
+    "debug.vm.user.pagebacked.phase",
+    "debug.vm.user.pagebacked.err",
+    "debug.vm.user.pagebacked.blocked",
 ]
 
 ALLOC_TRACK_NAMES = {
@@ -710,12 +783,14 @@ class DerivedTables:
         meta: dict[str, Any],
         sched_intervals: list[dict[str, int]] | None = None,
         lock_rows: list[dict[str, int]] | None = None,
+        ds_method_rows: list[dict[str, int]] | None = None,
     ) -> None:
         self.spans = spans
         self.counters = counters
         self.allocation_rows = allocation_rows
         self.sched_intervals = sched_intervals or []
         self.lock_rows = lock_rows or []
+        self.ds_method_rows = ds_method_rows or []
         self.meta = meta
 
 
@@ -775,6 +850,9 @@ def build_derived_tables(
     counters: list[dict[str, int]] = []
     allocation: list[dict[str, Any]] = []
     lock_rows: list[dict[str, int]] = []
+    ds_method_rows: list[dict[str, int]] = []
+    pending_ds_zone_by_emit: dict[tuple[int, int], int] = {}
+    ds_zone_metric_id = fnv1a32("debug.ds.method.zone_id")
 
     for record in records:
         kind = record.get("kind")
@@ -868,6 +946,27 @@ def build_derived_tables(
                     }
                 )
                 continue
+            if parent == DS_METHOD_TRACK_ID:
+                method_id = parse_u32_id(record.get("name_id"))
+                metric_id = parse_u32_id(payload.get("key"))
+                if method_id is None or metric_id is None:
+                    continue
+                emit_key = (int(hart or 0), method_id)
+                if metric_id == ds_zone_metric_id:
+                    pending_ds_zone_by_emit[emit_key] = int(value)
+                    continue
+                zone_id = pending_ds_zone_by_emit.pop(emit_key, None)
+                ds_method_rows.append(
+                    {
+                        "ts": record_ts(record),
+                        "hart": emit_key[0],
+                        "method_id": method_id,
+                        "zone_id": zone_id or None,
+                        "metric_id": metric_id,
+                        "value": value,
+                    }
+                )
+                continue
             if parent not in ALLOC_TRACK_NAMES:
                 continue
             allocation.append(
@@ -913,6 +1012,7 @@ def build_derived_tables(
         allocation_rows=allocation,
         sched_intervals=sched_intervals,
         lock_rows=lock_rows,
+        ds_method_rows=ds_method_rows,
         meta={
             "schema": "tx-observe-derived-v0",
             "decoder_version": ANALYZER_DECODER_VERSION,
@@ -927,6 +1027,7 @@ def build_derived_tables(
             "allocation_row_count": len(allocation),
             "sched_interval_count": len(sched_intervals),
             "lock_row_count": len(lock_rows),
+            "ds_method_row_count": len(ds_method_rows),
         },
     )
 
@@ -991,6 +1092,7 @@ def derived_tables_to_json(tables: DerivedTables, input_hash: str) -> dict[str, 
         "allocation_rows": tables.allocation_rows,
         "sched_intervals": tables.sched_intervals,
         "lock_rows": tables.lock_rows,
+        "ds_method_rows": tables.ds_method_rows,
     }
 
 
@@ -1001,6 +1103,7 @@ def derived_tables_from_json(data: dict[str, Any]) -> DerivedTables:
         allocation_rows=list(data.get("allocation_rows") or []),
         sched_intervals=list(data.get("sched_intervals") or []),
         lock_rows=list(data.get("lock_rows") or []),
+        ds_method_rows=list(data.get("ds_method_rows") or []),
         meta=dict(data.get("meta") or {}),
     )
 
@@ -1048,6 +1151,14 @@ PARQUET_SCHEMAS = {
         ("ts", "UBIGINT"),
         ("hart", "UINTEGER"),
         ("lock_id", "UINTEGER"),
+        ("metric_id", "UINTEGER"),
+        ("value", "UBIGINT"),
+    ],
+    "ds_method_rows.parquet": [
+        ("ts", "UBIGINT"),
+        ("hart", "UINTEGER"),
+        ("method_id", "UINTEGER"),
+        ("zone_id", "UINTEGER"),
         ("metric_id", "UINTEGER"),
         ("value", "UBIGINT"),
     ],
@@ -1239,6 +1350,7 @@ def write_parquet_manifest(
             "allocation_rows": len(tables.allocation_rows),
             "sched_intervals": len(tables.sched_intervals),
             "lock_rows": len(tables.lock_rows),
+            "ds_method_rows": len(tables.ds_method_rows),
         },
     }
     path = parquet_manifest_path(out_dir)
@@ -1278,6 +1390,11 @@ def export_derived_tables_parquet(
             "lock_rows.parquet",
             tables.lock_rows,
             [column for column, _ in PARQUET_SCHEMAS["lock_rows.parquet"]],
+        ),
+        (
+            "ds_method_rows.parquet",
+            tables.ds_method_rows,
+            [column for column, _ in PARQUET_SCHEMAS["ds_method_rows.parquet"]],
         ),
     ]
     for filename, rows, columns in exports:
@@ -1329,6 +1446,7 @@ def run_sql_query(
             ("allocation_rows", tables.allocation_rows, PARQUET_SCHEMAS["allocation_rows.parquet"]),
             ("sched_intervals", tables.sched_intervals, PARQUET_SCHEMAS["sched_intervals.parquet"]),
             ("lock_rows", tables.lock_rows, PARQUET_SCHEMAS["lock_rows.parquet"]),
+            ("ds_method_rows", tables.ds_method_rows, PARQUET_SCHEMAS["ds_method_rows.parquet"]),
             ("names", sql_names_rows(names), NAME_SQL_SCHEMA),
         ]
         setup: list[str] = []
@@ -1371,6 +1489,7 @@ CREATE TEMP VIEW counters AS SELECT * FROM read_parquet({duckdb_sql_string(parqu
 CREATE TEMP VIEW allocation_rows AS SELECT * FROM read_parquet({duckdb_sql_string(parquet_dir / "allocation_rows.parquet")});
 CREATE TEMP VIEW sched_intervals AS SELECT * FROM read_parquet({duckdb_sql_string(parquet_dir / "sched_intervals.parquet")});
 CREATE TEMP VIEW lock_rows AS SELECT * FROM read_parquet({duckdb_sql_string(parquet_dir / "lock_rows.parquet")});
+CREATE TEMP VIEW ds_method_rows AS SELECT * FROM read_parquet({duckdb_sql_string(parquet_dir / "ds_method_rows.parquet")});
 
 SELECT 'counts' AS section, 'spans' AS key, count(*)::VARCHAR AS n, NULL AS total_ns,
        NULL AS p50_ns, NULL AS p99_ns, NULL AS max_ns, 0::UBIGINT AS order_ns
@@ -1383,6 +1502,8 @@ UNION ALL
 SELECT 'counts', 'sched_intervals', count(*)::VARCHAR, NULL, NULL, NULL, NULL, 0::UBIGINT FROM sched_intervals
 UNION ALL
 SELECT 'counts', 'lock_rows', count(*)::VARCHAR, NULL, NULL, NULL, NULL, 0::UBIGINT FROM lock_rows
+UNION ALL
+SELECT 'counts', 'ds_method_rows', count(*)::VARCHAR, NULL, NULL, NULL, NULL, 0::UBIGINT FROM ds_method_rows
 UNION ALL
 SELECT 'span_total',
        coalesce(names.name, 'name_0x' || lower(hex(s.name_id))) AS key,
@@ -1418,7 +1539,8 @@ LIMIT {top + 4};
             f"spans={counts.get('spans', 0)} counters={counts.get('counters', 0)} "
             f"allocation_rows={counts.get('allocation_rows', 0)} "
             f"sched_intervals={counts.get('sched_intervals', 0)} "
-            f"lock_rows={counts.get('lock_rows', 0)}"
+            f"lock_rows={counts.get('lock_rows', 0)} "
+            f"ds_method_rows={counts.get('ds_method_rows', 0)}"
         ),
         "",
         "by span total (parquet):",
@@ -1467,6 +1589,7 @@ def run_python_file_with_table_dir(
             "TX_OBSERVE_ALLOCATION_ROWS_PARQUET": str(table_dir / "allocation_rows.parquet"),
             "TX_OBSERVE_SCHED_INTERVALS_PARQUET": str(table_dir / "sched_intervals.parquet"),
             "TX_OBSERVE_LOCK_ROWS_PARQUET": str(table_dir / "lock_rows.parquet"),
+            "TX_OBSERVE_DS_METHOD_ROWS_PARQUET": str(table_dir / "ds_method_rows.parquet"),
             "TX_OBSERVE_INPUT": str(input_path),
         }
     )
@@ -2261,6 +2384,100 @@ def analyze_lock_metrics(
     return "\n".join(out)
 
 
+def analyze_lock_service_counters(
+    records: list[dict[str, Any]],
+    names: dict[int, str],
+    top: int,
+    derived: DerivedTables | None = None,
+) -> str:
+    derived = derived or build_derived_tables(records)
+
+    grouped: dict[str, list[int]] = defaultdict(list)
+    for row in derived.counters:
+        counter_id = int(row["counter_id"])
+        name = names.get(counter_id, f"counter_0x{counter_id:x}")
+        if not name.startswith("debug.lock_service."):
+            continue
+        grouped[name].append(int(row["value"]))
+
+    if not grouped:
+        return "\nlock-service counters: none"
+
+    def score(item: tuple[str, list[int]]) -> int:
+        name, values = item
+        if name.endswith(".duration_ns"):
+            return max(values)
+        return sum(values)
+
+    out = ["", "lock-service counters:"]
+    for name, values in sorted(grouped.items(), key=score, reverse=True)[:top]:
+        if name.endswith(".duration_ns"):
+            out.append(
+                f"{name[:64].ljust(64)} duration n={len(values)} "
+                f"total={fmt_ns(sum(values)):>11} "
+                f"p50={fmt_ns(percentile(values, 0.50)):>10} "
+                f"p99={fmt_ns(percentile(values, 0.99)):>10} "
+                f"max={fmt_ns(max(values)):>10}"
+            )
+            continue
+        out.append(
+            f"{name[:64].ljust(64)} count n={len(values)} "
+            f"sum={sum(values):>10} p50={percentile(values, 0.50):>6} "
+            f"p99={percentile(values, 0.99):>6} max={max(values):>6}"
+        )
+    return "\n".join(out)
+
+
+def analyze_ds_method_metrics(
+    records: list[dict[str, Any]],
+    names: dict[int, str],
+    top: int,
+    derived: DerivedTables | None = None,
+) -> str:
+    derived = derived or build_derived_tables(records)
+    if not derived.ds_method_rows:
+        return "\nDS method metrics: none"
+
+    metric_names = {
+        fnv1a32("debug.ds.method.duration_ns"): "duration",
+    }
+    grouped: dict[tuple[int, int | None], dict[str, list[int]]] = defaultdict(lambda: defaultdict(list))
+    for row in derived.ds_method_rows:
+        method_id = int(row["method_id"])
+        zone_id = row.get("zone_id")
+        zone_key = int(zone_id) if zone_id is not None else None
+        metric_id = int(row["metric_id"])
+        metric_name = metric_names.get(metric_id, names.get(metric_id, f"metric_0x{metric_id:x}"))
+        grouped[(method_id, zone_key)][metric_name].append(int(row["value"]))
+
+    def score(item: tuple[tuple[int, int | None], dict[str, list[int]]]) -> int:
+        _key, metrics = item
+        values = metrics.get("duration") or []
+        return percentile(values, 0.99) if values else 0
+
+    out = ["", "DS method metrics:"]
+    for (method_id, zone_id), metrics in sorted(grouped.items(), key=score, reverse=True)[:top]:
+        name = names.get(method_id, f"method_0x{method_id:x}")
+        zone = "" if zone_id is None else f" zone={names.get(zone_id, f'zone_0x{zone_id:x}')}"
+        duration = metrics.get("duration", [])
+        if duration:
+            out.append(
+                f"{name[:48].ljust(48)}{zone} duration n={len(duration)} "
+                f"total={fmt_ns(sum(duration)):>11} "
+                f"p50={fmt_ns(percentile(duration, 0.50)):>10} "
+                f"p99={fmt_ns(percentile(duration, 0.99)):>10} "
+                f"max={fmt_ns(max(duration)):>10}"
+            )
+            continue
+        for metric_name, values in sorted(metrics.items()):
+            out.append(
+                f"{name[:48].ljust(48)}{zone} {metric_name} n={len(values)} "
+                f"sum={sum(values):>10} p50={percentile(values, 0.50):>6} "
+                f"p99={percentile(values, 0.99):>6} max={max(values):>6}"
+            )
+    return "\n".join(out)
+
+
 def analyze_sched_counters(records: list[dict[str, Any]], names: dict[int, str], top: int) -> str:
     events: list[tuple[int, str, int, int | None, int | None]] = []
     for record in records:
@@ -3037,7 +3254,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Optional directory for exported derived-table Parquet files "
             "(spans.parquet, counters.parquet, allocation_rows.parquet, "
-            "sched_intervals.parquet, lock_rows.parquet)."
+            "sched_intervals.parquet, lock_rows.parquet, ds_method_rows.parquet)."
         ),
     )
     parser.add_argument(
@@ -3141,6 +3358,8 @@ def main() -> int:
     print(analyze(records, names, args.top, derived_result.tables))
     print(analyze_allocation_tracks(records, names, args.top, derived_result.tables))
     print(analyze_lock_metrics(records, names, args.top, derived_result.tables))
+    print(analyze_lock_service_counters(records, names, args.top, derived_result.tables))
+    print(analyze_ds_method_metrics(records, names, args.top, derived_result.tables))
     print(analyze_futex_ops(records, names, args.top))
     print(analyze_futex_table_counters(records, names, args.top))
     print(analyze_wait_source_notify(records, names, args.top))

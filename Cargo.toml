@@ -34,7 +34,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://example.invalid/txkernel"
 
 [workspace.lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tx_lock_metrics)', 'cfg(tx_lock_metrics_vm)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tx_lock_metrics)', 'cfg(tx_lock_metrics_vm)', 'cfg(tx_lock_metrics_process)', 'cfg(tx_lock_metrics_kernel)', 'cfg(tx_sigprocmask_phase_metrics)', 'cfg(tx_signal_select_metrics)', 'cfg(tx_cap_upgrade_metrics)', 'cfg(tx_ds_metrics)', 'cfg(tx_ds_metrics_page_allocator)', 'cfg(tx_ds_metrics_zone)', 'cfg(tx_ds_metrics_process)', 'cfg(tx_vm_recipe_bplus)', 'cfg(tx_vm_recipe_bplus_arc_metrics)', 'cfg(tx_vm_recipe_bplus_shape_metrics)', 'cfg(tx_pmap_debug)'] }
 
 [profile.dev]
 panic = "abort"
