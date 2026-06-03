@@ -772,22 +772,18 @@ impl EntropyIf for Platform {
 // observation ring. The buffer's lifetime is the kernel's lifetime, so the
 // `'static` requirement in `RingDescriptor` is satisfied.
 //
-// Sizing: 8 MiB for the dumping hart → 208-byte ring header + 104k × 80-byte slots.
+// Sizing: 2 MiB per hart → 208-byte ring header + 26k × 80-byte slots.
 // The ring is circular; once full, oldest slots are overwritten. Full
 // libcbench mm/io/pthread diagnostic runs emit much more than the older
 // basic-musl smoke trace, so keep enough backing for an end-of-window
 // bracketed dump instead of relying on early threshold shutdown.
 //
 // Sizing budget: rv64-qemu OSComp boots with 1 GiB of guest RAM (`-m 1G`);
-// the single 8 MiB ring keeps the high-kernel bootstrap alias within its
+// the 4 x 2 MiB ring set keeps the high-kernel bootstrap alias within its
 // current 16 MiB boot mapping while avoiding trace wrap for diagnostic
 // captures of the current libcbench subset.
-//
-// One ring is allocated because `dump_console_hex` currently emits one hart
-// and the custom OSComp observe runner is deliberately SMP=1. Expanding this
-// for SMP needs multi-hart dump/extract support, not just more static backing.
-const OBS_RING_BYTES: usize = 8 * 1024 * 1024;
-const OBS_RING_HARTS: usize = 1;
+const OBS_RING_BYTES: usize = 2 * 1024 * 1024;
+const OBS_RING_HARTS: usize = 4;
 
 /// Aligned static backing for the observation ring. `#[repr(C, align(64))]`
 /// ensures cache-line alignment for the SPSC head/tail atomics that live in
@@ -795,7 +791,9 @@ const OBS_RING_HARTS: usize = 1;
 #[repr(C, align(64))]
 struct ObsRingBuf([u8; OBS_RING_BYTES]);
 
-static mut OBS_RINGS: [ObsRingBuf; OBS_RING_HARTS] =
+#[no_mangle]
+#[link_section = ".bss.observe_rings"]
+static mut TX_OBSERVE_RINGS: [ObsRingBuf; OBS_RING_HARTS] =
     [const { ObsRingBuf([0u8; OBS_RING_BYTES]) }; OBS_RING_HARTS];
 
 impl ObserverIf for Platform {
@@ -804,13 +802,13 @@ impl ObserverIf for Platform {
         if idx >= OBS_RING_HARTS {
             return None;
         }
-        // SAFETY: `OBS_RINGS[idx]` is a static buffer with the kernel's
+        // SAFETY: `TX_OBSERVE_RINGS[idx]` is a static buffer with the kernel's
         // lifetime. The SPSC discipline in `tx-observe` guarantees that
         // only the owning hart writes to its slot; readers (the daemon
         // or the serial-dump path) read after the producer has stopped.
         // `OBS_RING_BYTES` is a power of two (64 KiB = 2^16), satisfying
         // the `size` invariant on `RingDescriptor`.
-        let ptr = unsafe { OBS_RINGS[idx].0.as_mut_ptr() };
+        let ptr = unsafe { TX_OBSERVE_RINGS[idx].0.as_mut_ptr() };
         Some(tx_hal::RingDescriptor {
             base: core::ptr::NonNull::new(ptr).expect("OBS_RINGS slice has non-null base"),
             size: OBS_RING_BYTES,
@@ -840,10 +838,9 @@ pub fn obs_ring_bytes(hart: CpuId) -> Option<&'static [u8]> {
         return None;
     }
     // SAFETY: the kernel calls this only after the trace-producing
-    // workload has reached its observation-quiescence point (init
-    // zombified, no more emits in flight on this hart). The single-hart
-    // discipline (`-smp 1`) means no concurrent writer exists.
-    unsafe { Some(&OBS_RINGS[idx].0[..]) }
+    // workload has reached its observation-quiescence point for the selected
+    // hart. Live host drain reads the same backing while the guest runs.
+    unsafe { Some(&TX_OBSERVE_RINGS[idx].0[..]) }
 }
 
 #[cfg(target_arch = "riscv64")]

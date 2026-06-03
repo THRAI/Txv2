@@ -130,7 +130,7 @@ fn observe_names(args: &[String]) -> Result<()> {
             .or_insert(name.to_string());
     }
 
-    // ── 2. Symbol-table walk for `op_name_id::<S>` monomorphizations ────
+    // ── 2. Symbol-table walk for type-name-based observe ids ────────────
     //
     // Per OBS-V1-OPNAME-1 and OBS-HOST-V0-NAMES-GENERATION: the
     // names.json file is produced by an xtask in the kernel build that
@@ -170,6 +170,11 @@ fn observe_names(args: &[String]) -> Result<()> {
                 .entry(fnv1a32(with_lifetime.as_bytes()))
                 .or_insert(label);
             drives_found += 1;
+        }
+        if let Some(s) = extract_ds_zone_type_param(&demangled) {
+            table
+                .entry(fnv1a32(s.as_bytes()))
+                .or_insert(format!("zone.{}", short_type(s)));
         }
     }
 
@@ -261,7 +266,26 @@ fn demangle_symbol(name: &str) -> String {
 /// stop, leaving any trailer untouched.
 fn extract_op_name_id_type_param(demangled: &str) -> Option<&str> {
     const PIVOT: &str = "tx_scripts::drive::op_name_id::<";
-    let start = demangled.find(PIVOT)? + PIVOT.len();
+    extract_first_type_param_after(demangled, PIVOT)
+}
+
+fn extract_ds_zone_type_param(demangled: &str) -> Option<&str> {
+    for pivot in [
+        "tx_substrate::zone::reserve_for::<",
+        "tx_substrate::zone::sign_for::<",
+        "tx_substrate::zone::sign::<",
+        "tx_substrate::zone::return_slot::<",
+        "tx_substrate::zone::return_slot_from_reclaim::<",
+    ] {
+        if let Some(type_param) = extract_first_type_param_after(demangled, pivot) {
+            return Some(type_param);
+        }
+    }
+    None
+}
+
+fn extract_first_type_param_after<'a>(demangled: &'a str, pivot: &str) -> Option<&'a str> {
+    let start = demangled.find(pivot)? + pivot.len();
     let rest = &demangled[start..];
     let mut depth = 1usize;
     for (i, c) in rest.char_indices() {
@@ -344,6 +368,455 @@ const KERNEL_FNV1A_STABLE_NAMES: &[(&str, &str)] = &[
     (
         "debug.alloc.pagebacked.container.pages",
         "debug.alloc.pagebacked.container.pages",
+    ),
+    ("debug.ds.method.duration_ns", "debug.ds.method.duration_ns"),
+    ("debug.ds.method.zone_id", "debug.ds.method.zone_id"),
+    (
+        "debug.ds.substrate.zone.reserve_for",
+        "debug.ds.substrate.zone.reserve_for",
+    ),
+    (
+        "debug.ds.substrate.zone.sign_for",
+        "debug.ds.substrate.zone.sign_for",
+    ),
+    (
+        "debug.ds.substrate.zone.sign",
+        "debug.ds.substrate.zone.sign",
+    ),
+    (
+        "debug.ds.substrate.zone.pop_free_slot",
+        "debug.ds.substrate.zone.pop_free_slot",
+    ),
+    (
+        "debug.ds.substrate.zone.return_slot",
+        "debug.ds.substrate.zone.return_slot",
+    ),
+    (
+        "debug.ds.substrate.zone.return_slot_from_reclaim",
+        "debug.ds.substrate.zone.return_slot_from_reclaim",
+    ),
+    (
+        "debug.ds.substrate.zone.refill_bucket",
+        "debug.ds.substrate.zone.refill_bucket",
+    ),
+    (
+        "debug.ds.substrate.zone.drain_bucket_to_keg",
+        "debug.ds.substrate.zone.drain_bucket_to_keg",
+    ),
+    (
+        "debug.ds.substrate.page_allocator.reserve_frame",
+        "debug.ds.substrate.page_allocator.reserve_frame",
+    ),
+    (
+        "debug.ds.substrate.page_allocator.reserve_run",
+        "debug.ds.substrate.page_allocator.reserve_run",
+    ),
+    (
+        "debug.ds.process.pid_namespace.register_pid",
+        "debug.ds.process.pid_namespace.register_pid",
+    ),
+    (
+        "debug.ds.process.pid_namespace.register_tid",
+        "debug.ds.process.pid_namespace.register_tid",
+    ),
+    (
+        "debug.ds.process.pid_namespace.register_pgrp",
+        "debug.ds.process.pid_namespace.register_pgrp",
+    ),
+    (
+        "debug.ds.process.pid_namespace.register_session",
+        "debug.ds.process.pid_namespace.register_session",
+    ),
+    (
+        "debug.ds.process.pid_namespace.unregister_pid_number",
+        "debug.ds.process.pid_namespace.unregister_pid_number",
+    ),
+    (
+        "debug.ds.process.pid_namespace.unregister_tid_number",
+        "debug.ds.process.pid_namespace.unregister_tid_number",
+    ),
+    (
+        "debug.ds.process.pid_namespace.resolve_pid_number",
+        "debug.ds.process.pid_namespace.resolve_pid_number",
+    ),
+    (
+        "debug.ds.process.pid_namespace.resolve_pid_number_as",
+        "debug.ds.process.pid_namespace.resolve_pid_number_as",
+    ),
+    (
+        "debug.ds.process.pid_namespace.with_namespace",
+        "debug.ds.process.pid_namespace.with_namespace",
+    ),
+    (
+        "debug.ds.process.children.attach",
+        "debug.ds.process.children.attach",
+    ),
+    (
+        "debug.ds.process.children.detach",
+        "debug.ds.process.children.detach",
+    ),
+    (
+        "debug.ds.process.children.len",
+        "debug.ds.process.children.len",
+    ),
+    (
+        "debug.ds.process.children.is_empty",
+        "debug.ds.process.children.is_empty",
+    ),
+    (
+        "debug.ds.process.children.snapshot",
+        "debug.ds.process.children.snapshot",
+    ),
+    (
+        "debug.ds.process.children.drain",
+        "debug.ds.process.children.drain",
+    ),
+    (
+        "debug.ds.process.children.retain",
+        "debug.ds.process.children.retain",
+    ),
+    (
+        "debug.ds.process.group_members.attach",
+        "debug.ds.process.group_members.attach",
+    ),
+    (
+        "debug.ds.process.group_members.detach",
+        "debug.ds.process.group_members.detach",
+    ),
+    (
+        "debug.ds.process.group_members.len",
+        "debug.ds.process.group_members.len",
+    ),
+    (
+        "debug.ds.process.group_members.is_empty",
+        "debug.ds.process.group_members.is_empty",
+    ),
+    (
+        "debug.ds.process.group_members.retain",
+        "debug.ds.process.group_members.retain",
+    ),
+    (
+        "debug.ds.process.group_members.snapshot_live",
+        "debug.ds.process.group_members.snapshot_live",
+    ),
+    (
+        "debug.ds.process.group_members.count_live",
+        "debug.ds.process.group_members.count_live",
+    ),
+    (
+        "debug.ds.process.threads.attach",
+        "debug.ds.process.threads.attach",
+    ),
+    (
+        "debug.ds.process.threads.detach",
+        "debug.ds.process.threads.detach",
+    ),
+    (
+        "debug.ds.process.threads.count",
+        "debug.ds.process.threads.count",
+    ),
+    (
+        "debug.ds.process.threads.nth",
+        "debug.ds.process.threads.nth",
+    ),
+    (
+        "debug.ds.process.threads.find_by_tid",
+        "debug.ds.process.threads.find_by_tid",
+    ),
+    (
+        "debug.ds.process.threads.snapshot",
+        "debug.ds.process.threads.snapshot",
+    ),
+    (
+        "debug.ds.process.threads.drain",
+        "debug.ds.process.threads.drain",
+    ),
+    (
+        "debug.ds.process.threads.retain",
+        "debug.ds.process.threads.retain",
+    ),
+    (
+        "debug.ds.process.session_members.attach",
+        "debug.ds.process.session_members.attach",
+    ),
+    (
+        "debug.ds.process.session_members.len",
+        "debug.ds.process.session_members.len",
+    ),
+    (
+        "debug.ds.process.session_members.is_empty",
+        "debug.ds.process.session_members.is_empty",
+    ),
+    (
+        "debug.ds.process.session_members.snapshot_live",
+        "debug.ds.process.session_members.snapshot_live",
+    ),
+    (
+        "debug.signal.select.thread1.lock.request",
+        "debug.signal.select.thread1.lock.request",
+    ),
+    (
+        "debug.signal.select.thread1.lock.acquired",
+        "debug.signal.select.thread1.lock.acquired",
+    ),
+    (
+        "debug.signal.select.thread1.lock.release",
+        "debug.signal.select.thread1.lock.release",
+    ),
+    (
+        "debug.signal.select.owner.upgrade.request",
+        "debug.signal.select.owner.upgrade.request",
+    ),
+    (
+        "debug.signal.select.owner.upgrade.done",
+        "debug.signal.select.owner.upgrade.done",
+    ),
+    (
+        "debug.signal.select.owner.upgrade.miss",
+        "debug.signal.select.owner.upgrade.miss",
+    ),
+    (
+        "debug.signal.select.proc.lock.request",
+        "debug.signal.select.proc.lock.request",
+    ),
+    (
+        "debug.signal.select.proc.lock.acquired",
+        "debug.signal.select.proc.lock.acquired",
+    ),
+    (
+        "debug.signal.select.proc.lock.release",
+        "debug.signal.select.proc.lock.release",
+    ),
+    (
+        "debug.signal.select.thread2.lock.request",
+        "debug.signal.select.thread2.lock.request",
+    ),
+    (
+        "debug.signal.select.thread2.lock.acquired",
+        "debug.signal.select.thread2.lock.acquired",
+    ),
+    (
+        "debug.signal.select.thread2.lock.release",
+        "debug.signal.select.thread2.lock.release",
+    ),
+    (
+        "debug.signal.select.thread_pending.hit",
+        "debug.signal.select.thread_pending.hit",
+    ),
+    (
+        "debug.signal.select.group_pending.hit",
+        "debug.signal.select.group_pending.hit",
+    ),
+    ("debug.signal.select.done", "debug.signal.select.done"),
+    (
+        "debug.lock_service.process.payload.exit_group.shm_detach.duration_ns",
+        "debug.lock_service.process.payload.exit_group.shm_detach.duration_ns",
+    ),
+    (
+        "debug.lock_service.process.payload.exit_group.drain_fds.duration_ns",
+        "debug.lock_service.process.payload.exit_group.drain_fds.duration_ns",
+    ),
+    (
+        "debug.lock_service.process.payload.exit_group.threads_drain.duration_ns",
+        "debug.lock_service.process.payload.exit_group.threads_drain.duration_ns",
+    ),
+    (
+        "debug.lock_service.process.payload.exit_group.zombify_threads.duration_ns",
+        "debug.lock_service.process.payload.exit_group.zombify_threads.duration_ns",
+    ),
+    (
+        "debug.lock_service.process.payload.exit_group.drop_drained.duration_ns",
+        "debug.lock_service.process.payload.exit_group.drop_drained.duration_ns",
+    ),
+    (
+        "debug.lock_service.process.payload.exit_group.payload_drop.duration_ns",
+        "debug.lock_service.process.payload.exit_group.payload_drop.duration_ns",
+    ),
+    (
+        "debug.lock_service.process.payload.process_exit.shm_detach.duration_ns",
+        "debug.lock_service.process.payload.process_exit.shm_detach.duration_ns",
+    ),
+    (
+        "debug.lock_service.process.payload.process_exit.drain_fds.duration_ns",
+        "debug.lock_service.process.payload.process_exit.drain_fds.duration_ns",
+    ),
+    (
+        "debug.lock_service.process.payload.process_exit.drop_closed_fds.duration_ns",
+        "debug.lock_service.process.payload.process_exit.drop_closed_fds.duration_ns",
+    ),
+    (
+        "debug.lock_service.process.payload.process_exit.payload_drop.duration_ns",
+        "debug.lock_service.process.payload.process_exit.payload_drop.duration_ns",
+    ),
+    (
+        "debug.lock_service.process.payload.thread_exit.threads_detach.duration_ns",
+        "debug.lock_service.process.payload.thread_exit.threads_detach.duration_ns",
+    ),
+    (
+        "debug.lock_service.process.payload.thread_exit.thread_count.duration_ns",
+        "debug.lock_service.process.payload.thread_exit.thread_count.duration_ns",
+    ),
+    (
+        "debug.lock_service.process.payload.thread_exit.group_exit.duration_ns",
+        "debug.lock_service.process.payload.thread_exit.group_exit.duration_ns",
+    ),
+    (
+        "debug.lock_service.process.payload.robust.head_reads.duration_ns",
+        "debug.lock_service.process.payload.robust.head_reads.duration_ns",
+    ),
+    (
+        "debug.lock_service.process.payload.robust.entries.duration_ns",
+        "debug.lock_service.process.payload.robust.entries.duration_ns",
+    ),
+    (
+        "debug.lock_service.process.payload.robust.pending.duration_ns",
+        "debug.lock_service.process.payload.robust.pending.duration_ns",
+    ),
+    (
+        "debug.lock_service.process.payload.robust.entry_count",
+        "debug.lock_service.process.payload.robust.entry_count",
+    ),
+    (
+        "debug.lock_service.thread.payload.sigprocmask.payload_lock_wait.duration_ns",
+        "debug.lock_service.thread.payload.sigprocmask.payload_lock_wait.duration_ns",
+    ),
+    (
+        "debug.lock_service.thread.payload.sigprocmask.payload_lock_held.duration_ns",
+        "debug.lock_service.thread.payload.sigprocmask.payload_lock_held.duration_ns",
+    ),
+    (
+        "debug.lock_service.thread.payload.sigprocmask.payload_cap_clone.duration_ns",
+        "debug.lock_service.thread.payload.sigprocmask.payload_cap_clone.duration_ns",
+    ),
+    (
+        "debug.lock_service.thread.payload.sigprocmask.payload_missing",
+        "debug.lock_service.thread.payload.sigprocmask.payload_missing",
+    ),
+    (
+        "debug.lock_service.thread.payload.sigprocmask.mask_compute.duration_ns",
+        "debug.lock_service.thread.payload.sigprocmask.mask_compute.duration_ns",
+    ),
+    (
+        "debug.lock_service.thread.payload.sigprocmask.mask_noop",
+        "debug.lock_service.thread.payload.sigprocmask.mask_noop",
+    ),
+    (
+        "debug.lock_service.thread.payload.sigprocmask.mask_store.duration_ns",
+        "debug.lock_service.thread.payload.sigprocmask.mask_store.duration_ns",
+    ),
+    (
+        "debug.lock_service.thread.payload.sigprocmask.refresh.duration_ns",
+        "debug.lock_service.thread.payload.sigprocmask.refresh.duration_ns",
+    ),
+    (
+        "debug.cap.upgrade.to_cap.duration_ns",
+        "debug.cap.upgrade.to_cap.duration_ns",
+    ),
+    (
+        "debug.cap.upgrade.to_cap.attempts",
+        "debug.cap.upgrade.to_cap.attempts",
+    ),
+    (
+        "debug.cap.upgrade.to_cap.retries",
+        "debug.cap.upgrade.to_cap.retries",
+    ),
+    (
+        "debug.cap.upgrade.weak.total.duration_ns",
+        "debug.cap.upgrade.weak.total.duration_ns",
+    ),
+    (
+        "debug.cap.upgrade.weak.registry.duration_ns",
+        "debug.cap.upgrade.weak.registry.duration_ns",
+    ),
+    (
+        "debug.cap.upgrade.weak.meta.duration_ns",
+        "debug.cap.upgrade.weak.meta.duration_ns",
+    ),
+    (
+        "debug.cap.upgrade.weak.to_cap.duration_ns",
+        "debug.cap.upgrade.weak.to_cap.duration_ns",
+    ),
+    (
+        "debug.cap.upgrade.weak.outcome",
+        "debug.cap.upgrade.weak.outcome",
+    ),
+    ("debug.cap.upgrade.weak.kind", "debug.cap.upgrade.weak.kind"),
+    ("debug.sigprocmask.enter", "debug.sigprocmask.enter"),
+    ("debug.sigprocmask.args", "debug.sigprocmask.args"),
+    ("debug.sigprocmask.bad_size", "debug.sigprocmask.bad_size"),
+    ("debug.sigprocmask.read.err", "debug.sigprocmask.read.err"),
+    (
+        "debug.sigprocmask.read.after",
+        "debug.sigprocmask.read.after",
+    ),
+    (
+        "debug.sigprocmask.step.after",
+        "debug.sigprocmask.step.after",
+    ),
+    (
+        "debug.sigprocmask.step.zombie",
+        "debug.sigprocmask.step.zombie",
+    ),
+    (
+        "debug.sigprocmask.mask.zombie",
+        "debug.sigprocmask.mask.zombie",
+    ),
+    (
+        "debug.sigprocmask.mask.after",
+        "debug.sigprocmask.mask.after",
+    ),
+    ("debug.sigprocmask.write.err", "debug.sigprocmask.write.err"),
+    (
+        "debug.sigprocmask.write.after",
+        "debug.sigprocmask.write.after",
+    ),
+    ("debug.sigprocmask.return", "debug.sigprocmask.return"),
+    ("debug.vm.user.copy_in.len", "debug.vm.user.copy_in.len"),
+    ("debug.vm.user.copy_in.phase", "debug.vm.user.copy_in.phase"),
+    ("debug.vm.user.copy_in.err", "debug.vm.user.copy_in.err"),
+    ("debug.vm.user.copy_in.chunk", "debug.vm.user.copy_in.chunk"),
+    (
+        "debug.vm.user.copy_in.copied",
+        "debug.vm.user.copy_in.copied",
+    ),
+    (
+        "debug.vm.user.copy_in.blocked",
+        "debug.vm.user.copy_in.blocked",
+    ),
+    ("debug.vm.user.resolve.kind", "debug.vm.user.resolve.kind"),
+    ("debug.vm.user.resolve.phase", "debug.vm.user.resolve.phase"),
+    ("debug.vm.user.resolve.err", "debug.vm.user.resolve.err"),
+    (
+        "debug.vm.user.resolve.blocked",
+        "debug.vm.user.resolve.blocked",
+    ),
+    (
+        "debug.vm.user.resolve.backing",
+        "debug.vm.user.resolve.backing",
+    ),
+    (
+        "debug.vm.user.resolve_page.backing",
+        "debug.vm.user.resolve_page.backing",
+    ),
+    (
+        "debug.vm.user.resolve_page.err",
+        "debug.vm.user.resolve_page.err",
+    ),
+    (
+        "debug.vm.user.resolve_page.phase",
+        "debug.vm.user.resolve_page.phase",
+    ),
+    (
+        "debug.vm.user.pagebacked.phase",
+        "debug.vm.user.pagebacked.phase",
+    ),
+    (
+        "debug.vm.user.pagebacked.err",
+        "debug.vm.user.pagebacked.err",
+    ),
+    (
+        "debug.vm.user.pagebacked.blocked",
+        "debug.vm.user.pagebacked.blocked",
     ),
     ("resume", "resume"),
     ("step", "step"),
@@ -509,6 +982,7 @@ const KERNEL_FNV1A_STABLE_NAMES: &[(&str, &str)] = &[
         "debug.child_submit.register.after",
         "debug.child_submit.register.after",
     ),
+    ("debug.observe.ap.init", "debug.observe.ap.init"),
     (
         "debug.task.submit.slot.after",
         "debug.task.submit.slot.after",
@@ -1270,9 +1744,32 @@ fn observe_live_guest_mem(root: &Path, args: &[String]) -> Result<()> {
     }
 }
 
+fn observe_oscomp_live(root: &Path, args: &[String]) -> Result<()> {
+    let script = root.join("tools/oscomp-observe-live.py");
+    if !script.exists() {
+        return Err(format!("missing {}", script.display()));
+    }
+    let status = Command::new("python3")
+        .arg(script)
+        .args(args)
+        .status()
+        .map_err(|err| format!("failed to run oscomp live observe workflow: {err}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("oscomp live observe workflow exited with {status}"))
+    }
+}
+
 fn pass_optional_arg(args: &[String], cmd: &mut Command, name: &str) {
     if let Some(value) = optional_option_value(args, name) {
         cmd.args([name, &value]);
+    }
+}
+
+fn pass_optional_flag(args: &[String], cmd: &mut Command, name: &str) {
+    if args.iter().any(|arg| arg == name) {
+        cmd.arg(name);
     }
 }
 

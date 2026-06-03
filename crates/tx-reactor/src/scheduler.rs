@@ -1116,7 +1116,7 @@ impl Phase1Scheduler {
         meta: &TaskSchedMeta,
         mut total_queue_depth: impl FnMut(HartId) -> usize,
     ) -> HartId {
-        if meta.kernel_only || !meta.can_migrate || !meta.spread_on_submit {
+        if meta.kernel_only || !meta.spread_on_submit {
             return first_hart_in_mask(meta.affinity);
         }
 

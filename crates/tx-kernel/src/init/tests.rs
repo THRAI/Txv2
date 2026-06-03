@@ -19,9 +19,9 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use tx_hal::{
-    AllocError, Arch, Asid, BootHandoff, BootInfo, BootPlatformIf, BootProtocol, ConsoleIf, InitIf,
-    ObserverIf, PhysAddr, PlatformConfig, PlatformInfo, PmapError, PmapPermissions,
-    PmapReservation, PmapReserveKind, PmapRoot, PtNode,
+    AllocError, Arch, Asid, BootHandoff, BootInfo, BootPlatformIf, BootProtocol, ConsoleIf, CpuId,
+    CpuMask, InitIf, ObserverIf, PhysAddr, PlatformConfig, PlatformInfo, PmapError,
+    PmapPermissions, PmapReservation, PmapReserveKind, PmapRoot, PtNode,
 };
 
 /// Page size used to fabricate distinct test pmap roots. tx-hal
@@ -123,6 +123,8 @@ static USERSPACE_A0_LOG: Mutex<std::vec::Vec<usize>> = Mutex::new(std::vec::Vec:
 /// Test hook: when non-zero, the simulator marks the active userspace-run
 /// request as timer-preempted before returning from `enter_userspace_*`.
 static USERSPACE_PREEMPT_ON_ENTER: AtomicUsize = AtomicUsize::new(0);
+static TEST_CURRENT_CPU: AtomicUsize = AtomicUsize::new(0);
+static TEST_ONLINE_CPUS: AtomicUsize = AtomicUsize::new(1);
 
 impl tx_hal::TrapIf for TestPlatform {
     /// Inverted-loop simulator: stand in for a real `sret` into
@@ -194,7 +196,15 @@ impl tx_hal::TimeIf for TestPlatform {
 impl tx_hal::PercpuIf for TestPlatform {}
 impl tx_hal::CacheIf for TestPlatform {}
 impl tx_hal::DmaIf for TestPlatform {}
-impl tx_hal::SmpIf for TestPlatform {}
+impl tx_hal::SmpIf for TestPlatform {
+    fn current_cpu_id() -> CpuId {
+        CpuId(TEST_CURRENT_CPU.load(Ordering::Acquire))
+    }
+
+    fn online_cpus() -> CpuMask {
+        CpuMask::from_bits(TEST_ONLINE_CPUS.load(Ordering::Acquire) as u64)
+    }
+}
 
 impl tx_hal::EntropyIf for TestPlatform {}
 impl ObserverIf for TestPlatform {}
@@ -282,6 +292,8 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|e| e.into_inner())
         .clear();
     USERSPACE_PREEMPT_ON_ENTER.store(0, Ordering::Release);
+    TEST_CURRENT_CPU.store(0, Ordering::Release);
+    TEST_ONLINE_CPUS.store(1, Ordering::Release);
     guard
 }
 
@@ -314,6 +326,23 @@ fn drive_boot_wiring() {
 }
 
 // --- tests --------------------------------------------------------
+
+#[test]
+fn initial_userspace_sched_meta_stays_on_cpu0_when_boot_hart_is_nonzero() {
+    let _serial = setup();
+    TEST_CURRENT_CPU.store(3, Ordering::Release);
+    TEST_ONLINE_CPUS.store(0b1111, Ordering::Release);
+
+    let meta = CoreInit::<TestPlatform>::userspace_thread_sched_meta();
+
+    assert_eq!(
+        meta.affinity,
+        CpuMask::single(CpuId(0)).bits(),
+        "initial userspace remains on the BSP-safe CPU0 path; child threads own AP spread",
+    );
+    assert!(meta.userspace_thread);
+    assert!(!meta.spread_on_submit);
+}
 
 /// **Downgrade note (per trio plan §"Phase 3b tests"):** end-to-end
 /// `step_lookup("/dev/console")` cannot run yet — VFS's walker

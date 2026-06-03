@@ -173,6 +173,53 @@ fn submitted_movable_fair_tasks_spread_across_allowed_harts() {
 }
 
 #[test]
+fn pinned_spread_on_submit_uses_initial_spread_without_enabling_steal() {
+    let mut scheduler = Phase1Scheduler::new();
+    let first = TaskId(240);
+    let second = TaskId(241);
+
+    for task in [first, second] {
+        scheduler.task_submitted(
+            task,
+            TaskHandle::new(task),
+            InitialSchedMeta::fair()
+                .with_affinity(0b0011)
+                .pinned()
+                .spread_on_submit()
+                .userspace_thread(),
+        );
+        assert!(!scheduler.can_migrate(task));
+    }
+
+    assert_eq!(scheduler.queue_depths(HartId(0)).new, 1);
+    assert_eq!(scheduler.queue_depths(HartId(1)).new, 1);
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(first)
+    );
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(1)).map(|x| x.0),
+        Some(second)
+    );
+
+    scheduler.task_stopped(
+        second,
+        StopReason::SliceExpired,
+        Phase1Scheduler::NEW_QUEUE_SLICE_NS,
+        HartId(1),
+    );
+
+    assert_eq!(scheduler.try_steal(HartId(0), HartId(1)), None);
+    assert_eq!(
+        scheduler.task_owner(second),
+        Some(TaskRunOwner::Queued {
+            hart: HartId(1),
+            queue: Phase1QueueKind::Preempted,
+        })
+    );
+}
+
+#[test]
 fn userspace_thread_meta_is_explicit_and_can_be_movable() {
     let mut scheduler = Phase1Scheduler::new();
     let task = TaskId(26);

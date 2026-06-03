@@ -29,6 +29,7 @@ tx-test-support = { path = "../tx-test-support" }
 
 [dev-dependencies]
 tx-ext4-format = { path = "../tx-ext4-format" }
+tx-observe = { path = "../tx-observe", features = ["testing"] }
 # Self-dep with `test-support` enabled so integration tests in
 # `tests/` can reach the `_for_test` helpers gated behind
 # `feature = "test-support"` (D9-B's eligibility-scan pins and

@@ -29,7 +29,7 @@
 //! that draining runs with irq_depth=0 and is free to create epoch
 //! guards and call `step_ingest`.
 
-use crate::adapter::step_engine::{self as step_engine, SpinMutex, StepOutcome};
+use crate::adapter::step_engine::{self as step_engine, spin_mutex, SpinMutex, StepOutcome};
 use tx_hal::{
     ConsoleIf, IrqDispatchTable, IrqHandled, IrqHandlerFn, IrqIf, IRQ_DISPATCH_TABLE_SIZE,
 };
@@ -42,7 +42,10 @@ use tx_subsystems::tty::execution::step_ingest;
 /// the table from the boot path. Per Cross-cutting risk #4 in the
 /// pre-ELF plan, registration runs strictly before `unmask`, so the
 /// platform never sees a half-built table.
-static IRQ_DISPATCH_TABLE: SpinMutex<IrqDispatchTable> = SpinMutex::new(IrqDispatchTable::new());
+static IRQ_DISPATCH_TABLE: SpinMutex<IrqDispatchTable> = spin_mutex(
+    IrqDispatchTable::new(),
+    b"debug.lock.kernel.irq_dispatch_table",
+);
 
 /// Maximum bytes drained per UART RX IRQ. The 16550 RX FIFO is small;
 /// this cap keeps a single IRQ from stalling the trap shell while
@@ -71,7 +74,8 @@ impl UartRxPending {
     }
 }
 
-static UART_RX_PENDING: SpinMutex<UartRxPending> = SpinMutex::new(UartRxPending::new());
+static UART_RX_PENDING: SpinMutex<UartRxPending> =
+    spin_mutex(UartRxPending::new(), b"debug.lock.kernel.uart_rx_pending");
 
 /// Register `handler` as the dispatch entry for IRQ number `irq`.
 ///
