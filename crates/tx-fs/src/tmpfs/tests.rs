@@ -6,7 +6,7 @@
 
 use alloc::sync::Arc;
 
-use super::adapter::step_engine::{self as step_engine, guard, page_allocator, Errno, StepOutcome};
+use super::adapter::step_engine::{self as step_engine, Errno, StepOutcome, guard, page_allocator};
 use tx_subsystems::cred::{Capability, CapabilitySet};
 use tx_subsystems::page_backed::FsPageBacking;
 use tx_subsystems::vfs::{
@@ -14,7 +14,7 @@ use tx_subsystems::vfs::{
     S_IFMT, S_ISGID, S_ISUID,
 };
 
-use super::{Tmpfs, TMPFS_ROOT_OBJECT_ID};
+use super::{TMPFS_ROOT_OBJECT_ID, Tmpfs};
 
 fn init_substrate() {
     tx_test_support::init_host();
@@ -27,6 +27,22 @@ fn init_substrate() {
         Ok(_) | Err(page_allocator::AllocError::AlreadyInstalled) => {}
         Err(error) => panic!("claim zero frame for tmpfs tests: {error:?}"),
     }
+}
+
+#[test]
+#[cfg(tx_lock_metrics_fs)]
+fn tmpfs_state_lock_metrics_are_cfg_gated() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Tmpfs::new();
+
+    assert!(
+        tmpfs.state.lock_metrics_enabled(),
+        "tmpfs state lock must emit observed lock rows when tx_lock_metrics_fs is enabled"
+    );
 }
 
 /// Build a throw-away `Cap<MountPayload>` over `tmpfs` so tests that
@@ -971,7 +987,7 @@ fn tmpfs_v3_truncate_then_load_meta_reflects_size() {
 
 #[test]
 fn step_walk_against_tmpfs_resolves_real_path() {
-    use step_engine::{reserve_for, sign_for, Cap, StepOutcome as V3};
+    use step_engine::{Cap, StepOutcome as V3, reserve_for, sign_for};
     use tx_subsystems::mount::{
         DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, SourceLabel,
     };

@@ -23,3 +23,6 @@ tx-test-support = { path = "../tx-test-support" }
 
 [dev-dependencies]
 tx-subsystems = { path = "../tx-subsystems", features = ["test-support"] }
+
+[lints]
+workspace = true

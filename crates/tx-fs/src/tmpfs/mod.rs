@@ -25,14 +25,14 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 pub mod adapter;
 
-use adapter::step_engine::{self as step_engine, Cap, NoProgress, SpinMutex, StepOutcome};
+use adapter::step_engine::{self as step_engine, Cap, NoProgress, StepOutcome};
 
 use tx_subsystems::cred::Capability;
 use tx_subsystems::execution::Guard;
 use tx_subsystems::mount::MountPayload;
 use tx_subsystems::page_backed::{
-    step_truncate, AnonSwapPolicy, Frame, MaterializeAccess, PageContainer, PageContainerKind,
-    PageIndex,
+    AnonSwapPolicy, Frame, MaterializeAccess, PageContainer, PageContainerKind, PageIndex,
+    step_truncate,
 };
 use tx_subsystems::vfs::{
     Credential, DirCursor, DirEntry, FsObjectId, InlineName, InodeKind, InodeMeta, MountOutput,
@@ -124,14 +124,14 @@ impl TmpfsState {
 /// strong `Arc<dyn FsOps>` and `Arc<dyn FsPageBacking>` against the
 /// same `Tmpfs` so both trait objects observe the same state.
 pub struct Tmpfs {
-    state: SpinMutex<TmpfsState>,
+    state: crate::sync::TmpfsSpinMutex<TmpfsState>,
     next_object_id: AtomicU64,
 }
 
 impl Tmpfs {
     pub fn new() -> Self {
         Self {
-            state: SpinMutex::new(TmpfsState::new()),
+            state: crate::sync::tmpfs_spin_mutex(TmpfsState::new(), b"debug.lock.fs.tmpfs.state"),
             next_object_id: AtomicU64::new(TMPFS_FIRST_FREE_OBJECT_ID),
         }
     }
