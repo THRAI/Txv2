@@ -18,6 +18,36 @@
   still cannot carry the original wait-source identity, so full async ext4/FAT
   pager conversion remains a larger interface slice.
 
+- 2026-06-03 **tmpfs chown mode-bit clearing now matches LTP chown02.**
+  Root cause for the observed `ltp-musl` `chown02` mode mismatch was tmpfs
+  treating privileged `chown` differently from Linux: root/CAP_FOWNER preserved
+  `S_ISUID`/`S_ISGID`, while Linux clears setuid on `chown` and clears setgid
+  when group-execute is set; non-group-executable files keep `S_ISGID` because
+  the bit has mandatory-locking meaning. Updated `Tmpfs::step_chown` to apply
+  that Linux rule, extended tmpfs chown coverage, and added a syscall-level
+  regression that mirrors LTP's `fchmodat -> fchownat -> newfstatat` shape for
+  `testfile1`/`testfile2`. Verification: the new test first failed under the
+  old rule, then `cargo test -p tx-fs tmpfs_chown_ -- --nocapture`,
+  `cargo test -p tx-fs tmpfs -- --nocapture`, `cargo test -p tx-shims
+  dispatch_fchownat_root_matches_ltp_chown02_mode_clearing -- --nocapture`,
+  `cargo test -p tx-shims dac_setuid_wave4 -- --nocapture`,
+  `cargo check -p tx-fs -q`, `cargo check -p tx-shims -q`,
+  `rustfmt --check --edition 2021 --config skip_children=true
+  crates/tx-fs/src/tmpfs/mod.rs crates/tx-fs/src/tmpfs/tests.rs
+  crates/tx-shims/src/linux_syscall/tests/dac_setuid_wave4.rs`, and
+  `git diff --check` passed. Guest follow-up: built a private slim image under
+  `target/oscomp/custom-run/ltp-chown02-20260603/`, rebuilt RV64 QEMU kernel,
+  and ran `tx.oscomp.groups=ltp-musl`; the guest reached `RUN LTP CASE chown02`
+  but failed before the test body with `ltp/testcases/bin/chown02: I/O error`
+  and `FAIL LTP CASE chown02 : 126`. `fault-decode` found no kernel trap; host
+  debugfs inspection showed `chown02` is a dynamically linked RISC-V PIE using
+  interpreter `/lib/ld-musl-riscv64.so.1`, while the generated LTP-only slim
+  image contains no `/musl/lib` or loader. Treat this as a slim-image runtime
+  dependency blocker, not evidence against the chown mode-bit fix. Next step:
+  teach `tools/build-slim-sdcard.py`'s LTP case mode to include the musl
+  dynamic loader/runtime libs (or select a static LTP binary) and rerun the
+  same private guest case.
+
 - 2026-06-03 **VM recipe attribution observes are behind narrow cfg gates.**
   Normal VM recipe captures now keep the stable publish/reclaim counters needed
   for SQL comparisons (`publish.op`, `publish.touched_entries`,

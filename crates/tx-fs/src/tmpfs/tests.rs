@@ -6,7 +6,7 @@
 
 use alloc::sync::Arc;
 
-use super::adapter::step_engine::{self as step_engine, Errno, StepOutcome, guard, page_allocator};
+use super::adapter::step_engine::{self as step_engine, guard, page_allocator, Errno, StepOutcome};
 use tx_subsystems::cred::{Capability, CapabilitySet};
 use tx_subsystems::page_backed::FsPageBacking;
 use tx_subsystems::vfs::{
@@ -14,7 +14,7 @@ use tx_subsystems::vfs::{
     S_IFMT, S_ISGID, S_ISUID,
 };
 
-use super::{TMPFS_ROOT_OBJECT_ID, Tmpfs};
+use super::{Tmpfs, TMPFS_ROOT_OBJECT_ID};
 
 fn init_substrate() {
     tx_test_support::init_host();
@@ -821,10 +821,11 @@ fn tmpfs_chown_clears_setuid_bit_for_non_privileged() {
     assert_eq!(meta.mode & S_ISUID, 0);
     assert_eq!(meta.mode & S_ISGID, 0);
 
-    // Privileged callers preserve the setuid bit on chown — set
-    // it again, then chown via admin and verify it survives.
+    // Linux's chown(2) clearing rule also applies to privileged
+    // callers for executable files: setuid is cleared, and setgid is
+    // cleared when the group-execute bit is present.
     assert_eq!(
-        <Tmpfs as FsOps>::step_chmod(&*tmpfs, file_id, S_ISUID | 0o755, &admin, &guard),
+        <Tmpfs as FsOps>::step_chmod(&*tmpfs, file_id, S_ISUID | S_ISGID | 0o770, &admin, &guard),
         StepOutcome::Done(())
     );
     assert_eq!(
@@ -835,11 +836,37 @@ fn tmpfs_chown_clears_setuid_bit_for_non_privileged() {
         StepOutcome::Done(m) => m,
         other => panic!("load_inode_meta: {other:?}"),
     };
+    assert_eq!(meta.mode & (S_ISUID | S_ISGID), 0);
+    assert_eq!(meta.mode & !S_IFMT, 0o770);
+}
+
+#[test]
+fn tmpfs_chown_preserves_setgid_without_group_execute() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = guard();
+    let admin = cred_with_caps(0, 0, CapabilitySet::FULL);
+    let mode = (S_ISUID | S_ISGID | 0o700) | tx_subsystems::vfs::S_IFREG;
+    let (file_id, _) = match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", mode, &admin, &guard) {
+        StepOutcome::Done(out) => out,
+        other => panic!("create_inode: {other:?}"),
+    };
+
     assert_eq!(
-        meta.mode & S_ISUID,
-        S_ISUID,
-        "privileged chown should preserve S_ISUID"
+        <Tmpfs as FsOps>::step_chown(&*tmpfs, file_id, Some(0), Some(0), &admin, &guard),
+        StepOutcome::Done(())
     );
+    let meta = match tmpfs.load_inode_meta(file_id, &guard) {
+        StepOutcome::Done(m) => m,
+        other => panic!("load_inode_meta: {other:?}"),
+    };
+    assert_eq!(meta.mode & S_ISUID, 0);
+    assert_eq!(meta.mode & S_ISGID, S_ISGID);
+    assert_eq!(meta.mode & !S_IFMT, S_ISGID | 0o700);
 }
 
 // === FsOps + FsPageBacking tests ====================================
@@ -1020,7 +1047,7 @@ fn tmpfs_v3_truncate_then_load_meta_reflects_size() {
 
 #[test]
 fn step_walk_against_tmpfs_resolves_real_path() {
-    use step_engine::{Cap, StepOutcome as V3, reserve_for, sign_for};
+    use step_engine::{reserve_for, sign_for, Cap, StepOutcome as V3};
     use tx_subsystems::mount::{
         DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, SourceLabel,
     };

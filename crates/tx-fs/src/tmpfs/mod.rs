@@ -27,12 +27,11 @@ pub mod adapter;
 
 use adapter::step_engine::{self as step_engine, Cap, NoProgress, StepOutcome};
 
-use tx_subsystems::cred::Capability;
 use tx_subsystems::execution::Guard;
 use tx_subsystems::mount::MountPayload;
 use tx_subsystems::page_backed::{
-    AnonSwapPolicy, Frame, MaterializeAccess, PageContainer, PageContainerKind, PageIndex,
-    step_truncate,
+    step_truncate, AnonSwapPolicy, Frame, MaterializeAccess, PageContainer, PageContainerKind,
+    PageIndex,
 };
 use tx_subsystems::vfs::{
     Credential, DirCursor, DirEntry, FsObjectId, InlineName, InodeKind, InodeMeta, MountOutput,
@@ -829,8 +828,9 @@ impl FsOps for Tmpfs {
     /// source of truth in
     /// [`tx_subsystems::vfs::predicates::check_chown_perm`] (the
     /// same body the syscall-arm `cred::checks::authorize_chown`
-    /// consumes). Linux's silent-clear-`S_ISUID`/`S_ISGID` rule
-    /// applies for non-privileged callers (matches LTP `chown03`).
+    /// consumes). Linux's silent-clear rule always drops `S_ISUID`
+    /// and drops `S_ISGID` when the file has group-execute set
+    /// (matches LTP `chown02`/`chown03`).
     /// Per the DAC + setuid plan §"FsOps::step_chmod / step_chown".
     fn step_chown(
         &self,
@@ -849,18 +849,18 @@ impl FsOps for Tmpfs {
         {
             return StepOutcome::err(e.into());
         }
-        let privileged = cred.effective_caps.contains(Capability::FOWNER) || cred.uid == 0;
         if let Some(u) = new_uid {
             inode.meta.uid = u;
         }
         if let Some(g) = new_gid {
             inode.meta.gid = g;
         }
-        // Linux clears S_ISUID / S_ISGID on chown by non-privileged
-        // callers to prevent privilege-escalation via setuid binary
-        // ownership shifts. Slice mirrors LTP `chown03`'s rule.
-        if !privileged {
-            inode.meta.mode &= !(S_ISUID | S_ISGID);
+        // Linux clears setuid on chown. Setgid is cleared only for
+        // executable files; without group execute, S_ISGID has the
+        // mandatory-locking meaning and is preserved.
+        inode.meta.mode &= !S_ISUID;
+        if inode.meta.mode & 0o010 != 0 {
+            inode.meta.mode &= !S_ISGID;
         }
         StepOutcome::done(())
     }

@@ -18,13 +18,15 @@ use tx_subsystems::mount::{
 use tx_subsystems::page_backed::FsPageBacking;
 use tx_subsystems::process::step_chdir;
 use tx_subsystems::vfs::structure::{
-    Credential, DEntry, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking, S_IFDIR,
+    Credential, DEntry, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking, S_IFDIR, S_ISGID,
+    S_ISUID,
 };
 use tx_subsystems::vfs::FsOps;
 
 use crate::linux_syscall::{
     AT_EACCESS, AT_FDCWD, EXECVE_PATH_MAX, F_OK, NR_FACCESSAT, NR_FACCESSAT2, NR_FCHMOD,
-    NR_FCHMODAT, NR_FCHMODAT2, NR_FCHOWN, NR_FCHOWNAT, NR_OPENAT, O_RDONLY, R_OK, W_OK, X_OK,
+    NR_FCHMODAT, NR_FCHMODAT2, NR_FCHOWN, NR_FCHOWNAT, NR_NEWFSTATAT, NR_OPENAT, O_RDONLY, R_OK,
+    W_OK, X_OK,
 };
 
 /// errno magnitudes the tests check against (positive Linux RV64
@@ -35,11 +37,17 @@ const E_BADF: i32 = 9;
 const E_ACCES: i32 = 13;
 const E_ROFS: i32 = 30;
 const E_NAMETOOLONG: i32 = 36;
+const STAT_MODE_OFF: usize = 16;
+const STAT_BYTES: usize = 128;
 
 /// `(u32) -1` — Linux's "leave unchanged" sentinel for
 /// `fchownat`'s `uid` / `gid` args. Same convention as the
 /// `setre{u,g}id` family; reused here for symmetry.
 const NEG_ONE_U32: u64 = u32::MAX as u64;
+
+fn read_u32_at(buf: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
+}
 
 fn ensure_zero_frame_claimed() {
     match page_allocator::claim_zero_frame() {
@@ -595,6 +603,96 @@ fn dispatch_fchownat_minus_one_leaves_unchanged() {
     assert_eq!(meta.uid, 1000);
     assert_eq!(meta.gid, 200);
     drop(path);
+}
+
+/// LTP `chown02` shape: super-user `chown(2)` clears setuid and
+/// setgid bits on executable files, but preserves setgid on a
+/// non-group-executable file where the bit has mandatory-locking
+/// meaning.
+#[test]
+fn dispatch_fchownat_root_matches_ltp_chown02_mode_clearing() {
+    let _setup = wave4_setup();
+    let root = build_tmpfs_root();
+    let root_dentry = root.dentry.clone();
+    let tmpfs = root.tmpfs.clone();
+    let owner_cred = Credential {
+        uid: 0,
+        gid: 0,
+        effective_caps: CapabilitySet::FULL,
+    };
+    let guard = ebr_guard();
+    let _ = match tmpfs.create_inode(
+        TMPFS_ROOT_OBJECT_ID,
+        b"testfile1",
+        0o100666,
+        &owner_cred,
+        &guard,
+    ) {
+        StepOutcome::Done(out) => out,
+        other => panic!("create_inode(testfile1): {other:?}"),
+    };
+    let _ = match tmpfs.create_inode(
+        TMPFS_ROOT_OBJECT_ID,
+        b"testfile2",
+        0o100666,
+        &owner_cred,
+        &guard,
+    ) {
+        StepOutcome::Done(out) => out,
+        other => panic!("create_inode(testfile2): {other:?}"),
+    };
+    drop(guard);
+
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap, thread);
+
+    for (name, set_mode, expected_mode) in [
+        (
+            b"/testfile1".as_slice(),
+            S_ISUID | S_ISGID | 0o770,
+            0o100770,
+        ),
+        (b"/testfile2".as_slice(), S_ISGID | 0o700, 0o102700),
+    ] {
+        let path = nul_terminate(name);
+        let chmod_req = SyscallRequest::new(
+            NR_FCHMODAT,
+            [
+                AT_FDCWD as i64 as u64,
+                path.as_ptr() as u64,
+                set_mode as u64,
+                0,
+                0,
+                0,
+            ],
+        );
+        let chmod_result = block_on(dispatch::<ShimsTestPmap>(chmod_req, &ctx));
+        assert_eq!(chmod_result, SyscallResult::Return(0));
+
+        let chown_req = SyscallRequest::new(
+            NR_FCHOWNAT,
+            [AT_FDCWD as i64 as u64, path.as_ptr() as u64, 0, 0, 0, 0],
+        );
+        let chown_result = block_on(dispatch::<ShimsTestPmap>(chown_req, &ctx));
+        assert_eq!(chown_result, SyscallResult::Return(0));
+
+        let mut statbuf = vec![0u8; STAT_BYTES];
+        let stat_req = SyscallRequest::new(
+            NR_NEWFSTATAT,
+            [
+                AT_FDCWD as i64 as u64,
+                path.as_ptr() as u64,
+                statbuf.as_mut_ptr() as u64,
+                0,
+                0,
+                0,
+            ],
+        );
+        let stat_result = block_on(dispatch::<ShimsTestPmap>(stat_req, &ctx));
+        assert_eq!(stat_result, SyscallResult::Return(0));
+        assert_eq!(read_u32_at(&statbuf, STAT_MODE_OFF), expected_mode);
+        drop(path);
+    }
 }
 
 /// `fchown(fd, uid, gid)` resolves the open file's rnode and preserves
