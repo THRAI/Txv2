@@ -1,3 +1,26 @@
+- 2026-06-03 **No-scratch B+ malloc sparse-family performance measured.**
+  Ran `malloc-vm` (`sparse`, `bubble`, `big1`, `big2`) under
+  `RUSTFLAGS="--cfg tx_vm_recipe_bplus"`. The clean no-observe run at
+  `target/oscomp/custom-run/recipe-bplus-noscratch-rollback-malloc-vm-smp1-noobserve-20260603-133223`
+  completed with no trap lines and `userspace:exited:0`; body times were
+  `sparse=6.499532s`, `bubble=8.111215s`, `big1=12.095932s`, and
+  `big2=7.219934s`. A separate live-observe attribution run at
+  `target/oscomp/custom-run/recipe-bplus-noscratch-rollback-malloc-vm-smp1-20260603-132618`
+  is complete/lossless (`complete=true`, `raw_records=2054947`, zero
+  lost/overwritten/repair records) but carries probe overhead; its timings were
+  `sparse=11.430094s`, `bubble=9.800021s`, `big1=13.957925s`,
+  `big2=9.823464s`. Trace attribution points to teardown and recipe publish
+  tails: `sys_munmap` totals 8.191s over 886 calls (`p50=2.685ms`,
+  `p99=74.781ms`), `sys_mmap` totals 2.399s over 1152 calls (`p50=1.163ms`,
+  `p99=17.062ms`), and recipe publish rows total 1.954s for `Unmap`
+  (`avg=2.206ms`, `p99=21.772ms`) plus 1.415s for `MapRequireFree`
+  (`avg=1.224ms`, `p99=16.160ms`). Caveat: the clean score run is still well
+  above the 2026-05-31 VM malloc floor (`sparse=2.940566s`,
+  `bubble=2.798554s`, `big1=4.298212s`, `big2=3.776314s`), so B+ has not yet
+  passed the malloc/no-regression promotion check. Next step is to compare
+  treap/default versus B+ on the same current dirty tree, then inspect why B+
+  `munmap`/publish tails reappeared in the sparse-family path.
+
 - 2026-06-03 **PageBacked file-page misses now join overlapping fetches.**
   Added a per-page in-flight file-fetch record with an owner token and
   PageBacked-owned retry wait source. Reentrant/concurrent misses now join the
@@ -39,6 +62,60 @@
   warm-walk `IdentRef`/dcache contention before broader cache invalidation or
   negative-cache policy changes.
 
+- 2026-06-03 **tmpfs state lock can emit fs-scoped lock metrics.**
+  Added `tx_lock_metrics_fs` as a workspace-recognised cfg and gave tmpfs a
+  dedicated `TmpfsSpinMutex` facade so only the tmpfs mount-wide state lock
+  switches to `LockMetricsOn` under `RUSTFLAGS="--cfg tx_lock_metrics --cfg
+  tx_lock_metrics_fs"`. The observed lock name is
+  `debug.lock.fs.tmpfs.state`; bdev-fs and ext4/FAT bridge locks still use the
+  default `tx-fs` lock type. Verification: red/green `RUSTFLAGS="--cfg
+  tx_lock_metrics --cfg tx_lock_metrics_fs" cargo test -p tx-fs
+  tmpfs_state_lock_metrics_are_cfg_gated -- --nocapture`, `cargo test -p
+  tx-fs tmpfs -- --nocapture`, and `cargo check -p tx-fs -q` passed. Next
+  step: run an OSComp trace with `tx_lock_metrics_fs` before deciding whether
+  to split tmpfs state into per-directory or per-inode locks.
+
+- 2026-06-03 **No-scratch B+ pthread SMP1 observe passes the recipe lock avg
+  gate.** Ran the full pthread libcbench live-observe gate with
+  `RUSTFLAGS="--cfg tx_lock_metrics --cfg tx_lock_metrics_vm --cfg
+  tx_vm_recipe_bplus"` at
+  `target/oscomp/custom-run/recipe-bplus-noscratch-rollback-pthread-smp1-20260603-123205`.
+  The capture is usable evidence: `runtime.json` reports `complete=true`,
+  `raw_records=7521511`, and zero lost/overwritten/repair records; the serial
+  log completed all pthread sections (`serial1=34.244808s`,
+  `serial2=32.527260s`, `create_serial1=29.596169s`,
+  `minimal1=49.378282s`, `minimal2=28.555669s`). Recipe-index lock service now
+  meets the SMP1 promotion threshold: `debug.lock.vm.recipe_index.mutation`
+  has 30015 service rows totaling 12.546220s (`avg=417.998us`, `p50=318us`,
+  `p99=3.483ms`, max 18.453ms) with only 62.959ms aggregate wait. Publish-op
+  percentiles improved materially against
+  `recipe-bplus-noscratch-equalized-pthread-smp1-20260602-224102`: `Unmap`
+  avg 805us->402us (`p50=243us`, `p99=3.578ms`), `Protect` avg 957us->546us
+  (`p50=437us`, `p99=3.900ms`), and `MapRequireFree` avg 477us->275us
+  (`p50=259us`, `p99=852us`). Syscall spans now show the pthread spine as
+  `clone=25.968s`, `rt_sigprocmask=13.334s`, `munmap=10.706s`,
+  `mmap=10.692s`, `mprotect=6.864s`, and `exit=5.927s`. Caveat: this is an
+  SMP1 gate because the SMP4 fix is active in another worktree; B+ still needs
+  the remaining promotion checks, especially VM malloc/no-fault regression and
+  a later SMP4 pthread rerun, before becoming the default backend.
+
+- 2026-06-03 **B+ recipe tree rolled back from SharedRun leaf sharing to the
+  measured no-scratch Arc-entry leaf shape.** Reverted
+  `crates/tx-subsystems/src/vm/structure/recipe_tree.rs` so B+ leaves again
+  store inline `Arc<VmEntry>` refs and move owned replacement refs directly into
+  new leaf chunks, matching the best measured
+  `recipe-bplus-noscratch-equalized-pthread-smp1-20260602-224102` state rather
+  than the regressing SharedRun/hot-cold leaf-sharing path. No other code module
+  was edited for this rollback. Verification:
+  `RUSTFLAGS="--cfg tx_vm_recipe_bplus" cargo test -p tx-subsystems bplus_ --
+  --nocapture`, `RUSTFLAGS="--cfg tx_vm_recipe_bplus" cargo check -p
+  tx-subsystems -q`, `cargo test -p tx-subsystems vm_recipe -- --nocapture`,
+  scoped `rustfmt --edition 2024
+  crates/tx-subsystems/src/vm/structure/recipe_tree.rs`, and scoped
+  `git diff --check -- crates/tx-subsystems/src/vm/structure/recipe_tree.rs`
+  passed. Next step: rerun the pthread observe gate only after the unrelated
+  dirty tree is stable enough for a clean performance capture.
+
 - 2026-06-03 **PageBacked materialization state-lock service shrunk.**
   Moved cold anon/file page frame allocation and `MapPin` acquisition out of
   the `PageContainer.state` critical section. Hot cached materialization now
@@ -63,6 +140,512 @@
   pager migrations until after targeted metrics or correctness tests. Next
   step: implement a focused PageBacked in-flight/lock-service slice and add the
   bdev-fs routing test before wider filesystem SMP migration.
+
+- 2026-06-03 **Hot/cold B+ pthread observe is valid but still misses promotion.**
+  Checked
+  `target/oscomp/custom-run/recipe-bplus-hotcold-pthread-create-serial1-smp1-20260603-084812`.
+  The SMP1 live-drain capture is usable evidence: `runtime.json` reports
+  `complete=true`, `raw_records=1393981`, and zero lost/overwritten/repair
+  records; the serial log completed `b_pthread_create_serial1 (0)` with
+  `time: 128.822010000`. The remaining cost is still concentrated in VM recipe
+  mutation rather than futex or process locks: `sys_mprotect` totals 61.683s
+  over 2500 spans (`p50=24.456ms`, `p99=52.371ms`), `sys_mmap` totals 41.721s
+  over 2500 spans (`p50=17.161ms`, `p99=38.379ms`), and
+  `debug.lock.vm.recipe_index.mutation` has 5002 service rows totaling 100.655s
+  (`avg=20.123ms`, `p50=19.146ms`, `p99=45.884ms`, max 82.188ms) with only
+  8.726ms aggregate wait. Allocation-track rows line up with that lock cost:
+  `debug.alloc.vm.recipe_node` shows 5002 duration rows totaling 100.239s and
+  19103 logical node units, while private-page nodes are only 68.328ms total.
+  Conclusion: the run replaces the earlier invalid-observe caveat, but B+
+  remains far above the <=516us recipe-index promotion target and should stay
+  behind `tx_vm_recipe_bplus`. Next step is to move recipe node build/path-copy
+  work out of the `recipe_index.mutation` critical section or avoid rebuilding
+  recipe-node structure on single-page `mprotect`/`mmap` cycles before rerunning
+  the same SMP1 pthread gate.
+
+- 2026-06-03 **VM recipe entries now split hot metadata from heavy capabilities.**
+  `VmEntry` now stores range/prot/flags/backing-kind/UFD tag inline and keeps
+  `PageContainer` / `PrivatePageSet` ownership behind a shared owner bundle
+  (`VmCap<T>` over `Cap<T>`). Cloning or carrying unchanged recipe entries
+  during persistent rewrites now bumps the lightweight owner bundle instead of
+  retaining the heavy capability objects for every survivor. B+ leaves also
+  share unchanged survivor runs through `SharedRun` segments, so leaf repair
+  and range replacement no longer rebuild full owned `VmEntry`s for entries
+  that did not change. The single-overlap `mprotect` path now uses a
+  `VmEntryProtectRewrite` descriptor so the B+ backend constructs only the
+  matched replacement pieces at the target leaf rather than materializing the
+  before/target/after entries before entering the tree. A clone-smell scan
+  found no other VM structure with the same high-frequency persistent-rewrite
+  shape: `PrivatePageSet` owns per-page frame state, `LoadSegment` and
+  `VmMapRequest` own short-lived mapping inputs, and the process/thread
+  capability-heavy structures are lifecycle/snapshot lanes that should stay
+  observe-driven. Verification: `cargo check -p tx-subsystems -q`,
+  `RUSTFLAGS="--cfg tx_vm_recipe_bplus" cargo check -p tx-subsystems -q`,
+  `cargo test -p tx-subsystems vm_recipe -- --nocapture`, `cargo test -p
+  tx-subsystems fault_materialization -- --nocapture`, `cargo test -p
+  tx-subsystems vm_checks -- --nocapture`, `RUSTFLAGS="--cfg
+  tx_vm_recipe_bplus" cargo test -p tx-subsystems vm_recipe -- --nocapture`,
+  `RUSTFLAGS="--cfg tx_vm_recipe_bplus" cargo test -p tx-subsystems
+  fault_materialization -- --nocapture`, `RUSTFLAGS="--cfg
+  tx_vm_recipe_bplus" cargo test -p tx-subsystems vm_checks -- --nocapture`,
+  scoped `rustfmt --edition 2024 --check` over touched VM recipe files, and
+  scoped `git diff --check`. Caveat: this is functional evidence only; B+
+  still must pass a fresh valid pthread critical-section observe before it can
+  claim the <=516us promotion target or become the default backend. The latest
+  pthread captures remain invalid for that claim because one trapped in old
+  shared-run recursion and the later canonicalized run ended in the RV64 pmap
+  direct-map overflow before full pthread coverage.
+
+- 2026-06-03 **Fault-publication validation no longer clones the current recipe.**
+  `require_fault_publication` now revalidates the current recipe through
+  `recipes.lookup_view(...)` under an epoch guard and returns `Ok(())`
+  instead of materializing an owned `VmEntry` that every caller discarded. The
+  comparison now checks the borrowed view's range/prot/flags/backing, page
+  backing identity, UFD tag, and private-set identity against the saved fault
+  outcome, preserving stale-publication rejection while removing the extra
+  owner-bundle bump on the publish path. Added a red/green regression
+  `vm_checks_require_fault_publication_does_not_clone_recipe_entry`, which
+  first failed with owner refs `3 != 2` and now stays flat; added split-path
+  retain-count coverage proving mprotect-style replacement construction copies
+  hot metadata without retaining the heavy `PageContainer` cap for each
+  survivor/replacement. Adjacent audit:
+  `lookup_view` exists for hot reads, but `require_fault_recipe` still returns
+  an owned `VmEntry` because the async fault materialization state can cross
+  waits and needs retained PageContainer/PrivatePageSet ownership; pushing a
+  borrowed view through that state machine remains a deeper retained-owner /
+  generation protocol task. Similar Cap-heavy structures in process fd/nsproxy
+  snapshots, SysV SHM payloads, and PageBacked setup are not the same
+  high-frequency persistent VMA rewrite shape, so they remain unchanged until
+  observe points at them. Verification: `cargo test -p tx-subsystems
+  vm_checks_require_fault_publication -- --nocapture`, `RUSTFLAGS="--cfg
+  tx_vm_recipe_bplus" cargo test -p tx-subsystems bplus_ -- --nocapture`,
+  `RUSTFLAGS="--cfg tx_vm_recipe_bplus" cargo test -p tx-subsystems vm_recipe
+  -- --nocapture`, `RUSTFLAGS="--cfg tx_vm_recipe_bplus" cargo test -p
+  tx-subsystems fault_materialization -- --nocapture`, `cargo check -p
+  tx-subsystems -q`, `RUSTFLAGS="--cfg tx_vm_recipe_bplus" cargo check -p
+  tx-subsystems -q`, scoped `rustfmt --edition 2024 --check` over touched VM
+  files, `cargo test -p tx-subsystems vm_entry_split_ -- --nocapture`,
+  `RUSTFLAGS="--cfg tx_vm_recipe_bplus" cargo test -p tx-subsystems
+  vm_entry_split_ -- --nocapture`, and scoped `git diff --check`. Caveat:
+  whole-workspace
+  `cargo fmt --check` still reports unrelated dirty-tree formatting diffs
+  outside this VM slice. Pthread observe is still blocked for promotion
+  evidence: `target/oscomp/custom-run/recipe-bplus-sharedrun-pthread-smp1-20260603-063018`
+  trapped in the pre-canonicalization B+ `SharedRun` recursion, while
+  `target/oscomp/custom-run/recipe-bplus-sharedrun-canon-pthread-smp1-20260603-065356`
+  got through several pthread sections but then panicked in the RV64 pmap
+  direct-map path (`topology.rs:118` add overflow). Both traces are invalid
+  for critical-section performance claims; the second has `runtime.json`
+  `complete=true`, `raw_records=4890098`, and zero lost/overwritten records
+  but only partial benchmark coverage.
+
+- 2026-06-03 **B+ leaf repair no longer clones unchanged recipe owners.**
+  Added a focused regression for the remaining B+ ownership churn: underfull
+  leaf repair used to flatten sibling leaves through owned `VmEntry` copies,
+  which retained an extra shared owner-bundle reference for unchanged survivors.
+  The B+ insert, exact-remove, and underfull leaf-repair paths now splice
+  `SharedRun` segments from immutable old leaves instead of materializing
+  survivor entries; replacement entries still enter as owned inline `VmEntry`
+  values. A clone-smell scan found no remaining B+ `leaf.to_vec()`/entry-ref
+  flattening sites. Audit result for similar structures: PrivatePageSet
+  path-copying owns per-page frame state and is a different measured lane;
+  process fd/nsproxy/open-file and thread payload caps are lifecycle/snapshot
+  structures rather than high-frequency persistent recipe leaves, so they stay
+  unchanged until observe data points at them. Verification: `cargo check -p
+  tx-subsystems -q`, `RUSTFLAGS="--cfg tx_vm_recipe_bplus" cargo check -p
+  tx-subsystems -q`, `cargo test -p tx-subsystems vm_entry_split_ --
+  --nocapture`, `cargo test -p tx-subsystems fault_materialization --
+  --nocapture`, `RUSTFLAGS="--cfg tx_vm_recipe_bplus" cargo test -p
+  tx-subsystems vm_recipe -- --nocapture`, `RUSTFLAGS="--cfg
+  tx_vm_recipe_bplus" cargo test -p tx-subsystems fault_materialization --
+  --nocapture`, and `RUSTFLAGS="--cfg tx_vm_recipe_bplus" cargo test -p
+  tx-subsystems bplus_ -- --nocapture`. Caveat: no fresh pthread
+  critical-section observe capture has been run for this last survivor-sharing
+  slice yet; SMP1 is the expected measurement target while the SMP4 scheduler
+  fix is active in another worktree.
+
+- 2026-06-03 **VM recipe reclaim and publish-observe work moved out of hot sections.**
+  Added a VM-local deferred recipe-root reclaim queue: the EBR callback now
+  enqueues old immutable recipe roots into a fixed-size ring after EBR safety
+  is established, and explicit VM maintenance drains perform the expensive tree
+  destruction later. The BSP userspace reactor idle path and terminal child
+  cleanup path now drain that queue alongside existing EBR maintenance. Recipe
+  publish aggregate counters and stable `debug.vm.recipe.publish.*` records now
+  emit after the writer `recipe_index.mutation` lock drops, so lock service
+  rows no longer include aggregate publish-observe emission. `rewrite_locked`
+  and `rewrite_tag_ufd_registration` now use the backend `replace_range_summary`
+  splice path instead of remove+insert per VMA, matching the existing unmap and
+  protect cleanup. Added a focused VM test proving EBR enqueue is separate from
+  explicit VM drain. Verification: `cargo check -p tx-subsystems -q`, `cargo
+  test -p tx-subsystems vm_recipe -- --nocapture`, `RUSTFLAGS="--cfg
+  tx_vm_recipe_bplus" cargo test -p tx-subsystems bplus_ -- --nocapture`,
+  `cargo check -p tx-kernel -q`, and scoped `git diff --check`. Caveat: the
+  deeper POD/raw-id recipe side-table remains intentionally unimplemented until
+  the fault materialization path has an explicit retained-owner plus
+  generation/stale-publication protocol; the current safe split is still
+  `VmCap<T>` plus clone-free/shared-run recipe traversal. Next step is a fresh
+  pthread critical-section observe run to quantify the post-lock observe and
+  deferred-reclaim effects before choosing whether to pay the side-table
+  complexity.
+
+- 2026-06-03 **VM recipe hot/cold split verified; raw-id side table deferred.**
+  Continued the VM-local clone cleanup around the `VmCap<T>` split:
+  `VmBacking::Page.pc` and `VmEntry.private` now clone a VM wrapper instead
+  of retaining/dropping the underlying zone `Cap<PageContainer>` or
+  `Cap<PrivatePageSet>` on ordinary `VmEntry` copies, and recipe rewrite prep
+  now uses borrowed predecessor/successor/lookup/overlap traversal plus
+  summary-only removals for fixed map, unmap, protect, locked, remap, UFD tag,
+  gap search, and full-mapping checks. Focused tests prove `VmEntry::clone`
+  leaves the heavy cap retain counts unchanged. The deeper POD/raw-id
+  side-table form remains a follow-up: `require_fault_recipe` still returns an
+  owned `VmEntry`, materialization needs retained PageContainer/PrivatePageSet
+  ownership, and `require_fault_publication` compares recipe/private identity
+  after re-lookup, so a raw-id row needs an explicit retained-owner and
+  generation/stale-publication protocol first. Audit result: process fd/nsproxy
+  snapshots, VFS/OpenFile payloads, SysV SHM payloads, and exec-time page
+  handles are Cap-heavy but not observe-proven high-frequency persistent leaf
+  churn; leave them alone until measured. Verification: scoped `rustfmt
+  --edition 2024 --check`, scoped `git diff --check`, `cargo check -p
+  tx-subsystems -q`, `RUSTFLAGS="--cfg tx_vm_recipe_bplus" cargo check -p
+  tx-subsystems -q`, `cargo check -p tx-scripts -q`, `cargo check -p
+  tx-shims -q`, `cargo test -p tx-subsystems vm_entry_clone_does_not_retain --
+  --nocapture`, `cargo test -p tx-subsystems vm_recipe -- --nocapture`, `cargo
+  test -p tx-subsystems fault_materialization -- --nocapture`, `RUSTFLAGS="--cfg
+  tx_vm_recipe_bplus" cargo test -p tx-subsystems bplus_ -- --nocapture`,
+  `RUSTFLAGS="--cfg tx_vm_recipe_bplus --cfg tx_vm_recipe_bplus_arc_metrics"
+  cargo test -p tx-subsystems bplus_ -- --nocapture`, and both default/B+
+  `cargo clippy -p tx-subsystems --lib -- -W clippy::redundant_clone` runs.
+  Clippy found no VM recipe redundant clones; remaining redundant-clone findings
+  are process/VFS-only, with unrelated existing style warnings. Caveat: no fresh
+  pthread critical-section observe rerun has been captured for this structural
+  cleanup yet.
+
+- 2026-06-03 **B+ recipe leaves now store replacement entries inline.**
+  Removed the B+ backend's per-entry `Arc<VmEntry>` wrapper: owned replacement
+  leaf slots now store `VmEntry` values directly, while unchanged survivors
+  remain persistent through `SharedRun` references into old immutable leaf
+  chunks. This keeps the safe isolation boundary for mutable
+  `PrivatePageSet`s: VMA split/munmap still creates or slices the private set,
+  because sharing the same mutable set across old and new recipes would let a
+  stale fault insert private frames before `require_fault_publication` rejects
+  the stale recipe. `tx_vm_recipe_bplus_arc_metrics` is now a no-op regression
+  guard proving owned leaf builds and replacement leaves do not allocate or
+  clone entry Arcs. The Cap-heavy audit remains unchanged: Process fd/nsproxy
+  snapshots, VFS/open-file payloads, exec temporary `PageContainer` handles,
+  and SysV SHM payloads carry heavy caps, but they are lifecycle/snapshot
+  structures rather than high-frequency persistent recipe leaves and should not
+  get the VM recipe treatment without observe evidence. Verification:
+  `RUSTFLAGS="--cfg tx_vm_recipe_bplus" cargo check -p tx-subsystems -q`,
+  `cargo check -p tx-subsystems -q`, `RUSTFLAGS="--cfg tx_vm_recipe_bplus"
+  cargo test -p tx-subsystems bplus_ -- --nocapture`, `RUSTFLAGS="--cfg
+  tx_vm_recipe_bplus --cfg tx_vm_recipe_bplus_arc_metrics" cargo test -p
+  tx-subsystems bplus_ -- --nocapture`, `cargo test -p tx-subsystems
+  vm_entry_clone_does_not_retain -- --nocapture`, `cargo test -p
+  tx-subsystems vm_recipe -- --nocapture`, `cargo test -p tx-subsystems
+  fault_materialization -- --nocapture`, and scoped `git diff --check`.
+  Caveat: no fresh pthread critical-section observe has been rerun for the
+  inline-entry B+ representation.
+
+- 2026-06-03 **VM recipe entries split hot metadata from heavy Cap retention.**
+  Added `VmCap<T>` as a VM recipe handle wrapper and moved
+  `VmBacking::Page.pc` plus `VmEntry.private` through it so normal
+  `VmEntry` clones copy range/prot/flags/backing metadata without retaining
+  the underlying zone `Cap<PageContainer>` or `Cap<PrivatePageSet>` on every
+  recipe rewrite. Kept the public `lookup_view` private-set surface borrowed
+  as `&Cap<PrivatePageSet>`, preserved `VmEntry::sub_entry` private-set
+  split/rebase semantics, and updated mmap/exec/shm/page-backed constructors
+  to wrap page-container caps explicitly. Added focused retain-count tests for
+  page-backed and private-anon `VmEntry` clone paths. Scan result: process
+  fd/nsproxy snapshots, VFS `OpenFileBacking`, and SysV SHM payloads contain
+  Cap-heavy fields, but they are lifecycle/snapshot objects rather than the
+  per-rewrite VM leaf shape, so they need observe evidence before getting the
+  same treatment. Verification: scoped `rustfmt --edition 2024 --check
+  --config skip_children=true` over the rustfmt-clean touched VM/shim/script
+  files, while `linux_syscall/exec_op.rs` stayed constructor-only to avoid
+  unrelated legacy-format churn; scoped `git diff --check`,
+  `cargo check -p tx-subsystems -q`,
+  `RUSTFLAGS="--cfg tx_vm_recipe_bplus" cargo check -p tx-subsystems -q`,
+  `cargo check -p tx-scripts -q`, `cargo check -p tx-shims -q`,
+  `cargo check -p tx-kernel -q`, `cargo test -p tx-subsystems
+  vm_entry_clone_does_not_retain -- --nocapture`, `cargo test -p
+  tx-subsystems vm_recipe -- --nocapture`, `cargo test -p tx-subsystems
+  fault_materialization -- --nocapture`, `RUSTFLAGS="--cfg
+  tx_vm_recipe_bplus" cargo test -p tx-subsystems bplus_ -- --nocapture`,
+  and `cargo xtask progress validate`. Caveat: no pthread critical-section
+  observe has been rerun for this structural split yet.
+
+- 2026-06-03 **sigprocmask fast path removes owner-process upgrade from
+  common refresh.** Extended the group-pending summary fast path so
+  `step_sigprocmask` reuses its already-upgraded thread payload during
+  deliverability refresh, process-group producers synchronize per-thread
+  group-pending hints, and newly cloned sibling threads inherit existing
+  group-pending state. Added Weak-upgrade phase counters and names-table labels
+  to split registry/meta/to-cap cost while keeping noisy select/phase probes
+  behind narrow cfgs. Usable verification capture:
+  `target/oscomp/custom-run/sigprocmask-weak-upgrade-fastpath-pthread-minimal1-20260603-smp1`
+  (`complete=true`, `raw_records=1,268,305`, no loss/overwrites/repairs):
+  `sys_rt_sigprocmask n=10,007 p50=181us p95=232us p99=286us max=14.481ms`,
+  with zero Cap/Weak upgrade rows inside any sigprocmask span and
+  `IdentRef::to_cap()` attempts always `1` / retries `0`. The failed 4-hart
+  rerun timed out with an empty rawrecords file; a non-live bounded
+  pthread-minimal1 smoke completed with `userspace:exited:0` and no trap lines.
+  Current conclusion: the CAS-retry mechanism is not confirmed; the previous
+  owner-upgrade tail was an avoidable refresh-path cost, and the remaining max
+  span is in VM page-backed copy-in materialization, not signal refresh.
+  Verification also included `cargo test -p tx-subsystems
+  signal::tests::delivery -- --nocapture`, `cargo check -p tx-subsystems -q`,
+  `RUSTFLAGS="--cfg tx_cap_upgrade_metrics --cfg tx_signal_select_metrics --cfg tx_sigprocmask_phase_metrics --cfg tx_lock_metrics_process" cargo check -p tx-subsystems -q`,
+  `RUSTFLAGS="--cfg tx_cap_upgrade_metrics" cargo check -p tx-substrate -q`,
+  and a non-live `tools/oscomp-custom-run.py --libcbench --libcbench-only
+  pthread-minimal1 --run --fault-decode` smoke. Research note:
+  `docs/progress/research/2026-06-02-sigprocmask-tail-audit.md`.
+
+- 2026-06-03 **AP observe/child-spread worktree merged back and closed.**
+  Manually merged the dirty `codex/ap-observe-init` worktree into
+  `/Users/3y/Downloads/Tx` without overwriting unrelated main changes: AP entry
+  initializes `tx-observe` and emits `debug.observe.ap.init`, child pthread
+  submission can use cfg-gated wide affinity plus `spread_on_submit` while
+  staying pinned, first userspace remains CPU0-safe, and the scheduler now
+  allows pinned submit-spread initial placement without enabling
+  steal/rebalance. Added the full AP scheduling/status report and async-kernel
+  dispatch reference under `docs/progress/research/`, and marked
+  `docs/progress/worktrees/2026-06-02-ap-observe-init.json` merged.
+  Verification in main: `cargo test -p tx-kernel
+  initial_userspace_sched_meta_stays_on_cpu0_when_boot_hart_is_nonzero --
+  --nocapture`, `cargo test -p tx-reactor
+  pinned_spread_on_submit_uses_initial_spread_without_enabling_steal --
+  --nocapture`, `RUSTFLAGS="--cfg tx_userspace_child_spread_smp4" cargo check
+  -p tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf`, `cargo
+  xtask progress validate`, `cargo xtask lint docs`, and `git diff --check`.
+  Caveat: workspace-wide `cargo fmt --check` is still blocked by pre-existing
+  dirty formatting outside this merge, including
+  `crates/tx-subsystems/src/vm/structure/recipe_tree.rs` and broader import
+  ordering in already-dirty files. Closeout proof: `main...codex/ap-observe-init`
+  was `0 0`, AP content and reports were present in main, then
+  `/Users/3y/.codex/worktrees/ap-observe-init/Tx` was removed, worktrees were
+  pruned, and `codex/ap-observe-init` was deleted.
+
+- 2026-06-02 **B+ survivor leaf sharing removes unchanged-entry Arc clones.**
+  Changed `BPlusLeaf` from flat owned entry storage to inline
+  `Owned`/`SharedRun` segments so `replace_range` shares unchanged survivor
+  runs instead of cloning their `Arc<VmEntry>` refs. Added focused
+  `tx_vm_recipe_bplus_arc_metrics` clone-counter tests for owned leaf build and
+  survivor replacement, and made host unit tests bypass observe timing emission
+  while production arc-metric builds still emit timing records. The VM-first
+  linter pass also removed a treap `insert_entry` redundant clone; remaining
+  `clippy::redundant_clone` findings are process/VFS-only and left out of this
+  VM patch. Verification: `RUSTFLAGS="--cfg tx_vm_recipe_bplus --cfg
+  tx_vm_recipe_bplus_arc_metrics" cargo test -p tx-subsystems
+  bplus_owned_leaf_build_does_not_clone_entry_refs -- --nocapture`,
+  `RUSTFLAGS="--cfg tx_vm_recipe_bplus --cfg tx_vm_recipe_bplus_arc_metrics"
+  cargo test -p tx-subsystems
+  bplus_replace_range_shares_unchanged_survivor_refs -- --nocapture`,
+  `RUSTFLAGS="--cfg tx_vm_recipe_bplus" cargo test -p tx-subsystems bplus_ --
+  --nocapture`, `rustfmt --edition 2024 --check
+  crates/tx-subsystems/src/vm/structure/recipe_tree.rs`,
+  `git diff --check -- crates/tx-subsystems/src/vm/structure/recipe_tree.rs`,
+  and `RUSTFLAGS="--cfg tx_vm_recipe_bplus" cargo clippy -p tx-subsystems
+  --lib -- -W clippy::redundant_clone`. Research note:
+  `docs/progress/research/2026-06-02-bplus-arc-metrics-cfg.md`.
+
+- 2026-06-03 **SMP userspace scheduling gap report consolidated.** Added
+  `docs/progress/research/2026-06-03-smp-scheduler-gap-report.md` from the
+  read-only module subagent audits. The report splits gaps by Substrate
+  EBR/Zone/Cap, Process/ThreadRuntime/Signal, VM/PageBacked/VFS, Reactor/
+  Scheduler/wake, and Observe/vocabulary infrastructure. Current conclusion:
+  keep OSComp userspace scheduling pinned by default; first close attribution
+  gaps around `Weak::observe`/slot lookup, typed cap/phase rows, AP observe, and
+  lock-service joins, then address P0 correctness/critical-section items before
+  gated submit-spread or migration experiments. Verification: docs-only edit;
+  run markdown/progress checks before handoff.
+
+- 2026-06-02 **Cap-upgrade retry hypothesis not confirmed; sigprocmask
+  group-pending refresh fast path added.** Ran the lean pthread-minimal1 observe
+  with `tx_cap_upgrade_metrics` at
+  `target/oscomp/custom-run/sigprocmask-cap-upgrade-pthread-minimal1-20260603-lean`.
+  The live drain was clean (`raw_records=1,344,894`, `complete=true`,
+  `lost_records=0`, `overwritten_records=0`, `repairs=0`), and
+  `sys_rt_sigprocmask` measured `n=10,007`, `p50=409us`, `p95=1.035ms`,
+  `p99=1.965ms`, `max=24.454ms`. The cap-upgrade counters did not show CAS
+  retry pressure: all 127 sampled `IdentRef::to_cap()` upgrades had
+  `attempts=1` and `retries=0` (`duration_ns max=5.547ms`). Added a
+  conservative per-thread `group_pending_summary` hint so
+  `refresh_deliverable_signal_summary()` can skip the owner-process upgrade
+  when both thread-pending and known group-pending bits are empty; direct
+  `select_next_signal()` remains authoritative. Verification:
+  `cargo test -p tx-subsystems signal::tests::delivery -- --nocapture`,
+  `cargo check -p tx-subsystems -q`, and
+  `RUSTFLAGS="--cfg tx_cap_upgrade_metrics --cfg tx_signal_select_metrics --cfg tx_sigprocmask_phase_metrics --cfg tx_lock_metrics_process" cargo check -p tx-subsystems -q`.
+  Research note:
+  `docs/progress/research/2026-06-02-sigprocmask-tail-audit.md`.
+
+- 2026-06-02 **Cap-upgrade retry probe added and noisy sigprocmask probes
+  split behind narrow cfgs.** Added sparse `IdentRef::to_cap()` counters behind
+  `tx_cap_upgrade_metrics`: `debug.cap.upgrade.to_cap.duration_ns`,
+  `debug.cap.upgrade.to_cap.attempts`, and
+  `debug.cap.upgrade.to_cap.retries`. The probe emits only for slow
+  (`>=100us`) or retried upgrades, so the next pthread observe run can test the
+  suspected owner-process weak-cap CAS/retry choke without the previous
+  per-select/per-phase flood. `debug.signal.select.*` now requires
+  `tx_signal_select_metrics`, and detailed
+  `debug.lock_service.thread.payload.sigprocmask.*` phase timers now require
+  `tx_sigprocmask_phase_metrics`; the sampled shim-level `debug.sigprocmask.*`
+  markers remain sparse for span localization. Recommended next run:
+  `RUSTFLAGS="--cfg tx_cap_upgrade_metrics" cargo xtask observe oscomp-live --name sigprocmask-cap-upgrade-pthread-minimal1-YYYYMMDD-HHMMSS --test pthread-minimal1 --timeout 900`.
+  Verification now includes `cargo check -p tx-subsystems -q`,
+  `RUSTFLAGS="--cfg tx_cap_upgrade_metrics --cfg tx_lock_metrics_process" cargo check -p tx-subsystems -q`,
+  `RUSTFLAGS="--cfg tx_cap_upgrade_metrics --cfg tx_signal_select_metrics --cfg tx_sigprocmask_phase_metrics --cfg tx_lock_metrics_process" cargo check -p tx-subsystems -q`,
+  and `cargo test -p tx-subsystems lock_service_declares -- --nocapture`.
+  Research note:
+  `docs/progress/research/2026-06-02-sigprocmask-tail-audit.md`.
+
+- 2026-06-02 **rt_sigprocmask tail attributed to signal-refresh upgrade
+  latency in a lossless phase-only rerun.** Added detailed
+  `step_sigprocmask` phase timers and reran pthread-minimal1 at
+  `target/oscomp/custom-run/lock-service-step-sigprocmask-pthread-minimal1-20260602-230201`.
+  The live drain was lossless (`raw_records=1,446,316`, `complete=true`,
+  `lost_records=0`, `overwritten_records=0`, `repairs=0`). The worst
+  `sys_rt_sigprocmask` span was `66.992ms`; user copy-in completed by
+  `+0.209ms`, payload lock wait was only `10us`, and the dominant buckets were
+  `refresh_deliverable_signal_summary()` / `select_next_signal()`
+  (`refresh.duration_ns=46.651ms`) plus a separate
+  `payload_lock_held=19.651ms`. Within refresh, the marked
+  `owner.upgrade.request -> owner.upgrade.done` gap was about `30.434ms`, while
+  the proc/thread reacquire waits were small. Current conclusion: not a
+  measurement error, not B+ Arc, not VM copy/writeback, and not generic lock
+  contention; next probe should split the substrate weak-cap upgrade/retain path
+  into slow upgrade versus retry behavior. Research note:
+  `docs/progress/research/2026-06-02-sigprocmask-tail-audit.md`.
+
+- 2026-06-02 **B+ scratch Arc round removed and remeasured.** Changed
+  `BPlusLeaf` construction to move owned `BPlusEntryRef`s directly into inline
+  leaf storage instead of cloning a scratch slice into the new leaf. The new
+  focused arc-metrics test first failed with two clone records for two owned
+  entries, then passed with zero clone records after the move-based builder.
+  Full pthread SMP1 arc rerun at
+  `target/oscomp/custom-run/recipe-bplus-noscratch-arcmetrics-pthread-smp1-20260602-223145`
+  was clean (`raw_records=8,893,754`, `complete=true`, no lost/overwritten
+  records or repairs) and cut `clone+drop` from `999,201` to `486,961` with
+  unchanged `touched_entries=256,120` (`3.9006` -> `1.9013` events per
+  touched entry). The clean arc-off service run at
+  `target/oscomp/custom-run/recipe-bplus-noscratch-equalized-pthread-smp1-20260602-224102`
+  was also complete (`raw_records=8,064,934`, no loss/repairs) and lowered
+  `debug.lock.vm.recipe_index.mutation` service avg from `1.082298ms` to
+  `878.770us`, with publish avg from `889.115us` to `706.391us`. This removes
+  the duplicate scratch round but still leaves B+ above the old promotion
+  target; remaining work is residual survivor ownership churn rather than tree
+  depth or scratch cloning. Research note:
+  `docs/progress/research/2026-06-02-bplus-arc-metrics-cfg.md`.
+
+- 2026-06-02 **B+ Arc churn measured on full pthread SMP1 and exact 2x model
+  falsified.** Ran
+  `RUSTFLAGS="--cfg tx_lock_metrics --cfg tx_lock_metrics_vm --cfg tx_vm_recipe_bplus --cfg tx_vm_recipe_bplus_arc_metrics"`
+  through `tools/oscomp-observe-live.py --test pthread --smp 1 --timeout 900`
+  at
+  `target/oscomp/custom-run/recipe-bplus-arcmetrics-pthread-smp1-20260602-215049`.
+  Runtime quality was clean (`raw_records=8,910,654`, `complete=true`,
+  `lost_records=0`, `overwritten_records=0`, `repairs=0`) and exported
+  Parquet only. Full-run counters: `touched_entries total=256,120`,
+  `entry_arc.clone n=484,737`, `entry_arc.drop n=514,464`,
+  `clone+drop=999,201` versus `2*touched=512,240` (`ratio=1.9507` to the
+  proposed 2x model, `3.9006` per touched entry). Conclusion: Arc churn is
+  real and roughly linear, but the literal two-atomic-per-touched-entry model
+  is false for the current B+ implementation; there is extra survivor/wrapper
+  traffic to inspect before choosing the next representation change. Research
+  note: `docs/progress/research/2026-06-02-bplus-arc-metrics-cfg.md`.
+
+- 2026-06-02 **rt_sigprocmask tail localized to post-copy signal refresh.**
+  Refined the `process-ds-pthread-retry-20260602-200224` audit after raw
+  timestamp-window decode of the worst `sys_rt_sigprocmask` span
+  (`79.257ms`). Runtime capture is complete (`lost=0`, `overwritten=0`,
+  `repairs=0`), and raw VM user markers show the `set` copy-in completes at
+  `+767us`; the next selected marker is old-mask write-side VM resolution at
+  `+78.394ms`. That places the long hole between copy-in and write-out, inside
+  `step_sigprocmask` / `refresh_deliverable_signal_summary()`, not in Arc,
+  initial user read, or write-side VM resolution. Added per-operation
+  `debug.signal.select.*` markers around `select_next_signal`'s first
+  `thread.payload` lock, owner-process upgrade, `proc.payload` lock, and
+  second `thread.payload` reacquire so the next pthread observe run can split
+  lock wait, lock-held service, weak-cap upgrade latency, and group-pending
+  re-check time. Research note:
+  `docs/progress/research/2026-06-02-sigprocmask-tail-audit.md`.
+
+- 2026-06-02 **Userspace scheduling dispatch is still gated off by pinned
+  OSComp policy.** Added
+  `docs/progress/research/2026-06-02-userspace-scheduling-dispatch-status.md`
+  after reconciling the full pthread process-DS observe run with the live
+  scheduler/runtime code. Current status: APs boot and the reactor has
+  multi-hart placement, wake/IPI, steal, and rebalance machinery, but OSComp
+  userspace threads are submitted with a single-bit affinity mask and
+  `.pinned()`, so the measured full pthread run placed all decoded spans and
+  process DS rows on hart 1. Enabling work dispatch is not a one-line policy
+  promotion: first add all-hart observe initialization/final scheduler
+  summaries, then gate userspace spread/migration behind cfg or boot params,
+  and only promote after trap-slot lifetime, RV64 resume context, ASID
+  shootdown residency, remote wake/IPI volume, affinity/getcpu semantics, and
+  signal/mailbox wake behavior are verified under QEMU. Verification for this
+  recon: report/code/artifact audit only; next step is an AP-observe-first
+  gated dispatch experiment.
+
+- 2026-06-02 **Process identity DS observe measurement completed.** Ran the
+  new process data-structure probes through a full pthread live observe with
+  `RUSTFLAGS="--cfg tx_ds_metrics --cfg tx_ds_metrics_process"`:
+  `cargo xtask observe oscomp-live --name
+  process-ds-pthread-retry-20260602-200224 --test pthread --timeout 900`.
+  Artifact:
+  `target/oscomp/custom-run/process-ds-pthread-retry-20260602-200224`. The
+  first build attempt (`process-ds-pthread-20260602-195927`) ran out of disk
+  space before QEMU; only disposable incremental build caches were removed
+  before retrying, preserving `target/oscomp/custom-run` evidence. The retry
+  reached `#### OS COMP TEST GROUP END libcbench-musl ####` and
+  `userspace:exited:0`; live drain reported `complete=true`,
+  `raw_records=6,923,021`, `lost_records=0`, `overwritten_records=0`, and
+  `repairs=0`. Derived Parquet contains `ds_method_rows=50,089` and
+  `lock_rows=0` because this run enabled DS metrics only. Process
+  `debug.ds.process.*` rows total `1.589s` observed method time
+  (`p50=29us`, `p99=121us`, `max=23.463ms`). Top totals:
+  `pid_namespace.unregister_tid_number n=12,501 total=558.146ms p99=153us
+  max=1.603ms`; `pid_namespace.register_tid n=12,501 total=485.440ms
+  p99=124us max=23.463ms`; `threads.detach n=12,501 total=421.694ms
+  p99=107us max=3.710ms`; `threads.attach n=12,501 total=118.710ms p99=33us
+  max=609us`. No `debug.ds.substrate.*` rows were emitted in this trace
+  because `tx_ds_metrics_zone` and `tx_ds_metrics_page_allocator` were not
+  enabled; use the separate
+  `zone-current-pthread-minimal1-20260602-192224` run for zone-allocation cost
+  or rerun with process DS, zone/page-allocator DS, and process lock cfgs
+  together to compare method work against lock service in one capture. Current
+  conclusion: process identity/tree DS work is measurable but not the dominant
+  pthread wall-time source; the repeated TID namespace mutation and thread
+  attach/detach paths are the only process DS methods worth optimizing before
+  broader VM/process critical-section work. Full declared-slot table,
+  benchmark body times, top span context, and reproduction SQL are recorded in
+  `docs/progress/research/2026-06-02-process-ds-observe.md`.
+
+- 2026-06-02 **Process identity DS method probes are gated and labelable.**
+  Added process-local data-structure method timing behind the doubled gate
+  `tx_ds_metrics` + `tx_ds_metrics_process`. The new
+  `crates/tx-subsystems/src/process/ds_metrics.rs` helper emits
+  `debug.ds.method.duration_ns` rows on the existing `debug.ds.method` observe
+  track, so current `tools/tx-observe-analyze.py` exports them through
+  `ds_method_rows` without schema changes. Instrumented PID namespace
+  `BTreeMap` operations (`register_*`, `unregister_*`, `resolve_*`,
+  `with_namespace`) and the process topology containers for children, threads,
+  process-group members, and session members (`attach`, `detach`, `snapshot`,
+  `drain`, `retain`, live snapshots/counts). `xtask observe names` now includes
+  the corresponding `debug.ds.process.*` stable labels, and the workspace
+  check-cfg list accepts `tx_ds_metrics_process`. Verification: red/green
+  focused test
+  `RUSTFLAGS="--cfg tx_ds_metrics --cfg tx_ds_metrics_process" cargo test -p tx-subsystems process_ds_metrics_declares_identity_tree_method_names -- --nocapture`;
+  `cargo check -p tx-subsystems -q`; enabled build
+  `RUSTFLAGS="--cfg tx_ds_metrics --cfg tx_ds_metrics_process" cargo check -p tx-subsystems -q`;
+  compile-out check
+  `RUSTFLAGS="--cfg tx_ds_metrics_process" cargo check -p tx-subsystems -q`;
+  `cargo check -p xtask -q`; `cargo fmt --check`; and scoped
+  `git diff --check`. Next step: run a pthread live observe with
+  `RUSTFLAGS="--cfg tx_ds_metrics --cfg tx_ds_metrics_process"` and compare
+  `debug.ds.process.pid_namespace.*`, `debug.ds.process.children.*`, and
+  `debug.ds.process.threads.*` against existing process lock `service_ns` rows
+  to split method work from lock acquisition/queueing.
 
 - 2026-06-02 **Zone allocation observe pass shows allocation is not the main
   pthread-minimal1 cost.** Ran a fresh live-drained OSComp observe pass on the
