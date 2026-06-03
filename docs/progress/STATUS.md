@@ -1,3 +1,28 @@
+- 2026-06-03 **PageBacked materialization state-lock service shrunk.**
+  Moved cold anon/file page frame allocation and `MapPin` acquisition out of
+  the `PageContainer.state` critical section. Hot cached materialization now
+  snapshots page state under the lock, takes the `MapPin` after unlock, and
+  revalidates the page/PPN before returning so truncate or replacement cannot
+  leave a bare-PPN publication window. Added focused regressions proving anon
+  cold/hot materialization and file cold/hot materialization do not perform
+  frame allocation or `MapPin` acquisition while the PC state lock is held.
+  Verification: red/green `cargo test -p tx-subsystems materialization_keeps
+  -- --nocapture`, `cargo test -p tx-subsystems page_backed -- --nocapture`,
+  `cargo check -p tx-subsystems -q`, scoped rustfmt/diff checks,
+  `cargo xtask progress validate`, and `cargo xtask lint docs` passed. Next
+  step: add per-page file-backed in-flight dedup and then the bdev-fs
+  PageContainer routing test.
+
+- 2026-06-03 **Filesystem SMP gap audit added.** Added
+  `docs/progress/research/2026-06-03-filesystem-smp-gap-audit.md` as the
+  filesystem/PageBacked follow-up to the SMP scheduler gap report. The audit
+  keeps the first repair slice on PageBacked in-flight dedup and PC lock
+  shrink, flags bdev-fs block-device PageContainer routing for correctness
+  proof, and defers the large VFS `IdentRef` warm-walk plus ext4/FAT async
+  pager migrations until after targeted metrics or correctness tests. Next
+  step: implement a focused PageBacked in-flight/lock-service slice and add the
+  bdev-fs routing test before wider filesystem SMP migration.
+
 - 2026-06-02 **Zone allocation observe pass shows allocation is not the main
   pthread-minimal1 cost.** Ran a fresh live-drained OSComp observe pass on the
   current dirty checkout with `RUSTFLAGS="--cfg tx_ds_metrics --cfg

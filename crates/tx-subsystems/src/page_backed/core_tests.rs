@@ -497,6 +497,45 @@ fn anon_page_container_materializes_once_and_tracks_dirty_writes() {
 }
 
 #[test]
+fn anon_page_materialization_keeps_allocator_work_outside_state_lock() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    reset_page_container_lock_service_observations_for_test();
+    let pc = PageContainer::new(
+        PageContainerKind::Anon {
+            swap_policy: AnonSwapPolicy::Reclaimable,
+        },
+        4,
+    );
+    let page = PageIndex::new(1);
+
+    let first = pc
+        .materialize_anon(page, MaterializeAccess::Read)
+        .expect("cold anon materialization");
+    let cold_observations = page_container_lock_service_observations_for_test();
+
+    reset_page_container_lock_service_observations_for_test();
+    let second = pc
+        .materialize_anon(page, MaterializeAccess::Write)
+        .expect("hot anon rematerialization");
+    let hot_observations = page_container_lock_service_observations_for_test();
+
+    assert!(first.newly_installed);
+    assert_eq!(second.ppn, first.ppn);
+    assert!(!second.newly_installed);
+    assert_eq!(
+        cold_observations,
+        (0, 0),
+        "cold materialization must not allocate frames or acquire map pins under PageContainer.state"
+    );
+    assert_eq!(
+        hot_observations,
+        (0, 0),
+        "hot rematerialization must not acquire map pins under PageContainer.state"
+    );
+}
+
+#[test]
 fn page_container_cap_materializes_anon_pages() {
     setup_host_substrate();
     let pc = PageContainer::new_cap(
@@ -573,6 +612,43 @@ fn page_container_materialize_page_dispatches_file_fetch_once() {
         2 * crate::vm::USER_PAGE_SIZE as u64
     );
     assert_eq!(pc.resident_pages(), 1);
+}
+
+#[test]
+fn file_page_materialization_keeps_map_pin_outside_state_lock() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let guard = step_engine::guard();
+    reset_page_container_lock_service_observations_for_test();
+    let fs = Arc::new(RecordingFs::new());
+    let pc = file_page_container(fs.clone(), fs, FsObjectId::new(56), 4);
+
+    let first = match pc.materialize_page(PageIndex::new(2), MaterializeAccess::Read, &guard) {
+        V3Out::Done(page) => page,
+        other => panic!("unexpected materialize outcome: {other:?}"),
+    };
+    let cold_observations = page_container_lock_service_observations_for_test();
+
+    reset_page_container_lock_service_observations_for_test();
+    let second = match pc.materialize_page(PageIndex::new(2), MaterializeAccess::Write, &guard) {
+        V3Out::Done(page) => page,
+        other => panic!("unexpected rematerialize outcome: {other:?}"),
+    };
+    let hot_observations = page_container_lock_service_observations_for_test();
+
+    assert!(first.newly_installed);
+    assert_eq!(second.ppn, first.ppn);
+    assert!(!second.newly_installed);
+    assert_eq!(
+        cold_observations,
+        (0, 0),
+        "cold file materialization must not acquire map pins under PageContainer.state"
+    );
+    assert_eq!(
+        hot_observations,
+        (0, 0),
+        "hot file rematerialization must not acquire map pins under PageContainer.state"
+    );
 }
 
 #[test]

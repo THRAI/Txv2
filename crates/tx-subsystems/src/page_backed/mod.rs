@@ -13,9 +13,9 @@ pub mod adapter;
 pub mod notification;
 
 use adapter::step_engine::{
-    self as step_engine, page_allocator, AllocError, BitmapPageAllocator, ByteProgress, CachePin,
-    Cap, DeviceFrame, MapPin, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
-    ZeroPolicy, Zone, ZoneAllocated, ZoneError,
+    self as step_engine, AllocError, BitmapPageAllocator, ByteProgress, CachePin, Cap, DeviceFrame,
+    MapPin, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity, ZeroPolicy, Zone,
+    ZoneAllocated, ZoneError, page_allocator,
 };
 
 use crate::execution::{Errno, Guard};
@@ -32,12 +32,12 @@ mod targeted_read;
 mod user_buffer;
 pub use cross_variant::step_copy_file_range;
 pub use fs_page_backing::FsPageBacking;
-pub use lifecycle::{step_fallocate, step_fsync, step_truncate, FallocateOp, TruncateOp};
+pub use lifecycle::{FallocateOp, TruncateOp, step_fallocate, step_fsync, step_truncate};
 pub use reflink::{cow_replace_into_private, install_shared_page};
 pub use targeted_read::read_exact_at;
 pub use user_buffer::{
-    step_read_to_kernel, step_read_to_user, step_write_from_kernel, step_write_from_user,
-    ReadToUserOp, WriteFromUserOp,
+    ReadToUserOp, WriteFromUserOp, step_read_to_kernel, step_read_to_user, step_write_from_kernel,
+    step_write_from_user,
 };
 
 #[cfg(test)]
@@ -310,12 +310,44 @@ pub enum MaterializedPagePin {
     Device(DeviceFrame),
 }
 
+struct MaterializedPageSnapshot {
+    ppn: Ppn,
+    pin: MaterializedPageSnapshotPin,
+    newly_installed: bool,
+    dirty: bool,
+}
+
+enum MaterializedPageSnapshotPin {
+    Allocated(CachePin<'static, BitmapPageAllocator<'static>>),
+    Device(DeviceFrame),
+}
+
+impl MaterializedPageSnapshot {
+    fn into_materialized(self) -> Result<MaterializedPage, PageCacheError> {
+        let map_pin = match self.pin {
+            MaterializedPageSnapshotPin::Allocated(cache_pin) => {
+                debug_assert_eq!(cache_pin.ppn(), self.ppn);
+                let map_pin = acquire_map_pin_for_materialization(self.ppn)?;
+                drop(cache_pin);
+                MaterializedPagePin::Allocated(map_pin)
+            }
+            MaterializedPageSnapshotPin::Device(device) => MaterializedPagePin::Device(device),
+        };
+        Ok(MaterializedPage {
+            ppn: self.ppn,
+            map_pin,
+            newly_installed: self.newly_installed,
+            dirty: self.dirty,
+        })
+    }
+}
+
 #[derive(Debug)]
 pub struct PageContainer {
     kind: PageContainerKind,
     page_count: u64,
     size_bytes: AtomicU64,
-    state: SpinMutex<PageContainerState>,
+    state: PageContainerStateCell,
 }
 
 // `PageCacheIndex` (inside `PageContainerState`) is a `BTreeMap<PageIndex,
@@ -333,6 +365,124 @@ struct PageContainerState {
     pages: PageCacheIndex,
 }
 
+struct PageContainerStateCell {
+    inner: SpinMutex<PageContainerState>,
+}
+
+impl PageContainerStateCell {
+    const fn new(state: PageContainerState) -> Self {
+        Self {
+            inner: SpinMutex::new(state),
+        }
+    }
+
+    fn lock(&self) -> PageContainerStateGuard<'_> {
+        let inner = self.inner.lock();
+        PageContainerStateGuard {
+            #[cfg(test)]
+            _mark: PageContainerStateLockMark::enter(),
+            inner,
+        }
+    }
+}
+
+impl core::fmt::Debug for PageContainerStateCell {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("PageContainerStateCell")
+            .field(&*self.lock())
+            .finish()
+    }
+}
+
+struct PageContainerStateGuard<'a> {
+    #[cfg(test)]
+    _mark: PageContainerStateLockMark,
+    inner: tx_substrate::SpinMutexGuard<'a, PageContainerState>,
+}
+
+impl core::ops::Deref for PageContainerStateGuard<'_> {
+    type Target = PageContainerState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl core::ops::DerefMut for PageContainerStateGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static PAGE_CONTAINER_STATE_LOCK_DEPTH_FOR_TEST: core::cell::Cell<usize> =
+        core::cell::Cell::new(0);
+}
+
+#[cfg(test)]
+struct PageContainerStateLockMark;
+
+#[cfg(test)]
+impl PageContainerStateLockMark {
+    fn enter() -> Self {
+        PAGE_CONTAINER_STATE_LOCK_DEPTH_FOR_TEST.with(|depth| {
+            depth.set(depth.get() + 1);
+        });
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for PageContainerStateLockMark {
+    fn drop(&mut self) {
+        PAGE_CONTAINER_STATE_LOCK_DEPTH_FOR_TEST.with(|depth| {
+            depth.set(depth.get().saturating_sub(1));
+        });
+    }
+}
+
+#[cfg(test)]
+static FRAME_ALLOC_UNDER_STATE_LOCK_FOR_TEST: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+static MAP_PIN_UNDER_STATE_LOCK_FOR_TEST: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn page_container_state_lock_held_for_test() -> bool {
+    PAGE_CONTAINER_STATE_LOCK_DEPTH_FOR_TEST.with(|depth| depth.get() != 0)
+}
+
+#[cfg(test)]
+fn reset_page_container_lock_service_observations_for_test() {
+    FRAME_ALLOC_UNDER_STATE_LOCK_FOR_TEST.store(0, Ordering::Release);
+    MAP_PIN_UNDER_STATE_LOCK_FOR_TEST.store(0, Ordering::Release);
+}
+
+#[cfg(test)]
+fn page_container_lock_service_observations_for_test() -> (usize, usize) {
+    (
+        FRAME_ALLOC_UNDER_STATE_LOCK_FOR_TEST.load(Ordering::Acquire),
+        MAP_PIN_UNDER_STATE_LOCK_FOR_TEST.load(Ordering::Acquire),
+    )
+}
+
+#[cfg(test)]
+fn record_frame_alloc_for_test() {
+    if page_container_state_lock_held_for_test() {
+        FRAME_ALLOC_UNDER_STATE_LOCK_FOR_TEST.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+#[cfg(test)]
+fn record_map_pin_for_test() {
+    if page_container_state_lock_held_for_test() {
+        MAP_PIN_UNDER_STATE_LOCK_FOR_TEST.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
 impl PageContainer {
     pub fn new(kind: PageContainerKind, page_count: u64) -> Self {
         let capacity = page_count.saturating_mul(crate::vm::USER_PAGE_SIZE as u64);
@@ -340,7 +490,7 @@ impl PageContainer {
             kind,
             page_count,
             size_bytes: AtomicU64::new(capacity),
-            state: SpinMutex::new(PageContainerState {
+            state: PageContainerStateCell::new(PageContainerState {
                 pages: PageCacheIndex::new(),
             }),
         }
@@ -409,32 +559,41 @@ impl PageContainer {
         }
         self.check_bounds(page)?;
 
-        let mut state = self.state.lock();
-        let newly_installed = match state.pages.lookup(page) {
-            Some(_) => false,
-            None => {
-                let frame = allocate_cached_frame()?;
-                state.pages.install_if_absent(page, frame)?;
-                true
-            }
-        };
-
-        if access == MaterializeAccess::Write {
-            state.pages.mark_dirty(page)?;
+        if self.state.lock().pages.lookup(page).is_some() {
+            return self.materialize_existing_page(page, access, false);
         }
 
-        let ppn = state
-            .pages
-            .lookup(page)
-            .ok_or(PageCacheError::MissingPage)?;
-        let map_pin = page_allocator::acquire_map_pin(ppn).map_err(PageCacheError::Alloc)?;
-        let marks = state.pages.marks(page).ok_or(PageCacheError::MissingPage)?;
-        Ok(MaterializedPage {
-            ppn,
-            map_pin: MaterializedPagePin::Allocated(map_pin),
-            newly_installed,
-            dirty: marks.dirty,
-        })
+        let frame = allocate_cached_frame()?;
+        let ppn = frame.ppn;
+        let map_pin = acquire_map_pin_for_materialization(ppn)?;
+
+        let installed_dirty = {
+            let mut state = self.state.lock();
+            let installed = match state.pages.lookup(page) {
+                Some(_) => false,
+                None => {
+                    state.pages.install_if_absent(page, frame)?;
+                    true
+                }
+            };
+            if access == MaterializeAccess::Write {
+                state.pages.mark_dirty(page)?;
+            }
+            installed
+                .then(|| state.pages.marks(page).ok_or(PageCacheError::MissingPage))
+                .transpose()?
+                .map(|marks| marks.dirty)
+        };
+        if let Some(dirty) = installed_dirty {
+            return Ok(MaterializedPage {
+                ppn,
+                map_pin: MaterializedPagePin::Allocated(map_pin),
+                newly_installed: true,
+                dirty,
+            });
+        }
+        drop(map_pin);
+        self.materialize_existing_page(page, access, false)
     }
 
     pub fn materialize_page_for_fault(
@@ -658,23 +817,99 @@ impl PageContainer {
             Ok(frame) => frame,
             Err(error) => return StepOutcome::Err(page_cache_error_to_errno(error).into()),
         };
-        let mut state = self.state.lock();
-        let installed = match state.pages.lookup(page) {
-            Some(_) => false,
-            None => match state.pages.install_if_absent(page, frame) {
-                Ok(()) => true,
-                Err(PageCacheError::AlreadyPresent { .. }) => false,
-                Err(error) => return StepOutcome::Err(page_cache_error_to_errno(error).into()),
-            },
+        let ppn = frame.ppn;
+        let map_pin = match acquire_map_pin_for_materialization(ppn) {
+            Ok(pin) => pin,
+            Err(error) => return StepOutcome::Err(page_cache_error_to_errno(error).into()),
         };
-        if access == MaterializeAccess::Write {
-            if let Err(error) = state.pages.mark_dirty(page) {
-                return StepOutcome::Err(page_cache_error_to_errno(error).into());
+        let installed_dirty = {
+            let mut state = self.state.lock();
+            let installed = match state.pages.lookup(page) {
+                Some(_) => false,
+                None => match state.pages.install_if_absent(page, frame) {
+                    Ok(()) => true,
+                    Err(PageCacheError::AlreadyPresent { .. }) => false,
+                    Err(error) => return StepOutcome::Err(page_cache_error_to_errno(error).into()),
+                },
+            };
+            if access == MaterializeAccess::Write {
+                if let Err(error) = state.pages.mark_dirty(page) {
+                    return StepOutcome::Err(page_cache_error_to_errno(error).into());
+                }
             }
-        }
-        match materialized_from_state(&state, page, newly_installed || installed) {
-            Ok(page) => StepOutcome::Done(page),
+            installed
+                .then(|| state.pages.marks(page).ok_or(PageCacheError::MissingPage))
+                .transpose()
+                .map(|marks| marks.map(|marks| marks.dirty))
+        };
+        match installed_dirty {
+            Ok(Some(dirty)) => StepOutcome::Done(MaterializedPage {
+                ppn,
+                map_pin: MaterializedPagePin::Allocated(map_pin),
+                newly_installed: true,
+                dirty,
+            }),
+            Ok(None) => {
+                drop(map_pin);
+                match self.materialize_existing_page(page, access, newly_installed) {
+                    Ok(page) => StepOutcome::Done(page),
+                    Err(error) => StepOutcome::Err(page_cache_error_to_errno(error).into()),
+                }
+            }
             Err(error) => StepOutcome::Err(page_cache_error_to_errno(error).into()),
+        }
+    }
+
+    fn materialize_existing_page(
+        &self,
+        page: PageIndex,
+        access: MaterializeAccess,
+        newly_installed: bool,
+    ) -> Result<MaterializedPage, PageCacheError> {
+        loop {
+            let snapshot = {
+                let mut state = self.state.lock();
+                state
+                    .pages
+                    .lookup(page)
+                    .ok_or(PageCacheError::MissingPage)?;
+                if access == MaterializeAccess::Write
+                    && !matches!(self.kind, PageContainerKind::Device { .. })
+                {
+                    state.pages.mark_dirty(page)?;
+                }
+                materialized_snapshot_from_state(&state, page, newly_installed)?
+            };
+            let mut materialized = match snapshot.into_materialized() {
+                Ok(page) => page,
+                Err(PageCacheError::Alloc(AllocError::InvalidRequest)) => {
+                    if self.state.lock().pages.lookup(page).is_some() {
+                        return Err(PageCacheError::Alloc(AllocError::InvalidRequest));
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let Some(dirty) = ({
+                let mut state = self.state.lock();
+                match state.pages.pages.get_mut(&page) {
+                    Some(entry) if entry.ppn == materialized.ppn => {
+                        if access == MaterializeAccess::Write
+                            && !matches!(self.kind, PageContainerKind::Device { .. })
+                        {
+                            entry.marks.dirty = true;
+                            entry.marks.referenced = true;
+                        }
+                        Some(entry.marks.dirty)
+                    }
+                    _ => None,
+                }
+            }) else {
+                drop(materialized);
+                continue;
+            };
+            materialized.dirty = dirty;
+            return Ok(materialized);
         }
     }
 
@@ -695,23 +930,31 @@ impl PageContainer {
             return StepOutcome::Err(V3Errno::EINVAL);
         };
 
-        let mut state = self.state.lock();
-        let newly_installed = match state.pages.lookup(page) {
-            Some(_) => false,
-            None => {
-                let frame = CachedFrame {
-                    ppn,
-                    pin: PageCachePin::Device(DeviceFrame::new(ppn)),
-                };
-                match state.pages.install_if_absent(page, frame) {
-                    Ok(()) => true,
-                    Err(PageCacheError::AlreadyPresent { .. }) => false,
-                    Err(error) => return StepOutcome::Err(page_cache_error_to_errno(error).into()),
+        let snapshot = {
+            let mut state = self.state.lock();
+            let newly_installed = match state.pages.lookup(page) {
+                Some(_) => false,
+                None => {
+                    let frame = CachedFrame {
+                        ppn,
+                        pin: PageCachePin::Device(DeviceFrame::new(ppn)),
+                    };
+                    match state.pages.install_if_absent(page, frame) {
+                        Ok(()) => true,
+                        Err(PageCacheError::AlreadyPresent { .. }) => false,
+                        Err(error) => {
+                            return StepOutcome::Err(page_cache_error_to_errno(error).into());
+                        }
+                    }
                 }
-            }
+            };
+            materialized_snapshot_from_state(&state, page, newly_installed)
         };
-        match materialized_from_state(&state, page, newly_installed) {
-            Ok(page) => StepOutcome::Done(page),
+        match snapshot {
+            Ok(snapshot) => match snapshot.into_materialized() {
+                Ok(page) => StepOutcome::Done(page),
+                Err(error) => StepOutcome::Err(page_cache_error_to_errno(error).into()),
+            },
             Err(error) => StepOutcome::Err(page_cache_error_to_errno(error).into()),
         }
     }
@@ -721,16 +964,8 @@ impl PageContainer {
         page: PageIndex,
         access: MaterializeAccess,
     ) -> Option<Result<MaterializedPage, PageCacheError>> {
-        let mut state = self.state.lock();
-        state.pages.lookup(page)?;
-        if access == MaterializeAccess::Write
-            && !matches!(self.kind, PageContainerKind::Device { .. })
-        {
-            if let Err(error) = state.pages.mark_dirty(page) {
-                return Some(Err(error));
-            }
-        }
-        Some(materialized_from_state(&state, page, false))
+        self.state.lock().pages.lookup(page)?;
+        Some(self.materialize_existing_page(page, access, false))
     }
 
     fn check_bounds(&self, page: PageIndex) -> Result<(), PageCacheError> {
@@ -758,7 +993,7 @@ impl PageContainer {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return,
+                Ok(_) => break,
                 Err(current) => observed = current,
             }
         }
@@ -948,6 +1183,9 @@ impl<'a, I: SubjectIdentity> StepOp<I> for WriteOp<'a> {
 }
 
 fn allocate_cached_frame() -> Result<CachedFrame, PageCacheError> {
+    #[cfg(test)]
+    record_frame_alloc_for_test();
+
     let frame = page_allocator::reserve_frame(ZeroPolicy::Zeroed)
         .map_err(PageCacheError::Alloc)?
         .commit();
@@ -960,6 +1198,15 @@ fn allocate_cached_frame() -> Result<CachedFrame, PageCacheError> {
     })
 }
 
+fn acquire_map_pin_for_materialization(
+    ppn: Ppn,
+) -> Result<MapPin<'static, BitmapPageAllocator<'static>>, PageCacheError> {
+    #[cfg(test)]
+    record_map_pin_for_test();
+
+    page_allocator::acquire_map_pin(ppn).map_err(PageCacheError::Alloc)
+}
+
 fn cached_frame_from_frame(frame: Frame) -> Result<CachedFrame, PageCacheError> {
     let ppn = frame.ppn();
     let cache_pin = page_allocator::acquire_cache_pin(ppn).map_err(PageCacheError::Alloc)?;
@@ -969,28 +1216,28 @@ fn cached_frame_from_frame(frame: Frame) -> Result<CachedFrame, PageCacheError> 
     })
 }
 
-fn materialized_from_state(
+fn materialized_snapshot_from_state(
     state: &PageContainerState,
     page: PageIndex,
     newly_installed: bool,
-) -> Result<MaterializedPage, PageCacheError> {
+) -> Result<MaterializedPageSnapshot, PageCacheError> {
     let entry = state
         .pages
         .pages
         .get(&page)
         .ok_or(PageCacheError::MissingPage)?;
-    let map_pin = match &entry.pin {
+    let pin = match &entry.pin {
         PageCachePin::Allocated(cache_pin) => {
             debug_assert_eq!(cache_pin.ppn(), entry.ppn);
-            MaterializedPagePin::Allocated(
-                page_allocator::acquire_map_pin(entry.ppn).map_err(PageCacheError::Alloc)?,
-            )
+            let cache_pin =
+                page_allocator::acquire_cache_pin(entry.ppn).map_err(PageCacheError::Alloc)?;
+            MaterializedPageSnapshotPin::Allocated(cache_pin)
         }
-        PageCachePin::Device(device) => MaterializedPagePin::Device(*device),
+        PageCachePin::Device(device) => MaterializedPageSnapshotPin::Device(*device),
     };
-    Ok(MaterializedPage {
+    Ok(MaterializedPageSnapshot {
         ppn: entry.ppn,
-        map_pin,
+        pin,
         newly_installed,
         dirty: entry.marks.dirty,
     })
