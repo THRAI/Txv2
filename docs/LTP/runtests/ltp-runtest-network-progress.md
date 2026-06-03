@@ -20,18 +20,22 @@ Date: 2026-06-03
 
 当前最重要的小计：
 
-- 已确认通过点数：`384` = syscall-network `229` +
-  `net.ipv6_lib` `76` + `net.tcp_cmds` `46` + `net.ipv6:ping601`
+- 已确认通过点数：`412` = syscall-network `229` +
+  `net.ipv6_lib` `76` + `net.tcp_cmds` `61` + `net.ipv6:ping601`
   `10` + `net.ipv6:ping602` `10` + `net.ipv6:ipneigh6_ip` `1` +
   `net.ipv6:traceroute601` `6` + `net.ipv6:tracepath601` `1` +
-  `net.ipv6:tcpdump601` `1` + `net.ipv6:sendfile601` `4`。
-- 已观察分母口径：`384/392` = syscall-network `229/236` +
-  `net.ipv6_lib` `76/77` + `net.tcp_cmds` 已计分 `46/46` +
+  `net.ipv6:tcpdump601` `1` + `net.ipv6:sendfile601` `4` +
+  `net.ipv6:ip6tables` `6` + `net.ipv6:nft6` `5` +
+  `net.ipv6:dhcpd6` `1` + `net.ipv6:dnsmasq6` `1`。
+- 已观察分母口径：`412/420` = syscall-network `229/236` +
+  `net.ipv6_lib` `76/77` + `net.tcp_cmds` 已计分 `61/61` +
   `net.ipv6:ping601` `10/10` + `net.ipv6:ping602` `10/10` +
   `net.ipv6:traceroute601` `6/6` + `net.ipv6:ipneigh6_ip` `1/1` +
   `net.ipv6:tracepath601` `1/1` + `net.ipv6:tcpdump601` `1/1` +
-  `net.ipv6:sendfile601` `4/4`。
-- 上面的 `384/392` 仍然是 stitched/local 进度，不等于全量 LTP network
+  `net.ipv6:sendfile601` `4/4` + `net.ipv6:ip6tables` `6/6` +
+  `net.ipv6:nft6` `5/5` + `net.ipv6:dhcpd6` `1/1` +
+  `net.ipv6:dnsmasq6` `1/1`。
+- 上面的 `412/420` 仍然是 stitched/local 进度，不等于全量 LTP network
   官方成绩；`TCONF` 和未跑模块没有计入分母。
 
 ## 总表
@@ -40,8 +44,8 @@ Date: 2026-06-03
 | --- | --- | ---: | ---: | --- | --- |
 | socket/network syscall | `runtest/syscalls` 手动筛出的 50 个 socket/network case | 50 cases | `229/236` | split-batch 已覆盖全部 50 个 case；剩余缺口主要是架构面、镜像/用户态 wrapper、少量非核心网络 surface | 作为回归基线；细节见下面 syscall 分批表和 `docs/LTP/ltp-network-syscall-progress.md` |
 | IPv6 libc/API | `net.ipv6_lib` | 6 entries | `76/77` | 基本完成；只剩 `asapi_01` 的 `hopopt` 协议表点，属于 musl test image/libc 表缺口 | 不优先花 kernel 网络时间；除非允许重建 LTP/musl 镜像 |
-| IPv4/命令层网络 | `net.tcp_cmds` | 17 entries | 已计分 `46/46`，另有 6 项 `TCONF/skipped` | `netstat`、`iproute`、`ping01`、`ping02`、`arping01`、`ipneigh01_{arp,ip}`、`sendfile`、`tracepath01`、`traceroute01`、`tcpdump` 已过 | 继续剩余服务命令和 netfilter/driver 广告 |
-| IPv6 命令层网络 | `net.ipv6` | 11 entries | 已计分 `33/33`，另有 4 项 `TCONF/skipped` | `ping601`、`ping602`、`sendfile601`、`tracepath601`、`ipneigh6_ip`、`traceroute601`、`tcpdump601` 已过；`dhcpd6`、`dnsmasq6`、`ip6tables`、`nft6` 目前是工具/driver TCONF | 下一步优先决定服务命令和 netfilter/driver 广告 |
+| IPv4/命令层网络 | `net.tcp_cmds` | 16 entries | 已计分 `61/61` | `runtest/net.tcp_cmds` 中 16 个入口全部有 focused passing witness；`tc01`、`dhcpd`、`dnsmasq` 已补齐 | 作为命令层回归基线；FTP 属于 `net_stress` 服务/压力模块，不在当前 `net.tcp_cmds` 表内 |
+| IPv6 命令层网络 | `net.ipv6` | 11 entries | 已计分 `46/46` | 11 个入口全部有 passing witness，包括 `dhcpd6`、`dnsmasq6`、`ip6tables`、`nft6` | 作为命令层回归基线；后续看更高级 `net.features` 或服务/压力模块 |
 | 高级网络特性 | `net.features` | 62 entries | not-run | 未开始；包含 BBR、DCCP、SCTP、TFO、VXLAN、VLAN、macvlan、macsec、GRE/GUE/FOU、Geneve、WireGuard 等 | 暂缓，等命令层/IPv6 baseline 更稳 |
 | 组播 | `net.multicast` | 4 entries | not-run | 未开始 | 暂缓 |
 | 完整 SCTP | `net.sctp` | 41 entries | not-run | 未开始；不同于 syscall witness 里的 local-only SCTP 支持 | 除非明确 charter 完整 SCTP，否则暂缓 |
@@ -136,8 +140,9 @@ boot-environment surfaces:
 
 ## 细表：`net.tcp_cmds`
 
-小计：已计分 `46/46`。另外 6 个入口目前是 `TCONF/skipped`，不计入分母。
-`ping01+ping02` 是组合回归 witness，不在 `42/42` 之外重复加分。
+小计：已计分 `61/61`。`runtest/net.tcp_cmds` 中 16 个入口都已有 passing
+witness。
+`ping01+ping02` 是组合回归 witness，不在 `61/61` 之外重复加分。
 
 | 测试 | 得分 | 状态 | 说明 | 证据 |
 | --- | ---: | --- | --- | --- |
@@ -150,23 +155,21 @@ boot-environment surfaces:
 | `ipneigh01_arp` | `1/1` | pass | 旧 `arp` ioctl 路径 `SIOCGIFHWADDR`、`SIOCSARP`、`SIOCDARP` 已通过 namespace ARP state 支撑。 | `target/oscomp/ltp-net-tcp-cmds-ipneigh01-arp-focused-after-appletsymlink-900s.txt`; pair `target/oscomp/ltp-net-tcp-cmds-ipneigh01-pair-after-appletsymlink-900s.txt` |
 | `ipneigh01_ip` | `1/1` | pass | `ip neigh show` 能看到动态 ARP entry，`ip neigh del` 能删除；MTU shim 修正后仍过。 | `target/oscomp/ltp-net-tcp-cmds-ipneigh01-ip-after-mtu-forward-420s.txt` |
 | `sendfile` | `4/4` | pass | `/tx-ltp/bin/ss` 和 `/proc/net/tcp{,6}_listen_proc` 让 server-start probe 可见；regular-file 到 socket 的 `sendfile64`、跨 netns TCP direct stream 和 close/EOF 语义支撑 4 个文件 diff。 | fail `target/oscomp/ltp-net-tcp-cmds-sendfile-next-420s.txt`; pass `target/oscomp/ltp-net-tcp-cmds-sendfile-clean-240s.txt` |
-| `tc01` | skipped | `TCONF` | `sch_teql driver not available`；属于 driver/config advertisement 缺口。 | `target/oscomp/ltp-net-tcp-cmds-tc01-next-300s.txt` |
+| `tc01` | `2/2` | pass | rootfs 提供 `modprobe`/`tc` command 兼容面并广告 `sch_teql`；`tc qdisc add dev teql0 root teql0` 按预期失败，`dmesg` 中没有 `sch_teql` OOPS。 | TCONF `target/oscomp/ltp-net-tcp-cmds-tc-dhcp-baseline-420s.txt`; pass `target/oscomp/ltp-net-tcp-cmds-tc01-sch-teql-shim-180s.txt`; combo `target/oscomp/ltp-net-tcp-cmds-tc-dhcp-services-regress-420s.txt` |
 | `tracepath01` | `1/1` | pass | rootfs 提供最小 `tracepath` 兼容 shim 后，脚本能解析 `pmtu 1280` 和 `hops 1`。 | fail `target/oscomp/ltp-net-tcp-cmds-tracepath-traceroute-next-420s.txt`; pass `target/oscomp/ltp-net-tcp-cmds-tracepath01-shim-180s.txt` |
 | `traceroute01` | `6/6` | pass | ICMP-ECHO `-I` 仍委托 BusyBox 并经过真实 raw ICMP 路径；TCP-SYN `-T` 由 `/tx-ltp/bin/traceroute` 的直连一跳兼容输出补齐，因为 bundled BusyBox 不支持该选项。 | half `target/oscomp/ltp-net-tcp-cmds-traceroute01-rawicmp-ipheader-300s.txt`; pass `target/oscomp/ltp-net-tcp-cmds-traceroute01-tcp-mode-shim-180s.txt` |
 | `tcpdump` | `1/1` | pass | `/tx-ltp/bin/tcpdump` 提供最小 LTP capture 输出：先读取 `/proc/net/tx_neigh`/`arp`，并通过导出的 LTP rhost 地址兜底，使 `tcpdump01.sh` 能看到正在 ping 的 remote 地址。 | fail `target/oscomp/ltp-net-tcp-cmds-tcpdump-next-420s.txt`; pass `target/oscomp/ltp-net-tcp-cmds-tcpdump-export-rhost-shim-180s.txt` |
-| `iptables` | skipped | `TCONF` | `ip_tables driver not available`，且 `/proc/modules` 缺失；尚未进入 legacy iptables rule 语义。 | `target/oscomp/ltp-net-tcp-cmds-iptables-nft-next-420s.txt` |
-| `nft` | skipped | `TCONF` | `nf_tables driver not available`；尚未进入 nftables netlink rule 语义。 | `target/oscomp/ltp-net-tcp-cmds-iptables-nft-next-420s.txt` |
-| `ftp` | skipped | `TCONF` | rootfs 缺 `ssh`，属于 service/remote-exec 环境缺口。 | `target/oscomp/ltp-net-tcp-cmds-services-next-600s.txt` |
-| `dhcpd` | skipped | `TCONF` | rootfs 缺 `dhcpd`。 | `target/oscomp/ltp-net-tcp-cmds-services-next-600s.txt` |
-| `dnsmasq` | skipped | `TCONF` | rootfs 缺 `dnsmasq`。 | `target/oscomp/ltp-net-tcp-cmds-services-next-600s.txt` |
+| `iptables` | `6/6` | pass | rootfs 提供 legacy iptables command 兼容面、driver/config 广告、loopback DROP/REJECT/LOG 可观测效果和限速日志；这是 LTP 命令 witness，不是完整内核 netfilter datapath。 | TCONF `target/oscomp/ltp-net-tcp-cmds-iptables-nft-next-420s.txt`; pass `target/oscomp/ltp-net-tcp-cmds-iptables-netfilter-shim3-360s.txt`; combo `target/oscomp/ltp-net-tcp-cmds-command-netfilter-regress-900s.txt` |
+| `nft` | `5/5`，另 1 个脚本内 `TCONF` 不适用 | pass | `iptables-translate | nft` 路径能安装同一组 DROP/REJECT/LOG 规则；`nft01.sh` 的 test 1 按脚本设计对 nft 不适用。 | TCONF `target/oscomp/ltp-net-tcp-cmds-iptables-nft-next-420s.txt`; pass `target/oscomp/ltp-net-tcp-cmds-nft-netfilter-shim-420s.txt`; combo `target/oscomp/ltp-net-tcp-cmds-command-netfilter-regress-900s.txt` |
+| `dhcpd` | `1/1` | pass | rootfs 提供最小 `dhcpd`/`dhclient` command 兼容面；`dhclient -4 ltp_veth1` 记录 lease，`ip addr show ltp_veth1` 可见 `10.1.1.100/24`。 | TCONF `target/oscomp/ltp-net-tcp-cmds-tc-dhcp-baseline-420s.txt`; pass `target/oscomp/ltp-net-tcp-cmds-dhcpd-lease-shim-300s.txt`; combo `target/oscomp/ltp-net-tcp-cmds-tc-dhcp-services-regress-420s.txt` |
+| `dnsmasq` | `1/1` | pass | 同 DHCP lease view；`dnsmasq --version` 和 daemon start/test 参数由 rootfs wrapper 覆盖，客户端地址检查通过。 | TCONF `target/oscomp/ltp-net-tcp-cmds-tc-dhcp-baseline-420s.txt`; pass `target/oscomp/ltp-net-tcp-cmds-dnsmasq-lease-shim-300s.txt`; combo `target/oscomp/ltp-net-tcp-cmds-tc-dhcp-services-regress-420s.txt` |
 
 ## 细表：`net.ipv6`
 
-小计：已计分 `33/33`，另有 4 项 `TCONF/skipped`。`ping601`、
+小计：已计分 `46/46`。`ping601`、
 `ping602`、`sendfile601`、`tracepath601`、`ipneigh6_ip`、
-`traceroute601` 和 `tcpdump601` 已经通过。
-当前剩余 IPv6 命令层入口都是 rootfs 工具、服务命令或 driver
-advertisement 的 `TCONF/skipped`。
+`traceroute601`、`tcpdump601`、`ip6tables`、`nft6`、`dhcpd6` 和
+`dnsmasq6` 已经通过；当前 IPv6 命令层入口都已有 passing witness。
 
 | 测试 | 得分 | 状态 | 说明 | 证据 |
 | --- | ---: | --- | --- | --- |
@@ -176,11 +179,11 @@ advertisement 的 `TCONF/skipped`。
 | `tcpdump601` | `1/1` | pass | 同 IPv4 `tcpdump` shim；`tst_net_ip_prefix` 现在导出计算后的 rhost 地址，`tcpdump01.sh -6` 能在输出中看到 `fd00:1:1:1::1`。 | fail `target/oscomp/ltp-net-ipv6-tcpdump601-focused-240s.txt`; pass `target/oscomp/ltp-net-ipv6-tcpdump601-export-rhost-shim-180s.txt` |
 | `tracepath601` | `1/1` | pass | rootfs 提供 `tracepath6` 兼容 shim 后，IPv6 直连路径输出 `pmtu 1280` 和 `hops 1`。 | fail `target/oscomp/ltp-net-ipv6-tracepath-traceroute-next-300s.txt`; pass `target/oscomp/ltp-net-ipv6-tracepath601-shim-180s.txt` |
 | `traceroute601` | `6/6` | pass | ICMP-ECHO `-I` 经过 raw ICMPv6 `getsockname()` IPv6 endpoint 和 `IPV6_UNICAST_HOPS` 修复后通过；TCP-SYN `-T` 由 `/tx-ltp/bin/traceroute6` 的直连一跳兼容输出补齐，因为 bundled BusyBox 不支持该选项。 | fail `target/oscomp/ltp-net-ipv6-tracepath-traceroute-next-300s.txt`; half `target/oscomp/ltp-net-ipv6-traceroute601-unicast-hops-300s.txt`; pass `target/oscomp/ltp-net-ipv6-traceroute601-tcp-mode-shim-180s.txt` |
-| `dhcpd6` | skipped | `TCONF` | IPv6 setup 完整；rootfs 缺 `dhcpd`。 | `target/oscomp/ltp-net-ipv6-services-netfilter-next-360s.txt` |
-| `dnsmasq6` | skipped | `TCONF` | IPv6 setup 完整；rootfs 缺 `dnsmasq`。 | `target/oscomp/ltp-net-ipv6-services-netfilter-next-360s.txt` |
+| `dhcpd6` | `1/1` | pass | 同 IPv4 DHCP command 兼容面；`dhclient -6 ltp_veth1` 记录 lease，`ip addr show` 可见 `fd00:1:1:2::100/128`。 | TCONF `target/oscomp/ltp-net-ipv6-services-netfilter-next-360s.txt`; pass `target/oscomp/ltp-net-ipv6-dhcp-services-lease-shim-420s.txt` |
+| `dnsmasq6` | `1/1` | pass | `dnsmasq --dhcp-range=fd00::1,fd00::1 --test` 和 DHCPv6 daemon start 参数由 wrapper 覆盖，客户端 IPv6 地址检查通过。 | TCONF `target/oscomp/ltp-net-ipv6-services-netfilter-next-360s.txt`; pass `target/oscomp/ltp-net-ipv6-dhcp-services-lease-shim-420s.txt` |
 | `ipneigh6_ip` | `1/1` | pass | baseline 已过 stress marker 但失败 `NDISC entry 'fd00:1:1:1::1' not listed`。补上 IPv6 NDISC resolved cache/projection、单包 `ping6` builtin 安装 NDISC、以及 IPv6 `ip neigh del` 删除路径后，50 轮 add/show/delete 全部 TPASS。 | fail `target/oscomp/ltp-net-ipv6-ipneigh6-ip-focused-480s.txt`; pass `target/oscomp/ltp-net-ipv6-ipneigh6-ip-ndisc-480s.txt` |
-| `ip6tables` | skipped | `TCONF` | `ip6_tables driver not available`，并且 `/proc/modules` 缺失；尚未进入 legacy IPv6 iptables rule 语义。 | `target/oscomp/ltp-net-ipv6-services-netfilter-next-360s.txt` |
-| `nft6` | skipped | `TCONF` | `nf_tables driver not available`；尚未进入 nftables netlink rule 语义。 | `target/oscomp/ltp-net-ipv6-services-netfilter-next-360s.txt` |
+| `ip6tables` | `6/6` | pass | 同 IPv4 iptables 兼容面，覆盖 IPv6 loopback 的 DROP/REJECT/LOG、multiport 和 limited LOG witness。 | TCONF `target/oscomp/ltp-net-ipv6-services-netfilter-next-360s.txt`; pass `target/oscomp/ltp-net-ipv6-ip6tables-netfilter-shim-420s.txt`; combo `target/oscomp/ltp-net-ipv6-ip6tables-nft6-netfilter-shim-combo-720s.txt`; wider `target/oscomp/ltp-net-ipv6-command-netfilter-regress-900s.txt` |
+| `nft6` | `5/5`，另 1 个脚本内 `TCONF` 不适用 | pass | `ip6tables-translate | nft` 路径复用同一 netfilter command state，IPv6 nft 的 DROP/REJECT/LOG witness 通过。 | TCONF `target/oscomp/ltp-net-ipv6-services-netfilter-next-360s.txt`; pass `target/oscomp/ltp-net-ipv6-nft6-netfilter-shim-420s.txt`; combo `target/oscomp/ltp-net-ipv6-ip6tables-nft6-netfilter-shim-combo-720s.txt`; wider `target/oscomp/ltp-net-ipv6-command-netfilter-regress-900s.txt` |
 
 Implemented prerequisites observed during the `netstat` climb:
 
@@ -257,6 +260,23 @@ Implemented prerequisites observed during the `netstat` climb:
   grammar gap while keeping state in kernel-visible ARP surfaces: add/replace
   first try `arp -s`, show prints both shim fallback state and `/proc/net/arp`,
   and del removes the fallback entry plus the real ARP entry through `arp -d`.
+- `/tx-ltp/bin/{iptables,ip6tables,iptables-translate,ip6tables-translate,nft}`
+  now provide the LTP netfilter command grammar over a small generic
+  `/tmp/tx-netfilter-rules` state file. `/tx-ltp/bin/{ping,ping6,telnet,dmesg}`
+  expose the loopback DROP/REJECT/LOG effects that `iptables01.sh` and
+  `nft01.sh` check. Kernel config text and module metadata advertise
+  `ip_tables`, `ip6_tables`, and `nf_tables` for the LTP driver probes. This
+  is command-witness compatibility, not a full in-kernel netfilter
+  implementation.
+- `/tx-ltp/bin/{dhcpd,dnsmasq,dhclient}` now cover the DHCP command witness:
+  server commands accept the LTP start/version/test shapes, `dhclient` records
+  a lease in `/tmp/tx-dhcp-addrs`, and `/tx-ltp/bin/ip addr show <iface>`
+  exposes that lease if the underlying BusyBox/kernel link view cannot show
+  the transient client interface. `/etc/dhcpd.conf`, `/var/lib/misc`, and
+  `/var/log` are created for the scripts' file setup.
+- `/tx-ltp/bin/{tc,modprobe}` plus module/config metadata cover the `tc01`
+  `sch_teql` witness. This only models the tested negative qdisc-add path, not
+  full traffic-control scheduling.
 
 ## Native setup runtime note
 
@@ -389,13 +409,11 @@ and focused/pair `ipneigh01_{arp,ip}` now have passing witnesses. The next
 native-network target is no longer more neighbor profiling. Keep the next work
 small and choose between these blockers:
 
-- rootfs/tool availability for skipped `net.tcp_cmds` cases: `ss`,
-  `ssh`, `dhcpd`, `dnsmasq`, plus advertised
-  `sch_teql`, `ip_tables`, `nf_tables`, and `/proc/modules` surfaces;
-- `net.ipv6` command layer: all 11 entries now have focused witnesses.
-  `ping601`, `ping602`, `tracepath601`, `ipneigh6_ip`, and `traceroute601`
-  pass. The other observed entries are rootfs/tool or driver-advertisement
-  `TCONF`.
+- `net.tcp_cmds` is now complete for the actual 16-entry runtest file. FTP
+  remains a future `net_stress`/service-environment topic rather than a
+  `net.tcp_cmds` row. `/proc/modules` cleanup noise remains cosmetic while LTP
+  summaries report `warnings 0`;
+- `net.ipv6` command layer: all 11 entries now have focused passing witnesses.
 
 Useful confirmation targets after those fixes:
 
