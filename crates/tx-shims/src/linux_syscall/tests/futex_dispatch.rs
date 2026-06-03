@@ -10,7 +10,7 @@ use crate::linux_syscall::{
     FUTEX_WAKE_BITSET, FUTEX_WAKE_OP, NR_FUTEX,
 };
 use std::sync::Arc;
-use tx_substrate::wake::{TaskMailbox, TimerWheel};
+use tx_substrate::wake::{MailboxSchedulerHint, TaskMailbox, TimerWheel};
 
 const E_INVAL: i32 = 22;
 const E_AGAIN: i32 = 11;
@@ -176,6 +176,38 @@ fn dispatch_futex_wake_returns_n() {
     let req = SyscallRequest::new(NR_FUTEX, [uaddr, FUTEX_WAKE as u64, 3, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Return(0));
+}
+
+#[test]
+fn direct_trap_futex_wake_uses_wake_handoff_hint() {
+    let _setup = futex_setup();
+    let (proc_cap, thread) = fresh_proc_thread();
+    let mailbox = Arc::new(TaskMailbox::new());
+    let ctx = make_ctx(proc_cap.clone(), thread.clone()).with_mailbox(mailbox.clone());
+    let uaddr = map_user_futex_word(&ctx, 0x1234);
+
+    let wait_req = SyscallRequest::new(NR_FUTEX, [uaddr, FUTEX_WAIT as u64, 0x1234, 0, 0, 0]);
+    let waker = Waker::noop().clone();
+    let mut cx = Context::from_waker(&waker);
+    let mut wait = Box::pin(dispatch::<ShimsTestPmap>(wait_req, &ctx));
+    assert!(
+        matches!(wait.as_mut().poll(&mut cx), Poll::Pending),
+        "matching futex wait should park before the wake"
+    );
+
+    let wake_req = SyscallRequest::new(NR_FUTEX, [uaddr, FUTEX_WAKE as u64, 1, 0, 0, 0]);
+    let result = crate::linux_syscall::dispatch_direct_trap_oneshot(
+        &wake_req,
+        &proc_cap,
+        &thread,
+        &ctx.aspace,
+    );
+
+    assert_eq!(result, Some(SyscallResult::Return(1)));
+    assert_eq!(
+        mailbox.take_scheduler_hint(),
+        MailboxSchedulerHint::WakeHandoff
+    );
 }
 
 /// `futex(uaddr, FUTEX_REQUEUE, ...)` accepts a valid source and

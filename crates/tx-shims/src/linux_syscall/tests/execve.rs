@@ -340,6 +340,26 @@ fn dispatch_execve_non_elf_non_shebang_falls_back_to_bin_sh() {
     );
 }
 
+#[test]
+fn dispatch_execve_short_non_elf_non_shebang_falls_back_to_bin_sh() {
+    let _setup = execve_setup();
+
+    let bytes = b"/code/lmbench_src/bin/build/lmbench_all hello \"$@\"\n".to_vec();
+    assert!(bytes.len() < 64);
+    let (process, thread, _fs) = bootstrap_with_file(b"short-script", &bytes);
+    let ctx = make_ctx(process, thread);
+
+    let path: &[u8] = b"/short-script\0";
+    let req = SyscallRequest::new(NR_EXECVE, [path.as_ptr() as u64, 0, 0, 0, 0, 0]);
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(
+        result,
+        SyscallResult::Error(2),
+        "short wrapper scripts must reach the /bin/sh fallback before \
+         the ELF64 minimum-header rejection"
+    );
+}
+
 /// A path with no NUL terminator within `EXECVE_PATH_MAX = 4096`
 /// returns `-ENAMETOOLONG` (positive 36) — the bounded user-buffer
 /// copy short-circuits before any walker call.

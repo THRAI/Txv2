@@ -6,7 +6,7 @@
 //! injected `__PLATFORM_ADAPTER` manifest constant is present and
 //! well-formed.
 
-use tx_platform_adapter::platform_adapter;
+use tx_platform_adapter::{notification_adapter, platform_adapter};
 
 #[platform_adapter(
     platform = "substrate",
@@ -47,6 +47,34 @@ mod stacked_dual_platform {
     }
 }
 
+#[notification_adapter(
+    subsystem = "pipe",
+    domain = "readiness",
+    reason = "pipe notification.rs owns readable and writable wait masks and wake verbs"
+)]
+mod pipe_notification_boundary {
+    pub fn readable_mask() -> u64 {
+        1
+    }
+}
+
+#[platform_adapter(
+    platform = "substrate",
+    domain = "wait_routing",
+    apis = ["wake"],
+    reason = "pipe adapter exposes raw WaitSource primitives"
+)]
+#[notification_adapter(
+    subsystem = "pipe",
+    domain = "primitive_codes",
+    reason = "pipe adapter is allowed to bind primitive wait-code helpers"
+)]
+mod stacked_wait_boundary {
+    pub fn writable_mask() -> u64 {
+        2
+    }
+}
+
 #[test]
 fn injects_manifest_const_for_minimal_module() {
     let m = minimal_inline_module::__PLATFORM_ADAPTER_SUBSTRATE;
@@ -79,8 +107,26 @@ fn stacked_attributes_inject_per_platform_constants() {
 }
 
 #[test]
+fn notification_adapter_injects_manifest() {
+    let m = pipe_notification_boundary::__NOTIFICATION_ADAPTER;
+    assert!(m.contains("subsystem=pipe"));
+    assert!(m.contains("domain=readiness"));
+    assert!(m.contains("reason=pipe notification.rs owns readable"));
+}
+
+#[test]
+fn notification_adapter_can_stack_with_platform_adapter() {
+    let p = stacked_wait_boundary::__PLATFORM_ADAPTER_SUBSTRATE;
+    let n = stacked_wait_boundary::__NOTIFICATION_ADAPTER;
+    assert!(p.contains("platform=substrate") && p.contains("domain=wait_routing"));
+    assert!(n.contains("subsystem=pipe") && n.contains("domain=primitive_codes"));
+}
+
+#[test]
 fn original_module_items_still_visible() {
     assert_eq!(minimal_inline_module::_touch(), 7);
     assert_eq!(with_apis_list::_touch(), 7);
     assert_eq!(stacked_dual_platform::_touch(), 7);
+    assert_eq!(pipe_notification_boundary::readable_mask(), 1);
+    assert_eq!(stacked_wait_boundary::writable_mask(), 2);
 }

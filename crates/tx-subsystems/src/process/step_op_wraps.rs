@@ -60,6 +60,49 @@ fn fork_op_delegates_to_step_fork() {
 }
 
 #[test]
+fn clone_thread_op_delegates_to_step_clone_thread() {
+    let _g = setup();
+    let parent = bootstrap();
+    let mut parent_ctx = tx_hal::UserTrapContext::empty();
+    parent_ctx.pc = 0x4000_1000;
+    parent_ctx.regs[2] = 0x7000_0000;
+    parent_ctx.regs[4] = 0x6000_0000;
+
+    let stack = 0x7100_0000usize;
+    let tls = 0x6100_0000usize;
+    let ctid_ptr = 0x8100_0000u64;
+    let mut op = CloneThreadOp {
+        process: &parent,
+        parent_user_ctx: &parent_ctx,
+        stack,
+        tls,
+        ctid_ptr,
+    };
+    let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
+    let outcome = op.step(&mut ctx);
+
+    match outcome {
+        StepOutcome::Done(result) => {
+            let child = result.expect("clone thread should succeed");
+            assert_eq!(parent.live_thread_count(), 2);
+            assert_ne!(child.tid.0, parent.pid.0);
+            let saved = child
+                .payload_cap()
+                .expect("fresh child has payload")
+                .saved_user_context()
+                .expect("seed installs context");
+            assert_eq!(saved.regs[10], 0);
+            #[cfg(not(target_arch = "loongarch64"))]
+            {
+                assert_eq!(saved.regs[2], stack);
+                assert_eq!(saved.regs[4], tls);
+            }
+        }
+        _ => panic!("expected Done(_), got non-Done outcome"),
+    }
+}
+
+#[test]
 fn exit_group_op_delegates_to_step_exit_group() {
     let _g = setup();
     let parent = bootstrap();

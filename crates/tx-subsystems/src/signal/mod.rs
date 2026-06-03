@@ -33,12 +33,12 @@ use core::sync::atomic::{AtomicU64, Ordering};
 pub mod adapter;
 
 use adapter::step_engine::{
-    self, Cap, Guard, NoProgress, OneShotStepOp, OperationalCapExt, ScriptCtx, SignalRouting,
-    SpinMutex, StepOp, StepOutcome, SubjectIdentity,
+    self, Cap, Guard, NoProgress, OneShotStepOp, OperationalCapExt, PayloadCap, ScriptCtx,
+    SignalRouting, SpinMutex, StepOp, StepOutcome, SubjectIdentity,
 };
 
 use crate::execution::Errno;
-use crate::process::structure::{ProcessGroup, ProcessIdentity, SIGNAL_GENERATED};
+use crate::process::structure::{ProcessGroup, ProcessIdentity, ProcessPayload, SIGNAL_GENERATED};
 use crate::thread_runtime::execution::{post_signal, post_signal_mailbox};
 
 /// POSIX signal number, 1..=64.
@@ -509,6 +509,44 @@ pub enum PendingSource {
     Group,
 }
 
+#[cfg(any(test, tx_signal_select_metrics))]
+pub(crate) const SIGNAL_SELECT_TRACE_NAMES: &[&[u8]] = &[
+    b"debug.signal.select.thread1.lock.request",
+    b"debug.signal.select.thread1.lock.acquired",
+    b"debug.signal.select.thread1.lock.release",
+    b"debug.signal.select.owner.upgrade.request",
+    b"debug.signal.select.owner.upgrade.done",
+    b"debug.signal.select.owner.upgrade.miss",
+    b"debug.signal.select.proc.lock.request",
+    b"debug.signal.select.proc.lock.acquired",
+    b"debug.signal.select.proc.lock.release",
+    b"debug.signal.select.thread2.lock.request",
+    b"debug.signal.select.thread2.lock.acquired",
+    b"debug.signal.select.thread2.lock.release",
+    b"debug.signal.select.thread_pending.hit",
+    b"debug.signal.select.group_pending.hit",
+    b"debug.signal.select.done",
+];
+
+fn emit_signal_select_trace(name: &[u8], value: i64) {
+    #[cfg(tx_signal_select_metrics)]
+    {
+        let _ = value;
+        if let Some(observer) = tx_observe::current() {
+            debug_assert!(SIGNAL_SELECT_TRACE_NAMES.contains(&name));
+            observer.counter(
+                tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+                value,
+            );
+        }
+    }
+    #[cfg(not(tx_signal_select_metrics))]
+    {
+        let _ = name;
+        let _ = value;
+    }
+}
+
 /// Lowest deliverable signum on a thread per `SIGNAL_v1` §14.
 ///
 /// Selection order: thread-directed pending first (lowest signum),
@@ -520,36 +558,138 @@ pub enum PendingSource {
 pub fn select_next_signal(
     thread: &Cap<crate::thread_runtime::ThreadIdentity>,
 ) -> Option<(Signum, PendingSource)> {
+    emit_signal_select_trace(b"debug.signal.select.thread1.lock.request", 1);
     let payload_guard = thread.payload.lock();
-    let payload = payload_guard.as_ref()?;
+    emit_signal_select_trace(b"debug.signal.select.thread1.lock.acquired", 1);
+    let Some(payload) = payload_guard.as_ref() else {
+        emit_signal_select_trace(b"debug.signal.select.thread1.lock.release", 0);
+        drop(payload_guard);
+        emit_signal_select_trace(b"debug.signal.select.done", 0);
+        return None;
+    };
     let mask = payload.signal_mask();
 
     // Thread-directed pending first.
     let t_deliverable = payload.pending().deliverable_bits(mask);
     if let Some(sig) = lowest_signum_bit(t_deliverable) {
+        emit_signal_select_trace(b"debug.signal.select.thread_pending.hit", sig.raw() as i64);
+        emit_signal_select_trace(b"debug.signal.select.thread1.lock.release", 1);
+        drop(payload_guard);
+        emit_signal_select_trace(b"debug.signal.select.done", 1);
         return Some((sig, PendingSource::Thread));
     }
+    emit_signal_select_trace(b"debug.signal.select.thread1.lock.release", 2);
     drop(payload_guard);
 
     // Group-directed pending next.
     let guard = step_engine::guard();
-    let proc = thread.owner_proc.upgrade(&guard)?;
+    emit_signal_select_trace(b"debug.signal.select.owner.upgrade.request", 1);
+    let proc = thread.owner_proc.upgrade(&guard);
+    emit_signal_select_trace(b"debug.signal.select.owner.upgrade.done", 1);
+    let Some(proc) = proc else {
+        emit_signal_select_trace(b"debug.signal.select.owner.upgrade.miss", 1);
+        drop(guard);
+        emit_signal_select_trace(b"debug.signal.select.done", 0);
+        return None;
+    };
     drop(guard);
 
+    emit_signal_select_trace(b"debug.signal.select.proc.lock.request", 1);
     let proc_payload_guard = proc.payload.lock();
-    let proc_payload = proc_payload_guard.as_ref()?;
+    emit_signal_select_trace(b"debug.signal.select.proc.lock.acquired", 1);
+    let Some(proc_payload) = proc_payload_guard.as_ref() else {
+        emit_signal_select_trace(b"debug.signal.select.proc.lock.release", 0);
+        drop(proc_payload_guard);
+        emit_signal_select_trace(b"debug.signal.select.done", 0);
+        return None;
+    };
 
     // Mask check uses the same per-thread mask (re-read in case it
     // changed between blocks; cheap).
-    let mask = thread
-        .payload
-        .lock()
+    emit_signal_select_trace(b"debug.signal.select.thread2.lock.request", 1);
+    let thread_payload_guard = thread.payload.lock();
+    emit_signal_select_trace(b"debug.signal.select.thread2.lock.acquired", 1);
+    let mask = thread_payload_guard
         .as_ref()
         .map(|p| p.signal_mask())
         .unwrap_or(SignalMask::EMPTY);
+    emit_signal_select_trace(b"debug.signal.select.thread2.lock.release", 1);
+    drop(thread_payload_guard);
 
     let g_deliverable = proc_payload.group_pending().deliverable_bits(mask);
-    lowest_signum_bit(g_deliverable).map(|sig| (sig, PendingSource::Group))
+    let result = lowest_signum_bit(g_deliverable).map(|sig| {
+        emit_signal_select_trace(b"debug.signal.select.group_pending.hit", sig.raw() as i64);
+        (sig, PendingSource::Group)
+    });
+    emit_signal_select_trace(b"debug.signal.select.proc.lock.release", 1);
+    drop(proc_payload_guard);
+    emit_signal_select_trace(
+        b"debug.signal.select.done",
+        if result.is_some() { 2 } else { 0 },
+    );
+    result
+}
+
+fn refresh_deliverable_signal_summary_fast(
+    thread: &Cap<crate::thread_runtime::ThreadIdentity>,
+) -> bool {
+    let Some(payload) = thread.payload_cap() else {
+        return false;
+    };
+    refresh_deliverable_signal_summary_with_payload(thread, &payload)
+}
+
+pub(crate) fn refresh_deliverable_signal_summary_with_payload(
+    thread: &Cap<crate::thread_runtime::ThreadIdentity>,
+    payload: &PayloadCap<crate::thread_runtime::ThreadPayload>,
+) -> bool {
+    let mask = payload.signal_mask();
+    let t_deliverable = payload.pending().deliverable_bits(mask);
+    let g_hint_deliverable = payload.group_pending_summary() & !mask.raw_bits();
+    if t_deliverable == 0 && g_hint_deliverable == 0 {
+        payload.update_summary(|s| s.deliverable_signal = false);
+        return false;
+    }
+
+    let deliverable = select_next_signal(thread).is_some();
+    payload.update_summary(|s| s.deliverable_signal = deliverable);
+    deliverable
+}
+
+fn sync_group_pending_summaries(
+    process_payload: &ProcessPayload,
+    wake_sig: Option<Signum>,
+) -> bool {
+    let group_pending = process_payload.group_pending_snapshot();
+    let mut touched = false;
+    for thread in process_payload.threads.snapshot() {
+        if let Some(thread_payload) = sync_thread_group_pending_summary(process_payload, &thread) {
+            if let Some(sig) = wake_sig {
+                if (group_pending & sig.bit()) != 0 && !thread_payload.signal_mask().is_blocked(sig)
+                {
+                    post_signal_mailbox(&thread_payload, sig, SignalRouting::ProcessDirected);
+                }
+            }
+            touched = true;
+        }
+    }
+    touched
+}
+
+pub(crate) fn sync_thread_group_pending_summary(
+    process_payload: &ProcessPayload,
+    thread: &Cap<crate::thread_runtime::ThreadIdentity>,
+) -> Option<
+    crate::thread_runtime::adapter::step_engine::PayloadCap<crate::thread_runtime::ThreadPayload>,
+> {
+    let thread_payload = thread.upgrade_operational().ok()?;
+    let mask = thread_payload.signal_mask();
+    let group_pending = process_payload.group_pending_snapshot();
+    let deliverable = thread_payload.pending().deliverable_bits(mask) != 0
+        || (group_pending & !mask.raw_bits()) != 0;
+    thread_payload.store_group_pending_summary(group_pending);
+    thread_payload.update_summary(|s| s.deliverable_signal = deliverable);
+    Some(thread_payload)
 }
 
 /// Refresh the denormalised interrupt-summary deliverability bit from
@@ -561,11 +701,15 @@ pub fn select_next_signal(
 pub fn refresh_deliverable_signal_summary(
     thread: &Cap<crate::thread_runtime::ThreadIdentity>,
 ) -> bool {
-    let deliverable = select_next_signal(thread).is_some();
-    if let Some(payload) = thread.payload_cap() {
-        payload.update_summary(|s| s.deliverable_signal = deliverable);
-    }
-    deliverable
+    refresh_deliverable_signal_summary_fast(thread)
+}
+
+pub(crate) fn post_group_pending_signal(process: &Cap<ProcessIdentity>, sig: Signum) -> bool {
+    let Ok(payload) = process.upgrade_operational() else {
+        return false;
+    };
+    payload.group_pending().post(sig);
+    sync_group_pending_summaries(&payload, Some(sig))
 }
 
 fn lowest_signum_bit(bits: u64) -> Option<Signum> {
@@ -630,6 +774,9 @@ pub fn ast_check(thread: &Cap<crate::thread_runtime::ThreadIdentity>) -> AstOutc
     if summary.termination {
         return AstOutcome::InitiateTermination;
     }
+    if !summary.deliverable_signal && !summary.stop_requested {
+        return AstOutcome::Continue;
+    }
 
     let guard = step_engine::guard();
     let Some(proc) = thread.owner_proc.upgrade(&guard) else {
@@ -653,6 +800,7 @@ pub fn ast_check(thread: &Cap<crate::thread_runtime::ThreadIdentity>) -> AstOutc
                     return AstOutcome::Continue;
                 };
                 proc_payload.group_pending().clear(sig);
+                sync_group_pending_summaries(&proc_payload, None);
             }
         }
         refresh_deliverable_signal_summary(thread);
@@ -1098,9 +1246,7 @@ pub fn step_kill_pgrp(pgrp: &Cap<ProcessGroup>, sig: Signum) -> usize {
             // delivery step can recognise group-targeted posts.
             // Gewalt bypasses pending queues entirely.
             if catchable {
-                if let Ok(payload) = member.upgrade_operational() {
-                    payload.group_pending().post(sig);
-                }
+                post_group_pending_signal(member, sig);
             }
             delivered += 1;
         }
@@ -1274,9 +1420,7 @@ pub(crate) fn script_kill_pgrp_with_guard(
             // signals (SIGKILL/SIGSTOP/SIGCONT) bypass pending
             // queues entirely per SIGNAL_v1 §2 Consequence 2.
             if !is_gewalt(sig) {
-                if let Ok(payload) = member.upgrade_operational() {
-                    payload.group_pending().post(sig);
-                }
+                post_group_pending_signal(member, sig);
             }
             delivered += 1;
         }

@@ -1,7 +1,7 @@
 //! Thread-runtime execution: thread-exit step, signal-mask updates,
 //! and the internal helpers used by the signal shim.
 
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use tx_hal::{UserPtr, UserTrapContext};
 
@@ -9,12 +9,93 @@ use crate::thread_runtime::adapter::step_engine::{
     self, Cap, MailboxEvent, OneShotStepOp, OperationalCapExt, PayloadCap, SignalRouting,
 };
 
-use crate::futex::step_futex_wake_in;
-use crate::signal::{refresh_deliverable_signal_summary, SignalMask, Signum};
+use crate::futex::step_futex_lifecycle_wake_in;
+use crate::signal::{refresh_deliverable_signal_summary_with_payload, SignalMask, Signum};
 use crate::thread_runtime::structure::{
     drain_pending_syscall_return, ThreadIdentity, ThreadPayload,
 };
 // UserAccessIf trait not needed — copy_to_user is inherent on AddressSpace
+
+static CLEAR_CHILD_TID_WAKE_SAMPLE: AtomicU64 = AtomicU64::new(0);
+static THREAD_EXIT_PHASE_SAMPLE: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) const THREAD_RUNTIME_LOCK_SERVICE_TRACE_NAMES: &[&[u8]] = &[
+    b"debug.lock_service.thread.payload.sigprocmask.payload_lock_wait.duration_ns",
+    b"debug.lock_service.thread.payload.sigprocmask.payload_lock_held.duration_ns",
+    b"debug.lock_service.thread.payload.sigprocmask.payload_cap_clone.duration_ns",
+    b"debug.lock_service.thread.payload.sigprocmask.payload_missing",
+    b"debug.lock_service.thread.payload.sigprocmask.mask_compute.duration_ns",
+    b"debug.lock_service.thread.payload.sigprocmask.mask_noop",
+    b"debug.lock_service.thread.payload.sigprocmask.mask_store.duration_ns",
+    b"debug.lock_service.thread.payload.sigprocmask.refresh.duration_ns",
+];
+
+#[inline(always)]
+fn emit_thread_lock_service_trace(name: &'static [u8], value: i64) {
+    let known_names = THREAD_RUNTIME_LOCK_SERVICE_TRACE_NAMES;
+    debug_assert!(known_names.contains(&name));
+    #[cfg(tx_sigprocmask_phase_metrics)]
+    {
+        if let Some(observer) = tx_observe::current() {
+            observer.counter(
+                tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+                value,
+            );
+        }
+    }
+    #[cfg(not(tx_sigprocmask_phase_metrics))]
+    {
+        let _ = value;
+    }
+}
+
+#[inline(always)]
+fn measure_thread_lock_service<R>(name: &'static [u8], f: impl FnOnce() -> R) -> R {
+    let known_names = THREAD_RUNTIME_LOCK_SERVICE_TRACE_NAMES;
+    debug_assert!(known_names.contains(&name));
+    #[cfg(tx_sigprocmask_phase_metrics)]
+    {
+        let start = tx_observe::clock_now_ns();
+        let result = f();
+        let duration = tx_observe::clock_now_ns().saturating_sub(start);
+        emit_thread_lock_service_trace(name, duration.min(i64::MAX as u64) as i64);
+        result
+    }
+    #[cfg(not(tx_sigprocmask_phase_metrics))]
+    {
+        f()
+    }
+}
+
+fn clear_child_tid_debug_sample() -> bool {
+    let n = CLEAR_CHILD_TID_WAKE_SAMPLE.fetch_add(1, Ordering::Relaxed) + 1;
+    n <= 128 || n % 256 == 0
+}
+
+fn emit_clear_child_tid_debug(name: &[u8], value: i64) {
+    if let Some(observer) = tx_observe::current() {
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            value,
+        );
+        tx_observe::dump_registered_if_requested();
+    }
+}
+
+fn thread_exit_debug_sample() -> bool {
+    let n = THREAD_EXIT_PHASE_SAMPLE.fetch_add(1, Ordering::Relaxed) + 1;
+    n <= 128 || n % 256 == 0
+}
+
+fn emit_thread_exit_debug(name: &[u8], value: i64) {
+    if let Some(observer) = tx_observe::current() {
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            value,
+        );
+        tx_observe::dump_registered_if_requested();
+    }
+}
 
 /// Best-effort `MailboxEvent::SignalDelivered` post to a thread
 /// payload's bound mailbox per D9-A.
@@ -85,6 +166,10 @@ pub fn mark_thread_zombie_for_test(thread: &Cap<ThreadIdentity>, status: i32) {
 /// the last thread.
 pub fn step_thread_exit(thread: Cap<ThreadIdentity>, status: i32) {
     let mut group_exit_completed = false;
+    let trace = thread_exit_debug_sample();
+    if trace {
+        emit_thread_exit_debug(b"debug.thread_exit.enter", thread.tid.0 as i64);
+    }
     // Snapshot clear_child_tid and robust-list BEFORE
     // set_thread_zombie drops the thread payload.
     let ctid = thread
@@ -97,6 +182,9 @@ pub fn step_thread_exit(thread: Cap<ThreadIdentity>, status: i32) {
         let len = *p.robust_list_len.lock();
         head.map(|h| (h, len))
     });
+    if trace {
+        emit_thread_exit_debug(b"debug.thread_exit.snapshot.after", thread.tid.0 as i64);
+    }
 
     // observe
     // upgrade
@@ -104,36 +192,61 @@ pub fn step_thread_exit(thread: Cap<ThreadIdentity>, status: i32) {
     // commit
     // publish
     set_thread_zombie(&thread, status);
+    if trace {
+        emit_thread_exit_debug(b"debug.thread_exit.zombie.after", thread.tid.0 as i64);
+    }
 
     let guard = crate::thread_runtime::adapter::step_engine::guard();
     let Some(parent) = thread.owner_proc.upgrade(&guard) else {
         return;
     };
     drop(guard);
+    if trace {
+        emit_thread_exit_debug(b"debug.thread_exit.parent.after", thread.tid.0 as i64);
+    }
 
     let payload_guard = parent.payload.lock();
     let Some(payload) = payload_guard.as_ref() else {
         return;
     };
 
-    payload.threads.retain(|t| t.key() != thread.key());
-    let prev = payload
-        .thread_count
-        .fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
+    let _removed = crate::process::execution::measure_process_lock_service(
+        b"debug.lock_service.process.payload.thread_exit.threads_detach.duration_ns",
+        || payload.threads.detach(&thread),
+    );
+    if trace {
+        emit_thread_exit_debug(b"debug.thread_exit.retain.after", thread.tid.0 as i64);
+    }
+    let prev = crate::process::execution::measure_process_lock_service(
+        b"debug.lock_service.process.payload.thread_exit.thread_count.duration_ns",
+        || {
+            payload
+                .thread_count
+                .fetch_sub(1, core::sync::atomic::Ordering::AcqRel)
+        },
+    );
     let new_count = prev.saturating_sub(1);
+    if trace {
+        emit_thread_exit_debug(b"debug.thread_exit.count.after", thread.tid.0 as i64);
+    }
 
     // GroupExit coordination (PROCESS_v1 §5): if the owning process
     // has an active group-exit episode (exit_group or multi-threaded
     // execve), decrement the remaining_threads counter. The
     // initiating thread is not counted here.
-    if let Some(ref ge) = *payload.group_exit.lock() {
-        let prev_remaining = ge
-            .remaining_threads
-            .fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
-        if prev_remaining == 1 {
-            group_exit_completed = true;
-        }
-    }
+    crate::process::execution::measure_process_lock_service(
+        b"debug.lock_service.process.payload.thread_exit.group_exit.duration_ns",
+        || {
+            if let Some(ref ge) = *payload.group_exit.lock() {
+                let prev_remaining = ge
+                    .remaining_threads
+                    .fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
+                if prev_remaining == 1 {
+                    group_exit_completed = true;
+                }
+            }
+        },
+    );
 
     let was_last = new_count == 0;
     drop(payload_guard);
@@ -172,12 +285,18 @@ pub fn step_thread_exit(thread: Cap<ThreadIdentity>, status: i32) {
         }
         drop(guard);
     }
+    if trace {
+        emit_thread_exit_debug(b"debug.thread_exit.ctid.after", thread.tid.0 as i64);
+    }
 
     // robust-list walk: mark each robust futex as FUTEX_OWNER_DIED
     // and issue FUTEX_WAKE. Best-effort — if the userspace pages
     // are unmapped or the list is malformed, skip the entry.
     if let Some((head, _len)) = robust {
         walk_robust_list(&thread, head, 16);
+    }
+    if trace {
+        emit_thread_exit_debug(b"debug.thread_exit.robust.after", thread.tid.0 as i64);
     }
 
     if thread
@@ -186,7 +305,10 @@ pub fn step_thread_exit(thread: Cap<ThreadIdentity>, status: i32) {
         .map(|proc| proc.pid.0 != thread.tid.0)
         .unwrap_or(true)
     {
-        crate::process::numbers::unregister_pid_number(thread.tid.0 as u64);
+        crate::process::numbers::unregister_tid_number(thread.tid.0 as u64);
+    }
+    if trace {
+        emit_thread_exit_debug(b"debug.thread_exit.end", thread.tid.0 as i64);
     }
 }
 
@@ -196,7 +318,30 @@ fn clear_and_wake_child_tid(
     guard: &step_engine::Guard<'_>,
 ) {
     let _ = aspace.copy_to_user(UserPtr::<u8>::new(tid_ptr as usize), &[0u8; 4], guard);
-    step_futex_wake_in(aspace, tid_ptr, 1, guard);
+    let trace = clear_child_tid_debug_sample();
+    if trace {
+        emit_clear_child_tid_debug(b"debug.futex.clear_child_tid.uaddr", tid_ptr as i64);
+    }
+    match step_futex_lifecycle_wake_in(aspace, tid_ptr, 1, guard) {
+        step_engine::StepOutcome::Done(woken) => {
+            if trace {
+                emit_clear_child_tid_debug(b"debug.futex.clear_child_tid.woken", i64::from(woken));
+            }
+        }
+        step_engine::StepOutcome::Err(errno) => {
+            if trace {
+                emit_clear_child_tid_debug(
+                    b"debug.futex.clear_child_tid.err",
+                    i64::from(errno as i32),
+                );
+            }
+        }
+        step_engine::StepOutcome::Yield { .. } | step_engine::StepOutcome::Continue { .. } => {
+            if trace {
+                emit_clear_child_tid_debug(b"debug.futex.clear_child_tid.pending", 1);
+            }
+        }
+    }
 }
 
 /// Best-effort robust-list walk on thread exit.
@@ -223,33 +368,51 @@ fn walk_robust_list(thread: &Cap<ThreadIdentity>, head: u64, _offset: u64) {
     };
     let aspace = payload.aspace_cap();
 
-    let Some(first) = read_user_u64(&aspace, head, &guard) else {
-        return;
-    };
-    let Some(futex_offset) = read_user_i64(&aspace, head + 8, &guard) else {
-        return;
-    };
-    let Some(pending) = read_user_u64(&aspace, head + 16, &guard) else {
+    let Some((first, futex_offset, pending)) =
+        crate::process::execution::measure_process_lock_service(
+            b"debug.lock_service.process.payload.robust.head_reads.duration_ns",
+            || {
+                let first = read_user_u64(&aspace, head, &guard)?;
+                let futex_offset = read_user_i64(&aspace, head + 8, &guard)?;
+                let pending = read_user_u64(&aspace, head + 16, &guard)?;
+                Some((first, futex_offset, pending))
+            },
+        )
+    else {
         return;
     };
 
     let mut entry = first;
-    for _ in 0..2048 {
-        if entry == 0 || entry == head {
-            break;
-        }
-        mark_robust_entry_owner_died(&aspace, entry, futex_offset, &guard);
-        let Some(next) = read_user_u64(&aspace, entry, &guard) else {
-            break;
-        };
-        if next == entry {
-            break;
-        }
-        entry = next;
-    }
+    let mut entry_count = 0usize;
+    crate::process::execution::measure_process_lock_service(
+        b"debug.lock_service.process.payload.robust.entries.duration_ns",
+        || {
+            for _ in 0..2048 {
+                if entry == 0 || entry == head {
+                    break;
+                }
+                mark_robust_entry_owner_died(&aspace, entry, futex_offset, &guard);
+                entry_count += 1;
+                let Some(next) = read_user_u64(&aspace, entry, &guard) else {
+                    break;
+                };
+                if next == entry {
+                    break;
+                }
+                entry = next;
+            }
+        },
+    );
+    crate::process::execution::emit_process_lock_service_trace(
+        b"debug.lock_service.process.payload.robust.entry_count",
+        entry_count.min(i64::MAX as usize) as i64,
+    );
 
     if pending != 0 {
-        mark_robust_entry_owner_died(&aspace, pending, futex_offset, &guard);
+        crate::process::execution::measure_process_lock_service(
+            b"debug.lock_service.process.payload.robust.pending.duration_ns",
+            || mark_robust_entry_owner_died(&aspace, pending, futex_offset, &guard),
+        );
     }
 
     drop(guard);
@@ -304,7 +467,7 @@ fn mark_robust_entry_owner_died(
         &new.to_ne_bytes(),
         guard,
     );
-    step_futex_wake_in(aspace, futex_addr, 1, guard);
+    step_futex_lifecycle_wake_in(aspace, futex_addr, 1, guard);
 }
 
 /// Outcome of `step_sigprocmask`. `Replaced` is the normal path;
@@ -340,20 +503,71 @@ pub fn step_sigprocmask(
     // reserve
     // commit
     // publish
-    let Ok(payload) = thread.upgrade_operational() else {
+    #[cfg(tx_sigprocmask_phase_metrics)]
+    let payload_result = {
+        let lock_start = tx_observe::clock_now_ns();
+        let payload_guard = thread.payload.lock();
+        let acquired = tx_observe::clock_now_ns();
+        emit_thread_lock_service_trace(
+            b"debug.lock_service.thread.payload.sigprocmask.payload_lock_wait.duration_ns",
+            acquired.saturating_sub(lock_start).min(i64::MAX as u64) as i64,
+        );
+        let clone_start = tx_observe::clock_now_ns();
+        let payload = payload_guard.as_ref().cloned();
+        let clone_done = tx_observe::clock_now_ns();
+        emit_thread_lock_service_trace(
+            b"debug.lock_service.thread.payload.sigprocmask.payload_cap_clone.duration_ns",
+            clone_done.saturating_sub(clone_start).min(i64::MAX as u64) as i64,
+        );
+        drop(payload_guard);
+        let released = tx_observe::clock_now_ns();
+        emit_thread_lock_service_trace(
+            b"debug.lock_service.thread.payload.sigprocmask.payload_lock_held.duration_ns",
+            released.saturating_sub(acquired).min(i64::MAX as u64) as i64,
+        );
+        payload.ok_or(crate::thread_runtime::adapter::step_engine::Dead)
+    };
+    #[cfg(not(tx_sigprocmask_phase_metrics))]
+    let payload_result = thread.upgrade_operational();
+
+    let Ok(payload) = payload_result else {
+        emit_thread_lock_service_trace(
+            b"debug.lock_service.thread.payload.sigprocmask.payload_missing",
+            1,
+        );
         return SigprocmaskChange::ZombieIgnored;
     };
-    let prev_bits = payload.signal_mask.load(Ordering::Acquire);
-    let prev = SignalMask::new(prev_bits);
-    let new_bits = match how {
-        SigmaskHow::SetMask => next.raw_bits(),
-        SigmaskHow::Block => prev_bits | next.raw_bits(),
-        SigmaskHow::Unblock => prev_bits & !next.raw_bits(),
-    };
+    let (prev, new_bits) = measure_thread_lock_service(
+        b"debug.lock_service.thread.payload.sigprocmask.mask_compute.duration_ns",
+        || {
+            let prev_bits = payload.signal_mask.load(Ordering::Acquire);
+            let prev = SignalMask::new(prev_bits);
+            let new_bits = match how {
+                SigmaskHow::SetMask => next.raw_bits(),
+                SigmaskHow::Block => prev_bits | next.raw_bits(),
+                SigmaskHow::Unblock => prev_bits & !next.raw_bits(),
+            };
+            (prev, new_bits)
+        },
+    );
     let new = SignalMask::new(new_bits);
-    payload.signal_mask.store(new.raw_bits(), Ordering::Release);
+    if new.raw_bits() == prev.raw_bits() {
+        emit_thread_lock_service_trace(
+            b"debug.lock_service.thread.payload.sigprocmask.mask_noop",
+            1,
+        );
+        return SigprocmaskChange::Replaced { prev, new };
+    }
 
-    refresh_deliverable_signal_summary(thread);
+    measure_thread_lock_service(
+        b"debug.lock_service.thread.payload.sigprocmask.mask_store.duration_ns",
+        || payload.signal_mask.store(new.raw_bits(), Ordering::Release),
+    );
+
+    measure_thread_lock_service(
+        b"debug.lock_service.thread.payload.sigprocmask.refresh.duration_ns",
+        || refresh_deliverable_signal_summary_with_payload(thread, &payload),
+    );
 
     SigprocmaskChange::Replaced { prev, new }
 }

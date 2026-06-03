@@ -5,6 +5,37 @@
 
 use super::*;
 
+/// Private txKernel debug syscall: enable and start a bounded observe trace.
+pub(super) fn sys_tx_observe_begin(args: [u64; 6]) -> SyscallResult {
+    let threshold = args[0];
+    if threshold == 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    tx_subsystems::vm::reset_debug_phase_totals();
+    tx_observe::set_enabled(true);
+    tx_observe::reset_ring_and_arm(threshold);
+    SyscallResult::Return(0)
+}
+
+/// Private txKernel debug syscall: start an unbounded observe trace window.
+pub(super) fn sys_tx_observe_trace_on() -> SyscallResult {
+    tx_subsystems::vm::reset_debug_phase_totals();
+    tx_observe::set_enabled(true);
+    tx_observe::reset_ring_and_arm(0);
+    SyscallResult::Return(0)
+}
+
+/// Private txKernel debug syscall: stop tracing and request a trace dump.
+pub(super) fn sys_tx_observe_trace_off() -> SyscallResult {
+    tx_observe::set_enabled(false);
+    if tx_observe::trace_off_requests_dump() {
+        tx_observe::request_dump();
+    } else {
+        tx_observe::clear_dump_request();
+    }
+    SyscallResult::Return(0)
+}
+
 /// `getrandom(buf, buflen, flags)` — Linux RV64 generic ABI
 /// `__NR_getrandom = 278`.
 ///
@@ -135,6 +166,14 @@ pub(super) fn sys_prlimit64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
         }
     }
     SyscallResult::Return(0)
+}
+
+pub(super) fn sys_getrlimit<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    sys_prlimit64([0, args[0], 0, args[1], 0, 0], ctx)
+}
+
+pub(super) fn sys_setrlimit<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    sys_prlimit64([0, args[0], args[1], 0, 0, 0], ctx)
 }
 
 #[repr(C)]

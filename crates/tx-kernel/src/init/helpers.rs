@@ -18,8 +18,12 @@ impl<P: TxPlatform> SmpRescheduleSignal<P> {
 }
 
 impl<P: TxPlatform> boot_runtime::RescheduleSignal for SmpRescheduleSignal<P> {
-    fn send_reschedule_ipi(&mut self, target_hart: boot_runtime::HartId) {
+    fn send_reschedule_ipi(&mut self, target_hart: boot_runtime::HartId) -> bool {
+        if crate::init::boot_reactor_hart_is_polling_idle(target_hart) {
+            return false;
+        }
         <P as tx_hal::SmpIf>::send_ipi(CpuId(target_hart.0), IpiKind::Reschedule);
+        true
     }
 }
 

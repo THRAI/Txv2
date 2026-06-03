@@ -7,14 +7,15 @@
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
+use crate::adapter::step_engine::ByteProgress;
 use crate::cred::Cred;
 use crate::execution::Errno;
 use crate::ipc::sysv_msg::checks;
+use crate::ipc::sysv_msg::notification;
 use crate::ipc::sysv_msg::structure::Msg;
 use crate::ipc::sysv_shm::execution::{IPC_CREAT, IPC_EXCL, IPC_NOWAIT, IPC_PRIVATE};
 use crate::ipc::sysv_shm::structure::IpcPerm;
-use crate::process::adapter::step_engine::Cap;
-use crate::process::adapter::wait_routing::Mask;
+use crate::process::adapter::step_engine::{Cap, NoProgress, StepOutcome};
 use crate::process::nsproxy::SysvKey;
 
 // msgctl commands (same numbering as shmctl)
@@ -24,6 +25,9 @@ pub const MSG_EXCEPT: i32 = 0o20000;
 pub const MSG_STAT: i32 = 11;
 pub const MSG_INFO: i32 = 12;
 pub const MSG_STAT_ANY: i32 = 13;
+
+pub type MsgsndOutcome = StepOutcome<usize, ByteProgress>;
+pub type MsgrcvOutcome = StepOutcome<(i64, Vec<u8>), NoProgress>;
 
 // ---------------------------------------------------------------------------
 // Payload access helper
@@ -116,36 +120,63 @@ pub fn step_msgsnd(
     msgflg: i32,
     cred: &Cap<Cred>,
 ) -> Result<usize, Errno> {
+    // observe/upgrade/reserve/commit/publish are delegated to the v3 op.
+    // This legacy wrapper cannot drive waits, so it preserves the old
+    // non-blocking Result shape by surfacing a yielded wait as EAGAIN.
+    match step_msgsnd_v3(msqid, mtype, mtext, msgflg, cred) {
+        StepOutcome::Done(sent) => Ok(sent),
+        StepOutcome::Err(errno) => Err(errno.into()),
+        StepOutcome::Yield { .. } => Err(Errno::EAGAIN),
+        StepOutcome::Continue { .. } => Err(Errno::EIO),
+    }
+}
+
+pub fn step_msgsnd_v3(
+    msqid: u32,
+    mtype: i64,
+    mtext: Vec<u8>,
+    msgflg: i32,
+    cred: &Cap<Cred>,
+) -> MsgsndOutcome {
     // observe: inspect current subsystem state and validate inputs.
     // upgrade: acquire capabilities/guards needed for mutation.
     // reserve: reserve namespace, memory, or wait-source effects.
     // commit: apply the state transition.
     // publish: emit readiness, signal, or observable outcome.
     if mtype <= 0 {
-        return Err(Errno::EINVAL);
+        return StepOutcome::err(Errno::EINVAL.into());
     }
 
-    let queue = checks::require_msg_exists(msqid)?;
+    let queue = match checks::require_msg_exists(msqid) {
+        Ok(queue) => queue,
+        Err(errno) => return StepOutcome::err(errno.into()),
+    };
     if queue.destroyed.load(Ordering::Acquire) {
-        return Err(Errno::EIDRM);
+        return StepOutcome::err(Errno::EIDRM.into());
     }
-    checks::require_can_write_msg(&queue, cred)?;
+    if let Err(errno) = checks::require_can_write_msg(&queue, cred) {
+        return StepOutcome::err(errno.into());
+    }
 
     let msg = Msg { mtype, mtext };
     let msg_len = msg.mtext.len();
 
-    with_payload!(queue, payload, {
+    let payload = match queue.payload.lock().as_ref().cloned() {
+        Some(payload) => payload,
+        None => return StepOutcome::err(Errno::EIDRM.into()),
+    };
+
+    {
         if msg_len > payload.max_msg_size {
-            return Err(Errno::EINVAL);
+            return StepOutcome::err(Errno::EINVAL.into());
         }
 
         let current_bytes = payload.current_bytes.load(Ordering::Acquire);
         if current_bytes + (msg_len as u64) > payload.max_bytes as u64 {
             if (msgflg & IPC_NOWAIT) != 0 {
-                return Err(Errno::EAGAIN);
+                return StepOutcome::err(Errno::EAGAIN.into());
             }
-            // TODO: blocking send — yield OnWaitSource with send_source
-            return Err(Errno::EAGAIN);
+            return notification::wait_for_send_space(payload.send_source_id);
         }
 
         let mut messages = payload.messages.lock();
@@ -156,10 +187,9 @@ pub fn step_msgsnd(
             .fetch_add(msg_len as u64, Ordering::Release);
         payload.msg_count.fetch_add(1, Ordering::Release);
         payload.queue_seq.fetch_add(1, Ordering::Release);
-        payload.recv_channel.fire(Mask::from_bits(1));
-    });
-
-    Ok(msg_len)
+        notification::notify_message_available(&payload.recv_channel, &payload.recv_source);
+        StepOutcome::done(msg_len)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -174,31 +204,67 @@ pub fn step_msgrcv(
     msgflg: i32,
     cred: &Cap<Cred>,
 ) -> Result<(i64, Vec<u8>), Errno> {
+    // observe/upgrade/reserve/commit/publish are delegated to the v3 op.
+    // This legacy wrapper cannot drive waits, so it preserves the old
+    // non-blocking Result shape by surfacing a yielded wait as EAGAIN.
+    match step_msgrcv_v3(msqid, msgsz, msgtyp, msgflg, cred) {
+        StepOutcome::Done(message) => Ok(message),
+        StepOutcome::Err(errno) => Err(errno.into()),
+        StepOutcome::Yield { .. } => Err(Errno::EAGAIN),
+        StepOutcome::Continue { .. } => Err(Errno::EIO),
+    }
+}
+
+pub fn step_msgrcv_v3(
+    msqid: u32,
+    msgsz: usize,
+    msgtyp: i64,
+    msgflg: i32,
+    cred: &Cap<Cred>,
+) -> MsgrcvOutcome {
     // observe: inspect current subsystem state and validate inputs.
     // upgrade: acquire capabilities/guards needed for mutation.
     // reserve: reserve namespace, memory, or wait-source effects.
     // commit: apply the state transition.
     // publish: emit readiness, signal, or observable outcome.
-    let queue = checks::require_msg_exists(msqid)?;
-    checks::require_can_read_msg(&queue, cred)?;
+    let queue = match checks::require_msg_exists(msqid) {
+        Ok(queue) => queue,
+        Err(errno) => return StepOutcome::err(errno.into()),
+    };
+    if queue.destroyed.load(Ordering::Acquire) {
+        return StepOutcome::err(Errno::EIDRM.into());
+    }
+    if let Err(errno) = checks::require_can_read_msg(&queue, cred) {
+        return StepOutcome::err(errno.into());
+    }
 
-    with_payload!(queue, payload, {
+    let payload = match queue.payload.lock().as_ref().cloned() {
+        Some(payload) => payload,
+        None => return StepOutcome::err(Errno::EIDRM.into()),
+    };
+
+    {
         let msg_count = payload.msg_count.load(Ordering::Acquire);
         if msg_count == 0 {
             if (msgflg & IPC_NOWAIT) != 0 {
-                return Err(Errno::EAGAIN);
+                return StepOutcome::err(Errno::EAGAIN.into());
             }
             if queue.destroyed.load(Ordering::Acquire) {
-                return Err(Errno::EIDRM);
+                return StepOutcome::err(Errno::EIDRM.into());
             }
-            // TODO: blocking recv — yield OnWaitSource with recv_source
-            return Err(Errno::EAGAIN);
+            return notification::wait_for_message(payload.recv_source_id);
         }
 
         let mut messages = payload.messages.lock();
-        let pos = find_msg(&messages, msgtyp).ok_or(Errno::EAGAIN)?;
+        let pos = match find_msg(&messages, msgtyp) {
+            Some(pos) => pos,
+            None if (msgflg & IPC_NOWAIT) != 0 => return StepOutcome::err(Errno::EAGAIN.into()),
+            None => {
+                return notification::wait_for_message(payload.recv_source_id);
+            }
+        };
         if messages[pos].mtext.len() > msgsz && (msgflg & MSG_NOERROR) == 0 {
-            return Err(Errno::E2BIG);
+            return StepOutcome::err(Errno::E2BIG.into());
         }
         let msg = messages.remove(pos);
         let mlen = msg.mtext.len();
@@ -211,10 +277,10 @@ pub fn step_msgrcv(
             .current_bytes
             .fetch_sub(mlen as u64, Ordering::Release);
         payload.msg_count.fetch_sub(1, Ordering::Release);
-        payload.send_channel.fire(Mask::from_bits(1));
+        notification::notify_space_available(&payload.send_channel, &payload.send_source);
 
-        Ok((msg.mtype, mtext))
-    })
+        StepOutcome::done((msg.mtype, mtext))
+    }
 }
 
 fn find_msg(messages: &[Msg], msgtyp: i64) -> Option<usize> {
@@ -256,6 +322,15 @@ pub fn step_msgctl(
 
             if let Some(q) = crate::ipc::sysv_msg::structure::withdraw_msg(msqid) {
                 q.destroyed.store(true, Ordering::Release);
+                if let Some(payload) = q.payload.lock().as_ref().cloned() {
+                    payload.queue_seq.fetch_add(1, Ordering::Release);
+                    notification::abort_removed(
+                        &payload.send_channel,
+                        &payload.send_source,
+                        &payload.recv_channel,
+                        &payload.recv_source,
+                    );
+                }
             }
             Ok(MsgCtlResult::Success)
         }

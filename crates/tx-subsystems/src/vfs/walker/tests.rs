@@ -13,17 +13,17 @@ use crate::mount::{
 };
 use crate::tty::execution::{register_console_alias, register_hardware};
 use crate::tty::structure::TtyIdentity;
+use crate::vfs::FsOps;
 use crate::vfs::adapter::step_engine::{
-    guard, reserve_for, sign_for, ByteProgress, Cap, Errno as V3Errno, SpinMutex,
-    StepOutcome as V3, StepOutcome,
+    ByteProgress, Cap, Errno as V3Errno, SpinMutex, StepOutcome as V3, StepOutcome, guard,
+    reserve_for, sign_for,
 };
 use crate::vfs::structure::{
     Credential, DEntry, FsObjectId, InlineName, InodeKind, InodeMeta, OpenFileFlags, RNode,
     RNodeBacking, S_IFDIR,
 };
-use crate::vfs::FsOps;
 
-use super::{step_open, step_walk, step_walk_in_mount_namespace, SYMLOOP_MAX};
+use super::{SYMLOOP_MAX, step_open, step_walk, step_walk_in_mount_namespace};
 
 // === capturing char-device binding for the console TTY ================
 
@@ -101,6 +101,9 @@ struct TestFsInner {
     /// here so the assertions can drive the predicate down each
     /// triplet branch.
     inodes: alloc::collections::BTreeMap<FsObjectId, FixtureInodeRow>,
+    lookup_count: usize,
+    load_meta_count: usize,
+    materialise_count: usize,
     next_id: u64,
 }
 
@@ -119,6 +122,9 @@ impl TestFs {
         let mut inner = TestFsInner {
             children: alloc::collections::BTreeMap::new(),
             inodes: alloc::collections::BTreeMap::new(),
+            lookup_count: 0,
+            load_meta_count: 0,
+            materialise_count: 0,
             next_id: root_id.as_u64() + 1,
         };
         inner
@@ -226,6 +232,15 @@ impl TestFs {
             (InodeKind::Regular, None, TEST_DEFAULT_REGULAR_MODE, 0, 0),
         );
         id
+    }
+
+    fn lookup_counts(&self) -> (usize, usize, usize) {
+        let inner = self.inner.lock();
+        (
+            inner.lookup_count,
+            inner.load_meta_count,
+            inner.materialise_count,
+        )
     }
 
     /// Set per-inode (mode-low-bits, uid, gid) directly. Used by the

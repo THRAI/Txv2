@@ -26,9 +26,9 @@ use std::vec::Vec;
 use tx_hal::{AllocError, PhysAddr, PmapError, PmapPermissions, PmapReserveKind, PtNode, VirtAddr};
 
 use super::address_space::{
-    commit_mapping_from_root, create_pmap_root_from_bag, destroy_pmap_root_from_bag,
-    l1_table_mut_from_root, protect_mapping_from_root, reserve_mapping_from_root,
-    unmap_mapping_from_root,
+    coalesce_invalidation_ranges, commit_mapping_from_root, create_pmap_root_from_bag,
+    destroy_pmap_root_from_bag, l1_table_mut_from_root, protect_mapping_from_root,
+    reserve_mapping_from_root, unmap_mapping_from_root,
 };
 use super::kernel_space::{
     commit_direct_map_1g_from_bag, commit_kernel_mapping_from_bag, protect_kernel_mapping_from_bag,
@@ -715,6 +715,22 @@ fn protect_kernel_mapping_leaves_absent_slots_to_fault_path() {
         .expect("absent mapping is not a pmap mutation"),
         None
     );
+}
+
+#[test]
+fn shootdown_batch_coalesces_contiguous_invalidations() {
+    let batch = coalesce_invalidation_ranges(&[
+        tx_hal::PmapInvalidation::new(VirtAddr(0x1000), 0x1000),
+        tx_hal::PmapInvalidation::new(VirtAddr(0x2000), 0x1000),
+        tx_hal::PmapInvalidation::new(VirtAddr(0x5000), 0x1000),
+        tx_hal::PmapInvalidation::new(VirtAddr(0x6000), 0x1000),
+    ]);
+
+    assert_eq!(batch.len(), 2);
+    assert_eq!(batch[0].virt(), VirtAddr(0x1000));
+    assert_eq!(batch[0].size(), 0x2000);
+    assert_eq!(batch[1].virt(), VirtAddr(0x5000));
+    assert_eq!(batch[1].size(), 0x2000);
 }
 
 #[test]

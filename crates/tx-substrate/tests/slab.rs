@@ -94,7 +94,7 @@ fn slab_rejects_allocation_before_init() {
 }
 
 #[test]
-fn slab_reuses_small_objects_and_returns_empty_page() {
+fn slab_reuses_small_objects_and_retains_one_empty_page() {
     static mut PAGES: [TestPage; 2] = [TestPage {
         _bytes: [0; PAGE_SIZE],
     }; 2];
@@ -122,8 +122,8 @@ fn slab_reuses_small_objects_and_returns_empty_page() {
 
     assert_eq!(
         allocator.free_count(),
-        2,
-        "fully empty slab page should return to the frame allocator"
+        1,
+        "one fully empty slab page should stay retained for reuse"
     );
 
     let third = heap.try_alloc(layout).expect("object after return");
@@ -131,6 +131,108 @@ fn slab_reuses_small_objects_and_returns_empty_page() {
     unsafe {
         heap.dealloc(third.as_ptr(), layout);
     }
+}
+
+#[test]
+fn slab_returns_surplus_empty_pages_beyond_retained_page() {
+    static mut PAGES: [TestPage; 3] = [TestPage {
+        _bytes: [0; PAGE_SIZE],
+    }; 3];
+    let metas = [FrameMeta::new(), FrameMeta::new(), FrameMeta::new()];
+    let bitmap = [AtomicU64::new(0)];
+    let allocator = test_allocator(&metas, &bitmap, 3);
+    let provider = TestProvider {
+        allocator: &allocator,
+        base: core::ptr::addr_of_mut!(PAGES) as usize,
+    };
+    let heap = SlabHeap::new(provider);
+    heap.init().expect("heap init");
+    let layout = Layout::from_size_align(2048, 8).expect("valid layout");
+
+    let first = heap
+        .try_alloc(layout)
+        .expect("first page-sized class object");
+    let second = heap
+        .try_alloc(layout)
+        .expect("second page-sized class object");
+    assert_eq!(allocator.free_count(), 1);
+
+    unsafe {
+        heap.dealloc(first.as_ptr(), layout);
+        heap.dealloc(second.as_ptr(), layout);
+    }
+
+    assert_eq!(
+        allocator.free_count(),
+        2,
+        "only one empty slab page should be retained per size class"
+    );
+}
+
+#[test]
+fn slab_refills_medium_classes_in_page_batches() {
+    static mut PAGES: [TestPage; 20] = [TestPage {
+        _bytes: [0; PAGE_SIZE],
+    }; 20];
+    let metas = [
+        FrameMeta::new(),
+        FrameMeta::new(),
+        FrameMeta::new(),
+        FrameMeta::new(),
+        FrameMeta::new(),
+        FrameMeta::new(),
+        FrameMeta::new(),
+        FrameMeta::new(),
+        FrameMeta::new(),
+        FrameMeta::new(),
+        FrameMeta::new(),
+        FrameMeta::new(),
+        FrameMeta::new(),
+        FrameMeta::new(),
+        FrameMeta::new(),
+        FrameMeta::new(),
+        FrameMeta::new(),
+        FrameMeta::new(),
+        FrameMeta::new(),
+        FrameMeta::new(),
+    ];
+    let bitmap = [AtomicU64::new(0)];
+    let allocator = test_allocator(&metas, &bitmap, 20);
+    let provider = TestProvider {
+        allocator: &allocator,
+        base: core::ptr::addr_of_mut!(PAGES) as usize,
+    };
+    let heap = SlabHeap::new(provider);
+    heap.init().expect("heap init");
+    let layout = Layout::from_size_align(128, 8).expect("valid layout");
+
+    let first = heap.try_alloc(layout).expect("first medium object");
+    assert_eq!(
+        allocator.free_count(),
+        12,
+        "128-byte class should refill eight pages at a time"
+    );
+
+    let mut ptrs = Vec::new();
+    ptrs.push(first);
+    for _ in 1..(31 * 8) {
+        ptrs.push(heap.try_alloc(layout).expect("batched refill object"));
+    }
+    assert_eq!(allocator.free_count(), 12);
+
+    ptrs.push(heap.try_alloc(layout).expect("second batched refill"));
+    assert_eq!(allocator.free_count(), 4);
+
+    for ptr in ptrs {
+        unsafe {
+            heap.dealloc(ptr.as_ptr(), layout);
+        }
+    }
+    assert_eq!(
+        allocator.free_count(),
+        12,
+        "the latest refill batch remains cached while emptied older pages return"
+    );
 }
 
 #[test]

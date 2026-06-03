@@ -49,6 +49,10 @@ pub enum Errno {
     /// fd is `-EBADF`, not `-EPIPE`.
     EBADF,
     EBUSY,
+    /// Operation canceled. Used by Linux timerfd
+    /// `TFD_TIMER_CANCEL_ON_SET` after a realtime clock change.
+    /// Linux value: 125.
+    ECANCELED,
     EDQUOT,
     EEXIST,
     EFBIG,
@@ -108,6 +112,7 @@ impl Errno {
             Errno::EAGAIN => 11,
             Errno::EBADF => 9,
             Errno::EBUSY => 16,
+            Errno::ECANCELED => 125,
             Errno::EDQUOT => 122,
             Errno::EEXIST => 17,
             Errno::EFAULT => 14,

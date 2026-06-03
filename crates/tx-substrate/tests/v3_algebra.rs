@@ -87,6 +87,7 @@ fn errno_mirrors_v4_catalog() {
         Errno::EAGAIN,
         Errno::EBADF,
         Errno::EBUSY,
+        Errno::ECANCELED,
         Errno::EDQUOT,
         Errno::EEXIST,
         Errno::EFAULT,
@@ -112,7 +113,7 @@ fn errno_mirrors_v4_catalog() {
         Errno::ESTALE,
         Errno::ETIMEDOUT,
     ];
-    assert_eq!(cases.len(), 29);
+    assert_eq!(cases.len(), 30);
     for errno in cases {
         match errno {
             Errno::E2BIG
@@ -120,6 +121,7 @@ fn errno_mirrors_v4_catalog() {
             | Errno::EAGAIN
             | Errno::EBADF
             | Errno::EBUSY
+            | Errno::ECANCELED
             | Errno::EDQUOT
             | Errno::EEXIST
             | Errno::EFBIG

@@ -10,6 +10,7 @@ use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
 // xtask/src/lint_invariants_cred_check.rs.
 use tx_subsystems::cred::checks as cred_checks;
 use tx_subsystems::mount::MountPayload;
+use tx_subsystems::vfs::structure::OpenFileBacking;
 
 // =====================================================================
 // Wave 4 Part 4 of the DAC + setuid slice — file-mode syscall arms.
@@ -254,6 +255,39 @@ pub(super) fn sys_fchmodat<P: PmapIf>(
     }
 }
 
+/// `fchmod(fd, mode)`. Linux RV64 generic ABI.
+///
+/// Resolves the fd's rnode and applies the same authorization and
+/// `FsOps::step_chmod` mutation path as `fchmodat`, without adding
+/// any path or symlink policy.
+pub(super) fn sys_fchmod(fd: u32, mode: u32, ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let open_file = match ctx.process.fd(fd) {
+        Some(file) => file,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+    let rnode = match open_file.backing() {
+        OpenFileBacking::Rnode { rnode } => rnode.clone(),
+        _ => return SyscallResult::Error(EBADF_VALUE),
+    };
+    let new_mode = (mode & 0o7777) as u16;
+    let target_meta = rnode.meta();
+    if let Err(e) = cred_checks::authorize_chmod(ctx.cred_snapshot(), &target_meta, new_mode) {
+        return SyscallResult::error_from(e);
+    }
+    let fs_ops = match crate::linux_syscall::fs_basic::fs_ops_for_rnode(&rnode) {
+        Some(fs_ops) => fs_ops,
+        None => return SyscallResult::Error(ENOSYS_VALUE),
+    };
+    let guard = step_engine::guard();
+    match fs_ops.step_chmod(rnode.fs_object_id(), new_mode, &ctx.walker_cred(), &guard) {
+        StepOutcome::Done(()) => SyscallResult::Return(0),
+        StepOutcome::Err(errno) => {
+            SyscallResult::Error(fs_change_errno_magnitude(Errno::from(errno)))
+        }
+        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => SyscallResult::Error(EIO_VALUE),
+    }
+}
+
 /// `fchownat(dirfd, path, uid, gid, flags)`. Linux RV64 generic ABI.
 ///
 /// Wraps `FsOps::step_chown` (Wave 3 Part 2). Each of `uid` / `gid`
@@ -309,6 +343,45 @@ pub(super) fn sys_fchownat<P: PmapIf>(
     match result {
         Ok(()) => SyscallResult::Return(0),
         Err(v3errno) => SyscallResult::Error(fs_change_errno_magnitude(Errno::from(v3errno))),
+    }
+}
+
+/// `fchown(fd, uid, gid)`. Linux RV64 generic ABI.
+///
+/// Resolves the fd's rnode and applies the same authorization,
+/// `(u32)-1` sentinel decoding, and `FsOps::step_chown` mutation path
+/// as `fchownat`.
+pub(super) fn sys_fchown(
+    fd: u32,
+    uid_arg: u32,
+    gid_arg: u32,
+    ctx: &SyscallCtx<'_>,
+) -> SyscallResult {
+    let open_file = match ctx.process.fd(fd) {
+        Some(file) => file,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+    let rnode = match open_file.backing() {
+        OpenFileBacking::Rnode { rnode } => rnode.clone(),
+        _ => return SyscallResult::Error(EBADF_VALUE),
+    };
+    let uid = decode_uid_arg(uid_arg).map(|u| u.0);
+    let gid = decode_gid_arg(gid_arg).map(|g| g.0);
+    let target_meta = rnode.meta();
+    if let Err(e) = cred_checks::authorize_chown(ctx.cred_snapshot(), &target_meta, uid, gid) {
+        return SyscallResult::error_from(e);
+    }
+    let fs_ops = match crate::linux_syscall::fs_basic::fs_ops_for_rnode(&rnode) {
+        Some(fs_ops) => fs_ops,
+        None => return SyscallResult::Error(ENOSYS_VALUE),
+    };
+    let guard = step_engine::guard();
+    match fs_ops.step_chown(rnode.fs_object_id(), uid, gid, &ctx.walker_cred(), &guard) {
+        StepOutcome::Done(()) => SyscallResult::Return(0),
+        StepOutcome::Err(errno) => {
+            SyscallResult::Error(fs_change_errno_magnitude(Errno::from(errno)))
+        }
+        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => SyscallResult::Error(EIO_VALUE),
     }
 }
 

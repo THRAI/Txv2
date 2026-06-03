@@ -115,6 +115,54 @@ fn dispatch_mmap_anonymous_private_returns_aligned_user_va() {
     }
 }
 
+#[test]
+fn dispatch_vm_hot_handles_pthread_stack_lifecycle_only() {
+    let _setup = vm_setup();
+    let (proc_cap, thread) = fresh_proc_thread();
+    let ctx = make_ctx(proc_cap, thread);
+
+    assert_eq!(
+        block_on(dispatch_vm_hot(
+            SyscallRequest::new(NR_MREMAP, [0; 6]),
+            &ctx
+        )),
+        None,
+        "VM hot lane must stay limited to mmap/mprotect/munmap"
+    );
+
+    let target = 0x4000_0000u64;
+    let map = block_on(dispatch_vm_hot(
+        SyscallRequest::new(
+            NR_MMAP,
+            [
+                target,
+                USER_PAGE_SIZE as u64,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                u64::MAX,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(map, Some(SyscallResult::Return(target as i64)));
+
+    let protect = block_on(dispatch_vm_hot(
+        SyscallRequest::new(
+            NR_MPROTECT,
+            [target, USER_PAGE_SIZE as u64, PROT_READ, 0, 0, 0],
+        ),
+        &ctx,
+    ));
+    assert_eq!(protect, Some(SyscallResult::Return(0)));
+
+    let unmap = block_on(dispatch_vm_hot(
+        SyscallRequest::new(NR_MUNMAP, [target, USER_PAGE_SIZE as u64, 0, 0, 0, 0]),
+        &ctx,
+    ));
+    assert_eq!(unmap, Some(SyscallResult::Return(0)));
+}
+
 /// `mmap(.., 0, ..)` rejects with -EINVAL.
 #[test]
 fn dispatch_mmap_anonymous_private_zero_length_returns_neg_einval() {

@@ -1,9 +1,9 @@
 //! Content renderers for procfs pseudo-files.
 
 use crate::procfs::{
-    pid_from_cmdline_id, pid_from_fdinfo_id, pid_from_maps_id, pid_from_stat_id, PROCFS_CPUINFO_ID,
-    PROCFS_MEMINFO_ID, PROCFS_MOUNTS_ID, PROCFS_SYSVIPC_MSG_ID, PROCFS_SYSVIPC_SEM_ID,
-    PROCFS_SYSVIPC_SHM_ID, PROCFS_UPTIME_ID,
+    PROCFS_CPUINFO_ID, PROCFS_MEMINFO_ID, PROCFS_MOUNTS_ID, PROCFS_SYSVIPC_MSG_ID,
+    PROCFS_SYSVIPC_SEM_ID, PROCFS_SYSVIPC_SHM_ID, PROCFS_UPTIME_ID, pid_from_cmdline_id,
+    pid_from_fdinfo_id, pid_from_maps_id, pid_from_stat_id,
 };
 use alloc::format;
 use alloc::string::String;
@@ -83,7 +83,7 @@ fn render_uptime() -> String {
 }
 
 fn render_maps(pid: Pid) -> String {
-    use tx_subsystems::vm::VmBacking;
+    use tx_subsystems::vm::VmEntryBacking;
 
     let Some(proc) = process::process_by_pid(pid) else {
         return String::new();
@@ -108,17 +108,20 @@ fn render_maps(pid: Pid) -> String {
         let p = if entry.flags.shared { 's' } else { 'p' };
 
         // Offset and backing description.
-        let (offset, backing_desc) = match &entry.backing {
-            VmBacking::None => (0u64, "[none]"),
-            VmBacking::PrivateAnon => (0u64, "[anon]"),
-            VmBacking::Page { pc, offset: off } => {
+        let (offset, backing_desc) = match entry.backing_kind() {
+            VmEntryBacking::None => (0u64, "[none]"),
+            VmEntryBacking::PrivateAnon => (0u64, "[anon]"),
+            VmEntryBacking::Page { offset } => {
                 use tx_subsystems::page_backed::PageContainerKind;
+                let Some((pc, _)) = entry.page_backing() else {
+                    continue;
+                };
                 let desc = match pc.kind() {
                     PageContainerKind::Anon { .. } => "[anon]",
                     PageContainerKind::File { .. } => "[file]",
                     PageContainerKind::Device { .. } => "[device]",
                 };
-                (*off, desc)
+                (offset, desc)
             }
         };
 

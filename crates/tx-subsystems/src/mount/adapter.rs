@@ -20,11 +20,11 @@ use tx_platform_adapter::platform_adapter;
     reason = "expose the substrate zone role types (Cap, PayloadCap, Entity, ...) and SpinMutex primitive that mount uses for its identity/payload/namespace zones and global mount table"
 )]
 pub mod runtime {
+    pub(crate) use crate::sync::SpinMutex;
     pub use tx_substrate::zone::{
         register_zone_for, reserve_for, sign, sign_for, Cap, CapProducingPolicy, CoLocatedEntity,
         Dead, Entity, IdentRef, IdentitySlot, IsPayloadPolicy, ObserverNodePolicy,
         OperationalCapExt, OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy,
         RetainedEntityPolicy, Weak, Zone, ZoneAllocated, ZoneError, ZonePolicy,
     };
-    pub use tx_substrate::SpinMutex;
 }

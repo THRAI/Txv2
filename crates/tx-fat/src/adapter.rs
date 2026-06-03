@@ -12,6 +12,7 @@ use tx_platform_adapter::platform_adapter;
     reason = "expose substrate step engine outcome types, zone role types, EBR guard, and page-allocator primitives used by tx-fat FsOps implementation"
 )]
 pub mod step_engine {
+    pub(crate) use crate::sync::SpinMutex;
     pub use tx_substrate::epoch::{guard, Guard};
     pub use tx_substrate::page_allocator;
     pub use tx_substrate::step::{
@@ -23,5 +24,4 @@ pub mod step_engine {
         OperationalCapExt, OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy,
         RetainedEntityPolicy, Weak, Zone, ZoneAllocated, ZoneError, ZonePolicy,
     };
-    pub use tx_substrate::SpinMutex;
 }

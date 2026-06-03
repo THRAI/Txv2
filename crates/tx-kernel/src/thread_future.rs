@@ -78,27 +78,34 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
-use alloc::sync::Arc;
+use alloc::{boxed::Box, sync::Arc};
 
 use crate::adapter::boot_runtime;
 use crate::adapter::step_engine::{Cap, PayloadCap};
 use boot_runtime::ast::AstBatch;
 use boot_runtime::userspace::{
-    PageFaultAccess, PageFaultInfo as ReactorPageFaultInfo, UserspaceEntryDecision,
+    PageFaultAccess, PageFaultInfo as ReactorPageFaultInfo, SyscallRequest, UserspaceEntryDecision,
     UserspaceTrapInfo,
 };
 use tx_hal::{PercpuIf, TrapIf, TxPlatform};
+use tx_shims::linux_syscall::numbers::{
+    FUTEX_CMD_MASK, FUTEX_WAKE, FUTEX_WAKE_BITSET, NR_CLONE, NR_FUTEX, NR_MMAP, NR_MPROTECT,
+    NR_MUNMAP, NR_RT_SIGPROCMASK, NR_WRITEV,
+};
+use tx_shims::linux_syscall::SyscallResult;
 use tx_subsystems::signal::deliver_synchronous_fault;
 use tx_subsystems::signal::Signum;
 use tx_subsystems::signal::{ast_dispatch, refresh_deliverable_signal_summary, AstOutcome};
 use tx_subsystems::thread_runtime::execution::prepare_userspace_entry_payload_into;
 use tx_subsystems::thread_runtime::{
-    clear_current_thread_payload, clear_current_userspace_payload, set_current_thread_payload,
-    set_current_userspace_payload, ThreadIdentity, ThreadPayload,
+    clear_current_thread_identity, clear_current_thread_payload, clear_current_userspace_payload,
+    clear_current_userspace_thread_identity, set_current_thread_identity,
+    set_current_thread_payload, set_current_userspace_payload,
+    set_current_userspace_thread_identity, ThreadIdentity, ThreadPayload,
 };
 use tx_subsystems::vm::{
-    AccessMode, AddressSpace, Prot, UserAccessKind, UserRange, UserVirtAddr, VmBacking, VmEntry,
-    VmFault, USER_PAGE_SIZE,
+    AccessMode, AddressSpace, Prot, UserAccessKind, UserRange, UserVirtAddr, VmEntry,
+    VmEntryBacking, VmFault, USER_PAGE_SIZE,
 };
 
 /// Translate the reactor's `PageFaultAccess` into the VM subsystem's
@@ -181,6 +188,7 @@ const fn pf_info_implies_from_user(_info: ReactorPageFaultInfo) -> bool {
 /// alternative — leaving the slot set across yields — would deny
 /// other futures the slot when SMP scheduling lands.
 pub struct PerHartSlotted<P: TxPlatform, F: Future> {
+    thread: Cap<ThreadIdentity>,
     payload: PayloadCap<ThreadPayload>,
     inner: F,
     _platform: core::marker::PhantomData<fn() -> P>,
@@ -196,8 +204,9 @@ unsafe impl<P: TxPlatform, F: Future> Send for PerHartSlotted<P, F> where F: Sen
 unsafe impl<P: TxPlatform, F: Future> Sync for PerHartSlotted<P, F> where F: Sync {}
 
 impl<P: TxPlatform, F: Future> PerHartSlotted<P, F> {
-    pub fn new(payload: PayloadCap<ThreadPayload>, inner: F) -> Self {
+    pub fn new(thread: Cap<ThreadIdentity>, payload: PayloadCap<ThreadPayload>, inner: F) -> Self {
         Self {
+            thread,
             payload,
             inner,
             _platform: core::marker::PhantomData,
@@ -214,6 +223,7 @@ impl<P: TxPlatform, F: Future> Future for PerHartSlotted<P, F> {
         let this = unsafe { self.get_unchecked_mut() };
         let hart = <P as PercpuIf>::current_cpu_id().0;
 
+        let _prev_thread = set_current_thread_identity(hart, this.thread.clone());
         let _prev = set_current_thread_payload(hart, this.payload.clone());
         if let Some(mailbox) = crate::adapter::boot_runtime::current_task_mailbox(hart) {
             this.payload.bind_mailbox(Arc::downgrade(&mailbox));
@@ -225,6 +235,7 @@ impl<P: TxPlatform, F: Future> Future for PerHartSlotted<P, F> {
         let out = inner.poll(cx);
 
         let _ = clear_current_thread_payload(hart);
+        let _ = clear_current_thread_identity(hart);
 
         out
     }
@@ -244,7 +255,12 @@ pub async fn run_thread<P: TxPlatform>(
     thread: Cap<ThreadIdentity>,
     payload: PayloadCap<ThreadPayload>,
 ) {
+    let mut last_entry_sysno = None;
+    let mut syscall_handoff_pending = false;
     loop {
+        if let Some(sysno) = last_entry_sysno {
+            emit_syscall_roundtrip_marker(sysno, b"debug.thread.loop.top");
+        }
         // ----------------------------------------------------------------
         // (1) ENTRY-SIDE WAIT + AST CHECKPOINT.
         //
@@ -274,8 +290,14 @@ pub async fn run_thread<P: TxPlatform>(
                 panic!("run_thread: userspace_slot::start_request failed");
             }
         };
+        if let Some(sysno) = last_entry_sysno {
+            emit_syscall_roundtrip_marker(sysno, b"debug.thread.start_request.after");
+        }
         let entry_token = entry_wait.request();
         payload.set_active_userspace_request(Some(entry_token));
+        if let Some(sysno) = last_entry_sysno {
+            emit_syscall_roundtrip_marker(sysno, b"debug.thread.active_request.after");
+        }
 
         // Phase E (stop-state): before entering userspace, check
         // whether the thread is stopped (SIGSTOP / default-Stop
@@ -300,7 +322,13 @@ pub async fn run_thread<P: TxPlatform>(
         // (lowest first), disposition is consulted, and outcomes that
         // need materialisation (DefaultTerminate, DeliverHandler) are
         // handled inline.
+        if let Some(sysno) = last_entry_sysno {
+            emit_syscall_roundtrip_marker(sysno, b"debug.thread.ast.before");
+        }
         let ast_outcome = ast_dispatch(&thread);
+        if let Some(sysno) = last_entry_sysno {
+            emit_syscall_roundtrip_marker(sysno, b"debug.thread.ast.after");
+        }
         match ast_outcome {
             AstOutcome::DeliverHandler { sig, action } => {
                 // Phase D: full signal-frame delivery via
@@ -505,6 +533,9 @@ pub async fn run_thread<P: TxPlatform>(
             "checkpoint_userspace_entry_batch must succeed with the freshly-started \
              entry-side request"
         );
+        if let Some(sysno) = last_entry_sysno {
+            emit_syscall_roundtrip_marker(sysno, b"debug.thread.checkpoint.after");
+        }
 
         // ----------------------------------------------------------------
         // (2) BUILD MERGED CONTEXT AND DIVE INTO USERSPACE.
@@ -543,10 +574,21 @@ pub async fn run_thread<P: TxPlatform>(
             if let Some(aspace) = process.aspace_cap() {
                 let root = aspace.pmap().root_handle();
                 let mut ctx = tx_hal::UserTrapContext::empty();
+                if let Some(sysno) = last_entry_sysno {
+                    emit_syscall_roundtrip_marker(sysno, b"debug.thread.entry.prepare.before");
+                }
                 prepare_userspace_entry_payload_into(&payload, &mut ctx);
+                if let Some(sysno) = last_entry_sysno {
+                    emit_syscall_roundtrip_marker(sysno, b"debug.thread.entry.prepare.after");
+                }
                 payload.set_active_userspace_request(Some(entry_token));
                 let entry_hart = <P as tx_hal::SmpIf>::current_cpu_id().0;
+                let _prev_userspace_thread =
+                    set_current_userspace_thread_identity(entry_hart, thread.clone());
                 let _prev_userspace = set_current_userspace_payload(entry_hart, payload.clone());
+                if let Some(sysno) = last_entry_sysno {
+                    emit_syscall_roundtrip_marker(sysno, b"debug.thread.enter.before");
+                }
                 <P as TrapIf>::enter_userspace_with_context(&ctx, root);
             } else {
                 return;
@@ -570,8 +612,13 @@ pub async fn run_thread<P: TxPlatform>(
         let entry_hart = <P as tx_hal::SmpIf>::current_cpu_id().0;
         if !matches!(trap, UserspaceTrapInfo::TimerPreempt) {
             let _ = clear_current_userspace_payload(entry_hart);
+            let _ = clear_current_userspace_thread_identity(entry_hart);
         }
         payload.set_active_userspace_request(None);
+        if let UserspaceTrapInfo::Syscall(req) = trap {
+            emit_syscall_roundtrip_marker(req.nr, b"debug.thread.trap.consumed");
+        }
+        emit_thread_debug_value(b"debug.thread.trap.kind", trap_kind_code(&trap));
 
         // ----------------------------------------------------------------
         // (4) DISPATCH THE RESOLVED TRAP.
@@ -581,56 +628,161 @@ pub async fn run_thread<P: TxPlatform>(
                 crate::adapter::boot_runtime::yield_now().await;
             }
             UserspaceTrapInfo::Syscall(req) => {
+                if syscall_handoff_pending {
+                    // A previous syscall return asked for an explicit
+                    // scheduler boundary after one userspace slice. Successful
+                    // clone uses this as the child-publish handoff.
+                    syscall_handoff_pending = false;
+                    emit_thread_debug_value(b"debug.thread.clone_handoff.yield", req.nr as i64);
+                    crate::adapter::boot_runtime::yield_now().await;
+                }
+                emit_syscall_roundtrip_marker(req.nr, b"debug.thread.await.ready");
                 // Resolve the syscall context from the payload.
                 let Some(process) = thread.upgrade_owner_proc() else {
                     // Owning process gone; thread is detached. Stop.
                     return;
                 };
-                let Some(aspace) = process.aspace_cap() else {
-                    // Process zombified concurrently; stop.
-                    return;
-                };
-                let mut ctx = tx_shims::linux_syscall::SyscallCtx::new(
-                    process.clone(),
-                    thread.clone(),
-                    aspace.clone(),
-                );
-                // drive-taskmb: inject the current task's mailbox so
-                // drive() can park on it for yield resolution.
-                let hart = <P as tx_hal::SmpIf>::current_cpu_id().0;
-                if let Some(mailbox) = crate::adapter::boot_runtime::current_task_mailbox(hart) {
-                    ctx = ctx.with_mailbox(mailbox);
-                }
-                // drive-taskmb: inject the reactor's timer wheel for
-                // OnTimer yield resolution.
-                if let Some(tw) = crate::adapter::boot_runtime::current_timer_wheel(hart) {
-                    ctx = ctx.with_timer_wheel(tw);
-                }
-                // drive-taskmb: inject the reactor's delegate registry
-                // for OnAgent yield resolution.
-                if let Some(dr) = crate::adapter::boot_runtime::current_delegate_registry(hart) {
-                    ctx = ctx.with_delegate_registry(dr);
-                }
+                emit_syscall_roundtrip_marker(req.nr, b"debug.thread.process.after");
                 let sigreturn_ctx = payload.saved_user_context();
-                let result = tx_shims::linux_syscall::dispatch::<P>(req, &ctx).await;
+                let result = if let Some(result) =
+                    tx_shims::linux_syscall::dispatch_thread_exit_oneshot(&req, &thread)
+                {
+                    emit_syscall_roundtrip_marker(req.nr, b"debug.thread.oneshot.after");
+                    result
+                } else if let Some(result) =
+                    tx_shims::linux_syscall::dispatch_cap_only_immediate(&req, &process)
+                {
+                    emit_syscall_roundtrip_marker(req.nr, b"debug.thread.immediate.after");
+                    result
+                } else {
+                    let Some(aspace) = process.aspace_cap() else {
+                        // Process zombified concurrently; stop.
+                        return;
+                    };
+                    emit_syscall_roundtrip_marker(req.nr, b"debug.thread.aspace.after");
+                    if let Some(result) = tx_shims::linux_syscall::dispatch_thread_aspace_oneshot(
+                        &req, &thread, &aspace,
+                    ) {
+                        emit_syscall_roundtrip_marker(req.nr, b"debug.thread.oneshot.after");
+                        result
+                    } else if let Some(result) =
+                        tx_shims::linux_syscall::dispatch_vm_try_oneshot(&req, &aspace)
+                    {
+                        emit_syscall_roundtrip_marker(req.nr, b"debug.thread.oneshot.after");
+                        result
+                    } else if let Some(result) = tx_shims::linux_syscall::dispatch_clone_oneshot::<P>(
+                        &req, &process, &thread, &aspace,
+                    ) {
+                        emit_syscall_roundtrip_marker(req.nr, b"debug.thread.oneshot.after");
+                        result
+                    } else if let Some(result) =
+                        tx_shims::linux_syscall::dispatch_process_aspace_immediate(
+                            &req, &process, &aspace,
+                        )
+                    {
+                        emit_syscall_roundtrip_marker(req.nr, b"debug.thread.immediate.after");
+                        result
+                    } else {
+                        let ctx_process = process.clone();
+                        emit_syscall_roundtrip_marker(
+                            req.nr,
+                            b"debug.thread.ctx.process_clone.after",
+                        );
+                        let ctx_thread = thread.clone();
+                        emit_syscall_roundtrip_marker(
+                            req.nr,
+                            b"debug.thread.ctx.thread_clone.after",
+                        );
+                        let ctx_aspace = aspace.clone();
+                        emit_syscall_roundtrip_marker(
+                            req.nr,
+                            b"debug.thread.ctx.aspace_clone.after",
+                        );
+                        let cred_snapshot = process
+                            .cred_snapshot()
+                            .unwrap_or_else(tx_subsystems::cred::CredSnapshot::root);
+                        emit_syscall_roundtrip_marker(
+                            req.nr,
+                            b"debug.thread.ctx.cred_snapshot.after",
+                        );
+                        let mut ctx =
+                            tx_shims::linux_syscall::SyscallCtx::from_parts_with_cred_snapshot(
+                                ctx_process,
+                                ctx_thread,
+                                ctx_aspace,
+                                cred_snapshot,
+                            );
+                        emit_syscall_roundtrip_marker(req.nr, b"debug.thread.ctx.after");
+                        // drive-taskmb: inject the current task's mailbox so
+                        // drive() can park on it for yield resolution.
+                        let hart = <P as tx_hal::SmpIf>::current_cpu_id().0;
+                        if let Some(mailbox) =
+                            crate::adapter::boot_runtime::current_task_mailbox(hart)
+                        {
+                            ctx = ctx.with_mailbox(mailbox);
+                        }
+                        emit_syscall_roundtrip_marker(req.nr, b"debug.thread.mailbox.after");
+                        // drive-taskmb: inject the reactor's timer wheel for
+                        // OnTimer yield resolution.
+                        if let Some(tw) = crate::adapter::boot_runtime::current_timer_wheel(hart) {
+                            ctx = ctx.with_timer_wheel(tw);
+                        }
+                        emit_syscall_roundtrip_marker(req.nr, b"debug.thread.timer.after");
+                        // drive-taskmb: inject the reactor's delegate registry
+                        // for OnAgent yield resolution.
+                        if let Some(dr) =
+                            crate::adapter::boot_runtime::current_delegate_registry(hart)
+                        {
+                            ctx = ctx.with_delegate_registry(dr);
+                        }
+                        emit_syscall_roundtrip_marker(req.nr, b"debug.thread.delegate.after");
+                        emit_syscall_roundtrip_marker(req.nr, b"debug.thread.saved_ctx.after");
+                        emit_syscall_roundtrip_marker(req.nr, b"debug.thread.dispatch.before");
+                        let result = if let Some(result) =
+                            tx_shims::linux_syscall::dispatch_pthread_hot_oneshot(req, &ctx)
+                        {
+                            result
+                        } else if let Some(result) =
+                            tx_shims::linux_syscall::dispatch_writev_pagebacked_oneshot(&req, &ctx)
+                        {
+                            emit_syscall_roundtrip_marker(
+                                req.nr,
+                                b"debug.thread.dispatch.writev_pagebacked.after",
+                            );
+                            result
+                        } else if req.nr == NR_WRITEV {
+                            let fut = tx_shims::linux_syscall::dispatch_writev_hot(req, &ctx);
+                            emit_syscall_roundtrip_marker(
+                                req.nr,
+                                b"debug.thread.dispatch.writev_future.after",
+                            );
+                            let fut = Box::pin(fut);
+                            emit_syscall_roundtrip_marker(
+                                req.nr,
+                                b"debug.thread.dispatch.writev_box.after",
+                            );
+                            fut.await
+                                .expect("writev hot dispatch prefilter covers writev")
+                        } else if matches!(req.nr, NR_MMAP | NR_MPROTECT | NR_MUNMAP) {
+                            Box::pin(tx_shims::linux_syscall::dispatch_vm_hot(req, &ctx))
+                                .await
+                                .expect("VM hot dispatch prefilter covers mmap/mprotect/munmap")
+                        } else {
+                            Box::pin(tx_shims::linux_syscall::dispatch::<P>(req, &ctx)).await
+                        };
+                        emit_syscall_roundtrip_marker(req.nr, b"debug.thread.dispatch.after");
+                        result
+                    }
+                };
 
-                // Threshold-based observation dump. If the boot path
-                // installed a non-zero `OBSERVE_DUMP_THRESHOLD` (see
-                // `tx_observe::set_dump_threshold`), every emit ticks
-                // a global counter; once it crosses the threshold, this
-                // syscall return dumps the ring over the console and
-                // powers off the platform. Captures a bounded trace from
-                // workloads where init never naturally exits (e.g.
-                // oscomp's continuous test-group sequence).
-                if tx_observe::should_dump_now() {
-                    tx_observe::dump_console_hex::<P>(<P as tx_hal::SmpIf>::current_cpu_id());
-                    tx_hal::console_write_str::<P>(":observe:dump:threshold\n");
-                    <P as tx_hal::PowerIf>::system_off();
-                }
+                dump_observe_threshold_if_ready::<P>();
 
                 match result {
                     tx_shims::linux_syscall::SyscallResult::Return(v) => {
                         payload.store_pending_syscall_return(Some(Ok(v)));
+                    }
+                    tx_shims::linux_syscall::SyscallResult::CloneReturn { value, .. } => {
+                        payload.store_pending_syscall_return(Some(Ok(value)));
                     }
                     tx_shims::linux_syscall::SyscallResult::Error(e) => {
                         payload.store_pending_syscall_return(Some(Err(e)));
@@ -681,6 +833,9 @@ pub async fn run_thread<P: TxPlatform>(
                             );
                             return;
                         };
+                        let Some(aspace) = process.aspace_cap() else {
+                            return;
+                        };
                         if restore_sigreturn_frame::<P>(&thread, &aspace, &payload, &sigreturn_ctx)
                             .is_err()
                         {
@@ -692,8 +847,24 @@ pub async fn run_thread<P: TxPlatform>(
                         }
                     }
                 }
+                emit_syscall_roundtrip_marker(req.nr, b"debug.thread.return.stored");
+                last_entry_sysno = Some(req.nr);
+                if syscall_return_needs_handoff(&req, &result) {
+                    // Successful clone publishes a child task to the reactor.
+                    // Defer one handoff until the next syscall boundary so
+                    // the child can be observed before clone storms dominate
+                    // already-runnable peers.
+                    syscall_handoff_pending = true;
+                }
+                dump_observe_threshold_if_ready::<P>();
             }
             UserspaceTrapInfo::PageFault(info) => {
+                emit_thread_debug_value(b"debug.thread.page_fault.before", 1);
+                emit_thread_debug_value(b"debug.thread.page_fault.addr", info.addr.raw() as i64);
+                emit_thread_debug_value(
+                    b"debug.thread.page_fault.access",
+                    page_fault_access_code(info.access),
+                );
                 // Per `txdoc:VM-5-1-FAULT-HANDLER` and
                 // `txdoc:VM-3-6-CROSS-ASYNC-WAIT-DISCIPLINE`: drive
                 // the canonical async fault script. On Ok the recipe
@@ -721,14 +892,21 @@ pub async fn run_thread<P: TxPlatform>(
                     UserVirtAddr::new(info.addr.raw() as usize),
                     pf_access_to_vm_access(info.access),
                 );
-                match aspace.fault_script(fault).await {
+                dump_observe_threshold_if_ready::<P>();
+                match Box::pin(aspace.fault_script(fault)).await {
                     Ok(_) => {
                         // Mapping was published; fall through to AST
                         // drain + entry-prep tail (same path as a
                         // successful syscall, minus the
                         // `pending_syscall_return` write).
+                        emit_thread_debug_value(b"debug.thread.page_fault.ok", 1);
+                        dump_observe_threshold_if_ready::<P>();
                     }
                     Err(e) => {
+                        emit_thread_debug_value(
+                            b"debug.thread.page_fault.err",
+                            vm_fault_error_code(e),
+                        );
                         log_user_segv::<P>(&payload, info.addr.raw(), info.access, "pf", e);
                         log_nearby_recipes::<P>(&aspace, info.addr.raw() as usize);
                         deliver_synchronous_fault(&thread, Signum::SIGSEGV);
@@ -753,6 +931,122 @@ pub async fn run_thread<P: TxPlatform>(
         // Fall through to the top of the loop — next iteration
         // re-opens the entry-side wait, re-runs the AST checkpoint,
         // and re-dives into userspace with the merged context.
+    }
+}
+
+pub(crate) fn syscall_return_needs_handoff(req: &SyscallRequest, result: &SyscallResult) -> bool {
+    match (req.nr, result) {
+        (NR_CLONE, SyscallResult::Return(_)) => true,
+        (
+            NR_CLONE,
+            SyscallResult::CloneReturn {
+                child_submit: tx_subsystems::reactor_submit::SubmitChildThreadStatus::QueuedFallback,
+                ..
+            },
+        ) => true,
+        (
+            NR_CLONE,
+            SyscallResult::CloneReturn {
+                child_submit: tx_subsystems::reactor_submit::SubmitChildThreadStatus::Published,
+                ..
+            },
+        ) => true,
+        _ => false,
+    }
+}
+
+pub(crate) fn syscall_return_may_publish_wake_handoff(
+    req: &SyscallRequest,
+    result: &SyscallResult,
+) -> bool {
+    let SyscallResult::Return(woken) = result else {
+        return false;
+    };
+    if *woken <= 0 || req.nr != NR_FUTEX {
+        return false;
+    }
+    let op = (req.args[1] as u32) & FUTEX_CMD_MASK;
+    matches!(op, FUTEX_WAKE | FUTEX_WAKE_BITSET)
+}
+
+fn emit_syscall_roundtrip_marker(sysno: u64, name: &[u8]) {
+    if !cfg!(tx_thread_roundtrip_metrics) {
+        return;
+    }
+    if !matches!(
+        sysno,
+        tx_shims::linux_syscall::numbers::NR_GETPPID
+            | NR_CLONE
+            | NR_RT_SIGPROCMASK
+            | NR_MMAP
+            | NR_MPROTECT
+            | NR_MUNMAP
+            | NR_WRITEV
+    ) {
+        return;
+    }
+    if let Some(observer) = tx_observe::current() {
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            sysno as i64,
+        );
+        tx_observe::dump_registered_if_requested();
+    }
+}
+
+fn emit_thread_debug_value(name: &[u8], value: i64) {
+    if !cfg!(tx_thread_roundtrip_metrics) {
+        return;
+    }
+    if let Some(observer) = tx_observe::current() {
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            value,
+        );
+        tx_observe::dump_registered_if_requested();
+    }
+}
+
+fn trap_kind_code(trap: &UserspaceTrapInfo) -> i64 {
+    match trap {
+        UserspaceTrapInfo::TimerPreempt => 1,
+        UserspaceTrapInfo::Syscall(_) => 2,
+        UserspaceTrapInfo::PageFault(_) => 3,
+        UserspaceTrapInfo::Fatal(_) => 4,
+    }
+}
+
+const fn page_fault_access_code(access: PageFaultAccess) -> i64 {
+    match access {
+        PageFaultAccess::Read => 1,
+        PageFaultAccess::Write => 2,
+        PageFaultAccess::Execute => 3,
+        PageFaultAccess::Unknown => 4,
+    }
+}
+
+const fn vm_fault_error_code(error: tx_subsystems::vm::VmFaultError) -> i64 {
+    use tx_subsystems::vm::VmFaultError;
+
+    match error {
+        VmFaultError::Range(_) => 1,
+        VmFaultError::NoRecipe => 2,
+        VmFaultError::ProtectionViolation => 3,
+        VmFaultError::WouldBlock => 4,
+        VmFaultError::BackingMismatch => 5,
+        VmFaultError::BackingOffsetOverflow => 6,
+        VmFaultError::PageBeyondSize => 7,
+        VmFaultError::PageCache(_) => 8,
+        VmFaultError::StaleRecipe => 9,
+        VmFaultError::Pmap(_) => 10,
+    }
+}
+
+fn dump_observe_threshold_if_ready<P: TxPlatform>() {
+    if tx_observe::should_dump_now() {
+        tx_observe::dump_console_hex::<P>(<P as tx_hal::SmpIf>::current_cpu_id());
+        tx_hal::console_write_str::<P>(":observe:dump:threshold\n");
+        <P as tx_hal::PowerIf>::system_off();
     }
 }
 
@@ -850,12 +1144,12 @@ fn log_recipe<P: TxPlatform>(label: &str, entry: &VmEntry) {
     tx_hal::console_write_str::<P>(if entry.prot.write { "w" } else { "-" });
     tx_hal::console_write_str::<P>(if entry.prot.execute { "x" } else { "-" });
     tx_hal::console_write_str::<P>(":backing=");
-    match &entry.backing {
-        VmBacking::None => tx_hal::console_write_str::<P>("none"),
-        VmBacking::PrivateAnon => tx_hal::console_write_str::<P>("anon"),
-        VmBacking::Page { offset, .. } => {
+    match entry.backing_kind() {
+        VmEntryBacking::None => tx_hal::console_write_str::<P>("none"),
+        VmEntryBacking::PrivateAnon => tx_hal::console_write_str::<P>("anon"),
+        VmEntryBacking::Page { offset } => {
             tx_hal::console_write_str::<P>("page@0x");
-            write_hex_u64::<P>(*offset);
+            write_hex_u64::<P>(offset);
         }
     }
     tx_hal::console_write_str::<P>("\n");

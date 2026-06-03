@@ -639,6 +639,22 @@ drive the observation pipeline without memorising daemon CLI flags.
 | `observe validate --file <path>` | Parse the file header, walk slots, print a one-line summary: `txtrace v0: 1 hart, 16 slots/hart, 4 records, 0 framing errors`. Fast CI smoke check. |
 | `observe replay --file <path> [--out json\|pftrace] [--output <path>] [--filter level=N]` | Decode a `.txtrace` file. Default `--out json` writes NDJSON to stdout (pipeable to `jq`). With `--out pftrace --output <path>` writes a Perfetto `.pftrace` file. |
 | `observe pftrace --file <path> --output <pftrace>` | Convenience alias for `replay --out pftrace`; avoids remembering two flags for the common Perfetto case. |
+| `observe bundle (--file <txtrace>\|--serial <log>) --output-dir <dir> [--names <names.json>] [--kernel <elf>]` | Build a self-contained daemon runtime directory. The directory contains `trace.txtrace`, `replay.ndjson`, `trace.pftrace`, optional `names.json`, optional `serial.txt`, and `runtime.json`. `runtime.json` records per-hart producer/consumer/lost/framing stats plus `complete=true` only when the visible window has no lost, overwritten, or malformed records. |
+| `observe live-guest-mem --guest-mem <ram-file> --kernel <elf> --output-dir <dir> [--stop-file <path>] [--hart-count N] [--ring-bytes N]` | Drain the rv64-qemu board rings from a QEMU `memory-backend-file` guest-RAM image while the guest runs. The daemon locates `TX_OBSERVE_RINGS` in the kernel ELF, writes hot-path slots to `trace.rawrecords`, then post-processes `replay.ndjson` and `trace.pftrace` after stop before writing `runtime.json` with the drained record count plus final per-hart ring stats. |
+
+Console extraction is an offline host path, not a logging transport. The kernel
+serializes one compact `txtrace-v0` snapshot that contains every initialized
+hart ring selected by the dump mask. Each ring is re-packed to the smallest
+power-of-two slot count that still covers its visible producer window, and all
+rings in the snapshot share the maximum required order. This keeps SMP dumps
+host-decodable without emitting the full board backing buffer over UART.
+
+For OSComp runs, `tools/oscomp-custom-run.py --observe-bundle-dir <dir>` builds
+a post-run runtime directory from the serial snapshot, while
+`--observe-host-dir <dir>` starts the live guest-RAM daemon, configures QEMU
+with a file-backed RAM object, and leaves all runtime files under that host
+directory. The live path is the one to use when the workload can emit more
+events than the finite board rings retain at exit.
 
 The daemon CLI surface is documented in [`08_OBSERVATION_HOST_v0.md`](08_OBSERVATION_HOST_v0.md).
 

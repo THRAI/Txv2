@@ -14,15 +14,15 @@ use crate::mount::{
     DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, SourceLabel,
 };
 use crate::page_backed::FsPageBacking;
-use crate::vfs::adapter::step_engine::{guard, reserve_for, sign_for, Cap};
+use crate::vfs::FsOps;
+use crate::vfs::adapter::step_engine::{Cap, guard, reserve_for, sign_for};
 use crate::vfs::structure::{
     Credential, DEntry, FsObjectId, InlineName, InodeKind, InodeMeta, OpenFileFlags, RNode,
     RNodeBacking, S_IFDIR,
 };
 use crate::vfs::walker::{step_open, step_walk};
-use crate::vfs::FsOps;
 
-use super::{init_zones, TestFs};
+use super::{TestFs, init_zones};
 
 // === fixture: rootfs over TestFs ===================================
 
@@ -128,6 +128,47 @@ fn step_walk_resolves_multi_component_path() {
         }
         other => panic!("expected Done(baz), got {other:?}"),
     }
+}
+
+#[test]
+fn step_walk_caches_regular_file_positive_lookup() {
+    use crate::vfs::adapter::step_engine::StepOutcome as V3;
+
+    let _serial = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_zones();
+    let topo = build_rootfs_v3();
+
+    let file_id = topo.rootfs.add_regular(FsObjectId::new(2), b"file");
+    let cred = Credential::root();
+    let guard = guard();
+
+    let first = step_walk(topo.root_dentry.clone(), b"/file", &cred, &guard);
+    match first {
+        V3::Done(dentry) => {
+            assert_eq!(dentry.name().as_bytes(), b"file");
+            assert_eq!(dentry.rnode().fs_object_id(), file_id);
+        }
+        other => panic!("expected first walk to materialise file, got {other:?}"),
+    }
+    let first_counts = topo.rootfs.lookup_counts();
+    assert_eq!(first_counts, (1, 1, 1));
+
+    let second = step_walk(topo.root_dentry.clone(), b"/file", &cred, &guard);
+    match second {
+        V3::Done(dentry) => {
+            assert_eq!(dentry.name().as_bytes(), b"file");
+            assert_eq!(dentry.rnode().fs_object_id(), file_id);
+        }
+        other => panic!("expected cached second walk, got {other:?}"),
+    }
+    assert_eq!(
+        topo.rootfs.lookup_counts(),
+        first_counts,
+        "positive dcache hits for regular files must avoid backend lookup/meta/materialise"
+    );
+    drop(guard);
 }
 
 // Cascade flake: fails under workspace serial-test order due to the

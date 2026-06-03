@@ -11,22 +11,19 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 pub mod adapter;
+pub mod notification;
 
 use adapter::step_engine::{
-    eagain, eagain_no_progress, sign, yield_until_readable, yield_until_writable, ByteOutcome,
-    ByteProgress, Cap, NoProgress, OneShotStepOp, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
-    V3Errno, WaitSource, Zone, ZoneAllocated, ZoneError,
+    eagain, eagain_no_progress, sign, ByteOutcome, ByteProgress, Cap, NoProgress, OneShotStepOp,
+    ScriptCtx, StepOp, StepOutcome, SubjectIdentity, V3Errno, WaitSource, Zone, ZoneAllocated,
+    ZoneError,
 };
-use adapter::wait_routing::{self, Channel};
-
-use crate::wait_source;
+use adapter::wait_routing::Channel;
 
 pub const EFD_CLOEXEC: u32 = 0o2000000;
 pub const EFD_NONBLOCK: u32 = 0o4000;
 pub const EFD_SEMAPHORE: u32 = 0x1;
 
-pub const EVENTFD_READABLE: u64 = 0x1;
-pub const EVENTFD_WRITABLE: u64 = 0x2;
 pub const EVENTFD_MAX: u64 = u64::MAX - 1;
 
 pub struct EventFd {
@@ -42,34 +39,33 @@ pub struct EventFd {
 
 impl EventFd {
     pub fn new(init_val: u64, flags: u32) -> Self {
-        let reader_channel = Channel::new();
-        let writer_channel = Channel::new();
-        let reader_source_id = wait_source::register_wait_channel(reader_channel.clone());
-        let writer_source_id = wait_source::register_wait_channel(writer_channel.clone());
-        let reader_source = Some(wait_routing::new_wait_source(reader_source_id));
-        let writer_source = Some(wait_routing::new_wait_source(writer_source_id));
+        let wait_points = notification::new_wait_points();
 
         let readable = init_val != 0;
         let writable = init_val < EVENTFD_MAX;
 
         if readable {
-            wait_routing::fire_legacy_channel(&reader_channel, EVENTFD_READABLE);
-            wait_routing::notify_v3_source(reader_source.as_ref().unwrap(), EVENTFD_READABLE);
+            notification::notify_readable(
+                Some(&wait_points.reader_channel),
+                Some(&wait_points.reader_source),
+            );
         }
         if writable {
-            wait_routing::fire_legacy_channel(&writer_channel, EVENTFD_WRITABLE);
-            wait_routing::notify_v3_source(writer_source.as_ref().unwrap(), EVENTFD_WRITABLE);
+            notification::notify_writable(
+                Some(&wait_points.writer_channel),
+                Some(&wait_points.writer_source),
+            );
         }
 
         EventFd {
             counter: AtomicU64::new(init_val),
             flags: AtomicU64::new(flags as u64),
-            reader_source_id,
-            writer_source_id,
-            reader_channel: Some(reader_channel),
-            writer_channel: Some(writer_channel),
-            reader_source,
-            writer_source,
+            reader_source_id: wait_points.reader_source_id,
+            writer_source_id: wait_points.writer_source_id,
+            reader_channel: Some(wait_points.reader_channel),
+            writer_channel: Some(wait_points.writer_channel),
+            reader_source: Some(wait_points.reader_source),
+            writer_source: Some(wait_points.writer_source),
         }
     }
 
@@ -125,7 +121,7 @@ pub fn step_eventfd_read(efd: &EventFd, out: &mut [u8; 8], nonblocking: bool) ->
                 if nonblocking {
                     return eagain();
                 }
-                return yield_until_readable(efd.reader_source_id, EVENTFD_READABLE);
+                return notification::wait_until_readable(efd.reader_source_id);
             }
             if efd
                 .counter
@@ -145,7 +141,7 @@ pub fn step_eventfd_read(efd: &EventFd, out: &mut [u8; 8], nonblocking: bool) ->
         if nonblocking {
             return eagain();
         }
-        return yield_until_readable(efd.reader_source_id, EVENTFD_READABLE);
+        return notification::wait_until_readable(efd.reader_source_id);
     }
     out.copy_from_slice(&val.to_le_bytes());
     efd.fire_writable();
@@ -172,7 +168,7 @@ pub fn step_eventfd_write(
             if nonblocking {
                 return eagain_no_progress();
             }
-            return yield_until_writable(efd.writer_source_id, EVENTFD_WRITABLE);
+            return notification::wait_until_writable(efd.writer_source_id);
         }
         let new_val = current + val;
         if efd
@@ -190,20 +186,10 @@ pub fn step_eventfd_write(
 
 impl EventFd {
     fn fire_readable(&self) {
-        if let Some(ref ch) = self.reader_channel {
-            wait_routing::fire_legacy_channel(ch, EVENTFD_READABLE);
-        }
-        if let Some(ref src) = self.reader_source {
-            wait_routing::notify_v3_source(src, EVENTFD_READABLE);
-        }
+        notification::notify_readable(self.reader_channel.as_ref(), self.reader_source.as_ref());
     }
     fn fire_writable(&self) {
-        if let Some(ref ch) = self.writer_channel {
-            wait_routing::fire_legacy_channel(ch, EVENTFD_WRITABLE);
-        }
-        if let Some(ref src) = self.writer_source {
-            wait_routing::notify_v3_source(src, EVENTFD_WRITABLE);
-        }
+        notification::notify_writable(self.writer_channel.as_ref(), self.writer_source.as_ref());
     }
 }
 

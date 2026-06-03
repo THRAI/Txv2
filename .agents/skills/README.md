@@ -32,6 +32,9 @@ Current orientation skills:
 - `tx-oscomp-musl-debug` captures the named-worktree OSComp/LTP musl debugging
   workflow, including tailored sdcard/QEMU runs, fault/trap tools, focused host
   reductions, merge catch-up, and progress recording.
+- `tx-observe` covers kernel-side `tx-observe` emit points, txtrace ABI
+  changes, trace-daemon replay/live host drain, Perfetto tracks, OSComp trace
+  windows, page-fault/cold-cache probes, and allocation-track probes.
 - `tx-process-threadruntime` covers Process, ThreadRuntime, signal, syscall,
   exec, first-userspace, and runtime integration seams.
 - `tx-progress-memory` records or resumes durable decisions, plans, handoffs,

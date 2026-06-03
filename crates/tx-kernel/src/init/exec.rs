@@ -332,6 +332,13 @@ impl<P: TxPlatform> CoreInit<P> {
     pub(super) fn drive_bootstrap_exec() {
         use tx_subsystems::vfs::Credential;
 
+        let bsp = <P as tx_hal::PercpuIf>::current_cpu_id();
+        let _ = tx_observe::init::<P>(bsp);
+        tx_observe::register_dump_shutdown::<P>();
+        tx_observe::register_pre_dump_hook(tx_subsystems::vm::dump_debug_phase_totals::<P>);
+        tx_observe::set_dump_threshold(crate::OBSERVE_DUMP_THRESHOLD);
+        tx_observe::set_trace_off_requests_dump(!oscomp_bench_observe_live_drain::<P>());
+
         let init = tx_subsystems::process::execution::init_process()
             .expect("drive_bootstrap_exec: INIT_PROCESS must be populated");
         let thread = init
@@ -637,6 +644,7 @@ impl<P: TxPlatform> CoreInit<P> {
         let submitted = BOOT_REACTOR.with(|reactor| {
             reactor.submit_task_with_meta_from_hart(
                 crate::thread_future::PerHartSlotted::<P, _>::new(
+                    thread.clone(),
                     wrapper_payload,
                     crate::thread_future::run_thread::<P>(submit_thread, future_payload),
                 ),
@@ -680,6 +688,12 @@ impl<P: TxPlatform> CoreInit<P> {
                 continue;
             }
 
+            // Reclaim terminal child reactor tasks before publishing new
+            // clone children. Without this, pthread create/join loops keep
+            // allocating fresh task slots even though the exited child futures
+            // have already reached a terminal reactor state.
+            let drained_terminal_before_poll = Self::drain_terminal_thread_reactor_tasks();
+
             // Drain any pending child-thread submits posted from
             // sys_clone *before* polling the reactor again. This is
             // the per-loop visibility seam — submits enqueued during
@@ -688,10 +702,14 @@ impl<P: TxPlatform> CoreInit<P> {
             // ran under.
             let submitted_child_before_poll = Self::drain_pending_child_submits();
 
-            let step = match Self::step_boot_reactor_once_concurrent(current_cpu) {
+            // The userspace trap shell returns through a longjmp-like path, so
+            // do not carry a pre-entry CpuId local across reactor iterations.
+            let loop_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
+            let step = match Self::step_boot_reactor_once_concurrent(loop_cpu) {
                 Some(step) => step,
                 None => break,
             };
+            let drained_terminal_after_poll = Self::drain_terminal_thread_reactor_tasks();
             let submitted_child_after_poll = Self::drain_pending_child_submits();
 
             // EBR drain. Caps retired during the task polls above
@@ -712,17 +730,29 @@ impl<P: TxPlatform> CoreInit<P> {
             // rounds to fully propagate; iteration cadence (driven by
             // task polls + 5 ms timer ticks) finishes that in well
             // under a millisecond.
-            let drain_stats = step_engine::drain_with_budget(64);
+            let drain_stats = if step.should_idle() {
+                step_engine::drain_with_budget(64)
+            } else {
+                Default::default()
+            };
+            let vm_recipe_reclaims = if step.should_idle() {
+                tx_subsystems::vm::drain_deferred_recipe_reclaims(64)
+            } else {
+                0
+            };
 
             // Don't enter WFI if EBR reclaimed anything (reclaim callbacks
             // may have called wake_by_ref() on parked tasks, which is
             // invisible to step.should_idle() computed before the drain) or
             // if there are items still pending reclamation (need more epoch
             // advances before they can be reclaimed).
-            let ebr_active = drain_stats.reclaimed > 0 || drain_stats.remaining > 0;
+            let ebr_active =
+                drain_stats.reclaimed > 0 || drain_stats.remaining > 0 || vm_recipe_reclaims > 0;
             if step.should_idle()
                 && !submitted_child_before_poll
                 && !submitted_child_after_poll
+                && !drained_terminal_before_poll
+                && !drained_terminal_after_poll
                 && !ebr_active
                 && !init.is_zombie()
             {
@@ -741,6 +771,9 @@ impl<P: TxPlatform> CoreInit<P> {
                     P::set_deadline_ns(
                         P::read_ns().saturating_add(crate::init::IDLE_TIMER_PERIOD_NS),
                     );
+                }
+                if Self::poll_boot_reactor_idle_window(boot_runtime::HartId(loop_cpu.0)) {
+                    continue;
                 }
                 P::wait_for_interrupt_once();
                 if P::pending_ipi(IpiKind::Reschedule) {
@@ -767,6 +800,7 @@ impl<P: TxPlatform> CoreInit<P> {
                 // never reaches. This ensures EOF propagates within a
                 // few timer ticks (~20 ms) after the last writer closes.
                 let _ = step_engine::drain_with_budget(usize::MAX);
+                let _ = tx_subsystems::vm::drain_deferred_recipe_reclaims(usize::MAX);
             }
         }
 
@@ -835,6 +869,8 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
     use alloc::string::String;
 
     let mut cmd = String::from("cd /musl/musl");
+    let bench_observe_enabled = oscomp_bench_observe_enabled::<P>();
+    let bench_observe_threshold = oscomp_bench_observe_threshold::<P>();
     let mut selected = 0usize;
     if let Some(groups) = oscomp_groups_from_cmdline::<P>() {
         for group in groups.split(',') {
@@ -843,7 +879,11 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
                 continue;
             }
             if group == "all" {
-                append_default_oscomp_scripts(&mut cmd);
+                append_default_oscomp_scripts(
+                    &mut cmd,
+                    bench_observe_enabled,
+                    bench_observe_threshold,
+                );
                 return cmd;
             }
             if let Some(filter) = group.strip_prefix("libctest-musl:") {
@@ -862,13 +902,21 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
                 continue;
             }
             if let Some(script) = oscomp_musl_script_for_group(group) {
-                append_oscomp_musl_script(&mut cmd, script);
+                append_oscomp_musl_script_with_observe(
+                    &mut cmd,
+                    script,
+                    bench_observe_enabled,
+                    bench_observe_threshold,
+                );
+                selected += 1;
+            } else if matches!(group, "lmbench-probe" | "lmbench-probe-musl") {
+                append_lmbench_probe(&mut cmd);
                 selected += 1;
             }
         }
     }
     if selected == 0 {
-        append_default_oscomp_scripts(&mut cmd);
+        append_default_oscomp_scripts(&mut cmd, bench_observe_enabled, bench_observe_threshold);
     }
     cmd
 }
@@ -1029,20 +1077,136 @@ fn oscomp_groups_from_cmdline<P: tx_hal::TxPlatform>() -> Option<&'static str> {
     }
 }
 
-fn append_default_oscomp_scripts(cmd: &mut alloc::string::String) {
+fn oscomp_bench_observe_enabled_from_cmdline(cmdline: Option<&str>) -> bool {
+    let Some(cmdline) = cmdline else {
+        return true;
+    };
+    for token in cmdline.split_ascii_whitespace() {
+        if let Some(value) = token.strip_prefix("tx.oscomp.observe=") {
+            return !matches!(value, "0" | "false" | "off" | "no");
+        }
+    }
+    true
+}
+
+fn oscomp_bench_observe_threshold_from_cmdline(cmdline: Option<&str>) -> Option<u64> {
+    let cmdline = cmdline?;
+    for token in cmdline.split_ascii_whitespace() {
+        if let Some(value) = token.strip_prefix("tx.oscomp.observe_dump=") {
+            if matches!(value, "0" | "false" | "off" | "no") {
+                return Some(0);
+            }
+        }
+    }
+    for token in cmdline.split_ascii_whitespace() {
+        if let Some(value) = token.strip_prefix("tx.oscomp.observe_threshold=") {
+            return value.parse::<u64>().ok().filter(|threshold| *threshold > 0);
+        }
+    }
+    None
+}
+
+pub fn oscomp_bench_observe_live_drain_from_cmdline(cmdline: Option<&str>) -> bool {
+    let Some(cmdline) = cmdline else {
+        return false;
+    };
+    for token in cmdline.split_ascii_whitespace() {
+        if let Some(value) = token.strip_prefix("tx.oscomp.observe_live_drain=") {
+            return matches!(value, "1" | "true" | "on" | "yes");
+        }
+    }
+    false
+}
+
+fn oscomp_bench_observe_enabled<P: tx_hal::TxPlatform>() -> bool {
+    oscomp_bench_observe_enabled_from_cmdline(<P as tx_hal::BootInfoIf>::boot_info().cmdline)
+}
+
+fn oscomp_bench_observe_threshold<P: tx_hal::TxPlatform>() -> Option<u64> {
+    oscomp_bench_observe_threshold_from_cmdline(<P as tx_hal::BootInfoIf>::boot_info().cmdline)
+}
+
+pub fn oscomp_bench_observe_live_drain<P: tx_hal::TxPlatform>() -> bool {
+    oscomp_bench_observe_live_drain_from_cmdline(<P as tx_hal::BootInfoIf>::boot_info().cmdline)
+}
+
+fn append_default_oscomp_scripts(
+    cmd: &mut alloc::string::String,
+    bench_observe_enabled: bool,
+    bench_observe_threshold: Option<u64>,
+) {
     for (_, script) in DEFAULT_OSCOMP_MUSL_SCRIPTS {
         if *script == "libctest_testcode.sh" {
             append_full_libctest(cmd);
         } else {
-            append_oscomp_musl_script(cmd, script);
+            append_oscomp_musl_script_with_observe(
+                cmd,
+                script,
+                bench_observe_enabled,
+                bench_observe_threshold,
+            );
         }
     }
 }
 
+#[cfg(test)]
 fn append_oscomp_musl_script(cmd: &mut alloc::string::String, script: &str) {
+    append_oscomp_musl_script_with_observe(cmd, script, true, None);
+}
+
+fn append_oscomp_musl_script_with_observe(
+    cmd: &mut alloc::string::String,
+    script: &str,
+    bench_observe_enabled: bool,
+    bench_observe_threshold: Option<u64>,
+) {
     use core::fmt::Write as _;
 
+    if script == "libcbench_testcode.sh" {
+        tx_subsystems::vm::reset_debug_phase_totals();
+        tx_observe::set_enabled(bench_observe_enabled);
+        if bench_observe_enabled {
+            tx_observe::reset_ring_and_arm(
+                bench_observe_threshold.unwrap_or(crate::OSCOMP_BENCH_OBSERVE_DUMP_THRESHOLD),
+            );
+        }
+    } else if script == "lmbench_testcode.sh" {
+        tx_subsystems::vm::reset_debug_phase_totals();
+        tx_observe::set_enabled(bench_observe_enabled);
+        if bench_observe_enabled {
+            tx_observe::reset_ring_and_arm(bench_observe_threshold.unwrap_or(5_000));
+        }
+    }
     let _ = write!(cmd, "; ./busybox sh {script}");
+}
+
+fn append_lmbench_probe(cmd: &mut alloc::string::String) {
+    use core::fmt::Write as _;
+
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"#### OS COMP TEST GROUP START lmbench-probe ####\"\
+         ; ./busybox rm -f /tmp/hello\
+         ; ./busybox cp hello /tmp/hello\
+         ; ./busybox echo lmbench-probe:cp-status:$?\
+         ; ./busybox ls -l hello /tmp/hello\
+         ; ./busybox readlink hello\
+         ; ./busybox echo lmbench-probe:readlink-status:$?\
+         ; ./busybox cat hello\
+         ; ./busybox echo\
+         ; ./busybox ls -l /code /code/lmbench_src/bin/build/lmbench_all\
+         ; ./busybox sh /tmp/hello\
+         ; ./busybox echo lmbench-probe:sh-status:$?\
+         ; ./busybox ls -l lmbench_all lat_proc lat_syscall hello\
+         ; ./busybox find /musl -name lmbench_all\
+         ; ./busybox cmp -s hello /tmp/hello\
+         ; ./busybox echo lmbench-probe:cmp-status:$?\
+         ; ./busybox od -An -tx1 -N16 hello\
+         ; ./busybox od -An -tx1 -N16 /tmp/hello\
+         ; /tmp/hello\
+         ; ./busybox echo lmbench-probe:exec-status:$?\
+         ; ./busybox echo \"#### OS COMP TEST GROUP END lmbench-probe ####\""
+    );
 }
 
 const DEFAULT_OSCOMP_MUSL_SCRIPTS: &[(&str, &str)] = &[
@@ -1183,6 +1347,75 @@ mod tests {
         assert!(cmd.contains("./runtest.exe -w entry-dynamic.exe pthread_cancel_points"));
         assert!(cmd.contains("./runtest.exe -w entry-dynamic.exe pthread_cancel"));
         assert!(!cmd.contains("skipped known hang"));
+    }
+
+    #[test]
+    fn oscomp_bench_observe_cmdline_flag_defaults_on_and_accepts_off_values() {
+        assert!(oscomp_bench_observe_enabled_from_cmdline(None));
+        assert!(oscomp_bench_observe_enabled_from_cmdline(Some(
+            "tx.oscomp.groups=libcbench-musl"
+        )));
+        assert!(!oscomp_bench_observe_enabled_from_cmdline(Some(
+            "tx.oscomp.observe=0 tx.oscomp.groups=libcbench-musl"
+        )));
+        assert!(!oscomp_bench_observe_enabled_from_cmdline(Some(
+            "tx.oscomp.observe=off"
+        )));
+        assert!(oscomp_bench_observe_enabled_from_cmdline(Some(
+            "tx.oscomp.observe=1"
+        )));
+    }
+
+    #[test]
+    fn oscomp_bench_observe_threshold_accepts_positive_cmdline_value() {
+        assert_eq!(oscomp_bench_observe_threshold_from_cmdline(None), None);
+        assert_eq!(
+            oscomp_bench_observe_threshold_from_cmdline(Some(
+                "tx.oscomp.observe_threshold=12000 tx.oscomp.groups=lmbench-musl"
+            )),
+            Some(12000)
+        );
+        assert_eq!(
+            oscomp_bench_observe_threshold_from_cmdline(Some("tx.oscomp.observe_threshold=0")),
+            None
+        );
+        assert_eq!(
+            oscomp_bench_observe_threshold_from_cmdline(Some("tx.oscomp.observe_threshold=nope")),
+            None
+        );
+        assert_eq!(
+            oscomp_bench_observe_threshold_from_cmdline(Some(
+                "tx.oscomp.observe_dump=0 tx.oscomp.observe_threshold=12000"
+            )),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn oscomp_bench_observe_live_drain_cmdline_flag_is_explicit() {
+        assert!(!oscomp_bench_observe_live_drain_from_cmdline(None));
+        assert!(!oscomp_bench_observe_live_drain_from_cmdline(Some(
+            "tx.oscomp.observe_dump=0"
+        )));
+        assert!(oscomp_bench_observe_live_drain_from_cmdline(Some(
+            "tx.oscomp.observe_live_drain=1 tx.oscomp.observe=0"
+        )));
+        assert!(oscomp_bench_observe_live_drain_from_cmdline(Some(
+            "tx.oscomp.observe_live_drain=yes"
+        )));
+        assert!(!oscomp_bench_observe_live_drain_from_cmdline(Some(
+            "tx.oscomp.observe_live_drain=0"
+        )));
+    }
+
+    #[test]
+    fn append_lmbench_probe_builds_copy_integrity_probe() {
+        let mut cmd = String::from("cd /musl/musl");
+        append_lmbench_probe(&mut cmd);
+        assert!(cmd.contains("lmbench-probe:cp-status"));
+        assert!(cmd.contains("lmbench-probe:cmp-status"));
+        assert!(cmd.contains("/tmp/hello"));
+        assert!(!cmd.contains("lmbench_testcode.sh"));
     }
 
     #[test]

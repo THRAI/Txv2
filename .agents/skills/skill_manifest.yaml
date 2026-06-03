@@ -130,6 +130,25 @@ skills:
       - crates/tx-shims/src/linux_syscall/signal.rs
     purpose: Debug named-worktree OSComp/LTP musl failures through tailored QEMU runs, serial diagnosis, focused host reductions, merge catch-up, and progress recording.
 
+  tx-observe:
+    sources:
+      - docs/Txv3/08_OBSERVATION_v1.md
+      - docs/Txv3/08_OBSERVATION_SERIALIZATION_v0.md
+      - docs/Txv3/08_OBSERVATION_HOST_v0.md
+      - crates/tx-observe/src/lib.rs
+      - crates/tx-observe-types/src/record.rs
+      - crates/tx-observe-types/src/payload.rs
+      - crates/tx-observe-types/src/header.rs
+      - tools/tx-trace-daemon/src/main.rs
+      - tools/tx-trace-daemon/src/decode.rs
+      - tools/tx-trace-daemon/src/replay.rs
+      - tools/tx-trace-daemon/src/perfetto/writer.rs
+      - tools/tx-trace-daemon/src/perfetto/track.rs
+      - xtask/src/observe.rs
+      - tools/tx-observe-analyze.py
+      - docs/progress/STATUS.md
+    purpose: Guide tx-observe emit points, txtrace ABI work, trace-daemon replay/live host drain, Perfetto tracks, OSComp trace windows, page-fault/cold-cache probes, and allocation-track probes.
+
   tx-progress-memory:
     sources:
       - docs/progress/README.md

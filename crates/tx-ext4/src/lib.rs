@@ -13,6 +13,7 @@ pub mod mount;
 pub mod namespace;
 pub mod pager;
 mod read_backend;
+mod sync;
 
 #[cfg(test)]
 mod tests_v3;

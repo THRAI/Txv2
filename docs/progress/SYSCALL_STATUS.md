@@ -17,24 +17,23 @@ inner loop; OSComp + LTP are the correctness bar. When a syscall lands,
 record which specific OSComp/LTP test(s) closed it under "Currently
 passing" below.
 
-**Last refresh:** 2026-05-18 (initial seed; OSComp/LTP gold-standard
-framing added same day).
+**Last refresh:** 2026-05-24 (pipe/splice tail wired after the
+event-notification numbering slice; human priority table realigned to the
+Linux RV64 v6.17 reference-backed missing table).
 
 ## Headline counts
 
-- `pub const NR_*` defined in `numbers.rs`: **119**
-- Dispatched in `mod.rs` (per match arms): **~96**
-- Currently stubbed (returns `-ENOSYS`): see "Already-partial" below.
-- Outright unwired (no `NR_*` definition, no arm): **~116** syscalls — see
-  categorized list below.
+- `pub const NR_*` defined in `numbers.rs`: **200**
+- Dispatched in `mod.rs` (per match arms): **196**
+- Defined but not dispatched: **4** (`GETPEERNAME`, `GETSOCKOPT`,
+  `SHUTDOWN`, `SOCKETPAIR`).
+- True missing from local `numbers.rs` vs Linux RV64 v6.17: **120**.
+- Number mismatches vs Linux RV64 v6.17: **0**.
+- Local `NR_*` extras not in the Linux RV64 v6.17 reference: **0**.
 
-The numbers above are approximate at seed time. When you change the table,
-recount with:
-
-```sh
-grep -c '^pub const NR_' crates/tx-shims/src/linux_syscall/numbers.rs
-grep -cE 'NR_[A-Z_0-9]+ =>' crates/tx-shims/src/linux_syscall/mod.rs
-```
+The generated sections below are the mechanical source of truth. Recount with
+`cargo xtask syscall-status` or refresh with
+`cargo xtask syscall-status --regen && cargo xtask syscall sync`.
 
 ## High-stakes directions (prioritized by LTP impact ÷ effort)
 
@@ -44,25 +43,83 @@ number of additional LTP tests that move from skipped/failed to runnable.
 
 | Gap | LTP impact | Effort | Substrate status |
 |---|---|---|---|
-| `fork` + CLOEXEC bitmap | +50 fork/exec chain tests | S (~2w) | scaffolded in trio (commit `a70f4a0`); plumbing only |
-| `preadv` / `pwritev` / `fallocate` / `readahead` | +20 | S–M (3–4w) | `writev` loop + VFS hooks exist |
-| POSIX `mq_*` | +15 | M (3–4w) | single kernel queue object, no namespace work |
-| per-process timers (`timer_create` family, `setitimer`, `getrusage`) | +20 | M (2–3w) | deadline tracking shared with `timerfd` |
-| `getrlimit` / `setrlimit` + `sched_getaffinity` | +15 | S (~2w) | per-proc resource field |
-| `sendfile` / `splice` / `copy_file_range` | +15 | M (3–4w) | needs page-cache coherence path |
-| SysV IPC (`msg` / `sem` / `shm`) | +40 | L (6–10w) | new namespace-aware subsystem |
-| Network stack (full socket API) | +60 | XL (12–16w) | no subsystem exists — TCP/UDP state, sockaddr unions, sk_buff |
-| `inotify` / `fanotify` | +10 | M (~3w) | new event queue subsystem |
-| `chroot` / `pivot_root` / `swap*` | +8 | S–M (1–2w) | `chroot` is one field; bdev-fs lands swap |
-| `seccomp` / capabilities / `keyctl` | +15 | L (6–8w) | filter bytecode + keyring |
-| `ptrace` | +20 | XL (12w+) | parallel exec context — out of scope v1 |
-| `bpf` / `perf_event_open` | +10 | XL (12w+) | out of scope v1 |
+| Timer/time tail (`timer_create` family, `getitimer`, `setitimer`, `clock_adjtime`, `adjtimex`) | +18 timer tests | M (3–4w) | wallclock set/get policy, vDSO conversion state, `timerfd`, and `nanosleep` exist; per-process timer ids/signals plus adjustment/slew policy still needed |
+| Lightweight process/sysinfo tail (`waitid`, `clone3`, `pidfd_getfd`, `setns`, `unshare`, `sysinfo`) | +20 process/namespace tests | M–L (4–8w) | wait/clone/pidfd scaffolding exists; namespace view and sysinfo accounting semantics need care |
+| Network completion slice (`socketpair`, `shutdown`, `getpeername`, `getsockopt`, `sendmsg`, `recvmsg`, `sendmmsg`, `recvmmsg`) | +25 socket tests | M–L (4–8w) | socket syscall skeleton exists; four constants are defined-but-no-arm, message-vector ABI still missing |
+| Metadata/xattr tail (`xattr*`) | +15 fs metadata tests | M (3–5w) | chmod/chown fd variants are wired; xattr still needs filesystem-facing storage policy |
+| Modern path/mount APIs (`openat2`, `execveat`, `open_tree`, `move_mount`, `fsopen`/`fsconfig`/`fsmount`/`fspick`, `mount_setattr`) | +15 fs namespace tests | L (6–10w) | path walk/mount objects exist, but Linux open/mount attr ABI needs policy decisions |
+| Event notification depth (`inotify_*`, `fanotify_*`) | +12 event-loop tests | M (3–5w) | `epoll_pwait2` is wired and inotify/fanotify numbers dispatch to scaffold validation; real queues still need VFS fsnotify sources and fanotify-permission policy |
+| `io_uring`/AIO tail (`io_uring_register`, `io_cancel`, `io_pgetevents`, user-mmapped ring depth) | +10 async I/O tests | M (3–5w) | setup, raw AIO core, and a nonblocking `io_uring_enter` scaffold exist; real user-mmapped SQ/CQ parsing and registration remain |
+| Memory policy/advice tail (`mincore`, `mlock2`, `mlockall`, `process_vm_*`, `memfd_create`, memory policy syscalls) | +15 mm tests | L (6–10w) | VM/pagebacked primitives exist; policy and cross-process access need design |
+| Security/observability (`capget`, `capset`, `seccomp`, `keyctl`, `landlock_*`, `bpf`, `perf_event_open`, LSM syscalls) | +15 security/tooling tests | XL (12w+) | mostly new policy engines; keep behind explicit charter |
+| `ptrace` | +20 debugger/process-control tests | XL (12w+) | parallel exec-control model; out of scope for v1 unless explicitly chartered |
 
-**Reading the table.** Best LTP-impact-per-effort: `fork` + CLOEXEC,
-`getrlimit`/`setrlimit`, then `preadv`/`pwritev`/`fallocate`. SysV IPC and the
-network stack are larger but unlock the biggest LTP coverage jumps. `ptrace`
-and `bpf` are explicitly **out of scope for v1** — flag them and move on
-unless the user specifically chartered them.
+**Reading the table.** The no-new-design tranche landed on 2026-05-24:
+`close_range`, resource/scheduler query aliases, positioned/vector file I/O,
+file allocation/cache hints, `copy_file_range`, and fd chmod/chown variants
+are now defined and dispatched. The follow-up easy ABI query/no-op sweep also
+landed on 2026-05-24: `clock_getres`, `getcpu`, `personality`, `getgroups`,
+`restart_syscall`, `sched_setparam`, `getpriority`, `setpriority`,
+`ioprio_get`, and `ioprio_set`. Best remaining impact-per-effort is now
+timer/time probes, lightweight process/sysinfo calls, and network completion.
+The pipe/splice tail also landed on 2026-05-24: `splice`, `tee`, and
+`vmsplice` now use Linux RV64 v6.17 numbers and dispatch through a
+lease-capable pipe/page-backed staging path, with pipe-to-pipe `splice`,
+non-consuming `tee`, `vmsplice` iovec writes, Linux pipe offset-pointer
+`ESPIPE`, known splice flag validation, file/pipe offset-pointer preservation,
+resizable `F_GETPIPE_SZ`/`F_SETPIPE_SZ` pipe capacity, and full-page
+PageBacked lease transfer covered by host tests. `SPLICE_F_GIFT` remains
+explicit tech debt until VM user-page pin/adoption exists.
+The wallclock/vDSO slice also landed on 2026-05-24:
+`clock_settime(CLOCK_REALTIME)`, `settimeofday`, realtime offset state,
+seqlock-protected vDSO conversion snapshots, realtime absolute sleep
+revalidation, and `timerfd` cancel-on-set/rearm semantics. SysV IPC and POSIX mq
+are no longer high-stakes missing rows
+because their syscall numbers are defined and dispatched; remaining work there
+is semantic depth, not missing-table closure. Network is now a completion
+slice rather than "no subsystem exists": the basic socket arms are wired, but
+the four defined-but-no-arm entries plus message-vector syscalls still block a
+broad LTP socket tier. `ptrace`, `bpf`, Landlock, keyrings, and perf remain
+explicit v1 non-goals unless separately chartered.
+
+The event-notification numbering slice also landed on 2026-05-24:
+`epoll_pwait2` now shares the mailbox-backed epoll wait path with
+nanosecond `timespec` timeout parsing, while `inotify_init1`,
+`inotify_add_watch`, `inotify_rm_watch`, `fanotify_init`, and
+`fanotify_mark` are defined and dispatched as deliberate scaffolds. The
+inotify/fanotify arms validate obvious init flag errors and otherwise return
+`ENOSYS` until VFS fsnotify event queues and fanotify permission delegation
+are designed.
+
+The already-partial cleanup on 2026-05-24 closed the stale partial list:
+`io_uring_enter` now resolves ring fds and drains the in-kernel SQ scaffold
+into CQEs, epoll no longer returns `ENOSYS` for nonzero-timeout no-ready waits
+in the host path and reports pending userfaultfd faults as readable, and the
+manual status now matches the already-landed futex REQUEUE/PI,
+userfaultfd phase 2–5, and `rt_sigreturn` implementations.
+
+### Easy Sweep Landed
+
+The no-new-design easy sweep now has host coverage for the fixed v1 behavior:
+
+| Syscall(s) | Landed behavior |
+|---|---|
+| `clock_getres` | validates the same clock IDs as `clock_gettime`, writes fixed `{tv_sec=0, tv_nsec=1}` resolution, and accepts a null result pointer after clock validation |
+| `getcpu` | writes CPU `0` and node `0` for non-null output pointers and ignores the obsolete cache pointer |
+| `personality` | returns the Linux default personality, accepts query/default no-op set, and rejects unsupported changes |
+| `getgroups` | returns 0 groups for non-negative `gidsetsize`, writes no entries, and rejects negative size |
+| `restart_syscall` | explicit `ENOSYS` arm distinguishes it from unknown missing until interrupted-sleep restart exists |
+| `sched_setparam` | validates pid and `sched_param`; accepts priority 0 for current fixed `SCHED_OTHER`; rejects nonzero priority |
+| `getpriority`, `setpriority` | supports `PRIO_PROCESS` self/current process; returns Linux raw nice-0 value 20 and accepts no-op set within Linux nice range |
+| `ioprio_get`, `ioprio_set` | returns default best-effort priority; accepts no-op default self/current sets and rejects unsupported classes |
+
+The following are tempting but **not** easy without design/policy: xattrs
+(filesystem storage contract), `chroot`/modern mount APIs (namespace/path-root
+policy), `vmsplice(SPLICE_F_GIFT)` real user-page gifting beyond the current
+PageBacked file lease path, `waitid`
+(full `siginfo_t`/rusage wait semantics), `setfsuid`/`setfsgid` and
+`capget`/`capset` (credential/security policy), `sysinfo` (global accounting),
+and socket message APIs.
 
 ## OSComp + LTP coverage (the gold standard)
 
@@ -103,62 +160,76 @@ test(s) that newly pass — e.g. *"2026-05-19: `getrlimit01`, `getrlimit02`
 pass after rlimit field landed (commit `<sha>`)"*. The skill's "Done Means"
 requires this entry before the work counts as complete.
 
-## Unwired by topic (~116 syscalls)
+## Unwired by topic (manual grouping)
 
-### File I/O & VFS extras (18)
+This hand-maintained grouping is for planning only. The generated Linux RV64
+v6.17 table below is authoritative for the exact true-missing list and source
+locations.
 
-`preadv`, `pwritev`, `preadv2`, `pwritev2`, `sendfile`, `copy_file_range`,
-`splice`, `tee`, `sync_file_range`, `readahead`, `fallocate`,
-`name_to_handle_at`, `open_by_handle_at`, `fanotify_init` / `_mark`,
-`inotify_init1` / `_add_watch` / `_rm_watch`.
+### Easy ABI query/no-op tail
 
-### Network — entire socket API (20)
+Fixed-model coverage landed for `sched_setparam`, `getpriority`,
+`setpriority`, `getgroups`, `ioprio_get`, `ioprio_set`,
+`restart_syscall`, `clock_getres`, `getcpu`, and `personality` on
+2026-05-24. The current generated counts are `189` defined, `185`
+dispatched, `4` defined-but-no-arm, and `131` true missing. After the
+wallclock/vDSO slice the current generated counts are `191` defined, `187`
+dispatched, `4` defined-but-no-arm, and `129` true missing. After the
+event-notification numbering slice the current generated counts are `197`
+defined, `193` dispatched, `4` defined-but-no-arm, and `123` true missing.
+After the pipe/splice tail the current generated counts are `200` defined,
+`196` dispatched, `4` defined-but-no-arm, and `120` true missing.
 
-`socket`, `socketpair`, `bind`, `listen`, `accept`, `accept4`, `connect`,
-`getsockname`, `getpeername`, `send`, `sendto`, `sendmsg`, `sendmmsg`,
-`recv`, `recvfrom`, `recvmsg`, `recvmmsg`, `shutdown`, `setsockopt`,
-`getsockopt`.
+### File I/O & VFS extras
 
-### IPC SysV (12)
+`name_to_handle_at`, `open_by_handle_at`, `quotactl`, `acct`, `vhangup`.
 
-`msgget` / `msgsnd` / `msgrcv` / `msgctl`, `semget` / `semop` / `semctl` /
-`semtimedop`, `shmget` / `shmat` / `shmctl` / `shmdt`.
+### Network completion
 
-### IPC POSIX queues (10)
+Defined-but-no-arm: `socketpair`, `shutdown`, `getpeername`, `getsockopt`.
+True-missing message-vector and batch calls: `sendmsg`, `recvmsg`, `sendmmsg`,
+`recvmmsg`.
 
-`mq_open` / `_close` / `_unlink` / `_getattr` / `_setattr` / `_send` /
-`_receive` / `_timedsend` / `_timedreceive` / `_notify`.
+### Metadata and filesystem events
 
-### Memory extended (8)
+`setxattr`, `lsetxattr`, `fsetxattr`, `getxattr`, `lgetxattr`, `fgetxattr`,
+`listxattr`, `llistxattr`, `flistxattr`, `removexattr`, `lremovexattr`,
+`fremovexattr`. Event-notification numbers are no longer true-missing, but
+inotify/fanotify remain semantic scaffolds until filesystem event publication
+exists.
 
-`mlock2`, `mbind`, `migrate_pages`, `get_mempolicy`, `set_mempolicy`,
-`process_vm_readv` / `_writev`, `memfd_create`.
+### Memory extended
 
-### Process / sched / limits (22)
+`mlockall`, `munlockall`, `mincore`, `remap_file_pages`, `mbind`,
+`migrate_pages`, `get_mempolicy`, `set_mempolicy`, `move_pages`,
+`process_vm_readv`, `process_vm_writev`, `memfd_create`, `process_madvise`.
 
-`setns`, `unshare`, `pidfd_getfd`, `getrlimit`, `setrlimit`, `getrusage`,
-`sched_*` family (`setparam` / `getparam` / `setscheduler` / `getscheduler` /
-`get_priority_max` / `_min` / `setaffinity` / `getaffinity` / `yield` /
-`setattr` / `getattr` / `rr_get_interval`), `capget`, `capset`, `prctl`.
+### Process / namespace / sysinfo
 
-### Timer / time (7)
+`waitid`, `unshare`, `setns`, `clone3`, `pidfd_getfd`, `setgroups`,
+`sethostname`, `setdomainname`, `prctl`, `sysinfo`, `kcmp`, `riscv_hwprobe`,
+`riscv_flush_icache`.
 
-`timer_create` / `_settime` / `_gettime` / `_getoverrun` / `_delete`,
-`clock_adjtime`, `adjtimex`.
+### Timer / time
 
-### Security & keys (7)
+`getitimer`, `setitimer`, `timer_create`, `timer_settime`, `timer_gettime`,
+`timer_getoverrun`, `timer_delete`, `clock_adjtime`, `adjtimex`.
 
-`keyctl`, `add_key`, `request_key`, `seccomp`, `landlock_create_ruleset` /
-`_add_rule` / `_restrict_self`.
+### Security & keys
 
-### Filesystem misc / mount (4)
+`capget`, `capset`, `keyctl`, `add_key`, `request_key`, `seccomp`,
+`landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self`.
 
-`pivot_root`, `chroot`, `swapon`, `swapoff`.
+### Filesystem misc / mount
 
-### Misc / debug (8)
+`pivot_root`, `chroot`, `open_tree`, `move_mount`, `fsopen`, `fsconfig`,
+`fsmount`, `fspick`, `mount_setattr`, `openat2`, `execveat`, `swapon`,
+`swapoff`.
 
-`reboot`, `kexec_load`, `syslog`, `perf_event_open`, `bpf`, `ptrace`,
-`process_madvise`, `close_range`.
+### Misc / debug / observability
+
+`reboot`, `kexec_load`, `init_module`, `delete_module`, `finit_module`,
+`perf_event_open`, `bpf`, `ptrace`, `rt_tgsigqueueinfo`.
 
 ## Already-partial (existing arms returning `-ENOSYS`)
 
@@ -166,11 +237,8 @@ These syscalls have an `NR_*` defined and a dispatch arm wired, but the body
 is stubbed. Closing them is usually cheaper than greenfield work because
 classification, ctx threading, and tests are already in place.
 
-- `io_uring_enter` user-ring path
-- `userfaultfd` phases 2–5
-- `futex` REQUEUE / PI variants
-- `epoll_*` bodies (beyond core)
-- `rt_sigreturn`
+None currently curated. The remaining `restart_syscall` `ENOSYS` is explicit
+unsupported restart-state policy, not an already-partial body.
 
 ## How to update this file
 
@@ -199,12 +267,17 @@ When you implement or change a syscall:
 
 ### Mechanical status (autogenerated)
 
-_Counts read from `crates/tx-shims/src/linux_syscall/{numbers.rs, mod.rs}`._
+_Counts read from `crates/tx-shims/src/linux_syscall/{numbers.rs, mod.rs}` and checked against Linux RV64 v6.17 from `xtask/data/syscalls/riscv/64/rv64/linux-6.17-table.json` (source: https://syscalls.mebeim.net/db/riscv/64/rv64/latest/table.json). Linux file/line references point into `external/linux-rv-6.17`._
 _Run `cargo xtask syscall-status --regen` to refresh; `--check` to lint in CI._
 
-- **`NR_*` defined:** 159
-- **Dispatched (has a match arm):** 150
-- **Defined but not dispatched:** 9 — see list below
+- **`NR_*` defined:** 200
+- **Linux RV64 reference syscalls:** 320
+- **Dispatched (has a match arm):** 196
+- **Defined but not dispatched:** 4 — see list below
+
+- **True missing vs Linux RV64 reference:** 120
+- **Number mismatches vs Linux RV64 reference:** 0
+- **Local `NR_*` not in Linux RV64 reference:** 0
 
 #### Defined but not dispatched
 
@@ -212,48 +285,307 @@ These syscalls have a `pub const NR_*` in `numbers.rs` but no match arm in `disp
 
 | `NR_*` | # | Summary |
 |---|---:|---|
-| `NR_EPOLL_WAIT` | 232 | `epoll_wait(epfd, events, maxevents, timeout)`. The RV64/LA64 |
 | `NR_GETPEERNAME` | 205 | `getpeername(sockfd, addr, addrlen)`. Linux generic ABI `__NR_getpeername`. |
 | `NR_GETSOCKOPT` | 209 | `getsockopt(sockfd, level, optname, optval, optlen)`. Linux generic ABI `__NR_g… |
-| `NR_PIDFD_OPEN` | 434 | `pidfd_open(pid, flags)` — Linux RV64. |
-| `NR_PIDFD_SEND_SIGNAL` | 424 | `pidfd_send_signal(pidfd, sig, info, flags)` — Linux RV64. |
-| `NR_SEMTIMEDOP` | 192 | `semtimedop(semid, sops, nsops, timeout)`. Linux generic uapi `__NR_semtimedop … |
 | `NR_SHUTDOWN` | 210 | `shutdown(sockfd, how)`. Linux generic ABI `__NR_shutdown`. |
-| `NR_SIGNALFD` | 282 | Historical `signalfd(fd, &mask, sizemask)` (no `flags`). x86_64 |
 | `NR_SOCKETPAIR` | 199 | `socketpair(domain, type, protocol, sv)`. Linux generic ABI `__NR_socketpair`. |
+
+#### True missing from local `numbers.rs`
+
+Linux RV64 v6.17 syscalls that have no local `NR_*` constant. This is the greenfield backlog; it is distinct from defined-but-not-dispatched.
+
+| Linux # | Name | Signature | Linux source |
+|---:|---|---|---|
+| 3 | `io_cancel` | `aio_context_t ctx_id, struct iocb *iocb, struct io_event *result` | `fs/aio.c`:2176 |
+| 5 | `setxattr` | `const char *pathname, const char *name, const void *value, size_t size, int flags` | `fs/xattr.c`:743 |
+| 6 | `lsetxattr` | `const char *pathname, const char *name, const void *value, size_t size, int flags` | `fs/xattr.c`:750 |
+| 7 | `fsetxattr` | `int fd, const char *name, const void *value, size_t size, int flags` | `fs/xattr.c`:758 |
+| 8 | `getxattr` | `const char *pathname, const char *name, void *value, size_t size` | `fs/xattr.c`:888 |
+| 9 | `lgetxattr` | `const char *pathname, const char *name, void *value, size_t size` | `fs/xattr.c`:894 |
+| 10 | `fgetxattr` | `int fd, const char *name, void *value, size_t size` | `fs/xattr.c`:901 |
+| 11 | `listxattr` | `const char *pathname, char *list, size_t size` | `fs/xattr.c`:998 |
+| 12 | `llistxattr` | `const char *pathname, char *list, size_t size` | `fs/xattr.c`:1004 |
+| 13 | `flistxattr` | `int fd, char *list, size_t size` | `fs/xattr.c`:1010 |
+| 14 | `removexattr` | `const char *pathname, const char *name` | `fs/xattr.c`:1097 |
+| 15 | `lremovexattr` | `const char *pathname, const char *name` | `fs/xattr.c`:1103 |
+| 16 | `fremovexattr` | `int fd, const char *name` | `fs/xattr.c`:1109 |
+| 41 | `pivot_root` | `const char *new_root, const char *put_old` | `fs/namespace.c`:4661 |
+| 51 | `chroot` | `const char *filename` | `fs/open.c`:598 |
+| 58 | `vhangup` | `` | `fs/open.c`:1606 |
+| 60 | `quotactl` | `unsigned int cmd, const char *special, qid_t id, void *addr` | `fs/quota/quota.c`:917 |
+| 72 | `pselect6` | `int n, fd_set *inp, fd_set *outp, fd_set *exp, struct __kernel_timespec *tsp, void *sig` | `fs/select.c`:793 |
+| 89 | `acct` | `const char *name` | `kernel/acct.c`:314 |
+| 90 | `capget` | `cap_user_header_t header, cap_user_data_t dataptr` | `kernel/capability.c`:137 |
+| 91 | `capset` | `cap_user_header_t header, const cap_user_data_t data` | `kernel/capability.c`:216 |
+| 95 | `waitid` | `int which, pid_t upid, struct siginfo *infop, int options, struct rusage *ru` | `kernel/exit.c`:1797 |
+| 97 | `unshare` | `unsigned long unshare_flags` | `kernel/fork.c`:3196 |
+| 102 | `getitimer` | `int which, struct __kernel_old_itimerval *value` | `kernel/time/itimer.c`:113 |
+| 103 | `setitimer` | `int which, struct __kernel_old_itimerval *value, struct __kernel_old_itimerval *ovalue` | `kernel/time/itimer.c`:352 |
+| 104 | `kexec_load` | `unsigned long entry, unsigned long nr_segments, struct kexec_segment *segments, unsigne…` | `kernel/kexec.c`:242 |
+| 105 | `init_module` | `void *umod, unsigned long len, const char *uargs` | `kernel/module/main.c`:3569 |
+| 106 | `delete_module` | `const char *name_user, unsigned int flags` | `kernel/module/main.c`:776 |
+| 107 | `timer_create` | `const clockid_t which_clock, struct sigevent *timer_event_spec, timer_t *created_timer_…` | `kernel/time/posix-timers.c`:574 |
+| 108 | `timer_gettime` | `timer_t timer_id, struct __kernel_itimerspec *setting` | `kernel/time/posix-timers.c`:752 |
+| 109 | `timer_getoverrun` | `timer_t timer_id` | `kernel/time/posix-timers.c`:800 |
+| 110 | `timer_settime` | `timer_t timer_id, int flags, const struct __kernel_itimerspec *new_setting, struct __ke…` | `kernel/time/posix-timers.c`:955 |
+| 111 | `timer_delete` | `timer_t timer_id` | `kernel/time/posix-timers.c`:1060 |
+| 117 | `ptrace` | `long request, long pid, unsigned long addr, unsigned long data` | `kernel/ptrace.c`:1387 |
+| 142 | `reboot` | `int magic1, int magic2, unsigned int cmd, void *arg` | `kernel/reboot.c`:728 |
+| 151 | `setfsuid` | `uid_t uid` | `kernel/sys.c`:940 |
+| 152 | `setfsgid` | `gid_t gid` | `kernel/sys.c`:984 |
+| 159 | `setgroups` | `int gidsetsize, gid_t *grouplist` | `kernel/groups.c`:198 |
+| 161 | `sethostname` | `char *name, int len` | `kernel/sys.c`:1419 |
+| 162 | `setdomainname` | `char *name, int len` | `kernel/sys.c`:1473 |
+| 167 | `prctl` | `int option, unsigned long arg2, unsigned long arg3, unsigned long arg4, unsigned long a…` | `kernel/sys.c`:2455 |
+| 171 | `adjtimex` | `struct __kernel_timex *txc_p` | `kernel/time/time.c`:269 |
+| 179 | `sysinfo` | `struct sysinfo *info` | `kernel/sys.c`:2896 |
+| 211 | `sendmsg` | `int fd, struct user_msghdr *msg, unsigned int flags` | `net/socket.c`:2703 |
+| 212 | `recvmsg` | `int fd, struct user_msghdr *msg, unsigned int flags` | `net/socket.c`:2912 |
+| 217 | `add_key` | `const char *_type, const char *_description, const void *_payload, size_t plen, key_ser…` | `security/keys/keyctl.c`:74 |
+| 218 | `request_key` | `const char *_type, const char *_description, const char *_callout_info, key_serial_t de…` | `security/keys/keyctl.c`:167 |
+| 219 | `keyctl` | `int option, unsigned long arg2, unsigned long arg3, unsigned long arg4, unsigned long a…` | `security/keys/keyctl.c`:1874 |
+| 224 | `swapon` | `const char *specialfile, int swap_flags` | `mm/swapfile.c`:3259 |
+| 225 | `swapoff` | `const char *specialfile` | `mm/swapfile.c`:2674 |
+| 230 | `mlockall` | `int flags` | `mm/mlock.c`:745 |
+| 231 | `munlockall` | `` | `mm/mlock.c`:774 |
+| 232 | `mincore` | `unsigned long start, size_t len, unsigned char *vec` | `mm/mincore.c`:247 |
+| 234 | `remap_file_pages` | `unsigned long start, unsigned long size, unsigned long prot, unsigned long pgoff, unsig…` | `mm/mmap.c`:1087 |
+| 235 | `mbind` | `unsigned long start, unsigned long len, unsigned long mode, const unsigned long *nmask,…` | `mm/mempolicy.c`:1752 |
+| 236 | `get_mempolicy` | `int *policy, unsigned long *nmask, unsigned long maxnode, unsigned long addr, unsigned …` | `mm/mempolicy.c`:1909 |
+| 237 | `set_mempolicy` | `int mode, const unsigned long *nmask, unsigned long maxnode` | `mm/mempolicy.c`:1779 |
+| 238 | `migrate_pages` | `pid_t pid, unsigned long maxnode, const unsigned long *old_nodes, const unsigned long *…` | `mm/mempolicy.c`:1872 |
+| 239 | `move_pages` | `pid_t pid, unsigned long nr_pages, const void **pages, const int *nodes, int *status, i…` | `mm/migrate.c`:2590 |
+| 240 | `rt_tgsigqueueinfo` | `pid_t tgid, pid_t pid, int sig, siginfo_t *uinfo` | `kernel/signal.c`:4251 |
+| 241 | `perf_event_open` | `struct perf_event_attr *attr_uptr, pid_t pid, int cpu, int group_fd, unsigned long flags` | `kernel/events/core.c`:13360 |
+| 243 | `recvmmsg` | `int fd, struct mmsghdr *mmsg, unsigned int vlen, unsigned int flags, struct __kernel_ti…` | `net/socket.c`:3061 |
+| 258 | `riscv_hwprobe` | `struct riscv_hwprobe *pairs, size_t pair_count, size_t cpusetsize, unsigned long *cpus,…` | `arch/riscv/kernel/sys_hwprobe.c`:511 |
+| 259 | `riscv_flush_icache` | `uintptr_t start, uintptr_t end, uintptr_t flags` | `arch/riscv/kernel/sys_riscv.c`:59 |
+| 264 | `name_to_handle_at` | `int dfd, const char *name, struct file_handle *handle, void *mnt_id, int flag` | `fs/fhandle.c`:129 |
+| 265 | `open_by_handle_at` | `int mountdirfd, struct file_handle *handle, int flags` | `fs/fhandle.c`:440 |
+| 266 | `clock_adjtime` | `const clockid_t which_clock, struct __kernel_timex *utx` | `kernel/time/posix-timers.c`:1165 |
+| 268 | `setns` | `int fd, int flags` | `kernel/nsproxy.c`:536 |
+| 269 | `sendmmsg` | `int fd, struct mmsghdr *mmsg, unsigned int vlen, unsigned int flags` | `net/socket.c`:2781 |
+| 270 | `process_vm_readv` | `pid_t pid, const struct iovec *lvec, unsigned long liovcnt, const struct iovec *rvec, u…` | `mm/process_vm_access.c`:292 |
+| 271 | `process_vm_writev` | `pid_t pid, const struct iovec *lvec, unsigned long liovcnt, const struct iovec *rvec, u…` | `mm/process_vm_access.c`:299 |
+| 272 | `kcmp` | `pid_t pid1, pid_t pid2, int type, unsigned long idx1, unsigned long idx2` | `kernel/kcmp.c`:135 |
+| 273 | `finit_module` | `int fd, const char *uargs, int flags` | `kernel/module/main.c`:3723 |
+| 274 | `sched_setattr` | `pid_t pid, struct sched_attr *uattr, unsigned int flags` | `kernel/sched/syscalls.c`:977 |
+| 275 | `sched_getattr` | `pid_t pid, struct sched_attr *uattr, unsigned int usize, unsigned int flags` | `kernel/sched/syscalls.c`:1077 |
+| 277 | `seccomp` | `unsigned int op, unsigned int flags, void *uargs` | `kernel/seccomp.c`:2110 |
+| 279 | `memfd_create` | `const char *uname, unsigned int flags` | `mm/memfd.c`:469 |
+| 280 | `bpf` | `int cmd, union bpf_attr *uattr, unsigned int size` | `kernel/bpf/syscall.c`:6137 |
+| 281 | `execveat` | `int fd, const char *filename, const char *const *argv, const char *const *envp, int fla…` | `fs/exec.c`:2013 |
+| 284 | `mlock2` | `unsigned long start, size_t len, int flags` | `mm/mlock.c`:664 |
+| 292 | `io_pgetevents` | `aio_context_t ctx_id, long min_nr, long nr, struct io_event *events, struct __kernel_ti…` | `fs/aio.c`:2276 |
+| 293 | `rseq` | `struct rseq *rseq, u32 rseq_len, int flags, u32 sig` | `kernel/rseq.c`:474 |
+| 294 | `kexec_file_load` | `int kernel_fd, int initrd_fd, unsigned long cmdline_len, const char *cmdline_ptr, unsig…` | `kernel/kexec_file.c`:363 |
+| 427 | `io_uring_register` | `unsigned int fd, unsigned int opcode, void *arg, unsigned int nr_args` | `io_uring/register.c`:906 |
+| 428 | `open_tree` | `int dfd, const char *filename, unsigned flags` | `fs/namespace.c`:3150 |
+| 429 | `move_mount` | `int from_dfd, const char *from_pathname, int to_dfd, const char *to_pathname, unsigned …` | `fs/namespace.c`:4531 |
+| 430 | `fsopen` | `const char *_fs_name, unsigned int flags` | `fs/fsopen.c`:114 |
+| 431 | `fsconfig` | `int fd, unsigned int cmd, const char *_key, const void *_value, int aux` | `fs/fsopen.c`:344 |
+| 432 | `fsmount` | `int fs_fd, unsigned int flags, unsigned int attr_flags` | `fs/namespace.c`:4392 |
+| 433 | `fspick` | `int dfd, const char *path, unsigned int flags` | `fs/fsopen.c`:157 |
+| 435 | `clone3` | `struct clone_args *uargs, size_t size` | `kernel/fork.c`:2888 |
+| 437 | `openat2` | `int dfd, const char *filename, struct open_how *how, size_t usize` | `fs/open.c`:1469 |
+| 438 | `pidfd_getfd` | `int pidfd, int fd, unsigned int flags` | `kernel/pid.c`:903 |
+| 440 | `process_madvise` | `int pidfd, const struct iovec *vec, size_t vlen, int behavior, unsigned int flags` | `mm/madvise.c`:2057 |
+| 442 | `mount_setattr` | `int dfd, const char *path, unsigned int flags, struct mount_attr *uattr, size_t usize` | `fs/namespace.c`:5130 |
+| 443 | `quotactl_fd` | `unsigned int fd, unsigned int cmd, qid_t id, void *addr` | `fs/quota/quota.c`:973 |
+| 444 | `landlock_create_ruleset` | `const struct landlock_ruleset_attr *const attr, const size_t size, const __u32 flags` | `security/landlock/syscalls.c`:195 |
+| 445 | `landlock_add_rule` | `const int ruleset_fd, const enum landlock_rule_type rule_type, const void *const rule_a…` | `security/landlock/syscalls.c`:418 |
+| 446 | `landlock_restrict_self` | `const int ruleset_fd, const __u32 flags` | `security/landlock/syscalls.c`:478 |
+| 447 | `memfd_secret` | `unsigned int flags` | `mm/secretmem.c`:225 |
+| 448 | `process_mrelease` | `int pidfd, unsigned int flags` | `mm/oom_kill.c`:1204 |
+| 449 | `futex_waitv` | `struct futex_waitv *waiters, unsigned int nr_futexes, unsigned int flags, struct __kern…` | `kernel/futex/syscalls.c`:290 |
+| 450 | `set_mempolicy_home_node` | `unsigned long start, unsigned long len, unsigned long home_node, unsigned long flags` | `mm/mempolicy.c`:1685 |
+| 451 | `cachestat` | `unsigned int fd, struct cachestat_range *cstat_range, struct cachestat *cstat, unsigned…` | `mm/filemap.c`:4571 |
+| 454 | `futex_wake` | `void *uaddr, unsigned long mask, int nr, unsigned int flags` | `kernel/futex/syscalls.c`:338 |
+| 455 | `futex_wait` | `void *uaddr, unsigned long val, unsigned long mask, unsigned int flags, struct __kernel…` | `kernel/futex/syscalls.c`:370 |
+| 456 | `futex_requeue` | `struct futex_waitv *waiters, unsigned int flags, int nr_wake, int nr_requeue` | `kernel/futex/syscalls.c`:414 |
+| 457 | `statmount` | `const struct mnt_id_req *req, struct statmount *buf, size_t bufsize, unsigned int flags` | `fs/namespace.c`:5925 |
+| 458 | `listmount` | `const struct mnt_id_req *req, u64 *mnt_ids, size_t nr_mnt_ids, unsigned int flags` | `fs/namespace.c`:6032 |
+| 459 | `lsm_get_self_attr` | `unsigned int attr, struct lsm_ctx *ctx, u32 *size, u32 flags` | `security/lsm_syscalls.c`:77 |
+| 460 | `lsm_set_self_attr` | `unsigned int attr, struct lsm_ctx *ctx, u32 size, u32 flags` | `security/lsm_syscalls.c`:55 |
+| 461 | `lsm_list_modules` | `u64 *ids, u32 *size, u32 flags` | `security/lsm_syscalls.c`:96 |
+| 462 | `mseal` | `unsigned long start, size_t len, unsigned long flags` | `mm/mseal.c`:187 |
+| 463 | `setxattrat` | `int dfd, const char *pathname, unsigned int at_flags, const char *name, const struct xa…` | `fs/xattr.c`:719 |
+| 464 | `getxattrat` | `int dfd, const char *pathname, unsigned int at_flags, const char *name, struct xattr_ar…` | `fs/xattr.c`:863 |
+| 465 | `listxattrat` | `int dfd, const char *pathname, unsigned int at_flags, char *list, size_t size` | `fs/xattr.c`:991 |
+| 466 | `removexattrat` | `int dfd, const char *pathname, unsigned int at_flags, const char *name` | `fs/xattr.c`:1091 |
+| 467 | `open_tree_attr` | `int dfd, const char *filename, unsigned flags, struct mount_attr *uattr, size_t usize` | `fs/namespace.c`:5172 |
+| 468 | `file_getattr` | `int dfd, const char *filename, struct file_attr *ufattr, size_t usize, unsigned int at_…` | `fs/file_attr.c`:382 |
+| 469 | `file_setattr` | `int dfd, const char *filename, struct file_attr *ufattr, size_t usize, unsigned int at_…` | `fs/file_attr.c`:437 |
+
 
 <!-- END AUTOGEN: syscall-table -->
 
 <!-- BEGIN syscall-auto-table (generated by `cargo xtask syscall sync`) -->
 
 _This section is generated by `cargo xtask syscall sync` from
-`crates/tx-shims/src/linux_syscall/{numbers,mod}.rs`. Do not edit
+`crates/tx-shims/src/linux_syscall/{numbers,mod}.rs` and the Linux RV64 v6.17 reference
+at `xtask/data/syscalls/riscv/64/rv64/linux-6.17-table.json` (source: https://syscalls.mebeim.net/db/riscv/64/rv64/latest/table.json). Linux file/line references point into `external/linux-rv-6.17`. Do not edit
 between the BEGIN/END sentinels by hand — your changes will be
 overwritten by the next `sync`. The lint variant
-`cargo xtask lint syscall-status` fails on drift._
+`cargo xtask lint syscall-status` fails on drift or number mismatch._
 
 ### Counts (from dispatch table)
 
-- `pub const NR_*` in numbers.rs: **159**
-- dispatched in mod.rs: **149** (of which async: 41, likely-stub: 0)
-- defined but not dispatched: **10**
+- `pub const NR_*` in numbers.rs: **200**
+- Linux RV64 reference syscalls: **320**
+- dispatched in mod.rs: **196** (of which async: 52, likely-stub: 4)
+- defined but not dispatched: **4**
 
-### Defined in `numbers.rs` but no dispatch arm (10)
+- true missing vs Linux RV64 reference: **120**
+- number mismatches vs Linux RV64 reference: **0**
+- local `NR_*` not in Linux RV64 reference: **0**
+
+### Likely stubs (4)
+
+Heuristic — body ≤14 non-comment lines mentioning `ENOSYS`/`unimplemented!`/`todo!`. The human-curated `## Already-partial` section above is the authoritative classification; this list highlights candidates for cleanup or for moving into the curated catalog.
+
+- `NR_FANOTIFY_INIT` (262) → `sys_fanotify_init`
+- `NR_FANOTIFY_MARK` (263) → `sys_fanotify_mark`
+- `NR_INOTIFY_RM_WATCH` (28) → `sys_inotify_rm_watch`
+- `NR_RESTART_SYSCALL` (128) → `(inline)`
+
+### Defined in `numbers.rs` but no dispatch arm (4)
 
 These have a syscall number constant but no match arm in `mod.rs`. Either wire them up or remove the constant.
 
-- `NR_EPOLL_WAIT` (nr=232)
 - `NR_GETPEERNAME` (nr=205)
 - `NR_GETSOCKOPT` (nr=209)
-- `NR_IO_URING_ENTER` (nr=426)
-- `NR_PIDFD_OPEN` (nr=434)
-- `NR_PIDFD_SEND_SIGNAL` (nr=424)
-- `NR_SEMTIMEDOP` (nr=192)
 - `NR_SHUTDOWN` (nr=210)
-- `NR_SIGNALFD` (nr=282)
 - `NR_SOCKETPAIR` (nr=199)
 
-### Dispatched syscalls (149) — name → handler
+### True missing from local `numbers.rs` (120)
+
+These are Linux RV64 v6.17 syscalls with no local `NR_*` constant. This is the greenfield backlog; it is distinct from defined-but-not-dispatched.
+
+| Linux # | Name | Signature | Linux source |
+|---:|---|---|---|
+| 3 | `io_cancel` | `aio_context_t ctx_id, struct iocb *iocb, struct io_event *result` | `fs/aio.c`:2176 |
+| 5 | `setxattr` | `const char *pathname, const char *name, const void *value, size_t size, int flags` | `fs/xattr.c`:743 |
+| 6 | `lsetxattr` | `const char *pathname, const char *name, const void *value, size_t size, int flags` | `fs/xattr.c`:750 |
+| 7 | `fsetxattr` | `int fd, const char *name, const void *value, size_t size, int flags` | `fs/xattr.c`:758 |
+| 8 | `getxattr` | `const char *pathname, const char *name, void *value, size_t size` | `fs/xattr.c`:888 |
+| 9 | `lgetxattr` | `const char *pathname, const char *name, void *value, size_t size` | `fs/xattr.c`:894 |
+| 10 | `fgetxattr` | `int fd, const char *name, void *value, size_t size` | `fs/xattr.c`:901 |
+| 11 | `listxattr` | `const char *pathname, char *list, size_t size` | `fs/xattr.c`:998 |
+| 12 | `llistxattr` | `const char *pathname, char *list, size_t size` | `fs/xattr.c`:1004 |
+| 13 | `flistxattr` | `int fd, char *list, size_t size` | `fs/xattr.c`:1010 |
+| 14 | `removexattr` | `const char *pathname, const char *name` | `fs/xattr.c`:1097 |
+| 15 | `lremovexattr` | `const char *pathname, const char *name` | `fs/xattr.c`:1103 |
+| 16 | `fremovexattr` | `int fd, const char *name` | `fs/xattr.c`:1109 |
+| 41 | `pivot_root` | `const char *new_root, const char *put_old` | `fs/namespace.c`:4661 |
+| 51 | `chroot` | `const char *filename` | `fs/open.c`:598 |
+| 58 | `vhangup` | `` | `fs/open.c`:1606 |
+| 60 | `quotactl` | `unsigned int cmd, const char *special, qid_t id, void *addr` | `fs/quota/quota.c`:917 |
+| 72 | `pselect6` | `int n, fd_set *inp, fd_set *outp, fd_set *exp, struct __kernel_timespec *tsp, void *sig` | `fs/select.c`:793 |
+| 89 | `acct` | `const char *name` | `kernel/acct.c`:314 |
+| 90 | `capget` | `cap_user_header_t header, cap_user_data_t dataptr` | `kernel/capability.c`:137 |
+| 91 | `capset` | `cap_user_header_t header, const cap_user_data_t data` | `kernel/capability.c`:216 |
+| 95 | `waitid` | `int which, pid_t upid, struct siginfo *infop, int options, struct rusage *ru` | `kernel/exit.c`:1797 |
+| 97 | `unshare` | `unsigned long unshare_flags` | `kernel/fork.c`:3196 |
+| 102 | `getitimer` | `int which, struct __kernel_old_itimerval *value` | `kernel/time/itimer.c`:113 |
+| 103 | `setitimer` | `int which, struct __kernel_old_itimerval *value, struct __kernel_old_itimerval *ovalue` | `kernel/time/itimer.c`:352 |
+| 104 | `kexec_load` | `unsigned long entry, unsigned long nr_segments, struct kexec_segment *segments, unsigned …` | `kernel/kexec.c`:242 |
+| 105 | `init_module` | `void *umod, unsigned long len, const char *uargs` | `kernel/module/main.c`:3569 |
+| 106 | `delete_module` | `const char *name_user, unsigned int flags` | `kernel/module/main.c`:776 |
+| 107 | `timer_create` | `const clockid_t which_clock, struct sigevent *timer_event_spec, timer_t *created_timer_id` | `kernel/time/posix-timers.c`:574 |
+| 108 | `timer_gettime` | `timer_t timer_id, struct __kernel_itimerspec *setting` | `kernel/time/posix-timers.c`:752 |
+| 109 | `timer_getoverrun` | `timer_t timer_id` | `kernel/time/posix-timers.c`:800 |
+| 110 | `timer_settime` | `timer_t timer_id, int flags, const struct __kernel_itimerspec *new_setting, struct __kern…` | `kernel/time/posix-timers.c`:955 |
+| 111 | `timer_delete` | `timer_t timer_id` | `kernel/time/posix-timers.c`:1060 |
+| 117 | `ptrace` | `long request, long pid, unsigned long addr, unsigned long data` | `kernel/ptrace.c`:1387 |
+| 142 | `reboot` | `int magic1, int magic2, unsigned int cmd, void *arg` | `kernel/reboot.c`:728 |
+| 151 | `setfsuid` | `uid_t uid` | `kernel/sys.c`:940 |
+| 152 | `setfsgid` | `gid_t gid` | `kernel/sys.c`:984 |
+| 159 | `setgroups` | `int gidsetsize, gid_t *grouplist` | `kernel/groups.c`:198 |
+| 161 | `sethostname` | `char *name, int len` | `kernel/sys.c`:1419 |
+| 162 | `setdomainname` | `char *name, int len` | `kernel/sys.c`:1473 |
+| 167 | `prctl` | `int option, unsigned long arg2, unsigned long arg3, unsigned long arg4, unsigned long arg5` | `kernel/sys.c`:2455 |
+| 171 | `adjtimex` | `struct __kernel_timex *txc_p` | `kernel/time/time.c`:269 |
+| 179 | `sysinfo` | `struct sysinfo *info` | `kernel/sys.c`:2896 |
+| 211 | `sendmsg` | `int fd, struct user_msghdr *msg, unsigned int flags` | `net/socket.c`:2703 |
+| 212 | `recvmsg` | `int fd, struct user_msghdr *msg, unsigned int flags` | `net/socket.c`:2912 |
+| 217 | `add_key` | `const char *_type, const char *_description, const void *_payload, size_t plen, key_seria…` | `security/keys/keyctl.c`:74 |
+| 218 | `request_key` | `const char *_type, const char *_description, const char *_callout_info, key_serial_t dest…` | `security/keys/keyctl.c`:167 |
+| 219 | `keyctl` | `int option, unsigned long arg2, unsigned long arg3, unsigned long arg4, unsigned long arg5` | `security/keys/keyctl.c`:1874 |
+| 224 | `swapon` | `const char *specialfile, int swap_flags` | `mm/swapfile.c`:3259 |
+| 225 | `swapoff` | `const char *specialfile` | `mm/swapfile.c`:2674 |
+| 230 | `mlockall` | `int flags` | `mm/mlock.c`:745 |
+| 231 | `munlockall` | `` | `mm/mlock.c`:774 |
+| 232 | `mincore` | `unsigned long start, size_t len, unsigned char *vec` | `mm/mincore.c`:247 |
+| 234 | `remap_file_pages` | `unsigned long start, unsigned long size, unsigned long prot, unsigned long pgoff, unsigne…` | `mm/mmap.c`:1087 |
+| 235 | `mbind` | `unsigned long start, unsigned long len, unsigned long mode, const unsigned long *nmask, u…` | `mm/mempolicy.c`:1752 |
+| 236 | `get_mempolicy` | `int *policy, unsigned long *nmask, unsigned long maxnode, unsigned long addr, unsigned lo…` | `mm/mempolicy.c`:1909 |
+| 237 | `set_mempolicy` | `int mode, const unsigned long *nmask, unsigned long maxnode` | `mm/mempolicy.c`:1779 |
+| 238 | `migrate_pages` | `pid_t pid, unsigned long maxnode, const unsigned long *old_nodes, const unsigned long *ne…` | `mm/mempolicy.c`:1872 |
+| 239 | `move_pages` | `pid_t pid, unsigned long nr_pages, const void **pages, const int *nodes, int *status, int…` | `mm/migrate.c`:2590 |
+| 240 | `rt_tgsigqueueinfo` | `pid_t tgid, pid_t pid, int sig, siginfo_t *uinfo` | `kernel/signal.c`:4251 |
+| 241 | `perf_event_open` | `struct perf_event_attr *attr_uptr, pid_t pid, int cpu, int group_fd, unsigned long flags` | `kernel/events/core.c`:13360 |
+| 243 | `recvmmsg` | `int fd, struct mmsghdr *mmsg, unsigned int vlen, unsigned int flags, struct __kernel_time…` | `net/socket.c`:3061 |
+| 258 | `riscv_hwprobe` | `struct riscv_hwprobe *pairs, size_t pair_count, size_t cpusetsize, unsigned long *cpus, u…` | `arch/riscv/kernel/sys_hwprobe.c`:511 |
+| 259 | `riscv_flush_icache` | `uintptr_t start, uintptr_t end, uintptr_t flags` | `arch/riscv/kernel/sys_riscv.c`:59 |
+| 264 | `name_to_handle_at` | `int dfd, const char *name, struct file_handle *handle, void *mnt_id, int flag` | `fs/fhandle.c`:129 |
+| 265 | `open_by_handle_at` | `int mountdirfd, struct file_handle *handle, int flags` | `fs/fhandle.c`:440 |
+| 266 | `clock_adjtime` | `const clockid_t which_clock, struct __kernel_timex *utx` | `kernel/time/posix-timers.c`:1165 |
+| 268 | `setns` | `int fd, int flags` | `kernel/nsproxy.c`:536 |
+| 269 | `sendmmsg` | `int fd, struct mmsghdr *mmsg, unsigned int vlen, unsigned int flags` | `net/socket.c`:2781 |
+| 270 | `process_vm_readv` | `pid_t pid, const struct iovec *lvec, unsigned long liovcnt, const struct iovec *rvec, uns…` | `mm/process_vm_access.c`:292 |
+| 271 | `process_vm_writev` | `pid_t pid, const struct iovec *lvec, unsigned long liovcnt, const struct iovec *rvec, uns…` | `mm/process_vm_access.c`:299 |
+| 272 | `kcmp` | `pid_t pid1, pid_t pid2, int type, unsigned long idx1, unsigned long idx2` | `kernel/kcmp.c`:135 |
+| 273 | `finit_module` | `int fd, const char *uargs, int flags` | `kernel/module/main.c`:3723 |
+| 274 | `sched_setattr` | `pid_t pid, struct sched_attr *uattr, unsigned int flags` | `kernel/sched/syscalls.c`:977 |
+| 275 | `sched_getattr` | `pid_t pid, struct sched_attr *uattr, unsigned int usize, unsigned int flags` | `kernel/sched/syscalls.c`:1077 |
+| 277 | `seccomp` | `unsigned int op, unsigned int flags, void *uargs` | `kernel/seccomp.c`:2110 |
+| 279 | `memfd_create` | `const char *uname, unsigned int flags` | `mm/memfd.c`:469 |
+| 280 | `bpf` | `int cmd, union bpf_attr *uattr, unsigned int size` | `kernel/bpf/syscall.c`:6137 |
+| 281 | `execveat` | `int fd, const char *filename, const char *const *argv, const char *const *envp, int flags` | `fs/exec.c`:2013 |
+| 284 | `mlock2` | `unsigned long start, size_t len, int flags` | `mm/mlock.c`:664 |
+| 292 | `io_pgetevents` | `aio_context_t ctx_id, long min_nr, long nr, struct io_event *events, struct __kernel_time…` | `fs/aio.c`:2276 |
+| 293 | `rseq` | `struct rseq *rseq, u32 rseq_len, int flags, u32 sig` | `kernel/rseq.c`:474 |
+| 294 | `kexec_file_load` | `int kernel_fd, int initrd_fd, unsigned long cmdline_len, const char *cmdline_ptr, unsigne…` | `kernel/kexec_file.c`:363 |
+| 427 | `io_uring_register` | `unsigned int fd, unsigned int opcode, void *arg, unsigned int nr_args` | `io_uring/register.c`:906 |
+| 428 | `open_tree` | `int dfd, const char *filename, unsigned flags` | `fs/namespace.c`:3150 |
+| 429 | `move_mount` | `int from_dfd, const char *from_pathname, int to_dfd, const char *to_pathname, unsigned in…` | `fs/namespace.c`:4531 |
+| 430 | `fsopen` | `const char *_fs_name, unsigned int flags` | `fs/fsopen.c`:114 |
+| 431 | `fsconfig` | `int fd, unsigned int cmd, const char *_key, const void *_value, int aux` | `fs/fsopen.c`:344 |
+| 432 | `fsmount` | `int fs_fd, unsigned int flags, unsigned int attr_flags` | `fs/namespace.c`:4392 |
+| 433 | `fspick` | `int dfd, const char *path, unsigned int flags` | `fs/fsopen.c`:157 |
+| 435 | `clone3` | `struct clone_args *uargs, size_t size` | `kernel/fork.c`:2888 |
+| 437 | `openat2` | `int dfd, const char *filename, struct open_how *how, size_t usize` | `fs/open.c`:1469 |
+| 438 | `pidfd_getfd` | `int pidfd, int fd, unsigned int flags` | `kernel/pid.c`:903 |
+| 440 | `process_madvise` | `int pidfd, const struct iovec *vec, size_t vlen, int behavior, unsigned int flags` | `mm/madvise.c`:2057 |
+| 442 | `mount_setattr` | `int dfd, const char *path, unsigned int flags, struct mount_attr *uattr, size_t usize` | `fs/namespace.c`:5130 |
+| 443 | `quotactl_fd` | `unsigned int fd, unsigned int cmd, qid_t id, void *addr` | `fs/quota/quota.c`:973 |
+| 444 | `landlock_create_ruleset` | `const struct landlock_ruleset_attr *const attr, const size_t size, const __u32 flags` | `security/landlock/syscalls.c`:195 |
+| 445 | `landlock_add_rule` | `const int ruleset_fd, const enum landlock_rule_type rule_type, const void *const rule_att…` | `security/landlock/syscalls.c`:418 |
+| 446 | `landlock_restrict_self` | `const int ruleset_fd, const __u32 flags` | `security/landlock/syscalls.c`:478 |
+| 447 | `memfd_secret` | `unsigned int flags` | `mm/secretmem.c`:225 |
+| 448 | `process_mrelease` | `int pidfd, unsigned int flags` | `mm/oom_kill.c`:1204 |
+| 449 | `futex_waitv` | `struct futex_waitv *waiters, unsigned int nr_futexes, unsigned int flags, struct __kernel…` | `kernel/futex/syscalls.c`:290 |
+| 450 | `set_mempolicy_home_node` | `unsigned long start, unsigned long len, unsigned long home_node, unsigned long flags` | `mm/mempolicy.c`:1685 |
+| 451 | `cachestat` | `unsigned int fd, struct cachestat_range *cstat_range, struct cachestat *cstat, unsigned i…` | `mm/filemap.c`:4571 |
+| 454 | `futex_wake` | `void *uaddr, unsigned long mask, int nr, unsigned int flags` | `kernel/futex/syscalls.c`:338 |
+| 455 | `futex_wait` | `void *uaddr, unsigned long val, unsigned long mask, unsigned int flags, struct __kernel_t…` | `kernel/futex/syscalls.c`:370 |
+| 456 | `futex_requeue` | `struct futex_waitv *waiters, unsigned int flags, int nr_wake, int nr_requeue` | `kernel/futex/syscalls.c`:414 |
+| 457 | `statmount` | `const struct mnt_id_req *req, struct statmount *buf, size_t bufsize, unsigned int flags` | `fs/namespace.c`:5925 |
+| 458 | `listmount` | `const struct mnt_id_req *req, u64 *mnt_ids, size_t nr_mnt_ids, unsigned int flags` | `fs/namespace.c`:6032 |
+| 459 | `lsm_get_self_attr` | `unsigned int attr, struct lsm_ctx *ctx, u32 *size, u32 flags` | `security/lsm_syscalls.c`:77 |
+| 460 | `lsm_set_self_attr` | `unsigned int attr, struct lsm_ctx *ctx, u32 size, u32 flags` | `security/lsm_syscalls.c`:55 |
+| 461 | `lsm_list_modules` | `u64 *ids, u32 *size, u32 flags` | `security/lsm_syscalls.c`:96 |
+| 462 | `mseal` | `unsigned long start, size_t len, unsigned long flags` | `mm/mseal.c`:187 |
+| 463 | `setxattrat` | `int dfd, const char *pathname, unsigned int at_flags, const char *name, const struct xatt…` | `fs/xattr.c`:719 |
+| 464 | `getxattrat` | `int dfd, const char *pathname, unsigned int at_flags, const char *name, struct xattr_args…` | `fs/xattr.c`:863 |
+| 465 | `listxattrat` | `int dfd, const char *pathname, unsigned int at_flags, char *list, size_t size` | `fs/xattr.c`:991 |
+| 466 | `removexattrat` | `int dfd, const char *pathname, unsigned int at_flags, const char *name` | `fs/xattr.c`:1091 |
+| 467 | `open_tree_attr` | `int dfd, const char *filename, unsigned flags, struct mount_attr *uattr, size_t usize` | `fs/namespace.c`:5172 |
+| 468 | `file_getattr` | `int dfd, const char *filename, struct file_attr *ufattr, size_t usize, unsigned int at_fl…` | `fs/file_attr.c`:382 |
+| 469 | `file_setattr` | `int dfd, const char *filename, struct file_attr *ufattr, size_t usize, unsigned int at_fl…` | `fs/file_attr.c`:437 |
+
+### Dispatched syscalls (196) — name → handler
 
 Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the heuristic flagged.
 
@@ -264,13 +596,19 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 2 | `NR_IO_SUBMIT` | `sys_io_submit` | sync |
 | 4 | `NR_IO_GETEVENTS` | `sys_io_getevents` | async |
 | 17 | `NR_GETCWD` | `sys_getcwd` | sync |
+| 19 | `NR_EVENTFD2` | `sys_eventfd2` | sync |
 | 20 | `NR_EPOLL_CREATE1` | `sys_epoll_create1` | sync |
 | 21 | `NR_EPOLL_CTL` | `sys_epoll_ctl` | sync |
-| 22 | `NR_EPOLL_PWAIT` | `sys_epoll_wait` | sync |
+| 22 | `NR_EPOLL_PWAIT` | `sys_epoll_wait` | async |
 | 23 | `NR_DUP` | `sys_dup` | sync |
 | 24 | `NR_DUP3` | `sys_dup3` | sync |
 | 25 | `NR_FCNTL` | `sys_fcntl` | sync |
+| 26 | `NR_INOTIFY_INIT1` | `sys_inotify_init1` | sync |
+| 27 | `NR_INOTIFY_ADD_WATCH` | `sys_inotify_add_watch` | sync |
+| 28 | `NR_INOTIFY_RM_WATCH` | `sys_inotify_rm_watch` | sync [stub] |
 | 29 | `NR_IOCTL` | `sys_ioctl` | sync |
+| 30 | `NR_IOPRIO_SET` | `sys_ioprio_set` | sync |
+| 31 | `NR_IOPRIO_GET` | `sys_ioprio_get` | sync |
 | 32 | `NR_FLOCK` | `sys_flock` | sync |
 | 33 | `NR_MKNODAT` | `sys_mknodat` | async |
 | 34 | `NR_MKDIRAT` | `sys_mkdirat` | async |
@@ -283,11 +621,14 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 44 | `NR_FSTATFS` | `sys_fstatfs` | sync |
 | 45 | `NR_TRUNCATE` | `sys_truncate` | async |
 | 46 | `NR_FTRUNCATE` | `sys_ftruncate` | async |
+| 47 | `NR_FALLOCATE` | `sys_fallocate` | async |
 | 48 | `NR_FACCESSAT` | `sys_faccessat` | sync |
 | 49 | `NR_CHDIR` | `sys_chdir` | async |
 | 50 | `NR_FCHDIR` | `sys_fchdir` | async |
+| 52 | `NR_FCHMOD` | `sys_fchmod` | sync |
 | 53 | `NR_FCHMODAT` | `sys_fchmodat` | sync |
 | 54 | `NR_FCHOWNAT` | `sys_fchownat` | sync |
+| 55 | `NR_FCHOWN` | `sys_fchown` | sync |
 | 56 | `NR_OPENAT` | `sys_openat` | async |
 | 57 | `NR_CLOSE` | `sys_close` | sync |
 | 59 | `NR_PIPE2` | `sys_pipe2` | sync |
@@ -298,20 +639,27 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 65 | `NR_READV` | `sys_readv` | async |
 | 66 | `NR_WRITEV` | `sys_writev` | async |
 | 67 | `NR_PREAD64` | `sys_pread64` | async |
+| 68 | `NR_PWRITE64` | `sys_pwrite64` | async |
+| 69 | `NR_PREADV` | `sys_preadv` | async |
+| 70 | `NR_PWRITEV` | `sys_pwritev` | async |
 | 71 | `NR_SENDFILE64` | `sys_sendfile64` | async |
 | 73 | `NR_PPOLL` | `sys_ppoll` | async |
 | 74 | `NR_SIGNALFD4` | `sys_signalfd4` | sync |
+| 75 | `NR_VMSPLICE` | `sys_vmsplice` | async |
+| 76 | `NR_SPLICE` | `sys_splice` | async |
+| 77 | `NR_TEE` | `sys_tee` | sync |
 | 78 | `NR_READLINKAT` | `sys_readlinkat` | async |
 | 79 | `NR_NEWFSTATAT` | `sys_newfstatat` | async |
 | 80 | `NR_FSTAT` | `sys_fstat` | sync |
-| 81 | `NR_GETPGRP` | `sys_getpgrp` | sync |
 | 81 | `NR_SYNC` | `sys_sync` | sync |
 | 82 | `NR_FSYNC` | `sys_fsync` | sync |
 | 83 | `NR_FDATASYNC` | `sys_fdatasync` | sync |
+| 84 | `NR_SYNC_FILE_RANGE` | `sys_sync_file_range` | sync |
 | 85 | `NR_TIMERFD_CREATE` | `sys_timerfd_create` | sync |
 | 86 | `NR_TIMERFD_SETTIME` | `sys_timerfd_settime` | sync |
 | 87 | `NR_TIMERFD_GETTIME` | `sys_timerfd_gettime` | sync |
 | 88 | `NR_UTIMENSAT` | `sys_utimensat` | sync |
+| 92 | `NR_PERSONALITY` | `sys_personality` | sync |
 | 93 | `NR_EXIT` | `sys_exit` | sync |
 | 94 | `NR_EXIT_GROUP` | `sys_exit_group` | sync |
 | 96 | `NR_SET_TID_ADDRESS` | `sys_set_tid_address` | sync |
@@ -319,12 +667,22 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 99 | `NR_SET_ROBUST_LIST` | `sys_set_robust_list` | sync |
 | 100 | `NR_GET_ROBUST_LIST` | `sys_get_robust_list` | sync |
 | 101 | `NR_NANOSLEEP` | `sys_nanosleep` | async |
+| 112 | `NR_CLOCK_SETTIME` | `sys_clock_settime` | sync |
 | 113 | `NR_CLOCK_GETTIME` | `sys_clock_gettime` | sync |
+| 114 | `NR_CLOCK_GETRES` | `sys_clock_getres` | sync |
 | 115 | `NR_CLOCK_NANOSLEEP` | `sys_clock_nanosleep` | async |
 | 116 | `NR_SYSLOG` | `sys_syslog` | sync |
+| 118 | `NR_SCHED_SETPARAM` | `sys_sched_setparam` | sync |
 | 119 | `NR_SCHED_SETSCHEDULER` | `sys_sched_setscheduler` | sync |
+| 120 | `NR_SCHED_GETSCHEDULER` | `sys_sched_getscheduler` | sync |
+| 121 | `NR_SCHED_GETPARAM` | `sys_sched_getparam` | sync |
 | 122 | `NR_SCHED_SETAFFINITY` | `sys_sched_setaffinity` | sync |
 | 123 | `NR_SCHED_GETAFFINITY` | `sys_sched_getaffinity` | sync |
+| 124 | `NR_SCHED_YIELD` | `sys_sched_yield` | sync |
+| 125 | `NR_SCHED_GET_PRIORITY_MAX` | `sys_sched_get_priority_max` | sync |
+| 126 | `NR_SCHED_GET_PRIORITY_MIN` | `sys_sched_get_priority_min` | sync |
+| 127 | `NR_SCHED_RR_GET_INTERVAL` | `sys_sched_rr_get_interval` | sync |
+| 128 | `NR_RESTART_SYSCALL` | `(inline)` | sync [stub] |
 | 129 | `NR_KILL` | `sys_kill` | sync |
 | 130 | `NR_TKILL` | `sys_tkill` | sync |
 | 131 | `NR_TGKILL` | `sys_tgkill` | sync |
@@ -336,6 +694,8 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 137 | `NR_RT_SIGTIMEDWAIT` | `sys_rt_sigtimedwait` | async |
 | 138 | `NR_RT_SIGQUEUEINFO` | `sys_rt_sigqueueinfo` | sync |
 | 139 | `NR_RT_SIGRETURN` | `sys_rt_sigreturn` | sync |
+| 140 | `NR_SETPRIORITY` | `sys_setpriority` | sync |
+| 141 | `NR_GETPRIORITY` | `sys_getpriority` | sync |
 | 143 | `NR_SETREGID` | `sys_setregid` | sync |
 | 144 | `NR_SETGID` | `sys_setgid` | sync |
 | 145 | `NR_SETREUID` | `sys_setreuid` | sync |
@@ -349,9 +709,15 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 155 | `NR_GETPGID` | `sys_getpgid` | sync |
 | 156 | `NR_GETSID` | `sys_getsid` | sync |
 | 157 | `NR_SETSID` | `sys_setsid` | sync |
+| 158 | `NR_GETGROUPS` | `sys_getgroups` | sync |
 | 160 | `NR_UNAME` | `sys_uname` | sync |
+| 163 | `NR_GETRLIMIT` | `sys_getrlimit` | sync |
+| 164 | `NR_SETRLIMIT` | `sys_setrlimit` | sync |
+| 165 | `NR_GETRUSAGE` | `sys_getrusage` | sync |
 | 166 | `NR_UMASK` | `sys_umask` | sync |
+| 168 | `NR_GETCPU` | `sys_getcpu` | sync |
 | 169 | `NR_GETTIMEOFDAY` | `sys_gettimeofday` | sync |
+| 170 | `NR_SETTIMEOFDAY` | `sys_settimeofday` | sync |
 | 172 | `NR_GETPID` | `sys_getpid` | sync |
 | 173 | `NR_GETPPID` | `sys_getppid` | sync |
 | 174 | `NR_GETUID` | `sys_getuid` | sync |
@@ -371,6 +737,7 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 189 | `NR_MSGSND` | `sys_msgsnd` | sync |
 | 190 | `NR_SEMGET` | `sys_semget` | sync |
 | 191 | `NR_SEMCTL` | `sys_semctl` | sync |
+| 192 | `NR_SEMTIMEDOP` | `sys_semtimedop` | sync |
 | 193 | `NR_SEMOP` | `sys_semop` | sync |
 | 194 | `NR_SHMGET` | `sys_shmget` | sync |
 | 195 | `NR_SHMCTL` | `sys_shmctl` | sync |
@@ -385,12 +752,14 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 206 | `NR_SENDTO` | `sys_sendto` | sync |
 | 207 | `NR_RECVFROM` | `sys_recvfrom` | sync |
 | 208 | `NR_SETSOCKOPT` | `sys_setsockopt` | sync |
+| 213 | `NR_READAHEAD` | `sys_readahead` | sync |
 | 214 | `NR_BRK` | `sys_brk` | async |
 | 215 | `NR_MUNMAP` | `sys_munmap` | async |
 | 216 | `NR_MREMAP` | `sys_mremap` | async |
 | 220 | `NR_CLONE` | `sys_clone` | async |
 | 221 | `NR_EXECVE` | `sys_execve` | async |
 | 222 | `NR_MMAP` | `sys_mmap` | async |
+| 223 | `NR_FADVISE64_64` | `sys_fadvise64_64` | sync |
 | 226 | `NR_MPROTECT` | `sys_mprotect` | async |
 | 227 | `NR_MSYNC` | `sys_msync` | async |
 | 228 | `NR_MLOCK` | `sys_mlock` | async |
@@ -399,15 +768,25 @@ Sorted by syscall number. `*` marks `async` handlers; `[stub]` marks bodies the 
 | 242 | `NR_ACCEPT4` | `sys_accept4` | sync |
 | 260 | `NR_WAIT4` | `sys_wait4` | async |
 | 261 | `NR_PRLIMIT64` | `sys_prlimit64` | sync |
+| 262 | `NR_FANOTIFY_INIT` | `sys_fanotify_init` | sync [stub] |
+| 263 | `NR_FANOTIFY_MARK` | `sys_fanotify_mark` | sync [stub] |
 | 267 | `NR_SYNCFS` | `sys_syncfs` | sync |
 | 276 | `NR_RENAMEAT2` | `sys_renameat2` | async |
 | 278 | `NR_GETRANDOM` | `sys_getrandom` | sync |
 | 282 | `NR_USERFAULTFD` | `sys_userfaultfd` | sync |
 | 283 | `NR_MEMBARRIER` | `sys_membarrier` | sync |
-| 290 | `NR_EVENTFD2` | `sys_eventfd2` | sync |
+| 285 | `NR_COPY_FILE_RANGE` | `sys_copy_file_range` | async |
+| 286 | `NR_PREADV2` | `sys_preadv2` | async |
+| 287 | `NR_PWRITEV2` | `sys_pwritev2` | async |
 | 291 | `NR_STATX` | `sys_statx` | async |
+| 424 | `NR_PIDFD_SEND_SIGNAL` | `sys_pidfd_send_signal` | sync |
 | 425 | `NR_IO_URING_SETUP` | `sys_io_uring_setup` | sync |
+| 426 | `NR_IO_URING_ENTER` | `sys_io_uring_enter` | sync |
+| 434 | `NR_PIDFD_OPEN` | `sys_pidfd_open` | sync |
+| 436 | `NR_CLOSE_RANGE` | `sys_close_range` | sync |
 | 439 | `NR_FACCESSAT2` | `sys_faccessat2` | sync |
+| 441 | `NR_EPOLL_PWAIT2` | `sys_epoll_pwait2` | async |
+| 452 | `NR_FCHMODAT2` | `sys_fchmodat` | sync |
 
 <!-- END syscall-auto-table -->
 

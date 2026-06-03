@@ -535,6 +535,7 @@ impl BootStaticBag<IdentityDropped> {
         BootStaticBag::<IdentityLive>::store_dropped(self);
     }
 
+    #[track_caller]
     pub(crate) fn global_ref() -> &'static Self {
         unsafe {
             match &*STORED_BOOT_STATIC_BAG.0.get() {

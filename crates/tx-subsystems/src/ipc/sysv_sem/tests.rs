@@ -1,16 +1,23 @@
 use super::*;
 use crate::cred::{CapabilitySet, Cred, Gid, Uid};
+use crate::execution::Errno;
 use crate::ipc::sysv_shm::execution::{IPC_CREAT, IPC_EXCL};
+use crate::process::adapter::step_engine::{
+    InterestMask, NoProgress, StepOutcome, WaitSourceId, YieldShape,
+};
+use crate::process::adapter::wait_routing::{MailboxEvent, TaskMailbox};
 use crate::process::bootstrap_init_process;
+use crate::process::execution::reset_init_process_for_test;
 use crate::test_support::EPOCH_TEST_LOCK;
 use crate::vm::AddressSpace;
 use crate::zones;
-
+use alloc::sync::Arc;
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     tx_test_support::init_host();
     let _ = zones::register_all();
     tx_test_support::drain_to_quiescence();
+    reset_init_process_for_test();
     guard
 }
 
@@ -141,4 +148,68 @@ fn semctl_getpid_tracks_setall_and_semop_last_modifier() {
         Some(&process),
     )
     .expect("cleanup");
+}
+
+#[test]
+fn semop_blocking_wait_yields_and_rmid_wakes_waiter() {
+    let _g = setup();
+
+    let owner = cred(1000, 1000);
+    let ns = crate::process::nsproxy::sign_init_nsproxy().expect("nsproxy cap");
+    let process = bootstrap_init_process(AddressSpace::new_cap().expect("aspace cap"))
+        .expect("bootstrap init");
+    let semid =
+        execution::step_semget(IPC_EXCL, 1, IPC_CREAT | 0o600, &owner, &ns).expect("semget");
+
+    let sop = structure::SemBuf {
+        sem_num: 0,
+        sem_op: -1,
+        sem_flg: 0,
+    };
+    let wait_source_id = match execution::step_semop_v3(semid, &[sop], &owner, &process) {
+        StepOutcome::Yield {
+            progress,
+            shape: YieldShape::OnWaitSource { source, interests },
+        } => {
+            assert_eq!(progress, NoProgress);
+            assert_eq!(interests.raw(), 1);
+            source.raw()
+        }
+        other => panic!("expected blocking semop to yield, got {other:?}"),
+    };
+
+    let source = tx_substrate::wake::lookup_source(WaitSourceId::new(wait_source_id))
+        .expect("sem wait source should be registered");
+    let mailbox = Arc::new(TaskMailbox::new());
+    let generation = mailbox.next_generation();
+    let subscriber = source.register(Arc::downgrade(&mailbox), generation, InterestMask::new(1));
+    assert!(mailbox.poll().is_none(), "wait should park before IPC_RMID");
+
+    execution::step_semctl_in_ns(
+        semid,
+        0,
+        execution::IPC_RMID,
+        execution::SemCtlArg::None,
+        &owner,
+        &ns,
+        Some(&process),
+    )
+    .expect("IPC_RMID");
+
+    assert!(
+        matches!(
+            mailbox.poll(),
+            Some(MailboxEvent::SourceFired {
+                generation: fired,
+                ..
+            }) if fired == generation
+        ),
+        "IPC_RMID must wake sem waiters"
+    );
+    source.unregister(subscriber);
+    assert_eq!(
+        execution::step_semop(semid, &[sop], &owner, &process),
+        Err(Errno::EIDRM),
+        "retry after namespace withdrawal must report the removed id"
+    );
 }

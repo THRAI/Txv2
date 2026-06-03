@@ -137,13 +137,8 @@ pub(super) fn ns_to_timeval(ns: u64) -> TimevalLayout {
     }
 }
 
-// Keep CLOCK_REALTIME ahead of the OSComp ext4 image mtimes; libc
-// `stat.c` rejects file timestamps that appear to be in the future
-// relative to `time(0)`.
-const REALTIME_EPOCH_BASE_NS: u64 = 1_779_494_400_000_000_000;
-
 pub(super) fn realtime_ns<P: TimeIf>() -> u64 {
-    REALTIME_EPOCH_BASE_NS.saturating_add(<P as TimeIf>::read_ns())
+    tx_subsystems::wall_clock::realtime_now_ns::<P>()
 }
 
 /// Read a Linux-shaped `(tv_sec, tv_nsec)` pair from user memory and
@@ -167,6 +162,24 @@ pub(super) fn read_timespec_at(aspace: &AddressSpace, uaddr: u64) -> Option<u64>
         return None;
     }
     Some((ts.tv_sec as u64).saturating_mul(1_000_000_000) + (ts.tv_nsec as u64))
+}
+
+fn read_timeval_at(aspace: &AddressSpace, uaddr: u64) -> Option<u64> {
+    if uaddr == 0 {
+        return None;
+    }
+    let tv: TimevalLayout = match bootstrap_read_user::<TimevalLayout>(aspace, uaddr) {
+        Ok(v) => v,
+        Err(_) => return None,
+    };
+    if tv.tv_sec < 0 || tv.tv_usec < 0 || tv.tv_usec >= 1_000_000 {
+        return None;
+    }
+    Some((tv.tv_sec as u64).saturating_mul(1_000_000_000) + (tv.tv_usec as u64) * 1_000)
+}
+
+fn can_set_realtime(ctx: &SyscallCtx<'_>) -> bool {
+    ctx.cred().euid.is_root()
 }
 
 /// `clock_gettime(clk_id, tp)`. Linux RV64 generic ABI
@@ -202,6 +215,70 @@ pub(super) fn sys_clock_gettime<'a, P: TimeIf>(
     SyscallResult::Return(0)
 }
 
+/// `clock_settime(clk_id, tp)`. Linux RV64 generic ABI
+/// `__NR_clock_settime = 112`.
+///
+/// v1 supports setting `CLOCK_REALTIME` by replacing the wallclock
+/// offset above HAL monotonic time. Other clock ids are not settable
+/// and return `-EINVAL`; unprivileged callers return `-EPERM`.
+pub(super) fn sys_clock_settime<'a, P: TimeIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
+    let clk_id = args[0] as u32;
+    let ts_uaddr = args[1];
+    if clk_id != CLOCK_REALTIME {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if ts_uaddr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    if !can_set_realtime(ctx) {
+        return SyscallResult::Error(EPERM_VALUE);
+    }
+    let Some(ns) = read_timespec_at(&ctx.aspace, ts_uaddr) else {
+        return SyscallResult::Error(EINVAL_VALUE);
+    };
+    match tx_subsystems::wall_clock::set_realtime_ns::<P>(ns) {
+        Ok(_) => SyscallResult::Return(0),
+        Err(_) => SyscallResult::Error(EINVAL_VALUE),
+    }
+}
+
+/// `clock_getres(clk_id, res)`. Linux RV64 generic ABI
+/// `__NR_clock_getres = 114`.
+///
+/// Mirrors `clock_gettime`'s v1 clock-id surface. The platform time
+/// source is nanosecond-shaped, so the fixed reported resolution is
+/// one nanosecond. Linux permits a null `res` pointer; it still
+/// validates the clock id first.
+pub(super) fn sys_clock_getres<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let clk_id = args[0] as u32;
+    match clk_id {
+        CLOCK_REALTIME
+        | CLOCK_REALTIME_COARSE
+        | CLOCK_MONOTONIC
+        | CLOCK_PROCESS_CPUTIME_ID
+        | CLOCK_THREAD_CPUTIME_ID
+        | CLOCK_MONOTONIC_RAW
+        | CLOCK_MONOTONIC_COARSE
+        | CLOCK_BOOTTIME => {}
+        _ => return SyscallResult::Error(EINVAL_VALUE),
+    }
+
+    let res_uaddr = args[1];
+    if res_uaddr != 0 {
+        let res = TimespecLayout {
+            tv_sec: 0,
+            tv_nsec: 1,
+        };
+        if let Err(errno) = bootstrap_write_user::<TimespecLayout>(&ctx.aspace, res_uaddr, res) {
+            return SyscallResult::error_from(errno);
+        }
+    }
+    SyscallResult::Return(0)
+}
+
 /// `gettimeofday(tv, tz)`. Linux RV64 generic ABI
 /// `__NR_gettimeofday = 169`.
 ///
@@ -221,6 +298,31 @@ pub(super) fn sys_gettimeofday<'a, P: TimeIf>(
         return SyscallResult::error_from(errno);
     }
     SyscallResult::Return(0)
+}
+
+/// `settimeofday(tv, tz)`. Linux RV64 generic ABI
+/// `__NR_settimeofday = 170`.
+///
+/// The deprecated timezone argument is ignored for v1; setting time
+/// goes through the same wallclock offset as `clock_settime`.
+pub(super) fn sys_settimeofday<'a, P: TimeIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
+    let tv_uaddr = args[0];
+    if tv_uaddr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    if !can_set_realtime(ctx) {
+        return SyscallResult::Error(EPERM_VALUE);
+    }
+    let Some(ns) = read_timeval_at(&ctx.aspace, tv_uaddr) else {
+        return SyscallResult::Error(EINVAL_VALUE);
+    };
+    match tx_subsystems::wall_clock::set_realtime_ns::<P>(ns) {
+        Ok(_) => SyscallResult::Return(0),
+        Err(_) => SyscallResult::Error(EINVAL_VALUE),
+    }
 }
 
 /// `times(buf)`. Linux RV64 generic ABI `__NR_times = 153`.
@@ -333,15 +435,43 @@ pub(super) async fn sys_clock_nanosleep<'a, P: TimeIf>(
         None if req_uaddr == 0 => return SyscallResult::Error(EFAULT_VALUE),
         None => return SyscallResult::Error(EINVAL_VALUE),
     };
-    let now = <P as TimeIf>::read_ns();
+    if (flags & TIMER_ABSTIME) != 0 && (clk_id == CLOCK_REALTIME || clk_id == CLOCK_REALTIME_COARSE)
+    {
+        loop {
+            if realtime_ns::<P>() >= req_ns {
+                return SyscallResult::Return(0);
+            }
+            if ctx.timer_wheel.is_none() {
+                return SyscallResult::Return(0);
+            }
+            let deadline_ns =
+                tx_subsystems::wall_clock::monotonic_deadline_from_realtime_ns(req_ns);
+            if <P as TimeIf>::read_ns() >= deadline_ns {
+                continue;
+            }
+            match drive_nanosleep_until(ctx, req_ns, deadline_ns).await {
+                SyscallResult::Return(0) => continue,
+                other => return other,
+            }
+        }
+    }
+
     let deadline_ns = if (flags & TIMER_ABSTIME) != 0 {
         req_ns
     } else {
-        now.saturating_add(req_ns)
+        <P as TimeIf>::read_ns().saturating_add(req_ns)
     };
-    if now >= deadline_ns {
+    if <P as TimeIf>::read_ns() >= deadline_ns {
         return SyscallResult::Return(0);
     }
+    drive_nanosleep_until(ctx, req_ns, deadline_ns).await
+}
+
+async fn drive_nanosleep_until<'a>(
+    ctx: &SyscallCtx<'a>,
+    req_ns: u64,
+    deadline_ns: u64,
+) -> SyscallResult {
     use tx_scripts::drive;
     use tx_substrate::step::DriveMode;
     let mut script_ctx = build_subject_script_ctx(ctx);

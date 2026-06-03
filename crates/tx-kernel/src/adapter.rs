@@ -6,7 +6,7 @@
 //! every subsystem. Two domains:
 //!
 //! * `step_engine` — substrate. Step engine, zone role types, EBR
-//!   Guard, SpinMutex. Re-exports `zone::sign`.
+//!   Guard, and the tx-kernel lock facade. Re-exports `zone::sign`.
 //!
 //! * `boot_runtime` — stacked substrate + reactor. The boot-side
 //!   primitives kernel init pulls from reactor (HartId, hart_loop,
@@ -19,9 +19,10 @@ use tx_platform_adapter::platform_adapter;
     platform = "substrate",
     domain = "step_engine",
     apis = ["step", "zone", "epoch"],
-    reason = "expose substrate step engine outcome types, zone role types, EBR guard, and SpinMutex used by tx-kernel init and bootstrap wiring"
+    reason = "expose substrate step engine outcome types, zone role types, EBR guard, and the tx-kernel lock facade used by init and bootstrap wiring"
 )]
 pub mod step_engine {
+    pub(crate) use crate::sync::{spin_mutex, SpinMutex};
     pub use tx_substrate::epoch::{
         self as epoch, cpu_summary, drain_with_budget, guard, summary, Guard,
     };
@@ -34,7 +35,7 @@ pub mod step_engine {
         OperationalCapExt, OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy,
         RetainedEntityPolicy, Weak, Zone, ZoneAllocated, ZoneError, ZonePolicy,
     };
-    pub use tx_substrate::{init, init_on_ap, page_allocator, SpinMutex};
+    pub use tx_substrate::{init, init_on_ap, page_allocator};
 }
 
 #[platform_adapter(
@@ -45,7 +46,7 @@ pub mod step_engine {
 pub mod boot_runtime {
     pub use tx_reactor::{
         ast, current_delegate_registry, current_task_mailbox, current_timer_wheel, hart_loop,
-        userspace, wait, yield_now, HartId, InitialSchedMeta, Reactor, RescheduleSignal,
-        SharedReactor, SliceClock, TaskKey,
+        userspace, wait, yield_now, HartId, InitialSchedMeta, Phase1QueueKind, Reactor,
+        RescheduleSignal, SharedReactor, SliceClock, TaskKey,
     };
 }

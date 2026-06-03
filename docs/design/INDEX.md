@@ -60,6 +60,7 @@ How work runs: the step primitive and the runtime that drives it.
 - [`THREAD_RUNTIME_v1.md`](02_execution/THREAD_RUNTIME_v1.md) — running-thread states, reactor interaction, signal-delivery boundary.
 - [`REACTOR_v0.md`](02_execution/REACTOR_v0.md) — reactor boundary contract.
 - [`SCHEDULER_v0.md`](02_execution/SCHEDULER_v0.md) — scheduler policy and interface contract.
+- [`reactor_scheduling.md`](02_execution/reactor_scheduling.md) — wake-class and Phase 1 queue policy update for pthread lifecycle scheduling.
 - [`COMPLETION_v1.md`](02_execution/COMPLETION_v1.md) — Linux-inspired completion objects as reactor/wait middleware, not bus primitives or semantic truth.
 - [`EXEC_v1.md`](02_execution/EXEC_v1.md) — execve script spec: VFS/Mount/Cred/Loader/VM/Process/FD/Signal/ThreadRuntime composition and point-of-no-return discipline.
 - [`cred_service_v_1_draft (2).md`](<02_execution/cred_service_v_1_draft (2).md>) — credential service: durable identity-derived policy, authorization checks, credential-changing transitions.

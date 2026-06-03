@@ -56,7 +56,9 @@ pub struct OrphanEnd {
 
 impl SpanTable {
     pub fn new() -> Self {
-        Self { by_key: HashMap::new() }
+        Self {
+            by_key: HashMap::new(),
+        }
     }
 
     /// Record a SpanBegin.  Returns `true` if the key was new (normal), `false`
@@ -86,7 +88,11 @@ impl SpanTable {
                 span_id,
             })
         } else {
-            Err(OrphanEnd { ts: end_ts, span_id, track_uuid: track_uuid_hint })
+            Err(OrphanEnd {
+                ts: end_ts,
+                span_id,
+                track_uuid: track_uuid_hint,
+            })
         }
     }
 
@@ -140,7 +146,11 @@ mod tests {
     use super::*;
 
     fn entry(ts: u64) -> SpanEntry {
-        SpanEntry { name_iid: 1, begin_ts: ts, track_uuid: 42 }
+        SpanEntry {
+            name_iid: 1,
+            begin_ts: ts,
+            track_uuid: 42,
+        }
     }
 
     #[test]

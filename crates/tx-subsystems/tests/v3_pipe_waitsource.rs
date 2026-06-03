@@ -46,8 +46,7 @@ use tx_subsystems::pipe::adapter::wait_routing::{
     MailboxEvent, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource,
 };
 use tx_subsystems::pipe::{
-    step_pipe2, step_read, step_write, PipeFlags, PipePayload, PIPE_BUF, PIPE_READABLE,
-    PIPE_WRITABLE,
+    step_pipe2, step_read, step_write, PipeFlags, PipePayload, PIPE_READABLE, PIPE_WRITABLE,
 };
 use tx_subsystems::process::adapter::step_engine::ScriptCtx;
 use tx_subsystems::process::structure::ProcessIdentity;
@@ -240,11 +239,11 @@ fn blocked_writer_on_full_ring_is_woken_when_reader_drains_bytes() {
     let payload = payload_of(&reader);
     let mailbox = Arc::new(TaskMailbox::new());
 
-    // Fill the ring exactly to PIPE_BUF so the writer is blocked.
-    let big = alloc::vec![b'x'; PIPE_BUF];
+    // Fill the pipe exactly to its current capacity so the writer is blocked.
+    let big = alloc::vec![b'x'; payload.pipe_size_bytes()];
     let guard = ebr_guard();
     let filled = step_write(&payload, &big, &guard, false);
-    assert_eq!(filled, StepOutcome::Done(PIPE_BUF));
+    assert_eq!(filled, StepOutcome::Done(big.len()));
     drop(guard);
 
     // Writer registers against `writer_wait_source` while ring is full.

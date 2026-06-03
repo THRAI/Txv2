@@ -7,7 +7,7 @@
 use core::ptr;
 
 /// Fixed retired-node pool for the first EBR slice.
-pub const RETIRED_NODE_POOL_CAPACITY: usize = 128;
+pub const RETIRED_NODE_POOL_CAPACITY: usize = 1024;
 
 pub(crate) struct RetiredNode {
     /// Raw object storage that must not be reused until the epoch window closes.

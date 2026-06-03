@@ -15,7 +15,7 @@ use core::sync::atomic::{AtomicI8, AtomicU64, Ordering};
 use crate::vfs::adapter::step_engine::{
     self, Cap, SpinMutex, Weak, Zone, ZoneAllocated, ZoneError,
 };
-use crate::vfs::adapter::wait_routing::{self, Channel, WaitSource};
+use crate::vfs::adapter::wait_routing::{Channel, WaitSource};
 
 use crate::aio::AioContext;
 use crate::cred::{CapabilitySet, Cred, CredSnapshot};
@@ -34,7 +34,8 @@ use crate::tty::execution::IoctlSideEffect;
 use crate::tty::structure::TtyIdentity;
 use crate::tty::structure::{Termios, Winsize};
 use crate::userfaultfd::UserfaultFd;
-use crate::wait_source;
+use crate::vfs::notification;
+pub use crate::vfs::notification::{VFS_READABLE, VFS_WRITABLE};
 
 pub const VFS_NAME_MAX: usize = 255;
 
@@ -49,12 +50,6 @@ pub const VFS_NAME_MAX: usize = 255;
 /// blocking-IO contract); per-backing helpers (`pipe`, `tty`, future
 /// `socket`) layer their own bit allocations on top of this shape if
 /// they need them.
-pub const VFS_READABLE: u64 = 0x1;
-
-/// Per-RNode wait-source interest mask: space is available to write.
-/// See [`VFS_READABLE`] for the namespace + lifecycle convention.
-pub const VFS_WRITABLE: u64 = 0x2;
-
 // === zone statics =====================================================
 
 static DENTRY_ZONE: Zone<DEntry> = Zone::const_new();
@@ -570,23 +565,18 @@ pub struct RNode {
 
 impl RNode {
     pub fn new(fs_object_id: FsObjectId, meta: InodeMeta, backing: RNodeBacking) -> Self {
-        let read_wait_channel = Channel::new();
-        let read_wait_source_id = wait_source::register_wait_channel(read_wait_channel.clone());
-        let read_wait_source = wait_routing::new_wait_source(read_wait_source_id);
-        let write_wait_channel = Channel::new();
-        let write_wait_source_id = wait_source::register_wait_channel(write_wait_channel.clone());
-        let write_wait_source = wait_routing::new_wait_source(write_wait_source_id);
+        let wait_points = notification::new_rnode_wait_points();
         Self {
             fs_object_id,
             meta,
             backing,
             containing_mount: None,
-            read_wait_channel,
-            read_wait_source_id,
-            read_wait_source,
-            write_wait_channel,
-            write_wait_source_id,
-            write_wait_source,
+            read_wait_channel: wait_points.read_channel,
+            read_wait_source_id: wait_points.read_source_id,
+            read_wait_source: wait_points.read_source,
+            write_wait_channel: wait_points.write_channel,
+            write_wait_source_id: wait_points.write_source_id,
+            write_wait_source: wait_points.write_source,
         }
     }
 
@@ -707,16 +697,12 @@ impl RNode {
     /// either both paths fire or neither does, matching the
     /// exit_source / tty templates).
     pub fn fire_read_wait(&self, mask: u64) -> usize {
-        let released = wait_routing::fire_legacy_channel(&self.read_wait_channel, mask);
-        wait_routing::notify_v3_source(&self.read_wait_source, mask);
-        released
+        notification::notify_readable(&self.read_wait_channel, &self.read_wait_source, mask)
     }
 
     /// Companion to [`Self::fire_read_wait`] for the writable direction.
     pub fn fire_write_wait(&self, mask: u64) -> usize {
-        let released = wait_routing::fire_legacy_channel(&self.write_wait_channel, mask);
-        wait_routing::notify_v3_source(&self.write_wait_source, mask);
-        released
+        notification::notify_writable(&self.write_wait_channel, &self.write_wait_source, mask)
     }
 }
 
@@ -732,8 +718,10 @@ impl RNode {
 /// rows per inode.
 impl Drop for RNode {
     fn drop(&mut self) {
-        wait_source::release_wait_channel(self.read_wait_source_id);
-        wait_source::release_wait_channel(self.write_wait_source_id);
+        notification::release_rnode_wait_points(
+            self.read_wait_source_id,
+            self.write_wait_source_id,
+        );
     }
 }
 
@@ -1253,9 +1241,7 @@ impl OpenFile {
     /// update pipe reader/writer counts synchronously. That keeps pipe
     /// EOF/EPIPE visible at fd-close time instead of waiting for EBR to
     /// eventually retire the shared `OpenFile`.
-    pub(crate) fn pipe_endpoint(
-        &self,
-    ) -> Option<(Cap<crate::pipe::PipePayload>, crate::pipe::PipeSide)> {
+    pub fn pipe_endpoint(&self) -> Option<(Cap<crate::pipe::PipePayload>, crate::pipe::PipeSide)> {
         let OpenFileBacking::Rnode { rnode } = &self.backing else {
             return None;
         };

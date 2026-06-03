@@ -169,15 +169,20 @@ pub struct AddressSpace {
 **Stats consistency.** `stats` are derived and **not required to be strongly consistent** with `recipes` or `pmap` at all times. They are updated on commit paths of binding and materialization mutations, but observers may see stats that lag behind the authoritative state by some bounded amount. For observability-grade use (`/proc/<pid>/status`, rlimit enforcement approximations); not suitable for correctness checks.
 
 **Recipes implementation note.** The current implementation realizes
-the `PersistentBTree<UserRange, VmEntry>` semantic as a copy-on-write
-`BTreeMap<UserVirtAddr, VmEntry>` published behind an `AtomicPtr` with
-EBR for snapshot-consistent reads. Each mutation rebuilds the tree
-under a `SpinMutex` and atomically swaps the published root. The key
-is the start address of the entry's `UserRange`; range-overlap queries
-walk predecessor/successor entries explicitly. This satisfies the
-snapshot-consistency property the spec requires; replacing the COW
-`BTreeMap` with a structurally-shared persistent BTree is a future
-optimization tracked outside v1.2.
+the `PersistentBTree<UserRange, VmEntry>` semantic as an immutable,
+structurally shared recipe tree published behind an `AtomicPtr` with
+EBR for snapshot-consistent reads. Writers hold the VM-local mutation
+lock, path-copy the affected tree nodes, and atomically swap the
+published root; readers under an epoch guard see either the pre-mutation
+or post-mutation root, never an intermediate rewrite. The key is the
+start address of the entry's `UserRange`; range-overlap queries combine
+the immediate predecessor with entries whose starts lie inside the
+requested range. Adjacent compatible anonymous ranges may coalesce at
+commit time, preserving the same authoritative binding while avoiding
+recipe growth from page-at-a-time heap extension.
+Fork clones the published recipe root directly; child-only CoW metadata
+divergence path-copies the affected private entries while unchanged
+recipes continue to share nodes.
 
 **Fields are non-negotiable in v1.** Every AddressSpace has exactly these. There is no per-AddressSpace mutex; coordination is through the RangeLock.
 

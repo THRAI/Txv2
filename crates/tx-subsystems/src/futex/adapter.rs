@@ -22,6 +22,7 @@ use tx_platform_adapter::platform_adapter;
     reason = "wrap futex step outcomes (einval, eagain, yield-until-wake, done(n)) as named verbs over the substrate step engine"
 )]
 pub mod step_engine {
+    pub(crate) use crate::sync::SpinMutex;
     pub use tx_substrate::epoch::{guard, Guard};
     pub use tx_substrate::step::{
         AbortReason, Errno, InterestMask, NoProgress, OneShotStepOp, ProcessIdentity,
@@ -34,7 +35,6 @@ pub mod step_engine {
         OperationalCapExt, OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy,
         RetainedEntityPolicy, Weak, Zone, ZoneAllocated, ZoneError, ZonePolicy,
     };
-    pub use tx_substrate::SpinMutex;
 
     /// `futex(uaddr, FUTEX_WAIT, val, ...)` matched the value: park on
     /// the bucket's wait source. Wraps `StepOutcome::Yield { progress

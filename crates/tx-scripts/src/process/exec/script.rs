@@ -44,14 +44,14 @@
 use alloc::vec::Vec;
 
 use tx_hal::{EntropyIf, PmapIf, UserTrapContext};
-use tx_subsystems::cred::{step_apply_suid_for_exec, Capability, Gid, Uid};
+use tx_subsystems::cred::{Capability, Gid, Uid, step_apply_suid_for_exec};
 use tx_subsystems::execution::Errno;
 use tx_subsystems::mount::MountFlags;
-use tx_subsystems::page_backed::{read_exact_at, PageContainer};
+use tx_subsystems::page_backed::{PageContainer, read_exact_at};
 use tx_subsystems::process::adapter::wait_routing::Mask;
 use tx_subsystems::process::{
-    step_close_cloexec_fds, step_install_brk_for_exec, step_reset_signal_dispositions_for_exec,
-    ProcessIdentity,
+    ProcessIdentity, step_close_cloexec_fds, step_install_brk_for_exec,
+    step_reset_signal_dispositions_for_exec,
 };
 use tx_subsystems::thread_runtime::ThreadIdentity;
 use tx_subsystems::vfs::walker::step_open;
@@ -62,10 +62,11 @@ use tx_subsystems::vm::scripts::{
 use tx_subsystems::vm::{MapPlacement, MapReserveResult, Prot, VmBacking, VmEntry, VmEntryFlags};
 
 use super::loader::{
-    parse_image_plan, ExecImagePlan, InterpreterPlan, LoadSegment as ParsedLoadSegment, ParseError,
-    SegmentFlags as ParsedSegmentFlags, ELF64_PHENT, ET_DYN_LOAD_BIAS,
+    ELF64_PHENT, ET_DYN_LOAD_BIAS, ExecImagePlan, InterpreterPlan,
+    LoadSegment as ParsedLoadSegment, ParseError, SegmentFlags as ParsedSegmentFlags,
+    parse_image_plan,
 };
-use super::stack::{build_initial_user_stack, AuxvFacts};
+use super::stack::{AuxvFacts, build_initial_user_stack};
 use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
 use crate::adapter::vfs_exec::{
     Credential, DEntry, InodeKind, InodeMeta, OpenFileFlags, RNodeBacking,
@@ -463,9 +464,7 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     // worth of program headers (≈ 3.6 KiB), comfortably within one
     // 4 KiB page.
     let read_len = core::cmp::min(file_size as usize, INITIAL_PARSE_READ);
-    if read_len < 64 {
-        // ELF64 header alone is 64 bytes — anything smaller cannot be
-        // a valid binary.
+    if read_len == 0 {
         return Err(ExecError::NotExecutable);
     }
     let mut header_bytes: Vec<u8> = alloc::vec![0u8; read_len];
@@ -543,6 +542,9 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
             cred,
         ))
         .await;
+    }
+    if read_len < 64 {
+        return Err(ExecError::NotExecutable);
     }
 
     // ===== Phase 3 — parse + validate (pure CPU) =====================
@@ -859,7 +861,7 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
                     prot,
                     VmEntryFlags::PRIVATE,
                     VmBacking::Page {
-                        pc: interp_pc.clone(),
+                        pc: interp_pc.clone().into(),
                         offset: file_page_offset,
                     },
                 );
@@ -1429,11 +1431,7 @@ fn shebang_parse(header: &[u8]) -> Option<(&[u8], Option<&[u8]>)> {
     } else {
         let (arg, _) = shebang_split_word(rest);
         let arg = shebang_trim_end(arg);
-        if arg.is_empty() {
-            None
-        } else {
-            Some(arg)
-        }
+        if arg.is_empty() { None } else { Some(arg) }
     };
     Some((interp, opt_arg))
 }

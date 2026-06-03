@@ -9,14 +9,16 @@
 //!
 //! The VVAR page is a dedicated, page-aligned kernel frame mapped
 //! read-only into every user address space.  It carries a seqlock-
-//! guarded snapshot of the current realtime and monotonic clocks.
-//! The kernel updates it from the timer interrupt; user-mode vDSO
-//! code reads it without trapping.
+//! guarded snapshot of clock conversion state and realtime/monotonic
+//! basetimes. User-mode vDSO code reads the hardware counter and
+//! computes current time from that snapshot without trapping.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use alloc::vec::Vec;
 use tx_substrate::page_allocator;
+
+use crate::wall_clock::VvarSnapshot;
 
 // ---------------------------------------------------------------------------
 // VVAR page
@@ -34,7 +36,7 @@ pub struct VvarPage {
     pub mult: AtomicU64,
     pub shift: AtomicU64,
     pub mask: AtomicU64,
-    pub _reserved: [u8; 4032],
+    pub _reserved: [u8; 4024],
 }
 
 unsafe impl Sync for VvarPage {}
@@ -57,7 +59,7 @@ impl VvarPage {
             mult: AtomicU64::new(0),
             shift: AtomicU64::new(0),
             mask: AtomicU64::new(!0u64),
-            _reserved: [0u8; 4032],
+            _reserved: [0u8; 4024],
         }
     }
 
@@ -80,28 +82,57 @@ impl VvarPage {
         self.mult.store(mult, Ordering::Relaxed);
         self.shift.store(shift, Ordering::Relaxed);
         self.mask.store(!0u64, Ordering::Relaxed);
+        crate::wall_clock::set_clock_params(mult, shift, !0u64);
     }
 
     pub fn update(&self, realtime: (u64, u64), monotonic: (u64, u64)) {
+        let shift = self.shift.load(Ordering::Acquire);
+        let snapshot = VvarSnapshot {
+            cycle_last: read_cycle_counter(),
+            mask: self.mask.load(Ordering::Acquire),
+            mult: self.mult.load(Ordering::Acquire),
+            shift,
+            realtime_sec: realtime.0,
+            realtime_nsec_shifted: realtime.1 << shift,
+            monotonic_sec: monotonic.0,
+            monotonic_nsec_shifted: monotonic.1 << shift,
+        };
+        self.update_from_snapshot(snapshot);
+    }
+
+    pub fn update_from_snapshot(&self, snapshot: VvarSnapshot) {
         self.seq.fetch_add(1, Ordering::Relaxed);
         core::sync::atomic::fence(Ordering::Release);
-        self.realtime_sec.store(realtime.0, Ordering::Relaxed);
-        self.realtime_nsec.store(realtime.1, Ordering::Relaxed);
-        self.monotonic_sec.store(monotonic.0, Ordering::Relaxed);
-        self.monotonic_nsec.store(monotonic.1, Ordering::Relaxed);
-        #[cfg(target_arch = "riscv64")]
-        {
-            let now: u64;
-            unsafe {
-                core::arch::asm!("rdtime {t}", t = out(reg) now, options(nomem, nostack));
-            }
-            self.cycle_last.store(now, Ordering::Relaxed);
-        }
-        #[cfg(not(target_arch = "riscv64"))]
-        self.cycle_last.store(0, Ordering::Relaxed);
+        self.realtime_sec
+            .store(snapshot.realtime_sec, Ordering::Relaxed);
+        self.realtime_nsec
+            .store(snapshot.realtime_nsec_shifted, Ordering::Relaxed);
+        self.monotonic_sec
+            .store(snapshot.monotonic_sec, Ordering::Relaxed);
+        self.monotonic_nsec
+            .store(snapshot.monotonic_nsec_shifted, Ordering::Relaxed);
+        self.cycle_last
+            .store(snapshot.cycle_last, Ordering::Relaxed);
+        self.mult.store(snapshot.mult, Ordering::Relaxed);
+        self.shift.store(snapshot.shift, Ordering::Relaxed);
+        self.mask.store(snapshot.mask, Ordering::Relaxed);
         core::sync::atomic::fence(Ordering::Release);
         self.seq.fetch_add(1, Ordering::Release);
     }
+}
+
+#[cfg(target_arch = "riscv64")]
+fn read_cycle_counter() -> u64 {
+    let now: u64;
+    unsafe {
+        core::arch::asm!("rdtime {t}", t = out(reg) now, options(nomem, nostack));
+    }
+    now
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+fn read_cycle_counter() -> u64 {
+    0
 }
 
 // ---------------------------------------------------------------------------
@@ -187,6 +218,35 @@ pub fn vdso_available() -> bool {
         tx_vdso::VDSO_AVAILABLE
             && !tx_vdso::VDSO_IMAGE.is_empty()
             && unsafe { KERNEL_VDSO.is_some() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vvar_update_snapshot_publishes_shifted_bases_without_recomputing_cycle_last() {
+        let page = VvarPage::new();
+        let snapshot = VvarSnapshot {
+            cycle_last: 42,
+            mask: !0,
+            mult: 2,
+            shift: 3,
+            realtime_sec: 10,
+            realtime_nsec_shifted: 123 << 3,
+            monotonic_sec: 5,
+            monotonic_nsec_shifted: 456 << 3,
+        };
+
+        page.update_from_snapshot(snapshot);
+
+        assert_eq!(page.cycle_last.load(Ordering::Acquire), 42);
+        assert_eq!(page.mult.load(Ordering::Acquire), 2);
+        assert_eq!(page.shift.load(Ordering::Acquire), 3);
+        assert_eq!(page.realtime_nsec.load(Ordering::Acquire), 123 << 3);
+        assert_eq!(page.monotonic_nsec.load(Ordering::Acquire), 456 << 3);
+        assert_eq!(page.seq.load(Ordering::Acquire) % 2, 0);
     }
 }
 

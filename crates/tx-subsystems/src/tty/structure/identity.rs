@@ -19,9 +19,8 @@ use alloc::sync::Arc;
 use crate::tty::adapter::step_engine::{
     AtomicSlot, Cap, Dead, Entity, PayloadCap, RawPort, RawQueue, SpinMutex, Weak,
 };
-use crate::tty::adapter::wait_routing::{self, Channel, WaitSource};
-
-use crate::wait_source;
+use crate::tty::adapter::wait_routing::{Channel, WaitSource};
+use crate::tty::notification;
 
 use super::payload::TtyPayload;
 use crate::tty::adapter::step_engine::{self as step_engine};
@@ -256,13 +255,7 @@ impl TtyIdentity {
     /// `payload` starts as `None`; the caller must assign it after allocating
     /// the payload zone slot.
     pub fn new(kind: TtyKind, index: u32, name: &str) -> Self {
-        let wait_channel = Channel::new();
-        let wait_source_id = wait_source::register_wait_channel(wait_channel.clone());
-        // PR-3D-4 (D2/D4 coexistence). The new `Arc<WaitSource>`
-        // shares the legacy `wait_source_id` namespace so a v3
-        // caller using the `WaitSourceId` stamped into
-        // `YieldShape::OnWaitSource` lands on this same source.
-        let wait_source = wait_routing::new_wait_source(wait_source_id);
+        let wait_point = notification::new_wait_point();
         Self {
             kind,
             index,
@@ -273,9 +266,9 @@ impl TtyIdentity {
             hangup_port: RawPort::new(),
             session_ctl_port: RawPort::new(),
             payload: SpinMutex::new(None),
-            wait_channel,
-            wait_source_id,
-            wait_source,
+            wait_channel: wait_point.channel,
+            wait_source_id: wait_point.source_id,
+            wait_source: wait_point.source,
         }
     }
 
@@ -364,8 +357,7 @@ impl TtyIdentity {
 
 impl Drop for TtyIdentity {
     fn drop(&mut self) {
-        wait_source::release_wait_channel(self.wait_source_id);
-        wait_routing::unregister_source(self.wait_source_id);
+        notification::release_wait_point(self.wait_source_id);
     }
 }
 

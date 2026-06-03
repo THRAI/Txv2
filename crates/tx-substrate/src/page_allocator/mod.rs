@@ -224,6 +224,19 @@ static FRAME_KERNEL_ADDR: AtomicUsize = AtomicUsize::new(NO_FRAME_KERNEL_ADDR);
 const NO_ZERO_FRAME: usize = usize::MAX;
 static ZERO_FRAME_PPN: AtomicUsize = AtomicUsize::new(NO_ZERO_FRAME);
 
+macro_rules! measure_page_allocator {
+    ($method_name:expr, $body:block) => {{
+        #[cfg(all(tx_ds_metrics, tx_ds_metrics_page_allocator))]
+        {
+            crate::ds_metrics::measure($method_name, || $body)
+        }
+        #[cfg(not(all(tx_ds_metrics, tx_ds_metrics_page_allocator)))]
+        {
+            $body
+        }
+    }};
+}
+
 /// Install the steady-state bitmap allocator.
 ///
 /// Boot calls this once after `FrameMeta[]` and the bitmap are carved and
@@ -282,7 +295,9 @@ pub fn installed_bitmap_allocator() -> Result<&'static BitmapPageAllocator<'stat
 pub fn reserve_frame(
     policy: ZeroPolicy,
 ) -> Result<FrameReservation<'static, BitmapPageAllocator<'static>>, AllocError> {
-    installed_bitmap_allocator()?.reserve_frame(policy)
+    measure_page_allocator!(b"debug.ds.substrate.page_allocator.reserve_frame", {
+        installed_bitmap_allocator()?.reserve_frame(policy)
+    })
 }
 
 /// Acquire pmap/PTE role evidence for an already-live frame.
@@ -354,7 +369,9 @@ pub fn reserve_run(
     align: usize,
     policy: ZeroPolicy,
 ) -> Result<FrameRunReservation<'static, BitmapPageAllocator<'static>>, AllocError> {
-    installed_bitmap_allocator()?.reserve_run(count, align, policy)
+    measure_page_allocator!(b"debug.ds.substrate.page_allocator.reserve_run", {
+        installed_bitmap_allocator()?.reserve_run(count, align, policy)
+    })
 }
 
 /// Free-frame count from the installed backend.
@@ -367,8 +384,10 @@ pub fn free_count() -> Result<usize, AllocError> {
 /// This is for substrate components that intentionally hold a raw PPN after
 /// committing an `OwnedFrame` token into their own lifetime protocol.
 pub(crate) fn release_owned_frame(ppn: Ppn) -> Result<(), AllocError> {
-    installed_bitmap_allocator()?.release_owned(ppn);
-    Ok(())
+    measure_page_allocator!(b"debug.ds.substrate.page_allocator.release_owned_frame", {
+        installed_bitmap_allocator()?.release_owned(ppn);
+        Ok(())
+    })
 }
 
 /// Total frame count from the installed backend.
@@ -383,13 +402,18 @@ pub fn total_count() -> Result<usize, AllocError> {
 /// rollback can return abandoned intermediate pages without the HAL crate
 /// depending on substrate internals.
 pub fn reserve_page_table_node() -> Result<PtNode, tx_hal::AllocError> {
-    let frame = reserve_frame(ZeroPolicy::Zeroed)
-        .map_err(|_| tx_hal::AllocError::Exhausted)?
-        .commit();
-    let pt_frame = frame.into_page_table_frame();
-    let phys = PhysAddr(pt_frame.ppn().0 * 4096);
-    core::mem::forget(pt_frame);
-    Ok(PtNode::typed_frame(phys, release_page_table_node))
+    measure_page_allocator!(
+        b"debug.ds.substrate.page_allocator.reserve_page_table_node",
+        {
+            let frame = reserve_frame(ZeroPolicy::Zeroed)
+                .map_err(|_| tx_hal::AllocError::Exhausted)?
+                .commit();
+            let pt_frame = frame.into_page_table_frame();
+            let phys = PhysAddr(pt_frame.ppn().0 * 4096);
+            core::mem::forget(pt_frame);
+            Ok(PtNode::typed_frame(phys, release_page_table_node))
+        }
+    )
 }
 
 /// Claim and remember the kernel zero frame.
@@ -398,22 +422,28 @@ pub fn reserve_page_table_node() -> Result<PtNode, tx_hal::AllocError> {
 /// The frame is returned as a permanent anchor and intentionally never re-enters
 /// the normal allocator pool.
 pub fn claim_zero_frame() -> Result<Ppn, AllocError> {
-    if ZERO_FRAME_PPN.load(Ordering::Acquire) != NO_ZERO_FRAME {
-        return Err(AllocError::AlreadyInstalled);
-    }
-    let frame = reserve_frame(ZeroPolicy::Zeroed)?.commit();
-    let ppn = frame.ppn();
-    match ZERO_FRAME_PPN.compare_exchange(NO_ZERO_FRAME, ppn.0, Ordering::AcqRel, Ordering::Acquire)
-    {
-        Ok(_) => {
-            let _anchor = frame.into_permanent_frame();
-            Ok(ppn)
+    measure_page_allocator!(b"debug.ds.substrate.page_allocator.claim_zero_frame", {
+        if ZERO_FRAME_PPN.load(Ordering::Acquire) != NO_ZERO_FRAME {
+            return Err(AllocError::AlreadyInstalled);
         }
-        Err(_) => {
-            drop(frame);
-            Err(AllocError::AlreadyInstalled)
+        let frame = reserve_frame(ZeroPolicy::Zeroed)?.commit();
+        let ppn = frame.ppn();
+        match ZERO_FRAME_PPN.compare_exchange(
+            NO_ZERO_FRAME,
+            ppn.0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                let _anchor = frame.into_permanent_frame();
+                Ok(ppn)
+            }
+            Err(_) => {
+                drop(frame);
+                Err(AllocError::AlreadyInstalled)
+            }
         }
-    }
+    })
 }
 
 /// Return the permanent zero-frame PPN after boot has claimed it.
@@ -432,7 +462,10 @@ pub fn zero_frame_ppn() -> Result<Ppn, AllocError> {
 pub fn claim_permanent_frame(
     ppn: Ppn,
 ) -> Result<PermanentFrame<'static, BitmapPageAllocator<'static>>, AllocError> {
-    installed_bitmap_allocator()?.claim_permanent_frame(ppn)
+    measure_page_allocator!(
+        b"debug.ds.substrate.page_allocator.claim_permanent_frame",
+        { installed_bitmap_allocator()?.claim_permanent_frame(ppn) }
+    )
 }
 
 unsafe fn release_page_table_node(phys: PhysAddr) {

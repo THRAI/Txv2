@@ -10,7 +10,8 @@ use super::adapter::step_engine::{self as step_engine, guard, page_allocator, Er
 use tx_subsystems::cred::{Capability, CapabilitySet};
 use tx_subsystems::page_backed::FsPageBacking;
 use tx_subsystems::vfs::{
-    Credential, DirCursor, FsObjectId, FsOps, InodeKind, RNodeBacking, S_IFMT, S_ISGID, S_ISUID,
+    Credential, DirCursor, FsObjectId, FsOps, InodeKind, OpenFile, OpenFileFlags, RNodeBacking,
+    S_IFMT, S_ISGID, S_ISUID,
 };
 
 use super::{Tmpfs, TMPFS_ROOT_OBJECT_ID};
@@ -26,6 +27,22 @@ fn init_substrate() {
         Ok(_) | Err(page_allocator::AllocError::AlreadyInstalled) => {}
         Err(error) => panic!("claim zero frame for tmpfs tests: {error:?}"),
     }
+}
+
+#[test]
+#[cfg(tx_lock_metrics_fs)]
+fn tmpfs_state_lock_metrics_are_cfg_gated() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Tmpfs::new();
+
+    assert!(
+        tmpfs.state.lock_metrics_enabled(),
+        "tmpfs state lock must emit observed lock rows when tx_lock_metrics_fs is enabled"
+    );
 }
 
 /// Build a throw-away `Cap<MountPayload>` over `tmpfs` so tests that
@@ -421,7 +438,7 @@ fn tmpfs_materialise_rnode_for_regular_file_returns_page_backed() {
     match rnode.backing() {
         RNodeBacking::PageBacked { pc } => {
             // Sanity: the container's `page_count` matches tmpfs's
-            // static cap (`TMPFS_FILE_PAGE_CAP = 1024`). `size_bytes`
+            // static cap (`TMPFS_FILE_PAGE_CAP = 2048`). `size_bytes`
             // initialises to `page_count * USER_PAGE_SIZE` (the
             // PageContainer's capacity); inode-visible size lives on
             // `InodeMeta::size`, not the container, so we don't pin
@@ -430,13 +447,80 @@ fn tmpfs_materialise_rnode_for_regular_file_returns_page_backed() {
             // RNode means writes via `FsPageBacking` and reads via
             // `OpenFile::step_read` / `read_exact_at` see the same
             // underlying pages.
-            assert_eq!(pc.page_count(), 1024, "tmpfs file page-cap shape");
+            assert_eq!(pc.page_count(), 2048, "tmpfs file page-cap shape");
         }
         other => panic!("expected PageBacked backing for regular file, got {other:?}"),
     }
     // RNode meta round-trips the input meta.
     assert_eq!(rnode.fs_object_id(), file_id);
     assert_eq!(rnode.meta().kind(), InodeKind::Regular);
+}
+
+#[test]
+fn tmpfs_tmpfile_shape_read_after_write_survives_unlink() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = guard();
+    let cred = Credential::root();
+
+    let (file_id, file_meta) = match tmpfs.create_inode(
+        TMPFS_ROOT_OBJECT_ID,
+        b"tmpfile_probe",
+        0o100600,
+        &cred,
+        &guard,
+    ) {
+        StepOutcome::Done(out) => out,
+        other => panic!("create_inode failed: {other:?}"),
+    };
+    let rnode = match <Tmpfs as FsOps>::materialise_rnode(
+        &*tmpfs,
+        file_id,
+        file_meta,
+        &test_mount_payload(&tmpfs),
+        &guard,
+    ) {
+        StepOutcome::Done(rnode) => rnode,
+        other => panic!("materialise_rnode failed: {other:?}"),
+    };
+    let file = OpenFile::new_cap(
+        rnode,
+        OpenFileFlags {
+            read: true,
+            write: true,
+            append: false,
+            cloexec: false,
+            nonblocking: false,
+        },
+    )
+    .expect("open tmpfile-shaped file");
+
+    let payload: alloc::vec::Vec<u8> = (0..8192).map(|i| (i % 251) as u8).collect();
+    assert_eq!(
+        file.step_write(&payload, &guard),
+        StepOutcome::Done(payload.len())
+    );
+
+    assert_eq!(
+        tmpfs.unlink(TMPFS_ROOT_OBJECT_ID, b"tmpfile_probe", file_id, &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"tmpfile_probe", &guard),
+        StepOutcome::Err(Errno::ENOENT)
+    );
+
+    assert_eq!(file.step_lseek(0, 0, &guard), StepOutcome::Done(0));
+    let mut readback = alloc::vec![0u8; payload.len()];
+    assert_eq!(
+        file.step_read(&mut readback, &guard),
+        StepOutcome::Done(payload.len())
+    );
+    assert_eq!(readback, payload);
 }
 
 #[test]
@@ -498,6 +582,39 @@ fn tmpfs_materialise_rnode_for_symlink_returns_einval() {
             &test_mount_payload(&tmpfs),
             &guard
         ),
+        StepOutcome::Err(Errno::EINVAL)
+    );
+}
+
+#[test]
+fn tmpfs_read_link_returns_target_bytes() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = guard();
+    let cred = Credential::root();
+
+    let (link_id, _) =
+        match tmpfs.symlink(TMPFS_ROOT_OBJECT_ID, b"link", b"target/path", &cred, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("symlink failed: {other:?}"),
+        };
+    let (file_id, _) =
+        match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"regular", 0o100644, &cred, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("create_inode failed: {other:?}"),
+        };
+
+    let target = match <Tmpfs as FsOps>::read_link(&*tmpfs, link_id, &guard) {
+        StepOutcome::Done(target) => target,
+        other => panic!("read_link failed: {other:?}"),
+    };
+    assert_eq!(target.as_ref(), b"target/path");
+    assert_eq!(
+        <Tmpfs as FsOps>::read_link(&*tmpfs, file_id, &guard),
         StepOutcome::Err(Errno::EINVAL)
     );
 }
@@ -704,10 +821,11 @@ fn tmpfs_chown_clears_setuid_bit_for_non_privileged() {
     assert_eq!(meta.mode & S_ISUID, 0);
     assert_eq!(meta.mode & S_ISGID, 0);
 
-    // Privileged callers preserve the setuid bit on chown — set
-    // it again, then chown via admin and verify it survives.
+    // Linux's chown(2) clearing rule also applies to privileged
+    // callers for executable files: setuid is cleared, and setgid is
+    // cleared when the group-execute bit is present.
     assert_eq!(
-        <Tmpfs as FsOps>::step_chmod(&*tmpfs, file_id, S_ISUID | 0o755, &admin, &guard),
+        <Tmpfs as FsOps>::step_chmod(&*tmpfs, file_id, S_ISUID | S_ISGID | 0o770, &admin, &guard),
         StepOutcome::Done(())
     );
     assert_eq!(
@@ -718,11 +836,37 @@ fn tmpfs_chown_clears_setuid_bit_for_non_privileged() {
         StepOutcome::Done(m) => m,
         other => panic!("load_inode_meta: {other:?}"),
     };
+    assert_eq!(meta.mode & (S_ISUID | S_ISGID), 0);
+    assert_eq!(meta.mode & !S_IFMT, 0o770);
+}
+
+#[test]
+fn tmpfs_chown_preserves_setgid_without_group_execute() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = guard();
+    let admin = cred_with_caps(0, 0, CapabilitySet::FULL);
+    let mode = (S_ISUID | S_ISGID | 0o700) | tx_subsystems::vfs::S_IFREG;
+    let (file_id, _) = match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", mode, &admin, &guard) {
+        StepOutcome::Done(out) => out,
+        other => panic!("create_inode: {other:?}"),
+    };
+
     assert_eq!(
-        meta.mode & S_ISUID,
-        S_ISUID,
-        "privileged chown should preserve S_ISUID"
+        <Tmpfs as FsOps>::step_chown(&*tmpfs, file_id, Some(0), Some(0), &admin, &guard),
+        StepOutcome::Done(())
     );
+    let meta = match tmpfs.load_inode_meta(file_id, &guard) {
+        StepOutcome::Done(m) => m,
+        other => panic!("load_inode_meta: {other:?}"),
+    };
+    assert_eq!(meta.mode & S_ISUID, 0);
+    assert_eq!(meta.mode & S_ISGID, S_ISGID);
+    assert_eq!(meta.mode & !S_IFMT, S_ISGID | 0o700);
 }
 
 // === FsOps + FsPageBacking tests ====================================

@@ -1,4 +1,4 @@
-//! `sys_io_uring_setup(2)` — second `OnBehalfOf<P>` canary scaffold
+//! `sys_io_uring_setup(2)` / `sys_io_uring_enter(2)` scaffold
 //! (future PR-12 phase 0).
 //!
 //! Spec:
@@ -14,7 +14,10 @@
 //!    `OpenFileBacking::IoUring`, installs at the lowest free fd via
 //!    [`tx_subsystems::process::ProcessIdentity::install_fd`], and
 //!    returns the fd.
-//! 2. The syscall also spawns the SQPOLL kthread for the new ring by
+//! 2. [`sys_io_uring_enter`] — the syscall dispatcher for
+//!    `__NR_io_uring_enter = 426`. Resolves the ring fd, drains the
+//!    in-kernel SQ scaffold into CQEs, and returns the submitted count.
+//! 3. Setup also spawns the SQPOLL kthread for the new ring by
 //!    constructing a [`SqpollWorkerFuture`] via
 //!    [`tx_subsystems::io_uring::spawn_sqpoll_worker`] and stashing it
 //!    in a per-ring registry [`take_io_uring_worker_for_test`]. This
@@ -38,8 +41,8 @@
 //!   `IocbDispatcher`).
 //! - **CQE ring is in-kernel `VecDeque<CqeStub>`.** Phase 1 lands the
 //!   user-mmapped ring.
-//! - **No flag handling.** `IORING_SETUP_SQPOLL` is implicit;
-//!   non-SQPOLL setups are out of scope for this canary.
+//! - **Minimal enter flag handling.** Basic enter flags are recognised;
+//!   signal-mask enter and user-mmapped SQ/CQ parsing are deferred.
 //! - **Kthread spawn is deferred-pump.** Same model as AIO phase 2 —
 //!   the test pulls the stashed worker future and pumps it.
 //!
@@ -50,13 +53,17 @@ extern crate alloc;
 use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use tx_subsystems::io_uring::{spawn_sqpoll_worker, IoUring, SqpollWorkerFuture};
+use tx_subsystems::io_uring::{spawn_sqpoll_worker, CqeStub, IoUring, SqpollWorkerFuture};
 use tx_subsystems::vfs::structure::OpenFileFlags;
 use tx_subsystems::vfs::OpenFile;
 
-use super::{next_stdio_fd_below_nofile, ENOMEM_VALUE};
+use super::{next_stdio_fd_below_nofile, EBADF_VALUE, EINVAL_VALUE, ENOMEM_VALUE};
 use super::{SyscallCtx, SyscallResult};
 use crate::adapter::step_engine::SpinMutex;
+
+const IORING_ENTER_GETEVENTS: u32 = 1 << 0;
+const IORING_ENTER_SQ_WAKEUP: u32 = 1 << 1;
+const IORING_ENTER_SQ_WAIT: u32 = 1 << 2;
 
 /// Build the owner's `SubjectContext` from the syscall ctx. Mirrors
 /// the helper used by `linux_syscall::aio::sys_io_setup` — see that
@@ -137,6 +144,52 @@ pub(super) fn sys_io_uring_setup(
     let _ = ctx.process.install_fd(fd, open_cap);
 
     SyscallResult::Return(fd as i64)
+}
+
+/// `io_uring_enter(fd, to_submit, min_complete, flags, sig, sigsz)`.
+///
+/// Tx's current io_uring scaffold has an in-kernel SQ/CQ pair rather
+/// than Linux's user-mmapped rings. This arm still follows the same
+/// syscall contract shape: resolve the ring fd, accept the basic enter
+/// flags used by SQPOLL/GETEVENTS callers, drain up to `to_submit`
+/// SQEs from the ring, publish one zero-result CQE per submitted SQE,
+/// and return the submitted count. Waiting for `min_complete` is a
+/// later mailbox-backed sleep extension; today the call is nonblocking.
+pub(super) fn sys_io_uring_enter(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let fd = args[0] as u32;
+    let to_submit = args[1] as u32;
+    let _min_complete = args[2] as u32;
+    let flags = args[3] as u32;
+    let sig = args[4];
+    let sigsz = args[5];
+
+    let recognised_flags = IORING_ENTER_GETEVENTS | IORING_ENTER_SQ_WAKEUP | IORING_ENTER_SQ_WAIT;
+    if flags & !recognised_flags != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if sig != 0 || sigsz != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    let open_file = match super::resolve_fd(&ctx.process, fd) {
+        Some(file) => file,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+    let ring = match open_file.io_uring() {
+        Some(ring) => ring.clone(),
+        None => return SyscallResult::Error(EINVAL_VALUE),
+    };
+
+    let mut submitted = 0u32;
+    while submitted < to_submit {
+        let Some(sqe) = ring.pop_sqe() else {
+            break;
+        };
+        ring.push_cqe(CqeStub::new(sqe.user_data, 0, 0));
+        submitted += 1;
+    }
+
+    SyscallResult::Return(submitted as i64)
 }
 
 // === phase-0 worker-future registry =====================================

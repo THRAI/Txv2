@@ -39,6 +39,18 @@ use adapter::step_engine::Cap;
 use crate::process::ProcessIdentity;
 use crate::thread_runtime::ThreadIdentity;
 
+/// Result of asking the kernel reactor seam to publish a freshly cloned child.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SubmitChildThreadStatus {
+    /// The child was submitted directly to the live reactor and has a
+    /// scheduler-visible queue placement before the parent receives its clone
+    /// return value.
+    Published,
+    /// The child could not be published immediately and was queued for the
+    /// reactor loop's fallback drain path.
+    QueuedFallback,
+}
+
 /// Function-pointer signature for the reactor-submission hook.
 ///
 /// `child_process` and `child_thread` are the freshly minted caps
@@ -47,8 +59,10 @@ use crate::thread_runtime::ThreadIdentity;
 /// payload))` task to the boot reactor. `P` is captured by the
 /// installer (`tx-kernel::init`) at boot time so the seam can stay
 /// parameter-free.
-pub type SubmitChildThreadFn =
-    fn(child_process: Cap<ProcessIdentity>, child_thread: Cap<ThreadIdentity>);
+pub type SubmitChildThreadFn = fn(
+    child_process: Cap<ProcessIdentity>,
+    child_thread: Cap<ThreadIdentity>,
+) -> SubmitChildThreadStatus;
 
 /// Slot holding the installed [`SubmitChildThreadFn`]. `AtomicPtr`
 /// is used (over `SpinMutex<Option<...>>`) so the read path
@@ -94,10 +108,13 @@ pub fn submit_child_thread_fn() -> Option<SubmitChildThreadFn> {
 /// Wave 2's `sys_clone` calls this. Reaching the panic arm is a
 /// kernel-invariant violation: the boot path must install the hook
 /// before any user syscall can fire.
-pub fn submit_child_thread(child_process: Cap<ProcessIdentity>, child_thread: Cap<ThreadIdentity>) {
+pub fn submit_child_thread(
+    child_process: Cap<ProcessIdentity>,
+    child_thread: Cap<ThreadIdentity>,
+) -> SubmitChildThreadStatus {
     let f = submit_child_thread_fn()
         .expect("reactor_submit: SUBMIT_CHILD_THREAD_FN not installed before sys_clone fired");
-    f(child_process, child_thread);
+    f(child_process, child_thread)
 }
 
 /// Test-only: clear the installed hook so a subsequent
@@ -112,9 +129,10 @@ pub fn reset_for_test() {
 mod tests {
     use super::*;
 
-    fn dummy_submit(_p: Cap<ProcessIdentity>, _t: Cap<ThreadIdentity>) {
+    fn dummy_submit(_p: Cap<ProcessIdentity>, _t: Cap<ThreadIdentity>) -> SubmitChildThreadStatus {
         // No-op installer used to verify the slot mechanics; never
         // called because we don't synthesise valid Caps in this test.
+        SubmitChildThreadStatus::QueuedFallback
     }
 
     #[test]

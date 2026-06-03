@@ -5,13 +5,41 @@
 
 use super::*;
 use crate::adapter::step_engine::{self as step_engine};
-use crate::linux_syscall::numbers::CLONE_NEWIPC;
+use crate::linux_syscall::numbers::{CLONE_NEWIPC, NR_CLONE};
 
 /// Linux raw `wait4`/`getrusage` rusage image for musl LP64:
 /// two `timeval`s plus fourteen `long` counters. musl passes the
 /// syscall a pointer adjusted to this 144-byte prefix and keeps the
 /// public `struct rusage` reserved tail in libc-owned memory.
 const RUSAGE_BYTES: usize = 144;
+const SCHED_OTHER: i32 = 0;
+const PRIO_PROCESS: i32 = 0;
+const NICE_MIN: i32 = -20;
+const NICE_MAX: i32 = 19;
+const NICE_ZERO_RAW: i64 = 20;
+const IOPRIO_WHO_PROCESS: i32 = 1;
+const IOPRIO_CLASS_NONE: i32 = 0;
+const IOPRIO_CLASS_BE: i32 = 2;
+const IOPRIO_CLASS_SHIFT: u32 = 13;
+const IOPRIO_DEFAULT_BE: i32 = IOPRIO_CLASS_BE << IOPRIO_CLASS_SHIFT;
+const RUSAGE_CHILDREN: i32 = -1;
+const RUSAGE_SELF: i32 = 0;
+const RUSAGE_THREAD: i32 = 1;
+const LINUX_DEFAULT_PERSONALITY: u32 = 0;
+const PERSONALITY_QUERY: u32 = u32::MAX;
+
+fn emit_clone_marker(name: &[u8]) {
+    if !cfg!(tx_thread_lifecycle_metrics) {
+        return;
+    }
+    if let Some(observer) = tx_observe::current() {
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            NR_CLONE as i64,
+        );
+        tx_observe::dump_registered_if_requested();
+    }
+}
 
 /// `exit(status)` — per-thread exit per `PROCESS_v1` §7.3.1.
 ///
@@ -68,6 +96,43 @@ pub(super) fn sys_exit_group<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
 /// construction).
 pub(super) fn sys_getpid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
     SyscallResult::Return(ctx.process.pid.0 as i64)
+}
+
+/// `getcpu(cpup, nodep, unused)`. Linux RV64 generic ABI `__NR_getcpu = 168`.
+///
+/// v1 has a fixed single-node test/kernel shape. Write CPU 0 and
+/// NUMA node 0 when requested; the cache pointer is obsolete on Linux
+/// and ignored.
+pub(super) fn sys_getcpu<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let cpu_uaddr = args[0];
+    let node_uaddr = args[1];
+    if cpu_uaddr != 0 {
+        if let Err(errno) = bootstrap_write_user::<u32>(&ctx.aspace, cpu_uaddr, 0) {
+            return SyscallResult::error_from(errno);
+        }
+    }
+    if node_uaddr != 0 {
+        if let Err(errno) = bootstrap_write_user::<u32>(&ctx.aspace, node_uaddr, 0) {
+            return SyscallResult::error_from(errno);
+        }
+    }
+    SyscallResult::Return(0)
+}
+
+/// `personality(persona)`. Linux RV64 generic ABI `__NR_personality = 92`.
+///
+/// txKernel has no personality-dependent execution policy. Support
+/// Linux's query sentinel and a no-op set of the default personality;
+/// reject all other changes so tests see the unsupported policy
+/// boundary explicitly.
+pub(super) fn sys_personality(args: [u64; 6]) -> SyscallResult {
+    let persona = args[0] as u32;
+    match persona {
+        PERSONALITY_QUERY | LINUX_DEFAULT_PERSONALITY => {
+            SyscallResult::Return(LINUX_DEFAULT_PERSONALITY as i64)
+        }
+        _ => SyscallResult::Error(EINVAL_VALUE),
+    }
 }
 
 /// `execve(path, argv, envp)` — Wave 4 / Phase 6 of the ELF-loader
@@ -245,12 +310,17 @@ pub(super) fn execve_errno_magnitude(e: ExecError) -> i32 {
 /// Wave 1's surface (`fork_aspace`'s `WouldBlock` cannot fire under
 /// v1's single-thread-per-process model). The function is non-`async`
 /// to keep the seam minimal.
-pub(super) async fn sys_clone<'a, P: PmapIf>(
+pub(super) fn sys_clone_oneshot<P: PmapIf>(
     args: [u64; 6],
-    ctx: &SyscallCtx<'a>,
-) -> SyscallResult {
+    ctx: &SyscallCtx<'_>,
+) -> Option<SyscallResult> {
+    emit_clone_marker(b"debug.clone.enter");
     let flags = args[0];
     let stack = args[1];
+
+    if (flags & CLONE_VFORK) != 0 && (flags & CLONE_THREAD) == 0 {
+        return None;
+    }
 
     // Validation: the lower byte specifies the exit signal.
     // CLONE_THREAD threads don't generate an exit signal (the
@@ -260,11 +330,10 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
     // sets the lower byte to zero when CLONE_THREAD is set).
     let clone_thread = (flags & CLONE_THREAD) != 0;
     if !clone_thread && flags & SIGCHLD == 0 {
-        return SyscallResult::Error(EINVAL_VALUE);
+        return Some(SyscallResult::Error(EINVAL_VALUE));
     }
     let clone_vm = (flags & CLONE_VM) != 0;
     let clone_sighand = (flags & CLONE_SIGHAND) != 0;
-    let clone_vfork = (flags & CLONE_VFORK) != 0;
     let clone_settls = (flags & CLONE_SETTLS) != 0;
     let clone_child_cleartid = (flags & CLONE_CHILD_CLEARTID) != 0;
     let clone_parent_settid = (flags & CLONE_PARENT_SETTID) != 0;
@@ -273,10 +342,10 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
     let allowed_mask = if clone_thread {
         // CLONE_THREAD requires CLONE_SIGHAND per Linux semantics.
         if flags & CLONE_SIGHAND == 0 {
-            return SyscallResult::Error(EINVAL_VALUE);
+            return Some(SyscallResult::Error(EINVAL_VALUE));
         }
         if clone_newipc {
-            return SyscallResult::Error(EINVAL_VALUE);
+            return Some(SyscallResult::Error(EINVAL_VALUE));
         }
         SIGCHLD
             | CLONE_THREAD
@@ -302,7 +371,7 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
             | CLONE_NEWIPC
     };
     if flags & !allowed_mask != 0 {
-        return SyscallResult::Error(EINVAL_VALUE);
+        return Some(SyscallResult::Error(EINVAL_VALUE));
     }
     // `stack` (newsp) — Linux semantic: zero means the child shares the
     // parent's sp (bare fork). Non-zero means the libc clone wrapper has
@@ -323,6 +392,7 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
         .expect(":clone:no-payload: kernel-invariant violation, calling thread had no payload")
         .saved_user_context()
         .expect(":clone:no-context: kernel-invariant violation, parent thread had no saved_user_context");
+    emit_clone_marker(b"debug.clone.parent_ctx.after");
 
     // Txv2's Linux syscall shim receives clone arguments in the
     // asm-generic order used by the current userspace test images:
@@ -339,16 +409,22 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
     // ProcessIdentity is created.
     if clone_thread {
         let ctid_ptr = if clone_child_cleartid { ctid_arg } else { 0 };
-        let child_thread = tx_subsystems::process::execution::step_clone_thread(
-            &ctx.process,
-            &parent_user_ctx,
-            stack as usize,
-            tls as usize,
+        let mut script_ctx = crate::KernelScriptCtx::new();
+        let mut op = tx_subsystems::process::CloneThreadOp {
+            process: &ctx.process,
+            parent_user_ctx: &parent_user_ctx,
+            stack: stack as usize,
+            tls: tls as usize,
             ctid_ptr,
-        );
+        };
+        let child_thread = match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+            Ok(result) => result,
+            Err(v3errno) => return Some(SyscallResult::error_from(Errno::from(v3errno))),
+        };
+        emit_clone_marker(b"debug.clone.step_thread.after");
         let child_thread = match child_thread {
             Ok(t) => t,
-            Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+            Err(_) => return Some(SyscallResult::Error(ENOMEM_VALUE)),
         };
 
         // CLONE_PARENT_SETTID: write child tid to *ptid in parent's
@@ -364,11 +440,19 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
                 );
             }
         }
+        emit_clone_marker(b"debug.clone.parent_settid.after");
 
         // Hand the child thread to the reactor.
-        reactor_submit::submit_child_thread(ctx.process.clone(), child_thread.clone());
+        emit_clone_marker(b"debug.clone.reactor_submit.before");
+        let child_submit =
+            reactor_submit::submit_child_thread(ctx.process.clone(), child_thread.clone());
+        emit_clone_marker(b"debug.clone.reactor_submit.after");
 
-        return SyscallResult::Return(child_thread.tid.0 as i64);
+        emit_clone_marker(b"debug.clone.return");
+        return Some(SyscallResult::CloneReturn {
+            value: child_thread.tid.0 as i64,
+            child_submit,
+        });
     }
 
     // ── Non-CLONE_THREAD (fork) path ────────────────────────────
@@ -395,7 +479,7 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
         };
         match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
             Ok(r) => r,
-            Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
+            Err(v3errno) => return Some(SyscallResult::error_from(Errno::from(v3errno))),
         }
     };
     // step_fork: mint a child ProcessIdentity + leader ThreadIdentity
@@ -406,22 +490,22 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
             // Impossible by construction — the calling process is the
             // parent and is alive (we're servicing its syscall). Map
             // to ESRCH defensively.
-            return SyscallResult::Error(ESRCH_VALUE);
+            return Some(SyscallResult::Error(ESRCH_VALUE));
         }
         Err(tx_subsystems::process::ForkError::Vm(_)) => {
             // VmMapError (e.g. a transient WouldBlock or OOM during
             // fork_aspace). Map to EAGAIN — Linux's canonical
             // transient-fork-failure errno.
-            return SyscallResult::Error(EAGAIN_VALUE);
+            return Some(SyscallResult::Error(EAGAIN_VALUE));
         }
         Err(tx_subsystems::process::ForkError::Zone(_)) => {
-            return SyscallResult::Error(ENOMEM_VALUE);
+            return Some(SyscallResult::Error(ENOMEM_VALUE));
         }
         Err(tx_subsystems::process::ForkError::Busy) => {
-            return SyscallResult::Error(EAGAIN_VALUE);
+            return Some(SyscallResult::Error(EAGAIN_VALUE));
         }
         Err(tx_subsystems::process::ForkError::PidNamespace) => {
-            return SyscallResult::Error(ENOMEM_VALUE);
+            return Some(SyscallResult::Error(ENOMEM_VALUE));
         }
     };
 
@@ -444,11 +528,116 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
     // Hand the child's leader thread to the reactor. Panics with
     // `:clone:no-reactor-seam` if the boot path didn't install the
     // seam — that's a boot-time invariant violation.
-    reactor_submit::submit_child_thread(child.clone(), child_thread.clone());
+    let child_submit = reactor_submit::submit_child_thread(child.clone(), child_thread.clone());
 
-    // vfork: parent blocks until the child execs or exits.  The
-    // child's exec and exit paths both call notify_vfork_done(),
-    // which fires the waker we store here.
+    Some(SyscallResult::CloneReturn {
+        value: child.pid.0 as i64,
+        child_submit,
+    })
+}
+
+pub(super) async fn sys_clone<'a, P: PmapIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
+    if let Some(result) = sys_clone_oneshot::<P>(args, ctx) {
+        return result;
+    }
+
+    emit_clone_marker(b"debug.clone.enter");
+    let flags = args[0];
+    let stack = args[1];
+
+    // Validation: the lower byte specifies the exit signal.
+    // CLONE_THREAD threads don't generate an exit signal (the
+    // thread-group leader's exit signal governs process-wide
+    // SIGCHLD).  For fork-like clones we require SIGCHLD; for
+    // thread clones we accept any signal (including zero — musl
+    // sets the lower byte to zero when CLONE_THREAD is set).
+    let clone_thread = (flags & CLONE_THREAD) != 0;
+    if !clone_thread && flags & SIGCHLD == 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let clone_vm = (flags & CLONE_VM) != 0;
+    let clone_sighand = (flags & CLONE_SIGHAND) != 0;
+    let clone_vfork = (flags & CLONE_VFORK) != 0;
+    let clone_settls = (flags & CLONE_SETTLS) != 0;
+    let clone_newipc = (flags & CLONE_NEWIPC) != 0;
+
+    let allowed_mask = SIGCHLD
+        | CLONE_SETTLS
+        | CLONE_VM
+        | CLONE_VFORK
+        | CLONE_SIGHAND
+        | CLONE_FILES
+        | CLONE_FS
+        | CLONE_NEWIPC;
+    if flags & !allowed_mask != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    // Snapshot parent's saved trap context. Plan B discipline: the
+    // trap shell stored this at trap entry. `None` here means the
+    // shell never stored it — a kernel-invariant violation.
+    let parent_user_ctx = ctx
+        .thread
+        .payload_cap()
+        .expect(":clone:no-payload: kernel-invariant violation, calling thread had no payload")
+        .saved_user_context()
+        .expect(":clone:no-context: kernel-invariant violation, parent thread had no saved_user_context");
+    emit_clone_marker(b"debug.clone.parent_ctx.after");
+
+    // Txv2's Linux syscall shim receives clone arguments in the
+    // asm-generic order used by the current userspace test images:
+    //   clone(flags, stack, ptid, tls, ctid)
+    let tls = if clone_settls { args[3] } else { 0 };
+
+    // ── Non-CLONE_THREAD (fork) path with CLONE_VFORK ─────────────
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let fork_result = {
+        let mut op = tx_subsystems::process::execution::ForkOp::<P> {
+            parent: &ctx.process,
+            clone_vm,
+            clone_sighand,
+            clone_newipc,
+            _pmap: core::marker::PhantomData,
+        };
+        match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+            Ok(r) => r,
+            Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
+        }
+    };
+    let child = match fork_result {
+        Ok(c) => c,
+        Err(tx_subsystems::process::ForkError::ParentZombie) => {
+            return SyscallResult::Error(ESRCH_VALUE);
+        }
+        Err(tx_subsystems::process::ForkError::Vm(_)) => {
+            return SyscallResult::Error(EAGAIN_VALUE);
+        }
+        Err(tx_subsystems::process::ForkError::Zone(_)) => {
+            return SyscallResult::Error(ENOMEM_VALUE);
+        }
+        Err(tx_subsystems::process::ForkError::Busy) => {
+            return SyscallResult::Error(EAGAIN_VALUE);
+        }
+        Err(tx_subsystems::process::ForkError::PidNamespace) => {
+            return SyscallResult::Error(ENOMEM_VALUE);
+        }
+    };
+
+    let child_thread = child
+        .nth_thread(0)
+        .expect(":clone:no-leader: kernel-invariant violation, fresh child has no leader thread");
+
+    seed_child_leader_context(
+        &child_thread,
+        &parent_user_ctx,
+        tls as usize,
+        stack as usize,
+    );
+    let child_submit = reactor_submit::submit_child_thread(child.clone(), child_thread.clone());
+
     if clone_vfork {
         use core::future::Future;
         use core::pin::Pin;
@@ -487,7 +676,10 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
     }
 
     // Parent observes the child's pid.
-    SyscallResult::Return(child.pid.0 as i64)
+    SyscallResult::CloneReturn {
+        value: child.pid.0 as i64,
+        child_submit,
+    }
 }
 
 /// `wait4(pid, status, options, rusage)` — Wave 3 of the fork/clone/wait4
@@ -619,13 +811,10 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                 // Fall through to the exit_source wait.
             }
             WaitOutcome::Yield {
-                shape: YieldShape::OnWaitSource { source, .. },
+                shape: YieldShape::OnWaitSource { source, interests },
                 ..
             } => {
-                let token = tx_subsystems::execution::WaitToken::new(source.raw(), 1);
-                if let Some(future) = wait_source::wait_on_token(token) {
-                    future.await;
-                }
+                await_wait_source(ctx, source, interests).await;
             }
             WaitOutcome::Err(e) => return SyscallResult::error_from(e.into()),
             _ => {}
@@ -894,22 +1083,177 @@ pub(super) fn sys_sched_getaffinity<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) ->
     }
 }
 
+pub(super) fn sys_getrusage<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let who = args[0] as i32;
+    let usage = args[1];
+    if !matches!(who, RUSAGE_SELF | RUSAGE_CHILDREN | RUSAGE_THREAD) {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if usage == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    let raw = [0u8; RUSAGE_BYTES];
+    match bootstrap_copy_to_user(&ctx.aspace, usage, &raw) {
+        Ok(()) => SyscallResult::Return(0),
+        Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+    }
+}
+
+fn validate_sched_pid(pid: u64, ctx: &SyscallCtx<'_>) -> Result<(), SyscallResult> {
+    if pid == 0 || pid == ctx.process.pid.0 as u64 || pid == ctx.thread.tid.0 as u64 {
+        Ok(())
+    } else {
+        Err(SyscallResult::Error(ESRCH_VALUE))
+    }
+}
+
+fn validate_sched_policy(policy: i32) -> bool {
+    policy == SCHED_OTHER
+}
+
+fn validate_self_process_target(
+    which: i32,
+    who: u64,
+    ctx: &SyscallCtx<'_>,
+) -> Result<(), SyscallResult> {
+    if which != PRIO_PROCESS {
+        return Err(SyscallResult::Error(EINVAL_VALUE));
+    }
+    if who == 0 || who == ctx.process.pid.0 as u64 {
+        Ok(())
+    } else {
+        Err(SyscallResult::Error(ESRCH_VALUE))
+    }
+}
+
+pub(super) fn sys_sched_getscheduler<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    if let Err(err) = validate_sched_pid(args[0], ctx) {
+        return err;
+    }
+    SyscallResult::Return(SCHED_OTHER as i64)
+}
+
+pub(super) fn sys_sched_setparam<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    if let Err(err) = validate_sched_pid(args[0], ctx) {
+        return err;
+    }
+    let param = args[1];
+    if param == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    let sched_priority = match bootstrap_read_user::<i32>(&ctx.aspace, param) {
+        Ok(priority) => priority,
+        Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+    };
+    if sched_priority != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    SyscallResult::Return(0)
+}
+
+pub(super) fn sys_sched_getparam<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    if let Err(err) = validate_sched_pid(args[0], ctx) {
+        return err;
+    }
+    let param = args[1];
+    if param == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    match bootstrap_copy_to_user(&ctx.aspace, param, &0i32.to_le_bytes()) {
+        Ok(()) => SyscallResult::Return(0),
+        Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+    }
+}
+
+pub(super) fn sys_sched_yield() -> SyscallResult {
+    SyscallResult::Return(0)
+}
+
+pub(super) fn sys_sched_get_priority_max(args: [u64; 6]) -> SyscallResult {
+    if validate_sched_policy(args[0] as i32) {
+        SyscallResult::Return(0)
+    } else {
+        SyscallResult::Error(EINVAL_VALUE)
+    }
+}
+
+pub(super) fn sys_sched_get_priority_min(args: [u64; 6]) -> SyscallResult {
+    if validate_sched_policy(args[0] as i32) {
+        SyscallResult::Return(0)
+    } else {
+        SyscallResult::Error(EINVAL_VALUE)
+    }
+}
+
+pub(super) fn sys_sched_rr_get_interval<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    if let Err(err) = validate_sched_pid(args[0], ctx) {
+        return err;
+    }
+    let interval = args[1];
+    if interval == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    let raw = [0u8; 16];
+    match bootstrap_copy_to_user(&ctx.aspace, interval, &raw) {
+        Ok(()) => SyscallResult::Return(0),
+        Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+    }
+}
+
+pub(super) fn sys_getpriority<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    if let Err(err) = validate_self_process_target(args[0] as i32, args[1], ctx) {
+        return err;
+    }
+    SyscallResult::Return(NICE_ZERO_RAW)
+}
+
+pub(super) fn sys_setpriority<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    if let Err(err) = validate_self_process_target(args[0] as i32, args[1], ctx) {
+        return err;
+    }
+    let nice = args[2] as i32;
+    if !(NICE_MIN..=NICE_MAX).contains(&nice) {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    SyscallResult::Return(0)
+}
+
+pub(super) fn sys_ioprio_get<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    if let Err(err) = validate_ioprio_target(args[0] as i32, args[1], ctx) {
+        return err;
+    }
+    SyscallResult::Return(IOPRIO_DEFAULT_BE as i64)
+}
+
+pub(super) fn sys_ioprio_set<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    if let Err(err) = validate_ioprio_target(args[0] as i32, args[1], ctx) {
+        return err;
+    }
+    let ioprio = args[2] as i32;
+    if ioprio == IOPRIO_CLASS_NONE || ioprio == IOPRIO_DEFAULT_BE {
+        SyscallResult::Return(0)
+    } else {
+        SyscallResult::Error(EINVAL_VALUE)
+    }
+}
+
+fn validate_ioprio_target(which: i32, who: u64, ctx: &SyscallCtx<'_>) -> Result<(), SyscallResult> {
+    if which != IOPRIO_WHO_PROCESS {
+        return Err(SyscallResult::Error(EINVAL_VALUE));
+    }
+    if who == 0 || who == ctx.process.pid.0 as u64 {
+        Ok(())
+    } else {
+        Err(SyscallResult::Error(ESRCH_VALUE))
+    }
+}
+
 // =====================================================================
 // Slice 7 of the shell-prompt roadmap — fcntl extension + day-1 misc
-// syscalls (`getpgrp` / `kill` / `tkill` / `tgkill` / `getrandom` /
-// `uname` / `prlimit64` / `rt_sigreturn`). Each is a small, isolated
+// syscalls (`kill` / `tkill` / `tgkill` / `getrandom` / `uname` /
+// `prlimit64` / `rt_sigreturn`). Each is a small, isolated
 // arm that unblocks a specific shell-startup path. F_DUPFD /
 // F_DUPFD_CLOEXEC / F_GETFL extensions to fcntl live inside `sys_fcntl`
 // itself (see above). See
 // `docs/progress/plans/2026-05-07-shell-prompt-roadmap.md` Slice 7.
 // =====================================================================
-
-/// `getpgrp()` — Linux RV64 generic ABI `__NR_getpgrp = 81`.
-///
-/// glibc-only legacy call: glibc emulates `getpgrp()` as `getpgid(0)`.
-/// musl uses `getpgid(0)` directly and never issues this number, but
-/// shipping a real implementation is cheap and removes a startup
-/// `-ENOSYS` from any glibc-built binary that lands later.
-pub(super) fn sys_getpgrp<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
-    SyscallResult::Return(ctx.process.pgrp_cap().pgid.0 as i64)
-}

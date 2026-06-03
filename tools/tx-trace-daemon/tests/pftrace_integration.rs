@@ -23,9 +23,9 @@ use std::mem::size_of;
 use prost::Message;
 use tempfile::NamedTempFile;
 use tx_observe_types::{
-    header::TX_TRACE_MAGIC, TxTraceHeader, TxTraceHartRing, TxTraceKind, TxTraceLevel,
-    TxTraceRecord,
-    payload::TxPayloadTag,
+    header::TX_TRACE_MAGIC,
+    payload::{TxPayloadTag, ALLOC_TRACK_PAGE_FRAME},
+    TxTraceHartRing, TxTraceHeader, TxTraceKind, TxTraceLevel, TxTraceRecord,
 };
 
 // Pull in the daemon's own modules for replay.
@@ -105,7 +105,11 @@ fn make_trace_file(records: &[Vec<u8>]) -> Vec<u8> {
     write_u64_le(&mut buf, 64, rings_off as u64);
 
     let ring_base = rings_off;
-    write_u64_le(&mut buf, ring_base + RING_PRODUCER_OFF, records.len() as u64);
+    write_u64_le(
+        &mut buf,
+        ring_base + RING_PRODUCER_OFF,
+        records.len() as u64,
+    );
 
     let slots_base = ring_base + ring_header_size;
     for (i, rec) in records.iter().enumerate() {
@@ -151,6 +155,8 @@ struct TrackEventMsg {
     r#type: Option<i32>,
     #[prost(uint64, optional, tag = "10")]
     name_iid: Option<u64>,
+    #[prost(uint64, optional, tag = "11")]
+    track_uuid: Option<u64>,
     #[prost(string, optional, tag = "23")]
     name: Option<String>,
     #[prost(string, repeated, tag = "22")]
@@ -222,12 +228,18 @@ fn run_and_decode(records: Vec<Vec<u8>>) -> Trace {
 fn pftrace_synthetic_roundtrip() {
     // ── Build synthetic record sequence ──────────────────────────────────────
     let track_desc = make_record_bytes(
-        RECORD_MAGIC, 0,
+        RECORD_MAGIC,
+        0,
         TxTraceKind::TrackDescriptor as u8,
         TxTraceLevel::Boundary as u8,
-        0, 1, 500,
-        0, 0, 0xAAAA,
-        TxPayloadTag::TrackDescriptor as u16, 16,
+        0,
+        1,
+        500,
+        0,
+        0,
+        0xAAAA,
+        TxPayloadTag::TrackDescriptor as u16,
+        16,
         {
             // PayloadTrackDescriptor: track_id (u64) + name (u32) + track_kind (u8) + _pad [u8; 3]
             // track_id = 0x1234, name = 0xAAAA, track_kind = 1 (Task)
@@ -240,75 +252,132 @@ fn pftrace_synthetic_roundtrip() {
     );
 
     let span_begin_1 = make_record_bytes(
-        RECORD_MAGIC, 0,
+        RECORD_MAGIC,
+        0,
         TxTraceKind::SpanBegin as u8,
         TxTraceLevel::Drive as u8,
-        0, 2, 1000,
-        0x0001, 0, 0xBBBB,
-        TxPayloadTag::None as u16, 0, [0u8; 16],
+        0,
+        2,
+        1000,
+        0x0001,
+        0,
+        0xBBBB,
+        TxPayloadTag::None as u16,
+        0,
+        [0u8; 16],
     );
     let span_end_1 = make_record_bytes(
-        RECORD_MAGIC, 0,
+        RECORD_MAGIC,
+        0,
         TxTraceKind::SpanEnd as u8,
         TxTraceLevel::Drive as u8,
-        0, 3, 2000,
-        0x0001, 0, 0xBBBB,
-        TxPayloadTag::None as u16, 0, [0u8; 16],
+        0,
+        3,
+        2000,
+        0x0001,
+        0,
+        0xBBBB,
+        TxPayloadTag::None as u16,
+        0,
+        [0u8; 16],
     );
 
     let span_begin_2 = make_record_bytes(
-        RECORD_MAGIC, 0,
+        RECORD_MAGIC,
+        0,
         TxTraceKind::SpanBegin as u8,
         TxTraceLevel::Step as u8,
-        0, 4, 3000,
-        0x0002, 0, 0xCCCC,
-        TxPayloadTag::None as u16, 0, [0u8; 16],
+        0,
+        4,
+        3000,
+        0x0002,
+        0,
+        0xCCCC,
+        TxPayloadTag::None as u16,
+        0,
+        [0u8; 16],
     );
     let span_end_2 = make_record_bytes(
-        RECORD_MAGIC, 0,
+        RECORD_MAGIC,
+        0,
         TxTraceKind::SpanEnd as u8,
         TxTraceLevel::Step as u8,
-        0, 5, 4000,
-        0x0002, 0, 0xCCCC,
-        TxPayloadTag::None as u16, 0, [0u8; 16],
+        0,
+        5,
+        4000,
+        0x0002,
+        0,
+        0xCCCC,
+        TxPayloadTag::None as u16,
+        0,
+        [0u8; 16],
     );
 
     // Orphan SpanEnd — span_id 0xDEAD was never opened.
     let orphan_end = make_record_bytes(
-        RECORD_MAGIC, 0,
+        RECORD_MAGIC,
+        0,
         TxTraceKind::SpanEnd as u8,
         TxTraceLevel::Drive as u8,
-        0, 6, 5000,
-        0xDEAD, 0, 0,
-        TxPayloadTag::None as u16, 0, [0u8; 16],
+        0,
+        6,
+        5000,
+        0xDEAD,
+        0,
+        0,
+        TxPayloadTag::None as u16,
+        0,
+        [0u8; 16],
     );
 
     let instant = make_record_bytes(
-        RECORD_MAGIC, 0,
+        RECORD_MAGIC,
+        0,
         TxTraceKind::Instant as u8,
         TxTraceLevel::Boundary as u8,
-        0, 7, 6000,
-        0, 0, 0xDDDD,
-        TxPayloadTag::None as u16, 0, [0u8; 16],
+        0,
+        7,
+        6000,
+        0,
+        0,
+        0xDDDD,
+        TxPayloadTag::None as u16,
+        0,
+        [0u8; 16],
     );
 
     // Stomped magic → txtrace.repair.bad_magic
     let stomped_magic = make_record_bytes(
-        0xDEAD, 0,
+        0xDEAD,
+        0,
         TxTraceKind::SpanBegin as u8,
-        0, 0, 8, 7000, 0, 0, 0,
-        TxPayloadTag::None as u16, 0, [0u8; 16],
+        0,
+        0,
+        8,
+        7000,
+        0,
+        0,
+        0,
+        TxPayloadTag::None as u16,
+        0,
+        [0u8; 16],
     );
 
     // Unknown payload tag → txtrace.repair.payload_tag_unknown
     // Use tag value 0xFF00 which is not in TxPayloadTag.
     let unknown_payload = make_record_bytes(
-        RECORD_MAGIC, 0,
+        RECORD_MAGIC,
+        0,
         TxTraceKind::Instant as u8,
         TxTraceLevel::Boundary as u8,
-        0, 9, 8000,
-        0, 0, 0,
-        0xFF00u16, 4, // unknown tag with valid len
+        0,
+        9,
+        8000,
+        0,
+        0,
+        0,
+        0xFF00u16,
+        4, // unknown tag with valid len
         [0u8; 16],
     );
 
@@ -332,26 +401,47 @@ fn pftrace_synthetic_roundtrip() {
     assert!(!trace.packet.is_empty(), "decoded Trace must have packets");
 
     // 2. There is at least one ClockSnapshot packet.
-    let clock_snapshots: Vec<_> = trace.packet.iter()
+    let clock_snapshots: Vec<_> = trace
+        .packet
+        .iter()
         .filter(|p| p.clock_snapshot.is_some())
         .collect();
     assert_eq!(clock_snapshots.len(), 1, "expected exactly 1 ClockSnapshot");
 
     // 3. There is at least one harts-process TrackDescriptor.
-    let track_descs: Vec<_> = trace.packet.iter()
+    let track_descs: Vec<_> = trace
+        .packet
+        .iter()
         .filter(|p| p.track_descriptor.is_some())
         .collect();
-    assert!(!track_descs.is_empty(), "expected at least one TrackDescriptor");
+    assert!(
+        !track_descs.is_empty(),
+        "expected at least one TrackDescriptor"
+    );
 
     // 4. Two TYPE_SLICE_BEGIN packets (one for each matched span).
-    let slice_begins: Vec<_> = trace.packet.iter()
-        .filter(|p| p.track_event.as_ref().map(|e| e.r#type == Some(1)).unwrap_or(false))
+    let slice_begins: Vec<_> = trace
+        .packet
+        .iter()
+        .filter(|p| {
+            p.track_event
+                .as_ref()
+                .map(|e| e.r#type == Some(1))
+                .unwrap_or(false)
+        })
         .collect();
     assert_eq!(slice_begins.len(), 2, "expected 2 TYPE_SLICE_BEGIN packets");
 
     // 5. Two TYPE_SLICE_END packets.
-    let slice_ends: Vec<_> = trace.packet.iter()
-        .filter(|p| p.track_event.as_ref().map(|e| e.r#type == Some(2)).unwrap_or(false))
+    let slice_ends: Vec<_> = trace
+        .packet
+        .iter()
+        .filter(|p| {
+            p.track_event
+                .as_ref()
+                .map(|e| e.r#type == Some(2))
+                .unwrap_or(false)
+        })
         .collect();
     assert_eq!(slice_ends.len(), 2, "expected 2 TYPE_SLICE_END packets");
 
@@ -368,26 +458,44 @@ fn pftrace_synthetic_roundtrip() {
     assert_eq!(end2_ts, Some(4000), "span 2 end_ts mismatch");
 
     // 8. Orphan end → txtrace.repair.orphan_end instant.
-    let orphan_instants: Vec<_> = trace.packet.iter()
+    let orphan_instants: Vec<_> = trace
+        .packet
+        .iter()
         .filter(|p| {
-            p.track_event.as_ref().map(|e| {
-                e.r#type == Some(3) // TYPE_INSTANT
+            p.track_event
+                .as_ref()
+                .map(|e| {
+                    e.r#type == Some(3) // TYPE_INSTANT
                     && e.categories.iter().any(|c| c == "txtrace.repair.orphan_end")
-            }).unwrap_or(false)
+                })
+                .unwrap_or(false)
         })
         .collect();
-    assert_eq!(orphan_instants.len(), 1, "expected 1 txtrace.repair.orphan_end instant");
+    assert_eq!(
+        orphan_instants.len(),
+        1,
+        "expected 1 txtrace.repair.orphan_end instant"
+    );
 
     // 9. Stomped magic → txtrace.repair.bad_magic instant.
-    let bad_magic_instants: Vec<_> = trace.packet.iter()
+    let bad_magic_instants: Vec<_> = trace
+        .packet
+        .iter()
         .filter(|p| {
-            p.track_event.as_ref().map(|e| {
-                e.r#type == Some(3)
-                    && e.categories.iter().any(|c| c == "txtrace.repair.bad_magic")
-            }).unwrap_or(false)
+            p.track_event
+                .as_ref()
+                .map(|e| {
+                    e.r#type == Some(3)
+                        && e.categories.iter().any(|c| c == "txtrace.repair.bad_magic")
+                })
+                .unwrap_or(false)
         })
         .collect();
-    assert_eq!(bad_magic_instants.len(), 1, "expected 1 txtrace.repair.bad_magic instant");
+    assert_eq!(
+        bad_magic_instants.len(),
+        1,
+        "expected 1 txtrace.repair.bad_magic instant"
+    );
 
     // 10. Unknown payload tag → txtrace.repair.payload_tag_unknown instant.
     // Per decode.rs: an unknown tag value (not in TxPayloadTag) returns Ok(None)
@@ -402,12 +510,22 @@ fn pftrace_synthetic_roundtrip() {
     //
     // Additionally assert total TYPE_INSTANT count includes the orphan_end + bad_magic
     // + instant record + at least the bad_magic repair.
-    let instants: Vec<_> = trace.packet.iter()
-        .filter(|p| p.track_event.as_ref().map(|e| e.r#type == Some(3)).unwrap_or(false))
+    let instants: Vec<_> = trace
+        .packet
+        .iter()
+        .filter(|p| {
+            p.track_event
+                .as_ref()
+                .map(|e| e.r#type == Some(3))
+                .unwrap_or(false)
+        })
         .collect();
     // At minimum: orphan_end, bad_magic, the actual Instant record = 3.
-    assert!(instants.len() >= 3,
-        "expected at least 3 TYPE_INSTANT packets, got {}", instants.len());
+    assert!(
+        instants.len() >= 3,
+        "expected at least 3 TYPE_INSTANT packets, got {}",
+        instants.len()
+    );
 }
 
 /// OBS-3b: verify that a synthetic WaitSourceNotify + Resume pair round-trips
@@ -426,16 +544,22 @@ fn pftrace_resume_flow_reconstruction() {
     let mut wsn_payload = [0u8; 16];
     wsn_payload[0..4].copy_from_slice(&0x0000_ABCDu32.to_le_bytes()); // source_id_low
     wsn_payload[4..8].copy_from_slice(&0x0000_0001u32.to_le_bytes()); // mask_bits
-    wsn_payload[8..12].copy_from_slice(&1u32.to_le_bytes());           // task_id_low = 1
-    wsn_payload[12..16].copy_from_slice(&42u32.to_le_bytes());         // wait_generation_low = 42
+    wsn_payload[8..12].copy_from_slice(&1u32.to_le_bytes()); // task_id_low = 1
+    wsn_payload[12..16].copy_from_slice(&42u32.to_le_bytes()); // wait_generation_low = 42
 
     let wait_source_notify = make_record_bytes(
-        RECORD_MAGIC, 0,
+        RECORD_MAGIC,
+        0,
         TxTraceKind::Instant as u8,
         TxTraceLevel::Yield as u8,
-        0, 1, 1000,
-        0, 0, 0x0001,
-        TxPayloadTag::WaitSourceNotify as u16, 16,
+        0,
+        1,
+        1000,
+        0,
+        0,
+        0x0001,
+        TxPayloadTag::WaitSourceNotify as u16,
+        16,
         wsn_payload,
     );
 
@@ -460,28 +584,87 @@ fn pftrace_resume_flow_reconstruction() {
     };
 
     let resume = make_record_bytes(
-        RECORD_MAGIC, 0,
+        RECORD_MAGIC,
+        0,
         TxTraceKind::Instant as u8,
         TxTraceLevel::Yield as u8,
-        0, 2, 2000,
-        0, 0, 0x0002,
-        TxPayloadTag::Resume as u16, 16,
+        0,
+        2,
+        2000,
+        0,
+        0,
+        0x0002,
+        TxPayloadTag::Resume as u16,
+        16,
         resume_payload_bytes,
     );
 
     let trace = run_and_decode(vec![wait_source_notify, resume]);
 
     // We should have at least a ClockSnapshot + TrackDescriptor + 2 Instant packets.
-    assert!(trace.packet.len() >= 4,
-        "expected at least 4 packets (clock, track, wsn, resume), got {}", trace.packet.len());
+    assert!(
+        trace.packet.len() >= 4,
+        "expected at least 4 packets (clock, track, wsn, resume), got {}",
+        trace.packet.len()
+    );
 
     // Count TYPE_INSTANT (3) packets. There should be at least 2 (WaitSourceNotify + Resume).
-    let instants: Vec<_> = trace.packet.iter()
-        .filter(|p| p.track_event.as_ref().map(|e| e.r#type == Some(3)).unwrap_or(false))
+    let instants: Vec<_> = trace
+        .packet
+        .iter()
+        .filter(|p| {
+            p.track_event
+                .as_ref()
+                .map(|e| e.r#type == Some(3))
+                .unwrap_or(false)
+        })
         .collect();
-    assert!(instants.len() >= 2,
+    assert!(
+        instants.len() >= 2,
         "expected at least 2 TYPE_INSTANT packets (WaitSourceNotify + Resume), got {}",
-        instants.len());
+        instants.len()
+    );
+}
+
+#[test]
+fn explicit_allocation_track_instants_route_to_ds_track() {
+    let mut payload = [0u8; 16];
+    payload[0..4].copy_from_slice(&0x1111_2222u32.to_le_bytes());
+    payload[4] = 1; // TxValueKind::U64
+    payload[8..16].copy_from_slice(&0x1234u64.to_le_bytes());
+
+    let alloc = make_record_bytes(
+        RECORD_MAGIC,
+        0,
+        TxTraceKind::Instant as u8,
+        TxTraceLevel::Mutation as u8,
+        0,
+        1,
+        1000,
+        0,
+        ALLOC_TRACK_PAGE_FRAME,
+        0xA110_C001,
+        TxPayloadTag::ArgValue as u16,
+        16,
+        payload,
+    );
+    let trace = run_and_decode(vec![alloc]);
+    let alloc_desc = trace
+        .packet
+        .iter()
+        .filter_map(|p| p.track_descriptor.as_ref())
+        .find(|d| d.name.as_deref() == Some("debug.alloc.page_frame"))
+        .expect("allocation track descriptor");
+    let alloc_uuid = alloc_desc.uuid.expect("allocation track uuid");
+
+    assert!(
+        trace.packet.iter().any(|p| {
+            p.track_event
+                .as_ref()
+                .is_some_and(|e| e.r#type == Some(3) && e.track_uuid == Some(alloc_uuid))
+        }),
+        "allocation instant should land on the page-frame DS track"
+    );
 }
 
 /// Verify that the output file is actually non-empty (sanity for --out pftrace).
@@ -489,17 +672,27 @@ fn pftrace_resume_flow_reconstruction() {
 fn pftrace_output_is_nonempty() {
     // Minimal trace: just a single SpanBegin with no matching end.
     let span_begin = make_record_bytes(
-        RECORD_MAGIC, 0,
+        RECORD_MAGIC,
+        0,
         TxTraceKind::SpanBegin as u8,
         TxTraceLevel::Drive as u8,
-        0, 1, 100,
-        0x1, 0, 1,
-        TxPayloadTag::None as u16, 0, [0u8; 16],
+        0,
+        1,
+        100,
+        0x1,
+        0,
+        1,
+        TxPayloadTag::None as u16,
+        0,
+        [0u8; 16],
     );
     let trace = run_and_decode(vec![span_begin]);
 
     // Should have at least a ClockSnapshot + TrackDescriptor + the begin packet
     // + the unbalanced_begin repair instant (flushed at finish()).
-    assert!(trace.packet.len() >= 3,
-        "expected at least 3 packets, got {}", trace.packet.len());
+    assert!(
+        trace.packet.len() >= 3,
+        "expected at least 3 packets, got {}",
+        trace.packet.len()
+    );
 }

@@ -1,7 +1,7 @@
 #![cfg_attr(test, allow(unused_imports))]
 use super::*;
-use crate::vm::adapter::wait_routing::Channel;
 use crate::vm::RANGE_LOCK_RELEASE_MASK;
+use crate::vm::adapter::wait_routing::Channel;
 use alloc::boxed::Box;
 use core::future::Future;
 use core::ptr::null;
@@ -265,6 +265,241 @@ fn brk_script_grows_anon_mapping_when_requested_above_current() {
 }
 
 #[test]
+fn brk_script_repeated_growth_extends_single_recipe() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let brk_base = crate::vm::UserVirtAddr(0xb000);
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut current = brk_base;
+
+    for page in 1..=8 {
+        let requested = crate::vm::UserVirtAddr(brk_base.0 + page * crate::vm::USER_PAGE_SIZE);
+        let mut future = Box::pin(aspace.brk_script(brk_base, current, requested));
+        match future.as_mut().poll(&mut cx) {
+            Poll::Ready(Ok(new_brk)) => assert_eq!(new_brk, requested),
+            other => panic!("brk grow page {page} expected Ready(Ok), got {other:?}"),
+        }
+        current = requested;
+    }
+
+    assert_eq!(
+        aspace.stats().recipe_count,
+        1,
+        "brk growth should extend the heap mapping instead of appending one recipe per page"
+    );
+    assert!(aspace.lookup(crate::vm::UserVirtAddr(0xb000)).is_some());
+    assert!(aspace.lookup(crate::vm::UserVirtAddr(0x12000)).is_some());
+}
+
+#[test]
+fn brk_script_unaligned_base_extends_committed_page_range() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let brk_base = crate::vm::UserVirtAddr(0xb123);
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut current = brk_base;
+
+    for page in 1..=4 {
+        let requested = crate::vm::UserVirtAddr(0xc000 + page * crate::vm::USER_PAGE_SIZE);
+        let mut future = Box::pin(aspace.brk_script(brk_base, current, requested));
+        match future.as_mut().poll(&mut cx) {
+            Poll::Ready(Ok(new_brk)) => assert_eq!(new_brk, requested),
+            other => panic!("unaligned brk grow page {page} expected Ready(Ok), got {other:?}"),
+        }
+        current = requested;
+    }
+
+    assert_eq!(aspace.stats().recipe_count, 1);
+    assert!(aspace.lookup(crate::vm::UserVirtAddr(0xb123)).is_none());
+    assert!(aspace.lookup(crate::vm::UserVirtAddr(0xc000)).is_some());
+    assert!(aspace.lookup(crate::vm::UserVirtAddr(0xf000)).is_some());
+}
+
+#[test]
+fn brk_script_many_unaligned_grows_remain_one_recipe() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let brk_base = crate::vm::UserVirtAddr(0x2c2d0);
+    let committed_base = crate::vm::UserVirtAddr(0x2d000);
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut current = brk_base;
+
+    for page in 1..=1024 {
+        let requested =
+            crate::vm::UserVirtAddr(committed_base.0 + page * crate::vm::USER_PAGE_SIZE);
+        let mut future = Box::pin(aspace.brk_script(brk_base, current, requested));
+        match future.as_mut().poll(&mut cx) {
+            Poll::Ready(Ok(new_brk)) => assert_eq!(new_brk, requested),
+            other => {
+                panic!("many unaligned brk grow page {page} expected Ready(Ok), got {other:?}")
+            }
+        }
+        current = requested;
+    }
+
+    assert_eq!(aspace.stats().recipe_count, 1);
+    assert!(aspace.lookup(committed_base).is_some());
+    assert!(
+        aspace
+            .lookup(crate::vm::UserVirtAddr(
+                committed_base.0 + 1023 * crate::vm::USER_PAGE_SIZE
+            ))
+            .is_some()
+    );
+}
+
+#[test]
+fn try_brk_many_unaligned_grows_map_requested_pages() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let brk_base = crate::vm::UserVirtAddr(0x2c2d0);
+    let committed_base = crate::vm::UserVirtAddr(0x2d000);
+    let mut current = brk_base;
+
+    for page in 1..=1024 {
+        let requested =
+            crate::vm::UserVirtAddr(committed_base.0 + page * crate::vm::USER_PAGE_SIZE);
+        let new_brk = aspace
+            .try_brk(brk_base, current, requested)
+            .expect("uncontended brk grow should complete synchronously");
+        assert_eq!(new_brk, requested);
+        current = requested;
+    }
+
+    assert_eq!(
+        aspace.stats().recipe_count,
+        1,
+        "synchronous brk growth should use the same coalesced recipe contract as brk_script"
+    );
+    assert!(aspace.lookup(committed_base).is_some());
+    assert!(
+        aspace
+            .lookup(crate::vm::UserVirtAddr(
+                committed_base.0 + 1023 * crate::vm::USER_PAGE_SIZE
+            ))
+            .is_some()
+    );
+}
+
+#[test]
+fn try_brk_growth_maps_only_requested_committed_range() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let brk_base = crate::vm::UserVirtAddr(0x2c2d0);
+    let committed_base = crate::vm::UserVirtAddr(0x2d000);
+    let requested = crate::vm::UserVirtAddr(committed_base.0 + crate::vm::USER_PAGE_SIZE);
+
+    let new_brk = aspace
+        .try_brk(brk_base, brk_base, requested)
+        .expect("uncontended brk grow should complete synchronously");
+
+    assert_eq!(new_brk, requested);
+    assert_eq!(aspace.stats().recipe_count, 1);
+    assert_eq!(
+        aspace.stats().vm_size,
+        crate::vm::USER_PAGE_SIZE,
+        "brk growth should not reserve hidden capacity beyond the published break"
+    );
+    assert!(aspace.lookup(committed_base).is_some());
+    assert!(
+        aspace
+            .lookup(crate::vm::UserVirtAddr(
+                committed_base.0 + crate::vm::USER_PAGE_SIZE
+            ))
+            .is_none()
+    );
+}
+
+#[test]
+fn brk_script_many_unaligned_grows_with_faults_do_not_block() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let brk_base = crate::vm::UserVirtAddr(0x2c2d0);
+    let committed_base = crate::vm::UserVirtAddr(0x2d000);
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut current = brk_base;
+
+    for page in 1..=512 {
+        let requested =
+            crate::vm::UserVirtAddr(committed_base.0 + page * crate::vm::USER_PAGE_SIZE);
+        let mut brk_future = Box::pin(aspace.brk_script(brk_base, current, requested));
+        match brk_future.as_mut().poll(&mut cx) {
+            Poll::Ready(Ok(new_brk)) => assert_eq!(new_brk, requested),
+            other => panic!("brk grow page {page} expected Ready(Ok), got {other:?}"),
+        }
+
+        let fault_addr = crate::vm::UserVirtAddr(requested.0 - crate::vm::USER_PAGE_SIZE);
+        let mut fault_future =
+            Box::pin(aspace.fault_script(VmFault::new(fault_addr, AccessMode::Write)));
+        match fault_future.as_mut().poll(&mut cx) {
+            Poll::Ready(Ok(_)) => {}
+            other => panic!("heap fault page {page} expected Ready(Ok), got {other:?}"),
+        }
+
+        current = requested;
+    }
+
+    assert_eq!(
+        aspace.stats().recipe_count,
+        1,
+        "fault-populated heap growth should keep Linux-like VMA coalescing; private page residency must be cheap to split independently"
+    );
+}
+
+#[test]
+fn brk_growth_after_private_fault_keeps_single_recipe_with_structural_private_split() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let brk_base = crate::vm::UserVirtAddr(0x40000);
+    let committed_base = crate::vm::UserVirtAddr(0x40000);
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    let first_top = crate::vm::UserVirtAddr(committed_base.0 + crate::vm::USER_PAGE_SIZE);
+    let mut first_grow = Box::pin(aspace.brk_script(brk_base, brk_base, first_top));
+    match first_grow.as_mut().poll(&mut cx) {
+        Poll::Ready(Ok(new_brk)) => assert_eq!(new_brk, first_top),
+        other => panic!("first brk grow expected Ready(Ok), got {other:?}"),
+    }
+    assert_eq!(aspace.stats().recipe_count, 1);
+
+    let mut first_fault =
+        Box::pin(aspace.fault_script(VmFault::new(committed_base, AccessMode::Write)));
+    match first_fault.as_mut().poll(&mut cx) {
+        Poll::Ready(Ok(_)) => {}
+        other => panic!("first private fault expected Ready(Ok), got {other:?}"),
+    }
+
+    let second_top = crate::vm::UserVirtAddr(committed_base.0 + 2 * crate::vm::USER_PAGE_SIZE);
+    let mut second_grow = Box::pin(aspace.brk_script(brk_base, first_top, second_top));
+    match second_grow.as_mut().poll(&mut cx) {
+        Poll::Ready(Ok(new_brk)) => assert_eq!(new_brk, second_top),
+        other => panic!("second brk grow expected Ready(Ok), got {other:?}"),
+    }
+    assert_eq!(
+        aspace.stats().recipe_count,
+        1,
+        "clean adjacent growth should still merge into a resident private recipe once private pages split structurally"
+    );
+
+    let third_top = crate::vm::UserVirtAddr(committed_base.0 + 3 * crate::vm::USER_PAGE_SIZE);
+    let mut third_grow = Box::pin(aspace.brk_script(brk_base, second_top, third_top));
+    match third_grow.as_mut().poll(&mut cx) {
+        Poll::Ready(Ok(new_brk)) => assert_eq!(new_brk, third_top),
+        other => panic!("third brk grow expected Ready(Ok), got {other:?}"),
+    }
+    assert_eq!(
+        aspace.stats().recipe_count,
+        1,
+        "clean tail growth still coalesces with the clean tail recipe"
+    );
+}
+
+#[test]
 fn brk_script_shrinks_anon_mapping_when_requested_below_current() {
     setup_host_substrate();
     let aspace = AddressSpace::new();
@@ -349,6 +584,64 @@ fn fault_script_succeeds_in_one_poll_when_uncontended() {
         Poll::Ready(Ok(_)) => {}
         Poll::Ready(Err(error)) => panic!("uncontended fault errored: {error:?}"),
         Poll::Pending => panic!("uncontended fault should not yield"),
+    }
+}
+
+#[test]
+fn fault_script_prefaults_adjacent_private_anon_write_pages() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let target = range(0x100000, 256);
+
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            target,
+            Prot::READ_WRITE,
+            VmEntryFlags::PRIVATE,
+            VmBacking::PrivateAnon,
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("baseline map");
+
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    let first_fault = VmFault::new(crate::vm::UserVirtAddr(0x100000), AccessMode::Write);
+    let mut first = Box::pin(aspace.fault_script(first_fault));
+    match first.as_mut().poll(&mut cx) {
+        Poll::Ready(Ok(_)) => {}
+        Poll::Ready(Err(error)) => panic!("first fault errored: {error:?}"),
+        Poll::Pending => panic!("uncontended fault should not yield"),
+    }
+
+    let second_fault = VmFault::new(crate::vm::UserVirtAddr(0x101000), AccessMode::Write);
+    let mut second = Box::pin(aspace.fault_script(second_fault));
+    match second.as_mut().poll(&mut cx) {
+        Poll::Ready(Ok(_)) => {}
+        Poll::Ready(Err(error)) => panic!("second fault errored: {error:?}"),
+        Poll::Pending => panic!("uncontended fault should not yield"),
+    }
+
+    assert!(
+        aspace
+            .pmap()
+            .lookup(crate::vm::UserVirtAddr(0x100000).containing_page())
+            .is_some(),
+        "the first sequential fault records the stream without batching"
+    );
+    for page in UserRange::new_aligned(
+        crate::vm::UserVirtAddr(0x101000),
+        15 * crate::vm::USER_PAGE_SIZE,
+    )
+    .expect("tail range")
+    .iter_pages()
+    {
+        assert_eq!(
+            aspace.pmap().lookup(page).expect("prefaulted page").prot,
+            Prot::READ_WRITE
+        );
     }
 }
 
@@ -443,6 +736,36 @@ fn fork_aspace_clones_parent_recipes_into_fresh_child() {
 }
 
 #[test]
+fn fork_aspace_shares_recipe_root_for_unchanged_entries() {
+    setup_host_substrate();
+    let parent = AddressSpace::new();
+
+    for i in 0..2048 {
+        map_reserved(parent.reserve_map(
+            VmEntry::new(
+                range(0x1000 + i * 0x4000, 1),
+                Prot::NONE,
+                VmEntryFlags::PRIVATE,
+                VmBacking::PrivateAnon,
+            ),
+            MapPlacement::RequireFree,
+        ))
+        .commit()
+        .expect("map prot-none private entry");
+    }
+
+    let child =
+        crate::vm::AddressSpace::fork_aspace::<crate::vm::pmap::TestPmap>(&parent).expect("fork");
+
+    assert_eq!(child.stats().recipe_count, 2048);
+    assert_eq!(
+        child.recipes.debug_last_publish_touched_entries(),
+        0,
+        "fork should clone the immutable recipe root, not rebuild unchanged entries"
+    );
+}
+
+#[test]
 fn fork_aspace_demotes_parent_pmap_for_private_entries_only() {
     setup_host_substrate();
     let parent = AddressSpace::new();
@@ -485,14 +808,18 @@ fn fork_aspace_demotes_parent_pmap_for_private_entries_only() {
             .expect("publish");
     }
 
-    assert!(parent
-        .pmap()
-        .lookup(crate::vm::UserVirtAddr(0x24000).containing_page())
-        .is_some());
-    assert!(parent
-        .pmap()
-        .lookup(crate::vm::UserVirtAddr(0x26000).containing_page())
-        .is_some());
+    assert!(
+        parent
+            .pmap()
+            .lookup(crate::vm::UserVirtAddr(0x24000).containing_page())
+            .is_some()
+    );
+    assert!(
+        parent
+            .pmap()
+            .lookup(crate::vm::UserVirtAddr(0x26000).containing_page())
+            .is_some()
+    );
 
     let _child =
         crate::vm::AddressSpace::fork_aspace::<crate::vm::pmap::TestPmap>(&parent).expect("fork");
@@ -559,18 +886,22 @@ fn exec_aspace_tears_down_all_resident_ptes() {
     aspace
         .publish_fault_materialization(outcome, materialized)
         .expect("publish");
-    assert!(aspace
-        .pmap()
-        .lookup(crate::vm::UserVirtAddr(0x28000).containing_page())
-        .is_some());
+    assert!(
+        aspace
+            .pmap()
+            .lookup(crate::vm::UserVirtAddr(0x28000).containing_page())
+            .is_some()
+    );
 
     let torn = crate::vm::AddressSpace::exec_aspace(&aspace);
 
     assert_eq!(torn, 1);
-    assert!(aspace
-        .pmap()
-        .lookup(crate::vm::UserVirtAddr(0x28000).containing_page())
-        .is_none());
+    assert!(
+        aspace
+            .pmap()
+            .lookup(crate::vm::UserVirtAddr(0x28000).containing_page())
+            .is_none()
+    );
 }
 
 /// Hot-path verification for the D15 / PC CoW plan: parent writes a

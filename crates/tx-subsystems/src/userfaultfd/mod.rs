@@ -1,13 +1,13 @@
-//! Userfaultfd — fd-table scaffold (PR-10 phase 0).
+//! Userfaultfd — fd-table, registration, fault, and reply scaffold.
 //!
 //! Spec: `docs/Txv3/05_DELEGATE_v1.md` §8.1 (userfaultfd worked
 //! example), `docs/progress/decisions/2026-05-11-d7-pr-10-userfaultfd-plan.md`
 //! (phase plan).
 //!
-//! # Scope of this module (phase 0)
+//! # Scope of this module
 //!
-//! This module exists today **only to give a userfaultfd-kind fd a
-//! place to live in a process's fd table.** It establishes:
+//! This module gives a userfaultfd-kind fd a place to live in a
+//! process's fd table and carries the phase 2–5 machinery:
 //!
 //! 1. The zone-allocated `UserfaultFd` payload.
 //! 2. A stable `ufd_id` minted at construction — used in later phases
@@ -16,22 +16,16 @@
 //! 3. The `register_zones()` hook called from
 //!    [`crate::zones::register_all`].
 //!
-//! All real userfaultfd behaviour — `UFFDIO_API` handshake (P-10.2),
-//! `UFFDIO_REGISTER` per-VMA attachment (P-10.3), fault-path
-//! interception (P-10.4), `UFFDIO_COPY` / `UFFDIO_ZEROPAGE` /
-//! `UFFDIO_CONTINUE` reply ioctls (P-10.5), pending-fault queue
-//! (also P-10.5) — lands in later phases.
+//! `UFFDIO_API` handshake (P-10.2), `UFFDIO_REGISTER` per-VMA
+//! attachment (P-10.3), fault-path interception (P-10.4),
+//! `UFFDIO_COPY` / `UFFDIO_ZEROPAGE` / `UFFDIO_CONTINUE` reply ioctls
+//! (P-10.5), and the pending-fault read queue.
 //!
 //! # Drop semantics
 //!
-//! `UserfaultFd` carries no externally-registered state today, so
-//! the default drop is sufficient. When P-10.5 wires the pending-
-//! fault queue, the drop will also need to call
-//! `DelegateRegistry::mark_endpoint_died(self.ufd_id)` so any
-//! in-flight fault token transitions to `AgentDied` and parked
-//! faulting threads wake with the equivalent of SIGBUS (see D7 §3.3).
-//! That mark_endpoint_died call has no in-flight tokens to walk in
-//! phase 0 because nothing installs ufd-marked requests yet.
+//! Drop releases the ufd read wait-source registration. Endpoint-death
+//! fanout for parked faulting threads remains a follow-up for the
+//! production close-the-agent path.
 
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
@@ -39,20 +33,13 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub mod adapter;
+pub mod notification;
 
 use adapter::step_engine::{
-    sign, ByteProgress, Cap, DelegateRegistry, DelegateTokenId, InterestMask, SpinMutex,
-    StepOutcome, TaskMailbox, V3Errno, WaitSource, WaitSourceId, Zone, ZoneAllocated, ZoneError,
+    sign, ByteProgress, Cap, DelegateRegistry, DelegateTokenId, SpinMutex, StepOutcome,
+    TaskMailbox, V3Errno, WaitSource, Zone, ZoneAllocated, ZoneError,
 };
-use adapter::wait_routing::{Channel, Mask};
-
-use crate::wait_source;
-
-/// Interest-mask bit fired on the ufd's per-fd wait source when a new
-/// fault message lands in the pending queue. Mirrors pipe.rs's
-/// `PIPE_READABLE`: it pins the single read-readiness bit the
-/// `step_ufd_read` arm waits on.
-pub const UFD_READABLE: u64 = 0x1;
+use adapter::wait_routing::Channel;
 
 // === ufd_id minting ===================================================
 
@@ -251,9 +238,7 @@ impl UserfaultFd {
     /// observed at the syscall layer, but the raw value is stashed
     /// here so future bits do not break the substrate API.
     pub fn with_flags(open_flags: u32) -> Self {
-        let wait_channel = Channel::new();
-        let wait_source_id = wait_source::register_wait_channel(wait_channel.clone());
-        let wait_source = Arc::new(WaitSource::new(WaitSourceId::new(wait_source_id)));
+        let wait_point = notification::new_wait_point();
         Self {
             ufd_id: allocate_ufd_id(),
             open_flags,
@@ -261,9 +246,9 @@ impl UserfaultFd {
             registrations: SpinMutex::new(Vec::new()),
             delegate_registry: DelegateRegistry::new(),
             pending_faults: SpinMutex::new(VecDeque::new()),
-            wait_source,
-            wait_channel,
-            wait_source_id,
+            wait_source: wait_point.source,
+            wait_channel: wait_point.channel,
+            wait_source_id: wait_point.source_id,
         }
     }
 
@@ -383,13 +368,7 @@ impl UserfaultFd {
     /// after `install_request` returns the `DelegateTokenId`.
     pub fn push_fault_msg(&self, msg: UffdMsg) {
         self.pending_faults.lock().push_back(msg);
-        // Fire both wake paths (D2/D4 coexistence, mirroring pipe.rs):
-        // - legacy `Channel` waker for `wait_source::wait_on_token`
-        //   consumers,
-        // - new `WaitSource::notify` for v3 mailbox-based consumers.
-        self.wait_channel.fire(Mask::from_bits(UFD_READABLE));
-        self.wait_source
-            .notify_emit(InterestMask::new(UFD_READABLE));
+        notification::notify_readable(&self.wait_channel, &self.wait_source);
     }
 
     /// PR-10 phase 5: snapshot the pending-fault queue depth. Tests
@@ -481,7 +460,7 @@ pub fn step_ufd_read(
     // Park on the per-ufd wait source. The caller (sys_read in the
     // shim) drives `wait_source::wait_on_token` against the carrier
     // id; `push_fault_msg` fires the channel on the next install.
-    StepOutcome::yield_on_wait_source(ByteProgress::EMPTY, ufd.wait_source_id(), UFD_READABLE)
+    notification::wait_until_readable(ufd.wait_source_id())
 }
 
 /// Wire-format size of a serialized `struct uffd_msg` record per
@@ -522,7 +501,7 @@ impl Drop for UserfaultFd {
         // `Arc<WaitSource>` drops alongside the payload (no external
         // consumers may outlive it because they all upgrade through
         // the cap's `wait_source()` accessor).
-        wait_source::release_wait_channel(self.wait_source_id);
+        notification::release_wait_point(self.wait_source_id);
     }
 }
 

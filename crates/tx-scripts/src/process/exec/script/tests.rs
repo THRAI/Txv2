@@ -718,12 +718,12 @@ fn exec_script_resets_signal_dispositions_to_sig_dfl() {
     // existing step_sigaction step; verify it reads back as Handler
     // before the exec.
     use tx_subsystems::signal::step_sigaction;
-    let _ = step_sigaction(&process, Signum::SIGTERM, SigDisposition::Handler(0xdead));
+    let _ = step_sigaction(&process, Signum::SIGTERM, SigDisposition::handler(0xdead));
     assert_eq!(
         process
             .sig_disposition(Signum::SIGTERM)
             .expect("SIGTERM disposition pre-exec"),
-        SigDisposition::Handler(0xdead),
+        SigDisposition::handler(0xdead),
     );
 
     let cred = Credential::root();

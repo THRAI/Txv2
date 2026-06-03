@@ -3,9 +3,9 @@
 use super::*;
 
 use crate::linux_syscall::{
-    F_DUPFD, F_DUPFD_CLOEXEC, F_GETFL, F_SETFL, NR_FCNTL, NR_GETRANDOM, NR_KILL, NR_PRLIMIT64,
-    NR_RT_SIGRETURN, NR_TGKILL, NR_TKILL, NR_UNAME, O_RDWR, RLIMIT_AS, RLIMIT_NOFILE,
-    RLIM_INFINITY,
+    F_DUPFD, F_DUPFD_CLOEXEC, F_GETFL, F_SETFL, NR_FCNTL, NR_GETRANDOM, NR_KILL, NR_PIDFD_OPEN,
+    NR_PIDFD_SEND_SIGNAL, NR_PRLIMIT64, NR_RT_SIGRETURN, NR_TGKILL, NR_TKILL, NR_UNAME, O_RDWR,
+    RLIMIT_AS, RLIMIT_NOFILE, RLIM_INFINITY,
 };
 
 const E_BADF: i32 = 9;
@@ -26,6 +26,39 @@ fn uts_field(buf: &[u8; 6 * 65], index: usize) -> &[u8] {
 // -----------------------------------------------------------------
 // F_DUPFD / F_DUPFD_CLOEXEC / F_GETFL / F_SETFL.
 // -----------------------------------------------------------------
+
+/// `pidfd_open` is numbered and dispatch-routed, but the pidfd
+/// bus-adapter fd entity is still future work.
+#[test]
+fn dispatch_pidfd_open_returns_neg_enosys_until_pidfd_entity_lands() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let r = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_PIDFD_OPEN, [1, 0, 0, 0, 0, 0]),
+        &ctx,
+    ));
+    assert_eq!(r, SyscallResult::Error(E_NOSYS));
+}
+
+/// `pidfd_send_signal` is likewise intentionally routed to the
+/// explicit stub so syscall-status can distinguish it from an
+/// unclassified missing arm.
+#[test]
+fn dispatch_pidfd_send_signal_returns_neg_enosys_until_pidfd_entity_lands() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let r = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_PIDFD_SEND_SIGNAL, [3, 15, 0, 0, 0, 0]),
+        &ctx,
+    ));
+    assert_eq!(r, SyscallResult::Error(E_NOSYS));
+}
 
 /// `fcntl(fd, F_DUPFD, min)` returns the lowest unused fd ≥ min,
 /// referring to the same OpenFile and with the cloexec bit cleared.
@@ -120,14 +153,6 @@ fn dispatch_fcntl_f_getfl_returns_open_flag_bits() {
 // success path is exercised by `dispatch_fcntl_f_setfl_*` tests
 // elsewhere in this file when present, and at the
 // `OpenFile::set_runtime_nonblocking` unit-test level.
-
-// -----------------------------------------------------------------
-// getpgrp.
-// -----------------------------------------------------------------
-
-// Note: `dispatch_getpgrp_returns_caller_pgid` already lives at
-// line ~1910 in this file (replaced the previous -ENOSYS test —
-// Slice 7 made `getpgrp` a real arm).
 
 // -----------------------------------------------------------------
 // kill / tkill / tgkill.
@@ -381,6 +406,9 @@ impl PmapIf for LoongArchUnamePmap {
 
 impl EntropyIf for LoongArchUnamePmap {}
 impl tx_hal::AuxvIf for LoongArchUnamePmap {}
+impl tx_hal::ConsoleIf for LoongArchUnamePmap {
+    fn write_bytes(_bytes: &[u8]) {}
+}
 impl SmpIf for LoongArchUnamePmap {}
 impl tx_hal::TimeIf for LoongArchUnamePmap {
     fn read_ns() -> u64 {
@@ -512,10 +540,9 @@ fn dispatch_prlimit64_cross_pid_returns_neg_eperm() {
 }
 
 // -----------------------------------------------------------------
-// rt_sigreturn (carryover marker).
+// rt_sigreturn.
 // -----------------------------------------------------------------
 
-/// `rt_sigreturn` returns `-ENOSYS` for now. The
 /// `rt_sigreturn` with no parked signal frame returns `-EFAULT`.
 /// The kernel has no pre-handler context to restore — POSIX leaves
 /// this case undefined; we refuse rather than corrupt the live

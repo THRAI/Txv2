@@ -4,6 +4,8 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 pub mod adapter;
 pub mod aio;
 pub mod cred;
@@ -34,7 +36,14 @@ pub mod vdso;
 pub mod vfs;
 pub mod vm;
 pub mod wait_source;
+pub mod wall_clock;
 pub mod zones;
+
+static NEXT_NOTIFICATION_SOURCE_ID: AtomicU64 = AtomicU64::new(1 << 32);
+
+pub(crate) fn allocate_notification_source_id() -> u64 {
+    NEXT_NOTIFICATION_SOURCE_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 #[cfg(test)]
 pub(crate) mod test_support {

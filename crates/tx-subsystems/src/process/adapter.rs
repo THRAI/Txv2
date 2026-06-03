@@ -12,7 +12,7 @@
 //!   ProcessGroup / Session, EBR `Guard` / `guard()`, the
 //!   `RestrictionStackHandle` (`SubjectAuthority` plumbing), the
 //!   `AtomicSlot` primitive (used for slot-style payload binding),
-//!   and `SpinMutex`. Re-exports `zone::sign`.
+//!   and the subsystem/process lock facade. Re-exports `zone::sign`.
 //!
 //! * `wait_routing` — stacked substrate + reactor. The exit-source
 //!   path: each process exposes a `WaitSource` (substrate) that
@@ -30,6 +30,8 @@ use tx_platform_adapter::platform_adapter;
     reason = "expose substrate step engine (StepOp/StepOutcome, RestrictionStackHandle, SubjectIdentity), EBR guard, zone role types (Cap/PayloadCap/Weak/IdentRef/Entity), bus primitives (RawPort/RawQueue for signal_port/exit_source wires), and lock primitives (SpinMutex/AtomicSlot) used by process identity, payload, group, session, and the seven fork/exit/wait/chdir/getcwd/setpgid/setsid step ops"
 )]
 pub mod step_engine {
+    pub(crate) use crate::process::lock_metrics::{process_spin_mutex, ProcessSpinMutex};
+    pub(crate) use crate::sync::SpinMutex;
     pub use tx_substrate::bus::{RawPort, RawQueue};
     pub use tx_substrate::epoch::{guard, Guard};
     pub use tx_substrate::step::ProcessIdentity as PlaceholderProcessSubject;
@@ -43,7 +45,7 @@ pub mod step_engine {
         OperationalCapExt, OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy,
         RetainedEntityPolicy, Weak, Zone, ZoneAllocated, ZoneError, ZonePolicy,
     };
-    pub use tx_substrate::{AtomicSlot, SpinMutex};
+    pub use tx_substrate::AtomicSlot;
 }
 
 #[platform_adapter(

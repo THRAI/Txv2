@@ -25,6 +25,7 @@ use tx_platform_adapter::platform_adapter;
     reason = "expose substrate step engine (StepOp/StepOutcome and ten step_* file types), zone role types, EBR guard, and bus primitives (RawPort/RawQueue) used by TtyIdentity / TtyPayload across the tty subsystem"
 )]
 pub mod step_engine {
+    pub(crate) use crate::sync::SpinMutex;
     pub use tx_substrate::bus::{RawPort, RawQueue};
     pub use tx_substrate::epoch::{guard, Guard};
     pub use tx_substrate::step::ProcessIdentity as PlaceholderProcessSubject;
@@ -38,7 +39,7 @@ pub mod step_engine {
         OperationalCapExt, OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy,
         RetainedEntityPolicy, Weak, Zone, ZoneAllocated, ZoneError, ZonePolicy,
     };
-    pub use tx_substrate::{AtomicSlot, SpinMutex};
+    pub use tx_substrate::AtomicSlot;
 }
 
 #[platform_adapter(

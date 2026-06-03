@@ -58,6 +58,18 @@ pub(super) fn sys_getegid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
     SyscallResult::Return(ctx.cred().egid.raw() as i64)
 }
 
+/// `getgroups(gidsetsize, grouplist)`. Supplementary groups are not
+/// modelled in v1, so the caller has zero groups. Linux only needs to
+/// touch `grouplist` when entries are copied; with zero groups, even a
+/// positive `gidsetsize` performs no user write.
+pub(super) fn sys_getgroups(args: [u64; 6]) -> SyscallResult {
+    let gidsetsize = args[0] as i32;
+    if gidsetsize < 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    SyscallResult::Return(0)
+}
+
 /// `setuid(uid)`. Wraps `cred::step_setuid` (Wave 1).
 ///
 /// Privileged callers (`euid == 0` or `CAP_SETUID`) get all four of

@@ -44,9 +44,27 @@ pub enum StopReason {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WakeHint {
     Normal,
-    SignalDelivery,
+    WakeHandoff,
+    LifecycleWake,
     PriorityBoost,
+    SignalDelivery,
     None,
+}
+
+impl WakeHint {
+    pub const fn is_boosted(self) -> bool {
+        matches!(
+            self,
+            Self::LifecycleWake | Self::PriorityBoost | Self::SignalDelivery
+        )
+    }
+
+    pub const fn requests_userspace_preempt(self) -> bool {
+        matches!(
+            self,
+            Self::WakeHandoff | Self::LifecycleWake | Self::PriorityBoost | Self::SignalDelivery
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -144,6 +162,7 @@ impl InitialSchedMeta {
 pub struct SchedulerShared {
     pub(crate) meta: SpinLock<Vec<Option<TaskSchedMeta>>>,
     pub(crate) stats: SpinLock<SchedulerStats>,
+    pick_turn: AtomicU64,
 }
 
 impl SchedulerShared {
@@ -189,8 +208,17 @@ impl SchedulerShared {
             recently_stolen: false,
             must_migrate_on_stop: false,
             queued: false,
+            queued_turn: 0,
             owner: TaskRunOwner::Parked,
         });
+    }
+
+    fn current_turn(&self) -> u64 {
+        self.pick_turn.load(Ordering::Acquire)
+    }
+
+    fn advance_turn(&self) -> u64 {
+        self.pick_turn.fetch_add(1, Ordering::AcqRel) + 1
     }
 
     pub fn remove_meta(&self, task: TaskId) {
@@ -224,6 +252,7 @@ pub struct Phase1Scheduler {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Phase1QueueKind {
     Kernel,
+    Boosted,
     New,
     Preempted,
 }
@@ -244,6 +273,7 @@ pub enum TaskRunOwner {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Phase1QueueDepths {
     pub kernel: usize,
+    pub boosted: usize,
     pub new: usize,
     pub preempted: usize,
 }
@@ -260,6 +290,14 @@ pub struct LocalEnqueueRequest {
     pub hart: HartId,
     pub queue: Phase1QueueKind,
     pub front: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QueuedTaskReport {
+    pub task: TaskId,
+    pub hart: HartId,
+    pub queue: Phase1QueueKind,
+    pub queued_turn: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -298,6 +336,7 @@ pub(crate) struct TaskSchedMeta {
     recently_stolen: bool,
     must_migrate_on_stop: bool,
     queued: bool,
+    queued_turn: u64,
     owner: TaskRunOwner,
 }
 
@@ -314,6 +353,7 @@ impl TaskSchedMeta {
 #[derive(Clone, Debug)]
 pub(crate) struct HartRunQueues {
     pub(crate) kernel_queue: VecDeque<TaskId>,
+    pub(crate) boosted_queue: VecDeque<TaskId>,
     pub(crate) new_queue: VecDeque<TaskId>,
     pub(crate) preempted_queue: VecDeque<TaskId>,
 }
@@ -322,6 +362,7 @@ impl HartRunQueues {
     pub fn new() -> Self {
         Self {
             kernel_queue: VecDeque::new(),
+            boosted_queue: VecDeque::new(),
             new_queue: VecDeque::new(),
             preempted_queue: VecDeque::new(),
         }
@@ -350,6 +391,7 @@ impl HartSchedulerLocal {
         let local = self.queues.lock();
         Phase1QueueDepths {
             kernel: local.kernel_queue.len(),
+            boosted: local.boosted_queue.len(),
             new: local.new_queue.len(),
             preempted: local.preempted_queue.len(),
         }
@@ -405,6 +447,7 @@ impl Phase1Scheduler {
     pub const PREEMPTED_QUEUE_SLICE_NS: u64 = 10_000_000;
     pub const BALANCE_PERIOD_NS: u64 = 4_000_000;
     pub const MIN_REBALANCE_IMBALANCE: usize = 2;
+    pub const AGING_PROMOTION_TURNS: u64 = 8;
     const STEAL_SCAN_LIMIT: usize = 8;
 
     pub fn new() -> Self {
@@ -412,6 +455,7 @@ impl Phase1Scheduler {
             shared: SchedulerShared {
                 meta: SpinLock::new(Vec::new()),
                 stats: SpinLock::new(SchedulerStats::default()),
+                pick_turn: AtomicU64::new(0),
             },
             compat_locals: Vec::new(),
         }
@@ -442,6 +486,7 @@ impl Phase1Scheduler {
             .map(HartSchedulerLocal::queue_depths)
             .unwrap_or(Phase1QueueDepths {
                 kernel: 0,
+                boosted: 0,
                 new: 0,
                 preempted: 0,
             })
@@ -462,33 +507,26 @@ impl Phase1Scheduler {
         handle: TaskHandle,
         initial_meta: InitialSchedMeta,
     ) {
+        let _ = self.task_submitted_report(task, handle, initial_meta);
+    }
+
+    pub fn task_submitted_report(
+        &mut self,
+        task: TaskId,
+        handle: TaskHandle,
+        initial_meta: InitialSchedMeta,
+    ) -> QueuedTaskReport {
         let max_hart = max_hart_in_affinity(initial_meta.affinity);
         self.ensure_compat_harts_through(max_hart);
-        self.shared.insert_meta(task, handle, initial_meta);
-        let hart = self
-            .shared
-            .meta_for(task)
-            .map(|meta| {
-                self.initial_hart_for_meta_with_depths(&meta, |hart| {
-                    self.compat_total_queue_depth(hart)
-                })
-            })
-            .unwrap_or_else(|| first_hart_in_mask(normalize_affinity(initial_meta.affinity)));
-        let queue = if initial_meta.kernel_only {
-            Phase1QueueKind::Kernel
-        } else if initial_meta.preempted_on_submit {
-            Phase1QueueKind::Preempted
-        } else {
-            Phase1QueueKind::New
-        };
-        self.shared.with_meta_mut(task, |meta| {
-            meta.queued = true;
-            meta.owner = TaskRunOwner::Queued { hart, queue };
-        });
-        self.ensure_compat_hart(hart);
-        if let Some(local) = self.compat_local(hart) {
-            Self::push_to_local_queue(local, task, queue, false);
+        let (request, report) =
+            self.task_submitted_report_for_locals(task, handle, initial_meta, |hart| {
+                self.compat_total_queue_depth(hart)
+            });
+        self.ensure_compat_hart(request.hart);
+        if let Some(local) = self.compat_local(request.hart) {
+            Self::push_to_local_queue(local, request.task, request.queue, request.front);
         }
+        report
     }
 
     pub fn task_stopped(
@@ -550,7 +588,7 @@ impl Phase1Scheduler {
         let depths: Vec<usize> = (0..local_count)
             .map(|victim| {
                 let depths = self.queue_depths(HartId(victim));
-                depths.new + depths.preempted
+                depths.boosted + depths.new + depths.preempted
             })
             .collect();
         let victim = self.rebalance_victim_from_locals(
@@ -594,7 +632,7 @@ impl Phase1Scheduler {
                 continue;
             }
             let depths = self.queue_depths(victim);
-            let depth = depths.new + depths.preempted;
+            let depth = depths.boosted + depths.new + depths.preempted;
             if depth > best_depth {
                 best = Some(victim);
                 best_depth = depth;
@@ -618,7 +656,7 @@ impl Phase1Scheduler {
         local.last_balance_ns.store(now_ns, Ordering::Release);
 
         let local_depths = self.queue_depths_from_local(local);
-        let local_depth = local_depths.new + local_depths.preempted;
+        let local_depth = local_depths.boosted + local_depths.new + local_depths.preempted;
         let mut best_victim = None;
         let mut best_depth = local_depth;
         for victim_index in 0..local_count {
@@ -739,6 +777,17 @@ impl Phase1Scheduler {
         initial_meta: InitialSchedMeta,
         total_queue_depth: impl FnMut(HartId) -> usize,
     ) -> LocalEnqueueRequest {
+        self.task_submitted_report_for_locals(task, handle, initial_meta, total_queue_depth)
+            .0
+    }
+
+    pub fn task_submitted_report_for_locals(
+        &self,
+        task: TaskId,
+        handle: TaskHandle,
+        initial_meta: InitialSchedMeta,
+        total_queue_depth: impl FnMut(HartId) -> usize,
+    ) -> (LocalEnqueueRequest, QueuedTaskReport) {
         self.shared.insert_meta(task, handle, initial_meta);
         let hart = self
             .shared
@@ -752,16 +801,27 @@ impl Phase1Scheduler {
         } else {
             Phase1QueueKind::New
         };
+        let queued_turn = self.shared.current_turn();
         self.shared.with_meta_mut(task, |meta| {
             meta.queued = true;
+            meta.queued_turn = queued_turn;
             meta.owner = TaskRunOwner::Queued { hart, queue };
         });
-        LocalEnqueueRequest {
-            task,
-            hart,
-            queue,
-            front: false,
-        }
+        emit_sched_debug(b"debug.sched.submit.queue", pack_task_queue(task, queue));
+        (
+            LocalEnqueueRequest {
+                task,
+                hart,
+                queue,
+                front: false,
+            },
+            QueuedTaskReport {
+                task,
+                hart,
+                queue,
+                queued_turn,
+            },
+        )
     }
 
     pub fn task_dropped(&self, task: TaskId) {
@@ -823,7 +883,7 @@ impl Phase1Scheduler {
 
     pub fn total_queue_depth_from_local(&self, local: &HartSchedulerLocal) -> usize {
         let depths = self.queue_depths_from_local(local);
-        depths.kernel + depths.new + depths.preempted
+        depths.kernel + depths.boosted + depths.new + depths.preempted
     }
 
     pub fn push_wake_inbox_to_local(local: &HartSchedulerLocal, task: TaskId) {
@@ -856,6 +916,14 @@ impl Phase1Scheduler {
         ) {
             return Some(result);
         }
+        if let Some(result) =
+            self.peek_preempted_like_queue(hart, Phase1QueueKind::Boosted, &local.boosted_queue)
+        {
+            return Some(result);
+        }
+        if let Some(result) = self.peek_aged_preempted_queue(hart, &local.preempted_queue) {
+            return Some(result);
+        }
         if let Some(result) = self.peek_queue(
             hart,
             Phase1QueueKind::New,
@@ -867,6 +935,33 @@ impl Phase1Scheduler {
             return Some(result);
         }
         self.peek_preempted_queue(hart, &local.preempted_queue)
+    }
+
+    fn peek_preempted_like_queue(
+        &self,
+        hart: HartId,
+        queue: Phase1QueueKind,
+        tasks: &VecDeque<TaskId>,
+    ) -> Option<(TaskHandle, SliceConfig)> {
+        tasks.iter().find_map(|task| {
+            let meta = self.shared.meta_for(*task)?;
+            meta.is_queued_on(hart, queue)
+                .then_some((meta.handle, self.preempted_slice_for_task(*task)))
+        })
+    }
+
+    fn peek_aged_preempted_queue(
+        &self,
+        hart: HartId,
+        tasks: &VecDeque<TaskId>,
+    ) -> Option<(TaskHandle, SliceConfig)> {
+        let current_turn = self.shared.current_turn();
+        tasks.iter().find_map(|task| {
+            let meta = self.shared.meta_for(*task)?;
+            (meta.is_queued_on(hart, Phase1QueueKind::Preempted)
+                && current_turn.saturating_sub(meta.queued_turn) >= Self::AGING_PROMOTION_TURNS)
+                .then_some((meta.handle, self.preempted_slice_for_task(*task)))
+        })
     }
 
     pub fn try_steal_from_locals(
@@ -883,12 +978,17 @@ impl Phase1Scheduler {
         let mut rejected = Vec::new();
         let mut stolen = None;
 
-        for queue in [Phase1QueueKind::Preempted, Phase1QueueKind::New] {
+        for queue in [
+            Phase1QueueKind::Boosted,
+            Phase1QueueKind::Preempted,
+            Phase1QueueKind::New,
+        ] {
             for _ in 0..Self::STEAL_SCAN_LIMIT {
                 let task = {
                     let mut queues = Self::lock_queues_from_local(victim_local);
                     match queue {
                         Phase1QueueKind::Kernel => None,
+                        Phase1QueueKind::Boosted => queues.boosted_queue.pop_back(),
                         Phase1QueueKind::New => queues.new_queue.pop_back(),
                         Phase1QueueKind::Preempted => queues.preempted_queue.pop_back(),
                     }
@@ -935,6 +1035,7 @@ impl Phase1Scheduler {
             for (task, queue) in rejected.into_iter().rev() {
                 match queue {
                     Phase1QueueKind::Kernel => {}
+                    Phase1QueueKind::Boosted => victim_local.boosted_queue.push_back(task),
                     Phase1QueueKind::New => victim_local.new_queue.push_back(task),
                     Phase1QueueKind::Preempted => victim_local.preempted_queue.push_back(task),
                 }
@@ -994,12 +1095,28 @@ impl Phase1Scheduler {
         }
     }
 
+    fn wake_target_hart_for_meta(
+        &self,
+        meta: &TaskSchedMeta,
+        hint: WakeHint,
+        current_hart: HartId,
+    ) -> HartId {
+        if hint == WakeHint::LifecycleWake
+            && meta.can_migrate
+            && hart_allowed(meta.affinity, current_hart)
+        {
+            current_hart
+        } else {
+            self.home_hart_for_meta(meta)
+        }
+    }
+
     fn initial_hart_for_meta_with_depths(
         &self,
         meta: &TaskSchedMeta,
         mut total_queue_depth: impl FnMut(HartId) -> usize,
     ) -> HartId {
-        if meta.kernel_only || !meta.can_migrate || !meta.spread_on_submit {
+        if meta.kernel_only || !meta.spread_on_submit {
             return first_hart_in_mask(meta.affinity);
         }
 
@@ -1082,6 +1199,7 @@ impl Phase1Scheduler {
         let mut local = Self::lock_queues_from_local(local);
         let target = match queue {
             Phase1QueueKind::Kernel => &mut local.kernel_queue,
+            Phase1QueueKind::Boosted => &mut local.boosted_queue,
             Phase1QueueKind::New => &mut local.new_queue,
             Phase1QueueKind::Preempted => &mut local.preempted_queue,
         };
@@ -1100,6 +1218,7 @@ impl Phase1Scheduler {
         let mut local = Self::lock_queues_from_local(local);
         let queue = match queue {
             Phase1QueueKind::Kernel => &mut local.kernel_queue,
+            Phase1QueueKind::Boosted => &mut local.boosted_queue,
             Phase1QueueKind::New => &mut local.new_queue,
             Phase1QueueKind::Preempted => &mut local.preempted_queue,
         };
@@ -1116,6 +1235,8 @@ impl Phase1Scheduler {
         local: &HartSchedulerLocal,
     ) -> Option<(TaskHandle, SliceConfig)> {
         self.pop_from_local_queue(hart, local, Phase1QueueKind::Kernel)
+            .or_else(|| self.pop_from_local_queue(hart, local, Phase1QueueKind::Boosted))
+            .or_else(|| self.pop_aged_preempted_from_local(hart, local))
             .or_else(|| self.pop_from_local_queue(hart, local, Phase1QueueKind::New))
             .or_else(|| self.pop_from_local_queue(hart, local, Phase1QueueKind::Preempted))
     }
@@ -1142,33 +1263,69 @@ impl Phase1Scheduler {
         let mut local = Self::lock_queues_from_local(local);
         let queue = match queue {
             Phase1QueueKind::Kernel => &mut local.kernel_queue,
+            Phase1QueueKind::Boosted => &mut local.boosted_queue,
             Phase1QueueKind::New => &mut local.new_queue,
             Phase1QueueKind::Preempted => &mut local.preempted_queue,
         };
         queue.pop_front()
     }
 
+    fn pop_aged_preempted_from_local(
+        &self,
+        hart: HartId,
+        local: &HartSchedulerLocal,
+    ) -> Option<(TaskHandle, SliceConfig)> {
+        loop {
+            let task = self.pop_aged_task_from_preempted_queue(hart, local)?;
+            let slice = self.slice_for_popped_task(task, Phase1QueueKind::Preempted);
+            if let Some(next) =
+                self.finish_popped_task(hart, Phase1QueueKind::Preempted, task, slice)
+            {
+                return Some(next);
+            }
+        }
+    }
+
+    fn pop_aged_task_from_preempted_queue(
+        &self,
+        hart: HartId,
+        local: &HartSchedulerLocal,
+    ) -> Option<TaskId> {
+        let current_turn = self.shared.current_turn();
+        let mut local = Self::lock_queues_from_local(local);
+        let index = local.preempted_queue.iter().position(|task| {
+            self.shared.meta_for(*task).is_some_and(|meta| {
+                meta.is_queued_on(hart, Phase1QueueKind::Preempted)
+                    && current_turn.saturating_sub(meta.queued_turn) >= Self::AGING_PROMOTION_TURNS
+            })
+        })?;
+        local.preempted_queue.remove(index)
+    }
+
     fn slice_for_popped_task(&self, task: TaskId, queue: Phase1QueueKind) -> SliceConfig {
         match queue {
             Phase1QueueKind::Kernel => SliceConfig::Cooperative,
+            Phase1QueueKind::Boosted => self.preempted_slice_for_task(task),
             Phase1QueueKind::New => SliceConfig::Preemptive {
                 slice_ns: Self::NEW_QUEUE_SLICE_NS,
             },
-            Phase1QueueKind::Preempted => {
-                let slice_ns = self
-                    .shared
-                    .meta_for(task)
-                    .map(|meta| {
-                        if meta.remaining_budget_ns > 0 {
-                            meta.remaining_budget_ns
-                        } else {
-                            Self::PREEMPTED_QUEUE_SLICE_NS
-                        }
-                    })
-                    .unwrap_or(Self::PREEMPTED_QUEUE_SLICE_NS);
-                SliceConfig::Preemptive { slice_ns }
-            }
+            Phase1QueueKind::Preempted => self.preempted_slice_for_task(task),
         }
+    }
+
+    fn preempted_slice_for_task(&self, task: TaskId) -> SliceConfig {
+        let slice_ns = self
+            .shared
+            .meta_for(task)
+            .map(|meta| {
+                if meta.remaining_budget_ns > 0 {
+                    meta.remaining_budget_ns
+                } else {
+                    Self::PREEMPTED_QUEUE_SLICE_NS
+                }
+            })
+            .unwrap_or(Self::PREEMPTED_QUEUE_SLICE_NS);
+        SliceConfig::Preemptive { slice_ns }
     }
 
     fn finish_popped_task(
@@ -1182,6 +1339,8 @@ impl Phase1Scheduler {
             if !meta.is_queued_on(hart, queue) {
                 return None;
             }
+            emit_sched_debug(b"debug.sched.pick.queue", pack_task_queue(task, queue));
+            self.shared.advance_turn();
             meta.queued = false;
             meta.owner = TaskRunOwner::Polling { hart };
             meta.current_slice_ns = match slice {
@@ -1198,19 +1357,24 @@ impl Phase1Scheduler {
     fn task_runnable_inner_for_locals(
         &self,
         task: TaskId,
-        _hint: WakeHint,
+        hint: WakeHint,
         current_hart: HartId,
     ) -> Option<(RunnablePlacement, LocalEnqueueRequest)> {
         let meta = self.shared.meta_for(task)?;
-        let hart = self.home_hart_for_meta(&meta);
+        let hart = self.wake_target_hart_for_meta(&meta, hint, current_hart);
         let was_queued = meta.is_queued();
         let (queue, front) = if meta.kernel_only {
             (Phase1QueueKind::Kernel, false)
         } else {
             match meta.class {
                 SchedClass::Fair => {
-                    if meta.remaining_budget_ns > 0 {
-                        (Phase1QueueKind::Preempted, true)
+                    if hint.is_boosted() {
+                        (Phase1QueueKind::Boosted, false)
+                    } else if meta.remaining_budget_ns > 0 {
+                        (
+                            Phase1QueueKind::Preempted,
+                            !meta.userspace_thread || hint == WakeHint::WakeHandoff,
+                        )
                     } else {
                         (Phase1QueueKind::New, false)
                     }
@@ -1231,10 +1395,21 @@ impl Phase1Scheduler {
             return None;
         }
 
+        let queued_turn = self.shared.current_turn();
         self.shared.with_meta_mut(task, |meta| {
             meta.queued = true;
+            meta.queued_turn = queued_turn;
             meta.owner = TaskRunOwner::Queued { hart, queue };
         });
+        emit_sched_debug(b"debug.sched.runnable.queue", pack_task_queue(task, queue));
+        emit_sched_debug(
+            b"debug.sched.runnable.front",
+            ((task.0 as i64) << 1) | i64::from(front),
+        );
+        emit_sched_debug(
+            b"debug.sched.runnable.hint",
+            ((task.0 as i64) << 8) | wake_hint_code(hint),
+        );
 
         Some((
             RunnablePlacement {
@@ -1259,6 +1434,7 @@ impl Phase1Scheduler {
     ) -> Option<(HartId, Option<(Phase1QueueKind, bool)>)> {
         let mut requeue = None;
         let mut target_hart = hart;
+        emit_sched_debug(b"debug.sched.stop.reason", pack_task_stop(task, reason));
         self.shared.with_meta_mut(task, |meta| {
             meta.queued = false;
             meta.total_runtime_ns = meta.total_runtime_ns.saturating_add(consumed_ns);
@@ -1287,12 +1463,13 @@ impl Phase1Scheduler {
                     });
                 }
                 StopReason::UserspaceTrap => {
-                    meta.owner = TaskRunOwner::Parked;
-                    requeue = Some(if meta.userspace_thread {
-                        (Phase1QueueKind::New, true)
+                    if meta.remaining_budget_ns > 0 {
+                        meta.owner = TaskRunOwner::Parked;
+                        requeue = Some((Phase1QueueKind::Preempted, !meta.userspace_thread));
                     } else {
-                        (Phase1QueueKind::Preempted, meta.remaining_budget_ns > 0)
-                    });
+                        meta.owner = TaskRunOwner::Parked;
+                        requeue = Some((Phase1QueueKind::Preempted, false));
+                    }
                 }
                 StopReason::PreemptedExternal => {
                     meta.owner = TaskRunOwner::Parked;
@@ -1308,8 +1485,10 @@ impl Phase1Scheduler {
         })?;
 
         if let Some((queue, _front)) = requeue {
+            let queued_turn = self.shared.current_turn();
             self.shared.with_meta_mut(task, |meta| {
                 meta.queued = true;
+                meta.queued_turn = queued_turn;
                 meta.owner = TaskRunOwner::Queued {
                     hart: target_hart,
                     queue,
@@ -1340,6 +1519,58 @@ fn max_hart_in_affinity(mask: u64) -> HartId {
 
 fn hart_allowed(mask: u64, hart: HartId) -> bool {
     hart.0 < u64::BITS as usize && (normalize_affinity(mask) & (1u64 << hart.0)) != 0
+}
+
+fn queue_code(queue: Phase1QueueKind) -> i64 {
+    match queue {
+        Phase1QueueKind::Kernel => 1,
+        Phase1QueueKind::Boosted => 2,
+        Phase1QueueKind::New => 3,
+        Phase1QueueKind::Preempted => 4,
+    }
+}
+
+fn stop_reason_code(reason: StopReason) -> i64 {
+    match reason {
+        StopReason::Blocked => 1,
+        StopReason::Completed => 2,
+        StopReason::Yielded => 3,
+        StopReason::SliceExpired => 4,
+        StopReason::UserspaceTrap => 5,
+        StopReason::PreemptedExternal => 6,
+    }
+}
+
+fn wake_hint_code(hint: WakeHint) -> i64 {
+    match hint {
+        WakeHint::Normal => 0,
+        WakeHint::WakeHandoff => 1,
+        WakeHint::LifecycleWake => 2,
+        WakeHint::PriorityBoost => 3,
+        WakeHint::SignalDelivery => 4,
+        WakeHint::None => 5,
+    }
+}
+
+fn pack_task_queue(task: TaskId, queue: Phase1QueueKind) -> i64 {
+    ((task.0 as i64) << 8) | queue_code(queue)
+}
+
+fn pack_task_stop(task: TaskId, reason: StopReason) -> i64 {
+    ((task.0 as i64) << 8) | stop_reason_code(reason)
+}
+
+fn emit_sched_debug(name: &[u8], value: i64) {
+    if !cfg!(tx_sched_metrics) {
+        return;
+    }
+    if let Some(observer) = tx_observe::current() {
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            value,
+        );
+        tx_observe::dump_registered_if_requested();
+    }
 }
 
 impl Default for Phase1Scheduler {

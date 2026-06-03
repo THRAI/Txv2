@@ -25,9 +25,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 pub mod adapter;
 
-use adapter::step_engine::{self as step_engine, Cap, NoProgress, SpinMutex, StepOutcome};
+use adapter::step_engine::{self as step_engine, Cap, NoProgress, StepOutcome};
 
-use tx_subsystems::cred::Capability;
 use tx_subsystems::execution::Guard;
 use tx_subsystems::mount::MountPayload;
 use tx_subsystems::page_backed::{
@@ -53,14 +52,13 @@ const TMPFS_FIRST_FREE_OBJECT_ID: u64 = 3;
 /// `PageContainer::new` requires a fixed `page_count` capacity at
 /// allocation time (see `PageContainer::check_bounds`); tmpfs files
 /// are created with this cap and `size_bytes` grows lazily through
-/// `step_write` / `step_truncate`. 4 MiB ÷ 4 KiB pages is enough for
-/// every Phase 3b workload (init's preopened fds plus the test fixtures);
-/// raising the cap is a backward-compatible follow-up once a sparse
-/// page-count growth shape lands.
+/// `step_write` / `step_truncate`. 8 MiB ÷ 4 KiB pages covers the
+/// musl libcbench `tmpfile()` stdio path, which writes 5,000,000
+/// bytes before reading the same file back.
 // TODO(phase-vfs-tmpfs-grow): teach `PageContainer` to grow `page_count`
 // on demand so tmpfs files are bounded only by global swap pressure
 // rather than by this static cap.
-const TMPFS_FILE_PAGE_CAP: u64 = 1024;
+const TMPFS_FILE_PAGE_CAP: u64 = 2048;
 
 /// Maximum length of an inline symlink target, in bytes.
 ///
@@ -125,14 +123,14 @@ impl TmpfsState {
 /// strong `Arc<dyn FsOps>` and `Arc<dyn FsPageBacking>` against the
 /// same `Tmpfs` so both trait objects observe the same state.
 pub struct Tmpfs {
-    state: SpinMutex<TmpfsState>,
+    state: crate::sync::TmpfsSpinMutex<TmpfsState>,
     next_object_id: AtomicU64,
 }
 
 impl Tmpfs {
     pub fn new() -> Self {
         Self {
-            state: SpinMutex::new(TmpfsState::new()),
+            state: crate::sync::tmpfs_spin_mutex(TmpfsState::new(), b"debug.lock.fs.tmpfs.state"),
             next_object_id: AtomicU64::new(TMPFS_FIRST_FREE_OBJECT_ID),
         }
     }
@@ -621,6 +619,8 @@ impl FsOps for Tmpfs {
         meta.uid = cred.uid;
         meta.gid = cred.gid;
         meta.size = link_target.len() as u64;
+        let mut target = Vec::with_capacity(link_target.len());
+        target.extend_from_slice(link_target);
 
         let mut state = self.state.lock();
         let Some(parent_inode) = state.inodes.get_mut(&parent) else {
@@ -634,8 +634,6 @@ impl FsOps for Tmpfs {
         }
         children.insert(inline, new_id);
 
-        let mut target = Vec::with_capacity(link_target.len());
-        target.extend_from_slice(link_target);
         state.inodes.insert(
             new_id,
             TmpfsInode {
@@ -711,14 +709,17 @@ impl FsOps for Tmpfs {
         fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<alloc::boxed::Box<[u8]>, NoProgress> {
-        let state = self.state.lock();
-        let Some(inode) = state.inodes.get(&fs_object_id) else {
-            return StepOutcome::err(step_engine::Errno::ENOENT);
+        let target = {
+            let state = self.state.lock();
+            let Some(inode) = state.inodes.get(&fs_object_id) else {
+                return StepOutcome::err(step_engine::Errno::ENOENT);
+            };
+            match &inode.payload {
+                TmpfsPayload::Symlink(bytes) => bytes.clone(),
+                _ => return StepOutcome::err(step_engine::Errno::EINVAL),
+            }
         };
-        match &inode.payload {
-            TmpfsPayload::Symlink(bytes) => StepOutcome::done(bytes.clone().into_boxed_slice()),
-            _ => StepOutcome::err(step_engine::Errno::EINVAL),
-        }
+        StepOutcome::done(target.into_boxed_slice())
     }
 
     /// Materialise a `Cap<RNode>` for a non-directory, non-symlink
@@ -827,8 +828,9 @@ impl FsOps for Tmpfs {
     /// source of truth in
     /// [`tx_subsystems::vfs::predicates::check_chown_perm`] (the
     /// same body the syscall-arm `cred::checks::authorize_chown`
-    /// consumes). Linux's silent-clear-`S_ISUID`/`S_ISGID` rule
-    /// applies for non-privileged callers (matches LTP `chown03`).
+    /// consumes). Linux's silent-clear rule always drops `S_ISUID`
+    /// and drops `S_ISGID` when the file has group-execute set
+    /// (matches LTP `chown02`/`chown03`).
     /// Per the DAC + setuid plan §"FsOps::step_chmod / step_chown".
     fn step_chown(
         &self,
@@ -847,18 +849,18 @@ impl FsOps for Tmpfs {
         {
             return StepOutcome::err(e.into());
         }
-        let privileged = cred.effective_caps.contains(Capability::FOWNER) || cred.uid == 0;
         if let Some(u) = new_uid {
             inode.meta.uid = u;
         }
         if let Some(g) = new_gid {
             inode.meta.gid = g;
         }
-        // Linux clears S_ISUID / S_ISGID on chown by non-privileged
-        // callers to prevent privilege-escalation via setuid binary
-        // ownership shifts. Slice mirrors LTP `chown03`'s rule.
-        if !privileged {
-            inode.meta.mode &= !(S_ISUID | S_ISGID);
+        // Linux clears setuid on chown. Setgid is cleared only for
+        // executable files; without group execute, S_ISGID has the
+        // mandatory-locking meaning and is preserved.
+        inode.meta.mode &= !S_ISUID;
+        if inode.meta.mode & 0o010 != 0 {
+            inode.meta.mode &= !S_ISGID;
         }
         StepOutcome::done(())
     }

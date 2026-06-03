@@ -15,12 +15,12 @@ use alloc::vec::Vec;
 
 use crate::execution::Guard;
 use crate::mount::{MountNamespace, MountPayload};
+use crate::vfs::FsOps;
 use crate::vfs::adapter::step_engine::{self, Cap, StepOutcome};
 use crate::vfs::structure::{
     Credential, DEntry, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking,
 };
 use crate::vfs::walker::{self, SYMLOOP_MAX};
-use crate::vfs::FsOps;
 
 use super::state::{
     FinalSymlinkPolicy, IORequest, KernelStep, PathResolution, ResumeToken, WalkCause, WalkMode,
@@ -153,9 +153,7 @@ pub fn kernel_step(
     // --- lookup / materialise, with parent-local dentry cache ---
     let parent_fs_object_id = current.rnode().fs_object_id();
     let (child_dentry, child_rnode_cap, child_fs_object_id, child_meta) = if let Some(cached) =
-        current
-            .cached_child(child_inline)
-            .filter(|dentry| dentry.rnode().meta().kind() == InodeKind::Directory)
+        current.cached_child(child_inline)
     {
         let rnode = cached.rnode().clone();
         let fs_object_id = rnode.fs_object_id();
@@ -186,7 +184,7 @@ pub fn kernel_step(
             StepOutcome::Err(e) => {
                 return KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::from(
                     e,
-                )))
+                )));
             }
             StepOutcome::Continue { .. } => {
                 // Re-enter lookup (v3 continue without yield).
@@ -223,7 +221,7 @@ pub fn kernel_step(
             StepOutcome::Err(e) => {
                 return KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::from(
                     e,
-                )))
+                )));
             }
             StepOutcome::Continue { .. } => {
                 return KernelStep::Continue(WalkState::Walking(WalkingState {
@@ -254,7 +252,7 @@ pub fn kernel_step(
             Err(KernelStep::NeedIO(req, token)) => return KernelStep::NeedIO(req, token),
             Err(KernelStep::Error(cause)) => return KernelStep::Error(cause),
             Err(_) => {
-                return KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::EIO))
+                return KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::EIO));
             }
         };
 
@@ -263,12 +261,12 @@ pub fn kernel_step(
         let child_dentry = match step_engine::sign(child_dentry_raw) {
             Ok(cap) => cap,
             Err(_) => {
-                return KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::ENOMEM))
+                return KernelStep::Error(WalkCause::FsOpsRejected(
+                    crate::execution::Errno::ENOMEM,
+                ));
             }
         };
-        if child_meta.kind() == InodeKind::Directory {
-            current.cache_child(child_dentry.clone());
-        }
+        current.cache_child(child_dentry.clone());
         (
             child_dentry,
             child_rnode_cap,

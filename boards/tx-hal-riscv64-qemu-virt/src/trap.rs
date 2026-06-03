@@ -15,6 +15,8 @@ use tx_hal::{
 core::arch::global_asm!(
     r#"
     .section .text.trap, "ax"
+    .option push
+    .option arch, +f, +d
     .align 2
     .equ TX_RV64_TF_X0, 0
     .equ TX_RV64_TF_X1, 8
@@ -151,11 +153,14 @@ tx_rv64_qemu_minimal_trap_vector:
     sd t0, TX_RV64_TF_STVAL(sp)
     csrr t0, sstatus
     sd t0, TX_RV64_TF_SSTATUS(sp)
-    # t0 = sstatus; save FP regs if FS != Off (bits 14:13 non-zero).
+    # t0 = sstatus; save FP regs only once user FP state is active
+    # (FS=Clean/Dirty). FS=Initial means the frame owns the zero state
+    # and no user FP instruction has dirtied it yet.
     # Using t0 is safe: it was already saved to TX_RV64_TF_X5(sp) above.
     srli t0, t0, 13
     andi t0, t0, 3
-    beqz t0, 1f
+    li t1, 2
+    bltu t0, t1, 1f
     fsd f0,  TX_RV64_TF_F0(sp)
     fsd f1,  TX_RV64_TF_F1(sp)
     fsd f2,  TX_RV64_TF_F2(sp)
@@ -231,9 +236,10 @@ tx_rv64_qemu_minimal_trap_vector:
     csrw sepc, t0
     ld t0, TX_RV64_TF_SSTATUS(sp)
     csrw sstatus, t0
-    # t0 = outgoing sstatus; restore FP regs if FS != Off.
-    # prepare_user_return always sets FS=Initial, so this block
-    # executes on every return to userspace that had FP active.
+    # t0 = outgoing sstatus; restore FP regs if FS != Off. Ordinary
+    # integer-only threads return with FS=Off and avoid this block;
+    # the lazy-FP illegal-instruction path uses FS=Initial once to
+    # publish the zero FP state before retrying the first FP insn.
     srli t0, t0, 13
     andi t0, t0, 3
     beqz t0, 2f
@@ -463,6 +469,7 @@ tx_rv64_resume_kernel_after_reschedule:
     ld s11, (TX_RV64_RCTX_S0 +  88)(a0)
     ret
     .size tx_rv64_resume_kernel_after_reschedule, . - tx_rv64_resume_kernel_after_reschedule
+    .option pop
 "#
 );
 
@@ -472,7 +479,9 @@ const RV64_SSTATUS_SPIE: usize = 1 << 5;
 /// Must be non-zero before sret so user-space FP/Zd instructions
 /// don't trap with Illegal Instruction (scause=2).
 const RV64_SSTATUS_FS_MASK: usize = 3 << 13;
+const RV64_SSTATUS_FS_OFF: usize = 0 << 13;
 const RV64_SSTATUS_FS_INITIAL: usize = 1 << 13;
+const RV64_SSTATUS_FS_DIRTY: usize = 3 << 13;
 const X_SP: usize = 2;
 const X_RA: usize = 1;
 const X_TP: usize = 4;
@@ -602,7 +611,7 @@ impl Rv64TrapFrame {
 
     fn capture_user_context(&self) -> UserTrapContext {
         let fs = (self.sstatus >> 13) & 3;
-        let fp = if fs != 0 {
+        let fp = if fs >= 2 {
             let mut flags = UserFpContext::FLAG_VALID;
             if fs == 3 {
                 flags |= UserFpContext::FLAG_DIRTY;
@@ -636,7 +645,7 @@ impl Rv64TrapFrame {
             self.f = [0u64; 32];
             self.fcsr = 0;
         }
-        self.prepare_user_return();
+        self.prepare_user_return_with_fp_state(context.fp.is_valid());
     }
 
     fn set_signal_handler_regs(&mut self, regs: SignalHandlerRegs) {
@@ -651,8 +660,23 @@ impl Rv64TrapFrame {
     }
 
     pub fn prepare_user_return(&mut self) {
+        self.prepare_user_return_with_fp_state(false);
+    }
+
+    fn prepare_user_return_with_fp_state(&mut self, fp_valid: bool) {
         self.sstatus &= !RV64_SSTATUS_SPP;
         self.sstatus |= RV64_SSTATUS_SPIE;
+        let fs = if fp_valid {
+            RV64_SSTATUS_FS_DIRTY
+        } else {
+            RV64_SSTATUS_FS_OFF
+        };
+        self.sstatus = (self.sstatus & !RV64_SSTATUS_FS_MASK) | fs;
+    }
+
+    fn enable_initial_user_fp_state(&mut self) {
+        self.f = [0u64; 32];
+        self.fcsr = 0;
         self.sstatus = (self.sstatus & !RV64_SSTATUS_FS_MASK) | RV64_SSTATUS_FS_INITIAL;
     }
 }
@@ -831,8 +855,19 @@ where
             let _irq_context = crate::enter_irq_context();
             K::on_ipi(<Platform as tx_hal::SmpIf>::current_cpu_id())
         }
-        TrapClass::IllegalInstruction
-        | TrapClass::Breakpoint
+        TrapClass::IllegalInstruction => {
+            if from_user && try_enable_lazy_user_fp(frame) {
+                return TrapAction::Resume;
+            }
+            let fault = FaultInfo {
+                address: VirtAddr(frame.sepc),
+                write: false,
+                instruction: true,
+                from_user,
+            };
+            K::on_illegal_or_sync_fault(frame.view_mut(), fault)
+        }
+        TrapClass::Breakpoint
         | TrapClass::AlignmentFault { .. }
         | TrapClass::UnknownSync
         | TrapClass::UnknownInterrupt => {
@@ -845,6 +880,14 @@ where
             K::on_illegal_or_sync_fault(frame.view_mut(), fault)
         }
     }
+}
+
+fn try_enable_lazy_user_fp(frame: &mut Rv64TrapFrame) -> bool {
+    if frame.sstatus & RV64_SSTATUS_FS_MASK != RV64_SSTATUS_FS_OFF {
+        return false;
+    }
+    frame.enable_initial_user_fp_state();
+    true
 }
 
 pub(crate) const fn classify_rv64_trap(scause: usize) -> TrapClass {
@@ -975,6 +1018,7 @@ fn apply_trap_action(frame: &Rv64TrapFrame, action: TrapAction) {
             if from_user {
                 let cpu = <Platform as SmpIf>::current_cpu_id();
                 let stack_top = trap_stack_top_for_cpu(cpu);
+                crate::clear_current_asid_residency();
                 unsafe {
                     core::arch::asm!("csrw sscratch, {top}", top = in(reg) stack_top);
                     let ctx = current_kernel_resume_ctx_ptr();

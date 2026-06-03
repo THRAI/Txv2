@@ -7,24 +7,80 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use tx_hal::{PmapIf, UserTrapContext};
 
-use crate::process::adapter::step_engine::{
-    self, Cap, IdentRef, NoProgress, OneShotStepOp, OperationalCapExt, PayloadCap, ScriptCtx,
-    SpinMutex, StepOp, StepOutcome, SubjectIdentity, Weak, YieldShape, ZoneError,
-};
-use crate::process::adapter::wait_routing::{self, Mask};
-
 use crate::cred::Cred;
+use crate::process::adapter::step_engine::{
+    self, process_spin_mutex, Cap, IdentRef, NoProgress, OneShotStepOp, OperationalCapExt,
+    PayloadCap, ProcessSpinMutex, ScriptCtx, SpinMutex, StepOp, StepOutcome, SubjectIdentity, Weak,
+    YieldShape, ZoneError,
+};
 use crate::process::structure::{
     ExitStatus, Frame, Pgid, Pid, ProcessGroup, ProcessIdentity, ProcessPayload, Session, Sid,
 };
 use crate::process::topology::{
     ProcessChildren, ProcessGroupMembers, ProcessThreads, SessionMembers,
 };
-use crate::signal::{PendingSignalQueue, SigActionTable};
+use crate::signal::{sync_thread_group_pending_summary, PendingSignalQueue, SigActionTable};
 use crate::thread_runtime::execution::set_thread_zombie;
 use crate::thread_runtime::structure::{allocate_tid, ThreadIdentity, ThreadPayload, Tid};
 use crate::vfs::OpenFile;
 use crate::vm::{AddressSpace, VmMapError};
+
+pub(crate) const PROCESS_LOCK_SERVICE_TRACE_NAMES: &[&[u8]] = &[
+    b"debug.lock_service.process.payload.exit_group.shm_detach.duration_ns",
+    b"debug.lock_service.process.payload.exit_group.drain_fds.duration_ns",
+    b"debug.lock_service.process.payload.exit_group.threads_drain.duration_ns",
+    b"debug.lock_service.process.payload.exit_group.zombify_threads.duration_ns",
+    b"debug.lock_service.process.payload.exit_group.drop_drained.duration_ns",
+    b"debug.lock_service.process.payload.exit_group.payload_drop.duration_ns",
+    b"debug.lock_service.process.payload.process_exit.shm_detach.duration_ns",
+    b"debug.lock_service.process.payload.process_exit.drain_fds.duration_ns",
+    b"debug.lock_service.process.payload.process_exit.drop_closed_fds.duration_ns",
+    b"debug.lock_service.process.payload.process_exit.payload_drop.duration_ns",
+    b"debug.lock_service.process.payload.thread_exit.threads_detach.duration_ns",
+    b"debug.lock_service.process.payload.thread_exit.thread_count.duration_ns",
+    b"debug.lock_service.process.payload.thread_exit.group_exit.duration_ns",
+    b"debug.lock_service.process.payload.robust.head_reads.duration_ns",
+    b"debug.lock_service.process.payload.robust.entries.duration_ns",
+    b"debug.lock_service.process.payload.robust.pending.duration_ns",
+    b"debug.lock_service.process.payload.robust.entry_count",
+];
+
+#[inline(always)]
+pub(crate) fn measure_process_lock_service<R>(name: &'static [u8], f: impl FnOnce() -> R) -> R {
+    let known_names = PROCESS_LOCK_SERVICE_TRACE_NAMES;
+    debug_assert!(known_names.contains(&name));
+    #[cfg(tx_lock_metrics_process)]
+    {
+        let start = tx_observe::clock_now_ns();
+        let result = f();
+        let duration = tx_observe::clock_now_ns().saturating_sub(start);
+        emit_process_lock_service_trace(name, duration.min(i64::MAX as u64) as i64);
+        result
+    }
+    #[cfg(not(tx_lock_metrics_process))]
+    {
+        f()
+    }
+}
+
+#[inline(always)]
+pub(crate) fn emit_process_lock_service_trace(name: &'static [u8], value: i64) {
+    let known_names = PROCESS_LOCK_SERVICE_TRACE_NAMES;
+    debug_assert!(known_names.contains(&name));
+    #[cfg(tx_lock_metrics_process)]
+    {
+        if let Some(observer) = tx_observe::current() {
+            observer.counter(
+                tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+                value,
+            );
+        }
+    }
+    #[cfg(not(tx_lock_metrics_process))]
+    {
+        let _ = value;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // PID namespacing — delegates to `crate::process::numbers`
@@ -32,7 +88,8 @@ use crate::vm::{AddressSpace, VmMapError};
 
 use crate::process::numbers::{
     allocate_pid, register_pgrp, register_pid as ns_register_pid, register_session, register_tid,
-    resolve_pid_number_as, unregister_pid_number, with_namespace, PidName, PidNameKind,
+    resolve_pid_number_as, unregister_pid_number, unregister_tid_number, with_namespace, PidName,
+    PidNameKind,
 };
 
 /// Register a process pid → Cap binding. The Cap must be fully
@@ -91,7 +148,8 @@ pub const BOOTSTRAP_BRK_BASE: u64 = 0x6000_0000;
 /// The `SpinMutex<Option<Cap>>` shape matches every other day-1 slot
 /// in the process subsystem; migration to a future
 /// `adapter::step_engine::AtomicSlot<T>` is a subsystem-internal change.
-static INIT_PROCESS: SpinMutex<Option<Cap<ProcessIdentity>>> = SpinMutex::new(None);
+static INIT_PROCESS: ProcessSpinMutex<Option<Cap<ProcessIdentity>>> =
+    process_spin_mutex(None, b"debug.lock.process.init_process");
 
 /// Snapshot the global init handle. Returns `None` before
 /// `bootstrap_init_process` has run (test pre-bootstrap; boot-time
@@ -654,21 +712,42 @@ pub fn step_clone_thread(
     // reserve: reserve namespace, memory, or wait-source effects.
     // commit: apply the state transition.
     // publish: emit readiness, signal, or observable outcome.
+    emit_clone_thread_marker(b"debug.clone_thread.enter", process.pid.0 as i64);
     let tid = allocate_tid();
+    emit_clone_thread_marker(b"debug.clone_thread.allocate_tid.after", tid.0 as i64);
     let child = sign_thread(process.downgrade(), tid)?;
+    emit_clone_thread_marker(b"debug.clone_thread.sign_thread.after", tid.0 as i64);
     register_tid(child.tid, child.clone());
+    emit_clone_thread_marker(b"debug.clone_thread.register_tid.after", tid.0 as i64);
     seed_child_leader_context(&child, parent_user_ctx, tls, stack);
+    emit_clone_thread_marker(b"debug.clone_thread.seed_context.after", tid.0 as i64);
     if ctid_ptr != 0 {
         let payload = child
             .payload_cap()
             .expect("step_clone_thread: fresh child missing payload");
         *payload.clear_child_tid.lock() = Some(ctid_ptr);
     }
+    emit_clone_thread_marker(b"debug.clone_thread.clear_ctid.after", tid.0 as i64);
     if let Some(proc_payload) = process.payload.lock().as_ref() {
         proc_payload.threads.attach(child.clone());
+        sync_thread_group_pending_summary(proc_payload, &child);
         proc_payload.thread_count.fetch_add(1, Ordering::AcqRel);
     }
+    emit_clone_thread_marker(b"debug.clone_thread.attach.after", tid.0 as i64);
     Ok(child)
+}
+
+fn emit_clone_thread_marker(name: &[u8], value: i64) {
+    if !cfg!(tx_thread_lifecycle_metrics) {
+        return;
+    }
+    if let Some(observer) = tx_observe::current() {
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            value,
+        );
+        tx_observe::dump_registered_if_requested();
+    }
 }
 
 /// Exit the entire thread group: zombify every thread, drop the
@@ -696,20 +775,41 @@ pub fn step_exit_group(process: &Cap<ProcessIdentity>, status: ExitStatus) {
 
     let mut payload_guard = process.payload.lock();
     if let Some(payload) = payload_guard.as_ref() {
-        let _shm_detach =
-            crate::ipc::sysv_shm::execution::detach_all_for_aspace(&payload.aspace_cap());
-        let _closed_fds = payload.drain_fds();
-        let drained: Vec<Cap<ThreadIdentity>> = payload.threads.drain();
-        for thread in &drained {
-            set_thread_zombie(thread, status.wait_status_word());
-            if thread.tid.0 != process.pid.0 {
-                unregister_pid_number(thread.tid.0 as u64);
-            }
-        }
-        // `_closed_fds` and `drained` drop here, releasing open-file and
-        // thread refs before the payload is detached below.
+        let _shm_detach = measure_process_lock_service(
+            b"debug.lock_service.process.payload.exit_group.shm_detach.duration_ns",
+            || crate::ipc::sysv_shm::execution::detach_all_for_aspace(&payload.aspace_cap()),
+        );
+        let closed_fds = measure_process_lock_service(
+            b"debug.lock_service.process.payload.exit_group.drain_fds.duration_ns",
+            || payload.drain_fds(),
+        );
+        let drained: Vec<Cap<ThreadIdentity>> = measure_process_lock_service(
+            b"debug.lock_service.process.payload.exit_group.threads_drain.duration_ns",
+            || payload.threads.drain(),
+        );
+        measure_process_lock_service(
+            b"debug.lock_service.process.payload.exit_group.zombify_threads.duration_ns",
+            || {
+                for thread in &drained {
+                    set_thread_zombie(thread, status.wait_status_word());
+                    if thread.tid.0 != process.pid.0 {
+                        unregister_tid_number(thread.tid.0 as u64);
+                    }
+                }
+            },
+        );
+        measure_process_lock_service(
+            b"debug.lock_service.process.payload.exit_group.drop_drained.duration_ns",
+            || {
+                drop(closed_fds);
+                drop(drained);
+            },
+        );
     }
-    *payload_guard = None;
+    measure_process_lock_service(
+        b"debug.lock_service.process.payload.exit_group.payload_drop.duration_ns",
+        || *payload_guard = None,
+    );
     drop(payload_guard);
     *process.exit_status.lock() = Some(status);
 
@@ -745,11 +845,23 @@ pub(crate) fn step_process_exit(process: &Cap<ProcessIdentity>, status: ExitStat
     crate::ipc::sysv_sem::execution::step_sem_undo(process);
     let mut payload_guard = process.payload.lock();
     if let Some(payload) = payload_guard.as_ref() {
-        let _shm_detach =
-            crate::ipc::sysv_shm::execution::detach_all_for_aspace(&payload.aspace_cap());
-        let _closed_fds = payload.drain_fds();
+        let _shm_detach = measure_process_lock_service(
+            b"debug.lock_service.process.payload.process_exit.shm_detach.duration_ns",
+            || crate::ipc::sysv_shm::execution::detach_all_for_aspace(&payload.aspace_cap()),
+        );
+        let closed_fds = measure_process_lock_service(
+            b"debug.lock_service.process.payload.process_exit.drain_fds.duration_ns",
+            || payload.drain_fds(),
+        );
+        measure_process_lock_service(
+            b"debug.lock_service.process.payload.process_exit.drop_closed_fds.duration_ns",
+            || drop(closed_fds),
+        );
     }
-    *payload_guard = None;
+    measure_process_lock_service(
+        b"debug.lock_service.process.payload.process_exit.payload_drop.duration_ns",
+        || *payload_guard = None,
+    );
     post_sigchld_to_parent(process);
 }
 
@@ -899,9 +1011,7 @@ fn post_sigchld_to_parent(process: &Cap<ProcessIdentity>) {
         let _ = crate::signal::step_kill_process(&parent, crate::signal::Signum::SIGCHLD, None);
         // Fire the parent's exit_source. A zombie parent has no payload
         // and `fire_exit_source` returns 0 — no panic, no double-fire.
-        let _ = parent.fire_exit_source(Mask::from_bits(
-            crate::process::structure::EXIT_SOURCE_CHILD_ZOMBIFIED,
-        ));
+        let _ = crate::process::notification::notify_child_zombified(&parent);
     }
 }
 
@@ -1159,7 +1269,7 @@ pub fn step_setsid(target: &Cap<ProcessIdentity>) -> Result<Sid, SetsidError> {
 fn sign_session(sid: Sid) -> Result<Cap<Session>, ZoneError> {
     step_engine::sign(Session {
         sid,
-        controlling_tty: SpinMutex::new(None),
+        controlling_tty: process_spin_mutex(None, b"debug.lock.process.session.controlling_tty"),
         members: SessionMembers::new(),
     })
 }
@@ -1179,11 +1289,11 @@ fn sign_process_identity(
 ) -> Result<Cap<ProcessIdentity>, ZoneError> {
     step_engine::sign(ProcessIdentity {
         pid,
-        parent: SpinMutex::new(parent),
+        parent: process_spin_mutex(parent, b"debug.lock.process.identity.parent"),
         children: ProcessChildren::new(),
-        pgrp: SpinMutex::new(pgrp),
-        exit_status: SpinMutex::new(None),
-        payload: SpinMutex::new(None),
+        pgrp: process_spin_mutex(pgrp, b"debug.lock.process.identity.pgrp"),
+        exit_status: process_spin_mutex(None, b"debug.lock.process.identity.exit_status"),
+        payload: process_spin_mutex(None, b"debug.lock.process.identity.payload"),
     })
 }
 
@@ -1204,7 +1314,6 @@ fn sign_process_payload(
 ) -> Result<PayloadCap<ProcessPayload>, ZoneError> {
     use crate::process::adapter::step_engine::AtomicSlot;
     use crate::process::adapter::step_engine::{RawPort, RawQueue};
-    use crate::process::adapter::wait_routing::Channel;
     let aspace_slot: AtomicSlot<Cap<AddressSpace>> = AtomicSlot::empty();
     aspace_slot.store(Some(aspace));
 
@@ -1237,13 +1346,11 @@ fn sign_process_payload(
     // Carrier-lifetime cleanup (release on payload drop) is tracked
     // as Cross-cutting Risk #1 in the slice plan and is deferred
     // beyond Wave 1.
-    let exit_source = Channel::new();
-    let exit_source_id = crate::wait_source::register_wait_channel(exit_source.clone());
+    let exit_wait_point = crate::process::notification::new_exit_wait_point();
     // PR-3D-3 (D2/D4 coexistence). Per-process `WaitSource` shares the
     // same `u64` namespace as the legacy `exit_source` channel so a
     // `WaitSourceId` stamped into `YieldShape::OnWaitSource` lands at
     // both ends (legacy resolver + new `Arc<WaitSource>` slot).
-    let exit_wait_source = wait_routing::new_wait_source(exit_source_id);
 
     let cap = step_engine::sign(ProcessPayload {
         frame: Frame {
@@ -1256,9 +1363,9 @@ fn sign_process_payload(
         signal_port: RawPort::new(),
         cred: cred_slot,
         nsproxy: nsproxy_slot,
-        cwd: SpinMutex::new(cwd),
-        fds: SpinMutex::new(fds),
-        fd_cloexec: SpinMutex::new(fd_cloexec),
+        cwd: process_spin_mutex(cwd, b"debug.lock.process.payload.cwd"),
+        fds: process_spin_mutex(fds, b"debug.lock.process.payload.fds"),
+        fd_cloexec: process_spin_mutex(fd_cloexec, b"debug.lock.process.payload.fd_cloexec"),
         rlimit_nofile_cur: AtomicU32::new(rlimit_nofile.0),
         rlimit_nofile_max: AtomicU32::new(rlimit_nofile.1),
         brk_base: core::sync::atomic::AtomicU64::new(brk_base),
@@ -1271,18 +1378,18 @@ fn sign_process_payload(
         // per-process, copied across fork). `step_exec` preserves
         // the umask (umask survives `exec` per POSIX).
         umask: core::sync::atomic::AtomicU16::new(umask & 0o777),
-        sem_undos: SpinMutex::new(BTreeMap::new()),
-        exit_source,
-        exit_source_id,
-        exit_wait_source,
+        sem_undos: process_spin_mutex(BTreeMap::new(), b"debug.lock.process.payload.sem_undos"),
+        exit_source: exit_wait_point.channel,
+        exit_source_id: exit_wait_point.source_id,
+        exit_wait_source: exit_wait_point.source,
         exit_source_bus: RawQueue::new(),
-        _cmdline: SpinMutex::new(None),
-        _exe_file: SpinMutex::new(None),
-        _comm: SpinMutex::new([0u8; 16]),
+        _cmdline: process_spin_mutex(None, b"debug.lock.process.payload.cmdline"),
+        _exe_file: process_spin_mutex(None, b"debug.lock.process.payload.exe_file"),
+        _comm: process_spin_mutex([0u8; 16], b"debug.lock.process.payload.comm"),
         thread_count: AtomicU32::new(1), // leader thread
-        group_exit: SpinMutex::new(None),
+        group_exit: process_spin_mutex(None, b"debug.lock.process.payload.group_exit"),
         vfork_done: AtomicBool::new(false),
-        vfork_waiter: SpinMutex::new(None),
+        vfork_waiter: process_spin_mutex(None, b"debug.lock.process.payload.vfork_waiter"),
     })?;
     Ok(PayloadCap::from_cap(cap))
 }
@@ -1291,14 +1398,20 @@ fn sign_thread(
     owner_proc: Weak<ProcessIdentity>,
     tid: Tid,
 ) -> Result<Cap<ThreadIdentity>, ZoneError> {
-    let payload_cap = step_engine::sign(ThreadPayload::fresh())?;
+    let payload_value = ThreadPayload::fresh();
+    emit_clone_thread_marker(b"debug.clone_thread.payload_fresh.after", tid.0 as i64);
+    let payload_cap = step_engine::sign(payload_value)?;
+    emit_clone_thread_marker(b"debug.clone_thread.payload_sign.after", tid.0 as i64);
     let payload = PayloadCap::from_cap(payload_cap);
-    step_engine::sign(ThreadIdentity {
+    emit_clone_thread_marker(b"debug.clone_thread.payload_cap.after", tid.0 as i64);
+    let identity = step_engine::sign(ThreadIdentity {
         tid,
         owner_proc,
         exit_status: SpinMutex::new(None),
         payload: SpinMutex::new(Some(payload)),
-    })
+    })?;
+    emit_clone_thread_marker(b"debug.clone_thread.identity_sign.after", tid.0 as i64);
+    Ok(identity)
 }
 
 /// Test-only: attach a fresh sibling thread to `target`'s thread
@@ -1321,6 +1434,7 @@ pub fn spawn_sibling_thread_for_test(
     register_tid(sibling.tid, sibling.clone());
     if let Some(payload) = target.payload.lock().as_ref() {
         payload.threads.attach(sibling.clone());
+        sync_thread_group_pending_summary(payload, &sibling);
     }
     Ok(sibling)
 }
@@ -1397,6 +1511,37 @@ impl<'a, P: PmapIf, I: SubjectIdentity> StepOp<I> for ForkOp<'a, P> {
 }
 
 impl<P: PmapIf, I: SubjectIdentity> OneShotStepOp<I> for ForkOp<'_, P> {}
+
+/// `StepOp` wrap of [`step_clone_thread`] for `clone(CLONE_THREAD)`.
+///
+/// This keeps thread clone in the same one-shot step vocabulary as fork:
+/// the operation is synchronous, does not yield, and preserves the underlying
+/// `ZoneError` so syscall translation can keep mapping allocation failure to
+/// the Linux errno boundary.
+pub struct CloneThreadOp<'a> {
+    pub process: &'a Cap<ProcessIdentity>,
+    pub parent_user_ctx: &'a UserTrapContext,
+    pub stack: usize,
+    pub tls: usize,
+    pub ctid_ptr: u64,
+}
+
+impl<'a, I: SubjectIdentity> StepOp<I> for CloneThreadOp<'a> {
+    type Output = Result<Cap<ThreadIdentity>, ZoneError>;
+    type Progress = NoProgress;
+
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        StepOutcome::Done(step_clone_thread(
+            self.process,
+            self.parent_user_ctx,
+            self.stack,
+            self.tls,
+            self.ctid_ptr,
+        ))
+    }
+}
+
+impl<I: SubjectIdentity> OneShotStepOp<I> for CloneThreadOp<'_> {}
 
 /// `StepOp` wrap of [`step_exit_group`].
 pub struct ExitGroupOp<'a> {

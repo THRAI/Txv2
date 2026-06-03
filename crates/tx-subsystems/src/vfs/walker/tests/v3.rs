@@ -10,9 +10,12 @@
 use alloc::boxed::Box;
 
 use crate::execution::Guard;
-use crate::page_backed::Frame;
-use crate::vfs::adapter::step_engine::{guard, Errno, NoProgress, StepOutcome};
-use crate::vfs::structure::{Credential, DirCursor, DirEntry, FsObjectId, InodeKind, InodeMeta};
+use crate::mount::MountPayload;
+use crate::page_backed::{AnonSwapPolicy, Frame, PageContainer, PageContainerKind};
+use crate::vfs::adapter::step_engine::{Cap, Errno, NoProgress, StepOutcome, guard};
+use crate::vfs::structure::{
+    Credential, DirCursor, DirEntry, FsObjectId, InodeKind, InodeMeta, RNode, RNodeBacking,
+};
 
 use super::TestFs;
 
@@ -23,7 +26,8 @@ impl crate::vfs::FsOps for TestFs {
         name: &[u8],
         _guard: &Guard<'_>,
     ) -> StepOutcome<FsObjectId, NoProgress> {
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
+        inner.lookup_count += 1;
         let Some(map) = inner.children.get(&parent) else {
             return StepOutcome::err(Errno::ENOTDIR);
         };
@@ -38,7 +42,8 @@ impl crate::vfs::FsOps for TestFs {
         fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<InodeMeta, NoProgress> {
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
+        inner.load_meta_count += 1;
         let Some((kind, _, mode_low, uid, gid)) = inner.inodes.get(&fs_object_id) else {
             return StepOutcome::err(Errno::ENOENT);
         };
@@ -165,6 +170,33 @@ impl crate::vfs::FsOps for TestFs {
             None => StepOutcome::err(Errno::ENOENT),
         }
     }
+
+    fn materialise_rnode(
+        &self,
+        fs_object_id: FsObjectId,
+        meta: InodeMeta,
+        mount: &Cap<MountPayload>,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<Cap<RNode>, NoProgress> {
+        self.inner.lock().materialise_count += 1;
+        if meta.kind() != InodeKind::Regular {
+            return StepOutcome::err(Errno::ENOSYS);
+        }
+
+        let pc = match PageContainer::new_cap(
+            PageContainerKind::Anon {
+                swap_policy: AnonSwapPolicy::Persistent,
+            },
+            1,
+        ) {
+            Ok(pc) => pc,
+            Err(_) => return StepOutcome::err(Errno::ENOMEM),
+        };
+        match RNode::new_cap_in_mount(fs_object_id, meta, RNodeBacking::PageBacked { pc }, mount) {
+            Ok(rnode) => StepOutcome::done(rnode),
+            Err(_) => StepOutcome::err(Errno::ENOMEM),
+        }
+    }
 }
 
 impl crate::page_backed::FsPageBacking for TestFs {
@@ -209,8 +241,8 @@ impl crate::page_backed::FsPageBacking for TestFs {
 
 #[test]
 fn testfs_v3_lookup_round_trips_after_add_dir() {
-    use crate::vfs::adapter::step_engine::{Errno as V3Errno, StepOutcome as V3};
     use crate::vfs::FsOps;
+    use crate::vfs::adapter::step_engine::{Errno as V3Errno, StepOutcome as V3};
 
     let _serial = crate::test_support::EPOCH_TEST_LOCK
         .lock()
@@ -233,8 +265,8 @@ fn testfs_v3_lookup_round_trips_after_add_dir() {
 
 #[test]
 fn testfs_v3_read_link_returns_target_bytes() {
-    use crate::vfs::adapter::step_engine::{Errno as V3Errno, StepOutcome as V3};
     use crate::vfs::FsOps;
+    use crate::vfs::adapter::step_engine::{Errno as V3Errno, StepOutcome as V3};
 
     let _serial = crate::test_support::EPOCH_TEST_LOCK
         .lock()

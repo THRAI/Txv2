@@ -6,6 +6,7 @@
 use super::*;
 use crate::adapter::step_engine::{self as step_engine, Cap, NoProgress, SpinMutex, StepOutcome};
 use alloc::collections::BTreeMap;
+use tx_subsystems::vfs::structure::{OpenFileBacking, RNodeBacking, StructPayload};
 use tx_subsystems::vfs::FsObjectId;
 
 mod dir_sync;
@@ -177,8 +178,77 @@ pub(super) fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
                 Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
             }
         }
+        F_GETPIPE_SZ | F_SETPIPE_SZ => {
+            let Some(payload) = pipe_payload_for_fcntl(&file) else {
+                return SyscallResult::Error(EINVAL_VALUE);
+            };
+            if cmd == F_GETPIPE_SZ {
+                return SyscallResult::Return(payload.pipe_size_bytes() as i64);
+            }
+            let requested = match usize::try_from(arg) {
+                Ok(size) => size,
+                Err(_) => return SyscallResult::Error(EINVAL_VALUE),
+            };
+            match payload.set_pipe_size_bytes(requested) {
+                Ok(size) => SyscallResult::Return(size as i64),
+                Err(errno) => SyscallResult::error_from(errno),
+            }
+        }
         _ => SyscallResult::Error(ENOSYS_VALUE),
     }
+}
+
+fn pipe_payload_for_fcntl(file: &Cap<OpenFile>) -> Option<Cap<tx_subsystems::pipe::PipePayload>> {
+    let OpenFileBacking::Rnode { rnode } = file.backing() else {
+        return None;
+    };
+    let RNodeBacking::StructBacked {
+        payload: StructPayload::Pipe { payload, .. },
+    } = rnode.backing()
+    else {
+        return None;
+    };
+    Some(payload.clone())
+}
+
+/// `close_range(first, last, flags)`.
+///
+/// Walks sparse fd/cloexec keys rather than scanning the numeric
+/// interval. `CLOSE_RANGE_UNSHARE` is recognised but intentionally
+/// deferred because txKernel has no fd-table sharing model yet.
+pub(super) fn sys_close_range<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let first = args[0] as u32;
+    let last = args[1] as u32;
+    let flags = args[2] as u32;
+
+    const KNOWN_FLAGS: u32 = CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC;
+    if flags & !KNOWN_FLAGS != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if flags & CLOSE_RANGE_UNSHARE != 0 {
+        return SyscallResult::Error(ENOSYS_VALUE);
+    }
+    if first > last {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    let open_keys = ctx.process.open_fd_numbers();
+    let cloexec_keys = ctx.process.fd_cloexec_snapshot();
+    if flags & CLOSE_RANGE_CLOEXEC != 0 {
+        for fd in open_keys.range(first..=last).copied() {
+            ctx.process.set_fd_cloexec(fd, true);
+        }
+        return SyscallResult::Return(0);
+    }
+
+    for fd in open_keys.range(first..=last).copied() {
+        ctx.process.set_fd(fd, None);
+        ctx.process.set_fd_cloexec(fd, false);
+    }
+    for fd in cloexec_keys.range(first..=last).copied() {
+        ctx.process.set_fd_cloexec(fd, false);
+    }
+    SyscallResult::Return(0)
 }
 
 /// `openat(dirfd, path, flags, mode)`. Linux RV64 generic ABI
@@ -623,11 +693,14 @@ pub(super) fn sys_pipe2<'a>(pipefd_uaddr: u64, flags: u32, ctx: &SyscallCtx<'a>)
         ctx.process.set_fd_cloexec(writer_fd, true);
     }
 
-    // Write the (reader_fd, writer_fd) pair back to userspace
-    // through the canonical user-VA lane.
-    if let Err(errno) =
-        bootstrap_write_user::<[u32; 2]>(&ctx.aspace, pipefd_uaddr, [reader_fd, writer_fd])
-    {
+    // Write the (reader_fd, writer_fd) pair back to userspace as the
+    // Linux ABI's two adjacent little-endian `int` slots. Keep this
+    // byte-explicit instead of relying on a typed `[u32; 2]` write so
+    // fd publication is independent of Rust aggregate layout details.
+    let mut pipefd_bytes = [0u8; 8];
+    pipefd_bytes[0..4].copy_from_slice(&reader_fd.to_le_bytes());
+    pipefd_bytes[4..8].copy_from_slice(&writer_fd.to_le_bytes());
+    if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, pipefd_uaddr, &pipefd_bytes) {
         return SyscallResult::error_from(errno);
     }
 
