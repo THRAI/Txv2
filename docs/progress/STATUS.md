@@ -22,6 +22,19 @@
   without the new attribution cfgs and confirm recipe service tails no longer
   include those probe rows.
 
+- 2026-06-03 **ext4 bridge read-cache hits no longer copy 4 KiB under the cache lock.**
+  Changed `tx_ext4_bridge::ReadBlockCache` to store `Arc<Page4K>` entries so a
+  cache hit only updates LRU state and clones the shared block under the
+  spinlock; the caller copies the 4 KiB page into its output buffer after the
+  lock is released. Inserts now build a shared page outside the cache lock
+  before publishing the pointer. Added
+  `read_block_cache_returns_shared_page_for_lock_free_copy` to pin the
+  lock-free-copy cache contract. Verification: red/green `cargo test -p tx-fs
+  read_block_cache_returns_shared_page_for_lock_free_copy -- --nocapture` and
+  `cargo check -p tx-fs -q` passed. Next step: either mirror the same cache
+  shape for FAT if/when it grows a metadata cache, or instrument ext4 pager
+  misses to split block mapping, block read, frame allocation, and copy cost.
+
 - 2026-06-03 **tmpfs symlink/readlink no longer allocate under the state lock.**
   Moved symlink target buffer construction before the tmpfs state lock and
   moved `read_link`'s `Box<[u8]>` conversion after the lock, leaving the lock
