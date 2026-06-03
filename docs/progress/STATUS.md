@@ -1,3 +1,27 @@
+- 2026-06-03 **VM recipe attribution observes are behind narrow cfg gates.**
+  Normal VM recipe captures now keep the stable publish/reclaim counters needed
+  for SQL comparisons (`publish.op`, `publish.touched_entries`,
+  `publish.node_allocs`, `publish.duration_ns`, and `reclaim_tree.duration_ns`)
+  while moving high-volume attribution-only records behind explicit cfgs:
+  `tx_vm_recipe_publish_shape_metrics`, `tx_vm_recipe_reclaim_shape_metrics`,
+  and `tx_vm_recipe_node_alloc_metrics`. This prevents default pthread/VM
+  observe runs from paying for redundant publish shape rows, reclaim tree shape
+  rows, and per-node recipe allocation timing. Verification:
+  `cargo check -p tx-subsystems -q`,
+  `RUSTFLAGS="--cfg tx_vm_recipe_bplus" cargo check -p tx-subsystems -q`,
+  `RUSTFLAGS="--cfg tx_vm_recipe_node_alloc_metrics --cfg
+  tx_vm_recipe_publish_shape_metrics --cfg tx_vm_recipe_reclaim_shape_metrics
+  --cfg tx_vm_recipe_bplus --cfg tx_vm_recipe_bplus_shape_metrics" cargo check
+  -p tx-subsystems -q`, `cargo test -p tx-subsystems vm_recipe --
+  --nocapture`, `RUSTFLAGS="--cfg tx_vm_recipe_bplus" cargo test -p
+  tx-subsystems vm_recipe -- --nocapture`, and the same metric-heavy cfg set
+  with `cargo test -p tx-subsystems bplus_ -- --nocapture` passed. Caveat:
+  package-wide `cargo fmt --check --package tx-subsystems` still reports
+  unrelated pre-existing import-order drift; only the two touched VM files were
+  rustfmt-checked directly. Next step: rerun a pthread/VM observe capture
+  without the new attribution cfgs and confirm recipe service tails no longer
+  include those probe rows.
+
 - 2026-06-03 **tmpfs symlink/readlink no longer allocate under the state lock.**
   Moved symlink target buffer construction before the tmpfs state lock and
   moved `read_link`'s `Box<[u8]>` conversion after the lock, leaving the lock

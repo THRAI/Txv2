@@ -6,15 +6,15 @@ use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 use crate::vm::adapter::step_engine::epoch_mod as epoch;
-use crate::vm::lock_metrics::{VmSpinMutex, vm_spin_mutex};
+use crate::vm::lock_metrics::{vm_spin_mutex, VmSpinMutex};
 
 use crate::execution::Guard;
 
 use super::recipe_tree::{RecipeTree, VmEntryView};
 use super::{
-    AddressSpaceStats, AddressSpaceStatsDelta, MapPlacement, Prot, USER_PAGE_SIZE, UfdRegistration,
-    UserRange, UserVirtAddr, VmBacking, VmEntry, VmEntryError, VmEntryFlags, VmEntryProtectRewrite,
-    VmMapCommit, VmMapError, VmRemapPlacement,
+    AddressSpaceStats, AddressSpaceStatsDelta, MapPlacement, Prot, UfdRegistration, UserRange,
+    UserVirtAddr, VmBacking, VmEntry, VmEntryError, VmEntryFlags, VmEntryProtectRewrite,
+    VmMapCommit, VmMapError, VmRemapPlacement, USER_PAGE_SIZE,
 };
 
 static RECIPE_OP_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -89,6 +89,10 @@ static DEFERRED_RECIPE_RECLAIMS: VmSpinMutex<DeferredRecipeReclaimQueue> = vm_sp
     DeferredRecipeReclaimQueue::new(),
     b"debug.lock.vm.recipe_reclaim.deferred",
 );
+
+const VM_RECIPE_PUBLISH_SHAPE_METRICS: bool = cfg!(tx_vm_recipe_publish_shape_metrics);
+const VM_RECIPE_RECLAIM_SHAPE_METRICS: bool = cfg!(tx_vm_recipe_reclaim_shape_metrics);
+const VM_RECIPE_NODE_ALLOC_METRICS: bool = cfg!(tx_vm_recipe_node_alloc_metrics);
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(in crate::vm) struct RecipeDebugTotals {
@@ -607,7 +611,9 @@ pub(in crate::vm) fn drain_deferred_recipe_reclaims(limit: usize) -> usize {
     }
     if drained != 0 {
         RECIPE_DEFERRED_RECLAIM_DRAINED.fetch_add(drained, Ordering::Relaxed);
-        emit_vm_recipe_trace(b"debug.vm.recipe.reclaim_deferred.drained", drained as i64);
+        if VM_RECIPE_RECLAIM_SHAPE_METRICS {
+            emit_vm_recipe_trace(b"debug.vm.recipe.reclaim_deferred.drained", drained as i64);
+        }
     }
     drained
 }
@@ -626,85 +632,12 @@ unsafe fn perform_recipe_tree_reclaim(ptr: *mut RecipeTree) {
 
     let start_ns = tx_observe::clock_now_ns();
     let tree = unsafe { &*ptr };
-    let reclaim_stats = tree.reclaim_stats();
-    let node_count = reclaim_stats.node_chunks;
-    emit_vm_recipe_trace(b"debug.vm.recipe.reclaim_tree.begin", 1);
-    emit_vm_recipe_trace(
-        b"debug.vm.recipe.reclaim_tree.entries",
-        reclaim_stats.entries as i64,
-    );
-    emit_vm_recipe_trace(b"debug.vm.recipe.reclaim_tree.nodes", node_count as i64);
-    emit_vm_recipe_trace(
-        b"debug.vm.recipe.reclaim_tree.child_refs",
-        reclaim_stats.copied_child_refs as i64,
-    );
-    emit_vm_recipe_trace(
-        b"debug.vm.recipe.reclaim_tree.depth",
-        reclaim_stats.tree_depth as i64,
-    );
-    emit_vm_recipe_trace(
-        b"debug.vm.recipe.reclaim_tree.leaf_count",
-        reclaim_stats.leaf_count as i64,
-    );
-    emit_vm_recipe_trace(
-        b"debug.vm.recipe.reclaim_tree.internal_count",
-        reclaim_stats.internal_count as i64,
-    );
-    emit_vm_recipe_trace(
-        b"debug.vm.recipe.reclaim_tree.internal_fanout_min",
-        reclaim_stats.internal_fanout_min as i64,
-    );
-    emit_vm_recipe_trace(
-        b"debug.vm.recipe.reclaim_tree.internal_fanout_max",
-        reclaim_stats.internal_fanout_max as i64,
-    );
-    let avg_fanout = if reclaim_stats.internal_count == 0 {
-        0
-    } else {
-        reclaim_stats.internal_fanout_total / reclaim_stats.internal_count
-    };
-    emit_vm_recipe_trace(
-        b"debug.vm.recipe.reclaim_tree.internal_fanout_avg",
-        avg_fanout as i64,
-    );
-    emit_vm_recipe_trace(
-        b"debug.vm.recipe.reclaim_tree.nonroot_internal_count",
-        reclaim_stats.nonroot_internal_count as i64,
-    );
-    emit_vm_recipe_trace(
-        b"debug.vm.recipe.reclaim_tree.nonroot_internal_fanout_min",
-        reclaim_stats.nonroot_internal_fanout_min as i64,
-    );
-    emit_vm_recipe_trace(
-        b"debug.vm.recipe.reclaim_tree.nonroot_internal_fanout_max",
-        reclaim_stats.nonroot_internal_fanout_max as i64,
-    );
-    let avg_nonroot_fanout = if reclaim_stats.nonroot_internal_count == 0 {
-        0
-    } else {
-        reclaim_stats.nonroot_internal_fanout_total / reclaim_stats.nonroot_internal_count
-    };
-    emit_vm_recipe_trace(
-        b"debug.vm.recipe.reclaim_tree.nonroot_internal_fanout_avg",
-        avg_nonroot_fanout as i64,
-    );
-    emit_vm_recipe_trace(
-        b"debug.vm.recipe.reclaim_tree.leaf_fill_min",
-        reclaim_stats.leaf_fill_min as i64,
-    );
-    emit_vm_recipe_trace(
-        b"debug.vm.recipe.reclaim_tree.leaf_fill_max",
-        reclaim_stats.leaf_fill_max as i64,
-    );
-    let avg_fill = if reclaim_stats.leaf_count == 0 {
-        0
-    } else {
-        reclaim_stats.leaf_fill_total / reclaim_stats.leaf_count
-    };
-    emit_vm_recipe_trace(
-        b"debug.vm.recipe.reclaim_tree.leaf_fill_avg",
-        avg_fill as i64,
-    );
+    let mut node_count = 0usize;
+    if VM_RECIPE_RECLAIM_SHAPE_METRICS {
+        let reclaim_stats = tree.reclaim_stats();
+        node_count = reclaim_stats.node_chunks;
+        emit_recipe_reclaim_shape_debug(&reclaim_stats);
+    }
     // SAFETY: `ptr` was last published from `Box::into_raw(Box::new(_))`.
     let _ = unsafe { Box::from_raw(ptr as *mut RecipeTree) };
     let duration_ns = tx_observe::clock_now_ns().saturating_sub(start_ns);
@@ -713,7 +646,9 @@ unsafe fn perform_recipe_tree_reclaim(ptr: *mut RecipeTree) {
         b"debug.vm.recipe.reclaim_tree.duration_ns",
         duration_ns as i64,
     );
-    emit_vm_recipe_trace(b"debug.vm.recipe.reclaim_tree.end", 1);
+    if VM_RECIPE_RECLAIM_SHAPE_METRICS {
+        emit_vm_recipe_trace(b"debug.vm.recipe.reclaim_tree.end", 1);
+    }
 }
 
 pub(in crate::vm) struct AddressSpaceStatsCell {
@@ -809,15 +744,6 @@ fn emit_recipe_publish_debug(debug: &RecipePublishDebug, retired_old: bool) {
     );
     emit_vm_recipe_trace(b"debug.vm.recipe.publish.op", debug.op as i64);
     emit_vm_recipe_trace(
-        b"debug.vm.recipe.publish.before_len",
-        debug.before_len as i64,
-    );
-    emit_vm_recipe_trace(b"debug.vm.recipe.publish.after_len", debug.after_len as i64);
-    emit_vm_recipe_trace(
-        b"debug.vm.recipe.publish.changed_pages",
-        debug.changed_pages as i64,
-    );
-    emit_vm_recipe_trace(
         b"debug.vm.recipe.publish.node_allocs",
         debug.node_allocs as i64,
     );
@@ -825,8 +751,8 @@ fn emit_recipe_publish_debug(debug: &RecipePublishDebug, retired_old: bool) {
         b"debug.vm.recipe.publish.duration_ns",
         debug.duration_ns as i64,
     );
-    if retired_old {
-        emit_vm_recipe_trace(b"debug.vm.recipe.publish.retire_old", 1);
+    if VM_RECIPE_PUBLISH_SHAPE_METRICS {
+        emit_recipe_publish_shape_debug(debug, retired_old);
     }
 }
 
@@ -838,17 +764,117 @@ fn record_recipe_publish_debug(debug: &RecipePublishDebug) {
     atomic_max_usize(&RECIPE_OP_MAX_NS, debug.duration_ns as usize);
     atomic_max_usize(&RECIPE_OP_NODE_ALLOC_MAX, debug.node_allocs);
 
-    emit_vm_recipe_trace(b"debug.vm.recipe.publish.len_delta", {
-        let delta = debug.after_len as isize - debug.before_len as isize;
-        delta as i64
-    });
-    emit_vm_recipe_allocation(
-        b"debug.alloc.vm.recipe_node.per_publish",
-        debug.node_allocs as u64,
+    if VM_RECIPE_PUBLISH_SHAPE_METRICS {
+        emit_vm_recipe_trace(b"debug.vm.recipe.publish.len_delta", {
+            let delta = debug.after_len as isize - debug.before_len as isize;
+            delta as i64
+        });
+        emit_vm_recipe_allocation(
+            b"debug.alloc.vm.recipe_node.per_publish",
+            debug.node_allocs as u64,
+        );
+        emit_vm_recipe_allocation(
+            b"debug.alloc.vm.recipe_node.publish_duration_ns",
+            debug.duration_ns,
+        );
+    }
+}
+
+fn emit_recipe_publish_shape_debug(debug: &RecipePublishDebug, retired_old: bool) {
+    emit_vm_recipe_trace(
+        b"debug.vm.recipe.publish.before_len",
+        debug.before_len as i64,
     );
-    emit_vm_recipe_allocation(
-        b"debug.alloc.vm.recipe_node.publish_duration_ns",
-        debug.duration_ns,
+    emit_vm_recipe_trace(b"debug.vm.recipe.publish.after_len", debug.after_len as i64);
+    emit_vm_recipe_trace(
+        b"debug.vm.recipe.publish.changed_pages",
+        debug.changed_pages as i64,
+    );
+    if retired_old {
+        emit_vm_recipe_trace(b"debug.vm.recipe.publish.retire_old", 1);
+    }
+}
+
+fn emit_recipe_reclaim_shape_debug(reclaim_stats: &super::recipe_tree::RecipeReclaimStats) {
+    emit_vm_recipe_trace(b"debug.vm.recipe.reclaim_tree.begin", 1);
+    emit_vm_recipe_trace(
+        b"debug.vm.recipe.reclaim_tree.entries",
+        reclaim_stats.entries as i64,
+    );
+    emit_vm_recipe_trace(
+        b"debug.vm.recipe.reclaim_tree.nodes",
+        reclaim_stats.node_chunks as i64,
+    );
+    emit_vm_recipe_trace(
+        b"debug.vm.recipe.reclaim_tree.child_refs",
+        reclaim_stats.copied_child_refs as i64,
+    );
+    emit_vm_recipe_trace(
+        b"debug.vm.recipe.reclaim_tree.depth",
+        reclaim_stats.tree_depth as i64,
+    );
+    emit_vm_recipe_trace(
+        b"debug.vm.recipe.reclaim_tree.leaf_count",
+        reclaim_stats.leaf_count as i64,
+    );
+    emit_vm_recipe_trace(
+        b"debug.vm.recipe.reclaim_tree.internal_count",
+        reclaim_stats.internal_count as i64,
+    );
+    emit_vm_recipe_trace(
+        b"debug.vm.recipe.reclaim_tree.internal_fanout_min",
+        reclaim_stats.internal_fanout_min as i64,
+    );
+    emit_vm_recipe_trace(
+        b"debug.vm.recipe.reclaim_tree.internal_fanout_max",
+        reclaim_stats.internal_fanout_max as i64,
+    );
+    let avg_fanout = if reclaim_stats.internal_count == 0 {
+        0
+    } else {
+        reclaim_stats.internal_fanout_total / reclaim_stats.internal_count
+    };
+    emit_vm_recipe_trace(
+        b"debug.vm.recipe.reclaim_tree.internal_fanout_avg",
+        avg_fanout as i64,
+    );
+    emit_vm_recipe_trace(
+        b"debug.vm.recipe.reclaim_tree.nonroot_internal_count",
+        reclaim_stats.nonroot_internal_count as i64,
+    );
+    emit_vm_recipe_trace(
+        b"debug.vm.recipe.reclaim_tree.nonroot_internal_fanout_min",
+        reclaim_stats.nonroot_internal_fanout_min as i64,
+    );
+    emit_vm_recipe_trace(
+        b"debug.vm.recipe.reclaim_tree.nonroot_internal_fanout_max",
+        reclaim_stats.nonroot_internal_fanout_max as i64,
+    );
+    let avg_nonroot_fanout = if reclaim_stats.nonroot_internal_count == 0 {
+        0
+    } else {
+        reclaim_stats.nonroot_internal_fanout_total / reclaim_stats.nonroot_internal_count
+    };
+    emit_vm_recipe_trace(
+        b"debug.vm.recipe.reclaim_tree.nonroot_internal_fanout_avg",
+        avg_nonroot_fanout as i64,
+    );
+    emit_vm_recipe_trace(
+        b"debug.vm.recipe.reclaim_tree.leaf_fill_min",
+        reclaim_stats.leaf_fill_min as i64,
+    );
+    emit_vm_recipe_trace(
+        b"debug.vm.recipe.reclaim_tree.leaf_fill_max",
+        reclaim_stats.leaf_fill_max as i64,
+    );
+    let avg_fill = if reclaim_stats.leaf_count == 0 {
+        0
+    } else {
+        reclaim_stats.leaf_fill_total / reclaim_stats.leaf_count
+    };
+    emit_vm_recipe_trace(
+        b"debug.vm.recipe.reclaim_tree.leaf_fill_avg",
+        avg_fill as i64,
     );
 }
 
@@ -1576,7 +1602,13 @@ pub(super) fn emit_vm_recipe_trace_for_tree(name: &[u8], value: i64) {
 }
 
 pub(super) fn emit_vm_recipe_allocation_for_tree(name: &[u8], value: u64) {
-    emit_vm_recipe_allocation(name, value);
+    if VM_RECIPE_NODE_ALLOC_METRICS {
+        emit_vm_recipe_allocation(name, value);
+    }
+}
+
+pub(super) fn recipe_node_alloc_metrics_enabled_for_tree() -> bool {
+    VM_RECIPE_NODE_ALLOC_METRICS && tx_observe::current().is_some()
 }
 
 fn find_gap_in(entries: &RecipeTree, window: UserRange, page_count: usize) -> Option<UserRange> {

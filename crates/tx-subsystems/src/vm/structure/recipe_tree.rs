@@ -891,7 +891,7 @@ fn build_node(
 ) -> Arc<RecipeNode> {
     let subtree_len = 1 + node_len(&left) + node_len(&right);
     let subtree_vm_size = entry.range.len() + node_vm_size(&left) + node_vm_size(&right);
-    if tx_observe::current().is_none() {
+    if !super::recipe::recipe_node_alloc_metrics_enabled_for_tree() {
         return Arc::new(RecipeNode {
             key,
             priority,
@@ -3345,12 +3345,10 @@ mod tests {
             touched <= BPLUS_LEAF_CAP + 1,
             "gap insertion should splice at the destination leaf; touched={touched}"
         );
-        assert!(
-            rewritten
-                .values_vec()
-                .windows(2)
-                .all(|pair| pair[0].range.start().as_usize() < pair[1].range.start().as_usize())
-        );
+        assert!(rewritten
+            .values_vec()
+            .windows(2)
+            .all(|pair| pair[0].range.start().as_usize() < pair[1].range.start().as_usize()));
     }
 
     #[test]
