@@ -17,7 +17,7 @@ use tx_platform_adapter::platform_adapter;
     reason = "expose substrate step engine outcome types, zone role types, page-allocator primitives (BitmapPageAllocator, CachePin, DeviceFrame, MapPin, ZeroPolicy), EBR guard, and SpinMutex used by the page_backed subsystem's per-variant fetch/write step ops"
 )]
 pub mod step_engine {
-    pub use tx_substrate::epoch::{self as epoch, borrow_current_guard, guard, Guard};
+    pub use tx_substrate::epoch::{self as epoch, Guard, borrow_current_guard, guard};
     pub use tx_substrate::page_allocator::{
         self, AllocError, BitmapPageAllocator, CachePin, DeviceFrame, MapPin, ZeroPolicy,
     };
@@ -27,10 +27,35 @@ pub mod step_engine {
         SubjectIdentity, WaitSourceId, YieldShape,
     };
     pub use tx_substrate::zone::{
-        register_zone_for, reserve_for, sign, sign_for, Cap, CapProducingPolicy, CoLocatedEntity,
-        Dead, Entity, IdentRef, IdentitySlot, IsPayloadPolicy, ObserverNodePolicy,
-        OperationalCapExt, OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy,
-        RetainedEntityPolicy, Weak, Zone, ZoneAllocated, ZoneError, ZonePolicy,
+        Cap, CapProducingPolicy, CoLocatedEntity, Dead, Entity, IdentRef, IdentitySlot,
+        IsPayloadPolicy, ObserverNodePolicy, OperationalCapExt, OperationalRefExt, PayloadBinding,
+        PayloadCap, PayloadPolicy, RetainedEntityPolicy, Weak, Zone, ZoneAllocated, ZoneError,
+        ZonePolicy, register_zone_for, reserve_for, sign, sign_for,
     };
-    pub use tx_substrate::SpinMutex;
+}
+
+#[platform_adapter(
+    platform = "substrate",
+    domain = "wait_routing",
+    apis = ["wake"],
+    reason = "wrap WaitSource construction, registration, notification, and unregistration for PageBacked page-fetch in-flight wait sources"
+)]
+pub mod wait_routing {
+    use alloc::sync::Arc;
+
+    pub use tx_substrate::wake::WaitSource;
+
+    pub fn new_wait_source(source_id: u64) -> Arc<WaitSource> {
+        let source = tx_substrate::wake::new_source(source_id);
+        tx_substrate::wake::register_source(Arc::clone(&source));
+        source
+    }
+
+    pub fn notify_source(source: &Arc<WaitSource>, mask_bits: u64) {
+        tx_substrate::wake::notify(source, mask_bits);
+    }
+
+    pub fn unregister_source(source_id: u64) {
+        tx_substrate::wake::unregister_source(tx_substrate::step::WaitSourceId::new(source_id));
+    }
 }

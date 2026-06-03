@@ -363,6 +363,46 @@ unsafe impl Sync for PageContainer {}
 #[derive(Debug)]
 struct PageContainerState {
     pages: PageCacheIndex,
+    in_flight_file_pages: BTreeMap<PageIndex, FilePageFetch>,
+    // Page-scoped retry sources are retained so a task that already received
+    // `Yield` can still register and consume a pending wake before it retries
+    // and re-observes page state.
+    file_page_waits: BTreeMap<PageIndex, notification::PageReadyWait>,
+    next_file_fetch_id: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FilePageFetchId(u64);
+
+#[derive(Debug)]
+struct FilePageFetch {
+    id: FilePageFetchId,
+    source_id: Option<u64>,
+    joined: bool,
+}
+
+impl FilePageFetch {
+    const fn new(id: FilePageFetchId) -> Self {
+        Self {
+            id,
+            source_id: None,
+            joined: false,
+        }
+    }
+}
+
+enum FilePageFetchStart {
+    Cached(Result<MaterializedPage, PageCacheError>),
+    Joined(u64),
+    Owner(FilePageFetchId),
+}
+
+impl PageContainerState {
+    fn allocate_file_fetch_id(&mut self) -> FilePageFetchId {
+        let id = self.next_file_fetch_id;
+        self.next_file_fetch_id = self.next_file_fetch_id.wrapping_add(1).max(1);
+        FilePageFetchId(id)
+    }
 }
 
 struct PageContainerStateCell {
@@ -492,6 +532,9 @@ impl PageContainer {
             size_bytes: AtomicU64::new(capacity),
             state: PageContainerStateCell::new(PageContainerState {
                 pages: PageCacheIndex::new(),
+                in_flight_file_pages: BTreeMap::new(),
+                file_page_waits: BTreeMap::new(),
+                next_file_fetch_id: 1,
             }),
         }
     }
@@ -768,14 +811,21 @@ impl PageContainer {
         guard: &Guard<'_>,
     ) -> StepOutcome<MaterializedPage, NoProgress> {
         use adapter::step_engine::Errno as V3Errno;
-        if let Some(materialized) = self.materialize_cached_page(page, access) {
-            return match materialized {
-                Ok(page) => StepOutcome::Done(page),
-                Err(error) => StepOutcome::Err(page_cache_error_to_errno(error).into()),
-            };
-        }
+        let fetch_id = match self.begin_file_page_fetch(page, access) {
+            FilePageFetchStart::Cached(materialized) => {
+                return match materialized {
+                    Ok(page) => StepOutcome::Done(page),
+                    Err(error) => StepOutcome::Err(page_cache_error_to_errno(error).into()),
+                };
+            }
+            FilePageFetchStart::Joined(source_id) => {
+                return notification::yield_on_page_ready_source(NoProgress, source_id);
+            }
+            FilePageFetchStart::Owner(fetch_id) => fetch_id,
+        };
 
         let Some(offset) = page.as_u64().checked_mul(crate::vm::USER_PAGE_SIZE as u64) else {
+            self.finish_file_page_fetch_without_install(page, fetch_id);
             return StepOutcome::Err(V3Errno::EINVAL);
         };
         // Routes through `FsPageBacking::fetch_page`. v3 outcome:
@@ -787,61 +837,197 @@ impl PageContainer {
             .fs_page_backing
             .fetch_page(fs_object_id, offset, guard)
         {
-            StepOutcome::Done(frame) => self.install_fetched_file_page(page, access, frame, false),
+            StepOutcome::Done(frame) => {
+                self.install_fetched_file_page_from_owner(page, access, frame, fetch_id)
+            }
             StepOutcome::Continue { progress: _ } => {
                 // `Continue` with `NoProgress` means "fs is asking us
                 // to retry"; there is no frame to install. Conservative
                 // choice: surface `Err(EAGAIN)` so callers that expect
                 // a frame don't observe a stale value.
+                self.finish_file_page_fetch_without_install(page, fetch_id);
                 StepOutcome::Err(V3Errno::EAGAIN)
             }
             StepOutcome::Yield { progress: _, shape } => {
+                self.finish_file_page_fetch_without_install(page, fetch_id);
                 if let Some((carrier, interests)) = notification::wait_source_parts(&shape) {
                     notification::yield_on_wait_source(NoProgress, carrier, interests)
                 } else {
                     StepOutcome::Err(V3Errno::EIO)
                 }
             }
-            StepOutcome::Err(v3_errno) => StepOutcome::Err(v3_errno),
+            StepOutcome::Err(v3_errno) => {
+                self.finish_file_page_fetch_without_install(page, fetch_id);
+                StepOutcome::Err(v3_errno)
+            }
         }
     }
 
-    fn install_fetched_file_page(
+    fn begin_file_page_fetch(
+        &self,
+        page: PageIndex,
+        access: MaterializeAccess,
+    ) -> FilePageFetchStart {
+        loop {
+            if let Some(materialized) = self.materialize_cached_page(page, access) {
+                return FilePageFetchStart::Cached(materialized);
+            }
+
+            let mut state = self.state.lock();
+            if state.pages.lookup(page).is_some() {
+                drop(state);
+                return FilePageFetchStart::Cached(
+                    self.materialize_existing_page(page, access, false),
+                );
+            }
+
+            let existing_source_id = state
+                .file_page_waits
+                .get(&page)
+                .map(notification::page_ready_source_id);
+            if let Some(fetch) = state.in_flight_file_pages.get_mut(&page) {
+                if fetch.source_id.is_none() {
+                    fetch.source_id = existing_source_id;
+                }
+                if let Some(source_id) = fetch.source_id {
+                    fetch.joined = true;
+                    return FilePageFetchStart::Joined(source_id);
+                }
+                drop(state);
+
+                let wait = notification::new_page_ready_wait();
+                let source_id = notification::page_ready_source_id(&wait);
+                let mut state = self.state.lock();
+                if state.pages.lookup(page).is_some() {
+                    drop(state);
+                    return FilePageFetchStart::Cached(
+                        self.materialize_existing_page(page, access, false),
+                    );
+                }
+                if let Some(existing_source_id) = state
+                    .file_page_waits
+                    .get(&page)
+                    .map(notification::page_ready_source_id)
+                {
+                    if let Some(fetch) = state.in_flight_file_pages.get_mut(&page) {
+                        fetch.source_id = Some(existing_source_id);
+                        fetch.joined = true;
+                        return FilePageFetchStart::Joined(existing_source_id);
+                    }
+                    continue;
+                }
+                if state.in_flight_file_pages.contains_key(&page) {
+                    state.file_page_waits.insert(page, wait);
+                    let fetch = state
+                        .in_flight_file_pages
+                        .get_mut(&page)
+                        .expect("file page fetch still present");
+                    fetch.source_id = Some(source_id);
+                    fetch.joined = true;
+                    return FilePageFetchStart::Joined(source_id);
+                }
+                continue;
+            }
+
+            let fetch_id = state.allocate_file_fetch_id();
+            state
+                .in_flight_file_pages
+                .insert(page, FilePageFetch::new(fetch_id));
+            return FilePageFetchStart::Owner(fetch_id);
+        }
+    }
+
+    fn retire_file_page_fetch_wait(
+        state: &mut PageContainerState,
+        page: PageIndex,
+        fetch: FilePageFetch,
+    ) -> Option<notification::PageReadyNotifier> {
+        (fetch.joined && fetch.source_id.is_some())
+            .then(|| state.file_page_waits.get(&page).map(|wait| wait.notifier()))
+            .flatten()
+    }
+
+    fn finish_file_page_fetch_without_install(&self, page: PageIndex, fetch_id: FilePageFetchId) {
+        let notify_ready: Option<notification::PageReadyNotifier> = {
+            let mut state = self.state.lock();
+            let Some(fetch) = state.in_flight_file_pages.get(&page) else {
+                return;
+            };
+            if fetch.id != fetch_id {
+                return;
+            }
+            let fetch = state
+                .in_flight_file_pages
+                .remove(&page)
+                .expect("matched file page fetch present");
+            Self::retire_file_page_fetch_wait(&mut state, page, fetch)
+        };
+        if let Some(notifier) = notify_ready {
+            notification::notify_page_ready(&notifier);
+        }
+    }
+
+    fn install_fetched_file_page_from_owner(
         &self,
         page: PageIndex,
         access: MaterializeAccess,
         frame: Frame,
-        newly_installed: bool,
+        fetch_id: FilePageFetchId,
     ) -> StepOutcome<MaterializedPage, NoProgress> {
+        use adapter::step_engine::Errno as V3Errno;
+
         let frame = match cached_frame_from_frame(frame) {
             Ok(frame) => frame,
-            Err(error) => return StepOutcome::Err(page_cache_error_to_errno(error).into()),
+            Err(error) => {
+                self.finish_file_page_fetch_without_install(page, fetch_id);
+                return StepOutcome::Err(page_cache_error_to_errno(error).into());
+            }
         };
         let ppn = frame.ppn;
         let map_pin = match acquire_map_pin_for_materialization(ppn) {
             Ok(pin) => pin,
-            Err(error) => return StepOutcome::Err(page_cache_error_to_errno(error).into()),
-        };
-        let installed_dirty = {
-            let mut state = self.state.lock();
-            let installed = match state.pages.lookup(page) {
-                Some(_) => false,
-                None => match state.pages.install_if_absent(page, frame) {
-                    Ok(()) => true,
-                    Err(PageCacheError::AlreadyPresent { .. }) => false,
-                    Err(error) => return StepOutcome::Err(page_cache_error_to_errno(error).into()),
-                },
-            };
-            if access == MaterializeAccess::Write {
-                if let Err(error) = state.pages.mark_dirty(page) {
-                    return StepOutcome::Err(page_cache_error_to_errno(error).into());
-                }
+            Err(error) => {
+                self.finish_file_page_fetch_without_install(page, fetch_id);
+                return StepOutcome::Err(page_cache_error_to_errno(error).into());
             }
-            installed
-                .then(|| state.pages.marks(page).ok_or(PageCacheError::MissingPage))
-                .transpose()
-                .map(|marks| marks.map(|marks| marks.dirty))
         };
+        let (installed_dirty, notify_ready) = {
+            let mut state = self.state.lock();
+            let Some(fetch) = state.in_flight_file_pages.get(&page) else {
+                return StepOutcome::Err(V3Errno::EAGAIN);
+            };
+            if fetch.id != fetch_id {
+                return StepOutcome::Err(V3Errno::EAGAIN);
+            }
+            let fetch = state
+                .in_flight_file_pages
+                .remove(&page)
+                .expect("matched file page fetch present");
+            let notify_ready = Self::retire_file_page_fetch_wait(&mut state, page, fetch);
+
+            let installed_dirty = (|| {
+                let installed = match state.pages.lookup(page) {
+                    Some(_) => false,
+                    None => match state.pages.install_if_absent(page, frame) {
+                        Ok(()) => true,
+                        Err(PageCacheError::AlreadyPresent { .. }) => false,
+                        Err(error) => return Err(error),
+                    },
+                };
+                if access == MaterializeAccess::Write {
+                    state.pages.mark_dirty(page)?;
+                }
+                installed
+                    .then(|| state.pages.marks(page).ok_or(PageCacheError::MissingPage))
+                    .transpose()
+                    .map(|marks| marks.map(|marks| marks.dirty))
+            })();
+
+            (installed_dirty, notify_ready)
+        };
+        if let Some(notifier) = notify_ready {
+            notification::notify_page_ready(&notifier);
+        }
         match installed_dirty {
             Ok(Some(dirty)) => StepOutcome::Done(MaterializedPage {
                 ppn,
@@ -851,7 +1037,7 @@ impl PageContainer {
             }),
             Ok(None) => {
                 drop(map_pin);
-                match self.materialize_existing_page(page, access, newly_installed) {
+                match self.materialize_existing_page(page, access, false) {
                     Ok(page) => StepOutcome::Done(page),
                     Err(error) => StepOutcome::Err(page_cache_error_to_errno(error).into()),
                 }

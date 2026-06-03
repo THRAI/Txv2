@@ -29,7 +29,21 @@ impl PageCacheIndex {
 
 impl PageContainer {
     fn withdraw_cached_pages_from(&self, first: PageIndex) {
-        self.state.lock().pages.withdraw_from(first);
+        let notify_ready: Vec<notification::PageReadyNotifier> = {
+            let mut state = self.state.lock();
+            state.pages.withdraw_from(first);
+            state
+                .in_flight_file_pages
+                .split_off(&first)
+                .into_iter()
+                .filter_map(|(page, fetch)| {
+                    Self::retire_file_page_fetch_wait(&mut state, page, fetch)
+                })
+                .collect()
+        };
+        for notifier in notify_ready {
+            notification::notify_page_ready(&notifier);
+        }
     }
 
     fn dirty_pages_snapshot(&self) -> Vec<(PageIndex, Ppn)> {
@@ -386,8 +400,8 @@ mod v3_tests {
     use crate::execution::{Errno as V4Errno, WaitToken};
     use crate::mount::{DevId, MountOptions, MountPayload, MountPayloadPin, SourceLabel};
     use crate::page_backed::{
-        allocate_cached_frame, AnonSwapPolicy, CachedFrame, PageContainer, PageContainerKind,
-        PageIndex,
+        AnonSwapPolicy, CachedFrame, PageContainer, PageContainerKind, PageIndex,
+        allocate_cached_frame,
     };
     use crate::test_support::EPOCH_TEST_LOCK;
     use crate::vfs::{Credential, DirCursor, DirEntry, FsObjectId, InodeKind, InodeMeta};

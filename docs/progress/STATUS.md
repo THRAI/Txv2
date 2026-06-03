@@ -1,3 +1,15 @@
+- 2026-06-03 **PageBacked file-page misses now join overlapping fetches.**
+  Added a per-page in-flight file-fetch record with an owner token and
+  PageBacked-owned retry wait source. Reentrant/concurrent misses now join the
+  owner fetch instead of issuing duplicate `FsPageBacking::fetch_page` calls;
+  owner yield/error/truncate clears the in-flight slot and wakes joiners, while
+  stale owner publication after truncate returns `EAGAIN` instead of installing
+  a withdrawn page. Verification: `cargo test -p tx-subsystems file_page_ --
+  --nocapture`, `cargo test -p tx-subsystems page_backed -- --nocapture`,
+  `cargo check -p tx-subsystems -q`, scoped `rustfmt --edition 2024 --check`,
+  and scoped `git diff --check` passed. Next step: add the bdev-fs
+  PageContainer routing correctness test before wider filesystem SMP migration.
+
 - 2026-06-03 **PageBacked materialization state-lock service shrunk.**
   Moved cold anon/file page frame allocation and `MapPin` acquisition out of
   the `PageContainer.state` critical section. Hot cached materialization now
