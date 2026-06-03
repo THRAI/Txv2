@@ -24,6 +24,21 @@
   step: continue the filesystem SMP gap plan with the next PageBacked-facing
   backend correctness slice.
 
+- 2026-06-03 **VFS positive dcache now covers regular-file dentries.**
+  The walker no longer filters cached child dentries to directories and now
+  caches every successfully materialised positive child dentry, matching the
+  `VFS_CHECKS_V2.1.md` named-component cache model. Added a red/green walker
+  regression where two walks of `/file` previously repeated backend
+  lookup/meta/materialise work (`(2, 2, 2)` instead of `(1, 1, 1)`) and now hit
+  the parent-local dcache on the second walk. Verification: `cargo test -p
+  tx-subsystems step_walk_caches_regular_file_positive_lookup -- --nocapture`,
+  `cargo test -p tx-subsystems step_walk -- --nocapture`, `cargo check -p
+  tx-subsystems -q`, scoped `rustfmt --edition 2024 --check`, scoped `git diff
+  --check`, `cargo xtask progress validate`, and `cargo xtask lint docs`
+  passed. Next step: continue the filesystem SMP gap plan with measured
+  warm-walk `IdentRef`/dcache contention before broader cache invalidation or
+  negative-cache policy changes.
+
 - 2026-06-03 **PageBacked materialization state-lock service shrunk.**
   Moved cold anon/file page frame allocation and `MapPin` acquisition out of
   the `PageContainer.state` critical section. Hot cached materialization now
