@@ -54,8 +54,8 @@ pub use bitmap_backend::BitmapPageAllocator;
 pub use diagnostics::{AllocatorBackendKind, AllocatorDiagnostics};
 pub use frame_meta::FrameMeta;
 pub use tokens::{
-    CachePin, DeviceFrame, DmaPin, FrameReservation, FrameRunReservation, MapPin, MapPinRun,
-    OwnedFrame, OwnedFrameRun, OwnedFrameRunIter, PermanentFrame, PtFrame,
+    CachePin, DeviceFrame, DmaPin, FrameReservation, FrameRunReservation, GiftPin, MapPin,
+    MapPinRun, OwnedFrame, OwnedFrameRun, OwnedFrameRunIter, PermanentFrame, PtFrame,
 };
 
 /// Allocation failures surfaced by the page allocator.
@@ -199,6 +199,14 @@ pub trait PageAllocator: Sized {
     fn release_dma_pin(&self, ppn: Ppn);
 
     #[doc(hidden)]
+    /// Acquire retained-frame transfer evidence for a live frame.
+    fn acquire_gift_pin(&self, ppn: Ppn) -> Result<(), AllocError>;
+
+    #[doc(hidden)]
+    /// Release retained-frame transfer evidence and free if the whole state reaches zero.
+    fn release_gift_pin(&self, ppn: Ppn);
+
+    #[doc(hidden)]
     /// Release generic owned-frame refcount.
     fn release_owned(&self, ppn: Ppn);
 
@@ -336,6 +344,19 @@ pub fn acquire_dma_pin(
     let allocator = installed_bitmap_allocator()?;
     allocator.acquire_dma_pin(ppn)?;
     Ok(DmaPin::new(allocator, ppn))
+}
+
+/// Acquire user-page-transfer evidence for an already-live frame.
+///
+/// VM uses this after materializing an eligible user page and before publishing
+/// a `UserPageGift` pipe descriptor. The returned token owns a retained
+/// `refcount` contribution and releases it on drop.
+pub fn acquire_gift_pin(
+    ppn: Ppn,
+) -> Result<GiftPin<'static, BitmapPageAllocator<'static>>, AllocError> {
+    let allocator = installed_bitmap_allocator()?;
+    allocator.acquire_gift_pin(ppn)?;
+    Ok(GiftPin::new(allocator, ppn))
 }
 
 /// Copy the full contents of one frame to another through the installed direct-map hook.

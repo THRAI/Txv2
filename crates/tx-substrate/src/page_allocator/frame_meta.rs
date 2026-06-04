@@ -163,6 +163,10 @@ impl FrameMeta {
         self.decrement_counter(REFCOUNT_SHIFT, REFCOUNT_MASK, REFCOUNT_ONE)
     }
 
+    pub(crate) fn increment_refcount(&self) -> Result<(), AllocError> {
+        self.increment_counter(REFCOUNT_SHIFT, REFCOUNT_MASK, REFCOUNT_ONE, true)
+    }
+
     pub(crate) fn increment_map_count(&self) -> Result<(), AllocError> {
         self.increment_counter(MAP_COUNT_SHIFT, MAP_COUNT_MASK, MAP_COUNT_ONE, true)
     }

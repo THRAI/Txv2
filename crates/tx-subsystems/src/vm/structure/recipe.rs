@@ -93,6 +93,7 @@ static DEFERRED_RECIPE_RECLAIMS: VmSpinMutex<DeferredRecipeReclaimQueue> = vm_sp
 const VM_RECIPE_PUBLISH_SHAPE_METRICS: bool = cfg!(tx_vm_recipe_publish_shape_metrics);
 const VM_RECIPE_RECLAIM_SHAPE_METRICS: bool = cfg!(tx_vm_recipe_reclaim_shape_metrics);
 const VM_RECIPE_NODE_ALLOC_METRICS: bool = cfg!(tx_vm_recipe_node_alloc_metrics);
+const VM_RECIPE_PHASE_METRICS: bool = cfg!(tx_vm_recipe_phase_metrics);
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(in crate::vm) struct RecipeDebugTotals {
@@ -145,6 +146,8 @@ struct RecipeRewriteResult {
     touched_entries: usize,
     old_tree: Option<*mut RecipeTree>,
     publish_debug: Option<RecipePublishDebug>,
+    rewrite_ns: Option<u64>,
+    publish_ns: Option<u64>,
 }
 
 /// Authoritative recipe range index.
@@ -219,9 +222,13 @@ impl RecipeIndex {
             -> Result<(RecipeTree, usize, AddressSpaceStatsDelta, usize), VmMapError>,
     {
         if tx_observe::current().is_none() {
+            let rewrite_start = recipe_phase_clock_now();
             let (rewritten, changed_pages, stats_delta, touched_entries) = rewrite(current)?;
+            let rewrite_ns = recipe_phase_elapsed(rewrite_start);
             let leaf_splits = LAST_PUBLISH_LEAF_SPLITS.load(Ordering::Acquire);
+            let publish_start = recipe_phase_clock_now();
             let old_tree = self.publish(rewritten, touched_entries, leaf_splits);
+            let publish_ns = recipe_phase_elapsed(publish_start);
             return Ok(RecipeRewriteResult {
                 commit: VmMapCommit {
                     changed_pages,
@@ -230,6 +237,8 @@ impl RecipeIndex {
                 touched_entries,
                 old_tree,
                 publish_debug: None,
+                rewrite_ns,
+                publish_ns,
             });
         }
 
@@ -246,7 +255,9 @@ impl RecipeIndex {
                 .load(Ordering::Relaxed)
                 .saturating_sub(before_chunks);
         let after_len = rewritten.len();
+        let publish_start = recipe_phase_clock_now();
         let old_tree = self.publish(rewritten, touched_entries, node_allocs);
+        let publish_ns = recipe_phase_elapsed(publish_start);
         Ok(RecipeRewriteResult {
             commit: VmMapCommit {
                 changed_pages,
@@ -263,6 +274,8 @@ impl RecipeIndex {
                 node_allocs,
                 duration_ns,
             }),
+            rewrite_ns: Some(duration_ns),
+            publish_ns,
         })
     }
 
@@ -371,10 +384,16 @@ impl RecipeIndex {
     }
 
     fn finish_rewrite(result: RecipeRewriteResult) -> VmMapCommit {
+        emit_recipe_phase_duration(b"debug.vm.recipe.phase.rewrite_ns", result.rewrite_ns);
+        emit_recipe_phase_duration(b"debug.vm.recipe.phase.publish_swap_ns", result.publish_ns);
+        let debug_start = recipe_phase_clock_now();
         if let Some(debug) = result.publish_debug {
             emit_recipe_publish_debug(&debug, result.old_tree.is_some());
         }
+        emit_recipe_phase_duration_start(b"debug.vm.recipe.phase.debug_emit_ns", debug_start);
+        let retire_start = recipe_phase_clock_now();
         Self::retire_published_tree(result.old_tree);
+        emit_recipe_phase_duration_start(b"debug.vm.recipe.phase.retire_enqueue_ns", retire_start);
         result.commit
     }
 
@@ -383,7 +402,12 @@ impl RecipeIndex {
             // SAFETY: every reader holds an epoch guard issued before its
             // load; EBR delays reclamation until those guards drop. Once
             // drained, `reclaim_recipe_tree` runs and frees the box.
-            let _ = unsafe { epoch::retire_raw(old_ptr as *mut u8, reclaim_recipe_tree) };
+            let result = unsafe { epoch::retire_raw(old_ptr as *mut u8, reclaim_recipe_tree) };
+            if result.is_ok() {
+                emit_recipe_phase_count(b"debug.vm.recipe.phase.retire_queued", 1);
+            } else {
+                emit_recipe_phase_count(b"debug.vm.recipe.phase.retire_error", 1);
+            }
         }
     }
 
@@ -424,7 +448,9 @@ impl RecipeIndex {
         placement: MapPlacement,
     ) -> Result<VmMapCommit, VmMapError> {
         let result: Result<RecipeRewriteResult, VmMapError> = {
+            let lock_start = recipe_phase_clock_now();
             let _writer = self.mutation.lock();
+            emit_recipe_phase_duration_start(b"debug.vm.recipe.phase.lock_wait_ns", lock_start);
             // SAFETY: writer lock held, so under_writer_lock's borrow is sound.
             let current = unsafe { self.under_writer_lock() };
             match placement {
@@ -449,7 +475,9 @@ impl RecipeIndex {
 
     pub(in crate::vm) fn unmap(&self, range: UserRange) -> Result<VmMapCommit, VmMapError> {
         let result: Result<RecipeRewriteResult, VmMapError> = {
+            let lock_start = recipe_phase_clock_now();
             let _writer = self.mutation.lock();
+            emit_recipe_phase_duration_start(b"debug.vm.recipe.phase.lock_wait_ns", lock_start);
             let current = unsafe { self.under_writer_lock() };
             self.rewrite_with_debug(RecipePublishOp::Unmap, current, |current| {
                 rewrite_unmap(current, range)
@@ -465,7 +493,9 @@ impl RecipeIndex {
     ) -> Result<VmMapCommit, VmMapError> {
         emit_vm_recipe_trace(b"debug.vm.recipe.protect.phase", 0);
         let result: Result<RecipeRewriteResult, VmMapError> = {
+            let lock_start = recipe_phase_clock_now();
             let _writer = self.mutation.lock();
+            emit_recipe_phase_duration_start(b"debug.vm.recipe.phase.lock_wait_ns", lock_start);
             emit_vm_recipe_trace(b"debug.vm.recipe.protect.phase", 1);
             let current = unsafe { self.under_writer_lock() };
             self.rewrite_with_debug(RecipePublishOp::Protect, current, |current| {
@@ -494,7 +524,9 @@ impl RecipeIndex {
         locked: bool,
     ) -> Result<VmMapCommit, VmMapError> {
         let result: Result<RecipeRewriteResult, VmMapError> = {
+            let lock_start = recipe_phase_clock_now();
             let _writer = self.mutation.lock();
+            emit_recipe_phase_duration_start(b"debug.vm.recipe.phase.lock_wait_ns", lock_start);
             let current = unsafe { self.under_writer_lock() };
             self.rewrite_with_debug(RecipePublishOp::Locked, current, |current| {
                 rewrite_locked(current, range, locked)
@@ -511,7 +543,9 @@ impl RecipeIndex {
         destination: MapPlacement,
     ) -> Result<VmMapCommit, VmMapError> {
         let result: Result<RecipeRewriteResult, VmMapError> = {
+            let lock_start = recipe_phase_clock_now();
             let _writer = self.mutation.lock();
+            emit_recipe_phase_duration_start(b"debug.vm.recipe.phase.lock_wait_ns", lock_start);
             let current = unsafe { self.under_writer_lock() };
             let op = match placement {
                 VmRemapPlacement::Move => RecipePublishOp::RemapMove,
@@ -529,7 +563,9 @@ impl RecipeIndex {
 
     pub(in crate::vm) fn replace_entry(&self, entry: VmEntry) -> Result<VmMapCommit, VmMapError> {
         let result: Result<RecipeRewriteResult, VmMapError> = {
+            let lock_start = recipe_phase_clock_now();
             let _writer = self.mutation.lock();
+            emit_recipe_phase_duration_start(b"debug.vm.recipe.phase.lock_wait_ns", lock_start);
             let current = unsafe { self.under_writer_lock() };
             self.rewrite_with_debug(RecipePublishOp::ReplaceEntry, current, |current| {
                 let (rewritten, touched_entries) = current.replace_exact(entry)?;
@@ -562,7 +598,9 @@ impl RecipeIndex {
         tag: UfdRegistration,
     ) -> Result<VmMapCommit, VmMapError> {
         let result: Result<RecipeRewriteResult, VmMapError> = {
+            let lock_start = recipe_phase_clock_now();
             let _writer = self.mutation.lock();
+            emit_recipe_phase_duration_start(b"debug.vm.recipe.phase.lock_wait_ns", lock_start);
             let current = unsafe { self.under_writer_lock() };
             self.rewrite_with_debug(RecipePublishOp::UfdTag, current, |current| {
                 rewrite_tag_ufd_registration(current, range, tag)
@@ -578,23 +616,32 @@ unsafe fn reclaim_recipe_tree(ptr: *mut u8) {
 
 fn enqueue_deferred_recipe_reclaim(ptr: *mut RecipeTree) {
     let tree = DeferredRecipeTree(ptr);
+    let enqueue_start = recipe_phase_clock_now();
     let fallback = {
         let mut queue = DEFERRED_RECIPE_RECLAIMS.lock();
         match queue.push(tree) {
             Ok(()) => {
                 RECIPE_DEFERRED_RECLAIM_ENQUEUED.fetch_add(1, Ordering::Relaxed);
+                emit_recipe_phase_duration_start(
+                    b"debug.vm.recipe.phase.deferred_enqueue_ns",
+                    enqueue_start,
+                );
+                emit_recipe_phase_count(b"debug.vm.recipe.phase.deferred_enqueued", 1);
                 return;
             }
             Err(tree) => tree,
         }
     };
+    emit_recipe_phase_duration_start(b"debug.vm.recipe.phase.deferred_enqueue_ns", enqueue_start);
 
     RECIPE_DEFERRED_RECLAIM_INLINE_FALLBACK.fetch_add(1, Ordering::Relaxed);
+    emit_recipe_phase_count(b"debug.vm.recipe.phase.inline_fallback", 1);
     // SAFETY: the queue was full, so ownership remains with this fallback path.
     unsafe { perform_recipe_tree_reclaim(fallback.0) };
 }
 
 pub(in crate::vm) fn drain_deferred_recipe_reclaims(limit: usize) -> usize {
+    let drain_start = recipe_phase_clock_now();
     let mut drained = 0usize;
     while drained < limit {
         let next = {
@@ -609,8 +656,10 @@ pub(in crate::vm) fn drain_deferred_recipe_reclaims(limit: usize) -> usize {
         unsafe { perform_recipe_tree_reclaim(tree.0) };
         drained += 1;
     }
+    emit_recipe_phase_duration_start(b"debug.vm.recipe.phase.deferred_drain_ns", drain_start);
     if drained != 0 {
         RECIPE_DEFERRED_RECLAIM_DRAINED.fetch_add(drained, Ordering::Relaxed);
+        emit_recipe_phase_count(b"debug.vm.recipe.phase.deferred_drained", drained as u64);
         if VM_RECIPE_RECLAIM_SHAPE_METRICS {
             emit_vm_recipe_trace(b"debug.vm.recipe.reclaim_deferred.drained", drained as i64);
         }
@@ -641,6 +690,7 @@ unsafe fn perform_recipe_tree_reclaim(ptr: *mut RecipeTree) {
     // SAFETY: `ptr` was last published from `Box::into_raw(Box::new(_))`.
     let _ = unsafe { Box::from_raw(ptr as *mut RecipeTree) };
     let duration_ns = tx_observe::clock_now_ns().saturating_sub(start_ns);
+    emit_recipe_phase_count(b"debug.vm.recipe.phase.reclaim_drop_ns", duration_ns);
     record_recipe_reclaim_debug(duration_ns, node_count);
     emit_vm_recipe_trace(
         b"debug.vm.recipe.reclaim_tree.duration_ns",
@@ -1570,6 +1620,47 @@ fn emit_vm_recipe_trace(name: &[u8], value: i64) {
         observer.counter(
             tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
             value,
+        );
+    }
+}
+
+#[inline(always)]
+fn recipe_phase_metrics_enabled() -> bool {
+    VM_RECIPE_PHASE_METRICS && tx_observe::current().is_some()
+}
+
+#[inline(always)]
+fn recipe_phase_clock_now() -> Option<u64> {
+    if recipe_phase_metrics_enabled() {
+        Some(tx_observe::clock_now_ns())
+    } else {
+        None
+    }
+}
+
+fn recipe_phase_elapsed(start: Option<u64>) -> Option<u64> {
+    start.map(|start| tx_observe::clock_now_ns().saturating_sub(start))
+}
+
+fn emit_recipe_phase_duration(name: &[u8], duration: Option<u64>) {
+    let Some(duration) = duration else {
+        return;
+    };
+    emit_recipe_phase_count(name, duration);
+}
+
+fn emit_recipe_phase_duration_start(name: &[u8], start: Option<u64>) {
+    emit_recipe_phase_duration(name, recipe_phase_elapsed(start));
+}
+
+fn emit_recipe_phase_count(name: &[u8], value: u64) {
+    if !recipe_phase_metrics_enabled() {
+        return;
+    }
+    if let Some(observer) = tx_observe::current() {
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            value as i64,
         );
     }
 }

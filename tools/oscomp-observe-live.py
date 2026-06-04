@@ -9,6 +9,7 @@ tx-observe rings to raw records, and export analyzer Parquet tables.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import signal
@@ -26,6 +27,7 @@ DEFAULT_SMP = 4
 DEFAULT_RAM_SIZE = "1G"
 DEFAULT_RING_BYTES = 2 * 1024 * 1024
 DEFAULT_POLL_MS = 1
+LOCK_FILENAME = ".observe-live.lock"
 LIBCBENCH_TEST_SELECTIONS = {
     "pthread": "pthread",
     "pthread-serial1": "pthread-serial1",
@@ -98,6 +100,73 @@ class WorkflowPlan:
     commands: list[PlannedCommand]
 
 
+class TargetRunLock:
+    """Non-blocking per-output-dir guard for live observe runs."""
+
+    def __init__(self, layout: WorkflowLayout) -> None:
+        self.layout = layout
+        self.path = layout.base / LOCK_FILENAME
+        self.fd: int | None = None
+
+    def __enter__(self) -> "TargetRunLock":
+        self.layout.base.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            detail = read_lock_detail(self.path)
+            os.close(fd)
+            suffix = f": {detail}" if detail else ""
+            raise RuntimeError(
+                f"observe-live target already has an active run: {self.layout.base}{suffix}"
+            ) from exc
+        except Exception:
+            os.close(fd)
+            raise
+
+        self.fd = fd
+        payload = {
+            "schema": "tx-oscomp-observe-live-lock-v0",
+            "pid": os.getpid(),
+            "target": str(self.layout.base),
+            "started_unix_ms": int(time.time() * 1000),
+        }
+        encoded = (json.dumps(payload, sort_keys=True) + "\n").encode()
+        os.ftruncate(fd, 0)
+        os.write(fd, encoded)
+        os.fsync(fd)
+        return self
+
+    def __exit__(self, _exc_type, _exc, _tb) -> None:
+        if self.fd is None:
+            return
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+        finally:
+            os.close(self.fd)
+            self.fd = None
+
+
+def read_lock_detail(path: Path) -> str:
+    try:
+        raw = path.read_text().strip()
+    except OSError:
+        return ""
+    if not raw:
+        return ""
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+    pid = payload.get("pid")
+    started = payload.get("started_unix_ms")
+    if pid is None:
+        return raw
+    if started is None:
+        return f"pid={pid}"
+    return f"pid={pid}, started_unix_ms={started}"
+
+
 def select_libcbench_test(name: str) -> str:
     try:
         return LIBCBENCH_TEST_SELECTIONS[name]
@@ -166,7 +235,7 @@ def qemu_command(layout: WorkflowLayout, args: WorkflowArgs) -> list[str]:
 
 def build_plan(root: Path, args: WorkflowArgs, layout: WorkflowLayout) -> WorkflowPlan:
     custom_run = [
-        "python3",
+        sys.executable,
         str(root / "tools/oscomp-custom-run.py"),
         "--libcbench",
         "--libcbench-only",
@@ -262,10 +331,8 @@ def build_plan(root: Path, args: WorkflowArgs, layout: WorkflowLayout) -> Workfl
 
 def analyze_command(layout: WorkflowLayout, python_file: Path | None) -> list[str]:
     cmd = [
-        "cargo",
-        "xtask",
-        "observe",
-        "analyze",
+        sys.executable,
+        str(ROOT / "tools/tx-observe-analyze.py"),
         "--rawrecords",
         str(layout.rawrecords),
         "--names",
@@ -307,21 +374,22 @@ def run_workflow(root: Path, args: WorkflowArgs) -> WorkflowLayout:
             print(f"{command.label}: " + " ".join(command.argv))
         return layout
 
-    prepare_dirs(layout)
-    qemu_idx = next(
-        (idx for idx, command in enumerate(plan.commands) if command.label == "qemu"),
-        None,
-    )
-    if qemu_idx is None:
-        raise RuntimeError("internal error: workflow plan has no qemu stage")
-    for command in plan.commands[:qemu_idx]:
-        run_command(command, cwd=root)
+    with TargetRunLock(layout):
+        prepare_dirs(layout)
+        qemu_idx = next(
+            (idx for idx, command in enumerate(plan.commands) if command.label == "qemu"),
+            None,
+        )
+        if qemu_idx is None:
+            raise RuntimeError("internal error: workflow plan has no qemu stage")
+        for command in plan.commands[:qemu_idx]:
+            run_command(command, cwd=root)
 
-    run_qemu_with_drain(root, layout, plan.commands[qemu_idx], plan.commands[qemu_idx + 1], args.timeout)
-    run_command(plan.commands[qemu_idx + 2], cwd=root, stdout_path=layout.analyze_txt)
-    write_report(layout, args)
-    if not args.keep_guest_mem:
-        layout.guest_mem.unlink(missing_ok=True)
+        run_qemu_with_drain(root, layout, plan.commands[qemu_idx], plan.commands[qemu_idx + 1], args.timeout)
+        run_command(plan.commands[qemu_idx + 2], cwd=root, stdout_path=layout.analyze_txt)
+        write_report(layout, args)
+        if not args.keep_guest_mem:
+            layout.guest_mem.unlink(missing_ok=True)
     return layout
 
 

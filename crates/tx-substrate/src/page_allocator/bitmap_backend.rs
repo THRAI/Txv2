@@ -515,6 +515,18 @@ impl PageAllocator for BitmapPageAllocator<'_> {
         self.release_when_zero(ppn, state_after);
     }
 
+    fn acquire_gift_pin(&self, ppn: Ppn) -> Result<(), AllocError> {
+        self.meta(ppn).increment_refcount()
+    }
+
+    fn release_gift_pin(&self, ppn: Ppn) {
+        let state_after = self
+            .meta(ppn)
+            .decrement_refcount()
+            .expect("gift pin release must match an acquired gift pin");
+        self.release_when_zero(ppn, state_after);
+    }
+
     fn release_owned(&self, ppn: Ppn) {
         let state_after = self
             .meta(ppn)

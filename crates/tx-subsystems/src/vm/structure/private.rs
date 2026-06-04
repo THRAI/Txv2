@@ -293,6 +293,37 @@ impl PrivatePageTree {
         })
     }
 
+    fn remove_if_match(
+        &self,
+        key: VmPageOff,
+        expected: PrivateFrameIdentity,
+    ) -> Result<(Self, PrivateFrameSnapshot), PrivatePageError> {
+        let Some(existing) = self.lookup(key) else {
+            return Err(PrivatePageError::Missing);
+        };
+        if existing.ppn != expected.ppn || existing.state() != expected.state {
+            return Err(PrivatePageError::Conflict {
+                current: snapshot_from_frame(&existing),
+            });
+        }
+
+        let mut touched = 0usize;
+        let mut removed = None;
+        let root = remove_private_node(self.root.clone(), key, &mut removed, &mut touched);
+        debug_assert!(removed.is_some());
+        let snap = removed
+            .as_ref()
+            .map(|frame| snapshot_from_frame(frame))
+            .expect("removed private frame");
+        Ok((
+            Self {
+                root,
+                len: self.len.saturating_sub(1),
+            },
+            snap,
+        ))
+    }
+
     fn drain_range(&self, start: VmPageOff, end: VmPageOff) -> Self {
         let mut touched = 0usize;
         let (left, at_or_after_start) =
@@ -987,6 +1018,38 @@ impl PrivatePageSet {
         let next = pages.replace_exact(self.key_for(off), expected, new)?;
         *pages = next;
         Ok(snap)
+    }
+
+    /// Remove an exact private frame when the caller has already
+    /// acquired replacement lifetime evidence for the frame.
+    pub fn take_if_match(
+        &self,
+        off: VmPageOff,
+        expected: PrivateFrameIdentity,
+    ) -> Result<PrivateFrameSnapshot, PrivatePageError> {
+        let mut pages = self.pages.lock();
+        let (next, snap) = pages.remove_if_match(self.key_for(off), expected)?;
+        *pages = next;
+        Ok(snap)
+    }
+
+    /// Demote an exact private frame to SharedCow so future writes copy.
+    pub fn demote_if_match(
+        &self,
+        off: VmPageOff,
+        expected: PrivateFrameIdentity,
+    ) -> Result<PrivateFrameSnapshot, PrivatePageError> {
+        let pages = self.pages.lock();
+        let Some(existing) = pages.lookup(self.key_for(off)) else {
+            return Err(PrivatePageError::Missing);
+        };
+        if existing.ppn != expected.ppn || existing.state() != expected.state {
+            return Err(PrivatePageError::Conflict {
+                current: snapshot_from_frame(&existing),
+            });
+        }
+        existing.set_state(PrivateFrameState::SharedCow);
+        Ok(snapshot_from_frame(&existing))
     }
 
     /// Drop entries whose offsets fall in `[range_start_off, range_end_off)`.

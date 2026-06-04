@@ -12,6 +12,7 @@ use alloc::vec::Vec;
 pub mod adapter;
 pub mod checks;
 pub mod execution;
+mod gift;
 mod lock_metrics;
 pub mod notification;
 mod pmap;
@@ -34,22 +35,25 @@ pub use execution::{
     MadviseAdvice, MapReservation, MapReserveResult, NullUfdDispatch, UfdDispatch,
     UfdDispatchTarget,
 };
+pub use gift::{
+    classify_user_gift_page, GiftBatch, UserGiftEligibility, UserGiftFallbackReason,
+    UserGiftIovError, UserGiftIovPlan, UserPageGift, UserPageGiftFreeze, UserPageGiftSource,
+};
 pub use pmap::{PmapMappingSnapshot, PmapPublishOutcome, PmapStats, VmPmapError};
 pub use scripts::{
-    BssTail, ImagePlan, LoadSegment, ScriptError, SegmentFlags, USER_STACK_INITIAL_RESERVATION,
-    USER_STACK_TOP_DEFAULT, build_aspace_from_image, populate_detached_user_range,
+    build_aspace_from_image, populate_detached_user_range, BssTail, ImagePlan, LoadSegment,
+    ScriptError, SegmentFlags, USER_STACK_INITIAL_RESERVATION, USER_STACK_TOP_DEFAULT,
 };
 pub use structure::{
-    AccessMode, AcquirePairResult, AcquireResult, AddressSpace, AddressSpaceStats,
-    FULL_USER_V1_TOP, LockMode, MapPlacement, PendingWriter, PrivateFrame, PrivateFrameIdentity,
-    PrivateFrameSnapshot, PrivateFrameState, PrivatePageError, PrivatePageSet, Prot,
-    RANGE_LOCK_RELEASE_MASK, RangeGuard, RangeGuardPair, RangeLock, USER_PAGE_SIZE,
-    UfdRegistration, UserPage, UserPageIter, UserRange, UserRangeError, UserVirtAddr, VmBacking,
-    VmCap, VmEntry, VmEntryBacking, VmEntryError, VmEntryFlags, VmEntryProtectRewrite,
+    AccessMode, AcquirePairResult, AcquireResult, AddressSpace, AddressSpaceStats, LockMode,
+    MapPlacement, PendingWriter, PrivateFrame, PrivateFrameIdentity, PrivateFrameSnapshot,
+    PrivateFrameState, PrivatePageError, PrivatePageSet, Prot, RangeGuard, RangeGuardPair,
+    RangeLock, UfdRegistration, UserPage, UserPageIter, UserRange, UserRangeError, UserVirtAddr,
+    VmBacking, VmCap, VmEntry, VmEntryBacking, VmEntryError, VmEntryFlags, VmEntryProtectRewrite,
     VmEntryRewrite, VmFault, VmFaultError, VmFaultMaterialization, VmFaultMaterializationBacking,
     VmFaultMaterializationStep, VmFaultOutcome, VmMapCommit, VmMapError, VmMapOutcome,
     VmMapRequest, VmMapTarget, VmPageOff, VmRemapOutcome, VmRemapPlacement, VmRemapRequest,
-    WouldBlock,
+    WouldBlock, FULL_USER_V1_TOP, RANGE_LOCK_RELEASE_MASK, USER_PAGE_SIZE,
 };
 pub use user_access::UserAccessKind;
 

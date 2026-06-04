@@ -374,6 +374,7 @@ impl VmPmap {
     /// next access to the affected pages refaults, observes the new recipe
     /// protection, and republishes with the demoted permissions.
     pub fn teardown_range(&self, range: UserRange) -> Result<usize, VmPmapError> {
+        let total_start = pmap_map_path_clock_now();
         emit_pmap_teardown_trace(b"debug.vm.pmap.teardown.phase", 0);
         let mut removed = 0;
         let (start, end) = page_bounds_for_range(range);
@@ -382,10 +383,20 @@ impl VmPmap {
         } else {
             None
         };
+        let drain_start = pmap_map_path_clock_now();
         let (mappings, shifted) = {
             let mut state = self.state.lock();
             state.mappings.drain_range(start, end)
         };
+        emit_pmap_map_path_duration(b"debug.vm.map_path.pmap.teardown_drain_ns", drain_start);
+        emit_pmap_map_path_count(
+            b"debug.vm.map_path.pmap.teardown_removed_pages",
+            mappings.len() as u64,
+        );
+        emit_pmap_map_path_count(
+            b"debug.vm.map_path.pmap.teardown_shifted_entries",
+            shifted as u64,
+        );
         if let Some(remove_start_ns) = remove_start_ns {
             record_pmap_teardown_remove_debug(
                 tx_observe::clock_now_ns().saturating_sub(remove_start_ns),
@@ -399,13 +410,19 @@ impl VmPmap {
         let mut invalidations = Vec::new();
         let mut pins = Vec::new();
         let mut mappings = mappings.into_iter();
+        let loop_start = pmap_map_path_clock_now();
         while let Some((page, mapping)) = mappings.next() {
             emit_pmap_teardown_trace(b"debug.vm.pmap.teardown.phase", 2);
             emit_pmap_teardown_trace(b"debug.vm.pmap.teardown.phase", 3);
 
+            let unmap_start = pmap_map_path_clock_now();
             let result = match self.unmap_tracked_page(page, mapping.ppn) {
                 Ok(result) => result,
                 Err(error) => {
+                    emit_pmap_map_path_duration(
+                        b"debug.vm.map_path.pmap.teardown_hal_unmap_ns",
+                        unmap_start,
+                    );
                     let mut state = self.state.lock();
                     state.mappings.insert(page, mapping);
                     for (remaining_page, remaining_mapping) in mappings {
@@ -416,14 +433,25 @@ impl VmPmap {
                     return Err(error);
                 }
             };
+            emit_pmap_map_path_duration(
+                b"debug.vm.map_path.pmap.teardown_hal_unmap_ns",
+                unmap_start,
+            );
             emit_pmap_teardown_trace(b"debug.vm.pmap.teardown.phase", 4);
             invalidations.push(result.invalidation());
             pins.push(mapping.into_pin());
             emit_pmap_teardown_trace(b"debug.vm.pmap.teardown.phase", 5);
             removed += 1;
         }
+        emit_pmap_map_path_duration(b"debug.vm.map_path.pmap.teardown_loop_ns", loop_start);
+        let shootdown_start = pmap_map_path_clock_now();
         self.issue_unmap_batch(&mut invalidations, &mut pins);
+        emit_pmap_map_path_duration(
+            b"debug.vm.map_path.pmap.teardown_shootdown_ns",
+            shootdown_start,
+        );
         emit_pmap_teardown_trace(b"debug.vm.pmap.teardown.phase", 6);
+        emit_pmap_map_path_duration(b"debug.vm.map_path.pmap.teardown_total_ns", total_start);
         Ok(removed)
     }
 
@@ -476,6 +504,37 @@ impl VmPmap {
         }
 
         Ok(protected)
+    }
+
+    /// Remove one tracked mapping after the caller has acquired transfer
+    /// evidence for the mapped frame.
+    ///
+    /// This is the page-gift counterpart to `teardown_range`: it verifies the
+    /// resident mapping still names `expected_ppn`, removes the HAL PTE, issues
+    /// the ASID-scoped shootdown, then drops the old `MapPin`.
+    pub(in crate::vm) fn remove_page_for_gift(
+        &self,
+        page: UserPage,
+        expected_ppn: Ppn,
+    ) -> Result<bool, VmPmapError> {
+        let Some(mapping) = self.state.lock().mappings.remove(&page) else {
+            return Ok(false);
+        };
+        if mapping.ppn != expected_ppn {
+            self.state.lock().mappings.insert(page, mapping);
+            return Err(VmPmapError::MappingMismatch);
+        }
+
+        let result = match self.unmap_tracked_page(page, expected_ppn) {
+            Ok(result) => result,
+            Err(error) => {
+                self.state.lock().mappings.insert(page, mapping);
+                return Err(error);
+            }
+        };
+        self.issue_single_unmap_result(result, mapping.into_pin());
+        self.state.lock().shootdowns += 1;
+        Ok(true)
     }
 
     fn root(&self) -> &PmapRoot {
@@ -702,6 +761,40 @@ fn emit_pmap_teardown_trace(name: &[u8], value: i64) {
         observer.counter(
             tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
             value,
+        );
+    }
+}
+
+#[inline(always)]
+fn pmap_map_path_metrics_enabled() -> bool {
+    cfg!(tx_vm_map_path_metrics) && tx_observe::current().is_some()
+}
+
+#[inline(always)]
+fn pmap_map_path_clock_now() -> Option<u64> {
+    if pmap_map_path_metrics_enabled() {
+        Some(tx_observe::clock_now_ns())
+    } else {
+        None
+    }
+}
+
+fn emit_pmap_map_path_duration(name: &[u8], start: Option<u64>) {
+    let Some(start) = start else {
+        return;
+    };
+    let duration = tx_observe::clock_now_ns().saturating_sub(start);
+    emit_pmap_map_path_count(name, duration);
+}
+
+fn emit_pmap_map_path_count(name: &[u8], value: u64) {
+    if !pmap_map_path_metrics_enabled() {
+        return;
+    }
+    if let Some(observer) = tx_observe::current() {
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            value as i64,
         );
     }
 }

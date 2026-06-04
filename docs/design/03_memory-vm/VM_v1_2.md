@@ -1122,6 +1122,70 @@ Thundering-herd on release. Acceptable for expected contention profiles. Upgrade
 
 Not promoted to substrate. Other subsystems don't currently need range-based coordination. If a future subsystem does, the RangeLock pattern can be generalized — but the implementation should live with its primary consumer, not abstracted prematurely.
 
+### 9.12 User-page gifts for `vmsplice`
+<!-- txdoc:VM-9-12-USER-PAGE-GIFTS-FOR-VMSPLICE -->
+
+`vmsplice(SPLICE_F_GIFT)` needs page-granular transfer without changing VM's
+authoritative granularity. The VM contract is therefore a materialized transfer
+token:
+
+```rust
+pub struct UserPageGift { /* VM-private fields */ }
+pub struct GiftBatch { /* ordered full-page gifts plus copied tails */ }
+
+pub enum UserPageGiftFreeze {
+    DetachedPrivate,
+    DemotedCow,
+}
+```
+
+`UserPageGift` is not a `VmEntry`, not a page object, and not a page-level
+authoritative binding. It is linear evidence that a VM operation observed an
+eligible user page, materialized it to a frame, acquired substrate transfer
+retention for that frame, and revoked or demoted the old writable user
+materialization before publishing the token to a pipe descriptor.
+
+The VM primitive is:
+
+```rust
+pub fn gift_user_pages_step(
+    aspace: Cap<AddressSpace>,
+    iov: UserRange,
+    flags: GiftFlags,
+) -> StepOutcome<GiftBatch>;
+```
+
+The step obligations are:
+
+1. **Observe.** Validate the user range and split it into page-aligned units.
+   Unaligned heads/tails are reported to the caller for byte-copy fallback.
+2. **Acquire.** Take `RangeLock::Materializer` over each declared page range
+   that may be gifted. The reservation is still range-scoped; it does not
+   introduce a page lock or page-shaped VM binding.
+3. **Re-observe recipe.** Re-read the recipes BTree under the reservation. v1
+   eligibility is full-page aligned private anonymous or private CoW material
+   only. `MAP_SHARED`, device mappings, missing mappings, and unsupported
+   page-backed states are rejected for gift and handled by copy fallback.
+4. **Materialize.** Resolve the page to a concrete frame through the normal
+   fault/materialization path. If the step blocks, drop the reservation and
+   retry from observe on wake.
+5. **Reserve transfer evidence.** Acquire substrate `GiftPin` evidence for the
+   live frame. In the first implementation slice this is retained-frame
+   transfer evidence on `FrameMeta.refcount`, not DMA `pin_count`.
+6. **Freeze user ownership.** Remove or demote writable PTE materialization
+   before the token is visible outside VM. Private anonymous pages become
+   `DetachedPrivate`; private CoW sources become `DemotedCow`. Releasing the
+   token never restores the old writable PTE; a future user write refaults and
+   takes the normal CoW path.
+7. **Publish.** Return `UserPageGift` values to the syscall script. Pipe stores
+   them only as ordered descriptors. PageBacked is the consumer that installs
+   or copies the gifted frame into a destination `PageContainer`.
+
+This preserves the existing VM rule: recipes remain authoritative range
+bindings and PTEs remain derived materializations. Page gifting changes only the
+operation that prepares a transfer token; it does not make pages independently
+owned VM resources.
+
 ---
 
 ## 10. Summary

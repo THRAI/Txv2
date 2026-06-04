@@ -86,6 +86,10 @@ When bytes move:
   direct-map view);
 - page content is reached by asking PAGE_SUBSTRATE/VM helpers for a direct-map
   copy source/destination or by materializing a Frame for pmap installation;
+- gifted user pages arrive only as VM-produced `UserPageGift` tokens. The token
+  proves that VM has materialized the page, retained the frame with substrate
+  transfer evidence, and frozen the old writable user materialization before
+  PAGE_BACKED sees the frame;
 - device-backed page containers may carry device `Ppn` facts, but those facts
   remain mapping inputs, not allocator ownership or ordinary pointer authority.
 
@@ -864,6 +868,13 @@ transport; PageBacked owns page leases and install/copy policy. Common cases:
   the target page is absent, or copies into the resident destination frame when
   policy requires fallback. Ordinary anonymous pipe buffers and unaligned
   ranges use the byte-copy path.
+- **Gifted user page → Pipe → File (page-backed):** `vmsplice(SPLICE_F_GIFT)`
+  asks VM for `UserPageGift` tokens. Pipe stores those tokens as ordered
+  descriptor payloads; it does not inspect, freeze, or install the frame.
+  PageBacked consumes each token through
+  `PageContainer::install_user_gift_or_copy`: install the gifted frame into an
+  absent destination slot when policy permits, or copy into the resident
+  destination frame and drop the gift when policy requires fallback.
 - **File (page-backed) → Pipe:** full page-aligned file ranges export a
   PageBacked-owned `PageLease` and enqueue it as a pipe descriptor. Partial,
   unaligned, and unsupported ranges use the byte-copy path.
@@ -903,10 +914,13 @@ reserve all required capacity before publishing bytes. Notification/watchqueue
 pipes are a separate future pipe mode and do not share the byte-stream storage
 variants.
 
-**Tech debt:** `vmsplice(SPLICE_F_GIFT)` remains non-stealing until VM exposes
-a real user-page pin/adoption primitive. Tx may copy user iov bytes into pipe
-buffers, but must not advertise gifted user pages as stealable until the VM can
-prove userspace no longer owns the page and PageBacked/pipe owns release.
+`vmsplice(SPLICE_F_GIFT)` is stealable only after VM returns `UserPageGift`
+tokens per `VM_v1_2.md` `txdoc:VM-9-12-USER-PAGE-GIFTS-FOR-VMSPLICE`.
+Until that primitive is wired in code, the syscall may accept the flag as
+compatibility and copy user iov bytes into pipe buffers, but it must not
+advertise the copied buffers as gifted pages. Once wired, release ownership
+flows with the token: pipe drops the descriptor on ordinary stream discard, and
+PageBacked consumes it on install/copy completion.
 
 ### 9.2 sendfile
 <!-- txdoc:PAGE-BACKED-9-2-SENDFILE -->

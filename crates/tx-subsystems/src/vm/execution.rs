@@ -551,14 +551,20 @@ impl AddressSpace {
     }
 
     pub fn try_mmap(&self, request: VmMapRequest) -> Result<VmMapOutcome, VmMapError> {
+        let total_start = vm_map_path_clock_now();
         emit_vm_trace(b"debug.vm.mmap.enter", 0);
         let (range, placement) = match request.target {
             VmMapTarget::Anywhere { window, page_count } => {
                 emit_vm_trace(b"debug.vm.mmap.target", 0);
                 emit_vm_trace(b"debug.vm.mmap.pages", page_count as i64);
+                let search_start = vm_map_path_clock_now();
                 let range = self
                     .find_free_range_for_anywhere(window, page_count)
                     .ok_or(VmMapError::NoFreeRange)?;
+                emit_vm_map_path_duration(
+                    b"debug.vm.map_path.mmap.anywhere_search_ns",
+                    search_start,
+                );
                 (range, MapPlacement::RequireFree)
             }
             VmMapTarget::Fixed { range, placement } => {
@@ -574,10 +580,14 @@ impl AddressSpace {
         emit_vm_trace(b"debug.vm.mmap.placement", placement as i64);
         let entry = VmEntry::new(range, request.prot, request.flags, request.backing);
 
+        let reserve_start = vm_map_path_clock_now();
         match self.reserve_map(entry, placement) {
             MapReserveResult::Reserved(reservation) => {
+                emit_vm_map_path_duration(b"debug.vm.map_path.mmap.reserve_map_ns", reserve_start);
                 emit_vm_trace(b"debug.vm.mmap.reserved", 1);
+                let commit_start = vm_map_path_clock_now();
                 let commit = reservation.commit()?;
+                emit_vm_map_path_duration(b"debug.vm.map_path.mmap.commit_ns", commit_start);
                 emit_vm_trace(
                     b"debug.vm.mmap.committed_pages",
                     commit.changed_pages as i64,
@@ -586,10 +596,29 @@ impl AddressSpace {
                     self.next_mmap_search_start
                         .store(range.end().as_usize(), Ordering::Relaxed);
                 }
+                emit_vm_map_path_count(
+                    b"debug.vm.map_path.mmap.changed_pages",
+                    commit.changed_pages as u64,
+                );
+                emit_vm_map_path_duration(b"debug.vm.map_path.mmap.total_ns", total_start);
                 Ok(VmMapOutcome { range, commit })
             }
-            MapReserveResult::Blocked(_) => Err(VmMapError::WouldBlock),
-            MapReserveResult::Err(error) => Err(error),
+            MapReserveResult::Blocked(_) => {
+                emit_vm_map_path_duration(
+                    b"debug.vm.map_path.mmap.reserve_blocked_ns",
+                    reserve_start,
+                );
+                emit_vm_map_path_duration(b"debug.vm.map_path.mmap.total_ns", total_start);
+                Err(VmMapError::WouldBlock)
+            }
+            MapReserveResult::Err(error) => {
+                emit_vm_map_path_duration(
+                    b"debug.vm.map_path.mmap.reserve_error_ns",
+                    reserve_start,
+                );
+                emit_vm_map_path_duration(b"debug.vm.map_path.mmap.total_ns", total_start);
+                Err(error)
+            }
         }
     }
 
@@ -953,17 +982,35 @@ impl AddressSpace {
     }
 
     pub fn try_munmap(&self, range: UserRange) -> Result<VmMapCommit, VmMapError> {
+        let total_start = vm_map_path_clock_now();
         emit_vm_trace(b"debug.vm.unmap.phase", 0);
+        let acquire_start = vm_map_path_clock_now();
         let _guard = self.acquire_writer(range)?;
+        emit_vm_map_path_duration(b"debug.vm.map_path.munmap.acquire_ns", acquire_start);
         emit_vm_trace(b"debug.vm.unmap.phase", 1);
+        let recipe_start = vm_map_path_clock_now();
         let commit = self.recipes.unmap(range)?;
+        emit_vm_map_path_duration(b"debug.vm.map_path.munmap.recipe_ns", recipe_start);
         emit_vm_trace(b"debug.vm.unmap.phase", 2);
         emit_vm_trace(b"debug.vm.unmap.changed_pages", commit.changed_pages as i64);
+        let pmap_start = vm_map_path_clock_now();
         let pmap_removed = self.pmap.teardown_range(range)?;
+        emit_vm_map_path_duration(b"debug.vm.map_path.munmap.pmap_teardown_ns", pmap_start);
         emit_vm_trace(b"debug.vm.unmap.phase", 3);
         emit_vm_trace(b"debug.vm.unmap.pmap_removed", pmap_removed as i64);
+        let stats_start = vm_map_path_clock_now();
         self.stats.apply_delta(commit.stats_delta);
+        emit_vm_map_path_duration(b"debug.vm.map_path.munmap.stats_ns", stats_start);
         emit_vm_trace(b"debug.vm.unmap.phase", 4);
+        emit_vm_map_path_count(
+            b"debug.vm.map_path.munmap.changed_pages",
+            commit.changed_pages as u64,
+        );
+        emit_vm_map_path_count(
+            b"debug.vm.map_path.munmap.pmap_removed",
+            pmap_removed as u64,
+        );
+        emit_vm_map_path_duration(b"debug.vm.map_path.munmap.total_ns", total_start);
         Ok(commit)
     }
 
@@ -1014,7 +1061,9 @@ impl AddressSpace {
     ) -> Result<VmMapCommit, VmMapError> {
         let range = entry.range;
         emit_vm_trace(b"debug.vm.mmap.commit.phase", 0);
+        let recipe_start = vm_map_path_clock_now();
         let commit = self.recipes.commit_map(entry, placement)?;
+        emit_vm_map_path_duration(b"debug.vm.map_path.mmap.commit_recipe_ns", recipe_start);
         emit_vm_trace(b"debug.vm.mmap.commit.phase", 1);
         emit_vm_trace(
             b"debug.vm.mmap.commit.changed_pages",
@@ -1022,11 +1071,18 @@ impl AddressSpace {
         );
         if placement == MapPlacement::FixedReplace {
             emit_vm_trace(b"debug.vm.mmap.commit.fixed_teardown", 1);
+            let teardown_start = vm_map_path_clock_now();
             self.pmap.teardown_range(range)?;
+            emit_vm_map_path_duration(
+                b"debug.vm.map_path.mmap.commit_fixed_pmap_teardown_ns",
+                teardown_start,
+            );
             emit_vm_trace(b"debug.vm.mmap.commit.phase", 2);
         }
         emit_vm_trace(b"debug.vm.mmap.commit.phase", 3);
+        let stats_start = vm_map_path_clock_now();
         self.stats.apply_delta(commit.stats_delta);
+        emit_vm_map_path_duration(b"debug.vm.map_path.mmap.commit_stats_ns", stats_start);
         emit_vm_trace(b"debug.vm.mmap.commit.phase", 4);
         Ok(commit)
     }
@@ -1049,6 +1105,40 @@ fn emit_vm_trace(name: &[u8], value: i64) {
         observer.counter(
             tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
             value,
+        );
+    }
+}
+
+#[inline(always)]
+fn vm_map_path_metrics_enabled() -> bool {
+    cfg!(tx_vm_map_path_metrics) && tx_observe::current().is_some()
+}
+
+#[inline(always)]
+fn vm_map_path_clock_now() -> Option<u64> {
+    if vm_map_path_metrics_enabled() {
+        Some(tx_observe::clock_now_ns())
+    } else {
+        None
+    }
+}
+
+fn emit_vm_map_path_duration(name: &[u8], start: Option<u64>) {
+    let Some(start) = start else {
+        return;
+    };
+    let duration = tx_observe::clock_now_ns().saturating_sub(start);
+    emit_vm_map_path_count(name, duration);
+}
+
+fn emit_vm_map_path_count(name: &[u8], value: u64) {
+    if !vm_map_path_metrics_enabled() {
+        return;
+    }
+    if let Some(observer) = tx_observe::current() {
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            value as i64,
         );
     }
 }

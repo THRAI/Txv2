@@ -1,3 +1,416 @@
+- 2026-06-05 **User-page gift docs, GiftPin, and VM gift values landed; VM gift step is next.**
+  Updated the page-gift plan and active docs so `vmsplice(SPLICE_F_GIFT)` has a
+  VM-owned `UserPageGift` transfer contract instead of page-granular VM
+  ownership. `VM_v1_2.md` now defines the gift step obligations, `PAGE_BACKED_v1.md`
+  defines install/copy consumption, `PAGE_SUBSTRATE_v1.md` defines `GiftPin` as
+  retained-frame transfer evidence on `FrameMeta.refcount`, and the pipe lease
+  decision now points at the plan. `tx-substrate::page_allocator` now exposes
+  `GiftPin`, `OwnedFrame::try_gift_pin()`, and installed
+  `page_allocator::acquire_gift_pin(ppn)`; VM and PageBacked adapters re-export
+  the token. VM now has `UserPageGift`, `GiftBatch`, `UserPageGiftSource`,
+  `UserPageGiftFreeze`, `UserGiftIovPlan`, and pure gift eligibility
+  classification. Verification so far: `cargo test -p tx-substrate --test
+  page_allocator -- --nocapture --test-threads=1`, `cargo test -p
+  tx-subsystems --lib vm::tests::user_page_gift -- --nocapture
+  --test-threads=1`, `cargo check -p tx-subsystems`, scoped `rustfmt`, and
+  scoped `git diff --check`. Next step: add the mutating VM gift step that
+  materializes, acquires `GiftPin`, and demotes/removes writable PTEs before
+  pipe descriptor wiring.
+
+- 2026-06-04 **OSComp cyclictest/iozone retest still scores zero; no kernel trap.**
+  Retested the requested filtered RV64 OSComp groups with
+  `tx.oscomp.groups=cyclictest-musl,iozone-musl` using a private output dir
+  `target/oscomp/custom-run/cyclic-iozone-retest-20260604-223417/`. The first
+  `cargo xtask build --target rv64-qemu` attempt ended without a success result
+  or compiler diagnostics from the tool session, so this run used the existing
+  RV64 ELF at
+  `target/riscv64gc-unknown-none-elf/debug/tx-kernel-riscv64-qemu-virt`
+  (timestamp 2026-06-04 21:21:13), copied into the private submit dir. The
+  private 4G sdcard image was removed after capture to restore disk space; the
+  serial, judge, and fault-decode outputs were kept. Result:
+  `python3 tools/oscomp-judge.py
+  target/oscomp/custom-run/cyclic-iozone-retest-20260604-223417/os_serial_out_rv-opensbi.txt
+  target/oscomp/testdata` scores `cyclictest-musl` `0.0/4`, `iozone-musl`
+  `0.0/20`, total `0.0/24`. Serial evidence: cyclictest reaches
+  `#### OS COMP TEST GROUP END cyclictest-musl ####`, but still prints
+  `kill hackbench: fail, ignore STRESS result`; iozone still prints
+  `Sanity check failed`, then the 4-writer throughput phase fails at block 4
+  with `write: Invalid argument` and `iozone.DUMMY.*: No such file or
+  directory`. `cargo xtask fault-decode --target rv64-qemu --serial ... --all
+  --brief` found no `scause/sepc/stval` trap lines; `cargo xtask trap-trace
+  --serial ... --syscalls` could not decode this capture because the ELF was
+  not built with `trap-trace`/`txdbg` records. Next step: debug the two visible
+  guest-contract failures separately: hackbench cleanup/process-kill or packet
+  pipe lifetime for cyclictest, and the ext4/PageBacked write-growth `EINVAL`
+  path for iozone.
+
+- 2026-06-04 **tmpfs `readdir` and `materialise_rnode` now reject stale backend state.**
+  Continued the tmpfs backend interface-consistency sweep from
+  `docs/progress/research/2026-06-03-filesystem-smp-gap-audit.md`. `readdir`
+  now treats a directory entry whose child inode is missing as `ENOENT` instead
+  of fabricating a regular-file `DirEntry`; this aligns it with the
+  `unlink`/`rmdir` stale-binding validation repairs. `materialise_rnode` now
+  ignores caller-supplied stale `InodeMeta` and snapshots the backend inode's
+  current meta/nlink/visible PageContainer size before building the RNode; the
+  hot path snapshots the PageContainer cap once under the tmpfs state lock and
+  reads size after unlock. Verification: `CARGO_TARGET_DIR=/tmp/tx-tmpfs-consistency-check
+  cargo test -p tx-fs tmpfs_readdir_stale_child_returns_enoent -- --nocapture`
+  first failed on the old implementation with a fabricated regular entry, then
+  passed after the fix; `CARGO_TARGET_DIR=/tmp/tx-tmpfs-consistency-check cargo
+  test -p tx-fs
+  tmpfs_materialise_rnode_uses_backend_inode_meta_not_stale_input --
+  --nocapture` first failed on the old implementation with a stale Directory
+  RNode meta, then passed after the fix; `CARGO_TARGET_DIR=/tmp/tx-tmpfs-consistency-check
+  cargo test -p tx-fs tmpfs_ -- --nocapture` passed with 51 tests;
+  `dispatch_getdents64_`, `dispatch_readlinkat_`, and `dispatch_truncate_`
+  shim filters passed with 3, 3, and 2 tests respectively. Next step: no
+  further obvious bounded tmpfs backend interface drift was found in this pass;
+  remaining filesystem SMP work should move to VFS warm-walk caps or broader
+  Linux-compat flag/cross-mount semantics.
+
+- 2026-06-04 **Observe cleanup freed old bulk artifacts; `rt_sigprocmask` is source-attributed.**
+  Manual cleanup was required because this checkout's `cargo xtask observe`
+  lacks the cleanup subcommand: `target/oscomp/custom-run` dropped from `7.0G`
+  to `3.0G` after removing explicitly named stale/unrelated directories
+  (`cyclic-iozone-20260604`, old B+ narrow capture, whole-suite chokepoint/regex
+  runs, and test analyze caches). Current pthread, map-path, clone-path, and
+  sigprocmask artifacts were kept. The sigprocmask follow-up maps the latest
+  clean context-split buckets to concrete code: `try_direct_trap_syscall`
+  handles per-hart payload/thread lookup, owner upgrade, aspace cap snapshot,
+  direct dispatch, and trap-frame writeback; `sys_rt_sigprocmask_impl` carries
+  user-copy plus step/query; `step_sigprocmask_with_payload` carries the real
+  atomic mask update and deliverability refresh. Readout: no narrow SMP1
+  signal-only fix remains; continue with clone/VM map-unmap or VM user-copy
+  attribution. Details:
+  `docs/progress/research/2026-06-04-sigprocmask-payload-fast-path.md`.
+
+- 2026-06-05 **pthread VM backend target is pmap resident teardown.**
+  After the sigprocmask distribution check reduced its `read_user_ns` max to a
+  rare cold-tail note, the preserved map-path artifacts were re-read. Complete
+  SMP4 whole-suite evidence still ranks `sys_munmap` just behind clone
+  (`11.696s`, p99 `15.804ms`), and the detailed map-path run attributes most
+  top slow `munmap` samples to `munmap.pmap_teardown_ns`, not recipe. The
+  slowest joined samples show pmap-heavy 73-88ms calls with 138-160 resident
+  removals, thousands of shifted entries, 20-27ms drain costs, and only 5-8ms
+  shootdown. Readout: next backend is `VmPmap::teardown_range` resident-store
+  drain/shift plus unmap loop; shootdown targeting is secondary for this tail.
+  Details: `docs/progress/research/2026-06-04-mmap-munmap-map-path.md`.
+
+- 2026-06-04 **`rt_sigprocmask` direct-context split shows no single dominant context lookup.**
+  Added three nested `tx_sigprocmask_detail_metrics` markers under
+  `debug.trap.direct_sigprocmask.context_ns`:
+  `context_thread_ns`, `context_owner_ns`, and `context_aspace_ns`, then ran
+  the focused pthread SMP1 observe at
+  `target/oscomp/custom-run/sigprocmask-context-split-pthread-serial1-smp1-20260604-211952`.
+  Runtime quality was clean: `complete=true`, `raw_records=583345`, lost `0`,
+  overwritten `0`, repairs `0`; `b_pthread_createjoin_serial1` completed with
+  probe-on body time `34.505337000`. The context bucket split across all three
+  calls rather than isolating one outlier: `context_aspace_ns=0.366s`
+  (`p50=33us`, `p99=143us`), `context_owner_ns=0.335s` (`p50=31us`,
+  `p99=128us`), and `context_thread_ns=0.163s` (`p50=14us`, `p99=64us`), while
+  parent `context_ns=1.114s` (`p50=101us`, `p99=374us`). Readout: context
+  recovery overhead is distributed across per-hart thread lookup, weak-owner
+  upgrade, and process aspace snapshot; the larger remaining signal-path
+  buckets are still dispatch/shim work and VM user-copy tails. Verification:
+  `rustfmt --edition 2021 crates/tx-kernel/src/trap.rs xtask/src/observe.rs`,
+  `RUSTFLAGS="--cfg tx_sigprocmask_detail_metrics --cfg
+  tx_sigprocmask_phase_metrics --cfg tx_vm_recipe_bplus --cfg
+  tx_clone_path_metrics" cargo check -p tx-kernel -q -j1`, `cargo check -p
+  xtask -q`, and scoped `git diff --check` passed. Next step: leave
+  `rt_sigprocmask` unless targeting a broad fast syscall context-cache; return
+  to clone/VM map-unmap or VM user-copy tails for larger pthread gains.
+
+- 2026-06-04 **tmpfs `link` now distinguishes missing and non-directory parents.**
+  Continued the tmpfs backend semantic sweep from
+  `docs/progress/research/2026-06-03-filesystem-smp-gap-audit.md`. `link`
+  now returns `ENOENT` when the new parent id is missing and keeps `ENOTDIR`
+  for an existing non-directory parent, matching the create-family parent
+  validation shape instead of folding both cases into `ENOTDIR`. The failed
+  link path leaves the target inode's visible link count unchanged.
+  Verification: `CARGO_TARGET_DIR=/tmp/tx-tmpfs-link-parent-check cargo test
+  -p tx-fs tmpfs_link_missing_parent_returns_enoent -- --nocapture` first
+  failed on the old implementation with `ENOTDIR`, then passed after the fix;
+  `CARGO_TARGET_DIR=/tmp/tx-tmpfs-link-parent-check cargo test -p tx-fs tmpfs_
+  -- --nocapture` passed with 48 tests; `CARGO_TARGET_DIR=/tmp/tx-tmpfs-link-parent-check
+  cargo test -p tx-shims --lib dispatch_linkat_ -- --nocapture` passed with 3
+  tests. Next step: keep tmpfs state splitting trace-gated and continue the
+  broader VFS/syscall sweep only for remaining Linux-compat drift.
+
+- 2026-06-04 **tmpfs `unlink` now rejects stale directory entries before mutation.**
+  Continued the tmpfs backend defensive-validation sweep from
+  `docs/progress/research/2026-06-03-filesystem-smp-gap-audit.md`. `unlink`
+  now validates that the bound target inode still exists and is not a directory
+  before removing the parent/name directory entry. A stale directory entry that
+  points at a missing inode now returns `ENOENT` and leaves the namespace
+  unchanged, matching the earlier `rmdir` parent/name/target validation-order
+  repair. Verification: `CARGO_TARGET_DIR=/tmp/tx-tmpfs-link-parent-check cargo
+  test -p tx-fs
+  tmpfs_unlink_missing_target_inode_returns_enoent_without_mutating_namespace
+  -- --nocapture` first failed on the old implementation with `Done(())`, then
+  passed after the fix; `CARGO_TARGET_DIR=/tmp/tx-tmpfs-link-parent-check cargo
+  test -p tx-fs tmpfs_ -- --nocapture` passed with 49 tests; `CARGO_TARGET_DIR=/tmp/tx-tmpfs-link-parent-check
+  cargo test -p tx-shims --lib dispatch_unlinkat_ -- --nocapture` passed with
+  6 tests. Next step: keep tmpfs state splitting trace-gated and continue only
+  remaining VFS/syscall Linux-compat drifts.
+
+- 2026-06-04 **`rt_sigprocmask` detail capture attributes the residual to direct-route context plus shim work.**
+  Ran the focused pthread SMP1 observe with `tx_sigprocmask_detail_metrics`
+  enabled at
+  `target/oscomp/custom-run/sigprocmask-detail-pthread-serial1-smp1-20260604-194302`.
+  Runtime quality was clean: `complete=true`, `raw_records=553949`, lost `0`,
+  overwritten `0`, repairs `0`; `b_pthread_createjoin_serial1` completed with
+  body time `33.508882000`, so this is probe-on attribution rather than a clean
+  score. `sys_rt_sigprocmask` measured `2.346s` total over `10007` calls
+  (`p50=204us`, `p99=690us`, `max=27.289ms`). All calls used the payload-aware
+  direct route (`route=3` for 5005 calls, `route=7` for 5002 calls), and no
+  direct-fallback counters fired. Shim detail totals were `step_ns=0.797s`,
+  `read_user_ns=0.476s`, `write_user_ns=0.184s`, `decode_ns=0.031s`, with
+  `debug.sigprocmask.detail.total_ns=1.858s`. Direct-route wrapper counters
+  show additional context/precondition/payload overhead (`context_ns=0.775s`,
+  `payload_ns=0.377s`, `precondition_ns=0.283s`); `dispatch_ns=2.492s`
+  includes the shim body. The old payload reopen rows remain absent
+  (`payload_lock_wait`, `payload_lock_held`, and `payload_cap_clone` n=0), so
+  the old weak/payload reopen caveat is closed for SMP1. The live observe
+  wrapper now also takes a non-blocking `.observe-live.lock` in the output dir
+  to reject parallel runs on the same target before image/build/QEMU/analyze
+  start; verification: `uv run python -m py_compile
+  tools/oscomp-observe-live.py tools/tests/test_oscomp_observe_live.py`,
+  `uv run python tools/tests/test_oscomp_observe_live.py`, and scoped
+  `git diff --check` passed. Next step: decide whether to reduce
+  direct-route context/precondition overhead, or leave this path and return to
+  the larger clone/VM map-unmap pthread lane.
+
+- 2026-06-04 **tmpfs rmdir now validates the parent/name binding before target contents.**
+  Continued the tmpfs backend semantic sweep from
+  `docs/progress/research/2026-06-03-filesystem-smp-gap-audit.md`. `rmdir`
+  now first verifies that `parent/name` exists and maps to the caller-provided
+  target id before inspecting that target inode's type or child map. This keeps
+  an inconsistent backend call from leaking unrelated target state as
+  `ENOTEMPTY` and preserves the namespace when the target id does not match the
+  named child. Verification: `CARGO_TARGET_DIR=/tmp/tx-tmpfs-defense-check
+  cargo test -p tx-fs
+  tmpfs_rmdir_wrong_target_returns_enoent_before_inspecting_unrelated_target
+  -- --nocapture` first failed on the old implementation with `ENOTEMPTY`, then
+  passed after the validation-order fix; `CARGO_TARGET_DIR=/tmp/tx-tmpfs-defense-check
+  cargo test -p tx-fs tmpfs_rmdir -- --nocapture` passed with 3 tests. Next
+  step: run the wider tmpfs and progress/docs gates before marking this tmpfs
+  sweep complete.
+
+- 2026-06-04 **tmpfs namespace removals now defer inode reclamation to destroy_inode.**
+  Continued the tmpfs side of
+  `docs/progress/research/2026-06-03-filesystem-smp-gap-audit.md` while leaving
+  splice semantics to the other worker. tmpfs `rename` no longer directly
+  removes a displaced regular-file inode or empty-directory inode from the
+  inode table; it decrements/zeros the displaced inode's link count and leaves
+  backend storage reclamation to `destroy_inode`. `rmdir` now follows the same
+  lifetime shape for empty directories, and `destroy_inode` itself is defensive:
+  it no-ops for still-linked inodes, removes zero-link inodes, and tolerates
+  repeated calls for already-reclaimed ids. Verification: `CARGO_TARGET_DIR=/tmp/tx-tmpfs-lifetime-check
+  cargo test -p tx-fs tmpfs_destroy_inode_preserves_linked_inode --
+  --nocapture`, `tmpfs_unlink_unhooks_name_but_keeps_inode_until_destroy_inode`,
+  `tmpfs_rmdir_keeps_directory_inode_until_destroy_inode`,
+  `tmpfs_rename_over_regular_target_keeps_displaced_inode_until_destroy_inode`,
+  and
+  `tmpfs_rename_directory_over_empty_directory_keeps_displaced_inode_until_destroy_inode`
+  first failed on the old direct-removal paths and now pass. Next step: keep the
+  full tmpfs per-inode/per-directory state split trace-gated; remaining tmpfs
+  work should focus on bounded semantic drift and lock-service evidence.
+
+- 2026-06-04 **`rt_sigprocmask` detailed observe markers are cfg-gated.**
+  Added opt-in `tx_sigprocmask_detail_metrics` markers around the direct-trap
+  `rt_sigprocmask` route and the shim body so the next pthread SMP1 capture can
+  split payload/context/precondition/dispatch/writeback from decode,
+  user-copy, step/query, writeback, and total syscall time. The old sampled
+  `debug.sigprocmask.*` breadcrumbs now sit behind the same detail cfg, and the
+  direct trap route also emits decline reasons when the fast path falls back
+  before payload, active request, thread, process, aspace, precondition, or
+  dispatch support. Verification: `rustfmt --edition 2021
+  crates/tx-shims/src/linux_syscall/signal.rs crates/tx-kernel/src/trap.rs
+  xtask/src/observe.rs`, `cargo check -p tx-shims -q`,
+  `RUSTFLAGS="--cfg tx_sigprocmask_detail_metrics --cfg
+  tx_sigprocmask_phase_metrics" cargo check -p tx-shims --lib -q`,
+  `cargo check -p tx-kernel -q`, `RUSTFLAGS="--cfg
+  tx_sigprocmask_detail_metrics --cfg tx_sigprocmask_phase_metrics --cfg
+  tx_vm_recipe_bplus --cfg tx_clone_path_metrics" cargo check -p tx-kernel -q
+  -j1`, and `cargo check -p xtask -q` passed. A full-package cfg-enabled
+  `tx-shims` check was stopped after it stalled in the unrelated
+  `dump-kernel-user-layouts` bin; the covered library path passed. Next step:
+  run the focused pthread SMP1 observe with the detail cfg and compare the new
+  detail counters against the existing `sys_rt_sigprocmask` spans.
+
+- 2026-06-04 **Pipe transport now carries packet metadata and PageBacked leases through splice.**
+  Completed the pipe submodule upgrade from a byte-only movement model to the
+  ordered descriptor transport described by
+  `docs/progress/decisions/2026-05-24-pipe-lease-ring-policy.md`. Packet mode
+  is now a per-open-file status bit plus per-descriptor flag: `pipe2(O_DIRECT)`
+  and `fcntl(F_SETFL, O_DIRECT)` stamp future writes/splice pushes as packets,
+  short reads discard packet tails, and packet output pipes preserve packet
+  boundaries through `splice(pipe -> pipe)`, `tee`, and file-lease-to-pipe
+  pushes. Pipe-to-pipe splice now moves complete descriptors when possible, so
+  full-page PageBacked leases survive an intermediate pipe hop and can still be
+  installed shared by the destination PageBacked file. Blocking pipe-to-pipe
+  splice/tee also parks on the destination writer wait source when the output
+  pipe is full. Verification used an isolated target dir because unrelated
+  cargo jobs held the shared build lock: `CARGO_TARGET_DIR=target/codex-pipe-verify
+  cargo check -p tx-shims`, `cargo test -p tx-subsystems pipe_packet_mode --
+  --nocapture`, `cargo test -p tx-subsystems destination_writable --
+  --nocapture`, `cargo test -p tx-subsystems --test v3_pipe_waitsource --
+  --nocapture`, `cargo test -p tx-shims --lib
+  dispatch_pipe2_with_o_direct_uses_packet_mode -- --nocapture`, `cargo test -p
+  tx-shims --lib dispatch_fcntl_setfl_toggles_pipe_packet_mode --
+  --nocapture`, and `cargo test -p tx-shims --lib splice_dispatch --
+  --nocapture` all passed. Next step: rerun the filtered OSComp cyclictest
+  group to confirm hackbench cleanup now appears; iozone remains blocked on the
+  separate ext4/PageBacked writable-capacity growth issue. Blocker: true
+  `vmsplice(SPLICE_F_GIFT)` user-page gifting still needs VM user-page
+  pin/adoption/freeze/release primitives.
+
+- 2026-06-04 **tmpfs create-family ops reject existing names before allocation/id burn.**
+  Continued the tmpfs side of
+  `docs/progress/research/2026-06-03-filesystem-smp-gap-audit.md` while leaving
+  splice semantics to the other worker. `create_inode` now does a bounded
+  namespace precheck under the tmpfs state lock before allocating a regular-file
+  `PageContainer`, then allocates outside the lock and revalidates at publish
+  time. `mkdir` now allocates its object id only at publish time, and `symlink`
+  prechecks the destination before copying target bytes or allocating an object
+  id. This keeps expensive backing/target allocation out of the lock while
+  avoiding the old sequential failure-path drift where `EEXIST` still consumed
+  resources or ids. Verification: `CARGO_TARGET_DIR=/tmp/tx-tmpfs-create-check
+  cargo test -p tx-fs tmpfs_failed_ -- --nocapture` first failed on the old
+  `mkdir`/`symlink` implementation with the next id at 5 instead of 4, then
+  passed after the fix. Next step: keep tmpfs state splitting trace-gated and
+  continue closing bounded failure-path and metadata drift items that do not
+  overlap splice work.
+
+- 2026-06-04 **pipe2(O_DIRECT) now creates packet-mode pipes.**
+  While continuing the filesystem rename verification, the existing
+  packet-mode pipe scaffolding was completed enough to remove the stale
+  unimplemented packet-mode behavior that blocked `cyclictest`'s
+  hackbench fd-pair setup. `PipeFlags` and `OpenFileFlags` now carry the
+  packet bit, pipe rings split writes into packet descriptors, short reads
+  discard the unread tail of the current packet, and `fcntl(F_SETFL)` /
+  `F_GETFL` now toggle/report `O_DIRECT` for pipe fds. `sys_read` also has
+  the same pipe fast path as `sys_write`, so a packet short-read returns the
+  immediately copied byte count instead of re-entering the generic waiting
+  drive loop to fill the caller's whole buffer. Verification: `cargo test -p
+  tx-subsystems --lib pipe_packet_mode_ -- --nocapture` passed with 3 tests,
+  `cargo test -p tx-shims --lib dispatch_pipe2_with_o_direct_uses_packet_mode
+  -- --nocapture` passed, `cargo test -p tx-shims --lib
+  dispatch_fcntl_setfl_toggles_pipe_packet_mode -- --nocapture` passed, and
+  `cargo test -p tx-shims --lib dispatch_renameat2_ -- --nocapture` still
+  passed after the shared `OpenFileFlags` field update. Next step: rerun the
+  filtered `cyclictest-musl` OSComp group to confirm the hackbench cleanup
+  marker now appears; iozone still needs the separate ext4/PageBacked growth
+  fix.
+
+- 2026-06-04 **tmpfs rename moves directory subtrees across directories with cycle checks.**
+  Continued the filesystem SMP gap audit repair stream from
+  `docs/progress/research/2026-06-03-filesystem-smp-gap-audit.md`. tmpfs
+  `rename` now supports moving a directory subtree between two directories in
+  the same tmpfs mount, preserving the subtree children and publishing the new
+  parent/name atomically under the tmpfs state lock. The read-only validation
+  phase now rejects moves into the source directory's own subtree with
+  `EINVAL`, leaving the original namespace intact. Verification: `cargo test
+  -p tx-fs tmpfs_rename_directory_ -- --nocapture` first failed on the old
+  implementation with `Err(ENOSYS)` for both the directory move and
+  descendant-cycle regression, then passed after the fix. A follow-up syscall
+  sweep also passed `cargo test -p tx-shims --lib dispatch_renameat2_ --
+  --nocapture`, covering same-directory rename, cross-directory regular-file
+  rename, cross-directory directory-subtree rename, descendant-cycle rejection,
+  permission denial, and `RENAME_EXCHANGE` rejection. Next step: keep the full
+  tmpfs state split trace-gated; remaining rename work is broader Linux
+  compatibility, such as flag variants and cross-mount behavior, not the basic
+  tmpfs/VFS namespace move semantics.
+
+- 2026-06-04 **OSComp cyclictest/iozone-only failures traced to pipe2(O_DIRECT) and ext4 one-page write capacity.**
+  Continued the requested `cyclictest-musl,iozone-musl` investigation using
+  the saved run under
+  `target/oscomp/custom-run/cyclic-iozone-20260604/`. Judge replay confirms
+  both suites score zero on the captured serial: cyclictest's parser returns
+  zeroed buckets because `kill hackbench: success` is absent, and iozone's
+  parser sees only `iozone write/read 4 initial writers = 0.0` with every later
+  bucket missing. At capture time, cyclictest's guest line `Creating fdpair
+  (error: Function not implemented)` mapped to the missing packet-mode
+  `pipe2(O_DIRECT)` path in `crates/tx-shims/src/linux_syscall/fs_basic.rs`;
+  hackbench needs the fd pair to exist for the cleanup marker. Iozone's
+  trap-trace decode
+  shows the first throughput phase failing on plain `write(3, buf, 1024)` at
+  block 4: several 1 KiB writes succeed, then syscall records `0x08e0`,
+  `0x08ec`, `0x08f0`, and `0x08f9` return `-22 (EINVAL)`. The matching source
+  path is ext4 `materialise_rnode`, which allocates PageBacked file containers
+  with `page_count = meta.size.div_ceil(4096).max(1)`; new zero-length files
+  therefore get one 4 KiB page of capacity, and PageBacked's write guard rejects
+  the fifth 1 KiB write when `offset + len > capacity`. Verification:
+  `target/debug/xtask trap-trace --serial
+  target/oscomp/custom-run/cyclic-iozone-20260604/iozone-traptrace.serial.txt
+  --syscalls` produced
+  `target/oscomp/custom-run/cyclic-iozone-20260604/iozone-traptrace.syscalls.txt`;
+  both `target/oscomp/testdata/judge_cyclictest-musl.py` and
+  `target/oscomp/testdata/judge_iozone-musl.py` were replayed against
+  `os_serial_out_rv-opensbi.txt`. Follow-up: packet-mode `pipe2(O_DIRECT)`
+  has now landed in the entry above; next teach ext4 PageBacked file
+  containers to grow beyond their materialised inode size (or allocate a
+  larger writable capacity for new regular files) and rerun `iozone-musl`.
+
+- 2026-06-04 **tmpfs rename moves regular files across directories.**
+  Continued the filesystem SMP gap audit repair stream from
+  `docs/progress/research/2026-06-03-filesystem-smp-gap-audit.md`. tmpfs
+  `rename` now supports moving a regular-file namespace entry between two
+  directories in the same tmpfs mount, preserving the inode/link count and
+  making the old name return `ENOENT` while the new parent/name resolves to
+  the original file id. The implementation still rejects cross-directory
+  directory-source rename as `ENOSYS`, keeping directory cycle prevention and
+  parent-link semantics out of this narrow file-rename slice. Verification:
+  first `cargo test -p tx-fs
+  tmpfs_rename_file_across_directories_moves_name -- --nocapture` failed on
+  the old implementation with `Err(ENOSYS)`, then `cargo test -p tx-fs
+  tmpfs_rename_ -- --nocapture` passed with the new cross-directory regular
+  file regression included. Next step: if tmpfs traces or Linux-compat tests
+  require it, implement cross-directory directory rename with explicit
+  ancestor-cycle checks; otherwise keep the full tmpfs state split
+  trace-gated.
+
+- 2026-06-04 **rt_sigprocmask fast lane reuses the already-resolved thread payload.**
+  Continued the pthread syscall-floor work from
+  `docs/progress/research/2026-06-04-clone-path-pthread.md`. Signal summary
+  refresh now uses local pending bits plus the cached group-pending summary,
+  avoiding the old `select_next_signal` owner weak-upgrade in mask refresh.
+  The host observe wrapper now runs nested Python stages via the active
+  interpreter/`uv`, and both `thread_future` and direct-trap
+  `NR_RT_SIGPROCMASK` routes use the payload-aware one-shot dispatcher.
+  Verification: focused shims tests, cfg-heavy `cargo check -p tx-kernel -q`,
+  `cargo check -p xtask -q`, uv Python tests/py_compile, `xtask observe`
+  dry-run/analyze smoke, targeted `rustfmt`, and targeted `git diff --check`
+  passed. Fresh pthread SMP1 observe rerun
+  `target/oscomp/custom-run/sigprocmask-payload-fast-pthread-serial1-smp1-20260604-rerun`
+  is complete/lossless (`438868` raw records, lost/overwritten/repairs `0`);
+  `payload_lock_wait`, `payload_lock_held`, and `payload_cap_clone` are all
+  `n=0`, while `sys_rt_sigprocmask` improved from 2.020s total / 192us p50 to
+  1.774s total / 155us p50. Next step: leave this lane alone on SMP1 and
+  recheck under SMP4 after the separate multi-hart observe-ring fix lands.
+
+- 2026-06-04 **OSComp cyclictest/iozone-only RV64 run reaches cyclictest and stalls in iozone writes.**
+  Ran the requested filtered OSComp groups with
+  `tx.oscomp.groups=cyclictest-musl,iozone-musl`. The default
+  `target/oscomp/testdata/sdcard-rv.img` was a broken `/tmp/sdcard-debug.img`
+  symlink, so the full RV64 image was streamed from `sdcard-rv.img.xz` into
+  `target/oscomp/custom-run/cyclic-iozone-20260604/sdcard-rv.img`; the current
+  RV64 kernel ELF was copied to `target/oscomp/submit/kernel-rv`. The Makefile
+  `-bios default` QEMU shape stayed serial-silent, while the OpenSBI-shaped
+  rerun produced
+  `target/oscomp/custom-run/cyclic-iozone-20260604/os_serial_out_rv-opensbi.txt`.
+  `cyclictest-musl` reached its end marker, including successful
+  `NO_STRESS_P1`, `NO_STRESS_P8`, `STRESS_P1`, and `STRESS_P8` sections; the
+  suite also printed `kill hackbench: fail, ignore STRESS result`.
+  `iozone-musl` started, printed `Sanity check failed`, then stalled after
+  repeated `Error writing block 4, fd=3` / `write: Invalid argument` during the
+  first throughput write/read phase. Verification: normal RV64 smoke boot
+  passed with `target/debug/xtask qemu --target rv64-qemu --profile smoke
+  --expect-sentinel --timeout-ms 30000`; QEMU was stopped after the iozone
+  serial stopped growing. Next step: debug the tmpfs/file write path that
+  returns `EINVAL` under iozone, or rerun cyclictest alone if a clean latency
+  score is needed.
+
 - 2026-06-04 **tmpfs rename rejects non-empty directory replacement before mutation.**
   Continued the filesystem SMP gap audit repair stream from
   `docs/progress/research/2026-06-03-filesystem-smp-gap-audit.md`. tmpfs

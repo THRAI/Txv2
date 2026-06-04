@@ -15,6 +15,7 @@ mod observation;
 mod range_locks;
 mod script_async;
 mod user_access;
+mod user_page_gift;
 
 static COUNTING_PMAP_TEST_LOCK: Mutex<()> = Mutex::new(());
 static COUNTING_PMAP_STATE: LazyLock<Mutex<CountingPmapState>> =

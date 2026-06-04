@@ -18,16 +18,16 @@ pub use private::{
     PrivatePageSet, VmPageOff,
 };
 pub use range_lock::{
-    AcquirePairResult, AcquireResult, LockMode, PendingWriter, RANGE_LOCK_RELEASE_MASK, RangeGuard,
-    RangeGuardPair, RangeLock, WouldBlock,
+    AcquirePairResult, AcquireResult, LockMode, PendingWriter, RangeGuard, RangeGuardPair,
+    RangeLock, WouldBlock, RANGE_LOCK_RELEASE_MASK,
 };
 pub use types::{
-    AccessMode, AddressSpaceStats, FULL_USER_V1_TOP, MapPlacement, Prot, USER_PAGE_SIZE,
-    UfdRegistration, UserPage, UserPageIter, UserRange, UserRangeError, UserVirtAddr, VmBacking,
-    VmCap, VmEntry, VmEntryBacking, VmEntryError, VmEntryFlags, VmEntryProtectRewrite,
-    VmEntryRewrite, VmFault, VmFaultError, VmFaultMaterialization, VmFaultMaterializationBacking,
-    VmFaultMaterializationStep, VmFaultOutcome, VmMapCommit, VmMapError, VmMapOutcome,
-    VmMapRequest, VmMapTarget, VmRemapOutcome, VmRemapPlacement, VmRemapRequest,
+    AccessMode, AddressSpaceStats, MapPlacement, Prot, UfdRegistration, UserPage, UserPageIter,
+    UserRange, UserRangeError, UserVirtAddr, VmBacking, VmCap, VmEntry, VmEntryBacking,
+    VmEntryError, VmEntryFlags, VmEntryProtectRewrite, VmEntryRewrite, VmFault, VmFaultError,
+    VmFaultMaterialization, VmFaultMaterializationBacking, VmFaultMaterializationStep,
+    VmFaultOutcome, VmMapCommit, VmMapError, VmMapOutcome, VmMapRequest, VmMapTarget,
+    VmRemapOutcome, VmRemapPlacement, VmRemapRequest, FULL_USER_V1_TOP, USER_PAGE_SIZE,
 };
 
 pub(in crate::vm) use private::{
@@ -36,7 +36,7 @@ pub(in crate::vm) use private::{
 #[cfg(test)]
 pub(in crate::vm) use recipe::deferred_recipe_reclaim_len_for_test;
 pub(in crate::vm) use recipe::{
-    AddressSpaceStatsCell, RecipeIndex, drain_deferred_recipe_reclaims, recipe_debug_totals,
-    reset_recipe_debug_totals,
+    drain_deferred_recipe_reclaims, recipe_debug_totals, reset_recipe_debug_totals,
+    AddressSpaceStatsCell, RecipeIndex,
 };
 pub(in crate::vm) use types::AddressSpaceStatsDelta;

@@ -369,6 +369,154 @@ const KERNEL_FNV1A_STABLE_NAMES: &[(&str, &str)] = &[
         "debug.alloc.pagebacked.container.pages",
         "debug.alloc.pagebacked.container.pages",
     ),
+    (
+        "debug.vm.map_path.mmap.anywhere_search_ns",
+        "debug.vm.map_path.mmap.anywhere_search_ns",
+    ),
+    (
+        "debug.vm.map_path.mmap.reserve_map_ns",
+        "debug.vm.map_path.mmap.reserve_map_ns",
+    ),
+    (
+        "debug.vm.map_path.mmap.reserve_blocked_ns",
+        "debug.vm.map_path.mmap.reserve_blocked_ns",
+    ),
+    (
+        "debug.vm.map_path.mmap.reserve_error_ns",
+        "debug.vm.map_path.mmap.reserve_error_ns",
+    ),
+    (
+        "debug.vm.map_path.mmap.commit_ns",
+        "debug.vm.map_path.mmap.commit_ns",
+    ),
+    (
+        "debug.vm.map_path.mmap.commit_recipe_ns",
+        "debug.vm.map_path.mmap.commit_recipe_ns",
+    ),
+    (
+        "debug.vm.map_path.mmap.commit_fixed_pmap_teardown_ns",
+        "debug.vm.map_path.mmap.commit_fixed_pmap_teardown_ns",
+    ),
+    (
+        "debug.vm.map_path.mmap.commit_stats_ns",
+        "debug.vm.map_path.mmap.commit_stats_ns",
+    ),
+    (
+        "debug.vm.map_path.mmap.changed_pages",
+        "debug.vm.map_path.mmap.changed_pages",
+    ),
+    (
+        "debug.vm.map_path.mmap.total_ns",
+        "debug.vm.map_path.mmap.total_ns",
+    ),
+    (
+        "debug.vm.map_path.munmap.acquire_ns",
+        "debug.vm.map_path.munmap.acquire_ns",
+    ),
+    (
+        "debug.vm.map_path.munmap.recipe_ns",
+        "debug.vm.map_path.munmap.recipe_ns",
+    ),
+    (
+        "debug.vm.map_path.munmap.pmap_teardown_ns",
+        "debug.vm.map_path.munmap.pmap_teardown_ns",
+    ),
+    (
+        "debug.vm.map_path.munmap.stats_ns",
+        "debug.vm.map_path.munmap.stats_ns",
+    ),
+    (
+        "debug.vm.map_path.munmap.changed_pages",
+        "debug.vm.map_path.munmap.changed_pages",
+    ),
+    (
+        "debug.vm.map_path.munmap.pmap_removed",
+        "debug.vm.map_path.munmap.pmap_removed",
+    ),
+    (
+        "debug.vm.map_path.munmap.total_ns",
+        "debug.vm.map_path.munmap.total_ns",
+    ),
+    (
+        "debug.vm.map_path.pmap.teardown_drain_ns",
+        "debug.vm.map_path.pmap.teardown_drain_ns",
+    ),
+    (
+        "debug.vm.map_path.pmap.teardown_removed_pages",
+        "debug.vm.map_path.pmap.teardown_removed_pages",
+    ),
+    (
+        "debug.vm.map_path.pmap.teardown_shifted_entries",
+        "debug.vm.map_path.pmap.teardown_shifted_entries",
+    ),
+    (
+        "debug.vm.map_path.pmap.teardown_hal_unmap_ns",
+        "debug.vm.map_path.pmap.teardown_hal_unmap_ns",
+    ),
+    (
+        "debug.vm.map_path.pmap.teardown_loop_ns",
+        "debug.vm.map_path.pmap.teardown_loop_ns",
+    ),
+    (
+        "debug.vm.map_path.pmap.teardown_shootdown_ns",
+        "debug.vm.map_path.pmap.teardown_shootdown_ns",
+    ),
+    (
+        "debug.vm.map_path.pmap.teardown_total_ns",
+        "debug.vm.map_path.pmap.teardown_total_ns",
+    ),
+    (
+        "debug.vm.recipe.phase.lock_wait_ns",
+        "debug.vm.recipe.phase.lock_wait_ns",
+    ),
+    (
+        "debug.vm.recipe.phase.rewrite_ns",
+        "debug.vm.recipe.phase.rewrite_ns",
+    ),
+    (
+        "debug.vm.recipe.phase.publish_swap_ns",
+        "debug.vm.recipe.phase.publish_swap_ns",
+    ),
+    (
+        "debug.vm.recipe.phase.debug_emit_ns",
+        "debug.vm.recipe.phase.debug_emit_ns",
+    ),
+    (
+        "debug.vm.recipe.phase.retire_enqueue_ns",
+        "debug.vm.recipe.phase.retire_enqueue_ns",
+    ),
+    (
+        "debug.vm.recipe.phase.retire_queued",
+        "debug.vm.recipe.phase.retire_queued",
+    ),
+    (
+        "debug.vm.recipe.phase.retire_error",
+        "debug.vm.recipe.phase.retire_error",
+    ),
+    (
+        "debug.vm.recipe.phase.deferred_enqueue_ns",
+        "debug.vm.recipe.phase.deferred_enqueue_ns",
+    ),
+    (
+        "debug.vm.recipe.phase.deferred_enqueued",
+        "debug.vm.recipe.phase.deferred_enqueued",
+    ),
+    (
+        "debug.vm.recipe.phase.inline_fallback",
+        "debug.vm.recipe.phase.inline_fallback",
+    ),
+    (
+        "debug.vm.recipe.phase.deferred_drain_ns",
+        "debug.vm.recipe.phase.deferred_drain_ns",
+    ),
+    (
+        "debug.vm.recipe.phase.deferred_drained",
+        "debug.vm.recipe.phase.deferred_drained",
+    ),
+    (
+        "debug.vm.recipe.phase.reclaim_drop_ns",
+        "debug.vm.recipe.phase.reclaim_drop_ns",
+    ),
     ("debug.ds.method.duration_ns", "debug.ds.method.duration_ns"),
     ("debug.ds.method.zone_id", "debug.ds.method.zone_id"),
     (
@@ -709,6 +857,126 @@ const KERNEL_FNV1A_STABLE_NAMES: &[(&str, &str)] = &[
         "debug.lock_service.thread.payload.sigprocmask.refresh.duration_ns",
     ),
     (
+        "debug.sigprocmask.detail.decode_ns",
+        "debug.sigprocmask.detail.decode_ns",
+    ),
+    (
+        "debug.sigprocmask.detail.route",
+        "debug.sigprocmask.detail.route",
+    ),
+    (
+        "debug.sigprocmask.detail.bad_size",
+        "debug.sigprocmask.detail.bad_size",
+    ),
+    (
+        "debug.sigprocmask.detail.bad_how",
+        "debug.sigprocmask.detail.bad_how",
+    ),
+    (
+        "debug.sigprocmask.detail.read_user_ns",
+        "debug.sigprocmask.detail.read_user_ns",
+    ),
+    (
+        "debug.sigprocmask.detail.read_err",
+        "debug.sigprocmask.detail.read_err",
+    ),
+    (
+        "debug.sigprocmask.detail.step_ns",
+        "debug.sigprocmask.detail.step_ns",
+    ),
+    (
+        "debug.sigprocmask.detail.step_zombie",
+        "debug.sigprocmask.detail.step_zombie",
+    ),
+    (
+        "debug.sigprocmask.detail.query_mask_ns",
+        "debug.sigprocmask.detail.query_mask_ns",
+    ),
+    (
+        "debug.sigprocmask.detail.mask_zombie",
+        "debug.sigprocmask.detail.mask_zombie",
+    ),
+    (
+        "debug.sigprocmask.detail.write_user_ns",
+        "debug.sigprocmask.detail.write_user_ns",
+    ),
+    (
+        "debug.sigprocmask.detail.write_err",
+        "debug.sigprocmask.detail.write_err",
+    ),
+    (
+        "debug.sigprocmask.detail.total_ns",
+        "debug.sigprocmask.detail.total_ns",
+    ),
+    (
+        "debug.trap.direct_sigprocmask.payload_ns",
+        "debug.trap.direct_sigprocmask.payload_ns",
+    ),
+    (
+        "debug.trap.direct_sigprocmask.context_ns",
+        "debug.trap.direct_sigprocmask.context_ns",
+    ),
+    (
+        "debug.trap.direct_sigprocmask.context_thread_ns",
+        "debug.trap.direct_sigprocmask.context_thread_ns",
+    ),
+    (
+        "debug.trap.direct_sigprocmask.context_owner_ns",
+        "debug.trap.direct_sigprocmask.context_owner_ns",
+    ),
+    (
+        "debug.trap.direct_sigprocmask.context_aspace_ns",
+        "debug.trap.direct_sigprocmask.context_aspace_ns",
+    ),
+    (
+        "debug.trap.direct_sigprocmask.precondition_ns",
+        "debug.trap.direct_sigprocmask.precondition_ns",
+    ),
+    (
+        "debug.trap.direct_sigprocmask.precondition_failed",
+        "debug.trap.direct_sigprocmask.precondition_failed",
+    ),
+    (
+        "debug.trap.direct_sigprocmask.no_payload",
+        "debug.trap.direct_sigprocmask.no_payload",
+    ),
+    (
+        "debug.trap.direct_sigprocmask.no_active_request",
+        "debug.trap.direct_sigprocmask.no_active_request",
+    ),
+    (
+        "debug.trap.direct_sigprocmask.no_thread",
+        "debug.trap.direct_sigprocmask.no_thread",
+    ),
+    (
+        "debug.trap.direct_sigprocmask.no_process",
+        "debug.trap.direct_sigprocmask.no_process",
+    ),
+    (
+        "debug.trap.direct_sigprocmask.no_aspace",
+        "debug.trap.direct_sigprocmask.no_aspace",
+    ),
+    (
+        "debug.trap.direct_sigprocmask.dispatch_ns",
+        "debug.trap.direct_sigprocmask.dispatch_ns",
+    ),
+    (
+        "debug.trap.direct_sigprocmask.unsupported",
+        "debug.trap.direct_sigprocmask.unsupported",
+    ),
+    (
+        "debug.trap.direct_sigprocmask.writeback_ns",
+        "debug.trap.direct_sigprocmask.writeback_ns",
+    ),
+    (
+        "debug.trap.direct_sigprocmask.wake_handoff_ns",
+        "debug.trap.direct_sigprocmask.wake_handoff_ns",
+    ),
+    (
+        "debug.trap.direct_sigprocmask.total_ns",
+        "debug.trap.direct_sigprocmask.total_ns",
+    ),
+    (
         "debug.cap.upgrade.to_cap.duration_ns",
         "debug.cap.upgrade.to_cap.duration_ns",
     ),
@@ -957,6 +1225,118 @@ const KERNEL_FNV1A_STABLE_NAMES: &[(&str, &str)] = &[
         "debug.clone.reactor_submit.after",
     ),
     ("debug.clone.return", "debug.clone.return"),
+    (
+        "debug.clone_path.sys_clone.parent_ctx_ns",
+        "debug.clone_path.sys_clone.parent_ctx_ns",
+    ),
+    (
+        "debug.clone_path.sys_clone.step_thread_ns",
+        "debug.clone_path.sys_clone.step_thread_ns",
+    ),
+    (
+        "debug.clone_path.sys_clone.parent_settid_ns",
+        "debug.clone_path.sys_clone.parent_settid_ns",
+    ),
+    (
+        "debug.clone_path.sys_clone.reactor_submit_ns",
+        "debug.clone_path.sys_clone.reactor_submit_ns",
+    ),
+    (
+        "debug.clone_path.sys_clone.clone_thread_count",
+        "debug.clone_path.sys_clone.clone_thread_count",
+    ),
+    (
+        "debug.clone_path.sys_clone.total_ns",
+        "debug.clone_path.sys_clone.total_ns",
+    ),
+    (
+        "debug.clone_path.step_clone_thread.allocate_tid_ns",
+        "debug.clone_path.step_clone_thread.allocate_tid_ns",
+    ),
+    (
+        "debug.clone_path.step_clone_thread.sign_thread_ns",
+        "debug.clone_path.step_clone_thread.sign_thread_ns",
+    ),
+    (
+        "debug.clone_path.step_clone_thread.register_tid_ns",
+        "debug.clone_path.step_clone_thread.register_tid_ns",
+    ),
+    (
+        "debug.clone_path.step_clone_thread.seed_context_ns",
+        "debug.clone_path.step_clone_thread.seed_context_ns",
+    ),
+    (
+        "debug.clone_path.step_clone_thread.clear_ctid_ns",
+        "debug.clone_path.step_clone_thread.clear_ctid_ns",
+    ),
+    (
+        "debug.clone_path.step_clone_thread.attach_ns",
+        "debug.clone_path.step_clone_thread.attach_ns",
+    ),
+    (
+        "debug.clone_path.step_clone_thread.count",
+        "debug.clone_path.step_clone_thread.count",
+    ),
+    (
+        "debug.clone_path.step_clone_thread.total_ns",
+        "debug.clone_path.step_clone_thread.total_ns",
+    ),
+    (
+        "debug.clone_path.sign_thread.payload_fresh_ns",
+        "debug.clone_path.sign_thread.payload_fresh_ns",
+    ),
+    (
+        "debug.clone_path.sign_thread.payload_sign_ns",
+        "debug.clone_path.sign_thread.payload_sign_ns",
+    ),
+    (
+        "debug.clone_path.sign_thread.payload_cap_ns",
+        "debug.clone_path.sign_thread.payload_cap_ns",
+    ),
+    (
+        "debug.clone_path.sign_thread.identity_sign_ns",
+        "debug.clone_path.sign_thread.identity_sign_ns",
+    ),
+    (
+        "debug.clone_path.sign_thread.count",
+        "debug.clone_path.sign_thread.count",
+    ),
+    (
+        "debug.clone_path.sign_thread.total_ns",
+        "debug.clone_path.sign_thread.total_ns",
+    ),
+    (
+        "debug.clone_path.child_submit.payload_lookup_ns",
+        "debug.clone_path.child_submit.payload_lookup_ns",
+    ),
+    (
+        "debug.clone_path.child_submit.payload_clone_ns",
+        "debug.clone_path.child_submit.payload_clone_ns",
+    ),
+    (
+        "debug.clone_path.child_submit.reactor_with_ns",
+        "debug.clone_path.child_submit.reactor_with_ns",
+    ),
+    (
+        "debug.clone_path.child_submit.terminal_drain_ns",
+        "debug.clone_path.child_submit.terminal_drain_ns",
+    ),
+    (
+        "debug.clone_path.child_submit.register_task_ns",
+        "debug.clone_path.child_submit.register_task_ns",
+    ),
+    (
+        "debug.clone_path.child_submit.count",
+        "debug.clone_path.child_submit.count",
+    ),
+    (
+        "debug.clone_path.child_submit.not_submitted",
+        "debug.clone_path.child_submit.not_submitted",
+    ),
+    (
+        "debug.clone_path.child_submit.total_ns",
+        "debug.clone_path.child_submit.total_ns",
+    ),
     ("debug.child_submit.enter", "debug.child_submit.enter"),
     (
         "debug.child_submit.payload.after",
@@ -1508,17 +1888,12 @@ fn observe_replay(root: &Path, args: &[String]) -> Result<()> {
 // ── analyze ──────────────────────────────────────────────────────────────────
 
 fn observe_analyze(root: &Path, args: &[String]) -> Result<()> {
-    if !command_exists("python3") {
-        return Err("python3 is required for observe analyze".into());
-    }
-
     let script = root.join("tools").join("tx-observe-analyze.py");
     if !script.exists() {
         return Err(format!("analyzer script not found: {}", script.display()));
     }
-    let mut py_args = vec![script.display().to_string()];
-    py_args.extend(args.iter().cloned());
-    run_cmd_owned(root, "python3", &py_args)
+    let (program, py_args) = python_invocation(&script, args)?;
+    run_cmd_owned(root, &program, &py_args)
 }
 
 // ── pftrace ───────────────────────────────────────────────────────────────────
@@ -1749,9 +2124,9 @@ fn observe_oscomp_live(root: &Path, args: &[String]) -> Result<()> {
     if !script.exists() {
         return Err(format!("missing {}", script.display()));
     }
-    let status = Command::new("python3")
-        .arg(script)
-        .args(args)
+    let (program, py_args) = python_invocation(&script, args)?;
+    let status = Command::new(&program)
+        .args(&py_args)
         .status()
         .map_err(|err| format!("failed to run oscomp live observe workflow: {err}"))?;
     if status.success() {
@@ -1759,6 +2134,23 @@ fn observe_oscomp_live(root: &Path, args: &[String]) -> Result<()> {
     } else {
         Err(format!("oscomp live observe workflow exited with {status}"))
     }
+}
+
+fn python_invocation(script: &Path, args: &[String]) -> Result<(String, Vec<String>)> {
+    let mut py_args = Vec::new();
+    if command_exists("uv") {
+        py_args.push("run".to_string());
+        py_args.push("python".to_string());
+        py_args.push(script.display().to_string());
+        py_args.extend(args.iter().cloned());
+        return Ok(("uv".to_string(), py_args));
+    }
+    if command_exists("python3") {
+        py_args.push(script.display().to_string());
+        py_args.extend(args.iter().cloned());
+        return Ok(("python3".to_string(), py_args));
+    }
+    Err("uv or python3 is required for observe Python workflows".into())
 }
 
 fn pass_optional_arg(args: &[String], cmd: &mut Command, name: &str) {
