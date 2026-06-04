@@ -1770,7 +1770,15 @@ async fn recvmsg_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
                 let mut msg_flags = if recv.eor { MSG_EOR_BITS } else { 0 };
                 if recv.sctp_notification {
                     msg_flags |= MSG_NOTIFICATION_BITS;
-                } else if socket.kind == SocketKind::Sctp && recv.bytes > 0 {
+                } else if socket.kind == SocketKind::Sctp
+                    && recv.bytes > 0
+                    && socket.acquire_operational().is_some_and(|p| {
+                        // Only attach the sctp_sndrcvinfo cmsg when the socket
+                        // subscribed to SCTP_DATA_IO events (sctp_data_io_event,
+                        // byte 0 of sctp_event_subscribe).
+                        p.with_options(|o| o.sctp.events_subscribe[0] != 0)
+                    })
+                {
                     if let Err(errno) = write_sctp_sndrcv_cmsg(
                         ctx,
                         args[1],
@@ -2813,6 +2821,20 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             write_sockopt_bytes(ctx, optval, optlen_ptr, &buf)
         }
         (SOL_SCTP, SCTP_STATUS) if socket.kind == SocketKind::Sctp => {
+            // SCTP_STATUS requires an established association: a 1-to-1 socket
+            // must be connected, a 1-to-many socket must have at least one peer.
+            let has_assoc = if payload.with_options(|o| o.socket.sock_type == SocketType::SeqPacket)
+            {
+                payload.sctp_assoc_count() > 0
+            } else {
+                matches!(
+                    payload.protocol_snapshot(),
+                    SocketProtocol::Sctp(TcpState::Connected { .. })
+                )
+            };
+            if !has_assoc {
+                return SyscallResult::Error(errno_to_i32(Errno::EINVAL));
+            }
             // struct sctp_status (176 bytes): assoc id/state/rwnd/streams +
             // embedded sctp_paddrinfo. Report an ESTABLISHED association with the
             // negotiated stream counts; loopback has no per-path metrics to fill.

@@ -1283,6 +1283,10 @@ pub(super) fn sctp_recv_disconnected(socket: &Cap<SocketIdentity>) -> bool {
     let Some(payload) = socket.acquire_operational() else {
         return true;
     };
+    // 1-to-many (SEQPACKET) sockets receive from any peer — never ENOTCONN here.
+    if payload.with_options(|o| o.socket.sock_type != SocketType::Stream) {
+        return false;
+    }
     match payload.protocol_snapshot() {
         SocketProtocol::Sctp(TcpState::Connected { .. }) => payload.shutdown_wr(),
         SocketProtocol::Sctp(_) => true,

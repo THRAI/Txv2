@@ -531,6 +531,13 @@ impl SocketPayload {
             .map_or_else(Vec::new, RawSctpSocket::peers_snapshot)
     }
 
+    /// Number of 1-to-many (SEQPACKET) associations on this socket.
+    pub fn sctp_assoc_count(&self) -> usize {
+        self.raw_sctp
+            .as_ref()
+            .map_or(0, |raw| raw.peers_snapshot().len())
+    }
+
     pub fn record_packet_frame(&self, source: SockAddrLl, payload: Vec<u8>) -> Option<bool> {
         let raw_packet = self.raw_packet.as_ref()?;
         let became_readable = raw_packet.ingest_frame(source, payload)?;

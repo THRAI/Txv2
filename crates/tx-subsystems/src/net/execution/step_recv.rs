@@ -7,7 +7,7 @@ use crate::net::delegate::net_delegate_kick_poll;
 use crate::net::execution::{socket_recv_wait_token, yield_bytes_on_token, ByteStepOutcome};
 use crate::net::structure::{
     RecvWireSet, SendRecvFlags, SocketIdentity, SocketKind, SocketPayload, SocketProtocol,
-    SocketRecvBytesOutcome, TcpState,
+    SocketRecvBytesOutcome, SocketType, TcpState,
 };
 
 pub fn step_recv(
@@ -124,11 +124,15 @@ fn kick_tcp_loopback_after_recv(payload: &SocketPayload, bytes: usize) {
     }
 }
 
-/// True when an SCTP recv with no buffered data should report ENOTCONN: the
-/// socket either never had an established association (listening/bound/init/
-/// closed/connecting) or has locally shut down the write side (SHUT_WR), which
-/// for a 1-to-1 association means the association is being torn down.
+/// True when an SCTP recv with no buffered data should report ENOTCONN. This is
+/// a 1-to-1 (TCP-style) concept only: the socket either never had an established
+/// association (listening/bound/init/closed/connecting) or has locally shut down
+/// the write side (SHUT_WR), tearing the association down. A 1-to-many
+/// (SEQPACKET) socket can receive from any peer, so an empty recv blocks instead.
 fn sctp_recv_disconnected(payload: &SocketPayload) -> bool {
+    if payload.with_options(|o| o.socket.sock_type != SocketType::Stream) {
+        return false;
+    }
     match payload.protocol_snapshot() {
         SocketProtocol::Sctp(TcpState::Connected { .. }) => payload.shutdown_wr(),
         SocketProtocol::Sctp(_) => true,
