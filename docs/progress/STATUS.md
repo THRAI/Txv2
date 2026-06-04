@@ -1,3 +1,23 @@
+- 2026-06-05 **Pmap resident store has an opt-in chunked backend for teardown A/B.**
+  Added `ChunkedPmapResidentStore` behind the existing resident-store facade,
+  selected by `--cfg tx_vm_pmap_chunked_resident`; the default production alias
+  remains the address-sorted `VecPmapResidentStore` until observe data promotes
+  the new backend. The chunked store uses 64-entry sorted chunks and split-only
+  growth, preserving lookup, insertion, removal, range snapshots, page
+  enumeration, `MapPin` ownership, and shifted-entry accounting while removing
+  the old global suffix shift from full-chunk range teardown. Focused tests now
+  cover both backends for ordered lookup, replacement/removal, range drain,
+  partial boundary drains, and full middle-chunk drain without entry-shift
+  accounting. Verification: scoped `rustfmt`,
+  `CARGO_INCREMENTAL=0 cargo check -p tx-subsystems -q`,
+  `CARGO_INCREMENTAL=0 RUSTFLAGS="--cfg tx_vm_pmap_chunked_resident" cargo
+  check -p tx-subsystems -q`, `CARGO_INCREMENTAL=0 cargo test -p tx-subsystems
+  --lib resident::tests -- --nocapture --test-threads=1`, the same resident
+  test command under `RUSTFLAGS="--cfg tx_vm_pmap_chunked_resident"`, and scoped
+  `git diff --check`. Next step: run a pthread/map-path observe A/B comparing
+  `munmap.pmap_teardown_ns`, `pmap.teardown_drain_ns`, and
+  `teardown_shifted_entries` with and without `tx_vm_pmap_chunked_resident`.
+
 - 2026-06-05 **Pmap resident store now has a backend implementation trait.**
   Followed the recipe-tree facade pattern for the pmap resident shadow index:
   `PmapResidentStore` remains the production alias used by `VmPmap`, while

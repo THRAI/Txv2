@@ -7,11 +7,11 @@
 //! to enumerate resident pages and preserve `MapPin` ownership, but it does not
 //! prescribe this module's internal data structure.
 //!
-//! `PmapResidentStore` is the production alias used by `VmPmap`.
+//! `PmapResidentStore` is the production cfg-selected alias used by `VmPmap`.
 //! `PmapResidentStoreWith<B>` is the backend-neutral facade for A/B tests and
-//! future implementations. The v1 backend is an address-sorted `Vec`, preserved
-//! for behavior while later work swaps in a non-shifting teardown backend behind
-//! the `PmapResidentStoreImpl` trait.
+//! future implementations. The default backend is an address-sorted `Vec`,
+//! preserved for behavior and comparison. `tx_vm_pmap_chunked_resident` selects
+//! a chunked backend that avoids global suffix shifts on range teardown.
 
 use alloc::vec::Vec;
 use core::fmt::Debug;
@@ -19,7 +19,13 @@ use core::fmt::Debug;
 use super::{PmapMapping, PmapMappingSnapshot};
 use crate::vm::UserPage;
 
+#[cfg(not(tx_vm_pmap_chunked_resident))]
 type DefaultPmapResidentStoreImpl = VecPmapResidentStore;
+#[cfg(tx_vm_pmap_chunked_resident)]
+type DefaultPmapResidentStoreImpl = ChunkedPmapResidentStore;
+
+#[cfg(any(test, tx_vm_pmap_chunked_resident))]
+const CHUNK_CAPACITY: usize = 64;
 
 pub(super) type PmapResidentStore = PmapResidentStoreWith<DefaultPmapResidentStoreImpl>;
 
@@ -133,10 +139,12 @@ impl IntoIterator for DrainedMappings {
 }
 
 #[derive(Debug, Default)]
+#[cfg(any(test, not(tx_vm_pmap_chunked_resident)))]
 pub(super) struct VecPmapResidentStore {
     entries: Vec<(UserPage, PmapMapping)>,
 }
 
+#[cfg(any(test, not(tx_vm_pmap_chunked_resident)))]
 impl PmapResidentStoreImpl for VecPmapResidentStore {
     fn len(&self) -> usize {
         self.entries.len()
@@ -217,9 +225,498 @@ impl PmapResidentStoreImpl for VecPmapResidentStore {
     }
 }
 
+#[cfg(any(test, not(tx_vm_pmap_chunked_resident)))]
 impl VecPmapResidentStore {
     fn search(&self, page: UserPage) -> Result<usize, usize> {
         self.entries
             .binary_search_by_key(&page, |(entry_page, _)| *entry_page)
+    }
+}
+
+#[derive(Debug, Default)]
+#[cfg(any(test, tx_vm_pmap_chunked_resident))]
+pub(super) struct ChunkedPmapResidentStore {
+    chunks: Vec<ResidentChunk>,
+    len: usize,
+}
+
+#[cfg(any(test, tx_vm_pmap_chunked_resident))]
+impl PmapResidentStoreImpl for ChunkedPmapResidentStore {
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn reserve_additional(&mut self, additional: usize) {
+        if additional == 0 {
+            return;
+        }
+        let chunk_headroom = self
+            .chunks
+            .iter()
+            .map(ResidentChunk::spare_capacity)
+            .sum::<usize>();
+        let extra = additional.saturating_sub(chunk_headroom);
+        if extra > 0 {
+            self.chunks
+                .reserve(extra.saturating_add(CHUNK_CAPACITY - 1) / CHUNK_CAPACITY);
+        }
+    }
+
+    fn get(&self, page: &UserPage) -> Option<&PmapMapping> {
+        let chunk_index = self.find_chunk_for_page(*page)?;
+        self.chunks[chunk_index].get(page)
+    }
+
+    fn get_mut(&mut self, page: &UserPage) -> Option<&mut PmapMapping> {
+        let chunk_index = self.find_chunk_for_page(*page)?;
+        self.chunks[chunk_index].get_mut(page)
+    }
+
+    fn insert(&mut self, page: UserPage, mapping: PmapMapping) -> Option<PmapMapping> {
+        let chunk_index = match self.find_chunk_for_insert(page) {
+            Ok(index) => index,
+            Err(index) => {
+                self.chunks.insert(index, ResidentChunk::new());
+                index
+            }
+        };
+
+        let replaced = self.chunks[chunk_index].insert(page, mapping);
+        if replaced.is_none() {
+            self.len += 1;
+            if self.chunks[chunk_index].len() > CHUNK_CAPACITY {
+                let split = self.chunks[chunk_index].split();
+                self.chunks.insert(chunk_index + 1, split);
+            }
+        }
+        replaced
+    }
+
+    fn remove(&mut self, page: &UserPage) -> Option<PmapMapping> {
+        let chunk_index = self.find_chunk_for_page(*page)?;
+        let removed = self.chunks[chunk_index].remove(page)?;
+        self.len = self.len.saturating_sub(1);
+        if self.chunks[chunk_index].is_empty() {
+            self.chunks.remove(chunk_index);
+        }
+        Some(removed)
+    }
+
+    fn drain_range(&mut self, start: UserPage, end: UserPage) -> DrainedMappings {
+        if start >= end || self.chunks.is_empty() {
+            return DrainedMappings::default();
+        }
+
+        let mut entries = Vec::new();
+        let mut shifted_entries = 0usize;
+        let mut index = self
+            .find_chunk_index_by_first(start)
+            .unwrap_or_else(|index| index.saturating_sub(1));
+
+        while index < self.chunks.len() {
+            if self.chunks[index].first_page() >= Some(end) {
+                break;
+            }
+            if self.chunks[index]
+                .last_page()
+                .is_some_and(|last| last < start)
+            {
+                index += 1;
+                continue;
+            }
+
+            if self.chunks[index].covered_by(start, end) {
+                let chunk = self.chunks.remove(index);
+                self.len = self.len.saturating_sub(chunk.len());
+                entries.extend(chunk.into_entries());
+                continue;
+            }
+
+            let removed = self.chunks[index].drain_range(start, end);
+            shifted_entries = shifted_entries.saturating_add(removed.shifted_entries());
+            self.len = self.len.saturating_sub(removed.len());
+            entries.extend(removed);
+            if self.chunks[index].is_empty() {
+                self.chunks.remove(index);
+            } else {
+                index += 1;
+            }
+        }
+
+        DrainedMappings::new(entries, shifted_entries)
+    }
+
+    fn snapshots_in_range(
+        &self,
+        start: UserPage,
+        end: UserPage,
+    ) -> Vec<(UserPage, PmapMappingSnapshot)> {
+        let mut snapshots = Vec::new();
+        if start >= end {
+            return snapshots;
+        }
+        let mut index = self
+            .find_chunk_index_by_first(start)
+            .unwrap_or_else(|index| index.saturating_sub(1));
+        while index < self.chunks.len() {
+            if self.chunks[index].first_page() >= Some(end) {
+                break;
+            }
+            self.chunks[index].append_snapshots_in_range(start, end, &mut snapshots);
+            index += 1;
+        }
+        snapshots
+    }
+
+    fn pages_in_range(&self, start: UserPage, end: UserPage) -> Vec<UserPage> {
+        let mut pages = Vec::new();
+        if start >= end {
+            return pages;
+        }
+        let mut index = self
+            .find_chunk_index_by_first(start)
+            .unwrap_or_else(|index| index.saturating_sub(1));
+        while index < self.chunks.len() {
+            if self.chunks[index].first_page() >= Some(end) {
+                break;
+            }
+            self.chunks[index].append_pages_in_range(start, end, &mut pages);
+            index += 1;
+        }
+        pages
+    }
+}
+
+#[cfg(any(test, tx_vm_pmap_chunked_resident))]
+impl ChunkedPmapResidentStore {
+    fn find_chunk_for_page(&self, page: UserPage) -> Option<usize> {
+        let index = self
+            .find_chunk_index_by_first(page)
+            .unwrap_or_else(|index| index.saturating_sub(1));
+        self.chunks
+            .get(index)
+            .filter(|chunk| chunk.contains_page_range(page))
+            .map(|_| index)
+    }
+
+    fn find_chunk_for_insert(&self, page: UserPage) -> Result<usize, usize> {
+        if self.chunks.is_empty() {
+            return Err(0);
+        }
+        match self.find_chunk_index_by_first(page) {
+            Ok(index) => Ok(index),
+            Err(index) => {
+                if index > 0 && self.chunks[index - 1].accepts_insert(page) {
+                    Ok(index - 1)
+                } else {
+                    Err(index)
+                }
+            }
+        }
+    }
+
+    fn find_chunk_index_by_first(&self, page: UserPage) -> Result<usize, usize> {
+        self.chunks
+            .binary_search_by_key(&page, |chunk| chunk.first_page().expect("nonempty chunk"))
+    }
+}
+
+#[derive(Debug, Default)]
+#[cfg(any(test, tx_vm_pmap_chunked_resident))]
+struct ResidentChunk {
+    entries: Vec<(UserPage, PmapMapping)>,
+}
+
+#[cfg(any(test, tx_vm_pmap_chunked_resident))]
+impl ResidentChunk {
+    fn new() -> Self {
+        Self {
+            entries: Vec::with_capacity(CHUNK_CAPACITY),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn spare_capacity(&self) -> usize {
+        CHUNK_CAPACITY.saturating_sub(self.entries.len())
+    }
+
+    fn first_page(&self) -> Option<UserPage> {
+        self.entries.first().map(|(page, _)| *page)
+    }
+
+    fn last_page(&self) -> Option<UserPage> {
+        self.entries.last().map(|(page, _)| *page)
+    }
+
+    fn covered_by(&self, start: UserPage, end: UserPage) -> bool {
+        self.first_page().is_some_and(|first| first >= start)
+            && self.last_page().is_some_and(|last| last < end)
+    }
+
+    fn contains_page_range(&self, page: UserPage) -> bool {
+        self.first_page().is_some_and(|first| first <= page)
+            && self.last_page().is_some_and(|last| page <= last)
+    }
+
+    fn accepts_insert(&self, page: UserPage) -> bool {
+        self.last_page().is_some_and(|last| page >= last)
+            || self.contains_page_range(page)
+            || self.entries.len() < CHUNK_CAPACITY
+    }
+
+    fn get(&self, page: &UserPage) -> Option<&PmapMapping> {
+        self.search(*page).ok().map(|index| &self.entries[index].1)
+    }
+
+    fn get_mut(&mut self, page: &UserPage) -> Option<&mut PmapMapping> {
+        self.search(*page)
+            .ok()
+            .map(|index| &mut self.entries[index].1)
+    }
+
+    fn insert(&mut self, page: UserPage, mapping: PmapMapping) -> Option<PmapMapping> {
+        match self.search(page) {
+            Ok(index) => Some(core::mem::replace(&mut self.entries[index].1, mapping)),
+            Err(index) => {
+                self.entries.insert(index, (page, mapping));
+                None
+            }
+        }
+    }
+
+    fn remove(&mut self, page: &UserPage) -> Option<PmapMapping> {
+        self.search(*page)
+            .ok()
+            .map(|index| self.entries.remove(index).1)
+    }
+
+    fn drain_range(&mut self, start: UserPage, end: UserPage) -> DrainedMappings {
+        let start_index = self.search(start).unwrap_or_else(|index| index);
+        let end_index = self.search(end).unwrap_or_else(|index| index);
+        if start_index >= end_index {
+            return DrainedMappings::default();
+        }
+        let shifted_entries = self.entries.len().saturating_sub(end_index);
+        let entries = self.entries.drain(start_index..end_index).collect();
+        DrainedMappings::new(entries, shifted_entries)
+    }
+
+    fn split(&mut self) -> Self {
+        let split_at = self.entries.len() / 2;
+        Self {
+            entries: self.entries.split_off(split_at),
+        }
+    }
+
+    fn into_entries(self) -> Vec<(UserPage, PmapMapping)> {
+        self.entries
+    }
+
+    fn append_snapshots_in_range(
+        &self,
+        start: UserPage,
+        end: UserPage,
+        out: &mut Vec<(UserPage, PmapMappingSnapshot)>,
+    ) {
+        let start_index = self.search(start).unwrap_or_else(|index| index);
+        for (page, mapping) in self.entries[start_index..].iter() {
+            if *page >= end {
+                break;
+            }
+            out.push((*page, mapping.snapshot()));
+        }
+    }
+
+    fn append_pages_in_range(&self, start: UserPage, end: UserPage, out: &mut Vec<UserPage>) {
+        let start_index = self.search(start).unwrap_or_else(|index| index);
+        for (page, _) in self.entries[start_index..].iter() {
+            if *page >= end {
+                break;
+            }
+            out.push(*page);
+        }
+    }
+
+    fn search(&self, page: UserPage) -> Result<usize, usize> {
+        self.entries
+            .binary_search_by_key(&page, |(entry_page, _)| *entry_page)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::page_backed::MaterializedPagePin;
+    use crate::vm::Prot;
+    use alloc::vec;
+    use tx_hal::Ppn;
+    use tx_substrate::page_allocator::DeviceFrame;
+
+    fn mapping(page: usize) -> PmapMapping {
+        let ppn = Ppn(0x1000 + page);
+        PmapMapping::new(
+            ppn,
+            Prot::READ,
+            MaterializedPagePin::Device(DeviceFrame::new(ppn)),
+        )
+    }
+
+    fn page_values(entries: &[(UserPage, PmapMappingSnapshot)]) -> Vec<usize> {
+        entries.iter().map(|(page, _)| page.0).collect()
+    }
+
+    fn drained_values(drained: DrainedMappings) -> (Vec<usize>, usize) {
+        let shifted_entries = drained.shifted_entries();
+        let pages = drained.into_iter().map(|(page, _)| page.0).collect();
+        (pages, shifted_entries)
+    }
+
+    fn assert_ordered_backend<B: PmapResidentStoreImpl>() {
+        let mut store = PmapResidentStoreWith::<B>::new();
+        for page in [8, 1, 4, 2, 7, 3, 6, 5] {
+            assert!(store.insert(UserPage(page), mapping(page)).is_none());
+        }
+
+        assert_eq!(store.len(), 8);
+        assert_eq!(
+            page_values(&store.snapshots_in_range(UserPage(0), UserPage(10))),
+            vec![1, 2, 3, 4, 5, 6, 7, 8]
+        );
+        assert_eq!(
+            store.pages_in_range(UserPage(3), UserPage(7)),
+            vec![UserPage(3), UserPage(4), UserPage(5), UserPage(6)]
+        );
+        assert_eq!(
+            store.get(&UserPage(4)).map(|mapping| mapping.ppn),
+            Some(Ppn(0x1004))
+        );
+    }
+
+    fn assert_replace_and_remove_backend<B: PmapResidentStoreImpl>() {
+        let mut store = PmapResidentStoreWith::<B>::new();
+        assert!(store.insert(UserPage(4), mapping(4)).is_none());
+        let replacement = PmapMapping::new(
+            Ppn(0xbeef),
+            Prot::READ_WRITE,
+            MaterializedPagePin::Device(DeviceFrame::new(Ppn(0xbeef))),
+        );
+        let previous = store
+            .insert(UserPage(4), replacement)
+            .expect("previous mapping");
+        assert_eq!(previous.ppn, Ppn(0x1004));
+        assert_eq!(store.len(), 1);
+        assert_eq!(
+            store.get(&UserPage(4)).map(|mapping| mapping.ppn),
+            Some(Ppn(0xbeef))
+        );
+
+        let removed = store.remove(&UserPage(4)).expect("removed mapping");
+        assert_eq!(removed.ppn, Ppn(0xbeef));
+        assert_eq!(store.len(), 0);
+        assert!(store.remove(&UserPage(4)).is_none());
+    }
+
+    fn assert_drain_range_backend<B: PmapResidentStoreImpl>() {
+        let mut store = PmapResidentStoreWith::<B>::new();
+        for page in 0..96 {
+            store.insert(UserPage(page), mapping(page));
+        }
+
+        let (removed, shifted) = drained_values(store.drain_range(UserPage(16), UserPage(80)));
+        assert_eq!(removed, (16..80).collect::<Vec<_>>());
+        assert!(
+            shifted <= 16,
+            "chunked backend should not report global suffix shift"
+        );
+        assert_eq!(store.len(), 32);
+        assert_eq!(
+            page_values(&store.snapshots_in_range(UserPage(0), UserPage(96))),
+            (0..16).chain(80..96).collect::<Vec<_>>()
+        );
+    }
+
+    fn assert_partial_drain_keeps_boundary_chunks_searchable<B: PmapResidentStoreImpl>() {
+        let mut store = PmapResidentStoreWith::<B>::new();
+        for page in 0..96 {
+            store.insert(UserPage(page), mapping(page));
+        }
+
+        let (removed, _) = drained_values(store.drain_range(UserPage(16), UserPage(80)));
+        assert_eq!(removed, (16..80).collect::<Vec<_>>());
+        assert!(store.get(&UserPage(15)).is_some());
+        assert!(store.get(&UserPage(16)).is_none());
+        assert!(store.get(&UserPage(79)).is_none());
+        assert!(store.get(&UserPage(80)).is_some());
+
+        assert!(store.insert(UserPage(24), mapping(24)).is_none());
+        assert_eq!(
+            page_values(&store.snapshots_in_range(UserPage(0), UserPage(96))),
+            (0..16).chain(24..25).chain(80..96).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn vec_backend_preserves_order_and_lookup() {
+        assert_ordered_backend::<VecPmapResidentStore>();
+    }
+
+    #[test]
+    fn vec_backend_replaces_and_removes() {
+        assert_replace_and_remove_backend::<VecPmapResidentStore>();
+    }
+
+    #[test]
+    fn vec_backend_drains_range() {
+        let mut store = PmapResidentStoreWith::<VecPmapResidentStore>::new();
+        for page in 0..96 {
+            store.insert(UserPage(page), mapping(page));
+        }
+
+        let (removed, shifted) = drained_values(store.drain_range(UserPage(16), UserPage(80)));
+        assert_eq!(removed, (16..80).collect::<Vec<_>>());
+        assert_eq!(shifted, 16);
+    }
+
+    #[test]
+    fn chunked_backend_preserves_order_and_lookup() {
+        assert_ordered_backend::<ChunkedPmapResidentStore>();
+    }
+
+    #[test]
+    fn chunked_backend_replaces_and_removes() {
+        assert_replace_and_remove_backend::<ChunkedPmapResidentStore>();
+    }
+
+    #[test]
+    fn chunked_backend_drains_range_without_global_suffix_shift() {
+        assert_drain_range_backend::<ChunkedPmapResidentStore>();
+    }
+
+    #[test]
+    fn chunked_backend_keeps_boundary_chunks_searchable_after_partial_drain() {
+        assert_partial_drain_keeps_boundary_chunks_searchable::<ChunkedPmapResidentStore>();
+    }
+
+    #[test]
+    fn chunked_backend_drains_full_middle_chunks_without_entry_shift() {
+        let mut store = PmapResidentStoreWith::<ChunkedPmapResidentStore>::new();
+        for page in 0..192 {
+            store.insert(UserPage(page), mapping(page));
+        }
+
+        let (removed, shifted) = drained_values(store.drain_range(UserPage(64), UserPage(128)));
+        assert_eq!(removed, (64..128).collect::<Vec<_>>());
+        assert_eq!(shifted, 0);
+        assert_eq!(
+            page_values(&store.snapshots_in_range(UserPage(0), UserPage(192))),
+            (0..64).chain(128..192).collect::<Vec<_>>()
+        );
     }
 }
