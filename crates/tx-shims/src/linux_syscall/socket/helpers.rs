@@ -1323,6 +1323,27 @@ pub(super) fn read_sockopt_i32<'a>(
     bootstrap_read_user(&ctx.aspace, optval)
 }
 
+/// Read an `int`-or-`unsigned char` socket option value. `IP_MULTICAST_TTL` and
+/// `IP_MULTICAST_LOOP` accept either a 4-byte `int` or a 1-byte `char`; Linux
+/// reads a `char` when `optlen < sizeof(int)`.
+pub(super) fn read_sockopt_byte_or_i32<'a>(
+    ctx: &SyscallCtx<'a>,
+    optval: u64,
+    optlen: u32,
+) -> Result<i32, Errno> {
+    if optval == 0 {
+        return Err(Errno::EFAULT);
+    }
+    if optlen >= core::mem::size_of::<i32>() as u32 {
+        bootstrap_read_user(&ctx.aspace, optval)
+    } else if optlen >= 1 {
+        let byte: u8 = bootstrap_read_user(&ctx.aspace, optval)?;
+        Ok(byte as i32)
+    } else {
+        Err(Errno::EINVAL)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct PacketRxRingReq {
     pub block_size: u32,

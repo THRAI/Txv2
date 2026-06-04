@@ -1878,6 +1878,26 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             }
             set_ip_multicast_if(&payload, ctx, optval, optlen)
         }
+        (IPPROTO_IP, IP_MULTICAST_TTL) => {
+            let ttl = match read_sockopt_byte_or_i32(ctx, optval, optlen) {
+                Ok(ttl) => ttl,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            match ttl {
+                -1 => payload.with_options_mut(|opts| opts.ip.multicast_ttl = 1),
+                0..=255 => payload.with_options_mut(|opts| opts.ip.multicast_ttl = ttl as u8),
+                _ => return SyscallResult::Error(errno_to_i32(Errno::EINVAL)),
+            }
+            Ok(())
+        }
+        (IPPROTO_IP, IP_MULTICAST_LOOP) => {
+            let on = match read_sockopt_byte_or_i32(ctx, optval, optlen) {
+                Ok(value) => value != 0,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            payload.with_options_mut(|opts| opts.ip.multicast_loop = on);
+            Ok(())
+        }
         (SOL_IPV6, IPV6_V6ONLY) => {
             let on = match read_sockopt_bool(ctx, optval, optlen) {
                 Ok(on) => on,
@@ -2385,6 +2405,22 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             let addr = payload.with_options(|o| o.ip.ipv4_multicast_if);
             write_sockopt_bytes(ctx, optval, optlen_ptr, &addr.octets())
         }
+        (IPPROTO_IP, IP_MULTICAST_TTL) => write_sockopt_bytes(
+            ctx,
+            optval,
+            optlen_ptr,
+            &payload
+                .with_options(|o| o.ip.multicast_ttl as i32)
+                .to_le_bytes(),
+        ),
+        (IPPROTO_IP, IP_MULTICAST_LOOP) => write_sockopt_bytes(
+            ctx,
+            optval,
+            optlen_ptr,
+            &payload
+                .with_options(|o| o.ip.multicast_loop as i32)
+                .to_le_bytes(),
+        ),
         (SOL_IPV6, IPV6_V6ONLY) if payload.family() == AddressFamily::Inet6 => write_sockopt_i32(
             ctx,
             optval,
