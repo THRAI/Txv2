@@ -20,13 +20,14 @@ Date: 2026-06-03
 
 当前最重要的小计：
 
-- 已确认通过点数：`412` = syscall-network `229` +
+- 已确认通过点数：`413` = syscall-network `229` +
   `net.ipv6_lib` `76` + `net.tcp_cmds` `61` + `net.ipv6:ping601`
   `10` + `net.ipv6:ping602` `10` + `net.ipv6:ipneigh6_ip` `1` +
   `net.ipv6:traceroute601` `6` + `net.ipv6:tracepath601` `1` +
   `net.ipv6:tcpdump601` `1` + `net.ipv6:sendfile601` `4` +
   `net.ipv6:ip6tables` `6` + `net.ipv6:nft6` `5` +
-  `net.ipv6:dhcpd6` `1` + `net.ipv6:dnsmasq6` `1`。
+  `net.ipv6:dhcpd6` `1` + `net.ipv6:dnsmasq6` `1` +
+  `net.multicast:mc_cmds` `1`。
 - 已观察分母口径：`412/420` = syscall-network `229/236` +
   `net.ipv6_lib` `76/77` + `net.tcp_cmds` 已计分 `61/61` +
   `net.ipv6:ping601` `10/10` + `net.ipv6:ping602` `10/10` +
@@ -34,8 +35,8 @@ Date: 2026-06-03
   `net.ipv6:tracepath601` `1/1` + `net.ipv6:tcpdump601` `1/1` +
   `net.ipv6:sendfile601` `4/4` + `net.ipv6:ip6tables` `6/6` +
   `net.ipv6:nft6` `5/5` + `net.ipv6:dhcpd6` `1/1` +
-  `net.ipv6:dnsmasq6` `1/1`。
-- 上面的 `412/420` 仍然是 stitched/local 进度，不等于全量 LTP network
+  `net.ipv6:dnsmasq6` `1/1` + `net.multicast:mc_cmds` `1/1`。
+- 上面的 `413/421` 仍然是 stitched/local 进度，不等于全量 LTP network
   官方成绩；`TCONF` 和未跑模块没有计入分母。
 
 ## 总表
@@ -47,7 +48,7 @@ Date: 2026-06-03
 | IPv4/命令层网络 | `net.tcp_cmds` | 16 entries | 已计分 `61/61` | `runtest/net.tcp_cmds` 中 16 个入口全部有 focused passing witness；`tc01`、`dhcpd`、`dnsmasq` 已补齐 | 作为命令层回归基线；FTP 属于 `net_stress` 服务/压力模块，不在当前 `net.tcp_cmds` 表内 |
 | IPv6 命令层网络 | `net.ipv6` | 11 entries | 已计分 `46/46` | 11 个入口全部有 passing witness，包括 `dhcpd6`、`dnsmasq6`、`ip6tables`、`nft6` | 作为命令层回归基线；后续看更高级 `net.features` 或服务/压力模块 |
 | 高级网络特性 | `net.features` | 62 entries | not-run | 未开始；包含 BBR、DCCP、SCTP、TFO、VXLAN、VLAN、macvlan、macsec、GRE/GUE/FOU、Geneve、WireGuard 等 | 暂缓，等命令层/IPv6 baseline 更稳 |
-| 组播 | `net.multicast` | 4 entries | not-run | 未开始 | 暂缓 |
+| 组播 | `net.multicast` | 4 entries | `1/4` | `mc_cmds` 已通过；`mc_opts/mc_member/mc_commo` 需编译 helper、`netstat -gn`、长 sleep（mc_commo 还需 rhost）| 续做 `mc_opts`，其余视 helper/runtime 而定 |
 | 完整 SCTP | `net.sctp` | 41 entries | not-run | 未开始；不同于 syscall witness 里的 local-only SCTP 支持 | 除非明确 charter 完整 SCTP，否则暂缓 |
 | NFS/RPC/TIRPC | `net.nfs`、`net.rpc_tests`、`net.tirpc_tests` | 205 entries | not-run | 未开始；依赖服务、RPC/NFS 环境 | 暂缓 |
 | 网络压力测试 | `net_stress.*` | 588 entries | not-run | 未开始；覆盖服务、坏包、interface/route/multicast/ipsec 压力 | 暂缓 |
@@ -277,6 +278,17 @@ Implemented prerequisites observed during the `netstat` climb:
 - `/tx-ltp/bin/{tc,modprobe}` plus module/config metadata cover the `tc01`
   `sch_teql` witness. This only models the tested negative qdisc-add path, not
   full traffic-control scheduling.
+
+## 细表：`net.multicast`
+
+| 入口 | 得分 | 状态 | 说明 | witness |
+| --- | ---: | --- | --- | --- |
+| `mc_cmds` | `1/1` | pass | 三个 kernel 缺口已补：① `/proc/sys/net/ipv4/icmp_echo_ignore_broadcasts` procfs 文件读 `0`（我们从不抑制广播/组播 echo）；② `ip maddr show <iface>` 现在输出每个组播接口隐式加入的全主机组 `224.0.0.1`（保留状态文件条目，不回归 `iproute`）；③ raw ICMPv4 echo 到全主机组 `224.0.0.1` 现在由本地单播地址回应（绝不从组播地址回应），`ping -I <ipaddr> 224.0.0.1` 因此能看到本机应答。 | `target/oscomp/ltp-net-multicast-mc-cmds-after-impl-180s.txt`、`target/oscomp/ltp-net-multicast-mc-cmds-reconfirm-180s.txt` |
+| `mc_opts` | not-run | pending | 需编译 helper `mc_verify_opts`/`mc_verify_opts_error`，循环 10 次 + `ping -T`/`ping -I` 错误用例；逻辑简单但依赖镜像内 helper。 | — |
+| `mc_member` | not-run | pending | 需 `mc_member_test` helper、`netstat -gn`（`/proc/net/igmp` 投影）、数据文件、60s×2 sleep。 | — |
+| `mc_commo` | not-run | pending | 需 `mc_recv`/`mc_send` helper、`netstat -ng`、跨 rhost (`tst_rhost_run`)、100s sleep；最重。 | — |
+
+附带修复（回归保护）：`ip route add <dst> via <gw>`（无 `dev`）此前由新 route builtin 存成 `oif_name=None`，使 `/proc/net/route` 渲染不出出接口，回归了 `net.tcp_cmds:iproute` 子测 5。现在 `NetNamespacePayload::add_ipv4_route` 在缺省 `dev` 时从网关解析出接口（连接路由或 loopback），`iproute` 恢复 `6/6`。witness：`target/oscomp/ltp-net-tcp-cmds-iproute-oif-fix-360s.txt`。
 
 ## Native setup runtime note
 

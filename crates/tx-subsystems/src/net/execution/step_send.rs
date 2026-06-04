@@ -554,13 +554,19 @@ fn send_configured_icmpv4_echo(
     if payload.raw_icmp_protocol() != Some(ProtocolNumber(1)) {
         return StepOutcome::Err(Errno::EOPNOTSUPP);
     }
-    if !ipv4_addr_is_configured(dst_addr) {
+    let multicast_local = ipv4_multicast_group_is_joined_locally(dst_addr);
+    if !multicast_local && !ipv4_addr_is_configured(dst_addr) {
         return StepOutcome::Err(Errno::EOPNOTSUPP);
     }
     let Some(src_addr) = payload
         .raw_icmp_bound_local()
         .filter(|addr| *addr != Ipv4Address::UNSPECIFIED)
         .or_else(|| preferred_ipv4_source_for(&payload.net_namespace(), dst_addr))
+        .or_else(|| {
+            multicast_local
+                .then(|| first_configured_ipv4_source(&payload.net_namespace()))
+                .flatten()
+        })
     else {
         return StepOutcome::Err(Errno::EOPNOTSUPP);
     };
@@ -579,7 +585,20 @@ fn send_configured_icmpv4_echo(
             return StepOutcome::Err(Errno::EOPNOTSUPP);
         }
     };
-    deliver_icmpv4_reply_to_table(payload, request.reply_packet(), guard);
+    // A multicast echo is answered from the responding host's own unicast
+    // address (never from the group address) and addressed back to the sender.
+    let reply = if multicast_local {
+        crate::net::protocol::Icmpv4EchoPacket {
+            src: src_addr,
+            dst: request.src,
+            ident: request.ident,
+            seq_no: request.seq_no,
+            payload: request.payload.clone(),
+        }
+    } else {
+        request.reply_packet()
+    };
+    deliver_icmpv4_reply_to_table(payload, reply, guard);
     StepOutcome::Done(bytes.len())
 }
 
@@ -834,6 +853,26 @@ fn ipv4_addr_is_configured(addr: Ipv4Address) -> bool {
                 .into_iter()
                 .any(|link| link.is_up && link.ipv4_addr == Some(addr))
         })
+}
+
+const IPV4_ALL_HOSTS_GROUP: Ipv4Address = Ipv4Address::new([224, 0, 0, 1]);
+
+/// The all-hosts group (224.0.0.1) is implicitly joined by every multicast-
+/// capable interface, so the local host always answers an ICMP echo to it
+/// (we keep broadcast/multicast echo replies enabled, i.e. the
+/// `icmp_echo_ignore_broadcasts` sysctl reads 0).
+fn ipv4_multicast_group_is_joined_locally(addr: Ipv4Address) -> bool {
+    addr == IPV4_ALL_HOSTS_GROUP
+}
+
+fn first_configured_ipv4_source(
+    net_namespace: &PayloadCap<NetNamespacePayload>,
+) -> Option<Ipv4Address> {
+    net_namespace
+        .link_snapshot()
+        .into_iter()
+        .find(|link| link.is_up && !link.is_loopback && link.ipv4_addr.is_some())
+        .and_then(|link| link.ipv4_addr)
 }
 
 fn preferred_ipv4_source_for(

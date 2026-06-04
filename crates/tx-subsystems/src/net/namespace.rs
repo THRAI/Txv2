@@ -677,7 +677,7 @@ impl NetNamespacePayload {
     pub fn add_ipv4_route(
         &self,
         _authority: NetAdminAuthority,
-        route: NetNamespaceRouteConfig,
+        mut route: NetNamespaceRouteConfig,
     ) -> Result<(), Errno> {
         validate_route_config(route)?;
         if let Some(name) = route.oif_name {
@@ -685,6 +685,11 @@ impl NetNamespacePayload {
                 .into_iter()
                 .find(|link| link.name == name)
                 .ok_or(Errno::ENODEV)?;
+        } else if let Some(gateway) = route.gateway {
+            // No explicit `dev`: resolve the egress interface from the
+            // gateway's connected route (or loopback) so /proc/net/route and
+            // `ip route show` render `... via <gw> dev <oif>` like Linux.
+            route.oif_name = self.oif_for_gateway(gateway);
         }
 
         let entry = NetNamespaceRouteEntry::from_config(route);
@@ -836,6 +841,16 @@ impl NetNamespacePayload {
     }
 
     fn oif_for_gateway(&self, gateway: Ipv4Address) -> Option<&'static str> {
+        // A loopback gateway (127.0.0.0/8) is reached over the loopback device;
+        // the loopback link is intentionally absent from the connected-route
+        // snapshot, so resolve it directly here.
+        if gateway.octets()[0] == 127 {
+            return self
+                .link_snapshot()
+                .into_iter()
+                .find(|link| link.is_loopback)
+                .map(|link| link.name);
+        }
         self.route_snapshot()
             .into_iter()
             .filter(|route| route.kind == NetNamespaceRouteKind::Connected)
