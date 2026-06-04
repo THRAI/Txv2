@@ -38,11 +38,19 @@ Date: 2026-06-04
 - `test_inaddr_any(+v6)`:首条就是 `SCTP_EVENTS` + 通知路径,同上(阶段 2)。
 - `test_1_to_1_addrs`:前 3 个 errno 边界 case 过(含 EOPNOTSUPP),断在
   `sctp_getladdrs` 取真实本地地址列表(返 EOPNOTSUPP)——需多宿主地址 API(阶段 3)。
-- `test_tcp_style(+v6)`:case 1-2 过(accept/connect 边界),断在**第一个**客户端
-  `test_connect` → `ECONNREFUSED`。客户端是**预先 bind 到固定端口**再 connect(与
-  getname 的未绑定客户端不同),且紧接在一次对 listen socket 的(正确被拒的)connect
-  之后。疑点:`step_connect` 的 `require_socket_connect_target` 在被拒的
-  listener-connect 路径上是否对预绑定的 `clt_sk` 留下了连接索引污染。**待查**,值 44 case。
+- `test_tcp_style(+v6)`:**根因已查明并修掉一半**。原断点不是"第一个 connect",而是
+  **第 10 个**:测试 `listen(MAX_CLIENTS-1)=listen(9)` 后连 `MAX_CLIENTS=10` 个客户端,
+  期望全成功(再第 11 个 `clt2` 才被拒)。我们的 accept 队列 `is_full()` 用 `>= limit`
+  只收 9 个 → 第 10 个 `ETIMEDOUT`。Linux 语义是 `sk_ack_backlog > sk_max_ack_backlog`,
+  即 listen(N) 收 **N+1** 个。已把 `TcpBacklog::is_full` 和 `SocketAcceptQueue::push`
+  改为 `> limit`(payload.rs),TCP/SCTP 通用。**结果:tcp_style 2→10 TPASS**。
+  顺带修了 `step_bind` 的潜伏 bug:autobind 在已 bound/listening 的 socket 上调用
+  step_bind 会在协议状态检查拒绝(EINVAL)前就改了 bind 索引且不回滚 —— 现改为先查
+  可绑定状态再动表。两处都加了 host 回归测试(`rds_sctp_ltp_tests.rs`)。
+  **剩余 blocker(阶段 2-3)**:case 11 `recv(listen_sk)` 在未连接 socket 上应即时返错
+  却阻塞;case 12+ 要真实数据收发;case 13 `recv SHUTDOWN_COMP notification` 要
+  `SCTP_EVENTS` 订阅 + assoc_change/shutdown 通知。所以现在 case 11 会卡到超时,
+  整测试仍 FAIL —— 要等阶段 2 数据面+通知模型。
 
 **阶段 1 进展**:`SctpLevelOptions` sockopt 存储 + `SOL_SCTP` 接线已覆盖
 `SCTP_RTOINFO`/`SCTP_INITMSG`/`SCTP_ASSOCINFO`/`SCTP_STATUS`/`SCTP_PRIMARY_ADDR`/
@@ -72,8 +80,8 @@ Date: 2026-06-04
 | `test_sockopt` | 44 | TCONF(门) | 1 | — |
 | `test_sockopt_v6` | 44 | TCONF(门) | 1 | — |
 | `test_1_to_1_sockopt` | 23 | **pass** | 1 | `target/oscomp/ltp-net-sctp-1to1-sockopt.txt` |
-| `test_tcp_style` | 22 | TCONF(门) | 1 | — |
-| `test_tcp_style_v6` | 22 | TCONF(门) | 1 | — |
+| `test_tcp_style` | 22 | partial 10/22 | 2 | `target/oscomp/ltp-net-sctp-test_tcp_style.txt` |
+| `test_tcp_style_v6` | 22 | partial 10/22 | 2 | `target/oscomp/ltp-net-sctp-test_tcp_style_v6.txt` |
 | `test_1_to_1_socket_bind_listen` | 15 | **pass** | 1 | `target/oscomp/ltp-net-sctp-test_1_to_1_socket_bind_listen.txt` |
 | `test_basic` | 15 | TCONF(门) | 1 | — |
 | `test_basic_v6` | 15 | TCONF(门) | 1 | — |

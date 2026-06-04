@@ -161,6 +161,106 @@ fn sctp_loopback_stream_accepts_and_moves_bytes() {
 }
 
 #[test]
+fn sctp_rejected_connect_on_listener_does_not_break_listener() {
+    // Mirrors LTP test_tcp_style: a client connect must still succeed after a
+    // (correctly rejected) connect() is attempted on the listening socket.
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
+    let guard = tx_substrate::epoch::guard();
+
+    let listener = sctp_socket();
+    assert_eq!(
+        step_bind(&listener, inet(4100), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(step_listen(&listener, 5, &guard), StepOutcome::Done(()));
+
+    let client = sctp_socket();
+    assert_eq!(
+        step_bind(&client, inet(4101), &guard),
+        StepOutcome::Done(())
+    );
+
+    // Try to do an accept on the non-listening client. It should fail.
+    assert!(matches!(step_accept(&client, &guard), StepOutcome::Err(_)));
+
+    // A re-bind of the listening socket (as the implicit connect() autobind
+    // attempts) must be rejected WITHOUT mutating the bind index, otherwise the
+    // listener's registration would be clobbered.
+    assert_eq!(
+        step_bind(&listener, inet(4102), &guard),
+        StepOutcome::Err(Errno::EINVAL)
+    );
+
+    // Try to connect FROM the listening socket (to the client's port). It must
+    // fail and, crucially, must not disturb the listener's registration.
+    assert!(matches!(
+        step_connect(&listener, inet(4101), &guard),
+        StepOutcome::Err(_)
+    ));
+
+    // The client must still be able to connect to the listener.
+    assert_eq!(
+        step_connect(&client, inet(4100), &guard),
+        StepOutcome::Done(())
+    );
+    assert!(matches!(
+        step_accept(&listener, &guard),
+        StepOutcome::Done(_)
+    ));
+}
+
+#[test]
+fn sctp_listen_backlog_admits_n_plus_one_connections() {
+    // Linux accept-queue semantics: listen(N) admits N+1 pending connections
+    // (`sk_ack_backlog > sk_max_ack_backlog`). LTP test_tcp_style relies on this:
+    // it connects MAX_CLIENTS clients with listen(MAX_CLIENTS-1) and expects all
+    // to succeed, then one more to be refused.
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
+    let guard = tx_substrate::epoch::guard();
+
+    let listener = sctp_socket();
+    assert_eq!(
+        step_bind(&listener, inet(4400), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(step_listen(&listener, 2, &guard), StepOutcome::Done(()));
+
+    // listen(2) must admit 2 + 1 = 3 connections before refusing further ones.
+    for (i, port) in [4401u16, 4402, 4403].into_iter().enumerate() {
+        let client = sctp_socket();
+        assert_eq!(
+            step_bind(&client, inet(port), &guard),
+            StepOutcome::Done(()),
+            "bind client {i}"
+        );
+        assert_eq!(
+            step_connect(&client, inet(4400), &guard),
+            StepOutcome::Done(()),
+            "connect client {i} (within backlog+1)"
+        );
+    }
+
+    // The fourth connection exceeds backlog+1 and must be refused.
+    let overflow = sctp_socket();
+    assert_eq!(
+        step_bind(&overflow, inet(4404), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        step_connect(&overflow, inet(4400), &guard),
+        StepOutcome::Err(Errno::ECONNREFUSED),
+    );
+}
+
+#[test]
 fn sctp_ipv6_wildcard_listener_accepts_loopback_connect() {
     init_zones();
     let _lock = crate::test_support::EPOCH_TEST_LOCK

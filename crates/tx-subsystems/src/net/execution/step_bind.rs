@@ -27,6 +27,28 @@ pub fn step_bind(
     let Some(payload) = socket.acquire_operational() else {
         return StepOutcome::Err(Errno::ENOTCONN);
     };
+
+    // Reject a bind on a socket that is already past its initial state (bound,
+    // listening, connecting, connected, …) BEFORE touching the bind index. The
+    // protocol transition below would refuse it anyway (returning EINVAL), but
+    // the table mutation that precedes it is not rolled back — so without this
+    // guard a no-op bind (e.g. the implicit autobind on connect()) would clobber
+    // a listening socket's index entry. RawIcmp re-binds are handled in the
+    // transition match (its table step is a no-op), so it stays bindable here.
+    let bindable = matches!(
+        payload.protocol_snapshot(),
+        SocketProtocol::UnixDatagram(UnixDatagramState::Unbound)
+            | SocketProtocol::UnixStream(UnixStreamState::Init)
+            | SocketProtocol::Tcp(TcpState::Init)
+            | SocketProtocol::Sctp(TcpState::Init)
+            | SocketProtocol::Udp(UdpInner::Unbound)
+            | SocketProtocol::Rds(RdsState::Unbound)
+            | SocketProtocol::RawIcmp(_)
+    );
+    if !bindable {
+        return StepOutcome::Err(Errno::EINVAL);
+    }
+
     let table = payload.socket_table();
 
     let table_result = match witness.identity.kind {

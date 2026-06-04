@@ -1972,7 +1972,11 @@ impl TcpBacklog {
     }
 
     fn is_full(&self) -> bool {
-        self.limit == 0 || self.connecting.len() + self.connected.len() >= self.limit
+        // Linux semantics: the accept queue is full when the pending count
+        // EXCEEDS the backlog (`sk_ack_backlog > sk_max_ack_backlog`), so a
+        // listen(N) admits N+1 pending connections. `limit == 0` means the
+        // socket is not listening, so it accepts nothing.
+        self.limit == 0 || self.connecting.len() + self.connected.len() > self.limit
     }
 
     fn find_connecting(&self, local: IpEndpoint, peer: IpEndpoint) -> Option<usize> {
@@ -2029,7 +2033,10 @@ impl SocketAcceptQueue {
     }
 
     pub fn push(&mut self, entry: SocketAcceptEntry) -> bool {
-        if self.entries.len() >= self.limit {
+        // Matches `TcpBacklog::is_full`: a listen(N) accept queue holds N+1
+        // entries (Linux `sk_ack_backlog > sk_max_ack_backlog`). Only reached
+        // when the backlog is not full, so `limit` is always > 0 here.
+        if self.entries.len() > self.limit {
             return false;
         }
         self.entries.push(entry);
