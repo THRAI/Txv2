@@ -1,8 +1,9 @@
-use tx_substrate::zone::Cap;
+use tx_substrate::zone::{Cap, PayloadCap};
 
 use crate::execution::{Guard, StepOutcome};
 use crate::net::namespace::net_namespace_payloads_snapshot;
 use crate::net::structure::table::SocketTable;
+use crate::net::structure::SocketPayload;
 use crate::net::structure::{
     AcceptWireSet, ConnectionKey, IpEndpoint, RdsState, RecvWireSet, SendWireSet, SocketIdentity,
     SocketProtocol, TcpState, UdpInner, UnixDatagramState, UnixStreamState,
@@ -62,9 +63,11 @@ pub fn step_socket_close(
         }
         SocketProtocol::Tcp(TcpState::Init | TcpState::Closed) => {}
         SocketProtocol::Sctp(TcpState::Bound { local }) => {
+            peer_recv_woken += notify_sctp_seqpacket_peers_closed(&payload, table, guard);
             bindings_withdrawn += withdraw_ok(table.withdraw_sctp_bound(local));
         }
         SocketProtocol::Sctp(TcpState::Listening { local, .. }) => {
+            peer_recv_woken += notify_sctp_seqpacket_peers_closed(&payload, table, guard);
             bindings_withdrawn += withdraw_ok(table.withdraw_sctp_listener(local));
             bindings_withdrawn += withdraw_ok(table.withdraw_sctp_bound(local));
         }
@@ -237,6 +240,41 @@ fn mark_sctp_peer_closed(peer: &Cap<SocketIdentity>) -> PeerCloseWakes {
     }
 }
 
+/// When a 1-to-many (SEQPACKET) socket closes, deliver SCTP_SHUTDOWN_COMP to each
+/// peer association whose socket subscribed to association events. Returns the
+/// number of peer recv waiters woken.
+fn notify_sctp_seqpacket_peers_closed(
+    payload: &PayloadCap<SocketPayload>,
+    table: &SocketTable,
+    guard: &Guard<'_>,
+) -> usize {
+    let mut woken = 0;
+    for assoc in payload.sctp_peers() {
+        let Some(peer) = table
+            .lookup_sctp_listener_dual_stack_endpoint(assoc.peer, guard)
+            .or_else(|| table.lookup_sctp_bound(assoc.peer, guard))
+        else {
+            continue;
+        };
+        let Some(peer_payload) = peer.acquire_operational() else {
+            continue;
+        };
+        if !peer_payload.with_options(|o| o.sctp.event_assoc_change()) {
+            continue;
+        }
+        let streams = peer_payload.with_options(|o| o.sctp.initmsg_num_ostreams);
+        let bytes =
+            crate::net::execution::sctp_assoc_change_bytes(3 /* SHUTDOWN_COMP */, streams);
+        if peer_payload
+            .record_sctp_message(bytes, true, 0, 0, None)
+            .is_some()
+        {
+            woken += peer.readiness.fire_recv(RecvWireSet::HAS_DATA);
+        }
+    }
+    woken
+}
+
 /// Queue an SCTP_SHUTDOWN_EVENT notification on `peer`'s receive queue if it
 /// subscribed to shutdown events, so its next recvmsg surfaces the teardown.
 fn enqueue_sctp_shutdown_event(peer: &Cap<SocketIdentity>) {
@@ -247,7 +285,10 @@ fn enqueue_sctp_shutdown_event(peer: &Cap<SocketIdentity>) {
         return;
     }
     let bytes = crate::net::execution::sctp_shutdown_event_bytes();
-    if payload.record_sctp_message(bytes, true, 0, 0).is_some() {
+    if payload
+        .record_sctp_message(bytes, true, 0, 0, None)
+        .is_some()
+    {
         peer.readiness.fire_recv(RecvWireSet::HAS_DATA);
     }
 }

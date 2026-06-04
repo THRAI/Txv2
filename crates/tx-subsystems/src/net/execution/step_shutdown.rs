@@ -72,7 +72,10 @@ pub fn step_shutdown(
                     3, /* SCTP_SHUTDOWN_COMP */
                     streams,
                 );
-                if payload.record_sctp_message(bytes, true, 0, 0).is_some() {
+                if payload
+                    .record_sctp_message(bytes, true, 0, 0, None)
+                    .is_some()
+                {
                     socket.readiness.fire_recv(RecvWireSet::HAS_DATA);
                 }
             }

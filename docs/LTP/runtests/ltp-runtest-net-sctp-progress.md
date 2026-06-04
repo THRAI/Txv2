@@ -32,7 +32,18 @@ Date: 2026-06-04
 `test_getname`(13)、`test_getname_v6`(13)、`test_1_to_1_socket_bind_listen`(14)、
 `test_1_to_1_connect`(10)、`test_1_to_1_nonblock`(5)、`test_1_to_1_send`(8)、
 `test_1_to_1_recvfrom`(7)、`test_1_to_1_sendto`(4)、`test_1_to_1_events`(4)、
-`test_1_to_1_shutdown`(6)、`test_tcp_style`(22)、`test_tcp_style_v6`(22)。
+`test_1_to_1_shutdown`(6)、`test_tcp_style`(22)、`test_tcp_style_v6`(22)、
+`test_inaddr_any`(2)、`test_inaddr_any_v6`(2)、`test_recvmsg`(2)。
+
+**阶段 3 — 1-to-many(SEQPACKET)模型开张(2026-06-05):** `test_inaddr_any(+v6)`、
+`test_recvmsg` 过。模型:`RawSctpState` 加 per-socket 关联表(`peers: Vec<SctpAssoc>`)+
+帧带 `source`;新 `step_send_sctp_seqpacket`:`sendmsg(msg_name)` 查 dst 上 bound/listening
+的 socket,首次接触建联并给双方订阅端发 COMM_UP,数据**直投监听 socket 自身**(无 accept)
+带 source;recvmsg 用 frame.source 填 msg_name;close 时给各 peer 发 SHUTDOWN_COMP
+(`step_socket_close` 的 Bound/Listening 臂)。`sendmsg_impl` 按 sock_type 分流
+(SeqPacket→seqpacket 路径,Stream→1-to-1)。**剩余 1-to-many**:test_basic(case6
+SIGSEGV,疑 getladdrs)、test_connect(peeloff)、assoc_shutdown/abort(SCTP_STATUS
+要反映已拆关联)、sctp_sendrecvmsg、test_sockopt(+v6)。
 
 **阶段 2 tcp_style 收尾(2026-06-05):** `test_tcp_style(+v6)`(各 22)过。三处修正:
 - connect 失败(accept 队列满 ECONNREFUSED)不再把 socket 卡在 Connected ——
@@ -155,8 +166,8 @@ recvmsg→`EAGAIN` 可做,但 TEST5 要 `sendmsg`/`recvmsg`+`sctp_sndrcvinfo`+`M
 | `test_1_to_1_addrs` | 10 | TCONF(门) | 1 | — |
 | `test_1_to_1_rtoinfo` | 3 | **pass** | 1 | `target/oscomp/ltp-net-sctp-rtoinfo-120s.txt` |
 | `test_1_to_1_initmsg_connect` | 2 | **pass** | 1 | `target/oscomp/ltp-net-sctp-1to1-initmsg.txt` |
-| `test_inaddr_any` | 2 | TCONF(门) | 1 | — |
-| `test_inaddr_any_v6` | 2 | TCONF(门) | 1 | — |
+| `test_inaddr_any` | 2 | **pass** | 2 | `target/oscomp/ltp-net-sctp-m-test_inaddr_any.txt` |
+| `test_inaddr_any_v6` | 2 | **pass** | 2 | `target/oscomp/ltp-net-sctp-m-test_inaddr_any_v6.txt` |
 | `test_1_to_1_sendmsg` | 14 | TCONF(门) | 2 | — |
 | `test_1_to_1_accept_close` | 10 | **pass** | 2 | `target/oscomp/ltp-net-sctp-phase0-340s.txt` |
 | `test_1_to_1_connect` | 10 | **pass** | 1 | `target/oscomp/ltp-net-sctp-test_1_to_1_connect.txt` |
@@ -170,7 +181,7 @@ recvmsg→`EAGAIN` 可做,但 TEST5 要 `sendmsg`/`recvmsg`+`sctp_sndrcvinfo`+`M
 | `test_1_to_1_nonblock` | 5 | **pass** | 2 | `target/oscomp/ltp-net-sctp-test_1_to_1_nonblock.txt` |
 | `test_1_to_1_events` | 4 | **pass** | 2 | `target/oscomp/ltp-net-sctp-test_1_to_1_events.txt` |
 | `test_1_to_1_sendto` | 4 | **pass** | 2 | `target/oscomp/ltp-net-sctp-test_1_to_1_sendto.txt` |
-| `test_recvmsg` | 2 | TCONF(门) | 2 | — |
+| `test_recvmsg` | 2 | **pass** | 2 | `target/oscomp/ltp-net-sctp-m-test_recvmsg.txt` |
 | `test_assoc_abort` | 1 | TCONF(门) | 2 | — |
 | `test_assoc_shutdown` | 1 | TCONF(门) | 2 | — |
 | `test_connectx` | 10 | TCONF(门) | 3 | — |

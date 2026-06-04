@@ -15,15 +15,15 @@ use tx_subsystems::net::{
     netlink_route_send_with_netns_resolvers, netlink_xfrm_recv, netlink_xfrm_send, require_net_raw,
     socket_open_file_from_identity, step_accept, step_bind, step_connect, step_listen,
     step_poll_ready, step_poll_wait_token, step_process_loopback_udp, step_recv_kernel_bytes,
-    step_send_sctp_message, step_send_to_kernel_bytes, step_send_to_unix_path_kernel_bytes,
-    step_send_udp_loopback_kernel_bytes, step_shutdown, step_socket_close,
-    step_socket_open_file_in_namespace, step_tcp_loopback_handshake, step_tcp_loopback_transfer,
-    step_unix_socketpair_connect, AddressFamily, ConnectionKey, IpEndpoint, Ipv4Address,
-    Ipv4MulticastGroup, Ipv6Address, KernelSockAddr, LingerOption, NetNamespacePayload, PollMask,
-    RecvWireSet, SendRecvFlags, SockAddrIn, SockAddrIn6, SockAddrLl, SockShutdownCmd,
-    SocketHandleFlags, SocketIdentity, SocketKind, SocketOperationalEvidence, SocketProtocol,
-    SocketType, TcpState, TcpTlsUlpState, UdpInner, UnixDatagramState, UnixPeerCred,
-    UnixSocketPath, UnixStreamState, ValidSocketType, VIRTIO_NET_DEFAULT_MTU,
+    step_send_sctp_message, step_send_sctp_seqpacket, step_send_to_kernel_bytes,
+    step_send_to_unix_path_kernel_bytes, step_send_udp_loopback_kernel_bytes, step_shutdown,
+    step_socket_close, step_socket_open_file_in_namespace, step_tcp_loopback_handshake,
+    step_tcp_loopback_transfer, step_unix_socketpair_connect, AddressFamily, ConnectionKey,
+    IpEndpoint, Ipv4Address, Ipv4MulticastGroup, Ipv6Address, KernelSockAddr, LingerOption,
+    NetNamespacePayload, PollMask, RecvWireSet, SendRecvFlags, SockAddrIn, SockAddrIn6, SockAddrLl,
+    SockShutdownCmd, SocketHandleFlags, SocketIdentity, SocketKind, SocketOperationalEvidence,
+    SocketProtocol, SocketType, TcpState, TcpTlsUlpState, UdpInner, UnixDatagramState,
+    UnixPeerCred, UnixSocketPath, UnixStreamState, ValidSocketType, VIRTIO_NET_DEFAULT_MTU,
 };
 use tx_subsystems::signal::step_kill_process;
 use tx_subsystems::vfs::structure::OpenFileBacking;
@@ -1406,10 +1406,31 @@ async fn sendmsg_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
     // send so the peer's recvmsg can echo the ancillary data back.
     if socket.kind == SocketKind::Sctp {
         let info = sctp_info.unwrap_or_default();
+        let is_seqpacket = socket
+            .acquire_operational()
+            .is_some_and(|p| p.with_options(|o| o.socket.sock_type == SocketType::SeqPacket));
         loop {
             let outcome = {
                 let guard = tx_substrate::epoch::guard();
-                step_send_sctp_message(&socket, &bytes, info.stream, info.ppid, flags, &guard)
+                match (is_seqpacket, dst) {
+                    (true, Some(dst)) => step_send_sctp_seqpacket(
+                        &socket,
+                        dst,
+                        &bytes,
+                        info.stream,
+                        info.ppid,
+                        flags,
+                        &guard,
+                    ),
+                    _ => step_send_sctp_message(
+                        &socket,
+                        &bytes,
+                        info.stream,
+                        info.ppid,
+                        flags,
+                        &guard,
+                    ),
+                }
             };
             match outcome {
                 StepOutcome::Done(sent) => {

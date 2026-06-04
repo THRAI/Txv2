@@ -984,7 +984,7 @@ fn send_sctp_stream_bytes(
         return StepOutcome::Done(bytes.len());
     }
     let Some(became_readable) =
-        peer_payload.record_sctp_message(bytes.to_vec(), false, stream, ppid)
+        peer_payload.record_sctp_message(bytes.to_vec(), false, stream, ppid, None)
     else {
         return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
     };
@@ -1023,4 +1023,79 @@ pub fn step_send_sctp_message(
         return StepOutcome::Done(0);
     }
     send_sctp_stream_bytes(socket, &payload, bytes, stream, ppid, guard)
+}
+
+/// 1-to-many (SEQPACKET) send: deliver one message to the peer socket bound or
+/// listening at `dst`, creating the association on first contact (with COMM_UP
+/// to both subscribed ends). The message is delivered to the peer's own receive
+/// queue (no accept), tagged with this socket's endpoint as the source so the
+/// peer's recvmsg fills msg_name.
+pub fn step_send_sctp_seqpacket(
+    socket: &Cap<SocketIdentity>,
+    dst: IpEndpoint,
+    bytes: &[u8],
+    stream: u16,
+    ppid: u32,
+    flags: SendRecvFlags,
+    guard: &Guard<'_>,
+) -> ByteStepOutcome<usize> {
+    let witness = match require_socket_write_target(socket, flags, guard) {
+        Ok(witness) => witness,
+        Err(errno) => return StepOutcome::Err(errno),
+    };
+    debug_assert_eq!(witness.identity.raw(), socket.raw());
+    let Some(payload) = socket.acquire_operational() else {
+        return StepOutcome::Err(Errno::ENOTCONN);
+    };
+    if let Some(errno) = send_flags_error(witness.flags) {
+        return StepOutcome::Err(errno);
+    }
+    if payload.shutdown_wr() {
+        return StepOutcome::Err(Errno::EPIPE);
+    }
+    let local = match payload.protocol_snapshot() {
+        SocketProtocol::Sctp(TcpState::Bound { local })
+        | SocketProtocol::Sctp(TcpState::Listening { local, .. })
+        | SocketProtocol::Sctp(TcpState::Connecting { local, .. })
+        | SocketProtocol::Sctp(TcpState::Connected { local, .. }) => local,
+        _ => return StepOutcome::Err(Errno::EADDRNOTAVAIL),
+    };
+    if bytes.is_empty() {
+        return StepOutcome::Done(0);
+    }
+    if !dst.is_loopback() {
+        return StepOutcome::Err(Errno::EOPNOTSUPP);
+    }
+
+    let table = payload.socket_table();
+    let Some(peer) = table
+        .lookup_sctp_listener_dual_stack_endpoint(dst, guard)
+        .or_else(|| table.lookup_sctp_bound(dst, guard))
+    else {
+        return StepOutcome::Err(Errno::ECONNREFUSED);
+    };
+    let Some(peer_payload) = peer.acquire_operational() else {
+        return StepOutcome::Err(Errno::ECONNREFUSED);
+    };
+
+    // On first contact, establish the association on both ends and surface
+    // COMM_UP to whichever side subscribed to association events.
+    let is_new = payload
+        .sctp_ensure_assoc(dst)
+        .map_or(false, |(_, is_new)| is_new);
+    if is_new {
+        super::step_connect::enqueue_sctp_comm_up(socket);
+        let _ = peer_payload.sctp_ensure_assoc(local);
+        super::step_connect::enqueue_sctp_comm_up(&peer);
+    }
+
+    let Some(became_readable) =
+        peer_payload.record_sctp_message(bytes.to_vec(), false, stream, ppid, Some(local))
+    else {
+        return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
+    };
+    if became_readable {
+        peer.readiness.fire_recv(RecvWireSet::HAS_DATA);
+    }
+    StepOutcome::Done(bytes.len())
 }

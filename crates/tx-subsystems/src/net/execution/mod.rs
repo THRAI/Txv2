@@ -58,8 +58,9 @@ pub use step_process_network_events::{
 };
 pub use step_recv::{step_recv, step_recv_kernel_bytes};
 pub use step_send::{
-    step_send, step_send_kernel_bytes, step_send_sctp_message, step_send_to_kernel_bytes,
-    step_send_to_kernel_bytes_with_poll_kick, step_send_to_unix_path_kernel_bytes,
+    step_send, step_send_kernel_bytes, step_send_sctp_message, step_send_sctp_seqpacket,
+    step_send_to_kernel_bytes, step_send_to_kernel_bytes_with_poll_kick,
+    step_send_to_unix_path_kernel_bytes,
 };
 pub use step_shutdown::{step_shutdown, ShutdownOutcome};
 pub use step_socket_close::{step_socket_close, SocketCloseOutcome};

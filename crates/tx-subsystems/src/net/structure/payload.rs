@@ -511,11 +511,24 @@ impl SocketPayload {
         notification: bool,
         stream: u16,
         ppid: u32,
+        source: Option<IpEndpoint>,
     ) -> Option<bool> {
         let raw_sctp = self.raw_sctp.as_ref()?;
-        let became_readable = raw_sctp.ingest_message(payload, notification, stream, ppid)?;
+        let became_readable =
+            raw_sctp.ingest_message(payload, notification, stream, ppid, source)?;
         self.refresh_io_from_raw();
         Some(became_readable)
+    }
+
+    /// 1-to-many: find or create the association to `peer`; returns (id, is_new).
+    pub(crate) fn sctp_ensure_assoc(&self, peer: IpEndpoint) -> Option<(u32, bool)> {
+        Some(self.raw_sctp.as_ref()?.ensure_assoc(peer))
+    }
+
+    pub(crate) fn sctp_peers(&self) -> Vec<SctpAssoc> {
+        self.raw_sctp
+            .as_ref()
+            .map_or_else(Vec::new, RawSctpSocket::peers_snapshot)
     }
 
     pub fn record_packet_frame(&self, source: SockAddrLl, payload: Vec<u8>) -> Option<bool> {
@@ -719,7 +732,7 @@ impl SocketPayload {
                 let drain = raw_sctp.recv_message(out, peek)?;
                 SocketRecvBytesOutcome {
                     bytes: drain.bytes,
-                    source: None,
+                    source: drain.source,
                     unix_source: None,
                     packet_source: None,
                     destination: None,
@@ -1540,13 +1553,24 @@ pub(crate) struct RdsRecvDrain {
 
 /// One queued SCTP message (boundary-preserved) plus its ancillary metadata.
 /// `notification` marks a control event (assoc_change / shutdown) that recvmsg
-/// surfaces with MSG_NOTIFICATION; `stream`/`ppid` carry the sctp_sndrcvinfo.
+/// surfaces with MSG_NOTIFICATION; `stream`/`ppid` carry the sctp_sndrcvinfo;
+/// `source` is the sender's endpoint for 1-to-many recvmsg msg_name (None for
+/// 1-to-1, where there is a single fixed peer).
 #[derive(Clone)]
 struct SctpFrame {
     data: Vec<u8>,
     notification: bool,
     stream: u16,
     ppid: u32,
+    source: Option<IpEndpoint>,
+}
+
+/// A 1-to-many (SEQPACKET) association tracked on a socket: the peer endpoint and
+/// the locally-assigned association id.
+#[derive(Clone, Copy)]
+pub(crate) struct SctpAssoc {
+    pub peer: IpEndpoint,
+    pub assoc_id: u32,
 }
 
 pub(crate) struct RawSctpSocket {
@@ -1570,10 +1594,19 @@ impl RawSctpSocket {
         notification: bool,
         stream: u16,
         ppid: u32,
+        source: Option<IpEndpoint>,
     ) -> Option<bool> {
         self.state
             .lock()
-            .push_message(bytes, notification, stream, ppid, self.recv_limit)
+            .push_message(bytes, notification, stream, ppid, source, self.recv_limit)
+    }
+
+    pub fn ensure_assoc(&self, peer: IpEndpoint) -> (u32, bool) {
+        self.state.lock().ensure_assoc(peer)
+    }
+
+    pub fn peers_snapshot(&self) -> Vec<SctpAssoc> {
+        self.state.lock().peers_snapshot()
     }
 
     pub fn recv_len(&self, len: usize, peek: bool) -> Option<(usize, bool)> {
@@ -1596,6 +1629,9 @@ impl RawSctpSocket {
 struct RawSctpState {
     frames: Vec<SctpFrame>,
     queued_bytes: usize,
+    /// 1-to-many peer associations (SEQPACKET). Empty for 1-to-1 sockets.
+    peers: Vec<SctpAssoc>,
+    next_assoc_id: u32,
 }
 
 impl RawSctpState {
@@ -1603,6 +1639,8 @@ impl RawSctpState {
         Self {
             frames: Vec::new(),
             queued_bytes: 0,
+            peers: Vec::new(),
+            next_assoc_id: 1,
         }
     }
 
@@ -1612,6 +1650,7 @@ impl RawSctpState {
         notification: bool,
         stream: u16,
         ppid: u32,
+        source: Option<IpEndpoint>,
         recv_limit: usize,
     ) -> Option<bool> {
         let was_empty = self.queued_bytes == 0;
@@ -1624,8 +1663,25 @@ impl RawSctpState {
             notification,
             stream,
             ppid,
+            source,
         });
         Some(was_empty)
+    }
+
+    /// Find an existing 1-to-many association to `peer`, or create one. Returns
+    /// (assoc_id, is_new).
+    fn ensure_assoc(&mut self, peer: IpEndpoint) -> (u32, bool) {
+        if let Some(assoc) = self.peers.iter().find(|a| a.peer == peer) {
+            return (assoc.assoc_id, false);
+        }
+        let assoc_id = self.next_assoc_id;
+        self.next_assoc_id = self.next_assoc_id.wrapping_add(1).max(1);
+        self.peers.push(SctpAssoc { peer, assoc_id });
+        (assoc_id, true)
+    }
+
+    fn peers_snapshot(&self) -> Vec<SctpAssoc> {
+        self.peers.clone()
     }
 
     fn recv_len(&mut self, len: usize, peek: bool) -> Option<(usize, bool)> {
@@ -1649,6 +1705,7 @@ impl RawSctpState {
         let notification = front.notification;
         let stream = front.stream;
         let ppid = front.ppid;
+        let source = front.source;
         let n = core::cmp::min(out.len(), front_len);
         out[..n].copy_from_slice(&front.data[..n]);
         let eor = n == front_len;
@@ -1662,6 +1719,7 @@ impl RawSctpState {
             notification,
             stream,
             ppid,
+            source,
         })
     }
 
@@ -1697,6 +1755,8 @@ pub(crate) struct SctpRecvDrain {
     /// sctp_sndrcvinfo stream id / payload protocol id for the message.
     pub stream: u16,
     pub ppid: u32,
+    /// Sender endpoint for 1-to-many recvmsg msg_name (None for 1-to-1).
+    pub source: Option<IpEndpoint>,
 }
 
 pub(crate) struct RawUnixSocket {
