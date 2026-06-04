@@ -1213,6 +1213,33 @@ fn parse_sctp_sndrcvinfo(ctx: &SyscallCtx<'_>, header: &UserMsghdr) -> Option<Sc
     })
 }
 
+/// Write a `struct sctp_getaddrs { assoc_id; addr_num; addrs[] }` reply for
+/// SCTP_GET_LOCAL_ADDRS / SCTP_GET_PEER_ADDRS with a single address. addr_num is
+/// at offset 4, the sockaddr starts at offset 8 (where libc memmoves it from).
+fn write_sctp_getaddrs(
+    ctx: &SyscallCtx<'_>,
+    optval: u64,
+    optlen_ptr: u64,
+    endpoint: IpEndpoint,
+) -> Result<(), Errno> {
+    let mut buf = [0u8; 8 + SOCKADDR_IN6_BYTES as usize];
+    buf[4..8].copy_from_slice(&1u32.to_le_bytes()); // addr_num = 1
+    let total = if endpoint.family == AddressFamily::Inet6 {
+        // sockaddr_in6 @8: family/port/flowinfo/addr@16/scope = 28 bytes.
+        buf[8..10].copy_from_slice(&AF_INET6.to_le_bytes());
+        buf[10..12].copy_from_slice(&endpoint.port.to_be_bytes());
+        buf[16..32].copy_from_slice(&endpoint.addr6.octets());
+        8 + SOCKADDR_IN6_BYTES as usize
+    } else {
+        // sockaddr_in @8: family/port/addr = 16 bytes.
+        buf[8..10].copy_from_slice(&AF_INET.to_le_bytes());
+        buf[10..12].copy_from_slice(&endpoint.port.to_be_bytes());
+        buf[12..16].copy_from_slice(&endpoint.addr.octets());
+        8 + SOCKADDR_IN_BYTES as usize
+    };
+    write_sockopt_bytes(ctx, optval, optlen_ptr, &buf[..total])
+}
+
 /// Write an SCTP_SNDRCV control message (sctp_sndrcvinfo with `stream`/`ppid`)
 /// into a recvmsg msghdr's control buffer and set msg_controllen. If there is no
 /// room, the control data is omitted (controllen left at 0).
@@ -2871,6 +2898,18 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
         (SOL_SCTP, SCTP_EVENTS) if socket.kind == SocketKind::Sctp => {
             let buf = payload.with_options(|o| o.sctp.events_subscribe);
             write_sockopt_bytes(ctx, optval, optlen_ptr, &buf)
+        }
+        (SOL_SCTP, SCTP_GET_LOCAL_ADDRS) if socket.kind == SocketKind::Sctp => {
+            match socket_local_endpoint(&socket) {
+                Ok(endpoint) => write_sctp_getaddrs(ctx, optval, optlen_ptr, endpoint),
+                Err(errno) => Err(errno),
+            }
+        }
+        (SOL_SCTP, SCTP_GET_PEER_ADDRS) if socket.kind == SocketKind::Sctp => {
+            match socket_peer_endpoint(&socket) {
+                Ok(endpoint) => write_sctp_getaddrs(ctx, optval, optlen_ptr, endpoint),
+                Err(errno) => Err(errno),
+            }
         }
         (SOL_IPV6, IPV6_V6ONLY) if payload.family() == AddressFamily::Inet6 => write_sockopt_i32(
             ctx,

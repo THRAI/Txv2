@@ -163,7 +163,7 @@ recvmsg→`EAGAIN` 可做,但 TEST5 要 `sendmsg`/`recvmsg`+`sctp_sndrcvinfo`+`M
 | `test_basic_v6` | 15 | TCONF(门) | 1 | — |
 | `test_getname` | 13 | **pass** | 1 | `target/oscomp/ltp-net-sctp-getname.txt` |
 | `test_getname_v6` | 13 | **pass** | 1 | `target/oscomp/ltp-net-sctp-getname-v6.txt` |
-| `test_1_to_1_addrs` | 10 | TCONF(门) | 1 | — |
+| `test_1_to_1_addrs` | 10 | **pass** | 3 | `target/oscomp/ltp-net-sctp-addrs.txt` |
 | `test_1_to_1_rtoinfo` | 3 | **pass** | 1 | `target/oscomp/ltp-net-sctp-rtoinfo-120s.txt` |
 | `test_1_to_1_initmsg_connect` | 2 | **pass** | 1 | `target/oscomp/ltp-net-sctp-1to1-initmsg.txt` |
 | `test_inaddr_any` | 2 | **pass** | 2 | `target/oscomp/ltp-net-sctp-m-test_inaddr_any.txt` |
