@@ -27,9 +27,22 @@ Date: 2026-06-04
 - witness:`target/oscomp/ltp-net-sctp-probe-340s.txt`(开门前全 TCONF)、
   `target/oscomp/ltp-net-sctp-phase0-340s.txt`(开门后,accept_close 过)。
 
-静态 case 合计 ≈ **~400**(含 9 个 `_v6` 变体)。当前确认通过:`accept_close`(10 case)、
-`test_1_to_1_rtoinfo`(3 case)、`test_1_to_1_initmsg_connect`(2 case)、
-`test_1_to_1_sockopt`(22 case)。
+静态 case 合计 ≈ **~400**(含 9 个 `_v6` 变体)。当前确认通过:`accept_close`(10)、
+`test_1_to_1_rtoinfo`(3)、`test_1_to_1_initmsg_connect`(2)、`test_1_to_1_sockopt`(22)、
+`test_getname`(13)、`test_getname_v6`(13)、`test_1_to_1_socket_bind_listen`(14)。
+
+**phase-1 探针(2026-06-04,逐个单跑)发现的剩余 blocker**:
+- `test_basic(+v6)`:socket/bind 过后断在 `setsockopt(SCTP_EVENTS)` →"Protocol not
+  available"(catch-all 返 ENOPROTOOPT)。但即便实现 EVENTS,test_basic 还要 sendmsg/
+  recvmsg + COMM_UP/SHUTDOWN 通知 + `sctp_getladdrs/getpaddrs` —— 整体属**阶段 2-3**。
+- `test_inaddr_any(+v6)`:首条就是 `SCTP_EVENTS` + 通知路径,同上(阶段 2)。
+- `test_1_to_1_addrs`:前 3 个 errno 边界 case 过(含 EOPNOTSUPP),断在
+  `sctp_getladdrs` 取真实本地地址列表(返 EOPNOTSUPP)——需多宿主地址 API(阶段 3)。
+- `test_tcp_style(+v6)`:case 1-2 过(accept/connect 边界),断在**第一个**客户端
+  `test_connect` → `ECONNREFUSED`。客户端是**预先 bind 到固定端口**再 connect(与
+  getname 的未绑定客户端不同),且紧接在一次对 listen socket 的(正确被拒的)connect
+  之后。疑点:`step_connect` 的 `require_socket_connect_target` 在被拒的
+  listener-connect 路径上是否对预绑定的 `clt_sk` 留下了连接索引污染。**待查**,值 44 case。
 
 **阶段 1 进展**:`SctpLevelOptions` sockopt 存储 + `SOL_SCTP` 接线已覆盖
 `SCTP_RTOINFO`/`SCTP_INITMSG`/`SCTP_ASSOCINFO`/`SCTP_STATUS`/`SCTP_PRIMARY_ADDR`/
@@ -61,11 +74,11 @@ Date: 2026-06-04
 | `test_1_to_1_sockopt` | 23 | **pass** | 1 | `target/oscomp/ltp-net-sctp-1to1-sockopt.txt` |
 | `test_tcp_style` | 22 | TCONF(门) | 1 | — |
 | `test_tcp_style_v6` | 22 | TCONF(门) | 1 | — |
-| `test_1_to_1_socket_bind_listen` | 15 | TCONF(门) | 1 | — |
+| `test_1_to_1_socket_bind_listen` | 15 | **pass** | 1 | `target/oscomp/ltp-net-sctp-test_1_to_1_socket_bind_listen.txt` |
 | `test_basic` | 15 | TCONF(门) | 1 | — |
 | `test_basic_v6` | 15 | TCONF(门) | 1 | — |
-| `test_getname` | 13 | TCONF(门) | 1 | — |
-| `test_getname_v6` | 13 | TCONF(门) | 1 | — |
+| `test_getname` | 13 | **pass** | 1 | `target/oscomp/ltp-net-sctp-getname.txt` |
+| `test_getname_v6` | 13 | **pass** | 1 | `target/oscomp/ltp-net-sctp-getname-v6.txt` |
 | `test_1_to_1_addrs` | 10 | TCONF(门) | 1 | — |
 | `test_1_to_1_rtoinfo` | 3 | **pass** | 1 | `target/oscomp/ltp-net-sctp-rtoinfo-120s.txt` |
 | `test_1_to_1_initmsg_connect` | 2 | **pass** | 1 | `target/oscomp/ltp-net-sctp-1to1-initmsg.txt` |
