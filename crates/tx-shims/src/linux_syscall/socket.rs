@@ -58,6 +58,9 @@ const SCTP_SNDRCV_CMSG: i32 = 1;
 /// `struct sctp_sndrcvinfo` size: stream/ssn/flags (+pad) + ppid/context/ttl/
 /// tsn/cumtsn/assoc_id = 32 bytes.
 const SCTP_SNDRCVINFO_BYTES: usize = 32;
+/// sinfo_flags bits that request association teardown — invalid on a 1-to-1
+/// (TCP-style) socket: SCTP_ABORT (0x4) and SCTP_EOF (MSG_FIN, 0x200).
+const SCTP_SINFO_TEARDOWN_FLAGS: u16 = 0x0004 | 0x0200;
 const SCM_RIGHTS: i32 = 1;
 const MAX_MSG_IOV: u64 = 1024;
 const SOCKET_MSG_MAX_BYTES: usize = 1024 * 1024;
@@ -1176,10 +1179,17 @@ fn find_packet_arp_target_mac_in_netns(
     })
 }
 
-/// Parse an SCTP_SNDRCV control message (sctp_sndrcvinfo) from a sendmsg msghdr,
-/// returning (sinfo_stream, sinfo_ppid). Only the first cmsg is inspected, which
-/// is what the SCTP API tests build.
-fn parse_sctp_sndrcvinfo(ctx: &SyscallCtx<'_>, header: &UserMsghdr) -> Option<(u16, u32)> {
+/// Parsed sctp_sndrcvinfo ancillary data from a sendmsg control message.
+#[derive(Clone, Copy, Default)]
+struct SctpSndInfo {
+    stream: u16,
+    flags: u16,
+    ppid: u32,
+}
+
+/// Parse an SCTP_SNDRCV control message (sctp_sndrcvinfo) from a sendmsg msghdr.
+/// Only the first cmsg is inspected, which is what the SCTP API tests build.
+fn parse_sctp_sndrcvinfo(ctx: &SyscallCtx<'_>, header: &UserMsghdr) -> Option<SctpSndInfo> {
     if header.control == 0 {
         return None;
     }
@@ -1195,10 +1205,12 @@ fn parse_sctp_sndrcvinfo(ctx: &SyscallCtx<'_>, header: &UserMsghdr) -> Option<(u
     if level != SOL_SCTP || ctype != SCTP_SNDRCV_CMSG {
         return None;
     }
-    // sctp_sndrcvinfo: sinfo_stream @0, sinfo_ppid @8 (after ssn/flags + pad).
-    let stream = u16::from_le_bytes(buf[CMSG_HDR..CMSG_HDR + 2].try_into().ok()?);
-    let ppid = u32::from_le_bytes(buf[CMSG_HDR + 8..CMSG_HDR + 12].try_into().ok()?);
-    Some((stream, ppid))
+    // sctp_sndrcvinfo: sinfo_stream @0, sinfo_flags @4, sinfo_ppid @8.
+    Some(SctpSndInfo {
+        stream: u16::from_le_bytes(buf[CMSG_HDR..CMSG_HDR + 2].try_into().ok()?),
+        flags: u16::from_le_bytes(buf[CMSG_HDR + 4..CMSG_HDR + 6].try_into().ok()?),
+        ppid: u32::from_le_bytes(buf[CMSG_HDR + 8..CMSG_HDR + 12].try_into().ok()?),
+    })
 }
 
 /// Write an SCTP_SNDRCV control message (sctp_sndrcvinfo with `stream`/`ppid`)
@@ -1348,6 +1360,24 @@ async fn sendmsg_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
         Ok(total_len) => total_len,
         Err(errno_value) => return SyscallResult::Error(errno_value),
     };
+
+    // SCTP: parse the SCTP_SNDRCV ancillary data once. A teardown flag
+    // (SCTP_EOF/SCTP_ABORT) is invalid on a 1-to-1 (TCP-style) socket — reject
+    // with EINVAL even for an empty (iov-less) message.
+    let sctp_info = if socket.kind == SocketKind::Sctp {
+        parse_sctp_sndrcvinfo(ctx, &header)
+    } else {
+        None
+    };
+    if let Some(info) = sctp_info {
+        let is_stream = socket
+            .acquire_operational()
+            .is_some_and(|p| p.with_options(|o| o.socket.sock_type == SocketType::Stream));
+        if is_stream && info.flags & SCTP_SINFO_TEARDOWN_FLAGS != 0 {
+            return SyscallResult::Error(errno_to_i32(Errno::EINVAL));
+        }
+    }
+
     if total_len == 0 {
         return SyscallResult::Return(0);
     }
@@ -1375,11 +1405,11 @@ async fn sendmsg_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
     // from the SCTP_SNDRCV control message; route it through the message-oriented
     // send so the peer's recvmsg can echo the ancillary data back.
     if socket.kind == SocketKind::Sctp {
-        let (stream, ppid) = parse_sctp_sndrcvinfo(ctx, &header).unwrap_or((0, 0));
+        let info = sctp_info.unwrap_or_default();
         loop {
             let outcome = {
                 let guard = tx_substrate::epoch::guard();
-                step_send_sctp_message(&socket, &bytes, stream, ppid, flags, &guard)
+                step_send_sctp_message(&socket, &bytes, info.stream, info.ppid, flags, &guard)
             };
             match outcome {
                 StepOutcome::Done(sent) => {

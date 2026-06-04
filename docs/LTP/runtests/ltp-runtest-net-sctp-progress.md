@@ -32,7 +32,16 @@ Date: 2026-06-04
 `test_getname`(13)、`test_getname_v6`(13)、`test_1_to_1_socket_bind_listen`(14)、
 `test_1_to_1_connect`(10)、`test_1_to_1_nonblock`(5)、`test_1_to_1_send`(8)、
 `test_1_to_1_recvfrom`(7)、`test_1_to_1_sendto`(4)、`test_1_to_1_events`(4)、
-`test_1_to_1_shutdown`(6)。
+`test_1_to_1_shutdown`(6)、`test_tcp_style`(22)、`test_tcp_style_v6`(22)。
+
+**阶段 2 tcp_style 收尾(2026-06-05):** `test_tcp_style(+v6)`(各 22)过。三处修正:
+- connect 失败(accept 队列满 ECONNREFUSED)不再把 socket 卡在 Connected ——
+  `step_sctp_connect` 改为**先入 accept 队列成功后**才置 Connected + COMM_UP,
+  否则后续 connect 会误返 EISCONN。
+- 已订阅 assoc_event 的 socket 做 `SHUT_WR` → 在本端入队 `SCTP_SHUTDOWN_COMP`
+  通知(`step_shutdown`),排在待收数据之后。
+- 1-to-1 socket 上 sendmsg 带 `SCTP_EOF`/`SCTP_ABORT`(sinfo_flags)→ `EINVAL`
+  (在空 iov 早返前检查;`parse_sctp_sndrcvinfo` 现也读 sinfo_flags)。
 
 **阶段 2 shutdown 语义(2026-06-05):** `test_1_to_1_shutdown`(6)过。
 - `SHUT_WR`/`SHUT_RDWR` 在 1-to-1 SCTP 上**通知对端读侧 EOF**(`step_shutdown` 找对端
@@ -136,8 +145,8 @@ recvmsg→`EAGAIN` 可做,但 TEST5 要 `sendmsg`/`recvmsg`+`sctp_sndrcvinfo`+`M
 | `test_sockopt` | 44 | TCONF(门) | 1 | — |
 | `test_sockopt_v6` | 44 | TCONF(门) | 1 | — |
 | `test_1_to_1_sockopt` | 23 | **pass** | 1 | `target/oscomp/ltp-net-sctp-1to1-sockopt.txt` |
-| `test_tcp_style` | 22 | partial 10/22 | 2 | `target/oscomp/ltp-net-sctp-test_tcp_style.txt` |
-| `test_tcp_style_v6` | 22 | partial 10/22 | 2 | `target/oscomp/ltp-net-sctp-test_tcp_style_v6.txt` |
+| `test_tcp_style` | 22 | **pass** | 2 | `target/oscomp/ltp-net-sctp-test_tcp_style.txt` |
+| `test_tcp_style_v6` | 22 | **pass** | 2 | `target/oscomp/ltp-net-sctp-test_tcp_style_v6.txt` |
 | `test_1_to_1_socket_bind_listen` | 15 | **pass** | 1 | `target/oscomp/ltp-net-sctp-test_1_to_1_socket_bind_listen.txt` |
 | `test_basic` | 15 | TCONF(门) | 1 | — |
 | `test_basic_v6` | 15 | TCONF(门) | 1 | — |

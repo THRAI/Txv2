@@ -63,6 +63,19 @@ pub fn step_shutdown(
             {
                 peer.readiness.fire_recv(RecvWireSet::BROKEN);
             }
+            // If subscribed to association events, deliver SCTP_SHUTDOWN_COMP on
+            // this socket once the (loopback-immediate) shutdown completes. Queued
+            // after any pending data so recvmsg drains data first.
+            if payload.with_options(|o| o.sctp.event_assoc_change()) {
+                let streams = payload.with_options(|o| o.sctp.initmsg_num_ostreams);
+                let bytes = crate::net::execution::sctp_assoc_change_bytes(
+                    3, /* SCTP_SHUTDOWN_COMP */
+                    streams,
+                );
+                if payload.record_sctp_message(bytes, true, 0, 0).is_some() {
+                    socket.readiness.fire_recv(RecvWireSet::HAS_DATA);
+                }
+            }
         }
     }
 

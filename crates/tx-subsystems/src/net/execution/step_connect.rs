@@ -482,6 +482,23 @@ fn step_sctp_connect(
         return StepOutcome::Err(table_error_to_errno(error));
     }
 
+    // Enqueue onto the listener's accept queue FIRST; only commit this socket to
+    // the Connected state once the association is actually accepted. Otherwise a
+    // refused connect (accept queue full) would leave the socket wedged in
+    // Connected, breaking a later connect() with a spurious EISCONN.
+    let entry = SocketAcceptEntry {
+        child,
+        local: listener_local,
+        peer: local,
+        unix_peer: None,
+    };
+    if listener_payload.enqueue_accept_entry(entry).is_none() {
+        let _ = table.withdraw_sctp_connection(ConnectionKey::new(local, listener_local));
+        let _ = table.withdraw_sctp_connection(ConnectionKey::new(listener_local, local));
+        return StepOutcome::Err(Errno::ECONNREFUSED);
+    }
+    listener.readiness.fire_accept(AcceptWireSet::HAS_PENDING);
+
     payload.with_protocol_mut(|protocol| {
         *protocol = SocketProtocol::Sctp(TcpState::Connected {
             local,
@@ -490,21 +507,7 @@ fn step_sctp_connect(
     });
     // Deliver COMM_UP to the connecting side if it subscribed to events.
     enqueue_sctp_comm_up(socket);
-
-    let entry = SocketAcceptEntry {
-        child,
-        local: listener_local,
-        peer: local,
-        unix_peer: None,
-    };
-    if listener_payload.enqueue_accept_entry(entry).is_some() {
-        listener.readiness.fire_accept(AcceptWireSet::HAS_PENDING);
-        StepOutcome::Done(())
-    } else {
-        let _ = table.withdraw_sctp_connection(ConnectionKey::new(local, listener_local));
-        let _ = table.withdraw_sctp_connection(ConnectionKey::new(listener_local, local));
-        StepOutcome::Err(Errno::ECONNREFUSED)
-    }
+    StepOutcome::Done(())
 }
 
 fn sctp_listener_accepts_incoming(
