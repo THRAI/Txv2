@@ -12,6 +12,7 @@ mod bridge;
 mod dummy;
 mod veth;
 mod virtio;
+mod vlan;
 
 pub use bridge::{
     create_bridge_for_test_or_bootstrap, BridgeConfig, BridgeDevice, BridgeForwardOutcome,
@@ -29,6 +30,9 @@ pub use virtio::{
     VirtioNetQueueConfig, VirtioNetRxInjectOutcome, VirtioNetStats, VirtioNetStatsSnapshot,
     VirtioNetTxCompleteOutcome, VIRTIO_NET0_DEVICE, VIRTIO_NET0_REGISTRATION,
     VIRTIO_NET_DEFAULT_MTU, VIRTIO_NET_STAGING_MAJOR,
+};
+pub use vlan::{
+    create_vlan_for_test_or_bootstrap, VlanConfig, VlanDevice, VlanInstance, VLAN_DEFAULT_MTU,
 };
 
 pub type NetDeviceIrqOutcome = VirtioNetIrqOutcome;
@@ -63,6 +67,7 @@ pub enum NetDeviceKind {
     Dummy,
     Veth,
     Bridge,
+    Vlan,
 }
 
 pub trait NetDeviceOps: Send + Sync + 'static {

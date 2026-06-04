@@ -22,8 +22,9 @@ use crate::execution::Errno;
 use crate::net::admin::{require_net_admin, NetAdminAuthority};
 use crate::net::device::{
     create_bridge_for_test_or_bootstrap, create_dummy_for_test_or_bootstrap,
-    create_veth_pair_for_test_or_bootstrap, BridgeConfig, DummyConfig, EthernetAddress,
-    NetDeviceKind, VethEndpointConfig, VethPairConfig, DUMMY_DEFAULT_MTU, VETH_DEFAULT_MTU,
+    create_veth_pair_for_test_or_bootstrap, create_vlan_for_test_or_bootstrap, BridgeConfig,
+    DummyConfig, EthernetAddress, NetDeviceKind, VethEndpointConfig, VethPairConfig, VlanConfig,
+    DUMMY_DEFAULT_MTU, VETH_DEFAULT_MTU, VLAN_DEFAULT_MTU,
 };
 use crate::net::namespace::{
     NetNamespaceLinkInfo, NetNamespacePayload, NetNamespaceRouteConfig, NetNamespaceRouteInfo,
@@ -832,6 +833,7 @@ where
     match link_info.kind {
         Some("bridge") => create_bridge_link(netns, auth, name),
         Some("dummy") => create_dummy_link(netns, auth, name),
+        Some("vlan") => create_vlan_link(netns, auth, name),
         Some("veth") => {
             let peer_name = match link_info.peer_name {
                 Some(peer_name) => peer_name,
@@ -1125,6 +1127,28 @@ fn create_dummy_link(
     netns.attach_device(auth, instance.registration, None)
 }
 
+pub fn create_vlan_link(
+    netns: &NetNamespacePayload,
+    auth: NetAdminAuthority,
+    name: &str,
+) -> Result<(), Errno> {
+    if netns.find_device_by_name(name).is_some() {
+        return Err(Errno::EEXIST);
+    }
+    // Metadata-only VLAN link: it can be created, brought up/down, listed, and
+    // deleted, but carries no tagging data path (see device/vlan.rs). The
+    // parent link (IFLA_LINK) and VLAN id (IFLA_VLAN_ID) are accepted but not
+    // yet modelled, so do not claim a data path.
+    let leaked_name = leak_ifname(name);
+    let instance = create_vlan_for_test_or_bootstrap(VlanConfig {
+        name: leaked_name,
+        devt: allocate_dynamic_devt(),
+        mac: allocate_dynamic_mac(0x74),
+        mtu: VLAN_DEFAULT_MTU,
+    });
+    netns.attach_device(auth, instance.registration, None)
+}
+
 fn create_veth_links(
     netns: &NetNamespacePayload,
     auth: NetAdminAuthority,
@@ -1395,6 +1419,7 @@ fn link_kind_name(kind: NetDeviceKind) -> &'static str {
         NetDeviceKind::Dummy => "dummy",
         NetDeviceKind::Veth => "veth",
         NetDeviceKind::Bridge => "bridge",
+        NetDeviceKind::Vlan => "vlan",
     }
 }
 
@@ -1410,9 +1435,14 @@ fn parse_linkinfo<'a>(attrs: &'a [NlAttr<'a>]) -> Result<LinkInfoAttrs<'a>, Errn
     let mut peer_name = None;
 
     if let Some(info_data) = attr_by_kind(&nested, IFLA_INFO_DATA) {
-        let data_attrs = parse_attrs(info_data.payload)?;
-        if let Some(peer) = attr_by_kind(&data_attrs, VETH_INFO_PEER) {
-            peer_name = parse_veth_peer_name(peer.payload)?;
+        // IFLA_INFO_DATA layout is link-kind-specific; only veth's nested peer
+        // is consumed here. Tolerate kinds whose INFO_DATA we don't model
+        // (e.g. vlan's IFLA_VLAN_ID/PROTOCOL/FLAGS) rather than rejecting the
+        // whole RTM_NEWLINK with EINVAL.
+        if let Ok(data_attrs) = parse_attrs(info_data.payload) {
+            if let Some(peer) = attr_by_kind(&data_attrs, VETH_INFO_PEER) {
+                peer_name = parse_veth_peer_name(peer.payload)?;
+            }
         }
     }
 

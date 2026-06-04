@@ -47,7 +47,7 @@ Date: 2026-06-03
 | IPv6 libc/API | `net.ipv6_lib` | 6 entries | `76/77` | 基本完成；只剩 `asapi_01` 的 `hopopt` 协议表点，属于 musl test image/libc 表缺口 | 不优先花 kernel 网络时间；除非允许重建 LTP/musl 镜像 |
 | IPv4/命令层网络 | `net.tcp_cmds` | 16 entries | 已计分 `61/61` | `runtest/net.tcp_cmds` 中 16 个入口全部有 focused passing witness；`tc01`、`dhcpd`、`dnsmasq` 已补齐 | 作为命令层回归基线；FTP 属于 `net_stress` 服务/压力模块，不在当前 `net.tcp_cmds` 表内 |
 | IPv6 命令层网络 | `net.ipv6` | 11 entries | 已计分 `46/46` | 11 个入口全部有 passing witness，包括 `dhcpd6`、`dnsmasq6`、`ip6tables`、`nft6` | 作为命令层回归基线；后续看更高级 `net.features` 或服务/压力模块 |
-| 高级网络特性 | `net.features` | 62 entries | not-run | 未开始；包含 BBR、DCCP、SCTP、TFO、VXLAN、VLAN、macvlan、macsec、GRE/GUE/FOU、Geneve、WireGuard 等 | 暂缓，等命令层/IPv6 baseline 更稳 |
+| 高级网络特性 | `net.features` | 62 entries | `0/62`（VLAN 已实现但 runtime-bound）| VLAN 链路元数据 create/up/down/delete 已实现并工作（vlan01 跑出 2 个 TPASS 才超时）；但**所有 virt 链路测试（vlan/vxlan/macvlan/…）都是 `virt_lib.sh` 的 `NS_TIMES=10 × 9 数据项 ≈ 360 个 `ip` 的压力循环**，撞 TCG 进程-churn 性能墙（同 route4）。其余 bbr/dctcp/busy_poll/tcp_fastopen/bind_noport 是 netload 性能题。 | 非循环目标优先（fanout01 AF_PACKET 单发）；virt 族需 NS_TIMES 旋钮或真机 |
 | 组播 | `net.multicast` | 4 entries | `1/4` | `mc_cmds` 已通过；`mc_opts/mc_member/mc_commo` 需编译 helper、`netstat -gn`、长 sleep（mc_commo 还需 rhost）| 续做 `mc_opts`，其余视 helper/runtime 而定 |
 | 完整 SCTP | `net.sctp` | 41 entries | not-run | 未开始；不同于 syscall witness 里的 local-only SCTP 支持 | 除非明确 charter 完整 SCTP，否则暂缓 |
 | NFS/RPC/TIRPC | `net.nfs`、`net.rpc_tests`、`net.tirpc_tests` | 205 entries | not-run | 未开始；依赖服务、RPC/NFS 环境 | 暂缓 |
@@ -278,6 +278,17 @@ Implemented prerequisites observed during the `netstat` climb:
 - `/tx-ltp/bin/{tc,modprobe}` plus module/config metadata cover the `tc01`
   `sch_teql` witness. This only models the tested negative qdisc-add path, not
   full traffic-control scheduling.
+
+## 细表：`net.features`
+
+| 入口 | 得分 | 状态 | 说明 | witness |
+| --- | ---: | --- | --- | --- |
+| `vlan01` | `0/9`（功能已实现）| runtime-bound | **VLAN 链路元数据已实现**：新 `NetDeviceKind::Vlan` + `device/vlan.rs`（no-op 数据面，不谎称转发），rtnetlink `RTM_NEWLINK type=vlan` 分派，且 `ip link add ... type vlan` 由内核 `ip` builtin 直接处理（BusyBox 对 vlan 语法不可靠，会回 `RTNETLINK: Invalid argument`）。`ip link set up/down`/`delete` 走已有路径。实测 vlan01 的 create/up/down/delete **全部工作**，跑出 2 个 TPASS（数据项 1、2 的 "add 10 vlan, then delete"）后在第 3 项 320s 超时。**唯一 blocker 是 `virt_multiple_add_test` 的 `NS_TIMES=10 × 9 数据项 ≈ 360 个 `ip` 命令**在 TCG 下 ~4s/命令的进程-churn 成本——与 route4 同墙,非 VLAN 语义问题。 | `target/oscomp/ltp-net-features-vlan01-builtin-300s.txt`（2 TPASS then timeout）|
+| 其余 virt（vxlan/macvlan/macvtap/ipvlan/gre/gue/fou/geneve/sit/wireguard）| not-run | perf-walled | 同样走 `virt_lib.sh` 压力循环;且多数 `02/03` 变体跑 `tst_netload` 性能比较。需各自的 link-kind 模型 + NS_TIMES 旋钮/真机。 | — |
+| bbr/dctcp/busy_poll/tcp_fastopen/bind_noport | not-run | perf-walled | netload 吞吐/延迟比较,非纯语义。 | — |
+| `fanout01` | not-run | candidate | AF_PACKET `PACKET_FANOUT` 编译二进制,**单发非循环**——是 net.features 里少数可能不吃循环墙的;待探测。 | — |
+
+> 结论:`net.features` 不是"语义快分"——虚拟链路族是 NS_TIMES 压力循环(perf-walled,同 route4),性能题是 netload。可计分近距离目标在循环墙之外(fanout01、net.multicast 的 mc_opts/mc_member)。
 
 ## 细表：`net.multicast`
 

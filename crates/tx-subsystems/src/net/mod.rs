@@ -26,15 +26,16 @@ pub use admin::{
 };
 pub use device::{
     create_bridge_for_test_or_bootstrap, create_dummy_for_test_or_bootstrap,
-    create_veth_pair_for_test_or_bootstrap, net_device_by_devt, net_device_by_name,
-    net_device_snapshot, register_net_devices, BridgeConfig, BridgeDevice, BridgeForwardOutcome,
-    BridgeInstance, BridgePortSnapshot, BridgeSnapshot, DummyConfig, DummyDevice, DummyInstance,
-    EthernetAddress, NetDeviceKind, NetDeviceOps, NetDeviceRegistration, VethDevice,
-    VethEndpointConfig, VethPair, VethPairConfig, VethStatsSnapshot, VirtioNetConfig,
-    VirtioNetDevice, VirtioNetFeatureSet, VirtioNetIrqEvent, VirtioNetIrqOutcome,
-    VirtioNetQueueConfig, VirtioNetRxInjectOutcome, VirtioNetStats, VirtioNetStatsSnapshot,
-    VirtioNetTxCompleteOutcome, BRIDGE_FORWARD_BUDGET_DEFAULT, DUMMY_DEFAULT_MTU, VETH_DEFAULT_MTU,
-    VIRTIO_NET0_DEVICE, VIRTIO_NET0_REGISTRATION, VIRTIO_NET_DEFAULT_MTU, VIRTIO_NET_STAGING_MAJOR,
+    create_veth_pair_for_test_or_bootstrap, create_vlan_for_test_or_bootstrap, net_device_by_devt,
+    net_device_by_name, net_device_snapshot, register_net_devices, BridgeConfig, BridgeDevice,
+    BridgeForwardOutcome, BridgeInstance, BridgePortSnapshot, BridgeSnapshot, DummyConfig,
+    DummyDevice, DummyInstance, EthernetAddress, NetDeviceKind, NetDeviceOps,
+    NetDeviceRegistration, VethDevice, VethEndpointConfig, VethPair, VethPairConfig,
+    VethStatsSnapshot, VirtioNetConfig, VirtioNetDevice, VirtioNetFeatureSet, VirtioNetIrqEvent,
+    VirtioNetIrqOutcome, VirtioNetQueueConfig, VirtioNetRxInjectOutcome, VirtioNetStats,
+    VirtioNetStatsSnapshot, VirtioNetTxCompleteOutcome, VlanConfig, VlanDevice, VlanInstance,
+    BRIDGE_FORWARD_BUDGET_DEFAULT, DUMMY_DEFAULT_MTU, VETH_DEFAULT_MTU, VIRTIO_NET0_DEVICE,
+    VIRTIO_NET0_REGISTRATION, VIRTIO_NET_DEFAULT_MTU, VIRTIO_NET_STAGING_MAJOR, VLAN_DEFAULT_MTU,
 };
 pub use execution::{
     socket_accept_wait_token, socket_open_file_from_identity, socket_recv_wait_token,
@@ -122,7 +123,7 @@ pub use protocol::{
     SmoltcpPacketSource, SmoltcpPacketTxSink,
 };
 pub use rtnetlink::{
-    netlink_route_recv, netlink_route_recv_available, netlink_route_recv_packet,
+    create_vlan_link, netlink_route_recv, netlink_route_recv_available, netlink_route_recv_packet,
     netlink_route_send, netlink_route_send_with_netns_resolver,
     netlink_route_send_with_netns_resolvers, rtnetlink_handle_request,
     rtnetlink_handle_request_with_netns_resolver, rtnetlink_handle_request_with_netns_resolvers,
