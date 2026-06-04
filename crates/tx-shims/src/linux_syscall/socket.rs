@@ -2276,6 +2276,58 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             payload.with_options_mut(|opts| opts.sctp.events_subscribe = buf);
             Ok(())
         }
+        (SOL_SCTP, SCTP_PEER_ADDR_PARAMS) => {
+            if socket.kind != SocketKind::Sctp {
+                return SyscallResult::Error(errno_to_i32(Errno::ENOPROTOOPT));
+            }
+            // struct sctp_paddrparams (packed, aligned 4): spp_assoc_id @0,
+            // spp_address @4 (sockaddr_storage, 128B), spp_hbinterval @132,
+            // spp_pathmaxrxt @136 (u16), spp_pathmtu @138, spp_sackdelay @142,
+            // spp_flags @146. spp_sackdelay is shared with SCTP_DELAYED_ACK_TIME.
+            const SPP_BYTES: usize = 150;
+            if (optlen as usize) < SPP_BYTES {
+                return SyscallResult::Error(errno_to_i32(Errno::EINVAL));
+            }
+            let mut buf = [0u8; SPP_BYTES];
+            if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut buf, optval) {
+                return SyscallResult::Error(errno_to_i32(errno));
+            }
+            // A non-zero spp_assoc_id must name an existing association.
+            let assoc_id = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+            if assoc_id != 0 && payload.sctp_peer_addr_by_assoc(assoc_id).is_none() {
+                return SyscallResult::Error(errno_to_i32(Errno::EINVAL));
+            }
+            let hbinterval = u32::from_le_bytes([buf[132], buf[133], buf[134], buf[135]]);
+            let pathmaxrxt = u16::from_le_bytes([buf[136], buf[137]]);
+            let pathmtu = u32::from_le_bytes([buf[138], buf[139], buf[140], buf[141]]);
+            let sackdelay = u32::from_le_bytes([buf[142], buf[143], buf[144], buf[145]]);
+            let flags = u32::from_le_bytes([buf[146], buf[147], buf[148], buf[149]]);
+            payload.with_options_mut(|opts| {
+                opts.sctp.paddr_hbinterval = hbinterval;
+                opts.sctp.paddr_pathmaxrxt = pathmaxrxt;
+                opts.sctp.paddr_pathmtu = pathmtu;
+                opts.sctp.paddr_sackdelay = sackdelay;
+                opts.sctp.paddr_flags = flags;
+            });
+            Ok(())
+        }
+        (SOL_SCTP, SCTP_DELAYED_ACK_TIME) => {
+            if socket.kind != SocketKind::Sctp {
+                return SyscallResult::Error(errno_to_i32(Errno::ENOPROTOOPT));
+            }
+            // struct sctp_assoc_value { sctp_assoc_t assoc_id @0; __u32 assoc_value @4 }.
+            // assoc_value is the SACK delay, shared with spp_sackdelay above.
+            if (optlen as usize) < 8 {
+                return SyscallResult::Error(errno_to_i32(Errno::EINVAL));
+            }
+            let mut buf = [0u8; 8];
+            if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut buf, optval) {
+                return SyscallResult::Error(errno_to_i32(errno));
+            }
+            let value = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+            payload.with_options_mut(|opts| opts.sctp.paddr_sackdelay = value);
+            Ok(())
+        }
         (SOL_IPV6, IPV6_V6ONLY) => {
             let on = match read_sockopt_bool(ctx, optval, optlen) {
                 Ok(on) => on,
@@ -2895,6 +2947,33 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
         }
         (SOL_SCTP, SCTP_EVENTS) if socket.kind == SocketKind::Sctp => {
             let buf = payload.with_options(|o| o.sctp.events_subscribe);
+            write_sockopt_bytes(ctx, optval, optlen_ptr, &buf)
+        }
+        (SOL_SCTP, SCTP_PEER_ADDR_PARAMS) if socket.kind == SocketKind::Sctp => {
+            // Mirror the setsockopt layout (packed struct sctp_paddrparams).
+            let (hb, maxrxt, mtu, sackdelay, flags) = payload.with_options(|o| {
+                (
+                    o.sctp.paddr_hbinterval,
+                    o.sctp.paddr_pathmaxrxt,
+                    o.sctp.paddr_pathmtu,
+                    o.sctp.paddr_sackdelay,
+                    o.sctp.paddr_flags,
+                )
+            });
+            let mut buf = [0u8; 150];
+            buf[132..136].copy_from_slice(&hb.to_le_bytes());
+            buf[136..138].copy_from_slice(&maxrxt.to_le_bytes());
+            buf[138..142].copy_from_slice(&mtu.to_le_bytes());
+            buf[142..146].copy_from_slice(&sackdelay.to_le_bytes());
+            buf[146..150].copy_from_slice(&flags.to_le_bytes());
+            write_sockopt_bytes(ctx, optval, optlen_ptr, &buf)
+        }
+        (SOL_SCTP, SCTP_DELAYED_ACK_TIME) if socket.kind == SocketKind::Sctp => {
+            // struct sctp_assoc_value { assoc_id @0; assoc_value @4 }: the SACK
+            // delay, shared with spp_sackdelay of SCTP_PEER_ADDR_PARAMS.
+            let value = payload.with_options(|o| o.sctp.paddr_sackdelay);
+            let mut buf = [0u8; 8];
+            buf[4..8].copy_from_slice(&value.to_le_bytes());
             write_sockopt_bytes(ctx, optval, optlen_ptr, &buf)
         }
         (SOL_SCTP, SCTP_GET_LOCAL_ADDRS) if socket.kind == SocketKind::Sctp => {

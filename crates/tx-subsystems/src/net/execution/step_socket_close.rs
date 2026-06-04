@@ -268,11 +268,13 @@ fn notify_sctp_seqpacket_peers_closed(
         let Some(peer_payload) = peer.acquire_operational() else {
             continue;
         };
-        if !peer_payload.with_options(|o| o.sctp.event_assoc_change()) {
+        let wants_shutdown = peer_payload.with_options(|o| o.sctp.event_shutdown());
+        let wants_assoc_change = peer_payload.with_options(|o| o.sctp.event_assoc_change());
+        if !wants_shutdown && !wants_assoc_change {
             continue;
         }
         // The endpoint the peer associated with this socket: our local address on
-        // the route to the peer, which the SHUTDOWN_COMP notification carries as
+        // the route to the peer, which the teardown notifications carry as
         // msg_name. The association id is the peer's own (ids are per-socket).
         let source = if local.is_unspecified() {
             IpEndpoint::from_ip(assoc.peer.ip_addr(), local.port)
@@ -284,16 +286,28 @@ fn notify_sctp_seqpacket_peers_closed(
             .into_iter()
             .find(|a| a.peer == source)
             .map_or(assoc.assoc_id, |a| a.assoc_id);
-        let streams = peer_payload.with_options(|o| o.sctp.initmsg_num_ostreams);
-        let bytes = crate::net::execution::sctp_assoc_change_bytes(
-            3, /* SHUTDOWN_COMP */
-            streams,
-            peer_assoc_id,
-        );
-        if peer_payload
-            .record_sctp_message(bytes, true, 0, 0, Some(source))
-            .is_some()
-        {
+        let mut fired = false;
+        // SCTP_SHUTDOWN_EVENT is delivered when the peer receives SHUTDOWN;
+        // SHUTDOWN_COMP (an assoc_change) when the association is fully torn
+        // down. A 1-to-many socket may subscribe to either or both.
+        if wants_shutdown {
+            let bytes = crate::net::execution::sctp_shutdown_event_bytes();
+            fired |= peer_payload
+                .record_sctp_message(bytes, true, 0, 0, Some(source))
+                .is_some();
+        }
+        if wants_assoc_change {
+            let streams = peer_payload.with_options(|o| o.sctp.initmsg_num_ostreams);
+            let bytes = crate::net::execution::sctp_assoc_change_bytes(
+                3, /* SHUTDOWN_COMP */
+                streams,
+                peer_assoc_id,
+            );
+            fired |= peer_payload
+                .record_sctp_message(bytes, true, 0, 0, Some(source))
+                .is_some();
+        }
+        if fired {
             woken += peer.readiness.fire_recv(RecvWireSet::HAS_DATA);
         }
     }

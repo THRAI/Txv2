@@ -596,6 +596,13 @@ pub struct SctpLevelOptions {
     /// (one u8 flag per event, offsets per the uapi struct). Byte 1 is
     /// `sctp_association_event`, byte 5 is `sctp_shutdown_event`.
     pub events_subscribe: [u8; 16],
+    /// SCTP_PEER_ADDR_PARAMS (struct sctp_paddrparams) endpoint defaults.
+    /// `paddr_sackdelay` is shared with SCTP_DELAYED_ACK_TIME's assoc_value.
+    pub paddr_hbinterval: u32,
+    pub paddr_pathmaxrxt: u16,
+    pub paddr_pathmtu: u32,
+    pub paddr_sackdelay: u32,
+    pub paddr_flags: u32,
 }
 
 impl SctpLevelOptions {
@@ -754,6 +761,11 @@ impl SocketOptionSet {
                 assoc_local_rwnd: 0,
                 assoc_cookie_life: 60000,
                 events_subscribe: [0u8; 16],
+                paddr_hbinterval: 0,
+                paddr_pathmaxrxt: 5,
+                paddr_pathmtu: 0,
+                paddr_sackdelay: 0,
+                paddr_flags: 0,
             },
         }
     }
@@ -821,6 +833,11 @@ impl SocketOptionSet {
                 assoc_local_rwnd: 0,
                 assoc_cookie_life: 60000,
                 events_subscribe: [0u8; 16],
+                paddr_hbinterval: 0,
+                paddr_pathmaxrxt: 5,
+                paddr_pathmtu: 0,
+                paddr_sackdelay: 0,
+                paddr_flags: 0,
             },
         }
     }

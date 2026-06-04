@@ -56,8 +56,18 @@ Date: 2026-06-04
    `assoc_id`,经 `sctp_peer_addr_by_assoc` 查对端;`close` 的 SHUTDOWN_COMP
    通知带 `source`(对端视角的本地址)+ 对端自己的 assoc_id。
 
-**剩余 1-to-many**:test_connect(peeloff)、assoc_shutdown/abort(SCTP_STATUS
-要反映已拆关联)、sctp_sendrecvmsg、test_sockopt(+v6)。
+**test_sockopt 续(6→14,2026-06-05):** (a) SEQPACKET close 通知扩展——按订阅分别
+发 `SCTP_SHUTDOWN_EVENT`(0x8005)与/或 SHUTDOWN_COMP(assoc_change),均带 source
++ 对端 assoc_id(case 7)。(b) 新增 `SCTP_PEER_ADDR_PARAMS`(=9)与 `SCTP_DELAYED_ACK_TIME`
+(=16)的 get/set:`SctpLevelOptions` 加 paddr_* 字段(packed `sctp_paddrparams`
+@132 hbinterval/@136 pathmaxrxt/@138 pathmtu/@142 sackdelay/@146 flags),
+`spp_sackdelay` 与 DELAYED_ACK_TIME 的 `assoc_value` 共用一字段(case 11-13);
+非零 `spp_assoc_id` 须命中已有关联否则 EINVAL(case 14)。**剩余 case 15+**:1-to-many
+`connect()` + 服务端 COMM_UP(带 assoc_id)、spp_address 传输校验、精确长度校验。
+
+**剩余 1-to-many**:test_sockopt 尾(1-to-many connect + 传输校验)、test_connect
+(1-to-many connect 服务端 COMM_UP + peeloff)、assoc_shutdown/abort(SCTP_STATUS
+要反映已拆关联)、sctp_sendrecvmsg。
 
 **阶段 2 tcp_style 收尾(2026-06-05):** `test_tcp_style(+v6)`(各 22)过。三处修正:
 - connect 失败(accept 队列满 ECONNREFUSED)不再把 socket 卡在 Connected ——
