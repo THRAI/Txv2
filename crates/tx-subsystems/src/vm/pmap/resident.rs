@@ -7,24 +7,31 @@
 //! to enumerate resident pages and preserve `MapPin` ownership, but it does not
 //! prescribe this module's internal data structure.
 //!
-//! `PmapResidentStore` is the stable facade used by `VmPmap`. The v1 backend is
-//! an address-sorted `Vec`, preserved for behavior while later work swaps in a
-//! non-shifting teardown backend behind this boundary.
+//! `PmapResidentStore` is the production alias used by `VmPmap`.
+//! `PmapResidentStoreWith<B>` is the backend-neutral facade for A/B tests and
+//! future implementations. The v1 backend is an address-sorted `Vec`, preserved
+//! for behavior while later work swaps in a non-shifting teardown backend behind
+//! the `PmapResidentStoreImpl` trait.
 
 use alloc::vec::Vec;
+use core::fmt::Debug;
 
 use super::{PmapMapping, PmapMappingSnapshot};
 use crate::vm::UserPage;
 
+type DefaultPmapResidentStoreImpl = VecPmapResidentStore;
+
+pub(super) type PmapResidentStore = PmapResidentStoreWith<DefaultPmapResidentStoreImpl>;
+
 #[derive(Debug, Default)]
-pub(super) struct PmapResidentStore {
-    backend: VecPmapResidentStore,
+pub(super) struct PmapResidentStoreWith<B: PmapResidentStoreImpl> {
+    backend: B,
 }
 
-impl PmapResidentStore {
+impl<B: PmapResidentStoreImpl> PmapResidentStoreWith<B> {
     pub(super) fn new() -> Self {
         Self {
-            backend: VecPmapResidentStore::new(),
+            backend: B::default(),
         }
     }
 
@@ -69,6 +76,30 @@ impl PmapResidentStore {
     }
 }
 
+pub(super) trait PmapResidentStoreImpl: Debug + Default {
+    fn len(&self) -> usize;
+
+    fn reserve_additional(&mut self, additional: usize);
+
+    fn get(&self, page: &UserPage) -> Option<&PmapMapping>;
+
+    fn get_mut(&mut self, page: &UserPage) -> Option<&mut PmapMapping>;
+
+    fn insert(&mut self, page: UserPage, mapping: PmapMapping) -> Option<PmapMapping>;
+
+    fn remove(&mut self, page: &UserPage) -> Option<PmapMapping>;
+
+    fn drain_range(&mut self, start: UserPage, end: UserPage) -> DrainedMappings;
+
+    fn snapshots_in_range(
+        &self,
+        start: UserPage,
+        end: UserPage,
+    ) -> Vec<(UserPage, PmapMappingSnapshot)>;
+
+    fn pages_in_range(&self, start: UserPage, end: UserPage) -> Vec<UserPage>;
+}
+
 #[derive(Debug, Default)]
 pub(super) struct DrainedMappings {
     entries: Vec<(UserPage, PmapMapping)>,
@@ -102,17 +133,11 @@ impl IntoIterator for DrainedMappings {
 }
 
 #[derive(Debug, Default)]
-struct VecPmapResidentStore {
+pub(super) struct VecPmapResidentStore {
     entries: Vec<(UserPage, PmapMapping)>,
 }
 
-impl VecPmapResidentStore {
-    fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-        }
-    }
-
+impl PmapResidentStoreImpl for VecPmapResidentStore {
     fn len(&self) -> usize {
         self.entries.len()
     }
@@ -190,7 +215,9 @@ impl VecPmapResidentStore {
         }
         pages
     }
+}
 
+impl VecPmapResidentStore {
     fn search(&self, page: UserPage) -> Result<usize, usize> {
         self.entries
             .binary_search_by_key(&page, |(entry_page, _)| *entry_page)

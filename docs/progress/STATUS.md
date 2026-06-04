@@ -1,3 +1,14 @@
+- 2026-06-05 **Pmap resident store now has a backend implementation trait.**
+  Followed the recipe-tree facade pattern for the pmap resident shadow index:
+  `PmapResidentStore` remains the production alias used by `VmPmap`, while
+  `PmapResidentStoreWith<B>` and `PmapResidentStoreImpl` define the static
+  backend seam. The current address-sorted Vec is now `VecPmapResidentStore`
+  behind the trait, so pmap call sites still use the facade and no pmap logic
+  names the Vec backend directly. Verification so far: scoped `rustfmt` and
+  `cargo check -p tx-subsystems -q`. Next step: add the non-shifting backend
+  as a second `PmapResidentStoreImpl` and A/B it against the preserved
+  map-path counters.
+
 - 2026-06-05 **VM pmap resident-store interface extracted before backend swap.**
   After the VM gift/map-path cleanup commit, `VmPmap` no longer owns the
   resident shadow-index implementation inline. `PmapResidentStore` is now a
