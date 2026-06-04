@@ -6,7 +6,7 @@ use crate::net::checks::require::require_socket_read_target;
 use crate::net::delegate::net_delegate_kick_poll;
 use crate::net::execution::{socket_recv_wait_token, yield_bytes_on_token, ByteStepOutcome};
 use crate::net::structure::{
-    RecvWireSet, SendRecvFlags, SocketIdentity, SocketPayload, SocketProtocol,
+    RecvWireSet, SendRecvFlags, SocketIdentity, SocketKind, SocketPayload, SocketProtocol,
     SocketRecvBytesOutcome, TcpState,
 };
 
@@ -89,6 +89,13 @@ pub fn step_recv_kernel_bytes(
     }
 
     let Some(outcome) = payload.consume_recv_bytes_into(out, witness.flags) else {
+        // SCTP 1-to-1: with no data to drain, a recv on a socket whose
+        // association is not established — never connected (listening/bound/init)
+        // or locally shut down via SHUT_WR — returns ENOTCONN rather than
+        // blocking, matching Linux SCTP recvmsg.
+        if socket.kind == SocketKind::Sctp && sctp_recv_disconnected(&payload) {
+            return StepOutcome::Err(Errno::ENOTCONN);
+        }
         if recv_peer_closed(socket, &payload) {
             return StepOutcome::Done(SocketRecvBytesOutcome::default());
         }
@@ -114,6 +121,18 @@ fn kick_tcp_loopback_after_recv(payload: &SocketPayload, bytes: usize) {
         SocketProtocol::Tcp(TcpState::Connected { .. })
     ) {
         net_delegate_kick_poll();
+    }
+}
+
+/// True when an SCTP recv with no buffered data should report ENOTCONN: the
+/// socket either never had an established association (listening/bound/init/
+/// closed/connecting) or has locally shut down the write side (SHUT_WR), which
+/// for a 1-to-1 association means the association is being torn down.
+fn sctp_recv_disconnected(payload: &SocketPayload) -> bool {
+    match payload.protocol_snapshot() {
+        SocketProtocol::Sctp(TcpState::Connected { .. }) => payload.shutdown_wr(),
+        SocketProtocol::Sctp(_) => true,
+        _ => false,
     }
 }
 

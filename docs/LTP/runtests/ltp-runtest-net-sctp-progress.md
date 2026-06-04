@@ -30,7 +30,17 @@ Date: 2026-06-04
 静态 case 合计 ≈ **~400**(含 9 个 `_v6` 变体)。当前确认通过:`accept_close`(10)、
 `test_1_to_1_rtoinfo`(3)、`test_1_to_1_initmsg_connect`(2)、`test_1_to_1_sockopt`(22)、
 `test_getname`(13)、`test_getname_v6`(13)、`test_1_to_1_socket_bind_listen`(14)、
-`test_1_to_1_connect`(10)、`test_1_to_1_nonblock`(5)、`test_1_to_1_send`(8)。
+`test_1_to_1_connect`(10)、`test_1_to_1_nonblock`(5)、`test_1_to_1_send`(8)、
+`test_1_to_1_recvfrom`(7)、`test_1_to_1_sendto`(4)。
+
+**阶段 2 续(2026-06-05,无事件):** `test_1_to_1_recvfrom`(7)+`test_1_to_1_sendto`(4)过。
+- recvfrom:(a) recv 在未建联(listening/未连/SHUT_WR 后)的 SCTP socket 上返 `ENOTCONN`
+  而非阻塞——`step_recv` 加 `sctp_recv_disconnected`,且因 recvfrom/recv 在到达 recv step
+  前有 poll-wait 循环,shim `recvfrom_impl` 阻塞前也加同款检查;(b) recvfrom 用坏缓冲区
+  (-1)要 EFAULT 且**不能吞掉已排队消息**——consume 前先 `validate_user_range(Write)`
+  校验目的缓冲(之前是 consume 进 staging 后 copy-out 才失败,消息丢了)。
+- sendto:对**未连接**的 1-to-1 SCTP socket 带目的地址 sendto → **隐式建联**
+  (autobind + step_connect)再发(`sendto_impl`);已连接则忽略目的地址。
 
 **纯阶段一(不碰数据面/事件)已见底**:`test_1_to_1_connect` 靠 3 处 connect 语义修正
 通过——非法地址族→`EINVAL`(SCTP 把 read_sockaddr_in 的 EAFNOSUPPORT 映射为 EINVAL,
@@ -127,12 +137,12 @@ recvmsg→`EAGAIN` 可做,但 TEST5 要 `sendmsg`/`recvmsg`+`sctp_sndrcvinfo`+`M
 | `test_sctp_sendrecvmsg_v6` | 10 | TCONF(门) | 2 | — |
 | `test_1_to_1_send` | 9 | **pass** | 2 | `target/oscomp/ltp-net-sctp-test_1_to_1_send.txt` |
 | `test_1_to_1_recvmsg` | 8 | musl-blocked 3/8 | 2 | `target/oscomp/ltp-net-sctp-test_1_to_1_recvmsg.txt` |
-| `test_1_to_1_recvfrom` | 7 | TCONF(门) | 2 | — |
+| `test_1_to_1_recvfrom` | 7 | **pass** | 2 | `target/oscomp/ltp-net-sctp-test_1_to_1_recvfrom.txt` |
 | `test_1_to_1_shutdown` | 6 | TCONF(门) | 2 | — |
 | `test_connect` | 5 | TCONF(门) | 2 | — |
 | `test_1_to_1_nonblock` | 5 | **pass** | 2 | `target/oscomp/ltp-net-sctp-test_1_to_1_nonblock.txt` |
 | `test_1_to_1_events` | 4 | TCONF(门) | 2 | — |
-| `test_1_to_1_sendto` | 4 | TCONF(门) | 2 | — |
+| `test_1_to_1_sendto` | 4 | **pass** | 2 | `target/oscomp/ltp-net-sctp-test_1_to_1_sendto.txt` |
 | `test_recvmsg` | 2 | TCONF(门) | 2 | — |
 | `test_assoc_abort` | 1 | TCONF(门) | 2 | — |
 | `test_assoc_shutdown` | 1 | TCONF(门) | 2 | — |

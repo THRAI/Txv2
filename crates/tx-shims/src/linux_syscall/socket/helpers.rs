@@ -1274,6 +1274,22 @@ pub(super) fn socket_is_tcp_connecting(socket: &Cap<SocketIdentity>) -> bool {
     })
 }
 
+/// True when a recv with no buffered data on this SCTP socket must report
+/// ENOTCONN instead of blocking: the association is not established (never
+/// connected, or locally shut down via SHUT_WR). Mirrors the step_recv check;
+/// needed because recvfrom()/recv() block in a poll-wait loop before reaching
+/// the recv step.
+pub(super) fn sctp_recv_disconnected(socket: &Cap<SocketIdentity>) -> bool {
+    let Some(payload) = socket.acquire_operational() else {
+        return true;
+    };
+    match payload.protocol_snapshot() {
+        SocketProtocol::Sctp(TcpState::Connected { .. }) => payload.shutdown_wr(),
+        SocketProtocol::Sctp(_) => true,
+        _ => false,
+    }
+}
+
 pub(super) fn validate_recvfrom_addrlen<'a>(
     ctx: &SyscallCtx<'a>,
     sockaddr_len_ptr: u64,

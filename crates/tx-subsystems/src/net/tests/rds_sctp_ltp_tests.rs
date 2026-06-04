@@ -218,6 +218,31 @@ fn sctp_rejected_connect_on_listener_does_not_break_listener() {
 }
 
 #[test]
+fn sctp_recv_on_unconnected_socket_reports_enotconn() {
+    // LTP test_1_to_1_recvfrom case 4: a recv on a listening (never-connected)
+    // 1-to-1 SCTP socket returns ENOTCONN rather than blocking.
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
+    let guard = tx_substrate::epoch::guard();
+
+    let listener = sctp_socket();
+    assert_eq!(
+        step_bind(&listener, inet(4500), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(step_listen(&listener, 5, &guard), StepOutcome::Done(()));
+
+    let mut buf = [0u8; 16];
+    assert_eq!(
+        step_recv_kernel_bytes(&listener, &mut buf, SendRecvFlags::empty(), &guard),
+        StepOutcome::Err(Errno::ENOTCONN)
+    );
+}
+
+#[test]
 fn sctp_listen_backlog_admits_n_plus_one_connections() {
     // Linux accept-queue semantics: listen(N) admits N+1 pending connections
     // (`sk_ack_backlog > sk_max_ack_backlog`). LTP test_tcp_style relies on this:

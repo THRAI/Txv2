@@ -734,6 +734,28 @@ async fn sendto_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult 
     } else {
         None
     };
+    // SCTP 1-to-1: sendto with a destination on a socket that has no association
+    // yet implicitly establishes one (Linux SCTP implicit association), then
+    // sends on it. A socket that is already connected ignores the destination.
+    if socket.kind == SocketKind::Sctp && args[4] != 0 && socket_peer_endpoint(&socket).is_err() {
+        let remote = match read_sockaddr_in(ctx, args[4], args[5]) {
+            Ok(addr) => connect_sockaddr_for_local_stack(socket.kind, addr),
+            Err(Errno::EAFNOSUPPORT) => return SyscallResult::Error(errno_to_i32(Errno::EINVAL)),
+            Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+        };
+        if let Err(errno) = maybe_autobind_connect_client(&socket, remote) {
+            return SyscallResult::Error(errno_to_i32(errno));
+        }
+        let outcome = {
+            let guard = tx_substrate::epoch::guard();
+            step_connect(&socket, remote, &guard)
+        };
+        match outcome {
+            StepOutcome::Done(()) => {}
+            StepOutcome::Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            _ => return SyscallResult::Error(EIO_VALUE),
+        }
+    }
     if let Err(errno) = maybe_autobind_udp_sendto(&socket, dst) {
         return SyscallResult::Error(errno_to_i32(errno));
     }
@@ -950,6 +972,12 @@ async fn recvfrom_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
                 }
             };
             if !recv_ready_mask(ready) {
+                // SCTP: recv on a socket with no data and no established
+                // association (never connected, or locally shut down) reports
+                // ENOTCONN rather than blocking/EAGAIN.
+                if socket.kind == SocketKind::Sctp && sctp_recv_disconnected(&socket) {
+                    return SyscallResult::Error(errno_to_i32(Errno::ENOTCONN));
+                }
                 if flags.is_nonblocking() {
                     return SyscallResult::Error(EAGAIN_VALUE);
                 }
@@ -990,7 +1018,18 @@ async fn recvfrom_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
         }
         yielded_before_wait = false;
 
-        let mut staging = alloc::vec![0; recv_staging_len(&socket, len)];
+        let staging_len = recv_staging_len(&socket, len);
+        // Validate the destination buffer is writable BEFORE consuming the
+        // message, so a bad buffer (e.g. -1) returns EFAULT without dropping the
+        // queued message (a later recv must still see it).
+        if staging_len > 0 && !flags.contains(SendRecvFlags::MSG_PEEK) {
+            if let Err(errno) =
+                validate_user_range(ctx, args[1], staging_len, UserAccessKind::Write)
+            {
+                return SyscallResult::Error(errno_to_i32(errno));
+            }
+        }
+        let mut staging = alloc::vec![0; staging_len];
         let outcome = {
             let guard = tx_substrate::epoch::guard();
             step_recv_kernel_bytes(&socket, &mut staging, flags, &guard)
