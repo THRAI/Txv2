@@ -4,7 +4,8 @@ use crate::execution::{Errno, Guard, StepOutcome};
 use crate::net::checks::require::require_socket_shutdown_target;
 use crate::net::delegate::net_delegate_kick_poll;
 use crate::net::structure::{
-    RecvWireSet, SendWireSet, SockShutdownCmd, SocketIdentity, SocketProtocol, TcpState,
+    ConnectionKey, RecvWireSet, SendWireSet, SockShutdownCmd, SocketIdentity, SocketProtocol,
+    TcpState,
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -47,6 +48,22 @@ pub fn step_shutdown(
             raw_tcp.close();
         }
         payload.refresh_io_from_raw();
+    }
+
+    // SCTP: shutting down the write side tears down the (single) 1-to-1
+    // association, so signal the peer's read side — its next recv with no
+    // pending data sees EOF, like a peer close.
+    if closes_write_side && mark.send {
+        if let SocketProtocol::Sctp(TcpState::Connected { local, remote }) =
+            payload.protocol_snapshot()
+        {
+            if let Some(peer) = payload
+                .socket_table()
+                .lookup_sctp_connection(ConnectionKey::new(remote, local), guard)
+            {
+                peer.readiness.fire_recv(RecvWireSet::BROKEN);
+            }
+        }
     }
 
     let recv_woken = if mark.recv {

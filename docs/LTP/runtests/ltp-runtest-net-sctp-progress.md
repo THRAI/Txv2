@@ -31,7 +31,15 @@ Date: 2026-06-04
 `test_1_to_1_rtoinfo`(3)、`test_1_to_1_initmsg_connect`(2)、`test_1_to_1_sockopt`(22)、
 `test_getname`(13)、`test_getname_v6`(13)、`test_1_to_1_socket_bind_listen`(14)、
 `test_1_to_1_connect`(10)、`test_1_to_1_nonblock`(5)、`test_1_to_1_send`(8)、
-`test_1_to_1_recvfrom`(7)、`test_1_to_1_sendto`(4)、`test_1_to_1_events`(4)。
+`test_1_to_1_recvfrom`(7)、`test_1_to_1_sendto`(4)、`test_1_to_1_events`(4)、
+`test_1_to_1_shutdown`(6)。
+
+**阶段 2 shutdown 语义(2026-06-05):** `test_1_to_1_shutdown`(6)过。
+- `SHUT_WR`/`SHUT_RDWR` 在 1-to-1 SCTP 上**通知对端读侧 EOF**(`step_shutdown` 找对端
+  fire `RecvWireSet::BROKEN`),对端 recv 无数据时返 0(EOF);本端 SHUT_WR 后 drained
+  的 recv 返 ENOTCONN(复用 `sctp_recv_disconnected`)。
+- 向**已 SHUT_RD 的对端**发送:接受并丢弃(返成功),不再 EPIPE(否则 flag=0 的 send 触发 SIGPIPE)。
+- `shutdown` 未建联 SCTP socket → `ENOTCONN`(`socket_can_shutdown` 加状态检查)。
 
 **阶段 2 事件模型(2026-06-05):** `test_1_to_1_events`(4)过。实现:
 - `SCTP_EVENTS` 订阅(`sctp_event_subscribe`,存 `SctpLevelOptions.events_subscribe`)。
@@ -148,7 +156,7 @@ recvmsg→`EAGAIN` 可做,但 TEST5 要 `sendmsg`/`recvmsg`+`sctp_sndrcvinfo`+`M
 | `test_1_to_1_send` | 9 | **pass** | 2 | `target/oscomp/ltp-net-sctp-test_1_to_1_send.txt` |
 | `test_1_to_1_recvmsg` | 8 | musl-blocked 3/8 | 2 | `target/oscomp/ltp-net-sctp-test_1_to_1_recvmsg.txt` |
 | `test_1_to_1_recvfrom` | 7 | **pass** | 2 | `target/oscomp/ltp-net-sctp-test_1_to_1_recvfrom.txt` |
-| `test_1_to_1_shutdown` | 6 | TCONF(门) | 2 | — |
+| `test_1_to_1_shutdown` | 6 | **pass** | 2 | `target/oscomp/ltp-net-sctp-test_1_to_1_shutdown.txt` |
 | `test_connect` | 5 | TCONF(门) | 2 | — |
 | `test_1_to_1_nonblock` | 5 | **pass** | 2 | `target/oscomp/ltp-net-sctp-test_1_to_1_nonblock.txt` |
 | `test_1_to_1_events` | 4 | **pass** | 2 | `target/oscomp/ltp-net-sctp-test_1_to_1_events.txt` |

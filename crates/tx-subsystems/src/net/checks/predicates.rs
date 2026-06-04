@@ -306,7 +306,22 @@ pub(crate) fn socket_can_shutdown(
     socket: &SocketIdentity,
     _how: SockShutdownCmd,
 ) -> Result<(), Errno> {
-    socket_payload_present(socket)
+    socket.with_payload_for_check(|payload| {
+        let Some(payload) = payload else {
+            return Err(Errno::ENOTCONN);
+        };
+        // SCTP 1-to-1: shutdown() on a socket with no established association
+        // returns ENOTCONN.
+        if socket.kind == SocketKind::Sctp
+            && !matches!(
+                payload.protocol_snapshot(),
+                SocketProtocol::Sctp(TcpState::Connected { .. })
+            )
+        {
+            return Err(Errno::ENOTCONN);
+        }
+        Ok(())
+    })
 }
 
 pub(crate) fn socket_can_poll(socket: &SocketIdentity) -> Result<(), Errno> {

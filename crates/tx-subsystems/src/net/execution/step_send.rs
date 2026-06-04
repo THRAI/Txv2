@@ -979,7 +979,9 @@ fn send_sctp_stream_bytes(
         return StepOutcome::Err(Errno::EPIPE);
     }
     if peer_payload.shutdown_rd() {
-        return StepOutcome::Err(Errno::EPIPE);
+        // The peer shut down its read side: the message is accepted and silently
+        // discarded (the peer's recv returns EOF), not an EPIPE error.
+        return StepOutcome::Done(bytes.len());
     }
     let Some(became_readable) =
         peer_payload.record_sctp_message(bytes.to_vec(), false, stream, ppid)

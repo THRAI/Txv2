@@ -252,6 +252,24 @@ fn sctp_recv_on_unconnected_socket_reports_enotconn() {
 }
 
 #[test]
+fn sctp_shutdown_on_unconnected_socket_reports_enotconn() {
+    // LTP test_1_to_1_shutdown case 6: shutdown() on a socket with no
+    // established association returns ENOTCONN.
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
+    let guard = tx_substrate::epoch::guard();
+
+    let sk = sctp_socket();
+    assert_eq!(
+        step_shutdown(&sk, crate::net::structure::SockShutdownCmd::Recv, &guard),
+        StepOutcome::Err(Errno::ENOTCONN)
+    );
+}
+
+#[test]
 fn sctp_listen_backlog_admits_n_plus_one_connections() {
     // Linux accept-queue semantics: listen(N) admits N+1 pending connections
     // (`sk_ack_backlog > sk_max_ack_backlog`). LTP test_tcp_style relies on this:
