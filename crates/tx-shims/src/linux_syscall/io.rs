@@ -955,6 +955,112 @@ async fn sys_write_pagebacked<'a>(
     }
 }
 
+async fn sys_pipe_write_buffered<'a>(
+    payload: &Cap<tx_subsystems::pipe::PipePayload>,
+    bytes: &[u8],
+    nonblocking: bool,
+    packet_mode: bool,
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
+    use tx_scripts::drive;
+    use tx_substrate::step::DriveMode;
+    use tx_subsystems::pipe::WriteOp;
+
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let mode = if nonblocking || mailbox_arc.is_none() {
+        DriveMode::Nonblocking
+    } else {
+        DriveMode::Waiting
+    };
+    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+    let op = WriteOp {
+        payload,
+        bytes,
+        nonblocking,
+        packet_mode,
+    };
+
+    match drive(
+        op,
+        &mut script_ctx,
+        mode,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
+        timer_wheel_arc.as_ref(),
+    )
+    .await
+    {
+        Ok(total) => SyscallResult::Return(total as i64),
+        Err(v3errno) => {
+            let errno: tx_subsystems::execution::Errno = v3errno.into();
+            if errno == tx_subsystems::execution::Errno::EPIPE {
+                let _ = tx_subsystems::signal::step_kill_process(
+                    &ctx.process,
+                    tx_subsystems::signal::Signum::SIGPIPE,
+                    None,
+                );
+            }
+            SyscallResult::error_from(errno)
+        }
+    }
+}
+
+async fn sys_pipe_read_buffered<'a>(
+    payload: &Cap<tx_subsystems::pipe::PipePayload>,
+    buf_ptr: usize,
+    len: usize,
+    nonblocking: bool,
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
+    use tx_scripts::drive;
+    use tx_substrate::step::DriveMode;
+    use tx_subsystems::pipe::ReadOp;
+
+    let mut staging: alloc::vec::Vec<u8> = alloc::vec![0u8; len];
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let mode = if nonblocking || mailbox_arc.is_none() {
+        DriveMode::Nonblocking
+    } else {
+        DriveMode::Waiting
+    };
+    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+    let op = ReadOp {
+        payload,
+        out: &mut staging,
+        nonblocking,
+    };
+
+    match drive(
+        op,
+        &mut script_ctx,
+        mode,
+        mailbox_arc.as_ref(),
+        delegate_registry_arc.as_deref(),
+        timer_wheel_arc.as_ref(),
+    )
+    .await
+    {
+        Ok(total) => {
+            if total > 0 {
+                if let Err(errno) =
+                    bootstrap_copy_to_user(&ctx.aspace, buf_ptr as u64, &staging[..total])
+                {
+                    return SyscallResult::error_from(errno);
+                }
+            }
+            SyscallResult::Return(total as i64)
+        }
+        Err(v3errno) => {
+            let errno: tx_subsystems::execution::Errno = v3errno.into();
+            SyscallResult::error_from(errno)
+        }
+    }
+}
+
 pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let fd = args[0] as i32;
     let buf_ptr = args[1] as usize;
@@ -1000,30 +1106,7 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut bytes, buf_ptr as u64) {
             return SyscallResult::error_from(errno);
         }
-        let guard = crate::adapter::step_engine::guard();
-        match tx_subsystems::pipe::step_write(&tx, &bytes, &guard, file.flags().nonblocking, false)
-        {
-            crate::adapter::step_engine::StepOutcome::Done(n) => {
-                return SyscallResult::Return(n as i64);
-            }
-            crate::adapter::step_engine::StepOutcome::Continue { progress } => {
-                return SyscallResult::Return(progress.bytes() as i64);
-            }
-            crate::adapter::step_engine::StepOutcome::Err(errno) => {
-                let errno: tx_subsystems::execution::Errno = errno.into();
-                if errno == tx_subsystems::execution::Errno::EPIPE {
-                    let _ = tx_subsystems::signal::step_kill_process(
-                        &ctx.process,
-                        tx_subsystems::signal::Signum::SIGPIPE,
-                        None,
-                    );
-                }
-                return SyscallResult::error_from(errno);
-            }
-            crate::adapter::step_engine::StepOutcome::Yield { .. } => {
-                return SyscallResult::Error(EAGAIN_VALUE);
-            }
-        }
+        return sys_pipe_write_buffered(&tx, &bytes, file.flags().nonblocking, false, ctx).await;
     }
 
     let len = if matches!(
@@ -1050,35 +1133,14 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut bytes, buf_ptr as u64) {
             return SyscallResult::error_from(errno);
         }
-        let guard = crate::adapter::step_engine::guard();
-        match tx_subsystems::pipe::step_write(
+        return sys_pipe_write_buffered(
             &pipe,
             &bytes,
-            &guard,
             file.flags().nonblocking,
             file.flags().packet,
-        ) {
-            crate::adapter::step_engine::StepOutcome::Done(n) => {
-                return SyscallResult::Return(n as i64);
-            }
-            crate::adapter::step_engine::StepOutcome::Continue { progress } => {
-                return SyscallResult::Return(progress.bytes() as i64);
-            }
-            crate::adapter::step_engine::StepOutcome::Err(errno) => {
-                let errno: tx_subsystems::execution::Errno = errno.into();
-                if errno == tx_subsystems::execution::Errno::EPIPE {
-                    let _ = tx_subsystems::signal::step_kill_process(
-                        &ctx.process,
-                        tx_subsystems::signal::Signum::SIGPIPE,
-                        None,
-                    );
-                }
-                return SyscallResult::error_from(errno);
-            }
-            crate::adapter::step_engine::StepOutcome::Yield { .. } => {
-                return SyscallResult::Error(EAGAIN_VALUE);
-            }
-        }
+            ctx,
+        )
+        .await;
     }
 
     // PageBacked files: direct user-buffer path (PAGE_BACKED_v1 §5.1).
@@ -1310,38 +1372,7 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
         if len == 0 {
             return SyscallResult::Return(0);
         }
-        let mut staging: alloc::vec::Vec<u8> = alloc::vec![0u8; len];
-        let guard = crate::adapter::step_engine::guard();
-        match tx_subsystems::pipe::step_read(&rx, &mut staging, &guard, file.flags().nonblocking) {
-            crate::adapter::step_engine::StepOutcome::Done(n) => {
-                if n > 0 {
-                    if let Err(errno) =
-                        bootstrap_copy_to_user(&ctx.aspace, buf_ptr as u64, &staging[..n])
-                    {
-                        return SyscallResult::error_from(errno);
-                    }
-                }
-                return SyscallResult::Return(n as i64);
-            }
-            crate::adapter::step_engine::StepOutcome::Continue { progress } => {
-                let n = progress.bytes();
-                if n > 0 {
-                    if let Err(errno) =
-                        bootstrap_copy_to_user(&ctx.aspace, buf_ptr as u64, &staging[..n])
-                    {
-                        return SyscallResult::error_from(errno);
-                    }
-                }
-                return SyscallResult::Return(n as i64);
-            }
-            crate::adapter::step_engine::StepOutcome::Err(errno) => {
-                let errno: tx_subsystems::execution::Errno = errno.into();
-                return SyscallResult::error_from(errno);
-            }
-            crate::adapter::step_engine::StepOutcome::Yield { .. } => {
-                return SyscallResult::Error(EAGAIN_VALUE);
-            }
-        }
+        return sys_pipe_read_buffered(&rx, buf_ptr, len, file.flags().nonblocking, ctx).await;
     }
 
     let len = if matches!(
@@ -1370,39 +1401,7 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
     }
 
     if let Some((pipe, tx_subsystems::pipe::PipeSide::Reader)) = file.pipe_endpoint() {
-        let mut staging: alloc::vec::Vec<u8> = alloc::vec![0u8; len];
-        let guard = crate::adapter::step_engine::guard();
-        match tx_subsystems::pipe::step_read(&pipe, &mut staging, &guard, file.flags().nonblocking)
-        {
-            crate::adapter::step_engine::StepOutcome::Done(n) => {
-                if n > 0 {
-                    if let Err(errno) =
-                        bootstrap_copy_to_user(&ctx.aspace, buf_ptr as u64, &staging[..n])
-                    {
-                        return SyscallResult::error_from(errno);
-                    }
-                }
-                return SyscallResult::Return(n as i64);
-            }
-            crate::adapter::step_engine::StepOutcome::Continue { progress } => {
-                let n = progress.bytes();
-                if n > 0 {
-                    if let Err(errno) =
-                        bootstrap_copy_to_user(&ctx.aspace, buf_ptr as u64, &staging[..n])
-                    {
-                        return SyscallResult::error_from(errno);
-                    }
-                }
-                return SyscallResult::Return(n as i64);
-            }
-            crate::adapter::step_engine::StepOutcome::Err(errno) => {
-                let errno: tx_subsystems::execution::Errno = errno.into();
-                return SyscallResult::error_from(errno);
-            }
-            crate::adapter::step_engine::StepOutcome::Yield { .. } => {
-                return SyscallResult::Error(EAGAIN_VALUE);
-            }
-        }
+        return sys_pipe_read_buffered(&pipe, buf_ptr, len, file.flags().nonblocking, ctx).await;
     }
 
     // PageBacked files: direct user-buffer path (PAGE_BACKED_v1 §5.1).

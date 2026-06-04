@@ -6,8 +6,10 @@ use tx_subsystems::process::bootstrap_init_process;
 use crate::linux_syscall::{
     F_GETFL, F_GETPIPE_SZ, F_SETFL, F_SETPIPE_SZ, NR_CLOSE, NR_FCNTL, NR_PIPE2, NR_PPOLL,
     NR_PSELECT6, NR_READ, NR_SOCKETPAIR, NR_WRITE, NR_WRITEV, O_CLOEXEC, O_DIRECT, O_NONBLOCK,
-    O_WRONLY,
+    O_WRONLY, TTY_WRITE_MAX_INLINE,
 };
+use std::sync::Arc;
+use tx_substrate::wake::TaskMailbox;
 
 const E_INVAL: i32 = 22;
 const E_NOSYS: i32 = 38;
@@ -242,6 +244,123 @@ fn dispatch_socketpair_empty_blocking_read_returns_eagain_without_rnode_panic() 
     assert_eq!(
         block_on(dispatch::<ShimsTestPmap>(req, &ctx)),
         SyscallResult::Error(E_AGAIN)
+    );
+}
+
+#[test]
+fn dispatch_socketpair_blocking_read_parks_until_peer_write() {
+    let _setup = pipe2_setup();
+    let (proc_cap, thread) = fresh_proc_thread();
+    let mailbox = Arc::new(TaskMailbox::new());
+    let ctx = make_ctx(proc_cap.clone(), thread).with_mailbox(mailbox);
+    let sv = dispatch_socketpair(&ctx);
+    let mut read_buf = [0u8; 4];
+
+    let read_req = SyscallRequest::new(
+        NR_READ,
+        [
+            sv[0] as u64,
+            read_buf.as_mut_ptr() as u64,
+            read_buf.len() as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    let waker = Waker::noop().clone();
+    let mut cx = Context::from_waker(&waker);
+    let mut read = Box::pin(dispatch::<ShimsTestPmap>(read_req, &ctx));
+    assert!(
+        matches!(read.as_mut().poll(&mut cx), Poll::Pending),
+        "blocking socketpair read should park before data arrives"
+    );
+
+    let ping = *b"ping";
+    let write_req = SyscallRequest::new(
+        NR_WRITE,
+        [
+            sv[1] as u64,
+            ping.as_ptr() as u64,
+            ping.len() as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(write_req, &ctx)),
+        SyscallResult::Return(ping.len() as i64)
+    );
+    assert_eq!(block_on(read), SyscallResult::Return(read_buf.len() as i64));
+    assert_eq!(&read_buf, b"ping");
+}
+
+#[test]
+fn dispatch_socketpair_blocking_write_parks_until_peer_read() {
+    let _setup = pipe2_setup();
+    let (proc_cap, thread) = fresh_proc_thread();
+    let mailbox = Arc::new(TaskMailbox::new());
+    let ctx = make_ctx(proc_cap.clone(), thread).with_mailbox(mailbox);
+    let sv = dispatch_socketpair(&ctx);
+    let page = [b'x'; TTY_WRITE_MAX_INLINE];
+
+    for _ in 0..tx_subsystems::pipe::PIPE_DEF_BUFFERS {
+        let write_req = SyscallRequest::new(
+            NR_WRITE,
+            [
+                sv[0] as u64,
+                page.as_ptr() as u64,
+                page.len() as u64,
+                0,
+                0,
+                0,
+            ],
+        );
+        assert_eq!(
+            block_on(dispatch::<ShimsTestPmap>(write_req, &ctx)),
+            SyscallResult::Return(page.len() as i64)
+        );
+    }
+
+    let extra = *b"more";
+    let write_req = SyscallRequest::new(
+        NR_WRITE,
+        [
+            sv[0] as u64,
+            extra.as_ptr() as u64,
+            extra.len() as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    let waker = Waker::noop().clone();
+    let mut cx = Context::from_waker(&waker);
+    let mut write = Box::pin(dispatch::<ShimsTestPmap>(write_req, &ctx));
+    assert!(
+        matches!(write.as_mut().poll(&mut cx), Poll::Pending),
+        "blocking socketpair write should park while the peer receive buffer is full"
+    );
+
+    let mut read_buf = [0u8; TTY_WRITE_MAX_INLINE];
+    let read_req = SyscallRequest::new(
+        NR_READ,
+        [
+            sv[1] as u64,
+            read_buf.as_mut_ptr() as u64,
+            read_buf.len() as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(read_req, &ctx)),
+        SyscallResult::Return(read_buf.len() as i64)
+    );
+    assert_eq!(
+        block_on(write),
+        SyscallResult::Return(extra.len() as i64)
     );
 }
 
