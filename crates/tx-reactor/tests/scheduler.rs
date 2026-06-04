@@ -576,6 +576,87 @@ fn userspace_thread_normal_wake_with_budget_queues_behind_preempted_peers() {
 }
 
 #[test]
+fn userspace_thread_normal_wake_beats_aged_preempted_storm() {
+    let mut scheduler = Phase1Scheduler::new();
+    let sleeper = TaskId(82);
+    scheduler.task_submitted(
+        sleeper,
+        TaskHandle::new(sleeper),
+        InitialSchedMeta::fair().userspace_thread(),
+    );
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(sleeper)
+    );
+    scheduler.task_stopped(sleeper, StopReason::Blocked, 200_000, HartId(0));
+
+    let workers = [TaskId(83), TaskId(84), TaskId(85)];
+    for worker in workers {
+        scheduler.task_submitted(
+            worker,
+            TaskHandle::new(worker),
+            InitialSchedMeta::fair()
+                .userspace_thread()
+                .preempted_on_submit(),
+        );
+    }
+    for raw in 86..94 {
+        let kernel = submit_kernel(&mut scheduler, raw);
+        assert_eq!(
+            pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+            Some(kernel)
+        );
+    }
+
+    scheduler.task_runnable(sleeper, WakeHint::Normal);
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(workers[0])
+    );
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(sleeper)
+    );
+}
+
+#[test]
+fn userspace_thread_normal_wake_beats_unaged_preempted_storm_after_one_peer() {
+    let mut scheduler = Phase1Scheduler::new();
+    let sleeper = TaskId(94);
+    scheduler.task_submitted(
+        sleeper,
+        TaskHandle::new(sleeper),
+        InitialSchedMeta::fair().userspace_thread(),
+    );
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(sleeper)
+    );
+    scheduler.task_stopped(sleeper, StopReason::Blocked, 200_000, HartId(0));
+
+    let workers = [TaskId(95), TaskId(96), TaskId(97)];
+    for worker in workers {
+        scheduler.task_submitted(
+            worker,
+            TaskHandle::new(worker),
+            InitialSchedMeta::fair()
+                .userspace_thread()
+                .preempted_on_submit(),
+        );
+    }
+
+    scheduler.task_runnable(sleeper, WakeHint::Normal);
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(workers[0])
+    );
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(sleeper)
+    );
+}
+
+#[test]
 fn wake_handoff_fronts_userspace_waiter_without_boosting() {
     let mut scheduler = Phase1Scheduler::new();
     let waiter = TaskId(75);
@@ -774,6 +855,43 @@ fn aged_preempted_task_beats_new_after_eight_scheduler_turns() {
     assert_eq!(
         pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
         Some(aged)
+    );
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(new_peer)
+    );
+}
+
+#[test]
+fn aged_preempted_tasks_do_not_starve_new_queue() {
+    let mut scheduler = Phase1Scheduler::new();
+    let aged_tasks = [TaskId(90), TaskId(91), TaskId(92)];
+    for task in aged_tasks {
+        scheduler.task_submitted(
+            task,
+            TaskHandle::new(task),
+            InitialSchedMeta::fair()
+                .userspace_thread()
+                .preempted_on_submit(),
+        );
+    }
+
+    for raw in 93..101 {
+        let kernel = submit_kernel(&mut scheduler, raw);
+        assert_eq!(
+            pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+            Some(kernel)
+        );
+    }
+
+    let new_peer = submit_fair(&mut scheduler, 101);
+    let depths = scheduler.queue_depths(HartId(0));
+    assert_eq!(depths.preempted, aged_tasks.len());
+    assert_eq!(depths.new, 1);
+
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(aged_tasks[0])
     );
     assert_eq!(
         pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),

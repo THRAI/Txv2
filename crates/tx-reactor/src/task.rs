@@ -103,7 +103,10 @@ pub(crate) enum TakeRunnableError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PendingPollCommit {
-    Woken(MailboxSchedulerHint),
+    Woken {
+        hint: MailboxSchedulerHint,
+        mailbox_event: bool,
+    },
     Parked,
 }
 
@@ -326,7 +329,11 @@ impl TaskTable {
         let task = self.live_nonterminal_task_mut(handle)?;
         task.future = Some(future);
         if task.wake_state.take_wake() {
-            Ok(PendingPollCommit::Woken(task.mailbox.take_scheduler_hint()))
+            let mailbox_event = !task.mailbox.is_empty() || task.mailbox.overflow();
+            Ok(PendingPollCommit::Woken {
+                hint: task.mailbox.take_scheduler_hint(),
+                mailbox_event,
+            })
         } else {
             task.status = TaskStatus::Parked;
             task.last_stop_reason = Some(StopReason::Blocked);

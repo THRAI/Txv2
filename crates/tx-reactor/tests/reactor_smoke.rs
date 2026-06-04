@@ -8,9 +8,9 @@ use std::sync::{Arc, Mutex};
 
 use tx_reactor::wait::{Channel, Mask, WaitOutcome, WaitProtocol};
 use tx_reactor::{
-    HartId, InitialSchedMeta, Phase1QueueKind, Phase1Scheduler, Reactor, RescheduleSignal,
-    RunStats, SharedReactor, SliceClock, SliceConfig, StopReason, TaskHandle, TaskId, TaskStatus,
-    WakeDispatchReport, WakeHint,
+    yield_now, HartId, InitialSchedMeta, Phase1QueueKind, Phase1Scheduler, Reactor,
+    RescheduleSignal, RunStats, SharedReactor, SliceClock, SliceConfig, StopReason, TaskHandle,
+    TaskId, TaskStatus, WakeDispatchReport, WakeHint,
 };
 use tx_substrate::step::{InterestMask, WaitSourceId};
 use tx_substrate::wake::mailbox::{
@@ -1115,6 +1115,60 @@ fn slice_clock_accounts_consumed_time_and_requeues_expired_slice() {
         ],
         "each preemptive poll arms a slice deadline and cancels it after accounting",
     );
+}
+
+#[test]
+fn concurrent_hart_loop_advances_timer_during_self_yield_storm() {
+    let shared = SharedReactor::empty();
+    assert!(shared.init());
+    let timer_done = Arc::new(AtomicUsize::new(0));
+    let spinner_polls = Arc::new(AtomicUsize::new(0));
+    let deadlines = Arc::new(Mutex::new(Vec::new()));
+
+    shared
+        .with(|reactor| {
+            reactor.submit_task_with_meta(
+                {
+                    let timer_done = Arc::clone(&timer_done);
+                    let sleep = reactor.sleep_until(10);
+                    async move {
+                        sleep.await;
+                        timer_done.store(1, Ordering::SeqCst);
+                    }
+                },
+                InitialSchedMeta::fair().userspace_thread(),
+            )
+        })
+        .expect("shared reactor initialized");
+    shared
+        .with(|reactor| {
+            reactor.submit_task_with_meta(
+                {
+                    let spinner_polls = Arc::clone(&spinner_polls);
+                    async move {
+                        for _ in 0..4 {
+                            spinner_polls.fetch_add(1, Ordering::SeqCst);
+                            yield_now().await;
+                        }
+                    }
+                },
+                InitialSchedMeta::fair().userspace_thread(),
+            )
+        })
+        .expect("shared reactor initialized");
+
+    let mut signal = RecordingRescheduleSignal::default();
+    let mut clock = ScriptedSliceClock::new(vec![0, 0, 11, 11, 11, 11, 11, 11], deadlines);
+    let step = shared
+        .run_hart_loop_concurrent_with_slice_clock(HartId(0), 0, &mut signal, &mut clock)
+        .expect("reactor is initialized");
+
+    assert!(
+        step.observed_timer_wakes(),
+        "timer should fire inside the hot concurrent poll loop"
+    );
+    assert_eq!(timer_done.load(Ordering::SeqCst), 1);
+    assert!(spinner_polls.load(Ordering::SeqCst) >= 1);
 }
 
 #[test]

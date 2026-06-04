@@ -495,7 +495,7 @@ impl SharedReactor {
 
         let reactor = self.initialized()?;
         let mut stats = RunStats::empty();
-        let timer_wakes: usize;
+        let mut timer_wakes: usize;
         let wake_report: WakeDispatchReport;
 
         // Phase 1: advance time & drain wakes through shared/local locks.
@@ -629,13 +629,20 @@ impl SharedReactor {
                             let pending_commit =
                                 { view.shared.tasks.lock().finish_polled_pending(key, future) };
                             match pending_commit {
-                                Ok(PendingPollCommit::Woken(hint)) => {
+                                Ok(PendingPollCommit::Woken {
+                                    hint,
+                                    mailbox_event,
+                                }) => {
                                     emit_wake_debug(
                                         b"debug.wake.pending_hint",
                                         key.id(),
                                         mailbox_scheduler_hint_code(hint),
                                     );
-                                    let hint = mailbox_scheduler_hint_to_reactor(hint);
+                                    let hint = if mailbox_event {
+                                        mailbox_scheduler_hint_to_reactor(hint)
+                                    } else {
+                                        WakeHint::SelfYield
+                                    };
                                     view.mark_runnable_from_hart(key, hint, hart, signal);
                                 }
                                 Ok(PendingPollCommit::Parked) => {
@@ -651,6 +658,9 @@ impl SharedReactor {
                         }
                     }
                 }
+                timer_wakes =
+                    timer_wakes.saturating_add(view.advance_time_to(slice_clock.now_ns()));
+                view.drain_wakes_for_hart(hart, signal);
             }
         }
 
@@ -901,13 +911,20 @@ impl HartRuntimeView<'_> {
                         let pending_commit =
                             { self.shared.tasks.lock().finish_polled_pending(key, future) };
                         match pending_commit {
-                            Ok(PendingPollCommit::Woken(hint)) => {
+                            Ok(PendingPollCommit::Woken {
+                                hint,
+                                mailbox_event,
+                            }) => {
                                 emit_wake_debug(
                                     b"debug.wake.pending_hint",
                                     key.id(),
                                     mailbox_scheduler_hint_code(hint),
                                 );
-                                let hint = mailbox_scheduler_hint_to_reactor(hint);
+                                let hint = if mailbox_event {
+                                    mailbox_scheduler_hint_to_reactor(hint)
+                                } else {
+                                    WakeHint::SelfYield
+                                };
                                 self.mark_runnable_from_hart(key, hint, hart, signal);
                             }
                             Ok(PendingPollCommit::Parked) => {
