@@ -133,13 +133,14 @@ pub fn socket_urgent_wait_token(socket: &SocketIdentity) -> WaitToken {
 /// Build a `struct sctp_assoc_change` notification (20 bytes, native/LE) for the
 /// given `sac_state` (0=COMM_UP, 1=COMM_LOST, 3=SHUTDOWN_COMP) and stream count.
 /// `sn_type` is SCTP_ASSOC_CHANGE (0x8001).
-pub fn sctp_assoc_change_bytes(state: u16, streams: u16) -> alloc::vec::Vec<u8> {
+pub fn sctp_assoc_change_bytes(state: u16, streams: u16, assoc_id: u32) -> alloc::vec::Vec<u8> {
     let mut b = alloc::vec![0u8; 20];
     b[0..2].copy_from_slice(&0x8001u16.to_le_bytes()); // sac_type = SCTP_ASSOC_CHANGE
     b[4..8].copy_from_slice(&20u32.to_le_bytes()); // sac_length
     b[8..10].copy_from_slice(&state.to_le_bytes()); // sac_state
     b[12..14].copy_from_slice(&streams.to_le_bytes()); // sac_outbound_streams
     b[14..16].copy_from_slice(&streams.to_le_bytes()); // sac_inbound_streams
+    b[16..20].copy_from_slice(&assoc_id.to_le_bytes()); // sac_assoc_id
     b
 }
 

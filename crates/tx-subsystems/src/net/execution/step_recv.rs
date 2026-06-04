@@ -130,11 +130,15 @@ fn kick_tcp_loopback_after_recv(payload: &SocketPayload, bytes: usize) {
 /// the write side (SHUT_WR), tearing the association down. A 1-to-many
 /// (SEQPACKET) socket can receive from any peer, so an empty recv blocks instead.
 fn sctp_recv_disconnected(payload: &SocketPayload) -> bool {
-    if payload.with_options(|o| o.socket.sock_type != SocketType::Stream) {
-        return false;
-    }
+    let seqpacket = payload.with_options(|o| o.socket.sock_type == SocketType::SeqPacket);
     match payload.protocol_snapshot() {
         SocketProtocol::Sctp(TcpState::Connected { .. }) => payload.shutdown_wr(),
+        // 1-to-many: a listening socket (or one with associations) can still
+        // receive, so it blocks; one that is neither listening nor associated
+        // reports ENOTCONN.
+        SocketProtocol::Sctp(TcpState::Listening { .. }) if seqpacket => false,
+        SocketProtocol::Sctp(_) if seqpacket => payload.sctp_assoc_count() == 0,
+        // 1-to-1 (Stream): anything other than Connected is ENOTCONN.
         SocketProtocol::Sctp(_) => true,
         _ => false,
     }

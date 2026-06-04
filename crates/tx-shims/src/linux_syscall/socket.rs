@@ -1185,6 +1185,7 @@ struct SctpSndInfo {
     stream: u16,
     flags: u16,
     ppid: u32,
+    assoc_id: u32,
 }
 
 /// Parse an SCTP_SNDRCV control message (sctp_sndrcvinfo) from a sendmsg msghdr.
@@ -1205,11 +1206,13 @@ fn parse_sctp_sndrcvinfo(ctx: &SyscallCtx<'_>, header: &UserMsghdr) -> Option<Sc
     if level != SOL_SCTP || ctype != SCTP_SNDRCV_CMSG {
         return None;
     }
-    // sctp_sndrcvinfo: sinfo_stream @0, sinfo_flags @4, sinfo_ppid @8.
+    // sctp_sndrcvinfo: sinfo_stream @0, sinfo_flags @4, sinfo_ppid @8,
+    // sinfo_assoc_id @28.
     Some(SctpSndInfo {
         stream: u16::from_le_bytes(buf[CMSG_HDR..CMSG_HDR + 2].try_into().ok()?),
         flags: u16::from_le_bytes(buf[CMSG_HDR + 4..CMSG_HDR + 6].try_into().ok()?),
         ppid: u32::from_le_bytes(buf[CMSG_HDR + 8..CMSG_HDR + 12].try_into().ok()?),
+        assoc_id: u32::from_le_bytes(buf[CMSG_HDR + 28..CMSG_HDR + 32].try_into().ok()?),
     })
 }
 
@@ -1439,24 +1442,19 @@ async fn sendmsg_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
         loop {
             let outcome = {
                 let guard = tx_substrate::epoch::guard();
-                match (is_seqpacket, dst) {
-                    (true, Some(dst)) => step_send_sctp_seqpacket(
+                if is_seqpacket {
+                    step_send_sctp_seqpacket(
                         &socket,
                         dst,
+                        info.assoc_id,
                         &bytes,
                         info.stream,
                         info.ppid,
                         flags,
                         &guard,
-                    ),
-                    _ => step_send_sctp_message(
-                        &socket,
-                        &bytes,
-                        info.stream,
-                        info.ppid,
-                        flags,
-                        &guard,
-                    ),
+                    )
+                } else {
+                    step_send_sctp_message(&socket, &bytes, info.stream, info.ppid, flags, &guard)
                 }
             };
             match outcome {
@@ -2906,7 +2904,27 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             }
         }
         (SOL_SCTP, SCTP_GET_PEER_ADDRS) if socket.kind == SocketKind::Sctp => {
-            match socket_peer_endpoint(&socket) {
+            // 1-to-many (SEQPACKET): the peer addresses belong to the association
+            // named by the assoc_id at the start of the input buffer
+            // (struct sctp_getaddrs { sctp_assoc_t assoc_id; ... }). 1-to-1: a
+            // single fixed peer, no association lookup needed.
+            let is_seqpacket =
+                payload.with_options(|o| o.socket.sock_type == SocketType::SeqPacket);
+            let endpoint = if is_seqpacket {
+                let mut idbuf = [0u8; 4];
+                match bootstrap_copy_from_user(&ctx.aspace, &mut idbuf, optval) {
+                    Ok(()) => {
+                        let assoc_id = u32::from_le_bytes(idbuf);
+                        payload
+                            .sctp_peer_addr_by_assoc(assoc_id)
+                            .ok_or(Errno::EINVAL)
+                    }
+                    Err(_) => Err(Errno::EFAULT),
+                }
+            } else {
+                socket_peer_endpoint(&socket)
+            };
+            match endpoint {
                 Ok(endpoint) => write_sctp_getaddrs(ctx, optval, optlen_ptr, endpoint),
                 Err(errno) => Err(errno),
             }

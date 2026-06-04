@@ -1,4 +1,4 @@
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use alloc::vec::Vec;
 use smoltcp::socket::tcp;
@@ -529,6 +529,16 @@ impl SocketPayload {
         self.raw_sctp
             .as_ref()
             .map_or_else(Vec::new, RawSctpSocket::peers_snapshot)
+    }
+
+    /// Peer endpoint of the 1-to-many (SEQPACKET) association named by
+    /// `assoc_id`, for SCTP_GET_PEER_ADDRS (sctp_getpaddrs). None if no such
+    /// association exists.
+    pub fn sctp_peer_addr_by_assoc(&self, assoc_id: u32) -> Option<IpEndpoint> {
+        self.sctp_peers()
+            .into_iter()
+            .find(|assoc| assoc.assoc_id == assoc_id)
+            .map(|assoc| assoc.peer)
     }
 
     /// Number of 1-to-many (SEQPACKET) associations on this socket.
@@ -1638,8 +1648,13 @@ struct RawSctpState {
     queued_bytes: usize,
     /// 1-to-many peer associations (SEQPACKET). Empty for 1-to-1 sockets.
     peers: Vec<SctpAssoc>,
-    next_assoc_id: u32,
 }
+
+/// Association ids are drawn from a process-global monotonic counter so that
+/// ids are unique across sockets: a peer's association id never coincides with
+/// this socket's, which the SCTP API tests rely on when probing an "incorrect"
+/// association id from the other end.
+static NEXT_SCTP_ASSOC_ID: AtomicU32 = AtomicU32::new(1);
 
 impl RawSctpState {
     const fn new() -> Self {
@@ -1647,7 +1662,6 @@ impl RawSctpState {
             frames: Vec::new(),
             queued_bytes: 0,
             peers: Vec::new(),
-            next_assoc_id: 1,
         }
     }
 
@@ -1681,8 +1695,7 @@ impl RawSctpState {
         if let Some(assoc) = self.peers.iter().find(|a| a.peer == peer) {
             return (assoc.assoc_id, false);
         }
-        let assoc_id = self.next_assoc_id;
-        self.next_assoc_id = self.next_assoc_id.wrapping_add(1).max(1);
+        let assoc_id = NEXT_SCTP_ASSOC_ID.fetch_add(1, Ordering::Relaxed).max(1);
         self.peers.push(SctpAssoc { peer, assoc_id });
         (assoc_id, true)
     }

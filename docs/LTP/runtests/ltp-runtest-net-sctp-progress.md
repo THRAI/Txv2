@@ -41,8 +41,22 @@ Date: 2026-06-04
 的 socket,首次接触建联并给双方订阅端发 COMM_UP,数据**直投监听 socket 自身**(无 accept)
 带 source;recvmsg 用 frame.source 填 msg_name;close 时给各 peer 发 SHUTDOWN_COMP
 (`step_socket_close` 的 Bound/Listening 臂)。`sendmsg_impl` 按 sock_type 分流
-(SeqPacket→seqpacket 路径,Stream→1-to-1)。**剩余 1-to-many**:test_basic(case6
-SIGSEGV,疑 getladdrs)、test_connect(peeloff)、assoc_shutdown/abort(SCTP_STATUS
+(SeqPacket→seqpacket 路径,Stream→1-to-1)。
+
+**阶段 3 — test_basic(+v6)全过(15/15,2026-06-05):** 四处修正:
+1. **通配源地址解析**:`step_send_sctp_seqpacket` 中 sk 绑 `INADDR_ANY` 时,对端
+   看到的源地址是路由出口地址(loopback 短路下 = dst 的 loopback 地址),非字面
+   `0.0.0.0`——COMM_UP/数据帧的 `source` 与对端 assoc 键都用解析后的 `source`。
+2. **assoc_id 路由 sendmsg**:`SctpSndInfo` 解析 `sinfo_assoc_id`(@28);
+   `step_send_sctp_seqpacket` 接受 `dst: Option` + `assoc_id`,`msg_name` 为空时
+   按 assoc_id 查对端,无/未知 id → `EPIPE`(匹配 NULL-name 用例)。
+3. **全局唯一 assoc id**:`RawSctpState` 改用进程级原子计数器(`NEXT_SCTP_ASSOC_ID`)
+   发号,使两端 assoc id 不撞号(测试用对端 id 作"错误 id"探测时需要)。
+4. **1-to-many getpaddrs**:`SCTP_GET_PEER_ADDRS` 对 SEQPACKET 从 optval 读
+   `assoc_id`,经 `sctp_peer_addr_by_assoc` 查对端;`close` 的 SHUTDOWN_COMP
+   通知带 `source`(对端视角的本地址)+ 对端自己的 assoc_id。
+
+**剩余 1-to-many**:test_connect(peeloff)、assoc_shutdown/abort(SCTP_STATUS
 要反映已拆关联)、sctp_sendrecvmsg、test_sockopt(+v6)。
 
 **阶段 2 tcp_style 收尾(2026-06-05):** `test_tcp_style(+v6)`(各 22)过。三处修正:
@@ -164,6 +178,8 @@ recvmsg→`EAGAIN` 可做,但 TEST5 要 `sendmsg`/`recvmsg`+`sctp_sndrcvinfo`+`M
 | `test_getname` | 13 | **pass** | 1 | `target/oscomp/ltp-net-sctp-getname.txt` |
 | `test_getname_v6` | 13 | **pass** | 1 | `target/oscomp/ltp-net-sctp-getname-v6.txt` |
 | `test_1_to_1_addrs` | 10 | **pass** | 3 | `target/oscomp/ltp-net-sctp-addrs.txt` |
+| `test_basic` | 15 | **pass** | 3 | `target/oscomp/ltp-net-sctp-f-test_basic.txt` |
+| `test_basic_v6` | 15 | **pass** | 3 | `target/oscomp/ltp-net-sctp-f-test_basic_v6.txt` |
 | `test_1_to_1_rtoinfo` | 3 | **pass** | 1 | `target/oscomp/ltp-net-sctp-rtoinfo-120s.txt` |
 | `test_1_to_1_initmsg_connect` | 2 | **pass** | 1 | `target/oscomp/ltp-net-sctp-1to1-initmsg.txt` |
 | `test_inaddr_any` | 2 | **pass** | 2 | `target/oscomp/ltp-net-sctp-m-test_inaddr_any.txt` |

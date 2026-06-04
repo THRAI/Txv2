@@ -249,6 +249,15 @@ fn notify_sctp_seqpacket_peers_closed(
     guard: &Guard<'_>,
 ) -> usize {
     let mut woken = 0;
+    // This socket's local address, used to compute the source address each peer
+    // observed for it (a wildcard bind resolves to the peer's loopback address).
+    let local = match payload.protocol_snapshot() {
+        SocketProtocol::Sctp(TcpState::Bound { local })
+        | SocketProtocol::Sctp(TcpState::Listening { local, .. })
+        | SocketProtocol::Sctp(TcpState::Connecting { local, .. })
+        | SocketProtocol::Sctp(TcpState::Connected { local, .. }) => local,
+        _ => return woken,
+    };
     for assoc in payload.sctp_peers() {
         let Some(peer) = table
             .lookup_sctp_listener_dual_stack_endpoint(assoc.peer, guard)
@@ -262,11 +271,27 @@ fn notify_sctp_seqpacket_peers_closed(
         if !peer_payload.with_options(|o| o.sctp.event_assoc_change()) {
             continue;
         }
+        // The endpoint the peer associated with this socket: our local address on
+        // the route to the peer, which the SHUTDOWN_COMP notification carries as
+        // msg_name. The association id is the peer's own (ids are per-socket).
+        let source = if local.is_unspecified() {
+            IpEndpoint::from_ip(assoc.peer.ip_addr(), local.port)
+        } else {
+            local
+        };
+        let peer_assoc_id = peer_payload
+            .sctp_peers()
+            .into_iter()
+            .find(|a| a.peer == source)
+            .map_or(assoc.assoc_id, |a| a.assoc_id);
         let streams = peer_payload.with_options(|o| o.sctp.initmsg_num_ostreams);
-        let bytes =
-            crate::net::execution::sctp_assoc_change_bytes(3 /* SHUTDOWN_COMP */, streams);
+        let bytes = crate::net::execution::sctp_assoc_change_bytes(
+            3, /* SHUTDOWN_COMP */
+            streams,
+            peer_assoc_id,
+        );
         if peer_payload
-            .record_sctp_message(bytes, true, 0, 0, None)
+            .record_sctp_message(bytes, true, 0, 0, Some(source))
             .is_some()
         {
             woken += peer.readiness.fire_recv(RecvWireSet::HAS_DATA);

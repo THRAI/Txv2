@@ -471,7 +471,7 @@ fn step_sctp_connect(
     // The accepted (server-side) association is established immediately on our
     // loopback: deliver its COMM_UP to the child if it subscribed to events
     // (subscription inherited from the listener).
-    enqueue_sctp_comm_up(&child);
+    enqueue_sctp_comm_up(&child, Some(local), 0);
 
     if let Err(error) = table.insert_sctp_connection_pair(
         ConnectionKey::new(local, listener_local),
@@ -506,7 +506,7 @@ fn step_sctp_connect(
         });
     });
     // Deliver COMM_UP to the connecting side if it subscribed to events.
-    enqueue_sctp_comm_up(socket);
+    enqueue_sctp_comm_up(socket, Some(listener_local), 0);
     StepOutcome::Done(())
 }
 
@@ -534,8 +534,13 @@ const fn unspecified_endpoint() -> IpEndpoint {
 
 /// Enqueue an SCTP_ASSOC_CHANGE / SCTP_COMM_UP notification on `socket`'s own
 /// receive queue if it subscribed to association events. Delivered ahead of any
-/// data so recvmsg surfaces COMM_UP first (with MSG_NOTIFICATION).
-pub(crate) fn enqueue_sctp_comm_up(socket: &Cap<SocketIdentity>) {
+/// data so recvmsg surfaces COMM_UP first (with MSG_NOTIFICATION). `peer` is the
+/// remote endpoint (recvmsg msg_name); `assoc_id` identifies the association.
+pub(crate) fn enqueue_sctp_comm_up(
+    socket: &Cap<SocketIdentity>,
+    peer: Option<IpEndpoint>,
+    assoc_id: u32,
+) {
     let Some(payload) = socket.acquire_operational() else {
         return;
     };
@@ -543,9 +548,12 @@ pub(crate) fn enqueue_sctp_comm_up(socket: &Cap<SocketIdentity>) {
         return;
     }
     let streams = payload.with_options(|o| o.sctp.initmsg_num_ostreams);
-    let bytes = crate::net::execution::sctp_assoc_change_bytes(0 /* SCTP_COMM_UP */, streams);
+    let bytes = crate::net::execution::sctp_assoc_change_bytes(
+        0, /* SCTP_COMM_UP */
+        streams, assoc_id,
+    );
     if payload
-        .record_sctp_message(bytes, true, 0, 0, None)
+        .record_sctp_message(bytes, true, 0, 0, peer)
         .is_some()
     {
         socket

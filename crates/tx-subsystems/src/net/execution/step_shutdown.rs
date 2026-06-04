@@ -70,7 +70,7 @@ pub fn step_shutdown(
                 let streams = payload.with_options(|o| o.sctp.initmsg_num_ostreams);
                 let bytes = crate::net::execution::sctp_assoc_change_bytes(
                     3, /* SCTP_SHUTDOWN_COMP */
-                    streams,
+                    streams, 0,
                 );
                 if payload
                     .record_sctp_message(bytes, true, 0, 0, None)

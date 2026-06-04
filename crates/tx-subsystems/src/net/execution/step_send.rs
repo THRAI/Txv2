@@ -1032,7 +1032,8 @@ pub fn step_send_sctp_message(
 /// peer's recvmsg fills msg_name.
 pub fn step_send_sctp_seqpacket(
     socket: &Cap<SocketIdentity>,
-    dst: IpEndpoint,
+    dst: Option<IpEndpoint>,
+    assoc_id: u32,
     bytes: &[u8],
     stream: u16,
     ppid: u32,
@@ -1060,12 +1061,37 @@ pub fn step_send_sctp_seqpacket(
         | SocketProtocol::Sctp(TcpState::Connected { local, .. }) => local,
         _ => return StepOutcome::Err(Errno::EADDRNOTAVAIL),
     };
+    // Resolve the destination. An explicit msg_name wins; otherwise route by the
+    // sctp_sndrcvinfo association id, which must name an existing association.
+    // With neither (no msg_name, no/unknown assoc id) there is nothing to send
+    // on — Linux SCTP reports EPIPE.
+    let dst = match dst {
+        Some(dst) => dst,
+        None => match payload
+            .sctp_peers()
+            .into_iter()
+            .find(|assoc| assoc.assoc_id == assoc_id)
+        {
+            Some(assoc) if assoc_id != 0 => assoc.peer,
+            _ => return StepOutcome::Err(Errno::EPIPE),
+        },
+    };
     if bytes.is_empty() {
         return StepOutcome::Done(0);
     }
     if !dst.is_loopback() {
         return StepOutcome::Err(Errno::EOPNOTSUPP);
     }
+
+    // The source endpoint the peer observes is the local address on the route to
+    // dst. When this socket is bound to the wildcard address (INADDR_ANY / ::),
+    // that resolves to the destination's (loopback) address rather than the
+    // literal 0.0.0.0 / :: — keep the local port.
+    let source = if local.is_unspecified() {
+        IpEndpoint::from_ip(dst.ip_addr(), local.port)
+    } else {
+        local
+    };
 
     let table = payload.socket_table();
     let Some(peer) = table
@@ -1079,18 +1105,19 @@ pub fn step_send_sctp_seqpacket(
     };
 
     // On first contact, establish the association on both ends and surface
-    // COMM_UP to whichever side subscribed to association events.
-    let is_new = payload
-        .sctp_ensure_assoc(dst)
-        .map_or(false, |(_, is_new)| is_new);
+    // COMM_UP to whichever side subscribed to association events. The COMM_UP
+    // carries the remote endpoint as msg_name and the association id.
+    let (my_assoc_id, is_new) = payload.sctp_ensure_assoc(dst).unwrap_or((0, false));
     if is_new {
-        super::step_connect::enqueue_sctp_comm_up(socket);
-        let _ = peer_payload.sctp_ensure_assoc(local);
-        super::step_connect::enqueue_sctp_comm_up(&peer);
+        super::step_connect::enqueue_sctp_comm_up(socket, Some(dst), my_assoc_id);
+        let peer_assoc_id = peer_payload
+            .sctp_ensure_assoc(source)
+            .map_or(0, |(id, _)| id);
+        super::step_connect::enqueue_sctp_comm_up(&peer, Some(source), peer_assoc_id);
     }
 
     let Some(became_readable) =
-        peer_payload.record_sctp_message(bytes.to_vec(), false, stream, ppid, Some(local))
+        peer_payload.record_sctp_message(bytes.to_vec(), false, stream, ppid, Some(source))
     else {
         return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
     };
