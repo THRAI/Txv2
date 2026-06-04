@@ -6,7 +6,7 @@
 
 pub(crate) use readiness::{
     new_wait_points, notify_readable, notify_writable, release_wait_points, wait_until_readable,
-    wait_until_writable, yield_until_readable,
+    wait_until_writable, yield_until_readable, yield_until_writable,
 };
 pub use readiness::{PIPE_READABLE, PIPE_WRITABLE};
 
@@ -85,5 +85,9 @@ mod readiness {
 
     pub(crate) fn wait_until_writable(source_id: u64) -> StepOutcome<usize, ByteProgress> {
         step_engine::yield_until_writable(source_id, PIPE_WRITABLE)
+    }
+
+    pub(crate) fn yield_until_writable<T>(source_id: u64) -> StepOutcome<T, ByteProgress> {
+        StepOutcome::yield_on_wait_source(ByteProgress::EMPTY, source_id, PIPE_WRITABLE)
     }
 }

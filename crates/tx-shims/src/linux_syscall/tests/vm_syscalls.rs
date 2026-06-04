@@ -10,7 +10,10 @@ use tx_subsystems::process::bootstrap_init_process;
 use tx_subsystems::vfs::structure::{
     FsObjectId, InodeKind, InodeMeta, OpenFileFlags, RNode, RNodeBacking,
 };
-use tx_subsystems::vm::{AccessMode, UserVirtAddr, VmFault, USER_PAGE_SIZE};
+use tx_subsystems::vm::{
+    AccessMode, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntryFlags, VmFault,
+    VmMapRequest, USER_PAGE_SIZE,
+};
 
 use crate::linux_syscall::{
     MADV_DONTNEED, MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_PRIVATE, MAP_SHARED,
@@ -75,9 +78,40 @@ fn pagebacked_open_file(page_count: u64, size_bytes: u64) -> Cap<OpenFile> {
             append: false,
             cloexec: false,
             nonblocking: false,
+            packet: false,
         },
     )
     .expect("open file cap")
+}
+
+fn map_user_private_rw(ctx: &SyscallCtx<'_>, uaddr: usize, len: usize) {
+    let range =
+        UserRange::new_aligned(UserVirtAddr(uaddr), len.max(USER_PAGE_SIZE)).expect("user range");
+    let request = VmMapRequest::fixed(
+        range,
+        MapPlacement::FixedReplace,
+        Prot::READ_WRITE,
+        VmEntryFlags::PRIVATE,
+        VmBacking::PrivateAnon,
+    );
+    ctx.aspace.try_mmap(request).expect("map user range");
+}
+
+#[test]
+fn bootstrap_copy_to_user_reuses_active_epoch_guard() {
+    let _setup = vm_setup();
+    let (proc_cap, thread) = fresh_proc_thread();
+    let ctx = make_ctx(proc_cap, thread);
+    let uaddr = 0x5600_0000;
+    let payload = b"guard-reuse";
+    map_user_private_rw(&ctx, uaddr, USER_PAGE_SIZE);
+
+    let guard = guard();
+    let result =
+        crate::linux_syscall::user_copy::bootstrap_copy_to_user(&ctx.aspace, uaddr as u64, payload);
+    drop(guard);
+
+    assert_eq!(result, Ok(()));
 }
 
 /// `mmap(0, PAGE, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS,

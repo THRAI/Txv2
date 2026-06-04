@@ -185,6 +185,24 @@ fn select_fd_ready(
             _ => (false, None),
         };
     }
+    if let Some((rx, tx)) = file.socketpair_endpoint() {
+        return match dir {
+            SelectDir::Read => (
+                rx.readable_level(),
+                Some((
+                    WaitSourceId::new(rx.reader_source_id()),
+                    InterestMask::new(0x1),
+                )),
+            ),
+            SelectDir::Write => (
+                tx.writable_level(),
+                Some((
+                    WaitSourceId::new(tx.writer_source_id()),
+                    InterestMask::new(0x2),
+                )),
+            ),
+        };
+    }
 
     match file.rnode().backing() {
         RNodeBacking::StructBacked {
@@ -347,7 +365,7 @@ pub(super) fn sys_writev_pagebacked_oneshot<'a>(
     args: [u64; 6],
     ctx: &SyscallCtx<'a>,
 ) -> Option<SyscallResult> {
-    use tx_subsystems::vfs::structure::RNodeBacking;
+    use tx_subsystems::vfs::structure::{OpenFileBacking, RNodeBacking};
 
     let fd = args[0] as i32;
     let iov_ptr = args[1];
@@ -374,8 +392,11 @@ pub(super) fn sys_writev_pagebacked_oneshot<'a>(
         return None;
     }
 
-    let pc = match file.rnode().backing() {
-        RNodeBacking::PageBacked { pc } => pc.clone(),
+    let pc = match file.backing() {
+        OpenFileBacking::Rnode { rnode } => match rnode.backing() {
+            RNodeBacking::PageBacked { pc } => pc.clone(),
+            _ => return None,
+        },
         _ => return None,
     };
     if !file.flags().write {
@@ -475,7 +496,7 @@ pub(super) fn sys_writev_pagebacked_oneshot<'a>(
 }
 
 pub(super) fn sys_writev_pagebacked_candidate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> bool {
-    use tx_subsystems::vfs::structure::RNodeBacking;
+    use tx_subsystems::vfs::structure::{OpenFileBacking, RNodeBacking};
 
     let fd = args[0] as i32;
     if fd < 0 {
@@ -487,7 +508,12 @@ pub(super) fn sys_writev_pagebacked_candidate<'a>(args: [u64; 6], ctx: &SyscallC
     if file.posix_mq().is_some() || file.eventfd().is_some() {
         return false;
     }
-    matches!(file.rnode().backing(), RNodeBacking::PageBacked { .. })
+    match file.backing() {
+        OpenFileBacking::Rnode { rnode } => {
+            matches!(rnode.backing(), RNodeBacking::PageBacked { .. })
+        }
+        _ => false,
+    }
 }
 
 /// `readv(fd, iov, iovcnt)` — scatter-read counterpart of `sys_writev`.
@@ -573,31 +599,24 @@ pub(super) async fn sys_readv<'a, P: tx_hal::TimeIf>(
 /// `ppoll(fds, nfds, timeout_ptr, sigmask_ptr)`.
 ///
 /// Minimal implementation that supports the busybox interactive-shell
-/// pattern (single fd, POLLIN, blocking wait). For each pollfd we
-/// peek at the fd's TTY backing readability; if no fd is currently
-/// ready and the timeout is non-zero, we park on the first TTY fd's
-/// wait source and re-poll on wake. Returns the number of fds with
-/// non-zero `revents`.
+/// pattern plus anonymous pipe/socketpair readiness. For each pollfd
+/// we route through the same fd readiness helper used by `pselect6`;
+/// if no fd is currently ready and the timeout is non-zero, we park on
+/// the first fd wait source and re-poll on wake. Returns the number of
+/// fds with non-zero `revents`.
 ///
 /// Behaviour gaps (called out so a future caller doesn't trip on
 /// them):
-/// - Only POLLIN is honoured; POLLOUT / POLLERR / etc. are reported
-///   verbatim from `events` if any fd is found to be ready, otherwise
-///   suppressed. POLLOUT-only polls on TTY backings still return
-///   "ready" eagerly to match the legacy stub semantics.
-/// - Multi-fd waits park on the FIRST TTY POLLIN fd only. If a
-///   different fd becomes readable while we're parked on the first,
-///   we wake on the next ingest event regardless (the wait_source
-///   carrier fires from any TTY ingest path); the re-check loop then
-///   notices the other fd. Cross-fd starvation is theoretically
-///   possible but not observed in practice for the busybox flows.
+/// - Only POLLIN/POLLOUT are honoured; POLLERR / etc. are currently
+///   suppressed. TTY write polls still return "ready" eagerly.
+/// - Multi-fd waits park on the FIRST unready fd that exposes a wait
+///   source. If a different fd becomes ready first, it is noticed on a
+///   later wake.
 /// - The `timeout_ptr` is read but a non-NULL timeout uses the
 ///   timeout-elapsed branch only as an upper bound; the actual
 ///   timer hookup ships with the OnTimer wave (deferred).
 /// - The signal mask is ignored.
 pub(super) async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
-    use tx_subsystems::vfs::structure::{RNodeBacking, StructPayload};
-
     let fds_ptr = args[0];
     let nfds = args[1];
     let timeout_ptr = args[2];
@@ -611,15 +630,15 @@ pub(super) async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
 
     const POLLFD_BYTES: u64 = 8;
     const POLLIN: i16 = 0x0001;
+    const POLLOUT: i16 = 0x0004;
+    const POLLNVAL: i16 = 0x0020;
 
     let wait_allowed = timeout_ptr == 0; // NULL = infinite wait
     let _ = timeout_ptr;
 
-    // Track the first TTY fd's WaitSourceId for parking.
-    let mut park_source: Option<(u64, u64)> = None; // (source_id_raw, interests_raw)
-
     let ready = loop {
         let mut ready: i64 = 0;
+        let mut park_source = None;
         for i in 0..nfds {
             let ent_ptr = fds_ptr.wrapping_add(i * POLLFD_BYTES);
             let mut ent_bytes = [0u8; POLLFD_BYTES as usize];
@@ -632,26 +651,23 @@ pub(super) async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             if fd >= 0 {
                 if let Some(file) = resolve_fd(&ctx.process, fd as u32) {
                     if events & POLLIN != 0 {
-                        if let RNodeBacking::StructBacked {
-                            payload: StructPayload::Tty(tty),
-                        } = file.rnode().backing()
-                        {
-                            if tty_readable_level(tty) {
-                                revents |= POLLIN;
-                            } else if park_source.is_none() {
-                                park_source = Some((tty.wait_source_id(), POLLIN as u64));
-                            }
-                        } else {
+                        let (is_ready, source) = select_fd_ready(&file, SelectDir::Read);
+                        if is_ready {
                             revents |= POLLIN;
+                        } else if park_source.is_none() {
+                            park_source = source;
                         }
                     }
-                    let pollout: i16 = 0x0004;
-                    if events & pollout != 0 {
-                        revents |= pollout;
+                    if events & POLLOUT != 0 {
+                        let (is_ready, source) = select_fd_ready(&file, SelectDir::Write);
+                        if is_ready {
+                            revents |= POLLOUT;
+                        } else if park_source.is_none() {
+                            park_source = source;
+                        }
                     }
                 } else {
-                    let pollnval: i16 = 0x0020;
-                    revents = pollnval;
+                    revents = POLLNVAL;
                 }
             }
             if revents != 0 {
@@ -669,45 +685,10 @@ pub(super) async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         if !wait_allowed {
             break 0;
         }
-        let Some((source_id, interests)) = park_source.take() else {
+        let Some((source, interests)) = park_source else {
             break 0;
         };
-
-        // drive-taskmb: park on the fd's WaitSource via drive() +
-        // PpollOp. The driver registers the task mailbox with the
-        // WaitSource, parks, and wakes when the fd fires.
-        use crate::adapter::step_engine;
-        use step_engine::{InterestMask, WaitSourceId};
-        use tx_scripts::drive;
-        use tx_substrate::step::DriveMode;
-
-        let mut script_ctx = build_subject_script_ctx(ctx);
-        let mailbox_arc = script_ctx.mailbox().cloned();
-        let timer_wheel_arc = script_ctx.timer_wheel().cloned();
-        let delegate_registry_arc = script_ctx.delegate_registry().cloned();
-        // PpollOp does not need an epoch guard (`yield → park` only).
-        let op = tx_subsystems::vfs::composite::PpollOp {
-            wait_source_id: WaitSourceId::new(source_id),
-            interests: InterestMask::new(interests),
-            timeout_ms: None,
-            started: false,
-        };
-        match drive(
-            op,
-            &mut script_ctx,
-            DriveMode::Waiting,
-            mailbox_arc.as_ref(),
-            delegate_registry_arc.as_deref(),
-            timer_wheel_arc.as_ref(),
-        )
-        .await
-        {
-            Ok(1) => {
-                // Fd is ready; re-scan to update revents.
-            }
-            Ok(_) => break 0,
-            Err(_e) => break 0,
-        }
+        super::await_wait_source(ctx, source, interests).await;
     };
 
     SyscallResult::Return(ready)
@@ -1007,6 +988,43 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     if file.eventfd().is_some() {
         return super::eventfd::sys_eventfd_write(&file, args[1], len, ctx).await;
     }
+    if let Some((_rx, tx)) = file.socketpair_endpoint() {
+        if !file.flags().write {
+            return SyscallResult::Error(EINVAL_VALUE);
+        }
+        let len = core::cmp::min(len, TTY_WRITE_MAX_INLINE);
+        if len == 0 {
+            return SyscallResult::Return(0);
+        }
+        let mut bytes: alloc::vec::Vec<u8> = alloc::vec![0u8; len];
+        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut bytes, buf_ptr as u64) {
+            return SyscallResult::error_from(errno);
+        }
+        let guard = crate::adapter::step_engine::guard();
+        match tx_subsystems::pipe::step_write(&tx, &bytes, &guard, file.flags().nonblocking, false)
+        {
+            crate::adapter::step_engine::StepOutcome::Done(n) => {
+                return SyscallResult::Return(n as i64);
+            }
+            crate::adapter::step_engine::StepOutcome::Continue { progress } => {
+                return SyscallResult::Return(progress.bytes() as i64);
+            }
+            crate::adapter::step_engine::StepOutcome::Err(errno) => {
+                let errno: tx_subsystems::execution::Errno = errno.into();
+                if errno == tx_subsystems::execution::Errno::EPIPE {
+                    let _ = tx_subsystems::signal::step_kill_process(
+                        &ctx.process,
+                        tx_subsystems::signal::Signum::SIGPIPE,
+                        None,
+                    );
+                }
+                return SyscallResult::error_from(errno);
+            }
+            crate::adapter::step_engine::StepOutcome::Yield { .. } => {
+                return SyscallResult::Error(EAGAIN_VALUE);
+            }
+        }
+    }
 
     let len = if matches!(
         file.rnode().backing(),
@@ -1033,7 +1051,13 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             return SyscallResult::error_from(errno);
         }
         let guard = crate::adapter::step_engine::guard();
-        match tx_subsystems::pipe::step_write(&pipe, &bytes, &guard, file.flags().nonblocking) {
+        match tx_subsystems::pipe::step_write(
+            &pipe,
+            &bytes,
+            &guard,
+            file.flags().nonblocking,
+            file.flags().packet,
+        ) {
             crate::adapter::step_engine::StepOutcome::Done(n) => {
                 return SyscallResult::Return(n as i64);
             }
@@ -1051,7 +1075,9 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                 }
                 return SyscallResult::error_from(errno);
             }
-            crate::adapter::step_engine::StepOutcome::Yield { .. } => {}
+            crate::adapter::step_engine::StepOutcome::Yield { .. } => {
+                return SyscallResult::Error(EAGAIN_VALUE);
+            }
         }
     }
 
@@ -1276,6 +1302,47 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
     if file.timerfd().is_some() {
         return super::timerfd::sys_timerfd_read::<P>(&file, args[1], len, ctx).await;
     }
+    if let Some((rx, _tx)) = file.socketpair_endpoint() {
+        if !file.flags().read {
+            return SyscallResult::Error(EINVAL_VALUE);
+        }
+        let len = core::cmp::min(len, TTY_WRITE_MAX_INLINE);
+        if len == 0 {
+            return SyscallResult::Return(0);
+        }
+        let mut staging: alloc::vec::Vec<u8> = alloc::vec![0u8; len];
+        let guard = crate::adapter::step_engine::guard();
+        match tx_subsystems::pipe::step_read(&rx, &mut staging, &guard, file.flags().nonblocking) {
+            crate::adapter::step_engine::StepOutcome::Done(n) => {
+                if n > 0 {
+                    if let Err(errno) =
+                        bootstrap_copy_to_user(&ctx.aspace, buf_ptr as u64, &staging[..n])
+                    {
+                        return SyscallResult::error_from(errno);
+                    }
+                }
+                return SyscallResult::Return(n as i64);
+            }
+            crate::adapter::step_engine::StepOutcome::Continue { progress } => {
+                let n = progress.bytes();
+                if n > 0 {
+                    if let Err(errno) =
+                        bootstrap_copy_to_user(&ctx.aspace, buf_ptr as u64, &staging[..n])
+                    {
+                        return SyscallResult::error_from(errno);
+                    }
+                }
+                return SyscallResult::Return(n as i64);
+            }
+            crate::adapter::step_engine::StepOutcome::Err(errno) => {
+                let errno: tx_subsystems::execution::Errno = errno.into();
+                return SyscallResult::error_from(errno);
+            }
+            crate::adapter::step_engine::StepOutcome::Yield { .. } => {
+                return SyscallResult::Error(EAGAIN_VALUE);
+            }
+        }
+    }
 
     let len = if matches!(
         file.rnode().backing(),
@@ -1300,6 +1367,42 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
             return SyscallResult::error_from(errno);
         }
         return SyscallResult::Return(len as i64);
+    }
+
+    if let Some((pipe, tx_subsystems::pipe::PipeSide::Reader)) = file.pipe_endpoint() {
+        let mut staging: alloc::vec::Vec<u8> = alloc::vec![0u8; len];
+        let guard = crate::adapter::step_engine::guard();
+        match tx_subsystems::pipe::step_read(&pipe, &mut staging, &guard, file.flags().nonblocking)
+        {
+            crate::adapter::step_engine::StepOutcome::Done(n) => {
+                if n > 0 {
+                    if let Err(errno) =
+                        bootstrap_copy_to_user(&ctx.aspace, buf_ptr as u64, &staging[..n])
+                    {
+                        return SyscallResult::error_from(errno);
+                    }
+                }
+                return SyscallResult::Return(n as i64);
+            }
+            crate::adapter::step_engine::StepOutcome::Continue { progress } => {
+                let n = progress.bytes();
+                if n > 0 {
+                    if let Err(errno) =
+                        bootstrap_copy_to_user(&ctx.aspace, buf_ptr as u64, &staging[..n])
+                    {
+                        return SyscallResult::error_from(errno);
+                    }
+                }
+                return SyscallResult::Return(n as i64);
+            }
+            crate::adapter::step_engine::StepOutcome::Err(errno) => {
+                let errno: tx_subsystems::execution::Errno = errno.into();
+                return SyscallResult::error_from(errno);
+            }
+            crate::adapter::step_engine::StepOutcome::Yield { .. } => {
+                return SyscallResult::Error(EAGAIN_VALUE);
+            }
+        }
     }
 
     // PageBacked files: direct user-buffer path (PAGE_BACKED_v1 §5.1).

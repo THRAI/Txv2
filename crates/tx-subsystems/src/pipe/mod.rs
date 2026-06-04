@@ -1,4 +1,4 @@
-//! POSIX-style `pipe2(2)` primitive — anonymous unidirectional byte ring.
+//! POSIX-style `pipe2(2)` primitive — anonymous unidirectional pipe transport.
 //!
 //! Spec: `docs/design/05_filesystem/VFS_CHECKS_V2.1.md` (read/write
 //! routing), `man 2 pipe2`.
@@ -49,6 +49,14 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 pub mod adapter;
 pub mod notification;
 
+mod gift;
+#[cfg(test)]
+mod gift_tests;
+pub use gift::{
+    step_pop_user_page_gift, step_push_user_page_gift, step_reserve_user_page_gift_slot,
+    UserPageGiftSlot,
+};
+
 use adapter::step_engine::{
     self, ByteProgress, Cap, NoProgress, OneShotStepOp, ScriptCtx, SpinMutex, StepOp, StepOutcome,
     SubjectIdentity, Zone, ZoneAllocated, ZoneError,
@@ -68,6 +76,7 @@ pub const PIPE_DEF_BUFFERS: usize = 16;
 pub const PIPE_MAX_SIZE: usize = 1024 * 1024;
 
 const PIPE_BUF_FLAG_CAN_MERGE: u32 = 0x10;
+const PIPE_BUF_FLAG_PACKET: u32 = 0x20;
 const PIPE_TMP_PAGES: usize = 2;
 
 /// Reader vs writer end of a pipe. Threads through the synthetic
@@ -81,16 +90,17 @@ pub enum PipeSide {
     Writer,
 }
 
-/// Flags surface for `pipe2(2)`. Wave 3 honours `O_CLOEXEC` and
-/// `O_NONBLOCK`; `O_DIRECT` (packet-mode pipes) returns `ENOSYS` from
-/// the syscall arm.
+/// Flags surface for `pipe2(2)`. `O_DIRECT` is Linux packet mode:
+/// each write publishes packet descriptors, and short reads discard
+/// the unread tail of the current packet.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PipeFlags {
     pub cloexec: bool,
     pub nonblocking: bool,
+    pub packet: bool,
 }
 
-/// Anonymous-pipe payload. Carries the byte ring, per-side reference
+/// Anonymous-pipe payload. Carries the descriptor ring, per-side reference
 /// counts, and the two wait sources.
 ///
 /// **PR-3D-1 coexistence** (D2/D4 ADRs). Each side carries **two**
@@ -148,20 +158,13 @@ impl core::fmt::Debug for PipePayload {
 }
 
 #[derive(Debug)]
-enum PipeMode {
-    ByteStream,
-    #[allow(dead_code)] // txdoc:vfs-full-bringup-scaffold
-    Notification,
-}
-
-#[derive(Debug)]
 struct PipeRing {
-    mode: PipeMode,
     bufs: VecDeque<PipeBuf>,
     tmp_pages: Vec<Vec<u8>>,
     max_usage: usize,
     ring_size: usize,
     bytes: usize,
+    reserved_gift_slots: usize,
 }
 
 #[derive(Debug)]
@@ -176,45 +179,68 @@ struct PipeBuf {
 enum PipeStorage {
     AnonPage(Vec<u8>),
     PageBackedLease(PageLease),
+    UserPageGift(crate::vm::UserPageGift),
 }
 
 impl PipeRing {
     fn new() -> Self {
         Self {
-            mode: PipeMode::ByteStream,
             bufs: VecDeque::with_capacity(PIPE_DEF_BUFFERS),
             tmp_pages: Vec::new(),
             max_usage: PIPE_DEF_BUFFERS,
             ring_size: PIPE_DEF_BUFFERS,
             bytes: 0,
+            reserved_gift_slots: 0,
         }
     }
 
     fn is_empty(&self) -> bool {
-        debug_assert!(matches!(self.mode, PipeMode::ByteStream));
         self.bufs.is_empty()
     }
 
     fn is_full(&self) -> bool {
-        self.bufs.len() >= self.max_usage
+        self.occupied_slots() >= self.max_usage
     }
 
     fn pipe_size_bytes(&self) -> usize {
         self.max_usage.saturating_mul(crate::vm::USER_PAGE_SIZE)
     }
 
-    fn can_write_atomic(&self, len: usize) -> bool {
+    fn can_write_atomic(&self, len: usize, packet_mode: bool) -> bool {
+        if packet_mode {
+            return len <= PIPE_BUF && !self.is_full();
+        }
         self.available_write_capacity() >= len
     }
 
     fn available_write_capacity(&self) -> usize {
         let tail_merge = self.bufs.back().map(PipeBuf::merge_space).unwrap_or(0);
-        let free_slots = self.max_usage.saturating_sub(self.bufs.len());
+        let free_slots = self.max_usage.saturating_sub(self.occupied_slots());
         tail_merge.saturating_add(free_slots.saturating_mul(crate::vm::USER_PAGE_SIZE))
     }
 
+    fn can_accept_transfer(&self, packet: bool) -> bool {
+        if packet {
+            !self.is_full()
+        } else {
+            self.available_write_capacity() > 0
+        }
+    }
+
+    fn transfer_capacity(&self, packet: bool) -> usize {
+        if packet {
+            if self.is_full() {
+                0
+            } else {
+                PIPE_BUF
+            }
+        } else {
+            self.available_write_capacity()
+        }
+    }
+
     fn occupied_slots(&self) -> usize {
-        self.bufs.len()
+        self.bufs.len().saturating_add(self.reserved_gift_slots)
     }
 
     fn set_pipe_size_bytes(&mut self, requested: usize) -> Result<usize, Errno> {
@@ -237,21 +263,30 @@ impl PipeRing {
             let Some(front) = self.bufs.front_mut() else {
                 break;
             };
+            let packet = front.is_packet();
             let chunk = core::cmp::min(out.len() - copied, front.len);
             front.copy_to_slice(&mut out[copied..copied + chunk]);
             front.offset += chunk;
             front.len -= chunk;
             copied += chunk;
             self.bytes -= chunk;
-            if front.len == 0 {
+            let discard = if packet { front.len } else { 0 };
+            if front.len == 0 || packet {
                 let buf = self.bufs.pop_front().expect("front existed");
+                self.bytes -= discard;
                 self.release_storage(buf.storage);
+            }
+            if packet {
+                break;
             }
         }
         copied
     }
 
-    fn fill_from_slice(&mut self, bytes: &[u8]) -> usize {
+    fn fill_from_slice(&mut self, bytes: &[u8], packet_mode: bool) -> usize {
+        if packet_mode {
+            return self.fill_packets_from_slice(bytes);
+        }
         let mut copied = 0usize;
         if let Some(tail) = self.bufs.back_mut() {
             let chunk = tail.append_merge(&bytes[copied..]);
@@ -274,6 +309,27 @@ impl PipeRing {
         copied
     }
 
+    fn fill_packets_from_slice(&mut self, bytes: &[u8]) -> usize {
+        let mut copied = 0usize;
+        while copied < bytes.len() && !self.is_full() {
+            let mut page = self.take_anon_page();
+            let chunk = core::cmp::min(
+                crate::vm::USER_PAGE_SIZE,
+                core::cmp::min(PIPE_BUF, bytes.len() - copied),
+            );
+            page[..chunk].copy_from_slice(&bytes[copied..copied + chunk]);
+            self.bufs.push_back(PipeBuf {
+                storage: PipeStorage::AnonPage(page),
+                offset: 0,
+                len: chunk,
+                flags: PIPE_BUF_FLAG_PACKET,
+            });
+            copied += chunk;
+            self.bytes += chunk;
+        }
+        copied
+    }
+
     fn copy_to_slice(&self, out: &mut [u8]) -> usize {
         let mut copied = 0usize;
         for buf in &self.bufs {
@@ -283,46 +339,128 @@ impl PipeRing {
             let chunk = core::cmp::min(out.len() - copied, buf.len);
             buf.copy_to_slice(&mut out[copied..copied + chunk]);
             copied += chunk;
+            if buf.is_packet() {
+                break;
+            }
         }
         copied
     }
 
-    fn drain_to_ring(&mut self, dst: &mut PipeRing, len: usize) -> usize {
+    fn drain_to_ring(&mut self, dst: &mut PipeRing, len: usize, packet_mode: bool) -> usize {
         let mut moved = 0usize;
         let mut scratch = alloc::vec![0u8; core::cmp::min(len, crate::vm::USER_PAGE_SIZE)];
-        while moved < len && !self.is_empty() && !dst.is_full() {
-            let target = core::cmp::min(scratch.len(), len - moved);
+        while moved < len && !self.is_empty() {
+            let source_packet = self.bufs.front().is_some_and(PipeBuf::is_packet);
+            let packet_out = packet_mode || source_packet;
+            if !dst.can_accept_transfer(packet_out) {
+                break;
+            }
+            if let Some(n) = self.drain_descriptor_to_ring(dst, len - moved, packet_mode) {
+                moved += n;
+                if source_packet {
+                    break;
+                }
+                continue;
+            }
+            let target = core::cmp::min(
+                scratch.len(),
+                core::cmp::min(len - moved, dst.transfer_capacity(packet_out)),
+            );
+            if target == 0 {
+                break;
+            }
             let read = self.drain_to_slice(&mut scratch[..target]);
             if read == 0 {
                 break;
             }
-            let wrote = dst.fill_from_slice(&scratch[..read]);
+            let wrote = dst.fill_from_slice(&scratch[..read], packet_out);
             moved += wrote;
             if wrote < read {
+                break;
+            }
+            if source_packet {
                 break;
             }
         }
         moved
     }
 
-    fn tee_to_ring(&self, dst: &mut PipeRing, len: usize) -> usize {
+    fn tee_to_ring(&self, dst: &mut PipeRing, len: usize, packet_mode: bool) -> usize {
         let mut duplicated = 0usize;
         for buf in &self.bufs {
-            if duplicated >= len || dst.is_full() {
+            if duplicated >= len {
                 break;
             }
-            let chunk = core::cmp::min(buf.len, len - duplicated);
-            if let Some(clone) = buf.clone_prefix(chunk) {
-                dst.bytes += chunk;
-                dst.bufs.push_back(clone);
-                duplicated += chunk;
-            } else {
-                let mut scratch = alloc::vec![0u8; chunk];
-                buf.copy_to_slice(&mut scratch);
-                duplicated += dst.fill_from_slice(&scratch);
+            let packet_out = packet_mode || buf.is_packet();
+            if !dst.can_accept_transfer(packet_out) {
+                break;
+            }
+            let chunk = core::cmp::min(
+                buf.len,
+                core::cmp::min(len - duplicated, dst.transfer_capacity(packet_out)),
+            );
+            if chunk == 0 {
+                break;
+            }
+            if !dst.is_full() {
+                if let Some(clone) = buf.clone_prefix(chunk) {
+                    dst.push_transferred_buf(clone, packet_mode);
+                    duplicated += chunk;
+                    if buf.is_packet() {
+                        break;
+                    }
+                    continue;
+                }
+            }
+            let mut scratch = alloc::vec![0u8; chunk];
+            buf.copy_to_slice(&mut scratch);
+            duplicated += dst.fill_from_slice(&scratch, packet_out);
+            if buf.is_packet() {
+                break;
             }
         }
         duplicated
+    }
+
+    fn drain_descriptor_to_ring(
+        &mut self,
+        dst: &mut PipeRing,
+        limit: usize,
+        packet_mode: bool,
+    ) -> Option<usize> {
+        if limit == 0 || dst.is_full() {
+            return None;
+        }
+        let (front_len, source_packet) = {
+            let front = self.bufs.front()?;
+            (front.len, front.is_packet())
+        };
+        if packet_mode && front_len > PIPE_BUF {
+            return None;
+        }
+        let moved_len = core::cmp::min(front_len, limit);
+        if moved_len == front_len || source_packet {
+            if moved_len != front_len {
+                return None;
+            }
+            let mut buf = self.bufs.pop_front()?;
+            let consumed = if source_packet { buf.len } else { moved_len };
+            buf.len = moved_len;
+            self.bytes -= consumed;
+            dst.push_transferred_buf(buf, packet_mode);
+            return Some(moved_len);
+        }
+
+        None
+    }
+
+    fn push_transferred_buf(&mut self, mut buf: PipeBuf, packet_mode: bool) {
+        if packet_mode {
+            buf.flags |= PIPE_BUF_FLAG_PACKET;
+            buf.flags &= !PIPE_BUF_FLAG_CAN_MERGE;
+        }
+        self.bytes += buf.len;
+        self.bufs.push_back(buf);
     }
 
     fn take_anon_page(&mut self) -> Vec<u8> {
@@ -339,6 +477,7 @@ impl PipeRing {
             }
             PipeStorage::AnonPage(_) => {}
             PipeStorage::PageBackedLease(_) => {}
+            PipeStorage::UserPageGift(_) => {}
         }
     }
 
@@ -347,6 +486,7 @@ impl PipeRing {
         lease: PageLease,
         offset: usize,
         len: usize,
+        packet_mode: bool,
     ) -> Result<(), PageLease> {
         if self.is_full() {
             return Err(lease);
@@ -356,7 +496,7 @@ impl PipeRing {
             storage: PipeStorage::PageBackedLease(lease),
             offset,
             len,
-            flags: 0,
+            flags: if packet_mode { PIPE_BUF_FLAG_PACKET } else { 0 },
         });
         Ok(())
     }
@@ -366,6 +506,9 @@ impl PipeRing {
         if !matches!(front.storage, PipeStorage::PageBackedLease(_)) {
             return None;
         }
+        if front.offset != 0 || front.len != crate::vm::USER_PAGE_SIZE {
+            return None;
+        }
         let buf = self.bufs.pop_front()?;
         self.bytes -= buf.len;
         Some(buf)
@@ -373,6 +516,10 @@ impl PipeRing {
 }
 
 impl PipeBuf {
+    fn is_packet(&self) -> bool {
+        self.flags & PIPE_BUF_FLAG_PACKET != 0
+    }
+
     fn merge_space(&self) -> usize {
         if self.flags & PIPE_BUF_FLAG_CAN_MERGE == 0 {
             return 0;
@@ -380,6 +527,7 @@ impl PipeBuf {
         match &self.storage {
             PipeStorage::AnonPage(page) => page.len().saturating_sub(self.offset + self.len),
             PipeStorage::PageBackedLease(_) => 0,
+            PipeStorage::UserPageGift(_) => 0,
         }
     }
 
@@ -394,6 +542,7 @@ impl PipeBuf {
                 page[start..start + n].copy_from_slice(&bytes[..n]);
             }
             PipeStorage::PageBackedLease(_) => {}
+            PipeStorage::UserPageGift(_) => {}
         }
         self.len += n;
         n
@@ -415,6 +564,17 @@ impl PipeBuf {
                     }
                 }
             }
+            PipeStorage::UserPageGift(gift) => {
+                if let Ok(base) = step_engine::page_allocator::frame_kernel_addr(gift.ppn()) {
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            base.add(self.offset),
+                            out.as_mut_ptr(),
+                            out.len(),
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -427,6 +587,7 @@ impl PipeBuf {
                 len,
                 flags: self.flags,
             }),
+            PipeStorage::UserPageGift(_) => None,
         }
     }
 }
@@ -702,6 +863,7 @@ pub fn step_pipe2(flags: PipeFlags) -> Result<(Cap<OpenFile>, Cap<OpenFile>), Er
         append: false,
         cloexec: flags.cloexec,
         nonblocking: flags.nonblocking,
+        packet: flags.packet,
     };
     let writer_flags = OpenFileFlags {
         read: false,
@@ -709,6 +871,7 @@ pub fn step_pipe2(flags: PipeFlags) -> Result<(Cap<OpenFile>, Cap<OpenFile>), Er
         append: false,
         cloexec: flags.cloexec,
         nonblocking: flags.nonblocking,
+        packet: flags.packet,
     };
 
     let reader_open = OpenFile::new_cap(reader_rnode, reader_flags).map_err(|_| Errno::ENOMEM)?;
@@ -778,6 +941,7 @@ pub fn step_write(
     bytes: &[u8],
     _guard: &Guard<'_>,
     nonblocking: bool,
+    packet_mode: bool,
 ) -> StepOutcome<usize, ByteProgress> {
     // observe
     // upgrade
@@ -795,7 +959,7 @@ pub fn step_write(
     // ② upgrade — N/A (PayloadCap already held by caller)
     // ③ reserve — acquire ring lock
     let mut ring = payload.ring.lock();
-    if bytes.len() <= PIPE_BUF && !ring.can_write_atomic(bytes.len()) {
+    if bytes.len() <= PIPE_BUF && !ring.can_write_atomic(bytes.len(), packet_mode) {
         drop(ring);
         if nonblocking {
             return step_engine::eagain();
@@ -803,7 +967,7 @@ pub fn step_write(
         return notification::wait_until_writable(payload.writer_wait_source_id);
     }
     if !ring.is_full() || ring.available_write_capacity() > 0 {
-        let copied = ring.fill_from_slice(bytes);
+        let copied = ring.fill_from_slice(bytes, packet_mode);
         // ④ commit — fill bytes into ring, release lock
         // ⑤ publish — wake readers parked on bytes-available
         if copied > 0 {
@@ -854,6 +1018,7 @@ pub fn step_push_page_lease(
     len: usize,
     _guard: &Guard<'_>,
     nonblocking: bool,
+    packet_mode: bool,
 ) -> StepOutcome<usize, ByteProgress> {
     if len == 0 {
         return step_engine::done_bytes(0);
@@ -862,7 +1027,7 @@ pub fn step_push_page_lease(
         return step_engine::epipe();
     }
     let mut ring = payload.ring.lock();
-    match ring.push_page_lease(lease, offset, len) {
+    match ring.push_page_lease(lease, offset, len, packet_mode) {
         Ok(()) => {
             drop(ring);
             notification::notify_readable(
@@ -890,6 +1055,7 @@ pub fn step_pop_page_lease(
                 StepOutcome::Done(Some((lease, buf.offset, buf.len)))
             }
             PipeStorage::AnonPage(_) => StepOutcome::Done(None),
+            PipeStorage::UserPageGift(_) => StepOutcome::Done(None),
         };
     }
     drop(ring);
@@ -910,6 +1076,7 @@ pub fn step_splice_to_pipe(
     len: usize,
     _guard: &Guard<'_>,
     nonblocking: bool,
+    packet_mode: bool,
 ) -> StepOutcome<usize, ByteProgress> {
     if len == 0 {
         return step_engine::done_bytes(0);
@@ -921,12 +1088,16 @@ pub fn step_splice_to_pipe(
         return step_engine::epipe();
     }
 
-    let copied = with_two_rings(src, dst, |src_ring, dst_ring| {
-        if src_ring.is_empty() || dst_ring.is_full() {
+    let (copied, src_empty, dst_accepts) = with_two_rings(src, dst, |src_ring, dst_ring| {
+        let src_empty = src_ring.is_empty();
+        let packet_out = packet_mode || src_ring.bufs.front().is_some_and(PipeBuf::is_packet);
+        let dst_accepts = dst_ring.can_accept_transfer(packet_out);
+        let copied = if src_empty || !dst_accepts {
             0
         } else {
-            src_ring.drain_to_ring(dst_ring, len)
-        }
+            src_ring.drain_to_ring(dst_ring, len, packet_mode)
+        };
+        (copied, src_empty, dst_accepts)
     });
     if copied > 0 {
         notification::notify_writable(&src.writer_wait_channel, &src.writer_wait_source);
@@ -934,13 +1105,19 @@ pub fn step_splice_to_pipe(
         return step_engine::done_bytes(copied);
     }
 
-    if src.writer_count.load(Ordering::Acquire) == 0 {
+    if src_empty && src.writer_count.load(Ordering::Acquire) == 0 {
         return step_engine::done_bytes(0);
     }
     if nonblocking {
         return step_engine::eagain();
     }
-    notification::wait_until_readable(src.reader_wait_source_id)
+    if src_empty {
+        notification::wait_until_readable(src.reader_wait_source_id)
+    } else if !dst_accepts {
+        notification::wait_until_writable(dst.writer_wait_source_id)
+    } else {
+        notification::wait_until_readable(src.reader_wait_source_id)
+    }
 }
 
 /// Duplicate bytes from one pipe to another without consuming the
@@ -951,6 +1128,7 @@ pub fn step_tee_to_pipe(
     len: usize,
     _guard: &Guard<'_>,
     nonblocking: bool,
+    packet_mode: bool,
 ) -> StepOutcome<usize, ByteProgress> {
     if len == 0 {
         return step_engine::done_bytes(0);
@@ -962,21 +1140,35 @@ pub fn step_tee_to_pipe(
         return step_engine::epipe();
     }
 
-    let copied = with_two_rings(src, dst, |src_ring, dst_ring| {
-        src_ring.tee_to_ring(dst_ring, len)
+    let (copied, src_empty, dst_accepts) = with_two_rings(src, dst, |src_ring, dst_ring| {
+        let src_empty = src_ring.is_empty();
+        let packet_out = packet_mode || src_ring.bufs.front().is_some_and(PipeBuf::is_packet);
+        let dst_accepts = dst_ring.can_accept_transfer(packet_out);
+        let copied = if src_empty || !dst_accepts {
+            0
+        } else {
+            src_ring.tee_to_ring(dst_ring, len, packet_mode)
+        };
+        (copied, src_empty, dst_accepts)
     });
     if copied > 0 {
         notification::notify_readable(&dst.reader_wait_channel, &dst.reader_wait_source);
         return step_engine::done_bytes(copied);
     }
 
-    if src.writer_count.load(Ordering::Acquire) == 0 {
+    if src_empty && src.writer_count.load(Ordering::Acquire) == 0 {
         return step_engine::done_bytes(0);
     }
     if nonblocking {
         return step_engine::eagain();
     }
-    notification::wait_until_readable(src.reader_wait_source_id)
+    if src_empty {
+        notification::wait_until_readable(src.reader_wait_source_id)
+    } else if !dst_accepts {
+        notification::wait_until_writable(dst.writer_wait_source_id)
+    } else {
+        notification::wait_until_readable(src.reader_wait_source_id)
+    }
 }
 
 fn with_two_rings<R>(
@@ -1050,6 +1242,7 @@ pub struct WriteOp<'a> {
     pub payload: &'a Cap<PipePayload>,
     pub bytes: &'a [u8],
     pub nonblocking: bool,
+    pub packet_mode: bool,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for WriteOp<'a> {
@@ -1057,7 +1250,13 @@ impl<'a, I: SubjectIdentity> StepOp<I> for WriteOp<'a> {
     type Progress = ByteProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         let __guard = step_engine::guard();
-        step_write(self.payload, self.bytes, &__guard, self.nonblocking)
+        step_write(
+            self.payload,
+            self.bytes,
+            &__guard,
+            self.nonblocking,
+            self.packet_mode,
+        )
     }
 }
 
@@ -1166,13 +1365,115 @@ mod tests {
         // payload pulled via reader; same identity as writer's payload.
         let _ = writer;
         let guard = guard();
-        let write_outcome = step_write(&payload, b"hello", &guard, false);
+        let write_outcome = step_write(&payload, b"hello", &guard, false, false);
         assert_eq!(write_outcome, V3Out::Done(5));
         let mut buf = [0u8; 8];
         let read_outcome = step_read(&payload, &mut buf, &guard, false);
         drop(guard);
         assert_eq!(read_outcome, V3Out::Done(5));
         assert_eq!(&buf[..5], b"hello");
+    }
+
+    #[test]
+    fn pipe_packet_mode_short_read_discards_packet_tail() {
+        let _setup = setup();
+        let (reader, writer) = step_pipe2(PipeFlags {
+            cloexec: false,
+            nonblocking: false,
+            packet: true,
+        })
+        .expect("step_pipe2");
+        let payload = payload_of(&reader);
+        let _ = writer;
+        let guard = guard();
+
+        assert_eq!(
+            step_write(&payload, b"abcdef", &guard, false, true),
+            V3Out::Done(6)
+        );
+        assert_eq!(
+            step_write(&payload, b"XY", &guard, false, true),
+            V3Out::Done(2)
+        );
+
+        let mut first = [0u8; 3];
+        assert_eq!(
+            step_read(&payload, &mut first, &guard, false),
+            V3Out::Done(3)
+        );
+        assert_eq!(&first, b"abc");
+
+        let mut second = [0u8; 4];
+        assert_eq!(
+            step_read(&payload, &mut second, &guard, false),
+            V3Out::Done(2)
+        );
+        drop(guard);
+        assert_eq!(&second[..2], b"XY");
+    }
+
+    #[test]
+    fn pipe_packet_mode_splits_large_write_into_pipe_buf_packets() {
+        let _setup = setup();
+        let (reader, writer) = step_pipe2(PipeFlags {
+            cloexec: false,
+            nonblocking: false,
+            packet: true,
+        })
+        .expect("step_pipe2");
+        let payload = payload_of(&reader);
+        let _ = writer;
+        let mut bytes = alloc::vec![b'a'; PIPE_BUF];
+        bytes.extend_from_slice(b"zz");
+        let guard = guard();
+
+        assert_eq!(
+            step_write(&payload, &bytes, &guard, false, true),
+            V3Out::Done(bytes.len())
+        );
+        let mut first = alloc::vec![0u8; PIPE_BUF + 2];
+        assert_eq!(
+            step_read(&payload, &mut first, &guard, false),
+            V3Out::Done(PIPE_BUF)
+        );
+        assert_eq!(&first[..PIPE_BUF], &bytes[..PIPE_BUF]);
+        let mut second = [0u8; 4];
+        assert_eq!(
+            step_read(&payload, &mut second, &guard, false),
+            V3Out::Done(2)
+        );
+        drop(guard);
+        assert_eq!(&second[..2], b"zz");
+    }
+
+    #[test]
+    fn pipe_packet_mode_does_not_tail_merge_small_writes() {
+        let _setup = setup();
+        let (reader, writer) = step_pipe2(PipeFlags {
+            cloexec: false,
+            nonblocking: false,
+            packet: true,
+        })
+        .expect("step_pipe2");
+        let payload = payload_of(&reader);
+        let _ = writer;
+        payload
+            .set_pipe_size_bytes(crate::vm::USER_PAGE_SIZE)
+            .expect("one-page pipe");
+        let guard = guard();
+
+        assert_eq!(
+            step_write(&payload, b"a", &guard, false, true),
+            V3Out::Done(1)
+        );
+        assert_eq!(
+            step_write(&payload, b"b", &guard, true, true),
+            V3Out::Err(V3Errno::EAGAIN)
+        );
+        let mut out = [0u8; 8];
+        assert_eq!(step_read(&payload, &mut out, &guard, false), V3Out::Done(1));
+        drop(guard);
+        assert_eq!(out[0], b'a');
     }
 
     #[test]
@@ -1198,7 +1499,7 @@ mod tests {
         let guard = guard();
         let two_pages = alloc::vec![b'x'; 2 * crate::vm::USER_PAGE_SIZE];
         assert_eq!(
-            step_write(&payload, &two_pages, &guard, false),
+            step_write(&payload, &two_pages, &guard, false, false),
             V3Out::Done(two_pages.len())
         );
         drop(guard);
@@ -1221,12 +1522,12 @@ mod tests {
         let guard = guard();
         let almost_full = alloc::vec![b'a'; crate::vm::USER_PAGE_SIZE - 8];
         assert_eq!(
-            step_write(&payload, &almost_full, &guard, false),
+            step_write(&payload, &almost_full, &guard, false, false),
             V3Out::Done(almost_full.len())
         );
         let atomic = alloc::vec![b'b'; 16];
         assert_eq!(
-            step_write(&payload, &atomic, &guard, true),
+            step_write(&payload, &atomic, &guard, true, false),
             V3Out::Err(V3Errno::EAGAIN)
         );
 
@@ -1247,10 +1548,10 @@ mod tests {
         // Fill the pipe exactly to its current byte capacity.
         let big = alloc::vec![b'x'; payload.pipe_size_bytes()];
         let guard = guard();
-        let filled = step_write(&payload, &big, &guard, false);
+        let filled = step_write(&payload, &big, &guard, false, false);
         assert_eq!(filled, V3Out::Done(big.len()));
         // Next write blocks.
-        let outcome = step_write(&payload, b"y", &guard, false);
+        let outcome = step_write(&payload, b"y", &guard, false, false);
         drop(guard);
         match outcome {
             V3Out::Yield {
@@ -1269,14 +1570,92 @@ mod tests {
     }
 
     #[test]
+    fn pipe_splice_to_full_destination_waits_for_destination_writable() {
+        let _setup = setup();
+        let (src_reader, src_writer) = step_pipe2(PipeFlags::default()).expect("src pipe");
+        let (dst_reader, dst_writer) = step_pipe2(PipeFlags::default()).expect("dst pipe");
+        let src = payload_of(&src_reader);
+        let dst = payload_of(&dst_reader);
+        dst.set_pipe_size_bytes(crate::vm::USER_PAGE_SIZE)
+            .expect("one-page dst");
+        let guard = guard();
+        let dst_fill = alloc::vec![b'x'; crate::vm::USER_PAGE_SIZE];
+        assert_eq!(
+            step_write(&dst, &dst_fill, &guard, false, false),
+            V3Out::Done(dst_fill.len())
+        );
+        assert_eq!(
+            step_write(&src, b"data", &guard, false, false),
+            V3Out::Done(4)
+        );
+
+        let outcome = step_splice_to_pipe(&src, &dst, 1, &guard, false, false);
+        drop(guard);
+        match outcome {
+            V3Out::Yield {
+                shape:
+                    YieldShape::OnWaitSource {
+                        source: carrier,
+                        interests,
+                    },
+                ..
+            } => {
+                assert_eq!(carrier.raw(), dst.writer_source_id());
+                assert_eq!(interests.raw(), PIPE_WRITABLE);
+            }
+            other => panic!("expected destination-writable yield, got {other:?}"),
+        }
+        drop((src_reader, src_writer, dst_reader, dst_writer));
+    }
+
+    #[test]
+    fn pipe_tee_to_full_destination_waits_for_destination_writable() {
+        let _setup = setup();
+        let (src_reader, src_writer) = step_pipe2(PipeFlags::default()).expect("src pipe");
+        let (dst_reader, dst_writer) = step_pipe2(PipeFlags::default()).expect("dst pipe");
+        let src = payload_of(&src_reader);
+        let dst = payload_of(&dst_reader);
+        dst.set_pipe_size_bytes(crate::vm::USER_PAGE_SIZE)
+            .expect("one-page dst");
+        let guard = guard();
+        let dst_fill = alloc::vec![b'x'; crate::vm::USER_PAGE_SIZE];
+        assert_eq!(
+            step_write(&dst, &dst_fill, &guard, false, false),
+            V3Out::Done(dst_fill.len())
+        );
+        assert_eq!(
+            step_write(&src, b"data", &guard, false, false),
+            V3Out::Done(4)
+        );
+
+        let outcome = step_tee_to_pipe(&src, &dst, 1, &guard, false, false);
+        drop(guard);
+        match outcome {
+            V3Out::Yield {
+                shape:
+                    YieldShape::OnWaitSource {
+                        source: carrier,
+                        interests,
+                    },
+                ..
+            } => {
+                assert_eq!(carrier.raw(), dst.writer_source_id());
+                assert_eq!(interests.raw(), PIPE_WRITABLE);
+            }
+            other => panic!("expected destination-writable yield, got {other:?}"),
+        }
+        drop((src_reader, src_writer, dst_reader, dst_writer));
+    }
+
+    #[test]
     fn pipe_step_write_to_full_ring_returns_eagain_when_nonblocking() {
         let _setup = setup();
         let (reader, _writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
         let payload = payload_of(&reader);
         let big = alloc::vec![b'x'; payload.pipe_size_bytes()];
         let guard = guard();
-        let _ = step_write(&payload, &big, &guard, false);
-        let outcome = step_write(&payload, b"y", &guard, true);
+        let _ = step_write(&payload, &big, &guard, false, false);
+        let outcome = step_write(&payload, b"y", &guard, true, false);
         drop(guard);
         assert_eq!(outcome, V3Out::Err(V3Errno::EAGAIN));
     }
@@ -1291,7 +1670,7 @@ mod tests {
         drop(reader);
         assert_eq!(payload.reader_count_snapshot(), 0);
         let guard = guard();
-        let outcome = step_write(&payload, b"x", &guard, false);
+        let outcome = step_write(&payload, b"x", &guard, false, false);
         drop(guard);
         assert_eq!(outcome, V3Out::Err(V3Errno::EPIPE));
         drop(writer);
@@ -1303,6 +1682,7 @@ mod tests {
         let (reader, writer) = step_pipe2(PipeFlags {
             cloexec: true,
             nonblocking: false,
+            packet: false,
         })
         .expect("step_pipe2");
         assert!(reader.flags().cloexec);
@@ -1317,6 +1697,7 @@ mod tests {
         let (reader, writer) = step_pipe2(PipeFlags {
             cloexec: false,
             nonblocking: true,
+            packet: false,
         })
         .expect("step_pipe2");
         assert!(reader.flags().nonblocking);
@@ -1382,7 +1763,7 @@ mod tests {
         // syscall arm in tx-shims pairs this with SIGPIPE delivery
         // before returning -EPIPE to userspace.
         let guard = guard();
-        let outcome = step_write(&payload, b"x", &guard, false);
+        let outcome = step_write(&payload, b"x", &guard, false, false);
         drop(guard);
         assert_eq!(outcome, V3Out::Err(V3Errno::EPIPE));
         drop(writer);
@@ -1446,6 +1827,7 @@ mod tests {
         let outcome = step_pipe2(PipeFlags {
             cloexec: true,
             nonblocking: true,
+            packet: false,
         });
         match outcome {
             // publish: N/A — pipe creation doesn't publish signals
@@ -1472,7 +1854,7 @@ mod tests {
         let _ = writer; // hold writer alive so step_read sees writer_count > 0
         let guard = guard();
         // Seed with bytes via the (non-step_v3) write path.
-        let _ = step_write(&payload, b"hello", &guard, false);
+        let _ = step_write(&payload, b"hello", &guard, false, false);
         let mut buf = [0u8; 8];
         let outcome = step_read(&payload, &mut buf, &guard, false);
         drop(guard);
@@ -1601,7 +1983,7 @@ mod tests {
         let payload = payload_of(&reader);
         let _ = writer; // hold writer alive so reader_count > 0 path is irrelevant
         let guard = guard();
-        let outcome = step_write(&payload, b"hello", &guard, false);
+        let outcome = step_write(&payload, b"hello", &guard, false, false);
         drop(guard);
         match outcome {
             StepOutcome::Done(n) => {
@@ -1626,7 +2008,7 @@ mod tests {
         drop(reader);
         assert_eq!(payload.reader_count_snapshot(), 0);
         let guard = guard();
-        let outcome = step_write(&payload, b"x", &guard, false);
+        let outcome = step_write(&payload, b"x", &guard, false, false);
         drop(guard);
         match outcome {
             StepOutcome::Err(V3Errno::EPIPE) => {}
@@ -1648,10 +2030,10 @@ mod tests {
         // Fill the pipe exactly to its current byte capacity.
         let big = alloc::vec![b'x'; payload.pipe_size_bytes()];
         let guard = guard();
-        let filled = step_write(&payload, &big, &guard, false);
+        let filled = step_write(&payload, &big, &guard, false, false);
         assert_eq!(filled, V3Out::Done(big.len()));
         // Next write blocks → Yield::OnWaitSource with empty progress.
-        let outcome = step_write(&payload, b"y", &guard, false);
+        let outcome = step_write(&payload, b"y", &guard, false, false);
         drop(guard);
         match outcome {
             StepOutcome::Yield {
@@ -1685,8 +2067,8 @@ mod tests {
         let payload = payload_of(&reader);
         let big = alloc::vec![b'x'; payload.pipe_size_bytes()];
         let guard = guard();
-        let _ = step_write(&payload, &big, &guard, false);
-        let outcome = step_write(&payload, b"y", &guard, true);
+        let _ = step_write(&payload, &big, &guard, false, false);
+        let outcome = step_write(&payload, b"y", &guard, true, false);
         drop(guard);
         match outcome {
             StepOutcome::Err(V3Errno::EAGAIN) => {}
@@ -1756,6 +2138,7 @@ mod step_op_wraps {
             flags: PipeFlags {
                 cloexec: true,
                 nonblocking: true,
+                packet: false,
             },
         };
         let outcome = op.step(&mut ScriptCtx::<ProcessIdentity>::new());
@@ -1816,7 +2199,7 @@ mod step_op_wraps {
                         // below acquires its own per STEP_MODEL §1).
         {
             let guard = guard();
-            let _ = step_write(&payload, b"hello", &guard, false);
+            let _ = step_write(&payload, b"hello", &guard, false, false);
         }
         let mut buf = [0u8; 8];
         let mut op = ReadOp {
@@ -1873,6 +2256,7 @@ mod step_op_wraps {
             payload: &payload,
             bytes,
             nonblocking: false,
+            packet_mode: false,
         };
         let outcome = op.step(&mut ScriptCtx::<ProcessIdentity>::new());
         match outcome {
@@ -1893,6 +2277,7 @@ mod step_op_wraps {
             payload: &payload,
             bytes,
             nonblocking: false,
+            packet_mode: false,
         };
         let outcome = op.step(&mut ScriptCtx::<ProcessIdentity>::new());
         match outcome {
@@ -1914,6 +2299,7 @@ mod step_op_wraps {
             payload: &payload,
             bytes,
             nonblocking: false,
+            packet_mode: false,
         };
         let outcome = op.step(&mut ScriptCtx::<ProcessIdentity>::new());
         match outcome {

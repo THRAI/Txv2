@@ -1,8 +1,9 @@
 //! User-space memory copy primitives for syscall argument decoding.
 //!
-//! Each function bridges through the v3 step-engine guard API, taking a
-//! fresh `step_engine::guard()` inside the call site per the two-site
-//! discipline (`txdoc:VM-3-6-CROSS-ASYNC-WAIT-DISCIPLINE`).
+//! Each function bridges through the v3 step-engine guard API, borrowing
+//! an active epoch guard when the caller already holds one and otherwise
+//! taking a fresh `step_engine::guard()` inside the call site per the
+//! two-site discipline (`txdoc:VM-3-6-CROSS-ASYNC-WAIT-DISCIPLINE`).
 //!
 //! ## Bootstrap convention
 //!
@@ -36,6 +37,10 @@ pub(super) enum ReadCStrError {
 /// as `-E2BIG` per the Phase 6 plan.
 pub(super) enum ReadVecError {
     TooBig,
+}
+
+fn user_access_guard() -> step_engine::Guard<'static> {
+    step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard)
 }
 
 /// Bounded copy of a NUL-terminated user string into a kernel-owned
@@ -163,7 +168,7 @@ pub(super) fn read_user_cstr_vec(
 /// kernel-pointer dance on `EFAULT`.
 pub(super) fn bootstrap_read_user<T: Copy>(aspace: &AddressSpace, uaddr: u64) -> Result<T, Errno> {
     use step_engine::{Errno as V3Errno, StepOutcome as V3};
-    let guard = step_engine::guard();
+    let guard = user_access_guard();
     match aspace.read_user(UserPtr::<T>::new(uaddr as usize), &guard) {
         V3::Done(v) => Ok(v),
         V3::Err(V3Errno::EFAULT) => {
@@ -199,7 +204,7 @@ pub(super) fn bootstrap_write_user<T: Copy>(
     value: T,
 ) -> Result<(), Errno> {
     use StepOutcome as V3;
-    let guard = step_engine::guard();
+    let guard = user_access_guard();
     match aspace.write_user(UserPtr::<T>::new(uaddr as usize), value, &guard) {
         V3::Done(()) | V3::Continue { .. } => Ok(()),
         V3::Err(e) if Errno::from(e) == Errno::EFAULT => {
@@ -272,7 +277,7 @@ pub(super) fn bootstrap_copy_from_user(
             }
         }
 
-        let guard = step_engine::guard();
+        let guard = user_access_guard();
         match aspace.copy_from_user(dst, UserPtr::<u8>::new(uaddr as usize), &guard) {
             V3::Done(_) | V3::Continue { .. } => Ok(()),
             V3::Err(e) => Err(Errno::from(e)),
@@ -309,7 +314,7 @@ pub(super) fn bootstrap_copy_from_user(
             return Ok(());
         }
 
-        let guard = step_engine::guard();
+        let guard = user_access_guard();
         match aspace.copy_from_user(dst, UserPtr::<u8>::new(uaddr as usize), &guard) {
             V3::Done(_) | V3::Continue { .. } => Ok(()),
             V3::Err(e) if Errno::from(e) == Errno::EFAULT => {
@@ -356,7 +361,7 @@ pub(super) fn bootstrap_copy_to_user(
             }
         }
 
-        let guard = step_engine::guard();
+        let guard = user_access_guard();
         match aspace.copy_to_user(UserPtr::<u8>::new(uaddr as usize), src, &guard) {
             V3::Done(_) | V3::Continue { .. } => Ok(()),
             V3::Err(e) => Err(Errno::from(e)),
@@ -393,7 +398,7 @@ pub(super) fn bootstrap_copy_to_user(
             return Ok(());
         }
 
-        let guard = step_engine::guard();
+        let guard = user_access_guard();
         match aspace.copy_to_user(UserPtr::<u8>::new(uaddr as usize), src, &guard) {
             V3::Done(_) | V3::Continue { .. } => Ok(()),
             V3::Err(e) if Errno::from(e) == Errno::EFAULT => {
@@ -433,7 +438,7 @@ pub(super) fn bootstrap_read_user_cstr(
     if uaddr == 0 || max_len == 0 {
         return Ok(Vec::new());
     }
-    let guard = step_engine::guard();
+    let guard = user_access_guard();
     match aspace.read_user_cstr(UserPtr::<u8>::new(uaddr as usize), max_len, &guard) {
         V3::Done(v) => Ok(v),
         V3::Err(V3Errno::EFAULT) => {
