@@ -28,7 +28,7 @@ use tx_hal::{
 use tx_shims::linux_syscall::{
     dispatch, dispatch_cap_only_immediate, SyscallCtx, SyscallResult, FUTEX_PRIVATE_FLAG,
     FUTEX_WAKE, FUTEX_WAKE_BITSET, NR_CLONE, NR_EXIT_GROUP, NR_FUTEX, NR_GETPPID, NR_PSELECT6,
-    NR_WRITE,
+    NR_READ, NR_READV, NR_WRITE, NR_WRITEV,
 };
 use tx_subsystems::process::ExitStatus;
 use tx_subsystems::reactor_submit::SubmitChildThreadStatus;
@@ -44,7 +44,8 @@ use tx_subsystems::vm::{
 
 use crate::thread_future::{
     pf_access_to_vm_access, restore_sigreturn_frame, run_thread, siginfo_to_user_abi,
-    syscall_return_may_publish_wake_handoff, syscall_return_needs_handoff, PerHartSlotted,
+    syscall_return_consumes_hot_budget, syscall_return_may_publish_wake_handoff,
+    syscall_return_needs_handoff, PerHartSlotted,
 };
 use crate::trap::direct_trap_syscall_needs_wake_handoff;
 
@@ -347,6 +348,61 @@ fn positive_futex_wake_return_may_publish_wake_handoff() {
         &clone,
         &SyscallResult::Return(123)
     ));
+}
+
+#[test]
+fn hot_io_syscall_budget_requests_periodic_handoff() {
+    let write = SyscallRequest::new(NR_WRITE, [0; 6]);
+    let read = SyscallRequest::new(NR_READ, [0; 6]);
+    let writev = SyscallRequest::new(NR_WRITEV, [0; 6]);
+    let readv = SyscallRequest::new(NR_READV, [0; 6]);
+    let pselect = SyscallRequest::new(NR_PSELECT6, [0; 6]);
+    let mut budget = 2;
+
+    assert!(!syscall_return_consumes_hot_budget(
+        &write,
+        &SyscallResult::Return(100),
+        &mut budget
+    ));
+    assert_eq!(budget, 1);
+    assert!(syscall_return_consumes_hot_budget(
+        &read,
+        &SyscallResult::Return(100),
+        &mut budget
+    ));
+    assert_eq!(budget, 64);
+
+    budget = 1;
+    assert!(syscall_return_consumes_hot_budget(
+        &writev,
+        &SyscallResult::Return(100),
+        &mut budget
+    ));
+    assert_eq!(budget, 64);
+
+    budget = 1;
+    assert!(syscall_return_consumes_hot_budget(
+        &readv,
+        &SyscallResult::Return(100),
+        &mut budget
+    ));
+    assert_eq!(budget, 64);
+
+    budget = 1;
+    assert!(!syscall_return_consumes_hot_budget(
+        &pselect,
+        &SyscallResult::Return(1),
+        &mut budget
+    ));
+    assert_eq!(budget, 64);
+
+    budget = 1;
+    assert!(!syscall_return_consumes_hot_budget(
+        &write,
+        &SyscallResult::Error(11),
+        &mut budget
+    ));
+    assert_eq!(budget, 64);
 }
 
 #[test]

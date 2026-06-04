@@ -90,7 +90,7 @@ use boot_runtime::userspace::{
 use tx_hal::{PercpuIf, TrapIf, TxPlatform};
 use tx_shims::linux_syscall::numbers::{
     FUTEX_CMD_MASK, FUTEX_WAKE, FUTEX_WAKE_BITSET, NR_CLONE, NR_FUTEX, NR_MMAP, NR_MPROTECT,
-    NR_MUNMAP, NR_RT_SIGPROCMASK, NR_WRITEV,
+    NR_MUNMAP, NR_READ, NR_READV, NR_RT_SIGPROCMASK, NR_WRITE, NR_WRITEV,
 };
 use tx_shims::linux_syscall::SyscallResult;
 use tx_subsystems::signal::deliver_synchronous_fault;
@@ -107,6 +107,8 @@ use tx_subsystems::vm::{
     AccessMode, AddressSpace, Prot, UserAccessKind, UserRange, UserVirtAddr, VmEntry,
     VmEntryBacking, VmFault, USER_PAGE_SIZE,
 };
+
+const HOT_SYSCALL_HANDOFF_BUDGET: u8 = 64;
 
 /// Translate the reactor's `PageFaultAccess` into the VM subsystem's
 /// `AccessMode`, which is what `VmFault` consumes. The two enums do
@@ -257,6 +259,7 @@ pub async fn run_thread<P: TxPlatform>(
 ) {
     let mut last_entry_sysno = None;
     let mut syscall_handoff_pending = false;
+    let mut hot_syscall_budget = HOT_SYSCALL_HANDOFF_BUDGET;
     loop {
         if let Some(sysno) = last_entry_sysno {
             emit_syscall_roundtrip_marker(sysno, b"debug.thread.loop.top");
@@ -660,9 +663,11 @@ pub async fn run_thread<P: TxPlatform>(
                         return;
                     };
                     emit_syscall_roundtrip_marker(req.nr, b"debug.thread.aspace.after");
-                    if let Some(result) = tx_shims::linux_syscall::dispatch_thread_aspace_oneshot(
-                        &req, &thread, &aspace,
-                    ) {
+                    if let Some(result) =
+                        tx_shims::linux_syscall::dispatch_thread_payload_aspace_oneshot(
+                            &req, &thread, &payload, &aspace,
+                        )
+                    {
                         emit_syscall_roundtrip_marker(req.nr, b"debug.thread.oneshot.after");
                         result
                     } else if let Some(result) =
@@ -855,6 +860,14 @@ pub async fn run_thread<P: TxPlatform>(
                     // the child can be observed before clone storms dominate
                     // already-runnable peers.
                     syscall_handoff_pending = true;
+                    hot_syscall_budget = HOT_SYSCALL_HANDOFF_BUDGET;
+                } else if syscall_return_consumes_hot_budget(&req, &result, &mut hot_syscall_budget)
+                {
+                    // Syscall-heavy peers, e.g. hackbench over socketpairs,
+                    // can otherwise stay inside one reactor poll for a long
+                    // burst of user/kernel round-trips. Keep this coarse so
+                    // ordinary I/O does not hand off on every read/write.
+                    syscall_handoff_pending = true;
                 }
                 dump_observe_threshold_if_ready::<P>();
             }
@@ -953,6 +966,27 @@ pub(crate) fn syscall_return_needs_handoff(req: &SyscallRequest, result: &Syscal
         ) => true,
         _ => false,
     }
+}
+
+pub(crate) fn syscall_return_consumes_hot_budget(
+    req: &SyscallRequest,
+    result: &SyscallResult,
+    budget: &mut u8,
+) -> bool {
+    let SyscallResult::Return(value) = result else {
+        *budget = HOT_SYSCALL_HANDOFF_BUDGET;
+        return false;
+    };
+    if *value < 0 || !matches!(req.nr, NR_READ | NR_WRITE | NR_READV | NR_WRITEV) {
+        *budget = HOT_SYSCALL_HANDOFF_BUDGET;
+        return false;
+    }
+    if *budget > 1 {
+        *budget -= 1;
+        return false;
+    }
+    *budget = HOT_SYSCALL_HANDOFF_BUDGET;
+    true
 }
 
 pub(crate) fn syscall_return_may_publish_wake_handoff(
