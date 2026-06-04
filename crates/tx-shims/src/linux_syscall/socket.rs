@@ -58,6 +58,9 @@ const IPT_GETINFO_BYTES: usize = 84;
 const IPT_GET_ENTRIES_EMPTY_BYTES: usize = 36;
 const IPT_REPLACE_HEADER_BYTES: usize = 96;
 const IPT_REPLACE_SIZE_OFFSET: usize = 40;
+const IN_ADDR_BYTES: u32 = 4;
+const IP_MREQ_BYTES: u32 = 8;
+const IP_MREQN_BYTES: u32 = 12;
 const GROUP_REQ_BYTES: u32 = 136;
 const GROUP_REQ_GROUP_OFFSET: usize = 8;
 const IPV4_TCP_HEADER_BYTES: u16 = 40;
@@ -1869,6 +1872,12 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             payload.with_options_mut(|opts| opts.ip.hdr_incl = on);
             Ok(())
         }
+        (IPPROTO_IP, IP_MULTICAST_IF) => {
+            if payload.family() != AddressFamily::Inet {
+                return SyscallResult::Error(errno_to_i32(Errno::ENOPROTOOPT));
+            }
+            set_ip_multicast_if(&payload, ctx, optval, optlen)
+        }
         (SOL_IPV6, IPV6_V6ONLY) => {
             let on = match read_sockopt_bool(ctx, optval, optlen) {
                 Ok(on) => on,
@@ -2372,6 +2381,10 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             optlen_ptr,
             payload.with_options(|o| o.ip.hdr_incl as i32),
         ),
+        (IPPROTO_IP, IP_MULTICAST_IF) if payload.family() == AddressFamily::Inet => {
+            let addr = payload.with_options(|o| o.ip.ipv4_multicast_if);
+            write_sockopt_bytes(ctx, optval, optlen_ptr, &addr.octets())
+        }
         (SOL_IPV6, IPV6_V6ONLY) if payload.family() == AddressFamily::Inet6 => write_sockopt_i32(
             ctx,
             optval,
@@ -2481,6 +2494,69 @@ fn ipv6_recv_option_value(
     })
 }
 
+fn set_ip_multicast_if<'a>(
+    payload: &tx_subsystems::net::SocketOperationalEvidence,
+    ctx: &SyscallCtx<'a>,
+    optval: u64,
+    optlen: u32,
+) -> Result<(), Errno> {
+    let addr = read_ip_multicast_if(ctx, optval, optlen)?;
+    payload.with_options_mut(|opts| opts.ip.ipv4_multicast_if = addr);
+    Ok(())
+}
+
+fn read_ip_multicast_if<'a>(
+    ctx: &SyscallCtx<'a>,
+    optval: u64,
+    optlen: u32,
+) -> Result<Ipv4Address, Errno> {
+    if optval == 0 {
+        return Err(Errno::EFAULT);
+    }
+    if optlen < IN_ADDR_BYTES {
+        return Err(Errno::EINVAL);
+    }
+
+    let copy_len = if optlen >= IP_MREQN_BYTES {
+        IP_MREQN_BYTES
+    } else if optlen >= IP_MREQ_BYTES {
+        IP_MREQ_BYTES
+    } else {
+        IN_ADDR_BYTES
+    } as usize;
+    let mut bytes = [0u8; IP_MREQN_BYTES as usize];
+    bootstrap_copy_from_user(&ctx.aspace, &mut bytes[..copy_len], optval)?;
+
+    let addr = if optlen >= IP_MREQN_BYTES {
+        let ifindex = i32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        if ifindex < 0 {
+            return Err(Errno::EINVAL);
+        }
+        if ifindex > 0 {
+            link_ipv4_addr_by_ifindex(ctx, ifindex as u32)?
+        } else {
+            Ipv4Address::new(bytes[4..8].try_into().unwrap())
+        }
+    } else if optlen >= IP_MREQ_BYTES {
+        Ipv4Address::new(bytes[4..8].try_into().unwrap())
+    } else {
+        Ipv4Address::new(bytes[0..4].try_into().unwrap())
+    };
+
+    validate_ip_multicast_if_addr(ctx, addr)?;
+    Ok(addr)
+}
+
+fn validate_ip_multicast_if_addr(ctx: &SyscallCtx<'_>, addr: Ipv4Address) -> Result<(), Errno> {
+    if addr == Ipv4Address::UNSPECIFIED {
+        return Ok(());
+    }
+    match ctx.process.net_namespace() {
+        Some(netns) if netns.owns_ipv4_addr(addr) => Ok(()),
+        _ => Err(Errno::EADDRNOTAVAIL),
+    }
+}
+
 fn set_so_bindtodevice<'a>(
     payload: &tx_subsystems::net::SocketOperationalEvidence,
     ctx: &SyscallCtx<'a>,
@@ -2544,6 +2620,18 @@ fn link_name_by_ifindex(ctx: &SyscallCtx<'_>, ifindex: u32) -> Option<&'static s
         .link_snapshot()
         .into_iter()
         .find_map(|link| (link.ifindex == ifindex).then_some(link.name))
+}
+
+fn link_ipv4_addr_by_ifindex(ctx: &SyscallCtx<'_>, ifindex: u32) -> Result<Ipv4Address, Errno> {
+    let Some(link) = ctx.process.net_namespace().and_then(|netns| {
+        netns
+            .link_snapshot()
+            .into_iter()
+            .find(|link| link.ifindex == ifindex)
+    }) else {
+        return Err(Errno::ENODEV);
+    };
+    link.ipv4_addr.ok_or(Errno::EADDRNOTAVAIL)
 }
 
 fn write_icmp6_filter<'a>(

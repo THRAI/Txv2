@@ -1,8 +1,9 @@
 use super::*;
 
 use crate::net::protocol::{
-    build_icmpv4_echo_reply, build_icmpv4_echo_request, build_icmpv6_echo_request_message,
-    icmpv4_echo_message_len, parse_icmpv4_echo_payload_unchecked, parse_icmpv4_from_ipv4_bytes,
+    build_icmpv4_echo_reply, build_icmpv4_echo_request, build_icmpv4_echo_request_message,
+    build_icmpv6_echo_request_message, icmpv4_echo_message_len,
+    parse_icmpv4_echo_payload_unchecked, parse_icmpv4_from_ipv4_bytes,
     parse_icmpv4_loopback_packet, parse_icmpv4_payload, parse_icmpv6_payload_unchecked,
     parse_raw_icmpv4_echo_payload_unchecked, Icmpv4EchoPacket, Icmpv4Event, Icmpv6EchoPacket,
     Icmpv6Event, RawIcmpSocket,
@@ -161,6 +162,105 @@ fn raw_icmp_ipv4_recv_returns_ip_header_for_raw_socket() {
     assert_eq!(
         parse_icmpv4_from_ipv4_bytes(&out[..drain.bytes]),
         Icmpv4Event::EchoReply(reply)
+    );
+}
+
+#[test]
+fn raw_icmpv4_send_to_configured_peer_route_returns_echo_reply() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
+    let guard = tx_substrate::epoch::guard();
+    let local_ip = Ipv4Address::new([10, 0, 0, 2]);
+    let remote_ip = Ipv4Address::new([10, 23, 1, 1]);
+    let local_ns = crate::net::create_isolated_net_namespace_for_test("icmpv4-route-local")
+        .expect("local namespace")
+        .payload_cap()
+        .expect("local payload");
+    let remote_ns = crate::net::create_isolated_net_namespace_for_test("icmpv4-route-remote")
+        .expect("remote namespace")
+        .payload_cap()
+        .expect("remote payload");
+    let pair = create_veth_pair_for_test_or_bootstrap(VethPairConfig {
+        left: VethEndpointConfig {
+            name: "icmpv4-route-local0",
+            devt: DevT::new(91, 184),
+            mac: EthernetAddress::new([0x02, 0, 0, 0, 4, 1]),
+        },
+        right: VethEndpointConfig {
+            name: "icmpv4-route-remote0",
+            devt: DevT::new(91, 185),
+            mac: EthernetAddress::new([0x02, 0, 0, 0, 4, 2]),
+        },
+        mtu: VETH_DEFAULT_MTU,
+    });
+    local_ns
+        .attach_device_for_test_or_bootstrap(pair.left, None)
+        .expect("attach local veth");
+    remote_ns
+        .attach_device_for_test_or_bootstrap(pair.right, None)
+        .expect("attach remote veth");
+    let auth = NetAdminAuthority::for_test_or_bootstrap();
+    local_ns
+        .set_device_ipv4_addr_by_ifindex(auth, 2, Some(local_ip), Some(24))
+        .expect("set local ipv4");
+    remote_ns
+        .set_device_ipv4_addr_by_ifindex(auth, 2, Some(remote_ip), Some(24))
+        .expect("set remote ipv4");
+    local_ns
+        .add_ipv4_route(
+            auth,
+            crate::net::NetNamespaceRouteConfig {
+                dst: Ipv4Address::new([10, 23, 1, 0]),
+                prefix_len: 24,
+                gateway: None,
+                oif_name: Some("icmpv4-route-local0"),
+                preferred_src: None,
+                table: 254,
+                protocol: 4,
+                scope: 253,
+                route_type: 1,
+            },
+        )
+        .expect("add route to remote alias network");
+
+    let raw = match crate::net::step_socket_create_in_namespace(
+        ValidSocketType::validate(2, 3, 1).expect("AF_INET SOCK_RAW ICMP"),
+        local_ns,
+        &guard,
+    ) {
+        StepOutcome::Done(socket) => socket,
+        other => panic!("raw icmp socket create failed: {other:?}"),
+    };
+    let request = Icmpv4EchoPacket {
+        src: local_ip,
+        dst: remote_ip,
+        ident: 0x5151,
+        seq_no: 7,
+        payload: b"icmpv4-route".to_vec(),
+    };
+    let request_bytes = build_icmpv4_echo_request_message(&request);
+    assert_eq!(
+        step_send_to_kernel_bytes(
+            &raw,
+            Some(IpEndpoint::new(remote_ip, 0)),
+            &request_bytes,
+            SendRecvFlags::empty(),
+            &guard,
+        ),
+        StepOutcome::Done(request_bytes.len())
+    );
+
+    let mut out = [0u8; 128];
+    let recv = match step_recv_kernel_bytes(&raw, &mut out, SendRecvFlags::empty(), &guard) {
+        StepOutcome::Done(recv) => recv,
+        other => panic!("expected icmpv4 echo reply, got {other:?}"),
+    };
+    assert_eq!(
+        parse_icmpv4_from_ipv4_bytes(&out[..recv.bytes]),
+        Icmpv4Event::EchoReply(request.reply_packet())
     );
 }
 

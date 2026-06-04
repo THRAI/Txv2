@@ -9,17 +9,17 @@ use crate::linux_syscall::{
     EFAULT_VALUE, EINTR_VALUE, ENXIO_VALUE, FD_CLOEXEC, F_GETFD, F_GETFL, F_SETFL, IPPROTO_ICMP,
     IPPROTO_ICMPV6, IPPROTO_IP, IPPROTO_IPV6, IPPROTO_TCP, IPPROTO_UDP, IPPROTO_UDPLITE,
     IPT_SO_GET_ENTRIES, IPT_SO_GET_INFO, IPT_SO_SET_REPLACE, IPV6_ADDRFORM, IPV6_UNICAST_HOPS,
-    IP_HDRINCL, IP_RECVERR, IP_TTL, ITIMER_REAL, NETLINK_EXT_ACK, NETLINK_NETFILTER, NETLINK_ROUTE,
-    NETLINK_XFRM, NR_ACCEPT, NR_BIND, NR_CLOSE, NR_CONNECT, NR_DUP, NR_FCNTL, NR_GETSOCKNAME,
-    NR_GETSOCKOPT, NR_IOCTL, NR_LISTEN, NR_PIPE2, NR_PPOLL, NR_PSELECT6, NR_PSELECT6_TIME64,
-    NR_READ, NR_RECVFROM, NR_RECVMMSG, NR_RECVMSG, NR_SENDMMSG, NR_SENDMSG, NR_SENDTO,
-    NR_SETITIMER, NR_SETSOCKOPT, NR_SOCKET, NR_SOCKETPAIR, NR_WRITE, O_CLOEXEC, O_NONBLOCK, O_RDWR,
-    PACKET_RESERVE, PACKET_RX_RING, PACKET_VERSION, PACKET_VNET_HDR, SIOCDARP, SIOCGIFCONF,
-    SIOCGIFFLAGS, SIOCGIFHWADDR, SIOCGIFINDEX, SIOCGIFMTU, SIOCGIFNAME, SIOCGIFTXQLEN, SIOCSARP,
-    SIOCSIFFLAGS, SIOCSIFMTU, SOCKET_IO_MAX_INLINE, SOL_IPV6, SOL_NETLINK, SOL_PACKET, SOL_SOCKET,
-    SOL_TLS, SO_BINDTODEVICE, SO_DONTROUTE, SO_ERROR, SO_PEERCRED, SO_RCVTIMEO, SO_REUSEADDR,
-    SO_SNDBUF, SO_SNDBUFFORCE, SO_TYPE, TCP_MAXSEG, TCP_ULP, TLS_TX, TPACKET_V3,
-    TTY_WRITE_MAX_INLINE,
+    IP_HDRINCL, IP_MULTICAST_IF, IP_RECVERR, IP_TTL, ITIMER_REAL, NETLINK_EXT_ACK,
+    NETLINK_NETFILTER, NETLINK_ROUTE, NETLINK_XFRM, NR_ACCEPT, NR_BIND, NR_CLOSE, NR_CONNECT,
+    NR_DUP, NR_FCNTL, NR_GETSOCKNAME, NR_GETSOCKOPT, NR_IOCTL, NR_LISTEN, NR_PIPE2, NR_PPOLL,
+    NR_PSELECT6, NR_PSELECT6_TIME64, NR_READ, NR_RECVFROM, NR_RECVMMSG, NR_RECVMSG, NR_SENDMMSG,
+    NR_SENDMSG, NR_SENDTO, NR_SETITIMER, NR_SETSOCKOPT, NR_SOCKET, NR_SOCKETPAIR, NR_WRITE,
+    O_CLOEXEC, O_NONBLOCK, O_RDWR, PACKET_RESERVE, PACKET_RX_RING, PACKET_VERSION, PACKET_VNET_HDR,
+    SIOCDARP, SIOCGIFCONF, SIOCGIFFLAGS, SIOCGIFHWADDR, SIOCGIFINDEX, SIOCGIFMTU, SIOCGIFNAME,
+    SIOCGIFTXQLEN, SIOCSARP, SIOCSIFFLAGS, SIOCSIFMTU, SOCKET_IO_MAX_INLINE, SOL_IPV6, SOL_NETLINK,
+    SOL_PACKET, SOL_SOCKET, SOL_TLS, SO_BINDTODEVICE, SO_DONTROUTE, SO_ERROR, SO_PEERCRED,
+    SO_RCVTIMEO, SO_REUSEADDR, SO_SNDBUF, SO_SNDBUFFORCE, SO_TYPE, TCP_MAXSEG, TCP_ULP, TLS_TX,
+    TPACKET_V3, TTY_WRITE_MAX_INLINE,
 };
 use alloc::boxed::Box;
 use alloc::vec;
@@ -552,6 +552,67 @@ fn dispatch_setsockopt_so_bindtodevice_accepts_existing_link() {
             &ctx,
         ),
         SyscallResult::Error(errno_to_i32(Errno::ENODEV))
+    );
+}
+
+#[test]
+fn dispatch_setsockopt_ip_multicast_if_round_trips_local_ipv4() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_icmp(&ctx, SOCK_RAW);
+    let loopback = [127u8, 0, 0, 1];
+
+    assert_eq!(
+        socket_req(
+            NR_SETSOCKOPT,
+            [
+                fd as u64,
+                IPPROTO_IP as u64,
+                IP_MULTICAST_IF as u64,
+                loopback.as_ptr() as u64,
+                loopback.len() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let mut out = [0u8; 4];
+    let mut out_len = out.len() as u32;
+    assert_eq!(
+        socket_req(
+            NR_GETSOCKOPT,
+            [
+                fd as u64,
+                IPPROTO_IP as u64,
+                IP_MULTICAST_IF as u64,
+                out.as_mut_ptr() as u64,
+                (&mut out_len as *mut u32) as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(out_len, loopback.len() as u32);
+    assert_eq!(out, loopback);
+
+    let missing = [203u8, 0, 113, 44];
+    assert_eq!(
+        socket_req(
+            NR_SETSOCKOPT,
+            [
+                fd as u64,
+                IPPROTO_IP as u64,
+                IP_MULTICAST_IF as u64,
+                missing.as_ptr() as u64,
+                missing.len() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Error(errno_to_i32(Errno::EADDRNOTAVAIL))
     );
 }
 

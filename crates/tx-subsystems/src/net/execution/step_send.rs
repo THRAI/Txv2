@@ -7,13 +7,14 @@ use crate::net::delegate::net_delegate_kick_poll;
 use crate::net::execution::{socket_send_wait_token, yield_bytes_on_token, ByteStepOutcome};
 use crate::net::namespace::{net_namespace_payloads_snapshot, NetNamespacePayload};
 use crate::net::protocol::{
-    build_icmpv6_echo_reply_message, parse_icmpv6_payload_unchecked, Icmpv6Event, RawIpv6Packet,
+    build_icmpv6_echo_reply_message, parse_icmpv4_payload, parse_icmpv6_payload_unchecked,
+    parse_raw_icmpv4_echo_payload_unchecked, Icmpv4Event, Icmpv6Event, RawIpv6Packet,
     UDP_IPV4_MAX_PAYLOAD_BYTES,
 };
 use crate::net::structure::{
-    AddressFamily, ConnectionKey, IpEndpoint, Ipv6Address, ProtocolNumber, RdsState, RecvWireSet,
-    SendRecvFlags, SendWireSet, SocketIdentity, SocketKind, SocketPayload, SocketProtocol,
-    TcpState, UnixDatagramState, UnixSocketPath, UnixStreamState,
+    AddressFamily, ConnectionKey, IpEndpoint, Ipv4Address, Ipv6Address, ProtocolNumber, RdsState,
+    RecvWireSet, SendRecvFlags, SendWireSet, SocketIdentity, SocketKind, SocketPayload,
+    SocketProtocol, TcpState, UnixDatagramState, UnixSocketPath, UnixStreamState,
 };
 use crate::net::NetAdminAuthority;
 use tx_substrate::zone::PayloadCap;
@@ -245,6 +246,16 @@ pub fn step_send_to_kernel_bytes_with_poll_kick(
     }
     if bytes.is_empty() {
         return StepOutcome::Done(0);
+    }
+    if socket.kind == SocketKind::RawIcmp && payload.family() == AddressFamily::Inet {
+        if let Some(destination) = dst {
+            if destination.family != AddressFamily::Inet {
+                return StepOutcome::Err(Errno::EAFNOSUPPORT);
+            }
+            if !destination.is_loopback() && !destination.is_unspecified() {
+                return send_configured_icmpv4_echo(&payload, destination.addr, bytes, guard);
+            }
+        }
     }
     if socket.kind == SocketKind::RawIcmp && payload.family() == AddressFamily::Inet6 {
         return send_raw_ipv6(socket, &payload, dst, bytes, guard);
@@ -534,6 +545,74 @@ fn send_rds_packet(
     StepOutcome::Done(bytes.len())
 }
 
+fn send_configured_icmpv4_echo(
+    payload: &SocketPayload,
+    dst_addr: Ipv4Address,
+    bytes: &[u8],
+    guard: &Guard<'_>,
+) -> ByteStepOutcome<usize> {
+    if payload.raw_icmp_protocol() != Some(ProtocolNumber(1)) {
+        return StepOutcome::Err(Errno::EOPNOTSUPP);
+    }
+    if !ipv4_addr_is_configured(dst_addr) {
+        return StepOutcome::Err(Errno::EOPNOTSUPP);
+    }
+    let Some(src_addr) = payload
+        .raw_icmp_bound_local()
+        .filter(|addr| *addr != Ipv4Address::UNSPECIFIED)
+        .or_else(|| preferred_ipv4_source_for(&payload.net_namespace(), dst_addr))
+    else {
+        return StepOutcome::Err(Errno::EOPNOTSUPP);
+    };
+    let request = match parse_icmpv4_payload(src_addr, dst_addr, bytes) {
+        Icmpv4Event::EchoRequest(request) => request,
+        Icmpv4Event::Malformed => {
+            match parse_raw_icmpv4_echo_payload_unchecked(src_addr, dst_addr, bytes) {
+                Icmpv4Event::EchoRequest(request) => request,
+                Icmpv4Event::Malformed => return StepOutcome::Err(Errno::EINVAL),
+                Icmpv4Event::EchoReply(_) | Icmpv4Event::Unsupported => {
+                    return StepOutcome::Err(Errno::EOPNOTSUPP);
+                }
+            }
+        }
+        Icmpv4Event::EchoReply(_) | Icmpv4Event::Unsupported => {
+            return StepOutcome::Err(Errno::EOPNOTSUPP);
+        }
+    };
+    deliver_icmpv4_reply_to_table(payload, request.reply_packet(), guard);
+    StepOutcome::Done(bytes.len())
+}
+
+fn deliver_icmpv4_reply_to_table(
+    payload: &SocketPayload,
+    reply: crate::net::protocol::Icmpv4EchoPacket,
+    guard: &Guard<'_>,
+) {
+    for target in payload.socket_table().snapshot_raw_icmp(guard) {
+        if target.kind != SocketKind::RawIcmp {
+            continue;
+        }
+        let Some(target_payload) = target.acquire_operational() else {
+            continue;
+        };
+        if target_payload.family() != AddressFamily::Inet {
+            continue;
+        }
+        let accepts_destination = match target_payload.protocol_snapshot() {
+            SocketProtocol::RawIcmp(state) => {
+                state.protocol == ProtocolNumber(1) && state.accepts_ipv4_reply_to(reply.dst)
+            }
+            _ => false,
+        };
+        if !accepts_destination {
+            continue;
+        }
+        if target_payload.record_icmp_recv_echo_reply(reply.clone()) {
+            target.readiness.fire_recv(RecvWireSet::HAS_DATA);
+        }
+    }
+}
+
 fn send_raw_ipv6(
     _socket: &Cap<SocketIdentity>,
     payload: &SocketPayload,
@@ -744,6 +823,36 @@ fn ipv6_addr_is_configured(addr: Ipv6Address) -> bool {
                 .into_iter()
                 .any(|link| link.is_up && link.ipv6_addr == Some(addr))
         })
+}
+
+fn ipv4_addr_is_configured(addr: Ipv4Address) -> bool {
+    net_namespace_payloads_snapshot()
+        .into_iter()
+        .any(|namespace| {
+            namespace
+                .link_snapshot()
+                .into_iter()
+                .any(|link| link.is_up && link.ipv4_addr == Some(addr))
+        })
+}
+
+fn preferred_ipv4_source_for(
+    net_namespace: &PayloadCap<NetNamespacePayload>,
+    dst: Ipv4Address,
+) -> Option<Ipv4Address> {
+    let route = net_namespace.best_ipv4_route(dst)?;
+    route.preferred_src.or_else(|| {
+        net_namespace
+            .link_snapshot()
+            .into_iter()
+            .find(|link| {
+                link.name == route.oif_name
+                    && link.is_up
+                    && !link.is_loopback
+                    && link.ipv4_addr.is_some()
+            })
+            .and_then(|link| link.ipv4_addr)
+    })
 }
 
 fn configured_ipv6_peer_mac(addr: Ipv6Address) -> Option<crate::net::EthernetAddress> {

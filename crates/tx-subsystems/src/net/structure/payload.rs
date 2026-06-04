@@ -1152,7 +1152,7 @@ impl SocketPayload {
         }
     }
 
-    fn raw_icmp_bound_local(&self) -> Option<Ipv4Address> {
+    pub(crate) fn raw_icmp_bound_local(&self) -> Option<Ipv4Address> {
         match &*self.protocol.lock() {
             SocketProtocol::RawIcmp(state) => state.bound_local,
             _ => None,
