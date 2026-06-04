@@ -15,6 +15,10 @@ use crate::page_backed::MaterializedPagePin;
 
 use super::{Prot, UserPage, UserRange, USER_PAGE_SIZE};
 
+mod resident;
+
+use resident::PmapResidentStore;
+
 type ReserveMappingFn = fn(
     &PmapRoot,
     VirtAddr,
@@ -384,32 +388,32 @@ impl VmPmap {
             None
         };
         let drain_start = pmap_map_path_clock_now();
-        let (mappings, shifted) = {
+        let drained = {
             let mut state = self.state.lock();
             state.mappings.drain_range(start, end)
         };
         emit_pmap_map_path_duration(b"debug.vm.map_path.pmap.teardown_drain_ns", drain_start);
         emit_pmap_map_path_count(
             b"debug.vm.map_path.pmap.teardown_removed_pages",
-            mappings.len() as u64,
+            drained.len() as u64,
         );
         emit_pmap_map_path_count(
             b"debug.vm.map_path.pmap.teardown_shifted_entries",
-            shifted as u64,
+            drained.shifted_entries() as u64,
         );
         if let Some(remove_start_ns) = remove_start_ns {
             record_pmap_teardown_remove_debug(
                 tx_observe::clock_now_ns().saturating_sub(remove_start_ns),
-                shifted,
-                mappings.len(),
+                drained.shifted_entries(),
+                drained.len(),
             );
         }
         emit_pmap_teardown_trace(b"debug.vm.pmap.teardown.phase", 1);
-        emit_pmap_teardown_trace(b"debug.vm.pmap.teardown.pages", mappings.len() as i64);
+        emit_pmap_teardown_trace(b"debug.vm.pmap.teardown.pages", drained.len() as i64);
 
         let mut invalidations = Vec::new();
         let mut pins = Vec::new();
-        let mut mappings = mappings.into_iter();
+        let mut mappings = drained.into_iter();
         let loop_start = pmap_map_path_clock_now();
         while let Some((page, mapping)) = mappings.next() {
             emit_pmap_teardown_trace(b"debug.vm.pmap.teardown.phase", 2);
@@ -638,111 +642,6 @@ impl VmPmapState {
             rollbacks: 0,
             shootdowns: 0,
         }
-    }
-}
-
-#[derive(Debug, Default)]
-struct PmapResidentStore {
-    entries: Vec<(UserPage, PmapMapping)>,
-}
-
-impl PmapResidentStore {
-    fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-        }
-    }
-
-    fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    fn reserve_additional(&mut self, additional: usize) {
-        self.entries.reserve(additional);
-    }
-
-    fn get(&self, page: &UserPage) -> Option<&PmapMapping> {
-        self.search(*page).ok().map(|index| &self.entries[index].1)
-    }
-
-    fn get_mut(&mut self, page: &UserPage) -> Option<&mut PmapMapping> {
-        self.search(*page)
-            .ok()
-            .map(|index| &mut self.entries[index].1)
-    }
-
-    fn insert(&mut self, page: UserPage, mapping: PmapMapping) -> Option<PmapMapping> {
-        match self.search(page) {
-            Ok(index) => Some(core::mem::replace(&mut self.entries[index].1, mapping)),
-            Err(index) if index == self.entries.len() => {
-                self.entries.push((page, mapping));
-                None
-            }
-            Err(index) => {
-                self.entries.insert(index, (page, mapping));
-                None
-            }
-        }
-    }
-
-    fn remove(&mut self, page: &UserPage) -> Option<PmapMapping> {
-        self.remove_with_shift(page).map(|(mapping, _)| mapping)
-    }
-
-    fn remove_with_shift(&mut self, page: &UserPage) -> Option<(PmapMapping, usize)> {
-        self.search(*page).ok().map(|index| {
-            let shifted = self.entries.len().saturating_sub(index + 1);
-            (self.entries.remove(index).1, shifted)
-        })
-    }
-
-    fn drain_range(
-        &mut self,
-        start: UserPage,
-        end: UserPage,
-    ) -> (Vec<(UserPage, PmapMapping)>, usize) {
-        let start_index = self.search(start).unwrap_or_else(|index| index);
-        let end_index = self.search(end).unwrap_or_else(|index| index);
-        if start_index >= end_index {
-            return (Vec::new(), 0);
-        }
-
-        let shifted = self.entries.len().saturating_sub(end_index);
-        let removed = self.entries.drain(start_index..end_index).collect();
-        (removed, shifted)
-    }
-
-    fn snapshots_in_range(
-        &self,
-        start: UserPage,
-        end: UserPage,
-    ) -> Vec<(UserPage, PmapMappingSnapshot)> {
-        let mut snapshots = Vec::new();
-        let start_index = self.search(start).unwrap_or_else(|index| index);
-        for (page, mapping) in self.entries[start_index..].iter() {
-            if *page >= end {
-                break;
-            }
-            snapshots.push((*page, mapping.snapshot()));
-        }
-        snapshots
-    }
-
-    fn pages_in_range(&self, start: UserPage, end: UserPage) -> Vec<UserPage> {
-        let mut pages = Vec::new();
-        let start_index = self.search(start).unwrap_or_else(|index| index);
-        for (page, _) in self.entries[start_index..].iter() {
-            if *page >= end {
-                break;
-            }
-            pages.push(*page);
-        }
-        pages
-    }
-
-    fn search(&self, page: UserPage) -> Result<usize, usize> {
-        self.entries
-            .binary_search_by_key(&page, |(entry_page, _)| *entry_page)
     }
 }
 

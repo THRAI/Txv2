@@ -1,3 +1,16 @@
+- 2026-06-05 **VM pmap resident-store interface extracted before backend swap.**
+  After the VM gift/map-path cleanup commit, `VmPmap` no longer owns the
+  resident shadow-index implementation inline. `PmapResidentStore` is now a
+  pmap-facing facade in `crates/tx-subsystems/src/vm/pmap/resident.rs`, with
+  the current address-sorted Vec preserved as `VecPmapResidentStore`. The seam
+  keeps lookup, range snapshots, page enumeration, insertion, removal, draining,
+  `MapPin` ownership, and shifted-entry accounting behavior unchanged while
+  giving the next pmap backend change one local swap point. Verification so far:
+  scoped `rustfmt` on `pmap.rs` and `pmap/resident.rs`, plus `cargo check -p
+  tx-subsystems -q`. Next step: replace the Vec backend with a non-shifting
+  resident materialization store and compare `munmap.pmap_teardown_ns` /
+  `pmap.teardown_drain_ns` against the preserved map-path counters.
+
 - 2026-06-05 **User-page gift docs, GiftPin, and VM gift values landed; VM gift step is next.**
   Updated the page-gift plan and active docs so `vmsplice(SPLICE_F_GIFT)` has a
   VM-owned `UserPageGift` transfer contract instead of page-granular VM
