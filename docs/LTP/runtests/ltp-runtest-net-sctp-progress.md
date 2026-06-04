@@ -46,10 +46,18 @@ recvmsg→`EAGAIN` 可做,但 TEST5 要 `sendmsg`/`recvmsg`+`sctp_sndrcvinfo`+`M
 `SocketRecvBytesOutcome.eor` 透传到 recvmsg `msg_flags`)+ 非阻塞 SCTP connect 返
 `EINPROGRESS`(loopback 同步建联但对标 Linux 语义)。**新过:`test_1_to_1_nonblock`(5)、
 `test_1_to_1_send`(8)。** 数据面探针其余结果:`sendto` 2(断 case3 sendto-from)、
-`recvmsg` 3 后 **SIGSEGV(139)**——case4 的 EFAULT 校验缺口(门开后才暴露,非回归,
-读 addr=-1)、`recvfrom` 3、`sendmsg` 4(断 case5)、`sctp_sendrecvmsg` 0(首条即
-需事件/setup)。后续:`sctp_sndrcvinfo` cmsg 真正 round-trip(stream/ppid/assoc_id)、
-recvmsg 的 EFAULT 校验、`SCTP_EVENTS` 通知模型。
+`recvmsg` 3 后 **SIGSEGV(139)**、`recvfrom` 3 后超时(case4 阻塞等数据)、
+`sendmsg` 4(断 case5)、`sctp_sendrecvmsg` 0(首条即需事件/setup)。后续:
+`sctp_sndrcvinfo` cmsg 真正 round-trip(stream/ppid/assoc_id)、`SCTP_EVENTS` 通知模型。
+
+> **`test_1_to_1_recvmsg` 的 SIGSEGV 是 musl 不兼容,不是内核 bug(已查实)**:case4
+> `recvmsg(acpt_sk, (struct msghdr *)-1, flag)` 期望 EFAULT,但 musl 的 recvmsg
+> wrapper 在 64 位上会先 `h = *msg`(把 msghdr 拷到栈上以修正 iovlen/controllen 字段
+> 宽度),于是在**进内核前**就在用户态解引用 -1 → 段错误(user-segv pc 在 libc,
+> 非内核;case3 用合法 msghdr+坏 iov 字段则正常返 EFAULT)。lksctp 测试是按 glibc 写的,
+> 这是 glibc/musl 差异,内核侧无法修(改测试/libc 属掩盖,禁止)。
+> 内核的 `copy_to/from_user(-1)` 本身已正确返 EFAULT(recvfrom case3 即证),无需加固。
+> → `test_1_to_1_recvmsg` 在 musl 下最多过 3/8。
 
 **phase-1 探针(2026-06-04,逐个单跑)发现的剩余 blocker**:
 - `test_basic(+v6)`:socket/bind 过后断在 `setsockopt(SCTP_EVENTS)` →"Protocol not
@@ -118,7 +126,7 @@ recvmsg 的 EFAULT 校验、`SCTP_EVENTS` 通知模型。
 | `test_sctp_sendrecvmsg` | 10 | TCONF(门) | 2 | — |
 | `test_sctp_sendrecvmsg_v6` | 10 | TCONF(门) | 2 | — |
 | `test_1_to_1_send` | 9 | **pass** | 2 | `target/oscomp/ltp-net-sctp-test_1_to_1_send.txt` |
-| `test_1_to_1_recvmsg` | 8 | TCONF(门) | 2 | — |
+| `test_1_to_1_recvmsg` | 8 | musl-blocked 3/8 | 2 | `target/oscomp/ltp-net-sctp-test_1_to_1_recvmsg.txt` |
 | `test_1_to_1_recvfrom` | 7 | TCONF(门) | 2 | — |
 | `test_1_to_1_shutdown` | 6 | TCONF(门) | 2 | — |
 | `test_connect` | 5 | TCONF(门) | 2 | — |
