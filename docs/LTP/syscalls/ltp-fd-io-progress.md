@@ -14,6 +14,24 @@ Recorded through the end of the current fd-io case list. Latest changes included
 
 Timeout triage on 2026-05-26 ran the broad-batch skipped cases as single cases. `fcntl15`/`fcntl15_64` and `pipe02` now fail cleanly with checkpoint timeouts; `fcntl36`/`fcntl36_64` pass as single cases and did not reproduce the broad-batch OFD lock hang.
 
+2026-06-03 focused LA64 submit-tail rerun promoted a small official-scored
+tail set into active submit after verifying LA musl/glibc. Logs:
+`target/oscomp/ltp-extra-core-a-la-musl-20260603.txt`,
+`target/oscomp/ltp-extra-core-a2-la-musl-20260603.txt`,
+`target/oscomp/ltp-extra-core-b1-la-musl-20260603.txt`,
+`target/oscomp/ltp-extra-core-g1-la-glibc-20260603.txt`,
+`target/oscomp/ltp-extra-core-g2-la-glibc-20260603.txt`, and
+`target/oscomp/ltp-extra-core-g3-la-glibc-20260603.txt`.
+Promoted fd-io cases:
+`close02`, `dup03`, `dup05`, `dup06`, `dup205`, `dup206`, `fcntl03`,
+`fcntl03_64`, `fcntl04`, `fcntl04_64`, `fcntl08`, `fcntl08_64`,
+`fcntl12`, `fcntl12_64`, `fsync02`, `pipe01`, `pipe06`, `pipe08`,
+`pipe10`, `pipe14`, `pread01`, `pread01_64`, `pwrite01`,
+`pwrite01_64`, `pwrite03`, `pwrite03_64`, `pwrite04`, `pwrite04_64`,
+`read01`, `read04`, and `write03`.
+`write01` is intentionally not promoted: LA musl passed it, but the 2026-06-03
+LA glibc focused run returned `EINVAL` and scored `0/1`.
+
 ## Case Table
 
 | Case | Score | State | Note |
@@ -263,7 +281,7 @@ Timeout triage on 2026-05-26 ran the broad-batch skipped cases as single cases. 
 | `vmsplice02` | 0/3 | fail | vmsplice unsupported/mismatch |
 | `vmsplice03` | 0/1 | fail | vmsplice unsupported/mismatch |
 | `vmsplice04` | 0/1 | fail | vmsplice unsupported/mismatch |
-| `write01` | 1/1 | pass |  |
+| `write01` | 1/1 | audit-only | RV/LA musl historical pass, but 2026-06-03 LA glibc focused submit-tail rerun failed with `EINVAL`; omit from active common submit |
 | `write02` | 2/2 | pass |  |
 | `write03` | 1/1 | pass |  |
 | `write04` | 0/1 | fail | write behavior mismatch |

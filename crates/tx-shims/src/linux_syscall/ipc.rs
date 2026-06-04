@@ -2,9 +2,9 @@
 
 use super::{
     bootstrap_copy_from_user, bootstrap_copy_to_user, bootstrap_read_user, bootstrap_write_user,
-    errno_to_i32, read_user_cstr, ReadCStrError, SyscallCtx, SyscallResult, EBADF_VALUE, EFAULT_VALUE,
-    EINVAL_VALUE, ENAMETOOLONG_VALUE, ENOENT_VALUE, ENOMEM_VALUE, ENOSYS_VALUE, O_ACCMODE,
-    O_CLOEXEC, O_CREAT, O_EXCL, O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY,
+    errno_to_i32, read_user_cstr, ReadCStrError, SyscallCtx, SyscallResult, E2BIG_VALUE,
+    EBADF_VALUE, EFAULT_VALUE, EINVAL_VALUE, ENAMETOOLONG_VALUE, ENOENT_VALUE, ENOMEM_VALUE,
+    ENOSYS_VALUE, O_ACCMODE, O_CLOEXEC, O_CREAT, O_EXCL, O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY,
 };
 use alloc::vec::Vec;
 use tx_hal::TimeIf;
@@ -514,8 +514,11 @@ fn read_semops(args: [u64; 6], ctx: &SyscallCtx<'_>) -> Result<(u32, Vec<SemBuf>
     let semid = args[0] as u32;
     let sops_ptr = args[1];
     let nsops = args[2] as usize;
-    if nsops == 0 || nsops > 500 {
+    if nsops == 0 {
         return Err(SyscallResult::Error(EINVAL_VALUE));
+    }
+    if nsops > 500 {
+        return Err(SyscallResult::Error(E2BIG_VALUE));
     }
     if sops_ptr == 0 {
         return Err(SyscallResult::Error(EFAULT_VALUE));

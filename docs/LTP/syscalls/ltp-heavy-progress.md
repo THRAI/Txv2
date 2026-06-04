@@ -8,10 +8,24 @@ Runs are split into explicit 5-case groups with `make oscomp-local-rv64-ltp-musl
 | Item | Value | Note |
 | --- | ---: | --- |
 | cases | 67 | from `make ltp-batch-cases LTP_BATCH=heavy` |
-| latest local run | `[ltp-musl] 0/2` | 2026-05-26 latest 5-case group |
-| cumulative scored | `18/221` | recorded rows in this document |
+| latest local run | focused LA64 submit-tail rerun | 2026-06-03 promoted whitelist candidates, musl+glibc |
+| cumulative scored | `19/221` | recorded rows in this document |
 | reached case | `ustat02` | batch completed |
 | logs | `target/oscomp/ltp-progress/heavy` | per-group stdout and serial snapshots |
+
+## 2026-06-03 focused submit-tail rerun
+
+复测日志：
+
+- LA musl: `target/oscomp/ltp-extra-core-b1-la-musl-20260603.txt`
+- LA glibc: `target/oscomp/ltp-extra-core-g3-la-glibc-20260603.txt`
+
+确认可作为 active submit 尾部补充分的 heavy case：
+
+`getdomainname01`, `uname02`, `uname04`。
+
+`uname04` 在这次 LA musl/glibc focused run 中为 `2/2`，修正此前
+`persona(131072)` 路径导致的 `1/2` 记录。
 
 ## 2026-05-26 failure notes
 
@@ -88,6 +102,6 @@ Runs are split into explicit 5-case groups with `make oscomp-local-rv64-ltp-musl
 | `syslog12` | 0/6 | fail | TFAIL: syslog() with invalid type/command succeeded |
 | `uname01` | 2/2 | pass |  |
 | `uname02` | 1/1 | pass |  |
-| `uname04` | 1/2 | partial | TBROK: persona(131072) failed: ENOSYS (38) |
+| `uname04` | 2/2 | pass | 2026-06-03 LA musl/glibc focused submit-tail rerun passes all Summary checks |
 | `ustat01` | 0/1 | skip | TCONF: syscall(-1) __NR_ustat not supported on your arch |
 | `ustat02` | 0/1 | skip | TCONF: syscall(-1) __NR_ustat not supported on your arch |

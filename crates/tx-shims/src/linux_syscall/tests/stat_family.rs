@@ -23,8 +23,8 @@ use tx_subsystems::vfs::{FsOps, OpenFile};
 
 use crate::linux_syscall::numbers::{EFD_NONBLOCK_FLAG, NR_EVENTFD2};
 use crate::linux_syscall::{
-    AT_EMPTY_PATH, AT_FDCWD, NR_CHDIR, NR_FCHDIR, NR_FSTAT, NR_FSTATFS, NR_GETCWD, NR_GETDENTS64,
-    NR_NEWFSTATAT, NR_STATFS, NR_STATX, NR_UMASK,
+    AT_EMPTY_PATH, AT_FDCWD, NR_CHDIR, NR_FCHDIR, NR_FCHMODAT, NR_FSTAT, NR_FSTATFS, NR_GETCWD,
+    NR_GETDENTS64, NR_NEWFSTATAT, NR_STATFS, NR_STATX, NR_UMASK,
 };
 
 /// errno magnitudes the tests check against (positive Linux RV64
@@ -654,6 +654,56 @@ fn dispatch_statx_at_empty_path_stats_fd() {
     assert_eq!(read_u64_at(&statxbuf, STATX_INO_OFF), file_id.as_u64());
     assert_eq!(read_u16_at(&statxbuf, STATX_MODE_OFF), 0o100644);
     drop(empty);
+}
+
+#[test]
+fn dispatch_statx_after_fchmodat_observes_live_mode() {
+    let _setup = stat_setup();
+    let (root_dentry, tmpfs, _root_rnode) = build_tmpfs_root();
+    let owner_cred = Credential {
+        uid: 0,
+        gid: 0,
+        effective_caps: CapabilitySet::FULL,
+    };
+    {
+        let guard = guard();
+        match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner_cred, &guard) {
+            StepOutcome::Done(_) => {}
+            other => panic!("create_inode: {other:?}"),
+        }
+    }
+
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+    let path = nul_terminate(b"/f");
+
+    let chmod_req = SyscallRequest::new(
+        NR_FCHMODAT,
+        [AT_FDCWD as i64 as u64, path.as_ptr() as u64, 0o600, 0, 0, 0],
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(chmod_req, &ctx)),
+        SyscallResult::Return(0)
+    );
+
+    let mut statxbuf = vec![0u8; STATX_BYTES];
+    let statx_req = SyscallRequest::new(
+        NR_STATX,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            0,
+            crate::linux_syscall::numbers::STATX_BASIC_STATS as u64,
+            statxbuf.as_mut_ptr() as u64,
+            0,
+        ],
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(statx_req, &ctx)),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(read_u16_at(&statxbuf, STATX_MODE_OFF), 0o100600);
+    drop(path);
 }
 
 // -----------------------------------------------------------------

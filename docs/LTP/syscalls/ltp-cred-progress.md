@@ -8,10 +8,24 @@ Runs are split into explicit 5-case groups with `make oscomp-local-rv64-ltp-musl
 | Item | Value | Note |
 | --- | ---: | --- |
 | cases | 131 | from `make ltp-batch-cases LTP_BATCH=cred` |
-| latest local run | `[ltp-musl] 0/1` | 2026-05-26 latest 5-case group |
+| latest local run | focused LA64 submit-tail rerun | 2026-06-03 promoted whitelist candidates, musl+glibc |
 | cumulative scored | `125/290` | recorded rows in this document |
 | reached case | `setuid04_16` | batch completed |
 | logs | `target/oscomp/ltp-progress/cred` | per-group stdout and serial snapshots |
+
+## 2026-06-03 focused submit-tail rerun
+
+复测日志：
+
+- LA musl: `target/oscomp/ltp-extra-core-a-la-musl-20260603.txt`
+- LA glibc: `target/oscomp/ltp-extra-core-g1-la-glibc-20260603.txt`
+
+确认可作为 active submit 尾部补充分的 cred case：
+
+`capset04`, `getegid02`, `getegid02_16`, `geteuid01`, `getgid01`,
+`getgid03`, `getuid01`, `setgid01`, `setuid01`。
+
+这些 case 在 LA musl/glibc focused run 中均为 Summary 满分。
 
 ## 2026-05-26 failure notes
 

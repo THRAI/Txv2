@@ -398,6 +398,22 @@ fn block_on<F: Future>(mut fut: F) -> F::Output {
     panic!("block_on: future did not resolve in 1024 polls");
 }
 
+#[test]
+fn dispatch_future_size_stays_bounded() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread);
+    let req = SyscallRequest::new(NR_READ, [0, 0, 0, 0, 0, 0]);
+    let fut = dispatch::<ShimsTestPmap>(req, &ctx);
+    let size = core::mem::size_of_val(&fut);
+
+    assert!(
+        size < 64 * 1024,
+        "dispatch future grew to {size} bytes; syscall arms should stay boxed"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------

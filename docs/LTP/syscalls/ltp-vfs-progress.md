@@ -8,10 +8,46 @@ Runs are split into explicit 5-case groups with `make oscomp-local-rv64-ltp-musl
 | Item | Value | Note |
 | --- | ---: | --- |
 | cases | 258 | from `make ltp-batch-cases LTP_BATCH=vfs` |
-| latest local run | timeout triage | 2026-05-26 single-case reruns for previously hung VFS cases |
-| cumulative scored | `1023/1451` | recorded rows in this document |
+| latest local run | focused high-score rerun | 2026-06-03 `open11` RV/LA musl+glibc |
+| cumulative scored | `1028/1451` | recorded rows in this document |
 | reached case | `utimes01` | batch completed |
 | logs | `target/oscomp/ltp-progress/vfs` | per-group stdout and serial snapshots |
+
+## 2026-06-03 focused submit-tail rerun
+
+复测日志：
+
+- LA musl: `target/oscomp/ltp-extra-core-b1-la-musl-20260603.txt` and
+  `target/oscomp/ltp-extra-core-b2-la-musl-20260603.txt`
+- LA glibc: `target/oscomp/ltp-extra-core-g4-la-glibc-20260603.txt`
+
+确认可作为 active submit 尾部补充分的 VFS case：
+
+`chmod07`, `chown01`, `creat03`, `creat05`, `fchdir01`, `fchdir02`,
+`fchmod02`, `fchmod03`, `fchmod04`, `fchmod05`, `flock03`, `getcwd03`,
+`mkdir05`, `open03`, `open04`, `readdir01`, `rmdir01`, `symlink02`,
+`umask01`。
+
+这些 case 在 LA musl/glibc focused run 中均为 Summary 满分。此前 musl
+单跑时 `creat05`/`open04` 可能出现 tmpdir cleanup `TWARN`，但这次 glibc
+focused run 没有复现，judge 计分为 `21/21`。
+
+## 2026-06-03 focused high-score rerun
+
+`open11` 复测结果：
+
+- LA musl: `28/28`
+- LA glibc: `28/28`
+- RV musl: `28/28`
+- RV glibc: `28/28`
+
+修正点是目录目标的写打开和 `O_CREAT` 打开已有目录都按 Linux 语义返回
+`EISDIR`。对应日志：
+`target/oscomp/ltp-highfix-open11-semop02-la-musl-20260603.txt`,
+`target/oscomp/ltp-highfix-open11-la-musl-20260603.txt`,
+`target/oscomp/ltp-highfix-open11-semop02-la-glibc-20260603.txt`,
+`target/oscomp/ltp-highfix-open11-semop02-rv-musl-20260603.txt`, and
+`target/oscomp/ltp-highfix-open11-semop02-rv-glibc-20260603.txt`.
 
 ## 2026-05-26 failure notes
 
@@ -239,7 +275,7 @@ Runs are split into explicit 5-case groups with `make oscomp-local-rv64-ltp-musl
 | `open08` | 2/6 | partial | TFAIL: O_RDWR succeeded |
 | `open09` | 2/2 | pass |  |
 | `open10` | 6/9 | partial | TFAIL: dir_b/nosetgid: Incorrect group, 65534 != 1 |
-| `open11` | 23/28 | partial | TFAIL: open directory O_RDWR succeeded |
+| `open11` | 28/28 | pass | focused RV/LA musl/glibc rerun passes after directory `EISDIR` handling |
 | `open12` | 3/5 | partial | TBROK: open12.c:224: write(3,0xe56188,11) failed: errno=EINVAL(22): Invalid argument |
 | `open13` | 2/5 | partial | TFAIL: open13.c:144: fchmod(2) succeeded unexpectedly |
 | `open14` | 0/2 | fail | TBROK: open14.c:68: write(3,0x3b5b78,1024) failed: errno=EISDIR(21): Is a directory |

@@ -1174,7 +1174,7 @@ fn append_ltp_runtest(
     let _ = write!(
         cmd,
         "; selected_tags='{selected_tags}'; if [ -f ltp/runtest/{module} ]; then while read tag rest; do case \"$tag\" in ''|\\#*) continue;; esac; if [ -n \"$selected_tags\" ]; then case \"$selected_tags\" in *\"|$tag|\"*) ;; *) continue;; esac; fi; case \"$tag\" in {skip_pattern}) ./busybox echo \"SKIP LTP CASE $tag : local skip\"; continue;; esac; cmdline=${{rest:-$tag}}; {runtime_assignment} if [ -n \"$ltp_max_runtime\" ]; then cmdline=\"$cmdline -I $ltp_max_runtime\"; fi; ./busybox echo \"RUN LTP CASE $tag : $cmdline\"; summary_seen=0; passed=0; failed=0; broken=0; skipped=0; warnings=0; tx_cr=$(printf '\\r'); {{ PATH=/musl/musl/ltp/testcases/bin:/musl/musl/ltp/bin:/musl/musl/ltp/testscripts:/musl/musl:$PATH LTPROOT=/musl/musl/ltp KCONFIG_PATH=/proc/config ./busybox sh -c \"$cmdline\"; echo \"__TX_LTP_CASE_RET__:$?\"; }} 2>&1 | while IFS= read -r ltp_line; do {normalize_line_shell}case \"$ltp_line\" in __TX_LTP_CASE_RET__:*) ret=${{ltp_line#__TX_LTP_CASE_RET__:}}; {summary_shell}exit \"$ret\";; esac; {print_line_shell}case \"$ltp_line\" in Summary:) summary_seen=1;; *TPASS*) passed=$((passed + 1));; *TFAIL*) failed=$((failed + 1));; *TBROK*) broken=$((broken + 1));; *TCONF*) skipped=$((skipped + 1));; *TWARN*) warnings=$((warnings + 1));; esac; done; ret=$?; if [ $ret = 0 ]; then ./busybox echo \"PASS LTP CASE $tag : $ret\"; fi; ./busybox echo \"FAIL LTP CASE $tag : $ret\"; done < ltp/runtest/{module}; else ./busybox echo \"FAIL LTP RUNTEST {module} : missing runtest file\"; fi",
-        summary_shell = LTP_SYNTH_SUMMARY_SHELL,
+        summary_shell = LTP_NO_SYNTH_SUMMARY_SHELL,
         normalize_line_shell = LTP_NORMALIZE_LINE_SHELL,
         print_line_shell = LTP_PRINT_LINE_SHELL,
     );
@@ -1213,7 +1213,9 @@ fn ltp_runtest_selected_tags(filter: &str) -> alloc::string::String {
     selected
 }
 
-const LTP_SYNTH_SUMMARY_SHELL: &str = r#"if [ "$summary_seen" = 0 ] && [ $((passed + failed + broken + skipped + warnings)) -gt 0 ]; then printf 'Summary:\npassed   %s\nfailed   %s\nbroken   %s\nskipped  %s\nwarnings %s\n' "$passed" "$failed" "$broken" "$skipped" "$warnings"; fi; "#;
+// Keep the LTP output in the same scoring shape as the official judge: cases
+// without a real LTP Summary must remain unscored instead of being synthesized.
+const LTP_NO_SYNTH_SUMMARY_SHELL: &str = "";
 
 const LTP_NORMALIZE_LINE_SHELL: &str = r#"ltp_line=${ltp_line%"$tx_cr"}; "#;
 
@@ -1300,8 +1302,27 @@ fn append_batch_submit_ltp_runner_for_libc(
 
     let _ = write!(cmd, "; echo \"#### OS COMP TEST GROUP START {group} ####\"");
     append_ltp_submit_case_loop(cmd, libc, args);
-    append_ltp_submit_network_case_loop(cmd, libc, args);
+    append_ltp_submit_network_case_loop_if_enabled(cmd, libc, args);
     let _ = write!(cmd, "; echo \"#### OS COMP TEST GROUP END {group} ####\"");
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn append_ltp_submit_network_case_loop_if_enabled(
+    _cmd: &mut alloc::string::String,
+    _libc: &str,
+    _args: &LtpArgs<'_>,
+) {
+    // LA submit must stay on the historical non-network whitelist while the
+    // socket/network stack work is in flux.
+}
+
+#[cfg(not(target_arch = "loongarch64"))]
+fn append_ltp_submit_network_case_loop_if_enabled(
+    cmd: &mut alloc::string::String,
+    libc: &str,
+    args: &LtpArgs<'_>,
+) {
+    append_ltp_submit_network_case_loop(cmd, libc, args);
 }
 
 fn append_ltp_submit_case_loop(cmd: &mut alloc::string::String, libc: &str, args: &LtpArgs<'_>) {
@@ -1311,11 +1332,21 @@ fn append_ltp_submit_case_loop(cmd: &mut alloc::string::String, libc: &str, args
         LTP_SUBMIT_CASES,
         Some(LTP_SUBMIT_ONE_POINT_FIRST_CASE),
         ltp_submit_excluded_cases(),
-        ltp_submit_glibc_excluded_cases(libc),
+        ltp_submit_libc_excluded_cases(libc),
+        args,
+    );
+    append_ltp_case_loop_until_excluding_extra(
+        cmd,
+        libc,
+        LTP_SUBMIT_PROMOTED_TAIL_CASES,
+        None,
+        ltp_submit_excluded_cases(),
+        ltp_submit_libc_excluded_cases(libc),
         args,
     );
 }
 
+#[cfg(not(target_arch = "loongarch64"))]
 fn append_ltp_submit_network_case_loop(
     cmd: &mut alloc::string::String,
     libc: &str,
@@ -1445,7 +1476,7 @@ ret=$?; \
 if [ $ret = 0 ]; then echo \"PASS LTP CASE $case : $ret\"; fi; \
 echo \"FAIL LTP CASE $case : $ret\"; \
 done",
-        summary_shell = LTP_SYNTH_SUMMARY_SHELL,
+        summary_shell = LTP_NO_SYNTH_SUMMARY_SHELL,
         normalize_line_shell = LTP_NORMALIZE_LINE_SHELL,
         print_line_shell = LTP_PRINT_LINE_SHELL,
     );
@@ -1520,20 +1551,25 @@ fn ltp_submit_excluded_cases() -> &'static str {
 
 #[cfg(not(target_arch = "loongarch64"))]
 fn ltp_submit_excluded_cases() -> &'static str {
-    ""
+    LTP_SUBMIT_UNSCORED_LEGACY_CASES
 }
 
-fn ltp_submit_glibc_excluded_cases(libc: &str) -> &'static str {
+fn ltp_submit_libc_excluded_cases(libc: &str) -> &'static str {
     if libc == "glibc" {
-        LTP_BATCH_SUBMIT_GLIBC_EXCLUDED_CASES
+        ltp_submit_arch_glibc_excluded_cases()
     } else {
-        ""
+        LTP_BATCH_SUBMIT_LIBC_EXCLUDED_CASES
     }
 }
 
 #[cfg(target_arch = "loongarch64")]
-fn ltp_batch_submit_network_excluded_cases() -> &'static str {
-    LTP_BATCH_LA_SUBMIT_NETWORK_EXCLUDED_CASES
+fn ltp_submit_arch_glibc_excluded_cases() -> &'static str {
+    LTP_BATCH_LA_SUBMIT_GLIBC_EXCLUDED_CASES
+}
+
+#[cfg(not(target_arch = "loongarch64"))]
+fn ltp_submit_arch_glibc_excluded_cases() -> &'static str {
+    LTP_BATCH_SUBMIT_LIBC_EXCLUDED_CASES
 }
 
 #[cfg(not(target_arch = "loongarch64"))]
@@ -1541,18 +1577,18 @@ fn ltp_batch_submit_network_excluded_cases() -> &'static str {
     ""
 }
 
-#[cfg(target_arch = "loongarch64")]
+#[cfg(not(target_arch = "loongarch64"))]
 fn ltp_batch_submit_glibc_network_excluded_cases(libc: &str) -> &'static str {
     if libc == "glibc" {
-        LTP_BATCH_LA_SUBMIT_GLIBC_NETWORK_EXCLUDED_CASES
+        ltp_batch_submit_arch_glibc_network_excluded_cases()
     } else {
         ""
     }
 }
 
 #[cfg(not(target_arch = "loongarch64"))]
-fn ltp_batch_submit_glibc_network_excluded_cases(_libc: &str) -> &'static str {
-    ""
+fn ltp_batch_submit_arch_glibc_network_excluded_cases() -> &'static str {
+    LTP_BATCH_SUBMIT_GLIBC_NETWORK_EXCLUDED_CASES
 }
 
 fn ltp_case_list_contains(list: &str, needle: &str) -> bool {
@@ -1916,25 +1952,85 @@ socketpair02";
 // order is descending by recorded passed score; ties keep source order.
 const LTP_SUBMIT_ONE_POINT_FIRST_CASE: &str = "io_uring01";
 
-// LA64 submit whitelist delta. These cases are positive-score in the shared
-// RV-derived whitelist, but currently record zero LA score or hang the LA
-// submit lane. Keep the base order from LTP_SUBMIT_CASES and filter these out
-// at command construction time so RV keeps the existing submit list.
+// Official-scored one/low-point cases from the historical tail after
+// `io_uring01`. The active submit runner stops before that tail to avoid broad
+// untriaged sweeps, then appends this focused set that was rerun successfully on
+// LA64 musl/glibc on 2026-06-03. `write01` is intentionally omitted: it passes
+// musl, but LA64 glibc returned EINVAL in the focused run.
+const LTP_SUBMIT_PROMOTED_TAIL_CASES: &str = "\
+capset04+getegid02+getegid02_16+geteuid01+getgid01+getgid03+getuid01+setgid01+setuid01+\
+epoll_ctl04+epoll_ctl05+futex_cmp_requeue02+futex_wait02+futex_wait04+pselect03+pselect03_64+\
+close02+dup03+dup05+dup06+dup205+dup206+fcntl03+fcntl03_64+fcntl04+fcntl04_64+\
+fcntl08+fcntl08_64+fcntl12+fcntl12_64+fsync02+pipe01+pipe06+pipe08+pipe10+pipe14+\
+pread01+pread01_64+pwrite01+pwrite01_64+pwrite03+pwrite03_64+pwrite04+pwrite04_64+\
+read01+read04+write03+getdomainname01+uname02+uname04+gettimeofday02+timer_delete02+\
+timer_settime03+times01+chmod07+chown01+creat03+creat05+fchdir01+fchdir02+fchmod02+\
+fchmod03+fchmod04+fchmod05+flock03+getcwd03+mkdir05+open03+open04+readdir01+rmdir01+\
+symlink02+umask01+madvise05+mlock03+mlock04+mlock203+mmap02+mmap08+mmap15+mmap17+\
+mmap19+mmap20+mprotect05+munlock02+sbrk02+getpriority01+getpriority02+nice01+nice02+\
+nice03+nice04+prctl01+prctl09+sched_get_priority_max01+sched_get_priority_max02+\
+sched_get_priority_min01+sched_get_priority_min02+sched_rr_get_interval01+setpriority02+\
+wait402+wait02+wait01+shmat04+sendfile08_64+sendfile08+sendfile06_64+sendfile06+\
+sendfile05_64+sendfile05+semop04+semctl02+pidfd_open01+personality02+msgrcv08+\
+msgget01+mknod09+kill06+getsid02+getsid01+getppid02+getppid01+fork08+fork07+\
+fork03+exit02+setrlimit04+setrlimit05+clone07+clone06+clone05+clone03";
+
+// Old-format / official-unscored submit cases. These were only useful when the
+// local runner synthesized Summary blocks or the local judge filled in legacy
+// totals. Keep them visible here, but do not run them in submit LTP batches.
+#[cfg_attr(target_arch = "loongarch64", allow(dead_code))]
+const LTP_SUBMIT_UNSCORED_LEGACY_CASES: &str = "\
+prot_hsymlinks+clone02+exit_group01+fallocate01+fallocate02+fchownat01+fcntl07+fcntl07_64+\
+fcntl09+fcntl09_64+fcntl10+fcntl10_64+fstatat01+get_robust_list01+kill02+\
+lchown01+lchown02+linkat01+mincore01+mkdirat01+mknod06+mknodat01+mlockall01+\
+mlockall03+mremap05+msync03+munmap03+open12+open13+openat02+readlink01+\
+rt_sigaction01+rt_sigaction02+rt_sigaction03+rt_sigprocmask02+sched_getattr02+\
+sched_setattr01+setresgid01+setrlimit01+setsid01+signalfd01+symlink03+\
+symlinkat01+sysconf01+ulimit01";
+
+// LA64 submit whitelist delta. This starts with the shared official-unscored
+// cases above, then adds LA-only zero-score or hanging cases.
 #[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
 const LTP_LA_SUBMIT_EXCLUDED_CASES: &str = "\
-gettid02+fcntl36_64+fcntl36+creat08+open10+sched_setattr01+futex_wait03+\
-pselect01+pselect01_64+fcntl34+fcntl34_64+mq_notify01+semop05+chmod05+mknod05+\
-truncate03_64";
+prot_hsymlinks+clone02+exit_group01+fallocate01+fallocate02+fchownat01+fcntl07+fcntl07_64+\
+fcntl09+fcntl09_64+fcntl10+fcntl10_64+fstatat01+get_robust_list01+kill02+\
+lchown01+lchown02+linkat01+mincore01+mkdirat01+mknod06+mknodat01+mlockall01+\
+mlockall03+mremap05+msync03+munmap03+open12+open13+openat02+readlink01+\
+rt_sigaction01+rt_sigaction02+rt_sigaction03+rt_sigprocmask02+sched_getattr02+\
+sched_setattr01+setresgid01+setrlimit01+setsid01+signalfd01+symlink03+\
+symlinkat01+sysconf01+ulimit01+gettid02+fcntl36_64+fcntl36+creat08+open10+\
+futex_wait03+pselect01+pselect01_64+fcntl34+fcntl34_64+mq_notify01+semop05+\
+chmod05+mknod05";
 
 #[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
+#[cfg_attr(target_arch = "loongarch64", allow(dead_code))]
 const LTP_BATCH_LA_SUBMIT_NETWORK_EXCLUDED_CASES: &str =
     "bind04+bind05+bind06+accept02+getsockopt02+setsockopt06";
 
-const LTP_BATCH_SUBMIT_GLIBC_EXCLUDED_CASES: &str = "fcntl36_64+fcntl36";
+const LTP_BATCH_SUBMIT_LIBC_EXCLUDED_CASES: &str = "fcntl36_64+fcntl36";
 
 #[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
-const LTP_BATCH_LA_SUBMIT_GLIBC_NETWORK_EXCLUDED_CASES: &str = "bind03";
+const LTP_BATCH_LA_SUBMIT_GLIBC_EXCLUDED_CASES: &str = "fcntl36_64+fcntl36";
 
+// The network stack is still moving. RV glibc submit keeps only the early,
+// stable network prefix through sendto03; LA submit currently disables the
+// whole network append path above, so this list is not used there.
+#[cfg_attr(target_arch = "loongarch64", allow(dead_code))]
+const LTP_BATCH_SUBMIT_GLIBC_NETWORK_EXCLUDED_CASES: &str = "\
+recv01+recvfrom01+recvmsg01+recvmsg02+recvmsg03+sendmmsg01+sendmmsg02+\
+recvmmsg01+getsockopt02+bind01+bind02+bind03+bind04+bind05+connect01+connect02+accept01+\
+accept02+accept03+accept4_01+getpeername01+socketpair01+socketpair02+\
+setsockopt02+setsockopt03+setsockopt04+setsockopt08+setsockopt09+setsockopt10";
+
+#[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
+#[cfg_attr(target_arch = "loongarch64", allow(dead_code))]
+const LTP_BATCH_LA_SUBMIT_GLIBC_NETWORK_EXCLUDED_CASES: &str = "\
+recv01+recvfrom01+recvmsg01+recvmsg02+recvmsg03+sendmmsg01+sendmmsg02+\
+recvmmsg01+bind01+bind02+bind03+bind04+bind05+connect01+connect02+accept01+\
+accept02+accept03+accept4_01+getpeername01+socketpair01+socketpair02+\
+setsockopt02+setsockopt03+setsockopt04+setsockopt08+setsockopt09+setsockopt10";
+
+#[cfg_attr(target_arch = "loongarch64", allow(dead_code))]
 const LTP_BATCH_SUBMIT_NETWORK_CASES: &str = "\
 socket01+socket02+listen01+getsockname01+getsockopt01+getsockopt02+setsockopt01+send01+\
 send02+sendto01+sendto02+sendto03+recv01+recvfrom01+recvmsg01+recvmsg02+recvmsg03+\
@@ -2341,7 +2437,7 @@ fn append_full_ltp_runner(cmd: &mut alloc::string::String, args: &LtpArgs<'_>) {
     let _ = write!(
         cmd,
         "; for file in \"$target_dir\"/*; do if [ -f \"$file\" ]; then name=${{file##*/}}; case \"$name\" in {skip_pattern}) ./busybox echo \"SKIP LTP CASE $name : local skip\"; continue;; esac; {runtime_assignment} ./busybox echo \"RUN LTP CASE $name\"; summary_seen=0; passed=0; failed=0; broken=0; skipped=0; warnings=0; tx_cr=$(printf '\\r'); {{ if [ -n \"$ltp_max_runtime\" ]; then /bin/setsid \"$file\" -I \"$ltp_max_runtime\"; else /bin/setsid \"$file\"; fi; echo \"__TX_LTP_CASE_RET__:$?\"; }} 2>&1 | while IFS= read -r ltp_line; do {normalize_line_shell}case \"$ltp_line\" in __TX_LTP_CASE_RET__:*) ret=${{ltp_line#__TX_LTP_CASE_RET__:}}; {summary_shell}exit \"$ret\";; esac; {print_line_shell}case \"$ltp_line\" in Summary:) summary_seen=1;; *TPASS*) passed=$((passed + 1));; *TFAIL*) failed=$((failed + 1));; *TBROK*) broken=$((broken + 1));; *TCONF*) skipped=$((skipped + 1));; *TWARN*) warnings=$((warnings + 1));; esac; done; ret=$?; if [ $ret = 0 ]; then ./busybox echo \"PASS LTP CASE $name : $ret\"; fi; ./busybox echo \"FAIL LTP CASE $name : $ret\"; fi; done",
-        summary_shell = LTP_SYNTH_SUMMARY_SHELL,
+        summary_shell = LTP_NO_SYNTH_SUMMARY_SHELL,
         normalize_line_shell = LTP_NORMALIZE_LINE_SHELL,
         print_line_shell = LTP_PRINT_LINE_SHELL,
     );
@@ -2641,6 +2737,12 @@ mod tests {
         assert!(cmd.contains("RUN LTP CASE $case : $ltp_label"));
         assert!(cmd.contains("futex_wake03"));
         assert!(cmd.contains("setitimer01"));
+        assert!(cmd.contains("futex_cmp_requeue02"));
+        assert!(cmd.contains("mmap20"));
+        assert!(!cmd.contains("prot_hsymlinks"));
+        assert!(!cmd.contains("rt_sigaction01"));
+        assert!(!cmd.contains("sysconf01"));
+        assert!(!cmd.contains(" write01"));
         assert!(!cmd.contains("socket01"));
         assert!(!cmd.contains("recvmsg01"));
         assert!(!cmd.contains("sendmsg01"));
@@ -2694,15 +2796,47 @@ mod tests {
         assert!(cmd.contains("confstr01"));
         assert!(cmd.contains("futex_wake03"));
         assert!(cmd.contains("setitimer01"));
+        assert!(cmd.contains("futex_cmp_requeue02"));
+        assert!(cmd.contains("mmap20"));
+        #[cfg(not(target_arch = "loongarch64"))]
         assert!(cmd.contains("socket01"));
+        #[cfg(target_arch = "loongarch64")]
+        assert!(!cmd.contains("socket01"));
+        #[cfg(not(target_arch = "loongarch64"))]
         assert!(cmd.contains("recvmsg01"));
+        #[cfg(target_arch = "loongarch64")]
+        assert!(!cmd.contains("recvmsg01"));
+        assert!(!cmd.contains("prot_hsymlinks"));
+        assert!(!cmd.contains("rt_sigaction01"));
+        assert!(!cmd.contains("sysconf01"));
+        assert!(!cmd.contains("fallocate01"));
+        assert!(!cmd.contains(" write01"));
         let glibc_start = cmd
             .find("#### OS COMP TEST GROUP START ltp-glibc ####")
             .unwrap();
-        assert!(cmd[..glibc_start].contains("fcntl36_64"));
-        assert!(cmd[..glibc_start].contains("fcntl36"));
+        assert!(!cmd[..glibc_start].contains("fcntl36_64"));
+        assert!(!cmd[..glibc_start].contains("fcntl36"));
+        #[cfg(not(target_arch = "loongarch64"))]
+        assert!(cmd[..glibc_start].contains("getsockopt02"));
+        #[cfg(target_arch = "loongarch64")]
+        assert!(!cmd[..glibc_start].contains("getsockopt02"));
+        #[cfg(not(target_arch = "loongarch64"))]
+        assert!(cmd[..glibc_start].contains("bind03"));
+        #[cfg(target_arch = "loongarch64")]
+        assert!(!cmd[..glibc_start].contains("bind03"));
+        #[cfg(target_arch = "loongarch64")]
+        assert!(cmd[..glibc_start].contains("readv01"));
         assert!(!cmd[glibc_start..].contains("fcntl36_64"));
         assert!(!cmd[glibc_start..].contains("fcntl36"));
+        #[cfg(target_arch = "loongarch64")]
+        assert!(cmd[glibc_start..].contains("readv01"));
+        assert!(!cmd[glibc_start..].contains("getsockopt02"));
+        #[cfg(not(target_arch = "loongarch64"))]
+        assert!(cmd[glibc_start..].contains("sendto03"));
+        #[cfg(target_arch = "loongarch64")]
+        assert!(!cmd[glibc_start..].contains("sendto03"));
+        assert!(!cmd[glibc_start..].contains("recv01"));
+        assert!(!cmd[glibc_start..].contains("bind03"));
         assert!(!cmd.contains("bind06"));
         assert!(!cmd.contains("sendmsg01"));
         assert!(!cmd.contains("socketcall01"));
@@ -2724,7 +2858,19 @@ mod tests {
         assert!(!cmd.contains("#### OS COMP TEST GROUP START ltp-musl ####"));
         assert!(!cmd.contains("fcntl36"));
         assert!(!cmd.contains("fcntl36_64"));
+        #[cfg(target_arch = "loongarch64")]
+        assert!(cmd.contains("readv01"));
+        #[cfg(not(target_arch = "loongarch64"))]
         assert!(cmd.contains("socket01"));
+        #[cfg(target_arch = "loongarch64")]
+        assert!(!cmd.contains("socket01"));
+        assert!(!cmd.contains("getsockopt02"));
+        #[cfg(not(target_arch = "loongarch64"))]
+        assert!(cmd.contains("sendto03"));
+        #[cfg(target_arch = "loongarch64")]
+        assert!(!cmd.contains("sendto03"));
+        assert!(!cmd.contains("recv01"));
+        assert!(!cmd.contains("bind03"));
         assert!(!cmd.contains("setsockopt06"));
     }
 
@@ -2826,7 +2972,7 @@ mod tests {
         assert!(full_cmd.contains("__TX_LTP_CASE_RET__:$?"));
         assert!(full_cmd.contains("tx_cr=$(printf '\\r')"));
         assert!(full_cmd.contains("ltp_line=${ltp_line%\"$tx_cr\"};"));
-        assert!(full_cmd.contains("printf 'Summary:\\npassed   %s\\nfailed   %s\\nbroken   %s\\nskipped  %s\\nwarnings %s\\n'"));
+        assert!(!full_cmd.contains("printf 'Summary:\\npassed   %s\\nfailed   %s\\nbroken   %s\\nskipped  %s\\nwarnings %s\\n'"));
         assert!(full_cmd.contains("\\033[1;32mTPASS: \\033[0m"));
         assert!(!full_cmd.contains("ltp_out=/tmp"));
         assert!(full_cmd.contains("RUN LTP CASE $name"));
@@ -2846,7 +2992,7 @@ mod tests {
         assert!(filtered_cmd.contains("__TX_LTP_CASE_RET__:$?"));
         assert!(filtered_cmd.contains("tx_cr=$(printf '\\r')"));
         assert!(filtered_cmd.contains("ltp_line=${ltp_line%\"$tx_cr\"};"));
-        assert!(filtered_cmd.contains("printf 'Summary:\\npassed   %s\\nfailed   %s\\nbroken   %s\\nskipped  %s\\nwarnings %s\\n'"));
+        assert!(!filtered_cmd.contains("printf 'Summary:\\npassed   %s\\nfailed   %s\\nbroken   %s\\nskipped  %s\\nwarnings %s\\n'"));
         assert!(filtered_cmd.contains("\\033[1;32mTPASS: \\033[0m"));
         assert!(!filtered_cmd.contains("ltp_out=/tmp"));
         assert!(!filtered_cmd.contains("/tmp/ltp-busybox"));

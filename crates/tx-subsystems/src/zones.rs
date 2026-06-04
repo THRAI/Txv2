@@ -1,5 +1,6 @@
 use crate::adapter::step_engine::{epoch, page_allocator, zone, Zone, ZoneAllocated, ZoneError};
 use tx_hal::{console_write_str, TxPlatform};
+use tx_substrate::slab;
 
 use crate::{
     mount::{MountApiFile, MountIdentity, MountNamespace, MountPayload},
@@ -157,11 +158,28 @@ pub fn dump_summary<P: TxPlatform>() {
     write_usize::<P>(summary.captured_zones);
     console_write_str::<P>("\n");
 
-    if let (Ok(free), Ok(total)) = (page_allocator::free_count(), page_allocator::total_count()) {
+    if let Ok(diag) = page_allocator::backend_diagnostics() {
         console_write_str::<P>("txkernel:pagealloc:free=");
-        write_usize::<P>(free);
+        write_usize::<P>(diag.free_count);
         console_write_str::<P>(":total=");
-        write_usize::<P>(total);
+        write_usize::<P>(diag.total_count);
+        console_write_str::<P>(":max_run=");
+        write_usize::<P>(diag.max_contiguous_free_run);
+        console_write_str::<P>("\n");
+    }
+    if let Some(fail) = slab::last_allocation_failure() {
+        console_write_str::<P>("txkernel:heap:last_alloc_fail:size=");
+        write_usize::<P>(fail.size);
+        console_write_str::<P>(":align=");
+        write_usize::<P>(fail.align);
+        console_write_str::<P>(":pages=");
+        write_usize::<P>(fail.pages);
+        console_write_str::<P>(":free=");
+        write_usize::<P>(fail.free_count);
+        console_write_str::<P>(":total=");
+        write_usize::<P>(fail.total_count);
+        console_write_str::<P>(":max_run=");
+        write_usize::<P>(fail.max_contiguous_free_run);
         console_write_str::<P>("\n");
     }
 

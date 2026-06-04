@@ -8,6 +8,8 @@ use crate::linux_syscall::{
 use tx_subsystems::ipc::{sysv_msg, sysv_sem, sysv_shm};
 use tx_subsystems::vm::{Prot, VmBacking, USER_PAGE_SIZE};
 
+const E2BIG: i32 = 7;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 struct Msgbuf8 {
@@ -320,6 +322,30 @@ fn dispatch_sysv_semop_and_semctl_stat_use_musl_layout() {
     assert_eq!(ds.sem_perm.key, 0x53454d31);
     assert_eq!(ds.sem_perm.mode, 0o660);
     assert_eq!(ds.sem_nsems, 1);
+}
+
+#[test]
+fn dispatch_sysv_semop_too_many_ops_returns_e2big() {
+    let _setup = setup();
+    let process = bootstrap();
+    let thread = first_thread(&process);
+    let ctx = make_ctx(process, thread);
+
+    let op = SembufLayout {
+        sem_num: 0,
+        sem_op: 0,
+        sem_flg: 0,
+    };
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_SEMOP,
+                [0, (&op as *const SembufLayout) as u64, 501, 0, 0, 0],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Error(E2BIG)
+    );
 }
 
 #[test]

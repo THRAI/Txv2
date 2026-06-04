@@ -42,8 +42,11 @@
 extern crate alloc;
 
 use crate::adapter::reactor_entry;
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::future::Future;
+use core::pin::Pin;
 
 use reactor_entry::userspace::SyscallRequest;
 use tx_hal::{AuxvIf, EntropyIf, IpiKind, PmapIf, SmpIf, TimeIf};
@@ -144,7 +147,8 @@ use aio::*;
 pub mod io_uring;
 use io_uring::*;
 mod signalfd;
-use crate::adapter::step_engine::{self as step_engine, Cap};
+use crate::adapter::step_engine::{self as step_engine, Cap, SpinMutex};
+use alloc::collections::BTreeMap;
 use signalfd::*;
 mod eventfd;
 use eventfd::*;
@@ -258,6 +262,15 @@ pub(super) const ENAMETOOLONG_VALUE: i32 = 36;
 /// `sigsetsize != 8` rejection per `SIGNAL_v1` §3 / §15.1, and for
 /// any signum out of the 1..=64 range.
 pub(super) const EINVAL_VALUE: i32 = 22;
+
+type BoxedSyscallFuture<'a> = Pin<Box<dyn Future<Output = SyscallResult> + Send + 'a>>;
+
+fn boxed_syscall<'a, F>(future: F) -> BoxedSyscallFuture<'a>
+where
+    F: Future<Output = SyscallResult> + Send + 'a,
+{
+    Box::pin(future)
+}
 /// Linux generic ABI errno value for "no such process" (`ESRCH`).
 /// Used by `rt_sigprocmask` / `rt_sigaction` when the target thread /
 /// process is a zombie (no payload to install state on).
@@ -455,21 +468,30 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_SCHED_SETATTR => return sys_sched_setattr(req.args, ctx),
         nr if nr == NR_SCHED_GETAFFINITY => return sys_sched_getaffinity(req.args, ctx),
         nr if nr == NR_SCHED_SETAFFINITY => return sys_sched_setaffinity(req.args, ctx),
+        nr if nr == NR_SCHED_SETPARAM => return sys_sched_setparam(req.args, ctx),
         nr if nr == NR_SCHED_SETSCHEDULER => return sys_sched_setscheduler(req.args, ctx),
+        nr if nr == NR_SCHED_GETSCHEDULER => return sys_sched_getscheduler(req.args, ctx),
+        nr if nr == NR_SCHED_GETPARAM => return sys_sched_getparam(req.args, ctx),
+        nr if nr == NR_SCHED_GET_PRIORITY_MAX => return sys_sched_get_priority(req.args, true),
+        nr if nr == NR_SCHED_GET_PRIORITY_MIN => return sys_sched_get_priority(req.args, false),
+        nr if nr == NR_SCHED_RR_GET_INTERVAL => return sys_sched_rr_get_interval(req.args, ctx),
+        nr if nr == NR_SETPRIORITY => return sys_setpriority(req.args, ctx),
+        nr if nr == NR_GETPRIORITY => return sys_getpriority(req.args, ctx),
+        nr if nr == NR_PRCTL => return sys_prctl(req.args, ctx),
         nr if nr == NR_SET_TID_ADDRESS => return sys_set_tid_address(req.args, ctx),
         nr if nr == NR_SET_ROBUST_LIST => return sys_set_robust_list(req.args, ctx),
         nr if nr == NR_GET_ROBUST_LIST => return sys_get_robust_list(req.args, ctx),
         nr if nr == NR_MADVISE => return sys_madvise(req.args, ctx),
-        nr if nr == NR_MLOCK => return sys_mlock(req.args, ctx).await,
-        nr if nr == NR_MUNLOCK => return sys_munlock(req.args, ctx).await,
-        nr if nr == NR_MLOCKALL => return sys_mlockall(req.args, ctx).await,
-        nr if nr == NR_MUNLOCKALL => return sys_munlockall(req.args, ctx).await,
+        nr if nr == NR_MLOCK => return boxed_syscall(sys_mlock(req.args, ctx)).await,
+        nr if nr == NR_MUNLOCK => return boxed_syscall(sys_munlock(req.args, ctx)).await,
+        nr if nr == NR_MLOCKALL => return boxed_syscall(sys_mlockall(req.args, ctx)).await,
+        nr if nr == NR_MUNLOCKALL => return boxed_syscall(sys_munlockall(req.args, ctx)).await,
         nr if nr == NR_MINCORE => return sys_mincore(req.args, ctx),
         nr if nr == NR_REMAP_FILE_PAGES => return sys_remap_file_pages(req.args),
-        nr if nr == NR_MLOCK2 => return sys_mlock2(req.args, ctx).await,
+        nr if nr == NR_MLOCK2 => return boxed_syscall(sys_mlock2(req.args, ctx)).await,
         nr if nr == NR_UTIMENSAT => return sys_utimensat::<P>(req.args, ctx),
         nr if nr == NR_SHMGET => return sys_shmget(req.args, ctx),
-        nr if nr == NR_SHMDT => return sys_shmdt(req.args, ctx).await,
+        nr if nr == NR_SHMDT => return boxed_syscall(sys_shmdt(req.args, ctx)).await,
         nr if nr == NR_MSGGET => return sys_msgget(req.args, ctx),
         nr if nr == NR_MSGSND => return sys_msgsnd(req.args, ctx),
         nr if nr == NR_MSGRCV => return sys_msgrcv(req.args, ctx),
@@ -484,53 +506,55 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
 
     // ── Lanes 2+3: Script-based (OneShotStepOp + Full async drive) ──
     match req.nr {
-        nr if nr == NR_WRITE => sys_write(req.args, ctx).await,
-        nr if nr == NR_WRITEV => sys_writev(req.args, ctx).await,
-        nr if nr == NR_READ => sys_read::<P>(req.args, ctx).await,
-        nr if nr == NR_READV => sys_readv::<P>(req.args, ctx).await,
-        nr if nr == NR_MQ_TIMEDSEND => sys_mq_timedsend(req.args, ctx).await,
-        nr if nr == NR_MQ_TIMEDRECEIVE => sys_mq_timedreceive(req.args, ctx).await,
-        nr if nr == NR_PREAD64 => sys_pread64::<P>(req.args, ctx).await,
-        nr if nr == NR_PWRITE64 => sys_pwrite64(req.args, ctx).await,
-        nr if nr == NR_PREADV => sys_preadv::<P>(req.args, ctx).await,
-        nr if nr == NR_PWRITEV => sys_pwritev(req.args, ctx).await,
-        nr if nr == NR_PREADV2 => sys_preadv2::<P>(req.args, ctx).await,
-        nr if nr == NR_PWRITEV2 => sys_pwritev2(req.args, ctx).await,
+        nr if nr == NR_WRITE => boxed_syscall(sys_write(req.args, ctx)).await,
+        nr if nr == NR_WRITEV => boxed_syscall(sys_writev(req.args, ctx)).await,
+        nr if nr == NR_READ => boxed_syscall(sys_read::<P>(req.args, ctx)).await,
+        nr if nr == NR_READV => boxed_syscall(sys_readv::<P>(req.args, ctx)).await,
+        nr if nr == NR_MQ_TIMEDSEND => boxed_syscall(sys_mq_timedsend(req.args, ctx)).await,
+        nr if nr == NR_MQ_TIMEDRECEIVE => boxed_syscall(sys_mq_timedreceive(req.args, ctx)).await,
+        nr if nr == NR_PREAD64 => boxed_syscall(sys_pread64::<P>(req.args, ctx)).await,
+        nr if nr == NR_PWRITE64 => boxed_syscall(sys_pwrite64(req.args, ctx)).await,
+        nr if nr == NR_PREADV => boxed_syscall(sys_preadv::<P>(req.args, ctx)).await,
+        nr if nr == NR_PWRITEV => boxed_syscall(sys_pwritev(req.args, ctx)).await,
+        nr if nr == NR_PREADV2 => boxed_syscall(sys_preadv2::<P>(req.args, ctx)).await,
+        nr if nr == NR_PWRITEV2 => boxed_syscall(sys_pwritev2(req.args, ctx)).await,
         nr if nr == NR_FADVISE64 => sys_fadvise64(req.args, ctx),
         nr if nr == NR_SPLICE => sys_splice(req.args, ctx),
         nr if nr == NR_SOCKET => sys_socket(req.args, ctx),
         nr if nr == NR_SOCKETPAIR => sys_socketpair(req.args, ctx),
         nr if nr == NR_BIND => sys_bind(req.args, ctx),
         nr if nr == NR_LISTEN => sys_listen(req.args, ctx),
-        nr if nr == NR_ACCEPT => sys_accept::<P>(req.args, ctx).await,
-        nr if nr == NR_ACCEPT4 => sys_accept4::<P>(req.args, ctx).await,
-        nr if nr == NR_CONNECT => sys_connect(req.args, ctx).await,
+        nr if nr == NR_ACCEPT => boxed_syscall(sys_accept::<P>(req.args, ctx)).await,
+        nr if nr == NR_ACCEPT4 => boxed_syscall(sys_accept4::<P>(req.args, ctx)).await,
+        nr if nr == NR_CONNECT => boxed_syscall(sys_connect(req.args, ctx)).await,
         nr if nr == NR_GETSOCKNAME => sys_getsockname(req.args, ctx),
         nr if nr == NR_GETPEERNAME => sys_getpeername(req.args, ctx),
-        nr if nr == NR_SENDTO => sys_sendto(req.args, ctx).await,
-        nr if nr == NR_RECVFROM => sys_recvfrom::<P>(req.args, ctx).await,
-        nr if nr == NR_SENDMSG => sys_sendmsg(req.args, ctx).await,
-        nr if nr == NR_RECVMSG => sys_recvmsg(req.args, ctx).await,
-        nr if nr == NR_RECVMMSG => sys_recvmmsg::<P>(req.args, ctx).await,
-        nr if nr == NR_SENDMMSG => sys_sendmmsg(req.args, ctx).await,
+        nr if nr == NR_SENDTO => boxed_syscall(sys_sendto(req.args, ctx)).await,
+        nr if nr == NR_RECVFROM => boxed_syscall(sys_recvfrom::<P>(req.args, ctx)).await,
+        nr if nr == NR_SENDMSG => boxed_syscall(sys_sendmsg(req.args, ctx)).await,
+        nr if nr == NR_RECVMSG => boxed_syscall(sys_recvmsg(req.args, ctx)).await,
+        nr if nr == NR_RECVMMSG => boxed_syscall(sys_recvmmsg::<P>(req.args, ctx)).await,
+        nr if nr == NR_SENDMMSG => boxed_syscall(sys_sendmmsg(req.args, ctx)).await,
         nr if nr == NR_SETSOCKOPT => sys_setsockopt(req.args, ctx),
         nr if nr == NR_GETSOCKOPT => sys_getsockopt(req.args, ctx),
         nr if nr == NR_SHUTDOWN => sys_shutdown(req.args, ctx),
-        nr if nr == NR_SENDFILE64 => sys_sendfile64(req.args, ctx).await,
+        nr if nr == NR_SENDFILE64 => boxed_syscall(sys_sendfile64(req.args, ctx)).await,
         nr if nr == NR_COPY_FILE_RANGE => sys_copy_file_range::<P>(req.args, ctx),
-        nr if nr == NR_PPOLL => sys_ppoll::<P>(req.args, ctx).await,
-        nr if nr == NR_PSELECT6 => sys_pselect6::<P>(req.args, ctx).await,
-        nr if nr == NR_PSELECT6_TIME64 => sys_pselect6::<P>(req.args, ctx).await,
-        nr if nr == NR_SCHED_YIELD => sys_sched_yield().await,
+        nr if nr == NR_PPOLL => boxed_syscall(sys_ppoll::<P>(req.args, ctx)).await,
+        nr if nr == NR_PSELECT6 => boxed_syscall(sys_pselect6::<P>(req.args, ctx)).await,
+        nr if nr == NR_PSELECT6_TIME64 => boxed_syscall(sys_pselect6::<P>(req.args, ctx)).await,
+        nr if nr == NR_SCHED_YIELD => boxed_syscall(sys_sched_yield()).await,
         nr if nr == NR_EXIT => sys_exit(req.args, ctx),
         nr if nr == NR_EXIT_GROUP => sys_exit_group(req.args, ctx),
-        nr if nr == NR_BRK => sys_brk(req.args, ctx).await,
+        nr if nr == NR_BRK => boxed_syscall(sys_brk(req.args, ctx)).await,
         nr if nr == NR_RT_SIGPROCMASK => sys_rt_sigprocmask(req.args, ctx),
         nr if nr == NR_RT_SIGACTION => sys_rt_sigaction(req.args, ctx),
         nr if nr == NR_RT_SIGPENDING => sys_rt_sigpending(req.args, ctx),
-        nr if nr == NR_RT_SIGSUSPEND => sys_rt_sigsuspend::<P>(req.args, ctx).await,
+        nr if nr == NR_RT_SIGSUSPEND => boxed_syscall(sys_rt_sigsuspend::<P>(req.args, ctx)).await,
         nr if nr == NR_RT_SIGQUEUEINFO => sys_rt_sigqueueinfo(req.args, ctx),
-        nr if nr == NR_RT_SIGTIMEDWAIT => sys_rt_sigtimedwait::<P>(req.args, ctx).await,
+        nr if nr == NR_RT_SIGTIMEDWAIT => {
+            boxed_syscall(sys_rt_sigtimedwait::<P>(req.args, ctx)).await
+        }
         nr if nr == NR_PIDFD_OPEN => sys_pidfd_open(req.args, ctx),
         nr if nr == NR_PIDFD_SEND_SIGNAL => sys_pidfd_send_signal(req.args, ctx),
         nr if nr == NR_SIGALTSTACK => sys_sigaltstack(req.args, ctx),
@@ -539,15 +563,15 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_FCNTL => sys_fcntl(req.args, ctx),
         nr if nr == NR_SHMCTL => sys_shmctl(req.args, ctx),
         nr if nr == NR_MSGCTL => sys_msgctl(req.args, ctx),
-        nr if nr == NR_SEMOP => sys_semop(req.args, ctx).await,
-        nr if nr == NR_SEMTIMEDOP => sys_semtimedop::<P>(req.args, ctx).await,
+        nr if nr == NR_SEMOP => boxed_syscall(sys_semop(req.args, ctx)).await,
+        nr if nr == NR_SEMTIMEDOP => boxed_syscall(sys_semtimedop::<P>(req.args, ctx)).await,
         nr if nr == NR_SEMCTL => sys_semctl(req.args, ctx),
-        nr if nr == NR_SHMAT => sys_shmat(req.args, ctx).await,
-        nr if nr == NR_EXECVE => sys_execve::<P>(req.args, ctx).await,
-        nr if nr == NR_CLONE => sys_clone::<P>(req.args, ctx).await,
+        nr if nr == NR_SHMAT => boxed_syscall(sys_shmat(req.args, ctx)).await,
+        nr if nr == NR_EXECVE => boxed_syscall(sys_execve::<P>(req.args, ctx)).await,
+        nr if nr == NR_CLONE => boxed_syscall(sys_clone::<P>(req.args, ctx)).await,
         nr if nr == NR_UNSHARE => sys_unshare(req.args, ctx),
         nr if nr == NR_SETNS => sys_setns(req.args, ctx),
-        nr if nr == NR_WAIT4 => sys_wait4(req.args, ctx).await,
+        nr if nr == NR_WAIT4 => boxed_syscall(sys_wait4(req.args, ctx)).await,
         nr if nr == NR_GETRUSAGE => sys_getrusage(req.args, ctx),
         nr if nr == NR_SETPGID => sys_setpgid(req.args, ctx),
         nr if nr == NR_SETSID => sys_setsid(ctx),
@@ -600,13 +624,13 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         // `PmapIf`; the others operate purely on the fd table and the
         // `Cap<OpenFile>` slot it carries.
         nr if nr == NR_OPENAT => {
-            sys_openat::<P>(
+            boxed_syscall(sys_openat::<P>(
                 req.args[0] as i32,
                 req.args[1],
                 req.args[2] as u32,
                 req.args[3] as u32,
                 ctx,
-            )
+            ))
             .await
         }
         nr if nr == NR_NAME_TO_HANDLE_AT => sys_name_to_handle_at::<P>(
@@ -620,7 +644,7 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         nr if nr == NR_OPEN_BY_HANDLE_AT => {
             sys_open_by_handle_at(req.args[0] as i32, req.args[1], req.args[2] as u32, ctx)
         }
-        nr if nr == NR_CLOSE => sys_close(req.args[0] as u32, ctx).await,
+        nr if nr == NR_CLOSE => boxed_syscall(sys_close(req.args[0] as u32, ctx)).await,
         nr if nr == NR_DUP => sys_dup(req.args[0] as u32, ctx),
         nr if nr == NR_DUP3 => sys_dup3(
             req.args[0] as u32,
@@ -644,17 +668,17 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         // munmap / mprotect / mremap / madvise use StepOp wrappers
         // (VmMapOp / VmUnmapOp etc.) that yield on RangeLock
         // conflicts; the drive loop parks on WaitSource and retries.
-        nr if nr == NR_MMAP => sys_mmap(req.args, ctx).await,
-        nr if nr == NR_MUNMAP => sys_munmap(req.args, ctx).await,
-        nr if nr == NR_MPROTECT => sys_mprotect(req.args, ctx).await,
-        nr if nr == NR_MREMAP => sys_mremap(req.args, ctx).await,
-        nr if nr == NR_MSYNC => sys_msync(req.args, ctx).await,
+        nr if nr == NR_MMAP => boxed_syscall(sys_mmap(req.args, ctx)).await,
+        nr if nr == NR_MUNMAP => boxed_syscall(sys_munmap(req.args, ctx)).await,
+        nr if nr == NR_MPROTECT => boxed_syscall(sys_mprotect(req.args, ctx)).await,
+        nr if nr == NR_MREMAP => boxed_syscall(sys_mremap(req.args, ctx)).await,
+        nr if nr == NR_MSYNC => boxed_syscall(sys_msync(req.args, ctx)).await,
         // Slice 3 of the shell-prompt roadmap — `futex(2)`. v1 honours
         // `FUTEX_WAIT` / `FUTEX_WAKE` against a 256-bucket hash table;
         // other op selectors return `-ENOSYS`. `FUTEX_PRIVATE_FLAG` /
         // `FUTEX_CLOCK_REALTIME` are recognised but ignored. Required
         // for musl libc init.
-        nr if nr == NR_FUTEX => sys_futex::<P>(req.args, ctx).await,
+        nr if nr == NR_FUTEX => boxed_syscall(sys_futex::<P>(req.args, ctx)).await,
         // Slice 4 of the shell-prompt roadmap — time syscalls. The
         // four POSIX clock ids alias to the platform monotonic clock
         // for v1 (CLOCK_REALTIME has no boot-time RTC offset yet;
@@ -665,8 +689,10 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         // past-deadline cases short-circuit immediately.
         nr if nr == NR_CLOCK_GETTIME => sys_clock_gettime::<P>(req.args, ctx),
         nr if nr == NR_CLOCK_GETRES => sys_clock_getres(req.args, ctx),
-        nr if nr == NR_NANOSLEEP => sys_nanosleep::<P>(req.args, ctx).await,
-        nr if nr == NR_CLOCK_NANOSLEEP => sys_clock_nanosleep::<P>(req.args, ctx).await,
+        nr if nr == NR_NANOSLEEP => boxed_syscall(sys_nanosleep::<P>(req.args, ctx)).await,
+        nr if nr == NR_CLOCK_NANOSLEEP => {
+            boxed_syscall(sys_clock_nanosleep::<P>(req.args, ctx)).await
+        }
         nr if nr == NR_SETITIMER => sys_setitimer::<P>(req.args, ctx),
         // Slice 5 of the shell-prompt roadmap — `ioctl(2)` + TTY
         // routing. Without this, musl's `isatty(STDIN_FILENO)` check
@@ -681,27 +707,27 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         // / `umask`). `fchdir` returns `-ENOSYS` (carryover; OpenFile
         // has no DEntry hint to install via step_chdir).
         nr if nr == NR_FSTAT => sys_fstat(req.args, ctx),
-        nr if nr == NR_NEWFSTATAT => sys_newfstatat(req.args, ctx).await,
+        nr if nr == NR_NEWFSTATAT => boxed_syscall(sys_newfstatat(req.args, ctx)).await,
         nr if nr == NR_GETCWD => sys_getcwd(req.args, ctx),
-        nr if nr == NR_CHDIR => sys_chdir(req.args, ctx).await,
-        nr if nr == NR_FCHDIR => sys_fchdir::<P>(req.args, ctx).await,
-        nr if nr == NR_STATFS => sys_statfs::<P>(req.args, ctx).await,
-        nr if nr == NR_FSTATFS => sys_fstatfs::<P>(req.args, ctx).await,
-        nr if nr == NR_SYNC => sys_sync::<P>(req.args, ctx).await,
-        nr if nr == NR_SYNCFS => sys_syncfs::<P>(req.args, ctx).await,
+        nr if nr == NR_CHDIR => boxed_syscall(sys_chdir(req.args, ctx)).await,
+        nr if nr == NR_FCHDIR => boxed_syscall(sys_fchdir::<P>(req.args, ctx)).await,
+        nr if nr == NR_STATFS => boxed_syscall(sys_statfs::<P>(req.args, ctx)).await,
+        nr if nr == NR_FSTATFS => boxed_syscall(sys_fstatfs::<P>(req.args, ctx)).await,
+        nr if nr == NR_SYNC => boxed_syscall(sys_sync::<P>(req.args, ctx)).await,
+        nr if nr == NR_SYNCFS => boxed_syscall(sys_syncfs::<P>(req.args, ctx)).await,
         nr if nr == NR_SYNC_FILE_RANGE => sys_sync_file_range(req.args, ctx),
         nr if nr == NR_READAHEAD => sys_readahead(req.args, ctx),
-        nr if nr == NR_FSYNC => sys_fsync::<P>(req.args, ctx).await,
-        nr if nr == NR_FDATASYNC => sys_fdatasync::<P>(req.args, ctx).await,
-        nr if nr == NR_FLOCK => sys_flock::<P>(req.args, ctx).await,
-        nr if nr == NR_OPEN_TREE => sys_open_tree::<P>(req.args, ctx).await,
-        nr if nr == NR_FSOPEN => sys_fsopen::<P>(req.args, ctx).await,
-        nr if nr == NR_FSPICK => sys_fspick::<P>(req.args, ctx).await,
-        nr if nr == NR_MOUNT => sys_mount::<P>(req.args, ctx).await,
-        nr if nr == NR_UMOUNT2 => sys_umount2::<P>(req.args, ctx).await,
-        nr if nr == NR_MKNODAT => sys_mknodat::<P>(req.args, ctx).await,
-        nr if nr == NR_GETDENTS64 => sys_getdents64(req.args, ctx).await,
-        nr if nr == NR_STATX => sys_statx(req.args, ctx).await,
+        nr if nr == NR_FSYNC => boxed_syscall(sys_fsync::<P>(req.args, ctx)).await,
+        nr if nr == NR_FDATASYNC => boxed_syscall(sys_fdatasync::<P>(req.args, ctx)).await,
+        nr if nr == NR_FLOCK => boxed_syscall(sys_flock::<P>(req.args, ctx)).await,
+        nr if nr == NR_OPEN_TREE => boxed_syscall(sys_open_tree::<P>(req.args, ctx)).await,
+        nr if nr == NR_FSOPEN => boxed_syscall(sys_fsopen::<P>(req.args, ctx)).await,
+        nr if nr == NR_FSPICK => boxed_syscall(sys_fspick::<P>(req.args, ctx)).await,
+        nr if nr == NR_MOUNT => boxed_syscall(sys_mount::<P>(req.args, ctx)).await,
+        nr if nr == NR_UMOUNT2 => boxed_syscall(sys_umount2::<P>(req.args, ctx)).await,
+        nr if nr == NR_MKNODAT => boxed_syscall(sys_mknodat::<P>(req.args, ctx)).await,
+        nr if nr == NR_GETDENTS64 => boxed_syscall(sys_getdents64(req.args, ctx)).await,
+        nr if nr == NR_STATX => boxed_syscall(sys_statx(req.args, ctx)).await,
         // Slice 7 of the shell-prompt roadmap — fcntl extension +
         // day-1 misc syscalls. None individually heavy; each unblocks
         // a specific shell-startup path.
@@ -732,15 +758,15 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         // recognised flag bits but unsupported. See
         // `docs/progress/plans/2026-05-07-shell-prompt-roadmap.md`
         // Slice 8.
-        nr if nr == NR_MKDIRAT => sys_mkdirat(req.args, ctx).await,
-        nr if nr == NR_UNLINKAT => sys_unlinkat(req.args, ctx).await,
-        nr if nr == NR_SYMLINKAT => sys_symlinkat(req.args, ctx).await,
-        nr if nr == NR_LINKAT => sys_linkat(req.args, ctx).await,
-        nr if nr == NR_TRUNCATE => sys_truncate(req.args, ctx).await,
-        nr if nr == NR_FTRUNCATE => sys_ftruncate(req.args, ctx).await,
+        nr if nr == NR_MKDIRAT => boxed_syscall(sys_mkdirat(req.args, ctx)).await,
+        nr if nr == NR_UNLINKAT => boxed_syscall(sys_unlinkat(req.args, ctx)).await,
+        nr if nr == NR_SYMLINKAT => boxed_syscall(sys_symlinkat(req.args, ctx)).await,
+        nr if nr == NR_LINKAT => boxed_syscall(sys_linkat(req.args, ctx)).await,
+        nr if nr == NR_TRUNCATE => boxed_syscall(sys_truncate(req.args, ctx)).await,
+        nr if nr == NR_FTRUNCATE => boxed_syscall(sys_ftruncate(req.args, ctx)).await,
         nr if nr == NR_FALLOCATE => sys_fallocate(req.args, ctx),
-        nr if nr == NR_READLINKAT => sys_readlinkat(req.args, ctx).await,
-        nr if nr == NR_RENAMEAT2 => sys_renameat2(req.args, ctx).await,
+        nr if nr == NR_READLINKAT => boxed_syscall(sys_readlinkat(req.args, ctx)).await,
+        nr if nr == NR_RENAMEAT2 => boxed_syscall(sys_renameat2(req.args, ctx)).await,
         // syslog(2) / klogctl — kernel ring-buffer read/control.
         // Stubbed: type 2 (READ) returns 0 bytes so `dmesg(1)` exits 0.
         nr if nr == NR_SYSLOG => sys_syslog(req.args, ctx),
@@ -777,7 +803,7 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
         // satisfied when `timeout == NULL`. Serialises each drained
         // event into a 32-byte `struct io_event` and writes through
         // P's address space.
-        nr if nr == NR_IO_GETEVENTS => sys_io_getevents(req.args, ctx).await,
+        nr if nr == NR_IO_GETEVENTS => boxed_syscall(sys_io_getevents(req.args, ctx)).await,
         // PR-11 phase 5 — `io_destroy(2)` dispatch. Trips the
         // worker's abort signal (cooperative cancel), drops the
         // worker future, removes the fd-table entry. Mirrors
@@ -859,13 +885,13 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf>(
             ctx,
         ),
         nr if nr == NR_EPOLL_PWAIT => {
-            sys_epoll_wait::<P>(
+            boxed_syscall(sys_epoll_wait::<P>(
                 req.args[0] as u32,
                 req.args[1],
                 req.args[2] as u32,
                 req.args[3] as i32,
                 ctx,
-            )
+            ))
             .await
         }
         _ => SyscallResult::Error(ENOSYS_VALUE),
@@ -882,38 +908,76 @@ struct SchedParamLayout {
     sched_priority: i32,
 }
 
+static SCHED_POLICIES: SpinMutex<BTreeMap<u32, u32>> = SpinMutex::new(BTreeMap::new());
+static SCHED_PARAMS_COMPAT: SpinMutex<BTreeMap<u32, SchedParamLayout>> =
+    SpinMutex::new(BTreeMap::new());
+static NICE_VALUES: SpinMutex<BTreeMap<u32, i32>> = SpinMutex::new(BTreeMap::new());
+static PR_TIMERSLACK_NS: SpinMutex<BTreeMap<u32, u64>> = SpinMutex::new(BTreeMap::new());
+static PR_GLOBAL_TIMERSLACK_NS: SpinMutex<u64> = SpinMutex::new(50_000);
+static PR_PDEATHSIG: SpinMutex<BTreeMap<u32, i32>> = SpinMutex::new(BTreeMap::new());
+static PR_CHILD_SUBREAPER: SpinMutex<BTreeMap<u32, i32>> = SpinMutex::new(BTreeMap::new());
+
+const SCHED_OTHER: u32 = 0;
+const SCHED_FIFO_COMPAT: u32 = 1;
+const SCHED_RR_COMPAT: u32 = 2;
+const SCHED_BATCH_COMPAT: u32 = 3;
+const SCHED_IDLE_COMPAT: u32 = 5;
+const SCHED_DEADLINE_COMPAT: u32 = 6;
+
+fn sched_tid_arg(pid_arg: u64, ctx: &SyscallCtx<'_>) -> Result<u32, SyscallResult> {
+    if pid_arg == 0 {
+        return Ok(ctx.thread.tid.0);
+    }
+    if pid_arg > i32::MAX as u64 {
+        return Err(SyscallResult::Error(EINVAL_VALUE));
+    }
+    let Ok(pid32) = u32::try_from(pid_arg) else {
+        return Err(SyscallResult::Error(ESRCH_VALUE));
+    };
+    if process_by_pid(Pid(pid32)).is_some()
+        || matches!(
+            tx_subsystems::process::numbers::resolve_pid_number(pid_arg),
+            Some(tx_subsystems::process::numbers::PidName::Thread(_))
+        )
+    {
+        Ok(pid32)
+    } else {
+        Err(SyscallResult::Error(ESRCH_VALUE))
+    }
+}
+
+fn sched_policy_supported_compat(policy: u32) -> bool {
+    matches!(
+        policy,
+        SCHED_OTHER | SCHED_FIFO_COMPAT | SCHED_RR_COMPAT | SCHED_BATCH_COMPAT | SCHED_IDLE_COMPAT
+    )
+}
+
+fn sched_priority_valid(policy: u32, priority: i32) -> bool {
+    match policy {
+        SCHED_FIFO_COMPAT | SCHED_RR_COMPAT => (1..=99).contains(&priority),
+        SCHED_OTHER | SCHED_BATCH_COMPAT | SCHED_IDLE_COMPAT => priority == 0,
+        _ => false,
+    }
+}
+
+fn sched_policy_for_tid(tid: u32) -> u32 {
+    *SCHED_POLICIES.lock().get(&tid).unwrap_or(&SCHED_OTHER)
+}
+
 /// `sched_setscheduler(pid, policy, param)` — validation-only shim.
 ///
 /// The actual scheduler policy remains txKernel's native policy, but Linux
 /// callers expect the basic errno surface for bad pid/policy/param/priority.
 fn sys_sched_setscheduler<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
-    const SCHED_OTHER: u32 = 0;
-    const SCHED_FIFO: u32 = 1;
-    const SCHED_RR: u32 = 2;
-    const SCHED_BATCH: u32 = 3;
-    const SCHED_IDLE: u32 = 5;
-
-    let pid = args[0];
+    let tid = match sched_tid_arg(args[0], ctx) {
+        Ok(tid) => tid,
+        Err(err) => return err,
+    };
     let policy = args[1] as u32;
     let param_ptr = args[2];
 
-    if pid != 0 {
-        let Ok(pid32) = u32::try_from(pid) else {
-            return SyscallResult::Error(ESRCH_VALUE);
-        };
-        if process_by_pid(Pid(pid32)).is_none()
-            && !matches!(
-                tx_subsystems::process::numbers::resolve_pid_number(pid),
-                Some(tx_subsystems::process::numbers::PidName::Thread(_))
-            )
-        {
-            return SyscallResult::Error(ESRCH_VALUE);
-        }
-    }
-    if !matches!(
-        policy,
-        SCHED_OTHER | SCHED_FIFO | SCHED_RR | SCHED_BATCH | SCHED_IDLE
-    ) {
+    if !sched_policy_supported_compat(policy) {
         return SyscallResult::Error(EINVAL_VALUE);
     }
     if param_ptr == 0 {
@@ -924,15 +988,346 @@ fn sys_sched_setscheduler<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRe
         Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
     };
     let priority = param.sched_priority;
-    let valid_priority = match policy {
-        SCHED_FIFO | SCHED_RR => (1..=99).contains(&priority),
-        _ => priority == 0,
-    };
-    if !valid_priority {
+    if !sched_priority_valid(policy, priority) {
         return SyscallResult::Error(EINVAL_VALUE);
     }
+    if matches!(policy, SCHED_FIFO_COMPAT | SCHED_RR_COMPAT)
+        && !ctx.cred_snapshot().cred().euid.is_root()
+    {
+        return SyscallResult::Error(EPERM_VALUE);
+    }
 
+    SCHED_POLICIES.lock().insert(tid, policy);
+    SCHED_PARAMS_COMPAT.lock().insert(tid, param);
     SyscallResult::Return(0)
+}
+
+fn sys_sched_setparam<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let tid = match sched_tid_arg(args[0], ctx) {
+        Ok(tid) => tid,
+        Err(err) => return err,
+    };
+    let param_ptr = args[1];
+    if param_ptr == 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let param = match bootstrap_read_user::<SchedParamLayout>(&ctx.aspace, param_ptr) {
+        Ok(param) => param,
+        Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+    };
+    if !sched_priority_valid(sched_policy_for_tid(tid), param.sched_priority) {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if tid != ctx.thread.tid.0 && !ctx.cred_snapshot().cred().euid.is_root() {
+        return SyscallResult::Error(EPERM_VALUE);
+    }
+    SCHED_PARAMS_COMPAT.lock().insert(tid, param);
+    SyscallResult::Return(0)
+}
+
+fn sys_sched_getparam<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let tid = match sched_tid_arg(args[0], ctx) {
+        Ok(tid) => tid,
+        Err(err) => return err,
+    };
+    let param_ptr = args[1];
+    if param_ptr == 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let param = SCHED_PARAMS_COMPAT
+        .lock()
+        .get(&tid)
+        .copied()
+        .unwrap_or(SchedParamLayout { sched_priority: 0 });
+    match bootstrap_write_user::<SchedParamLayout>(&ctx.aspace, param_ptr, param) {
+        Ok(()) => SyscallResult::Return(0),
+        Err(_) => SyscallResult::Error(EINVAL_VALUE),
+    }
+}
+
+fn sys_sched_getscheduler<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let tid = match sched_tid_arg(args[0], ctx) {
+        Ok(tid) => tid,
+        Err(err) => return err,
+    };
+    SyscallResult::Return(sched_policy_for_tid(tid) as i64)
+}
+
+fn sys_sched_get_priority(args: [u64; 6], max: bool) -> SyscallResult {
+    let policy = args[0] as u32;
+    match policy {
+        SCHED_FIFO_COMPAT | SCHED_RR_COMPAT => SyscallResult::Return(if max { 99 } else { 1 }),
+        SCHED_OTHER | SCHED_BATCH_COMPAT | SCHED_IDLE_COMPAT | SCHED_DEADLINE_COMPAT => {
+            SyscallResult::Return(0)
+        }
+        _ => SyscallResult::Error(EINVAL_VALUE),
+    }
+}
+
+fn sys_sched_rr_get_interval<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    if let Err(err) = sched_tid_arg(args[0], ctx) {
+        return err;
+    }
+    let interval_ptr = args[1];
+    if interval_ptr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    if interval_ptr < 0x10_000 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    let interval = TimespecLayout {
+        tv_sec: 0,
+        tv_nsec: 10_000_000,
+    };
+    match bootstrap_write_user::<TimespecLayout>(&ctx.aspace, interval_ptr, interval) {
+        Ok(()) => SyscallResult::Return(0),
+        Err(_) => SyscallResult::Error(EINVAL_VALUE),
+    }
+}
+
+fn priority_target_tid(which: i32, who: u32, ctx: &SyscallCtx<'_>) -> Result<u32, SyscallResult> {
+    match which {
+        0 => {
+            if who == 0 {
+                Ok(ctx.thread.tid.0)
+            } else if process_by_pid(Pid(who)).is_some()
+                || matches!(
+                    tx_subsystems::process::numbers::resolve_pid_number(who as u64),
+                    Some(tx_subsystems::process::numbers::PidName::Thread(_))
+                )
+            {
+                Ok(who)
+            } else {
+                Err(SyscallResult::Error(ESRCH_VALUE))
+            }
+        }
+        1 | 2 => {
+            if who == 0 {
+                Ok(ctx.thread.tid.0)
+            } else {
+                Err(SyscallResult::Error(ESRCH_VALUE))
+            }
+        }
+        _ => Err(SyscallResult::Error(EINVAL_VALUE)),
+    }
+}
+
+fn clamp_nice(prio: i32) -> i32 {
+    prio.clamp(-20, 19)
+}
+
+fn sys_setpriority<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let which = args[0] as i32;
+    let who = args[1] as u32;
+    let tid = match priority_target_tid(which, who, ctx) {
+        Ok(tid) => tid,
+        Err(err) => return err,
+    };
+    let next = clamp_nice(args[2] as i32);
+    let current = *NICE_VALUES.lock().get(&tid).unwrap_or(&0);
+    if which == 0
+        && who != 0
+        && tid != ctx.thread.tid.0
+        && !ctx.cred_snapshot().cred().euid.is_root()
+    {
+        return SyscallResult::Error(EPERM_VALUE);
+    }
+    if next < current && !ctx.cred_snapshot().cred().euid.is_root() {
+        return SyscallResult::Error(if next <= -10 {
+            EPERM_VALUE
+        } else {
+            EACCES_VALUE
+        });
+    }
+    NICE_VALUES.lock().insert(tid, next);
+    SyscallResult::Return(0)
+}
+
+fn sys_getpriority<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let which = args[0] as i32;
+    let who = args[1] as u32;
+    let tid = match priority_target_tid(which, who, ctx) {
+        Ok(tid) => tid,
+        Err(err) => return err,
+    };
+    let nice = *NICE_VALUES.lock().get(&tid).unwrap_or(&0);
+    SyscallResult::Return((20 - nice) as i64)
+}
+
+fn sys_prctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    const PR_SET_PDEATHSIG: u64 = 1;
+    const PR_GET_PDEATHSIG: u64 = 2;
+    const PR_GET_DUMPABLE: u64 = 3;
+    const PR_SET_DUMPABLE: u64 = 4;
+    const PR_GET_TIMING: u64 = 13;
+    const PR_SET_TIMING: u64 = 14;
+    const PR_SET_NAME: u64 = 15;
+    const PR_GET_NAME: u64 = 16;
+    const PR_GET_SECCOMP: u64 = 21;
+    const PR_SET_SECCOMP: u64 = 22;
+    const PR_CAPBSET_READ: u64 = 23;
+    const PR_CAPBSET_DROP: u64 = 24;
+    const PR_GET_TSC: u64 = 25;
+    const PR_SET_TSC: u64 = 26;
+    const PR_GET_SECUREBITS: u64 = 27;
+    const PR_SET_SECUREBITS: u64 = 28;
+    const PR_SET_TIMERSLACK: u64 = 29;
+    const PR_GET_TIMERSLACK: u64 = 30;
+    const PR_SET_CHILD_SUBREAPER: u64 = 36;
+    const PR_GET_CHILD_SUBREAPER: u64 = 37;
+    const PR_SET_NO_NEW_PRIVS: u64 = 38;
+    const PR_GET_NO_NEW_PRIVS: u64 = 39;
+    const PR_CAP_AMBIENT: u64 = 47;
+
+    match args[0] {
+        PR_SET_PDEATHSIG => {
+            if args[1] > 64 {
+                SyscallResult::Error(EINVAL_VALUE)
+            } else {
+                PR_PDEATHSIG
+                    .lock()
+                    .insert(ctx.process.pid.0, args[1] as i32);
+                SyscallResult::Return(0)
+            }
+        }
+        PR_GET_PDEATHSIG => {
+            let ptr = args[1];
+            if ptr == 0 {
+                return SyscallResult::Error(EFAULT_VALUE);
+            }
+            let sig = *PR_PDEATHSIG.lock().get(&ctx.process.pid.0).unwrap_or(&0);
+            match bootstrap_write_user::<i32>(&ctx.aspace, ptr, sig) {
+                Ok(()) => SyscallResult::Return(0),
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+            }
+        }
+        PR_GET_DUMPABLE => SyscallResult::Return(1),
+        PR_SET_DUMPABLE => {
+            if args[1] <= 1 {
+                SyscallResult::Return(0)
+            } else {
+                SyscallResult::Error(EINVAL_VALUE)
+            }
+        }
+        PR_GET_TIMING => SyscallResult::Return(0),
+        PR_SET_TIMING => {
+            if args[1] == 0 {
+                SyscallResult::Return(0)
+            } else {
+                SyscallResult::Error(EINVAL_VALUE)
+            }
+        }
+        PR_SET_NAME => {
+            let ptr = args[1];
+            if ptr == 0 {
+                return SyscallResult::Error(EFAULT_VALUE);
+            }
+            let mut comm = [0u8; 16];
+            if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut comm, ptr) {
+                return SyscallResult::Error(errno_to_i32(errno));
+            }
+            comm[15] = 0;
+            if ctx.process.set_comm(comm) {
+                SyscallResult::Return(0)
+            } else {
+                SyscallResult::Error(ESRCH_VALUE)
+            }
+        }
+        PR_GET_NAME => {
+            let ptr = args[1];
+            if ptr == 0 {
+                return SyscallResult::Error(EFAULT_VALUE);
+            }
+            let comm = ctx.process.comm();
+            match bootstrap_copy_to_user(&ctx.aspace, ptr, &comm) {
+                Ok(()) => SyscallResult::Return(0),
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+            }
+        }
+        PR_GET_SECCOMP | PR_SET_SECCOMP | PR_CAP_AMBIENT => SyscallResult::Error(EINVAL_VALUE),
+        PR_CAPBSET_READ => {
+            if args[1] < 64 {
+                SyscallResult::Return(1)
+            } else {
+                SyscallResult::Error(EINVAL_VALUE)
+            }
+        }
+        PR_CAPBSET_DROP => {
+            if args[1] < 64 {
+                SyscallResult::Error(EPERM_VALUE)
+            } else {
+                SyscallResult::Error(EINVAL_VALUE)
+            }
+        }
+        PR_GET_SECUREBITS => SyscallResult::Return(0),
+        PR_SET_SECUREBITS => SyscallResult::Error(EPERM_VALUE),
+        PR_GET_TSC => {
+            let ptr = args[1];
+            if ptr == 0 {
+                return SyscallResult::Error(EFAULT_VALUE);
+            }
+            match bootstrap_write_user::<i32>(&ctx.aspace, ptr, 0) {
+                Ok(()) => SyscallResult::Return(0),
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+            }
+        }
+        PR_SET_TSC => {
+            if args[1] <= 2 {
+                SyscallResult::Return(0)
+            } else {
+                SyscallResult::Error(EINVAL_VALUE)
+            }
+        }
+        PR_SET_TIMERSLACK => {
+            let slack = if args[1] == 0 { 50_000 } else { args[1] };
+            PR_TIMERSLACK_NS.lock().insert(ctx.thread.tid.0, slack);
+            *PR_GLOBAL_TIMERSLACK_NS.lock() = slack;
+            SyscallResult::Return(0)
+        }
+        PR_GET_TIMERSLACK => {
+            let fallback = *PR_GLOBAL_TIMERSLACK_NS.lock();
+            let slack = *PR_TIMERSLACK_NS
+                .lock()
+                .get(&ctx.thread.tid.0)
+                .unwrap_or(&fallback);
+            SyscallResult::Return(slack as i64)
+        }
+        PR_SET_CHILD_SUBREAPER => {
+            PR_CHILD_SUBREAPER
+                .lock()
+                .insert(ctx.process.pid.0, i32::from(args[1] != 0));
+            SyscallResult::Return(0)
+        }
+        PR_GET_CHILD_SUBREAPER => {
+            let ptr = args[1];
+            if ptr == 0 {
+                return SyscallResult::Error(EFAULT_VALUE);
+            }
+            let flag = *PR_CHILD_SUBREAPER
+                .lock()
+                .get(&ctx.process.pid.0)
+                .unwrap_or(&0);
+            match bootstrap_write_user::<i32>(&ctx.aspace, ptr, flag) {
+                Ok(()) => SyscallResult::Return(0),
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+            }
+        }
+        PR_SET_NO_NEW_PRIVS => {
+            if args[1] == 1 && args[2] == 0 && args[3] == 0 && args[4] == 0 {
+                SyscallResult::Return(0)
+            } else {
+                SyscallResult::Error(EINVAL_VALUE)
+            }
+        }
+        PR_GET_NO_NEW_PRIVS => {
+            if args[1] == 0 && args[2] == 0 && args[3] == 0 && args[4] == 0 {
+                SyscallResult::Return(0)
+            } else {
+                SyscallResult::Error(EINVAL_VALUE)
+            }
+        }
+        _ => SyscallResult::Error(EINVAL_VALUE),
+    }
 }
 
 /// `membarrier(cmd, flags, cpu_id)` — issue memory-ordering barriers

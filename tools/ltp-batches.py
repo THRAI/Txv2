@@ -306,17 +306,31 @@ def load_rust_const_string(name: str) -> str:
     return re.sub(r"[\\\s]", "", match.group("value"))
 
 
-def load_submit_cases() -> list[str]:
+def load_submit_cases(arch: str = "") -> list[str]:
     cases = [case for case in load_rust_const_string("LTP_SUBMIT_CASES").split("+") if case]
     stop_before = load_rust_const_string("LTP_SUBMIT_ONE_POINT_FIRST_CASE")
     if stop_before in cases:
         cases = cases[: cases.index(stop_before)]
     cases.extend(
         case
-        for case in load_rust_const_string("LTP_BATCH_SUBMIT_NETWORK_CASES").split("+")
+        for case in load_rust_const_string("LTP_SUBMIT_PROMOTED_TAIL_CASES").split("+")
         if case
     )
+    if arch not in LA_SUBMIT_ARCHES:
+        cases.extend(
+            case
+            for case in load_rust_const_string("LTP_BATCH_SUBMIT_NETWORK_CASES").split("+")
+            if case
+        )
     return cases
+
+
+def load_submit_unscored_legacy_cases() -> set[str]:
+    return {
+        case
+        for case in load_rust_const_string("LTP_SUBMIT_UNSCORED_LEGACY_CASES").split("+")
+        if case
+    }
 
 
 def load_la_submit_excluded_cases() -> set[str]:
@@ -331,10 +345,29 @@ def load_la_submit_excluded_cases() -> set[str]:
     }
 
 
-def load_submit_glibc_excluded_cases(arch: str) -> set[str]:
+def load_submit_libc_excluded_cases(arch: str, libc: str) -> set[str]:
     excluded = {
         case
-        for case in load_rust_const_string("LTP_BATCH_SUBMIT_GLIBC_EXCLUDED_CASES").split("+")
+        for case in load_rust_const_string("LTP_BATCH_SUBMIT_LIBC_EXCLUDED_CASES").split("+")
+        if case
+    }
+    if libc == "glibc" and arch in LA_SUBMIT_ARCHES:
+        excluded.update(
+            case
+            for case in load_rust_const_string(
+                "LTP_BATCH_LA_SUBMIT_GLIBC_EXCLUDED_CASES"
+            ).split("+")
+            if case
+        )
+    return excluded
+
+
+def load_submit_glibc_network_excluded_cases(arch: str) -> set[str]:
+    excluded = {
+        case
+        for case in load_rust_const_string("LTP_BATCH_SUBMIT_GLIBC_NETWORK_EXCLUDED_CASES").split(
+            "+"
+        )
         if case
     }
     if arch in LA_SUBMIT_ARCHES:
@@ -355,18 +388,22 @@ def cases_for_batch(
         if batch in SUBMIT_GLIBC_BATCH_ALIASES:
             libc = "glibc"
         available = set(cases)
+        legacy_excluded = load_submit_unscored_legacy_cases()
         la_excluded = load_la_submit_excluded_cases() if arch in LA_SUBMIT_ARCHES else set()
-        glibc_excluded = (
-            load_submit_glibc_excluded_cases(arch) if libc == "glibc" else set()
+        libc_excluded = load_submit_libc_excluded_cases(arch, libc)
+        glibc_network_excluded = (
+            load_submit_glibc_network_excluded_cases(arch) if libc == "glibc" else set()
         )
         return [
             case
-            for case in load_submit_cases()
+            for case in load_submit_cases(arch)
             if case in available
             and is_valid_case_name(case)
             and case not in SKIP_CASES
+            and case not in legacy_excluded
             and case not in la_excluded
-            and case not in glibc_excluded
+            and case not in libc_excluded
+            and case not in glibc_network_excluded
         ]
     if batch == "all":
         return [

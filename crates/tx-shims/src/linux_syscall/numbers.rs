@@ -56,11 +56,20 @@ pub const NR_FADVISE64: u64 = 223;
 /// pthread_create to set the new thread's scheduling policy.
 /// v1 stub: returns 0 (success, no-op) — real priority
 /// inheritance deferred to the scheduler slice.
+pub const NR_SCHED_SETPARAM: u64 = 118;
 pub const NR_SCHED_SETSCHEDULER: u64 = 119;
+pub const NR_SCHED_GETSCHEDULER: u64 = 120;
+pub const NR_SCHED_GETPARAM: u64 = 121;
 /// `sched_yield()`. Linux generic ABI `__NR_sched_yield = 124`.
 /// LTP's fuzzy-sync helpers rely on this on single-CPU guests to hand
 /// execution to the peer racing thread.
 pub const NR_SCHED_YIELD: u64 = 124;
+pub const NR_SCHED_GET_PRIORITY_MAX: u64 = 125;
+pub const NR_SCHED_GET_PRIORITY_MIN: u64 = 126;
+pub const NR_SCHED_RR_GET_INTERVAL: u64 = 127;
+pub const NR_SETPRIORITY: u64 = 140;
+pub const NR_GETPRIORITY: u64 = 141;
+pub const NR_PRCTL: u64 = 167;
 /// `ppoll(fds, nfds, tmo_p, sigmask)`. Linux generic ABI
 /// `__NR_ppoll`. busybox sh's interactive read loop polls stdin
 /// before reading. The v1 implementation is a minimal stub: walk

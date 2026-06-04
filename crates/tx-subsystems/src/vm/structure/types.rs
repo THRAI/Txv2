@@ -1272,10 +1272,9 @@ fn allocate_private_materialized_page_from_source(
     dirty: bool,
 ) -> Result<MaterializedPage, VmFaultError> {
     crate::page_backed::reclaim_clean_file_pages_if_low();
-    let reservation = crate::page_backed::reserve_frame_with_reclaim(
-        ZeroPolicy::UninitFullOverwrite,
-    )
-    .map_err(page_alloc_error)?;
+    let reservation =
+        crate::page_backed::reserve_frame_with_reclaim(ZeroPolicy::UninitFullOverwrite)
+            .map_err(page_alloc_error)?;
     page_allocator::copy_frame_contents(source, reservation.ppn()).map_err(page_alloc_error)?;
     let frame = reservation.commit();
     let ppn = frame.ppn();

@@ -312,11 +312,18 @@ pub(super) async fn sys_writev<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
         None
     };
     if let Some(file) = stdio_tty_file {
-        let mut combined = alloc::vec::Vec::new();
+        if !file.flags().write {
+            return SyscallResult::Error(EBADF_VALUE);
+        }
+        let mut staging = alloc::vec![0u8; TTY_WRITE_MAX_INLINE];
+        let mut total: i64 = 0;
         for i in 0..iovcnt as u64 {
             let ent_ptr = iov_ptr.wrapping_add(i * IOVEC_BYTES);
             let mut ent_bytes = [0u8; IOVEC_BYTES as usize];
             if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut ent_bytes, ent_ptr) {
+                if total > 0 {
+                    return SyscallResult::Return(total);
+                }
                 return SyscallResult::error_from(errno);
             }
             let base = u64::from_le_bytes(ent_bytes[0..8].try_into().unwrap());
@@ -325,29 +332,63 @@ pub(super) async fn sys_writev<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
                 continue;
             }
             if len > MAX_RW_COUNT {
+                if total > 0 {
+                    return SyscallResult::Return(total);
+                }
                 return SyscallResult::Error(EINVAL_VALUE);
             }
 
-            let old_len = combined.len();
-            let len = len as usize;
-            let Some(new_len) = old_len.checked_add(len) else {
-                return SyscallResult::Error(EINVAL_VALUE);
-            };
-            if new_len as u64 > MAX_RW_COUNT {
-                return SyscallResult::Error(EINVAL_VALUE);
-            }
-            combined.resize(new_len, 0);
-            if let Err(errno) =
-                bootstrap_copy_from_user(&ctx.aspace, &mut combined[old_len..], base)
-            {
-                return SyscallResult::error_from(errno);
+            let mut copied = 0u64;
+            while copied < len {
+                let remaining = len - copied;
+                let allowed = MAX_RW_COUNT.saturating_sub(total as u64);
+                if allowed == 0 {
+                    return SyscallResult::Return(total);
+                }
+                let chunk = core::cmp::min(
+                    core::cmp::min(remaining, allowed) as usize,
+                    TTY_WRITE_MAX_INLINE,
+                );
+                let src = match base.checked_add(copied) {
+                    Some(src) => src,
+                    None => {
+                        if total > 0 {
+                            return SyscallResult::Return(total);
+                        }
+                        return SyscallResult::Error(EINVAL_VALUE);
+                    }
+                };
+                if let Err(errno) =
+                    bootstrap_copy_from_user(&ctx.aspace, &mut staging[..chunk], src)
+                {
+                    if total > 0 {
+                        return SyscallResult::Return(total);
+                    }
+                    return SyscallResult::error_from(errno);
+                }
+                match sys_write_kernel_bytes_to_file(&file, &staging[..chunk], ctx).await {
+                    SyscallResult::Return(n) => {
+                        if n <= 0 {
+                            return SyscallResult::Return(total);
+                        }
+                        total += n;
+                        copied += n as u64;
+                        if (n as usize) < chunk {
+                            return SyscallResult::Return(total);
+                        }
+                    }
+                    SyscallResult::Error(e) => {
+                        if total > 0 {
+                            return SyscallResult::Return(total);
+                        }
+                        return SyscallResult::Error(e);
+                    }
+                    other => return other,
+                }
             }
         }
 
-        if !file.flags().write {
-            return SyscallResult::Error(EBADF_VALUE);
-        }
-        return sys_write_kernel_bytes_to_file(&file, &combined, ctx).await;
+        return SyscallResult::Return(total);
     }
 
     let mut total: i64 = 0;

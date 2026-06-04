@@ -34,6 +34,7 @@ const E_INVAL: i32 = 22;
 const E_ACCES: i32 = 13;
 const E_NAMETOOLONG: i32 = 36;
 const E_MFILE: i32 = 24;
+const E_ISDIR: i32 = 21;
 
 fn ensure_zero_frame_claimed() {
     match page_allocator::claim_zero_frame() {
@@ -299,6 +300,57 @@ fn dispatch_openat_o_directory_directory_returns_fd() {
         SyscallResult::Return(fd) => assert!(proc_cap.fd(fd as u32).is_some()),
         other => panic!("openat O_DIRECTORY on directory: {other:?}"),
     }
+    drop(path);
+}
+
+/// Linux rejects write-capable opens of directory targets with `EISDIR`.
+#[test]
+fn dispatch_openat_rdwr_directory_returns_neg_eisdir() {
+    let _setup = fd_ops_setup();
+    let (root_dentry, _tmpfs) = build_tmpfs_root();
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let path = nul_terminate(b"/");
+    let req = SyscallRequest::new(
+        NR_OPENAT,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            O_RDWR as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Error(E_ISDIR));
+    drop(path);
+}
+
+/// Existing directory targets are not creatable regular files, even if the
+/// requested access mode is read-only.
+#[test]
+fn dispatch_openat_creat_directory_returns_neg_eisdir() {
+    let _setup = fd_ops_setup();
+    let (root_dentry, _tmpfs) = build_tmpfs_root();
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let path = nul_terminate(b"/");
+    let req = SyscallRequest::new(
+        NR_OPENAT,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            (O_RDONLY | O_CREAT) as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Error(E_ISDIR));
     drop(path);
 }
 

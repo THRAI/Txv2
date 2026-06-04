@@ -19,33 +19,174 @@ keep source order. Network rows are appended from
 | Item | Value | Note |
 | --- | ---: | --- |
 | whitelist cases | 651 | 609 historical non-network rows + 42 RV network positive-score rows |
-| stitched score | `4366/5200` | local documented score summed from the table, not a single official full-run result |
+| stitched score | `4376/5200` | local documented score summed from the table, not a single official full-run result |
 | LA recorded cases | 651 | all rows have `LA Status` / `LA Note`; LA timeout/stall rows may not have a score denominator |
-| LA recorded score | `4285/5136` | all LA rows with a score summed from the table |
-| LA submit whitelist cases | 629 | 593 LA-filtered non-network rows + 36 LA network positive-score rows |
-| LA submit stitched score | `4277/5094` | LA submit-eligible rows summed from the table |
-| active submit runner cases | RV musl 409 / RV glibc 407 / LA musl 397 / LA glibc 396 | glibc lanes apply the 2026-06-03 hang/unimplemented-lock exclusions below |
+| LA recorded score | `4295/5136` | all LA rows with a score summed from the table |
+| LA submit whitelist cases | LA musl 450 / LA glibc 449 | active non-network runner after 2026-06-04 full-pass submit-tail promotion; network rows are audit-only for LA |
+| LA submit stitched score | pending clean rerun | previous `4277/5094` included network rows and is no longer the current LA submit shape |
+| active submit runner cases | RV musl 495 / RV glibc 467 / LA musl 451 / LA glibc 451 | after 2026-06-04 full-pass tail promotion; excludes official-unscored legacy rows and slow/unimplemented lock rows; LA no longer appends network rows |
 | p0 source | excluded | p0 overlaps module batches |
 | local command | `make oscomp-local-rv64-ltp-batch LTP_BATCH=submit` | mirrors the no-`tx.oscomp.groups` submit path |
 | local LA command | `make oscomp-local-la64-ltp-batch LTP_BATCH=submit` | uses `tools/ltp-batches.py --arch la64` for the local count |
 | local glibc-only command | `make oscomp-local-rv64-ltp-batch LTP_BATCH=submit-glibc` / `make oscomp-local-la64-ltp-batch LTP_BATCH=submit-glibc` | short batch name avoids qemu cmdline truncation from explicit hundreds-case filters |
 | latest local LA submit run | `3879/4302` | 2026-05-30 before `truncate03_64` exclusion; 362 active cases completed with `#### OS COMP TEST GROUP END ltp-musl` |
 
+## 2026-06-03 Submit-Tail Promotion
+
+The active submit runner still stops the historical table at `io_uring01` to
+avoid broad untriaged tail sweeps. It now appends the shared
+`crates/tx-kernel/src/init/exec.rs::LTP_SUBMIT_PROMOTED_TAIL_CASES`, so the
+same promoted non-network subset is active for both RV and LA. This pass
+verified the subset on LA64 musl/glibc because the recent blocker was on LA.
+
+Focused LA64 results:
+
+- LA musl: promoted-candidate run was `92/92`; the active promoted subset is
+  `91/91` after dropping `write01`.
+- LA glibc: promoted-candidate run was `91/92`; `write01` failed with
+  `EINVAL`, so the active promoted subset is `91/91`.
+- Logs:
+  `target/oscomp/ltp-extra-core-a-la-musl-20260603.txt`,
+  `target/oscomp/ltp-extra-core-a2-la-musl-20260603.txt`,
+  `target/oscomp/ltp-extra-core-b1-la-musl-20260603.txt`,
+  `target/oscomp/ltp-extra-core-b2-la-musl-20260603.txt`,
+  `target/oscomp/ltp-extra-core-c-la-musl-20260603.txt`,
+  `target/oscomp/ltp-extra-core-g1-la-glibc-20260603.txt`,
+  `target/oscomp/ltp-extra-core-g2-la-glibc-20260603.txt`,
+  `target/oscomp/ltp-extra-core-g3-la-glibc-20260603.txt`,
+  `target/oscomp/ltp-extra-core-g4-la-glibc-20260603.txt`, and
+  `target/oscomp/ltp-extra-core-g5-la-glibc-20260603.txt`.
+
+Promoted modules: cred, event, fd-io, heavy, time, vfs, and vm. The only
+focused candidate intentionally left out is `write01`, because it is not stable
+across both libc lanes.
+
+Tool count after the shared promotion:
+
+- RV musl submit: 495 cases
+- RV glibc submit-glibc: 467 cases
+- LA musl submit: 450 cases
+- LA glibc submit-glibc: 449 cases
+
+## 2026-06-03 High-Score Focused Fixes
+
+Focused reruns improved two existing whitelist cases without changing the
+active case count:
+
+- `open11`: `23/28` -> `28/28` on RV/LA musl/glibc after making write-capable
+  opens of directory targets, and `O_CREAT` against existing directories,
+  return `EISDIR`.
+- `semop02`: `19/26` -> `21/26` on RV/LA musl/glibc after making
+  `nsops > SEMOPM` return `E2BIG` instead of `EINVAL`.
+
+Logs:
+`target/oscomp/ltp-highfix-open11-semop02-la-musl-20260603.txt`,
+`target/oscomp/ltp-highfix-open11-la-musl-20260603.txt`,
+`target/oscomp/ltp-highfix-open11-semop02-la-glibc-20260603.txt`,
+`target/oscomp/ltp-highfix-open11-semop02-rv-musl-20260603.txt`, and
+`target/oscomp/ltp-highfix-open11-semop02-rv-glibc-20260603.txt`.
+
+## 2026-06-04 Full-Pass Local Additions
+
+The scoring rule for this sweep is stricter than the earlier local whitelist:
+no `LTP_MAX_RUNTIME`, no synthesized Summary blocks, and only full-pass rows
+reported by the judge are promoted. Cases that print old-format `TPASS` but
+score as `0/0` stay out.
+
+Promoted into `LTP_SUBMIT_PROMOTED_TAIL_CASES`:
+
+`getpriority01`, `getpriority02`, `nice01`, `nice02`, `nice03`, `nice04`,
+`prctl01`, `prctl09`, `sched_get_priority_max01`,
+`sched_get_priority_max02`, `sched_get_priority_min01`,
+`sched_get_priority_min02`, `sched_rr_get_interval01`, `setpriority02`,
+`wait402`, `wait02`, `wait01`, `shmat04`, `sendfile08_64`, `sendfile08`,
+`sendfile06_64`, `sendfile06`, `sendfile05_64`, `sendfile05`, `semop04`,
+`semctl02`, `pidfd_open01`, `personality02`, `msgrcv08`, `msgget01`,
+`mknod09`, `kill06`, `getsid02`, `getsid01`, `getppid02`, `getppid01`,
+`fork08`, `fork07`, `fork03`, `exit02`, `setrlimit04`, `setrlimit05`,
+`clone07`, `clone06`, `clone05`, and `clone03`.
+
+This adds 46 fully-scored case rows to the active submit tail. The promoted
+subset is `83/83` on both RV and LA musl focused local runs. The RV glibc
+focused candidate run reports `80/89`, but the 2026-06-04 RV full submit rerun
+timed out at glibc `exit_group01` after the thread-exit check and ended with
+`trap-action-terminate`; after excluding that row, the promoted glibc-safe
+subset is `79/79` pending the next clean full rerun. The failing RV glibc rows
+were `execvp01`, `execve06`, `execve01`, `execv01`, `execlp01`, `execle01`,
+and `execl01`, so those musl-passing rows are intentionally not promoted yet.
+
+Not promoted from the same sweep:
+
+- `prctl02`, `prctl08`, and `sched_rr_get_interval03`: partial rows.
+- `sched_setparam*`, `sched_getparam*`, `sched_getscheduler*`, and
+  `sched_setscheduler04`: RV can pass several of these, but LA has `TCONF` or
+  failure rows in the focused rerun.
+- old-format `0/0` rows such as `writev*`, `pipe04/05/09`, `msync*`,
+  `mremap*`, `kill07-12`, and `getresuid/getresgid*`.
+- `exit_group01`: passes focused/musl runs, but the 2026-06-04 RV full submit
+  rerun timed out in the glibc thread-exit check and ended with
+  `trap-action-terminate`; not promoted until the full glibc path exits cleanly.
+- slow or LA-excluded rows such as `fcntl36*`, `fcntl34*`, `futex_wait03`,
+  `semop05`, `chmod05`, and `mknod05`.
+
+Logs:
+
+`target/oscomp/ltp-sched-prctl-a-rv-musl-noI-20260604.txt`,
+`target/oscomp/ltp-sched-prctl-a-la-musl-noI-20260603.txt`,
+`target/oscomp/ltp-sched-extra-a-rv-musl-noI-20260604.txt`,
+`target/oscomp/ltp-sched-extra-a-la-musl-noI-20260604.txt`,
+`target/oscomp/ltp-tail-onepoint-a-rv-musl-noI-20260604.txt`,
+`target/oscomp/ltp-tail-onepoint-a-la-musl-noI-20260604.txt`,
+`target/oscomp/ltp-tail-onepoint-b-rv-musl-noI-20260604.txt`,
+`target/oscomp/ltp-tail-onepoint-b-la-musl-noI-20260604.txt`,
+`target/oscomp/ltp-tail-onepoint-c-rv-musl-noI-20260604.txt`,
+`target/oscomp/ltp-tail-onepoint-c-la-musl-noI-20260604.txt`,
+`target/oscomp/ltp-tail-onepoint-d-rv-musl-noI-20260604.txt`,
+`target/oscomp/ltp-tail-onepoint-d-la-musl-noI-20260604.txt`,
+`target/oscomp/ltp-tail-onepoint-e-rv-musl-noI-20260604.txt`,
+`target/oscomp/ltp-tail-onepoint-e-la-musl-noI-20260604.txt`, and
+`target/oscomp/os_serial_out_rv.txt` for the RV glibc focused candidate run.
+
+## Official-Unscored Legacy Cases
+
+These rows remain in the audit table because they were part of the historical
+local whitelist, but the active submit runner now filters them through
+`LTP_SUBMIT_UNSCORED_LEGACY_CASES`. They depended on local Summary synthesis or
+legacy local judge fill-in, so they should not be run for official-score
+comparisons.
+
+Excluded from active RV/LA submit:
+
+`prot_hsymlinks`, `clone02`, `fallocate01`, `fallocate02`, `fchownat01`,
+`fcntl07`, `fcntl07_64`, `fcntl09`, `fcntl09_64`, `fcntl10`, `fcntl10_64`,
+`fstatat01`, `get_robust_list01`, `kill02`, `lchown01`, `lchown02`,
+`linkat01`, `mincore01`, `mkdirat01`, `mknod06`, `mknodat01`, `mlockall01`,
+`mlockall03`, `mremap05`, `msync03`, `munmap03`, `open12`, `open13`,
+`openat02`, `readlink01`, `rt_sigaction01`, `rt_sigaction02`,
+`rt_sigaction03`, `rt_sigprocmask02`, `sched_getattr02`, `sched_setattr01`,
+`setresgid01`, `setrlimit01`, `setsid01`, `signalfd01`, `symlink03`,
+`symlinkat01`, `sysconf01`, `ulimit01`.
+
 ## LA Submit Delta
 
 LA keeps the shared `LTP_SUBMIT_CASES` order but filters out cases listed in
-`crates/tx-kernel/src/init/exec.rs::LTP_LA_SUBMIT_EXCLUDED_CASES`. The immediate
-blockers observed locally are `gettid02`, `mq_notify01`, and `truncate03_64`:
-the first two can print partial progress and then fail to return to the runner;
-`truncate03_64` can trigger a kernel panic during the LA glibc default run after
-long submit accumulation. The rest of this list is the current zero-score
-`LA Status = fail` set from the table below.
+`crates/tx-kernel/src/init/exec.rs::LTP_LA_SUBMIT_EXCLUDED_CASES`, which now
+starts with the shared official-unscored legacy rows above. The immediate
+LA-only blockers observed locally include `gettid02` and `mq_notify01`, which
+can print partial progress and then fail to return to the runner. The rest of
+this list is the current zero-score `LA Status = fail` set from the table below.
 
-Excluded from LA submit:
+Additional LA-only non-network exclusions:
 
-`gettid02`, `fcntl36_64`, `fcntl36`, `creat08`, `open10`, `sched_setattr01`,
-`futex_wait03`, `pselect01`, `pselect01_64`, `fcntl34`, `fcntl34_64`,
-`mq_notify01`, `semop05`, `chmod05`, `mknod05`, `truncate03_64`.
+`gettid02`, `fcntl36_64`, `fcntl36`, `creat08`, `open10`, `futex_wait03`,
+`pselect01`, `pselect01_64`, `fcntl34`, `fcntl34_64`, `mq_notify01`,
+`semop05`, `chmod05`, `mknod05`.
+
+`readv01` and `truncate03_64` were temporarily excluded after earlier long-run
+`memory allocation of 2097152 bytes failed` panics. After the tmpfs unlink/drop
+cleanup, the interrupted 2026-06-04 rerun reached well past `readv01`,
+`truncate03_64`, and `stat03_64` without reproducing the 2 MiB allocation panic,
+so both rows are back in active LA submit pending a clean full rerun.
 
 Network submit exclusions:
 
@@ -53,21 +194,24 @@ Network submit exclusions:
   positive focused scores, but the 2026-06-03 RV whitelist run spent several
   minutes in them and then stalled at `setsockopt06`, so they are kept only as
   audit rows below.
-- RV submit-glibc additionally excludes `fcntl36_64` and `fcntl36`.
+- RV active submit now excludes `fcntl36_64` and `fcntl36` in both libc lanes.
   Txv2 does not yet implement full POSIX/OFD record-lock ownership and
   `F_SETLKW`/`F_OFD_SETLKW` blocking-wakeup semantics; the 2026-06-03 RV
   glibc runs stopped inside the `fcntl36*` OFD/POSIX synchronization subtests
-  and did not return to the LTP runner. The musl lane still keeps the
-  historical rows for audit, but glibc submit treats these as not implemented.
-- LA active submit excludes `bind04`, `bind05`, `bind06`, `accept02`,
-  `getsockopt02`, and `setsockopt06`. `getsockopt02` still passes as an LA
-  single glibc case, but the combined LA whitelist run reaches it in
-  `ltp-glibc` after `ltp-musl` and repeatedly gets `EADDRINUSE` before
-  `trap-action-terminate`.
-- LA submit-glibc additionally excludes `bind03`. The 2026-06-03 LA full
-  whitelist run completed `ltp-musl`, reached `ltp-glibc/bind03`, reported
-  `address is in use` from 10s through 120s, then hit
-  `trap-action-terminate`. The musl lane still keeps this case.
+  and did not return to the LTP runner. The musl lane could continue after
+  timeout, but the cases are slow, so active submit keeps them as audit rows
+  until the lock wait path is fixed.
+- RV submit-glibc now runs only the early network prefix through `sendto03`.
+  The later `recv*`, `sendmmsg*`, `recvmmsg01`, `bind*`, `connect*`,
+  `accept*`, `socketpair*`, and later `setsockopt*` rows stay as
+  musl/focused audit rows while the network stack work is still in progress.
+- LA active submit and submit-glibc no longer append any network rows. The LA
+  network rows stay visible in the table as audit/focused-sweep data only while
+  the socket/network stack is still moving.
+- Earlier RV/LA combined glibc runs reproduced `getsockopt02`/`bind03`
+  port-reuse hangs (`EADDRINUSE` / `address is in use`). Keep those rows
+  visible in the table, but do not use them in LA submit until the socket
+  close/port-release state leak is fixed.
 - `setsockopt05` is removed from the shared active submit whitelist. Focused
   runs can pass, but repeated LA glibc full-whitelist runs on 2026-06-03 panic
   inside this case with `memory allocation of 2097152 bytes failed`
@@ -80,10 +224,10 @@ Network submit exclusions:
 | --- | ---: | ---: |
 | aio | 1 | `1/2` |
 | cred | 39 | `125/155` |
-| event | 43 | `439/493` |
+| event | 43 | `441/493` |
 | fd-io | 151 | `828/1015` |
-| heavy | 11 | `18/142` |
-| ipc | 42 | `244/322` |
+| heavy | 11 | `19/142` |
+| ipc | 42 | `246/322` |
 | mount | 2 | `4/7` |
 | network | 42 | `211/215` |
 | process | 64 | `311/380` |
@@ -91,9 +235,9 @@ Network submit exclusions:
 | signal | 22 | `561/570` |
 | smoke | 20 | `131/158` |
 | time | 35 | `284/304` |
-| vfs | 114 | `1023/1196` |
+| vfs | 114 | `1028/1196` |
 | vm | 48 | `113/162` |
-| total | 651 | `4366/5200` |
+| total | 651 | `4376/5200` |
 
 ## Cases
 
@@ -124,9 +268,9 @@ Network submit exclusions:
 | `name_to_handle_at01` | vfs | vfs | pass | `27/27` | pass | LA 27/27 |
 | `mq_timedreceive01` | ipc | ipc | partial | `24/30` | partial | LA 24/30; TFAIL: mq_timedreceive() failed unexpectedly, expected EINVAL: EAGAIN/EWOULDBLOCK (11) |
 | `chmod01` | vfs | vfs | partial | `24/32` | partial | LA 16/32; TFAIL: stat(testfile) mode=0644 |
-| `open11` | vfs | vfs | partial | `23/28` | partial | LA 23/28; TFAIL: open directory O_RDWR succeeded |
+| `open11` | vfs | vfs | pass | `28/28` | pass | LA 28/28; focused RV/LA musl/glibc rerun passes after directory `EISDIR` handling |
 | `linkat01` | vfs | vfs | pass | `22/22` | pass | LA 22/22 |
-| `semop02` | ipc | ipc | partial | `19/26` | partial | LA 19/26; TFAIL: semop failed unexpectedly; expected: E2BIG: EINVAL (22) |
+| `semop02` | ipc | ipc | partial | `21/26` | partial | LA 21/26; `nsops > SEMOPM` now returns E2BIG; two variants still succeed unexpectedly |
 | `ppoll01` | event | event | partial | `18/20` | partial | LA 18/20; TFAIL: ret: 0, exp: -1, ret_errno: SUCCESS (0), exp_errno: EINTR (4) |
 | `llseek03` | fd-io | fd-io | pass | `18/18` | pass | LA 18/18 |
 | `personality01` | process | process | pass | `18/18` | pass | LA 18/18 |
@@ -152,7 +296,7 @@ Network submit exclusions:
 | `msgrcv07` | ipc | ipc | partial | `11/13` | partial | LA 11/13; TFAIL: MSG_EXCEPT didn't get MSGTYPE1 message |
 | `gettid02` | process | process | pass | `11/11` | fail | LA 0/1; TBROK: Test killed by SIGSEGV! |
 | `clock_nanosleep01` | time | time | partial | `11/14` | partial | LA 11/14; TFAIL: returned 0, expected -1, expected errno: EFAULT (14): SUCCESS (0) |
-| `readv01` | fd-io | fd-io | pass | `10/10` | pass | LA 10/10 |
+| `readv01` | fd-io | fd-io | pass | `10/10` | pass | LA 10/10; re-enabled for LA glibc after the 2026-06-04 interrupted rerun passed the previous 2 MiB allocation-panic point |
 | `clock_gettime02` | time | time | pass | `10/10` | pass | LA 10/10 |
 | `link04` | vfs | vfs | partial | `10/14` | partial | LA 10/14; TFAIL: link(<invalid address>, <nefile>) Failed expected errno: 14: ENAMETOOLONG (36) |
 | `readlinkat01` | vfs | vfs | partial | `10/12` | partial | LA 10/12; TFAIL: readlinkat(5, , , 1024) failed: EINVAL (22) |
@@ -184,8 +328,8 @@ Network submit exclusions:
 | `epoll_wait02` | event | event | pass | `7/7` | pass | LA 7/7 |
 | `futex_wait05` | event | event | pass | `7/7` | pass | LA 7/7 |
 | `poll02` | event | event | pass | `7/7` | pass | LA 7/7 |
-| `fcntl36_64` | fd-io | fd-io | pass | `7/7` | fail | Not implemented for glibc submit: POSIX/OFD record-lock ownership and blocking wait semantics are incomplete. LA 0/1; TBROK: Test killed by SIGSEGV! RV musl keeps the historical audit row. |
-| `fcntl36` | fd-io | fd-io | pass | `7/7` | fail | Not implemented for glibc submit: POSIX/OFD record-lock ownership and blocking wait semantics are incomplete. LA 0/1; TBROK: Test killed by SIGSEGV! RV glibc single run timed out on 2026-06-03. |
+| `fcntl36_64` | fd-io | fd-io | pass | `7/7` | fail | Active submit excludes this slow lock-wait case in both libc lanes for now. POSIX/OFD record-lock ownership and blocking wait semantics are incomplete; LA 0/1; TBROK: Test killed by SIGSEGV! |
+| `fcntl36` | fd-io | fd-io | pass | `7/7` | fail | Active submit excludes this slow lock-wait case in both libc lanes for now. POSIX/OFD record-lock ownership and blocking wait semantics are incomplete; LA 0/1; RV glibc single run timed out on 2026-06-03. |
 | `pipe2_01` | fd-io | fd-io | pass | `7/7` | partial | LA 4/5; TBROK: pipe2({-1,-1}) failed with flag(16384): EINVAL (22) |
 | `pwritev02` | fd-io | fd-io | pass | `7/7` | pass | LA 7/7 |
 | `pwritev02_64` | fd-io | fd-io | pass | `7/7` | pass | LA 7/7 |
@@ -260,7 +404,7 @@ Network submit exclusions:
 | `mknodat01` | vfs | vfs | pass | `5/5` | pass | LA 5/5 |
 | `statx03` | vfs | vfs | partial | `5/7` | partial | LA 5/7; TFAIL: statx() should fail with EFAULT: ENAMETOOLONG (36) |
 | `truncate03` | vfs | vfs | partial | `5/8` | partial | LA 5/8; TFAIL: truncate(tc->pathname, tc->length) succeeded |
-| `truncate03_64` | vfs | vfs | partial | `5/8` | excluded | LA glibc default run panics here after long submit accumulation; single-case score was LA 5/8 |
+| `truncate03_64` | vfs | vfs | partial | `5/8` | partial | LA 5/8; re-enabled after the 2026-06-04 interrupted rerun passed the previous long-run allocation-panic point |
 | `unlink07` | vfs | vfs | partial | `5/6` | partial | LA 5/6; TFAIL: invalid address expected EFAULT: ENAMETOOLONG (36) |
 | `setegid01` | cred | cred | pass | `4/4` | pass | LA 4/4 |
 | `setresuid02` | cred | cred | pass | `4/4` | pass | LA 4/4 |
@@ -493,7 +637,7 @@ Network submit exclusions:
 | `setuid01` | cred | cred | pass | `1/1` | pass | LA 1/1 |
 | `epoll_ctl04` | event | event | pass | `1/1` | pass | LA 1/1 |
 | `epoll_ctl05` | event | event | pass | `1/1` | pass | LA 1/1 |
-| `futex_cmp_requeue02` | event | event | partial | `1/3` | partial | LA 1/3; TFAIL: futex_cmp_requeue() succeeded unexpectedly |
+| `futex_cmp_requeue02` | event | event | pass | `3/3` | pass | LA 3/3 in 2026-06-03 musl/glibc focused submit-tail rerun |
 | `futex_wait02` | event | event | pass | `1/1` | pass | LA 1/1 |
 | `futex_wait03` | event | event | pass | `1/1` | fail | LA 0/1; TBROK: Test killed by SIGSEGV! |
 | `futex_wait04` | event | event | pass | `1/1` | pass | LA 1/1 |
@@ -554,7 +698,7 @@ Network submit exclusions:
 | `sendfile06_64` | fd-io | fd-io | pass | `1/1` | pass | LA 1/1 |
 | `sendfile08` | fd-io | fd-io | pass | `1/1` | pass | LA 1/1 |
 | `sendfile08_64` | fd-io | fd-io | pass | `1/1` | pass | LA 1/1 |
-| `write01` | fd-io | fd-io | pass | `1/1` | pass | LA 1/1 |
+| `write01` | fd-io | fd-io | audit-only | `1/1` | partial | Not active submit: LA musl passed, but 2026-06-03 LA glibc focused submit-tail rerun failed `0/1` with `EINVAL` |
 | `write03` | fd-io | fd-io | pass | `1/1` | pass | LA 1/1 |
 | `writev02` | fd-io | fd-io | pass | `1/1` | pass | LA 1/1 |
 | `writev05` | fd-io | fd-io | pass | `1/1` | pass | LA 1/1 |
@@ -566,7 +710,7 @@ Network submit exclusions:
 | `newuname01` | heavy | heavy | pass | `1/1` | pass | LA 1/1 |
 | `ptrace05` | heavy | heavy | partial | `1/124` | partial | LA 1/124; TFAIL: ptrace05.c:96: Failed to ptrace(PTRACE_TRACEME, ...) properly: errno=ENOSYS(38): Function not implemented |
 | `uname02` | heavy | heavy | pass | `1/1` | pass | LA 1/1 |
-| `uname04` | heavy | heavy | partial | `1/2` | partial | LA 1/2; TBROK: persona(131072) failed: ENOSYS (38) |
+| `uname04` | heavy | heavy | pass | `2/2` | pass | LA 2/2 in 2026-06-03 musl/glibc focused submit-tail rerun |
 | `msgctl02` | ipc | ipc | partial | `1/2` | partial | LA 1/2; TFAIL: msg_qbytes = 16384, expected 16383 |
 | `msgget01` | ipc | ipc | pass | `1/1` | pass | LA 1/1 |
 | `msgrcv08` | ipc | ipc | pass | `1/1` | pass | LA 1/1 |
@@ -584,16 +728,16 @@ Network submit exclusions:
 | `clone06` | process | process | pass | `1/1` | pass | LA 1/1 |
 | `clone07` | process | process | pass | `1/1` | pass | LA 1/1 |
 | `clone302` | process | process | partial | `1/2` | partial | LA 1/2; TCONF: syscall(435) __NR_clone3 not supported on your arch |
-| `execl01` | process | process | pass | `1/1` | pass | LA 1/1 |
-| `execle01` | process | process | pass | `1/1` | pass | LA 1/1 |
-| `execlp01` | process | process | pass | `1/1` | pass | LA 1/1 |
-| `execv01` | process | process | pass | `1/1` | pass | LA 1/1 |
-| `execve01` | process | process | pass | `1/1` | pass | LA 1/1 |
-| `execve06` | process | process | pass | `1/1` | pass | LA 1/1 |
-| `execvp01` | process | process | pass | `1/1` | pass | LA 1/1 |
-| `exit01` | process | process | pass | `1/1` | pass | LA 1/1 |
+| `execl01` | process | process | audit-only | `1/1` | partial | Musl focused runs pass, but RV glibc candidate sweep failed; not promoted on 2026-06-04 |
+| `execle01` | process | process | audit-only | `1/1` | partial | Musl focused runs pass, but RV glibc candidate sweep failed; not promoted on 2026-06-04 |
+| `execlp01` | process | process | audit-only | `1/1` | partial | Musl focused runs pass, but RV glibc candidate sweep failed; not promoted on 2026-06-04 |
+| `execv01` | process | process | audit-only | `1/1` | partial | Musl focused runs pass, but RV glibc candidate sweep failed; not promoted on 2026-06-04 |
+| `execve01` | process | process | audit-only | `1/1` | partial | Musl focused runs pass, but RV glibc candidate sweep failed; not promoted on 2026-06-04 |
+| `execve06` | process | process | audit-only | `1/1` | partial | Musl focused runs pass, but RV glibc candidate sweep failed; not promoted on 2026-06-04 |
+| `execvp01` | process | process | audit-only | `1/1` | partial | Musl focused runs pass, but RV glibc candidate sweep failed; not promoted on 2026-06-04 |
+| `exit01` | process | process | audit-only | `1/1` | partial | Old-format row scores as `0/0` in focused judge output; not promoted |
 | `exit02` | process | process | pass | `1/1` | pass | LA 1/1 |
-| `exit_group01` | process | process | pass | `1/1` | pass | LA 1/1 |
+| `exit_group01` | process | process | audit-only | `1/1` | audit-only | Focused/musl runs pass, but 2026-06-04 RV full submit timed out at glibc `exit_group01` and ended with `trap-action-terminate`; not active submit |
 | `fork03` | process | process | pass | `1/1` | pass | LA 1/1 |
 | `fork04` | process | process | partial | `1/2` | partial | LA 1/2; TBROK: tst_checkpoint_wait(0, 10000) failed: ETIMEDOUT (110) |
 | `fork07` | process | process | pass | `1/1` | pass | LA 1/1 |
@@ -713,7 +857,7 @@ Network submit exclusions:
 | `listen01` | network | socket | pass | `3/3` | pass | LA 3/3 |
 | `getsockname01` | network | socket | pass | `6/6` | pass | LA 6/6 |
 | `getsockopt01` | network | socket | pass | `9/9` | pass | LA 9/9 |
-| `getsockopt02` | network | socket | pass | `1/1` | pass | LA 1/1; LA active submit excludes the glibc combined-run path after 2026-06-03 `EADDRINUSE`/`trap-action-terminate` |
+| `getsockopt02` | network | socket | pass | `1/1` | pass | LA 1/1; RV/LA glibc submit excludes the combined-run path after 2026-06-03 `EADDRINUSE`/`trap-action-terminate`, while the musl/focused paths keep the audit score |
 | `setsockopt01` | network | socket | pass | `8/8` | pass | LA 8/8 |
 | `send01` | network | socket | pass | `6/6` | pass | LA 6/6 |
 | `send02` | network | socket | pass | `4/4` | pass | LA 4/4 |
@@ -730,7 +874,7 @@ Network submit exclusions:
 | `recvmmsg01` | network | socket | partial | `1/2` | partial | LA 1/2; musl wrapper SIGSEGV after first EBADF subcase |
 | `bind01` | network | socket | pass | `7/7` | pass | LA 7/7 |
 | `bind02` | network | socket | pass | `1/1` | pass | LA 1/1 |
-| `bind03` | network | socket | pass | `3/3` | pass | LA 3/3; LA submit-glibc excludes after the 2026-06-03 full whitelist run hit `EADDRINUSE` through 120s and `trap-action-terminate`; LA musl keeps it. |
+| `bind03` | network | socket | pass | `3/3` | pass | LA 3/3; RV/LA submit-glibc exclude after 2026-06-03 combined runs hit `EADDRINUSE`/`address is in use`; musl/focused paths keep the audit score. |
 | `bind04` | network | socket | pass | `16/16` | timeout/stall | LA timeout/stall; broad b4 run stalled after first TPASS |
 | `bind05` | network | socket | pass | `14/14` | timeout/stall | LA timeout/stall; single run hit 120s timeout after first TPASS/no summary |
 | `bind06` | network | socket | pass | `1/1` | timeout/stall | RV active submit excludes this long case after the 2026-06-03 whitelist run; LA timeout/stall; single run hit 600s timeout before summary |

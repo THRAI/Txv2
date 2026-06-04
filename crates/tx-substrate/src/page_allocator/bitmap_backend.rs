@@ -396,6 +396,22 @@ impl<'a> BitmapPageAllocator<'a> {
             }
         }
     }
+
+    fn max_contiguous_free_run(&self) -> usize {
+        let mut best = 0usize;
+        let mut current = 0usize;
+        for index in 0..self.total {
+            let ppn = self.ppn_from_dense_index(index);
+            let meta = self.meta(ppn);
+            if !meta.is_reserved() && meta.state() == 0 && self.bit_is_set(ppn) {
+                current += 1;
+                best = best.max(current);
+            } else {
+                current = 0;
+            }
+        }
+        best
+    }
 }
 
 impl PageAllocator for BitmapPageAllocator<'_> {
@@ -438,6 +454,7 @@ impl PageAllocator for BitmapPageAllocator<'_> {
             base_ppn: self.base_ppn,
             total_count: self.total_count(),
             free_count: self.free_count(),
+            max_contiguous_free_run: self.max_contiguous_free_run(),
             scan_hint: self.hint.load(Ordering::Acquire),
         }
     }

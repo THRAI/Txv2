@@ -58,7 +58,7 @@ Runs are split into explicit 5-case groups with `make oscomp-local-rv64-ltp-musl
 | `execvp01` | 1/1 | pass |  |
 | `exit01` | 1/1 | pass |  |
 | `exit02` | 1/1 | pass |  |
-| `exit_group01` | 1/1 | pass |  |
+| `exit_group01` | 1/1 | audit-only | Focused/musl runs pass, but 2026-06-04 RV full submit timed out at glibc `exit_group01` and ended with `trap-action-terminate`; keep out of submit until full glibc exits cleanly |
 | `fork01` | 2/2 | pass |  |
 | `fork03` | 1/1 | pass |  |
 | `fork04` | 1/2 | partial | TBROK: tst_checkpoint_wait(0, 10000) failed: ETIMEDOUT (110) |

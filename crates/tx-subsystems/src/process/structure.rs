@@ -461,6 +461,17 @@ impl ProcessIdentity {
             .unwrap_or([b'?', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
     }
 
+    /// Replace the process short name used by `/proc/<pid>/stat`.
+    /// Returns `false` if the process is already zombie.
+    pub fn set_comm(&self, comm: [u8; 16]) -> bool {
+        let payload = self.payload.lock();
+        let Some(payload) = payload.as_ref() else {
+            return false;
+        };
+        *payload._comm.lock() = comm;
+        true
+    }
+
     /// Process command-line (for `/proc/<pid>/cmdline`). Returns
     /// `None` for zombies (no payload) or when no cmdline was set.
     pub fn cmdline(&self) -> Option<alloc::vec::Vec<u8>> {

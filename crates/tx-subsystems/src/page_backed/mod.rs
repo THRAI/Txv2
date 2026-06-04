@@ -931,10 +931,7 @@ fn cached_frame_from_frame(frame: Frame) -> Result<CachedFrame, PageCacheError> 
 
 pub fn reserve_frame_with_reclaim(
     policy: ZeroPolicy,
-) -> Result<
-    page_allocator::FrameReservation<'static, BitmapPageAllocator<'static>>,
-    AllocError,
-> {
+) -> Result<page_allocator::FrameReservation<'static, BitmapPageAllocator<'static>>, AllocError> {
     match page_allocator::reserve_frame(policy) {
         Ok(frame) => Ok(frame),
         Err(AllocError::Exhausted) => {

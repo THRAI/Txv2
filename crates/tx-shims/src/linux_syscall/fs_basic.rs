@@ -974,6 +974,8 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
             match unlink_outcome {
                 V3::Done(()) => {
                     dir_dentry.remove_cached_child_by_name(&tmp_name);
+                    let guard = step_engine::guard();
+                    let _ = fs_ops.destroy_inode(target_id, &guard);
                     opened = Some(openfile);
                     break;
                 }
@@ -1038,6 +1040,11 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
         {
             return SyscallResult::Error(ENOTDIR_VALUE);
         }
+        if want_write
+            && openfile.rnode().meta().kind() == tx_subsystems::vfs::structure::InodeKind::Directory
+        {
+            return SyscallResult::Error(EISDIR_VALUE);
+        }
         let _ = ctx.process.set_fd(fd, Some(openfile));
         if want_cloexec {
             ctx.process.set_fd_cloexec(fd, true);
@@ -1096,6 +1103,12 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     let dentry_meta = dentry.rnode().meta();
     if want_directory && dentry_meta.kind() != tx_subsystems::vfs::structure::InodeKind::Directory {
         return SyscallResult::Error(ENOTDIR_VALUE);
+    }
+    if want_create && dentry_meta.kind() == tx_subsystems::vfs::structure::InodeKind::Directory {
+        return SyscallResult::Error(EISDIR_VALUE);
+    }
+    if want_write && dentry_meta.kind() == tx_subsystems::vfs::structure::InodeKind::Directory {
+        return SyscallResult::Error(EISDIR_VALUE);
     }
 
     // Step 2: O_TRUNC. Apply *before* materialising the OpenFile so

@@ -5,9 +5,9 @@ use tx_hal::{
 };
 
 use crate::{
-    dispatch_trap_frame, enter_irq_context, for_each_console_byte_for_sbi, mark_ipi_ack, percpu_tls_for_cpu,
-    remote_sfence_targets_from, trap::classify_rv64_trap, Platform, Rv64TrapFrame,
-    RV64_PERCPU_AREAS,
+    dispatch_trap_frame, enter_irq_context, for_each_console_byte_for_sbi, mark_ipi_ack,
+    percpu_tls_for_cpu, remote_sfence_targets_from, trap::classify_rv64_trap, Platform,
+    Rv64TrapFrame, RV64_PERCPU_AREAS,
 };
 
 static RV64_HAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

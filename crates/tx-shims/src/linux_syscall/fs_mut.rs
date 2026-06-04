@@ -352,6 +352,10 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     match outcome {
         V3::Done(()) => {
             parent_dentry.remove_cached_child_by_name(basename);
+            if !want_rmdir && child_meta.nlinks <= 1 {
+                let guard = step_engine::guard();
+                let _ = fs_ops.destroy_inode(target_id, &guard);
+            }
             SyscallResult::Return(0)
         }
         V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
