@@ -603,6 +603,9 @@ pub struct SctpLevelOptions {
     pub paddr_pathmtu: u32,
     pub paddr_sackdelay: u32,
     pub paddr_flags: u32,
+    /// SCTP_DEFAULT_SEND_PARAM: raw `struct sctp_sndrcvinfo` (32 bytes) used as
+    /// the socket-level default for sends without an explicit sndrcvinfo.
+    pub default_send_param: [u8; 32],
 }
 
 impl SctpLevelOptions {
@@ -766,6 +769,7 @@ impl SocketOptionSet {
                 paddr_pathmtu: 0,
                 paddr_sackdelay: 0,
                 paddr_flags: 0,
+                default_send_param: [0u8; 32],
             },
         }
     }
@@ -838,6 +842,7 @@ impl SocketOptionSet {
                 paddr_pathmtu: 0,
                 paddr_sackdelay: 0,
                 paddr_flags: 0,
+                default_send_param: [0u8; 32],
             },
         }
     }

@@ -73,9 +73,16 @@ socket 上建联(无 accept/child),两端 `sctp_ensure_assoc` + COMM_UP(带 asso
 校验:enable/disable 互斥位对冲突 → EINVAL;`SPP_HB_DEMAND` 需具体关联(assoc_id≠0)
 否则 EINVAL(case 22-25)。
 
-**剩余 1-to-many**:test_sockopt 尾(case 26+ `SCTP_DEFAULT_SEND_PARAM` 默认发送
-参数 TEST #6)、test_connect(peeloff)、assoc_shutdown/abort(SCTP_STATUS
-要反映已拆关联)、sctp_sendrecvmsg。
+**SCTP_DEFAULT_SEND_PARAM(test_sockopt 25→32,2026-06-05):** `SctpLevelOptions`
+加 `default_send_param: [u8;32]`(socket 级 `sctp_sndrcvinfo`)+ get/set(=10),
+非零 assoc_id 校验。socket 级单字段即覆盖 case 26-32(含 set-then-get 的 assoc 级)。
+
+**当前共同 blocker = `sctp_peeloff`**:test_sockopt case 33、test_connect case 4、
+test_peeloff 都卡在 `sctp_peeloff()`(返 EOPNOTSUPP)——把 1-to-many 的某关联剥离
+成独立 1-to-1 fd。
+
+**剩余 1-to-many**:`sctp_peeloff`(共同 blocker)、assoc_shutdown/abort
+(SCTP_STATUS 要反映已拆关联)、sctp_sendrecvmsg。
 
 **阶段 2 tcp_style 收尾(2026-06-05):** `test_tcp_style(+v6)`(各 22)过。三处修正:
 - connect 失败(accept 队列满 ECONNREFUSED)不再把 socket 卡在 Connected ——
@@ -198,6 +205,8 @@ recvmsg→`EAGAIN` 可做,但 TEST5 要 `sendmsg`/`recvmsg`+`sctp_sndrcvinfo`+`M
 | `test_1_to_1_addrs` | 10 | **pass** | 3 | `target/oscomp/ltp-net-sctp-addrs.txt` |
 | `test_basic` | 15 | **pass** | 3 | `target/oscomp/ltp-net-sctp-f-test_basic.txt` |
 | `test_basic_v6` | 15 | **pass** | 3 | `target/oscomp/ltp-net-sctp-f-test_basic_v6.txt` |
+| `test_sockopt` | 44 | partial 32/44 (peeloff) | 多 | `target/oscomp/ltp-net-sctp-n-test_sockopt.txt` |
+| `test_connect` | 5 | partial 3/5 (peeloff) | 多 | `target/oscomp/ltp-net-sctp-k-test_connect.txt` |
 | `test_1_to_1_rtoinfo` | 3 | **pass** | 1 | `target/oscomp/ltp-net-sctp-rtoinfo-120s.txt` |
 | `test_1_to_1_initmsg_connect` | 2 | **pass** | 1 | `target/oscomp/ltp-net-sctp-1to1-initmsg.txt` |
 | `test_inaddr_any` | 2 | **pass** | 2 | `target/oscomp/ltp-net-sctp-m-test_inaddr_any.txt` |

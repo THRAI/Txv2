@@ -2352,6 +2352,26 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             payload.with_options_mut(|opts| opts.sctp.paddr_sackdelay = value);
             Ok(())
         }
+        (SOL_SCTP, SCTP_DEFAULT_SEND_PARAM) => {
+            if socket.kind != SocketKind::Sctp {
+                return SyscallResult::Error(errno_to_i32(Errno::ENOPROTOOPT));
+            }
+            // struct sctp_sndrcvinfo (32B): sinfo_stream@0, sinfo_ppid@8,
+            // sinfo_assoc_id@28. A non-zero assoc_id must name an association.
+            if (optlen as usize) < SCTP_SNDRCVINFO_BYTES {
+                return SyscallResult::Error(errno_to_i32(Errno::EINVAL));
+            }
+            let mut buf = [0u8; SCTP_SNDRCVINFO_BYTES];
+            if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut buf, optval) {
+                return SyscallResult::Error(errno_to_i32(errno));
+            }
+            let assoc_id = u32::from_le_bytes([buf[28], buf[29], buf[30], buf[31]]);
+            if assoc_id != 0 && payload.sctp_peer_addr_by_assoc(assoc_id).is_none() {
+                return SyscallResult::Error(errno_to_i32(Errno::EINVAL));
+            }
+            payload.with_options_mut(|opts| opts.sctp.default_send_param = buf);
+            Ok(())
+        }
         (SOL_IPV6, IPV6_V6ONLY) => {
             let on = match read_sockopt_bool(ctx, optval, optlen) {
                 Ok(on) => on,
@@ -2998,6 +3018,10 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             let value = payload.with_options(|o| o.sctp.paddr_sackdelay);
             let mut buf = [0u8; 8];
             buf[4..8].copy_from_slice(&value.to_le_bytes());
+            write_sockopt_bytes(ctx, optval, optlen_ptr, &buf)
+        }
+        (SOL_SCTP, SCTP_DEFAULT_SEND_PARAM) if socket.kind == SocketKind::Sctp => {
+            let buf = payload.with_options(|o| o.sctp.default_send_param);
             write_sockopt_bytes(ctx, optval, optlen_ptr, &buf)
         }
         (SOL_SCTP, SCTP_GET_LOCAL_ADDRS) if socket.kind == SocketKind::Sctp => {
