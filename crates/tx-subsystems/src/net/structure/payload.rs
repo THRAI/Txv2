@@ -505,9 +505,15 @@ impl SocketPayload {
         Some(became_readable)
     }
 
-    pub(crate) fn record_sctp_stream_bytes(&self, payload: Vec<u8>) -> Option<bool> {
+    pub(crate) fn record_sctp_message(
+        &self,
+        payload: Vec<u8>,
+        notification: bool,
+        stream: u16,
+        ppid: u32,
+    ) -> Option<bool> {
         let raw_sctp = self.raw_sctp.as_ref()?;
-        let became_readable = raw_sctp.ingest_stream_bytes(payload)?;
+        let became_readable = raw_sctp.ingest_message(payload, notification, stream, ppid)?;
         self.refresh_io_from_raw();
         Some(became_readable)
     }
@@ -589,6 +595,9 @@ impl SocketPayload {
                 truncated: drain.truncated,
                 became_empty: drain.became_empty,
                 eor: false,
+                sctp_notification: false,
+                sctp_stream: 0,
+                sctp_ppid: 0,
             });
         }
         let unix_stream = self.with_protocol(|protocol| {
@@ -615,6 +624,9 @@ impl SocketPayload {
                     truncated: false,
                     became_empty,
                     eor: false,
+                    sctp_notification: false,
+                    sctp_stream: 0,
+                    sctp_ppid: 0,
                 },
                 None if raw_tcp.is_recv_closed() => SocketRecvBytesOutcome {
                     bytes: 0,
@@ -625,6 +637,9 @@ impl SocketPayload {
                     truncated: false,
                     became_empty: false,
                     eor: false,
+                    sctp_notification: false,
+                    sctp_stream: 0,
+                    sctp_ppid: 0,
                 },
                 None => return None,
             },
@@ -639,6 +654,9 @@ impl SocketPayload {
                     truncated: drain.truncated,
                     became_empty: drain.became_empty,
                     eor: false,
+                    sctp_notification: false,
+                    sctp_stream: 0,
+                    sctp_ppid: 0,
                 }
             }
             (None, None, Some(raw_icmp), None, None, None) => {
@@ -660,6 +678,9 @@ impl SocketPayload {
                     truncated: drain.truncated,
                     became_empty: drain.became_empty,
                     eor: false,
+                    sctp_notification: false,
+                    sctp_stream: 0,
+                    sctp_ppid: 0,
                 }
             }
             (None, None, None, Some(raw_unix), None, None) => {
@@ -673,6 +694,9 @@ impl SocketPayload {
                     truncated: drain.truncated,
                     became_empty: drain.became_empty,
                     eor: false,
+                    sctp_notification: false,
+                    sctp_stream: 0,
+                    sctp_ppid: 0,
                 }
             }
             (None, None, None, None, Some(raw_rds), None) => {
@@ -686,6 +710,9 @@ impl SocketPayload {
                     truncated: drain.truncated,
                     became_empty: drain.became_empty,
                     eor: false,
+                    sctp_notification: false,
+                    sctp_stream: 0,
+                    sctp_ppid: 0,
                 }
             }
             (None, None, None, None, None, Some(raw_sctp)) => {
@@ -699,6 +726,9 @@ impl SocketPayload {
                     truncated: false,
                     became_empty: drain.became_empty,
                     eor: drain.eor,
+                    sctp_notification: drain.notification,
+                    sctp_stream: drain.stream,
+                    sctp_ppid: drain.ppid,
                 }
             }
             _ => return None,
@@ -1248,6 +1278,11 @@ pub struct SocketRecvBytesOutcome {
     /// End-of-record: the read consumed a complete message (SCTP message
     /// boundary). Maps to `MSG_EOR` in recvmsg. Always false for byte streams.
     pub eor: bool,
+    /// The delivered message is an SCTP control notification (`MSG_NOTIFICATION`).
+    pub sctp_notification: bool,
+    /// sctp_sndrcvinfo stream id / payload protocol id for an SCTP data message.
+    pub sctp_stream: u16,
+    pub sctp_ppid: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1503,6 +1538,17 @@ pub(crate) struct RdsRecvDrain {
     pub became_empty: bool,
 }
 
+/// One queued SCTP message (boundary-preserved) plus its ancillary metadata.
+/// `notification` marks a control event (assoc_change / shutdown) that recvmsg
+/// surfaces with MSG_NOTIFICATION; `stream`/`ppid` carry the sctp_sndrcvinfo.
+#[derive(Clone)]
+struct SctpFrame {
+    data: Vec<u8>,
+    notification: bool,
+    stream: u16,
+    ppid: u32,
+}
+
 pub(crate) struct RawSctpSocket {
     state: SpinMutex<RawSctpState>,
     recv_limit: usize,
@@ -1518,8 +1564,16 @@ impl RawSctpSocket {
         }
     }
 
-    pub fn ingest_stream_bytes(&self, bytes: Vec<u8>) -> Option<bool> {
-        self.state.lock().push_bytes(bytes, self.recv_limit)
+    pub fn ingest_message(
+        &self,
+        bytes: Vec<u8>,
+        notification: bool,
+        stream: u16,
+        ppid: u32,
+    ) -> Option<bool> {
+        self.state
+            .lock()
+            .push_message(bytes, notification, stream, ppid, self.recv_limit)
     }
 
     pub fn recv_len(&self, len: usize, peek: bool) -> Option<(usize, bool)> {
@@ -1540,7 +1594,7 @@ impl RawSctpSocket {
 }
 
 struct RawSctpState {
-    frames: Vec<Vec<u8>>,
+    frames: Vec<SctpFrame>,
     queued_bytes: usize,
 }
 
@@ -1552,13 +1606,25 @@ impl RawSctpState {
         }
     }
 
-    fn push_bytes(&mut self, bytes: Vec<u8>, recv_limit: usize) -> Option<bool> {
+    fn push_message(
+        &mut self,
+        bytes: Vec<u8>,
+        notification: bool,
+        stream: u16,
+        ppid: u32,
+        recv_limit: usize,
+    ) -> Option<bool> {
         let was_empty = self.queued_bytes == 0;
         if self.queued_bytes.saturating_add(bytes.len()) > recv_limit {
             return None;
         }
         self.queued_bytes += bytes.len();
-        self.frames.push(bytes);
+        self.frames.push(SctpFrame {
+            data: bytes,
+            notification,
+            stream,
+            ppid,
+        });
         Some(was_empty)
     }
 
@@ -1579,9 +1645,12 @@ impl RawSctpState {
     /// recv and `eor` is false (partial delivery).
     fn recv_message(&mut self, out: &mut [u8], peek: bool) -> Option<SctpRecvDrain> {
         let front = self.frames.first()?;
-        let front_len = front.len();
+        let front_len = front.data.len();
+        let notification = front.notification;
+        let stream = front.stream;
+        let ppid = front.ppid;
         let n = core::cmp::min(out.len(), front_len);
-        out[..n].copy_from_slice(&front[..n]);
+        out[..n].copy_from_slice(&front.data[..n]);
         let eor = n == front_len;
         if !peek {
             self.drop_front_bytes(n)?;
@@ -1590,6 +1659,9 @@ impl RawSctpState {
             bytes: n,
             became_empty: !peek && self.queued_bytes == 0,
             eor,
+            notification,
+            stream,
+            ppid,
         })
     }
 
@@ -1599,14 +1671,14 @@ impl RawSctpState {
 
     fn drop_front_bytes(&mut self, mut remaining: usize) -> Option<()> {
         while remaining > 0 {
-            let front_len = self.frames.first()?.len();
+            let front_len = self.frames.first()?.data.len();
             if front_len <= remaining {
                 let frame = self.frames.remove(0);
-                self.queued_bytes = self.queued_bytes.saturating_sub(frame.len());
-                remaining -= frame.len();
+                self.queued_bytes = self.queued_bytes.saturating_sub(frame.data.len());
+                remaining -= frame.data.len();
             } else {
                 let front = self.frames.first_mut()?;
-                front.drain(..remaining);
+                front.data.drain(..remaining);
                 self.queued_bytes = self.queued_bytes.saturating_sub(remaining);
                 remaining = 0;
             }
@@ -1620,6 +1692,11 @@ pub(crate) struct SctpRecvDrain {
     pub became_empty: bool,
     /// The returned bytes completed a whole SCTP message (set `MSG_EOR`).
     pub eor: bool,
+    /// The message is a control notification (set `MSG_NOTIFICATION`).
+    pub notification: bool,
+    /// sctp_sndrcvinfo stream id / payload protocol id for the message.
+    pub stream: u16,
+    pub ppid: u32,
 }
 
 pub(crate) struct RawUnixSocket {

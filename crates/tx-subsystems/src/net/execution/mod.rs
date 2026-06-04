@@ -58,7 +58,7 @@ pub use step_process_network_events::{
 };
 pub use step_recv::{step_recv, step_recv_kernel_bytes};
 pub use step_send::{
-    step_send, step_send_kernel_bytes, step_send_to_kernel_bytes,
+    step_send, step_send_kernel_bytes, step_send_sctp_message, step_send_to_kernel_bytes,
     step_send_to_kernel_bytes_with_poll_kick, step_send_to_unix_path_kernel_bytes,
 };
 pub use step_shutdown::{step_shutdown, ShutdownOutcome};
@@ -127,4 +127,26 @@ pub fn socket_accept_wait_token(socket: &SocketIdentity) -> WaitToken {
 
 pub fn socket_urgent_wait_token(socket: &SocketIdentity) -> WaitToken {
     WaitToken::new(socket.wait_carriers.urgent, UrgentEvent::URGENT.bits())
+}
+
+/// Build a `struct sctp_assoc_change` notification (20 bytes, native/LE) for the
+/// given `sac_state` (0=COMM_UP, 1=COMM_LOST, 3=SHUTDOWN_COMP) and stream count.
+/// `sn_type` is SCTP_ASSOC_CHANGE (0x8001).
+pub fn sctp_assoc_change_bytes(state: u16, streams: u16) -> alloc::vec::Vec<u8> {
+    let mut b = alloc::vec![0u8; 20];
+    b[0..2].copy_from_slice(&0x8001u16.to_le_bytes()); // sac_type = SCTP_ASSOC_CHANGE
+    b[4..8].copy_from_slice(&20u32.to_le_bytes()); // sac_length
+    b[8..10].copy_from_slice(&state.to_le_bytes()); // sac_state
+    b[12..14].copy_from_slice(&streams.to_le_bytes()); // sac_outbound_streams
+    b[14..16].copy_from_slice(&streams.to_le_bytes()); // sac_inbound_streams
+    b
+}
+
+/// Build a `struct sctp_shutdown_event` notification (12 bytes, native/LE).
+/// `sn_type` is SCTP_SHUTDOWN_EVENT (0x8005).
+pub fn sctp_shutdown_event_bytes() -> alloc::vec::Vec<u8> {
+    let mut b = alloc::vec![0u8; 12];
+    b[0..2].copy_from_slice(&0x8005u16.to_le_bytes()); // sse_type = SCTP_SHUTDOWN_EVENT
+    b[4..8].copy_from_slice(&12u32.to_le_bytes()); // sse_length
+    b
 }

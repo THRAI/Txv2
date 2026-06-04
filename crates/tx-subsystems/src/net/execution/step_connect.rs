@@ -468,6 +468,10 @@ fn step_sctp_connect(
         Ok(child) => child,
         Err(_) => return StepOutcome::Err(Errno::ENOMEM),
     };
+    // The accepted (server-side) association is established immediately on our
+    // loopback: deliver its COMM_UP to the child if it subscribed to events
+    // (subscription inherited from the listener).
+    enqueue_sctp_comm_up(&child);
 
     if let Err(error) = table.insert_sctp_connection_pair(
         ConnectionKey::new(local, listener_local),
@@ -484,6 +488,8 @@ fn step_sctp_connect(
             remote: listener_local,
         });
     });
+    // Deliver COMM_UP to the connecting side if it subscribed to events.
+    enqueue_sctp_comm_up(socket);
 
     let entry = SocketAcceptEntry {
         child,
@@ -521,6 +527,25 @@ fn sctp_listener_accepts_incoming(
 
 const fn unspecified_endpoint() -> IpEndpoint {
     IpEndpoint::new(Ipv4Address::UNSPECIFIED, 0)
+}
+
+/// Enqueue an SCTP_ASSOC_CHANGE / SCTP_COMM_UP notification on `socket`'s own
+/// receive queue if it subscribed to association events. Delivered ahead of any
+/// data so recvmsg surfaces COMM_UP first (with MSG_NOTIFICATION).
+pub(crate) fn enqueue_sctp_comm_up(socket: &Cap<SocketIdentity>) {
+    let Some(payload) = socket.acquire_operational() else {
+        return;
+    };
+    if !payload.with_options(|o| o.sctp.event_assoc_change()) {
+        return;
+    }
+    let streams = payload.with_options(|o| o.sctp.initmsg_num_ostreams);
+    let bytes = crate::net::execution::sctp_assoc_change_bytes(0 /* SCTP_COMM_UP */, streams);
+    if payload.record_sctp_message(bytes, true, 0, 0).is_some() {
+        socket
+            .readiness
+            .fire_recv(crate::net::structure::RecvWireSet::HAS_DATA);
+    }
 }
 
 fn update_udp_connection_index(

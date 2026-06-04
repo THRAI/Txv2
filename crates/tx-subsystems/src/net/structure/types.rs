@@ -592,6 +592,22 @@ pub struct SctpLevelOptions {
     pub assoc_peer_rwnd: u32,
     pub assoc_local_rwnd: u32,
     pub assoc_cookie_life: u32,
+    /// SCTP_EVENTS subscription: raw `struct sctp_event_subscribe` bytes
+    /// (one u8 flag per event, offsets per the uapi struct). Byte 1 is
+    /// `sctp_association_event`, byte 5 is `sctp_shutdown_event`.
+    pub events_subscribe: [u8; 16],
+}
+
+impl SctpLevelOptions {
+    /// Subscribed to SCTP_ASSOC_CHANGE notifications (sctp_association_event).
+    pub fn event_assoc_change(&self) -> bool {
+        self.events_subscribe[1] != 0
+    }
+
+    /// Subscribed to SCTP_SHUTDOWN_EVENT notifications (sctp_shutdown_event).
+    pub fn event_shutdown(&self) -> bool {
+        self.events_subscribe[5] != 0
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -737,6 +753,7 @@ impl SocketOptionSet {
                 assoc_peer_rwnd: 0,
                 assoc_local_rwnd: 0,
                 assoc_cookie_life: 60000,
+                events_subscribe: [0u8; 16],
             },
         }
     }
@@ -803,6 +820,7 @@ impl SocketOptionSet {
                 assoc_peer_rwnd: 0,
                 assoc_local_rwnd: 0,
                 assoc_cookie_life: 60000,
+                events_subscribe: [0u8; 16],
             },
         }
     }

@@ -124,7 +124,7 @@ pub fn step_send_kernel_bytes(
         return send_tcp_stream_bytes(socket, &payload, bytes, guard);
     }
     if socket.kind == SocketKind::Sctp {
-        return send_sctp_stream_bytes(socket, &payload, bytes, guard);
+        return send_sctp_stream_bytes(socket, &payload, bytes, 0, 0, guard);
     }
     if socket.kind == SocketKind::UnixDatagram {
         return send_unix_datagram_connected(socket, &payload, bytes, guard);
@@ -267,7 +267,7 @@ pub fn step_send_to_kernel_bytes_with_poll_kick(
         return send_tcp_stream_bytes(socket, &payload, bytes, guard);
     }
     if socket.kind == SocketKind::Sctp {
-        return send_sctp_stream_bytes(socket, &payload, bytes, guard);
+        return send_sctp_stream_bytes(socket, &payload, bytes, 0, 0, guard);
     }
     if socket.kind == SocketKind::RdsSeqPacket {
         return send_rds_packet(socket, &payload, dst, bytes, guard);
@@ -952,6 +952,8 @@ fn send_sctp_stream_bytes(
     socket: &Cap<SocketIdentity>,
     payload: &SocketPayload,
     bytes: &[u8],
+    stream: u16,
+    ppid: u32,
     guard: &Guard<'_>,
 ) -> ByteStepOutcome<usize> {
     let (local, remote) = match payload.protocol_snapshot() {
@@ -979,11 +981,44 @@ fn send_sctp_stream_bytes(
     if peer_payload.shutdown_rd() {
         return StepOutcome::Err(Errno::EPIPE);
     }
-    let Some(became_readable) = peer_payload.record_sctp_stream_bytes(bytes.to_vec()) else {
+    let Some(became_readable) =
+        peer_payload.record_sctp_message(bytes.to_vec(), false, stream, ppid)
+    else {
         return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
     };
     if became_readable {
         peer.readiness.fire_recv(RecvWireSet::HAS_DATA);
     }
     StepOutcome::Done(bytes.len())
+}
+
+/// Send one SCTP message carrying its sctp_sndrcvinfo (stream/ppid), used by
+/// sendmsg with an SCTP_SNDRCV control message. Mirrors the send preamble of
+/// `step_send_kernel_bytes` but threads the ancillary stream/ppid to the peer.
+pub fn step_send_sctp_message(
+    socket: &Cap<SocketIdentity>,
+    bytes: &[u8],
+    stream: u16,
+    ppid: u32,
+    flags: SendRecvFlags,
+    guard: &Guard<'_>,
+) -> ByteStepOutcome<usize> {
+    let witness = match require_socket_write_target(socket, flags, guard) {
+        Ok(witness) => witness,
+        Err(errno) => return StepOutcome::Err(errno),
+    };
+    debug_assert_eq!(witness.identity.raw(), socket.raw());
+    let Some(payload) = socket.acquire_operational() else {
+        return StepOutcome::Err(Errno::ENOTCONN);
+    };
+    if let Some(errno) = send_flags_error(witness.flags) {
+        return StepOutcome::Err(errno);
+    }
+    if payload.shutdown_wr() {
+        return StepOutcome::Err(Errno::EPIPE);
+    }
+    if bytes.is_empty() {
+        return StepOutcome::Done(0);
+    }
+    send_sctp_stream_bytes(socket, &payload, bytes, stream, ppid, guard)
 }

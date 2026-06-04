@@ -73,6 +73,9 @@ pub fn step_socket_close(
             if let Some(peer) =
                 table.lookup_sctp_connection(ConnectionKey::new(remote, local), guard)
             {
+                // Notify the peer's event subscription that the association is
+                // going down (SCTP_SHUTDOWN_EVENT), queued ahead of the EOF mark.
+                enqueue_sctp_shutdown_event(&peer);
                 let peer_wakes = mark_sctp_peer_closed(&peer);
                 peer_recv_woken += peer_wakes.recv_woken;
                 peer_send_woken += peer_wakes.send_woken;
@@ -231,6 +234,21 @@ fn mark_sctp_peer_closed(peer: &Cap<SocketIdentity>) -> PeerCloseWakes {
     PeerCloseWakes {
         recv_woken,
         send_woken,
+    }
+}
+
+/// Queue an SCTP_SHUTDOWN_EVENT notification on `peer`'s receive queue if it
+/// subscribed to shutdown events, so its next recvmsg surfaces the teardown.
+fn enqueue_sctp_shutdown_event(peer: &Cap<SocketIdentity>) {
+    let Some(payload) = peer.acquire_operational() else {
+        return;
+    };
+    if !payload.with_options(|o| o.sctp.event_shutdown()) {
+        return;
+    }
+    let bytes = crate::net::execution::sctp_shutdown_event_bytes();
+    if payload.record_sctp_message(bytes, true, 0, 0).is_some() {
+        peer.readiness.fire_recv(RecvWireSet::HAS_DATA);
     }
 }
 

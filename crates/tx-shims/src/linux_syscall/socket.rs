@@ -15,7 +15,7 @@ use tx_subsystems::net::{
     netlink_route_send_with_netns_resolvers, netlink_xfrm_recv, netlink_xfrm_send, require_net_raw,
     socket_open_file_from_identity, step_accept, step_bind, step_connect, step_listen,
     step_poll_ready, step_poll_wait_token, step_process_loopback_udp, step_recv_kernel_bytes,
-    step_send_to_kernel_bytes, step_send_to_unix_path_kernel_bytes,
+    step_send_sctp_message, step_send_to_kernel_bytes, step_send_to_unix_path_kernel_bytes,
     step_send_udp_loopback_kernel_bytes, step_shutdown, step_socket_close,
     step_socket_open_file_in_namespace, step_tcp_loopback_handshake, step_tcp_loopback_transfer,
     step_unix_socketpair_connect, AddressFamily, ConnectionKey, IpEndpoint, Ipv4Address,
@@ -51,6 +51,13 @@ const CMSGHDR_BYTES: u64 = 16;
 const MSG_CTRUNC_BITS: u32 = 0x08;
 /// `MSG_EOR` — recvmsg delivered a complete record (SCTP message boundary).
 const MSG_EOR_BITS: u32 = 0x80;
+/// `MSG_NOTIFICATION` — recvmsg delivered an SCTP control notification.
+const MSG_NOTIFICATION_BITS: u32 = 0x8000;
+/// `SCTP_SNDRCV` cmsg type (ancillary sctp_sndrcvinfo at IPPROTO_SCTP level).
+const SCTP_SNDRCV_CMSG: i32 = 1;
+/// `struct sctp_sndrcvinfo` size: stream/ssn/flags (+pad) + ppid/context/ttl/
+/// tsn/cumtsn/assoc_id = 32 bytes.
+const SCTP_SNDRCVINFO_BYTES: usize = 32;
 const SCM_RIGHTS: i32 = 1;
 const MAX_MSG_IOV: u64 = 1024;
 const SOCKET_MSG_MAX_BYTES: usize = 1024 * 1024;
@@ -1169,6 +1176,57 @@ fn find_packet_arp_target_mac_in_netns(
     })
 }
 
+/// Parse an SCTP_SNDRCV control message (sctp_sndrcvinfo) from a sendmsg msghdr,
+/// returning (sinfo_stream, sinfo_ppid). Only the first cmsg is inspected, which
+/// is what the SCTP API tests build.
+fn parse_sctp_sndrcvinfo(ctx: &SyscallCtx<'_>, header: &UserMsghdr) -> Option<(u16, u32)> {
+    if header.control == 0 {
+        return None;
+    }
+    const CMSG_HDR: usize = 16; // size_t cmsg_len + int level + int type
+    let total = header.controllen as usize;
+    if total < CMSG_HDR + SCTP_SNDRCVINFO_BYTES {
+        return None;
+    }
+    let mut buf = [0u8; CMSG_HDR + SCTP_SNDRCVINFO_BYTES];
+    bootstrap_copy_from_user(&ctx.aspace, &mut buf, header.control).ok()?;
+    let level = i32::from_le_bytes(buf[8..12].try_into().ok()?);
+    let ctype = i32::from_le_bytes(buf[12..16].try_into().ok()?);
+    if level != SOL_SCTP || ctype != SCTP_SNDRCV_CMSG {
+        return None;
+    }
+    // sctp_sndrcvinfo: sinfo_stream @0, sinfo_ppid @8 (after ssn/flags + pad).
+    let stream = u16::from_le_bytes(buf[CMSG_HDR..CMSG_HDR + 2].try_into().ok()?);
+    let ppid = u32::from_le_bytes(buf[CMSG_HDR + 8..CMSG_HDR + 12].try_into().ok()?);
+    Some((stream, ppid))
+}
+
+/// Write an SCTP_SNDRCV control message (sctp_sndrcvinfo with `stream`/`ppid`)
+/// into a recvmsg msghdr's control buffer and set msg_controllen. If there is no
+/// room, the control data is omitted (controllen left at 0).
+fn write_sctp_sndrcv_cmsg(
+    ctx: &SyscallCtx<'_>,
+    msghdr_ptr: u64,
+    header: UserMsghdr,
+    stream: u16,
+    ppid: u32,
+) -> Result<(), Errno> {
+    const CMSG_HDR: usize = 16;
+    const TOTAL: usize = CMSG_HDR + SCTP_SNDRCVINFO_BYTES; // CMSG_LEN(sizeof sndrcvinfo) = 48
+    if header.control == 0 || (header.controllen as usize) < TOTAL {
+        return Ok(());
+    }
+    let mut buf = [0u8; TOTAL];
+    buf[0..8].copy_from_slice(&(TOTAL as u64).to_le_bytes()); // cmsg_len
+    buf[8..12].copy_from_slice(&SOL_SCTP.to_le_bytes()); // cmsg_level = IPPROTO_SCTP
+    buf[12..16].copy_from_slice(&SCTP_SNDRCV_CMSG.to_le_bytes()); // cmsg_type = SCTP_SNDRCV
+    buf[CMSG_HDR..CMSG_HDR + 2].copy_from_slice(&stream.to_le_bytes()); // sinfo_stream
+    buf[CMSG_HDR + 8..CMSG_HDR + 12].copy_from_slice(&ppid.to_le_bytes()); // sinfo_ppid
+    bootstrap_copy_to_user(&ctx.aspace, header.control, &buf)?;
+    write_msghdr_controllen(ctx, msghdr_ptr, TOTAL as u64)?;
+    Ok(())
+}
+
 pub(super) fn sys_sendmsg<'a>(
     args: [u64; 6],
     ctx: &'a SyscallCtx<'a>,
@@ -1310,6 +1368,41 @@ async fn sendmsg_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
         bytes.resize(start + iov.len, 0);
         if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut bytes[start..], iov.base) {
             return SyscallResult::Error(errno_to_i32(errno));
+        }
+    }
+
+    // SCTP carries one message per sendmsg with its sctp_sndrcvinfo (stream/ppid)
+    // from the SCTP_SNDRCV control message; route it through the message-oriented
+    // send so the peer's recvmsg can echo the ancillary data back.
+    if socket.kind == SocketKind::Sctp {
+        let (stream, ppid) = parse_sctp_sndrcvinfo(ctx, &header).unwrap_or((0, 0));
+        loop {
+            let outcome = {
+                let guard = tx_substrate::epoch::guard();
+                step_send_sctp_message(&socket, &bytes, stream, ppid, flags, &guard)
+            };
+            match outcome {
+                StepOutcome::Done(sent) => {
+                    finish_sendto_progress(&socket, sent, flags).await;
+                    return SyscallResult::Return(sent as i64);
+                }
+                StepOutcome::Continue { progress } => {
+                    let sent = progress.bytes();
+                    finish_sendto_progress(&socket, sent, flags).await;
+                    return SyscallResult::Return(sent as i64);
+                }
+                StepOutcome::Yield { shape, .. } => {
+                    if flags.is_nonblocking() {
+                        return SyscallResult::Error(EAGAIN_VALUE);
+                    }
+                    if let Some(future) = wait_on_yield_shape(shape) {
+                        let _ = future.await;
+                    } else {
+                        return SyscallResult::Error(EIO_VALUE);
+                    }
+                }
+                StepOutcome::Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            }
         }
     }
 
@@ -1621,8 +1714,22 @@ async fn recvmsg_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
                     }
                 }
                 // SCTP preserves message boundaries: set MSG_EOR when the read
-                // consumed a complete message.
+                // consumed a complete message; MSG_NOTIFICATION for a control
+                // event; and echo the sctp_sndrcvinfo (stream/ppid) for data.
                 let mut msg_flags = if recv.eor { MSG_EOR_BITS } else { 0 };
+                if recv.sctp_notification {
+                    msg_flags |= MSG_NOTIFICATION_BITS;
+                } else if socket.kind == SocketKind::Sctp && recv.bytes > 0 {
+                    if let Err(errno) = write_sctp_sndrcv_cmsg(
+                        ctx,
+                        args[1],
+                        header,
+                        recv.sctp_stream,
+                        recv.sctp_ppid,
+                    ) {
+                        return SyscallResult::Error(errno_to_i32(errno));
+                    }
+                }
                 match write_raw_ipv6_recvmsg_control(
                     ctx,
                     args[1],
@@ -2067,6 +2174,22 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             if socket_peer_endpoint(&socket).is_err() {
                 return SyscallResult::Error(errno_to_i32(Errno::ENOTCONN));
             }
+            Ok(())
+        }
+        (SOL_SCTP, SCTP_EVENTS) => {
+            if socket.kind != SocketKind::Sctp {
+                return SyscallResult::Error(errno_to_i32(Errno::ENOPROTOOPT));
+            }
+            // struct sctp_event_subscribe: one u8 flag per event (8-11 bytes).
+            if optlen == 0 {
+                return SyscallResult::Error(errno_to_i32(Errno::EINVAL));
+            }
+            let copy = core::cmp::min(optlen as usize, 16);
+            let mut buf = [0u8; 16];
+            if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut buf[..copy], optval) {
+                return SyscallResult::Error(errno_to_i32(errno));
+            }
+            payload.with_options_mut(|opts| opts.sctp.events_subscribe = buf);
             Ok(())
         }
         (SOL_IPV6, IPV6_V6ONLY) => {
@@ -2670,6 +2793,10 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             buf[4..6].copy_from_slice(&AF_INET.to_le_bytes());
             buf[6..8].copy_from_slice(&endpoint.port.to_be_bytes());
             buf[8..12].copy_from_slice(&endpoint.addr.octets());
+            write_sockopt_bytes(ctx, optval, optlen_ptr, &buf)
+        }
+        (SOL_SCTP, SCTP_EVENTS) if socket.kind == SocketKind::Sctp => {
+            let buf = payload.with_options(|o| o.sctp.events_subscribe);
             write_sockopt_bytes(ctx, optval, optlen_ptr, &buf)
         }
         (SOL_IPV6, IPV6_V6ONLY) if payload.family() == AddressFamily::Inet6 => write_sockopt_i32(

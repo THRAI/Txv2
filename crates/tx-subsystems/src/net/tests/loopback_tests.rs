@@ -53,6 +53,9 @@ fn assert_tcp_payload_round_trip(
             truncated: false,
             became_empty: true,
             eor: false,
+            sctp_notification: false,
+            sctp_stream: 0,
+            sctp_ppid: 0,
         })
     );
     assert_eq!(out, bytes);

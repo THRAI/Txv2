@@ -286,6 +286,9 @@ fn udp_loopback_wildcard_server_reply_reaches_connected_client() {
             truncated: false,
             became_empty: true,
             eor: false,
+            sctp_notification: false,
+            sctp_stream: 0,
+            sctp_ppid: 0,
         })
     );
     assert_eq!(&response[..4], b"pong");
@@ -522,6 +525,9 @@ fn udp_loopback_msg_more_defers_until_uncork_send() {
             truncated: false,
             became_empty: true,
             eor: false,
+            sctp_notification: false,
+            sctp_stream: 0,
+            sctp_ppid: 0,
         })
     );
     assert_eq!(&out[..6], b"hello!");

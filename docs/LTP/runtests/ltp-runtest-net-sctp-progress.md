@@ -31,7 +31,17 @@ Date: 2026-06-04
 `test_1_to_1_rtoinfo`(3)、`test_1_to_1_initmsg_connect`(2)、`test_1_to_1_sockopt`(22)、
 `test_getname`(13)、`test_getname_v6`(13)、`test_1_to_1_socket_bind_listen`(14)、
 `test_1_to_1_connect`(10)、`test_1_to_1_nonblock`(5)、`test_1_to_1_send`(8)、
-`test_1_to_1_recvfrom`(7)、`test_1_to_1_sendto`(4)。
+`test_1_to_1_recvfrom`(7)、`test_1_to_1_sendto`(4)、`test_1_to_1_events`(4)。
+
+**阶段 2 事件模型(2026-06-05):** `test_1_to_1_events`(4)过。实现:
+- `SCTP_EVENTS` 订阅(`sctp_event_subscribe`,存 `SctpLevelOptions.events_subscribe`)。
+- 通知作为特殊"消息"入收队列(`SctpFrame { notification, stream, ppid, data }`),
+  recvmsg 投递时置 `MSG_NOTIFICATION`。COMM_UP 在 connect 建联时入双方队列(若订阅
+  assoc_event);SHUTDOWN_EVENT 在对端 close 时入本端队列(若订阅 shutdown_event)。
+- `sctp_sndrcvinfo` cmsg round-trip:sendmsg 解析 SCTP_SNDRCV cmsg 的 stream/ppid 随
+  消息存帧;recvmsg 为数据消息回填 SCTP_SNDRCV cmsg(stream/ppid)。
+- 结构:`sctp_assoc_change`(20B)/`sctp_shutdown_event`(12B)字节构造在
+  `net/execution/mod.rs`;`SocketRecvBytesOutcome` 加 `sctp_notification/stream/ppid`。
 
 **阶段 2 续(2026-06-05,无事件):** `test_1_to_1_recvfrom`(7)+`test_1_to_1_sendto`(4)过。
 - recvfrom:(a) recv 在未建联(listening/未连/SHUT_WR 后)的 SCTP socket 上返 `ENOTCONN`
@@ -141,7 +151,7 @@ recvmsg→`EAGAIN` 可做,但 TEST5 要 `sendmsg`/`recvmsg`+`sctp_sndrcvinfo`+`M
 | `test_1_to_1_shutdown` | 6 | TCONF(门) | 2 | — |
 | `test_connect` | 5 | TCONF(门) | 2 | — |
 | `test_1_to_1_nonblock` | 5 | **pass** | 2 | `target/oscomp/ltp-net-sctp-test_1_to_1_nonblock.txt` |
-| `test_1_to_1_events` | 4 | TCONF(门) | 2 | — |
+| `test_1_to_1_events` | 4 | **pass** | 2 | `target/oscomp/ltp-net-sctp-test_1_to_1_events.txt` |
 | `test_1_to_1_sendto` | 4 | **pass** | 2 | `target/oscomp/ltp-net-sctp-test_1_to_1_sendto.txt` |
 | `test_recvmsg` | 2 | TCONF(门) | 2 | — |
 | `test_assoc_abort` | 1 | TCONF(门) | 2 | — |
