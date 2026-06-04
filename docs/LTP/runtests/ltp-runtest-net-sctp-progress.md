@@ -29,7 +29,17 @@ Date: 2026-06-04
 
 静态 case 合计 ≈ **~400**(含 9 个 `_v6` 变体)。当前确认通过:`accept_close`(10)、
 `test_1_to_1_rtoinfo`(3)、`test_1_to_1_initmsg_connect`(2)、`test_1_to_1_sockopt`(22)、
-`test_getname`(13)、`test_getname_v6`(13)、`test_1_to_1_socket_bind_listen`(14)。
+`test_getname`(13)、`test_getname_v6`(13)、`test_1_to_1_socket_bind_listen`(14)、
+`test_1_to_1_connect`(10)。
+
+**纯阶段一(不碰数据面/事件)已见底**:`test_1_to_1_connect` 靠 3 处 connect 语义修正
+通过——非法地址族→`EINVAL`(SCTP 把 read_sockaddr_in 的 EAFNOSUPPORT 映射为 EINVAL,
+对标 Linux `sctp_verify_addr`)、connect on listening→`EISCONN`(`socket_can_connect`
++ `step_sctp_connect` 加 Listening 臂)、queue 满→`ECONNREFUSED`(backlog 修复)。
+`test_1_to_1_nonblock` **不是纯阶段一**:TEST2/4 的非阻塞 connect→`EINPROGRESS`、
+recvmsg→`EAGAIN` 可做,但 TEST5 要 `sendmsg`/`recvmsg`+`sctp_sndrcvinfo`+`MSG_EOR`
+(数据面),全过得等阶段 2。其余未过条目均需阶段 2(数据面+`SCTP_EVENTS` 通知)或
+阶段 3(`sctp_getladdrs` 多宿主地址)。
 
 **phase-1 探针(2026-06-04,逐个单跑)发现的剩余 blocker**:
 - `test_basic(+v6)`:socket/bind 过后断在 `setsockopt(SCTP_EVENTS)` →"Protocol not
@@ -94,7 +104,7 @@ Date: 2026-06-04
 | `test_inaddr_any_v6` | 2 | TCONF(门) | 1 | — |
 | `test_1_to_1_sendmsg` | 14 | TCONF(门) | 2 | — |
 | `test_1_to_1_accept_close` | 10 | **pass** | 2 | `target/oscomp/ltp-net-sctp-phase0-340s.txt` |
-| `test_1_to_1_connect` | 10 | TCONF(门) | 2 | — |
+| `test_1_to_1_connect` | 10 | **pass** | 1 | `target/oscomp/ltp-net-sctp-test_1_to_1_connect.txt` |
 | `test_sctp_sendrecvmsg` | 10 | TCONF(门) | 2 | — |
 | `test_sctp_sendrecvmsg_v6` | 10 | TCONF(门) | 2 | — |
 | `test_1_to_1_send` | 9 | TCONF(门) | 2 | — |
@@ -102,7 +112,7 @@ Date: 2026-06-04
 | `test_1_to_1_recvfrom` | 7 | TCONF(门) | 2 | — |
 | `test_1_to_1_shutdown` | 6 | TCONF(门) | 2 | — |
 | `test_connect` | 5 | TCONF(门) | 2 | — |
-| `test_1_to_1_nonblock` | 5 | TCONF(门) | 2 | — |
+| `test_1_to_1_nonblock` | 5 | partial(需阶段2) | 2 | — |
 | `test_1_to_1_events` | 4 | TCONF(门) | 2 | — |
 | `test_1_to_1_sendto` | 4 | TCONF(门) | 2 | — |
 | `test_recvmsg` | 2 | TCONF(门) | 2 | — |

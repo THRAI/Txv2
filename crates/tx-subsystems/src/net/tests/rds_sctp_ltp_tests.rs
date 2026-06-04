@@ -195,12 +195,13 @@ fn sctp_rejected_connect_on_listener_does_not_break_listener() {
         StepOutcome::Err(Errno::EINVAL)
     );
 
-    // Try to connect FROM the listening socket (to the client's port). It must
-    // fail and, crucially, must not disturb the listener's registration.
-    assert!(matches!(
+    // Try to connect FROM the listening socket (to the client's port). A 1-to-1
+    // SCTP connect on a listening socket is rejected with EISCONN (like Linux),
+    // and crucially must not disturb the listener's registration.
+    assert_eq!(
         step_connect(&listener, inet(4101), &guard),
-        StepOutcome::Err(_)
-    ));
+        StepOutcome::Err(Errno::EISCONN)
+    );
 
     // The client must still be able to connect to the listener.
     assert_eq!(

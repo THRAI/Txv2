@@ -406,6 +406,11 @@ async fn connect_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
     } else {
         match read_sockaddr_in(ctx, args[1], args[2]) {
             Ok(remote) => remote,
+            // Linux SCTP (sctp_verify_addr) rejects an unsupported address
+            // family on connect() with EINVAL, unlike TCP's EAFNOSUPPORT.
+            Err(Errno::EAFNOSUPPORT) if socket.kind == SocketKind::Sctp => {
+                return SyscallResult::Error(errno_to_i32(Errno::EINVAL));
+            }
             Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
         }
     };

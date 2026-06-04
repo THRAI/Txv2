@@ -256,6 +256,11 @@ pub(crate) fn socket_can_connect(
             (SocketKind::Sctp, SocketProtocol::Sctp(TcpState::Connected { .. })) => {
                 Err(Errno::EISCONN)
             }
+            // 1-to-1 (TCP-style) SCTP: connect() on a listening socket is
+            // rejected with EISCONN, like connect() on an established one.
+            (SocketKind::Sctp, SocketProtocol::Sctp(TcpState::Listening { .. })) => {
+                Err(Errno::EISCONN)
+            }
             (
                 SocketKind::Udp,
                 SocketProtocol::Udp(

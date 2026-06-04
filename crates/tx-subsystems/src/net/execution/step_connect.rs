@@ -426,7 +426,11 @@ fn step_sctp_connect(
         SocketProtocol::Sctp(TcpState::Connected { .. }) => {
             return StepOutcome::Err(Errno::EISCONN)
         }
-        SocketProtocol::Sctp(TcpState::Listening { .. }) => return StepOutcome::Err(Errno::EINVAL),
+        // Linux 1-to-1 (TCP-style) SCTP returns EISCONN for connect() on a
+        // listening socket, the same as on an already-connected one.
+        SocketProtocol::Sctp(TcpState::Listening { .. }) => {
+            return StepOutcome::Err(Errno::EISCONN)
+        }
         SocketProtocol::Sctp(TcpState::Closed) => return StepOutcome::Err(Errno::ENOTCONN),
         _ => return StepOutcome::Err(Errno::EINVAL),
     };
