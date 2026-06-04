@@ -588,6 +588,7 @@ impl SocketPayload {
                 destination: None,
                 truncated: drain.truncated,
                 became_empty: drain.became_empty,
+                eor: false,
             });
         }
         let unix_stream = self.with_protocol(|protocol| {
@@ -613,6 +614,7 @@ impl SocketPayload {
                     destination: None,
                     truncated: false,
                     became_empty,
+                    eor: false,
                 },
                 None if raw_tcp.is_recv_closed() => SocketRecvBytesOutcome {
                     bytes: 0,
@@ -622,6 +624,7 @@ impl SocketPayload {
                     destination: None,
                     truncated: false,
                     became_empty: false,
+                    eor: false,
                 },
                 None => return None,
             },
@@ -635,6 +638,7 @@ impl SocketPayload {
                     destination: Some(drain.destination),
                     truncated: drain.truncated,
                     became_empty: drain.became_empty,
+                    eor: false,
                 }
             }
             (None, None, Some(raw_icmp), None, None, None) => {
@@ -655,6 +659,7 @@ impl SocketPayload {
                     destination: Some(destination),
                     truncated: drain.truncated,
                     became_empty: drain.became_empty,
+                    eor: false,
                 }
             }
             (None, None, None, Some(raw_unix), None, None) => {
@@ -667,6 +672,7 @@ impl SocketPayload {
                     destination: None,
                     truncated: drain.truncated,
                     became_empty: drain.became_empty,
+                    eor: false,
                 }
             }
             (None, None, None, None, Some(raw_rds), None) => {
@@ -679,10 +685,11 @@ impl SocketPayload {
                     destination: Some(drain.destination),
                     truncated: drain.truncated,
                     became_empty: drain.became_empty,
+                    eor: false,
                 }
             }
             (None, None, None, None, None, Some(raw_sctp)) => {
-                let drain = raw_sctp.recv_stream_bytes(out, peek)?;
+                let drain = raw_sctp.recv_message(out, peek)?;
                 SocketRecvBytesOutcome {
                     bytes: drain.bytes,
                     source: None,
@@ -691,6 +698,7 @@ impl SocketPayload {
                     destination: None,
                     truncated: false,
                     became_empty: drain.became_empty,
+                    eor: drain.eor,
                 }
             }
             _ => return None,
@@ -1237,6 +1245,9 @@ pub struct SocketRecvBytesOutcome {
     pub destination: Option<IpEndpoint>,
     pub truncated: bool,
     pub became_empty: bool,
+    /// End-of-record: the read consumed a complete message (SCTP message
+    /// boundary). Maps to `MSG_EOR` in recvmsg. Always false for byte streams.
+    pub eor: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1515,8 +1526,8 @@ impl RawSctpSocket {
         self.state.lock().recv_len(len, peek)
     }
 
-    pub fn recv_stream_bytes(&self, out: &mut [u8], peek: bool) -> Option<SctpRecvDrain> {
-        self.state.lock().recv_stream_bytes(out, peek)
+    pub fn recv_message(&self, out: &mut [u8], peek: bool) -> Option<SctpRecvDrain> {
+        self.state.lock().recv_message(out, peek)
     }
 
     pub fn recv_available(&self) -> usize {
@@ -1562,25 +1573,23 @@ impl RawSctpState {
         Some((bytes, !peek && self.queued_bytes == 0))
     }
 
-    fn recv_stream_bytes(&mut self, out: &mut [u8], peek: bool) -> Option<SctpRecvDrain> {
-        if self.queued_bytes == 0 {
-            return None;
-        }
-        let mut copied = 0usize;
-        for frame in &self.frames {
-            if copied >= out.len() {
-                break;
-            }
-            let n = core::cmp::min(out.len() - copied, frame.len());
-            out[copied..copied + n].copy_from_slice(&frame[..n]);
-            copied += n;
-        }
+    /// Message-oriented receive: deliver bytes from the FRONT message only
+    /// (SCTP preserves message boundaries). `eor` is set when the whole front
+    /// message fit in `out`; otherwise the remainder stays queued for the next
+    /// recv and `eor` is false (partial delivery).
+    fn recv_message(&mut self, out: &mut [u8], peek: bool) -> Option<SctpRecvDrain> {
+        let front = self.frames.first()?;
+        let front_len = front.len();
+        let n = core::cmp::min(out.len(), front_len);
+        out[..n].copy_from_slice(&front[..n]);
+        let eor = n == front_len;
         if !peek {
-            self.drop_front_bytes(copied)?;
+            self.drop_front_bytes(n)?;
         }
         Some(SctpRecvDrain {
-            bytes: copied,
+            bytes: n,
             became_empty: !peek && self.queued_bytes == 0,
+            eor,
         })
     }
 
@@ -1609,6 +1618,8 @@ impl RawSctpState {
 pub(crate) struct SctpRecvDrain {
     pub bytes: usize,
     pub became_empty: bool,
+    /// The returned bytes completed a whole SCTP message (set `MSG_EOR`).
+    pub eor: bool,
 }
 
 pub(crate) struct RawUnixSocket {

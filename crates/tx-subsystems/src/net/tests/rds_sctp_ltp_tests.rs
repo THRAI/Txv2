@@ -83,6 +83,7 @@ fn rds_loopback_seqpacket_delivers_source_endpoint() {
             destination: Some(endpoint(4000)),
             truncated: false,
             became_empty: true,
+            eor: false,
         })
     );
     assert_eq!(&out[..payload.len()], payload);
@@ -135,6 +136,7 @@ fn sctp_loopback_stream_accepts_and_moves_bytes() {
             destination: None,
             truncated: false,
             became_empty: true,
+            eor: true,
         })
     );
     assert_eq!(request_out, request);
@@ -155,6 +157,7 @@ fn sctp_loopback_stream_accepts_and_moves_bytes() {
             destination: None,
             truncated: false,
             became_empty: true,
+            eor: true,
         })
     );
     assert_eq!(&response_out[..response.len()], response);

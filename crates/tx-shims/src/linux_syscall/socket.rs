@@ -49,6 +49,8 @@ const MMSGHDR_BYTES: u64 = 64;
 const MMSGHDR_LEN_OFFSET: u64 = MSGHDR_BYTES;
 const CMSGHDR_BYTES: u64 = 16;
 const MSG_CTRUNC_BITS: u32 = 0x08;
+/// `MSG_EOR` — recvmsg delivered a complete record (SCTP message boundary).
+const MSG_EOR_BITS: u32 = 0x80;
 const SCM_RIGHTS: i32 = 1;
 const MAX_MSG_IOV: u64 = 1024;
 const SOCKET_MSG_MAX_BYTES: usize = 1024 * 1024;
@@ -430,6 +432,13 @@ async fn connect_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
         match outcome {
             StepOutcome::Done(()) => {
                 record_unix_stream_peer_cred(&socket, ctx);
+                // Linux reports a fresh non-blocking SCTP connect() as
+                // EINPROGRESS even though our loopback association is set up
+                // synchronously; the socket is in fact already connected, so
+                // subsequent accept/recv on the peer proceed normally.
+                if nonblocking && socket.kind == SocketKind::Sctp && !was_connecting {
+                    return SyscallResult::Error(errno_to_i32(Errno::EINPROGRESS));
+                }
                 return SyscallResult::Return(0);
             }
             StepOutcome::Yield { shape, .. } => {
@@ -1572,6 +1581,9 @@ async fn recvmsg_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
                         return SyscallResult::Error(errno_to_i32(errno));
                     }
                 }
+                // SCTP preserves message boundaries: set MSG_EOR when the read
+                // consumed a complete message.
+                let mut msg_flags = if recv.eor { MSG_EOR_BITS } else { 0 };
                 match write_raw_ipv6_recvmsg_control(
                     ctx,
                     args[1],
@@ -1579,13 +1591,13 @@ async fn recvmsg_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
                     &socket,
                     recv.destination,
                 ) {
-                    Ok(msg_flags) if msg_flags != 0 => {
-                        if let Err(errno) = write_msghdr_flags(ctx, args[1], msg_flags) {
-                            return SyscallResult::Error(errno_to_i32(errno));
-                        }
-                    }
-                    Ok(_) => {}
+                    Ok(control_flags) => msg_flags |= control_flags,
                     Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+                }
+                if msg_flags != 0 {
+                    if let Err(errno) = write_msghdr_flags(ctx, args[1], msg_flags) {
+                        return SyscallResult::Error(errno_to_i32(errno));
+                    }
                 }
                 return SyscallResult::Return(recv.bytes as i64);
             }

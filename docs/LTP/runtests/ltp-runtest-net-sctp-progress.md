@@ -30,7 +30,7 @@ Date: 2026-06-04
 静态 case 合计 ≈ **~400**(含 9 个 `_v6` 变体)。当前确认通过:`accept_close`(10)、
 `test_1_to_1_rtoinfo`(3)、`test_1_to_1_initmsg_connect`(2)、`test_1_to_1_sockopt`(22)、
 `test_getname`(13)、`test_getname_v6`(13)、`test_1_to_1_socket_bind_listen`(14)、
-`test_1_to_1_connect`(10)。
+`test_1_to_1_connect`(10)、`test_1_to_1_nonblock`(5)、`test_1_to_1_send`(8)。
 
 **纯阶段一(不碰数据面/事件)已见底**:`test_1_to_1_connect` 靠 3 处 connect 语义修正
 通过——非法地址族→`EINVAL`(SCTP 把 read_sockaddr_in 的 EAFNOSUPPORT 映射为 EINVAL,
@@ -40,6 +40,16 @@ Date: 2026-06-04
 recvmsg→`EAGAIN` 可做,但 TEST5 要 `sendmsg`/`recvmsg`+`sctp_sndrcvinfo`+`MSG_EOR`
 (数据面),全过得等阶段 2。其余未过条目均需阶段 2(数据面+`SCTP_EVENTS` 通知)或
 阶段 3(`sctp_getladdrs` 多宿主地址)。
+
+**阶段 2 进展(数据面 MVP,2026-06-04)**:实现了消息边界保留的 SCTP recv
+(`RawSctpState::recv_message` 一次取一条 front 消息)+ `MSG_EOR`(经
+`SocketRecvBytesOutcome.eor` 透传到 recvmsg `msg_flags`)+ 非阻塞 SCTP connect 返
+`EINPROGRESS`(loopback 同步建联但对标 Linux 语义)。**新过:`test_1_to_1_nonblock`(5)、
+`test_1_to_1_send`(8)。** 数据面探针其余结果:`sendto` 2(断 case3 sendto-from)、
+`recvmsg` 3 后 **SIGSEGV(139)**——case4 的 EFAULT 校验缺口(门开后才暴露,非回归,
+读 addr=-1)、`recvfrom` 3、`sendmsg` 4(断 case5)、`sctp_sendrecvmsg` 0(首条即
+需事件/setup)。后续:`sctp_sndrcvinfo` cmsg 真正 round-trip(stream/ppid/assoc_id)、
+recvmsg 的 EFAULT 校验、`SCTP_EVENTS` 通知模型。
 
 **phase-1 探针(2026-06-04,逐个单跑)发现的剩余 blocker**:
 - `test_basic(+v6)`:socket/bind 过后断在 `setsockopt(SCTP_EVENTS)` →"Protocol not
@@ -107,12 +117,12 @@ recvmsg→`EAGAIN` 可做,但 TEST5 要 `sendmsg`/`recvmsg`+`sctp_sndrcvinfo`+`M
 | `test_1_to_1_connect` | 10 | **pass** | 1 | `target/oscomp/ltp-net-sctp-test_1_to_1_connect.txt` |
 | `test_sctp_sendrecvmsg` | 10 | TCONF(门) | 2 | — |
 | `test_sctp_sendrecvmsg_v6` | 10 | TCONF(门) | 2 | — |
-| `test_1_to_1_send` | 9 | TCONF(门) | 2 | — |
+| `test_1_to_1_send` | 9 | **pass** | 2 | `target/oscomp/ltp-net-sctp-test_1_to_1_send.txt` |
 | `test_1_to_1_recvmsg` | 8 | TCONF(门) | 2 | — |
 | `test_1_to_1_recvfrom` | 7 | TCONF(门) | 2 | — |
 | `test_1_to_1_shutdown` | 6 | TCONF(门) | 2 | — |
 | `test_connect` | 5 | TCONF(门) | 2 | — |
-| `test_1_to_1_nonblock` | 5 | partial(需阶段2) | 2 | — |
+| `test_1_to_1_nonblock` | 5 | **pass** | 2 | `target/oscomp/ltp-net-sctp-test_1_to_1_nonblock.txt` |
 | `test_1_to_1_events` | 4 | TCONF(门) | 2 | — |
 | `test_1_to_1_sendto` | 4 | TCONF(门) | 2 | — |
 | `test_recvmsg` | 2 | TCONF(门) | 2 | — |

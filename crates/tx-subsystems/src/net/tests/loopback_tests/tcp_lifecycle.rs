@@ -79,6 +79,7 @@ fn tcp_socket_close_flushes_queued_bytes_to_peer_before_eof() {
             packet_source: None,
             truncated: false,
             became_empty: true,
+            eor: false,
         })
     );
     assert_eq!(&out, b"0");
@@ -546,6 +547,7 @@ fn tcp_recv_kicks_loopback_after_freeing_peer_window() {
             destination: None,
             truncated: false,
             became_empty: true,
+            eor: false,
         })
     );
     assert_eq!(&out, b"abcde");
@@ -571,6 +573,7 @@ fn tcp_recv_kicks_loopback_after_freeing_peer_window() {
             destination: None,
             truncated: false,
             became_empty: true,
+            eor: false,
         })
     );
     assert_eq!(&tail, b"fghij");
@@ -662,6 +665,7 @@ fn tcp_msg_more_auto_flushes_full_segment_for_stream_progress() {
             destination: None,
             truncated: false,
             became_empty: true,
+            eor: false,
         })
     );
     assert_eq!(&out[..5], b"hello");
@@ -748,6 +752,7 @@ fn tcp_loopback_pending_moves_multiple_msg_more_streams() {
                 destination: None,
                 truncated: false,
                 became_empty: true,
+                eor: false,
             })
         );
         assert!(out.iter().all(|byte| *byte == 0x33));
@@ -793,6 +798,7 @@ fn tcp_close_preserves_peer_receive_bytes_until_eof() {
             destination: None,
             truncated: false,
             became_empty: true,
+            eor: false,
         })
     );
     assert_eq!(&out, b"hello");

@@ -52,6 +52,7 @@ fn assert_tcp_payload_round_trip(
             packet_source: None,
             truncated: false,
             became_empty: true,
+            eor: false,
         })
     );
     assert_eq!(out, bytes);
