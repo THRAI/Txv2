@@ -578,11 +578,19 @@ impl LingerOption {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SctpLevelOptions {
+    pub rto_initial: u32,
+    pub rto_max: u32,
+    pub rto_min: u32,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SocketOptionSet {
     pub socket: SocketLevelOptions,
     pub ip: IpLevelOptions,
     pub tcp: TcpLevelOptions,
+    pub sctp: SctpLevelOptions,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -707,6 +715,11 @@ impl SocketOptionSet {
                 window_clamp: 0,
                 tls_ulp: None,
             },
+            sctp: SctpLevelOptions {
+                rto_initial: 3000,
+                rto_max: 60000,
+                rto_min: 1000,
+            },
         }
     }
 
@@ -758,6 +771,11 @@ impl SocketOptionSet {
                 cork: false,
                 window_clamp: 0,
                 tls_ulp: None,
+            },
+            sctp: SctpLevelOptions {
+                rto_initial: 3000,
+                rto_max: 60000,
+                rto_min: 1000,
             },
         }
     }

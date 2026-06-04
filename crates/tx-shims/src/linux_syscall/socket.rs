@@ -1898,6 +1898,28 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             payload.with_options_mut(|opts| opts.ip.multicast_loop = on);
             Ok(())
         }
+        (SOL_SCTP, SCTP_RTOINFO) => {
+            if socket.kind != SocketKind::Sctp {
+                return SyscallResult::Error(errno_to_i32(Errno::ENOPROTOOPT));
+            }
+            // struct sctp_rtoinfo { assoc_id (u32); srto_initial; srto_max; srto_min }
+            if optlen < 16 {
+                return SyscallResult::Error(errno_to_i32(Errno::EINVAL));
+            }
+            let mut buf = [0u8; 16];
+            if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut buf, optval) {
+                return SyscallResult::Error(errno_to_i32(errno));
+            }
+            let initial = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+            let max = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+            let min = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+            payload.with_options_mut(|opts| {
+                opts.sctp.rto_initial = initial;
+                opts.sctp.rto_max = max;
+                opts.sctp.rto_min = min;
+            });
+            Ok(())
+        }
         (SOL_IPV6, IPV6_V6ONLY) => {
             let on = match read_sockopt_bool(ctx, optval, optlen) {
                 Ok(on) => on,
@@ -2421,6 +2443,15 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
                 .with_options(|o| o.ip.multicast_loop as i32)
                 .to_le_bytes(),
         ),
+        (SOL_SCTP, SCTP_RTOINFO) if socket.kind == SocketKind::Sctp => {
+            let (initial, max, min) =
+                payload.with_options(|o| (o.sctp.rto_initial, o.sctp.rto_max, o.sctp.rto_min));
+            let mut buf = [0u8; 16];
+            buf[4..8].copy_from_slice(&initial.to_le_bytes());
+            buf[8..12].copy_from_slice(&max.to_le_bytes());
+            buf[12..16].copy_from_slice(&min.to_le_bytes());
+            write_sockopt_bytes(ctx, optval, optlen_ptr, &buf)
+        }
         (SOL_IPV6, IPV6_V6ONLY) if payload.family() == AddressFamily::Inet6 => write_sockopt_i32(
             ctx,
             optval,
