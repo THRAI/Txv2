@@ -583,6 +583,10 @@ pub struct SctpLevelOptions {
     pub rto_initial: u32,
     pub rto_max: u32,
     pub rto_min: u32,
+    pub initmsg_num_ostreams: u16,
+    pub initmsg_max_instreams: u16,
+    pub initmsg_max_attempts: u16,
+    pub initmsg_max_init_timeo: u16,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -719,6 +723,10 @@ impl SocketOptionSet {
                 rto_initial: 3000,
                 rto_max: 60000,
                 rto_min: 1000,
+                initmsg_num_ostreams: 10,
+                initmsg_max_instreams: 65535,
+                initmsg_max_attempts: 8,
+                initmsg_max_init_timeo: 0,
             },
         }
     }
@@ -776,6 +784,10 @@ impl SocketOptionSet {
                 rto_initial: 3000,
                 rto_max: 60000,
                 rto_min: 1000,
+                initmsg_num_ostreams: 10,
+                initmsg_max_instreams: 65535,
+                initmsg_max_attempts: 8,
+                initmsg_max_init_timeo: 0,
             },
         }
     }

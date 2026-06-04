@@ -28,10 +28,10 @@ Date: 2026-06-04
   `target/oscomp/ltp-net-sctp-phase0-340s.txt`(开门后,accept_close 过)。
 
 静态 case 合计 ≈ **~400**(含 9 个 `_v6` 变体)。当前确认通过:`accept_close`(10 case)、
-`test_1_to_1_rtoinfo`(3 case)。
+`test_1_to_1_rtoinfo`(3 case)、`test_1_to_1_initmsg_connect`(2 case)。
 
 **阶段 1 进展**:已搭 `SctpLevelOptions` sockopt 存储基础(`types.rs`)+ `SOL_SCTP`/
-`SCTP_RTOINFO` 接线(`socket.rs`)。后续 sockopt(ASSOCINFO/INITMSG/EVENTS/STATUS/…)
+`SCTP_RTOINFO`/`SCTP_INITMSG` 接线(`socket.rs`)。后续 sockopt(ASSOCINFO/EVENTS/STATUS/…)
 可照此模式叠加:加 `SctpLevelOptions` 字段 + numbers 常量 + set/get 臂。
 注意 `test_sockopt`(最密 88 case)还需 1-to-many sendmsg/recvmsg + 事件,属阶段 2-3。
 
@@ -59,7 +59,7 @@ Date: 2026-06-04
 | `test_getname_v6` | 13 | TCONF(门) | 1 | — |
 | `test_1_to_1_addrs` | 10 | TCONF(门) | 1 | — |
 | `test_1_to_1_rtoinfo` | 3 | **pass** | 1 | `target/oscomp/ltp-net-sctp-rtoinfo-120s.txt` |
-| `test_1_to_1_initmsg_connect` | 2 | TCONF(门) | 1 | — |
+| `test_1_to_1_initmsg_connect` | 2 | **pass** | 1 | `target/oscomp/ltp-net-sctp-1to1-initmsg.txt` |
 | `test_inaddr_any` | 2 | TCONF(门) | 1 | — |
 | `test_inaddr_any_v6` | 2 | TCONF(门) | 1 | — |
 | `test_1_to_1_sendmsg` | 14 | TCONF(门) | 2 | — |

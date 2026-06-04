@@ -1920,6 +1920,31 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             });
             Ok(())
         }
+        (SOL_SCTP, SCTP_INITMSG) => {
+            if socket.kind != SocketKind::Sctp {
+                return SyscallResult::Error(errno_to_i32(Errno::ENOPROTOOPT));
+            }
+            // struct sctp_initmsg { sinit_num_ostreams; sinit_max_instreams;
+            //                       sinit_max_attempts; sinit_max_init_timeo } (all u16)
+            if optlen < 8 {
+                return SyscallResult::Error(errno_to_i32(Errno::EINVAL));
+            }
+            let mut buf = [0u8; 8];
+            if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut buf, optval) {
+                return SyscallResult::Error(errno_to_i32(errno));
+            }
+            let num_ostreams = u16::from_le_bytes([buf[0], buf[1]]);
+            let max_instreams = u16::from_le_bytes([buf[2], buf[3]]);
+            let max_attempts = u16::from_le_bytes([buf[4], buf[5]]);
+            let max_init_timeo = u16::from_le_bytes([buf[6], buf[7]]);
+            payload.with_options_mut(|opts| {
+                opts.sctp.initmsg_num_ostreams = num_ostreams;
+                opts.sctp.initmsg_max_instreams = max_instreams;
+                opts.sctp.initmsg_max_attempts = max_attempts;
+                opts.sctp.initmsg_max_init_timeo = max_init_timeo;
+            });
+            Ok(())
+        }
         (SOL_IPV6, IPV6_V6ONLY) => {
             let on = match read_sockopt_bool(ctx, optval, optlen) {
                 Ok(on) => on,
@@ -2450,6 +2475,23 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             buf[4..8].copy_from_slice(&initial.to_le_bytes());
             buf[8..12].copy_from_slice(&max.to_le_bytes());
             buf[12..16].copy_from_slice(&min.to_le_bytes());
+            write_sockopt_bytes(ctx, optval, optlen_ptr, &buf)
+        }
+        (SOL_SCTP, SCTP_INITMSG) if socket.kind == SocketKind::Sctp => {
+            let (num_ostreams, max_instreams, max_attempts, max_init_timeo) =
+                payload.with_options(|o| {
+                    (
+                        o.sctp.initmsg_num_ostreams,
+                        o.sctp.initmsg_max_instreams,
+                        o.sctp.initmsg_max_attempts,
+                        o.sctp.initmsg_max_init_timeo,
+                    )
+                });
+            let mut buf = [0u8; 8];
+            buf[0..2].copy_from_slice(&num_ostreams.to_le_bytes());
+            buf[2..4].copy_from_slice(&max_instreams.to_le_bytes());
+            buf[4..6].copy_from_slice(&max_attempts.to_le_bytes());
+            buf[6..8].copy_from_slice(&max_init_timeo.to_le_bytes());
             write_sockopt_bytes(ctx, optval, optlen_ptr, &buf)
         }
         (SOL_IPV6, IPV6_V6ONLY) if payload.family() == AddressFamily::Inet6 => write_sockopt_i32(
