@@ -65,8 +65,16 @@ Date: 2026-06-04
 非零 `spp_assoc_id` 须命中已有关联否则 EINVAL(case 14)。**剩余 case 15+**:1-to-many
 `connect()` + 服务端 COMM_UP(带 assoc_id)、spp_address 传输校验、精确长度校验。
 
-**剩余 1-to-many**:test_sockopt 尾(1-to-many connect + 传输校验)、test_connect
-(1-to-many connect 服务端 COMM_UP + peeloff)、assoc_shutdown/abort(SCTP_STATUS
+**1-to-many connect + paddrparams 校验(test_sockopt 14→25、test_connect 2→3,
+2026-06-05):** (a) `step_sctp_connect` 加 SEQPACKET 分支:connect() 直接在监听
+socket 上建联(无 accept/child),两端 `sctp_ensure_assoc` + COMM_UP(带 assoc_id);
+重复 connect 已有关联 → EISCONN(test_connect case 1-3、test_sockopt case 15)。
+(b) `SCTP_DELAYED_ACK_TIME` set 也做非零 assoc_id 校验(case 20)。(c) `spp_flags`
+校验:enable/disable 互斥位对冲突 → EINVAL;`SPP_HB_DEMAND` 需具体关联(assoc_id≠0)
+否则 EINVAL(case 22-25)。
+
+**剩余 1-to-many**:test_sockopt 尾(case 26+ `SCTP_DEFAULT_SEND_PARAM` 默认发送
+参数 TEST #6)、test_connect(peeloff)、assoc_shutdown/abort(SCTP_STATUS
 要反映已拆关联)、sctp_sendrecvmsg。
 
 **阶段 2 tcp_style 收尾(2026-06-05):** `test_tcp_style(+v6)`(各 22)过。三处修正:

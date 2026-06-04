@@ -2302,6 +2302,25 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             let pathmtu = u32::from_le_bytes([buf[138], buf[139], buf[140], buf[141]]);
             let sackdelay = u32::from_le_bytes([buf[142], buf[143], buf[144], buf[145]]);
             let flags = u32::from_le_bytes([buf[146], buf[147], buf[148], buf[149]]);
+            // spp_flags validation (Linux SCTP): an enable and its matching
+            // disable bit are mutually exclusive, and SPP_HB_DEMAND requires a
+            // specific association (a transport to demand a heartbeat on).
+            const SPP_HB_ENABLE: u32 = 1 << 0;
+            const SPP_HB_DISABLE: u32 = 1 << 1;
+            const SPP_HB_DEMAND: u32 = 1 << 2;
+            const SPP_PMTUD_ENABLE: u32 = 1 << 3;
+            const SPP_PMTUD_DISABLE: u32 = 1 << 4;
+            const SPP_SACKDELAY_ENABLE: u32 = 1 << 5;
+            const SPP_SACKDELAY_DISABLE: u32 = 1 << 6;
+            let conflicting = (flags & (SPP_HB_ENABLE | SPP_HB_DISABLE))
+                == (SPP_HB_ENABLE | SPP_HB_DISABLE)
+                || (flags & (SPP_PMTUD_ENABLE | SPP_PMTUD_DISABLE))
+                    == (SPP_PMTUD_ENABLE | SPP_PMTUD_DISABLE)
+                || (flags & (SPP_SACKDELAY_ENABLE | SPP_SACKDELAY_DISABLE))
+                    == (SPP_SACKDELAY_ENABLE | SPP_SACKDELAY_DISABLE);
+            if conflicting || (flags & SPP_HB_DEMAND != 0 && assoc_id == 0) {
+                return SyscallResult::Error(errno_to_i32(Errno::EINVAL));
+            }
             payload.with_options_mut(|opts| {
                 opts.sctp.paddr_hbinterval = hbinterval;
                 opts.sctp.paddr_pathmaxrxt = pathmaxrxt;
@@ -2323,6 +2342,11 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             let mut buf = [0u8; 8];
             if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut buf, optval) {
                 return SyscallResult::Error(errno_to_i32(errno));
+            }
+            // A non-zero assoc_id must name an existing association.
+            let assoc_id = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+            if assoc_id != 0 && payload.sctp_peer_addr_by_assoc(assoc_id).is_none() {
+                return SyscallResult::Error(errno_to_i32(Errno::EINVAL));
             }
             let value = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
             payload.with_options_mut(|opts| opts.sctp.paddr_sackdelay = value);

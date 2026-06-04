@@ -9,9 +9,10 @@ use crate::net::namespace::{net_namespace_payloads_snapshot, NetNamespacePayload
 use crate::net::structure::registry;
 use crate::net::structure::table::SocketTable;
 use crate::net::structure::{
-    AcceptWireSet, ConnectionKey, IpEndpoint, Ipv4Address, KernelSockAddr, SendWireSet,
-    SocketAcceptEntry, SocketIdentity, SocketKind, SocketOperationalEvidence, SocketProtocol,
-    TcpState, UdpInner, UnixDatagramState, UnixSocketPath, UnixStreamState,
+    AcceptWireSet, ConnectionKey, IpEndpoint, Ipv4Address, KernelSockAddr, RecvWireSet,
+    SendWireSet, SocketAcceptEntry, SocketIdentity, SocketKind, SocketOperationalEvidence,
+    SocketProtocol, SocketType, TcpState, UdpInner, UnixDatagramState, UnixSocketPath,
+    UnixStreamState,
 };
 
 pub fn step_connect(
@@ -457,6 +458,29 @@ fn step_sctp_connect(
         }
         _ => return StepOutcome::Err(Errno::ECONNREFUSED),
     };
+
+    // 1-to-many (SEQPACKET): connect() establishes an association directly on the
+    // listener socket — no accept queue, no child socket. Both ends record the
+    // association and receive COMM_UP; the connecting socket remains a 1-to-many
+    // socket (subsequent sends route by msg_name or association id). `local` is
+    // already a specific address (the wildcard case is rejected above).
+    if payload.with_options(|o| o.socket.sock_type == SocketType::SeqPacket) {
+        // Re-connecting to an endpoint we already have an association with is
+        // EISCONN; otherwise establish it now.
+        let (client_assoc_id, is_new) = payload
+            .sctp_ensure_assoc(listener_local)
+            .unwrap_or((0, false));
+        if !is_new {
+            return StepOutcome::Err(Errno::EISCONN);
+        }
+        let server_assoc_id = listener_payload
+            .sctp_ensure_assoc(local)
+            .map_or(0, |(id, _)| id);
+        enqueue_sctp_comm_up(&listener, Some(local), server_assoc_id);
+        listener.readiness.fire_recv(RecvWireSet::HAS_DATA);
+        enqueue_sctp_comm_up(socket, Some(listener_local), client_assoc_id);
+        return StepOutcome::Done(());
+    }
 
     let child_options = listener_payload.with_options(Clone::clone);
     let child = match registry::create_connected_sctp_for_accept_in_namespace(
