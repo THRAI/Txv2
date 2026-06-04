@@ -1,3 +1,23 @@
+- 2026-06-05 **Filtered OSComp `cyclictest-musl,iozone-musl` now runs to completion.**
+  Rebuilt RV64 after the socketpair/user-copy and reactor scheduling fixes, then
+  ran a private OSComp QEMU pass at
+  `target/oscomp/custom-run/cyclic-iozone-timeradvance-20260605-053511` with
+  `tx.oscomp.groups=cyclictest-musl,iozone-musl console=ttyS0`. The old
+  hackbench stall is gone: cyclictest reaches `STRESS_P1` and `STRESS_P8`,
+  `kill hackbench: success`, and group end. Iozone also reaches group end and
+  userspace exits `0`; the OSComp judge scores `cyclictest-musl` `4.0/4` and
+  `iozone-musl` `20.0/20` for `24.0/24` total. The private raw
+  `sdcard-rv.img` was removed after QEMU exit; only the serial log remains.
+  Verification: focused shims regressions for active-guard reuse, socketpair
+  read/write/readiness, and writev prefilter all passed; `cargo xtask build
+  --target rv64-qemu` passed; `cargo xtask fault-decode --target rv64-qemu
+  --serial ... --all --brief` found no trap lines; `tools/oscomp-judge.py`
+  reported full score. Next step: stage/review the scoped socketpair,
+  user-copy, and reactor-timer changes separately from the broader dirty
+  filesystem tree, then consider a wider OSComp rerun. Remaining note: iozone
+  still prints its upstream-style `Sanity check failed` warning, but the scored
+  throughput subtests complete.
+
 - 2026-06-05 **Pmap resident store has an opt-in chunked backend for teardown A/B.**
   Added `ChunkedPmapResidentStore` behind the existing resident-store facade,
   selected by `--cfg tx_vm_pmap_chunked_resident`; the default production alias
