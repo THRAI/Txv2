@@ -28,11 +28,20 @@ Date: 2026-06-04
   `target/oscomp/ltp-net-sctp-phase0-340s.txt`(开门后,accept_close 过)。
 
 静态 case 合计 ≈ **~400**(含 9 个 `_v6` 变体)。当前确认通过:`accept_close`(10 case)、
-`test_1_to_1_rtoinfo`(3 case)、`test_1_to_1_initmsg_connect`(2 case)。
+`test_1_to_1_rtoinfo`(3 case)、`test_1_to_1_initmsg_connect`(2 case)、
+`test_1_to_1_sockopt`(22 case)。
 
-**阶段 1 进展**:已搭 `SctpLevelOptions` sockopt 存储基础(`types.rs`)+ `SOL_SCTP`/
-`SCTP_RTOINFO`/`SCTP_INITMSG` 接线(`socket.rs`)。后续 sockopt(ASSOCINFO/EVENTS/STATUS/…)
-可照此模式叠加:加 `SctpLevelOptions` 字段 + numbers 常量 + set/get 臂。
+**阶段 1 进展**:`SctpLevelOptions` sockopt 存储 + `SOL_SCTP` 接线已覆盖
+`SCTP_RTOINFO`/`SCTP_INITMSG`/`SCTP_ASSOCINFO`/`SCTP_STATUS`/`SCTP_PRIMARY_ADDR`/
+`SCTP_AUTOCLOSE`(`socket.rs`)。要点:
+- `SCTP_AUTOCLOSE` 在 1-to-1(STREAM)socket 上按 Linux 返回 `EOPNOTSUPP`
+  (autoclose 仅对 1-to-many 有意义);未知 SCTP optname 的 setsockopt 走 catch-all
+  返回 `ENOPROTOOPT`,getsockopt 走 catch-all 返回 `EOPNOTSUPP`。
+- `SO_SNDBUF`/`SO_RCVBUF` 现按 Linux 语义存 **2×** 请求值(下限 `SOCK_MIN_BUF`),
+  getsockopt 读回翻倍值——这是全局行为(非仅 SCTP),`test_1_to_1_sockopt` TEST14/16/17/18 依赖。
+- `SCTP_STATUS`/`SCTP_PRIMARY_ADDR` 用 loopback 对端 endpoint 合成只读结构
+  (无真实多宿主/路径度量);`SCTP_ASSOCINFO` 全字段 round-trip 存储。
+后续 sockopt(EVENTS/PEER_ADDR_PARAMS/…)照此模式叠加。
 注意 `test_sockopt`(最密 88 case)还需 1-to-many sendmsg/recvmsg + 事件,属阶段 2-3。
 
 ## 阶段划分(初步,阶段 0 重跑后据实修正)
@@ -49,7 +58,7 @@ Date: 2026-06-04
 | --- | ---: | --- | --- | --- |
 | `test_sockopt` | 44 | TCONF(门) | 1 | — |
 | `test_sockopt_v6` | 44 | TCONF(门) | 1 | — |
-| `test_1_to_1_sockopt` | 23 | TCONF(门) | 1 | — |
+| `test_1_to_1_sockopt` | 23 | **pass** | 1 | `target/oscomp/ltp-net-sctp-1to1-sockopt.txt` |
 | `test_tcp_style` | 22 | TCONF(门) | 1 | — |
 | `test_tcp_style_v6` | 22 | TCONF(门) | 1 | — |
 | `test_1_to_1_socket_bind_listen` | 15 | TCONF(门) | 1 | — |

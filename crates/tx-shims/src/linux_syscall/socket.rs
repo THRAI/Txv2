@@ -52,6 +52,9 @@ const MSG_CTRUNC_BITS: u32 = 0x08;
 const SCM_RIGHTS: i32 = 1;
 const MAX_MSG_IOV: u64 = 1024;
 const SOCKET_MSG_MAX_BYTES: usize = 1024 * 1024;
+/// Linux floor for SO_SNDBUF/SO_RCVBUF after the 2x bookkeeping multiplier
+/// (`SOCK_MIN_SNDBUF`/`SOCK_MIN_RCVBUF` ≈ `2048 + sizeof(struct sk_buff)`).
+const SOCK_MIN_BUF: usize = 2304;
 const NETLINK_RECVMSG_MAX: usize = 1024 * 1024;
 const NETLINK_INLINE_SEND_MAX: usize = 256;
 const IPT_GETINFO_BYTES: usize = 84;
@@ -1782,7 +1785,10 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
                 Ok(size) => size,
                 Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
             };
-            payload.with_options_mut(|opts| opts.socket.send_buf_size = size);
+            // Linux stores 2x the requested buffer (bookkeeping overhead) with a
+            // floor of SOCK_MIN_SNDBUF; getsockopt reads this doubled value back.
+            let stored = core::cmp::max(size.saturating_mul(2), SOCK_MIN_BUF);
+            payload.with_options_mut(|opts| opts.socket.send_buf_size = stored);
             Ok(())
         }
         (SOL_SOCKET, SO_SNDBUFFORCE) => {
@@ -1799,7 +1805,10 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
                 Ok(size) => size,
                 Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
             };
-            payload.with_options_mut(|opts| opts.socket.recv_buf_size = size);
+            // Linux stores 2x the requested buffer (bookkeeping overhead) with a
+            // floor of SOCK_MIN_RCVBUF; getsockopt reads this doubled value back.
+            let stored = core::cmp::max(size.saturating_mul(2), SOCK_MIN_BUF);
+            payload.with_options_mut(|opts| opts.socket.recv_buf_size = stored);
             Ok(())
         }
         (SOL_SOCKET, SO_NO_CHECK) => {
@@ -1943,6 +1952,65 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
                 opts.sctp.initmsg_max_attempts = max_attempts;
                 opts.sctp.initmsg_max_init_timeo = max_init_timeo;
             });
+            Ok(())
+        }
+        (SOL_SCTP, SCTP_AUTOCLOSE) => {
+            if socket.kind != SocketKind::Sctp {
+                return SyscallResult::Error(errno_to_i32(Errno::ENOPROTOOPT));
+            }
+            // SCTP_AUTOCLOSE is only valid on 1-to-many (SEQPACKET) sockets;
+            // on a 1-to-1 (TCP-style) socket Linux returns EOPNOTSUPP.
+            if payload.with_options(|o| o.socket.sock_type == SocketType::Stream) {
+                return SyscallResult::Error(errno_to_i32(Errno::EOPNOTSUPP));
+            }
+            // 1-to-many: accept and ignore the autoclose timeout for now.
+            Ok(())
+        }
+        (SOL_SCTP, SCTP_ASSOCINFO) => {
+            if socket.kind != SocketKind::Sctp {
+                return SyscallResult::Error(errno_to_i32(Errno::ENOPROTOOPT));
+            }
+            // struct sctp_assocparams { assoc_id (u32); sasoc_asocmaxrxt (u16);
+            //   sasoc_number_peer_destinations (u16); sasoc_peer_rwnd (u32);
+            //   sasoc_local_rwnd (u32); sasoc_cookie_life (u32) } = 20 bytes
+            if optlen < 20 {
+                return SyscallResult::Error(errno_to_i32(Errno::EINVAL));
+            }
+            let mut buf = [0u8; 20];
+            if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut buf, optval) {
+                return SyscallResult::Error(errno_to_i32(errno));
+            }
+            let asocmaxrxt = u16::from_le_bytes([buf[4], buf[5]]);
+            let number_peer_destinations = u16::from_le_bytes([buf[6], buf[7]]);
+            let peer_rwnd = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+            let local_rwnd = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+            let cookie_life = u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
+            payload.with_options_mut(|opts| {
+                opts.sctp.assoc_asocmaxrxt = asocmaxrxt;
+                opts.sctp.assoc_number_peer_destinations = number_peer_destinations;
+                opts.sctp.assoc_peer_rwnd = peer_rwnd;
+                opts.sctp.assoc_local_rwnd = local_rwnd;
+                opts.sctp.assoc_cookie_life = cookie_life;
+            });
+            Ok(())
+        }
+        (SOL_SCTP, SCTP_PRIMARY_ADDR) => {
+            if socket.kind != SocketKind::Sctp {
+                return SyscallResult::Error(errno_to_i32(Errno::ENOPROTOOPT));
+            }
+            // struct sctp_prim { ssp_assoc_id (u32); ssp_addr (sockaddr_storage) }
+            // packed = 4 + 128 = 132 bytes. We accept the request on a connected
+            // association without rebinding the (single, loopback) primary path.
+            if optlen < 132 {
+                return SyscallResult::Error(errno_to_i32(Errno::EINVAL));
+            }
+            let mut buf = [0u8; 132];
+            if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut buf, optval) {
+                return SyscallResult::Error(errno_to_i32(errno));
+            }
+            if socket_peer_endpoint(&socket).is_err() {
+                return SyscallResult::Error(errno_to_i32(Errno::ENOTCONN));
+            }
             Ok(())
         }
         (SOL_IPV6, IPV6_V6ONLY) => {
@@ -2492,6 +2560,60 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             buf[2..4].copy_from_slice(&max_instreams.to_le_bytes());
             buf[4..6].copy_from_slice(&max_attempts.to_le_bytes());
             buf[6..8].copy_from_slice(&max_init_timeo.to_le_bytes());
+            write_sockopt_bytes(ctx, optval, optlen_ptr, &buf)
+        }
+        (SOL_SCTP, SCTP_ASSOCINFO) if socket.kind == SocketKind::Sctp => {
+            // struct sctp_assocparams (20 bytes), see setsockopt arm above.
+            let (asocmaxrxt, number_peer_destinations, peer_rwnd, local_rwnd, cookie_life) =
+                payload.with_options(|o| {
+                    (
+                        o.sctp.assoc_asocmaxrxt,
+                        o.sctp.assoc_number_peer_destinations,
+                        o.sctp.assoc_peer_rwnd,
+                        o.sctp.assoc_local_rwnd,
+                        o.sctp.assoc_cookie_life,
+                    )
+                });
+            let mut buf = [0u8; 20];
+            buf[4..6].copy_from_slice(&asocmaxrxt.to_le_bytes());
+            buf[6..8].copy_from_slice(&number_peer_destinations.to_le_bytes());
+            buf[8..12].copy_from_slice(&peer_rwnd.to_le_bytes());
+            buf[12..16].copy_from_slice(&local_rwnd.to_le_bytes());
+            buf[16..20].copy_from_slice(&cookie_life.to_le_bytes());
+            write_sockopt_bytes(ctx, optval, optlen_ptr, &buf)
+        }
+        (SOL_SCTP, SCTP_STATUS) if socket.kind == SocketKind::Sctp => {
+            // struct sctp_status (176 bytes): assoc id/state/rwnd/streams +
+            // embedded sctp_paddrinfo. Report an ESTABLISHED association with the
+            // negotiated stream counts; loopback has no per-path metrics to fill.
+            let (instreams, outstreams) = payload
+                .with_options(|o| (o.sctp.initmsg_max_instreams, o.sctp.initmsg_num_ostreams));
+            let mut buf = [0u8; 176];
+            // sstat_state (s32 @4) = SCTP_STATE_ESTABLISHED (4).
+            buf[4..8].copy_from_slice(&4i32.to_le_bytes());
+            // sstat_instrms (u16 @16) / sstat_outstrms (u16 @18).
+            buf[16..18].copy_from_slice(&instreams.to_le_bytes());
+            buf[18..20].copy_from_slice(&outstreams.to_le_bytes());
+            // sstat_primary: sctp_paddrinfo @24, spinfo_address @28 (sockaddr_in).
+            if let Ok(endpoint) = socket_peer_endpoint(&socket) {
+                buf[28..30].copy_from_slice(&AF_INET.to_le_bytes());
+                buf[30..32].copy_from_slice(&endpoint.port.to_be_bytes());
+                buf[32..36].copy_from_slice(&endpoint.addr.octets());
+            }
+            // spinfo_state (s32 @156) = SCTP_ACTIVE (2).
+            buf[156..160].copy_from_slice(&2i32.to_le_bytes());
+            write_sockopt_bytes(ctx, optval, optlen_ptr, &buf)
+        }
+        (SOL_SCTP, SCTP_PRIMARY_ADDR) if socket.kind == SocketKind::Sctp => {
+            // struct sctp_prim { ssp_assoc_id (u32) @0; ssp_addr @4 } packed = 132B.
+            let endpoint = match socket_peer_endpoint(&socket) {
+                Ok(endpoint) => endpoint,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            let mut buf = [0u8; 132];
+            buf[4..6].copy_from_slice(&AF_INET.to_le_bytes());
+            buf[6..8].copy_from_slice(&endpoint.port.to_be_bytes());
+            buf[8..12].copy_from_slice(&endpoint.addr.octets());
             write_sockopt_bytes(ctx, optval, optlen_ptr, &buf)
         }
         (SOL_IPV6, IPV6_V6ONLY) if payload.family() == AddressFamily::Inet6 => write_sockopt_i32(

@@ -587,6 +587,11 @@ pub struct SctpLevelOptions {
     pub initmsg_max_instreams: u16,
     pub initmsg_max_attempts: u16,
     pub initmsg_max_init_timeo: u16,
+    pub assoc_asocmaxrxt: u16,
+    pub assoc_number_peer_destinations: u16,
+    pub assoc_peer_rwnd: u32,
+    pub assoc_local_rwnd: u32,
+    pub assoc_cookie_life: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -727,6 +732,11 @@ impl SocketOptionSet {
                 initmsg_max_instreams: 65535,
                 initmsg_max_attempts: 8,
                 initmsg_max_init_timeo: 0,
+                assoc_asocmaxrxt: 10,
+                assoc_number_peer_destinations: 0,
+                assoc_peer_rwnd: 0,
+                assoc_local_rwnd: 0,
+                assoc_cookie_life: 60000,
             },
         }
     }
@@ -788,6 +798,11 @@ impl SocketOptionSet {
                 initmsg_max_instreams: 65535,
                 initmsg_max_attempts: 8,
                 initmsg_max_init_timeo: 0,
+                assoc_asocmaxrxt: 10,
+                assoc_number_peer_destinations: 0,
+                assoc_peer_rwnd: 0,
+                assoc_local_rwnd: 0,
+                assoc_cookie_life: 60000,
             },
         }
     }
