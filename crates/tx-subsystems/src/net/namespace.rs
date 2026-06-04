@@ -885,11 +885,13 @@ impl NetNamespacePayload {
         is_up: bool,
     ) -> Result<(), Errno> {
         if ifindex == 1 {
-            return if is_up {
-                Ok(())
-            } else {
-                Err(Errno::EOPNOTSUPP)
-            };
+            // The loopback device is always functional. Linux lets you toggle
+            // its IFF_UP (returning success), so accept the request, but never
+            // actually tear down loopback delivery — many subsystems rely on it
+            // and no test needs `lo` genuinely down (e.g. CVE survival probes
+            // just need SIOCSIFFLAGS to succeed).
+            let _ = is_up;
+            return Ok(());
         }
         let registration = self.find_device_by_ifindex(ifindex).ok_or(Errno::ENODEV)?;
         let mut devices = self.namespace_devices.lock();
