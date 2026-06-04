@@ -1086,6 +1086,50 @@ impl AddressSpace {
         emit_vm_trace(b"debug.vm.mmap.commit.phase", 4);
         Ok(commit)
     }
+
+    /// Install many recipe rows on a *detached* aspace (exec image build,
+    /// interpreter load) in a single `RecipeTree` publish.
+    ///
+    /// Mirrors `fork_aspace`'s batched commit: acquire the full user-range
+    /// `ExclusiveWriter` once (the aspace has no thread in it yet, so this is
+    /// uncontended), auto-attach a fresh `PrivatePageSet` to every private
+    /// entry that lacks one (matching `reserve_map`, so later fork CoW has a
+    /// per-`VmEntry` store to share), then commit all entries through one
+    /// `commit_many_require_free`. This replaces the previous per-segment
+    /// `reserve_map`/`commit` loop, whose per-entry `commit_map` cloned the
+    /// whole tree — turning exec's ~O(M^2) entry copies + M publishes into
+    /// O(M) copies and a single publish. `RequireFree` validation runs per
+    /// entry inside `commit_many_require_free` against the growing rewritten
+    /// tree, so intra-batch and against-existing overlaps are still rejected.
+    pub fn commit_recipes_detached(
+        &self,
+        entries: Vec<VmEntry>,
+    ) -> Result<VmMapCommit, VmMapError> {
+        let V3StepOutcome::Done(_guard) = self
+            .range_lock
+            .acquire_step(UserRange::full_user_v1(), LockMode::ExclusiveWriter)
+        else {
+            return Err(VmMapError::WouldBlock);
+        };
+
+        let mut prepared = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let entry = if !entry.flags.shared && entry.private.is_none() {
+                match PrivatePageSet::new_cap() {
+                    Ok(set) => entry.with_private(Some(set)),
+                    Err(e) => return Err(VmMapError::Private(PrivatePageError::Zone(e))),
+                }
+            } else {
+                entry
+            };
+            prepared.push(entry);
+        }
+
+        let commit = self.recipes.commit_many_require_free(prepared)?;
+        let guard = step_engine::guard();
+        self.stats.store(self.recipes.stats(&guard));
+        Ok(commit)
+    }
 }
 
 fn remap_union_range(old_range: UserRange, new_range: UserRange) -> Result<UserRange, VmMapError> {

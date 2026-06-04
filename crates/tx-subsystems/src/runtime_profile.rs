@@ -34,6 +34,30 @@ static MMAP: AtomicU64 = AtomicU64::new(0);
 static MPROTECT: AtomicU64 = AtomicU64::new(0);
 static MUNMAP: AtomicU64 = AtomicU64::new(0);
 
+// VM recipe-tree republish accounting. Every `RecipeIndex` mutator (map,
+// unmap, protect, fork's batched commit, exec's per-segment registration)
+// swaps in a freshly cloned tree through `RecipeIndex::publish`. These two
+// counters expose how often that happens and how many entries the published
+// trees carry, so a trace can see exec's O(M^2) per-segment republish versus
+// fork's single O(M) batched commit — without timing instrumentation.
+static RECIPE_PUBLISHES: AtomicU64 = AtomicU64::new(0);
+static RECIPE_ENTRY_COPIES: AtomicU64 = AtomicU64::new(0);
+// Peak published-tree size seen across all aspaces. A heap that fragments
+// (one anon VmEntry per page-crossing brk growth) drives this up, so it
+// quantifies the worst-case whole-tree-clone cost and bounds the win from
+// coalescing brk growth into the adjacent heap entry.
+static RECIPE_MAX_TREE: AtomicU64 = AtomicU64::new(0);
+// Per-source recipe-publish attribution: which RecipeIndex mutator triggered
+// each whole-tree-clone publish. Sum should equal RECIPE_PUBLISHES; pins down
+// where the publish volume actually comes from.
+static PUB_MAP: AtomicU64 = AtomicU64::new(0);
+static PUB_MAP_MANY: AtomicU64 = AtomicU64::new(0);
+static PUB_UNMAP: AtomicU64 = AtomicU64::new(0);
+static PUB_PROTECT: AtomicU64 = AtomicU64::new(0);
+static PUB_MLOCK: AtomicU64 = AtomicU64::new(0);
+static PUB_REMAP: AtomicU64 = AtomicU64::new(0);
+static PUB_UFD: AtomicU64 = AtomicU64::new(0);
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Snapshot {
     pub syscalls: u64,
@@ -62,6 +86,16 @@ pub struct Snapshot {
     pub mmap: u64,
     pub mprotect: u64,
     pub munmap: u64,
+    pub recipe_publishes: u64,
+    pub recipe_entry_copies: u64,
+    pub recipe_max_tree: u64,
+    pub pub_map: u64,
+    pub pub_map_many: u64,
+    pub pub_unmap: u64,
+    pub pub_protect: u64,
+    pub pub_mlock: u64,
+    pub pub_remap: u64,
+    pub pub_ufd: u64,
 }
 
 pub fn record_syscall(nr: u64, args: [u64; 6]) {
@@ -143,6 +177,41 @@ pub fn record_unknown_user_fault() {
     UPF.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Record one recipe-tree publication and the number of entries in the newly
+/// published tree (a proxy for the per-publish whole-tree clone cost). Called
+/// from `RecipeIndex::publish`; cheap relaxed atomics, safe in any context.
+pub fn record_recipe_publish(published_entries: u64) {
+    RECIPE_PUBLISHES.fetch_add(1, Ordering::Relaxed);
+    RECIPE_ENTRY_COPIES.fetch_add(published_entries, Ordering::Relaxed);
+    RECIPE_MAX_TREE.fetch_max(published_entries, Ordering::Relaxed);
+}
+
+/// Source of a recipe-tree publish, for per-caller attribution.
+#[derive(Clone, Copy)]
+pub enum RecipeSource {
+    Map,
+    MapMany,
+    Unmap,
+    Protect,
+    Mlock,
+    Remap,
+    Ufd,
+}
+
+/// Record which `RecipeIndex` mutator triggered a recipe publish.
+pub fn record_recipe_source(src: RecipeSource) {
+    let counter = match src {
+        RecipeSource::Map => &PUB_MAP,
+        RecipeSource::MapMany => &PUB_MAP_MANY,
+        RecipeSource::Unmap => &PUB_UNMAP,
+        RecipeSource::Protect => &PUB_PROTECT,
+        RecipeSource::Mlock => &PUB_MLOCK,
+        RecipeSource::Remap => &PUB_REMAP,
+        RecipeSource::Ufd => &PUB_UFD,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
 pub fn snapshot() -> Snapshot {
     Snapshot {
         syscalls: SYSCALLS.load(Ordering::Relaxed),
@@ -171,5 +240,15 @@ pub fn snapshot() -> Snapshot {
         mmap: MMAP.load(Ordering::Relaxed),
         mprotect: MPROTECT.load(Ordering::Relaxed),
         munmap: MUNMAP.load(Ordering::Relaxed),
+        recipe_publishes: RECIPE_PUBLISHES.load(Ordering::Relaxed),
+        recipe_entry_copies: RECIPE_ENTRY_COPIES.load(Ordering::Relaxed),
+        recipe_max_tree: RECIPE_MAX_TREE.load(Ordering::Relaxed),
+        pub_map: PUB_MAP.load(Ordering::Relaxed),
+        pub_map_many: PUB_MAP_MANY.load(Ordering::Relaxed),
+        pub_unmap: PUB_UNMAP.load(Ordering::Relaxed),
+        pub_protect: PUB_PROTECT.load(Ordering::Relaxed),
+        pub_mlock: PUB_MLOCK.load(Ordering::Relaxed),
+        pub_remap: PUB_REMAP.load(Ordering::Relaxed),
+        pub_ufd: PUB_UFD.load(Ordering::Relaxed),
     }
 }
