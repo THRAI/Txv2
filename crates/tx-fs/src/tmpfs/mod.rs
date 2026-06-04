@@ -18,9 +18,9 @@
 //!   use `PageContainerKind::Anon { swap_policy: Reclaimable }`,
 //!   reclaim-eligible per spec.
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 pub mod adapter;
@@ -84,7 +84,7 @@ enum TmpfsPayload {
     /// through `readlink`-style paths (deferred — Phase 3b only
     /// surfaces creation), so the variant currently appears unread.
     #[cfg_attr(test, allow(dead_code))]
-    Symlink(Vec<u8>),
+    Symlink(Arc<[u8]>),
 }
 
 /// One inode entry. Stored inside `TmpfsState::inodes`, keyed by id.
@@ -114,6 +114,38 @@ impl TmpfsState {
         );
         Self { inodes }
     }
+}
+
+#[derive(Clone, Debug)]
+struct InodeMetaSnapshot {
+    meta: InodeMeta,
+    nlink: u32,
+    size_source: Option<Cap<PageContainer>>,
+}
+
+fn inode_meta_from_snapshot(snapshot: InodeMetaSnapshot) -> InodeMeta {
+    let mut meta = snapshot.meta;
+    meta.nlinks = snapshot.nlink;
+    if let Some(container) = snapshot.size_source {
+        meta.size = container.size_bytes();
+    }
+    meta
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReaddirEntrySnapshot {
+    child_id: FsObjectId,
+    kind: InodeKind,
+    name: InlineName,
+    next_cursor: DirCursor,
+}
+
+fn dir_entry_from_readdir_snapshot(
+    snapshot: ReaddirEntrySnapshot,
+) -> Result<(DirEntry, DirCursor), step_engine::Errno> {
+    let entry = DirEntry::new(snapshot.child_id, snapshot.kind, snapshot.name.as_bytes())
+        .map_err(step_engine::Errno::from)?;
+    Ok((entry, snapshot.next_cursor))
 }
 
 /// In-memory tmpfs backend.
@@ -241,26 +273,28 @@ impl FsOps for Tmpfs {
         fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<InodeMeta, NoProgress> {
-        let state = self.state.lock();
-        match state.inodes.get(&fs_object_id) {
-            Some(inode) => {
-                let mut meta = inode.meta;
-                meta.nlinks = inode.nlink;
-                // For regular files the authoritative size lives in
-                // the PageContainer: writes via `step_write_from_*`
-                // call `pc.grow_size_to`, which the cached
-                // `payload.size`/`meta.size` do not observe (the
-                // syscall path doesn't round-trip through tmpfs).
-                // Truncate keeps both fields in sync, but a plain
-                // `write(2)` only bumps `pc.size_bytes`. Report that
-                // as the visible `st_size`.
-                if let TmpfsPayload::RegularFile { container, .. } = &inode.payload {
-                    meta.size = container.size_bytes();
-                }
-                StepOutcome::done(meta)
+        let snapshot = {
+            let state = self.state.lock();
+            let Some(inode) = state.inodes.get(&fs_object_id) else {
+                return StepOutcome::err(step_engine::Errno::ENOENT);
+            };
+            // For regular files the authoritative size lives in the
+            // PageContainer: writes via `step_write_from_*` call
+            // `pc.grow_size_to`, which the cached `payload.size` /
+            // `meta.size` do not observe. Snapshot the container cap
+            // here, then read the size after dropping the tmpfs
+            // mount-wide state lock.
+            let size_source = match &inode.payload {
+                TmpfsPayload::RegularFile { container, .. } => Some(container.clone()),
+                _ => None,
+            };
+            InodeMetaSnapshot {
+                meta: inode.meta,
+                nlink: inode.nlink,
+                size_source,
             }
-            None => StepOutcome::err(step_engine::Errno::ENOENT),
-        }
+        };
+        StepOutcome::done(inode_meta_from_snapshot(snapshot))
     }
 
     fn serialize_inode_meta(
@@ -445,21 +479,67 @@ impl FsOps for Tmpfs {
         }
 
         let mut state = self.state.lock();
+        let (target_id, displaced_id) = {
+            let Some(parent_inode) = state.inodes.get(&old_parent) else {
+                return StepOutcome::err(step_engine::Errno::ENOENT);
+            };
+            let TmpfsPayload::Directory(children) = &parent_inode.payload else {
+                return StepOutcome::err(step_engine::Errno::ENOTDIR);
+            };
+            let Some(target_id) = children.get(&old_key).copied() else {
+                return StepOutcome::err(step_engine::Errno::ENOENT);
+            };
+            let displaced_id = children.get(&new_key).copied();
+            if displaced_id == Some(target_id) {
+                return StepOutcome::done(());
+            }
+            if let Some(displaced_id) = displaced_id {
+                let Some(target_inode) = state.inodes.get(&target_id) else {
+                    return StepOutcome::err(step_engine::Errno::ENOENT);
+                };
+                let Some(displaced_inode) = state.inodes.get(&displaced_id) else {
+                    return StepOutcome::err(step_engine::Errno::ENOENT);
+                };
+                let target_is_dir = matches!(target_inode.payload, TmpfsPayload::Directory(_));
+                let displaced_is_dir =
+                    matches!(displaced_inode.payload, TmpfsPayload::Directory(_));
+                if !target_is_dir && displaced_is_dir {
+                    return StepOutcome::err(step_engine::Errno::EISDIR);
+                }
+                if target_is_dir && !displaced_is_dir {
+                    return StepOutcome::err(step_engine::Errno::ENOTDIR);
+                }
+                if target_is_dir {
+                    if let TmpfsPayload::Directory(children) = &displaced_inode.payload {
+                        if !children.is_empty() {
+                            return StepOutcome::err(step_engine::Errno::ENOTEMPTY);
+                        }
+                    }
+                }
+            }
+            (target_id, displaced_id)
+        };
         let Some(parent_inode) = state.inodes.get_mut(&old_parent) else {
             return StepOutcome::err(step_engine::Errno::ENOENT);
         };
         let TmpfsPayload::Directory(children) = &mut parent_inode.payload else {
             return StepOutcome::err(step_engine::Errno::ENOTDIR);
         };
-        let Some(target_id) = children.remove(&old_key) else {
-            return StepOutcome::err(step_engine::Errno::ENOENT);
-        };
-        // If a file exists at the destination, replace it (POSIX
-        // rename semantics for same-type-collision; cross-type
-        // collision is left as a follow-up alongside cross-dir).
+        children.remove(&old_key);
+        // If a same-type object exists at the destination, replace it
+        // with POSIX-shaped rename semantics. Cross-type collisions
+        // were rejected in the read-only validation phase above.
         let displaced = children.insert(new_key, target_id);
+        debug_assert_eq!(displaced, displaced_id);
         if let Some(displaced_id) = displaced {
-            state.inodes.remove(&displaced_id);
+            if let Some(displaced_inode) = state.inodes.get_mut(&displaced_id) {
+                if displaced_inode.nlink > 1 {
+                    displaced_inode.nlink -= 1;
+                    displaced_inode.meta.nlinks = displaced_inode.nlink;
+                } else {
+                    state.inodes.remove(&displaced_id);
+                }
+            }
         }
         StepOutcome::done(())
     }
@@ -471,12 +551,12 @@ impl FsOps for Tmpfs {
         target: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        let mut state = self.state.lock();
         // Validate name is valid.
         let iname = match InlineName::new(name) {
             Ok(n) => n,
             Err(_) => return StepOutcome::err(step_engine::Errno::ENAMETOOLONG),
         };
+        let mut state = self.state.lock();
         // Phase 1: immutable checks — parent exists, is a directory,
         // name is free.
         {
@@ -490,12 +570,22 @@ impl FsOps for Tmpfs {
                 }
             }
         }
-        // Phase 2: mutable ops — validate target, insert link.
-        let _target_inode = match state.inodes.get_mut(&target) {
+        // Phase 2: validate target.
+        match state.inodes.get(&target) {
             Some(i) if matches!(i.payload, TmpfsPayload::RegularFile { .. }) => i,
             Some(_) => return StepOutcome::err(step_engine::Errno::EPERM),
             None => return StepOutcome::err(step_engine::Errno::ENOENT),
         };
+
+        // Phase 3: mutable ops — publish the alias and reflect the
+        // extra namespace reference in the inode metadata.
+        let target_inode = state
+            .inodes
+            .get_mut(&target)
+            .expect("target inode disappeared mid-link");
+        target_inode.nlink = target_inode.nlink.saturating_add(1);
+        target_inode.meta.nlinks = target_inode.nlink;
+
         let parent_inode = match state.inodes.get_mut(&parent) {
             Some(i) => i,
             None => return StepOutcome::err(step_engine::Errno::ENOTDIR),
@@ -619,8 +709,7 @@ impl FsOps for Tmpfs {
         meta.uid = cred.uid;
         meta.gid = cred.gid;
         meta.size = link_target.len() as u64;
-        let mut target = Vec::with_capacity(link_target.len());
-        target.extend_from_slice(link_target);
+        let target = Arc::<[u8]>::from(link_target);
 
         let mut state = self.state.lock();
         let Some(parent_inode) = state.inodes.get_mut(&parent) else {
@@ -652,30 +741,39 @@ impl FsOps for Tmpfs {
         cursor: DirCursor,
         _guard: &Guard<'_>,
     ) -> StepOutcome<Option<(DirEntry, DirCursor)>, NoProgress> {
-        let state = self.state.lock();
-        let Some(parent_inode) = state.inodes.get(&fs_object_id) else {
-            return StepOutcome::err(step_engine::Errno::ENOENT);
+        let snapshot = {
+            let state = self.state.lock();
+            let Some(parent_inode) = state.inodes.get(&fs_object_id) else {
+                return StepOutcome::err(step_engine::Errno::ENOENT);
+            };
+            let TmpfsPayload::Directory(children) = &parent_inode.payload else {
+                return StepOutcome::err(step_engine::Errno::ENOTDIR);
+            };
+            let index = cursor.as_u64() as usize;
+            let Some((name, child_id)) = children.iter().nth(index) else {
+                return StepOutcome::done(None);
+            };
+            // Resolve child kind for the DirEntry by peeking the child
+            // inode's meta. Falls back to Regular if the child is missing
+            // (a state inconsistency we shouldn't observe in practice).
+            let kind = state
+                .inodes
+                .get(child_id)
+                .map(|child| child.meta.kind())
+                .unwrap_or(InodeKind::Regular);
+            ReaddirEntrySnapshot {
+                child_id: *child_id,
+                kind,
+                name: *name,
+                next_cursor: DirCursor::from_u64(cursor.as_u64() + 1),
+            }
         };
-        let TmpfsPayload::Directory(children) = &parent_inode.payload else {
-            return StepOutcome::err(step_engine::Errno::ENOTDIR);
+
+        let entry = match dir_entry_from_readdir_snapshot(snapshot) {
+            Ok(entry) => entry,
+            Err(err) => return StepOutcome::err(err),
         };
-        let index = cursor.as_u64() as usize;
-        let Some((name, child_id)) = children.iter().nth(index) else {
-            return StepOutcome::done(None);
-        };
-        // Resolve child kind for the DirEntry by peeking the child
-        // inode's meta. Falls back to Regular if the child is missing
-        // (a state inconsistency we shouldn't observe in practice).
-        let kind = state
-            .inodes
-            .get(child_id)
-            .map(|child| child.meta.kind())
-            .unwrap_or(InodeKind::Regular);
-        let entry = match DirEntry::new(*child_id, kind, name.as_bytes()) {
-            Ok(e) => e,
-            Err(err) => return StepOutcome::err(err.into()),
-        };
-        StepOutcome::done(Some((entry, DirCursor::from_u64(cursor.as_u64() + 1))))
+        StepOutcome::done(Some(entry))
     }
 
     fn destroy_inode(
@@ -719,7 +817,7 @@ impl FsOps for Tmpfs {
                 _ => return StepOutcome::err(step_engine::Errno::EINVAL),
             }
         };
-        StepOutcome::done(target.into_boxed_slice())
+        StepOutcome::done(Box::<[u8]>::from(&*target))
     }
 
     /// Materialise a `Cap<RNode>` for a non-directory, non-symlink

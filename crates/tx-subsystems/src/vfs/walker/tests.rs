@@ -13,17 +13,17 @@ use crate::mount::{
 };
 use crate::tty::execution::{register_console_alias, register_hardware};
 use crate::tty::structure::TtyIdentity;
-use crate::vfs::FsOps;
 use crate::vfs::adapter::step_engine::{
-    ByteProgress, Cap, Errno as V3Errno, SpinMutex, StepOutcome as V3, StepOutcome, guard,
-    reserve_for, sign_for,
+    guard, reserve_for, sign_for, ByteProgress, Cap, Errno as V3Errno, SpinMutex,
+    StepOutcome as V3, StepOutcome,
 };
 use crate::vfs::structure::{
     Credential, DEntry, FsObjectId, InlineName, InodeKind, InodeMeta, OpenFileFlags, RNode,
     RNodeBacking, S_IFDIR,
 };
+use crate::vfs::FsOps;
 
-use super::{SYMLOOP_MAX, step_open, step_walk, step_walk_in_mount_namespace};
+use super::{step_open, step_walk, step_walk_in_mount_namespace, SYMLOOP_MAX};
 
 // === capturing char-device binding for the console TTY ================
 
@@ -103,11 +103,29 @@ struct TestFsInner {
     inodes: alloc::collections::BTreeMap<FsObjectId, FixtureInodeRow>,
     lookup_count: usize,
     load_meta_count: usize,
+    read_link_count: usize,
     materialise_count: usize,
+    next_lookup_yield: Option<LookupYield>,
+    next_load_meta_yield: Option<InodeYield>,
+    next_read_link_yield: Option<InodeYield>,
+    next_materialise_yield: Option<InodeYield>,
     next_id: u64,
 }
 
 type FixtureInodeRow = (InodeKind, Option<alloc::vec::Vec<u8>>, u16, u32, u32);
+
+struct LookupYield {
+    parent: FsObjectId,
+    name: alloc::vec::Vec<u8>,
+    source_id: u64,
+    interests: u64,
+}
+
+struct InodeYield {
+    fs_object_id: FsObjectId,
+    source_id: u64,
+    interests: u64,
+}
 
 // Default mode-low-bits for the legacy `add_*` helpers. The DAC slice
 // uses 0o755 for directories so the walker's descent X-bit check
@@ -124,7 +142,12 @@ impl TestFs {
             inodes: alloc::collections::BTreeMap::new(),
             lookup_count: 0,
             load_meta_count: 0,
+            read_link_count: 0,
             materialise_count: 0,
+            next_lookup_yield: None,
+            next_load_meta_yield: None,
+            next_read_link_yield: None,
+            next_materialise_yield: None,
             next_id: root_id.as_u64() + 1,
         };
         inner
@@ -241,6 +264,43 @@ impl TestFs {
             inner.load_meta_count,
             inner.materialise_count,
         )
+    }
+
+    fn yield_next_lookup(&self, parent: FsObjectId, name: &[u8], source_id: u64, interests: u64) {
+        self.inner.lock().next_lookup_yield = Some(LookupYield {
+            parent,
+            name: name.to_vec(),
+            source_id,
+            interests,
+        });
+    }
+
+    fn yield_next_load_inode_meta(&self, fs_object_id: FsObjectId, source_id: u64, interests: u64) {
+        self.inner.lock().next_load_meta_yield = Some(InodeYield {
+            fs_object_id,
+            source_id,
+            interests,
+        });
+    }
+
+    fn yield_next_read_link(&self, fs_object_id: FsObjectId, source_id: u64, interests: u64) {
+        self.inner.lock().next_read_link_yield = Some(InodeYield {
+            fs_object_id,
+            source_id,
+            interests,
+        });
+    }
+
+    fn yield_next_materialise(&self, fs_object_id: FsObjectId, source_id: u64, interests: u64) {
+        self.inner.lock().next_materialise_yield = Some(InodeYield {
+            fs_object_id,
+            source_id,
+            interests,
+        });
+    }
+
+    fn read_link_count(&self) -> usize {
+        self.inner.lock().read_link_count
     }
 
     /// Set per-inode (mode-low-bits, uid, gid) directly. Used by the
@@ -726,6 +786,72 @@ fn step_walk_uses_mount_namespace_table_before_global_fallback() {
         V3::Err(V3Errno::ENOENT) => {}
         other => panic!("expected namespace without mount to hide /dev contents, got {other:?}"),
     }
+}
+
+#[test]
+fn run_walker_resume_preserves_mount_namespace() {
+    let _serial = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_zones();
+    crate::mount::reset_mount_table_for_test();
+    let topo = build_rootfs();
+    let (dev_mount, _tty) = mount_devfs_at_dev(&topo);
+
+    let root_dev_id =
+        match <TestFs as FsOps>::lookup(&*topo.rootfs, FsObjectId::new(2), b"dev", &guard()) {
+            V3::Done(id) => id,
+            other => panic!("rootfs lookup(dev) failed: {other:?}"),
+        };
+    let rootfs_payload = topo
+        .root_dentry
+        .rnode()
+        .containing_mount_weak()
+        .expect("root rnode has containing_mount")
+        .upgrade(&guard())
+        .expect("rootfs payload upgrade");
+    let ns_with_mount =
+        crate::mount::MountNamespace::new_cap(topo.root_mount.clone()).expect("ns cap");
+    ns_with_mount.register_mount(&rootfs_payload, root_dev_id, dev_mount);
+
+    topo.rootfs
+        .yield_next_lookup(FsObjectId::new(2), b"dev", 0x61, 0x01);
+
+    let cred = Credential::root();
+    let first_guard = guard();
+    let state = crate::vfs::resolution::driver::run_walker_with_mount_namespace(
+        topo.root_dentry.clone(),
+        b"/dev/consoledir",
+        crate::vfs::resolution::state::WalkMode::Entity,
+        crate::vfs::resolution::state::FinalSymlinkPolicy::Follow,
+        &cred,
+        Some(&ns_with_mount),
+        &first_guard,
+    );
+    drop(first_guard);
+
+    let resume = match state {
+        crate::vfs::resolution::state::WalkState::Defer { resume, .. } => resume,
+        other => panic!("expected deferred namespace walk, got {other:?}"),
+    };
+
+    let second_guard = guard();
+    let resolved = crate::vfs::resolution::driver::resume_walker(
+        resume,
+        crate::vfs::resolution::state::WalkMode::Entity,
+        crate::vfs::resolution::state::FinalSymlinkPolicy::Follow,
+        &cred,
+        &second_guard,
+    )
+    .expect("resume should preserve namespace-local mount crossing");
+    drop(second_guard);
+
+    assert_eq!(resolved.dentry.name().as_bytes(), b"consoledir");
+    assert!(
+        resolved.rnode.fs_object_id().as_u64() > 0x6465_7600,
+        "expected devfs namespace object after resume, got {:?}",
+        resolved.rnode.fs_object_id()
+    );
 }
 
 // === DAC predicate tests (Wave 3 Part 2) ==============================

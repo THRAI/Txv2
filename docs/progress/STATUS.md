@@ -1,3 +1,255 @@
+- 2026-06-04 **tmpfs rename rejects non-empty directory replacement before mutation.**
+  Continued the filesystem SMP gap audit repair stream from
+  `docs/progress/research/2026-06-03-filesystem-smp-gap-audit.md`. tmpfs
+  same-directory `rename` now rejects directory-over-non-empty-directory
+  replacement as `ENOTEMPTY` during the read-only validation phase, before
+  removing the source name or replacing the destination entry. The regression
+  keeps the source directory, target directory, and target child all resolvable
+  after the failed operation. Verification: `cargo test -p tx-fs
+  tmpfs_rename_ -- --nocapture` passed after first confirming the new
+  non-empty-directory regression failed on the old implementation with
+  `Done(())`. Next step: keep cross-directory rename and the full tmpfs state
+  split as separate trace-gated work.
+
+- 2026-06-04 **tmpfs rename rejects file-directory cross-type replacement before mutation.**
+  Continued the filesystem SMP gap audit repair stream from
+  `docs/progress/research/2026-06-03-filesystem-smp-gap-audit.md`. tmpfs
+  same-directory `rename` now validates source and destination inode kinds
+  before mutating the directory map: regular-file-over-directory returns
+  `EISDIR`, directory-over-regular-file returns `ENOTDIR`, and both names
+  continue to resolve to their original inode ids after the failed operation.
+  This closes the drift where cross-type replacement returned `Done(())` and
+  rewired the namespace. Verification: `cargo test -p tx-fs
+  tmpfs_rename_file_over_directory_returns_eisdir_without_mutating_namespace
+  -- --nocapture`, `cargo test -p tx-fs
+  tmpfs_rename_directory_over_file_returns_enotdir_without_mutating_namespace
+  -- --nocapture`, `cargo test -p tx-fs
+  tmpfs_rename_over_hard_linked_target_decrements_one_name -- --nocapture`,
+  and `cargo test -p tx-fs
+  tmpfs_rename_between_hard_links_to_same_inode_is_noop -- --nocapture`
+  passed. Next step: keep tmpfs same-directory rename coverage focused on
+  namespace semantics while leaving cross-directory rename and the full state
+  split as separate, trace-gated work.
+
+- 2026-06-04 **pthread clone path attribution points at reactor submit and terminal drain.**
+  Added opt-in `tx_clone_path_metrics` counters around `sys_clone_oneshot`,
+  `step_clone_thread`, `sign_thread`, and child reactor submission, then
+  captured `target/oscomp/custom-run/clone-path-light-pthread-serial1-smp1-20260604`
+  with `--smp 1`. The run is complete/lossless (`raw_records=468,531`, zero
+  lost/overwritten/repairs) and completed `b_pthread_createjoin_serial1` in
+  `25.039005000`. `sys_clone` totals `3.576s` (`p50=1.397ms`) while
+  `rt_sigprocmask` totals `2.020s` (`p50=192us`), separating the shared syscall
+  floor from clone-specific work. The explicit clone body is `3.259s`, led by
+  reactor submission (`1.790s`) and child-submit terminal drain (`0.783s`),
+  with `step_clone_thread` at `1.126s`. Details:
+  `docs/progress/research/2026-06-04-clone-path-pthread.md`. Next step: split
+  child reactor submission / terminal-child drain internals before chasing TID
+  allocation or recipe changes in the clone lane.
+
+- 2026-06-04 **tmpfs rename between hard links to the same inode is a no-op.**
+  Continued the filesystem SMP gap audit repair stream from
+  `docs/progress/research/2026-06-03-filesystem-smp-gap-audit.md`. tmpfs
+  same-directory `rename` now detects when the old and new directory entries
+  already point at the same inode, returning success without removing the old
+  name or decrementing `nlink`. This fixes the drift where
+  `rename(primary, alias)` for two hard links to the same regular file removed
+  `primary` and incorrectly reduced the visible link count. Verification:
+  `cargo test -p tx-fs
+  tmpfs_rename_between_hard_links_to_same_inode_is_noop -- --nocapture`,
+  `cargo test -p tx-fs
+  tmpfs_rename_over_hard_linked_target_decrements_one_name -- --nocapture`,
+  and `cargo test -p tx-fs
+  tmpfs_link_increments_nlink_and_unlink_decrements_one_name -- --nocapture`
+  passed. Next step: continue tmpfs namespace-semantic cleanup while keeping
+  cross-directory rename and the full state split as separate trace-gated work.
+
+- 2026-06-04 **tmpfs rename preserves displaced hard-linked inodes.**
+  Continued the filesystem SMP gap audit repair stream from
+  `docs/progress/research/2026-06-03-filesystem-smp-gap-audit.md`. tmpfs
+  same-directory `rename` now treats an overwritten destination name like a
+  single namespace unlink: when the displaced inode has another hard-link
+  alias, it decrements `nlink` / cached metadata and keeps the inode table
+  entry alive instead of removing it outright. This fixes the drift where
+  `rename(source, target)` could leave `target_alias` resolving to an inode id
+  that `load_inode_meta` reported as `ENOENT`. Verification: `cargo test -p
+  tx-fs tmpfs_rename_over_hard_linked_target_decrements_one_name --
+  --nocapture` and `cargo test -p tx-fs
+  tmpfs_link_increments_nlink_and_unlink_decrements_one_name -- --nocapture`
+  passed. Next step: keep tmpfs namespace semantics and bounded lock-service
+  cleanup moving while leaving cross-directory rename and the full state split
+  as separate, trace-gated work.
+
+- 2026-06-04 **tmpfs hard links now update inode link count.**
+  Continued the filesystem SMP gap audit repair stream from
+  `docs/progress/research/2026-06-03-filesystem-smp-gap-audit.md`. tmpfs
+  `link` now validates the new name before taking `debug.lock.fs.tmpfs.state`
+  and increments the target regular file's `nlink` / cached metadata when
+  publishing the alias. This fixes a semantic drift where `load_inode_meta`
+  still reported one link after a successful hard link, and keeps a later
+  `unlink` of one name from driving the count to zero while another name still
+  resolves the same inode. Verification: `cargo test -p tx-fs
+  tmpfs_link_increments_nlink_and_unlink_decrements_one_name -- --nocapture`,
+  `cargo test -p tx-fs
+  tmpfs_unlink_unhooks_name_but_keeps_inode_until_destroy_inode --
+  --nocapture`, and `cargo test -p tx-fs tmpfs_create_then_lookup_round_trip
+  -- --nocapture` passed. Next step: continue bounded tmpfs lock-service
+  cleanup while leaving the full state split trace-gated.
+
+- 2026-06-04 **tmpfs load_inode_meta reads PageContainer size outside the state lock.**
+  Continued the filesystem SMP gap audit repair stream from
+  `docs/progress/research/2026-06-03-filesystem-smp-gap-audit.md`. tmpfs
+  `load_inode_meta` now snapshots inode metadata, link count, and the optional
+  regular-file `PageContainer` cap while holding `debug.lock.fs.tmpfs.state`,
+  then reads `PageContainer::size_bytes()` after dropping the mount-wide state
+  lock. This keeps visible `st_size` synchronized with PageBacked writes
+  without serving the PageContainer size query inside the tmpfs namespace lock.
+  Caveat: the regular-file container cap is still cloned under the tmpfs lock,
+  so this is a narrow lock-service shrink rather than the per-inode/per-
+  directory split. Verification: `cargo test -p tx-fs
+  tmpfs_inode_meta_snapshot_reads_pagecontainer_size_after_snapshot --
+  --nocapture`, `cargo test -p tx-fs
+  tmpfs_v3_truncate_then_load_meta_reflects_size -- --nocapture`, `cargo test
+  -p tx-fs tmpfs_fetch_page_materialises_anon_then_flush_noop -- --nocapture`,
+  and `cargo test -p tx-fs tmpfs_create_then_lookup_round_trip --
+  --nocapture` passed. Next step: keep tmpfs state splitting gated on
+  lock-service traces and continue removing bounded lock-held clone/copy work.
+
+- 2026-06-04 **tmpfs readdir builds DirEntry outside the mount-wide state lock.**
+  Continued the filesystem SMP gap audit repair stream from
+  `docs/progress/research/2026-06-03-filesystem-smp-gap-audit.md`. tmpfs
+  `readdir` now snapshots only `(child id, child kind, inline name, next
+  cursor)` while holding `debug.lock.fs.tmpfs.state`, then constructs the
+  returned `DirEntry` after dropping the mount-wide state lock. This removes
+  name validation/copy work from the tmpfs state critical section without
+  changing the external directory enumeration contract. Verification:
+  `cargo test -p tx-fs
+  tmpfs_readdir_snapshot_builds_direntry_without_state_borrow --
+  --nocapture` and `cargo test -p tx-fs
+  tmpfs_mkdir_then_readdir_yields_dir_entry -- --nocapture` passed. Next step:
+  keep hunting bounded lock-held clone/copy work, while leaving the
+  per-directory/per-inode tmpfs state split trace-gated.
+
+- 2026-06-04 **tmpfs symlink readlink no longer copies target bytes under the state lock.**
+  Continued the filesystem SMP gap audit repair stream from
+  `docs/progress/research/2026-06-03-filesystem-smp-gap-audit.md`. tmpfs
+  symlink payloads now store target bytes as `Arc<[u8]>`, so `read_link`
+  clones a shared byte handle while holding `debug.lock.fs.tmpfs.state` and
+  performs the caller-owned `Box<[u8]>` copy after dropping the mount-wide
+  state lock. This is a narrow lock-service shrink only: tmpfs still has one
+  mount-wide state lock, and the per-directory/per-inode split remains
+  trace-gated. Verification: `cargo test -p tx-fs
+  tmpfs_symlink_payload_uses_shared_target_bytes -- --nocapture`, `cargo test
+  -p tx-fs tmpfs_read_link -- --nocapture`, and `cargo test -p tx-fs
+  tmpfs_materialise_rnode_for_symlink_returns_einval -- --nocapture` passed.
+  Next step: keep tmpfs state splitting gated on lock-service traces, or move
+  to ext4/FAT pager instrumentation if filesystem-heavy SMP points at backend
+  serialization first.
+
+- 2026-06-04 **VFS walker component parser no longer front-removes path bytes.**
+  Continued the filesystem SMP gap audit repair stream from
+  `docs/progress/research/2026-06-03-filesystem-smp-gap-audit.md`. The
+  shared `kernel_step` path and typed I/O resume continuations now use one
+  owned `take_next_component` helper that collapses separator runs without
+  repeated `Vec::remove(0)` or `Vec::drain(..next_slash)` front movement.
+  This is a bounded CPU-shape repair only: the walker still carries strong
+  `Cap` state, and the eventual zero-allocation guard-scoped component cursor
+  remains part of the warm-walk migration. Verification:
+  `cargo test -p tx-subsystems --lib
+  take_next_component_collapses_separator_runs_without_front_removal --
+  --nocapture`, `cargo test -p tx-subsystems --lib run_walker --
+  --nocapture`, and `cargo test -p tx-subsystems --lib resume_walker_after_ --
+  --nocapture` passed. Next step: keep VFS `IdentRef` warm-walk migration
+  trace-gated, or move to ext4/FAT async pager work if filesystem-heavy SMP
+  traces point at backend serialization.
+
+- 2026-06-04 **mmap/munmap map-path probe splits pthread VM spine costs.**
+  Added opt-in `tx_vm_map_path_metrics` counters for `try_mmap`,
+  `try_munmap`, and `VmPmap::teardown_range`, then captured
+  `target/oscomp/custom-run/map-path-mm-io-pthread-20260604` with
+  `tx_vm_recipe_bplus` plus VM lock/map-path metrics. The run is usable for
+  attribution but not lossless (`raw_records=4,802,275`, `complete=false`,
+  `lost=1,401`, zero overwritten/repairs). `munmap` totals split almost evenly
+  between recipe rewrite (`8.515s`) and pmap teardown (`9.373s`), while `mmap`
+  is dominated by recipe commit (`8.182s` of `14.646s` total); free-range search
+  is secondary (`1.782s`). Pmap teardown tails are driven by resident-page
+  removal/drain and sorted-store shifts, not only shootdown. Follow-up
+  malloc-only observe attempts (`malloc-vm`, `malloc-big1`) stalled before the
+  benchmark body or produced only 66 records, so they are recorded as invalid
+  reruns. Details: `docs/progress/research/2026-06-04-mmap-munmap-map-path.md`.
+  Next step: split recipe unmap/commit internals by B+ replace path and split
+  pmap resident-store drain from HAL unmap/shootdown under a smaller valid
+  window.
+
+- 2026-06-04 **pthread-serial1 recipe phase split narrows the mmap/munmap
+  culprit.** Added opt-in `tx_vm_recipe_phase_metrics` counters around recipe
+  lock wait, rewrite, publish swap, debug emission, EBR retire enqueue,
+  deferred enqueue, deferred drain, and actual root drop; also added
+  `debug.vm.map_path.pmap.teardown_loop_ns` to close the pmap accounting gap.
+  Focused artifact
+  `target/oscomp/custom-run/map-path-recipe-phase-pthread-serial1-20260604`
+  is complete/lossless (`raw_records=774,716`, zero lost/overwritten/repairs)
+  and completed `b_pthread_createjoin_serial1` in `46.310305000`. The normal
+  analyzer/parquet export stalled after guest exit on this host, so a
+  lightweight raw-record counter decoder over the live-drain 8+80 byte format
+  produced JSON summaries under the run's `analysis/` directory. Clean totals:
+  `munmap.total=3.130s`, split almost evenly between `recipe=1.373s` and
+  `pmap=1.385s`; `mmap.total=2.015s`, with `commit_recipe=1.105s`. Recipe
+  phase totals show rewrite remains the largest in-map-path phase
+  (`2.827s`, p50 `315us`, p99 `1.369ms`), while deferred drain/reclaim is real
+  but separate (`0.842s` drain, `0.402s` drop) and not directly inside
+  `mmap.commit_recipe_ns` / `munmap.recipe_ns`. Broad `--test pthread` still
+  panics before the benchmark body even without phase counters, so focused
+  pthread selectors remain the valid measurement lane. Details:
+  `docs/progress/research/2026-06-04-mmap-munmap-map-path.md`. Next step:
+  restore stable recipe publish-op counters in the narrow profile so rewrite
+  can be attributed by `MapRequireFree`/`Protect`/`Unmap` without heavy shape
+  metrics, and measure deferred reclaim as a separate interference lane.
+
+- 2026-06-04 **Wholesale libcbench choke-point observe pass ranks pthread first.**
+  Cleaned old observe artifacts under `target/oscomp/custom-run`, keeping the
+  prior narrow pthread reference and the fresh lossless captures documented in
+  `docs/progress/research/2026-06-04-wholesale-chokepoints.md`. New live
+  observe windows cover pthread-only, `mm-io-pthread`, and regex with
+  `complete=true` and zero lost/overwritten/repair records. The mixed
+  benchmark window ranks pthread at `106.356s`, stdio at `28.348s`, and malloc
+  at `27.523s`; after excluding parent `wait4`, top syscall spans are
+  `clone`, `munmap`, `mmap`, `writev`, `rt_sigprocmask`, `read`, `mprotect`,
+  `futex`, and `exit`. Lock wait is negligible; the largest named lock-held
+  section remains `debug.lock.vm.recipe_index.mutation` (`12.026s` mixed,
+  `13.727s` pthread-only), with recipe publish split across `MapRequireFree`,
+  `Unmap`, and `Protect`. Caveat: allocation/DS/scheduler derived tables are
+  empty in this narrow profile, so allocator or scheduler rankings need a
+  targeted follow-up run. Next step: focus on the pthread lifecycle VM spine
+  before reopening stdio FS/user-copy or allocator-specific probes.
+
+- 2026-06-04 **VFS async walker now preserves yield, error, and namespace state.**
+  Continued the filesystem SMP gap audit repair stream from
+  `docs/progress/research/2026-06-03-filesystem-smp-gap-audit.md` and closed
+  the staged `run_walker`/`resume_walker` semantic drift. `run_walker` now
+  drives `kernel_step` directly instead of routing through synchronous
+  `walk_to_completion`, so lookup `Yield` becomes `WalkState::Defer` carrying
+  the original `IORequest` plus `ResumeToken`, and lookup errors become
+  `WalkState::Error` instead of an empty walking frame. Resume tokens for
+  lookup/meta/materialise yields now retain the deferred component in
+  `remaining`, so `resume_walker` re-predicates the component rather than
+  skipping it. Resume tokens also carry the mount namespace that constrained
+  mountpoint crossing before yield, so namespace-local mounts are preserved
+  across `resume_walker`. `resume_walker_after_io` now accepts typed
+  `IOResult` completions and consumes successful `DirLookup`, `LoadInodeMeta`,
+  `ReadLink`, and `MaterialiseRnode` results without issuing a second backend
+  operation for the completed stage. Added VFS walker regressions for
+  lookup-yield defer/resume, supplied I/O-result resume for all four walker I/O
+  request kinds, missing-lookup error preservation, and namespace-preserving
+  resume. Verification: `cargo test -p tx-subsystems resume_walker_after_ --
+  --nocapture`, `cargo test -p tx-subsystems
+  run_walker_resume_preserves_mount_namespace -- --nocapture`, `cargo test -p
+  tx-subsystems run_walker -- --nocapture`, `cargo check -p tx-subsystems -q`,
+  `rustfmt --check --edition 2021` over the touched VFS files, and `git diff
+  --check` passed. Caveat: full `cargo fmt --check` still reports pre-existing
+  formatting drift in unrelated files outside this slice. Next step: move to
+  VFS `IdentRef` warm-walk migration or ext4/FAT async pager work after trace
+  evidence points at that lane.
+
 - 2026-06-03 **ext4/FAT block bridges preserve retryable device outcomes.**
   Continued the filesystem SMP gap audit repair stream from
   `docs/progress/research/2026-06-03-filesystem-smp-gap-audit.md`. The

@@ -17,10 +17,13 @@ use crate::vfs::FsOps;
 
 use super::error::classify;
 use super::state::{
-    FinalSymlinkPolicy, KernelStep, PathResolution, ResumeToken, WalkCause, WalkMode, WalkState,
-    WalkingState,
+    FinalSymlinkPolicy, IORequest, IOResult, KernelStep, PathResolution, ResumeToken, WalkCause,
+    WalkMode, WalkState, WalkingState,
 };
-use super::step::{kernel_step, TerminalRules};
+use super::step::{
+    kernel_step, kernel_step_after_lookup_io, kernel_step_after_materialise_io,
+    kernel_step_after_meta_io, kernel_step_after_readlink_io, TerminalRules,
+};
 
 /// Drive a walk from start to terminal, synchronously.
 ///
@@ -53,15 +56,7 @@ pub fn walk_to_completion_with_mount_namespace(
     mount_namespace: Option<&Cap<MountNamespace>>,
     guard: &Guard<'_>,
 ) -> Result<PathResolution, Errno> {
-    let mount_root = walker::mount_root_dentry(&rooted_at);
-
-    let (current, remaining): (Cap<DEntry>, Vec<u8>) = if path.first() == Some(&b'/') {
-        (mount_root.clone(), path[1..].to_vec())
-    } else {
-        (rooted_at.clone(), path.to_vec())
-    };
-
-    let must_be_directory = remaining.last().copied() == Some(b'/');
+    let (current, remaining, mount_root, must_be_directory) = initial_walk_frame(rooted_at, path);
 
     let _fs_ops: Arc<dyn FsOps> = walker::fs_ops_for(&current, guard)
         .or_else(|| walker::fs_ops_for(&mount_root, guard))
@@ -103,6 +98,7 @@ pub fn walk_to_completion_with_mount_namespace(
             WalkState::Walking(w) => w,
             WalkState::Terminal(resolved) => return Ok(resolved),
             WalkState::Defer { cause, .. } => return Err(classify(&cause)),
+            WalkState::Error(cause) => return Err(classify(&cause)),
         };
 
         let fs_ops = walker::fs_ops_for(&walking.current, guard)
@@ -167,8 +163,8 @@ pub fn walk_to_completion_with_mount_namespace(
 
 /// Start a walk, return after terminal or first yield.
 ///
-/// Constructs the initial `WalkingState`, runs one step, and returns
-/// the resulting `WalkState`.
+/// Constructs the initial `WalkingState` and drives `kernel_step`
+/// until terminal, error, or first yield.
 pub fn run_walker(
     rooted_at: Cap<DEntry>,
     path: &[u8],
@@ -177,18 +173,35 @@ pub fn run_walker(
     cred: &Credential,
     guard: &Guard<'_>,
 ) -> WalkState {
-    let rooted = rooted_at.clone();
-    let root2 = rooted.clone();
-    match walk_to_completion(rooted_at, path, mode, policy, cred, guard) {
-        Ok(resolved) => WalkState::Terminal(resolved),
-        Err(_err) => WalkState::Walking(WalkingState {
-            current: rooted,
-            remaining: Vec::new(),
+    run_walker_with_mount_namespace(rooted_at, path, mode, policy, cred, None, guard)
+}
+
+/// Start a walk using the supplied mount namespace, returning after terminal,
+/// error, or first yield.
+pub fn run_walker_with_mount_namespace(
+    rooted_at: Cap<DEntry>,
+    path: &[u8],
+    mode: WalkMode,
+    policy: FinalSymlinkPolicy,
+    cred: &Credential,
+    mount_namespace: Option<&Cap<MountNamespace>>,
+    guard: &Guard<'_>,
+) -> WalkState {
+    let (current, remaining, mount_root, must_be_directory) = initial_walk_frame(rooted_at, path);
+    drive_walk_state(
+        WalkingState {
+            current,
+            remaining,
             hop_count: 0,
-            mount_root: root2,
-            must_be_directory: false,
-        }),
-    }
+            mount_root,
+            must_be_directory,
+        },
+        mode,
+        policy,
+        cred,
+        mount_namespace,
+        guard,
+    )
 }
 
 /// Resume a walker from a `ResumeToken` after IO completion.
@@ -202,36 +215,275 @@ pub fn resume_walker(
     cred: &Credential,
     guard: &Guard<'_>,
 ) -> Result<PathResolution, Errno> {
-    let walking = token.walking;
+    let mount_namespace = token.mount_namespace;
+    match drive_walk_state(
+        token.walking,
+        mode,
+        policy,
+        cred,
+        mount_namespace.as_ref(),
+        guard,
+    ) {
+        WalkState::Terminal(resolved) => Ok(resolved),
+        WalkState::Defer { cause, .. } | WalkState::Error(cause) => Err(classify(&cause)),
+        WalkState::Walking(_) => Err(Errno::EAGAIN),
+    }
+}
 
-    let _fs_ops = walker::fs_ops_for(&walking.current, guard)
-        .or_else(|| walker::fs_ops_for(&walking.mount_root, guard))
-        .ok_or(Errno::ENODEV)?;
+/// Resume a walker after the backend completed the exact request that yielded.
+///
+/// This entry point consumes the completed I/O result first, then continues the
+/// walker. It preserves retry-style `resume_walker` for legacy callers that do
+/// not yet have a typed completion channel.
+pub fn resume_walker_after_io(
+    token: ResumeToken,
+    io_result: IOResult,
+    mode: WalkMode,
+    policy: FinalSymlinkPolicy,
+    cred: &Credential,
+    guard: &Guard<'_>,
+) -> WalkState {
+    let mount_namespace = token.mount_namespace.clone();
+    let state = match apply_io_result(
+        token,
+        io_result,
+        mount_namespace.as_ref(),
+        cred,
+        mode,
+        policy,
+        guard,
+    ) {
+        Ok(state) => state,
+        Err(errno) => return WalkState::Error(WalkCause::FsOpsRejected(errno)),
+    };
+    drive_existing_walk_state(state, mode, policy, cred, mount_namespace.as_ref(), guard)
+}
 
-    let _mount_payload = walker::mount_payload_for(&walking.current, guard)
-        .or_else(|| walker::mount_payload_for(&walking.mount_root, guard));
+fn initial_walk_frame(
+    rooted_at: Cap<DEntry>,
+    path: &[u8],
+) -> (Cap<DEntry>, Vec<u8>, Cap<DEntry>, bool) {
+    let mount_root = walker::mount_root_dentry(&rooted_at);
+    let (current, remaining): (Cap<DEntry>, Vec<u8>) = if path.first() == Some(&b'/') {
+        (mount_root.clone(), path[1..].to_vec())
+    } else {
+        (rooted_at, path.to_vec())
+    };
+    let must_be_directory = remaining.last().copied() == Some(b'/');
+    (current, remaining, mount_root, must_be_directory)
+}
 
-    let mut state = WalkState::Walking(walking);
+fn apply_io_result(
+    token: ResumeToken,
+    io_result: IOResult,
+    mount_namespace: Option<&Cap<MountNamespace>>,
+    cred: &Credential,
+    mode: WalkMode,
+    policy: FinalSymlinkPolicy,
+    guard: &Guard<'_>,
+) -> Result<WalkState, Errno> {
+    match (token.request, io_result) {
+        (
+            IORequest::DirLookup { fs_object_id, name },
+            IOResult::DirLookup(Ok(child_fs_object_id)),
+        ) => {
+            let fs_ops = walker::fs_ops_for(&token.walking.current, guard)
+                .or_else(|| walker::fs_ops_for(&token.walking.mount_root, guard))
+                .ok_or(Errno::ENODEV)?;
+            let mount_payload = walker::mount_payload_for(&token.walking.current, guard)
+                .or_else(|| walker::mount_payload_for(&token.walking.mount_root, guard));
+            let rules = TerminalRules::new(mode, policy);
+            Ok(kernel_step_to_walk_state(
+                kernel_step_after_lookup_io(
+                    token.walking,
+                    fs_ops,
+                    mount_payload,
+                    mount_namespace,
+                    fs_object_id,
+                    &name,
+                    child_fs_object_id,
+                    cred,
+                    rules,
+                    guard,
+                ),
+                mount_namespace,
+            ))
+        }
+        (IORequest::LoadInodeMeta { fs_object_id }, IOResult::LoadInodeMeta(Ok(child_meta))) => {
+            let fs_ops = walker::fs_ops_for(&token.walking.current, guard)
+                .or_else(|| walker::fs_ops_for(&token.walking.mount_root, guard))
+                .ok_or(Errno::ENODEV)?;
+            let mount_payload = walker::mount_payload_for(&token.walking.current, guard)
+                .or_else(|| walker::mount_payload_for(&token.walking.mount_root, guard));
+            let rules = TerminalRules::new(mode, policy);
+            Ok(kernel_step_to_walk_state(
+                kernel_step_after_meta_io(
+                    token.walking,
+                    fs_ops,
+                    mount_payload,
+                    mount_namespace,
+                    fs_object_id,
+                    child_meta,
+                    cred,
+                    rules,
+                    guard,
+                ),
+                mount_namespace,
+            ))
+        }
+        (IORequest::ReadLink { fs_object_id, meta }, IOResult::ReadLink(Ok(target))) => {
+            let mount_payload = walker::mount_payload_for(&token.walking.current, guard)
+                .or_else(|| walker::mount_payload_for(&token.walking.mount_root, guard));
+            let rules = TerminalRules::new(mode, policy);
+            Ok(kernel_step_to_walk_state(
+                kernel_step_after_readlink_io(
+                    token.walking,
+                    mount_payload,
+                    mount_namespace,
+                    fs_object_id,
+                    meta,
+                    target,
+                    cred,
+                    rules,
+                    guard,
+                ),
+                mount_namespace,
+            ))
+        }
+        (
+            IORequest::MaterialiseRnode { fs_object_id, meta },
+            IOResult::MaterialiseRnode(Ok(rnode)),
+        ) => {
+            let mount_payload = walker::mount_payload_for(&token.walking.current, guard)
+                .or_else(|| walker::mount_payload_for(&token.walking.mount_root, guard));
+            let rules = TerminalRules::new(mode, policy);
+            Ok(kernel_step_to_walk_state(
+                kernel_step_after_materialise_io(
+                    token.walking,
+                    mount_payload,
+                    mount_namespace,
+                    fs_object_id,
+                    meta,
+                    rnode,
+                    cred,
+                    rules,
+                    guard,
+                ),
+                mount_namespace,
+            ))
+        }
+        (IORequest::DirLookup { .. }, IOResult::DirLookup(Err(errno)))
+        | (IORequest::LoadInodeMeta { .. }, IOResult::LoadInodeMeta(Err(errno)))
+        | (IORequest::ReadLink { .. }, IOResult::ReadLink(Err(errno)))
+        | (IORequest::MaterialiseRnode { .. }, IOResult::MaterialiseRnode(Err(errno))) => {
+            Err(errno)
+        }
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+fn kernel_step_to_walk_state(
+    step: KernelStep,
+    mount_namespace: Option<&Cap<MountNamespace>>,
+) -> WalkState {
+    match step {
+        KernelStep::Continue(state) => state,
+        KernelStep::NeedIO(request, mut resume) => {
+            resume.mount_namespace = mount_namespace.cloned();
+            WalkState::Defer {
+                request,
+                resume,
+                cause: WalkCause::FsOpsRejected(Errno::EAGAIN),
+            }
+        }
+        KernelStep::Error(cause) => WalkState::Error(cause),
+    }
+}
+
+fn drive_existing_walk_state(
+    state: WalkState,
+    mode: WalkMode,
+    policy: FinalSymlinkPolicy,
+    cred: &Credential,
+    mount_namespace: Option<&Cap<MountNamespace>>,
+    guard: &Guard<'_>,
+) -> WalkState {
+    match state {
+        WalkState::Walking(walking) => {
+            drive_walk_state(walking, mode, policy, cred, mount_namespace, guard)
+        }
+        WalkState::Terminal(resolved) => WalkState::Terminal(resolved),
+        WalkState::Defer {
+            request,
+            resume,
+            cause,
+        } => WalkState::Defer {
+            request,
+            resume,
+            cause,
+        },
+        WalkState::Error(cause) => WalkState::Error(cause),
+    }
+}
+
+fn drive_walk_state(
+    initial: WalkingState,
+    mode: WalkMode,
+    policy: FinalSymlinkPolicy,
+    cred: &Credential,
+    mount_namespace: Option<&Cap<MountNamespace>>,
+    guard: &Guard<'_>,
+) -> WalkState {
+    let mut state = WalkState::Walking(initial);
 
     loop {
-        let w = match state {
+        let walking = match state {
             WalkState::Walking(w) => w,
-            WalkState::Terminal(resolved) => return Ok(resolved),
-            WalkState::Defer { cause, .. } => return Err(classify(&cause)),
+            WalkState::Terminal(resolved) => return WalkState::Terminal(resolved),
+            WalkState::Defer {
+                request,
+                resume,
+                cause,
+            } => {
+                return WalkState::Defer {
+                    request,
+                    resume,
+                    cause,
+                };
+            }
+            WalkState::Error(cause) => return WalkState::Error(cause),
         };
 
-        let fs_ops = walker::fs_ops_for(&w.current, guard)
-            .or_else(|| walker::fs_ops_for(&w.mount_root, guard))
-            .ok_or(Errno::ENODEV)?;
+        let fs_ops = match walker::fs_ops_for(&walking.current, guard)
+            .or_else(|| walker::fs_ops_for(&walking.mount_root, guard))
+        {
+            Some(fs_ops) => fs_ops,
+            None => return WalkState::Error(WalkCause::FsOpsRejected(Errno::ENODEV)),
+        };
 
-        let mp = walker::mount_payload_for(&w.current, guard)
-            .or_else(|| walker::mount_payload_for(&w.mount_root, guard));
+        let mount_payload = walker::mount_payload_for(&walking.current, guard)
+            .or_else(|| walker::mount_payload_for(&walking.mount_root, guard));
 
         let rules = TerminalRules::new(mode, policy);
-        match kernel_step(w, fs_ops, mp, None, cred, rules, guard) {
+        match kernel_step(
+            walking,
+            fs_ops,
+            mount_payload,
+            mount_namespace,
+            cred,
+            rules,
+            guard,
+        ) {
             KernelStep::Continue(next) => state = next,
-            KernelStep::Error(cause) => return Err(classify(&cause)),
-            KernelStep::NeedIO(_req, _token) => return Err(Errno::EAGAIN),
+            KernelStep::Error(cause) => return WalkState::Error(cause),
+            KernelStep::NeedIO(request, mut resume) => {
+                resume.mount_namespace = mount_namespace.cloned();
+                return WalkState::Defer {
+                    request,
+                    resume,
+                    cause: WalkCause::FsOpsRejected(Errno::EAGAIN),
+                };
+            }
         }
     }
 }

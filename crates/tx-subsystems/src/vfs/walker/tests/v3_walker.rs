@@ -7,6 +7,7 @@
 //! `cargo xtask lint arch` 1500-line authored-file cap, mirroring the
 //! `v3.rs` sibling that hosts the `FsOps for TestFs` impl.
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 
 use crate::execution::Errno;
@@ -14,15 +15,15 @@ use crate::mount::{
     DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, SourceLabel,
 };
 use crate::page_backed::FsPageBacking;
-use crate::vfs::FsOps;
-use crate::vfs::adapter::step_engine::{Cap, guard, reserve_for, sign_for};
+use crate::vfs::adapter::step_engine::{guard, reserve_for, sign_for, Cap};
 use crate::vfs::structure::{
     Credential, DEntry, FsObjectId, InlineName, InodeKind, InodeMeta, OpenFileFlags, RNode,
     RNodeBacking, S_IFDIR,
 };
 use crate::vfs::walker::{step_open, step_walk};
+use crate::vfs::FsOps;
 
-use super::{TestFs, init_zones};
+use super::{init_zones, TestFs};
 
 // === fixture: rootfs over TestFs ===================================
 
@@ -169,6 +170,355 @@ fn step_walk_caches_regular_file_positive_lookup() {
         "positive dcache hits for regular files must avoid backend lookup/meta/materialise"
     );
     drop(guard);
+}
+
+#[test]
+fn run_walker_preserves_lookup_yield_as_defer() {
+    use crate::vfs::resolution::driver::run_walker;
+    use crate::vfs::resolution::state::{FinalSymlinkPolicy, WalkMode, WalkState};
+
+    let _serial = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_zones();
+    let topo = build_rootfs_v3();
+
+    topo.rootfs.add_dir(FsObjectId::new(2), b"slow");
+    topo.rootfs
+        .yield_next_lookup(FsObjectId::new(2), b"slow", 0x51, 0x02);
+
+    let cred = Credential::root();
+    let first_guard = guard();
+    let state = run_walker(
+        topo.root_dentry.clone(),
+        b"/slow",
+        WalkMode::Entity,
+        FinalSymlinkPolicy::Follow,
+        &cred,
+        &first_guard,
+    );
+    drop(first_guard);
+
+    let resume = match state {
+        WalkState::Defer {
+            request, resume, ..
+        } => {
+            match request {
+                crate::vfs::resolution::state::IORequest::DirLookup { fs_object_id, name } => {
+                    assert_eq!(fs_object_id, FsObjectId::new(2));
+                    assert_eq!(&*name, b"slow");
+                }
+                other => panic!("expected deferred lookup request, got {other:?}"),
+            }
+            assert_eq!(
+                resume.walking.current.rnode().fs_object_id(),
+                FsObjectId::new(2)
+            );
+            assert_eq!(
+                resume.walking.remaining,
+                b"slow".to_vec(),
+                "resume token must restart at the deferred lookup component"
+            );
+            resume
+        }
+        other => panic!("expected deferred walker state, got {other:?}"),
+    };
+    assert_eq!(
+        topo.rootfs.lookup_counts(),
+        (1, 0, 0),
+        "lookup yield must not be collapsed into meta/materialise work"
+    );
+
+    let guard = guard();
+    let resolved = crate::vfs::resolution::driver::resume_walker(
+        resume,
+        WalkMode::Entity,
+        FinalSymlinkPolicy::Follow,
+        &cred,
+        &guard,
+    )
+    .expect("resume after lookup yield");
+    drop(guard);
+    assert_eq!(resolved.dentry.name().as_bytes(), b"slow");
+}
+
+#[test]
+fn resume_walker_after_lookup_io_uses_supplied_result() {
+    use crate::vfs::resolution::driver::{resume_walker_after_io, run_walker};
+    use crate::vfs::resolution::state::{FinalSymlinkPolicy, IOResult, WalkMode, WalkState};
+
+    let _serial = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_zones();
+    let topo = build_rootfs_v3();
+
+    let slow_id = topo.rootfs.add_dir(FsObjectId::new(2), b"slow");
+    topo.rootfs
+        .yield_next_lookup(FsObjectId::new(2), b"slow", 0x51, 0x02);
+
+    let cred = Credential::root();
+    let first_guard = guard();
+    let state = run_walker(
+        topo.root_dentry.clone(),
+        b"/slow",
+        WalkMode::Entity,
+        FinalSymlinkPolicy::Follow,
+        &cred,
+        &first_guard,
+    );
+    drop(first_guard);
+
+    let resume = match state {
+        WalkState::Defer { resume, .. } => resume,
+        other => panic!("expected deferred walker state, got {other:?}"),
+    };
+    assert_eq!(topo.rootfs.lookup_counts(), (1, 0, 0));
+
+    let guard = guard();
+    let state = resume_walker_after_io(
+        resume,
+        IOResult::DirLookup(Ok(slow_id)),
+        WalkMode::Entity,
+        FinalSymlinkPolicy::Follow,
+        &cred,
+        &guard,
+    );
+    drop(guard);
+
+    let resolved = match state {
+        WalkState::Terminal(resolved) => resolved,
+        other => panic!("expected terminal result after supplied lookup result, got {other:?}"),
+    };
+
+    assert_eq!(resolved.dentry.name().as_bytes(), b"slow");
+    assert_eq!(
+        topo.rootfs.lookup_counts(),
+        (1, 1, 0),
+        "explicit IO-result resume must not issue a second backend lookup"
+    );
+}
+
+#[test]
+fn resume_walker_after_meta_io_uses_supplied_result() {
+    use crate::vfs::resolution::driver::{resume_walker_after_io, run_walker};
+    use crate::vfs::resolution::state::{FinalSymlinkPolicy, IOResult, WalkMode, WalkState};
+
+    let _serial = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_zones();
+    let topo = build_rootfs_v3();
+
+    let slow_id = topo.rootfs.add_dir(FsObjectId::new(2), b"slow");
+    topo.rootfs.yield_next_load_inode_meta(slow_id, 0x52, 0x02);
+
+    let cred = Credential::root();
+    let first_guard = guard();
+    let state = run_walker(
+        topo.root_dentry.clone(),
+        b"/slow",
+        WalkMode::Entity,
+        FinalSymlinkPolicy::Follow,
+        &cred,
+        &first_guard,
+    );
+    drop(first_guard);
+
+    let resume = match state {
+        WalkState::Defer { resume, .. } => resume,
+        other => panic!("expected deferred walker state, got {other:?}"),
+    };
+    assert_eq!(topo.rootfs.lookup_counts(), (1, 1, 0));
+
+    let guard = guard();
+    let state = resume_walker_after_io(
+        resume,
+        IOResult::LoadInodeMeta(Ok(InodeMeta::new(InodeKind::Directory, S_IFDIR | 0o755))),
+        WalkMode::Entity,
+        FinalSymlinkPolicy::Follow,
+        &cred,
+        &guard,
+    );
+    drop(guard);
+
+    let resolved = match state {
+        WalkState::Terminal(resolved) => resolved,
+        other => panic!("expected terminal result after supplied meta result, got {other:?}"),
+    };
+
+    assert_eq!(resolved.dentry.name().as_bytes(), b"slow");
+    assert_eq!(
+        topo.rootfs.lookup_counts(),
+        (1, 1, 0),
+        "explicit meta IO-result resume must not issue a second load_inode_meta"
+    );
+}
+
+#[test]
+fn resume_walker_after_readlink_io_uses_supplied_result() {
+    use crate::vfs::resolution::driver::{resume_walker_after_io, run_walker};
+    use crate::vfs::resolution::state::{FinalSymlinkPolicy, IOResult, WalkMode, WalkState};
+
+    let _serial = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_zones();
+    let topo = build_rootfs_v3();
+
+    topo.rootfs.add_dir(FsObjectId::new(2), b"target");
+    let link_id = topo
+        .rootfs
+        .add_symlink(FsObjectId::new(2), b"link", b"target");
+    topo.rootfs.yield_next_read_link(link_id, 0x53, 0x02);
+
+    let cred = Credential::root();
+    let first_guard = guard();
+    let state = run_walker(
+        topo.root_dentry.clone(),
+        b"/link",
+        WalkMode::Entity,
+        FinalSymlinkPolicy::Follow,
+        &cred,
+        &first_guard,
+    );
+    drop(first_guard);
+
+    let resume = match state {
+        WalkState::Defer { resume, .. } => resume,
+        other => panic!("expected deferred walker state, got {other:?}"),
+    };
+    assert_eq!(topo.rootfs.read_link_count(), 1);
+
+    let guard = guard();
+    let state = resume_walker_after_io(
+        resume,
+        IOResult::ReadLink(Ok(Box::from(&b"target"[..]))),
+        WalkMode::Entity,
+        FinalSymlinkPolicy::Follow,
+        &cred,
+        &guard,
+    );
+    drop(guard);
+
+    let resolved = match state {
+        WalkState::Terminal(resolved) => resolved,
+        other => panic!("expected terminal result after supplied readlink result, got {other:?}"),
+    };
+
+    assert_eq!(resolved.dentry.name().as_bytes(), b"target");
+    assert_eq!(
+        topo.rootfs.read_link_count(),
+        1,
+        "explicit readlink IO-result resume must not issue a second read_link"
+    );
+}
+
+#[test]
+fn resume_walker_after_materialise_io_uses_supplied_result() {
+    use crate::page_backed::{AnonSwapPolicy, PageContainer, PageContainerKind};
+    use crate::vfs::resolution::driver::{resume_walker_after_io, run_walker};
+    use crate::vfs::resolution::state::{FinalSymlinkPolicy, IOResult, WalkMode, WalkState};
+
+    let _serial = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_zones();
+    let topo = build_rootfs_v3();
+
+    let file_id = topo.rootfs.add_regular(FsObjectId::new(2), b"file");
+    topo.rootfs.yield_next_materialise(file_id, 0x54, 0x02);
+
+    let cred = Credential::root();
+    let first_guard = guard();
+    let state = run_walker(
+        topo.root_dentry.clone(),
+        b"/file",
+        WalkMode::Entity,
+        FinalSymlinkPolicy::Follow,
+        &cred,
+        &first_guard,
+    );
+    drop(first_guard);
+
+    let resume = match state {
+        WalkState::Defer { resume, .. } => resume,
+        other => panic!("expected deferred walker state, got {other:?}"),
+    };
+    assert_eq!(topo.rootfs.lookup_counts(), (1, 1, 1));
+
+    let mount = topo
+        .root_dentry
+        .rnode()
+        .containing_mount_weak()
+        .expect("root rnode has containing mount")
+        .upgrade(&guard())
+        .expect("mount payload upgrade");
+    let pc = PageContainer::new_cap(
+        PageContainerKind::Anon {
+            swap_policy: AnonSwapPolicy::Persistent,
+        },
+        1,
+    )
+    .expect("page container");
+    let meta = InodeMeta::new(InodeKind::Regular, 0o644);
+    let rnode = RNode::new_cap_in_mount(file_id, meta, RNodeBacking::PageBacked { pc }, &mount)
+        .expect("supplied rnode");
+
+    let guard = guard();
+    let state = resume_walker_after_io(
+        resume,
+        IOResult::MaterialiseRnode(Ok(rnode)),
+        WalkMode::Entity,
+        FinalSymlinkPolicy::Follow,
+        &cred,
+        &guard,
+    );
+    drop(guard);
+
+    let resolved = match state {
+        WalkState::Terminal(resolved) => resolved,
+        other => {
+            panic!("expected terminal result after supplied materialise result, got {other:?}")
+        }
+    };
+
+    assert_eq!(resolved.dentry.name().as_bytes(), b"file");
+    assert_eq!(
+        topo.rootfs.lookup_counts(),
+        (1, 1, 1),
+        "explicit materialise IO-result resume must not issue a second materialise_rnode"
+    );
+}
+
+#[test]
+fn run_walker_preserves_lookup_error_as_error_state() {
+    use crate::execution::Errno;
+    use crate::vfs::resolution::driver::run_walker;
+    use crate::vfs::resolution::state::{FinalSymlinkPolicy, WalkCause, WalkMode, WalkState};
+
+    let _serial = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_zones();
+    let topo = build_rootfs_v3();
+
+    let cred = Credential::root();
+    let guard = guard();
+    let state = run_walker(
+        topo.root_dentry.clone(),
+        b"/missing",
+        WalkMode::Entity,
+        FinalSymlinkPolicy::Follow,
+        &cred,
+        &guard,
+    );
+    drop(guard);
+
+    match state {
+        WalkState::Error(WalkCause::FsOpsRejected(Errno::ENOENT)) => {}
+        other => panic!("expected ENOENT error state, got {other:?}"),
+    }
 }
 
 // Cascade flake: fails under workspace serial-test order due to the
