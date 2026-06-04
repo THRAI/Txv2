@@ -121,12 +121,14 @@ impl SocketKind {
             }
             (AddressFamily::Inet, SocketType::Stream, 0 | 6) => Ok(Self::Tcp),
             (AddressFamily::Inet, SocketType::Stream, 132) => Ok(Self::Sctp),
+            (AddressFamily::Inet, SocketType::SeqPacket, 132) => Ok(Self::Sctp),
             (AddressFamily::Inet, SocketType::Dgram, 0 | 17 | 136) => Ok(Self::Udp),
             (AddressFamily::Inet, SocketType::Dgram, 1)
             | (AddressFamily::Inet, SocketType::Raw, 1) => Ok(Self::RawIcmp),
             (AddressFamily::Inet, _, _) => Err(Errno::EPROTONOSUPPORT),
             (AddressFamily::Inet6, SocketType::Stream, 0 | 6) => Ok(Self::Tcp),
             (AddressFamily::Inet6, SocketType::Stream, 132) => Ok(Self::Sctp),
+            (AddressFamily::Inet6, SocketType::SeqPacket, 132) => Ok(Self::Sctp),
             (AddressFamily::Inet6, SocketType::Dgram, 0 | 17 | 136) => Ok(Self::Udp),
             (AddressFamily::Inet6, SocketType::Raw, 58 | 159) => Ok(Self::RawIcmp),
             (AddressFamily::Inet6, _, _) => Err(Errno::EPROTONOSUPPORT),

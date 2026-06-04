@@ -10,15 +10,24 @@ Date: 2026-06-04
 
 ## 当前状态
 
-- **0 / 41 通过**(2026-06-04 probe)。
-- 41 个二进制**都在镜像里、都能跑**,但**全部 TCONF 在 `tst_check_driver("sctp")`
-  这道门**——连各自的 `socket()` 都没走到。
-- 门机制:`tst_check_driver`(`lib/tst_kernel.c`)读 `/lib/modules/$(uname -r)/modules.builtin`
-  和 `modules.dep`,找 "sctp"。现在没有 → 判"驱动不可用"。
-- ⚠️ 门必须**和真实 SCTP 实现一起开**:单开门会把 TCONF 变成 FAIL/TBROK(更难看)。
-- witness:`target/oscomp/ltp-net-sctp-probe-340s.txt`(全 TCONF)。
+**阶段 0 已应用(开门 + STREAM/SEQPACKET socket 映射)。**
 
-静态 case 合计 ≈ **~400**(含 9 个 `_v6` 变体)。
+- 门已开:`modules.builtin`/`modules.dep` 加了 `kernel/net/sctp/sctp.ko`
+  (`tst_check_driver("sctp")` 通过);`socket(AF_INET/INET6, STREAM|SEQPACKET,
+  IPPROTO_SCTP)` → `SocketKind::Sctp`。
+- **`test_1_to_1_accept_close` 已通过**(1-to-1 socket/bind/listen/connect/accept/
+  close 全程工作,10 case)——证明现有 loopback-TCP 脚手架撑得住 1-to-1 生命周期。
+- 阶段 0 重跑(340s 内跑了 8/41)的真实 blocker:
+  - **SCTP sockopt 返回 ENOPROTOOPT**(SCTP_EVENTS / SCTP_INITMSG / …)——头号阻塞。
+  - `sctp_getladdrs/getpaddrs` 报错(多宿主地址 API)。
+  - `connect`/`connectx` 边界 errno 不对(invalid family/length)。
+  - 非阻塞 connect 给 EAGAIN(期望 0/EINPROGRESS)。
+- ⚠️ 注意:开门后,未实现的部分从 TCONF 变成 FAIL,且个别测试在某操作上阻塞到
+  30s 内部超时——这是 SCTP 建设期的中间状态(随阶段 1/2/3 翻成 TPASS)。
+- witness:`target/oscomp/ltp-net-sctp-probe-340s.txt`(开门前全 TCONF)、
+  `target/oscomp/ltp-net-sctp-phase0-340s.txt`(开门后,accept_close 过)。
+
+静态 case 合计 ≈ **~400**(含 9 个 `_v6` 变体)。当前确认通过:`accept_close`(10 case)。
 
 ## 阶段划分(初步,阶段 0 重跑后据实修正)
 
@@ -48,7 +57,7 @@ Date: 2026-06-04
 | `test_inaddr_any` | 2 | TCONF(门) | 1 | — |
 | `test_inaddr_any_v6` | 2 | TCONF(门) | 1 | — |
 | `test_1_to_1_sendmsg` | 14 | TCONF(门) | 2 | — |
-| `test_1_to_1_accept_close` | 10 | TCONF(门) | 2 | — |
+| `test_1_to_1_accept_close` | 10 | **pass** | 2 | `target/oscomp/ltp-net-sctp-phase0-340s.txt` |
 | `test_1_to_1_connect` | 10 | TCONF(门) | 2 | — |
 | `test_sctp_sendrecvmsg` | 10 | TCONF(门) | 2 | — |
 | `test_sctp_sendrecvmsg_v6` | 10 | TCONF(门) | 2 | — |
