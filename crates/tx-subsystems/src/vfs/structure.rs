@@ -1318,6 +1318,21 @@ impl OpenFile {
         Some((payload.clone(), *side))
     }
 
+    /// Return the socket identity carried by this file, if it is a
+    /// socket fd. Used by net-diag projections (`net/project.rs`) to
+    /// enumerate a process's open sockets.
+    pub fn socket_identity(&self) -> Option<&Cap<SocketIdentity>> {
+        match &self.backing {
+            OpenFileBacking::Rnode { rnode } => match rnode.backing() {
+                RNodeBacking::StructBacked {
+                    payload: StructPayload::Socket { identity },
+                } => Some(identity),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Return the anonymous stream socketpair endpoint, if this fd is
     /// one. The first payload is the readable side for this fd; the
     /// second is the writable side toward the peer.

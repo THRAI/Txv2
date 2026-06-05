@@ -99,6 +99,7 @@ pub fn socket_open_file_from_identity(
             append: false,
             cloexec: flags.cloexec,
             nonblocking: flags.nonblock,
+            packet: false,
         },
     )
     .map_err(|_| Errno::ENOMEM)?;

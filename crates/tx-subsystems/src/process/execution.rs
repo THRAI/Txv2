@@ -351,10 +351,13 @@ pub fn bootstrap_init_process(
     // Create the init namespace proxy. Day-1: all namespace caps
     // point at init-namespace stubs; mnt_ns is deferred.
     let nsproxy = crate::process::nsproxy::sign_init_nsproxy()?;
+    let init_net_namespace =
+        crate::net::initial_net_namespace_payload_with_owner(nsproxy.user_ns.clone());
     let payload = sign_process_payload(
         aspace,
         vec![leader.clone()],
         nsproxy,
+        init_net_namespace,
         Cred::root(),
         None,
         BTreeMap::new(),
@@ -440,6 +443,7 @@ pub fn step_fork_with_options<P: PmapIf>(
     let (
         parent_aspace,
         parent_nsproxy,
+        parent_net_namespace,
         parent_cred,
         parent_cwd,
         parent_fds,
@@ -454,6 +458,7 @@ pub fn step_fork_with_options<P: PmapIf>(
         (
             payload.aspace_cap(),
             payload.nsproxy_cap(),
+            payload.net_namespace(),
             payload.cred(),
             payload.cwd(),
             payload.clone_fds_for_fork(),
@@ -510,6 +515,7 @@ pub fn step_fork_with_options<P: PmapIf>(
         child_aspace_cap,
         vec![leader],
         child_nsproxy,
+        parent_net_namespace,
         parent_cred,
         parent_cwd,
         parent_fds,
@@ -1369,6 +1375,7 @@ fn sign_process_payload(
     aspace: Cap<AddressSpace>,
     threads: Vec<Cap<ThreadIdentity>>,
     nsproxy: Cap<crate::process::nsproxy::NsProxy>,
+    net_namespace: PayloadCap<crate::net::NetNamespacePayload>,
     cred: Cred,
     cwd: Option<Cap<crate::vfs::DEntry>>,
     fds: BTreeMap<u32, Cap<OpenFile>>,
@@ -1403,6 +1410,13 @@ fn sign_process_payload(
     let nsproxy_slot: AtomicSlot<Cap<crate::process::nsproxy::NsProxy>> = AtomicSlot::empty();
     nsproxy_slot.store(Some(nsproxy));
 
+    // Network namespace slot — the caller provides the initial namespace
+    // payload (seeded from `initial_net_namespace_payload_with_owner` at
+    // bootstrap, cloned from the parent at fork).
+    let net_namespace_slot: AtomicSlot<PayloadCap<crate::net::NetNamespacePayload>> =
+        AtomicSlot::empty();
+    net_namespace_slot.store(Some(net_namespace));
+
     // Allocate a fresh `exit_source` Channel per `ProcessPayload` and
     // register it with the global wait-source resolver so async
     // awaiters can `wait_on_token` against the returned id without
@@ -1430,6 +1444,7 @@ fn sign_process_payload(
         signal_port: RawPort::new(),
         cred: cred_slot,
         nsproxy: nsproxy_slot,
+        net_namespace: net_namespace_slot,
         cwd: process_spin_mutex(cwd, b"debug.lock.process.payload.cwd"),
         fds: process_spin_mutex(fds, b"debug.lock.process.payload.fds"),
         fd_cloexec: process_spin_mutex(fd_cloexec, b"debug.lock.process.payload.fd_cloexec"),

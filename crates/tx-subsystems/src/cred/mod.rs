@@ -95,6 +95,8 @@ impl Capability {
     pub const SETUID: Self = Self(7);
     /// `CAP_NET_ADMIN` — network administration.
     pub const NET_ADMIN: Self = Self(12);
+    /// `CAP_NET_RAW` — raw and packet socket creation.
+    pub const NET_RAW: Self = Self(13);
     /// `CAP_SYS_ADMIN` — generic privileged operations.
     pub const SYS_ADMIN: Self = Self(21);
 

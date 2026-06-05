@@ -471,6 +471,35 @@ impl ProcessIdentity {
         self.payload.lock().as_ref().and_then(|p| p.fd(idx))
     }
 
+    /// Snapshot the process's current network namespace. Day-1 all
+    /// processes are seeded with the initial namespace; fork inherits
+    /// the parent's namespace cap. Returns `None` for zombies.
+    pub fn net_namespace(&self) -> Option<PayloadCap<crate::net::NetNamespacePayload>> {
+        self.payload.lock().as_ref().map(|p| p.net_namespace())
+    }
+
+    /// Replace the process's current network namespace, returning the
+    /// previous namespace cap. Returns `None` for zombies.
+    pub fn replace_net_namespace(
+        &self,
+        new: PayloadCap<crate::net::NetNamespacePayload>,
+    ) -> Option<PayloadCap<crate::net::NetNamespacePayload>> {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.replace_net_namespace(new))
+    }
+
+    /// Snapshot the full fd table for procfs / net-diag projections.
+    /// Returns an empty map for zombies (no payload).
+    pub fn open_fds(&self) -> BTreeMap<u32, Cap<crate::vfs::OpenFile>> {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.open_fds())
+            .unwrap_or_default()
+    }
+
     /// Snapshot the current working-directory `Cap<DEntry>` if one is
     /// installed on the payload. Returns `None` for zombies or
     /// processes whose cwd has never been bound (init pre-rootfs).
@@ -1021,6 +1050,12 @@ pub struct ProcessPayload {
     /// Day-1: all namespace caps point at the init namespace.
     /// `mnt_ns` is deferred (`MountNamespace` bootstrap not yet wired).
     pub(crate) nsproxy: AtomicSlot<Cap<crate::process::nsproxy::NsProxy>>,
+    /// Current network namespace, seeded at construction by
+    /// `initial_net_namespace_payload()`; `step_fork` clones the
+    /// parent's cap. `AtomicSlot` lets `unshare(CLONE_NEWNET)` / `setns`
+    /// publish a replacement. The slot is always populated for a live
+    /// process (see `net_namespace()` accessor expectation).
+    pub(crate) net_namespace: AtomicSlot<PayloadCap<crate::net::NetNamespacePayload>>,
     /// Current working directory as a `DEntry` `Cap`.
     ///
     /// Spec note: `PROCESS_v1` §3 declares this as `Cap<RNode>` on a
@@ -1345,6 +1380,25 @@ impl ProcessPayload {
     /// set (init pre-rootfs).
     pub fn cwd(&self) -> Option<Cap<DEntry>> {
         self.cwd.lock().clone()
+    }
+
+    /// Snapshot this payload's current network namespace cap. The slot
+    /// is seeded at construction and always populated for a live process.
+    pub fn net_namespace(&self) -> PayloadCap<crate::net::NetNamespacePayload> {
+        self.net_namespace
+            .load()
+            .expect("ProcessPayload.net_namespace slot is always populated")
+    }
+
+    /// Replace this payload's network namespace cap, returning the
+    /// previous one. Used by `unshare(CLONE_NEWNET)` / `setns`.
+    pub fn replace_net_namespace(
+        &self,
+        new: PayloadCap<crate::net::NetNamespacePayload>,
+    ) -> PayloadCap<crate::net::NetNamespacePayload> {
+        self.net_namespace
+            .swap(Some(new))
+            .expect("ProcessPayload.net_namespace slot is always populated")
     }
 
     /// Snapshot the `Cap<OpenFile>` registered at fd `idx`, if any.
