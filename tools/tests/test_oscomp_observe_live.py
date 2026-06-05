@@ -62,6 +62,7 @@ class OscompObserveLiveTests(unittest.TestCase):
             commands = [" ".join(str(part) for part in command.argv) for command in plan.commands]
 
             self.assertIn("--observe-bracket", commands[0])
+            self.assertEqual(plan.commands[0].argv[0], sys.executable)
             self.assertIn("--libcbench-only pthread", commands[0])
             self.assertIn("memory-backend-file,id=txram,size=1G", commands[3])
             self.assertIn("mem-path=" + str(layout.guest_mem), commands[3])
@@ -72,6 +73,8 @@ class OscompObserveLiveTests(unittest.TestCase):
             self.assertIn("--guest-mem " + str(layout.guest_mem), commands[4])
             self.assertIn("--output-dir " + str(layout.host_dir), commands[4])
             self.assertNotIn("--finalize", commands[4])
+            self.assertEqual(plan.commands[5].argv[0], sys.executable)
+            self.assertIn("tools/tx-observe-analyze.py", commands[5])
             self.assertIn("--rawrecords " + str(layout.rawrecords), commands[5])
             self.assertIn("--parquet-dir " + str(layout.parquet_dir), commands[5])
             self.assertIn("--python-file analysis.py", commands[5])
@@ -137,6 +140,20 @@ class OscompObserveLiveTests(unittest.TestCase):
 
             self.assertEqual(layout.base, out)
             self.assertEqual(layout.host_dir, out / "host")
+
+    def test_target_run_lock_rejects_parallel_same_target(self):
+        mod = load_module()
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            layout = mod.build_layout(root, "pthread")
+
+            with mod.TargetRunLock(layout):
+                with self.assertRaisesRegex(RuntimeError, "active run"):
+                    with mod.TargetRunLock(layout):
+                        pass
+
+            with mod.TargetRunLock(layout):
+                pass
 
 
 if __name__ == "__main__":

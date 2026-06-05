@@ -1,3 +1,19 @@
+- 2026-06-05 **SMP4 malloc pre-body Cap panic isolated to terminal reactor drain under an active EBR guard.**
+  Current stack has the pmap resident cleanup commit (`ea4a95a8`), packet flag
+  initializer cleanup (`ba271743`), and pmap registry scaling (`df622d48`).
+  The SMP4 failure was reproduced by temporarily re-enabling terminal
+  completed/cancelled future drain inside child submission while an epoch guard
+  was already active: `malloc-big1` on `-smp 4` panicked before the benchmark
+  body with a stale `DEntry` Cap and `guards=1`. Restoring the guard-aware
+  terminal drain deferral cleared the failure. Verification:
+  `cargo check -p tx-kernel -q`; `target/oscomp/custom-run/smp4-cap-diag-malloc-big1-20260605`
+  fixed run with manual QEMU `-smp 4`, observe disabled, completed
+  `b_malloc_big1`, reached libcbench group end, `userspace:exited:0`, and
+  `fault-decode` found no trap lines. Negative repro artifact:
+  `serial-smp4-negative.txt`; fixed artifact: `serial-smp4-fixed2.txt`. Next
+  step: keep `tools/shell-tests/hello` deletion out unless it is confirmed
+  intentional, then rerun focused pthread observe on the cleaned stack.
+
 - 2026-06-05 **Filtered OSComp `cyclictest-musl,iozone-musl` now runs to completion.**
   Rebuilt RV64 after the socketpair/user-copy and reactor scheduling fixes, then
   ran a private OSComp QEMU pass at

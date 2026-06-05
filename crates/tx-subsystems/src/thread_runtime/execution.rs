@@ -537,6 +537,21 @@ pub fn step_sigprocmask(
         );
         return SigprocmaskChange::ZombieIgnored;
     };
+
+    step_sigprocmask_with_payload(thread, &payload, how, next)
+}
+
+/// Update the per-thread signal mask using an already-resolved thread payload.
+///
+/// This is the hot syscall fast path: the thread future has already installed
+/// the current payload in a per-hart slot, so reopening `thread.payload` would
+/// only clone the same cap under the thread-payload lock.
+pub fn step_sigprocmask_with_payload(
+    thread: &Cap<ThreadIdentity>,
+    payload: &PayloadCap<ThreadPayload>,
+    how: SigmaskHow,
+    next: SignalMask,
+) -> SigprocmaskChange {
     let (prev, new_bits) = measure_thread_lock_service(
         b"debug.lock_service.thread.payload.sigprocmask.mask_compute.duration_ns",
         || {

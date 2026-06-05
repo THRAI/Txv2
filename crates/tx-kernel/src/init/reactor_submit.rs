@@ -34,6 +34,40 @@ static BENCH_CHILD_TERMINAL_DRAIN: AtomicU64 = AtomicU64::new(0);
 
 const TERMINAL_THREAD_EBR_DRAIN_BUDGET: usize = 64;
 
+#[inline(always)]
+fn clone_path_metrics_enabled() -> bool {
+    cfg!(tx_clone_path_metrics) && tx_observe::current().is_some()
+}
+
+#[inline(always)]
+fn clone_path_clock_now() -> Option<u64> {
+    if clone_path_metrics_enabled() {
+        Some(tx_observe::clock_now_ns())
+    } else {
+        None
+    }
+}
+
+fn emit_clone_path_duration(name: &[u8], start: Option<u64>) {
+    let Some(start) = start else {
+        return;
+    };
+    let duration = tx_observe::clock_now_ns().saturating_sub(start);
+    emit_clone_path_count(name, duration);
+}
+
+fn emit_clone_path_count(name: &[u8], value: u64) {
+    if !clone_path_metrics_enabled() {
+        return;
+    }
+    if let Some(observer) = tx_observe::current() {
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            value as i64,
+        );
+    }
+}
+
 impl<P: TxPlatform> CoreInit<P> {
     /// Reactor-submission hook body. Captured by
     /// [`Self::install_reactor_submit_seam`] as a plain `fn` pointer
@@ -114,7 +148,7 @@ impl<P: TxPlatform> CoreInit<P> {
         }
         drop(tasks);
 
-        if removed != 0 {
+        if removed != 0 && step_engine::borrow_current_guard().is_none() {
             let first = step_engine::drain_with_budget(TERMINAL_THREAD_EBR_DRAIN_BUDGET);
             let second = step_engine::drain_with_budget(TERMINAL_THREAD_EBR_DRAIN_BUDGET);
             let vm_recipe_reclaims =
@@ -127,6 +161,11 @@ impl<P: TxPlatform> CoreInit<P> {
             emit_child_submit_marker(
                 "debug.child_submit.vm_recipe_reclaimed",
                 vm_recipe_reclaims as i64,
+            );
+        } else if removed != 0 {
+            emit_child_submit_marker(
+                "debug.child_submit.ebr_deferred_active_guard",
+                removed as i64,
             );
         }
         removed != 0
@@ -192,16 +231,31 @@ impl<P: TxPlatform> CoreInit<P> {
         submit_cpu: CpuId,
         child_thread: Cap<tx_subsystems::thread_runtime::ThreadIdentity>,
     ) -> bool {
+        let total_start = clone_path_clock_now();
         emit_child_submit_marker("debug.child_submit.enter", child_thread.tid.0 as i64);
+        let payload_lookup_start = clone_path_clock_now();
         let Some(payload) = child_thread.payload_cap() else {
+            emit_clone_path_duration(
+                b"debug.clone_path.child_submit.payload_lookup_ns",
+                payload_lookup_start,
+            );
             bench_child_tick::<P>("payload_missing", &BENCH_CHILD_PAYLOAD_MISSING, 1);
             return false;
         };
+        emit_clone_path_duration(
+            b"debug.clone_path.child_submit.payload_lookup_ns",
+            payload_lookup_start,
+        );
         emit_child_submit_marker(
             "debug.child_submit.payload.after",
             child_thread.tid.0 as i64,
         );
+        let payload_clone_start = clone_path_clock_now();
         let task_payload = payload.clone();
+        emit_clone_path_duration(
+            b"debug.clone_path.child_submit.payload_clone_ns",
+            payload_clone_start,
+        );
         emit_child_submit_marker(
             "debug.child_submit.payload_clone.after",
             child_thread.tid.0 as i64,
@@ -211,23 +265,36 @@ impl<P: TxPlatform> CoreInit<P> {
         let mut signal = SmpRescheduleSignal::<P>::new();
         let mut drained = alloc::vec::Vec::new();
         emit_child_submit_marker("debug.child_submit.reactor.with.before", child_tid as i64);
+        let reactor_with_start = clone_path_clock_now();
+        let may_drain_terminal = step_engine::borrow_current_guard().is_none();
         let submitted = BOOT_REACTOR.with(|reactor| {
-            // Concurrent userspace polling can run an entire hot pthread
-            // batch inside one reactor step. Reclaim terminal children in the
-            // same reactor critical section as submission so the task table
-            // can reuse slots without an extra reactor lock round-trip.
-            drained.extend(
-                reactor
-                    .drain_completed()
-                    .into_iter()
-                    .map(|record| record.handle),
-            );
-            drained.extend(
-                reactor
-                    .drain_cancelled()
-                    .into_iter()
-                    .map(|record| record.handle),
-            );
+            if may_drain_terminal {
+                // Concurrent userspace polling can run an entire hot pthread
+                // batch inside one reactor step. Reclaim terminal children in
+                // the same reactor critical section as submission so the task
+                // table can reuse slots without an extra reactor lock
+                // round-trip. When child submission runs inside an existing
+                // EBR guard, defer this drain: dropping terminal futures may
+                // run destructors that need Weak upgrades, and nested guards
+                // are forbidden by the epoch substrate.
+                drained.extend(
+                    reactor
+                        .drain_completed()
+                        .into_iter()
+                        .map(|record| record.handle),
+                );
+                drained.extend(
+                    reactor
+                        .drain_cancelled()
+                        .into_iter()
+                        .map(|record| record.handle),
+                );
+            } else {
+                emit_child_submit_marker(
+                    "debug.child_submit.terminal_drain_deferred",
+                    child_tid as i64,
+                );
+            }
             emit_child_submit_marker("debug.child_submit.submit_call.before", child_tid as i64);
             reactor.submit_task_publish_ack(
                 crate::thread_future::PerHartSlotted::<P, _>::new(
@@ -240,8 +307,17 @@ impl<P: TxPlatform> CoreInit<P> {
                 &mut signal,
             )
         });
+        emit_clone_path_duration(
+            b"debug.clone_path.child_submit.reactor_with_ns",
+            reactor_with_start,
+        );
         emit_child_submit_marker("debug.child_submit.reactor.with.after", child_tid as i64);
+        let terminal_drain_start = clone_path_clock_now();
         let _ = Self::finish_terminal_thread_reactor_drain(&drained);
+        emit_clone_path_duration(
+            b"debug.clone_path.child_submit.terminal_drain_ns",
+            terminal_drain_start,
+        );
         if let Some(report) = submitted {
             let task_key = report.task;
             emit_child_submit_marker(
@@ -259,10 +335,19 @@ impl<P: TxPlatform> CoreInit<P> {
                     | ((report.dispatch.local_reschedules as i64) << 32),
             );
             bench_child_tick::<P>("submitted", &BENCH_CHILD_SUBMIT, 256);
+            let register_start = clone_path_clock_now();
             Self::register_thread_reactor_task(child_tid, task_key);
+            emit_clone_path_duration(
+                b"debug.clone_path.child_submit.register_task_ns",
+                register_start,
+            );
             emit_child_submit_marker("debug.child_submit.register.after", child_tid as i64);
+            emit_clone_path_count(b"debug.clone_path.child_submit.count", 1);
+            emit_clone_path_duration(b"debug.clone_path.child_submit.total_ns", total_start);
             true
         } else {
+            emit_clone_path_count(b"debug.clone_path.child_submit.not_submitted", 1);
+            emit_clone_path_duration(b"debug.clone_path.child_submit.total_ns", total_start);
             false
         }
     }
@@ -292,7 +377,7 @@ fn phase1_queue_code(queue: boot_runtime::Phase1QueueKind) -> i64 {
 
 fn bench_child_tick<P: TxPlatform>(phase: &str, counter: &AtomicU64, every: u64) {
     let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
-    if n == 1 || n % every == 0 {
+    if n <= 8 || n % every == 0 {
         write_bench_child_count::<P>(phase, n);
     }
 }
@@ -303,7 +388,7 @@ fn bench_child_add<P: TxPlatform>(phase: &str, counter: &AtomicU64, amount: u64,
     }
     let prev = counter.fetch_add(amount, Ordering::Relaxed);
     let n = prev.saturating_add(amount);
-    if prev == 0 || n / every != prev / every {
+    if n <= 8 || prev == 0 || n / every != prev / every {
         write_bench_child_count::<P>(phase, n);
     }
 }

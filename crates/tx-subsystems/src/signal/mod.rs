@@ -640,18 +640,13 @@ fn refresh_deliverable_signal_summary_fast(
 }
 
 pub(crate) fn refresh_deliverable_signal_summary_with_payload(
-    thread: &Cap<crate::thread_runtime::ThreadIdentity>,
+    _thread: &Cap<crate::thread_runtime::ThreadIdentity>,
     payload: &PayloadCap<crate::thread_runtime::ThreadPayload>,
 ) -> bool {
     let mask = payload.signal_mask();
     let t_deliverable = payload.pending().deliverable_bits(mask);
     let g_hint_deliverable = payload.group_pending_summary() & !mask.raw_bits();
-    if t_deliverable == 0 && g_hint_deliverable == 0 {
-        payload.update_summary(|s| s.deliverable_signal = false);
-        return false;
-    }
-
-    let deliverable = select_next_signal(thread).is_some();
+    let deliverable = t_deliverable != 0 || g_hint_deliverable != 0;
     payload.update_summary(|s| s.deliverable_signal = deliverable);
     deliverable
 }

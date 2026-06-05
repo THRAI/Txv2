@@ -712,28 +712,61 @@ pub fn step_clone_thread(
     // reserve: reserve namespace, memory, or wait-source effects.
     // commit: apply the state transition.
     // publish: emit readiness, signal, or observable outcome.
+    let total_start = clone_path_clock_now();
     emit_clone_thread_marker(b"debug.clone_thread.enter", process.pid.0 as i64);
+    let allocate_tid_start = clone_path_clock_now();
     let tid = allocate_tid();
+    emit_clone_path_duration(
+        b"debug.clone_path.step_clone_thread.allocate_tid_ns",
+        allocate_tid_start,
+    );
     emit_clone_thread_marker(b"debug.clone_thread.allocate_tid.after", tid.0 as i64);
+    let sign_thread_start = clone_path_clock_now();
     let child = sign_thread(process.downgrade(), tid)?;
+    emit_clone_path_duration(
+        b"debug.clone_path.step_clone_thread.sign_thread_ns",
+        sign_thread_start,
+    );
     emit_clone_thread_marker(b"debug.clone_thread.sign_thread.after", tid.0 as i64);
+    let register_tid_start = clone_path_clock_now();
     register_tid(child.tid, child.clone());
+    emit_clone_path_duration(
+        b"debug.clone_path.step_clone_thread.register_tid_ns",
+        register_tid_start,
+    );
     emit_clone_thread_marker(b"debug.clone_thread.register_tid.after", tid.0 as i64);
+    let seed_context_start = clone_path_clock_now();
     seed_child_leader_context(&child, parent_user_ctx, tls, stack);
+    emit_clone_path_duration(
+        b"debug.clone_path.step_clone_thread.seed_context_ns",
+        seed_context_start,
+    );
     emit_clone_thread_marker(b"debug.clone_thread.seed_context.after", tid.0 as i64);
+    let clear_ctid_start = clone_path_clock_now();
     if ctid_ptr != 0 {
         let payload = child
             .payload_cap()
             .expect("step_clone_thread: fresh child missing payload");
         *payload.clear_child_tid.lock() = Some(ctid_ptr);
     }
+    emit_clone_path_duration(
+        b"debug.clone_path.step_clone_thread.clear_ctid_ns",
+        clear_ctid_start,
+    );
     emit_clone_thread_marker(b"debug.clone_thread.clear_ctid.after", tid.0 as i64);
+    let attach_start = clone_path_clock_now();
     if let Some(proc_payload) = process.payload.lock().as_ref() {
         proc_payload.threads.attach(child.clone());
         sync_thread_group_pending_summary(proc_payload, &child);
         proc_payload.thread_count.fetch_add(1, Ordering::AcqRel);
     }
+    emit_clone_path_duration(
+        b"debug.clone_path.step_clone_thread.attach_ns",
+        attach_start,
+    );
     emit_clone_thread_marker(b"debug.clone_thread.attach.after", tid.0 as i64);
+    emit_clone_path_count(b"debug.clone_path.step_clone_thread.count", 1);
+    emit_clone_path_duration(b"debug.clone_path.step_clone_thread.total_ns", total_start);
     Ok(child)
 }
 
@@ -747,6 +780,40 @@ fn emit_clone_thread_marker(name: &[u8], value: i64) {
             value,
         );
         tx_observe::dump_registered_if_requested();
+    }
+}
+
+#[inline(always)]
+fn clone_path_metrics_enabled() -> bool {
+    cfg!(tx_clone_path_metrics) && tx_observe::current().is_some()
+}
+
+#[inline(always)]
+fn clone_path_clock_now() -> Option<u64> {
+    if clone_path_metrics_enabled() {
+        Some(tx_observe::clock_now_ns())
+    } else {
+        None
+    }
+}
+
+fn emit_clone_path_duration(name: &[u8], start: Option<u64>) {
+    let Some(start) = start else {
+        return;
+    };
+    let duration = tx_observe::clock_now_ns().saturating_sub(start);
+    emit_clone_path_count(name, duration);
+}
+
+fn emit_clone_path_count(name: &[u8], value: u64) {
+    if !clone_path_metrics_enabled() {
+        return;
+    }
+    if let Some(observer) = tx_observe::current() {
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            value as i64,
+        );
     }
 }
 
@@ -1398,19 +1465,42 @@ fn sign_thread(
     owner_proc: Weak<ProcessIdentity>,
     tid: Tid,
 ) -> Result<Cap<ThreadIdentity>, ZoneError> {
+    let total_start = clone_path_clock_now();
+    let payload_fresh_start = clone_path_clock_now();
     let payload_value = ThreadPayload::fresh();
+    emit_clone_path_duration(
+        b"debug.clone_path.sign_thread.payload_fresh_ns",
+        payload_fresh_start,
+    );
     emit_clone_thread_marker(b"debug.clone_thread.payload_fresh.after", tid.0 as i64);
+    let payload_sign_start = clone_path_clock_now();
     let payload_cap = step_engine::sign(payload_value)?;
+    emit_clone_path_duration(
+        b"debug.clone_path.sign_thread.payload_sign_ns",
+        payload_sign_start,
+    );
     emit_clone_thread_marker(b"debug.clone_thread.payload_sign.after", tid.0 as i64);
+    let payload_cap_start = clone_path_clock_now();
     let payload = PayloadCap::from_cap(payload_cap);
+    emit_clone_path_duration(
+        b"debug.clone_path.sign_thread.payload_cap_ns",
+        payload_cap_start,
+    );
     emit_clone_thread_marker(b"debug.clone_thread.payload_cap.after", tid.0 as i64);
+    let identity_sign_start = clone_path_clock_now();
     let identity = step_engine::sign(ThreadIdentity {
         tid,
         owner_proc,
         exit_status: SpinMutex::new(None),
         payload: SpinMutex::new(Some(payload)),
     })?;
+    emit_clone_path_duration(
+        b"debug.clone_path.sign_thread.identity_sign_ns",
+        identity_sign_start,
+    );
     emit_clone_thread_marker(b"debug.clone_thread.identity_sign.after", tid.0 as i64);
+    emit_clone_path_count(b"debug.clone_path.sign_thread.count", 1);
+    emit_clone_path_duration(b"debug.clone_path.sign_thread.total_ns", total_start);
     Ok(identity)
 }
 

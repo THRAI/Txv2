@@ -61,7 +61,8 @@ impl ThreadIdentity {
     pub fn upgrade_owner_proc(
         &self,
     ) -> Option<crate::thread_runtime::adapter::step_engine::Cap<ProcessIdentity>> {
-        let guard = crate::thread_runtime::adapter::step_engine::guard();
+        let guard = crate::thread_runtime::adapter::step_engine::borrow_current_guard()
+            .unwrap_or_else(crate::thread_runtime::adapter::step_engine::guard);
         self.owner_proc.upgrade(&guard)
     }
 

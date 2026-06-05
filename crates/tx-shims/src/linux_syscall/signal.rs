@@ -4,6 +4,7 @@
 //! either in this submodule or in the shared parent (`super::*`).
 
 use super::*;
+#[cfg(tx_sigprocmask_detail_metrics)]
 use core::sync::atomic::{AtomicU64, Ordering};
 use tx_subsystems::process::numbers::{resolve_pid_number_as, PidName, PidNameKind};
 use tx_subsystems::signal::{step_kill_pgrp, SigInfo, SI_USER};
@@ -12,6 +13,7 @@ use tx_subsystems::signal::{KillOutcome, SignalTarget};
 #[cfg(target_arch = "loongarch64")]
 const MUSL_SIGCANCEL: u8 = 33;
 const SI_TKILL: i32 = -6;
+#[cfg(tx_sigprocmask_detail_metrics)]
 static SIGPROCMASK_TRACE_SAMPLE: AtomicU64 = AtomicU64::new(0);
 
 #[repr(C)]
@@ -89,11 +91,18 @@ fn drain_stale_signal_events(mailbox: &crate::adapter::reactor_entry::TaskMailbo
     }
 }
 
+#[cfg(tx_sigprocmask_detail_metrics)]
 fn sigprocmask_trace_sample() -> Option<i64> {
     let seq = SIGPROCMASK_TRACE_SAMPLE.fetch_add(1, Ordering::Relaxed);
     (seq < 64 || seq.is_power_of_two()).then_some(seq as i64)
 }
 
+#[cfg(not(tx_sigprocmask_detail_metrics))]
+fn sigprocmask_trace_sample() -> Option<i64> {
+    None
+}
+
+#[cfg(tx_sigprocmask_detail_metrics)]
 fn emit_sigprocmask_debug(name: &[u8], value: i64) {
     if let Some(observer) = tx_observe::current() {
         observer.counter(
@@ -103,6 +112,42 @@ fn emit_sigprocmask_debug(name: &[u8], value: i64) {
         tx_observe::dump_registered_if_requested();
     }
 }
+
+#[cfg(not(tx_sigprocmask_detail_metrics))]
+fn emit_sigprocmask_debug(_name: &[u8], _value: i64) {}
+
+#[cfg(tx_sigprocmask_detail_metrics)]
+fn sigprocmask_detail_now() -> u64 {
+    tx_observe::clock_now_ns()
+}
+
+#[cfg(not(tx_sigprocmask_detail_metrics))]
+fn sigprocmask_detail_now() -> u64 {
+    0
+}
+
+#[cfg(tx_sigprocmask_detail_metrics)]
+fn emit_sigprocmask_detail_duration(name: &[u8], start_ns: u64) {
+    if let Some(observer) = tx_observe::current() {
+        let dur = tx_observe::clock_now_ns().saturating_sub(start_ns);
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            dur.min(i64::MAX as u64) as i64,
+        );
+        tx_observe::dump_registered_if_requested();
+    }
+}
+
+#[cfg(not(tx_sigprocmask_detail_metrics))]
+fn emit_sigprocmask_detail_duration(_name: &[u8], _start_ns: u64) {}
+
+#[cfg(tx_sigprocmask_detail_metrics)]
+fn emit_sigprocmask_detail_value(name: &[u8], value: i64) {
+    emit_sigprocmask_debug(name, value);
+}
+
+#[cfg(not(tx_sigprocmask_detail_metrics))]
+fn emit_sigprocmask_detail_value(_name: &[u8], _value: i64) {}
 
 /// `rt_sigprocmask(how, set, oldset, sigsetsize)` per `SIGNAL_v1` §3.
 ///
@@ -119,10 +164,42 @@ pub(super) fn sys_rt_sigprocmask_thread_aspace(
     thread: &Cap<ThreadIdentity>,
     aspace: &Cap<AddressSpace>,
 ) -> SyscallResult {
+    sys_rt_sigprocmask_impl(args, thread, None, aspace)
+}
+
+pub(super) fn sys_rt_sigprocmask_thread_payload_aspace(
+    args: [u64; 6],
+    thread: &Cap<ThreadIdentity>,
+    payload: &PayloadCap<ThreadPayload>,
+    aspace: &Cap<AddressSpace>,
+) -> SyscallResult {
+    sys_rt_sigprocmask_impl(args, thread, Some(payload), aspace)
+}
+
+fn sys_rt_sigprocmask_impl(
+    args: [u64; 6],
+    thread: &Cap<ThreadIdentity>,
+    payload: Option<&PayloadCap<ThreadPayload>>,
+    aspace: &Cap<AddressSpace>,
+) -> SyscallResult {
+    let total_start = sigprocmask_detail_now();
+    let decode_start = sigprocmask_detail_now();
+    #[cfg(not(tx_sigprocmask_detail_metrics))]
+    let _ = decode_start;
     let how_raw = args[0] as i32;
     let set_ptr = args[1] as usize;
     let oldset_ptr = args[2] as usize;
     let sigsetsize = args[3];
+    #[cfg(tx_sigprocmask_detail_metrics)]
+    {
+        emit_sigprocmask_detail_duration(b"debug.sigprocmask.detail.decode_ns", decode_start);
+        emit_sigprocmask_detail_value(
+            b"debug.sigprocmask.detail.route",
+            i64::from(payload.is_some())
+                | (i64::from(set_ptr != 0) << 1)
+                | (i64::from(oldset_ptr != 0) << 2),
+        );
+    }
     let trace_seq = sigprocmask_trace_sample();
     if let Some(seq) = trace_seq {
         emit_sigprocmask_debug(b"debug.sigprocmask.enter", seq);
@@ -138,6 +215,11 @@ pub(super) fn sys_rt_sigprocmask_thread_aspace(
         if let Some(seq) = trace_seq {
             emit_sigprocmask_debug(b"debug.sigprocmask.bad_size", seq);
         }
+        #[cfg(tx_sigprocmask_detail_metrics)]
+        {
+            emit_sigprocmask_detail_value(b"debug.sigprocmask.detail.bad_size", 1);
+            emit_sigprocmask_detail_duration(b"debug.sigprocmask.detail.total_ns", total_start);
+        }
         return SyscallResult::Error(EINVAL_VALUE);
     }
 
@@ -151,7 +233,14 @@ pub(super) fn sys_rt_sigprocmask_thread_aspace(
         (0, _) => Some(SigmaskHow::Block),
         (1, _) => Some(SigmaskHow::Unblock),
         (2, _) => Some(SigmaskHow::SetMask),
-        _ => return SyscallResult::Error(EINVAL_VALUE),
+        _ => {
+            #[cfg(tx_sigprocmask_detail_metrics)]
+            {
+                emit_sigprocmask_detail_value(b"debug.sigprocmask.detail.bad_how", 1);
+                emit_sigprocmask_detail_duration(b"debug.sigprocmask.detail.total_ns", total_start);
+            }
+            return SyscallResult::Error(EINVAL_VALUE);
+        }
     };
 
     // Read the user-supplied set bitset through the canonical
@@ -161,11 +250,30 @@ pub(super) fn sys_rt_sigprocmask_thread_aspace(
     let next_mask = if set_ptr == 0 {
         SignalMask::EMPTY
     } else {
+        let read_start = sigprocmask_detail_now();
         match bootstrap_read_user::<u64>(aspace, set_ptr as u64) {
-            Ok(bits) => SignalMask::new(bits),
+            Ok(bits) => {
+                emit_sigprocmask_detail_duration(
+                    b"debug.sigprocmask.detail.read_user_ns",
+                    read_start,
+                );
+                SignalMask::new(bits)
+            }
             Err(errno) => {
                 if let Some(seq) = trace_seq {
                     emit_sigprocmask_debug(b"debug.sigprocmask.read.err", seq);
+                }
+                #[cfg(tx_sigprocmask_detail_metrics)]
+                {
+                    emit_sigprocmask_detail_duration(
+                        b"debug.sigprocmask.detail.read_user_ns",
+                        read_start,
+                    );
+                    emit_sigprocmask_detail_value(b"debug.sigprocmask.detail.read_err", 1);
+                    emit_sigprocmask_detail_duration(
+                        b"debug.sigprocmask.detail.total_ns",
+                        total_start,
+                    );
                 }
                 return SyscallResult::error_from(errno);
             }
@@ -180,28 +288,71 @@ pub(super) fn sys_rt_sigprocmask_thread_aspace(
     // signal deliverability, which is unnecessary work on pthread lifecycle
     // probes.
     let prev_mask: SignalMask = match how {
-        Some(how) => match step_sigprocmask(thread, how, next_mask) {
-            SigprocmaskChange::Replaced { prev, .. } => {
-                if let Some(seq) = trace_seq {
-                    emit_sigprocmask_debug(b"debug.sigprocmask.step.after", seq);
+        Some(how) => {
+            let step_start = sigprocmask_detail_now();
+            match payload.map_or_else(
+                || step_sigprocmask(thread, how, next_mask),
+                |payload| step_sigprocmask_with_payload(thread, payload, how, next_mask),
+            ) {
+                SigprocmaskChange::Replaced { prev, .. } => {
+                    emit_sigprocmask_detail_duration(
+                        b"debug.sigprocmask.detail.step_ns",
+                        step_start,
+                    );
+                    if let Some(seq) = trace_seq {
+                        emit_sigprocmask_debug(b"debug.sigprocmask.step.after", seq);
+                    }
+                    prev
                 }
-                prev
-            }
-            SigprocmaskChange::ZombieIgnored => {
-                if let Some(seq) = trace_seq {
-                    emit_sigprocmask_debug(b"debug.sigprocmask.step.zombie", seq);
+                SigprocmaskChange::ZombieIgnored => {
+                    #[cfg(tx_sigprocmask_detail_metrics)]
+                    {
+                        emit_sigprocmask_detail_duration(
+                            b"debug.sigprocmask.detail.step_ns",
+                            step_start,
+                        );
+                        emit_sigprocmask_detail_value(b"debug.sigprocmask.detail.step_zombie", 1);
+                        emit_sigprocmask_detail_duration(
+                            b"debug.sigprocmask.detail.total_ns",
+                            total_start,
+                        );
+                    }
+                    if let Some(seq) = trace_seq {
+                        emit_sigprocmask_debug(b"debug.sigprocmask.step.zombie", seq);
+                    }
+                    return SyscallResult::Error(ESRCH_VALUE);
                 }
-                return SyscallResult::Error(ESRCH_VALUE);
             }
-        },
+        }
         None => {
-            let Some(payload) = thread.payload_cap() else {
-                if let Some(seq) = trace_seq {
-                    emit_sigprocmask_debug(b"debug.sigprocmask.mask.zombie", seq);
-                }
-                return SyscallResult::Error(ESRCH_VALUE);
+            let query_start = sigprocmask_detail_now();
+            let mask = if let Some(payload) = payload {
+                payload.signal_mask()
+            } else {
+                let Some(payload) = thread.payload_cap() else {
+                    if let Some(seq) = trace_seq {
+                        emit_sigprocmask_debug(b"debug.sigprocmask.mask.zombie", seq);
+                    }
+                    #[cfg(tx_sigprocmask_detail_metrics)]
+                    {
+                        emit_sigprocmask_detail_duration(
+                            b"debug.sigprocmask.detail.query_mask_ns",
+                            query_start,
+                        );
+                        emit_sigprocmask_detail_value(b"debug.sigprocmask.detail.mask_zombie", 1);
+                        emit_sigprocmask_detail_duration(
+                            b"debug.sigprocmask.detail.total_ns",
+                            total_start,
+                        );
+                    }
+                    return SyscallResult::Error(ESRCH_VALUE);
+                };
+                payload.signal_mask()
             };
-            let mask = payload.signal_mask();
+            emit_sigprocmask_detail_duration(
+                b"debug.sigprocmask.detail.query_mask_ns",
+                query_start,
+            );
             if let Some(seq) = trace_seq {
                 emit_sigprocmask_debug(b"debug.sigprocmask.mask.after", seq);
             }
@@ -210,14 +361,25 @@ pub(super) fn sys_rt_sigprocmask_thread_aspace(
     };
 
     if oldset_ptr != 0 {
+        let write_start = sigprocmask_detail_now();
         if let Err(errno) =
             bootstrap_write_user::<u64>(aspace, oldset_ptr as u64, prev_mask.raw_bits())
         {
             if let Some(seq) = trace_seq {
                 emit_sigprocmask_debug(b"debug.sigprocmask.write.err", seq);
             }
+            #[cfg(tx_sigprocmask_detail_metrics)]
+            {
+                emit_sigprocmask_detail_duration(
+                    b"debug.sigprocmask.detail.write_user_ns",
+                    write_start,
+                );
+                emit_sigprocmask_detail_value(b"debug.sigprocmask.detail.write_err", 1);
+                emit_sigprocmask_detail_duration(b"debug.sigprocmask.detail.total_ns", total_start);
+            }
             return SyscallResult::error_from(errno);
         }
+        emit_sigprocmask_detail_duration(b"debug.sigprocmask.detail.write_user_ns", write_start);
         if let Some(seq) = trace_seq {
             emit_sigprocmask_debug(b"debug.sigprocmask.write.after", seq);
         }
@@ -226,6 +388,7 @@ pub(super) fn sys_rt_sigprocmask_thread_aspace(
     if let Some(seq) = trace_seq {
         emit_sigprocmask_debug(b"debug.sigprocmask.return", seq);
     }
+    emit_sigprocmask_detail_duration(b"debug.sigprocmask.detail.total_ns", total_start);
     SyscallResult::Return(0)
 }
 

@@ -24,7 +24,7 @@ use tx_platform_adapter::platform_adapter;
 pub mod step_engine {
     pub(crate) use crate::sync::{spin_mutex, SpinMutex};
     pub use tx_substrate::epoch::{
-        self as epoch, cpu_summary, drain_with_budget, guard, summary, Guard,
+        self as epoch, borrow_current_guard, cpu_summary, drain_with_budget, guard, summary, Guard,
     };
     pub use tx_substrate::step::{
         ByteProgress, Errno, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,

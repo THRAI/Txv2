@@ -102,35 +102,116 @@ fn try_direct_trap_syscall<P: TxPlatform>(
     view: &mut TrapFrameMut<'_>,
     req: &trap_handoff::SyscallRequest,
 ) -> Option<TrapAction> {
+    let direct_total_start = direct_sigprocmask_detail_now(req.nr);
     let hart = <P as PercpuIf>::current_cpu_id().0;
+    let payload_start = direct_sigprocmask_detail_now(req.nr);
     let Some(payload) = tx_subsystems::thread_runtime::current_userspace_payload(hart) else {
+        emit_direct_sigprocmask_detail_value(
+            req.nr,
+            b"debug.trap.direct_sigprocmask.no_payload",
+            1,
+        );
         return None;
     };
     if payload.active_userspace_request().is_none() {
+        emit_direct_sigprocmask_detail_value(
+            req.nr,
+            b"debug.trap.direct_sigprocmask.no_active_request",
+            1,
+        );
         return None;
     }
+    emit_direct_sigprocmask_detail_duration(
+        req.nr,
+        b"debug.trap.direct_sigprocmask.payload_ns",
+        payload_start,
+    );
 
+    let context_start = direct_sigprocmask_detail_now(req.nr);
+    let thread_lookup_start = direct_sigprocmask_detail_now(req.nr);
     let Some(thread) = tx_subsystems::thread_runtime::current_userspace_thread_identity(hart)
     else {
+        emit_direct_sigprocmask_detail_value(req.nr, b"debug.trap.direct_sigprocmask.no_thread", 1);
         return None;
     };
+    emit_direct_sigprocmask_detail_duration(
+        req.nr,
+        b"debug.trap.direct_sigprocmask.context_thread_ns",
+        thread_lookup_start,
+    );
+    let owner_upgrade_start = direct_sigprocmask_detail_now(req.nr);
     let Some(process) = thread.upgrade_owner_proc() else {
+        emit_direct_sigprocmask_detail_value(
+            req.nr,
+            b"debug.trap.direct_sigprocmask.no_process",
+            1,
+        );
         return None;
     };
+    emit_direct_sigprocmask_detail_duration(
+        req.nr,
+        b"debug.trap.direct_sigprocmask.context_owner_ns",
+        owner_upgrade_start,
+    );
+    let aspace_start = direct_sigprocmask_detail_now(req.nr);
     let Some(aspace) = process.aspace_cap() else {
+        emit_direct_sigprocmask_detail_value(req.nr, b"debug.trap.direct_sigprocmask.no_aspace", 1);
         return None;
     };
+    emit_direct_sigprocmask_detail_duration(
+        req.nr,
+        b"debug.trap.direct_sigprocmask.context_aspace_ns",
+        aspace_start,
+    );
+    emit_direct_sigprocmask_detail_duration(
+        req.nr,
+        b"debug.trap.direct_sigprocmask.context_ns",
+        context_start,
+    );
 
+    let precondition_start = direct_sigprocmask_detail_now(req.nr);
     if !direct_syscall_preconditions(req.nr, &payload, &process) {
+        emit_direct_sigprocmask_detail_duration(
+            req.nr,
+            b"debug.trap.direct_sigprocmask.precondition_ns",
+            precondition_start,
+        );
+        emit_direct_sigprocmask_detail_value(
+            req.nr,
+            b"debug.trap.direct_sigprocmask.precondition_failed",
+            1,
+        );
         return None;
     }
+    emit_direct_sigprocmask_detail_duration(
+        req.nr,
+        b"debug.trap.direct_sigprocmask.precondition_ns",
+        precondition_start,
+    );
 
-    let Some(result) =
-        tx_shims::linux_syscall::dispatch_direct_trap_oneshot(req, &process, &thread, &aspace)
-    else {
+    let dispatch_start = direct_sigprocmask_detail_now(req.nr);
+    let Some(result) = tx_shims::linux_syscall::dispatch_direct_trap_payload_oneshot(
+        req, &process, &thread, &payload, &aspace,
+    ) else {
+        emit_direct_sigprocmask_detail_duration(
+            req.nr,
+            b"debug.trap.direct_sigprocmask.dispatch_ns",
+            dispatch_start,
+        );
+        emit_direct_sigprocmask_detail_value(
+            req.nr,
+            b"debug.trap.direct_sigprocmask.unsupported",
+            1,
+        );
         return None;
     };
+    emit_direct_sigprocmask_detail_duration(
+        req.nr,
+        b"debug.trap.direct_sigprocmask.dispatch_ns",
+        dispatch_start,
+    );
 
+    let post_start = direct_sigprocmask_detail_now(req.nr);
     let needs_reschedule = direct_trap_syscall_needs_wake_handoff(req, &result);
 
     match result {
@@ -146,12 +227,33 @@ fn try_direct_trap_syscall<P: TxPlatform>(
     view.set_pc(VirtAddr(
         view.view().pc.0.wrapping_add(RV64_ECALL_INSN_BYTES),
     ));
+    emit_direct_sigprocmask_detail_duration(
+        req.nr,
+        b"debug.trap.direct_sigprocmask.writeback_ns",
+        post_start,
+    );
     emit_debug_counter(b"debug.trap.direct_syscall", req.nr as i64);
     if needs_reschedule {
         emit_debug_counter(b"debug.trap.direct_wake_handoff", req.nr as i64);
+        let handoff_start = direct_sigprocmask_detail_now(req.nr);
         let outcome = trap_handoff::hand_off_timer_preempt(hart, view);
+        emit_direct_sigprocmask_detail_duration(
+            req.nr,
+            b"debug.trap.direct_sigprocmask.wake_handoff_ns",
+            handoff_start,
+        );
+        emit_direct_sigprocmask_detail_duration(
+            req.nr,
+            b"debug.trap.direct_sigprocmask.total_ns",
+            direct_total_start,
+        );
         return Some(trap_handoff::timer_preempt_outcome_to_trap_action(&outcome));
     }
+    emit_direct_sigprocmask_detail_duration(
+        req.nr,
+        b"debug.trap.direct_sigprocmask.total_ns",
+        direct_total_start,
+    );
     Some(TrapAction::Resume)
 }
 
@@ -192,6 +294,55 @@ fn emit_debug_counter(name: &[u8], value: i64) {
         tx_observe::dump_registered_if_requested();
     }
 }
+
+#[cfg(tx_sigprocmask_detail_metrics)]
+fn direct_sigprocmask_detail_now(nr: u64) -> u64 {
+    if nr == NR_RT_SIGPROCMASK {
+        tx_observe::clock_now_ns()
+    } else {
+        0
+    }
+}
+
+#[cfg(not(tx_sigprocmask_detail_metrics))]
+fn direct_sigprocmask_detail_now(_nr: u64) -> u64 {
+    0
+}
+
+#[cfg(tx_sigprocmask_detail_metrics)]
+fn emit_direct_sigprocmask_detail_duration(nr: u64, name: &[u8], start_ns: u64) {
+    if nr != NR_RT_SIGPROCMASK {
+        return;
+    }
+    if let Some(observer) = tx_observe::current() {
+        let dur = tx_observe::clock_now_ns().saturating_sub(start_ns);
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            dur.min(i64::MAX as u64) as i64,
+        );
+        tx_observe::dump_registered_if_requested();
+    }
+}
+
+#[cfg(not(tx_sigprocmask_detail_metrics))]
+fn emit_direct_sigprocmask_detail_duration(_nr: u64, _name: &[u8], _start_ns: u64) {}
+
+#[cfg(tx_sigprocmask_detail_metrics)]
+fn emit_direct_sigprocmask_detail_value(nr: u64, name: &[u8], value: i64) {
+    if nr != NR_RT_SIGPROCMASK {
+        return;
+    }
+    if let Some(observer) = tx_observe::current() {
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            value,
+        );
+        tx_observe::dump_registered_if_requested();
+    }
+}
+
+#[cfg(not(tx_sigprocmask_detail_metrics))]
+fn emit_direct_sigprocmask_detail_value(_nr: u64, _name: &[u8], _value: i64) {}
 
 fn log_page_fault_handoff_failure<P: TxPlatform>(
     hart: usize,

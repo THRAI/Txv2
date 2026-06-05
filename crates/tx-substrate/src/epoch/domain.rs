@@ -169,6 +169,7 @@ impl EpochDomain {
         Ok(())
     }
 
+    #[track_caller]
     fn guard(&'static self) -> Guard<'static> {
         assert!(
             self.initialized.load(Ordering::Acquire),
@@ -192,6 +193,12 @@ impl EpochDomain {
         );
 
         let current_epoch = self.global_epoch.0.load(Ordering::Acquire);
+        let active_epoch = local.current();
+        assert_eq!(
+            active_epoch, 0,
+            "epoch::guard nested on CPU {} with active epoch {}; use borrow_current_guard()",
+            cpu_id.0, active_epoch
+        );
         local.enter(current_epoch);
         self.active_guards.0.fetch_add(1, Ordering::AcqRel);
         // Publish the local epoch before any protected load can float above the
@@ -659,6 +666,7 @@ pub fn init_on_ap(cpu: CpuId) -> Result<(), EpochError> {
     GLOBAL_DOMAIN.init_on_ap(cpu)
 }
 
+#[track_caller]
 pub(crate) fn guard() -> Guard<'static> {
     GLOBAL_DOMAIN.guard()
 }

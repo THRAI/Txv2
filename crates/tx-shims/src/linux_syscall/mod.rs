@@ -74,8 +74,12 @@ use tx_subsystems::signal::{
     DeliverSignalOp, KillProcessOp, SaFlags, SigActionEntry, SigDisposition, SigDispositionChange,
     SigactionOp, SignalMask, Signum,
 };
-use tx_subsystems::thread_runtime::execution::{step_sigprocmask, SigmaskHow, SigprocmaskChange};
-use tx_subsystems::thread_runtime::{step_thread_exit, ThreadExitOp, ThreadIdentity, ThreadKillOp};
+use tx_subsystems::thread_runtime::execution::{
+    step_sigprocmask, step_sigprocmask_with_payload, SigmaskHow, SigprocmaskChange,
+};
+use tx_subsystems::thread_runtime::{
+    step_thread_exit, ThreadExitOp, ThreadIdentity, ThreadKillOp, ThreadPayload,
+};
 use tx_subsystems::tty::execution::{
     step_ioctl_tcgets, step_ioctl_tcsets, step_ioctl_tiocgpgrp, step_ioctl_tiocgwinsz,
     step_ioctl_tiocnotty, step_ioctl_tiocsctty_for_process, step_ioctl_tiocspgrp,
@@ -136,7 +140,7 @@ use aio::*;
 pub mod io_uring;
 use io_uring::*;
 mod signalfd;
-use crate::adapter::step_engine::{self as step_engine, Cap};
+use crate::adapter::step_engine::{self as step_engine, Cap, PayloadCap};
 use signalfd::*;
 mod eventfd;
 use eventfd::*;
@@ -587,6 +591,26 @@ pub fn dispatch_thread_aspace_oneshot(
     Some(result)
 }
 
+/// Fast one-shot lane for syscalls that need the current thread payload and
+/// address space, avoiding both full [`SyscallCtx`] construction and reopening
+/// `thread.payload` after the thread future has already resolved it.
+pub fn dispatch_thread_payload_aspace_oneshot(
+    req: &SyscallRequest,
+    thread: &Cap<ThreadIdentity>,
+    payload: &PayloadCap<ThreadPayload>,
+    aspace: &Cap<AddressSpace>,
+) -> Option<SyscallResult> {
+    if req.nr != NR_RT_SIGPROCMASK {
+        return None;
+    }
+    let l0_span = emit_syscall_enter(req);
+    let prev = tx_observe::set_current_parent_span(l0_span);
+    let result = sys_rt_sigprocmask_thread_payload_aspace(req.args, thread, payload, aspace);
+    tx_observe::set_current_parent_span(prev);
+    emit_syscall_exit(l0_span, &result);
+    Some(result)
+}
+
 /// Fast one-shot lane for anonymous private `mmap` that can commit without
 /// parking on the VM range lock.
 pub fn dispatch_vm_try_oneshot(
@@ -640,6 +664,21 @@ pub fn dispatch_direct_trap_oneshot(
             Some(result)
         }
         _ => None,
+    }
+}
+
+/// Direct trap-resume lane variant for call sites that already hold the
+/// current userspace thread payload.
+pub fn dispatch_direct_trap_payload_oneshot(
+    req: &SyscallRequest,
+    process: &Cap<ProcessIdentity>,
+    thread: &Cap<ThreadIdentity>,
+    payload: &PayloadCap<ThreadPayload>,
+    aspace: &Cap<AddressSpace>,
+) -> Option<SyscallResult> {
+    match req.nr {
+        NR_RT_SIGPROCMASK => dispatch_thread_payload_aspace_oneshot(req, thread, payload, aspace),
+        _ => dispatch_direct_trap_oneshot(req, process, thread, aspace),
     }
 }
 

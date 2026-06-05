@@ -1007,7 +1007,7 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
             use tx_scripts::drive;
             use tx_substrate::step::Deadline;
             use tx_substrate::step::DriveMode;
-            use tx_subsystems::futex::{FUTEX_WAKE_MASK, FutexWaitOp};
+            use tx_subsystems::futex::{FutexWaitOp, FUTEX_WAKE_MASK};
 
             if uaddr == 0 {
                 return SyscallResult::error_from(Errno::EINVAL);

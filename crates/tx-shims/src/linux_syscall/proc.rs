@@ -41,6 +41,40 @@ fn emit_clone_marker(name: &[u8]) {
     }
 }
 
+#[inline(always)]
+fn clone_path_metrics_enabled() -> bool {
+    cfg!(tx_clone_path_metrics) && tx_observe::current().is_some()
+}
+
+#[inline(always)]
+fn clone_path_clock_now() -> Option<u64> {
+    if clone_path_metrics_enabled() {
+        Some(tx_observe::clock_now_ns())
+    } else {
+        None
+    }
+}
+
+fn emit_clone_path_duration(name: &[u8], start: Option<u64>) {
+    let Some(start) = start else {
+        return;
+    };
+    let duration = tx_observe::clock_now_ns().saturating_sub(start);
+    emit_clone_path_count(name, duration);
+}
+
+fn emit_clone_path_count(name: &[u8], value: u64) {
+    if !clone_path_metrics_enabled() {
+        return;
+    }
+    if let Some(observer) = tx_observe::current() {
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            value as i64,
+        );
+    }
+}
+
 /// `exit(status)` — per-thread exit per `PROCESS_v1` §7.3.1.
 ///
 /// The implementation of `step_thread_exit` (in
@@ -314,6 +348,7 @@ pub(super) fn sys_clone_oneshot<P: PmapIf>(
     args: [u64; 6],
     ctx: &SyscallCtx<'_>,
 ) -> Option<SyscallResult> {
+    let total_start = clone_path_clock_now();
     emit_clone_marker(b"debug.clone.enter");
     let flags = args[0];
     let stack = args[1];
@@ -386,12 +421,17 @@ pub(super) fn sys_clone_oneshot<P: PmapIf>(
     // with the stable `:clone:no-context` sentinel (matches the ELF
     // loader's `:bootstrap-exec:fail` precedent — decision recorded
     // 2026-05-06 in the Wave 2 plan, Open Q #2).
+    let parent_ctx_start = clone_path_clock_now();
     let parent_user_ctx = ctx
         .thread
         .payload_cap()
         .expect(":clone:no-payload: kernel-invariant violation, calling thread had no payload")
         .saved_user_context()
         .expect(":clone:no-context: kernel-invariant violation, parent thread had no saved_user_context");
+    emit_clone_path_duration(
+        b"debug.clone_path.sys_clone.parent_ctx_ns",
+        parent_ctx_start,
+    );
     emit_clone_marker(b"debug.clone.parent_ctx.after");
 
     // Txv2's Linux syscall shim receives clone arguments in the
@@ -417,10 +457,15 @@ pub(super) fn sys_clone_oneshot<P: PmapIf>(
             tls: tls as usize,
             ctid_ptr,
         };
+        let step_thread_start = clone_path_clock_now();
         let child_thread = match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
             Ok(result) => result,
             Err(v3errno) => return Some(SyscallResult::error_from(Errno::from(v3errno))),
         };
+        emit_clone_path_duration(
+            b"debug.clone_path.sys_clone.step_thread_ns",
+            step_thread_start,
+        );
         emit_clone_marker(b"debug.clone.step_thread.after");
         let child_thread = match child_thread {
             Ok(t) => t,
@@ -430,6 +475,7 @@ pub(super) fn sys_clone_oneshot<P: PmapIf>(
         // CLONE_PARENT_SETTID: write child tid to *ptid in parent's
         // userspace. Linux semantics: write `child_tid` (as i32)
         // before the child is scheduled.
+        let parent_settid_start = clone_path_clock_now();
         if clone_parent_settid {
             let ptid_ptr = args[2];
             if ptid_ptr != 0 {
@@ -440,15 +486,26 @@ pub(super) fn sys_clone_oneshot<P: PmapIf>(
                 );
             }
         }
+        emit_clone_path_duration(
+            b"debug.clone_path.sys_clone.parent_settid_ns",
+            parent_settid_start,
+        );
         emit_clone_marker(b"debug.clone.parent_settid.after");
 
         // Hand the child thread to the reactor.
         emit_clone_marker(b"debug.clone.reactor_submit.before");
+        let reactor_submit_start = clone_path_clock_now();
         let child_submit =
             reactor_submit::submit_child_thread(ctx.process.clone(), child_thread.clone());
+        emit_clone_path_duration(
+            b"debug.clone_path.sys_clone.reactor_submit_ns",
+            reactor_submit_start,
+        );
         emit_clone_marker(b"debug.clone.reactor_submit.after");
 
         emit_clone_marker(b"debug.clone.return");
+        emit_clone_path_count(b"debug.clone_path.sys_clone.clone_thread_count", 1);
+        emit_clone_path_duration(b"debug.clone_path.sys_clone.total_ns", total_start);
         return Some(SyscallResult::CloneReturn {
             value: child_thread.tid.0 as i64,
             child_submit,

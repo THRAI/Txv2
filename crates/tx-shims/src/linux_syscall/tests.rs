@@ -41,7 +41,8 @@ use tx_subsystems::zones;
 
 use super::{
     dispatch, dispatch_cap_only_immediate, dispatch_clone_oneshot,
-    dispatch_process_aspace_immediate, dispatch_thread_aspace_oneshot, dispatch_vm_hot,
+    dispatch_direct_trap_payload_oneshot, dispatch_process_aspace_immediate,
+    dispatch_thread_aspace_oneshot, dispatch_thread_payload_aspace_oneshot, dispatch_vm_hot,
     dispatch_writev_hot, SyscallCtx, SyscallResult, BRK_LINEAR_HEAP_SOFT_LIMIT_BYTES, CLONE_VFORK,
     EINVAL_VALUE, ENOSYS_VALUE, FD_CLOEXEC, F_GETFD, F_SETFD, NR_BRK, NR_CLONE, NR_EXECVE, NR_EXIT,
     NR_EXIT_GROUP, NR_FCNTL, NR_GETPGID, NR_GETPID, NR_GETPPID, NR_GETSID, NR_GET_ROBUST_LIST,
@@ -1021,6 +1022,95 @@ fn dispatch_thread_aspace_oneshot_handles_rt_sigprocmask_only() {
     assert_eq!(oldset, SIGUSR1_BIT);
 }
 
+#[test]
+fn dispatch_thread_payload_aspace_oneshot_reuses_resolved_payload() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let payload = thread.payload_cap().expect("thread payload alive");
+    let aspace = proc_cap.aspace_cap().expect("alive aspace");
+
+    const SIG_SETMASK: u64 = 2;
+    const SIGUSR1_BIT: u64 = 1u64 << 9;
+
+    assert_eq!(
+        dispatch_thread_payload_aspace_oneshot(
+            &SyscallRequest::new(NR_GETPID, [0; 6]),
+            &thread,
+            &payload,
+            &aspace,
+        ),
+        None,
+        "payload-aware one-shot lane must stay narrow"
+    );
+
+    let set: u64 = SIGUSR1_BIT;
+    let set_result = dispatch_thread_payload_aspace_oneshot(
+        &SyscallRequest::new(
+            NR_RT_SIGPROCMASK,
+            [SIG_SETMASK, &set as *const u64 as u64, 0, 8, 0, 0],
+        ),
+        &thread,
+        &payload,
+        &aspace,
+    );
+    assert_eq!(set_result, Some(SyscallResult::Return(0)));
+
+    let mut oldset: u64 = 0;
+    let query_result = dispatch_thread_payload_aspace_oneshot(
+        &SyscallRequest::new(
+            NR_RT_SIGPROCMASK,
+            [SIG_SETMASK, 0, &mut oldset as *mut u64 as u64, 8, 0, 0],
+        ),
+        &thread,
+        &payload,
+        &aspace,
+    );
+
+    assert_eq!(query_result, Some(SyscallResult::Return(0)));
+    assert_eq!(oldset, SIGUSR1_BIT);
+}
+
+#[test]
+fn dispatch_direct_trap_payload_oneshot_routes_sigprocmask_through_payload_lane() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let payload = thread.payload_cap().expect("thread payload alive");
+    let aspace = proc_cap.aspace_cap().expect("alive aspace");
+
+    const SIG_SETMASK: u64 = 2;
+    const SIGUSR1_BIT: u64 = 1u64 << 9;
+
+    let set: u64 = SIGUSR1_BIT;
+    let set_result = dispatch_direct_trap_payload_oneshot(
+        &SyscallRequest::new(
+            NR_RT_SIGPROCMASK,
+            [SIG_SETMASK, &set as *const u64 as u64, 0, 8, 0, 0],
+        ),
+        &proc_cap,
+        &thread,
+        &payload,
+        &aspace,
+    );
+    assert_eq!(set_result, Some(SyscallResult::Return(0)));
+
+    let mut oldset: u64 = 0;
+    let query_result = dispatch_direct_trap_payload_oneshot(
+        &SyscallRequest::new(
+            NR_RT_SIGPROCMASK,
+            [SIG_SETMASK, 0, &mut oldset as *mut u64 as u64, 8, 0, 0],
+        ),
+        &proc_cap,
+        &thread,
+        &payload,
+        &aspace,
+    );
+
+    assert_eq!(query_result, Some(SyscallResult::Return(0)));
+    assert_eq!(oldset, SIGUSR1_BIT);
+}
+
 /// `rt_sigprocmask` with `sigsetsize != 8` is rejected with `-EINVAL`
 /// per Linux generic ABI / `SIGNAL_v1` §3 (sigset is always 64 bits
 /// on RV64).
@@ -1559,7 +1649,7 @@ mod fd_ops_wave2;
 //     `uaddr`; both fds resolve to the same shared payload.
 //   - `pipe2(uaddr, O_CLOEXEC)` sets the cloexec bit on both fds.
 //   - `pipe2(uaddr, O_NONBLOCK)` threads through to OpenFile.flags.
-//   - `pipe2(uaddr, O_DIRECT)` returns `-ENOSYS` (packet-mode pipes).
+//   - `pipe2(uaddr, O_DIRECT)` creates packet-mode pipes.
 //   - `pipe2(uaddr, junk)` returns `-EINVAL`.
 // ===========================================================================
 mod fd_ops_wave3;

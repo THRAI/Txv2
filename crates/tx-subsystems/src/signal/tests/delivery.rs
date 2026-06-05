@@ -576,6 +576,33 @@ fn refresh_summary_uses_group_pending_hint_for_producer_post() {
 }
 
 #[test]
+fn sigprocmask_refresh_uses_cached_group_hint_without_owner_upgrade() {
+    let _g = setup();
+    let proc_cap = fresh_init();
+    let leader = leader(&proc_cap);
+    let payload = leader.payload_cap().expect("leader payload");
+
+    let mut block = SignalMask::EMPTY;
+    block.block(Signum::SIGTERM);
+    let _ = step_sigprocmask(&leader, SigmaskHow::SetMask, block);
+    payload.store_group_pending_summary(Signum::SIGTERM.bit());
+
+    // Drop the owning process identity while keeping the thread identity and
+    // payload alive. The refresh path should maintain the summary from the
+    // cached group-pending hint instead of requiring the owner weak to upgrade.
+    reset_init_process_for_test();
+    drop(proc_cap);
+    tx_test_support::drain_to_quiescence();
+
+    let _ = step_sigprocmask(&leader, SigmaskHow::SetMask, SignalMask::EMPTY);
+
+    assert!(
+        payload.interrupt_summary().deliverable_signal,
+        "cached group-pending hint should be enough to refresh the summary"
+    );
+}
+
+#[test]
 fn post_group_pending_signal_refreshes_unmasked_thread_summary() {
     let _g = setup();
     let proc_cap = fresh_init();

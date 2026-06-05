@@ -244,7 +244,7 @@ impl ProcessIdentity {
     /// and after the parent identity has been fully reclaimed.
     pub fn parent_cap(&self) -> Option<Cap<ProcessIdentity>> {
         let weak = (*self.parent.lock())?;
-        let guard = step_engine::guard();
+        let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
         weak.upgrade(&guard)
     }
 
@@ -1717,7 +1717,7 @@ impl Session {
     /// or the TTY identity has been reclaimed.
     pub fn controlling_tty_cap(&self) -> Option<Cap<TtyIdentity>> {
         let weak = (*self.controlling_tty.lock())?;
-        let guard = step_engine::guard();
+        let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
         weak.upgrade(&guard)
     }
 
@@ -1746,7 +1746,7 @@ impl Session {
     /// Used by TTY hangup producers that need a typed session-leader pgrp
     /// target for SIGHUP fanout.
     pub fn leader_pgrp_cap(&self) -> Option<Cap<ProcessGroup>> {
-        let guard = step_engine::guard();
+        let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
         self.leader_pgrp_cap_with_guard(&guard)
     }
 
@@ -1795,6 +1795,15 @@ fn adjust_pipe_fd_ref(file: &Cap<OpenFile>, increment: bool) {
             (crate::pipe::PipeSide::Writer, true) => payload.incr_writer(),
             (crate::pipe::PipeSide::Reader, false) => payload.decr_reader(),
             (crate::pipe::PipeSide::Writer, false) => payload.decr_writer(),
+        }
+    }
+    if let Some((rx, tx)) = file.socketpair_endpoint() {
+        if increment {
+            rx.incr_reader();
+            tx.incr_writer();
+        } else {
+            rx.decr_reader();
+            tx.decr_writer();
         }
     }
 }

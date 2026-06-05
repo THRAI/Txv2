@@ -33,7 +33,7 @@ pub mod step_engine {
     pub(crate) use crate::process::lock_metrics::{process_spin_mutex, ProcessSpinMutex};
     pub(crate) use crate::sync::SpinMutex;
     pub use tx_substrate::bus::{RawPort, RawQueue};
-    pub use tx_substrate::epoch::{guard, Guard};
+    pub use tx_substrate::epoch::{borrow_current_guard, guard, Guard};
     pub use tx_substrate::step::ProcessIdentity as PlaceholderProcessSubject;
     pub use tx_substrate::step::{
         drive_oneshot, Errno, InterestMask, NoProgress, OneShotStepOp, RestrictionStackHandle,
