@@ -57,5 +57,11 @@ pub fn require_owner_or_admin(queue: &MsgQueueIdentity, cred: &Cred) -> Result<(
 }
 
 pub fn require_msg_exists(msqid: u32) -> Result<Cap<MsgQueueIdentity>, Errno> {
-    crate::ipc::sysv_msg::structure::lookup_msg(msqid).ok_or(Errno::EINVAL)
+    crate::ipc::sysv_msg::structure::lookup_msg(msqid).ok_or_else(|| {
+        if crate::ipc::sysv_msg::structure::was_msg_removed(msqid) {
+            Errno::EIDRM
+        } else {
+            Errno::EINVAL
+        }
+    })
 }

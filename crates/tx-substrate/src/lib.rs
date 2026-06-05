@@ -14,6 +14,8 @@ pub mod bitmap {
 
 pub mod bus;
 
+#[cfg(tx_ds_metrics)]
+pub mod ds_metrics;
 pub mod epoch;
 pub mod index;
 pub mod mutation;
@@ -32,7 +34,7 @@ pub mod wake;
 pub mod zone;
 
 pub use slot::AtomicSlot;
-pub use sync::{SpinMutex, SpinMutexGuard};
+pub use sync::{LockMetricsOff, LockMetricsOn, SpinMutex, SpinMutexGuard};
 
 #[doc(hidden)]
 pub mod testing {

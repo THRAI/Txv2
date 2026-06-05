@@ -15,7 +15,6 @@ use crate::ipc::posix_mq::structure::{self, MqNotification};
 use crate::ipc::sysv_msg::structure::Msg;
 use crate::ipc::sysv_shm::structure::IpcPerm;
 use crate::process::adapter::step_engine::Cap;
-use crate::process::adapter::wait_routing::Mask;
 use crate::process::nsproxy::PosixMqName;
 use crate::signal::SignalTarget;
 
@@ -201,7 +200,8 @@ pub fn step_mq_send(
             .fetch_add(msg.len() as u64, Ordering::Release);
         payload.msg_count.fetch_add(1, Ordering::Release);
         payload.queue_seq.fetch_add(1, Ordering::Release);
-        let woken_receivers = payload.recv_channel.fire(Mask::from_bits(1));
+        let woken_receivers =
+            crate::ipc::posix_mq::notification::notify_message_available(&payload.recv_channel);
 
         if was_empty && woken_receivers == 0 {
             instance.identity.notify.lock().take()
@@ -272,7 +272,7 @@ pub fn step_mq_receive(
         .current_bytes
         .fetch_sub(msg_len as u64, Ordering::Release);
     payload.msg_count.fetch_sub(1, Ordering::Release);
-    payload.send_channel.fire(Mask::from_bits(1));
+    crate::ipc::posix_mq::notification::notify_space_available(&payload.send_channel);
     Ok((msg.mtext, msg.mtype.saturating_sub(1) as u32))
 }
 

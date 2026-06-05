@@ -511,7 +511,7 @@ fn oscomp_list_suites(root: &Path, args: &[String]) -> Result<()> {
         ));
     }
 
-    let mut suites: BTreeSet<String> = fs::read_dir(&data)
+    let mut suites: Vec<String> = fs::read_dir(&data)
         .map_err(|e| e.to_string())?
         .filter_map(|entry| {
             let entry = entry.ok()?;
@@ -523,25 +523,7 @@ fn oscomp_list_suites(root: &Path, args: &[String]) -> Result<()> {
             }
         })
         .collect();
-    let scripts_dir = data.join("scripts");
-    if scripts_dir.is_dir() {
-        for suite_dir in fs::read_dir(&scripts_dir).map_err(|e| e.to_string())? {
-            let suite_dir = suite_dir.map_err(|e| e.to_string())?;
-            let suite_name = suite_dir.file_name().to_string_lossy().to_string();
-            let testcode = suite_dir.path().join(format!("{suite_name}_testcode.sh"));
-            if testcode.exists() {
-                suites.insert(suite_name.clone());
-                if let Some(target) = &target_filter {
-                    let suffix = if target.starts_with("la") {
-                        "glibc"
-                    } else {
-                        "musl"
-                    };
-                    suites.insert(format!("{suite_name}-{suffix}"));
-                }
-            }
-        }
-    }
+    suites.sort();
 
     if let Some(target) = &target_filter {
         let hint = if target.starts_with("la") {
@@ -556,7 +538,7 @@ fn oscomp_list_suites(root: &Path, args: &[String]) -> Result<()> {
     } else {
         println!("Suites in {}:", data.display());
     }
-    for suite in suites {
+    for suite in &suites {
         println!("  {suite}");
     }
     Ok(())

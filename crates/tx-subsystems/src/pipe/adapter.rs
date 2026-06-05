@@ -8,7 +8,7 @@
 //! Two domains:
 //!
 //! * **`step_engine`** — wraps `tx_substrate::step` step outcomes,
-//!   `tx_substrate::zone` allocation, and `tx_substrate::SpinMutex` as
+//!   `tx_substrate::zone` allocation, and the subsystem lock facade as
 //!   named pipe-side verbs (`done_bytes`, `eagain`, `epipe`,
 //!   `yield_until_readable`, `yield_until_writable`, `sign`).
 //!
@@ -25,11 +25,13 @@ use tx_platform_adapter::platform_adapter;
 #[platform_adapter(
     platform = "substrate",
     domain = "step_engine",
-    apis = ["step", "zone"],
-    reason = "expose pipe step outcomes (done/eagain/epipe/yield) as named verbs; bundle zone allocation into pipe-domain helpers"
+    apis = ["step", "zone", "page_allocator"],
+    reason = "expose pipe step outcomes (done/eagain/epipe/yield) as named verbs; bundle zone allocation and page-backed lease frame reads into pipe-domain helpers"
 )]
 pub mod step_engine {
+    pub(crate) use crate::sync::SpinMutex;
     pub use tx_substrate::epoch::{guard, Guard};
+    pub use tx_substrate::page_allocator;
     pub use tx_substrate::step::{
         drive_oneshot, ByteProgress, Errno, InterestMask, NoProgress, OneShotStepOp,
         ProcessIdentity, ScriptCtx, StepOp, StepOutcome, StepProgress, SubjectIdentity,
@@ -41,7 +43,6 @@ pub mod step_engine {
         OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy, RetainedEntityPolicy, Weak,
         Zone, ZoneAllocated, ZoneError, ZonePolicy,
     };
-    pub use tx_substrate::SpinMutex;
 
     pub type ByteOutcome = StepOutcome<usize, ByteProgress>;
 

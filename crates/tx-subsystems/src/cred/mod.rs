@@ -83,8 +83,6 @@ impl Capability {
     pub const CHOWN: Self = Self(0);
     /// `CAP_DAC_OVERRIDE` — bypass discretionary access control.
     pub const DAC_OVERRIDE: Self = Self(1);
-    /// `CAP_DAC_READ_SEARCH` — bypass read/search permission checks.
-    pub const DAC_READ_SEARCH: Self = Self(2);
     /// `CAP_FOWNER` — bypass file-owner-only checks (chmod, chown,
     /// utimes, etc.) for files the caller does not own. Per Linux's
     /// POSIX cap-FOWNER number (3).
@@ -97,8 +95,6 @@ impl Capability {
     pub const SETUID: Self = Self(7);
     /// `CAP_NET_ADMIN` — network administration.
     pub const NET_ADMIN: Self = Self(12);
-    /// `CAP_NET_RAW` — raw and packet socket creation.
-    pub const NET_RAW: Self = Self(13);
     /// `CAP_SYS_ADMIN` — generic privileged operations.
     pub const SYS_ADMIN: Self = Self(21);
 
@@ -156,7 +152,7 @@ impl CapabilitySet {
 /// here in the subsystem layer. The trait body is intentionally
 /// empty — step-level authority helpers consume the rich Cred
 /// surface (uid/gid/effective caps) via inherent methods and the
-/// `From<&Cred> for step::Credential` bridge, not via the
+/// `From<&Cred> for step_v3::Credential` bridge, not via the
 /// abstract view.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Cred {
@@ -216,32 +212,6 @@ unsafe impl ZoneAllocated for Cred {
 /// at `setup()`.
 pub fn sign_cred(cred: Cred) -> Result<Cap<Cred>, ZoneError> {
     step_engine::sign(cred)
-}
-
-/// Replace the current process capability masks. This is the syscall-facing
-/// primitive behind `capset(2)`; higher layers validate the Linux header,
-/// pid, and requested mask relationship before publishing.
-pub fn step_set_capability_sets(
-    target: &Cap<ProcessIdentity>,
-    effective_caps: CapabilitySet,
-    permitted_caps: CapabilitySet,
-) -> CredChange {
-    let payload_guard = target.payload.lock();
-    let Some(payload) = payload_guard.as_ref() else {
-        return CredChange::Zombie;
-    };
-    let prev_cap = payload.cred_cap();
-    let mut new = *prev_cap;
-    new.effective_caps = effective_caps;
-    new.permitted_caps = permitted_caps;
-    let Ok(new_cap) = sign_cred(new) else {
-        return CredChange::Zombie;
-    };
-    let _old_cap = payload.replace_cred(new_cap);
-    CredChange::Replaced {
-        prev: *prev_cap,
-        new,
-    }
 }
 
 /// PR-9 phase 5 — D5 §7. Mint a placeholder
@@ -399,10 +369,6 @@ pub fn step_setuid(target: &Cap<ProcessIdentity>, new_uid: Uid) -> CredChange {
         new.uid = new_uid;
         new.euid = new_uid;
         new.suid = new_uid;
-        if !new_uid.is_root() {
-            new.effective_caps = CapabilitySet::EMPTY;
-            new.permitted_caps = CapabilitySet::EMPTY;
-        }
     } else if new_uid == prev.uid || new_uid == prev.euid || new_uid == prev.suid {
         // Non-privileged: allowed to swap effective among existing IDs.
         // `suid` is preserved per Linux semantics.

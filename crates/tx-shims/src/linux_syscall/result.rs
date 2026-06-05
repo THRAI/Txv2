@@ -6,6 +6,7 @@
 //! `sret`.
 
 use tx_subsystems::execution::Errno;
+use tx_subsystems::reactor_submit::SubmitChildThreadStatus;
 
 use super::errno_to_i32;
 
@@ -21,6 +22,14 @@ use super::errno_to_i32;
 pub enum SyscallResult {
     /// Success — encode `value` into `a0` (positive return path).
     Return(i64),
+    /// Successful `clone`/`fork` return carrying the internal child reactor
+    /// publish status. Userspace still observes only `value`; the thread
+    /// future uses `child_submit` to decide whether an extra child-publish
+    /// handoff is still required.
+    CloneReturn {
+        value: i64,
+        child_submit: SubmitChildThreadStatus,
+    },
     /// Failure — encode `-errno` into `a0`. `errno` is the positive
     /// magnitude (e.g. 38 for `ENOSYS`); the userspace-entry shim is
     /// responsible for negating before writing.
@@ -39,20 +48,20 @@ pub enum SyscallResult {
     ///
     /// Cites: `txdoc:EXEC-12-1-INSTALL-USER-TRAP-CONTEXT`.
     ExecCommitted,
-    /// `rt_sigreturn` reached the kernel's platform signal-frame
-    /// path. The thread future must decode the on-stack frame with
-    /// `SignalFrameIf` before re-entering userspace, so musl-style
-    /// handlers that edit the saved ucontext are honored.
-    SigreturnRestored,
-    /// `rt_sigreturn` already restored a syscall-layer compatibility
-    /// signal frame into `saved_user_context`. The thread future MUST
-    /// NOT drain `pending_syscall_return` and MUST NOT decode another
-    /// platform frame for this iteration.
+    /// `rt_sigreturn` restored the saved signal frame into the
+    /// thread's `saved_user_context`.  The thread future MUST NOT
+    /// drain `pending_syscall_return` for this iteration — the next
+    /// userspace re-entry uses the restored context (which carries
+    /// the original registers saved before the signal handler was
+    /// invoked).  Same fall-through semantics as `ExecCommitted`:
+    /// AST drain + `prepare_userspace_entry_payload` +
+    /// `enter_userspace_with_context`.
     ///
-    /// N69b wires the minimal signal-frame restore path used by
-    /// itimer/SIGALRM delivery; full `SignalFrameIf` integration can
-    /// still replace the compat frame later.
-    SigreturnContextRestored,
+    /// Phase B (first pass): the variant is declared and the thread
+    /// future handles it, but the actual `SignalFrameIf` restore
+    /// (reading `SavedSignalFrame` from user stack) lands in
+    /// Phase D with full handler delivery.
+    SigreturnRestored,
 }
 
 impl SyscallResult {

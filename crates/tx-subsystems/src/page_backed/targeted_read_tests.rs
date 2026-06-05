@@ -131,7 +131,7 @@ fn read_exact_at_short_read_returns_err() {
     let mut out = vec![0u8; 64];
     let outcome = read_exact_at(&pc, 100, &mut out, &guard);
 
-    assert_eq!(outcome, V3StepOutcome::Err(Errno::ENOEXEC));
+    assert_eq!(outcome, V3StepOutcome::Err(Errno::ENOEXEC.into()));
 }
 
 #[test]

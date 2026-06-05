@@ -96,7 +96,7 @@ def _dfswrite(debugfs, image, local_path, ext4_path):
     b = os.path.basename(ext4_path)
     # write file, then set permissions to 755 for scripts/binaries
     st = os.stat(local_path)
-    mode = 0o100000 | (st.st_mode & 0o777)
+    mode = st.st_mode & 0o777
     # debugfs sif takes decimal mode
     cmds = f"cd {d}\nwrite {local_path} {b}\nsif {b} mode 0{oct(mode)[2:]}\n"
     r = subprocess.run([debugfs, "-w", "-f", "-", image],
@@ -188,21 +188,7 @@ SUITE_DEFS = {
         "case_dir": "ltp/testcases/bin",
         # When cases specified: extract these infrastructure items instead of
         # the full ltp/ tree
-        "infra_dirs": ["lib",
-                        "ltp/bin", "ltp/libkirk", "ltp/metadata",
-                        "ltp/runtest", "ltp/scenario_groups",
-                        "ltp/testscripts", "ltp/testcases/data"],
-        "infra_files": ["ltp/kirk", "ltp/runltp-ng", "ltp/ltx",
-                         "ltp/IDcheck.sh", "ltp/runltp", "ltp/ver_linux", "ltp/Version"],
-    },
-    "ltp-glibc": {
-        "root": "glibc",
-        "dirs": ["ltp"],
-        "scripts": [],
-        "extras": [],
-        "case_dir": "ltp/testcases/bin",
-        "infra_dirs": ["lib",
-                        "ltp/bin", "ltp/libkirk", "ltp/metadata",
+        "infra_dirs": ["ltp/bin", "ltp/libkirk", "ltp/metadata",
                         "ltp/runtest", "ltp/scenario_groups",
                         "ltp/testscripts", "ltp/testcases/data"],
         "infra_files": ["ltp/kirk", "ltp/runltp-ng", "ltp/ltx",
@@ -219,18 +205,6 @@ SUITE_DEFS = {
 }
 
 BUSYBOX_FILES = ["busybox"]
-BUSYBOX_APPLET_COPIES = ["ip", "ifconfig"]
-
-
-def unique_preserve_order(items):
-    seen = set()
-    ordered = []
-    for item in items:
-        if item in seen:
-            continue
-        seen.add(item)
-        ordered.append(item)
-    return ordered
 
 
 # ── case listing ──────────────────────────────────────────────────────────
@@ -249,9 +223,9 @@ def list_basic_cases(debugfs, image):
     return [t.strip() for t in m.group(1).strip().split() if t.strip()]
 
 
-def list_ltp_cases_for_root(debugfs, image, root):
+def list_ltp_cases(debugfs, image):
     tmp = tempfile.mktemp(suffix="_syscalls")
-    if not _dfsdump(debugfs, image, f"/{root}/ltp/runtest/syscalls", tmp):
+    if not _dfsdump(debugfs, image, "/musl/ltp/runtest/syscalls", tmp):
         return []
     cases = []
     with open(tmp) as f:
@@ -264,14 +238,6 @@ def list_ltp_cases_for_root(debugfs, image, root):
                 cases.append(parts[0])
     os.unlink(tmp)
     return sorted(set(cases))
-
-
-def list_ltp_musl_cases(debugfs, image):
-    return list_ltp_cases_for_root(debugfs, image, "musl")
-
-
-def list_ltp_glibc_cases(debugfs, image):
-    return list_ltp_cases_for_root(debugfs, image, "glibc")
 
 
 def list_libctest_cases(debugfs, image):
@@ -322,8 +288,7 @@ def list_busybox_cases(debugfs, image):
 
 CASE_LISTERS = {
     "basic-musl": list_basic_cases,
-    "ltp-musl": list_ltp_musl_cases,
-    "ltp-glibc": list_ltp_glibc_cases,
+    "ltp-musl": list_ltp_cases,
     "libctest-musl": list_libctest_cases,
     "lua-musl": list_lua_cases,
     "busybox-musl": list_busybox_cases,
@@ -345,33 +310,20 @@ def gen_basic_testcode(cases):
     return "\n".join(lines) + "\n"
 
 
-def gen_ltp_testcode(cases, libc="musl"):
+def gen_ltp_testcode(cases):
     lines = [
         '#!/bin/sh',
-        f'echo "#### OS COMP TEST GROUP START ltp-{libc} ####"',
+        'echo "#### OS COMP TEST GROUP START ltp-musl ####"',
         '',
     ]
     for c in cases:
         lines.append(f'echo "RUN LTP CASE {c}"')
         lines.append(f'"ltp/testcases/bin/{c}"')
         lines.append('ret=$?')
-        lines.append(f'if [ "$ret" -eq 0 ]; then')
-        lines.append(f'  echo "PASS LTP CASE {c} : $ret"')
-        lines.append('else')
-        lines.append(f'  echo "FAIL LTP CASE {c} : $ret"')
-        lines.append('fi')
-        lines.append('# OSComp LTP judges use this legacy FAIL line as the')
-        lines.append('# end-of-case marker, including for successful ret=0 cases.')
-        lines.append(f'if [ "$ret" -eq 0 ]; then')
-        lines.append(f'  echo "FAIL LTP CASE {c} : $ret"')
-        lines.append('fi')
+        lines.append(f'echo "FAIL LTP CASE {c} : $ret"')
         lines.append('')
-    lines.append(f'echo "#### OS COMP TEST GROUP END ltp-{libc} ####"')
+    lines.append('echo "#### OS COMP TEST GROUP END ltp-musl ####"')
     return "\n".join(lines) + "\n"
-
-
-def gen_ltp_glibc_testcode(cases):
-    return gen_ltp_testcode(cases, libc="glibc")
 
 
 def gen_lua_testcode(cases):
@@ -419,7 +371,6 @@ def gen_busybox_testcode(cases):
 TESTCODE_GENS = {
     "basic-musl": gen_basic_testcode,
     "ltp-musl": gen_ltp_testcode,
-    "ltp-glibc": gen_ltp_glibc_testcode,
     "lua-musl": gen_lua_testcode,
     "libctest-musl": gen_libctest_testcode,
     "busybox-musl": gen_busybox_testcode,
@@ -483,10 +434,6 @@ def build_slim_sdcard(config: SlimConfig):
     custom_testcodes = {}          # script_name → new content
     ltp_binaries = set()           # LTP binaries to extract from ltp/testcases/bin/
     basic_binaries = set()         # basic binaries from basic/
-    glibc_files = set()            # /glibc/* paths
-    glibc_dirs = set()             # /glibc/* dirs to extract recursively
-    glibc_custom_testcodes = {}     # script_name → new content under /glibc
-    glibc_ltp_binaries = set()      # glibc LTP binaries
     seen_suites = set()
 
     for suite in config.suites:
@@ -502,23 +449,12 @@ def build_slim_sdcard(config: SlimConfig):
         if name == "ltp-musl":
             cases = suite.cases or config.ltp_cases
             if cases:
-                ltp_binaries = unique_preserve_order(cases)
+                ltp_binaries = set(cases)
                 dirs.update(sd.get("infra_dirs", []))
                 files.update(sd.get("infra_files", []))
-                custom_testcodes["ltp_testcode.sh"] = gen_ltp_testcode(ltp_binaries)
+                custom_testcodes["ltp_testcode.sh"] = gen_ltp_testcode(list(ltp_binaries))
             else:
                 dirs.update(sd["dirs"])
-        elif name == "ltp-glibc":
-            cases = suite.cases or config.ltp_cases
-            if cases:
-                glibc_ltp_binaries = unique_preserve_order(cases)
-                glibc_dirs.update(sd.get("infra_dirs", []))
-                glibc_files.update(sd.get("infra_files", []))
-                glibc_custom_testcodes["ltp_testcode.sh"] = gen_ltp_glibc_testcode(
-                    glibc_ltp_binaries
-                )
-            else:
-                glibc_dirs.update(sd["dirs"])
         elif name == "basic-musl" and suite.cases:
             basic_binaries = set(suite.cases)
             custom_testcodes["basic_testcode.sh"] = gen_basic_testcode(list(basic_binaries))
@@ -535,30 +471,19 @@ def build_slim_sdcard(config: SlimConfig):
 
     # ── Print plan ──
     print(f"Suites: {sorted(seen_suites)}")
-    print(
-        f"Base files: {len(files)}, dirs: {len(dirs)}; "
-        f"glibc files: {len(glibc_files)}, glibc dirs: {len(glibc_dirs)}"
-    )
+    print(f"Base files: {len(files)}, dirs: {len(dirs)}")
     if ltp_binaries:
         print(f"LTP case binaries: {len(ltp_binaries)}")
-    if glibc_ltp_binaries:
-        print(f"glibc LTP case binaries: {len(glibc_ltp_binaries)}")
     if basic_binaries:
         print(f"Basic case binaries: {len(basic_binaries)}")
-    if custom_testcodes or glibc_custom_testcodes:
-        print(
-            f"Custom testcodes: musl={list(custom_testcodes.keys())}, "
-            f"glibc={list(glibc_custom_testcodes.keys())}"
-        )
+    if custom_testcodes:
+        print(f"Custom testcodes: {list(custom_testcodes.keys())}")
 
     # ── Step 1: Extract ──
     work = tempfile.mkdtemp(prefix="slim-sdcard-")
     try:
         musl_dir = os.path.join(work, "extract", "musl")
-        glibc_dir = os.path.join(work, "extract", "glibc")
         os.makedirs(musl_dir, exist_ok=True)
-        if glibc_files or glibc_dirs or glibc_ltp_binaries or glibc_custom_testcodes:
-            os.makedirs(glibc_dir, exist_ok=True)
 
         # Individual files
         for f in sorted(files):
@@ -571,36 +496,12 @@ def build_slim_sdcard(config: SlimConfig):
             status = "" if ok else " MISSING"
             print(f"  {f} ({tag}){status}")
 
-        for f in sorted(glibc_files):
-            src = f"/glibc/{f}"
-            dst = os.path.join(glibc_dir, f)
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            ok = _dfsdump(debugfs, source, src, dst, executable=True)
-            sz = os.path.getsize(dst) if ok else 0
-            tag = f"{sz/1048576:.1f}M" if sz > 1048576 else str(sz)
-            status = "" if ok else " MISSING"
-            print(f"  [glibc] {f} ({tag}){status}")
-
-        busybox_dst = os.path.join(musl_dir, "busybox")
-        if os.path.exists(busybox_dst):
-            for applet in BUSYBOX_APPLET_COPIES:
-                applet_dst = os.path.join(musl_dir, applet)
-                shutil.copy2(busybox_dst, applet_dst)
-                os.chmod(applet_dst, 0o755)
-                print(f"  [busybox applet] {applet} -> busybox")
-
         # Directories (recursive)
         for d in sorted(dirs):
             src = f"/musl/{d}"
             dst = os.path.join(musl_dir, d)
             extract_dir_recursive(debugfs, source, src, dst)
             print(f"  {d}/ (recursive)")
-
-        for d in sorted(glibc_dirs):
-            src = f"/glibc/{d}"
-            dst = os.path.join(glibc_dir, d)
-            extract_dir_recursive(debugfs, source, src, dst)
-            print(f"  [glibc] {d}/ (recursive)")
 
         # LTP case binaries
         if ltp_binaries:
@@ -614,18 +515,6 @@ def build_slim_sdcard(config: SlimConfig):
                 tag = f"{sz/1048576:.1f}M" if sz > 1048576 else str(sz)
                 status = "" if ok else " NOT FOUND"
                 print(f"  [ltp] {case} ({tag}){status}")
-
-        if glibc_ltp_binaries:
-            bin_dir = os.path.join(glibc_dir, "ltp", "testcases", "bin")
-            os.makedirs(bin_dir, exist_ok=True)
-            for case in sorted(glibc_ltp_binaries):
-                src = f"/glibc/ltp/testcases/bin/{case}"
-                dst = os.path.join(bin_dir, case)
-                ok = _dfsdump(debugfs, source, src, dst, executable=True)
-                sz = os.path.getsize(dst) if ok else 0
-                tag = f"{sz/1048576:.1f}M" if sz > 1048576 else str(sz)
-                status = "" if ok else " NOT FOUND"
-                print(f"  [glibc ltp] {case} ({tag}){status}")
 
         # Basic case binaries
         if basic_binaries:
@@ -648,13 +537,6 @@ def build_slim_sdcard(config: SlimConfig):
                 f.write(content)
             os.chmod(dst, 0o755)
             print(f"  [custom] {script_name} ({len(content)} bytes)")
-
-        for script_name, content in glibc_custom_testcodes.items():
-            dst = os.path.join(glibc_dir, script_name)
-            with open(dst, "w") as f:
-                f.write(content)
-            os.chmod(dst, 0o755)
-            print(f"  [glibc custom] {script_name} ({len(content)} bytes)")
 
         # Generate run-all.sh — chains all present testcode scripts in order.
         # The kernel can exec `cd /musl && sh run-all.sh` instead of a
@@ -820,11 +702,7 @@ def main():
     if args.config:
         config = parse_config(args.config)
     elif args.suites:
-        ltp_cases = (
-            [case.strip() for case in args.ltp_cases.split(",") if case.strip()]
-            if args.ltp_cases
-            else []
-        )
+        ltp_cases = args.ltp_cases.split(",") if args.ltp_cases else []
         suites = [SuiteConfig(name=s) for s in args.suites]
         config = SlimConfig(
             source=src,

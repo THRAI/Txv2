@@ -1,6 +1,28 @@
 use tx_substrate::SpinMutex;
 
 #[test]
+fn spinmutex_default_type_has_lock_metrics_disabled() {
+    let mutex = SpinMutex::new(0u64);
+
+    assert!(!mutex.lock_metrics_enabled());
+}
+
+#[test]
+fn spinmutex_observed_constructor_preserves_lock_api() {
+    let mutex = tx_substrate::SpinMutex::new_observed(
+        0u64,
+        tx_substrate::LockMetricsOn::new(b"debug.lock.test"),
+    );
+
+    assert_eq!(mutex.lock_metrics_enabled(), cfg!(tx_lock_metrics));
+    {
+        let mut guard = mutex.lock();
+        *guard = 11;
+    }
+    assert_eq!(*mutex.lock(), 11);
+}
+
+#[test]
 fn spinmutex_lock_unlock_round_trip() {
     // Construct via the public `const fn new`, then take and mutate
     // through the guard. Drop the guard, re-lock, and confirm the

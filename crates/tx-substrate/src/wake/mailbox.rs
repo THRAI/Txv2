@@ -12,7 +12,8 @@
 //!
 //! The PR-3 ADR uses the term "WakeHint" for the event posted to a
 //! mailbox. The `tx-reactor` crate already has a `scheduler::WakeHint`
-//! enum (`Normal`/`SignalDelivery`/`PriorityBoost`/`None`) that
+//! enum (`Normal`/`WakeHandoff`/`LifecycleWake`/`SignalDelivery`/
+//! `PriorityBoost`/`None`) that
 //! classifies scheduler-input metadata, not wake-event content. To
 //! avoid collision the ADR's `WakeHint` is spelled [`MailboxEvent`]
 //! here. Both serve different concerns.
@@ -193,6 +194,43 @@ pub enum MailboxEvent {
     TimerFired { token: TimerToken },
 }
 
+/// Scheduler-facing priority hint latched by [`TaskMailbox::post`].
+///
+/// The mailbox owns the semantic event type, while the reactor owns concrete
+/// queue placement. Default semantic posts use [`Normal`](Self::Normal)
+/// except for delivered signals; producers that know a stronger scheduling
+/// reason use [`TaskMailbox::post_with_scheduler_hint`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MailboxSchedulerHint {
+    Normal,
+    WakeHandoff,
+    LifecycleWake,
+    PriorityBoost,
+    SignalDelivery,
+}
+
+impl MailboxSchedulerHint {
+    const fn code(self) -> u8 {
+        match self {
+            Self::Normal => 0,
+            Self::WakeHandoff => 1,
+            Self::LifecycleWake => 2,
+            Self::PriorityBoost => 3,
+            Self::SignalDelivery => 4,
+        }
+    }
+
+    const fn from_code(code: u8) -> Self {
+        match code {
+            4 => Self::SignalDelivery,
+            3 => Self::PriorityBoost,
+            2 => Self::LifecycleWake,
+            1 => Self::WakeHandoff,
+            _ => Self::Normal,
+        }
+    }
+}
+
 /// Bounded MPSC queue capacity for a single mailbox.
 ///
 /// Tuned for "many small wakes per scheduling slice." If full,
@@ -237,6 +275,7 @@ pub struct TaskMailbox {
     /// can render per-process ProcessDescriptor tracks parenting
     /// per-thread tracks (OBS-V1 §15.6 sched_switch view).
     process_id_low: u32,
+    scheduler_hint: AtomicU64,
 }
 
 impl TaskMailbox {
@@ -255,6 +294,7 @@ impl TaskMailbox {
             waker: SpinMutex::new(None),
             task_id_low: 0,
             process_id_low: 0,
+            scheduler_hint: AtomicU64::new(0),
         }
     }
 
@@ -336,6 +376,20 @@ impl TaskMailbox {
     /// [`Self::overflow`] flag is latched until the driver consumes
     /// it via [`Self::take_overflow`].
     pub fn post(&self, event: MailboxEvent) -> bool {
+        self.post_with_scheduler_hint(event, Self::default_scheduler_hint(event))
+    }
+
+    /// Post an event with an explicit scheduler hint.
+    ///
+    /// Use this only at producer convergence points that know the reason for
+    /// the wake. Generic readiness notifications should continue to use
+    /// [`Self::post`], which maps `SourceFired` to `Normal`.
+    pub fn post_with_scheduler_hint(
+        &self,
+        event: MailboxEvent,
+        hint: MailboxSchedulerHint,
+    ) -> bool {
+        self.publish_scheduler_hint(hint);
         let enqueued = {
             let mut q = self.queue.lock();
             // Coalesce consecutive `SourceFired` deliveries for the
@@ -389,6 +443,37 @@ impl TaskMailbox {
             w.wake_by_ref();
         }
         enqueued
+    }
+
+    const fn default_scheduler_hint(event: MailboxEvent) -> MailboxSchedulerHint {
+        match event {
+            MailboxEvent::SignalDelivered { .. } => MailboxSchedulerHint::SignalDelivery,
+            MailboxEvent::SourceFired { .. }
+            | MailboxEvent::AgentReplied { .. }
+            | MailboxEvent::Abort { .. }
+            | MailboxEvent::TimerFired { .. } => MailboxSchedulerHint::Normal,
+        }
+    }
+
+    fn publish_scheduler_hint(&self, hint: MailboxSchedulerHint) {
+        let code = u64::from(hint.code());
+        let mut current = self.scheduler_hint.load(Ordering::Acquire);
+        while code > current {
+            match self.scheduler_hint.compare_exchange_weak(
+                current,
+                code,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(next) => current = next,
+            }
+        }
+    }
+
+    /// Consume the scheduler hint associated with the current wake batch.
+    pub fn take_scheduler_hint(&self) -> MailboxSchedulerHint {
+        MailboxSchedulerHint::from_code(self.scheduler_hint.swap(0, Ordering::AcqRel) as u8)
     }
 
     /// Drain the next event. Returns `None` if empty.
@@ -560,19 +645,76 @@ mod tests {
     }
 
     #[test]
-    fn overflow_latches_on_full_queue_and_drops_event() {
+    fn source_fired_latches_normal_scheduler_hint_by_default() {
         let mb = TaskMailbox::new();
         let evt = MailboxEvent::SourceFired {
             generation: WaitGeneration::new(1),
-            source: WaitSourceId::new(1),
+            source: WaitSourceId::new(11),
             interests: InterestMask::new(0b1),
         };
-        for _ in 0..MAILBOX_QUEUE_BOUND {
-            assert!(mb.post(evt));
+        assert_eq!(mb.take_scheduler_hint(), MailboxSchedulerHint::Normal);
+        assert!(mb.post(evt));
+        assert_eq!(mb.take_scheduler_hint(), MailboxSchedulerHint::Normal);
+        assert_eq!(mb.take_scheduler_hint(), MailboxSchedulerHint::Normal);
+    }
+
+    #[test]
+    fn explicit_source_fired_hint_latches_strongest_scheduler_hint() {
+        let mb = TaskMailbox::new();
+        let evt = MailboxEvent::SourceFired {
+            generation: WaitGeneration::new(1),
+            source: WaitSourceId::new(11),
+            interests: InterestMask::new(0b1),
+        };
+        assert!(mb.post_with_scheduler_hint(evt, MailboxSchedulerHint::WakeHandoff));
+        assert_eq!(mb.take_scheduler_hint(), MailboxSchedulerHint::WakeHandoff);
+        assert_eq!(mb.poll(), Some(evt));
+
+        let evt2 = MailboxEvent::SourceFired {
+            generation: WaitGeneration::new(2),
+            source: WaitSourceId::new(11),
+            interests: InterestMask::new(0b1),
+        };
+        assert!(mb.post_with_scheduler_hint(evt2, MailboxSchedulerHint::LifecycleWake));
+        assert!(mb.post_with_scheduler_hint(
+            MailboxEvent::TimerFired {
+                token: TimerToken::new(1)
+            },
+            MailboxSchedulerHint::PriorityBoost
+        ));
+        assert!(mb.post_with_scheduler_hint(
+            MailboxEvent::TimerFired {
+                token: TimerToken::new(2)
+            },
+            MailboxSchedulerHint::WakeHandoff
+        ));
+        assert!(mb.post(MailboxEvent::SignalDelivered {
+            signum: 15,
+            routing: SignalRouting::ProcessDirected,
+        }));
+        assert_eq!(
+            mb.take_scheduler_hint(),
+            MailboxSchedulerHint::SignalDelivery
+        );
+    }
+
+    #[test]
+    fn overflow_latches_on_full_queue_and_drops_event() {
+        let mb = TaskMailbox::new();
+        for i in 0..MAILBOX_QUEUE_BOUND {
+            assert!(mb.post(MailboxEvent::SourceFired {
+                generation: WaitGeneration::new(i as u64 + 1),
+                source: WaitSourceId::new(1),
+                interests: InterestMask::new(0b1),
+            }));
         }
         assert!(!mb.overflow());
         // Next post overflows.
-        assert!(!mb.post(evt));
+        assert!(!mb.post(MailboxEvent::SourceFired {
+            generation: WaitGeneration::new(MAILBOX_QUEUE_BOUND as u64 + 1),
+            source: WaitSourceId::new(1),
+            interests: InterestMask::new(0b1),
+        }));
         assert!(mb.overflow());
         // Latched until consumed.
         assert!(mb.overflow());
@@ -704,13 +846,12 @@ mod tests {
         use core::sync::atomic::AtomicBool;
 
         let mb = TaskMailbox::new();
-        let evt = MailboxEvent::SourceFired {
-            generation: WaitGeneration::new(1),
-            source: WaitSourceId::new(1),
-            interests: InterestMask::new(0b1),
-        };
-        for _ in 0..MAILBOX_QUEUE_BOUND {
-            assert!(mb.post(evt));
+        for i in 0..MAILBOX_QUEUE_BOUND {
+            assert!(mb.post(MailboxEvent::SourceFired {
+                generation: WaitGeneration::new(i as u64 + 1),
+                source: WaitSourceId::new(1),
+                interests: InterestMask::new(0b1),
+            }));
         }
 
         let flag = Arc::new(AtomicBool::new(false));
@@ -718,7 +859,11 @@ mod tests {
         mb.register_waker(waker);
 
         // Now overflow.
-        assert!(!mb.post(evt));
+        assert!(!mb.post(MailboxEvent::SourceFired {
+            generation: WaitGeneration::new(MAILBOX_QUEUE_BOUND as u64 + 1),
+            source: WaitSourceId::new(1),
+            interests: InterestMask::new(0b1),
+        }));
         assert!(mb.overflow());
         assert!(
             flag.load(Ordering::Acquire),

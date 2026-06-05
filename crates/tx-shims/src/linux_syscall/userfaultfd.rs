@@ -162,6 +162,7 @@ pub(super) fn sys_userfaultfd<'a>(flags: u32, ctx: &SyscallCtx<'a>) -> SyscallRe
         append: false,
         cloexec,
         nonblocking,
+        packet: false,
     };
     let open_cap = match OpenFile::new_userfaultfd_cap(ufd_cap, open_flags) {
         Ok(cap) => cap,
@@ -702,8 +703,7 @@ pub(super) fn step_uffdio_continue(
 /// - `Error(EAGAIN)` if the queue is empty and the ufd was opened
 ///   with `O_NONBLOCK`.
 /// - Otherwise parks on the per-ufd wait source (via
-///   `wait_source::wait_on_token`) and re-polls when a fault is
-///   pushed.
+///   the task mailbox and re-polls when a fault is pushed.
 pub(super) async fn sys_ufd_read(
     file: &OpenFile,
     buf_ptr: u64,
@@ -723,7 +723,6 @@ pub(super) async fn sys_ufd_read(
     }
 
     let nonblocking = file.flags().nonblocking;
-    use tx_subsystems::execution::WaitToken;
     let wire_size = tx_subsystems::userfaultfd::UFFD_MSG_WIRE_SIZE;
     loop {
         let outcome = {
@@ -749,7 +748,7 @@ pub(super) async fn sys_ufd_read(
                 return SyscallResult::Return(read as i64);
             }
             V3Out::Err(v3errno) => {
-                let errno: Errno = v3errno;
+                let errno: Errno = v3errno.into();
                 if errno == Errno::EAGAIN {
                     return SyscallResult::Error(EAGAIN_VALUE);
                 }
@@ -763,10 +762,7 @@ pub(super) async fn sys_ufd_read(
                     },
                 ..
             } => {
-                let token = WaitToken::new(carrier.raw(), interests.raw());
-                if let Some(future) = super::wait_source::wait_on_token(token) {
-                    let _ = future.await;
-                }
+                super::await_wait_source(ctx, carrier, interests).await;
                 // Re-poll on next loop iteration.
             }
             // Other shapes are unreachable for the ufd read path.

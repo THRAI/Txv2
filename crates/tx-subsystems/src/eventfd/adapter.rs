@@ -26,8 +26,6 @@ pub mod step_engine {
         OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy, RetainedEntityPolicy, Weak,
         Zone, ZoneAllocated, ZoneError, ZonePolicy,
     };
-    pub use tx_substrate::SpinMutex;
-
     pub type ByteOutcome = StepOutcome<usize, ByteProgress>;
 
     pub fn done_bytes(n: usize) -> ByteOutcome {

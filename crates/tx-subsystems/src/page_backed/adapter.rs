@@ -5,7 +5,7 @@
 //! domain `step_engine` covers everything: step_v3 types used by the
 //! per-variant fetch / write step ops, zone role types for the
 //! `PageContainer` zone, the `page_allocator` surface (allocator,
-//! cache pins, device frames, map pins, zero policy), EBR Guard +
+//! cache pins, device frames, gift pins, map pins, zero policy), EBR Guard +
 //! guard, and SpinMutex.
 
 use tx_platform_adapter::platform_adapter;
@@ -14,16 +14,16 @@ use tx_platform_adapter::platform_adapter;
     platform = "substrate",
     domain = "step_engine",
     apis = ["step", "zone", "epoch", "page_allocator"],
-    reason = "expose substrate step engine outcome types, zone role types, page-allocator primitives (BitmapPageAllocator, CachePin, DeviceFrame, MapPin, ZeroPolicy), EBR guard, and SpinMutex used by the page_backed subsystem's per-variant fetch/write step ops"
+    reason = "expose substrate step engine outcome types, zone role types, page-allocator primitives (BitmapPageAllocator, CachePin, DeviceFrame, GiftPin, MapPin, ZeroPolicy), EBR guard, and SpinMutex used by the page_backed subsystem's per-variant fetch/write step ops"
 )]
 pub mod step_engine {
     pub use tx_substrate::epoch::{self as epoch, borrow_current_guard, guard, Guard};
     pub use tx_substrate::page_allocator::{
-        self, AllocError, BitmapPageAllocator, CachePin, DeviceFrame, MapPin, ZeroPolicy,
+        self, AllocError, BitmapPageAllocator, CachePin, DeviceFrame, GiftPin, MapPin, ZeroPolicy,
     };
     pub use tx_substrate::step::{
         ByteProgress, Errno, InterestMask, NoProgress, PageProgress,
-        ProcessIdentity as PlaceholderProcessSubject, ScriptCtx, StepOp, StepOutcome,
+        ProcessIdentity as PlaceholderProcessSubject, ScriptCtx, StepOp, StepOutcome, StepProgress,
         SubjectIdentity, WaitSourceId, YieldShape,
     };
     pub use tx_substrate::zone::{
@@ -32,5 +32,30 @@ pub mod step_engine {
         OperationalCapExt, OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy,
         RetainedEntityPolicy, Weak, Zone, ZoneAllocated, ZoneError, ZonePolicy,
     };
-    pub use tx_substrate::SpinMutex;
+}
+
+#[platform_adapter(
+    platform = "substrate",
+    domain = "wait_routing",
+    apis = ["wake"],
+    reason = "wrap WaitSource construction, registration, notification, and unregistration for PageBacked page-fetch in-flight wait sources"
+)]
+pub mod wait_routing {
+    use alloc::sync::Arc;
+
+    pub use tx_substrate::wake::WaitSource;
+
+    pub fn new_wait_source(source_id: u64) -> Arc<WaitSource> {
+        let source = tx_substrate::wake::new_source(source_id);
+        tx_substrate::wake::register_source(Arc::clone(&source));
+        source
+    }
+
+    pub fn notify_source(source: &Arc<WaitSource>, mask_bits: u64) {
+        tx_substrate::wake::notify(source, mask_bits);
+    }
+
+    pub fn unregister_source(source_id: u64) {
+        tx_substrate::wake::unregister_source(tx_substrate::step::WaitSourceId::new(source_id));
+    }
 }

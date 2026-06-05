@@ -1,13 +1,6 @@
 ---
 name: tx-ltp-syscall
-description: >-
-  Use when planning, prioritizing, or implementing Linux syscalls for LTP and
-  OSComp coverage in txKernel, including ENOSYS reports, failing or skipping
-  LTP/OSComp cases, syscall status questions, and completion bookkeeping. LTP
-  and OSComp are the gold-standard correctness bar; a syscall is done when the
-  relevant tests pass, not when only unit tests pass. Pair with
-  tx-syscall-dispatch, tx-step-migration, tx-shell-syscall-fixup, and
-  tx-network-test-fixup for socket/network witnesses.
+description: Use when planning, prioritizing, or implementing Linux syscalls for LTP + OSComp coverage in txKernel. Trigger whenever the user mentions LTP, OSComp, syscall coverage, ENOSYS reports, "what syscall should I implement next", a specific Linux syscall by name (`fork`, `sendfile`, `mq_open`, `sched_getaffinity`, …), an LTP or OSComp test that's failing or skipping, the current/next state of syscall implementation, or any question about whether a syscall is "done" — even when they don't say "skill". **OSComp and LTP are the gold-standard correctness bar for any syscall**: a syscall isn't done because `cargo xtask unit` passes; it's done because the relevant LTP/OSComp test moves from failed/skipped to passing. Also use when finishing a syscall change and a progress record must be updated. Pairs with `tx-syscall-dispatch` (for lane classification), `tx-step-migration` (for v5 `StepOp` wrapping), and `tx-shell-syscall-fixup` (for tight observe→fix→verify loops); this skill is the planning/tracking layer that wraps them.
 ---
 
 # tx-ltp-syscall
@@ -51,26 +44,6 @@ if the test isn't currently runnable for unrelated reasons, name the
 substitute coverage and *why* LTP/OSComp can't run yet — that is itself a
 high-priority follow-up). "Manually tested with a shell" is not the bar.
 
-## Test-Driven Fix Integrity
-
-LTP and OSComp tests are witnesses for Linux ABI semantics, not targets to
-special-case.
-
-- Do **not** hardcode a test name, binary path, argv pattern, magic input
-  buffer, fixed benchmark label, or one-off errno sequence to make a case pass.
-  Implement the Linux behavior the test exposes.
-- A fixed port, path, or payload in a test harness is evidence only. Kernel
-  behavior must remain general across callers.
-- If an unsupported Linux surface is intentionally out of scope, return the
-  principled Linux-style error and record the blocker instead of faking success.
-- If a simple local patch cannot solve the failure without bending the model,
-  stop and discuss a refactor plan with the user before making broad changes.
-  Name the failing test, the semantic gap, affected modules, risk, and the
-  verification set.
-- Keep the scope honest: when a network LTP case fails because of a non-network
-  prerequisite, record that prerequisite rather than expanding the network task
-  silently.
-
 ## Read First
 
 - `docs/progress/SYSCALL_STATUS.md` — **the living syscall map.** Headline
@@ -93,9 +66,6 @@ special-case.
   `04_process-signals/PROCESS_v1.md` for `fork`/`setpgid`/`getpid` work,
   `05_filesystem/VFS_CHECKS_V2.1.md` for path-walk syscalls,
   `03_memory-vm/VM_v1_2.md` for `mmap`/`brk`/`mprotect`).
-- For socket/network LTP cases, read
-  `docs/progress/research/2026-05-21-ltp-network-prep.md` and load
-  `tx-network-test-fixup`.
 
 The first three are non-negotiable. Skip the rest only if you have the
 information already and can name where it came from.
@@ -268,102 +238,6 @@ shape is the same: pick the specific test name that exercises the syscall
 you changed (`fork01`, `getrlimit02`, `sendfile02`, …) and confirm it
 passes.
 
-Current local shortcuts:
-
-```sh
-make oscomp-local-rv64-ltp-musl OSCOMP_LTP=<case>
-make oscomp-local-rv64-ltp-musl OSCOMP_LTP=<case1>,<case2>
-make oscomp-local-la64-ltp-musl OSCOMP_LTP=<case1>,<case2>
-make oscomp-local-rv64-ltp-batch LTP_BATCH=<batch>
-make oscomp-local-rv64-ltp-batch LTP_BATCH=submit
-make oscomp-local-la64-ltp-batch LTP_BATCH=submit
-python3 tools/ltp-batches.py --batch <batch>
-python3 tools/ltp-batches.py --list
-make ltp-runtests
-make ltp-runtest-cases LTP_RUNTEST=<module>
-make oscomp-local-rv64-ltp-runtest LTP_RUNTEST=<module>
-make oscomp-local-rv64-ltp-runtest LTP_RUNTEST=<module> LTP_RUNTEST_CASES=<tag1>,<tag2>
-```
-
-Current LTP bookkeeping docs:
-
-- `docs/LTP/ltp-batches.md` — syscalls batch split, suggested order, and
-  current stitched per-batch scores.
-- `docs/LTP/ltp-submit-whitelist.md` — submit whitelist score table. This is
-  the one to update when adding/removing positive-score cases or recording
-  LA64 alignment status.
-- `docs/LTP/syscalls/ltp-*-progress.md` — detailed per-module case notes.
-- `docs/LTP/runtests/` — native LTP runtest-module progress outside the
-  syscalls batch split.
-
-Submit whitelist rules:
-
-- `LTP_BATCH=submit` is the local mirror of the no-`tx.oscomp.groups`
-  submission path. Official-style no-group boot runs this same whitelist via
-  `append_default_oscomp_scripts()` in
-  `crates/tx-kernel/src/init/exec.rs`.
-- The whitelist constant is `LTP_SUBMIT_CASES` in
-  `crates/tx-kernel/src/init/exec.rs`.
-- Build the whitelist from cases with nonzero passed score in
-  `docs/LTP/syscalls/ltp-*-progress.md`.
-- Do not use `docs/LTP/syscalls/ltp-progress.md` (`p0`) as a whitelist source:
-  p0 intentionally overlaps real module batches and is only a smoke/sample
-  slice.
-- Partial-score cases belong in the submit whitelist when they add points.
-  Keep known RV-positive cases such as `futex_wake03` and `setitimer01` even
-  if LA64 is being aligned later.
-- After changing the whitelist, update `docs/LTP/ltp-submit-whitelist.md`
-  with the case count, total stitched score, module breakdown, and per-case
-  rows.
-
-Syscalls batch rules:
-
-- `tools/ltp-batches.py` splits the extracted OSComp LTP syscalls list into
-  batches such as `smoke`, `fd-io`, `vfs`, `vm`, `process`, `cred`,
-  `signal`, `ipc`, `sched`, `event`, `time`, `mount`, `heavy`, and `aio`.
-- `p0` is allowed as a quick sample/regression slice, but it overlaps the
-  real modules and should not be counted into submit totals.
-- `LTP_BATCH=all` is a diagnostic syscalls sweep, not the official full LTP
-  and not every upstream LTP runtest module.
-
-Native runtest rules:
-
-- `make ltp-runtests` lists upstream LTP runtest modules.
-- `make ltp-runtest-cases LTP_RUNTEST=<module>` lists tags in one module.
-- Guest-side execution is wired through `ltp-runtest:<module>` in
-  `exec.rs`; `LTP_RUNTEST_CASES=a,b` filters by tag inside the module.
-- Native runtest rows may overlap syscalls rows by name. Treat them as a
-  separate exploration track unless the exact same judge case is confirmed.
-
-LA64 whitelist alignment workflow:
-
-- Run LA64 submit-whitelist cases in small groups, normally five cases per
-  run:
-
-  ```sh
-  timeout 90s make oscomp-local-la64-ltp-musl OSCOMP_LTP=case1,case2,case3,case4,case5
-  ```
-
-- If the group exits normally, record each case in
-  `docs/LTP/ltp-submit-whitelist.md` using the `LA Status` and `LA Note`
-  columns. Use `pass`, `partial`, `fail`, `skip`, or `hang`.
-- If a case clearly finishes and the judge summary is printed, do not wait for
-  the outer timeout; record the result immediately and continue.
-- If the guest stops making progress past the case's own LTP timeout window,
-  stop that run, mark the case/group as `hang`, and continue after isolating
-  the next case.
-- Record concrete symptoms in `LA Note`, for example `LA 1/2; mmap SQ/CQ ring
-  returns EINVAL, exits cleanly`, `host timeout after RUN`, or `kernel panic:
-  <file>:<line>`.
-
-Known local skips live in `tools/ltp-batches.py::SKIP_CASES` and
-`crates/tx-kernel/src/init/exec.rs::LOCAL_LTP_SKIP_SHELL_PATTERN`. These are only for
-cases that currently wedge the guest or never reach the normal LTP
-summary/guest-exit path. Local command generation skips them for direct
-`OSCOMP_LTP=...`, full `ltp-musl`, native runtest loops, and
-`tools/ltp-batches.py` batch lists. Do not re-run a skipped case unless the
-user explicitly asks to reopen that specific bug.
-
 **The completion report must name at least one LTP and/or OSComp test
 that now passes because of this change.** If LTP/OSComp can't currently
 run for the affected syscall (e.g. test environment missing, dependency
@@ -382,9 +256,6 @@ wrong result inside an LTP/OSComp run.
 
 ## What Not To Do
 
-- **Don't hardcode for LTP/OSComp.** No branches on testcase names,
-  executable names, argv shapes, magic benchmark strings, or exact payloads.
-  Fix the semantic behavior or record a principled unsupported surface.
 - **Don't add a new `NR_*` without checking `numbers.rs` for an existing
   entry.** Linux RV64 numbers come from `asm-generic/unistd.h`; a
   duplicate definition will silently shadow the real one.
@@ -410,8 +281,6 @@ wrong result inside an LTP/OSComp run.
   `tx-shell-syscall-fixup`.
 - New subsystem surface introduced by the syscall →
   `tx-subsystem-manifest`.
-- Socket/network syscall failure or OSComp network benchmark →
-  `tx-network-test-fixup`.
 - CI gate failure encountered along the way → `tx-ci-triage`.
 - Recording the progress catch-up → `tx-progress-memory`.
 
@@ -422,8 +291,6 @@ wrong result inside an LTP/OSComp run.
   named in the completion report. (If LTP/OSComp cannot currently run
   against the syscall, name the blocker and add it as a high-priority
   follow-up — do not silently substitute weaker coverage.)
-- The fix is semantic, not test-specific; any required broader refactor was
-  discussed with the user before implementation.
 - `cargo xtask ci` is green; the syscall-family invariants ratchets did
   not regress.
 - `cargo xtask oscomp run --target rv64-qemu` covers the test that

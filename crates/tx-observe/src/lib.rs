@@ -30,11 +30,12 @@
 
 #![no_std]
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use tx_hal::{ConsoleIf, CpuId, ObserverIf, PercpuIf, TimeIf};
+use tx_hal::{ConsoleIf, CpuId, ObserverIf, PercpuIf, PowerIf, TimeIf};
 use tx_observe_types::{
-    PayloadCounterValue, TxPayloadTag, TxTraceHartRing, TxTraceKind, TxTraceRecord,
+    PayloadArgValue, PayloadCounterValue, TxPayloadTag, TxTraceHartRing, TxTraceKind,
+    TxTraceRecord, TxValueKind,
 };
 // TxTraceLevel is imported via pub use below so the same name is available
 // both inside this module and as a macro-accessible re-export.
@@ -195,6 +196,54 @@ impl EventNameId {
     }
 }
 
+/// Fixed diagnostic allocation tracks used to route allocation probes onto
+/// stable Perfetto lanes.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum AllocationTrack {
+    ZoneSlab,
+    PageFrame,
+    PageRun,
+    VmRecipeNode,
+    VmPrivatePageNode,
+    PageBackedCache,
+    VmAddressSpace,
+    PageBackedContainer,
+    ThreadPayload,
+    ThreadIdentity,
+    ProcessPayload,
+    ProcessIdentity,
+    ProcessThreads,
+    PidNamespace,
+    Lock,
+    DsMethod,
+}
+
+impl AllocationTrack {
+    #[inline]
+    pub const fn track_id(self) -> u64 {
+        match self {
+            Self::ZoneSlab => tx_observe_types::payload::ALLOC_TRACK_ZONE_SLAB,
+            Self::PageFrame => tx_observe_types::payload::ALLOC_TRACK_PAGE_FRAME,
+            Self::PageRun => tx_observe_types::payload::ALLOC_TRACK_PAGE_RUN,
+            Self::VmRecipeNode => tx_observe_types::payload::ALLOC_TRACK_VM_RECIPE_NODE,
+            Self::VmPrivatePageNode => tx_observe_types::payload::ALLOC_TRACK_VM_PRIVATE_PAGE_NODE,
+            Self::PageBackedCache => tx_observe_types::payload::ALLOC_TRACK_PAGEBACKED_CACHE,
+            Self::VmAddressSpace => tx_observe_types::payload::ALLOC_TRACK_VM_ADDRESS_SPACE,
+            Self::PageBackedContainer => {
+                tx_observe_types::payload::ALLOC_TRACK_PAGEBACKED_CONTAINER
+            }
+            Self::ThreadPayload => tx_observe_types::payload::ALLOC_TRACK_THREAD_PAYLOAD,
+            Self::ThreadIdentity => tx_observe_types::payload::ALLOC_TRACK_THREAD_IDENTITY,
+            Self::ProcessPayload => tx_observe_types::payload::ALLOC_TRACK_PROCESS_PAYLOAD,
+            Self::ProcessIdentity => tx_observe_types::payload::ALLOC_TRACK_PROCESS_IDENTITY,
+            Self::ProcessThreads => tx_observe_types::payload::ALLOC_TRACK_PROCESS_THREADS,
+            Self::PidNamespace => tx_observe_types::payload::ALLOC_TRACK_PID_NAMESPACE,
+            Self::Lock => tx_observe_types::payload::ALLOC_TRACK_LOCK,
+            Self::DsMethod => tx_observe_types::payload::ALLOC_TRACK_DS_METHOD,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // InitError
 // ---------------------------------------------------------------------------
@@ -283,6 +332,7 @@ static HART_SLOTS: HartLocalArray<HartSlot, MAX_HARTS> =
 /// Static array of `HartEmitter` instances, one per hart.
 /// Populated during `init`.
 static EMITTERS: HartLocalOptionArray<HartEmitter, MAX_HARTS> = HartLocalOptionArray::new_none();
+static OBSERVE_ENABLED: AtomicBool = AtomicBool::new(true);
 
 // ---------------------------------------------------------------------------
 // Public facade: HartEmitter
@@ -413,6 +463,97 @@ impl HartEmitter {
             SpanId::NONE,
             SpanId::NONE,
             TxPayloadTag::CounterValue,
+            payload_bytes,
+        );
+    }
+
+    /// Emit a point-in-time allocation marker on an explicit DS allocation
+    /// track. The `parent` field carries the explicit track id and the
+    /// `ArgValue` payload carries one unsigned value chosen by the call site
+    /// (for example PPN, page index, touched-node count, slab slot count).
+    pub fn allocation(&self, track: AllocationTrack, name: EventNameId, value: u64) {
+        const VALUE_KEY: EventNameId = EventNameId::from_raw(fnv1a32(b"value"));
+        self.arg_value(TxTraceLevel::Mutation, track, name, VALUE_KEY, value);
+    }
+
+    /// Emit a lock metric marker. The explicit lock track lives in `parent`,
+    /// `name` carries the lock identity, and `metric` carries the sample kind
+    /// (`debug.lock.wait_ns`, `debug.lock.service_ns`, ...).
+    pub fn lock_metric(&self, lock: EventNameId, metric: EventNameId, value: u64) {
+        self.arg_value(
+            TxTraceLevel::Mutation,
+            AllocationTrack::Lock,
+            lock,
+            metric,
+            value,
+        );
+    }
+
+    /// Emit a substrate/data-structure method metric marker. The explicit DS
+    /// method track lives in `parent`, `name` carries the method identity, and
+    /// `metric` carries the sample kind (`debug.ds.method.duration_ns`, ...).
+    pub fn ds_method_metric(&self, method: EventNameId, metric: EventNameId, value: u64) {
+        self.ds_method_metric_for_zone(method, EventNameId::from_raw(0), metric, value);
+    }
+
+    /// Emit a DS method metric with an optional zone/type identity in the
+    /// high half of the payload key. `zone.raw() == 0` means no zone scope.
+    pub fn ds_method_metric_for_zone(
+        &self,
+        method: EventNameId,
+        zone: EventNameId,
+        metric: EventNameId,
+        value: u64,
+    ) {
+        if zone.raw() != 0 {
+            const ZONE_KEY: EventNameId =
+                EventNameId::from_raw(fnv1a32(b"debug.ds.method.zone_id"));
+            self.arg_value(
+                TxTraceLevel::Mutation,
+                AllocationTrack::DsMethod,
+                method,
+                ZONE_KEY,
+                zone.raw() as u64,
+            );
+        }
+        self.arg_value(
+            TxTraceLevel::Mutation,
+            AllocationTrack::DsMethod,
+            method,
+            metric,
+            value,
+        );
+    }
+
+    fn arg_value(
+        &self,
+        level: TxTraceLevel,
+        track: AllocationTrack,
+        name: EventNameId,
+        key: EventNameId,
+        value: u64,
+    ) {
+        let payload = PayloadArgValue {
+            key: key.raw(),
+            value_kind: TxValueKind::U64 as u8,
+            _pad: [0; 3],
+            value0: value,
+        };
+        let payload_bytes = unsafe {
+            core::slice::from_raw_parts(
+                &payload as *const PayloadArgValue as *const u8,
+                core::mem::size_of::<PayloadArgValue>(),
+            )
+        };
+        let slot = self.slot();
+        self.emit(
+            slot,
+            TxTraceKind::Instant,
+            level,
+            name,
+            SpanId::NONE,
+            SpanId::from_raw_or_none(track.track_id()),
+            TxPayloadTag::ArgValue,
             payload_bytes,
         );
     }
@@ -587,6 +728,12 @@ fn read_ts() -> u64 {
     f()
 }
 
+/// Read the platform trace clock in nanoseconds, or `0` before observe init.
+#[inline]
+pub fn clock_now_ns() -> u64 {
+    read_ts()
+}
+
 // ---------------------------------------------------------------------------
 // CPU-id reader (mirrors TS_FN pattern — Option C, D16)
 // ---------------------------------------------------------------------------
@@ -640,12 +787,32 @@ fn read_current_cpu_id() -> Option<CpuId> {
 /// `read_ts()` (D16 Option C).
 #[inline]
 pub fn current() -> Option<&'static HartEmitter> {
+    if !OBSERVE_ENABLED.load(Ordering::Relaxed) {
+        return None;
+    }
     let cpu_id = read_current_cpu_id()?;
     let idx = cpu_id.0;
     if idx >= MAX_HARTS {
         return None;
     }
     EMITTERS.get(idx).as_ref()
+}
+
+/// Enable or disable producer-side observation emission.
+///
+/// This is a diagnostic gate for benchmark timing runs where the observer has
+/// already been initialised but the ring-write overhead would contaminate the
+/// workload being measured. It does not clear ring contents or change dump
+/// thresholds; it only makes [`current`] return `None` while disabled.
+#[inline]
+pub fn set_enabled(enabled: bool) {
+    OBSERVE_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Return whether producer-side observation emission is currently enabled.
+#[inline]
+pub fn is_enabled() -> bool {
+    OBSERVE_ENABLED.load(Ordering::Relaxed)
 }
 
 // ---------------------------------------------------------------------------
@@ -672,6 +839,9 @@ pub fn current() -> Option<&'static HartEmitter> {
 static EMITTED_COUNT: AtomicU64 = AtomicU64::new(0);
 static DUMP_THRESHOLD: AtomicU64 = AtomicU64::new(0);
 static DUMP_REQUESTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static DUMP_SHUTDOWN_FN: AtomicU64 = AtomicU64::new(0);
+static TRACE_OFF_REQUESTS_DUMP: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
 
 /// Configure a "bounded dump" threshold for the current run.
 ///
@@ -695,6 +865,102 @@ pub fn should_dump_now() -> bool {
         .is_ok()
 }
 
+/// Request one trace dump at the next dispatcher/kernel boundary.
+#[inline]
+pub fn request_dump() {
+    DUMP_REQUESTED.store(true, Ordering::Release);
+}
+
+/// Clear a pending trace dump request.
+///
+/// Live host-drain workflows use the same guest bracketing syscalls as the
+/// serial dump path, but they drain the shared rings out-of-band and must not
+/// let trace-off request a serial dump/shutdown.
+#[inline]
+pub fn clear_dump_request() {
+    DUMP_REQUESTED.store(false, Ordering::Release);
+}
+
+/// Configure whether a private trace-off syscall should request a serial dump.
+///
+/// Serial-bracket traces keep the default `true`. Live shared-memory drains set
+/// this to `false` so the bracket only gates producer emission and the host
+/// owns final artifact generation.
+#[inline]
+pub fn set_trace_off_requests_dump(enabled: bool) {
+    TRACE_OFF_REQUESTS_DUMP.store(enabled, Ordering::Relaxed);
+}
+
+/// Return whether trace-off should request a serial dump.
+#[inline]
+pub fn trace_off_requests_dump() -> bool {
+    TRACE_OFF_REQUESTS_DUMP.load(Ordering::Relaxed)
+}
+
+type DumpShutdownFn = fn() -> !;
+type PreDumpHookFn = fn();
+
+static PRE_DUMP_HOOK_FN: AtomicU64 = AtomicU64::new(0);
+
+/// Register a platform-specific diagnostic hook to run immediately before a
+/// console trace dump. The hook is outside the ring, so it can print aggregate
+/// counters that must survive a full/lossy observation buffer.
+pub fn register_pre_dump_hook(f: PreDumpHookFn) {
+    PRE_DUMP_HOOK_FN.store(f as *const () as usize as u64, Ordering::Relaxed);
+}
+
+fn run_pre_dump_hook() {
+    let raw = PRE_DUMP_HOOK_FN.load(Ordering::Relaxed);
+    if raw == 0 {
+        return;
+    }
+    // SAFETY: `raw` was written by `register_pre_dump_hook` from a valid
+    // monomorphised function pointer.
+    let f: PreDumpHookFn = unsafe { core::mem::transmute(raw as usize) };
+    f();
+}
+
+fn dump_shutdown_for<P>() -> !
+where
+    P: ConsoleIf + ObserverIf + TimeIf + PercpuIf + PowerIf + tx_hal::SmpIf,
+{
+    dump_console_hex_all::<P>();
+    tx_hal::console_write_str::<P>(":observe:dump:threshold\n");
+    <P as PowerIf>::system_off();
+}
+
+/// Register a platform-specific threshold dump/shutdown hook.
+///
+/// This lets low-level diagnostic probes that do not carry `P` still
+/// force the same bounded trace dump once `check_dump_threshold` has
+/// requested it.
+pub fn register_dump_shutdown<P>()
+where
+    P: ConsoleIf + ObserverIf + TimeIf + PercpuIf + PowerIf + tx_hal::SmpIf,
+{
+    DUMP_SHUTDOWN_FN.store(
+        dump_shutdown_for::<P> as *const () as usize as u64,
+        Ordering::Relaxed,
+    );
+}
+
+/// If the global threshold requested a dump, run the registered platform hook.
+///
+/// No-op when no hook has been registered. This function may diverge.
+pub fn dump_registered_if_requested() {
+    if !should_dump_now() {
+        return;
+    }
+    let raw = DUMP_SHUTDOWN_FN.load(Ordering::Relaxed);
+    if raw == 0 {
+        return;
+    }
+    // SAFETY: `raw` was written by `register_dump_shutdown` from a valid
+    // monomorphised function pointer.
+    let f: DumpShutdownFn = unsafe { core::mem::transmute(raw as usize) };
+    f();
+}
+
 #[inline]
 fn check_dump_threshold() {
     let threshold = DUMP_THRESHOLD.load(Ordering::Relaxed);
@@ -705,6 +971,21 @@ fn check_dump_threshold() {
     if count >= threshold {
         DUMP_REQUESTED.store(true, Ordering::Relaxed);
     }
+}
+
+fn compact_ring_order(record_count: usize) -> u8 {
+    let mut order = 2u8;
+    let mut slots = 1usize << order;
+    while slots < record_count && order < 24 {
+        order += 1;
+        slots <<= 1;
+    }
+    order
+}
+
+#[cfg(any(test, feature = "testing"))]
+pub fn testing_compact_ring_order(record_count: usize) -> u8 {
+    compact_ring_order(record_count)
 }
 
 /// Reset the observation ring for the calling hart: clear
@@ -763,6 +1044,34 @@ pub fn reset_ring_and_arm(threshold: u64) {
     DUMP_THRESHOLD.store(threshold, Ordering::Relaxed);
 }
 
+/// Reset every initialized hart ring and arm the global dump threshold.
+///
+/// This is the SMP counterpart to [`reset_ring_and_arm`]. Diagnostic guest
+/// hooks use it before a bracketed trace so host replay sees one coherent
+/// multi-hart window instead of stale records on remote harts.
+pub fn reset_all_rings_and_arm(threshold: u64) {
+    OBSERVE_ENABLED.store(false, Ordering::Relaxed);
+    for idx in 0..MAX_HARTS {
+        if EMITTERS.get(idx).is_none() {
+            continue;
+        }
+        let slot = HART_SLOTS.get(idx);
+        // SAFETY: the emitter gate proves init completed for this hart. The
+        // global enabled flag has been lowered before clearing cursors, so new
+        // emitters stop at `current()`.
+        let ring = unsafe { &*slot.ring_hdr };
+        ring.producer.store(0, Ordering::Relaxed);
+        ring.consumer.store(0, Ordering::Relaxed);
+        ring.seq.store(0, Ordering::Relaxed);
+        ring.lost.store(0, Ordering::Relaxed);
+        slot.span_counter.store(0, Ordering::Relaxed);
+    }
+    EMITTED_COUNT.store(0, Ordering::Relaxed);
+    DUMP_REQUESTED.store(false, Ordering::Relaxed);
+    DUMP_THRESHOLD.store(threshold, Ordering::Relaxed);
+    OBSERVE_ENABLED.store(true, Ordering::Relaxed);
+}
+
 // ---------------------------------------------------------------------------
 // Serial-console hex dump (host extraction path)
 //
@@ -809,69 +1118,84 @@ pub fn dump_console_hex<P>(hart: CpuId)
 where
     P: ConsoleIf + ObserverIf + TimeIf,
 {
-    let Some(desc) = P::observation_ring(hart) else {
-        // No ring backing on this board → nothing to dump.
-        return;
+    dump_console_hex_mask::<P>(tx_hal::CpuMask::single(hart), Some(hart.0 as u64));
+}
+
+/// Dump all platform-possible hart rings as one compact txtrace frame.
+pub fn dump_console_hex_all<P>()
+where
+    P: ConsoleIf + ObserverIf + TimeIf + tx_hal::SmpIf,
+{
+    dump_console_hex_mask::<P>(P::possible_cpus(), None);
+}
+
+const TX_TRACE_HART_RING_BYTES: usize = core::mem::size_of::<TxTraceHartRing>();
+const TX_TRACE_RECORD_BYTES: usize = core::mem::size_of::<TxTraceRecord>();
+
+#[derive(Copy, Clone)]
+struct RingSnapshot {
+    desc: tx_hal::RingDescriptor,
+    actual_slots: usize,
+    start: u64,
+    count: usize,
+    lost: u64,
+}
+
+fn ring_snapshot(desc: tx_hal::RingDescriptor) -> Option<RingSnapshot> {
+    if desc.size < TX_TRACE_HART_RING_BYTES + TX_TRACE_RECORD_BYTES {
+        return None;
+    }
+    let raw_slots = (desc.size - TX_TRACE_HART_RING_BYTES) / TX_TRACE_RECORD_BYTES;
+    if raw_slots == 0 {
+        return None;
+    }
+    let actual_slots = 1usize << (usize::BITS - 1 - raw_slots.leading_zeros());
+    // SAFETY: `desc` came from `ObserverIf`; the region begins with a
+    // `TxTraceHartRing` header for this hart.
+    let hdr = unsafe { &*(desc.base.as_ptr() as *const TxTraceHartRing) };
+    let producer = hdr.producer.load(Ordering::Acquire);
+    let consumer = hdr.consumer.load(Ordering::Acquire);
+    let available = producer.wrapping_sub(consumer);
+    let count = if available > actual_slots as u64 {
+        actual_slots
+    } else {
+        available as usize
     };
-    // SAFETY: `desc` came from `P::observation_ring(hart)`. The board's
-    // contract is that the region is valid for the kernel's lifetime
-    // and exclusively owned by hart `hart` on the producer side. By the
-    // time the dump is invoked, the producer has quiesced (init has
-    // zombified), so a read of the full region is sound.
-    let ring_full: &[u8] = unsafe { core::slice::from_raw_parts(desc.base.as_ptr(), desc.size) };
-    // For partial-ring dumps (e.g. when triggered by the bounded-trace
-    // threshold), reading the producer cursor lets us emit only the
-    // populated slots instead of the entire ring. The 4 MiB rv64
-    // backing produces an ~8 MiB hex stream that takes ~25 minutes
-    // at 115 200 baud; trimming to the filled portion cuts that to
-    // seconds for early-phase dumps. The records past `producer` are
-    // either zeros or stale pre-reset data — neither is wanted in
-    // the trace.
-    let ring: &[u8] = {
-        const TX_TRACE_HART_RING_BYTES: usize = 208;
-        const TX_TRACE_RECORD_BYTES: usize = 80;
-        if ring_full.len() < TX_TRACE_HART_RING_BYTES {
-            ring_full
-        } else {
-            // SAFETY: header layout matches `TxTraceHartRing`. The
-            // first AtomicU64 field is `producer` at offset 0 of the
-            // header.
-            let ring_hdr_ptr = desc.base.as_ptr() as *const TxTraceHartRing;
-            let producer = unsafe { (*ring_hdr_ptr).producer.load(Ordering::Acquire) };
-            let slot_capacity_max =
-                (ring_full.len() - TX_TRACE_HART_RING_BYTES) / TX_TRACE_RECORD_BYTES;
-            // prev power of two
-            let slot_capacity = if slot_capacity_max == 0 {
-                0
-            } else {
-                1usize << (usize::BITS - 1 - slot_capacity_max.leading_zeros())
-            };
-            let used_slots = if (producer as usize) >= slot_capacity {
-                slot_capacity
-            } else {
-                producer as usize
-            };
-            let used_bytes = TX_TRACE_HART_RING_BYTES + used_slots * TX_TRACE_RECORD_BYTES;
-            &ring_full[..used_bytes.min(ring_full.len())]
-        }
-    };
+    Some(RingSnapshot {
+        desc,
+        actual_slots,
+        start: producer.wrapping_sub(count as u64),
+        count,
+        lost: hdr.lost.load(Ordering::Acquire),
+    })
+}
+
+fn dump_console_hex_mask<P>(mask: tx_hal::CpuMask, hart_label: Option<u64>)
+where
+    P: ConsoleIf + ObserverIf + TimeIf,
+{
+    run_pre_dump_hook();
     use tx_observe_types::{TxTraceClockId, TxTraceHeader, TxTraceHeaderFlags, TX_TRACE_MAGIC};
 
-    // `ring_order` is `log2(slot_count)`. The ring slot count is
-    // `(ring.len() - 208) / 80` where 208 is `size_of::<TxTraceHartRing>()`
-    // and 80 is `size_of::<TxTraceRecord>()`. For the rv64-qemu 64 KiB
-    // backing, `(65536 - 208) / 80 = 816` slots — round down to the
-    // nearest power of two = 512 = 2^9.
-    const TX_TRACE_HART_RING_BYTES: usize = 208;
-    const TX_TRACE_RECORD_BYTES: usize = 80;
-    let usable = ring.len().saturating_sub(TX_TRACE_HART_RING_BYTES);
-    let slot_count_max = usable / TX_TRACE_RECORD_BYTES;
-    // Largest power-of-two ≤ slot_count_max:
-    let ring_order = if slot_count_max == 0 {
-        0u8
-    } else {
-        (usize::BITS - 1 - slot_count_max.leading_zeros()) as u8
-    };
+    let mut hart_count = 0usize;
+    let mut max_records = 0usize;
+    for idx in 0..MAX_HARTS {
+        let hart = CpuId(idx);
+        if !mask.contains(hart) {
+            continue;
+        }
+        if let Some(snapshot) = P::observation_ring(hart).and_then(ring_snapshot) {
+            hart_count += 1;
+            max_records = max_records.max(snapshot.count);
+        }
+    }
+    if hart_count == 0 {
+        return;
+    }
+
+    let ring_order = compact_ring_order(max_records);
+    let slot_count = 1usize << ring_order;
+    let ring_bytes = TX_TRACE_HART_RING_BYTES + slot_count * TX_TRACE_RECORD_BYTES;
 
     let header = TxTraceHeader {
         magic: TX_TRACE_MAGIC,
@@ -880,7 +1204,7 @@ where
         endian: 1,
         ptr_width: 8,
         record_size: TX_TRACE_RECORD_BYTES as u16,
-        hart_count: 1,
+        hart_count: hart_count as u16,
         ring_order,
         flags: if P::clock_shared() {
             TxTraceHeaderFlags::CLOCK_SHARED.0
@@ -914,11 +1238,15 @@ where
     };
 
     // ── Frame begin ───────────────────────────────────────────────────────
-    let total_bytes = header_bytes.len() + ring.len();
+    let total_bytes = header_bytes.len() + hart_count * ring_bytes;
     tx_hal::console_write_str::<P>("TXTRACE-BEGIN bytes=");
     write_u64_decimal::<P>(total_bytes as u64);
     tx_hal::console_write_str::<P>(" hart=");
-    write_u64_decimal::<P>(hart.0 as u64);
+    if let Some(hart) = hart_label {
+        write_u64_decimal::<P>(hart);
+    } else {
+        tx_hal::console_write_str::<P>("all");
+    }
     tx_hal::console_write_str::<P>(" clock_hz=");
     write_u64_decimal::<P>(P::frequency_hz());
     tx_hal::console_write_str::<P>("\n");
@@ -926,25 +1254,85 @@ where
     // ── Hex bytes ─────────────────────────────────────────────────────────
     // 64-byte chunks per console line keep extraction robust even when the
     // serial driver inserts CR/LF padding.
-    const CHUNK: usize = 64;
     let mut emitted = 0;
-    let mut emit_bytes = |bytes: &[u8]| {
-        for &b in bytes {
-            write_hex_byte::<P>(b);
-            emitted += 1;
-            if emitted % CHUNK == 0 {
-                tx_hal::console_write_str::<P>("\n");
-            }
+    emit_hex_bytes::<P>(&header_bytes, &mut emitted);
+    for idx in 0..MAX_HARTS {
+        let hart = CpuId(idx);
+        if !mask.contains(hart) {
+            continue;
         }
-    };
-    emit_bytes(&header_bytes);
-    emit_bytes(ring);
-    if emitted % CHUNK != 0 {
+        let Some(snapshot) = P::observation_ring(hart).and_then(ring_snapshot) else {
+            continue;
+        };
+        emit_ring_snapshot::<P>(hart, snapshot, slot_count, &mut emitted);
+    }
+    if emitted % 64 != 0 {
         tx_hal::console_write_str::<P>("\n");
     }
 
     // ── Frame end ─────────────────────────────────────────────────────────
     tx_hal::console_write_str::<P>("TXTRACE-END\n");
+}
+
+fn emit_ring_snapshot<P: ConsoleIf>(
+    hart: CpuId,
+    snapshot: RingSnapshot,
+    slot_count: usize,
+    emitted: &mut usize,
+) {
+    let count = snapshot.count.min(slot_count);
+    let ring_hdr = TxTraceHartRing {
+        hart_id: hart.0 as u16,
+        flags: 0,
+        _pad0: [0; 60],
+        producer: AtomicU64::new(count as u64),
+        _pad1: [0; 56],
+        consumer: AtomicU64::new(0),
+        _pad2: [0; 56],
+        lost: AtomicU64::new(snapshot.lost),
+        seq: AtomicU64::new(count as u64),
+    };
+    let header_bytes = unsafe {
+        core::slice::from_raw_parts(
+            &ring_hdr as *const TxTraceHartRing as *const u8,
+            TX_TRACE_HART_RING_BYTES,
+        )
+    };
+    emit_hex_bytes::<P>(header_bytes, emitted);
+
+    let slots = unsafe {
+        snapshot.desc.base.as_ptr().add(TX_TRACE_HART_RING_BYTES) as *const TxTraceRecord
+    };
+    for offset in 0..count {
+        let cursor = snapshot.start.wrapping_add(offset as u64);
+        let slot_idx = (cursor & (snapshot.actual_slots as u64 - 1)) as usize;
+        let record = unsafe { slots.add(slot_idx) as *const u8 };
+        let bytes = unsafe { core::slice::from_raw_parts(record, TX_TRACE_RECORD_BYTES) };
+        emit_hex_bytes::<P>(bytes, emitted);
+    }
+    emit_zero_bytes::<P>((slot_count - count) * TX_TRACE_RECORD_BYTES, emitted);
+}
+
+fn emit_hex_bytes<P: ConsoleIf>(bytes: &[u8], emitted: &mut usize) {
+    const CHUNK: usize = 64;
+    for &b in bytes {
+        write_hex_byte::<P>(b);
+        *emitted += 1;
+        if *emitted % CHUNK == 0 {
+            tx_hal::console_write_str::<P>("\n");
+        }
+    }
+}
+
+fn emit_zero_bytes<P: ConsoleIf>(count: usize, emitted: &mut usize) {
+    const CHUNK: usize = 64;
+    for _ in 0..count {
+        write_hex_byte::<P>(0);
+        *emitted += 1;
+        if *emitted % CHUNK == 0 {
+            tx_hal::console_write_str::<P>("\n");
+        }
+    }
 }
 
 #[inline]
@@ -1097,6 +1485,8 @@ pub(crate) unsafe fn testing_reset(hart_idx: usize) {
     }
     TS_FN.store(0, Ordering::Relaxed);
     CPU_ID_FN.store(0, Ordering::Relaxed);
+    PRE_DUMP_HOOK_FN.store(0, Ordering::Relaxed);
+    OBSERVE_ENABLED.store(true, Ordering::Relaxed);
 }
 
 // ---------------------------------------------------------------------------

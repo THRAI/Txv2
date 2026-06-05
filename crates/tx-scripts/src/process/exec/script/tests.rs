@@ -301,10 +301,8 @@ const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
 const EV_CURRENT: u8 = 1;
 const ET_EXEC: u16 = 2;
-const ET_DYN: u16 = 3;
 const EM_RISCV: u16 = 243;
 const PT_LOAD: u32 = 1;
-const PT_INTERP: u32 = 3;
 const PT_PHDR: u32 = 6;
 const PF_R: u32 = 4;
 const PF_X: u32 = 1;
@@ -400,179 +398,6 @@ fn minimal_elf_bytes() -> Vec<u8> {
         file_size as u64,
         file_size as u64,
         FIX_PAGE,
-    );
-
-    bytes
-}
-
-// ---------------------------------------------------------------------------
-// N69a dynamic-link fixtures: a main ET_EXEC with PT_INTERP pointing at
-// a separately-built ET_DYN interpreter.
-// ---------------------------------------------------------------------------
-
-struct PhdrFields {
-    p_type: u32,
-    p_flags: u32,
-    p_offset: u64,
-    p_vaddr: u64,
-    p_filesz: u64,
-    p_memsz: u64,
-    p_align: u64,
-}
-
-fn write_phdr_at(b: &mut [u8], at: usize, phdr: PhdrFields) {
-    b[at..at + 4].copy_from_slice(&phdr.p_type.to_le_bytes());
-    b[at + 4..at + 8].copy_from_slice(&phdr.p_flags.to_le_bytes());
-    b[at + 8..at + 16].copy_from_slice(&phdr.p_offset.to_le_bytes());
-    b[at + 16..at + 24].copy_from_slice(&phdr.p_vaddr.to_le_bytes());
-    b[at + 24..at + 32].copy_from_slice(&phdr.p_vaddr.to_le_bytes()); // paddr
-    b[at + 32..at + 40].copy_from_slice(&phdr.p_filesz.to_le_bytes());
-    b[at + 40..at + 48].copy_from_slice(&phdr.p_memsz.to_le_bytes());
-    b[at + 48..at + 56].copy_from_slice(&phdr.p_align.to_le_bytes());
-}
-
-/// Emit a minimal ET_EXEC main image whose `PT_INTERP` segment points
-/// at `interp_path` (NUL-terminated inline). Layout: Ehdr (64) +
-/// PT_PHDR (56) + PT_LOAD (56) + PT_INTERP (56) + interp_path bytes.
-fn minimal_elf_with_interp_bytes(interp_path: &[u8]) -> Vec<u8> {
-    let phoff: u64 = 64;
-    let n_phdrs: u16 = 3;
-    let phent: u16 = 56;
-    let total_phdrs = (n_phdrs as u64) * (phent as u64);
-    let path_offset: u64 = phoff + total_phdrs;
-    let path_len: u64 = (interp_path.len() as u64) + 1; // include NUL
-    let file_size: usize = (path_offset + path_len) as usize;
-    let mut bytes = vec![0u8; file_size];
-
-    // ----- Ehdr -----
-    bytes[0..4].copy_from_slice(&ELF_MAGIC);
-    bytes[4] = ELFCLASS64;
-    bytes[5] = ELFDATA2LSB;
-    bytes[6] = EV_CURRENT;
-    bytes[16..18].copy_from_slice(&ET_EXEC.to_le_bytes());
-    bytes[18..20].copy_from_slice(&EM_RISCV.to_le_bytes());
-    bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
-    bytes[24..32].copy_from_slice(&(BASE_LOAD_VADDR + ENTRY_OFFSET).to_le_bytes());
-    bytes[32..40].copy_from_slice(&phoff.to_le_bytes());
-    bytes[40..48].copy_from_slice(&0u64.to_le_bytes()); // shoff
-    bytes[48..52].copy_from_slice(&0u32.to_le_bytes()); // flags
-    bytes[52..54].copy_from_slice(&64u16.to_le_bytes()); // ehsize
-    bytes[54..56].copy_from_slice(&phent.to_le_bytes());
-    bytes[56..58].copy_from_slice(&n_phdrs.to_le_bytes());
-    bytes[58..60].copy_from_slice(&0u16.to_le_bytes());
-    bytes[60..62].copy_from_slice(&0u16.to_le_bytes());
-    bytes[62..64].copy_from_slice(&0u16.to_le_bytes());
-
-    // ----- PT_PHDR -----
-    let pt_phdr_vaddr = BASE_LOAD_VADDR + phoff;
-    write_phdr_at(
-        &mut bytes,
-        phoff as usize,
-        PhdrFields {
-            p_type: PT_PHDR,
-            p_flags: PF_R,
-            p_offset: phoff,
-            p_vaddr: pt_phdr_vaddr,
-            p_filesz: total_phdrs,
-            p_memsz: total_phdrs,
-            p_align: 8,
-        },
-    );
-
-    // ----- PT_LOAD (R+X covers everything in the file) -----
-    write_phdr_at(
-        &mut bytes,
-        (phoff + 56) as usize,
-        PhdrFields {
-            p_type: PT_LOAD,
-            p_flags: PF_R | PF_X,
-            p_offset: 0,
-            p_vaddr: BASE_LOAD_VADDR,
-            p_filesz: file_size as u64,
-            p_memsz: file_size as u64,
-            p_align: FIX_PAGE,
-        },
-    );
-
-    // ----- PT_INTERP -----
-    write_phdr_at(
-        &mut bytes,
-        (phoff + 112) as usize,
-        PhdrFields {
-            p_type: PT_INTERP,
-            p_flags: PF_R,
-            p_offset: path_offset,
-            p_vaddr: BASE_LOAD_VADDR + path_offset,
-            p_filesz: path_len,
-            p_memsz: path_len,
-            p_align: 1,
-        },
-    );
-
-    // ----- inline NUL-terminated interpreter path -----
-    let off = path_offset as usize;
-    bytes[off..off + interp_path.len()].copy_from_slice(interp_path);
-    bytes[off + interp_path.len()] = 0;
-
-    bytes
-}
-
-/// Emit a minimal ET_DYN interpreter image with one R+X LOAD at
-/// vaddr=0 (canonical ET_DYN layout — load bias is applied by the
-/// kernel). Mirrors `minimal_elf_bytes` shape but flips `e_type`.
-fn minimal_interp_elf_bytes() -> Vec<u8> {
-    let phoff: u64 = 64;
-    let n_phdrs: u16 = 2;
-    let phent: u16 = 56;
-    let total_phdrs = (n_phdrs as u64) * (phent as u64);
-    let file_size: usize = (phoff + total_phdrs) as usize;
-    let mut bytes = vec![0u8; file_size];
-
-    bytes[0..4].copy_from_slice(&ELF_MAGIC);
-    bytes[4] = ELFCLASS64;
-    bytes[5] = ELFDATA2LSB;
-    bytes[6] = EV_CURRENT;
-    bytes[16..18].copy_from_slice(&ET_DYN.to_le_bytes());
-    bytes[18..20].copy_from_slice(&EM_RISCV.to_le_bytes());
-    bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
-    // Entry near top of the file image; load_bias is added by the kernel.
-    bytes[24..32].copy_from_slice(&ENTRY_OFFSET.to_le_bytes());
-    bytes[32..40].copy_from_slice(&phoff.to_le_bytes());
-    bytes[40..48].copy_from_slice(&0u64.to_le_bytes());
-    bytes[48..52].copy_from_slice(&0u32.to_le_bytes());
-    bytes[52..54].copy_from_slice(&64u16.to_le_bytes());
-    bytes[54..56].copy_from_slice(&phent.to_le_bytes());
-    bytes[56..58].copy_from_slice(&n_phdrs.to_le_bytes());
-
-    // PT_PHDR at relative vaddr=phoff (load_bias adds 0x3000_0000 at
-    // runtime).
-    write_phdr_at(
-        &mut bytes,
-        phoff as usize,
-        PhdrFields {
-            p_type: PT_PHDR,
-            p_flags: PF_R,
-            p_offset: phoff,
-            p_vaddr: phoff,
-            p_filesz: total_phdrs,
-            p_memsz: total_phdrs,
-            p_align: 8,
-        },
-    );
-
-    // PT_LOAD covering everything; vaddr=0 (relative).
-    write_phdr_at(
-        &mut bytes,
-        (phoff + 56) as usize,
-        PhdrFields {
-            p_type: PT_LOAD,
-            p_flags: PF_R | PF_X,
-            p_offset: 0,
-            p_vaddr: 0,
-            p_filesz: file_size as u64,
-            p_memsz: file_size as u64,
-            p_align: FIX_PAGE,
-        },
     );
 
     bytes
@@ -893,12 +718,12 @@ fn exec_script_resets_signal_dispositions_to_sig_dfl() {
     // existing step_sigaction step; verify it reads back as Handler
     // before the exec.
     use tx_subsystems::signal::step_sigaction;
-    let _ = step_sigaction(&process, Signum::SIGTERM, SigDisposition::Handler(0xdead));
+    let _ = step_sigaction(&process, Signum::SIGTERM, SigDisposition::handler(0xdead));
     assert_eq!(
         process
             .sig_disposition(Signum::SIGTERM)
             .expect("SIGTERM disposition pre-exec"),
-        SigDisposition::Handler(0xdead),
+        SigDisposition::handler(0xdead),
     );
 
     let cred = Credential::root();
@@ -1194,131 +1019,4 @@ fn exec_script_no_setuid_at_secure_zero() {
     assert_eq!(post.uid, pre.uid);
     assert_eq!(post.euid, pre.euid);
     assert_eq!(post.suid, pre.suid);
-}
-
-// ---------------------------------------------------------------------------
-// N69a: dynamic-link / PT_INTERP coverage.
-// ---------------------------------------------------------------------------
-
-/// `exec_script` opens the `PT_INTERP` target, parses it as ET_DYN,
-/// registers its LOAD segments at `INTERP_LOAD_BIAS_DEFAULT`, and
-/// seeds the trap context with `interp.entry + INTERP_LOAD_BIAS_DEFAULT`
-/// rather than the main image's `e_entry`.
-#[test]
-fn exec_script_dynamic_link_jumps_into_interpreter_at_load_bias() {
-    use tx_subsystems::vm::INTERP_LOAD_BIAS_DEFAULT;
-    let _setup = setup();
-
-    // Build the interpreter image first so we know what entry the
-    // kernel should target.
-    let interp_bytes = minimal_interp_elf_bytes();
-    // Build the main image with PT_INTERP -> "/libfake.so".
-    let main_bytes = minimal_elf_with_interp_bytes(b"/libfake.so");
-
-    let (root_dentry, fs) = build_fs_root();
-    let _ = fs.add_regular_with_bytes(FsObjectId::new(2), b"init", &main_bytes);
-    let _ = fs.add_regular_with_bytes(FsObjectId::new(2), b"libfake.so", &interp_bytes);
-
-    let aspace = fresh_aspace();
-    let process = bootstrap_init_process(aspace).expect("bootstrap init");
-    let thread = process.nth_thread(0).expect("leader thread");
-    match step_chdir(&process, root_dentry) {
-        ChdirOutcome::Replaced { .. } => {}
-        ChdirOutcome::ZombieIgnored => panic!("init bootstrap somehow zombified"),
-    }
-
-    let cred = Credential::root();
-    let result = block_on(exec_script::<ScriptsTestPmap>(
-        &process,
-        &thread,
-        b"/init",
-        &[],
-        &[],
-        &cred,
-    ));
-    assert_eq!(result, Ok(()), "dynamic-link exec must succeed");
-
-    let payload = thread.payload_cap().expect("alive thread payload");
-    let ctx = payload
-        .saved_user_context()
-        .expect("Phase 6 must have seeded the trap context");
-
-    // Interpreter entry = ENTRY_OFFSET (0x80), load_bias =
-    // 0x3000_0000 ⇒ initial PC sits inside the interpreter image,
-    // NOT at the main program's e_entry (`0x10080`).
-    let expected_pc = INTERP_LOAD_BIAS_DEFAULT + ENTRY_OFFSET;
-    assert_eq!(
-        ctx.pc as u64, expected_pc,
-        "PC must point at interp.entry + load_bias, not the main program's e_entry"
-    );
-
-    // The main program's e_entry (0x10080) must not be the PC —
-    // defensively assert this so a future regression that forgets to
-    // swap the entry point lands here.
-    assert_ne!(ctx.pc as u64, BASE_LOAD_VADDR + ENTRY_OFFSET);
-}
-
-/// When the main image has no `PT_INTERP` the historical
-/// static-`ET_EXEC` path is preserved: PC points at the main entry,
-/// `AT_BASE = 0`. This is the regression gate for the dynamic-link
-/// slice.
-#[test]
-fn exec_script_static_path_still_jumps_to_main_entry() {
-    let _setup = setup();
-    let bytes = minimal_elf_bytes();
-    let (process, thread, _fs) = bootstrap_with_file(b"init", &bytes);
-
-    let cred = Credential::root();
-    let result = block_on(exec_script::<ScriptsTestPmap>(
-        &process,
-        &thread,
-        b"/init",
-        &[],
-        &[],
-        &cred,
-    ));
-    assert_eq!(result, Ok(()));
-
-    let payload = thread.payload_cap().expect("alive thread payload");
-    let ctx = payload.saved_user_context().expect("seeded ctx");
-    assert_eq!(
-        ctx.pc as u64,
-        BASE_LOAD_VADDR + ENTRY_OFFSET,
-        "static path keeps PC at main e_entry"
-    );
-}
-
-/// PT_INTERP pointing at a non-existent file must fail before PoNR;
-/// the caller's address space is preserved.
-#[test]
-fn exec_script_dynamic_link_missing_interp_returns_path_not_found() {
-    let _setup = setup();
-    let main_bytes = minimal_elf_with_interp_bytes(b"/no-such-interp.so");
-
-    let (root_dentry, fs) = build_fs_root();
-    let _ = fs.add_regular_with_bytes(FsObjectId::new(2), b"init", &main_bytes);
-
-    let aspace = fresh_aspace();
-    let process = bootstrap_init_process(aspace).expect("bootstrap init");
-    let thread = process.nth_thread(0).expect("leader thread");
-    match step_chdir(&process, root_dentry) {
-        ChdirOutcome::Replaced { .. } => {}
-        ChdirOutcome::ZombieIgnored => panic!("init bootstrap somehow zombified"),
-    }
-
-    let aspace_before = process.aspace_cap().expect("alive aspace");
-    let cred = Credential::root();
-    let result = block_on(exec_script::<ScriptsTestPmap>(
-        &process,
-        &thread,
-        b"/init",
-        &[],
-        &[],
-        &cred,
-    ));
-    assert_eq!(result, Err(ExecError::PathNotFound));
-
-    // Pre-PoNR error path must leave the process aspace untouched.
-    let aspace_after = process.aspace_cap().expect("alive aspace post-fail");
-    assert_eq!(aspace_before.key(), aspace_after.key());
 }

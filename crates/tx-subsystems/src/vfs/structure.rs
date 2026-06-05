@@ -8,14 +8,14 @@
 //! pure observation helpers belong here.
 
 use alloc::boxed::Box;
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicI8, AtomicU64, Ordering};
 
 use crate::vfs::adapter::step_engine::{
-    self, Cap, PayloadCap, SpinMutex, Weak, Zone, ZoneAllocated, ZoneError,
+    self, Cap, SpinMutex, Weak, Zone, ZoneAllocated, ZoneError,
 };
-use crate::vfs::adapter::wait_routing::{self, Channel, WaitSource};
+use crate::vfs::adapter::wait_routing::{Channel, WaitSource};
 
 use crate::aio::AioContext;
 use crate::cred::{CapabilitySet, Cred, CredSnapshot};
@@ -25,8 +25,7 @@ use crate::eventfd::EventFd;
 use crate::execution::Errno;
 use crate::io_uring::IoUring;
 use crate::ipc::posix_mq::structure::PosixMqInstance;
-use crate::mount::{MountApiFile, MountIdentity, MountPayload};
-use crate::net::{NetNamespacePayload, SocketIdentity};
+use crate::mount::{MountIdentity, MountPayload};
 use crate::page_backed::PageContainer;
 use crate::process::{ProcessGroup, ProcessIdentity};
 use crate::signalfd::SignalFd;
@@ -35,7 +34,8 @@ use crate::tty::execution::IoctlSideEffect;
 use crate::tty::structure::TtyIdentity;
 use crate::tty::structure::{Termios, Winsize};
 use crate::userfaultfd::UserfaultFd;
-use crate::wait_source;
+use crate::vfs::notification;
+pub use crate::vfs::notification::{VFS_READABLE, VFS_WRITABLE};
 
 pub const VFS_NAME_MAX: usize = 255;
 
@@ -50,25 +50,11 @@ pub const VFS_NAME_MAX: usize = 255;
 /// blocking-IO contract); per-backing helpers (`pipe`, `tty`, future
 /// `socket`) layer their own bit allocations on top of this shape if
 /// they need them.
-pub const VFS_READABLE: u64 = 0x1;
-
-/// Per-RNode wait-source interest mask: space is available to write.
-/// See [`VFS_READABLE`] for the namespace + lifecycle convention.
-pub const VFS_WRITABLE: u64 = 0x2;
-
 // === zone statics =====================================================
 
 static DENTRY_ZONE: Zone<DEntry> = Zone::const_new();
 static RNODE_ZONE: Zone<RNode> = Zone::const_new();
 static OPEN_FILE_ZONE: Zone<OpenFile> = Zone::const_new();
-static FSNOTIFY_INSTANCE_ZONE: Zone<FsNotifyInstance> = Zone::const_new();
-static FLOCK_TABLE: SpinMutex<BTreeMap<FsObjectId, FlockRecord>> = SpinMutex::new(BTreeMap::new());
-
-#[derive(Default)]
-struct FlockRecord {
-    exclusive_owner: Option<u64>,
-    shared_owners: BTreeSet<u64>,
-}
 
 unsafe impl ZoneAllocated for DEntry {
     fn zone() -> &'static Zone<Self> {
@@ -85,12 +71,6 @@ unsafe impl ZoneAllocated for RNode {
 unsafe impl ZoneAllocated for OpenFile {
     fn zone() -> &'static Zone<Self> {
         &OPEN_FILE_ZONE
-    }
-}
-
-unsafe impl ZoneAllocated for FsNotifyInstance {
-    fn zone() -> &'static Zone<Self> {
-        &FSNOTIFY_INSTANCE_ZONE
     }
 }
 
@@ -454,6 +434,10 @@ pub struct OpenFileFlags {
     /// (page-backed regular files, TTY) ignore it today and
     /// re-honour it once the per-backing nonblock plumbing lands.
     pub nonblocking: bool,
+    /// `O_DIRECT` on pipes means packet mode. Other backings preserve
+    /// this bit for `F_GETFL` / `F_SETFL` round-trips until direct-I/O
+    /// semantics land in their owner.
+    pub packet: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -504,7 +488,6 @@ pub enum RNodeBacking {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProjectionSchemaId {
     Procfs,
-    Sysfs,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -518,57 +501,17 @@ impl ProjectionKey {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FsNotifyKind {
-    Inotify,
-    Fanotify,
-}
-
-#[derive(Debug)]
-pub struct FsNotifyInstance {
-    kind: FsNotifyKind,
-}
-
-impl FsNotifyInstance {
-    pub const fn new(kind: FsNotifyKind) -> Self {
-        Self { kind }
-    }
-
-    pub fn new_cap(kind: FsNotifyKind) -> Result<Cap<Self>, ZoneError> {
-        step_engine::sign(Self::new(kind))
-    }
-
-    pub const fn kind(&self) -> FsNotifyKind {
-        self.kind
-    }
-}
-
 #[derive(Clone, Debug)]
 pub enum StructPayload {
     Tty(Cap<TtyIdentity>),
     CharDevice(&'static CharDeviceBinding),
     BlockDevice(&'static BlockDeviceRegistration),
-    /// Linux fsnotify instance exposed as an fd (`inotify_init1`,
-    /// `fanotify_init`). This first shape provides a typed non-socket
-    /// descriptor and wait source; watch/mark event production lands in
-    /// the future fsnotify subsystem.
-    FsNotify {
-        instance: Cap<FsNotifyInstance>,
-    },
     /// Anonymous pipe — `pipe2(2)`. `side` distinguishes the
     /// reader-end RNode from the writer-end RNode; both share a
     /// single `Cap<PipePayload>`. fd-ops Wave 3.
     Pipe {
         payload: Cap<crate::pipe::PipePayload>,
         side: crate::pipe::PipeSide,
-    },
-    /// Socket-backed open file used by the network syscall facade.
-    Socket {
-        identity: Cap<SocketIdentity>,
-    },
-    /// Internal network-namespace fd used by the staged rtnetlink path.
-    NetNamespace {
-        payload: PayloadCap<NetNamespacePayload>,
     },
 }
 
@@ -626,23 +569,18 @@ pub struct RNode {
 
 impl RNode {
     pub fn new(fs_object_id: FsObjectId, meta: InodeMeta, backing: RNodeBacking) -> Self {
-        let read_wait_channel = Channel::new();
-        let read_wait_source_id = wait_source::register_wait_channel(read_wait_channel.clone());
-        let read_wait_source = wait_routing::new_wait_source(read_wait_source_id);
-        let write_wait_channel = Channel::new();
-        let write_wait_source_id = wait_source::register_wait_channel(write_wait_channel.clone());
-        let write_wait_source = wait_routing::new_wait_source(write_wait_source_id);
+        let wait_points = notification::new_rnode_wait_points();
         Self {
             fs_object_id,
             meta,
             backing,
             containing_mount: None,
-            read_wait_channel,
-            read_wait_source_id,
-            read_wait_source,
-            write_wait_channel,
-            write_wait_source_id,
-            write_wait_source,
+            read_wait_channel: wait_points.read_channel,
+            read_wait_source_id: wait_points.read_source_id,
+            read_wait_source: wait_points.read_source,
+            write_wait_channel: wait_points.write_channel,
+            write_wait_source_id: wait_points.write_source_id,
+            write_wait_source: wait_points.write_source,
         }
     }
 
@@ -683,79 +621,6 @@ impl RNode {
 
     pub const fn backing(&self) -> &RNodeBacking {
         &self.backing
-    }
-
-    pub fn flock_try_acquire(
-        &self,
-        owner: u64,
-        lock_type: u32,
-        blocking: bool,
-    ) -> Result<(), Errno> {
-        if owner == 0 {
-            return Err(Errno::EINVAL);
-        }
-
-        loop {
-            {
-                let mut locks = FLOCK_TABLE.lock();
-                let record = locks.entry(self.fs_object_id).or_default();
-                let can_lock = match lock_type {
-                    // LOCK_SH: compatible with other shared locks; if this
-                    // owner held exclusive, downgrade to shared.
-                    1 => record.exclusive_owner.is_none() || record.exclusive_owner == Some(owner),
-                    // LOCK_EX: requires no other owner. Converting from a
-                    // shared lock held only by this owner is permitted.
-                    2 => {
-                        record.exclusive_owner.is_none()
-                            && (record.shared_owners.is_empty()
-                                || (record.shared_owners.len() == 1
-                                    && record.shared_owners.contains(&owner)))
-                            || record.exclusive_owner == Some(owner)
-                    }
-                    _ => return Err(Errno::EINVAL),
-                };
-
-                if can_lock {
-                    match lock_type {
-                        1 => {
-                            record.exclusive_owner = None;
-                            record.shared_owners.insert(owner);
-                        }
-                        2 => {
-                            record.shared_owners.remove(&owner);
-                            record.exclusive_owner = Some(owner);
-                        }
-                        _ => unreachable!(),
-                    }
-                    return Ok(());
-                }
-
-                if !blocking {
-                    return Err(Errno::EAGAIN);
-                }
-            }
-            core::hint::spin_loop();
-        }
-    }
-
-    pub fn flock_release_owner(&self, owner: u64) {
-        if owner == 0 {
-            return;
-        }
-
-        let mut locks = FLOCK_TABLE.lock();
-        let Some(record) = locks.get_mut(&self.fs_object_id) else {
-            return;
-        };
-
-        if record.exclusive_owner == Some(owner) {
-            record.exclusive_owner = None;
-        }
-        record.shared_owners.remove(&owner);
-
-        if record.exclusive_owner.is_none() && record.shared_owners.is_empty() {
-            locks.remove(&self.fs_object_id);
-        }
     }
 
     pub fn with_containing_mount(mut self, mount: &Cap<MountPayload>) -> Self {
@@ -836,16 +701,12 @@ impl RNode {
     /// either both paths fire or neither does, matching the
     /// exit_source / tty templates).
     pub fn fire_read_wait(&self, mask: u64) -> usize {
-        let released = wait_routing::fire_legacy_channel(&self.read_wait_channel, mask);
-        wait_routing::notify_v3_source(&self.read_wait_source, mask);
-        released
+        notification::notify_readable(&self.read_wait_channel, &self.read_wait_source, mask)
     }
 
     /// Companion to [`Self::fire_read_wait`] for the writable direction.
     pub fn fire_write_wait(&self, mask: u64) -> usize {
-        let released = wait_routing::fire_legacy_channel(&self.write_wait_channel, mask);
-        wait_routing::notify_v3_source(&self.write_wait_source, mask);
-        released
+        notification::notify_writable(&self.write_wait_channel, &self.write_wait_source, mask)
     }
 }
 
@@ -861,8 +722,10 @@ impl RNode {
 /// rows per inode.
 impl Drop for RNode {
     fn drop(&mut self) {
-        wait_source::release_wait_channel(self.read_wait_source_id);
-        wait_source::release_wait_channel(self.write_wait_source_id);
+        notification::release_rnode_wait_points(
+            self.read_wait_source_id,
+            self.write_wait_source_id,
+        );
     }
 }
 
@@ -1098,48 +961,16 @@ pub enum OpenFileBacking {
     /// descriptor is a normal fd-table entry whose backing carries the
     /// POSIX mq identity and per-open flags.
     PosixMq { mq: Cap<PosixMqInstance> },
-    /// `pidfd_open(2)` open file. The fd keeps a capability reference
-    /// to the target process identity; exit/readiness lives on the
-    /// process side, so this adapter does not duplicate signal truth.
-    Pidfd { process: Cap<ProcessIdentity> },
-    /// Minimal typed kernel-object fds for syscall surfaces whose full
-    /// subsystem semantics are intentionally staged. The fd owns enough
-    /// metadata to preserve object kind and creation parameters; later
-    /// phases can split these into dedicated subsystem caps when read,
-    /// ioctl, poll, and cross-object references land.
-    KernelObject { object: KernelObjectFile },
-    /// Linux 5.2 new mount API fd (`fsopen`, `fspick`, `fsmount`,
-    /// `open_tree`). The cap carries the mount-context or detached
-    /// mount identity; full topology mutation remains in mount syscalls.
-    MountApi { file: Cap<MountApiFile> },
-}
-
-/// Metadata carried by phase-0 kernel-object fds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KernelObjectFile {
-    PerfEvent(PerfEventFile),
-    BpfMap(BpfMapFile),
-}
-
-/// `perf_event_open(2)` phase-0 fd metadata.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PerfEventFile {
-    pub attr_type: u32,
-    pub config: u64,
-    pub pid: i32,
-    pub cpu: i32,
-    pub group_fd: i32,
-    pub flags: u64,
-}
-
-/// `bpf(BPF_MAP_CREATE)` phase-0 fd metadata.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BpfMapFile {
-    pub map_type: u32,
-    pub key_size: u32,
-    pub value_size: u32,
-    pub max_entries: u32,
-    pub map_flags: u32,
+    /// Minimal anonymous `socketpair(AF_UNIX, SOCK_STREAM)` open file.
+    /// Each endpoint is backed by two pipe payloads: `rx` receives
+    /// bytes from the peer, and `tx` carries bytes written by this fd
+    /// to the peer. It is a non-path fd kind, so syscall handlers must
+    /// dispatch via [`OpenFile::socketpair_endpoint`] before calling
+    /// [`OpenFile::rnode`].
+    SocketPair {
+        rx: Cap<crate::pipe::PipePayload>,
+        tx: Cap<crate::pipe::PipePayload>,
+    },
 }
 
 /// Per-fd file-position carrier.
@@ -1177,9 +1008,15 @@ pub struct OpenFile {
     pub(crate) flags: OpenFileFlags,
     /// Runtime `O_NONBLOCK` override set via `fcntl(F_SETFL)`.
     nonblocking_override: AtomicI8,
+    /// Runtime pipe packet-mode override set via `fcntl(F_SETFL)`.
+    packet_override: AtomicI8,
     /// Best-effort DEntry hint set by `step_open`. `None` for
     /// non-VFS shapes (ufd, aio, etc.). Used by `fchdir`.
     opendir_dentry: Option<Cap<DEntry>>,
+
+    /// Advisory file lock state: 0 = unlocked, non-zero = exclusive-locked.
+    /// Per open-file-description, not per-inode (POSIX flock semantics).
+    flock_state: core::sync::atomic::AtomicU64,
 }
 
 impl OpenFile {
@@ -1189,8 +1026,10 @@ impl OpenFile {
             offset: AtomicU64::new(0),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
+            packet_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
+            flock_state: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1206,9 +1045,7 @@ impl OpenFile {
         dentry: Cap<DEntry>,
     ) -> Result<Cap<Self>, ZoneError> {
         let mut file = Self::new(rnode, flags);
-        if matches!(file.rnode().backing(), RNodeBacking::Directory) {
-            file.opendir_dentry = Some(dentry);
-        }
+        file.opendir_dentry = Some(dentry);
         step_engine::sign(file)
     }
 
@@ -1224,8 +1061,10 @@ impl OpenFile {
             offset: AtomicU64::new(0),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
+            packet_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
+            flock_state: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1253,8 +1092,10 @@ impl OpenFile {
             offset: AtomicU64::new(0),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
+            packet_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
+            flock_state: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1278,8 +1119,10 @@ impl OpenFile {
             offset: AtomicU64::new(0),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
+            packet_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
+            flock_state: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1300,8 +1143,10 @@ impl OpenFile {
             offset: AtomicU64::new(0),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
+            packet_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
+            flock_state: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1319,8 +1164,10 @@ impl OpenFile {
             offset: AtomicU64::new(0),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
+            packet_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
+            flock_state: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1341,8 +1188,10 @@ impl OpenFile {
             offset: AtomicU64::new(0),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
+            packet_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
+            flock_state: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1361,8 +1210,10 @@ impl OpenFile {
             offset: AtomicU64::new(0),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
+            packet_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
+            flock_state: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1374,64 +1225,31 @@ impl OpenFile {
         step_engine::sign(Self::new_posix_mq(mq, flags))
     }
 
-    /// Construct a pidfd-backed `OpenFile`.
-    pub fn new_pidfd(process: Cap<ProcessIdentity>, flags: OpenFileFlags) -> Self {
+    /// Construct one endpoint of an anonymous stream socketpair.
+    pub fn new_socketpair_endpoint(
+        rx: Cap<crate::pipe::PipePayload>,
+        tx: Cap<crate::pipe::PipePayload>,
+        flags: OpenFileFlags,
+    ) -> Self {
         Self {
-            backing: OpenFileBacking::Pidfd { process },
+            backing: OpenFileBacking::SocketPair { rx, tx },
             offset: AtomicU64::new(0),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
+            packet_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
+            flock_state: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
-    /// Zone-sign a fresh pidfd-backed `OpenFile`.
-    pub fn new_pidfd_cap(
-        process: Cap<ProcessIdentity>,
+    /// Zone-sign one anonymous stream socketpair endpoint.
+    pub fn new_socketpair_endpoint_cap(
+        rx: Cap<crate::pipe::PipePayload>,
+        tx: Cap<crate::pipe::PipePayload>,
         flags: OpenFileFlags,
     ) -> Result<Cap<Self>, ZoneError> {
-        step_engine::sign(Self::new_pidfd(process, flags))
-    }
-
-    /// Construct a phase-0 kernel-object-backed `OpenFile`.
-    pub fn new_kernel_object(object: KernelObjectFile, flags: OpenFileFlags) -> Self {
-        Self {
-            backing: OpenFileBacking::KernelObject { object },
-            offset: AtomicU64::new(0),
-            readdir_cursor: AtomicU64::new(0),
-            nonblocking_override: AtomicI8::new(-1),
-            flags,
-            opendir_dentry: None,
-        }
-    }
-
-    /// Zone-sign a fresh phase-0 kernel-object-backed `OpenFile`.
-    pub fn new_kernel_object_cap(
-        object: KernelObjectFile,
-        flags: OpenFileFlags,
-    ) -> Result<Cap<Self>, ZoneError> {
-        step_engine::sign(Self::new_kernel_object(object, flags))
-    }
-
-    /// Construct a new-mount-API-backed `OpenFile`.
-    pub fn new_mount_api(file: Cap<MountApiFile>, flags: OpenFileFlags) -> Self {
-        Self {
-            backing: OpenFileBacking::MountApi { file },
-            offset: AtomicU64::new(0),
-            readdir_cursor: AtomicU64::new(0),
-            nonblocking_override: AtomicI8::new(-1),
-            flags,
-            opendir_dentry: None,
-        }
-    }
-
-    /// Zone-sign a fresh new-mount-API-backed `OpenFile`.
-    pub fn new_mount_api_cap(
-        file: Cap<MountApiFile>,
-        flags: OpenFileFlags,
-    ) -> Result<Cap<Self>, ZoneError> {
-        step_engine::sign(Self::new_mount_api(file, flags))
+        step_engine::sign(Self::new_socketpair_endpoint(rx, tx, flags))
     }
 
     /// Construct an io_uring-backed `OpenFile` (future PR-12 phase 0 —
@@ -1446,8 +1264,10 @@ impl OpenFile {
             offset: AtomicU64::new(0),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
+            packet_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
+            flock_state: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1473,9 +1293,7 @@ impl OpenFile {
     /// update pipe reader/writer counts synchronously. That keeps pipe
     /// EOF/EPIPE visible at fd-close time instead of waiting for EBR to
     /// eventually retire the shared `OpenFile`.
-    pub(crate) fn pipe_endpoint(
-        &self,
-    ) -> Option<(Cap<crate::pipe::PipePayload>, crate::pipe::PipeSide)> {
+    pub fn pipe_endpoint(&self) -> Option<(Cap<crate::pipe::PipePayload>, crate::pipe::PipeSide)> {
         let OpenFileBacking::Rnode { rnode } = &self.backing else {
             return None;
         };
@@ -1486,6 +1304,18 @@ impl OpenFile {
             return None;
         };
         Some((payload.clone(), *side))
+    }
+
+    /// Return the anonymous stream socketpair endpoint, if this fd is
+    /// one. The first payload is the readable side for this fd; the
+    /// second is the writable side toward the peer.
+    pub fn socketpair_endpoint(
+        &self,
+    ) -> Option<(Cap<crate::pipe::PipePayload>, Cap<crate::pipe::PipePayload>)> {
+        match &self.backing {
+            OpenFileBacking::SocketPair { rx, tx } => Some((rx.clone(), tx.clone())),
+            _ => None,
+        }
     }
 
     /// VFS-shaped accessor — returns the inner `Cap<RNode>` for an
@@ -1533,17 +1363,9 @@ impl OpenFile {
                 "OpenFile::rnode() called on a POSIX-mq-backed OpenFile; \
                  dispatch via OpenFile::backing() / OpenFile::posix_mq() first",
             ),
-            OpenFileBacking::Pidfd { .. } => panic!(
-                "OpenFile::rnode() called on a pidfd-backed OpenFile; \
-                 dispatch via OpenFile::backing() / OpenFile::pidfd_process() first",
-            ),
-            OpenFileBacking::KernelObject { .. } => panic!(
-                "OpenFile::rnode() called on a kernel-object-backed OpenFile; \
-                 dispatch via OpenFile::backing() / OpenFile::kernel_object() first",
-            ),
-            OpenFileBacking::MountApi { .. } => panic!(
-                "OpenFile::rnode() called on a mount-api-backed OpenFile; \
-                 dispatch via OpenFile::backing() / OpenFile::mount_api_file() first",
+            OpenFileBacking::SocketPair { .. } => panic!(
+                "OpenFile::rnode() called on a socketpair-backed OpenFile; \
+                 dispatch via OpenFile::backing() / OpenFile::socketpair_endpoint() first",
             ),
         }
     }
@@ -1561,22 +1383,44 @@ impl OpenFile {
     /// `blocking`: `false` = `LOCK_NB`.
     pub fn flock_acquire(
         &self,
-        lock_type: u32,
+        _lock_type: u32,
         blocking: bool,
     ) -> Result<(), crate::execution::Errno> {
-        // `flock(2)` conflicts across distinct open-file descriptions of
-        // the same inode, while dup/fork clones of one OpenFile share
-        // ownership and may unlock it.
-        let owner = self as *const Self as u64;
-        self.rnode().flock_try_acquire(owner, lock_type, blocking)
+        // v1: exclusive-only, per-open-file-description.
+        // Any shared lock maps to exclusive.
+        if blocking {
+            // Simple spin-wait for v1.
+            loop {
+                if self
+                    .flock_state
+                    .compare_exchange(
+                        0,
+                        1,
+                        core::sync::atomic::Ordering::Acquire,
+                        core::sync::atomic::Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    return Ok(());
+                }
+            }
+        } else {
+            self.flock_state
+                .compare_exchange(
+                    0,
+                    1,
+                    core::sync::atomic::Ordering::Acquire,
+                    core::sync::atomic::Ordering::Relaxed,
+                )
+                .map_err(|_| crate::execution::Errno::EAGAIN)?;
+            Ok(())
+        }
     }
 
     /// Release a held advisory lock.
     pub fn flock_release(&self) {
-        let owner = self as *const Self as u64;
-        if let OpenFileBacking::Rnode { rnode } = &self.backing {
-            rnode.flock_release_owner(owner);
-        }
+        self.flock_state
+            .store(0, core::sync::atomic::Ordering::Release);
     }
 
     /// `Some(&Cap<UserfaultFd>)` iff this `OpenFile` is the
@@ -1596,9 +1440,7 @@ impl OpenFile {
             | OpenFileBacking::Eventfd { .. }
             | OpenFileBacking::Timerfd { .. }
             | OpenFileBacking::PosixMq { .. }
-            | OpenFileBacking::Pidfd { .. }
-            | OpenFileBacking::KernelObject { .. }
-            | OpenFileBacking::MountApi { .. } => None,
+            | OpenFileBacking::SocketPair { .. } => None,
         }
     }
 
@@ -1620,9 +1462,7 @@ impl OpenFile {
             | OpenFileBacking::Eventfd { .. }
             | OpenFileBacking::Timerfd { .. }
             | OpenFileBacking::PosixMq { .. }
-            | OpenFileBacking::Pidfd { .. }
-            | OpenFileBacking::KernelObject { .. }
-            | OpenFileBacking::MountApi { .. } => None,
+            | OpenFileBacking::SocketPair { .. } => None,
         }
     }
 
@@ -1643,9 +1483,7 @@ impl OpenFile {
             | OpenFileBacking::Eventfd { .. }
             | OpenFileBacking::Timerfd { .. }
             | OpenFileBacking::PosixMq { .. }
-            | OpenFileBacking::Pidfd { .. }
-            | OpenFileBacking::KernelObject { .. }
-            | OpenFileBacking::MountApi { .. } => None,
+            | OpenFileBacking::SocketPair { .. } => None,
         }
     }
 
@@ -1662,9 +1500,7 @@ impl OpenFile {
             | OpenFileBacking::Eventfd { .. }
             | OpenFileBacking::Timerfd { .. }
             | OpenFileBacking::PosixMq { .. }
-            | OpenFileBacking::Pidfd { .. }
-            | OpenFileBacking::KernelObject { .. }
-            | OpenFileBacking::MountApi { .. } => None,
+            | OpenFileBacking::SocketPair { .. } => None,
         }
     }
 
@@ -1681,9 +1517,7 @@ impl OpenFile {
             | OpenFileBacking::Epoll { .. }
             | OpenFileBacking::Timerfd { .. }
             | OpenFileBacking::PosixMq { .. }
-            | OpenFileBacking::Pidfd { .. }
-            | OpenFileBacking::KernelObject { .. }
-            | OpenFileBacking::MountApi { .. } => None,
+            | OpenFileBacking::SocketPair { .. } => None,
         }
     }
 
@@ -1700,9 +1534,7 @@ impl OpenFile {
             | OpenFileBacking::Epoll { .. }
             | OpenFileBacking::Eventfd { .. }
             | OpenFileBacking::PosixMq { .. }
-            | OpenFileBacking::Pidfd { .. }
-            | OpenFileBacking::KernelObject { .. }
-            | OpenFileBacking::MountApi { .. } => None,
+            | OpenFileBacking::SocketPair { .. } => None,
         }
     }
 
@@ -1724,9 +1556,7 @@ impl OpenFile {
             | OpenFileBacking::Eventfd { .. }
             | OpenFileBacking::Timerfd { .. }
             | OpenFileBacking::PosixMq { .. }
-            | OpenFileBacking::Pidfd { .. }
-            | OpenFileBacking::KernelObject { .. }
-            | OpenFileBacking::MountApi { .. } => None,
+            | OpenFileBacking::SocketPair { .. } => None,
         }
     }
 
@@ -1743,65 +1573,7 @@ impl OpenFile {
             | OpenFileBacking::Eventfd { .. }
             | OpenFileBacking::Timerfd { .. }
             | OpenFileBacking::IoUring { .. }
-            | OpenFileBacking::Pidfd { .. }
-            | OpenFileBacking::KernelObject { .. }
-            | OpenFileBacking::MountApi { .. } => None,
-        }
-    }
-
-    /// `Some(&Cap<ProcessIdentity>)` iff this `OpenFile` is a pidfd.
-    pub fn pidfd_process(&self) -> Option<&Cap<ProcessIdentity>> {
-        match &self.backing {
-            OpenFileBacking::Pidfd { process } => Some(process),
-            OpenFileBacking::Rnode { .. }
-            | OpenFileBacking::Ufd { .. }
-            | OpenFileBacking::AioContext { .. }
-            | OpenFileBacking::SignalFd { .. }
-            | OpenFileBacking::Epoll { .. }
-            | OpenFileBacking::Eventfd { .. }
-            | OpenFileBacking::Timerfd { .. }
-            | OpenFileBacking::IoUring { .. }
-            | OpenFileBacking::PosixMq { .. }
-            | OpenFileBacking::KernelObject { .. }
-            | OpenFileBacking::MountApi { .. } => None,
-        }
-    }
-
-    /// `Some(&KernelObjectFile)` iff this `OpenFile` is a phase-0
-    /// kernel-object fd.
-    pub fn kernel_object(&self) -> Option<&KernelObjectFile> {
-        match &self.backing {
-            OpenFileBacking::KernelObject { object } => Some(object),
-            OpenFileBacking::Rnode { .. }
-            | OpenFileBacking::Ufd { .. }
-            | OpenFileBacking::AioContext { .. }
-            | OpenFileBacking::SignalFd { .. }
-            | OpenFileBacking::Epoll { .. }
-            | OpenFileBacking::Eventfd { .. }
-            | OpenFileBacking::Timerfd { .. }
-            | OpenFileBacking::IoUring { .. }
-            | OpenFileBacking::PosixMq { .. }
-            | OpenFileBacking::Pidfd { .. }
-            | OpenFileBacking::MountApi { .. } => None,
-        }
-    }
-
-    /// `Some(&Cap<MountApiFile>)` iff this `OpenFile` is a Linux new
-    /// mount API fd (`fsopen`, `fspick`, `fsmount`, or `open_tree`).
-    pub fn mount_api_file(&self) -> Option<&Cap<MountApiFile>> {
-        match &self.backing {
-            OpenFileBacking::MountApi { file } => Some(file),
-            OpenFileBacking::Rnode { .. }
-            | OpenFileBacking::Ufd { .. }
-            | OpenFileBacking::AioContext { .. }
-            | OpenFileBacking::SignalFd { .. }
-            | OpenFileBacking::Epoll { .. }
-            | OpenFileBacking::Eventfd { .. }
-            | OpenFileBacking::Timerfd { .. }
-            | OpenFileBacking::IoUring { .. }
-            | OpenFileBacking::PosixMq { .. }
-            | OpenFileBacking::Pidfd { .. }
-            | OpenFileBacking::KernelObject { .. } => None,
+            | OpenFileBacking::SocketPair { .. } => None,
         }
     }
 
@@ -1840,11 +1612,21 @@ impl OpenFile {
             1 => f.nonblocking = true,
             _ => {}
         }
+        match self.packet_override.load(Ordering::Acquire) {
+            0 => f.packet = false,
+            1 => f.packet = true,
+            _ => {}
+        }
         f
     }
 
     pub fn set_nonblocking(&self, val: bool) {
         self.nonblocking_override
+            .store(if val { 1 } else { 0 }, Ordering::Release);
+    }
+
+    pub fn set_packet_mode(&self, val: bool) {
+        self.packet_override
             .store(if val { 1 } else { 0 }, Ordering::Release);
     }
 

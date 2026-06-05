@@ -47,7 +47,7 @@ pub(crate) mod topology;
 
 pub(crate) use address_space::{
     commit_mapping, create_pmap_root, destroy_pmap_root, protect_mapping, reserve_mapping,
-    rollback_mapping, shootdown_mapping, unmap_mapping,
+    rollback_mapping, shootdown_mapping, shootdown_mappings, unmap_mapping, ASID_CAPACITY,
 };
 pub(crate) use kernel_space::{
     bootstrap_pmap_info, commit_kernel_direct_map_1g, commit_kernel_mapping, extend_direct_map,
@@ -532,11 +532,31 @@ fn l0_table_for_test<State>(
 // Low-level table maintenance and boot-pool pointer helpers. `sfence.vma` is a
 // local invalidation for this v1 path; remote shootdown is still tracked as a
 // later substrate blocker in progress memory.
-fn sfence_vma_all() {
+pub(crate) fn sfence_vma_all() {
     #[cfg(target_arch = "riscv64")]
     unsafe {
         core::arch::asm!("sfence.vma", options(nostack));
     }
+}
+
+pub(crate) fn sfence_vma_range_asid(virt: VirtAddr, size: usize, asid: tx_hal::Asid) {
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        let mut addr = virt.0;
+        let end = virt.0.saturating_add(size);
+        while addr < end {
+            core::arch::asm!(
+                "sfence.vma {addr}, {asid}",
+                addr = in(reg) addr,
+                asid = in(reg) asid.0 as usize,
+                options(nostack)
+            );
+            addr = addr.saturating_add(PAGE_SIZE);
+        }
+    }
+
+    #[cfg(not(target_arch = "riscv64"))]
+    let _ = (virt, size, asid);
 }
 
 fn pool_index<State>(bag: &BootStaticBag<State>, phys: PhysAddr) -> Option<usize> {

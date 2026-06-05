@@ -26,10 +26,12 @@ use tx_hal::{
     PmapReservation, PmapReserveKind, PmapRoot, PtNode,
 };
 use tx_shims::linux_syscall::{
-    dispatch, SyscallCtx, SyscallResult, FUTEX_PRIVATE_FLAG, FUTEX_WAKE, NR_EXIT_GROUP, NR_FUTEX,
-    NR_WRITE,
+    dispatch, dispatch_cap_only_immediate, SyscallCtx, SyscallResult, FUTEX_PRIVATE_FLAG,
+    FUTEX_WAKE, FUTEX_WAKE_BITSET, NR_CLONE, NR_EXIT_GROUP, NR_FUTEX, NR_GETPPID, NR_PSELECT6,
+    NR_READ, NR_READV, NR_WRITE, NR_WRITEV,
 };
 use tx_subsystems::process::ExitStatus;
+use tx_subsystems::reactor_submit::SubmitChildThreadStatus;
 use tx_subsystems::signal::{SigDisposition, Signum};
 use tx_subsystems::thread_runtime::{
     clear_current_thread_payload, current_thread_payload, drain_pending_syscall_return,
@@ -42,8 +44,10 @@ use tx_subsystems::vm::{
 
 use crate::thread_future::{
     pf_access_to_vm_access, restore_sigreturn_frame, run_thread, siginfo_to_user_abi,
-    PerHartSlotted,
+    syscall_return_consumes_hot_budget, syscall_return_may_publish_wake_handoff,
+    syscall_return_needs_handoff, PerHartSlotted,
 };
+use crate::trap::direct_trap_syscall_needs_wake_handoff;
 
 const TEST_PAGE_SIZE: usize = 4096;
 
@@ -222,6 +226,243 @@ fn bootstrap_payload() -> PayloadCap<ThreadPayload> {
     leader.payload_cap_for_test().expect("leader payload alive")
 }
 
+#[test]
+fn clone_return_needs_child_publish_handoff_after_successful_publish() {
+    let clone = SyscallRequest::new(NR_CLONE, [0; 6]);
+    let futex_wake = SyscallRequest::new(
+        NR_FUTEX,
+        [0x1000, (FUTEX_WAKE | FUTEX_PRIVATE_FLAG) as u64, 1, 0, 0, 0],
+    );
+    let futex_wake_bitset = SyscallRequest::new(
+        NR_FUTEX,
+        [
+            0x1000,
+            (FUTEX_WAKE_BITSET | FUTEX_PRIVATE_FLAG) as u64,
+            1,
+            0,
+            0,
+            u32::MAX as u64,
+        ],
+    );
+    let futex_wait = SyscallRequest::new(NR_FUTEX, [0x1000, 0, 1, 0, 0, 0]);
+    let pselect = SyscallRequest::new(NR_PSELECT6, [0; 6]);
+    let write = SyscallRequest::new(NR_WRITE, [0; 6]);
+
+    assert!(syscall_return_needs_handoff(
+        &clone,
+        &SyscallResult::Return(123)
+    ));
+    assert!(syscall_return_needs_handoff(
+        &clone,
+        &SyscallResult::CloneReturn {
+            value: 123,
+            child_submit: SubmitChildThreadStatus::QueuedFallback,
+        }
+    ));
+    assert!(syscall_return_needs_handoff(
+        &clone,
+        &SyscallResult::CloneReturn {
+            value: 123,
+            child_submit: SubmitChildThreadStatus::Published,
+        }
+    ));
+    assert!(!syscall_return_needs_handoff(
+        &clone,
+        &SyscallResult::Error(22)
+    ));
+    assert!(!syscall_return_needs_handoff(
+        &clone,
+        &SyscallResult::NoReturn
+    ));
+    assert!(!syscall_return_needs_handoff(
+        &write,
+        &SyscallResult::Return(1)
+    ));
+    assert!(!syscall_return_needs_handoff(
+        &futex_wake,
+        &SyscallResult::Return(1)
+    ));
+    assert!(!syscall_return_needs_handoff(
+        &futex_wake_bitset,
+        &SyscallResult::Return(1)
+    ));
+    assert!(!syscall_return_needs_handoff(
+        &futex_wake,
+        &SyscallResult::Return(0)
+    ));
+    assert!(!syscall_return_needs_handoff(
+        &futex_wait,
+        &SyscallResult::Return(0)
+    ));
+    assert!(!syscall_return_needs_handoff(
+        &pselect,
+        &SyscallResult::Return(0)
+    ));
+    assert!(!syscall_return_needs_handoff(
+        &pselect,
+        &SyscallResult::Return(1)
+    ));
+}
+
+#[test]
+fn positive_futex_wake_return_may_publish_wake_handoff() {
+    let futex_wake = SyscallRequest::new(
+        NR_FUTEX,
+        [0x1000, (FUTEX_WAKE | FUTEX_PRIVATE_FLAG) as u64, 1, 0, 0, 0],
+    );
+    let futex_wake_bitset = SyscallRequest::new(
+        NR_FUTEX,
+        [
+            0x1000,
+            (FUTEX_WAKE_BITSET | FUTEX_PRIVATE_FLAG) as u64,
+            1,
+            0,
+            0,
+            u32::MAX as u64,
+        ],
+    );
+    let futex_wait = SyscallRequest::new(NR_FUTEX, [0x1000, 0, 1, 0, 0, 0]);
+    let clone = SyscallRequest::new(NR_CLONE, [0; 6]);
+
+    assert!(syscall_return_may_publish_wake_handoff(
+        &futex_wake,
+        &SyscallResult::Return(1)
+    ));
+    assert!(syscall_return_may_publish_wake_handoff(
+        &futex_wake_bitset,
+        &SyscallResult::Return(1)
+    ));
+    assert!(!syscall_return_may_publish_wake_handoff(
+        &futex_wake,
+        &SyscallResult::Return(0)
+    ));
+    assert!(!syscall_return_may_publish_wake_handoff(
+        &futex_wake,
+        &SyscallResult::Error(11)
+    ));
+    assert!(!syscall_return_may_publish_wake_handoff(
+        &futex_wait,
+        &SyscallResult::Return(0)
+    ));
+    assert!(!syscall_return_may_publish_wake_handoff(
+        &clone,
+        &SyscallResult::Return(123)
+    ));
+}
+
+#[test]
+fn hot_io_syscall_budget_requests_periodic_handoff() {
+    let write = SyscallRequest::new(NR_WRITE, [0; 6]);
+    let read = SyscallRequest::new(NR_READ, [0; 6]);
+    let writev = SyscallRequest::new(NR_WRITEV, [0; 6]);
+    let readv = SyscallRequest::new(NR_READV, [0; 6]);
+    let pselect = SyscallRequest::new(NR_PSELECT6, [0; 6]);
+    let mut budget = 2;
+
+    assert!(!syscall_return_consumes_hot_budget(
+        &write,
+        &SyscallResult::Return(100),
+        &mut budget
+    ));
+    assert_eq!(budget, 1);
+    assert!(syscall_return_consumes_hot_budget(
+        &read,
+        &SyscallResult::Return(100),
+        &mut budget
+    ));
+    assert_eq!(budget, 64);
+
+    budget = 1;
+    assert!(syscall_return_consumes_hot_budget(
+        &writev,
+        &SyscallResult::Return(100),
+        &mut budget
+    ));
+    assert_eq!(budget, 64);
+
+    budget = 1;
+    assert!(syscall_return_consumes_hot_budget(
+        &readv,
+        &SyscallResult::Return(100),
+        &mut budget
+    ));
+    assert_eq!(budget, 64);
+
+    budget = 1;
+    assert!(!syscall_return_consumes_hot_budget(
+        &pselect,
+        &SyscallResult::Return(1),
+        &mut budget
+    ));
+    assert_eq!(budget, 64);
+
+    budget = 1;
+    assert!(!syscall_return_consumes_hot_budget(
+        &write,
+        &SyscallResult::Error(11),
+        &mut budget
+    ));
+    assert_eq!(budget, 64);
+}
+
+#[test]
+fn positive_direct_futex_wake_needs_wake_handoff_boundary() {
+    let futex_wake = SyscallRequest::new(
+        NR_FUTEX,
+        [0x1000, (FUTEX_WAKE | FUTEX_PRIVATE_FLAG) as u64, 1, 0, 0, 0],
+    );
+    let futex_wake_bitset = SyscallRequest::new(
+        NR_FUTEX,
+        [
+            0x1000,
+            (FUTEX_WAKE_BITSET | FUTEX_PRIVATE_FLAG) as u64,
+            1,
+            0,
+            0,
+            u32::MAX as u64,
+        ],
+    );
+    let futex_wait = SyscallRequest::new(NR_FUTEX, [0x1000, 0, 1, 0, 0, 0]);
+    let clone = SyscallRequest::new(NR_CLONE, [0; 6]);
+
+    assert!(direct_trap_syscall_needs_wake_handoff(
+        &futex_wake,
+        &SyscallResult::Return(1)
+    ));
+    assert!(direct_trap_syscall_needs_wake_handoff(
+        &futex_wake_bitset,
+        &SyscallResult::Return(1)
+    ));
+    assert!(!direct_trap_syscall_needs_wake_handoff(
+        &futex_wake,
+        &SyscallResult::Return(0)
+    ));
+    assert!(!direct_trap_syscall_needs_wake_handoff(
+        &futex_wait,
+        &SyscallResult::Return(0)
+    ));
+    assert!(!direct_trap_syscall_needs_wake_handoff(
+        &clone,
+        &SyscallResult::Return(123)
+    ));
+}
+
+#[test]
+fn getppid_uses_cap_only_immediate_fast_path() {
+    let _guard = setup();
+    let aspace = tx_subsystems::vm::AddressSpace::new_cap_for_platform::<TestPlatform>()
+        .expect("test aspace");
+    let init = tx_subsystems::process::bootstrap_init_process(aspace).expect("bootstrap init");
+    let getppid = SyscallRequest::new(NR_GETPPID, [0; 6]);
+    let write = SyscallRequest::new(NR_WRITE, [0; 6]);
+
+    assert_eq!(
+        dispatch_cap_only_immediate(&getppid, &init),
+        Some(SyscallResult::Return(0))
+    );
+    assert_eq!(dispatch_cap_only_immediate(&write, &init), None);
+}
+
 fn noop_waker() -> Waker {
     Waker::noop().clone()
 }
@@ -252,6 +493,24 @@ fn block_on<F: Future>(mut fut: F) -> F::Output {
 /// `__thread_list_lock`. Parking between those two instructions
 /// leaves sibling threads blocked in `__tl_lock`.
 #[test]
+fn run_thread_future_stays_within_clone_submit_budget() {
+    let _g = setup();
+    let payload = bootstrap_payload();
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS populated post-bootstrap");
+    let leader = init.nth_thread(0).expect("leader");
+
+    let future = run_thread::<TestPlatform>(leader.clone(), payload.clone());
+    let wrapped = PerHartSlotted::<TestPlatform, _>::new(leader, payload, future);
+
+    assert!(
+        core::mem::size_of_val(&wrapped) <= 2048,
+        "run_thread task future grew past the clone-submit budget: {} bytes",
+        core::mem::size_of_val(&wrapped)
+    );
+}
+
+#[test]
 fn futex_wake_return_reenters_userspace_without_mailbox_event() {
     let _g = setup();
     let payload = bootstrap_payload();
@@ -268,8 +527,8 @@ fn futex_wake_return_reenters_userspace_without_mailbox_event() {
     initial_ctx.regs[10] = 99;
     payload.store_saved_user_context(Some(initial_ctx));
 
-    let future = run_thread::<TestPlatform>(leader, payload.clone());
-    let wrapped = PerHartSlotted::<TestPlatform, _>::new(payload.clone(), future);
+    let future = run_thread::<TestPlatform>(leader.clone(), payload.clone());
+    let wrapped = PerHartSlotted::<TestPlatform, _>::new(leader, payload.clone(), future);
     let reactor = crate::adapter::boot_runtime::Reactor::new();
     let _task = reactor.submit_task(wrapped);
 
@@ -296,6 +555,10 @@ fn futex_wake_return_reenters_userspace_without_mailbox_event() {
     let second = reactor.run_until_idle();
     assert_eq!(second.completed, 0);
     assert_eq!(
+        second.polled, 1,
+        "FUTEX_WAKE must return to userspace in the same thread-future poll"
+    );
+    assert_eq!(
         *USERSPACE_A0_LOG.lock().unwrap_or_else(|e| e.into_inner()),
         std::vec![99, 0],
         "FUTEX_WAKE return must be written back and immediately re-enter userspace"
@@ -310,6 +573,9 @@ fn futex_wake_return_reenters_userspace_without_mailbox_event() {
 fn per_hart_slotted_sets_and_clears_slot_around_poll() {
     let _g = setup();
     let payload = bootstrap_payload();
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS populated post-bootstrap");
+    let leader = init.nth_thread(0).expect("leader");
 
     let payload_for_inner = payload.clone();
     let inner = async move {
@@ -323,7 +589,7 @@ fn per_hart_slotted_sets_and_clears_slot_around_poll() {
         );
     };
 
-    let mut wrapped = PerHartSlotted::<TestPlatform, _>::new(payload.clone(), inner);
+    let mut wrapped = PerHartSlotted::<TestPlatform, _>::new(leader, payload.clone(), inner);
 
     // Pre-poll: slot empty.
     assert!(
@@ -355,6 +621,9 @@ fn per_hart_slotted_sets_and_clears_slot_around_poll() {
 fn per_hart_slotted_clears_slot_on_pending_exit() {
     let _g = setup();
     let payload = bootstrap_payload();
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS populated post-bootstrap");
+    let leader = init.nth_thread(0).expect("leader");
 
     // Inner future that returns Pending the first time it's polled.
     struct PendOnce {
@@ -379,7 +648,7 @@ fn per_hart_slotted_clears_slot_on_pending_exit() {
     }
 
     let mut wrapped =
-        PerHartSlotted::<TestPlatform, _>::new(payload.clone(), PendOnce { polled: false });
+        PerHartSlotted::<TestPlatform, _>::new(leader, payload.clone(), PendOnce { polled: false });
     // SAFETY: stack-pinned for the call.
     let mut pinned = unsafe { Pin::new_unchecked(&mut wrapped) };
     let waker = noop_waker();
@@ -402,6 +671,9 @@ fn per_hart_slotted_clears_slot_on_pending_exit() {
 fn per_hart_slotted_binds_current_task_mailbox() {
     let _g = setup();
     let payload = bootstrap_payload();
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS populated post-bootstrap");
+    let leader = init.nth_thread(0).expect("leader");
     assert!(
         payload.mailbox_handle().is_none(),
         "payload starts without a bound task mailbox",
@@ -417,7 +689,7 @@ fn per_hart_slotted_binds_current_task_mailbox() {
             .is_some();
     };
 
-    let wrapped = PerHartSlotted::<TestPlatform, _>::new(payload.clone(), inner);
+    let wrapped = PerHartSlotted::<TestPlatform, _>::new(leader, payload.clone(), inner);
     let reactor = crate::adapter::boot_runtime::Reactor::new();
     let _task = reactor.submit_task(wrapped);
     let result = reactor.run_until_idle();
@@ -822,6 +1094,10 @@ fn thread_future_execve_continues_loop_without_writing_pending_return() {
             payload.store_pending_syscall_return(Some(Ok(v)));
             false
         }
+        SyscallResult::CloneReturn { value, .. } => {
+            payload.store_pending_syscall_return(Some(Ok(value)));
+            false
+        }
         SyscallResult::Error(e) => {
             payload.store_pending_syscall_return(Some(Err(e)));
             false
@@ -829,7 +1105,6 @@ fn thread_future_execve_continues_loop_without_writing_pending_return() {
         SyscallResult::NoReturn => true,
         SyscallResult::ExecCommitted => false,
         SyscallResult::SigreturnRestored => false,
-        SyscallResult::SigreturnContextRestored => false,
     };
 
     assert!(

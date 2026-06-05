@@ -49,6 +49,25 @@ pub use slab::ZoneSlab;
 
 const ZONE_ID_INITIALIZING: usize = usize::MAX;
 
+macro_rules! measure_zone {
+    ($method_name:expr, $zone_ty:ty, $body:block) => {{
+        #[cfg(all(tx_ds_metrics, tx_ds_metrics_zone))]
+        {
+            crate::ds_metrics::measure_for_zone(
+                $method_name,
+                tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(
+                    core::any::type_name::<$zone_ty>().as_bytes(),
+                )),
+                || $body,
+            )
+        }
+        #[cfg(not(all(tx_ds_metrics, tx_ds_metrics_zone)))]
+        {
+            $body
+        }
+    }};
+}
+
 pub struct Zone<T: 'static> {
     /// Lazily assigned registry ID. Zero means not yet assigned.
     id: AtomicUsize,
@@ -143,21 +162,27 @@ impl<T: 'static> Zone<T> {
     pub(crate) fn pop_free_slot(
         &'static self,
     ) -> Result<core::ptr::NonNull<slot::Slot<T>>, ZoneError> {
-        let cpu_pin = runtime::pin_current_cpu()?;
-        let bucket = unsafe { &mut *self.buckets[cpu_pin.cpu_id().0].get() };
-        if let Some(slot) = bucket.pop() {
-            return Ok(slot);
-        }
-        self.keg.refill_bucket(self, bucket)?;
-        bucket.pop().ok_or(ZoneError::AllocationFailed)
+        measure_zone!(b"debug.ds.substrate.zone.pop_free_slot", T, {
+            let cpu_pin = runtime::pin_current_cpu()?;
+            let bucket = unsafe { &mut *self.buckets[cpu_pin.cpu_id().0].get() };
+            if let Some(slot) = bucket.pop() {
+                return Ok(slot);
+            }
+            self.keg.refill_bucket(self, bucket)?;
+            bucket.pop().ok_or(ZoneError::AllocationFailed)
+        })
     }
 
     pub(crate) fn return_slot(&self, slot: core::ptr::NonNull<slot::Slot<T>>) {
-        self.keg.return_slot(slot);
+        measure_zone!(b"debug.ds.substrate.zone.return_slot", T, {
+            self.keg.return_slot(slot);
+        });
     }
 
     pub(crate) fn return_slot_from_reclaim(&self, slot: core::ptr::NonNull<slot::Slot<T>>) {
-        self.keg.return_slot_without_slab_retire(slot);
+        measure_zone!(b"debug.ds.substrate.zone.return_slot_from_reclaim", T, {
+            self.keg.return_slot_without_slab_retire(slot);
+        });
     }
 
     pub(crate) fn trim_empty_slabs(&self, limit: usize) -> usize {
@@ -182,13 +207,17 @@ impl<T: 'static> Zone<T> {
         &'static self,
         bucket: &mut ZoneBucket<T, N>,
     ) -> Result<(), ZoneError> {
-        self.keg.refill_bucket(self, bucket)
+        measure_zone!(b"debug.ds.substrate.zone.refill_bucket", T, {
+            self.keg.refill_bucket(self, bucket)
+        })
     }
 
     pub fn drain_bucket_to_keg<const N: usize>(&self, bucket: &mut ZoneBucket<T, N>) {
-        while let Some(slot) = bucket.pop() {
-            self.keg.return_slot(slot);
-        }
+        measure_zone!(b"debug.ds.substrate.zone.drain_bucket_to_keg", T, {
+            while let Some(slot) = bucket.pop() {
+                self.keg.return_slot(slot);
+            }
+        });
     }
 
     pub(crate) fn init_cpu_bucket(&'static self, cpu: CpuId) -> Result<(), ZoneError> {
@@ -230,7 +259,9 @@ pub unsafe trait ZoneAllocated: Sized + 'static {
 }
 
 pub fn reserve_for<T: ZoneAllocated>() -> Result<ZoneReservation<T>, ZoneError> {
-    reserve(T::zone())
+    measure_zone!(b"debug.ds.substrate.zone.reserve_for", T, {
+        reserve(T::zone())
+    })
 }
 
 pub fn register_zone_for<T: ZoneAllocated>() -> Result<ZoneInfo, ZoneError> {
@@ -241,7 +272,9 @@ pub fn sign_for<T: ZoneAllocated>(reservation: ZoneReservation<T>, value: T) -> 
 where
     T::Policy: CapProducingPolicy,
 {
-    reservation::sign(reservation, value)
+    measure_zone!(b"debug.ds.substrate.zone.sign_for", T, {
+        reservation::sign(reservation, value)
+    })
 }
 
 /// Reserve a zone slot and sign a value into it in one step.
@@ -254,8 +287,10 @@ pub fn sign<T: ZoneAllocated>(value: T) -> Result<Cap<T>, ZoneError>
 where
     T::Policy: CapProducingPolicy,
 {
-    let res = reserve_for::<T>()?;
-    Ok(sign_for(res, value))
+    measure_zone!(b"debug.ds.substrate.zone.sign", T, {
+        let res = reserve_for::<T>()?;
+        Ok(sign_for(res, value))
+    })
 }
 
 pub fn init_ap_for_current_stage(cpu: CpuId) -> Result<(), ZoneError> {

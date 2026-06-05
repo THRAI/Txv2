@@ -28,6 +28,7 @@ use crate::vfs::adapter::step_engine::{
     self, Cap, Deadline, InterestMask, NoProgress, OneShotStepOp, ProcessIdentity, ResumeOutcome,
     ScriptCtx, StepOp, StepOutcome, SubjectIdentity, WaitSourceId, YieldShape,
 };
+use crate::vfs::notification;
 use crate::vfs::walker;
 use crate::vfs::{Credential, DEntry, FsObjectId, InlineName, InodeKind, InodeMeta};
 
@@ -672,7 +673,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for LstatOp<'a> {
                     &__guard,
                 ) {
                     Ok(resolved) => resolved.dentry,
-                    Err(e) => return StepOutcome::err(e),
+                    Err(e) => return StepOutcome::err(e.into()),
                 };
                 self.target = Some(d.clone());
                 d
@@ -988,22 +989,10 @@ impl<I: SubjectIdentity> StepOp<I> for PpollOp {
                 // TimerWheel fire path needs deadline plumbing).
                 // Future: combine OnWaitSource + OnTimer via
                 // composite yield.
-                return StepOutcome::Yield {
-                    progress: NoProgress,
-                    shape: YieldShape::OnWaitSource {
-                        source: self.wait_source_id,
-                        interests: self.interests,
-                    },
-                };
+                return notification::ppoll_wait(self.wait_source_id, self.interests);
             }
             // Infinite timeout — yield and park until the fd fires.
-            return StepOutcome::Yield {
-                progress: NoProgress,
-                shape: YieldShape::OnWaitSource {
-                    source: self.wait_source_id,
-                    interests: self.interests,
-                },
-            };
+            return notification::ppoll_wait(self.wait_source_id, self.interests);
         }
         // Resumed after wake: fd is ready.
         StepOutcome::done(1)

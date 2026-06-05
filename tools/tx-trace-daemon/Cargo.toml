@@ -15,6 +15,9 @@ serde_json = "1"
 thiserror = "2"
 prost = "0.13"
 siphasher = "1"
+memmap2 = "0.9"
+object = "0.39"
+rustc-demangle = "0.1"
 
 [dev-dependencies]
 tempfile = "3"

@@ -197,6 +197,7 @@ fn devfs_lookup_null_materialises_char_device() {
             append: false,
             cloexec: false,
             nonblocking: false,
+            packet: false,
         },
     )
     .expect("null open file");
@@ -245,75 +246,6 @@ fn devfs_lookup_misc_rtc_materialises_char_device() {
         } => assert_eq!(binding.name, "rtc"),
         other => panic!("expected StructBacked::CharDevice, got {other:?}"),
     }
-}
-
-#[test]
-fn devfs_lookup_zero_materialises_char_device() {
-    let _serial = crate::test_support::FS_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    init_tty_zones();
-
-    let guard = guard();
-    let devfs = Devfs::new();
-
-    let obj_id = match <Devfs as FsOps>::lookup(&devfs, DEVFS_ROOT_OBJECT_ID, b"zero", &guard) {
-        V3Outcome::Done(id) => id,
-        other => panic!("devfs.lookup(zero) failed: {other:?}"),
-    };
-    let meta = match <Devfs as FsOps>::load_inode_meta(&devfs, obj_id, &guard) {
-        V3Outcome::Done(meta) => meta,
-        other => panic!("devfs.load_inode_meta(zero) failed: {other:?}"),
-    };
-    assert_eq!(meta.kind(), tx_subsystems::vfs::InodeKind::CharDevice);
-
-    let mount = devfs_mount_payload();
-    let rnode = match <Devfs as FsOps>::materialise_rnode(&devfs, obj_id, meta, &mount, &guard) {
-        V3Outcome::Done(rnode) => rnode,
-        other => panic!("devfs.materialise_rnode(zero) failed: {other:?}"),
-    };
-    match rnode.backing() {
-        RNodeBacking::StructBacked {
-            payload: StructPayload::CharDevice(binding),
-        } => assert_eq!(binding.name, "zero"),
-        other => panic!("expected StructBacked::CharDevice, got {other:?}"),
-    }
-
-    let file = OpenFile::new_cap(
-        rnode,
-        OpenFileFlags {
-            read: true,
-            write: true,
-            append: false,
-            cloexec: false,
-            nonblocking: false,
-        },
-    )
-    .expect("zero open file");
-    let mut out = [0xaa; 4];
-    assert_eq!(file.step_read(&mut out, &guard), V3Outcome::Done(4));
-    assert_eq!(out, [0; 4]);
-}
-
-#[test]
-fn devfs_lookup_null_static_char_device_succeeds() {
-    let _serial = crate::test_support::FS_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    init_tty_zones();
-
-    let guard = guard();
-    let devfs = Devfs::new();
-
-    let obj_id = match <Devfs as FsOps>::lookup(&devfs, DEVFS_ROOT_OBJECT_ID, b"null", &guard) {
-        V3Outcome::Done(id) => id,
-        other => panic!("devfs.lookup(null) failed: {other:?}"),
-    };
-    let meta = match <Devfs as FsOps>::load_inode_meta(&devfs, obj_id, &guard) {
-        V3Outcome::Done(meta) => meta,
-        other => panic!("devfs.load_inode_meta(null) failed: {other:?}"),
-    };
-    assert_eq!(meta.kind(), tx_subsystems::vfs::InodeKind::CharDevice);
 }
 
 #[test]
@@ -614,9 +546,5 @@ fn devfs_readdir_yields_registered_aliases_and_terminates() {
     assert!(
         names.iter().any(|n| n == b"console"),
         "readdir should yield console; got {names:?}"
-    );
-    assert!(
-        names.iter().any(|n| n == b"zero"),
-        "readdir should yield static /dev/zero; got {names:?}"
     );
 }

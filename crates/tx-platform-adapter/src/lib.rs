@@ -50,6 +50,12 @@ struct AdapterArgs {
     apis: Vec<LitStr>,
 }
 
+struct NotificationAdapterArgs {
+    subsystem: LitStr,
+    domain: LitStr,
+    reason: LitStr,
+}
+
 impl Parse for AdapterArgs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let mut platform: Option<LitStr> = None;
@@ -110,6 +116,55 @@ impl Parse for AdapterArgs {
     }
 }
 
+impl Parse for NotificationAdapterArgs {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let mut subsystem: Option<LitStr> = None;
+        let mut domain: Option<LitStr> = None;
+        let mut reason: Option<LitStr> = None;
+
+        while !input.is_empty() {
+            let key: syn::Ident = input.parse()?;
+            input.parse::<Token![=]>()?;
+            match key.to_string().as_str() {
+                "subsystem" => subsystem = Some(parse_dup(&key, "subsystem", subsystem, input)?),
+                "domain" => domain = Some(parse_dup(&key, "domain", domain, input)?),
+                "reason" => reason = Some(parse_dup(&key, "reason", reason, input)?),
+                other => {
+                    return Err(syn::Error::new(
+                        key.span(),
+                        format!(
+                            "unknown key `{other}`; expected `subsystem`, `domain`, or `reason`"
+                        ),
+                    ));
+                }
+            }
+            if !input.is_empty() {
+                input.parse::<Token![,]>()?;
+            }
+        }
+
+        let subsystem = subsystem.ok_or_else(|| {
+            syn::Error::new(Span::call_site(), "missing required `subsystem = \"...\"`")
+        })?;
+        let domain = domain.ok_or_else(|| {
+            syn::Error::new(Span::call_site(), "missing required `domain = \"...\"`")
+        })?;
+        let reason = reason.ok_or_else(|| {
+            syn::Error::new(Span::call_site(), "missing required `reason = \"...\"`")
+        })?;
+
+        validate_subsystem(&subsystem)?;
+        validate_domain(&domain)?;
+        validate_reason(&reason)?;
+
+        Ok(NotificationAdapterArgs {
+            subsystem,
+            domain,
+            reason,
+        })
+    }
+}
+
 fn parse_dup(
     key_ident: &syn::Ident,
     key_name: &str,
@@ -137,6 +192,23 @@ fn validate_platform(p: &LitStr) -> syn::Result<()> {
             KNOWN_PLATFORMS.join(", ")
         ),
     ))
+}
+
+fn validate_subsystem(s: &LitStr) -> syn::Result<()> {
+    let value = s.value();
+    if value.is_empty() {
+        return Err(syn::Error::new(s.span(), "`subsystem` must be non-empty"));
+    }
+    if !value
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    {
+        return Err(syn::Error::new(
+            s.span(),
+            format!("`subsystem = \"{value}\"` must be snake_case (a-z, 0-9, underscore)"),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_domain(d: &LitStr) -> syn::Result<()> {
@@ -209,6 +281,15 @@ fn manifest_string(args: &AdapterArgs) -> String {
     parts.join(";")
 }
 
+fn notification_manifest_string(args: &NotificationAdapterArgs) -> String {
+    [
+        format!("subsystem={}", args.subsystem.value()),
+        format!("domain={}", args.domain.value()),
+        format!("reason={}", args.reason.value()),
+    ]
+    .join(";")
+}
+
 /// Mark a module as the legitimate adapter between an upper subsystem
 /// and a platform crate. See crate-level docs for the contract.
 #[proc_macro_attribute]
@@ -242,6 +323,38 @@ pub fn platform_adapter(attr: TokenStream, item: TokenStream) -> TokenStream {
     let manifest_const: syn::Item = syn::parse_quote! {
         #[doc(hidden)]
         pub const #const_ident: &str = #manifest;
+    };
+
+    let mut injected = Vec::with_capacity(items.len() + 1);
+    injected.push(manifest_const);
+    injected.extend(items);
+    module.content = Some((brace, injected));
+
+    quote!(#module).into()
+}
+
+/// Mark a module as the legitimate semantic notification boundary for
+/// a subsystem. This complements `#[platform_adapter]`: platform adapters
+/// expose raw primitives, while notification adapters expose subsystem
+/// wake meanings.
+#[proc_macro_attribute]
+pub fn notification_adapter(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(attr as NotificationAdapterArgs);
+    let mut module = parse_macro_input!(item as ItemMod);
+
+    let Some((brace, items)) = module.content.take() else {
+        return syn::Error::new_spanned(
+            &module.ident,
+            "#[notification_adapter] requires an inline module `mod x { ... }`, not a declaration `mod x;`",
+        )
+        .to_compile_error()
+        .into();
+    };
+
+    let manifest = notification_manifest_string(&args);
+    let manifest_const: syn::Item = syn::parse_quote! {
+        #[doc(hidden)]
+        pub const __NOTIFICATION_ADAPTER: &str = #manifest;
     };
 
     let mut injected = Vec::with_capacity(items.len() + 1);

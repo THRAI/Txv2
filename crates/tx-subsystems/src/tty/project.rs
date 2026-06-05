@@ -29,7 +29,7 @@ pub struct DevptsInstance;
 /// Resolve a devfs TTY entry such as `ttyS0` or `console`.
 pub fn devfs_tty_by_name(name: &[u8], _guard: &Guard<'_>) -> V3Out<Cap<TtyIdentity>, NoProgress> {
     if name == b"ptmx" {
-        return V3Out::err(Errno::EINVAL);
+        return V3Out::err(Errno::EINVAL.into());
     }
 
     if let Some(index) = parse_tty_s_index(name) {
@@ -42,7 +42,7 @@ pub fn devfs_tty_by_name(name: &[u8], _guard: &Guard<'_>) -> V3Out<Cap<TtyIdenti
         return V3Out::done(alias);
     }
 
-    V3Out::err(Errno::ENOENT)
+    V3Out::err(Errno::ENOENT.into())
 }
 
 /// Snapshot of one devfs alias entry, surfaced to consumers that want to
@@ -107,7 +107,7 @@ pub fn devfs_rnode_by_name(name: &[u8], guard: &Guard<'_>) -> V3Out<Cap<RNode>, 
     let tty = match devfs_tty_by_name(name, guard) {
         V3Out::Done(tty) => tty,
         V3Out::Err(err) => return V3Out::Err(err),
-        _ => return V3Out::err(Errno::EIO),
+        _ => return V3Out::err(Errno::EIO.into()),
     };
     let index = tty.index;
     rnode_for_tty(tty, FsObjectId::new(DEVFS_TTY_OBJECT_BASE + index as u64))
@@ -124,7 +124,7 @@ pub fn open_devfs_tty_by_name(name: &[u8], guard: &Guard<'_>) -> V3Out<Cap<OpenF
     let tty = match devfs_tty_by_name(name, guard) {
         V3Out::Done(tty) => tty,
         V3Out::Err(err) => return V3Out::Err(err),
-        _ => return V3Out::err(Errno::EIO),
+        _ => return V3Out::err(Errno::EIO.into()),
     };
     open_file_for_tty(tty, guard)
 }
@@ -136,7 +136,7 @@ pub fn devpts_slave_by_index(
 ) -> V3Out<Cap<TtyIdentity>, NoProgress> {
     match registry::pty_slave(index) {
         Some(slave) => V3Out::done(slave),
-        None => V3Out::err(Errno::ENOENT),
+        None => V3Out::err(Errno::ENOENT.into()),
     }
 }
 
@@ -145,7 +145,7 @@ pub fn devpts_rnode_by_index(index: u32, guard: &Guard<'_>) -> V3Out<Cap<RNode>,
     let slave = match devpts_slave_by_index(index, guard) {
         V3Out::Done(slave) => slave,
         V3Out::Err(err) => return V3Out::Err(err),
-        _ => return V3Out::err(Errno::EIO),
+        _ => return V3Out::err(Errno::EIO.into()),
     };
     rnode_for_tty(slave, devpts_object_id_for_index(index))
 }
@@ -159,7 +159,7 @@ pub fn open_file_for_tty(
     let rnode = match rnode_for_tty(tty, object_id) {
         V3Out::Done(rnode) => rnode,
         V3Out::Err(err) => return V3Out::Err(err),
-        _ => return V3Out::err(Errno::EIO),
+        _ => return V3Out::err(Errno::EIO.into()),
     };
 
     match OpenFile::new_cap(
@@ -170,10 +170,11 @@ pub fn open_file_for_tty(
             append: false,
             cloexec: false,
             nonblocking: false,
+            packet: false,
         },
     ) {
         Ok(file) => V3Out::done(file),
-        Err(_) => V3Out::err(Errno::EIO),
+        Err(_) => V3Out::err(Errno::EIO.into()),
     }
 }
 
@@ -186,7 +187,7 @@ fn rnode_for_tty(tty: Cap<TtyIdentity>, object_id: FsObjectId) -> V3Out<Cap<RNod
         },
     ) {
         Ok(rnode) => V3Out::done(rnode),
-        Err(_) => V3Out::err(Errno::EIO),
+        Err(_) => V3Out::err(Errno::EIO.into()),
     }
 }
 
@@ -310,7 +311,7 @@ impl FsOps for DevptsInstance {
         _guard: &Guard<'_>,
     ) -> StepOutcome<FsObjectId, NoProgress> {
         if parent != DEVPTS_ROOT_OBJECT_ID {
-            return StepOutcome::err(Errno::ENOENT);
+            return StepOutcome::err(Errno::ENOENT.into());
         }
 
         if name == b"ptmx" {
@@ -318,13 +319,13 @@ impl FsOps for DevptsInstance {
         }
 
         let Some(index) = parse_u32_decimal(name) else {
-            return StepOutcome::err(Errno::ENOENT);
+            return StepOutcome::err(Errno::ENOENT.into());
         };
         if registry::contains_pty_slave(index) {
             return StepOutcome::done(devpts_object_id_for_index(index));
         }
 
-        StepOutcome::err(Errno::ENOENT)
+        StepOutcome::err(Errno::ENOENT.into())
     }
 
     fn load_inode_meta(
@@ -343,7 +344,7 @@ impl FsOps for DevptsInstance {
                 return StepOutcome::done(InodeMeta::new(InodeKind::CharDevice, 0o020620));
             }
         }
-        StepOutcome::err(Errno::ENOENT)
+        StepOutcome::err(Errno::ENOENT.into())
     }
 
     fn serialize_inode_meta(
@@ -352,7 +353,7 @@ impl FsOps for DevptsInstance {
         _meta: &InodeMeta,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS)
+        StepOutcome::err(Errno::EROFS.into())
     }
 
     fn create_inode(
@@ -363,7 +364,7 @@ impl FsOps for DevptsInstance {
         _cred: &Credential,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
-        StepOutcome::err(Errno::EROFS)
+        StepOutcome::err(Errno::EROFS.into())
     }
 
     fn unlink(
@@ -373,7 +374,7 @@ impl FsOps for DevptsInstance {
         _target: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS)
+        StepOutcome::err(Errno::EROFS.into())
     }
 
     fn rename(
@@ -384,7 +385,7 @@ impl FsOps for DevptsInstance {
         _new_name: &[u8],
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS)
+        StepOutcome::err(Errno::EROFS.into())
     }
 
     fn link(
@@ -394,7 +395,7 @@ impl FsOps for DevptsInstance {
         _target: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS)
+        StepOutcome::err(Errno::EROFS.into())
     }
 
     fn mkdir(
@@ -405,7 +406,7 @@ impl FsOps for DevptsInstance {
         _cred: &Credential,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
-        StepOutcome::err(Errno::EROFS)
+        StepOutcome::err(Errno::EROFS.into())
     }
 
     fn rmdir(
@@ -415,7 +416,7 @@ impl FsOps for DevptsInstance {
         _target: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::EROFS)
+        StepOutcome::err(Errno::EROFS.into())
     }
 
     fn symlink(
@@ -426,7 +427,7 @@ impl FsOps for DevptsInstance {
         _cred: &Credential,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
-        StepOutcome::err(Errno::EROFS)
+        StepOutcome::err(Errno::EROFS.into())
     }
 
     fn readdir(
@@ -436,12 +437,12 @@ impl FsOps for DevptsInstance {
         _guard: &Guard<'_>,
     ) -> StepOutcome<Option<(DirEntry, DirCursor)>, NoProgress> {
         if fs_object_id != DEVPTS_ROOT_OBJECT_ID {
-            return StepOutcome::err(Errno::ENOTDIR);
+            return StepOutcome::err(Errno::ENOTDIR.into());
         }
 
         let entries = match devpts_dir_entries() {
             Ok(entries) => entries,
-            Err(err) => return StepOutcome::err(err),
+            Err(err) => return StepOutcome::err(err.into()),
         };
         let index = cursor.as_u64() as usize;
         let Some(entry) = entries.get(index).copied() else {
@@ -463,7 +464,7 @@ impl FsOps for DevptsInstance {
             return StepOutcome::done(());
         }
 
-        StepOutcome::err(Errno::ENOENT)
+        StepOutcome::err(Errno::ENOENT.into())
     }
 
     fn materialise_rnode(
@@ -483,7 +484,7 @@ impl FsOps for DevptsInstance {
                 StepOutcome::Done(o) => o,
                 StepOutcome::Err(e) => return StepOutcome::err(e),
                 StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
-                    return StepOutcome::err(Errno::EIO);
+                    return StepOutcome::err(Errno::EIO.into());
                 }
             };
             match RNode::new_cap_in_mount(
@@ -495,7 +496,7 @@ impl FsOps for DevptsInstance {
                 mount,
             ) {
                 Ok(rnode) => StepOutcome::done(rnode),
-                Err(_) => StepOutcome::err(Errno::ENOMEM),
+                Err(_) => StepOutcome::err(Errno::ENOMEM.into()),
             }
         } else if let Some(index) = pty_index_from_devpts_object_id(fs_object_id) {
             // The devpts pty-slave path still resolves via the
@@ -505,7 +506,7 @@ impl FsOps for DevptsInstance {
             let _ = mount;
             devpts_rnode_by_index(index, guard)
         } else {
-            StepOutcome::err(Errno::ENOSYS)
+            StepOutcome::err(Errno::ENOSYS.into())
         }
     }
 

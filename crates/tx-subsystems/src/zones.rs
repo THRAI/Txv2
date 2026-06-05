@@ -2,9 +2,9 @@ use crate::adapter::step_engine::{epoch, zone, Zone, ZoneAllocated, ZoneError};
 use tx_hal::{console_write_str, TxPlatform};
 
 use crate::{
-    mount::{MountApiFile, MountIdentity, MountNamespace, MountPayload},
+    mount::{MountIdentity, MountNamespace, MountPayload},
     page_backed::PageContainer,
-    vfs::{DEntry, FsNotifyInstance, OpenFile, RNode},
+    vfs::{DEntry, OpenFile, RNode},
     vm::AddressSpace,
 };
 
@@ -28,7 +28,6 @@ pub fn register_all() -> Result<(), ZoneError> {
     vm::register_zones()?;
     page_backed::register_zones()?;
     mount::register_zones()?;
-    net::register_zones()?;
     vfs::register_zones()?;
     tty::register_zones()?;
     pipe::register_zones()?;
@@ -228,16 +227,7 @@ mod mount {
         zone::register_zone_for::<MountIdentity>()?;
         zone::register_zone_for::<MountPayload>()?;
         zone::register_zone_for::<MountNamespace>()?;
-        zone::register_zone_for::<MountApiFile>()?;
         Ok(())
-    }
-}
-
-mod net {
-    use super::*;
-
-    pub(super) fn register_zones() -> Result<(), ZoneError> {
-        crate::net::register_zones()
     }
 }
 
@@ -248,7 +238,6 @@ mod vfs {
         zone::register_zone_for::<DEntry>()?;
         zone::register_zone_for::<RNode>()?;
         zone::register_zone_for::<OpenFile>()?;
-        zone::register_zone_for::<FsNotifyInstance>()?;
         Ok(())
     }
 }

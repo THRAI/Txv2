@@ -34,6 +34,118 @@ impl BlockDeviceImage {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::devfs::adapter::step_engine::{page_allocator, NoProgress};
+    use tx_subsystems::device::{BlockDeviceOps, PhysicalBlockNumber};
+    use tx_subsystems::execution::Guard;
+
+    #[derive(Clone, Copy)]
+    enum BlockingMode {
+        Continue,
+        Yield,
+    }
+
+    struct BlockingBlockDevice {
+        mode: BlockingMode,
+    }
+
+    impl BlockingBlockDevice {
+        const fn new(mode: BlockingMode) -> Self {
+            Self { mode }
+        }
+
+        fn outcome(&self) -> StepOutcome<(), NoProgress> {
+            match self.mode {
+                BlockingMode::Continue => StepOutcome::continue_with(NoProgress),
+                BlockingMode::Yield => StepOutcome::yield_on_wait_source(NoProgress, 43, 0x1),
+            }
+        }
+    }
+
+    impl BlockDeviceOps for BlockingBlockDevice {
+        fn read_blocks(
+            &self,
+            _block_id: PhysicalBlockNumber,
+            _target: &mut [Frame],
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<(), NoProgress> {
+            self.outcome()
+        }
+
+        fn write_blocks(
+            &self,
+            _block_id: PhysicalBlockNumber,
+            _source: &[Frame],
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<(), NoProgress> {
+            self.outcome()
+        }
+
+        fn barrier(&self, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
+            StepOutcome::done(())
+        }
+    }
+
+    impl BlockDevice for BlockingBlockDevice {
+        fn total_blocks(&self) -> u64 {
+            64
+        }
+
+        fn block_size(&self) -> u32 {
+            BLOCK_SIZE as u32
+        }
+    }
+
+    static CONTINUE_DEVICE: BlockingBlockDevice = BlockingBlockDevice::new(BlockingMode::Continue);
+    static YIELD_DEVICE: BlockingBlockDevice = BlockingBlockDevice::new(BlockingMode::Yield);
+
+    fn init_bridge_test() {
+        tx_test_support::init_host();
+        match page_allocator::claim_zero_frame() {
+            Ok(_) | Err(page_allocator::AllocError::AlreadyInstalled) => {}
+            Err(error) => panic!("claim zero frame for FAT bridge tests: {error:?}"),
+        }
+    }
+
+    #[test]
+    fn fat_bridge_maps_retrying_read_to_would_block() {
+        let _serial = crate::test_support::FS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        init_bridge_test();
+        let mut out = [0u8; BLOCK_SIZE];
+
+        assert_eq!(
+            BlockDeviceImage::new(&CONTINUE_DEVICE).read_block(0, &mut out),
+            Err(FatFormatError::WouldBlock)
+        );
+        assert_eq!(
+            BlockDeviceImage::new(&YIELD_DEVICE).read_block(0, &mut out),
+            Err(FatFormatError::WouldBlock)
+        );
+    }
+
+    #[test]
+    fn fat_bridge_maps_retrying_write_to_would_block() {
+        let _serial = crate::test_support::FS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        init_bridge_test();
+        let data = [0x5au8; BLOCK_SIZE];
+
+        assert_eq!(
+            BlockDeviceImage::new(&CONTINUE_DEVICE).write_block(0, &data),
+            Err(FatFormatError::WouldBlock)
+        );
+        assert_eq!(
+            BlockDeviceImage::new(&YIELD_DEVICE).write_block(0, &data),
+            Err(FatFormatError::WouldBlock)
+        );
+    }
+}
+
 impl BlockImage for BlockDeviceImage {
     fn total_blocks(&self) -> u64 {
         let Some(spb) = self.sectors_per_fat_block() else {
@@ -63,7 +175,10 @@ impl BlockImage for BlockDeviceImage {
         drop(guard);
         match outcome {
             StepOutcome::Done(()) => {}
-            _ => return Err(FatFormatError::IO),
+            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
+                return Err(FatFormatError::WouldBlock);
+            }
+            StepOutcome::Err(_) => return Err(FatFormatError::IO),
         }
 
         let src = page_allocator::frame_kernel_addr(ppn).map_err(|_| FatFormatError::IO)?;
@@ -107,7 +222,10 @@ impl BlockImage for BlockDeviceImage {
         drop(run);
         match outcome {
             StepOutcome::Done(()) => Ok(()),
-            _ => Err(FatFormatError::IO),
+            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
+                Err(FatFormatError::WouldBlock)
+            }
+            StepOutcome::Err(_) => Err(FatFormatError::IO),
         }
     }
 }

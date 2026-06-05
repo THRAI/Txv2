@@ -42,7 +42,7 @@ pub fn step_hangup(
         })
         .and_then(|session| session.leader_pgrp_cap_with_guard(guard));
     if !tty.is_live() {
-        return V3::Err(Errno::EIO);
+        return V3::Err(Errno::EIO.into());
     }
 
     if binding.is_some() {

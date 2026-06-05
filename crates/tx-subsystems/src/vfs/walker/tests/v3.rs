@@ -10,9 +10,12 @@
 use alloc::boxed::Box;
 
 use crate::execution::Guard;
-use crate::page_backed::Frame;
-use crate::vfs::adapter::step_engine::{guard, Errno, NoProgress, StepOutcome};
-use crate::vfs::structure::{Credential, DirCursor, DirEntry, FsObjectId, InodeKind, InodeMeta};
+use crate::mount::MountPayload;
+use crate::page_backed::{AnonSwapPolicy, Frame, PageContainer, PageContainerKind};
+use crate::vfs::adapter::step_engine::{guard, Cap, Errno, NoProgress, StepOutcome};
+use crate::vfs::structure::{
+    Credential, DirCursor, DirEntry, FsObjectId, InodeKind, InodeMeta, RNode, RNodeBacking,
+};
 
 use super::TestFs;
 
@@ -23,7 +26,19 @@ impl crate::vfs::FsOps for TestFs {
         name: &[u8],
         _guard: &Guard<'_>,
     ) -> StepOutcome<FsObjectId, NoProgress> {
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
+        inner.lookup_count += 1;
+        if matches!(
+            inner.next_lookup_yield.as_ref(),
+            Some(yield_point) if yield_point.parent == parent && yield_point.name.as_slice() == name
+        ) {
+            let yield_point = inner.next_lookup_yield.take().expect("yield point");
+            return StepOutcome::yield_on_wait_source(
+                NoProgress,
+                yield_point.source_id,
+                yield_point.interests,
+            );
+        }
         let Some(map) = inner.children.get(&parent) else {
             return StepOutcome::err(Errno::ENOTDIR);
         };
@@ -38,7 +53,19 @@ impl crate::vfs::FsOps for TestFs {
         fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<InodeMeta, NoProgress> {
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
+        inner.load_meta_count += 1;
+        if matches!(
+            inner.next_load_meta_yield.as_ref(),
+            Some(yield_point) if yield_point.fs_object_id == fs_object_id
+        ) {
+            let yield_point = inner.next_load_meta_yield.take().expect("yield point");
+            return StepOutcome::yield_on_wait_source(
+                NoProgress,
+                yield_point.source_id,
+                yield_point.interests,
+            );
+        }
         let Some((kind, _, mode_low, uid, gid)) = inner.inodes.get(&fs_object_id) else {
             return StepOutcome::err(Errno::ENOENT);
         };
@@ -156,13 +183,66 @@ impl crate::vfs::FsOps for TestFs {
         fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<Box<[u8]>, NoProgress> {
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
+        inner.read_link_count += 1;
+        if matches!(
+            inner.next_read_link_yield.as_ref(),
+            Some(yield_point) if yield_point.fs_object_id == fs_object_id
+        ) {
+            let yield_point = inner.next_read_link_yield.take().expect("yield point");
+            return StepOutcome::yield_on_wait_source(
+                NoProgress,
+                yield_point.source_id,
+                yield_point.interests,
+            );
+        }
         match inner.inodes.get(&fs_object_id) {
             Some((InodeKind::Symlink, Some(target), _, _, _)) => {
                 StepOutcome::done(target.clone().into_boxed_slice())
             }
             Some(_) => StepOutcome::err(Errno::EINVAL),
             None => StepOutcome::err(Errno::ENOENT),
+        }
+    }
+
+    fn materialise_rnode(
+        &self,
+        fs_object_id: FsObjectId,
+        meta: InodeMeta,
+        mount: &Cap<MountPayload>,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<Cap<RNode>, NoProgress> {
+        {
+            let mut inner = self.inner.lock();
+            inner.materialise_count += 1;
+            if matches!(
+                inner.next_materialise_yield.as_ref(),
+                Some(yield_point) if yield_point.fs_object_id == fs_object_id
+            ) {
+                let yield_point = inner.next_materialise_yield.take().expect("yield point");
+                return StepOutcome::yield_on_wait_source(
+                    NoProgress,
+                    yield_point.source_id,
+                    yield_point.interests,
+                );
+            }
+        }
+        if meta.kind() != InodeKind::Regular {
+            return StepOutcome::err(Errno::ENOSYS);
+        }
+
+        let pc = match PageContainer::new_cap(
+            PageContainerKind::Anon {
+                swap_policy: AnonSwapPolicy::Persistent,
+            },
+            1,
+        ) {
+            Ok(pc) => pc,
+            Err(_) => return StepOutcome::err(Errno::ENOMEM),
+        };
+        match RNode::new_cap_in_mount(fs_object_id, meta, RNodeBacking::PageBacked { pc }, mount) {
+            Ok(rnode) => StepOutcome::done(rnode),
+            Err(_) => StepOutcome::err(Errno::ENOMEM),
         }
     }
 }

@@ -14,4 +14,5 @@ pub enum Ext4FormatError {
     OutOfBounds,
     Truncated,
     Unsupported,
+    WouldBlock,
 }

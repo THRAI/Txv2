@@ -162,6 +162,12 @@ impl<'a, A: PageAllocator> OwnedFrame<'a, A> {
         Ok(DmaPin::new(self.allocator, self.ppn))
     }
 
+    /// Acquire user-page-transfer evidence for this live frame.
+    pub fn try_gift_pin(&self) -> Result<GiftPin<'a, A>, AllocError> {
+        self.allocator.acquire_gift_pin(self.ppn)?;
+        Ok(GiftPin::new(self.allocator, self.ppn))
+    }
+
     /// Transfer ownership to pmap page-table storage.
     ///
     /// The returned `PtFrame` must be released through pmap teardown, not by
@@ -460,6 +466,14 @@ role_pin!(
     /// all other owner and role counters are also zero.
     DmaPin,
     release_dma_pin
+);
+role_pin!(
+    /// Evidence that a VM user-page gift transfer may still reference a frame.
+    ///
+    /// Dropping the token decrements retained `refcount`; the frame is freed
+    /// only when all other owner and role counters are also zero.
+    GiftPin,
+    release_gift_pin
 );
 
 /// Pmap-owned page-table frame.

@@ -18,7 +18,6 @@ static TEST_ROOT_ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 static TEST_ROOT_RELEASES: AtomicUsize = AtomicUsize::new(0);
 static TEST_PMAP_ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 static TEST_PMAP_RELEASES: AtomicUsize = AtomicUsize::new(0);
-static TEST_MANY_PT_RELEASES: AtomicUsize = AtomicUsize::new(0);
 static TEST_TIMER_TRAPS: AtomicUsize = AtomicUsize::new(0);
 static TEST_SYSCALL_TRAPS: AtomicUsize = AtomicUsize::new(0);
 static TEST_IRQ_DISPATCHES: AtomicUsize = AtomicUsize::new(0);
@@ -1272,26 +1271,6 @@ fn pt_node_allocator_handoff_is_one_shot_and_releases_typed_frames() {
     reset_pt_node_allocator_for_test();
 }
 
-#[test]
-fn committed_pt_node_registry_scales_past_boot_pool_sized_loads() {
-    let _guard = lock_test_pmap_state();
-    reset_la64_committed_pt_nodes_for_test();
-    TEST_MANY_PT_RELEASES.store(0, Ordering::Release);
-
-    const NODES: usize = 300;
-    for index in 0..NODES {
-        let phys = PhysAddr(0x0100_0000 + index * Platform::PAGE_SIZE);
-        register_la64_committed_pt_node(PtNode::typed_frame(phys, test_many_pt_release));
-    }
-
-    for index in 0..NODES {
-        let phys = PhysAddr(0x0100_0000 + index * Platform::PAGE_SIZE);
-        let node = take_la64_committed_pt_node(phys).expect("registered PT node");
-        Platform::free_pt_node(node);
-    }
-    assert_eq!(TEST_MANY_PT_RELEASES.load(Ordering::Acquire), NODES);
-}
-
 fn test_pt_allocator() -> Result<PtNode, AllocError> {
     TEST_PT_ALLOCATIONS.fetch_add(1, Ordering::AcqRel);
     Ok(PtNode::typed_frame(PhysAddr(0x0040_0000), test_pt_release))
@@ -1300,10 +1279,6 @@ fn test_pt_allocator() -> Result<PtNode, AllocError> {
 unsafe fn test_pt_release(phys: PhysAddr) {
     assert_eq!(phys, PhysAddr(0x0040_0000));
     TEST_PT_RELEASES.fetch_add(1, Ordering::AcqRel);
-}
-
-unsafe fn test_many_pt_release(_phys: PhysAddr) {
-    TEST_MANY_PT_RELEASES.fetch_add(1, Ordering::AcqRel);
 }
 
 fn test_root_allocator() -> Result<PtNode, AllocError> {

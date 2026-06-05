@@ -1,6 +1,6 @@
 use tx_reactor::{
-    HartId, InitialSchedMeta, Phase1QueueKind, Phase1Scheduler, SchedulerAffinityError,
-    SliceConfig, StopReason, TaskHandle, TaskId, TaskRunOwner, WakeHint,
+    HartId, InitialSchedMeta, Phase1QueueKind, Phase1Scheduler, QueuedTaskReport,
+    SchedulerAffinityError, SliceConfig, StopReason, TaskHandle, TaskId, TaskRunOwner, WakeHint,
 };
 
 fn submit_fair(scheduler: &mut Phase1Scheduler, raw: usize) -> TaskId {
@@ -44,6 +44,7 @@ fn submitted_fair_task_enters_new_queue_once() {
 
     let depths = scheduler.queue_depths(HartId(0));
     assert_eq!(depths.kernel, 0);
+    assert_eq!(depths.boosted, 0);
     assert_eq!(depths.new, 1);
     assert_eq!(depths.preempted, 0);
     assert!(scheduler.is_queued(task));
@@ -95,8 +96,40 @@ fn submitted_task_can_start_in_preempted_queue() {
     );
 
     let depths = scheduler.queue_depths(HartId(0));
+    assert_eq!(depths.boosted, 0);
     assert_eq!(depths.new, 0);
     assert_eq!(depths.preempted, 1);
+    assert_eq!(
+        scheduler.task_owner(task),
+        Some(TaskRunOwner::Queued {
+            hart: HartId(0),
+            queue: Phase1QueueKind::Preempted,
+        })
+    );
+}
+
+#[test]
+fn submitted_task_reports_queue_and_turn_at_publish_point() {
+    let mut scheduler = Phase1Scheduler::new();
+    let task = TaskId(73);
+
+    let report = scheduler.task_submitted_report(
+        task,
+        TaskHandle::new(task),
+        InitialSchedMeta::fair()
+            .userspace_thread()
+            .preempted_on_submit(),
+    );
+
+    assert_eq!(
+        report,
+        QueuedTaskReport {
+            task,
+            hart: HartId(0),
+            queue: Phase1QueueKind::Preempted,
+            queued_turn: 0,
+        }
+    );
     assert_eq!(
         scheduler.task_owner(task),
         Some(TaskRunOwner::Queued {
@@ -136,6 +169,53 @@ fn submitted_movable_fair_tasks_spread_across_allowed_harts() {
     assert_eq!(
         pick_id_and_slice(&mut scheduler, HartId(2)).map(|x| x.0),
         Some(third)
+    );
+}
+
+#[test]
+fn pinned_spread_on_submit_uses_initial_spread_without_enabling_steal() {
+    let mut scheduler = Phase1Scheduler::new();
+    let first = TaskId(240);
+    let second = TaskId(241);
+
+    for task in [first, second] {
+        scheduler.task_submitted(
+            task,
+            TaskHandle::new(task),
+            InitialSchedMeta::fair()
+                .with_affinity(0b0011)
+                .pinned()
+                .spread_on_submit()
+                .userspace_thread(),
+        );
+        assert!(!scheduler.can_migrate(task));
+    }
+
+    assert_eq!(scheduler.queue_depths(HartId(0)).new, 1);
+    assert_eq!(scheduler.queue_depths(HartId(1)).new, 1);
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(first)
+    );
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(1)).map(|x| x.0),
+        Some(second)
+    );
+
+    scheduler.task_stopped(
+        second,
+        StopReason::SliceExpired,
+        Phase1Scheduler::NEW_QUEUE_SLICE_NS,
+        HartId(1),
+    );
+
+    assert_eq!(scheduler.try_steal(HartId(0), HartId(1)), None);
+    assert_eq!(
+        scheduler.task_owner(second),
+        Some(TaskRunOwner::Queued {
+            hart: HartId(1),
+            queue: Phase1QueueKind::Preempted,
+        })
     );
 }
 
@@ -213,6 +293,7 @@ fn yielded_fair_task_resets_budget_and_requeues_with_fresh_preempted_slice() {
 
     let depths = scheduler.queue_depths(HartId(0));
     assert_eq!(depths.kernel, 0);
+    assert_eq!(depths.boosted, 0);
     assert_eq!(depths.new, 0);
     assert_eq!(depths.preempted, 1);
     assert_eq!(scheduler.remaining_budget_ns(task), Some(0));
@@ -225,42 +306,6 @@ fn yielded_fair_task_resets_budget_and_requeues_with_fresh_preempted_slice() {
                 slice_ns: Phase1Scheduler::PREEMPTED_QUEUE_SLICE_NS,
             },
         ))
-    );
-}
-
-#[test]
-fn yielded_userspace_thread_requeues_at_new_tail_behind_peer() {
-    let mut scheduler = Phase1Scheduler::new();
-    let userspace = TaskId(31);
-    scheduler.task_submitted(
-        userspace,
-        TaskHandle::new(userspace),
-        InitialSchedMeta::fair().userspace_thread(),
-    );
-    let peer = submit_fair(&mut scheduler, 32);
-
-    assert_eq!(
-        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
-        Some(userspace)
-    );
-    scheduler.task_stopped(userspace, StopReason::Yielded, 250_000, HartId(0));
-
-    assert_eq!(
-        scheduler.task_owner(userspace),
-        Some(TaskRunOwner::Queued {
-            hart: HartId(0),
-            queue: Phase1QueueKind::New,
-        })
-    );
-    assert_eq!(scheduler.queue_depths(HartId(0)).new, 2);
-    assert_eq!(scheduler.queue_depths(HartId(0)).preempted, 0);
-    assert_eq!(
-        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
-        Some(peer)
-    );
-    assert_eq!(
-        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
-        Some(userspace)
     );
 }
 
@@ -278,6 +323,7 @@ fn yielded_kernel_task_stays_cooperative() {
 
     let depths = scheduler.queue_depths(HartId(0));
     assert_eq!(depths.kernel, 1);
+    assert_eq!(depths.boosted, 0);
     assert_eq!(depths.new, 0);
     assert_eq!(depths.preempted, 0);
     assert_eq!(scheduler.remaining_budget_ns(task), Some(0));
@@ -315,6 +361,7 @@ fn blocked_task_preserves_remaining_budget_until_wake() {
     scheduler.task_runnable(task, WakeHint::PriorityBoost);
 
     let depths = scheduler.queue_depths(HartId(0));
+    assert_eq!(depths.boosted, 0);
     assert_eq!(depths.new, 0);
     assert_eq!(depths.preempted, 1);
     assert_eq!(
@@ -327,49 +374,6 @@ fn blocked_task_preserves_remaining_budget_until_wake() {
         ))
     );
     assert_eq!(pick_id_and_slice(&mut scheduler, HartId(0)), None);
-}
-
-#[test]
-fn blocked_userspace_thread_wakes_through_new_queue_even_with_remaining_budget() {
-    let mut scheduler = Phase1Scheduler::new();
-    let task = TaskId(72);
-    scheduler.task_submitted(
-        task,
-        TaskHandle::new(task),
-        InitialSchedMeta::fair().userspace_thread(),
-    );
-    let preempted = TaskId(73);
-    scheduler.task_submitted(
-        preempted,
-        TaskHandle::new(preempted),
-        InitialSchedMeta::fair().preempted_on_submit(),
-    );
-
-    assert_eq!(
-        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
-        Some(task)
-    );
-    scheduler.task_stopped(task, StopReason::Blocked, 100_000, HartId(0));
-    assert_eq!(
-        scheduler.remaining_budget_ns(task),
-        Some(Phase1Scheduler::NEW_QUEUE_SLICE_NS - 100_000)
-    );
-
-    scheduler.task_runnable(task, WakeHint::Normal);
-
-    assert_eq!(
-        scheduler.task_owner(task),
-        Some(TaskRunOwner::Queued {
-            hart: HartId(0),
-            queue: Phase1QueueKind::New,
-        })
-    );
-    assert_eq!(scheduler.queue_depths(HartId(0)).new, 1);
-    assert_eq!(scheduler.queue_depths(HartId(0)).preempted, 1);
-    assert_eq!(
-        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
-        Some(task)
-    );
 }
 
 #[test]
@@ -389,6 +393,7 @@ fn blocked_task_with_exhausted_budget_wakes_as_new() {
     scheduler.task_runnable(task, WakeHint::Normal);
 
     let depths = scheduler.queue_depths(HartId(0));
+    assert_eq!(depths.boosted, 0);
     assert_eq!(depths.new, 1);
     assert_eq!(depths.preempted, 0);
     assert_eq!(
@@ -403,7 +408,7 @@ fn blocked_task_with_exhausted_budget_wakes_as_new() {
 }
 
 #[test]
-fn userspace_trap_preserves_remaining_budget_at_front() {
+fn userspace_trap_preserves_remaining_budget_behind_new_tasks() {
     let mut scheduler = Phase1Scheduler::new();
     let first = submit_fair(&mut scheduler, 5);
     let second = submit_fair(&mut scheduler, 6);
@@ -425,7 +430,12 @@ fn userspace_trap_preserves_remaining_budget_at_front() {
     scheduler.task_stopped(second, StopReason::UserspaceTrap, 200_000, HartId(0));
 
     let remaining = Phase1Scheduler::NEW_QUEUE_SLICE_NS - 200_000;
+    let new_peer = submit_fair(&mut scheduler, 60);
     assert_eq!(scheduler.remaining_budget_ns(second), Some(remaining));
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(new_peer)
+    );
     assert_eq!(
         pick_id_and_slice(&mut scheduler, HartId(0)),
         Some((
@@ -463,7 +473,7 @@ fn userspace_trap_without_remaining_budget_requeues_with_fresh_slice() {
 }
 
 #[test]
-fn userspace_thread_trap_requeues_at_front_even_after_budget_exhaustion() {
+fn userspace_thread_trap_with_budget_yields_to_new_peers() {
     let mut scheduler = Phase1Scheduler::new();
     let userspace = TaskId(70);
     scheduler.task_submitted(
@@ -477,20 +487,415 @@ fn userspace_thread_trap_requeues_at_front_even_after_budget_exhaustion() {
         pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
         Some(userspace)
     );
-    scheduler.task_stopped(
+    let new_peer = submit_fair(&mut scheduler, 72);
+    scheduler.task_stopped(userspace, StopReason::UserspaceTrap, 200_000, HartId(0));
+
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(peer)
+    );
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(new_peer)
+    );
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(userspace)
+    );
+}
+
+#[test]
+fn userspace_thread_trap_with_budget_stays_behind_preempted_peer() {
+    let mut scheduler = Phase1Scheduler::new();
+    let current = TaskId(80);
+    scheduler.task_submitted(
+        current,
+        TaskHandle::new(current),
+        InitialSchedMeta::fair().userspace_thread(),
+    );
+
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(current)
+    );
+
+    let peer = TaskId(81);
+    scheduler.task_submitted(
+        peer,
+        TaskHandle::new(peer),
+        InitialSchedMeta::fair()
+            .userspace_thread()
+            .preempted_on_submit(),
+    );
+    scheduler.task_stopped(current, StopReason::UserspaceTrap, 200_000, HartId(0));
+
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(peer)
+    );
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(current)
+    );
+}
+
+#[test]
+fn userspace_thread_normal_wake_with_budget_queues_behind_preempted_peers() {
+    let mut scheduler = Phase1Scheduler::new();
+    let userspace = TaskId(73);
+    scheduler.task_submitted(
         userspace,
-        StopReason::UserspaceTrap,
-        Phase1Scheduler::NEW_QUEUE_SLICE_NS,
-        HartId(0),
+        TaskHandle::new(userspace),
+        InitialSchedMeta::fair().userspace_thread(),
     );
 
     assert_eq!(
         pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
         Some(userspace)
     );
+    scheduler.task_stopped(userspace, StopReason::Blocked, 200_000, HartId(0));
+
+    let child = TaskId(74);
+    scheduler.task_submitted(
+        child,
+        TaskHandle::new(child),
+        InitialSchedMeta::fair()
+            .userspace_thread()
+            .preempted_on_submit(),
+    );
+    scheduler.task_runnable(userspace, WakeHint::Normal);
+
     assert_eq!(
         pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
-        Some(peer)
+        Some(child)
+    );
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(userspace)
+    );
+}
+
+#[test]
+fn userspace_thread_normal_wake_beats_aged_preempted_storm() {
+    let mut scheduler = Phase1Scheduler::new();
+    let sleeper = TaskId(82);
+    scheduler.task_submitted(
+        sleeper,
+        TaskHandle::new(sleeper),
+        InitialSchedMeta::fair().userspace_thread(),
+    );
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(sleeper)
+    );
+    scheduler.task_stopped(sleeper, StopReason::Blocked, 200_000, HartId(0));
+
+    let workers = [TaskId(83), TaskId(84), TaskId(85)];
+    for worker in workers {
+        scheduler.task_submitted(
+            worker,
+            TaskHandle::new(worker),
+            InitialSchedMeta::fair()
+                .userspace_thread()
+                .preempted_on_submit(),
+        );
+    }
+    for raw in 86..94 {
+        let kernel = submit_kernel(&mut scheduler, raw);
+        assert_eq!(
+            pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+            Some(kernel)
+        );
+    }
+
+    scheduler.task_runnable(sleeper, WakeHint::Normal);
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(workers[0])
+    );
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(sleeper)
+    );
+}
+
+#[test]
+fn userspace_thread_normal_wake_beats_unaged_preempted_storm_after_one_peer() {
+    let mut scheduler = Phase1Scheduler::new();
+    let sleeper = TaskId(94);
+    scheduler.task_submitted(
+        sleeper,
+        TaskHandle::new(sleeper),
+        InitialSchedMeta::fair().userspace_thread(),
+    );
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(sleeper)
+    );
+    scheduler.task_stopped(sleeper, StopReason::Blocked, 200_000, HartId(0));
+
+    let workers = [TaskId(95), TaskId(96), TaskId(97)];
+    for worker in workers {
+        scheduler.task_submitted(
+            worker,
+            TaskHandle::new(worker),
+            InitialSchedMeta::fair()
+                .userspace_thread()
+                .preempted_on_submit(),
+        );
+    }
+
+    scheduler.task_runnable(sleeper, WakeHint::Normal);
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(workers[0])
+    );
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(sleeper)
+    );
+}
+
+#[test]
+fn wake_handoff_fronts_userspace_waiter_without_boosting() {
+    let mut scheduler = Phase1Scheduler::new();
+    let waiter = TaskId(75);
+    scheduler.task_submitted(
+        waiter,
+        TaskHandle::new(waiter),
+        InitialSchedMeta::fair().userspace_thread(),
+    );
+
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(waiter)
+    );
+    scheduler.task_stopped(waiter, StopReason::Blocked, 200_000, HartId(0));
+
+    let current_parent = TaskId(76);
+    scheduler.task_submitted(
+        current_parent,
+        TaskHandle::new(current_parent),
+        InitialSchedMeta::fair().userspace_thread(),
+    );
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(current_parent)
+    );
+    scheduler.task_stopped(
+        current_parent,
+        StopReason::UserspaceTrap,
+        200_000,
+        HartId(0),
+    );
+
+    scheduler.task_runnable(waiter, WakeHint::WakeHandoff);
+
+    let depths = scheduler.queue_depths(HartId(0));
+    assert_eq!(depths.boosted, 0);
+    assert_eq!(depths.preempted, 2);
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(waiter)
+    );
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(current_parent)
+    );
+}
+
+#[test]
+fn lifecycle_priority_and_signal_wakes_enter_boosted_queue() {
+    let mut scheduler = Phase1Scheduler::new();
+    let lifecycle = TaskId(77);
+    let priority = TaskId(78);
+    let signal = TaskId(79);
+
+    for task in [lifecycle, priority, signal] {
+        scheduler.task_submitted(
+            task,
+            TaskHandle::new(task),
+            InitialSchedMeta::fair().userspace_thread(),
+        );
+        assert_eq!(
+            pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+            Some(task)
+        );
+        scheduler.task_stopped(task, StopReason::Blocked, 100_000, HartId(0));
+    }
+
+    scheduler.task_runnable(lifecycle, WakeHint::LifecycleWake);
+    scheduler.task_runnable(priority, WakeHint::PriorityBoost);
+    scheduler.task_runnable(signal, WakeHint::SignalDelivery);
+
+    let depths = scheduler.queue_depths(HartId(0));
+    assert_eq!(depths.boosted, 3);
+    assert_eq!(depths.new, 0);
+    assert_eq!(depths.preempted, 0);
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(lifecycle)
+    );
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(priority)
+    );
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(signal)
+    );
+}
+
+#[test]
+fn lifecycle_wake_places_joiner_on_waker_hart_when_affine() {
+    let mut scheduler = Phase1Scheduler::new();
+    let joiner = TaskId(801);
+
+    scheduler.task_submitted(
+        joiner,
+        TaskHandle::new(joiner),
+        InitialSchedMeta::fair()
+            .userspace_thread()
+            .movable()
+            .with_affinity(0b11),
+    );
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(joiner)
+    );
+    scheduler.task_stopped(joiner, StopReason::Blocked, 100_000, HartId(0));
+
+    let placement = scheduler
+        .task_runnable_from(joiner, WakeHint::LifecycleWake, HartId(1))
+        .expect("lifecycle wake should place parked joiner");
+
+    assert_eq!(
+        placement.target_hart,
+        HartId(1),
+        "lifecycle wake should resume on the exiting thread's hart"
+    );
+    assert!(
+        !placement.wake_remote,
+        "sync-affine lifecycle wake should use the same-hart handoff path"
+    );
+    let depths = scheduler.queue_depths(HartId(1));
+    assert_eq!(depths.boosted, 1);
+    assert_eq!(
+        scheduler.task_owner(joiner),
+        Some(TaskRunOwner::Queued {
+            hart: HartId(1),
+            queue: Phase1QueueKind::Boosted,
+        })
+    );
+}
+
+#[test]
+fn lifecycle_wake_respects_pinned_joiner_affinity() {
+    let mut scheduler = Phase1Scheduler::new();
+    let joiner = TaskId(802);
+
+    scheduler.task_submitted(
+        joiner,
+        TaskHandle::new(joiner),
+        InitialSchedMeta::fair()
+            .userspace_thread()
+            .pinned()
+            .with_affinity(0b01),
+    );
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(joiner)
+    );
+    scheduler.task_stopped(joiner, StopReason::Blocked, 100_000, HartId(0));
+
+    let placement = scheduler
+        .task_runnable_from(joiner, WakeHint::LifecycleWake, HartId(1))
+        .expect("lifecycle wake should place pinned joiner");
+
+    assert_eq!(placement.target_hart, HartId(0));
+    assert!(placement.wake_remote);
+    assert_eq!(
+        scheduler.task_owner(joiner),
+        Some(TaskRunOwner::Queued {
+            hart: HartId(0),
+            queue: Phase1QueueKind::Boosted,
+        })
+    );
+}
+
+#[test]
+fn aged_preempted_task_beats_new_after_eight_scheduler_turns() {
+    let mut scheduler = Phase1Scheduler::new();
+    let aged = submit_fair(&mut scheduler, 80);
+
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(aged)
+    );
+    scheduler.task_stopped(
+        aged,
+        StopReason::SliceExpired,
+        Phase1Scheduler::NEW_QUEUE_SLICE_NS,
+        HartId(0),
+    );
+
+    for raw in 81..89 {
+        let kernel = submit_kernel(&mut scheduler, raw);
+        assert_eq!(
+            pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+            Some(kernel)
+        );
+    }
+
+    let new_peer = submit_fair(&mut scheduler, 89);
+    let depths = scheduler.queue_depths(HartId(0));
+    assert_eq!(depths.preempted, 1);
+    assert_eq!(depths.new, 1);
+
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(aged)
+    );
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(new_peer)
+    );
+}
+
+#[test]
+fn aged_preempted_tasks_do_not_starve_new_queue() {
+    let mut scheduler = Phase1Scheduler::new();
+    let aged_tasks = [TaskId(90), TaskId(91), TaskId(92)];
+    for task in aged_tasks {
+        scheduler.task_submitted(
+            task,
+            TaskHandle::new(task),
+            InitialSchedMeta::fair()
+                .userspace_thread()
+                .preempted_on_submit(),
+        );
+    }
+
+    for raw in 93..101 {
+        let kernel = submit_kernel(&mut scheduler, raw);
+        assert_eq!(
+            pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+            Some(kernel)
+        );
+    }
+
+    let new_peer = submit_fair(&mut scheduler, 101);
+    let depths = scheduler.queue_depths(HartId(0));
+    assert_eq!(depths.preempted, aged_tasks.len());
+    assert_eq!(depths.new, 1);
+
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(aged_tasks[0])
+    );
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(new_peer)
     );
 }
 
@@ -528,7 +933,7 @@ fn slice_expired_resets_budget_and_moves_to_preempted_back() {
 }
 
 #[test]
-fn external_preemption_preserves_remaining_budget_at_back() {
+fn external_preemption_preserves_remaining_budget_at_front() {
     let mut scheduler = Phase1Scheduler::new();
     let first = submit_fair(&mut scheduler, 10);
     let second = submit_fair(&mut scheduler, 11);
@@ -554,15 +959,6 @@ fn external_preemption_preserves_remaining_budget_at_back() {
     assert_eq!(
         pick_id_and_slice(&mut scheduler, HartId(0)),
         Some((
-            first,
-            SliceConfig::Preemptive {
-                slice_ns: Phase1Scheduler::PREEMPTED_QUEUE_SLICE_NS,
-            }
-        ))
-    );
-    assert_eq!(
-        pick_id_and_slice(&mut scheduler, HartId(0)),
-        Some((
             second,
             SliceConfig::Preemptive {
                 slice_ns: remaining
@@ -585,6 +981,7 @@ fn duplicate_runnable_notifications_do_not_duplicate_preempted_entry() {
     scheduler.task_runnable(task, WakeHint::None);
 
     let depths = scheduler.queue_depths(HartId(0));
+    assert_eq!(depths.boosted, 0);
     assert_eq!(depths.new, 0);
     assert_eq!(depths.preempted, 1);
     assert_eq!(

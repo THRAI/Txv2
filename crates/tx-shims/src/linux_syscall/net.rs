@@ -10,10 +10,15 @@ use crate::adapter::step_engine::SpinMutex;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
+use tx_subsystems::vfs::structure::{OpenFile, OpenFileFlags};
 
+const AF_UNIX: i32 = 1;
+const AF_LOCAL: i32 = AF_UNIX;
 const SOCK_STREAM: i32 = 1;
 const SOCK_DGRAM: i32 = 2;
 const SOCK_TYPE_MASK: i32 = 0xf;
+const SOCK_CLOEXEC: i32 = O_CLOEXEC as i32;
+const SOCK_NONBLOCK: i32 = O_NONBLOCK as i32;
 const MAX_SOCKADDR_BYTES: usize = 128;
 const MAX_SOCKET_PAYLOAD: usize = 4096;
 
@@ -21,8 +26,6 @@ const MAX_SOCKET_PAYLOAD: usize = 4096;
 struct FakeSocket {
     owner_pid: u32,
     kind: i32,
-    nonblocking: bool,
-    peer_fd: Option<u32>,
     bound_addr: Option<Vec<u8>>,
     inbox: Vec<u8>,
     listening: bool,
@@ -34,10 +37,6 @@ static SOCKETS: SpinMutex<BTreeMap<u32, FakeSocket>> = SpinMutex::new(BTreeMap::
 
 fn socket_kind(raw_type: i32) -> i32 {
     raw_type & SOCK_TYPE_MASK
-}
-
-fn socket_nonblocking(raw_type: i32) -> bool {
-    raw_type & O_NONBLOCK as i32 != 0
 }
 
 fn read_sockaddr(ctx: &SyscallCtx<'_>, addr: u64, len: u64) -> Result<Vec<u8>, i32> {
@@ -71,102 +70,8 @@ fn allocate_socket_fd() -> u32 {
     NEXT_SOCKET_FD.fetch_add(1, Ordering::Relaxed)
 }
 
-pub(super) fn is_socket_fd(fd: u32, _ctx: &SyscallCtx<'_>) -> bool {
-    SOCKETS.lock().contains_key(&fd)
-}
-
-pub(super) fn socket_readable(fd: u32, _ctx: &SyscallCtx<'_>) -> bool {
-    SOCKETS
-        .lock()
-        .get(&fd)
-        .is_some_and(|sock| !sock.inbox.is_empty())
-}
-
-pub(super) fn close_socket_fd(fd: u32, _ctx: &SyscallCtx<'_>) -> bool {
-    let mut sockets = SOCKETS.lock();
-    let Some(sock) = sockets.get(&fd) else {
-        return false;
-    };
-    let peer_fd = sock.peer_fd;
-    sockets.remove(&fd);
-    if let Some(peer) = peer_fd.and_then(|peer| sockets.get_mut(&peer)) {
-        peer.peer_fd = None;
-        peer.connected = false;
-    }
-    true
-}
-
-pub(super) fn sys_socket_write(
-    fd: u32,
-    buf: u64,
-    len: usize,
-    ctx: &SyscallCtx<'_>,
-) -> Option<SyscallResult> {
-    let mut payload = alloc::vec![0u8; len];
-    if len > 0 {
-        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut payload, buf) {
-            return Some(SyscallResult::error_from(errno));
-        }
-    }
-
-    let mut sockets = SOCKETS.lock();
-    let (peer_fd, nonblocking) = {
-        let sock = sockets.get(&fd)?;
-        (sock.peer_fd, sock.nonblocking)
-    };
-    if let Some(peer) = peer_fd.and_then(|peer_fd| sockets.get_mut(&peer_fd)) {
-        if peer.inbox.len().saturating_add(payload.len()) > MAX_SOCKET_PAYLOAD {
-            let _ = nonblocking;
-            return Some(SyscallResult::Error(EAGAIN_VALUE));
-        }
-        peer.inbox.extend_from_slice(&payload);
-    }
-    Some(SyscallResult::Return(len as i64))
-}
-
-pub(super) fn sys_socket_sendfile(
-    fd: u32,
-    count: usize,
-    ctx: &SyscallCtx<'_>,
-) -> Option<SyscallResult> {
-    let _ = ctx;
-    let sockets = SOCKETS.lock();
-    let sock = sockets.get(&fd)?;
-    let Some(peer_fd) = sock.peer_fd else {
-        return Some(SyscallResult::Error(ENOTCONN_VALUE));
-    };
-    let Some(peer) = sockets.get(&peer_fd) else {
-        return Some(SyscallResult::Error(ENOTCONN_VALUE));
-    };
-    if peer.inbox.len().saturating_add(count) > MAX_SOCKET_PAYLOAD {
-        return Some(SyscallResult::Error(EAGAIN_VALUE));
-    }
-    Some(SyscallResult::Error(EINVAL_VALUE))
-}
-
-pub(super) fn sys_socket_read(
-    fd: u32,
-    buf: u64,
-    len: usize,
-    ctx: &SyscallCtx<'_>,
-) -> Option<SyscallResult> {
-    let payload = {
-        let mut sockets = SOCKETS.lock();
-        let sock = sockets.get_mut(&fd)?;
-        let take_len = core::cmp::min(len, sock.inbox.len());
-        sock.inbox.drain(..take_len).collect::<Vec<u8>>()
-    };
-    if !payload.is_empty() {
-        if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, buf, &payload) {
-            return Some(SyscallResult::error_from(errno));
-        }
-    }
-    Some(SyscallResult::Return(payload.len() as i64))
-}
-
 pub(super) fn sys_socket(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
-    let raw_type = args[1] as i32;
-    let kind = socket_kind(raw_type);
+    let kind = socket_kind(args[1] as i32);
     if kind != SOCK_DGRAM && kind != SOCK_STREAM {
         return SyscallResult::Error(EINVAL_VALUE);
     }
@@ -177,8 +82,6 @@ pub(super) fn sys_socket(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult 
         FakeSocket {
             owner_pid,
             kind,
-            nonblocking: socket_nonblocking(raw_type),
-            peer_fd: None,
             bound_addr: None,
             inbox: Vec::new(),
             listening: false,
@@ -186,6 +89,111 @@ pub(super) fn sys_socket(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult 
         },
     );
     SyscallResult::Return(fd as i64)
+}
+
+pub(super) fn sys_socketpair(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let domain = args[0] as i32;
+    let raw_type = args[1] as i32;
+    let protocol = args[2] as i32;
+    let sv = args[3];
+
+    if sv == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    if domain != AF_UNIX && domain != AF_LOCAL {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let kind = socket_kind(raw_type);
+    if kind != SOCK_STREAM || protocol != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let recognised = SOCK_TYPE_MASK | SOCK_CLOEXEC | SOCK_NONBLOCK;
+    if raw_type & !recognised != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    let pipe_flags = tx_subsystems::pipe::PipeFlags {
+        cloexec: raw_type & SOCK_CLOEXEC != 0,
+        nonblocking: raw_type & SOCK_NONBLOCK != 0,
+        packet: false,
+    };
+    let (a_rx_payload, b_rx_payload) = match socketpair_pipe_payloads(pipe_flags) {
+        Ok(payloads) => payloads,
+        Err(errno) => return SyscallResult::error_from(errno),
+    };
+
+    let open_flags = OpenFileFlags {
+        read: true,
+        write: true,
+        append: false,
+        cloexec: pipe_flags.cloexec,
+        nonblocking: pipe_flags.nonblocking,
+        packet: false,
+    };
+    let a_file = match OpenFile::new_socketpair_endpoint_cap(
+        a_rx_payload.clone(),
+        b_rx_payload.clone(),
+        open_flags,
+    ) {
+        Ok(file) => file,
+        Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+    };
+    let b_file =
+        match OpenFile::new_socketpair_endpoint_cap(b_rx_payload, a_rx_payload, open_flags) {
+            Ok(file) => file,
+            Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+        };
+
+    let fd0 = match next_stdio_fd_below_nofile(&ctx.process) {
+        Ok(fd) => fd,
+        Err(err) => return err,
+    };
+    let _ = ctx.process.install_fd(fd0, a_file);
+    let fd1 = match next_stdio_fd_below_nofile(&ctx.process) {
+        Ok(fd) => fd,
+        Err(err) => {
+            let _ = ctx.process.set_fd(fd0, None);
+            return err;
+        }
+    };
+    let _ = ctx.process.install_fd(fd1, b_file);
+    if pipe_flags.cloexec {
+        ctx.process.set_fd_cloexec(fd0, true);
+        ctx.process.set_fd_cloexec(fd1, true);
+    }
+
+    let mut sv_bytes = [0u8; 8];
+    sv_bytes[0..4].copy_from_slice(&fd0.to_le_bytes());
+    sv_bytes[4..8].copy_from_slice(&fd1.to_le_bytes());
+    if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, sv, &sv_bytes) {
+        let _ = ctx.process.set_fd(fd0, None);
+        let _ = ctx.process.set_fd(fd1, None);
+        return SyscallResult::error_from(errno);
+    }
+
+    SyscallResult::Return(0)
+}
+
+fn socketpair_pipe_payloads(
+    flags: tx_subsystems::pipe::PipeFlags,
+) -> Result<
+    (
+        crate::adapter::step_engine::Cap<tx_subsystems::pipe::PipePayload>,
+        crate::adapter::step_engine::Cap<tx_subsystems::pipe::PipePayload>,
+    ),
+    tx_subsystems::execution::Errno,
+> {
+    let (a_reader, _a_writer) = tx_subsystems::pipe::step_pipe2(flags)?;
+    let (b_reader, _b_writer) = tx_subsystems::pipe::step_pipe2(flags)?;
+    let a_payload = a_reader
+        .pipe_endpoint()
+        .map(|(payload, _)| payload)
+        .ok_or(tx_subsystems::execution::Errno::EINVAL)?;
+    let b_payload = b_reader
+        .pipe_endpoint()
+        .map(|(payload, _)| payload)
+        .ok_or(tx_subsystems::execution::Errno::EINVAL)?;
+    Ok((a_payload, b_payload))
 }
 
 pub(super) fn sys_bind(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
@@ -225,28 +233,6 @@ pub(super) fn sys_getsockname(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRe
     }
 }
 
-pub(super) fn sys_getpeername(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
-    let fd = args[0] as u32;
-    let owner_pid = ctx.process.pid.0;
-    let addr = {
-        let sockets = SOCKETS.lock();
-        let Some(sock) = sockets.get(&fd) else {
-            return SyscallResult::Error(EBADF_VALUE);
-        };
-        if sock.owner_pid != owner_pid {
-            return SyscallResult::Error(EBADF_VALUE);
-        }
-        if sock.kind == SOCK_STREAM && !sock.connected {
-            return SyscallResult::Error(ENOTCONN_VALUE);
-        }
-        sock.bound_addr.clone().unwrap_or_else(default_sockaddr)
-    };
-    match write_sockaddr(ctx, args[1], args[2], &addr) {
-        Ok(()) => SyscallResult::Return(0),
-        Err(errno) => SyscallResult::Error(errno),
-    }
-}
-
 pub(super) fn sys_setsockopt(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let owner_pid = ctx.process.pid.0;
     if SOCKETS
@@ -258,97 +244,6 @@ pub(super) fn sys_setsockopt(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRes
     } else {
         SyscallResult::Error(EBADF_VALUE)
     }
-}
-
-pub(super) fn sys_getsockopt(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
-    let owner_pid = ctx.process.pid.0;
-    let valid_fd = SOCKETS
-        .lock()
-        .get(&(args[0] as u32))
-        .is_some_and(|sock| sock.owner_pid == owner_pid);
-    if !valid_fd {
-        return SyscallResult::Error(EBADF_VALUE);
-    }
-    if args[3] == 0 || args[4] == 0 {
-        return SyscallResult::Error(EFAULT_VALUE);
-    }
-    let user_len = match bootstrap_read_user::<u32>(&ctx.aspace, args[4]) {
-        Ok(len) => len as usize,
-        Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
-    };
-    let value = 0i32.to_ne_bytes();
-    let copy_len = core::cmp::min(user_len, value.len());
-    if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, args[3], &value[..copy_len]) {
-        return SyscallResult::Error(errno_to_i32(errno));
-    }
-    if let Err(errno) = bootstrap_write_user::<u32>(&ctx.aspace, args[4], value.len() as u32) {
-        return SyscallResult::Error(errno_to_i32(errno));
-    }
-    SyscallResult::Return(0)
-}
-
-pub(super) fn sys_shutdown(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
-    let fd = args[0] as u32;
-    let owner_pid = ctx.process.pid.0;
-    let mut sockets = SOCKETS.lock();
-    let Some(sock) = sockets.get_mut(&fd) else {
-        return SyscallResult::Error(EBADF_VALUE);
-    };
-    if sock.owner_pid != owner_pid {
-        return SyscallResult::Error(EBADF_VALUE);
-    }
-    sock.connected = false;
-    SyscallResult::Return(0)
-}
-
-pub(super) fn sys_socketpair(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
-    let raw_type = args[1] as i32;
-    let kind = socket_kind(raw_type);
-    if kind != SOCK_DGRAM && kind != SOCK_STREAM {
-        return SyscallResult::Error(EINVAL_VALUE);
-    }
-    if args[3] == 0 {
-        return SyscallResult::Error(EFAULT_VALUE);
-    }
-    let owner_pid = ctx.process.pid.0;
-    let fd0 = allocate_socket_fd();
-    let fd1 = allocate_socket_fd();
-    {
-        let mut sockets = SOCKETS.lock();
-        sockets.insert(
-            fd0,
-            FakeSocket {
-                owner_pid,
-                kind,
-                nonblocking: socket_nonblocking(raw_type),
-                peer_fd: Some(fd1),
-                bound_addr: Some(default_sockaddr()),
-                inbox: Vec::new(),
-                listening: false,
-                connected: true,
-            },
-        );
-        sockets.insert(
-            fd1,
-            FakeSocket {
-                owner_pid,
-                kind,
-                nonblocking: socket_nonblocking(raw_type),
-                peer_fd: Some(fd0),
-                bound_addr: Some(default_sockaddr()),
-                inbox: Vec::new(),
-                listening: false,
-                connected: true,
-            },
-        );
-    }
-    let mut pair = [0u8; 8];
-    pair[..4].copy_from_slice(&fd0.to_ne_bytes());
-    pair[4..].copy_from_slice(&fd1.to_ne_bytes());
-    if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, args[3], &pair) {
-        return SyscallResult::Error(errno_to_i32(errno));
-    }
-    SyscallResult::Return(0)
 }
 
 pub(super) fn sys_listen(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
@@ -425,8 +320,6 @@ pub(super) fn sys_accept4(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult
         FakeSocket {
             owner_pid,
             kind: SOCK_STREAM,
-            nonblocking: false,
-            peer_fd: None,
             bound_addr: Some(peer_addr),
             inbox: Vec::new(),
             listening: false,

@@ -85,6 +85,19 @@ fn stale_waker_does_not_wake_reused_slot() {
 }
 
 #[test]
+fn submitted_task_mailbox_carries_reactor_task_id() {
+    let mut tasks = TaskTable::new();
+    let first = tasks.submit(pending::<()>());
+    let second = tasks.submit(pending::<()>());
+
+    let first_mailbox = tasks.mailbox(first).expect("first mailbox");
+    let second_mailbox = tasks.mailbox(second).expect("second mailbox");
+
+    assert_eq!(first_mailbox.task_id_low(), first.id().0 as u32);
+    assert_eq!(second_mailbox.task_id_low(), second.id().0 as u32);
+}
+
+#[test]
 fn repeated_wakes_coalesce_before_drain() {
     let mut tasks = TaskTable::new();
     let task = tasks.submit(pending::<()>());

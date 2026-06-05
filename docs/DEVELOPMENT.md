@@ -34,13 +34,6 @@ with `docker compose run --rm busybox-la64` or, after installing a
 against musl, set `TX_MUSL_LIBC` to the musl `libc.so`; the builder includes it
 under `/lib/libc.so` and adds musl loader symlinks for RV64 and LA64.
 
-For RV64 network benchmark bring-up, the BusyBox image builder can also install
-OSComp/RustOS musl binaries when `TX_OSCOMP_RISCV_MUSL_DIR` points at a
-`testcase/riscv/musl` directory. It copies `iperf3`, `netperf`, and `netserver`
-when present, installs `lib/libc.so`, and creates the musl loader symlinks
-including `/lib/ld-musl-riscv64-sf.so.1`. Individual binaries can be overridden
-with `TX_IPERF3`, `TX_NETPERF`, or `TX_NETSERVER`.
-
 ## Docker workflow
 
 Txv2 ships a `docker-compose.yml` with:

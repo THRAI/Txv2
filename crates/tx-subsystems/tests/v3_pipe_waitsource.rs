@@ -46,8 +46,7 @@ use tx_subsystems::pipe::adapter::wait_routing::{
     MailboxEvent, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource,
 };
 use tx_subsystems::pipe::{
-    step_pipe2, step_read, step_write, PipeFlags, PipePayload, PIPE_BUF, PIPE_READABLE,
-    PIPE_WRITABLE,
+    step_pipe2, step_read, step_write, PipeFlags, PipePayload, PIPE_READABLE, PIPE_WRITABLE,
 };
 use tx_subsystems::process::adapter::step_engine::ScriptCtx;
 use tx_subsystems::process::structure::ProcessIdentity;
@@ -215,7 +214,7 @@ fn blocked_reader_on_empty_ring_is_woken_when_writer_pushes_bytes() {
 
     // Writer-side step pushes bytes -> reader source notifies.
     let guard = ebr_guard();
-    let outcome = step_write(&payload, b"x", &guard, false);
+    let outcome = step_write(&payload, b"x", &guard, false, false);
     drop(guard);
     assert_eq!(outcome, StepOutcome::Done(1));
 
@@ -240,11 +239,11 @@ fn blocked_writer_on_full_ring_is_woken_when_reader_drains_bytes() {
     let payload = payload_of(&reader);
     let mailbox = Arc::new(TaskMailbox::new());
 
-    // Fill the ring exactly to PIPE_BUF so the writer is blocked.
-    let big = alloc::vec![b'x'; PIPE_BUF];
+    // Fill the pipe exactly to its current capacity so the writer is blocked.
+    let big = alloc::vec![b'x'; payload.pipe_size_bytes()];
     let guard = ebr_guard();
-    let filled = step_write(&payload, &big, &guard, false);
-    assert_eq!(filled, StepOutcome::Done(PIPE_BUF));
+    let filled = step_write(&payload, &big, &guard, false, false);
+    assert_eq!(filled, StepOutcome::Done(big.len()));
     drop(guard);
 
     // Writer registers against `writer_wait_source` while ring is full.
@@ -349,7 +348,7 @@ fn step_write_empty_bytes_does_not_fire_reader_wait_source() {
     let (_guard_reg, _gen) = register(payload.reader_wait_source(), &mailbox, PIPE_READABLE);
 
     let guard = ebr_guard();
-    let outcome = step_write(&payload, &[], &guard, false);
+    let outcome = step_write(&payload, &[], &guard, false, false);
     drop(guard);
     assert_eq!(outcome, StepOutcome::Done(0));
 
@@ -372,7 +371,7 @@ fn step_read_empty_buf_does_not_fire_writer_wait_source() {
 
     // Seed the ring so the reader path would otherwise drain.
     let guard = ebr_guard();
-    let _ = step_write(&payload, b"hi", &guard, false);
+    let _ = step_write(&payload, b"hi", &guard, false, false);
     drop(guard);
 
     // Drain any side-effect SourceFired the seeding step posted to a
@@ -422,7 +421,7 @@ fn waitsource_notify_stamps_caller_generation_on_event() {
     );
 
     let guard = ebr_guard();
-    let _ = step_write(&payload, b"x", &guard, false);
+    let _ = step_write(&payload, b"x", &guard, false, false);
     drop(guard);
 
     let evt = mailbox.poll().expect("event should be queued");
@@ -459,7 +458,7 @@ fn write_fires_both_legacy_channel_and_new_wait_source() {
     // fire but a missing `WaitSource::notify` would leave the
     // mailbox empty. The next assertion catches that.
     let guard = ebr_guard();
-    let outcome = step_write(&payload, b"x", &guard, false);
+    let outcome = step_write(&payload, b"x", &guard, false, false);
     drop(guard);
     assert_eq!(outcome, StepOutcome::Done(1));
 

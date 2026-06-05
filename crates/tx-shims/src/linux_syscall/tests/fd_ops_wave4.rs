@@ -67,6 +67,7 @@ fn pagebacked_open_file(page_count: u64, size_bytes: u64) -> Cap<OpenFile> {
             append: false,
             cloexec: false,
             nonblocking: false,
+            packet: false,
         },
     )
     .expect("open file cap")

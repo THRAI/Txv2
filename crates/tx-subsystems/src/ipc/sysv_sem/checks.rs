@@ -55,5 +55,11 @@ pub fn require_owner_or_admin(array: &SemArrayIdentity, cred: &Cred) -> Result<(
 }
 
 pub fn require_sem_exists(semid: u32) -> Result<Cap<SemArrayIdentity>, Errno> {
-    crate::ipc::sysv_sem::structure::lookup_sem(semid).ok_or(Errno::EINVAL)
+    crate::ipc::sysv_sem::structure::lookup_sem(semid).ok_or_else(|| {
+        if crate::ipc::sysv_sem::structure::was_sem_removed(semid) {
+            Errno::EIDRM
+        } else {
+            Errno::EINVAL
+        }
+    })
 }

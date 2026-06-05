@@ -25,6 +25,7 @@ use tx_platform_adapter::platform_adapter;
     reason = "expose substrate step engine (StepOp/StepOutcome and ten step_* file types), zone role types, EBR guard, and bus primitives (RawPort/RawQueue) used by TtyIdentity / TtyPayload across the tty subsystem"
 )]
 pub mod step_engine {
+    pub(crate) use crate::sync::SpinMutex;
     pub use tx_substrate::bus::{RawPort, RawQueue};
     pub use tx_substrate::epoch::{guard, Guard};
     pub use tx_substrate::step::ProcessIdentity as PlaceholderProcessSubject;
@@ -38,7 +39,7 @@ pub mod step_engine {
         OperationalCapExt, OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy,
         RetainedEntityPolicy, Weak, Zone, ZoneAllocated, ZoneError, ZonePolicy,
     };
-    pub use tx_substrate::{AtomicSlot, SpinMutex};
+    pub use tx_substrate::AtomicSlot;
 }
 
 #[platform_adapter(
@@ -60,9 +61,7 @@ pub mod wait_routing {
         MailboxEvent, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource,
     };
 
-    /// Delegates to `tx_substrate::wake::new_source`. Also registers
-    /// the source in the global registry so the driver can look it up
-    /// by [`WaitSourceId`] during yield resolution.
+    /// Delegates to `tx_substrate::wake::new_source`.
     pub fn new_wait_source(source_id: u64) -> Arc<WaitSource> {
         let source = tx_substrate::wake::new_source(source_id);
         tx_substrate::wake::register_source(Arc::clone(&source));

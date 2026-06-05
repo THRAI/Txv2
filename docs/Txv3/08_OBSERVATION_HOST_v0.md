@@ -82,8 +82,25 @@ Three transports, plus a degenerate fourth for testing:
 | File replay | `--replay <file>` | Open a captured region snapshot; play through records start-to-end as if live. Used to debug daemon bugs without rerunning QEMU. |
 | Snapshot decode | `--snapshot <file>` | Read a captured region from a memory-backend-file post-crash; decode all records in one pass; emit `.pftrace` + halt. |
 | Pipe (test) | `--pipe` | Read raw record bytes from stdin. Used by daemon unit tests to feed synthetic record sequences. |
+| Live guest RAM | `live-guest-mem --guest-mem <ram-file> --kernel <elf> --output-dir <dir>` | OSComp/QEMU MVP path. QEMU backs all guest RAM with `memory-backend-file`; the daemon locates the exported `TX_OBSERVE_RINGS` symbol in the kernel ELF, converts it to a guest-RAM file offset, and drains the per-hart board rings while the guest runs. |
 
 OBS-HOST-V0-TRANSPORT-IVSHMEM: live mmap requires the ivshmem region to be backed by `-object memory-backend-file,id=trace,size=...,mem-path=/tmp/txtrace` so the daemon mmaps the path. Without `memory-backend-file`, the daemon cannot attach to a running guest (ivshmem-plain BARs are not exposed to the host as paths). The ivshmem device on the QEMU board crate is configured with `memory-backend-file` by default.
+
+OBS-HOST-V0-TRANSPORT-GUEST-MEM-LIVE: the OSComp live-drain path uses QEMU
+`-object memory-backend-file,id=txram,size=1G,mem-path=<guest-ram>,share=on`
+and `-machine virt,memory-backend=txram`. This is not a separate trace device:
+it maps the guest's normal RAM into a host file, then treats the board's
+exported `TX_OBSERVE_RINGS` static as the live trace region. The daemon writes
+all runtime products under `--output-dir`: `replay.ndjson`, `trace.pftrace`,
+`runtime.json`, and optional support files such as `daemon.log` and the
+guest-RAM backing file when the OSComp wrapper created it there.
+
+OBS-HOST-V0-TRANSPORT-GUEST-MEM-PROTOCOL: the MVP guest-memory drain reads and
+writes the ring's `producer` and `consumer` fields through a host mmap using
+the same byte layout as `TxTraceHartRing`; it is a best-effort QEMU TCG host
+protocol, not a formal cross-process atomic ABI. Correctness depends on the
+kernel's release-store producer discipline, the daemon keeping up with the
+finite ring, and QEMU exposing coherent writes through the shared backing file.
 
 OBS-HOST-V0-ATTACH-LATE: when the daemon attaches to a live region with `producer > consumer + slot_count`, the daemon was overrun before consuming. Policy: jump `consumer` to `producer - slot_count` (drop overrun), emit a synthetic Perfetto `data_loss` event with `lost_records: u64 = current_lost - 0` (the kernel-counted drops since last attach), then proceed. Do *not* attempt to replay overwritten records.
 
@@ -110,6 +127,22 @@ offset rings_off + (hart_count-1) * ring_stride : ring (hart_count-1)
 ```
 
 `ring_stride = sizeof(TxTraceHartRing) + (1 << ring_order) * sizeof(TxTraceRecord)`. Ring headers and slots are **interleaved per-hart**, not separated into two arrays. The header's `rings_off` field is the offset of ring 0; subsequent rings are at `rings_off + h * ring_stride`. This keeps each hart's producer-side state cacheline-local with the slots it writes.
+
+Serial-extracted snapshots use the same layout. The dump path may compact the
+physical board rings before hex emission: it preserves each selected hart's
+visible producer window, copies those records into a fresh zero-based ring, and
+sets the global `ring_order` to the smallest power-of-two order that can hold
+the largest selected window. Replay treats this exactly like a live region
+snapshot.
+
+For the rv64-qemu OSComp board, `TX_OBSERVE_RINGS` currently reserves 2 MiB
+per hart for four harts. The kernel ring initializer uses the largest
+power-of-two slot count that fits after the 208-byte `TxTraceHartRing` header,
+so each 2 MiB slab yields 16,384 usable 80-byte records. A larger 8 MiB-per-hart
+experiment overflowed the current 16 MiB bootstrap high-kernel alias budget, so
+the live-drain MVP keeps the static `.bss` cost to 8 MiB total and relies on
+the host daemon to drain during execution rather than preserving the whole
+workload in the finite board rings.
 
 ### 4.1 Header validation
 
@@ -151,6 +184,32 @@ For each hart `h`, repeat:
 ```
 
 OBS-HOST-V0-DRAIN-FAIRNESS: drain harts round-robin to keep no single hart starving the daemon. With N harts and slot_count of 16K, one full sweep at typical event rates is microseconds.
+
+OBS-HOST-V0-SMP-REPLAY-ORDER: file replay emits records in trace-time order
+across harts when `hart_count > 1`, using `(timestamp, hart_id, seq)` as the
+stable ordering key. This preserves per-hart order and gives JSON/analyzer
+consumers a single causal timeline for QEMU SMP traces where the trace clock is
+shared.
+
+OBS-HOST-V0-BUNDLE-RUNTIME: the `bundle` command builds a self-contained
+runtime directory for one captured trace. It copies the trace to
+`trace.txtrace`, emits `replay.ndjson`, emits `trace.pftrace`, copies
+`names.json` when supplied, and writes `runtime.json` with the paths and ring
+completeness stats. `complete=true` means every retained ring has
+`lost == 0`, no `producer-consumer > slot_count` overwrite window, and no record
+framing errors. A syntactically valid trace with `complete=false` is still a
+usable tail sample, not a lossless full-window trace.
+
+OBS-HOST-V0-LIVE-RUNTIME: the `live-guest-mem` command writes records from a
+running guest-RAM file into `trace.rawrecords` on the hot path, advancing each
+ring consumer as soon as the fixed-size slot bytes are copied. After the stop
+file appears or the duration limit expires, the daemon decodes that raw stream
+into `replay.ndjson` and `trace.pftrace`, then writes `runtime.json`.
+`runtime.json` carries a `drained` section for the records actually streamed
+during the run and a final `stats` section for the post-stop ring state. In a
+successful live drain, `drained.records` is the full-stream count;
+`stats.total_records` may be zero because the daemon advanced each ring
+consumer to the producer before writing the runtime metadata.
 
 ### 4.3 Record decode
 

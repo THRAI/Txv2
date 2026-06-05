@@ -14,14 +14,14 @@
 //! mount slots populate, tmpfs's `/dev` mkdir succeeds, devfs's
 //! console alias resolves, and init's cwd + fds 0/1/2 are bound.
 
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use std::sync::Mutex;
 
 use tx_hal::{
-    AllocError, Arch, Asid, BootHandoff, BootInfo, BootPlatformIf, BootProtocol, ConsoleIf, InitIf,
-    ObserverIf, PhysAddr, PlatformConfig, PlatformInfo, PmapError, PmapPermissions,
-    PmapReservation, PmapReserveKind, PmapRoot, PtNode,
+    AllocError, Arch, Asid, BootHandoff, BootInfo, BootPlatformIf, BootProtocol, ConsoleIf, CpuId,
+    CpuMask, InitIf, ObserverIf, PhysAddr, PlatformConfig, PlatformInfo, PmapError,
+    PmapPermissions, PmapReservation, PmapReserveKind, PmapRoot, PtNode,
 };
 
 /// Page size used to fabricate distinct test pmap roots. tx-hal
@@ -119,11 +119,12 @@ static LAST_USERSPACE_CTX: Mutex<Option<tx_hal::UserTrapContext>> = Mutex::new(N
 /// test. Reset only by the next `setup()` — persists across the
 /// per-iteration `run_thread` invocations that the smoke chains.
 static USERSPACE_A0_LOG: Mutex<std::vec::Vec<usize>> = Mutex::new(std::vec::Vec::new());
-static TEST_NOW_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Test hook: when non-zero, the simulator marks the active userspace-run
 /// request as timer-preempted before returning from `enter_userspace_*`.
 static USERSPACE_PREEMPT_ON_ENTER: AtomicUsize = AtomicUsize::new(0);
+static TEST_CURRENT_CPU: AtomicUsize = AtomicUsize::new(0);
+static TEST_ONLINE_CPUS: AtomicUsize = AtomicUsize::new(1);
 
 impl tx_hal::TrapIf for TestPlatform {
     /// Inverted-loop simulator: stand in for a real `sret` into
@@ -183,7 +184,7 @@ impl tx_hal::IrqIf for TestPlatform {}
 
 impl tx_hal::TimeIf for TestPlatform {
     fn read_ns() -> u64 {
-        TEST_NOW_NS.load(Ordering::Acquire)
+        0
     }
     fn set_deadline_ns(_deadline: u64) {}
     fn cancel_deadline() {}
@@ -195,7 +196,15 @@ impl tx_hal::TimeIf for TestPlatform {
 impl tx_hal::PercpuIf for TestPlatform {}
 impl tx_hal::CacheIf for TestPlatform {}
 impl tx_hal::DmaIf for TestPlatform {}
-impl tx_hal::SmpIf for TestPlatform {}
+impl tx_hal::SmpIf for TestPlatform {
+    fn current_cpu_id() -> CpuId {
+        CpuId(TEST_CURRENT_CPU.load(Ordering::Acquire))
+    }
+
+    fn online_cpus() -> CpuMask {
+        CpuMask::from_bits(TEST_ONLINE_CPUS.load(Ordering::Acquire) as u64)
+    }
+}
 
 impl tx_hal::EntropyIf for TestPlatform {}
 impl ObserverIf for TestPlatform {}
@@ -268,7 +277,6 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
     tx_subsystems::cross_crate_test_support::reset_dev_id_counter();
     tx_subsystems::cross_crate_test_support::reset_reactor_submit_seam();
     crate::init::reset_boot_state_for_test();
-    tx_subsystems::net::initial_loopback_iface().clear_for_test_or_bootstrap();
     crate::irq::reset_dispatch_table_for_test();
     tx_subsystems::device::reset_block_registry_for_test();
     CONSOLE_CAPTURED_LEN.store(0, Ordering::Release);
@@ -284,12 +292,9 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|e| e.into_inner())
         .clear();
     USERSPACE_PREEMPT_ON_ENTER.store(0, Ordering::Release);
-    TEST_NOW_NS.store(0, Ordering::Release);
+    TEST_CURRENT_CPU.store(0, Ordering::Release);
+    TEST_ONLINE_CPUS.store(1, Ordering::Release);
     guard
-}
-
-fn set_test_time_ns(now_ns: u64) {
-    TEST_NOW_NS.store(now_ns, Ordering::Release);
 }
 
 fn bootstrap_init() {
@@ -312,7 +317,6 @@ fn drive_boot_wiring() {
     // platform-publication path in the boot-wiring smoke.
     CoreInit::<TestPlatform>::install_irq_handlers();
     CoreInit::<TestPlatform>::init_block_devices();
-    CoreInit::<TestPlatform>::init_net_devices();
     CoreInit::<TestPlatform>::mount_rootfs_from_boot_media();
     CoreInit::<TestPlatform>::mount_devfs_at_dev();
     CoreInit::<TestPlatform>::register_devfs_console_alias();
@@ -321,11 +325,24 @@ fn drive_boot_wiring() {
     CoreInit::<TestPlatform>::bind_init_cwd_and_root();
 }
 
-mod net_delegate_deadline;
-mod net_delegate_device;
-mod userspace_net_smoke;
-
 // --- tests --------------------------------------------------------
+
+#[test]
+fn initial_userspace_sched_meta_stays_on_cpu0_when_boot_hart_is_nonzero() {
+    let _serial = setup();
+    TEST_CURRENT_CPU.store(3, Ordering::Release);
+    TEST_ONLINE_CPUS.store(0b1111, Ordering::Release);
+
+    let meta = CoreInit::<TestPlatform>::userspace_thread_sched_meta();
+
+    assert_eq!(
+        meta.affinity,
+        CpuMask::single(CpuId(0)).bits(),
+        "initial userspace remains on the BSP-safe CPU0 path; child threads own AP spread",
+    );
+    assert!(meta.userspace_thread);
+    assert!(!meta.spread_on_submit);
+}
 
 /// **Downgrade note (per trio plan §"Phase 3b tests"):** end-to-end
 /// `step_lookup("/dev/console")` cannot run yet — VFS's walker
@@ -433,41 +450,6 @@ fn boot_smoke_walker_resolves_dev_console_after_mount_registration() {
         }
         other => panic!("expected StructBacked Tty backing, got {other:?}"),
     }
-}
-
-#[test]
-fn boot_smoke_walker_resolves_dev_null_as_char_device() {
-    use tx_subsystems::vfs::{walker, Credential, InodeKind};
-
-    let _serial = setup();
-    drive_boot_wiring();
-
-    let init = tx_subsystems::process::execution::init_process()
-        .expect("INIT_PROCESS must be populated post-bootstrap");
-    let cwd = init.cwd().expect("init cwd must be bound");
-    let cred = Credential::root();
-    let guard = guard();
-    use step_engine::StepOutcome as V3;
-    let dentry = match walker::step_walk(cwd, b"/dev/null", &cred, &guard) {
-        V3::Done(dentry) => dentry,
-        other => panic!("step_walk(/dev/null) must succeed, got {other:?}"),
-    };
-    assert_eq!(dentry.name().as_bytes(), b"null");
-    assert_eq!(dentry.rnode().meta().kind(), InodeKind::CharDevice);
-
-    let payload = dentry
-        .rnode()
-        .containing_mount_weak()
-        .and_then(|weak| weak.upgrade(&guard))
-        .expect("/dev/null rnode must carry devfs mount payload");
-    let loaded = match payload
-        .fs_ops()
-        .load_inode_meta(dentry.rnode().fs_object_id(), &guard)
-    {
-        V3::Done(meta) => meta,
-        other => panic!("devfs load_inode_meta(/dev/null) failed: {other:?}"),
-    };
-    assert_eq!(loaded.kind(), InodeKind::CharDevice);
 }
 
 /// Post-`mount_bdevfs_at_dev_block`, the VFS walker must resolve
@@ -900,8 +882,11 @@ fn boot_smoke_production_userspace_loop_writes_console_then_exits() {
     let mut cx = Context::from_waker(&waker);
 
     let future = crate::thread_future::run_thread::<TestPlatform>(leader.clone(), payload.clone());
-    let wrapped =
-        crate::thread_future::PerHartSlotted::<TestPlatform, _>::new(payload.clone(), future);
+    let wrapped = crate::thread_future::PerHartSlotted::<TestPlatform, _>::new(
+        leader.clone(),
+        payload.clone(),
+        future,
+    );
     let mut boxed = std::boxed::Box::new(wrapped);
     // SAFETY: `boxed` is owned for the duration of this test and
     // never moved after pinning.
@@ -1059,8 +1044,11 @@ fn run_thread_timer_preempt_yields_and_reenters_without_resolving_wait() {
     let waker = Waker::noop().clone();
     let mut cx = Context::from_waker(&waker);
     let future = crate::thread_future::run_thread::<TestPlatform>(leader.clone(), payload.clone());
-    let wrapped =
-        crate::thread_future::PerHartSlotted::<TestPlatform, _>::new(payload.clone(), future);
+    let wrapped = crate::thread_future::PerHartSlotted::<TestPlatform, _>::new(
+        leader.clone(),
+        payload.clone(),
+        future,
+    );
     let mut boxed = std::boxed::Box::new(wrapped);
     // SAFETY: `boxed` is owned for the duration of this test and is not moved
     // after pinning.
@@ -1311,7 +1299,11 @@ fn reactor_submission_seam_submits_child_thread_smoke() {
     let leader = child
         .nth_thread(0)
         .expect("fresh child has a leader thread");
-    reactor_submit::submit_child_thread(child.clone(), leader);
+    assert_eq!(
+        reactor_submit::submit_child_thread(child.clone(), leader),
+        reactor_submit::SubmitChildThreadStatus::QueuedFallback,
+        "uninitialised boot reactor path must report fallback queueing"
+    );
     // No assertion on reactor side-effects — the BOOT_REACTOR slot
     // is not initialised in the test scaffolding (init_boot_reactor
     // is gated behind init_substrate_if_ready). The smoke covers

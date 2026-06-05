@@ -91,6 +91,70 @@ fn bootstrap() -> Cap<ProcessIdentity> {
     bootstrap_init_process(fresh_aspace()).expect("bootstrap init")
 }
 
+#[cfg(all(tx_ds_metrics, tx_ds_metrics_process))]
+#[test]
+fn process_ds_metrics_declares_identity_tree_method_names() {
+    let names = crate::process::ds_metrics::PROCESS_DS_METHOD_NAMES;
+
+    assert!(names.contains(&b"debug.ds.process.pid_namespace.register_pid".as_slice()));
+    assert!(names.contains(&b"debug.ds.process.pid_namespace.resolve_pid_number_as".as_slice()));
+    assert!(names.contains(&b"debug.ds.process.pid_namespace.unregister_pid_number".as_slice()));
+    assert!(names.contains(&b"debug.ds.process.children.snapshot".as_slice()));
+    assert!(names.contains(&b"debug.ds.process.threads.snapshot".as_slice()));
+}
+
+#[test]
+fn process_lock_service_declares_high_stake_payload_phase_names() {
+    let names = crate::process::execution::PROCESS_LOCK_SERVICE_TRACE_NAMES;
+
+    assert!(names.contains(
+        &b"debug.lock_service.process.payload.exit_group.shm_detach.duration_ns".as_slice()
+    ));
+    assert!(names.contains(
+        &b"debug.lock_service.process.payload.exit_group.drain_fds.duration_ns".as_slice()
+    ));
+    assert!(names.contains(
+        &b"debug.lock_service.process.payload.exit_group.threads_drain.duration_ns".as_slice()
+    ));
+    assert!(names.contains(
+        &b"debug.lock_service.process.payload.exit_group.zombify_threads.duration_ns".as_slice()
+    ));
+    assert!(names.contains(
+        &b"debug.lock_service.process.payload.exit_group.drop_drained.duration_ns".as_slice()
+    ));
+    assert!(names.contains(
+        &b"debug.lock_service.process.payload.exit_group.payload_drop.duration_ns".as_slice()
+    ));
+    assert!(names.contains(
+        &b"debug.lock_service.process.payload.process_exit.shm_detach.duration_ns".as_slice()
+    ));
+    assert!(names.contains(
+        &b"debug.lock_service.process.payload.process_exit.drain_fds.duration_ns".as_slice()
+    ));
+    assert!(names.contains(
+        &b"debug.lock_service.process.payload.process_exit.drop_closed_fds.duration_ns".as_slice()
+    ));
+    assert!(names.contains(
+        &b"debug.lock_service.process.payload.process_exit.payload_drop.duration_ns".as_slice()
+    ));
+    assert!(names.contains(
+        &b"debug.lock_service.process.payload.thread_exit.threads_detach.duration_ns".as_slice()
+    ));
+    assert!(names.contains(
+        &b"debug.lock_service.process.payload.thread_exit.thread_count.duration_ns".as_slice()
+    ));
+    assert!(names.contains(
+        &b"debug.lock_service.process.payload.thread_exit.group_exit.duration_ns".as_slice()
+    ));
+    assert!(names
+        .contains(&b"debug.lock_service.process.payload.robust.head_reads.duration_ns".as_slice()));
+    assert!(names
+        .contains(&b"debug.lock_service.process.payload.robust.entries.duration_ns".as_slice()));
+    assert!(names
+        .contains(&b"debug.lock_service.process.payload.robust.pending.duration_ns".as_slice()));
+    assert!(names.contains(&b"debug.lock_service.process.payload.robust.entry_count".as_slice()));
+}
+
 struct NullMountFs;
 
 impl FsOps for NullMountFs {
@@ -476,23 +540,6 @@ fn fork_inherits_mount_namespace_from_nsproxy_bundle() {
 }
 
 #[test]
-fn fork_inherits_parent_network_namespace() {
-    let _g = setup();
-    let parent = bootstrap();
-
-    let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
-    let parent_netns = parent.net_namespace().expect("parent netns");
-    let child_netns = child.net_namespace().expect("child netns");
-
-    assert!(core::ptr::eq(
-        parent_netns.socket_table(),
-        child_netns.socket_table()
-    ));
-    assert_eq!(parent_netns.link_snapshot()[0].name, "lo");
-    assert_eq!(child_netns.link_snapshot()[0].name, "lo");
-}
-
-#[test]
 fn fork_clones_address_space_into_distinct_cap() {
     let _g = setup();
     let parent = bootstrap();
@@ -800,40 +847,6 @@ fn fork_child_exit_does_not_apply_parent_sysv_sem_undo_adjustments() {
     {
         sysv_sem::execution::SemCtlResult::Val(value) => assert_eq!(value, 2),
         other => panic!("expected Val, got {other:?}"),
-    }
-}
-
-#[test]
-fn exit_group_closes_unshared_raw_icmp_socket_fd() {
-    let _g = setup();
-    let proc_cap = bootstrap();
-    let netns = proc_cap.net_namespace().expect("process net namespace");
-    let opened = {
-        let guard = ebr_guard();
-        match crate::net::step_socket_open_file_in_namespace(2, 3, 1, netns.clone(), &guard) {
-            crate::execution::StepOutcome::Done(opened) => opened,
-            crate::execution::StepOutcome::Err(errno) => {
-                panic!("raw icmp socket open failed: {errno:?}")
-            }
-            crate::execution::StepOutcome::Continue { .. }
-            | crate::execution::StepOutcome::Yield { .. } => {
-                panic!("raw icmp socket open did not complete")
-            }
-        }
-    };
-
-    proc_cap.set_fd(7, Some(opened.file));
-    {
-        let guard = ebr_guard();
-        assert_eq!(netns.socket_table().snapshot_raw_icmp(&guard).len(), 1);
-    }
-
-    step_exit_group(&proc_cap, ExitStatus::Exited(0));
-
-    assert!(opened.identity.live_payload().is_none());
-    {
-        let guard = ebr_guard();
-        assert!(netns.socket_table().snapshot_raw_icmp(&guard).is_empty());
     }
 }
 

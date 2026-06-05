@@ -98,15 +98,13 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::{Context, Poll};
 
 pub mod adapter;
+pub mod notification;
+pub use notification::{EVENTS_AVAILABLE_MASK, IOCB_ARRIVED_MASK};
 
 use adapter::step_engine::{
-    sign, with_on_behalf_of, AbortSignal, CancelReason, Cap, InterestMask, OnBehalfOfAbort,
-    ScriptCtx, SpinMutex, SubjectContext, SubjectIdentity, WaitSource, WaitSourceId, Zone,
-    ZoneAllocated, ZoneError,
+    sign, with_on_behalf_of, AbortSignal, CancelReason, Cap, OnBehalfOfAbort, ScriptCtx, SpinMutex,
+    SubjectContext, SubjectIdentity, WaitSource, Zone, ZoneAllocated, ZoneError,
 };
-use adapter::wait_routing::Channel;
-
-use crate::wait_source;
 
 // === iocb opcodes ====================================================
 //
@@ -379,24 +377,19 @@ impl AioContext {
     /// `nr_events` capacity. Mirrors `UserfaultFd::with_flags` from
     /// W-Q's phase 0 template.
     pub fn with_nr_events(nr_events: u32) -> Self {
-        let iocb_arrived_channel = Channel::new();
-        let iocb_arrived_id = wait_source::register_wait_channel(iocb_arrived_channel);
-        let iocb_arrived = Arc::new(WaitSource::new(WaitSourceId::new(iocb_arrived_id)));
-        let events_available_channel = Channel::new();
-        let events_available_id = wait_source::register_wait_channel(events_available_channel);
-        let events_available = Arc::new(WaitSource::new(WaitSourceId::new(events_available_id)));
+        let wait_points = notification::new_wait_points();
         Self {
             context_id: allocate_context_id(),
             nr_events,
             _pad: 0,
             submit_queue: SpinMutex::new(VecDeque::new()),
-            iocb_arrived,
-            iocb_arrived_id,
+            iocb_arrived: wait_points.iocb_arrived,
+            iocb_arrived_id: wait_points.iocb_arrived_id,
             worker_abort: Arc::new(AbortSignal::new()),
             dispatched: AtomicU64::new(0),
             completion_queue: SpinMutex::new(VecDeque::new()),
-            events_available,
-            events_available_id,
+            events_available: wait_points.events_available,
+            events_available_id: wait_points.events_available_id,
         }
     }
 
@@ -477,9 +470,7 @@ impl AioContext {
         }
         queue.push_back(iocb);
         drop(queue);
-        // Wake any parked worker. Mirrors the pipe push path.
-        self.iocb_arrived
-            .notify_emit(InterestMask::new(IOCB_ARRIVED_MASK));
+        notification::notify_iocb_arrived(&self.iocb_arrived);
         Ok(())
     }
 
@@ -537,9 +528,7 @@ impl AioContext {
     /// worker body after each iocb dispatch.
     pub fn push_completion(&self, event: IoEvent) {
         self.completion_queue.lock().push_back(event);
-        // Notify any parked io_getevents waiters.
-        self.events_available
-            .notify_emit(InterestMask::new(EVENTS_AVAILABLE_MASK));
+        notification::notify_events_available(&self.events_available);
     }
 
     /// Pop one completion event off the queue, if any. Used by
@@ -570,16 +559,6 @@ impl AioContext {
     }
 }
 
-/// Interest-mask bit the `iocb_arrived` wait source publishes on push.
-/// Single bit because the carrier has a single semantic event
-/// ("queue went from empty to non-empty" / "a new iocb is ready").
-pub const IOCB_ARRIVED_MASK: u64 = 0x1;
-
-/// Interest-mask bit the `events_available` wait source publishes on
-/// completion-push. Single bit; pairs with [`IOCB_ARRIVED_MASK`] on the
-/// opposite carrier.
-pub const EVENTS_AVAILABLE_MASK: u64 = 0x1;
-
 impl Default for AioContext {
     fn default() -> Self {
         Self::new()
@@ -595,8 +574,7 @@ impl Drop for AioContext {
         self.worker_abort.trip(OnBehalfOfAbort::CooperativeCancel(
             CancelReason::OwnerRequested,
         ));
-        wait_source::release_wait_channel(self.iocb_arrived_id);
-        wait_source::release_wait_channel(self.events_available_id);
+        notification::release_wait_points(self.iocb_arrived_id, self.events_available_id);
     }
 }
 

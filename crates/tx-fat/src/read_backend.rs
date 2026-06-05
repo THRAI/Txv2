@@ -316,6 +316,7 @@ pub(crate) fn map_format_error(err: FatFormatError) -> Errno {
         FatFormatError::BadBPB(_) | FatFormatError::Corrupt | FatFormatError::IO => Errno::EIO,
         FatFormatError::OutOfBounds => Errno::EIO,
         FatFormatError::Unsupported => Errno::ENOSYS,
+        FatFormatError::WouldBlock => Errno::EAGAIN,
         FatFormatError::FileTooLarge => Errno::EIO,
         FatFormatError::NotFound => Errno::ENOENT,
     }

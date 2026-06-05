@@ -98,20 +98,15 @@ impl<I: BlockImage> Ext4FsInstance<I> {
     pub(crate) fn read_dir_entries_cached(
         &self,
         inode: InodeNo,
-        start_index: usize,
         out: &mut [DirEntryLite; READDIR_WINDOW_ENTRIES],
     ) -> Result<usize, Errno> {
-        if let Some(count) = self.dir_cache.lock().get(inode, start_index, out) {
+        if let Some(count) = self.dir_cache.lock().get(inode, out) {
             return Ok(count);
         }
 
         let mut entries = [DirEntryLite::empty(); READDIR_WINDOW_ENTRIES];
-        let count = self.with_pager(|pager| {
-            pager.read_dir_entries_from(inode, start_index as u64, &mut entries)
-        })?;
-        self.dir_cache
-            .lock()
-            .insert(inode, start_index, &entries, count);
+        let count = self.with_pager(|pager| pager.read_dir_entries(inode, &mut entries))?;
+        self.dir_cache.lock().insert(inode, &entries, count);
         {
             let mut lookup_cache = self.lookup_cache.lock();
             for entry in entries.iter().take(count) {
@@ -151,12 +146,12 @@ impl DirCache {
     fn get(
         &mut self,
         inode: InodeNo,
-        start_index: usize,
         out: &mut [DirEntryLite; READDIR_WINDOW_ENTRIES],
     ) -> Option<usize> {
-        let index = self.entries.iter().position(|entry| {
-            entry.valid && entry.inode == inode && entry.start_index == start_index
-        })?;
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| entry.valid && entry.inode == inode)?;
         self.clock = self.clock.wrapping_add(1);
         let entry = &mut self.entries[index];
         entry.last_used = self.clock;
@@ -165,34 +160,10 @@ impl DirCache {
     }
 
     fn lookup(&mut self, inode: InodeNo, name: &[u8]) -> Option<Option<InodeNo>> {
-        let mut complete_first_window = None;
-        let mut found_index = None;
-        for (index, entry) in self.entries.iter().enumerate() {
-            if !entry.valid || entry.inode != inode {
-                continue;
-            }
-            if entry.start_index == 0 && entry.count < READDIR_WINDOW_ENTRIES {
-                complete_first_window = Some(index);
-            }
-            if entry
-                .entries
-                .iter()
-                .take(entry.count)
-                .any(|dir_entry| dir_entry.name() == name)
-            {
-                found_index = Some(index);
-                break;
-            }
-        }
-        let index = match found_index {
-            Some(index) => index,
-            None => {
-                let index = complete_first_window?;
-                self.clock = self.clock.wrapping_add(1);
-                self.entries[index].last_used = self.clock;
-                return Some(None);
-            }
-        };
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| entry.valid && entry.inode == inode)?;
         self.clock = self.clock.wrapping_add(1);
         let entry = &mut self.entries[index];
         entry.last_used = self.clock;
@@ -201,13 +172,16 @@ impl DirCache {
                 return Some(Some(dir_entry.inode));
             }
         }
-        None
+        if entry.count < READDIR_WINDOW_ENTRIES {
+            Some(None)
+        } else {
+            None
+        }
     }
 
     fn insert(
         &mut self,
         inode: InodeNo,
-        start_index: usize,
         entries: &[DirEntryLite; READDIR_WINDOW_ENTRIES],
         count: usize,
     ) {
@@ -215,9 +189,7 @@ impl DirCache {
         let victim = self
             .entries
             .iter()
-            .position(|entry| {
-                !entry.valid || (entry.inode == inode && entry.start_index == start_index)
-            })
+            .position(|entry| !entry.valid || entry.inode == inode)
             .unwrap_or_else(|| {
                 if self.entries.len() < DIR_CACHE_ENTRIES {
                     self.entries.push(DirCacheEntry::empty());
@@ -234,7 +206,6 @@ impl DirCache {
         let entry = &mut self.entries[victim];
         entry.valid = true;
         entry.inode = inode;
-        entry.start_index = start_index;
         entry.count = count.min(READDIR_WINDOW_ENTRIES);
         entry.last_used = self.clock;
         entry.entries.clear();
@@ -253,7 +224,6 @@ impl DirCache {
 struct DirCacheEntry {
     valid: bool,
     inode: InodeNo,
-    start_index: usize,
     count: usize,
     entries: Vec<DirEntryLite>,
     last_used: u64,
@@ -264,7 +234,6 @@ impl DirCacheEntry {
         Self {
             valid: false,
             inode: InodeNo::new(0),
-            start_index: 0,
             count: 0,
             entries: Vec::new(),
             last_used: 0,
@@ -554,6 +523,7 @@ pub(crate) fn map_format_error(err: Ext4FormatError) -> Errno {
         }
         Ext4FormatError::OutOfBounds => Errno::ENOENT,
         Ext4FormatError::Unsupported => Errno::ENOSYS,
+        Ext4FormatError::WouldBlock => Errno::EAGAIN,
     }
 }
 

@@ -133,8 +133,6 @@ fn setuid_privileged_changes_both_uid_and_euid() {
     assert_eq!(new.euid, Uid(1000));
     // Privileged setuid bumps the saved-set to match.
     assert_eq!(new.suid, Uid(1000));
-    assert_eq!(new.effective_caps, CapabilitySet::EMPTY);
-    assert_eq!(new.permitted_caps, CapabilitySet::EMPTY);
 }
 
 #[test]

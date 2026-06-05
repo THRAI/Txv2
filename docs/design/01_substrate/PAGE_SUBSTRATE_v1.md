@@ -38,7 +38,7 @@ payload evidence used by them:
 
 | Substrate declaration | Public evidence | Reclamation role |
 |---|---|---|
-| physical frame | `FrameMeta` plus typed contributors (`MapPin`, `CachePin`, `DmaToken`) | compound payload counters, no fake `Zone<VmEntry>` |
+| physical frame | `FrameMeta` plus typed contributors (`MapPin`, `CachePin`, `DmaPin`, `GiftPin`) | compound payload counters and retainers, no fake `Zone<VmEntry>` |
 | free bitmap rows | bitmap bits and reservations | allocator state, not entities |
 | pmap intermediate nodes | HAL/substrate-owned page-table nodes | pmap materialization, not caps |
 | slab pages / zone backing pages | substrate allocation units | hidden storage for policy-based zones |
@@ -196,8 +196,8 @@ The rule is intentionally narrow:
 - direct-map helpers may produce a kernel pointer for copying, zeroing, or page
   table access, but the pointer is scoped to that substrate operation;
 - upper semantic subsystems receive role evidence (`OwnedFrame`, `MapPin`,
-  `CachePin`, `DmaPin`, `PtFrame`) or entity evidence (`Cap<T>`, `Weak<T>`,
-  `IdentRef<'g, T>`), not freeing authority hidden in a raw address.
+  `CachePin`, `DmaPin`, `GiftPin`, `PtFrame`) or entity evidence (`Cap<T>`,
+  `Weak<T>`, `IdentRef<'g, T>`), not freeing authority hidden in a raw address.
 
 This keeps the address dialect local. Above PAGE_SUBSTRATE, ordinary kernel code
 should not compute `DIRECT_MAP_BASE + phys`, interpret a `usize` as a pointer,
@@ -246,7 +246,7 @@ const _: () = assert!(core::mem::size_of::<FrameMeta>() == 8);
 
 **Bit-width rationale.**
 
-- `refcount` (10 bits, max 1023): generic frame owner/retainer count. It includes `OwnedFrame`, permanent anchors, pmap page-table ownership, and future retained frame handles. Role-specific liveness stays in `map_count`, `cache_ref`, and `pin_count`; v1 has no separate allocation pin.
+- `refcount` (10 bits, max 1023): generic frame owner/retainer count. It includes `OwnedFrame`, permanent anchors, pmap page-table ownership, retained frame handles, and `GiftPin` transfer retention. Role-specific liveness stays in `map_count`, `cache_ref`, and `pin_count`; v1 has no separate allocation pin.
 - `map_count` (10 bits, max 1023): PTEs installing this frame across address spaces. An anonymous page in a 1000-process fork scenario hits ~1000; 1023 is tight but workable. If we need headroom, we widen to 12 bits by shrinking cache_ref to 6; revisit under benchmarking.
 - `cache_ref` (8 bits, max 255): PageContainer page-index inclusions. Typically 1 (the page lives in one PC); reflink elevates to N where N is the number of reflinking PCs. 255 is ample for anticipated use cases.
 - `pin_count` (4 bits, max 15): concurrent DMA operations on this page. 15 concurrent outstanding DMA requests is more than any sane device driver needs.
@@ -573,6 +573,11 @@ Semantics:
 - Dropping an uncommitted reservation rolls the frame back into the allocator.
 - Dropping `OwnedFrame` decrements refcount; the frame returns to the allocator only if the whole packed state reaches zero.
 - Role handoff is acquire-role-counter first, publish binding second, drop `OwnedFrame` last. Role tokens include `MapPin`, `CachePin`, and `DmaPin`.
+- Transfer handoff is acquire-retained-frame evidence first, freeze the old
+  writable publication second, publish the transfer descriptor third, and drop
+  the source owner last. `GiftPin` is the transfer token for this path. It
+  retains through `refcount` in v1 so pipe descriptors and `tee` duplicates do
+  not consume the narrow DMA-oriented `pin_count`.
 
 This matches the `substrate::{zone, index, credit}::reserve / commit` pattern from `SUBSYSTEM_ANATOMY §4`.
 
@@ -662,10 +667,16 @@ Operations on `FrameMeta.state` are packed-counter CASes. Each counter has exact
 
 | Counter | Incremented by | Decremented by |
 |---|---|---|
-| refcount | OwnedFrame / permanent / retained-owner acquisition | OwnedFrame drop or explicit owner teardown |
+| refcount | OwnedFrame / permanent / retained-owner / GiftPin acquisition | OwnedFrame drop, GiftPin drop, or explicit owner teardown |
 | map_count | PTE install | PTE teardown |
 | cache_ref | PageContainer page-index insert | PageContainer page-index remove |
-| pin_count | DmaToken acquire | DmaToken release |
+| pin_count | DmaPin acquire | DmaPin release |
+
+`GiftPin` is typed transfer evidence, not a new semantic page entity and not a
+DMA pin. Its acquire path is a live-frame CAS on `refcount`: if the packed state
+word is zero, acquire fails with the same sentinel semantics as map/cache/DMA
+upgrades. This gives VM a linear token it can place in `UserPageGift` while
+leaving `pin_count` reserved for hardware-facing long-term DMA pressure.
 
 Each increment is a bounded CAS loop:
 

@@ -410,17 +410,6 @@ mod tests {
     }
 
     #[test]
-    fn rv64_signal_frame_bytes_include_trampoline() {
-        let frame_bytes = [0u8; size_of::<Rv64SignalFrame>()];
-        let staged = SignalFrameBytes::from_slice(&frame_bytes);
-        let trampoline_end = offset_of!(Rv64SignalFrame, trampoline)
-            + core::mem::size_of_val(&RV64_SIGRETURN_TRAMPOLINE);
-
-        assert_eq!(staged.len, size_of::<Rv64SignalFrame>());
-        assert!(trampoline_end <= staged.data.len());
-    }
-
-    #[test]
     fn align_down_rounds_to_requested_boundary() {
         assert_eq!(align_down(0x100f, 16), 0x1000);
         assert_eq!(align_down(0x1000, 16), 0x1000);

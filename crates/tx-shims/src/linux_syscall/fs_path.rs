@@ -10,6 +10,7 @@ use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
 // xtask/src/lint_invariants_cred_check.rs.
 use tx_subsystems::cred::checks as cred_checks;
 use tx_subsystems::mount::MountPayload;
+use tx_subsystems::vfs::structure::OpenFileBacking;
 
 // =====================================================================
 // Wave 4 Part 4 of the DAC + setuid slice — file-mode syscall arms.
@@ -79,7 +80,7 @@ use tx_subsystems::mount::MountPayload;
 /// (`OpenFile::opendir_dentry()` carries the dentry for fds opened
 /// with `O_DIRECTORY`). Returns `EBADF` for closed/invalid fds and
 /// `ENOTDIR` for fds that aren't directories.
-pub(super) fn resolve_cwd(dirfd: i32, ctx: &SyscallCtx) -> Result<Cap<DEntry>, i32> {
+fn resolve_cwd(dirfd: i32, ctx: &SyscallCtx) -> Result<Cap<DEntry>, i32> {
     if dirfd == AT_FDCWD {
         return ctx.process.cwd().ok_or(ENOENT_VALUE);
     }
@@ -90,24 +91,13 @@ pub(super) fn resolve_cwd(dirfd: i32, ctx: &SyscallCtx) -> Result<Cap<DEntry>, i
     open_file.opendir_dentry().ok_or(ENOTDIR_VALUE)
 }
 
-pub(super) fn resolve_cwd_for_path(
-    dirfd: i32,
-    path: &[u8],
-    ctx: &SyscallCtx,
-) -> Result<Cap<DEntry>, i32> {
-    if path.starts_with(b"/") {
-        return ctx.process.cwd().ok_or(ENOENT_VALUE);
-    }
-    resolve_cwd(dirfd, ctx)
-}
-
 fn resolve_path_at<P: PmapIf>(
     dirfd: i32,
     path: &[u8],
     cred: &Credential,
     ctx: &SyscallCtx<'_>,
 ) -> Result<Cap<DEntry>, i32> {
-    let cwd: Cap<DEntry> = resolve_cwd_for_path(dirfd, path, ctx)?;
+    let cwd: Cap<DEntry> = resolve_cwd(dirfd, ctx)?;
     let guard = step_engine::guard();
     // Uses `step_walk` (consuming `FsOps` via the direct
     // `MountPayload::fs_ops` field) and matches the four-variant
@@ -124,7 +114,7 @@ fn resolve_path_at<P: PmapIf>(
         V3::Continue { .. } | V3::Yield { .. } => {
             return Err(EIO_VALUE);
         }
-        V3::Err(errno) => return Err(errno_to_i32(errno)),
+        V3::Err(errno) => return Err(errno_to_i32(Errno::from(errno))),
     };
     drop(guard);
     Ok(dentry)
@@ -211,10 +201,10 @@ pub(super) fn fs_ops_for_dentry(
 ///
 /// Wraps `FsOps::step_chmod` (Wave 3 Part 2). Permission failures
 /// surface as `-EPERM`; read-only filesystems (e.g. devfs) return
-/// `-EROFS`. Linux RV64's `fchmodat` syscall is the legacy 3-argument
-/// form; any would-be flags register is ignored here. Mode is masked
-/// to the bottom 12 bits (preserving `S_ISUID`, `S_ISGID`, `S_ISVTX`
-/// plus `rwxrwxrwx`).
+/// `-EROFS`. The `flags` argument (`AT_SYMLINK_NOFOLLOW`) is accepted
+/// silently — chmod doesn't follow symlinks at this layer in the
+/// slice anyway. Mode is masked to the bottom 12 bits (preserving
+/// `S_ISUID`, `S_ISGID`, `S_ISVTX` plus `rwxrwxrwx`).
 pub(super) fn sys_fchmodat<P: PmapIf>(
     dirfd: i32,
     path_uaddr: u64,
@@ -226,15 +216,12 @@ pub(super) fn sys_fchmodat<P: PmapIf>(
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
     };
-    if path.is_empty() {
-        return SyscallResult::Error(ENOENT_VALUE);
-    }
-    let rooted_at = match resolve_cwd_for_path(dirfd, &path, ctx) {
+    let rooted_at = match resolve_cwd(dirfd, ctx) {
         Ok(d) => d,
         Err(e) => return SyscallResult::Error(e),
     };
     let walker_cred = ctx.walker_cred();
-    let requested_mode = (mode & 0o7777) as u16;
+    let new_mode = (mode & 0o7777) as u16;
 
     // Cred check at the syscall arm using ctx.cred_snapshot().
     // Per-FS step_chmod impls (tmpfs / devfs / bdevfs / procfs)
@@ -247,11 +234,9 @@ pub(super) fn sys_fchmodat<P: PmapIf>(
         Err(e) => return SyscallResult::Error(e),
     };
     let target_meta = target_dentry.rnode().meta();
-    if let Err(e) = cred_checks::authorize_chmod(ctx.cred_snapshot(), &target_meta, requested_mode)
-    {
+    if let Err(e) = cred_checks::authorize_chmod(ctx.cred_snapshot(), &target_meta, new_mode) {
         return SyscallResult::error_from(e);
     }
-    let new_mode = chmod_mode_after_linux_fsetid_clear(requested_mode, &target_meta, ctx);
 
     let result = {
         let mut script_ctx = build_subject_script_ctx(ctx);
@@ -266,57 +251,40 @@ pub(super) fn sys_fchmodat<P: PmapIf>(
     };
     match result {
         Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => SyscallResult::Error(fs_change_errno_magnitude(v3errno)),
+        Err(v3errno) => SyscallResult::Error(fs_change_errno_magnitude(Errno::from(v3errno))),
     }
 }
 
-/// `fchmod(fd, mode)`. Linux RV64 generic ABI `__NR_fchmod = 52`.
-pub(super) fn sys_fchmod(fd: i32, mode: u32, ctx: &SyscallCtx<'_>) -> SyscallResult {
-    if fd < 0 {
-        return SyscallResult::Error(EBADF_VALUE);
-    }
-    let open_file = match ctx.process.fd(fd as u32) {
+/// `fchmod(fd, mode)`. Linux RV64 generic ABI.
+///
+/// Resolves the fd's rnode and applies the same authorization and
+/// `FsOps::step_chmod` mutation path as `fchmodat`, without adding
+/// any path or symlink policy.
+pub(super) fn sys_fchmod(fd: u32, mode: u32, ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let open_file = match ctx.process.fd(fd) {
         Some(file) => file,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
-    let rnode = open_file.rnode();
-    let fs_object_id = rnode.fs_object_id();
-    let fs_ops = match fs_ops_for_rnode(rnode) {
-        Some(fs_ops) => fs_ops,
-        None => return SyscallResult::Error(EROFS_VALUE),
+    let rnode = match open_file.backing() {
+        OpenFileBacking::Rnode { rnode } => rnode.clone(),
+        _ => return SyscallResult::Error(EBADF_VALUE),
     };
-    let target_meta = {
-        let guard = step_engine::guard();
-        match fs_ops.load_inode_meta(fs_object_id, &guard) {
-            StepOutcome::Done(meta) => meta,
-            _ => rnode.meta(),
-        }
-    };
-    let requested_mode = (mode & 0o7777) as u16;
-    if let Err(e) = cred_checks::authorize_chmod(ctx.cred_snapshot(), &target_meta, requested_mode)
-    {
+    let new_mode = (mode & 0o7777) as u16;
+    let target_meta = rnode.meta();
+    if let Err(e) = cred_checks::authorize_chmod(ctx.cred_snapshot(), &target_meta, new_mode) {
         return SyscallResult::error_from(e);
     }
-    let new_mode = chmod_mode_after_linux_fsetid_clear(requested_mode, &target_meta, ctx);
+    let fs_ops = match crate::linux_syscall::fs_basic::fs_ops_for_rnode(&rnode) {
+        Some(fs_ops) => fs_ops,
+        None => return SyscallResult::Error(ENOSYS_VALUE),
+    };
     let guard = step_engine::guard();
-    match fs_ops.step_chmod(fs_object_id, new_mode, &ctx.walker_cred(), &guard) {
+    match fs_ops.step_chmod(rnode.fs_object_id(), new_mode, &ctx.walker_cred(), &guard) {
         StepOutcome::Done(()) => SyscallResult::Return(0),
-        StepOutcome::Err(v3errno) => SyscallResult::Error(fs_change_errno_magnitude(v3errno)),
-        _ => SyscallResult::Error(ENOSYS_VALUE),
-    }
-}
-
-fn chmod_mode_after_linux_fsetid_clear(
-    requested_mode: u16,
-    target_meta: &InodeMeta,
-    ctx: &SyscallCtx<'_>,
-) -> u16 {
-    let cred = ctx.cred_snapshot().cred();
-    if (requested_mode & S_ISGID) != 0 && cred.euid.raw() != 0 && cred.egid.raw() != target_meta.gid
-    {
-        requested_mode & !S_ISGID
-    } else {
-        requested_mode
+        StepOutcome::Err(errno) => {
+            SyscallResult::Error(fs_change_errno_magnitude(Errno::from(errno)))
+        }
+        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => SyscallResult::Error(EIO_VALUE),
     }
 }
 
@@ -333,24 +301,17 @@ pub(super) fn sys_fchownat<P: PmapIf>(
     path_uaddr: u64,
     uid_arg: u32,
     gid_arg: u32,
-    flags: i32,
+    _flags: i32,
     ctx: &SyscallCtx<'_>,
 ) -> SyscallResult {
-    let known_flags = AT_EMPTY_PATH as i32 | AT_SYMLINK_NOFOLLOW;
-    if flags & !known_flags != 0 {
-        return SyscallResult::Error(EINVAL_VALUE);
-    }
     let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
     };
-    if path.is_empty() && flags & AT_EMPTY_PATH as i32 == 0 {
-        return SyscallResult::Error(ENOENT_VALUE);
-    }
     let walker_cred = ctx.walker_cred();
     let uid = decode_uid_arg(uid_arg).map(|u| u.0);
     let gid = decode_gid_arg(gid_arg).map(|g| g.0);
-    let rooted_at = match resolve_cwd_for_path(dirfd, &path, ctx) {
+    let rooted_at = match resolve_cwd(dirfd, ctx) {
         Ok(d) => d,
         Err(e) => return SyscallResult::Error(e),
     };
@@ -381,7 +342,46 @@ pub(super) fn sys_fchownat<P: PmapIf>(
     };
     match result {
         Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => SyscallResult::Error(fs_change_errno_magnitude(v3errno)),
+        Err(v3errno) => SyscallResult::Error(fs_change_errno_magnitude(Errno::from(v3errno))),
+    }
+}
+
+/// `fchown(fd, uid, gid)`. Linux RV64 generic ABI.
+///
+/// Resolves the fd's rnode and applies the same authorization,
+/// `(u32)-1` sentinel decoding, and `FsOps::step_chown` mutation path
+/// as `fchownat`.
+pub(super) fn sys_fchown(
+    fd: u32,
+    uid_arg: u32,
+    gid_arg: u32,
+    ctx: &SyscallCtx<'_>,
+) -> SyscallResult {
+    let open_file = match ctx.process.fd(fd) {
+        Some(file) => file,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+    let rnode = match open_file.backing() {
+        OpenFileBacking::Rnode { rnode } => rnode.clone(),
+        _ => return SyscallResult::Error(EBADF_VALUE),
+    };
+    let uid = decode_uid_arg(uid_arg).map(|u| u.0);
+    let gid = decode_gid_arg(gid_arg).map(|g| g.0);
+    let target_meta = rnode.meta();
+    if let Err(e) = cred_checks::authorize_chown(ctx.cred_snapshot(), &target_meta, uid, gid) {
+        return SyscallResult::error_from(e);
+    }
+    let fs_ops = match crate::linux_syscall::fs_basic::fs_ops_for_rnode(&rnode) {
+        Some(fs_ops) => fs_ops,
+        None => return SyscallResult::Error(ENOSYS_VALUE),
+    };
+    let guard = step_engine::guard();
+    match fs_ops.step_chown(rnode.fs_object_id(), uid, gid, &ctx.walker_cred(), &guard) {
+        StepOutcome::Done(()) => SyscallResult::Return(0),
+        StepOutcome::Err(errno) => {
+            SyscallResult::Error(fs_change_errno_magnitude(Errno::from(errno)))
+        }
+        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => SyscallResult::Error(EIO_VALUE),
     }
 }
 
@@ -470,7 +470,7 @@ pub(super) fn sys_faccessat2_impl<P: PmapIf>(
         };
         match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
             Ok(m) => m,
-            Err(v3errno) => return SyscallResult::error_from(v3errno),
+            Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
         }
     };
     let mode_bits = inode_meta.mode as u32;
@@ -577,7 +577,7 @@ pub(super) async fn sys_chdir<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
             V3::Continue { .. } | V3::Yield { .. } => {
                 return SyscallResult::Error(EIO_VALUE);
             }
-            V3::Err(errno) => return SyscallResult::error_from(errno),
+            V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
         }
     };
 
@@ -593,7 +593,7 @@ pub(super) async fn sys_chdir<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(ChdirOutcome::Replaced { .. }) => SyscallResult::Return(0),
         Ok(ChdirOutcome::ZombieIgnored) => SyscallResult::Error(ESRCH_VALUE),
-        Err(v3errno) => SyscallResult::error_from(v3errno),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
@@ -631,7 +631,7 @@ pub(super) fn sys_getcwd<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
     let path = match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(Some(p)) => p,
         Ok(None) => return SyscallResult::Error(ENOENT_VALUE),
-        Err(v3errno) => return SyscallResult::error_from(v3errno),
+        Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
     };
     // `path` is the rendered absolute path bytes (no NUL terminator);
     // `size` must accommodate `path.len() + 1` to fit the terminator.
@@ -682,8 +682,8 @@ pub(super) fn sys_umask<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
 //   - `sys_readlinkat` (NR_READLINKAT = 78) — walks parent directory
 //     and calls `FsOps::lookup` + `FsOps::read_link` so the symlink
 //     itself is returned (not its target).
-//   - `sys_utimensat` (NR_UTIMENSAT = 88) — updates inode timestamps
-//     through `FsOps::serialize_inode_meta`.
+//   - `sys_utimensat` (NR_UTIMENSAT = 88) — returns `-ENOSYS` (no
+//     `FsOps::set_times` hook yet; deferred per slice plan).
 //   - `sys_renameat2` (NR_RENAMEAT2 = 276) — `RENAME_NOREPLACE`
 //     honoured via pre-walk; `RENAME_EXCHANGE` / `RENAME_WHITEOUT`
 //     return `-ENOSYS` / `-EINVAL`.
@@ -737,7 +737,7 @@ pub(super) fn walk_from(
     match outcome {
         V3::Done(d) => Ok(d),
         V3::Continue { .. } | V3::Yield { .. } => Err(EIO_VALUE),
-        V3::Err(errno) => Err(errno_to_i32(errno)),
+        V3::Err(errno) => Err(errno_to_i32(Errno::from(errno))),
     }
 }
 
@@ -758,6 +758,6 @@ pub(super) fn walk_from_process(
     match outcome {
         V3::Done(d) => Ok(d),
         V3::Continue { .. } | V3::Yield { .. } => Err(EIO_VALUE),
-        V3::Err(errno) => Err(errno_to_i32(errno)),
+        V3::Err(errno) => Err(errno_to_i32(Errno::from(errno))),
     }
 }

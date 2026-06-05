@@ -156,6 +156,7 @@ fn open_file_dispatches_struct_payload_read_write() {
             append: false,
             cloexec: false,
             nonblocking: false,
+            packet: false,
         },
     );
     let mut out = [0u8; 8];
@@ -195,6 +196,7 @@ fn open_file_dispatches_struct_payload_read_write() {
             append: false,
             cloexec: false,
             nonblocking: false,
+            packet: false,
         },
     );
     let mut char_out = [0u8; 1];
@@ -255,6 +257,7 @@ fn open_file_step_ioctl_dispatches_basic_tty_requests() {
             append: false,
             cloexec: false,
             nonblocking: false,
+            packet: false,
         },
     );
     let caller = OpenFileIoctlCaller::from_process(&init);
@@ -315,6 +318,7 @@ fn open_file_step_ioctl_dispatches_process_aware_tty_session_ops() {
             append: false,
             cloexec: false,
             nonblocking: false,
+            packet: false,
         },
     );
     let init_caller = OpenFileIoctlCaller::from_process(&init);
@@ -384,6 +388,7 @@ fn open_file_step_ioctl_rejects_non_tty_backings() {
             append: false,
             cloexec: false,
             nonblocking: false,
+            packet: false,
         },
     );
     assert_eq!(
@@ -405,6 +410,7 @@ fn open_file_step_ioctl_rejects_non_tty_backings() {
             append: false,
             cloexec: false,
             nonblocking: false,
+            packet: false,
         },
     );
     assert_eq!(

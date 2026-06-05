@@ -26,7 +26,6 @@ use tx_subsystems::signalfd::ops::SignalfdCreateOp;
 use tx_subsystems::signalfd::{signalfd_read, SignalFd, SIGNALFD_SIGINFO_SIZE};
 use tx_subsystems::vfs::structure::OpenFileFlags;
 use tx_subsystems::vfs::OpenFile;
-use tx_subsystems::wait_source;
 
 use super::numbers::{O_CLOEXEC, O_NONBLOCK, SFD_CLOEXEC, SFD_NONBLOCK};
 use super::{
@@ -96,7 +95,7 @@ pub(super) fn sys_signalfd4<'a>(
             match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
                 Ok(Ok(cap)) => cap,
                 Ok(Err(_)) => return SyscallResult::Error(ENOMEM_VALUE),
-                Err(v3errno) => return SyscallResult::error_from(v3errno),
+                Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
             }
         };
 
@@ -106,6 +105,7 @@ pub(super) fn sys_signalfd4<'a>(
             append: false,
             cloexec,
             nonblocking,
+            packet: false,
         };
         let open_cap = match OpenFile::new_signalfd_cap(sfd_cap, open_flags) {
             Ok(cap) => cap,
@@ -134,13 +134,6 @@ pub(super) fn sys_signalfd4<'a>(
     };
     sfd_cap.set_mask(mask);
     SyscallResult::Return(fd as i64)
-}
-
-/// Historical `signalfd(fd, mask, sizemask)` wrapper. Linux generic
-/// userspace normally reaches `signalfd4`, but some LTP binaries still
-/// probe the old three-argument shape.
-pub(super) fn sys_signalfd<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
-    sys_signalfd4(args[0] as i32, args[1], args[2], 0, ctx)
 }
 
 /// signalfd-shaped `read(2)` arm. Drains one
@@ -172,7 +165,6 @@ pub(super) async fn sys_signalfd_read(
     }
 
     let nonblocking = file.flags().nonblocking;
-    use tx_subsystems::execution::WaitToken;
     loop {
         let outcome = {
             let mut staging = [0u8; SIGNALFD_SIGINFO_SIZE];
@@ -193,7 +185,7 @@ pub(super) async fn sys_signalfd_read(
                 return SyscallResult::Return(read as i64);
             }
             V3Out::Err(v3errno) => {
-                let errno: Errno = v3errno;
+                let errno: Errno = v3errno.into();
                 if errno == Errno::EAGAIN {
                     return SyscallResult::Error(EAGAIN_VALUE);
                 }
@@ -207,10 +199,7 @@ pub(super) async fn sys_signalfd_read(
                     },
                 ..
             } => {
-                let token = WaitToken::new(carrier.raw(), interests.raw());
-                if let Some(future) = wait_source::wait_on_token(token) {
-                    let _ = future.await;
-                }
+                super::await_wait_source(ctx, carrier, interests).await;
                 // Re-poll on next loop iteration.
             }
             V3Out::Continue { .. } | V3Out::Yield { .. } => {

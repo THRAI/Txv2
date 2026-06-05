@@ -6,18 +6,14 @@
 // `impl<P: TxPlatform> CoreInit<P>` block in `init.rs` and
 // `init::exec`.
 //
-// The helper creates `/bin/{sh,busybox,ls,basename,ip,ifconfig}` and
-// `/usr/bin/env` as
+// The helper creates `/bin/{sh,busybox,ls}` and `/usr/bin/env` as
 // rootfs-tmpfs symlinks pointing at `/musl/musl/busybox` so the
 // OSComp `libctest`, `lua`, and `libcbench` wrapper scripts find
-// their shebang interpreters. It also exposes the absolute dynamic
-// loader paths used by the OSComp RV64/LA64 images. See the doc-comment on
+// their shebang interpreters. See the doc-comment on
 // `populate_rootfs_shebang_shims` for the full design rationale.
 
 use super::*;
-use crate::adapter::step_engine::{self as step_engine, page_allocator, StepOutcome};
-use tx_subsystems::page_backed::{FsPageBacking, MaterializeAccess, PageIndex};
-use tx_subsystems::vfs::{FsObjectId, FsOps};
+use crate::adapter::step_engine::{self as step_engine, StepOutcome};
 
 impl<P: TxPlatform> CoreInit<P> {
     /// Populate the rootfs tmpfs with the shebang shims the
@@ -27,18 +23,8 @@ impl<P: TxPlatform> CoreInit<P> {
     /// ```text
     /// /bin/busybox    → /musl/musl/busybox  (handles `#!/bin/busybox sh …`)
     /// /bin/sh         → /musl/musl/busybox  (handles `#!/bin/sh`)
-    /// /bin/cat        → /musl/musl/busybox  (LTP opens it as a stable file)
     /// /bin/ls         → /musl/musl/busybox  (lets BusyBox `which ls` pass)
-    /// /bin/basename   → /musl/musl/busybox  (lets full LTP markers name cases)
-    /// /bin/ip         → /musl/musl/busybox  (lets LTP setup scripts bring up lo)
-    /// /bin/ifconfig   → /musl/musl/busybox  (same, for older LTP helpers)
     /// /usr/bin/env    → /musl/musl/busybox  (handles `#!/usr/bin/env …`)
-    /// /boot/config-6.1.0-txkernel          (lets LTP parse kernel config)
-    /// /lib/ld-linux-riscv64-lp64d.so.1 → /musl/glibc/lib/ld-linux-riscv64-lp64d.so.1
-    /// /lib/libc.so.6  → /musl/glibc/lib/libc.so.6
-    /// /lib/libm.so.6  → /musl/glibc/lib/libm.so.6
-    /// /lib64/ld-linux-loongarch-lp64d.so.1 → /musl/glibc/lib/ld-linux-loongarch-lp64d.so.1
-    /// /lib64/ld-musl-loongarch-lp64d.so.1  → /musl/musl/lib/libc.so
     /// ```
     ///
     /// The wrapper scripts (`scripts/lua/test.sh`, `run-static.sh`,
@@ -85,12 +71,7 @@ impl<P: TxPlatform> CoreInit<P> {
         };
         let _ = symlink_into(fs_ops, bin_id, b"busybox", b"/musl/musl/busybox", &cred);
         let _ = symlink_into(fs_ops, bin_id, b"sh", b"/musl/musl/busybox", &cred);
-        let _ = symlink_into(fs_ops, bin_id, b"cat", b"/musl/musl/busybox", &cred);
-        let _ = symlink_into(fs_ops, bin_id, b"true", b"/musl/musl/busybox", &cred);
         let _ = symlink_into(fs_ops, bin_id, b"ls", b"/musl/musl/busybox", &cred);
-        let _ = symlink_into(fs_ops, bin_id, b"basename", b"/musl/musl/busybox", &cred);
-        let _ = symlink_into(fs_ops, bin_id, b"ip", b"/musl/musl/busybox", &cred);
-        let _ = symlink_into(fs_ops, bin_id, b"ifconfig", b"/musl/musl/busybox", &cred);
 
         // /usr and /usr/bin
         let usr_id = match mkdir_or_find(fs_ops, root_fs_object_id, b"usr", 0o755, &cred) {
@@ -110,66 +91,6 @@ impl<P: TxPlatform> CoreInit<P> {
             }
         };
         let _ = symlink_into(fs_ops, usr_bin_id, b"env", b"/musl/musl/busybox", &cred);
-
-        // glibc dynamic payloads in the OSComp sdcard request absolute loader
-        // paths such as /lib/ld-linux-riscv64-lp64d.so.1. Keep these as
-        // symlinks into the mounted sdcard so the same rootfs can boot either
-        // musl or glibc focused witnesses.
-        let lib_id = match mkdir_or_find(fs_ops, root_fs_object_id, b"lib", 0o755, &cred) {
-            Some(id) => id,
-            None => {
-                Self::write_board_sentinel_prefix();
-                tx_hal::console_write_str::<P>(":shebang-shims:err:mkdir-lib\n");
-                return;
-            }
-        };
-        let _ = symlink_into(
-            fs_ops,
-            lib_id,
-            b"ld-linux-riscv64-lp64d.so.1",
-            b"/musl/glibc/lib/ld-linux-riscv64-lp64d.so.1",
-            &cred,
-        );
-        let _ = symlink_into(
-            fs_ops,
-            lib_id,
-            b"libc.so.6",
-            b"/musl/glibc/lib/libc.so.6",
-            &cred,
-        );
-        let _ = symlink_into(
-            fs_ops,
-            lib_id,
-            b"libm.so.6",
-            b"/musl/glibc/lib/libm.so.6",
-            &cred,
-        );
-
-        // LA64 OSComp user binaries request absolute /lib64 loaders:
-        // the basic/glibc payloads use glibc's ld-linux, while the musl
-        // dynamic payloads use musl's libc.so as the loader.
-        let lib64_id = match mkdir_or_find(fs_ops, root_fs_object_id, b"lib64", 0o755, &cred) {
-            Some(id) => id,
-            None => {
-                Self::write_board_sentinel_prefix();
-                tx_hal::console_write_str::<P>(":shebang-shims:err:mkdir-lib64\n");
-                return;
-            }
-        };
-        let _ = symlink_into(
-            fs_ops,
-            lib64_id,
-            b"ld-linux-loongarch-lp64d.so.1",
-            b"/musl/glibc/lib/ld-linux-loongarch-lp64d.so.1",
-            &cred,
-        );
-        let _ = symlink_into(
-            fs_ops,
-            lib64_id,
-            b"ld-musl-loongarch-lp64d.so.1",
-            b"/musl/musl/lib/libc.so",
-            &cred,
-        );
 
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":shebang-shims:ok\n");
@@ -245,144 +166,6 @@ impl<P: TxPlatform> CoreInit<P> {
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":tmp-dirs:ok\n");
     }
-
-    /// Seed the small identity database and helper commands expected by
-    /// older LTP tests that create a temporary non-root user.
-    pub(crate) fn populate_rootfs_identity_files() {
-        let root_mount = ROOT_MOUNT
-            .lock()
-            .clone()
-            .expect("populate_rootfs_identity_files: ROOT_MOUNT must be populated");
-        let rootfs_payload = root_mount
-            .payload_cap()
-            .expect("rootfs payload alive during boot")
-            .into_cap()
-            .clone();
-        let cred = Credential::root();
-        let root_fs_object_id = root_mount.root().fs_object_id();
-        let fs_ops = &rootfs_payload.fs_ops;
-        let fs_page_backing = &rootfs_payload.fs_page_backing;
-        let create_ctx = RootfsCreateContext {
-            fs_ops,
-            fs_page_backing,
-            mount: &rootfs_payload,
-            cred: &cred,
-        };
-
-        let etc_id = match mkdir_or_find(fs_ops, root_fs_object_id, b"etc", 0o755, &cred) {
-            Some(id) => id,
-            None => {
-                Self::write_board_sentinel_prefix();
-                tx_hal::console_write_str::<P>(":identity-files:err:mkdir-etc\n");
-                return;
-            }
-        };
-        let _ = mkdir_or_find(fs_ops, root_fs_object_id, b"home", 0o755, &cred);
-        let _ = mkdir_or_find(fs_ops, root_fs_object_id, b"root", 0o700, &cred);
-
-        let passwd = b"root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/nonexistent:/bin/sh\nhsym:x:1000:1000:hsym:/home/hsym:/bin/sh\n";
-        let group =
-            b"root:x:0:\ndaemon:x:2:\nusers:x:100:\nnogroup:x:65534:\nnobody:x:65534:\nhsym:x:1000:\n";
-        if !create_file_with_data(&create_ctx, etc_id, b"passwd", 0o666, passwd)
-            || !create_file_with_data(&create_ctx, etc_id, b"group", 0o666, group)
-        {
-            Self::write_board_sentinel_prefix();
-            tx_hal::console_write_str::<P>(":identity-files:err:create-etc-files\n");
-            return;
-        }
-        let _ = create_file_with_data(
-            &create_ctx,
-            etc_id,
-            b"shadow",
-            0o600,
-            b"root:*:0:0:99999:7:::\nnobody:*:0:0:99999:7:::\nhsym:*:0:0:99999:7:::\n",
-        );
-        let _ = create_file_with_data(
-            &create_ctx,
-            etc_id,
-            b"gshadow",
-            0o600,
-            b"root:*::\ndaemon:*::\nusers:*::\nnogroup:*::\nnobody:*::\nhsym:*::\n",
-        );
-
-        let bin_id = match mkdir_or_find(fs_ops, root_fs_object_id, b"bin", 0o755, &cred) {
-            Some(id) => id,
-            None => {
-                Self::write_board_sentinel_prefix();
-                tx_hal::console_write_str::<P>(":identity-files:err:mkdir-bin\n");
-                return;
-            }
-        };
-        let useradd_script = b"#!/bin/sh\nexit 0\n";
-        let userdel_script = b"#!/bin/sh\nexit 0\n";
-        let _ = create_file_with_data(&create_ctx, bin_id, b"useradd", 0o755, useradd_script);
-        let _ = create_file_with_data(&create_ctx, bin_id, b"userdel", 0o755, userdel_script);
-        let usr_id = match mkdir_or_find(fs_ops, root_fs_object_id, b"usr", 0o755, &cred) {
-            Some(id) => id,
-            None => root_fs_object_id,
-        };
-        let usr_bin_id = mkdir_or_find(fs_ops, usr_id, b"bin", 0o755, &cred).unwrap_or(usr_id);
-        let usr_sbin_id = mkdir_or_find(fs_ops, usr_id, b"sbin", 0o755, &cred).unwrap_or(usr_id);
-        let sbin_id = mkdir_or_find(fs_ops, root_fs_object_id, b"sbin", 0o755, &cred)
-            .unwrap_or(root_fs_object_id);
-        for parent in [usr_bin_id, usr_sbin_id, sbin_id] {
-            let _ = symlink_into(fs_ops, parent, b"useradd", b"/bin/useradd", &cred);
-            let _ = symlink_into(fs_ops, parent, b"userdel", b"/bin/userdel", &cred);
-        }
-
-        Self::write_board_sentinel_prefix();
-        tx_hal::console_write_str::<P>(":identity-files:ok\n");
-    }
-
-    /// Populate the plain-text kernel config path that LTP probes after
-    /// `/proc/config.gz`. The config is intentionally conservative: it exposes
-    /// implemented compatibility surfaces and marks unsupported heavy features
-    /// as not set so LTP reports them as configuration skips instead of running
-    /// into unrelated missing namespace/TLS/netfilter machinery.
-    pub(crate) fn populate_rootfs_kernel_config() {
-        let root_mount = ROOT_MOUNT
-            .lock()
-            .clone()
-            .expect("populate_rootfs_kernel_config: ROOT_MOUNT must be populated");
-        let rootfs_payload = root_mount
-            .payload_cap()
-            .expect("rootfs payload alive during boot")
-            .into_cap()
-            .clone();
-        let cred = Credential::root();
-        let root_fs_object_id = root_mount.root().fs_object_id();
-        let fs_ops = &rootfs_payload.fs_ops;
-        let fs_page_backing = &rootfs_payload.fs_page_backing;
-        let create_ctx = RootfsCreateContext {
-            fs_ops,
-            fs_page_backing,
-            mount: &rootfs_payload,
-            cred: &cred,
-        };
-
-        let boot_id = match mkdir_or_find(fs_ops, root_fs_object_id, b"boot", 0o755, &cred) {
-            Some(id) => id,
-            None => {
-                Self::write_board_sentinel_prefix();
-                tx_hal::console_write_str::<P>(":kernel-config:err:mkdir-boot\n");
-                return;
-            }
-        };
-        if !create_file_with_data(
-            &create_ctx,
-            boot_id,
-            b"config-6.1.0-txkernel",
-            0o644,
-            tx_fs::procfs::KERNEL_CONFIG_TEXT.as_bytes(),
-        ) {
-            Self::write_board_sentinel_prefix();
-            tx_hal::console_write_str::<P>(":kernel-config:err:create-config\n");
-            return;
-        }
-
-        Self::write_board_sentinel_prefix();
-        tx_hal::console_write_str::<P>(":kernel-config:ok\n");
-    }
 }
 
 /// Create-or-find a directory under `parent`. Treats EEXIST as
@@ -433,69 +216,5 @@ fn symlink_into(
     matches!(
         fs_ops.symlink(parent, name, target, cred, &guard),
         StepOutcome::Done(_)
-    )
-}
-
-struct RootfsCreateContext<'a> {
-    fs_ops: &'a alloc::sync::Arc<dyn FsOps>,
-    fs_page_backing: &'a alloc::sync::Arc<dyn FsPageBacking>,
-    mount: &'a Cap<MountPayload>,
-    cred: &'a Credential,
-}
-
-fn create_file_with_data(
-    ctx: &RootfsCreateContext<'_>,
-    parent: FsObjectId,
-    name: &[u8],
-    mode: u16,
-    data: &[u8],
-) -> bool {
-    let (file_id, file_meta) = {
-        let guard = step_engine::guard();
-        match ctx
-            .fs_ops
-            .create_inode(parent, name, mode, ctx.cred, &guard)
-        {
-            StepOutcome::Done(out) => out,
-            StepOutcome::Err(step_engine::Errno::EEXIST) => return true,
-            _ => return false,
-        }
-    };
-
-    let pc = {
-        let guard = step_engine::guard();
-        let rnode = match ctx
-            .fs_ops
-            .materialise_rnode(file_id, file_meta, ctx.mount, &guard)
-        {
-            StepOutcome::Done(rnode) => rnode,
-            _ => return false,
-        };
-        match rnode.backing() {
-            RNodeBacking::PageBacked { pc } => pc.clone(),
-            _ => return false,
-        }
-    };
-
-    for (idx, chunk) in data.chunks(tx_subsystems::vm::USER_PAGE_SIZE).enumerate() {
-        let materialized =
-            match pc.materialize_anon(PageIndex::new(idx as u64), MaterializeAccess::Write) {
-                Ok(page) => page,
-                Err(_) => return false,
-            };
-        let frame_base = match page_allocator::frame_kernel_addr(materialized.ppn) {
-            Ok(addr) => addr,
-            Err(_) => return false,
-        };
-        unsafe {
-            core::ptr::copy_nonoverlapping(chunk.as_ptr(), frame_base, chunk.len());
-        }
-    }
-
-    let guard = step_engine::guard();
-    matches!(
-        ctx.fs_page_backing
-            .truncate(file_id, data.len() as u64, &guard),
-        StepOutcome::Done(())
     )
 }

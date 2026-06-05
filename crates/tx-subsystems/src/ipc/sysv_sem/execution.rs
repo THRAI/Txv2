@@ -9,27 +9,13 @@ use core::sync::atomic::Ordering;
 use crate::cred::Cred;
 use crate::execution::Errno;
 use crate::ipc::sysv_sem::checks;
+use crate::ipc::sysv_sem::notification;
 use crate::ipc::sysv_sem::structure::{self, sem_flg, SemBuf};
 use crate::ipc::sysv_shm::execution::{IPC_CREAT, IPC_EXCL, IPC_PRIVATE};
 use crate::ipc::sysv_shm::structure::IpcPerm;
-use crate::process::adapter::step_engine::{
-    Cap, InterestMask, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity, WaitSourceId,
-    YieldShape,
-};
-use crate::process::adapter::wait_routing::{self, Mask};
+use crate::process::adapter::step_engine::{Cap, NoProgress, StepOutcome};
 use crate::process::nsproxy::SysvKey;
 use crate::process::structure::ProcessIdentity;
-use tx_substrate::step::{Errno as StepErrno, ResumeOutcome};
-
-const SEM_CHANGED_MASK: u64 = 1;
-
-fn fire_sem_changed(payload: &structure::SemArrayPayload) {
-    payload.changed_seq.fetch_add(1, Ordering::Release);
-    payload
-        .changed_channel
-        .fire(Mask::from_bits(SEM_CHANGED_MASK));
-    wait_routing::notify_v3_source(&payload.changed_wait_source, SEM_CHANGED_MASK);
-}
 
 // semctl commands
 pub use crate::ipc::sysv_shm::execution::{IPC_INFO, IPC_RMID, IPC_SET, IPC_STAT};
@@ -43,6 +29,8 @@ pub const SETALL: i32 = 17;
 pub const SETVAL: i32 = 16;
 pub const SEM_INFO: i32 = 19;
 pub const SEM_STAT_ANY: i32 = 20;
+
+pub type SemopOutcome = StepOutcome<usize, NoProgress>;
 
 macro_rules! with_payload {
     ($array:expr, $guard:ident, $block:block) => {{
@@ -126,30 +114,57 @@ pub fn step_semop(
     cred: &Cap<Cred>,
     process: &Cap<ProcessIdentity>,
 ) -> Result<usize, Errno> {
+    // observe/upgrade/reserve/commit/publish are delegated to the v3 op.
+    // This legacy wrapper cannot drive waits, so it preserves the old
+    // non-blocking Result shape by surfacing a yielded wait as EAGAIN.
+    match step_semop_v3(semid, sops, cred, process) {
+        StepOutcome::Done(applied) => Ok(applied),
+        StepOutcome::Err(errno) => Err(errno.into()),
+        StepOutcome::Yield { .. } => Err(Errno::EAGAIN),
+        StepOutcome::Continue { .. } => Err(Errno::EIO),
+    }
+}
+
+pub fn step_semop_v3(
+    semid: u32,
+    sops: &[SemBuf],
+    cred: &Cap<Cred>,
+    process: &Cap<ProcessIdentity>,
+) -> SemopOutcome {
     // observe: inspect current subsystem state and validate inputs.
     // upgrade: acquire capabilities/guards needed for mutation.
     // reserve: reserve namespace, memory, or wait-source effects.
     // commit: apply the state transition.
     // publish: emit readiness, signal, or observable outcome.
     if sops.is_empty() {
-        return Err(Errno::EINVAL);
+        return StepOutcome::err(Errno::EINVAL.into());
     }
 
-    let array = checks::require_sem_exists(semid)?;
+    let array = match checks::require_sem_exists(semid) {
+        Ok(array) => array,
+        Err(errno) => return StepOutcome::err(errno.into()),
+    };
     if array.destroyed.load(Ordering::Acquire) {
-        return Err(Errno::EIDRM);
+        return StepOutcome::err(Errno::EIDRM.into());
     }
-    checks::require_can_write_sem(&array, cred)?;
+    if let Err(errno) = checks::require_can_write_sem(&array, cred) {
+        return StepOutcome::err(errno.into());
+    }
 
     let nowait = sops.iter().any(|s| (s.sem_flg & sem_flg::IPC_NOWAIT) != 0);
 
-    with_payload!(array, payload, {
+    let payload = match array.payload.lock().as_ref().cloned() {
+        Some(payload) => payload,
+        None => return StepOutcome::err(Errno::EIDRM.into()),
+    };
+
+    {
         let mut values = payload.values.lock();
 
         // Validate all ops can fit.
         for s in sops {
             if s.sem_num >= array.nsems {
-                return Err(Errno::EFBIG);
+                return StepOutcome::err(Errno::EFBIG.into());
             }
         }
 
@@ -170,10 +185,9 @@ pub fn step_semop(
 
         if would_block {
             if nowait {
-                return Err(Errno::EAGAIN);
+                return StepOutcome::err(Errno::EAGAIN.into());
             }
-            // TODO: blocking semop — yield OnWaitSource with changed_channel
-            return Err(Errno::EAGAIN);
+            return notification::wait_for_change(payload.changed_source_id);
         }
 
         // Apply all ops and track SEM_UNDO.
@@ -204,115 +218,18 @@ pub fn step_semop(
                 .lock()
                 .as_ref()
                 .cloned()
-                .ok_or(Errno::ESRCH)?;
+                .ok_or(Errno::ESRCH);
+            let proc_payload = match proc_payload {
+                Ok(proc_payload) => proc_payload,
+                Err(errno) => return StepOutcome::err(errno.into()),
+            };
             proc_payload.record_sem_undo(semid, undo_adjustments);
         }
 
-        fire_sem_changed(payload);
-    });
-
-    Ok(sops.len())
-}
-
-pub struct SemopWaitOp<'a> {
-    pub semid: u32,
-    pub sops: &'a [SemBuf],
-    pub cred: &'a Cap<Cred>,
-    pub process: &'a Cap<ProcessIdentity>,
-    pub tid: Option<u32>,
-    watched_array: Option<Cap<structure::SemArrayIdentity>>,
-    waiting: bool,
-}
-
-impl<'a> SemopWaitOp<'a> {
-    pub fn new(
-        semid: u32,
-        sops: &'a [SemBuf],
-        cred: &'a Cap<Cred>,
-        process: &'a Cap<ProcessIdentity>,
-        tid: Option<u32>,
-    ) -> Self {
-        Self {
-            semid,
-            sops,
-            cred,
-            process,
-            tid,
-            watched_array: None,
-            waiting: false,
-        }
-    }
-
-    fn changed_source(&mut self) -> Result<u64, Errno> {
-        let array = if let Some(array) = self.watched_array.as_ref() {
-            array.clone()
-        } else {
-            let array = checks::require_sem_exists(self.semid)?;
-            self.watched_array = Some(array.clone());
-            array
-        };
-        if array.destroyed.load(Ordering::Acquire) {
-            return Err(Errno::EIDRM);
-        }
-        let payload = array.payload.lock().as_ref().cloned().ok_or(Errno::EIDRM)?;
-        Ok(payload.changed_source_id)
-    }
-}
-
-impl<I: SubjectIdentity> StepOp<I> for SemopWaitOp<'_> {
-    type Output = usize;
-    type Progress = NoProgress;
-
-    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        match step_semop(self.semid, self.sops, self.cred, self.process) {
-            Ok(applied) => StepOutcome::Done(applied),
-            Err(Errno::EAGAIN) => match self.changed_source() {
-                Ok(source_id) => {
-                    if !self.waiting {
-                        crate::futex::register_waiting_tid(self.tid);
-                    }
-                    self.waiting = true;
-                    StepOutcome::Yield {
-                        progress: NoProgress,
-                        shape: YieldShape::OnWaitSource {
-                            source: WaitSourceId::new(source_id),
-                            interests: InterestMask::new(SEM_CHANGED_MASK),
-                        },
-                    }
-                }
-                Err(errno) => StepOutcome::Err(errno.into()),
-            },
-            Err(Errno::EINVAL)
-                if self
-                    .watched_array
-                    .as_ref()
-                    .is_some_and(|array| array.destroyed.load(Ordering::Acquire)) =>
-            {
-                StepOutcome::Err(Errno::EIDRM.into())
-            }
-            Err(errno) => StepOutcome::Err(errno.into()),
-        }
-    }
-
-    fn apply_resume(&mut self, resume: ResumeOutcome) -> Result<(), StepErrno> {
-        if matches!(resume, ResumeOutcome::Retry) {
-            if self.waiting {
-                crate::futex::unregister_waiting_tid(self.tid);
-            }
-            self.waiting = false;
-            Ok(())
-        } else {
-            Err(StepErrno::EINVAL)
-        }
-    }
-}
-
-impl Drop for SemopWaitOp<'_> {
-    fn drop(&mut self) {
-        if self.waiting {
-            crate::futex::unregister_waiting_tid(self.tid);
-            self.waiting = false;
-        }
+        // Changed seq bump + wake.
+        payload.changed_seq.fetch_add(1, Ordering::Release);
+        notification::notify_changed(&payload.changed_channel, &payload.changed_source);
+        StepOutcome::done(sops.len())
     }
 }
 
@@ -340,7 +257,8 @@ pub fn step_semctl(
             if let Some(a) = structure::withdraw_sem(semid) {
                 a.destroyed.store(true, Ordering::Release);
                 if let Some(payload) = a.payload.lock().as_ref().cloned() {
-                    fire_sem_changed(&payload);
+                    payload.changed_seq.fetch_add(1, Ordering::Release);
+                    notification::notify_changed(&payload.changed_channel, &payload.changed_source);
                 }
             }
             Ok(SemCtlResult::Success)
@@ -399,7 +317,8 @@ pub fn step_semctl(
                 if let Some(process) = process {
                     values[semnum as usize].last_pid = process.pid.0;
                 }
-                fire_sem_changed(payload);
+                payload.changed_seq.fetch_add(1, Ordering::Release);
+                notification::notify_changed(&payload.changed_channel, &payload.changed_source);
             });
             Ok(SemCtlResult::Success)
         }
@@ -432,7 +351,8 @@ pub fn step_semctl(
                         slot.last_pid = process.pid.0;
                     }
                 }
-                fire_sem_changed(payload);
+                payload.changed_seq.fetch_add(1, Ordering::Release);
+                notification::notify_changed(&payload.changed_channel, &payload.changed_source);
             });
             Ok(SemCtlResult::Success)
         }
@@ -520,7 +440,11 @@ pub fn step_sem_undo(process: &Cap<ProcessIdentity>) {
                 values[i].val = values[i].val.wrapping_add(*adj);
             }
         }
-        fire_sem_changed(&payload_guard);
+        payload_guard.changed_seq.fetch_add(1, Ordering::Release);
+        notification::notify_changed(
+            &payload_guard.changed_channel,
+            &payload_guard.changed_source,
+        );
     }
 }
 

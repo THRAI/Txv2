@@ -9,6 +9,7 @@ mod address_space;
 mod private;
 mod range_lock;
 mod recipe;
+pub(in crate::vm) mod recipe_tree;
 mod types;
 
 pub use address_space::AddressSpace;
@@ -22,11 +23,20 @@ pub use range_lock::{
 };
 pub use types::{
     AccessMode, AddressSpaceStats, MapPlacement, Prot, UfdRegistration, UserPage, UserPageIter,
-    UserRange, UserRangeError, UserVirtAddr, VmBacking, VmEntry, VmEntryError, VmEntryFlags,
-    VmEntryRewrite, VmFault, VmFaultError, VmFaultMaterialization, VmFaultMaterializationBacking,
-    VmFaultMaterializationStep, VmFaultOutcome, VmMapCommit, VmMapError, VmMapOutcome,
-    VmMapRequest, VmMapTarget, VmRemapOutcome, VmRemapPlacement, VmRemapRequest, FULL_USER_V1_TOP,
-    USER_PAGE_SIZE,
+    UserRange, UserRangeError, UserVirtAddr, VmBacking, VmCap, VmEntry, VmEntryBacking,
+    VmEntryError, VmEntryFlags, VmEntryProtectRewrite, VmEntryRewrite, VmFault, VmFaultError,
+    VmFaultMaterialization, VmFaultMaterializationBacking, VmFaultMaterializationStep,
+    VmFaultOutcome, VmMapCommit, VmMapError, VmMapOutcome, VmMapRequest, VmMapTarget,
+    VmRemapOutcome, VmRemapPlacement, VmRemapRequest, FULL_USER_V1_TOP, USER_PAGE_SIZE,
 };
 
-pub(in crate::vm) use recipe::{AddressSpaceStatsCell, RecipeIndex};
+pub(in crate::vm) use private::{
+    private_page_debug_samples, private_page_debug_totals, reset_private_page_debug_totals,
+};
+#[cfg(test)]
+pub(in crate::vm) use recipe::deferred_recipe_reclaim_len_for_test;
+pub(in crate::vm) use recipe::{
+    drain_deferred_recipe_reclaims, recipe_debug_totals, reset_recipe_debug_totals,
+    AddressSpaceStatsCell, RecipeIndex,
+};
+pub(in crate::vm) use types::AddressSpaceStatsDelta;

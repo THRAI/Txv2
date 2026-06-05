@@ -24,6 +24,7 @@ use tx_platform_adapter::platform_adapter;
     reason = "wrap substrate step engine (StepOp), EBR guard/guard(), and signal-routing primitives (SignalRouting, OperationalCapExt, SpinMutex) used by the signal mutators"
 )]
 pub mod step_engine {
+    pub(crate) use crate::sync::SpinMutex;
     pub use tx_substrate::epoch::{guard, Guard};
     pub use tx_substrate::step::ProcessIdentity as PlaceholderProcessSubject;
     pub use tx_substrate::step::{
@@ -37,7 +38,6 @@ pub mod step_engine {
         OperationalCapExt, OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy,
         RetainedEntityPolicy, Weak, Zone, ZoneAllocated, ZoneError, ZonePolicy,
     };
-    pub use tx_substrate::SpinMutex;
 }
 
 #[platform_adapter(

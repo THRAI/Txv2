@@ -10,9 +10,9 @@
 # VVAR layout (offsets from base):
 #   0x00  seq            (u64)
 #   0x08  realtime_sec   (u64)
-#   0x10  realtime_nsec  (u64)
+#   0x10  realtime_nsec  (u64, shifted by shift for high-res)
 #   0x18  monotonic_sec  (u64)
-#   0x20  monotonic_nsec (u64)
+#   0x20  monotonic_nsec (u64, shifted by shift for high-res)
 #   0x28  cycle_last     (u64)
 #   0x30  mult           (u64)
 #   0x38  shift          (u64)
@@ -27,6 +27,7 @@
 .globl __vdso_clock_gettime
 .type  __vdso_clock_gettime, @function
 __vdso_clock_gettime:
+.Lclock_gettime_entry:
     addi    sp, sp, -64
     sd      ra, 56(sp)
     sd      s0, 48(sp)
@@ -56,95 +57,63 @@ __vdso_clock_gettime:
 
 # ---- high-resolution realtime ----
 .Lgt_highres_realtime:
-    # Read rdtime, compute delta, add to base.
-    rdtime  t0                      # t0 = current cycle counter
-    ld      t1, 0x28(s0)            # t1 = vvar->cycle_last
-    ld      t2, 0x40(s0)            # t2 = vvar->mask
-    sub     t0, t0, t1
-    and     t0, t0, t2              # t0 = delta cycles
-
-    ld      t3, 0x30(s0)            # t3 = mult
-    ld      t4, 0x38(s0)            # t4 = shift
-    mulhu   t5, t0, t3              # high 64 bits of 128-bit mul
-    mul     t0, t0, t3              # low 64 bits
-    # 128-bit (t5:t0) >> t4
-    beqz    t4, .Lgt_ns_noshift
-    addi    t1, zero, 64
-    bltu    t4, t1, .Lgt_shift_lt64
-    # shift >= 64: result = t5 >> (t4 - 64)
-    sub     t1, t4, t1
-    srl     t0, t5, t1
-    j       .Lgt_ns_done
-.Lgt_shift_lt64:
-    sub     t1, t1, t4
-    sll     t2, t5, t1
-    srl     t0, t0, t4
-    or      t0, t0, t2
-    j       .Lgt_ns_done
-.Lgt_ns_noshift:
-    mv      t0, t5
-.Lgt_ns_done:
-
-    # Add to realtime base with seqlock.
-    j       .Lgt_add_to_base
+    addi    s5, s0, 0x08           # realtime_sec
+    addi    s6, s0, 0x10           # realtime_nsec
+    j       .Lgt_seqlock_highres
 
 # ---- high-resolution monotonic ----
 .Lgt_highres_monotonic:
-    rdtime  t0
-    ld      t1, 0x28(s0)
-    ld      t2, 0x40(s0)
-    sub     t0, t0, t1
-    and     t0, t0, t2
-
-    ld      t3, 0x30(s0)
-    ld      t4, 0x38(s0)
-    mulhu   t5, t0, t3
-    mul     t0, t0, t3
-    beqz    t4, .Lgt_mn_noshift
-    addi    t1, zero, 64
-    bltu    t4, t1, .Lgt_mn_lt64
-    sub     t1, t4, t1
-    srl     t0, t5, t1
-    j       .Lgt_mn_done
-.Lgt_mn_lt64:
-    sub     t1, t1, t4
-    sll     t2, t5, t1
-    srl     t0, t0, t4
-    or      t0, t0, t2
-    j       .Lgt_mn_done
-.Lgt_mn_noshift:
-    mv      t0, t5
-.Lgt_mn_done:
-
-    # Add to monotonic base with seqlock.
-    # s1/s2 point to sec/nsec base.
     addi    s5, s0, 0x18           # monotonic_sec
     addi    s6, s0, 0x20           # monotonic_nsec
-    j       .Lgt_seqlock_add
+    j       .Lgt_seqlock_highres
 
-.Lgt_add_to_base:
-    addi    s5, s0, 0x08           # realtime_sec
-    addi    s6, s0, 0x10           # realtime_nsec
-
-.Lgt_seqlock_add:
-    # t0 = ns delta, s5 = &sec, s6 = &nsec
+.Lgt_seqlock_highres:
+    # s5 = &sec, s6 = &shifted_nsec. Read the full conversion tuple
+    # under one seqlock sample, matching Linux vDSO datapage rules.
 1:  ld      t1, 0(s0)              # t1 = seq
     andi    t2, t1, 1
     bnez    t2, 1b
     fence   r, rw
     ld      s3, 0(s5)              # s3 = base seconds
-    ld      s4, 0(s6)              # s4 = base nanoseconds
+    ld      s4, 0(s6)              # s4 = shifted base nanoseconds
+    ld      t6, 0x28(s0)           # t6 = cycle_last
+    ld      t2, 0x40(s0)           # t2 = mask
+    ld      t3, 0x30(s0)           # t3 = mult
+    ld      t4, 0x38(s0)           # t4 = shift
+    rdtime  t0                     # t0 = current cycle counter
     fence   r, rw
-    ld      t2, 0(s0)              # t2 = seq (re-read)
-    bne     t1, t2, 1b
+    ld      t5, 0(s0)              # t5 = seq (re-read)
+    bne     t1, t5, 1b
 
-    # Add ns delta to base nsec, normalize.
-    add     s4, s4, t0
+    # Linux-style high-res math:
+    # ns = ((delta_cycles * mult) + shifted_base_nsec) >> shift.
+    sub     t0, t0, t6
+    and     t0, t0, t2
+    mulhu   t5, t0, t3             # high 64 bits of 128-bit mul
+    mul     t0, t0, t3             # low 64 bits
+    add     t0, t0, s4
+    sltu    t2, t0, s4
+    add     t5, t5, t2
+    beqz    t4, .Lgt_shifted_done
+    addi    t1, zero, 64
+    bltu    t4, t1, .Lgt_shifted_lt64
+    sub     t1, t4, t1
+    srl     s4, t5, t1
+    j       .Lgt_normalize
+.Lgt_shifted_lt64:
+    sub     t1, t1, t4
+    sll     t2, t5, t1
+    srl     s4, t0, t4
+    or      s4, s4, t2
+    j       .Lgt_normalize
+.Lgt_shifted_done:
+    mv      s4, t0
+
+.Lgt_normalize:
     li      t3, 1000000000
-    bltu    s4, t3, .Lgt_no_overflow
-    sub     s4, s4, t3
-    addi    s3, s3, 1
-.Lgt_no_overflow:
+    divu    t2, s4, t3
+    remu    s4, s4, t3
+    add     s3, s3, t2
     sd      s3, 0(a1)              # ts->tv_sec
     sd      s4, 8(a1)              # ts->tv_nsec
     li      a0, 0
@@ -171,6 +140,8 @@ __vdso_clock_gettime:
     fence   r, rw
     ld      t1, 0(s0)              # seq (re-read)
     bne     t0, t1, 1b
+    ld      t2, 0x38(s0)           # nsec is stored shifted
+    srl     s4, s4, t2
     sd      s3, 0(a1)              # ts->tv_sec
     sd      s4, 8(a1)              # ts->tv_nsec
     li      a0, 0
@@ -194,40 +165,30 @@ __vdso_clock_gettime:
 .globl __vdso_gettimeofday
 .type  __vdso_gettimeofday, @function
 __vdso_gettimeofday:
-    addi    sp, sp, -32
-    sd      ra, 24(sp)
-    sd      s0, 16(sp)
-    sd      s1, 8(sp)
+    addi    sp, sp, -48
+    sd      ra, 40(sp)
+    sd      s0, 32(sp)
+    sd      s1, 24(sp)
 
-    # Load VVAR base.
-    lui     s0, 0xFFFEF
-    addi    t0, zero, 64
-    slli    t0, t0, 32
-    add     s0, s0, t0
+    mv      s1, a0                 # save timeval*
+    li      a0, 0                  # CLOCK_REALTIME
+    addi    a1, sp, 0              # scratch timespec
+    jal     ra, .Lclock_gettime_entry
+    bnez    a0, .Lgtod_done
 
-    # Read realtime sec (offset 8) and nsec (offset 16) with seqlock.
-    addi    s1, s0, 8
-
-1:  ld      t0, 0(s0)
-    andi    t1, t0, 1
-    bnez    t1, 1b
-    fence   r, rw
-    ld      t2, 0(s1)              # t2 = seconds
-    ld      t3, 16(s0)             # t3 = nsec
-    fence   r, rw
-    ld      t1, 0(s0)
-    bne     t0, t1, 1b
-
-    sd      t2, 0(a0)              # tv->tv_sec
+    ld      t2, 0(sp)              # ts.tv_sec
+    ld      t3, 8(sp)              # ts.tv_nsec
+    sd      t2, 0(s1)              # tv->tv_sec
     li      t0, 1000
     divu    t3, t3, t0
-    sd      t3, 8(a0)              # tv->tv_usec
+    sd      t3, 8(s1)              # tv->tv_usec
     li      a0, 0
 
-    ld      ra, 24(sp)
-    ld      s0, 16(sp)
-    ld      s1, 8(sp)
-    addi    sp, sp, 32
+.Lgtod_done:
+    ld      ra, 40(sp)
+    ld      s0, 32(sp)
+    ld      s1, 24(sp)
+    addi    sp, sp, 48
     ret
 .size __vdso_gettimeofday, .-__vdso_gettimeofday
 

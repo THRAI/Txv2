@@ -21,6 +21,7 @@ test-support = []
 [dependencies]
 smoltcp = { path = "../../external/smoltcp-asterinas", default-features = false, features = ["alloc", "log", "medium-ethernet", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp"] }
 tx-hal = { path = "../tx-hal" }
+tx-observe = { path = "../tx-observe" }
 tx-platform-adapter = { path = "../tx-platform-adapter" }
 tx-reactor = { path = "../tx-reactor" }
 tx-substrate = { path = "../tx-substrate" }
@@ -29,6 +30,7 @@ tx-test-support = { path = "../tx-test-support" }
 
 [dev-dependencies]
 tx-ext4-format = { path = "../tx-ext4-format" }
+tx-observe = { path = "../tx-observe", features = ["testing"] }
 # Self-dep with `test-support` enabled so integration tests in
 # `tests/` can reach the `_for_test` helpers gated behind
 # `feature = "test-support"` (D9-B's eligibility-scan pins and
@@ -36,3 +38,6 @@ tx-ext4-format = { path = "../tx-ext4-format" }
 # `process::execution::spawn_sibling_thread_for_test`).
 tx-subsystems = { path = ".", features = ["test-support"] }
 tx-test-support = { path = "../tx-test-support" }
+
+[lints]
+workspace = true

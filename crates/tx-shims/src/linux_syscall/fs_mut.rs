@@ -12,37 +12,6 @@ use tx_fs;
 // silently bypass the gate.
 use tx_subsystems::cred::checks as cred_checks;
 use tx_subsystems::mount::{self};
-use tx_subsystems::net::UnixSocketPath;
-
-fn mount_is_read_only(dentry: &Cap<DEntry>) -> bool {
-    if mount_payload_for_dentry(dentry)
-        .is_some_and(|payload| payload.options.flags.contains(mount::MountFlags::READ_ONLY))
-    {
-        return true;
-    }
-
-    let mut cursor = Some(dentry.clone());
-    while let Some(dentry) = cursor {
-        {
-            let guard = step_engine::guard();
-            if dentry
-                .mounted_hint()
-                .and_then(|mount| mount.upgrade(&guard))
-                .is_some_and(|mount| mount.flags().contains(mount::MountFlags::READ_ONLY))
-            {
-                return true;
-            }
-        }
-        if mount::mount_for_root_dentry(&dentry)
-            .is_some_and(|mount| mount.flags().contains(mount::MountFlags::READ_ONLY))
-        {
-            return true;
-        }
-        cursor = dentry.parent_hint();
-    }
-
-    false
-}
 
 /// Split a path into `(parent, basename)` for the `O_CREAT`-on-missing
 /// re-walk. `path` is a slash-separated sequence; trailing slashes
@@ -117,7 +86,7 @@ pub(crate) fn create_then_walk<P: PmapIf>(
             V3::Continue { .. } | V3::Yield { .. } => {
                 return Err(EIO_VALUE);
             }
-            V3::Err(errno) => return Err(errno_to_i32(errno)),
+            V3::Err(errno) => return Err(errno_to_i32(Errno::from(errno))),
         }
     };
 
@@ -128,9 +97,10 @@ pub(crate) fn create_then_walk<P: PmapIf>(
         None => return Err(EROFS_VALUE),
     };
 
-    // Mint the new inode under the parent. The caller has already
-    // applied the process umask, leaving the bottom 12 mode bits
-    // (`rwxrwxrwx | S_ISUID/S_ISGID/S_ISVTX`) for the filesystem.
+    // Mint the new inode under the parent. The mode arrives from
+    // userspace as the bottom 12 bits (`rwxrwxrwx | S_ISUID/S_ISGID/
+    // S_ISVTX`); umask plumbing is deferred to a future slice
+    // (TODO(phase-umask)).
     let parent_fs_object_id = parent_dentry.rnode().fs_object_id();
     let new_mode = mode & 0o7777;
     {
@@ -144,7 +114,7 @@ pub(crate) fn create_then_walk<P: PmapIf>(
             V3::Continue { .. } | V3::Yield { .. } => {
                 return Err(EIO_VALUE);
             }
-            V3::Err(errno) => return Err(errno_to_i32(errno)),
+            V3::Err(errno) => return Err(errno_to_i32(Errno::from(errno))),
         }
     }
 
@@ -158,7 +128,7 @@ pub(crate) fn create_then_walk<P: PmapIf>(
     match outcome {
         V3::Done(d) => Ok(d),
         V3::Continue { .. } | V3::Yield { .. } => Err(EIO_VALUE),
-        V3::Err(errno) => Err(errno_to_i32(errno)),
+        V3::Err(errno) => Err(errno_to_i32(Errno::from(errno))),
     }
 }
 
@@ -193,6 +163,9 @@ pub(super) async fn sys_mkdirat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
     let dirfd = args[0] as i32;
     let path_uaddr = args[1];
     let mode = args[2] as u16;
+    if dirfd != AT_FDCWD {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
     let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
@@ -200,9 +173,9 @@ pub(super) async fn sys_mkdirat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
     if path.is_empty() {
         return SyscallResult::Error(ENOENT_VALUE);
     }
-    let rooted_at = match resolve_cwd_for_path(dirfd, &path, ctx) {
-        Ok(d) => d,
-        Err(e) => return SyscallResult::Error(e),
+    let cwd = match ctx.process.cwd() {
+        Some(d) => d,
+        None => return SyscallResult::Error(ENOENT_VALUE),
     };
     let cred = ctx.walker_cred();
     let (parent_path, basename) = split_path(&path);
@@ -214,16 +187,13 @@ pub(super) async fn sys_mkdirat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
         return SyscallResult::Error(EEXIST_VALUE);
     }
     let parent_dentry = if parent_path.is_empty() {
-        rooted_at
+        cwd
     } else {
-        match walk_from(rooted_at, parent_path, &cred) {
+        match walk_from(cwd, parent_path, &cred) {
             Ok(d) => d,
             Err(e) => return SyscallResult::Error(e),
         }
     };
-    if mount_is_read_only(&parent_dentry) {
-        return SyscallResult::Error(EROFS_VALUE);
-    }
     let parent_id = parent_dentry.rnode().fs_object_id();
     use StepOutcome as V3;
     let fs_ops = match fs_ops_for_dentry(&parent_dentry) {
@@ -253,7 +223,7 @@ pub(super) async fn sys_mkdirat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
             SyscallResult::Return(0)
         }
         V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-        V3::Err(errno) => SyscallResult::error_from(errno),
+        V3::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
     }
 }
 
@@ -268,8 +238,8 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     let dirfd = args[0] as i32;
     let path_uaddr = args[1];
     let flags = args[2] as u32;
-    if flags & !AT_REMOVEDIR != 0 {
-        return SyscallResult::Error(EINVAL_VALUE);
+    if dirfd != AT_FDCWD {
+        return SyscallResult::Error(EBADF_VALUE);
     }
     let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
@@ -278,52 +248,38 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     if path.is_empty() {
         return SyscallResult::Error(ENOENT_VALUE);
     }
-    let rooted_at = match resolve_cwd_for_path(dirfd, &path, ctx) {
-        Ok(d) => d,
-        Err(e) => return SyscallResult::Error(e),
+    let cwd = match ctx.process.cwd() {
+        Some(d) => d,
+        None => return SyscallResult::Error(ENOENT_VALUE),
     };
     let cred = ctx.walker_cred();
     let (parent_path, basename) = split_path(&path);
     if basename.is_empty() {
         return SyscallResult::Error(EISDIR_VALUE);
     }
+    // Walk parent first so the parent FsOps is in scope. The full
+    // walk gives us the target's `FsObjectId` and inode kind so the
+    // arm can pick `unlink` vs `rmdir` correctly.
     let parent_dentry = if parent_path.is_empty() {
-        rooted_at
+        cwd.clone()
     } else {
-        match walk_from(rooted_at, parent_path, &cred) {
+        match walk_from(cwd.clone(), parent_path, &cred) {
             Ok(d) => d,
             Err(e) => return SyscallResult::Error(e),
         }
     };
-    if mount_is_read_only(&parent_dentry) {
-        return SyscallResult::Error(EROFS_VALUE);
-    }
+    let target_dentry = match walk_from(cwd, &path, &cred) {
+        Ok(d) => d,
+        Err(e) => return SyscallResult::Error(e),
+    };
     let parent_id = parent_dentry.rnode().fs_object_id();
+    let target_id = target_dentry.rnode().fs_object_id();
+    let target_kind = target_dentry.rnode().meta().kind();
     use StepOutcome as V3;
     let fs_ops = match fs_ops_for_dentry(&parent_dentry) {
         Some(o) => o,
         None => return SyscallResult::Error(EROFS_VALUE),
     };
-    let target_id = {
-        let guard = step_engine::guard();
-        match fs_ops.lookup(parent_id, basename, &guard) {
-            V3::Done(id) => id,
-            V3::Continue { .. } | V3::Yield { .. } => return SyscallResult::Error(EIO_VALUE),
-            V3::Err(errno) if errno == Errno::ENOENT && try_unlink_unix_socket_path(ctx, &path) => {
-                return SyscallResult::Return(0);
-            }
-            V3::Err(errno) => return SyscallResult::error_from(errno),
-        }
-    };
-    let child_meta = {
-        let guard = step_engine::guard();
-        match fs_ops.load_inode_meta(target_id, &guard) {
-            V3::Done(meta) => meta,
-            V3::Continue { .. } | V3::Yield { .. } => return SyscallResult::Error(EIO_VALUE),
-            V3::Err(errno) => return SyscallResult::error_from(errno),
-        }
-    };
-    let target_kind = child_meta.kind();
     let want_rmdir = (flags & AT_REMOVEDIR) != 0;
     if want_rmdir && target_kind != InodeKind::Directory {
         return SyscallResult::Error(ENOTDIR_VALUE);
@@ -336,6 +292,7 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     // — write-on-parent and the sticky-bit rule were unguarded before
     // this check.
     let parent_meta = parent_dentry.rnode().meta();
+    let child_meta = target_dentry.rnode().meta();
     if let Err(e) = cred_checks::authorize_unlink(ctx.cred_snapshot(), &parent_meta, &child_meta) {
         return SyscallResult::error_from(e);
     }
@@ -353,23 +310,8 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
             SyscallResult::Return(0)
         }
         V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-        V3::Err(errno) => SyscallResult::error_from(errno),
+        V3::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
     }
-}
-
-fn try_unlink_unix_socket_path(ctx: &SyscallCtx<'_>, path: &[u8]) -> bool {
-    let Ok(path) = UnixSocketPath::new(path) else {
-        return false;
-    };
-    let Some(net_namespace) = ctx.process.net_namespace() else {
-        return false;
-    };
-    let table = net_namespace.socket_table();
-    let guard = step_engine::guard();
-    if !table.lookup_unix_path_node(path, &guard) {
-        return false;
-    }
-    table.unlink_unix_path(path).is_ok()
 }
 
 /// `symlinkat(target, newdirfd, linkpath)`. Linux RV64 generic ABI
@@ -383,6 +325,9 @@ pub(super) async fn sys_symlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     let target_uaddr = args[0];
     let newdirfd = args[1] as i32;
     let linkpath_uaddr = args[2];
+    if newdirfd != AT_FDCWD {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
     let target = match read_user_cstr(&ctx.aspace, target_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
@@ -397,9 +342,9 @@ pub(super) async fn sys_symlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     if linkpath.is_empty() {
         return SyscallResult::Error(ENOENT_VALUE);
     }
-    let rooted_at = match resolve_cwd_for_path(newdirfd, &linkpath, ctx) {
-        Ok(d) => d,
-        Err(e) => return SyscallResult::Error(e),
+    let cwd = match ctx.process.cwd() {
+        Some(d) => d,
+        None => return SyscallResult::Error(ENOENT_VALUE),
     };
     let cred = ctx.walker_cred();
     let (parent_path, basename) = split_path(&linkpath);
@@ -407,16 +352,13 @@ pub(super) async fn sys_symlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
         return SyscallResult::Error(EEXIST_VALUE);
     }
     let parent_dentry = if parent_path.is_empty() {
-        rooted_at
+        cwd
     } else {
-        match walk_from(rooted_at, parent_path, &cred) {
+        match walk_from(cwd, parent_path, &cred) {
             Ok(d) => d,
             Err(e) => return SyscallResult::Error(e),
         }
     };
-    if mount_is_read_only(&parent_dentry) {
-        return SyscallResult::Error(EROFS_VALUE);
-    }
     let parent_id = parent_dentry.rnode().fs_object_id();
     use StepOutcome as V3;
     let fs_ops = match fs_ops_for_dentry(&parent_dentry) {
@@ -440,7 +382,7 @@ pub(super) async fn sys_symlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
             SyscallResult::Return(0)
         }
         V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-        V3::Err(errno) => SyscallResult::error_from(errno),
+        V3::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
     }
 }
 
@@ -459,10 +401,9 @@ pub(super) async fn sys_linkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     let oldpath_uaddr = args[1];
     let newdirfd = args[2] as i32;
     let newpath_uaddr = args[3];
-    let flags = args[4] as u32;
-    const AT_SYMLINK_FOLLOW_U32: u32 = 0x400;
-    if flags & !AT_SYMLINK_FOLLOW_U32 != 0 {
-        return SyscallResult::Error(EINVAL_VALUE);
+    let _flags = args[4] as u32;
+    if olddirfd != AT_FDCWD || newdirfd != AT_FDCWD {
+        return SyscallResult::Error(EBADF_VALUE);
     }
     let oldpath = match read_user_cstr(&ctx.aspace, oldpath_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
@@ -478,26 +419,20 @@ pub(super) async fn sys_linkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     if newpath.is_empty() {
         return SyscallResult::Error(ENOENT_VALUE);
     }
-    let old_root = match resolve_cwd_for_path(olddirfd, &oldpath, ctx) {
-        Ok(d) => d,
-        Err(e) => return SyscallResult::Error(e),
-    };
-    let new_root = match resolve_cwd_for_path(newdirfd, &newpath, ctx) {
-        Ok(d) => d,
-        Err(e) => return SyscallResult::Error(e),
+    let cwd = match ctx.process.cwd() {
+        Some(d) => d,
+        None => return SyscallResult::Error(ENOENT_VALUE),
     };
     let cred = ctx.walker_cred();
     // Walk source → target FsObjectId. Linux rejects directories
-    // as `-EPERM`, but a read-only destination mount takes
-    // precedence once the new parent has been resolved.
-    let source_dentry = match walk_from(old_root, &oldpath, &cred) {
+    // here as `-EPERM` (no hard-linking directories).
+    let source_dentry = match walk_from(cwd.clone(), &oldpath, &cred) {
         Ok(d) => d,
         Err(e) => return SyscallResult::Error(e),
     };
-    let source_fs_ops = match fs_ops_for_dentry(&source_dentry) {
-        Some(o) => o,
-        None => return SyscallResult::Error(EROFS_VALUE),
-    };
+    if source_dentry.rnode().meta().kind() == InodeKind::Directory {
+        return SyscallResult::Error(EPERM_VALUE);
+    }
     let source_id = source_dentry.rnode().fs_object_id();
     // Walk new path's parent directory.
     let (new_parent_path, new_basename) = split_path(&newpath);
@@ -505,29 +440,19 @@ pub(super) async fn sys_linkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
         return SyscallResult::Error(EEXIST_VALUE);
     }
     let new_parent_dentry = if new_parent_path.is_empty() {
-        new_root
+        cwd
     } else {
-        match walk_from(new_root, new_parent_path, &cred) {
+        match walk_from(cwd.clone(), new_parent_path, &cred) {
             Ok(d) => d,
             Err(e) => return SyscallResult::Error(e),
         }
     };
-    if mount_is_read_only(&new_parent_dentry) {
-        return SyscallResult::Error(EROFS_VALUE);
-    }
-    if source_dentry.rnode().meta().kind() == InodeKind::Directory {
-        return SyscallResult::Error(EPERM_VALUE);
-    }
     let new_parent_id = new_parent_dentry.rnode().fs_object_id();
     use StepOutcome as V3;
     let fs_ops = match fs_ops_for_dentry(&new_parent_dentry) {
         Some(o) => o,
         None => return SyscallResult::Error(EROFS_VALUE),
     };
-    if !alloc::sync::Arc::ptr_eq(&source_fs_ops, &fs_ops) {
-        const EXDEV_VALUE: i32 = 18;
-        return SyscallResult::Error(EXDEV_VALUE);
-    }
     // POSIX link(2) permission: write + search on the new parent
     // (sticky is NOT consulted — link only adds, doesn't remove).
     // Walker only enforced search-on-ancestors; without this, any
@@ -548,7 +473,7 @@ pub(super) async fn sys_linkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
             SyscallResult::Return(0)
         }
         V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-        V3::Err(errno) => SyscallResult::error_from(errno),
+        V3::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
     }
 }
 
@@ -592,7 +517,7 @@ pub(super) async fn sys_truncate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     match outcome {
         V3::Done(()) | V3::Continue { .. } => SyscallResult::Return(0),
         V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-        V3::Err(v3_errno) => SyscallResult::error_from(v3_errno),
+        V3::Err(v3_errno) => SyscallResult::error_from(v3_errno.into()),
     }
 }
 
@@ -641,72 +566,54 @@ pub(super) async fn sys_ftruncate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     .await
     {
         Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => SyscallResult::error_from(v3errno),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
-/// `fallocate(fd, mode, offset, len)`. Linux RV64 generic ABI
-/// `__NR_fallocate = 47`.
-///
-/// Supports the fd-io/LTP surface: `mode == 0` grows visible file size via
-/// `step_fallocate`; `FALLOC_FL_KEEP_SIZE` validates the range but does not
-/// publish a larger size. Other range-manipulation modes are intentionally
-/// rejected until hole-punch/zero-range backing exists.
-pub(super) fn sys_fallocate(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
-    const FALLOC_FL_KEEP_SIZE: i32 = 0x01;
-    const EFBIG_VALUE: i32 = 27;
-
+pub(super) async fn sys_fallocate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let fd = args[0] as i32;
-    let mode = args[1] as i32;
+    let mode = args[1] as u32;
     let offset = args[2] as i64;
     let len = args[3] as i64;
-
     if fd < 0 {
         return SyscallResult::Error(EBADF_VALUE);
     }
-    if offset < 0 || len <= 0 {
+    if mode != 0 {
+        return SyscallResult::Error(ENOSYS_VALUE);
+    }
+    if offset < 0 || len < 0 {
         return SyscallResult::Error(EINVAL_VALUE);
     }
-    if mode != 0 && mode != FALLOC_FL_KEEP_SIZE {
-        return SyscallResult::Error(EOPNOTSUPP_VALUE);
-    }
-
+    let Some(new_size) = (offset as u64).checked_add(len as u64) else {
+        return SyscallResult::Error(EINVAL_VALUE);
+    };
     let file = match resolve_fd(&ctx.process, fd as u32) {
         Some(f) => f,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
-    if !file.flags().write {
-        return SyscallResult::Error(EBADF_VALUE);
-    }
     let pc = match file.rnode().backing() {
         RNodeBacking::PageBacked { pc } => pc.clone(),
         RNodeBacking::Directory => return SyscallResult::Error(EISDIR_VALUE),
         _ => return SyscallResult::Error(EINVAL_VALUE),
     };
-
-    let offset = offset as u64;
-    let len = len as u64;
-    let end = match offset.checked_add(len) {
-        Some(end) if end <= i64::MAX as u64 => end,
-        _ => return SyscallResult::Error(EFBIG_VALUE),
-    };
-
-    if mode == FALLOC_FL_KEEP_SIZE && end <= pc.size_bytes() {
-        return SyscallResult::Return(0);
-    }
-    if mode == FALLOC_FL_KEEP_SIZE {
-        return SyscallResult::Return(0);
-    }
-
-    let outcome = {
-        let guard = step_engine::guard();
-        tx_subsystems::page_backed::step_fallocate(&pc, end, &guard)
-    };
-    use StepOutcome as V3;
-    match outcome {
-        V3::Done(()) | V3::Continue { .. } => SyscallResult::Return(0),
-        V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-        V3::Err(v3_errno) => SyscallResult::error_from(v3_errno),
+    use tx_scripts::drive;
+    use tx_substrate::step::DriveMode;
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let op = tx_subsystems::page_backed::FallocateOp { pc: &pc, new_size };
+    match drive(
+        op,
+        &mut script_ctx,
+        DriveMode::Waiting,
+        mailbox_arc.as_ref(),
+        None,
+        timer_wheel_arc.as_ref(),
+    )
+    .await
+    {
+        Ok(()) => SyscallResult::Return(0),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
@@ -730,6 +637,9 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     let path_uaddr = args[1];
     let buf_uaddr = args[2];
     let buf_len = args[3] as usize;
+    if dirfd != AT_FDCWD {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
     if buf_uaddr == 0 {
         return SyscallResult::Error(EFAULT_VALUE);
     }
@@ -741,48 +651,11 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
     };
     if path.is_empty() {
-        if dirfd == AT_FDCWD {
-            return SyscallResult::Error(ENOENT_VALUE);
-        }
-        if dirfd < 0 {
-            return SyscallResult::Error(EBADF_VALUE);
-        }
-        let file = match ctx.process.fd(dirfd as u32) {
-            Some(file) => file,
-            None => return SyscallResult::Error(EBADF_VALUE),
-        };
-        let rnode = file.rnode();
-        if rnode.meta().kind() != InodeKind::Symlink {
-            return SyscallResult::Error(EINVAL_VALUE);
-        }
-        let fs_ops = match fs_ops_for_rnode(rnode) {
-            Some(ops) => ops,
-            None => return SyscallResult::Error(ENOSYS_VALUE),
-        };
-        use StepOutcome as V3;
-        let link_bytes = {
-            let guard = step_engine::guard();
-            match fs_ops.read_link(rnode.fs_object_id(), &guard) {
-                V3::Done(b) => b,
-                V3::Continue { .. } | V3::Yield { .. } => {
-                    return SyscallResult::Error(EIO_VALUE);
-                }
-                V3::Err(errno) => return SyscallResult::error_from(errno),
-            }
-        };
-        let to_copy = core::cmp::min(link_bytes.len(), buf_len);
-        if to_copy > 0 {
-            if let Err(errno) =
-                bootstrap_copy_to_user(&ctx.aspace, buf_uaddr, &link_bytes[..to_copy])
-            {
-                return SyscallResult::error_from(errno);
-            }
-        }
-        return SyscallResult::Return(to_copy as i64);
+        return SyscallResult::Error(ENOENT_VALUE);
     }
-    let rooted_at = match resolve_cwd_for_path(dirfd, &path, ctx) {
-        Ok(d) => d,
-        Err(e) => return SyscallResult::Error(e),
+    let cwd = match ctx.process.cwd() {
+        Some(d) => d,
+        None => return SyscallResult::Error(ENOENT_VALUE),
     };
     let cred = ctx.walker_cred();
     let (parent_path, basename) = split_path(&path);
@@ -790,9 +663,9 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
         return SyscallResult::Error(EINVAL_VALUE);
     }
     let parent_dentry = if parent_path.is_empty() {
-        rooted_at
+        cwd
     } else {
-        match walk_from(rooted_at, parent_path, &cred) {
+        match walk_from(cwd, parent_path, &cred) {
             Ok(d) => d,
             Err(e) => return SyscallResult::Error(e),
         }
@@ -813,7 +686,7 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
             V3::Continue { .. } | V3::Yield { .. } => {
                 return SyscallResult::Error(EIO_VALUE);
             }
-            V3::Err(errno) => return SyscallResult::error_from(errno),
+            V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
         }
     };
     let target_meta = {
@@ -823,7 +696,7 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
             V3::Continue { .. } | V3::Yield { .. } => {
                 return SyscallResult::Error(EIO_VALUE);
             }
-            V3::Err(errno) => return SyscallResult::error_from(errno),
+            V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
         }
     };
     if target_meta.kind() != InodeKind::Symlink {
@@ -836,7 +709,7 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
             V3::Continue { .. } | V3::Yield { .. } => {
                 return SyscallResult::Error(EIO_VALUE);
             }
-            V3::Err(errno) => return SyscallResult::error_from(errno),
+            V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
         }
     };
     let to_copy = core::cmp::min(link_bytes.len(), buf_len);
@@ -846,226 +719,6 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
         }
     }
     SyscallResult::Return(to_copy as i64)
-}
-
-fn allocate_mount_api_fd<'a>(ctx: &SyscallCtx<'a>) -> Result<u32, SyscallResult> {
-    let fd = ctx.process.allocate_fd();
-    let (soft_limit, _) = ctx.process.rlimit_nofile();
-    if fd >= soft_limit {
-        Err(SyscallResult::Error(EMFILE_VALUE))
-    } else {
-        Ok(fd)
-    }
-}
-
-fn install_mount_api_fd<'a>(
-    ctx: &SyscallCtx<'a>,
-    file: Cap<mount::MountApiFile>,
-    flags: OpenFileFlags,
-) -> SyscallResult {
-    let fd = match allocate_mount_api_fd(ctx) {
-        Ok(fd) => fd,
-        Err(err) => return err,
-    };
-    let cloexec = flags.cloexec;
-    let open_file = match OpenFile::new_mount_api_cap(file, flags) {
-        Ok(open_file) => open_file,
-        Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
-    };
-    let _ = ctx.process.install_fd(fd, open_file);
-    if cloexec {
-        ctx.process.set_fd_cloexec(fd, true);
-    }
-    SyscallResult::Return(fd as i64)
-}
-
-fn supported_mount_api_fstype(fstype: &[u8]) -> Option<&'static str> {
-    match fstype {
-        b"tmpfs" => Some("tmpfs"),
-        b"vfat" => Some("vfat"),
-        b"ext2" => Some("ext2"),
-        b"ext3" => Some("ext3"),
-        b"ext4" => Some("ext4"),
-        b"devfs" => Some("devfs"),
-        b"proc" => Some("proc"),
-        b"sysfs" => Some("sysfs"),
-        _ => None,
-    }
-}
-
-fn mount_api_root_dentry(mut dentry: Cap<DEntry>) -> Cap<DEntry> {
-    while let Some(parent) = dentry.parent_hint() {
-        dentry = parent;
-    }
-    dentry
-}
-
-/// `fsopen(fsname, flags)`. Linux generic ABI `__NR_fsopen = 430`.
-///
-/// This is the fd-provider slice for the Linux 5.2 mount API: it validates
-/// the fs label/flags and returns a mount-context file descriptor. The
-/// follow-up `fsconfig`/`fsmount` superblock-creation path is still deferred
-/// by `MOUNT_v1`; callers that try to drive that path currently hit the
-/// syscall dispatch default for those later syscalls.
-pub(super) async fn sys_fsopen<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
-    let _ = core::marker::PhantomData::<P>;
-    let fsname_uaddr = args[0];
-    let flags = args[1] as u32;
-
-    if flags & !FSOPEN_CLOEXEC != 0 {
-        return SyscallResult::Error(EINVAL_VALUE);
-    }
-
-    let fsname = match read_user_cstr(&ctx.aspace, fsname_uaddr, 64) {
-        Ok(name) => name,
-        Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
-    };
-    let Some(fstype) = supported_mount_api_fstype(&fsname) else {
-        return SyscallResult::Error(ENODEV_VALUE);
-    };
-
-    let file =
-        match mount::MountApiFile::new_fs_context_cap(fstype, mount::FsContextMode::New, None) {
-            Ok(file) => file,
-            Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
-        };
-    install_mount_api_fd(
-        ctx,
-        file,
-        OpenFileFlags {
-            read: true,
-            write: true,
-            cloexec: flags & FSOPEN_CLOEXEC != 0,
-            ..OpenFileFlags::default()
-        },
-    )
-}
-
-/// `fspick(dirfd, path, flags)`. Linux generic ABI `__NR_fspick = 433`.
-///
-/// Returns a reconfiguration-context fd over an already-resolved mount. Full
-/// `FSCONFIG_CMD_RECONFIGURE` handling is deliberately left to the later
-/// mount-API topology slice; this fd still behaves like a non-socket for
-/// generic fd consumers.
-pub(super) async fn sys_fspick<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
-    let _ = core::marker::PhantomData::<P>;
-    let dirfd = args[0] as i32;
-    let path_uaddr = args[1];
-    let flags = args[2] as u32;
-    const VALID_FSPICK_FLAGS: u32 =
-        FSPICK_CLOEXEC | FSPICK_SYMLINK_NOFOLLOW | FSPICK_NO_AUTOMOUNT | FSPICK_EMPTY_PATH;
-
-    if flags & !VALID_FSPICK_FLAGS != 0 {
-        return SyscallResult::Error(EINVAL_VALUE);
-    }
-
-    let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
-        Ok(path) => path,
-        Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
-    };
-    if path.is_empty() && flags & FSPICK_EMPTY_PATH == 0 {
-        return SyscallResult::Error(ENOENT_VALUE);
-    }
-
-    let rooted_at = match resolve_cwd_for_path(dirfd, &path, ctx) {
-        Ok(dentry) => dentry,
-        Err(errno) => return SyscallResult::Error(errno),
-    };
-    let cred = ctx.walker_cred();
-    let target = if path == b"/" {
-        mount_api_root_dentry(rooted_at)
-    } else {
-        match walk_from_process(rooted_at, &path, &cred, &ctx.process) {
-            Ok(dentry) => dentry,
-            Err(errno) => return SyscallResult::Error(errno),
-        }
-    };
-    let payload = match mount_payload_for_dentry(&target) {
-        Some(payload) => payload,
-        None => return SyscallResult::Error(ENODEV_VALUE),
-    };
-    let picked_mount = mount::mount_for_root_dentry(&target);
-    let file = match mount::MountApiFile::new_fs_context_cap(
-        payload.fstype,
-        mount::FsContextMode::Reconfigure,
-        picked_mount,
-    ) {
-        Ok(file) => file,
-        Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
-    };
-    install_mount_api_fd(
-        ctx,
-        file,
-        OpenFileFlags {
-            read: true,
-            write: true,
-            cloexec: flags & FSPICK_CLOEXEC != 0,
-            ..OpenFileFlags::default()
-        },
-    )
-}
-
-/// `open_tree(dirfd, path, flags)`. Linux generic ABI `__NR_open_tree = 428`.
-///
-/// The fd-provider phase returns an O_PATH-like mount-api fd. Socket syscalls
-/// therefore report `EBADF` for this backing, matching Linux's generic-fd
-/// behaviour for `accept03`.
-pub(super) async fn sys_open_tree<P: PmapIf>(
-    args: [u64; 6],
-    ctx: &SyscallCtx<'_>,
-) -> SyscallResult {
-    let _ = core::marker::PhantomData::<P>;
-    let dirfd = args[0] as i32;
-    let path_uaddr = args[1];
-    let flags = args[2] as u32;
-    const VALID_OPEN_TREE_FLAGS: u32 = OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC;
-
-    if flags & !VALID_OPEN_TREE_FLAGS != 0 {
-        return SyscallResult::Error(EINVAL_VALUE);
-    }
-
-    let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
-        Ok(path) => path,
-        Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
-    };
-    if path.is_empty() {
-        return SyscallResult::Error(ENOENT_VALUE);
-    }
-
-    let rooted_at = match resolve_cwd_for_path(dirfd, &path, ctx) {
-        Ok(dentry) => dentry,
-        Err(errno) => return SyscallResult::Error(errno),
-    };
-    let cred = ctx.walker_cred();
-    let target = if path == b"/" {
-        mount_api_root_dentry(rooted_at)
-    } else {
-        match walk_from_process(rooted_at, &path, &cred, &ctx.process) {
-            Ok(dentry) => dentry,
-            Err(errno) => return SyscallResult::Error(errno),
-        }
-    };
-    let payload = match mount_payload_for_dentry(&target) {
-        Some(payload) => payload,
-        None => return SyscallResult::Error(ENODEV_VALUE),
-    };
-    let file = match mount::MountApiFile::new_detached_mount_cap(
-        mount::MountApiFileKind::OpenTree,
-        payload,
-        target.rnode().clone(),
-        mount::MountFlags::empty(),
-    ) {
-        Ok(file) => file,
-        Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
-    };
-    install_mount_api_fd(
-        ctx,
-        file,
-        OpenFileFlags {
-            cloexec: flags & OPEN_TREE_CLOEXEC != 0,
-            ..OpenFileFlags::default()
-        },
-    )
 }
 
 /// `mount(source, target, fstype, flags, data)`. Linux RV64 ABI `__NR_mount = 40`.
@@ -1102,25 +755,6 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
     };
 
     const MS_BIND: u64 = 4096;
-    const MS_RDONLY: u64 = 1;
-    const MS_REMOUNT: u64 = 32;
-    const MS_NOSUID: u64 = 2;
-    const MS_NODEV: u64 = 4;
-    const MS_NOEXEC: u64 = 8;
-    const MS_NOATIME: u64 = 1024;
-    if (flags & MS_REMOUNT) != 0 {
-        let mut mount_flags = mount::MountFlags::empty();
-        if (flags & MS_RDONLY) != 0 {
-            mount_flags = mount_flags.union(mount::MountFlags::READ_ONLY);
-        }
-        let mount = match mount::mount_for_root_dentry(&target_dentry) {
-            Some(mount) => mount,
-            None => return SyscallResult::Error(EINVAL_VALUE),
-        };
-        mount::remount(&mount, mount_flags);
-        return SyscallResult::Return(0);
-    }
-
     if (flags & MS_BIND) != 0 {
         // Bind mount.
         let source = match read_user_cstr(&ctx.aspace, source_uaddr, EXECVE_PATH_MAX) {
@@ -1175,18 +809,18 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
         tx_subsystems::vfs::InodeMeta,
         &str,
     ) = match fstype_str {
-        // `vfat`/`ext2`/`ext3` are oscomp/LTP compatibility shims:
-        // these tests need a mountable scratch filesystem for VFS
-        // semantics (including readonly flags), not actual on-disk
-        // format coverage. A fresh tmpfs at the mount point satisfies
-        // that contract without pretending to parse those formats.
-        "tmpfs" | "vfat" | "ext2" | "ext3" => {
+        // `vfat` is an oscomp-basic compatibility shim: we have no
+        // FAT driver, but the basic test mounts `/dev/vda2` as
+        // `vfat` and only asserts `mount` + `umount` round-trip
+        // (`assert(ret == 0)`). A fresh tmpfs at the mount point
+        // satisfies that contract without pretending to read FAT
+        // bytes. Real FAT support tracks separately.
+        "tmpfs" | "vfat" => {
             let tmpfs = alloc::sync::Arc::new(tx_fs::tmpfs::Tmpfs::new());
-            let label = match fstype_str {
-                "vfat" => "vfat",
-                "ext2" => "ext2",
-                "ext3" => "ext3",
-                _ => "tmpfs",
+            let label = if fstype_str == "vfat" {
+                "vfat"
+            } else {
+                "tmpfs"
             };
             (
                 tmpfs.clone().fs_ops_arc(),
@@ -1216,16 +850,6 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
                 tx_fs::procfs::PROCFS_DIR_MODE,
             ),
             "proc",
-        ),
-        "sysfs" => (
-            tx_fs::sysfs::Sysfs::fs_ops_arc(),
-            tx_fs::sysfs::Sysfs::fs_page_backing_arc(),
-            tx_fs::sysfs::SYSFS_ROOT_ID,
-            tx_subsystems::vfs::InodeMeta::new(
-                tx_subsystems::vfs::InodeKind::Directory,
-                tx_fs::sysfs::SYSFS_DIR_MODE,
-            ),
-            "sysfs",
         ),
         "ext4" => {
             // Resolve `source` (e.g. `/dev/block/vda`) into a bdev-fs
@@ -1275,6 +899,11 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
     // Translate the Linux `flags` u64 into kernel `MountFlags`.
     // Linux's `mount(2)` manpage: `MS_RDONLY = 1`, `MS_NOSUID = 2`,
     // `MS_NODEV = 4`, `MS_NOEXEC = 8`, `MS_NOATIME = 1024`.
+    const MS_RDONLY: u64 = 1;
+    const MS_NOSUID: u64 = 2;
+    const MS_NODEV: u64 = 4;
+    const MS_NOEXEC: u64 = 8;
+    const MS_NOATIME: u64 = 1024;
     let mut mount_flags = mount::MountFlags::empty();
     if (flags & MS_RDONLY) != 0 {
         mount_flags = mount_flags.union(mount::MountFlags::READ_ONLY);
@@ -1330,7 +959,7 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
         root_rnode,
         None,
         mount_payload,
-        mount_flags,
+        mount::MountFlags::empty(),
     ) {
         Ok(m) => m,
         Err(_) => return SyscallResult::Error(Errno::ENOMEM as i32),
@@ -1409,7 +1038,7 @@ pub(super) async fn sys_umount2<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>)
 /// | (dev >> 12) & 0xfff00).
 pub(super) async fn sys_mknodat<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let _ = core::marker::PhantomData::<P>;
-    let dirfd = args[0] as i32;
+    let _dirfd = args[0] as u32;
     let path_uaddr = args[1];
     let mode = args[2] as u32;
     let _dev = args[3] as u64;
@@ -1423,44 +1052,23 @@ pub(super) async fn sys_mknodat<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>)
     let S_IFCHR: u32 = 0o020000;
     let S_IFBLK: u32 = 0o060000;
     let S_IFIFO: u32 = 0o010000;
-    let S_IFSOCK: u32 = 0o140000;
 
     let cred = ctx.walker_cred();
-    let rooted_at = match resolve_cwd_for_path(dirfd, &path, ctx) {
-        Ok(d) => d,
-        Err(e) => return SyscallResult::Error(e),
+    let cwd = match ctx.process.cwd() {
+        Some(d) => d,
+        None => return SyscallResult::Error(ENOENT_VALUE),
     };
     let kind = match mode & 0o170000u32 {
         t if t == S_IFREG || t == 0 => tx_subsystems::vfs::InodeKind::Regular,
         t if t == S_IFCHR => tx_subsystems::vfs::InodeKind::CharDevice,
         t if t == S_IFBLK => tx_subsystems::vfs::InodeKind::BlockDevice,
         t if t == S_IFIFO => tx_subsystems::vfs::InodeKind::Fifo,
-        t if t == S_IFSOCK => tx_subsystems::vfs::InodeKind::Socket,
         _ => return SyscallResult::Error(EINVAL_VALUE),
     };
-    if path.is_empty() {
-        return SyscallResult::Error(ENOENT_VALUE);
-    }
-    let (parent_path, _) = split_path(&path);
-    let parent_dentry = if parent_path.is_empty() {
-        rooted_at.clone()
-    } else {
-        match walk_from(rooted_at.clone(), parent_path, &cred) {
-            Ok(dentry) => dentry,
-            Err(errno) => return SyscallResult::Error(errno),
-        }
-    };
-    if mount_is_read_only(&parent_dentry) {
-        return SyscallResult::Error(EROFS_VALUE);
-    }
-    let parent_meta = parent_dentry.rnode().meta();
-    if let Err(e) = cred_checks::authorize_link(ctx.cred_snapshot(), &parent_meta) {
-        return SyscallResult::error_from(e);
-    }
     let result = {
         let mut script_ctx = build_subject_script_ctx(ctx);
         let mut op = MknodOp {
-            rooted_at: &rooted_at,
+            rooted_at: &cwd,
             path: &path,
             mode: mode as u16,
             kind,
@@ -1471,7 +1079,7 @@ pub(super) async fn sys_mknodat<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>)
     };
     match result {
         Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => SyscallResult::error_from(v3errno),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
@@ -1539,10 +1147,7 @@ pub(super) fn sys_utimensat<'a, P: tx_hal::TimeIf>(
             Ok(path) => path,
             Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
         };
-        if path.is_empty() {
-            if flags & AT_EMPTY_PATH == 0 {
-                return SyscallResult::Error(ENOENT_VALUE);
-            }
+        if path.is_empty() && (dirfd != AT_FDCWD || flags & AT_EMPTY_PATH != 0) {
             if dirfd == AT_FDCWD {
                 match ctx.process.cwd() {
                     Some(cwd) => cwd.rnode().clone(),
@@ -1558,11 +1163,14 @@ pub(super) fn sys_utimensat<'a, P: tx_hal::TimeIf>(
                 }
             }
         } else {
-            let rooted_at = match resolve_cwd_for_path(dirfd, &path, ctx) {
-                Ok(dentry) => dentry,
-                Err(errno) => return SyscallResult::Error(errno),
+            if dirfd != AT_FDCWD {
+                return SyscallResult::Error(EBADF_VALUE);
+            }
+            let cwd = match ctx.process.cwd() {
+                Some(cwd) => cwd,
+                None => return SyscallResult::Error(ENOENT_VALUE),
             };
-            let dentry = match walk_from(rooted_at, &path, &ctx.walker_cred()) {
+            let dentry = match walk_from(cwd, &path, &ctx.walker_cred()) {
                 Ok(dentry) => dentry,
                 Err(errno) => return SyscallResult::Error(errno),
             };
@@ -1621,24 +1229,29 @@ pub(super) fn sys_utimensat<'a, P: tx_hal::TimeIf>(
 ///   resolves successfully, the arm short-circuits with `-EEXIST`.
 ///
 /// The dispatch routes through `FsOps::rename(old_parent, old_name,
-/// new_parent, new_name, &guard)`. The in-tree tmpfs surface only
-/// supports same-directory rename today; cross-directory rename
-/// surfaces as `-ENOSYS` from the backend.
+/// new_parent, new_name, &guard)`. The in-tree tmpfs surface supports
+/// same-directory rename plus cross-directory regular-file moves and
+/// directory-subtree moves within one tmpfs mount. Atomic exchange is
+/// still outside this syscall surface.
 pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let olddirfd = args[0] as i32;
     let oldpath_uaddr = args[1];
     let newdirfd = args[2] as i32;
     let newpath_uaddr = args[3];
     let flags = args[4] as u32;
-    // Validate flags. RENAME_WHITEOUT is still unsupported; Linux also
-    // rejects RENAME_NOREPLACE combined with RENAME_EXCHANGE.
+    if olddirfd != AT_FDCWD || newdirfd != AT_FDCWD {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    // Validate flags. RENAME_EXCHANGE → ENOSYS (atomic swap unsupported).
+    // RENAME_WHITEOUT and any unrecognised bits → EINVAL.
+    if (flags & RENAME_EXCHANGE) != 0 {
+        return SyscallResult::Error(ENOSYS_VALUE);
+    }
     let recognised = RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT;
     if (flags & !recognised) != 0 {
         return SyscallResult::Error(EINVAL_VALUE);
     }
-    if (flags & RENAME_WHITEOUT) != 0
-        || ((flags & RENAME_EXCHANGE) != 0 && (flags & RENAME_NOREPLACE) != 0)
-    {
+    if (flags & RENAME_WHITEOUT) != 0 {
         return SyscallResult::Error(EINVAL_VALUE);
     }
     let oldpath = match read_user_cstr(&ctx.aspace, oldpath_uaddr, EXECVE_PATH_MAX) {
@@ -1655,13 +1268,9 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     if newpath.is_empty() {
         return SyscallResult::Error(ENOENT_VALUE);
     }
-    let old_root = match resolve_cwd_for_path(olddirfd, &oldpath, ctx) {
-        Ok(d) => d,
-        Err(e) => return SyscallResult::Error(e),
-    };
-    let new_root = match resolve_cwd_for_path(newdirfd, &newpath, ctx) {
-        Ok(d) => d,
-        Err(e) => return SyscallResult::Error(e),
+    let cwd = match ctx.process.cwd() {
+        Some(d) => d,
+        None => return SyscallResult::Error(ENOENT_VALUE),
     };
     // RENAME_NOREPLACE: the composite RenameOp handles path resolution
     // internally; the flag acts as a post-resolution collision check
@@ -1685,21 +1294,21 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
         return SyscallResult::Error(EISDIR_VALUE);
     }
     let old_parent_dentry = if old_parent_path.is_empty() {
-        old_root.clone()
+        cwd.clone()
     } else {
-        match walk_from(old_root.clone(), old_parent_path, &cred) {
+        match walk_from(cwd.clone(), old_parent_path, &cred) {
             Ok(d) => d,
             Err(e) => return SyscallResult::Error(e),
         }
     };
-    let old_child_dentry = match walk_from(old_root.clone(), &oldpath, &cred) {
+    let old_child_dentry = match walk_from(cwd.clone(), &oldpath, &cred) {
         Ok(d) => d,
         Err(e) => return SyscallResult::Error(e),
     };
     let new_parent_dentry = if new_parent_path.is_empty() {
-        new_root.clone()
+        cwd.clone()
     } else {
-        match walk_from(new_root.clone(), new_parent_path, &cred) {
+        match walk_from(cwd.clone(), new_parent_path, &cred) {
             Ok(d) => d,
             Err(e) => return SyscallResult::Error(e),
         }
@@ -1707,16 +1316,7 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     // Displaced inode is optional — walk_from returns Err(ENOENT)
     // when the new path doesn't exist, which is the normal case
     // for a rename that creates rather than overwrites.
-    let displaced_dentry = walk_from(new_root.clone(), &newpath, &cred).ok();
-    if (flags & RENAME_NOREPLACE) != 0 && displaced_dentry.is_some() {
-        return SyscallResult::Error(EEXIST_VALUE);
-    }
-    if (flags & RENAME_EXCHANGE) != 0 && displaced_dentry.is_none() {
-        return SyscallResult::Error(ENOENT_VALUE);
-    }
-    if mount_is_read_only(&old_parent_dentry) || mount_is_read_only(&new_parent_dentry) {
-        return SyscallResult::Error(EROFS_VALUE);
-    }
+    let displaced_dentry = walk_from(cwd.clone(), &newpath, &cred).ok();
     let old_parent_meta = old_parent_dentry.rnode().meta();
     let old_child_meta = old_child_dentry.rnode().meta();
     let new_parent_meta = new_parent_dentry.rnode().meta();
@@ -1731,73 +1331,20 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     ) {
         return SyscallResult::error_from(e);
     }
-    let fs_ops = match fs_ops_for_dentry(&old_parent_dentry) {
-        Some(ops) => ops,
-        None => return SyscallResult::Error(EROFS_VALUE),
+    let result = {
+        let mut script_ctx = build_subject_script_ctx(ctx);
+        let mut op = RenameOp {
+            rooted_at: &cwd,
+            oldpath: &oldpath,
+            newpath: &newpath,
+            cred: &cred,
+            state: None,
+        };
+        step_engine::drive_oneshot(&mut op, &mut script_ctx)
     };
-    let new_fs_ops = match fs_ops_for_dentry(&new_parent_dentry) {
-        Some(ops) => ops,
-        None => return SyscallResult::Error(EROFS_VALUE),
-    };
-    if !alloc::sync::Arc::ptr_eq(&fs_ops, &new_fs_ops) {
-        const EXDEV_VALUE: i32 = 18;
-        return SyscallResult::Error(EXDEV_VALUE);
-    }
-    let outcome = if (flags & RENAME_EXCHANGE) != 0 {
-        const TMP_NAME: &[u8] = b".tx_rename_exchange_tmp";
-        let guard = step_engine::guard();
-        match fs_ops.rename(
-            old_parent_dentry.rnode().fs_object_id(),
-            old_basename,
-            old_parent_dentry.rnode().fs_object_id(),
-            TMP_NAME,
-            &guard,
-        ) {
-            StepOutcome::Done(()) => {}
-            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
-                return SyscallResult::Error(EIO_VALUE);
-            }
-            StepOutcome::Err(errno) => return SyscallResult::error_from(errno),
-        }
-        match fs_ops.rename(
-            new_parent_dentry.rnode().fs_object_id(),
-            new_basename,
-            old_parent_dentry.rnode().fs_object_id(),
-            old_basename,
-            &guard,
-        ) {
-            StepOutcome::Done(()) => {}
-            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
-                return SyscallResult::Error(EIO_VALUE);
-            }
-            StepOutcome::Err(errno) => return SyscallResult::error_from(errno),
-        }
-        fs_ops.rename(
-            old_parent_dentry.rnode().fs_object_id(),
-            TMP_NAME,
-            new_parent_dentry.rnode().fs_object_id(),
-            new_basename,
-            &guard,
-        )
-    } else {
-        let guard = step_engine::guard();
-        fs_ops.rename(
-            old_parent_dentry.rnode().fs_object_id(),
-            old_basename,
-            new_parent_dentry.rnode().fs_object_id(),
-            new_basename,
-            &guard,
-        )
-    };
-    match outcome {
-        StepOutcome::Done(()) => {
-            old_parent_dentry.remove_cached_child_by_name(b".tx_rename_exchange_tmp");
-            old_parent_dentry.remove_cached_child_by_name(old_basename);
-            new_parent_dentry.remove_cached_child_by_name(new_basename);
-            SyscallResult::Return(0)
-        }
-        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-        StepOutcome::Err(errno) => SyscallResult::error_from(errno),
+    match result {
+        Ok(()) => SyscallResult::Return(0),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 

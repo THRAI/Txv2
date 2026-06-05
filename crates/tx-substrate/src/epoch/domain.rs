@@ -14,13 +14,16 @@ use super::retired::{append_index, PerCpuRetiredPool};
 use tx_hal::{CpuId, CpuPinGuard, IrqIf, PercpuIf, SmpIf};
 
 const INITIAL_EPOCH: u64 = 1;
-const RETIRE_THRESHOLD: usize = 64;
-const DEFAULT_DRAIN_BATCH: usize = 32;
-const MAX_EPOCH_CPUS: usize = 8;
+const RETIRE_THRESHOLD: usize = 512;
+const DEFAULT_DRAIN_BATCH: usize = 128;
+const MAX_EPOCH_CPUS: usize = 64;
 
 pub use super::retired::RETIRED_NODE_POOL_CAPACITY;
 
 static GLOBAL_DOMAIN: EpochDomain = EpochDomain::new();
+static RETIRE_TRACE_SAMPLE: AtomicU64 = AtomicU64::new(0);
+static DRAIN_TRACE_SAMPLE: AtomicU64 = AtomicU64::new(0);
+static RECLAIM_TRACE_SAMPLE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EpochError {
@@ -166,6 +169,7 @@ impl EpochDomain {
         Ok(())
     }
 
+    #[track_caller]
     fn guard(&'static self) -> Guard<'static> {
         assert!(
             self.initialized.load(Ordering::Acquire),
@@ -188,12 +192,13 @@ impl EpochDomain {
             "epoch::guard current CPU has not called epoch::init_on_ap/init_on_bsp"
         );
 
-        let local_epoch = local.current();
-        if local_epoch != 0 {
-            return Guard::new_borrowed(self, local, cpu_id, local_epoch, cpu_pin);
-        }
-
         let current_epoch = self.global_epoch.0.load(Ordering::Acquire);
+        let active_epoch = local.current();
+        assert_eq!(
+            active_epoch, 0,
+            "epoch::guard nested on CPU {} with active epoch {}; use borrow_current_guard()",
+            cpu_id.0, active_epoch
+        );
         local.enter(current_epoch);
         self.active_guards.0.fetch_add(1, Ordering::AcqRel);
         // Publish the local epoch before any protected load can float above the
@@ -236,10 +241,21 @@ impl EpochDomain {
         ptr: *mut u8,
         reclaim_fn: unsafe fn(*mut u8),
     ) -> Result<(), EpochError> {
+        let trace_seq = epoch_trace_sample(&RETIRE_TRACE_SAMPLE);
+        if let Some(seq) = trace_seq {
+            emit_epoch_trace(b"debug.epoch.retire.enter", seq);
+            emit_epoch_trace(b"debug.epoch.retire.reclaim_fn", reclaim_fn as usize as i64);
+        }
         if ptr.is_null() {
+            if let Some(seq) = trace_seq {
+                emit_epoch_trace(b"debug.epoch.retire.null", seq);
+            }
             return Err(EpochError::NullPointer);
         }
         if !self.initialized.load(Ordering::Acquire) {
+            if let Some(seq) = trace_seq {
+                emit_epoch_trace(b"debug.epoch.retire.not_initialized", seq);
+            }
             return Err(EpochError::NotInitialized);
         }
 
@@ -259,6 +275,9 @@ impl EpochDomain {
         drop(cpu_pin);
 
         if index.is_none() {
+            if let Some(seq) = trace_seq {
+                emit_epoch_trace(b"debug.epoch.retire.alloc_miss", seq);
+            }
             let _ = self.try_drain(DEFAULT_DRAIN_BATCH);
 
             let cpu_pin = (hooks.pin_current_cpu)();
@@ -280,9 +299,17 @@ impl EpochDomain {
 
             let retired = unsafe { &mut *local.retired_ptr() };
             retired.push(&mut pool.nodes, index);
-            let should_try_drain = retired.count > RETIRE_THRESHOLD;
+            let retired_count = retired.count;
+            if let Some(seq) = trace_seq {
+                emit_epoch_trace(b"debug.epoch.retire.queued", seq);
+                emit_epoch_trace(b"debug.epoch.retire.local_count", retired_count as i64);
+            }
+            let should_try_drain = retired_count > RETIRE_THRESHOLD;
             drop(cpu_pin);
             if should_try_drain {
+                if let Some(seq) = trace_seq {
+                    emit_epoch_trace(b"debug.epoch.retire.threshold", seq);
+                }
                 let _ = self.try_drain(DEFAULT_DRAIN_BATCH);
             }
             return Ok(());
@@ -298,15 +325,28 @@ impl EpochDomain {
 
         let retired = unsafe { &mut *local.retired_ptr() };
         retired.push(&mut pool.nodes, index);
-        let should_try_drain = retired.count > RETIRE_THRESHOLD;
+        let retired_count = retired.count;
+        if let Some(seq) = trace_seq {
+            emit_epoch_trace(b"debug.epoch.retire.queued", seq);
+            emit_epoch_trace(b"debug.epoch.retire.local_count", retired_count as i64);
+        }
+        let should_try_drain = retired_count > RETIRE_THRESHOLD;
 
         if should_try_drain {
+            if let Some(seq) = trace_seq {
+                emit_epoch_trace(b"debug.epoch.retire.threshold", seq);
+            }
             let _ = self.try_drain(DEFAULT_DRAIN_BATCH);
         }
         Ok(())
     }
 
     fn try_drain(&'static self, budget: usize) -> DrainStats {
+        let trace_seq = epoch_trace_sample(&DRAIN_TRACE_SAMPLE);
+        if let Some(seq) = trace_seq {
+            emit_epoch_trace(b"debug.epoch.drain.enter", seq);
+            emit_epoch_trace(b"debug.epoch.drain.budget", budget as i64);
+        }
         if !self.initialized.load(Ordering::Acquire) {
             return DrainStats::default();
         }
@@ -330,6 +370,10 @@ impl EpochDomain {
         let hooks = self.hooks();
         let cpu_pin = (hooks.pin_current_cpu)();
         let cpu_id = cpu_pin.cpu_id();
+        if let Some(_seq) = trace_seq {
+            emit_epoch_trace(b"debug.epoch.drain.cpu", cpu_id.0 as i64);
+            emit_epoch_trace(b"debug.epoch.drain.safe_epoch", safe_epoch as i64);
+        }
         if cpu_id.0 >= self.possible_cpus.0.load(Ordering::Acquire)
             || !(hooks.is_cpu_online)(cpu_id)
             || !self.cpu_states[cpu_id.0].is_initialized()
@@ -371,6 +415,16 @@ impl EpochDomain {
         }
 
         stats.reclaimed = self.reclaim_list(cpu_id, reclaim_head);
+        if let Some(seq) = trace_seq {
+            emit_epoch_trace(b"debug.epoch.drain.exit", seq);
+            emit_epoch_trace(b"debug.epoch.drain.advanced", stats.advanced_epochs as i64);
+            emit_epoch_trace(b"debug.epoch.drain.reclaimed", stats.reclaimed as i64);
+            emit_epoch_trace(b"debug.epoch.drain.remaining", stats.remaining as i64);
+            emit_epoch_trace(
+                b"debug.epoch.drain.active_guards",
+                stats.active_guards as i64,
+            );
+        }
         stats
     }
 
@@ -419,7 +473,15 @@ impl EpochDomain {
 
             // The callback owns object-specific destruction. The domain only
             // decides when it is safe to call it.
+            let trace_seq = epoch_trace_sample(&RECLAIM_TRACE_SAMPLE);
+            if let Some(seq) = trace_seq {
+                emit_epoch_trace(b"debug.epoch.reclaim.begin", seq);
+                emit_epoch_trace(b"debug.epoch.reclaim.fn", reclaim_fn as usize as i64);
+            }
             unsafe { reclaim_fn(ptr) };
+            if let Some(seq) = trace_seq {
+                emit_epoch_trace(b"debug.epoch.reclaim.end", seq);
+            }
 
             let state = unsafe { &mut *self.state.get() };
             state.free_node(cpu, index);
@@ -472,6 +534,20 @@ impl EpochDomain {
             local_epoch: state.current(),
             retired_count: state.retired_count(),
         })
+    }
+}
+
+fn epoch_trace_sample(counter: &AtomicU64) -> Option<i64> {
+    let seq = counter.fetch_add(1, Ordering::Relaxed);
+    (seq < 128 || seq.is_power_of_two()).then_some(seq as i64)
+}
+
+fn emit_epoch_trace(name: &[u8], value: i64) {
+    if let Some(observer) = tx_observe::current() {
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            value,
+        );
     }
 }
 
@@ -590,6 +666,7 @@ pub fn init_on_ap(cpu: CpuId) -> Result<(), EpochError> {
     GLOBAL_DOMAIN.init_on_ap(cpu)
 }
 
+#[track_caller]
 pub(crate) fn guard() -> Guard<'static> {
     GLOBAL_DOMAIN.guard()
 }

@@ -219,6 +219,7 @@ fn dispatch_ioctl_rtc_rd_time_on_rtc_char_device_writes_rtc_time() {
             append: false,
             cloexec: false,
             nonblocking: false,
+            packet: false,
         },
     )
     .expect("rtc open file");

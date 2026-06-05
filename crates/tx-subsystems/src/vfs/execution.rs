@@ -17,7 +17,6 @@ use crate::vfs::adapter::step_engine::{
 };
 use crate::vm::AddressSpace;
 use tx_hal::UserPtr;
-use tx_substrate::zone::PayloadCap;
 
 use super::structure::{
     Credential, DirEntry, FsObjectId, InodeMeta, OpenFile, OpenFileBacking, OpenFileIoctl,
@@ -28,7 +27,7 @@ use crate::mount::MountPayload;
 // === FsOps — emits step_v3 outcomes ==================================
 //
 // Per-method progress-type choice: every method in `FsOps` uses
-// `step::NoProgress`. The trait surface is one-shot identity-side
+// `step_v3::NoProgress`. The trait surface is one-shot identity-side
 // queries / mutations (`lookup`, `mkdir`, `unlink`, …): the caller
 // asks one question per call, and the trait's contract has no
 // sub-operation accumulation (`readdir` returns one entry per call;
@@ -53,7 +52,7 @@ use crate::mount::MountPayload;
 /// `FsOps` is **not** the "v4 trait." It is the live VFS operation
 /// boundary dispatched as `Arc<dyn FsOps>` from the shim layer
 /// (`fs_basic.rs`, `fs_mut.rs`, `fs_path.rs`). Once its methods return
-/// `step::StepOutcome`, it is a v3 trait in substance — the name
+/// `step_v3::StepOutcome`, it is a v3 trait in substance — the name
 /// is older than the v3 vocabulary, that is all. See
 /// `docs/progress/decisions/2026-05-11-pr-1-6-keep-fsops.md` for the
 /// rationale (v3 requires StepOutcome shape unification, not
@@ -260,51 +259,6 @@ pub trait FsOps: Send + Sync + 'static {
         let _ = (fs_object_id, offset, buf, guard);
         StepOutcome::err(Errno::ENOSYS)
     }
-
-    /// Read projected content using the caller's network namespace
-    /// when a backend has namespace-sensitive projections such as
-    /// `/proc/net/*`. Backends without such projections inherit the
-    /// legacy projected read behavior.
-    fn step_read_projected_with_netns(
-        &self,
-        fs_object_id: FsObjectId,
-        offset: u64,
-        buf: &mut [u8],
-        caller_netns: Option<&crate::net::NetNamespacePayload>,
-        guard: &Guard<'_>,
-    ) -> StepOutcome<u64, NoProgress> {
-        let _ = caller_netns;
-        self.step_read_projected(fs_object_id, offset, buf, guard)
-    }
-
-    /// Write content to a projected inode (procfs/sysctl style files).
-    /// Called by `OpenFile::step_write` when `RNodeBacking::Projected`.
-    /// Default: `ENOSYS`.
-    fn step_write_projected(
-        &self,
-        fs_object_id: FsObjectId,
-        offset: u64,
-        bytes: &[u8],
-        guard: &Guard<'_>,
-    ) -> StepOutcome<u64, NoProgress> {
-        let _ = (fs_object_id, offset, bytes, guard);
-        StepOutcome::err(Errno::ENOSYS)
-    }
-
-    /// Write projected content using the caller's network namespace
-    /// when the projection is namespace-sensitive. The default keeps
-    /// existing backends on their legacy projected write path.
-    fn step_write_projected_with_netns(
-        &self,
-        fs_object_id: FsObjectId,
-        offset: u64,
-        bytes: &[u8],
-        caller_netns: Option<&crate::net::NetNamespacePayload>,
-        guard: &Guard<'_>,
-    ) -> StepOutcome<u64, NoProgress> {
-        let _ = caller_netns;
-        self.step_write_projected(fs_object_id, offset, bytes, guard)
-    }
 }
 
 /// Filesystem driver output produced at mount time and consumed by Mount
@@ -333,18 +287,6 @@ pub struct MountOutput {
 impl OpenFile {
     /// Dispatch a read against this file's RNode backing.
     pub fn step_read(&self, out: &mut [u8], guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
-        self.step_read_with_netns(out, None, guard)
-    }
-
-    /// Dispatch a read with optional caller network namespace context
-    /// for namespace-sensitive projected files.
-    pub fn step_read_with_netns(
-        &self,
-        out: &mut [u8],
-        caller_netns: Option<&crate::net::NetNamespacePayload>,
-        guard: &Guard<'_>,
-    ) -> StepOutcome<usize, ByteProgress> {
-        let file_flags = self.flags();
         // observe
         // upgrade
         // reserve
@@ -356,7 +298,8 @@ impl OpenFile {
         // ③ reserve — (N/A: delegated to backing trait impl)
         // ④ commit — (N/A: delegated to backing trait impl)
         // ⑤ publish — (N/A: read doesn't fire signals)
-        if !file_flags.read {
+        let flags = self.flags();
+        if !flags.read {
             return StepOutcome::Err(Errno::EINVAL);
         }
 
@@ -368,32 +311,20 @@ impl OpenFile {
         // file). Surface EINVAL until then.
         if matches!(
             self.backing(),
-            OpenFileBacking::Ufd { .. } | OpenFileBacking::KernelObject { .. }
+            OpenFileBacking::Ufd { .. } | OpenFileBacking::SocketPair { .. }
         ) {
             return StepOutcome::Err(Errno::EINVAL);
         }
 
-        let rnode = self.rnode();
-        match rnode.backing() {
+        match self.rnode().backing() {
             RNodeBacking::StructBacked { payload } => match payload {
                 StructPayload::Tty(tty) => tty::execution::step_read(tty, out, guard),
                 StructPayload::CharDevice(binding) => binding.ops.read(out, guard),
                 StructPayload::BlockDevice(_) => StepOutcome::Err(Errno::ENOSYS),
-                StructPayload::FsNotify { .. } => {
-                    if file_flags.nonblocking {
-                        StepOutcome::Err(Errno::EAGAIN)
-                    } else {
-                        StepOutcome::yield_on_wait_source(
-                            ByteProgress::EMPTY,
-                            rnode.read_wait_source_id(),
-                            super::structure::VFS_READABLE,
-                        )
-                    }
-                }
                 StructPayload::Pipe {
                     payload,
                     side: crate::pipe::PipeSide::Reader,
-                } => crate::pipe::step_read(payload, out, guard, file_flags.nonblocking),
+                } => crate::pipe::step_read(payload, out, guard, flags.nonblocking),
                 // Wrong-side read against a writer-end RNode. The
                 // OpenFileFlags.read=false guard above handles the
                 // common case (writer-end OpenFiles never set read);
@@ -402,26 +333,6 @@ impl OpenFile {
                     side: crate::pipe::PipeSide::Writer,
                     ..
                 } => StepOutcome::Err(Errno::EBADF),
-                StructPayload::Socket { identity } => {
-                    match crate::net::execution::step_recv_kernel_bytes(
-                        identity,
-                        out,
-                        crate::net::SendRecvFlags::empty(),
-                        guard,
-                    ) {
-                        StepOutcome::Done(outcome) => StepOutcome::Done(outcome.bytes),
-                        StepOutcome::Continue { progress } => StepOutcome::Continue { progress },
-                        StepOutcome::Yield { progress, shape } => {
-                            if file_flags.nonblocking && progress.bytes() == 0 {
-                                StepOutcome::Err(Errno::EAGAIN)
-                            } else {
-                                StepOutcome::Yield { progress, shape }
-                            }
-                        }
-                        StepOutcome::Err(errno) => StepOutcome::Err(errno),
-                    }
-                }
-                StructPayload::NetNamespace { .. } => StepOutcome::Err(Errno::ENOSYS),
             },
             RNodeBacking::Directory => StepOutcome::Err(Errno::EISDIR),
             // PR-11 follow-up (W-KK, closing the ENOSYS gap W-JJ flagged
@@ -441,13 +352,10 @@ impl OpenFile {
                     .and_then(|mw| mw.upgrade(guard))
                 {
                     Some(mp) => {
-                        match mp.fs_ops().step_read_projected_with_netns(
-                            rnode.fs_object_id(),
-                            off,
-                            out,
-                            caller_netns,
-                            guard,
-                        ) {
+                        match mp
+                            .fs_ops()
+                            .step_read_projected(rnode.fs_object_id(), off, out, guard)
+                        {
                             StepOutcome::Done(n) => {
                                 self.set_offset(off + n);
                                 StepOutcome::Done(n as usize)
@@ -510,7 +418,7 @@ impl OpenFile {
         // Linux returns ESPIPE on `lseek(uffd_fd, ...)`; match that.
         if matches!(
             self.backing(),
-            OpenFileBacking::Ufd { .. } | OpenFileBacking::KernelObject { .. }
+            OpenFileBacking::Ufd { .. } | OpenFileBacking::SocketPair { .. }
         ) {
             return StepOutcome::Err(Errno::ESPIPE);
         }
@@ -525,10 +433,7 @@ impl OpenFile {
                 StructPayload::Tty(_)
                 | StructPayload::CharDevice(_)
                 | StructPayload::BlockDevice(_)
-                | StructPayload::FsNotify { .. }
-                | StructPayload::Pipe { .. }
-                | StructPayload::Socket { .. }
-                | StructPayload::NetNamespace { .. } => return StepOutcome::Err(Errno::ESPIPE),
+                | StructPayload::Pipe { .. } => return StepOutcome::Err(Errno::ESPIPE),
             },
             RNodeBacking::Directory => return StepOutcome::Err(Errno::EISDIR),
             RNodeBacking::Symlink { .. } | RNodeBacking::Projected { .. } => {
@@ -575,18 +480,6 @@ impl OpenFile {
 
     /// Dispatch a write against this file's RNode backing.
     pub fn step_write(&self, bytes: &[u8], guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
-        self.step_write_with_netns(bytes, None, guard)
-    }
-
-    /// Dispatch a write with optional caller network namespace context
-    /// for namespace-sensitive projected files.
-    pub fn step_write_with_netns(
-        &self,
-        bytes: &[u8],
-        caller_netns: Option<&crate::net::NetNamespacePayload>,
-        guard: &Guard<'_>,
-    ) -> StepOutcome<usize, ByteProgress> {
-        let file_flags = self.flags();
         // observe
         // upgrade
         // reserve
@@ -598,7 +491,8 @@ impl OpenFile {
         // ④ commit — (N/A: delegated to backing trait impl)
         // ⑤ publish — (N/A: write doesn't fire signals directly)
         // observe: validate file is writable
-        if !file_flags.write {
+        let flags = self.flags();
+        if !flags.write {
             return StepOutcome::Err(Errno::EINVAL);
         }
 
@@ -607,7 +501,7 @@ impl OpenFile {
         // reply path, not write(2). Surface EINVAL until then.
         if matches!(
             self.backing(),
-            OpenFileBacking::Ufd { .. } | OpenFileBacking::KernelObject { .. }
+            OpenFileBacking::Ufd { .. } | OpenFileBacking::SocketPair { .. }
         ) {
             return StepOutcome::Err(Errno::EINVAL);
         }
@@ -617,38 +511,17 @@ impl OpenFile {
                 StructPayload::Tty(tty) => tty::execution::step_write(tty, bytes, guard),
                 StructPayload::CharDevice(binding) => binding.ops.write(bytes, guard),
                 StructPayload::BlockDevice(_) => StepOutcome::Err(Errno::ENOSYS),
-                StructPayload::FsNotify { .. } => StepOutcome::Err(Errno::EINVAL),
                 StructPayload::Pipe {
                     payload,
                     side: crate::pipe::PipeSide::Writer,
-                } => crate::pipe::step_write(payload, bytes, guard, file_flags.nonblocking),
+                } => {
+                    crate::pipe::step_write(payload, bytes, guard, flags.nonblocking, flags.packet)
+                }
                 // Wrong-side write against a reader-end RNode.
                 StructPayload::Pipe {
                     side: crate::pipe::PipeSide::Reader,
                     ..
                 } => StepOutcome::Err(Errno::EBADF),
-                StructPayload::Socket { identity } => {
-                    let flags = if file_flags.nonblocking {
-                        crate::net::SendRecvFlags::MSG_DONTWAIT
-                    } else {
-                        crate::net::SendRecvFlags::empty()
-                    };
-                    match crate::net::execution::step_send_kernel_bytes(
-                        identity, bytes, flags, guard,
-                    ) {
-                        StepOutcome::Done(written) => StepOutcome::Done(written),
-                        StepOutcome::Continue { progress } => StepOutcome::Continue { progress },
-                        StepOutcome::Yield { progress, shape } => {
-                            if file_flags.nonblocking && progress.bytes() == 0 {
-                                StepOutcome::Err(Errno::EAGAIN)
-                            } else {
-                                StepOutcome::Yield { progress, shape }
-                            }
-                        }
-                        StepOutcome::Err(errno) => StepOutcome::Err(errno),
-                    }
-                }
-                StructPayload::NetNamespace { .. } => StepOutcome::Err(Errno::ENOSYS),
             },
             RNodeBacking::Directory => StepOutcome::Err(Errno::EISDIR),
             // Symmetric to the PageBacked step_read arm above — route
@@ -660,36 +533,13 @@ impl OpenFile {
                 // requires this seek-and-write to be atomic; our model
                 // approximates it by snapping the offset just before the
                 // write helper consumes it.
-                if self.flags().append {
+                if flags.append {
                     self.set_offset(pc.size_bytes());
                 }
                 crate::page_backed::step_write_from_kernel(pc, self, bytes, guard)
             }
-            RNodeBacking::Symlink { .. } => StepOutcome::Err(Errno::ENOSYS),
-            RNodeBacking::Projected { .. } => {
-                let rnode = self.rnode();
-                let off = self.offset();
-                match rnode
-                    .containing_mount_weak()
-                    .and_then(|mw| mw.upgrade(guard))
-                {
-                    Some(mp) => match mp.fs_ops().step_write_projected_with_netns(
-                        rnode.fs_object_id(),
-                        off,
-                        bytes,
-                        caller_netns,
-                        guard,
-                    ) {
-                        StepOutcome::Done(n) => {
-                            self.set_offset(off + n);
-                            StepOutcome::Done(n as usize)
-                        }
-                        StepOutcome::Err(e) => StepOutcome::Err(e),
-                        StepOutcome::Continue { .. } => StepOutcome::Err(Errno::EAGAIN),
-                        StepOutcome::Yield { .. } => StepOutcome::Err(Errno::EIO),
-                    },
-                    None => StepOutcome::Err(Errno::ENOENT),
-                }
+            RNodeBacking::Symlink { .. } | RNodeBacking::Projected { .. } => {
+                StepOutcome::Err(Errno::ENOSYS)
             }
         }
     }
@@ -723,7 +573,7 @@ impl OpenFile {
         // this dispatcher.
         if matches!(
             self.backing(),
-            OpenFileBacking::Ufd { .. } | OpenFileBacking::KernelObject { .. }
+            OpenFileBacking::Ufd { .. } | OpenFileBacking::SocketPair { .. }
         ) {
             return StepOutcome::Err(Errno::ENOTTY);
         }
@@ -734,10 +584,7 @@ impl OpenFile {
                 StructPayload::BlockDevice(_) => StepOutcome::Err(Errno::ENOSYS),
                 // Pipe was added on main; ioctl on a pipe returns
                 // ENOTTY (matches Linux behaviour).
-                StructPayload::FsNotify { .. }
-                | StructPayload::Pipe { .. }
-                | StructPayload::Socket { .. }
-                | StructPayload::NetNamespace { .. } => StepOutcome::Err(Errno::ENOTTY),
+                StructPayload::Pipe { .. } => StepOutcome::Err(Errno::ENOTTY),
             },
             RNodeBacking::Directory => StepOutcome::Err(Errno::EISDIR),
             RNodeBacking::PageBacked { .. }
@@ -837,7 +684,6 @@ fn step_tty_ioctl(
 pub struct OpenFileReadOp<'a> {
     pub file: &'a Cap<super::structure::OpenFile>,
     pub out: &'a mut [u8],
-    pub caller_netns: Option<PayloadCap<crate::net::NetNamespacePayload>>,
     /// Internal write cursor: each `step()` call fills bytes starting
     /// at `out[cursor..]` and advances `cursor` by the amount returned
     /// in the outcome. This allows `drive()` to call `step()` multiple
@@ -851,13 +697,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileReadOp<'a> {
     type Progress = ByteProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         let guard = step_engine::guard();
-        let caller_netns = self
-            .caller_netns
-            .as_ref()
-            .map(|netns| &**netns as &crate::net::NetNamespacePayload);
-        let result =
-            self.file
-                .step_read_with_netns(&mut self.out[self.cursor..], caller_netns, &guard);
+        let result = self.file.step_read(&mut self.out[self.cursor..], &guard);
         // Advance cursor by the bytes read in this step. The
         // `StepProgress` accumulator (ByteProgress) carries the same
         // value, so `drive()`'s `accumulated` stays in sync with the
@@ -904,7 +744,6 @@ impl OneShotStepOp<crate::process::ProcessIdentity> for OpenFileLseekOp<'_> {}
 pub struct OpenFileWriteOp<'a> {
     pub file: &'a Cap<super::structure::OpenFile>,
     pub bytes: &'a [u8],
-    pub caller_netns: Option<PayloadCap<crate::net::NetNamespacePayload>>,
     /// Internal write cursor: each `step()` call consumes bytes starting
     /// at `bytes[cursor..]`. Mirrors `OpenFileReadOp::cursor`.
     pub cursor: usize,
@@ -915,13 +754,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileWriteOp<'a> {
     type Progress = ByteProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         let guard = step_engine::guard();
-        let caller_netns = self
-            .caller_netns
-            .as_ref()
-            .map(|netns| &**netns as &crate::net::NetNamespacePayload);
-        let result =
-            self.file
-                .step_write_with_netns(&self.bytes[self.cursor..], caller_netns, &guard);
+        let result = self.file.step_write(&self.bytes[self.cursor..], &guard);
         match &result {
             StepOutcome::Done(n) => {
                 self.cursor += *n;
@@ -968,11 +801,14 @@ impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileWriteFromUserOp<'a> {
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         let guard = step_engine::guard();
         let remaining = self.len - self.cursor;
+        emit_vfs_trace(b"debug.vfs.write_from_user_op.remaining", remaining as i64);
+        emit_vfs_trace(b"debug.vfs.write_from_user_op.cursor", self.cursor as i64);
         if remaining == 0 {
             return StepOutcome::Done(self.cursor);
         }
         match self.file.rnode().backing() {
             RNodeBacking::PageBacked { pc } => {
+                emit_vfs_trace(b"debug.vfs.write_from_user_op.phase", 0);
                 let result = crate::page_backed::step_write_from_user(
                     pc,
                     self.file,
@@ -982,11 +818,29 @@ impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileWriteFromUserOp<'a> {
                     &guard,
                 );
                 match &result {
-                    StepOutcome::Done(n) => self.cursor += *n,
-                    StepOutcome::Continue { progress } => self.cursor += progress.bytes(),
-                    StepOutcome::Yield { progress, .. } => self.cursor += progress.bytes(),
-                    StepOutcome::Err(_) => {}
+                    StepOutcome::Done(n) => {
+                        emit_vfs_trace(b"debug.vfs.write_from_user_op.done", *n as i64);
+                        self.cursor += *n;
+                    }
+                    StepOutcome::Continue { progress } => {
+                        emit_vfs_trace(
+                            b"debug.vfs.write_from_user_op.progress",
+                            progress.bytes() as i64,
+                        );
+                        self.cursor += progress.bytes();
+                    }
+                    StepOutcome::Yield { progress, .. } => {
+                        emit_vfs_trace(
+                            b"debug.vfs.write_from_user_op.yield_progress",
+                            progress.bytes() as i64,
+                        );
+                        self.cursor += progress.bytes();
+                    }
+                    StepOutcome::Err(_) => {
+                        emit_vfs_trace(b"debug.vfs.write_from_user_op.err", 1);
+                    }
                 }
+                emit_vfs_trace(b"debug.vfs.write_from_user_op.phase", 1);
                 result
             }
             _ => StepOutcome::Err(Errno::ENOSYS),
@@ -1039,6 +893,15 @@ impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileReadToUserOp<'a> {
     }
 }
 
+fn emit_vfs_trace(name: &[u8], value: i64) {
+    if let Some(observer) = tx_observe::current() {
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            value,
+        );
+    }
+}
+
 /// `StepOp` wrap of [`OpenFile::step_ioctl`]. The caller / request enums
 /// borrow `'a`, so the wrap inherits the same lifetime.
 pub struct OpenFileIoctlOp<'a> {
@@ -1075,10 +938,11 @@ impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileGetFlOp<'a> {
 impl OneShotStepOp for OpenFileGetFlOp<'_> {}
 impl OneShotStepOp<crate::process::ProcessIdentity> for OpenFileGetFlOp<'_> {}
 
-/// `StepOp` wrap for `fcntl(F_SETFL)` — sets `OpenFile::nonblocking`.
+/// `StepOp` wrap for `fcntl(F_SETFL)` — sets mutable OpenFile status flags.
 pub struct OpenFileSetFlOp<'a> {
     pub file: &'a Cap<super::structure::OpenFile>,
     pub nonblocking: bool,
+    pub packet: bool,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileSetFlOp<'a> {
@@ -1086,6 +950,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileSetFlOp<'a> {
     type Progress = NoProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
         self.file.set_nonblocking(self.nonblocking);
+        self.file.set_packet_mode(self.packet);
         StepOutcome::Done(())
     }
 }
@@ -1174,7 +1039,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for FlockOp<'a> {
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
         match self.file.flock_acquire(self.lock_type, self.blocking) {
             Ok(()) => StepOutcome::Done(()),
-            Err(e) => StepOutcome::Err(e),
+            Err(e) => StepOutcome::Err(e.into()),
         }
     }
 }
@@ -1283,6 +1148,7 @@ mod step_op_wraps {
                 append: false,
                 cloexec: false,
                 nonblocking: false,
+                packet: false,
             },
         )
         .expect("open file")
@@ -1321,6 +1187,7 @@ mod step_op_wraps {
                 append: false,
                 cloexec: false,
                 nonblocking: false,
+                packet: false,
             },
         )
         .expect("open file")
@@ -1341,6 +1208,7 @@ mod step_op_wraps {
                 append: false,
                 cloexec: false,
                 nonblocking: false,
+                packet: false,
             },
         )
         .expect("open file")
@@ -1354,7 +1222,6 @@ mod step_op_wraps {
         let mut op = OpenFileReadOp {
             file: &file,
             out: &mut buf,
-            caller_netns: None,
             cursor: 0,
         };
         let mut ctx = ScriptCtx::<ProcessIdentity>::new();
@@ -1375,7 +1242,6 @@ mod step_op_wraps {
         let mut op = OpenFileReadOp {
             file: &file,
             out: &mut buf,
-            caller_netns: None,
             cursor: 0,
         };
         let mut ctx = ScriptCtx::<ProcessIdentity>::new();
@@ -1392,7 +1258,6 @@ mod step_op_wraps {
         let mut op = OpenFileWriteOp {
             file: &file,
             bytes: b"hello",
-            caller_netns: None,
             cursor: 0,
         };
         let mut ctx = ScriptCtx::<ProcessIdentity>::new();
@@ -1409,7 +1274,6 @@ mod step_op_wraps {
         let mut op = OpenFileWriteOp {
             file: &file,
             bytes: b"hi",
-            caller_netns: None,
             cursor: 0,
         };
         let mut ctx = ScriptCtx::<ProcessIdentity>::new();
@@ -1561,6 +1425,7 @@ mod step_op_wraps {
                 append: false,
                 cloexec: false,
                 nonblocking: false,
+                packet: false,
             },
         )
         .map_err(|_| Errno::ENOMEM)?;

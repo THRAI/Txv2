@@ -6,23 +6,21 @@
 
 use tx_subsystems::execution::Errno;
 use tx_subsystems::timerfd::{
-    step_timerfd_read, timerfd_settime, ItimerSpec, TimerFd, ITIMERSPEC_BYTES,
+    step_timerfd_read, timerfd_settime_with_flags, ItimerSpec, TimerFd, ITIMERSPEC_BYTES,
 };
 use tx_subsystems::vfs::structure::OpenFileFlags;
 use tx_subsystems::vfs::OpenFile;
-use tx_subsystems::wait_source;
 
 use super::numbers::{
     CLOCK_MONOTONIC, CLOCK_REALTIME, NR_TIMERFD_CREATE, NR_TIMERFD_GETTIME, NR_TIMERFD_SETTIME,
     TFD_CLOEXEC_FLAG, TFD_NONBLOCK_FLAG, TFD_TIMER_ABSTIME_FLAG, TFD_TIMER_CANCEL_ON_SET_FLAG,
 };
-use super::time::realtime_ns;
 use super::{
     bootstrap_copy_to_user, bootstrap_read_user, bootstrap_write_user, errno_to_i32,
     next_stdio_fd_below_nofile, SyscallCtx, SyscallResult, EAGAIN_VALUE, EBADF_VALUE, EINVAL_VALUE,
     ENOMEM_VALUE,
 };
-use crate::adapter::step_engine::{self as step_engine};
+use crate::adapter::step_engine::{self as step_engine, InterestMask, WaitSourceId};
 
 // === timerfd_create ===================================================
 
@@ -64,7 +62,7 @@ pub(super) fn sys_timerfd_create<'a>(
         match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
             Ok(Ok(cap)) => cap,
             Ok(Err(_)) => return SyscallResult::Error(ENOMEM_VALUE),
-            Err(v3errno) => return SyscallResult::error_from(v3errno),
+            Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
         }
     };
 
@@ -74,6 +72,7 @@ pub(super) fn sys_timerfd_create<'a>(
         append: false,
         cloexec,
         nonblocking,
+        packet: false,
     };
     let open_cap = match OpenFile::new_timerfd_cap(tfd_cap, open_flags) {
         Ok(cap) => cap,
@@ -137,24 +136,23 @@ pub(super) fn sys_timerfd_settime<'a, P: super::TimeIf>(
     };
 
     let now_ns = P::read_ns();
-    let clock_now_ns = if tfd_cap.clockid() == CLOCK_REALTIME {
-        realtime_ns::<P>()
-    } else {
-        now_ns
-    };
-    let mut new_value = new_value;
-    if abstime && new_value.it_value_ns != 0 {
-        new_value.it_value_ns =
-            now_ns.saturating_add(new_value.it_value_ns.saturating_sub(clock_now_ns));
-    }
+    let generation = tx_subsystems::wall_clock::generation();
 
     // Read old_value if requested (before mutating).
     let old_spec = if old_value_ptr != 0 {
         let mut old = ItimerSpec::default();
-        timerfd_settime(tfd_cap, abstime, now_ns, new_value, Some(&mut old));
+        timerfd_settime_with_flags(
+            tfd_cap,
+            abstime,
+            now_ns,
+            new_value,
+            Some(&mut old),
+            flags,
+            generation,
+        );
         Some(old)
     } else {
-        timerfd_settime(tfd_cap, abstime, now_ns, new_value, None);
+        timerfd_settime_with_flags(tfd_cap, abstime, now_ns, new_value, None, flags, generation);
         None
     };
 
@@ -239,7 +237,6 @@ pub(super) async fn sys_timerfd_read<P: super::TimeIf>(
     }
 
     let nonblocking = file.flags().nonblocking;
-    use tx_subsystems::execution::WaitToken;
     loop {
         let now_ns = P::read_ns();
         let mut staging = [0u8; 8];
@@ -253,7 +250,7 @@ pub(super) async fn sys_timerfd_read<P: super::TimeIf>(
                 return SyscallResult::Return(n as i64);
             }
             V3Out::Err(v3errno) => {
-                let errno: Errno = v3errno;
+                let errno: Errno = v3errno.into();
                 if errno == Errno::EAGAIN {
                     return SyscallResult::Error(EAGAIN_VALUE);
                 }
@@ -267,30 +264,46 @@ pub(super) async fn sys_timerfd_read<P: super::TimeIf>(
                     },
                 ..
             } => {
-                // Try the deadline-based sleep before falling back to
-                // the wait source.  If the timer has an armed deadline,
-                // park until that deadline instead of waiting for an
-                // arbitrary wake.
                 let deadline = tfd_cap.deadline_ns();
-                if deadline > 0 && deadline > now_ns {
-                    // Use the reactor's timer queue to sleep until
-                    // the deadline.
-                    if let Some(future) = tx_subsystems::timer_sleep::sleep_until_ns(deadline) {
-                        let _ = future.await;
-                        continue; // re-poll
-                    }
-                }
-                // Fall back to the classic wait-source path.
-                let token = WaitToken::new(carrier.raw(), interests.raw());
-                if let Some(future) = wait_source::wait_on_token(token) {
-                    let _ = future.await;
-                }
+                wait_for_timerfd_wake(ctx, deadline, now_ns, carrier, interests).await;
             }
             V3Out::Continue { .. } | V3Out::Yield { .. } => {
                 return SyscallResult::error_from(Errno::EIO);
             }
         }
     }
+}
+
+async fn wait_for_timerfd_wake(
+    ctx: &SyscallCtx<'_>,
+    deadline: u64,
+    now_ns: u64,
+    source: WaitSourceId,
+    interests: InterestMask,
+) {
+    let Some(timer_future) = (deadline > now_ns)
+        .then(|| tx_subsystems::timer_sleep::sleep_until_ns(deadline))
+        .flatten()
+    else {
+        super::await_wait_source(ctx, source, interests).await;
+        return;
+    };
+
+    let source_future = super::await_wait_source(ctx, source, interests);
+    let mut timer_future = core::pin::pin!(timer_future);
+    let mut source_future = core::pin::pin!(source_future);
+
+    use core::future::{poll_fn, Future};
+    use core::task::Poll;
+
+    poll_fn(|cx| {
+        if timer_future.as_mut().poll(cx).is_ready() || source_future.as_mut().poll(cx).is_ready() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
 }
 
 /// Silence unused-import warnings.

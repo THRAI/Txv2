@@ -1,12 +1,11 @@
 // Auto-extracted from `crates/tx-subsystems/src/signal/tests.rs` (2026-05-08 jumbo split).
 #![cfg_attr(test, allow(unused_imports))]
 use super::*;
-use crate::process::{
-    bootstrap_init_process, step_fork, step_setpgid, ExitStatus, Pgid, ProcessIdentity,
-};
+use crate::process::execution::spawn_sibling_thread_for_test;
+use crate::process::{bootstrap_init_process, ExitStatus, ProcessIdentity};
 use crate::signal::adapter::step_engine::{Cap, SignalRouting};
 use crate::signal::{
-    ast_check, default_action, script_kill_pgrp, select_next_signal, step_kill_process,
+    ast_check, default_action, post_group_pending_signal, select_next_signal, step_kill_process,
     step_sigaction, AstOutcome, DefaultAction, InterruptSummary, KillOutcome, PendingSource,
     SaFlags, SigActionEntry, SigDisposition, SignalTarget,
 };
@@ -197,13 +196,7 @@ fn select_falls_through_to_group_pending_when_thread_empty() {
     let proc_cap = fresh_init();
     let leader = leader(&proc_cap);
 
-    proc_cap
-        .payload
-        .lock()
-        .as_ref()
-        .unwrap()
-        .group_pending()
-        .post(Signum::SIGTERM);
+    assert!(post_group_pending_signal(&proc_cap, Signum::SIGTERM));
 
     assert_eq!(
         select_next_signal(&leader),
@@ -523,13 +516,7 @@ fn sigprocmask_unblock_sets_deliverable_for_group_pending() {
     let mut block = SignalMask::EMPTY;
     block.block(Signum::SIGTERM);
     let _ = step_sigprocmask(&leader, SigmaskHow::SetMask, block);
-    proc_cap
-        .payload
-        .lock()
-        .as_ref()
-        .unwrap()
-        .group_pending()
-        .post(Signum::SIGTERM);
+    assert!(post_group_pending_signal(&proc_cap, Signum::SIGTERM));
     assert!(
         !leader
             .payload
@@ -551,6 +538,107 @@ fn sigprocmask_unblock_sets_deliverable_for_group_pending() {
             .interrupt_summary()
             .deliverable_signal,
         "sigprocmask must recompute deliverability from process group-pending signals too"
+    );
+}
+
+#[test]
+fn refresh_summary_uses_group_pending_hint_for_producer_post() {
+    let _g = setup();
+    let proc_cap = fresh_init();
+    let leader = leader(&proc_cap);
+
+    let mut block = SignalMask::EMPTY;
+    block.block(Signum::SIGTERM);
+    let _ = step_sigprocmask(&leader, SigmaskHow::SetMask, block);
+
+    assert!(post_group_pending_signal(&proc_cap, Signum::SIGTERM));
+    assert!(
+        !leader
+            .payload
+            .lock()
+            .as_ref()
+            .unwrap()
+            .interrupt_summary()
+            .deliverable_signal
+    );
+
+    let _ = step_sigprocmask(&leader, SigmaskHow::SetMask, SignalMask::EMPTY);
+
+    assert!(
+        leader
+            .payload
+            .lock()
+            .as_ref()
+            .unwrap()
+            .interrupt_summary()
+            .deliverable_signal
+    );
+}
+
+#[test]
+fn sigprocmask_refresh_uses_cached_group_hint_without_owner_upgrade() {
+    let _g = setup();
+    let proc_cap = fresh_init();
+    let leader = leader(&proc_cap);
+    let payload = leader.payload_cap().expect("leader payload");
+
+    let mut block = SignalMask::EMPTY;
+    block.block(Signum::SIGTERM);
+    let _ = step_sigprocmask(&leader, SigmaskHow::SetMask, block);
+    payload.store_group_pending_summary(Signum::SIGTERM.bit());
+
+    // Drop the owning process identity while keeping the thread identity and
+    // payload alive. The refresh path should maintain the summary from the
+    // cached group-pending hint instead of requiring the owner weak to upgrade.
+    reset_init_process_for_test();
+    drop(proc_cap);
+    tx_test_support::drain_to_quiescence();
+
+    let _ = step_sigprocmask(&leader, SigmaskHow::SetMask, SignalMask::EMPTY);
+
+    assert!(
+        payload.interrupt_summary().deliverable_signal,
+        "cached group-pending hint should be enough to refresh the summary"
+    );
+}
+
+#[test]
+fn post_group_pending_signal_refreshes_unmasked_thread_summary() {
+    let _g = setup();
+    let proc_cap = fresh_init();
+    let leader = leader(&proc_cap);
+
+    assert!(post_group_pending_signal(&proc_cap, Signum::SIGTERM));
+
+    assert!(
+        leader
+            .payload
+            .lock()
+            .as_ref()
+            .unwrap()
+            .interrupt_summary()
+            .deliverable_signal
+    );
+}
+
+#[test]
+fn spawned_sibling_inherits_existing_group_pending_hint() {
+    let _g = setup();
+    let proc_cap = fresh_init();
+
+    assert!(post_group_pending_signal(&proc_cap, Signum::SIGTERM));
+    let sibling = spawn_sibling_thread_for_test(&proc_cap).expect("sibling");
+
+    let _ = step_sigprocmask(&sibling, SigmaskHow::SetMask, SignalMask::EMPTY);
+
+    assert!(
+        sibling
+            .payload
+            .lock()
+            .as_ref()
+            .unwrap()
+            .interrupt_summary()
+            .deliverable_signal
     );
 }
 
@@ -819,39 +907,6 @@ fn step_kill_pgrp_does_not_mirror_gewalt_to_group_pending() {
     assert!(
         !parent_group_pending,
         "Gewalt must not be mirrored onto group_pending"
-    );
-}
-
-#[test]
-fn kill_zero_style_pgrp_fanout_reaches_in_group_child_handler() {
-    let _g = setup();
-    let parent = fresh_init();
-    let _ = step_setpgid(&parent, Pgid(parent.pid.0)).expect("parent setpgrp");
-    let sigusr1 = Signum::new(10).expect("SIGUSR1");
-
-    let child1 = step_fork::<TestPmap>(&parent, false, false).expect("fork child1");
-    let child_a = step_fork::<TestPmap>(&child1, false, false).expect("fork child A");
-    let child_b = step_fork::<TestPmap>(&child1, false, false).expect("fork child B");
-    let _ = child_a;
-    step_setpgid(&child_b, Pgid(child_b.pid.0)).expect("child B setpgrp");
-
-    let _ = step_sigaction(&parent, sigusr1, SigDisposition::Ignore);
-    let _ = step_sigaction(&child1, sigusr1, SigDisposition::Handler(0xCAFE_F00D));
-
-    let delivered = script_kill_pgrp(&parent, &parent.pgrp_cap(), sigusr1).expect("kill pgrp");
-    assert_eq!(delivered, 3, "parent, child1, and child A are in the pgrp");
-
-    assert_eq!(
-        ast_check(&leader(&child1)),
-        AstOutcome::DeliverHandler {
-            sig: sigusr1,
-            action: SigActionEntry::handler(0xCAFE_F00D),
-        }
-    );
-    assert_eq!(
-        ast_check(&leader(&child_b)),
-        AstOutcome::Continue,
-        "child B moved to another pgrp and must not receive SIGUSR1"
     );
 }
 

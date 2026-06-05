@@ -161,7 +161,7 @@ pub fn step_walk<'g>(
         guard,
     ) {
         Ok(resolved) => StepOutcome::done(resolved.dentry),
-        Err(e) => StepOutcome::err(e),
+        Err(e) => StepOutcome::err(e.into()),
     }
 }
 
@@ -192,7 +192,7 @@ pub fn step_walk_in_mount_namespace<'g>(
         guard,
     ) {
         Ok(resolved) => StepOutcome::done(resolved.dentry),
-        Err(e) => StepOutcome::err(e),
+        Err(e) => StepOutcome::err(e.into()),
     }
 }
 
@@ -252,7 +252,7 @@ pub fn step_open<'g>(
         guard,
     ) {
         Ok(w) => w,
-        Err(err) => return V3::err(err),
+        Err(err) => return V3::err(err.into()),
     };
 
     let rnode = dentry.rnode().clone();

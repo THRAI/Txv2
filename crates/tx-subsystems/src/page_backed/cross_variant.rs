@@ -41,21 +41,21 @@ pub fn step_copy_file_range(
         return V3::done(0);
     }
     if matches!(out_pc.kind(), PageContainerKind::Device { .. }) {
-        return V3::err(Errno::EINVAL);
+        return V3::err(Errno::EINVAL.into());
     }
 
     let Some(in_capacity) = in_pc.byte_capacity() else {
-        return V3::err(Errno::EINVAL);
+        return V3::err(Errno::EINVAL.into());
     };
     let Some(out_capacity) = out_pc.byte_capacity() else {
-        return V3::err(Errno::EINVAL);
+        return V3::err(Errno::EINVAL.into());
     };
 
     let Some(out_end) = out_offset.checked_add(len as u64) else {
-        return V3::err(Errno::EINVAL);
+        return V3::err(Errno::EINVAL.into());
     };
     if out_end > out_capacity {
-        return V3::err(Errno::EINVAL);
+        return V3::err(Errno::EINVAL.into());
     }
 
     let in_valid_end = core::cmp::min(in_pc.size_bytes(), in_capacity);
@@ -89,7 +89,6 @@ pub fn step_copy_file_range(
         //   byte progress (or `EMPTY` when `advanced == 0`).
         // - `Yield { OnAgent .. }` → unsupported, surface `EIO`/partial.
         // - `Err(errno)` → `Err(errno)` (no progress yet) or partial `Done`.
-        use crate::page_backed::adapter::step_engine::YieldShape;
         let in_materialized = match in_pc.materialize_page(in_page, MaterializeAccess::Read, guard)
         {
             StepOutcome::Done(m) => m,
@@ -100,34 +99,29 @@ pub fn step_copy_file_range(
                 publish_progress(out_pc, out_offset, advanced);
                 return V3::done(advanced);
             }
-            StepOutcome::Yield {
-                shape:
-                    YieldShape::OnWaitSource {
-                        source: carrier,
-                        interests,
-                    },
-                ..
-            } => {
+            StepOutcome::Yield { shape, .. } => {
+                let Some((carrier, interests)) =
+                    crate::page_backed::notification::wait_source_parts(&shape)
+                else {
+                    if advanced == 0 {
+                        return V3::err(step_engine::Errno::EIO);
+                    }
+                    publish_progress(out_pc, out_offset, advanced);
+                    return V3::done(advanced);
+                };
                 if advanced == 0 {
-                    return V3::yield_on_wait_source(
+                    return crate::page_backed::notification::yield_on_wait_source(
                         ByteProgress::EMPTY,
-                        carrier.raw(),
-                        interests.raw(),
+                        carrier,
+                        interests,
                     );
                 }
                 publish_progress(out_pc, out_offset, advanced);
-                return V3::yield_on_wait_source(
+                return crate::page_backed::notification::yield_on_wait_source(
                     ByteProgress::new(advanced),
-                    carrier.raw(),
-                    interests.raw(),
+                    carrier,
+                    interests,
                 );
-            }
-            StepOutcome::Yield { .. } => {
-                if advanced == 0 {
-                    return V3::err(step_engine::Errno::EIO);
-                }
-                publish_progress(out_pc, out_offset, advanced);
-                return V3::done(advanced);
             }
             StepOutcome::Err(errno) => {
                 if advanced == 0 {
@@ -148,34 +142,29 @@ pub fn step_copy_file_range(
                     publish_progress(out_pc, out_offset, advanced);
                     return V3::done(advanced);
                 }
-                StepOutcome::Yield {
-                    shape:
-                        YieldShape::OnWaitSource {
-                            source: carrier,
-                            interests,
-                        },
-                    ..
-                } => {
+                StepOutcome::Yield { shape, .. } => {
+                    let Some((carrier, interests)) =
+                        crate::page_backed::notification::wait_source_parts(&shape)
+                    else {
+                        if advanced == 0 {
+                            return V3::err(step_engine::Errno::EIO);
+                        }
+                        publish_progress(out_pc, out_offset, advanced);
+                        return V3::done(advanced);
+                    };
                     if advanced == 0 {
-                        return V3::yield_on_wait_source(
+                        return crate::page_backed::notification::yield_on_wait_source(
                             ByteProgress::EMPTY,
-                            carrier.raw(),
-                            interests.raw(),
+                            carrier,
+                            interests,
                         );
                     }
                     publish_progress(out_pc, out_offset, advanced);
-                    return V3::yield_on_wait_source(
+                    return crate::page_backed::notification::yield_on_wait_source(
                         ByteProgress::new(advanced),
-                        carrier.raw(),
-                        interests.raw(),
+                        carrier,
+                        interests,
                     );
-                }
-                StepOutcome::Yield { .. } => {
-                    if advanced == 0 {
-                        return V3::err(step_engine::Errno::EIO);
-                    }
-                    publish_progress(out_pc, out_offset, advanced);
-                    return V3::done(advanced);
                 }
                 StepOutcome::Err(errno) => {
                     if advanced == 0 {
@@ -190,7 +179,7 @@ pub fn step_copy_file_range(
             Ok(ptr) => ptr,
             Err(_) => {
                 if advanced == 0 {
-                    return V3::err(Errno::EIO);
+                    return V3::err(Errno::EIO.into());
                 }
                 publish_progress(out_pc, out_offset, advanced);
                 return V3::done(advanced);
@@ -200,7 +189,7 @@ pub fn step_copy_file_range(
             Ok(ptr) => ptr,
             Err(_) => {
                 if advanced == 0 {
-                    return V3::err(Errno::EIO);
+                    return V3::err(Errno::EIO.into());
                 }
                 publish_progress(out_pc, out_offset, advanced);
                 return V3::done(advanced);
