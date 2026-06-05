@@ -64,6 +64,7 @@ pub(super) fn sys_eventfd2<'a>(init_val: u64, flags: u32, ctx: &SyscallCtx<'a>) 
         append: false,
         cloexec,
         nonblocking,
+        packet: false,
     };
     let open_cap = match OpenFile::new_eventfd_cap(efd_cap, open_flags) {
         Ok(cap) => cap,

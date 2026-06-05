@@ -140,11 +140,11 @@ pub const NR_SETPRIORITY: u64 = 140;
 pub const NR_GETPRIORITY: u64 = 141;
 /// `fcntl(fd, cmd, arg)`. Linux generic ABI `__NR_fcntl` (= `__NR3264_fcntl`).
 ///
-/// Wave 2 of the ELF loader plan ships a minimal subset:
-/// `F_GETFD` / `F_SETFD` against the per-process CLOEXEC bitmap
-/// (`ProcessPayload.fd_cloexec`). Other commands (`F_DUPFD`,
-/// `F_GETFL`, `F_SETFL`, etc.) return `-ENOSYS` until the relevant
-/// follow-up phases (`fcntl-extension`) wire them up.
+/// Wave 2 of the ELF loader plan shipped the initial `F_GETFD` /
+/// `F_SETFD` subset against the per-process CLOEXEC bitmap
+/// (`ProcessPayload.fd_cloexec`). Follow-up phases now also cover the
+/// duplicated-fd and status-flag commands used by fd-heavy workloads;
+/// commands outside the implemented subset still return `-ENOSYS`.
 pub const NR_FCNTL: u64 = 25;
 /// `inotify_init1(flags)`. Linux RV64 generic ABI.
 pub const NR_INOTIFY_INIT1: u64 = 26;
@@ -284,9 +284,9 @@ pub const NR_CLOSE: u64 = 57;
 /// the BTreeMap, and writes the pair back to userspace at
 /// `pipefd_uaddr` as `[u32; 2]` little-endian.
 ///
-/// Recognised `flags`: `O_CLOEXEC | O_NONBLOCK`. `O_DIRECT`
-/// (packet-mode pipes) is recognised but returns `-ENOSYS`. Any
-/// other bits return `-EINVAL`.
+/// Recognised `flags`: `O_CLOEXEC | O_NONBLOCK | O_DIRECT`.
+/// `O_DIRECT` creates packet-mode pipes. Any other bits return
+/// `-EINVAL`.
 ///
 /// **SIGPIPE delivery.** Q2 DECIDED 2026-05-07: `OpenFile::step_write`
 /// returns `Err(EPIPE)` when all readers have closed. The
@@ -295,9 +295,8 @@ pub const NR_CLOSE: u64 = 57;
 /// returning `-EPIPE` to userspace. The pipe module itself has no
 /// process Cap and so cannot deliver the signal.
 pub const NR_PIPE2: u64 = 59;
-/// `O_DIRECT` flag bit (`0o40000`). Recognised by `sys_pipe2` but
-/// not implemented (packet-mode pipes are out of scope). Any other
-/// open arm currently ignores this bit.
+/// `O_DIRECT` flag bit (`0o40000`). For `pipe2`, this means Linux
+/// packet mode. Other open arms currently ignore this bit.
 pub const O_DIRECT: u32 = 0o40000;
 
 // ---------------------------------------------------------------------
@@ -1236,19 +1235,15 @@ pub const F_DUPFD: i32 = 0;
 /// Slice 7 surface: composes the access mode (`O_RDONLY` / `O_WRONLY`
 /// / `O_RDWR`) from `OpenFileFlags::{read,write}`, OR's `O_APPEND`
 /// from `OpenFileFlags::append`, OR's `O_NONBLOCK` from
-/// `OpenFileFlags::nonblocking`. `O_CLOEXEC` is **not** included
-/// (Linux semantic: cloexec is per-fd, queried via `F_GETFD`, not
+/// `OpenFileFlags::nonblocking`, and OR's `O_DIRECT` from
+/// `OpenFileFlags::packet`. `O_CLOEXEC` is **not** included (Linux
+/// semantic: cloexec is per-fd, queried via `F_GETFD`, not
 /// per-OpenFile).
 pub const F_GETFL: i32 = 3;
-/// `F_SETFL` cmd: replace the per-OpenFile open-flag bits.
-///
-/// **Slice 7 carryover.** Returns `-ENOSYS` for now. The
-/// `OpenFileFlags` struct in `vfs::structure` is a plain `Copy`-struct
-/// field on `OpenFile` (not behind an atomic / mutex), so the
-/// "replace flags atomically" semantic F_SETFL needs is not safe under
-/// the current shape. Wiring interior mutability onto OpenFileFlags is
-/// the gating change; once it lands, this command moves to the
-/// mutator side. `TODO(phase-fcntl-setfl)`.
+/// `F_SETFL` cmd: replace the mutable per-OpenFile status flag bits.
+/// The current implementation updates `O_NONBLOCK` and pipe
+/// `O_DIRECT` packet mode; other status flags are ignored until their
+/// owner implements them.
 pub const F_SETFL: i32 = 4;
 /// `F_DUPFD_CLOEXEC` cmd: like [`F_DUPFD`] but the new fd is marked
 /// close-on-exec (the per-fd CLOEXEC bit is set on the result).

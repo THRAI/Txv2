@@ -298,7 +298,8 @@ impl OpenFile {
         // ③ reserve — (N/A: delegated to backing trait impl)
         // ④ commit — (N/A: delegated to backing trait impl)
         // ⑤ publish — (N/A: read doesn't fire signals)
-        if !self.flags.read {
+        let flags = self.flags();
+        if !flags.read {
             return StepOutcome::Err(Errno::EINVAL);
         }
 
@@ -308,7 +309,10 @@ impl OpenFile {
         // The agent-side read syscall lands in P-10.5 with its own
         // dispatch (it dequeues a fault message, not bytes from a
         // file). Surface EINVAL until then.
-        if matches!(self.backing(), OpenFileBacking::Ufd { .. }) {
+        if matches!(
+            self.backing(),
+            OpenFileBacking::Ufd { .. } | OpenFileBacking::SocketPair { .. }
+        ) {
             return StepOutcome::Err(Errno::EINVAL);
         }
 
@@ -320,7 +324,7 @@ impl OpenFile {
                 StructPayload::Pipe {
                     payload,
                     side: crate::pipe::PipeSide::Reader,
-                } => crate::pipe::step_read(payload, out, guard, self.flags.nonblocking),
+                } => crate::pipe::step_read(payload, out, guard, flags.nonblocking),
                 // Wrong-side read against a writer-end RNode. The
                 // OpenFileFlags.read=false guard above handles the
                 // common case (writer-end OpenFiles never set read);
@@ -412,7 +416,10 @@ impl OpenFile {
         // ⑤ publish — (N/A: lseek doesn't fire signals)
         // PR-10 phase 0: userfaultfd fds have no offset semantic.
         // Linux returns ESPIPE on `lseek(uffd_fd, ...)`; match that.
-        if matches!(self.backing(), OpenFileBacking::Ufd { .. }) {
+        if matches!(
+            self.backing(),
+            OpenFileBacking::Ufd { .. } | OpenFileBacking::SocketPair { .. }
+        ) {
             return StepOutcome::Err(Errno::ESPIPE);
         }
         // Backing-driven dispatch: short-circuit non-seekable
@@ -484,14 +491,18 @@ impl OpenFile {
         // ④ commit — (N/A: delegated to backing trait impl)
         // ⑤ publish — (N/A: write doesn't fire signals directly)
         // observe: validate file is writable
-        if !self.flags.write {
+        let flags = self.flags();
+        if !flags.write {
             return StepOutcome::Err(Errno::EINVAL);
         }
 
         // PR-10 phase 0: userfaultfd fds have no VFS-shaped write path.
         // The agent-side `UFFDIO_*` ioctls (phase P-10.5) deliver the
         // reply path, not write(2). Surface EINVAL until then.
-        if matches!(self.backing(), OpenFileBacking::Ufd { .. }) {
+        if matches!(
+            self.backing(),
+            OpenFileBacking::Ufd { .. } | OpenFileBacking::SocketPair { .. }
+        ) {
             return StepOutcome::Err(Errno::EINVAL);
         }
 
@@ -503,7 +514,9 @@ impl OpenFile {
                 StructPayload::Pipe {
                     payload,
                     side: crate::pipe::PipeSide::Writer,
-                } => crate::pipe::step_write(payload, bytes, guard, self.flags.nonblocking),
+                } => {
+                    crate::pipe::step_write(payload, bytes, guard, flags.nonblocking, flags.packet)
+                }
                 // Wrong-side write against a reader-end RNode.
                 StructPayload::Pipe {
                     side: crate::pipe::PipeSide::Reader,
@@ -520,7 +533,7 @@ impl OpenFile {
                 // requires this seek-and-write to be atomic; our model
                 // approximates it by snapping the offset just before the
                 // write helper consumes it.
-                if self.flags.append {
+                if flags.append {
                     self.set_offset(pc.size_bytes());
                 }
                 crate::page_backed::step_write_from_kernel(pc, self, bytes, guard)
@@ -558,7 +571,10 @@ impl OpenFile {
         // TTY-shaped; userfaultfd ioctls have their own request
         // catalog landing in P-10.2+. Return ENOTTY for ufd fds via
         // this dispatcher.
-        if matches!(self.backing(), OpenFileBacking::Ufd { .. }) {
+        if matches!(
+            self.backing(),
+            OpenFileBacking::Ufd { .. } | OpenFileBacking::SocketPair { .. }
+        ) {
             return StepOutcome::Err(Errno::ENOTTY);
         }
         match self.rnode().backing() {
@@ -922,10 +938,11 @@ impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileGetFlOp<'a> {
 impl OneShotStepOp for OpenFileGetFlOp<'_> {}
 impl OneShotStepOp<crate::process::ProcessIdentity> for OpenFileGetFlOp<'_> {}
 
-/// `StepOp` wrap for `fcntl(F_SETFL)` — sets `OpenFile::nonblocking`.
+/// `StepOp` wrap for `fcntl(F_SETFL)` — sets mutable OpenFile status flags.
 pub struct OpenFileSetFlOp<'a> {
     pub file: &'a Cap<super::structure::OpenFile>,
     pub nonblocking: bool,
+    pub packet: bool,
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileSetFlOp<'a> {
@@ -933,6 +950,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileSetFlOp<'a> {
     type Progress = NoProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
         self.file.set_nonblocking(self.nonblocking);
+        self.file.set_packet_mode(self.packet);
         StepOutcome::Done(())
     }
 }
@@ -1130,6 +1148,7 @@ mod step_op_wraps {
                 append: false,
                 cloexec: false,
                 nonblocking: false,
+                packet: false,
             },
         )
         .expect("open file")
@@ -1168,6 +1187,7 @@ mod step_op_wraps {
                 append: false,
                 cloexec: false,
                 nonblocking: false,
+                packet: false,
             },
         )
         .expect("open file")
@@ -1188,6 +1208,7 @@ mod step_op_wraps {
                 append: false,
                 cloexec: false,
                 nonblocking: false,
+                packet: false,
             },
         )
         .expect("open file")
@@ -1404,6 +1425,7 @@ mod step_op_wraps {
                 append: false,
                 cloexec: false,
                 nonblocking: false,
+                packet: false,
             },
         )
         .map_err(|_| Errno::ENOMEM)?;

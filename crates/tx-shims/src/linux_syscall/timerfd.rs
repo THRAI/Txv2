@@ -72,6 +72,7 @@ pub(super) fn sys_timerfd_create<'a>(
         append: false,
         cloexec,
         nonblocking,
+        packet: false,
     };
     let open_cap = match OpenFile::new_timerfd_cap(tfd_cap, open_flags) {
         Ok(cap) => cap,

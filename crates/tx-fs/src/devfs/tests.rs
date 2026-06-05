@@ -197,6 +197,7 @@ fn devfs_lookup_null_materialises_char_device() {
             append: false,
             cloexec: false,
             nonblocking: false,
+            packet: false,
         },
     )
     .expect("null open file");

@@ -1,9 +1,9 @@
 //! Content renderers for procfs pseudo-files.
 
 use crate::procfs::{
-    PROCFS_CPUINFO_ID, PROCFS_MEMINFO_ID, PROCFS_MOUNTS_ID, PROCFS_SYSVIPC_MSG_ID,
-    PROCFS_SYSVIPC_SEM_ID, PROCFS_SYSVIPC_SHM_ID, PROCFS_UPTIME_ID, pid_from_cmdline_id,
-    pid_from_fdinfo_id, pid_from_maps_id, pid_from_stat_id,
+    pid_from_cmdline_id, pid_from_fdinfo_id, pid_from_maps_id, pid_from_stat_id, PROCFS_CPUINFO_ID,
+    PROCFS_MEMINFO_ID, PROCFS_MOUNTS_ID, PROCFS_SYSVIPC_MSG_ID, PROCFS_SYSVIPC_SEM_ID,
+    PROCFS_SYSVIPC_SHM_ID, PROCFS_UPTIME_ID,
 };
 use alloc::format;
 use alloc::string::String;

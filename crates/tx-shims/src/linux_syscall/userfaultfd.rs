@@ -162,6 +162,7 @@ pub(super) fn sys_userfaultfd<'a>(flags: u32, ctx: &SyscallCtx<'a>) -> SyscallRe
         append: false,
         cloexec,
         nonblocking,
+        packet: false,
     };
     let open_cap = match OpenFile::new_userfaultfd_cap(ufd_cap, open_flags) {
         Ok(cap) => cap,

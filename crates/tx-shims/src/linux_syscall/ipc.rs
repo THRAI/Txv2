@@ -217,6 +217,7 @@ fn mq_open_file_flags(oflag: i32) -> Result<OpenFileFlags, SyscallResult> {
         append: false,
         cloexec: (oflag & O_CLOEXEC as i32) != 0,
         nonblocking: (oflag & O_NONBLOCK as i32) != 0,
+        packet: false,
     })
 }
 

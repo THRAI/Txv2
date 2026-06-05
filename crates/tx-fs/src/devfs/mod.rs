@@ -317,6 +317,7 @@ pub fn open_console_for_init_via_walker() -> Cap<OpenFile> {
                     append: false,
                     cloexec: false,
                     nonblocking: false,
+                    packet: false,
                 },
                 0,
                 &cred,
@@ -365,6 +366,7 @@ fn open_console_for_init_legacy() -> Cap<OpenFile> {
             append: false,
             cloexec: false,
             nonblocking: false,
+            packet: false,
         },
     )
     .expect("open_console_for_init: OpenFile reservation failed")

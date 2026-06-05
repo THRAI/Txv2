@@ -902,6 +902,7 @@ mod tests {
                 append: false,
                 cloexec: false,
                 nonblocking: false,
+                packet: false,
             },
         )
         .expect("mq open file");

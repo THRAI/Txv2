@@ -105,6 +105,7 @@ pub(super) fn sys_signalfd4<'a>(
             append: false,
             cloexec,
             nonblocking,
+            packet: false,
         };
         let open_cap = match OpenFile::new_signalfd_cap(sfd_cap, open_flags) {
             Ok(cap) => cap,

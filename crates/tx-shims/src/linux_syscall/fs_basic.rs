@@ -74,10 +74,8 @@ fn allocate_fd_at_least_under_limit<'a>(
 /// CLOEXEC set.
 ///
 /// Slice 7 surface adds `F_DUPFD` / `F_DUPFD_CLOEXEC` / `F_GETFL`.
-/// `F_SETFL` returns `-ENOSYS` (carryover — `OpenFileFlags` is a
-/// plain `Copy`-struct field on `OpenFile`, not behind an atomic /
-/// mutex, so the "replace flags atomically" semantic is unsafe under
-/// the current shape; `TODO(phase-fcntl-setfl)`).
+/// `F_SETFL` updates the mutable nonblocking and packet-mode status
+/// bits exposed through `OpenFile::flags()`.
 ///
 /// Validation (fd-ops Wave 1: `EBADF` is now driven by "is this fd
 /// open?" rather than the retired `FD_TABLE_SIZE = 8` ceiling — Linux
@@ -164,14 +162,19 @@ pub(super) fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             if f.nonblocking {
                 bits |= O_NONBLOCK as u64;
             }
+            if f.packet {
+                bits |= O_DIRECT as u64;
+            }
             SyscallResult::Return(bits as i64)
         }
         F_SETFL => {
             let arg = args[2] as u64;
+            let packet = (arg & O_DIRECT as u64) != 0;
             let mut script_ctx = build_subject_script_ctx(ctx);
             let mut op = OpenFileSetFlOp {
                 file: &file,
                 nonblocking: (arg & O_NONBLOCK as u64) != 0,
+                packet,
             };
             match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
                 Ok(()) => SyscallResult::Return(0),
@@ -339,6 +342,7 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
         append: want_append,
         cloexec: want_cloexec,
         nonblocking: flags & O_NONBLOCK != 0,
+        packet: false,
     };
 
     // Resolve the dirfd anchor. AT_FDCWD → process cwd; a real dirfd
@@ -627,27 +631,23 @@ pub(super) fn sys_dup3<'a>(
 /// `O_NONBLOCK` (sets the per-OpenFile nonblocking flag, threaded
 /// through `OpenFileFlags.nonblocking` so reader/writer-side
 /// `step_read`/`step_write` short-circuit `Blocked` to `EAGAIN`).
-/// `O_DIRECT` (packet-mode pipes) is recognised but unsupported and
-/// returns `-ENOSYS`. Any other bits return `-EINVAL`.
+/// `O_DIRECT` creates a packet-mode pipe. Any other bits return
+/// `-EINVAL`.
 ///
 /// Userspace writeback: the `pipefd_uaddr` flows through
 /// `bootstrap_write_user::<[u32; 2]>` (canonical `aspace.write_user`
 /// lane with kernel-pointer fallback for test scaffolding).
 pub(super) fn sys_pipe2<'a>(pipefd_uaddr: u64, flags: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
     // Validate flags. Recognised: O_CLOEXEC | O_NONBLOCK | O_DIRECT.
-    // O_DIRECT is recognised but unsupported (packet-mode pipes are
-    // out of scope) → `-ENOSYS`.
     let recognised = O_CLOEXEC | O_NONBLOCK | O_DIRECT;
     if flags & !recognised != 0 {
         return SyscallResult::Error(EINVAL_VALUE);
-    }
-    if flags & O_DIRECT != 0 {
-        return SyscallResult::Error(ENOSYS_VALUE);
     }
 
     let pipe_flags = tx_subsystems::pipe::PipeFlags {
         cloexec: flags & O_CLOEXEC != 0,
         nonblocking: flags & O_NONBLOCK != 0,
+        packet: flags & O_DIRECT != 0,
     };
     // PR-9 phase 3b: drive `step_pipe2` via the `Pipe2Op` StepOp
     // wrap, threading a `&mut KernelScriptCtx`.

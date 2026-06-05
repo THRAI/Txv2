@@ -94,6 +94,7 @@ fn pagebacked_file(id: u64, page_count: u64, size: u64) -> (Cap<OpenFile>, Cap<P
             append: false,
             cloexec: false,
             nonblocking: false,
+            packet: false,
         },
     )
     .expect("open file cap");

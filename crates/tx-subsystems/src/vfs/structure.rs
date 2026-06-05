@@ -434,6 +434,10 @@ pub struct OpenFileFlags {
     /// (page-backed regular files, TTY) ignore it today and
     /// re-honour it once the per-backing nonblock plumbing lands.
     pub nonblocking: bool,
+    /// `O_DIRECT` on pipes means packet mode. Other backings preserve
+    /// this bit for `F_GETFL` / `F_SETFL` round-trips until direct-I/O
+    /// semantics land in their owner.
+    pub packet: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -957,6 +961,16 @@ pub enum OpenFileBacking {
     /// descriptor is a normal fd-table entry whose backing carries the
     /// POSIX mq identity and per-open flags.
     PosixMq { mq: Cap<PosixMqInstance> },
+    /// Minimal anonymous `socketpair(AF_UNIX, SOCK_STREAM)` open file.
+    /// Each endpoint is backed by two pipe payloads: `rx` receives
+    /// bytes from the peer, and `tx` carries bytes written by this fd
+    /// to the peer. It is a non-path fd kind, so syscall handlers must
+    /// dispatch via [`OpenFile::socketpair_endpoint`] before calling
+    /// [`OpenFile::rnode`].
+    SocketPair {
+        rx: Cap<crate::pipe::PipePayload>,
+        tx: Cap<crate::pipe::PipePayload>,
+    },
 }
 
 /// Per-fd file-position carrier.
@@ -994,6 +1008,8 @@ pub struct OpenFile {
     pub(crate) flags: OpenFileFlags,
     /// Runtime `O_NONBLOCK` override set via `fcntl(F_SETFL)`.
     nonblocking_override: AtomicI8,
+    /// Runtime pipe packet-mode override set via `fcntl(F_SETFL)`.
+    packet_override: AtomicI8,
     /// Best-effort DEntry hint set by `step_open`. `None` for
     /// non-VFS shapes (ufd, aio, etc.). Used by `fchdir`.
     opendir_dentry: Option<Cap<DEntry>>,
@@ -1010,6 +1026,7 @@ impl OpenFile {
             offset: AtomicU64::new(0),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
+            packet_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
             flock_state: core::sync::atomic::AtomicU64::new(0),
@@ -1044,6 +1061,7 @@ impl OpenFile {
             offset: AtomicU64::new(0),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
+            packet_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
             flock_state: core::sync::atomic::AtomicU64::new(0),
@@ -1074,6 +1092,7 @@ impl OpenFile {
             offset: AtomicU64::new(0),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
+            packet_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
             flock_state: core::sync::atomic::AtomicU64::new(0),
@@ -1100,6 +1119,7 @@ impl OpenFile {
             offset: AtomicU64::new(0),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
+            packet_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
             flock_state: core::sync::atomic::AtomicU64::new(0),
@@ -1123,6 +1143,7 @@ impl OpenFile {
             offset: AtomicU64::new(0),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
+            packet_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
             flock_state: core::sync::atomic::AtomicU64::new(0),
@@ -1143,6 +1164,7 @@ impl OpenFile {
             offset: AtomicU64::new(0),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
+            packet_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
             flock_state: core::sync::atomic::AtomicU64::new(0),
@@ -1166,6 +1188,7 @@ impl OpenFile {
             offset: AtomicU64::new(0),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
+            packet_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
             flock_state: core::sync::atomic::AtomicU64::new(0),
@@ -1187,6 +1210,7 @@ impl OpenFile {
             offset: AtomicU64::new(0),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
+            packet_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
             flock_state: core::sync::atomic::AtomicU64::new(0),
@@ -1201,6 +1225,33 @@ impl OpenFile {
         step_engine::sign(Self::new_posix_mq(mq, flags))
     }
 
+    /// Construct one endpoint of an anonymous stream socketpair.
+    pub fn new_socketpair_endpoint(
+        rx: Cap<crate::pipe::PipePayload>,
+        tx: Cap<crate::pipe::PipePayload>,
+        flags: OpenFileFlags,
+    ) -> Self {
+        Self {
+            backing: OpenFileBacking::SocketPair { rx, tx },
+            offset: AtomicU64::new(0),
+            readdir_cursor: AtomicU64::new(0),
+            nonblocking_override: AtomicI8::new(-1),
+            packet_override: AtomicI8::new(-1),
+            flags,
+            opendir_dentry: None,
+            flock_state: core::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Zone-sign one anonymous stream socketpair endpoint.
+    pub fn new_socketpair_endpoint_cap(
+        rx: Cap<crate::pipe::PipePayload>,
+        tx: Cap<crate::pipe::PipePayload>,
+        flags: OpenFileFlags,
+    ) -> Result<Cap<Self>, ZoneError> {
+        step_engine::sign(Self::new_socketpair_endpoint(rx, tx, flags))
+    }
+
     /// Construct an io_uring-backed `OpenFile` (future PR-12 phase 0 —
     /// second `OnBehalfOf<P>` canary). The resulting value carries
     /// `OpenFileBacking::IoUring { ring }` and no `Cap<RNode>` —
@@ -1213,6 +1264,7 @@ impl OpenFile {
             offset: AtomicU64::new(0),
             readdir_cursor: AtomicU64::new(0),
             nonblocking_override: AtomicI8::new(-1),
+            packet_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
             flock_state: core::sync::atomic::AtomicU64::new(0),
@@ -1252,6 +1304,18 @@ impl OpenFile {
             return None;
         };
         Some((payload.clone(), *side))
+    }
+
+    /// Return the anonymous stream socketpair endpoint, if this fd is
+    /// one. The first payload is the readable side for this fd; the
+    /// second is the writable side toward the peer.
+    pub fn socketpair_endpoint(
+        &self,
+    ) -> Option<(Cap<crate::pipe::PipePayload>, Cap<crate::pipe::PipePayload>)> {
+        match &self.backing {
+            OpenFileBacking::SocketPair { rx, tx } => Some((rx.clone(), tx.clone())),
+            _ => None,
+        }
     }
 
     /// VFS-shaped accessor — returns the inner `Cap<RNode>` for an
@@ -1298,6 +1362,10 @@ impl OpenFile {
             OpenFileBacking::PosixMq { .. } => panic!(
                 "OpenFile::rnode() called on a POSIX-mq-backed OpenFile; \
                  dispatch via OpenFile::backing() / OpenFile::posix_mq() first",
+            ),
+            OpenFileBacking::SocketPair { .. } => panic!(
+                "OpenFile::rnode() called on a socketpair-backed OpenFile; \
+                 dispatch via OpenFile::backing() / OpenFile::socketpair_endpoint() first",
             ),
         }
     }
@@ -1371,7 +1439,8 @@ impl OpenFile {
             | OpenFileBacking::Epoll { .. }
             | OpenFileBacking::Eventfd { .. }
             | OpenFileBacking::Timerfd { .. }
-            | OpenFileBacking::PosixMq { .. } => None,
+            | OpenFileBacking::PosixMq { .. }
+            | OpenFileBacking::SocketPair { .. } => None,
         }
     }
 
@@ -1392,7 +1461,8 @@ impl OpenFile {
             | OpenFileBacking::Epoll { .. }
             | OpenFileBacking::Eventfd { .. }
             | OpenFileBacking::Timerfd { .. }
-            | OpenFileBacking::PosixMq { .. } => None,
+            | OpenFileBacking::PosixMq { .. }
+            | OpenFileBacking::SocketPair { .. } => None,
         }
     }
 
@@ -1412,7 +1482,8 @@ impl OpenFile {
             | OpenFileBacking::Epoll { .. }
             | OpenFileBacking::Eventfd { .. }
             | OpenFileBacking::Timerfd { .. }
-            | OpenFileBacking::PosixMq { .. } => None,
+            | OpenFileBacking::PosixMq { .. }
+            | OpenFileBacking::SocketPair { .. } => None,
         }
     }
 
@@ -1428,7 +1499,8 @@ impl OpenFile {
             | OpenFileBacking::IoUring { .. }
             | OpenFileBacking::Eventfd { .. }
             | OpenFileBacking::Timerfd { .. }
-            | OpenFileBacking::PosixMq { .. } => None,
+            | OpenFileBacking::PosixMq { .. }
+            | OpenFileBacking::SocketPair { .. } => None,
         }
     }
 
@@ -1444,7 +1516,8 @@ impl OpenFile {
             | OpenFileBacking::IoUring { .. }
             | OpenFileBacking::Epoll { .. }
             | OpenFileBacking::Timerfd { .. }
-            | OpenFileBacking::PosixMq { .. } => None,
+            | OpenFileBacking::PosixMq { .. }
+            | OpenFileBacking::SocketPair { .. } => None,
         }
     }
 
@@ -1460,7 +1533,8 @@ impl OpenFile {
             | OpenFileBacking::IoUring { .. }
             | OpenFileBacking::Epoll { .. }
             | OpenFileBacking::Eventfd { .. }
-            | OpenFileBacking::PosixMq { .. } => None,
+            | OpenFileBacking::PosixMq { .. }
+            | OpenFileBacking::SocketPair { .. } => None,
         }
     }
 
@@ -1481,7 +1555,8 @@ impl OpenFile {
             | OpenFileBacking::Epoll { .. }
             | OpenFileBacking::Eventfd { .. }
             | OpenFileBacking::Timerfd { .. }
-            | OpenFileBacking::PosixMq { .. } => None,
+            | OpenFileBacking::PosixMq { .. }
+            | OpenFileBacking::SocketPair { .. } => None,
         }
     }
 
@@ -1497,7 +1572,8 @@ impl OpenFile {
             | OpenFileBacking::Epoll { .. }
             | OpenFileBacking::Eventfd { .. }
             | OpenFileBacking::Timerfd { .. }
-            | OpenFileBacking::IoUring { .. } => None,
+            | OpenFileBacking::IoUring { .. }
+            | OpenFileBacking::SocketPair { .. } => None,
         }
     }
 
@@ -1536,11 +1612,21 @@ impl OpenFile {
             1 => f.nonblocking = true,
             _ => {}
         }
+        match self.packet_override.load(Ordering::Acquire) {
+            0 => f.packet = false,
+            1 => f.packet = true,
+            _ => {}
+        }
         f
     }
 
     pub fn set_nonblocking(&self, val: bool) {
         self.nonblocking_override
+            .store(if val { 1 } else { 0 }, Ordering::Release);
+    }
+
+    pub fn set_packet_mode(&self, val: bool) {
+        self.packet_override
             .store(if val { 1 } else { 0 }, Ordering::Release);
     }
 

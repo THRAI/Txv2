@@ -10,10 +10,15 @@ use crate::adapter::step_engine::SpinMutex;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
+use tx_subsystems::vfs::structure::{OpenFile, OpenFileFlags};
 
+const AF_UNIX: i32 = 1;
+const AF_LOCAL: i32 = AF_UNIX;
 const SOCK_STREAM: i32 = 1;
 const SOCK_DGRAM: i32 = 2;
 const SOCK_TYPE_MASK: i32 = 0xf;
+const SOCK_CLOEXEC: i32 = O_CLOEXEC as i32;
+const SOCK_NONBLOCK: i32 = O_NONBLOCK as i32;
 const MAX_SOCKADDR_BYTES: usize = 128;
 const MAX_SOCKET_PAYLOAD: usize = 4096;
 
@@ -84,6 +89,111 @@ pub(super) fn sys_socket(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult 
         },
     );
     SyscallResult::Return(fd as i64)
+}
+
+pub(super) fn sys_socketpair(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let domain = args[0] as i32;
+    let raw_type = args[1] as i32;
+    let protocol = args[2] as i32;
+    let sv = args[3];
+
+    if sv == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    if domain != AF_UNIX && domain != AF_LOCAL {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let kind = socket_kind(raw_type);
+    if kind != SOCK_STREAM || protocol != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let recognised = SOCK_TYPE_MASK | SOCK_CLOEXEC | SOCK_NONBLOCK;
+    if raw_type & !recognised != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    let pipe_flags = tx_subsystems::pipe::PipeFlags {
+        cloexec: raw_type & SOCK_CLOEXEC != 0,
+        nonblocking: raw_type & SOCK_NONBLOCK != 0,
+        packet: false,
+    };
+    let (a_rx_payload, b_rx_payload) = match socketpair_pipe_payloads(pipe_flags) {
+        Ok(payloads) => payloads,
+        Err(errno) => return SyscallResult::error_from(errno),
+    };
+
+    let open_flags = OpenFileFlags {
+        read: true,
+        write: true,
+        append: false,
+        cloexec: pipe_flags.cloexec,
+        nonblocking: pipe_flags.nonblocking,
+        packet: false,
+    };
+    let a_file = match OpenFile::new_socketpair_endpoint_cap(
+        a_rx_payload.clone(),
+        b_rx_payload.clone(),
+        open_flags,
+    ) {
+        Ok(file) => file,
+        Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+    };
+    let b_file =
+        match OpenFile::new_socketpair_endpoint_cap(b_rx_payload, a_rx_payload, open_flags) {
+            Ok(file) => file,
+            Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+        };
+
+    let fd0 = match next_stdio_fd_below_nofile(&ctx.process) {
+        Ok(fd) => fd,
+        Err(err) => return err,
+    };
+    let _ = ctx.process.install_fd(fd0, a_file);
+    let fd1 = match next_stdio_fd_below_nofile(&ctx.process) {
+        Ok(fd) => fd,
+        Err(err) => {
+            let _ = ctx.process.set_fd(fd0, None);
+            return err;
+        }
+    };
+    let _ = ctx.process.install_fd(fd1, b_file);
+    if pipe_flags.cloexec {
+        ctx.process.set_fd_cloexec(fd0, true);
+        ctx.process.set_fd_cloexec(fd1, true);
+    }
+
+    let mut sv_bytes = [0u8; 8];
+    sv_bytes[0..4].copy_from_slice(&fd0.to_le_bytes());
+    sv_bytes[4..8].copy_from_slice(&fd1.to_le_bytes());
+    if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, sv, &sv_bytes) {
+        let _ = ctx.process.set_fd(fd0, None);
+        let _ = ctx.process.set_fd(fd1, None);
+        return SyscallResult::error_from(errno);
+    }
+
+    SyscallResult::Return(0)
+}
+
+fn socketpair_pipe_payloads(
+    flags: tx_subsystems::pipe::PipeFlags,
+) -> Result<
+    (
+        crate::adapter::step_engine::Cap<tx_subsystems::pipe::PipePayload>,
+        crate::adapter::step_engine::Cap<tx_subsystems::pipe::PipePayload>,
+    ),
+    tx_subsystems::execution::Errno,
+> {
+    let (a_reader, _a_writer) = tx_subsystems::pipe::step_pipe2(flags)?;
+    let (b_reader, _b_writer) = tx_subsystems::pipe::step_pipe2(flags)?;
+    let a_payload = a_reader
+        .pipe_endpoint()
+        .map(|(payload, _)| payload)
+        .ok_or(tx_subsystems::execution::Errno::EINVAL)?;
+    let b_payload = b_reader
+        .pipe_endpoint()
+        .map(|(payload, _)| payload)
+        .ok_or(tx_subsystems::execution::Errno::EINVAL)?;
+    Ok((a_payload, b_payload))
 }
 
 pub(super) fn sys_bind(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {

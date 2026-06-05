@@ -141,9 +141,21 @@ impl<'a, P: PmapIf + EntropyIf + AuxvIf, I: step_engine::SubjectIdentity> StepOp
                     Some(cwd) => cwd,
                     None => return StepOutcome::Err(step_engine::Errno::ENOENT),
                 };
-                let outcome = step_open(rooted_at, self.path,
-                    OpenFileFlags { read: true, write: false, append: false, cloexec: false, nonblocking: false },
-                    0, self.cred, &guard);
+                let outcome = step_open(
+                    rooted_at,
+                    self.path,
+                    OpenFileFlags {
+                        read: true,
+                        write: false,
+                        append: false,
+                        cloexec: false,
+                        nonblocking: false,
+                        packet: false,
+                    },
+                    0,
+                    self.cred,
+                    &guard,
+                );
                 match outcome {
                     StepOutcome::Done(file) => {
                         let pc = match file.rnode().backing() {
@@ -195,9 +207,21 @@ impl<'a, P: PmapIf + EntropyIf + AuxvIf, I: step_engine::SubjectIdentity> StepOp
                     .interpreter_path.as_ref().unwrap().clone();
                 let guard = step_engine::guard();
                 let rooted_at = self.process.cwd().unwrap();
-                let outcome = step_open(rooted_at, &interp_path,
-                    OpenFileFlags { read: true, write: false, append: false, cloexec: false, nonblocking: false },
-                    0, self.cred, &guard);
+                let outcome = step_open(
+                    rooted_at,
+                    &interp_path,
+                    OpenFileFlags {
+                        read: true,
+                        write: false,
+                        append: false,
+                        cloexec: false,
+                        nonblocking: false,
+                        packet: false,
+                    },
+                    0,
+                    self.cred,
+                    &guard,
+                );
                 match outcome {
                     StepOutcome::Done(file) => {
                         let pc = match file.rnode().backing() {

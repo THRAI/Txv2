@@ -158,6 +158,7 @@ fn directory_open_file(root_rnode: Cap<RNode>) -> Cap<OpenFile> {
             append: false,
             cloexec: false,
             nonblocking: false,
+            packet: false,
         },
     )
     .expect("directory open file cap")
