@@ -69,7 +69,7 @@ Legend:
 | VFS | Warm path still carries strong `Cap<DEntry>`/`Cap<RNode>` | Open | `WalkingState`, `PathResolution`, and dcache entries still carry strong `Cap` handles. | Refcount and clone/drop traffic remain on hot path; still mismatches `VFS_CHECKS_V2.1` warm-walk `IdentRef` target. | P1 open |
 | VFS | Walker async/resume is staged, not production-shaped | Partial | `run_walker` now drives `kernel_step` directly, preserves lookup `Yield` as `WalkState::Defer { request, resume, .. }`, preserves errors as `WalkState::Error`, keeps the deferred component in the resume token, carries mount-namespace context through `resume_walker`, and `resume_walker_after_io` consumes successful typed completions for `DirLookup`, `LoadInodeMeta`, `ReadLink`, and `MaterialiseRnode` without issuing a second backend operation for the completed stage. `cargo test -p tx-subsystems run_walker -- --nocapture`, `cargo test -p tx-subsystems run_walker_resume_preserves_mount_namespace -- --nocapture`, and `cargo test -p tx-subsystems resume_walker_after_ -- --nocapture` passed. | The walker still carries strong `Cap` state rather than guard-scoped `IdentRef`, and true async backends still need scheduler/reactor integration around the typed request/result channel. | P1 partial |
 | VFS dcache | Cache is directory-only in practice | Done | `kernel_step` now caches all positive child dentries and the cache hit path no longer filters to directories. `cargo test -p tx-subsystems step_walk_caches_regular_file_positive_lookup -- --nocapture` passed. | Negative cache and broad invalidation policy remain future work. | P1 closed for positive regular-file dcache |
-| tmpfs | One mount-wide `SpinMutex<TmpfsState>` serializes namespace operations | Partial | `tx_lock_metrics_fs` and `debug.lock.fs.tmpfs.state` now expose tmpfs lock-service measurements. tmpfs symlink payloads now store `Arc<[u8]>`, so `read_link` clones a shared target handle under the state lock and copies the returned `Box<[u8]>` after unlock. `readdir` now snapshots child id/kind/name/cursor under the state lock and builds `DirEntry` after unlock. `load_inode_meta` now snapshots inode meta/nlink and the optional regular-file `PageContainer` cap under the state lock, then reads `PageContainer::size_bytes()` after unlock. `link` now validates the new name before taking the state lock and increments the target regular file's `nlink` / cached metadata when publishing the alias. Same-directory `rename` now treats an overwritten hard-linked destination as one namespace unlink, decrementing `nlink` and preserving the displaced inode while another alias exists; it returns success without mutating namespace state when old and new names already point at the same inode; it rejects file-directory cross-type replacement before mutating the directory map; and it rejects directory-over-non-empty-directory replacement as `ENOTEMPTY` before mutating the directory map. `cargo test -p tx-fs tmpfs_state_lock_metrics_are_cfg_gated -- --nocapture`, `cargo test -p tx-fs tmpfs_symlink_payload_uses_shared_target_bytes -- --nocapture`, `cargo test -p tx-fs tmpfs_readdir_snapshot_builds_direntry_without_state_borrow -- --nocapture`, `cargo test -p tx-fs tmpfs_inode_meta_snapshot_reads_pagecontainer_size_after_snapshot -- --nocapture`, `cargo test -p tx-fs tmpfs_link_increments_nlink_and_unlink_decrements_one_name -- --nocapture`, `cargo test -p tx-fs tmpfs_rename_over_hard_linked_target_decrements_one_name -- --nocapture`, `cargo test -p tx-fs tmpfs_rename_between_hard_links_to_same_inode_is_noop -- --nocapture`, `cargo test -p tx-fs tmpfs_rename_file_over_directory_returns_eisdir_without_mutating_namespace -- --nocapture`, `cargo test -p tx-fs tmpfs_rename_directory_over_file_returns_enotdir_without_mutating_namespace -- --nocapture`, and `cargo test -p tx-fs tmpfs_rename_directory_over_nonempty_directory_returns_enotempty_without_mutating_namespace -- --nocapture` passed. | The mount-wide lock still exists; per-directory/per-inode split is not implemented and should wait for trace evidence. Regular-file container cap snapshots still clone a strong cap under the state lock. Cross-directory rename is still out of scope. | P1 partial |
+| tmpfs | One mount-wide `SpinMutex<TmpfsState>` serializes namespace operations | Partial | `tx_lock_metrics_fs` and `debug.lock.fs.tmpfs.state` now expose tmpfs lock-service measurements. tmpfs symlink payloads now store `Arc<[u8]>`, so `read_link` clones a shared target handle under the state lock and copies the returned `Box<[u8]>` after unlock. `readdir` now snapshots child id/kind/name/cursor under the state lock and builds `DirEntry` after unlock; stale child ids now return `ENOENT` instead of fabricating a regular-file entry. `load_inode_meta` now snapshots inode meta/nlink and the optional regular-file `PageContainer` cap under the state lock, then reads `PageContainer::size_bytes()` after unlock. `materialise_rnode` now ignores stale caller-provided meta, snapshots backend inode meta/nlink plus one regular-file `PageContainer` cap under the state lock, then reads visible size after unlock before signing the RNode. `create_inode` now rejects existing names before allocating a regular-file `PageContainer`, allocates outside the lock, and revalidates before publishing; `mkdir` allocates an object id only at publish time; `symlink` rejects existing names before copying target bytes or allocating an object id. `mkdir`/`rmdir` and directory `rename` now maintain parent directory `nlink` metadata. `unlink`, `rmdir`, `rename` displaced-target handling, and `destroy_inode` now follow the VFS lifetime contract: namespace removals decrement or zero nlinks and backend reclamation happens only through zero-link `destroy_inode`. `unlink` now rejects a stale parent/name entry whose target inode is already missing as `ENOENT` without removing the namespace entry. `rmdir` now validates the parent/name binding against the supplied target id before inspecting the target inode's children, so wrong-target calls fail as `ENOENT` without leaking unrelated directory state. `link` now validates the new name before taking the state lock, increments the target regular file's `nlink` / cached metadata when publishing the alias, and distinguishes a missing new parent (`ENOENT`) from an existing non-directory new parent (`ENOTDIR`) without changing the target link count on failure. Same-directory `rename` now treats an overwritten hard-linked destination as one namespace unlink, decrementing `nlink` and preserving the displaced inode while another alias exists; it returns success without mutating namespace state when old and new names already point at the same inode; it rejects file-directory cross-type replacement before mutating the directory map; it rejects directory-over-non-empty-directory replacement as `ENOTEMPTY` before mutating the directory map; it moves regular-file names across directories while preserving inode/link-count state; and it moves directory subtrees across directories while rejecting moves into the source subtree as `EINVAL`. `cargo test -p tx-fs tmpfs_state_lock_metrics_are_cfg_gated -- --nocapture`, `cargo test -p tx-fs tmpfs_symlink_payload_uses_shared_target_bytes -- --nocapture`, `cargo test -p tx-fs tmpfs_readdir_snapshot_builds_direntry_without_state_borrow -- --nocapture`, `cargo test -p tx-fs tmpfs_readdir_stale_child_returns_enoent -- --nocapture`, `cargo test -p tx-fs tmpfs_inode_meta_snapshot_reads_pagecontainer_size_after_snapshot -- --nocapture`, `cargo test -p tx-fs tmpfs_materialise_rnode_uses_backend_inode_meta_not_stale_input -- --nocapture`, `cargo test -p tx-fs tmpfs_failed_ -- --nocapture`, `cargo test -p tx-fs tmpfs_mkdir_and_rmdir_update_parent_directory_nlinks -- --nocapture`, `cargo test -p tx-fs tmpfs_unlink_missing_target_inode_returns_enoent_without_mutating_namespace -- --nocapture`, `cargo test -p tx-fs tmpfs_rmdir_wrong_target_returns_enoent_before_inspecting_unrelated_target -- --nocapture`, `cargo test -p tx-fs tmpfs_destroy_inode_preserves_linked_inode -- --nocapture`, `cargo test -p tx-fs tmpfs_unlink_unhooks_name_but_keeps_inode_until_destroy_inode -- --nocapture`, `cargo test -p tx-fs tmpfs_rmdir_keeps_directory_inode_until_destroy_inode -- --nocapture`, `cargo test -p tx-fs tmpfs_rename_over_regular_target_keeps_displaced_inode_until_destroy_inode -- --nocapture`, `cargo test -p tx-fs tmpfs_rename_directory_over_empty_directory_keeps_displaced_inode_until_destroy_inode -- --nocapture`, `cargo test -p tx-fs tmpfs_link_increments_nlink_and_unlink_decrements_one_name -- --nocapture`, `cargo test -p tx-fs tmpfs_link_missing_parent_returns_enoent -- --nocapture`, `cargo test -p tx-fs tmpfs_rename_over_hard_linked_target_decrements_one_name -- --nocapture`, `cargo test -p tx-fs tmpfs_rename_between_hard_links_to_same_inode_is_noop -- --nocapture`, `cargo test -p tx-fs tmpfs_rename_file_over_directory_returns_eisdir_without_mutating_namespace -- --nocapture`, `cargo test -p tx-fs tmpfs_rename_directory_over_file_returns_enotdir_without_mutating_namespace -- --nocapture`, `cargo test -p tx-fs tmpfs_rename_directory_over_nonempty_directory_returns_enotempty_without_mutating_namespace -- --nocapture`, `cargo test -p tx-fs tmpfs_rename_file_across_directories_moves_name -- --nocapture`, `cargo test -p tx-fs tmpfs_rename_directory_across_directories_moves_subtree -- --nocapture`, `cargo test -p tx-fs tmpfs_rename_directory_across_directories_updates_parent_nlinks -- --nocapture`, `cargo test -p tx-fs tmpfs_rename_directory_over_empty_directory_updates_parent_nlinks -- --nocapture`, `cargo test -p tx-fs tmpfs_rename_directory_into_own_descendant_returns_einval_without_mutating_namespace -- --nocapture`, `cargo test -p tx-shims --lib dispatch_getdents64_ -- --nocapture`, `cargo test -p tx-shims --lib dispatch_readlinkat_ -- --nocapture`, `cargo test -p tx-shims --lib dispatch_truncate_ -- --nocapture`, `cargo test -p tx-shims --lib dispatch_renameat2_ -- --nocapture`, `cargo test -p tx-shims --lib dispatch_linkat_ -- --nocapture`, and `cargo test -p tx-shims --lib dispatch_unlinkat_ -- --nocapture` passed. | The mount-wide lock still exists; per-directory/per-inode split is not implemented and should wait for trace evidence. Regular-file container cap snapshots still clone a strong cap under the state lock, though `materialise_rnode` now takes only one regular-file container snapshot before releasing the lock. Backend `FsOps::readdir`/`unlink`/`rmdir` now have stale-binding coverage before normal result publication or namespace mutation; syscall/VFS `getdents64` and `unlinkat` cover normal directory enumeration, regular-file unlink, directory-vs-file flag errors, missing path, and permission denial. Backend `FsOps::rename` and syscall/VFS `renameat2` now have focused same-dir, cross-dir regular-file, cross-dir directory-subtree, descendant-cycle, parent-nlink, unlinked-but-live lifecycle, and rmdir wrong-target validation-order coverage. Backend `FsOps::link` and syscall/VFS `linkat` now cover hard-link nlink updates, failed parent semantics, missing source, directory source, and permission denial. Broader Linux compatibility such as remaining flag variants and cross-mount behavior remains separate work. | P1 partial |
 | ext4/FAT | Kernel pager paths are synchronous and coarse-locked | Open | ext4 and FAT still wrap pager state in coarse sync cells. | Cold-cache paths can still serialize or spin under filesystem-heavy SMP. | P0 open for filesystem-heavy SMP experiments |
 | ext4/FAT bridge | Block-device `Yield` / `Continue` is collapsed to format I/O error | Done | ext4/FAT format layers now expose `WouldBlock`; bridges map retryable `Continue`/`Yield` to `WouldBlock`/`EAGAIN`. `cargo test -p tx-fs ext4_bridge_maps_retrying -- --nocapture` and `cargo test -p tx-fs fat_bridge_maps_retrying -- --nocapture` passed. | The original wait-source identity is still lost because the synchronous `BlockImage` format trait cannot carry it. Full async pager work remains separate. | P0 closed for bridge error mapping; async identity still open under pager item |
 | bdev-fs | Block-device RNodes are PageBacked over an `Anon` PC | Done | bdev-fs now creates file-backed PageContainers for block-device nodes and routes reads through `BdevFsMountPayload::fetch_page`. `cargo test -p tx-fs materialised_block_device_rnode_reads_through_bdevfs_page_backing -- --nocapture` passed. | Coherence-index lock service can still be measured later, but the correctness drift is closed. | P0/P1 closed |
@@ -173,11 +173,19 @@ The current implementation has one `SpinMutex<TmpfsState>` over
 but the mount-wide lock serializes unrelated directories and inodes. A few
 methods clone or allocate while close to the lock boundary:
 
-- `create_inode` allocates a `PageContainer` before taking the tmpfs lock,
-  which is good.
-- `materialise_rnode` clones the file's `Cap<PageContainer>` under the tmpfs
-  lock, drops the lock, then signs the RNode, which is mostly good but still
-  pays cap traffic under the namespace lock.
+- `create_inode` now checks parent/name existence under the tmpfs lock before
+  allocating a `PageContainer`, allocates the container outside the lock, then
+  revalidates before publish. That keeps the expensive allocation out of the
+  mount-wide critical section while avoiding failure-path drift where `EEXIST`
+  consumed file backing and an object id.
+- `mkdir` allocates its object id only at publish time, and `symlink` checks
+  parent/name existence before copying target bytes or allocating an object id,
+  so duplicate-name failures do not burn ids or allocate discarded payloads.
+- `materialise_rnode` now ignores stale caller-provided inode metadata and
+  snapshots the backend inode metadata, link count, and one regular-file
+  `Cap<PageContainer>` under the tmpfs lock. It then drops the lock, reads
+  visible file size from the PageContainer, and signs the RNode from backend
+  state instead of trusting the caller's `InodeMeta`.
 - `fetch_page` snapshots the container cap under lock, drops the lock, then
   calls PageBacked, which is the right direction.
 - `read_link` now snapshots an `Arc<[u8]>` symlink target under the tmpfs
@@ -187,7 +195,9 @@ methods clone or allocate while close to the lock boundary:
 - `readdir` now snapshots the child id, child kind, inline name, and next
   cursor under the tmpfs lock, drops the lock, then constructs the returned
   `DirEntry`, avoiding name validation/copy work while serving
-  `debug.lock.fs.tmpfs.state`.
+  `debug.lock.fs.tmpfs.state`. If a directory entry points at a missing child
+  inode, `readdir` returns `ENOENT` instead of fabricating a regular-file
+  entry.
 - `load_inode_meta` now snapshots inode metadata, link count, and the optional
   regular-file `PageContainer` cap under the tmpfs lock, drops the lock, then
   reads `PageContainer::size_bytes()` so visible file size does not require a
@@ -195,7 +205,21 @@ methods clone or allocate while close to the lock boundary:
 - `link` now validates the new directory name before taking the tmpfs lock and
   increments the target regular file's `nlink` / cached metadata when
   publishing the alias, closing the drift where `load_inode_meta` still
-  reported one link after a successful hard link.
+  reported one link after a successful hard link. It also distinguishes a
+  missing new parent (`ENOENT`) from an existing non-directory new parent
+  (`ENOTDIR`) without changing the target link count on failure.
+- `mkdir` creates directories with `nlinks = 2`, increments the parent
+  directory link count for the child's `..`, and `rmdir` decrements it after
+  removing an empty child directory.
+- `unlink` now validates that the parent/name binding's target inode still
+  exists before removing the directory entry. A stale namespace entry pointing
+  at a missing inode returns `ENOENT` and leaves the directory map unchanged.
+- `rmdir` now leaves the removed directory inode in the inode table with
+  `nlinks = 0`; backend storage reclamation is deferred to `destroy_inode` once
+  VFS proves no live references remain.
+- `rmdir` validates that `parent/name` maps to the supplied target id before
+  inspecting that target inode's type or child map, so inconsistent backend
+  calls fail as `ENOENT` without leaking unrelated target directory state.
 - Same-directory `rename` now treats an overwritten destination as a single
   namespace unlink for the displaced inode: if another hard-link alias exists,
   tmpfs decrements `nlink` and preserves the inode table entry instead of
@@ -210,6 +234,18 @@ methods clone or allocate while close to the lock boundary:
   replacement as `ENOTEMPTY` during read-only validation, so a failed
   replacement preserves the source directory, target directory, and target
   children.
+- `rename` now moves regular-file namespace entries across directories within
+  the same tmpfs mount, preserving the inode/link count while removing the old
+  name and publishing the new parent/name.
+- `rename` now moves directory subtrees across directories within the same
+  tmpfs mount. The read-only validation phase rejects moves into the source
+  subtree as `EINVAL`, preserving the original source and descendant namespace.
+- Directory `rename` now also updates parent directory link counts when a
+  child directory moves across parents or replaces an empty child directory.
+- `rename` displaced-target handling now preserves overwritten regular-file
+  and empty-directory inodes with zeroed link counts instead of reclaiming them
+  inside the namespace mutation; `destroy_inode` removes only zero-link inodes
+  and no-ops for still-linked or already-reclaimed ids.
 
 Current status and recommendation:
 
@@ -217,9 +253,11 @@ Current status and recommendation:
 2. tmpfs lock-service metrics are now available through `tx_lock_metrics_fs`
    as `debug.lock.fs.tmpfs.state`.
 3. Symlink readlink, directory entry construction, regular-file visible size
-   reads, and hard-link name validation no longer deep-copy, validate, or query
-   returned data under the state lock; keep looking for similar bounded
-   lock-held clone/copy work before taking on a full state split.
+   reads, failed create-family operations, and hard-link name validation no
+   longer deep-copy, validate, allocate/query returned data, copy symlink
+   targets, or burn ids under the state lock/failed path; keep looking for
+   similar bounded lock-held clone/copy/allocation work before taking on a full
+   state split.
 4. After PageBacked PC fixes, split tmpfs state into at least an inode table
    index plus per-directory/per-inode payload locks if traces show namespace
    lock service, especially under `/dev/shm` and tmpfile-heavy workloads.
@@ -315,8 +353,11 @@ behavior is the common denominator.
    `rename` now preserves displaced hard-linked inodes by decrementing nlink,
    treats rename-between-aliases of the same inode as a no-op, and rejects
    file-directory cross-type replacement plus non-empty target-directory
-   replacement before mutation. Cross-directory rename and state splitting
-   remain trace-gated.
+   replacement before mutation, moves regular-file names across directories,
+   and moves directory subtrees across directories with descendant-cycle
+   rejection. `rmdir`, displaced-target `rename`, and `destroy_inode` now obey
+   the VFS lifetime contract by deferring backend reclamation until zero-link
+   `destroy_inode`. The tmpfs state split remains trace-gated.
 5. **VFS async/resume repair**: partially done; `run_walker` preserves Defer
    and Error state, resume tokens retain the deferred component, and
    namespace-carrying resume is covered. Typed I/O-result resume now covers
@@ -343,4 +384,5 @@ added in the current repair pass, the VFS section records the bounded
 component-parser CPU-shape repair, and the tmpfs row records the symlink
 readlink, readdir, `load_inode_meta`, hard-link, and same-directory rename
 lock-held-work/semantic shrinks, including cross-type and non-empty-directory
-replacement rejection.
+replacement rejection, plus cross-directory regular-file and directory-subtree
+rename.
