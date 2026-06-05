@@ -108,7 +108,7 @@ pub(super) fn destroy_pmap_root_from_bag<State>(bag: &BootStaticBag<State>, root
         }
         *slot = 0;
     }
-    let invalidated = invalidate_destroyed_root();
+    let invalidated = invalidate_destroyed_root(bag, root.phys());
     free_asid_after_invalidation(root.asid(), invalidated);
     free_pt_node_from_bag(bag, root.into_node());
 }
@@ -489,7 +489,44 @@ pub(crate) fn coalesce_invalidation_ranges(
     coalesced
 }
 
-fn invalidate_destroyed_root() -> RootInvalidated {
+/// Invalidate translations for a root that is about to be freed.
+///
+/// Critically, if the current hart's `satp` still references the root we are
+/// about to return to the frame allocator, the CPU keeps that (soon-reused)
+/// frame live as its active page-table root. A plain `sfence.vma` does NOT fix
+/// this — it flushes the TLB but leaves `satp` pointing at the doomed frame, so
+/// the next TLB-miss walk (e.g. the very next trap fetching the trap vector)
+/// reads whatever heap data has since been written into the reclaimed frame and
+/// the hart wedges in an instruction-fault loop on the now-unmapped high-half
+/// kernel text. Switch to the always-valid kernel bootstrap root first.
+///
+/// v1 / `-smp 1`: only the local hart can hold this root in `satp`; remote-hart
+/// shootdown of a freed root remains the tracked SMP blocker (see module docs).
+fn invalidate_destroyed_root<State>(
+    bag: &BootStaticBag<State>,
+    root_phys: PhysAddr,
+) -> RootInvalidated {
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        const SATP_PPN_MASK: usize = (1usize << 44) - 1;
+        let cur_satp: usize;
+        core::arch::asm!("csrr {0}, satp", out(reg) cur_satp, options(nostack));
+        if (cur_satp & SATP_PPN_MASK) == (root_phys.0 >> 12) {
+            // Sv39 satp for the bootstrap kernel root (ASID 0 — global kernel
+            // half), mirroring `activate_user_pmap`'s encoding (`0x8 << 60`).
+            const SATP_MODE_SV39: usize = 0x8 << 60;
+            let boot_satp = SATP_MODE_SV39 | (bag.bootstrap_root_phys().0 >> 12);
+            core::arch::asm!(
+                "csrw satp, {0}",
+                "sfence.vma",
+                in(reg) boot_satp,
+                options(nostack)
+            );
+            return RootInvalidated;
+        }
+    }
+    #[cfg(not(target_arch = "riscv64"))]
+    let _ = (bag, root_phys);
     sfence_vma_all();
     RootInvalidated
 }
