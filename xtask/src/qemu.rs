@@ -4,7 +4,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::image::{busybox_initramfs_name, busybox_root_ext4_name};
+use crate::image::{alpine_initramfs_name, busybox_initramfs_name, busybox_root_ext4_name};
 use crate::target::{Profile, TxTarget};
 use crate::util::{option_value, optional_option_value, shell_join, tail_lines};
 use crate::Result;
@@ -26,6 +26,37 @@ struct QemuOptions {
     /// shell-test driver) sees output directly and types into stdin.
     /// Ctrl-A C to drop into the QEMU monitor, Ctrl-A X to quit.
     interactive: bool,
+    net: QemuNet,
+    host_ping: Option<HostPingOptions>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum QemuNet {
+    None,
+    User,
+    Tap(String),
+    Bridge(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HostPingOptions {
+    guest_ip: String,
+    count: u32,
+    timeout: Duration,
+}
+
+impl HostPingOptions {
+    fn command_args(&self) -> Vec<String> {
+        let timeout_secs = self.timeout.as_millis().div_ceil(1000).max(1);
+        vec![
+            "ping".into(),
+            "-c".into(),
+            self.count.to_string(),
+            "-W".into(),
+            timeout_secs.to_string(),
+            self.guest_ip.clone(),
+        ]
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -100,12 +131,18 @@ fn qemu_options(args: &[String]) -> Result<QemuOptions> {
         })
         .transpose()?;
 
+    let expect_sentinel = args.iter().any(|arg| arg == "--expect-sentinel");
+    let net = qemu_net(args)?;
+    let host_ping = host_ping_options(args, expect_sentinel, &net)?;
+
     Ok(QemuOptions {
         expect_sentinel,
         timeout,
         smp,
         no_block: args.iter().any(|arg| arg == "--no-block"),
         interactive: args.iter().any(|arg| arg == "--interactive"),
+        net,
+        host_ping,
     })
 }
 
@@ -223,7 +260,7 @@ fn qemu_command(
 
     args.extend([
         "-m".to_string(),
-        qemu_memory(target).to_string(),
+        qemu_memory(target, profile).to_string(),
         "-smp".to_string(),
         qemu_smp(target, options).to_string(),
         // Force multi-threaded TCG: vCPUs run on parallel host threads
@@ -269,15 +306,20 @@ fn qemu_command(
         args.push("-no-shutdown".into());
     }
 
-    if profile == Profile::Busybox {
-        let initramfs = root
-            .join("target")
-            .join("images")
-            .join(busybox_initramfs_name(target));
-        let cmdline = if target == TxTarget::Rv64M1DockMock {
-            "tx.profile=busybox tx.board=m1dock-mock tx.mock.spi0.cs0=target/images/m1dock-sd.img console=ttyS0"
-        } else {
-            "tx.profile=busybox console=ttyS0"
+    if matches!(profile, Profile::Busybox | Profile::Alpine) {
+        let initramfs_name = match profile {
+            Profile::Busybox => busybox_initramfs_name(target),
+            Profile::Alpine => alpine_initramfs_name(target),
+            Profile::Smoke => unreachable!("handled by outer profile match"),
+        };
+        let initramfs = root.join("target").join("images").join(initramfs_name);
+        let cmdline = match (profile, target) {
+            (Profile::Busybox, TxTarget::Rv64M1DockMock) => {
+                "tx.profile=busybox tx.board=m1dock-mock tx.mock.spi0.cs0=target/images/m1dock-sd.img console=ttyS0"
+            }
+            (Profile::Busybox, _) => "tx.profile=busybox console=ttyS0",
+            (Profile::Alpine, _) => "tx.profile=alpine init=/bin/sh console=ttyS0",
+            (Profile::Smoke, _) => unreachable!("handled by outer profile match"),
         };
         args.push("-initrd".into());
         args.push(initramfs.display().to_string());
@@ -354,6 +396,41 @@ fn qemu_smp(target: TxTarget, options: &QemuOptions) -> usize {
     }
 }
 
+pub(crate) fn append_net_args(args: &mut Vec<String>, target: TxTarget, net: &QemuNet) {
+    match net {
+        QemuNet::None => {}
+        QemuNet::User => {
+            args.push("-netdev".into());
+            args.push("user,id=net0".into());
+            push_net_device(args, target);
+        }
+        QemuNet::Tap(ifname) => {
+            args.push("-netdev".into());
+            args.push(format!(
+                "tap,id=net0,ifname={ifname},script=no,downscript=no"
+            ));
+            push_net_device(args, target);
+        }
+        QemuNet::Bridge(bridge) => {
+            args.push("-netdev".into());
+            args.push(format!("bridge,id=net0,br={bridge}"));
+            push_net_device(args, target);
+        }
+    }
+}
+
+fn push_net_device(args: &mut Vec<String>, target: TxTarget) {
+    args.push("-device".into());
+    match target {
+        TxTarget::Rv64Qemu | TxTarget::Rv64M1DockMock => {
+            args.push("virtio-net-device,netdev=net0,bus=virtio-mmio-bus.0".into());
+        }
+        TxTarget::La64Qemu => {
+            args.push("virtio-net-pci,netdev=net0".into());
+        }
+    }
+}
+
 fn qemu_cpu(target: TxTarget) -> Option<&'static str> {
     match target {
         TxTarget::Rv64Qemu | TxTarget::Rv64M1DockMock => None,
@@ -361,10 +438,11 @@ fn qemu_cpu(target: TxTarget) -> Option<&'static str> {
     }
 }
 
-fn qemu_memory(target: TxTarget) -> &'static str {
-    match target {
-        TxTarget::Rv64Qemu | TxTarget::Rv64M1DockMock => "256M",
-        TxTarget::La64Qemu => "1152M",
+fn qemu_memory(target: TxTarget, profile: Profile) -> &'static str {
+    match (target, profile) {
+        (TxTarget::Rv64Qemu, Profile::Alpine) => "512M",
+        (TxTarget::Rv64Qemu | TxTarget::Rv64M1DockMock, _) => "256M",
+        (TxTarget::La64Qemu, _) => "1152M",
     }
 }
 
@@ -467,6 +545,51 @@ fn opensbi_bios(root: &Path) -> String {
         silent.display().to_string()
     } else {
         "default".to_string()
+    }
+}
+
+fn run_host_ping(root: &Path, options: &HostPingOptions) -> Result<()> {
+    let command = options.command_args();
+    println!("$ {}", shell_join(&command));
+    let Some((program, rest)) = command.split_first() else {
+        return Err("empty host ping command".into());
+    };
+    let mut child = Command::new(program)
+        .args(rest)
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("failed to run host ping: {err}"))?;
+    let started = Instant::now();
+
+    loop {
+        if let Some(status) = child.try_wait().map_err(|err| err.to_string())? {
+            let output = child.wait_with_output().map_err(|err| err.to_string())?;
+            if status.success() {
+                println!("host ping succeeded: {}", options.guest_ip);
+                return Ok(());
+            }
+            return Err(format!(
+                "host ping exited with {status}\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout).trim_end(),
+                String::from_utf8_lossy(&output.stderr).trim_end()
+            ));
+        }
+
+        if started.elapsed() >= options.timeout {
+            let _ = child.kill();
+            let output = child.wait_with_output().map_err(|err| err.to_string())?;
+            return Err(format!(
+                "host ping timed out after {} ms\nstdout:\n{}\nstderr:\n{}",
+                options.timeout.as_millis(),
+                String::from_utf8_lossy(&output.stdout).trim_end(),
+                String::from_utf8_lossy(&output.stderr).trim_end()
+            ));
+        }
+
+        thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -731,6 +854,8 @@ mod tests {
             smp: None,
             no_block: false,
             interactive: false,
+            net: QemuNet::None,
+            host_ping: None,
         };
         let command = qemu_command(
             Path::new("/tmp/tx"),
@@ -758,6 +883,8 @@ mod tests {
             smp: None,
             no_block: false,
             interactive: false,
+            net: QemuNet::None,
+            host_ping: None,
         };
         let command = qemu_command(
             Path::new("/tmp/tx"),
@@ -788,6 +915,8 @@ mod tests {
             smp: Some(1),
             no_block: false,
             interactive: false,
+            net: QemuNet::None,
+            host_ping: None,
         };
         let command = qemu_command(
             Path::new("/tmp/tx"),
@@ -808,6 +937,8 @@ mod tests {
             smp: None,
             no_block: false,
             interactive: false,
+            net: QemuNet::None,
+            host_ping: None,
         };
         let command = qemu_command(
             Path::new("/tmp/tx"),
@@ -826,5 +957,143 @@ mod tests {
         assert!(rendered.contains(
             "-drive driver=raw,file.driver=file,file.filename=target/images/busybox-root-la64-qemu.ext4,file.locking=off,if=none,id=txblk0,read-only=on"
         ));
+    }
+
+    #[test]
+    fn qemu_net_user_adds_target_specific_virtio_net_device() {
+        let rv64 = qemu_command(
+            Path::new("/tmp/tx"),
+            TxTarget::Rv64Qemu,
+            Profile::Smoke,
+            &QemuOptions {
+                expect_sentinel: true,
+                timeout: Duration::from_secs(10),
+                no_block: true,
+                interactive: false,
+                net: QemuNet::User,
+                smp: None,
+                host_ping: None,
+            },
+        )
+        .unwrap()
+        .join(" ");
+        assert!(rv64.contains("-netdev user,id=net0"));
+        assert!(rv64.contains("-device virtio-net-device,netdev=net0,bus=virtio-mmio-bus.0"));
+
+        let la64 = qemu_command(
+            Path::new("/tmp/tx"),
+            TxTarget::La64Qemu,
+            Profile::Smoke,
+            &QemuOptions {
+                expect_sentinel: true,
+                timeout: Duration::from_secs(10),
+                no_block: true,
+                interactive: false,
+                net: QemuNet::User,
+                smp: None,
+                host_ping: None,
+            },
+        )
+        .unwrap()
+        .join(" ");
+        assert!(la64.contains("-netdev user,id=net0"));
+        assert!(la64.contains("-device virtio-net-pci,netdev=net0"));
+    }
+
+    #[test]
+    fn qemu_net_parses_tap_and_bridge_backends() {
+        assert_eq!(
+            qemu_net(&["--net".into(), "tap:tap0".into()]).unwrap(),
+            QemuNet::Tap("tap0".into())
+        );
+        assert_eq!(
+            qemu_net(&["--net".into(), "bridge:br0".into()]).unwrap(),
+            QemuNet::Bridge("br0".into())
+        );
+        assert!(qemu_net(&["--net".into(), "tap:".into()]).is_err());
+    }
+
+    #[test]
+    fn qemu_host_ping_requires_sentinel_and_tap_or_bridge() {
+        let without_sentinel = qemu_options(&[
+            "--target".into(),
+            "rv64-qemu".into(),
+            "--profile".into(),
+            "smoke".into(),
+            "--net".into(),
+            "tap:txv2tap0".into(),
+            "--host-ping-guest".into(),
+            "10.0.2.15".into(),
+        ])
+        .unwrap_err();
+        assert!(without_sentinel.contains("--expect-sentinel"));
+
+        let user_net = qemu_options(&[
+            "--target".into(),
+            "rv64-qemu".into(),
+            "--profile".into(),
+            "smoke".into(),
+            "--expect-sentinel".into(),
+            "--net".into(),
+            "user".into(),
+            "--host-ping-guest".into(),
+            "10.0.2.15".into(),
+        ])
+        .unwrap_err();
+        assert!(user_net.contains("--net tap:<ifname> or --net bridge:<bridge>"));
+    }
+
+    #[test]
+    fn qemu_host_ping_parses_options_and_command() {
+        let options = qemu_options(&[
+            "--target".into(),
+            "rv64-qemu".into(),
+            "--profile".into(),
+            "smoke".into(),
+            "--expect-sentinel".into(),
+            "--net".into(),
+            "bridge:br0".into(),
+            "--host-ping-guest".into(),
+            "10.0.2.15".into(),
+            "--host-ping-count".into(),
+            "2".into(),
+            "--host-ping-timeout-ms".into(),
+            "2500".into(),
+        ])
+        .unwrap();
+        let host_ping = options.host_ping.expect("host ping should parse");
+
+        assert_eq!(host_ping.guest_ip, "10.0.2.15");
+        assert_eq!(host_ping.count, 2);
+        assert_eq!(host_ping.timeout, Duration::from_millis(2500));
+        assert_eq!(
+            host_ping.command_args(),
+            vec!["ping", "-c", "2", "-W", "3", "10.0.2.15"]
+        );
+    }
+
+    #[test]
+    fn qemu_smp_option_overrides_target_default() {
+        let options = qemu_options(&[
+            "--expect-sentinel".into(),
+            "--target".into(),
+            "rv64-qemu".into(),
+            "--profile".into(),
+            "smoke".into(),
+            "--smp".into(),
+            "1".into(),
+        ])
+        .unwrap();
+
+        let command = qemu_command(
+            Path::new("/tmp/tx"),
+            TxTarget::Rv64Qemu,
+            Profile::Smoke,
+            &options,
+        )
+        .unwrap()
+        .join(" ");
+
+        assert!(command.contains("-smp 1"));
     }
 }

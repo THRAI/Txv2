@@ -1,3 +1,15 @@
+- 2026-06-05 **PR #50 merge-conflict repair rebased onto current `main`.**
+  Resolved the GitHub conflict state for `codex/filesystem-smp-gap-stack` by
+  merging `origin/main` into the PR stack and repairing the compile fallout:
+  restored the Alpine image/qemu integration pair, restored the `smoltcp`
+  manifest dependencies required by the merged network code, and removed the
+  duplicate page-allocator helper block produced by the merge. Verification:
+  `cargo check -p tx-kernel -q`, `cargo check -p tx-subsystems -q`,
+  `cargo xtask progress validate`, `uv run python -m unittest
+  tools.tests.test_oscomp_observe_live`, conflict-marker grep, and
+  `git diff --check` all pass locally. Next step: push the repaired PR branch
+  and re-check PR #50 merge state on GitHub.
+
 - 2026-06-05 **SMP4 malloc pre-body Cap panic isolated to terminal reactor drain under an active EBR guard.**
   Current stack has the pmap resident cleanup commit (`ea4a95a8`), packet flag
   initializer cleanup (`ba271743`), and pmap registry scaling (`df622d48`).

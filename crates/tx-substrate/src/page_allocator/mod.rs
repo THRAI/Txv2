@@ -384,69 +384,6 @@ pub fn frame_kernel_addr(ppn: Ppn) -> Result<*mut u8, AllocError> {
     Ok(unsafe { lookup(ppn) })
 }
 
-/// Acquire pmap/PTE role evidence for an already-live frame.
-///
-/// Page cache code uses this after observing a cached PPN and before handing a
-/// frame to VM/pmap publication. The returned token owns the `map_count`
-/// contribution and releases it on drop.
-pub fn acquire_map_pin(
-    ppn: Ppn,
-) -> Result<MapPin<'static, BitmapPageAllocator<'static>>, AllocError> {
-    let allocator = installed_bitmap_allocator()?;
-    allocator.acquire_map_pin(ppn)?;
-    Ok(MapPin::new(allocator, ppn))
-}
-
-/// Acquire page-cache role evidence for an already-live frame.
-///
-/// Filesystem page fetchers can return a populated frame by PPN; PageBacked
-/// uses this helper when it installs that frame into a `PageContainer` index.
-pub fn acquire_cache_pin(
-    ppn: Ppn,
-) -> Result<CachePin<'static, BitmapPageAllocator<'static>>, AllocError> {
-    let allocator = installed_bitmap_allocator()?;
-    allocator.acquire_cache_pin(ppn)?;
-    Ok(CachePin::new(allocator, ppn))
-}
-
-/// Acquire DMA/long-term-pin role evidence for an already-live frame.
-///
-/// Device drivers use this when a frame is handed to hardware and must not be
-/// reclaimed until the DMA mapping is torn down. The returned token owns the
-/// `pin_count` contribution and releases it on drop.
-pub fn acquire_dma_pin(
-    ppn: Ppn,
-) -> Result<DmaPin<'static, BitmapPageAllocator<'static>>, AllocError> {
-    let allocator = installed_bitmap_allocator()?;
-    allocator.acquire_dma_pin(ppn)?;
-    Ok(DmaPin::new(allocator, ppn))
-}
-
-/// Copy the full contents of one frame to another through the installed direct-map hook.
-pub fn copy_frame_contents(source: Ppn, dest: Ppn) -> Result<(), AllocError> {
-    let copier = FRAME_COPIER.load(Ordering::Acquire);
-    if copier == NO_FRAME_COPIER {
-        return Err(AllocError::FrameCopyUnavailable);
-    }
-    let copier: FrameCopier = unsafe { core::mem::transmute(copier) };
-    unsafe { copier(source, dest) };
-    Ok(())
-}
-
-/// Look up the direct-map kernel virtual address of `ppn`.
-///
-/// Returns a pointer to the start of the frame. Callers add their own offset.
-/// The pointer is valid for the lifetime of the frame; the caller is
-/// responsible for not retaining it past frame teardown.
-pub fn frame_kernel_addr(ppn: Ppn) -> Result<*mut u8, AllocError> {
-    let lookup = FRAME_KERNEL_ADDR.load(Ordering::Acquire);
-    if lookup == NO_FRAME_KERNEL_ADDR {
-        return Err(AllocError::FrameKernelAddrUnavailable);
-    }
-    let lookup: FrameKernelAddr = unsafe { core::mem::transmute(lookup) };
-    Ok(unsafe { lookup(ppn) })
-}
-
 /// Reserve a contiguous frame run from the installed backend.
 pub fn reserve_run(
     count: usize,

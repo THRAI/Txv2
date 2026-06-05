@@ -19,12 +19,16 @@ pub(crate) fn image(root: &Path, args: Vec<String>) -> Result<()> {
     let target = image_target(&args[1..])?;
     match (kind.as_str(), profile) {
         ("cpio" | "initramfs", Profile::Busybox) => image_cpio_busybox(root, target),
+        ("cpio" | "initramfs", Profile::Alpine) => image_cpio_alpine(root, &args[1..], target),
         ("ext4", Profile::Busybox) => {
             let name = busybox_root_ext4_name(target);
             image_ext4_busybox(root, &args[1..], target, &name)
         }
         ("m1dock-sd", Profile::Busybox) => {
             image_ext4_busybox(root, &args[1..], target, "m1dock-sd.img")
+        }
+        ("ext4" | "m1dock-sd", Profile::Alpine) => {
+            Err("image alpine profile currently supports cpio/initramfs only".into())
         }
         ("cpio" | "initramfs" | "ext4" | "m1dock-sd", Profile::Smoke) => {
             Err("image smoke profile is not defined; use --profile busybox".into())
@@ -37,6 +41,10 @@ pub(crate) fn image(root: &Path, args: Vec<String>) -> Result<()> {
 
 pub(crate) fn busybox_initramfs_name(target: TxTarget) -> String {
     format!("busybox-initramfs-{}.cpio", target.name())
+}
+
+pub(crate) fn alpine_initramfs_name(target: TxTarget) -> String {
+    format!("alpine-initramfs-{}.cpio", target.name())
 }
 
 pub(crate) fn busybox_root_ext4_name(target: TxTarget) -> String {
@@ -59,6 +67,32 @@ fn image_cpio_busybox(root: &Path, target: TxTarget) -> Result<()> {
         .join("target")
         .join("images")
         .join(busybox_initramfs_name(target));
+    fs::create_dir_all(out.parent().expect("image path has parent"))
+        .map_err(|err| err.to_string())?;
+    remove_existing_image(&out)?;
+
+    let script = format!(
+        "cd '{}' && find . -print | cpio -o -H newc > '{}'",
+        shell_escape(&layout.display().to_string()),
+        shell_escape(&out.display().to_string())
+    );
+    run_shell(root, &script)?;
+    println!("wrote {}", out.display());
+    Ok(())
+}
+
+fn image_cpio_alpine(root: &Path, args: &[String], target: TxTarget) -> Result<()> {
+    if target != TxTarget::Rv64Qemu {
+        return Err("alpine image profile is currently supported only for rv64-qemu".into());
+    }
+    if !command_exists("cpio") {
+        return Err("cpio is required to create the alpine initramfs".into());
+    }
+    let layout = prepare_alpine_rootfs(root, args, target)?;
+    let out = root
+        .join("target")
+        .join("images")
+        .join(alpine_initramfs_name(target));
     fs::create_dir_all(out.parent().expect("image path has parent"))
         .map_err(|err| err.to_string())?;
     remove_existing_image(&out)?;
