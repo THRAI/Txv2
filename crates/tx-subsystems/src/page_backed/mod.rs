@@ -13,9 +13,9 @@ pub mod adapter;
 pub mod notification;
 
 use adapter::step_engine::{
-    self as step_engine, AllocError, BitmapPageAllocator, ByteProgress, CachePin, Cap, DeviceFrame,
-    MapPin, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity, ZeroPolicy, Zone,
-    ZoneAllocated, ZoneError, page_allocator,
+    self as step_engine, page_allocator, AllocError, BitmapPageAllocator, ByteProgress, CachePin,
+    Cap, DeviceFrame, MapPin, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
+    ZeroPolicy, Zone, ZoneAllocated, ZoneError,
 };
 
 use crate::execution::{Errno, Guard};
@@ -26,18 +26,19 @@ use tx_hal::{Ppn, UserPtr};
 
 mod cross_variant;
 mod fs_page_backing;
+mod gift;
 mod lifecycle;
 mod reflink;
 mod targeted_read;
 mod user_buffer;
 pub use cross_variant::step_copy_file_range;
 pub use fs_page_backing::FsPageBacking;
-pub use lifecycle::{FallocateOp, TruncateOp, step_fallocate, step_fsync, step_truncate};
+pub use lifecycle::{step_fallocate, step_fsync, step_truncate, FallocateOp, TruncateOp};
 pub use reflink::{cow_replace_into_private, install_shared_page};
 pub use targeted_read::read_exact_at;
 pub use user_buffer::{
-    ReadToUserOp, WriteFromUserOp, step_read_to_kernel, step_read_to_user, step_write_from_kernel,
-    step_write_from_user,
+    step_read_to_kernel, step_read_to_user, step_write_from_kernel, step_write_from_user,
+    ReadToUserOp, WriteFromUserOp,
 };
 
 #[cfg(test)]

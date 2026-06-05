@@ -146,6 +146,13 @@ pub struct UserPageGift {
     freeze: UserPageGiftFreeze,
 }
 
+// UserPageGift is linear transfer evidence for an already-frozen user page.
+// Moving the token between pipe descriptors across harts moves only ownership
+// of the retained-frame contribution; it does not grant shared mutable access
+// to VM recipe state or frame metadata.
+unsafe impl Send for UserPageGift {}
+unsafe impl Sync for UserPageGift {}
+
 impl UserPageGift {
     pub fn new_for_vm(
         ppn: Ppn,

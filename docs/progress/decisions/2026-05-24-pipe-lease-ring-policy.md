@@ -7,7 +7,8 @@ Date: 2026-05-24
 Pipe is an ordered, waitable stream transport, not the owner of file-cache
 policy. PageBacked owns `PageLease` creation, retain/release evidence, and
 destination install/copy fallback. Pipe stores descriptor slots that may carry
-ordinary anonymous pipe pages or PageBacked leases.
+ordinary anonymous pipe pages, PageBacked leases, or VM-produced
+`UserPageGift` transfer tokens.
 
 The byte-stream pipe ring defaults to 16 page slots and can be resized through
 `fcntl(F_SETPIPE_SZ)`. `PIPE_BUF` writes reserve enough tail-merge and free-slot
@@ -27,11 +28,21 @@ allocating per syscall.
 
 ## Tech Debt
 
-`vmsplice(SPLICE_F_GIFT)` is accepted only as staged compatibility today. Tx
-does not steal user pages until VM grows a user-page pin/adoption primitive that
-can fault/pin an iovec range, revoke or freeze userspace writable ownership,
-carry lifetime/accounting through pipe descriptors, and transfer release
-ownership to PageBacked when installation succeeds.
+`vmsplice(SPLICE_F_GIFT)` is accepted only as staged compatibility until the
+page-gift implementation plan lands in code:
+`docs/progress/plans/2026-06-04-page-gift.md`.
+
+The active-doc contract is now explicit:
+
+- VM produces `UserPageGift` tokens after materializing an eligible full-page
+  private user mapping, acquiring substrate `GiftPin` transfer evidence, and
+  freezing the old writable PTE materialization.
+- Pipe stores gifts only as ordered descriptor payloads.
+- PageBacked consumes gifts through install/copy policy.
+
+Until the VM primitive and descriptor wiring are implemented, Tx may copy user
+iov bytes into pipe buffers for compatibility, but must not advertise copied
+buffers as stealable gifts.
 
 ## Verification
 

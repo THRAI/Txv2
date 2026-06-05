@@ -18,6 +18,23 @@
   still prints its upstream-style `Sanity check failed` warning, but the scored
   throughput subtests complete.
 
+- 2026-06-05 **User-page gift core path reaches vmsplice -> pipe -> PageBacked.**
+  The page-gift implementation now has VM-owned `UserPageGift` creation and
+  source detach/demote behavior, PageBacked `install_user_gift_or_copy`, pipe
+  `UserPageGift` descriptor transport with reservation-token capacity
+  accounting, and `vmsplice(SPLICE_F_GIFT)` dispatch for one full page-aligned
+  eligible iovec. Pipe-to-file tries user gifts before PageBacked leases and
+  byte copy; unsupported or unaligned iovecs still fall back to byte copy.
+  Verification used an isolated target dir to avoid unrelated shared-target
+  Cargo jobs: `vm::tests::user_page_gift` 7/7,
+  `page_backed::core_tests::pagebacked_user_gift` 3/3, `pipe::gift_tests` 3/3,
+  `pipe_` 30/30, `v3_pipe_waitsource` 8/8, `vmsplice_gift` 3/3, and full
+  `linux_syscall::tests::splice_dispatch` 15/15. The plan catch-up is in
+  `docs/progress/plans/2026-06-04-page-gift.md`. Next step: add the remaining
+  syscall-level user-page -> pipe -> pipe -> file regression, decide whether
+  lightweight gift observability is worth adding, then rerun the filtered
+  OSComp `cyclictest-musl,iozone-musl` groups.
+
 - 2026-06-05 **Pmap resident store has an opt-in chunked backend for teardown A/B.**
   Added `ChunkedPmapResidentStore` behind the existing resident-store facade,
   selected by `--cfg tx_vm_pmap_chunked_resident`; the default production alias

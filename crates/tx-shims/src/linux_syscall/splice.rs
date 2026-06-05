@@ -1,8 +1,10 @@
 //! `splice(2)` / `tee(2)` / `vmsplice(2)` v1 syscall shims.
 //!
-//! The current pipe subsystem owns a byte ring, not Linux's page-pinned
-//! pipe-buffer objects. These arms preserve the externally visible pipe
-//! movement semantics with kernel staging and narrow pipe-to-pipe helpers.
+//! Pipe is an ordered descriptor transport: anonymous pipe pages and
+//! PageBacked leases can both travel through its slots. PageBacked
+//! owns lease/gift export and install policy; VM owns user-page
+//! gift eligibility and freeze/detach before a gift descriptor is
+//! published to a pipe.
 
 use super::*;
 use crate::adapter::step_engine::StepOutcome;
@@ -22,6 +24,7 @@ struct PipeEnd {
     payload: Cap<tx_subsystems::pipe::PipePayload>,
     side: tx_subsystems::pipe::PipeSide,
     nonblocking: bool,
+    packet: bool,
 }
 
 fn pipe_end(file: &Cap<OpenFile>) -> Option<PipeEnd> {
@@ -33,6 +36,7 @@ fn pipe_end(file: &Cap<OpenFile>) -> Option<PipeEnd> {
                 payload: payload.clone(),
                 side: *side,
                 nonblocking: file.flags().nonblocking,
+                packet: file.flags().packet,
             }),
             _ => None,
         },
@@ -53,7 +57,8 @@ fn validate_flags(flags: u32) -> Option<SyscallResult> {
 }
 
 pub(super) async fn sys_vmsplice<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
-    if let Some(result) = validate_flags(args[3] as u32) {
+    let flags = args[3] as u32;
+    if let Some(result) = validate_flags(flags) {
         return result;
     }
     let fd = args[0] as i32;
@@ -69,11 +74,11 @@ pub(super) async fn sys_vmsplice<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
         Some(file) => file,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
-    match pipe_end(&file) {
-        Some(end) if end.side == tx_subsystems::pipe::PipeSide::Writer => {}
+    let out_pipe = match pipe_end(&file) {
+        Some(end) if end.side == tx_subsystems::pipe::PipeSide::Writer => end,
         Some(_) => return SyscallResult::Error(EBADF_VALUE),
         None => return SyscallResult::Error(EINVAL_VALUE),
-    }
+    };
     if nr_segs == 0 {
         return SyscallResult::Return(0);
     }
@@ -94,6 +99,27 @@ pub(super) async fn sys_vmsplice<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
             continue;
         }
 
+        if flags & SPLICE_F_GIFT != 0 {
+            if let Some(result) = try_vmsplice_gift_to_pipe(&out_pipe, base, len, flags, ctx) {
+                match result {
+                    SyscallResult::Return(n) => {
+                        total += n;
+                        if (n as u64) < len {
+                            return SyscallResult::Return(total);
+                        }
+                        continue;
+                    }
+                    SyscallResult::Error(e) => {
+                        if total > 0 {
+                            return SyscallResult::Return(total);
+                        }
+                        return SyscallResult::Error(e);
+                    }
+                    other => return other,
+                }
+            }
+        }
+
         let result = sys_write([fd as u64, base, len, 0, 0, 0], ctx).await;
         match result {
             SyscallResult::Return(n) => {
@@ -112,6 +138,63 @@ pub(super) async fn sys_vmsplice<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
         }
     }
     SyscallResult::Return(total)
+}
+
+fn try_vmsplice_gift_to_pipe<'a>(
+    out_pipe: &PipeEnd,
+    base: u64,
+    len: u64,
+    flags: u32,
+    ctx: &SyscallCtx<'a>,
+) -> Option<SyscallResult> {
+    let page_size = tx_subsystems::vm::USER_PAGE_SIZE;
+    if len != page_size as u64 {
+        return None;
+    }
+    let base = usize::try_from(base).ok()?;
+    if !base.is_multiple_of(page_size) {
+        return None;
+    }
+    let range = match UserRange::new_aligned(UserVirtAddr(base), page_size) {
+        Ok(range) => range,
+        Err(_) => return None,
+    };
+    let nonblocking = splice_nonblocking(flags, false, out_pipe.nonblocking);
+    let slot = {
+        let guard = step_engine::guard();
+        match tx_subsystems::pipe::step_reserve_user_page_gift_slot(
+            &out_pipe.payload,
+            &guard,
+            nonblocking,
+            out_pipe.packet,
+        ) {
+            StepOutcome::Done(slot) => slot,
+            StepOutcome::Err(e) => return Some(splice_outcome_to_result(StepOutcome::Err(e))),
+            StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
+                return Some(SyscallResult::Error(EAGAIN_VALUE));
+            }
+        }
+    };
+    let batch = match ctx.aspace.gift_user_pages_step(ctx.aspace.clone(), range) {
+        StepOutcome::Done(batch) => batch,
+        StepOutcome::Err(e) => return Some(SyscallResult::error_from(e.into())),
+        StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
+            return Some(SyscallResult::Error(EAGAIN_VALUE));
+        }
+    };
+    if batch.is_empty() {
+        return None;
+    }
+    if batch.bytes() != page_size || batch.gift_count() != 1 {
+        return Some(SyscallResult::Error(EINVAL_VALUE));
+    }
+    let mut gifts = batch.into_gifts();
+    let gift = gifts.pop().expect("gift_count checked");
+    let outcome = {
+        let guard = step_engine::guard();
+        slot.commit(gift, &guard)
+    };
+    Some(splice_outcome_to_result(outcome))
 }
 
 pub(super) fn sys_tee<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
@@ -154,6 +237,7 @@ pub(super) fn sys_tee<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
         len,
         &guard,
         nonblocking,
+        out_pipe.packet,
     );
     drop(guard);
     splice_outcome_to_result(outcome)
@@ -214,6 +298,7 @@ pub(super) async fn sys_splice<'a, P: tx_hal::TimeIf>(
                     len,
                     &guard,
                     nonblocking,
+                    output.packet,
                 )
             };
             splice_outcome_to_result(outcome)
@@ -249,6 +334,9 @@ async fn splice_pipe_to_file<'a, P: tx_hal::TimeIf>(
         Some(end) => end,
         None => return SyscallResult::Error(EINVAL_VALUE),
     };
+    if let Some(result) = try_splice_pipe_gift_to_file(fd_out, off_out_ptr, &in_pipe, len, ctx) {
+        return result;
+    }
     if let Some(result) = try_splice_pipe_lease_to_file(fd_out, off_out_ptr, &in_pipe, len, ctx) {
         return result;
     }
@@ -306,6 +394,68 @@ async fn splice_pipe_to_file<'a, P: tx_hal::TimeIf>(
             result
         }
         other => other,
+    }
+}
+
+fn try_splice_pipe_gift_to_file<'a>(
+    fd_out: i32,
+    off_out_ptr: u64,
+    in_pipe: &PipeEnd,
+    len: usize,
+    ctx: &SyscallCtx<'a>,
+) -> Option<SyscallResult> {
+    let out_file = resolve_fd(&ctx.process, fd_out as u32)?;
+    let OpenFileBacking::Rnode { rnode } = out_file.backing() else {
+        return None;
+    };
+    let RNodeBacking::PageBacked { pc } = rnode.backing() else {
+        return None;
+    };
+    let out_offset = if off_out_ptr != 0 {
+        match bootstrap_read_user::<u64>(&ctx.aspace, off_out_ptr) {
+            Ok(offset) => offset,
+            Err(errno) => return Some(SyscallResult::error_from(errno)),
+        }
+    } else {
+        out_file.offset()
+    };
+    let page_size = tx_subsystems::vm::USER_PAGE_SIZE as u64;
+    if !out_offset.is_multiple_of(page_size) || len < tx_subsystems::vm::USER_PAGE_SIZE {
+        return None;
+    }
+    let gift_outcome = {
+        let guard = step_engine::guard();
+        tx_subsystems::pipe::step_pop_user_page_gift(&in_pipe.payload, &guard, in_pipe.nonblocking)
+    };
+    let Some(gift) = (match gift_outcome {
+        StepOutcome::Done(value) => value,
+        StepOutcome::Err(e) => return Some(splice_outcome_to_result(StepOutcome::Err(e))),
+        StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
+            return Some(SyscallResult::Error(EAGAIN_VALUE));
+        }
+    }) else {
+        return None;
+    };
+    let gift_len = gift.len();
+    if gift_len != tx_subsystems::vm::USER_PAGE_SIZE || gift_len > len {
+        return Some(SyscallResult::Error(EINVAL_VALUE));
+    }
+    let page = tx_subsystems::page_backed::PageIndex::new(out_offset / page_size);
+    match pc.install_user_gift_or_copy(page, gift) {
+        Ok(_installed_or_copied) => {
+            pc.set_size_bytes(out_offset + gift_len as u64);
+            if off_out_ptr != 0 {
+                let _ = bootstrap_write_user::<u64>(
+                    &ctx.aspace,
+                    off_out_ptr,
+                    out_offset + gift_len as u64,
+                );
+            } else {
+                out_file.set_offset(out_offset + gift_len as u64);
+            }
+            Some(SyscallResult::Return(gift_len as i64))
+        }
+        Err(_) => Some(SyscallResult::Error(EINVAL_VALUE)),
     }
 }
 
@@ -493,6 +643,7 @@ fn try_splice_file_lease_to_pipe<'a>(
             lease_len,
             &guard,
             out_pipe.nonblocking,
+            out_pipe.packet,
         )
     };
     match splice_outcome_to_result(outcome) {

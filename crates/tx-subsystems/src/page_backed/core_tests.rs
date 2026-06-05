@@ -31,6 +31,29 @@ fn cached_frame_for_test() -> CachedFrame {
     allocate_cached_frame().expect("cached frame")
 }
 
+fn user_page_gift_for_test() -> (crate::vm::UserPageGift, Ppn) {
+    setup_host_substrate();
+    let aspace = crate::vm::AddressSpace::new_cap().expect("gift source aspace");
+    let range = crate::vm::UserRange::new_aligned(
+        crate::vm::UserVirtAddr(0x10000),
+        crate::vm::USER_PAGE_SIZE,
+    )
+    .expect("gift source range");
+    let frame = page_allocator::reserve_frame(ZeroPolicy::Zeroed)
+        .expect("gift source frame")
+        .commit();
+    let ppn = frame.ppn();
+    let pin = frame.try_gift_pin().expect("gift pin for source frame");
+    let gift = crate::vm::UserPageGift::new_for_vm(
+        ppn,
+        crate::vm::UserPageGiftSource::new(aspace, range),
+        pin,
+        crate::vm::UserPageGiftFreeze::DetachedPrivate,
+    );
+    drop(frame);
+    (gift, ppn)
+}
+
 struct RecordingFs {
     fetches: AtomicUsize,
     last_object: AtomicU64,
@@ -643,6 +666,7 @@ fn open_file_for_pc(pc: &PageContainer) -> OpenFile {
             append: false,
             cloexec: false,
             nonblocking: false,
+            packet: false,
         },
     )
 }
@@ -1061,6 +1085,76 @@ fn page_container_materialize_page_wraps_device_ppns() {
         }
         other => panic!("expected out-of-bounds error, got {other:?}"),
     }
+}
+
+#[test]
+fn pagebacked_user_gift_installs_absent_slot_without_copy() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    let (gift, source_ppn) = user_page_gift_for_test();
+    let pc = PageContainer::new(
+        PageContainerKind::Anon {
+            swap_policy: AnonSwapPolicy::Reclaimable,
+        },
+        2,
+    );
+    let page = PageIndex::new(1);
+
+    assert_eq!(pc.install_user_gift_or_copy(page, gift), Ok(true));
+
+    assert_eq!(pc.lookup(page), Some(source_ppn));
+    assert_eq!(pc.resident_pages(), 1);
+    assert!(
+        pc.page_marks(page)
+            .expect("gift-installed page marks")
+            .dirty,
+        "gifted user contents become dirty PageBacked contents"
+    );
+}
+
+#[test]
+fn pagebacked_user_gift_copies_to_present_slot_and_marks_dirty() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    let (gift, source_ppn) = user_page_gift_for_test();
+    let pattern = [0x41, 0x52, 0x63, 0x74, 0x85, 0x96, 0xa7, 0xb8];
+    page_allocator::testing::write_frame_bytes_for_test(source_ppn, 128, &pattern);
+    let pc = PageContainer::new(
+        PageContainerKind::Anon {
+            swap_policy: AnonSwapPolicy::Reclaimable,
+        },
+        2,
+    );
+    let page = PageIndex::new(0);
+    let existing = pc
+        .materialize_anon(page, MaterializeAccess::Read)
+        .expect("existing destination page");
+    page_allocator::testing::write_frame_bytes_for_test(existing.ppn, 128, &[0u8; 8]);
+
+    assert_eq!(pc.install_user_gift_or_copy(page, gift), Ok(false));
+
+    let mut observed = [0u8; 8];
+    page_allocator::testing::read_frame_bytes_for_test(existing.ppn, 128, &mut observed);
+    assert_eq!(observed, pattern);
+    assert_eq!(pc.lookup(page), Some(existing.ppn));
+    assert!(pc.page_marks(page).expect("copied page marks").dirty);
+}
+
+#[test]
+fn pagebacked_user_gift_rejects_device_destination() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    let (gift, _source_ppn) = user_page_gift_for_test();
+    let pc = PageContainer::new(
+        PageContainerKind::Device {
+            base_ppn: Ppn(0xfeed_0000),
+            page_count: 1,
+        },
+        1,
+    );
+
+    assert_eq!(
+        pc.install_user_gift_or_copy(PageIndex::new(0), gift),
+        Err(PageCacheError::UnsupportedKind)
+    );
+    assert_eq!(pc.resident_pages(), 0);
 }
 
 #[test]
