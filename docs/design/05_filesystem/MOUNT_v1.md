@@ -131,8 +131,12 @@ upgrade, and publish role-shaped evidence.
   ABI-only.
 - **Real `setns(CLONE_NEWNS)`** crossing into a different namespace.
   v1 is ABI-only.
-- **`open_tree` / `fsopen` / `fsmount` / `mount_setattr`.** Linux
-  5.2 new mount API.
+- **Full Linux 5.2 new mount API.** `fsconfig` / `fsmount` /
+  `move_mount` / `mount_setattr` topology and superblock mutation
+  semantics are deferred. A scoped fd-provider phase may expose
+  `fsopen` / `fspick` / `open_tree` descriptors for generic fd
+  consumers, but it must not claim full mount API support until those
+  later syscalls mutate topology through the mount subsystem.
 - **OverlayFS / autofs / unionfs.** Filesystem-specific; out of v1.
 - **fsnotify on mount events.** A consumer of `umount_port` is
   sketched but not specified.
@@ -2572,7 +2576,7 @@ MOUNT-11.
 | `mount(... MS_SHARED|SLAVE|PRIVATE ...)` | Propagation deferred. |
 | `unshare(CLONE_NEWNS)` actual COW | Returns success but no new namespace; Phase 2. |
 | `setns(fd, CLONE_NEWNS)` to a different ns | Returns EINVAL; only the existing ns is valid. |
-| `open_tree`/`fsopen`/`fsmount`/`move_mount`/`mount_setattr` | Linux 5.2 new mount API; deferred. |
+| full `fsconfig`/`fsmount`/`move_mount`/`mount_setattr` | Linux 5.2 new mount API topology and superblock mutation semantics deferred; scoped `fsopen`/`fspick`/`open_tree` fd providers may exist for generic fd consumers. |
 | `fchroot`-style operations | Out of v1 scope. |
 
 ### 8.3 Userspace expectations
@@ -2975,7 +2979,7 @@ through.
 | Real `step_unshare_mnt_ns` | BTree COW clone + per-mount Identity duplication; Phase 2 mount-namespace work. |
 | Real `step_setns_mnt` | Cross-namespace move; needs Phase 2 unshare. |
 | `MS_SHARED` / `MS_SLAVE` / `MS_PRIVATE` propagation | Linux 2.6.15 shared subtree; `MountIdentity.propagation` field reserved. |
-| `open_tree` / `move_mount` / `fsopen` / `fsmount` / `mount_setattr` | Linux 5.2 new mount API. |
+| full `fsconfig` / `fsmount` / `move_mount` / `mount_setattr` | Linux 5.2 new mount API topology and superblock mutation semantics; scoped `fsopen` / `fspick` / `open_tree` fd providers are not full support. |
 | OverlayFS / autofs / unionfs | FS-specific. |
 | fsnotify / inotify on mount events | Consumer of `umount_port` not specified. |
 | RNode-to-MountPayload back-link | Currently inferred from PageContainerKind::File; if procfs/devfs synth RNodes need a uniform back-link, add `RNode.containing_mount: Weak<MountPayload>`. v1 manages without. |

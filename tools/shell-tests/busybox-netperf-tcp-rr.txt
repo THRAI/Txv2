@@ -1,0 +1,18 @@
+# busybox-netperf-tcp-rr.txt — N69c OSComp TCP_RR probe.
+#
+# Exercises persistent TCP request/response over IPv4 loopback: 64-byte
+# request, 64-byte response, one-second test duration.
+
+wait "/ # " within 30000
+sleep 500
+
+send "/bin/netserver -D -L 127.0.0.1 -p 12865 & server_pid=$!\n"
+expect "/ # " within 10000
+sleep 1500
+
+send "echo \"====== netperf TCP_RR begin ======\"; if /bin/netperf -H 127.0.0.1 -p 12865 -t TCP_RR -l 1 -- -s 16k -S 16k -m 1k -M 1k -r 64,64 -R 1; then echo \"N69C_TCP_RR_OK\"; else echo \"N69C_TCP_RR_FAIL\"; fi; kill -9 $server_pid\n"
+expect "N69C_TCP_RR_OK" within 60000
+expect "/ # " within 10000
+
+sleep 500
+quit

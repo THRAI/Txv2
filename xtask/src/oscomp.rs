@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -260,12 +261,13 @@ fn oscomp_run(root: &Path, args: &[String]) -> Result<()> {
 fn oscomp_qemu(root: &Path, args: &[String]) -> Result<()> {
     let target = TxTarget::parse(&option_value(args, "--target")?)?;
     let data = oscomp_data_dir(root, args);
+    let boot_suite = optional_option_value(args, "--boot-suite");
     let submit = optional_option_value(args, "--submit")
         .map(PathBuf::from)
         .map(|path| resolve_path(root, path))
         .unwrap_or_else(|| root.join("target").join("oscomp").join("submit"));
     let dry_run = args.iter().any(|arg| arg == "--dry-run");
-    let (kernel, sdcard, out, qemu_args) = match target {
+    let (kernel, sdcard, out, mut qemu_args) = match target {
         TxTarget::Rv64Qemu => (
             submit.join("kernel-rv"),
             data.join("sdcard-rv.img"),
@@ -338,6 +340,15 @@ fn oscomp_qemu(root: &Path, args: &[String]) -> Result<()> {
             );
         }
     };
+    if let Some(suite) = boot_suite {
+        let cmdline = format!("tx.oscomp={suite} console=ttyS0");
+        qemu_args.push("-append".into());
+        qemu_args.push(cmdline.clone());
+        if target == TxTarget::La64Qemu {
+            qemu_args.push("-fw_cfg".into());
+            qemu_args.push(format!("name=opt/tx.cmdline,string={cmdline}"));
+        }
+    }
     println!("{}", shell_join(&qemu_args));
     println!("serial output: {}", out.display());
     if dry_run {

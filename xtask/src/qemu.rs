@@ -11,7 +11,7 @@ use crate::Result;
 
 const DEFAULT_SENTINEL_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct QemuOptions {
     expect_sentinel: bool,
     timeout: Duration,
@@ -48,6 +48,9 @@ pub(crate) fn qemu(root: &Path, args: Vec<String>) -> Result<()> {
         println!("serial: {}", serial_log_relative(target, profile).display());
         println!("expect: {}", expected_sentinel(target));
         println!("timeout-ms: {}", options.timeout.as_millis());
+    }
+    if let Some(host_ping) = &options.host_ping {
+        println!("host-ping: {}", shell_join(&host_ping.command_args()));
     }
     if dry_run {
         return Ok(());
@@ -98,12 +101,105 @@ fn qemu_options(args: &[String]) -> Result<QemuOptions> {
         .transpose()?;
 
     Ok(QemuOptions {
-        expect_sentinel: args.iter().any(|arg| arg == "--expect-sentinel"),
+        expect_sentinel,
         timeout,
         smp,
         no_block: args.iter().any(|arg| arg == "--no-block"),
         interactive: args.iter().any(|arg| arg == "--interactive"),
     })
+}
+
+pub(crate) fn qemu_net(args: &[String]) -> Result<QemuNet> {
+    let Some(value) = optional_option_value(args, "--net") else {
+        return Ok(QemuNet::None);
+    };
+
+    match value.as_str() {
+        "none" => Ok(QemuNet::None),
+        "user" => Ok(QemuNet::User),
+        value if value.starts_with("tap:") => {
+            let ifname = value.trim_start_matches("tap:");
+            if ifname.is_empty() {
+                Err("--net tap:<ifname> requires a non-empty interface name".into())
+            } else {
+                Ok(QemuNet::Tap(ifname.into()))
+            }
+        }
+        value if value.starts_with("bridge:") => {
+            let bridge = value.trim_start_matches("bridge:");
+            if bridge.is_empty() {
+                Err("--net bridge:<bridge> requires a non-empty bridge name".into())
+            } else {
+                Ok(QemuNet::Bridge(bridge.into()))
+            }
+        }
+        other => Err(format!(
+            "invalid --net value '{other}', expected none, user, tap:<ifname>, or bridge:<bridge>"
+        )),
+    }
+}
+
+fn host_ping_options(
+    args: &[String],
+    expect_sentinel: bool,
+    net: &QemuNet,
+) -> Result<Option<HostPingOptions>> {
+    let guest_ip = optional_option_value(args, "--host-ping-guest");
+    let has_count = args.iter().any(|arg| arg == "--host-ping-count");
+    let has_timeout = args.iter().any(|arg| arg == "--host-ping-timeout-ms");
+
+    let Some(guest_ip) = guest_ip else {
+        if has_count || has_timeout {
+            return Err(
+                "--host-ping-count/--host-ping-timeout-ms require --host-ping-guest".into(),
+            );
+        }
+        return Ok(None);
+    };
+    if guest_ip.is_empty() {
+        return Err("--host-ping-guest requires a non-empty guest IP".into());
+    }
+    if !expect_sentinel {
+        return Err("--host-ping-guest requires --expect-sentinel".into());
+    }
+    if !matches!(net, QemuNet::Tap(_) | QemuNet::Bridge(_)) {
+        return Err(
+            "--host-ping-guest requires --net tap:<ifname> or --net bridge:<bridge>".into(),
+        );
+    }
+
+    let count = optional_option_value(args, "--host-ping-count")
+        .map(|value| {
+            let count = value
+                .parse::<u32>()
+                .map_err(|err| format!("invalid --host-ping-count value '{value}': {err}"))?;
+            if count == 0 {
+                Err("--host-ping-count must be greater than 0".to_string())
+            } else {
+                Ok(count)
+            }
+        })
+        .transpose()?
+        .unwrap_or(3);
+    let timeout = optional_option_value(args, "--host-ping-timeout-ms")
+        .map(|value| {
+            let millis = value
+                .parse::<u64>()
+                .map_err(|err| format!("invalid --host-ping-timeout-ms value '{value}': {err}"))?;
+            if millis == 0 {
+                Err("--host-ping-timeout-ms must be greater than 0".to_string())
+            } else {
+                Ok(Duration::from_millis(millis))
+            }
+        })
+        .transpose()?
+        .unwrap_or(Duration::from_millis(6000));
+
+    Ok(Some(HostPingOptions {
+        guest_ip,
+        count,
+        timeout,
+    }))
 }
 
 fn qemu_command(
@@ -235,6 +331,7 @@ fn qemu_command(
             ));
         }
     }
+    append_net_args(&mut args, target, &options.net);
     args.push("-d".into());
     args.push("guest_errors".into());
     args.push("-D".into());
@@ -306,6 +403,12 @@ fn run_with_sentinel(
         let serial = fs::read_to_string(&serial_log).unwrap_or_default();
         match sentinel_state(&serial, &sentinel, started.elapsed(), options.timeout) {
             SentinelState::Found => {
+                if let Some(host_ping) = &options.host_ping {
+                    run_host_ping(root, host_ping).inspect_err(|_| {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    })?;
+                }
                 let _ = child.kill();
                 let _ = child.wait();
                 println!("qemu smoke sentinel observed: {sentinel}");
@@ -338,6 +441,11 @@ fn run_with_sentinel(
         if let Some(status) = child.try_wait().map_err(|err| err.to_string())? {
             let serial = fs::read_to_string(&serial_log).unwrap_or_default();
             if serial_contains_sentinel(&serial, &sentinel) {
+                if options.host_ping.is_some() {
+                    return Err(format!(
+                        "qemu exited before host ping could run after observing {sentinel}"
+                    ));
+                }
                 println!("qemu smoke sentinel observed: {sentinel}");
                 return Ok(());
             }

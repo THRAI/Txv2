@@ -489,6 +489,15 @@ pub(crate) fn coalesce_invalidation_ranges(
     coalesced
 }
 
+fn invalidate_destroyed_root() -> RootInvalidated {
+    sfence_vma_all();
+    RootInvalidated
+}
+
+fn free_asid_after_invalidation(asid: Asid, _invalidated: RootInvalidated) {
+    free_asid(asid);
+}
+
 // Root-relative intermediate table management mirrors the kernel-bootstrap
 // helpers but works from an arbitrary process root. Empty L0/L1 tables are
 // pruned after unmap so committed PT-node ownership returns through the pmap

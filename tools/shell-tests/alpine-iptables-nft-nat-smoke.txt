@@ -1,0 +1,37 @@
+# alpine-iptables-nft-nat-smoke.txt - real Alpine iptables-nft smoke path.
+#
+# This covers the first Docker-relevant iptables-nft control-plane calls:
+# version probing, filter/nat table listing, rule append, and saved-rule style
+# listing. The backend must remain the txKernel netfilter model.
+
+wait ":bootstrap-exec:ok" within 60000
+wait "/ # " within 60000
+sleep 500
+
+send "IPT=/sbin/iptables; [ -x $IPT ] || IPT=/usr/sbin/iptables; $IPT --version\n"
+expect "iptables v" within 10000
+expect "nf_tables" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "$IPT -L\n"
+expect "Chain" within 15000
+expect "/ # " within 15000
+
+sleep 500
+send "$IPT -t nat -L\n"
+expect "Chain" within 15000
+expect "/ # " within 15000
+
+sleep 500
+send "$IPT -t nat -A POSTROUTING -s 172.17.0.0/16 -j MASQUERADE\n"
+expect "/ # " within 15000
+
+sleep 500
+send "$IPT -t nat -S\n"
+expect "POSTROUTING" within 15000
+expect "MASQUERADE" within 15000
+expect "/ # " within 15000
+
+sleep 500
+quit
