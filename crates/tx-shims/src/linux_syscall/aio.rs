@@ -750,7 +750,8 @@ pub(super) fn sys_io_destroy(ctx_fd: u32, ctx: &SyscallCtx<'_>) -> SyscallResult
     // `Cap<OpenFile>` retires through EBR; the cap clone we hold
     // above (`aio_cap`) keeps the AioContext payload alive for the
     // duration of this syscall, then drops as we return.
-    let _previous = ctx.process.close_fd(ctx_fd);
+    let _previous = ctx.process.set_fd(ctx_fd, None);
+    ctx.process.set_fd_cloexec(ctx_fd, false);
 
     SyscallResult::Return(0)
 }

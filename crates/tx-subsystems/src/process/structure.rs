@@ -471,19 +471,6 @@ impl ProcessIdentity {
         self.payload.lock().as_ref().and_then(|p| p.fd(idx))
     }
 
-    /// Snapshot the full fd table for procfs/tool projections.
-    ///
-    /// Returns an empty map for zombies. The returned `OpenFile` caps are
-    /// cloned out of the payload lock, so callers can inspect them without
-    /// borrowing process state.
-    pub fn open_fds(&self) -> BTreeMap<u32, Cap<crate::vfs::OpenFile>> {
-        self.payload
-            .lock()
-            .as_ref()
-            .map(|p| p.open_fds())
-            .unwrap_or_default()
-    }
-
     /// Snapshot the current working-directory `Cap<DEntry>` if one is
     /// installed on the payload. Returns `None` for zombies or
     /// processes whose cwd has never been bound (init pre-rootfs).
@@ -515,15 +502,6 @@ impl ProcessIdentity {
             .lock()
             .as_ref()
             .and_then(|p| p.set_fd(idx, file))
-    }
-
-    /// Close fd `idx`, returning the detached `OpenFile` when the fd
-    /// existed. Unlike the low-level [`Self::set_fd`] remove form,
-    /// this also clears the matching close-on-exec bit after a
-    /// successful close. Missing fds leave CLOEXEC state untouched so
-    /// callers can preserve Linux's `close(2) -> EBADF` behavior.
-    pub fn close_fd(&self, idx: u32) -> Option<Cap<crate::vfs::OpenFile>> {
-        self.payload.lock().as_ref().and_then(|p| p.close_fd(idx))
     }
 
     /// Allocate the lowest unused fd ≥ 0 without installing anything.
@@ -1398,20 +1376,6 @@ impl ProcessPayload {
         drop(slot);
         if let Some(file) = &previous {
             decr_pipe_fd_ref(file);
-        }
-        previous
-    }
-
-    /// Close fd `idx` and clear its CLOEXEC bit only when an fd was
-    /// actually present. This is the semantic close path used by
-    /// `close(2)` and exec's CLOEXEC sweep; `set_fd(idx, None)`
-    /// remains a lower-level table mutation for tests and replacement
-    /// operations.
-    pub fn close_fd(&self, idx: u32) -> Option<Cap<OpenFile>> {
-        let previous = self.fds.lock().remove(&idx);
-        if let Some(file) = &previous {
-            decr_pipe_fd_ref(file);
-            self.fd_cloexec.lock().remove(&idx);
         }
         previous
     }

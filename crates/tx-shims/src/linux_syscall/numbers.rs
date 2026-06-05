@@ -971,6 +971,28 @@ pub const TIOCSWINSZ: u32 = 0x5414;
 /// `TIOCNOTTY = 0x5422` — detach this TTY as the calling session's
 /// controlling terminal.
 pub const TIOCNOTTY: u32 = 0x5422;
+/// `SIOCGIFNAME = 0x8910` — resolve `struct ifreq.ifr_ifindex` to ifname.
+pub const SIOCGIFNAME: u32 = 0x8910;
+/// `SIOCGIFCONF = 0x8912` — enumerate interface `struct ifreq` entries.
+pub const SIOCGIFCONF: u32 = 0x8912;
+/// `SIOCGIFFLAGS = 0x8913` — read `struct ifreq.ifr_flags`.
+pub const SIOCGIFFLAGS: u32 = 0x8913;
+/// `SIOCSIFFLAGS = 0x8914` — write `struct ifreq.ifr_flags`.
+pub const SIOCSIFFLAGS: u32 = 0x8914;
+/// `SIOCGIFMTU = 0x8921` — read `struct ifreq.ifr_mtu`.
+pub const SIOCGIFMTU: u32 = 0x8921;
+/// `SIOCSIFMTU = 0x8922` — write `struct ifreq.ifr_mtu`.
+pub const SIOCSIFMTU: u32 = 0x8922;
+/// `SIOCGIFHWADDR = 0x8927` — read `struct ifreq.ifr_hwaddr`.
+pub const SIOCGIFHWADDR: u32 = 0x8927;
+/// `SIOCGIFINDEX = 0x8933` — resolve `struct ifreq.ifr_name` to ifindex.
+pub const SIOCGIFINDEX: u32 = 0x8933;
+/// `SIOCGIFTXQLEN = 0x8942` — query `struct ifreq.ifr_qlen`.
+pub const SIOCGIFTXQLEN: u32 = 0x8942;
+/// `SIOCDARP = 0x8953` — delete an IPv4 ARP cache entry via `struct arpreq`.
+pub const SIOCDARP: u32 = 0x8953;
+/// `SIOCSARP = 0x8955` — install an IPv4 ARP cache entry via `struct arpreq`.
+pub const SIOCSARP: u32 = 0x8955;
 
 // ---------------------------------------------------------------------
 // Slice 6 of the shell-prompt roadmap — stat family syscalls.
@@ -1174,8 +1196,7 @@ pub const NR_RT_SIGTIMEDWAIT: u64 = 137;
 /// Phase J: returns `-ENOSYS`; TODO full implementation.
 pub const NR_PIDFD_OPEN: u64 = 434;
 /// `pidfd_send_signal(pidfd, sig, info, flags)` — Linux RV64.
-/// Sends a signal through a pidfd-backed open file; `sig == 0` is an
-/// existence probe.
+/// Phase J: returns `-ENOSYS`; TODO full implementation.
 pub const NR_PIDFD_SEND_SIGNAL: u64 = 424;
 /// `uname(buf)`. Linux RV64 generic ABI `__NR_uname = 160`. Writes
 /// the static utsname (`sysname` / `nodename` / `release` / `version`

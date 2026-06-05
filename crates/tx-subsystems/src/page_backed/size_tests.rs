@@ -5,7 +5,6 @@ use crate::vfs::{FsObjectId, InodeKind, InodeMeta, OpenFile, OpenFileFlags, RNod
 
 fn setup_host_substrate() {
     tx_test_support::init_host();
-    crate::zones::register_all().expect("kernel zones");
     match step_engine::page_allocator::claim_zero_frame() {
         Ok(_) | Err(step_engine::page_allocator::AllocError::AlreadyInstalled) => {}
         Err(error) => panic!("claim zero frame for PageBacked size tests: {error:?}"),
@@ -81,7 +80,6 @@ fn pagebacked_step_write_extends_visible_size_within_capacity() {
         2,
     );
     assert_eq!(step_truncate(&pc, 8, &guard), V3Out::Done(()));
-    let epoch_before_write = pc.content_epoch();
     let of = open_file_for_pc(&pc);
     of.set_offset((crate::vm::USER_PAGE_SIZE + 9) as u64);
 
@@ -89,7 +87,6 @@ fn pagebacked_step_write_extends_visible_size_within_capacity() {
 
     assert_eq!(of.offset(), (crate::vm::USER_PAGE_SIZE + 16) as u64);
     assert_eq!(pc.size_bytes(), (crate::vm::USER_PAGE_SIZE + 16) as u64);
-    assert!(pc.content_epoch() > epoch_before_write);
     assert!(pc.page_marks(PageIndex::new(1)).expect("page 1").dirty);
 }
 

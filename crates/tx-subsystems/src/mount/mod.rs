@@ -17,8 +17,7 @@ use crate::execution::KernelResult;
 use crate::page_backed::{FsPageBacking, PageContainer};
 use crate::vfs::{
     adapter::step_engine::{Guard, NoProgress, StepOutcome},
-    render_dentry_path, DEntry, FsObjectId, FsOps, InodeMeta, OpenFile, RNode, RNodeBacking,
-    StructPayload,
+    render_dentry_path, DEntry, FsObjectId, FsOps, InodeMeta, RNode,
 };
 
 static MOUNT_IDENTITY_ZONE: Zone<MountIdentity> = Zone::const_new();
@@ -426,15 +425,6 @@ impl MountNamespace {
             root: self.root.clone(),
             mounts: SpinMutex::new(cloned),
         })
-    }
-}
-
-pub fn mount_namespace_cap_from_file(file: &Cap<OpenFile>) -> Option<Cap<MountNamespace>> {
-    match file.rnode().backing() {
-        RNodeBacking::StructBacked {
-            payload: StructPayload::MountNamespace { payload },
-        } => Some(payload.clone()),
-        _ => None,
     }
 }
 

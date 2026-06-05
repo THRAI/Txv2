@@ -41,7 +41,7 @@ pub fn step_close_cloexec_fds(process: &Cap<ProcessIdentity>) {
         // Drop via the existing accessor; the previous `Cap` (if any)
         // is returned for EBR-deferred drop. We discard it here — the
         // slot is now empty, the fd is closed.
-        let _ = process.close_fd(fd);
+        let _ = process.set_fd(fd, None);
     }
     // Clear the set wholesale: every previously-marked fd is now
     // closed; future fcntl(F_SETFD) calls start from a clean state.

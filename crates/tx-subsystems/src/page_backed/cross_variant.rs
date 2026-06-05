@@ -213,7 +213,6 @@ fn publish_progress(out_pc: &PageContainer, out_offset: u64, advanced: usize) {
         return;
     }
     out_pc.grow_size_to(out_offset + advanced as u64);
-    out_pc.bump_content_epoch();
 }
 
 // ---------------------------------------------------------------------------

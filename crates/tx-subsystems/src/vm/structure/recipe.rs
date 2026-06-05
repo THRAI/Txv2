@@ -473,30 +473,6 @@ impl RecipeIndex {
         Ok(Self::finish_rewrite(result?))
     }
 
-    pub(in crate::vm) fn commit_many_require_free(
-        &self,
-        entries: impl IntoIterator<Item = VmEntry>,
-    ) -> Result<VmMapCommit, VmMapError> {
-        let _writer = self.mutation.lock();
-        // SAFETY: writer lock held, so under_writer_lock's borrow is sound.
-        let current = unsafe { self.under_writer_lock() };
-        let mut rewritten = RecipeTree::clone(current);
-        let mut changed_pages = 0;
-        let mut changed = false;
-
-        for entry in entries {
-            validate_insert_free(&rewritten, &entry)?;
-            changed_pages += entry.range.page_count();
-            push_entry(&mut rewritten, entry);
-            changed = true;
-        }
-
-        if changed {
-            self.publish(rewritten);
-        }
-        Ok(VmMapCommit { changed_pages })
-    }
-
     pub(in crate::vm) fn unmap(&self, range: UserRange) -> Result<VmMapCommit, VmMapError> {
         let result: Result<RecipeRewriteResult, VmMapError> = {
             let lock_start = recipe_phase_clock_now();

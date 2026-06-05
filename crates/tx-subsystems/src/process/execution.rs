@@ -1857,10 +1857,12 @@ impl StepOp<crate::process::ProcessIdentity> for CloseOp {
         &mut self,
         _ctx: &mut ScriptCtx<crate::process::ProcessIdentity>,
     ) -> StepOutcome<(), NoProgress> {
-        match self.process.close_fd(self.fd) {
-            Some(_) => StepOutcome::Done(()),
-            None => StepOutcome::Err(crate::process::adapter::step_engine::Errno::EBADF),
+        if self.process.fd(self.fd).is_none() {
+            return StepOutcome::Err(crate::process::adapter::step_engine::Errno::EBADF);
         }
+        let _prev = self.process.set_fd(self.fd, None);
+        self.process.set_fd_cloexec(self.fd, false);
+        StepOutcome::Done(())
     }
 }
 

@@ -192,51 +192,6 @@ fn process_payload_install_fd_returns_previous_occupant() {
     assert!(proc_cap.fd(5).is_some(), "fd 5 must remain installed");
 }
 
-/// Semantic close removes the fd and clears its CLOEXEC bit in one
-/// operation. `set_fd(fd, None)` intentionally remains a low-level
-/// table edit for replacement-style tests.
-#[test]
-fn process_payload_close_fd_removes_fd_and_cloexec_bit() {
-    let _g = setup();
-    let proc_cap = bootstrap();
-
-    proc_cap.set_fd(7, Some(fresh_open_file()));
-    proc_cap.set_fd_cloexec(7, true);
-    proc_cap.set_fd_cloexec(8, true);
-
-    let closed = proc_cap.close_fd(7);
-
-    assert!(closed.is_some(), "close_fd returns the detached file");
-    assert!(proc_cap.fd(7).is_none(), "fd 7 is closed");
-    assert!(
-        !proc_cap.fd_cloexec(7),
-        "successful close clears the matching CLOEXEC bit"
-    );
-    assert!(
-        proc_cap.fd_cloexec(8),
-        "unrelated CLOEXEC bits are untouched"
-    );
-}
-
-#[test]
-fn process_payload_close_fd_missing_preserves_cloexec_state() {
-    let _g = setup();
-    let proc_cap = bootstrap();
-
-    proc_cap.set_fd_cloexec(9, true);
-
-    let closed = proc_cap.close_fd(9);
-
-    assert!(
-        closed.is_none(),
-        "missing fd close reports no detached file"
-    );
-    assert!(
-        proc_cap.fd_cloexec(9),
-        "failed close preserves CLOEXEC state for EBADF semantics"
-    );
-}
-
 /// fd-ops Wave 1: `step_fork`'s fd-table clone walks the parent's
 /// `BTreeMap` entries (sparse fds included), not a 0..8 array index
 /// loop. The child sees every parent fd, including fds > 31.

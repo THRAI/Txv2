@@ -275,6 +275,9 @@ pub const EXECVE_VEC_MAX: usize = 256;
 /// syscall number not handled by Phase 2a / 2b.
 pub(super) const ENOSYS_VALUE: i32 = 38;
 pub(super) const ENODEV_VALUE: i32 = 19;
+/// Linux generic ABI errno value for "no such device or address" (`ENXIO`).
+/// Used by interface-index lookup helpers when an ifindex has no backing link.
+pub(super) const ENXIO_VALUE: i32 = 6;
 /// Linux generic ABI errno value for "bad file descriptor" (`EBADF`).
 pub(super) const EBADF_VALUE: i32 = 9;
 /// Linux generic ABI errno value for "too many open files" (`EMFILE`).
