@@ -448,13 +448,6 @@ impl PmapIf for Platform {
         pmap::shootdown_mappings(asid, invalidations);
     }
 
-    fn shootdown_mappings(asid: Asid, invalidations: &[PmapInvalidation]) {
-        pmap::shootdown_mappings(asid, invalidations);
-        for invalidation in invalidations {
-            remote_sfence_vma_asid(asid, *invalidation);
-        }
-    }
-
     /// Write `satp` to point at `root.phys()` with Sv39 mode bits and
     /// the root's ASID, then issue a local `sfence.vma`.
     ///

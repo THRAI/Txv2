@@ -462,11 +462,6 @@ fn free_asid(asid: Asid) {
     ALLOCATED_ASIDS[word_index].fetch_and(!(1u64 << bit_index), Ordering::AcqRel);
 }
 
-fn invalidate_destroyed_root() -> RootInvalidated {
-    sfence_vma_all();
-    RootInvalidated
-}
-
 fn free_asid_after_invalidation(asid: Asid, _invalidated: RootInvalidated) {
     crate::clear_asid_residency(asid);
     free_asid(asid);
@@ -529,10 +524,6 @@ fn invalidate_destroyed_root<State>(
     let _ = (bag, root_phys);
     sfence_vma_all();
     RootInvalidated
-}
-
-fn free_asid_after_invalidation(asid: Asid, _invalidated: RootInvalidated) {
-    free_asid(asid);
 }
 
 // Root-relative intermediate table management mirrors the kernel-bootstrap

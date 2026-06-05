@@ -41,6 +41,12 @@ pub fn register_all() -> Result<(), ZoneError> {
     epoll::register_zones()?;
     eventfd::register_zones()?;
     timerfd::register_zones()?;
+    // Network subsystem zones (net namespace identity/payload + socket
+    // identity/payload registries). Re-homed after PR#50 stripped the net
+    // stack: without this, `initial_net_namespace_payload_with_owner` (seeded
+    // into every ProcessPayload at bootstrap/fork) panics on an unregistered
+    // zone.
+    crate::net::register_zones()?;
     subject_placeholders::register_zones()?;
     Ok(())
 }

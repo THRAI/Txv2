@@ -780,6 +780,7 @@ fn exec_script_closes_cloexec_fds_keeps_others() {
                 append: false,
                 cloexec: false,
                 nonblocking: false,
+                packet: false,
             },
             0,
             &cred,

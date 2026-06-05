@@ -262,6 +262,7 @@ fn make_tmpfs_open_file(page_count: u64) -> Cap<OpenFile> {
             append: false,
             cloexec: false,
             nonblocking: false,
+            packet: false,
         },
     )
     .expect("open file cap")
@@ -299,6 +300,7 @@ fn seed_file_content(file: &Cap<OpenFile>, content: &[u8]) {
             append: false,
             cloexec: false,
             nonblocking: false,
+            packet: false,
         },
     )
     .expect("writer open file cap");
