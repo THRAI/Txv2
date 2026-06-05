@@ -126,7 +126,7 @@ where
         _fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::ENOSYS.into())
+        StepOutcome::done(())
     }
 
     // `fallocate` and `supports_reflink` inherit the trait defaults

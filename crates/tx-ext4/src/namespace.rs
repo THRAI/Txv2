@@ -42,6 +42,13 @@ fn ext4_file_type_to_kind(file_type: u8) -> InodeKind {
 
 use tx_subsystems::vfs::FsOps;
 
+/// Static writable capacity for ext4 regular-file PageContainers.
+///
+/// PageContainer currently has a fixed `page_count` capacity. Match tmpfs'
+/// day-1 growth window so newly-created ext4 files can grow through ordinary
+/// PageBacked writes instead of failing after one page.
+const EXT4_FILE_PAGE_CAP: u64 = 2048;
+
 /// Factory for `MountOutput::fs_ops`.
 ///
 /// Mirrors `Tmpfs::fs_ops_arc`.
@@ -368,13 +375,13 @@ where
         };
 
         const PAGE_SIZE: u64 = 4096;
-        // Always allocate at least one page so empty files have write capacity.
+        // Always allocate a writable growth window for regular files.
         // `PageContainer::new()` initialises `size_bytes` to `page_count *
         // PAGE_SIZE` (the physical capacity), not to the inode's logical size,
         // so we must call `set_size_bytes` afterwards.  Without this correction
         // O_APPEND writes compute `offset = size_bytes = PAGE_SIZE`, which
         // immediately exceeds `capacity = PAGE_SIZE`, yielding EINVAL.
-        let page_count = meta.size.div_ceil(PAGE_SIZE).max(1);
+        let page_count = meta.size.div_ceil(PAGE_SIZE).max(EXT4_FILE_PAGE_CAP);
         let pc = match PageContainer::new_cap(
             PageContainerKind::File {
                 mount: pin,
