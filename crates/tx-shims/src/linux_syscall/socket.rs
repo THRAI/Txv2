@@ -15,7 +15,7 @@ use tx_subsystems::net::{
     netlink_route_send_with_netns_resolvers, netlink_xfrm_recv, netlink_xfrm_send, require_net_raw,
     socket_open_file_from_identity, step_accept, step_bind, step_connect, step_listen,
     step_poll_ready, step_poll_wait_token, step_process_loopback_udp, step_recv_kernel_bytes,
-    step_send_sctp_message, step_send_sctp_seqpacket, step_send_to_kernel_bytes,
+    step_sctp_peeloff, step_send_sctp_message, step_send_sctp_seqpacket, step_send_to_kernel_bytes,
     step_send_to_unix_path_kernel_bytes, step_send_udp_loopback_kernel_bytes, step_shutdown,
     step_socket_close, step_socket_open_file_in_namespace, step_tcp_loopback_handshake,
     step_tcp_loopback_transfer, step_unix_socketpair_connect, AddressFamily, ConnectionKey,
@@ -3023,6 +3023,42 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
         (SOL_SCTP, SCTP_DEFAULT_SEND_PARAM) if socket.kind == SocketKind::Sctp => {
             let buf = payload.with_options(|o| o.sctp.default_send_param);
             write_sockopt_bytes(ctx, optval, optlen_ptr, &buf)
+        }
+        (SOL_SCTP, SCTP_SOCKOPT_PEELOFF) if socket.kind == SocketKind::Sctp => {
+            // sctp_peeloff_arg_t { sctp_assoc_t associd @0; int sd @4 } = 8 bytes.
+            // Peel the named association into a new 1-to-1 socket and return its
+            // file descriptor in `sd`.
+            let mut buf = [0u8; 8];
+            if bootstrap_copy_from_user(&ctx.aspace, &mut buf, optval).is_err() {
+                Err(Errno::EFAULT)
+            } else {
+                let assoc_id = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                let peeled = {
+                    let guard = tx_substrate::epoch::guard();
+                    step_sctp_peeloff(&socket, assoc_id, &guard)
+                };
+                match peeled {
+                    StepOutcome::Done(child) => {
+                        match socket_open_file_from_identity(
+                            child,
+                            SocketHandleFlags {
+                                nonblock: false,
+                                cloexec: false,
+                            },
+                        ) {
+                            Ok(opened) => {
+                                let new_fd = ctx.process.allocate_fd();
+                                let _ = ctx.process.set_fd(new_fd, Some(opened.file));
+                                buf[4..8].copy_from_slice(&(new_fd as i32).to_le_bytes());
+                                write_sockopt_bytes(ctx, optval, optlen_ptr, &buf)
+                            }
+                            Err(errno) => Err(errno),
+                        }
+                    }
+                    StepOutcome::Err(errno) => Err(errno),
+                    _ => Err(Errno::EIO),
+                }
+            }
         }
         (SOL_SCTP, SCTP_GET_LOCAL_ADDRS) if socket.kind == SocketKind::Sctp => {
             match socket_local_endpoint(&socket) {

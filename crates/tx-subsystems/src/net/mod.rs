@@ -46,7 +46,7 @@ pub use execution::{
     step_process_loopback_udp, step_process_network_events, step_process_network_events_at,
     step_process_network_events_in_namespace_at, step_process_network_tick,
     step_process_network_tick_in_namespace, step_process_network_tick_loopback,
-    step_process_network_tick_loopback_in_namespace, step_recv_kernel_bytes,
+    step_process_network_tick_loopback_in_namespace, step_recv_kernel_bytes, step_sctp_peeloff,
     step_send_kernel_bytes, step_send_sctp_message, step_send_sctp_seqpacket,
     step_send_to_kernel_bytes, step_send_to_kernel_bytes_with_poll_kick,
     step_send_to_unix_path_kernel_bytes, step_send_udp_loopback_kernel_bytes, step_shutdown,

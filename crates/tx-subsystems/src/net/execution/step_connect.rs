@@ -534,6 +534,48 @@ fn step_sctp_connect(
     StepOutcome::Done(())
 }
 
+/// SCTP_SOCKOPT_PEELOFF: split the 1-to-many association named by `assoc_id` off
+/// into a new 1-to-1 (TCP-style) socket, returning its identity for the caller
+/// to install as a file descriptor. The new socket is Connected to the peer and
+/// inherits the parent socket's options.
+pub fn step_sctp_peeloff(
+    socket: &Cap<SocketIdentity>,
+    assoc_id: u32,
+    _guard: &Guard<'_>,
+) -> StepOutcome<Cap<SocketIdentity>> {
+    let Some(payload) = socket.acquire_operational() else {
+        return StepOutcome::Err(Errno::ENOTCONN);
+    };
+    // Peel-off is a 1-to-many (SEQPACKET) operation; the assoc_id must name one
+    // of this socket's associations.
+    if !payload.with_options(|o| o.socket.sock_type == SocketType::SeqPacket) {
+        return StepOutcome::Err(Errno::EINVAL);
+    }
+    let Some(peer) = payload.sctp_peer_addr_by_assoc(assoc_id) else {
+        return StepOutcome::Err(Errno::EINVAL);
+    };
+    let local = match payload.protocol_snapshot() {
+        SocketProtocol::Sctp(TcpState::Bound { local })
+        | SocketProtocol::Sctp(TcpState::Listening { local, .. })
+        | SocketProtocol::Sctp(TcpState::Connecting { local, .. })
+        | SocketProtocol::Sctp(TcpState::Connected { local, .. }) => local,
+        _ => return StepOutcome::Err(Errno::EINVAL),
+    };
+    // The peeled-off socket is a 1-to-1 (TCP-style) socket, Connected to the
+    // association's peer.
+    let mut options = payload.with_options(Clone::clone);
+    options.socket.sock_type = SocketType::Stream;
+    match registry::create_connected_sctp_for_accept_in_namespace(
+        local,
+        peer,
+        options,
+        payload.net_namespace(),
+    ) {
+        Ok(child) => StepOutcome::Done(child),
+        Err(_) => StepOutcome::Err(Errno::ENOMEM),
+    }
+}
+
 fn sctp_listener_accepts_incoming(
     listener_payload: &SocketOperationalEvidence,
     listener_local: IpEndpoint,

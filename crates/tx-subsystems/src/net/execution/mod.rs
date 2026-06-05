@@ -30,7 +30,7 @@ mod step_udp_loopback;
 
 pub use step_accept::{step_accept, SocketAcceptOutcome};
 pub use step_bind::step_bind;
-pub use step_connect::step_connect;
+pub use step_connect::{step_connect, step_sctp_peeloff};
 pub use step_device_tx::{
     step_process_device_tx_pending, step_process_device_tx_pending_at,
     step_process_device_tx_pending_in_namespace_at, DeviceTxBudget, DeviceTxOutcome,
