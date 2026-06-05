@@ -19,7 +19,7 @@
 //!   reclaim-eligible per spec.
 
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -146,6 +146,42 @@ fn dir_entry_from_readdir_snapshot(
     let entry = DirEntry::new(snapshot.child_id, snapshot.kind, snapshot.name.as_bytes())
         .map_err(step_engine::Errno::from)?;
     Ok((entry, snapshot.next_cursor))
+}
+
+fn directory_subtree_contains(state: &TmpfsState, root: FsObjectId, needle: FsObjectId) -> bool {
+    let mut stack = alloc::vec![root];
+    let mut visited = BTreeSet::new();
+
+    while let Some(current) = stack.pop() {
+        if current == needle {
+            return true;
+        }
+        if !visited.insert(current) {
+            continue;
+        }
+        let Some(inode) = state.inodes.get(&current) else {
+            continue;
+        };
+        let TmpfsPayload::Directory(children) = &inode.payload else {
+            continue;
+        };
+        stack.extend(children.values().copied());
+    }
+
+    false
+}
+
+fn adjust_directory_nlink(state: &mut TmpfsState, dir: FsObjectId, delta: i32) {
+    let Some(inode) = state.inodes.get_mut(&dir) else {
+        return;
+    };
+    debug_assert!(matches!(inode.payload, TmpfsPayload::Directory(_)));
+    if delta >= 0 {
+        inode.nlink = inode.nlink.saturating_add(delta as u32);
+    } else {
+        inode.nlink = inode.nlink.saturating_sub(delta.unsigned_abs());
+    }
+    inode.meta.nlinks = inode.nlink;
 }
 
 /// In-memory tmpfs backend.
@@ -348,6 +384,19 @@ impl FsOps for Tmpfs {
         }
         let mode = (mode & !S_IFMT) | S_IFREG;
 
+        {
+            let state = self.state.lock();
+            let Some(parent_inode) = state.inodes.get(&parent) else {
+                return StepOutcome::err(step_engine::Errno::ENOENT);
+            };
+            let TmpfsPayload::Directory(children) = &parent_inode.payload else {
+                return StepOutcome::err(step_engine::Errno::ENOTDIR);
+            };
+            if children.contains_key(&inline) {
+                return StepOutcome::err(step_engine::Errno::EEXIST);
+            }
+        }
+
         let container = match PageContainer::new_cap(
             PageContainerKind::Anon {
                 swap_policy: AnonSwapPolicy::Reclaimable,
@@ -370,7 +419,6 @@ impl FsOps for Tmpfs {
         // the actual content.
         container.set_size_bytes(0);
 
-        let new_id = self.alloc_object_id();
         let mut meta = InodeMeta::new(InodeKind::Regular, mode);
         meta.uid = cred.uid;
         meta.gid = cred.gid;
@@ -386,6 +434,7 @@ impl FsOps for Tmpfs {
         if children.contains_key(&inline) {
             return StepOutcome::err(step_engine::Errno::EEXIST);
         }
+        let new_id = self.alloc_object_id();
         children.insert(inline, new_id);
 
         state.inodes.insert(
@@ -428,11 +477,13 @@ impl FsOps for Tmpfs {
         if found_id != target {
             return StepOutcome::err(step_engine::Errno::ENOENT);
         }
-        // Reject directory targets — those go through `rmdir`.
-        if let Some(target_inode) = state.inodes.get(&found_id) {
-            if matches!(target_inode.payload, TmpfsPayload::Directory(_)) {
-                return StepOutcome::err(step_engine::Errno::EISDIR);
-            }
+        // Reject missing/stale targets and directory targets before
+        // mutating the namespace. Directories must go through `rmdir`.
+        let Some(target_inode) = state.inodes.get(&found_id) else {
+            return StepOutcome::err(step_engine::Errno::ENOENT);
+        };
+        if matches!(target_inode.payload, TmpfsPayload::Directory(_)) {
+            return StepOutcome::err(step_engine::Errno::EISDIR);
         }
         // Remove the directory entry.
         let parent_inode = state
@@ -460,12 +511,6 @@ impl FsOps for Tmpfs {
         new_name: &[u8],
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        // TODO(phase-vfs-rename-xdir): cross-directory rename. Day-1
-        // ships same-directory rename; cross-directory needs the
-        // walker + dentry rebinding seam to land first.
-        if old_parent != new_parent {
-            return StepOutcome::err(step_engine::Errno::ENOSYS);
-        }
         let old_key = match InlineName::new(old_name) {
             Ok(n) => n,
             Err(err) => return StepOutcome::err(err.into()),
@@ -474,12 +519,12 @@ impl FsOps for Tmpfs {
             Ok(n) => n,
             Err(err) => return StepOutcome::err(err.into()),
         };
-        if old_key == new_key {
+        if old_parent == new_parent && old_key == new_key {
             return StepOutcome::done(());
         }
 
         let mut state = self.state.lock();
-        let (target_id, displaced_id) = {
+        let (target_id, target_is_dir, displaced_id, displaced_is_dir) = {
             let Some(parent_inode) = state.inodes.get(&old_parent) else {
                 return StepOutcome::err(step_engine::Errno::ENOENT);
             };
@@ -489,20 +534,33 @@ impl FsOps for Tmpfs {
             let Some(target_id) = children.get(&old_key).copied() else {
                 return StepOutcome::err(step_engine::Errno::ENOENT);
             };
-            let displaced_id = children.get(&new_key).copied();
+            let Some(target_inode) = state.inodes.get(&target_id) else {
+                return StepOutcome::err(step_engine::Errno::ENOENT);
+            };
+            let target_is_dir = matches!(target_inode.payload, TmpfsPayload::Directory(_));
+            if old_parent != new_parent
+                && target_is_dir
+                && directory_subtree_contains(&state, target_id, new_parent)
+            {
+                return StepOutcome::err(step_engine::Errno::EINVAL);
+            }
+
+            let Some(new_parent_inode) = state.inodes.get(&new_parent) else {
+                return StepOutcome::err(step_engine::Errno::ENOENT);
+            };
+            let TmpfsPayload::Directory(new_children) = &new_parent_inode.payload else {
+                return StepOutcome::err(step_engine::Errno::ENOTDIR);
+            };
+            let displaced_id = new_children.get(&new_key).copied();
             if displaced_id == Some(target_id) {
                 return StepOutcome::done(());
             }
+            let mut displaced_is_dir = false;
             if let Some(displaced_id) = displaced_id {
-                let Some(target_inode) = state.inodes.get(&target_id) else {
-                    return StepOutcome::err(step_engine::Errno::ENOENT);
-                };
                 let Some(displaced_inode) = state.inodes.get(&displaced_id) else {
                     return StepOutcome::err(step_engine::Errno::ENOENT);
                 };
-                let target_is_dir = matches!(target_inode.payload, TmpfsPayload::Directory(_));
-                let displaced_is_dir =
-                    matches!(displaced_inode.payload, TmpfsPayload::Directory(_));
+                displaced_is_dir = matches!(displaced_inode.payload, TmpfsPayload::Directory(_));
                 if !target_is_dir && displaced_is_dir {
                     return StepOutcome::err(step_engine::Errno::EISDIR);
                 }
@@ -517,28 +575,47 @@ impl FsOps for Tmpfs {
                     }
                 }
             }
-            (target_id, displaced_id)
+            (target_id, target_is_dir, displaced_id, displaced_is_dir)
         };
-        let Some(parent_inode) = state.inodes.get_mut(&old_parent) else {
-            return StepOutcome::err(step_engine::Errno::ENOENT);
-        };
-        let TmpfsPayload::Directory(children) = &mut parent_inode.payload else {
-            return StepOutcome::err(step_engine::Errno::ENOTDIR);
-        };
-        children.remove(&old_key);
+        {
+            let Some(parent_inode) = state.inodes.get_mut(&old_parent) else {
+                return StepOutcome::err(step_engine::Errno::ENOENT);
+            };
+            let TmpfsPayload::Directory(children) = &mut parent_inode.payload else {
+                return StepOutcome::err(step_engine::Errno::ENOTDIR);
+            };
+            let removed = children.remove(&old_key);
+            debug_assert_eq!(removed, Some(target_id));
+        }
         // If a same-type object exists at the destination, replace it
         // with POSIX-shaped rename semantics. Cross-type collisions
         // were rejected in the read-only validation phase above.
-        let displaced = children.insert(new_key, target_id);
+        let displaced = {
+            let Some(new_parent_inode) = state.inodes.get_mut(&new_parent) else {
+                return StepOutcome::err(step_engine::Errno::ENOENT);
+            };
+            let TmpfsPayload::Directory(children) = &mut new_parent_inode.payload else {
+                return StepOutcome::err(step_engine::Errno::ENOTDIR);
+            };
+            children.insert(new_key, target_id)
+        };
         debug_assert_eq!(displaced, displaced_id);
+        if target_is_dir && old_parent != new_parent {
+            adjust_directory_nlink(&mut state, old_parent, -1);
+            adjust_directory_nlink(&mut state, new_parent, 1);
+        }
+        if displaced_is_dir {
+            adjust_directory_nlink(&mut state, new_parent, -1);
+        }
         if let Some(displaced_id) = displaced {
-            if let Some(displaced_inode) = state.inodes.get_mut(&displaced_id) {
-                if displaced_inode.nlink > 1 {
-                    displaced_inode.nlink -= 1;
-                    displaced_inode.meta.nlinks = displaced_inode.nlink;
-                } else {
-                    state.inodes.remove(&displaced_id);
+            if displaced_is_dir {
+                if let Some(displaced_inode) = state.inodes.get_mut(&displaced_id) {
+                    displaced_inode.nlink = 0;
+                    displaced_inode.meta.nlinks = 0;
                 }
+            } else if let Some(displaced_inode) = state.inodes.get_mut(&displaced_id) {
+                displaced_inode.nlink = displaced_inode.nlink.saturating_sub(1);
+                displaced_inode.meta.nlinks = displaced_inode.nlink;
             }
         }
         StepOutcome::done(())
@@ -560,10 +637,12 @@ impl FsOps for Tmpfs {
         // Phase 1: immutable checks — parent exists, is a directory,
         // name is free.
         {
-            let parent_inode = match state.inodes.get(&parent) {
-                Some(i) if matches!(i.payload, TmpfsPayload::Directory(_)) => i,
-                _ => return StepOutcome::err(step_engine::Errno::ENOTDIR),
+            let Some(parent_inode) = state.inodes.get(&parent) else {
+                return StepOutcome::err(step_engine::Errno::ENOENT);
             };
+            if !matches!(parent_inode.payload, TmpfsPayload::Directory(_)) {
+                return StepOutcome::err(step_engine::Errno::ENOTDIR);
+            }
             if let TmpfsPayload::Directory(ref children) = parent_inode.payload {
                 if children.contains_key(&iname) {
                     return StepOutcome::err(step_engine::Errno::EEXIST);
@@ -613,10 +692,10 @@ impl FsOps for Tmpfs {
             Err(err) => return StepOutcome::err(err.into()),
         };
         let mode = (mode & !S_IFMT) | S_IFDIR;
-        let new_id = self.alloc_object_id();
         let mut meta = InodeMeta::new(InodeKind::Directory, mode);
         meta.uid = cred.uid;
         meta.gid = cred.gid;
+        meta.nlinks = 2;
 
         let mut state = self.state.lock();
         let Some(parent_inode) = state.inodes.get_mut(&parent) else {
@@ -628,7 +707,10 @@ impl FsOps for Tmpfs {
         if children.contains_key(&inline) {
             return StepOutcome::err(step_engine::Errno::EEXIST);
         }
+        let new_id = self.alloc_object_id();
         children.insert(inline, new_id);
+        parent_inode.nlink = parent_inode.nlink.saturating_add(1);
+        parent_inode.meta.nlinks = parent_inode.nlink;
 
         state.inodes.insert(
             new_id,
@@ -658,14 +740,30 @@ impl FsOps for Tmpfs {
             Err(err) => return StepOutcome::err(err.into()),
         };
         let mut state = self.state.lock();
-        let Some(target_inode) = state.inodes.get(&target) else {
-            return StepOutcome::err(step_engine::Errno::ENOENT);
-        };
-        let TmpfsPayload::Directory(target_children) = &target_inode.payload else {
-            return StepOutcome::err(step_engine::Errno::ENOTDIR);
-        };
-        if !target_children.is_empty() {
-            return StepOutcome::err(step_engine::Errno::ENOTEMPTY);
+        {
+            let Some(parent_inode) = state.inodes.get(&parent) else {
+                return StepOutcome::err(step_engine::Errno::ENOENT);
+            };
+            let TmpfsPayload::Directory(children) = &parent_inode.payload else {
+                return StepOutcome::err(step_engine::Errno::ENOTDIR);
+            };
+            let Some(found_id) = children.get(&inline).copied() else {
+                return StepOutcome::err(step_engine::Errno::ENOENT);
+            };
+            if found_id != target {
+                return StepOutcome::err(step_engine::Errno::ENOENT);
+            }
+        }
+        {
+            let Some(target_inode) = state.inodes.get(&target) else {
+                return StepOutcome::err(step_engine::Errno::ENOENT);
+            };
+            let TmpfsPayload::Directory(target_children) = &target_inode.payload else {
+                return StepOutcome::err(step_engine::Errno::ENOTDIR);
+            };
+            if !target_children.is_empty() {
+                return StepOutcome::err(step_engine::Errno::ENOTEMPTY);
+            }
         }
 
         let Some(parent_inode) = state.inodes.get_mut(&parent) else {
@@ -674,14 +772,14 @@ impl FsOps for Tmpfs {
         let TmpfsPayload::Directory(children) = &mut parent_inode.payload else {
             return StepOutcome::err(step_engine::Errno::ENOTDIR);
         };
-        let Some(found_id) = children.get(&inline).copied() else {
-            return StepOutcome::err(step_engine::Errno::ENOENT);
-        };
-        if found_id != target {
-            return StepOutcome::err(step_engine::Errno::ENOENT);
+        let removed = children.remove(&inline);
+        debug_assert_eq!(removed, Some(target));
+        parent_inode.nlink = parent_inode.nlink.saturating_sub(1);
+        parent_inode.meta.nlinks = parent_inode.nlink;
+        if let Some(target_inode) = state.inodes.get_mut(&target) {
+            target_inode.nlink = 0;
+            target_inode.meta.nlinks = 0;
         }
-        children.remove(&inline);
-        state.inodes.remove(&found_id);
         StepOutcome::done(())
     }
 
@@ -704,7 +802,20 @@ impl FsOps for Tmpfs {
             Ok(n) => n,
             Err(err) => return StepOutcome::err(err.into()),
         };
-        let new_id = self.alloc_object_id();
+
+        {
+            let state = self.state.lock();
+            let Some(parent_inode) = state.inodes.get(&parent) else {
+                return StepOutcome::err(step_engine::Errno::ENOENT);
+            };
+            let TmpfsPayload::Directory(children) = &parent_inode.payload else {
+                return StepOutcome::err(step_engine::Errno::ENOTDIR);
+            };
+            if children.contains_key(&inline) {
+                return StepOutcome::err(step_engine::Errno::EEXIST);
+            }
+        }
+
         let mut meta = InodeMeta::new(InodeKind::Symlink, S_IFLNK | 0o777);
         meta.uid = cred.uid;
         meta.gid = cred.gid;
@@ -721,6 +832,7 @@ impl FsOps for Tmpfs {
         if children.contains_key(&inline) {
             return StepOutcome::err(step_engine::Errno::EEXIST);
         }
+        let new_id = self.alloc_object_id();
         children.insert(inline, new_id);
 
         state.inodes.insert(
@@ -753,17 +865,12 @@ impl FsOps for Tmpfs {
             let Some((name, child_id)) = children.iter().nth(index) else {
                 return StepOutcome::done(None);
             };
-            // Resolve child kind for the DirEntry by peeking the child
-            // inode's meta. Falls back to Regular if the child is missing
-            // (a state inconsistency we shouldn't observe in practice).
-            let kind = state
-                .inodes
-                .get(child_id)
-                .map(|child| child.meta.kind())
-                .unwrap_or(InodeKind::Regular);
+            let Some(child_inode) = state.inodes.get(child_id) else {
+                return StepOutcome::err(step_engine::Errno::ENOENT);
+            };
             ReaddirEntrySnapshot {
                 child_id: *child_id,
-                kind,
+                kind: child_inode.meta.kind(),
                 name: *name,
                 next_cursor: DirCursor::from_u64(cursor.as_u64() + 1),
             }
@@ -791,6 +898,12 @@ impl FsOps for Tmpfs {
         // as a successful no-op so the upper layer can drop without
         // observing an error.
         let mut state = self.state.lock();
+        let Some(inode) = state.inodes.get(&fs_object_id) else {
+            return StepOutcome::done(());
+        };
+        if inode.nlink > 0 {
+            return StepOutcome::done(());
+        }
         state.inodes.remove(&fs_object_id);
         StepOutcome::done(())
     }
@@ -854,30 +967,34 @@ impl FsOps for Tmpfs {
     fn materialise_rnode(
         &self,
         fs_object_id: FsObjectId,
-        meta: InodeMeta,
+        _meta: InodeMeta,
         mount: &Cap<MountPayload>,
         _guard: &Guard<'_>,
     ) -> StepOutcome<Cap<RNode>, NoProgress> {
-        let state = self.state.lock();
-        let Some(inode) = state.inodes.get(&fs_object_id) else {
-            return StepOutcome::err(step_engine::Errno::ENOENT);
-        };
-        let backing = match &inode.payload {
-            TmpfsPayload::RegularFile { container, .. } => RNodeBacking::PageBacked {
-                pc: container.clone(),
-            },
-            // The walker handles Directory and Symlink inline; this
-            // arm should not be reached for those kinds. Return a
-            // POSIX-shaped errno rather than panicking so a backend
-            // misroute surfaces as a recoverable error.
-            TmpfsPayload::Directory(_) => {
-                return StepOutcome::err(step_engine::Errno::EISDIR);
+        let (container, mut meta, nlink) = {
+            let state = self.state.lock();
+            let Some(inode) = state.inodes.get(&fs_object_id) else {
+                return StepOutcome::err(step_engine::Errno::ENOENT);
+            };
+            match &inode.payload {
+                TmpfsPayload::RegularFile { container, .. } => {
+                    (container.clone(), inode.meta, inode.nlink)
+                }
+                // The walker handles Directory and Symlink inline; this
+                // arm should not be reached for those kinds. Return a
+                // POSIX-shaped errno rather than panicking so a backend
+                // misroute surfaces as a recoverable error.
+                TmpfsPayload::Directory(_) => {
+                    return StepOutcome::err(step_engine::Errno::EISDIR);
+                }
+                TmpfsPayload::Symlink(_) => {
+                    return StepOutcome::err(step_engine::Errno::EINVAL);
+                }
             }
-            TmpfsPayload::Symlink(_) => {
-                return StepOutcome::err(step_engine::Errno::EINVAL);
-            }
         };
-        drop(state);
+        meta.nlinks = nlink;
+        meta.size = container.size_bytes();
+        let backing = RNodeBacking::PageBacked { pc: container };
 
         match RNode::new_cap_in_mount(fs_object_id, meta, backing, mount) {
             Ok(rnode) => StepOutcome::done(rnode),
