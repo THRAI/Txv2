@@ -30,7 +30,9 @@ use tx_hal::{PhysAddr, PhysRange, PmapError, PmapPermissions};
 use crate::boot_static::{BootStaticBag, PageTable};
 
 #[cfg(target_arch = "riscv64")]
-use super::topology::{direct_map_virt, DIRECT_MAP_BASE, DIRECT_MAP_SIZE, PAGE_SIZE, QEMU_RAM_BASE};
+use super::topology::{
+    direct_map_virt, DIRECT_MAP_BASE, DIRECT_MAP_SIZE, PAGE_SIZE, QEMU_RAM_BASE,
+};
 
 pub(crate) const PTE_V: u64 = 1 << 0;
 pub(crate) const PTE_R: u64 = 1 << 1;
@@ -167,7 +169,9 @@ fn debug_page_table_phys(phys: PhysAddr) {
     unsafe {
         core::arch::asm!("mv {ra}, ra", ra = out(reg) caller_ra, options(nomem, nostack));
     }
-    crate::trap::console_write_literal(b"txkernel:qemu-riscv64-virt:pmap:bad-page-table-phys:phys=0x");
+    crate::trap::console_write_literal(
+        b"txkernel:qemu-riscv64-virt:pmap:bad-page-table-phys:phys=0x",
+    );
     crate::trap::console_write_hex(phys.0);
     crate::trap::console_write_literal(b":caller_ra=0x");
     crate::trap::console_write_hex(caller_ra);

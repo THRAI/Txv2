@@ -51,7 +51,11 @@ use super::{
     validate_user_mapping_virt,
 };
 
-static ALLOCATED_ASIDS: AtomicU64 = AtomicU64::new(1);
+const ASID_BITMAP_WORDS: usize = 16;
+pub(crate) const ASID_CAPACITY: usize = ASID_BITMAP_WORDS * u64::BITS as usize;
+
+static ALLOCATED_ASIDS: [AtomicU64; ASID_BITMAP_WORDS] =
+    [const { AtomicU64::new(0) }; ASID_BITMAP_WORDS];
 
 /// Root-relative ensured table plus the fresh PT-node that backs it.
 ///
@@ -414,37 +418,48 @@ pub(crate) fn shootdown_mappings(asid: Asid, invalidations: &[PmapInvalidation])
 }
 
 fn alloc_asid() -> Result<Asid, PmapError> {
-    loop {
-        let allocated = ALLOCATED_ASIDS.load(Ordering::Acquire);
-        for asid in 1..u64::BITS {
-            let bit = 1u64 << asid;
-            if allocated & bit != 0 {
-                continue;
+    for word_index in 0..ASID_BITMAP_WORDS {
+        loop {
+            let allocated = ALLOCATED_ASIDS[word_index].load(Ordering::Acquire);
+            let reserved = if word_index == 0 { 1 } else { 0 };
+            if allocated | reserved == u64::MAX {
+                break;
             }
-            if ALLOCATED_ASIDS
-                .compare_exchange(
-                    allocated,
-                    allocated | bit,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-            {
-                return Ok(Asid(asid as u16));
+            for bit_index in 0..u64::BITS as usize {
+                let asid = word_index * u64::BITS as usize + bit_index;
+                if asid == 0 || asid >= ASID_CAPACITY {
+                    continue;
+                }
+                let bit = 1u64 << bit_index;
+                if allocated & bit != 0 {
+                    continue;
+                }
+                if ALLOCATED_ASIDS[word_index]
+                    .compare_exchange(
+                        allocated,
+                        allocated | bit,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    return Ok(Asid(asid as u16));
+                }
+                break;
             }
-            break;
-        }
-        if allocated == u64::MAX {
-            return Err(PmapError::Exhausted);
         }
     }
+    Err(PmapError::Exhausted)
 }
 
 fn free_asid(asid: Asid) {
-    if asid.0 == 0 || asid.0 as u32 >= u64::BITS {
+    let asid = asid.0 as usize;
+    if asid == 0 || asid >= ASID_CAPACITY {
         return;
     }
-    ALLOCATED_ASIDS.fetch_and(!(1u64 << asid.0), Ordering::AcqRel);
+    let word_index = asid / u64::BITS as usize;
+    let bit_index = asid % u64::BITS as usize;
+    ALLOCATED_ASIDS[word_index].fetch_and(!(1u64 << bit_index), Ordering::AcqRel);
 }
 
 fn invalidate_destroyed_root() -> RootInvalidated {
@@ -597,5 +612,7 @@ fn release_page_table_tree_from_bag<State>(bag: &BootStaticBag<State>, phys: Phy
 
 #[cfg(test)]
 pub(super) fn reset_asids_for_test() {
-    ALLOCATED_ASIDS.store(1, Ordering::Release);
+    for word in &ALLOCATED_ASIDS {
+        word.store(0, Ordering::Release);
+    }
 }

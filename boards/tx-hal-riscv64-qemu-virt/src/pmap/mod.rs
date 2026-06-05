@@ -47,7 +47,7 @@ pub(crate) mod topology;
 
 pub(crate) use address_space::{
     commit_mapping, create_pmap_root, destroy_pmap_root, protect_mapping, reserve_mapping,
-    rollback_mapping, shootdown_mapping, shootdown_mappings, unmap_mapping,
+    rollback_mapping, shootdown_mapping, shootdown_mappings, unmap_mapping, ASID_CAPACITY,
 };
 pub(crate) use kernel_space::{
     bootstrap_pmap_info, commit_kernel_direct_map_1g, commit_kernel_mapping, extend_direct_map,

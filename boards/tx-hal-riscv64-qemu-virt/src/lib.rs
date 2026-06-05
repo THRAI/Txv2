@@ -73,7 +73,8 @@ const PLIC_CONTEXT_STRIDE: usize = 0x1000;
 const PLIC_CLAIM_COMPLETE: usize = 0x4;
 static ONLINE_CPUS: AtomicU64 = AtomicU64::new(0);
 static IPI_ACKED_CPUS: AtomicU64 = AtomicU64::new(0);
-static ASID_RESIDENCY: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
+static ASID_RESIDENCY: [AtomicU64; pmap::ASID_CAPACITY] =
+    [const { AtomicU64::new(0) }; pmap::ASID_CAPACITY];
 static FALLBACK_IRQ_DEPTH: AtomicUsize = AtomicUsize::new(0);
 static INSTALLED_IRQ_TABLE: AtomicPtr<IrqDispatchTable> = AtomicPtr::new(core::ptr::null_mut());
 

@@ -41,22 +41,32 @@ use crate::boot_static::{BootStaticBag, IdentityDropped};
 
 use super::{pool_index, pt_node_zero_ptr, zero_page, PT_NODE_POOL_ENTRIES};
 
-const COMMITTED_PT_NODE_REGISTRY_ENTRIES: usize = 256;
+const COMMITTED_PT_NODE_REGISTRY_ENTRIES: usize = 8192;
 
 static PT_NODE_ALLOCATED: AtomicUsize = AtomicUsize::new(0);
 static INSTALLED_PT_NODE_ALLOCATOR: AtomicUsize = AtomicUsize::new(0);
 static COMMITTED_PT_NODE_REGISTRY_LOCK: AtomicBool = AtomicBool::new(false);
-static COMMITTED_PT_NODES: CommittedPtNodeRegistry =
-    CommittedPtNodeRegistry(UnsafeCell::new([None; COMMITTED_PT_NODE_REGISTRY_ENTRIES]));
+static COMMITTED_PT_NODES: CommittedPtNodeRegistry = CommittedPtNodeRegistry(UnsafeCell::new(
+    [CommittedPtNodeEntry::Empty; COMMITTED_PT_NODE_REGISTRY_ENTRIES],
+));
 
 /// Fixed-size registry from committed branch-table physical pages to `PtNode`.
 ///
 /// Branch PTEs only store a physical address. This registry keeps the typed
 /// ownership token needed to release the page-table page when an unmap later
 /// prunes the branch.
-struct CommittedPtNodeRegistry(UnsafeCell<[Option<PtNode>; COMMITTED_PT_NODE_REGISTRY_ENTRIES]>);
+struct CommittedPtNodeRegistry(
+    UnsafeCell<[CommittedPtNodeEntry; COMMITTED_PT_NODE_REGISTRY_ENTRIES]>,
+);
 
 unsafe impl Sync for CommittedPtNodeRegistry {}
+
+#[derive(Clone, Copy)]
+enum CommittedPtNodeEntry {
+    Empty,
+    Tombstone,
+    Occupied(PtNode),
+}
 
 // Allocation starts with the installed typed allocator when available and falls
 // back to the static boot pool. The boot pool is a bitmap over linker-carved
@@ -169,18 +179,34 @@ fn lock_committed_pt_node_registry() -> RegistryGuard {
 pub(super) fn register_committed_pt_node(node: PtNode) {
     let _guard = lock_committed_pt_node_registry();
     let nodes = unsafe { &mut *COMMITTED_PT_NODES.0.get() };
-    for slot in nodes.iter_mut() {
-        if slot.is_some_and(|registered| registered.phys == node.phys) {
-            return;
+
+    let mut first_tombstone = None;
+    let start = committed_pt_node_slot_index(node.phys);
+    for offset in 0..COMMITTED_PT_NODE_REGISTRY_ENTRIES {
+        let index = (start + offset) % COMMITTED_PT_NODE_REGISTRY_ENTRIES;
+        match nodes[index] {
+            CommittedPtNodeEntry::Empty => {
+                let index = first_tombstone.unwrap_or(index);
+                nodes[index] = CommittedPtNodeEntry::Occupied(node);
+                return;
+            }
+            CommittedPtNodeEntry::Tombstone => {
+                first_tombstone.get_or_insert(index);
+            }
+            CommittedPtNodeEntry::Occupied(registered) if registered.phys == node.phys => {
+                return;
+            }
+            CommittedPtNodeEntry::Occupied(_) => {}
         }
     }
-    for slot in nodes.iter_mut() {
-        if slot.is_none() {
-            *slot = Some(node);
-            return;
-        }
+    if let Some(index) = first_tombstone {
+        nodes[index] = CommittedPtNodeEntry::Occupied(node);
+        return;
     }
-    panic!("committed PT-node registry exhausted");
+    panic!(
+        "committed PT-node registry exhausted: entries={}",
+        COMMITTED_PT_NODE_REGISTRY_ENTRIES
+    );
 }
 
 pub(super) fn register_committed_intermediates(intermediates: PmapReservationIntermediates) {
@@ -195,9 +221,17 @@ pub(super) fn register_committed_intermediates(intermediates: PmapReservationInt
 fn take_committed_pt_node(phys: PhysAddr) -> Option<PtNode> {
     let _guard = lock_committed_pt_node_registry();
     let nodes = unsafe { &mut *COMMITTED_PT_NODES.0.get() };
-    for slot in nodes.iter_mut() {
-        if slot.is_some_and(|registered| registered.phys == phys) {
-            return slot.take();
+    let start = committed_pt_node_slot_index(phys);
+    for offset in 0..COMMITTED_PT_NODE_REGISTRY_ENTRIES {
+        let index = (start + offset) % COMMITTED_PT_NODE_REGISTRY_ENTRIES;
+        match nodes[index] {
+            CommittedPtNodeEntry::Empty => return None,
+            CommittedPtNodeEntry::Tombstone => {}
+            CommittedPtNodeEntry::Occupied(registered) if registered.phys == phys => {
+                nodes[index] = CommittedPtNodeEntry::Tombstone;
+                return Some(registered);
+            }
+            CommittedPtNodeEntry::Occupied(_) => {}
         }
     }
     None
@@ -218,6 +252,11 @@ fn zero_pt_node<State>(bag: &BootStaticBag<State>, index: usize) {
     }
 }
 
+fn committed_pt_node_slot_index(phys: PhysAddr) -> usize {
+    let page = phys.0 >> 12;
+    page.wrapping_mul(0x9e37_79b9_7f4a_7c15usize) & (COMMITTED_PT_NODE_REGISTRY_ENTRIES - 1)
+}
+
 const fn pool_full_mask() -> usize {
     (1usize << PT_NODE_POOL_ENTRIES) - 1
 }
@@ -234,7 +273,7 @@ pub(super) fn install_pt_node_allocator_for_test(allocator: Option<PtNodeAllocat
 pub(super) fn reset_committed_pt_nodes_for_test() {
     let _guard = lock_committed_pt_node_registry();
     unsafe {
-        (*COMMITTED_PT_NODES.0.get()).fill(None);
+        (*COMMITTED_PT_NODES.0.get()).fill(CommittedPtNodeEntry::Empty);
     }
 }
 
