@@ -16,7 +16,7 @@ use tx_subsystems::page_backed::FsPageBacking;
 use tx_subsystems::pipe::{step_pipe2, PipeFlags};
 use tx_subsystems::process::step_chdir;
 use tx_subsystems::vfs::structure::{
-    Credential, DEntry, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking, S_IFDIR,
+    Credential, DEntry, FsObjectId, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking, S_IFDIR,
 };
 use tx_subsystems::vfs::FsOps;
 
@@ -140,22 +140,30 @@ fn root_cred() -> Credential {
 }
 
 fn create_regular(tmpfs: &Arc<Tmpfs>, name: &[u8]) {
+    create_regular_in(tmpfs, TMPFS_ROOT_OBJECT_ID, name);
+}
+
+fn create_regular_in(tmpfs: &Arc<Tmpfs>, parent: FsObjectId, name: &[u8]) {
     use step_engine::StepOutcome;
     let cred = root_cred();
     let guard = guard();
-    match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, name, 0o100644, &cred, &guard) {
+    match tmpfs.create_inode(parent, name, 0o100644, &cred, &guard) {
         StepOutcome::Done(_) => {}
-        other => panic!("create_inode {:?}: {other:?}", name),
+        other => panic!("create_inode {:?} in {parent:?}: {other:?}", name),
     }
 }
 
-fn make_dir(tmpfs: &Arc<Tmpfs>, name: &[u8]) {
+fn make_dir(tmpfs: &Arc<Tmpfs>, name: &[u8]) -> FsObjectId {
+    make_dir_in(tmpfs, TMPFS_ROOT_OBJECT_ID, name)
+}
+
+fn make_dir_in(tmpfs: &Arc<Tmpfs>, parent: FsObjectId, name: &[u8]) -> FsObjectId {
     use step_engine::StepOutcome;
     let cred = root_cred();
     let guard = guard();
-    match tmpfs.mkdir(TMPFS_ROOT_OBJECT_ID, name, 0o755, &cred, &guard) {
-        StepOutcome::Done(_) => {}
-        other => panic!("mkdir {:?}: {other:?}", name),
+    match tmpfs.mkdir(parent, name, 0o755, &cred, &guard) {
+        StepOutcome::Done((id, _)) => id,
+        other => panic!("mkdir {:?} in {parent:?}: {other:?}", name),
     }
 }
 
@@ -170,12 +178,13 @@ fn make_symlink(tmpfs: &Arc<Tmpfs>, name: &[u8], target: &[u8]) {
 }
 
 fn lookup_exists(tmpfs: &Arc<Tmpfs>, name: &[u8]) -> bool {
+    lookup_exists_in(tmpfs, TMPFS_ROOT_OBJECT_ID, name)
+}
+
+fn lookup_exists_in(tmpfs: &Arc<Tmpfs>, parent: FsObjectId, name: &[u8]) -> bool {
     use step_engine::StepOutcome;
     let guard = guard();
-    matches!(
-        tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, name, &guard),
-        StepOutcome::Done(_)
-    )
+    matches!(tmpfs.lookup(parent, name, &guard), StepOutcome::Done(_))
 }
 
 // -----------------------------------------------------------------
@@ -826,6 +835,126 @@ fn dispatch_renameat2_same_directory_succeeds() {
     assert_eq!(result, SyscallResult::Return(0));
     assert!(!lookup_exists(&tmpfs, b"a"), "/a should be gone");
     assert!(lookup_exists(&tmpfs, b"b"), "/b should exist");
+    drop(oldpath);
+    drop(newpath);
+}
+
+/// Cross-directory rename succeeds: `/old/a` becomes `/new/b`.
+#[test]
+fn dispatch_renameat2_cross_directory_succeeds() {
+    let _setup = fm_setup();
+    let (root_dentry, tmpfs) = build_tmpfs_root();
+    let old_dir_id = make_dir(&tmpfs, b"old");
+    let new_dir_id = make_dir(&tmpfs, b"new");
+    create_regular_in(&tmpfs, old_dir_id, b"a");
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let oldpath = nul_terminate(b"/old/a");
+    let newpath = nul_terminate(b"/new/b");
+    let req = SyscallRequest::new(
+        NR_RENAMEAT2,
+        [
+            AT_FDCWD as i64 as u64,
+            oldpath.as_ptr() as u64,
+            AT_FDCWD as i64 as u64,
+            newpath.as_ptr() as u64,
+            0,
+            0,
+        ],
+    );
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Return(0));
+    assert!(
+        !lookup_exists_in(&tmpfs, old_dir_id, b"a"),
+        "/old/a should be gone"
+    );
+    assert!(
+        lookup_exists_in(&tmpfs, new_dir_id, b"b"),
+        "/new/b should exist"
+    );
+    drop(oldpath);
+    drop(newpath);
+}
+
+/// Cross-directory directory rename moves the subtree.
+#[test]
+fn dispatch_renameat2_cross_directory_directory_succeeds() {
+    let _setup = fm_setup();
+    let (root_dentry, tmpfs) = build_tmpfs_root();
+    let old_dir_id = make_dir(&tmpfs, b"old");
+    let new_dir_id = make_dir(&tmpfs, b"new");
+    let source_dir_id = make_dir_in(&tmpfs, old_dir_id, b"dir");
+    create_regular_in(&tmpfs, source_dir_id, b"child");
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let oldpath = nul_terminate(b"/old/dir");
+    let newpath = nul_terminate(b"/new/moved");
+    let req = SyscallRequest::new(
+        NR_RENAMEAT2,
+        [
+            AT_FDCWD as i64 as u64,
+            oldpath.as_ptr() as u64,
+            AT_FDCWD as i64 as u64,
+            newpath.as_ptr() as u64,
+            0,
+            0,
+        ],
+    );
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Return(0));
+    assert!(
+        !lookup_exists_in(&tmpfs, old_dir_id, b"dir"),
+        "/old/dir should be gone"
+    );
+    assert!(
+        lookup_exists_in(&tmpfs, new_dir_id, b"moved"),
+        "/new/moved should exist"
+    );
+    assert!(
+        lookup_exists_in(&tmpfs, source_dir_id, b"child"),
+        "moved directory subtree should keep its child"
+    );
+    drop(oldpath);
+    drop(newpath);
+}
+
+/// Moving a directory into its own descendant returns `-EINVAL`
+/// without mutating the namespace.
+#[test]
+fn dispatch_renameat2_directory_into_own_descendant_returns_neg_einval() {
+    let _setup = fm_setup();
+    let (root_dentry, tmpfs) = build_tmpfs_root();
+    let dir_id = make_dir(&tmpfs, b"dir");
+    let child_dir_id = make_dir_in(&tmpfs, dir_id, b"child_dir");
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let oldpath = nul_terminate(b"/dir");
+    let newpath = nul_terminate(b"/dir/child_dir/moved");
+    let req = SyscallRequest::new(
+        NR_RENAMEAT2,
+        [
+            AT_FDCWD as i64 as u64,
+            oldpath.as_ptr() as u64,
+            AT_FDCWD as i64 as u64,
+            newpath.as_ptr() as u64,
+            0,
+            0,
+        ],
+    );
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Error(E_INVAL));
+    assert!(lookup_exists(&tmpfs, b"dir"), "/dir should survive");
+    assert!(
+        lookup_exists_in(&tmpfs, dir_id, b"child_dir"),
+        "/dir/child_dir should survive"
+    );
+    assert!(
+        !lookup_exists_in(&tmpfs, child_dir_id, b"moved"),
+        "cycle rejection must not publish destination"
+    );
     drop(oldpath);
     drop(newpath);
 }

@@ -1229,9 +1229,10 @@ pub(super) fn sys_utimensat<'a, P: tx_hal::TimeIf>(
 ///   resolves successfully, the arm short-circuits with `-EEXIST`.
 ///
 /// The dispatch routes through `FsOps::rename(old_parent, old_name,
-/// new_parent, new_name, &guard)`. The in-tree tmpfs surface only
-/// supports same-directory rename today; cross-directory rename
-/// surfaces as `-ENOSYS` from the backend.
+/// new_parent, new_name, &guard)`. The in-tree tmpfs surface supports
+/// same-directory rename plus cross-directory regular-file moves and
+/// directory-subtree moves within one tmpfs mount. Atomic exchange is
+/// still outside this syscall surface.
 pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let olddirfd = args[0] as i32;
     let oldpath_uaddr = args[1];
