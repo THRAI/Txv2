@@ -6,8 +6,9 @@
 use tx_platform_adapter::notification_adapter;
 
 pub(crate) use wait_source::{
-    PageReadyNotifier, PageReadyWait, is_wait_source, new_page_ready_wait, notify_page_ready,
-    page_ready_source_id, wait_source_parts, yield_on_page_ready_source, yield_on_wait_source,
+    is_wait_source, new_page_ready_wait, notify_page_ready, page_ready_source_id,
+    wait_source_parts, yield_on_page_ready_source, yield_on_wait_source, PageReadyNotifier,
+    PageReadyWait,
 };
 
 #[notification_adapter(

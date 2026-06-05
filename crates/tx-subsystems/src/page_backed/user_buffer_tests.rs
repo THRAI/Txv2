@@ -4,8 +4,8 @@ use crate::page_backed::adapter::step_engine::{
 };
 use crate::vfs::{FsObjectId, InodeKind, InodeMeta, OpenFile, OpenFileFlags, RNode, RNodeBacking};
 use crate::vm::{
-    AddressSpace, MapPlacement, Prot, USER_PAGE_SIZE, UserRange, UserVirtAddr, VmBacking, VmEntry,
-    VmEntryFlags,
+    AddressSpace, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntry, VmEntryFlags,
+    USER_PAGE_SIZE,
 };
 use alloc::vec;
 use alloc::vec::Vec;
@@ -37,6 +37,7 @@ fn open_file_for_pc(pc: &PageContainer) -> OpenFile {
             append: false,
             cloexec: false,
             nonblocking: false,
+            packet: false,
         },
     )
 }

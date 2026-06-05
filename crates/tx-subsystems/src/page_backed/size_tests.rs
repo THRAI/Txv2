@@ -28,6 +28,7 @@ fn open_file_for_pc(pc: &PageContainer) -> OpenFile {
             append: false,
             cloexec: false,
             nonblocking: false,
+            packet: false,
         },
     )
 }

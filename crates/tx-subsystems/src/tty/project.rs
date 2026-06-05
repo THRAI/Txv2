@@ -170,6 +170,7 @@ pub fn open_file_for_tty(
             append: false,
             cloexec: false,
             nonblocking: false,
+            packet: false,
         },
     ) {
         Ok(file) => V3Out::done(file),
