@@ -531,6 +531,12 @@ impl SocketPayload {
             .map_or_else(Vec::new, RawSctpSocket::peers_snapshot)
     }
 
+    /// Remove the 1-to-many association named by `assoc_id`, returning its peer
+    /// endpoint if it existed.
+    pub fn sctp_remove_assoc(&self, assoc_id: u32) -> Option<IpEndpoint> {
+        self.raw_sctp.as_ref()?.remove_assoc(assoc_id)
+    }
+
     /// Peer endpoint of the 1-to-many (SEQPACKET) association named by
     /// `assoc_id`, for SCTP_GET_PEER_ADDRS (sctp_getpaddrs). None if no such
     /// association exists.
@@ -1622,6 +1628,10 @@ impl RawSctpSocket {
         self.state.lock().ensure_assoc(peer)
     }
 
+    pub fn remove_assoc(&self, assoc_id: u32) -> Option<IpEndpoint> {
+        self.state.lock().remove_assoc(assoc_id)
+    }
+
     pub fn peers_snapshot(&self) -> Vec<SctpAssoc> {
         self.state.lock().peers_snapshot()
     }
@@ -1698,6 +1708,13 @@ impl RawSctpState {
         let assoc_id = NEXT_SCTP_ASSOC_ID.fetch_add(1, Ordering::Relaxed).max(1);
         self.peers.push(SctpAssoc { peer, assoc_id });
         (assoc_id, true)
+    }
+
+    /// Remove the association named by `assoc_id`, returning its peer endpoint if
+    /// it existed.
+    fn remove_assoc(&mut self, assoc_id: u32) -> Option<IpEndpoint> {
+        let idx = self.peers.iter().position(|a| a.assoc_id == assoc_id)?;
+        Some(self.peers.remove(idx).peer)
     }
 
     fn peers_snapshot(&self) -> Vec<SctpAssoc> {

@@ -63,7 +63,7 @@ pub use step_send::{
     step_send_to_unix_path_kernel_bytes,
 };
 pub use step_shutdown::{step_shutdown, ShutdownOutcome};
-pub use step_socket_close::{step_socket_close, SocketCloseOutcome};
+pub use step_socket_close::{step_sctp_shutdown_assoc, step_socket_close, SocketCloseOutcome};
 pub use step_socket_create::{step_socket_create, step_socket_create_in_namespace};
 pub use step_socket_open_file::{
     socket_open_file_from_identity, step_socket_open_file, step_socket_open_file_in_namespace,

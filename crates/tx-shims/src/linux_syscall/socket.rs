@@ -15,15 +15,16 @@ use tx_subsystems::net::{
     netlink_route_send_with_netns_resolvers, netlink_xfrm_recv, netlink_xfrm_send, require_net_raw,
     socket_open_file_from_identity, step_accept, step_bind, step_connect, step_listen,
     step_poll_ready, step_poll_wait_token, step_process_loopback_udp, step_recv_kernel_bytes,
-    step_sctp_peeloff, step_send_sctp_message, step_send_sctp_seqpacket, step_send_to_kernel_bytes,
-    step_send_to_unix_path_kernel_bytes, step_send_udp_loopback_kernel_bytes, step_shutdown,
-    step_socket_close, step_socket_open_file_in_namespace, step_tcp_loopback_handshake,
-    step_tcp_loopback_transfer, step_unix_socketpair_connect, AddressFamily, ConnectionKey,
-    IpEndpoint, Ipv4Address, Ipv4MulticastGroup, Ipv6Address, KernelSockAddr, LingerOption,
-    NetNamespacePayload, PollMask, RecvWireSet, SendRecvFlags, SockAddrIn, SockAddrIn6, SockAddrLl,
-    SockShutdownCmd, SocketHandleFlags, SocketIdentity, SocketKind, SocketOperationalEvidence,
-    SocketProtocol, SocketType, TcpState, TcpTlsUlpState, UdpInner, UnixDatagramState,
-    UnixPeerCred, UnixSocketPath, UnixStreamState, ValidSocketType, VIRTIO_NET_DEFAULT_MTU,
+    step_sctp_peeloff, step_sctp_shutdown_assoc, step_send_sctp_message, step_send_sctp_seqpacket,
+    step_send_to_kernel_bytes, step_send_to_unix_path_kernel_bytes,
+    step_send_udp_loopback_kernel_bytes, step_shutdown, step_socket_close,
+    step_socket_open_file_in_namespace, step_tcp_loopback_handshake, step_tcp_loopback_transfer,
+    step_unix_socketpair_connect, AddressFamily, ConnectionKey, IpEndpoint, Ipv4Address,
+    Ipv4MulticastGroup, Ipv6Address, KernelSockAddr, LingerOption, NetNamespacePayload, PollMask,
+    RecvWireSet, SendRecvFlags, SockAddrIn, SockAddrIn6, SockAddrLl, SockShutdownCmd,
+    SocketHandleFlags, SocketIdentity, SocketKind, SocketOperationalEvidence, SocketProtocol,
+    SocketType, TcpState, TcpTlsUlpState, UdpInner, UnixDatagramState, UnixPeerCred,
+    UnixSocketPath, UnixStreamState, ValidSocketType, VIRTIO_NET_DEFAULT_MTU,
 };
 use tx_subsystems::signal::step_kill_process;
 use tx_subsystems::vfs::structure::OpenFileBacking;
@@ -1400,11 +1401,23 @@ async fn sendmsg_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
         None
     };
     if let Some(info) = sctp_info {
-        let is_stream = socket
+        let sock_type = socket
             .acquire_operational()
-            .is_some_and(|p| p.with_options(|o| o.socket.sock_type == SocketType::Stream));
-        if is_stream && info.flags & SCTP_SINFO_TEARDOWN_FLAGS != 0 {
+            .map(|p| p.with_options(|o| o.socket.sock_type));
+        let teardown = info.flags & SCTP_SINFO_TEARDOWN_FLAGS != 0;
+        if sock_type == Some(SocketType::Stream) && teardown {
             return SyscallResult::Error(errno_to_i32(Errno::EINVAL));
+        }
+        // 1-to-many: SCTP_EOF/SCTP_ABORT gracefully shuts down the named
+        // association (no payload is sent). Handle it before the empty-message
+        // early return below.
+        if sock_type == Some(SocketType::SeqPacket) && teardown {
+            let guard = tx_substrate::epoch::guard();
+            return match step_sctp_shutdown_assoc(&socket, info.assoc_id, &guard) {
+                StepOutcome::Done(()) => SyscallResult::Return(0),
+                StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+                _ => SyscallResult::Error(errno_to_i32(Errno::EIO)),
+            };
         }
     }
 
@@ -2965,10 +2978,23 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
         }
         (SOL_SCTP, SCTP_STATUS) if socket.kind == SocketKind::Sctp => {
             // SCTP_STATUS requires an established association: a 1-to-1 socket
-            // must be connected, a 1-to-many socket must have at least one peer.
+            // must be connected; a 1-to-many socket must have the association
+            // named by the input sstat_assoc_id (@0), or any association when the
+            // id is 0. A torn-down association id therefore returns EINVAL.
             let has_assoc = if payload.with_options(|o| o.socket.sock_type == SocketType::SeqPacket)
             {
-                payload.sctp_assoc_count() > 0
+                let mut idbuf = [0u8; 4];
+                let assoc_id = if bootstrap_copy_from_user(&ctx.aspace, &mut idbuf, optval).is_ok()
+                {
+                    u32::from_le_bytes(idbuf)
+                } else {
+                    0
+                };
+                if assoc_id != 0 {
+                    payload.sctp_peer_addr_by_assoc(assoc_id).is_some()
+                } else {
+                    payload.sctp_assoc_count() > 0
+                }
             } else {
                 matches!(
                     payload.protocol_snapshot(),

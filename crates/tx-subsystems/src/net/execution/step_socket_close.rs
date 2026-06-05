@@ -1,6 +1,6 @@
 use tx_substrate::zone::{Cap, PayloadCap};
 
-use crate::execution::{Guard, StepOutcome};
+use crate::execution::{Errno, Guard, StepOutcome};
 use crate::net::namespace::net_namespace_payloads_snapshot;
 use crate::net::structure::table::SocketTable;
 use crate::net::structure::SocketPayload;
@@ -259,59 +259,102 @@ fn notify_sctp_seqpacket_peers_closed(
         _ => return woken,
     };
     for assoc in payload.sctp_peers() {
-        let Some(peer) = table
-            .lookup_sctp_listener_dual_stack_endpoint(assoc.peer, guard)
-            .or_else(|| table.lookup_sctp_bound(assoc.peer, guard))
-        else {
-            continue;
-        };
-        let Some(peer_payload) = peer.acquire_operational() else {
-            continue;
-        };
-        let wants_shutdown = peer_payload.with_options(|o| o.sctp.event_shutdown());
-        let wants_assoc_change = peer_payload.with_options(|o| o.sctp.event_assoc_change());
-        if !wants_shutdown && !wants_assoc_change {
-            continue;
-        }
-        // The endpoint the peer associated with this socket: our local address on
-        // the route to the peer, which the teardown notifications carry as
-        // msg_name. The association id is the peer's own (ids are per-socket).
-        let source = if local.is_unspecified() {
-            IpEndpoint::from_ip(assoc.peer.ip_addr(), local.port)
-        } else {
-            local
-        };
-        let peer_assoc_id = peer_payload
-            .sctp_peers()
-            .into_iter()
-            .find(|a| a.peer == source)
-            .map_or(assoc.assoc_id, |a| a.assoc_id);
-        let mut fired = false;
-        // SCTP_SHUTDOWN_EVENT is delivered when the peer receives SHUTDOWN;
-        // SHUTDOWN_COMP (an assoc_change) when the association is fully torn
-        // down. A 1-to-many socket may subscribe to either or both.
-        if wants_shutdown {
-            let bytes = crate::net::execution::sctp_shutdown_event_bytes();
-            fired |= peer_payload
-                .record_sctp_message(bytes, true, 0, 0, Some(source))
-                .is_some();
-        }
-        if wants_assoc_change {
-            let streams = peer_payload.with_options(|o| o.sctp.initmsg_num_ostreams);
-            let bytes = crate::net::execution::sctp_assoc_change_bytes(
-                3, /* SHUTDOWN_COMP */
-                streams,
-                peer_assoc_id,
-            );
-            fired |= peer_payload
-                .record_sctp_message(bytes, true, 0, 0, Some(source))
-                .is_some();
-        }
-        if fired {
-            woken += peer.readiness.fire_recv(RecvWireSet::HAS_DATA);
-        }
+        woken += notify_sctp_peer_assoc_closed(local, assoc.peer, assoc.assoc_id, table, guard);
     }
     woken
+}
+
+/// Deliver the teardown notification(s) for a single 1-to-many association to its
+/// peer socket: SCTP_SHUTDOWN_EVENT and/or SHUTDOWN_COMP (assoc_change) per the
+/// peer's subscription, each carrying the source (the peer's view of this
+/// socket's local address) and the peer's own association id. Returns the number
+/// of tasks woken. `local` is this socket's local address; `peer_endpoint` is the
+/// association's peer; `fallback_assoc_id` is used if the peer has no matching
+/// association recorded.
+fn notify_sctp_peer_assoc_closed(
+    local: IpEndpoint,
+    peer_endpoint: IpEndpoint,
+    fallback_assoc_id: u32,
+    table: &SocketTable,
+    guard: &Guard<'_>,
+) -> usize {
+    let Some(peer) = table
+        .lookup_sctp_listener_dual_stack_endpoint(peer_endpoint, guard)
+        .or_else(|| table.lookup_sctp_bound(peer_endpoint, guard))
+    else {
+        return 0;
+    };
+    let Some(peer_payload) = peer.acquire_operational() else {
+        return 0;
+    };
+    let wants_shutdown = peer_payload.with_options(|o| o.sctp.event_shutdown());
+    let wants_assoc_change = peer_payload.with_options(|o| o.sctp.event_assoc_change());
+    if !wants_shutdown && !wants_assoc_change {
+        return 0;
+    }
+    let source = if local.is_unspecified() {
+        IpEndpoint::from_ip(peer_endpoint.ip_addr(), local.port)
+    } else {
+        local
+    };
+    let peer_assoc_id = peer_payload
+        .sctp_peers()
+        .into_iter()
+        .find(|a| a.peer == source)
+        .map_or(fallback_assoc_id, |a| a.assoc_id);
+    let mut fired = false;
+    // SCTP_SHUTDOWN_EVENT is delivered when the peer receives SHUTDOWN;
+    // SHUTDOWN_COMP (an assoc_change) when the association is fully torn down. A
+    // 1-to-many socket may subscribe to either or both.
+    if wants_shutdown {
+        let bytes = crate::net::execution::sctp_shutdown_event_bytes();
+        fired |= peer_payload
+            .record_sctp_message(bytes, true, 0, 0, Some(source))
+            .is_some();
+    }
+    if wants_assoc_change {
+        let streams = peer_payload.with_options(|o| o.sctp.initmsg_num_ostreams);
+        let bytes = crate::net::execution::sctp_assoc_change_bytes(
+            3, /* SHUTDOWN_COMP */
+            streams,
+            peer_assoc_id,
+        );
+        fired |= peer_payload
+            .record_sctp_message(bytes, true, 0, 0, Some(source))
+            .is_some();
+    }
+    if fired {
+        peer.readiness.fire_recv(RecvWireSet::HAS_DATA)
+    } else {
+        0
+    }
+}
+
+/// SCTP_EOF on a 1-to-many (SEQPACKET) socket: gracefully shut down the single
+/// association named by `assoc_id` — notify its peer (SHUTDOWN_EVENT/COMP) and
+/// drop the association from this socket. A no-op if no such association exists.
+pub fn step_sctp_shutdown_assoc(
+    socket: &Cap<SocketIdentity>,
+    assoc_id: u32,
+    guard: &Guard<'_>,
+) -> StepOutcome<()> {
+    let Some(payload) = socket.acquire_operational() else {
+        return StepOutcome::Err(Errno::ENOTCONN);
+    };
+    let local = match payload.protocol_snapshot() {
+        SocketProtocol::Sctp(TcpState::Bound { local })
+        | SocketProtocol::Sctp(TcpState::Listening { local, .. })
+        | SocketProtocol::Sctp(TcpState::Connecting { local, .. })
+        | SocketProtocol::Sctp(TcpState::Connected { local, .. }) => local,
+        _ => return StepOutcome::Err(Errno::EINVAL),
+    };
+    let Some(peer_endpoint) = payload.sctp_peer_addr_by_assoc(assoc_id) else {
+        return StepOutcome::Done(());
+    };
+    let table = payload.socket_table();
+    notify_sctp_peer_assoc_closed(local, peer_endpoint, assoc_id, table, guard);
+    payload.sctp_remove_assoc(assoc_id);
+    StepOutcome::Done(())
 }
 
 /// Queue an SCTP_SHUTDOWN_EVENT notification on `peer`'s receive queue if it

@@ -96,8 +96,16 @@ peers 移除),比当前"建联但不迁移"的最小版更深。
 另:`test_1_to_1_threads` 确认通过(1)。各自新 blocker 属真正的分片/重组数据面语义
 (MAXSEG 驱动的分片长度、disable 时超 frag point → EMSGSIZE),loopback 直投模型未建模。
 
-**剩余 1-to-many**:peeloff 关联迁移、assoc_shutdown/abort(SCTP_STATUS 反映已拆
-关联,getsockopt 成功但字段不符)、分片数据面(MAXSEG/DISABLE_FRAGMENTS 行为)。
+**test_assoc_shutdown 通过(SCTP_EOF 优雅拆联,2026-06-05):** (a) `RawSctpState` +
+`SocketPayload` 加 `remove_assoc`/`sctp_remove_assoc`(按 assoc_id 摘除,返回 peer)。
+(b) 把 close 的 per-peer 通知抽成 `notify_sctp_peer_assoc_closed`,新 step
+`step_sctp_shutdown_assoc`:通知该关联对端(SHUTDOWN_EVENT/COMP)再从本端摘除。
+(c) `sendmsg_impl`:SEQPACKET 带 `SCTP_EOF`/`SCTP_ABORT`(sinfo_flags)→ 调
+`step_sctp_shutdown_assoc`(在空消息早返之前)。(d) `SCTP_STATUS` 对 SEQPACKET 校验
+输入 `sstat_assoc_id`——已摘除的 assoc → EINVAL。
+
+**剩余 1-to-many**:test_assoc_abort(`SCTP_ABORT` 需 COMM_LOST(state 1)而非
+SHUTDOWN_COMP,且早期 client→server 数据流有长度问题)、peeloff 关联迁移、分片数据面。
 
 **阶段 2 tcp_style 收尾(2026-06-05):** `test_tcp_style(+v6)`(各 22)过。三处修正:
 - connect 失败(accept 队列满 ECONNREFUSED)不再把 socket 卡在 Connected ——
@@ -224,6 +232,7 @@ recvmsg→`EAGAIN` 可做,但 TEST5 要 `sendmsg`/`recvmsg`+`sctp_sndrcvinfo`+`M
 | `test_connect` | 5 | partial 4/5 (peeloff 迁移) | 多 | `target/oscomp/ltp-net-sctp-p-test_connect.txt` |
 | `test_peeloff` | 7 | partial 3/7 (peeloff 迁移) | 多 | `target/oscomp/ltp-net-sctp-p-test_peeloff.txt` |
 | `test_1_to_1_threads` | 1 | **pass** | 1 | `target/oscomp/ltp-net-sctp-rg6-test_1_to_1_threads.txt` |
+| `test_assoc_shutdown` | 1 | **pass** | 1 | `target/oscomp/ltp-net-sctp-r-test_assoc_shutdown.txt` |
 | `test_sctp_sendrecvmsg` | ~10 | partial 6 (分片) | 多 | `target/oscomp/ltp-net-sctp-q-test_sctp_sendrecvmsg.txt` |
 | `test_timetolive` | ~6 | partial 3 (分片) | 多 | `target/oscomp/ltp-net-sctp-q-test_timetolive.txt` |
 | `test_fragments` | ~8 | partial 2 (分片) | 多 | `target/oscomp/ltp-net-sctp-q-test_fragments.txt` |
