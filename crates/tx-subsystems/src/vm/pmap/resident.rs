@@ -250,15 +250,10 @@ impl PmapResidentStoreImpl for ChunkedPmapResidentStore {
         if additional == 0 {
             return;
         }
-        let chunk_headroom = self
-            .chunks
-            .iter()
-            .map(ResidentChunk::spare_capacity)
-            .sum::<usize>();
-        let extra = additional.saturating_sub(chunk_headroom);
-        if extra > 0 {
-            self.chunks
-                .reserve(extra.saturating_add(CHUNK_CAPACITY - 1) / CHUNK_CAPACITY);
+        let needed_chunks = additional.saturating_add(CHUNK_CAPACITY - 1) / CHUNK_CAPACITY;
+        let spare_chunks = self.chunks.capacity().saturating_sub(self.chunks.len());
+        if needed_chunks > spare_chunks {
+            self.chunks.reserve(needed_chunks - spare_chunks);
         }
     }
 
@@ -273,6 +268,31 @@ impl PmapResidentStoreImpl for ChunkedPmapResidentStore {
     }
 
     fn insert(&mut self, page: UserPage, mapping: PmapMapping) -> Option<PmapMapping> {
+        if self.chunks.is_empty() {
+            let mut chunk = ResidentChunk::new();
+            chunk.push(page, mapping);
+            self.chunks.push(chunk);
+            self.len += 1;
+            return None;
+        }
+        if self
+            .chunks
+            .last()
+            .and_then(ResidentChunk::last_page)
+            .is_some_and(|last_page| last_page < page)
+        {
+            let last = self.chunks.last_mut().expect("nonempty chunks");
+            if last.len() >= CHUNK_CAPACITY {
+                let mut chunk = ResidentChunk::new();
+                chunk.push(page, mapping);
+                self.chunks.push(chunk);
+            } else {
+                last.push(page, mapping);
+            }
+            self.len += 1;
+            return None;
+        }
+
         let chunk_index = match self.find_chunk_for_insert(page) {
             Ok(index) => index,
             Err(index) => {
@@ -308,6 +328,7 @@ impl PmapResidentStoreImpl for ChunkedPmapResidentStore {
         }
 
         let mut entries = Vec::new();
+        entries.reserve(end.0.saturating_sub(start.0).min(self.len));
         let mut shifted_entries = 0usize;
         let mut index = self
             .find_chunk_index_by_first(start)
@@ -443,10 +464,6 @@ impl ResidentChunk {
         self.entries.is_empty()
     }
 
-    fn spare_capacity(&self) -> usize {
-        CHUNK_CAPACITY.saturating_sub(self.entries.len())
-    }
-
     fn first_page(&self) -> Option<UserPage> {
         self.entries.first().map(|(page, _)| *page)
     }
@@ -489,6 +506,12 @@ impl ResidentChunk {
                 None
             }
         }
+    }
+
+    fn push(&mut self, page: UserPage, mapping: PmapMapping) {
+        debug_assert!(self.entries.len() < CHUNK_CAPACITY);
+        debug_assert!(self.last_page().is_none_or(|last| last < page));
+        self.entries.push((page, mapping));
     }
 
     fn remove(&mut self, page: &UserPage) -> Option<PmapMapping> {
@@ -718,5 +741,85 @@ mod tests {
             page_values(&store.snapshots_in_range(UserPage(0), UserPage(192))),
             (0..64).chain(128..192).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn chunked_backend_matches_vec_for_mixed_sparse_operations() {
+        let mut vec_store = PmapResidentStoreWith::<VecPmapResidentStore>::new();
+        let mut chunked_store = PmapResidentStoreWith::<ChunkedPmapResidentStore>::new();
+        let mut rng = 0x5eed_f00d_dead_beefu64;
+
+        fn next(rng: &mut u64) -> usize {
+            *rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (*rng >> 32) as usize
+        }
+
+        for step in 0..4096 {
+            match next(&mut rng) % 5 {
+                0 | 1 => {
+                    let page = UserPage(next(&mut rng) % 512);
+                    let vec_prev = vec_store.insert(page, mapping(page.0));
+                    let chunk_prev = chunked_store.insert(page, mapping(page.0));
+                    assert_eq!(vec_prev.map(|m| m.ppn), chunk_prev.map(|m| m.ppn));
+                }
+                2 => {
+                    let page = UserPage(next(&mut rng) % 512);
+                    let vec_removed = vec_store.remove(&page);
+                    let chunk_removed = chunked_store.remove(&page);
+                    assert_eq!(
+                        vec_removed.map(|m| m.ppn),
+                        chunk_removed.map(|m| m.ppn),
+                        "remove diverged at step {step} for page {:?}",
+                        page
+                    );
+                }
+                3 => {
+                    let a = next(&mut rng) % 512;
+                    let b = next(&mut rng) % 512;
+                    let start = UserPage(a.min(b));
+                    let end = UserPage(a.max(b).saturating_add(1));
+                    let (vec_removed, _) = drained_values(vec_store.drain_range(start, end));
+                    let (chunk_removed, _) = drained_values(chunked_store.drain_range(start, end));
+                    assert_eq!(
+                        vec_removed, chunk_removed,
+                        "drain diverged at step {step} for {:?}..{:?}",
+                        start, end
+                    );
+                }
+                _ => {
+                    let a = next(&mut rng) % 512;
+                    let b = next(&mut rng) % 512;
+                    let start = UserPage(a.min(b));
+                    let end = UserPage(a.max(b).saturating_add(1));
+                    assert_eq!(
+                        page_values(&vec_store.snapshots_in_range(start, end)),
+                        page_values(&chunked_store.snapshots_in_range(start, end)),
+                        "snapshot diverged at step {step} for {:?}..{:?}",
+                        start,
+                        end
+                    );
+                    assert_eq!(
+                        vec_store.pages_in_range(start, end),
+                        chunked_store.pages_in_range(start, end),
+                        "page walk diverged at step {step} for {:?}..{:?}",
+                        start,
+                        end
+                    );
+                }
+            }
+
+            assert_eq!(
+                vec_store.len(),
+                chunked_store.len(),
+                "len diverged at step {step}"
+            );
+            assert_eq!(
+                page_values(&vec_store.snapshots_in_range(UserPage(0), UserPage(512))),
+                page_values(&chunked_store.snapshots_in_range(UserPage(0), UserPage(512))),
+                "full snapshot diverged at step {step}"
+            );
+        }
     }
 }
