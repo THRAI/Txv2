@@ -3474,3 +3474,209 @@ pub(super) fn fast_close_stateless_netlink_socket_file(file: &Cap<OpenFile>) {
         let _ = socket.take_payload();
     }
 }
+
+/// `ioctl(2)` interface-shape requests on a socket fd (SIOCGIF*/SIOCSIF*).
+/// Operates on the calling process net namespace links. Originally feature
+/// content (cfc8c17c / 1a81cd89, sp); re-homed here onto main during the
+/// 2026-06-05 rebase (lives in socket.rs where net_namespace()/bootstrap_*
+/// resolve; routed from fs_basic.rs::sys_ioctl for StructPayload::Socket).
+pub(super) fn sys_socket_ioctl<'a>(request: u32, argp: u64, ctx: &SyscallCtx<'a>) -> SyscallResult {
+    const IFREQ_NAME_BYTES: usize = 16;
+    const IFREQ_BYTES: usize = 40;
+    const IFREQ_DATA_OFFSET: u64 = IFREQ_NAME_BYTES as u64;
+    const IFCONF_BUF_OFFSET: u64 = 8;
+    const AF_INET_U16: u16 = 2;
+    const IFF_UP: i16 = 0x0001;
+    const IFF_BROADCAST: i16 = 0x0002;
+    const IFF_LOOPBACK: i16 = 0x0008;
+    const IFF_RUNNING: i16 = 0x0040;
+    const IFF_MULTICAST: i16 = 0x1000;
+
+    if argp == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+
+    let Some(netns) = ctx.process.net_namespace() else {
+        return SyscallResult::Error(ESRCH_VALUE);
+    };
+    if request == SIOCGIFCONF {
+        let ifc_len: i32 = match bootstrap_read_user(&ctx.aspace, argp) {
+            Ok(len) => len,
+            Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+        };
+        let ifc_buf: u64 = match bootstrap_read_user(&ctx.aspace, argp + IFCONF_BUF_OFFSET) {
+            Ok(buf) => buf,
+            Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+        };
+        let links = netns.link_snapshot();
+        let required_len = links.len().saturating_mul(IFREQ_BYTES);
+        if ifc_buf == 0 || ifc_len <= 0 {
+            return match bootstrap_write_user(&ctx.aspace, argp, required_len as i32) {
+                Ok(()) => SyscallResult::Return(0),
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+            };
+        }
+        let writable_len = core::cmp::min(ifc_len as usize, required_len);
+        let entry_count = writable_len / IFREQ_BYTES;
+        let mut out = Vec::with_capacity(entry_count * IFREQ_BYTES);
+        for link in links.into_iter().take(entry_count) {
+            let mut ifreq = [0u8; IFREQ_BYTES];
+            let name = link.name.as_bytes();
+            let copy_len = core::cmp::min(name.len(), IFREQ_NAME_BYTES - 1);
+            ifreq[..copy_len].copy_from_slice(&name[..copy_len]);
+            ifreq[16..18].copy_from_slice(&AF_INET_U16.to_le_bytes());
+            if let Some(addr) = link.ipv4_addr {
+                ifreq[20..24].copy_from_slice(&addr.octets());
+            }
+            out.extend_from_slice(&ifreq);
+        }
+        if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, ifc_buf, &out) {
+            return SyscallResult::Error(errno_to_i32(errno));
+        }
+        return match bootstrap_write_user(&ctx.aspace, argp, out.len() as i32) {
+            Ok(()) => SyscallResult::Return(0),
+            Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+        };
+    }
+    if request == SIOCGIFNAME {
+        let ifindex: i32 = match bootstrap_read_user(&ctx.aspace, argp + IFREQ_DATA_OFFSET) {
+            Ok(ifindex) => ifindex,
+            Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+        };
+        if ifindex <= 0 {
+            return SyscallResult::Error(ENXIO_VALUE);
+        }
+        let Some(link) = netns
+            .link_snapshot()
+            .into_iter()
+            .find(|link| link.ifindex == ifindex as u32)
+        else {
+            return SyscallResult::Error(ENXIO_VALUE);
+        };
+        let mut out_name = [0u8; IFREQ_NAME_BYTES];
+        let name = link.name.as_bytes();
+        let copy_len = core::cmp::min(name.len(), IFREQ_NAME_BYTES - 1);
+        out_name[..copy_len].copy_from_slice(&name[..copy_len]);
+        return match bootstrap_write_user(&ctx.aspace, argp, out_name) {
+            Ok(()) => SyscallResult::Return(0),
+            Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+        };
+    }
+
+    let mut name_bytes = [0u8; IFREQ_NAME_BYTES];
+    if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut name_bytes, argp) {
+        return SyscallResult::Error(errno_to_i32(errno));
+    }
+    let end = name_bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(IFREQ_NAME_BYTES);
+    let Ok(ifname) = core::str::from_utf8(&name_bytes[..end]) else {
+        return SyscallResult::Error(EINVAL_VALUE);
+    };
+    let require_net_admin = || {
+        if let Some(owner) = netns.owner_user_namespace() {
+            let current = ctx.process.nsproxy_cap().ok_or(Errno::ESRCH)?;
+            tx_subsystems::net::require_net_admin_in_user_namespace(
+                ctx.cred(),
+                &current.user_ns,
+                &owner,
+            )
+        } else {
+            tx_subsystems::net::require_net_admin(ctx.cred())
+        }
+    };
+    let link = netns
+        .link_snapshot()
+        .into_iter()
+        .find(|link| link.name == ifname);
+
+    match request {
+        SIOCGIFFLAGS => {
+            let Some(link) = link else {
+                return SyscallResult::Error(ENODEV_VALUE);
+            };
+            let mut flags = IFF_RUNNING;
+            if link.is_up {
+                flags |= IFF_UP;
+            }
+            if link.is_loopback {
+                flags |= IFF_LOOPBACK;
+            } else {
+                flags |= IFF_BROADCAST | IFF_MULTICAST;
+            }
+            match bootstrap_write_user(&ctx.aspace, argp + IFREQ_DATA_OFFSET, flags) {
+                Ok(()) => SyscallResult::Return(0),
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+            }
+        }
+        SIOCSIFFLAGS => {
+            let Some(link) = link else {
+                return SyscallResult::Error(ENODEV_VALUE);
+            };
+            let auth = match require_net_admin() {
+                Ok(auth) => auth,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            let requested: i16 = match bootstrap_read_user(&ctx.aspace, argp + IFREQ_DATA_OFFSET) {
+                Ok(flags) => flags,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            match netns.set_device_up_by_ifindex(auth, link.ifindex, requested & IFF_UP != 0) {
+                Ok(()) => SyscallResult::Return(0),
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+            }
+        }
+        SIOCGIFMTU => {
+            let Some(link) = link else {
+                return SyscallResult::Error(ENODEV_VALUE);
+            };
+            let mtu = i32::from(link.mtu);
+            match bootstrap_write_user(&ctx.aspace, argp + IFREQ_DATA_OFFSET, mtu) {
+                Ok(()) => SyscallResult::Return(0),
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+            }
+        }
+        SIOCSIFMTU => {
+            let Some(link) = link else {
+                return SyscallResult::Error(ENODEV_VALUE);
+            };
+            let auth = match require_net_admin() {
+                Ok(auth) => auth,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            let requested: i32 = match bootstrap_read_user(&ctx.aspace, argp + IFREQ_DATA_OFFSET) {
+                Ok(mtu) => mtu,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            let Ok(requested) = u16::try_from(requested) else {
+                return SyscallResult::Error(EINVAL_VALUE);
+            };
+            match netns.set_device_mtu_by_ifindex(auth, link.ifindex, requested) {
+                Ok(()) => SyscallResult::Return(0),
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+            }
+        }
+        SIOCGIFINDEX => {
+            let Some(link) = link else {
+                return SyscallResult::Error(ENODEV_VALUE);
+            };
+            let ifindex = link.ifindex as i32;
+            match bootstrap_write_user(&ctx.aspace, argp + IFREQ_DATA_OFFSET, ifindex) {
+                Ok(()) => SyscallResult::Return(0),
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+            }
+        }
+        SIOCGIFTXQLEN => {
+            if link.is_none() {
+                return SyscallResult::Error(ENODEV_VALUE);
+            }
+            let tx_queue_len = 0i32;
+            match bootstrap_write_user(&ctx.aspace, argp + IFREQ_DATA_OFFSET, tx_queue_len) {
+                Ok(()) => SyscallResult::Return(0),
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+            }
+        }
+        _ => SyscallResult::Error(errno_to_i32(Errno::ENOTTY)),
+    }
+}

@@ -75,6 +75,24 @@ pub enum Errno {
     ESTALE,
     /// Wait deadline expired. Linux value: 110.
     ETIMEDOUT,
+    // Network errno catalog — restored after PR#50 stripped these; used by the
+    // net subsystem (socket/bind/connect/send/recv error paths).
+    EADDRINUSE,
+    EADDRNOTAVAIL,
+    EAFNOSUPPORT,
+    EALREADY,
+    ECONNREFUSED,
+    EDESTADDRREQ,
+    EINPROGRESS,
+    EISCONN,
+    EMLINK,
+    EMSGSIZE,
+    ENOPROTOOPT,
+    ENOTCONN,
+    ENOTSOCK,
+    EOPNOTSUPP,
+    EPROTONOSUPPORT,
+    ESOCKTNOSUPPORT,
 }
 
 /// Bridge `execution::Errno` into `step_v3::Errno`. The two enums
@@ -119,6 +137,22 @@ impl From<Errno> for crate::adapter::step_engine::V3Errno {
             Errno::ESRCH => Self::ESRCH,
             Errno::ESTALE => Self::ESTALE,
             Errno::ETIMEDOUT => Self::ETIMEDOUT,
+            Errno::EADDRINUSE => Self::EADDRINUSE,
+            Errno::EADDRNOTAVAIL => Self::EADDRNOTAVAIL,
+            Errno::EAFNOSUPPORT => Self::EAFNOSUPPORT,
+            Errno::EALREADY => Self::EALREADY,
+            Errno::ECONNREFUSED => Self::ECONNREFUSED,
+            Errno::EDESTADDRREQ => Self::EDESTADDRREQ,
+            Errno::EINPROGRESS => Self::EINPROGRESS,
+            Errno::EISCONN => Self::EISCONN,
+            Errno::EMLINK => Self::EMLINK,
+            Errno::EMSGSIZE => Self::EMSGSIZE,
+            Errno::ENOPROTOOPT => Self::ENOPROTOOPT,
+            Errno::ENOTCONN => Self::ENOTCONN,
+            Errno::ENOTSOCK => Self::ENOTSOCK,
+            Errno::EOPNOTSUPP => Self::EOPNOTSUPP,
+            Errno::EPROTONOSUPPORT => Self::EPROTONOSUPPORT,
+            Errno::ESOCKTNOSUPPORT => Self::ESOCKTNOSUPPORT,
         }
     }
 }
@@ -167,6 +201,22 @@ impl From<crate::adapter::step_engine::V3Errno> for Errno {
             V3::ESRCH => Errno::ESRCH,
             V3::ESTALE => Errno::ESTALE,
             V3::ETIMEDOUT => Errno::ETIMEDOUT,
+            V3::EADDRINUSE => Errno::EADDRINUSE,
+            V3::EADDRNOTAVAIL => Errno::EADDRNOTAVAIL,
+            V3::EAFNOSUPPORT => Errno::EAFNOSUPPORT,
+            V3::EALREADY => Errno::EALREADY,
+            V3::ECONNREFUSED => Errno::ECONNREFUSED,
+            V3::EDESTADDRREQ => Errno::EDESTADDRREQ,
+            V3::EINPROGRESS => Errno::EINPROGRESS,
+            V3::EISCONN => Errno::EISCONN,
+            V3::EMLINK => Errno::EMLINK,
+            V3::EMSGSIZE => Errno::EMSGSIZE,
+            V3::ENOPROTOOPT => Errno::ENOPROTOOPT,
+            V3::ENOTCONN => Errno::ENOTCONN,
+            V3::ENOTSOCK => Errno::ENOTSOCK,
+            V3::EOPNOTSUPP => Errno::EOPNOTSUPP,
+            V3::EPROTONOSUPPORT => Errno::EPROTONOSUPPORT,
+            V3::ESOCKTNOSUPPORT => Errno::ESOCKTNOSUPPORT,
         }
     }
 }

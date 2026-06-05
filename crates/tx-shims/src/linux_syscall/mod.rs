@@ -152,8 +152,8 @@ mod event_notify;
 use event_notify::*;
 mod splice;
 use splice::*;
-mod net;
-use net::*;
+mod socket;
+use socket::*;
 
 mod ctx;
 pub use ctx::*;

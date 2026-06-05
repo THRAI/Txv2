@@ -13,7 +13,7 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicI8, AtomicU64, Ordering};
 
 use crate::vfs::adapter::step_engine::{
-    self, Cap, SpinMutex, Weak, Zone, ZoneAllocated, ZoneError,
+    self, Cap, PayloadCap, SpinMutex, Weak, Zone, ZoneAllocated, ZoneError,
 };
 use crate::vfs::adapter::wait_routing::{Channel, WaitSource};
 
@@ -26,6 +26,8 @@ use crate::execution::Errno;
 use crate::io_uring::IoUring;
 use crate::ipc::posix_mq::structure::PosixMqInstance;
 use crate::mount::{MountIdentity, MountPayload};
+use crate::net::namespace::NetNamespacePayload;
+use crate::net::structure::SocketIdentity;
 use crate::page_backed::PageContainer;
 use crate::process::{ProcessGroup, ProcessIdentity};
 use crate::signalfd::SignalFd;
@@ -512,6 +514,16 @@ pub enum StructPayload {
     Pipe {
         payload: Cap<crate::pipe::PipePayload>,
         side: crate::pipe::PipeSide,
+    },
+    /// Socket-backed open file used by the network syscall facade.
+    /// Restored after PR#50 accidentally dropped it; required by the net
+    /// subsystem and the socket.rs syscall layer.
+    Socket {
+        identity: Cap<SocketIdentity>,
+    },
+    /// Internal network-namespace fd used by the staged rtnetlink path.
+    NetNamespace {
+        payload: PayloadCap<NetNamespacePayload>,
     },
 }
 

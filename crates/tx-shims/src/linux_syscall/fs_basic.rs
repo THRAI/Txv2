@@ -861,6 +861,16 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
         return SyscallResult::error_from(Errno::ENOTTY);
     }
 
+    // Socket fds: route interface-shape ioctls (SIOCGIF*/SIOCSIF*) to the
+    // net-namespace-backed handler in socket.rs (where net_namespace() and the
+    // socket helpers resolve). Re-homed onto main during the 2026-06-05 rebase.
+    if let RNodeBacking::StructBacked {
+        payload: StructPayload::Socket { .. },
+    } = file.rnode().backing()
+    {
+        return super::socket::sys_socket_ioctl(request, argp, ctx);
+    }
+
     // Resolve to a TTY. Non-TTY fds → -ENOTTY for terminal-shape ioctls
     // (Linux semantic — even pipes / regular files return ENOTTY for
     // these requests, per `man ioctl_tty`).

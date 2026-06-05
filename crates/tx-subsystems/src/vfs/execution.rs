@@ -333,6 +333,26 @@ impl OpenFile {
                     side: crate::pipe::PipeSide::Writer,
                     ..
                 } => StepOutcome::Err(Errno::EBADF),
+                StructPayload::Socket { identity } => {
+                    match crate::net::execution::step_recv_kernel_bytes(
+                        identity,
+                        out,
+                        crate::net::SendRecvFlags::empty(),
+                        guard,
+                    ) {
+                        StepOutcome::Done(outcome) => StepOutcome::Done(outcome.bytes),
+                        StepOutcome::Continue { progress } => StepOutcome::Continue { progress },
+                        StepOutcome::Yield { progress, shape } => {
+                            if flags.nonblocking && progress.bytes() == 0 {
+                                StepOutcome::Err(Errno::EAGAIN)
+                            } else {
+                                StepOutcome::Yield { progress, shape }
+                            }
+                        }
+                        StepOutcome::Err(errno) => StepOutcome::Err(errno),
+                    }
+                }
+                StructPayload::NetNamespace { .. } => StepOutcome::Err(Errno::ENOSYS),
             },
             RNodeBacking::Directory => StepOutcome::Err(Errno::EISDIR),
             // PR-11 follow-up (W-KK, closing the ENOSYS gap W-JJ flagged
@@ -433,7 +453,9 @@ impl OpenFile {
                 StructPayload::Tty(_)
                 | StructPayload::CharDevice(_)
                 | StructPayload::BlockDevice(_)
-                | StructPayload::Pipe { .. } => return StepOutcome::Err(Errno::ESPIPE),
+                | StructPayload::Pipe { .. }
+                | StructPayload::Socket { .. }
+                | StructPayload::NetNamespace { .. } => return StepOutcome::Err(Errno::ESPIPE),
             },
             RNodeBacking::Directory => return StepOutcome::Err(Errno::EISDIR),
             RNodeBacking::Symlink { .. } | RNodeBacking::Projected { .. } => {
@@ -522,6 +544,28 @@ impl OpenFile {
                     side: crate::pipe::PipeSide::Reader,
                     ..
                 } => StepOutcome::Err(Errno::EBADF),
+                StructPayload::Socket { identity } => {
+                    let send_flags = if flags.nonblocking {
+                        crate::net::SendRecvFlags::MSG_DONTWAIT
+                    } else {
+                        crate::net::SendRecvFlags::empty()
+                    };
+                    match crate::net::execution::step_send_kernel_bytes(
+                        identity, bytes, send_flags, guard,
+                    ) {
+                        StepOutcome::Done(written) => StepOutcome::Done(written),
+                        StepOutcome::Continue { progress } => StepOutcome::Continue { progress },
+                        StepOutcome::Yield { progress, shape } => {
+                            if flags.nonblocking && progress.bytes() == 0 {
+                                StepOutcome::Err(Errno::EAGAIN)
+                            } else {
+                                StepOutcome::Yield { progress, shape }
+                            }
+                        }
+                        StepOutcome::Err(errno) => StepOutcome::Err(errno),
+                    }
+                }
+                StructPayload::NetNamespace { .. } => StepOutcome::Err(Errno::ENOSYS),
             },
             RNodeBacking::Directory => StepOutcome::Err(Errno::EISDIR),
             // Symmetric to the PageBacked step_read arm above — route
@@ -584,7 +628,9 @@ impl OpenFile {
                 StructPayload::BlockDevice(_) => StepOutcome::Err(Errno::ENOSYS),
                 // Pipe was added on main; ioctl on a pipe returns
                 // ENOTTY (matches Linux behaviour).
-                StructPayload::Pipe { .. } => StepOutcome::Err(Errno::ENOTTY),
+                StructPayload::Pipe { .. }
+                | StructPayload::Socket { .. }
+                | StructPayload::NetNamespace { .. } => StepOutcome::Err(Errno::ENOTTY),
             },
             RNodeBacking::Directory => StepOutcome::Err(Errno::EISDIR),
             RNodeBacking::PageBacked { .. }

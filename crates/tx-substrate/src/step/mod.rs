@@ -97,6 +97,24 @@ pub enum Errno {
     ESTALE,
     /// Wait deadline expired. Linux value: 110.
     ETIMEDOUT,
+    // Network errno catalog — restored after PR#50 stripped these; required by
+    // the net subsystem (socket/bind/connect/send/recv error paths).
+    EADDRINUSE,
+    EADDRNOTAVAIL,
+    EAFNOSUPPORT,
+    EALREADY,
+    ECONNREFUSED,
+    EDESTADDRREQ,
+    EINPROGRESS,
+    EISCONN,
+    EMLINK,
+    EMSGSIZE,
+    ENOPROTOOPT,
+    ENOTCONN,
+    ENOTSOCK,
+    EOPNOTSUPP,
+    EPROTONOSUPPORT,
+    ESOCKTNOSUPPORT,
 }
 
 impl Errno {
@@ -140,6 +158,22 @@ impl Errno {
             Errno::ESTALE => 116,
             Errno::ETIMEDOUT => 110,
             Errno::EINTR => 4,
+            Errno::EADDRINUSE => 98,
+            Errno::EADDRNOTAVAIL => 99,
+            Errno::EAFNOSUPPORT => 97,
+            Errno::EALREADY => 114,
+            Errno::ECONNREFUSED => 111,
+            Errno::EDESTADDRREQ => 89,
+            Errno::EINPROGRESS => 115,
+            Errno::EISCONN => 106,
+            Errno::EMLINK => 31,
+            Errno::EMSGSIZE => 90,
+            Errno::ENOPROTOOPT => 92,
+            Errno::ENOTCONN => 107,
+            Errno::ENOTSOCK => 88,
+            Errno::EOPNOTSUPP => 95,
+            Errno::EPROTONOSUPPORT => 93,
+            Errno::ESOCKTNOSUPPORT => 94,
         }
     }
 }
