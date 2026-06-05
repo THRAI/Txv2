@@ -90,8 +90,14 @@ EADDRNOTAVAIL)、test_sockopt case 34(peeled socket 上按 assoc_id 设 DEFAULT_
 ——都需把关联真正从原 1-to-many socket 迁移到 peeled socket(连接表 + 路由 + 从原
 peers 移除),比当前"建联但不迁移"的最小版更深。
 
+**SCTP_MAXSEG + SCTP_DISABLE_FRAGMENTS sockopt(2026-06-05):** `SctpLevelOptions`
+加 `maxseg: u32` / `disable_fragments: bool` + get/set(=13 / =8,plain int)。解锁
+三测试的早期 case:test_sctp_sendrecvmsg 0→6、test_timetolive 0→3、test_fragments 0→2。
+另:`test_1_to_1_threads` 确认通过(1)。各自新 blocker 属真正的分片/重组数据面语义
+(MAXSEG 驱动的分片长度、disable 时超 frag point → EMSGSIZE),loopback 直投模型未建模。
+
 **剩余 1-to-many**:peeloff 关联迁移、assoc_shutdown/abort(SCTP_STATUS 反映已拆
-关联)、sctp_sendrecvmsg。
+关联,getsockopt 成功但字段不符)、分片数据面(MAXSEG/DISABLE_FRAGMENTS 行为)。
 
 **阶段 2 tcp_style 收尾(2026-06-05):** `test_tcp_style(+v6)`(各 22)过。三处修正:
 - connect 失败(accept 队列满 ECONNREFUSED)不再把 socket 卡在 Connected ——
@@ -217,6 +223,10 @@ recvmsg→`EAGAIN` 可做,但 TEST5 要 `sendmsg`/`recvmsg`+`sctp_sndrcvinfo`+`M
 | `test_sockopt` | 44 | partial 33/44 (peeloff 迁移) | 多 | `target/oscomp/ltp-net-sctp-p-test_sockopt.txt` |
 | `test_connect` | 5 | partial 4/5 (peeloff 迁移) | 多 | `target/oscomp/ltp-net-sctp-p-test_connect.txt` |
 | `test_peeloff` | 7 | partial 3/7 (peeloff 迁移) | 多 | `target/oscomp/ltp-net-sctp-p-test_peeloff.txt` |
+| `test_1_to_1_threads` | 1 | **pass** | 1 | `target/oscomp/ltp-net-sctp-rg6-test_1_to_1_threads.txt` |
+| `test_sctp_sendrecvmsg` | ~10 | partial 6 (分片) | 多 | `target/oscomp/ltp-net-sctp-q-test_sctp_sendrecvmsg.txt` |
+| `test_timetolive` | ~6 | partial 3 (分片) | 多 | `target/oscomp/ltp-net-sctp-q-test_timetolive.txt` |
+| `test_fragments` | ~8 | partial 2 (分片) | 多 | `target/oscomp/ltp-net-sctp-q-test_fragments.txt` |
 | `test_1_to_1_rtoinfo` | 3 | **pass** | 1 | `target/oscomp/ltp-net-sctp-rtoinfo-120s.txt` |
 | `test_1_to_1_initmsg_connect` | 2 | **pass** | 1 | `target/oscomp/ltp-net-sctp-1to1-initmsg.txt` |
 | `test_inaddr_any` | 2 | **pass** | 2 | `target/oscomp/ltp-net-sctp-m-test_inaddr_any.txt` |

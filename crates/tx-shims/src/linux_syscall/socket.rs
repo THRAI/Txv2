@@ -2213,6 +2213,28 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             // 1-to-many: accept and ignore the autoclose timeout for now.
             Ok(())
         }
+        (SOL_SCTP, SCTP_MAXSEG) => {
+            if socket.kind != SocketKind::Sctp {
+                return SyscallResult::Error(errno_to_i32(Errno::ENOPROTOOPT));
+            }
+            let val = match read_sockopt_i32(ctx, optval, optlen) {
+                Ok(val) => val,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            payload.with_options_mut(|opts| opts.sctp.maxseg = val.max(0) as u32);
+            Ok(())
+        }
+        (SOL_SCTP, SCTP_DISABLE_FRAGMENTS) => {
+            if socket.kind != SocketKind::Sctp {
+                return SyscallResult::Error(errno_to_i32(Errno::ENOPROTOOPT));
+            }
+            let val = match read_sockopt_i32(ctx, optval, optlen) {
+                Ok(val) => val,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            payload.with_options_mut(|opts| opts.sctp.disable_fragments = val != 0);
+            Ok(())
+        }
         (SOL_SCTP, SCTP_ASSOCINFO) => {
             if socket.kind != SocketKind::Sctp {
                 return SyscallResult::Error(errno_to_i32(Errno::ENOPROTOOPT));
@@ -3023,6 +3045,14 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
         (SOL_SCTP, SCTP_DEFAULT_SEND_PARAM) if socket.kind == SocketKind::Sctp => {
             let buf = payload.with_options(|o| o.sctp.default_send_param);
             write_sockopt_bytes(ctx, optval, optlen_ptr, &buf)
+        }
+        (SOL_SCTP, SCTP_MAXSEG) if socket.kind == SocketKind::Sctp => {
+            let val = payload.with_options(|o| o.sctp.maxseg);
+            write_sockopt_i32(ctx, optval, optlen_ptr, val as i32)
+        }
+        (SOL_SCTP, SCTP_DISABLE_FRAGMENTS) if socket.kind == SocketKind::Sctp => {
+            let val = payload.with_options(|o| o.sctp.disable_fragments);
+            write_sockopt_i32(ctx, optval, optlen_ptr, val as i32)
         }
         (SOL_SCTP, SCTP_SOCKOPT_PEELOFF) if socket.kind == SocketKind::Sctp => {
             // sctp_peeloff_arg_t { sctp_assoc_t associd @0; int sd @4 } = 8 bytes.

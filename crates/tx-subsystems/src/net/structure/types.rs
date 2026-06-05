@@ -606,6 +606,10 @@ pub struct SctpLevelOptions {
     /// SCTP_DEFAULT_SEND_PARAM: raw `struct sctp_sndrcvinfo` (32 bytes) used as
     /// the socket-level default for sends without an explicit sndrcvinfo.
     pub default_send_param: [u8; 32],
+    /// SCTP_MAXSEG: maximum fragment size (0 = use the path default).
+    pub maxseg: u32,
+    /// SCTP_DISABLE_FRAGMENTS: reject messages larger than the fragment point.
+    pub disable_fragments: bool,
 }
 
 impl SctpLevelOptions {
@@ -770,6 +774,8 @@ impl SocketOptionSet {
                 paddr_sackdelay: 0,
                 paddr_flags: 0,
                 default_send_param: [0u8; 32],
+                maxseg: 0,
+                disable_fragments: false,
             },
         }
     }
@@ -843,6 +849,8 @@ impl SocketOptionSet {
                 paddr_sackdelay: 0,
                 paddr_flags: 0,
                 default_send_param: [0u8; 32],
+                maxseg: 0,
+                disable_fragments: false,
             },
         }
     }
