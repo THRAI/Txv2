@@ -240,6 +240,16 @@ pub use numbers::{
     NR_SENDFILE64,
 };
 
+// Socket / network constants used by the socket syscall layer.
+pub use numbers::{
+    AF_INET, AF_INET6, AF_NETLINK, AF_PACKET, AF_UNIX, IPPROTO_ICMPV6, IPPROTO_IP, IPPROTO_TCP,
+    IPV6_2292DSTOPTS, IPV6_2292HOPLIMIT, IPV6_2292HOPOPTS, IPV6_2292PKTINFO, IPV6_2292RTHDR,
+    IPV6_HOPLIMIT, IPV6_PKTINFO, IPV6_RECVDSTOPTS, IPV6_RECVHOPLIMIT, IPV6_RECVHOPOPTS,
+    IPV6_RECVPKTINFO, IPV6_RECVRTHDR, IPV6_RECVTCLASS, IPV6_TCLASS, MCAST_JOIN_GROUP,
+    MCAST_LEAVE_GROUP, SIOCGIFCONF, SIOCGIFNAME, SOL_IPV6, SOL_NETLINK, SOL_PACKET, SOL_RAW,
+    SOL_SCTP, SOL_SOCKET, TPACKET_V1, TPACKET_V3,
+};
+
 /// Maximum number of input bytes the Phase 2a `write` syscall accepts
 /// in a single call. The dispatcher copies `[buf_ptr, buf_ptr+len)` into
 /// a kernel-side stack-bounded slice (via `from_raw_parts`); higher-level
@@ -870,12 +880,12 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + tx
         nr if nr == NR_BIND => sys_bind(req.args, ctx),
         nr if nr == NR_GETSOCKNAME => sys_getsockname(req.args, ctx),
         nr if nr == NR_SETSOCKOPT => sys_setsockopt(req.args, ctx),
-        nr if nr == NR_SENDTO => sys_sendto(req.args, ctx),
-        nr if nr == NR_RECVFROM => sys_recvfrom(req.args, ctx),
+        nr if nr == NR_SENDTO => sys_sendto(req.args, ctx).await,
+        nr if nr == NR_RECVFROM => sys_recvfrom::<P>(req.args, ctx).await,
         nr if nr == NR_LISTEN => sys_listen(req.args, ctx),
-        nr if nr == NR_CONNECT => sys_connect(req.args, ctx),
-        nr if nr == NR_ACCEPT => sys_accept(req.args, ctx),
-        nr if nr == NR_ACCEPT4 => sys_accept4(req.args, ctx),
+        nr if nr == NR_CONNECT => sys_connect(req.args, ctx).await,
+        nr if nr == NR_ACCEPT => sys_accept::<P>(req.args, ctx).await,
+        nr if nr == NR_ACCEPT4 => sys_accept4::<P>(req.args, ctx).await,
         nr if nr == NR_SENDFILE64 => sys_sendfile64(req.args, ctx).await,
         nr if nr == NR_PPOLL => sys_ppoll(req.args, ctx).await,
         nr if nr == NR_PSELECT6 => sys_pselect6::<P>(req.args, ctx).await,
@@ -1329,6 +1339,24 @@ pub(super) fn errno_to_i32(errno: Errno) -> i32 {
         Errno::ESTALE => 116,
         Errno::ETIMEDOUT => 110,
         Errno::EINTR => 4,
+        // Socket / network errnos (re-homed with the net syscall surface).
+        // Values mirror `tx_substrate::step::Errno::linux_i32`.
+        Errno::EADDRINUSE => 98,
+        Errno::EADDRNOTAVAIL => 99,
+        Errno::EAFNOSUPPORT => 97,
+        Errno::EALREADY => 114,
+        Errno::ECONNREFUSED => 111,
+        Errno::EDESTADDRREQ => 89,
+        Errno::EINPROGRESS => 115,
+        Errno::EISCONN => 106,
+        Errno::EMLINK => 31,
+        Errno::EMSGSIZE => 90,
+        Errno::ENOPROTOOPT => 92,
+        Errno::ENOTCONN => 107,
+        Errno::ENOTSOCK => 88,
+        Errno::EOPNOTSUPP => 95,
+        Errno::EPROTONOSUPPORT => 93,
+        Errno::ESOCKTNOSUPPORT => 94,
     }
 }
 

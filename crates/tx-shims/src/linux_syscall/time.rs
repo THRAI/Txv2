@@ -497,3 +497,29 @@ async fn drive_nanosleep_until<'a>(
         Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Interval-timer (ITIMER_REAL / SIGALRM) bridge for interruptible socket waits.
+//
+// The socket layer's `wait_on_socket_or_itimer` consults these to let an armed
+// ITIMER_REAL interrupt a blocking recv/accept. The full setitimer/getitimer
+// subsystem (per-pid IntervalTimer store + the tx-kernel trap-return delivery
+// hook `maybe_deliver_itimer_signal`) was NOT re-homed in the network rebase —
+// it is a separable timer feature. These stubs make the socket wait fall
+// through to a plain await, which is correct whenever no ITIMER_REAL is armed.
+//
+// TODO(itimer): restore the interval-timer subsystem if a socket-timeout LTP
+// test needs SIGALRM to interrupt a blocking socket syscall.
+// ---------------------------------------------------------------------------
+
+/// Deadline (ns) of this pid's armed ITIMER_REAL, or `None` if none is armed.
+/// Stub: always `None` until the interval-timer subsystem is re-homed.
+pub(super) fn itimer_real_deadline_ns(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// Take (and clear) a pending ITIMER_REAL interrupt delivered to this pid.
+/// Stub: always `false` until the interval-timer subsystem is re-homed.
+pub(super) fn consume_itimer_real_delivered_interrupt(_pid: u32) -> bool {
+    false
+}

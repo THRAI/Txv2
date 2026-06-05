@@ -479,11 +479,10 @@ pub(super) fn socket_identity_from_file(
             _ if open_file_is_path_only(file) => Err(Errno::EBADF),
             _ => Err(Errno::ENOTSOCK),
         },
-        OpenFileBacking::MountApi { file }
-            if file.kind() == tx_subsystems::mount::MountApiFileKind::OpenTree =>
-        {
-            Err(Errno::EBADF)
-        }
+        // NOTE: the feature branch had an `OpenFileBacking::MountApi` arm here
+        // (returning EBADF for an `open_tree` fd passed to a socket syscall).
+        // main does not carry the new mount-API fd kind, so non-socket
+        // backings fall through to ENOTSOCK.
         _ => Err(Errno::ENOTSOCK),
     }
 }

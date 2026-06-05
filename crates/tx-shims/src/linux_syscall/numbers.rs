@@ -1868,3 +1868,83 @@ pub const MEMBARRIER_SUPPORTED_MASK: u64 = MEMBARRIER_CMD_QUERY
     | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED
     | MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE
     | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE;
+
+// ---------------------------------------------------------------------------
+// Socket / network constants
+//
+// Address families, protocols, socket-option levels, IPv6 ancillary option
+// names, multicast group ops, and AF_PACKET ring versions used by the socket
+// syscall layer (`linux_syscall/socket.rs` + `socket/helpers.rs`). Values are
+// the Linux generic-ABI numbers. Re-homed after PR#50 stripped the net
+// syscall surface; SIOCGIF* live with the ioctl block above.
+// ---------------------------------------------------------------------------
+
+/// `AF_UNIX` / `AF_LOCAL` — local interprocess sockets.
+pub const AF_UNIX: u16 = 1;
+/// `AF_INET` — IPv4 Internet protocols.
+pub const AF_INET: u16 = 2;
+/// `AF_INET6` — IPv6 Internet protocols.
+pub const AF_INET6: u16 = 10;
+/// `AF_NETLINK` — kernel/user-space netlink sockets.
+pub const AF_NETLINK: u16 = 16;
+/// `AF_PACKET` — low-level packet interface.
+pub const AF_PACKET: u16 = 17;
+
+/// `IPPROTO_IP` — dummy protocol / IPv4-level socket options.
+pub const IPPROTO_IP: i32 = 0;
+/// `IPPROTO_TCP` — Transmission Control Protocol.
+pub const IPPROTO_TCP: i32 = 6;
+/// `IPPROTO_ICMPV6` — ICMPv6.
+pub const IPPROTO_ICMPV6: i32 = 58;
+
+/// `SOL_SOCKET` — socket-level options.
+pub const SOL_SOCKET: i32 = 1;
+/// `SOL_SCTP` — SCTP-level options.
+pub const SOL_SCTP: i32 = 132;
+/// `SOL_IPV6` — IPv6-level options.
+pub const SOL_IPV6: i32 = 41;
+/// `SOL_RAW` — raw-socket-level options.
+pub const SOL_RAW: i32 = 255;
+/// `SOL_PACKET` — AF_PACKET-level options.
+pub const SOL_PACKET: i32 = 263;
+/// `SOL_NETLINK` — netlink-level options.
+pub const SOL_NETLINK: i32 = 270;
+
+/// `IPV6_2292PKTINFO` — RFC 2292 packet info.
+pub const IPV6_2292PKTINFO: i32 = 2;
+/// `IPV6_2292HOPOPTS` — RFC 2292 hop-by-hop options.
+pub const IPV6_2292HOPOPTS: i32 = 3;
+/// `IPV6_2292DSTOPTS` — RFC 2292 destination options.
+pub const IPV6_2292DSTOPTS: i32 = 4;
+/// `IPV6_2292RTHDR` — RFC 2292 routing header.
+pub const IPV6_2292RTHDR: i32 = 5;
+/// `IPV6_2292HOPLIMIT` — RFC 2292 hop limit.
+pub const IPV6_2292HOPLIMIT: i32 = 8;
+/// `IPV6_PKTINFO` — sticky/ancillary packet info.
+pub const IPV6_PKTINFO: i32 = 50;
+/// `IPV6_RECVPKTINFO` — receive packet info.
+pub const IPV6_RECVPKTINFO: i32 = 49;
+/// `IPV6_RECVHOPLIMIT` — receive hop limit.
+pub const IPV6_RECVHOPLIMIT: i32 = 51;
+/// `IPV6_HOPLIMIT` — ancillary hop limit.
+pub const IPV6_HOPLIMIT: i32 = 52;
+/// `IPV6_RECVHOPOPTS` — receive hop-by-hop options.
+pub const IPV6_RECVHOPOPTS: i32 = 53;
+/// `IPV6_RECVRTHDR` — receive routing header.
+pub const IPV6_RECVRTHDR: i32 = 56;
+/// `IPV6_RECVDSTOPTS` — receive destination options.
+pub const IPV6_RECVDSTOPTS: i32 = 58;
+/// `IPV6_RECVTCLASS` — receive traffic class.
+pub const IPV6_RECVTCLASS: i32 = 66;
+/// `IPV6_TCLASS` — ancillary/sticky traffic class.
+pub const IPV6_TCLASS: i32 = 67;
+
+/// `MCAST_JOIN_GROUP` — protocol-independent multicast join.
+pub const MCAST_JOIN_GROUP: i32 = 42;
+/// `MCAST_LEAVE_GROUP` — protocol-independent multicast leave.
+pub const MCAST_LEAVE_GROUP: i32 = 45;
+
+/// `TPACKET_V1` — AF_PACKET v1 ring format.
+pub const TPACKET_V1: i32 = 0;
+/// `TPACKET_V3` — AF_PACKET v3 ring format.
+pub const TPACKET_V3: i32 = 2;
