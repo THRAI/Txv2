@@ -271,6 +271,9 @@ pub use numbers::{
     SIOCGIFINDEX, SIOCGIFMTU, SIOCGIFTXQLEN, SIOCSIFFLAGS, SIOCSIFMTU, SOL_TLS,
 };
 
+// Message-based socket syscall numbers (their handlers were undispatched).
+pub use numbers::{NR_RECVMMSG, NR_RECVMSG, NR_SENDMMSG, NR_SENDMSG};
+
 /// Maximum number of input bytes the Phase 2a `write` syscall accepts
 /// in a single call. The dispatcher copies `[buf_ptr, buf_ptr+len)` into
 /// a kernel-side stack-bounded slice (via `from_raw_parts`); higher-level
@@ -907,6 +910,13 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + tx
         nr if nr == NR_CONNECT => sys_connect(req.args, ctx).await,
         nr if nr == NR_ACCEPT => sys_accept::<P>(req.args, ctx).await,
         nr if nr == NR_ACCEPT4 => sys_accept4::<P>(req.args, ctx).await,
+        nr if nr == NR_GETPEERNAME => sys_getpeername(req.args, ctx),
+        nr if nr == NR_GETSOCKOPT => sys_getsockopt(req.args, ctx),
+        nr if nr == NR_SHUTDOWN => sys_shutdown(req.args, ctx),
+        nr if nr == NR_SENDMSG => sys_sendmsg(req.args, ctx).await,
+        nr if nr == NR_RECVMSG => sys_recvmsg::<P>(req.args, ctx).await,
+        nr if nr == NR_SENDMMSG => sys_sendmmsg(req.args, ctx).await,
+        nr if nr == NR_RECVMMSG => sys_recvmmsg::<P>(req.args, ctx).await,
         nr if nr == NR_SENDFILE64 => sys_sendfile64(req.args, ctx).await,
         nr if nr == NR_PPOLL => sys_ppoll(req.args, ctx).await,
         nr if nr == NR_PSELECT6 => sys_pselect6::<P>(req.args, ctx).await,

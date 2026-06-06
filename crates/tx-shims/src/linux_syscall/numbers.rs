@@ -2028,6 +2028,15 @@ pub const IPT_SO_GET_ENTRIES: i32 = 65;
 pub const IPPROTO_UDP: i32 = 17;
 /// `SOL_TLS` — kernel TLS socket-option level.
 pub const SOL_TLS: i32 = 282;
+
+// Message-based socket syscall numbers (RV64 generic ABI). Re-homed: their
+// handlers (sys_sendmsg/recvmsg/sendmmsg/recvmmsg) exist but were undispatched,
+// so sendmsg(2) fell through to ENOSYS — breaking every SCTP/UDP/TCP test that
+// sends ancillary-data messages.
+pub const NR_SENDMSG: u64 = 211;
+pub const NR_RECVMSG: u64 = 212;
+pub const NR_RECVMMSG: u64 = 243;
+pub const NR_SENDMMSG: u64 = 269;
 // More IPPROTO_IPV6 (SOL_IPV6) options.
 pub const IPV6_ADDRFORM: i32 = 1;
 pub const IPV6_CHECKSUM: i32 = 7;
