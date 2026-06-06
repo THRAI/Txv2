@@ -1,3 +1,19 @@
+- 2026-06-07 **Net re-home: netns/userns infrastructure restored — dimension-A b6 now 10/11
+  (exact baseline).** Causal correction (git-verified): the dropped surface was orphaned by
+  **PR#50** (`4b7868a1`, codex/filesystem-smp-gap-stack merge — NOT user work): its parent PR#47
+  has KERNEL_CONFIG_TEXT=5/sys_unshare=1/PROCFS_SYS_KERNEL=21, the merge result has 0. main never
+  had them (feature additions). The subsequent re-home restored most net code but not these env
+  pieces. Restored the full netns setup chain layer by layer, each verified to unblock the next:
+  **(1)** kernel .config (`5a02d5e7`), **(2)** /proc/sys/kernel/{tainted,pid_max} (`4e5e664b`),
+  **(3)** unshare(CLONE_NEWUSER|CLONE_NEWNET) syscall (`7ebd189b`), **(4)** writable
+  /proc/<pid>/{uid_map,gid_map,setgroups} + /proc/self->caller-pid resolution (`75d3a6e4`:
+  FsOps::step_write_projected + VFS Projected write routing + procfs writable nodes +
+  procfs_self_target_pid). **Result:** setsockopt05/07/08/09 (full userns+netns setup) PASS;
+  **b6 setsockopt02-10 = 10/11 (10 TPASS + 1 TCONF), exact baseline.** Non-regressive: recv01 5/5,
+  b1 40/40. **Still-open env gaps (separate, not netns):** /etc/passwd `nobody` (bind02 getpwnam),
+  on-disk unix-socket files (recvmsg01/bind04 unlink ENOENT), SCTP/bind back-to-back EADDRINUSE
+  (lingering loopback peer). Layer map: `msp/net-rehome-verification-tracker.md`.
+
 - 2026-06-06 **Net re-home: restored dropped boot/env surface (NOT a "verification path"
   difference — corrected).** The runtest-vs-slim-sdcard "difference" was a misdiagnosis: both
   run the same kernel/binaries; the failures are a **stack of boot/env surface PR#50 dropped**,
