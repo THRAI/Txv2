@@ -13,7 +13,8 @@
 // `populate_rootfs_shebang_shims` for the full design rationale.
 
 use super::*;
-use crate::adapter::step_engine::{self as step_engine, StepOutcome};
+use crate::adapter::step_engine::{self as step_engine, page_allocator, StepOutcome};
+use tx_subsystems::page_backed::{FsPageBacking, MaterializeAccess, PageIndex};
 
 impl<P: TxPlatform> CoreInit<P> {
     /// Populate the rootfs tmpfs with the shebang shims the
@@ -166,6 +167,150 @@ impl<P: TxPlatform> CoreInit<P> {
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":tmp-dirs:ok\n");
     }
+
+    /// Seed `/lib/modules/6.1.0-txkernel/modules.{dep,builtin}` listing the
+    /// network drivers — including `kernel/net/sctp/sctp.ko` — so LTP's
+    /// `tst_check_driver("sctp")` / `tst_kernel` gate opens and the
+    /// `net.sctp` suite actually runs instead of TCONF-skipping. Re-homed
+    /// with the net subsystem (main dropped it). The `/boot/config-*` text
+    /// (needed only by LTP's kconfig parser) is intentionally omitted here.
+    pub(crate) fn populate_rootfs_kernel_config() {
+        let root_mount = ROOT_MOUNT
+            .lock()
+            .clone()
+            .expect("populate_rootfs_kernel_config: ROOT_MOUNT must be populated");
+        let rootfs_payload = root_mount
+            .payload_cap()
+            .expect("rootfs payload alive during boot")
+            .into_cap()
+            .clone();
+        let cred = Credential::root();
+        let root_fs_object_id = root_mount.root().fs_object_id();
+        let fs_ops = &rootfs_payload.fs_ops;
+        let fs_page_backing = &rootfs_payload.fs_page_backing;
+        let create_ctx = RootfsCreateContext {
+            fs_ops,
+            fs_page_backing,
+            mount: &rootfs_payload,
+            cred: &cred,
+        };
+
+        let lib_id = match mkdir_or_find(fs_ops, root_fs_object_id, b"lib", 0o755, &cred) {
+            Some(id) => id,
+            None => {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":kernel-config:err:mkdir-lib\n");
+                return;
+            }
+        };
+        let modules_id = match mkdir_or_find(fs_ops, lib_id, b"modules", 0o755, &cred) {
+            Some(id) => id,
+            None => {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":kernel-config:err:mkdir-modules\n");
+                return;
+            }
+        };
+        let release_id = match mkdir_or_find(fs_ops, modules_id, b"6.1.0-txkernel", 0o755, &cred) {
+            Some(id) => id,
+            None => {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":kernel-config:err:mkdir-release\n");
+                return;
+            }
+        };
+        let modules_dep = b"kernel/drivers/net/dummy.ko:\n\
+kernel/drivers/net/veth.ko:\n\
+kernel/net/sched/sch_teql.ko:\n\
+kernel/net/ipv4/netfilter/ip_tables.ko:\n\
+kernel/net/ipv6/netfilter/ip6_tables.ko:\n\
+kernel/net/netfilter/nf_tables.ko:\n\
+kernel/net/sctp/sctp.ko:\n";
+        let modules_builtin = b"kernel/drivers/net/dummy.ko\n\
+kernel/drivers/net/veth.ko\n\
+kernel/net/sched/sch_teql.ko\n\
+kernel/net/ipv4/netfilter/ip_tables.ko\n\
+kernel/net/ipv6/netfilter/ip6_tables.ko\n\
+kernel/net/netfilter/nf_tables.ko\n\
+kernel/net/sctp/sctp.ko\n";
+        if !create_file_with_data(&create_ctx, release_id, b"modules.dep", 0o644, modules_dep)
+            || !create_file_with_data(
+                &create_ctx,
+                release_id,
+                b"modules.builtin",
+                0o644,
+                modules_builtin,
+            )
+        {
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":kernel-config:err:create-modules\n");
+            return;
+        }
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":kernel-config:ok\n");
+    }
+}
+
+struct RootfsCreateContext<'a> {
+    fs_ops: &'a alloc::sync::Arc<dyn tx_subsystems::vfs::FsOps>,
+    fs_page_backing: &'a alloc::sync::Arc<dyn FsPageBacking>,
+    mount: &'a Cap<tx_subsystems::mount::MountPayload>,
+    cred: &'a Credential,
+}
+
+fn create_file_with_data(
+    ctx: &RootfsCreateContext<'_>,
+    parent: tx_subsystems::vfs::FsObjectId,
+    name: &[u8],
+    mode: u16,
+    data: &[u8],
+) -> bool {
+    let (file_id, file_meta) = {
+        let guard = step_engine::guard();
+        match ctx.fs_ops.create_inode(parent, name, mode, ctx.cred, &guard) {
+            StepOutcome::Done(out) => out,
+            StepOutcome::Err(step_engine::Errno::EEXIST) => return true,
+            _ => return false,
+        }
+    };
+
+    let pc = {
+        let guard = step_engine::guard();
+        let rnode = match ctx
+            .fs_ops
+            .materialise_rnode(file_id, file_meta, ctx.mount, &guard)
+        {
+            StepOutcome::Done(rnode) => rnode,
+            _ => return false,
+        };
+        match rnode.backing() {
+            tx_subsystems::vfs::structure::RNodeBacking::PageBacked { pc } => pc.clone(),
+            _ => return false,
+        }
+    };
+
+    for (idx, chunk) in data.chunks(tx_subsystems::vm::USER_PAGE_SIZE).enumerate() {
+        let materialized =
+            match pc.materialize_anon(PageIndex::new(idx as u64), MaterializeAccess::Write) {
+                Ok(page) => page,
+                Err(_) => return false,
+            };
+        let frame_base = match page_allocator::frame_kernel_addr(materialized.ppn) {
+            Ok(addr) => addr,
+            Err(_) => return false,
+        };
+        unsafe {
+            core::ptr::copy_nonoverlapping(chunk.as_ptr(), frame_base, chunk.len());
+        }
+    }
+
+    let guard = step_engine::guard();
+    matches!(
+        ctx.fs_page_backing
+            .truncate(file_id, data.len() as u64, &guard),
+        StepOutcome::Done(())
+    )
 }
 
 /// Create-or-find a directory under `parent`. Treats EEXIST as
