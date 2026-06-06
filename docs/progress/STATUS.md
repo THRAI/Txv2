@@ -1,3 +1,15 @@
+- 2026-06-07 **Dimension A (socket syscall) sweep complete.** Cleared the last 7 unrun cases:
+  sendto01/sendto03/getpeername01 PASS; **sendto02 PASS after fixing sendto to validate the user
+  buffer before the SCTP implicit association (`<this commit>`: EFAULT before ECONNREFUSED)**;
+  send02 (4/4 MSG_MORE, 1000-iter), connect02 (IPv6 dual-stack 1000-loop), bind06 (AF_PACKET
+  race) all PASS. **Dimension A now: b1 40/40, b2 35/35, b5 14/17, b6 10/11 = baseline-exact;
+  b3/b4 clean except the known non-regressions** — recvmsg01/bind04 (AF_UNIX bind has no on-disk
+  inode: pre-existing, backup lacked it too), sendmsg01 (14/14 then teardown SIGSEGV, handoff §5),
+  recvmmsg01 (musl wrapper — the baseline's own b3 37/38 miss), bind05 (pthread peer hang). So the
+  dimension-A 229/236 baseline is effectively restored; remaining gaps are pre-existing/known, not
+  re-home regressions. Next: dimension C (SCTP, 28 unchecked) and dimension B (net.*, 36 entries),
+  both now likely helped by the restored netns/userns infra.
+
 - 2026-06-07 **Net re-home: /etc/{passwd,group} identity files restored (`21dff5c9`) — bind02
   PASS.** PR#50 also dropped `populate_rootfs_identity_files`; re-homed a minimal seeder (root +
   nobody) so `getpwnam(nobody)` resolves. **Boundary reached:** every surface PR#50 dropped that
