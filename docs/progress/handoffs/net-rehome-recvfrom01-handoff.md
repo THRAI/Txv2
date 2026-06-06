@@ -182,6 +182,53 @@ ret=0 — rely on the per-case `TPASS` count + `: 0`, and diff the TPASS count v
   and `boards/tx-hal-riscv64-qemu-virt/src/boot_trampoline.rs` `.equ TX_RV64_KERNEL_ALIAS_L0_TABLES, 16`
   — **must stay in sync**; this fixed the silent boot livelock (0 serial, PC pinned).
 
+## Baseline test inventory — exactly what to restore + re-run
+
+This is the user's goal: restore SCTP to baseline AND re-run every previously-passing
+net-stack LTP test. Two source-of-truth ledgers (read them, they have per-case detail):
+- **net syscall cases (50):** `docs/LTP/ltp-network-syscall-progress.md` (b1–b6 below).
+- **net.sctp cases:** `docs/LTP/runtests/ltp-runtest-net-sctp-progress.md` (table ~lines 216-265).
+- Batch grouping rationale: `docs/LTP/ltp-batches.md` (normal batches FILTER net prefixes —
+  net tests are "manual only", run by name; `LTP_BATCH=net`=0 is NOT "no tests").
+
+### Net syscall batches b1–b6 (run via `ltp-runtest:syscalls:<+joined>`, baseline scores)
+
+| Batch | Cases (`+`-join for the boot arg) | Baseline | Witness log |
+| --- | --- | --- | --- |
+| **b1** basic/options | `socket01 socket02 listen01 getsockname01 getsockopt01 getsockopt02 setsockopt01` | 40/40 | `target/oscomp/ltp-net-b1-basic.txt` |
+| **b2** send/recv | `send01 send02 sendto01 sendto02 sendto03 recv01 recvfrom01` | 35/35 | `target/oscomp/ltp-net-b2-after-rds-sctp.txt` |
+| **b3** msg/mmsg | `sendmsg01 sendmsg02 sendmsg03 recvmsg01 recvmsg02 recvmsg03 sendmmsg01 sendmmsg02 recvmmsg01` | 37/38 | `target/oscomp/ltp-net-b3-after-rds-sctp.txt` |
+| **b4** bind/connect/accept | `bind01 bind02 bind03 bind04 bind05 bind06 connect01 connect02 accept01 accept02 accept03 accept4_01 getpeername01` | 93/95 | `target/oscomp/ltp-net-b4-after-kernel-object-fds.txt` |
+| **b5** socketpair/socketcall | `socketpair01 socketpair02 socketcall01 socketcall02 socketcall03` | 14/17 | `target/oscomp/ltp-net-b5-socketpair-socketcall.txt` |
+| **b6** setsockopt tail | `setsockopt02 setsockopt03 setsockopt04 setsockopt05 setsockopt06 setsockopt07 setsockopt08 setsockopt09 setsockopt10` | 10/11 | `target/oscomp/ltp-net-b6-after-tls-ulp.txt` |
+
+Local judge subcase total across b1–b6 baseline: **229/236**. Score a run with
+`python3 tools/oscomp-judge.py target/oscomp/<log>.txt target/oscomp/testdata`.
+
+**⚠️ ORDER MATTERS (confirmed):** b2's `send01 send02 sendto01 sendto02 sendto03` run BEFORE
+`recv01 recvfrom01` and **warm the loopback** — that's why recv01/recvfrom01 pass `35/35` in
+the baseline batch but **hang when run alone** (the cold-start connect bug above). So: run
+each batch in its **listed order**, and reproduce the baseline by running the **whole b2
+group** (not recvfrom01 alone). Fixing the cold-start connect hang is the robust fix; running
+b2-in-order is how the baseline achieved the pass. Boot-arg note: long `+`-joined filters can
+be truncated (see the doc's `send01+s` truncation warning) — if a batch looks cut off, split it.
+
+### net.sctp baseline (run via `ltp-runtest:net.sctp:<+joined>` or whole module)
+
+**PASS in baseline (restore all of these):** `test_1_to_1_sockopt`(22-23) `test_tcp_style`(22)
+`test_tcp_style_v6`(22) `test_1_to_1_socket_bind_listen`(15) `test_basic`(15) `test_basic_v6`(15)
+`test_getname`(13) `test_getname_v6`(13) `test_1_to_1_addrs`(10) `test_1_to_1_accept_close`(10)
+`test_1_to_1_connect`(10) `test_1_to_1_send`(9) `test_1_to_1_recvfrom`(7) `test_1_to_1_shutdown`(6)
+`test_1_to_1_nonblock`(5) `test_1_to_1_events`(4) `test_1_to_1_sendto`(4) `test_1_to_1_rtoinfo`(3)
+`test_1_to_1_initmsg_connect`(2) `test_inaddr_any`(2) `test_inaddr_any_v6`(2) `test_recvmsg`(2)
+`test_1_to_1_threads`(1) `test_assoc_shutdown`(1).
+**PARTIAL (match the documented fraction, don't regress):** `test_sockopt` 33/44 ·
+`test_connect` 4/5 · `test_peeloff` 3/7 · `test_sctp_sendrecvmsg` 6 · `test_timetolive` 3 ·
+`test_fragments` 2 · `test_1_to_1_recvmsg` 3/8 (musl-blocked).
+**Already re-verified this session (individually):** `test_assoc_shutdown` TPASS,
+`test_1_to_1_sockopt` 22/22, `test_1_to_1_socket_bind_listen` 14/14, `test_basic` 14/15.
+(Witness counts in the doc are ground truth; e.g. sockopt witness=22, not the static 23.)
+
 ## Baselines / witnesses
 
 - SCTP documented baseline: `docs/LTP/runtests/ltp-runtest-net-sctp-progress.md`.
