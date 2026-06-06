@@ -273,6 +273,55 @@ kernel/net/sctp/sctp.ko\n";
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":kernel-config:ok\n");
     }
+
+    /// Seed minimal `/etc/{passwd,group}` (with a `nobody` entry) so libc
+    /// `getpwnam`/`getgrnam` resolve. Re-homed with the net subsystem; PR#50
+    /// dropped the identity-file seeding, so LTP cases that drop privileges to
+    /// `nobody` (e.g. bind02) TBROK with `getpwnam(nobody): ENOENT`.
+    pub(crate) fn populate_rootfs_identity_files() {
+        let root_mount = ROOT_MOUNT
+            .lock()
+            .clone()
+            .expect("populate_rootfs_identity_files: ROOT_MOUNT must be populated");
+        let rootfs_payload = root_mount
+            .payload_cap()
+            .expect("rootfs payload alive during boot")
+            .into_cap()
+            .clone();
+        let cred = Credential::root();
+        let root_fs_object_id = root_mount.root().fs_object_id();
+        let fs_ops = &rootfs_payload.fs_ops;
+        let fs_page_backing = &rootfs_payload.fs_page_backing;
+        let create_ctx = RootfsCreateContext {
+            fs_ops,
+            fs_page_backing,
+            mount: &rootfs_payload,
+            cred: &cred,
+        };
+
+        let etc_id = match mkdir_or_find(fs_ops, root_fs_object_id, b"etc", 0o755, &cred) {
+            Some(id) => id,
+            None => {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":identity-files:err:mkdir-etc\n");
+                return;
+            }
+        };
+
+        let passwd = b"root:x:0:0:root:/root:/bin/sh\n\
+nobody:x:65534:65534:nobody:/nonexistent:/bin/sh\n";
+        let group = b"root:x:0:\ndaemon:x:2:\nusers:x:100:\nnogroup:x:65534:\nnobody:x:65534:\n";
+        if !create_file_with_data(&create_ctx, etc_id, b"passwd", 0o644, passwd)
+            || !create_file_with_data(&create_ctx, etc_id, b"group", 0o644, group)
+        {
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":identity-files:err:create-etc-files\n");
+            return;
+        }
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":identity-files:ok\n");
+    }
 }
 
 struct RootfsCreateContext<'a> {
