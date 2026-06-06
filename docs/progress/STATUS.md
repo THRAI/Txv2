@@ -31,8 +31,26 @@
   such failures poison the shared `EPOCH_TEST_LOCK`, cascading ~191 net tests to
   "FAILED"; core net unit tests pass in isolation (e.g. `core_structure_tests` 25/25).
   **Commits:** `8be855d9` (tx-subsystems), `4453aa57` (tx-shims), `bed63c40` (zones +
-  HAL + test packet fields). **Verification in progress:** QEMU oscomp
-  cyclictest/iozone + SCTP LTP. **Not force-pushed** — local only.
+  HAL + test packet fields), `2ebc196f` (boot-livelock fix). **BOOT-LIVELOCK FIX
+  (`2ebc196f`):** the grown debug kernel image (main's 8M `TX_OBSERVE_RINGS` + the
+  re-homed net subsystem → `__kernel_end` ~16.7M) outgrew the 16M bootstrap
+  kernel-alias window the boot trampoline maps before enabling paging; the moment
+  satp turned on the unmapped image tail store-page-faulted (scause=15) into
+  `stvec=0x80200000` (the entry trampoline), re-running the BSS-clear loop with
+  paging on → 99.9%-CPU trap-vector livelock, zero serial output. Diagnosed by
+  QEMU monitor (PC pinned at the BSS-clear store, scause=15, stvec=entry) +
+  identical-command boot of the backup kernel (12.9M, boots fine). Fixed:
+  `KERNEL_BOOTSTRAP_ALIAS_SIZE` 16M→32M + `TX_RV64_KERNEL_ALIAS_L0_TABLES` 8→16.
+  **QEMU verification (rv64-qemu, `make oscomp-qemu-rv64 OSCOMP_GROUPS=<g>`):**
+  kernel boots clean (zone/reactor/init/tty/irq/block/mounts/fixture); **cyclictest
+  PASS** (NO_STRESS_P1/P8 + STRESS_P1/P8 + hackbench all `success`, `userspace:exited:0`,
+  zero panics/traps); **iozone PASS** (`iozone test complete`). These are PR#50's
+  two non-net suites. **SCTP / net.sctp:** the net subsystem (incl. SCTP protocol
+  code) re-homed + boots, but the SCTP `setsockopt`/`getsockopt` dispatch remains
+  deferred (the user's own pre-existing #1 blocker: SCTP sockopt → ENOPROTOOPT),
+  and `make oscomp-local-rv64-ltp-runtest LTP_RUNTEST=net.sctp` (the documented
+  SCTP entry) is no longer in the Makefile — needs the docker grader. **Not
+  force-pushed** — local only.
 
 - 2026-06-05 **Rebased `feature-network-next` onto current `main`.** The branch was
   69 commits past a 2026-05-28 merge-base while `main` raced 732 commits / 8 days

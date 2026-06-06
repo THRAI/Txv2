@@ -896,6 +896,16 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
                 selected += 1;
                 continue;
             }
+            // `ltp-runtest:<module>[:<case-filter>]` runs a specific LTP runtest
+            // file (e.g. `net.sctp`), optionally filtered to `+`-joined case tags.
+            // Re-homed with the net subsystem (main dropped the LTP runner).
+            if let Some(module) = group.strip_prefix("ltp-runtest:") {
+                let (module, filter) = module.split_once(':').unwrap_or((module, ""));
+                let ltp_args = ltp_args_from_cmdline::<P>();
+                append_ltp_runtest(&mut cmd, module, filter, &ltp_args);
+                selected += 1;
+                continue;
+            }
             if is_libctest_musl_group(group) {
                 append_full_libctest(&mut cmd);
                 selected += 1;
@@ -1246,6 +1256,262 @@ fn oscomp_musl_script_for_group(group: &str) -> Option<&'static str> {
 
 fn is_libctest_musl_group(group: &str) -> bool {
     matches!(group, "libctest" | "libctest-musl")
+}
+
+// ---------------------------------------------------------------------------
+// LTP runtest runner (`tx.oscomp.groups=ltp-runtest:<module>[:<case-filter>]`).
+//
+// Re-homed with the net subsystem after PR#50 dropped it from main. Lets a
+// boot cmdline run one LTP runtest file (e.g. `net.sctp`) — optionally filtered
+// to `+`-joined case tags — by emitting a busybox shell loop over
+// `ltp/runtest/<module>` that prints `RUN/PASS/FAIL LTP CASE` markers the
+// host-side judge parses.
+// ---------------------------------------------------------------------------
+
+const LOCAL_LTP_SKIP_SHELL_PATTERN: &str = "\
+clock_gettime01|clock_gettime04|dirtyc0w_shmem|fork14|futex_cmp_requeue01|\
+getrusage03|getrusage04|kcmp03|kill10|kill11|msgrcv05|msgrcv06|msgsnd05|\
+msgsnd06|rename14|shmctl01|sigtimedwait01|sigwaitinfo01|wait401|waitid07|\
+waitid08|waitpid07|waitpid11";
+
+const LTP_CASE_PATH: &str =
+    "/tx-ltp/bin:/musl/musl/ltp/testcases/bin:/musl/musl/ltp/bin:/musl/musl/ltp/testscripts:/musl/musl:$PATH";
+const LTP_TRACE_CASE_PATH: &str =
+    "/tx-ltp/trace-bin:/tx-ltp/bin:/musl/musl/ltp/testcases/bin:/musl/musl/ltp/bin:/musl/musl/ltp/testscripts:/musl/musl:$PATH";
+
+#[derive(Clone, Copy, Debug, Default)]
+struct LtpArgs<'a> {
+    max_runtime: Option<&'a str>,
+    max_runtime_cases: Option<&'a str>,
+    trace_runtime: bool,
+}
+
+impl<'a> LtpArgs<'a> {
+    const fn none() -> Self {
+        Self {
+            max_runtime: None,
+            max_runtime_cases: None,
+            trace_runtime: false,
+        }
+    }
+
+    const fn max_runtime(max_runtime: &'a str) -> Self {
+        Self {
+            max_runtime: Some(max_runtime),
+            max_runtime_cases: None,
+            trace_runtime: false,
+        }
+    }
+
+    const fn max_runtime_for_cases(max_runtime: &'a str, cases: &'a str) -> Self {
+        Self {
+            max_runtime: Some(max_runtime),
+            max_runtime_cases: Some(cases),
+            trace_runtime: false,
+        }
+    }
+
+    fn shell_max_runtime_assignment(&self, case_var: &str) -> alloc::string::String {
+        use alloc::string::String;
+        use core::fmt::Write as _;
+
+        let mut assignment = String::from("ltp_max_runtime='';");
+        let Some(value) = self.max_runtime.filter(|value| is_positive_int_token(value)) else {
+            return assignment;
+        };
+        match self.max_runtime_cases {
+            None => {
+                let _ = write!(assignment, " ltp_max_runtime='{value}';");
+            }
+            Some(cases) => {
+                let mut pattern = String::new();
+                for candidate in cases.split('+').map(str::trim) {
+                    if !is_ltp_case_token(candidate) {
+                        continue;
+                    }
+                    if !pattern.is_empty() {
+                        pattern.push('|');
+                    }
+                    pattern.push_str(candidate);
+                }
+                if !pattern.is_empty() {
+                    let _ = write!(
+                        assignment,
+                        " case \"${case_var}\" in {pattern}) ltp_max_runtime='{value}';; esac;"
+                    );
+                }
+            }
+        }
+        assignment
+    }
+
+    fn shell_trace_runtime_assignment(&self) -> &'static str {
+        if self.trace_runtime {
+            "tx_ltp_trace_runtime=1; export tx_ltp_trace_runtime; TST_NET_RHOST_RUN_DEBUG=1; export TST_NET_RHOST_RUN_DEBUG;"
+        } else {
+            "tx_ltp_trace_runtime=''; export tx_ltp_trace_runtime;"
+        }
+    }
+
+    const fn ltp_case_path(&self) -> &'static str {
+        if self.trace_runtime {
+            LTP_TRACE_CASE_PATH
+        } else {
+            LTP_CASE_PATH
+        }
+    }
+}
+
+fn ltp_args_from_cmdline<P: tx_hal::TxPlatform>() -> LtpArgs<'static> {
+    let max_runtime = cmdline_value::<P>("tx.ltp.max_runtime").filter(|v| is_positive_int_token(v));
+    let max_runtime_cases = cmdline_value::<P>("tx.ltp.max_runtime_cases");
+    let trace_runtime = cmdline_bool::<P>("tx.ltp.trace_runtime");
+    let mut args = match (max_runtime, max_runtime_cases) {
+        (Some(max_runtime), Some(cases)) => LtpArgs::max_runtime_for_cases(max_runtime, cases),
+        (Some(max_runtime), None) => LtpArgs::max_runtime(max_runtime),
+        _ => LtpArgs::none(),
+    };
+    args.trace_runtime = trace_runtime;
+    args
+}
+
+fn cmdline_value<P: tx_hal::TxPlatform>(key: &str) -> Option<&'static str> {
+    let cmdline = <P as tx_hal::BootInfoIf>::boot_info().cmdline?;
+    for token in cmdline.split_ascii_whitespace() {
+        let Some((token_key, value)) = token.split_once('=') else {
+            continue;
+        };
+        if token_key == key && !value.is_empty() {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn cmdline_bool<P: tx_hal::TxPlatform>(key: &str) -> bool {
+    matches!(cmdline_value::<P>(key), Some("1" | "true" | "yes" | "on"))
+}
+
+fn is_positive_int_token(value: &str) -> bool {
+    value.bytes().all(|byte| byte.is_ascii_digit()) && value.bytes().any(|byte| byte != b'0')
+}
+
+fn is_ltp_case_token(case: &str) -> bool {
+    !case.is_empty()
+        && case
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+fn is_safe_ltp_runtest_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+fn is_safe_ltp_runtest_filter(filter: &str) -> bool {
+    filter
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'+'))
+}
+
+fn ltp_runtest_selected_tags(filter: &str) -> alloc::string::String {
+    use core::fmt::Write as _;
+
+    if filter.is_empty() {
+        return alloc::string::String::new();
+    }
+    let mut selected = alloc::string::String::from("|");
+    for tag in filter.split('+') {
+        if tag.is_empty() {
+            continue;
+        }
+        let _ = write!(selected, "{tag}|");
+    }
+    selected
+}
+
+fn is_native_network_runtest(module: &str) -> bool {
+    module.starts_with("net.") || module.starts_with("net_stress.") || module == "can"
+}
+
+fn append_ltp_script_env_with_default_ifaces(
+    cmd: &mut alloc::string::String,
+    install_default_ifaces: bool,
+) {
+    use core::fmt::Write as _;
+
+    let _ = write!(
+        cmd,
+        "; /musl/musl/busybox mkdir -p /bin; if [ ! -f /tmp/tx-busybox-copied ]; then /musl/musl/busybox rm -f /tmp/tx-busybox-stage; if /musl/musl/busybox cp /musl/musl/busybox /tmp/tx-busybox-stage; then /musl/musl/busybox chmod 755 /tmp/tx-busybox-stage; /musl/musl/busybox rm -f /bin/busybox /bin/sh /bin/cat /bin/true /bin/ls /bin/basename /bin/ip /bin/ifconfig /bin/grep /bin/seq /bin/ping /bin/arp; /musl/musl/busybox mv /tmp/tx-busybox-stage /bin/busybox; /bin/busybox --install -s /bin; /bin/busybox touch /tmp/tx-busybox-copied; fi; fi; export LTPROOT=/musl/musl/ltp; export PATH=/tx-ltp/bin:/bin:/musl/glibc:/musl/musl:/musl/musl/ltp/testcases/bin"
+    );
+    if install_default_ifaces {
+        let _ = write!(
+            cmd,
+            "; [ -n \"$LHOST_IFACES\" ] || export LHOST_IFACES=virtio-net0; [ -n \"$RHOST_IFACES\" ] || export RHOST_IFACES=virtio-net0"
+        );
+    }
+}
+
+fn append_ltp_runtest_env(cmd: &mut alloc::string::String, module: &str) {
+    use core::fmt::Write as _;
+
+    append_ltp_script_env_with_default_ifaces(cmd, false);
+    if module == "net.ipv6_lib" {
+        let _ = write!(
+            cmd,
+            "; [ -n \"$LHOST_IFACES\" ] || export LHOST_IFACES=virtio-net0"
+        );
+    } else if is_native_network_runtest(module) {
+        let _ = write!(cmd, "; [ -n \"$LHOST_IFACES\" ] || export LHOST_IFACES=eth0");
+    }
+}
+
+fn append_ltp_runtest(
+    cmd: &mut alloc::string::String,
+    module: &str,
+    filter: &str,
+    args: &LtpArgs<'_>,
+) {
+    use core::fmt::Write as _;
+
+    let module = module.trim();
+    let filter = filter.trim();
+    append_ltp_runtest_env(cmd, module);
+    if !is_safe_ltp_runtest_name(module) || !is_safe_ltp_runtest_filter(filter) {
+        let _ = write!(
+            cmd,
+            "; ./busybox echo \"#### OS COMP TEST GROUP START ltp-musl ####\""
+        );
+        let _ = write!(
+            cmd,
+            "; ./busybox echo \"FAIL LTP RUNTEST {module} : invalid module name\""
+        );
+        let _ = write!(
+            cmd,
+            "; ./busybox echo \"#### OS COMP TEST GROUP END ltp-musl ####\""
+        );
+        return;
+    }
+
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"#### OS COMP TEST GROUP START ltp-musl ####\""
+    );
+    let selected_tags = ltp_runtest_selected_tags(filter);
+    let skip_pattern = LOCAL_LTP_SKIP_SHELL_PATTERN;
+    let runtime_assignment = args.shell_max_runtime_assignment("tag");
+    let trace_assignment = args.shell_trace_runtime_assignment();
+    let ltp_case_path = args.ltp_case_path();
+    let _ = write!(
+        cmd,
+        "; selected_tags='{selected_tags}'; {trace_assignment} if [ -f ltp/runtest/{module} ]; then while read tag rest; do case \"$tag\" in ''|\\#*) continue;; esac; if [ -n \"$selected_tags\" ]; then case \"$selected_tags\" in *\"|$tag|\"*) ;; *) continue;; esac; fi; case \"$tag\" in {skip_pattern}) ./busybox echo \"SKIP LTP CASE $tag : local skip\"; continue;; esac; cmdline=${{rest:-$tag}}; {runtime_assignment} if [ -n \"$ltp_max_runtime\" ]; then cmdline=\"$cmdline -I $ltp_max_runtime\"; fi; ./busybox echo \"RUN LTP CASE $tag : $cmdline\"; if [ -n \"$tx_ltp_trace_runtime\" ]; then ./busybox echo \"TX-LTP-RUNTIME begin $tag $(./busybox date +%s 2>/dev/null)\"; PS4=\"TX-LTP-CMD:$tag: \" PATH={ltp_case_path} LTPROOT=/musl/musl/ltp KCONFIG_PATH=/proc/config ./busybox sh -x -c \"$cmdline\"; ret=$?; ./busybox echo \"TX-LTP-RUNTIME end $tag $ret $(./busybox date +%s 2>/dev/null)\"; else PATH={ltp_case_path} LTPROOT=/musl/musl/ltp KCONFIG_PATH=/proc/config ./busybox sh -c \"$cmdline\"; ret=$?; fi; if [ $ret = 0 ]; then ./busybox echo \"PASS LTP CASE $tag : $ret\"; fi; ./busybox echo \"FAIL LTP CASE $tag : $ret\"; done < ltp/runtest/{module}; else ./busybox echo \"FAIL LTP RUNTEST {module} : missing runtest file\"; fi"
+    );
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"#### OS COMP TEST GROUP END ltp-musl ####\""
+    );
 }
 
 fn libctest_case_needs_cwd_dso(case: &str) -> bool {
