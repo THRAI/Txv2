@@ -5,6 +5,9 @@
 
 use super::*;
 
+use alloc::collections::BTreeMap;
+use tx_substrate::sync::SpinMutex;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(super) struct TimespecLayout {
@@ -499,27 +502,152 @@ async fn drive_nanosleep_until<'a>(
 }
 
 // ---------------------------------------------------------------------------
-// Interval-timer (ITIMER_REAL / SIGALRM) bridge for interruptible socket waits.
+// Interval timers (setitimer/getitimer) + the ITIMER_REAL deadline the socket
+// recv-timeout wait consults.
 //
-// The socket layer's `wait_on_socket_or_itimer` consults these to let an armed
-// ITIMER_REAL interrupt a blocking recv/accept. The full setitimer/getitimer
-// subsystem (per-pid IntervalTimer store + the tx-kernel trap-return delivery
-// hook `maybe_deliver_itimer_signal`) was NOT re-homed in the network rebase —
-// it is a separable timer feature. These stubs make the socket wait fall
-// through to a plain await, which is correct whenever no ITIMER_REAL is armed.
-//
-// TODO(itimer): restore the interval-timer subsystem if a socket-timeout LTP
-// test needs SIGALRM to interrupt a blocking socket syscall.
+// `wait_on_socket_or_itimer` bounds a blocking recv/accept by racing the socket
+// future against `timer_sleep::sleep_until_ns(itimer_real_deadline_ns(pid))`.
+// With the deadline stubbed to `None` a blocking recv with an armed alarm never
+// woke — LTP `recvfrom01` (and any alarm-bounded blocking-recv test) hung. This
+// restores the per-pid timer store + setitimer/getitimer so the deadline is
+// real and the recv wakes itself at expiry (returning EINTR). The SIGALRM signal
+// *delivery* path (poll_due_itimers / tx-kernel trap hook) is intentionally not
+// re-homed; the socket wait does not need a delivered signal, only the deadline.
 // ---------------------------------------------------------------------------
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct ItimervalLayout {
+    pub(super) it_interval: TimevalLayout,
+    pub(super) it_value: TimevalLayout,
+}
+
+const ITIMER_REAL: u32 = 0;
+const ITIMER_VIRTUAL: u32 = 1;
+const ITIMER_PROF: u32 = 2;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct IntervalTimer {
+    deadline_ns: u64,
+    interval_ns: u64,
+}
+
+static INTERVAL_TIMERS: SpinMutex<Option<BTreeMap<(u32, u32), IntervalTimer>>> =
+    SpinMutex::new(None);
+
+fn with_interval_timers<R>(f: impl FnOnce(&mut BTreeMap<(u32, u32), IntervalTimer>) -> R) -> R {
+    let mut guard = INTERVAL_TIMERS.lock();
+    let timers = guard.get_or_insert_with(BTreeMap::new);
+    f(timers)
+}
+
+fn valid_itimer(which: u32) -> bool {
+    matches!(which, ITIMER_REAL | ITIMER_VIRTUAL | ITIMER_PROF)
+}
+
+fn timeval_to_ns(tv: TimevalLayout) -> Option<u64> {
+    if tv.tv_sec < 0 || tv.tv_usec < 0 || tv.tv_usec >= 1_000_000 {
+        return None;
+    }
+    (tv.tv_sec as u64)
+        .checked_mul(1_000_000_000)
+        .and_then(|sec_ns| sec_ns.checked_add((tv.tv_usec as u64).saturating_mul(1_000)))
+}
+
+fn itimer_to_layout(timer: Option<IntervalTimer>, now_ns: u64) -> ItimervalLayout {
+    let timer = timer.unwrap_or_default();
+    ItimervalLayout {
+        it_interval: ns_to_timeval(timer.interval_ns),
+        it_value: ns_to_timeval(if timer.deadline_ns == 0 {
+            0
+        } else {
+            timer.deadline_ns.saturating_sub(now_ns)
+        }),
+    }
+}
+
+fn parse_itimerval(value: ItimervalLayout) -> Option<(u64, u64)> {
+    let interval_ns = timeval_to_ns(value.it_interval)?;
+    let value_ns = timeval_to_ns(value.it_value)?;
+    Some((interval_ns, value_ns))
+}
+
+pub(super) fn sys_getitimer<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let which = args[0] as u32;
+    let curr_value_ptr = args[1];
+    if !valid_itimer(which) {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if curr_value_ptr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    let now_ns = P::read_ns();
+    let timer = with_interval_timers(|timers| timers.get(&(ctx.process.pid.0, which)).copied());
+    let value = itimer_to_layout(timer, now_ns);
+    match bootstrap_write_user::<ItimervalLayout>(&ctx.aspace, curr_value_ptr, value) {
+        Ok(()) => SyscallResult::Return(0),
+        Err(errno) => SyscallResult::error_from(errno),
+    }
+}
+
+pub(super) fn sys_setitimer<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let which = args[0] as u32;
+    let new_value_ptr = args[1];
+    let old_value_ptr = args[2];
+    if !valid_itimer(which) {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if new_value_ptr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    let new_value = match bootstrap_read_user::<ItimervalLayout>(&ctx.aspace, new_value_ptr) {
+        Ok(value) => value,
+        Err(errno) => return SyscallResult::error_from(errno),
+    };
+    let Some((interval_ns, value_ns)) = parse_itimerval(new_value) else {
+        return SyscallResult::Error(EINVAL_VALUE);
+    };
+    let now_ns = P::read_ns();
+    let key = (ctx.process.pid.0, which);
+    let old_timer = with_interval_timers(|timers| timers.get(&key).copied());
+    if old_value_ptr != 0 {
+        let old_value = itimer_to_layout(old_timer, now_ns);
+        if let Err(errno) =
+            bootstrap_write_user::<ItimervalLayout>(&ctx.aspace, old_value_ptr, old_value)
+        {
+            return SyscallResult::error_from(errno);
+        }
+    }
+    let timer = IntervalTimer {
+        deadline_ns: if value_ns == 0 {
+            0
+        } else {
+            now_ns.saturating_add(value_ns)
+        },
+        interval_ns,
+    };
+    with_interval_timers(|timers| {
+        if timer.deadline_ns == 0 && timer.interval_ns == 0 {
+            timers.remove(&key);
+        } else {
+            timers.insert(key, timer);
+        }
+    });
+    SyscallResult::Return(0)
+}
+
 /// Deadline (ns) of this pid's armed ITIMER_REAL, or `None` if none is armed.
-/// Stub: always `None` until the interval-timer subsystem is re-homed.
-pub(super) fn itimer_real_deadline_ns(_pid: u32) -> Option<u64> {
-    None
+pub(super) fn itimer_real_deadline_ns(pid: u32) -> Option<u64> {
+    with_interval_timers(|timers| {
+        timers
+            .get(&(pid, ITIMER_REAL))
+            .and_then(|timer| (timer.deadline_ns != 0).then_some(timer.deadline_ns))
+    })
 }
 
 /// Take (and clear) a pending ITIMER_REAL interrupt delivered to this pid.
-/// Stub: always `false` until the interval-timer subsystem is re-homed.
+/// The socket recv-timeout wait reaches its deadline via `itimer_real_deadline_ns`
+/// + its own `sleep_until_ns` timer, so the SIGALRM-delivery side stays a no-op.
 pub(super) fn consume_itimer_real_delivered_interrupt(_pid: u32) -> bool {
     false
 }

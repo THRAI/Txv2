@@ -2037,6 +2037,11 @@ pub const NR_SENDMSG: u64 = 211;
 pub const NR_RECVMSG: u64 = 212;
 pub const NR_RECVMMSG: u64 = 243;
 pub const NR_SENDMMSG: u64 = 269;
+
+// Interval timers — setitimer arms the ITIMER_REAL deadline that bounds blocking
+// recv (LTP alarm-bounded recv tests hung without it).
+pub const NR_GETITIMER: u64 = 102;
+pub const NR_SETITIMER: u64 = 103;
 // More IPPROTO_IPV6 (SOL_IPV6) options.
 pub const IPV6_ADDRFORM: i32 = 1;
 pub const IPV6_CHECKSUM: i32 = 7;

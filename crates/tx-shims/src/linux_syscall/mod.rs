@@ -274,6 +274,9 @@ pub use numbers::{
 // Message-based socket syscall numbers (their handlers were undispatched).
 pub use numbers::{NR_RECVMMSG, NR_RECVMSG, NR_SENDMMSG, NR_SENDMSG};
 
+// Interval-timer syscalls (setitimer arms the recv-timeout deadline).
+pub use numbers::{NR_GETITIMER, NR_SETITIMER};
+
 /// Maximum number of input bytes the Phase 2a `write` syscall accepts
 /// in a single call. The dispatcher copies `[buf_ptr, buf_ptr+len)` into
 /// a kernel-side stack-bounded slice (via `from_raw_parts`); higher-level
@@ -917,6 +920,8 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + tx
         nr if nr == NR_RECVMSG => sys_recvmsg::<P>(req.args, ctx).await,
         nr if nr == NR_SENDMMSG => sys_sendmmsg(req.args, ctx).await,
         nr if nr == NR_RECVMMSG => sys_recvmmsg::<P>(req.args, ctx).await,
+        nr if nr == NR_SETITIMER => time::sys_setitimer::<P>(req.args, ctx),
+        nr if nr == NR_GETITIMER => time::sys_getitimer::<P>(req.args, ctx),
         nr if nr == NR_SENDFILE64 => sys_sendfile64(req.args, ctx).await,
         nr if nr == NR_PPOLL => sys_ppoll(req.args, ctx).await,
         nr if nr == NR_PSELECT6 => sys_pselect6::<P>(req.args, ctx).await,
