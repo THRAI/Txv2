@@ -75,6 +75,126 @@ const PROCFS_MAPS_OFFSET: u64 = 0x10003;
 const PROCFS_EXE_OFFSET: u64 = 0x10004;
 const PROCFS_FD_OFFSET: u64 = 0x20000;
 const PROCFS_FDINFO_OFFSET: u64 = 0x30000;
+// `/proc/<pid>/{uid_map,gid_map,setgroups}` (user-namespace map writes used by
+// LTP netns setup). Sits in a dedicated id region far above the fd/fdinfo space
+// (which spans up to ~PID_BASE+0x1_0003_xxxx because it keys pid in the high
+// bits) so these ids never alias the stat/fd inode ids. Three files per pid:
+// pid*4 + {0=uid_map, 1=gid_map, 2=setgroups}.
+const PROCFS_USERNS_BASE: u64 = PROCFS_PID_BASE + 0x2_0000_0000;
+const fn pid_uid_map_id(pid: Pid) -> FsObjectId {
+    FsObjectId::new(PROCFS_USERNS_BASE + (pid.0 as u64) * 4)
+}
+const fn pid_gid_map_id(pid: Pid) -> FsObjectId {
+    FsObjectId::new(PROCFS_USERNS_BASE + (pid.0 as u64) * 4 + 1)
+}
+const fn pid_setgroups_id(pid: Pid) -> FsObjectId {
+    FsObjectId::new(PROCFS_USERNS_BASE + (pid.0 as u64) * 4 + 2)
+}
+pub fn pid_from_uid_map_id(id: FsObjectId) -> Option<Pid> {
+    pid_from_userns_id(id, 0)
+}
+pub fn pid_from_gid_map_id(id: FsObjectId) -> Option<Pid> {
+    pid_from_userns_id(id, 1)
+}
+pub fn pid_from_setgroups_id(id: FsObjectId) -> Option<Pid> {
+    pid_from_userns_id(id, 2)
+}
+fn pid_from_userns_id(id: FsObjectId, which: u64) -> Option<Pid> {
+    let r = id.as_u64();
+    if r < PROCFS_USERNS_BASE {
+        return None;
+    }
+    let offset = r - PROCFS_USERNS_BASE;
+    if offset % 4 != which {
+        return None;
+    }
+    let pid = offset / 4;
+    if pid <= u32::MAX as u64 {
+        Some(Pid(pid as u32))
+    } else {
+        None
+    }
+}
+
+#[derive(Clone, Copy)]
+enum UsernsWriteTarget {
+    UidMap,
+    GidMap,
+    Setgroups,
+}
+
+/// Best-effort `/proc/self` target pid. The procfs `read_link`/FsOps seam has no
+/// caller-pid context, so this heuristic returns the highest live non-init pid —
+/// i.e. the most recently created process, which is the caller for the LTP
+/// netns-setup pattern (`unshare` then write `/proc/self/{setgroups,uid,gid}_map`
+/// before any fork). Re-homed from the pre-rebase tree; PR#50 dropped it and
+/// `read_link` was left hardcoding pid 1, which routed every `/proc/self/*` write
+/// to the init user namespace. A true current-pid accessor would be cleaner.
+fn procfs_self_target_pid() -> Pid {
+    process::all_pids()
+        .into_iter()
+        .filter(|(pid, alive)| *alive && pid.0 != 1)
+        .map(|(pid, _)| pid)
+        .max_by_key(|pid| pid.0)
+        .unwrap_or(Pid(1))
+}
+
+/// Handle a write to `/proc/<pid>/{uid_map,gid_map,setgroups}` by routing to the
+/// target process's user namespace. Returns `None` if `fs_object_id` is not one
+/// of these files (so the caller falls through). Self-write only matters for the
+/// LTP netns setup, so the target process supplies both the target user ns and
+/// the writer cred/user ns.
+fn write_userns_projection(
+    fs_object_id: FsObjectId,
+    offset: u64,
+    bytes: &[u8],
+) -> Option<StepOutcome<u64, NoProgress>> {
+    let (pid, target) = if let Some(pid) = pid_from_uid_map_id(fs_object_id) {
+        (pid, UsernsWriteTarget::UidMap)
+    } else if let Some(pid) = pid_from_gid_map_id(fs_object_id) {
+        (pid, UsernsWriteTarget::GidMap)
+    } else {
+        (pid_from_setgroups_id(fs_object_id)?, UsernsWriteTarget::Setgroups)
+    };
+
+    let Some(proc) = process::process_by_pid(pid) else {
+        return Some(StepOutcome::err(Errno::ESRCH.into()));
+    };
+    let Some(nsproxy) = proc.nsproxy_cap() else {
+        return Some(StepOutcome::err(Errno::ESRCH.into()));
+    };
+    let Some(writer_cred) = proc.cred() else {
+        return Some(StepOutcome::err(Errno::ESRCH.into()));
+    };
+    let user_ns = nsproxy.user_ns.clone();
+
+    let result = match target {
+        UsernsWriteTarget::Setgroups => {
+            tx_subsystems::process::nsproxy::write_user_namespace_setgroups(&user_ns, offset, bytes)
+        }
+        UsernsWriteTarget::UidMap => tx_subsystems::process::nsproxy::write_user_namespace_id_map(
+            &user_ns,
+            writer_cred,
+            &user_ns,
+            tx_subsystems::process::nsproxy::UserNsMapKind::Uid,
+            offset,
+            bytes,
+        ),
+        UsernsWriteTarget::GidMap => tx_subsystems::process::nsproxy::write_user_namespace_id_map(
+            &user_ns,
+            writer_cred,
+            &user_ns,
+            tx_subsystems::process::nsproxy::UserNsMapKind::Gid,
+            offset,
+            bytes,
+        ),
+    };
+
+    Some(match result {
+        Ok(()) => StepOutcome::done(bytes.len() as u64),
+        Err(errno) => StepOutcome::err(errno.into()),
+    })
+}
 const fn pid_dir_id(pid: Pid) -> FsObjectId {
     FsObjectId::new(PROCFS_PID_BASE + pid.0 as u64)
 }
@@ -211,6 +331,10 @@ fn dir_entry(id: FsObjectId, kind: InodeKind, name: &[u8]) -> DirEntry {
 
 pub const PROCFS_DIR_MODE: u16 = S_IFDIR | 0o555;
 pub const PROCFS_FILE_MODE: u16 = S_IFREG | 0o444;
+/// Writable projected files (`/proc/<pid>/{uid_map,gid_map,setgroups}`): need a
+/// write bit so `open(O_WRONLY)` is permitted and the write routes to
+/// `step_write_projected`.
+pub const PROCFS_RW_FILE_MODE: u16 = S_IFREG | 0o644;
 pub const PROCFS_SYMLINK_MODE: u16 = S_IFLNK | 0o777;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -313,6 +437,15 @@ impl FsOps for Procfs {
             if name == b"fdinfo" && process::process_by_pid(pid).is_some() {
                 return StepOutcome::done(pid_fdinfo_dir_id(pid));
             }
+            if name == b"uid_map" && process::process_by_pid(pid).is_some() {
+                return StepOutcome::done(pid_uid_map_id(pid));
+            }
+            if name == b"gid_map" && process::process_by_pid(pid).is_some() {
+                return StepOutcome::done(pid_gid_map_id(pid));
+            }
+            if name == b"setgroups" && process::process_by_pid(pid).is_some() {
+                return StepOutcome::done(pid_setgroups_id(pid));
+            }
             return StepOutcome::err(Errno::ENOENT.into());
         }
         if let Some(pid) = pid_from_fdinfo_dir(parent) {
@@ -363,6 +496,12 @@ impl FsOps for Procfs {
             }
             id if pid_from_dir(id).is_some() => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Directory, PROCFS_DIR_MODE))
+            }
+            id if pid_from_uid_map_id(id).is_some()
+                || pid_from_gid_map_id(id).is_some()
+                || pid_from_setgroups_id(id).is_some() =>
+            {
+                StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_RW_FILE_MODE))
             }
             id if pid_from_stat_id(id).is_some() => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
@@ -418,6 +557,9 @@ impl FsOps for Procfs {
                 (b"exe", pid_exe_id(pid), InodeKind::Symlink),
                 (b"fd", pid_fd_dir_id(pid), InodeKind::Directory),
                 (b"fdinfo", pid_fdinfo_dir_id(pid), InodeKind::Directory),
+                (b"uid_map", pid_uid_map_id(pid), InodeKind::Regular),
+                (b"gid_map", pid_gid_map_id(pid), InodeKind::Regular),
+                (b"setgroups", pid_setgroups_id(pid), InodeKind::Regular),
             ];
             let fi = idx.saturating_sub(2);
             if fi < files.len() {
@@ -556,9 +698,12 @@ impl FsOps for Procfs {
         _guard: &Guard<'_>,
     ) -> StepOutcome<alloc::boxed::Box<[u8]>, NoProgress> {
         if id == PROCFS_SELF_ID {
-            // v1: /proc/self always points to pid 1.
-            // Full implementation requires caller pid context.
-            StepOutcome::done(alloc::boxed::Box::from(&b"1"[..]))
+            // Resolve to the most-recently-created live process (best-effort
+            // current pid; see procfs_self_target_pid). Hardcoding pid 1 routed
+            // every /proc/self/* access to init — wrong for the userns map writes.
+            let pid = procfs_self_target_pid();
+            let target = alloc::format!("{}", pid.0);
+            StepOutcome::done(target.into_bytes().into_boxed_slice())
         } else if let Some((pid, fd_num)) = pid_from_fd_id(id) {
             // /proc/<pid>/fd/N — symlink target is the path of the open file.
             let Some(proc) = process::process_by_pid(pid) else {
@@ -722,6 +867,18 @@ impl FsOps for Procfs {
             buf[..len].copy_from_slice(&available[..len]);
             StepOutcome::done(len as u64)
         }
+    }
+    fn step_write_projected(
+        &self,
+        fs_object_id: FsObjectId,
+        offset: u64,
+        bytes: &[u8],
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<u64, NoProgress> {
+        if let Some(outcome) = write_userns_projection(fs_object_id, offset, bytes) {
+            return outcome;
+        }
+        StepOutcome::err(Errno::ENOSYS.into())
     }
     fn step_chmod(
         &self,

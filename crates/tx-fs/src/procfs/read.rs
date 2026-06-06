@@ -1,7 +1,8 @@
 //! Content renderers for procfs pseudo-files.
 
 use crate::procfs::{
-    pid_from_cmdline_id, pid_from_fdinfo_id, pid_from_maps_id, pid_from_stat_id, KERNEL_CONFIG_TEXT,
+    pid_from_cmdline_id, pid_from_fdinfo_id, pid_from_gid_map_id, pid_from_maps_id,
+    pid_from_setgroups_id, pid_from_stat_id, pid_from_uid_map_id, KERNEL_CONFIG_TEXT,
     PROCFS_CONFIG_ID, PROCFS_CPUINFO_ID, PROCFS_MEMINFO_ID, PROCFS_MOUNTS_ID,
     PROCFS_SYS_KERNEL_PID_MAX_ID, PROCFS_SYS_KERNEL_TAINTED_ID, PROCFS_SYSVIPC_MSG_ID,
     PROCFS_SYSVIPC_SEM_ID, PROCFS_SYSVIPC_SHM_ID, PROCFS_UPTIME_ID,
@@ -20,6 +21,15 @@ pub fn render(fs_object_id: FsObjectId) -> String {
     }
     if let Some(pid) = pid_from_maps_id(fs_object_id) {
         return render_maps(pid);
+    }
+    if let Some(pid) = pid_from_uid_map_id(fs_object_id) {
+        return render_userns_id_map(pid, false);
+    }
+    if let Some(pid) = pid_from_gid_map_id(fs_object_id) {
+        return render_userns_id_map(pid, true);
+    }
+    if let Some(pid) = pid_from_setgroups_id(fs_object_id) {
+        return render_userns_setgroups(pid);
     }
     if let Some((pid, fd)) = pid_from_fdinfo_id(fs_object_id) {
         return render_fdinfo(pid, fd);
@@ -191,6 +201,45 @@ fn fdinfo_flags(file: &tx_subsystems::vfs::OpenFile) -> u32 {
 
 pub fn render_config() -> String {
     String::from(KERNEL_CONFIG_TEXT)
+}
+
+/// `/proc/<pid>/{uid_map,gid_map}` — one `inside outside length` row per entry,
+/// Linux's `%10u %10u %10u` column layout.
+fn render_userns_id_map(pid: Pid, gid: bool) -> String {
+    let Some(proc) = process::process_by_pid(pid) else {
+        return String::new();
+    };
+    let Some(nsproxy) = proc.nsproxy_cap() else {
+        return String::new();
+    };
+    let entries = if gid {
+        nsproxy.user_ns.gid_map_snapshot()
+    } else {
+        nsproxy.user_ns.uid_map_snapshot()
+    };
+    let mut out = String::new();
+    for e in entries {
+        out.push_str(&format!(
+            "{:>10} {:>10} {:>10}\n",
+            e.inside, e.outside, e.length
+        ));
+    }
+    out
+}
+
+/// `/proc/<pid>/setgroups` — "allow\n" or "deny\n".
+fn render_userns_setgroups(pid: Pid) -> String {
+    use tx_subsystems::process::nsproxy::SetgroupsPolicy;
+    let Some(proc) = process::process_by_pid(pid) else {
+        return String::new();
+    };
+    let Some(nsproxy) = proc.nsproxy_cap() else {
+        return String::new();
+    };
+    match nsproxy.user_ns.setgroups_policy() {
+        SetgroupsPolicy::Allow => String::from("allow\n"),
+        SetgroupsPolicy::Deny => String::from("deny\n"),
+    }
 }
 
 pub fn render_meminfo() -> String {
