@@ -2,7 +2,8 @@
 
 use crate::procfs::{
     pid_from_cmdline_id, pid_from_fdinfo_id, pid_from_maps_id, pid_from_stat_id, KERNEL_CONFIG_TEXT,
-    PROCFS_CONFIG_ID, PROCFS_CPUINFO_ID, PROCFS_MEMINFO_ID, PROCFS_MOUNTS_ID, PROCFS_SYSVIPC_MSG_ID,
+    PROCFS_CONFIG_ID, PROCFS_CPUINFO_ID, PROCFS_MEMINFO_ID, PROCFS_MOUNTS_ID,
+    PROCFS_SYS_KERNEL_PID_MAX_ID, PROCFS_SYS_KERNEL_TAINTED_ID, PROCFS_SYSVIPC_MSG_ID,
     PROCFS_SYSVIPC_SEM_ID, PROCFS_SYSVIPC_SHM_ID, PROCFS_UPTIME_ID,
 };
 use alloc::format;
@@ -29,6 +30,8 @@ pub fn render(fs_object_id: FsObjectId) -> String {
         PROCFS_UPTIME_ID => render_uptime(),
         PROCFS_MEMINFO_ID => render_meminfo(),
         PROCFS_CONFIG_ID => render_config(),
+        PROCFS_SYS_KERNEL_TAINTED_ID => String::from("0\n"),
+        PROCFS_SYS_KERNEL_PID_MAX_ID => String::from("4194304\n"),
         PROCFS_SYSVIPC_MSG_ID => render_sysvipc_msg(),
         PROCFS_SYSVIPC_SEM_ID => render_sysvipc_sem(),
         PROCFS_SYSVIPC_SHM_ID => render_sysvipc_shm(),

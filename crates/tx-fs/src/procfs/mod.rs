@@ -59,6 +59,15 @@ CONFIG_IP6_NF_IPTABLES=y\n\
 CONFIG_IP6_NF_FILTER=y\n\
 CONFIG_NF_TABLES=y\n\
 CONFIG_TLS=y\n";
+
+// `/proc/sys/kernel/` subtree (re-homed; PR#50 dropped all of /proc/sys). LTP's
+// `tst_taint` opens `/proc/sys/kernel/tainted` in setup for many cases, and a
+// missing file makes them TBROK before the test body. `/proc/sys/net/*` and
+// `/proc/sys/fs/*` from the pre-rebase tree remain to be re-homed if needed.
+pub const PROCFS_SYS_ID: FsObjectId = FsObjectId::new(0x7072_6F0B);
+pub const PROCFS_SYS_KERNEL_ID: FsObjectId = FsObjectId::new(0x7072_6F0C);
+pub const PROCFS_SYS_KERNEL_TAINTED_ID: FsObjectId = FsObjectId::new(0x7072_6F0D);
+pub const PROCFS_SYS_KERNEL_PID_MAX_ID: FsObjectId = FsObjectId::new(0x7072_6F0E);
 const PROCFS_PID_BASE: u64 = 0x7072_0000;
 const PROCFS_STAT_OFFSET: u64 = 0x10000;
 const PROCFS_MEM_OFFSET: u64 = 0x10002;
@@ -245,6 +254,9 @@ impl FsOps for Procfs {
             if name == b"sysvipc" {
                 return StepOutcome::done(PROCFS_SYSVIPC_ID);
             }
+            if name == b"sys" {
+                return StepOutcome::done(PROCFS_SYS_ID);
+            }
             if let Ok(n) = core::str::from_utf8(name).unwrap_or("").parse::<u32>() {
                 if n > 0 && process::process_by_pid(Pid(n)).is_some() {
                     return StepOutcome::done(pid_dir_id(Pid(n)));
@@ -261,6 +273,21 @@ impl FsOps for Procfs {
             }
             if name == b"shm" {
                 return StepOutcome::done(PROCFS_SYSVIPC_SHM_ID);
+            }
+            return StepOutcome::err(Errno::ENOENT.into());
+        }
+        if parent == PROCFS_SYS_ID {
+            if name == b"kernel" {
+                return StepOutcome::done(PROCFS_SYS_KERNEL_ID);
+            }
+            return StepOutcome::err(Errno::ENOENT.into());
+        }
+        if parent == PROCFS_SYS_KERNEL_ID {
+            if name == b"tainted" {
+                return StepOutcome::done(PROCFS_SYS_KERNEL_TAINTED_ID);
+            }
+            if name == b"pid_max" {
+                return StepOutcome::done(PROCFS_SYS_KERNEL_PID_MAX_ID);
             }
             return StepOutcome::err(Errno::ENOENT.into());
         }
@@ -326,6 +353,12 @@ impl FsOps for Procfs {
                 StepOutcome::done(InodeMeta::new(InodeKind::Directory, PROCFS_DIR_MODE))
             }
             PROCFS_SYSVIPC_MSG_ID | PROCFS_SYSVIPC_SEM_ID | PROCFS_SYSVIPC_SHM_ID => {
+                StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
+            }
+            PROCFS_SYS_ID | PROCFS_SYS_KERNEL_ID => {
+                StepOutcome::done(InodeMeta::new(InodeKind::Directory, PROCFS_DIR_MODE))
+            }
+            PROCFS_SYS_KERNEL_TAINTED_ID | PROCFS_SYS_KERNEL_PID_MAX_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
             }
             id if pid_from_dir(id).is_some() => {
@@ -441,6 +474,40 @@ impl FsOps for Procfs {
                 }
                 return StepOutcome::done(None);
             }
+            if id == PROCFS_SYS_ID {
+                if state_byte < 2 {
+                    return finish_dots(state_byte, idx, id);
+                }
+                let files: &[(&[u8], FsObjectId, InodeKind)] =
+                    &[(b"kernel", PROCFS_SYS_KERNEL_ID, InodeKind::Directory)];
+                let fi = idx.saturating_sub(2);
+                if fi < files.len() {
+                    let (name, oid, kind) = files[fi];
+                    return StepOutcome::done(Some((
+                        dir_entry(oid, kind, name),
+                        DirCursor([2, (fi + 1) as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                    )));
+                }
+                return StepOutcome::done(None);
+            }
+            if id == PROCFS_SYS_KERNEL_ID {
+                if state_byte < 2 {
+                    return finish_dots(state_byte, idx, id);
+                }
+                let files: &[(&[u8], FsObjectId, InodeKind)] = &[
+                    (b"tainted", PROCFS_SYS_KERNEL_TAINTED_ID, InodeKind::Regular),
+                    (b"pid_max", PROCFS_SYS_KERNEL_PID_MAX_ID, InodeKind::Regular),
+                ];
+                let fi = idx.saturating_sub(2);
+                if fi < files.len() {
+                    let (name, oid, kind) = files[fi];
+                    return StepOutcome::done(Some((
+                        dir_entry(oid, kind, name),
+                        DirCursor([2, (fi + 1) as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                    )));
+                }
+                return StepOutcome::done(None);
+            }
             return finish_dots(state_byte, idx, id);
         }
 
@@ -456,6 +523,7 @@ impl FsOps for Procfs {
             (b"meminfo", PROCFS_MEMINFO_ID, InodeKind::Regular),
             (b"config", PROCFS_CONFIG_ID, InodeKind::Regular),
             (b"sysvipc", PROCFS_SYSVIPC_ID, InodeKind::Directory),
+            (b"sys", PROCFS_SYS_ID, InodeKind::Directory),
         ];
         let si = idx.saturating_sub(2);
         if state_byte == 2 && si < statics.len() {
