@@ -1,3 +1,26 @@
+- 2026-06-06 **Net runtime re-home: restored the syscall surface batch-testing
+  exposed as missing.** Running the LTP net suites the way the OSComp grader does
+  (batch, fresh boot per `make oscomp-qemu-rv64 OSCOMP_GROUPS=ltp-runtest:...`)
+  surfaced five orphaned-glue regressions that compile-clean hid: **(1)** all 66
+  socket-option *name* constants (SO_*/IP_*/IPV6_* opts/TCP_*/SCTP_*/PACKET_*/
+  NETLINK_*/SIOC*/SOL_TLS) were stripped — leaving them undefined turned every
+  `(level, OPTNAME)` set/getsockopt arm into a binding pattern (76 unreachable
+  arms; first arm per level swallowed all), so e.g. `setsockopt(SCTP_EVENTS)`
+  → EINVAL (`66dee1eb`). **(2)** the message syscalls sendmsg/recvmsg/sendmmsg/
+  recvmmsg + getsockopt/getpeername/shutdown had handlers but no dispatch arms →
+  `sendmsg` ENOSYS (`7f32deff`). **(3)** the `ltp-runtest:` LTP runner + `net.sctp`
+  driver gate (`/lib/modules/.../modules.{dep,builtin}` w/ sctp.ko) were gone
+  (`f497ec00`,`98467925`). **(4)** `/proc/meminfo` was a 0-valued stub → LTP's
+  tst_memutils TBROK'd every new-framework test at setup (`d2ec0bdc`). **(5)**
+  `sys_close` never called `maybe_close_socket_file_after_fd_remove` → closing a
+  socket fd never withdrew its port → spurious EADDRINUSE on rebind (`ee5f4a06`).
+  **Verified individually vs the user's witness baselines:** `test_assoc_shutdown`
+  TPASS; `test_1_to_1_sockopt` 22/22; `test_1_to_1_socket_bind_listen` 14/14;
+  `test_basic` 14/15; `getsockopt01` 9/9; bind03/getpeername01/getsockname01/
+  getsockopt01/02 PASS. Remaining batch follow-ups: recvmsg01/recvmmsg01,
+  sendmsg01 exit-139 at teardown. **Batch verification is the submission scenario**
+  — see [[net-rehome-preexisting-test-failures]] for batch-vs-individual nuance.
+
 - 2026-06-06 **Net re-home COMPLETE — entire rebased tree compiles (host libs +
   RV64 kernel ELF + initramfs image all build clean).** PR#50 (an unrelated
   filesystem/SMP merge) had orphaned the whole network integration layer during
