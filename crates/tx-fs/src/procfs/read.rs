@@ -186,7 +186,22 @@ fn fdinfo_flags(file: &tx_subsystems::vfs::OpenFile) -> u32 {
 }
 
 pub fn render_meminfo() -> String {
-    String::from("MemTotal: 0 kB\nMemFree: 0 kB\n")
+    // Full enough for LTP's tst_memutils (`/proc/meminfo` parser): it sscanf's
+    // `MemAvailable:` and needs non-zero values. main shipped a 0-valued stub
+    // (MemTotal/MemFree only) which makes every new-framework LTP test TBROK at
+    // setup ("Expected 1 conversions got 0"). Re-homed the user's fuller table.
+    String::from(
+        "MemTotal:        1048576 kB\n\
+         MemFree:          524288 kB\n\
+         MemAvailable:     524288 kB\n\
+         Buffers:               0 kB\n\
+         Cached:                0 kB\n\
+         SwapCached:            0 kB\n\
+         Active:                0 kB\n\
+         Inactive:              0 kB\n\
+         SwapTotal:             0 kB\n\
+         SwapFree:              0 kB\n",
+    )
 }
 
 fn render_sysvipc_msg() -> String {
