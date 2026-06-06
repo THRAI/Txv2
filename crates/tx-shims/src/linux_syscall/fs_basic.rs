@@ -544,12 +544,24 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
 /// `drive_oneshot` (no reactor, no yield).
 pub(super) fn sys_close<'a>(fd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
     let mut script_ctx = build_subject_script_ctx(ctx);
+    // Snapshot the OpenFile before the close op removes the fd, so that after a
+    // successful close we can run net-socket teardown (withdraw the socket from
+    // the bind/listen/connection tables) on the last fd. Re-homed: the rebase
+    // dropped this call, so closing a socket fd left its port "bound" forever —
+    // every close+rebind (LTP socket_bind_listen case 9, ...) then got a
+    // spurious EADDRINUSE.
+    let file_to_close = ctx.process.fd(fd);
     let mut op = CloseOp {
         process: ctx.process.clone(),
         fd,
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
-        Ok(()) => SyscallResult::Return(0),
+        Ok(()) => {
+            if let Some(file) = file_to_close {
+                super::socket::maybe_close_socket_file_after_fd_remove(&file);
+            }
+            SyscallResult::Return(0)
+        }
         Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
