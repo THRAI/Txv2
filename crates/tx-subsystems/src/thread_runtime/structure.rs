@@ -78,7 +78,8 @@ impl ThreadIdentity {
     pub fn upgrade_owner_proc(
         &self,
     ) -> Option<crate::thread_runtime::adapter::step_engine::Cap<ProcessIdentity>> {
-        let guard = crate::thread_runtime::adapter::step_engine::guard();
+        let guard = crate::thread_runtime::adapter::step_engine::borrow_current_guard()
+            .unwrap_or_else(crate::thread_runtime::adapter::step_engine::guard);
         self.owner_proc.upgrade(&guard)
     }
 
@@ -143,6 +144,11 @@ pub struct ThreadPayload {
     pub(crate) signal_mask: AtomicU64,
     /// Per-thread pending-signal bitset.
     pub(crate) thread_pending: PendingSignalQueue,
+    /// Conservative summary of process-group pending signals known to
+    /// affect this thread. A zero value lets signal-mask refresh skip
+    /// the owner-process upgrade; nonzero falls back to the
+    /// authoritative `ProcessPayload.group_pending`.
+    pub(crate) group_pending_summary: AtomicU64,
     /// `InterruptSummary` packed into 8 bits, kept current by
     /// `post_signal`, `step_sigprocmask`, `step_thread_exit`, and the
     /// SIGKILL routing path. Read by `select_next_signal` /
@@ -172,8 +178,7 @@ pub struct ThreadPayload {
     /// executing.
     pub(crate) saved_signal_context: SpinMutex<Option<UserTrapContext>>,
     /// Signal mask active before the most recent handler delivery.
-    /// Restored together with `saved_signal_context` by
-    /// `rt_sigreturn`.
+    /// Restored together with `saved_signal_context` by `rt_sigreturn`.
     pub(crate) saved_signal_mask: SpinMutex<Option<SignalMask>>,
     /// Result of the last completed syscall, drained by the
     /// userspace-entry checkpoint and written into the (then-fresh)
@@ -236,9 +241,8 @@ pub struct ThreadPayload {
     /// `Some((base, size))` gives the alternate stack range.
     pub(crate) alt_stack: SpinMutex<Option<(usize, usize)>>,
     /// Best-effort procfs state hint. Set while the thread future is
-    /// awaiting syscall dispatch; long-running/blocking syscall futures
-    /// should appear as `S` to Linux tests that wait through
-    /// `/proc/<pid>/stat`.
+    /// awaiting syscall dispatch; blocking syscall futures should
+    /// appear as sleeping to procfs observers.
     pub(crate) proc_sleeping: AtomicBool,
     /// `clear_child_tid` pointer from `set_tid_address`.  Written
     /// atomically to 0 on thread exit when futex wake is supported.
@@ -260,6 +264,7 @@ impl ThreadPayload {
             task: SpinMutex::new(None),
             signal_mask: AtomicU64::new(0),
             thread_pending: PendingSignalQueue::new(),
+            group_pending_summary: AtomicU64::new(0),
             signal_summary: AtomicU8::new(0),
             userspace_slot: UserspaceRunSlot::new(),
             active_request: SpinMutex::new(None),
@@ -352,9 +357,7 @@ impl ThreadPayload {
         *self.saved_signal_context.lock() = ctx;
     }
 
-    /// Return whether a signal handler is currently using the saved
-    /// pre-handler context slot. Delivery code uses this to avoid
-    /// nesting another handler on top of the single parked context.
+    /// Whether a signal handler frame is currently in flight.
     pub fn has_saved_signal_context(&self) -> bool {
         self.saved_signal_context.lock().is_some()
     }
@@ -367,10 +370,12 @@ impl ThreadPayload {
         self.saved_signal_context.lock().take()
     }
 
+    /// Replace the signal mask saved for the active signal frame.
     pub fn store_saved_signal_mask(&self, mask: Option<SignalMask>) {
         *self.saved_signal_mask.lock() = mask;
     }
 
+    /// Take the signal mask saved for the active signal frame.
     pub fn take_saved_signal_mask(&self) -> Option<SignalMask> {
         self.saved_signal_mask.lock().take()
     }
@@ -422,6 +427,16 @@ impl ThreadPayload {
     /// Borrow the per-thread pending-signal queue.
     pub fn pending(&self) -> &PendingSignalQueue {
         &self.thread_pending
+    }
+
+    /// Snapshot the conservative process-group pending hint.
+    pub(crate) fn group_pending_summary(&self) -> u64 {
+        self.group_pending_summary.load(Ordering::Acquire)
+    }
+
+    /// Replace the process-group pending hint.
+    pub(crate) fn store_group_pending_summary(&self, bits: u64) {
+        self.group_pending_summary.store(bits, Ordering::Release);
     }
 
     /// Snapshot the current interrupt summary.
@@ -490,6 +505,38 @@ pub fn drain_pending_syscall_return(payload: &ThreadPayload) -> Option<Result<i6
     payload.pending_syscall_return.lock().take()
 }
 
+/// Allocate and retire reusable `ThreadPayload` slots before userspace starts.
+///
+/// Pthread-heavy guests can create enough threads in one timed batch to empty
+/// the first per-CPU zone bucket. Without a warm spare slab, the next
+/// `clone(CLONE_THREAD)` pays the full frame-backed slab allocation cost inside
+/// the benchmark window. This helper intentionally moves that cache growth to
+/// boot/init time while leaving the slots reusable for normal clone paths.
+pub fn prewarm_thread_payload_slots(count: usize) -> usize {
+    use alloc::vec::Vec;
+
+    let mut caps = Vec::new();
+    for _ in 0..count {
+        match crate::thread_runtime::adapter::step_engine::sign(ThreadPayload::fresh()) {
+            Ok(cap) => caps.push(cap),
+            Err(_) => break,
+        }
+    }
+
+    let warmed = caps.len();
+    drop(caps);
+    let mut quiet = 0u8;
+    while quiet < 2 {
+        let stats = crate::thread_runtime::adapter::step_engine::drain_with_budget(usize::MAX);
+        if stats.reclaimed == 0 {
+            quiet += 1;
+        } else {
+            quiet = 0;
+        }
+    }
+    warmed
+}
+
 // ---------------------------------------------------------------------------
 // Per-hart current-thread-payload registry
 // ---------------------------------------------------------------------------
@@ -528,6 +575,26 @@ impl ThreadPayloadSlots {
 
 static CURRENT_THREAD_PAYLOAD: ThreadPayloadSlots = ThreadPayloadSlots::new();
 static CURRENT_USERSPACE_PAYLOAD: ThreadPayloadSlots = ThreadPayloadSlots::new();
+
+struct ThreadIdentitySlots {
+    slots: [SpinMutex<Option<crate::thread_runtime::adapter::step_engine::Cap<ThreadIdentity>>>;
+        MAX_THREAD_PAYLOAD_HARTS],
+}
+
+impl ThreadIdentitySlots {
+    const fn new() -> Self {
+        #[allow(clippy::declare_interior_mutable_const)]
+        const NIL: SpinMutex<
+            Option<crate::thread_runtime::adapter::step_engine::Cap<ThreadIdentity>>,
+        > = SpinMutex::new(None);
+        Self {
+            slots: [NIL; MAX_THREAD_PAYLOAD_HARTS],
+        }
+    }
+}
+
+static CURRENT_THREAD_IDENTITY: ThreadIdentitySlots = ThreadIdentitySlots::new();
+static CURRENT_USERSPACE_THREAD_IDENTITY: ThreadIdentitySlots = ThreadIdentitySlots::new();
 static LAST_USERSPACE_SET_HART: AtomicU64 = AtomicU64::new(u64::MAX);
 static LAST_USERSPACE_CLEAR_HART: AtomicU64 = AtomicU64::new(u64::MAX);
 static USERSPACE_SET_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -545,6 +612,15 @@ pub fn current_thread_payload(hart: usize) -> Option<PayloadCap<ThreadPayload>> 
     CURRENT_THREAD_PAYLOAD.slots[hart].lock().clone()
 }
 
+pub fn current_thread_identity(
+    hart: usize,
+) -> Option<crate::thread_runtime::adapter::step_engine::Cap<ThreadIdentity>> {
+    if hart >= MAX_THREAD_PAYLOAD_HARTS {
+        return None;
+    }
+    CURRENT_THREAD_IDENTITY.slots[hart].lock().clone()
+}
+
 /// Return the payload that most recently entered userspace on `hart`.
 ///
 /// Unlike [`current_thread_payload`], this slot spans the machine userspace
@@ -557,6 +633,15 @@ pub fn current_userspace_payload(hart: usize) -> Option<PayloadCap<ThreadPayload
         return None;
     }
     CURRENT_USERSPACE_PAYLOAD.slots[hart].lock().clone()
+}
+
+pub fn current_userspace_thread_identity(
+    hart: usize,
+) -> Option<crate::thread_runtime::adapter::step_engine::Cap<ThreadIdentity>> {
+    if hart >= MAX_THREAD_PAYLOAD_HARTS {
+        return None;
+    }
+    CURRENT_USERSPACE_THREAD_IDENTITY.slots[hart].lock().clone()
 }
 
 pub fn current_thread_payload_mask() -> u64 {
@@ -589,6 +674,20 @@ pub fn set_current_thread_payload(
     prev
 }
 
+pub fn set_current_thread_identity(
+    hart: usize,
+    thread: crate::thread_runtime::adapter::step_engine::Cap<ThreadIdentity>,
+) -> Option<crate::thread_runtime::adapter::step_engine::Cap<ThreadIdentity>> {
+    assert!(
+        hart < MAX_THREAD_PAYLOAD_HARTS,
+        "hart {hart} exceeds MAX_THREAD_PAYLOAD_HARTS",
+    );
+    let mut slot = CURRENT_THREAD_IDENTITY.slots[hart].lock();
+    let prev = slot.clone();
+    *slot = Some(thread);
+    prev
+}
+
 /// Clear the current thread payload on `hart`. Returns whatever was
 /// installed, if any.
 pub fn clear_current_thread_payload(hart: usize) -> Option<PayloadCap<ThreadPayload>> {
@@ -596,6 +695,15 @@ pub fn clear_current_thread_payload(hart: usize) -> Option<PayloadCap<ThreadPayl
         return None;
     }
     CURRENT_THREAD_PAYLOAD.slots[hart].lock().take()
+}
+
+pub fn clear_current_thread_identity(
+    hart: usize,
+) -> Option<crate::thread_runtime::adapter::step_engine::Cap<ThreadIdentity>> {
+    if hart >= MAX_THREAD_PAYLOAD_HARTS {
+        return None;
+    }
+    CURRENT_THREAD_IDENTITY.slots[hart].lock().take()
 }
 
 /// Install `payload` as the userspace-running payload on `hart`.
@@ -615,6 +723,20 @@ pub fn set_current_userspace_payload(
     prev
 }
 
+pub fn set_current_userspace_thread_identity(
+    hart: usize,
+    thread: crate::thread_runtime::adapter::step_engine::Cap<ThreadIdentity>,
+) -> Option<crate::thread_runtime::adapter::step_engine::Cap<ThreadIdentity>> {
+    assert!(
+        hart < MAX_THREAD_PAYLOAD_HARTS,
+        "hart {hart} exceeds MAX_THREAD_PAYLOAD_HARTS",
+    );
+    let mut slot = CURRENT_USERSPACE_THREAD_IDENTITY.slots[hart].lock();
+    let prev = slot.clone();
+    *slot = Some(thread);
+    prev
+}
+
 /// Clear the userspace-running payload on `hart`.
 pub fn clear_current_userspace_payload(hart: usize) -> Option<PayloadCap<ThreadPayload>> {
     if hart >= MAX_THREAD_PAYLOAD_HARTS {
@@ -624,6 +746,15 @@ pub fn clear_current_userspace_payload(hart: usize) -> Option<PayloadCap<ThreadP
     LAST_USERSPACE_CLEAR_HART.store(hart as u64, Ordering::Relaxed);
     USERSPACE_CLEAR_COUNT.fetch_add(1, Ordering::Relaxed);
     cleared
+}
+
+pub fn clear_current_userspace_thread_identity(
+    hart: usize,
+) -> Option<crate::thread_runtime::adapter::step_engine::Cap<ThreadIdentity>> {
+    if hart >= MAX_THREAD_PAYLOAD_HARTS {
+        return None;
+    }
+    CURRENT_USERSPACE_THREAD_IDENTITY.slots[hart].lock().take()
 }
 
 pub fn userspace_payload_trace_counters() -> (u64, u64, u64, u64) {

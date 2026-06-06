@@ -81,7 +81,7 @@ fn split_cap_words(bits: u64, idx: usize) -> u32 {
 }
 
 /// `capget(hdrp, datap)`. Minimal Linux capability ABI used by LTP setup.
-pub(super) fn sys_capget<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) fn sys_capget(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let header_uaddr = args[0];
     let data_uaddr = args[1];
     let header = match bootstrap_read_user::<CapUserHeader>(&ctx.aspace, header_uaddr) {
@@ -123,7 +123,7 @@ pub(super) fn sys_capget<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
 }
 
 /// `capset(hdrp, datap)`. Supports self-only effective/permitted changes.
-pub(super) fn sys_capset<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+pub(super) fn sys_capset(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let header_uaddr = args[0];
     let data_uaddr = args[1];
     let header = match bootstrap_read_user::<CapUserHeader>(&ctx.aspace, header_uaddr) {
@@ -204,6 +204,41 @@ pub(super) fn sys_getegid<'a>(ctx: &SyscallCtx<'a>) -> SyscallResult {
     SyscallResult::Return(ctx.cred().egid.raw() as i64)
 }
 
+/// `getgroups(gidsetsize, grouplist)`. Supplementary groups are not
+/// modelled in v1, so the caller has zero groups. Linux only needs to
+/// touch `grouplist` when entries are copied; with zero groups, even a
+/// positive `gidsetsize` performs no user write.
+pub(super) fn sys_getgroups(args: [u64; 6]) -> SyscallResult {
+    let gidsetsize = args[0] as i32;
+    if gidsetsize < 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    SyscallResult::Return(0)
+}
+
+/// `setgroups(size, list)`. Supplementary groups are not modelled yet, but
+/// root-only callers use this in LTP setup before switching uid/gid.
+pub(super) fn sys_setgroups(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let size = args[0] as usize;
+    let list_uaddr = args[1];
+    if size > 1024 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if size > 0 && list_uaddr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    if !ctx.cred_snapshot().is_privileged_for(Capability::SETGID) {
+        return SyscallResult::Error(EPERM_VALUE);
+    }
+    if size > 0 {
+        match bootstrap_read_user::<u32>(&ctx.aspace, list_uaddr) {
+            Ok(_) => {}
+            Err(errno) => return SyscallResult::error_from(errno),
+        }
+    }
+    SyscallResult::Return(0)
+}
+
 /// `setuid(uid)`. Wraps `cred::step_setuid` (Wave 1).
 ///
 /// Privileged callers (`euid == 0` or `CAP_SETUID`) get all four of
@@ -220,7 +255,7 @@ pub(super) fn sys_setuid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(change) => cred_change_to_result(change),
-        Err(v3errno) => SyscallResult::error_from(v3errno),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
@@ -238,34 +273,8 @@ pub(super) fn sys_setgid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(change) => cred_change_to_result(change),
-        Err(v3errno) => SyscallResult::error_from(v3errno),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
-}
-
-/// `setgroups(size, list)`. Supplementary groups are not modelled yet, but
-/// root-only callers use this in LTP setup before switching uid/gid.
-pub(super) fn sys_setgroups<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
-    let size = args[0] as usize;
-    let list_uaddr = args[1];
-    if size > 1024 {
-        return SyscallResult::Error(EINVAL_VALUE);
-    }
-    if size > 0 && list_uaddr == 0 {
-        return SyscallResult::Error(EFAULT_VALUE);
-    }
-    if !ctx
-        .cred_snapshot()
-        .is_privileged_for(tx_subsystems::cred::Capability::SETGID)
-    {
-        return SyscallResult::Error(EPERM_VALUE);
-    }
-    if size > 0 {
-        match bootstrap_read_user::<u32>(&ctx.aspace, list_uaddr) {
-            Ok(_) => {}
-            Err(errno) => return SyscallResult::error_from(errno),
-        }
-    }
-    SyscallResult::Return(0)
 }
 
 /// `setreuid(ruid, euid)`. Wraps `cred::step_setreuid` (Wave 1).
@@ -288,7 +297,7 @@ pub(super) fn sys_setreuid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallR
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(change) => cred_change_to_result(change),
-        Err(v3errno) => SyscallResult::error_from(v3errno),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
@@ -305,7 +314,7 @@ pub(super) fn sys_setregid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallR
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(change) => cred_change_to_result(change),
-        Err(v3errno) => SyscallResult::error_from(v3errno),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
@@ -329,7 +338,7 @@ pub(super) fn sys_setresuid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(change) => cred_change_to_result(change),
-        Err(v3errno) => SyscallResult::error_from(v3errno),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
@@ -348,7 +357,7 @@ pub(super) fn sys_setresgid<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
         Ok(change) => cred_change_to_result(change),
-        Err(v3errno) => SyscallResult::error_from(v3errno),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 

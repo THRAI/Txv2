@@ -242,6 +242,82 @@ fn ordinary_thread_exit_decrements_live_thread_count() {
 }
 
 #[test]
+fn ordinary_thread_exit_unregisters_only_thread_namespace_role() {
+    use crate::process::numbers::{resolve_pid_number_as, PidName, PidNameKind};
+
+    let _g = setup();
+    let parent = bootstrap();
+    let parent_ctx = synthetic_parent_ctx();
+    let child = step_clone_thread(&parent, &parent_ctx, SignalMask::EMPTY, 0, 0, 0)
+        .expect("step_clone_thread");
+    let child_tid = child.tid.0 as u64;
+    let parent_pid = parent.pid.0 as u64;
+
+    assert!(matches!(
+        resolve_pid_number_as(child_tid, PidNameKind::Thread),
+        Some(PidName::Thread(_))
+    ));
+
+    step_thread_exit(child, 0);
+
+    assert!(
+        resolve_pid_number_as(child_tid, PidNameKind::Thread).is_none(),
+        "non-leader thread exit must remove only the TID binding"
+    );
+    assert!(matches!(
+        resolve_pid_number_as(parent_pid, PidNameKind::Process),
+        Some(PidName::Process(_)),
+    ));
+    assert!(matches!(
+        resolve_pid_number_as(parent_pid, PidNameKind::Thread),
+        Some(PidName::Thread(_)),
+    ));
+}
+
+#[test]
+fn repeated_clone_thread_and_exit_keeps_process_roster_consistent() {
+    let _g = setup();
+    let parent = bootstrap();
+    let parent_ctx = synthetic_parent_ctx();
+    let leader = first_thread(&parent);
+
+    let mut children = alloc::vec::Vec::new();
+    for i in 0..128usize {
+        let stack = 0x7000_0000 + i * 0x4000;
+        let tls = 0x6000_0000 + i * 0x40;
+        let ctid = 0x8000_0000 + i as u64 * 4;
+        let child = step_clone_thread(&parent, &parent_ctx, SignalMask::EMPTY, stack, tls, ctid)
+            .expect("step_clone_thread");
+        assert!(
+            parent.thread_by_tid(child.tid.0).is_some(),
+            "fresh clone must be addressable by tid"
+        );
+        children.push(child);
+    }
+
+    assert_eq!(parent.live_thread_count(), 129);
+    assert!(
+        parent.thread_by_tid(leader.tid.0).is_some(),
+        "leader must stay in the process roster while siblings run"
+    );
+
+    for child in children {
+        let tid = child.tid.0;
+        step_thread_exit(child, 0);
+        assert!(
+            parent.thread_by_tid(tid).is_none(),
+            "exited sibling must leave the process roster"
+        );
+    }
+
+    assert_eq!(parent.live_thread_count(), 1);
+    assert!(
+        parent.thread_by_tid(leader.tid.0).is_some(),
+        "leader must be the sole remaining live thread"
+    );
+}
+
+#[test]
 fn exec_group_collapse_keeps_initiator_and_clears_episode() {
     let _g = setup();
     let parent = bootstrap();

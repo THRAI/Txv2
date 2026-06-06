@@ -230,8 +230,12 @@ impl MountApiFile {
         self.picked_mount.lock().clone()
     }
 
-    pub fn detached_mount(&self) -> Option<DetachedMountState> {
+    pub fn detached(&self) -> Option<DetachedMountState> {
         self.detached.lock().clone()
+    }
+
+    pub fn replace_detached(&self, next: Option<DetachedMountState>) -> Option<DetachedMountState> {
+        core::mem::replace(&mut *self.detached.lock(), next)
     }
 }
 
@@ -693,19 +697,6 @@ pub fn mount_for(
     None
 }
 
-/// Look up a registered mount whose root RNode is represented by
-/// `root_dentry`. This covers syscall paths that have already walked
-/// across the mount point and therefore hold the mounted filesystem's
-/// root dentry rather than the parent-side mountpoint dentry.
-pub fn mount_for_root_dentry(root_dentry: &Cap<DEntry>) -> Option<Cap<MountIdentity>> {
-    let root_rnode_addr = cap_raw_addr(root_dentry.rnode());
-    let table = MOUNT_TABLE.lock();
-    table
-        .iter()
-        .find(|entry| cap_raw_addr(entry.mount.root()) == root_rnode_addr)
-        .map(|entry| entry.mount.clone_cap())
-}
-
 // ============================================================================
 // Mount table snapshot (for /proc/mounts)
 // ============================================================================
@@ -914,6 +905,11 @@ pub fn bootstrap_mount(
     parent_mount: Option<Cap<MountIdentity>>,
     guard: &Guard<'_>,
 ) -> Result<Cap<MountIdentity>, Errno> {
+    let parent_payload = mountpoint
+        .rnode()
+        .containing_mount_weak()
+        .and_then(|weak| weak.upgrade(guard))
+        .ok_or(Errno::ENODEV)?;
     let fs_ops = source_payload.fs_ops().clone();
     let root_id = FsObjectId::ROOT;
 
@@ -940,7 +936,7 @@ pub fn bootstrap_mount(
 
     // Register in the global mount table.
     let mountpoint_fs_object_id = mountpoint.rnode().fs_object_id();
-    register_mount(&source_payload, mountpoint_fs_object_id, mount.clone());
+    register_mount(&parent_payload, mountpoint_fs_object_id, mount.clone());
 
     Ok(mount)
 }
@@ -954,7 +950,7 @@ fn drive_step_outcome_to_done<T>(
     loop {
         match step_fn() {
             StepOutcome::Done(value) => return Ok(value),
-            StepOutcome::Err(e) => return Err(e),
+            StepOutcome::Err(e) => return Err(e.into()),
             _ => {
                 // In bootstrap context, Continue/Yield are not expected;
                 // spin once and retry.
@@ -1173,6 +1169,19 @@ mod tests {
         ) -> StepOutcome<(), NoProgress> {
             StepOutcome::done(())
         }
+
+        fn materialise_rnode(
+            &self,
+            fs_object_id: FsObjectId,
+            meta: InodeMeta,
+            mount: &Cap<MountPayload>,
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<Cap<RNode>, NoProgress> {
+            match RNode::new_cap_in_mount(fs_object_id, meta, RNodeBacking::Directory, mount) {
+                Ok(rnode) => StepOutcome::done(rnode),
+                Err(_) => StepOutcome::err(V3Errno::ENOMEM),
+            }
+        }
     }
 
     impl FsPageBacking for MockFs {
@@ -1329,6 +1338,90 @@ mod tests {
         assert_eq!(payload.payload_pin_count(), 0);
     }
 
+    #[test]
+    fn bootstrap_mount_registers_with_parent_mount_payload_key() {
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        crate::zones::register_all().expect("kernel zones");
+        reset_mount_table_for_test();
+
+        let parent_fs = Arc::new(MockFs);
+        let parent_payload = MountPayload::new_cap(
+            parent_fs.clone() as Arc<dyn FsOps>,
+            parent_fs as Arc<dyn FsPageBacking>,
+            None,
+            DevId::new(11),
+            MountOptions::default(),
+            "parentfs",
+            SourceLabel::Static("parent"),
+        )
+        .expect("parent mount payload");
+        let parent_root = RNode::new_cap_in_mount(
+            FsObjectId::ROOT,
+            InodeMeta::new(InodeKind::Directory, 0o040755),
+            RNodeBacking::Directory,
+            &parent_payload,
+        )
+        .expect("parent root rnode");
+        let parent_mount = MountIdentity::new_cap(
+            MountId::new(11),
+            None,
+            parent_root,
+            None,
+            parent_payload.clone(),
+            MountFlags::empty(),
+        )
+        .expect("parent mount");
+
+        let mountpoint_id = FsObjectId::new(44);
+        let mountpoint_rnode = RNode::new_cap_in_mount(
+            mountpoint_id,
+            InodeMeta::new(InodeKind::Directory, 0o040755),
+            RNodeBacking::Directory,
+            &parent_payload,
+        )
+        .expect("mountpoint rnode");
+        let mountpoint = DEntry::new_cap(
+            crate::vfs::InlineName::new(b"mnt").expect("inline name"),
+            mountpoint_rnode,
+        )
+        .expect("mountpoint dentry");
+
+        let child_fs = Arc::new(MockFs);
+        let child_payload = MountPayload::new_cap(
+            child_fs.clone() as Arc<dyn FsOps>,
+            child_fs as Arc<dyn FsPageBacking>,
+            None,
+            DevId::new(12),
+            MountOptions::default(),
+            "childfs",
+            SourceLabel::Static("child"),
+        )
+        .expect("child mount payload");
+
+        let guard = crate::vfs::adapter::step_engine::guard();
+        let mounted = bootstrap_mount(
+            child_payload.clone(),
+            mountpoint,
+            Some(parent_mount),
+            &guard,
+        )
+        .expect("bootstrap mount");
+
+        assert_eq!(
+            mount_for(&parent_payload, mountpoint_id)
+                .expect("parent-keyed mount")
+                .id(),
+            mounted.id()
+        );
+        assert!(
+            mount_for(&child_payload, mountpoint_id).is_none(),
+            "child/source payload must not be used as the mountpoint lookup key"
+        );
+    }
+
     // -- step_v3 free-fn probes -------------------------------------------
     //
     // Mount has no production `step_*` fns; the only `StepOutcome`-shaped
@@ -1348,7 +1441,7 @@ mod tests {
     // - `mockfs_load_inode_meta_v3` — single `Done` outcome over a
     //   non-trivial payload (`InodeMeta`).
     // - `mockfs_fetch_page_v3` — single `Err(ENOSYS)` outcome routed
-    //   through the `From<execution::Errno> for step::Errno` bridge
+    //   through the `From<execution::Errno> for step_v3::Errno` bridge
     //   (`Errno::into()`); pins that conversion path.
 
     /// step_v3-shape sibling of [`MockFs::lookup`]. Returns
@@ -1379,17 +1472,17 @@ mod tests {
 
     /// step_v3-shape sibling of [`MockFs::fetch_page`]. Always returns
     /// `Err(ENOSYS)`, routed through the `From<execution::Errno> for
-    /// step::Errno` bridge so any drift in the errno catalog fails
+    /// step_v3::Errno` bridge so any drift in the errno catalog fails
     /// this test. Mirrors how a real mount-side step fn would surface
     /// an `execution::Errno` into a step_v3 outcome:
-    /// `let errno: step::Errno = exec_err.into()`.
+    /// `let errno: step_v3::Errno = exec_err.into()`.
     fn mockfs_fetch_page_v3(
         _fs_object_id: FsObjectId,
         _offset: u64,
         _guard: &Guard<'_>,
     ) -> StepOutcome<Frame, NoProgress> {
         let exec_err = Errno::ENOSYS;
-        let v3_err: V3Errno = exec_err;
+        let v3_err: V3Errno = exec_err.into();
         StepOutcome::err(v3_err)
     }
 

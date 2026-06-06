@@ -26,9 +26,9 @@ use std::vec::Vec;
 use tx_hal::{AllocError, PhysAddr, PmapError, PmapPermissions, PmapReserveKind, PtNode, VirtAddr};
 
 use super::address_space::{
-    commit_mapping_from_root, create_pmap_root_from_bag, destroy_pmap_root_from_bag,
-    l1_table_mut_from_root, protect_mapping_from_root, reserve_mapping_from_root,
-    unmap_mapping_from_root,
+    coalesce_invalidation_ranges, commit_mapping_from_root, create_pmap_root_from_bag,
+    destroy_pmap_root_from_bag, l1_table_mut_from_root, protect_mapping_from_root,
+    reserve_mapping_from_root, unmap_mapping_from_root,
 };
 use super::kernel_space::{
     commit_direct_map_1g_from_bag, commit_kernel_mapping_from_bag, protect_kernel_mapping_from_bag,
@@ -37,7 +37,7 @@ use super::kernel_space::{
 };
 use super::pt_node::{
     alloc_pt_node_from_bag, free_pt_node_from_bag, install_pt_node_allocator_for_test,
-    pt_node_allocated_for_test, reset_committed_pt_nodes_for_test,
+    pt_node_allocated_for_test, register_committed_pt_node, reset_committed_pt_nodes_for_test,
 };
 use super::pte::{
     encode_leaf_pte, page_table_mut_from_phys, pte_phys, PTE_A, PTE_D, PTE_G, PTE_R, PTE_U, PTE_V,
@@ -50,7 +50,7 @@ use super::topology::{
 };
 use super::{
     l0_table_for_test, l0_table_mut, l1_table_for_test, reset_pt_node_pool_for_test,
-    shootdown_kernel_mapping, HighSentinelError,
+    shootdown_kernel_mapping, HighSentinelError, ASID_CAPACITY,
 };
 use crate::boot_static::{BootLinkedAddr, BootStaticBag, IdentityLive};
 
@@ -76,12 +76,12 @@ static TEST_TYPED_PT_TABLES: TestTypedPtTables = TestTypedPtTables(UnsafeCell::n
     [crate::boot_static::PageTable([0; 512]); 2],
 ));
 
-struct TestRootPtTables(UnsafeCell<[crate::boot_static::PageTable; 64]>);
+struct TestRootPtTables(UnsafeCell<[crate::boot_static::PageTable; ASID_CAPACITY]>);
 
 unsafe impl Sync for TestRootPtTables {}
 
 static TEST_ROOT_PT_TABLES: TestRootPtTables = TestRootPtTables(UnsafeCell::new(
-    [crate::boot_static::PageTable([0; 512]); 64],
+    [crate::boot_static::PageTable([0; 512]); ASID_CAPACITY],
 ));
 
 // Test fixtures construct a host `BootStaticBag`, then drive the same pmap
@@ -120,7 +120,7 @@ unsafe fn test_typed_pt_release(_phys: PhysAddr) {
 
 fn test_root_pt_allocator() -> Result<PtNode, AllocError> {
     let index = TEST_ROOT_ALLOC_NEXT.fetch_add(1, Ordering::AcqRel);
-    if index >= 64 {
+    if index >= ASID_CAPACITY {
         return Err(AllocError::Exhausted);
     }
 
@@ -718,6 +718,22 @@ fn protect_kernel_mapping_leaves_absent_slots_to_fault_path() {
 }
 
 #[test]
+fn shootdown_batch_coalesces_contiguous_invalidations() {
+    let batch = coalesce_invalidation_ranges(&[
+        tx_hal::PmapInvalidation::new(VirtAddr(0x1000), 0x1000),
+        tx_hal::PmapInvalidation::new(VirtAddr(0x2000), 0x1000),
+        tx_hal::PmapInvalidation::new(VirtAddr(0x5000), 0x1000),
+        tx_hal::PmapInvalidation::new(VirtAddr(0x6000), 0x1000),
+    ]);
+
+    assert_eq!(batch.len(), 2);
+    assert_eq!(batch[0].virt(), VirtAddr(0x1000));
+    assert_eq!(batch[0].size(), 0x2000);
+    assert_eq!(batch[1].virt(), VirtAddr(0x5000));
+    assert_eq!(batch[1].size(), 0x2000);
+}
+
+#[test]
 fn committed_4k_unmap_releases_empty_intermediate_tables() {
     let _guard = pmap_test_guard();
     reset_typed_pt_allocator_test_state();
@@ -754,6 +770,19 @@ fn committed_4k_unmap_releases_empty_intermediate_tables() {
     );
 
     reset_typed_pt_allocator_test_state();
+    reset_committed_pt_nodes_for_test();
+}
+
+#[test]
+fn committed_pt_node_registry_handles_hackbench_fanout() {
+    let _guard = pmap_test_guard();
+    reset_committed_pt_nodes_for_test();
+
+    for i in 0..4096 {
+        let phys = PhysAddr(0x9000_0000 + i * PAGE_SIZE);
+        register_committed_pt_node(PtNode::boot_pool(phys));
+    }
+
     reset_committed_pt_nodes_for_test();
 }
 
@@ -809,9 +838,9 @@ fn process_root_exhausts_asids_without_allocating_reserved_zero() {
     publish_bootstrap_bag(&mut bag);
 
     let mut roots = Vec::new();
-    for expected_asid in 1..64 {
+    for expected_asid in 1..ASID_CAPACITY {
         let root = create_pmap_root_from_bag(&bag).expect("root should allocate until ASIDs end");
-        assert_eq!(root.asid().0, expected_asid);
+        assert_eq!(root.asid().0, expected_asid as u16);
         roots.push(root);
     }
 

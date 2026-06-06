@@ -107,37 +107,49 @@ pub(crate) fn la64_kernel_addr_to_phys(addr: usize) -> usize {
 }
 
 pub(crate) fn alloc_la64_asid() -> Result<Asid, PmapError> {
-    loop {
-        let allocated = LA64_ALLOCATED_ASIDS.load(Ordering::Acquire);
-        for asid in 1..u64::BITS {
-            let bit = 1u64 << asid;
-            if allocated & bit != 0 {
-                continue;
+    for word_index in 0..LA64_ASID_BITMAP_WORDS {
+        loop {
+            let allocated = LA64_ALLOCATED_ASIDS[word_index].load(Ordering::Acquire);
+            // ASID 0 is reserved (word 0, bit 0).
+            let reserved = if word_index == 0 { 1 } else { 0 };
+            if allocated | reserved == u64::MAX {
+                break;
             }
-            if LA64_ALLOCATED_ASIDS
-                .compare_exchange(
-                    allocated,
-                    allocated | bit,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-            {
-                return Ok(Asid(asid as u16));
+            for bit_index in 0..u64::BITS as usize {
+                let asid = word_index * u64::BITS as usize + bit_index;
+                if asid == 0 || asid >= LA64_ASID_CAPACITY {
+                    continue;
+                }
+                let bit = 1u64 << bit_index;
+                if allocated & bit != 0 {
+                    continue;
+                }
+                if LA64_ALLOCATED_ASIDS[word_index]
+                    .compare_exchange(
+                        allocated,
+                        allocated | bit,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    return Ok(Asid(asid as u16));
+                }
+                break;
             }
-            break;
-        }
-        if allocated == u64::MAX {
-            return Err(PmapError::Exhausted);
         }
     }
+    Err(PmapError::Exhausted)
 }
 
 pub(crate) fn free_la64_asid(asid: Asid) {
-    if asid.0 == 0 || asid.0 as u32 >= u64::BITS {
+    let asid = asid.0 as usize;
+    if asid == 0 || asid >= LA64_ASID_CAPACITY {
         return;
     }
-    LA64_ALLOCATED_ASIDS.fetch_and(!(1u64 << asid.0), Ordering::AcqRel);
+    let word_index = asid / u64::BITS as usize;
+    let bit_index = asid % u64::BITS as usize;
+    LA64_ALLOCATED_ASIDS[word_index].fetch_and(!(1u64 << bit_index), Ordering::AcqRel);
 }
 
 #[cfg(feature = "la64-boot-trace")]

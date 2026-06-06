@@ -205,7 +205,7 @@ const CLOCK_GETRES_NS: i64 = 2_000_000;
 const REALTIME_EPOCH_BASE_NS: u64 = 1_779_494_400_000_000_000;
 
 pub(super) fn realtime_ns<P: TimeIf>() -> u64 {
-    REALTIME_EPOCH_BASE_NS.saturating_add(<P as TimeIf>::read_ns())
+    tx_subsystems::wall_clock::realtime_now_ns::<P>()
 }
 
 /// Read a Linux-shaped `(tv_sec, tv_nsec)` pair from user memory and
@@ -352,6 +352,58 @@ pub(super) fn sys_gettimeofday<'a, P: TimeIf>(
         return SyscallResult::error_from(errno);
     }
     SyscallResult::Return(0)
+}
+
+fn can_set_realtime(ctx: &SyscallCtx<'_>) -> bool {
+    ctx.cred().euid.is_root()
+}
+
+pub(super) fn sys_clock_settime<'a, P: TimeIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
+    let clk_id = args[0] as u32;
+    let ts_uaddr = args[1];
+    if clk_id != CLOCK_REALTIME {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if ts_uaddr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    if !can_set_realtime(ctx) {
+        return SyscallResult::Error(EPERM_VALUE);
+    }
+    let Some(ns) = read_timespec_at(&ctx.aspace, ts_uaddr) else {
+        return SyscallResult::Error(EINVAL_VALUE);
+    };
+    match tx_subsystems::wall_clock::set_realtime_ns::<P>(ns) {
+        Ok(_) => SyscallResult::Return(0),
+        Err(_) => SyscallResult::Error(EINVAL_VALUE),
+    }
+}
+
+pub(super) fn sys_settimeofday<'a, P: TimeIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
+    let tv_uaddr = args[0];
+    if tv_uaddr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    if !can_set_realtime(ctx) {
+        return SyscallResult::Error(EPERM_VALUE);
+    }
+    let tv = match bootstrap_read_user::<TimevalLayout>(&ctx.aspace, tv_uaddr) {
+        Ok(tv) => tv,
+        Err(errno) => return SyscallResult::error_from(errno),
+    };
+    let Some(ns) = timeval_to_ns(tv) else {
+        return SyscallResult::Error(EINVAL_VALUE);
+    };
+    match tx_subsystems::wall_clock::set_realtime_ns::<P>(ns) {
+        Ok(_) => SyscallResult::Return(0),
+        Err(_) => SyscallResult::Error(EINVAL_VALUE),
+    }
 }
 
 const ITIMER_REAL: u32 = 0;
@@ -684,7 +736,7 @@ pub fn maybe_deliver_itimer_signal<P: TimeIf + tx_hal::PlatformConfig>(
     let siginfo_addr = frame_addr + offset_of!(CompatSignalFrame, siginfo);
     let ucontext_addr = frame_addr + offset_of!(CompatSignalFrame, user_context);
     let trampoline_pc = frame_addr + offset_of!(CompatSignalFrame, trampoline);
-    let return_pc = sigaction_restorer(process.pid.0, sig).unwrap_or(trampoline_pc);
+    let return_pc = sigaction_restorer(process, sig).unwrap_or(trampoline_pc);
     let frame = CompatSignalFrame {
         magic: RV64_SIGFRAME_MAGIC,
         version: RV64_SIGFRAME_VERSION,
@@ -725,6 +777,11 @@ pub fn maybe_deliver_itimer_signal<P: TimeIf + tx_hal::PlatformConfig>(
     ctx.regs[12] = ucontext_addr;
     thread_payload.store_saved_signal_context(Some(frame.user_context));
     ctx
+}
+
+fn sigaction_restorer(process: &Cap<ProcessIdentity>, sig: Signum) -> Option<usize> {
+    let restorer = process.sig_action_entry(sig)?.restorer;
+    (restorer != 0).then_some(restorer)
 }
 
 pub(super) fn read_compat_signal_frame(

@@ -33,8 +33,7 @@ Catalog of families:
 | **YIELD-*** | **YieldShape discipline** | **v5, new** |
 | **DELEGATE-*** | **OnAgent yield** | **v5, new** |
 | **SCOPE-*** | **ExecutionScope** | **v5, new** |
-| PID-*, MAP-*, FS-*, etc. | subsystem-specific | v4, preserved |
-| **NSVIEW-*** | **namespace views and userns authority** | **v4, refined here** |
+| PID-*, NSVIEW-*, MAP-*, FS-*, etc. | subsystem-specific | v4, preserved |
 
 ---
 
@@ -133,29 +132,6 @@ SCOPE-5. **Resources held inside an OnBehalfOf scope must not outlive the scope.
 SCOPE-6. **A kernel task may enter at most one OnBehalfOf scope at a time.** Nested OnBehalfOf is forbidden; instead, the task's scope is replaced (with an explicit transition, dropping all scope-held resources).
 
 SCOPE-7. **`current_subject_context()` does not exist.** Helpers receive `&SubjectContext` by parameter; SUBJ-1 is the wider statement of which this is the SCOPE-specific consequence.
-
----
-
-## NSVIEW — namespace views and authority
-
-<!-- txdoc:INV-V5-NSVIEW -->
-
-NSVIEW-1 through NSVIEW-3 are preserved from `INVARIANTS_v4`: namespace
-bundles hold namespace references rather than foreign semantic state,
-published bundles are immutable, and namespace-aware syscalls separate
-resolve, canonical operation, and render phases.
-
-NSVIEW-4. **Capability checks are namespace-relative.** Entering or creating a
-child `UserNamespace` grants authority only in that user namespace, not in
-ancestors or globally.
-
-NSVIEW-5. **Every non-user namespace records its immutable owning
-`UserNamespace`.** Privileged operations scoped by that namespace check
-capabilities in the owning user namespace.
-
-NSVIEW-6. **`UserNamespace` uid/gid maps and setgroups policy are namespace
-state exposed through procfs projections.** Map writes follow Linux write-once,
-offset-zero, non-overlap, and setgroups-gated `gid_map` rules.
 
 ---
 
@@ -260,9 +236,8 @@ All v4 invariants in these families hold unchanged in v5. Cross-references in th
 | YIELD | new family, 9 invariants |
 | DELEGATE | new family, 9 invariants |
 | SCOPE | new family, 7 invariants |
-| NSVIEW-4..6 | added namespace-relative capability, non-user namespace owner, and userns map projection rules |
 | STEP-1 | rephrased over four-variant outcome |
 | STEP-3 | rephrased over `StepProgress` monoid |
 | SCRIPT-V5-1..3 | new sub-rules for upper/lower split |
 | WIT-5, WIT-6 | new sub-rules for yield boundary |
-| all other v4 invariants | preserved unchanged unless explicitly refined above |
+| all other v4 invariants | preserved unchanged |

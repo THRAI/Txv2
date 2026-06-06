@@ -22,7 +22,11 @@ pub struct InternTable {
 
 impl InternTable {
     pub fn new() -> Self {
-        Self { map: HashMap::new(), next_iid: 1, external: HashMap::new() }
+        Self {
+            map: HashMap::new(),
+            next_iid: 1,
+            external: HashMap::new(),
+        }
     }
 
     /// Load an external name map (names.json contents, name_table section).

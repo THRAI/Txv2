@@ -464,7 +464,10 @@ fn record_unix_stream_peer_cred(socket: &Cap<SocketIdentity>, ctx: &SyscallCtx<'
 
 mod helpers;
 use helpers::*;
-pub(super) use helpers::{socket_poll_mask_from_file, socket_poll_wait_token_from_file};
+pub(super) use helpers::{
+    drive_loopback_pending, socket_identity_from_file, socket_poll_mask_from_file,
+    socket_poll_wait_token_from_file,
+};
 
 pub(super) fn sys_getsockname<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let socket = match resolve_socket_fd(ctx, args[0] as i32) {

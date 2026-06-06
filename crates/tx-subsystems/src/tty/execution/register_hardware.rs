@@ -19,11 +19,11 @@ pub fn register_hardware(
     use crate::tty::adapter::step_engine::StepOutcome as V3Out;
     let id_res = match step_engine::reserve_for::<TtyIdentity>() {
         Ok(reservation) => reservation,
-        Err(_) => return V3Out::err(Errno::EIO),
+        Err(_) => return V3Out::err(Errno::EIO.into()),
     };
     let payload_res = match step_engine::reserve_for::<TtyPayload>() {
         Ok(reservation) => reservation,
-        Err(_) => return V3Out::err(Errno::EIO),
+        Err(_) => return V3Out::err(Errno::EIO.into()),
     };
 
     let tty = step_engine::sign_for(
@@ -39,7 +39,7 @@ pub fn register_hardware(
     if registry::register_hardware_tty(index, tty.clone()).is_err()
         || registry::register_devfs_alias(name, tty.clone()).is_err()
     {
-        return V3Out::err(Errno::EIO);
+        return V3Out::err(Errno::EIO.into());
     }
 
     V3Out::done(tty)
@@ -49,7 +49,7 @@ pub fn register_hardware(
 pub fn register_console_alias(name: &str, tty: Cap<TtyIdentity>) -> StepOutcome<(), NoProgress> {
     use crate::tty::adapter::step_engine::StepOutcome as V3Out;
     if registry::register_devfs_alias(name, tty).is_err() {
-        return V3Out::err(Errno::EIO);
+        return V3Out::err(Errno::EIO.into());
     }
     V3Out::done(())
 }

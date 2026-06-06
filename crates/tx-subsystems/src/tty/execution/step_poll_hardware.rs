@@ -46,7 +46,7 @@ pub fn step_poll_hardware_input(
     // reserve
     // commit
     // publish
-    use crate::tty::adapter::step_engine::{NoProgress, StepOutcome as V3, YieldShape};
+    use crate::tty::adapter::step_engine::{NoProgress, StepOutcome as V3};
 
     if max_bytes == 0 {
         return V3::Done(HardwarePollOutcome::default());
@@ -54,12 +54,12 @@ pub fn step_poll_hardware_input(
 
     let payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
-        Err(err) => return V3::Err(err),
+        Err(err) => return V3::Err(err.into()),
     };
 
     let binding = match &payload.transport {
         TtyTransport::Hardware { binding } => *binding,
-        TtyTransport::Pty { .. } => return V3::Err(Errno::EINVAL),
+        TtyTransport::Pty { .. } => return V3::Err(Errno::EINVAL.into()),
     };
 
     // Helper: dispatch ingest's v3 outcome up into our v3 outcome.
@@ -76,18 +76,18 @@ pub fn step_poll_hardware_input(
                 bytes_read: read,
                 ingest: IngestOutcome::default(),
             }),
-            V3::Yield {
-                progress: _,
-                shape:
-                    YieldShape::OnWaitSource {
-                        source: carrier,
-                        interests,
-                    },
-            } => V3::yield_on_wait_source(NoProgress, carrier.raw(), interests.raw()),
-            V3::Yield { shape, .. } => V3::Yield {
-                progress: NoProgress,
-                shape,
-            },
+            V3::Yield { progress: _, shape } => {
+                if let Some((carrier, interests)) =
+                    crate::tty::notification::wait_source_parts(&shape)
+                {
+                    crate::tty::notification::yield_on_wait_source(NoProgress, carrier, interests)
+                } else {
+                    V3::Yield {
+                        progress: NoProgress,
+                        shape,
+                    }
+                }
+            }
             V3::Err(e) => V3::Err(e),
         }
     };
@@ -122,22 +122,21 @@ pub fn step_poll_hardware_input(
             bytes.truncate(read);
             drive_ingest(&bytes, read, guard)
         }
-        V3::Yield {
-            progress,
-            shape:
-                YieldShape::OnWaitSource {
-                    source: carrier,
-                    interests,
-                },
-        } => {
-            let read = progress.bytes().min(bytes.len());
-            if read == 0 {
-                return V3::yield_on_wait_source(NoProgress, carrier.raw(), interests.raw());
+        V3::Yield { progress, shape } => {
+            if let Some((carrier, interests)) = crate::tty::notification::wait_source_parts(&shape)
+            {
+                let read = progress.bytes().min(bytes.len());
+                if read == 0 {
+                    return crate::tty::notification::yield_on_wait_source(
+                        NoProgress, carrier, interests,
+                    );
+                }
+                bytes.truncate(read);
+                drive_ingest(&bytes, read, guard)
+            } else {
+                V3::Err(Errno::EIO.into())
             }
-            bytes.truncate(read);
-            drive_ingest(&bytes, read, guard)
         }
-        V3::Yield { .. } => V3::Err(Errno::EIO),
         V3::Err(err) => V3::Err(err),
     }
 }

@@ -28,6 +28,7 @@
 //! See `docs/progress/decisions/2026-04-29-process-root-asid-shootdown-anchors.md`
 //! and `docs/progress/decisions/2026-04-29-rv64-pmap-module-extraction.md`.
 
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use tx_hal::{
@@ -45,11 +46,16 @@ use super::pt_node::{
 use super::{
     encode_branch_pte, encode_leaf_pte_with_permissions, ensure_l0_table_for_reservation,
     l0_table_mut, page_table_mut_from_phys, pte_is_branch, pte_phys, rv64_1g_leaf_index,
-    rv64_2m_leaf_index, rv64_4k_leaf_index, sfence_vma_all, validate_aligned_mapping,
-    validate_aligned_virt, validate_rv64_leaf_permissions, validate_user_mapping_virt,
+    rv64_2m_leaf_index, rv64_4k_leaf_index, sfence_vma_all, sfence_vma_range_asid,
+    validate_aligned_mapping, validate_aligned_virt, validate_rv64_leaf_permissions,
+    validate_user_mapping_virt,
 };
 
-static ALLOCATED_ASIDS: AtomicU64 = AtomicU64::new(1);
+const ASID_BITMAP_WORDS: usize = 16;
+pub(crate) const ASID_CAPACITY: usize = ASID_BITMAP_WORDS * u64::BITS as usize;
+
+static ALLOCATED_ASIDS: [AtomicU64; ASID_BITMAP_WORDS] =
+    [const { AtomicU64::new(0) }; ASID_BITMAP_WORDS];
 
 /// Root-relative ensured table plus the fresh PT-node that backs it.
 ///
@@ -273,7 +279,9 @@ pub(super) fn commit_mapping_from_root(
             l0.0[rv64_4k_leaf_index(reservation.virt().0)] = pte;
         }
     }
-    sfence_vma_all();
+    // User pmap commits are consumed at the next userspace entry, where
+    // `activate_user_pmap` writes `satp` and issues `sfence.vma`. Avoid a
+    // second per-PTE fence here; unmap/protect still fence at invalidation.
 }
 
 pub(crate) fn unmap_mapping(
@@ -397,38 +405,61 @@ pub(crate) fn shootdown_mapping(_asid: Asid, _invalidation: PmapInvalidation) {
     sfence_vma_all();
 }
 
+pub(crate) fn shootdown_mappings(asid: Asid, invalidations: &[PmapInvalidation]) {
+    if invalidations.is_empty() {
+        return;
+    }
+
+    let coalesced = coalesce_invalidation_ranges(invalidations);
+    for invalidation in &coalesced {
+        sfence_vma_range_asid(invalidation.virt(), invalidation.size(), asid);
+    }
+    crate::remote_sfence_vma_asid_batch(asid, &coalesced);
+}
+
 fn alloc_asid() -> Result<Asid, PmapError> {
-    loop {
-        let allocated = ALLOCATED_ASIDS.load(Ordering::Acquire);
-        for asid in 1..u64::BITS {
-            let bit = 1u64 << asid;
-            if allocated & bit != 0 {
-                continue;
+    for word_index in 0..ASID_BITMAP_WORDS {
+        loop {
+            let allocated = ALLOCATED_ASIDS[word_index].load(Ordering::Acquire);
+            let reserved = if word_index == 0 { 1 } else { 0 };
+            if allocated | reserved == u64::MAX {
+                break;
             }
-            if ALLOCATED_ASIDS
-                .compare_exchange(
-                    allocated,
-                    allocated | bit,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-            {
-                return Ok(Asid(asid as u16));
+            for bit_index in 0..u64::BITS as usize {
+                let asid = word_index * u64::BITS as usize + bit_index;
+                if asid == 0 || asid >= ASID_CAPACITY {
+                    continue;
+                }
+                let bit = 1u64 << bit_index;
+                if allocated & bit != 0 {
+                    continue;
+                }
+                if ALLOCATED_ASIDS[word_index]
+                    .compare_exchange(
+                        allocated,
+                        allocated | bit,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    return Ok(Asid(asid as u16));
+                }
+                break;
             }
-            break;
-        }
-        if allocated == u64::MAX {
-            return Err(PmapError::Exhausted);
         }
     }
+    Err(PmapError::Exhausted)
 }
 
 fn free_asid(asid: Asid) {
-    if asid.0 == 0 || asid.0 as u32 >= u64::BITS {
+    let asid = asid.0 as usize;
+    if asid == 0 || asid >= ASID_CAPACITY {
         return;
     }
-    ALLOCATED_ASIDS.fetch_and(!(1u64 << asid.0), Ordering::AcqRel);
+    let word_index = asid / u64::BITS as usize;
+    let bit_index = asid % u64::BITS as usize;
+    ALLOCATED_ASIDS[word_index].fetch_and(!(1u64 << bit_index), Ordering::AcqRel);
 }
 
 fn invalidate_destroyed_root() -> RootInvalidated {
@@ -437,7 +468,25 @@ fn invalidate_destroyed_root() -> RootInvalidated {
 }
 
 fn free_asid_after_invalidation(asid: Asid, _invalidated: RootInvalidated) {
+    crate::clear_asid_residency(asid);
     free_asid(asid);
+}
+
+pub(crate) fn coalesce_invalidation_ranges(
+    invalidations: &[PmapInvalidation],
+) -> Vec<PmapInvalidation> {
+    let mut coalesced: Vec<PmapInvalidation> = Vec::with_capacity(invalidations.len());
+    for invalidation in invalidations {
+        if let Some(last) = coalesced.last_mut() {
+            let last_end = last.virt().0 + last.size();
+            if last_end == invalidation.virt().0 {
+                *last = PmapInvalidation::new(last.virt(), last.size() + invalidation.size());
+                continue;
+            }
+        }
+        coalesced.push(*invalidation);
+    }
+    coalesced
 }
 
 // Root-relative intermediate table management mirrors the kernel-bootstrap
@@ -563,5 +612,7 @@ fn release_page_table_tree_from_bag<State>(bag: &BootStaticBag<State>, phys: Phy
 
 #[cfg(test)]
 pub(super) fn reset_asids_for_test() {
-    ALLOCATED_ASIDS.store(1, Ordering::Release);
+    for word in &ALLOCATED_ASIDS {
+        word.store(0, Ordering::Release);
+    }
 }

@@ -22,6 +22,7 @@ use tx_platform_adapter::platform_adapter;
     reason = "wrap futex step outcomes (einval, eagain, yield-until-wake, done(n)) as named verbs over the substrate step engine"
 )]
 pub mod step_engine {
+    pub(crate) use crate::sync::SpinMutex;
     pub use tx_substrate::epoch::{guard, Guard};
     pub use tx_substrate::step::{
         AbortReason, Errno, InterestMask, NoProgress, OneShotStepOp, ProcessIdentity,
@@ -34,7 +35,6 @@ pub mod step_engine {
         OperationalCapExt, OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy,
         RetainedEntityPolicy, Weak, Zone, ZoneAllocated, ZoneError, ZonePolicy,
     };
-    pub use tx_substrate::SpinMutex;
 
     /// `futex(uaddr, FUTEX_WAIT, val, ...)` matched the value: park on
     /// the bucket's wait source. Wraps `StepOutcome::Yield { progress
@@ -91,17 +91,15 @@ pub mod wait_routing {
     /// coexistence wake path.
     ///
     /// Delegates to `tx_reactor::wait::fire_legacy`.
-    pub fn fire_legacy_channel(channel: &Channel, mask_bits: u64) -> usize {
-        tx_reactor::wait::fire_legacy(channel, mask_bits)
+    pub fn fire_legacy_channel(channel: &Channel, mask_bits: u64) {
+        tx_reactor::wait::fire_legacy(channel, mask_bits);
     }
 
     /// Notify the v3 `WaitSource` for one futex bucket — D2
     /// coexistence wake path (mailbox).
     ///
     /// Delegates to `tx_substrate::wake::notify`.
-    pub fn notify_v3_source(source: &Arc<WaitSource>, mask_bits: u64) -> usize {
-        use tx_substrate::step::InterestMask;
-
-        source.notify(InterestMask::new(mask_bits))
+    pub fn notify_v3_source(source: &Arc<WaitSource>, mask_bits: u64) {
+        tx_substrate::wake::notify(source, mask_bits)
     }
 }

@@ -9,8 +9,9 @@ struct RecordingSignal {
 }
 
 impl RescheduleSignal for RecordingSignal {
-    fn send_reschedule_ipi(&mut self, target_hart: HartId) {
+    fn send_reschedule_ipi(&mut self, target_hart: HartId) -> bool {
         self.sent.push(target_hart);
+        true
     }
 }
 

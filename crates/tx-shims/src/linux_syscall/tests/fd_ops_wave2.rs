@@ -145,7 +145,6 @@ fn dispatch_openat_existing_file_o_rdonly_returns_fd() {
     drop(guard);
 
     let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
-    proc_cap.set_rlimit_nofile(1024, 1024);
     let ctx = make_ctx(proc_cap.clone(), thread);
 
     let path = nul_terminate(b"/f");
@@ -412,7 +411,6 @@ fn dispatch_openat_o_creat_o_excl_existing_returns_neg_eexist() {
     drop(guard);
 
     let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
-    proc_cap.set_rlimit_nofile(1024, 1024);
     let ctx = make_ctx(proc_cap, thread);
 
     let path = nul_terminate(b"/f");
@@ -495,6 +493,84 @@ fn dispatch_openat_o_trunc_truncates_existing() {
     drop(path);
 }
 
+/// `openat(O_TRUNC)` must not trust the cached `RNode` size. A prior
+/// path walk can cache a dentry while the tmpfs inode is still empty;
+/// later writes/truncates update the backend inode size, not that cached
+/// metadata snapshot.
+#[test]
+fn dispatch_openat_o_trunc_truncates_stale_cached_dentry() {
+    let _setup = fd_ops_setup();
+    let (root_dentry, tmpfs) = build_tmpfs_root();
+    let owner_cred = Credential {
+        uid: 0,
+        gid: 0,
+        effective_caps: CapabilitySet::FULL,
+    };
+    let guard = ebr_guard();
+    let (file_id, _) = match tmpfs.create_inode(
+        TMPFS_ROOT_OBJECT_ID,
+        b"stale",
+        0o100644,
+        &owner_cred,
+        &guard,
+    ) {
+        StepOutcome::Done(out) => out,
+        other => panic!("create_inode: {other:?}"),
+    };
+    drop(guard);
+
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap, thread);
+    let path = nul_terminate(b"/stale");
+
+    let first_open = SyscallRequest::new(
+        NR_OPENAT,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            O_RDWR as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    match block_on(dispatch::<ShimsTestPmap>(first_open, &ctx)) {
+        SyscallResult::Return(_) => {}
+        other => panic!("initial openat: {other:?}"),
+    }
+
+    let guard = ebr_guard();
+    match tmpfs.truncate(file_id, 4096, &guard) {
+        StepOutcome::Done(()) => {}
+        other => panic!("backend truncate: {other:?}"),
+    }
+    drop(guard);
+
+    let trunc_open = SyscallRequest::new(
+        NR_OPENAT,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            (O_RDWR | O_TRUNC) as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    match block_on(dispatch::<ShimsTestPmap>(trunc_open, &ctx)) {
+        SyscallResult::Return(_) => {}
+        other => panic!("openat O_TRUNC stale dentry: {other:?}"),
+    }
+
+    let guard = ebr_guard();
+    let meta = match tmpfs.load_inode_meta(file_id, &guard) {
+        StepOutcome::Done(m) => m,
+        other => panic!("load_inode_meta: {other:?}"),
+    };
+    assert_eq!(meta.size, 0, "O_TRUNC must clear backend size");
+    drop(path);
+}
+
 /// `openat(.., O_RDONLY | O_CLOEXEC)` sets the cloexec bit on the
 /// returned fd. The bit is consulted by `step_close_cloexec_fds`
 /// at exec time.
@@ -558,8 +634,8 @@ fn dispatch_openat_path_not_found_returns_neg_enoent() {
     drop(path);
 }
 
-/// Non-`AT_FDCWD` dirfd values return `-EBADF` for relative paths
-/// when the fd is not open.
+/// Non-`AT_FDCWD` dirfd values return `-EBADF`. The slice's fd
+/// table doesn't carry directory-fd semantics yet.
 #[test]
 fn dispatch_openat_dirfd_not_at_fdcwd_returns_neg_ebadf() {
     let _setup = fd_ops_setup();
@@ -567,7 +643,7 @@ fn dispatch_openat_dirfd_not_at_fdcwd_returns_neg_ebadf() {
     let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
     let ctx = make_ctx(proc_cap, thread);
 
-    let path = nul_terminate(b"f");
+    let path = nul_terminate(b"/f");
     // dirfd = 5 (a positive fd value); not AT_FDCWD = -100.
     let req = SyscallRequest::new(
         NR_OPENAT,

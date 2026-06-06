@@ -74,13 +74,11 @@ use tx_subsystems::aio::{
     is_valid_iocb_opcode, spawn_worker_for_context, AioContext, AioWorkerFuture, IoEvent, Iocb,
     IocbDispatcher, EVENTS_AVAILABLE_MASK, IOCB_CMD_PREAD, IOCB_CMD_PWRITE, IO_EVENT_BYTES,
 };
-use tx_subsystems::execution::WaitToken;
 use tx_subsystems::process::ProcessIdentity;
 use tx_subsystems::vfs::execution::{OpenFileLseekOp, OpenFileReadOp, OpenFileWriteOp};
 use tx_subsystems::vfs::structure::OpenFileFlags;
 use tx_subsystems::vfs::OpenFile;
 use tx_subsystems::vm::AddressSpace;
-use tx_subsystems::wait_source;
 
 use super::{
     bootstrap_copy_from_user, bootstrap_copy_to_user, next_stdio_fd_below_nofile, SyscallCtx,
@@ -88,7 +86,9 @@ use super::{
 };
 use super::{EBADF_VALUE, EFAULT_VALUE, EINVAL_VALUE, ENOMEM_VALUE};
 use crate::adapter::step_engine::StepOutcome as V3Out;
-use crate::adapter::step_engine::{self as step_engine, Cap, SpinMutex, StepOp};
+use crate::adapter::step_engine::{
+    self as step_engine, Cap, InterestMask, SpinMutex, StepOp, WaitSourceId,
+};
 
 // === Linux negative-errno values used by the dispatcher =============
 //
@@ -326,7 +326,7 @@ fn run_read(file: &Cap<OpenFile>, out: &mut [u8]) -> Result<usize, i64> {
                 if total > 0 {
                     return Ok(total);
                 }
-                return Err(-(super::errno_to_i32(v3errno) as i64));
+                return Err(-(super::errno_to_i32(v3errno.into()) as i64));
             }
         }
     }
@@ -369,7 +369,7 @@ fn run_write(file: &Cap<OpenFile>, bytes: &[u8]) -> Result<usize, i64> {
                 if total > 0 {
                     return Ok(total);
                 }
-                return Err(-(super::errno_to_i32(v3errno) as i64));
+                return Err(-(super::errno_to_i32(v3errno.into()) as i64));
             }
         }
     }
@@ -720,10 +720,12 @@ pub(super) async fn sys_io_getevents<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -
             break;
         }
         // Park on the events_available carrier and re-drain.
-        let token = WaitToken::new(aio_cap.events_available_id(), EVENTS_AVAILABLE_MASK);
-        if let Some(future) = wait_source::wait_on_token(token) {
-            let _ = future.await;
-        }
+        super::await_wait_source(
+            ctx,
+            WaitSourceId::new(aio_cap.events_available_id()),
+            InterestMask::new(EVENTS_AVAILABLE_MASK),
+        )
+        .await;
         iter_budget = iter_budget.saturating_sub(1);
         if iter_budget == 0 {
             // Defensive break: never block forever in the canary even

@@ -6,10 +6,11 @@
 //! in `execution.rs`.
 
 use crate::vm::adapter::step_engine::{self as step_engine};
+use crate::vm::structure::recipe_tree::VmEntryView;
 use crate::vm::{
-    AccessMode, AddressSpace, MapPlacement, UserRange, VmEntry, VmFault, VmFaultError,
-    VmFaultMaterialization, VmFaultMaterializationBacking, VmFaultOutcome, VmMapError,
-    VmRemapPlacement,
+    AccessMode, AddressSpace, MapPlacement, UserRange, VmEntry, VmEntryBacking, VmFault,
+    VmFaultError, VmFaultMaterialization, VmFaultMaterializationBacking, VmFaultOutcome,
+    VmMapError, VmRemapPlacement,
 };
 
 pub fn require_fault_recipe(
@@ -24,7 +25,7 @@ pub fn require_fault_recipe(
 
     Ok(VmFaultOutcome {
         page_range,
-        private_identity: entry.private.as_ref().map(|set| set.raw()),
+        private_identity: entry.private_identity(),
         entry,
         access: fault.access,
         pmap_materialization_deferred: aspace.pmap().materialization_deferred(),
@@ -35,24 +36,26 @@ pub fn require_fault_publication(
     aspace: &AddressSpace,
     outcome: &VmFaultOutcome,
     materialization: &VmFaultMaterialization,
-) -> Result<VmEntry, VmFaultError> {
+) -> Result<(), VmFaultError> {
+    let guard = step_engine::guard();
     let entry = aspace
-        .lookup(outcome.page_range.start())
+        .recipes
+        .lookup_view(outcome.page_range.start(), &guard)
         .ok_or(VmFaultError::StaleRecipe)?;
-    if entry != outcome.entry || !permits_fault(&entry, outcome.access) {
+    if !view_matches_entry(entry, &outcome.entry) || !entry.permits_fault(outcome.access) {
         return Err(VmFaultError::StaleRecipe);
     }
-    if entry.private.as_ref().map(|set| set.raw()) != outcome.private_identity {
+    if entry.private.map(|private| private.raw()) != outcome.private_identity {
         return Err(VmFaultError::StaleRecipe);
     }
 
-    match (&entry.backing, materialization.backing) {
-        (crate::vm::VmBacking::Page { .. }, VmFaultMaterializationBacking::PageBacked) => {
+    match (entry.backing, materialization.backing) {
+        (VmEntryBacking::Page { .. }, VmFaultMaterializationBacking::PageBacked) => {
             if outcome.backing_page_index()? != materialization.page_index {
                 return Err(VmFaultError::StaleRecipe);
             }
         }
-        (crate::vm::VmBacking::PrivateAnon, VmFaultMaterializationBacking::PrivateAnon) => {
+        (VmEntryBacking::PrivateAnon, VmFaultMaterializationBacking::PrivateAnon) => {
             if outcome.private_anon_page_index()? != materialization.page_index {
                 return Err(VmFaultError::StaleRecipe);
             }
@@ -60,7 +63,31 @@ pub fn require_fault_publication(
         _ => return Err(VmFaultError::StaleRecipe),
     }
 
-    Ok(entry)
+    Ok(())
+}
+
+fn view_matches_entry(view: VmEntryView<'_>, entry: &VmEntry) -> bool {
+    if view.range != entry.range
+        || view.prot != entry.prot
+        || view.flags != entry.flags
+        || view.ufd_registration != entry.ufd_registration
+        || view.backing != entry.backing_kind()
+    {
+        return false;
+    }
+
+    match view.backing {
+        VmEntryBacking::None | VmEntryBacking::PrivateAnon => true,
+        VmEntryBacking::Page { offset } => {
+            let Some((view_pc, view_offset)) = view.page else {
+                return false;
+            };
+            let Some((entry_pc, entry_offset)) = entry.page_backing() else {
+                return false;
+            };
+            view_offset == offset && entry_offset == offset && view_pc == entry_pc
+        }
+    }
 }
 
 pub fn require_map_admission(

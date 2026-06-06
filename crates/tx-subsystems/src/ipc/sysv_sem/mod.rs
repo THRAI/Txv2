@@ -8,6 +8,7 @@
 
 pub mod checks;
 pub mod execution;
+pub mod notification;
 pub mod projection;
 pub mod structure;
 

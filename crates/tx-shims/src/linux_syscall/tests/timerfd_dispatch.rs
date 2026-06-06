@@ -2,13 +2,13 @@
 #![cfg_attr(test, allow(unused_imports))]
 use super::*;
 
-use crate::linux_syscall::numbers::TFD_TIMER_ABSTIME_FLAG;
 use crate::linux_syscall::{
-    time::realtime_ns, CLOCK_MONOTONIC, CLOCK_REALTIME, NR_TIMERFD_CREATE, NR_TIMERFD_GETTIME,
-    NR_TIMERFD_SETTIME,
+    CLOCK_MONOTONIC, CLOCK_REALTIME, NR_READ, NR_TIMERFD_CREATE, NR_TIMERFD_GETTIME,
+    NR_TIMERFD_SETTIME, TFD_TIMER_ABSTIME_FLAG, TFD_TIMER_CANCEL_ON_SET_FLAG,
 };
 
 const E_INVAL: i32 = 22;
+const E_CANCELED: i32 = 125;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -32,8 +32,12 @@ fn timerfd_setup() -> (TestSetup, Cap<ProcessIdentity>, Cap<ThreadIdentity>) {
 }
 
 fn create_timerfd(ctx: &SyscallCtx<'_>) -> i64 {
+    create_timerfd_with_clock(ctx, CLOCK_MONOTONIC)
+}
+
+fn create_timerfd_with_clock(ctx: &SyscallCtx<'_>, clockid: u32) -> i64 {
     match block_on(dispatch::<ShimsTestPmap>(
-        SyscallRequest::new(NR_TIMERFD_CREATE, [CLOCK_MONOTONIC as u64, 0, 0, 0, 0, 0]),
+        SyscallRequest::new(NR_TIMERFD_CREATE, [clockid as u64, 0, 0, 0, 0, 0]),
         ctx,
     )) {
         SyscallResult::Return(fd) => fd,
@@ -135,51 +139,6 @@ fn dispatch_timerfd_settime_and_gettime_use_musl_itimerspec_layout() {
 }
 
 #[test]
-fn dispatch_timerfd_realtime_abstime_is_converted_to_monotonic_deadline() {
-    let (_setup, proc_cap, thread) = timerfd_setup();
-    let ctx = make_ctx(proc_cap.clone(), thread);
-    let fd = match block_on(dispatch::<ShimsTestPmap>(
-        SyscallRequest::new(NR_TIMERFD_CREATE, [CLOCK_REALTIME as u64, 0, 0, 0, 0, 0]),
-        &ctx,
-    )) {
-        SyscallResult::Return(fd) => fd,
-        other => panic!("timerfd_create realtime: {other:?}"),
-    };
-
-    let realtime_deadline = realtime_ns::<ShimsTestPmap>().saturating_add(100_000_000);
-    let new_value = TestItimerspec {
-        it_interval: TestTimespec::default(),
-        it_value: TestTimespec {
-            tv_sec: (realtime_deadline / 1_000_000_000) as i64,
-            tv_nsec: (realtime_deadline % 1_000_000_000) as i64,
-        },
-    };
-    let result = block_on(dispatch::<ShimsTestPmap>(
-        SyscallRequest::new(
-            NR_TIMERFD_SETTIME,
-            [
-                fd as u64,
-                TFD_TIMER_ABSTIME_FLAG as u64,
-                &new_value as *const TestItimerspec as u64,
-                0,
-                0,
-                0,
-            ],
-        ),
-        &ctx,
-    ));
-    assert_eq!(result, SyscallResult::Return(0));
-
-    let file = proc_cap.fd(fd as u32).expect("timerfd fd installed");
-    let tfd = file.timerfd().expect("timerfd backing");
-    let remaining = tfd.remaining_value_ns(<ShimsTestPmap as tx_hal::TimeIf>::read_ns());
-    assert!(
-        remaining <= 100_000_000,
-        "realtime absolute timer must be stored in monotonic deadline domain, got remaining {remaining}ns",
-    );
-}
-
-#[test]
 fn dispatch_timerfd_settime_rejects_unknown_flags() {
     let (_setup, proc_cap, thread) = timerfd_setup();
     let ctx = make_ctx(proc_cap, thread);
@@ -237,4 +196,65 @@ fn dispatch_timerfd_settime_rejects_invalid_nsec() {
         &ctx,
     ));
     assert_eq!(result, SyscallResult::Error(E_INVAL));
+}
+
+#[test]
+fn dispatch_timerfd_cancel_on_set_realtime_abstime_read_returns_ecanceled() {
+    let (_setup, proc_cap, thread) = timerfd_setup();
+    let ctx = make_ctx(proc_cap, thread);
+    let fd = create_timerfd_with_clock(&ctx, CLOCK_REALTIME);
+    let new_value = TestItimerspec {
+        it_interval: TestTimespec::default(),
+        it_value: TestTimespec {
+            tv_sec: 1_900_000_000,
+            tv_nsec: 0,
+        },
+    };
+    let flags = TFD_TIMER_ABSTIME_FLAG | TFD_TIMER_CANCEL_ON_SET_FLAG;
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_TIMERFD_SETTIME,
+            [
+                fd as u64,
+                flags as u64,
+                &new_value as *const TestItimerspec as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Return(0));
+
+    let set = TestTimespec {
+        tv_sec: 1_800_000_000,
+        tv_nsec: 0,
+    };
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            crate::linux_syscall::NR_CLOCK_SETTIME,
+            [
+                CLOCK_REALTIME as u64,
+                &set as *const TestTimespec as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Return(0));
+
+    let mut buf = 0u64;
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_READ,
+            [fd as u64, &mut buf as *mut u64 as u64, 8, 0, 0, 0],
+        ),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Error(E_CANCELED));
 }

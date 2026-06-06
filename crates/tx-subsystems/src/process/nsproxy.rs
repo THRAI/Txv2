@@ -24,7 +24,9 @@ use crate::ipc::sysv_msg::structure::MsgQueueIdentity;
 use crate::ipc::sysv_sem::structure::SemArrayIdentity;
 use crate::ipc::sysv_shm::structure::ShmSegmentIdentity;
 use crate::mount::MountNamespace;
-use crate::process::adapter::step_engine::{sign, Cap, SpinMutex, Zone, ZoneAllocated, ZoneError};
+use crate::process::adapter::step_engine::{
+    process_spin_mutex, sign, Cap, ProcessSpinMutex, Zone, ZoneAllocated, ZoneError,
+};
 
 // ---------------------------------------------------------------------------
 // SysV IPC key types
@@ -128,15 +130,15 @@ impl Default for IpcLimits {
 /// replaced with namespace-number `IndexTable<SysvKey, Cap<...>>`.
 pub struct IpcNamespace {
     /// SysV semaphore arrays, keyed by `key_t` (or IPC_PRIVATE id).
-    pub sysv_sem: SpinMutex<BTreeMap<SysvKey, Cap<SemArrayIdentity>>>,
+    pub sysv_sem: ProcessSpinMutex<BTreeMap<SysvKey, Cap<SemArrayIdentity>>>,
     /// SysV shared memory segments, keyed by `key_t`.
-    pub sysv_shm: SpinMutex<BTreeMap<SysvKey, Cap<ShmSegmentIdentity>>>,
+    pub sysv_shm: ProcessSpinMutex<BTreeMap<SysvKey, Cap<ShmSegmentIdentity>>>,
     /// SysV message queues, keyed by `key_t`.
-    pub sysv_msg: SpinMutex<BTreeMap<SysvKey, Cap<MsgQueueIdentity>>>,
+    pub sysv_msg: ProcessSpinMutex<BTreeMap<SysvKey, Cap<MsgQueueIdentity>>>,
     /// POSIX message queues, keyed by path name.
-    pub posix_mq: SpinMutex<BTreeMap<PosixMqName, Cap<PosixMqIdentity>>>,
+    pub posix_mq: ProcessSpinMutex<BTreeMap<PosixMqName, Cap<PosixMqIdentity>>>,
     /// Per-namespace tunable limits.
-    pub limits: SpinMutex<IpcLimits>,
+    pub limits: ProcessSpinMutex<IpcLimits>,
     /// Monotonic counter for `IPC_PRIVATE` id generation (shared across
     /// all three SysV kinds — Linux uses separate idr per kind but a
     /// shared `ipc_ids` allocator). Day-1 single atomic counter.
@@ -146,11 +148,11 @@ pub struct IpcNamespace {
 impl IpcNamespace {
     pub fn with_limits(limits: IpcLimits) -> Self {
         Self {
-            sysv_sem: SpinMutex::new(BTreeMap::new()),
-            sysv_shm: SpinMutex::new(BTreeMap::new()),
-            sysv_msg: SpinMutex::new(BTreeMap::new()),
-            posix_mq: SpinMutex::new(BTreeMap::new()),
-            limits: SpinMutex::new(limits),
+            sysv_sem: process_spin_mutex(BTreeMap::new(), b"debug.lock.process.nsproxy.sysv_sem"),
+            sysv_shm: process_spin_mutex(BTreeMap::new(), b"debug.lock.process.nsproxy.sysv_shm"),
+            sysv_msg: process_spin_mutex(BTreeMap::new(), b"debug.lock.process.nsproxy.sysv_msg"),
+            posix_mq: process_spin_mutex(BTreeMap::new(), b"debug.lock.process.nsproxy.posix_mq"),
+            limits: process_spin_mutex(limits, b"debug.lock.process.nsproxy.limits"),
             next_private_id: AtomicU32::new(0),
         }
     }
@@ -184,10 +186,6 @@ impl Default for IpcNamespace {
 pub struct PidNamespaceStub;
 
 /// A single uid/gid mapping row in a Linux user namespace map file.
-///
-/// Phase A only needs a real namespace identity so `unshare(CLONE_NEWUSER)`
-/// can publish a distinct cap. The bounded map storage lands now because the
-/// next procfs phase will write `/proc/self/{uid_map,gid_map}` into these rows.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UserIdMapEntry {
     pub inside: u32,
@@ -202,20 +200,16 @@ pub enum SetgroupsPolicy {
     Deny,
 }
 
-/// Minimal user namespace model.
-///
-/// This is deliberately smaller than Linux's full credential namespace. It is
-/// enough to give each `CLONE_NEWUSER` caller a real namespace identity and a
-/// home for the uid/gid maps LTP writes through procfs in the next phase.
+/// Minimal user namespace model used by `CLONE_NEWUSER` and procfs map writes.
 pub struct UserNamespace {
     pub parent: Option<Cap<UserNamespace>>,
     pub owner_uid: u32,
     pub owner_gid: u32,
-    pub uid_map: SpinMutex<Vec<UserIdMapEntry>>,
-    pub gid_map: SpinMutex<Vec<UserIdMapEntry>>,
-    uid_map_written: SpinMutex<bool>,
-    gid_map_written: SpinMutex<bool>,
-    pub setgroups: SpinMutex<SetgroupsPolicy>,
+    pub uid_map: ProcessSpinMutex<Vec<UserIdMapEntry>>,
+    pub gid_map: ProcessSpinMutex<Vec<UserIdMapEntry>>,
+    uid_map_written: ProcessSpinMutex<bool>,
+    gid_map_written: ProcessSpinMutex<bool>,
+    pub setgroups: ProcessSpinMutex<SetgroupsPolicy>,
 }
 
 impl UserNamespace {
@@ -224,19 +218,28 @@ impl UserNamespace {
             parent: None,
             owner_uid: 0,
             owner_gid: 0,
-            uid_map: SpinMutex::new(vec![UserIdMapEntry {
-                inside: 0,
-                outside: 0,
-                length: u32::MAX,
-            }]),
-            gid_map: SpinMutex::new(vec![UserIdMapEntry {
-                inside: 0,
-                outside: 0,
-                length: u32::MAX,
-            }]),
-            uid_map_written: SpinMutex::new(true),
-            gid_map_written: SpinMutex::new(true),
-            setgroups: SpinMutex::new(SetgroupsPolicy::Allow),
+            uid_map: process_spin_mutex(
+                vec![UserIdMapEntry {
+                    inside: 0,
+                    outside: 0,
+                    length: u32::MAX,
+                }],
+                b"debug.lock.process.userns.uid_map",
+            ),
+            gid_map: process_spin_mutex(
+                vec![UserIdMapEntry {
+                    inside: 0,
+                    outside: 0,
+                    length: u32::MAX,
+                }],
+                b"debug.lock.process.userns.gid_map",
+            ),
+            uid_map_written: process_spin_mutex(true, b"debug.lock.process.userns.uid_written"),
+            gid_map_written: process_spin_mutex(true, b"debug.lock.process.userns.gid_written"),
+            setgroups: process_spin_mutex(
+                SetgroupsPolicy::Allow,
+                b"debug.lock.process.userns.setgroups",
+            ),
         }
     }
 
@@ -246,11 +249,14 @@ impl UserNamespace {
             parent: Some(parent),
             owner_uid,
             owner_gid,
-            uid_map: SpinMutex::new(Vec::new()),
-            gid_map: SpinMutex::new(Vec::new()),
-            uid_map_written: SpinMutex::new(false),
-            gid_map_written: SpinMutex::new(false),
-            setgroups: SpinMutex::new(inherited_setgroups),
+            uid_map: process_spin_mutex(Vec::new(), b"debug.lock.process.userns.uid_map"),
+            gid_map: process_spin_mutex(Vec::new(), b"debug.lock.process.userns.gid_map"),
+            uid_map_written: process_spin_mutex(false, b"debug.lock.process.userns.uid_written"),
+            gid_map_written: process_spin_mutex(false, b"debug.lock.process.userns.gid_written"),
+            setgroups: process_spin_mutex(
+                inherited_setgroups,
+                b"debug.lock.process.userns.setgroups",
+            ),
         }
     }
 
@@ -290,13 +296,6 @@ impl UserIdMapEntry {
     }
 }
 
-/// Linux-style namespace-relative capability check.
-///
-/// The initial namespace uses the credential's ordinary effective-capability
-/// test. A process that is a member of a child user namespace has full
-/// capabilities in that namespace only; a parent-namespace process whose euid
-/// is the recorded namespace owner also has capabilities in that child
-/// namespace, matching Linux's owner rule for procfs map setup.
 pub fn has_capability_in_user_namespace(
     cred: Cred,
     subject_user_ns: &Cap<UserNamespace>,
@@ -333,10 +332,7 @@ pub fn write_user_namespace_setgroups(
     offset: u64,
     bytes: &[u8],
 ) -> Result<(), Errno> {
-    if offset != 0 {
-        return Err(Errno::EINVAL);
-    }
-    if bytes.len() >= USERNS_MAP_MAX_BYTES {
+    if offset != 0 || bytes.len() >= USERNS_MAP_MAX_BYTES {
         return Err(Errno::EINVAL);
     }
 
@@ -418,10 +414,10 @@ fn validate_parent_map_authority(
         return Err(Errno::EPERM);
     };
 
-    let parent_maps_all = entries
+    if !entries
         .iter()
-        .all(|entry| id_range_mapped(parent, kind, entry.outside, entry.length));
-    if !parent_maps_all {
+        .all(|entry| id_range_mapped(parent, kind, entry.outside, entry.length))
+    {
         return Err(Errno::EPERM);
     }
 
@@ -622,7 +618,6 @@ unsafe impl ZoneAllocated for UserNamespace {
         &USER_NAMESPACE_ZONE
     }
 }
-
 stub_zone!(CgroupNamespaceStub, CGROUP_NS_STUB_ZONE);
 stub_zone!(UtsNamespaceStub, UTS_NS_STUB_ZONE);
 stub_zone!(NetNamespaceStub, NET_NS_STUB_ZONE);

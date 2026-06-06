@@ -5,9 +5,11 @@ use tx_hal::{
 };
 
 use crate::{
-    dispatch_trap_frame, enter_irq_context, for_each_console_byte_for_sbi, mark_ipi_ack,
-    percpu_tls_for_cpu, remote_sfence_targets_from, trap::classify_rv64_trap, Platform,
-    Rv64TrapFrame, RV64_PERCPU_AREAS,
+    asid_residency_mask, clear_asid_residency, clear_current_asid_residency, dispatch_trap_frame,
+    enter_irq_context, for_each_console_byte_for_sbi, mark_asid_resident_on_current_cpu,
+    mark_ipi_ack, percpu_tls_for_cpu, remote_sfence_targets_for_asid_from,
+    remote_sfence_targets_from, trap::classify_rv64_trap, Platform, Rv64TrapFrame,
+    RV64_PERCPU_AREAS,
 };
 
 static RV64_HAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -564,8 +566,9 @@ fn trap_frame_prepare_user_return_sets_sret_mode_bits() {
     assert_eq!(frame.sstatus & (1 << 8), 0, "SPP must be clear (user mode)");
     assert_ne!(frame.sstatus & (1 << 5), 0, "SPIE must be set");
     assert_eq!(frame.previous_mode(), TrapPreviousMode::User);
-    // FS must be Initial (01) so FP instructions don't trap on re-entry.
-    assert_eq!((frame.sstatus >> 13) & 3, 1, "FS must be Initial");
+    // FP starts lazily disabled; the first user FP instruction enables
+    // a zeroed FP image through the illegal-instruction path.
+    assert_eq!((frame.sstatus >> 13) & 3, 0, "FS must be Off");
 }
 
 #[test]
@@ -616,10 +619,37 @@ fn trap_dispatch_routes_page_fault_with_user_flag() {
 #[test]
 fn trap_dispatch_routes_sync_fault_to_illegal_or_sync_sink() {
     let mut frame = test_trap_frame(2, 0x4040, 0);
+    frame.sstatus |= 1 << 13;
 
     let action = dispatch_trap_frame::<RecordingTrapSink>(&mut frame);
 
     assert_eq!(action, TrapAction::Terminate);
+}
+
+#[test]
+fn trap_dispatch_lazily_enables_user_fp_once() {
+    let mut frame = test_trap_frame(2, 0x4040, 0);
+    frame.sstatus &= !(1 << 8);
+    frame.f = [0xdead_beef_dead_beef; 32];
+    frame.fcsr = 7;
+
+    let action = dispatch_trap_frame::<RecordingTrapSink>(&mut frame);
+
+    assert_eq!(action, TrapAction::Resume);
+    assert_eq!(
+        (frame.sstatus >> 13) & 3,
+        1,
+        "first FP trap should retry with FS=Initial"
+    );
+    assert_eq!(frame.f, [0u64; 32], "lazy FP must publish zero regs");
+    assert_eq!(frame.fcsr, 0, "lazy FP must clear fcsr");
+
+    let action = dispatch_trap_frame::<RecordingTrapSink>(&mut frame);
+    assert_eq!(
+        action,
+        TrapAction::Terminate,
+        "non-FP illegal instruction is only retried once"
+    );
 }
 
 #[test]
@@ -634,6 +664,25 @@ fn remote_sfence_targets_are_empty_for_uniprocessor_online_mask() {
     let targets = remote_sfence_targets_from(CpuMask::single(CpuId(0)), CpuId(0));
 
     assert!(targets.is_empty());
+}
+
+#[test]
+fn remote_sfence_targets_are_limited_to_asid_residency() {
+    let _guard = RV64_HAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let asid = tx_hal::Asid(9);
+    clear_asid_residency(asid);
+
+    <Platform as PercpuIf>::install_early_percpu(CpuId(1));
+    mark_asid_resident_on_current_cpu(asid);
+    <Platform as PercpuIf>::install_early_percpu(CpuId(3));
+    mark_asid_resident_on_current_cpu(asid);
+
+    let targets = remote_sfence_targets_for_asid_from(asid, CpuMask::from_bits(0b1111), CpuId(1));
+
+    assert_eq!(targets.bits(), 0b1000);
+    assert_eq!(asid_residency_mask(asid).bits(), 0b1010);
+    clear_current_asid_residency();
+    clear_asid_residency(asid);
 }
 
 #[test]
@@ -680,7 +729,10 @@ fn trap_frame_fp_context_round_trips_through_capture_restore() {
 
     let ctx = frame.view_mut().capture_user_context();
 
-    assert!(ctx.fp.is_valid(), "FP context must be valid when FS != Off");
+    assert!(
+        ctx.fp.is_valid(),
+        "FP context must be valid when FS=Clean/Dirty"
+    );
     assert_ne!(
         ctx.fp.flags & tx_hal::UserFpContext::FLAG_DIRTY,
         0,
@@ -696,11 +748,12 @@ fn trap_frame_fp_context_round_trips_through_capture_restore() {
 
     assert_eq!(frame2.f, frame.f, "restored FP regs must match original");
     assert_eq!(frame2.fcsr, 0x05, "restored fcsr must match original");
-    // prepare_user_return always sets FS=Initial (01).
+    // Restoring a valid FP context marks it dirty so the trap vector
+    // saves it on the next user trap.
     assert_eq!(
         (frame2.sstatus >> 13) & 3,
-        1,
-        "FS must be Initial after restore_user_context"
+        3,
+        "FS must be Dirty after restoring valid FP state"
     );
 }
 

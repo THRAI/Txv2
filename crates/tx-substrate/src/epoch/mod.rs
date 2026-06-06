@@ -42,6 +42,7 @@ pub mod testing {
 ///
 /// While the returned guard is alive, raw observations created by zone/Weak
 /// paths are protected from physical slot reuse.
+#[track_caller]
 pub fn guard() -> Guard<'static> {
     domain::guard()
 }

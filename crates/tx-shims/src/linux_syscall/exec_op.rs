@@ -141,9 +141,21 @@ impl<'a, P: PmapIf + EntropyIf + AuxvIf, I: step_engine::SubjectIdentity> StepOp
                     Some(cwd) => cwd,
                     None => return StepOutcome::Err(step_engine::Errno::ENOENT),
                 };
-                let outcome = step_open(rooted_at, self.path,
-                    OpenFileFlags { read: true, write: false, append: false, cloexec: false, nonblocking: false },
-                    0, self.cred, &guard);
+                let outcome = step_open(
+                    rooted_at,
+                    self.path,
+                    OpenFileFlags {
+                        read: true,
+                        write: false,
+                        append: false,
+                        cloexec: false,
+                        nonblocking: false,
+                        packet: false,
+                    },
+                    0,
+                    self.cred,
+                    &guard,
+                );
                 match outcome {
                     StepOutcome::Done(file) => {
                         let pc = match file.rnode().backing() {
@@ -195,9 +207,21 @@ impl<'a, P: PmapIf + EntropyIf + AuxvIf, I: step_engine::SubjectIdentity> StepOp
                     .interpreter_path.as_ref().unwrap().clone();
                 let guard = step_engine::guard();
                 let rooted_at = self.process.cwd().unwrap();
-                let outcome = step_open(rooted_at, &interp_path,
-                    OpenFileFlags { read: true, write: false, append: false, cloexec: false, nonblocking: false },
-                    0, self.cred, &guard);
+                let outcome = step_open(
+                    rooted_at,
+                    &interp_path,
+                    OpenFileFlags {
+                        read: true,
+                        write: false,
+                        append: false,
+                        cloexec: false,
+                        nonblocking: false,
+                        packet: false,
+                    },
+                    0,
+                    self.cred,
+                    &guard,
+                );
                 match outcome {
                     StepOutcome::Done(file) => {
                         let pc = match file.rnode().backing() {
@@ -328,7 +352,7 @@ impl<'a, P: PmapIf + EntropyIf + AuxvIf, I: step_engine::SubjectIdentity> StepOp
                         };
                         let prot = Prot::READ_WRITE; // simplified; real code uses READ_EXEC etc
                         let entry = VmEntry::new(range, prot, VmEntryFlags::PRIVATE,
-                            VmBacking::Page { pc: interp_pc.clone(), offset: seg.file_offset });
+                            VmBacking::Page { pc: interp_pc.clone().into(), offset: seg.file_offset });
                         match aspace.reserve_map(entry, MapPlacement::RequireFree) {
                             MapReserveResult::Reserved(r) => { let _ = r.commit(); }
                             _ => return StepOutcome::Err(step_engine::Errno::ENOMEM),

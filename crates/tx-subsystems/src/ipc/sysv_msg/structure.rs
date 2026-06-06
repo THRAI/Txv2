@@ -97,12 +97,16 @@ pub struct MsgQueuePayload {
     /// Registered wait-source ids for poll/select integration.
     pub send_source_id: u64,
     pub recv_source_id: u64,
+    pub send_source: alloc::sync::Arc<crate::process::adapter::wait_routing::WaitSource>,
+    pub recv_source: alloc::sync::Arc<crate::process::adapter::wait_routing::WaitSource>,
 }
 
 impl Drop for MsgQueuePayload {
     fn drop(&mut self) {
-        crate::wait_source::release_wait_channel(self.send_source_id);
-        crate::wait_source::release_wait_channel(self.recv_source_id);
+        crate::ipc::sysv_msg::notification::release_wait_channels(
+            self.send_source_id,
+            self.recv_source_id,
+        );
     }
 }
 
@@ -111,6 +115,7 @@ impl Drop for MsgQueuePayload {
 // ---------------------------------------------------------------------------
 
 static MSG_TABLE: SpinMutex<BTreeMap<u32, Cap<MsgQueueIdentity>>> = SpinMutex::new(BTreeMap::new());
+static REMOVED_MSG_IDS: SpinMutex<Vec<u32>> = SpinMutex::new(Vec::new());
 
 static NEXT_MSGID: AtomicU32 = AtomicU32::new(1);
 
@@ -149,6 +154,10 @@ pub(crate) fn lookup_msg(msqid: u32) -> Option<Cap<MsgQueueIdentity>> {
     MSG_TABLE.lock().get(&msqid).cloned()
 }
 
+pub(crate) fn was_msg_removed(msqid: u32) -> bool {
+    REMOVED_MSG_IDS.lock().contains(&msqid)
+}
+
 pub(crate) fn register_msg(
     key: Option<SysvKey>,
     cred: Cap<crate::cred::Cred>,
@@ -161,10 +170,8 @@ pub(crate) fn register_msg(
     use crate::process::adapter::step_engine::sign;
     let msqid = NEXT_MSGID.fetch_add(1, Ordering::Relaxed);
 
-    let send_channel = Channel::new();
-    let recv_channel = Channel::new();
-    let send_source_id = crate::wait_source::register_wait_channel(send_channel.clone());
-    let recv_source_id = crate::wait_source::register_wait_channel(recv_channel.clone());
+    let (send_channel, recv_channel, send_source_id, recv_source_id, send_source, recv_source) =
+        crate::ipc::sysv_msg::notification::new_wait_channels();
 
     let identity = sign(MsgQueueIdentity {
         key,
@@ -189,6 +196,8 @@ pub(crate) fn register_msg(
         recv_channel,
         send_source_id,
         recv_source_id,
+        send_source,
+        recv_source,
     })?;
     *identity.payload.lock() = Some(PayloadCap::from_cap(payload));
     MSG_TABLE.lock().insert(msqid, identity.clone());
@@ -196,7 +205,11 @@ pub(crate) fn register_msg(
 }
 
 pub(crate) fn withdraw_msg(msqid: u32) -> Option<Cap<MsgQueueIdentity>> {
-    MSG_TABLE.lock().remove(&msqid)
+    let removed = MSG_TABLE.lock().remove(&msqid);
+    if removed.is_some() {
+        REMOVED_MSG_IDS.lock().push(msqid);
+    }
+    removed
 }
 
 pub(crate) fn all_msg_queues() -> Vec<Cap<MsgQueueIdentity>> {

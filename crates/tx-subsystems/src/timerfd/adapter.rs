@@ -14,7 +14,8 @@ use tx_platform_adapter::platform_adapter;
     reason = "expose substrate step engine outcome/error types, zone allocation, EBR guard, and WaitSource for timerfd step ops"
 )]
 pub mod step_engine {
-    pub use tx_substrate::epoch::{guard, Guard};
+    pub(crate) use crate::sync::SpinMutex;
+    pub use tx_substrate::epoch::{borrow_current_guard, guard, Guard};
     pub use tx_substrate::step::{
         drive_oneshot, ByteProgress, Errno as V3Errno, InterestMask, NoProgress, OneShotStepOp,
         ProcessIdentity, ScriptCtx, StepOp, StepOutcome, StepProgress, SubjectIdentity,
@@ -26,7 +27,6 @@ pub mod step_engine {
         OperationalCapExt, OperationalRefExt, PayloadBinding, PayloadCap, Weak, Zone,
         ZoneAllocated, ZoneError,
     };
-    pub use tx_substrate::SpinMutex;
 
     pub type ByteOutcome = StepOutcome<usize, ByteProgress>;
 

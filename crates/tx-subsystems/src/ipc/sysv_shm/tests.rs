@@ -3,8 +3,8 @@ use crate::cred::{CapabilitySet, Cred, Gid, Uid};
 use crate::execution::Errno;
 use crate::test_support::EPOCH_TEST_LOCK;
 use crate::vm::{
-    AddressSpace, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntryFlags,
-    VmMapRequest, USER_PAGE_SIZE,
+    AddressSpace, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntryBacking,
+    VmEntryFlags, VmMapRequest, USER_PAGE_SIZE,
 };
 use crate::zones;
 use core::future::Future;
@@ -82,7 +82,10 @@ fn shmat_maps_pagebacked_segment_and_shmdt_tracks_attach_count() {
         .expect("shmat installs VMA");
     assert_eq!(entry.prot, Prot::READ_WRITE);
     assert!(entry.flags.shared);
-    assert!(matches!(entry.backing, VmBacking::Page { offset: 0, .. }));
+    assert!(matches!(
+        entry.backing_kind(),
+        VmEntryBacking::Page { offset: 0 }
+    ));
 
     let attached = match execution::step_shmctl(shmid, execution::IPC_STAT, None, &creator)
         .expect("stat after attach")

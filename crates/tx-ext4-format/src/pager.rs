@@ -410,18 +410,6 @@ impl<I: BlockImage> Ext4Pager<I> {
         Ok(())
     }
 
-    /// Update the inode table metadata fields directly (no journal).
-    pub fn write_inode_meta(&mut self, inode_no: InodeNo, meta: InodeMetaLite) -> Result<()> {
-        let loc = self.inode_location(inode_no)?;
-        let mut block = [0u8; BLOCK_SIZE];
-        self.image.read_block(loc.block, &mut block)?;
-        let mut inode = Inode::parse(&block[loc.offset..loc.offset + loc.len])?;
-        apply_meta(&mut inode, meta);
-        inode.encode(&mut block[loc.offset..loc.offset + loc.len])?;
-        self.image.write_block(loc.block, &block)?;
-        Ok(())
-    }
-
     /// Allocate a free data block in group 0, mark it used, and return its
     /// absolute block number.
     pub fn allocate_block(&mut self) -> Result<u64> {
@@ -466,7 +454,7 @@ impl<I: BlockImage> Ext4Pager<I> {
             return Err(Ext4FormatError::OutOfBounds);
         }
         let new_min = (8usize + name.len() + 3) & !3;
-        let mut disk_inode = self.read_inode(dir_ino)?;
+        let disk_inode = self.read_inode(dir_ino)?;
         let page_count = div_ceil_u64(disk_inode.size, BLOCK_SIZE as u64);
 
         for page_index in 0..page_count {
@@ -517,42 +505,7 @@ impl<I: BlockImage> Ext4Pager<I> {
                 off += rec_len;
             }
         }
-        let data_block = self.allocate_block()?;
-        let mut page = [0u8; BLOCK_SIZE];
-        encode_dir_entry(new_ino.get(), BLOCK_SIZE as u16, file_type, name, &mut page)?;
-        self.image.write_block(data_block, &page)?;
-
-        let logical_block = logical_block(page_count)?;
-        let mut extents = Extent::parse_all(disk_inode.extent_root_bytes())?;
-        if let Some(last) = extents.last_mut() {
-            let last_end = last.logical_block.saturating_add(last.initialized_len());
-            let last_phys_end = last.physical_start + last.initialized_len() as u64;
-            if last_end == logical_block
-                && last_phys_end == data_block
-                && last.initialized_len() < u16::MAX as u32
-            {
-                last.len = last.len.saturating_add(1);
-            } else {
-                extents.push(Extent {
-                    logical_block,
-                    len: 1,
-                    physical_start: data_block,
-                });
-            }
-        } else {
-            extents.push(Extent {
-                logical_block,
-                len: 1,
-                physical_start: data_block,
-            });
-        }
-        disk_inode.size = disk_inode.size.saturating_add(BLOCK_SIZE as u64);
-        disk_inode.blocks_512 = disk_inode
-            .blocks_512
-            .saturating_add((BLOCK_SIZE / 512) as u64);
-        disk_inode.set_extent_root(&extents)?;
-        self.write_inode(dir_ino, &disk_inode)?;
-        Ok(())
+        Err(Ext4FormatError::OutOfBounds)
     }
 
     /// Remove the directory entry named `name` from `dir_ino`.  Returns the
@@ -688,7 +641,7 @@ impl<I: BlockImage> Ext4Pager<I> {
         Inode::parse(&block[location.offset..location.offset + location.len])
     }
 
-    pub fn read_dir_entries_from(
+    fn read_dir_entries_from(
         &mut self,
         directory: InodeNo,
         skip_entries: u64,

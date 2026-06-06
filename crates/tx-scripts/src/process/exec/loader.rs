@@ -12,29 +12,22 @@
 //!   txdoc:EXEC-8-6-AT-PHDR-COMPUTATION
 //!
 //! Supported ELF types:
-//!   - `ET_EXEC`: static executables (load_bias = 0, absolute VAs).
-//!     A main executable may carry `PT_INTERP`; the parser records the
-//!     segment locator so the orchestrator can load the interpreter.
-//!   - `ET_DYN`: static-PIE main images and dynamic interpreters. Main
-//!     images get the fixed `ET_DYN_LOAD_BIAS`; interpreter plans keep
-//!     relative VAs so the exec script can choose `AT_BASE`.
-//!
-//! N69a extension (2026-05-13): accepts `PT_INTERP` on the main program
-//! and records the segment's `(file_offset, filesz)` so the orchestrator
-//! can read the interpreter path from the file. Accepts `PT_DYNAMIC`
-//! silently (the main program's dynamic section is consumed by `ld`,
-//! not the kernel). Adds a second entry point `parse_interp_plan` that
-//! accepts `ET_DYN` (musl's `libc.so` is ET_DYN) and rejects nested
-//! `PT_INTERP` (an interp may not itself have an interp).
+//!   - `ET_EXEC`: static executables (load_bias = 0, absolute VAs), plus the
+//!     staged dynamic shape where `PT_INTERP` identifies an interpreter and
+//!     `PT_DYNAMIC` is left for that interpreter to consume.
+//!   - `ET_DYN`: static-PIE (position-independent, no `DT_NEEDED`, zero
+//!     relocations) and interpreter/shared-object images. The kernel chooses a
+//!     fixed load bias (`ET_DYN_LOAD_BIAS`) and shifts all virtual addresses.
 //!
 //! Out of scope for the slice:
+//!   - Kernel-side relocation processing and `DT_NEEDED` dependency loading.
 //!   - relocations and debug info.
 //!   - elf32 (RV64 only).
 //!
 //! `goblin` types do not escape this module. The architectural contract
-//! is `parse_image_plan` / `parse_interp_plan` and the txKernel-owned
-//! `ExecImagePlan` output. A future swap to the `elf` crate (per
-//! `EXEC-8-10`) would leave the contract unchanged.
+//! is `parse_image_plan` and the txKernel-owned `ExecImagePlan` output.
+//! A future swap to the `elf` crate (per `EXEC-8-10`) would leave the
+//! contract unchanged.
 
 use alloc::vec::Vec;
 
@@ -88,16 +81,12 @@ pub enum ParseError {
     Magic,
     /// `e_machine` is not an architecture txKernel can enter.
     Arch,
-    /// `e_type` did not match the parse mode (`ET_EXEC`/`ET_DYN` for
-    /// the main program, `ET_DYN` for the interpreter).
+    /// `e_type` is neither `ET_EXEC` nor `ET_DYN`.
     Type,
-    /// `PT_INTERP` was found where it is not allowed (currently: in an
-    /// interpreter image, which may not itself have an interp).
+    /// `PT_DYNAMIC` was found without a `PT_INTERP` owner in an
+    /// `ET_EXEC` binary. Dynamic executables must enter through their
+    /// interpreter.
     HasInterp,
-    /// `PT_INTERP` segment shape is invalid: empty `p_filesz`, segment
-    /// range overflows the file, or more than one `PT_INTERP` was
-    /// emitted by the toolchain (the loader supports at most one).
-    InterpMalformed,
     /// At least one `PT_LOAD` is required.
     NoLoad,
     /// Program-header table malformed: header range overflows the
@@ -149,19 +138,21 @@ pub struct BssTail {
     pub size: u64,
 }
 
-/// Locator for the main image's `PT_INTERP` segment. The parser does
-/// **not** resolve the path bytes — that requires reading the file,
-/// which is `script.rs`'s job (the parser stays pure / no-I/O).
-///
-/// `file_offset` and `filesz` come straight from the `PT_INTERP` phdr
-/// (`p_offset`, `p_filesz`). The orchestrator reads exactly
-/// `[file_offset, file_offset + filesz)` from the file's
-/// `PageContainer`, strips the trailing NUL, and feeds the result to
-/// the VFS walker to open the interpreter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InterpRef {
-    pub file_offset: u64,
-    pub filesz: u64,
+/// Interpreter image plan.  Built from a separate ELF parse when
+/// the main binary carries PT_INTERP.  Unlike ExecImagePlan
+/// (main + interpreter), this is just the interpreter's image.
+#[derive(Debug, Clone)]
+pub struct InterpreterPlan {
+    /// Interpreter base reported through `AT_BASE`.
+    pub load_bias: u64,
+    /// Interpreter entry point, already bias-adjusted.
+    pub entry: u64,
+    /// LOAD segments, already bias-adjusted.
+    pub load_segments: Vec<LoadSegment>,
+    /// Optional BSS tail.
+    pub bss_extension: Option<BssTail>,
+    /// Whether PT_GNU_STACK requests an executable stack.
+    pub executable_stack: bool,
 }
 
 /// txKernel-owned image plan produced from a parsed ELF. The output
@@ -184,40 +175,15 @@ pub struct ExecImagePlan {
     /// `memsz > filesz` tail).
     pub bss_extension: Option<BssTail>,
     /// Load bias applied to this image's virtual addresses.
-    /// `0` for `ET_EXEC` and interpreter plans; `ET_DYN_LOAD_BIAS` for
-    /// static-PIE main images (`ET_DYN`).
+    /// `0` for `ET_EXEC`; `ET_DYN_LOAD_BIAS` for static-PIE (`ET_DYN`).
     /// All `vaddr` fields in `load_segments`, `entry`, and `at_phdr`
-    /// already have this value added when the value is non-zero.
+    /// already have this value added — callers see final in-memory VAs.
     pub load_bias: u64,
     /// Whether PT_GNU_STACK requests an executable stack.
     /// Default false; true only when the binary explicitly adds PF_X.
     pub executable_stack: bool,
-    /// `Some` when a `PT_INTERP` segment was present on the main
-    /// program (N69a). The orchestrator reads the path bytes from the
-    /// file and recursively loads the interpreter at a kernel-chosen
-    /// load bias. Always `None` for interp-mode parses
-    /// (`parse_interp_plan`) — an interpreter may not itself have an
-    /// interp.
-    pub interp: Option<InterpRef>,
-}
-
-/// Which image kind a parse pass is producing.
-///
-/// The shared body of `parse_image_plan` / `parse_interp_plan` flips
-/// just three checks based on this mode: which `e_type` is accepted,
-/// whether `PT_INTERP` is recorded or rejected, and whether the
-/// computed `at_phdr` is the program's (recorded for the main image)
-/// or unused (interp uses base + e_phoff at runtime).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ParseMode {
-    /// Top-level executable. Accepts `ET_EXEC` and `ET_DYN`; records
-    /// `PT_INTERP` for either executable shape. An `ET_DYN` image without
-    /// `PT_INTERP` remains a static PIE and runs directly at load bias.
-    MainProgram,
-    /// Dynamic interpreter (musl `libc.so`). Requires `ET_DYN`;
-    /// rejects `PT_INTERP` (defensive: an interp may not have an
-    /// interp).
-    Interpreter,
+    /// Interpreter plan (from PT_INTERP).  None for static binaries.
+    pub interpreter_path: Option<Vec<u8>>,
 }
 
 /// Parse the ELF header + program headers and produce an image plan.
@@ -228,31 +194,8 @@ enum ParseMode {
 /// rejects overlap, bad alignment, congruence violations, multiple
 /// BSS-extending LOADs.
 ///
-/// N69a: `PT_INTERP` is now accepted on the main program and its
-/// `(file_offset, filesz)` is returned via `ExecImagePlan.interp`.
-/// `PT_DYNAMIC` is ignored silently (consumed by `ld`, not the kernel).
-///
 /// Cites: txdoc:EXEC-8-PHASE-3-LOAD-EXECUTABLE-IMAGE-PLAN.
 pub fn parse_image_plan(elf_bytes: &[u8]) -> Result<ExecImagePlan, ParseError> {
-    parse_with_mode(elf_bytes, ParseMode::MainProgram)
-}
-
-/// Parse the ELF header + program headers of an *interpreter* image
-/// (musl `libc.so` for the riscv64-sf target).
-///
-/// Same shape as [`parse_image_plan`] but accepts `ET_DYN` instead of
-/// `ET_EXEC` and rejects any `PT_INTERP` segment (an interpreter may
-/// not itself have an interp). The returned `ExecImagePlan` carries
-/// the interpreter's `e_entry` and LOAD segments at their **relative**
-/// virtual addresses; the orchestrator applies a load bias when
-/// registering recipes (the bias appears in the auxv as `AT_BASE`).
-///
-/// N69a.
-pub fn parse_interp_plan(elf_bytes: &[u8]) -> Result<ExecImagePlan, ParseError> {
-    parse_with_mode(elf_bytes, ParseMode::Interpreter)
-}
-
-fn parse_with_mode(elf_bytes: &[u8], mode: ParseMode) -> Result<ExecImagePlan, ParseError> {
     // ----- Header --------------------------------------------------
     if elf_bytes.len() < ELF64_EHDR_SIZE {
         return Err(ParseError::Magic);
@@ -280,11 +223,10 @@ fn parse_with_mode(elf_bytes: &[u8], mode: ParseMode) -> Result<ExecImagePlan, P
         return Err(ParseError::Arch);
     }
     // Accept both ET_EXEC (static, absolute VAs) and ET_DYN (static-PIE,
-    // relative VAs shifted by ET_DYN_LOAD_BIAS) for the main program.
-    // Interpreter parses accept ET_DYN only and keep relative VAs.
-    let is_dyn = match (mode, header.e_type) {
-        (ParseMode::MainProgram, ET_EXEC) => false,
-        (ParseMode::MainProgram, ET_DYN) | (ParseMode::Interpreter, ET_DYN) => true,
+    // relative VAs shifted by ET_DYN_LOAD_BIAS). Anything else is rejected.
+    let is_dyn = match header.e_type {
+        ET_EXEC => false,
+        ET_DYN => true,
         _ => return Err(ParseError::Type),
     };
 
@@ -316,38 +258,28 @@ fn parse_with_mode(elf_bytes: &[u8], mode: ParseMode) -> Result<ExecImagePlan, P
     let mut load_segments: Vec<LoadSegment> = Vec::new();
     let mut pt_phdr_vaddr: Option<u64> = None;
     let mut exec_stack: bool = false;
-    let mut interp: Option<InterpRef> = None;
+    let mut interp_path: Option<Vec<u8>> = None;
+    let mut has_dynamic = false;
+
     for phdr in &phdrs {
         match phdr.p_type {
-            PT_INTERP => match mode {
-                ParseMode::MainProgram => {
-                    // At most one PT_INTERP per image; reject duplicates
-                    // and zero-size shapes loudly. The orchestrator
-                    // tolerates a single trailing NUL inside `filesz`.
-                    if interp.is_some() {
-                        return Err(ParseError::InterpMalformed);
-                    }
-                    if phdr.p_filesz == 0 {
-                        return Err(ParseError::InterpMalformed);
-                    }
-                    let _end = phdr
-                        .p_offset
-                        .checked_add(phdr.p_filesz)
-                        .ok_or(ParseError::InterpMalformed)?;
-                    interp = Some(InterpRef {
-                        file_offset: phdr.p_offset,
-                        filesz: phdr.p_filesz,
-                    });
+            PT_INTERP => {
+                // Extract interpreter path from ELF bytes.
+                let off = phdr.p_offset as usize;
+                let len = (phdr.p_filesz as usize).min(4096);
+                if off + len <= elf_bytes.len() {
+                    let path = elf_bytes[off..off + len]
+                        .split(|&b| b == 0)
+                        .next()
+                        .unwrap_or(&[])
+                        .to_vec();
+                    interp_path = Some(path);
                 }
-                ParseMode::Interpreter => {
-                    // An interpreter may not itself have an interp.
-                    return Err(ParseError::HasInterp);
-                }
-            },
+            }
             PT_DYNAMIC => {
-                // Ignored: the dynamic linker (or the main program's
-                // own PT_DYNAMIC consumer) handles this section. The
-                // kernel does not interpret it.
+                has_dynamic = true;
+                // PT_INTERP-interpreted binaries may also carry
+                // PT_DYNAMIC; the dynamic linker consumes that table.
             }
             PT_PHDR => {
                 pt_phdr_vaddr = Some(phdr.p_vaddr);
@@ -365,19 +297,20 @@ fn parse_with_mode(elf_bytes: &[u8], mode: ParseMode) -> Result<ExecImagePlan, P
         }
     }
 
+    let _executable_stack = exec_stack;
+
     if load_segments.is_empty() {
         return Err(ParseError::NoLoad);
+    }
+    if !is_dyn && has_dynamic && interp_path.is_none() {
+        return Err(ParseError::HasInterp);
     }
 
     // Choose load bias: 0 for ET_EXEC (absolute VAs already in place),
     // ET_DYN_LOAD_BIAS for static-PIE (relative VAs shifted to a fixed
     // kernel-chosen base). Must be a multiple of PAGE_SIZE to preserve
     // the ELF congruence invariant.
-    let load_bias: u64 = if mode == ParseMode::MainProgram && is_dyn {
-        ET_DYN_LOAD_BIAS
-    } else {
-        0
-    };
+    let load_bias: u64 = if is_dyn { ET_DYN_LOAD_BIAS } else { 0 };
 
     // §8.6: AT_PHDR computation — run on original (pre-bias) vaddrs
     // so the delta arithmetic inside uses unshifted segment VAs, then
@@ -418,7 +351,7 @@ fn parse_with_mode(elf_bytes: &[u8], mode: ParseMode) -> Result<ExecImagePlan, P
         bss_extension,
         load_bias,
         executable_stack: exec_stack,
-        interp,
+        interpreter_path: interp_path,
     })
 }
 

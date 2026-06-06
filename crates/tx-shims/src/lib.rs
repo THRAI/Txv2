@@ -27,6 +27,7 @@ extern crate std;
 
 pub mod linux_syscall;
 pub mod posix_signal {}
+mod sync;
 
 /// Production `ScriptCtx` alias.
 ///

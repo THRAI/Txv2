@@ -37,6 +37,27 @@ fn bootstrap() -> Cap<ProcessIdentity> {
     bootstrap_init_process(fresh_aspace()).expect("bootstrap init")
 }
 
+#[test]
+fn signal_select_trace_declares_per_operation_markers() {
+    let names = crate::signal::SIGNAL_SELECT_TRACE_NAMES;
+
+    assert!(names.contains(&b"debug.signal.select.thread1.lock.request".as_slice()));
+    assert!(names.contains(&b"debug.signal.select.thread1.lock.acquired".as_slice()));
+    assert!(names.contains(&b"debug.signal.select.thread1.lock.release".as_slice()));
+    assert!(names.contains(&b"debug.signal.select.owner.upgrade.request".as_slice()));
+    assert!(names.contains(&b"debug.signal.select.owner.upgrade.done".as_slice()));
+    assert!(names.contains(&b"debug.signal.select.owner.upgrade.miss".as_slice()));
+    assert!(names.contains(&b"debug.signal.select.proc.lock.request".as_slice()));
+    assert!(names.contains(&b"debug.signal.select.proc.lock.acquired".as_slice()));
+    assert!(names.contains(&b"debug.signal.select.proc.lock.release".as_slice()));
+    assert!(names.contains(&b"debug.signal.select.thread2.lock.request".as_slice()));
+    assert!(names.contains(&b"debug.signal.select.thread2.lock.acquired".as_slice()));
+    assert!(names.contains(&b"debug.signal.select.thread2.lock.release".as_slice()));
+    assert!(names.contains(&b"debug.signal.select.thread_pending.hit".as_slice()));
+    assert!(names.contains(&b"debug.signal.select.group_pending.hit".as_slice()));
+    assert!(names.contains(&b"debug.signal.select.done".as_slice()));
+}
+
 fn first_thread(proc_cap: &Cap<ProcessIdentity>) -> Cap<ThreadIdentity> {
     let payload_guard = proc_cap.payload.lock();
     let payload = payload_guard.as_ref().expect("alive");

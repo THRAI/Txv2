@@ -83,10 +83,10 @@ Architecture/discipline linters. Kinds:
   discipline lints. Rule names: `step`, `step-discipline`,
   `step-v4-vocabulary`, `step-no-await`, `step-sync-signature`,
   `subject-context`, `witness-scope`, `signal-publish`,
-  `script-boundary`, `checks-purity`, `step-guard`, `no-adhoc-drive`,
-  `syscall-adhoc-loop`, `syscall-no-await`, `syscall-ctx-bridge`, or
-  `all`. See [`xtask/src/lint.rs`](../../../xtask/src/lint.rs) for the
-  current set.
+  `script-boundary`, `checks-purity`, `cred-check`, `step-guard`,
+  `legacy-wait-channel`, `notification-boundary`, `no-adhoc-drive`,
+  `syscall-adhoc-loop`, `syscall-no-await`, `syscall-ctx-bridge`, or `all`. See
+  [`xtask/src/lint.rs`](../../../xtask/src/lint.rs) for the current set.
 
 ### `cargo xtask boundary-report [--top N] [--json]`
 

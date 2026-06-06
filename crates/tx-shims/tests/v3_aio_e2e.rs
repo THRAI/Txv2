@@ -151,6 +151,9 @@ impl PmapIf for StubPmap {
 
 impl EntropyIf for StubPmap {}
 impl tx_hal::AuxvIf for StubPmap {}
+impl tx_hal::ConsoleIf for StubPmap {
+    fn write_bytes(_bytes: &[u8]) {}
+}
 impl tx_hal::SmpIf for StubPmap {}
 
 impl TimeIf for StubPmap {
@@ -259,6 +262,7 @@ fn make_tmpfs_open_file(page_count: u64) -> Cap<OpenFile> {
             append: false,
             cloexec: false,
             nonblocking: false,
+            packet: false,
         },
     )
     .expect("open file cap")
@@ -296,6 +300,7 @@ fn seed_file_content(file: &Cap<OpenFile>, content: &[u8]) {
             append: false,
             cloexec: false,
             nonblocking: false,
+            packet: false,
         },
     )
     .expect("writer open file cap");

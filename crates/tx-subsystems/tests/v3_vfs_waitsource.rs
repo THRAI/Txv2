@@ -7,8 +7,9 @@
 //! readiness. Unlike pipe (one payload — two sources) / futex (one
 //! registry — 256 buckets) / exit_source (one process — one source) /
 //! tty (one identity — one source), VFS is the **per-inode unbounded
-//! count** consumer: every RNode created at runtime mints two sources
-//! (read + write) and releases them on retirement.
+//! count** consumer: an RNode mints two sources (read + write) the
+//! first time a caller asks for per-inode readiness and releases them
+//! on retirement.
 //!
 //! VFS wake-key model: one `Arc<WaitSource>` per direction
 //! (`read_wait_source` / `write_wait_source`) per `RNode`. The bits
@@ -17,8 +18,9 @@
 //! sees no spurious writable-side posts and vice versa. This is
 //! mechanically the same as pipe's two-source-per-payload shape; the
 //! novelty here is **unbounded object count** — the brief calls out
-//! that a large-N inode-create-destroy stress run must not leak
-//! registry rows.
+//! that a large-N inode-create-destroy stress run must not allocate
+//! readiness rows for ordinary path cache entries, and must not leak
+//! rows for RNodes that do use the endpoint.
 //!
 //! Invariants pinned (bundled into a single `#[test]` per the cred-
 //! zone / exit_wait_source / tty_waitsource integration-test
@@ -58,7 +60,10 @@
 //!    `Arc<WaitSource>` before retirement still hold the strong ref
 //!    and observe no spurious posts, matching the exit_source /
 //!    pipe / tty templates.
-//! 7. **large-N-inode-create-destroy-no-arc-leak**. The crux of the
+//! 7. **lazy-allocation**. Constructing plain RNodes does not register
+//!    readiness rows. The first accessor allocates the read/write pair,
+//!    and drop releases it.
+//! 8. **large-N-inode-create-destroy-no-arc-leak**. The crux of the
 //!    per-inode unbounded-count flag: minting and immediately dropping
 //!    N inodes back-to-back must release N pairs of registry slots,
 //!    so a later `lookup_wait_channel` on any of those ids returns
@@ -136,6 +141,44 @@ fn assert_source_fired_for(
         }
         other => panic!("expected SourceFired, got {other:?}"),
     }
+}
+
+#[test]
+fn vfs_rnode_wait_sources_are_allocated_lazily() {
+    let _setup = setup();
+    let baseline = legacy_wait_source::registered_wait_source_count();
+    {
+        let rnode = make_rnode(9001);
+        tx_test_support::drain_to_quiescence();
+        assert_eq!(
+            legacy_wait_source::registered_wait_source_count(),
+            baseline,
+            "plain RNode construction must not allocate global wait-source rows",
+        );
+
+        let read_id = rnode.read_wait_source_id();
+        let write_id = rnode.write_wait_source_id();
+        assert_ne!(read_id, write_id);
+        assert!(
+            legacy_wait_source::lookup_wait_channel(read_id).is_some(),
+            "first readiness accessor registers the read carrier",
+        );
+        assert!(
+            legacy_wait_source::lookup_wait_channel(write_id).is_some(),
+            "first readiness accessor registers the write carrier",
+        );
+        assert_eq!(
+            legacy_wait_source::registered_wait_source_count(),
+            baseline + 2,
+            "one RNode readiness endpoint owns exactly two registry rows",
+        );
+    }
+    tx_test_support::drain_to_quiescence();
+    assert_eq!(
+        legacy_wait_source::registered_wait_source_count(),
+        baseline,
+        "dropping a lazily-initialized RNode releases its readiness rows",
+    );
 }
 
 /// Single integration test that bootstraps once and walks every
@@ -313,7 +356,7 @@ fn vfs_wait_source_invariants_round_trip() {
     let posted = write_source.notify(InterestMask::new(VFS_WRITABLE));
     assert_eq!(posted, 0, "orphaned source has no subscribers");
 
-    // ---- (7) large-N-inode-create-destroy-no-arc-leak -------------
+    // ---- (8) large-N-inode-create-destroy-no-arc-leak -------------
     // Mint N inodes back-to-back, snapshot the ids, drop the caps,
     // and confirm every id is unresolvable. Without `Drop for RNode`
     // releasing slots, the `BTreeMap` would retain `2 * N` rows.

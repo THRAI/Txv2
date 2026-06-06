@@ -3,9 +3,11 @@ use tx_hal::{console_write_str, TxPlatform};
 use tx_substrate::slab;
 
 use crate::{
-    mount::{MountApiFile, MountIdentity, MountNamespace, MountPayload},
+    mount::{MountIdentity, MountNamespace, MountPayload},
+    net,
     page_backed::PageContainer,
-    vfs::{DEntry, FsNotifyInstance, OpenFile, RNode},
+    vfs::structure::FsNotifyInstance,
+    vfs::{DEntry, OpenFile, RNode},
     vm::AddressSpace,
 };
 
@@ -29,7 +31,6 @@ pub fn register_all() -> Result<(), ZoneError> {
     vm::register_zones()?;
     page_backed::register_zones()?;
     mount::register_zones()?;
-    net::register_zones()?;
     vfs::register_zones()?;
     tty::register_zones()?;
     pipe::register_zones()?;
@@ -43,6 +44,7 @@ pub fn register_all() -> Result<(), ZoneError> {
     epoll::register_zones()?;
     eventfd::register_zones()?;
     timerfd::register_zones()?;
+    net::register_zones()?;
     subject_placeholders::register_zones()?;
     Ok(())
 }
@@ -183,15 +185,11 @@ pub fn dump_summary<P: TxPlatform>() {
         console_write_str::<P>("\n");
     }
 
-    let wait_sources = crate::wait_source::registry_summary();
+    let wait_sources = tx_substrate::wake::registry_summary();
     console_write_str::<P>("txkernel:wait_source:registered=");
-    write_usize::<P>(wait_sources.total);
-    console_write_str::<P>(":channels=");
-    write_usize::<P>(wait_sources.channels);
-    console_write_str::<P>(":queues=");
-    write_usize::<P>(wait_sources.raw_queues);
-    console_write_str::<P>(":ports=");
-    write_usize::<P>(wait_sources.raw_ports);
+    write_usize::<P>(wait_sources.live);
+    console_write_str::<P>(":slots=");
+    write_usize::<P>(wait_sources.slots);
     console_write_str::<P>("\n");
 
     let wake_sources = crate::adapter::step_engine::wake::registry_summary();
@@ -380,16 +378,8 @@ mod mount {
         zone::register_zone_for::<MountIdentity>()?;
         zone::register_zone_for::<MountPayload>()?;
         zone::register_zone_for::<MountNamespace>()?;
-        zone::register_zone_for::<MountApiFile>()?;
+        zone::register_zone_for::<crate::mount::MountApiFile>()?;
         Ok(())
-    }
-}
-
-mod net {
-    use super::*;
-
-    pub(super) fn register_zones() -> Result<(), ZoneError> {
-        crate::net::register_zones()
     }
 }
 

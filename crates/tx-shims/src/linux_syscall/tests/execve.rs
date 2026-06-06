@@ -340,6 +340,26 @@ fn dispatch_execve_non_elf_non_shebang_falls_back_to_bin_sh() {
     );
 }
 
+#[test]
+fn dispatch_execve_short_non_elf_non_shebang_falls_back_to_bin_sh() {
+    let _setup = execve_setup();
+
+    let bytes = b"/code/lmbench_src/bin/build/lmbench_all hello \"$@\"\n".to_vec();
+    assert!(bytes.len() < 64);
+    let (process, thread, _fs) = bootstrap_with_file(b"short-script", &bytes);
+    let ctx = make_ctx(process, thread);
+
+    let path: &[u8] = b"/short-script\0";
+    let req = SyscallRequest::new(NR_EXECVE, [path.as_ptr() as u64, 0, 0, 0, 0, 0]);
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(
+        result,
+        SyscallResult::Error(2),
+        "short wrapper scripts must reach the /bin/sh fallback before \
+         the ELF64 minimum-header rejection"
+    );
+}
+
 /// A path with no NUL terminator within `EXECVE_PATH_MAX = 4096`
 /// returns `-ENAMETOOLONG` (positive 36) — the bounded user-buffer
 /// copy short-circuits before any walker call.
@@ -460,11 +480,11 @@ impl tx_subsystems::vfs::FsOps for ExecveTestFs {
     ) -> StepOutcome<FsObjectId, NoProgress> {
         let inner = self.inner.lock();
         let Some(map) = inner.children.get(&parent) else {
-            return StepOutcome::err(Errno::ENOTDIR);
+            return StepOutcome::err(Errno::ENOTDIR.into());
         };
         match map.get(name) {
             Some(id) => StepOutcome::done(*id),
-            None => StepOutcome::err(Errno::ENOENT),
+            None => StepOutcome::err(Errno::ENOENT.into()),
         }
     }
 
@@ -475,7 +495,7 @@ impl tx_subsystems::vfs::FsOps for ExecveTestFs {
     ) -> StepOutcome<InodeMeta, NoProgress> {
         let inner = self.inner.lock();
         let Some(inode) = inner.inodes.get(&fs_object_id) else {
-            return StepOutcome::err(Errno::ENOENT);
+            return StepOutcome::err(Errno::ENOENT.into());
         };
         let meta = match inode {
             ExecveTestInode::Directory => InodeMeta::new(InodeKind::Directory, S_IFDIR | 0o755),
@@ -505,7 +525,7 @@ impl tx_subsystems::vfs::FsOps for ExecveTestFs {
         _cred: &Credential,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
-        StepOutcome::err(Errno::ENOSYS)
+        StepOutcome::err(Errno::ENOSYS.into())
     }
 
     fn unlink(
@@ -515,7 +535,7 @@ impl tx_subsystems::vfs::FsOps for ExecveTestFs {
         _target: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::ENOSYS)
+        StepOutcome::err(Errno::ENOSYS.into())
     }
 
     fn rename(
@@ -526,7 +546,7 @@ impl tx_subsystems::vfs::FsOps for ExecveTestFs {
         _new_name: &[u8],
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::ENOSYS)
+        StepOutcome::err(Errno::ENOSYS.into())
     }
 
     fn link(
@@ -536,7 +556,7 @@ impl tx_subsystems::vfs::FsOps for ExecveTestFs {
         _target: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::ENOSYS)
+        StepOutcome::err(Errno::ENOSYS.into())
     }
 
     fn mkdir(
@@ -547,7 +567,7 @@ impl tx_subsystems::vfs::FsOps for ExecveTestFs {
         _cred: &Credential,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
-        StepOutcome::err(Errno::ENOSYS)
+        StepOutcome::err(Errno::ENOSYS.into())
     }
 
     fn rmdir(
@@ -557,7 +577,7 @@ impl tx_subsystems::vfs::FsOps for ExecveTestFs {
         _target: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::ENOSYS)
+        StepOutcome::err(Errno::ENOSYS.into())
     }
 
     fn symlink(
@@ -568,7 +588,7 @@ impl tx_subsystems::vfs::FsOps for ExecveTestFs {
         _cred: &Credential,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
-        StepOutcome::err(Errno::ENOSYS)
+        StepOutcome::err(Errno::ENOSYS.into())
     }
 
     fn readdir(
@@ -593,7 +613,7 @@ impl tx_subsystems::vfs::FsOps for ExecveTestFs {
         _fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<Box<[u8]>, NoProgress> {
-        StepOutcome::err(Errno::EINVAL)
+        StepOutcome::err(Errno::EINVAL.into())
     }
 
     fn materialise_rnode(
@@ -605,7 +625,7 @@ impl tx_subsystems::vfs::FsOps for ExecveTestFs {
     ) -> StepOutcome<Cap<RNode>, NoProgress> {
         let inner = self.inner.lock();
         let Some(inode) = inner.inodes.get(&fs_object_id) else {
-            return StepOutcome::err(Errno::ENOENT);
+            return StepOutcome::err(Errno::ENOENT.into());
         };
         match inode {
             ExecveTestInode::Regular { container, .. } => {
@@ -618,10 +638,10 @@ impl tx_subsystems::vfs::FsOps for ExecveTestFs {
                     mount,
                 ) {
                     Ok(rnode) => StepOutcome::done(rnode),
-                    Err(_) => StepOutcome::err(Errno::ENOMEM),
+                    Err(_) => StepOutcome::err(Errno::ENOMEM.into()),
                 }
             }
-            ExecveTestInode::Directory => StepOutcome::err(Errno::EISDIR),
+            ExecveTestInode::Directory => StepOutcome::err(Errno::EISDIR.into()),
         }
     }
 }
@@ -637,17 +657,17 @@ impl tx_subsystems::page_backed::FsPageBacking for ExecveTestFs {
         let container = match inner.inodes.get(&fs_object_id) {
             Some(ExecveTestInode::Regular { container, .. }) => container.clone(),
             Some(ExecveTestInode::Directory) => {
-                return StepOutcome::err(Errno::EISDIR);
+                return StepOutcome::err(Errno::EISDIR.into());
             }
             None => {
-                return StepOutcome::err(Errno::ENOENT);
+                return StepOutcome::err(Errno::ENOENT.into());
             }
         };
         drop(inner);
 
         let page_size = USER_PAGE_SIZE as u64;
         if !offset.is_multiple_of(page_size) {
-            return StepOutcome::err(Errno::EINVAL);
+            return StepOutcome::err(Errno::EINVAL.into());
         }
         let page_index = PageIndex::new(offset / page_size);
         use StepOutcome as V3;

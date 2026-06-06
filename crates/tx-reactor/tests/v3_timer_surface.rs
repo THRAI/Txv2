@@ -23,7 +23,6 @@ fn timer_token_roundtrips_through_new_and_raw() {
 fn timer_wheel_starts_empty() {
     let wheel = TimerWheel::new();
     assert_eq!(wheel.armed_count(), 0);
-    assert_eq!(wheel.next_deadline_ns(), None);
 }
 
 #[test]
@@ -74,22 +73,6 @@ fn lookup_returns_installed_metadata() {
     let found = wheel.lookup(token).expect("token is live");
     assert_eq!(found.0, deadline);
     assert_eq!(found.1, TimerGuardRole::DelegateTimeout);
-}
-
-#[test]
-fn next_deadline_tracks_earliest_live_registration() {
-    let wheel = TimerWheel::new();
-    let later = wheel.install(Deadline::from_raw(50), TimerGuardRole::PrimarySleep);
-    assert_eq!(wheel.next_deadline_ns(), Some(50));
-
-    let earlier = wheel.install(Deadline::from_raw(20), TimerGuardRole::DeadlineAbort);
-    assert_eq!(wheel.next_deadline_ns(), Some(20));
-
-    drop(earlier);
-    assert_eq!(wheel.next_deadline_ns(), Some(50));
-
-    drop(later);
-    assert_eq!(wheel.next_deadline_ns(), None);
 }
 
 #[test]

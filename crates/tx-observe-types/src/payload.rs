@@ -356,6 +356,36 @@ pub enum TxValueKind {
 }
 
 // ---------------------------------------------------------------------------
+// Explicit diagnostic allocation tracks
+// ---------------------------------------------------------------------------
+
+/// High nibble used in an `Instant.parent` field to mean "route this instant
+/// to an explicit diagnostic track id" instead of treating `parent` as a span.
+///
+/// This preserves the fixed 80-byte record and 16-byte payload ABI: allocation
+/// probes use `Instant + PayloadArgValue`, with `parent` carrying one of the
+/// `ALLOC_TRACK_*` constants below.
+pub const EXPLICIT_TRACK_ID_PREFIX: u64 = 0xD500_0000_0000_0000;
+pub const EXPLICIT_TRACK_ID_MASK: u64 = 0xFF00_0000_0000_0000;
+
+pub const ALLOC_TRACK_ZONE_SLAB: u64 = EXPLICIT_TRACK_ID_PREFIX | 0x0001;
+pub const ALLOC_TRACK_PAGE_FRAME: u64 = EXPLICIT_TRACK_ID_PREFIX | 0x0002;
+pub const ALLOC_TRACK_PAGE_RUN: u64 = EXPLICIT_TRACK_ID_PREFIX | 0x0003;
+pub const ALLOC_TRACK_VM_RECIPE_NODE: u64 = EXPLICIT_TRACK_ID_PREFIX | 0x0004;
+pub const ALLOC_TRACK_VM_PRIVATE_PAGE_NODE: u64 = EXPLICIT_TRACK_ID_PREFIX | 0x0005;
+pub const ALLOC_TRACK_PAGEBACKED_CACHE: u64 = EXPLICIT_TRACK_ID_PREFIX | 0x0006;
+pub const ALLOC_TRACK_VM_ADDRESS_SPACE: u64 = EXPLICIT_TRACK_ID_PREFIX | 0x0007;
+pub const ALLOC_TRACK_PAGEBACKED_CONTAINER: u64 = EXPLICIT_TRACK_ID_PREFIX | 0x0008;
+pub const ALLOC_TRACK_THREAD_PAYLOAD: u64 = EXPLICIT_TRACK_ID_PREFIX | 0x0009;
+pub const ALLOC_TRACK_THREAD_IDENTITY: u64 = EXPLICIT_TRACK_ID_PREFIX | 0x000A;
+pub const ALLOC_TRACK_PROCESS_PAYLOAD: u64 = EXPLICIT_TRACK_ID_PREFIX | 0x000B;
+pub const ALLOC_TRACK_PROCESS_IDENTITY: u64 = EXPLICIT_TRACK_ID_PREFIX | 0x000C;
+pub const ALLOC_TRACK_PROCESS_THREADS: u64 = EXPLICIT_TRACK_ID_PREFIX | 0x000D;
+pub const ALLOC_TRACK_PID_NAMESPACE: u64 = EXPLICIT_TRACK_ID_PREFIX | 0x000E;
+pub const ALLOC_TRACK_LOCK: u64 = EXPLICIT_TRACK_ID_PREFIX | 0x000F;
+pub const ALLOC_TRACK_DS_METHOD: u64 = EXPLICIT_TRACK_ID_PREFIX | 0x0010;
+
+// ---------------------------------------------------------------------------
 // §8.7 Mutation payloads (L6, deferred from MVP — schemas reserved)
 // ---------------------------------------------------------------------------
 

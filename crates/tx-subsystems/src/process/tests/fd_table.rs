@@ -23,6 +23,7 @@ fn fresh_open_file() -> Cap<crate::vfs::OpenFile> {
             append: false,
             cloexec: false,
             nonblocking: false,
+            packet: false,
         },
     )
     .expect("open file cap")

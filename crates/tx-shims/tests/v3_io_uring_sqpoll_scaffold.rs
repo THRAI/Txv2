@@ -32,7 +32,7 @@
 //!    Mirrors W-CC's PR-11 phase 2 `worker_terminates_cleanly` pin.
 //!
 //! 5. **Framework reusability.** The SQPOLL kthread is constructed
-//!    from substrate's `step::with_on_behalf_of` **as-is** — no
+//!    from substrate's `step_v3::with_on_behalf_of` **as-is** — no
 //!    new framework primitive is added. The scaffold's
 //!    [`tx_subsystems::io_uring::spawn_sqpoll_worker`] is a
 //!    row-for-row clone of
@@ -127,6 +127,9 @@ impl PmapIf for StubPmap {
 
 impl EntropyIf for StubPmap {}
 impl tx_hal::AuxvIf for StubPmap {}
+impl tx_hal::ConsoleIf for StubPmap {
+    fn write_bytes(_bytes: &[u8]) {}
+}
 impl tx_hal::SmpIf for StubPmap {}
 
 impl TimeIf for StubPmap {

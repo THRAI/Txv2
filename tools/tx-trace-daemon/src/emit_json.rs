@@ -14,7 +14,6 @@ use crate::decode::DecodedEvent;
 pub fn emit(event: &DecodedEvent) -> io::Result<()> {
     let stdout = io::stdout();
     let mut lock = stdout.lock();
-    serde_json::to_writer(&mut lock, event)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    serde_json::to_writer(&mut lock, event).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     lock.write_all(b"\n")
 }

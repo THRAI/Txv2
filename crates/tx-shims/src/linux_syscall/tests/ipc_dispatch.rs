@@ -1,12 +1,13 @@
 use super::*;
 
+use crate::linux_syscall::time::TimespecLayout;
 use crate::linux_syscall::{
     IpcPermLayout, MsqidDsLayout, SembufLayout, SemidDsLayout, ShmInfoLayout, ShmidDsLayout,
     ShminfoLayout, NR_MSGCTL, NR_MSGGET, NR_MSGRCV, NR_MSGSND, NR_SEMCTL, NR_SEMGET, NR_SEMOP,
-    NR_SHMAT, NR_SHMCTL, NR_SHMDT, NR_SHMGET,
+    NR_SEMTIMEDOP, NR_SHMAT, NR_SHMCTL, NR_SHMDT, NR_SHMGET,
 };
 use tx_subsystems::ipc::{sysv_msg, sysv_sem, sysv_shm};
-use tx_subsystems::vm::{Prot, VmBacking, USER_PAGE_SIZE};
+use tx_subsystems::vm::{Prot, VmEntryBacking, USER_PAGE_SIZE};
 
 const E2BIG: i32 = 7;
 
@@ -345,6 +346,209 @@ fn dispatch_sysv_semop_too_many_ops_returns_e2big() {
             &ctx,
         )),
         SyscallResult::Error(E2BIG)
+    );
+}
+
+#[test]
+fn dispatch_sysv_semtimedop_matches_semop_for_ready_operations() {
+    let _setup = setup();
+    let process = bootstrap();
+    let thread = first_thread(&process);
+    let ctx = make_ctx(process, thread);
+
+    let semid = match block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_SEMGET,
+            [
+                0x5345544d,
+                1,
+                (sysv_shm::execution::IPC_CREAT | 0o660) as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    )) {
+        SyscallResult::Return(id) => id as u64,
+        other => panic!("semget failed: {other:?}"),
+    };
+
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_SEMCTL,
+                [semid, 0, sysv_sem::execution::SETVAL as u64, 2, 0, 0],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Return(0)
+    );
+
+    let op = SembufLayout {
+        sem_num: 0,
+        sem_op: -1,
+        sem_flg: 0,
+    };
+    let timeout = TimespecLayout {
+        tv_sec: 1,
+        tv_nsec: 250_000_000,
+    };
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_SEMTIMEDOP,
+                [
+                    semid,
+                    (&op as *const SembufLayout) as u64,
+                    1,
+                    (&timeout as *const TimespecLayout) as u64,
+                    0,
+                    0,
+                ],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Return(1)
+    );
+
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_SEMCTL,
+                [semid, 0, sysv_sem::execution::GETVAL as u64, 0, 0, 0],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Return(1)
+    );
+}
+
+#[test]
+fn dispatch_sysv_semtimedop_validates_timeout_layout() {
+    let _setup = setup();
+    let process = bootstrap();
+    let thread = first_thread(&process);
+    let ctx = make_ctx(process, thread);
+
+    let semid = match block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_SEMGET,
+            [
+                0x53455449,
+                1,
+                (sysv_shm::execution::IPC_CREAT | 0o660) as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    )) {
+        SyscallResult::Return(id) => id as u64,
+        other => panic!("semget failed: {other:?}"),
+    };
+
+    let op = SembufLayout {
+        sem_num: 0,
+        sem_op: -1,
+        sem_flg: sysv_shm::execution::IPC_NOWAIT as i16,
+    };
+    let invalid_nsec = TimespecLayout {
+        tv_sec: 0,
+        tv_nsec: 1_000_000_000,
+    };
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_SEMTIMEDOP,
+                [
+                    semid,
+                    (&op as *const SembufLayout) as u64,
+                    1,
+                    (&invalid_nsec as *const TimespecLayout) as u64,
+                    0,
+                    0,
+                ],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Error(EINVAL_VALUE)
+    );
+
+    let negative_sec = TimespecLayout {
+        tv_sec: -1,
+        tv_nsec: 0,
+    };
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_SEMTIMEDOP,
+                [
+                    semid,
+                    (&op as *const SembufLayout) as u64,
+                    1,
+                    (&negative_sec as *const TimespecLayout) as u64,
+                    0,
+                    0,
+                ],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Error(EINVAL_VALUE)
+    );
+}
+
+#[test]
+fn dispatch_sysv_semtimedop_pending_operations_use_semop_nonblocking_subset() {
+    let _setup = setup();
+    let process = bootstrap();
+    let thread = first_thread(&process);
+    let ctx = make_ctx(process, thread);
+
+    let semid = match block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_SEMGET,
+            [
+                0x53455450,
+                1,
+                (sysv_shm::execution::IPC_CREAT | 0o660) as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    )) {
+        SyscallResult::Return(id) => id as u64,
+        other => panic!("semget failed: {other:?}"),
+    };
+
+    let op = SembufLayout {
+        sem_num: 0,
+        sem_op: -1,
+        sem_flg: 0,
+    };
+    let timeout = TimespecLayout {
+        tv_sec: 0,
+        tv_nsec: 1,
+    };
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_SEMTIMEDOP,
+                [
+                    semid,
+                    (&op as *const SembufLayout) as u64,
+                    1,
+                    (&timeout as *const TimespecLayout) as u64,
+                    0,
+                    0,
+                ],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Error(11)
     );
 }
 
@@ -757,7 +961,10 @@ fn dispatch_sysv_shmat_maps_pagebacked_vma_and_shmdt_unmaps_it() {
         .expect("shmat installs VMA recipe");
     assert_eq!(entry.prot, Prot::READ_WRITE);
     assert!(entry.flags.shared);
-    assert!(matches!(entry.backing, VmBacking::Page { offset: 0, .. }));
+    assert!(matches!(
+        entry.backing_kind(),
+        VmEntryBacking::Page { offset: 0 }
+    ));
 
     let mut ds = ShmidDsLayout::default();
     assert_eq!(

@@ -6,11 +6,14 @@
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::ptr::{self, NonNull};
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU64, Ordering};
 
+use super::cap::cap_kind_byte;
 use super::meta::{SlotMeta, SlotState};
 use super::registry::SlotKey;
 use super::slab::ZoneSlab;
+
+static RECLAIM_SLOT_TRACE_SAMPLE: AtomicU64 = AtomicU64::new(0);
 
 #[repr(C)]
 pub(crate) struct Slot<T: 'static> {
@@ -62,6 +65,15 @@ impl<T: 'static> Slot<T> {
 }
 
 pub(crate) unsafe fn reclaim_slot<T: 'static>(ptr: *mut u8) {
+    let trace_seq = reclaim_slot_trace_sample();
+    if let Some(seq) = trace_seq {
+        emit_reclaim_slot_trace(b"debug.zone.reclaim_slot.begin", seq);
+        emit_reclaim_slot_trace(b"debug.zone.reclaim_slot.kind", cap_kind_byte::<T>() as i64);
+        emit_reclaim_slot_trace(
+            b"debug.zone.reclaim_slot.size",
+            core::mem::size_of::<T>() as i64,
+        );
+    }
     let slot = ptr as *mut Slot<T>;
     unsafe {
         // EBR has proven that no guard-scoped IdentRef can still dereference
@@ -90,5 +102,22 @@ pub(crate) unsafe fn reclaim_slot<T: 'static>(ptr: *mut u8) {
                 break;
             }
         }
+    }
+    if let Some(seq) = trace_seq {
+        emit_reclaim_slot_trace(b"debug.zone.reclaim_slot.end", seq);
+    }
+}
+
+fn reclaim_slot_trace_sample() -> Option<i64> {
+    let seq = RECLAIM_SLOT_TRACE_SAMPLE.fetch_add(1, Ordering::Relaxed);
+    (seq < 128 || seq.is_power_of_two()).then_some(seq as i64)
+}
+
+fn emit_reclaim_slot_trace(name: &[u8], value: i64) {
+    if let Some(observer) = tx_observe::current() {
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            value,
+        );
     }
 }

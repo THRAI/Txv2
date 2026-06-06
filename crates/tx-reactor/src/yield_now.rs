@@ -37,7 +37,6 @@ impl Future for YieldNow {
             Poll::Ready(())
         } else {
             this.yielded = true;
-            crate::task::mark_current_task_yielded();
             cx.waker().wake_by_ref();
             Poll::Pending
         }

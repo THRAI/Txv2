@@ -65,22 +65,17 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 pub mod adapter;
+pub mod notification;
 pub mod ops;
 
 use adapter::step_engine::{
-    guard, sign, ByteProgress, Cap, InterestMask, OperationalCapExt, SpinMutex, StepOutcome,
-    V3Errno, WaitSource, WaitSourceId, Weak, Zone, ZoneAllocated, ZoneError,
+    borrow_current_guard, guard, sign, ByteProgress, Cap, OperationalCapExt, SpinMutex,
+    StepOutcome, V3Errno, WaitSource, Weak, Zone, ZoneAllocated, ZoneError,
 };
-use adapter::wait_routing::{Channel, Mask};
+use adapter::wait_routing::Channel;
 
 use crate::process::structure::ProcessIdentity;
 use crate::signal::Signum;
-use crate::wait_source;
-
-/// Interest-mask bit fired on the SignalFd's per-fd wait source when a
-/// new signum lands in the pending queue. Mirrors pipe.rs's
-/// `PIPE_READABLE` / userfaultfd's `UFD_READABLE`.
-pub const SIGNALFD_READABLE: u64 = 0x1;
 
 /// Wire size of one `struct signalfd_siginfo` record, per Linux's
 /// generic uapi (`<sys/signalfd.h>`). 128 bytes — phase D9-D emits a
@@ -176,18 +171,16 @@ impl SignalFd {
     /// should prefer [`Self::new_cap_for_process`] which zone-signs
     /// and registers in one step.
     pub fn new(owner_proc_key: u32, owner_proc: Option<Weak<ProcessIdentity>>, mask: u64) -> Self {
-        let wait_channel = Channel::new();
-        let wait_source_id = wait_source::register_wait_channel(wait_channel.clone());
-        let wait_source = Arc::new(WaitSource::new(WaitSourceId::new(wait_source_id)));
+        let wait_point = notification::new_wait_point();
         Self {
             sfd_id: allocate_sfd_id(),
             owner_proc_key,
             owner_proc,
             mask: AtomicU64::new(mask),
             pending: SpinMutex::new(VecDeque::new()),
-            wait_source,
-            wait_channel,
-            wait_source_id,
+            wait_source: wait_point.source,
+            wait_channel: wait_point.channel,
+            wait_source_id: wait_point.source_id,
         }
     }
 
@@ -256,11 +249,7 @@ impl SignalFd {
             return false;
         }
         self.pending.lock().push_back(signum.raw());
-        // Fire both wake paths (D2/D4 coexistence, mirroring pipe.rs /
-        // userfaultfd.rs):
-        self.wait_channel.fire(Mask::from_bits(SIGNALFD_READABLE));
-        self.wait_source
-            .notify_emit(InterestMask::new(SIGNALFD_READABLE));
+        notification::notify_readable(&self.wait_channel, &self.wait_source);
         true
     }
 
@@ -277,7 +266,7 @@ impl Drop for SignalFd {
         // receives posts from `step_kill_process`. Also release the
         // legacy carrier id so the wait_source registry does not leak.
         unregister_subscription(self.owner_proc_key, self.sfd_id);
-        wait_source::release_wait_channel(self.wait_source_id);
+        notification::release_wait_point(self.wait_source_id);
     }
 }
 
@@ -313,7 +302,7 @@ fn unregister_subscription(proc_key: u32, sfd_id: u64) {
         // Retain entries that either fail to upgrade (already gone) or
         // upgrade to a different `sfd_id`. The matching entry drops out
         // of the list.
-        let guard = guard();
+        let guard = borrow_current_guard().unwrap_or_else(guard);
         list.retain(|w| match w.upgrade(&guard) {
             Some(cap) => cap.sfd_id() != sfd_id,
             None => false,
@@ -344,7 +333,7 @@ pub fn notify_process_signal(proc_key: u32, signum: Signum) -> usize {
     if snapshot.is_empty() {
         return 0;
     }
-    let guard = guard();
+    let guard = borrow_current_guard().unwrap_or_else(guard);
     let mut delivered = 0usize;
     for weak in &snapshot {
         let Some(cap) = weak.upgrade(&guard) else {
@@ -380,7 +369,7 @@ pub fn signalfd_create(
 /// semantics (signalfd and signal handlers are independent
 /// consumers).
 fn drain_pending_signals(sfd: &SignalFd) {
-    let guard = guard();
+    let guard = borrow_current_guard().unwrap_or_else(guard);
     let owner_weak = match &sfd.owner_proc {
         Some(w) => w,
         None => return,
@@ -452,7 +441,7 @@ pub fn signalfd_read(
     if nonblocking {
         return StepOutcome::err(V3Errno::EAGAIN);
     }
-    StepOutcome::yield_on_wait_source(ByteProgress::EMPTY, sfd.wait_source_id(), SIGNALFD_READABLE)
+    notification::wait_until_readable(sfd.wait_source_id())
 }
 
 /// Serialize a single `Signum` into a 128-byte

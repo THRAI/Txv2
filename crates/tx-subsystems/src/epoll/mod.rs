@@ -48,9 +48,7 @@ pub struct EpollEntry {
     pub source: WaitSourceId,
     /// Target epoll, when the monitored fd is itself an epoll fd.
     pub target_epoll: Option<Cap<Epoll>>,
-    /// Last readiness mask observed by `epoll_wait`. Used by the
-    /// syscall shim to implement edge-triggered delivery without
-    /// re-reporting a level that has not transitioned.
+    /// Last readiness mask observed by `epoll_wait`.
     pub last_ready: u32,
     /// `EPOLLONESHOT` disables the entry after one delivered event
     /// until userspace re-enables it with `EPOLL_CTL_MOD`.
@@ -172,6 +170,7 @@ pub fn step_epoll_ctl_add(
     if fds.contains_key(&fd) {
         return StepOutcome::Err(V3Errno::EEXIST);
     }
+
     fds.insert(
         fd,
         EpollEntry {

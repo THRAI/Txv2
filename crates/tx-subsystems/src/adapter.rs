@@ -7,7 +7,7 @@
 //!
 //! Two domains:
 //! * `step_engine` — substrate: step_v3 outcome/error/progress types,
-//!   zone Cap, EBR Guard/guard, page_allocator, and SpinMutex. Used by
+//!   zone Cap, EBR Guard/guard, page_allocator, and the subsystem lock facade. Used by
 //!   device.rs, execution.rs, and initramfs/mod.rs.
 //! * `wait_routing` — reactor: Channel, Mask, WaitFuture. Used by
 //!   wait_source.rs.
@@ -22,6 +22,7 @@ use tx_platform_adapter::platform_adapter;
     reason = "expose substrate step engine outcome/error/progress types, zone Cap, EBR Guard/guard, page_allocator frame_kernel_addr, and wake registry diagnostics used by crate-root shared infrastructure files (execution.rs, device.rs, initramfs/mod.rs, zones.rs)"
 )]
 pub mod step_engine {
+    pub(crate) use crate::sync::SpinMutex;
     pub use tx_substrate::epoch::{self as epoch, guard, EpochSummary, Guard};
     pub use tx_substrate::page_allocator;
     pub use tx_substrate::step::{
@@ -34,7 +35,6 @@ pub mod step_engine {
         OperationalCapExt, OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy,
         RetainedEntityPolicy, Weak, Zone, ZoneAllocated, ZoneError, ZoneInfo, ZonePolicy,
     };
-    pub use tx_substrate::SpinMutex;
 }
 
 #[platform_adapter(

@@ -6,6 +6,7 @@
 //! `sret`.
 
 use tx_subsystems::execution::Errno;
+use tx_subsystems::reactor_submit::SubmitChildThreadStatus;
 
 use super::errno_to_i32;
 
@@ -21,6 +22,14 @@ use super::errno_to_i32;
 pub enum SyscallResult {
     /// Success — encode `value` into `a0` (positive return path).
     Return(i64),
+    /// Successful `clone`/`fork` return carrying the internal child reactor
+    /// publish status. Userspace still observes only `value`; the thread
+    /// future uses `child_submit` to decide whether an extra child-publish
+    /// handoff is still required.
+    CloneReturn {
+        value: i64,
+        child_submit: SubmitChildThreadStatus,
+    },
     /// Failure — encode `-errno` into `a0`. `errno` is the positive
     /// magnitude (e.g. 38 for `ENOSYS`); the userspace-entry shim is
     /// responsible for negating before writing.
@@ -48,10 +57,6 @@ pub enum SyscallResult {
     /// signal frame into `saved_user_context`. The thread future MUST
     /// NOT drain `pending_syscall_return` and MUST NOT decode another
     /// platform frame for this iteration.
-    ///
-    /// N69b wires the minimal signal-frame restore path used by
-    /// itimer/SIGALRM delivery; full `SignalFrameIf` integration can
-    /// still replace the compat frame later.
     SigreturnContextRestored,
 }
 

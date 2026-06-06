@@ -1,5 +1,6 @@
 #![no_std]
 
+extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
@@ -85,6 +86,8 @@ const PLIC_CONTEXT_STRIDE: usize = 0x1000;
 const PLIC_CLAIM_COMPLETE: usize = 0x4;
 static ONLINE_CPUS: AtomicU64 = AtomicU64::new(0);
 static IPI_ACKED_CPUS: AtomicU64 = AtomicU64::new(0);
+static ASID_RESIDENCY: [AtomicU64; pmap::ASID_CAPACITY] =
+    [const { AtomicU64::new(0) }; pmap::ASID_CAPACITY];
 static FALLBACK_IRQ_DEPTH: AtomicUsize = AtomicUsize::new(0);
 static INSTALLED_IRQ_TABLE: AtomicPtr<IrqDispatchTable> = AtomicPtr::new(core::ptr::null_mut());
 
@@ -197,7 +200,7 @@ static RV64_KERNEL_RESUME_CTX: [PerHartCell<KernelResumeCtx>; MAX_BOOT_CPUS] = [
     }),
 ];
 
-/// Per-CPU trap-handler stack. Sized 16 KiB; the trap vector
+/// Per-CPU trap-handler stack. Sized 64 KiB; the trap vector
 /// `csrrw`-swaps onto its top via `sscratch` so trap-handler frames
 /// don't trample the BSP/AP runtime kernel stack (which holds the
 /// reactor + thread future frames at the moment a user trap fires).
@@ -210,8 +213,8 @@ static RV64_KERNEL_RESUME_CTX: [PerHartCell<KernelResumeCtx>; MAX_BOOT_CPUS] = [
 /// `KERNEL_RO`); plain `static [u8; N]` lands in `.rodata` and
 /// the trap-vector's first store would fault.
 ///
-/// Total static cost is `MAX_BOOT_CPUS × 16 KiB = 64 KiB`.
-const RV64_TRAP_STACK_SIZE: usize = 16 * 1024;
+/// Total static cost is `MAX_BOOT_CPUS × 64 KiB = 256 KiB`.
+const RV64_TRAP_STACK_SIZE: usize = 64 * 1024;
 
 #[repr(C, align(16))]
 pub struct Rv64TrapStack(pub [u8; RV64_TRAP_STACK_SIZE]);
@@ -275,7 +278,7 @@ impl PlatformConfig for Platform {
     const USER_TOP: tx_hal::VirtAddr = tx_hal::VirtAddr(pmap_topology::SV39_USER_TOP);
     const USER_RESERVED_TOP_SIZE: usize = pmap_topology::USER_RESERVED_TOP_SIZE;
     const USER_ALLOC_TOP: tx_hal::VirtAddr = tx_hal::VirtAddr(pmap_topology::SV39_USER_ALLOC_TOP);
-    const KERNEL_STACK_SIZE: usize = 512 * 1024;
+    const KERNEL_STACK_SIZE: usize = 128 * 1024;
     const KERNEL_STACK_ALIGN: usize = Self::PAGE_SIZE;
     const PAGE_TABLE_LEVELS: u8 = 3;
     const ASID_BITS: u8 = 16;
@@ -454,7 +457,11 @@ impl PmapIf for Platform {
 
     fn shootdown_mapping(asid: Asid, invalidation: PmapInvalidation) {
         pmap::shootdown_mapping(asid, invalidation);
-        remote_sfence_vma_asid(asid, invalidation);
+        remote_sfence_vma_asid_batch(asid, &[invalidation]);
+    }
+
+    fn shootdown_mappings(asid: Asid, invalidations: &[PmapInvalidation]) {
+        pmap::shootdown_mappings(asid, invalidations);
     }
 
     /// Write `satp` to point at `root.phys()` with Sv39 mode bits and
@@ -467,6 +474,7 @@ impl PmapIf for Platform {
     /// user mappings), and every user-mode instruction fetch would
     /// fault forever.
     fn activate_user_pmap(root: &PmapRoot) {
+        mark_asid_resident_on_current_cpu(root.asid());
         #[cfg(target_arch = "riscv64")]
         unsafe {
             const SATP_MODE_SV39: usize = 0x8 << 60;
@@ -781,23 +789,18 @@ impl EntropyIf for Platform {
 // observation ring. The buffer's lifetime is the kernel's lifetime, so the
 // `'static` requirement in `RingDescriptor` is satisfied.
 //
-// Sizing: 4 MiB total → 208-byte ring header + 52428 × 80-byte slots ≈ 52k
-// records per hart. The ring is circular; once full, oldest slots are
-// overwritten. A full oscomp basic-musl run (~32 tests × ~30 syscalls ×
-// ~10 records each ≈ 10k records) fits with headroom, so the dump at
-// init-exit captures the full basic-era trace even when later test groups
-// (busybox-musl, libctest, cyclictest) continue and push more records.
+// Sizing: 2 MiB per hart → 208-byte ring header + 26k × 80-byte slots.
+// The ring is circular; once full, oldest slots are overwritten. Full
+// libcbench mm/io/pthread diagnostic runs emit much more than the older
+// basic-musl smoke trace, so keep enough backing for an end-of-window
+// bracketed dump instead of relying on early threshold shutdown.
 //
-// Sizing budget: rv64-qemu boots with 1 GiB of guest RAM (`-m 1G`); 4 MiB
-// in `.bss` is < 0.4 % of available memory and stays comfortably out of
-// the kernel direct-map / heap regions.
-//
-// One ring is allocated per supported hart; rv64-qemu boots with `-smp 1`
-// for oscomp/smoke runs so only hart 0's slot is populated, but the buffer
-// is sized for `MAX_OBS_HARTS = 1` here. Future SMP-aware impls can extend
-// the array.
-const OBS_RING_BYTES: usize = 4 * 1024 * 1024;
-const OBS_RING_HARTS: usize = 1;
+// Sizing budget: rv64-qemu OSComp boots with 1 GiB of guest RAM (`-m 1G`);
+// the 4 x 2 MiB ring set keeps the high-kernel bootstrap alias within its
+// current 16 MiB boot mapping while avoiding trace wrap for diagnostic
+// captures of the current libcbench subset.
+const OBS_RING_BYTES: usize = 2 * 1024 * 1024;
+const OBS_RING_HARTS: usize = 4;
 
 /// Aligned static backing for the observation ring. `#[repr(C, align(64))]`
 /// ensures cache-line alignment for the SPSC head/tail atomics that live in
@@ -805,7 +808,9 @@ const OBS_RING_HARTS: usize = 1;
 #[repr(C, align(64))]
 struct ObsRingBuf([u8; OBS_RING_BYTES]);
 
-static mut OBS_RINGS: [ObsRingBuf; OBS_RING_HARTS] =
+#[no_mangle]
+#[link_section = ".bss.observe_rings"]
+static mut TX_OBSERVE_RINGS: [ObsRingBuf; OBS_RING_HARTS] =
     [const { ObsRingBuf([0u8; OBS_RING_BYTES]) }; OBS_RING_HARTS];
 
 impl ObserverIf for Platform {
@@ -814,13 +819,13 @@ impl ObserverIf for Platform {
         if idx >= OBS_RING_HARTS {
             return None;
         }
-        // SAFETY: `OBS_RINGS[idx]` is a static buffer with the kernel's
+        // SAFETY: `TX_OBSERVE_RINGS[idx]` is a static buffer with the kernel's
         // lifetime. The SPSC discipline in `tx-observe` guarantees that
         // only the owning hart writes to its slot; readers (the daemon
         // or the serial-dump path) read after the producer has stopped.
         // `OBS_RING_BYTES` is a power of two (64 KiB = 2^16), satisfying
         // the `size` invariant on `RingDescriptor`.
-        let ptr = unsafe { OBS_RINGS[idx].0.as_mut_ptr() };
+        let ptr = unsafe { TX_OBSERVE_RINGS[idx].0.as_mut_ptr() };
         Some(tx_hal::RingDescriptor {
             base: core::ptr::NonNull::new(ptr).expect("OBS_RINGS slice has non-null base"),
             size: OBS_RING_BYTES,
@@ -850,10 +855,9 @@ pub fn obs_ring_bytes(hart: CpuId) -> Option<&'static [u8]> {
         return None;
     }
     // SAFETY: the kernel calls this only after the trace-producing
-    // workload has reached its observation-quiescence point (init
-    // zombified, no more emits in flight on this hart). The single-hart
-    // discipline (`-smp 1`) means no concurrent writer exists.
-    unsafe { Some(&OBS_RINGS[idx].0[..]) }
+    // workload has reached its observation-quiescence point for the selected
+    // hart. Live host drain reads the same backing while the guest runs.
+    unsafe { Some(&TX_OBSERVE_RINGS[idx].0[..]) }
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -1377,26 +1381,32 @@ fn remote_sfence_vma(invalidation: PmapInvalidation) {
     let _ = invalidation;
 }
 
-fn remote_sfence_vma_asid(asid: Asid, invalidation: PmapInvalidation) {
-    let targets = remote_sfence_targets();
+pub(crate) fn remote_sfence_vma_asid_batch(asid: Asid, invalidations: &[PmapInvalidation]) {
+    if invalidations.is_empty() {
+        return;
+    }
+
+    let targets = remote_sfence_targets_for_asid(asid);
     if targets.is_empty() {
         return;
     }
 
     #[cfg(target_arch = "riscv64")]
     {
-        let error = sbi_remote_sfence_vma_asid(
-            targets.bits(),
-            0,
-            invalidation.virt().0,
-            invalidation.size(),
-            asid.0 as usize,
-        );
-        assert_eq!(error, 0, "SBI remote sfence.vma.asid failed");
+        for invalidation in invalidations {
+            let error = sbi_remote_sfence_vma_asid(
+                targets.bits(),
+                0,
+                invalidation.virt().0,
+                invalidation.size(),
+                asid.0 as usize,
+            );
+            assert_eq!(error, 0, "SBI remote sfence.vma.asid failed");
+        }
     }
 
     #[cfg(not(target_arch = "riscv64"))]
-    let _ = (asid, invalidation);
+    let _ = (asid, invalidations);
 }
 
 fn remote_sfence_targets() -> CpuMask {
@@ -1405,6 +1415,62 @@ fn remote_sfence_targets() -> CpuMask {
 
 fn remote_sfence_targets_from(online: CpuMask, current: CpuId) -> CpuMask {
     CpuMask::from_bits(online.bits() & !CpuMask::single(current).bits())
+}
+
+fn remote_sfence_targets_for_asid(asid: Asid) -> CpuMask {
+    remote_sfence_targets_for_asid_from(asid, <Platform as SmpIf>::online_cpus(), current_cpu_id())
+}
+
+fn remote_sfence_targets_for_asid_from(asid: Asid, online: CpuMask, current: CpuId) -> CpuMask {
+    let resident = asid_residency_mask(asid);
+    CpuMask::from_bits(resident.bits() & online.bits() & !CpuMask::single(current).bits())
+}
+
+fn mark_asid_resident_on_current_cpu(asid: Asid) {
+    let cpu = current_cpu_id();
+    if (asid.0 as usize) >= ASID_RESIDENCY.len() || cpu.0 >= u64::BITS as usize {
+        return;
+    }
+    ASID_RESIDENCY[asid.0 as usize].fetch_or(1u64 << cpu.0, Ordering::AcqRel);
+}
+
+pub(crate) fn clear_current_asid_residency() {
+    let asid = current_satp_asid();
+    if asid.0 == 0 || (asid.0 as usize) >= ASID_RESIDENCY.len() {
+        return;
+    }
+    let cpu = current_cpu_id();
+    if cpu.0 >= u64::BITS as usize {
+        return;
+    }
+    ASID_RESIDENCY[asid.0 as usize].fetch_and(!(1u64 << cpu.0), Ordering::AcqRel);
+}
+
+fn asid_residency_mask(asid: Asid) -> CpuMask {
+    if (asid.0 as usize) >= ASID_RESIDENCY.len() {
+        return CpuMask::EMPTY;
+    }
+    CpuMask::from_bits(ASID_RESIDENCY[asid.0 as usize].load(Ordering::Acquire))
+}
+
+pub(crate) fn clear_asid_residency(asid: Asid) {
+    if (asid.0 as usize) < ASID_RESIDENCY.len() {
+        ASID_RESIDENCY[asid.0 as usize].store(0, Ordering::Release);
+    }
+}
+
+fn current_satp_asid() -> Asid {
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        let satp: usize;
+        core::arch::asm!("csrr {satp}, satp", satp = out(reg) satp, options(nostack));
+        return Asid(((satp >> 44) & 0xffff) as u16);
+    }
+
+    #[cfg(not(target_arch = "riscv64"))]
+    {
+        Asid(0)
+    }
 }
 
 fn send_sbi_ipi(mask: CpuMask) {

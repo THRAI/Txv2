@@ -1,7 +1,9 @@
 use tx_hal::{
-    CpuId, FaultInfo, IpiKind, IrqHandled, KernelTrapSink, PercpuIf, SmpIf, TrapAction,
-    TrapFrameMut, TxPlatform,
+    CpuId, FaultInfo, IpiKind, IrqHandled, KernelTrapSink, PercpuIf, TrapAction, TrapFrameMut,
+    TxPlatform, VirtAddr,
 };
+use tx_shims::linux_syscall::numbers::{NR_RT_SIGPROCMASK, NR_SET_TID_ADDRESS};
+use tx_shims::linux_syscall::SyscallResult;
 
 use crate::{adapter::boot_runtime, trap_handoff};
 
@@ -13,9 +15,6 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
         // policy; only user-mode faults can be handed off to a
         // userspace-run wait.
         if !fault.from_user {
-            if fault.instruction && fault.address.0 == 0 && <P as SmpIf>::online_cpu_count() > 1 {
-                <P as SmpIf>::park_this_cpu();
-            }
             return TrapAction::Terminate;
         }
 
@@ -33,13 +32,7 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
         action
     }
 
-    fn on_syscall(view: TrapFrameMut<'_>) -> TrapAction {
-        // Only a trap that came from user mode may consume the active
-        // userspace-run token and overwrite `saved_user_context`.
-        if view.view().previous_mode != tx_hal::TrapPreviousMode::User {
-            return TrapAction::Terminate;
-        }
-
+    fn on_syscall(mut view: TrapFrameMut<'_>) -> TrapAction {
         // Phase 1: translate, snapshot context into the active
         // payload, resolve the userspace-run wait, and reschedule.
         // No trap-frame writeback (Plan B); the userspace-entry
@@ -47,6 +40,10 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
         // `set_syscall_return` / `set_syscall_error` into the
         // *fresh* trap frame before `enter_userspace`.
         let req = trap_handoff::translate_syscall::<P>(&view.view());
+        if let Some(action) = try_direct_trap_syscall::<P>(&mut view, &req) {
+            return action;
+        }
+        emit_debug_counter(b"debug.trap.syscall", req.nr as i64);
         let hart = <P as PercpuIf>::current_cpu_id().0;
         let outcome = trap_handoff::hand_off_syscall(hart, &view, req);
         trap_handoff::outcome_to_trap_action(&outcome)
@@ -54,19 +51,8 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
 
     fn on_timer_interrupt(cpu: CpuId, view: TrapFrameMut<'_>) -> TrapAction {
         P::cancel_deadline();
-        // Update the global VVAR page with current time, but only if the
-        // vDSO image was successfully mapped during boot. Without this
-        // guard a timer fires before `init_vdso()` runs (or after it
-        // failed silently) and `vvar_page()` dereferences the still-null
-        // `VVAR_PTR`, panicking with a store/AMO page fault at scause=15.
-        if tx_subsystems::vdso::vdso_available() {
-            let mono_ns = P::read_ns();
-            let sec = mono_ns / 1_000_000_000;
-            let nsec = mono_ns % 1_000_000_000;
-            tx_subsystems::vdso::vvar_page().update((sec, nsec), (sec, nsec));
-        }
-
         if view.view().previous_mode == tx_hal::TrapPreviousMode::User {
+            emit_debug_counter(b"debug.trap.timer_user", view.view().pc.0 as i64);
             let hart = <P as PercpuIf>::current_cpu_id().0;
             let outcome = trap_handoff::hand_off_timer_preempt(hart, &view);
             if matches!(outcome, trap_handoff::TimerPreemptOutcome::Preempted) {
@@ -111,6 +97,253 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
         TrapAction::Terminate
     }
 }
+
+fn try_direct_trap_syscall<P: TxPlatform>(
+    view: &mut TrapFrameMut<'_>,
+    req: &trap_handoff::SyscallRequest,
+) -> Option<TrapAction> {
+    let direct_total_start = direct_sigprocmask_detail_now(req.nr);
+    let hart = <P as PercpuIf>::current_cpu_id().0;
+    let payload_start = direct_sigprocmask_detail_now(req.nr);
+    let Some(payload) = tx_subsystems::thread_runtime::current_userspace_payload(hart) else {
+        emit_direct_sigprocmask_detail_value(
+            req.nr,
+            b"debug.trap.direct_sigprocmask.no_payload",
+            1,
+        );
+        return None;
+    };
+    if payload.active_userspace_request().is_none() {
+        emit_direct_sigprocmask_detail_value(
+            req.nr,
+            b"debug.trap.direct_sigprocmask.no_active_request",
+            1,
+        );
+        return None;
+    }
+    emit_direct_sigprocmask_detail_duration(
+        req.nr,
+        b"debug.trap.direct_sigprocmask.payload_ns",
+        payload_start,
+    );
+
+    let context_start = direct_sigprocmask_detail_now(req.nr);
+    let thread_lookup_start = direct_sigprocmask_detail_now(req.nr);
+    let Some(thread) = tx_subsystems::thread_runtime::current_userspace_thread_identity(hart)
+    else {
+        emit_direct_sigprocmask_detail_value(req.nr, b"debug.trap.direct_sigprocmask.no_thread", 1);
+        return None;
+    };
+    emit_direct_sigprocmask_detail_duration(
+        req.nr,
+        b"debug.trap.direct_sigprocmask.context_thread_ns",
+        thread_lookup_start,
+    );
+    let owner_upgrade_start = direct_sigprocmask_detail_now(req.nr);
+    let Some(process) = thread.upgrade_owner_proc() else {
+        emit_direct_sigprocmask_detail_value(
+            req.nr,
+            b"debug.trap.direct_sigprocmask.no_process",
+            1,
+        );
+        return None;
+    };
+    emit_direct_sigprocmask_detail_duration(
+        req.nr,
+        b"debug.trap.direct_sigprocmask.context_owner_ns",
+        owner_upgrade_start,
+    );
+    let aspace_start = direct_sigprocmask_detail_now(req.nr);
+    let Some(aspace) = process.aspace_cap() else {
+        emit_direct_sigprocmask_detail_value(req.nr, b"debug.trap.direct_sigprocmask.no_aspace", 1);
+        return None;
+    };
+    emit_direct_sigprocmask_detail_duration(
+        req.nr,
+        b"debug.trap.direct_sigprocmask.context_aspace_ns",
+        aspace_start,
+    );
+    emit_direct_sigprocmask_detail_duration(
+        req.nr,
+        b"debug.trap.direct_sigprocmask.context_ns",
+        context_start,
+    );
+
+    let precondition_start = direct_sigprocmask_detail_now(req.nr);
+    if !direct_syscall_preconditions(req.nr, &payload, &process) {
+        emit_direct_sigprocmask_detail_duration(
+            req.nr,
+            b"debug.trap.direct_sigprocmask.precondition_ns",
+            precondition_start,
+        );
+        emit_direct_sigprocmask_detail_value(
+            req.nr,
+            b"debug.trap.direct_sigprocmask.precondition_failed",
+            1,
+        );
+        return None;
+    }
+    emit_direct_sigprocmask_detail_duration(
+        req.nr,
+        b"debug.trap.direct_sigprocmask.precondition_ns",
+        precondition_start,
+    );
+
+    let dispatch_start = direct_sigprocmask_detail_now(req.nr);
+    let Some(result) = tx_shims::linux_syscall::dispatch_direct_trap_payload_oneshot(
+        req, &process, &thread, &payload, &aspace,
+    ) else {
+        emit_direct_sigprocmask_detail_duration(
+            req.nr,
+            b"debug.trap.direct_sigprocmask.dispatch_ns",
+            dispatch_start,
+        );
+        emit_direct_sigprocmask_detail_value(
+            req.nr,
+            b"debug.trap.direct_sigprocmask.unsupported",
+            1,
+        );
+        return None;
+    };
+    emit_direct_sigprocmask_detail_duration(
+        req.nr,
+        b"debug.trap.direct_sigprocmask.dispatch_ns",
+        dispatch_start,
+    );
+
+    let post_start = direct_sigprocmask_detail_now(req.nr);
+    let needs_reschedule = direct_trap_syscall_needs_wake_handoff(req, &result);
+
+    match result {
+        SyscallResult::Return(value) => view.set_syscall_return(value),
+        SyscallResult::CloneReturn { value, .. } => view.set_syscall_return(value),
+        SyscallResult::Error(errno) => view.set_syscall_error(errno),
+        SyscallResult::NoReturn
+        | SyscallResult::ExecCommitted
+        | SyscallResult::SigreturnRestored
+        | SyscallResult::SigreturnContextRestored => return None,
+    }
+
+    const RV64_ECALL_INSN_BYTES: usize = 4;
+    view.set_pc(VirtAddr(
+        view.view().pc.0.wrapping_add(RV64_ECALL_INSN_BYTES),
+    ));
+    emit_direct_sigprocmask_detail_duration(
+        req.nr,
+        b"debug.trap.direct_sigprocmask.writeback_ns",
+        post_start,
+    );
+    emit_debug_counter(b"debug.trap.direct_syscall", req.nr as i64);
+    if needs_reschedule {
+        emit_debug_counter(b"debug.trap.direct_wake_handoff", req.nr as i64);
+        let handoff_start = direct_sigprocmask_detail_now(req.nr);
+        let outcome = trap_handoff::hand_off_timer_preempt(hart, view);
+        emit_direct_sigprocmask_detail_duration(
+            req.nr,
+            b"debug.trap.direct_sigprocmask.wake_handoff_ns",
+            handoff_start,
+        );
+        emit_direct_sigprocmask_detail_duration(
+            req.nr,
+            b"debug.trap.direct_sigprocmask.total_ns",
+            direct_total_start,
+        );
+        return Some(trap_handoff::timer_preempt_outcome_to_trap_action(&outcome));
+    }
+    emit_direct_sigprocmask_detail_duration(
+        req.nr,
+        b"debug.trap.direct_sigprocmask.total_ns",
+        direct_total_start,
+    );
+    Some(TrapAction::Resume)
+}
+
+pub(crate) fn direct_trap_syscall_needs_wake_handoff(
+    req: &trap_handoff::SyscallRequest,
+    result: &SyscallResult,
+) -> bool {
+    crate::thread_future::syscall_return_may_publish_wake_handoff(req, result)
+}
+
+fn direct_syscall_preconditions(
+    nr: u64,
+    payload: &tx_subsystems::thread_runtime::ThreadPayload,
+    process: &tx_subsystems::process::ProcessIdentity,
+) -> bool {
+    match nr {
+        NR_RT_SIGPROCMASK => {
+            payload.pending().snapshot() == 0
+                && process.group_pending_snapshot() == 0
+                && payload.interrupt_summary() == tx_subsystems::signal::InterruptSummary::EMPTY
+        }
+        NR_SET_TID_ADDRESS => {
+            payload.interrupt_summary() == tx_subsystems::signal::InterruptSummary::EMPTY
+        }
+        _ => true,
+    }
+}
+
+fn emit_debug_counter(name: &[u8], value: i64) {
+    if !cfg!(tx_thread_roundtrip_metrics) {
+        return;
+    }
+    if let Some(observer) = tx_observe::current() {
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            value,
+        );
+        tx_observe::dump_registered_if_requested();
+    }
+}
+
+#[cfg(tx_sigprocmask_detail_metrics)]
+fn direct_sigprocmask_detail_now(nr: u64) -> u64 {
+    if nr == NR_RT_SIGPROCMASK {
+        tx_observe::clock_now_ns()
+    } else {
+        0
+    }
+}
+
+#[cfg(not(tx_sigprocmask_detail_metrics))]
+fn direct_sigprocmask_detail_now(_nr: u64) -> u64 {
+    0
+}
+
+#[cfg(tx_sigprocmask_detail_metrics)]
+fn emit_direct_sigprocmask_detail_duration(nr: u64, name: &[u8], start_ns: u64) {
+    if nr != NR_RT_SIGPROCMASK {
+        return;
+    }
+    if let Some(observer) = tx_observe::current() {
+        let dur = tx_observe::clock_now_ns().saturating_sub(start_ns);
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            dur.min(i64::MAX as u64) as i64,
+        );
+        tx_observe::dump_registered_if_requested();
+    }
+}
+
+#[cfg(not(tx_sigprocmask_detail_metrics))]
+fn emit_direct_sigprocmask_detail_duration(_nr: u64, _name: &[u8], _start_ns: u64) {}
+
+#[cfg(tx_sigprocmask_detail_metrics)]
+fn emit_direct_sigprocmask_detail_value(nr: u64, name: &[u8], value: i64) {
+    if nr != NR_RT_SIGPROCMASK {
+        return;
+    }
+    if let Some(observer) = tx_observe::current() {
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            value,
+        );
+        tx_observe::dump_registered_if_requested();
+    }
+}
+
+#[cfg(not(tx_sigprocmask_detail_metrics))]
+fn emit_direct_sigprocmask_detail_value(_nr: u64, _name: &[u8], _value: i64) {}
 
 fn log_page_fault_handoff_failure<P: TxPlatform>(
     hart: usize,

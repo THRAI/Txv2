@@ -218,16 +218,25 @@ static LA64_IRQ_CONTEXT_DEPTHS: [AtomicUsize; LA64_MAX_BOOT_CPUS] = [
     AtomicUsize::new(0),
 ];
 static LA64_IRQ_DISPATCH_TABLE: AtomicUsize = AtomicUsize::new(0);
-static LA64_ALLOCATED_ASIDS: AtomicU64 = AtomicU64::new(1);
+/// LA64 supports a 10-bit ASID space (`ASID_BITS = 10`, `LA64_ASID_MASK =
+/// 0x3ff`), i.e. 1024 ASIDs. The allocator must cover that whole space so that
+/// EBR-deferred address-space reclaim (retired-but-not-yet-freed `PmapRoot`s
+/// each still holding their ASID) cannot exhaust the pool under fork-heavy
+/// workloads — a single `u64` (63 usable ASIDs) starved `fork()` with `EAGAIN`
+/// once ~63 roots were in flight. Mirrors the RV64 16-word bitmap.
+const LA64_ASID_BITMAP_WORDS: usize = 16;
+const LA64_ASID_CAPACITY: usize = LA64_ASID_BITMAP_WORDS * u64::BITS as usize;
+static LA64_ALLOCATED_ASIDS: [AtomicU64; LA64_ASID_BITMAP_WORDS] =
+    [const { AtomicU64::new(0) }; LA64_ASID_BITMAP_WORDS];
 static LA64_KERNEL_PGDH_PHYS: AtomicUsize = AtomicUsize::new(0);
 static LA64_KERNEL_PGDH_BOOTSTRAP_MAPPED: AtomicBool = AtomicBool::new(false);
 static LA64_ACTIVE_PGDL: AtomicUsize = AtomicUsize::new(0);
 static LA64_ACTIVE_PGDH: AtomicUsize = AtomicUsize::new(0);
 static LA64_ACTIVE_ASID: AtomicUsize = AtomicUsize::new(0);
-const LA64_COMMITTED_PT_NODE_REGISTRY_ENTRIES: usize = 4096;
 static LA64_COMMITTED_PT_NODE_REGISTRY_LOCK: AtomicBool = AtomicBool::new(false);
+const LA64_COMMITTED_PT_NODE_REGISTRY_SLOTS: usize = 4096;
 static LA64_COMMITTED_PT_NODES: La64CommittedPtNodeRegistry = La64CommittedPtNodeRegistry(
-    UnsafeCell::new([None; LA64_COMMITTED_PT_NODE_REGISTRY_ENTRIES]),
+    UnsafeCell::new([None; LA64_COMMITTED_PT_NODE_REGISTRY_SLOTS]),
 );
 #[cfg(target_arch = "loongarch64")]
 static LA64_KERNEL_TLS_VALID: [AtomicBool; LA64_MAX_BOOT_CPUS] = [
@@ -386,7 +395,7 @@ pub(crate) fn la64_entry_trap_frame_ptr_for_cpu(cpu: CpuId) -> *mut La64TrapFram
 }
 
 struct La64CommittedPtNodeRegistry(
-    UnsafeCell<[Option<PtNode>; LA64_COMMITTED_PT_NODE_REGISTRY_ENTRIES]>,
+    UnsafeCell<[Option<PtNode>; LA64_COMMITTED_PT_NODE_REGISTRY_SLOTS]>,
 );
 
 unsafe impl Sync for La64CommittedPtNodeRegistry {}

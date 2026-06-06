@@ -130,7 +130,6 @@ struct RegisteredZone {
 }
 
 static NEXT_ZONE_ID: AtomicUsize = AtomicUsize::new(1);
-static REGISTERED_LIMIT: AtomicUsize = AtomicUsize::new(0);
 static REGISTRY: ZoneRegistry = ZoneRegistry::new();
 
 pub(crate) fn allocate_zone_id() -> ZoneId {
@@ -186,7 +185,6 @@ pub(crate) fn slot_for<T: 'static>(key: SlotKey) -> Option<NonNull<Slot<T>>> {
 pub(crate) fn init_registry() {
     REGISTRY.clear();
     NEXT_ZONE_ID.store(1, Ordering::Release);
-    REGISTERED_LIMIT.store(0, Ordering::Release);
 }
 
 pub(crate) fn reset_for_test() {
@@ -218,12 +216,6 @@ fn slot_from_key<T: 'static>(erased: *const (), key: SlotKey) -> Option<*mut ()>
     zone.slot_from_key(key).map(|slot| slot.as_ptr() as *mut ())
 }
 
-fn registered_index_limit() -> usize {
-    REGISTERED_LIMIT
-        .load(Ordering::Acquire)
-        .min(MAX_REGISTERED_ZONES)
-}
-
 struct ZoneRegistry {
     lock: SpinLock,
     entries: [UnsafeCell<Option<RegisteredZone>>; MAX_REGISTERED_ZONES],
@@ -251,13 +243,11 @@ impl ZoneRegistry {
                 Some(existing)
                     if existing.erased == entry.erased && existing.type_id == entry.type_id =>
                 {
-                    REGISTERED_LIMIT.fetch_max(entry.zone_id.0, Ordering::AcqRel);
                     Ok(())
                 }
                 Some(_) => Err(ZoneError::InvalidState),
                 None => {
                     *slot = Some(entry);
-                    REGISTERED_LIMIT.fetch_max(entry.zone_id.0, Ordering::AcqRel);
                     Ok(())
                 }
             }
@@ -275,8 +265,8 @@ impl ZoneRegistry {
     fn count(&self) -> usize {
         let _guard = self.lock.lock();
         let mut count = 0;
-        for index in 0..registered_index_limit() {
-            if unsafe { (*self.entries[index].get()).is_some() } {
+        for entry in &self.entries {
+            if unsafe { (*entry.get()).is_some() } {
                 count += 1;
             }
         }
@@ -285,7 +275,7 @@ impl ZoneRegistry {
 
     fn snapshot(&self, out: &mut [Option<ZoneInfo>]) -> usize {
         let mut written = 0;
-        for index in 0..registered_index_limit() {
+        for index in 0..MAX_REGISTERED_ZONES {
             if written == out.len() {
                 break;
             }
@@ -299,7 +289,7 @@ impl ZoneRegistry {
     }
 
     fn init_cpu_buckets(&self, cpu: CpuId) -> Result<(), ZoneError> {
-        for index in 0..registered_index_limit() {
+        for index in 0..MAX_REGISTERED_ZONES {
             let Some(entry) = self.entry_at(index) else {
                 continue;
             };
@@ -309,7 +299,7 @@ impl ZoneRegistry {
     }
 
     fn flush_current_cpu_buckets(&self) -> Result<(), ZoneError> {
-        for index in 0..registered_index_limit() {
+        for index in 0..MAX_REGISTERED_ZONES {
             let Some(entry) = self.entry_at(index) else {
                 continue;
             };
@@ -322,7 +312,7 @@ impl ZoneRegistry {
         let mut stats = EmptySlabTrimStats::default();
         let mut remaining = limit;
 
-        for index in 0..registered_index_limit() {
+        for index in 0..MAX_REGISTERED_ZONES {
             let Some(entry) = self.entry_at(index) else {
                 continue;
             };
@@ -340,7 +330,7 @@ impl ZoneRegistry {
 
     fn slot_for<T: 'static>(&self, key: SlotKey) -> Option<NonNull<Slot<T>>> {
         let zone_id = key.zone_id();
-        if zone_id.0 == 0 || zone_id.0 > registered_index_limit() {
+        if zone_id.0 == 0 || zone_id.0 > MAX_REGISTERED_ZONES {
             return None;
         }
 
@@ -355,7 +345,7 @@ impl ZoneRegistry {
     }
 
     fn entry_at(&self, index: usize) -> Option<RegisteredZone> {
-        if index >= registered_index_limit() {
+        if index >= MAX_REGISTERED_ZONES {
             return None;
         }
         let _guard = self.lock.lock();
@@ -369,58 +359,5 @@ impl ZoneRegistry {
                 *entry.get() = None;
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    struct Poison;
-
-    fn panic_refresh_info(_: *const ()) -> ZoneInfo {
-        panic!("poison refresh_info must not be called")
-    }
-
-    fn panic_init_cpu_bucket(_: *const (), _: CpuId) -> Result<(), ZoneError> {
-        panic!("poison init_cpu_bucket must not be called")
-    }
-
-    fn panic_flush_current_cpu_bucket(_: *const ()) -> Result<(), ZoneError> {
-        panic!("poison flush_current_cpu_bucket must not be called")
-    }
-
-    fn panic_trim_empty_slabs(_: *const (), _: usize) -> usize {
-        panic!("poison trim_empty_slabs must not be called")
-    }
-
-    fn panic_slot_from_key(_: *const (), _: SlotKey) -> Option<*mut ()> {
-        panic!("poison slot_from_key must not be called")
-    }
-
-    #[test]
-    fn maintenance_ignores_never_registered_high_slots() {
-        init_registry();
-        unsafe {
-            *REGISTRY.entries[8].get() = Some(RegisteredZone {
-                zone_id: ZoneId(9),
-                type_id: TypeId::of::<Poison>(),
-                erased: core::ptr::null(),
-                refresh_info: panic_refresh_info,
-                init_cpu_bucket: panic_init_cpu_bucket,
-                flush_current_cpu_bucket: panic_flush_current_cpu_bucket,
-                trim_empty_slabs: panic_trim_empty_slabs,
-                slot_from_key: panic_slot_from_key,
-            });
-        }
-
-        assert_eq!(registered_zone_count(), 0);
-        let mut snapshot_buf = [None; 4];
-        assert_eq!(snapshot(&mut snapshot_buf), 0);
-        flush_current_cpu_buckets().expect("no registered zones to flush");
-        init_cpu_buckets(CpuId(0)).expect("no registered zones to initialize");
-        assert_eq!(trim_empty_slabs(usize::MAX), EmptySlabTrimStats::default());
-
-        init_registry();
     }
 }

@@ -116,6 +116,72 @@ fn cache_and_dma_pins_keep_frame_live_until_all_roles_drop() {
 }
 
 #[test]
+fn gift_pin_acquire_on_live_frame_increments_transfer_evidence() {
+    let metas = [FrameMeta::new()];
+    let bitmap = [AtomicU64::new(0)];
+    let allocator = BitmapPageAllocator::new_for_test(&metas, &bitmap, 1);
+    allocator.mark_free_for_test(Ppn(0));
+
+    let frame = allocator
+        .reserve_frame(ZeroPolicy::UninitFullOverwrite)
+        .expect("reservation")
+        .commit();
+    let gift_pin = frame
+        .try_gift_pin()
+        .expect("gift pin should retain a live frame");
+
+    assert_eq!(gift_pin.ppn(), Ppn(0));
+    assert_eq!(metas[0].refcount_for_test(), 2);
+    assert_eq!(metas[0].pin_count_for_test(), 0);
+    assert_eq!(allocator.free_count(), 0);
+}
+
+#[test]
+fn gift_pin_drop_releases_transfer_evidence() {
+    let metas = [FrameMeta::new()];
+    let bitmap = [AtomicU64::new(0)];
+    let allocator = BitmapPageAllocator::new_for_test(&metas, &bitmap, 1);
+    allocator.mark_free_for_test(Ppn(0));
+
+    let frame = allocator
+        .reserve_frame(ZeroPolicy::UninitFullOverwrite)
+        .expect("reservation")
+        .commit();
+    let gift_pin = frame
+        .try_gift_pin()
+        .expect("gift pin should retain a live frame");
+
+    drop(frame);
+
+    assert_eq!(metas[0].refcount_for_test(), 1);
+    assert_eq!(allocator.free_count(), 0);
+    assert!(!allocator.is_free_for_test(Ppn(0)));
+
+    drop(gift_pin);
+
+    assert_eq!(metas[0].state_for_test(), 0);
+    assert_eq!(allocator.free_count(), 1);
+    assert!(allocator.is_free_for_test(Ppn(0)));
+}
+
+#[test]
+fn gift_pin_rejects_dead_frame() {
+    let metas = [FrameMeta::new()];
+    let bitmap = [AtomicU64::new(0)];
+    let allocator = BitmapPageAllocator::new_for_test(&metas, &bitmap, 1);
+    allocator.mark_free_for_test(Ppn(0));
+
+    let err = allocator
+        .acquire_gift_pin(Ppn(0))
+        .expect_err("dead frame cannot be retained for transfer");
+
+    assert_eq!(err, AllocError::InvalidRequest);
+    assert_eq!(metas[0].state_for_test(), 0);
+    assert_eq!(allocator.free_count(), 1);
+    assert!(allocator.is_free_for_test(Ppn(0)));
+}
+
+#[test]
 fn contiguous_run_commit_can_split_into_owned_frames() {
     let metas = [
         FrameMeta::new(),

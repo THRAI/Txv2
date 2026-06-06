@@ -3,14 +3,13 @@
 use core::sync::atomic::Ordering;
 
 use crate::tty::adapter::step_engine::Cap;
-use crate::tty::adapter::wait_routing::Mask;
 
 use crate::execution::Guard;
 #[cfg(test)]
 use crate::tty::adapter::step_engine::ByteProgress;
 use crate::tty::adapter::step_engine::{self as step_engine};
 use crate::tty::adapter::step_engine::{
-    InterestMask, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
+    NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
 };
 use crate::tty::checks::require_live_tty;
 use crate::tty::execution::{
@@ -52,7 +51,7 @@ pub fn step_ingest(
     use crate::tty::adapter::step_engine::StepOutcome as V3;
     let payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
-        Err(err) => return V3::Err(err),
+        Err(err) => return V3::Err(err.into()),
     };
 
     let mut outcome = IngestOutcome::default();
@@ -60,21 +59,7 @@ pub fn step_ingest(
     let linearized = payload.apply_ingest_linearizer();
     if linearized.readable_fired {
         tty.input_readable.fire(TTY_READABLE);
-        // Pre-ELF Phase 5 (item 9): the BIF-5 readiness wire is
-        // RawQueue-shaped and only wakes RawQueue subscribers; the
-        // wait-carrier registry that `sys_read`'s `wait_on_token`
-        // loop drives is `Channel`-shaped, so we fire both. The
-        // Channel is registered at TTY construction; see
-        // `TtyIdentity::new`.
-        tty.wait_channel().fire(Mask::from_bits(TTY_READABLE));
-        // PR-3D-4 (D2 coexistence): fire the new `WaitSource`
-        // alongside the legacy `Channel`. Same `WaitSourceId`
-        // namespace, same `TTY_READABLE` interest bit. Subscribers
-        // installed via `WaitSource::prepare(..).install_if(..)`
-        // receive a `MailboxEvent::SourceFired` posted under the same
-        // payload-observation arm as the Channel fire above.
-        tty.wait_source()
-            .notify_emit(InterestMask::new(TTY_READABLE));
+        crate::tty::notification::notify_readable(tty.wait_channel(), tty.wait_source());
         outcome.readable_fired = true;
     }
     if linearized.writable_fired {
@@ -108,16 +93,10 @@ pub fn step_ingest(
                                 payload.eof_pending.store(true, Ordering::Release);
                             }
                             tty.input_readable.fire(TTY_READABLE);
-                            // Pre-ELF Phase 5 (item 9): see the
-                            // companion comment near the linearizer
-                            // fire above. The wait-carrier `Channel`
-                            // wakes `sys_read`'s blocking-read loop.
-                            tty.wait_channel().fire(Mask::from_bits(TTY_READABLE));
-                            // PR-3D-4 (D2 coexistence): paired notify
-                            // on the new `WaitSource`. See the
-                            // companion site above for the rationale.
-                            tty.wait_source()
-                                .notify_emit(InterestMask::new(TTY_READABLE));
+                            crate::tty::notification::notify_readable(
+                                tty.wait_channel(),
+                                tty.wait_source(),
+                            );
                             outcome.readable_fired = true;
                         }
                         LdiscInputEffect::SignalFgPgrp(signal) => {

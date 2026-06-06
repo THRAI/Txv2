@@ -15,8 +15,8 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 
 use crate::process::adapter::step_engine::{
-    self, AtomicSlot, Cap, Dead, Entity, PayloadCap, PayloadPolicy, RawPort, RawQueue, SpinMutex,
-    Weak, Zone, ZoneAllocated,
+    self, AtomicSlot, Cap, Dead, Entity, PayloadCap, PayloadPolicy, ProcessSpinMutex, RawPort,
+    RawQueue, Weak, Zone, ZoneAllocated,
 };
 use crate::process::adapter::wait_routing::{self, Channel, Mask, WaitSource};
 
@@ -141,7 +141,7 @@ pub struct ProcessIdentity {
     /// `Binding<ProcessIdentity>`; day-1 uses `SpinMutex<Option<Weak<...>>>`
     /// (same retention story; CAS-rebind arrives with the substrate
     /// `Binding<T>` primitive).
-    pub(crate) parent: SpinMutex<Option<Weak<ProcessIdentity>>>,
+    pub(crate) parent: ProcessSpinMutex<Option<Weak<ProcessIdentity>>>,
     /// Downward materialization of children: processes whose `parent`
     /// binding names this process. Per `PROCESS_v1` §2.1 the spec
     /// shape is `DllContainer<ProcessIdentity>`; day-1 uses
@@ -157,14 +157,18 @@ pub struct ProcessIdentity {
     /// child's parent slot) and `step_waitpid_nohang` (reap —
     /// withdraws the Cap, releasing retention).
     pub(crate) children: ProcessChildren,
-    pub(crate) pgrp: SpinMutex<Cap<ProcessGroup>>,
+    pub(crate) pgrp: ProcessSpinMutex<Cap<ProcessGroup>>,
     /// Process-visible exit disposition. `Some` once the process has
     /// run `step_exit_group` / `step_exit_group_with_signal` (or the
     /// last-thread cascade has fired); otherwise `None`. Discriminates
     /// explicit-int exits from signal-driven termination per
     /// `PROCESS_v1` §6.2.
-    pub(crate) exit_status: SpinMutex<Option<ExitStatus>>,
-    pub(crate) payload: SpinMutex<Option<PayloadCap<ProcessPayload>>>,
+    pub(crate) exit_status: ProcessSpinMutex<Option<ExitStatus>>,
+    /// True once this process was reparented to init because its
+    /// original parent exited. Direct children of init keep this false so
+    /// the userspace runner can still reap them with wait4.
+    pub(crate) adopted_by_init: AtomicBool,
+    pub(crate) payload: ProcessSpinMutex<Option<PayloadCap<ProcessPayload>>>,
 }
 
 /// `ProcessIdentity` is the production [`SubjectIdentity`]
@@ -175,7 +179,7 @@ pub struct ProcessIdentity {
 /// thread-identity view, and exit-source id). Concrete types stay
 /// here in the subsystem layer.
 ///
-/// `Restrictions` currently uses the `step::RestrictionStackHandle`
+/// `Restrictions` currently uses the `step_v3::RestrictionStackHandle`
 /// placeholder because the real append-only stack lives in
 /// `tx-policy`, which is still skeleton. PR-K wires the real type
 /// alongside the seccomp/landlock landing. The trait's
@@ -225,7 +229,7 @@ impl step_engine::SubjectIdentity for ProcessIdentity {
 impl ProcessIdentity {
     /// Access the process payload slot.  Returns `None` when the
     /// process is a zombie (payload dropped).
-    pub fn payload_slot(&self) -> &SpinMutex<Option<PayloadCap<ProcessPayload>>> {
+    pub fn payload_slot(&self) -> &ProcessSpinMutex<Option<PayloadCap<ProcessPayload>>> {
         &self.payload
     }
 
@@ -241,7 +245,7 @@ impl ProcessIdentity {
     /// and after the parent identity has been fully reclaimed.
     pub fn parent_cap(&self) -> Option<Cap<ProcessIdentity>> {
         let weak = (*self.parent.lock())?;
-        let guard = step_engine::guard();
+        let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
         weak.upgrade(&guard)
     }
 
@@ -294,29 +298,9 @@ impl ProcessIdentity {
         if self.is_zombie() {
             return b'Z';
         }
-        if crate::futex::thread_has_waiter(self.pid.0) {
-            return b'S';
-        }
-        if let Some(leader) = self.thread_by_tid(self.pid.0) {
-            return leader.proc_state_char();
-        }
-        let Some(threads) = self.threads_snapshot() else {
-            return b'Z';
-        };
-        let mut saw_sleeping = false;
-        for thread in threads {
-            match thread.proc_state_char() {
-                b'R' => return b'R',
-                b'T' => return b'T',
-                b'S' => saw_sleeping = true,
-                _ => {}
-            }
-        }
-        if saw_sleeping {
-            b'S'
-        } else {
-            b'R'
-        }
+        self.nth_thread(0)
+            .map(|thread| thread.proc_state_char())
+            .unwrap_or(b'R')
     }
 
     /// Process command-line (delegates to payload).
@@ -350,9 +334,10 @@ impl ProcessIdentity {
         self.payload.lock().as_ref()?.threads.find_by_tid(tid)
     }
 
-    /// Snapshot live thread identities for `/proc/<pid>/task`.
+    /// Snapshot all threads currently attached to this live process.
+    /// Returns `None` for zombies.
     pub fn threads_snapshot(&self) -> Option<alloc::vec::Vec<Cap<ThreadIdentity>>> {
-        Some(self.payload.lock().as_ref()?.threads.snapshot())
+        self.payload.lock().as_ref().map(|p| p.threads.snapshot())
     }
 
     /// Collapse all sibling threads for exec, leaving `initiator`
@@ -378,6 +363,14 @@ impl ProcessIdentity {
     /// (zombie), never "the slot is empty on a live payload".
     pub fn aspace_cap(&self) -> Option<Cap<AddressSpace>> {
         self.payload.lock().as_ref().map(|p| p.aspace_cap())
+    }
+
+    pub fn group_pending_snapshot(&self) -> u64 {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.group_pending_snapshot())
+            .unwrap_or(0)
     }
 
     /// Snapshot the per-process credential. Returns `None` for zombies
@@ -436,19 +429,29 @@ impl ProcessIdentity {
         self.nsproxy_cap()?.mnt_ns.clone()
     }
 
-    /// Snapshot the current user namespace cap.
-    /// Returns `None` for zombies (no payload).
     pub fn user_namespace_cap(&self) -> Option<Cap<crate::process::nsproxy::UserNamespace>> {
         Some(self.nsproxy_cap()?.user_ns.clone())
     }
 
-    /// Replace the process's namespace proxy bundle, returning the previous
-    /// bundle cap. Returns `None` for zombies.
     pub fn replace_nsproxy(
         &self,
         new: Cap<crate::process::nsproxy::NsProxy>,
     ) -> Option<Cap<crate::process::nsproxy::NsProxy>> {
         self.payload.lock().as_ref().map(|p| p.replace_nsproxy(new))
+    }
+
+    pub fn net_namespace(&self) -> Option<PayloadCap<crate::net::NetNamespacePayload>> {
+        self.payload.lock().as_ref().map(|p| p.net_namespace())
+    }
+
+    pub fn replace_net_namespace(
+        &self,
+        new: PayloadCap<crate::net::NetNamespacePayload>,
+    ) -> Option<PayloadCap<crate::net::NetNamespacePayload>> {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.replace_net_namespace(new))
     }
 
     /// Process short name (for `/proc/<pid>/stat`). Returns `"?"` for
@@ -495,26 +498,6 @@ impl ProcessIdentity {
         let payload_guard = self.payload.lock();
         let payload = payload_guard.as_ref()?;
         payload.frame.vm.swap(Some(new))
-    }
-
-    /// Snapshot the process's current network namespace. Day-1 all
-    /// processes are seeded with the initial namespace; fork inherits
-    /// the parent's namespace cap. Future `clone/unshare/setns` work
-    /// mutates this slot under the namespace/capability syscalls.
-    pub fn net_namespace(&self) -> Option<PayloadCap<crate::net::NetNamespacePayload>> {
-        self.payload.lock().as_ref().map(|p| p.net_namespace())
-    }
-
-    /// Replace the process's current network namespace, returning the
-    /// previous namespace cap. Returns `None` for zombies.
-    pub fn replace_net_namespace(
-        &self,
-        new: PayloadCap<crate::net::NetNamespacePayload>,
-    ) -> Option<PayloadCap<crate::net::NetNamespacePayload>> {
-        self.payload
-            .lock()
-            .as_ref()
-            .map(|p| p.replace_net_namespace(new))
     }
 
     /// Snapshot the `Cap<OpenFile>` registered at fd `idx` on this
@@ -607,7 +590,7 @@ impl ProcessIdentity {
             .lock()
             .as_ref()
             .map(|p| p.rlimit_nofile())
-            .unwrap_or((1024, 1024))
+            .unwrap_or((1024, 4096))
     }
 
     pub fn set_rlimit_nofile(&self, cur: u32, max: u32) {
@@ -621,7 +604,7 @@ impl ProcessIdentity {
             .lock()
             .as_ref()
             .map(|p| p.rlimit_memlock())
-            .unwrap_or((u64::MAX, u64::MAX))
+            .unwrap_or((0, 0))
     }
 
     pub fn set_rlimit_memlock(&self, cur: u64, max: u64) {
@@ -687,11 +670,21 @@ impl ProcessIdentity {
     /// `BTreeSet<u32>`. Returns an empty set for zombies. Used by
     /// [`crate::process::execution::step_close_cloexec_fds`] during
     /// exec phase 7 to walk every marked fd.
-    pub(crate) fn fd_cloexec_snapshot(&self) -> BTreeSet<u32> {
+    pub fn fd_cloexec_snapshot(&self) -> BTreeSet<u32> {
         self.payload
             .lock()
             .as_ref()
             .map(|p| p.fd_cloexec_snapshot())
+            .unwrap_or_default()
+    }
+
+    /// Snapshot the current open fd numbers. Used by range-based fd
+    /// syscalls to walk sparse keys without scanning to `u32::MAX`.
+    pub fn open_fd_numbers(&self) -> BTreeSet<u32> {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.open_fd_numbers())
             .unwrap_or_default()
     }
 
@@ -796,7 +789,7 @@ impl ProcessIdentity {
     }
 
     /// Snapshot the Linux `personality(2)` value. Returns `0`
-    /// (`PER_LINUX`) for zombies.
+    /// for zombies, matching the default Linux personality.
     pub fn personality(&self) -> u32 {
         self.payload
             .lock()
@@ -806,7 +799,7 @@ impl ProcessIdentity {
     }
 
     /// Atomically replace the process personality, returning the
-    /// previous value. No-op (returns `0`) for zombies.
+    /// previous value. No-op for zombies.
     pub fn swap_personality(&self, new: u32) -> u32 {
         self.payload
             .lock()
@@ -1106,14 +1099,9 @@ pub struct ProcessPayload {
     /// Day-1: all namespace caps point at the init namespace.
     /// `mnt_ns` is deferred (`MountNamespace` bootstrap not yet wired).
     pub(crate) nsproxy: AtomicSlot<Cap<crate::process::nsproxy::NsProxy>>,
-
-    /// Current network namespace for socket/device lookup.
-    ///
-    /// N71M3 staging: `bootstrap_init_process` seeds this with
-    /// `initial_net_namespace_payload()`, `step_fork` clones the
-    /// parent's cap, and `unshare(CLONE_NEWNET)` / `setns(...,
-    /// CLONE_NEWNET)` publish a replacement cap through this slot.
-    /// Socket creation in `tx-shims` resolves through this field.
+    /// Per-process network namespace. Init receives the initial net
+    /// namespace payload; fork clones the parent namespace unless an
+    /// explicit namespace operation replaces it.
     pub(crate) net_namespace: AtomicSlot<PayloadCap<crate::net::NetNamespacePayload>>,
     /// Current working directory as a `DEntry` `Cap`.
     ///
@@ -1128,7 +1116,7 @@ pub struct ProcessPayload {
     /// initial cwd. Day-1 `bootstrap_init_process` leaves this slot
     /// empty; `step_getcwd` returns `None` for a process with no
     /// cwd installed.
-    pub(crate) cwd: SpinMutex<Option<Cap<DEntry>>>,
+    pub(crate) cwd: ProcessSpinMutex<Option<Cap<DEntry>>>,
     /// Sparse fd table keyed by `u32` fd value.
     ///
     /// **fd-ops Wave 1 (2026-05-07):** flipped from a fixed
@@ -1146,7 +1134,7 @@ pub struct ProcessPayload {
     /// `.clone()` so parent and child share the same `OpenFile` —
     /// `dup`-shape sharing (separate file description per fd) is a
     /// deferred follow-up.
-    pub(crate) fds: SpinMutex<BTreeMap<u32, Cap<OpenFile>>>,
+    pub(crate) fds: ProcessSpinMutex<BTreeMap<u32, Cap<OpenFile>>>,
     /// Per-fd close-on-exec set. fd `i` is marked CLOEXEC iff
     /// `fd_cloexec.contains(&i)`; marked fds are closed by
     /// [`crate::process::execution::step_close_cloexec_fds`] during
@@ -1165,7 +1153,7 @@ pub struct ProcessPayload {
     /// Default empty (no fds CLOEXEC at process creation). `step_fork`
     /// clones the parent's set per Linux semantics (CLOEXEC is per-fd,
     /// copied across fork).
-    pub(crate) fd_cloexec: SpinMutex<BTreeSet<u32>>,
+    pub(crate) fd_cloexec: ProcessSpinMutex<BTreeSet<u32>>,
     /// Per-process open-fd resource limit. Linux exposes this as
     /// `RLIMIT_NOFILE`; fork copies it and exec preserves it.
     pub(crate) rlimit_nofile_cur: AtomicU32,
@@ -1214,19 +1202,12 @@ pub struct ProcessPayload {
     /// scalar with swap semantics.
     pub(crate) umask: AtomicU16,
     /// Linux `personality(2)` value for this process.
-    ///
-    /// The low byte carries the execution domain (`PER_*`) and the
-    /// upper bytes carry bug-emulation flags such as `STICKY_TIMEOUTS`.
-    /// TxKernel records and reports the value so libc/LTP probes can
-    /// observe Linux-compatible set/readback semantics; individual
-    /// flag side effects are implemented by the affected syscall arms
-    /// as needed.
     pub(crate) personality: AtomicU32,
     /// SysV semaphore undo records owned by this process.
     ///
     /// Per `docs/Txv3/08_SYSV_IPC_v1.md` §4.4 / IPC-3, `SEM_UNDO`
     /// state is process-local and process exit drains only this list.
-    pub(crate) sem_undos: SpinMutex<BTreeMap<u32, SemUndo>>,
+    pub(crate) sem_undos: ProcessSpinMutex<BTreeMap<u32, SemUndo>>,
     /// Reactor wait source that fires when **any** child of this
     /// process zombifies (per `txdoc:PROCESS-WAIT-FAMILY-1`'s
     /// `children_state_channel` notion). Created at payload-sign time
@@ -1294,23 +1275,23 @@ pub struct ProcessPayload {
     /// Process command-line snapshot. Populated by `execve` at the
     /// point-of-no-return commit; read by procfs `/proc/<pid>/cmdline`.
     /// `None` for kernel threads and pre-exec processes.
-    pub _cmdline: SpinMutex<Option<alloc::vec::Vec<u8>>>,
+    pub _cmdline: ProcessSpinMutex<Option<alloc::vec::Vec<u8>>>,
     /// Canonical executable DEntry. Set by `execve` to the resolved
     /// path of the loaded binary. Read by procfs `/proc/<pid>/exe`
     /// (symlink target) and `/proc/<pid>/stat`.
     /// `None` for kernel threads and pre-exec processes.
-    pub _exe_file: SpinMutex<Option<Cap<DEntry>>>,
+    pub _exe_file: ProcessSpinMutex<Option<Cap<DEntry>>>,
     /// Process short name (comm). Up to 15 bytes + NUL. Initialised
     /// from the executable basename at `execve`; can be changed via
     /// `prctl(PR_SET_NAME)`. Read by procfs `/proc/<pid>/stat`.
-    pub _comm: SpinMutex<[u8; 16]>,
+    pub _comm: ProcessSpinMutex<[u8; 16]>,
     pub(crate) thread_count: AtomicU32,
-    pub(crate) group_exit: SpinMutex<Option<GroupExitState>>,
+    pub(crate) group_exit: ProcessSpinMutex<Option<GroupExitState>>,
     pub vfork_done: AtomicBool,
     /// Waker for a vfork-parent that is parked in `sys_clone` waiting
     /// for this process to exec or exit.  Set by the parent before
     /// parking; taken and fired by the child's exec and exit paths.
-    pub(crate) vfork_waiter: SpinMutex<Option<core::task::Waker>>,
+    pub(crate) vfork_waiter: ProcessSpinMutex<Option<core::task::Waker>>,
 }
 
 impl Drop for ProcessPayload {
@@ -1364,6 +1345,10 @@ impl ProcessPayload {
     /// Borrow the per-process group-pending queue.
     pub fn group_pending(&self) -> &PendingSignalQueue {
         &self.group_pending
+    }
+
+    pub fn group_pending_snapshot(&self) -> u64 {
+        self.group_pending.snapshot()
     }
 
     /// Snapshot the current credential value. Returns a `Copy` so
@@ -1566,6 +1551,10 @@ impl ProcessPayload {
         self.snapshot_fds()
     }
 
+    pub fn open_fd_numbers(&self) -> BTreeSet<u32> {
+        self.fds.lock().keys().copied().collect()
+    }
+
     /// Process command-line (for `/proc/<pid>/cmdline`).
     pub fn cmdline(&self) -> Option<alloc::vec::Vec<u8>> {
         self._cmdline.lock().clone()
@@ -1765,7 +1754,7 @@ impl ProcessPayload {
     }
 
     /// Replace the Linux `personality(2)` value, returning the old
-    /// value as Linux does.
+    /// value.
     pub fn swap_personality(&self, new: u32) -> u32 {
         self.personality.swap(new, Ordering::AcqRel)
     }
@@ -1835,7 +1824,7 @@ impl ProcessGroup {
 /// the session continues to exist with no controlling terminal.
 pub struct Session {
     pub sid: Sid,
-    pub(crate) controlling_tty: SpinMutex<Option<Weak<TtyIdentity>>>,
+    pub(crate) controlling_tty: ProcessSpinMutex<Option<Weak<TtyIdentity>>>,
     /// Process groups whose `session` binding names this session.
     /// Per `PROCESS_v1` §2.4 (the spec calls this DLL `members`); we
     /// hold weak refs because retention is held by each pgrp's
@@ -1860,7 +1849,7 @@ impl Session {
     /// or the TTY identity has been reclaimed.
     pub fn controlling_tty_cap(&self) -> Option<Cap<TtyIdentity>> {
         let weak = (*self.controlling_tty.lock())?;
-        let guard = step_engine::guard();
+        let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
         weak.upgrade(&guard)
     }
 
@@ -1889,7 +1878,7 @@ impl Session {
     /// Used by TTY hangup producers that need a typed session-leader pgrp
     /// target for SIGHUP fanout.
     pub fn leader_pgrp_cap(&self) -> Option<Cap<ProcessGroup>> {
-        let guard = step_engine::guard();
+        let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
         self.leader_pgrp_cap_with_guard(&guard)
     }
 
@@ -1938,6 +1927,15 @@ fn adjust_pipe_fd_ref(file: &Cap<OpenFile>, increment: bool) {
             (crate::pipe::PipeSide::Writer, true) => payload.incr_writer(),
             (crate::pipe::PipeSide::Reader, false) => payload.decr_reader(),
             (crate::pipe::PipeSide::Writer, false) => payload.decr_writer(),
+        }
+    }
+    if let Some((rx, tx)) = file.socketpair_endpoint() {
+        if increment {
+            rx.incr_reader();
+            tx.incr_writer();
+        } else {
+            rx.decr_reader();
+            tx.decr_writer();
         }
     }
 }

@@ -22,7 +22,7 @@ core::arch::global_asm!(
     .equ TX_RV64_KERNEL_ALIAS_L0_TABLES, 8
     .equ TX_RV64_PAGE_SIZE, 4096
     .equ TX_RV64_MAX_BOOT_CPUS, 4
-    .equ TX_RV64_BOOT_STACK_STRIDE, 524288
+    .equ TX_RV64_BOOT_STACK_STRIDE, 131072
     .equ TX_RV64_SATP_SV39, 0x8000000000000000
     .equ TX_RV64_PTE_V, 0x001
     .equ TX_RV64_PTE_R, 0x002
@@ -42,8 +42,7 @@ _start:
     la sp, __tx_boot_stack_top_load
     li t0, TX_RV64_MAX_BOOT_CPUS
     bgeu s0, t0, .Ltx_bsp_stack_ready
-    li t1, TX_RV64_BOOT_STACK_STRIDE
-    mul t1, s0, t1
+    slli t1, s0, 17
     sub sp, sp, t1
 .Ltx_bsp_stack_ready:
 
@@ -135,8 +134,7 @@ _start:
     la sp, __tx_boot_stack_top_load
     li t1, TX_RV64_MAX_BOOT_CPUS
     bgeu s0, t1, .Ltx_bsp_high_stack_ready
-    li t2, TX_RV64_BOOT_STACK_STRIDE
-    mul t2, s0, t2
+    slli t2, s0, 17
     sub sp, sp, t2
 .Ltx_bsp_high_stack_ready:
     add sp, sp, t0
@@ -161,8 +159,7 @@ tx_rv64_qemu_secondary_start:
     bgeu s0, t0, 9f
 
     la sp, __tx_boot_stack_top_load
-    li t1, TX_RV64_BOOT_STACK_STRIDE
-    mul t1, s0, t1
+    slli t1, s0, 17
     sub sp, sp, t1
     li t0, TX_RV64_KERNEL_VIRT_OFFSET
     add sp, sp, t0

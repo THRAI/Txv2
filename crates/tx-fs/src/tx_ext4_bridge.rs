@@ -6,6 +6,7 @@
 //! bridges the two by allocating a transient frame, issuing a DMA operation,
 //! and copying between the frame and the caller's `[u8; 4096]` buffer.
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ptr::NonNull;
 
@@ -69,7 +70,10 @@ impl BlockDeviceImage {
         drop(guard);
         match outcome {
             StepOutcome::Done(()) => {}
-            _ => return Err(Ext4FormatError::Truncated),
+            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
+                return Err(Ext4FormatError::WouldBlock);
+            }
+            StepOutcome::Err(_) => return Err(Ext4FormatError::Truncated),
         }
 
         let src = page_allocator::frame_kernel_addr(ppn).map_err(|_| Ext4FormatError::Truncated)?;
@@ -95,11 +99,14 @@ impl BlockImage for BlockDeviceImage {
     }
 
     fn read_block(&self, block: u64, out: &mut Page4K) -> Result<()> {
-        if self.cache.lock().get(block, out) {
+        let cached = { self.cache.lock().get(block) };
+        if let Some(cached) = cached {
+            out.copy_from_slice(cached.as_ref());
             return Ok(());
         }
         self.read_block_uncached(block, out)?;
-        self.cache.lock().insert(block, out);
+        let cached = Arc::new(*out);
+        self.cache.lock().insert(block, cached);
         Ok(())
     }
 
@@ -134,10 +141,14 @@ impl BlockImage for BlockDeviceImage {
         drop(run);
         match outcome {
             StepOutcome::Done(()) => {
-                self.cache.lock().insert(block, data);
+                let cached = Arc::new(*data);
+                self.cache.lock().insert(block, cached);
                 Ok(())
             }
-            _ => Err(Ext4FormatError::Truncated),
+            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
+                Err(Ext4FormatError::WouldBlock)
+            }
+            StepOutcome::Err(_) => Err(Ext4FormatError::Truncated),
         }
     }
 }
@@ -157,22 +168,21 @@ impl ReadBlockCache {
         }
     }
 
-    fn get(&mut self, block: u64, out: &mut Page4K) -> bool {
+    fn get(&mut self, block: u64) -> Option<Arc<Page4K>> {
         let Some(index) = self
             .entries
             .iter()
             .position(|entry| entry.valid && entry.block == block)
         else {
-            return false;
+            return None;
         };
         self.clock = self.clock.wrapping_add(1);
         let entry = &mut self.entries[index];
         entry.last_used = self.clock;
-        out.copy_from_slice(&entry.data);
-        true
+        Some(entry.data.clone())
     }
 
-    fn insert(&mut self, block: u64, data: &Page4K) {
+    fn insert(&mut self, block: u64, data: Arc<Page4K>) {
         self.clock = self.clock.wrapping_add(1);
         let victim = self
             .entries
@@ -195,7 +205,7 @@ impl ReadBlockCache {
         entry.valid = true;
         entry.block = block;
         entry.last_used = self.clock;
-        entry.data.copy_from_slice(data);
+        entry.data = data;
     }
 }
 
@@ -203,7 +213,7 @@ struct ReadBlockCacheEntry {
     valid: bool,
     block: u64,
     last_used: u64,
-    data: Page4K,
+    data: Arc<Page4K>,
 }
 
 impl ReadBlockCacheEntry {
@@ -212,7 +222,136 @@ impl ReadBlockCacheEntry {
             valid: false,
             block: 0,
             last_used: 0,
-            data: [0; BLOCK_SIZE],
+            data: Arc::new([0; BLOCK_SIZE]),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::devfs::adapter::step_engine::{page_allocator, NoProgress};
+    use tx_subsystems::device::{BlockDeviceOps, PhysicalBlockNumber};
+    use tx_subsystems::execution::Guard;
+
+    #[test]
+    fn read_block_cache_returns_shared_page_for_lock_free_copy() {
+        let mut cache = ReadBlockCache::new();
+        let mut block = [0u8; BLOCK_SIZE];
+        block[0] = 0x5a;
+        block[BLOCK_SIZE - 1] = 0xa5;
+
+        let shared = alloc::sync::Arc::new(block);
+        cache.insert(7, shared.clone());
+
+        let cached = cache.get(7).expect("cache hit");
+        assert!(alloc::sync::Arc::ptr_eq(&cached, &shared));
+        assert_eq!(cached[0], 0x5a);
+        assert_eq!(cached[BLOCK_SIZE - 1], 0xa5);
+        assert!(cache.get(8).is_none());
+    }
+
+    #[derive(Clone, Copy)]
+    enum BlockingMode {
+        Continue,
+        Yield,
+    }
+
+    struct BlockingBlockDevice {
+        mode: BlockingMode,
+    }
+
+    impl BlockingBlockDevice {
+        const fn new(mode: BlockingMode) -> Self {
+            Self { mode }
+        }
+
+        fn outcome(&self) -> StepOutcome<(), NoProgress> {
+            match self.mode {
+                BlockingMode::Continue => StepOutcome::continue_with(NoProgress),
+                BlockingMode::Yield => StepOutcome::yield_on_wait_source(NoProgress, 42, 0x1),
+            }
+        }
+    }
+
+    impl BlockDeviceOps for BlockingBlockDevice {
+        fn read_blocks(
+            &self,
+            _block_id: PhysicalBlockNumber,
+            _target: &mut [Frame],
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<(), NoProgress> {
+            self.outcome()
+        }
+
+        fn write_blocks(
+            &self,
+            _block_id: PhysicalBlockNumber,
+            _source: &[Frame],
+            _guard: &Guard<'_>,
+        ) -> StepOutcome<(), NoProgress> {
+            self.outcome()
+        }
+
+        fn barrier(&self, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
+            StepOutcome::done(())
+        }
+    }
+
+    impl BlockDevice for BlockingBlockDevice {
+        fn total_blocks(&self) -> u64 {
+            64
+        }
+
+        fn block_size(&self) -> u32 {
+            512
+        }
+    }
+
+    static CONTINUE_DEVICE: BlockingBlockDevice = BlockingBlockDevice::new(BlockingMode::Continue);
+    static YIELD_DEVICE: BlockingBlockDevice = BlockingBlockDevice::new(BlockingMode::Yield);
+
+    fn init_bridge_test() {
+        tx_test_support::init_host();
+        match page_allocator::claim_zero_frame() {
+            Ok(_) | Err(page_allocator::AllocError::AlreadyInstalled) => {}
+            Err(error) => panic!("claim zero frame for ext4 bridge tests: {error:?}"),
+        }
+    }
+
+    #[test]
+    fn ext4_bridge_maps_retrying_read_to_would_block() {
+        let _serial = crate::test_support::FS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        init_bridge_test();
+        let mut out = [0u8; BLOCK_SIZE];
+
+        assert_eq!(
+            BlockDeviceImage::new(&CONTINUE_DEVICE).read_block(0, &mut out),
+            Err(Ext4FormatError::WouldBlock)
+        );
+        assert_eq!(
+            BlockDeviceImage::new(&YIELD_DEVICE).read_block(0, &mut out),
+            Err(Ext4FormatError::WouldBlock)
+        );
+    }
+
+    #[test]
+    fn ext4_bridge_maps_retrying_write_to_would_block() {
+        let _serial = crate::test_support::FS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        init_bridge_test();
+        let data = [0x5au8; BLOCK_SIZE];
+
+        assert_eq!(
+            BlockDeviceImage::new(&CONTINUE_DEVICE).write_block(0, &data),
+            Err(Ext4FormatError::WouldBlock)
+        );
+        assert_eq!(
+            BlockDeviceImage::new(&YIELD_DEVICE).write_block(0, &data),
+            Err(Ext4FormatError::WouldBlock)
+        );
     }
 }

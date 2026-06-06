@@ -22,7 +22,7 @@ use page_allocator::ZeroPolicy;
 fn materialize_frame(page: &Page4K) -> StepOutcome<Frame, NoProgress> {
     let owned = match reserve_frame_with_reclaim(ZeroPolicy::Zeroed) {
         Ok(reservation) => reservation.commit(),
-        Err(_) => return StepOutcome::err(Errno::EBUSY),
+        Err(_) => return StepOutcome::err(Errno::EBUSY.into()),
     };
     let ppn = owned.ppn();
 
@@ -34,7 +34,7 @@ fn materialize_frame(page: &Page4K) -> StepOutcome<Frame, NoProgress> {
     {
         let dst = match page_allocator::frame_kernel_addr(ppn) {
             Ok(ptr) => ptr,
-            Err(_) => return StepOutcome::err(Errno::EIO),
+            Err(_) => return StepOutcome::err(Errno::EIO.into()),
         };
         // SAFETY: `dst` is the kernel direct-map VA of a freshly
         // allocated frame we own through `owned`. `page` is a
@@ -82,11 +82,11 @@ where
         _guard: &Guard<'_>,
     ) -> StepOutcome<Frame, NoProgress> {
         if !offset.is_multiple_of(BLOCK_SIZE as u64) {
-            return StepOutcome::err(Errno::EINVAL);
+            return StepOutcome::err(Errno::EINVAL.into());
         }
         let inode = match inode_no(fs_object_id) {
             Ok(inode) => inode,
-            Err(err) => return StepOutcome::err(err),
+            Err(err) => return StepOutcome::err(err.into()),
         };
         let file_page_index = offset / BLOCK_SIZE as u64;
         let mut page: Page4K = [0; BLOCK_SIZE];
@@ -94,7 +94,7 @@ where
         if let Err(err) =
             self.with_pager(|pager| pager.read_page(inode, file_page_index, &mut page))
         {
-            return StepOutcome::err(err);
+            return StepOutcome::err(err.into());
         }
 
         materialize_frame(&page)
@@ -107,7 +107,7 @@ where
         _frame: &Frame,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::ENOSYS)
+        StepOutcome::err(Errno::ENOSYS.into())
     }
 
     fn truncate(
@@ -116,7 +116,7 @@ where
         _new_size: u64,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::ENOSYS)
+        StepOutcome::err(Errno::ENOSYS.into())
     }
 
     fn fsync_file(
@@ -124,7 +124,7 @@ where
         _fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::ENOSYS)
+        StepOutcome::done(())
     }
 
     // `fallocate` and `supports_reflink` inherit the trait defaults

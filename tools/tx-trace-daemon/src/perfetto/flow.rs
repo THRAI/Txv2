@@ -10,8 +10,8 @@
 //! emitted by the kernel (OBS-3b/OBS-4 not yet wired).  This module is
 //! structurally complete and exercised via unit tests with synthetic input.
 
-use std::hash::{Hash, Hasher};
 use siphasher::sip::SipHasher13;
+use std::hash::{Hash, Hasher};
 
 /// Flow kind discriminant — matches §9 of the host spec.
 ///
@@ -20,16 +20,16 @@ use siphasher::sip::SipHasher13;
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FlowKind {
-    SourceWake    = 1,
-    AgentReply    = 2,
-    TimerExpire   = 3,
+    SourceWake = 1,
+    AgentReply = 2,
+    TimerExpire = 3,
     AbortDelivery = 4,
     /// Parent → child fork edge (OBS-V1 §15.9). `task_id` carries
     /// the parent's PID and `wait_gen` carries the child's PID — the
     /// pair uniquely identifies the spawn event so both producer
     /// (anchored on parent track) and consumer (anchored on child
     /// track) hash to the same `flow_id`.
-    Fork          = 5,
+    Fork = 5,
 }
 
 /// Compute the Perfetto flow_id for a producer/consumer pair.
@@ -57,9 +57,9 @@ mod tests {
 
     #[test]
     fn different_kind_produces_different_id() {
-        let a = compute_flow_id(1, 1, FlowKind::SourceWake,    0);
-        let b = compute_flow_id(1, 1, FlowKind::AgentReply,    0);
-        let c = compute_flow_id(1, 1, FlowKind::TimerExpire,   0);
+        let a = compute_flow_id(1, 1, FlowKind::SourceWake, 0);
+        let b = compute_flow_id(1, 1, FlowKind::AgentReply, 0);
+        let c = compute_flow_id(1, 1, FlowKind::TimerExpire, 0);
         let d = compute_flow_id(1, 1, FlowKind::AbortDelivery, 0);
         // All four must be distinct.
         let set = std::collections::HashSet::from([a, b, c, d]);
@@ -93,7 +93,10 @@ mod tests {
                     FlowKind::AbortDelivery,
                 ] {
                     let id = compute_flow_id(task, gen, kind, 0xabcd_1234_5678_ef01);
-                    assert!(ids.insert(id), "collision at task={task} gen={gen} kind={kind:?}");
+                    assert!(
+                        ids.insert(id),
+                        "collision at task={task} gen={gen} kind={kind:?}"
+                    );
                 }
             }
         }

@@ -4,7 +4,7 @@
 //! either in this submodule or in the shared parent (`super::*`).
 
 use super::*;
-use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
+use crate::adapter::step_engine::{self as step_engine, Cap, Guard, StepOutcome};
 use tx_fs;
 // The alias-name `cred_checks` is required by
 // `xtask lint invariants cred-check` — see CRED_CHECK_SIGNALS in
@@ -33,15 +33,46 @@ fn mount_is_read_only(dentry: &Cap<DEntry>) -> bool {
                 return true;
             }
         }
-        if mount::mount_for_root_dentry(&dentry)
-            .is_some_and(|mount| mount.flags().contains(mount::MountFlags::READ_ONLY))
-        {
-            return true;
-        }
         cursor = dentry.parent_hint();
     }
 
     false
+}
+
+fn mount_identity_for_dentry(
+    ctx: &SyscallCtx<'_>,
+    dentry: &Cap<DEntry>,
+) -> Option<Cap<mount::MountIdentity>> {
+    let guard = step_engine::guard();
+    if let Some(mount) = dentry.mounted_hint().and_then(|weak| weak.upgrade(&guard)) {
+        return Some(mount);
+    }
+    if let Some(parent) = dentry.parent_hint() {
+        if let Some(mount) = parent.mounted_hint().and_then(|weak| weak.upgrade(&guard)) {
+            return Some(mount);
+        }
+    }
+    let namespace = ctx.process.mount_namespace_cap()?;
+    let root = namespace.root();
+    if root.root().key() == dentry.rnode().key() {
+        return Some(root.clone());
+    }
+    None
+}
+
+fn resolve_cwd_for_path(
+    dirfd: i32,
+    _path: &[u8],
+    ctx: &SyscallCtx<'_>,
+) -> Result<Cap<DEntry>, i32> {
+    if dirfd == AT_FDCWD {
+        return ctx.process.cwd().ok_or(ENOENT_VALUE);
+    }
+    if dirfd < 0 {
+        return Err(EBADF_VALUE);
+    }
+    let open_file = ctx.process.fd(dirfd as u32).ok_or(EBADF_VALUE)?;
+    open_file.opendir_dentry().ok_or(ENOTDIR_VALUE)
 }
 
 /// Split a path into `(parent, basename)` for the `O_CREAT`-on-missing
@@ -117,7 +148,7 @@ pub(crate) fn create_then_walk<P: PmapIf>(
             V3::Continue { .. } | V3::Yield { .. } => {
                 return Err(EIO_VALUE);
             }
-            V3::Err(errno) => return Err(errno_to_i32(errno)),
+            V3::Err(errno) => return Err(errno_to_i32(Errno::from(errno))),
         }
     };
 
@@ -128,9 +159,10 @@ pub(crate) fn create_then_walk<P: PmapIf>(
         None => return Err(EROFS_VALUE),
     };
 
-    // Mint the new inode under the parent. The caller has already
-    // applied the process umask, leaving the bottom 12 mode bits
-    // (`rwxrwxrwx | S_ISUID/S_ISGID/S_ISVTX`) for the filesystem.
+    // Mint the new inode under the parent. The mode arrives from
+    // userspace as the bottom 12 bits (`rwxrwxrwx | S_ISUID/S_ISGID/
+    // S_ISVTX`); umask plumbing is deferred to a future slice
+    // (TODO(phase-umask)).
     let parent_fs_object_id = parent_dentry.rnode().fs_object_id();
     let new_mode = mode & 0o7777;
     {
@@ -144,7 +176,7 @@ pub(crate) fn create_then_walk<P: PmapIf>(
             V3::Continue { .. } | V3::Yield { .. } => {
                 return Err(EIO_VALUE);
             }
-            V3::Err(errno) => return Err(errno_to_i32(errno)),
+            V3::Err(errno) => return Err(errno_to_i32(Errno::from(errno))),
         }
     }
 
@@ -158,7 +190,7 @@ pub(crate) fn create_then_walk<P: PmapIf>(
     match outcome {
         V3::Done(d) => Ok(d),
         V3::Continue { .. } | V3::Yield { .. } => Err(EIO_VALUE),
-        V3::Err(errno) => Err(errno_to_i32(errno)),
+        V3::Err(errno) => Err(errno_to_i32(Errno::from(errno))),
     }
 }
 
@@ -254,7 +286,7 @@ pub(super) async fn sys_mkdirat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
             SyscallResult::Return(0)
         }
         V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-        V3::Err(errno) => SyscallResult::error_from(errno),
+        V3::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
     }
 }
 
@@ -311,10 +343,12 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
         match fs_ops.lookup(parent_id, basename, &guard) {
             V3::Done(id) => id,
             V3::Continue { .. } | V3::Yield { .. } => return SyscallResult::Error(EIO_VALUE),
-            V3::Err(errno) if errno == Errno::ENOENT && try_unlink_unix_socket_path(ctx, &path) => {
+            V3::Err(errno)
+                if errno == Errno::ENOENT && try_unlink_unix_socket_path(ctx, &path, &guard) =>
+            {
                 return SyscallResult::Return(0);
             }
-            V3::Err(errno) => return SyscallResult::error_from(errno),
+            V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
         }
     };
     let child_meta = {
@@ -322,7 +356,7 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
         match fs_ops.load_inode_meta(target_id, &guard) {
             V3::Done(meta) => meta,
             V3::Continue { .. } | V3::Yield { .. } => return SyscallResult::Error(EIO_VALUE),
-            V3::Err(errno) => return SyscallResult::error_from(errno),
+            V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
         }
     };
     let target_kind = child_meta.kind();
@@ -352,18 +386,18 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     match outcome {
         V3::Done(()) => {
             parent_dentry.remove_cached_child_by_name(basename);
-            if !want_rmdir && child_meta.nlinks <= 1 {
+            if want_rmdir || child_meta.nlinks <= 1 {
                 let guard = step_engine::guard();
                 let _ = fs_ops.destroy_inode(target_id, &guard);
             }
             SyscallResult::Return(0)
         }
         V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-        V3::Err(errno) => SyscallResult::error_from(errno),
+        V3::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
     }
 }
 
-fn try_unlink_unix_socket_path(ctx: &SyscallCtx<'_>, path: &[u8]) -> bool {
+fn try_unlink_unix_socket_path(ctx: &SyscallCtx<'_>, path: &[u8], guard: &Guard<'_>) -> bool {
     let Ok(path) = UnixSocketPath::new(path) else {
         return false;
     };
@@ -371,8 +405,7 @@ fn try_unlink_unix_socket_path(ctx: &SyscallCtx<'_>, path: &[u8]) -> bool {
         return false;
     };
     let table = net_namespace.socket_table();
-    let guard = step_engine::guard();
-    if !table.lookup_unix_path_node(path, &guard) {
+    if !table.lookup_unix_path_node(path, guard) {
         return false;
     }
     table.unlink_unix_path(path).is_ok()
@@ -448,7 +481,7 @@ pub(super) async fn sys_symlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
             SyscallResult::Return(0)
         }
         V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-        V3::Err(errno) => SyscallResult::error_from(errno),
+        V3::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
     }
 }
 
@@ -558,7 +591,7 @@ pub(super) async fn sys_linkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
             SyscallResult::Return(0)
         }
         V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-        V3::Err(errno) => SyscallResult::error_from(errno),
+        V3::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
     }
 }
 
@@ -576,7 +609,7 @@ pub(super) async fn sys_truncate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
-        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
+        Err(ReadCStrError::Fault(_)) => return SyscallResult::Error(EFAULT_VALUE),
     };
     if path.is_empty() {
         return SyscallResult::Error(ENOENT_VALUE);
@@ -603,7 +636,7 @@ pub(super) async fn sys_truncate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     match outcome {
         V3::Done(()) | V3::Continue { .. } => SyscallResult::Return(0),
         V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-        V3::Err(v3_errno) => SyscallResult::error_from(v3_errno),
+        V3::Err(v3_errno) => SyscallResult::error_from(v3_errno.into()),
     }
 }
 
@@ -652,18 +685,11 @@ pub(super) async fn sys_ftruncate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     .await
     {
         Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => SyscallResult::error_from(v3errno),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
-/// `fallocate(fd, mode, offset, len)`. Linux RV64 generic ABI
-/// `__NR_fallocate = 47`.
-///
-/// Supports the fd-io/LTP surface: `mode == 0` grows visible file size via
-/// `step_fallocate`; `FALLOC_FL_KEEP_SIZE` validates the range but does not
-/// publish a larger size. Other range-manipulation modes are intentionally
-/// rejected until hole-punch/zero-range backing exists.
-pub(super) fn sys_fallocate(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+pub(super) async fn sys_fallocate<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     const FALLOC_FL_KEEP_SIZE: i32 = 0x01;
     const EFBIG_VALUE: i32 = 27;
 
@@ -702,9 +728,6 @@ pub(super) fn sys_fallocate(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResu
         _ => return SyscallResult::Error(EFBIG_VALUE),
     };
 
-    if mode == FALLOC_FL_KEEP_SIZE && end <= pc.size_bytes() {
-        return SyscallResult::Return(0);
-    }
     if mode == FALLOC_FL_KEEP_SIZE {
         return SyscallResult::Return(0);
     }
@@ -717,7 +740,7 @@ pub(super) fn sys_fallocate(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResu
     match outcome {
         V3::Done(()) | V3::Continue { .. } => SyscallResult::Return(0),
         V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-        V3::Err(v3_errno) => SyscallResult::error_from(v3_errno),
+        V3::Err(v3_errno) => SyscallResult::error_from(Errno::from(v3_errno)),
     }
 }
 
@@ -779,7 +802,7 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
                 V3::Continue { .. } | V3::Yield { .. } => {
                     return SyscallResult::Error(EIO_VALUE);
                 }
-                V3::Err(errno) => return SyscallResult::error_from(errno),
+                V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
             }
         };
         let to_copy = core::cmp::min(link_bytes.len(), buf_len);
@@ -825,7 +848,7 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
             V3::Continue { .. } | V3::Yield { .. } => {
                 return SyscallResult::Error(EIO_VALUE);
             }
-            V3::Err(errno) => return SyscallResult::error_from(errno),
+            V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
         }
     };
     let target_meta = {
@@ -835,7 +858,7 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
             V3::Continue { .. } | V3::Yield { .. } => {
                 return SyscallResult::Error(EIO_VALUE);
             }
-            V3::Err(errno) => return SyscallResult::error_from(errno),
+            V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
         }
     };
     if target_meta.kind() != InodeKind::Symlink {
@@ -848,7 +871,7 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
             V3::Continue { .. } | V3::Yield { .. } => {
                 return SyscallResult::Error(EIO_VALUE);
             }
-            V3::Err(errno) => return SyscallResult::error_from(errno),
+            V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
         }
     };
     let to_copy = core::cmp::min(link_bytes.len(), buf_len);
@@ -860,7 +883,15 @@ pub(super) async fn sys_readlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     SyscallResult::Return(to_copy as i64)
 }
 
-fn allocate_mount_api_fd<'a>(ctx: &SyscallCtx<'a>) -> Result<u32, SyscallResult> {
+fn mount_api_resolve_cwd_for_path(
+    dirfd: i32,
+    path: &[u8],
+    ctx: &SyscallCtx<'_>,
+) -> Result<Cap<DEntry>, i32> {
+    resolve_cwd_for_path(dirfd, path, ctx)
+}
+
+fn allocate_mount_api_fd(ctx: &SyscallCtx<'_>) -> Result<u32, SyscallResult> {
     let fd = ctx.process.allocate_fd();
     let (soft_limit, _) = ctx.process.rlimit_nofile();
     if fd >= soft_limit {
@@ -870,8 +901,8 @@ fn allocate_mount_api_fd<'a>(ctx: &SyscallCtx<'a>) -> Result<u32, SyscallResult>
     }
 }
 
-fn install_mount_api_fd<'a>(
-    ctx: &SyscallCtx<'a>,
+fn install_mount_api_fd(
+    ctx: &SyscallCtx<'_>,
     file: Cap<mount::MountApiFile>,
     flags: OpenFileFlags,
 ) -> SyscallResult {
@@ -913,12 +944,6 @@ fn mount_api_root_dentry(mut dentry: Cap<DEntry>) -> Cap<DEntry> {
 }
 
 /// `fsopen(fsname, flags)`. Linux generic ABI `__NR_fsopen = 430`.
-///
-/// This is the fd-provider slice for the Linux 5.2 mount API: it validates
-/// the fs label/flags and returns a mount-context file descriptor. The
-/// follow-up `fsconfig`/`fsmount` superblock-creation path is still deferred
-/// by `MOUNT_v1`; callers that try to drive that path currently hit the
-/// syscall dispatch default for those later syscalls.
 pub(super) async fn sys_fsopen<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let _ = core::marker::PhantomData::<P>;
     let fsname_uaddr = args[0];
@@ -955,11 +980,6 @@ pub(super) async fn sys_fsopen<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) 
 }
 
 /// `fspick(dirfd, path, flags)`. Linux generic ABI `__NR_fspick = 433`.
-///
-/// Returns a reconfiguration-context fd over an already-resolved mount. Full
-/// `FSCONFIG_CMD_RECONFIGURE` handling is deliberately left to the later
-/// mount-API topology slice; this fd still behaves like a non-socket for
-/// generic fd consumers.
 pub(super) async fn sys_fspick<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     let _ = core::marker::PhantomData::<P>;
     let dirfd = args[0] as i32;
@@ -981,7 +1001,7 @@ pub(super) async fn sys_fspick<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) 
         return SyscallResult::Error(ENOENT_VALUE);
     }
 
-    let rooted_at = match resolve_cwd_for_path(dirfd, &path, ctx) {
+    let rooted_at = match mount_api_resolve_cwd_for_path(dirfd, &path, ctx) {
         Ok(dentry) => dentry,
         Err(errno) => return SyscallResult::Error(errno),
     };
@@ -998,7 +1018,7 @@ pub(super) async fn sys_fspick<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) 
         Some(payload) => payload,
         None => return SyscallResult::Error(ENODEV_VALUE),
     };
-    let picked_mount = mount::mount_for_root_dentry(&target);
+    let picked_mount = mount_identity_for_dentry(ctx, &target);
     let file = match mount::MountApiFile::new_fs_context_cap(
         payload.fstype,
         mount::FsContextMode::Reconfigure,
@@ -1020,10 +1040,6 @@ pub(super) async fn sys_fspick<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) 
 }
 
 /// `open_tree(dirfd, path, flags)`. Linux generic ABI `__NR_open_tree = 428`.
-///
-/// The fd-provider phase returns an O_PATH-like mount-api fd. Socket syscalls
-/// therefore report `EBADF` for this backing, matching Linux's generic-fd
-/// behaviour for `accept03`.
 pub(super) async fn sys_open_tree<P: PmapIf>(
     args: [u64; 6],
     ctx: &SyscallCtx<'_>,
@@ -1047,7 +1063,7 @@ pub(super) async fn sys_open_tree<P: PmapIf>(
         return SyscallResult::Error(ENOENT_VALUE);
     }
 
-    let rooted_at = match resolve_cwd_for_path(dirfd, &path, ctx) {
+    let rooted_at = match mount_api_resolve_cwd_for_path(dirfd, &path, ctx) {
         Ok(dentry) => dentry,
         Err(errno) => return SyscallResult::Error(errno),
     };
@@ -1096,7 +1112,7 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
     let target = match read_user_cstr(&ctx.aspace, target_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
-        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
+        Err(ReadCStrError::Fault(_)) => return SyscallResult::Error(EFAULT_VALUE),
     };
 
     let cwd = match ctx.process.cwd() {
@@ -1129,7 +1145,7 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
         if (flags & MS_RDONLY) != 0 {
             mount_flags = mount_flags.union(mount::MountFlags::READ_ONLY);
         }
-        let mount = match mount::mount_for_root_dentry(&target_dentry) {
+        let mount = match mount_identity_for_dentry(ctx, &target_dentry) {
             Some(mount) => mount,
             None => return SyscallResult::Error(EINVAL_VALUE),
         };
@@ -1142,7 +1158,7 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
         let source = match read_user_cstr(&ctx.aspace, source_uaddr, EXECVE_PATH_MAX) {
             Ok(p) => p,
             Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
-            Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
+            Err(ReadCStrError::Fault(_)) => return SyscallResult::Error(EFAULT_VALUE),
         };
         let source_dentry = match walk_from_process(cwd, &source, &cred, &ctx.process) {
             Ok(d) => d,
@@ -1159,7 +1175,7 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
     let fstype = match read_user_cstr(&ctx.aspace, fstype_uaddr, 64) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
-        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
+        Err(ReadCStrError::Fault(_)) => return SyscallResult::Error(EFAULT_VALUE),
     };
     let fstype_str = match core::str::from_utf8(&fstype) {
         Ok(s) => s,
@@ -1179,7 +1195,7 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
         let source = match read_user_cstr(&ctx.aspace, source_uaddr, EXECVE_PATH_MAX) {
             Ok(p) => p,
             Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
-            Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
+            Err(ReadCStrError::Fault(_)) => return SyscallResult::Error(EFAULT_VALUE),
         };
         Some(source)
     } else {
@@ -1385,7 +1401,7 @@ pub(super) async fn sys_umount2<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>)
     let target = match read_user_cstr(&ctx.aspace, target_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
-        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
+        Err(ReadCStrError::Fault(_)) => return SyscallResult::Error(EFAULT_VALUE),
     };
 
     let cwd = match ctx.process.cwd() {
@@ -1440,11 +1456,11 @@ pub(super) async fn sys_mknodat<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>)
         Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
 
-    let S_IFREG: u32 = 0o100000;
-    let S_IFCHR: u32 = 0o020000;
-    let S_IFBLK: u32 = 0o060000;
-    let S_IFIFO: u32 = 0o010000;
-    let S_IFSOCK: u32 = 0o140000;
+    const S_IFREG: u32 = 0o100000;
+    const S_IFCHR: u32 = 0o020000;
+    const S_IFBLK: u32 = 0o060000;
+    const S_IFIFO: u32 = 0o010000;
+    const S_IFSOCK: u32 = 0o140000;
 
     let cred = ctx.walker_cred();
     let rooted_at = match resolve_cwd_for_path(dirfd, &path, ctx) {
@@ -1492,7 +1508,7 @@ pub(super) async fn sys_mknodat<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>)
     };
     match result {
         Ok(()) => SyscallResult::Return(0),
-        Err(v3errno) => SyscallResult::error_from(v3errno),
+        Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
 }
 
@@ -1643,9 +1659,10 @@ pub(super) fn sys_utimensat<'a, P: tx_hal::TimeIf>(
 ///   resolves successfully, the arm short-circuits with `-EEXIST`.
 ///
 /// The dispatch routes through `FsOps::rename(old_parent, old_name,
-/// new_parent, new_name, &guard)`. The in-tree tmpfs surface only
-/// supports same-directory rename today; cross-directory rename
-/// surfaces as `-ENOSYS` from the backend.
+/// new_parent, new_name, &guard)`. The in-tree tmpfs surface supports
+/// same-directory rename plus cross-directory regular-file moves and
+/// directory-subtree moves within one tmpfs mount. Atomic exchange is
+/// still outside this syscall surface.
 pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let olddirfd = args[0] as i32;
     let oldpath_uaddr = args[1];
@@ -1781,7 +1798,7 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
             StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
                 return SyscallResult::Error(EIO_VALUE);
             }
-            StepOutcome::Err(errno) => return SyscallResult::error_from(errno),
+            StepOutcome::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
         }
         match fs_ops.rename(
             new_parent_dentry.rnode().fs_object_id(),
@@ -1794,7 +1811,7 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
             StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
                 return SyscallResult::Error(EIO_VALUE);
             }
-            StepOutcome::Err(errno) => return SyscallResult::error_from(errno),
+            StepOutcome::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
         }
         fs_ops.rename(
             old_parent_dentry.rnode().fs_object_id(),
@@ -1818,10 +1835,16 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
             old_parent_dentry.remove_cached_child_by_name(b".tx_rename_exchange_tmp");
             old_parent_dentry.remove_cached_child_by_name(old_basename);
             new_parent_dentry.remove_cached_child_by_name(new_basename);
+            if (flags & RENAME_EXCHANGE) == 0 {
+                if let Some(displaced) = displaced_dentry.as_ref() {
+                    let guard = step_engine::guard();
+                    let _ = fs_ops.destroy_inode(displaced.rnode().fs_object_id(), &guard);
+                }
+            }
             SyscallResult::Return(0)
         }
         StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => SyscallResult::Error(EIO_VALUE),
-        StepOutcome::Err(errno) => SyscallResult::error_from(errno),
+        StepOutcome::Err(errno) => SyscallResult::error_from(Errno::from(errno)),
     }
 }
 

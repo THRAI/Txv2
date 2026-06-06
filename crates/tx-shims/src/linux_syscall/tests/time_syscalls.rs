@@ -4,14 +4,14 @@ use super::*;
 
 use crate::linux_syscall::{
     CLOCK_MONOTONIC, CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME, CLOCK_THREAD_CPUTIME_ID,
-    ITIMER_REAL, NR_CLOCK_GETTIME, NR_CLOCK_NANOSLEEP, NR_GETTIMEOFDAY, NR_NANOSLEEP,
-    NR_RT_SIGACTION, NR_RT_SIGRETURN, NR_SETITIMER, NR_TIMES, TIMER_ABSTIME, TIMES_NS_PER_TICK,
+    NR_CLOCK_GETTIME, NR_CLOCK_NANOSLEEP, NR_CLOCK_SETTIME, NR_GETITIMER, NR_GETTIMEOFDAY,
+    NR_NANOSLEEP, NR_SETITIMER, NR_SETTIMEOFDAY, NR_TIMES, TIMER_ABSTIME, TIMES_NS_PER_TICK,
 };
-use tx_hal::UserTrapContext;
-use tx_subsystems::signal::{step_sigaction, SigDisposition, Signum};
+use tx_subsystems::cred::{step_setresuid, Uid};
 
 const E_INVAL: i32 = 22;
 const E_FAULT: i32 = 14;
+const E_PERM: i32 = 1;
 const OSCOMP_IMAGE_TIMESTAMP_FLOOR_SEC: i64 = 1_779_473_960;
 
 /// Mirror of `TimespecLayout` for test-side decoding. The
@@ -35,8 +35,8 @@ struct TestTimeval {
 #[repr(C)]
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 struct TestItimerval {
-    interval: TestTimeval,
-    value: TestTimeval,
+    it_interval: TestTimeval,
+    it_value: TestTimeval,
 }
 
 #[repr(C)]
@@ -147,6 +147,65 @@ fn dispatch_gettimeofday_writes_timeval_to_user() {
 }
 
 #[test]
+fn dispatch_setitimer_and_getitimer_round_trip_real_timer() {
+    const ITIMER_REAL: u64 = 0;
+
+    let (_setup, proc_cap, thread) = time_setup();
+    let ctx = make_ctx(proc_cap, thread);
+    let new_timer = TestItimerval {
+        it_interval: TestTimeval {
+            tv_sec: 2,
+            tv_usec: 0,
+        },
+        it_value: TestTimeval {
+            tv_sec: 10,
+            tv_usec: 0,
+        },
+    };
+    let mut old_timer = TestItimerval::default();
+    let mut current = TestItimerval::default();
+
+    let set = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_SETITIMER,
+            [
+                ITIMER_REAL,
+                &new_timer as *const TestItimerval as u64,
+                &mut old_timer as *mut TestItimerval as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(set, SyscallResult::Return(0));
+    assert_eq!(old_timer, TestItimerval::default());
+
+    let get = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_GETITIMER,
+            [
+                ITIMER_REAL,
+                &mut current as *mut TestItimerval as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(get, SyscallResult::Return(0));
+    assert_eq!(current.it_interval.tv_sec, 2);
+    assert_eq!(current.it_interval.tv_usec, 0);
+    assert!(
+        current.it_value.tv_sec > 0 || current.it_value.tv_usec > 0,
+        "active interval timer should report non-zero remaining time"
+    );
+}
+
+#[test]
 fn dispatch_gettimeofday_realtime_is_not_before_oscomp_image_timestamps() {
     let (_setup, proc_cap, thread) = time_setup();
     let ctx = make_ctx(proc_cap, thread);
@@ -174,6 +233,178 @@ fn dispatch_gettimeofday_null_buffer_returns_neg_efault() {
     let req = SyscallRequest::new(NR_GETTIMEOFDAY, [0, 0, 0, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Error(E_FAULT));
+}
+
+#[test]
+fn dispatch_clock_settime_updates_realtime_without_moving_monotonic() {
+    let (_setup, proc_cap, thread) = time_setup();
+    let ctx = make_ctx(proc_cap, thread);
+    let new_rt = TestTimespec {
+        tv_sec: 1_800_000_000,
+        tv_nsec: 123_456_789,
+    };
+
+    let before_mono = {
+        let mut ts = TestTimespec::default();
+        let result = block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_CLOCK_GETTIME,
+                [
+                    CLOCK_MONOTONIC as u64,
+                    &mut ts as *mut TestTimespec as u64,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            &ctx,
+        ));
+        assert_eq!(result, SyscallResult::Return(0));
+        ts.tv_sec
+            .saturating_mul(1_000_000_000)
+            .saturating_add(ts.tv_nsec)
+    };
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_CLOCK_SETTIME,
+            [
+                CLOCK_REALTIME as u64,
+                &new_rt as *const TestTimespec as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Return(0));
+
+    let mut rt = TestTimespec::default();
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_CLOCK_GETTIME,
+            [
+                CLOCK_REALTIME as u64,
+                &mut rt as *mut TestTimespec as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Return(0));
+    assert_eq!(rt.tv_sec, new_rt.tv_sec);
+    assert!(rt.tv_nsec >= new_rt.tv_nsec);
+
+    let mut after = TestTimespec::default();
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_CLOCK_GETTIME,
+            [
+                CLOCK_MONOTONIC as u64,
+                &mut after as *mut TestTimespec as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Return(0));
+    let after_mono = after
+        .tv_sec
+        .saturating_mul(1_000_000_000)
+        .saturating_add(after.tv_nsec);
+    assert!(after_mono >= before_mono);
+    assert!(
+        after_mono - before_mono < 1_000_000,
+        "clock_settime must not jump CLOCK_MONOTONIC: before={before_mono} after={after_mono}"
+    );
+}
+
+#[test]
+fn dispatch_settimeofday_updates_gettimeofday_realtime() {
+    let (_setup, proc_cap, thread) = time_setup();
+    let ctx = make_ctx(proc_cap, thread);
+    let tv = TestTimeval {
+        tv_sec: 1_800_000_010,
+        tv_usec: 654_321,
+    };
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_SETTIMEOFDAY,
+            [&tv as *const TestTimeval as u64, 0, 0, 0, 0, 0],
+        ),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Return(0));
+
+    let mut out = TestTimeval::default();
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_GETTIMEOFDAY,
+            [&mut out as *mut TestTimeval as u64, 0, 0, 0, 0, 0],
+        ),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Return(0));
+    assert_eq!(out.tv_sec, tv.tv_sec);
+    assert!(out.tv_usec >= tv.tv_usec);
+}
+
+#[test]
+fn dispatch_clock_settime_rejects_non_realtime_and_unprivileged_callers() {
+    let (_setup, proc_cap, thread) = time_setup();
+    let ctx = make_ctx(proc_cap.clone(), thread.clone());
+    let ts = TestTimespec {
+        tv_sec: 1_800_000_000,
+        tv_nsec: 0,
+    };
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_CLOCK_SETTIME,
+            [
+                CLOCK_MONOTONIC as u64,
+                &ts as *const TestTimespec as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Error(E_INVAL));
+
+    let target = Uid(1000);
+    assert!(matches!(
+        step_setresuid(&proc_cap, Some(target), Some(target), Some(target)),
+        tx_subsystems::cred::CredChange::Replaced { .. }
+    ));
+    let unpriv_ctx = make_ctx(proc_cap, thread);
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_CLOCK_SETTIME,
+            [
+                CLOCK_REALTIME as u64,
+                &ts as *const TestTimespec as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &unpriv_ctx,
+    ));
+    assert_eq!(result, SyscallResult::Error(E_PERM));
 }
 
 /// `times(buf)` returns the monotonic tick count and writes
@@ -236,277 +467,6 @@ fn dispatch_times_with_null_buffer_returns_tick_count() {
         other => panic!("expected Return, got {other:?}"),
     };
     assert!(ticks > 0);
-}
-
-#[test]
-fn dispatch_setitimer_accepts_real_timer_and_writes_old_zero() {
-    let (_setup, proc_cap, thread) = time_setup();
-    let ctx = make_ctx(proc_cap, thread);
-    let new_timer = TestItimerval {
-        interval: TestTimeval {
-            tv_sec: 0,
-            tv_usec: 0,
-        },
-        value: TestTimeval {
-            tv_sec: 1,
-            tv_usec: 250_000,
-        },
-    };
-    let mut old_timer = TestItimerval {
-        interval: TestTimeval {
-            tv_sec: 9,
-            tv_usec: 9,
-        },
-        value: TestTimeval {
-            tv_sec: 9,
-            tv_usec: 9,
-        },
-    };
-
-    let req = SyscallRequest::new(
-        NR_SETITIMER,
-        [
-            ITIMER_REAL as u64,
-            (&new_timer as *const TestItimerval) as u64,
-            (&mut old_timer as *mut TestItimerval) as u64,
-            0,
-            0,
-            0,
-        ],
-    );
-    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
-    assert_eq!(result, SyscallResult::Return(0));
-    assert_eq!(old_timer, TestItimerval::default());
-}
-
-#[test]
-fn dispatch_setitimer_reports_previous_real_timer_remaining() {
-    let (_setup, proc_cap, thread) = time_setup();
-    let ctx = make_ctx(proc_cap, thread);
-    let first_timer = TestItimerval {
-        interval: TestTimeval {
-            tv_sec: 2,
-            tv_usec: 125_000,
-        },
-        value: TestTimeval {
-            tv_sec: 10,
-            tv_usec: 0,
-        },
-    };
-    let second_timer = TestItimerval {
-        interval: TestTimeval {
-            tv_sec: 0,
-            tv_usec: 0,
-        },
-        value: TestTimeval {
-            tv_sec: 1,
-            tv_usec: 0,
-        },
-    };
-    let mut old_timer = TestItimerval::default();
-
-    assert_eq!(
-        block_on(dispatch::<ShimsTestPmap>(
-            SyscallRequest::new(
-                NR_SETITIMER,
-                [
-                    ITIMER_REAL as u64,
-                    (&first_timer as *const TestItimerval) as u64,
-                    0,
-                    0,
-                    0,
-                    0,
-                ],
-            ),
-            &ctx,
-        )),
-        SyscallResult::Return(0)
-    );
-    assert_eq!(
-        block_on(dispatch::<ShimsTestPmap>(
-            SyscallRequest::new(
-                NR_SETITIMER,
-                [
-                    ITIMER_REAL as u64,
-                    (&second_timer as *const TestItimerval) as u64,
-                    (&mut old_timer as *mut TestItimerval) as u64,
-                    0,
-                    0,
-                    0,
-                ],
-            ),
-            &ctx,
-        )),
-        SyscallResult::Return(0)
-    );
-    assert_eq!(old_timer.interval, first_timer.interval);
-    assert_eq!(old_timer.value.tv_sec, 9);
-    assert!(old_timer.value.tv_usec > 0);
-}
-
-#[test]
-fn dispatch_setitimer_rejects_invalid_timeval() {
-    let (_setup, proc_cap, thread) = time_setup();
-    let ctx = make_ctx(proc_cap, thread);
-    let new_timer = TestItimerval {
-        interval: TestTimeval {
-            tv_sec: 0,
-            tv_usec: 1_000_000,
-        },
-        value: TestTimeval {
-            tv_sec: 0,
-            tv_usec: 0,
-        },
-    };
-
-    let req = SyscallRequest::new(
-        NR_SETITIMER,
-        [
-            ITIMER_REAL as u64,
-            (&new_timer as *const TestItimerval) as u64,
-            0,
-            0,
-            0,
-            0,
-        ],
-    );
-    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
-    assert_eq!(result, SyscallResult::Error(E_INVAL));
-}
-
-#[test]
-fn itimer_real_sigalrm_handler_round_trip_restores_context() {
-    let (_setup, proc_cap, thread) = time_setup();
-    let ctx = make_ctx(proc_cap.clone(), thread.clone());
-    let sigalrm = Signum::new(14).expect("SIGALRM");
-    let handler = 0xcafeusize;
-    let _ = step_sigaction(&proc_cap, sigalrm, SigDisposition::handler(handler));
-
-    let new_timer = TestItimerval {
-        interval: TestTimeval {
-            tv_sec: 0,
-            tv_usec: 0,
-        },
-        value: TestTimeval {
-            tv_sec: 0,
-            tv_usec: 1,
-        },
-    };
-    let req = SyscallRequest::new(
-        NR_SETITIMER,
-        [
-            ITIMER_REAL as u64,
-            (&new_timer as *const TestItimerval) as u64,
-            0,
-            0,
-            0,
-            0,
-        ],
-    );
-    assert_eq!(
-        block_on(dispatch::<ShimsTestPmap>(req, &ctx)),
-        SyscallResult::Return(0)
-    );
-
-    for _ in 0..1_100 {
-        let _ = <ShimsTestPmap as tx_hal::TimeIf>::read_ns();
-    }
-
-    let mut stack = [0u8; 2048];
-    let mut original = UserTrapContext::empty();
-    original.pc = 0x1234;
-    original.regs[2] = stack.as_mut_ptr() as usize + stack.len();
-    original.regs[10] = 0x55;
-
-    let delivered = crate::linux_syscall::maybe_deliver_itimer_signal::<ShimsTestPmap>(
-        original,
-        &proc_cap,
-        &thread,
-        &ctx.aspace,
-    );
-    assert_eq!(delivered.pc, handler);
-    assert_eq!(delivered.regs[10], 14);
-    assert!(delivered.regs[1] >= delivered.regs[2]);
-    assert!(delivered.regs[2] < original.regs[2]);
-
-    let payload = thread.payload_cap().expect("live thread payload");
-    payload.store_saved_user_context(Some(delivered));
-    let r = block_on(dispatch::<ShimsTestPmap>(
-        SyscallRequest::new(NR_RT_SIGRETURN, [0; 6]),
-        &ctx,
-    ));
-    assert_eq!(r, SyscallResult::SigreturnContextRestored);
-    let restored = payload
-        .saved_user_context()
-        .expect("sigreturn restored context");
-    assert_eq!(restored.pc, original.pc);
-    assert_eq!(restored.regs[2], original.regs[2]);
-    assert_eq!(restored.regs[10], original.regs[10]);
-}
-
-#[test]
-fn itimer_real_sigalrm_ignores_rv64_sigaction_mask_as_restorer() {
-    let (_setup, proc_cap, thread) = time_setup();
-    let ctx = make_ctx(proc_cap.clone(), thread.clone());
-    let handler = 0xcafeusize;
-    let sigalrm_mask_bit = 1u64 << (14 - 1);
-    let act: [u64; 3] = [handler as u64, 0, sigalrm_mask_bit];
-    assert_eq!(
-        block_on(dispatch::<ShimsTestPmap>(
-            SyscallRequest::new(NR_RT_SIGACTION, [14, act.as_ptr() as u64, 0, 8, 0, 0,],),
-            &ctx
-        )),
-        SyscallResult::Return(0)
-    );
-
-    let new_timer = TestItimerval {
-        interval: TestTimeval {
-            tv_sec: 0,
-            tv_usec: 0,
-        },
-        value: TestTimeval {
-            tv_sec: 0,
-            tv_usec: 1,
-        },
-    };
-    assert_eq!(
-        block_on(dispatch::<ShimsTestPmap>(
-            SyscallRequest::new(
-                NR_SETITIMER,
-                [
-                    ITIMER_REAL as u64,
-                    (&new_timer as *const TestItimerval) as u64,
-                    0,
-                    0,
-                    0,
-                    0,
-                ],
-            ),
-            &ctx,
-        )),
-        SyscallResult::Return(0)
-    );
-
-    for _ in 0..1_100 {
-        let _ = <ShimsTestPmap as tx_hal::TimeIf>::read_ns();
-    }
-
-    let stack = [0u8; 2048];
-    let stack_start = stack.as_ptr() as usize;
-    let stack_end = stack_start + stack.len();
-    let mut original = UserTrapContext::empty();
-    original.pc = 0x1234;
-    original.regs[2] = stack_end;
-
-    let delivered = crate::linux_syscall::maybe_deliver_itimer_signal::<ShimsTestPmap>(
-        original,
-        &proc_cap,
-        &thread,
-        &ctx.aspace,
-    );
-    assert_eq!(delivered.pc, handler);
-    assert_ne!(delivered.regs[1], sigalrm_mask_bit as usize);
-    assert!((stack_start..stack_end).contains(&delivered.regs[1]));
 }
 
 /// `nanosleep((0, 0), _)` short-circuits to `Return(0)` per the

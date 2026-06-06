@@ -1,59 +1,15 @@
-use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, Ordering};
+//! Subsystem lock facade.
+//!
+//! Runtime subsystems use this module instead of importing
+//! `tx_substrate::SpinMutex` directly. That keeps lock instrumentation and
+//! future lock-policy swaps behind one local API surface.
 
-pub(crate) struct SpinMutex<T> {
-    locked: AtomicBool,
-    value: UnsafeCell<T>,
-}
+pub(crate) type SpinMutex<T> = tx_substrate::SpinMutex<T>;
 
-unsafe impl<T: Send> Sync for SpinMutex<T> {}
+#[cfg(any(tx_lock_metrics_vm, tx_lock_metrics_process))]
+pub(crate) type ObservedSpinMutex<T> = tx_substrate::SpinMutex<T, tx_substrate::LockMetricsOn>;
 
-impl<T> SpinMutex<T> {
-    pub(crate) const fn new(value: T) -> Self {
-        Self {
-            locked: AtomicBool::new(false),
-            value: UnsafeCell::new(value),
-        }
-    }
-
-    pub(crate) fn lock(&self) -> SpinMutexGuard<'_, T> {
-        while self
-            .locked
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
-        }
-        SpinMutexGuard { mutex: self }
-    }
-}
-
-impl<T: core::fmt::Debug> core::fmt::Debug for SpinMutex<T> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_tuple("SpinMutex").field(&*self.lock()).finish()
-    }
-}
-
-pub(crate) struct SpinMutexGuard<'a, T> {
-    mutex: &'a SpinMutex<T>,
-}
-
-impl<T> core::ops::Deref for SpinMutexGuard<'_, T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        unsafe { &*self.mutex.value.get() }
-    }
-}
-
-impl<T> core::ops::DerefMut for SpinMutexGuard<'_, T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { &mut *self.mutex.value.get() }
-    }
-}
-
-impl<T> Drop for SpinMutexGuard<'_, T> {
-    fn drop(&mut self) {
-        self.mutex.locked.store(false, Ordering::Release);
-    }
+#[cfg(any(tx_lock_metrics_vm, tx_lock_metrics_process))]
+pub(crate) const fn observed_spin_mutex<T>(value: T, name: &'static [u8]) -> ObservedSpinMutex<T> {
+    tx_substrate::SpinMutex::new_observed(value, tx_substrate::LockMetricsOn::new(name))
 }

@@ -17,7 +17,6 @@
 //! - `txdoc:PROCESS-STEP-EXIT-GROUP-1` (PROCESS_v1 §7.3.2).
 
 use alloc::boxed::Box;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
@@ -27,45 +26,31 @@ use std::sync::Mutex;
 use crate::adapter::reactor_entry::userspace::SyscallRequest;
 use crate::adapter::step_engine::{self as step_engine, guard, Cap, StepOutcome};
 use crate::linux_syscall::reset_uts_nodename_for_test;
-use tx_fs::tmpfs::{Tmpfs, TMPFS_ROOT_OBJECT_ID};
 use tx_subsystems::cross_crate_test_support::{
     reset_init_process, reset_pid_counter, reset_reactor_affinity_seam, reset_tid_counter,
 };
 use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use tx_subsystems::execution::Guard;
-use tx_subsystems::mount::{
-    self, FsContextMode, MountApiFileKind, MountFlags, MountIdentity, MountOptions, MountPayload,
-    SourceLabel,
-};
-use tx_subsystems::process::{
-    bootstrap_init_process, step_chdir, ChdirOutcome, ExitStatus, Pid, ProcessIdentity,
-};
-use tx_subsystems::signal::Signum;
+use tx_subsystems::process::{bootstrap_init_process, ExitStatus, Pid, ProcessIdentity};
 use tx_subsystems::thread_runtime::ThreadIdentity;
 use tx_subsystems::tty::execution::{register_console_alias, register_hardware};
-use tx_subsystems::vfs::structure::{
-    BpfMapFile, DEntry, FsNotifyKind, InlineName, InodeKind, InodeMeta, KernelObjectFile,
-    OpenFileBacking, PerfEventFile, RNode, RNodeBacking, StructPayload,
+use tx_subsystems::vfs::{
+    InodeKind, InodeMeta, OpenFile, OpenFileFlags, RNode, RNodeBacking, StructPayload,
 };
-use tx_subsystems::vfs::{FsOps, OpenFile};
 use tx_subsystems::vm::AddressSpace;
 use tx_subsystems::zones;
 
 use super::{
-    dispatch, SyscallCtx, SyscallResult, AT_FDCWD, BPF_MAP_CREATE, BPF_MAP_TYPE_ARRAY,
-    CLONE_CHILD_CLEARTID, CLONE_CHILD_SETTID, CLONE_PARENT_SETTID, EBADF_VALUE, EFAULT_VALUE,
-    EINVAL_VALUE, ENODEV_VALUE, ENOENT_VALUE, ENOSYS_VALUE, FAN_CLASS_CONTENT, FAN_CLASS_NOTIF,
-    FAN_CLOEXEC, FAN_NONBLOCK, FD_CLOEXEC, FSOPEN_CLOEXEC, FSPICK_CLOEXEC, FSPICK_NO_AUTOMOUNT,
-    F_GETFD, F_GETFL, F_SETFD, IN_CLOEXEC, IN_NONBLOCK, MFD_ALLOW_SEALING, MFD_CLOEXEC, NR_ACCEPT,
-    NR_BPF, NR_BRK, NR_CLONE, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP, NR_FANOTIFY_INIT, NR_FCNTL,
-    NR_FSOPEN, NR_FSPICK, NR_GETPGID, NR_GETPGRP, NR_GETPID, NR_GETPPID, NR_GETSID,
-    NR_GET_ROBUST_LIST, NR_INOTIFY_INIT1, NR_MEMBARRIER, NR_MEMFD_CREATE, NR_MEMFD_SECRET,
-    NR_OPEN_TREE, NR_PERF_EVENT_OPEN, NR_PIDFD_OPEN, NR_PIPE2, NR_PPOLL, NR_READ, NR_RT_SIGACTION,
-    NR_RT_SIGPROCMASK, NR_RT_SIGTIMEDWAIT, NR_SCHED_GETAFFINITY, NR_SCHED_SETAFFINITY,
-    NR_SCHED_YIELD, NR_SETPGID, NR_SETSID, NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS,
-    NR_TIMERFD_CREATE, NR_WAIT4, NR_WRITE, NR_WRITEV, OPEN_TREE_CLOEXEC, OPEN_TREE_CLONE,
-    O_DIRECTORY, O_NONBLOCK, O_RDONLY, O_RDWR, PERF_COUNT_SW_CPU_CLOCK, PERF_TYPE_SOFTWARE,
-    PIDFD_NONBLOCK, SIGCHLD, WNOHANG,
+    dispatch, dispatch_cap_only_immediate, dispatch_clone_oneshot,
+    dispatch_direct_trap_payload_oneshot, dispatch_process_aspace_immediate,
+    dispatch_thread_aspace_oneshot, dispatch_thread_payload_aspace_oneshot, dispatch_vm_hot,
+    dispatch_writev_hot, SyscallCtx, SyscallResult, BRK_LINEAR_HEAP_SOFT_LIMIT_BYTES, CLONE_VFORK,
+    EINVAL_VALUE, ENOSYS_VALUE, FD_CLOEXEC, F_GETFD, F_SETFD, NR_BRK, NR_CLONE, NR_EXECVE, NR_EXIT,
+    NR_EXIT_GROUP, NR_FCNTL, NR_GETPGID, NR_GETPID, NR_GETPPID, NR_GETSID, NR_GET_ROBUST_LIST,
+    NR_MEMBARRIER, NR_READ, NR_RT_SIGACTION, NR_RT_SIGPROCMASK, NR_SCHED_GETAFFINITY,
+    NR_SCHED_SETAFFINITY, NR_SETPGID, NR_SETSID, NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS,
+    NR_TIMERFD_CREATE, NR_TX_OBSERVE_BEGIN, NR_TX_OBSERVE_TRACE_OFF, NR_TX_OBSERVE_TRACE_ON,
+    NR_WAIT4, NR_WRITE, NR_WRITEV, SIGCHLD, WNOHANG,
 };
 
 // ---------------------------------------------------------------------------
@@ -233,13 +218,13 @@ fn setup() -> TestSetup {
     reset_tid_counter();
     reset_init_process();
     reset_reactor_affinity_seam();
+    tx_subsystems::wall_clock::reset_for_test();
     reset_uts_nodename_for_test();
     tx_subsystems::net::reset_initial_net_namespace_for_test();
     tx_subsystems::net::initial_loopback_iface().clear_for_test_or_bootstrap();
     tx_subsystems::net::device::reset_net_registry_for_test();
     tx_subsystems::net::reset_netfilter_for_test();
     super::reset_itimer_registry_for_test();
-    super::reset_sigaction_restorers_for_test();
     TestSetup { _lock: lock }
 }
 
@@ -251,52 +236,6 @@ fn bootstrap() -> Cap<ProcessIdentity> {
     bootstrap_init_process(fresh_aspace()).expect("bootstrap init")
 }
 
-fn build_mount_api_test_root() -> (Cap<DEntry>, Cap<MountIdentity>) {
-    let tmpfs = Arc::new(Tmpfs::new());
-    let payload = MountPayload::new_cap(
-        tmpfs.clone() as Arc<dyn FsOps>,
-        tmpfs as Arc<dyn tx_subsystems::page_backed::FsPageBacking>,
-        None,
-        mount::allocate_dev_id(),
-        MountOptions::default(),
-        "tmpfs",
-        SourceLabel::Static("tmpfs"),
-    )
-    .expect("mount payload");
-
-    let root_rnode = {
-        let raw = RNode::new(
-            TMPFS_ROOT_OBJECT_ID,
-            InodeMeta::new(InodeKind::Directory, 0o755),
-            RNodeBacking::Directory,
-        )
-        .with_containing_mount(&payload);
-        let res = step_engine::reserve_for::<RNode>().expect("rnode reservation");
-        step_engine::sign_for(res, raw)
-    };
-    let root_mount = MountIdentity::new_cap(
-        mount::allocate_mount_id(),
-        None,
-        root_rnode.clone(),
-        None,
-        payload,
-        MountFlags::empty(),
-    )
-    .expect("root mount identity");
-    let root_dentry = DEntry::new_cap(InlineName::ROOT, root_rnode).expect("root dentry");
-    (root_dentry, root_mount)
-}
-
-fn bootstrap_with_cwd(root_dentry: Cap<DEntry>) -> (Cap<ProcessIdentity>, Cap<ThreadIdentity>) {
-    let process = bootstrap();
-    let thread = first_thread(&process);
-    match step_chdir(&process, root_dentry) {
-        ChdirOutcome::Replaced { .. } => {}
-        ChdirOutcome::ZombieIgnored => panic!("init bootstrap zombified"),
-    }
-    (process, thread)
-}
-
 fn first_thread(proc_cap: &Cap<ProcessIdentity>) -> Cap<ThreadIdentity> {
     proc_cap
         .nth_thread(0)
@@ -306,6 +245,32 @@ fn first_thread(proc_cap: &Cap<ProcessIdentity>) -> Cap<ThreadIdentity> {
 fn make_ctx(process: Cap<ProcessIdentity>, thread: Cap<ThreadIdentity>) -> SyscallCtx<'static> {
     let aspace = process.aspace_cap().expect("alive aspace");
     SyscallCtx::new(process, thread, aspace)
+}
+
+#[test]
+fn dispatch_writev_hot_routes_only_writev() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread);
+
+    assert_eq!(
+        block_on(dispatch_writev_hot(
+            SyscallRequest::new(NR_WRITE, [3, 0, 1, 0, 0, 0]),
+            &ctx
+        )),
+        None,
+        "writev hot lane must not accept plain write"
+    );
+
+    assert_eq!(
+        block_on(dispatch_writev_hot(
+            SyscallRequest::new(NR_WRITEV, [3, 0, 1025, 0, 0, 0]),
+            &ctx
+        )),
+        Some(SyscallResult::Error(EINVAL_VALUE)),
+        "writev hot lane must preserve sys_writev argument validation"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -351,6 +316,58 @@ impl CharDeviceOps for CapturingOps {
             .extend_from_slice(bytes);
         StepOutcome::Done(bytes.len())
     }
+}
+
+struct PanicCharOps;
+
+impl CharDeviceOps for PanicCharOps {
+    fn read(
+        &self,
+        _out: &mut [u8],
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<usize, step_engine::ByteProgress> {
+        panic!("static char-device read should be handled before VFS drive")
+    }
+
+    fn write(
+        &self,
+        _bytes: &[u8],
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<usize, step_engine::ByteProgress> {
+        panic!("static char-device write should be handled before VFS drive")
+    }
+}
+
+static PANIC_CHAR_OPS: PanicCharOps = PanicCharOps;
+static TEST_NULL_BINDING: CharDeviceBinding = CharDeviceBinding {
+    devt: DevT::new(1, 3),
+    name: "null",
+    ops: &PANIC_CHAR_OPS,
+};
+static TEST_ZERO_BINDING: CharDeviceBinding = CharDeviceBinding {
+    devt: DevT::new(1, 5),
+    name: "zero",
+    ops: &PANIC_CHAR_OPS,
+};
+
+fn static_char_file(binding: &'static CharDeviceBinding, read: bool, write: bool) -> Cap<OpenFile> {
+    let rnode = RNode::new_cap(
+        tx_subsystems::vfs::FsObjectId::new(binding.devt.raw()),
+        InodeMeta::new(InodeKind::CharDevice, 0o020666),
+        RNodeBacking::StructBacked {
+            payload: StructPayload::CharDevice(binding),
+        },
+    )
+    .expect("static char rnode");
+    OpenFile::new_cap(
+        rnode,
+        OpenFileFlags {
+            read,
+            write,
+            ..OpenFileFlags::default()
+        },
+    )
+    .expect("static char open file")
 }
 
 fn install_capturing_console() -> &'static CapturingOps {
@@ -451,34 +468,92 @@ fn dispatch_write_one_to_console_returns_byte_count() {
     );
 }
 
-/// `writev(1, iov, 2)` uses the stdout/stderr TTY fast path. The
-/// combined buffer is kernel-owned after iovec gather, so this verifies
-/// that the fast path writes those bytes directly instead of feeding a
-/// kernel pointer back through the user-buffer `write(2)` lane.
 #[test]
-fn dispatch_writev_stdout_tty_fast_path_writes_combined_buffer() {
+fn dispatch_write_dev_null_fast_path_returns_count_without_user_copy() {
     let _setup = setup();
-    let ops = install_capturing_console();
-
     let proc_cap = bootstrap();
     let thread = first_thread(&proc_cap);
-    proc_cap.set_fd(1, Some(tx_fs::devfs::open_console_for_init()));
-
+    proc_cap.set_fd(3, Some(static_char_file(&TEST_NULL_BINDING, false, true)));
     let ctx = make_ctx(proc_cap, thread);
-    let part1: &[u8] = b"netperf ";
-    let part2: &[u8] = b"row\n";
-    let iov = [
-        part1.as_ptr() as u64,
-        part1.len() as u64,
-        part2.as_ptr() as u64,
-        part2.len() as u64,
-    ];
-    let req = SyscallRequest::new(NR_WRITEV, [1, iov.as_ptr() as u64, 2, 0, 0, 0]);
 
-    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_WRITE, [3, 0, 7, 0, 0, 0]),
+        &ctx,
+    ));
 
-    assert_eq!(result, SyscallResult::Return(12));
-    assert_eq!(ops.snapshot(), b"netperf row\r\n");
+    assert_eq!(result, SyscallResult::Return(7));
+}
+
+#[test]
+fn process_aspace_immediate_write_dev_null_returns_count_without_user_copy() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    proc_cap.set_fd(3, Some(static_char_file(&TEST_NULL_BINDING, false, true)));
+    let aspace = proc_cap.aspace_cap().expect("alive aspace");
+
+    let result = dispatch_process_aspace_immediate(
+        &SyscallRequest::new(NR_WRITE, [3, 0, 7, 0, 0, 0]),
+        &proc_cap,
+        &aspace,
+    );
+
+    assert_eq!(result, Some(SyscallResult::Return(7)));
+}
+
+#[test]
+fn cap_only_immediate_write_dev_null_returns_count_without_aspace() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    proc_cap.set_fd(3, Some(static_char_file(&TEST_NULL_BINDING, false, true)));
+
+    let result = dispatch_cap_only_immediate(
+        &SyscallRequest::new(NR_WRITE, [3, 0, 7, 0, 0, 0]),
+        &proc_cap,
+    );
+
+    assert_eq!(result, Some(SyscallResult::Return(7)));
+}
+
+#[test]
+fn dispatch_read_dev_zero_fast_path_fills_user_buffer_without_vfs_drive() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    proc_cap.set_fd(4, Some(static_char_file(&TEST_ZERO_BINDING, true, false)));
+    let ctx = make_ctx(proc_cap, thread);
+    let mut buf = [0xAAu8; 8];
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_READ,
+            [4, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0],
+        ),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Return(8));
+    assert_eq!(buf, [0u8; 8]);
+}
+
+#[test]
+fn process_aspace_immediate_read_dev_zero_fills_user_buffer() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    proc_cap.set_fd(4, Some(static_char_file(&TEST_ZERO_BINDING, true, false)));
+    let aspace = proc_cap.aspace_cap().expect("alive aspace");
+    let mut buf = [0xAAu8; 8];
+
+    let result = dispatch_process_aspace_immediate(
+        &SyscallRequest::new(
+            NR_READ,
+            [4, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0],
+        ),
+        &proc_cap,
+        &aspace,
+    );
+
+    assert_eq!(result, Some(SyscallResult::Return(8)));
+    assert_eq!(buf, [0u8; 8]);
 }
 
 /// `exit_group(0)` zombifies the process at once and records
@@ -561,625 +636,88 @@ fn dispatch_unknown_nr_returns_neg_enosys() {
 }
 
 #[test]
-fn dispatch_pidfd_open_installs_pidfd_backing_for_self() {
+fn dispatch_tx_observe_begin_private_syscall_returns_success() {
     let _setup = setup();
-    let proc_cap = bootstrap();
-    let thread = first_thread(&proc_cap);
-    let ctx = make_ctx(proc_cap.clone(), thread);
-    let req = SyscallRequest::new(NR_PIDFD_OPEN, [proc_cap.pid.0 as u64, 0, 0, 0, 0, 0]);
 
-    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
-    let fd = match result {
-        SyscallResult::Return(fd) => fd as u32,
-        other => panic!("pidfd_open failed: {other:?}"),
-    };
-    let file = proc_cap.fd(fd).expect("pidfd installed");
-    match file.backing() {
-        OpenFileBacking::Pidfd { process } => assert_eq!(process.pid, proc_cap.pid),
-        other => panic!("expected pidfd backing, got {other:?}"),
-    }
-    assert!(proc_cap.fd_cloexec(fd));
-    let flags = file.flags();
-    assert!(flags.read);
-    assert!(!flags.write);
-    assert!(flags.cloexec);
-    assert!(!flags.nonblocking);
-}
-
-#[test]
-fn dispatch_pidfd_open_honours_nonblock_and_rejects_unknown_flags() {
-    let _setup = setup();
-    let proc_cap = bootstrap();
-    let thread = first_thread(&proc_cap);
-    let ctx = make_ctx(proc_cap.clone(), thread);
-
-    let invalid = SyscallRequest::new(NR_PIDFD_OPEN, [proc_cap.pid.0 as u64, 1, 0, 0, 0, 0]);
-    assert_eq!(
-        block_on(dispatch::<ShimsTestPmap>(invalid, &ctx)),
-        SyscallResult::Error(EINVAL_VALUE)
-    );
-
-    let req = SyscallRequest::new(
-        NR_PIDFD_OPEN,
-        [proc_cap.pid.0 as u64, PIDFD_NONBLOCK as u64, 0, 0, 0, 0],
-    );
-    let fd = match block_on(dispatch::<ShimsTestPmap>(req, &ctx)) {
-        SyscallResult::Return(fd) => fd as u32,
-        other => panic!("pidfd_open(O_NONBLOCK) failed: {other:?}"),
-    };
-    let file = proc_cap.fd(fd).expect("pidfd installed");
-    assert!(file.flags().nonblocking);
-    assert!(proc_cap.fd_cloexec(fd));
-
-    let getfl = SyscallRequest::new(NR_FCNTL, [fd as u64, F_GETFL as u64, 0, 0, 0, 0]);
-    assert_eq!(
-        block_on(dispatch::<ShimsTestPmap>(getfl, &ctx)),
-        SyscallResult::Return(O_NONBLOCK as i64)
-    );
-}
-
-#[test]
-fn dispatch_inotify_init1_installs_typed_fsnotify_fd() {
-    let _setup = setup();
-    let proc_cap = bootstrap();
-    let thread = first_thread(&proc_cap);
-    let ctx = make_ctx(proc_cap.clone(), thread);
-
-    let invalid = SyscallRequest::new(NR_INOTIFY_INIT1, [0x100, 0, 0, 0, 0, 0]);
-    assert_eq!(
-        block_on(dispatch::<ShimsTestPmap>(invalid, &ctx)),
-        SyscallResult::Error(EINVAL_VALUE)
-    );
-
-    let req = SyscallRequest::new(
-        NR_INOTIFY_INIT1,
-        [(IN_CLOEXEC | IN_NONBLOCK) as u64, 0, 0, 0, 0, 0],
-    );
-    let fd = match block_on(dispatch::<ShimsTestPmap>(req, &ctx)) {
-        SyscallResult::Return(fd) => fd as u32,
-        other => panic!("inotify_init1 failed: {other:?}"),
-    };
-    let file = proc_cap.fd(fd).expect("inotify fd installed");
-    match file.rnode().backing() {
-        RNodeBacking::StructBacked {
-            payload: StructPayload::FsNotify { instance },
-        } => assert_eq!(instance.kind(), FsNotifyKind::Inotify),
-        other => panic!("expected inotify fsnotify backing, got {other:?}"),
-    }
-    assert!(file.flags().read);
-    assert!(!file.flags().write);
-    assert!(file.flags().cloexec);
-    assert!(file.flags().nonblocking);
-    assert!(proc_cap.fd_cloexec(fd));
-
-    let getfd = SyscallRequest::new(NR_FCNTL, [fd as u64, F_GETFD as u64, 0, 0, 0, 0]);
-    assert_eq!(
-        block_on(dispatch::<ShimsTestPmap>(getfd, &ctx)),
-        SyscallResult::Return(FD_CLOEXEC as i64)
-    );
-    let getfl = SyscallRequest::new(NR_FCNTL, [fd as u64, F_GETFL as u64, 0, 0, 0, 0]);
-    assert_eq!(
-        block_on(dispatch::<ShimsTestPmap>(getfl, &ctx)),
-        SyscallResult::Return(O_NONBLOCK as i64)
-    );
-    let accept = SyscallRequest::new(NR_ACCEPT, [fd as u64, 0, 0, 0, 0, 0]);
-    assert_eq!(
-        block_on(dispatch::<ShimsTestPmap>(accept, &ctx)),
-        SyscallResult::Error(88)
-    );
-}
-
-#[test]
-fn dispatch_fanotify_init_installs_notification_class_fd() {
-    let _setup = setup();
-    let proc_cap = bootstrap();
-    let thread = first_thread(&proc_cap);
-    let ctx = make_ctx(proc_cap.clone(), thread);
-
-    let unsupported_class = SyscallRequest::new(
-        NR_FANOTIFY_INIT,
-        [FAN_CLASS_CONTENT as u64, O_RDONLY as u64, 0, 0, 0, 0],
-    );
-    assert_eq!(
-        block_on(dispatch::<ShimsTestPmap>(unsupported_class, &ctx)),
-        SyscallResult::Error(EINVAL_VALUE)
-    );
-
-    let unsupported_event_flags = SyscallRequest::new(
-        NR_FANOTIFY_INIT,
-        [FAN_CLASS_NOTIF as u64, O_RDWR as u64, 0, 0, 0, 0],
-    );
-    assert_eq!(
-        block_on(dispatch::<ShimsTestPmap>(unsupported_event_flags, &ctx)),
-        SyscallResult::Error(EINVAL_VALUE)
-    );
-
-    let req = SyscallRequest::new(
-        NR_FANOTIFY_INIT,
-        [
-            (FAN_CLASS_NOTIF | FAN_CLOEXEC | FAN_NONBLOCK) as u64,
-            O_RDONLY as u64,
-            0,
-            0,
-            0,
-            0,
-        ],
-    );
-    let fd = match block_on(dispatch::<ShimsTestPmap>(req, &ctx)) {
-        SyscallResult::Return(fd) => fd as u32,
-        other => panic!("fanotify_init failed: {other:?}"),
-    };
-    let file = proc_cap.fd(fd).expect("fanotify fd installed");
-    match file.rnode().backing() {
-        RNodeBacking::StructBacked {
-            payload: StructPayload::FsNotify { instance },
-        } => assert_eq!(instance.kind(), FsNotifyKind::Fanotify),
-        other => panic!("expected fanotify fsnotify backing, got {other:?}"),
-    }
-    assert!(file.flags().read);
-    assert!(!file.flags().write);
-    assert!(file.flags().cloexec);
-    assert!(file.flags().nonblocking);
-    assert!(proc_cap.fd_cloexec(fd));
-
-    let accept = SyscallRequest::new(NR_ACCEPT, [fd as u64, 0, 0, 0, 0, 0]);
-    assert_eq!(
-        block_on(dispatch::<ShimsTestPmap>(accept, &ctx)),
-        SyscallResult::Error(88)
-    );
-}
-
-#[test]
-fn dispatch_fsopen_installs_mount_context_fd() {
-    let _setup = setup();
-    let proc_cap = bootstrap();
-    let thread = first_thread(&proc_cap);
-    let ctx = make_ctx(proc_cap.clone(), thread);
-    let ext2 = b"ext2\0";
-    let invalid_fs = b"invalid\0";
-
-    let invalid_flags = SyscallRequest::new(NR_FSOPEN, [ext2.as_ptr() as u64, 0x10, 0, 0, 0, 0]);
-    assert_eq!(
-        block_on(dispatch::<ShimsTestPmap>(invalid_flags, &ctx)),
-        SyscallResult::Error(EINVAL_VALUE)
-    );
-
-    let invalid_fs_req =
-        SyscallRequest::new(NR_FSOPEN, [invalid_fs.as_ptr() as u64, 0, 0, 0, 0, 0]);
-    assert_eq!(
-        block_on(dispatch::<ShimsTestPmap>(invalid_fs_req, &ctx)),
-        SyscallResult::Error(ENODEV_VALUE)
-    );
-
-    let req = SyscallRequest::new(
-        NR_FSOPEN,
-        [ext2.as_ptr() as u64, FSOPEN_CLOEXEC as u64, 0, 0, 0, 0],
-    );
-    let fd = match block_on(dispatch::<ShimsTestPmap>(req, &ctx)) {
-        SyscallResult::Return(fd) => fd as u32,
-        other => panic!("fsopen(ext2) failed: {other:?}"),
-    };
-    let file = proc_cap.fd(fd).expect("fsopen fd installed");
-    match file.backing() {
-        OpenFileBacking::MountApi { file } => {
-            assert_eq!(file.kind(), MountApiFileKind::FsContext);
-            assert_eq!(file.mode(), Some(FsContextMode::New));
-            assert_eq!(file.fstype(), "ext2");
-        }
-        other => panic!("expected mount-api fs-context backing, got {other:?}"),
-    }
-    assert!(file.flags().read);
-    assert!(file.flags().write);
-    assert!(file.flags().cloexec);
-    assert!(proc_cap.fd_cloexec(fd));
-
-    let accept = SyscallRequest::new(NR_ACCEPT, [fd as u64, 0, 0, 0, 0, 0]);
-    assert_eq!(
-        block_on(dispatch::<ShimsTestPmap>(accept, &ctx)),
-        SyscallResult::Error(88)
-    );
-}
-
-#[test]
-fn dispatch_fspick_installs_reconfigure_context_fd() {
-    let _setup = setup();
-    let (root_dentry, _root_mount) = build_mount_api_test_root();
-    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
-    let ctx = make_ctx(proc_cap.clone(), thread);
-    let root = b"/\0";
-    let relative = b"mntpoint\0";
-    let missing = b"/definitely-not-present\0";
-
-    let invalid_flags = SyscallRequest::new(
-        NR_FSPICK,
-        [AT_FDCWD as u64, root.as_ptr() as u64, 0x10, 0, 0, 0],
-    );
-    assert_eq!(
-        block_on(dispatch::<ShimsTestPmap>(invalid_flags, &ctx)),
-        SyscallResult::Error(EINVAL_VALUE)
-    );
-
-    let invalid_fd = SyscallRequest::new(
-        NR_FSPICK,
-        [
-            (-1_i64) as u64,
-            relative.as_ptr() as u64,
-            (FSPICK_CLOEXEC | FSPICK_NO_AUTOMOUNT) as u64,
-            0,
-            0,
-            0,
-        ],
-    );
-    assert_eq!(
-        block_on(dispatch::<ShimsTestPmap>(invalid_fd, &ctx)),
-        SyscallResult::Error(EBADF_VALUE)
-    );
-
-    let invalid_path = SyscallRequest::new(
-        NR_FSPICK,
-        [
-            AT_FDCWD as u64,
-            missing.as_ptr() as u64,
-            FSPICK_NO_AUTOMOUNT as u64,
-            0,
-            0,
-            0,
-        ],
-    );
-    assert_eq!(
-        block_on(dispatch::<ShimsTestPmap>(invalid_path, &ctx)),
-        SyscallResult::Error(ENOENT_VALUE)
-    );
-
-    let req = SyscallRequest::new(
-        NR_FSPICK,
-        [
-            AT_FDCWD as u64,
-            root.as_ptr() as u64,
-            (FSPICK_CLOEXEC | FSPICK_NO_AUTOMOUNT) as u64,
-            0,
-            0,
-            0,
-        ],
-    );
-    let fd = match block_on(dispatch::<ShimsTestPmap>(req, &ctx)) {
-        SyscallResult::Return(fd) => fd as u32,
-        other => panic!("fspick(/) failed: {other:?}"),
-    };
-    let file = proc_cap.fd(fd).expect("fspick fd installed");
-    match file.backing() {
-        OpenFileBacking::MountApi { file } => {
-            assert_eq!(file.kind(), MountApiFileKind::FsContext);
-            assert_eq!(file.mode(), Some(FsContextMode::Reconfigure));
-            assert!(!file.fstype().is_empty());
-        }
-        other => panic!("expected mount-api reconfigure backing, got {other:?}"),
-    }
-    assert!(file.flags().read);
-    assert!(file.flags().write);
-    assert!(file.flags().cloexec);
-    assert!(proc_cap.fd_cloexec(fd));
-
-    let accept = SyscallRequest::new(NR_ACCEPT, [fd as u64, 0, 0, 0, 0, 0]);
-    assert_eq!(
-        block_on(dispatch::<ShimsTestPmap>(accept, &ctx)),
-        SyscallResult::Error(88)
-    );
-}
-
-#[test]
-fn dispatch_open_tree_installs_path_only_mount_fd() {
-    let _setup = setup();
-    let (root_dentry, _root_mount) = build_mount_api_test_root();
-    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
-    let ctx = make_ctx(proc_cap.clone(), thread);
-    let root = b"/\0";
-    let relative = b"mntpoint\0";
-    let missing = b"/definitely-not-present\0";
-
-    let invalid_flags = SyscallRequest::new(
-        NR_OPEN_TREE,
-        [AT_FDCWD as u64, root.as_ptr() as u64, 0xffff_ffff, 0, 0, 0],
-    );
-    assert_eq!(
-        block_on(dispatch::<ShimsTestPmap>(invalid_flags, &ctx)),
-        SyscallResult::Error(EINVAL_VALUE)
-    );
-
-    let invalid_fd = SyscallRequest::new(
-        NR_OPEN_TREE,
-        [
-            (-1_i64) as u64,
-            relative.as_ptr() as u64,
-            OPEN_TREE_CLONE as u64,
-            0,
-            0,
-            0,
-        ],
-    );
-    assert_eq!(
-        block_on(dispatch::<ShimsTestPmap>(invalid_fd, &ctx)),
-        SyscallResult::Error(EBADF_VALUE)
-    );
-
-    let invalid_path = SyscallRequest::new(
-        NR_OPEN_TREE,
-        [
-            AT_FDCWD as u64,
-            missing.as_ptr() as u64,
-            OPEN_TREE_CLONE as u64,
-            0,
-            0,
-            0,
-        ],
-    );
-    assert_eq!(
-        block_on(dispatch::<ShimsTestPmap>(invalid_path, &ctx)),
-        SyscallResult::Error(ENOENT_VALUE)
-    );
-
-    let req = SyscallRequest::new(
-        NR_OPEN_TREE,
-        [
-            AT_FDCWD as u64,
-            root.as_ptr() as u64,
-            OPEN_TREE_CLOEXEC as u64,
-            0,
-            0,
-            0,
-        ],
-    );
-    let fd = match block_on(dispatch::<ShimsTestPmap>(req, &ctx)) {
-        SyscallResult::Return(fd) => fd as u32,
-        other => panic!("open_tree(/) failed: {other:?}"),
-    };
-    let file = proc_cap.fd(fd).expect("open_tree fd installed");
-    match file.backing() {
-        OpenFileBacking::MountApi { file } => {
-            assert_eq!(file.kind(), MountApiFileKind::OpenTree);
-            assert!(!file.fstype().is_empty());
-        }
-        other => panic!("expected mount-api open_tree backing, got {other:?}"),
-    }
-    assert!(!file.flags().read);
-    assert!(!file.flags().write);
-    assert!(file.flags().cloexec);
-    assert!(proc_cap.fd_cloexec(fd));
-
-    let accept = SyscallRequest::new(NR_ACCEPT, [fd as u64, 0, 0, 0, 0, 0]);
-    assert_eq!(
-        block_on(dispatch::<ShimsTestPmap>(accept, &ctx)),
-        SyscallResult::Error(EBADF_VALUE)
-    );
-}
-
-#[test]
-fn dispatch_memfd_create_installs_anon_pagebacked_file() {
-    let _setup = setup();
-    let proc_cap = bootstrap();
-    let thread = first_thread(&proc_cap);
-    let ctx = make_ctx(proc_cap.clone(), thread);
-    let name = b"ltp_memfd\0";
-
-    let req = SyscallRequest::new(NR_MEMFD_CREATE, [name.as_ptr() as u64, 0, 0, 0, 0, 0]);
-    let fd = match block_on(dispatch::<ShimsTestPmap>(req, &ctx)) {
-        SyscallResult::Return(fd) => fd as u32,
-        other => panic!("memfd_create failed: {other:?}"),
-    };
-    let file = proc_cap.fd(fd).expect("memfd installed");
-    assert!(!proc_cap.fd_cloexec(fd));
-    let flags = file.flags();
-    assert!(flags.read);
-    assert!(flags.write);
-    assert!(!flags.cloexec);
-    match file.rnode().backing() {
-        RNodeBacking::PageBacked { pc } => {
-            assert!(matches!(
-                pc.kind(),
-                tx_subsystems::page_backed::PageContainerKind::Anon { .. }
-            ));
-            assert_eq!(pc.size_bytes(), 0);
-        }
-        other => panic!("expected PageBacked memfd rnode, got {other:?}"),
-    }
-}
-
-#[test]
-fn dispatch_memfd_create_validates_name_flags_and_cloexec() {
-    let _setup = setup();
-    let proc_cap = bootstrap();
-    let thread = first_thread(&proc_cap);
-    let ctx = make_ctx(proc_cap.clone(), thread);
-    let name = b"test\0";
-
-    let null_name = SyscallRequest::new(NR_MEMFD_CREATE, [0, 0, 0, 0, 0, 0]);
-    assert_eq!(
-        block_on(dispatch::<ShimsTestPmap>(null_name, &ctx)),
-        SyscallResult::Error(EFAULT_VALUE)
-    );
-
-    let sealing = SyscallRequest::new(
-        NR_MEMFD_CREATE,
-        [name.as_ptr() as u64, MFD_ALLOW_SEALING as u64, 0, 0, 0, 0],
-    );
-    assert_eq!(
-        block_on(dispatch::<ShimsTestPmap>(sealing, &ctx)),
-        SyscallResult::Error(EINVAL_VALUE)
-    );
-
-    let unknown = SyscallRequest::new(NR_MEMFD_CREATE, [name.as_ptr() as u64, 0x100, 0, 0, 0, 0]);
-    assert_eq!(
-        block_on(dispatch::<ShimsTestPmap>(unknown, &ctx)),
-        SyscallResult::Error(EINVAL_VALUE)
-    );
-
-    let cloexec = SyscallRequest::new(
-        NR_MEMFD_CREATE,
-        [name.as_ptr() as u64, MFD_CLOEXEC as u64, 0, 0, 0, 0],
-    );
-    let fd = match block_on(dispatch::<ShimsTestPmap>(cloexec, &ctx)) {
-        SyscallResult::Return(fd) => fd as u32,
-        other => panic!("memfd_create(MFD_CLOEXEC) failed: {other:?}"),
-    };
-    assert!(proc_cap.fd_cloexec(fd));
-    assert!(proc_cap.fd(fd).expect("memfd installed").flags().cloexec);
-}
-
-#[test]
-fn dispatch_perf_event_open_installs_non_socket_kernel_object_fd() {
-    let _setup = setup();
-    let proc_cap = bootstrap();
-    let thread = first_thread(&proc_cap);
-    let ctx = make_ctx(proc_cap.clone(), thread);
-
-    let mut attr = [0u8; 48];
-    let attr_len = attr.len() as u32;
-    attr[0..4].copy_from_slice(&PERF_TYPE_SOFTWARE.to_le_bytes());
-    attr[4..8].copy_from_slice(&attr_len.to_le_bytes());
-    attr[8..16].copy_from_slice(&PERF_COUNT_SW_CPU_CLOCK.to_le_bytes());
-    attr[40..48].copy_from_slice(&((1u64 << 0) | (1u64 << 5) | (1u64 << 6)).to_le_bytes());
-
-    let req = SyscallRequest::new(
-        NR_PERF_EVENT_OPEN,
-        [
-            attr.as_ptr() as u64,
-            0,
-            (-1i64) as u64,
-            (-1i64) as u64,
-            0,
-            0,
-        ],
-    );
-    let fd = match block_on(dispatch::<ShimsTestPmap>(req, &ctx)) {
-        SyscallResult::Return(fd) => fd as u32,
-        other => panic!("perf_event_open failed: {other:?}"),
-    };
-    let file = proc_cap.fd(fd).expect("perf event fd installed");
-    assert_eq!(
-        file.kernel_object(),
-        Some(&KernelObjectFile::PerfEvent(PerfEventFile {
-            attr_type: PERF_TYPE_SOFTWARE,
-            config: PERF_COUNT_SW_CPU_CLOCK,
-            pid: 0,
-            cpu: -1,
-            group_fd: -1,
-            flags: 0,
-        }))
-    );
-
-    let accept = SyscallRequest::new(NR_ACCEPT, [fd as u64, 0, 0, 0, 0, 0]);
-    assert_eq!(
-        block_on(dispatch::<ShimsTestPmap>(accept, &ctx)),
-        SyscallResult::Error(88)
-    );
-}
-
-#[test]
-fn dispatch_bpf_map_create_installs_non_socket_kernel_object_fd() {
-    let _setup = setup();
-    let proc_cap = bootstrap();
-    let thread = first_thread(&proc_cap);
-    let ctx = make_ctx(proc_cap.clone(), thread);
-
-    let mut attr = [0u8; 20];
-    attr[0..4].copy_from_slice(&BPF_MAP_TYPE_ARRAY.to_le_bytes());
-    attr[4..8].copy_from_slice(&4u32.to_le_bytes());
-    attr[8..12].copy_from_slice(&8u32.to_le_bytes());
-    attr[12..16].copy_from_slice(&1u32.to_le_bytes());
-
-    let req = SyscallRequest::new(
-        NR_BPF,
-        [
-            BPF_MAP_CREATE as u64,
-            attr.as_ptr() as u64,
-            attr.len() as u64,
-            0,
-            0,
-            0,
-        ],
-    );
-    let fd = match block_on(dispatch::<ShimsTestPmap>(req, &ctx)) {
-        SyscallResult::Return(fd) => fd as u32,
-        other => panic!("bpf(BPF_MAP_CREATE) failed: {other:?}"),
-    };
-    let file = proc_cap.fd(fd).expect("bpf map fd installed");
-    assert_eq!(
-        file.kernel_object(),
-        Some(&KernelObjectFile::BpfMap(BpfMapFile {
-            map_type: BPF_MAP_TYPE_ARRAY,
-            key_size: 4,
-            value_size: 8,
-            max_entries: 1,
-            map_flags: 0,
-        }))
-    );
-
-    let accept = SyscallRequest::new(NR_ACCEPT, [fd as u64, 0, 0, 0, 0, 0]);
-    assert_eq!(
-        block_on(dispatch::<ShimsTestPmap>(accept, &ctx)),
-        SyscallResult::Error(88)
-    );
-}
-
-#[test]
-fn dispatch_memfd_secret_installs_non_socket_pagebacked_file() {
-    let _setup = setup();
-    let proc_cap = bootstrap();
-    let thread = first_thread(&proc_cap);
-    let ctx = make_ctx(proc_cap.clone(), thread);
-
-    let invalid_flags = SyscallRequest::new(NR_MEMFD_SECRET, [1, 0, 0, 0, 0, 0]);
-    assert_eq!(
-        block_on(dispatch::<ShimsTestPmap>(invalid_flags, &ctx)),
-        SyscallResult::Error(EINVAL_VALUE)
-    );
-
-    let req = SyscallRequest::new(NR_MEMFD_SECRET, [0, 0, 0, 0, 0, 0]);
-    let fd = match block_on(dispatch::<ShimsTestPmap>(req, &ctx)) {
-        SyscallResult::Return(fd) => fd as u32,
-        other => panic!("memfd_secret failed: {other:?}"),
-    };
-    let file = proc_cap.fd(fd).expect("memfd_secret fd installed");
-    let flags = file.flags();
-    assert!(flags.read);
-    assert!(flags.write);
-    assert!(!flags.cloexec);
-    match file.rnode().backing() {
-        RNodeBacking::PageBacked { pc } => {
-            assert!(matches!(
-                pc.kind(),
-                tx_subsystems::page_backed::PageContainerKind::Anon { .. }
-            ));
-            assert_eq!(pc.size_bytes(), 0);
-        }
-        other => panic!("expected PageBacked secretmem rnode, got {other:?}"),
-    }
-
-    let accept = SyscallRequest::new(NR_ACCEPT, [fd as u64, 0, 0, 0, 0, 0]);
-    assert_eq!(
-        block_on(dispatch::<ShimsTestPmap>(accept, &ctx)),
-        SyscallResult::Error(88)
-    );
-}
-
-#[test]
-fn dispatch_sched_yield_yields_before_returning_zero() {
-    let _setup = setup();
     let proc_cap = bootstrap();
     let thread = first_thread(&proc_cap);
     let ctx = make_ctx(proc_cap, thread);
-    let req = SyscallRequest::new(NR_SCHED_YIELD, [0; 6]);
-    let mut fut = dispatch::<ShimsTestPmap>(req, &ctx);
-    let waker = Waker::noop().clone();
-    let mut cx = Context::from_waker(&waker);
-    // SAFETY: the future stays on the stack while pinned for these polls.
-    let mut pinned = unsafe { Pin::new_unchecked(&mut fut) };
 
-    assert_eq!(pinned.as_mut().poll(&mut cx), Poll::Pending);
-    assert_eq!(
-        pinned.as_mut().poll(&mut cx),
-        Poll::Ready(SyscallResult::Return(0))
-    );
+    let req = SyscallRequest::new(NR_TX_OBSERVE_BEGIN, [30_000, 0, 0, 0, 0, 0]);
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+
+    assert_eq!(result, SyscallResult::Return(0));
+}
+
+#[test]
+fn dispatch_tx_observe_begin_rejects_zero_threshold() {
+    let _setup = setup();
+
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let req = SyscallRequest::new(NR_TX_OBSERVE_BEGIN, [0, 0, 0, 0, 0, 0]);
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+
+    assert_eq!(result, SyscallResult::Error(EINVAL_VALUE));
+}
+
+#[test]
+fn dispatch_tx_observe_trace_on_private_syscall_enables_tracing() {
+    let _setup = setup();
+    tx_observe::set_enabled(false);
+
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let req = SyscallRequest::new(NR_TX_OBSERVE_TRACE_ON, [0; 6]);
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+
+    assert_eq!(result, SyscallResult::Return(0));
+    assert!(tx_observe::is_enabled());
+}
+
+#[test]
+fn dispatch_tx_observe_trace_off_private_syscall_disables_and_requests_dump() {
+    let _setup = setup();
+    tx_observe::set_enabled(true);
+    tx_observe::set_trace_off_requests_dump(true);
+    let _ = tx_observe::should_dump_now();
+
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let req = SyscallRequest::new(NR_TX_OBSERVE_TRACE_OFF, [0; 6]);
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+
+    assert_eq!(result, SyscallResult::Return(0));
+    assert!(!tx_observe::is_enabled());
+    assert!(tx_observe::should_dump_now());
+    tx_observe::set_enabled(true);
+}
+
+#[test]
+fn dispatch_tx_observe_trace_off_can_disable_dump_for_live_drain() {
+    let _setup = setup();
+    tx_observe::set_enabled(true);
+    tx_observe::set_trace_off_requests_dump(false);
+    let _ = tx_observe::should_dump_now();
+
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let req = SyscallRequest::new(NR_TX_OBSERVE_TRACE_OFF, [0; 6]);
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+
+    assert_eq!(result, SyscallResult::Return(0));
+    assert!(!tx_observe::is_enabled());
+    assert!(!tx_observe::should_dump_now());
+    tx_observe::set_trace_off_requests_dump(true);
+    tx_observe::set_enabled(true);
 }
 
 // ---------------------------------------------------------------------------
@@ -1271,97 +809,6 @@ fn dispatch_read_blocks_until_tty_input_then_returns_byte() {
     panic!("dispatch did not resolve after step_ingest woke the carrier; last poll = {result:?}");
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct TestPollFd {
-    fd: i32,
-    events: i16,
-    revents: i16,
-}
-
-#[test]
-fn dispatch_ppoll_reports_pipe_polout_only_while_space_remains() {
-    const POLLOUT: i16 = 0x0004;
-
-    let _setup = setup();
-    let proc_cap = bootstrap();
-    let thread = first_thread(&proc_cap);
-    let ctx = make_ctx(proc_cap, thread);
-
-    let mut pipefd = [-1i32; 2];
-    assert_eq!(
-        block_on(dispatch::<ShimsTestPmap>(
-            SyscallRequest::new(NR_PIPE2, [pipefd.as_mut_ptr() as u64, 0, 0, 0, 0, 0]),
-            &ctx,
-        )),
-        SyscallResult::Return(0)
-    );
-
-    let timeout = [0u64; 2];
-    let mut pfd = TestPollFd {
-        fd: pipefd[1],
-        events: POLLOUT,
-        revents: 0,
-    };
-    assert_eq!(
-        block_on(dispatch::<ShimsTestPmap>(
-            SyscallRequest::new(
-                NR_PPOLL,
-                [
-                    &mut pfd as *mut TestPollFd as u64,
-                    1,
-                    timeout.as_ptr() as u64,
-                    0,
-                    0,
-                    0,
-                ],
-            ),
-            &ctx,
-        )),
-        SyscallResult::Return(1)
-    );
-    assert_eq!(pfd.revents, POLLOUT);
-
-    let buf = [0x41u8; tx_subsystems::pipe::PIPE_BUF];
-    assert_eq!(
-        block_on(dispatch::<ShimsTestPmap>(
-            SyscallRequest::new(
-                NR_WRITE,
-                [
-                    pipefd[1] as u64,
-                    buf.as_ptr() as u64,
-                    buf.len() as u64,
-                    0,
-                    0,
-                    0,
-                ],
-            ),
-            &ctx,
-        )),
-        SyscallResult::Return(buf.len() as i64)
-    );
-
-    pfd.revents = 0;
-    assert_eq!(
-        block_on(dispatch::<ShimsTestPmap>(
-            SyscallRequest::new(
-                NR_PPOLL,
-                [
-                    &mut pfd as *mut TestPollFd as u64,
-                    1,
-                    timeout.as_ptr() as u64,
-                    0,
-                    0,
-                    0,
-                ],
-            ),
-            &ctx,
-        )),
-        SyscallResult::Return(0)
-    );
-    assert_eq!(pfd.revents, 0);
-}
-
 /// `brk(0)` reports the current break, then `brk(>current)` grows,
 /// then `brk(<current)` shrinks. Bootstrap init's break starts at
 /// `BOOTSTRAP_BRK_BASE = 0x6000_0000`. Page granularity: arguments
@@ -1420,6 +867,35 @@ fn dispatch_brk_invalid_range_returns_unchanged_current() {
         proc_cap.current_brk(),
         0x6000_0000,
         "invalid brk must not have moved the break"
+    );
+}
+
+#[test]
+fn dispatch_brk_growth_past_soft_limit_returns_unchanged_current() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+    let base = proc_cap.brk_base();
+    let small = base + 64;
+
+    let r1 = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_BRK, [small, 0, 0, 0, 0, 0]),
+        &ctx,
+    ));
+    assert_eq!(r1, SyscallResult::Return(small as i64));
+    assert_eq!(proc_cap.current_brk(), small);
+
+    let too_far = base + BRK_LINEAR_HEAP_SOFT_LIMIT_BYTES as u64 + USER_PAGE_SIZE as u64;
+    let r2 = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_BRK, [too_far, 0, 0, 0, 0, 0]),
+        &ctx,
+    ));
+    assert_eq!(r2, SyscallResult::Return(small as i64));
+    assert_eq!(
+        proc_cap.current_brk(),
+        small,
+        "brk growth past the soft linear heap budget should not move the break"
     );
 }
 
@@ -1486,6 +962,178 @@ fn dispatch_rt_sigprocmask_block_then_unblock_round_trip() {
     );
 }
 
+#[test]
+fn dispatch_rt_sigprocmask_query_only_reports_current_mask() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread.clone());
+
+    const SIG_SETMASK: u64 = 2;
+    const SIGUSR1_BIT: u64 = 1u64 << 9;
+
+    let set: u64 = SIGUSR1_BIT;
+    let r1 = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_RT_SIGPROCMASK,
+            [SIG_SETMASK, &set as *const u64 as u64, 0, 8, 0, 0],
+        ),
+        &ctx,
+    ));
+    assert_eq!(r1, SyscallResult::Return(0));
+
+    let mut oldset: u64 = 0;
+    let r2 = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_RT_SIGPROCMASK,
+            [SIG_SETMASK, 0, &mut oldset as *mut u64 as u64, 8, 0, 0],
+        ),
+        &ctx,
+    ));
+
+    assert_eq!(r2, SyscallResult::Return(0));
+    assert_eq!(oldset, SIGUSR1_BIT);
+    assert_eq!(
+        thread
+            .payload_cap()
+            .expect("payload alive")
+            .signal_mask()
+            .raw_bits(),
+        SIGUSR1_BIT,
+        "query-only rt_sigprocmask must not mutate the mask"
+    );
+}
+
+#[test]
+fn dispatch_thread_aspace_oneshot_handles_rt_sigprocmask_only() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let aspace = proc_cap.aspace_cap().expect("alive aspace");
+
+    const SIG_SETMASK: u64 = 2;
+    const SIGUSR1_BIT: u64 = 1u64 << 9;
+
+    assert_eq!(
+        dispatch_thread_aspace_oneshot(&SyscallRequest::new(NR_GETPID, [0; 6]), &thread, &aspace,),
+        None,
+        "thread/aspace one-shot lane must stay narrow"
+    );
+
+    let set: u64 = SIGUSR1_BIT;
+    let set_result = dispatch_thread_aspace_oneshot(
+        &SyscallRequest::new(
+            NR_RT_SIGPROCMASK,
+            [SIG_SETMASK, &set as *const u64 as u64, 0, 8, 0, 0],
+        ),
+        &thread,
+        &aspace,
+    );
+    assert_eq!(set_result, Some(SyscallResult::Return(0)));
+
+    let mut oldset: u64 = 0;
+    let query_result = dispatch_thread_aspace_oneshot(
+        &SyscallRequest::new(
+            NR_RT_SIGPROCMASK,
+            [SIG_SETMASK, 0, &mut oldset as *mut u64 as u64, 8, 0, 0],
+        ),
+        &thread,
+        &aspace,
+    );
+
+    assert_eq!(query_result, Some(SyscallResult::Return(0)));
+    assert_eq!(oldset, SIGUSR1_BIT);
+}
+
+#[test]
+fn dispatch_thread_payload_aspace_oneshot_reuses_resolved_payload() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let payload = thread.payload_cap().expect("thread payload alive");
+    let aspace = proc_cap.aspace_cap().expect("alive aspace");
+
+    const SIG_SETMASK: u64 = 2;
+    const SIGUSR1_BIT: u64 = 1u64 << 9;
+
+    assert_eq!(
+        dispatch_thread_payload_aspace_oneshot(
+            &SyscallRequest::new(NR_GETPID, [0; 6]),
+            &thread,
+            &payload,
+            &aspace,
+        ),
+        None,
+        "payload-aware one-shot lane must stay narrow"
+    );
+
+    let set: u64 = SIGUSR1_BIT;
+    let set_result = dispatch_thread_payload_aspace_oneshot(
+        &SyscallRequest::new(
+            NR_RT_SIGPROCMASK,
+            [SIG_SETMASK, &set as *const u64 as u64, 0, 8, 0, 0],
+        ),
+        &thread,
+        &payload,
+        &aspace,
+    );
+    assert_eq!(set_result, Some(SyscallResult::Return(0)));
+
+    let mut oldset: u64 = 0;
+    let query_result = dispatch_thread_payload_aspace_oneshot(
+        &SyscallRequest::new(
+            NR_RT_SIGPROCMASK,
+            [SIG_SETMASK, 0, &mut oldset as *mut u64 as u64, 8, 0, 0],
+        ),
+        &thread,
+        &payload,
+        &aspace,
+    );
+
+    assert_eq!(query_result, Some(SyscallResult::Return(0)));
+    assert_eq!(oldset, SIGUSR1_BIT);
+}
+
+#[test]
+fn dispatch_direct_trap_payload_oneshot_routes_sigprocmask_through_payload_lane() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let payload = thread.payload_cap().expect("thread payload alive");
+    let aspace = proc_cap.aspace_cap().expect("alive aspace");
+
+    const SIG_SETMASK: u64 = 2;
+    const SIGUSR1_BIT: u64 = 1u64 << 9;
+
+    let set: u64 = SIGUSR1_BIT;
+    let set_result = dispatch_direct_trap_payload_oneshot(
+        &SyscallRequest::new(
+            NR_RT_SIGPROCMASK,
+            [SIG_SETMASK, &set as *const u64 as u64, 0, 8, 0, 0],
+        ),
+        &proc_cap,
+        &thread,
+        &payload,
+        &aspace,
+    );
+    assert_eq!(set_result, Some(SyscallResult::Return(0)));
+
+    let mut oldset: u64 = 0;
+    let query_result = dispatch_direct_trap_payload_oneshot(
+        &SyscallRequest::new(
+            NR_RT_SIGPROCMASK,
+            [SIG_SETMASK, 0, &mut oldset as *mut u64 as u64, 8, 0, 0],
+        ),
+        &proc_cap,
+        &thread,
+        &payload,
+        &aspace,
+    );
+
+    assert_eq!(query_result, Some(SyscallResult::Return(0)));
+    assert_eq!(oldset, SIGUSR1_BIT);
+}
+
 /// `rt_sigprocmask` with `sigsetsize != 8` is rejected with `-EINVAL`
 /// per Linux generic ABI / `SIGNAL_v1` §3 (sigset is always 64 bits
 /// on RV64).
@@ -1501,76 +1149,6 @@ fn dispatch_rt_sigprocmask_rejects_wrong_sigsetsize() {
         &ctx,
     ));
     assert_eq!(r, SyscallResult::Error(22));
-}
-
-/// `rt_sigtimedwait(set, info, {0,0}, 8)` is a true poll: if no
-/// matching pending signal exists, it returns `-EAGAIN`.
-#[test]
-fn dispatch_rt_sigtimedwait_zero_timeout_returns_neg_eagain() {
-    let _setup = setup();
-    let proc_cap = bootstrap();
-    let thread = first_thread(&proc_cap);
-    let ctx = make_ctx(proc_cap, thread);
-
-    let mut set = Signum::SIGCHLD.bit();
-    let mut timeout = [0i64, 0i64];
-    let r = block_on(dispatch::<ShimsTestPmap>(
-        SyscallRequest::new(
-            NR_RT_SIGTIMEDWAIT,
-            [
-                &mut set as *mut u64 as u64,
-                0,
-                timeout.as_mut_ptr() as u64,
-                8,
-                0,
-                0,
-            ],
-        ),
-        &ctx,
-    ));
-    assert_eq!(r, SyscallResult::Error(11));
-}
-
-/// `rt_sigtimedwait` consumes a matching pending signal and writes the
-/// leading `siginfo_t.si_signo` field. This pins the ABI shape used by
-/// the OSComp libctest runtest harness to wait for child `SIGCHLD`.
-#[test]
-fn dispatch_rt_sigtimedwait_consumes_pending_sigchld() {
-    let _setup = setup();
-    let proc_cap = bootstrap();
-    let thread = first_thread(&proc_cap);
-    let ctx = make_ctx(proc_cap, thread.clone());
-
-    let payload = thread
-        .payload_cap()
-        .expect("bootstrap leader thread must be live");
-    payload.pending().post(Signum::SIGCHLD);
-
-    let mut set = Signum::SIGCHLD.bit();
-    let mut info = [0xa5u8; 128];
-    let r = block_on(dispatch::<ShimsTestPmap>(
-        SyscallRequest::new(
-            NR_RT_SIGTIMEDWAIT,
-            [
-                &mut set as *mut u64 as u64,
-                info.as_mut_ptr() as u64,
-                0,
-                8,
-                0,
-                0,
-            ],
-        ),
-        &ctx,
-    ));
-    assert_eq!(r, SyscallResult::Return(SIGCHLD as i64));
-    assert!(
-        !payload.pending().is_pending(Signum::SIGCHLD),
-        "sigtimedwait must dequeue the consumed signal"
-    );
-    assert_eq!(
-        u32::from_le_bytes(info[0..4].try_into().unwrap()),
-        SIGCHLD as u32
-    );
 }
 
 /// `rt_sigaction(SIGUSR1, act, oldact, 8)` round-trip: install a
@@ -1626,8 +1204,8 @@ fn dispatch_rt_sigaction_install_then_query_round_trip() {
 }
 
 /// musl's pthread cancellation handler is installed with
-/// `SA_SIGINFO | SA_RESTART | SA_ONSTACK` and a full mask. RV64's
-/// rt_sigaction ABI exchanges the kernel handler/flags/mask words; losing
+/// `SA_SIGINFO | SA_RESTART | SA_ONSTACK` and a full mask. The kernel
+/// rt_sigaction ABI must preserve those words when queried back; losing
 /// them means AST delivery cannot distinguish the 3-argument handler
 /// shape or compute the handler-entry mask.
 #[test]
@@ -1643,9 +1221,10 @@ fn dispatch_rt_sigaction_round_trips_musl_rv64_flags_and_mask() {
     const SA_RESTART: u64 = 0x1000_0000;
     const FLAGS: u64 = SA_SIGINFO | SA_ONSTACK | SA_RESTART;
     const MASK: u64 = u64::MAX;
+    const UNUSED: u64 = 0x4444_5555_6666_7777;
 
-    let act: [u64; 3] = [HANDLER_ADDR, FLAGS, MASK];
-    let mut oldact: [u64; 3] = [0xDEADu64; 3];
+    let act: [u64; 4] = [HANDLER_ADDR, FLAGS, MASK, UNUSED];
+    let mut oldact: [u64; 4] = [0xDEADu64; 4];
 
     let r1 = block_on(dispatch::<ShimsTestPmap>(
         SyscallRequest::new(
@@ -1662,9 +1241,9 @@ fn dispatch_rt_sigaction_round_trips_musl_rv64_flags_and_mask() {
         &ctx,
     ));
     assert_eq!(r1, SyscallResult::Return(0));
-    assert_eq!(oldact, [0, 0, 0]);
+    assert_eq!(oldact, [0, 0, 0, 0]);
 
-    let mut observed: [u64; 3] = [0xDEADu64; 3];
+    let mut observed: [u64; 4] = [0xDEADu64; 4];
     let r2 = block_on(dispatch::<ShimsTestPmap>(
         SyscallRequest::new(
             NR_RT_SIGACTION,
@@ -1688,6 +1267,10 @@ fn dispatch_rt_sigaction_round_trips_musl_rv64_flags_and_mask() {
     assert_ne!(
         observed[2] & tx_subsystems::signal::Signum::SIGTERM.bit(),
         0
+    );
+    assert_eq!(
+        observed[3], UNUSED,
+        "RV64 musl has no SA_RESTORER, so the last word is ABI-unused"
     );
 }
 
@@ -1828,9 +1411,16 @@ fn dispatch_fcntl_setfd_clears_other_bits() {
 
 /// Unknown `cmd` values return `-ENOSYS`.
 ///
-/// Unknown fcntl commands return `-EINVAL` per Linux.
+/// Wave 2 originally treated F_DUPFD / F_GETFL / F_SETFL as unknown;
+/// Slice 7 of the shell-prompt roadmap (2026-05-07) adds real arms
+/// for F_DUPFD / F_DUPFD_CLOEXEC / F_GETFL (F_SETFL still returns
+/// ENOSYS as a documented carryover — see the dedicated
+/// `dispatch_fcntl_f_setfl_returns_neg_enosys` test in the
+/// `fcntl_misc` module). This test uses an arbitrary high `cmd` value
+/// (`F_GETLK = 5`, file locking — out of scope for v1) to exercise
+/// the catch-all unknown branch.
 #[test]
-fn dispatch_fcntl_unknown_cmd_returns_neg_einval() {
+fn dispatch_fcntl_unknown_cmd_returns_neg_enosys() {
     let _setup = setup();
     let _ops = install_capturing_console();
     let proc_cap = bootstrap();
@@ -1840,11 +1430,12 @@ fn dispatch_fcntl_unknown_cmd_returns_neg_einval() {
     proc_cap.set_fd(3, Some(tx_fs::devfs::open_console_for_init()));
     let ctx = make_ctx(proc_cap, thread);
 
+    // F_GETLK = 5 (file locking) is not in any in-tree fcntl surface.
     let r = block_on(dispatch::<ShimsTestPmap>(
-        SyscallRequest::new(NR_FCNTL, [3, 9999, 0, 0, 0, 0]),
+        SyscallRequest::new(NR_FCNTL, [3, 5, 0, 0, 0, 0]),
         &ctx,
     ));
-    assert_eq!(r, SyscallResult::Error(22));
+    assert_eq!(r, SyscallResult::Error(38));
 }
 
 /// `fcntl` against a closed/never-installed fd returns `-EBADF`.
@@ -2081,7 +1672,7 @@ mod fd_ops_wave2;
 //     `uaddr`; both fds resolve to the same shared payload.
 //   - `pipe2(uaddr, O_CLOEXEC)` sets the cloexec bit on both fds.
 //   - `pipe2(uaddr, O_NONBLOCK)` threads through to OpenFile.flags.
-//   - `pipe2(uaddr, O_DIRECT)` returns `-ENOSYS` (packet-mode pipes).
+//   - `pipe2(uaddr, O_DIRECT)` creates packet-mode pipes.
 //   - `pipe2(uaddr, junk)` returns `-EINVAL`.
 // ===========================================================================
 mod fd_ops_wave3;
@@ -2100,6 +1691,18 @@ mod fd_ops_wave3;
 //   - lseek against an unknown fd returns `-EBADF`.
 // ===========================================================================
 mod fd_ops_wave4;
+
+// ===========================================================================
+// Pipe/splice zero-copy tail (`splice` / `tee` / `vmsplice`).
+//
+// Coverage:
+//   - Linux RV64 numbers match v6.17 (`vmsplice=75`, `splice=76`, `tee=77`).
+//   - `vmsplice` writes userspace iovec bytes into a pipe writer fd.
+//   - `splice` moves bytes pipe -> pipe and validates pipe offset pointers.
+//   - `tee` duplicates bytes pipe -> pipe without consuming the input pipe.
+//   - Unknown splice flags return `-EINVAL`.
+// ===========================================================================
+mod splice_dispatch;
 
 // ===========================================================================
 // Slice 2 of the shell-prompt roadmap — VM syscall arms
@@ -2238,13 +1841,32 @@ mod stat_family;
 // =====================================================================
 // Slice 7 of the shell-prompt roadmap — fcntl extension + day-1 misc
 // syscalls (`F_DUPFD` / `F_DUPFD_CLOEXEC` / `F_GETFL` / `F_SETFL` /
-// `getpgrp` / `kill` / `tkill` / `tgkill` / `getrandom` / `uname` /
-// `prlimit64` / `rt_sigreturn`).
+// `kill` / `tkill` / `tgkill` / `getrandom` / `uname` / `prlimit64` /
+// `rt_sigreturn`).
 //
 // See `docs/progress/plans/2026-05-07-shell-prompt-roadmap.md` Slice 7.
 // =====================================================================
 
 mod fcntl_misc;
+
+// ===========================================================================
+// No-new-design high-stakes syscall backlog entries that reuse existing
+// fd-table/resource/scheduler semantics.
+// ===========================================================================
+
+mod high_stakes_syscalls;
+
+// ===========================================================================
+// Easy time/personality/getcpu syscall slice.
+// ===========================================================================
+
+mod time_personality_getcpu;
+
+// ===========================================================================
+// Easy fixed-model scheduler/priority/ioprio syscall slice.
+// ===========================================================================
+
+mod easy_syscalls;
 
 // =====================================================================
 // Slice 8 of the shell-prompt roadmap — file-mutation syscalls.
@@ -2281,6 +1903,10 @@ mod ipc_dispatch;
 // and LP64 `struct epoll_event` copy paths.
 // ===========================================================================
 mod epoll_dispatch;
+#[path = "tests/event_notification_dispatch.rs"]
+mod event_notification_dispatch;
+#[path = "tests/io_uring_dispatch.rs"]
+mod io_uring_dispatch;
 
 // ===========================================================================
 // POSIX message queues — musl treats `mqd_t` as an fd and uses the LP64
@@ -2289,30 +1915,16 @@ mod epoll_dispatch;
 mod mq_dispatch;
 
 // ===========================================================================
+// Network socket fdtable/syscall bridge.
+// ===========================================================================
+mod socket_fdtable;
+
+// ===========================================================================
+// Network namespace syscall ABI (`unshare`, `setns`, `/proc/self/ns/net`).
+// ===========================================================================
+mod netns_syscalls;
+
+// ===========================================================================
 // Kernel-to-user layout marker registry used by the musl ABI detector.
 // ===========================================================================
 mod kernel_user_layouts;
-
-// =====================================================================
-// Network N39 — socket fdtable/syscall bridge.
-//
-// Coverage:
-// - `socket(2)` installs a struct-backed socket `OpenFile`.
-// - `bind(2)` / `listen(2)` update the socket state and
-//   `getsockname(2)` reports the bound endpoint.
-// - `setsockopt(2)` / `getsockopt(2)` round-trip day-1 socket options.
-// - `close(2)` tears down the socket binding when the final fd closes.
-// =====================================================================
-
-mod socket_fdtable;
-
-// =====================================================================
-// Network N71M3 — namespace user ABI.
-//
-// Coverage:
-// - `unshare(CLONE_NEWNET)` publishes a fresh process net namespace.
-// - `setns(fd, CLONE_NEWNET)` joins a namespace fd payload.
-// - `/proc/<pid>/ns/net` materialises as a struct-backed namespace fd.
-// =====================================================================
-
-mod netns_syscalls;

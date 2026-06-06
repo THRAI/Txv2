@@ -14,8 +14,8 @@ use crate::vfs::{
     Credential, DirCursor, DirEntry, FsObjectId, FsOps, InodeKind, InodeMeta, OpenFile,
     OpenFileFlags, RNode, RNodeBacking,
 };
-use alloc::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use alloc::sync::{Arc, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 fn setup_host_substrate() {
     tx_test_support::init_host();
@@ -29,6 +29,29 @@ fn setup_host_substrate() {
 fn cached_frame_for_test() -> CachedFrame {
     setup_host_substrate();
     allocate_cached_frame().expect("cached frame")
+}
+
+fn user_page_gift_for_test() -> (crate::vm::UserPageGift, Ppn) {
+    setup_host_substrate();
+    let aspace = crate::vm::AddressSpace::new_cap().expect("gift source aspace");
+    let range = crate::vm::UserRange::new_aligned(
+        crate::vm::UserVirtAddr(0x10000),
+        crate::vm::USER_PAGE_SIZE,
+    )
+    .expect("gift source range");
+    let frame = page_allocator::reserve_frame(ZeroPolicy::Zeroed)
+        .expect("gift source frame")
+        .commit();
+    let ppn = frame.ppn();
+    let pin = frame.try_gift_pin().expect("gift pin for source frame");
+    let gift = crate::vm::UserPageGift::new_for_vm(
+        ppn,
+        crate::vm::UserPageGiftSource::new(aspace, range),
+        pin,
+        crate::vm::UserPageGiftFreeze::DetachedPrivate,
+    );
+    drop(frame);
+    (gift, ppn)
 }
 
 struct RecordingFs {
@@ -208,13 +231,239 @@ impl FsPageBacking for RecordingFs {
     }
 }
 
+struct ReentrantFs {
+    fetches: AtomicUsize,
+    reentered: AtomicBool,
+    outcome: ReentrantFetchOutcome,
+    inner_done: AtomicUsize,
+    inner_wait_source: AtomicU64,
+    inner_wait_interests: AtomicU64,
+    pc: std::sync::Mutex<Option<Weak<PageContainer>>>,
+}
+
+#[derive(Clone, Copy)]
+enum ReentrantFetchOutcome {
+    Done,
+    Yield,
+}
+
+impl ReentrantFs {
+    fn new() -> Self {
+        Self::with_outcome(ReentrantFetchOutcome::Done)
+    }
+
+    fn blocking() -> Self {
+        Self::with_outcome(ReentrantFetchOutcome::Yield)
+    }
+
+    fn with_outcome(outcome: ReentrantFetchOutcome) -> Self {
+        Self {
+            fetches: AtomicUsize::new(0),
+            reentered: AtomicBool::new(false),
+            outcome,
+            inner_done: AtomicUsize::new(0),
+            inner_wait_source: AtomicU64::new(0),
+            inner_wait_interests: AtomicU64::new(0),
+            pc: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn set_page_container(&self, pc: &Arc<PageContainer>) {
+        *self.pc.lock().expect("reentrant fs pc lock") = Some(Arc::downgrade(pc));
+    }
+}
+
+impl crate::vfs::FsOps for ReentrantFs {
+    fn lookup(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _guard: &Guard<'_>,
+    ) -> V3Out<FsObjectId, NoProgress> {
+        V3Out::err(V3Errno::ENOSYS)
+    }
+
+    fn load_inode_meta(
+        &self,
+        _fs_object_id: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> V3Out<InodeMeta, NoProgress> {
+        V3Out::done(InodeMeta::new(InodeKind::Regular, 0o100644))
+    }
+
+    fn serialize_inode_meta(
+        &self,
+        _fs_object_id: FsObjectId,
+        _meta: &InodeMeta,
+        _guard: &Guard<'_>,
+    ) -> V3Out<(), NoProgress> {
+        V3Out::done(())
+    }
+
+    fn create_inode(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _mode: u16,
+        _cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> V3Out<(FsObjectId, InodeMeta), NoProgress> {
+        V3Out::err(V3Errno::EROFS)
+    }
+
+    fn unlink(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _target: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> V3Out<(), NoProgress> {
+        V3Out::err(V3Errno::EROFS)
+    }
+
+    fn rename(
+        &self,
+        _old_parent: FsObjectId,
+        _old_name: &[u8],
+        _new_parent: FsObjectId,
+        _new_name: &[u8],
+        _guard: &Guard<'_>,
+    ) -> V3Out<(), NoProgress> {
+        V3Out::err(V3Errno::EROFS)
+    }
+
+    fn link(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _target: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> V3Out<(), NoProgress> {
+        V3Out::err(V3Errno::EROFS)
+    }
+
+    fn mkdir(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _mode: u16,
+        _cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> V3Out<(FsObjectId, InodeMeta), NoProgress> {
+        V3Out::err(V3Errno::EROFS)
+    }
+
+    fn rmdir(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _target: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> V3Out<(), NoProgress> {
+        V3Out::err(V3Errno::EROFS)
+    }
+
+    fn symlink(
+        &self,
+        _parent: FsObjectId,
+        _name: &[u8],
+        _link_target: &[u8],
+        _cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> V3Out<(FsObjectId, InodeMeta), NoProgress> {
+        V3Out::err(V3Errno::EROFS)
+    }
+
+    fn readdir(
+        &self,
+        _fs_object_id: FsObjectId,
+        _cursor: DirCursor,
+        _guard: &Guard<'_>,
+    ) -> V3Out<Option<(DirEntry, DirCursor)>, NoProgress> {
+        V3Out::done(None)
+    }
+
+    fn destroy_inode(
+        &self,
+        _fs_object_id: FsObjectId,
+        _guard: &Guard<'_>,
+    ) -> V3Out<(), NoProgress> {
+        V3Out::done(())
+    }
+}
+
+impl FsPageBacking for ReentrantFs {
+    fn fetch_page(
+        &self,
+        _fs_object_id: FsObjectId,
+        _offset: u64,
+        guard: &Guard<'_>,
+    ) -> V3Out<Frame, NoProgress> {
+        self.fetches.fetch_add(1, Ordering::AcqRel);
+        if !self.reentered.swap(true, Ordering::AcqRel) {
+            let pc = self
+                .pc
+                .lock()
+                .expect("reentrant fs pc lock")
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .expect("reentrant page container");
+            match pc.materialize_page(PageIndex::new(0), MaterializeAccess::Read, guard) {
+                V3Out::Yield { shape, .. } => {
+                    let Some((source, interests)) =
+                        crate::page_backed::notification::wait_source_parts(&shape)
+                    else {
+                        panic!("expected reentrant file miss to yield on wait source");
+                    };
+                    self.inner_wait_source.store(source, Ordering::Release);
+                    self.inner_wait_interests
+                        .store(interests, Ordering::Release);
+                }
+                V3Out::Done(_) => {
+                    self.inner_done.store(1, Ordering::Release);
+                }
+                other => panic!("unexpected reentrant materialize outcome: {other:?}"),
+            }
+        }
+        match self.outcome {
+            ReentrantFetchOutcome::Done => V3Out::done(Frame::new(
+                page_allocator::zero_frame_ppn().expect("zero frame"),
+            )),
+            ReentrantFetchOutcome::Yield => V3Out::yield_on_wait_source(NoProgress, 9, 0x44),
+        }
+    }
+
+    fn flush_page(
+        &self,
+        _fs_object_id: FsObjectId,
+        _offset: u64,
+        _frame: &Frame,
+        _guard: &Guard<'_>,
+    ) -> V3Out<(), NoProgress> {
+        V3Out::done(())
+    }
+
+    fn truncate(
+        &self,
+        _fs_object_id: FsObjectId,
+        _new_size: u64,
+        _guard: &Guard<'_>,
+    ) -> V3Out<(), NoProgress> {
+        V3Out::done(())
+    }
+
+    fn fsync_file(&self, _fs_object_id: FsObjectId, _guard: &Guard<'_>) -> V3Out<(), NoProgress> {
+        V3Out::done(())
+    }
+}
+
 struct BlockingFs;
 
 // Trait impls so `BlockingFs` satisfies the `FsOps` /
 // `FsPageBacking` fields on `MountPayload`. The interesting case
-// is `fetch_page`: a carrier wait has no equivalent in this
-// one-shot `NoProgress` stub, so the closest analog `Err(EAGAIN)`
-// is surfaced here — that gives walker-driven tests a non-Done
+// is `fetch_page`: a `Blocked(token)` shape has no equivalent in
+// `NoProgress` outcomes, so the closest analog `Err(EAGAIN)` is
+// surfaced here — that gives walker-driven tests a non-Done
 // deterministic result. The page-backed unit tests below all
 // drive `BlockingFs` through `materialize_page` (which reads its
 // own `fs_page_backing` route), so this trait body is
@@ -417,6 +666,7 @@ fn open_file_for_pc(pc: &PageContainer) -> OpenFile {
             append: false,
             cloexec: false,
             nonblocking: false,
+            packet: false,
         },
     )
 }
@@ -539,6 +789,45 @@ fn anon_page_container_materializes_once_and_tracks_dirty_writes() {
 }
 
 #[test]
+fn anon_page_materialization_keeps_allocator_work_outside_state_lock() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    reset_page_container_lock_service_observations_for_test();
+    let pc = PageContainer::new(
+        PageContainerKind::Anon {
+            swap_policy: AnonSwapPolicy::Reclaimable,
+        },
+        4,
+    );
+    let page = PageIndex::new(1);
+
+    let first = pc
+        .materialize_anon(page, MaterializeAccess::Read)
+        .expect("cold anon materialization");
+    let cold_observations = page_container_lock_service_observations_for_test();
+
+    reset_page_container_lock_service_observations_for_test();
+    let second = pc
+        .materialize_anon(page, MaterializeAccess::Write)
+        .expect("hot anon rematerialization");
+    let hot_observations = page_container_lock_service_observations_for_test();
+
+    assert!(first.newly_installed);
+    assert_eq!(second.ppn, first.ppn);
+    assert!(!second.newly_installed);
+    assert_eq!(
+        cold_observations,
+        (0, 0),
+        "cold materialization must not allocate frames or acquire map pins under PageContainer.state"
+    );
+    assert_eq!(
+        hot_observations,
+        (0, 0),
+        "hot rematerialization must not acquire map pins under PageContainer.state"
+    );
+}
+
+#[test]
 fn page_container_cap_materializes_anon_pages() {
     setup_host_substrate();
     let pc = PageContainer::new_cap(
@@ -618,6 +907,176 @@ fn page_container_materialize_page_dispatches_file_fetch_once() {
 }
 
 #[test]
+fn file_page_miss_joins_reentrant_inflight_without_duplicate_fetch() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let guard = step_engine::guard();
+    let fs = Arc::new(ReentrantFs::new());
+    let pc = Arc::new(file_page_container(
+        fs.clone(),
+        fs.clone(),
+        FsObjectId::new(57),
+        4,
+    ));
+    fs.set_page_container(&pc);
+
+    let first = match pc.materialize_page(PageIndex::new(0), MaterializeAccess::Read, &guard) {
+        V3Out::Done(page) => page,
+        other => panic!("unexpected materialize outcome: {other:?}"),
+    };
+
+    assert!(first.newly_installed);
+    assert_eq!(pc.resident_pages(), 1);
+    assert_eq!(
+        fs.inner_done.load(Ordering::Acquire),
+        0,
+        "reentrant same-page miss must join the in-flight fetch rather than materialize recursively"
+    );
+    assert_ne!(
+        fs.inner_wait_source.load(Ordering::Acquire),
+        0,
+        "reentrant same-page miss should receive a PageBacked-owned retry source"
+    );
+    assert_eq!(fs.inner_wait_interests.load(Ordering::Acquire), 0x1);
+    assert_eq!(
+        fs.fetches.load(Ordering::Acquire),
+        1,
+        "only the first caller should issue the backend fetch for a concurrently missing page"
+    );
+}
+
+#[test]
+fn file_page_miss_join_source_survives_blocked_owner_fetch() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let guard = step_engine::guard();
+    let fs = Arc::new(ReentrantFs::blocking());
+    let pc = Arc::new(file_page_container(
+        fs.clone(),
+        fs.clone(),
+        FsObjectId::new(58),
+        4,
+    ));
+    fs.set_page_container(&pc);
+
+    match pc.materialize_page(PageIndex::new(0), MaterializeAccess::Read, &guard) {
+        V3Out::Yield { shape, .. } => {
+            let Some((source, interests)) =
+                crate::page_backed::notification::wait_source_parts(&shape)
+            else {
+                panic!("expected backend file fetch wait source");
+            };
+            assert_eq!(source, 9);
+            assert_eq!(interests, 0x44);
+        }
+        other => panic!("expected blocked owner fetch, got {other:?}"),
+    }
+
+    let inner_source = fs.inner_wait_source.load(Ordering::Acquire);
+    assert_ne!(
+        inner_source, 0,
+        "reentrant joiner should receive a PageBacked-owned retry source"
+    );
+    assert_eq!(fs.inner_wait_interests.load(Ordering::Acquire), 0x1);
+    assert_eq!(fs.inner_done.load(Ordering::Acquire), 0);
+    assert_eq!(fs.fetches.load(Ordering::Acquire), 1);
+    assert_eq!(pc.resident_pages(), 0);
+
+    let state = pc.state.lock();
+    assert!(
+        !state.in_flight_file_pages.contains_key(&PageIndex::new(0)),
+        "owner yield must clear the in-flight fetch slot so the next retry can become owner"
+    );
+    assert_eq!(
+        state
+            .file_page_waits
+            .get(&PageIndex::new(0))
+            .map(crate::page_backed::notification::page_ready_source_id),
+        Some(inner_source),
+        "the PageBacked retry source must survive owner yield for late waiter registration"
+    );
+}
+
+#[test]
+fn file_page_stale_owner_after_truncate_cannot_publish_page() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let guard = step_engine::guard();
+    let fs = Arc::new(RecordingFs::new());
+    let pc = file_page_container(fs.clone(), fs, FsObjectId::new(59), 4);
+    let page = PageIndex::new(0);
+    let fetch_id = {
+        let mut state = pc.state.lock();
+        let fetch_id = state.allocate_file_fetch_id();
+        let wait = crate::page_backed::notification::new_page_ready_wait();
+        let source_id = crate::page_backed::notification::page_ready_source_id(&wait);
+        let mut fetch = FilePageFetch::new(fetch_id);
+        fetch.source_id = Some(source_id);
+        fetch.joined = true;
+        state.file_page_waits.insert(page, wait);
+        state.in_flight_file_pages.insert(page, fetch);
+        fetch_id
+    };
+
+    assert_eq!(step_truncate(&pc, 0, &guard), V3Out::Done(()));
+
+    let stale = pc.install_fetched_file_page_from_owner(
+        page,
+        MaterializeAccess::Read,
+        Frame::new(page_allocator::zero_frame_ppn().expect("zero frame")),
+        fetch_id,
+    );
+
+    match stale {
+        V3Out::Err(errno) => assert_eq!(errno, V3Errno::EAGAIN),
+        other => panic!("expected stale owner publish to return EAGAIN, got {other:?}"),
+    }
+    assert_eq!(pc.resident_pages(), 0);
+    assert_eq!(pc.lookup(page), None);
+    assert!(
+        pc.state.lock().file_page_waits.contains_key(&page),
+        "truncate must keep the PageBacked retry source live for late waiter registration"
+    );
+}
+
+#[test]
+fn file_page_materialization_keeps_map_pin_outside_state_lock() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let guard = step_engine::guard();
+    reset_page_container_lock_service_observations_for_test();
+    let fs = Arc::new(RecordingFs::new());
+    let pc = file_page_container(fs.clone(), fs, FsObjectId::new(56), 4);
+
+    let first = match pc.materialize_page(PageIndex::new(2), MaterializeAccess::Read, &guard) {
+        V3Out::Done(page) => page,
+        other => panic!("unexpected materialize outcome: {other:?}"),
+    };
+    let cold_observations = page_container_lock_service_observations_for_test();
+
+    reset_page_container_lock_service_observations_for_test();
+    let second = match pc.materialize_page(PageIndex::new(2), MaterializeAccess::Write, &guard) {
+        V3Out::Done(page) => page,
+        other => panic!("unexpected rematerialize outcome: {other:?}"),
+    };
+    let hot_observations = page_container_lock_service_observations_for_test();
+
+    assert!(first.newly_installed);
+    assert_eq!(second.ppn, first.ppn);
+    assert!(!second.newly_installed);
+    assert_eq!(
+        cold_observations,
+        (0, 0),
+        "cold file materialization must not acquire map pins under PageContainer.state"
+    );
+    assert_eq!(
+        hot_observations,
+        (0, 0),
+        "hot file rematerialization must not acquire map pins under PageContainer.state"
+    );
+}
+
+#[test]
 fn page_container_materialize_page_propagates_file_block() {
     let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
     setup_host_substrate();
@@ -626,16 +1085,14 @@ fn page_container_materialize_page_propagates_file_block() {
     let pc = file_page_container(fs.clone(), fs, FsObjectId::new(77), 4);
 
     match pc.materialize_page(PageIndex::new(0), MaterializeAccess::Read, &guard) {
-        V3Out::Yield {
-            shape:
-                step_engine::YieldShape::OnWaitSource {
-                    source: carrier,
-                    interests,
-                },
-            ..
-        } => {
-            assert_eq!(carrier.raw(), 9);
-            assert_eq!(interests.raw(), 0x44);
+        V3Out::Yield { shape, .. } => {
+            let Some((carrier, interests)) =
+                crate::page_backed::notification::wait_source_parts(&shape)
+            else {
+                panic!("expected wait-source file fetch, got {shape:?}");
+            };
+            assert_eq!(carrier, 9);
+            assert_eq!(interests, 0x44);
         }
         other => panic!("expected blocked file fetch, got {other:?}"),
     }
@@ -670,6 +1127,76 @@ fn page_container_materialize_page_wraps_device_ppns() {
         }
         other => panic!("expected out-of-bounds error, got {other:?}"),
     }
+}
+
+#[test]
+fn pagebacked_user_gift_installs_absent_slot_without_copy() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    let (gift, source_ppn) = user_page_gift_for_test();
+    let pc = PageContainer::new(
+        PageContainerKind::Anon {
+            swap_policy: AnonSwapPolicy::Reclaimable,
+        },
+        2,
+    );
+    let page = PageIndex::new(1);
+
+    assert_eq!(pc.install_user_gift_or_copy(page, gift), Ok(true));
+
+    assert_eq!(pc.lookup(page), Some(source_ppn));
+    assert_eq!(pc.resident_pages(), 1);
+    assert!(
+        pc.page_marks(page)
+            .expect("gift-installed page marks")
+            .dirty,
+        "gifted user contents become dirty PageBacked contents"
+    );
+}
+
+#[test]
+fn pagebacked_user_gift_copies_to_present_slot_and_marks_dirty() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    let (gift, source_ppn) = user_page_gift_for_test();
+    let pattern = [0x41, 0x52, 0x63, 0x74, 0x85, 0x96, 0xa7, 0xb8];
+    page_allocator::testing::write_frame_bytes_for_test(source_ppn, 128, &pattern);
+    let pc = PageContainer::new(
+        PageContainerKind::Anon {
+            swap_policy: AnonSwapPolicy::Reclaimable,
+        },
+        2,
+    );
+    let page = PageIndex::new(0);
+    let existing = pc
+        .materialize_anon(page, MaterializeAccess::Read)
+        .expect("existing destination page");
+    page_allocator::testing::write_frame_bytes_for_test(existing.ppn, 128, &[0u8; 8]);
+
+    assert_eq!(pc.install_user_gift_or_copy(page, gift), Ok(false));
+
+    let mut observed = [0u8; 8];
+    page_allocator::testing::read_frame_bytes_for_test(existing.ppn, 128, &mut observed);
+    assert_eq!(observed, pattern);
+    assert_eq!(pc.lookup(page), Some(existing.ppn));
+    assert!(pc.page_marks(page).expect("copied page marks").dirty);
+}
+
+#[test]
+fn pagebacked_user_gift_rejects_device_destination() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    let (gift, _source_ppn) = user_page_gift_for_test();
+    let pc = PageContainer::new(
+        PageContainerKind::Device {
+            base_ppn: Ppn(0xfeed_0000),
+            page_count: 1,
+        },
+        1,
+    );
+
+    assert_eq!(
+        pc.install_user_gift_or_copy(PageIndex::new(0), gift),
+        Err(PageCacheError::UnsupportedKind)
+    );
+    assert_eq!(pc.resident_pages(), 0);
 }
 
 #[test]
@@ -775,7 +1302,10 @@ fn pagebacked_step_write_rejects_device_backing() {
     );
     let of = open_file_for_pc(&pc);
 
-    assert_eq!(step_write(&pc, &of, 8, &guard), V3Out::Err(Errno::EINVAL));
+    assert_eq!(
+        step_write(&pc, &of, 8, &guard),
+        V3Out::Err(Errno::EINVAL.into())
+    );
     assert_eq!(of.offset(), 0);
     assert_eq!(pc.resident_pages(), 0);
 }
@@ -879,7 +1409,7 @@ mod step_op_wraps {
             len: 8,
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
-        assert_eq!(op.step(&mut ctx), V3Out::Err(Errno::EINVAL));
+        assert_eq!(op.step(&mut ctx), V3Out::Err(Errno::EINVAL.into()));
         assert_eq!(of.offset(), 0);
         assert_eq!(pc.resident_pages(), 0);
     }

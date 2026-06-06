@@ -56,6 +56,8 @@ pub enum FatFormatError {
     Unsupported,
     /// I/O error from the block device.
     IO,
+    /// Underlying block device yielded or asked the caller to retry.
+    WouldBlock,
     /// File too large (> 4 GB for FAT32).
     FileTooLarge,
     /// Entry not found.

@@ -38,8 +38,8 @@ pub mod timer;
 pub mod wait_source;
 
 pub use mailbox::{
-    agent_event_matches, ActiveWait, MailboxEvent, SignalRouting, TaskMailbox, WaitGeneration,
-    MAILBOX_QUEUE_BOUND,
+    agent_event_matches, ActiveWait, MailboxEvent, MailboxSchedulerHint, SignalRouting,
+    TaskMailbox, WaitGeneration, MAILBOX_QUEUE_BOUND,
 };
 pub use timer::{TimerGuard, TimerGuardRole, TimerToken, TimerWheel};
 pub use wait_source::{

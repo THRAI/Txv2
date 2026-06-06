@@ -15,10 +15,23 @@
 
 use alloc::collections::BTreeMap;
 
-use crate::adapter::step_engine::{Cap, SpinMutex};
+use crate::process::adapter::step_engine::{process_spin_mutex, Cap, ProcessSpinMutex};
 use crate::process::structure::{Pgid, Pid, ProcessGroup, ProcessIdentity, Session, Sid};
 use crate::thread_runtime::structure::{ThreadIdentity, Tid};
 // allocate_tid re-exported via thread_runtime
+
+macro_rules! measure_process_ds {
+    ($method_name:expr, $body:block) => {{
+        #[cfg(all(tx_ds_metrics, tx_ds_metrics_process))]
+        {
+            crate::process::ds_metrics::measure($method_name, || $body)
+        }
+        #[cfg(not(all(tx_ds_metrics, tx_ds_metrics_process)))]
+        {
+            $body
+        }
+    }};
+}
 
 // ---------------------------------------------------------------------------
 // PidName
@@ -57,40 +70,58 @@ impl PidName {
 // Global registry
 // ---------------------------------------------------------------------------
 
-static PID_NS: SpinMutex<BTreeMap<(u64, PidNameKind), PidName>> = SpinMutex::new(BTreeMap::new());
+static PID_NS: ProcessSpinMutex<BTreeMap<(u64, PidNameKind), PidName>> =
+    process_spin_mutex(BTreeMap::new(), b"debug.lock.process.pid_namespace");
 
 /// Register a process-level pid.
 pub fn register_pid(pid: Pid, cap: Cap<ProcessIdentity>) {
-    PID_NS
-        .lock()
-        .insert((pid.0 as u64, PidNameKind::Process), PidName::Process(cap));
+    measure_process_ds!(b"debug.ds.process.pid_namespace.register_pid", {
+        PID_NS
+            .lock()
+            .insert((pid.0 as u64, PidNameKind::Process), PidName::Process(cap));
+    });
 }
 
 /// Register a thread-level tid.
 pub fn register_tid(tid: Tid, cap: Cap<ThreadIdentity>) {
-    PID_NS
-        .lock()
-        .insert((tid.0 as u64, PidNameKind::Thread), PidName::Thread(cap));
+    measure_process_ds!(b"debug.ds.process.pid_namespace.register_tid", {
+        PID_NS
+            .lock()
+            .insert((tid.0 as u64, PidNameKind::Thread), PidName::Thread(cap));
+    });
 }
 
 /// Register a process-group-level pgid.
 pub fn register_pgrp(pgid: Pgid, cap: Cap<ProcessGroup>) {
-    PID_NS.lock().insert(
-        (pgid.0 as u64, PidNameKind::ProcessGroup),
-        PidName::ProcessGroup(cap),
-    );
+    measure_process_ds!(b"debug.ds.process.pid_namespace.register_pgrp", {
+        PID_NS.lock().insert(
+            (pgid.0 as u64, PidNameKind::ProcessGroup),
+            PidName::ProcessGroup(cap),
+        );
+    });
 }
 
 /// Register a session-level sid.
 pub fn register_session(sid: Sid, cap: Cap<Session>) {
-    PID_NS
-        .lock()
-        .insert((sid.0 as u64, PidNameKind::Session), PidName::Session(cap));
+    measure_process_ds!(b"debug.ds.process.pid_namespace.register_session", {
+        PID_NS
+            .lock()
+            .insert((sid.0 as u64, PidNameKind::Session), PidName::Session(cap));
+    });
 }
 
 /// Unregister every role currently bound to a raw number.
 pub fn unregister_pid_number(number: u64) {
-    PID_NS.lock().retain(|(key, _), _| *key != number);
+    measure_process_ds!(b"debug.ds.process.pid_namespace.unregister_pid_number", {
+        PID_NS.lock().retain(|(key, _), _| *key != number);
+    });
+}
+
+/// Unregister only the thread-level TID binding for a raw number.
+pub fn unregister_tid_number(number: u64) {
+    measure_process_ds!(b"debug.ds.process.pid_namespace.unregister_tid_number", {
+        PID_NS.lock().remove(&(number, PidNameKind::Thread));
+    });
 }
 
 /// Resolve a number to its preferred `PidName`.
@@ -99,25 +130,31 @@ pub fn unregister_pid_number(number: u64) {
 /// [`resolve_pid_number_as`] so pid, tid, pgid, and sid lookups do not
 /// depend on role priority.
 pub fn resolve_pid_number(number: u64) -> Option<PidName> {
-    let ns = PID_NS.lock();
-    [
-        PidNameKind::Process,
-        PidNameKind::Thread,
-        PidNameKind::ProcessGroup,
-        PidNameKind::Session,
-    ]
-    .into_iter()
-    .find_map(|kind| ns.get(&(number, kind)).cloned())
+    measure_process_ds!(b"debug.ds.process.pid_namespace.resolve_pid_number", {
+        let ns = PID_NS.lock();
+        [
+            PidNameKind::Process,
+            PidNameKind::Thread,
+            PidNameKind::ProcessGroup,
+            PidNameKind::Session,
+        ]
+        .into_iter()
+        .find_map(|kind| ns.get(&(number, kind)).cloned())
+    })
 }
 
 /// Resolve a number to a specific pid-namespace role.
 pub fn resolve_pid_number_as(number: u64, kind: PidNameKind) -> Option<PidName> {
-    PID_NS.lock().get(&(number, kind)).cloned()
+    measure_process_ds!(b"debug.ds.process.pid_namespace.resolve_pid_number_as", {
+        PID_NS.lock().get(&(number, kind)).cloned()
+    })
 }
 
 /// Iterate all entries (for procfs).
 pub fn with_namespace<T>(f: impl FnOnce(&BTreeMap<(u64, PidNameKind), PidName>) -> T) -> T {
-    f(&PID_NS.lock())
+    measure_process_ds!(b"debug.ds.process.pid_namespace.with_namespace", {
+        f(&PID_NS.lock())
+    })
 }
 
 // ---------------------------------------------------------------------------

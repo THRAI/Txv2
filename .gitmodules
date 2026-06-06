@@ -13,3 +13,12 @@
 	path = external/musl
 	url = https://git.musl-libc.org/git/musl
 	ignore = untracked
+[submodule "external/linux-rv-6.17"]
+	path = external/linux-rv-6.17
+	url = https://github.com/torvalds/linux.git
+[submodule "external/lmbench"]
+	path = external/lmbench
+	url = https://github.com/intel/lmbench.git
+[submodule "external/libc-bench"]
+	path = external/libc-bench
+	url = https://git.musl-libc.org/git/libc-bench

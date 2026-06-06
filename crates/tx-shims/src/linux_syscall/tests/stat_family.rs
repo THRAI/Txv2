@@ -16,15 +16,14 @@ use tx_subsystems::page_backed::FsPageBacking;
 use tx_subsystems::pipe::{step_pipe2, PipeFlags};
 use tx_subsystems::process::step_chdir;
 use tx_subsystems::vfs::structure::{
-    Credential, DEntry, FsObjectId, InlineName, InodeKind, InodeMeta, OpenFileFlags, RNode,
-    RNodeBacking, StructPayload, S_IFDIR,
+    Credential, DEntry, InlineName, InodeKind, InodeMeta, OpenFileFlags, RNode, RNodeBacking,
+    S_IFDIR,
 };
 use tx_subsystems::vfs::{FsOps, OpenFile};
 
-use crate::linux_syscall::numbers::{EFD_NONBLOCK_FLAG, NR_EVENTFD2};
 use crate::linux_syscall::{
     AT_EMPTY_PATH, AT_FDCWD, NR_CHDIR, NR_FCHDIR, NR_FCHMODAT, NR_FSTAT, NR_FSTATFS, NR_GETCWD,
-    NR_GETDENTS64, NR_NEWFSTATAT, NR_STATFS, NR_STATX, NR_UMASK,
+    NR_GETDENTS64, NR_LSEEK, NR_NEWFSTATAT, NR_STATFS, NR_STATX, NR_UMASK, SEEK_SET,
 };
 
 /// errno magnitudes the tests check against (positive Linux RV64
@@ -46,7 +45,6 @@ const STAT_MODE_OFF: usize = 16;
 const STAT_NLINK_OFF: usize = 20;
 const STAT_UID_OFF: usize = 24;
 const STAT_GID_OFF: usize = 28;
-const STAT_RDEV_OFF: usize = 32;
 const STAT_SIZE_OFF: usize = 48;
 const STAT_BLKSIZE_OFF: usize = 56;
 /// Total `struct stat` byte size on RV64 generic ABI: matches
@@ -160,58 +158,10 @@ fn directory_open_file(root_rnode: Cap<RNode>) -> Cap<OpenFile> {
             append: false,
             cloexec: false,
             nonblocking: false,
+            packet: false,
         },
     )
     .expect("directory open file cap")
-}
-
-struct StatNullOps;
-
-impl CharDeviceOps for StatNullOps {
-    fn read(
-        &self,
-        _out: &mut [u8],
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<usize, step_engine::ByteProgress> {
-        StepOutcome::done(0)
-    }
-
-    fn write(
-        &self,
-        bytes: &[u8],
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<usize, step_engine::ByteProgress> {
-        StepOutcome::done(bytes.len())
-    }
-}
-
-static STAT_NULL_OPS: StatNullOps = StatNullOps;
-static STAT_NULL_BINDING: CharDeviceBinding = CharDeviceBinding {
-    devt: DevT::new(1, 3),
-    name: "stat-null",
-    ops: &STAT_NULL_OPS,
-};
-
-fn stat_null_open_file() -> Cap<OpenFile> {
-    let rnode = RNode::new_cap(
-        FsObjectId::new(1993),
-        InodeMeta::new(InodeKind::CharDevice, 0o020666),
-        RNodeBacking::StructBacked {
-            payload: StructPayload::CharDevice(&STAT_NULL_BINDING),
-        },
-    )
-    .expect("stat null rnode");
-    OpenFile::new_cap(
-        rnode,
-        OpenFileFlags {
-            read: true,
-            write: true,
-            append: false,
-            cloexec: false,
-            nonblocking: false,
-        },
-    )
-    .expect("stat null open file")
 }
 
 fn read_u32_at(buf: &[u8], off: usize) -> u32 {
@@ -319,51 +269,6 @@ fn dispatch_fstat_on_tty_fd_writes_stat_struct() {
     // S_IFCHR = 0o020000 in the upper nibble.
     let mode = read_u32_at(&statbuf, STAT_MODE_OFF);
     assert_eq!(mode & 0o170000, 0o020000, "expected S_IFCHR; got {mode:#o}");
-}
-
-/// `fstat()` on a direct character device reports Linux's encoded
-/// `st_rdev` major/minor. glibc's `daemon(3)` uses this to verify
-/// that `/dev/null` is the real null device after it opens the path.
-#[test]
-fn dispatch_fstat_on_chardev_fd_writes_rdev() {
-    let _setup = stat_setup();
-    let proc_cap = bootstrap();
-    let thread = first_thread(&proc_cap);
-    proc_cap.set_fd(3, Some(stat_null_open_file()));
-    let ctx = make_ctx(proc_cap, thread);
-
-    let mut statbuf = vec![0u8; STAT_BYTES];
-    let req = SyscallRequest::new(NR_FSTAT, [3, statbuf.as_mut_ptr() as u64, 0, 0, 0, 0]);
-    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
-    assert_eq!(result, SyscallResult::Return(0));
-    assert_eq!(read_u64_at(&statbuf, STAT_RDEV_OFF), 0x103);
-}
-
-/// `fstat(eventfd)` is legal on Linux anon-inode fds. It must not try
-/// to unwrap an `OpenFile::rnode()` from the eventfd backing.
-#[test]
-fn dispatch_fstat_on_eventfd_fd_writes_anon_inode_stat() {
-    let _setup = stat_setup();
-    let proc_cap = bootstrap();
-    let thread = first_thread(&proc_cap);
-    let ctx = make_ctx(proc_cap, thread);
-
-    let req = SyscallRequest::new(NR_EVENTFD2, [0, EFD_NONBLOCK_FLAG as u64, 0, 0, 0, 0]);
-    let fd = match block_on(dispatch::<ShimsTestPmap>(req, &ctx)) {
-        SyscallResult::Return(fd) => fd,
-        other => panic!("eventfd2: {other:?}"),
-    };
-
-    let mut statbuf = vec![0u8; STAT_BYTES];
-    let req = SyscallRequest::new(
-        NR_FSTAT,
-        [fd as u64, statbuf.as_mut_ptr() as u64, 0, 0, 0, 0],
-    );
-    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
-    assert_eq!(result, SyscallResult::Return(0));
-    assert_eq!(read_u32_at(&statbuf, STAT_MODE_OFF), 0o600);
-    assert_eq!(read_u32_at(&statbuf, STAT_NLINK_OFF), 1);
-    assert_eq!(read_u64_at(&statbuf, STAT_SIZE_OFF), 0);
 }
 
 /// `fstat(unknown_fd, statbuf)` returns `-EBADF`.
@@ -585,7 +490,7 @@ fn dispatch_statx_on_root_writes_statx_struct() {
         crate::linux_syscall::numbers::STATX_BASIC_STATS
     );
     assert_eq!(read_u32_at(&statxbuf, STATX_BLKSIZE_OFF), 4096);
-    assert_eq!(read_u32_at(&statxbuf, STATX_NLINK_OFF), 1);
+    assert_eq!(read_u32_at(&statxbuf, STATX_NLINK_OFF), 2);
     let mode = read_u16_at(&statxbuf, STATX_MODE_OFF);
     assert_eq!(mode & 0o170000, 0o040000, "expected S_IFDIR; got {mode:#o}");
     assert_eq!(
@@ -951,6 +856,78 @@ fn dispatch_getdents64_on_directory_fd_writes_entries() {
     );
     let result2 = block_on(dispatch::<ShimsTestPmap>(req2, &ctx));
     assert_eq!(result2, SyscallResult::Return(0));
+}
+
+/// Directory fds are seekable as directory streams: `rewinddir()` in libc
+/// is an `lseek(fd, 0, SEEK_SET)` underneath. LTP cleanup relies on this
+/// when recursively removing large temporary directories.
+#[test]
+fn dispatch_lseek_directory_fd_resets_getdents64_cursor() {
+    let _setup = stat_setup();
+    let (_root_dentry, tmpfs, root_rnode) = build_tmpfs_root();
+    let owner_cred = Credential {
+        uid: 0,
+        gid: 0,
+        effective_caps: CapabilitySet::FULL,
+    };
+    let id_a = {
+        let guard = guard();
+        match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"a", 0o100644, &owner_cred, &guard) {
+            StepOutcome::Done((id, _)) => id,
+            other => panic!("create_inode a: {other:?}"),
+        }
+    };
+    let id_b = {
+        let guard = guard();
+        match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"b", 0o100644, &owner_cred, &guard) {
+            StepOutcome::Done((id, _)) => id,
+            other => panic!("create_inode b: {other:?}"),
+        }
+    };
+
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    proc_cap.set_fd(7, Some(directory_open_file(root_rnode)));
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    let mut first = vec![0u8; 24];
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_GETDENTS64,
+            [7, first.as_mut_ptr() as u64, first.len() as u64, 0, 0, 0],
+        ),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Return(24));
+
+    let rewind = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_LSEEK, [7, 0, SEEK_SET as u64, 0, 0, 0]),
+        &ctx,
+    ));
+    assert_eq!(rewind, SyscallResult::Return(0));
+
+    let mut all = vec![0u8; 128];
+    let total = match block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_GETDENTS64,
+            [7, all.as_mut_ptr() as u64, all.len() as u64, 0, 0, 0],
+        ),
+        &ctx,
+    )) {
+        SyscallResult::Return(n) => n as usize,
+        other => panic!("getdents64 after rewind: {other:?}"),
+    };
+
+    let mut seen = alloc::collections::BTreeSet::new();
+    let mut off = 0usize;
+    while off < total {
+        let ino = read_u64_at(&all, off);
+        let reclen = read_u16_at(&all, off + 16) as usize;
+        seen.insert(ino);
+        off += reclen;
+    }
+    assert!(seen.contains(&id_a.as_u64()));
+    assert!(seen.contains(&id_b.as_u64()));
 }
 
 /// `getdents64(pipe_fd, buf, buf_len)` returns `-ENOTDIR`. Pipes

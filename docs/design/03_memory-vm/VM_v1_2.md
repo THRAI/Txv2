@@ -169,15 +169,20 @@ pub struct AddressSpace {
 **Stats consistency.** `stats` are derived and **not required to be strongly consistent** with `recipes` or `pmap` at all times. They are updated on commit paths of binding and materialization mutations, but observers may see stats that lag behind the authoritative state by some bounded amount. For observability-grade use (`/proc/<pid>/status`, rlimit enforcement approximations); not suitable for correctness checks.
 
 **Recipes implementation note.** The current implementation realizes
-the `PersistentBTree<UserRange, VmEntry>` semantic as a copy-on-write
-`BTreeMap<UserVirtAddr, VmEntry>` published behind an `AtomicPtr` with
-EBR for snapshot-consistent reads. Each mutation rebuilds the tree
-under a `SpinMutex` and atomically swaps the published root. The key
-is the start address of the entry's `UserRange`; range-overlap queries
-walk predecessor/successor entries explicitly. This satisfies the
-snapshot-consistency property the spec requires; replacing the COW
-`BTreeMap` with a structurally-shared persistent BTree is a future
-optimization tracked outside v1.2.
+the `PersistentBTree<UserRange, VmEntry>` semantic as an immutable,
+structurally shared recipe tree published behind an `AtomicPtr` with
+EBR for snapshot-consistent reads. Writers hold the VM-local mutation
+lock, path-copy the affected tree nodes, and atomically swap the
+published root; readers under an epoch guard see either the pre-mutation
+or post-mutation root, never an intermediate rewrite. The key is the
+start address of the entry's `UserRange`; range-overlap queries combine
+the immediate predecessor with entries whose starts lie inside the
+requested range. Adjacent compatible anonymous ranges may coalesce at
+commit time, preserving the same authoritative binding while avoiding
+recipe growth from page-at-a-time heap extension.
+Fork clones the published recipe root directly; child-only CoW metadata
+divergence path-copies the affected private entries while unchanged
+recipes continue to share nodes.
 
 **Fields are non-negotiable in v1.** Every AddressSpace has exactly these. There is no per-AddressSpace mutex; coordination is through the RangeLock.
 
@@ -1116,6 +1121,70 @@ Thundering-herd on release. Acceptable for expected contention profiles. Upgrade
 <!-- txdoc:VM-9-11-RANGELOCK-IS-VM-SPECIFIC -->
 
 Not promoted to substrate. Other subsystems don't currently need range-based coordination. If a future subsystem does, the RangeLock pattern can be generalized — but the implementation should live with its primary consumer, not abstracted prematurely.
+
+### 9.12 User-page gifts for `vmsplice`
+<!-- txdoc:VM-9-12-USER-PAGE-GIFTS-FOR-VMSPLICE -->
+
+`vmsplice(SPLICE_F_GIFT)` needs page-granular transfer without changing VM's
+authoritative granularity. The VM contract is therefore a materialized transfer
+token:
+
+```rust
+pub struct UserPageGift { /* VM-private fields */ }
+pub struct GiftBatch { /* ordered full-page gifts plus copied tails */ }
+
+pub enum UserPageGiftFreeze {
+    DetachedPrivate,
+    DemotedCow,
+}
+```
+
+`UserPageGift` is not a `VmEntry`, not a page object, and not a page-level
+authoritative binding. It is linear evidence that a VM operation observed an
+eligible user page, materialized it to a frame, acquired substrate transfer
+retention for that frame, and revoked or demoted the old writable user
+materialization before publishing the token to a pipe descriptor.
+
+The VM primitive is:
+
+```rust
+pub fn gift_user_pages_step(
+    aspace: Cap<AddressSpace>,
+    iov: UserRange,
+    flags: GiftFlags,
+) -> StepOutcome<GiftBatch>;
+```
+
+The step obligations are:
+
+1. **Observe.** Validate the user range and split it into page-aligned units.
+   Unaligned heads/tails are reported to the caller for byte-copy fallback.
+2. **Acquire.** Take `RangeLock::Materializer` over each declared page range
+   that may be gifted. The reservation is still range-scoped; it does not
+   introduce a page lock or page-shaped VM binding.
+3. **Re-observe recipe.** Re-read the recipes BTree under the reservation. v1
+   eligibility is full-page aligned private anonymous or private CoW material
+   only. `MAP_SHARED`, device mappings, missing mappings, and unsupported
+   page-backed states are rejected for gift and handled by copy fallback.
+4. **Materialize.** Resolve the page to a concrete frame through the normal
+   fault/materialization path. If the step blocks, drop the reservation and
+   retry from observe on wake.
+5. **Reserve transfer evidence.** Acquire substrate `GiftPin` evidence for the
+   live frame. In the first implementation slice this is retained-frame
+   transfer evidence on `FrameMeta.refcount`, not DMA `pin_count`.
+6. **Freeze user ownership.** Remove or demote writable PTE materialization
+   before the token is visible outside VM. Private anonymous pages become
+   `DetachedPrivate`; private CoW sources become `DemotedCow`. Releasing the
+   token never restores the old writable PTE; a future user write refaults and
+   takes the normal CoW path.
+7. **Publish.** Return `UserPageGift` values to the syscall script. Pipe stores
+   them only as ordered descriptors. PageBacked is the consumer that installs
+   or copies the gifted frame into a destination `PageContainer`.
+
+This preserves the existing VM rule: recipes remain authoritative range
+bindings and PTEs remain derived materializations. Page gifting changes only the
+operation that prepares a transfer token; it does not make pages independently
+owned VM resources.
 
 ---
 

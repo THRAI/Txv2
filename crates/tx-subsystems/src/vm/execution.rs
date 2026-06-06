@@ -7,6 +7,7 @@
 use alloc::collections::BTreeSet;
 use alloc::sync::Weak;
 use alloc::vec::Vec;
+use core::sync::atomic::Ordering;
 
 use tx_hal::PmapIf;
 
@@ -16,18 +17,23 @@ use crate::page_backed::{step_fsync, PageContainerKind};
 use crate::vm::adapter::step_engine::{
     self as step_engine, AbortReason, AgentCancelPolicy, DelegateRegistry, DelegateReply,
     DelegateRequest, StepOutcome, StepOutcome as V3StepOutcome, TaskMailbox, TokenDropPolicy,
-    UfdAccessKind, UfdReply, UfdRequest, YieldShape,
+    UfdAccessKind, UfdReply, UfdRequest,
 };
 use crate::vm::checks::{
     require_fault_publication, require_fault_recipe, require_map_admission, require_remap_shape,
 };
+use crate::vm::pmap::PmapBatchPage;
 use crate::vm::structure::{PrivatePageError, PrivatePageSet};
 use crate::vm::{
-    AddressSpace, LockMode, MapPlacement, PmapPublishOutcome, Prot, RangeGuard, UserRange,
-    UserVirtAddr, VmBacking, VmEntry, VmFault, VmFaultError, VmFaultMaterialization,
-    VmFaultMaterializationStep, VmFaultOutcome, VmMapCommit, VmMapError, VmMapOutcome,
-    VmMapRequest, VmMapTarget, VmRemapOutcome, VmRemapPlacement, VmRemapRequest, USER_PAGE_SIZE,
+    AccessMode, AddressSpace, LockMode, MapPlacement, PmapPublishOutcome, Prot, RangeGuard,
+    UserRange, UserVirtAddr, VmBacking, VmEntry, VmEntryBacking, VmFault, VmFaultError,
+    VmFaultMaterialization, VmFaultMaterializationStep, VmFaultOutcome, VmMapCommit, VmMapError,
+    VmMapOutcome, VmMapRequest, VmMapTarget, VmRemapOutcome, VmRemapPlacement, VmRemapRequest,
+    USER_PAGE_SIZE,
 };
+
+const PRIVATE_ANON_FAULT_BATCH_PAGES: usize = 16;
+const PRIVATE_ANON_FAULT_BATCH_MIN_VMA_BYTES: usize = USER_PAGE_SIZE * 2;
 
 pub fn page_align_up(addr: usize) -> usize {
     checked_page_align_up(addr).expect("page_align_up overflow")
@@ -62,7 +68,7 @@ impl AddressSpace {
             return Err(VmFaultError::WouldBlock);
         };
 
-        let _entry = require_fault_publication(self, &outcome, &materialization)?;
+        require_fault_publication(self, &outcome, &materialization)?;
 
         self.pmap
             .publish_page_with_replacement(
@@ -80,14 +86,16 @@ impl AddressSpace {
     /// CoW.
     ///
     /// VM_v1_2 §5.6. The child is constructed via the same platform pmap
-    /// type as `parent`. Each parent recipe is cloned (a `Cap<PageContainer>`
-    /// clone is a refcount bump) and committed into the child's recipe
-    /// index via `RecipeIndex::commit_map(_, RequireFree)`. For every
-    /// MAP_PRIVATE entry, the parent's pmap range is torn down so the
-    /// next access on either side refaults and the existing
-    /// `materialize_page_recipe` CoW path produces a private frame for the
-    /// writer. MAP_SHARED entries leave the parent's PTEs intact; the
-    /// child's pmap starts empty and rebuilds via refault.
+    /// type as `parent`. The child recipe index starts as an O(1)
+    /// structurally shared clone of the parent's published root. Private
+    /// CoW entries with resident private sets are then path-copied in the
+    /// child only, so the child can carry sibling `SharedCow` sets while
+    /// unchanged recipes continue sharing tree nodes. For every MAP_PRIVATE
+    /// entry, the parent's pmap range is demoted read-only so the next write
+    /// on either side refaults and the existing `materialize_page_recipe`
+    /// CoW path produces a private frame for the writer. MAP_SHARED entries
+    /// leave the parent's PTEs intact; the child's pmap starts empty and
+    /// rebuilds via refault.
     ///
     /// Per VM_v1_2 §9.5, fork acquires an `ExclusiveWriter` reservation on
     /// the full user range (`UserRange::full_user_v1()`) so no concurrent
@@ -108,27 +116,19 @@ impl AddressSpace {
             return Err(VmMapError::WouldBlock);
         };
 
+        let guard = step_engine::guard();
         let parent_recipes = parent.recipes_snapshot();
-        let child = AddressSpace::new_for_platform::<P>()?;
+        let child_recipes = parent.recipes.clone_shared(&guard);
+        let child = AddressSpace::new_with_recipes_for_platform::<P>(child_recipes)?;
 
         for entry in parent_recipes {
             let private = !entry.flags.shared;
             let range = entry.range;
-            // Final-form lazy share-RO CoW (see plan).
-            let child_entry = if private {
-                match &entry.private {
-                    Some(parent_set) => {
-                        let child_set = parent_set.fork_share().map_err(VmMapError::Private)?;
-                        entry.clone().with_private(Some(child_set))
-                    }
-                    None => entry.clone(),
-                }
-            } else {
-                entry.clone()
-            };
-            child
-                .recipes
-                .commit_map(child_entry, MapPlacement::RequireFree)?;
+            if let (true, Some(parent_set)) = (private, entry.private()) {
+                let child_set = parent_set.fork_share().map_err(VmMapError::Private)?;
+                let child_entry = entry.clone().with_private(Some(child_set));
+                child.recipes.replace_entry(child_entry)?;
+            }
             if private {
                 parent
                     .pmap
@@ -136,7 +136,6 @@ impl AddressSpace {
             }
         }
 
-        let guard = step_engine::guard();
         child.stats.store(child.recipes.stats(&guard));
         Ok(child)
     }
@@ -289,9 +288,16 @@ impl AddressSpace {
                 None
             };
 
+            emit_vm_trace(b"debug.vm.fault.script.phase", 0);
             match self.try_fault_script_materialize_and_publish(&outcome, ufd_reply)? {
-                FaultScriptPublish::Done(outcome) => return Ok(outcome),
+                FaultScriptPublish::Done(published) => {
+                    emit_vm_trace(b"debug.vm.fault.script.phase", 1);
+                    self.prefault_private_anon_write_batch(&outcome);
+                    emit_vm_trace(b"debug.vm.fault.script.phase", 2);
+                    return Ok(published);
+                }
                 FaultScriptPublish::Wait(token) => {
+                    emit_vm_trace(b"debug.vm.fault.script.wait", 1);
                     await_range_lock(token).await;
                     continue;
                 }
@@ -304,27 +310,35 @@ impl AddressSpace {
         page_range: UserRange,
         fault: VmFault,
     ) -> Result<FaultScriptResolve, VmFaultError> {
+        emit_vm_trace(b"debug.vm.fault.resolve.phase", 0);
         let _guard = match self
             .range_lock
             .acquire_step(page_range, LockMode::Materializer)
         {
-            V3StepOutcome::Done(guard) => guard,
-            V3StepOutcome::Yield {
-                shape:
-                    YieldShape::OnWaitSource {
-                        source: carrier,
-                        interests,
-                    },
-                ..
-            } => {
-                return Ok(FaultScriptResolve::Wait(WaitToken::new(
-                    carrier.raw(),
-                    interests.raw(),
-                )));
+            V3StepOutcome::Done(guard) => {
+                emit_vm_trace(b"debug.vm.fault.resolve.phase", 1);
+                guard
+            }
+            V3StepOutcome::Yield { shape, .. } => {
+                if let Some(token) = crate::vm::notification::wait_token_from_shape(&shape) {
+                    emit_vm_trace(b"debug.vm.fault.resolve.wait", 1);
+                    return Ok(FaultScriptResolve::Wait(token));
+                }
+                unreachable_acquire_step()
             }
             _ => unreachable_acquire_step(),
         };
-        Ok(FaultScriptResolve::Done(require_fault_recipe(self, fault)?))
+        let outcome = require_fault_recipe(self, fault)?;
+        emit_vm_trace(
+            b"debug.vm.fault.resolve.access",
+            vm_fault_access_trace_id(outcome.access),
+        );
+        emit_vm_trace(
+            b"debug.vm.fault.resolve.backing",
+            vm_backing_trace_id(outcome.entry.backing_kind()),
+        );
+        emit_vm_trace(b"debug.vm.fault.resolve.phase", 2);
+        Ok(FaultScriptResolve::Done(outcome))
     }
 
     fn try_fault_script_publish(
@@ -332,28 +346,36 @@ impl AddressSpace {
         outcome: &VmFaultOutcome,
         materialization: VmFaultMaterialization,
     ) -> Result<FaultScriptPublish, VmFaultError> {
+        emit_vm_trace(b"debug.vm.fault.publish.phase", 0);
         let _guard = match self
             .range_lock
             .acquire_step(outcome.page_range, LockMode::Materializer)
         {
-            V3StepOutcome::Done(guard) => guard,
-            V3StepOutcome::Yield {
-                shape:
-                    YieldShape::OnWaitSource {
-                        source: carrier,
-                        interests,
-                    },
-                ..
-            } => {
-                drop(materialization);
-                return Ok(FaultScriptPublish::Wait(WaitToken::new(
-                    carrier.raw(),
-                    interests.raw(),
-                )));
+            V3StepOutcome::Done(guard) => {
+                emit_vm_trace(b"debug.vm.fault.publish.phase", 1);
+                guard
+            }
+            V3StepOutcome::Yield { shape, .. } => {
+                if let Some(token) = crate::vm::notification::wait_token_from_shape(&shape) {
+                    drop(materialization);
+                    emit_vm_trace(b"debug.vm.fault.publish.wait", 1);
+                    return Ok(FaultScriptPublish::Wait(token));
+                }
+                unreachable_acquire_step()
             }
             _ => unreachable_acquire_step(),
         };
+        emit_vm_trace(b"debug.vm.fault.publish.phase", 2);
+        emit_vm_trace(
+            b"debug.vm.fault.publish.pmap_mapped_pages",
+            self.pmap.stats().mapped_pages as i64,
+        );
+        emit_vm_trace(
+            b"debug.vm.fault.publish.private_len",
+            outcome.entry.private().map(|set| set.len()).unwrap_or(0) as i64,
+        );
         let _entry = require_fault_publication(self, outcome, &materialization)?;
+        emit_vm_trace(b"debug.vm.fault.publish.phase", 3);
         let published = self
             .pmap
             .publish_page_with_replacement(
@@ -364,6 +386,7 @@ impl AddressSpace {
                 materialization.replace_existing,
             )
             .map_err(VmFaultError::Pmap)?;
+        emit_vm_trace(b"debug.vm.fault.publish.phase", 4);
         Ok(FaultScriptPublish::Done(published))
     }
 
@@ -372,21 +395,33 @@ impl AddressSpace {
         outcome: &VmFaultOutcome,
         ufd_reply: Option<DelegateReply>,
     ) -> Result<FaultScriptPublish, VmFaultError> {
+        emit_vm_trace(b"debug.vm.fault.materialize.phase", 0);
         let materialization = match ufd_reply {
             Some(DelegateReply::Ufd(UfdReply::Copy {
                 src_kernel_addr,
                 dst_uaddr: _,
                 len,
-            })) => materialize_ufd_copy(outcome, src_kernel_addr, len)?,
+            })) => {
+                emit_vm_trace(b"debug.vm.fault.materialize.ufd_copy", 1);
+                materialize_ufd_copy(outcome, src_kernel_addr, len)?
+            }
             Some(DelegateReply::Ufd(UfdReply::ZeroPage { .. })) | None => {
                 let guard = step_engine::guard();
+                emit_vm_trace(b"debug.vm.fault.materialize.phase", 1);
                 match outcome.materialize_pagebacked_step(&guard) {
-                    VmFaultMaterializationStep::Done(materialization) => materialization,
+                    VmFaultMaterializationStep::Done(materialization) => {
+                        emit_vm_trace(b"debug.vm.fault.materialize.phase", 2);
+                        materialization
+                    }
                     VmFaultMaterializationStep::Blocked(token) => {
                         drop(guard);
+                        emit_vm_trace(b"debug.vm.fault.materialize.wait", 1);
                         return Ok(FaultScriptPublish::Wait(token));
                     }
-                    VmFaultMaterializationStep::Err(error) => return Err(error),
+                    VmFaultMaterializationStep::Err(error) => {
+                        emit_vm_trace(b"debug.vm.fault.materialize.err", 1);
+                        return Err(error);
+                    }
                 }
             }
             Some(DelegateReply::Ufd(UfdReply::Continue { .. })) => {
@@ -400,29 +435,215 @@ impl AddressSpace {
                 return Err(VmFaultError::WouldBlock);
             }
         };
+        emit_vm_trace(b"debug.vm.fault.materialize.phase", 3);
         self.try_fault_script_publish(outcome, materialization)
     }
 
+    fn prefault_private_anon_write_batch(&self, first: &VmFaultOutcome) {
+        if !private_anon_write_batch_shape(first) {
+            return;
+        }
+        let current_page = first.page_range.start().containing_page().0;
+        let next_expected = current_page.saturating_add(1);
+        let previous_expected = self
+            .next_private_anon_write_fault_page
+            .swap(next_expected, Ordering::Relaxed);
+        if previous_expected != current_page {
+            return;
+        }
+
+        let Some(batch_bytes) = PRIVATE_ANON_FAULT_BATCH_PAGES.checked_mul(USER_PAGE_SIZE) else {
+            return;
+        };
+        let mut addr = first.page_range.end().0;
+        let batch_end = first.page_range.start().0.saturating_add(batch_bytes);
+        let end = core::cmp::min(first.entry.range.end().0, batch_end);
+        emit_vm_trace(b"debug.vm.fault.prefault.begin", current_page as i64);
+        emit_vm_trace(
+            b"debug.vm.fault.prefault.limit_pages",
+            ((end.saturating_sub(addr)) / USER_PAGE_SIZE) as i64,
+        );
+
+        let Some(batch_range) =
+            UserRange::new_aligned(UserVirtAddr(addr), end.saturating_sub(addr)).ok()
+        else {
+            return;
+        };
+        if batch_range.is_empty() {
+            return;
+        }
+        let _batch_guard = match self
+            .range_lock
+            .acquire_step(batch_range, LockMode::Materializer)
+        {
+            V3StepOutcome::Done(guard) => guard,
+            V3StepOutcome::Yield { .. } => {
+                emit_vm_trace(b"debug.vm.fault.prefault.published_pages", 0);
+                return;
+            }
+            _ => unreachable_acquire_step(),
+        };
+        emit_vm_trace(b"debug.vm.fault.prefault.phase", 0);
+
+        let mut batch_pages = Vec::new();
+        while addr < end {
+            let page_addr = UserVirtAddr(addr);
+            emit_vm_trace(b"debug.vm.fault.prefault.phase", 1);
+            if self.pmap.lookup(page_addr.containing_page()).is_some() {
+                addr = match addr.checked_add(USER_PAGE_SIZE) {
+                    Some(next) => next,
+                    None => break,
+                };
+                continue;
+            }
+
+            let page_range = match UserRange::new_aligned(page_addr, USER_PAGE_SIZE) {
+                Ok(range) => range,
+                Err(_) => break,
+            };
+            let fault = VmFault::new(page_addr, first.access);
+            emit_vm_trace(b"debug.vm.fault.prefault.phase", 2);
+            let outcome = match require_fault_recipe(self, fault) {
+                Ok(outcome) if outcome.page_range == page_range => outcome,
+                _ => break,
+            };
+            if !private_anon_write_batch_shape(&outcome) {
+                break;
+            }
+
+            let guard = step_engine::guard();
+            emit_vm_trace(b"debug.vm.fault.prefault.phase", 3);
+            let materialization = match outcome.materialize_pagebacked_step(&guard) {
+                VmFaultMaterializationStep::Done(materialization) => materialization,
+                VmFaultMaterializationStep::Blocked(_) | VmFaultMaterializationStep::Err(_) => {
+                    break;
+                }
+            };
+            drop(guard);
+            emit_vm_trace(b"debug.vm.fault.prefault.phase", 4);
+            batch_pages.push(PmapBatchPage {
+                page: outcome.page_range.start().containing_page(),
+                ppn: materialization.page.ppn,
+                prot: materialization.publish_prot,
+                map_pin: materialization.page.map_pin,
+            });
+            emit_vm_trace(b"debug.vm.fault.prefault.phase", 5);
+
+            addr = match addr.checked_add(USER_PAGE_SIZE) {
+                Some(next) => next,
+                None => break,
+            };
+        }
+        emit_vm_trace(b"debug.vm.fault.prefault.phase", 6);
+        let published_pages = self.pmap.publish_new_pages_best_effort(batch_pages);
+        emit_vm_trace(b"debug.vm.fault.prefault.phase", 7);
+        if published_pages > 0 {
+            let next = current_page
+                .saturating_add(1)
+                .saturating_add(published_pages);
+            self.next_private_anon_write_fault_page
+                .store(next, Ordering::Relaxed);
+        }
+        emit_vm_trace(
+            b"debug.vm.fault.prefault.published_pages",
+            published_pages as i64,
+        );
+    }
+
     pub fn try_mmap(&self, request: VmMapRequest) -> Result<VmMapOutcome, VmMapError> {
+        let total_start = vm_map_path_clock_now();
+        emit_vm_trace(b"debug.vm.mmap.enter", 0);
         let (range, placement) = match request.target {
             VmMapTarget::Anywhere { window, page_count } => {
+                emit_vm_trace(b"debug.vm.mmap.target", 0);
+                emit_vm_trace(b"debug.vm.mmap.pages", page_count as i64);
+                let search_start = vm_map_path_clock_now();
                 let range = self
-                    .find_free_range(window, page_count)
+                    .find_free_range_for_anywhere(window, page_count)
                     .ok_or(VmMapError::NoFreeRange)?;
+                emit_vm_map_path_duration(
+                    b"debug.vm.map_path.mmap.anywhere_search_ns",
+                    search_start,
+                );
                 (range, MapPlacement::RequireFree)
             }
-            VmMapTarget::Fixed { range, placement } => (range, placement),
+            VmMapTarget::Fixed { range, placement } => {
+                emit_vm_trace(b"debug.vm.mmap.target", 1);
+                emit_vm_trace(b"debug.vm.mmap.pages", range.page_count() as i64);
+                (range, placement)
+            }
         };
+        emit_vm_trace(
+            b"debug.vm.mmap.range_start",
+            range.start().as_usize() as i64,
+        );
+        emit_vm_trace(b"debug.vm.mmap.placement", placement as i64);
         let entry = VmEntry::new(range, request.prot, request.flags, request.backing);
 
+        let reserve_start = vm_map_path_clock_now();
         match self.reserve_map(entry, placement) {
             MapReserveResult::Reserved(reservation) => {
+                emit_vm_map_path_duration(b"debug.vm.map_path.mmap.reserve_map_ns", reserve_start);
+                emit_vm_trace(b"debug.vm.mmap.reserved", 1);
+                let commit_start = vm_map_path_clock_now();
                 let commit = reservation.commit()?;
+                emit_vm_map_path_duration(b"debug.vm.map_path.mmap.commit_ns", commit_start);
+                emit_vm_trace(
+                    b"debug.vm.mmap.committed_pages",
+                    commit.changed_pages as i64,
+                );
+                if matches!(request.target, VmMapTarget::Anywhere { .. }) {
+                    self.next_mmap_search_start
+                        .store(range.end().as_usize(), Ordering::Relaxed);
+                }
+                emit_vm_map_path_count(
+                    b"debug.vm.map_path.mmap.changed_pages",
+                    commit.changed_pages as u64,
+                );
+                emit_vm_map_path_duration(b"debug.vm.map_path.mmap.total_ns", total_start);
                 Ok(VmMapOutcome { range, commit })
             }
-            MapReserveResult::Blocked(_) => Err(VmMapError::WouldBlock),
-            MapReserveResult::Err(error) => Err(error),
+            MapReserveResult::Blocked(_) => {
+                emit_vm_map_path_duration(
+                    b"debug.vm.map_path.mmap.reserve_blocked_ns",
+                    reserve_start,
+                );
+                emit_vm_map_path_duration(b"debug.vm.map_path.mmap.total_ns", total_start);
+                Err(VmMapError::WouldBlock)
+            }
+            MapReserveResult::Err(error) => {
+                emit_vm_map_path_duration(
+                    b"debug.vm.map_path.mmap.reserve_error_ns",
+                    reserve_start,
+                );
+                emit_vm_map_path_duration(b"debug.vm.map_path.mmap.total_ns", total_start);
+                Err(error)
+            }
         }
+    }
+
+    fn find_free_range_for_anywhere(
+        &self,
+        window: UserRange,
+        page_count: usize,
+    ) -> Option<UserRange> {
+        let len = page_count.checked_mul(USER_PAGE_SIZE)?;
+        let hint = self.next_mmap_search_start.load(Ordering::Relaxed);
+        if hint > window.start().as_usize()
+            && hint < window.end().as_usize()
+            && hint.is_multiple_of(USER_PAGE_SIZE)
+            && hint.checked_add(len)? <= window.end().as_usize()
+        {
+            let hinted_window = UserRange::new_aligned(
+                UserVirtAddr(hint),
+                window.end().as_usize().checked_sub(hint)?,
+            )
+            .ok()?;
+            if let Some(range) = self.find_free_range(hinted_window, page_count) {
+                return Some(range);
+            }
+        }
+        self.find_free_range(window, page_count)
     }
 
     /// Canonical async mmap script per VM_v1_2 §5.2. Yields on `RangeLock`
@@ -467,23 +688,18 @@ impl AddressSpace {
                 .acquire_step(range, LockMode::ExclusiveWriter)
             {
                 V3StepOutcome::Done(guard) => guard,
-                V3StepOutcome::Yield {
-                    shape:
-                        YieldShape::OnWaitSource {
-                            source: carrier,
-                            interests,
-                        },
-                    ..
-                } => {
-                    await_range_lock(WaitToken::new(carrier.raw(), interests.raw())).await;
+                V3StepOutcome::Yield { shape, .. } => {
+                    let Some(token) = crate::vm::notification::wait_token_from_shape(&shape) else {
+                        unreachable_acquire_step();
+                    };
+                    await_range_lock(token).await;
                     continue;
                 }
                 _ => unreachable_acquire_step(),
             };
             let commit = self.recipes.unmap(range)?;
             self.pmap.teardown_range(range)?;
-            let guard = step_engine::guard();
-            self.stats.store(self.recipes.stats(&guard));
+            self.stats.apply_delta(commit.stats_delta);
             return Ok(commit);
         }
     }
@@ -501,23 +717,18 @@ impl AddressSpace {
                 .acquire_step(range, LockMode::ExclusiveWriter)
             {
                 V3StepOutcome::Done(guard) => guard,
-                V3StepOutcome::Yield {
-                    shape:
-                        YieldShape::OnWaitSource {
-                            source: carrier,
-                            interests,
-                        },
-                    ..
-                } => {
-                    await_range_lock(WaitToken::new(carrier.raw(), interests.raw())).await;
+                V3StepOutcome::Yield { shape, .. } => {
+                    let Some(token) = crate::vm::notification::wait_token_from_shape(&shape) else {
+                        unreachable_acquire_step();
+                    };
+                    await_range_lock(token).await;
                     continue;
                 }
                 _ => unreachable_acquire_step(),
             };
             let commit = self.recipes.protect(range, prot)?;
             self.pmap.teardown_range(range)?;
-            let guard = step_engine::guard();
-            self.stats.store(self.recipes.stats(&guard));
+            self.stats.apply_delta(commit.stats_delta);
             return Ok(commit);
         }
     }
@@ -540,15 +751,12 @@ impl AddressSpace {
                         (request.new_range, LockMode::ExclusiveWriter),
                     ) {
                         V3StepOutcome::Done(pair) => pair,
-                        V3StepOutcome::Yield {
-                            shape:
-                                YieldShape::OnWaitSource {
-                                    source: carrier,
-                                    interests,
-                                },
-                            ..
-                        } => {
-                            let token = WaitToken::new(carrier.raw(), interests.raw());
+                        V3StepOutcome::Yield { shape, .. } => {
+                            let Some(token) =
+                                crate::vm::notification::wait_token_from_shape(&shape)
+                            else {
+                                unreachable_acquire_step();
+                            };
                             await_range_lock(token).await;
                             continue;
                         }
@@ -562,15 +770,12 @@ impl AddressSpace {
                         .acquire_step(lock_range, LockMode::ExclusiveWriter)
                     {
                         V3StepOutcome::Done(guard) => guard,
-                        V3StepOutcome::Yield {
-                            shape:
-                                YieldShape::OnWaitSource {
-                                    source: carrier,
-                                    interests,
-                                },
-                            ..
-                        } => {
-                            let token = WaitToken::new(carrier.raw(), interests.raw());
+                        V3StepOutcome::Yield { shape, .. } => {
+                            let Some(token) =
+                                crate::vm::notification::wait_token_from_shape(&shape)
+                            else {
+                                unreachable_acquire_step();
+                            };
                             await_range_lock(token).await;
                             continue;
                         }
@@ -589,8 +794,7 @@ impl AddressSpace {
             {
                 self.pmap.teardown_range(teardown_range)?;
             }
-            let guard = step_engine::guard();
-            self.stats.store(self.recipes.stats(&guard));
+            self.stats.apply_delta(commit.stats_delta);
             return Ok(VmRemapOutcome {
                 old_range: request.old_range,
                 new_range: request.new_range,
@@ -616,7 +820,7 @@ impl AddressSpace {
     /// page-aligned. Process-level tracking of the brk value (which hart
     /// holds it, exec-time base, fork inheritance) lives in the Process
     /// subsystem and is out of scope for VM.
-    pub async fn brk_script(
+    pub fn try_brk(
         &self,
         brk_base: crate::vm::UserVirtAddr,
         current_brk: crate::vm::UserVirtAddr,
@@ -646,7 +850,7 @@ impl AddressSpace {
                     crate::vm::VmEntryFlags::PRIVATE,
                     VmBacking::PrivateAnon,
                 );
-                self.mmap_script(request).await?;
+                self.try_mmap(request)?;
             }
         } else {
             let old_committed =
@@ -659,10 +863,31 @@ impl AddressSpace {
                     old_committed - new_committed,
                 )
                 .map_err(|_| VmMapError::InvalidRange)?;
-                self.munmap_script(range).await?;
+                self.try_munmap(range)?;
             }
         }
         Ok(requested_brk)
+    }
+
+    pub async fn brk_script(
+        &self,
+        brk_base: crate::vm::UserVirtAddr,
+        current_brk: crate::vm::UserVirtAddr,
+        requested_brk: crate::vm::UserVirtAddr,
+    ) -> Result<crate::vm::UserVirtAddr, VmMapError> {
+        loop {
+            match self.try_brk(brk_base, current_brk, requested_brk) {
+                Ok(new_brk) => return Ok(new_brk),
+                Err(VmMapError::WouldBlock) => {
+                    let token = WaitToken::new(
+                        self.range_lock.wait_source_id(),
+                        crate::vm::RANGE_LOCK_RELEASE_MASK,
+                    );
+                    await_range_lock(token).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     pub fn try_mremap(&self, request: VmRemapRequest) -> Result<VmRemapOutcome, VmMapError> {
@@ -704,8 +929,7 @@ impl AddressSpace {
         {
             self.pmap.teardown_range(teardown_range)?;
         }
-        let guard = step_engine::guard();
-        self.stats.store(self.recipes.stats(&guard));
+        self.stats.apply_delta(commit.stats_delta);
         Ok(VmRemapOutcome {
             old_range: request.old_range,
             new_range: request.new_range,
@@ -719,15 +943,11 @@ impl AddressSpace {
             .acquire_step(entry.range, LockMode::ExclusiveWriter)
         {
             V3StepOutcome::Done(guard) => guard,
-            V3StepOutcome::Yield {
-                shape:
-                    YieldShape::OnWaitSource {
-                        source: carrier,
-                        interests,
-                    },
-                ..
-            } => {
-                return MapReserveResult::Blocked(WaitToken::new(carrier.raw(), interests.raw()));
+            V3StepOutcome::Yield { shape, .. } => {
+                let Some(token) = crate::vm::notification::wait_token_from_shape(&shape) else {
+                    unreachable_acquire_step();
+                };
+                return MapReserveResult::Blocked(token);
             }
             _ => unreachable_acquire_step(),
         };
@@ -742,7 +962,7 @@ impl AddressSpace {
         // `vm::scripts`). Without this, private write faults would
         // allocate pages straight into the pmap but skip the per-VmEntry
         // CoW store — fork would then have nothing to share.
-        let entry = if !entry.flags.shared && entry.private.is_none() {
+        let entry = if !entry.flags.shared && entry.prot.write && entry.private().is_none() {
             match PrivatePageSet::new_cap() {
                 Ok(set) => entry.with_private(Some(set)),
                 Err(e) => {
@@ -762,20 +982,53 @@ impl AddressSpace {
     }
 
     pub fn try_munmap(&self, range: UserRange) -> Result<VmMapCommit, VmMapError> {
+        let total_start = vm_map_path_clock_now();
+        emit_vm_trace(b"debug.vm.unmap.phase", 0);
+        let acquire_start = vm_map_path_clock_now();
         let _guard = self.acquire_writer(range)?;
+        emit_vm_map_path_duration(b"debug.vm.map_path.munmap.acquire_ns", acquire_start);
+        emit_vm_trace(b"debug.vm.unmap.phase", 1);
+        let recipe_start = vm_map_path_clock_now();
         let commit = self.recipes.unmap(range)?;
-        self.pmap.teardown_range(range)?;
-        let guard = step_engine::guard();
-        self.stats.store(self.recipes.stats(&guard));
+        emit_vm_map_path_duration(b"debug.vm.map_path.munmap.recipe_ns", recipe_start);
+        emit_vm_trace(b"debug.vm.unmap.phase", 2);
+        emit_vm_trace(b"debug.vm.unmap.changed_pages", commit.changed_pages as i64);
+        let pmap_start = vm_map_path_clock_now();
+        let pmap_removed = self.pmap.teardown_range(range)?;
+        emit_vm_map_path_duration(b"debug.vm.map_path.munmap.pmap_teardown_ns", pmap_start);
+        emit_vm_trace(b"debug.vm.unmap.phase", 3);
+        emit_vm_trace(b"debug.vm.unmap.pmap_removed", pmap_removed as i64);
+        let stats_start = vm_map_path_clock_now();
+        self.stats.apply_delta(commit.stats_delta);
+        emit_vm_map_path_duration(b"debug.vm.map_path.munmap.stats_ns", stats_start);
+        emit_vm_trace(b"debug.vm.unmap.phase", 4);
+        emit_vm_map_path_count(
+            b"debug.vm.map_path.munmap.changed_pages",
+            commit.changed_pages as u64,
+        );
+        emit_vm_map_path_count(
+            b"debug.vm.map_path.munmap.pmap_removed",
+            pmap_removed as u64,
+        );
+        emit_vm_map_path_duration(b"debug.vm.map_path.munmap.total_ns", total_start);
         Ok(commit)
     }
 
     pub fn try_mprotect(&self, range: UserRange, prot: Prot) -> Result<VmMapCommit, VmMapError> {
+        emit_vm_trace(b"debug.vm.protect.phase", 0);
         let _guard = self.acquire_writer(range)?;
+        emit_vm_trace(b"debug.vm.protect.phase", 1);
         let commit = self.recipes.protect(range, prot)?;
-        self.pmap.teardown_range(range)?;
-        let guard = step_engine::guard();
-        self.stats.store(self.recipes.stats(&guard));
+        emit_vm_trace(b"debug.vm.protect.phase", 2);
+        emit_vm_trace(
+            b"debug.vm.protect.changed_pages",
+            commit.changed_pages as i64,
+        );
+        let pmap_removed = self.pmap.teardown_range(range)?;
+        emit_vm_trace(b"debug.vm.protect.phase", 3);
+        emit_vm_trace(b"debug.vm.protect.pmap_removed", pmap_removed as i64);
+        self.stats.apply_delta(commit.stats_delta);
+        emit_vm_trace(b"debug.vm.protect.phase", 4);
         Ok(commit)
     }
 
@@ -807,12 +1060,30 @@ impl AddressSpace {
         placement: MapPlacement,
     ) -> Result<VmMapCommit, VmMapError> {
         let range = entry.range;
+        emit_vm_trace(b"debug.vm.mmap.commit.phase", 0);
+        let recipe_start = vm_map_path_clock_now();
         let commit = self.recipes.commit_map(entry, placement)?;
+        emit_vm_map_path_duration(b"debug.vm.map_path.mmap.commit_recipe_ns", recipe_start);
+        emit_vm_trace(b"debug.vm.mmap.commit.phase", 1);
+        emit_vm_trace(
+            b"debug.vm.mmap.commit.changed_pages",
+            commit.changed_pages as i64,
+        );
         if placement == MapPlacement::FixedReplace {
+            emit_vm_trace(b"debug.vm.mmap.commit.fixed_teardown", 1);
+            let teardown_start = vm_map_path_clock_now();
             self.pmap.teardown_range(range)?;
+            emit_vm_map_path_duration(
+                b"debug.vm.map_path.mmap.commit_fixed_pmap_teardown_ns",
+                teardown_start,
+            );
+            emit_vm_trace(b"debug.vm.mmap.commit.phase", 2);
         }
-        let guard = step_engine::guard();
-        self.stats.store(self.recipes.stats(&guard));
+        emit_vm_trace(b"debug.vm.mmap.commit.phase", 3);
+        let stats_start = vm_map_path_clock_now();
+        self.stats.apply_delta(commit.stats_delta);
+        emit_vm_map_path_duration(b"debug.vm.map_path.mmap.commit_stats_ns", stats_start);
+        emit_vm_trace(b"debug.vm.mmap.commit.phase", 4);
         Ok(commit)
     }
 }
@@ -824,6 +1095,68 @@ fn remap_union_range(old_range: UserRange, new_range: UserRange) -> Result<UserR
         .min(new_range.start().as_usize());
     let end = old_range.end().as_usize().max(new_range.end().as_usize());
     UserRange::new_aligned(UserVirtAddr(start), end - start).map_err(|_| VmMapError::InvalidRange)
+}
+
+fn emit_vm_trace(name: &[u8], value: i64) {
+    if !cfg!(tx_vm_phase_metrics) {
+        return;
+    }
+    if let Some(observer) = tx_observe::current() {
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            value,
+        );
+    }
+}
+
+#[inline(always)]
+fn vm_map_path_metrics_enabled() -> bool {
+    cfg!(tx_vm_map_path_metrics) && tx_observe::current().is_some()
+}
+
+#[inline(always)]
+fn vm_map_path_clock_now() -> Option<u64> {
+    if vm_map_path_metrics_enabled() {
+        Some(tx_observe::clock_now_ns())
+    } else {
+        None
+    }
+}
+
+fn emit_vm_map_path_duration(name: &[u8], start: Option<u64>) {
+    let Some(start) = start else {
+        return;
+    };
+    let duration = tx_observe::clock_now_ns().saturating_sub(start);
+    emit_vm_map_path_count(name, duration);
+}
+
+fn emit_vm_map_path_count(name: &[u8], value: u64) {
+    if !vm_map_path_metrics_enabled() {
+        return;
+    }
+    if let Some(observer) = tx_observe::current() {
+        observer.counter(
+            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            value as i64,
+        );
+    }
+}
+
+fn vm_fault_access_trace_id(access: AccessMode) -> i64 {
+    match access {
+        AccessMode::Read => 1,
+        AccessMode::Write => 2,
+        AccessMode::Execute => 3,
+    }
+}
+
+fn vm_backing_trace_id(backing: VmEntryBacking) -> i64 {
+    match backing {
+        VmEntryBacking::None => 0,
+        VmEntryBacking::PrivateAnon => 1,
+        VmEntryBacking::Page { .. } => 2,
+    }
 }
 
 fn remap_teardown_ranges(
@@ -862,6 +1195,15 @@ enum FaultScriptResolve {
 enum FaultScriptPublish {
     Done(PmapPublishOutcome),
     Wait(WaitToken),
+}
+
+fn private_anon_write_batch_shape(outcome: &VmFaultOutcome) -> bool {
+    outcome.access == AccessMode::Write
+        && !outcome.entry.flags.shared
+        && outcome.entry.ufd_registration.is_none()
+        && matches!(outcome.entry.backing_kind(), VmEntryBacking::PrivateAnon)
+        && outcome.entry.prot.write
+        && outcome.entry.range.len() >= PRIVATE_ANON_FAULT_BATCH_MIN_VMA_BYTES
 }
 
 impl core::fmt::Debug for MapReserveResult<'_> {
@@ -954,7 +1296,7 @@ impl AddressSpace {
             if !entry.range.overlaps(range) {
                 continue;
             }
-            let VmBacking::Page { pc, .. } = &entry.backing else {
+            let Some((pc, _)) = entry.page_backing() else {
                 continue;
             };
             if !matches!(pc.kind(), PageContainerKind::File { .. }) {
@@ -999,8 +1341,8 @@ impl MapReservation<'_> {
 /// token's channel has been retired the await is a no-op and the caller's
 /// retry loop runs immediately.
 async fn await_range_lock(token: WaitToken) {
-    if let Some(future) = crate::wait_source::wait_on_token(token) {
-        let _ = future.await;
+    if let Some(wait) = crate::wait_source::wait_on_token(token) {
+        let _ = wait.await;
     }
 }
 

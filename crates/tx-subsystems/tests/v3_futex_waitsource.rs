@@ -78,7 +78,9 @@ use tx_subsystems::vm::{
 use tx_subsystems::wait_source as legacy_wait_source;
 use tx_subsystems::zones;
 
-/// Minimal `PmapIf` stub for integration tests.
+/// Minimal `PmapIf` stub for integration tests — the futex wait-source
+/// test only needs an AddressSpace with a single PrivateAnon page; it
+/// never actually walks the pmap, so the stub is a no-op.
 struct FutexTestPmap;
 
 static NEXT_ROOT_ID: AtomicUsize = AtomicUsize::new(1);
@@ -459,6 +461,7 @@ fn wait_source_id_round_trips_from_yield_shape_to_bucket_source() {
         stamped_id,
         "futex wait should yield the exact wait source, not the bucket source",
     );
+
     assert!(
         bucket_wait_source_for_source_id(stamped_id).is_none(),
         "exact futex wait-source ids must not resolve through the legacy bucket namespace",

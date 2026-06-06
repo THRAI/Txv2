@@ -1,10 +1,11 @@
 //! Bounded key/value index with linear reservations.
 
-use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::ops::Deref;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
+
+use alloc::vec::Vec;
 
 use crate::epoch::Guard;
 
@@ -89,7 +90,6 @@ impl Drop for SpinGuard<'_> {
 pub struct Index<K, V, const N: usize> {
     lock: SpinLock,
     entries: [Entry<K, V>; N],
-    scan_limit: AtomicUsize,
 }
 
 unsafe impl<K: Send, V: Send, const N: usize> Sync for Index<K, V, N> {}
@@ -100,7 +100,6 @@ impl<K, V, const N: usize> Index<K, V, N> {
         Self {
             lock: SpinLock::new(),
             entries: [const { Entry::new() }; N],
-            scan_limit: AtomicUsize::new(0),
         }
     }
 }
@@ -109,30 +108,27 @@ impl<K: Eq, V, const N: usize> Index<K, V, N> {
     /// Reserve a key that is not currently committed or reserved.
     pub fn reserve(&self, key: K) -> Result<IndexReservation<'_, K, V, N>, IndexError> {
         let _guard = self.lock.lock();
-        let limit = self.scan_limit_locked();
 
-        for entry in &self.entries[..limit] {
+        for entry in &self.entries {
             let state = unsafe { *entry.state.get() };
             if state != EMPTY && unsafe { (*entry.key.get()).assume_init_ref() == &key } {
                 return Err(IndexError::Duplicate);
             }
         }
 
-        let empty_in_span = self.entries[..limit]
+        let Some((slot_index, entry)) = self
+            .entries
             .iter()
             .enumerate()
-            .find(|(_, entry)| unsafe { *entry.state.get() == EMPTY });
-        let (slot_index, entry) = match empty_in_span {
-            Some(slot) => slot,
-            None if limit < N => (limit, &self.entries[limit]),
-            None => return Err(IndexError::Full),
+            .find(|(_, entry)| unsafe { *entry.state.get() == EMPTY })
+        else {
+            return Err(IndexError::Full);
         };
 
         unsafe {
             (*entry.key.get()).write(key);
             *entry.state.get() = RESERVED_EMPTY;
         }
-        self.extend_scan_limit_locked(slot_index + 1);
 
         Ok(IndexReservation {
             index: self,
@@ -144,9 +140,8 @@ impl<K: Eq, V, const N: usize> Index<K, V, N> {
     /// Observe a committed value under an epoch guard.
     pub fn lookup<'g>(&self, key: &K, _guard: &'g Guard<'_>) -> Option<IndexRef<'g, K, V>> {
         let _lock = self.lock.lock();
-        let limit = self.scan_limit_locked();
 
-        for entry in &self.entries[..limit] {
+        for entry in &self.entries {
             let state = unsafe { *entry.state.get() };
             if state == COMMITTED && unsafe { (*entry.key.get()).assume_init_ref() == key } {
                 let key = unsafe { &*(*entry.key.get()).as_ptr() };
@@ -163,9 +158,8 @@ impl<K: Eq, V, const N: usize> Index<K, V, N> {
         key: &K,
     ) -> Result<CommittedReservation<'_, K, V, N>, IndexError> {
         let _guard = self.lock.lock();
-        let limit = self.scan_limit_locked();
 
-        for (slot_index, entry) in self.entries[..limit].iter().enumerate() {
+        for (slot_index, entry) in self.entries.iter().enumerate() {
             let state = unsafe { *entry.state.get() };
             if state != EMPTY && unsafe { (*entry.key.get()).assume_init_ref() == key } {
                 return match state {
@@ -190,63 +184,16 @@ impl<K: Eq, V, const N: usize> Index<K, V, N> {
 }
 
 impl<K, V, const N: usize> Index<K, V, N> {
-    fn scan_limit_locked(&self) -> usize {
-        self.scan_limit.load(Ordering::Acquire).min(N)
-    }
-
-    fn extend_scan_limit_locked(&self, candidate: usize) {
-        let current = self.scan_limit_locked();
-        if candidate > current {
-            self.scan_limit.store(candidate.min(N), Ordering::Release);
-        }
-    }
-
-    fn shrink_scan_limit_locked(&self) {
-        let mut limit = self.scan_limit_locked();
-        while limit > 0 {
-            let entry = &self.entries[limit - 1];
-            if unsafe { *entry.state.get() } != EMPTY {
-                break;
-            }
-            limit -= 1;
-        }
-        self.scan_limit.store(limit, Ordering::Release);
-    }
-
-    /// Snapshot committed values observed under an epoch guard.
-    pub fn snapshot_values(&self, _guard: &Guard<'_>) -> Vec<V>
-    where
-        V: Clone,
-    {
-        let _lock = self.lock.lock();
-        let limit = self.scan_limit_locked();
-        let mut values = Vec::new();
-
-        for entry in &self.entries[..limit] {
-            let state = unsafe { *entry.state.get() };
-            if state == COMMITTED {
-                values.push(unsafe { (*entry.value.get()).assume_init_ref().clone() });
-            }
-        }
-
-        values
-    }
-
     /// Snapshot committed values through a caller-supplied projection.
-    ///
-    /// This is useful for indexes whose value has a fallible observation
-    /// path: stale values can be skipped without panicking while the index
-    /// remains locked against concurrent mutation.
     pub fn snapshot_values_filter_map<R>(
         &self,
         _guard: &Guard<'_>,
         mut f: impl FnMut(&V) -> Option<R>,
     ) -> Vec<R> {
         let _lock = self.lock.lock();
-        let limit = self.scan_limit_locked();
         let mut values = Vec::new();
 
-        for entry in &self.entries[..limit] {
+        for entry in &self.entries {
             let state = unsafe { *entry.state.get() };
             if state == COMMITTED {
                 let value = unsafe { (*entry.value.get()).assume_init_ref() };
@@ -357,7 +304,6 @@ impl<K, V, const N: usize> Drop for IndexReservation<'_, K, V, N> {
                 *entry.state.get() = EMPTY;
             }
         }
-        self.index.shrink_scan_limit_locked();
     }
 }
 
@@ -378,7 +324,6 @@ impl<K, V, const N: usize> CommittedReservation<'_, K, V, N> {
             *entry.state.get() = EMPTY;
             value
         };
-        self.index.shrink_scan_limit_locked();
         self.committed = true;
         value
     }

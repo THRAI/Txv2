@@ -82,6 +82,7 @@ fn make_page_backed_open_file(page_count: u64, read: bool, write: bool) -> zone:
             append: false,
             cloexec: false,
             nonblocking: false,
+            packet: false,
         },
     )
     .expect("open file cap")

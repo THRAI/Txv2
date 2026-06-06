@@ -24,7 +24,8 @@ use tx_platform_adapter::platform_adapter;
     reason = "expose substrate step engine outcome types (StepOutcome, ByteProgress, NoProgress, Errno), zone role types (Cap, Weak, Zone, ZoneAllocated), and EBR guard used by vfs trait surface and walker step ops"
 )]
 pub mod step_engine {
-    pub use tx_substrate::epoch::{guard, Guard};
+    pub(crate) use crate::sync::SpinMutex;
+    pub use tx_substrate::epoch::{borrow_current_guard, guard, Guard};
     pub use tx_substrate::step::{
         drive_oneshot, ByteProgress, Deadline, Errno, InterestMask, NoProgress, OneShotStepOp,
         ProcessIdentity, ResumeOutcome, ScriptCtx, StepOp, StepOutcome, StepProgress,
@@ -36,7 +37,6 @@ pub mod step_engine {
         OperationalCapExt, OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy,
         RetainedEntityPolicy, Weak, Zone, ZoneAllocated, ZoneError, ZonePolicy,
     };
-    pub use tx_substrate::SpinMutex;
 }
 
 #[platform_adapter(
@@ -67,7 +67,6 @@ pub mod wait_routing {
         source
     }
 
-    /// Delegates to `tx_substrate::wake::unregister_source`.
     pub fn unregister_source(source_id: u64) {
         tx_substrate::wake::unregister_source(tx_substrate::step::WaitSourceId::new(source_id));
     }

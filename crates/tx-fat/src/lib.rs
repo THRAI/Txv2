@@ -14,3 +14,4 @@ pub mod mount;
 pub mod namespace;
 mod pager;
 mod read_backend;
+mod sync;

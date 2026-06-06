@@ -9,13 +9,12 @@
 //! `RANGE_LOCK_RELEASE_MASK` bit so async script wrappers can convert a
 //! `WouldBlock` outcome into an awaitable wait via `WouldBlock::wait_token`.
 
-use crate::vm::adapter::step_engine::{
-    InterestMask, NoProgress, SpinMutex, StepOutcome as V3StepOutcome, WaitSourceId, YieldShape,
-};
-use crate::vm::adapter::wait_routing::{Channel, Mask};
+use crate::vm::adapter::step_engine::{NoProgress, StepOutcome as V3StepOutcome};
+use crate::vm::adapter::wait_routing::{Channel, WaitSource};
+use crate::vm::lock_metrics::{vm_spin_mutex, VmSpinMutex};
+use alloc::sync::Arc;
 
 use crate::execution::WaitToken;
-use crate::wait_source;
 
 use super::UserRange;
 
@@ -113,19 +112,20 @@ impl Drop for PendingWriter<'_> {
 /// This type preserves the declared overlap semantics and writer preference,
 /// but it is not the final optimized segment tree/concurrent interval index.
 pub struct RangeLock {
-    state: SpinMutex<RangeLockState>,
+    state: VmSpinMutex<RangeLockState>,
     wait_channel: Channel,
+    wait_source: Arc<WaitSource>,
     wait_source_id: u64,
 }
 
 impl RangeLock {
     pub fn new() -> Self {
-        let wait_channel = Channel::new();
-        let wait_source_id = wait_source::register_wait_channel(wait_channel.clone());
+        let wait_point = crate::vm::notification::new_range_lock_wait_point();
         Self {
-            state: SpinMutex::new(RangeLockState::new()),
-            wait_channel,
-            wait_source_id,
+            state: vm_spin_mutex(RangeLockState::new(), b"debug.lock.vm.range_lock.state"),
+            wait_channel: wait_point.channel,
+            wait_source: wait_point.source,
+            wait_source_id: wait_point.source_id,
         }
     }
 
@@ -157,14 +157,7 @@ impl RangeLock {
         match self.acquire_step_rich(range, mode) {
             AcquireResult::Acquired(guard) => V3StepOutcome::Done(guard),
             AcquireResult::WouldBlock(blocked) => {
-                let token = blocked.wait_token();
-                V3StepOutcome::Yield {
-                    progress: NoProgress,
-                    shape: YieldShape::OnWaitSource {
-                        source: WaitSourceId::new(token.source_id()),
-                        interests: InterestMask::new(token.interest()),
-                    },
-                }
+                crate::vm::notification::range_lock_blocked(blocked.wait_token().source_id())
             }
         }
     }
@@ -178,14 +171,7 @@ impl RangeLock {
         match self.acquire_pair_step_rich(a, b) {
             AcquirePairResult::Acquired(pair) => V3StepOutcome::Done(pair),
             AcquirePairResult::WouldBlock(blocked) => {
-                let token = blocked.wait_token();
-                V3StepOutcome::Yield {
-                    progress: NoProgress,
-                    shape: YieldShape::OnWaitSource {
-                        source: WaitSourceId::new(token.source_id()),
-                        interests: InterestMask::new(token.interest()),
-                    },
-                }
+                crate::vm::notification::range_lock_blocked(blocked.wait_token().source_id())
             }
         }
     }
@@ -280,15 +266,16 @@ impl RangeLock {
 
     fn release_active(&self, id: u64, range: UserRange) {
         self.state.lock().release_active(id, range);
-        self.wait_channel
-            .fire(Mask::from_bits(RANGE_LOCK_RELEASE_MASK));
+        crate::vm::notification::notify_range_lock_released(&self.wait_channel, &self.wait_source);
     }
 
     fn release_pending_writer(&self, id: u64, range: UserRange) {
         if id != 0 {
             self.state.lock().release_pending_writer(id, range);
-            self.wait_channel
-                .fire(Mask::from_bits(RANGE_LOCK_RELEASE_MASK));
+            crate::vm::notification::notify_range_lock_released(
+                &self.wait_channel,
+                &self.wait_source,
+            );
         }
     }
 }
@@ -301,7 +288,7 @@ impl Default for RangeLock {
 
 impl Drop for RangeLock {
     fn drop(&mut self) {
-        wait_source::release_wait_channel(self.wait_source_id);
+        crate::vm::notification::release_range_lock_wait_point(self.wait_source_id);
     }
 }
 

@@ -8,6 +8,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
+use crate::mount::MountNamespace;
 use crate::vfs::adapter::step_engine::Cap;
 use crate::vfs::{DEntry, FsObjectId, InodeMeta, RNode};
 
@@ -57,9 +58,12 @@ pub enum WalkState {
     Walking(WalkingState),
     /// Walker emitted an IO request and must yield.
     Defer {
+        request: IORequest,
         resume: ResumeToken,
         cause: WalkCause,
     },
+    /// Walker hit a terminal error before producing a path resolution.
+    Error(WalkCause),
     /// Walker reached a terminal outcome.
     Terminal(PathResolution),
 }
@@ -86,12 +90,16 @@ pub struct WalkingState {
 
 /// Opaque re-entry token encoding the full walker state for yield/resume.
 ///
-/// v1: encodes `WalkingState` inline plus the surrounding context
-/// (`fs_ops`, `mount_payload`, `mode`, `policy`).
+/// v1: encodes `WalkingState` inline plus mount-namespace context. The
+/// caller still supplies mode/policy/credential when resuming.
 #[derive(Clone, Debug)]
 pub struct ResumeToken {
     /// Serialised walking state.
     pub walking: WalkingState,
+    /// I/O request that suspended this walker.
+    pub request: IORequest,
+    /// Mount namespace that constrained mountpoint crossing before yield.
+    pub mount_namespace: Option<Cap<MountNamespace>>,
     /// How many symlink hops accounted for.
     pub hop_count: u32,
 }
@@ -134,12 +142,21 @@ pub enum IORequest {
     },
     ReadLink {
         fs_object_id: FsObjectId,
+        meta: InodeMeta,
     },
     /// Materialise an RNode for a freshly-looked-up inode.
     MaterialiseRnode {
         fs_object_id: FsObjectId,
         meta: InodeMeta,
     },
+}
+
+#[derive(Clone, Debug)]
+pub enum IOResult {
+    DirLookup(Result<FsObjectId, crate::execution::Errno>),
+    LoadInodeMeta(Result<InodeMeta, crate::execution::Errno>),
+    ReadLink(Result<Box<[u8]>, crate::execution::Errno>),
+    MaterialiseRnode(Result<Cap<RNode>, crate::execution::Errno>),
 }
 
 // ============================================================================

@@ -51,7 +51,7 @@ impl LifecycleFs {
 
     fn failing_fallocate(errno: Errno) -> Self {
         Self {
-            fallocate_outcome: V3Outcome::err(errno),
+            fallocate_outcome: V3Outcome::err(errno.into()),
             ..Self::new()
         }
     }
@@ -65,7 +65,7 @@ impl LifecycleFs {
 
     fn failing_truncate(errno: Errno) -> Self {
         Self {
-            truncate_outcome: V3Outcome::err(errno),
+            truncate_outcome: V3Outcome::err(errno.into()),
             ..Self::new()
         }
     }
@@ -200,7 +200,7 @@ fn pagebacked_step_truncate_leaves_state_unchanged_when_file_backing_fails() {
 
     assert_eq!(
         step_truncate(&pc, crate::vm::USER_PAGE_SIZE as u64, &guard),
-        V3Out::Err(Errno::EROFS)
+        V3Out::Err(Errno::EROFS.into())
     );
 
     assert_eq!(pc.size_bytes(), original_size);
@@ -229,10 +229,13 @@ fn pagebacked_step_truncate_rejects_device_and_capacity_growth() {
         1,
     );
 
-    assert_eq!(step_truncate(&device, 0, &guard), V3Out::Err(Errno::EINVAL));
+    assert_eq!(
+        step_truncate(&device, 0, &guard),
+        V3Out::Err(Errno::EINVAL.into())
+    );
     assert_eq!(
         step_truncate(&anon, 2 * crate::vm::USER_PAGE_SIZE as u64, &guard),
-        V3Out::Err(Errno::EINVAL)
+        V3Out::Err(Errno::EINVAL.into())
     );
 }
 
@@ -466,7 +469,7 @@ fn pagebacked_step_fallocate_leaves_state_unchanged_when_file_backing_fails() {
 
     assert_eq!(
         step_fallocate(&pc, 2 * crate::vm::USER_PAGE_SIZE as u64, &guard),
-        V3Out::Err(Errno::EDQUOT)
+        V3Out::Err(Errno::EDQUOT.into())
     );
 
     assert_eq!(fs.fallocates.load(Ordering::Acquire), 1);
@@ -490,7 +493,7 @@ fn pagebacked_step_fallocate_rejects_device_and_capacity_growth() {
 
     assert_eq!(
         step_fallocate(&device, 16, &guard),
-        V3Out::Err(Errno::EINVAL)
+        V3Out::Err(Errno::EINVAL.into())
     );
 
     let anon = PageContainer::new(
@@ -502,7 +505,7 @@ fn pagebacked_step_fallocate_rejects_device_and_capacity_growth() {
     let beyond = 3 * crate::vm::USER_PAGE_SIZE as u64;
     assert_eq!(
         step_fallocate(&anon, beyond, &guard),
-        V3Out::Err(Errno::EINVAL)
+        V3Out::Err(Errno::EINVAL.into())
     );
     assert_eq!(anon.size_bytes(), 2 * crate::vm::USER_PAGE_SIZE as u64);
 }
@@ -812,6 +815,9 @@ fn fsopsv3_default_read_link_returns_enosys() {
     // Wave-8 design choice: defaults match `FsOps` exactly. `LifecycleFs`
     // does not override `read_link`, so the default `ENOSYS` answer
     // must round-trip through the v3 outcome shape.
+    let _lock = EPOCH_TEST_LOCK
+        .lock()
+        .expect("page-backed lifecycle test lock");
     setup_host_substrate();
     let guard = step_engine::guard();
     let fs = LifecycleFs::new();

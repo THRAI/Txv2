@@ -7,7 +7,7 @@
 
 use alloc::vec::Vec;
 
-use crate::vm::{AddressSpace, AddressSpaceStats, Prot, UserRange, VmBacking, VmEntryFlags};
+use crate::vm::{AddressSpace, AddressSpaceStats, Prot, UserRange, VmEntryBacking, VmEntryFlags};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AddressSpaceProjection {
@@ -40,7 +40,7 @@ pub fn project_address_space(aspace: &AddressSpace) -> AddressSpaceProjection {
                 range: entry.range,
                 prot: entry.prot,
                 flags: entry.flags,
-                backing: project_backing(&entry.backing),
+                backing: project_backing(entry.backing_kind()),
             })
             .collect(),
     }
@@ -50,10 +50,10 @@ pub fn address_space_stats(aspace: &AddressSpace) -> AddressSpaceStats {
     aspace.stats()
 }
 
-const fn project_backing(backing: &VmBacking) -> VmBackingProjection {
+const fn project_backing(backing: VmEntryBacking) -> VmBackingProjection {
     match backing {
-        VmBacking::None => VmBackingProjection::None,
-        VmBacking::PrivateAnon => VmBackingProjection::PrivateAnon,
-        VmBacking::Page { offset, .. } => VmBackingProjection::Page { offset: *offset },
+        VmEntryBacking::None => VmBackingProjection::None,
+        VmEntryBacking::PrivateAnon => VmBackingProjection::PrivateAnon,
+        VmEntryBacking::Page { offset } => VmBackingProjection::Page { offset },
     }
 }

@@ -18,7 +18,9 @@ const MIN_CLASS: usize = 8;
 const MAX_SLAB_CLASS: usize = 2048;
 const CLASS_COUNT: usize = 9;
 const CLASS_SIZES: [usize; CLASS_COUNT] = [8, 16, 32, 64, 128, 256, 512, 1024, 2048];
+const CLASS_REFILL_PAGES: [usize; CLASS_COUNT] = [1, 1, 1, 4, 8, 4, 2, 1, 1];
 const DEFAULT_PAGE_SIZE: usize = 4096;
+const RETAIN_EMPTY_SLAB_PAGES_PER_CLASS: usize = 1;
 
 /// Slab allocation failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -154,6 +156,11 @@ impl<P: SlabPageProvider> SlabHeap<P> {
 
             *class.free_list.get() = (*object).next;
             let header = page_header_for_object(object as *mut u8, self.provider.page_size());
+            if (*header).retained_empty {
+                debug_assert_eq!((*header).free_count, (*header).capacity);
+                (*header).retained_empty = false;
+                *class.retained_empty_pages.get() -= 1;
+            }
             (*header).free_count -= 1;
 
             Ok(NonNull::new_unchecked(object as *mut u8))
@@ -173,14 +180,19 @@ impl<P: SlabPageProvider> SlabHeap<P> {
             (*header).free_count += 1;
 
             if (*header).free_count == (*header).capacity {
-                let page_base = header as *mut u8;
-                remove_page_objects_from_free_list(
-                    class.free_list.get(),
-                    page_base,
-                    self.provider.page_size(),
-                );
-                unlink_page(class.pages.get(), header);
-                page_to_release = header;
+                if *class.retained_empty_pages.get() < RETAIN_EMPTY_SLAB_PAGES_PER_CLASS {
+                    (*header).retained_empty = true;
+                    *class.retained_empty_pages.get() += 1;
+                } else {
+                    let page_base = header as *mut u8;
+                    remove_page_objects_from_free_list(
+                        class.free_list.get(),
+                        page_base,
+                        self.provider.page_size(),
+                    );
+                    unlink_page(class.pages.get(), header);
+                    page_to_release = header;
+                }
             }
         }
 
@@ -226,44 +238,59 @@ impl<P: SlabPageProvider> SlabHeap<P> {
     unsafe fn populate_class(&self, index: usize, class: &SlabClass) -> Result<(), SlabError> {
         let size = CLASS_SIZES[index];
         let page_size = self.provider.page_size();
-        let ppn = self.provider.reserve_run(1, 1)?;
-        let page = unsafe { self.provider.direct_map_ptr(ppn) };
-        if page.is_null() {
-            unsafe {
-                self.provider.release_run(ppn, 1);
-            }
-            return Err(SlabError::InvalidLayout);
-        }
-
         let object_start = align_up(core::mem::size_of::<SlabPageHeader>(), size)
             .ok_or(SlabError::InvalidLayout)?;
         let capacity = (page_size - object_start) / size;
         if capacity == 0 {
-            unsafe {
-                self.provider.release_run(ppn, 1);
-            }
             return Err(SlabError::InvalidLayout);
         }
 
-        unsafe {
-            let header = page as *mut SlabPageHeader;
-            header.write(SlabPageHeader {
-                ppn,
-                capacity,
-                free_count: capacity,
-                next: *class.pages.get(),
-                prev: ptr::null_mut(),
-            });
-
-            if !(*class.pages.get()).is_null() {
-                (**class.pages.get()).prev = header;
+        let mut page_count = CLASS_REFILL_PAGES[index].max(1);
+        let ppn = match self.provider.reserve_run(page_count, 1) {
+            Ok(ppn) => ppn,
+            Err(err) if page_count > 1 => {
+                page_count = 1;
+                match self.provider.reserve_run(1, 1) {
+                    Ok(ppn) => ppn,
+                    Err(_) => return Err(err.into()),
+                }
             }
-            *class.pages.get() = header;
+            Err(err) => return Err(err.into()),
+        };
 
-            for offset in 0..capacity {
-                let object = page.add(object_start + offset * size) as *mut FreeObject;
-                (*object).next = *class.free_list.get();
-                *class.free_list.get() = object;
+        unsafe {
+            for page_offset in 0..page_count {
+                let page = self.provider.direct_map_ptr(Ppn(ppn.0 + page_offset));
+                if page.is_null() {
+                    self.provider.release_run(ppn, page_count);
+                    return Err(SlabError::InvalidLayout);
+                }
+            }
+
+            for page_offset in 0..page_count {
+                let page_ppn = Ppn(ppn.0 + page_offset);
+                let page = self.provider.direct_map_ptr(page_ppn);
+
+                let header = page as *mut SlabPageHeader;
+                header.write(SlabPageHeader {
+                    ppn: page_ppn,
+                    capacity,
+                    free_count: capacity,
+                    retained_empty: false,
+                    next: *class.pages.get(),
+                    prev: ptr::null_mut(),
+                });
+
+                if !(*class.pages.get()).is_null() {
+                    (**class.pages.get()).prev = header;
+                }
+                *class.pages.get() = header;
+
+                for offset in 0..capacity {
+                    let object = page.add(object_start + offset * size) as *mut FreeObject;
+                    (*object).next = *class.free_list.get();
+                    *class.free_list.get() = object;
+                }
             }
         }
 
@@ -275,6 +302,7 @@ struct SlabClass {
     lock: SpinLock,
     free_list: UnsafeCell<*mut FreeObject>,
     pages: UnsafeCell<*mut SlabPageHeader>,
+    retained_empty_pages: UnsafeCell<usize>,
 }
 
 unsafe impl Sync for SlabClass {}
@@ -285,6 +313,7 @@ impl SlabClass {
             lock: SpinLock::new(),
             free_list: UnsafeCell::new(ptr::null_mut()),
             pages: UnsafeCell::new(ptr::null_mut()),
+            retained_empty_pages: UnsafeCell::new(0),
         }
     }
 }
@@ -327,6 +356,7 @@ struct SlabPageHeader {
     ppn: Ppn,
     capacity: usize,
     free_count: usize,
+    retained_empty: bool,
     next: *mut SlabPageHeader,
     prev: *mut SlabPageHeader,
 }

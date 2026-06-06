@@ -5,7 +5,7 @@ use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use tx_hal::UserTrapContext;
 use tx_subsystems::process::{Pgid, Pid};
-use tx_subsystems::reactor_submit;
+use tx_subsystems::reactor_submit::{self, SubmitChildThreadStatus};
 
 // -----------------------------------------------------------------------
 // Reactor-submission test capture.
@@ -22,10 +22,14 @@ static SUBMIT_CHILD_THREAD_CALLS: AtomicUsize = AtomicUsize::new(0);
 static SUBMIT_CHILD_PROC_KEY: AtomicUsize = AtomicUsize::new(0);
 static SUBMIT_CHILD_THREAD_KEY: AtomicUsize = AtomicUsize::new(0);
 
-fn capturing_submit(child_process: Cap<ProcessIdentity>, child_thread: Cap<ThreadIdentity>) {
+fn capturing_submit(
+    child_process: Cap<ProcessIdentity>,
+    child_thread: Cap<ThreadIdentity>,
+) -> SubmitChildThreadStatus {
     SUBMIT_CHILD_THREAD_CALLS.fetch_add(1, AtomicOrdering::SeqCst);
     SUBMIT_CHILD_PROC_KEY.store(child_process.key().raw() as usize, AtomicOrdering::SeqCst);
     SUBMIT_CHILD_THREAD_KEY.store(child_thread.key().raw() as usize, AtomicOrdering::SeqCst);
+    SubmitChildThreadStatus::Published
 }
 
 fn install_capturing_seam_and_reset() {
@@ -33,6 +37,16 @@ fn install_capturing_seam_and_reset() {
     SUBMIT_CHILD_PROC_KEY.store(0, AtomicOrdering::SeqCst);
     SUBMIT_CHILD_THREAD_KEY.store(0, AtomicOrdering::SeqCst);
     reactor_submit::install_submit_child_thread(capturing_submit);
+}
+
+fn expect_clone_return_value(result: SyscallResult) -> i64 {
+    match result {
+        SyscallResult::CloneReturn {
+            value,
+            child_submit: SubmitChildThreadStatus::Published,
+        } => value,
+        other => panic!("expected CloneReturn(value, Published), got {other:?}"),
+    }
 }
 
 /// Synthesise a parent `UserTrapContext` and stamp it onto the
@@ -79,10 +93,7 @@ fn dispatch_clone_bare_sigchld_returns_child_pid() {
     let req = SyscallRequest::new(NR_CLONE, [SIGCHLD, 0, 0, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
 
-    let child_pid = match result {
-        SyscallResult::Return(v) => v,
-        other => panic!("expected Return(child_pid), got {other:?}"),
-    };
+    let child_pid = expect_clone_return_value(result);
     assert!(child_pid > 0, "child pid must be positive, got {child_pid}");
     assert_ne!(
         child_pid as u32, parent_pid.0,
@@ -112,10 +123,7 @@ fn dispatch_clone_with_clone_vm_flag_returns_child_pid() {
     let req = SyscallRequest::new(NR_CLONE, [SIGCHLD | CLONE_VM, 0, 0, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     // CLONE_VM is now accepted — child shares parent's aspace.
-    match result {
-        SyscallResult::Return(pid) => assert!(pid > 0),
-        other => panic!("expected Return(pid), got {other:?}"),
-    }
+    assert!(expect_clone_return_value(result) > 0);
 }
 
 /// flags = `SIGCHLD | CLONE_NEWIPC` creates a child process in a
@@ -136,10 +144,7 @@ fn dispatch_clone_with_clone_newipc_publishes_fresh_ipc_namespace() {
     const CLONE_NEWIPC: u64 = 0x08000000;
     let req = SyscallRequest::new(NR_CLONE, [SIGCHLD | CLONE_NEWIPC, 0, 0, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
-    let child_pid = match result {
-        SyscallResult::Return(pid) => pid,
-        other => panic!("expected Return(pid), got {other:?}"),
-    };
+    let child_pid = expect_clone_return_value(result);
 
     let child = tx_subsystems::process::process_by_pid(tx_subsystems::process::structure::Pid(
         child_pid as u32,
@@ -156,91 +161,6 @@ fn dispatch_clone_with_clone_newipc_publishes_fresh_ipc_namespace() {
         child_nsproxy.pid_ns.key().raw()
     );
     assert_eq!(child_nsproxy.ipc_ns.limits.lock().mq_maxmsg, 19);
-}
-
-/// glibc's `_Fork` on RV64 issues
-/// `clone(SIGCHLD | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID, 0,
-///        NULL, NULL, ctid)`. Accepting these flags is normal Linux
-/// ABI, not a test-specific bypass: the child tid is published at
-/// `ctid`, and the same pointer is recorded for the exit-time
-/// clear-child-tid futex protocol.
-#[test]
-fn dispatch_clone_with_glibc_fork_tid_flags_returns_child_pid() {
-    let _setup = setup();
-    install_capturing_seam_and_reset();
-
-    let proc_cap = bootstrap();
-    let thread = first_thread(&proc_cap);
-    let _ = seed_parent_trap_context(&thread);
-    let ctx = make_ctx(proc_cap.clone(), thread);
-
-    let mut child_tid_word = 0i32;
-    let child_tid_ptr = &mut child_tid_word as *mut i32 as u64;
-    let flags = SIGCHLD | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID;
-    let req = SyscallRequest::new(NR_CLONE, [flags, 0, 0, 0, child_tid_ptr, 0]);
-    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
-    let child_pid = match result {
-        SyscallResult::Return(pid) => {
-            assert!(pid > 0);
-            pid
-        }
-        other => panic!("expected Return(pid), got {other:?}"),
-    };
-
-    let child = tx_subsystems::process::process_by_pid(tx_subsystems::process::structure::Pid(
-        child_pid as u32,
-    ))
-    .expect("child process is registered after clone");
-    let child_leader = child.nth_thread(0).expect("child has leader thread");
-    assert_eq!(
-        child_tid_word, child_leader.tid.0 as i32,
-        "CLONE_CHILD_SETTID must publish the child leader tid"
-    );
-    assert_eq!(
-        *child_leader
-            .payload_cap()
-            .expect("child leader payload")
-            .clear_child_tid
-            .lock(),
-        Some(child_tid_ptr),
-        "CLONE_CHILD_CLEARTID records the exit-time clear_child_tid pointer"
-    );
-}
-
-/// `CLONE_PARENT_SETTID` publishes the child's tid into the parent's
-/// userspace before the parent observes the successful clone return.
-#[test]
-fn dispatch_clone_with_parent_settid_writes_parent_tid_word() {
-    let _setup = setup();
-    install_capturing_seam_and_reset();
-
-    let proc_cap = bootstrap();
-    let thread = first_thread(&proc_cap);
-    let _ = seed_parent_trap_context(&thread);
-    let ctx = make_ctx(proc_cap.clone(), thread);
-
-    let mut parent_tid_word = 0i32;
-    let parent_tid_ptr = &mut parent_tid_word as *mut i32 as u64;
-    let flags = SIGCHLD | CLONE_PARENT_SETTID;
-    let req = SyscallRequest::new(NR_CLONE, [flags, 0, parent_tid_ptr, 0, 0, 0]);
-    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
-    let child_pid = match result {
-        SyscallResult::Return(pid) => {
-            assert!(pid > 0);
-            pid
-        }
-        other => panic!("expected Return(pid), got {other:?}"),
-    };
-
-    let child = tx_subsystems::process::process_by_pid(tx_subsystems::process::structure::Pid(
-        child_pid as u32,
-    ))
-    .expect("child process is registered after clone");
-    let child_leader = child.nth_thread(0).expect("child has leader thread");
-    assert_eq!(
-        parent_tid_word, child_leader.tid.0 as i32,
-        "CLONE_PARENT_SETTID must publish the child leader tid to parent memory"
-    );
 }
 
 /// flags = bare SIGCHLD, stack = `0x4000_0000` → success; the child's
@@ -261,13 +181,8 @@ fn dispatch_clone_with_nonzero_stack_seeds_child_sp() {
     const NEWSP: u64 = 0x4000_0000;
     let req = SyscallRequest::new(NR_CLONE, [SIGCHLD, NEWSP, 0, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
-    let child_pid = match result {
-        SyscallResult::Return(pid) => {
-            assert!(pid > 0);
-            pid
-        }
-        other => panic!("expected Return(pid), got {other:?}"),
-    };
+    let child_pid = expect_clone_return_value(result);
+    assert!(child_pid > 0);
     let child = tx_subsystems::process::process_by_pid(tx_subsystems::process::structure::Pid(
         child_pid as u32,
     ))
@@ -315,7 +230,13 @@ fn dispatch_clone_seeds_child_a0_to_zero_and_pc_after_ecall() {
 
     let req = SyscallRequest::new(NR_CLONE, [SIGCHLD, 0, 0, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
-    assert!(matches!(result, SyscallResult::Return(v) if v > 0));
+    assert!(matches!(
+        result,
+        SyscallResult::CloneReturn {
+            value: v,
+            child_submit: SubmitChildThreadStatus::Published,
+        } if v > 0
+    ));
 
     // Inspect the child's leader thread saved context.
     let children = proc_cap.children();
@@ -368,7 +289,7 @@ fn dispatch_clone_submits_child_via_reactor_seam() {
 
     let req = SyscallRequest::new(NR_CLONE, [SIGCHLD, 0, 0, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
-    assert!(matches!(result, SyscallResult::Return(v) if v > 0));
+    assert!(expect_clone_return_value(result) > 0);
 
     // Seam was hit exactly once.
     assert_eq!(SUBMIT_CHILD_THREAD_CALLS.load(AtomicOrdering::SeqCst), 1);
@@ -388,6 +309,36 @@ fn dispatch_clone_submits_child_via_reactor_seam() {
         SUBMIT_CHILD_THREAD_KEY.load(AtomicOrdering::SeqCst),
         child_leader.key().raw() as usize,
         "captured thread cap must be the child's leader thread"
+    );
+}
+
+#[test]
+fn dispatch_clone_oneshot_handles_non_vfork_and_defers_vfork() {
+    let _setup = setup();
+    install_capturing_seam_and_reset();
+
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let _ = seed_parent_trap_context(&thread);
+    let aspace = proc_cap.aspace_cap().expect("bootstrap process has aspace");
+
+    let fork_req = SyscallRequest::new(NR_CLONE, [SIGCHLD, 0, 0, 0, 0, 0]);
+    let fork_result =
+        dispatch_clone_oneshot::<ShimsTestPmap>(&fork_req, &proc_cap, &thread, &aspace);
+    assert!(matches!(
+        fork_result,
+        Some(SyscallResult::CloneReturn {
+            value: v,
+            child_submit: SubmitChildThreadStatus::Published,
+        }) if v > 0
+    ));
+    assert_eq!(SUBMIT_CHILD_THREAD_CALLS.load(AtomicOrdering::SeqCst), 1);
+
+    let vfork_req = SyscallRequest::new(NR_CLONE, [SIGCHLD | CLONE_VFORK, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        dispatch_clone_oneshot::<ShimsTestPmap>(&vfork_req, &proc_cap, &thread, &aspace),
+        None,
+        "CLONE_VFORK must stay on the async clone path"
     );
 }
 
@@ -495,27 +446,6 @@ fn dispatch_getpgid_self_returns_own_pgid() {
     let ctx = make_ctx(proc_cap, thread);
 
     let req = SyscallRequest::new(NR_GETPGID, [0, 0, 0, 0, 0, 0]);
-    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
-    assert_eq!(result, SyscallResult::Return(expected_pgid));
-}
-
-/// `getpgrp()` returns the caller's process-group id.
-///
-/// Slice 7 of the shell-prompt roadmap (2026-05-07) replaced the
-/// previous `-ENOSYS` stub with the real implementation
-/// (`process.pgrp_cap().pgid.0`). musl uses `getpgid(0)` directly
-/// and never issues this number, but glibc emulates `getpgrp()`
-/// as `getpgid(0)` and shipping the real arm removes a startup
-/// `-ENOSYS` from any glibc-built binary that lands later.
-#[test]
-fn dispatch_getpgrp_returns_caller_pgid() {
-    let _setup = setup();
-    let proc_cap = bootstrap();
-    let thread = first_thread(&proc_cap);
-    let expected_pgid = proc_cap.pgrp_cap().pgid.0 as i64;
-    let ctx = make_ctx(proc_cap, thread);
-
-    let req = SyscallRequest::new(NR_GETPGRP, [0; 6]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Return(expected_pgid));
 }

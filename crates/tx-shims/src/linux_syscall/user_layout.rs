@@ -730,16 +730,46 @@ pub const KERNEL_USER_LAYOUT_CANDIDATES: &[KernelUserCandidate] = &[
         "struct sysinfo",
         "sysinfo(2) is not dispatched yet; add checked coverage when getloadavg/sysconf memory queries are wired.",
     ),
-    full_candidate!("struct ipc_perm", <IpcPermLayout as KernelToUserLayout>::LAYOUT),
-    full_candidate!("struct msqid_ds", <MsqidDsLayout as KernelToUserLayout>::LAYOUT),
-    full_candidate!("struct msginfo", <MsginfoLayout as KernelToUserLayout>::LAYOUT),
-    full_candidate!("struct semid_ds", <SemidDsLayout as KernelToUserLayout>::LAYOUT),
-    full_candidate!("struct seminfo", <SeminfoLayout as KernelToUserLayout>::LAYOUT),
-    full_candidate!("struct sembuf", <SembufLayout as KernelToUserLayout>::LAYOUT),
-    full_candidate!("struct shmid_ds", <ShmidDsLayout as KernelToUserLayout>::LAYOUT),
-    full_candidate!("struct shminfo", <ShminfoLayout as KernelToUserLayout>::LAYOUT),
-    full_candidate!("struct shm_info", <ShmInfoLayout as KernelToUserLayout>::LAYOUT),
-    full_candidate!("struct mq_attr", <MqAttrLayout as KernelToUserLayout>::LAYOUT),
+    full_candidate!(
+        "struct ipc_perm",
+        <IpcPermLayout as KernelToUserLayout>::LAYOUT
+    ),
+    full_candidate!(
+        "struct msqid_ds",
+        <MsqidDsLayout as KernelToUserLayout>::LAYOUT
+    ),
+    full_candidate!(
+        "struct msginfo",
+        <MsginfoLayout as KernelToUserLayout>::LAYOUT
+    ),
+    full_candidate!(
+        "struct semid_ds",
+        <SemidDsLayout as KernelToUserLayout>::LAYOUT
+    ),
+    full_candidate!(
+        "struct seminfo",
+        <SeminfoLayout as KernelToUserLayout>::LAYOUT
+    ),
+    full_candidate!(
+        "struct sembuf",
+        <SembufLayout as KernelToUserLayout>::LAYOUT
+    ),
+    full_candidate!(
+        "struct shmid_ds",
+        <ShmidDsLayout as KernelToUserLayout>::LAYOUT
+    ),
+    full_candidate!(
+        "struct shminfo",
+        <ShminfoLayout as KernelToUserLayout>::LAYOUT
+    ),
+    full_candidate!(
+        "struct shm_info",
+        <ShmInfoLayout as KernelToUserLayout>::LAYOUT
+    ),
+    full_candidate!(
+        "struct mq_attr",
+        <MqAttrLayout as KernelToUserLayout>::LAYOUT
+    ),
     KernelUserCandidate {
         name: "struct sigevent mq_notify prefix",
         rust_type: <SigeventPrefixLayout as KernelToUserLayout>::LAYOUT.rust_type,

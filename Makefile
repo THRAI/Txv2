@@ -398,8 +398,6 @@ oscomp-local-rv64-smp4: oscomp-build-rv64 oscomp-submit-rv64 oscomp-qemu-rv64-sm
 
 oscomp-local-rv64-smp2: docker-build-rv64 docker-oscomp-prepare oscomp-submit-rv64 oscomp-qemu-rv64-smp2 oscomp-judge-rv64-smp2
 
-oscomp-local-rv64-smp4: oscomp-build-rv64 oscomp-submit-rv64 oscomp-qemu-rv64-smp4 oscomp-judge-rv64-smp4
-
 oscomp-local-la64: oscomp-build-la64 oscomp-submit-la64 oscomp-qemu-la64 oscomp-judge-la64
 
 oscomp-local-la64-smp4: oscomp-build-la64 oscomp-submit-la64 oscomp-qemu-la64-smp4 oscomp-judge-la64-smp4

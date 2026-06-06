@@ -133,6 +133,7 @@ fn ufd_open_file_flags() -> OpenFileFlags {
         append: false,
         cloexec: false,
         nonblocking: false,
+        packet: false,
     }
 }
 
@@ -177,7 +178,10 @@ fn userfaultfd_phase0_fd_scaffold_invariants_round_trip() {
         | OpenFileBacking::Eventfd { .. }
         | OpenFileBacking::Timerfd { .. }
         | OpenFileBacking::PosixMq { .. }
-        | OpenFileBacking::Pidfd { .. } => {
+        | OpenFileBacking::Pidfd { .. }
+        | OpenFileBacking::KernelObject { .. }
+        | OpenFileBacking::MountApi { .. }
+        | OpenFileBacking::SocketPair { .. } => {
             panic!("expected OpenFileBacking::Ufd")
         }
     }

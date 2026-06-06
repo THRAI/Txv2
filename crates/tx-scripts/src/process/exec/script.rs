@@ -57,13 +57,13 @@ use tx_subsystems::thread_runtime::ThreadIdentity;
 use tx_subsystems::vfs::walker::step_open;
 use tx_subsystems::vm::scripts::{
     self as vm_scripts, BssTail as VmBssTail, ImagePlan as VmImagePlan,
-    LoadSegment as VmLoadSegment, SegmentFlags as VmSegmentFlags, INTERP_LOAD_BIAS_DEFAULT,
-    USER_STACK_TOP_DEFAULT,
+    LoadSegment as VmLoadSegment, SegmentFlags as VmSegmentFlags, USER_STACK_TOP_DEFAULT,
 };
+use tx_subsystems::vm::{MapPlacement, MapReserveResult, Prot, VmBacking, VmEntry, VmEntryFlags};
 
 use super::loader::{
-    parse_image_plan, parse_interp_plan, ExecImagePlan, LoadSegment as ParsedLoadSegment,
-    ParseError, SegmentFlags as ParsedSegmentFlags, ELF64_PHENT, ET_DYN_LOAD_BIAS,
+    parse_image_plan, ExecImagePlan, InterpreterPlan, LoadSegment as ParsedLoadSegment, ParseError,
+    SegmentFlags as ParsedSegmentFlags, ELF64_PHENT, ET_DYN_LOAD_BIAS,
 };
 use super::stack::{build_initial_user_stack, AuxvFacts};
 use crate::adapter::step_engine::{self as step_engine, Cap, StepOutcome};
@@ -74,6 +74,8 @@ use crate::adapter::vfs_exec::{
 /// User page size — RV64 today; mirrors `vm::USER_PAGE_SIZE` so the
 /// brk-base round-up doesn't require pulling in another import.
 const USER_PAGE_SIZE: u64 = 4096;
+
+const INTERP_BASE: u64 = 0x3E_0000_0000;
 
 // ASLR functions moved inline to exec_script_inner
 
@@ -356,6 +358,13 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
         let offset = r & ((1 << 24) - 1) & !(USER_PAGE_SIZE - 1);
         ET_DYN_LOAD_BIAS + offset
     };
+    let randomize_interp_base = || -> u64 {
+        let mut buf = [0u8; 8];
+        tx_services::random::fill_bytes(&mut buf);
+        let r = u64::from_le_bytes(buf);
+        let offset = r & ((1 << 24) - 1) & !(USER_PAGE_SIZE - 1);
+        INTERP_BASE + offset
+    };
     let randomize_stack_top = || -> u64 {
         let mut buf = [0u8; 8];
         tx_services::random::fill_bytes(&mut buf);
@@ -385,8 +394,7 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     let openfile = {
         use StepOutcome as V3;
         let guard = step_engine::guard();
-        let cwd = process.cwd().ok_or(ExecError::PathNotFound)?;
-        let rooted_at = exec_root_for_path(&cwd, path);
+        let rooted_at = process.cwd().ok_or(ExecError::PathNotFound)?;
         let outcome = step_open(
             rooted_at,
             path,
@@ -396,6 +404,7 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
                 append: false,
                 cloexec: false,
                 nonblocking: false,
+                packet: false,
             },
             0,
             cred,
@@ -406,7 +415,7 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
             V3::Continue { .. } | V3::Yield { .. } => Err(ExecError::Busy),
             V3::Err(err) => {
                 EXEC_LAST_OPEN_ERRNO.store(err as i32, core::sync::atomic::Ordering::Relaxed);
-                Err(ExecError::from_walker_errno(err))
+                Err(ExecError::from_walker_errno(Errno::from(err)))
             }
         };
         drop(guard);
@@ -455,9 +464,7 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     // worth of program headers (≈ 3.6 KiB), comfortably within one
     // 4 KiB page.
     let read_len = core::cmp::min(file_size as usize, INITIAL_PARSE_READ);
-    if read_len < 64 {
-        // ELF64 header alone is 64 bytes — anything smaller cannot be
-        // a valid binary.
+    if read_len == 0 {
         return Err(ExecError::NotExecutable);
     }
     let mut header_bytes: Vec<u8> = alloc::vec![0u8; read_len];
@@ -468,7 +475,7 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
         let result = match outcome {
             V3::Done(()) => Ok(()),
             V3::Continue { .. } | V3::Yield { .. } => Err(ExecError::Busy),
-            V3::Err(err) => Err(ExecError::from_read_errno(err)),
+            V3::Err(err) => Err(ExecError::from_read_errno(err.into())),
         };
         drop(guard);
         result?;
@@ -536,21 +543,22 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
         ))
         .await;
     }
+    if read_len < 64 {
+        return Err(ExecError::NotExecutable);
+    }
 
     // ===== Phase 3 — parse + validate (pure CPU) =====================
     //
     // `txdoc:EXEC-8-3-PARSE-AND-VALIDATE`. Goblin-backed parser owns
     // every header and program-header check (class / data / version /
-    // arch / type / phdr-table fits / congruence / overlap / W^X).
-    // N69a accepts `PT_INTERP` on the main program and surfaces the
-    // segment locator in `parsed.interp`; the orchestrator dereferences
-    // the path bytes below and loads the interpreter alongside the main
-    // image.  If parsing still rejects the image after the shebang /
-    // non-ELF probes above, fall back to `/bin/sh` within the recursion
-    // budget for OSComp-style script launchers.
+    // arch / type / no PT_INTERP / no PT_DYNAMIC / phdr-table fits /
+    // congruence / overlap / W^X).  If the file does not look like a
+    // valid ELF and has no shebang, fall back to `/bin/sh` so that
+    // scripts without a `#!` line (e.g. OSComp libctest's run-static.sh
+    // / run-dynamic.sh) still execute.
     let mut parsed: ExecImagePlan = match parse_image_plan(&header_bytes) {
         Ok(plan) => plan,
-        Err(parse_err) => {
+        Err(_parse_err) => {
             if !is_elf && depth < SHEBANG_MAX_DEPTH {
                 let interp_path: Vec<u8> = b"/bin/sh".to_vec();
                 let mut new_argv: Vec<Vec<u8>> = Vec::new();
@@ -571,7 +579,7 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
                 ))
                 .await;
             }
-            return Err(ExecError::from_parse_error(parse_err));
+            return Err(ExecError::NotExecutable);
         }
     };
 
@@ -593,15 +601,141 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
         seg.vaddr = (seg.vaddr as i64 + aslr_delta) as u64;
     }
 
-    // ===== Phase 3a — open + parse interpreter (N69a) ================
+    // ===== Phase 3b — load interpreter (if PT_INTERP present) =========
     //
-    // When the main image carries a `PT_INTERP`, read the interpreter
-    // path bytes from the file, resolve it through the same VFS
-    // walker, parse it as ET_DYN, and stage a vm-side image plan.
-    // Nothing is mapped yet; the recipe rows land in Phase 4 right
-    // after `build_aspace_from_image`.
-    let interp_load = if let Some(interp_ref) = parsed.interp {
-        Some(load_interp_image(&file_pc, &header_bytes, interp_ref, process, cred).await?)
+    // When the main binary carries PT_INTERP, open and parse the
+    // interpreter ELF.  The interpreter is loaded above the main
+    // binary at a fixed high address (INTERP_LOAD_BIAS).
+    let interp_data: Option<(
+        InterpreterPlan,
+        Cap<tx_subsystems::page_backed::PageContainer>,
+    )> = if let Some(ref interp_path) = parsed.interpreter_path {
+        let interp_file = {
+            use StepOutcome as V3;
+            let guard = step_engine::guard();
+            let rooted_at = process.cwd().ok_or(ExecError::PathNotFound)?;
+            let interp_root = exec_root_for_path(&rooted_at, interp_path);
+            let mut outcome = step_open(
+                interp_root.clone(),
+                interp_path,
+                OpenFileFlags {
+                    read: true,
+                    write: false,
+                    append: false,
+                    cloexec: false,
+                    nonblocking: false,
+                    packet: false,
+                },
+                0,
+                cred,
+                &guard,
+            );
+            // When the sdcard is mounted at /musl (OSComp layout),
+            // PT_INTERP paths like /lib/ld-musl-riscv64.so.1 don't
+            // resolve at the tmpfs root.  Retry with a /musl prefix
+            // so the walker crosses from tmpfs into ext4.
+            if matches!(outcome, V3::Err(_)) && interp_path.starts_with(b"/") {
+                let mut musl_path = alloc::vec::Vec::with_capacity(5 + interp_path.len());
+                musl_path.extend_from_slice(b"/musl");
+                musl_path.extend_from_slice(interp_path);
+                let musl_root = exec_root_for_path(&rooted_at, &musl_path);
+                outcome = step_open(
+                    musl_root,
+                    &musl_path,
+                    OpenFileFlags {
+                        read: true,
+                        write: false,
+                        append: false,
+                        cloexec: false,
+                        nonblocking: false,
+                        packet: false,
+                    },
+                    0,
+                    cred,
+                    &guard,
+                );
+            }
+            // The musl OSComp images ship the dynamic linker as
+            // /musl/musl/lib/libc.so, while PT_INTERP names the Linux
+            // compatibility path (/lib*/ld-musl-*.so.1). Try the
+            // shipped location before giving up.
+            if matches!(outcome, V3::Err(_))
+                && interp_path
+                    .windows(b"ld-musl".len())
+                    .any(|window| window == b"ld-musl")
+            {
+                let libc_path = b"/musl/musl/lib/libc.so";
+                let libc_root = exec_root_for_path(&rooted_at, libc_path);
+                outcome = step_open(
+                    libc_root,
+                    libc_path,
+                    OpenFileFlags {
+                        read: true,
+                        write: false,
+                        append: false,
+                        cloexec: false,
+                        nonblocking: false,
+                        packet: false,
+                    },
+                    0,
+                    cred,
+                    &guard,
+                );
+            }
+            match outcome {
+                V3::Done(file) => file,
+                V3::Err(_) => return Err(ExecError::IoError),
+                _ => return Err(ExecError::Busy),
+            }
+        };
+        // Extract PageContainer from the interpreter file's RNode.
+        let interp_pc: Cap<PageContainer> = match interp_file.rnode().backing() {
+            RNodeBacking::PageBacked { pc } => pc.clone(),
+            _ => return Err(ExecError::NotExecutable),
+        };
+        // Read interpreter ELF header + program headers.
+        let mut interp_hdr = [0u8; 4096];
+        let guard = step_engine::guard();
+        let outcome = read_exact_at(&interp_pc, 0, &mut interp_hdr, &guard);
+        match outcome {
+            StepOutcome::Done(()) => {}
+            _ => return Err(ExecError::IoError),
+        }
+        let interp_parsed = parse_image_plan(&interp_hdr).map_err(ExecError::from_parse_error)?;
+        let mut interp_segs: Vec<ParsedLoadSegment> = Vec::new();
+        let interp_lowest_vaddr = interp_parsed
+            .load_segments
+            .iter()
+            .map(|s| s.vaddr)
+            .min()
+            .unwrap_or(0);
+        // Fixed high address for the interpreter.
+
+        let interp_load_delta = randomize_interp_base() - interp_lowest_vaddr;
+        let interp_runtime_load_bias = interp_parsed
+            .load_bias
+            .checked_add(interp_load_delta)
+            .ok_or(ExecError::NotExecutable)?;
+        for seg in &interp_parsed.load_segments {
+            interp_segs.push(ParsedLoadSegment {
+                vaddr: seg.vaddr + interp_load_delta,
+                memsz: seg.memsz,
+                filesz: seg.filesz,
+                file_offset: seg.file_offset,
+                flags: seg.flags,
+                align: seg.align,
+            });
+        }
+        Some((
+            InterpreterPlan {
+                load_bias: interp_runtime_load_bias,
+                entry: interp_parsed.entry + interp_load_delta,
+                load_segments: interp_segs,
+                bss_extension: interp_parsed.bss_extension,
+                executable_stack: interp_parsed.executable_stack,
+            },
+            interp_pc,
+        ))
     } else {
         None
     };
@@ -664,14 +798,11 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     // for demand-faulting bytes from the file). Every LOAD segment
     // shares the same backing `Cap` (they all view different ranges
     // of the same file).
-    let interp_exec_stack = interp_load
+    let interp_exec_stack = interp_data
         .as_ref()
-        .is_some_and(|interp| interp.parsed.executable_stack);
+        .is_some_and(|(i, _)| i.executable_stack);
     let stack_top = randomize_stack_top();
-    let mut image_plan = build_vm_image_plan(&parsed, stack_top, &file_pc);
-    if interp_exec_stack {
-        image_plan.executable_stack = true;
-    }
+    let image_plan = build_vm_image_plan(&parsed, interp_exec_stack, stack_top, &file_pc);
     // V1 (`build_aspace_from_image`) takes no `&Guard` — it acquires
     // its own per-call guards internally. Per
     // `txdoc:VM-3-6-CROSS-ASYNC-WAIT-DISCIPLINE` callers must NOT
@@ -679,20 +810,95 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     let new_aspace = vm_scripts::build_aspace_from_image::<P>(&image_plan)
         .map_err(ExecError::from_build_aspace_error)?;
 
-    // ===== Phase 4b — register interpreter LOAD segments (N69a) =====
+    // ===== Phase 4a.2 — register interpreter LOAD segments =========
     //
-    // Stages the interp's recipe rows on the same detached aspace at
-    // `INTERP_LOAD_BIAS_DEFAULT`. The main image owns the stack range;
-    // the interpreter does not add one. Failures here drop the
-    // detached aspace exactly like a Phase 4 failure would — no
-    // observable side effect on the caller.
-    if let Some(interp) = interp_load.as_ref() {
-        vm_scripts::register_interp_image(&new_aspace, &interp.vm_plan, INTERP_LOAD_BIAS_DEFAULT)
-            .map_err(ExecError::from_build_aspace_error)?;
-    }
+    // The interpreter's PageContainer-backed LOAD segments are
+    // registered as additional VmEntry recipes in the detached
+    // aspace, alongside the main binary's entries.  Overlap with the
+    // main binary's segments was validated in Phase 4a.1.
+    if let Some((ref interp, ref interp_pc)) = interp_data {
+        for seg in &interp.load_segments {
+            let prot = if seg.flags.writable {
+                if seg.flags.executable {
+                    Prot::new(true, true, true)
+                } else {
+                    Prot::READ_WRITE
+                }
+            } else if seg.flags.executable {
+                Prot::READ_EXECUTE
+            } else {
+                Prot::READ
+            };
 
-    // ===== Phase 5 — thread-group collapse (if multi-threaded) =======
-    let _ = process.collapse_threads_for_exec(thread);
+            let page_size = tx_subsystems::vm::USER_PAGE_SIZE as u64;
+            let page_delta = seg.vaddr % page_size;
+            let map_start = seg.vaddr - page_delta;
+            let file_page_offset = seg
+                .file_offset
+                .checked_sub(page_delta)
+                .ok_or(ExecError::NotExecutable)?;
+            let file_end = seg
+                .vaddr
+                .checked_add(seg.filesz)
+                .ok_or(ExecError::NotExecutable)?;
+            let mem_end = seg
+                .vaddr
+                .checked_add(seg.memsz)
+                .ok_or(ExecError::NotExecutable)?;
+            let file_end_rounded = page_round_up(file_end).ok_or(ExecError::NotExecutable)?;
+            let mem_end_rounded = page_round_up(mem_end).ok_or(ExecError::NotExecutable)?;
+            let file_part_end = if mem_end > file_end {
+                (file_end & !(page_size - 1)).max(map_start)
+            } else {
+                file_end_rounded.min(mem_end_rounded)
+            };
+
+            if file_part_end > map_start {
+                let seg_range = match vm_scripts::align_range(map_start, file_part_end - map_start)
+                {
+                    Some(r) => r,
+                    None => return Err(ExecError::NotExecutable),
+                };
+                let entry = VmEntry::new(
+                    seg_range,
+                    prot,
+                    VmEntryFlags::PRIVATE,
+                    VmBacking::Page {
+                        pc: interp_pc.clone().into(),
+                        offset: file_page_offset,
+                    },
+                );
+                match new_aspace.reserve_map(entry, MapPlacement::RequireFree) {
+                    MapReserveResult::Reserved(r) => {
+                        r.commit().map_err(|_| ExecError::OutOfMemory)?;
+                    }
+                    MapReserveResult::Blocked(_) => return Err(ExecError::Busy),
+                    MapReserveResult::Err(_) => return Err(ExecError::OutOfMemory),
+                }
+            }
+
+            if mem_end_rounded > file_part_end {
+                let seg_range =
+                    match vm_scripts::align_range(file_part_end, mem_end_rounded - file_part_end) {
+                        Some(r) => r,
+                        None => return Err(ExecError::NotExecutable),
+                    };
+                let entry = VmEntry::new(
+                    seg_range,
+                    prot,
+                    VmEntryFlags::PRIVATE,
+                    VmBacking::PrivateAnon,
+                );
+                match new_aspace.reserve_map(entry, MapPlacement::RequireFree) {
+                    MapReserveResult::Reserved(r) => {
+                        r.commit().map_err(|_| ExecError::OutOfMemory)?;
+                    }
+                    MapReserveResult::Blocked(_) => return Err(ExecError::Busy),
+                    MapReserveResult::Err(_) => return Err(ExecError::OutOfMemory),
+                }
+            }
+        }
+    }
 
     // ===== Phase 5a — eagerly populate partial-last-page bytes ========
     //
@@ -711,15 +917,102 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     // ".got\0ata" string fragments via gp-relative loads into its
     // BSS-extension area).
     let page_size = tx_subsystems::vm::USER_PAGE_SIZE as u64;
-    populate_partial_last_pages(&new_aspace, &image_plan.load_segments, 0, page_size).await?;
-    if let Some(interp) = interp_load.as_ref() {
-        populate_partial_last_pages(
-            &new_aspace,
-            &interp.vm_plan.load_segments,
-            INTERP_LOAD_BIAS_DEFAULT,
-            page_size,
-        )
-        .await?;
+    for segment in &image_plan.load_segments {
+        if segment.filesz == 0 {
+            continue;
+        }
+        // Only segments with BSS extension (memsz > filesz) get the
+        // partial-last-page anon-with-eager-copy treatment per
+        // `register_load_segment`'s comment block. Segments without
+        // BSS keep the original Page-backed-up-to-`file_end_rounded`
+        // shape — there's no observable junk past filesz because
+        // userspace doesn't access bytes past `vaddr + memsz`.
+        if segment.memsz <= segment.filesz {
+            continue;
+        }
+        let file_end = segment
+            .vaddr
+            .checked_add(segment.filesz)
+            .ok_or(ExecError::NotExecutable)?;
+        // Page-floor of `file_end` (start of the last page that
+        // contains file data).  `partial_start` is the vaddr of
+        // the first file-data byte in that page — clamped to
+        // `segment.vaddr` in case the segment starts mid-page.
+        let file_end_page_floor = file_end & !(page_size - 1);
+        let partial_start = file_end_page_floor.max(segment.vaddr);
+        // Number of file-content bytes in this partial page.
+        // This is the distance from `partial_start` to `file_end`,
+        // *not* the page-offset of `file_end` — the latter
+        // over-counts when the segment started mid-page and the
+        // page floor lies before `segment.vaddr`.
+        let partial_in_page = file_end - partial_start;
+        if partial_in_page == 0 {
+            continue;
+        }
+        // File offset of `partial_start`. The segment's `file_offset`
+        // corresponds to `vaddr`; offsetting by `partial_start - vaddr`
+        // gives the file offset of the bytes we need to seed. If the
+        // segment starts mid-page, the page floor can precede `vaddr`,
+        // so `partial_start` is clamped to the segment start.
+        let file_off = segment
+            .file_offset
+            .checked_add(partial_start - segment.vaddr)
+            .ok_or(ExecError::NotExecutable)?;
+        let mut buf = alloc::vec![0u8; partial_in_page as usize];
+        {
+            use StepOutcome as V3;
+            let guard = step_engine::guard();
+            match read_exact_at(&segment.backing, file_off, &mut buf, &guard) {
+                V3::Done(()) => {}
+                V3::Continue { .. } | V3::Yield { .. } => return Err(ExecError::Busy),
+                V3::Err(_) => return Err(ExecError::NotExecutable),
+            }
+        }
+        match vm_scripts::populate_detached_user_range(&new_aspace, partial_start, &buf).await {
+            StepOutcome::Done(()) => {}
+            StepOutcome::Err(err) => {
+                return Err(ExecError::from_populate_errno(err.into()));
+            }
+            _ => return Err(ExecError::Busy),
+        }
+    }
+    if let Some((ref interp, ref interp_pc)) = interp_data {
+        for segment in &interp.load_segments {
+            if segment.filesz == 0 || segment.memsz <= segment.filesz {
+                continue;
+            }
+            let file_end = segment
+                .vaddr
+                .checked_add(segment.filesz)
+                .ok_or(ExecError::NotExecutable)?;
+            let file_end_page_floor = file_end & !(page_size - 1);
+            let partial_start = file_end_page_floor.max(segment.vaddr);
+            let partial_in_page = file_end - partial_start;
+            if partial_in_page == 0 {
+                continue;
+            }
+            let file_off = segment
+                .file_offset
+                .checked_add(partial_start - segment.vaddr)
+                .ok_or(ExecError::NotExecutable)?;
+            let mut buf = alloc::vec![0u8; partial_in_page as usize];
+            {
+                use StepOutcome as V3;
+                let guard = step_engine::guard();
+                match read_exact_at(interp_pc, file_off, &mut buf, &guard) {
+                    V3::Done(()) => {}
+                    V3::Continue { .. } | V3::Yield { .. } => return Err(ExecError::Busy),
+                    V3::Err(_) => return Err(ExecError::NotExecutable),
+                }
+            }
+            match vm_scripts::populate_detached_user_range(&new_aspace, partial_start, &buf).await {
+                StepOutcome::Done(()) => {}
+                StepOutcome::Err(err) => {
+                    return Err(ExecError::from_populate_errno(err.into()));
+                }
+                _ => return Err(ExecError::Busy),
+            }
+        }
     }
 
     // ===== Phase 5 — compose + populate user stack ===================
@@ -748,24 +1041,19 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     tx_services::random::fill_bytes(&mut at_random_bytes);
     let arch = <P as tx_hal::AuxvIf>::arch_auxv_facts();
 
+    let interp_aux = interp_data
+        .as_ref()
+        .map(|(interp, _)| (interp.load_bias, interp.entry));
+
     let auxv_facts = AuxvFacts {
         at_phdr: parsed.at_phdr,
         at_phent: ELF64_PHENT,
         at_phnum: parsed.at_phnum,
         at_pagesz: USER_PAGE_SIZE,
-        // N69a: when the main image carries a `PT_INTERP`, the
-        // kernel stages the interpreter at `INTERP_LOAD_BIAS_DEFAULT`
-        // and reports the bias here so musl's `__libc_start_main`
-        // recognises this as an interpreter-loaded binary. Static
-        // `ET_EXEC` (no PT_INTERP) keeps the historical `at_base = 0`.
-        // `AT_ENTRY` always carries the **program's** entry through
-        // to userspace; the initial PC below jumps into the
-        // interpreter instead when one is present.
-        at_base: if interp_load.is_some() {
-            INTERP_LOAD_BIAS_DEFAULT
-        } else {
-            0
-        },
+        // Dynamic ELF starts at the interpreter entry. The dynamic
+        // linker still needs the main program entry in AT_ENTRY and
+        // its own load bias in AT_BASE to relocate and hand off.
+        at_base: interp_aux.map(|(base, _)| base).unwrap_or(0),
         at_entry: parsed.entry,
         at_uid: cred.uid.raw() as u64,
         at_euid: cred.euid.raw() as u64,
@@ -802,19 +1090,18 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     {
         StepOutcome::Done(()) => {}
         StepOutcome::Err(err) => {
-            return Err(ExecError::from_populate_errno(err));
+            return Err(ExecError::from_populate_errno(err.into()));
         }
         _ => return Err(ExecError::Busy),
     }
 
     // ----- Phase 5 (cont) — collapse old-AS work -------------------
     //
-    // `txdoc:EXEC-10-COLLAPSE-OLD-AS-WORK`. No-op for the v1 slice:
-    // no `CLONE_FILES` / `CLONE_SIGHAND` exists, the fd table and
-    // sig_actions are owned in-place by `process`, and there are no
-    // sibling threads to zombify. The Phase-7 commit list below
-    // mutates the in-place state directly. Spec anchor pinned for
-    // when CLONE_* support arrives.
+    // `txdoc:EXEC-10-COLLAPSE-OLD-AS-WORK`. CLONE_THREAD is live, so
+    // the old thread group must be reduced to the calling thread after
+    // all reversible preparation has succeeded and before the address
+    // space replacement becomes visible.
+    let _collapsed = process.collapse_threads_for_exec(thread);
 
     // ===== Phase 6 — address-space visibility boundary ===============
     //
@@ -849,15 +1136,7 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     // so any concurrent reader on another hart can finish its
     // observation of the old aspace before its memory is reused.
 
-    // N69a: when an interpreter is present the kernel jumps into it,
-    // not into the program. The interpreter relocates itself, mmaps
-    // any shared libs the program needs (musl's libc.so is both the
-    // interpreter and the C runtime), then calls the program's
-    // `_start` (whose address musl reads from auxv `AT_ENTRY`).
-    let entry_pc = match interp_load.as_ref() {
-        Some(interp) => (interp.parsed.entry + INTERP_LOAD_BIAS_DEFAULT) as usize,
-        None => parsed.entry as usize,
-    };
+    let entry_pc = interp_aux.map(|(_, entry)| entry).unwrap_or(parsed.entry) as usize;
     let initial_sp = stack_image.initial_sp as usize;
     let user_ctx = make_initial_user_trap_context(P::ARCH, entry_pc, initial_sp);
     if let Some(payload) = thread.payload_cap() {
@@ -931,79 +1210,6 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     Ok(())
 }
 
-/// Eager-populate every BSS-tail-extending LOAD segment's
-/// partial-last-page from the file. Shared between the main image and
-/// the N69a interpreter image.
-///
-/// `load_bias` is the offset already applied (or to be applied) when
-/// the segment's recipe row was registered — zero for the main image,
-/// `INTERP_LOAD_BIAS_DEFAULT` for the interpreter. `page_size` is the
-/// platform's user page size (4096 on RV64).
-///
-/// Per the ELF spec, bytes in the LAST file-backed page of a LOAD
-/// segment beyond `vaddr + filesz` must read as zero. The recipe
-/// registration in `register_load_segment` rounds the file-backed
-/// range DOWN to a page boundary when there's a BSS extension; this
-/// loop eagerly populates that page's file-content prefix from the
-/// `PageContainer`, leaving the rest of the page zero (fresh anon
-/// allocation). Without this fix, RX segments would expose adjacent
-/// file bytes past `filesz` (busybox.musl previously crashed
-/// dereferencing `.got\0ata` string fragments via gp-relative loads).
-async fn populate_partial_last_pages(
-    aspace: &Cap<tx_subsystems::vm::AddressSpace>,
-    segments: &[VmLoadSegment],
-    load_bias: u64,
-    page_size: u64,
-) -> Result<(), ExecError> {
-    for segment in segments {
-        if segment.filesz == 0 || segment.memsz <= segment.filesz {
-            continue;
-        }
-        let biased_vaddr = segment
-            .vaddr
-            .checked_add(load_bias)
-            .ok_or(ExecError::NotExecutable)?;
-        let file_end = biased_vaddr
-            .checked_add(segment.filesz)
-            .ok_or(ExecError::NotExecutable)?;
-        let partial_in_page = file_end & (page_size - 1);
-        if partial_in_page == 0 {
-            continue;
-        }
-        let partial_start = (file_end - partial_in_page).max(biased_vaddr);
-        // File offset of `partial_start`. Segment's `file_offset`
-        // corresponds to its (relative) `vaddr`; offset by
-        // `partial_start - biased_vaddr` to reach the bytes we need to
-        // seed. If the segment starts mid-page, the page floor can
-        // precede `vaddr`, so `partial_start` is clamped to the segment
-        // start.
-        let file_off = segment
-            .file_offset
-            .checked_add(partial_start - biased_vaddr)
-            .ok_or(ExecError::NotExecutable)?;
-        let mut buf = alloc::vec![0u8; partial_in_page as usize];
-        {
-            use StepOutcome as V3;
-            let guard = step_engine::guard();
-            match read_exact_at(&segment.backing, file_off, &mut buf, &guard) {
-                V3::Done(()) => {}
-                V3::Continue { .. } | V3::Yield { .. } => return Err(ExecError::Busy),
-                V3::Err(_) => return Err(ExecError::NotExecutable),
-            }
-        }
-        match vm_scripts::populate_detached_user_range(aspace, partial_start, &buf).await {
-            StepOutcome::Done(()) => {}
-            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
-                return Err(ExecError::Busy);
-            }
-            StepOutcome::Err(err) => {
-                return Err(ExecError::from_populate_errno(err));
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Compose a fresh `UserTrapContext` for the new image's first
 /// userspace entry. RV64 register file is zeroed (per System V psABI:
 /// `_start` reads its arguments off the stack, not registers); only
@@ -1041,157 +1247,11 @@ const fn translate_flags(parsed: ParsedSegmentFlags) -> VmSegmentFlags {
     }
 }
 
-/// Staged interpreter image (N69a). Built before Phase 4 so the main
-/// `build_aspace_from_image` call still owns aspace allocation while
-/// the interpreter contributes only recipe rows.
-struct InterpLoad {
-    /// Parser output — used for the initial PC (`parsed.entry +
-    /// INTERP_LOAD_BIAS_DEFAULT`).
-    parsed: ExecImagePlan,
-    /// vm-scripts view, with the interpreter file `PageContainer`
-    /// stitched into every LOAD segment's `backing` — consumed by
-    /// `register_interp_image` and `populate_partial_last_pages`.
-    vm_plan: VmImagePlan,
-}
-
-/// Resolve a `PT_INTERP` reference into an `InterpLoad`.
-///
-/// `main_header_bytes` is the kernel's initial 4 KiB window over the
-/// main image; we slice the interp path from it when the PT_INTERP
-/// segment is entirely covered (the canonical case for musl-linked
-/// binaries, where the segment sits in the first few hundred bytes of
-/// the file). Otherwise the function reads the path bytes through the
-/// main file's `PageContainer`.
-///
-/// The interpreter is opened via the same VFS walker the main file
-/// went through. Linux does not require the interpreter to carry an
-/// X bit (`fs/binfmt_elf.c::load_elf_binary` opens it with
-/// `MAY_READ | MAY_EXEC` against `init_cred`, ignoring the file's
-/// X bit for ELF-spec compatibility — old toolchains shipped `libc.so`
-/// without X). We follow the same policy: read-bit only.
-async fn load_interp_image(
-    main_file_pc: &Cap<PageContainer>,
-    main_header_bytes: &[u8],
-    interp_ref: super::loader::InterpRef,
-    process: &Cap<ProcessIdentity>,
-    cred: &Credential,
-) -> Result<InterpLoad, ExecError> {
-    // --- 1. extract the interpreter path string from the main file -------
-    //
-    // Hard cap on path length: 4096 bytes is Linux's `PATH_MAX`. The
-    // PT_INTERP segment carries `path\0`; the trailing NUL counts toward
-    // `filesz` and is stripped here.
-    if interp_ref.filesz == 0 || interp_ref.filesz > 4096 {
-        return Err(ExecError::NotExecutable);
-    }
-    let need = interp_ref.filesz as usize;
-    let start = interp_ref.file_offset as usize;
-    let end = start.checked_add(need).ok_or(ExecError::NotExecutable)?;
-
-    let mut path_buf: Vec<u8>;
-    let path_bytes_full: &[u8] = if end <= main_header_bytes.len() {
-        &main_header_bytes[start..end]
-    } else {
-        path_buf = alloc::vec![0u8; need];
-        use StepOutcome as V3;
-        let guard = step_engine::guard();
-        let outcome = read_exact_at(main_file_pc, interp_ref.file_offset, &mut path_buf, &guard);
-        let result = match outcome {
-            V3::Done(()) => Ok(()),
-            V3::Continue { .. } | V3::Yield { .. } => Err(ExecError::Busy),
-            V3::Err(_) => Err(ExecError::NotExecutable),
-        };
-        drop(guard);
-        result?;
-        &path_buf[..]
-    };
-
-    // Strip trailing NULs (the toolchain emits exactly one; we tolerate
-    // alignment padding too).
-    let trimmed_end = path_bytes_full
-        .iter()
-        .rposition(|&b| b != 0)
-        .map(|i| i + 1)
-        .unwrap_or(0);
-    let interp_path = &path_bytes_full[..trimmed_end];
-    if interp_path.is_empty() {
-        return Err(ExecError::NotExecutable);
-    }
-
-    // --- 2. resolve + open the interpreter through the VFS walker -------
-    //
-    // Linux requires read access only; the X bit on `libc.so` is not
-    // checked because the kernel maps it via `mmap` semantics rather
-    // than `execve`. Errors here translate the walker's errno through
-    // the same `from_walker_errno` mapper the main file used.
-    let interp_open = {
-        use StepOutcome as V3;
-        let guard = step_engine::guard();
-        let cwd = process.cwd().ok_or(ExecError::PathNotFound)?;
-        let rooted_at = exec_root_for_path(&cwd, interp_path);
-        let outcome = step_open(
-            rooted_at,
-            interp_path,
-            OpenFileFlags {
-                read: true,
-                write: false,
-                append: false,
-                cloexec: false,
-                nonblocking: false,
-            },
-            0,
-            cred,
-            &guard,
-        );
-        let result = match outcome {
-            V3::Done(file) => Ok(file),
-            V3::Continue { .. } | V3::Yield { .. } => Err(ExecError::Busy),
-            V3::Err(err) => Err(ExecError::from_walker_errno(err)),
-        };
-        drop(guard);
-        result?
-    };
-
-    let interp_file_pc = match interp_open.rnode().backing() {
-        RNodeBacking::PageBacked { pc } => pc.clone(),
-        _ => return Err(ExecError::NotExecutable),
-    };
-    let interp_size = interp_file_pc.size_bytes();
-
-    // --- 3. read interpreter header bytes and parse as ET_DYN ----------
-    let interp_read_len = core::cmp::min(interp_size as usize, INITIAL_PARSE_READ);
-    if interp_read_len < 64 {
-        return Err(ExecError::NotExecutable);
-    }
-    let mut interp_header_bytes: Vec<u8> = alloc::vec![0u8; interp_read_len];
-    {
-        use StepOutcome as V3;
-        let guard = step_engine::guard();
-        let outcome = read_exact_at(&interp_file_pc, 0, &mut interp_header_bytes, &guard);
-        let result = match outcome {
-            V3::Done(()) => Ok(()),
-            V3::Continue { .. } | V3::Yield { .. } => Err(ExecError::Busy),
-            V3::Err(err) => Err(ExecError::from_read_errno(err)),
-        };
-        drop(guard);
-        result?;
-    }
-    let interp_parsed: ExecImagePlan =
-        parse_interp_plan(&interp_header_bytes).map_err(ExecError::from_parse_error)?;
-
-    // --- 4. bridge to the vm-side image plan --------------------------
-    let vm_plan = build_vm_image_plan(&interp_parsed, USER_STACK_TOP_DEFAULT, &interp_file_pc);
-
-    Ok(InterpLoad {
-        parsed: interp_parsed,
-        vm_plan,
-    })
-}
-
 /// Bridge `parse_image_plan`'s view (no PageContainer) to the
 /// vm-scripts view (LOAD segments carry the file's `Cap<PageContainer>`).
 fn build_vm_image_plan(
     parsed: &ExecImagePlan,
+    interp_exec_stack: bool,
     stack_top: u64,
     file_pc: &Cap<PageContainer>,
 ) -> VmImagePlan {
@@ -1218,7 +1278,7 @@ fn build_vm_image_plan(
         stack_top,
         load_segments,
         bss_extension,
-        executable_stack: parsed.executable_stack,
+        executable_stack: parsed.executable_stack || interp_exec_stack,
     }
 }
 

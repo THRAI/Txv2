@@ -1555,6 +1555,7 @@ pub fn net_namespace_open_file_from_payload(
             append: false,
             cloexec: false,
             nonblocking: false,
+            packet: false,
         },
     )
     .map_err(|_| Errno::ENOMEM)

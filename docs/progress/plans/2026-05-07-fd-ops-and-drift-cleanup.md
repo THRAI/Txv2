@@ -188,7 +188,8 @@ The biggest sub-part. New subsystem: `tx_subsystems::pipe`.
     block on a writer-side wait carrier.
 
 - `sys_pipe2(uaddr_pipefd, flags, ctx)`: validate flags (only
-  `O_CLOEXEC | O_NONBLOCK | O_DIRECT` recognised; others ENOSYS),
+  `O_CLOEXEC | O_NONBLOCK | O_DIRECT` recognised; other bits return
+  `EINVAL`; `O_DIRECT` creates Linux packet-mode pipes),
   call `pipe::step_pipe2(flags)`, allocate two fds, write the
   pair to user via `core::ptr::write_volatile` (TODO(phase-userva)
   marker per other arms).

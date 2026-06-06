@@ -8,12 +8,13 @@ use alloc::sync::Arc;
 
 use super::adapter::step_engine::{self as step_engine, guard, page_allocator, Errno, StepOutcome};
 use tx_subsystems::cred::{Capability, CapabilitySet};
-use tx_subsystems::page_backed::FsPageBacking;
+use tx_subsystems::page_backed::{AnonSwapPolicy, FsPageBacking, PageContainer, PageContainerKind};
 use tx_subsystems::vfs::{
-    Credential, DirCursor, FsObjectId, FsOps, InodeKind, RNodeBacking, S_IFMT, S_ISGID, S_ISUID,
+    Credential, DirCursor, FsObjectId, FsOps, InlineName, InodeKind, InodeMeta, OpenFile,
+    OpenFileFlags, RNodeBacking, S_IFDIR, S_IFMT, S_IFREG, S_ISGID, S_ISUID,
 };
 
-use super::{Tmpfs, TMPFS_ROOT_OBJECT_ID};
+use super::{Tmpfs, TmpfsPayload, TMPFS_ROOT_OBJECT_ID};
 
 fn init_substrate() {
     tx_test_support::init_host();
@@ -26,6 +27,22 @@ fn init_substrate() {
         Ok(_) | Err(page_allocator::AllocError::AlreadyInstalled) => {}
         Err(error) => panic!("claim zero frame for tmpfs tests: {error:?}"),
     }
+}
+
+#[test]
+#[cfg(tx_lock_metrics_fs)]
+fn tmpfs_state_lock_metrics_are_cfg_gated() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Tmpfs::new();
+
+    assert!(
+        tmpfs.state.lock_metrics_enabled(),
+        "tmpfs state lock must emit observed lock rows when tx_lock_metrics_fs is enabled"
+    );
 }
 
 /// Build a throw-away `Cap<MountPayload>` over `tmpfs` so tests that
@@ -92,6 +109,40 @@ fn tmpfs_create_then_lookup_round_trip() {
 }
 
 #[test]
+fn tmpfs_inode_meta_snapshot_reads_pagecontainer_size_after_snapshot() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let pc = PageContainer::new_cap(
+        PageContainerKind::Anon {
+            swap_policy: AnonSwapPolicy::Reclaimable,
+        },
+        2,
+    )
+    .expect("page container");
+    pc.set_size_bytes(4096);
+
+    let mut meta = tx_subsystems::vfs::InodeMeta::new(InodeKind::Regular, 0o100644);
+    meta.size = 0;
+    let snapshot = super::InodeMetaSnapshot {
+        meta,
+        nlink: 1,
+        size_source: Some(pc.clone()),
+    };
+
+    pc.set_size_bytes(8192);
+    let loaded = super::inode_meta_from_snapshot(snapshot);
+
+    assert_eq!(loaded.nlinks, 1);
+    assert_eq!(
+        loaded.size, 8192,
+        "tmpfs load_inode_meta should read PageContainer size after releasing the state lock"
+    );
+}
+
+#[test]
 fn tmpfs_mkdir_then_readdir_yields_dir_entry() {
     let _serial = crate::test_support::FS_TEST_LOCK
         .lock()
@@ -136,6 +187,153 @@ fn tmpfs_mkdir_then_readdir_yields_dir_entry() {
     assert_eq!(
         tmpfs.readdir(file_id, DirCursor::START, &guard),
         StepOutcome::Err(Errno::ENOTDIR)
+    );
+}
+
+#[test]
+fn tmpfs_readdir_cursor_survives_unlink_of_previous_entry() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = guard();
+    let cred = Credential::root();
+
+    let (a_id, _) = match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"a", 0o100644, &cred, &guard) {
+        StepOutcome::Done(out) => out,
+        other => panic!("create a failed: {other:?}"),
+    };
+    let (b_id, _) = match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"b", 0o100644, &cred, &guard) {
+        StepOutcome::Done(out) => out,
+        other => panic!("create b failed: {other:?}"),
+    };
+    let (c_id, _) = match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"c", 0o100644, &cred, &guard) {
+        StepOutcome::Done(out) => out,
+        other => panic!("create c failed: {other:?}"),
+    };
+
+    let first_cursor = match tmpfs.readdir(TMPFS_ROOT_OBJECT_ID, DirCursor::START, &guard) {
+        StepOutcome::Done(Some((entry, next))) => {
+            assert_eq!(entry.fs_object_id, a_id);
+            next
+        }
+        other => panic!("first readdir failed: {other:?}"),
+    };
+
+    assert_eq!(
+        tmpfs.unlink(TMPFS_ROOT_OBJECT_ID, b"a", a_id, &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(tmpfs.destroy_inode(a_id, &guard), StepOutcome::Done(()));
+
+    let second_cursor = match tmpfs.readdir(TMPFS_ROOT_OBJECT_ID, first_cursor, &guard) {
+        StepOutcome::Done(Some((entry, next))) => {
+            assert_eq!(
+                entry.fs_object_id, b_id,
+                "cursor must not skip b after a was removed"
+            );
+            next
+        }
+        other => panic!("second readdir failed: {other:?}"),
+    };
+    match tmpfs.readdir(TMPFS_ROOT_OBJECT_ID, second_cursor, &guard) {
+        StepOutcome::Done(Some((entry, _))) => assert_eq!(entry.fs_object_id, c_id),
+        other => panic!("third readdir failed: {other:?}"),
+    }
+}
+
+#[test]
+fn tmpfs_mkdir_and_rmdir_update_parent_directory_nlinks() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = guard();
+    let cred = Credential::root();
+
+    let root_before = match tmpfs.load_inode_meta(TMPFS_ROOT_OBJECT_ID, &guard) {
+        StepOutcome::Done(meta) => meta,
+        other => panic!("load root meta before mkdir failed: {other:?}"),
+    };
+    assert_eq!(root_before.nlinks, 2);
+
+    let (dir_id, dir_meta) = match tmpfs.mkdir(TMPFS_ROOT_OBJECT_ID, b"child", 0o755, &cred, &guard)
+    {
+        StepOutcome::Done(out) => out,
+        other => panic!("mkdir child failed: {other:?}"),
+    };
+    assert_eq!(dir_meta.nlinks, 2);
+
+    let root_after_mkdir = match tmpfs.load_inode_meta(TMPFS_ROOT_OBJECT_ID, &guard) {
+        StepOutcome::Done(meta) => meta,
+        other => panic!("load root meta after mkdir failed: {other:?}"),
+    };
+    assert_eq!(
+        root_after_mkdir.nlinks, 3,
+        "parent directory nlink should include child directory '..'"
+    );
+
+    assert_eq!(
+        tmpfs.rmdir(TMPFS_ROOT_OBJECT_ID, b"child", dir_id, &guard),
+        StepOutcome::Done(())
+    );
+    let root_after_rmdir = match tmpfs.load_inode_meta(TMPFS_ROOT_OBJECT_ID, &guard) {
+        StepOutcome::Done(meta) => meta,
+        other => panic!("load root meta after rmdir failed: {other:?}"),
+    };
+    assert_eq!(root_after_rmdir.nlinks, 2);
+}
+
+#[test]
+fn tmpfs_readdir_snapshot_builds_direntry_without_state_borrow() {
+    let name = InlineName::new(b"dev").expect("inline name");
+    let snapshot = super::ReaddirEntrySnapshot {
+        child_id: FsObjectId::new(42),
+        kind: InodeKind::Directory,
+        name,
+        next_cursor: DirCursor::from_u64(7),
+    };
+
+    let (entry, next) =
+        super::dir_entry_from_readdir_snapshot(snapshot).expect("dir entry from snapshot");
+
+    assert_eq!(entry.fs_object_id, FsObjectId::new(42));
+    assert_eq!(entry.kind, InodeKind::Directory);
+    assert_eq!(entry.name.as_bytes(), b"dev");
+    assert_eq!(next, DirCursor::from_u64(7));
+}
+
+#[test]
+fn tmpfs_readdir_stale_child_returns_enoent() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = guard();
+    let ghost_id = FsObjectId::new(0xface);
+    let ghost_name = InlineName::new(b"ghost").expect("ghost inline name");
+
+    {
+        let mut state = tmpfs.state.lock();
+        let root_inode = state
+            .inodes
+            .get_mut(&TMPFS_ROOT_OBJECT_ID)
+            .expect("root inode");
+        let TmpfsPayload::Directory(children) = &mut root_inode.payload else {
+            panic!("root must be directory");
+        };
+        children.insert(ghost_name, tmpfs.alloc_dirent(ghost_id));
+    }
+
+    assert_eq!(
+        tmpfs.readdir(TMPFS_ROOT_OBJECT_ID, DirCursor::START, &guard),
+        StepOutcome::Err(Errno::ENOENT)
     );
 }
 
@@ -187,6 +385,786 @@ fn tmpfs_unlink_unhooks_name_but_keeps_inode_until_destroy_inode() {
     assert_eq!(
         tmpfs.unlink(TMPFS_ROOT_OBJECT_ID, b"d", dir_id, &guard),
         StepOutcome::Err(Errno::EISDIR)
+    );
+}
+
+#[test]
+fn tmpfs_unlink_missing_target_inode_returns_enoent_without_mutating_namespace() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = guard();
+    let ghost_id = FsObjectId::new(0xfeed);
+    let ghost_name = InlineName::new(b"ghost").expect("ghost inline name");
+
+    {
+        let mut state = tmpfs.state.lock();
+        let root_inode = state
+            .inodes
+            .get_mut(&TMPFS_ROOT_OBJECT_ID)
+            .expect("root inode");
+        let TmpfsPayload::Directory(children) = &mut root_inode.payload else {
+            panic!("root must be directory");
+        };
+        children.insert(ghost_name, tmpfs.alloc_dirent(ghost_id));
+    }
+
+    assert_eq!(
+        tmpfs.unlink(TMPFS_ROOT_OBJECT_ID, b"ghost", ghost_id, &guard),
+        StepOutcome::Err(Errno::ENOENT)
+    );
+
+    let state = tmpfs.state.lock();
+    let root_inode = state
+        .inodes
+        .get(&TMPFS_ROOT_OBJECT_ID)
+        .expect("root inode after failed unlink");
+    let TmpfsPayload::Directory(children) = &root_inode.payload else {
+        panic!("root must be directory");
+    };
+    assert_eq!(
+        children.get(&ghost_name).map(|entry| entry.object_id),
+        Some(ghost_id)
+    );
+}
+
+#[test]
+fn tmpfs_destroy_inode_preserves_linked_inode() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = guard();
+    let cred = Credential::root();
+
+    let (file_id, _) =
+        match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"live", 0o100644, &cred, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("create_inode failed: {other:?}"),
+        };
+
+    assert_eq!(tmpfs.destroy_inode(file_id, &guard), StepOutcome::Done(()));
+    assert_eq!(
+        tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"live", &guard),
+        StepOutcome::Done(file_id)
+    );
+    let meta = match tmpfs.load_inode_meta(file_id, &guard) {
+        StepOutcome::Done(meta) => meta,
+        other => panic!("linked inode must survive destroy_inode: {other:?}"),
+    };
+    assert_eq!(meta.nlinks, 1);
+}
+
+#[test]
+fn tmpfs_link_increments_nlink_and_unlink_decrements_one_name() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = guard();
+    let cred = Credential::root();
+
+    let (file_id, _) =
+        match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"primary", 0o100644, &cred, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("create_inode failed: {other:?}"),
+        };
+
+    assert_eq!(
+        tmpfs.link(TMPFS_ROOT_OBJECT_ID, b"alias", file_id, &guard),
+        StepOutcome::Done(())
+    );
+
+    let linked_meta = match tmpfs.load_inode_meta(file_id, &guard) {
+        StepOutcome::Done(meta) => meta,
+        other => panic!("load_inode_meta after link failed: {other:?}"),
+    };
+    assert_eq!(linked_meta.nlinks, 2);
+
+    assert_eq!(
+        tmpfs.unlink(TMPFS_ROOT_OBJECT_ID, b"primary", file_id, &guard),
+        StepOutcome::Done(())
+    );
+
+    let after_unlink = match tmpfs.load_inode_meta(file_id, &guard) {
+        StepOutcome::Done(meta) => meta,
+        other => panic!("load_inode_meta after unlink failed: {other:?}"),
+    };
+    assert_eq!(after_unlink.nlinks, 1);
+    assert_eq!(
+        tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"alias", &guard),
+        StepOutcome::Done(file_id)
+    );
+}
+
+#[test]
+fn tmpfs_readdir_returns_each_hardlink_directory_entry() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = guard();
+    let cred = Credential::root();
+
+    let (file_id, _) =
+        match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"primary", 0o100644, &cred, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("create_inode failed: {other:?}"),
+        };
+    assert_eq!(
+        tmpfs.link(TMPFS_ROOT_OBJECT_ID, b"alias", file_id, &guard),
+        StepOutcome::Done(())
+    );
+
+    let mut cursor = DirCursor::START;
+    let mut names = alloc::vec::Vec::new();
+    loop {
+        match tmpfs.readdir(TMPFS_ROOT_OBJECT_ID, cursor, &guard) {
+            StepOutcome::Done(Some((entry, next))) => {
+                assert_eq!(entry.fs_object_id, file_id);
+                names.push(entry.name);
+                cursor = next;
+            }
+            StepOutcome::Done(None) => break,
+            other => panic!("readdir failed: {other:?}"),
+        }
+    }
+
+    names.sort();
+    assert_eq!(
+        names,
+        alloc::vec![
+            InlineName::new(b"alias").unwrap(),
+            InlineName::new(b"primary").unwrap(),
+        ]
+    );
+}
+
+#[test]
+fn tmpfs_link_missing_parent_returns_enoent() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = guard();
+    let cred = Credential::root();
+
+    let (file_id, _) =
+        match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"primary", 0o100644, &cred, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("create_inode failed: {other:?}"),
+        };
+
+    assert_eq!(
+        tmpfs.link(FsObjectId::new(0xdead_beef), b"alias", file_id, &guard),
+        StepOutcome::Err(step_engine::Errno::ENOENT)
+    );
+    let meta = match tmpfs.load_inode_meta(file_id, &guard) {
+        StepOutcome::Done(meta) => meta,
+        other => panic!("load_inode_meta after failed link failed: {other:?}"),
+    };
+    assert_eq!(meta.nlinks, 1);
+}
+
+#[test]
+fn tmpfs_rename_over_hard_linked_target_decrements_one_name() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = guard();
+    let cred = Credential::root();
+
+    let (source_id, _) =
+        match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"source", 0o100644, &cred, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("create source failed: {other:?}"),
+        };
+    let (target_id, _) =
+        match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"target", 0o100644, &cred, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("create target failed: {other:?}"),
+        };
+
+    assert_eq!(
+        tmpfs.link(TMPFS_ROOT_OBJECT_ID, b"target_alias", target_id, &guard),
+        StepOutcome::Done(())
+    );
+
+    assert_eq!(
+        tmpfs.rename(
+            TMPFS_ROOT_OBJECT_ID,
+            b"source",
+            TMPFS_ROOT_OBJECT_ID,
+            b"target",
+            &guard
+        ),
+        StepOutcome::Done(())
+    );
+
+    assert_eq!(
+        tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"target", &guard),
+        StepOutcome::Done(source_id)
+    );
+    assert_eq!(
+        tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"target_alias", &guard),
+        StepOutcome::Done(target_id)
+    );
+
+    let target_meta = match tmpfs.load_inode_meta(target_id, &guard) {
+        StepOutcome::Done(meta) => meta,
+        other => panic!("hard-linked displaced target must remain addressable: {other:?}"),
+    };
+    assert_eq!(target_meta.nlinks, 1);
+}
+
+#[test]
+fn tmpfs_rename_over_regular_target_keeps_displaced_inode_until_destroy_inode() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = guard();
+    let cred = Credential::root();
+
+    let (source_id, _) =
+        match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"source", 0o100644, &cred, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("create source failed: {other:?}"),
+        };
+    let (target_id, _) =
+        match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"target", 0o100644, &cred, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("create target failed: {other:?}"),
+        };
+
+    assert_eq!(
+        tmpfs.rename(
+            TMPFS_ROOT_OBJECT_ID,
+            b"source",
+            TMPFS_ROOT_OBJECT_ID,
+            b"target",
+            &guard
+        ),
+        StepOutcome::Done(())
+    );
+
+    assert_eq!(
+        tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"target", &guard),
+        StepOutcome::Done(source_id)
+    );
+    let displaced_meta = match tmpfs.load_inode_meta(target_id, &guard) {
+        StepOutcome::Done(meta) => meta,
+        other => panic!("displaced inode must remain until destroy_inode: {other:?}"),
+    };
+    assert_eq!(displaced_meta.nlinks, 0);
+
+    assert_eq!(
+        tmpfs.destroy_inode(target_id, &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        tmpfs.load_inode_meta(target_id, &guard),
+        StepOutcome::Err(Errno::ENOENT)
+    );
+}
+
+#[test]
+fn tmpfs_rename_between_hard_links_to_same_inode_is_noop() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = guard();
+    let cred = Credential::root();
+
+    let (file_id, _) =
+        match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"primary", 0o100644, &cred, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("create_inode failed: {other:?}"),
+        };
+    assert_eq!(
+        tmpfs.link(TMPFS_ROOT_OBJECT_ID, b"alias", file_id, &guard),
+        StepOutcome::Done(())
+    );
+
+    assert_eq!(
+        tmpfs.rename(
+            TMPFS_ROOT_OBJECT_ID,
+            b"primary",
+            TMPFS_ROOT_OBJECT_ID,
+            b"alias",
+            &guard
+        ),
+        StepOutcome::Done(())
+    );
+
+    assert_eq!(
+        tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"primary", &guard),
+        StepOutcome::Done(file_id)
+    );
+    assert_eq!(
+        tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"alias", &guard),
+        StepOutcome::Done(file_id)
+    );
+    let meta = match tmpfs.load_inode_meta(file_id, &guard) {
+        StepOutcome::Done(meta) => meta,
+        other => panic!("load_inode_meta after same-inode rename failed: {other:?}"),
+    };
+    assert_eq!(meta.nlinks, 2);
+}
+
+#[test]
+fn tmpfs_rename_file_over_directory_returns_eisdir_without_mutating_namespace() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = guard();
+    let cred = Credential::root();
+
+    let (file_id, _) =
+        match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"file", 0o100644, &cred, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("create file failed: {other:?}"),
+        };
+    let (dir_id, _) = match tmpfs.mkdir(TMPFS_ROOT_OBJECT_ID, b"dir", 0o755, &cred, &guard) {
+        StepOutcome::Done(out) => out,
+        other => panic!("mkdir failed: {other:?}"),
+    };
+
+    assert_eq!(
+        tmpfs.rename(
+            TMPFS_ROOT_OBJECT_ID,
+            b"file",
+            TMPFS_ROOT_OBJECT_ID,
+            b"dir",
+            &guard
+        ),
+        StepOutcome::Err(Errno::EISDIR)
+    );
+    assert_eq!(
+        tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"file", &guard),
+        StepOutcome::Done(file_id)
+    );
+    assert_eq!(
+        tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"dir", &guard),
+        StepOutcome::Done(dir_id)
+    );
+}
+
+#[test]
+fn tmpfs_rename_directory_over_file_returns_enotdir_without_mutating_namespace() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = guard();
+    let cred = Credential::root();
+
+    let (dir_id, _) = match tmpfs.mkdir(TMPFS_ROOT_OBJECT_ID, b"dir", 0o755, &cred, &guard) {
+        StepOutcome::Done(out) => out,
+        other => panic!("mkdir failed: {other:?}"),
+    };
+    let (file_id, _) =
+        match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"file", 0o100644, &cred, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("create file failed: {other:?}"),
+        };
+
+    assert_eq!(
+        tmpfs.rename(
+            TMPFS_ROOT_OBJECT_ID,
+            b"dir",
+            TMPFS_ROOT_OBJECT_ID,
+            b"file",
+            &guard
+        ),
+        StepOutcome::Err(Errno::ENOTDIR)
+    );
+    assert_eq!(
+        tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"dir", &guard),
+        StepOutcome::Done(dir_id)
+    );
+    assert_eq!(
+        tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"file", &guard),
+        StepOutcome::Done(file_id)
+    );
+}
+
+#[test]
+fn tmpfs_rename_directory_over_nonempty_directory_returns_enotempty_without_mutating_namespace() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = guard();
+    let cred = Credential::root();
+
+    let (source_dir_id, _) =
+        match tmpfs.mkdir(TMPFS_ROOT_OBJECT_ID, b"source_dir", 0o755, &cred, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("mkdir source_dir failed: {other:?}"),
+        };
+    let (target_dir_id, _) =
+        match tmpfs.mkdir(TMPFS_ROOT_OBJECT_ID, b"target_dir", 0o755, &cred, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("mkdir target_dir failed: {other:?}"),
+        };
+    let (child_id, _) = match tmpfs.create_inode(target_dir_id, b"child", 0o100644, &cred, &guard) {
+        StepOutcome::Done(out) => out,
+        other => panic!("create child in target_dir failed: {other:?}"),
+    };
+
+    assert_eq!(
+        tmpfs.rename(
+            TMPFS_ROOT_OBJECT_ID,
+            b"source_dir",
+            TMPFS_ROOT_OBJECT_ID,
+            b"target_dir",
+            &guard
+        ),
+        StepOutcome::Err(Errno::ENOTEMPTY)
+    );
+    assert_eq!(
+        tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"source_dir", &guard),
+        StepOutcome::Done(source_dir_id)
+    );
+    assert_eq!(
+        tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"target_dir", &guard),
+        StepOutcome::Done(target_dir_id)
+    );
+    assert_eq!(
+        tmpfs.lookup(target_dir_id, b"child", &guard),
+        StepOutcome::Done(child_id)
+    );
+}
+
+#[test]
+fn tmpfs_rename_directory_over_empty_directory_updates_parent_nlinks() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = guard();
+    let cred = Credential::root();
+
+    let (source_dir_id, _) =
+        match tmpfs.mkdir(TMPFS_ROOT_OBJECT_ID, b"source_dir", 0o755, &cred, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("mkdir source_dir failed: {other:?}"),
+        };
+    let (target_dir_id, _) =
+        match tmpfs.mkdir(TMPFS_ROOT_OBJECT_ID, b"target_dir", 0o755, &cred, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("mkdir target_dir failed: {other:?}"),
+        };
+
+    let root_before = match tmpfs.load_inode_meta(TMPFS_ROOT_OBJECT_ID, &guard) {
+        StepOutcome::Done(meta) => meta,
+        other => panic!("load root meta before rename failed: {other:?}"),
+    };
+    assert_eq!(root_before.nlinks, 4);
+
+    assert_eq!(
+        tmpfs.rename(
+            TMPFS_ROOT_OBJECT_ID,
+            b"source_dir",
+            TMPFS_ROOT_OBJECT_ID,
+            b"target_dir",
+            &guard
+        ),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"target_dir", &guard),
+        StepOutcome::Done(source_dir_id)
+    );
+    let displaced_meta = match tmpfs.load_inode_meta(target_dir_id, &guard) {
+        StepOutcome::Done(meta) => meta,
+        other => panic!("displaced directory must remain until destroy_inode: {other:?}"),
+    };
+    assert_eq!(displaced_meta.nlinks, 0);
+    let root_after = match tmpfs.load_inode_meta(TMPFS_ROOT_OBJECT_ID, &guard) {
+        StepOutcome::Done(meta) => meta,
+        other => panic!("load root meta after rename failed: {other:?}"),
+    };
+    assert_eq!(
+        root_after.nlinks, 3,
+        "replacing an empty child directory removes one '..' contribution"
+    );
+}
+
+#[test]
+fn tmpfs_rename_directory_over_empty_directory_keeps_displaced_inode_until_destroy_inode() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = guard();
+    let cred = Credential::root();
+
+    let (source_dir_id, _) =
+        match tmpfs.mkdir(TMPFS_ROOT_OBJECT_ID, b"source_dir", 0o755, &cred, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("mkdir source_dir failed: {other:?}"),
+        };
+    let (target_dir_id, _) =
+        match tmpfs.mkdir(TMPFS_ROOT_OBJECT_ID, b"target_dir", 0o755, &cred, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("mkdir target_dir failed: {other:?}"),
+        };
+
+    assert_eq!(
+        tmpfs.rename(
+            TMPFS_ROOT_OBJECT_ID,
+            b"source_dir",
+            TMPFS_ROOT_OBJECT_ID,
+            b"target_dir",
+            &guard
+        ),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"target_dir", &guard),
+        StepOutcome::Done(source_dir_id)
+    );
+    let displaced_meta = match tmpfs.load_inode_meta(target_dir_id, &guard) {
+        StepOutcome::Done(meta) => meta,
+        other => panic!("displaced directory must remain until destroy_inode: {other:?}"),
+    };
+    assert_eq!(displaced_meta.nlinks, 0);
+
+    assert_eq!(
+        tmpfs.destroy_inode(target_dir_id, &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        tmpfs.load_inode_meta(target_dir_id, &guard),
+        StepOutcome::Err(Errno::ENOENT)
+    );
+}
+
+#[test]
+fn tmpfs_rename_file_across_directories_moves_name() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = guard();
+    let cred = Credential::root();
+
+    let (old_dir_id, _) = match tmpfs.mkdir(TMPFS_ROOT_OBJECT_ID, b"old_dir", 0o755, &cred, &guard)
+    {
+        StepOutcome::Done(out) => out,
+        other => panic!("mkdir old_dir failed: {other:?}"),
+    };
+    let (new_dir_id, _) = match tmpfs.mkdir(TMPFS_ROOT_OBJECT_ID, b"new_dir", 0o755, &cred, &guard)
+    {
+        StepOutcome::Done(out) => out,
+        other => panic!("mkdir new_dir failed: {other:?}"),
+    };
+    let (file_id, _) = match tmpfs.create_inode(old_dir_id, b"file", 0o100644, &cred, &guard) {
+        StepOutcome::Done(out) => out,
+        other => panic!("create file in old_dir failed: {other:?}"),
+    };
+
+    assert_eq!(
+        tmpfs.rename(old_dir_id, b"file", new_dir_id, b"moved", &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        tmpfs.lookup(old_dir_id, b"file", &guard),
+        StepOutcome::Err(Errno::ENOENT)
+    );
+    assert_eq!(
+        tmpfs.lookup(new_dir_id, b"moved", &guard),
+        StepOutcome::Done(file_id)
+    );
+
+    let meta = match tmpfs.load_inode_meta(file_id, &guard) {
+        StepOutcome::Done(meta) => meta,
+        other => panic!("load moved file meta failed: {other:?}"),
+    };
+    assert_eq!(meta.nlinks, 1);
+}
+
+#[test]
+fn tmpfs_rename_directory_across_directories_moves_subtree() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = guard();
+    let cred = Credential::root();
+
+    let (old_parent_id, _) =
+        match tmpfs.mkdir(TMPFS_ROOT_OBJECT_ID, b"old_parent", 0o755, &cred, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("mkdir old_parent failed: {other:?}"),
+        };
+    let (new_parent_id, _) =
+        match tmpfs.mkdir(TMPFS_ROOT_OBJECT_ID, b"new_parent", 0o755, &cred, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("mkdir new_parent failed: {other:?}"),
+        };
+    let (dir_id, _) = match tmpfs.mkdir(old_parent_id, b"dir", 0o755, &cred, &guard) {
+        StepOutcome::Done(out) => out,
+        other => panic!("mkdir dir failed: {other:?}"),
+    };
+    let (child_id, _) = match tmpfs.create_inode(dir_id, b"child", 0o100644, &cred, &guard) {
+        StepOutcome::Done(out) => out,
+        other => panic!("create child in dir failed: {other:?}"),
+    };
+
+    assert_eq!(
+        tmpfs.rename(old_parent_id, b"dir", new_parent_id, b"moved_dir", &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        tmpfs.lookup(old_parent_id, b"dir", &guard),
+        StepOutcome::Err(Errno::ENOENT)
+    );
+    assert_eq!(
+        tmpfs.lookup(new_parent_id, b"moved_dir", &guard),
+        StepOutcome::Done(dir_id)
+    );
+    assert_eq!(
+        tmpfs.lookup(dir_id, b"child", &guard),
+        StepOutcome::Done(child_id)
+    );
+}
+
+#[test]
+fn tmpfs_rename_directory_across_directories_updates_parent_nlinks() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = guard();
+    let cred = Credential::root();
+
+    let (old_parent_id, _) =
+        match tmpfs.mkdir(TMPFS_ROOT_OBJECT_ID, b"old_parent", 0o755, &cred, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("mkdir old_parent failed: {other:?}"),
+        };
+    let (new_parent_id, _) =
+        match tmpfs.mkdir(TMPFS_ROOT_OBJECT_ID, b"new_parent", 0o755, &cred, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("mkdir new_parent failed: {other:?}"),
+        };
+    let (dir_id, _) = match tmpfs.mkdir(old_parent_id, b"dir", 0o755, &cred, &guard) {
+        StepOutcome::Done(out) => out,
+        other => panic!("mkdir dir failed: {other:?}"),
+    };
+
+    let old_before = match tmpfs.load_inode_meta(old_parent_id, &guard) {
+        StepOutcome::Done(meta) => meta,
+        other => panic!("load old parent meta before rename failed: {other:?}"),
+    };
+    let new_before = match tmpfs.load_inode_meta(new_parent_id, &guard) {
+        StepOutcome::Done(meta) => meta,
+        other => panic!("load new parent meta before rename failed: {other:?}"),
+    };
+    assert_eq!(old_before.nlinks, 3);
+    assert_eq!(new_before.nlinks, 2);
+
+    assert_eq!(
+        tmpfs.rename(old_parent_id, b"dir", new_parent_id, b"moved_dir", &guard),
+        StepOutcome::Done(())
+    );
+
+    let old_after = match tmpfs.load_inode_meta(old_parent_id, &guard) {
+        StepOutcome::Done(meta) => meta,
+        other => panic!("load old parent meta after rename failed: {other:?}"),
+    };
+    let new_after = match tmpfs.load_inode_meta(new_parent_id, &guard) {
+        StepOutcome::Done(meta) => meta,
+        other => panic!("load new parent meta after rename failed: {other:?}"),
+    };
+    assert_eq!(old_after.nlinks, 2);
+    assert_eq!(new_after.nlinks, 3);
+    assert_eq!(
+        tmpfs.lookup(new_parent_id, b"moved_dir", &guard),
+        StepOutcome::Done(dir_id)
+    );
+}
+
+#[test]
+fn tmpfs_rename_directory_into_own_descendant_returns_einval_without_mutating_namespace() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = guard();
+    let cred = Credential::root();
+
+    let (dir_id, _) = match tmpfs.mkdir(TMPFS_ROOT_OBJECT_ID, b"dir", 0o755, &cred, &guard) {
+        StepOutcome::Done(out) => out,
+        other => panic!("mkdir dir failed: {other:?}"),
+    };
+    let (child_dir_id, _) = match tmpfs.mkdir(dir_id, b"child_dir", 0o755, &cred, &guard) {
+        StepOutcome::Done(out) => out,
+        other => panic!("mkdir child_dir failed: {other:?}"),
+    };
+
+    assert_eq!(
+        tmpfs.rename(
+            TMPFS_ROOT_OBJECT_ID,
+            b"dir",
+            child_dir_id,
+            b"moved_dir",
+            &guard
+        ),
+        StepOutcome::Err(Errno::EINVAL)
+    );
+    assert_eq!(
+        tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"dir", &guard),
+        StepOutcome::Done(dir_id)
+    );
+    assert_eq!(
+        tmpfs.lookup(dir_id, b"child_dir", &guard),
+        StepOutcome::Done(child_dir_id)
+    );
+    assert_eq!(
+        tmpfs.lookup(child_dir_id, b"moved_dir", &guard),
+        StepOutcome::Err(Errno::ENOENT)
     );
 }
 
@@ -333,6 +1311,113 @@ fn tmpfs_create_existing_returns_eexist() {
 }
 
 #[test]
+fn tmpfs_failed_create_does_not_consume_file_backing_or_object_id() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = guard();
+    let cred = Credential::root();
+
+    let (first_id, _) =
+        match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"dup", 0o100644, &cred, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("initial create_inode failed: {other:?}"),
+        };
+
+    assert_eq!(
+        tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"dup", 0o100644, &cred, &guard),
+        StepOutcome::Err(Errno::EEXIST)
+    );
+
+    let (next_id, _) =
+        match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"next", 0o100644, &cred, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("next create_inode failed: {other:?}"),
+        };
+    assert_eq!(
+        next_id.as_u64(),
+        first_id.as_u64() + 1,
+        "failed create_inode must reject before allocating file backing or an object id"
+    );
+}
+
+#[test]
+fn tmpfs_failed_mkdir_does_not_consume_object_id() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = guard();
+    let cred = Credential::root();
+
+    let (first_id, _) = match tmpfs.mkdir(TMPFS_ROOT_OBJECT_ID, b"dupdir", 0o755, &cred, &guard) {
+        StepOutcome::Done(out) => out,
+        other => panic!("initial mkdir failed: {other:?}"),
+    };
+
+    assert_eq!(
+        tmpfs.mkdir(TMPFS_ROOT_OBJECT_ID, b"dupdir", 0o755, &cred, &guard),
+        StepOutcome::Err(Errno::EEXIST)
+    );
+
+    let (next_id, _) =
+        match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"after_dir", 0o100644, &cred, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("create_inode after failed mkdir failed: {other:?}"),
+        };
+    assert_eq!(
+        next_id.as_u64(),
+        first_id.as_u64() + 1,
+        "failed mkdir must not consume an object id"
+    );
+}
+
+#[test]
+fn tmpfs_failed_symlink_does_not_consume_target_copy_or_object_id() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = guard();
+    let cred = Credential::root();
+
+    let (first_id, _) =
+        match tmpfs.symlink(TMPFS_ROOT_OBJECT_ID, b"duplink", b"target", &cred, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("initial symlink failed: {other:?}"),
+        };
+
+    assert_eq!(
+        tmpfs.symlink(
+            TMPFS_ROOT_OBJECT_ID,
+            b"duplink",
+            b"unused-target",
+            &cred,
+            &guard
+        ),
+        StepOutcome::Err(Errno::EEXIST)
+    );
+
+    let (next_id, _) =
+        match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"after_link", 0o100644, &cred, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("create_inode after failed symlink failed: {other:?}"),
+        };
+    assert_eq!(
+        next_id.as_u64(),
+        first_id.as_u64() + 1,
+        "failed symlink must reject before copying the target bytes or consuming an object id"
+    );
+}
+
+#[test]
 fn tmpfs_rmdir_nonempty_returns_enotempty() {
     let _serial = crate::test_support::FS_TEST_LOCK
         .lock()
@@ -373,6 +1458,84 @@ fn tmpfs_rmdir_nonempty_returns_enotempty() {
     assert_eq!(
         tmpfs.rmdir(TMPFS_ROOT_OBJECT_ID, b"d", dir_id, &guard),
         StepOutcome::Done(())
+    );
+}
+
+#[test]
+fn tmpfs_rmdir_wrong_target_returns_enoent_before_inspecting_unrelated_target() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = guard();
+    let cred = Credential::root();
+
+    let (empty_dir_id, _) =
+        match tmpfs.mkdir(TMPFS_ROOT_OBJECT_ID, b"empty_dir", 0o755, &cred, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("mkdir empty_dir failed: {other:?}"),
+        };
+    let (nonempty_dir_id, _) =
+        match tmpfs.mkdir(TMPFS_ROOT_OBJECT_ID, b"nonempty_dir", 0o755, &cred, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("mkdir nonempty_dir failed: {other:?}"),
+        };
+    let _child = match tmpfs.create_inode(nonempty_dir_id, b"child", 0o100644, &cred, &guard) {
+        StepOutcome::Done(out) => out,
+        other => panic!("create child failed: {other:?}"),
+    };
+
+    assert_eq!(
+        tmpfs.rmdir(TMPFS_ROOT_OBJECT_ID, b"empty_dir", nonempty_dir_id, &guard),
+        StepOutcome::Err(Errno::ENOENT),
+        "rmdir must verify parent/name maps to target before inspecting target contents"
+    );
+    assert_eq!(
+        tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"empty_dir", &guard),
+        StepOutcome::Done(empty_dir_id)
+    );
+    assert_eq!(
+        tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"nonempty_dir", &guard),
+        StepOutcome::Done(nonempty_dir_id)
+    );
+}
+
+#[test]
+fn tmpfs_rmdir_keeps_directory_inode_until_destroy_inode() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = guard();
+    let cred = Credential::root();
+
+    let (dir_id, _) = match tmpfs.mkdir(TMPFS_ROOT_OBJECT_ID, b"victim_dir", 0o755, &cred, &guard) {
+        StepOutcome::Done(out) => out,
+        other => panic!("mkdir failed: {other:?}"),
+    };
+
+    assert_eq!(
+        tmpfs.rmdir(TMPFS_ROOT_OBJECT_ID, b"victim_dir", dir_id, &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"victim_dir", &guard),
+        StepOutcome::Err(Errno::ENOENT)
+    );
+    let unlinked_meta = match tmpfs.load_inode_meta(dir_id, &guard) {
+        StepOutcome::Done(meta) => meta,
+        other => panic!("rmdir target must remain until destroy_inode: {other:?}"),
+    };
+    assert_eq!(unlinked_meta.nlinks, 0);
+
+    assert_eq!(tmpfs.destroy_inode(dir_id, &guard), StepOutcome::Done(()));
+    assert_eq!(
+        tmpfs.load_inode_meta(dir_id, &guard),
+        StepOutcome::Err(Errno::ENOENT)
     );
 }
 
@@ -421,7 +1584,7 @@ fn tmpfs_materialise_rnode_for_regular_file_returns_page_backed() {
     match rnode.backing() {
         RNodeBacking::PageBacked { pc } => {
             // Sanity: the container's `page_count` matches tmpfs's
-            // static cap (`TMPFS_FILE_PAGE_CAP = 1024`). `size_bytes`
+            // static cap (`TMPFS_FILE_PAGE_CAP = 2048`). `size_bytes`
             // initialises to `page_count * USER_PAGE_SIZE` (the
             // PageContainer's capacity); inode-visible size lives on
             // `InodeMeta::size`, not the container, so we don't pin
@@ -430,13 +1593,117 @@ fn tmpfs_materialise_rnode_for_regular_file_returns_page_backed() {
             // RNode means writes via `FsPageBacking` and reads via
             // `OpenFile::step_read` / `read_exact_at` see the same
             // underlying pages.
-            assert_eq!(pc.page_count(), 1024, "tmpfs file page-cap shape");
+            assert_eq!(pc.page_count(), 2048, "tmpfs file page-cap shape");
         }
         other => panic!("expected PageBacked backing for regular file, got {other:?}"),
     }
     // RNode meta round-trips the input meta.
     assert_eq!(rnode.fs_object_id(), file_id);
     assert_eq!(rnode.meta().kind(), InodeKind::Regular);
+}
+
+#[test]
+fn tmpfs_materialise_rnode_uses_backend_inode_meta_not_stale_input() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = guard();
+    let cred = Credential::root();
+
+    let (file_id, _) =
+        match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"stale_meta", 0o100640, &cred, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("create_inode failed: {other:?}"),
+        };
+
+    let mut stale_meta = InodeMeta::new(InodeKind::Directory, S_IFDIR | 0o777);
+    stale_meta.nlinks = 99;
+
+    let rnode = match <Tmpfs as FsOps>::materialise_rnode(
+        &*tmpfs,
+        file_id,
+        stale_meta,
+        &test_mount_payload(&tmpfs),
+        &guard,
+    ) {
+        StepOutcome::Done(rnode) => rnode,
+        other => panic!("materialise_rnode with stale meta failed: {other:?}"),
+    };
+
+    assert_eq!(rnode.meta().kind(), InodeKind::Regular);
+    assert_eq!(rnode.meta().mode & S_IFMT, S_IFREG);
+    assert_eq!(rnode.meta().nlinks, 1);
+}
+
+#[test]
+fn tmpfs_tmpfile_shape_read_after_write_survives_unlink() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = guard();
+    let cred = Credential::root();
+
+    let (file_id, file_meta) = match tmpfs.create_inode(
+        TMPFS_ROOT_OBJECT_ID,
+        b"tmpfile_probe",
+        0o100600,
+        &cred,
+        &guard,
+    ) {
+        StepOutcome::Done(out) => out,
+        other => panic!("create_inode failed: {other:?}"),
+    };
+    let rnode = match <Tmpfs as FsOps>::materialise_rnode(
+        &*tmpfs,
+        file_id,
+        file_meta,
+        &test_mount_payload(&tmpfs),
+        &guard,
+    ) {
+        StepOutcome::Done(rnode) => rnode,
+        other => panic!("materialise_rnode failed: {other:?}"),
+    };
+    let file = OpenFile::new_cap(
+        rnode,
+        OpenFileFlags {
+            read: true,
+            write: true,
+            append: false,
+            cloexec: false,
+            nonblocking: false,
+            packet: false,
+        },
+    )
+    .expect("open tmpfile-shaped file");
+
+    let payload: alloc::vec::Vec<u8> = (0..8192).map(|i| (i % 251) as u8).collect();
+    assert_eq!(
+        file.step_write(&payload, &guard),
+        StepOutcome::Done(payload.len())
+    );
+
+    assert_eq!(
+        tmpfs.unlink(TMPFS_ROOT_OBJECT_ID, b"tmpfile_probe", file_id, &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"tmpfile_probe", &guard),
+        StepOutcome::Err(Errno::ENOENT)
+    );
+
+    assert_eq!(file.step_lseek(0, 0, &guard), StepOutcome::Done(0));
+    let mut readback = alloc::vec![0u8; payload.len()];
+    assert_eq!(
+        file.step_read(&mut readback, &guard),
+        StepOutcome::Done(payload.len())
+    );
+    assert_eq!(readback, payload);
 }
 
 #[test]
@@ -499,6 +1766,70 @@ fn tmpfs_materialise_rnode_for_symlink_returns_einval() {
             &guard
         ),
         StepOutcome::Err(Errno::EINVAL)
+    );
+}
+
+#[test]
+fn tmpfs_read_link_returns_target_bytes() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = guard();
+    let cred = Credential::root();
+
+    let (link_id, _) =
+        match tmpfs.symlink(TMPFS_ROOT_OBJECT_ID, b"link", b"target/path", &cred, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("symlink failed: {other:?}"),
+        };
+    let (file_id, _) =
+        match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"regular", 0o100644, &cred, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("create_inode failed: {other:?}"),
+        };
+
+    let target = match <Tmpfs as FsOps>::read_link(&*tmpfs, link_id, &guard) {
+        StepOutcome::Done(target) => target,
+        other => panic!("read_link failed: {other:?}"),
+    };
+    assert_eq!(target.as_ref(), b"target/path");
+    assert_eq!(
+        <Tmpfs as FsOps>::read_link(&*tmpfs, file_id, &guard),
+        StepOutcome::Err(Errno::EINVAL)
+    );
+}
+
+#[test]
+fn tmpfs_symlink_payload_uses_shared_target_bytes() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = guard();
+    let cred = Credential::root();
+
+    let (link_id, _) =
+        match tmpfs.symlink(TMPFS_ROOT_OBJECT_ID, b"link", b"target/path", &cred, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("symlink failed: {other:?}"),
+        };
+
+    let state = tmpfs.state.lock();
+    let inode = state.inodes.get(&link_id).expect("link inode");
+    let TmpfsPayload::Symlink(target) = &inode.payload else {
+        panic!("link inode should carry symlink payload");
+    };
+    let target_clone = target.clone();
+    assert_eq!(&*target_clone, b"target/path");
+    assert_eq!(
+        Arc::strong_count(target),
+        2,
+        "symlink payload clones should share target bytes instead of copying under the tmpfs lock"
     );
 }
 
@@ -704,10 +2035,11 @@ fn tmpfs_chown_clears_setuid_bit_for_non_privileged() {
     assert_eq!(meta.mode & S_ISUID, 0);
     assert_eq!(meta.mode & S_ISGID, 0);
 
-    // Privileged callers preserve the setuid bit on chown — set
-    // it again, then chown via admin and verify it survives.
+    // Linux's chown(2) clearing rule also applies to privileged
+    // callers for executable files: setuid is cleared, and setgid is
+    // cleared when the group-execute bit is present.
     assert_eq!(
-        <Tmpfs as FsOps>::step_chmod(&*tmpfs, file_id, S_ISUID | 0o755, &admin, &guard),
+        <Tmpfs as FsOps>::step_chmod(&*tmpfs, file_id, S_ISUID | S_ISGID | 0o770, &admin, &guard),
         StepOutcome::Done(())
     );
     assert_eq!(
@@ -718,11 +2050,37 @@ fn tmpfs_chown_clears_setuid_bit_for_non_privileged() {
         StepOutcome::Done(m) => m,
         other => panic!("load_inode_meta: {other:?}"),
     };
+    assert_eq!(meta.mode & (S_ISUID | S_ISGID), 0);
+    assert_eq!(meta.mode & !S_IFMT, 0o770);
+}
+
+#[test]
+fn tmpfs_chown_preserves_setgid_without_group_execute() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = guard();
+    let admin = cred_with_caps(0, 0, CapabilitySet::FULL);
+    let mode = (S_ISUID | S_ISGID | 0o700) | tx_subsystems::vfs::S_IFREG;
+    let (file_id, _) = match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", mode, &admin, &guard) {
+        StepOutcome::Done(out) => out,
+        other => panic!("create_inode: {other:?}"),
+    };
+
     assert_eq!(
-        meta.mode & S_ISUID,
-        S_ISUID,
-        "privileged chown should preserve S_ISUID"
+        <Tmpfs as FsOps>::step_chown(&*tmpfs, file_id, Some(0), Some(0), &admin, &guard),
+        StepOutcome::Done(())
     );
+    let meta = match tmpfs.load_inode_meta(file_id, &guard) {
+        StepOutcome::Done(m) => m,
+        other => panic!("load_inode_meta: {other:?}"),
+    };
+    assert_eq!(meta.mode & S_ISUID, 0);
+    assert_eq!(meta.mode & S_ISGID, S_ISGID);
+    assert_eq!(meta.mode & !S_IFMT, S_ISGID | 0o700);
 }
 
 // === FsOps + FsPageBacking tests ====================================

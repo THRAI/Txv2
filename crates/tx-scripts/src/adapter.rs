@@ -12,7 +12,10 @@ use tx_platform_adapter::platform_adapter;
     reason = "expose substrate step engine outcome types, zone role types, and EBR guard used by the tx-scripts exec script"
 )]
 pub mod step_engine {
+    #[cfg(test)]
+    pub(crate) use crate::sync::SpinMutex;
     pub use tx_substrate::epoch::{guard, Guard};
+    pub use tx_substrate::page_allocator;
     pub use tx_substrate::step::{
         AcceptOutcome, AgentCancelPolicy, ByteProgress, Deadline, DelegateEndpoint,
         DelegateRequest, DelegateToken, DriveMode, Errno, InterestMask, NoProgress,
@@ -26,7 +29,6 @@ pub mod step_engine {
         OperationalCapExt, OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy,
         RetainedEntityPolicy, Weak, Zone, ZoneAllocated, ZoneError, ZonePolicy,
     };
-    pub use tx_substrate::{page_allocator, SpinMutex};
 }
 
 #[platform_adapter(

@@ -354,11 +354,9 @@ pub struct ProcessPayload {
   per-call check sites; the cred snapshot does not yet carry the
   rlimit bundle. v3 introduces an explicit `policy: ProcessPolicy`
   field with the rlimit + scheduling-policy bundle.
-- `nsproxy: Cap<NsProxy>`. Namespace-aware builds carry this immutable bundle
-  on the payload. Older flat-namespace paths can model it as a bundle whose
-  fields all point at init namespaces. `NAMESPACE_VIEW_v1` owns the userns,
-  pidns, mountns, and netns semantics; PROCESS owns only the pointer
-  publication on clone/unshare/setns.
+- `nsproxy: Cap<NsProxy>`. Not yet present; namespaces are flat
+  ("everyone shares the same root namespace"). v3 introduces the
+  nsproxy bundle when mount/pid/user namespaces land.
 - `group_exit: GroupExit` and `leader_exit_status: AtomicOption<ExitStatus>`.
   Currently exit_group collapse is handled inline by
   `step_exit_group` without a dedicated coordination struct;

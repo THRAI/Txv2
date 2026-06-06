@@ -242,17 +242,17 @@ fn render_maps(pid: Pid) -> String {
         let p = if entry.flags.shared { 's' } else { 'p' };
 
         // Offset and backing description.
-        let (offset, backing_desc) = match &entry.backing {
+        let (offset, backing_desc) = match entry.backing() {
             VmBacking::None => (0u64, "[none]"),
             VmBacking::PrivateAnon => (0u64, "[anon]"),
-            VmBacking::Page { pc, offset: off } => {
+            VmBacking::Page { pc, offset } => {
                 use tx_subsystems::page_backed::PageContainerKind;
                 let desc = match pc.kind() {
                     PageContainerKind::Anon { .. } => "[anon]",
                     PageContainerKind::File { .. } => "[file]",
                     PageContainerKind::Device { .. } => "[device]",
                 };
-                (*off, desc)
+                (offset, desc)
             }
         };
 
@@ -292,17 +292,17 @@ fn render_smaps(pid: Pid) -> String {
         let x = if entry.prot.execute { 'x' } else { '-' };
         let p = if entry.flags.shared { 's' } else { 'p' };
 
-        let (offset, backing_desc) = match &entry.backing {
+        let (offset, backing_desc) = match entry.backing() {
             VmBacking::None => (0u64, "[none]"),
             VmBacking::PrivateAnon => (0u64, "[anon]"),
-            VmBacking::Page { pc, offset: off } => {
+            VmBacking::Page { pc, offset } => {
                 use tx_subsystems::page_backed::PageContainerKind;
                 let desc = match pc.kind() {
                     PageContainerKind::Anon { .. } => "[anon]",
                     PageContainerKind::File { .. } => "[file]",
                     PageContainerKind::Device { .. } => "[device]",
                 };
-                (*off, desc)
+                (offset, desc)
             }
         };
 

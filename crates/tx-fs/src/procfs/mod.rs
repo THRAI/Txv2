@@ -13,6 +13,7 @@ mod read;
 use adapter::step_engine::{Cap, NoProgress, StepOutcome};
 use tx_subsystems::execution::{Errno, Guard};
 use tx_subsystems::mount::MountPayload;
+use tx_subsystems::net::NetNamespacePayload;
 use tx_subsystems::page_backed::{Frame, FsPageBacking};
 use tx_subsystems::process::numbers::{resolve_pid_number_as, PidName, PidNameKind};
 use tx_subsystems::process::{self, Pid};
@@ -425,6 +426,98 @@ impl Procfs {
     }
     pub fn fs_ops_arc() -> Arc<dyn FsOps> {
         Arc::new(Self::new())
+    }
+
+    fn step_read_projected_with_netns(
+        &self,
+        fs_object_id: FsObjectId,
+        offset: u64,
+        buf: &mut [u8],
+        caller_netns: Option<&tx_subsystems::net::NetNamespacePayload>,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<u64, NoProgress> {
+        // `/proc/<pid>/mem` — read from target process's address space.
+        // `offset` is the virtual address to read from.
+        if let Some(pid) = pid_from_mem_id(fs_object_id) {
+            let Some(proc) = process::process_by_pid(pid) else {
+                return StepOutcome::err(Errno::ESRCH);
+            };
+            let Some(aspace) = proc.aspace_cap() else {
+                return StepOutcome::err(Errno::ESRCH);
+            };
+            let src = UserPtr::<u8>::new(offset as usize);
+            match aspace.copy_from_user(buf, src, guard) {
+                StepOutcome::Done(n) => StepOutcome::done(n as u64),
+                StepOutcome::Err(e) => StepOutcome::err(e),
+                StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
+                    StepOutcome::err(Errno::EIO)
+                }
+            }
+        } else {
+            // Other projected files: render content via read::render.
+            let content: Vec<u8> = read::render_with_netns(fs_object_id, caller_netns).into_bytes();
+            let bytes = content.as_slice();
+            let off = offset as usize;
+            if off >= bytes.len() {
+                return StepOutcome::done(0);
+            }
+            let available = &bytes[off..];
+            let len = available.len().min(buf.len());
+            buf[..len].copy_from_slice(&available[..len]);
+            StepOutcome::done(len as u64)
+        }
+    }
+
+    fn step_write_projected_with_netns(
+        &self,
+        fs_object_id: FsObjectId,
+        offset: u64,
+        bytes: &[u8],
+        caller_netns: Option<&tx_subsystems::net::NetNamespacePayload>,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<u64, NoProgress> {
+        if let Some(outcome) = write_userns_projection(fs_object_id, offset, bytes) {
+            return outcome;
+        }
+
+        let default_netns;
+        let netns = match caller_netns {
+            Some(netns) => netns,
+            None => {
+                default_netns = tx_subsystems::net::initial_net_namespace_payload();
+                &default_netns
+            }
+        };
+
+        if fs_object_id == PROCFS_NET_TX_NF_RULES_ID {
+            return match tx_subsystems::net::apply_netfilter_control_command(netns, bytes) {
+                Ok(()) => StepOutcome::done(bytes.len() as u64),
+                Err(errno) => StepOutcome::err(errno),
+            };
+        }
+
+        if matches!(
+            fs_object_id,
+            PROCFS_SYS_FS_PIPE_MAX_SIZE_ID
+                | PROCFS_SYS_FS_LEASE_BREAK_TIME_ID
+                | PROCFS_SYS_FS_PROTECTED_HARDLINKS_ID
+                | PROCFS_SYS_FS_PROTECTED_SYMLINKS_ID
+                | PROCFS_SYS_USER_MAX_USER_NAMESPACES_ID
+        ) {
+            return StepOutcome::done(bytes.len() as u64);
+        }
+
+        if fs_object_id != PROCFS_SYS_NET_IPV4_IP_FORWARD_ID {
+            return StepOutcome::err(Errno::EROFS);
+        }
+        let trimmed = trim_ascii_space(bytes);
+        let enabled = match trimmed {
+            b"0" => false,
+            b"1" => true,
+            _ => return StepOutcome::err(Errno::EINVAL),
+        };
+        netns.set_ipv4_forwarding_for_test_or_bootstrap(enabled);
+        StepOutcome::done(bytes.len() as u64)
     }
 }
 
@@ -1283,39 +1376,10 @@ impl FsOps for Procfs {
         fs_object_id: FsObjectId,
         offset: u64,
         buf: &mut [u8],
-        caller_netns: Option<&tx_subsystems::net::NetNamespacePayload>,
+        caller_netns: Option<&NetNamespacePayload>,
         guard: &Guard<'_>,
     ) -> StepOutcome<u64, NoProgress> {
-        // `/proc/<pid>/mem` — read from target process's address space.
-        // `offset` is the virtual address to read from.
-        if let Some(pid) = pid_from_mem_id(fs_object_id) {
-            let Some(proc) = process::process_by_pid(pid) else {
-                return StepOutcome::err(Errno::ESRCH);
-            };
-            let Some(aspace) = proc.aspace_cap() else {
-                return StepOutcome::err(Errno::ESRCH);
-            };
-            let src = UserPtr::<u8>::new(offset as usize);
-            match aspace.copy_from_user(buf, src, guard) {
-                StepOutcome::Done(n) => StepOutcome::done(n as u64),
-                StepOutcome::Err(e) => StepOutcome::err(e),
-                StepOutcome::Yield { .. } | StepOutcome::Continue { .. } => {
-                    StepOutcome::err(Errno::EIO)
-                }
-            }
-        } else {
-            // Other projected files: render content via read::render.
-            let content: Vec<u8> = read::render_with_netns(fs_object_id, caller_netns).into_bytes();
-            let bytes = content.as_slice();
-            let off = offset as usize;
-            if off >= bytes.len() {
-                return StepOutcome::done(0);
-            }
-            let available = &bytes[off..];
-            let len = available.len().min(buf.len());
-            buf[..len].copy_from_slice(&available[..len]);
-            StepOutcome::done(len as u64)
-        }
+        Procfs::step_read_projected_with_netns(self, fs_object_id, offset, buf, caller_netns, guard)
     }
 
     fn step_write_projected(
@@ -1331,54 +1395,21 @@ impl FsOps for Procfs {
     fn step_write_projected_with_netns(
         &self,
         fs_object_id: FsObjectId,
-        _offset: u64,
+        offset: u64,
         bytes: &[u8],
-        caller_netns: Option<&tx_subsystems::net::NetNamespacePayload>,
-        _guard: &Guard<'_>,
+        caller_netns: Option<&NetNamespacePayload>,
+        guard: &Guard<'_>,
     ) -> StepOutcome<u64, NoProgress> {
-        if let Some(outcome) = write_userns_projection(fs_object_id, _offset, bytes) {
-            return outcome;
-        }
-
-        let default_netns;
-        let netns = match caller_netns {
-            Some(netns) => netns,
-            None => {
-                default_netns = tx_subsystems::net::initial_net_namespace_payload();
-                &default_netns
-            }
-        };
-
-        if fs_object_id == PROCFS_NET_TX_NF_RULES_ID {
-            return match tx_subsystems::net::apply_netfilter_control_command(netns, bytes) {
-                Ok(()) => StepOutcome::done(bytes.len() as u64),
-                Err(errno) => StepOutcome::err(errno),
-            };
-        }
-
-        if matches!(
+        Procfs::step_write_projected_with_netns(
+            self,
             fs_object_id,
-            PROCFS_SYS_FS_PIPE_MAX_SIZE_ID
-                | PROCFS_SYS_FS_LEASE_BREAK_TIME_ID
-                | PROCFS_SYS_FS_PROTECTED_HARDLINKS_ID
-                | PROCFS_SYS_FS_PROTECTED_SYMLINKS_ID
-                | PROCFS_SYS_USER_MAX_USER_NAMESPACES_ID
-        ) {
-            return StepOutcome::done(bytes.len() as u64);
-        }
-
-        if fs_object_id != PROCFS_SYS_NET_IPV4_IP_FORWARD_ID {
-            return StepOutcome::err(Errno::EROFS);
-        }
-        let trimmed = trim_ascii_space(bytes);
-        let enabled = match trimmed {
-            b"0" => false,
-            b"1" => true,
-            _ => return StepOutcome::err(Errno::EINVAL),
-        };
-        netns.set_ipv4_forwarding_for_test_or_bootstrap(enabled);
-        StepOutcome::done(bytes.len() as u64)
+            offset,
+            bytes,
+            caller_netns,
+            guard,
+        )
     }
+
     fn step_chmod(
         &self,
         _: FsObjectId,

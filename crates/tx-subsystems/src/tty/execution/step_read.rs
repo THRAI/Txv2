@@ -33,20 +33,20 @@ pub fn step_read(
     // reserve
     // commit
     // publish
-    use crate::tty::adapter::step_engine::{ByteProgress, StepOutcome as V3};
+    use crate::tty::adapter::step_engine::StepOutcome as V3;
 
     if out.is_empty() {
         return V3::Done(0);
     }
 
     if let Err(err) = require_fg_pgrp(tty, guard) {
-        return V3::Err(err);
+        return V3::Err(err.into());
     }
 
     let payload = match require_live_tty(tty, guard) {
         Ok(payload) => payload,
         Err(err) => {
-            return V3::Err(err);
+            return V3::Err(err.into());
         }
     };
 
@@ -91,12 +91,12 @@ pub fn step_read(
     // bytes arrive. Threshold / VMIN logic comes from main's
     // 2026-05-06 tty work.
     if threshold_unmet {
-        V3::yield_on_wait_source(ByteProgress::EMPTY, tty.wait_source_id(), TTY_READABLE)
+        crate::tty::notification::yield_readable_for_tty(tty.wait_source_id())
     } else if copied == 0 {
         if matches!(vmin_policy, Some(0)) {
             V3::Done(0)
         } else {
-            V3::yield_on_wait_source(ByteProgress::EMPTY, tty.wait_source_id(), TTY_READABLE)
+            crate::tty::notification::yield_readable_for_tty(tty.wait_source_id())
         }
     } else {
         V3::Done(copied)
@@ -122,7 +122,7 @@ pub fn step_read_for_caller(
 
     if let Err(err) = require_fg_pgrp_for(tty, Some(caller)) {
         let _ = background_read_signal(tty, caller);
-        return V3::Err(err);
+        return V3::Err(err.into());
     }
 
     step_read(tty, out, guard)
@@ -143,7 +143,7 @@ pub fn step_read_for_process(
 
     let caller_info = match super::IoctlCaller::from_process_with_guard(caller, guard) {
         Ok(caller_info) => caller_info,
-        Err(err) => return V3::Err(err),
+        Err(err) => return V3::Err(err.into()),
     };
 
     if out.is_empty() {
@@ -155,7 +155,7 @@ pub fn step_read_for_process(
         let _ = super::step_ioctl::deliver_signal_dispatch_for_process_with_guard(
             caller, dispatch, guard,
         );
-        return V3::Err(err);
+        return V3::Err(err.into());
     }
 
     step_read(tty, out, guard)
