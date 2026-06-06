@@ -1,3 +1,27 @@
+- 2026-06-06 **Net re-home follow-up: process-exit socket port release + verification-path
+  finding.** (1) **Port leak on exit fixed (`a05785aa`):** socket port reservations live in
+  the socket table (endpoint-keyed `Cap<SocketIdentity>`), withdrawn only by `step_socket_close`,
+  which ran solely on the explicit `close(2)` path. `step_process_exit` dropped fd Caps but never
+  withdrew the table bindings → a process exiting with a bound socket still open (e.g. an LTP case
+  that aborts via early TBROK before SAFE_CLOSE) leaked the port → next process `bind` → EADDRINUSE.
+  Now `step_process_exit` calls `step_socket_close` for each last-owned (retain_count==1) socket fd.
+  Non-regressive: recv01 5/5, b1 40/40. **Still open (NOT simple):** SCTP/bind back-to-back
+  EADDRINUSE in one boot persists after this — deeper cause is a lingering loopback peer/child
+  socket from synthesized connect/accept holding the port; left as follow-up. (2) **Verification
+  path discrepancy:** ledger baselines (`docs/LTP/*progress.md`) were generated via the
+  **slim-sdcard** path (`cargo xtask oscomp slim-sdcard` / `OSCOMP_LTP=`), but the handoff's
+  "graded scenario" and my runs use the **runtest** path (`OSCOMP_GROUPS=ltp-runtest:syscalls:`).
+  They run the same kernel+binaries but assemble different env: the runtest runner forces
+  `KCONFIG_PATH=/proc/config` (unparseable; baselines used `/boot/config-6.1.0-txkernel`),
+  uses a cwd where unix-socket files don't resolve, and lacks an `/etc/passwd` `nobody` — so
+  setsockopt05/07/08/09/10, sendmsg03 TBROK `Cannot parse kernel .config`; recvmsg01/bind04 TBROK
+  `unlink ENOENT`; bind02 TBROK `getpwnam(nobody)`. **None are select/poll regressions** (those
+  tests don't use select/poll). Full per-test matrix + path table in
+  `msp/net-rehome-verification-tracker.md`. **Verified-passing via runtest path (matches baseline):**
+  b1 40/40, b5 14/17, recv01 5/5, recvfrom01 7/7, sendmsg01(14 subcases)/sendmsg02/sendmmsg01/02/
+  recvmsg02/03, bind01/03, accept01/02/connect01/accept4_01(8/9)/accept03(22/23), setsockopt02/03/04,
+  SCTP assoc_shutdown/1_to_1_connect(10/10)/1_to_1_accept_close(10).
+
 - 2026-06-06 **Net re-home: fixed the multi-process TCP-loopback cold-start hang
   — root cause was select/poll, NOT connect() (prior handoff misattributed it).**
   The PR#50 re-home dropped network sockets from `select_fd_ready()` (tx-shims
