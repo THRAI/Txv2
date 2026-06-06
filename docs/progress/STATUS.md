@@ -1,3 +1,39 @@
+- 2026-06-06 **Net re-home: fixed the multi-process TCP-loopback cold-start hang
+  — root cause was select/poll, NOT connect() (prior handoff misattributed it).**
+  The PR#50 re-home dropped network sockets from `select_fd_ready()` (tx-shims
+  `linux_syscall/io.rs`): a real socket fell into the catch-all `_ => (true,None)`
+  arm, so `pselect6`/`ppoll` reported every socket as permanently ready with no
+  wait source. A blocking `select()` on a not-yet-readable socket therefore
+  returned ready immediately, and the test then blocked in the following `recv()`
+  — the recv01/recvfrom01 "hang at first connect" was actually this. **Fix
+  (`8e4789d1`):** (a) `select_fd_ready()` routes sockets through
+  `socket_poll_mask_from_file`/`socket_poll_wait_token_from_file` (the seam
+  recvfrom uses); (b) new `SelectPark` enum + `await_select_park()` — socket wait
+  carriers live in the **subsystems** `wait_source` REGISTRY, not the substrate
+  `reactor_entry` registry `await_wait_source()` consults, so a socket token sent
+  through `await_wait_source()` silently no-ops (`lookup_source`→None→instant
+  return) and **busy-loops**; sockets now park via `wait_source::wait_on_token()`,
+  pipe/tty/socketpair still via `await_wait_source()`; (c) `pselect6`/`ppoll` pump
+  `drive_loopback_pending()` each iteration so delivered loopback data is visible.
+  **Verified cold-start, individually (fresh boot each):** recv01 5/5 TPASS ret=0,
+  recvfrom01 7/7 TPASS ret=0, net.sctp `test_assoc_shutdown` (sentinel) TPASS.
+  **No regression:** syscall b1 group (socket01/socket02/listen01/getsockname01/
+  getsockopt01/getsockopt02/setsockopt01) = 40/40 TPASS exact baseline match;
+  accept01/accept02/accept4_01/connect01 PASS, accept03 22/23 (the one O_PATH
+  fd-errno gap is pre-existing baseline). **Known-limitation / next step:** the
+  socket `select` park awaits the raw `wait_on_token` future (its own mailbox), so
+  it does not wake on SIGALRM — fine here (the old code never blocked on sockets at
+  all), but a signal-interrupted socket-`select` would not return EINTR; wrap with
+  signal-aware waiting if a test needs it. **send02 is slow, NOT a regression:** it
+  loops 1000× connect/accept/send and its `check_recv` busy-loops on
+  `recv(MSG_DONTWAIT)` (never touches select/poll), so it is untouched by this fix;
+  its slowness is the 1000-iter stress + the deliberately-unhomed SIGALRM timeout.
+  Remaining baseline sweep (dimension A b3/b5/b6, full SCTP, dimension B net.*) and
+  sendmsg01 exit-139 still open. Verify env note: `make oscomp-qemu-rv64` with the
+  sdcard image is blocked by the agent harness sandbox; run qemu via a wrapper
+  script with the sandbox disabled and an internal `timeout`<110s (foreground) or
+  it gets killed — see `target/oscomp/run_recv01.sh`.
+
 - 2026-06-06 **Net runtime re-home: restored the syscall surface batch-testing
   exposed as missing.** Running the LTP net suites the way the OSComp grader does
   (batch, fresh boot per `make oscomp-qemu-rv64 OSCOMP_GROUPS=ltp-runtest:...`)
