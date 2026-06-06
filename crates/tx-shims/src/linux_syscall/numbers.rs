@@ -366,9 +366,12 @@ pub const CLONE_SYSVSEM: u64 = 0x40000;
 /// Namespace flags. `CLONE_NEWIPC` is wired to the process nsproxy
 /// clone path; the others are still silently accepted by pthread_create
 /// compatibility paths and remain namespace stubs.
+pub const CLONE_NEWNS: u64 = 0x20000;
 pub const CLONE_NEWCGROUP: u64 = 0x2000000;
 pub const CLONE_NEWUTS: u64 = 0x4000000;
 pub const CLONE_NEWIPC: u64 = 0x8000000;
+pub const CLONE_NEWUSER: u64 = 0x1000_0000;
+pub const CLONE_NEWNET: u64 = 0x4000_0000;
 
 /// `getppid()`. Linux generic ABI `__NR_getppid`. Wraps
 /// `ProcessIdentity::parent_pid()`. Returns `0` (`Pid::RESERVED`)
@@ -1324,6 +1327,9 @@ pub const NR_GETRLIMIT: u64 = 163;
 pub const NR_SETRLIMIT: u64 = 164;
 /// `getrusage(who, usage)`. Linux RV64 generic ABI.
 pub const NR_GETRUSAGE: u64 = 165;
+/// `unshare(flags)`. Linux RV64 generic ABI. Wired for CLONE_NEWUSER /
+/// CLONE_NEWNET (network-namespace LTP setup).
+pub const NR_UNSHARE: u64 = 97;
 
 /// `close_range(first, last, flags)`. Linux RV64 generic ABI.
 pub const NR_CLOSE_RANGE: u64 = 436;

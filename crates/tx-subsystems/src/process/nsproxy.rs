@@ -735,3 +735,30 @@ pub fn clone_nsproxy_with_mount_namespace(
         time_ns: nsproxy.time_ns.clone(),
     })
 }
+
+/// `unshare(CLONE_NEWUSER)` support: clone the nsproxy with a fresh child user
+/// namespace owned by `owner_uid`/`owner_gid`, keeping all other namespaces.
+/// Re-homed with the net subsystem (PR#50 dropped it together with sys_unshare).
+pub fn clone_nsproxy_with_user_namespace(
+    nsproxy: &Cap<NsProxy>,
+    owner_uid: u32,
+    owner_gid: u32,
+) -> Result<Cap<NsProxy>, ZoneError> {
+    let user_ns = sign(UserNamespace::child(
+        nsproxy.user_ns.clone(),
+        owner_uid,
+        owner_gid,
+    ))?;
+
+    sign(NsProxy {
+        pid_ns: nsproxy.pid_ns.clone(),
+        pid_for_children: nsproxy.pid_for_children.clone(),
+        mnt_ns: nsproxy.mnt_ns.clone(),
+        user_ns,
+        cgroup_ns: nsproxy.cgroup_ns.clone(),
+        uts_ns: nsproxy.uts_ns.clone(),
+        ipc_ns: nsproxy.ipc_ns.clone(),
+        net_ns: nsproxy.net_ns.clone(),
+        time_ns: nsproxy.time_ns.clone(),
+    })
+}

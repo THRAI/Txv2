@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::adapter::step_engine::{self as step_engine};
-use crate::linux_syscall::numbers::{CLONE_NEWIPC, NR_CLONE};
+use crate::linux_syscall::numbers::{CLONE_NEWIPC, CLONE_NEWNET, CLONE_NEWUSER, NR_CLONE};
 
 /// Linux raw `wait4`/`getrusage` rusage image for musl LP64:
 /// two `timeval`s plus fourteen `long` counters. musl passes the
@@ -120,6 +120,84 @@ pub(super) fn sys_exit_group<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
         Ok(()) => SyscallResult::NoReturn,
         Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }
+}
+
+/// `unshare(CLONE_NEWUSER)` / `unshare(CLONE_NEWNET)` — move the calling
+/// process into fresh namespace views. Re-homed with the net subsystem; PR#50
+/// dropped the whole unshare/netns syscall surface, so LTP network setup
+/// (`tst_net`'s `unshare(CLONE_NEWUSER)` then `unshare(CLONE_NEWNET)`) hit ENOSYS.
+///
+/// `CLONE_NEWUSER` publishes a fresh child user namespace in the process
+/// nsproxy. `CLONE_NEWNET` creates a network namespace owned by the caller's
+/// (post-NEWUSER) user namespace. With both flags, Linux creates the user
+/// namespace first so the net-namespace authorization uses the fresh one.
+pub(super) fn sys_unshare<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let flags = args[0];
+    if flags == 0 {
+        return SyscallResult::Return(0);
+    }
+    if flags & !(CLONE_NEWUSER | CLONE_NEWNET) != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    let Some(current) = ctx.process.nsproxy_cap() else {
+        return SyscallResult::Error(ESRCH_VALUE);
+    };
+    let cred = ctx.cred();
+    let mut replacement_nsproxy = None;
+    let mut subject_user_ns = current.user_ns.clone();
+
+    if flags & CLONE_NEWUSER != 0 {
+        if ctx.process.live_thread_count() > 1 {
+            return SyscallResult::Error(EINVAL_VALUE);
+        }
+        if !current.user_ns.maps_uid(cred.euid.raw()) || !current.user_ns.maps_gid(cred.egid.raw())
+        {
+            return SyscallResult::Error(EPERM_VALUE);
+        }
+        let replacement = match tx_subsystems::process::nsproxy::clone_nsproxy_with_user_namespace(
+            &current,
+            cred.euid.raw(),
+            cred.egid.raw(),
+        ) {
+            Ok(replacement) => replacement,
+            Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+        };
+        subject_user_ns = replacement.user_ns.clone();
+        replacement_nsproxy = Some(replacement);
+    }
+
+    let mut replacement_netns = None;
+    if flags & CLONE_NEWNET != 0 {
+        if !tx_subsystems::process::nsproxy::has_capability_in_user_namespace(
+            cred,
+            &subject_user_ns,
+            &subject_user_ns,
+            Capability::SYS_ADMIN,
+        ) {
+            return SyscallResult::Error(EPERM_VALUE);
+        }
+        let namespace = match tx_subsystems::net::create_isolated_net_namespace_with_owner(
+            "unshare",
+            Some(subject_user_ns.clone()),
+        ) {
+            Ok(namespace) => namespace,
+            Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+        };
+        let Some(payload) = namespace.payload_cap() else {
+            return SyscallResult::Error(EIO_VALUE);
+        };
+        replacement_netns = Some(payload);
+    }
+
+    if let Some(replacement) = replacement_nsproxy {
+        let _old = ctx.process.replace_nsproxy(replacement);
+    }
+    if let Some(payload) = replacement_netns {
+        let _old = ctx.process.replace_net_namespace(payload);
+    }
+
+    SyscallResult::Return(0)
 }
 
 /// `getpid()` — direct read of `process.pid` per `PROCESS_v1`

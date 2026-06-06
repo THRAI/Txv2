@@ -417,6 +417,17 @@ impl ProcessIdentity {
         self.payload.lock().as_ref().map(|p| p.nsproxy_cap())
     }
 
+    /// Install `new` as the process nsproxy, returning the previous cap (or
+    /// `None` for a zombie). Used by `unshare(CLONE_NEWUSER)` to publish a fresh
+    /// user-namespace bundle. Re-homed with the net subsystem (PR#50 kept only
+    /// the `pub(crate)` ProcessPayload variant and dropped this wrapper).
+    pub fn replace_nsproxy(
+        &self,
+        new: Cap<crate::process::nsproxy::NsProxy>,
+    ) -> Option<Cap<crate::process::nsproxy::NsProxy>> {
+        self.payload.lock().as_ref().map(|p| p.replace_nsproxy(new))
+    }
+
     pub fn mount_namespace_cap(&self) -> Option<Cap<crate::mount::MountNamespace>> {
         self.nsproxy_cap()?.mnt_ns.clone()
     }
