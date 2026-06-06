@@ -1,3 +1,39 @@
+- 2026-06-06 **Net re-home COMPLETE — entire rebased tree compiles (host libs +
+  RV64 kernel ELF + initramfs image all build clean).** PR#50 (an unrelated
+  filesystem/SMP merge) had orphaned the whole network integration layer during
+  conflict resolution; this pass re-homed it onto main's refactored substrate.
+  **tx-subsystems 372→0, tx-shims 80→0, HAL board 6→0.** Key restores (preserving
+  main-side additions where they superseded): wait_source `RawQueue`/`RawPort`
+  wait-source model + `adapter::wait_mailbox` (kept main's `register_wait_channel_with_id`);
+  full `UserNamespace` model grafted over main's `UserNamespaceStub` (kept main's
+  SYSV IPC namespace work); process↔netns binding (`ProcessPayload.net_namespace`
+  `AtomicSlot`, `ProcessIdentity::net_namespace/open_fds`, seeded at bootstrap via
+  `initial_net_namespace_payload_with_owner`, cloned at fork); `CAP_NET_RAW`;
+  `OpenFile::socket_identity`; socket constant catalog (`AF_*`/`SOL_*`/`IPV6_*`/
+  `MCAST_*`/`TPACKET_*`) + 16 socket errnos; `Cap::try_clone_live`,
+  `Index::snapshot_values_filter_map`. `net::register_zones()` re-wired into
+  `zones::register_all` (its absence panicked every process bootstrap on an
+  unregistered net zone). **HAL pmap merge-dedup:** a botched rebase left duplicate
+  fn defs; kept the feature's `invalidate_destroyed_root<State>` (route4-livelock
+  UAF fix) + main's `free_asid_after_invalidation` (residency) + main's
+  `shootdown_mappings` (batch sfence). **Deferred:** the interval-timer (ITIMER_REAL/
+  SIGALRM) subsystem was NOT re-homed — `time.rs` `itimer_real_deadline_ns` /
+  `consume_itimer_real_delivered_interrupt` are stubbed (socket waits fall through to
+  plain await; correct when no ITIMER_REAL armed); restore if a socket-timeout LTP
+  case needs SIGALRM-interrupted blocking recv. The mount-API fd kind
+  (`OpenFileBacking::MountApi`) arm was dropped from `socket_identity_from_file`
+  (main has no such fd kind). **Host unit tests: two failures confirmed PRE-EXISTING
+  (not regressions):** `dispatch_read_blocks_until_tty_input_then_returns_byte`
+  busy-loops in isolation on clean `main` too (no-mailbox `DriveMode::Waiting` Retry
+  loop — needs the full-suite harness); `bridge_tests::namespace_runtime_drives_*`
+  fail identically on the backup branch (`bridge_forwarded: 0` — these "runtime
+  drives" integration tests need the real QEMU device/IRQ pipeline). A handful of
+  such failures poison the shared `EPOCH_TEST_LOCK`, cascading ~191 net tests to
+  "FAILED"; core net unit tests pass in isolation (e.g. `core_structure_tests` 25/25).
+  **Commits:** `8be855d9` (tx-subsystems), `4453aa57` (tx-shims), `bed63c40` (zones +
+  HAL + test packet fields). **Verification in progress:** QEMU oscomp
+  cyclictest/iozone + SCTP LTP. **Not force-pushed** — local only.
+
 - 2026-06-05 **Rebased `feature-network-next` onto current `main`.** The branch was
   69 commits past a 2026-05-28 merge-base while `main` raced 732 commits / 8 days
   ahead with a heavy refactor of the syscall/glue layer. Replayed **65/69** commits
