@@ -1,3 +1,16 @@
+- 2026-06-07 **Net re-home: /etc/{passwd,group} identity files restored (`21dff5c9`) — bind02
+  PASS.** PR#50 also dropped `populate_rootfs_identity_files`; re-homed a minimal seeder (root +
+  nobody) so `getpwnam(nobody)` resolves. **Boundary reached:** every surface PR#50 dropped that
+  is in the backup has now been re-homed (select/poll, port-release, .config, /proc/sys/kernel,
+  unshare, writable procfs uid_map+/proc/self, identity files). The remaining runtest-path
+  failures are **NOT re-home regressions** — they are pre-existing limitations the backup also
+  lacked or known issues: **(a)** AF_UNIX bind uses an in-memory table (no on-disk inode) in BOTH
+  backup and current, so `SAFE_UNLINK` of a bound unix path TBROKs (recvmsg01, bind04) — real
+  Linux creates the inode; this is NEW work, not a restore; **(b)** sendmsg01 14/14 subcases pass
+  then teardown SIGSEGV (handoff §5 todo); **(c)** recvmmsg01 musl-wrapper SIGSEGV (the baseline's
+  own 1/38 b3 miss, not a kernel bug); **(d)** SCTP/bind back-to-back EADDRINUSE (lingering
+  loopback peer; process-exit port release `a05785aa` covers exit-without-close but not this).
+
 - 2026-06-07 **Net re-home: netns/userns infrastructure restored — dimension-A b6 now 10/11
   (exact baseline).** Causal correction (git-verified): the dropped surface was orphaned by
   **PR#50** (`4b7868a1`, codex/filesystem-smp-gap-stack merge — NOT user work): its parent PR#47
