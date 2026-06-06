@@ -751,6 +751,15 @@ async fn sendto_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult 
     // yet implicitly establishes one (Linux SCTP implicit association), then
     // sends on it. A socket that is already connected ignores the destination.
     if socket.kind == SocketKind::Sctp && args[4] != 0 && socket_peer_endpoint(&socket).is_err() {
+        // Validate the user send buffer before the implicit association: Linux
+        // faults on the buffer (EFAULT) before reporting protocol-state errors,
+        // so sendto(fd, NULL, ...) must return EFAULT, not ECONNREFUSED from the
+        // implicit connect (sendto02).
+        if len > 0 {
+            if let Err(errno) = validate_user_range(ctx, args[1], len, UserAccessKind::Read) {
+                return SyscallResult::Error(errno_to_i32(errno));
+            }
+        }
         let remote = match read_sockaddr_in(ctx, args[4], args[5]) {
             Ok(addr) => connect_sockaddr_for_local_stack(socket.kind, addr),
             Err(Errno::EAFNOSUPPORT) => return SyscallResult::Error(errno_to_i32(Errno::EINVAL)),
