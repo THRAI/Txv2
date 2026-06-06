@@ -1948,3 +1948,88 @@ pub const MCAST_LEAVE_GROUP: i32 = 45;
 pub const TPACKET_V1: i32 = 0;
 /// `TPACKET_V3` — AF_PACKET v3 ring format.
 pub const TPACKET_V3: i32 = 2;
+
+// Socket-option *names* (the `optname` arg to set/getsockopt), grouped by level.
+// CRITICAL: these MUST be defined — the set/getsockopt dispatch matches on
+// `(level, OPTNAME)`; an undefined OPTNAME silently becomes an irrefutable
+// binding pattern, so the first arm in a level group swallows every option
+// (76 unreachable arms). Re-homed after PR#50 stripped them. Values are the
+// Linux generic-ABI numbers.
+
+// SOL_SOCKET options.
+pub const SO_REUSEADDR: i32 = 2;
+pub const SO_TYPE: i32 = 3;
+pub const SO_ERROR: i32 = 4;
+pub const SO_DONTROUTE: i32 = 5;
+pub const SO_BROADCAST: i32 = 6;
+pub const SO_SNDBUF: i32 = 7;
+pub const SO_RCVBUF: i32 = 8;
+pub const SO_KEEPALIVE: i32 = 9;
+pub const SO_OOBINLINE: i32 = 10;
+pub const SO_NO_CHECK: i32 = 11;
+pub const SO_LINGER: i32 = 13;
+pub const SO_REUSEPORT: i32 = 15;
+pub const SO_PEERCRED: i32 = 17;
+pub const SO_RCVTIMEO: i32 = 20;
+pub const SO_SNDTIMEO: i32 = 21;
+pub const SO_BINDTODEVICE: i32 = 25;
+pub const SO_SNDBUFFORCE: i32 = 32;
+
+// IPPROTO_IP options.
+pub const IP_TTL: i32 = 2;
+pub const IP_HDRINCL: i32 = 3;
+pub const IP_RECVERR: i32 = 11;
+pub const IP_MULTICAST_IF: i32 = 32;
+pub const IP_MULTICAST_TTL: i32 = 33;
+pub const IP_MULTICAST_LOOP: i32 = 34;
+pub const ICMP6_FILTER: i32 = 1;
+
+// IPPROTO_TCP options.
+pub const TCP_NODELAY: i32 = 1;
+pub const TCP_MAXSEG: i32 = 2;
+pub const TCP_INFO: i32 = 11;
+pub const TCP_CONGESTION: i32 = 13;
+pub const TCP_ULP: i32 = 31;
+pub const TLS_TX: i32 = 1;
+
+// IPPROTO_SCTP options.
+pub const SCTP_RTOINFO: i32 = 0;
+pub const SCTP_ASSOCINFO: i32 = 1;
+pub const SCTP_INITMSG: i32 = 2;
+pub const SCTP_AUTOCLOSE: i32 = 4;
+pub const SCTP_PRIMARY_ADDR: i32 = 6;
+pub const SCTP_DISABLE_FRAGMENTS: i32 = 8;
+pub const SCTP_PEER_ADDR_PARAMS: i32 = 9;
+pub const SCTP_DEFAULT_SEND_PARAM: i32 = 10;
+pub const SCTP_EVENTS: i32 = 11;
+pub const SCTP_MAXSEG: i32 = 13;
+pub const SCTP_STATUS: i32 = 14;
+pub const SCTP_DELAYED_ACK_TIME: i32 = 16;
+pub const SCTP_SOCKOPT_PEELOFF: i32 = 102;
+pub const SCTP_GET_PEER_ADDRS: i32 = 108;
+pub const SCTP_GET_LOCAL_ADDRS: i32 = 109;
+
+// AF_PACKET (SOL_PACKET) options.
+pub const PACKET_RX_RING: i32 = 5;
+pub const PACKET_VERSION: i32 = 10;
+pub const PACKET_RESERVE: i32 = 12;
+pub const PACKET_VNET_HDR: i32 = 15;
+
+// SOL_NETLINK options.
+pub const NETLINK_EXT_ACK: i32 = 11;
+
+// iptables (SOL_IP get/set) options.
+pub const IPT_SO_SET_REPLACE: i32 = 64;
+pub const IPT_SO_SET_ADD_COUNTERS: i32 = 65;
+pub const IPT_SO_GET_INFO: i32 = 64;
+pub const IPT_SO_GET_ENTRIES: i32 = 65;
+
+/// `IPPROTO_UDP` — User Datagram Protocol.
+pub const IPPROTO_UDP: i32 = 17;
+/// `SOL_TLS` — kernel TLS socket-option level.
+pub const SOL_TLS: i32 = 282;
+// More IPPROTO_IPV6 (SOL_IPV6) options.
+pub const IPV6_ADDRFORM: i32 = 1;
+pub const IPV6_CHECKSUM: i32 = 7;
+pub const IPV6_UNICAST_HOPS: i32 = 16;
+pub const IPV6_V6ONLY: i32 = 26;
