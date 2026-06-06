@@ -266,6 +266,14 @@ Spot-check the cheap/stable ones first (`net.ipv6_lib` in6_01/in6_02/asapi_02/as
 `net.tcp_cmds` netstat/iproute/ping01) before the 300–900 s shim-dependent ones. Use the per-entry
 witness log names in the ledger to reproduce each.
 
+**⏱️ 5-minute rule (dimension B only):** if a single dimension-B test takes **more than ~5 min
+(300 s) of wall clock** to pass, **defer it — don't verify it now.** These are slow by nature
+(witnesses are 180–900 s, TCG-dilated) and not worth the verification time; clear the sub-5-min
+ones, mark the long ones "to-verify" for later or a faster/real-HW environment. This applies ONLY
+to dimension B — dimensions A (syscall) and C (SCTP) are core and must be verified however slow
+(a few inherently-slow core cases like `connect02`'s 1000-iteration loop just get their own long
+timeout; they are NOT in scope for this skip rule).
+
 ## Baselines / witnesses
 
 - SCTP documented baseline: `docs/LTP/runtests/ltp-runtest-net-sctp-progress.md`.
