@@ -29,6 +29,36 @@ pub const PROCFS_SYSVIPC_ID: FsObjectId = FsObjectId::new(0x7072_6F06);
 pub const PROCFS_SYSVIPC_MSG_ID: FsObjectId = FsObjectId::new(0x7072_6F07);
 pub const PROCFS_SYSVIPC_SEM_ID: FsObjectId = FsObjectId::new(0x7072_6F08);
 pub const PROCFS_SYSVIPC_SHM_ID: FsObjectId = FsObjectId::new(0x7072_6F09);
+pub const PROCFS_CONFIG_ID: FsObjectId = FsObjectId::new(0x7072_6F0A);
+
+/// Minimal plain-text kernel `.config` exposed at `/proc/config` (and seeded as
+/// `/boot/config-6.1.0-txkernel`) so LTP's `tst_kconfig` parser can confirm the
+/// features the network suites probe. Re-homed with the net subsystem; the
+/// PR#50 re-home dropped the whole config surface (this const, the
+/// `/proc/config` backing, and the `/boot/config-*` seeding), which made every
+/// kconfig-gated LTP case TBROK with "Cannot parse kernel .config" regardless
+/// of runner path. Conservative on purpose — it advertises only what the LTP
+/// witnesses check, not the kernel's real build options.
+pub const KERNEL_CONFIG_TEXT: &str = "CONFIG_EVENTFD=y\n\
+CONFIG_TIME_NS=y\n\
+CONFIG_HIGH_RES_TIMERS=y\n\
+CONFIG_NET_NS=y\n\
+CONFIG_USER_NS=y\n\
+CONFIG_DUMMY=y\n\
+CONFIG_VETH=y\n\
+CONFIG_NET_SCH_TEQL=y\n\
+CONFIG_NETFILTER_XTABLES=y\n\
+CONFIG_NETFILTER_XT_MATCH_STATE=y\n\
+CONFIG_NETFILTER_XT_MATCH_LIMIT=y\n\
+CONFIG_NETFILTER_XT_MATCH_MULTIPORT=y\n\
+CONFIG_NETFILTER_XT_TARGET_LOG=y\n\
+CONFIG_IP_NF_TARGET_REJECT=y\n\
+CONFIG_IP_NF_IPTABLES=y\n\
+CONFIG_IP_NF_FILTER=y\n\
+CONFIG_IP6_NF_IPTABLES=y\n\
+CONFIG_IP6_NF_FILTER=y\n\
+CONFIG_NF_TABLES=y\n\
+CONFIG_TLS=y\n";
 const PROCFS_PID_BASE: u64 = 0x7072_0000;
 const PROCFS_STAT_OFFSET: u64 = 0x10000;
 const PROCFS_MEM_OFFSET: u64 = 0x10002;
@@ -209,6 +239,9 @@ impl FsOps for Procfs {
             if name == b"meminfo" {
                 return StepOutcome::done(PROCFS_MEMINFO_ID);
             }
+            if name == b"config" {
+                return StepOutcome::done(PROCFS_CONFIG_ID);
+            }
             if name == b"sysvipc" {
                 return StepOutcome::done(PROCFS_SYSVIPC_ID);
             }
@@ -282,7 +315,11 @@ impl FsOps for Procfs {
             PROCFS_SELF_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Symlink, PROCFS_SYMLINK_MODE))
             }
-            PROCFS_MOUNTS_ID | PROCFS_CPUINFO_ID | PROCFS_UPTIME_ID | PROCFS_MEMINFO_ID => {
+            PROCFS_MOUNTS_ID
+            | PROCFS_CPUINFO_ID
+            | PROCFS_UPTIME_ID
+            | PROCFS_MEMINFO_ID
+            | PROCFS_CONFIG_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
             }
             PROCFS_SYSVIPC_ID => {
@@ -417,6 +454,7 @@ impl FsOps for Procfs {
             (b"cpuinfo", PROCFS_CPUINFO_ID, InodeKind::Regular),
             (b"uptime", PROCFS_UPTIME_ID, InodeKind::Regular),
             (b"meminfo", PROCFS_MEMINFO_ID, InodeKind::Regular),
+            (b"config", PROCFS_CONFIG_ID, InodeKind::Regular),
             (b"sysvipc", PROCFS_SYSVIPC_ID, InodeKind::Directory),
         ];
         let si = idx.saturating_sub(2);

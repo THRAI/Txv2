@@ -247,6 +247,29 @@ kernel/net/sctp/sctp.ko\n";
             return;
         }
 
+        // Seed `/boot/config-6.1.0-txkernel` (the plain-text kernel .config LTP's
+        // tst_kconfig parser probes after `/proc/config[.gz]`). Re-homed with the
+        // net subsystem; PR#50 dropped it, which made every kconfig-gated LTP case
+        // TBROK "Cannot parse kernel .config". The `/proc/config` procfs backing
+        // (KCONFIG_PATH used by the runtest runner) is restored in tx-fs procfs.
+        if let Some(boot_id) = mkdir_or_find(fs_ops, root_fs_object_id, b"boot", 0o755, &cred) {
+            if !create_file_with_data(
+                &create_ctx,
+                boot_id,
+                b"config-6.1.0-txkernel",
+                0o644,
+                tx_fs::procfs::KERNEL_CONFIG_TEXT.as_bytes(),
+            ) {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":kernel-config:err:create-boot-config\n");
+                return;
+            }
+        } else {
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":kernel-config:err:mkdir-boot\n");
+            return;
+        }
+
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":kernel-config:ok\n");
     }

@@ -1,9 +1,9 @@
 //! Content renderers for procfs pseudo-files.
 
 use crate::procfs::{
-    pid_from_cmdline_id, pid_from_fdinfo_id, pid_from_maps_id, pid_from_stat_id, PROCFS_CPUINFO_ID,
-    PROCFS_MEMINFO_ID, PROCFS_MOUNTS_ID, PROCFS_SYSVIPC_MSG_ID, PROCFS_SYSVIPC_SEM_ID,
-    PROCFS_SYSVIPC_SHM_ID, PROCFS_UPTIME_ID,
+    pid_from_cmdline_id, pid_from_fdinfo_id, pid_from_maps_id, pid_from_stat_id, KERNEL_CONFIG_TEXT,
+    PROCFS_CONFIG_ID, PROCFS_CPUINFO_ID, PROCFS_MEMINFO_ID, PROCFS_MOUNTS_ID, PROCFS_SYSVIPC_MSG_ID,
+    PROCFS_SYSVIPC_SEM_ID, PROCFS_SYSVIPC_SHM_ID, PROCFS_UPTIME_ID,
 };
 use alloc::format;
 use alloc::string::String;
@@ -28,6 +28,7 @@ pub fn render(fs_object_id: FsObjectId) -> String {
         PROCFS_CPUINFO_ID => render_cpuinfo(),
         PROCFS_UPTIME_ID => render_uptime(),
         PROCFS_MEMINFO_ID => render_meminfo(),
+        PROCFS_CONFIG_ID => render_config(),
         PROCFS_SYSVIPC_MSG_ID => render_sysvipc_msg(),
         PROCFS_SYSVIPC_SEM_ID => render_sysvipc_sem(),
         PROCFS_SYSVIPC_SHM_ID => render_sysvipc_shm(),
@@ -183,6 +184,10 @@ fn fdinfo_flags(file: &tx_subsystems::vfs::OpenFile) -> u32 {
         out |= 0o2000000;
     }
     out
+}
+
+pub fn render_config() -> String {
+    String::from(KERNEL_CONFIG_TEXT)
 }
 
 pub fn render_meminfo() -> String {
