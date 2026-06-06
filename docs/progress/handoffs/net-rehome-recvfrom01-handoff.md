@@ -49,58 +49,71 @@ non-net glue, defer to `main` unless the user explicitly added a feature/bugfix 
   `getsockopt02`, `listen01`, `recv01`, plus `getpeername01`, `bind03` individually.
   (Before the meminfo fix these ALL failed at setup with TBROK.)
 
-## THE BATCH BLOCKER — recvfrom01 (fix this first; it stalls the whole batch)
+## THE BATCH BLOCKER — multi-process TCP-loopback connect cold-start hang (NOT recvfrom-specific)
+
+**This diagnosis was completed empirically — do not re-litigate the ruled-out hypotheses.**
 
 The net syscall batch runs alphabetically and **hangs at `recvfrom01`**, blocking every
-test after it. Root-cause analysis already done:
+test after it. But the hang is **NOT recvfrom-specific** — `recv01` hangs at the *identical*
+point when run alone. Evidence:
 
 - `recvfrom01.c` and `recv01.c` are the **same old-style multi-process LTP test**:
   `start_server()` → `tst_fork()` → child `do_child()` does `accept()` + `write(newfd,"hoser\n",6)`;
-  the parent's `setup1()` does `connect()` then **`poll()`s up to 2 s** for that data
-  ("Wait for something to be readable, else we won't detect EFAULT").
-- **`recv01` PASSES all cases** with this identical architecture → fork, TCP loopback,
-  connect, accept, data delivery, poll-with-timeout, blocking recv, and
-  `EFAULT`-on-bad-buffer **all work**.
-- recvfrom01 prints case 1 + case 2 TPASS (testno 0,1 = `setup0`, bad-fd / non-socket — no
-  connect) then **hangs at case 3 = testno 2 = the first `setup1` case**. The case table:
-  - testno 2: `from=(struct sockaddr*)-1`, salen=&fromlen, retval 0, ENOTSOCK, "invalid socket buffer"  ← **HANGS HERE**
-  - testno 3: fromlen=-1, EINVAL, "invalid socket addr length"
-  - testno 4: buf=(void*)-1, EFAULT, "invalid recv buffer"
-  - testno 5/6: MSG_OOB EINVAL / MSG_ERRQUEUE EAGAIN
-- The only thing testno 2 adds over recv01 is the **bad source-address out-pointer
-  `from=(sockaddr*)-1`** (= `0xffffffffffffffff`), written back by
-  `write_sockaddr_endpoint(ctx, args[4], args[5], source)` at
-  `crates/tx-shims/src/linux_syscall/socket.rs:1058`.
-  That fn (`socket/helpers.rs:1120`) uses **faultable `bootstrap_copy_to_user`** — and
-  recv01 proved that path returns clean `EFAULT` for `(void*)-1`. So the writeback alone
-  "should" not livelock.
+  the parent's `setup1()` does `socket()`+`connect()` then **`select()`s up to 2 s** for data.
+- Both go through the **same syscall**: riscv64 has **no `NR_RECV`** (numbers.rs has only
+  `NR_RECVFROM=207`); musl `recv()` = the recvfrom syscall with `from=NULL`. So recv01 and
+  recvfrom01 both drive `recvfrom_impl` (socket.rs:899); recv01 with `args[4]=0`, recvfrom01
+  testno 2 with `args[4]=0xffff…`.
+- **Empirical (fresh boot, individual runs):**
+  - `recvfrom01` alone: prints testno 1,2 TPASS (setup0, bad-fd/non-socket — no connect),
+    then **silent hang at testno 2 (0-indexed) = first `setup1` case**. 320 s, no further output.
+  - `recv01` alone: **identical** — testno 1,2 TPASS then silent hang at the first `setup1` case.
+  - **No `TBROK "no message ready in 2 sec"` is ever printed** → setup1 never reaches/returns
+    from its 2 s `select()`. So the stall is in **`connect()`** (or `select()`'s timeout is
+    not honored), *before* any recv.
+- `recv01` "PASS" in the earlier batch was **state-dependent / a false pass** — it ran 5th,
+  after `getsockname01/getsockopt01/getsockopt02/listen01` warmed the loopback/net-delegate.
+  Alone it hangs. (⚠️ Lesson: the batch can produce FALSE PASSES that mask cold-start hangs —
+  verify net tests **individually too**, not only in batch.)
 
-**Two candidate causes — disambiguate empirically before coding:**
-1. **(addr-writeback fault)** `bootstrap_copy_to_user` to `0xffff…` livelocks specifically
-   when reached *after* a successful recv (vs recv01's pre-recv buffer copy), echoing the
-   known page-fault-retry livelock class (see memory `route4-livelock=page-table-UAF`).
-2. **(blocking recv)** the recvfrom *blocks* waiting for "hoser\n" because in the
-   recvfrom01 timing/ordering the data isn't delivered, and the framework's watchdog
-   (now uses the re-homed `setitimer`/itimer deadline → `wait_on_socket_or_itimer`) only
-   wakes at the framework timeout, not 2 s.
+**RULED OUT — do not chase these:**
+- *recvfrom source-address writeback to `from=0xffff…`*: for a **connected TCP (SOCK_STREAM)**
+  socket, `consume_recv_bytes_into` sets `source: None` (payload.rs:41,54 — only **UDP**
+  sets `source: Some`, line 71). So `write_sockaddr_endpoint` is **never called** for these
+  tests; the bad `from` pointer is never dereferenced. Confirmed the hang is pre-recv.
+- *itimer / framework watchdog*: irrelevant — the stall is in connect, before any blocking recv.
 
-**Diagnostic step (do this first):** run recvfrom01 **alone** with a ~300 s timeout and
-capture serial:
+**ROOT CAUSE (high confidence):** the **first multi-process TCP-loopback `connect()` on a
+cold boot hangs** — the client process blocks in `connect()` and the SYN/SYN-ACK handshake
+with the **forked child server's `accept()`** is never driven (the two processes don't
+interleave, and/or loopback delivery isn't pumped while connect blocks). recvfrom_impl pumps
+loopback in its wait loop via `drive_loopback_pending()` (socket.rs:975); the connect/accept
+path likely does not.
+
+**Where to fix (LIVE code — note the dead-code trap):**
+- LIVE, dispatched (mod.rs:913-915, all `.await`ed): `sys_connect`→`connect_impl`
+  (**socket.rs:399 / 406, async**), `sys_accept`/`sys_accept4` (**socket.rs:321**).
+- **DEAD CODE — ignore:** `crates/tx-shims/src/linux_syscall/net.rs` has an orphaned
+  `FakeSocket`/`SOCKETS` stub `sys_connect` (net.rs:265) / `sys_accept4` / `sys_sendto`.
+  These are **not dispatched**. (Separate cleanup candidate: the whole net.rs FakeSocket
+  layer looks orphaned by the re-home — verify and consider deleting.)
+
+**First action:** read `connect_impl` (socket.rs:406) and the accept wait path (socket.rs:321).
+Check whether connect's blocking wait loop (a) yields so the forked server's `accept()` runs,
+and (b) calls `drive_loopback_pending()` (or kicks the net delegate) so the handshake packets
+move while connect blocks — mirroring `recvfrom_impl`'s loop at socket.rs:973-1028. Add that
+driving/yielding if missing. Also confirm `select()`/`poll()` honor a finite timeout (so a
+genuinely-dataless setup1 would TBROK rather than hang).
+
+**Verify the fix:** `recv01` ALONE and `recvfrom01` ALONE must BOTH complete (fresh boot, not
+a warmed batch):
 ```
+cargo build -p tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf
 cp target/riscv64gc-unknown-none-elf/debug/tx-kernel-riscv64-qemu-virt target/oscomp/submit/kernel-rv
-timeout 320 make oscomp-qemu-rv64 OSCOMP_GROUPS=ltp-runtest:syscalls:recvfrom01 > /tmp/rf.log 2>&1
-grep -nE "TPASS|TFAIL|TBROK|no message ready|recvfrom" /tmp/rf.log
+timeout 120 make oscomp-qemu-rv64 OSCOMP_GROUPS=ltp-runtest:syscalls:recv01 > /tmp/recv01.log 2>&1; grep -aE "recv01 +[0-9]|TBROK|PASS LTP CASE|FAIL LTP CASE" /tmp/recv01.log
+timeout 120 make oscomp-qemu-rv64 OSCOMP_GROUPS=ltp-runtest:syscalls:recvfrom01 > /tmp/rf.log 2>&1; grep -aE "recvfrom01 +[0-9]|TBROK|PASS LTP CASE|FAIL LTP CASE" /tmp/rf.log
 ```
-- If it prints **"client setup1 failed - no message ready in 2 sec" (TBROK)** → it's the
-  **poll/data-delivery** path (candidate 2). Compare recvfrom01's setup1 vs recv01's setup1
-  for any real difference; check multi-process loopback timing.
-- If it **hangs silently** in the recvfrom call (no TBROK) → it's the **recvfrom-specific
-  addr-writeback** (candidate 1). Fix: validate/short-circuit the `from` pointer, or make
-  the writeback's fault return `EFAULT` without retrying. Inspect `recvfrom_impl`
-  (`socket.rs:899`) ordering: it should be safe to write the src addr to a bad pointer and
-  get EFAULT, same as recv's buffer copy.
-- If it eventually unblocks at ~framework-timeout → confirms candidate 2 + itimer is the
-  only thing waking it (still a FAIL; recvfrom must not block here).
+Kill stray qemu between runs: `pkill -9 -f qemu-system-riscv64; sleep 2`.
 
 ## OTHER REMAINING net items (after recvfrom01)
 
@@ -186,7 +199,11 @@ ret=0 — rely on the per-case `TPASS` count + `: 0`, and diff the TPASS count v
 
 ## First action in the new conversation
 
-Run the recvfrom01 disambiguation command above, read the serial log, decide candidate 1 vs
-2, fix it, re-run recvfrom01 to green, then continue the full net + SCTP batch comparison
-against the baselines. Keep `test_assoc_shutdown` green as a regression guard each round.
-Do a `docs/progress/STATUS.md` catch-up before declaring done.
+Read `connect_impl` (socket.rs:406) + the accept path (socket.rs:321); add loopback-driving
+/ yielding to connect's blocking wait so the cold-start multi-process TCP handshake completes
+(see "THE BATCH BLOCKER" section — diagnosis is done, root cause is the connect cold-start
+hang, NOT recvfrom). Verify `recv01` AND `recvfrom01` both pass **individually** (fresh boot),
+then run the full net syscall + net.sctp batches and diff against baselines. Keep
+`test_assoc_shutdown` green as a regression guard each round. ⚠️ The batch can produce FALSE
+PASSES that hide cold-start hangs — always cross-check key net tests individually too. Do a
+`docs/progress/STATUS.md` catch-up before declaring done.
