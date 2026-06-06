@@ -926,6 +926,24 @@ pub(crate) fn step_process_exit(process: &Cap<ProcessIdentity>, status: ExitStat
             b"debug.lock_service.process.payload.process_exit.drain_fds.duration_ns",
             || payload.drain_fds(),
         );
+        // Release socket port/table bindings for any socket fd this process was
+        // the last owner of. Process exit drops the fd Caps but — unlike the
+        // explicit close(2) path (maybe_close_socket_file_after_fd_remove ->
+        // step_socket_close) — never ran the socket-close teardown, so a bound
+        // port stayed reserved in the socket table and the next process binding
+        // the same endpoint failed EADDRINUSE. This bites back-to-back LTP test
+        // processes, especially a test that exits via early TBROK before closing
+        // its sockets. Skip fds still shared (dup/fork) so a forked child keeps
+        // the listener until it too exits.
+        for file in closed_fds.values() {
+            if file.retain_count() > 1 {
+                continue;
+            }
+            if let Some(socket) = file.socket_identity() {
+                let guard = tx_substrate::epoch::guard();
+                let _ = crate::net::execution::step_socket_close(socket, &guard);
+            }
+        }
         measure_process_lock_service(
             b"debug.lock_service.process.payload.process_exit.drop_closed_fds.duration_ns",
             || drop(closed_fds),
