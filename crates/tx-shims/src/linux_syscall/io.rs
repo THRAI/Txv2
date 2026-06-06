@@ -18,6 +18,20 @@ enum SelectDir {
     Write,
 }
 
+/// Where a not-yet-ready fd parks. Pipe/TTY/socketpair carriers live in the
+/// substrate `reactor_entry` wait-source registry (parked via
+/// `await_wait_source`); real network sockets live in the subsystems
+/// `wait_source` registry (parked via `wait_on_token`). Routing a socket token
+/// through `await_wait_source` silently no-ops (different registry) and
+/// busy-loops, so the two must be kept distinct.
+enum SelectPark {
+    Reactor(
+        crate::adapter::step_engine::WaitSourceId,
+        crate::adapter::step_engine::InterestMask,
+    ),
+    Socket(tx_subsystems::execution::WaitToken),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StaticCharDevice {
     Null,
@@ -150,16 +164,7 @@ fn fdset_clear(bits: &mut [u8], fd: u64) {
     }
 }
 
-fn select_fd_ready(
-    file: &Cap<OpenFile>,
-    dir: SelectDir,
-) -> (
-    bool,
-    Option<(
-        crate::adapter::step_engine::WaitSourceId,
-        crate::adapter::step_engine::InterestMask,
-    )>,
-) {
+fn select_fd_ready(file: &Cap<OpenFile>, dir: SelectDir) -> (bool, Option<SelectPark>) {
     use crate::adapter::step_engine::{InterestMask, WaitSourceId};
     use tx_subsystems::pipe::PipeSide;
     use tx_subsystems::vfs::structure::{RNodeBacking, StructPayload};
@@ -168,14 +173,14 @@ fn select_fd_ready(
         return match (dir, side) {
             (SelectDir::Read, PipeSide::Reader) => (
                 pipe.readable_level(),
-                Some((
+                Some(SelectPark::Reactor(
                     WaitSourceId::new(pipe.reader_source_id()),
                     InterestMask::new(0x1),
                 )),
             ),
             (SelectDir::Write, PipeSide::Writer) => (
                 pipe.writable_level(),
-                Some((
+                Some(SelectPark::Reactor(
                     WaitSourceId::new(pipe.writer_source_id()),
                     InterestMask::new(0x2),
                 )),
@@ -189,19 +194,59 @@ fn select_fd_ready(
         return match dir {
             SelectDir::Read => (
                 rx.readable_level(),
-                Some((
+                Some(SelectPark::Reactor(
                     WaitSourceId::new(rx.reader_source_id()),
                     InterestMask::new(0x1),
                 )),
             ),
             SelectDir::Write => (
                 tx.writable_level(),
-                Some((
+                Some(SelectPark::Reactor(
                     WaitSourceId::new(tx.writer_source_id()),
                     InterestMask::new(0x2),
                 )),
             ),
         };
+    }
+
+    // Real network sockets are not pipe/socketpair/TTY backed; route their
+    // readiness through the socket poll seam. Without this, sockets fall into
+    // the catch-all `_ => (true, None)` arm below and select/poll reports every
+    // socket as permanently ready with no wait source — so a blocking
+    // `select`/`poll` on a not-yet-readable socket returns immediately. Socket
+    // carriers live in the subsystems `wait_source` registry, so they must park
+    // via `wait_on_token` (SelectPark::Socket), not the substrate
+    // `await_wait_source` path. The re-home dropped this case entirely.
+    {
+        use tx_subsystems::net::PollMask;
+        let guard = tx_substrate::epoch::guard();
+        if let Some(result) = super::socket::socket_poll_mask_from_file(file, &guard) {
+            let mask = match result {
+                Ok(mask) => mask,
+                // Report ready with no wait source: select/poll returns and the
+                // subsequent read/write op surfaces the real errno.
+                Err(_) => return (true, None),
+            };
+            let (ready, want) = match dir {
+                SelectDir::Read => (
+                    mask.intersects(
+                        PollMask::IN | PollMask::ERR | PollMask::HUP | PollMask::RDHUP,
+                    ),
+                    PollMask::IN,
+                ),
+                SelectDir::Write => {
+                    (mask.intersects(PollMask::OUT | PollMask::ERR), PollMask::OUT)
+                }
+            };
+            if ready {
+                return (true, None);
+            }
+            let source = match super::socket::socket_poll_wait_token_from_file(file, want, &guard) {
+                Some(Ok(Some(token))) => Some(SelectPark::Socket(token)),
+                _ => None,
+            };
+            return (false, source);
+        }
     }
 
     match file.rnode().backing() {
@@ -210,7 +255,7 @@ fn select_fd_ready(
         } => match dir {
             SelectDir::Read => (
                 tty_readable_level(tty),
-                Some((
+                Some(SelectPark::Reactor(
                     WaitSourceId::new(tty.wait_source_id()),
                     InterestMask::new(0x1),
                 )),
@@ -218,6 +263,28 @@ fn select_fd_ready(
             SelectDir::Write => (true, None),
         },
         _ => (true, None),
+    }
+}
+
+/// Park the current task on the wait source chosen by `select_fd_ready`,
+/// routing to the correct registry. Returns when the source fires (or
+/// immediately, for an unresolvable socket token, after a yield to avoid a
+/// busy-loop). The caller re-polls all fds after this returns.
+async fn await_select_park(ctx: &SyscallCtx<'_>, park: SelectPark) {
+    match park {
+        SelectPark::Reactor(source, interests) => {
+            super::await_wait_source(ctx, source, interests).await;
+        }
+        SelectPark::Socket(token) => {
+            match tx_subsystems::wait_source::wait_on_token(token) {
+                Some(future) => {
+                    let _ = future.await;
+                }
+                // Token not registered (should not happen for a live socket):
+                // yield rather than spin so other tasks make progress.
+                None => tx_reactor::yield_now().await,
+            }
+        }
     }
 }
 
@@ -637,6 +704,9 @@ pub(super) async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     let _ = timeout_ptr;
 
     let ready = loop {
+        // Pump any pending loopback packets so socket readiness reflects the
+        // latest delivered data before we sample each fd.
+        super::socket::drive_loopback_pending();
         let mut ready: i64 = 0;
         let mut park_source = None;
         for i in 0..nfds {
@@ -685,10 +755,10 @@ pub(super) async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         if !wait_allowed {
             break 0;
         }
-        let Some((source, interests)) = park_source else {
+        let Some(park) = park_source else {
             break 0;
         };
-        super::await_wait_source(ctx, source, interests).await;
+        await_select_park(ctx, park).await;
     };
 
     SyscallResult::Return(ready)
@@ -760,6 +830,9 @@ pub(super) async fn sys_pselect6<'a, P: tx_hal::TimeIf + tx_hal::ConsoleIf>(
         }
     }
     loop {
+        // Pump any pending loopback packets so socket readiness reflects the
+        // latest delivered data before we sample each fd.
+        super::socket::drive_loopback_pending();
         let mut out_read = readfds.clone();
         let mut out_write = writefds.clone();
         let mut out_except = exceptfds.clone();
@@ -821,7 +894,7 @@ pub(super) async fn sys_pselect6<'a, P: tx_hal::TimeIf + tx_hal::ConsoleIf>(
             return SyscallResult::Return(ready);
         }
 
-        let Some((source, interests)) = park_source else {
+        let Some(park) = park_source else {
             if let Some(ns) = timeout_ns {
                 if ns != 0 {
                     sleep_for_select_timeout::<P>(ctx, ns).await;
@@ -829,7 +902,7 @@ pub(super) async fn sys_pselect6<'a, P: tx_hal::TimeIf + tx_hal::ConsoleIf>(
             }
             return SyscallResult::Return(0);
         };
-        super::await_wait_source(ctx, source, interests).await;
+        await_select_park(ctx, park).await;
     }
 }
 

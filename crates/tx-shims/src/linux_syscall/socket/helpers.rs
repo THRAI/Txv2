@@ -362,7 +362,7 @@ pub(super) async fn finish_sendto_progress(
     yield_after_sendto_if_needed(socket).await;
 }
 
-pub(super) fn drive_loopback_pending() {
+pub(crate) fn drive_loopback_pending() {
     let guard = tx_substrate::epoch::guard();
     let _ = tx_subsystems::net::execution::step_process_loopback_pending_zero(
         tx_subsystems::net::protocol::loopback_iface(),
