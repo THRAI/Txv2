@@ -1,3 +1,19 @@
+- 2026-06-06 **Net re-home: restored dropped boot/env surface (NOT a "verification path"
+  difference — corrected).** The runtest-vs-slim-sdcard "difference" was a misdiagnosis: both
+  run the same kernel/binaries; the failures are a **stack of boot/env surface PR#50 dropped**,
+  fixed layer by layer (each fix reveals the next): **(1) kernel .config (`5a02d5e7`)** —
+  restored `KERNEL_CONFIG_TEXT`, `/proc/config` procfs backing, `/boot/config-6.1.0-txkernel`
+  seeding → `Cannot parse kernel .config` gone. **(2) `/proc/sys/kernel/{tainted,pid_max}`
+  (`4e5e664b`)** — restored the dropped `/proc/sys` nested dir (wired like `/proc/sysvipc`) →
+  `tst_taint` `/proc/sys/kernel/tainted ENOENT` gone. **Result (runtest path):** setsockopt10
+  now PASSES; setsockopt05/07/08/09 advanced past config+tainted to their next gap,
+  `unshare(CLONE_NEWNET) ENOSYS` (a **syscall**-level drop, out of the procfs-surface scope).
+  Non-regressive: recv01 5/5, b1 40/40. **Still-dropped procfs surface (pre-rebase tree had it):**
+  `/proc/sys/{net/ipv4,net/ipv6/conf/*,fs,user}` — only the slow/deferred dimension-B net.*
+  command suites need these. **Still-dropped syscall surface:** `unshare(CLONE_NEWNET)` (and
+  likely more) blocks the netns-based dimension-A tests. Layer map in
+  `msp/net-rehome-verification-tracker.md`.
+
 - 2026-06-06 **Net re-home follow-up: process-exit socket port release + verification-path
   finding.** (1) **Port leak on exit fixed (`a05785aa`):** socket port reservations live in
   the socket table (endpoint-keyed `Cap<SocketIdentity>`), withdrawn only by `step_socket_close`,
