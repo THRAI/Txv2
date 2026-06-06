@@ -232,8 +232,9 @@ be truncated (see the doc's `send01+s` truncation warning) — if a batch looks 
 ### Upstream `net.*` suites (the THIRD dimension — easy to miss; ledger: `docs/LTP/runtests/ltp-runtest-network-progress.md`)
 
 These are the native LTP `net.*` runtests (NOT syscalls, NOT the local SCTP witnesses). Run via
-`ltp-runtest:<suite>:<case>`. **Confirmed baseline total across everything = 415/423**
-(= syscall 229 + the suites below). ⚠️ These are **runtime-heavy** (witness logs are 180–900 s,
+`ltp-runtest:<suite>:<case>`. **`415/423` = syscall (229/236) + these net.\* suites (186/187)
+ONLY — it does NOT include the local SCTP witnesses**, which are a separate third dimension with
+their own scoring (ledger `ltp-runtest-net-sctp-progress.md`). ⚠️ These are **runtime-heavy** (witness logs are 180–900 s,
 TCG time-dilated) and depend on **rootfs command shims** (`/tx-ltp/bin/{ss,tcpdump,traceroute,
 traceroute6,tracepath,tracepath6}`, dhcpd/dnsmasq/nft/iptables/tc wrappers), netns/veth, `/proc/net/*`
 projections, neigh/ARP+NDISC cache, and netfilter command state — all re-home-sensitive surface.
