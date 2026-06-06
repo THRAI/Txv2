@@ -229,6 +229,42 @@ be truncated (see the doc's `send01+s` truncation warning) — if a batch looks 
 `test_1_to_1_sockopt` 22/22, `test_1_to_1_socket_bind_listen` 14/14, `test_basic` 14/15.
 (Witness counts in the doc are ground truth; e.g. sockopt witness=22, not the static 23.)
 
+### Upstream `net.*` suites (the THIRD dimension — easy to miss; ledger: `docs/LTP/runtests/ltp-runtest-network-progress.md`)
+
+These are the native LTP `net.*` runtests (NOT syscalls, NOT the local SCTP witnesses). Run via
+`ltp-runtest:<suite>:<case>`. **Confirmed baseline total across everything = 415/423**
+(= syscall 229 + the suites below). ⚠️ These are **runtime-heavy** (witness logs are 180–900 s,
+TCG time-dilated) and depend on **rootfs command shims** (`/tx-ltp/bin/{ss,tcpdump,traceroute,
+traceroute6,tracepath,tracepath6}`, dhcpd/dnsmasq/nft/iptables/tc wrappers), netns/veth, `/proc/net/*`
+projections, neigh/ARP+NDISC cache, and netfilter command state — all re-home-sensitive surface.
+
+- **`net.ipv6_lib`  76/77** (6 entries): `in6_01`(5) `in6_02`(3) `getaddrinfo_01`(22)
+  `asapi_01`(16/17 partial — only `getprotobyname("hopopt")` missing) `asapi_02`(12) `asapi_03`(18).
+  Most stable group.
+- **`net.tcp_cmds`  61/61** (16 entries): `netstat`(5) `iproute`(6) `ping01`(10) `ping02`(10)
+  `arping01`(1) `ipneigh01_arp`(1) `ipneigh01_ip`(1) `sendfile`(4) `tc01`(2) `tracepath01`(1)
+  `traceroute01`(6) `tcpdump`(1) `iptables`(6) `nft`(5) `dhcpd`(1) `dnsmasq`(1).
+- **`net.ipv6`  46/46** (11 entries): `ping601`(10) `ping602`(10) `traceroute601`(6) `sendfile601`(4)
+  `ip6tables`(6) `nft6`(5) `ipneigh6_ip`(1) `tracepath601`(1) `tcpdump601`(1) `dhcpd6`(1) `dnsmasq6`(1).
+- **`net.features`  1/62**: only `fanout01`(1) (AF_PACKET PACKET_FANOUT CVE race; needs ~540 s wall
+  under TCG). The other 61 are virt-link (`NS_TIMES` loops) / netload perf → TCG walls, never passed.
+- **`net.multicast`  2/4**: `mc_cmds`(1) `mc_opts`(1) pass; `mc_member`/`mc_commo` not-run (need
+  `netstat -gn`/`/proc/net/igmp`, long sleeps, rhost).
+- **IPv6 TCP ("tcp_ipv6") coverage** is spread, not one test: `connect02` (IPv6 dual-stack TCP,
+  focused `target/oscomp/ltp-net-ipv6-connect02.txt`; loops 1000× → needs a long outer timeout),
+  `bind04` (IPv4/IPv6 TCP+SCTP loopback), RawTcp `[::1]` smoltcp segments, plus `net.ipv6`
+  `sendfile601`/`traceroute601 -T`. Enabling local SCTP is what first exposed the `[::1]` TCP path.
+- **not-run / out of scope (never in baseline — don't chase):** upstream `net.sctp` (41, distinct
+  from local SCTP witnesses), `net.nfs`/`net.rpc_tests`/`net.tirpc_tests` (205), `net_stress.*` (588),
+  `can` (3).
+
+**Verification priority for these:** lower than the syscall+SCTP core (they're slow and shim-heavy),
+but they ARE "previously-passing net tests" per the goal. The re-home most likely touched their
+support surface (procfs `/proc/net/*`, neigh/NDISC, netfilter command state, AF_PACKET, raw ICMP).
+Spot-check the cheap/stable ones first (`net.ipv6_lib` in6_01/in6_02/asapi_02/asapi_03,
+`net.tcp_cmds` netstat/iproute/ping01) before the 300–900 s shim-dependent ones. Use the per-entry
+witness log names in the ledger to reproduce each.
+
 ## Baselines / witnesses
 
 - SCTP documented baseline: `docs/LTP/runtests/ltp-runtest-net-sctp-progress.md`.
