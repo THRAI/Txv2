@@ -1,3 +1,17 @@
+- 2026-06-07 **Dimension C (net.sctp) sweep complete — all 31 entries match baseline, no
+  regressions.** Verified each case in its own fresh boot (back-to-back in one boot still
+  EADDRINUSEs — the deep lingering-loopback-peer issue, unfixed). **24 PASS entries** all match
+  baseline TPASS counts: test_1_to_1_sockopt 22, tcp_style/tcp_style_v6 22/22, basic/basic_v6
+  15/15, socket_bind_listen 14, getname/getname_v6 13/13, 1_to_1_addrs 10, 1_to_1_send 8,
+  1_to_1_recvfrom 7, 1_to_1_shutdown 6, 1_to_1_nonblock 5, 1_to_1_events 4, 1_to_1_sendto 4,
+  1_to_1_rtoinfo 3, 1_to_1_initmsg_connect 2, inaddr_any/inaddr_any_v6 2/2, recvmsg 2,
+  1_to_1_threads 1, plus the earlier assoc_shutdown/1_to_1_connect(10)/1_to_1_accept_close(10).
+  **7 PARTIAL entries** all match their baseline partial scores (no regression): test_sockopt 33,
+  test_connect 4, test_peeloff 3, test_sctp_sendrecvmsg 6, test_timetolive 3, test_fragments 2,
+  test_1_to_1_recvmsg 3 (musl). Caveat: the back-to-back EADDRINUSE means a single-boot net.sctp
+  *batch* still won't reproduce these; individually all are green. Remaining: dimension B (net.*,
+  36 entries, slow).
+
 - 2026-06-07 **Dimension A (socket syscall) sweep complete.** Cleared the last 7 unrun cases:
   sendto01/sendto03/getpeername01 PASS; **sendto02 PASS after fixing sendto to validate the user
   buffer before the SCTP implicit association (`<this commit>`: EFAULT before ECONNREFUSED)**;
