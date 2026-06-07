@@ -558,6 +558,7 @@ for arg in \"$@\"; do\n\
         -*s*) cat /proc/net/snmp 2>/dev/null || true; exit 0 ;;\n\
         -*i*) cat /proc/net/dev 2>/dev/null || true; exit 0 ;;\n\
         -*g*) [ -r /proc/net/igmp ] && cat /proc/net/igmp; [ -r /proc/net/igmp6 ] && cat /proc/net/igmp6; exit 0 ;;\n\
+        -*r*) echo \"Kernel IP routing table\"; [ -r /proc/net/route ] && cat /proc/net/route; exit 0 ;;\n\
     esac\n\
 done\n\
 exec \"$bb\" netstat \"$@\"\n";
