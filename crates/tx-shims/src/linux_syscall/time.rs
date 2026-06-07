@@ -651,3 +651,51 @@ pub(super) fn itimer_real_deadline_ns(pid: u32) -> Option<u64> {
 pub(super) fn consume_itimer_real_delivered_interrupt(_pid: u32) -> bool {
     false
 }
+
+/// Fire `pid`'s ITIMER_REAL at expiry: re-arm the deadline and deliver SIGALRM
+/// to the process when it has a handler installed.
+///
+/// The socket recv wait calls this the moment the deadline is reached. Two
+/// effects matter:
+///
+///  1. **Re-arm.** A periodic timer (`it_interval > 0`) advances to `now +
+///     interval` (not `deadline + interval`, which under slow TCG could stay in
+///     the past and make a blocked recv spin returning EINTR); a one-shot timer
+///     is disarmed. Without this the passed deadline made every recv wake
+///     immediately — the busy loop seen on `ping01`.
+///  2. **SIGALRM.** Delivered only when a handler is installed (see
+///     [`tx_subsystems::signal::deliver_signal_if_handler`]). busybox `ping`
+///     sends each subsequent probe from its SIGALRM handler, so without delivery
+///     it only ever sent one packet; handler-less alarm users keep EINTR-only
+///     semantics and are not terminated.
+pub(super) fn fire_itimer_real<P: TimeIf>(pid: u32) {
+    let Some(process) = tx_subsystems::process::execution::process_by_pid(
+        tx_subsystems::process::structure::Pid(pid),
+    ) else {
+        return;
+    };
+    let Some(sigalrm) = tx_subsystems::signal::Signum::new(SIGALRM_SIGNUM) else {
+        return;
+    };
+    // No handler → preserve the existing EINTR-only contract: do not deliver and
+    // do not re-arm (the caller still returns EINTR for this expiry).
+    if !tx_subsystems::signal::deliver_signal_if_handler(&process, sigalrm) {
+        return;
+    }
+    let now_ns = P::read_ns();
+    let key = (pid, ITIMER_REAL);
+    let interval_ns = with_interval_timers(|timers| timers.get(&key).map(|timer| timer.interval_ns));
+    match interval_ns {
+        Some(interval) if interval > 0 => with_interval_timers(|timers| {
+            if let Some(timer) = timers.get_mut(&key) {
+                timer.deadline_ns = now_ns.saturating_add(interval);
+            }
+        }),
+        Some(_) => with_interval_timers(|timers| {
+            timers.remove(&key);
+        }),
+        None => {}
+    }
+}
+
+const SIGALRM_SIGNUM: u8 = 14;

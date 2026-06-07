@@ -1666,6 +1666,7 @@ pub(super) async fn wait_on_socket_or_itimer<P: TimeIf>(
         return SocketWaitWake::SocketReady;
     };
     if <P as TimeIf>::read_ns() >= deadline_ns {
+        super::time::fire_itimer_real::<P>(pid);
         return SocketWaitWake::ItimerExpired;
     }
     let Some(mut timer_future) = tx_subsystems::timer_sleep::sleep_until_ns(deadline_ns) else {
@@ -1673,7 +1674,7 @@ pub(super) async fn wait_on_socket_or_itimer<P: TimeIf>(
         return SocketWaitWake::SocketReady;
     };
 
-    core::future::poll_fn(|cx| {
+    let wake = core::future::poll_fn(|cx| {
         if core::future::Future::poll(core::pin::Pin::new(&mut socket_future), cx).is_ready() {
             return core::task::Poll::Ready(SocketWaitWake::SocketReady);
         }
@@ -1682,7 +1683,11 @@ pub(super) async fn wait_on_socket_or_itimer<P: TimeIf>(
         }
         core::task::Poll::Pending
     })
-    .await
+    .await;
+    if wake == SocketWaitWake::ItimerExpired {
+        super::time::fire_itimer_real::<P>(pid);
+    }
+    wake
 }
 
 pub(super) fn recv_special_flags_errno(flags: SendRecvFlags) -> Option<i32> {

@@ -1,3 +1,24 @@
+- 2026-06-08 **Dimension B: PING FAMILY PASSES — root cause was ITIMER_REAL/SIGALRM delivery, NOT
+  ICMP reply delivery.** `ping01` **10 TPASS / 0 TFAIL** and `ping02` **10 TPASS / 0 TFAIL** (verified
+  under QEMU, clean build). A 20-counter probe through the whole ICMP echo→reply→recvfrom chain proved
+  reply delivery was already CORRECT: `send_configured_icmpv4_echo` → `deliver_icmpv4_reply_to_table`
+  (iter=1, accept=1, **record=1** → `fire_recv`) and the raw-icmp recvfrom consumed it once
+  (`rqnz=1, rdone=1`). The real bug: busybox `ping` sends each subsequent probe from its **SIGALRM
+  handler**, armed via `setitimer(ITIMER_REAL, it_interval=0.2s)`. The existing design (time.rs
+  comment) made ITIMER_REAL expiry wake a blocked recv with EINTR but **intentionally never delivered
+  SIGALRM** *and never re-armed* the deadline — so ping sent exactly ONE packet (`br=1`) then spun
+  ~3775 recvfrom→EINTR calls (the passed deadline fired instantly every poll) and never advanced.
+  **Fix (3 files):** (1) `signal::deliver_signal_if_handler(process, sig)` — posts a signal *only when
+  a user handler is installed* (handler-less alarm users keep EINTR-only semantics so `recvfrom01`
+  isn't terminated by the default-SIGALRM Term action); (2) `time::fire_itimer_real::<P>(pid)` — on
+  ITIMER_REAL expiry, deliver SIGALRM (gated on handler) and re-arm (periodic → `now+interval` to
+  avoid a past-deadline spin; one-shot → disarm); (3) `wait_on_socket_or_itimer` calls
+  `fire_itimer_real` at both expiry points. With this, ping's handler runs on return-to-userspace,
+  sends packets 2/3, and `br` climbs (13,14,15…). All temporary probe instrumentation removed; diff is
+  3 files / +77 lines. Host itimer test (`dispatch_recvmsg_..._due_itimer`, one-shot/no-handler) is
+  unaffected (no-op → EINTR preserved). **Next:** verify ping601/602 (IPv6 — likely TCONF, IPv6
+  disabled on lhost) and quantify the rest of the 29 command-layer tests.
+
 - 2026-06-08 **Dimension B: `kill(-pgid)` implemented (`3e6af3d3`); ping reply→recvfrom is the sole
   remaining ICMP blocker.** The 520s ping01 run confirmed two things: (1) the timeout watchdog now
   fires correctly (`Test timed out, sending SIGTERM!` at 300s — procfs fix working), but (2) its

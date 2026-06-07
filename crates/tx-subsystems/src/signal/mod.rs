@@ -979,6 +979,28 @@ pub fn deliver_posix_signal(target: SignalTarget, sig: Signum) -> KillOutcome {
     }
 }
 
+/// Deliver `sig` to `process` only when it has a user handler installed.
+///
+/// Returns `true` if a handler was present (signal posted; the AST runs it on
+/// return to userspace), `false` otherwise (no-op). The ITIMER_REAL expiry path
+/// uses this so an alarm-bounded blocking recv on a process *without* a SIGALRM
+/// handler keeps its EINTR-only behaviour — delivering the default action would
+/// terminate the process and regress e.g. LTP `recvfrom01` — while a process
+/// that registered a handler (e.g. busybox `ping`'s interval-driven sender)
+/// actually gets it run.
+pub fn deliver_signal_if_handler(process: &Cap<ProcessIdentity>, sig: Signum) -> bool {
+    let disposition = match process.upgrade_operational() {
+        Ok(payload) => payload.sig_actions().get(sig),
+        Err(_) => return false,
+    };
+    if matches!(disposition, SigDisposition::Handler(_)) {
+        step_kill_process(process, sig, None);
+        true
+    } else {
+        false
+    }
+}
+
 /// Target for `deliver_posix_signal`.
 ///
 /// Per `SIGNAL_v1` §12, a signal can be addressed to a process
