@@ -1356,10 +1356,8 @@ if [ \"$1\" = \"neigh\" ]; then\n\
             if [ -n \"$addr\" ] && [ -n \"$dev\" ]; then\n\
                 tx_ltp_trace_phase \"neigh-del tx-ctl-begin\"\n\
                 tx_neigh_ctl_ok=\n\
-                if exec 3<> /proc/net/tx_neigh_ctl 2>/dev/null; then\n\
-                    printf '%s %s\\n' \"$addr\" \"$dev\" >&3 2>/dev/null || true\n\
+                if [ -w /proc/net/tx_neigh_ctl ] && ( printf '%s %s\\n' \"$addr\" \"$dev\" > /proc/net/tx_neigh_ctl ) 2>/dev/null; then\n\
                     tx_neigh_ctl_ok=1\n\
-                    exec 3>&-\n\
                 fi\n\
                 if [ -n \"$tx_neigh_ctl_ok\" ]; then\n\
                     tx_ltp_trace_phase \"neigh-del tx-ctl-end\"\n\
