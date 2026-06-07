@@ -5,7 +5,8 @@ use crate::procfs::{
     pid_from_setgroups_id, pid_from_stat_id, pid_from_status_id, pid_from_uid_map_id,
     KERNEL_CONFIG_TEXT,
     PROCFS_CONFIG_ID, PROCFS_CPUINFO_ID, PROCFS_MEMINFO_ID, PROCFS_MOUNTS_ID,
-    PROCFS_SYS_KERNEL_PID_MAX_ID, PROCFS_SYS_KERNEL_TAINTED_ID, PROCFS_SYSVIPC_MSG_ID,
+    PROCFS_NET_IF_INET6_ID, PROCFS_SYS_KERNEL_PID_MAX_ID, PROCFS_SYS_KERNEL_TAINTED_ID,
+    PROCFS_SYS_NET_IPV6_ACCEPT_DAD_ID, PROCFS_SYS_NET_IPV6_DISABLE_IPV6_ID, PROCFS_SYSVIPC_MSG_ID,
     PROCFS_SYSVIPC_SEM_ID, PROCFS_SYSVIPC_SHM_ID, PROCFS_UPTIME_ID,
 };
 use alloc::format;
@@ -46,11 +47,51 @@ pub fn render(fs_object_id: FsObjectId) -> String {
         PROCFS_CONFIG_ID => render_config(),
         PROCFS_SYS_KERNEL_TAINTED_ID => String::from("0\n"),
         PROCFS_SYS_KERNEL_PID_MAX_ID => String::from("4194304\n"),
+        PROCFS_NET_IF_INET6_ID => render_if_inet6(),
+        // IPv6 is enabled; every conf entry reads back 0 (not disabled).
+        PROCFS_SYS_NET_IPV6_DISABLE_IPV6_ID | PROCFS_SYS_NET_IPV6_ACCEPT_DAD_ID => {
+            String::from("0\n")
+        }
         PROCFS_SYSVIPC_MSG_ID => render_sysvipc_msg(),
         PROCFS_SYSVIPC_SEM_ID => render_sysvipc_sem(),
         PROCFS_SYSVIPC_SHM_ID => render_sysvipc_shm(),
         _ => String::new(),
     }
+}
+
+/// `/proc/net/if_inet6` — one line per configured IPv6 address in the root net
+/// namespace, in the kernel's format:
+/// `<32-hex addr> <ifindex hex> <prefixlen hex> <scope hex> <flags hex> <dev>`.
+/// LTP `tst_net_detect_ipv6` only requires the file to exist, but `ip -6 addr`
+/// and the v6 suites read it, so we render real data from the link snapshot.
+fn render_if_inet6() -> String {
+    use core::fmt::Write as _;
+    let netns = tx_subsystems::net::namespace::initial_net_namespace_payload();
+    let mut out = String::new();
+    for link in netns.link_snapshot() {
+        let Some(addr) = link.ipv6_addr else {
+            continue;
+        };
+        let octets = addr.octets();
+        let prefix = link.ipv6_prefix_len.unwrap_or(64);
+        let scope: u8 = if link.is_loopback {
+            0x10 // host
+        } else if octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80 {
+            0x20 // link-local
+        } else {
+            0x00 // global
+        };
+        for b in octets {
+            let _ = write!(out, "{b:02x}");
+        }
+        // ifindex prefixlen scope flags(IFA_F_PERMANENT=0x80) devname
+        let _ = write!(
+            out,
+            " {:02x} {:02x} {:02x} {:02x} {:>8}\n",
+            link.ifindex, prefix, scope, 0x80u8, link.name
+        );
+    }
+    out
 }
 
 fn render_stat(pid: Pid) -> String {

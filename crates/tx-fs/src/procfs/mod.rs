@@ -69,6 +69,23 @@ pub const PROCFS_SYS_ID: FsObjectId = FsObjectId::new(0x7072_6F0B);
 pub const PROCFS_SYS_KERNEL_ID: FsObjectId = FsObjectId::new(0x7072_6F0C);
 pub const PROCFS_SYS_KERNEL_TAINTED_ID: FsObjectId = FsObjectId::new(0x7072_6F0D);
 pub const PROCFS_SYS_KERNEL_PID_MAX_ID: FsObjectId = FsObjectId::new(0x7072_6F0E);
+
+// `/proc/net/` + `/proc/sys/net/ipv6/` subtree (re-homed; the PR#50 net re-home
+// dropped all of `/proc/sys/net` and `/proc/net/if_inet6`). LTP's
+// `tst_net_detect_ipv6` requires `[ -f /proc/net/if_inet6 ]` AND
+// `cat /proc/sys/net/ipv6/conf/all/disable_ipv6` == 0 (plus the per-iface
+// `disable_ipv6` and a writable `accept_dad` that `sysctl -qw` touches in
+// setup); without them every net.ipv6 case is skipped TCONF "IPv6 disabled".
+// The `conf/<iface>` directory is served generically (one shared entry-dir id)
+// since every iface advertises the same disable_ipv6=0 / accept_dad scalars.
+pub const PROCFS_NET_ID: FsObjectId = FsObjectId::new(0x7072_6F0F);
+pub const PROCFS_NET_IF_INET6_ID: FsObjectId = FsObjectId::new(0x7072_6F10);
+pub const PROCFS_SYS_NET_ID: FsObjectId = FsObjectId::new(0x7072_6F11);
+pub const PROCFS_SYS_NET_IPV6_ID: FsObjectId = FsObjectId::new(0x7072_6F12);
+pub const PROCFS_SYS_NET_IPV6_CONF_ID: FsObjectId = FsObjectId::new(0x7072_6F13);
+pub const PROCFS_SYS_NET_IPV6_CONF_ENTRY_ID: FsObjectId = FsObjectId::new(0x7072_6F14);
+pub const PROCFS_SYS_NET_IPV6_DISABLE_IPV6_ID: FsObjectId = FsObjectId::new(0x7072_6F15);
+pub const PROCFS_SYS_NET_IPV6_ACCEPT_DAD_ID: FsObjectId = FsObjectId::new(0x7072_6F16);
 const PROCFS_PID_BASE: u64 = 0x7072_0000;
 // `/proc/<pid>` directory ids occupy [PROCFS_PID_BASE, PROCFS_PID_BASE + PROCFS_PID_DIR_LIMIT).
 const PROCFS_PID_DIR_LIMIT: u64 = 0x10000;
@@ -446,6 +463,9 @@ impl FsOps for Procfs {
             if name == b"sys" {
                 return StepOutcome::done(PROCFS_SYS_ID);
             }
+            if name == b"net" {
+                return StepOutcome::done(PROCFS_NET_ID);
+            }
             if let Ok(n) = core::str::from_utf8(name).unwrap_or("").parse::<u32>() {
                 if n > 0 && process::process_by_pid(Pid(n)).is_some() {
                     return StepOutcome::done(pid_dir_id(Pid(n)));
@@ -468,6 +488,44 @@ impl FsOps for Procfs {
         if parent == PROCFS_SYS_ID {
             if name == b"kernel" {
                 return StepOutcome::done(PROCFS_SYS_KERNEL_ID);
+            }
+            if name == b"net" {
+                return StepOutcome::done(PROCFS_SYS_NET_ID);
+            }
+            return StepOutcome::err(Errno::ENOENT.into());
+        }
+        if parent == PROCFS_NET_ID {
+            if name == b"if_inet6" {
+                return StepOutcome::done(PROCFS_NET_IF_INET6_ID);
+            }
+            return StepOutcome::err(Errno::ENOENT.into());
+        }
+        if parent == PROCFS_SYS_NET_ID {
+            if name == b"ipv6" {
+                return StepOutcome::done(PROCFS_SYS_NET_IPV6_ID);
+            }
+            return StepOutcome::err(Errno::ENOENT.into());
+        }
+        if parent == PROCFS_SYS_NET_IPV6_ID {
+            if name == b"conf" {
+                return StepOutcome::done(PROCFS_SYS_NET_IPV6_CONF_ID);
+            }
+            return StepOutcome::err(Errno::ENOENT.into());
+        }
+        if parent == PROCFS_SYS_NET_IPV6_CONF_ID {
+            // `all`, `default`, or any per-interface name (`lo`, `eth0`, veth…).
+            // Every entry advertises the same scalars, so they share one dir id.
+            if !name.is_empty() {
+                return StepOutcome::done(PROCFS_SYS_NET_IPV6_CONF_ENTRY_ID);
+            }
+            return StepOutcome::err(Errno::ENOENT.into());
+        }
+        if parent == PROCFS_SYS_NET_IPV6_CONF_ENTRY_ID {
+            if name == b"disable_ipv6" {
+                return StepOutcome::done(PROCFS_SYS_NET_IPV6_DISABLE_IPV6_ID);
+            }
+            if name == b"accept_dad" {
+                return StepOutcome::done(PROCFS_SYS_NET_IPV6_ACCEPT_DAD_ID);
             }
             return StepOutcome::err(Errno::ENOENT.into());
         }
@@ -573,6 +631,22 @@ impl FsOps for Procfs {
             }
             PROCFS_SYS_KERNEL_TAINTED_ID | PROCFS_SYS_KERNEL_PID_MAX_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
+            }
+            PROCFS_NET_ID
+            | PROCFS_SYS_NET_ID
+            | PROCFS_SYS_NET_IPV6_ID
+            | PROCFS_SYS_NET_IPV6_CONF_ID
+            | PROCFS_SYS_NET_IPV6_CONF_ENTRY_ID => {
+                StepOutcome::done(InodeMeta::new(InodeKind::Directory, PROCFS_DIR_MODE))
+            }
+            PROCFS_NET_IF_INET6_ID => {
+                StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
+            }
+            // disable_ipv6 / accept_dad are writable: LTP setup does
+            // `sysctl -qw net.ipv6.conf.<iface>.accept_dad=0` (and may clear
+            // disable_ipv6), which `open(O_WRONLY)`s the file.
+            PROCFS_SYS_NET_IPV6_DISABLE_IPV6_ID | PROCFS_SYS_NET_IPV6_ACCEPT_DAD_ID => {
+                StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_RW_FILE_MODE))
             }
             id if pid_from_dir(id).is_some() => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Directory, PROCFS_DIR_MODE))
@@ -731,8 +805,10 @@ impl FsOps for Procfs {
                 if state_byte < 2 {
                     return finish_dots(state_byte, idx, id);
                 }
-                let files: &[(&[u8], FsObjectId, InodeKind)] =
-                    &[(b"kernel", PROCFS_SYS_KERNEL_ID, InodeKind::Directory)];
+                let files: &[(&[u8], FsObjectId, InodeKind)] = &[
+                    (b"kernel", PROCFS_SYS_KERNEL_ID, InodeKind::Directory),
+                    (b"net", PROCFS_SYS_NET_ID, InodeKind::Directory),
+                ];
                 let fi = idx.saturating_sub(2);
                 if fi < files.len() {
                     let (name, oid, kind) = files[fi];
@@ -761,6 +837,105 @@ impl FsOps for Procfs {
                 }
                 return StepOutcome::done(None);
             }
+            if id == PROCFS_NET_ID {
+                if state_byte < 2 {
+                    return finish_dots(state_byte, idx, id);
+                }
+                let files: &[(&[u8], FsObjectId, InodeKind)] =
+                    &[(b"if_inet6", PROCFS_NET_IF_INET6_ID, InodeKind::Regular)];
+                let fi = idx.saturating_sub(2);
+                if fi < files.len() {
+                    let (name, oid, kind) = files[fi];
+                    return StepOutcome::done(Some((
+                        dir_entry(oid, kind, name),
+                        DirCursor([2, (fi + 1) as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                    )));
+                }
+                return StepOutcome::done(None);
+            }
+            if id == PROCFS_SYS_NET_ID {
+                if state_byte < 2 {
+                    return finish_dots(state_byte, idx, id);
+                }
+                let files: &[(&[u8], FsObjectId, InodeKind)] =
+                    &[(b"ipv6", PROCFS_SYS_NET_IPV6_ID, InodeKind::Directory)];
+                let fi = idx.saturating_sub(2);
+                if fi < files.len() {
+                    let (name, oid, kind) = files[fi];
+                    return StepOutcome::done(Some((
+                        dir_entry(oid, kind, name),
+                        DirCursor([2, (fi + 1) as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                    )));
+                }
+                return StepOutcome::done(None);
+            }
+            if id == PROCFS_SYS_NET_IPV6_ID {
+                if state_byte < 2 {
+                    return finish_dots(state_byte, idx, id);
+                }
+                let files: &[(&[u8], FsObjectId, InodeKind)] =
+                    &[(b"conf", PROCFS_SYS_NET_IPV6_CONF_ID, InodeKind::Directory)];
+                let fi = idx.saturating_sub(2);
+                if fi < files.len() {
+                    let (name, oid, kind) = files[fi];
+                    return StepOutcome::done(Some((
+                        dir_entry(oid, kind, name),
+                        DirCursor([2, (fi + 1) as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                    )));
+                }
+                return StepOutcome::done(None);
+            }
+            if id == PROCFS_SYS_NET_IPV6_CONF_ID {
+                if state_byte < 2 {
+                    return finish_dots(state_byte, idx, id);
+                }
+                // `all`, `default`, then one entry per interface in the root
+                // netns. All share the generic entry-dir id.
+                let mut names: Vec<&[u8]> = alloc::vec![b"all".as_slice(), b"default".as_slice()];
+                for link in
+                    tx_subsystems::net::namespace::initial_net_namespace_payload().link_snapshot()
+                {
+                    names.push(link.name.as_bytes());
+                }
+                let fi = idx.saturating_sub(2);
+                if fi < names.len() {
+                    return StepOutcome::done(Some((
+                        dir_entry(
+                            PROCFS_SYS_NET_IPV6_CONF_ENTRY_ID,
+                            InodeKind::Directory,
+                            names[fi],
+                        ),
+                        DirCursor([2, (fi + 1) as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                    )));
+                }
+                return StepOutcome::done(None);
+            }
+            if id == PROCFS_SYS_NET_IPV6_CONF_ENTRY_ID {
+                if state_byte < 2 {
+                    return finish_dots(state_byte, idx, id);
+                }
+                let files: &[(&[u8], FsObjectId, InodeKind)] = &[
+                    (
+                        b"disable_ipv6",
+                        PROCFS_SYS_NET_IPV6_DISABLE_IPV6_ID,
+                        InodeKind::Regular,
+                    ),
+                    (
+                        b"accept_dad",
+                        PROCFS_SYS_NET_IPV6_ACCEPT_DAD_ID,
+                        InodeKind::Regular,
+                    ),
+                ];
+                let fi = idx.saturating_sub(2);
+                if fi < files.len() {
+                    let (name, oid, kind) = files[fi];
+                    return StepOutcome::done(Some((
+                        dir_entry(oid, kind, name),
+                        DirCursor([2, (fi + 1) as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                    )));
+                }
+                return StepOutcome::done(None);
+            }
             return finish_dots(state_byte, idx, id);
         }
 
@@ -777,6 +952,7 @@ impl FsOps for Procfs {
             (b"config", PROCFS_CONFIG_ID, InodeKind::Regular),
             (b"sysvipc", PROCFS_SYSVIPC_ID, InodeKind::Directory),
             (b"sys", PROCFS_SYS_ID, InodeKind::Directory),
+            (b"net", PROCFS_NET_ID, InodeKind::Directory),
         ];
         let si = idx.saturating_sub(2);
         if state_byte == 2 && si < statics.len() {
@@ -1032,6 +1208,14 @@ impl FsOps for Procfs {
     ) -> StepOutcome<u64, NoProgress> {
         if let Some(outcome) = write_userns_projection(fs_object_id, offset, bytes) {
             return outcome;
+        }
+        // `sysctl -w net.ipv6.conf.<iface>.{accept_dad,disable_ipv6}=…` from LTP
+        // tst_net setup. We have no per-iface IPv6 toggle state; accept the write
+        // (report all bytes consumed) so setup proceeds. disable_ipv6 stays 0.
+        if fs_object_id == PROCFS_SYS_NET_IPV6_ACCEPT_DAD_ID
+            || fs_object_id == PROCFS_SYS_NET_IPV6_DISABLE_IPV6_ID
+        {
+            return StepOutcome::done(bytes.len() as u64);
         }
         StepOutcome::err(Errno::ENOSYS.into())
     }
