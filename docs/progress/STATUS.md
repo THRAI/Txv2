@@ -1,3 +1,29 @@
+- 2026-06-08 **Dimension B: IPv6 STACK RESTORED — net.ipv6 was uniformly TCONF because the PR#50 net
+  re-home DROPPED the IPv6 procfs glue; ping601/ping602 now PASS (10/0 each).** The pre-rebase backup
+  (`feature-network-backup-before-main-rebase-20260605`) served `/proc/net/if_inet6` +
+  `/proc/sys/net/ipv6/conf/*/disable_ipv6` via procfs and intercepted IPv6 `ip`/`sysctl` at the
+  syscall level (the `tx_ltp_*` layer in `proc.rs`, ~1300 lines); the re-home moved command handling
+  to shell shims but never ported the IPv6 surface, so LTP `tst_net_detect_ipv6` (`[ -f
+  /proc/net/if_inet6 ]` + `cat .../conf/all/disable_ipv6 == 0`) failed → "IPv6 disabled" → every
+  net.ipv6 case skipped. Restored in the CURRENT architecture (Linux semantics, not a verbatim backup
+  copy):
+  - **`61e1cf02` procfs IPv6 detection glue** — `/proc/net/if_inet6` rendered from the root-netns link
+    snapshot in the kernel's `<32hex> <ifindex> <prefixlen> <scope> <flags> <dev>` format;
+    `/proc/sys/net/ipv6/conf/{all,default,<iface>}/disable_ipv6` → 0 and `accept_dad` (writable).
+    conf/<iface> entries get DISTINCT hashed inode ids (sharing a dir inode aliases the dcache).
+  - **`94604bd2` sysctl accept_dad shim** — the real ping6 blocker: `tst_init_iface` runs
+    `sysctl -qw net.ipv6.conf.<iface>.accept_dad=0 || return $?` BEFORE `ip link set <iface> up`;
+    busybox sysctl writing that key returned non-zero, aborting iface setup early → eth0 left **down,
+    no addresses** → `ping6 sendto: Not supported` (the configured-echo gate needs the dst on an *up*
+    link). Made `/tx-ltp/bin/sysctl` a thin shim that no-ops `net.ipv6.conf.*` writes and forwards the
+    rest; now iface comes up and `ip addr add` (v4+v6, via rtnetlink RTM_NEWADDR which already handled
+    AF_INET6) takes effect. **Debug technique:** a temporary link-snapshot probe (net AtomicU32/String
+    statics dumped from `dispatch_inner`) showed `eth0 up=false v4=.0 v6=..00` before, `up=true v4=.2
+    v6=..02` after, and `handle_newaddr` na6=0→2 — pinpointing the down-iface chain. All probes
+    removed. **Verified:** ping601 10/0, ping602 10/0, ping01 (IPv4) still 10/0. Remaining net.ipv6
+    cases (sendfile601, tcpdump601, tracepath601, traceroute601, ip6tables, nft6, ipneigh6, dhcpd6,
+    dnsmasq6) now RUN (sweep in progress) instead of TCONF.
+
 - 2026-06-08 **Dimension B: `iproute` `ip neigh` subtest fixed (`5119da8a`) — iproute 4/2 ⇒ 5/1.**
   `ip neigh del` returned non-zero despite its explicit `exit 0`: the shim did
   `if exec 3<> /proc/net/tx_neigh_ctl 2>/dev/null`, but that control file is never served by the
