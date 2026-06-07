@@ -6,8 +6,7 @@ use crate::procfs::{
     KERNEL_CONFIG_TEXT,
     PROCFS_CONFIG_ID, PROCFS_CPUINFO_ID, PROCFS_MEMINFO_ID, PROCFS_MOUNTS_ID,
     PROCFS_NET_IF_INET6_ID, PROCFS_SYS_KERNEL_PID_MAX_ID, PROCFS_SYS_KERNEL_TAINTED_ID,
-    PROCFS_SYS_NET_IPV6_ACCEPT_DAD_ID, PROCFS_SYS_NET_IPV6_DISABLE_IPV6_ID, PROCFS_SYSVIPC_MSG_ID,
-    PROCFS_SYSVIPC_SEM_ID, PROCFS_SYSVIPC_SHM_ID, PROCFS_UPTIME_ID,
+    PROCFS_SYSVIPC_MSG_ID, PROCFS_SYSVIPC_SEM_ID, PROCFS_SYSVIPC_SHM_ID, PROCFS_UPTIME_ID,
 };
 use alloc::format;
 use alloc::string::String;
@@ -39,6 +38,11 @@ pub fn render(fs_object_id: FsObjectId) -> String {
     if let Some((pid, fd)) = pid_from_fdinfo_id(fs_object_id) {
         return render_fdinfo(pid, fd);
     }
+    // `/proc/sys/net/ipv6/conf/<iface>/{disable_ipv6,accept_dad}` — IPv6 enabled,
+    // DAD off; both read back 0.
+    if matches!(super::ipv6_conf_kind(fs_object_id), Some(1) | Some(2)) {
+        return String::from("0\n");
+    }
     match fs_object_id {
         PROCFS_MOUNTS_ID => render_mounts(),
         PROCFS_CPUINFO_ID => render_cpuinfo(),
@@ -48,10 +52,6 @@ pub fn render(fs_object_id: FsObjectId) -> String {
         PROCFS_SYS_KERNEL_TAINTED_ID => String::from("0\n"),
         PROCFS_SYS_KERNEL_PID_MAX_ID => String::from("4194304\n"),
         PROCFS_NET_IF_INET6_ID => render_if_inet6(),
-        // IPv6 is enabled; every conf entry reads back 0 (not disabled).
-        PROCFS_SYS_NET_IPV6_DISABLE_IPV6_ID | PROCFS_SYS_NET_IPV6_ACCEPT_DAD_ID => {
-            String::from("0\n")
-        }
         PROCFS_SYSVIPC_MSG_ID => render_sysvipc_msg(),
         PROCFS_SYSVIPC_SEM_ID => render_sysvipc_sem(),
         PROCFS_SYSVIPC_SHM_ID => render_sysvipc_shm(),

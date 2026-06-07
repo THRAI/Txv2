@@ -436,9 +436,26 @@ nobody:x:65534:65534:nobody:/nonexistent:/bin/sh\n";
             b"mount".as_slice(),
             b"readlink".as_slice(),
             b"seq".as_slice(),
-            b"sysctl".as_slice(),
         ] {
             let _ = symlink_into(fs_ops, tx_ltp_bin_id, name, b"/bin/busybox", &cred);
+        }
+        // `sysctl` is a thin shim: LTP tst_net setup does
+        // `sysctl -qw net.ipv6.conf.<iface>.accept_dad=0`, and busybox sysctl
+        // writing that key returns non-zero here (no per-iface DAD toggle file),
+        // which aborts `tst_init_iface` before `ip link set <iface> up` — leaving
+        // the interface down and unconfigured. No-op the IPv6 conf writes (DAD is
+        // already off / the addresses are permanent) and forward everything else.
+        let sysctl_script = b"#!/bin/sh\n\
+bb=/bin/busybox\n\
+[ -x \"$bb\" ] || bb=/musl/musl/busybox\n\
+case \"$*\" in\n\
+    *net.ipv6.conf.*) exit 0 ;;\n\
+esac\n\
+exec \"$bb\" sysctl \"$@\"\n";
+        if !create_file_with_data(&create_ctx, tx_ltp_bin_id, b"sysctl", 0o755, sysctl_script) {
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":network-db:err:create-sysctl\n");
+            return;
         }
         let netfilter_dmesg_script = br#"#!/bin/sh
 if [ -r /tmp/tx-dmesg ]; then
@@ -483,7 +500,12 @@ case \"$cmd\" in\n\
         \"/musl/musl/ltp/testcases/bin/$cmd\" \"$@\" ;;\n\
     ip)\n\
         /tx-ltp/bin/ip \"$@\" ;;\n\
-    arp|cat|cut|grep|id|ln|mkdir|mount|readlink|seq|sysctl)\n\
+    sysctl)\n\
+        case \"$*\" in\n\
+            *net.ipv6.conf.*) exit 0 ;;\n\
+        esac\n\
+        \"$bb\" sysctl \"$@\" ;;\n\
+    arp|cat|cut|grep|id|ln|mkdir|mount|readlink|seq)\n\
         \"$bb\" \"$cmd\" \"$@\" ;;\n\
     dmesg)\n\
         if [ -x /tx-ltp/bin/dmesg ]; then /tx-ltp/bin/dmesg \"$@\"; elif [ -r /tmp/tx-dmesg ]; then while IFS= read -r line; do echo \"$line\"; done < /tmp/tx-dmesg; fi ;;\n\

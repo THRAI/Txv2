@@ -76,16 +76,40 @@ pub const PROCFS_SYS_KERNEL_PID_MAX_ID: FsObjectId = FsObjectId::new(0x7072_6F0E
 // `cat /proc/sys/net/ipv6/conf/all/disable_ipv6` == 0 (plus the per-iface
 // `disable_ipv6` and a writable `accept_dad` that `sysctl -qw` touches in
 // setup); without them every net.ipv6 case is skipped TCONF "IPv6 disabled".
-// The `conf/<iface>` directory is served generically (one shared entry-dir id)
-// since every iface advertises the same disable_ipv6=0 / accept_dad scalars.
+// Each `conf/<name>` entry gets a DISTINCT inode id (hashed from the name): two
+// directory names must never share one inode or the VFS dcache aliases them
+// (the bug that made `sysctl -w net.ipv6.conf.eth0.accept_dad=0` return EISDIR).
+// Content is name-independent (disable_ipv6=0, accept_dad writable no-op).
 pub const PROCFS_NET_ID: FsObjectId = FsObjectId::new(0x7072_6F0F);
 pub const PROCFS_NET_IF_INET6_ID: FsObjectId = FsObjectId::new(0x7072_6F10);
 pub const PROCFS_SYS_NET_ID: FsObjectId = FsObjectId::new(0x7072_6F11);
 pub const PROCFS_SYS_NET_IPV6_ID: FsObjectId = FsObjectId::new(0x7072_6F12);
 pub const PROCFS_SYS_NET_IPV6_CONF_ID: FsObjectId = FsObjectId::new(0x7072_6F13);
-pub const PROCFS_SYS_NET_IPV6_CONF_ENTRY_ID: FsObjectId = FsObjectId::new(0x7072_6F14);
-pub const PROCFS_SYS_NET_IPV6_DISABLE_IPV6_ID: FsObjectId = FsObjectId::new(0x7072_6F15);
-pub const PROCFS_SYS_NET_IPV6_ACCEPT_DAD_ID: FsObjectId = FsObjectId::new(0x7072_6F16);
+
+// `conf/<name>/` entries live in their own high id region: dir = base + tag*4,
+// disable_ipv6 = dir+1, accept_dad = dir+2, where tag = FNV-1a(name) (30-bit).
+const PROCFS_IPV6_CONF_BASE: u64 = PROCFS_PID_BASE + 0x80_0000_0000;
+const PROCFS_IPV6_CONF_SPAN: u64 = 0x1_0000_0000;
+fn ipv6_conf_tag(name: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in name {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h & 0x3FFF_FFFF
+}
+fn ipv6_conf_dir_id(name: &[u8]) -> FsObjectId {
+    FsObjectId::new(PROCFS_IPV6_CONF_BASE + ipv6_conf_tag(name) * 4)
+}
+/// 0 = directory, 1 = disable_ipv6, 2 = accept_dad, or `None` if not a conf id.
+fn ipv6_conf_kind(id: FsObjectId) -> Option<u8> {
+    let r = id.as_u64();
+    if r >= PROCFS_IPV6_CONF_BASE && r < PROCFS_IPV6_CONF_BASE + PROCFS_IPV6_CONF_SPAN * 4 {
+        Some((r & 3) as u8)
+    } else {
+        None
+    }
+}
 const PROCFS_PID_BASE: u64 = 0x7072_0000;
 // `/proc/<pid>` directory ids occupy [PROCFS_PID_BASE, PROCFS_PID_BASE + PROCFS_PID_DIR_LIMIT).
 const PROCFS_PID_DIR_LIMIT: u64 = 0x10000;
@@ -513,19 +537,19 @@ impl FsOps for Procfs {
             return StepOutcome::err(Errno::ENOENT.into());
         }
         if parent == PROCFS_SYS_NET_IPV6_CONF_ID {
-            // `all`, `default`, or any per-interface name (`lo`, `eth0`, veth…).
-            // Every entry advertises the same scalars, so they share one dir id.
+            // `all`, `default`, or any per-interface name (`lo`, `eth0`, veth…),
+            // each hashed to its own distinct directory inode.
             if !name.is_empty() {
-                return StepOutcome::done(PROCFS_SYS_NET_IPV6_CONF_ENTRY_ID);
+                return StepOutcome::done(ipv6_conf_dir_id(name));
             }
             return StepOutcome::err(Errno::ENOENT.into());
         }
-        if parent == PROCFS_SYS_NET_IPV6_CONF_ENTRY_ID {
+        if ipv6_conf_kind(parent) == Some(0) {
             if name == b"disable_ipv6" {
-                return StepOutcome::done(PROCFS_SYS_NET_IPV6_DISABLE_IPV6_ID);
+                return StepOutcome::done(FsObjectId::new(parent.as_u64() + 1));
             }
             if name == b"accept_dad" {
-                return StepOutcome::done(PROCFS_SYS_NET_IPV6_ACCEPT_DAD_ID);
+                return StepOutcome::done(FsObjectId::new(parent.as_u64() + 2));
             }
             return StepOutcome::err(Errno::ENOENT.into());
         }
@@ -635,17 +659,20 @@ impl FsOps for Procfs {
             PROCFS_NET_ID
             | PROCFS_SYS_NET_ID
             | PROCFS_SYS_NET_IPV6_ID
-            | PROCFS_SYS_NET_IPV6_CONF_ID
-            | PROCFS_SYS_NET_IPV6_CONF_ENTRY_ID => {
+            | PROCFS_SYS_NET_IPV6_CONF_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Directory, PROCFS_DIR_MODE))
             }
             PROCFS_NET_IF_INET6_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
             }
+            // `conf/<name>/` directory.
+            id if ipv6_conf_kind(id) == Some(0) => {
+                StepOutcome::done(InodeMeta::new(InodeKind::Directory, PROCFS_DIR_MODE))
+            }
             // disable_ipv6 / accept_dad are writable: LTP setup does
             // `sysctl -qw net.ipv6.conf.<iface>.accept_dad=0` (and may clear
             // disable_ipv6), which `open(O_WRONLY)`s the file.
-            PROCFS_SYS_NET_IPV6_DISABLE_IPV6_ID | PROCFS_SYS_NET_IPV6_ACCEPT_DAD_ID => {
+            id if matches!(ipv6_conf_kind(id), Some(1) | Some(2)) => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_RW_FILE_MODE))
             }
             id if pid_from_dir(id).is_some() => {
@@ -900,29 +927,25 @@ impl FsOps for Procfs {
                 let fi = idx.saturating_sub(2);
                 if fi < names.len() {
                     return StepOutcome::done(Some((
-                        dir_entry(
-                            PROCFS_SYS_NET_IPV6_CONF_ENTRY_ID,
-                            InodeKind::Directory,
-                            names[fi],
-                        ),
+                        dir_entry(ipv6_conf_dir_id(names[fi]), InodeKind::Directory, names[fi]),
                         DirCursor([2, (fi + 1) as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
                     )));
                 }
                 return StepOutcome::done(None);
             }
-            if id == PROCFS_SYS_NET_IPV6_CONF_ENTRY_ID {
+            if ipv6_conf_kind(id) == Some(0) {
                 if state_byte < 2 {
                     return finish_dots(state_byte, idx, id);
                 }
                 let files: &[(&[u8], FsObjectId, InodeKind)] = &[
                     (
                         b"disable_ipv6",
-                        PROCFS_SYS_NET_IPV6_DISABLE_IPV6_ID,
+                        FsObjectId::new(id.as_u64() + 1),
                         InodeKind::Regular,
                     ),
                     (
                         b"accept_dad",
-                        PROCFS_SYS_NET_IPV6_ACCEPT_DAD_ID,
+                        FsObjectId::new(id.as_u64() + 2),
                         InodeKind::Regular,
                     ),
                 ];
@@ -1212,9 +1235,7 @@ impl FsOps for Procfs {
         // `sysctl -w net.ipv6.conf.<iface>.{accept_dad,disable_ipv6}=…` from LTP
         // tst_net setup. We have no per-iface IPv6 toggle state; accept the write
         // (report all bytes consumed) so setup proceeds. disable_ipv6 stays 0.
-        if fs_object_id == PROCFS_SYS_NET_IPV6_ACCEPT_DAD_ID
-            || fs_object_id == PROCFS_SYS_NET_IPV6_DISABLE_IPV6_ID
-        {
+        if matches!(ipv6_conf_kind(fs_object_id), Some(1) | Some(2)) {
             return StepOutcome::done(bytes.len() as u64);
         }
         StepOutcome::err(Errno::ENOSYS.into())
