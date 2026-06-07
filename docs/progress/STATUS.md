@@ -1,3 +1,21 @@
+- 2026-06-07 **Dimension B (net.*) regression assessed complete; C-based groups restored,
+  shell/command-layer blocked by one deep deferred infra stack.** To enable the suites,
+  re-homed more PR#50-dropped surface: **populate_rootfs_network_databases** (`842397d0`:
+  /etc/{hosts,services,protocols} + the whole /tx-ltp/bin shim suite), **boot-net runtime**
+  (`a19ff10f`: re-declared `mod net;` — the entire init/net.rs was orphaned/uncompiled — +
+  submit_net_runtime_tasks so virtio-net0 is published and the net delegate runs), **socket
+  select() timeout** (`86334bf6`: races the socket wait against a deadline so negative
+  "no-packet" checks return 0 instead of hanging), and **/proc/<pid>/status** (`938a275d`).
+  **Results:** net.ipv6_lib **6/6** (in6_01 5, in6_02 3, getaddrinfo_01 22, asapi_01 16/17
+  [hopopt = musl table limit], asapi_02 14, asapi_03 18); net.features **fanout01** PASS. **The
+  29 shell/command-layer entries (net.tcp_cmds 16 + net.ipv6 11 + net.multicast 2) are all
+  blocked by one root cause**: network.sh setup hangs right after "IPv6 disabled on lhost"
+  because the `/proc/sys/net` subtree (104 nodes, incl. ipv6/conf/*/disable_ipv6) was dropped,
+  and the suites further need veth + netns-exec + mount-api that the re-home didn't restore — a
+  large, deeply-interdependent infra stack the handoff itself defers (5-minute rule / "暂缓").
+  recv01 5/5, b1 40/40 throughout. Dimension-B regression is fully assessed (every entry checked
+  + classified); making the 29 pass is a separate large effort.
+
 - 2026-06-07 **Dimension C (net.sctp) sweep complete — all 31 entries match baseline, no
   regressions.** Verified each case in its own fresh boot (back-to-back in one boot still
   EADDRINUSEs — the deep lingering-loopback-peer issue, unfixed). **24 PASS entries** all match
