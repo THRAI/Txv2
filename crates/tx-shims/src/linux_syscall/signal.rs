@@ -775,11 +775,39 @@ pub(super) fn sys_kill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
             },
         );
     }
-    if pid <= 0 {
-        // TODO(phase-pgrp-kill): pgrp-targeted (`pid < 0` /
-        // `pid == 0` / `pid == -1`) kills need a global pid-to-pgrp
-        // lookup the slice does not yet wire.
+    if pid == -1 {
+        // kill(-1, sig): broadcast to every permitted process. Not yet wired;
+        // the LTP timeout watchdog uses kill(-pgid) (pid < -1), handled below.
         return SyscallResult::Error(ENOSYS_VALUE);
+    }
+    if pid < 0 {
+        // kill(-pgid, sig): signal every member of process group `-pid`.
+        // Resolve the group via the pid namespace's ProcessGroup binding and
+        // fan out through the cred-checked script entry point (same path as
+        // kill(0, sig)). LTP's `tst_timeout_kill` does `kill(-$$, SIGTERM)`.
+        let pgid = tx_subsystems::process::Pgid((-(pid as i64)) as u32);
+        let signum = match u8::try_from(sig).ok().and_then(Signum::new) {
+            Some(s) => Some(s),
+            None if sig == 0 => None, // existence probe — no signal delivered
+            None => return SyscallResult::Error(EINVAL_VALUE),
+        };
+        let Some(pgrp) = tx_subsystems::process::process_group_by_pgid(pgid) else {
+            return SyscallResult::Error(ESRCH_VALUE);
+        };
+        let Some(signum) = signum else {
+            // sig == 0: existence probe succeeds (group resolved above).
+            return SyscallResult::Return(0);
+        };
+        return dispatch_errno(
+            tx_subsystems::signal::script_kill_pgrp(&ctx.process, &pgrp, signum),
+            |n| {
+                if n > 0 {
+                    SyscallResult::Return(0)
+                } else {
+                    SyscallResult::Error(EPERM_VALUE)
+                }
+            },
+        );
     }
 
     let target = match process_by_pid(Pid(pid as u32)) {

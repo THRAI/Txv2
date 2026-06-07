@@ -111,6 +111,14 @@ pub fn process_by_pid(pid: Pid) -> Option<Cap<ProcessIdentity>> {
     }
 }
 
+/// Look up a process group by PGID (for `kill(-pgid, sig)`).
+pub fn process_group_by_pgid(pgid: Pgid) -> Option<Cap<ProcessGroup>> {
+    match resolve_pid_number_as(pgid.0 as u64, PidNameKind::ProcessGroup) {
+        Some(PidName::ProcessGroup(cap)) => Some(cap),
+        _ => None,
+    }
+}
+
 /// Return all registered PIDs with alive status (for procfs).
 pub fn all_pids() -> alloc::vec::Vec<(Pid, bool)> {
     let mut out = alloc::vec::Vec::new();
