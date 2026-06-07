@@ -1,3 +1,20 @@
+- 2026-06-07 **Dimension B netns chain — Step 1 done: `clone(CLONE_NEWNET|CLONE_NEWNS)` now works
+  (`61a5d89d`).** Incremental re-home of the netns chain (dropped by rebase). Three clone gates
+  rejected the flags: `sys_clone_oneshot` allowed_mask, the trap-level `dispatch_clone_oneshot`
+  `.expect(Some)` fast path, and async `sys_clone` allowed_mask. Fix: both fast paths fall through for
+  CLONE_NEWNET|CLONE_NEWNS; async `sys_clone` allows them + SYS_ADMIN cap check; `ForkOptions`/`ForkOp`/
+  `step_fork` gain clone_newnet/clone_newns and create+assign a fresh isolated net namespace to the
+  child (mount-ns isolation deferred — child shares parent mnt_ns). **Verified:** `tst_ns_create
+  net,mnt` now returns a real child pid (`/proc/26/ns/net`, was empty). **Next gates (Step 2):**
+  (a) `/proc/<pid>/ns/{net,mnt}` procfs nsfs nodes — `tst_ns_exec` does `open(/proc/<pid>/ns/net)` →
+  ENOENT (HEAD has the `StructPayload::NetNamespace` file backing + `net_namespace_open_file_from_payload`
+  at namespace.rs:1912, but no procfs node that opens it); (b) `sys_setns` (NR_SETNS=268) — absent in
+  HEAD, backup's net branch is portable (`net_namespace_payload_from_file` + owner cap check +
+  `replace_net_namespace`); the mnt branch needs `mount::mount_namespace_cap_from_file` +
+  `clone_nsproxy_with_mount_namespace` (defer with mount-ns); (c) `/var/run` dir (`mkdir -p
+  /var/run/netns` fails). After Step 2, tst_ns_exec should run rhost-side commands and the iproute
+  subtests can score. Backup procfs ns scheme: PROCFS_NS_OBJECT_BASE=0x7074_0000_0000 (procfs/mod.rs).
+
 - 2026-06-07 **Dimension B: veth/`ip link add` hang FIXED (socket read/write lane re-homed,
   `a01ed8f6`); next gate is the clone/setns/nsfs netns chain.** The "veth livelock" hypothesis was
   WRONG. A per-syscall trace (temporary instrumentation, since removed) showed busybox `ip` for veth
