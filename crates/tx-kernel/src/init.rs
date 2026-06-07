@@ -304,6 +304,7 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::populate_rootfs_tmp_dirs();
             Self::populate_rootfs_kernel_config();
             Self::populate_rootfs_identity_files();
+            Self::populate_rootfs_network_databases();
             Self::init_csprng();
             Self::bind_init_cwd_and_root();
 
