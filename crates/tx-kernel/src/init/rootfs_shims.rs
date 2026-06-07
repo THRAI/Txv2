@@ -1200,9 +1200,9 @@ if [ \"$ip_object\" = \"xfrm\" ] && [ \"$ip_command\" = \"state\" ]; then\n\
 fi\n\
 if [ \"$ip_object\" = \"link\" ] && [ \"$ip_command\" = \"set\" ]; then\n\
     for tx_ltp_ip_arg in \"$@\"; do\n\
-        if [ \"$tx_ltp_ip_arg\" = \"mtu\" ]; then\n\
-            tx_ltp_exec \"$bb\" ip \"$@\"\n\
-        fi\n\
+        case \"$tx_ltp_ip_arg\" in\n\
+            mtu|up|down) tx_ltp_exec \"$bb\" ip \"$@\" ;;\n\
+        esac\n\
     done\n\
     exit 0\n\
 fi\n\
