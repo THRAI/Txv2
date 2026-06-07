@@ -1,3 +1,20 @@
+- 2026-06-08 **Dimension B: `kill(-pgid)` implemented (`3e6af3d3`); ping reply→recvfrom is the sole
+  remaining ICMP blocker.** The 520s ping01 run confirmed two things: (1) the timeout watchdog now
+  fires correctly (`Test timed out, sending SIGTERM!` at 300s — procfs fix working), but (2) its
+  `kill(-pgid, SIGTERM)` was ENOSYS (`kill(-12) failed`). Fixed: added `process_group_by_pgid` and
+  routed `pid < -1` in `sys_kill` through the cred-checked `script_kill_pgrp` (same path as
+  `kill(0)`); `pid == -1` broadcast stays ENOSYS. **The ICMP ping itself still blocks** — ping sends
+  the echo (sendto succeeds; `send_configured_icmpv4_echo` runs), but ping's `recvfrom` never wakes,
+  so it blocks the full 300s. Chain analyzed and looks correct on paper:
+  `deliver_icmpv4_reply_to_table` (iterates `socket_table().snapshot_raw_icmp`; ping socket IS
+  registered at create via `step_socket_create.register_raw_icmp`) → `accepts_ipv4_reply_to(reply.dst)`
+  (reply.dst = ping's src 10.0.0.2; unbound socket accepts any) → `record_icmp_recv_echo_reply` →
+  `ingest_rx_echo_reply` (recv_buf 256KB, ample) → `fire_recv(HAS_DATA)`. One of these links is the
+  break — needs a deliver/recvfrom probe to pinpoint (candidates: reply.dst vs the ping socket's
+  bound_local, or the fire_recv→recvfrom wait-token mismatch). This is the last piece for the ping
+  family (ping01/02/601/602); verification also fights the TCG wall (setup ~140s, ping sweep needs a
+  >300s window).
+
 - 2026-06-08 **Dimension B ICMP track: `is_up` + sysfs iface-attr gates fixed (`493ee154` ip-shim,
   `3c836279` sysfs).** Chased `ping 10.0.0.1 → sendto: Not supported` (EOPNOTSUPP) to
   `send_configured_icmpv4_echo`'s `ipv4_addr_is_configured(dst)` requiring an **up** interface:
