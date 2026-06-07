@@ -829,6 +829,14 @@ pub(super) async fn sys_pselect6<'a, P: tx_hal::TimeIf + tx_hal::ConsoleIf>(
             return SyscallResult::error_from(errno);
         }
     }
+    // Absolute deadline for a finite, non-zero timeout. Used to bound a socket
+    // wait so a select(2) that expects to time out (e.g. negative "no packet"
+    // checks) returns 0 instead of parking forever. (zero timeout => wait_allowed
+    // is false; None => infinite.)
+    let deadline_ns: Option<u64> = match timeout_ns {
+        Some(ns) if ns != 0 => Some(<P as tx_hal::TimeIf>::read_ns().saturating_add(ns)),
+        _ => None,
+    };
     loop {
         // Pump any pending loopback packets so socket readiness reflects the
         // latest delivered data before we sample each fd.
@@ -902,6 +910,63 @@ pub(super) async fn sys_pselect6<'a, P: tx_hal::TimeIf + tx_hal::ConsoleIf>(
             }
             return SyscallResult::Return(0);
         };
+        // A socket wait with a finite deadline races the source against a timer
+        // so the select returns 0 on timeout instead of parking forever.
+        if let (SelectPark::Socket(token), Some(dl)) = (&park, deadline_ns) {
+            let token = *token;
+            let timed_out = match tx_subsystems::wait_source::wait_on_token(token) {
+                Some(mut fut) => {
+                    if <P as tx_hal::TimeIf>::read_ns() >= dl {
+                        true
+                    } else if let Some(mut timer) = tx_subsystems::timer_sleep::sleep_until_ns(dl) {
+                        core::future::poll_fn(|cx| {
+                            if core::future::Future::poll(core::pin::Pin::new(&mut fut), cx)
+                                .is_ready()
+                            {
+                                return core::task::Poll::Ready(false);
+                            }
+                            if core::future::Future::poll(core::pin::Pin::new(&mut timer), cx)
+                                .is_ready()
+                            {
+                                return core::task::Poll::Ready(true);
+                            }
+                            core::task::Poll::Pending
+                        })
+                        .await
+                    } else {
+                        let _ = fut.await;
+                        false
+                    }
+                }
+                None => {
+                    tx_reactor::yield_now().await;
+                    false
+                }
+            };
+            if timed_out {
+                if readfds_ptr != 0 {
+                    if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, readfds_ptr, &out_read) {
+                        return SyscallResult::error_from(errno);
+                    }
+                }
+                if writefds_ptr != 0 {
+                    if let Err(errno) =
+                        bootstrap_copy_to_user(&ctx.aspace, writefds_ptr, &out_write)
+                    {
+                        return SyscallResult::error_from(errno);
+                    }
+                }
+                if exceptfds_ptr != 0 {
+                    if let Err(errno) =
+                        bootstrap_copy_to_user(&ctx.aspace, exceptfds_ptr, &out_except)
+                    {
+                        return SyscallResult::error_from(errno);
+                    }
+                }
+                return SyscallResult::Return(0);
+            }
+            continue;
+        }
         await_select_park(ctx, park).await;
     }
 }
