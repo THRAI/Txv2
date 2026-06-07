@@ -683,7 +683,54 @@ pub(super) async fn sys_readv<'a, P: tx_hal::TimeIf>(
 ///   timeout-elapsed branch only as an upper bound; the actual
 ///   timer hookup ships with the OnTimer wave (deferred).
 /// - The signal mask is ignored.
-pub(super) async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+/// `ppoll`/`poll` with no fds: a pure wait. NULL timeout blocks indefinitely
+/// (the `pause()` idiom); a finite timeout sleeps then returns 0. Blocks via the
+/// timer wheel (no busy-loop); a fatal signal tears the task down out-of-band.
+async fn ppoll_empty_wait<'a, P: tx_hal::TimeIf>(
+    ctx: &SyscallCtx<'a>,
+    timeout_ptr: u64,
+) -> SyscallResult {
+    let timeout_ns = if timeout_ptr == 0 {
+        None
+    } else {
+        let mut ts = [0u8; 16];
+        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut ts, timeout_ptr) {
+            return SyscallResult::error_from(errno);
+        }
+        let sec = i64::from_le_bytes(ts[0..8].try_into().unwrap());
+        let nsec = i64::from_le_bytes(ts[8..16].try_into().unwrap());
+        if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+            return SyscallResult::Error(EINVAL_VALUE);
+        }
+        Some((sec as u64).saturating_mul(1_000_000_000).saturating_add(nsec as u64))
+    };
+
+    match timeout_ns {
+        Some(0) => SyscallResult::Return(0),
+        Some(ns) => {
+            let deadline = <P as tx_hal::TimeIf>::read_ns().saturating_add(ns);
+            if let Some(timer) = tx_subsystems::timer_sleep::sleep_until_ns(deadline) {
+                timer.await;
+            }
+            SyscallResult::Return(0)
+        }
+        None => loop {
+            // Re-arm a far (1h) deadline each iteration rather than one huge
+            // absolute value, avoiding timer-wheel overflow concerns.
+            let deadline = <P as tx_hal::TimeIf>::read_ns().saturating_add(3_600_000_000_000);
+            if let Some(timer) = tx_subsystems::timer_sleep::sleep_until_ns(deadline) {
+                timer.await;
+            } else {
+                tx_reactor::yield_now().await;
+            }
+        },
+    }
+}
+
+pub(super) async fn sys_ppoll<'a, P: tx_hal::TimeIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
     let fds_ptr = args[0];
     let nfds = args[1];
     let timeout_ptr = args[2];
@@ -692,7 +739,12 @@ pub(super) async fn sys_ppoll<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         return SyscallResult::Error(EINVAL_VALUE);
     }
     if nfds == 0 {
-        return SyscallResult::Return(0);
+        // No fds: `ppoll(NULL, 0, timeout, sigmask)`. A NULL timeout is the
+        // `pause()` idiom on rv64 musl (pause == ppoll(0,0,NULL,NULL)) and must
+        // block until a signal/kill — not return immediately, which would make
+        // daemonised pausers (LTP's tst_ns_create child) exit. A finite timeout
+        // sleeps then returns 0.
+        return ppoll_empty_wait::<P>(ctx, timeout_ptr).await;
     }
 
     const POLLFD_BYTES: u64 = 8;

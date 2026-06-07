@@ -934,7 +934,7 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + tx
         nr if nr == NR_SETITIMER => time::sys_setitimer::<P>(req.args, ctx),
         nr if nr == NR_GETITIMER => time::sys_getitimer::<P>(req.args, ctx),
         nr if nr == NR_SENDFILE64 => sys_sendfile64(req.args, ctx).await,
-        nr if nr == NR_PPOLL => sys_ppoll(req.args, ctx).await,
+        nr if nr == NR_PPOLL => sys_ppoll::<P>(req.args, ctx).await,
         nr if nr == NR_PSELECT6 => sys_pselect6::<P>(req.args, ctx).await,
         nr if nr == NR_EXIT => sys_exit(req.args, ctx),
         nr if nr == NR_EXIT_GROUP => sys_exit_group(req.args, ctx),
