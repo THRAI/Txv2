@@ -2,7 +2,8 @@
 
 use crate::procfs::{
     pid_from_cmdline_id, pid_from_fdinfo_id, pid_from_gid_map_id, pid_from_maps_id,
-    pid_from_setgroups_id, pid_from_stat_id, pid_from_uid_map_id, KERNEL_CONFIG_TEXT,
+    pid_from_setgroups_id, pid_from_stat_id, pid_from_status_id, pid_from_uid_map_id,
+    KERNEL_CONFIG_TEXT,
     PROCFS_CONFIG_ID, PROCFS_CPUINFO_ID, PROCFS_MEMINFO_ID, PROCFS_MOUNTS_ID,
     PROCFS_SYS_KERNEL_PID_MAX_ID, PROCFS_SYS_KERNEL_TAINTED_ID, PROCFS_SYSVIPC_MSG_ID,
     PROCFS_SYSVIPC_SEM_ID, PROCFS_SYSVIPC_SHM_ID, PROCFS_UPTIME_ID,
@@ -13,6 +14,9 @@ use tx_subsystems::process::{self, Pid};
 use tx_subsystems::vfs::FsObjectId;
 
 pub fn render(fs_object_id: FsObjectId) -> String {
+    if let Some(pid) = pid_from_status_id(fs_object_id) {
+        return render_status(pid);
+    }
     if let Some(pid) = pid_from_stat_id(fs_object_id) {
         return render_stat(pid);
     }
@@ -201,6 +205,42 @@ fn fdinfo_flags(file: &tx_subsystems::vfs::OpenFile) -> u32 {
 
 pub fn render_config() -> String {
     String::from(KERNEL_CONFIG_TEXT)
+}
+
+const fn state_name(state: char) -> &'static str {
+    match state {
+        'R' => "running",
+        'S' => "sleeping",
+        'Z' => "zombie",
+        _ => "unknown",
+    }
+}
+
+/// `/proc/<pid>/status` — enough for LTP's getdatasize() (`VmData:` line). VmData
+/// is reported as a stable 0 (no per-mapping accounting re-homed yet), which is
+/// sufficient for the leak check (before == after). Re-homed; PR#50 dropped it.
+fn render_status(pid: Pid) -> String {
+    let Some(proc) = process::process_by_pid(pid) else {
+        return String::new();
+    };
+    let state = proc.state_char() as char;
+    let name_buf = proc.comm();
+    let name =
+        core::str::from_utf8(&name_buf[..name_buf.iter().position(|&b| b == 0).unwrap_or(16)])
+            .unwrap_or("?");
+    format!(
+        "Name:\t{}\nState:\t{} ({})\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nThreads:\t{}\n\
+VmData:\t{:8} kB\nVmLck:\t{:8} kB\n",
+        name,
+        state,
+        state_name(state),
+        pid.0,
+        pid.0,
+        proc.parent_pid().0,
+        proc.live_thread_count(),
+        0,
+        0,
+    )
 }
 
 /// `/proc/<pid>/{uid_map,gid_map}` — one `inside outside length` row per entry,

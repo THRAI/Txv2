@@ -116,6 +116,21 @@ fn pid_from_userns_id(id: FsObjectId, which: u64) -> Option<Pid> {
     }
 }
 
+// `/proc/<pid>/status` in its own collision-free id region (above the userns
+// region), pid in the low bits.
+const PROCFS_STATUS_BASE: u64 = PROCFS_PID_BASE + 0x10_0000_0000;
+const fn pid_status_id(pid: Pid) -> FsObjectId {
+    FsObjectId::new(PROCFS_STATUS_BASE + pid.0 as u64)
+}
+pub fn pid_from_status_id(id: FsObjectId) -> Option<Pid> {
+    let r = id.as_u64();
+    if r >= PROCFS_STATUS_BASE && r - PROCFS_STATUS_BASE <= u32::MAX as u64 {
+        Some(Pid((r - PROCFS_STATUS_BASE) as u32))
+    } else {
+        None
+    }
+}
+
 #[derive(Clone, Copy)]
 enum UsernsWriteTarget {
     UidMap,
@@ -437,6 +452,9 @@ impl FsOps for Procfs {
             if name == b"fdinfo" && process::process_by_pid(pid).is_some() {
                 return StepOutcome::done(pid_fdinfo_dir_id(pid));
             }
+            if name == b"status" && process::process_by_pid(pid).is_some() {
+                return StepOutcome::done(pid_status_id(pid));
+            }
             if name == b"uid_map" && process::process_by_pid(pid).is_some() {
                 return StepOutcome::done(pid_uid_map_id(pid));
             }
@@ -503,6 +521,9 @@ impl FsOps for Procfs {
             {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_RW_FILE_MODE))
             }
+            id if pid_from_status_id(id).is_some() => {
+                StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
+            }
             id if pid_from_stat_id(id).is_some() => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
             }
@@ -551,6 +572,7 @@ impl FsOps for Procfs {
             }
             let files: &[(&[u8], FsObjectId, InodeKind)] = &[
                 (b"stat", pid_stat_id(pid), InodeKind::Regular),
+                (b"status", pid_status_id(pid), InodeKind::Regular),
                 (b"cmdline", pid_cmdline_id(pid), InodeKind::Regular),
                 (b"mem", pid_mem_id(pid), InodeKind::Regular),
                 (b"maps", pid_maps_id(pid), InodeKind::Regular),
