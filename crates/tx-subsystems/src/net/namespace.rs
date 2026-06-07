@@ -1886,6 +1886,102 @@ pub fn initial_net_namespace_payload() -> PayloadCap<NetNamespacePayload> {
         .expect("initial net namespace payload installed")
 }
 
+/// Delete a neighbor entry described by a `/proc/net/tx_neigh_ctl` write line
+/// (`"<addr> <dev>\n"`), used by the `ip neigh del` shim. Resolves `dev` to an
+/// ifindex in the root netns and removes the static ARP (IPv4) or NDISC (IPv6)
+/// entry. Returns true on success.
+pub fn delete_neighbor_ctl(line: &[u8]) -> bool {
+    let Ok(text) = core::str::from_utf8(line) else {
+        return false;
+    };
+    let mut parts = text.split_whitespace();
+    let (Some(addr_str), Some(dev)) = (parts.next(), parts.next()) else {
+        return false;
+    };
+    let netns = initial_net_namespace_payload();
+    let Some(ifindex) = netns
+        .link_snapshot()
+        .into_iter()
+        .find(|link| link.name == dev)
+        .map(|link| link.ifindex)
+    else {
+        return false;
+    };
+    let auth = NetAdminAuthority::for_test_or_bootstrap();
+    if addr_str.contains(':') {
+        match parse_ipv6_ascii(addr_str) {
+            Some(addr) => netns
+                .delete_static_ndisc_by_ifindex(auth, ifindex, addr)
+                .is_ok(),
+            None => false,
+        }
+    } else {
+        match parse_ipv4_ascii(addr_str) {
+            Some(addr) => netns
+                .delete_static_neighbor_by_ifindex(auth, ifindex, addr)
+                .is_ok(),
+            None => false,
+        }
+    }
+}
+
+fn parse_ipv4_ascii(s: &str) -> Option<Ipv4Address> {
+    let mut octets = [0u8; 4];
+    let mut parts = s.split('.');
+    for octet in &mut octets {
+        *octet = parts.next()?.parse::<u8>().ok()?;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(Ipv4Address::new(octets))
+}
+
+fn parse_ipv6_ascii(s: &str) -> Option<Ipv6Address> {
+    let mut octets = [0u8; 16];
+    let put = |octets: &mut [u8; 16], pos: usize, g: &str| -> Option<usize> {
+        let v = u16::from_str_radix(g, 16).ok()?;
+        octets[pos] = (v >> 8) as u8;
+        octets[pos + 1] = v as u8;
+        Some(pos + 2)
+    };
+    if let Some(idx) = s.find("::") {
+        let (left, right) = (&s[..idx], &s[idx + 2..]);
+        let lgroups: Vec<&str> = if left.is_empty() {
+            Vec::new()
+        } else {
+            left.split(':').collect()
+        };
+        let rgroups: Vec<&str> = if right.is_empty() {
+            Vec::new()
+        } else {
+            right.split(':').collect()
+        };
+        if lgroups.len() + rgroups.len() > 7 {
+            return None;
+        }
+        let mut pos = 0usize;
+        for g in &lgroups {
+            pos = put(&mut octets, pos, g)?;
+        }
+        let mut rpos = 16 - rgroups.len() * 2;
+        for g in &rgroups {
+            rpos = put(&mut octets, rpos, g)?;
+        }
+        Some(Ipv6Address::new(octets))
+    } else {
+        let groups: Vec<&str> = s.split(':').collect();
+        if groups.len() != 8 {
+            return None;
+        }
+        let mut pos = 0usize;
+        for g in &groups {
+            pos = put(&mut octets, pos, g)?;
+        }
+        Some(Ipv6Address::new(octets))
+    }
+}
+
 pub fn initial_net_namespace_payload_with_owner(
     owner_user_ns: Cap<UserNamespace>,
 ) -> PayloadCap<NetNamespacePayload> {

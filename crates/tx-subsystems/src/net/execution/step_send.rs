@@ -570,6 +570,7 @@ fn send_configured_icmpv4_echo(
     else {
         return StepOutcome::Err(Errno::EOPNOTSUPP);
     };
+    learn_configured_icmpv4_neighbor(payload, src_addr, dst_addr);
     let request = match parse_icmpv4_payload(src_addr, dst_addr, bytes) {
         Icmpv4Event::EchoRequest(request) => request,
         Icmpv4Event::Malformed => {
@@ -892,6 +893,48 @@ fn preferred_ipv4_source_for(
             })
             .and_then(|link| link.ipv4_addr)
     })
+}
+
+/// Auto-create an ARP/neighbor entry for the pinged IPv4 dst (mirrors
+/// `learn_configured_icmpv6_neighbor`). LTP `ipneigh01` pings a peer then expects
+/// `ip neigh show` to list it; our synthetic echo never does real ARP, so install
+/// the peer's configured MAC on the sending link. The entry surfaces via
+/// `/proc/net/tx_neigh`.
+fn learn_configured_icmpv4_neighbor(
+    payload: &SocketPayload,
+    src_addr: Ipv4Address,
+    dst_addr: Ipv4Address,
+) {
+    let netns = payload.net_namespace();
+    let Some(link) = netns
+        .link_snapshot()
+        .into_iter()
+        .find(|link| link.is_up && !link.is_loopback && link.ipv4_addr == Some(src_addr))
+    else {
+        return;
+    };
+    let Some(peer_mac) = configured_ipv4_peer_mac(dst_addr) else {
+        return;
+    };
+    let _ = netns.install_static_neighbor_by_ifindex(
+        NetAdminAuthority::for_test_or_bootstrap(),
+        link.ifindex,
+        dst_addr,
+        peer_mac,
+    );
+}
+
+fn configured_ipv4_peer_mac(addr: Ipv4Address) -> Option<crate::net::EthernetAddress> {
+    for namespace in net_namespace_payloads_snapshot() {
+        for link in namespace.link_snapshot() {
+            if link.is_up && link.ipv4_addr == Some(addr) {
+                if let Some(mac) = link.mac {
+                    return Some(mac);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn configured_ipv6_peer_mac(addr: Ipv6Address) -> Option<crate::net::EthernetAddress> {

@@ -85,6 +85,13 @@ pub const PROCFS_NET_IF_INET6_ID: FsObjectId = FsObjectId::new(0x7072_6F10);
 pub const PROCFS_SYS_NET_ID: FsObjectId = FsObjectId::new(0x7072_6F11);
 pub const PROCFS_SYS_NET_IPV6_ID: FsObjectId = FsObjectId::new(0x7072_6F12);
 pub const PROCFS_SYS_NET_IPV6_CONF_ID: FsObjectId = FsObjectId::new(0x7072_6F13);
+// `/proc/net/tx_neigh` — kernel ARP+NDISC neighbor table, one line per entry, read
+// by the `ip neigh show` shim. LTP ipneigh01 pings a peer (auto-creating the entry
+// via learn_configured_icmpv*_neighbor) then expects `ip neigh show` to list it.
+// `/proc/net/tx_neigh_ctl` — write "<addr> <dev>" to delete an entry (the `ip
+// neigh del` shim path).
+pub const PROCFS_NET_TX_NEIGH_ID: FsObjectId = FsObjectId::new(0x7072_6F14);
+pub const PROCFS_NET_TX_NEIGH_CTL_ID: FsObjectId = FsObjectId::new(0x7072_6F15);
 
 // `conf/<name>/` entries live in their own high id region: dir = base + tag*4,
 // disable_ipv6 = dir+1, accept_dad = dir+2, where tag = FNV-1a(name) (30-bit).
@@ -522,6 +529,12 @@ impl FsOps for Procfs {
             if name == b"if_inet6" {
                 return StepOutcome::done(PROCFS_NET_IF_INET6_ID);
             }
+            if name == b"tx_neigh" {
+                return StepOutcome::done(PROCFS_NET_TX_NEIGH_ID);
+            }
+            if name == b"tx_neigh_ctl" {
+                return StepOutcome::done(PROCFS_NET_TX_NEIGH_CTL_ID);
+            }
             return StepOutcome::err(Errno::ENOENT.into());
         }
         if parent == PROCFS_SYS_NET_ID {
@@ -662,8 +675,11 @@ impl FsOps for Procfs {
             | PROCFS_SYS_NET_IPV6_CONF_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Directory, PROCFS_DIR_MODE))
             }
-            PROCFS_NET_IF_INET6_ID => {
+            PROCFS_NET_IF_INET6_ID | PROCFS_NET_TX_NEIGH_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
+            }
+            PROCFS_NET_TX_NEIGH_CTL_ID => {
+                StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_RW_FILE_MODE))
             }
             // `conf/<name>/` directory.
             id if ipv6_conf_kind(id) == Some(0) => {
@@ -868,8 +884,11 @@ impl FsOps for Procfs {
                 if state_byte < 2 {
                     return finish_dots(state_byte, idx, id);
                 }
-                let files: &[(&[u8], FsObjectId, InodeKind)] =
-                    &[(b"if_inet6", PROCFS_NET_IF_INET6_ID, InodeKind::Regular)];
+                let files: &[(&[u8], FsObjectId, InodeKind)] = &[
+                    (b"if_inet6", PROCFS_NET_IF_INET6_ID, InodeKind::Regular),
+                    (b"tx_neigh", PROCFS_NET_TX_NEIGH_ID, InodeKind::Regular),
+                    (b"tx_neigh_ctl", PROCFS_NET_TX_NEIGH_CTL_ID, InodeKind::Regular),
+                ];
                 let fi = idx.saturating_sub(2);
                 if fi < files.len() {
                     let (name, oid, kind) = files[fi];
@@ -1236,6 +1255,11 @@ impl FsOps for Procfs {
         // tst_net setup. We have no per-iface IPv6 toggle state; accept the write
         // (report all bytes consumed) so setup proceeds. disable_ipv6 stays 0.
         if matches!(ipv6_conf_kind(fs_object_id), Some(1) | Some(2)) {
+            return StepOutcome::done(bytes.len() as u64);
+        }
+        // `ip neigh del` writes "<addr> <dev>" here to drop a neighbor entry.
+        if fs_object_id == PROCFS_NET_TX_NEIGH_CTL_ID {
+            let _ = tx_subsystems::net::namespace::delete_neighbor_ctl(bytes);
             return StepOutcome::done(bytes.len() as u64);
         }
         StepOutcome::err(Errno::ENOSYS.into())
