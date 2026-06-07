@@ -196,6 +196,7 @@ pub struct CoreInit<P: TxPlatform> {
 
 mod exec;
 mod helpers;
+mod sysfs_mount;
 mod net;
 mod reactor_submit;
 
@@ -299,6 +300,7 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::register_devfs_console_alias();
             Self::mount_tmpfs_at_dev_shm();
             Self::mount_procfs_at_proc();
+            Self::mount_sysfs_at_sys();
             Self::mount_bdevfs_at_dev_block();
             Self::mount_sdcard_at_musl();
             Self::populate_rootfs_shebang_shims();

@@ -393,28 +393,15 @@ impl FsOps for Sysfs {
         fs_object_id: FsObjectId,
         offset: u64,
         buf: &mut [u8],
-        guard: &Guard<'_>,
-    ) -> StepOutcome<u64, NoProgress> {
-        self.step_read_projected_with_netns(fs_object_id, offset, buf, None, guard)
-    }
-
-    fn step_read_projected_with_netns(
-        &self,
-        fs_object_id: FsObjectId,
-        offset: u64,
-        buf: &mut [u8],
-        caller_netns: Option<&NetNamespacePayload>,
         _guard: &Guard<'_>,
     ) -> StepOutcome<u64, NoProgress> {
-        let default_netns;
-        let netns = match caller_netns {
-            Some(netns) => netns,
-            None => {
-                default_netns = initial_netns();
-                &default_netns
-            }
-        };
-        let content = match render_projected(fs_object_id, netns) {
+        // The read path carries no caller netns (the FsOps trait read is
+        // netns-agnostic), but the `fs_object_id` already encodes the ns_slot of
+        // the target iface (resolved at lookup/readdir time against all netns),
+        // so `render_projected` derives the correct namespace from the id. The
+        // `initial_netns()` argument is only a fallback for ids without a slot.
+        let netns = initial_netns();
+        let content = match render_projected(fs_object_id, &netns) {
             Ok(content) => content,
             Err(errno) => return StepOutcome::err(errno),
         };

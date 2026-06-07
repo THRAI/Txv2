@@ -830,17 +830,27 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
         // (`assert(ret == 0)`). A fresh tmpfs at the mount point
         // satisfies that contract without pretending to read FAT
         // bytes. Real FAT support tracks separately.
-        // `sysfs` has no driver yet; LTP netns setup only needs the mount to
-        // succeed (`mount -t sysfs none /sys`) so `init_ltp_netspace`'s ROD passes.
-        // A fresh tmpfs at the mount point satisfies that contract; subtests that
-        // read /sys/class/net/<iface>/* still see ENOENT, which is a per-subtest
-        // gap, not a setup failure. Real sysfs tracks separately.
-        "tmpfs" | "vfat" | "sysfs" => {
+        // `sysfs` projects `/sys/class/net/<ifname>/{address,mtu,...}` from the
+        // caller's NetNamespacePayload link snapshots (tx_fs::sysfs). LTP's
+        // `init_ltp_netspace` does `mount -t sysfs none /sys`, and tst_init_iface
+        // reads the iface MAC/MTU from there, so a real sysfs (not a tmpfs stub)
+        // is needed for the net command tests to read iface attributes.
+        "sysfs" => (
+            tx_fs::sysfs::Sysfs::fs_ops_arc(),
+            tx_fs::sysfs::Sysfs::fs_page_backing_arc(),
+            tx_fs::sysfs::SYSFS_ROOT_ID,
+            tx_subsystems::vfs::InodeMeta::new(
+                tx_subsystems::vfs::InodeKind::Directory,
+                tx_fs::sysfs::SYSFS_DIR_MODE,
+            ),
+            "sysfs",
+        ),
+        "tmpfs" | "vfat" => {
             let tmpfs = alloc::sync::Arc::new(tx_fs::tmpfs::Tmpfs::new());
-            let label = match fstype_str {
-                "vfat" => "vfat",
-                "sysfs" => "sysfs",
-                _ => "tmpfs",
+            let label = if fstype_str == "vfat" {
+                "vfat"
+            } else {
+                "tmpfs"
             };
             (
                 tmpfs.clone().fs_ops_arc(),
