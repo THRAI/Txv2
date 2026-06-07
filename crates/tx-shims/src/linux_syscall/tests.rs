@@ -1430,9 +1430,12 @@ fn dispatch_fcntl_unknown_cmd_returns_neg_enosys() {
     proc_cap.set_fd(3, Some(tx_fs::devfs::open_console_for_init()));
     let ctx = make_ctx(proc_cap, thread);
 
-    // F_GETLK = 5 (file locking) is not in any in-tree fcntl surface.
+    // 9999 is not a real fcntl command, so it must fall to the default
+    // ENOSYS arm. (F_GETLK = 5 used to stand in for "unknown command",
+    // but the POSIX record-lock surface now implements it, so a clearly
+    // unassigned command number is required here.)
     let r = block_on(dispatch::<ShimsTestPmap>(
-        SyscallRequest::new(NR_FCNTL, [3, 5, 0, 0, 0, 0]),
+        SyscallRequest::new(NR_FCNTL, [3, 9999, 0, 0, 0, 0]),
         &ctx,
     ));
     assert_eq!(r, SyscallResult::Error(38));

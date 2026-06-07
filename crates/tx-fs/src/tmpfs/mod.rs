@@ -35,7 +35,8 @@ use tx_subsystems::page_backed::{
 };
 use tx_subsystems::vfs::{
     Credential, DirCursor, DirEntry, FsObjectId, InlineName, InodeKind, InodeMeta, MountOutput,
-    RNode, RNodeBacking, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, S_ISGID, S_ISUID, VFS_NAME_MAX,
+    RNode, RNodeBacking, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK,
+    S_ISGID, S_ISUID, VFS_NAME_MAX,
 };
 
 /// Mode for the tmpfs root directory.
@@ -390,16 +391,29 @@ impl FsOps for Tmpfs {
             Ok(n) => n,
             Err(err) => return StepOutcome::err(err.into()),
         };
-        // Day-1 tmpfs only handles regular files via `create_inode`.
-        // Directories arrive through `mkdir`, symlinks through
-        // `symlink`. Reject anything else with `EINVAL`.
+        // `mknod(2)` file types. Directories and symlinks have their own
+        // entry points (`mkdir` / `symlink`); everything else — regular,
+        // FIFO, char/block device, socket — is created here with the
+        // S_IFMT-derived kind, matching the ext4 backend so e.g.
+        // `mkfifo(3)` works on a tmpfs cwd (LTP open11/lseek02/select01).
+        // Special nodes carry an (empty) page-cache container like a
+        // zero-length regular file; their kind drives open/stat/lseek.
         let kind_bits = mode & S_IFMT;
-        if kind_bits != 0 && kind_bits != S_IFREG {
-            return StepOutcome::err(step_engine::Errno::EINVAL);
-        }
-        let mode = (mode & !S_IFMT) | S_IFREG;
+        let kind = match kind_bits {
+            0 | S_IFREG => InodeKind::Regular,
+            S_IFIFO => InodeKind::Fifo,
+            S_IFCHR => InodeKind::CharDevice,
+            S_IFBLK => InodeKind::BlockDevice,
+            S_IFSOCK => InodeKind::Socket,
+            _ => return StepOutcome::err(step_engine::Errno::EINVAL),
+        };
+        let mode = if kind_bits == 0 {
+            (mode & !S_IFMT) | S_IFREG
+        } else {
+            mode
+        };
 
-        {
+        let (parent_setgid, parent_gid) = {
             let state = self.state.lock();
             let Some(parent_inode) = state.inodes.get(&parent) else {
                 return StepOutcome::err(step_engine::Errno::ENOENT);
@@ -410,7 +424,8 @@ impl FsOps for Tmpfs {
             if children.contains_key(&inline) {
                 return StepOutcome::err(step_engine::Errno::EEXIST);
             }
-        }
+            (parent_inode.meta.mode & S_ISGID != 0, parent_inode.meta.gid)
+        };
 
         let container = match PageContainer::new_cap(
             PageContainerKind::Anon {
@@ -434,9 +449,12 @@ impl FsOps for Tmpfs {
         // the actual content.
         container.set_size_bytes(0);
 
-        let mut meta = InodeMeta::new(InodeKind::Regular, mode);
+        let mut meta = InodeMeta::new(kind, mode);
         meta.uid = cred.uid;
-        meta.gid = cred.gid;
+        // System V S_ISGID-directory semantics: a new entry created in a
+        // set-group-ID directory inherits that directory's group instead
+        // of the caller's egid (LTP open10/creat08).
+        meta.gid = if parent_setgid { parent_gid } else { cred.gid };
         meta.size = 0;
 
         let mut state = self.state.lock();

@@ -20,7 +20,7 @@ use tx_hal::UserPtr;
 use tx_substrate::zone::PayloadCap;
 
 use super::structure::{
-    Credential, DirCursor, DirEntry, FsObjectId, InodeMeta, OpenFile, OpenFileBacking,
+    Credential, DirCursor, DirEntry, FsObjectId, InodeKind, InodeMeta, OpenFile, OpenFileBacking,
     OpenFileIoctl, OpenFileIoctlCaller, OpenFileIoctlResult, RNodeBacking, StructPayload,
 };
 use crate::mount::MountPayload;
@@ -535,7 +535,18 @@ impl OpenFile {
             RNodeBacking::Symlink { .. } | RNodeBacking::Projected { .. } => {
                 return StepOutcome::Err(Errno::ENOSYS)
             }
-            RNodeBacking::PageBacked { .. } => {}
+            RNodeBacking::PageBacked { .. } => {
+                // tmpfs/ext4 store FIFO and socket nodes with a
+                // zero-length page-cache container, but they are not
+                // seekable: lseek(2) on a FIFO/socket returns ESPIPE
+                // (LTP lseek02).
+                if matches!(
+                    self.rnode().meta().kind(),
+                    InodeKind::Fifo | InodeKind::Socket
+                ) {
+                    return StepOutcome::Err(Errno::ESPIPE);
+                }
+            }
         }
 
         // PageBacked branch: compute the new offset based on whence.

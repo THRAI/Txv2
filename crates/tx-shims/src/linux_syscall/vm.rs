@@ -304,6 +304,15 @@ pub(super) async fn sys_mmap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRes
             Some(f) => f,
             None => return SyscallResult::Error(EBADF_VALUE),
         };
+        // Linux file-mapping access checks (mm/mmap.c): every file
+        // mapping requires the descriptor be open for reading, and a
+        // writable shared mapping additionally requires write access.
+        if !file.flags().read {
+            return SyscallResult::error_from(Errno::EACCES);
+        }
+        if shared && (prot_bits & PROT_WRITE) != 0 && !file.flags().write {
+            return SyscallResult::error_from(Errno::EACCES);
+        }
         match extract_page_container(&file) {
             Some(pc) => VmBacking::Page {
                 pc: pc.into(),
@@ -1018,6 +1027,14 @@ pub(super) fn sys_madvise<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRe
         MADV_WILLNEED => MadviseAdvice::WillNeed,
         MADV_DONTNEED => MadviseAdvice::DontNeed,
         MADV_FREE => MadviseAdvice::Free,
+        // Advisory hints we do not act on yet — fork-inheritance
+        // (DONTFORK/DOFORK), KSM (MERGEABLE/UNMERGEABLE), THP
+        // (HUGEPAGE/NOHUGEPAGE), coredump (DONTDUMP/DODUMP),
+        // WIPEONFORK/KEEPONFORK, and COLD/PAGEOUT. These are valid
+        // Linux advices, so accept them as no-ops rather than failing
+        // (LTP madvise01). Values are the stable generic
+        // `<linux/mman.h>` numbers REMOVE(9)..PAGEOUT(21).
+        9..=21 => return SyscallResult::Return(0),
         _ => return SyscallResult::Error(ENOSYS_VALUE),
     };
     let range = match UserRange::new_aligned(UserVirtAddr::new(addr as usize), length) {

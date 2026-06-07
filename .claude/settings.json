@@ -12,5 +12,11 @@
         ]
       }
     ]
+  },
+  "permissions": {
+    "allow": [
+      "Bash(readelf *)",
+      "Bash(fc-list *)"
+    ]
   }
 }

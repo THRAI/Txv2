@@ -2022,7 +2022,22 @@ sched_get_priority_min01+sched_get_priority_min02+sched_rr_get_interval01+setpri
 wait402+wait02+wait01+shmat04+sendfile08_64+sendfile08+sendfile06_64+sendfile06+\
 sendfile05_64+sendfile05+semop04+semctl02+pidfd_open01+personality02+msgrcv08+\
 msgget01+mknod09+kill06+getsid02+getsid01+getppid02+getppid01+fork08+fork07+\
-fork03+exit02+setrlimit04+setrlimit05+clone07+clone06+clone05+clone03";
+fork03+exit02+setrlimit04+setrlimit05+clone07+clone06+clone05+clone03+\
+access03+brk01+brk02+capget02+chdir04+chmod05+chown03+clone04+clone302+close_range02+\
+creat04+epoll_create02+epoll_pwait02+epoll_pwait03+epoll_pwait05+epoll_wait04+execl01+execle01+execlp01+execv01+\
+execve01+execve02+execve05+execve06+execvp01+exit_group01+fchown01+fchown02+fchown03+fchown05+\
+fcntl36+fcntl36_64+fork04+getcpu01+getcwd02+geteuid02+gethostname01+getpagesize01+getrandom04+getuid03+\
+inotify_init1_01+inotify_init1_02+ioprio_get01+ioprio_set03+io_uring01+kill03+kill05+link02+llseek01+madvise02+\
+memfd_create02+memset01+mincore02+mincore03+mkdir04+msgctl02+msgsnd01+open02+open07+pathconf02+\
+pause01+pidfd_getfd01+pidfd_open04+pipe02+pipe07+pipe13+pipe2_02+pipe2_04+prctl02+prctl03+\
+prctl05+prctl08+readlink01+rename09+rmdir03+rt_sigsuspend01+sbrk01+sched_getparam01+sched_getparam03+sched_getscheduler01+\
+sched_getscheduler02+sched_rr_get_interval02+sched_rr_get_interval03+sched_setparam01+sched_setparam02+sched_setparam03+sched_setparam04+sched_setparam05+sched_setscheduler02+sched_setscheduler04+\
+semop03+setegid02+setgid02+setgroups01+setgroups02+setpgid03+setregid02+setresgid03+setresuid03+setresuid04+\
+setrlimit02+setrlimit03+shmctl07+shmdt01+sighold02+signal01+signal02+splice03+splice04+statfs02+\
+statfs02_64+tee02+tgkill03+tkill02+unshare02+vmsplice02+waitid04+waitid05+waitid06+waitpid06+\
+waitpid09+waitpid10+waitpid12+\
+fanotify04+fanotify08+write01+\
+clock_settime01+clock_settime02+settimeofday01+settimeofday02+stime01+stime02";
 
 // Positive-score cases selected from the Chronix LTP list and verified on the
 // current Txv2 images. These are not old-format tests, complete without a
@@ -2048,15 +2063,13 @@ symlinkat01+sysconf01+ulimit01";
 // cases above, then adds LA-only zero-score or hanging cases.
 #[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
 const LTP_LA_SUBMIT_EXCLUDED_CASES: &str = "\
-prot_hsymlinks+clone02+exit_group01+fallocate01+fallocate02+fchownat01+fcntl07+fcntl07_64+\
-fcntl09+fcntl09_64+fcntl10+fcntl10_64+fstatat01+get_robust_list01+kill02+\
-lchown01+lchown02+linkat01+mincore01+mkdirat01+mknod06+mknodat01+mlockall01+\
-mlockall03+mremap05+msync03+munmap03+open12+open13+openat02+readlink01+\
-rt_sigaction01+rt_sigaction02+rt_sigaction03+rt_sigprocmask02+sched_getattr02+\
-sched_setattr01+setresgid01+setrlimit01+setsid01+signalfd01+symlink03+\
-symlinkat01+sysconf01+ulimit01+gettid02+fcntl36_64+fcntl36+creat08+open10+\
-futex_wait03+pselect01+pselect01_64+fcntl34+fcntl34_64+mq_notify01+semop05+\
-chmod05+mknod05";
+prot_hsymlinks+clone02+fallocate01+fallocate02+fchownat01+fcntl07+fcntl07_64+fcntl09+fcntl09_64+fcntl10+\
+fcntl10_64+fstatat01+get_robust_list01+kill02+lchown01+lchown02+linkat01+mincore01+mkdirat01+mknod06+\
+mknodat01+mlockall01+mlockall03+mremap05+msync03+munmap03+open12+open13+openat02+rt_sigaction01+\
+rt_sigaction02+rt_sigaction03+rt_sigprocmask02+sched_getattr02+sched_setattr01+setresgid01+setrlimit01+setsid01+signalfd01+symlink03+\
+symlinkat01+sysconf01+ulimit01+gettid02+fcntl36_64+fcntl36+futex_wait03+pselect01+pselect01_64+fcntl34+\
+fcntl34_64+mq_notify01+semop05+mknod05+execve05+fcntl36+fcntl36_64+fork04+pipe02+sched_setscheduler04+\
+tgkill01+tgkill03+tkill02";
 
 #[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
 #[cfg_attr(target_arch = "loongarch64", allow(dead_code))]

@@ -1,0 +1,9 @@
+clock_settime01
+clock_settime02
+fanotify04
+fanotify08
+settimeofday01
+settimeofday02
+stime01
+stime02
+write01

@@ -1284,7 +1284,7 @@ pub(super) async fn sys_pselect6<'a, P: tx_hal::TimeIf>(
     args: [u64; 6],
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
-    use tx_subsystems::vfs::structure::{RNodeBacking, StructPayload};
+    use tx_subsystems::vfs::structure::{InodeKind, RNodeBacking, StructPayload};
 
     let nfds = args[0];
     let readfds = args[1];
@@ -1511,6 +1511,11 @@ pub(super) async fn sys_pselect6<'a, P: tx_hal::TimeIf>(
                                 false
                             }
                         }
+                        // Regular files are always ready for reading in
+                        // select/poll (POSIX); FIFOs/sockets/etc. are not.
+                        RNodeBacking::PageBacked { .. } => {
+                            matches!(file.rnode().meta().kind(), InodeKind::Regular)
+                        }
                         _ => false,
                     };
                     if readable {
@@ -1539,6 +1544,11 @@ pub(super) async fn sys_pselect6<'a, P: tx_hal::TimeIf>(
                                 );
                                 false
                             }
+                        }
+                        // Regular files are always ready for writing in
+                        // select/poll (POSIX).
+                        RNodeBacking::PageBacked { .. } => {
+                            matches!(file.rnode().meta().kind(), InodeKind::Regular)
                         }
                         _ => false,
                     };
@@ -1870,6 +1880,15 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         return sys_pipe_write_buffered(&tx, &bytes, file.flags().nonblocking, false, ctx).await;
     }
 
+    // POSIX: write(2) on a descriptor not opened for writing fails with
+    // EBADF (the FMODE_WRITE check). Covers read-only regular files, the
+    // read end of a pipe/FIFO, and read-only char/tty/null devices.
+    // Special fds with their own write semantics (eventfd, socket,
+    // socketpair, POSIX mq) are dispatched above and are opened RW.
+    if !file.flags().write {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+
     let len = if matches!(
         file.rnode().backing(),
         tx_subsystems::vfs::RNodeBacking::PageBacked { .. }
@@ -2152,6 +2171,15 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
             return SyscallResult::Return(0);
         }
         return sys_pipe_read_buffered(&rx, buf_ptr, len, file.flags().nonblocking, ctx).await;
+    }
+
+    // POSIX: read(2) on a descriptor not opened for reading fails with
+    // EBADF (the FMODE_READ check). Covers write-only regular files, the
+    // write end of a pipe/FIFO, and write-only char/tty devices. Special
+    // fds with their own read semantics (eventfd, socket, socketpair,
+    // POSIX mq) are dispatched above and are opened RW.
+    if !file.flags().read {
+        return SyscallResult::Error(EBADF_VALUE);
     }
 
     let len = if matches!(
@@ -2549,8 +2577,32 @@ pub(super) fn sys_fadvise64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
 
 pub(super) fn sys_readahead<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let fd = args[0] as i32;
-    if fd < 0 || resolve_fd(&ctx.process, fd as u32).is_none() {
+    if fd < 0 {
         return SyscallResult::Error(EBADF_VALUE);
+    }
+    let file = match resolve_fd(&ctx.process, fd as u32) {
+        Some(f) => f,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+    // readahead(2): EBADF if the descriptor is not open for reading
+    // (e.g. an `O_PATH` or write-only fd).
+    if !file.flags().read {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    // readahead(2): EINVAL unless the fd refers to a regular file (page
+    // cache backing). Directories, symlinks, FIFOs/pipes, sockets, char
+    // devices, and the anonymous fd kinds (eventfd, pidfd, …) all reject.
+    let regular = match file.backing() {
+        tx_subsystems::vfs::structure::OpenFileBacking::Rnode { rnode } => {
+            matches!(
+                rnode.backing(),
+                tx_subsystems::vfs::RNodeBacking::PageBacked { .. }
+            )
+        }
+        _ => false,
+    };
+    if !regular {
+        return SyscallResult::Error(EINVAL_VALUE);
     }
     SyscallResult::Return(0)
 }
