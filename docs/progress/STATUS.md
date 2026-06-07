@@ -1,3 +1,24 @@
+- 2026-06-07 **Dimension B: veth/`ip link add` hang FIXED (socket read/write lane re-homed,
+  `a01ed8f6`); next gate is the clone/setns/nsfs netns chain.** The "veth livelock" hypothesis was
+  WRONG. A per-syscall trace (temporary instrumentation, since removed) showed busybox `ip` for veth
+  does: socket→bind→getsockname→clock_gettime→**write()**, and the write() never returns. Root cause:
+  the rebase dropped the entire **socket lane from `read(2)`/`write(2)`** in `tx-shims/.../io.rs` —
+  busybox sends RTM_NEWLINK via write() on the AF_NETLINK fd (not sendmsg), and with no socket-send
+  routing the write fell into the VFS rnode op and parked forever (`DriveMode::Waiting`). Re-homed
+  `sys_write_socket`/`sys_read_socket` (netlink send/recv + UDP-loopback inline + general
+  step_send/step_recv loop) + the `SOCKET_IO_MAX_INLINE` const from the pre-rebase tree; route socket
+  fds to them in sys_write/sys_read. **Verified clean-kernel:** iproute no longer hangs — runs past
+  veth through init_ltp_netspace into the subtests and returns a result (was: infinite hang at the
+  first setup step). This also de-risks batches (a hung veth no longer blocks following tests).
+  **Next blocker (precise):** `tst_ns_create.c:83: TBROK: clone failed: EINVAL (22)` — `sys_clone`'s
+  `allowed_mask` (proc.rs:702) excludes `CLONE_NEWNET|CLONE_NEWNS`. Restoring full netns needs a larger
+  multi-component re-home the rebase dropped: (1) clone allowed_mask + SYS_ADMIN cap check; (2) extend
+  `ForkOp`/`ForkOptions`/`step_fork` (tx-subsystems) with clone_newnet/clone_newns to create+assign
+  child net+mnt namespaces; (3) **`sys_setns` — absent in HEAD** (tst_ns_exec needs it); (4)
+  **`/proc/<pid>/ns/net` nsfs nodes — absent in HEAD** (the `ln -s /proc/$pid/ns/net` step). All exist
+  in `feature-network-backup-before-main-rebase-20260605`. Until that lands, the 29 command-layer tests
+  reach the subtests but fail (rhost-side commands run via netns). Probe: `target/oscomp/run_net_trace.sh`.
+
 - 2026-06-07 **Dimension B command-layer blocker ROOT-CAUSED to a single veth regression (not a
   "deep infra stack").** Drove the 29 shell/command-layer entries (net.tcp_cmds 16 + net.ipv6 11 +
   net.multicast 2) to one precise gate via `tx.ltp.trace_runtime=1` (boots the case under `sh -x`).
