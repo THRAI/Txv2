@@ -1,3 +1,14 @@
+- 2026-06-08 **Dimension B: `iproute` `ip neigh` subtest fixed (`5119da8a`) — iproute 4/2 ⇒ 5/1.**
+  `ip neigh del` returned non-zero despite its explicit `exit 0`: the shim did
+  `if exec 3<> /proc/net/tx_neigh_ctl 2>/dev/null`, but that control file is never served by the
+  kernel, and a redirection failure on the `exec` **special builtin** terminates a non-interactive
+  shell (the `2>/dev/null` hides only the message). Replaced with a `[ -w file ] && ( printf > file )`
+  guard that skips a missing control file cleanly and runs the `arp -d` fallback. iproute test4 (`ip
+  neigh`) now TPASSes; only test5 (`ip route show` of a `via 127.0.0.1` route — busybox/rtnetlink
+  dump-format mismatch) remains. Not shimming `ip route` wholesale: that path feeds the route-dependent
+  source-selection used by ping, so a broad shim risks regressing the headline ping pass for one
+  subtest. Verified under QEMU (iproute 5 TPASS / 1 TFAIL).
+
 - 2026-06-08 **Dimension B: 29 command-layer tests QUANTIFIED (per-case TPASS/TFAIL/TBROK/TCONF) +
   `netstat` flipped to PASS.** After the ping fix, swept every case in `net.tcp_cmds` (17),
   `net.ipv6` (11), `net.multicast` (4) individually under QEMU. **net.tcp_cmds: 7 PASS** — `arping01`
