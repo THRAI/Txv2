@@ -1,5 +1,28 @@
+- 2026-06-07 **Dimension B command-layer HANG ROOT-CAUSED + FIXED — it was a procfs id-collision bug,
+  NOT a shell/waitpid gap (`1d20fcaf`).** The prior "shell background-job/waitpid" theory below was
+  WRONG. A per-syscall console probe proved the watchdog (pid 218) runs fine end-to-end: `execve`
+  tst_timeout_kill → `setpgid(0,0)` → `nanosleep`, alive & sleeping, never signalled, never reaped.
+  The actual bug: LTP's `_tst_setup_timer` polls `/proc/<watchdog>/stat` field-3 for "S", but reading
+  `/proc/<pid>/stat` for **any pid >= 2** returned **-ESRCH**. `tx-fs/procfs/mod.rs` packed the per-pid
+  scalar files as `PROCFS_PID_BASE + pid + {0x10000 stat, 0x10001 cmdline, 0x10002 mem, 0x10003 maps,
+  0x10004 exe}` but each decoder matched a 0x10000-wide window → the windows overlapped completely
+  (`pid_stat_id(N) == pid_mem_id(N-2)`), so `/proc/218/stat` decoded as `/proc/216/mem` (216 reaped) →
+  -ESRCH. `/proc/1/stat` worked only because `pid_stat_id(1)` fell just below the mem window;
+  `/proc/<pid>/status` worked (separate high base). **Fix:** gave stat/cmdline/mem/maps/exe each a
+  distinct widely-spaced id region (`PROCFS_{STAT,CMDLINE,MEM,MAPS,EXE}_BASE`, one 4 GiB span per type)
+  so `id = base + pid` never aliases across types or pids, with bound-checked decoders. **Verified
+  under QEMU:** `/proc/218/stat` → `218 (tst_timeout_kil) S 14 218 1`; the iproute timer poll breaks
+  and the test runs all 6 subtests to completion (3 TPASS / 3 TFAIL) then `kill(pid,SIGTERM)` cleanup
+  succeeds. This unblocks the `_tst_setup_timer` gate for **every** net.* command-layer test.
+  **Remaining failures are subtest-level (NOT the infra hang):** e.g. iproute's MTU check
+  (`/sys/class/net/eth0/mtu` absent — `mount -t sysfs none /sys` is ENOSYS so /sys/class/net is
+  unpopulated), `ip neigh del`, `ip route show`; plus the persistent TCG runtime wall (~140s setup/test).
+  All debug instrumentation removed; only `crates/tx-fs/src/procfs/mod.rs` changed.
+
 - 2026-06-07 **Dimension B netns chain FULLY RESTORED — LTP `init_ltp_netspace` + tst_net setup now
-  complete end-to-end; remaining blocker is shell background-job scheduling + TCG runtime.** Steps 2-4
+  complete end-to-end; remaining blocker is shell background-job scheduling + TCG runtime.** (Superseded
+  by the procfs-id-collision entry above — the "shell background-job/waitpid gap" diagnosis was wrong.)
+  Steps 2-4
   landed: `/proc/<pid>/ns/{net,mnt}` nsfs nodes + `setns` (NR_SETNS) + `/var/run`/`/sys` (`fac21e21`);
   `ppoll(nfds=0)` honors timeout so `pause()` blocks (`427c5b1b`) — that fixed the `tst_ns_create`
   daemon child persisting (`setsid`+`pause` to hold the ns); and `/proc/<pid>/stat` reports `'S'` for
