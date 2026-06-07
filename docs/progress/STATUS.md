@@ -1,3 +1,22 @@
+- 2026-06-08 **Dimension B: `ipneigh01_ip` + `ipneigh6_ip` PASS — re-homed `/proc/net/tx_neigh` +
+  added IPv4 neighbor learning (`35438956`).** LTP ipneigh01 (`ip` variant) pings a peer, expects
+  `ip neigh show` to list the auto-created entry, then `ip neigh del` to drop it. Our synthetic echo
+  never did real ARP and the PR#50 re-home dropped `/proc/net/tx_neigh` (read by the `ip neigh` shim),
+  so the entry never appeared. Fix: (1) `send_configured_icmpv4_echo` calls a new
+  `learn_configured_icmpv4_neighbor` (mirrors the IPv6 learn) — installs the pinged dst's configured
+  peer MAC as a static ARP on the sending link; (2) procfs serves `/proc/net/tx_neigh` (rendered from
+  the root-netns neighbor table) + `/proc/net/tx_neigh_ctl` (write `<addr> <dev>` →
+  `net::delete_neighbor_ctl`, which parses v4/v6 and removes the static ARP/NDISC). **Verified:**
+  ipneigh01_ip 1/0, ipneigh6_ip 1/0; iproute still 5/1 (its `ip neigh` subtest still TPASS), ping01
+  still 10/0 — no regressions. **Still open:** `ipneigh01_arp` (the `arp` variant uses busybox
+  `arp -an`/`arp -d` → needs `/proc/net/arp` served + SIOCDARP delete, separate from tx_neigh).
+
+  **Session tally — 9 NEW net tests PASS:** ping01, ping02 (IPv4 itimer/SIGALRM), netstat (-rn shim),
+  ping601, ping602 (IPv6 restore), tracepath601, tcpdump601 (unblocked by IPv6 restore), ipneigh01_ip,
+  ipneigh6_ip (neigh). Plus iproute 4/6→5/6. Remaining tractable: ipneigh01_arp (/proc/net/arp +
+  SIOCDARP), traceroute01/601 `-T` TCP mode, iproute test5 (`ip route show`), iptables/nft & ip6tables/
+  nft6 netfilter coverage; environmental (TBROK/daemons, TCG runtime) for the rest.
+
 - 2026-06-08 **Dimension B: IPv6 STACK RESTORED — net.ipv6 was uniformly TCONF because the PR#50 net
   re-home DROPPED the IPv6 procfs glue; ping601/ping602 now PASS (10/0 each).** The pre-rebase backup
   (`feature-network-backup-before-main-rebase-20260605`) served `/proc/net/if_inet6` +
