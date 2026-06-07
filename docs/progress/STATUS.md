@@ -1,3 +1,18 @@
+- 2026-06-07 **Dimension B: two setup-gate fixes land — net.* command tests now RUN their subtests
+  (`1d20fcaf` procfs id-collision, `41d76a4d` mount).** After the procfs fix unblocked the
+  `_tst_setup_timer` "S" poll, the next gate was `init_ltp_netspace`'s `mount --make-rprivate /sys` +
+  `mount -t sysfs none /sys` — both `_ => ENOSYS` in `sys_mount` (propagation flag-changes fell through
+  with empty fstype; sysfs had no arm) → ROD → TBROK for every tst_net.sh-framework test. Fix: mount
+  propagation changes (MS_SHARED/PRIVATE/SLAVE/UNBINDABLE) are no-op success (no propagation-tree
+  model), and `sysfs` mounts as a tmpfs stub. **Verified:** ping01 now passes setup and runs its ping
+  subtests (was TBROK at the mount). **Per-feature gaps that remain (NOT setup hangs) — these are the
+  real work to re-pass the 29:** (1) **sysfs `/sys/class/net/<iface>/{address,mtu}` unpopulated** —
+  the stub tmpfs has no entries, so iproute's MTU check and ping01's address read fail/TBROK; (2)
+  **ICMP ping over the veth pair fails** — `ping -c 3 10.0.0.1` from lhost to the netns rhost gets no
+  reply (ping01: 10 TFAIL); (3) **`ip neigh del` / `ip route show`** subtest gaps (iproute). iproute
+  currently scores 3 TPASS / 3 TFAIL; ping01 0 TPASS / 10 TFAIL / 1 TBROK. The setup hang that blocked
+  ALL 29 is gone; remaining failures are these per-feature gaps + the TCG runtime wall.
+
 - 2026-06-07 **Dimension B command-layer HANG ROOT-CAUSED + FIXED — it was a procfs id-collision bug,
   NOT a shell/waitpid gap (`1d20fcaf`).** The prior "shell background-job/waitpid" theory below was
   WRONG. A per-syscall console probe proved the watchdog (pid 218) runs fine end-to-end: `execve`
