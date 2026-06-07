@@ -196,6 +196,7 @@ pub struct CoreInit<P: TxPlatform> {
 
 mod exec;
 mod helpers;
+mod net;
 mod reactor_submit;
 
 impl<P: TxPlatform> CoreInit<P> {
@@ -307,6 +308,11 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::populate_rootfs_network_databases();
             Self::init_csprng();
             Self::bind_init_cwd_and_root();
+            // Boot net bring-up: publish the boot net device (virtio-net0) into
+            // the initial namespace so it is enumerable (if_nametoindex etc.) and
+            // submit the net delegate/deadline runtime tasks. PR#50 dropped this
+            // call; without it only `lo` exists in the namespace (in6_02 etc.).
+            Self::submit_net_runtime_tasks();
 
             // Deferred H4 spine slots:
             // - post-substrate init hooks
