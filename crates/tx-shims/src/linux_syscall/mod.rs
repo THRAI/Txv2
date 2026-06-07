@@ -286,6 +286,10 @@ pub use numbers::{NR_GETITIMER, NR_SETITIMER};
 /// across multiple write calls until the userspace-VA copy lane lands.
 pub const TTY_WRITE_MAX_INLINE: usize = 4096;
 
+/// Maximum bytes staged per inline socket `read(2)`/`write(2)` step (re-homed
+/// from the pre-rebase net tree; the rebase dropped it with the socket I/O lane).
+pub const SOCKET_IO_MAX_INLINE: usize = 64 * 1024;
+
 /// Maximum path-name length accepted by `execve(2)` (Linux's
 /// `PATH_MAX`). Mirrors the `TTY_WRITE_MAX_INLINE = 4096` discipline
 /// for inline buffer copies. A longer path returns `-ENAMETOOLONG`

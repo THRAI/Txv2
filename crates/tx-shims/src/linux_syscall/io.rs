@@ -1305,6 +1305,15 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         }
     }
 
+    // Socket fds carry their own `write(2)` arm — busybox's `ip` sends
+    // RTM_NEWLINK via write() on the AF_NETLINK socket (not sendmsg), and
+    // programs may write() on connected TCP/UDP sockets. Route to the socket
+    // send path; without this a socket write falls into the VFS `step_write`
+    // op and parks forever (the dimension-B `ip link add type veth` hang).
+    if let Some(socket) = file.socket_identity().cloned() {
+        return sys_write_socket(&file, socket, &bytes, ctx).await;
+    }
+
     sys_write_buffered(&file, &bytes, ctx).await
 }
 
@@ -1358,6 +1367,412 @@ async fn sys_write_buffered<'a>(
             }
             SyscallResult::error_from(errno)
         }
+    }
+}
+
+// ── Socket read/write lane ────────────────────────────────────────────────
+// Re-homed from the pre-rebase net tree: `read(2)`/`write(2)` on a socket fd
+// must route to the netlink/UDP-loopback/general socket send/recv paths. The
+// rebase dropped this lane, so socket I/O via read/write fell into the VFS
+// rnode op and parked forever (e.g. busybox `ip link add type veth` sending
+// RTM_NEWLINK via write()).
+
+async fn sys_write_socket(
+    file: &Cap<OpenFile>,
+    socket: Cap<tx_subsystems::net::SocketIdentity>,
+    bytes: &[u8],
+    ctx: &SyscallCtx<'_>,
+) -> SyscallResult {
+    if bytes.is_empty() {
+        return SyscallResult::Return(0);
+    }
+
+    let mut flags = tx_subsystems::net::SendRecvFlags::empty();
+    if file.flags().nonblocking {
+        flags |= tx_subsystems::net::SendRecvFlags::MSG_DONTWAIT;
+    }
+
+    if udp_write_can_drive_loopback_inline(&socket) {
+        return sys_write_udp_loopback_socket(&socket, bytes, flags).await;
+    }
+
+    if matches!(
+        socket.kind,
+        tx_subsystems::net::SocketKind::NetlinkRoute
+            | tx_subsystems::net::SocketKind::NetlinkXfrm
+            | tx_subsystems::net::SocketKind::NetlinkNetfilter
+    ) {
+        let mut resolve_netns_fd = |fd: i32| {
+            if fd < 0 {
+                return None;
+            }
+            let file = resolve_fd(&ctx.process, fd as u32)?;
+            tx_subsystems::net::net_namespace_payload_from_file(&file)
+        };
+        let mut resolve_netns_pid = |pid: u32| {
+            let process = process_by_pid(Pid(pid))?;
+            process.net_namespace()
+        };
+        let result = match socket.kind {
+            tx_subsystems::net::SocketKind::NetlinkRoute => {
+                tx_subsystems::net::netlink_route_send_with_netns_resolvers(
+                    &socket,
+                    bytes,
+                    ctx.cred(),
+                    &mut resolve_netns_fd,
+                    &mut resolve_netns_pid,
+                )
+            }
+            tx_subsystems::net::SocketKind::NetlinkXfrm => {
+                tx_subsystems::net::netlink_xfrm_send(&socket, bytes, ctx.cred())
+            }
+            tx_subsystems::net::SocketKind::NetlinkNetfilter => {
+                tx_subsystems::net::netlink_netfilter_send(&socket, bytes, ctx.cred())
+            }
+            _ => unreachable!(),
+        };
+        return match result {
+            Ok(sent) => SyscallResult::Return(sent as i64),
+            Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+        };
+    }
+
+    let mut total = 0usize;
+    let mut remaining = bytes;
+
+    loop {
+        let outcome = {
+            let guard = tx_substrate::epoch::guard();
+            tx_subsystems::net::execution::step_send_kernel_bytes(&socket, remaining, flags, &guard)
+        };
+        match outcome {
+            tx_substrate::step::StepOutcome::Done(written) => {
+                total += written;
+                drive_loopback_after_socket_write(&socket, written);
+                yield_after_socket_write_if_needed(&socket, written).await;
+                return SyscallResult::Return(total as i64);
+            }
+            tx_substrate::step::StepOutcome::Continue { progress } => {
+                let written = progress.bytes();
+                total += written;
+                drive_loopback_after_socket_write(&socket, written);
+                let stop = written == 0 || written >= remaining.len();
+                if stop {
+                    yield_after_socket_write_if_needed(&socket, written).await;
+                    return SyscallResult::Return(total as i64);
+                }
+                yield_after_socket_write_if_needed(&socket, written).await;
+                remaining = &remaining[written..];
+            }
+            tx_substrate::step::StepOutcome::Yield { progress, shape } => {
+                let written = progress.bytes();
+                if written > 0 {
+                    total += written;
+                    drive_loopback_after_socket_write(&socket, written);
+                    if written >= remaining.len() {
+                        yield_after_socket_write_if_needed(&socket, written).await;
+                        return SyscallResult::Return(total as i64);
+                    }
+                    yield_after_socket_write_if_needed(&socket, written).await;
+                    remaining = &remaining[written..];
+                } else if flags.is_nonblocking() {
+                    if total > 0 {
+                        return SyscallResult::Return(total as i64);
+                    }
+                    return SyscallResult::Error(EAGAIN_VALUE);
+                } else {
+                    drive_loopback_pending();
+                }
+
+                match shape {
+                    tx_substrate::step::YieldShape::OnWaitSource { source, interests }
+                    | tx_substrate::step::YieldShape::OnEdge { source, interests } => {
+                        let token =
+                            tx_subsystems::execution::WaitToken::new(source.raw(), interests.raw());
+                        if let Some(future) = tx_subsystems::wait_source::wait_on_token(token) {
+                            let _ = future.await;
+                        }
+                    }
+                    tx_substrate::step::YieldShape::OnAgent { .. }
+                    | tx_substrate::step::YieldShape::OnTimer { .. } => {
+                        if total > 0 {
+                            return SyscallResult::Return(total as i64);
+                        }
+                        return SyscallResult::Error(errno_to_i32(Errno::EIO));
+                    }
+                }
+            }
+            tx_substrate::step::StepOutcome::Err(errno) => {
+                if total > 0 {
+                    return SyscallResult::Return(total as i64);
+                }
+                return SyscallResult::Error(errno_to_i32(errno));
+            }
+        }
+    }
+}
+
+async fn sys_write_udp_loopback_socket(
+    socket: &Cap<tx_subsystems::net::SocketIdentity>,
+    bytes: &[u8],
+    flags: tx_subsystems::net::SendRecvFlags,
+) -> SyscallResult {
+    loop {
+        let outcome = {
+            let guard = tx_substrate::epoch::guard();
+            tx_subsystems::net::execution::step_send_udp_loopback_kernel_bytes(
+                socket, None, bytes, flags, &guard,
+            )
+        };
+        match outcome {
+            tx_substrate::step::StepOutcome::Done(written) => {
+                return SyscallResult::Return(written as i64);
+            }
+            tx_substrate::step::StepOutcome::Continue { progress } => {
+                return SyscallResult::Return(progress.bytes() as i64);
+            }
+            tx_substrate::step::StepOutcome::Yield { progress, shape } => {
+                if progress.bytes() > 0 {
+                    return SyscallResult::Return(progress.bytes() as i64);
+                }
+                if flags.is_nonblocking() {
+                    return SyscallResult::Error(EAGAIN_VALUE);
+                }
+                match shape {
+                    tx_substrate::step::YieldShape::OnWaitSource { source, interests }
+                    | tx_substrate::step::YieldShape::OnEdge { source, interests } => {
+                        let token =
+                            tx_subsystems::execution::WaitToken::new(source.raw(), interests.raw());
+                        if let Some(future) = tx_subsystems::wait_source::wait_on_token(token) {
+                            let _ = future.await;
+                        }
+                    }
+                    tx_substrate::step::YieldShape::OnAgent { .. }
+                    | tx_substrate::step::YieldShape::OnTimer { .. } => {
+                        return SyscallResult::Error(EIO_VALUE);
+                    }
+                }
+            }
+            tx_substrate::step::StepOutcome::Err(errno) => {
+                return SyscallResult::Error(errno_to_i32(errno));
+            }
+        }
+    }
+}
+
+fn udp_write_can_drive_loopback_inline(socket: &Cap<tx_subsystems::net::SocketIdentity>) -> bool {
+    if socket.kind != tx_subsystems::net::SocketKind::Udp {
+        return false;
+    }
+    let Some(payload) = socket.acquire_operational() else {
+        return false;
+    };
+    match payload.protocol_snapshot() {
+        tx_subsystems::net::SocketProtocol::Udp(tx_subsystems::net::UdpInner::Connected {
+            local,
+            remote,
+        }) => {
+            udp_local_allows_loopback_inline(local)
+                && remote.addr == tx_subsystems::net::Ipv4Address::LOOPBACK
+        }
+        _ => false,
+    }
+}
+
+fn udp_local_allows_loopback_inline(local: tx_subsystems::net::IpEndpoint) -> bool {
+    local.addr == tx_subsystems::net::Ipv4Address::UNSPECIFIED
+        || local.addr == tx_subsystems::net::Ipv4Address::LOOPBACK
+}
+
+async fn yield_after_socket_write_if_needed(
+    socket: &Cap<tx_subsystems::net::SocketIdentity>,
+    written: usize,
+) {
+    if written > 0
+        && matches!(
+            socket.kind,
+            tx_subsystems::net::SocketKind::Tcp | tx_subsystems::net::SocketKind::Sctp
+        )
+    {
+        tx_reactor::yield_now().await;
+    }
+}
+
+fn drive_loopback_after_socket_write(
+    socket: &Cap<tx_subsystems::net::SocketIdentity>,
+    written: usize,
+) {
+    drive_tcp_loopback_after_socket_write(socket, written);
+    drive_udp_loopback_after_socket_write(socket, written);
+}
+
+fn drive_tcp_loopback_after_socket_write(
+    socket: &Cap<tx_subsystems::net::SocketIdentity>,
+    written: usize,
+) {
+    if written == 0 {
+        return;
+    }
+    let guard = tx_substrate::epoch::guard();
+    let _ = tx_subsystems::net::execution::step_tcp_loopback_transfer(socket, written, &guard);
+    socket
+        .readiness
+        .clear_send(tx_subsystems::net::structure::SendWireSet::SPACE);
+}
+
+fn drive_udp_loopback_after_socket_write(
+    socket: &Cap<tx_subsystems::net::SocketIdentity>,
+    written: usize,
+) {
+    if written == 0 {
+        return;
+    }
+    let Some(payload) = socket.acquire_operational() else {
+        return;
+    };
+    if !matches!(
+        payload.protocol_snapshot(),
+        tx_subsystems::net::SocketProtocol::Udp(
+            tx_subsystems::net::UdpInner::Bound { .. }
+                | tx_subsystems::net::UdpInner::Connected { .. }
+        )
+    ) {
+        return;
+    }
+    let guard = tx_substrate::epoch::guard();
+    let _ = tx_subsystems::net::execution::step_process_loopback_udp(socket, 8, &guard);
+}
+
+async fn sys_read_socket<'a>(
+    file: &Cap<OpenFile>,
+    socket: Cap<tx_subsystems::net::SocketIdentity>,
+    buf_ptr: u64,
+    len: usize,
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
+    let mut flags = tx_subsystems::net::SendRecvFlags::empty();
+    if file.flags().nonblocking {
+        flags |= tx_subsystems::net::SendRecvFlags::MSG_DONTWAIT;
+    }
+    let mut staging: alloc::vec::Vec<u8> = alloc::vec![0u8; len.min(SOCKET_IO_MAX_INLINE)];
+
+    if matches!(
+        socket.kind,
+        tx_subsystems::net::SocketKind::NetlinkRoute
+            | tx_subsystems::net::SocketKind::NetlinkXfrm
+            | tx_subsystems::net::SocketKind::NetlinkNetfilter
+    ) {
+        loop {
+            let result = match socket.kind {
+                tx_subsystems::net::SocketKind::NetlinkRoute => {
+                    tx_subsystems::net::netlink_route_recv(&socket, &mut staging, flags)
+                }
+                tx_subsystems::net::SocketKind::NetlinkXfrm => {
+                    tx_subsystems::net::netlink_xfrm_recv(&socket, &mut staging, flags)
+                }
+                tx_subsystems::net::SocketKind::NetlinkNetfilter => {
+                    tx_subsystems::net::netlink_netfilter_recv(&socket, &mut staging, flags)
+                }
+                _ => unreachable!(),
+            };
+            match result {
+                Ok(recv) => {
+                    if recv > 0 {
+                        if let Err(errno) =
+                            bootstrap_copy_to_user(&ctx.aspace, buf_ptr, &staging[..recv])
+                        {
+                            return SyscallResult::Error(errno_to_i32(errno));
+                        }
+                    }
+                    return SyscallResult::Return(recv as i64);
+                }
+                Err(tx_subsystems::execution::Errno::EAGAIN) if !flags.is_nonblocking() => {
+                    let wait_token = {
+                        let guard = tx_substrate::epoch::guard();
+                        super::socket::socket_poll_wait_token_from_file(
+                            file,
+                            tx_subsystems::net::PollMask::IN,
+                            &guard,
+                        )
+                    };
+                    match wait_token {
+                        Some(Ok(Some(token))) => {
+                            if let Some(future) = tx_subsystems::wait_source::wait_on_token(token) {
+                                let _ = future.await;
+                            } else {
+                                return SyscallResult::Error(EIO_VALUE);
+                            }
+                        }
+                        Some(Ok(None)) | None => return SyscallResult::Error(EAGAIN_VALUE),
+                        Some(Err(errno)) => return SyscallResult::Error(errno_to_i32(errno)),
+                    }
+                }
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            }
+        }
+    }
+
+    loop {
+        drive_loopback_pending();
+        let outcome = {
+            let guard = tx_substrate::epoch::guard();
+            tx_subsystems::net::execution::step_recv_kernel_bytes(
+                &socket,
+                &mut staging,
+                flags,
+                &guard,
+            )
+        };
+        match outcome {
+            tx_substrate::step::StepOutcome::Done(recv) => {
+                if recv.bytes > 0 {
+                    if let Err(errno) =
+                        bootstrap_copy_to_user(&ctx.aspace, buf_ptr, &staging[..recv.bytes])
+                    {
+                        return SyscallResult::Error(errno_to_i32(errno));
+                    }
+                }
+                yield_after_socket_read_if_needed(&socket, recv.bytes).await;
+                return SyscallResult::Return(recv.bytes as i64);
+            }
+            tx_substrate::step::StepOutcome::Yield { shape, .. } => {
+                if flags.is_nonblocking() {
+                    return SyscallResult::Error(EAGAIN_VALUE);
+                }
+                match shape {
+                    tx_substrate::step::YieldShape::OnWaitSource { source, interests }
+                    | tx_substrate::step::YieldShape::OnEdge { source, interests } => {
+                        let token =
+                            tx_subsystems::execution::WaitToken::new(source.raw(), interests.raw());
+                        if let Some(future) = tx_subsystems::wait_source::wait_on_token(token) {
+                            let _ = future.await;
+                        }
+                    }
+                    tx_substrate::step::YieldShape::OnAgent { .. }
+                    | tx_substrate::step::YieldShape::OnTimer { .. } => {
+                        return SyscallResult::Error(errno_to_i32(Errno::EIO));
+                    }
+                }
+            }
+            tx_substrate::step::StepOutcome::Continue { .. } => {}
+            tx_substrate::step::StepOutcome::Err(errno) => {
+                return SyscallResult::Error(errno_to_i32(errno));
+            }
+        }
+    }
+}
+
+async fn yield_after_socket_read_if_needed(
+    socket: &Cap<tx_subsystems::net::SocketIdentity>,
+    bytes: usize,
+) {
+    if bytes > 0
+        && matches!(
+            socket.kind,
+            tx_subsystems::net::SocketKind::Tcp | tx_subsystems::net::SocketKind::Sctp
+        )
+    {
+        tx_reactor::yield_now().await;
     }
 }
 
@@ -1511,6 +1926,13 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
             return SyscallResult::Return(0);
         }
         return sys_pipe_read_buffered(&rx, buf_ptr, len, file.flags().nonblocking, ctx).await;
+    }
+
+    // Socket fds carry their own `read(2)` arm (netlink ACK/dump replies, and
+    // byte-stream reads on connected TCP sockets). Route to the socket recv
+    // path before the VFS rnode lane, which would park forever for a socket.
+    if let Some(socket) = file.socket_identity().cloned() {
+        return sys_read_socket(&file, socket, buf_ptr as u64, len, ctx).await;
     }
 
     let len = if matches!(
