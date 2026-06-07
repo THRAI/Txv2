@@ -1,3 +1,26 @@
+- 2026-06-07 **Dimension B command-layer blocker ROOT-CAUSED to a single veth regression (not a
+  "deep infra stack").** Drove the 29 shell/command-layer entries (net.tcp_cmds 16 + net.ipv6 11 +
+  net.multicast 2) to one precise gate via `tx.ltp.trace_runtime=1` (boots the case under `sh -x`).
+  All 29 share LTP's `init_ltp_netspace` setup (tst_net.sh:170; single-qemu → always `TST_USE_NETNS=yes`).
+  Trace shows it hangs at the FIRST setup step: **`ip link add name ltp_ns_veth1 type veth peer name
+  ltp_ns_veth2`** — `tst_check_drivers veth` passes, then the veth-pair create begins and never returns
+  (busybox `ip` → netlink `RTM_NEWLINK type=veth`, synchronous send). `ip link add type dummy` works
+  on the same path, so it's veth-specific. **This is a genuine regression, not missing infra:** the
+  Jun-4 witness `ltp-net-tcp-cmds-iproute-after-maddr-change-360s.txt` shows `init_ltp_netspace` fully
+  working then (veth created + moved into netns: "initialize 'rhost' 'ltp_ns_veth1'", "eth0 --
+  ltp_ns_veth1", 5/6 subtests TPASS). And the **net device/rtnetlink module is byte-identical to the
+  Jun-5 backup** (`git diff` HEAD..backup over net/ = only an unrelated `OpenFileFlags{packet}` rebase
+  field) — so the break is in the **rebased main's environment interaction with veth**, NOT the net code.
+  Leading hypothesis: single-core **livelock** — the net delegate self-re-arms via `net_delegate_kick_poll()`
+  (delegate/runtime.rs:234/255/267/273) whenever a step reports progress; an always-ready veth in a
+  namespace runtime can make `drive_all_net_namespace_runtimes_at` report progress every tick → delegate
+  monopolizes the reactor → busybox's veth `sendmsg` starves (same livelock class as route4). NOT yet
+  confirmed vs a lost-wakeup block; needs one instrumented rebuild (console print needs P-threading into
+  rtnetlink/delegate, or a counter in init/net.rs). Probe scripts: `target/oscomp/run_net_trace.sh`.
+  Earlier "deep deferred infra stack" framing was too pessimistic — kernel already has veth create +
+  IFLA_NET_NS_PID ifmove + setns/unshare; the helpers (tst_ns_*) delegate to real LTP C binaries on the
+  image. Fixing this ONE veth-livelock should unblock most/all 29.
+
 - 2026-06-07 **Dimension B (net.*) regression assessed complete; C-based groups restored,
   shell/command-layer blocked by one deep deferred infra stack.** To enable the suites,
   re-homed more PR#50-dropped surface: **populate_rootfs_network_databases** (`842397d0`:
