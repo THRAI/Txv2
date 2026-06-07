@@ -70,10 +70,27 @@ pub const PROCFS_SYS_KERNEL_ID: FsObjectId = FsObjectId::new(0x7072_6F0C);
 pub const PROCFS_SYS_KERNEL_TAINTED_ID: FsObjectId = FsObjectId::new(0x7072_6F0D);
 pub const PROCFS_SYS_KERNEL_PID_MAX_ID: FsObjectId = FsObjectId::new(0x7072_6F0E);
 const PROCFS_PID_BASE: u64 = 0x7072_0000;
-const PROCFS_STAT_OFFSET: u64 = 0x10000;
-const PROCFS_MEM_OFFSET: u64 = 0x10002;
-const PROCFS_MAPS_OFFSET: u64 = 0x10003;
-const PROCFS_EXE_OFFSET: u64 = 0x10004;
+// `/proc/<pid>` directory ids occupy [PROCFS_PID_BASE, PROCFS_PID_BASE + PROCFS_PID_DIR_LIMIT).
+const PROCFS_PID_DIR_LIMIT: u64 = 0x10000;
+// Per-pid scalar pseudo-files (stat/cmdline/mem/maps/exe). Each file type owns a
+// distinct region wide enough for any u32 pid (PROCFS_PID_FILE_SPAN), and the
+// regions are spaced far apart so `id = base + pid` never aliases across types or
+// pids.
+//
+// The earlier scheme packed these at `PROCFS_PID_BASE + pid + {0x10000, 0x10002,
+// 0x10003, 0x10004}` with decoders that matched a 0x10000-wide window. Because the
+// per-type offsets were only 1–4 apart while pid is added directly, the windows
+// overlapped completely: `pid_stat_id(N) == pid_mem_id(N-2)`, etc. Reading
+// `/proc/<pid>/stat` for any pid >= 2 therefore decoded as `/proc/<pid-2>/mem`
+// (returning ESRCH when that pid was gone) — which wedged LTP's `_tst_setup_timer`
+// poll on `/proc/<watchdog>/stat`. `/proc/1/stat` happened to work only because
+// `pid_stat_id(1)` fell just below the mem window.
+const PROCFS_PID_FILE_SPAN: u64 = 0x1_0000_0000;
+const PROCFS_STAT_BASE: u64 = PROCFS_PID_BASE + 0x30_0000_0000;
+const PROCFS_CMDLINE_BASE: u64 = PROCFS_PID_BASE + 0x40_0000_0000;
+const PROCFS_MEM_BASE: u64 = PROCFS_PID_BASE + 0x50_0000_0000;
+const PROCFS_MAPS_BASE: u64 = PROCFS_PID_BASE + 0x60_0000_0000;
+const PROCFS_EXE_BASE: u64 = PROCFS_PID_BASE + 0x70_0000_0000;
 const PROCFS_FD_OFFSET: u64 = 0x20000;
 const PROCFS_FDINFO_OFFSET: u64 = 0x30000;
 // `/proc/<pid>/{uid_map,gid_map,setgroups}` (user-namespace map writes used by
@@ -252,19 +269,19 @@ const fn pid_dir_id(pid: Pid) -> FsObjectId {
     FsObjectId::new(PROCFS_PID_BASE + pid.0 as u64)
 }
 const fn pid_stat_id(pid: Pid) -> FsObjectId {
-    FsObjectId::new(PROCFS_PID_BASE + pid.0 as u64 + PROCFS_STAT_OFFSET)
+    FsObjectId::new(PROCFS_STAT_BASE + pid.0 as u64)
 }
 const fn pid_cmdline_id(pid: Pid) -> FsObjectId {
-    FsObjectId::new(PROCFS_PID_BASE + pid.0 as u64 + PROCFS_STAT_OFFSET + 1)
+    FsObjectId::new(PROCFS_CMDLINE_BASE + pid.0 as u64)
 }
 const fn pid_mem_id(pid: Pid) -> FsObjectId {
-    FsObjectId::new(PROCFS_PID_BASE + pid.0 as u64 + PROCFS_MEM_OFFSET)
+    FsObjectId::new(PROCFS_MEM_BASE + pid.0 as u64)
 }
 const fn pid_maps_id(pid: Pid) -> FsObjectId {
-    FsObjectId::new(PROCFS_PID_BASE + pid.0 as u64 + PROCFS_MAPS_OFFSET)
+    FsObjectId::new(PROCFS_MAPS_BASE + pid.0 as u64)
 }
 const fn pid_exe_id(pid: Pid) -> FsObjectId {
-    FsObjectId::new(PROCFS_PID_BASE + pid.0 as u64 + PROCFS_EXE_OFFSET)
+    FsObjectId::new(PROCFS_EXE_BASE + pid.0 as u64)
 }
 const fn pid_fd_dir_id(pid: Pid) -> FsObjectId {
     FsObjectId::new(PROCFS_PID_BASE + PROCFS_FD_OFFSET + (pid.0 as u64 * 0x10000))
@@ -283,27 +300,24 @@ const fn pid_fdinfo_id(pid: Pid, fd: u32) -> FsObjectId {
 }
 pub fn pid_from_mem_id(id: FsObjectId) -> Option<Pid> {
     let r = id.as_u64();
-    let base = PROCFS_PID_BASE + PROCFS_MEM_OFFSET;
-    if r >= base && r < base + 0x10000 {
-        Some(Pid((r - base) as u32))
+    if r >= PROCFS_MEM_BASE && r < PROCFS_MEM_BASE + PROCFS_PID_FILE_SPAN {
+        Some(Pid((r - PROCFS_MEM_BASE) as u32))
     } else {
         None
     }
 }
 pub fn pid_from_maps_id(id: FsObjectId) -> Option<Pid> {
     let r = id.as_u64();
-    let base = PROCFS_PID_BASE + PROCFS_MAPS_OFFSET;
-    if r >= base && r < base + 0x10000 {
-        Some(Pid((r - base) as u32))
+    if r >= PROCFS_MAPS_BASE && r < PROCFS_MAPS_BASE + PROCFS_PID_FILE_SPAN {
+        Some(Pid((r - PROCFS_MAPS_BASE) as u32))
     } else {
         None
     }
 }
 pub fn pid_from_exe_id(id: FsObjectId) -> Option<Pid> {
     let r = id.as_u64();
-    let base = PROCFS_PID_BASE + PROCFS_EXE_OFFSET;
-    if r >= base && r < base + 0x10000 {
-        Some(Pid((r - base) as u32))
+    if r >= PROCFS_EXE_BASE && r < PROCFS_EXE_BASE + PROCFS_PID_FILE_SPAN {
+        Some(Pid((r - PROCFS_EXE_BASE) as u32))
     } else {
         None
     }
@@ -353,7 +367,7 @@ pub fn pid_from_fdinfo_id(id: FsObjectId) -> Option<(Pid, u32)> {
 
 fn pid_from_dir(id: FsObjectId) -> Option<Pid> {
     let r = id.as_u64();
-    if r > PROCFS_PID_BASE && r < PROCFS_PID_BASE + PROCFS_STAT_OFFSET {
+    if r > PROCFS_PID_BASE && r < PROCFS_PID_BASE + PROCFS_PID_DIR_LIMIT {
         Some(Pid((r - PROCFS_PID_BASE) as u32))
     } else {
         None
@@ -361,18 +375,16 @@ fn pid_from_dir(id: FsObjectId) -> Option<Pid> {
 }
 pub fn pid_from_stat_id(id: FsObjectId) -> Option<Pid> {
     let r = id.as_u64();
-    let base = PROCFS_PID_BASE + PROCFS_STAT_OFFSET;
-    if r >= base && r < base + 0x10000 {
-        Some(Pid((r - base) as u32))
+    if r >= PROCFS_STAT_BASE && r < PROCFS_STAT_BASE + PROCFS_PID_FILE_SPAN {
+        Some(Pid((r - PROCFS_STAT_BASE) as u32))
     } else {
         None
     }
 }
 pub fn pid_from_cmdline_id(id: FsObjectId) -> Option<Pid> {
     let r = id.as_u64();
-    let base = PROCFS_PID_BASE + PROCFS_STAT_OFFSET + 1;
-    if r >= base && r < base + 0x10000 {
-        Some(Pid((r - base) as u32))
+    if r >= PROCFS_CMDLINE_BASE && r < PROCFS_CMDLINE_BASE + PROCFS_PID_FILE_SPAN {
+        Some(Pid((r - PROCFS_CMDLINE_BASE) as u32))
     } else {
         None
     }
