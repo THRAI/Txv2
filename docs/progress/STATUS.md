@@ -1,3 +1,20 @@
+- 2026-06-08 **Dimension B ICMP track: `is_up` + sysfs iface-attr gates fixed (`493ee154` ip-shim,
+  `3c836279` sysfs).** Chased `ping 10.0.0.1 → sendto: Not supported` (EOPNOTSUPP) to
+  `send_configured_icmpv4_echo`'s `ipv4_addr_is_configured(dst)` requiring an **up** interface:
+  diag showed `anyaddr=1, addrup=0` — `10.0.0.1` was configured on the rhost veth but its `is_up`
+  was false. Root cause: the `ip` shim **stubbed `ip link set <dev> up/down` as a no-op `exit 0`**
+  (only forwarded when `mtu` present), so the veth was never actually brought up; our rtnetlink
+  already applies IFF_UP, so forwarding `up`/`down` to real `ip` fixes it. Second gate: `tst_init_iface`
+  reads `/sys/class/net/<iface>/{address,mtu}` → TBROK, because the **sysfs driver (tx_fs::sysfs) was
+  orphaned** (never declared in lib.rs after the rebase) and `/sys` was only ever a tmpfs stub. Fixed:
+  re-homed sysfs (declared module, `ProjectionSchemaId::Sysfs`, netns-agnostic inline read), mount
+  `-t sysfs` as the real driver, and **mount sysfs on `/sys` at boot** (root netns) like procfs.
+  **Verified:** boot prints `:mount:sysfs:ok`; ping01 passes iface init with no `/sys/class/net` TBROK
+  and reaches the ping subtests (was TBROK at the MAC read). **Remaining for ping to PASS:** the ICMP
+  echo *reply* must reach the socket's `recvfrom` — ping currently blocks in the ping loop (reply
+  delivery TBD; verification also hampered by the TCG wall: setup alone ~140s, so the full ping sweep
+  overruns a 280s run). Next: confirm/fix synthetic-echo reply delivery to the RawIcmp recv queue.
+
 - 2026-06-07 **Dimension B: two setup-gate fixes land — net.* command tests now RUN their subtests
   (`1d20fcaf` procfs id-collision, `41d76a4d` mount).** After the procfs fix unblocked the
   `_tst_setup_timer` "S" poll, the next gate was `init_ltp_netspace`'s `mount --make-rprivate /sys` +
