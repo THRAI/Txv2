@@ -164,6 +164,16 @@ impl<P: TxPlatform> CoreInit<P> {
             return;
         }
 
+        // /var/run/netns — LTP's `init_ltp_netspace` symlinks the network
+        // namespace here (`ln -s /proc/<pid>/ns/net /var/run/netns/ltp_ns`) and
+        // reads the pid back via `readlink`. Pre-create the chain so the symlink
+        // (and the LTP_NETNS pid derived from it) succeed.
+        if let Some(run_id) = mkdir_or_find(fs_ops, var_id, b"run", 0o755, &cred) {
+            let _ = mkdir_or_find(fs_ops, run_id, b"netns", 0o755, &cred);
+        }
+        // /sys — mountpoint for `mount -t sysfs` inside the netns.
+        let _ = mkdir_or_find(fs_ops, root_fs_object_id, b"sys", 0o755, &cred);
+
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":tmp-dirs:ok\n");
     }

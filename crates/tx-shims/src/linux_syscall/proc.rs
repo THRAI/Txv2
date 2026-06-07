@@ -202,6 +202,69 @@ pub(super) fn sys_unshare<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRe
     SyscallResult::Return(0)
 }
 
+/// `setns(fd, nstype)` — join the network and/or mount namespace referenced by
+/// a namespace fd such as `/proc/<pid>/ns/net` or `/proc/<pid>/ns/mnt`. Used by
+/// LTP's `tst_ns_exec` (which calls `setns(fd, 0)` per opened nsfs fd).
+pub(super) fn sys_setns<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let fd = args[0] as i64;
+    let nstype = args[1];
+    if fd < 0 {
+        return SyscallResult::Error(EBADF_VALUE);
+    }
+    if nstype != 0 && nstype != CLONE_NEWNET && nstype != CLONE_NEWNS {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    let Some(file) = resolve_fd(&ctx.process, fd as u32) else {
+        return SyscallResult::Error(EBADF_VALUE);
+    };
+    let Some(current) = ctx.process.nsproxy_cap() else {
+        return SyscallResult::Error(ESRCH_VALUE);
+    };
+
+    if nstype == 0 || nstype == CLONE_NEWNET {
+        if let Some(payload) = tx_subsystems::net::net_namespace_payload_from_file(&file) {
+            let authorized = payload.owner_user_namespace().is_some_and(|owner| {
+                tx_subsystems::process::nsproxy::has_capability_in_user_namespace(
+                    ctx.cred(),
+                    &current.user_ns,
+                    &owner,
+                    Capability::SYS_ADMIN,
+                )
+            });
+            if !authorized {
+                return SyscallResult::Error(EPERM_VALUE);
+            }
+            let _old = ctx.process.replace_net_namespace(payload);
+            return SyscallResult::Return(0);
+        }
+    }
+
+    if nstype == 0 || nstype == CLONE_NEWNS {
+        if let Some(payload) = tx_subsystems::mount::mount_namespace_cap_from_file(&file) {
+            if !tx_subsystems::process::nsproxy::has_capability_in_user_namespace(
+                ctx.cred(),
+                &current.user_ns,
+                &current.user_ns,
+                Capability::SYS_ADMIN,
+            ) {
+                return SyscallResult::Error(EPERM_VALUE);
+            }
+            let replacement =
+                match tx_subsystems::process::nsproxy::clone_nsproxy_with_mount_namespace(
+                    &current, payload,
+                ) {
+                    Ok(replacement) => replacement,
+                    Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+                };
+            let _old = ctx.process.replace_nsproxy(replacement);
+            return SyscallResult::Return(0);
+        }
+    }
+
+    SyscallResult::Error(EINVAL_VALUE)
+}
+
 /// `getpid()` — direct read of `process.pid` per `PROCESS_v1`
 /// §"Step catalog" / `getpid` row in the trio plan.
 ///

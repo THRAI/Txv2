@@ -525,6 +525,10 @@ pub enum StructPayload {
     NetNamespace {
         payload: PayloadCap<NetNamespacePayload>,
     },
+    /// Mount-namespace fd backing `/proc/<pid>/ns/mnt`, consumed by `setns(2)`.
+    MountNamespace {
+        payload: Cap<crate::mount::MountNamespace>,
+    },
 }
 
 // === live-node entities ===============================================

@@ -18,6 +18,7 @@ use tx_subsystems::vfs::{
     render_dentry_path, Credential, DirCursor, DirEntry, FsObjectId, FsOps, InodeKind, InodeMeta,
     ProjectionKey, ProjectionSchemaId, RNode, RNodeBacking, S_IFDIR, S_IFLNK, S_IFREG,
 };
+use tx_subsystems::vfs::structure::StructPayload;
 
 pub const PROCFS_ROOT_ID: FsObjectId = FsObjectId::new(0x7072_6F00);
 pub const PROCFS_SELF_ID: FsObjectId = FsObjectId::new(0x7072_6F01);
@@ -129,6 +130,43 @@ pub fn pid_from_status_id(id: FsObjectId) -> Option<Pid> {
     } else {
         None
     }
+}
+
+// `/proc/<pid>/ns/` directory + the per-namespace nsfs nodes in their own
+// collision-free id region (the highest procfs region). Layout per pid:
+//   +0 = ns dir, +1 = ns/net. (ns/mnt etc. can take +2.. when added.)
+// Opened by LTP's `tst_ns_exec` (`open(/proc/<pid>/ns/net)` then `setns`).
+const PROCFS_NS_BASE: u64 = PROCFS_PID_BASE + 0x20_0000_0000;
+const PROCFS_NS_STRIDE: u64 = 4;
+const fn pid_ns_dir_id(pid: Pid) -> FsObjectId {
+    FsObjectId::new(PROCFS_NS_BASE + pid.0 as u64 * PROCFS_NS_STRIDE)
+}
+const fn pid_netns_id(pid: Pid) -> FsObjectId {
+    FsObjectId::new(PROCFS_NS_BASE + pid.0 as u64 * PROCFS_NS_STRIDE + 1)
+}
+const fn pid_mntns_id(pid: Pid) -> FsObjectId {
+    FsObjectId::new(PROCFS_NS_BASE + pid.0 as u64 * PROCFS_NS_STRIDE + 2)
+}
+fn pid_from_ns_object_id(id: FsObjectId, tag: u64) -> Option<Pid> {
+    let r = id.as_u64();
+    if r < PROCFS_NS_BASE {
+        return None;
+    }
+    let offset = r - PROCFS_NS_BASE;
+    if offset % PROCFS_NS_STRIDE == tag && offset / PROCFS_NS_STRIDE <= u32::MAX as u64 {
+        Some(Pid((offset / PROCFS_NS_STRIDE) as u32))
+    } else {
+        None
+    }
+}
+fn pid_from_ns_dir(id: FsObjectId) -> Option<Pid> {
+    pid_from_ns_object_id(id, 0)
+}
+fn pid_from_netns_id(id: FsObjectId) -> Option<Pid> {
+    pid_from_ns_object_id(id, 1)
+}
+fn pid_from_mntns_id(id: FsObjectId) -> Option<Pid> {
+    pid_from_ns_object_id(id, 2)
 }
 
 #[derive(Clone, Copy)]
@@ -464,6 +502,18 @@ impl FsOps for Procfs {
             if name == b"setgroups" && process::process_by_pid(pid).is_some() {
                 return StepOutcome::done(pid_setgroups_id(pid));
             }
+            if name == b"ns" && process::process_by_pid(pid).is_some() {
+                return StepOutcome::done(pid_ns_dir_id(pid));
+            }
+            return StepOutcome::err(Errno::ENOENT.into());
+        }
+        if let Some(pid) = pid_from_ns_dir(parent) {
+            if name == b"net" && process::process_by_pid(pid).is_some() {
+                return StepOutcome::done(pid_netns_id(pid));
+            }
+            if name == b"mnt" && process::process_by_pid(pid).is_some() {
+                return StepOutcome::done(pid_mntns_id(pid));
+            }
             return StepOutcome::err(Errno::ENOENT.into());
         }
         if let Some(pid) = pid_from_fdinfo_dir(parent) {
@@ -524,6 +574,12 @@ impl FsOps for Procfs {
             id if pid_from_status_id(id).is_some() => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
             }
+            id if pid_from_ns_dir(id).is_some() => {
+                StepOutcome::done(InodeMeta::new(InodeKind::Directory, PROCFS_DIR_MODE))
+            }
+            id if pid_from_netns_id(id).is_some() || pid_from_mntns_id(id).is_some() => {
+                StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
+            }
             id if pid_from_stat_id(id).is_some() => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
             }
@@ -582,6 +638,27 @@ impl FsOps for Procfs {
                 (b"uid_map", pid_uid_map_id(pid), InodeKind::Regular),
                 (b"gid_map", pid_gid_map_id(pid), InodeKind::Regular),
                 (b"setgroups", pid_setgroups_id(pid), InodeKind::Regular),
+                (b"ns", pid_ns_dir_id(pid), InodeKind::Directory),
+            ];
+            let fi = idx.saturating_sub(2);
+            if fi < files.len() {
+                let (name, oid, kind) = files[fi];
+                return StepOutcome::done(Some((
+                    dir_entry(oid, kind, name),
+                    DirCursor([2, (fi + 1) as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                )));
+            }
+            return StepOutcome::done(None);
+        }
+
+        if let Some(pid) = pid_from_ns_dir(id) {
+            // `/proc/<pid>/ns/` — currently exposes `net`.
+            if state_byte < 2 {
+                return finish_dots(state_byte, idx, id);
+            }
+            let files: &[(&[u8], FsObjectId, InodeKind)] = &[
+                (b"net", pid_netns_id(pid), InodeKind::Regular),
+                (b"mnt", pid_mntns_id(pid), InodeKind::Regular),
             ];
             let fi = idx.saturating_sub(2);
             if fi < files.len() {
@@ -838,6 +915,50 @@ impl FsOps for Procfs {
         mount: &Cap<MountPayload>,
         _guard: &Guard<'_>,
     ) -> StepOutcome<Cap<RNode>, NoProgress> {
+        // `/proc/<pid>/ns/net` — back the node with the target process's net
+        // namespace so `open()` yields a NetNamespace-carrying file that
+        // `setns(2)` (and the rtnetlink fd resolvers) can resolve.
+        if let Some(pid) = pid_from_netns_id(id) {
+            let Some(proc) = process::process_by_pid(pid) else {
+                return StepOutcome::err(Errno::ENOENT.into());
+            };
+            let Some(payload) = proc.net_namespace() else {
+                return StepOutcome::err(Errno::ESRCH.into());
+            };
+            return match RNode::new_cap_in_mount(
+                id,
+                meta,
+                RNodeBacking::StructBacked {
+                    payload: StructPayload::NetNamespace { payload },
+                },
+                mount,
+            ) {
+                Ok(cap) => StepOutcome::done(cap),
+                Err(_) => StepOutcome::err(Errno::ENOMEM.into()),
+            };
+        }
+        // `/proc/<pid>/ns/mnt` — back with the target's mount namespace so
+        // `setns(2)` can resolve it (mount-ns isolation is deferred; this is
+        // the shared mnt ns for now, but tst_ns_exec requires the node to open).
+        if let Some(pid) = pid_from_mntns_id(id) {
+            let Some(proc) = process::process_by_pid(pid) else {
+                return StepOutcome::err(Errno::ENOENT.into());
+            };
+            let Some(payload) = proc.mount_namespace_cap() else {
+                return StepOutcome::err(Errno::ESRCH.into());
+            };
+            return match RNode::new_cap_in_mount(
+                id,
+                meta,
+                RNodeBacking::StructBacked {
+                    payload: StructPayload::MountNamespace { payload },
+                },
+                mount,
+            ) {
+                Ok(cap) => StepOutcome::done(cap),
+                Err(_) => StepOutcome::err(Errno::ENOMEM.into()),
+            };
+        }
         match RNode::new_cap_in_mount(
             id,
             meta,

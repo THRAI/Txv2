@@ -317,6 +317,19 @@ pub struct MountNamespace {
     mounts: SpinMutex<Vec<MountTableEntry>>,
 }
 
+/// Extract the mount namespace carried by a `/proc/<pid>/ns/mnt` fd, used by
+/// `setns(2)`. Mirror of `net::net_namespace_payload_from_file`.
+pub fn mount_namespace_cap_from_file(
+    file: &Cap<crate::vfs::OpenFile>,
+) -> Option<Cap<MountNamespace>> {
+    match file.rnode().backing() {
+        crate::vfs::RNodeBacking::StructBacked {
+            payload: crate::vfs::structure::StructPayload::MountNamespace { payload },
+        } => Some(payload.clone()),
+        _ => None,
+    }
+}
+
 impl MountNamespace {
     pub fn new(root: Cap<MountIdentity>) -> Self {
         Self {

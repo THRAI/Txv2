@@ -1330,6 +1330,7 @@ pub const NR_GETRUSAGE: u64 = 165;
 /// `unshare(flags)`. Linux RV64 generic ABI. Wired for CLONE_NEWUSER /
 /// CLONE_NEWNET (network-namespace LTP setup).
 pub const NR_UNSHARE: u64 = 97;
+pub const NR_SETNS: u64 = 268;
 
 /// `close_range(first, last, flags)`. Linux RV64 generic ABI.
 pub const NR_CLOSE_RANGE: u64 = 436;
