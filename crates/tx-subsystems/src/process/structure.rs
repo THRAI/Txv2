@@ -294,10 +294,17 @@ impl ProcessIdentity {
 
     /// Process state char for /proc/<pid>/stat.
     pub fn state_char(&self) -> u8 {
+        // We don't track fine-grained per-thread run/sleep state in this tree
+        // (the backup's `proc_state_char`/`thread_has_waiter` machinery wasn't
+        // re-homed). A live process inspected via `/proc/<pid>/stat` by another
+        // process is, in this single-core cooperative model, parked rather than
+        // on-CPU, so report interruptible-sleep. LTP's `_tst_setup_timer` polls
+        // `/proc/<watchdog>/stat` field 3 until it reads "S"; reporting "R"
+        // forever wedged that loop (then the watchdog timed out).
         if self.is_zombie() {
             b'Z'
         } else {
-            b'R'
+            b'S'
         }
     }
 
