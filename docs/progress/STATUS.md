@@ -20,9 +20,13 @@
     AF_INET6) takes effect. **Debug technique:** a temporary link-snapshot probe (net AtomicU32/String
     statics dumped from `dispatch_inner`) showed `eth0 up=false v4=.0 v6=..00` before, `up=true v4=.2
     v6=..02` after, and `handle_newaddr` na6=0→2 — pinpointing the down-iface chain. All probes
-    removed. **Verified:** ping601 10/0, ping602 10/0, ping01 (IPv4) still 10/0. Remaining net.ipv6
-    cases (sendfile601, tcpdump601, tracepath601, traceroute601, ip6tables, nft6, ipneigh6, dhcpd6,
-    dnsmasq6) now RUN (sweep in progress) instead of TCONF.
+    removed. **Verified:** ping601 10/0, ping602 10/0, ping01 (IPv4) still 10/0. **net.ipv6 sweep
+    (was 0 PASS / all TCONF, now 4 PASS):** PASS = ping601, ping602, tracepath601 (1/0), tcpdump601
+    (1/0); FAIL (same subtest gaps as their IPv4 twins) = traceroute601 (5/1, `-T` TCP mode),
+    ipneigh6_ip (0/1, neighbor table), ip6tables (4/2), nft6 (3/2); TBROK (need real rhost daemons) =
+    sendfile601, dhcpd6, dnsmasq6. The remaining net.ipv6 failures are NOT IPv6-specific — they mirror
+    the IPv4 command-layer gaps (neighbor-table population, traceroute TCP mode, netfilter coverage),
+    so fixing those once helps both families.
 
 - 2026-06-08 **Dimension B: `iproute` `ip neigh` subtest fixed (`5119da8a`) — iproute 4/2 ⇒ 5/1.**
   `ip neigh del` returned non-zero despite its explicit `exit 0`: the shim did
