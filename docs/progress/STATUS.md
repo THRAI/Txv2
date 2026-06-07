@@ -1,3 +1,22 @@
+- 2026-06-07 **Dimension B netns chain FULLY RESTORED — LTP `init_ltp_netspace` + tst_net setup now
+  complete end-to-end; remaining blocker is shell background-job scheduling + TCG runtime.** Steps 2-4
+  landed: `/proc/<pid>/ns/{net,mnt}` nsfs nodes + `setns` (NR_SETNS) + `/var/run`/`/sys` (`fac21e21`);
+  `ppoll(nfds=0)` honors timeout so `pause()` blocks (`427c5b1b`) — that fixed the `tst_ns_create`
+  daemon child persisting (`setsid`+`pause` to hold the ns); and `/proc/<pid>/stat` reports `'S'` for
+  live processes (`e677ed85`, needed by LTP's watchdog poll). **Verified end-to-end:** veth created +
+  moved into the child netns, rhost addresses configured (`eth0 -- ltp_ns_veth1`, `10.0.0.2/24 --
+  10.0.0.1/24`); the iproute subtests now START. **Remaining (NOT yet passing), three layers:**
+  (1) **shell background-job/waitpid gap** — LTP's `_tst_setup_timer` spawns `tst_timeout_kill &`
+  (watchdog: `setpgid(0,0)`+`sleep(300)`) then polls `/proc/<pid>/stat` for state "S"; a per-syscall
+  probe proved the parent NEVER runs the poll during the watchdog's 300s sleep (zero `render_stat`
+  calls) — it only polls after the watchdog exits (→ ENOENT loop). So `cmd &` makes the parent block
+  ~300s instead of running concurrently (likely waitpid/job-control: parent waits on the bg child, or
+  the cut command-substitution wait doesn't wake on the right child). (2) **`kill(-pgid)` is ENOSYS**
+  (`kill(-12) failed: Function not implemented`) — process-group kill unimplemented (watchdog cleanup).
+  (3) **TCG runtime wall** — setup alone is ~140s; the full iproute subtest sweep needs many minutes
+  via per-op `tst_ns_exec` (clone+setns+exec), same class as route4/netload. Net code + nsfs + setns +
+  clone-netns are all verified working; the 29 are gated on the shell/runtime layer now, not net infra.
+
 - 2026-06-07 **Dimension B netns chain — Step 1 done: `clone(CLONE_NEWNET|CLONE_NEWNS)` now works
   (`61a5d89d`).** Incremental re-home of the netns chain (dropped by rebase). Three clone gates
   rejected the flags: `sys_clone_oneshot` allowed_mask, the trap-level `dispatch_clone_oneshot`
