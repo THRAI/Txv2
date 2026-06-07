@@ -1,3 +1,23 @@
+- 2026-06-08 **Dimension B: 29 command-layer tests QUANTIFIED (per-case TPASS/TFAIL/TBROK/TCONF) +
+  `netstat` flipped to PASS.** After the ping fix, swept every case in `net.tcp_cmds` (17),
+  `net.ipv6` (11), `net.multicast` (4) individually under QEMU. **net.tcp_cmds: 7 PASS** — `arping01`
+  (1/0), `netstat` (5/0, FIXED below), `ping01` (10/0, FIXED), `ping02` (10/0, FIXED), `tc01` (2/0),
+  `tcpdump` (1/0), `tracepath01` (1/0); **6 FAIL** — `ipneigh01_arp`/`ipneigh01_ip` (0/1 each, "ARP
+  entry 10.0.0.1 not listed": synthetic ICMP never records a neighbor entry), `iproute` (4/2: `ip
+  neigh del` + `ip route show` of a `via 127.0.0.1` route), `iptables` (4/2), `nft` (3/2+1 TCONF),
+  `traceroute01` (5/1: only the `-T` TCP-probe timing subtest; `-I` ICMP mode fully passes); **3
+  TBROK** — `sendfile` (rhost server not visible via `ss -ltp`), `dhcpd`/`dnsmasq` (need real
+  daemons); **1 TCONF** — `ftp`. **net.multicast: 2 PASS** (`mc_cmds`, `mc_opts`), **2 runtime-bound**
+  (`mc_commo` 0/1, `mc_member` no verdict in 100s — TCG sleep walls, not infra). **net.ipv6: all
+  TCONF** — IPv6 is disabled on lhost via kernel cmdline ("IPv6 disabled on lhost or not compiled
+  in"), so ping601/602/sendfile601/tcpdump601/tracepath601/traceroute601/dhcpd6 (and the 4 unrun
+  IPv6 cases) skip; enabling the v6 stack is a separate large effort. **netstat fix (`a630cfba`):**
+  `netstat -rn` fell through to busybox (no served `/proc/net/route`); added a `-*r*` arm to the
+  netstat shim mirroring `-i`/`-s`/`-g` → 4/1 ⇒ **5/0 PASS**. **Net new passes this session: ping01,
+  ping02, netstat (3).** Remaining gaps are all per-subtest feature work (neigh-table population,
+  rtnetlink route store/dump, netfilter rule coverage, traceroute TCP mode) or environmental
+  (IPv6-off, missing daemons, TCG runtime), not setup/infra hangs.
+
 - 2026-06-08 **Dimension B: PING FAMILY PASSES — root cause was ITIMER_REAL/SIGALRM delivery, NOT
   ICMP reply delivery.** `ping01` **10 TPASS / 0 TFAIL** and `ping02` **10 TPASS / 0 TFAIL** (verified
   under QEMU, clean build). A 20-counter probe through the whole ICMP echo→reply→recvfrom chain proved
