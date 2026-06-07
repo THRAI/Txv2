@@ -754,6 +754,21 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
         None => return SyscallResult::Error(ENODEV_VALUE),
     };
 
+    // Mount-propagation changes (`mount --make-{r,}{shared,private,slave,unbindable}`):
+    // these mutate an existing mount's propagation type rather than creating a new
+    // mount, and `fstype`/`source` are NULL. We don't model mount-propagation trees,
+    // so making a subtree private/shared/etc. is observably a no-op — report success.
+    // LTP's `init_ltp_netspace` does `mount --make-rprivate /sys` (MS_REC|MS_PRIVATE)
+    // via ROD before mounting sysfs; failing it TBROKs every tst_net.sh-framework test.
+    const MS_SHARED: u64 = 1 << 20;
+    const MS_UNBINDABLE: u64 = 1 << 17;
+    const MS_PRIVATE: u64 = 1 << 18;
+    const MS_SLAVE: u64 = 1 << 19;
+    const MS_PROPAGATION: u64 = MS_SHARED | MS_PRIVATE | MS_SLAVE | MS_UNBINDABLE;
+    if (flags & MS_PROPAGATION) != 0 {
+        return SyscallResult::Return(0);
+    }
+
     const MS_BIND: u64 = 4096;
     if (flags & MS_BIND) != 0 {
         // Bind mount.
@@ -815,12 +830,17 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
         // (`assert(ret == 0)`). A fresh tmpfs at the mount point
         // satisfies that contract without pretending to read FAT
         // bytes. Real FAT support tracks separately.
-        "tmpfs" | "vfat" => {
+        // `sysfs` has no driver yet; LTP netns setup only needs the mount to
+        // succeed (`mount -t sysfs none /sys`) so `init_ltp_netspace`'s ROD passes.
+        // A fresh tmpfs at the mount point satisfies that contract; subtests that
+        // read /sys/class/net/<iface>/* still see ENOENT, which is a per-subtest
+        // gap, not a setup failure. Real sysfs tracks separately.
+        "tmpfs" | "vfat" | "sysfs" => {
             let tmpfs = alloc::sync::Arc::new(tx_fs::tmpfs::Tmpfs::new());
-            let label = if fstype_str == "vfat" {
-                "vfat"
-            } else {
-                "tmpfs"
+            let label = match fstype_str {
+                "vfat" => "vfat",
+                "sysfs" => "sysfs",
+                _ => "tmpfs",
             };
             (
                 tmpfs.clone().fs_ops_arc(),
