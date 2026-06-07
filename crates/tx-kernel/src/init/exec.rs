@@ -2677,7 +2677,7 @@ const DEFAULT_OSCOMP_MUSL_PRE_LTP_SCRIPTS: &[(&str, &str)] = &[
 const DEFAULT_OSCOMP_GLIBC_PRE_LTP_SCRIPTS: &[(&str, &str)] = &[
     ("basic-glibc", "basic_testcode.sh"),
     ("busybox-glibc", "busybox_testcode.sh"),
-    ("libctest-glibc", "libctest_testcode.sh"),
+    // libctest-glibc removed: official scoring counts only musl libctest.
     ("lua-glibc", "lua_testcode.sh"),
     ("netperf-glibc", "netperf_testcode.sh"),
 ];

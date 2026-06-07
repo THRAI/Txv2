@@ -1128,7 +1128,6 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     // bits, and tmpfs's create_inode honoured those bits at create
     // time, so the perms apply equally to the just-created file.
     //
-    // Same Send-future discipline as Step 1: poll_walker_synchronously.
     let openfile: Cap<OpenFile> = {
         let guard = step_engine::guard();
         let outcome = step_open(cwd, &path, open_flags, mode as u16, &walker_cred, &guard);
@@ -1176,6 +1175,17 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
 /// `drive_oneshot` (no reactor, no yield).
 pub(super) fn sys_close<'a>(fd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
     let file_to_close = ctx.process.fd(fd);
+    // Write back dirty data + logical size before dropping the fd. There
+    // is no background writeback daemon, so close is the flush point for
+    // page-backed files; without it a fresh reopen reads the stale
+    // (create-time, zero) inode size and empty data. Best-effort — the
+    // ext4 flush path is synchronous (Done).
+    if let Some(file) = &file_to_close {
+        if let Some(pc) = crate::linux_syscall::vm::extract_page_container(file) {
+            let guard = step_engine::guard();
+            let _ = tx_subsystems::page_backed::step_fsync(&pc, &guard);
+        }
+    }
     let mut script_ctx = build_subject_script_ctx(ctx);
     let mut op = CloseOp {
         process: ctx.process.clone(),

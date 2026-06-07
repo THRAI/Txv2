@@ -1,1 +1,4 @@
-setfsgid02
+float_trigo
+msgsnd02
+proc01
+starvation

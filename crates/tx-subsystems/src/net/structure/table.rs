@@ -13,7 +13,11 @@ const CONNECTION_SLOTS: usize = 256;
 const RAW_ICMP_SLOTS: usize = 128;
 const UNIX_PATH_NODE_SLOTS: usize = 256;
 const UNIX_BOUND_SLOTS: usize = 256;
-const UNIX_STREAM_PEER_SLOTS: usize = 256;
+// hackbench (cyclictest's stress phase) creates hundreds of AF_UNIX
+// socketpairs concurrently; each pair inserts two peer entries. 256 slots
+// overflowed and `insert_unix_peer` returned ENOMEM ("Creating fdpair
+// (error: Out of memory)") even though physical memory was plentiful.
+const UNIX_STREAM_PEER_SLOTS: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LocalEndpointKey {

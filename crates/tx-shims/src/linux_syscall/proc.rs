@@ -1549,6 +1549,15 @@ fn sched_tid_arg(pid_arg: u64, ctx: &SyscallCtx<'_>) -> Result<u32, SyscallResul
         return Err(SyscallResult::Error(EINVAL_VALUE));
     }
     let tid = u32::try_from(pid_arg).map_err(|_| SyscallResult::Error(ESRCH_VALUE))?;
+    // A thread can always query/modify its own scheduler parameters, even if
+    // it is not (yet) discoverable through the global pid/thread number table.
+    // cyclictest's measurement threads call sched_setscheduler/sched_getparam
+    // with their own gettid(); on la those threads were not resolved by the
+    // table lookup below and the calls failed with ESRCH ("unable to get
+    // scheduler parameters"). Resolving the caller's own tid up-front fixes it.
+    if tid == ctx.thread.tid.0 {
+        return Ok(tid);
+    }
     if process_by_pid(Pid(tid)).is_some()
         || matches!(
             tx_subsystems::process::numbers::resolve_pid_number(tid as u64),
@@ -1750,6 +1759,27 @@ pub(super) fn sys_sched_getparam<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
 }
 
 pub(super) fn sys_sched_yield() -> SyscallResult {
+    SyscallResult::Return(0)
+}
+
+/// `get_mempolicy(mode, nodemask, maxnode, addr, flags)` — compatibility stub.
+///
+/// We present a single NUMA domain (node 0) with `MPOL_DEFAULT`. Returning
+/// ENOSYS (the unimplemented default) made NUMA-aware userspace bail: the la
+/// cyclictest build probes the policy here and aborted with "unable to get
+/// scheduler parameters". A benign success lets it proceed.
+pub(super) fn sys_get_mempolicy<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let mode_ptr = args[0];
+    let nodemask_ptr = args[1];
+    let maxnode = args[2];
+    if mode_ptr != 0 {
+        if let Err(errno) = bootstrap_write_user::<i32>(&ctx.aspace, mode_ptr, 0) {
+            return SyscallResult::Error(errno_to_i32(errno));
+        }
+    }
+    if nodemask_ptr != 0 && maxnode >= 1 {
+        let _ = bootstrap_write_user::<u64>(&ctx.aspace, nodemask_ptr, 1);
+    }
     SyscallResult::Return(0)
 }
 

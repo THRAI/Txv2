@@ -371,12 +371,27 @@ pub fn step_semctl(
             // Count queries — return 0 stubs.
             Ok(SemCtlResult::Val(0))
         }
-        IPC_INFO | SEM_INFO => Ok(SemCtlResult::Info {
-            semmni: 32000,
-            semmns: 1024000000,
-            semmsl: 32000,
-            semopm: 500,
-        }),
+        IPC_INFO | SEM_INFO => {
+            // `SEM_INFO` reports live usage; `IPC_INFO` reports the
+            // implementation constants. semusz = sets in use, semaem =
+            // total semaphores across all sets (LTP semctl09).
+            let (semusz, semaem) = if cmd == SEM_INFO {
+                let arrays = structure::all_sem_arrays();
+                let sets = arrays.len() as u64;
+                let sems = arrays.iter().map(|a| a.nsems as u64).sum();
+                (sets, sems)
+            } else {
+                (20, 32767)
+            };
+            Ok(SemCtlResult::Info {
+                semmni: 32000,
+                semmns: 1024000000,
+                semmsl: 32000,
+                semopm: 500,
+                semusz,
+                semaem,
+            })
+        }
         _ => Err(Errno::EINVAL),
     }
 }
@@ -463,6 +478,12 @@ pub enum SemCtlResult {
         semmns: u64,
         semmsl: u64,
         semopm: u64,
+        /// `SEM_INFO`: number of semaphore sets currently allocated.
+        /// `IPC_INFO`: implementation `SEMUSZ` constant.
+        semusz: u64,
+        /// `SEM_INFO`: total semaphores across all sets.
+        /// `IPC_INFO`: implementation `SEMAEM` constant.
+        semaem: u64,
     },
 }
 

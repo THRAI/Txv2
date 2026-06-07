@@ -1,14 +1,11 @@
-# RV 白名单逐用例得分（ltp-glibc / ltp-musl，2026-06-07）
-
-判分=LTP Summary passed N。✓全过 ~部分 ✗零分。
+# RV 白名单逐用例得分（2026-06-07）
 
 ## 总分
-- ltp-glibc: **3920/4319**
-- ltp-musl: **3881/4291**
+- ltp-glibc: **3923/4319**
+- ltp-musl: **3885/4291**
 
 共 592 用例。
 
-## 逐用例
 | case | rv-glibc | rv-musl |
 |------|----------|---------|
 | accept01 | ✓5/5 | ✓5/5 |
@@ -92,7 +89,7 @@
 | epoll_wait01 | ✗0/1 | ✗0/1 |
 | epoll_wait02 | ✓7/7 | ✓7/7 |
 | epoll_wait03 | ✓5/5 | ✓5/5 |
-| epoll_wait04 | ✓1/1 | ✗0/1 |
+| epoll_wait04 | ✓1/1 | ✓1/1 |
 | epoll_wait06 | ✓9/9 | ✓9/9 |
 | epoll_wait07 | ✓5/5 | ✓5/5 |
 | eventfd01 | ✓4/4 | ✓4/4 |
@@ -229,7 +226,7 @@
 | gettid01 | ✓2/2 | ✓2/2 |
 | gettid02 | ✓11/11 | ✓11/11 |
 | gettimeofday01 | ~2/3 | ~2/3 |
-| gettimeofday02 | ✓1/1 | ✓1/1 |
+| gettimeofday02 | ✗0/1 | ✓1/1 |
 | getuid01 | ✓1/1 | ✓1/1 |
 | getuid03 | ~1/2 | ~1/2 |
 | inotify_init1_01 | ✓4/4 | ✓4/4 |
@@ -297,7 +294,7 @@
 | msgctl02 | ~1/2 | ~1/2 |
 | msgctl03 | ~1/2 | ~1/2 |
 | msgctl04 | ~12/14 | ~12/14 |
-| msgctl06 | ~2/10 | ~2/10 |
+| msgctl06 | ✗0/10 | ✗0/10 |
 | msgctl12 | ~3/4 | ~3/4 |
 | msgget01 | ✓1/1 | ✓1/1 |
 | msgget02 | ✓6/6 | ✓6/6 |
@@ -311,7 +308,7 @@
 | munlockall01 | ✓2/2 | ✓2/2 |
 | name_to_handle_at01 | ✓27/27 | ✓27/27 |
 | name_to_handle_at02 | ✓9/9 | ✓9/9 |
-| nanosleep01 | ~6/7 | ✓7/7 |
+| nanosleep01 | ✓7/7 | ✓7/7 |
 | nanosleep02 | ✓2/2 | ✓2/2 |
 | nanosleep04 | ✓3/3 | ✓3/3 |
 | nice01 | ✓3/3 | ✓3/3 |
@@ -369,7 +366,7 @@
 | prctl03 | ~3/6 | ~3/6 |
 | prctl05 | ~2/3 | ~2/3 |
 | prctl08 | ~9/11 | ~9/11 |
-| prctl09 | ~6/7 | ✓7/7 |
+| prctl09 | ✓7/7 | ✓7/7 |
 | pread01 | ✓1/1 | ✓1/1 |
 | pread01_64 | ✓1/1 | ✓1/1 |
 | pread02 | ✓3/3 | ✓3/3 |
@@ -417,7 +414,7 @@
 | rmdir01 | ✓1/1 | ✓1/1 |
 | rmdir03 | ✓2/2 | ✓2/2 |
 | rt_sigsuspend01 | ✓2/2 | ✓2/2 |
-| sbrk01 | ✓3/3 | ~1/3 |
+| sbrk01 | ~2/3 | ~1/3 |
 | sbrk02 | ✓1/1 | ✓1/1 |
 | sched_get_priority_max01 | ✓6/6 | ✓6/6 |
 | sched_get_priority_max02 | ✓1/1 | ✓1/1 |
@@ -444,13 +441,13 @@
 | select02 | ~14/17 | ~14/17 |
 | select03 | ~16/40 | ~16/40 |
 | select04 | ~4/7 | ~4/7 |
-| semctl01 | ~8/12 | ~8/12 |
+| semctl01 | ~9/12 | ~9/12 |
 | semctl02 | ✓1/1 | ✓1/1 |
 | semctl03 | ~6/8 | ~6/8 |
 | semctl04 | ✓2/2 | ✓2/2 |
 | semctl05 | ✓3/3 | ✓3/3 |
 | semctl07 | ✓16/16 | ✓16/16 |
-| semctl09 | ~4/16 | ~4/16 |
+| semctl09 | ~8/16 | ~8/16 |
 | semget01 | ✓3/3 | ✓3/3 |
 | semget02 | ✓6/6 | ✓6/6 |
 | semop01 | ✓4/4 | ✓4/4 |

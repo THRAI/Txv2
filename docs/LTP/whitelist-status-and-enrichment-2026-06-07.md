@@ -4,10 +4,11 @@
 
 | 架构 | ltp-glibc | ltp-musl | 总分 | 距 4000 |
 |------|-----------|----------|------|---------|
-| RV64 | **3920**/4319 | **3881**/4291 | **7801**/8610 | -80 / -119 |
-| LA64 | **3935**/4306 | **3874**/4261 | **7809**/8567 | -65 / -126 |
+| RV64 | **3923**/4319 | **3885**/4291 | **7808**/8610 | -77 / -115 |
+| LA64 | **3938**/4306 | **3877**/4261 | **7815**/8567 | -62 / -123 |
 
-本会话累计:rv **6950→7801(+851)**、la **6980→7809(+829)**。0 panic、无 batch hang。
+本会话累计:rv **6950→7808(+858)**、la **6980→7815(+835)**。0 panic、无 batch hang。
+(含 IPC info 修复:semctl09 SEM_INFO 用量 4/16→8/16、msgctl06 MSG_INFO 用量 2/10→4/10。SEM_STAT/MSG_STAT 数组索引语义试过会回归,未攻克。)
 
 **对齐情况**:rv-la 已对齐(glibc la+15、musl rv+7,±15 内);glibc-musl 仍差 ~39-61(主因 waitpid01 +42,深层信号自终止,难修)。
 
@@ -142,8 +143,27 @@ clock_settime03  creat07
 
 **rv-la 对齐:** 从 `LTP_LA_SUBMIT_EXCLUDED_CASES` 移除 20 个过时排除(它们在 la 上其实能得分:prctl02/03/05/08、semop03、sched_setparam01-05、pipe2_02/04、pipe07/13、open10、creat08、chmod05、exit_group01、readlink01、sched_setscheduler02),la 总分 +142 追平 rv。
 
-## 五、剩余可提分方向（未做/难）
+## 五、到 4000 的路线图（每项约 -65~-126，需累积 ~10-15 个中等修复）
 
-- **glibc-musl 对齐**:waitpid01(musl 84 vs glibc 126,+42×2)——子进程 raise 信号应以 Signaled 终止,但线程继续执行被 exit(0) 覆盖。深层信号自终止问题。
-- **la 特有 hang**(保持排除,本质内核 bug):gettid02、mq_notify01、tgkill03/01、futex_wait03、sched_setattr01、clock_settime03、creat07、setfsgid02、tgkill02 等——过断言但不退出/checkpoint 超时,批量会挂死。
-- splice07(memfd_secret,-25)、select03(arch-skip 不可修)、semctl09/timerfd01/msgctl06 等子系统部分用例。
+数据驱动(四配置逐用例失分聚合)。**绝大多数失分用例四配置一致 → 修一次 ×4 配置受益。**
+
+| 优先 | 用例/主题 | +/配置 | 工作量 | 现状/修法 |
+|------|-----------|--------|--------|-----------|
+| ✅ 已修 | **setgid 目录组继承**(open10/creat08) | +6 | — | 已完成 |
+| ⏳ 部分 | **SysV sem SEM_INFO 用量**(semctl09) | +4 | — | semusz/semaem 已填(4/16→8/16);剩 SEM_STAT 索引语义(+4) |
+| 1 | **waitid05/06** P_PGID | +10 | 中 | waitid(P_PGID) 返 ENOSYS,需按进程组等待 |
+| 2 | **statfs02+pathconf02** 路径校验 | +10 | 中 | 负向测试:空/超长/ENOTDIR/ELOOP 路径应报错(路径解析器) |
+| 3 | **madvise02** | +12 | 中 | 无效上下文应拒绝 advice(负向校验) |
+| 4 | **chmod01+chown05** | +14 | 中(VFS) | chmod/chown 改 fs inode 但 stat 读 RNode 缓存旧 meta;需刷新 RNode meta |
+| 5 | **mq_timedsend/recv01+mq_open01** | +16 | 中 | POSIX mq 行为/errno |
+| 6 | **SysV msg/shm INFO+STAT 索引** | +12 | 中 | MSG_INFO 用量 + *_STAT 按数组索引(类似 sem) |
+| 7 | **timerfd01** | +8 | 中 | 定时器未触发(timerfd timer) |
+| 8 | **prctl02** | +8 | 中 | 实现缺失的 prctl 选项(现 TCONF 跳过) |
+| 9 | **mlock201** | +7 | 中 | VmLck 按实际页数记账(现恒 8 页) |
+| 10 | open07(O_NOFOLLOW)、chown05、getpgid01、semop02、times03… | 各 ~4-6 | 中低 | 零碎 |
+| 最大 | **waitpid01** | musl+31/glibc+20 | 高/风险 | 子进程 raise 信号应以 Signaled 终止,但线程继续被 exit(0) 覆盖。深层信号自终止,之前改坏过 |
+| ✗ 不可修 | select03(arch 无 __NR_select)、splice07(memfd_secret) | — | — | 跳过 |
+
+**la 特有 hang(保持排除,内核 hang bug,后续可单独修):** gettid02、mq_notify01、tgkill03/01、futex_wait03、sched_setattr01、clock_settime03、creat07、setfsgid02、tgkill02。
+
+**结论:** 4000 可达,但是一串中等子系统修复的累积(非一招)。建议按上表 1→10 推进,优先"四配置共享 + 自包含"的(waitid/statfs/madvise/mq),避开深层(waitpid01/chmod-VFS)直到最后。

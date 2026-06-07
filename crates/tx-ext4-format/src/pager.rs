@@ -219,6 +219,96 @@ impl<I: BlockImage> Ext4Pager<I> {
         })
     }
 
+    /// Write a file page back to disk, allocating a fresh block and
+    /// extending the inode's extent map when the target page is a hole.
+    /// Backs `FsPageBacking::flush_page` (the read-only
+    /// `write_existing_page` above only handles already-mapped blocks).
+    pub fn write_page(
+        &mut self,
+        inode: InodeNo,
+        file_page_index: u64,
+        page: &Page4K,
+    ) -> Result<()> {
+        let mut disk_inode = self.read_inode(inode)?;
+        let logical = logical_block(file_page_index)?;
+        let block = match self.resolve_inode_block(&disk_inode, logical)? {
+            BlockMapping::Data(block) => block,
+            BlockMapping::Hole => {
+                let new_block = self.allocate_block()?;
+                self.attach_data_block(&mut disk_inode, logical, new_block)?;
+                disk_inode.blocks_512 = disk_inode
+                    .blocks_512
+                    .saturating_add((BLOCK_SIZE / 512) as u64);
+                // Size is owned by `serialize_inode_meta` (exact logical
+                // size) and `set_inode_size`; writeback only persists the
+                // data block + extent, never the size.
+                self.write_inode(inode, &disk_inode)?;
+                new_block
+            }
+            BlockMapping::NeedNode(_) => return Err(Ext4FormatError::Unsupported),
+        };
+        self.image.write_block(block, page)?;
+        Ok(())
+    }
+
+    /// Attach a newly allocated `physical` block at `logical` to the
+    /// inode's inline extent root, growing the trailing extent when the
+    /// block continues it contiguously, otherwise appending a fresh
+    /// extent. Errors `Unsupported` if the inline root (4 extents) is
+    /// full — extent-tree spill is not yet implemented, but sequential
+    /// per-file writeback coalesces into one extent so the common case
+    /// never overflows.
+    fn attach_data_block(
+        &mut self,
+        inode: &mut Inode,
+        logical: u32,
+        physical: u64,
+    ) -> Result<()> {
+        let mut extents = match ExtentNode::parse(inode.extent_root_bytes())? {
+            ExtentNode::Leaf(list) => list,
+            ExtentNode::Index(_) => return Err(Ext4FormatError::Unsupported),
+        };
+        // Keep extents sorted by logical_block (ext4 invariant). Find the
+        // insertion point, then coalesce with the preceding extent when the
+        // new block continues it contiguously (the common sequential-
+        // writeback case → a single growing extent).
+        let pos = extents
+            .iter()
+            .position(|e| e.logical_block > logical)
+            .unwrap_or(extents.len());
+        if pos > 0 {
+            let prev = &mut extents[pos - 1];
+            let contiguous = prev.logical_block + prev.len as u32 == logical
+                && prev.physical_start + prev.len as u64 == physical
+                && (prev.len as u32) < Extent::UNINITIALIZED_MASK as u32;
+            if contiguous {
+                prev.len += 1;
+                inode.set_extent_root(&extents)?;
+                return Ok(());
+            }
+        }
+        extents.insert(
+            pos,
+            Extent {
+                logical_block: logical,
+                len: 1,
+                physical_start: physical,
+            },
+        );
+        inode.set_extent_root(&extents)?;
+        Ok(())
+    }
+
+    /// Set the inode's logical size — backs `FsPageBacking::truncate`.
+    /// Block reclamation on shrink is not yet implemented; the `size`
+    /// field governs how many bytes reads return.
+    pub fn set_inode_size(&mut self, inode: InodeNo, new_size: u64) -> Result<()> {
+        let mut disk_inode = self.read_inode(inode)?;
+        disk_inode.size = new_size;
+        self.write_inode(inode, &disk_inode)?;
+        Ok(())
+    }
+
     pub fn lookup(&mut self, directory: InodeNo, name: &[u8]) -> Result<Option<InodeNo>> {
         let mut entries = [DirEntryLite::empty(); 8];
         let mut offset = 0u64;

@@ -543,6 +543,10 @@ pub const NR_SCHED_GETATTR: u64 = 275;
 pub const NR_SCHED_GETSCHEDULER: u64 = 120;
 /// `sched_getparam(pid, param)`. Linux RV64 generic ABI.
 pub const NR_SCHED_GETPARAM: u64 = 121;
+/// `get_mempolicy(policy, nmask, maxnode, addr, flags)`. Linux generic ABI.
+/// cyclictest (NUMA-enabled la build) calls this; unimplemented it returned
+/// ENOSYS and cyclictest bailed with "unable to get scheduler parameters".
+pub const NR_GET_MEMPOLICY: u64 = 236;
 /// `sched_yield()`. Linux RV64 generic ABI.
 pub const NR_SCHED_YIELD: u64 = 124;
 /// `sched_get_priority_max(policy)`. Linux RV64 generic ABI.

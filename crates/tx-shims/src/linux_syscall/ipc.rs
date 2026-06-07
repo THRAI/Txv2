@@ -622,16 +622,19 @@ pub(super) fn sys_msgctl(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult 
                 msgmni,
                 msgmax,
                 msgmnb,
+                msgpool,
+                msgmap,
+                msgtql,
             } => {
                 let msgmni_i32 = msgmni.min(i32::MAX as u64) as i32;
                 let info = MsginfoLayout {
-                    msgpool: 0,
-                    msgmap: 0,
+                    msgpool: msgpool.min(i32::MAX as u64) as i32,
+                    msgmap: msgmap.min(i32::MAX as u64) as i32,
                     msgmax: msgmax.min(i32::MAX as u64) as i32,
                     msgmnb: msgmnb.min(i32::MAX as u64) as i32,
                     msgmni: msgmni_i32,
                     msgssz: 0,
-                    msgtql: msgmni_i32,
+                    msgtql: msgtql.min(i32::MAX as u64) as i32,
                     msgseg: 0,
                 };
                 if let Err(errno) = bootstrap_write_user(&ctx.aspace, buf_ptr, info) {
@@ -786,6 +789,8 @@ pub(super) fn sys_semctl(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult 
                 semmns,
                 semmsl,
                 semopm,
+                semusz,
+                semaem,
             } => {
                 let info = SeminfoLayout {
                     semmap: 0,
@@ -795,9 +800,9 @@ pub(super) fn sys_semctl(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult 
                     semmsl: semmsl.min(i32::MAX as u64) as i32,
                     semopm: semopm.min(i32::MAX as u64) as i32,
                     semume: 0,
-                    semusz: 0,
+                    semusz: semusz.min(i32::MAX as u64) as i32,
                     semvmx: 32767,
-                    semaem: 0,
+                    semaem: semaem.min(i32::MAX as u64) as i32,
                 };
                 if let Err(errno) = bootstrap_write_user(&ctx.aspace, arg_raw, info) {
                     return SyscallResult::Error(errno_to_i32(errno));

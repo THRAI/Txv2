@@ -147,6 +147,34 @@ pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<(), Page
         }
     }
 
+    // Persist the logical size once data blocks are written back:
+    // `flush_page` writes data only, so without this a fresh reopen
+    // sees the inode's stale (create-time) size and reads zero bytes.
+    if pages_so_far > 0 {
+        let size = pc.size_bytes();
+        match mount
+            .payload()
+            .fs_page_backing
+            .truncate(*fs_object_id, size, guard)
+        {
+            V3::Done(()) => {}
+            V3::Continue { progress: _ } => return V3::continue_with(PageProgress::EMPTY),
+            V3::Yield { progress: _, shape } => {
+                let Some((carrier, interests)) =
+                    crate::page_backed::notification::wait_source_parts(&shape)
+                else {
+                    return V3::err(step_engine::Errno::EIO);
+                };
+                return crate::page_backed::notification::yield_on_wait_source(
+                    PageProgress::EMPTY,
+                    carrier,
+                    interests,
+                );
+            }
+            V3::Err(v3_errno) => return V3::err(v3_errno),
+        }
+    }
+
     match mount
         .payload()
         .fs_page_backing

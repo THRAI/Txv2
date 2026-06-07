@@ -368,11 +368,34 @@ pub fn step_msgctl(
                 qbytes,
             }))
         }
-        IPC_INFO | MSG_INFO => Ok(MsgCtlResult::Info {
-            msgmni: 32000,
-            msgmax: 8192,
-            msgmnb: 16384,
-        }),
+        IPC_INFO | MSG_INFO => {
+            // `MSG_INFO` reports live usage; `IPC_INFO` reports limits
+            // (LTP msgctl06). msgpool = queues in use, msgmap/msgtql =
+            // total messages queued.
+            let (msgpool, msgmap, msgtql) = if cmd == MSG_INFO {
+                let queues = crate::ipc::sysv_msg::structure::all_msg_queues();
+                let msgs: u64 = queues
+                    .iter()
+                    .filter_map(|q| {
+                        q.payload
+                            .lock()
+                            .as_ref()
+                            .map(|p| p.msg_count.load(Ordering::Relaxed) as u64)
+                    })
+                    .sum();
+                (queues.len() as u64, msgs, msgs)
+            } else {
+                (0, 0, 0)
+            };
+            Ok(MsgCtlResult::Info {
+                msgmni: 32000,
+                msgmax: 8192,
+                msgmnb: 16384,
+                msgpool,
+                msgmap,
+                msgtql,
+            })
+        }
         _ => Err(Errno::EINVAL),
     }
 }
@@ -418,6 +441,12 @@ pub enum MsgCtlResult {
         msgmni: u64,
         msgmax: u64,
         msgmnb: u64,
+        /// `MSG_INFO`: number of message queues currently allocated.
+        msgpool: u64,
+        /// `MSG_INFO`: total messages queued across all queues.
+        msgmap: u64,
+        /// `MSG_INFO`: total messages queued (== msgmap here).
+        msgtql: u64,
     },
 }
 
