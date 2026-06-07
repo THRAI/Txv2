@@ -549,6 +549,12 @@ pub fn dispatch_clone_oneshot<P: PmapIf>(
     if (flags & CLONE_VFORK) != 0 && (flags & CLONE_THREAD) == 0 {
         return None;
     }
+    // Net/mount-namespace clones take the async fork path (namespace creation +
+    // SYS_ADMIN check); sys_clone_oneshot returns None for them, so this fast
+    // path must defer rather than `.expect(...)` a Some.
+    if (flags & (numbers::CLONE_NEWNET | numbers::CLONE_NEWNS)) != 0 {
+        return None;
+    }
 
     let l0_span = emit_syscall_enter(req);
     let prev = tx_observe::set_current_parent_span(l0_span);

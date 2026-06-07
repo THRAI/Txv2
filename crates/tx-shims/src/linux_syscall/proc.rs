@@ -5,7 +5,9 @@
 
 use super::*;
 use crate::adapter::step_engine::{self as step_engine};
-use crate::linux_syscall::numbers::{CLONE_NEWIPC, CLONE_NEWNET, CLONE_NEWUSER, NR_CLONE};
+use crate::linux_syscall::numbers::{
+    CLONE_NEWIPC, CLONE_NEWNET, CLONE_NEWNS, CLONE_NEWUSER, NR_CLONE,
+};
 
 /// Linux raw `wait4`/`getrusage` rusage image for musl LP64:
 /// two `timeval`s plus fourteen `long` counters. musl passes the
@@ -435,6 +437,13 @@ pub(super) fn sys_clone_oneshot<P: PmapIf>(
         return None;
     }
 
+    // Network/mount-namespace clones (`tst_ns_create net,mnt`) need the
+    // async fork path: it creates+assigns the child's fresh net namespace and
+    // performs the SYS_ADMIN capability check. Fall through.
+    if (flags & (CLONE_NEWNET | CLONE_NEWNS)) != 0 {
+        return None;
+    }
+
     // Validation: the lower byte specifies the exit signal.
     // CLONE_THREAD threads don't generate an exit signal (the
     // thread-group leader's exit signal governs process-wide
@@ -610,6 +619,9 @@ pub(super) fn sys_clone_oneshot<P: PmapIf>(
             clone_vm,
             clone_sighand,
             clone_newipc,
+            // netns/mnt-ns clones fall through to async sys_clone above.
+            clone_newnet: false,
+            clone_newns: false,
             _pmap: core::marker::PhantomData,
         };
         match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
@@ -698,6 +710,8 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
     let clone_vfork = (flags & CLONE_VFORK) != 0;
     let clone_settls = (flags & CLONE_SETTLS) != 0;
     let clone_newipc = (flags & CLONE_NEWIPC) != 0;
+    let clone_newnet = (flags & CLONE_NEWNET) != 0;
+    let clone_newns = (flags & CLONE_NEWNS) != 0;
 
     let allowed_mask = SIGCHLD
         | CLONE_SETTLS
@@ -706,9 +720,27 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
         | CLONE_SIGHAND
         | CLONE_FILES
         | CLONE_FS
-        | CLONE_NEWIPC;
+        | CLONE_NEWIPC
+        | CLONE_NEWNET
+        | CLONE_NEWNS;
     if flags & !allowed_mask != 0 {
         return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    // Creating a network/mount namespace requires CAP_SYS_ADMIN in the
+    // caller's user namespace (matches Linux and the re-homed unshare path).
+    if clone_newnet || clone_newns {
+        let Some(current) = ctx.process.nsproxy_cap() else {
+            return SyscallResult::Error(ESRCH_VALUE);
+        };
+        if !tx_subsystems::process::nsproxy::has_capability_in_user_namespace(
+            ctx.cred(),
+            &current.user_ns,
+            &current.user_ns,
+            Capability::SYS_ADMIN,
+        ) {
+            return SyscallResult::Error(EPERM_VALUE);
+        }
     }
 
     // Snapshot parent's saved trap context. Plan B discipline: the
@@ -735,6 +767,8 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
             clone_vm,
             clone_sighand,
             clone_newipc,
+            clone_newnet,
+            clone_newns,
             _pmap: core::marker::PhantomData,
         };
         match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
