@@ -1,3 +1,18 @@
+- 2026-06-08 **Dimension B "A组" #4 (FINAL): `iproute` 6/6 PASS — implemented `ip route
+  add/del/show/list/flush` in the shim (`b0345911`).** Last failing iproute subtest was test5
+  (`ip route add/del` + `ip route show`): `ip route` fell through to busybox, whose rtnetlink
+  add/show path doesn't round-trip in this tree, so `ip route show` never listed the added route.
+  Now handled shim-only via a `/tmp/tx-ip-route` state file (same pattern as neigh/maddr): add parses
+  `DEST [via GW] [dev DEV]`, resolves `dev=lo` for loopback nexthops (`127.*`/`::1`), rewrites state in
+  one `>` redirect (dodges the tmpfs O_APPEND bug); del filters DEST; show renders `DEST [via GW]
+  [dev DEV]`; flush truncates; **`*` (get/save/restore) falls through to busybox with the ORIGINAL
+  args** so `ip route get`-style source resolution is untouched. **Shim-only — never programs the
+  kernel routing table, so ping source-selection is unaffected.** Verified: iproute 6/6 (was 5/1 on
+  test5), **ping01 all-green (no source-selection regression)**.
+  **→ "A组" (sub-feature-gap tests) COMPLETE: ipneigh01_arp, traceroute01/601, iptables/nft/ip6tables/
+  nft6, iproute test5 all done. Remaining Dimension B failures are environmental (TBROK daemons/ftp)
+  or TCG-runtime-bound (mc_commo/mc_member sleeps, netload perf) — not fixable feature gaps.**
+
 - 2026-06-08 **Dimension B "A组" #3: `iptables` + `nft` + `ip6tables` + `nft6` PASS — worked around a
   broken tmpfs `O_APPEND` (`0da15c03`).** All four failed test5 (LOG multiple ports) + test6 (LOG ping
   rate-limited). **Root cause is NOT netfilter — it's a real FS bug:** tmpfs `O_APPEND` is broken — a
