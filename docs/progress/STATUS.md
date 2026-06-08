@@ -1,3 +1,12 @@
+- 2026-06-08 **Dimension B "A组" #1: `ipneigh01_arp` PASS — SIOCSARP/SIOCDARP ioctl + `/proc/net/arp`
+  (`6cb88062`).** The `arp` variant uses busybox `arp -an` (reads `/proc/net/arp`) + `arp -d <ip> -i
+  <dev>` (SIOCDARP `struct arpreq`); both were dropped in PR#50 (SIOCSARP/SIOCDARP defined but never
+  dispatched, `/proc/net/arp` unserved). Re-homed from the backup into `sys_socket_ioctl`
+  (parse arpreq IPv4/dev/MAC → install/delete_static_neighbor_by_ifindex) + procfs `/proc/net/arp`.
+  Verified: ipneigh01_arp 1/0; iproute still 5/1, ipneigh01_ip still 1/0. **All 4 ipneigh tests now
+  pass** (ipneigh01_arp/ipneigh01_ip/ipneigh6_ip + the iproute ip-neigh subtest). Next A组 items:
+  traceroute01/601 `-T`, iptables/nft/ip6tables/nft6, iproute test5.
+
 - 2026-06-08 **Dimension B: `ipneigh01_ip` + `ipneigh6_ip` PASS — re-homed `/proc/net/tx_neigh` +
   added IPv4 neighbor learning (`35438956`).** LTP ipneigh01 (`ip` variant) pings a peer, expects
   `ip neigh show` to list the auto-created entry, then `ip neigh del` to drop it. Our synthetic echo
