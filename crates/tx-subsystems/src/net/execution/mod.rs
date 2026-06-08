@@ -144,6 +144,24 @@ pub fn sctp_assoc_change_bytes(state: u16, streams: u16, assoc_id: u32) -> alloc
     b
 }
 
+/// Build a COMM_LOST `sctp_assoc_change` for an ungraceful ABORT. lksctp copies
+/// the ABORT chunk that caused the loss into `sac_info[]`, so the total length is
+/// `sizeof(struct sctp_assoc_change) + 4 = 24` (what `test_assoc_abort` asserts),
+/// and `sac_state` is `SCTP_COMM_LOST` (1).
+pub fn sctp_assoc_change_abort_bytes(streams: u16, assoc_id: u32) -> alloc::vec::Vec<u8> {
+    let mut b = alloc::vec![0u8; 24];
+    b[0..2].copy_from_slice(&0x8001u16.to_le_bytes()); // sac_type = SCTP_ASSOC_CHANGE
+    b[4..8].copy_from_slice(&24u32.to_le_bytes()); // sac_length = 24 (20 + 4-byte sac_info)
+    b[8..10].copy_from_slice(&1u16.to_le_bytes()); // sac_state = SCTP_COMM_LOST
+    b[12..14].copy_from_slice(&streams.to_le_bytes()); // sac_outbound_streams
+    b[14..16].copy_from_slice(&streams.to_le_bytes()); // sac_inbound_streams
+    b[16..20].copy_from_slice(&assoc_id.to_le_bytes()); // sac_assoc_id
+    // sac_info[]: the 4-byte ABORT chunk header (type=6, flags=0, length=4).
+    b[20] = 6;
+    b[23] = 4;
+    b
+}
+
 /// Build a `struct sctp_shutdown_event` notification (12 bytes, native/LE).
 /// `sn_type` is SCTP_SHUTDOWN_EVENT (0x8005).
 pub fn sctp_shutdown_event_bytes() -> alloc::vec::Vec<u8> {

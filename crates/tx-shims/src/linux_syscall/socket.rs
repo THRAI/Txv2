@@ -509,6 +509,57 @@ fn record_unix_stream_peer_cred(socket: &Cap<SocketIdentity>, ctx: &SyscallCtx<'
     });
 }
 
+/// `sctp_connectx()` (default symver `sctp_connectx3`) is implemented in lksctp as
+/// `getsockopt(SCTP_SOCKOPT_CONNECTX3)` carrying
+/// `struct sctp_getaddrs_old { sctp_assoc_t assoc_id; int addr_num; struct sockaddr
+/// *addrs; }` (16 bytes on 64-bit): `addr_num` is the byte length of the packed
+/// address array pointed at by `addrs`. We connect to the first address (every
+/// candidate is loopback) and return the new association id in `assoc_id`. An empty
+/// address list (`addr_num == 0`) is EINVAL.
+fn sctp_connectx3(
+    ctx: &SyscallCtx<'_>,
+    socket: &Cap<SocketIdentity>,
+    optval: u64,
+    optlen_ptr: u64,
+) -> Result<(), Errno> {
+    let mut param = [0u8; 16];
+    bootstrap_copy_from_user(&ctx.aspace, &mut param, optval).map_err(|_| Errno::EFAULT)?;
+    let addr_num = i32::from_le_bytes([param[4], param[5], param[6], param[7]]);
+    let addrs_ptr = u64::from_le_bytes([
+        param[8], param[9], param[10], param[11], param[12], param[13], param[14], param[15],
+    ]);
+    if addr_num <= 0 {
+        return Err(Errno::EINVAL);
+    }
+    // Parse the first sockaddr from the packed list (its family sizes it).
+    let remote = match read_sockaddr_in(ctx, addrs_ptr, addr_num as u64) {
+        Ok(remote) => remote,
+        // SCTP maps an unsupported family to EINVAL (sctp_verify_addr).
+        Err(Errno::EAFNOSUPPORT) => return Err(Errno::EINVAL),
+        Err(errno) => return Err(errno),
+    };
+    let remote = connect_sockaddr_for_local_stack(socket.kind, remote);
+    maybe_autobind_connect_client(socket, remote)?;
+    // SCTP loopback associations are established synchronously by step_connect.
+    let outcome = {
+        let guard = tx_substrate::epoch::guard();
+        step_connect(socket, remote, &guard)
+    };
+    match outcome {
+        StepOutcome::Done(()) => {}
+        StepOutcome::Err(errno) => return Err(errno),
+        _ => return Err(Errno::EINPROGRESS),
+    }
+    // Report the association id so it matches the COMM_UP notification's
+    // sac_assoc_id (1-to-many). 1-to-1 sockets keep no peer list → 0.
+    let assoc_id = socket
+        .acquire_operational()
+        .and_then(|p| p.sctp_assoc_id_for_peer(remote.as_ip_endpoint()))
+        .unwrap_or(0);
+    param[0..4].copy_from_slice(&assoc_id.to_le_bytes());
+    write_sockopt_bytes(ctx, optval, optlen_ptr, &param)
+}
+
 mod helpers;
 use helpers::*;
 pub(super) use helpers::{
@@ -1424,7 +1475,10 @@ async fn sendmsg_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
         // early return below.
         if sock_type == Some(SocketType::SeqPacket) && teardown {
             let guard = tx_substrate::epoch::guard();
-            return match step_sctp_shutdown_assoc(&socket, info.assoc_id, &guard) {
+            // SCTP_ABORT (0x4) is an ungraceful teardown (peer gets COMM_LOST);
+            // SCTP_EOF (0x200) is graceful (peer gets SHUTDOWN_EVENT/COMP).
+            let abort = info.flags & 0x0004 != 0;
+            return match step_sctp_shutdown_assoc(&socket, info.assoc_id, abort, &guard) {
                 StepOutcome::Done(()) => SyscallResult::Return(0),
                 StepOutcome::Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
                 _ => SyscallResult::Error(errno_to_i32(Errno::EIO)),
@@ -2177,6 +2231,22 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             };
             payload.with_options_mut(|opts| opts.ip.multicast_loop = on);
             Ok(())
+        }
+        (SOL_SCTP, SCTP_SOCKOPT_BINDX_ADD | SCTP_SOCKOPT_BINDX_REM) => {
+            if socket.kind != SocketKind::Sctp {
+                return SyscallResult::Error(errno_to_i32(Errno::ENOPROTOOPT));
+            }
+            // sctp_bindx(): optval is a packed array of sockaddrs (`optlen` bytes).
+            // Every test address is loopback (127/8, ::1) — already reachable via
+            // the primary binding — so multi-homing add/remove is accepted as a
+            // no-op once the buffer is validated to parse.
+            if optlen < 2 {
+                return SyscallResult::Error(errno_to_i32(Errno::EINVAL));
+            }
+            match read_sockaddr_in(ctx, optval, optlen as u64) {
+                Ok(_) => Ok(()),
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            }
         }
         (SOL_SCTP, SCTP_RTOINFO) => {
             if socket.kind != SocketKind::Sctp {
@@ -3126,6 +3196,9 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
                     _ => Err(Errno::EIO),
                 }
             }
+        }
+        (SOL_SCTP, SCTP_SOCKOPT_CONNECTX3) if socket.kind == SocketKind::Sctp => {
+            sctp_connectx3(ctx, &socket, optval, optlen_ptr)
         }
         (SOL_SCTP, SCTP_GET_LOCAL_ADDRS) if socket.kind == SocketKind::Sctp => {
             match socket_local_endpoint(&socket) {

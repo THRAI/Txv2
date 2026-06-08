@@ -259,7 +259,8 @@ fn notify_sctp_seqpacket_peers_closed(
         _ => return woken,
     };
     for assoc in payload.sctp_peers() {
-        woken += notify_sctp_peer_assoc_closed(local, assoc.peer, assoc.assoc_id, table, guard);
+        woken +=
+            notify_sctp_peer_assoc_closed(local, assoc.peer, assoc.assoc_id, false, table, guard);
     }
     woken
 }
@@ -270,11 +271,14 @@ fn notify_sctp_seqpacket_peers_closed(
 /// socket's local address) and the peer's own association id. Returns the number
 /// of tasks woken. `local` is this socket's local address; `peer_endpoint` is the
 /// association's peer; `fallback_assoc_id` is used if the peer has no matching
-/// association recorded.
+/// association recorded. When `abort` is set the teardown was an ungraceful
+/// SCTP_ABORT: the peer gets a single COMM_LOST assoc_change (24 bytes) and no
+/// SHUTDOWN_EVENT, matching Linux/lksctp.
 fn notify_sctp_peer_assoc_closed(
     local: IpEndpoint,
     peer_endpoint: IpEndpoint,
     fallback_assoc_id: u32,
+    abort: bool,
     table: &SocketTable,
     guard: &Guard<'_>,
 ) -> usize {
@@ -305,8 +309,9 @@ fn notify_sctp_peer_assoc_closed(
     let mut fired = false;
     // SCTP_SHUTDOWN_EVENT is delivered when the peer receives SHUTDOWN;
     // SHUTDOWN_COMP (an assoc_change) when the association is fully torn down. A
-    // 1-to-many socket may subscribe to either or both.
-    if wants_shutdown {
+    // 1-to-many socket may subscribe to either or both. An ungraceful ABORT has
+    // no graceful SHUTDOWN phase, so it emits no SHUTDOWN_EVENT.
+    if wants_shutdown && !abort {
         let bytes = crate::net::execution::sctp_shutdown_event_bytes();
         fired |= peer_payload
             .record_sctp_message(bytes, true, 0, 0, Some(source))
@@ -314,11 +319,15 @@ fn notify_sctp_peer_assoc_closed(
     }
     if wants_assoc_change {
         let streams = peer_payload.with_options(|o| o.sctp.initmsg_num_ostreams);
-        let bytes = crate::net::execution::sctp_assoc_change_bytes(
-            3, /* SHUTDOWN_COMP */
-            streams,
-            peer_assoc_id,
-        );
+        let bytes = if abort {
+            crate::net::execution::sctp_assoc_change_abort_bytes(streams, peer_assoc_id)
+        } else {
+            crate::net::execution::sctp_assoc_change_bytes(
+                3, /* SHUTDOWN_COMP */
+                streams,
+                peer_assoc_id,
+            )
+        };
         fired |= peer_payload
             .record_sctp_message(bytes, true, 0, 0, Some(source))
             .is_some();
@@ -330,12 +339,14 @@ fn notify_sctp_peer_assoc_closed(
     }
 }
 
-/// SCTP_EOF on a 1-to-many (SEQPACKET) socket: gracefully shut down the single
-/// association named by `assoc_id` — notify its peer (SHUTDOWN_EVENT/COMP) and
-/// drop the association from this socket. A no-op if no such association exists.
+/// SCTP_EOF/SCTP_ABORT on a 1-to-many (SEQPACKET) socket: tear down the single
+/// association named by `assoc_id` — notify its peer (SHUTDOWN_EVENT/COMP for a
+/// graceful EOF, or a single COMM_LOST for an ungraceful `abort`) and drop the
+/// association from this socket. A no-op if no such association exists.
 pub fn step_sctp_shutdown_assoc(
     socket: &Cap<SocketIdentity>,
     assoc_id: u32,
+    abort: bool,
     guard: &Guard<'_>,
 ) -> StepOutcome<()> {
     let Some(payload) = socket.acquire_operational() else {
@@ -352,7 +363,7 @@ pub fn step_sctp_shutdown_assoc(
         return StepOutcome::Done(());
     };
     let table = payload.socket_table();
-    notify_sctp_peer_assoc_closed(local, peer_endpoint, assoc_id, table, guard);
+    notify_sctp_peer_assoc_closed(local, peer_endpoint, assoc_id, abort, table, guard);
     payload.sctp_remove_assoc(assoc_id);
     StepOutcome::Done(())
 }

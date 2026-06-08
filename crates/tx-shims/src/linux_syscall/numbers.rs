@@ -2012,9 +2012,14 @@ pub const SCTP_EVENTS: i32 = 11;
 pub const SCTP_MAXSEG: i32 = 13;
 pub const SCTP_STATUS: i32 = 14;
 pub const SCTP_DELAYED_ACK_TIME: i32 = 16;
+pub const SCTP_SOCKOPT_BINDX_ADD: i32 = 100;
+pub const SCTP_SOCKOPT_BINDX_REM: i32 = 101;
 pub const SCTP_SOCKOPT_PEELOFF: i32 = 102;
+pub const SCTP_SOCKOPT_CONNECTX_OLD: i32 = 107;
 pub const SCTP_GET_PEER_ADDRS: i32 = 108;
 pub const SCTP_GET_LOCAL_ADDRS: i32 = 109;
+pub const SCTP_SOCKOPT_CONNECTX: i32 = 110;
+pub const SCTP_SOCKOPT_CONNECTX3: i32 = 111;
 
 // AF_PACKET (SOL_PACKET) options.
 pub const PACKET_RX_RING: i32 = 5;

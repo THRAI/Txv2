@@ -547,6 +547,15 @@ impl SocketPayload {
             .map(|assoc| assoc.peer)
     }
 
+    /// 1-to-many (SEQPACKET): the association id whose peer endpoint is `peer`,
+    /// if such an association exists (used to report sctp_connectx's assoc id).
+    pub fn sctp_assoc_id_for_peer(&self, peer: IpEndpoint) -> Option<u32> {
+        self.sctp_peers()
+            .into_iter()
+            .find(|assoc| assoc.peer == peer)
+            .map(|assoc| assoc.assoc_id)
+    }
+
     /// Number of 1-to-many (SEQPACKET) associations on this socket.
     pub fn sctp_assoc_count(&self) -> usize {
         self.raw_sctp
