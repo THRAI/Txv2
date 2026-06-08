@@ -830,7 +830,17 @@ nf_append_rule() {
             *) shift ;;
         esac
     done
-    echo "$family $target $proto $src $dst $dports $limit $prefix" >> "$state"
+    nf_dmesg_append "$state" "$family $target $proto $src $dst $dports $limit $prefix"
+}
+
+# Append a line via read+rewrite (tmpfs O_APPEND is broken here: `>>` writes at
+# offset 0 and overwrites, so plain `echo >> file` only ever keeps the last line).
+nf_dmesg_append() {
+    nfa_file="$1"
+    nfa_line="$2"
+    nfa_tmp="${nfa_file}.$$"
+    { [ -r "$nfa_file" ] && cat "$nfa_file"; echo "$nfa_line"; } > "$nfa_tmp"
+    mv "$nfa_tmp" "$nfa_file"
 }
 
 nf_iptables() {
@@ -941,11 +951,18 @@ nf_log_ping() {
     n="$count"
     [ "$n" -gt 0 ] 2>/dev/null || n=1
     [ "$1" = 1 ] && [ "$n" -gt 5 ] && n=5
-    i=0
-    while [ "$i" -lt "$n" ]; do
-        echo "$2 SRC=$target DST=$target PROTO=$proto" >> "$dmesg_state"
-        i=$((i + 1))
-    done
+    # tmpfs O_APPEND is broken here (`>>` overwrites at offset 0), so build the
+    # whole file (existing + n new lines) and write it once via truncation.
+    nflp_tmp="${dmesg_state}.$$"
+    {
+        [ -r "$dmesg_state" ] && cat "$dmesg_state"
+        i=0
+        while [ "$i" -lt "$n" ]; do
+            echo "$2 SRC=$target DST=$target PROTO=$proto"
+            i=$((i + 1))
+        done
+    } > "$nflp_tmp"
+    mv "$nflp_tmp" "$dmesg_state"
 }
 
 blocked=
