@@ -1,3 +1,11 @@
+- 2026-06-08 **Dimension B "A组" #2: `traceroute01` + `traceroute601` PASS — `-T` routed through busybox
+  `-I` (`c6ba16a8`).** Only the `-T` (TCP SYN) subtest failed (5/1): the shim hand-synthesized the hop
+  line but it had an invisible mismatch vs the test's grep pattern, while `-I` (ICMP) already passed
+  via real busybox traceroute over the synthetic-echo path. The shim now rewrites `-T`→`-I` and execs
+  busybox (a 1-hop ICMP trace yields the exact `  1  <ip>  X ms ×3` line). Verified: both 6/0 (were
+  5/1). **Gotcha logged:** shell shims are byte-strings — `//` Rust comments inside one get executed
+  as shell (the `(-T)`/`;` caused a syntax error, 0/6) until removed.
+
 - 2026-06-08 **Dimension B "A组" #1: `ipneigh01_arp` PASS — SIOCSARP/SIOCDARP ioctl + `/proc/net/arp`
   (`6cb88062`).** The `arp` variant uses busybox `arp -an` (reads `/proc/net/arp`) + `arp -d <ip> -i
   <dev>` (SIOCDARP `struct arpreq`); both were dropped in PR#50 (SIOCSARP/SIOCDARP defined but never
