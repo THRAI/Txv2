@@ -1,8 +1,8 @@
 use crate::execution::Errno;
 use crate::net::structure::{
     AddressFamily, IpEndpoint, KernelSockAddr, RdsState, SendRecvFlags, SockAddrIn, SockAddrIn6,
-    SockShutdownCmd, SocketIdentity, SocketKind, SocketPayload, SocketProtocol, TcpState, UdpInner,
-    UnixDatagramState, UnixStreamState,
+    SockShutdownCmd, SocketIdentity, SocketKind, SocketPayload, SocketProtocol, SocketType,
+    TcpState, UdpInner, UnixDatagramState, UnixStreamState,
 };
 
 pub(crate) fn endpoint_from_sockaddr(addr: KernelSockAddr) -> Result<IpEndpoint, Errno> {
@@ -256,10 +256,15 @@ pub(crate) fn socket_can_connect(
             (SocketKind::Sctp, SocketProtocol::Sctp(TcpState::Connected { .. })) => {
                 Err(Errno::EISCONN)
             }
-            // 1-to-1 (TCP-style) SCTP: connect() on a listening socket is
-            // rejected with EISCONN, like connect() on an established one.
+            // A 1-to-many (SEQPACKET) listening socket may also initiate new
+            // associations; a 1-to-1 (TCP-style) connect() on a listening socket
+            // is rejected with EISCONN, like connect() on an established one.
             (SocketKind::Sctp, SocketProtocol::Sctp(TcpState::Listening { .. })) => {
-                Err(Errno::EISCONN)
+                if payload.with_options(|o| o.socket.sock_type == SocketType::SeqPacket) {
+                    require_socket_family(payload, endpoint_from_sockaddr(addr)?)
+                } else {
+                    Err(Errno::EISCONN)
+                }
             }
             (
                 SocketKind::Udp,

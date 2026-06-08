@@ -366,7 +366,11 @@ async fn accept_impl<'a, P: TimeIf>(
                     Ok(opened) => opened,
                     Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
                 };
-                let write_addr = if listener.kind == SocketKind::UnixStream {
+                let write_addr = if addr_ptr == 0 {
+                    // accept(fd, NULL, addrlen): Linux returns no peer address and
+                    // leaves addrlen untouched (it is not faulted even if non-NULL).
+                    Ok(())
+                } else if listener.kind == SocketKind::UnixStream {
                     write_sockaddr_un(ctx, addr_ptr, addrlen_ptr, accepted.unix_peer)
                 } else {
                     write_sockaddr_endpoint(ctx, addr_ptr, addrlen_ptr, accepted.peer)
@@ -2495,7 +2499,9 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
                 return SyscallResult::Error(errno_to_i32(Errno::ENOPROTOOPT));
             }
             // struct sctp_sndrcvinfo (32B): sinfo_stream@0, sinfo_ppid@8,
-            // sinfo_assoc_id@28. A non-zero assoc_id must name an association.
+            // sinfo_assoc_id@28. On a 1-to-many socket a non-zero assoc_id must
+            // name an association; on a 1-to-1 (TCP-style) socket the assoc_id is
+            // ignored entirely.
             if (optlen as usize) < SCTP_SNDRCVINFO_BYTES {
                 return SyscallResult::Error(errno_to_i32(Errno::EINVAL));
             }
@@ -2504,7 +2510,8 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
                 return SyscallResult::Error(errno_to_i32(errno));
             }
             let assoc_id = u32::from_le_bytes([buf[28], buf[29], buf[30], buf[31]]);
-            if assoc_id != 0 && payload.sctp_peer_addr_by_assoc(assoc_id).is_none() {
+            let is_seqpacket = payload.with_options(|o| o.socket.sock_type == SocketType::SeqPacket);
+            if is_seqpacket && assoc_id != 0 && payload.sctp_peer_addr_by_assoc(assoc_id).is_none() {
                 return SyscallResult::Error(errno_to_i32(Errno::EINVAL));
             }
             payload.with_options_mut(|opts| opts.sctp.default_send_param = buf);
