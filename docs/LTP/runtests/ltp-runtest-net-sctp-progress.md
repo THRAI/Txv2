@@ -10,6 +10,25 @@ Date: 2026-06-04
 
 ## 当前状态
 
+**2026-06-09 续做:+10 个条目通过**(`feature-network-next`,逐个 rv64-qemu 验证 + 提交):
+`test_assoc_abort`、`test_1_to_1_connectx`、`test_peeloff`(+v6)、`test_connect`、
+`test_fragments`(+v6)、`test_sockopt`(+v6,44/44)、`test_autoclose`。要点见
+`docs/progress/STATUS.md` 2026-06-09 条。**剩余 7 个未过,均为深层/受限(非快速缺口)**:
+- `test_1_to_1_recvmsg`/`test_1_to_1_sendmsg`:**musl libc 阻塞** —— `(struct msghdr*)-1`
+  在 musl 的 recvmsg/sendmsg wrapper 里**用户态**解引用即段错误,内核根本看不到这次调用
+  (内核的 copy_to/from_user(-1) 本身已正确返 EFAULT)。内核侧无解,改测试/libc 属作弊。
+  最多 3/8、5/14。
+- `test_sctp_sendrecvmsg`(+v6)、`test_timetolive`(+v6):需真正的 **PR-SCTP** —— fillmsg
+  填满 rwnd 使带 TTL 的消息卡在发送队列、在 sleep(3) 期间过期,然后发送端收到
+  `SCTP_SEND_FAILED` 通知(携带被丢弃消息、按分片切片)。= rwnd 流控 + TTL 定时器 +
+  SEND_FAILED,体量大且与"loopback 即时投递"模型冲突。
+- `test_connectx`:**多宿主** —— test_peer_addr 要 getpaddrs 返回每个关联的全部 NUMADDR
+  (127.0.0.x)对端地址 + 非阻塞 connectx EINPROGRESS 且 assoc_id 对齐;当前模型每关联只存
+  一个 peer。(bindx + CONNECTX3 已做,多宿主模型未做。)
+> 排错经验:sockopt 结构偏移对不上时,去读测试头文件里的真实 `struct` 定义 ——
+> `packed`/`aligned` 属性会改偏移(本次 `struct sctp_paddrinfo` 是 packed,aligned(4),
+> `spinfo_address` 在偏移 **4** 而非 8,卡了好几轮)。
+
 **阶段 0 已应用(开门 + STREAM/SEQPACKET socket 映射)。**
 
 - 门已开:`modules.builtin`/`modules.dep` 加了 `kernel/net/sctp/sctp.ko`
