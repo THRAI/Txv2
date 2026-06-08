@@ -3491,6 +3491,58 @@ pub(super) fn fast_close_stateless_netlink_socket_file(file: &Cap<OpenFile>) {
 /// content (cfc8c17c / 1a81cd89, sp); re-homed here onto main during the
 /// 2026-06-05 rebase (lives in socket.rs where net_namespace()/bootstrap_*
 /// resolve; routed from fs_basic.rs::sys_ioctl for StructPayload::Socket).
+// `struct arpreq` (SIOCSARP/SIOCDARP): arp_pa (sockaddr, 0..16), arp_ha
+// (sockaddr, 16..32), arp_flags (int, 32..36), arp_netmask (sockaddr, 36..52),
+// arp_dev (char[16], 52..68).
+const ARPREQ_BYTES: usize = 68;
+const ARPREQ_HA_OFFSET: usize = 16;
+const ARPREQ_DEV_OFFSET: usize = 52;
+const ARPREQ_IN_ADDR_OFFSET: usize = 4; // sockaddr_in.sin_addr
+const ARPREQ_SA_DATA_OFFSET: usize = 2; // sockaddr.sa_data (ARPHRD_ETHER defined above)
+
+fn parse_arpreq_ipv4(bytes: &[u8; ARPREQ_BYTES]) -> Result<Ipv4Address, i32> {
+    let family = u16::from_le_bytes(bytes[0..2].try_into().unwrap());
+    if family != 2 {
+        return Err(errno_to_i32(Errno::EAFNOSUPPORT));
+    }
+    Ok(Ipv4Address::new([
+        bytes[ARPREQ_IN_ADDR_OFFSET],
+        bytes[ARPREQ_IN_ADDR_OFFSET + 1],
+        bytes[ARPREQ_IN_ADDR_OFFSET + 2],
+        bytes[ARPREQ_IN_ADDR_OFFSET + 3],
+    ]))
+}
+
+fn parse_arpreq_device(bytes: &[u8; ARPREQ_BYTES]) -> Result<Option<&str>, i32> {
+    let dev = &bytes[ARPREQ_DEV_OFFSET..ARPREQ_DEV_OFFSET + 16];
+    let end = dev.iter().position(|byte| *byte == 0).unwrap_or(16);
+    if end == 0 {
+        return Ok(None);
+    }
+    core::str::from_utf8(&dev[..end])
+        .map(Some)
+        .map_err(|_| EINVAL_VALUE)
+}
+
+fn parse_arpreq_ethernet_addr(
+    bytes: &[u8; ARPREQ_BYTES],
+) -> Result<tx_subsystems::net::EthernetAddress, i32> {
+    let family =
+        u16::from_le_bytes(bytes[ARPREQ_HA_OFFSET..ARPREQ_HA_OFFSET + 2].try_into().unwrap());
+    if family != 0 && family != ARPHRD_ETHER {
+        return Err(EINVAL_VALUE);
+    }
+    let base = ARPREQ_HA_OFFSET + ARPREQ_SA_DATA_OFFSET;
+    Ok(tx_subsystems::net::EthernetAddress::new([
+        bytes[base],
+        bytes[base + 1],
+        bytes[base + 2],
+        bytes[base + 3],
+        bytes[base + 4],
+        bytes[base + 5],
+    ]))
+}
+
 pub(super) fn sys_socket_ioctl<'a>(request: u32, argp: u64, ctx: &SyscallCtx<'a>) -> SyscallResult {
     const IFREQ_NAME_BYTES: usize = 16;
     const IFREQ_BYTES: usize = 40;
@@ -3571,6 +3623,53 @@ pub(super) fn sys_socket_ioctl<'a>(request: u32, argp: u64, ctx: &SyscallCtx<'a>
         return match bootstrap_write_user(&ctx.aspace, argp, out_name) {
             Ok(()) => SyscallResult::Return(0),
             Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+        };
+    }
+
+    if request == SIOCSARP || request == SIOCDARP {
+        let mut arpreq = [0u8; ARPREQ_BYTES];
+        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut arpreq, argp) {
+            return SyscallResult::Error(errno_to_i32(errno));
+        }
+        let ip = match parse_arpreq_ipv4(&arpreq) {
+            Ok(ip) => ip,
+            Err(errno) => return SyscallResult::Error(errno),
+        };
+        let dev = match parse_arpreq_device(&arpreq) {
+            Ok(dev) => dev,
+            Err(errno) => return SyscallResult::Error(errno),
+        };
+        let links = netns.link_snapshot();
+        let link = if let Some(dev) = dev {
+            links.iter().find(|link| link.name == dev)
+        } else if let Some(route) = netns.best_ipv4_route(ip) {
+            links.iter().find(|link| link.name == route.oif_name)
+        } else {
+            links
+                .iter()
+                .find(|link| !link.is_loopback && link.ipv4_addr.is_some())
+        };
+        let Some(link) = link else {
+            return SyscallResult::Error(ENODEV_VALUE);
+        };
+        let auth = tx_subsystems::net::NetAdminAuthority::for_test_or_bootstrap();
+        return match request {
+            SIOCDARP => match netns.delete_static_neighbor_by_ifindex(auth, link.ifindex, ip) {
+                Ok(()) => SyscallResult::Return(0),
+                Err(Errno::ENOENT) => SyscallResult::Error(ENXIO_VALUE),
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+            },
+            SIOCSARP => {
+                let mac = match parse_arpreq_ethernet_addr(&arpreq) {
+                    Ok(mac) => mac,
+                    Err(errno) => return SyscallResult::Error(errno),
+                };
+                match netns.install_static_neighbor_by_ifindex(auth, link.ifindex, ip, mac) {
+                    Ok(()) => SyscallResult::Return(0),
+                    Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+                }
+            }
+            _ => unreachable!(),
         };
     }
 
