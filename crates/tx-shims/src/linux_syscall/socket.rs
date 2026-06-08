@@ -62,6 +62,11 @@ const SCTP_SNDRCVINFO_BYTES: usize = 32;
 /// sinfo_flags bits that request association teardown — invalid on a 1-to-1
 /// (TCP-style) socket: SCTP_ABORT (0x4) and SCTP_EOF (MSG_FIN, 0x200).
 const SCTP_SINFO_TEARDOWN_FLAGS: u16 = 0x0004 | 0x0200;
+
+/// Default association fragmentation point when SCTP_MAXSEG is unset: the loopback
+/// MTU (65536) minus SCTP common + DATA chunk overhead. With SCTP_DISABLE_FRAGMENTS
+/// a single message larger than this is rejected with EMSGSIZE instead of split.
+const SCTP_DEFAULT_FRAG_POINT: usize = 65515;
 const SCM_RIGHTS: i32 = 1;
 const MAX_MSG_IOV: u64 = 1024;
 const SOCKET_MSG_MAX_BYTES: usize = 1024 * 1024;
@@ -1514,6 +1519,23 @@ async fn sendmsg_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
     // send so the peer's recvmsg can echo the ancillary data back.
     if socket.kind == SocketKind::Sctp {
         let info = sctp_info.unwrap_or_default();
+        // SCTP_DISABLE_FRAGMENTS: a message larger than the association
+        // fragmentation point is rejected with EMSGSIZE rather than split.
+        let (disable_frag, maxseg) = socket
+            .acquire_operational()
+            .map_or((false, 0u32), |p| {
+                p.with_options(|o| (o.sctp.disable_fragments, o.sctp.maxseg))
+            });
+        if disable_frag {
+            let frag_point = if maxseg != 0 {
+                maxseg as usize
+            } else {
+                SCTP_DEFAULT_FRAG_POINT
+            };
+            if total_len > frag_point {
+                return SyscallResult::Error(errno_to_i32(Errno::EMSGSIZE));
+            }
+        }
         let is_seqpacket = socket
             .acquire_operational()
             .is_some_and(|p| p.with_options(|o| o.socket.sock_type == SocketType::SeqPacket));
