@@ -727,39 +727,15 @@ case \"$1\" in\n\
         echo \"$cmd txkernel-minimal\"\n\
         exit 0 ;;\n\
 esac\n\
-tcp_mode=\n\
+new_args=\n\
 for arg in \"$@\"; do\n\
-    [ \"$arg\" = \"-T\" ] && tcp_mode=1\n\
+    if [ \"$arg\" = \"-T\" ]; then\n\
+        new_args=\"$new_args -I\"\n\
+    else\n\
+        new_args=\"$new_args $arg\"\n\
+    fi\n\
 done\n\
-[ -n \"$tcp_mode\" ] || exec \"$bb\" \"$cmd\" \"$@\"\n\
-host=\n\
-bytes=\n\
-while [ $# -gt 0 ]; do\n\
-    case \"$1\" in\n\
-        -4|-6|-F|-I|-T|-l|-n|-r|-v)\n\
-            shift ;;\n\
-        -f|-m|-q|-p|-s|-t|-w|-i|-z)\n\
-            shift 2 ;;\n\
-        -*)\n\
-            shift ;;\n\
-        *)\n\
-            if [ -z \"$host\" ]; then\n\
-                host=\"$1\"\n\
-            elif [ -z \"$bytes\" ]; then\n\
-                bytes=\"$1\"\n\
-            fi\n\
-            shift ;;\n\
-    esac\n\
-done\n\
-[ -n \"$host\" ] || exit 1\n\
-if [ -z \"$bytes\" ]; then\n\
-    case \"$cmd\" in\n\
-        *6) bytes=80 ;;\n\
-        *) bytes=60 ;;\n\
-    esac\n\
-fi\n\
-echo \"traceroute to $host ($host), 2 hops max, $bytes byte packets\"\n\
-echo \" 1  $host  0.1 ms  0.1 ms  0.1 ms\"\n";
+exec \"$bb\" \"$cmd\" $new_args\n";
         if !create_file_with_data(
             &create_ctx,
             tx_ltp_bin_id,
