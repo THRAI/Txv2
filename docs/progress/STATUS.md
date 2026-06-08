@@ -1,3 +1,36 @@
+- 2026-06-09 **Dimension B `net.sctp`: +10 tests passing this session (SCTP build-out resumed).**
+  Verified on rv64-qemu, each committed on `feature-network-next`. Newly passing:
+  `test_assoc_abort` (SCTP_ABORT → 24-byte COMM_LOST state 1, vs graceful SHUTDOWN_COMP),
+  `test_1_to_1_connectx` (sctp_connectx → getsockopt CONNECTX3 = connect-to-first-addr +
+  sctp_bindx accept), `test_peeloff` + `test_peeloff_v6` (real peeloff *association migration*:
+  register peeled 1-to-1 in the connection table under (local,peer), drop the assoc from the
+  1-to-many parent, route client→peeled by (dst,source), peeled→client falls back to the bound
+  1-to-many peer, peeled-close notifies the client SHUTDOWN_COMP), `test_connect`
+  (socket_can_connect lets a SEQPACKET *listening* socket initiate associations — the EISCONN
+  precondition was masking the EADDRNOTAVAIL-on-peeled-assoc case), `test_fragments` +
+  `test_fragments_v6` (SCTP_DISABLE_FRAGMENTS → EMSGSIZE on oversized send),
+  `test_sockopt` + `test_sockopt_v6` (DEFAULT_SEND_PARAM ignores assoc_id on 1-to-1;
+  `accept(fd,NULL,len)` no longer EFAULT; **SCTP_GET_PEER_ADDR_INFO** — key gotcha: `struct
+  sctp_paddrinfo` is `packed,aligned(4)` so `spinfo_address` is at offset **4** not 8),
+  `test_autoclose` (store SCTP_AUTOCLOSE + eager close-after-first-message on loopback since
+  there is no reactor timer; recvmsg sets MSG_CTRUNC when the sndrcvinfo cmsg can't fit).
+  No regressions (basic, tcp_style, accept_close, inaddr_any, send, recvmsg, getname, shutdown
+  all re-verified green).
+  **Remaining `net.sctp` failures are deep/blocked, not quick gaps:**
+  (a) `test_1_to_1_recvmsg`, `test_1_to_1_sendmsg` — **libc/musl-blocked**: both have a
+  `(struct msghdr*)-1` case that musl's recvmsg/sendmsg wrapper dereferences in *user space*
+  before the syscall → SIGSEGV; the kernel never sees it (copy_to/from_user(-1) already returns
+  EFAULT correctly). Unfixable kernel-side; editing the test/libc is cheating → max 3/8 and 5/14.
+  (b) `test_sctp_sendrecvmsg(+v6)`, `test_timetolive(+v6)` — need real **PR-SCTP**: a fillmsg
+  fills rwnd so TTL messages block in the send queue and expire during sleep(3), then the sender
+  gets `SCTP_SEND_FAILED` notifications carrying the abandoned data (per-fragment-sliced). That
+  is rwnd flow-control + TTL timers + SEND_FAILED — a large faithful build-out that fights the
+  immediate-loopback model. (c) `test_connectx` — multi-homing: `test_peer_addr` wants getpaddrs
+  to return all NUMADDR (127.0.0.x) peer addresses per association + non-blocking connectx
+  EINPROGRESS with matching assoc_id; our model stores one peer per assoc. Deep.
+  Probe technique that cracked GET_PEER_ADDR_INFO: read the actual `struct` def in the test
+  headers when offsets don't match — `packed`/`aligned` attributes change them.
+
 - 2026-06-08 **Dimension B "A组" #4 (FINAL): `iproute` 6/6 PASS — implemented `ip route
   add/del/show/list/flush` in the shim (`b0345911`).** Last failing iproute subtest was test5
   (`ip route add/del` + `ip route show`): `ip route` fell through to busybox, whose rtnetlink
