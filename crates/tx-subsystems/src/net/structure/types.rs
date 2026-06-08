@@ -610,6 +610,9 @@ pub struct SctpLevelOptions {
     pub maxseg: u32,
     /// SCTP_DISABLE_FRAGMENTS: reject messages larger than the fragment point.
     pub disable_fragments: bool,
+    /// SCTP_AUTOCLOSE: idle seconds after which a 1-to-many association closes
+    /// automatically (0 = disabled).
+    pub autoclose: u32,
 }
 
 impl SctpLevelOptions {
@@ -776,6 +779,7 @@ impl SocketOptionSet {
                 default_send_param: [0u8; 32],
                 maxseg: 0,
                 disable_fragments: false,
+                autoclose: 0,
             },
         }
     }
@@ -851,6 +855,7 @@ impl SocketOptionSet {
                 default_send_param: [0u8; 32],
                 maxseg: 0,
                 disable_fragments: false,
+                autoclose: 0,
             },
         }
     }

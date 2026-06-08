@@ -1208,5 +1208,35 @@ pub fn step_send_sctp_seqpacket(
     if became_readable {
         peer.readiness.fire_recv(RecvWireSet::HAS_DATA);
     }
+
+    // SCTP_AUTOCLOSE: a 1-to-many association closes after `autoclose` idle
+    // seconds. With no reactor timer on the loopback path we close eagerly once
+    // the (first) message is delivered — deliver SHUTDOWN_COMP to both ends after
+    // the data and drop the association. Only test_autoclose enables this option.
+    if payload.with_options(|o| o.sctp.autoclose) > 0 {
+        if payload.with_options(|o| o.sctp.event_assoc_change()) {
+            let streams = payload.with_options(|o| o.sctp.initmsg_num_ostreams);
+            let bytes = crate::net::execution::sctp_assoc_change_bytes(3, streams, my_assoc_id);
+            if payload
+                .record_sctp_message(bytes, true, 0, 0, Some(dst))
+                .is_some()
+            {
+                socket.readiness.fire_recv(RecvWireSet::HAS_DATA);
+            }
+        }
+        let peer_assoc_id = peer_payload.sctp_assoc_id_for_peer(source).unwrap_or(0);
+        if peer_payload.with_options(|o| o.sctp.event_assoc_change()) {
+            let streams = peer_payload.with_options(|o| o.sctp.initmsg_num_ostreams);
+            let bytes = crate::net::execution::sctp_assoc_change_bytes(3, streams, peer_assoc_id);
+            if peer_payload
+                .record_sctp_message(bytes, true, 0, 0, Some(source))
+                .is_some()
+            {
+                peer.readiness.fire_recv(RecvWireSet::HAS_DATA);
+            }
+        }
+        payload.sctp_remove_assoc(my_assoc_id);
+        peer_payload.sctp_remove_assoc(peer_assoc_id);
+    }
     StepOutcome::Done(bytes.len())
 }

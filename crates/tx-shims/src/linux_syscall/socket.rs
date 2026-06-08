@@ -1324,11 +1324,13 @@ fn write_sctp_sndrcv_cmsg(
     header: UserMsghdr,
     stream: u16,
     ppid: u32,
-) -> Result<(), Errno> {
+) -> Result<bool, Errno> {
     const CMSG_HDR: usize = 16;
     const TOTAL: usize = CMSG_HDR + SCTP_SNDRCVINFO_BYTES; // CMSG_LEN(sizeof sndrcvinfo) = 48
     if header.control == 0 || (header.controllen as usize) < TOTAL {
-        return Ok(());
+        // The sndrcvinfo cmsg does not fit: the data is still delivered but the
+        // control message is truncated (the caller sets MSG_CTRUNC).
+        return Ok(true);
     }
     let mut buf = [0u8; TOTAL];
     buf[0..8].copy_from_slice(&(TOTAL as u64).to_le_bytes()); // cmsg_len
@@ -1338,7 +1340,7 @@ fn write_sctp_sndrcv_cmsg(
     buf[CMSG_HDR + 8..CMSG_HDR + 12].copy_from_slice(&ppid.to_le_bytes()); // sinfo_ppid
     bootstrap_copy_to_user(&ctx.aspace, header.control, &buf)?;
     write_msghdr_controllen(ctx, msghdr_ptr, TOTAL as u64)?;
-    Ok(())
+    Ok(false)
 }
 
 pub(super) fn sys_sendmsg<'a>(
@@ -1908,14 +1910,19 @@ async fn recvmsg_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
                         p.with_options(|o| o.sctp.events_subscribe[0] != 0)
                     })
                 {
-                    if let Err(errno) = write_sctp_sndrcv_cmsg(
+                    match write_sctp_sndrcv_cmsg(
                         ctx,
                         args[1],
                         header,
                         recv.sctp_stream,
                         recv.sctp_ppid,
                     ) {
-                        return SyscallResult::Error(errno_to_i32(errno));
+                        Ok(truncated) => {
+                            if truncated {
+                                msg_flags |= MSG_CTRUNC_BITS;
+                            }
+                        }
+                        Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
                     }
                 }
                 match write_raw_ipv6_recvmsg_control(
@@ -2330,7 +2337,14 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             if payload.with_options(|o| o.socket.sock_type == SocketType::Stream) {
                 return SyscallResult::Error(errno_to_i32(Errno::EOPNOTSUPP));
             }
-            // 1-to-many: accept and ignore the autoclose timeout for now.
+            // 1-to-many: store the autoclose timeout (seconds). On our loopback
+            // path an established association closes once its first message is
+            // delivered (no reactor timer), which is what test_autoclose observes.
+            let secs = match read_sockopt_i32(ctx, optval, optlen) {
+                Ok(val) => val.max(0) as u32,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            payload.with_options_mut(|opts| opts.sctp.autoclose = secs);
             Ok(())
         }
         (SOL_SCTP, SCTP_MAXSEG) => {
