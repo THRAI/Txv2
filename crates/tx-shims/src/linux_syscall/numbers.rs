@@ -2011,6 +2011,7 @@ pub const SCTP_DEFAULT_SEND_PARAM: i32 = 10;
 pub const SCTP_EVENTS: i32 = 11;
 pub const SCTP_MAXSEG: i32 = 13;
 pub const SCTP_STATUS: i32 = 14;
+pub const SCTP_GET_PEER_ADDR_INFO: i32 = 15;
 pub const SCTP_DELAYED_ACK_TIME: i32 = 16;
 pub const SCTP_SOCKOPT_BINDX_ADD: i32 = 100;
 pub const SCTP_SOCKOPT_BINDX_REM: i32 = 101;

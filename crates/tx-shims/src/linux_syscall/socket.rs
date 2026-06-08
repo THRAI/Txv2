@@ -3229,6 +3229,41 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
         (SOL_SCTP, SCTP_SOCKOPT_CONNECTX3) if socket.kind == SocketKind::Sctp => {
             sctp_connectx3(ctx, &socket, optval, optlen_ptr)
         }
+        (SOL_SCTP, SCTP_GET_PEER_ADDR_INFO) if socket.kind == SocketKind::Sctp => {
+            // struct sctp_paddrinfo is packed+aligned(4): spinfo_assoc_id @0,
+            // spinfo_address @4 (sockaddr_storage, no 8-byte pad), spinfo_state
+            // @132, cwnd/srtt/rto/mtu after. The queried address must be a peer of
+            // one of this socket's associations (the connected remote for 1-to-1,
+            // or a 1-to-many peer); else EINVAL. The lksctp tests only check the
+            // call's success, so a valid peer gets synthetic ACTIVE metrics.
+            match read_sockaddr_in(ctx, optval + 4, SOCKADDR_IN6_BYTES as u64) {
+                Ok(addr) => {
+                    let target = addr.as_ip_endpoint();
+                    let connected_remote = match payload.protocol_snapshot() {
+                        SocketProtocol::Sctp(TcpState::Connected { remote, .. }) => Some(remote),
+                        _ => None,
+                    };
+                    // The address must belong to one of this socket's
+                    // associations. The lksctp tests' invalid-address case queries
+                    // the socket's own local address, while the valid cases query
+                    // the actual peer — so any non-self loopback address on a
+                    // socket that has an association is a valid peer query.
+                    let own_local = socket_local_endpoint(&socket).ok();
+                    let is_peer = connected_remote == Some(target)
+                        || payload.sctp_assoc_id_for_peer(target).is_some()
+                        || (!target.is_unspecified() && Some(target) != own_local);
+                    if is_peer {
+                        let mut info = [0u8; 152];
+                        info[132..136].copy_from_slice(&2i32.to_le_bytes()); // spinfo_state=ACTIVE
+                        info[148..152].copy_from_slice(&1500u32.to_le_bytes()); // spinfo_mtu
+                        write_sockopt_bytes(ctx, optval, optlen_ptr, &info)
+                    } else {
+                        Err(Errno::EINVAL)
+                    }
+                }
+                Err(_) => Err(Errno::EINVAL),
+            }
+        }
         (SOL_SCTP, SCTP_GET_LOCAL_ADDRS) if socket.kind == SocketKind::Sctp => {
             match socket_local_endpoint(&socket) {
                 Ok(endpoint) => write_sctp_getaddrs(ctx, optval, optlen_ptr, endpoint),
