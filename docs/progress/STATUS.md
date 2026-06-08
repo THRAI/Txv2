@@ -1,3 +1,17 @@
+- 2026-06-08 **Dimension B "A组" #3: `iptables` + `nft` + `ip6tables` + `nft6` PASS — worked around a
+  broken tmpfs `O_APPEND` (`0da15c03`).** All four failed test5 (LOG multiple ports) + test6 (LOG ping
+  rate-limited). **Root cause is NOT netfilter — it's a real FS bug:** tmpfs `O_APPEND` is broken — a
+  re-opened non-empty file reports `pc.size_bytes()==0`, so the `O_APPEND` seek-to-EOF
+  (`vfs/execution.rs:600`) goes to offset 0 and every `echo >> file` OVERWRITES instead of appends
+  (only the last line survives). So the netfilter rule store lost its range rule when the multiport
+  rule was added, and the ping-LOG kept 1 of 5 lines. **Worked around in the shims** (FS fix is out of
+  this networking scope): `nf_append_rule`/`nf_log_ping` now read+rewrite via `> tmp; mv` (the pattern
+  `nf_flush_family` already uses; `O_TRUNC` works). iptables 6/0, ip6tables 6/0, nft 5/0+1TCONF, nft6
+  5/0+1TCONF. **⚠ The tmpfs `O_APPEND` bug is general — any `>>` across processes overwrites; worth a
+  proper FS fix (page-container size not restored on re-open) — likely blocks other LTP tests too.**
+  **Gotcha logged:** non-ASCII (em-dash) inside a `br#"..."#` byte-string is a compile error → the
+  build silently fails and the cp/run uses the STALE kernel (cost one wasted round here).
+
 - 2026-06-08 **Dimension B "A组" #2: `traceroute01` + `traceroute601` PASS — `-T` routed through busybox
   `-I` (`c6ba16a8`).** Only the `-T` (TCP SYN) subtest failed (5/1): the shim hand-synthesized the hop
   line but it had an invisible mismatch vs the test's grep pattern, while `-I` (ICMP) already passed
