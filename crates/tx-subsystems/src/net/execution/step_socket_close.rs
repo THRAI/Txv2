@@ -82,6 +82,12 @@ pub fn step_socket_close(
                 let peer_wakes = mark_sctp_peer_closed(&peer);
                 peer_recv_woken += peer_wakes.recv_woken;
                 peer_send_woken += peer_wakes.send_woken;
+            } else {
+                // No 1-to-1 connection peer: a peeled-off socket whose peer is a
+                // 1-to-many client. Deliver the SHUTDOWN_COMP assoc_change to the
+                // client's association.
+                peer_recv_woken +=
+                    notify_sctp_peer_assoc_closed(local, remote, 0, false, table, guard);
             }
             bindings_withdrawn +=
                 withdraw_ok(table.withdraw_sctp_connection(ConnectionKey::new(local, remote)));

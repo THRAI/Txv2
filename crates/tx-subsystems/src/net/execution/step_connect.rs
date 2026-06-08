@@ -427,10 +427,15 @@ fn step_sctp_connect(
         SocketProtocol::Sctp(TcpState::Connected { .. }) => {
             return StepOutcome::Err(Errno::EISCONN)
         }
-        // Linux 1-to-1 (TCP-style) SCTP returns EISCONN for connect() on a
-        // listening socket, the same as on an already-connected one.
-        SocketProtocol::Sctp(TcpState::Listening { .. }) => {
-            return StepOutcome::Err(Errno::EISCONN)
+        // A 1-to-many (SEQPACKET) listening socket may also initiate new
+        // associations; a 1-to-1 (TCP-style) listening socket cannot, so connect()
+        // on it is EISCONN, the same as on an already-connected one.
+        SocketProtocol::Sctp(TcpState::Listening { local, .. }) => {
+            if payload.with_options(|o| o.socket.sock_type == SocketType::SeqPacket) {
+                select_tcp_connect_local(payload, local, remote)
+            } else {
+                return StepOutcome::Err(Errno::EISCONN);
+            }
         }
         SocketProtocol::Sctp(TcpState::Closed) => return StepOutcome::Err(Errno::ENOTCONN),
         _ => return StepOutcome::Err(Errno::EINVAL),
@@ -443,6 +448,15 @@ fn step_sctp_connect(
     }
 
     let table = payload.socket_table();
+    // A 1-to-many socket cannot re-create an association that has been peeled off
+    // (its (local, remote) connection slot is owned by the peeled 1-to-1 socket).
+    if payload.with_options(|o| o.socket.sock_type == SocketType::SeqPacket)
+        && table
+            .lookup_sctp_connection(ConnectionKey::new(local, remote), guard)
+            .is_some()
+    {
+        return StepOutcome::Err(Errno::EADDRNOTAVAIL);
+    }
     let Some(listener) = table.lookup_sctp_listener_dual_stack_endpoint(remote, guard) else {
         return StepOutcome::Err(Errno::ECONNREFUSED);
     };
@@ -541,7 +555,7 @@ fn step_sctp_connect(
 pub fn step_sctp_peeloff(
     socket: &Cap<SocketIdentity>,
     assoc_id: u32,
-    _guard: &Guard<'_>,
+    guard: &Guard<'_>,
 ) -> StepOutcome<Cap<SocketIdentity>> {
     let Some(payload) = socket.acquire_operational() else {
         return StepOutcome::Err(Errno::ENOTCONN);
@@ -565,15 +579,27 @@ pub fn step_sctp_peeloff(
     // association's peer.
     let mut options = payload.with_options(Clone::clone);
     options.socket.sock_type = SocketType::Stream;
-    match registry::create_connected_sctp_for_accept_in_namespace(
+    let child = match registry::create_connected_sctp_for_accept_in_namespace(
         local,
         peer,
         options,
         payload.net_namespace(),
     ) {
-        Ok(child) => StepOutcome::Done(child),
-        Err(_) => StepOutcome::Err(Errno::ENOMEM),
+        Ok(child) => child,
+        Err(_) => return StepOutcome::Err(Errno::ENOMEM),
+    };
+    // Migrate the association onto the peeled-off socket: register it under
+    // (local, peer) so the peer's future messages route to it (the peer is a
+    // 1-to-many socket, so only this end is a connection-table entry) and so its
+    // close notifies the peer; then drop the association from the 1-to-many parent
+    // (a subsequent SCTP_STATUS on this assoc id reports EINVAL).
+    let table = payload.socket_table();
+    if let Err(error) = table.insert_sctp_connection(ConnectionKey::new(local, peer), child.clone())
+    {
+        return StepOutcome::Err(table_error_to_errno(error));
     }
+    payload.sctp_remove_assoc(assoc_id);
+    StepOutcome::Done(child)
 }
 
 fn sctp_listener_accepts_incoming(

@@ -1007,6 +1007,25 @@ fn send_sctp_stream_bytes(
     };
     let table = payload.socket_table();
     let Some(peer) = table.lookup_sctp_connection(ConnectionKey::new(remote, local), guard) else {
+        // No 1-to-1 connection peer: after sctp_peeloff the peer is a 1-to-many
+        // (SEQPACKET) socket bound at `remote`. Deliver tagged with our local
+        // endpoint as the source so the client attributes it to its association.
+        if let Some(peer) = table.lookup_sctp_bound(remote, guard) {
+            if let Some(peer_payload) = peer.acquire_operational() {
+                if peer_payload.shutdown_rd() {
+                    return StepOutcome::Done(bytes.len());
+                }
+                if let Some(became_readable) =
+                    peer_payload.record_sctp_message(bytes.to_vec(), false, stream, ppid, Some(local))
+                {
+                    if became_readable {
+                        peer.readiness.fire_recv(RecvWireSet::HAS_DATA);
+                    }
+                    return StepOutcome::Done(bytes.len());
+                }
+                return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
+            }
+        }
         return StepOutcome::Err(Errno::EPIPE);
     };
     let Some(peer_payload) = peer.acquire_operational() else {
@@ -1137,6 +1156,28 @@ pub fn step_send_sctp_seqpacket(
     };
 
     let table = payload.socket_table();
+    // A peeled-off association lives on its own 1-to-1 socket registered under
+    // (dst, source); deliver there instead of the 1-to-many listener if present.
+    if let Some(peeled) = table.lookup_sctp_connection(ConnectionKey::new(dst, source), guard) {
+        if let Some(peeled_payload) = peeled.acquire_operational() {
+            if peeled_payload.shutdown_rd() {
+                return StepOutcome::Done(bytes.len());
+            }
+            let Some(became_readable) = peeled_payload.record_sctp_message(
+                bytes.to_vec(),
+                false,
+                stream,
+                ppid,
+                Some(source),
+            ) else {
+                return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
+            };
+            if became_readable {
+                peeled.readiness.fire_recv(RecvWireSet::HAS_DATA);
+            }
+            return StepOutcome::Done(bytes.len());
+        }
+    }
     let Some(peer) = table
         .lookup_sctp_listener_dual_stack_endpoint(dst, guard)
         .or_else(|| table.lookup_sctp_bound(dst, guard))
