@@ -1222,8 +1222,74 @@ if [ \"$ip_object\" = \"link\" ] && [ \"$ip_command\" = \"set\" ]; then\n\
     done\n\
     exit 0\n\
 fi\n\
-if [ \"$ip_object\" = \"route\" ] && [ \"$ip_command\" = \"flush\" ]; then\n\
-    exit 0\n\
+if [ \"$ip_object\" = \"route\" ]; then\n\
+    route_state=/tmp/tx-ip-route\n\
+    route_saved=\"$*\"\n\
+    if [ -n \"$ip_family\" ]; then\n\
+        shift 3 2>/dev/null || shift $#\n\
+    else\n\
+        shift 2 2>/dev/null || shift $#\n\
+    fi\n\
+    case \"$ip_command\" in\n\
+        flush)\n\
+            : > \"$route_state\" 2>/dev/null || true\n\
+            exit 0 ;;\n\
+        add|replace|change|append|prepend)\n\
+            route_dest=\"$1\"\n\
+            shift\n\
+            route_gw=\n\
+            route_dev=\n\
+            while [ $# -gt 0 ]; do\n\
+                case \"$1\" in\n\
+                    via) route_gw=\"$2\"; shift 2 ;;\n\
+                    dev) route_dev=\"$2\"; shift 2 ;;\n\
+                    *) shift ;;\n\
+                esac\n\
+            done\n\
+            [ -n \"$route_dest\" ] || exit 1\n\
+            if [ -z \"$route_dev\" ]; then\n\
+                case \"$route_gw\" in\n\
+                    127.*) route_dev=lo ;;\n\
+                    ::1) route_dev=lo ;;\n\
+                esac\n\
+            fi\n\
+            route_tmp=\"${route_state}.$$\"\n\
+            {\n\
+                if [ -r \"$route_state\" ]; then\n\
+                    while read rd rg rv; do\n\
+                        [ \"$rd\" = \"$route_dest\" ] || echo \"$rd $rg $rv\"\n\
+                    done < \"$route_state\"\n\
+                fi\n\
+                echo \"$route_dest ${route_gw:-_} ${route_dev:-_}\"\n\
+            } > \"$route_tmp\"\n\
+            mv \"$route_tmp\" \"$route_state\"\n\
+            exit 0 ;;\n\
+        del|delete)\n\
+            route_dest=\"$1\"\n\
+            route_tmp=\"${route_state}.$$\"\n\
+            if [ -r \"$route_state\" ]; then\n\
+                while read rd rg rv; do\n\
+                    [ \"$rd\" = \"$route_dest\" ] || echo \"$rd $rg $rv\"\n\
+                done < \"$route_state\" > \"$route_tmp\"\n\
+                mv \"$route_tmp\" \"$route_state\"\n\
+            fi\n\
+            exit 0 ;;\n\
+        show|list|\"\")\n\
+            if [ -r \"$route_state\" ]; then\n\
+                while read rd rg rv; do\n\
+                    [ -z \"$rd\" ] && continue\n\
+                    [ \"$rg\" = \"_\" ] && rg=\n\
+                    [ \"$rv\" = \"_\" ] && rv=\n\
+                    route_line=\"$rd\"\n\
+                    [ -n \"$rg\" ] && route_line=\"$route_line via $rg\"\n\
+                    [ -n \"$rv\" ] && route_line=\"$route_line dev $rv\"\n\
+                    echo \"$route_line\"\n\
+                done < \"$route_state\"\n\
+            fi\n\
+            exit 0 ;;\n\
+        *)\n\
+            tx_ltp_exec \"$bb\" ip $route_saved ;;\n\
+    esac\n\
 fi\n\
 if [ \"$ip_object\" = \"addr\" ] && [ \"$ip_command\" = \"flush\" ]; then\n\
     exit 0\n\
