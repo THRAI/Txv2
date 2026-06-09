@@ -10,22 +10,24 @@ Date: 2026-06-04
 
 ## 当前状态
 
-**2026-06-09 续做:+14 个条目通过 → 38/41**(`feature-network-next`,逐个 rv64-qemu 验证 + 提交):
+**2026-06-09 续做:+15 个条目通过 → 39/41**(`feature-network-next`,逐个 rv64-qemu 验证 + 提交):
 `test_assoc_abort`、`test_1_to_1_connectx`、`test_peeloff`(+v6)、`test_connect`、
 `test_fragments`(+v6)、`test_sockopt`(+v6,44/44)、`test_autoclose`、
-`test_sctp_sendrecvmsg`(+v6)、`test_timetolive`(+v6)。要点见 `docs/progress/STATUS.md` 2026-06-09 条。
+`test_sctp_sendrecvmsg`(+v6)、`test_timetolive`(+v6)、`test_connectx`(多宿主)。
+要点见 `docs/progress/STATUS.md` 2026-06-09 条。
 **PR-SCTP TTL 已做(取"可观察行为"模型,非完整 rwnd 流控):** `sinfo_timetolive>0` 的消息直接丢弃
 ——不投给对端;发送端按分片(SCTP_MAXSEG 切片、末片置 SCTP_DATA_LAST_FRAG)收到 `SCTP_SEND_FAILED`
 (0x8003)携带被丢数据。lksctp 的 ttl 测试都是先 fillmsg 填满 rwnd 再 sleep 过 TTL,所以
 "ttl>0 ⇒ 丢弃"正好复现它们检查的行为(无需 rwnd/定时器)。
-**剩余 3 个未过 —— 2 个物理无解 + 1 个大活:**
-- `test_1_to_1_recvmsg`/`test_1_to_1_sendmsg`:**musl libc 阻塞,内核侧无解** —— `(struct msghdr*)-1`
-  在 musl 的 recvmsg/sendmsg wrapper 里**用户态**解引用即段错误,内核根本看不到这次调用
-  (内核的 copy_to/from_user(-1) 本身已正确返 EFAULT)。改测试/libc 属作弊。最多 3/8、5/14。
-- `test_connectx`:真**多宿主**(NUMADDR=6)—— 第一道墙:SCTP bind 拒绝 127.0.0.2+(EADDRNOTAVAIL,
-  只配了 127.0.0.1 → 要接受整个 127/8);再 test_peer_addr 要 `sctp_getpaddrs` 严格返回每个关联的
-  **全部 6 个**对端地址 + 非阻塞 connectx EINPROGRESS 且 assoc_id 对齐。要给每个关联存一个从对端 bound
-  地址来的地址**集合**。比 TTL 那次大,**未动手**。(bindx + CONNECTX3 单地址已做,多宿主模型未做。)
+**多宿主已做(test_connectx,NUMADDR=6):** bind 接受整个 127/8(原只 127.0.0.1);每个 socket 存
+自己的全部 bound 地址集(RawSctpState.local_addrs = 主 bind + 每个 bindx ADD);SCTP_GET_PEER_ADDRS
+按"关联的对端 endpoint → 对端 socket → 它的 local_addrs"返回**全部**地址(无需按关联存,peeloff 也
+不用改 —— peeled 1-to-1 的 `remote` 本就解析到 client);非阻塞 connectx → EINPROGRESS 且仍写回
+assoc id;peeled-slot 检查移到 loopback 门之前(peeled 127.0.1.x → EADDRNOTAVAIL 而非 EOPNOTSUPP)。
+**剩余 2 个未过 —— 都是 libc 阻塞、内核侧无解(39/41 即上限):**
+- `test_1_to_1_recvmsg`/`test_1_to_1_sendmsg`:`(struct msghdr*)-1` 在 musl 的 recvmsg/sendmsg
+  wrapper 里**用户态**解引用即段错误,内核根本看不到这次调用(内核 copy_to/from_user(-1) 已正确返
+  EFAULT)。改测试/libc 属作弊。最多 3/8、5/14。**不改测试二进制的话,39/41 就是天花板。**
 > 排错经验:sockopt 结构偏移对不上时,去读测试头文件里的真实 `struct` 定义 ——
 > `packed`/`aligned` 属性会改偏移(本次 `struct sctp_paddrinfo` 是 packed,aligned(4),
 > `spinfo_address` 在偏移 **4** 而非 8,卡了好几轮)。

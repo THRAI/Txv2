@@ -1,4 +1,4 @@
-- 2026-06-09 **Dimension B `net.sctp`: +14 tests this session → 38/41 passing (SCTP build-out resumed).**
+- 2026-06-09 **Dimension B `net.sctp`: +15 tests this session → 39/41 passing (only 2 libc-blocked left).**
   Verified on rv64-qemu, each committed on `feature-network-next`. Newly passing:
   `test_assoc_abort` (SCTP_ABORT → 24-byte COMM_LOST state 1, vs graceful SHUTDOWN_COMP),
   `test_1_to_1_connectx` (sctp_connectx → getsockopt CONNECTX3 = connect-to-first-addr +
@@ -19,20 +19,22 @@
   abandoned — not delivered to the peer; the sender gets one `SCTP_SEND_FAILED` (0x8003) per
   fragment, sliced at SCTP_MAXSEG, with SCTP_DATA_LAST_FRAG on the last; the lksctp tests always
   fill rwnd then sleep past the TTL, so "ttl>0 ⇒ abandon" reproduces exactly what they check).
-  No regressions (basic, tcp_style, accept_close, inaddr_any, send, recvmsg, getname, shutdown,
-  peeloff, autoclose all re-verified green).
-  **Remaining 3 `net.sctp` failures are impossible or a separate big lift:**
-  (a) `test_1_to_1_recvmsg`, `test_1_to_1_sendmsg` — **libc/musl-blocked, unfixable kernel-side**:
-  both have a `(struct msghdr*)-1` case that musl's recvmsg/sendmsg wrapper dereferences in *user
-  space* before the syscall → SIGSEGV; the kernel never sees it (copy_to/from_user(-1) already
-  returns EFAULT correctly). Editing the test/libc is cheating → max 3/8 and 5/14.
-  (b) `test_connectx` — real **multi-homing**: binds NUMADDR=6 addresses (127.0.0.1..6) via
-  bind+bindx (first wall: our SCTP bind rejects 127.0.0.2+ with EADDRNOTAVAIL — only 127.0.0.1 is
-  configured; need to accept all 127/8), then `test_peer_addr` requires `sctp_getpaddrs` to return
-  *exactly* all 6 peer addresses per association (strict count + set match), plus non-blocking
-  connectx → EINPROGRESS with the assoc_id matching the COMM_UP. Our model stores ONE peer per
-  association — this needs a per-association address SET populated from the peer's bound addresses.
-  Bigger than the TTL extension; a focused multi-homing build-out (not started).
+  and **`test_connectx`** (real **multi-homing**, NUMADDR=6): bind accepts all 127/8 (was only
+  127.0.0.1); each socket tracks its full bound address set (primary bind + every sctp_bindx ADD);
+  SCTP_GET_PEER_ADDRS returns the peer's full set by resolving the association's peer endpoint →
+  the peer socket → its bound addresses (no per-association storage needed, and peeloff needs no
+  extra work — the peeled 1-to-1 socket's `remote` already resolves to the client); sctp_connectx
+  on a non-blocking socket returns EINPROGRESS while still writing the assoc id; the peeled-off
+  slot is checked before the loopback gate so a peeled multi-homed peer (127.0.1.x) reports
+  EADDRNOTAVAIL not EOPNOTSUPP.
+  No regressions across the whole suite (basic, tcp_style, accept_close, inaddr_any, send, recvmsg,
+  getname±v6, shutdown, peeloff, autoclose, 1_to_1_addrs, 1_to_1_connectx, sockopt all green).
+  **Remaining 2 `net.sctp` failures are libc-blocked, unfixable kernel-side:**
+  `test_1_to_1_recvmsg`, `test_1_to_1_sendmsg` — both have a `(struct msghdr*)-1` case that musl's
+  recvmsg/sendmsg wrapper dereferences in *user space* before the syscall → SIGSEGV; the kernel
+  never sees the call (its own copy_to/from_user(-1) already returns EFAULT correctly). Editing
+  the test or libc is cheating → these max out at 3/8 and 5/14. **39/41 is the ceiling without
+  changing the test binaries.**
   Probe technique that cracked GET_PEER_ADDR_INFO: read the actual `struct` def in the test
   headers when offsets don't match — `packed`/`aligned` attributes change them.
 
