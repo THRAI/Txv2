@@ -2672,6 +2672,8 @@ const DEFAULT_OSCOMP_MUSL_PRE_LTP_SCRIPTS: &[(&str, &str)] = &[
     ("libctest-musl", "libctest_testcode.sh"),
     ("lua-musl", "lua_testcode.sh"),
     ("netperf-musl", "netperf_testcode.sh"),
+    ("iozone-musl", "iozone_testcode.sh"),
+    ("cyclictest-musl", "cyclictest_testcode.sh"),
 ];
 
 const DEFAULT_OSCOMP_GLIBC_PRE_LTP_SCRIPTS: &[(&str, &str)] = &[
@@ -2680,6 +2682,8 @@ const DEFAULT_OSCOMP_GLIBC_PRE_LTP_SCRIPTS: &[(&str, &str)] = &[
     // libctest-glibc removed: official scoring counts only musl libctest.
     ("lua-glibc", "lua_testcode.sh"),
     ("netperf-glibc", "netperf_testcode.sh"),
+    ("iozone-glibc", "iozone_testcode.sh"),
+    ("cyclictest-glibc", "cyclictest_testcode.sh"),
 ];
 
 fn oscomp_musl_script_for_group(group: &str) -> Option<&'static str> {
@@ -2961,9 +2965,9 @@ mod tests {
         );
         assert!(!cmd.contains("libcbench_testcode.sh"));
         assert!(!cmd.contains("lmbench_testcode.sh"));
-        assert!(!cmd.contains("iozone_testcode.sh"));
+        assert!(cmd.contains("iozone_testcode.sh"));
         assert!(!cmd.contains("iperf_testcode.sh"));
-        assert!(!cmd.contains("cyclictest_testcode.sh"));
+        assert!(cmd.contains("cyclictest_testcode.sh"));
         assert!(!cmd.contains("; target_dir=\"ltp/testcases/bin\""));
         assert!(!cmd.contains("; /bin/setsid \"$file\""));
     }
