@@ -1108,7 +1108,16 @@ pub(super) async fn sys_msync<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
 pub(super) fn extract_page_container(
     file: &Cap<OpenFile>,
 ) -> Option<Cap<tx_subsystems::page_backed::PageContainer>> {
-    use tx_subsystems::vfs::structure::RNodeBacking;
+    use tx_subsystems::vfs::structure::{OpenFileBacking, RNodeBacking};
+    // Only VFS rnode-backed files have an rnode at all. Special fds
+    // (epoll, eventfd, signalfd, timerfd, userfaultfd, io_uring, …) carry
+    // no rnode and `OpenFile::rnode()` panics on them, so guard on the
+    // OpenFile backing before touching it — callers (mmap, close-time
+    // writeback) treat `None` as "no page container", which is correct
+    // for these fd types.
+    if !matches!(file.backing(), OpenFileBacking::Rnode { .. }) {
+        return None;
+    }
     match file.rnode().backing() {
         RNodeBacking::PageBacked { pc } => Some(pc.clone()),
         _ => None,

@@ -1,7 +1,7 @@
 use crate::ondisk::{
     encode_dir_entry, encode_journal_commit, encode_journal_descriptor, parse_journal_descriptor,
-    BitmapMut, BitmapView, BlockMapping, CommitHeader, DirEntry, DirEntryIter, Extent, ExtentNode,
-    GroupDesc, Inode, InodeLocation, InodeTableLayout, Superblock,
+    BitmapMut, BitmapView, BlockMapping, CommitHeader, DirEntry, DirEntryIter, Extent, ExtentIdx,
+    ExtentNode, GroupDesc, Inode, InodeLocation, InodeTableLayout, Superblock,
 };
 use crate::ondisk::{read_u16_le, read_u32_le, write_u16_le};
 use crate::{Ext4FormatError, Result};
@@ -251,52 +251,80 @@ impl<I: BlockImage> Ext4Pager<I> {
         Ok(())
     }
 
-    /// Attach a newly allocated `physical` block at `logical` to the
-    /// inode's inline extent root, growing the trailing extent when the
-    /// block continues it contiguously, otherwise appending a fresh
-    /// extent. Errors `Unsupported` if the inline root (4 extents) is
-    /// full — extent-tree spill is not yet implemented, but sequential
-    /// per-file writeback coalesces into one extent so the common case
-    /// never overflows.
+    /// Attach a newly allocated `physical` block at `logical` to the inode's
+    /// extent map, growing the trailing extent when the block continues it
+    /// contiguously, otherwise inserting a fresh extent.
+    ///
+    /// The inode's inline root holds at most 4 extents. When a 5th distinct
+    /// extent is needed (e.g. a file fragmented by concurrent multi-process
+    /// writeback, or random-order writes), the extents spill into a freshly
+    /// allocated extent block and the inode root becomes a single-entry,
+    /// depth-1 index node pointing at it. A 4 KiB extent block holds up to 340
+    /// extents, which covers the file sizes the test workloads use; deeper
+    /// trees / multiple child blocks remain `Unsupported`.
     fn attach_data_block(
         &mut self,
         inode: &mut Inode,
         logical: u32,
         physical: u64,
     ) -> Result<()> {
-        let mut extents = match ExtentNode::parse(inode.extent_root_bytes())? {
-            ExtentNode::Leaf(list) => list,
-            ExtentNode::Index(_) => return Err(Ext4FormatError::Unsupported),
-        };
-        // Keep extents sorted by logical_block (ext4 invariant). Find the
-        // insertion point, then coalesce with the preceding extent when the
-        // new block continues it contiguously (the common sequential-
-        // writeback case → a single growing extent).
-        let pos = extents
-            .iter()
-            .position(|e| e.logical_block > logical)
-            .unwrap_or(extents.len());
-        if pos > 0 {
-            let prev = &mut extents[pos - 1];
-            let contiguous = prev.logical_block + prev.len as u32 == logical
-                && prev.physical_start + prev.len as u64 == physical
-                && (prev.len as u32) < Extent::UNINITIALIZED_MASK as u32;
-            if contiguous {
-                prev.len += 1;
-                inode.set_extent_root(&extents)?;
-                return Ok(());
+        const INLINE_MAX_EXTENTS: usize = 4;
+        let block_max_extents = (BLOCK_SIZE - 12) / 12;
+        match ExtentNode::parse(inode.extent_root_bytes())? {
+            ExtentNode::Leaf(mut extents) => {
+                coalesce_insert_extent(&mut extents, logical, physical);
+                if extents.len() <= INLINE_MAX_EXTENTS {
+                    inode.set_extent_root(&extents)?;
+                    return Ok(());
+                }
+                // Inline root full: spill all extents into a fresh extent block
+                // and turn the inode root into a single-entry index node.
+                let child = self.allocate_block()?;
+                let mut block = [0u8; BLOCK_SIZE];
+                ExtentNode::encode_leaf(&extents, &mut block)?;
+                self.image.write_block(child, &block)?;
+                inode.blocks_512 = inode.blocks_512.saturating_add((BLOCK_SIZE / 512) as u64);
+                inode.set_extent_index_root(
+                    &[ExtentIdx {
+                        logical_block: extents[0].logical_block,
+                        child,
+                    }],
+                    1,
+                )?;
+                Ok(())
+            }
+            ExtentNode::Index(indexes) => {
+                if indexes.is_empty() {
+                    return Err(Ext4FormatError::Corrupt);
+                }
+                // depth-1, single child block. Pick the child covering `logical`.
+                let idx_pos = indexes
+                    .iter()
+                    .rposition(|i| i.logical_block <= logical)
+                    .unwrap_or(0);
+                let child = indexes[idx_pos].child;
+                let mut block = [0u8; BLOCK_SIZE];
+                self.image.read_block(child, &mut block)?;
+                let mut extents = match ExtentNode::parse(&block)? {
+                    ExtentNode::Leaf(list) => list,
+                    ExtentNode::Index(_) => return Err(Ext4FormatError::Unsupported),
+                };
+                coalesce_insert_extent(&mut extents, logical, physical);
+                if extents.len() > block_max_extents {
+                    return Err(Ext4FormatError::Unsupported);
+                }
+                ExtentNode::encode_leaf(&extents, &mut block)?;
+                self.image.write_block(child, &block)?;
+                // Keep the index entry's key in sync if the lowest logical moved.
+                let new_low = extents[0].logical_block;
+                if new_low != indexes[idx_pos].logical_block {
+                    let mut idxs = indexes.clone();
+                    idxs[idx_pos].logical_block = new_low;
+                    inode.set_extent_index_root(&idxs, 1)?;
+                }
+                Ok(())
             }
         }
-        extents.insert(
-            pos,
-            Extent {
-                logical_block: logical,
-                len: 1,
-                physical_start: physical,
-            },
-        );
-        inode.set_extent_root(&extents)?;
-        Ok(())
     }
 
     /// Set the inode's logical size — backs `FsPageBacking::truncate`.
@@ -912,6 +940,35 @@ impl<I: BlockImage> Ext4Pager<I> {
         }
         Err(Ext4FormatError::Corrupt)
     }
+}
+
+/// Insert `(logical → physical)` into a logical-sorted extent list, growing the
+/// preceding extent in place when the new block continues it contiguously
+/// (the common sequential case → one growing extent), otherwise inserting a
+/// fresh single-block extent at the sorted position.
+fn coalesce_insert_extent(extents: &mut Vec<Extent>, logical: u32, physical: u64) {
+    let pos = extents
+        .iter()
+        .position(|e| e.logical_block > logical)
+        .unwrap_or(extents.len());
+    if pos > 0 {
+        let prev = &mut extents[pos - 1];
+        let contiguous = prev.logical_block + prev.len as u32 == logical
+            && prev.physical_start + prev.len as u64 == physical
+            && (prev.len as u32) < Extent::UNINITIALIZED_MASK as u32;
+        if contiguous {
+            prev.len += 1;
+            return;
+        }
+    }
+    extents.insert(
+        pos,
+        Extent {
+            logical_block: logical,
+            len: 1,
+            physical_start: physical,
+        },
+    );
 }
 
 fn read_group_descs<I: BlockImage>(image: &I, superblock: &Superblock) -> Result<Vec<GroupDesc>> {

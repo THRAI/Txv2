@@ -1525,33 +1525,100 @@ pub(super) fn wait_on_yield_shape(shape: YieldShape) -> Option<wait_source::Regi
 pub(super) enum SocketWaitWake {
     SocketReady,
     ItimerExpired,
+    /// The thread's signal mailbox fired while parked on the socket wait.
+    /// The caller must check for a deliverable pending signal and return
+    /// EINTR if one is present. Without this, a process blocked in a
+    /// socketpair `recv`/`accept`/`connect` could never be interrupted by a
+    /// catchable signal (e.g. SIGTERM from `kill`), so `kill hackbench` left
+    /// its workers parked forever — they never woke to process the signal,
+    /// never exited, and leaked as `[]` tasks.
+    SignalInterrupted,
+}
+
+/// Park on a socket wait future, but wake (returning `true`) if a signal is
+/// posted to this thread while parked. Used by the blocking `send`/`sendto`
+/// paths, which have no itimer deadline and are not generic over a `TimeIf`
+/// platform, so they cannot use [`wait_on_socket_or_itimer`]. The caller must
+/// confirm a deliverable signal via `select_next_signal` before returning
+/// EINTR. See [`SocketWaitWake::SignalInterrupted`] for why this matters.
+pub(super) async fn wait_on_socket_or_signal(
+    mut socket_future: wait_source::RegisteredWaitFuture,
+    mailbox: Option<&tx_substrate::wake::mailbox::TaskMailbox>,
+) -> bool {
+    core::future::poll_fn(|cx| {
+        if let Some(mailbox) = mailbox {
+            mailbox.register_waker(cx.waker().clone());
+            let mut signalled = false;
+            while let Some(event) = mailbox.poll() {
+                if matches!(
+                    event,
+                    tx_substrate::wake::mailbox::MailboxEvent::SignalDelivered { .. }
+                ) {
+                    signalled = true;
+                }
+            }
+            if signalled {
+                return core::task::Poll::Ready(true);
+            }
+        }
+        if core::future::Future::poll(core::pin::Pin::new(&mut socket_future), cx).is_ready() {
+            return core::task::Poll::Ready(false);
+        }
+        core::task::Poll::Pending
+    })
+    .await
 }
 
 pub(super) async fn wait_on_socket_or_itimer<P: TimeIf>(
     mut socket_future: wait_source::RegisteredWaitFuture,
     pid: u32,
+    mailbox: Option<&tx_substrate::wake::mailbox::TaskMailbox>,
 ) -> SocketWaitWake {
     if super::time::consume_itimer_real_delivered_interrupt(pid) {
         return SocketWaitWake::ItimerExpired;
     }
-    let Some(deadline_ns) = super::time::itimer_real_deadline_ns(pid) else {
-        let _ = socket_future.await;
-        return SocketWaitWake::SocketReady;
-    };
-    if <P as TimeIf>::read_ns() >= deadline_ns {
-        return SocketWaitWake::ItimerExpired;
+    // The blocked socket future registers its task waker on its OWN private
+    // wait-source mailbox, NOT on the thread's signal mailbox. So a signal
+    // posted via `post_signal` (which fires the thread mailbox) would never
+    // wake a task parked here. Register our waker on the thread mailbox too,
+    // so a signal post wakes us; then on each poll drain the thread mailbox
+    // and, if a `SignalDelivered` event arrived, report it so the caller
+    // returns EINTR. Draining (not peeking) prevents a busy-loop on a stale
+    // event. This mirrors how `drive(..., mailbox)` makes blocked pipe/file IO
+    // interruptible, and is what lets `kill` terminate a process blocked in a
+    // socketpair recv (previously hackbench workers leaked because their
+    // blocked read could not be interrupted).
+    let deadline_ns = super::time::itimer_real_deadline_ns(pid);
+    if let Some(deadline_ns) = deadline_ns {
+        if <P as TimeIf>::read_ns() >= deadline_ns {
+            return SocketWaitWake::ItimerExpired;
+        }
     }
-    let Some(mut timer_future) = tx_subsystems::timer_sleep::sleep_until_ns(deadline_ns) else {
-        let _ = socket_future.await;
-        return SocketWaitWake::SocketReady;
-    };
+    let mut timer_future = deadline_ns.and_then(tx_subsystems::timer_sleep::sleep_until_ns);
 
     core::future::poll_fn(|cx| {
+        if let Some(mailbox) = mailbox {
+            mailbox.register_waker(cx.waker().clone());
+            let mut signalled = false;
+            while let Some(event) = mailbox.poll() {
+                if matches!(
+                    event,
+                    tx_substrate::wake::mailbox::MailboxEvent::SignalDelivered { .. }
+                ) {
+                    signalled = true;
+                }
+            }
+            if signalled {
+                return core::task::Poll::Ready(SocketWaitWake::SignalInterrupted);
+            }
+        }
         if core::future::Future::poll(core::pin::Pin::new(&mut socket_future), cx).is_ready() {
             return core::task::Poll::Ready(SocketWaitWake::SocketReady);
         }
-        if core::future::Future::poll(core::pin::Pin::new(&mut timer_future), cx).is_ready() {
-            return core::task::Poll::Ready(SocketWaitWake::ItimerExpired);
+        if let Some(ref mut timer_future) = timer_future {
+            if core::future::Future::poll(core::pin::Pin::new(timer_future), cx).is_ready() {
+                return core::task::Poll::Ready(SocketWaitWake::ItimerExpired);
+            }
         }
         core::task::Poll::Pending
     })

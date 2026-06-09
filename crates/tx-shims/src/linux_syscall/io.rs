@@ -410,6 +410,12 @@ fn pselect_timeout_policy<'a>(
 enum PselectWaitWake {
     FdReady,
     TimedOut,
+    /// The thread signal mailbox fired while parked. The caller checks for a
+    /// deliverable pending signal and returns EINTR. Without this, ppoll/pselect
+    /// could not be interrupted by a catchable signal — a process blocked in
+    /// ppoll (e.g. hackbench workers polling their socketpairs) would never wake
+    /// to process SIGTERM, so `kill` left them running and they leaked.
+    Signalled,
 }
 
 fn push_unique_wait_token(
@@ -421,11 +427,34 @@ fn push_unique_wait_token(
     }
 }
 
-async fn wait_on_any_token(mut futures: alloc::vec::Vec<wait_source::RegisteredWaitFuture>) {
+/// Park until one of `futures` is ready or a signal is posted. Returns `true`
+/// if woken by the thread signal mailbox (caller then checks `select_next_signal`
+/// and returns EINTR). Registering on the thread mailbox is what makes a blocked
+/// ppoll/pselect interruptible — the fd futures each park on their own private
+/// wait-source mailbox, so a posted signal would otherwise never wake the task.
+async fn wait_on_any_token(
+    mut futures: alloc::vec::Vec<wait_source::RegisteredWaitFuture>,
+    mailbox: Option<&tx_substrate::wake::mailbox::TaskMailbox>,
+) -> bool {
     core::future::poll_fn(|cx| {
+        if let Some(mailbox) = mailbox {
+            mailbox.register_waker(cx.waker().clone());
+            let mut signalled = false;
+            while let Some(event) = mailbox.poll() {
+                if matches!(
+                    event,
+                    tx_substrate::wake::mailbox::MailboxEvent::SignalDelivered { .. }
+                ) {
+                    signalled = true;
+                }
+            }
+            if signalled {
+                return core::task::Poll::Ready(true);
+            }
+        }
         for future in futures.iter_mut() {
             if core::future::Future::poll(core::pin::Pin::new(future), cx).is_ready() {
-                return core::task::Poll::Ready(());
+                return core::task::Poll::Ready(false);
             }
         }
         core::task::Poll::Pending
@@ -436,6 +465,7 @@ async fn wait_on_any_token(mut futures: alloc::vec::Vec<wait_source::RegisteredW
 async fn wait_on_any_token_or_pselect_deadline<P: tx_hal::TimeIf>(
     mut fd_futures: alloc::vec::Vec<wait_source::RegisteredWaitFuture>,
     deadline_ns: u64,
+    mailbox: Option<&tx_substrate::wake::mailbox::TaskMailbox>,
 ) -> PselectWaitWake {
     if <P as tx_hal::TimeIf>::read_ns() >= deadline_ns {
         return PselectWaitWake::TimedOut;
@@ -445,6 +475,21 @@ async fn wait_on_any_token_or_pselect_deadline<P: tx_hal::TimeIf>(
     };
 
     core::future::poll_fn(|cx| {
+        if let Some(mailbox) = mailbox {
+            mailbox.register_waker(cx.waker().clone());
+            let mut signalled = false;
+            while let Some(event) = mailbox.poll() {
+                if matches!(
+                    event,
+                    tx_substrate::wake::mailbox::MailboxEvent::SignalDelivered { .. }
+                ) {
+                    signalled = true;
+                }
+            }
+            if signalled {
+                return core::task::Poll::Ready(PselectWaitWake::Signalled);
+            }
+        }
         for future in fd_futures.iter_mut() {
             if core::future::Future::poll(core::pin::Pin::new(future), cx).is_ready() {
                 return core::task::Poll::Ready(PselectWaitWake::FdReady);
@@ -1252,12 +1297,35 @@ pub(super) async fn sys_ppoll<'a, P: tx_hal::TimeIf>(
             break 0;
         }
         if let Some(deadline_ns) = effective_deadline_ns {
-            match wait_on_any_token_or_pselect_deadline::<P>(futures, deadline_ns).await {
+            match wait_on_any_token_or_pselect_deadline::<P>(
+                futures,
+                deadline_ns,
+                ctx.mailbox.as_deref(),
+            )
+            .await
+            {
                 PselectWaitWake::FdReady => {}
                 PselectWaitWake::TimedOut => break 0,
+                PselectWaitWake::Signalled => {
+                    if tx_subsystems::signal::thread_pending_signal_interrupts(&ctx.thread) {
+                        return restore_ppoll_sigmask(
+                            ctx,
+                            saved_mask,
+                            temporary_sigmask,
+                            SyscallResult::Error(EINTR_VALUE),
+                        );
+                    }
+                }
             }
-        } else {
-            wait_on_any_token(futures).await;
+        } else if wait_on_any_token(futures, ctx.mailbox.as_deref()).await
+            && tx_subsystems::signal::thread_pending_signal_interrupts(&ctx.thread)
+        {
+            return restore_ppoll_sigmask(
+                ctx,
+                saved_mask,
+                temporary_sigmask,
+                SyscallResult::Error(EINTR_VALUE),
+            );
         }
     };
 
@@ -1587,14 +1655,27 @@ pub(super) async fn sys_pselect6<'a, P: tx_hal::TimeIf>(
             .collect::<alloc::vec::Vec<_>>();
         if !futures.is_empty() {
             if let Some(deadline_ns) = effective_deadline_ns {
-                match wait_on_any_token_or_pselect_deadline::<P>(futures, deadline_ns).await {
+                match wait_on_any_token_or_pselect_deadline::<P>(
+                    futures,
+                    deadline_ns,
+                    ctx.mailbox.as_deref(),
+                )
+                .await
+                {
                     PselectWaitWake::FdReady => {}
                     PselectWaitWake::TimedOut => {
                         break (read_ready, write_ready, except_ready, ready_count);
                     }
+                    PselectWaitWake::Signalled => {
+                        if tx_subsystems::signal::thread_pending_signal_interrupts(&ctx.thread) {
+                            return SyscallResult::Error(EINTR_VALUE);
+                        }
+                    }
                 }
-            } else {
-                wait_on_any_token(futures).await;
+            } else if wait_on_any_token(futures, ctx.mailbox.as_deref()).await
+                && tx_subsystems::signal::thread_pending_signal_interrupts(&ctx.thread)
+            {
+                return SyscallResult::Error(EINTR_VALUE);
             }
         } else {
             if let Some(deadline_ns) = effective_deadline_ns {

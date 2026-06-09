@@ -1192,14 +1192,29 @@ impl FsOps for Procfs {
         }
 
         let pids: Vec<(Pid, bool)> = process::all_pids();
-        let pi = if state_byte == 2 { 0 } else { idx };
+        // The pid index must span two cursor bytes (raw[1] low, raw[2] high):
+        // a single u8 wraps at 256, so once /proc holds 256+ entries the cursor
+        // cycles 255 -> 0 forever and `getdents` never reaches EOF (busybox
+        // `ps` then reprints the table endlessly). Both bytes live inside the
+        // low 8 bytes that `OpenFile` preserves across readdir calls.
+        let pi = if state_byte == 2 {
+            0
+        } else {
+            (raw[1] as usize) | ((raw[2] as usize) << 8)
+        };
         if pi < pids.len() {
             let (pid, alive) = pids[pi];
             if alive {
                 let s = alloc::format!("{}", pid.0);
+                let next = pi + 1;
                 return StepOutcome::done(Some((
                     dir_entry(pid_dir_id(pid), InodeKind::Directory, s.as_bytes()),
-                    DirCursor([3, (pi + 1) as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                    DirCursor([
+                        3,
+                        (next & 0xff) as u8,
+                        (next >> 8) as u8,
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    ]),
                 )));
             }
         }

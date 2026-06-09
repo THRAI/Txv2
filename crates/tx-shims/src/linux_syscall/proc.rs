@@ -1252,6 +1252,18 @@ pub(super) async fn sys_wait4<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                 shape: YieldShape::OnWaitSource { source, interests },
                 ..
             } => {
+                // Make the blocking wait signal-interruptible. The loop re-runs
+                // `op.step()` at the top, so any reapable child is collected
+                // *before* this check — that keeps a child-exit SIGCHLD from
+                // spuriously returning EINTR. Only when no child is ready does a
+                // pending deliverable signal interrupt the wait. Without this,
+                // a parent blocked in wait4 (e.g. hackbench waiting on its
+                // workers) could not be killed by SIGTERM, so its whole tree
+                // leaked — fatal on LA64 where the leaked page tables exhaust
+                // the fixed PT-node registry and panic.
+                if tx_subsystems::signal::thread_pending_signal_interrupts(&ctx.thread) {
+                    return SyscallResult::Error(EINTR_VALUE);
+                }
                 await_wait_source(ctx, source, interests).await;
             }
             WaitOutcome::Err(e) => return SyscallResult::error_from(e.into()),

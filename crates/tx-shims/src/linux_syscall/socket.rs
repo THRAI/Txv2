@@ -345,10 +345,16 @@ async fn accept_impl<'a, P: TimeIf>(
                     return SyscallResult::Error(EAGAIN_VALUE);
                 }
                 if let Some(future) = wait_on_yield_shape(shape) {
-                    if matches!(
-                        wait_on_socket_or_itimer::<P>(future, ctx.process.pid.0).await,
-                        SocketWaitWake::ItimerExpired
-                    ) {
+                    let wake = wait_on_socket_or_itimer::<P>(
+                        future,
+                        ctx.process.pid.0,
+                        ctx.mailbox.as_deref(),
+                    )
+                    .await;
+                    if matches!(wake, SocketWaitWake::ItimerExpired)
+                        || (matches!(wake, SocketWaitWake::SignalInterrupted)
+                            && tx_subsystems::signal::thread_pending_signal_interrupts(&ctx.thread))
+                    {
                         return SyscallResult::Error(EINTR_VALUE);
                     }
                 } else {
@@ -714,7 +720,11 @@ async fn sendto_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult 
                         return SyscallResult::Error(EAGAIN_VALUE);
                     }
                     if let Some(future) = wait_on_yield_shape(shape) {
-                        let _ = future.await;
+                        if wait_on_socket_or_signal(future, ctx.mailbox.as_deref()).await
+                            && tx_subsystems::signal::thread_pending_signal_interrupts(&ctx.thread)
+                        {
+                            return SyscallResult::Error(EINTR_VALUE);
+                        }
                     } else {
                         return SyscallResult::Error(EIO_VALUE);
                     }
@@ -771,7 +781,11 @@ async fn sendto_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult 
                     return SyscallResult::Error(EAGAIN_VALUE);
                 }
                 if let Some(future) = wait_on_yield_shape(shape) {
-                    let _ = future.await;
+                    if wait_on_socket_or_signal(future, ctx.mailbox.as_deref()).await
+                        && tx_subsystems::signal::thread_pending_signal_interrupts(&ctx.thread)
+                    {
+                        return SyscallResult::Error(EINTR_VALUE);
+                    }
                 } else {
                     return SyscallResult::Error(EIO_VALUE);
                 }
@@ -885,10 +899,13 @@ async fn recvfrom_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
                 let Some(future) = wait_source::wait_on_token(wait_token) else {
                     return SyscallResult::Error(EIO_VALUE);
                 };
-                if matches!(
-                    wait_on_socket_or_itimer::<P>(future, ctx.process.pid.0).await,
-                    SocketWaitWake::ItimerExpired
-                ) {
+                let wake =
+                    wait_on_socket_or_itimer::<P>(future, ctx.process.pid.0, ctx.mailbox.as_deref())
+                        .await;
+                if matches!(wake, SocketWaitWake::ItimerExpired)
+                    || (matches!(wake, SocketWaitWake::SignalInterrupted)
+                        && tx_subsystems::signal::thread_pending_signal_interrupts(&ctx.thread))
+                {
                     if recv_queued_len(&socket) > 0 {
                         yielded_before_wait = false;
                         continue;
@@ -934,10 +951,16 @@ async fn recvfrom_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
                     return SyscallResult::Error(EAGAIN_VALUE);
                 }
                 if let Some(future) = wait_on_yield_shape(shape) {
-                    if matches!(
-                        wait_on_socket_or_itimer::<P>(future, ctx.process.pid.0).await,
-                        SocketWaitWake::ItimerExpired
-                    ) {
+                    let wake = wait_on_socket_or_itimer::<P>(
+                        future,
+                        ctx.process.pid.0,
+                        ctx.mailbox.as_deref(),
+                    )
+                    .await;
+                    if matches!(wake, SocketWaitWake::ItimerExpired)
+                        || (matches!(wake, SocketWaitWake::SignalInterrupted)
+                            && tx_subsystems::signal::thread_pending_signal_interrupts(&ctx.thread))
+                    {
                         if recv_queued_len(&socket) > 0 {
                             continue;
                         }
@@ -1150,7 +1173,11 @@ async fn sendmsg_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
                     return SyscallResult::Error(EAGAIN_VALUE);
                 }
                 if let Some(future) = wait_on_yield_shape(shape) {
-                    let _ = future.await;
+                    if wait_on_socket_or_signal(future, ctx.mailbox.as_deref()).await
+                        && tx_subsystems::signal::thread_pending_signal_interrupts(&ctx.thread)
+                    {
+                        return SyscallResult::Error(EINTR_VALUE);
+                    }
                 } else {
                     return SyscallResult::Error(EIO_VALUE);
                 }
@@ -1320,7 +1347,11 @@ async fn recvmsg_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
                     return SyscallResult::Error(EAGAIN_VALUE);
                 }
                 if let Some(future) = wait_on_yield_shape(shape) {
-                    let _ = future.await;
+                    if wait_on_socket_or_signal(future, ctx.mailbox.as_deref()).await
+                        && tx_subsystems::signal::thread_pending_signal_interrupts(&ctx.thread)
+                    {
+                        return SyscallResult::Error(EINTR_VALUE);
+                    }
                 } else {
                     return SyscallResult::Error(EIO_VALUE);
                 }

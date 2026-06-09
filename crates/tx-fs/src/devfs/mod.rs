@@ -930,10 +930,18 @@ impl FsPageBacking for Devfs {
 
     fn truncate(
         &self,
-        _fs_object_id: FsObjectId,
+        fs_object_id: FsObjectId,
         _new_size: u64,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
+        // `/dev/null` is the bit bucket: truncation is a no-op, matching
+        // Linux where O_TRUNC on a character device is silently ignored.
+        // netserver does `fopen("/dev/null","w")` (O_WRONLY|O_CREAT|O_TRUNC);
+        // returning ENOSYS here made that open fail and broke every netperf
+        // test. Scoped to the null device so other devfs nodes keep ENOSYS.
+        if fs_object_id == DEVFS_NULL_OBJECT_ID {
+            return StepOutcome::done(());
+        }
         StepOutcome::err(Errno::ENOSYS.into())
     }
 

@@ -1,3 +1,79 @@
+- 2026-06-09 **LA64 multithreaded libctest failures were a QEMU-version bug, not a kernel bug — use QEMU 9.2.1, not the system 8.2.2.**
+  The 23 la64 `libctest-musl` failures (pthread_cond, pthread_tsd, sem_init,
+  pthread_rwlock_ebusy, pthread_once_deadlock, tls_init/local_exec,
+  pthread_robust_detach, pthread_exit_cancel, the pthread_cancel family, …) all
+  timed out because a secondary pthread deadlocked: it spun forever in a
+  userspace LL/SC atomic loop (musl, user pc `0x1200354a8`: `ll.w; addi; sc.w;
+  beqz-retry`) whose `sc.w` never succeeded, while the main thread blocked in
+  futex. Reliable evidence: 488 trap-frame `era` samples all at `0x1200354a8`,
+  plus disassembly of the musl binary. RV64 passed the same binaries.
+  Root cause: the **system QEMU `8.2.2` (Debian)** mis-emulates LoongArch
+  `ll.w`/`sc.w` — `sc.w` fails even in an interrupt-free window, which is
+  impossible per the LL/SC spec. Ruled out kernel-side: LLBCTL/KLO handling
+  (changing/removing it had zero effect), page MAT (user PTEs are
+  `MAT_CC`, `ldpte` carries it into the TLB), timer frequency (~10ms periodic,
+  measured), and preemption. The OSComp toolchain ships **QEMU `9.2.1`** (built
+  locally at `qemu-local/install-9.2.1/bin/qemu-system-loongarch64`), which
+  fixes the LL/SC emulation. Re-running on 9.2.1: `libctest-musl` **197 → 214
+  /220** (the multithreaded tests pass; the leftover few are the pre-existing
+  pthread_cancel/tls_get_new_dtv set, not chased). **Operational takeaway: run
+  all la64 OSComp tests with QEMU 9.2.1, e.g.
+  `PATH=/data/home-ljs/ljslll/os/qemu-local/install-9.2.1/bin:$PATH make
+  oscomp-local-la64 …`.** Earlier la64 conclusions in this log that blamed the
+  cyclictest-musl `0/4` on a "binary build difference" are most likely the same
+  8.2.2 bug and should be re-tested on 9.2.1. All exploratory la64 changes
+  (trap_asm LLBCTL, ucontext, diagnostics) were reverted; the tree carries only
+  the verified bridge fix below. Next step: point the Makefile/CI at QEMU 9.2.1.
+
+- 2026-06-09 **Blocking syscalls made signal-interruptible (POSIX-precise) — fixes the `[]` task leak, the LA64 PT-node panic, and netperf.**
+  Root cause of the worker-task leak (`ps` showed up to 401 lingering `[]`
+  kernel-thread placeholders): hackbench workers blocked in `ppoll`/`recv`/
+  `wait4` were not signal-interruptible, so `SIGTERM`/`SIGKILL` could not unpark
+  them; on LA64 the accumulation exhausted the fixed-size PT-node registry and
+  panicked at `cyclictest-glibc`. Fix (bridge approach, keeps the per-wait
+  private-mailbox `wait_on_token` mechanism for correct poll-many demux/level
+  readiness, and ADDS signal-awareness by also draining the thread signal
+  mailbox): `ppoll`/`pselect` (io.rs), `recv`/`send`/`accept`/`recvmsg`
+  (socket.rs + socket/helpers.rs), and `wait4` (proc.rs) now return `EINTR` via
+  a new POSIX-precise predicate `signal::thread_pending_signal_interrupts`
+  (tx-subsystems/src/signal/mod.rs) — interrupts only on a fatal default action
+  or a non-`SA_RESTART` handler; ignored signals (e.g. `SIGCHLD`) do NOT
+  interrupt (this precision is what keeps netperf at 5/5 — a broad
+  `select_next_signal().is_some()` check regressed it to 1/5). Also:
+  `/dev/null` `O_TRUNC` no-op in devfs (netperf 0→5), procfs getdents cursor
+  widened to u16 so `/proc` enumeration no longer loops printing `[]` (ps fix),
+  and `kill(pid < -1, ...)` process-group delivery in signal.rs.
+  Verification (full local OSComp, single QEMU per arch):
+  RV64 **608.19/610** (netperf-musl 5/5, libctest-musl 220/220, leak 401→2);
+  LA64 **585.04/610**, no panic (cyclictest-glibc 0→4.34, leak 401→30, well
+  under the panic threshold). No regressions in basic/busybox/lua/iozone.
+  **Decision — wait-mechanism convergence deferred:** the kernel has two
+  wait-source registries (tx-substrate `WaitSource` + pending_mask vs
+  tx-subsystems `RegisteredWaitSource` RawQueue/RawPort/Channel level-peek).
+  Converging them is a foundational refactor (unify two parallel subscriber-list
+  implementations + redesign `TaskMailbox` for multi-subscription poll-many
+  demux); attempted convergent primitive regressed netperf (3/5) and the leak
+  (26) vs the bridge, and the perf cost of NOT converging is negligible (private
+  mailbox alloc only on the about-to-sleep path), so the bridge was kept and the
+  convergence left as a separate dedicated project.
+  **Known gap — `cyclictest-musl` 0/4 on LA64 (won't-fix this pass):** it prints
+  "unable to get scheduler parameters" and exits. pid-isolated full-lane syscall
+  tracing showed the LA64 cyclictest binary, after a byte-identical startup to
+  RV64 (same `/proc/self/status` reads, `sched_getaffinity` mask=1,
+  `/etc/localtime` ENOENT), prints the error and exits WITHOUT ever calling
+  `sched_getscheduler`/`sched_getparam` (0 occurrences anywhere) — and never
+  calls `set_tid_address`/`gettid` either. The kernel sched/procfs/syscall-
+  dispatch paths are identical across arches (verified — no la64 conditional
+  except the documented clone arg-order swap). Conclusion: the divergence is in
+  the LA64-image cyclictest binary (different musl build: extra `mprotect`,
+  different brk/open init order), not a kernel sched defect; nothing kernel-side
+  aligns it. All temporary diagnostics were reverted (`git checkout` of
+  tx-shims/linux_syscall/mod.rs, tx-kernel/thread_future.rs,
+  tx-fs/procfs/read.rs); final changeset is 8 files (devfs, procfs/mod.rs,
+  io.rs, proc.rs, signal.rs, socket.rs, socket/helpers.rs, signal/mod.rs).
+  Next step: optional dedicated wait-source convergence project; otherwise the
+  bridge fix is complete and verified.
+
 - 2026-06-05 **PR #50 merge-conflict repair rebased onto current `main`.**
   Resolved the GitHub conflict state for `codex/filesystem-smp-gap-stack` by
   merging `origin/main` into the PR stack and repairing the compile fallout:
