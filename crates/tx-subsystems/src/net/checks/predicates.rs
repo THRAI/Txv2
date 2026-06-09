@@ -40,7 +40,10 @@ fn require_local_bind_addr(
 ) -> Result<IpEndpoint, Errno> {
     match endpoint.family {
         AddressFamily::Inet => {
+            // Linux treats the entire 127.0.0.0/8 as loopback-local, so any such
+            // address is bindable (SCTP multi-homing tests bind 127.0.0.1..6).
             if endpoint.addr == crate::net::structure::Ipv4Address::UNSPECIFIED
+                || endpoint.addr.octets()[0] == 127
                 || payload.net_namespace().owns_ipv4_addr(endpoint.addr)
             {
                 Ok(endpoint)

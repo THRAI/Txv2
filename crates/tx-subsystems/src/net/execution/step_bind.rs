@@ -137,6 +137,11 @@ pub fn step_bind(
         _ => false,
     });
     if bound {
+        if socket.kind == SocketKind::Sctp {
+            // Track the primary bound address for the socket's multi-homed
+            // address set (sctp_bindx appends the rest); reported via getpaddrs.
+            payload.sctp_add_local_addr(witness.local);
+        }
         StepOutcome::Done(())
     } else {
         StepOutcome::Err(Errno::EINVAL)

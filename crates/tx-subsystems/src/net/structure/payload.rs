@@ -556,6 +556,40 @@ impl SocketPayload {
             .map(|assoc| assoc.assoc_id)
     }
 
+    /// All local addresses this socket is bound to (primary bind + sctp_bindx).
+    pub fn sctp_local_addrs(&self) -> Vec<IpEndpoint> {
+        self.raw_sctp
+            .as_ref()
+            .map_or_else(Vec::new, RawSctpSocket::local_addrs)
+    }
+
+    /// Record an additional bound local address (bind primary / sctp_bindx).
+    pub fn sctp_add_local_addr(&self, endpoint: IpEndpoint) {
+        if let Some(raw) = self.raw_sctp.as_ref() {
+            raw.add_local_addr(endpoint);
+        }
+    }
+
+    /// The full multi-homed address set of the peer reachable at `peer`, for
+    /// SCTP_GET_PEER_ADDRS: resolve the peer socket and return its bound address
+    /// set. Falls back to just `peer` if the peer socket can't be resolved or
+    /// reports no addresses.
+    pub fn sctp_peer_local_addrs(&self, peer: IpEndpoint) -> Vec<IpEndpoint> {
+        let guard = tx_substrate::epoch::guard();
+        let table = self.socket_table();
+        let addrs = table
+            .lookup_sctp_listener_dual_stack_endpoint(peer, &guard)
+            .or_else(|| table.lookup_sctp_bound(peer, &guard))
+            .and_then(|sock| sock.acquire_operational())
+            .map(|payload| payload.sctp_local_addrs())
+            .unwrap_or_default();
+        if addrs.is_empty() {
+            alloc::vec![peer]
+        } else {
+            addrs
+        }
+    }
+
     /// Number of 1-to-many (SEQPACKET) associations on this socket.
     pub fn sctp_assoc_count(&self) -> usize {
         self.raw_sctp
@@ -1641,6 +1675,14 @@ impl RawSctpSocket {
         self.state.lock().remove_assoc(assoc_id)
     }
 
+    pub fn add_local_addr(&self, endpoint: IpEndpoint) {
+        self.state.lock().add_local_addr(endpoint);
+    }
+
+    pub fn local_addrs(&self) -> Vec<IpEndpoint> {
+        self.state.lock().local_addrs()
+    }
+
     pub fn peers_snapshot(&self) -> Vec<SctpAssoc> {
         self.state.lock().peers_snapshot()
     }
@@ -1667,6 +1709,9 @@ struct RawSctpState {
     queued_bytes: usize,
     /// 1-to-many peer associations (SEQPACKET). Empty for 1-to-1 sockets.
     peers: Vec<SctpAssoc>,
+    /// All local addresses this socket is bound to (primary bind + sctp_bindx),
+    /// used to report the full multi-homed address set to peers via getpaddrs.
+    local_addrs: Vec<IpEndpoint>,
 }
 
 /// Association ids are drawn from a process-global monotonic counter so that
@@ -1681,7 +1726,18 @@ impl RawSctpState {
             frames: Vec::new(),
             queued_bytes: 0,
             peers: Vec::new(),
+            local_addrs: Vec::new(),
         }
+    }
+
+    fn add_local_addr(&mut self, endpoint: IpEndpoint) {
+        if !self.local_addrs.contains(&endpoint) {
+            self.local_addrs.push(endpoint);
+        }
+    }
+
+    fn local_addrs(&self) -> Vec<IpEndpoint> {
+        self.local_addrs.clone()
     }
 
     fn push_message(

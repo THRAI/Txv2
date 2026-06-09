@@ -443,19 +443,21 @@ fn step_sctp_connect(
     if local.is_unspecified() || local.port == 0 {
         return StepOutcome::Err(Errno::EADDRNOTAVAIL);
     }
-    if !remote.is_loopback() {
-        return StepOutcome::Err(Errno::EOPNOTSUPP);
-    }
 
     let table = payload.socket_table();
     // A 1-to-many socket cannot re-create an association that has been peeled off
     // (its (local, remote) connection slot is owned by the peeled 1-to-1 socket).
+    // Checked before the loopback gate so a peeled multi-homed peer address (e.g.
+    // 127.0.1.x) still reports EADDRNOTAVAIL rather than EOPNOTSUPP.
     if payload.with_options(|o| o.socket.sock_type == SocketType::SeqPacket)
         && table
             .lookup_sctp_connection(ConnectionKey::new(local, remote), guard)
             .is_some()
     {
         return StepOutcome::Err(Errno::EADDRNOTAVAIL);
+    }
+    if !remote.is_loopback() {
+        return StepOutcome::Err(Errno::EOPNOTSUPP);
     }
     let Some(listener) = table.lookup_sctp_listener_dual_stack_endpoint(remote, guard) else {
         return StepOutcome::Err(Errno::ECONNREFUSED);

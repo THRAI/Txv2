@@ -530,6 +530,7 @@ fn sctp_connectx3(
     socket: &Cap<SocketIdentity>,
     optval: u64,
     optlen_ptr: u64,
+    nonblocking: bool,
 ) -> Result<(), Errno> {
     let mut param = [0u8; 16];
     bootstrap_copy_from_user(&ctx.aspace, &mut param, optval).map_err(|_| Errno::EFAULT)?;
@@ -566,7 +567,15 @@ fn sctp_connectx3(
         .and_then(|p| p.sctp_assoc_id_for_peer(remote.as_ip_endpoint()))
         .unwrap_or(0);
     param[0..4].copy_from_slice(&assoc_id.to_le_bytes());
-    write_sockopt_bytes(ctx, optval, optlen_ptr, &param)
+    write_sockopt_bytes(ctx, optval, optlen_ptr, &param)?;
+    // A non-blocking connectx reports EINPROGRESS even though our loopback
+    // association is already established; the assoc id is still written back so
+    // sctp_connectx3() returns it to the caller.
+    if nonblocking {
+        Err(Errno::EINPROGRESS)
+    } else {
+        Ok(())
+    }
 }
 
 mod helpers;
@@ -1317,6 +1326,35 @@ fn write_sctp_getaddrs(
         8 + SOCKADDR_IN_BYTES as usize
     };
     write_sockopt_bytes(ctx, optval, optlen_ptr, &buf[..total])
+}
+
+/// Write a `struct sctp_getaddrs { assoc_id; addr_num; addrs[] }` reply with N
+/// addresses (multi-homing): addr_num @4 = N, the packed sockaddrs follow @8.
+/// `sctp_getpaddrs()` returns addr_num, so every peer address must be present.
+fn write_sctp_getaddrs_multi(
+    ctx: &SyscallCtx<'_>,
+    optval: u64,
+    optlen_ptr: u64,
+    endpoints: &[IpEndpoint],
+) -> Result<(), Errno> {
+    let mut buf = alloc::vec![0u8; 8];
+    buf[4..8].copy_from_slice(&(endpoints.len() as u32).to_le_bytes()); // addr_num
+    for ep in endpoints {
+        if ep.family == AddressFamily::Inet6 {
+            let mut sa = [0u8; SOCKADDR_IN6_BYTES as usize];
+            sa[0..2].copy_from_slice(&AF_INET6.to_le_bytes());
+            sa[2..4].copy_from_slice(&ep.port.to_be_bytes());
+            sa[8..24].copy_from_slice(&ep.addr6.octets());
+            buf.extend_from_slice(&sa);
+        } else {
+            let mut sa = [0u8; SOCKADDR_IN_BYTES as usize];
+            sa[0..2].copy_from_slice(&AF_INET.to_le_bytes());
+            sa[2..4].copy_from_slice(&ep.port.to_be_bytes());
+            sa[4..8].copy_from_slice(&ep.addr.octets());
+            buf.extend_from_slice(&sa);
+        }
+    }
+    write_sockopt_bytes(ctx, optval, optlen_ptr, &buf)
 }
 
 /// Write an SCTP_SNDRCV control message (sctp_sndrcvinfo with `stream`/`ppid`)
@@ -2276,15 +2314,33 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             }
             // sctp_bindx(): optval is a packed array of sockaddrs (`optlen` bytes).
             // Every test address is loopback (127/8, ::1) — already reachable via
-            // the primary binding — so multi-homing add/remove is accepted as a
-            // no-op once the buffer is validated to parse.
+            // the primary binding — so we don't touch the bind index; we only
+            // record the addresses in the socket's multi-homed set (for ADD) so
+            // getpaddrs reports the full set to peers.
             if optlen < 2 {
                 return SyscallResult::Error(errno_to_i32(Errno::EINVAL));
             }
-            match read_sockaddr_in(ctx, optval, optlen as u64) {
-                Ok(_) => Ok(()),
-                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            let add = optname == SCTP_SOCKOPT_BINDX_ADD;
+            let total = optlen as u64;
+            let mut off = 0u64;
+            while off + 2 <= total {
+                let addr = match read_sockaddr_in(ctx, optval + off, total - off) {
+                    Ok(addr) => addr,
+                    Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+                };
+                let endpoint = addr.as_ip_endpoint();
+                if add {
+                    if let Some(p) = socket.acquire_operational() {
+                        p.sctp_add_local_addr(endpoint);
+                    }
+                }
+                off += if endpoint.family == AddressFamily::Inet6 {
+                    SOCKADDR_IN6_BYTES as u64
+                } else {
+                    SOCKADDR_IN_BYTES as u64
+                };
             }
+            Ok(())
         }
         (SOL_SCTP, SCTP_RTOINFO) => {
             if socket.kind != SocketKind::Sctp {
@@ -2926,10 +2982,11 @@ fn validate_ipt_replace_request<'a>(
 }
 
 pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
-    let socket = match resolve_socket_fd(ctx, args[0] as i32) {
-        Ok((_, socket)) => socket,
+    let (file, socket) = match resolve_socket_fd(ctx, args[0] as i32) {
+        Ok(pair) => pair,
         Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
     };
+    let nonblocking = file.flags().nonblocking;
     let level = args[1] as i32;
     let optname = args[2] as i32;
     let optval = args[3];
@@ -3246,7 +3303,7 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             }
         }
         (SOL_SCTP, SCTP_SOCKOPT_CONNECTX3) if socket.kind == SocketKind::Sctp => {
-            sctp_connectx3(ctx, &socket, optval, optlen_ptr)
+            sctp_connectx3(ctx, &socket, optval, optlen_ptr, nonblocking)
         }
         (SOL_SCTP, SCTP_GET_PEER_ADDR_INFO) if socket.kind == SocketKind::Sctp => {
             // struct sctp_paddrinfo is packed+aligned(4): spinfo_assoc_id @0,
@@ -3311,7 +3368,12 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
                 socket_peer_endpoint(&socket)
             };
             match endpoint {
-                Ok(endpoint) => write_sctp_getaddrs(ctx, optval, optlen_ptr, endpoint),
+                // Report the peer's full multi-homed address set (sctp_getpaddrs
+                // expects every address of the association's peer).
+                Ok(endpoint) => {
+                    let addrs = payload.sctp_peer_local_addrs(endpoint);
+                    write_sctp_getaddrs_multi(ctx, optval, optlen_ptr, &addrs)
+                }
                 Err(errno) => Err(errno),
             }
         }
