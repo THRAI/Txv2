@@ -888,6 +888,22 @@ pub fn step_exit_group(process: &Cap<ProcessIdentity>, status: ExitStatus) {
             b"debug.lock_service.process.payload.exit_group.drain_fds.duration_ns",
             || payload.drain_fds(),
         );
+        // Release socket port/table bindings, mirroring step_process_exit:
+        // fd-Cap drop alone never runs the socket-close teardown, so a
+        // SIGKILLed listener (route_gewalt → step_exit_group_with_signal
+        // lands here, not in step_process_exit) kept its port reserved and
+        // the next bind failed EADDRINUSE — netperf_testcode.sh kill -9's
+        // its netserver between the musl and glibc groups. Skip fds still
+        // shared (dup/fork) so a forked child keeps the listener.
+        for file in closed_fds.values() {
+            if file.retain_count() > 1 {
+                continue;
+            }
+            if let Some(socket) = file.socket_identity() {
+                let guard = tx_substrate::epoch::guard();
+                let _ = crate::net::execution::step_socket_close(socket, &guard);
+            }
+        }
         let drained: Vec<Cap<ThreadIdentity>> = measure_process_lock_service(
             b"debug.lock_service.process.payload.exit_group.threads_drain.duration_ns",
             || payload.threads.drain(),

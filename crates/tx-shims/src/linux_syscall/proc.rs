@@ -6,7 +6,7 @@
 use super::*;
 use crate::adapter::step_engine::{self as step_engine};
 use crate::linux_syscall::numbers::{
-    CLONE_NEWIPC, CLONE_NEWNET, CLONE_NEWNS, CLONE_NEWUSER, NR_CLONE,
+    CLONE_CHILD_SETTID, CLONE_NEWIPC, CLONE_NEWNET, CLONE_NEWNS, CLONE_NEWUSER, NR_CLONE,
 };
 
 /// Linux raw `wait4`/`getrusage` rusage image for musl LP64:
@@ -521,6 +521,7 @@ pub(super) fn sys_clone_oneshot<P: PmapIf>(
     let clone_sighand = (flags & CLONE_SIGHAND) != 0;
     let clone_settls = (flags & CLONE_SETTLS) != 0;
     let clone_child_cleartid = (flags & CLONE_CHILD_CLEARTID) != 0;
+    let clone_child_settid = (flags & CLONE_CHILD_SETTID) != 0;
     let clone_parent_settid = (flags & CLONE_PARENT_SETTID) != 0;
     let clone_newipc = (flags & CLONE_NEWIPC) != 0;
 
@@ -546,6 +547,9 @@ pub(super) fn sys_clone_oneshot<P: PmapIf>(
             | CLONE_NEWCGROUP
             | CLONE_NEWUTS
     } else {
+        // CHILD_SETTID/CHILD_CLEARTID/PARENT_SETTID: glibc's fork()
+        // is clone(SIGCHLD | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID)
+        // with ctid = &self->tid (musl passes bare SIGCHLD).
         SIGCHLD
             | CLONE_SETTLS
             | CLONE_VM
@@ -554,6 +558,9 @@ pub(super) fn sys_clone_oneshot<P: PmapIf>(
             | CLONE_FILES
             | CLONE_FS
             | CLONE_NEWIPC
+            | CLONE_CHILD_SETTID
+            | CLONE_CHILD_CLEARTID
+            | CLONE_PARENT_SETTID
     };
     if flags & !allowed_mask != 0 {
         return Some(SyscallResult::Error(EINVAL_VALUE));
@@ -734,6 +741,29 @@ pub(super) fn sys_clone_oneshot<P: PmapIf>(
         tls as usize,
         stack as usize,
     );
+
+    // Fork-shape tid bookkeeping, before the child is scheduled:
+    // PARENT_SETTID writes into the parent's aspace, CHILD_SETTID
+    // into the child's COW copy (glibc fork points ctid at the
+    // child TCB's tid slot, which still holds the parent's tid),
+    // CHILD_CLEARTID arms exit-time clear+futex-wake.
+    if clone_parent_settid && args[2] != 0 {
+        let _ = super::user_copy::bootstrap_write_user(&ctx.aspace, args[2], child.pid.0 as i32);
+    }
+    if clone_child_settid && ctid_arg != 0 {
+        if let Some(child_aspace) = child.aspace_cap() {
+            let _ = super::user_copy::bootstrap_write_user(
+                &child_aspace,
+                ctid_arg,
+                child.pid.0 as i32,
+            );
+        }
+    }
+    if clone_child_cleartid && ctid_arg != 0 {
+        if let Some(payload) = child_thread.payload_cap() {
+            *payload.clear_child_tid.lock() = Some(ctid_arg);
+        }
+    }
 
     // Hand the child's leader thread to the reactor. Panics with
     // `:clone:no-reactor-seam` if the boot path didn't install the

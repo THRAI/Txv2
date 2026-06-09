@@ -1568,12 +1568,15 @@ pub(super) fn inode_meta_to_stat(meta: &InodeMeta, ino: u64, rdev: u64) -> StatL
     }
 }
 
-fn inode_meta_to_statx(meta: &InodeMeta, ino: u64) -> StatxLayout {
+fn inode_meta_to_statx(meta: &InodeMeta, ino: u64, rdev: u64) -> StatxLayout {
     let ts = |sec, nsec| StatxTimestamp {
         tv_sec: sec,
         tv_nsec: nsec as u32,
         __reserved: 0,
     };
+    // Decode the Linux makedev layout back into the statx split form.
+    let rdev_major = ((rdev >> 8) & 0xfff) as u32;
+    let rdev_minor = ((rdev & 0xff) | ((rdev >> 12) & !0xffu64)) as u32;
 
     StatxLayout {
         stx_mask: numbers::STATX_BASIC_STATS,
@@ -1592,14 +1595,41 @@ fn inode_meta_to_statx(meta: &InodeMeta, ino: u64) -> StatxLayout {
         stx_btime: ts(0, 0),
         stx_ctime: ts(meta.ctime.sec, meta.ctime.nsec),
         stx_mtime: ts(meta.mtime.sec, meta.mtime.nsec),
-        stx_rdev_major: 0,
-        stx_rdev_minor: 0,
+        stx_rdev_major: rdev_major,
+        stx_rdev_minor: rdev_minor,
         stx_dev_major: 0,
         stx_dev_minor: 0,
         stx_mnt_id: 0,
         stx_dio_mem_align: 0,
         stx_dio_offset_align: 0,
         __spare3: [0; 12],
+    }
+}
+
+/// Linux-encoded `st_rdev` (`makedev` layout: `(major & 0xfff) << 8 |
+/// (minor & 0xff) | (minor & ~0xff) << 12`) for a character-device
+/// open file; 0 for everything else. glibc's `daemon()` fstats
+/// `/dev/null` and requires `S_ISCHR` + `st_rdev == makedev(1,3)`,
+/// else it fails with `ENODEV` — iperf3's `-s -D` server died on that.
+fn linux_rdev(major: u64, minor: u64) -> u64 {
+    ((major & 0xfff) << 8) | (minor & 0xff) | ((minor & !0xff) << 12)
+}
+
+fn rdev_for_open_file(file: &Cap<OpenFile>) -> u64 {
+    match file.rnode().backing() {
+        RNodeBacking::StructBacked {
+            payload: StructPayload::CharDevice(binding),
+        } => linux_rdev(binding.devt.major() as u64, binding.devt.minor() as u64),
+        _ => rdev_for_fs_object_id(file.rnode().fs_object_id()),
+    }
+}
+
+/// Path-walked stats only have the object id; resolve static devfs
+/// char nodes through the devfs table.
+fn rdev_for_fs_object_id(id: FsObjectId) -> u64 {
+    match tx_fs::devfs::devt_for_object_id(id) {
+        Some(devt) => linux_rdev(devt.major() as u64, devt.minor() as u64),
+        None => 0,
     }
 }
 
@@ -1664,7 +1694,7 @@ pub(super) fn sys_fstat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
     let fs_object_id = rnode.fs_object_id();
     let meta = stat_meta_for_open_file(&file);
     let ino = fs_object_id.as_u64();
-    let stat = inode_meta_to_stat(&meta, ino, 0);
+    let stat = inode_meta_to_stat(&meta, ino, rdev_for_open_file(&file));
 
     if let Err(errno) = bootstrap_write_user::<StatLayout>(&ctx.aspace, statbuf_uaddr, stat) {
         return SyscallResult::error_from(errno);
@@ -1774,7 +1804,7 @@ pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     };
 
     apply_stat_meta_override(ino, &mut statx_result.meta);
-    let statx = inode_meta_to_statx(&statx_result.meta, ino.as_u64());
+    let statx = inode_meta_to_statx(&statx_result.meta, ino.as_u64(), rdev_for_fs_object_id(ino));
     if let Err(errno) = bootstrap_write_user::<StatxLayout>(&ctx.aspace, statxbuf_uaddr, statx) {
         return SyscallResult::error_from(errno);
     }
@@ -1860,7 +1890,7 @@ pub(super) async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
     };
 
     apply_stat_meta_override(ino, &mut meta);
-    let stat = inode_meta_to_stat(&meta, ino.as_u64(), 0);
+    let stat = inode_meta_to_stat(&meta, ino.as_u64(), rdev_for_fs_object_id(ino));
 
     if let Err(errno) = bootstrap_write_user::<StatLayout>(&ctx.aspace, statbuf_uaddr, stat) {
         return SyscallResult::error_from(errno);

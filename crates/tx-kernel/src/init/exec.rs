@@ -392,7 +392,10 @@ impl<P: TxPlatform> CoreInit<P> {
             }
             tx_hal::console_write_str::<P>("\n");
             let sdcard_cmd = build_oscomp_sdcard_cmd::<P>();
-            let sdcard_envp: &[&[u8]] = &[b"PATH=/bin:/musl/glibc:/musl/musl"];
+            let sdcard_envp: &[&[u8]] = &[
+                b"PATH=/bin:/musl/glibc:/musl/musl",
+                b"LD_LIBRARY_PATH=/musl/glibc/lib:/lib",
+            ];
             let sdcard_argv: &[&[u8]] = &[b"sh", b"-c", sdcard_cmd.as_bytes()];
             let outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
                 &init,
@@ -911,6 +914,15 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
                 selected += 1;
                 continue;
             }
+            // glibc lane (re-homed; the main rebase dropped it with the
+            // network groups): the sdcard's /glibc dir mirrors /musl with
+            // glibc-linked binaries, and its testcode scripts emit
+            // `-glibc`-suffixed GROUP markers for the judge.
+            if let Some(script) = oscomp_glibc_script_for_group(group) {
+                append_oscomp_glibc_script(&mut cmd, script);
+                selected += 1;
+                continue;
+            }
             if let Some(script) = oscomp_musl_script_for_group(group) {
                 append_oscomp_musl_script_with_observe(
                     &mut cmd,
@@ -1157,6 +1169,9 @@ fn append_default_oscomp_scripts(
             );
         }
     }
+    for (_, script) in DEFAULT_OSCOMP_GLIBC_SCRIPTS {
+        append_oscomp_glibc_script(cmd, script);
+    }
 }
 
 #[cfg(test)]
@@ -1232,6 +1247,46 @@ const DEFAULT_OSCOMP_MUSL_SCRIPTS: &[(&str, &str)] = &[
     ("cyclictest-musl", "cyclictest_testcode.sh"),
     ("ltp-musl", "ltp_testcode.sh"),
 ];
+
+/// glibc groups included in the default (judged) boot. Kept to the
+/// benchmark groups for now — the wider glibc suites need their own
+/// validation pass before joining the default run.
+const DEFAULT_OSCOMP_GLIBC_SCRIPTS: &[(&str, &str)] = &[
+    ("netperf-glibc", "netperf_testcode.sh"),
+    ("iperf-glibc", "iperf_testcode.sh"),
+];
+
+/// Map a `<suite>-glibc` group to its testcode script under `/musl/glibc`.
+/// Same script names as the musl lane; the directory selects the libc.
+fn oscomp_glibc_script_for_group(group: &str) -> Option<&'static str> {
+    let canonical = group.strip_suffix("-glibc")?;
+    match canonical {
+        "basic" => Some("basic_testcode.sh"),
+        "busybox" => Some("busybox_testcode.sh"),
+        "libctest" => Some("libctest_testcode.sh"),
+        "libcbench" => Some("libcbench_testcode.sh"),
+        "lua" => Some("lua_testcode.sh"),
+        "lmbench" => Some("lmbench_testcode.sh"),
+        "iozone" => Some("iozone_testcode.sh"),
+        "netperf" => Some("netperf_testcode.sh"),
+        "iperf" => Some("iperf_testcode.sh"),
+        "cyclictest" => Some("cyclictest_testcode.sh"),
+        "ltp" => Some("ltp_testcode.sh"),
+        _ => None,
+    }
+}
+
+/// Run one glibc testcode script from `/musl/glibc`, then restore the
+/// musl CWD. `;` separators (not `&&`) so a failing script never skips
+/// the groups queued after it.
+fn append_oscomp_glibc_script(cmd: &mut alloc::string::String, script: &str) {
+    use core::fmt::Write as _;
+
+    let _ = write!(
+        cmd,
+        "; cd /musl/glibc; /musl/musl/busybox sh {script}; cd /musl/musl"
+    );
+}
 
 fn oscomp_musl_script_for_group(group: &str) -> Option<&'static str> {
     let canonical = match group.strip_suffix("-musl") {
@@ -1695,5 +1750,36 @@ mod tests {
             cmd.contains("; ./busybox echo \"#### OS COMP TEST GROUP START libctest-musl ####\"")
         );
         assert!(!cmd.contains("basic_testcode.sh && ./busybox echo"));
+    }
+
+    #[test]
+    fn glibc_groups_map_to_glibc_dir_scripts() {
+        assert_eq!(
+            oscomp_glibc_script_for_group("netperf-glibc"),
+            Some("netperf_testcode.sh")
+        );
+        assert_eq!(
+            oscomp_glibc_script_for_group("iperf-glibc"),
+            Some("iperf_testcode.sh")
+        );
+        assert_eq!(
+            oscomp_glibc_script_for_group("ltp-glibc"),
+            Some("ltp_testcode.sh")
+        );
+        // musl groups must not route through the glibc lane.
+        assert_eq!(oscomp_glibc_script_for_group("netperf-musl"), None);
+        assert_eq!(oscomp_glibc_script_for_group("netperf"), None);
+
+        let mut cmd = alloc::string::String::from("cd /musl/musl");
+        append_oscomp_glibc_script(&mut cmd, "netperf_testcode.sh");
+        assert!(cmd.contains("; cd /musl/glibc; /musl/musl/busybox sh netperf_testcode.sh; cd /musl/musl"));
+    }
+
+    #[test]
+    fn default_scripts_include_glibc_bench_groups() {
+        let mut cmd = alloc::string::String::from("cd /musl/musl");
+        append_default_oscomp_scripts(&mut cmd, false, None);
+        assert!(cmd.contains("; cd /musl/glibc; /musl/musl/busybox sh netperf_testcode.sh; cd /musl/musl"));
+        assert!(cmd.contains("; cd /musl/glibc; /musl/musl/busybox sh iperf_testcode.sh; cd /musl/musl"));
     }
 }

@@ -154,6 +154,27 @@ pub const DEVFS_ROOT_MODE: u16 = S_IFDIR | 0o755;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Devfs;
 
+/// `DevT` for a static devfs character node, by stable object id.
+/// Path-walked `stat`/`statx` only have the `FsObjectId` (no rnode
+/// with the `CharDeviceBinding`), so they resolve the device number
+/// here. glibc's `daemon()` fstat-checks `/dev/null` against
+/// `makedev(1,3)` and fails with `ENODEV` when `st_rdev` is 0.
+pub fn devt_for_object_id(id: FsObjectId) -> Option<DevT> {
+    if id == DEVFS_NULL_OBJECT_ID {
+        Some(NULL_CHAR_BINDING.devt)
+    } else if id == DEVFS_ZERO_OBJECT_ID {
+        Some(ZERO_CHAR_BINDING.devt)
+    } else if id == DEVFS_RTC_OBJECT_ID {
+        Some(RTC_CHAR_BINDING.devt)
+    } else if id == DEVFS_URANDOM_OBJECT_ID {
+        Some(URANDOM_CHAR_BINDING.devt)
+    } else if id == DEVFS_RANDOM_OBJECT_ID {
+        Some(RANDOM_CHAR_BINDING.devt)
+    } else {
+        None
+    }
+}
+
 struct NullCharOps;
 
 impl CharDeviceOps for NullCharOps {

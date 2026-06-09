@@ -359,6 +359,10 @@ pub const CLONE_PARENT: u64 = 0x8000;
 pub const CLONE_THREAD: u64 = 0x10000;
 pub const CLONE_CHILD_CLEARTID: u64 = 0x200000;
 pub const CLONE_PARENT_SETTID: u64 = 0x100000;
+/// glibc's `arch_fork` passes `CLONE_CHILD_SETTID |
+/// CLONE_CHILD_CLEARTID | SIGCHLD` with `ctid = &self->tid` so the
+/// kernel stamps the child's tid into the child's TCB.
+pub const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
 /// Ignored by Linux since 2.5.32; musl sets it unconditionally.
 pub const CLONE_DETACHED: u64 = 0x400000;
 /// System-V semaphore undo on exit; musl sets this in pthread_create.
