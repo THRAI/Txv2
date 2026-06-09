@@ -376,7 +376,13 @@ pub(super) fn recv_ready_mask(mask: PollMask) -> bool {
 }
 
 pub(super) fn recv_staging_len(socket: &Cap<SocketIdentity>, requested: usize) -> usize {
-    let capped = requested.min(TTY_WRITE_MAX_INLINE);
+    // Socket recv stages onto the heap, so cap at the socket I/O size
+    // (`SOCKET_IO_MAX_INLINE`, 64 KiB) rather than the TTY 4 KiB inline limit.
+    // The rebase that dropped the socket I/O lane left this at 4 KiB, which
+    // throttled a streaming TCP receiver to ~4 KiB/syscall (iperf3's server did
+    // ~320 recvs for one 1.25 MB test → ~0.86 Mbit/s under TCG). Still
+    // `min(requested, queued)`-bounded, so small reads stay small.
+    let capped = requested.min(SOCKET_IO_MAX_INLINE);
     let ready = recv_queued_len(socket);
     if ready == 0 {
         capped

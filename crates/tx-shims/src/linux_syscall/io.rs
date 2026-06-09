@@ -1338,6 +1338,14 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         tx_subsystems::vfs::RNodeBacking::PageBacked { .. }
     ) {
         len
+    } else if file.socket_identity().is_some() {
+        // Socket write(2) stages onto the heap and routes to the socket send
+        // path, so cap at the socket I/O size (64 KiB) not the TTY 4 KiB inline
+        // limit. The rebase that dropped the socket I/O lane left this at 4 KiB,
+        // which throttled a streaming TCP sender to ~4 KiB/syscall (iperf3 issues
+        // 128 KiB write()s but only 4096 were taken → ~320 writes per 1.25 MB
+        // test, the dominant cost behind loopback TCP's sub-1-Mbit/s rate).
+        core::cmp::min(len, SOCKET_IO_MAX_INLINE)
     } else {
         core::cmp::min(len, TTY_WRITE_MAX_INLINE)
     };

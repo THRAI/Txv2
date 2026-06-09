@@ -1,4 +1,19 @@
+- 2026-06-09 (follow-up) **`iperf` 3/6 → 6/6: the TCP "throughput wall" was a rebase regression, not a TCG limit.**
+  A timestamped socket-syscall trace showed iperf3's `write(128 KiB)` returning only **4096** — the
+  socket `read`/`write` path was capped at `TTY_WRITE_MAX_INLINE` (4 KiB) instead of the intended
+  `SOCKET_IO_MAX_INLINE` (64 KiB). `mod.rs` still defined the 64 KiB const with a comment that the
+  rebase "dropped it with the socket I/O lane", but `recv_staging_len` (helpers.rs) and the
+  `write(2)` len cap (io.rs) had silently fallen back to the TTY 4 KiB limit. So a streaming TCP
+  endpoint did ~320 syscalls per 1.25 MB test, each paying the full emulated round-trip → ~0.86
+  Mbit/s and a 12 s wall for a `-t 2` run. **Restoring 64 KiB on both the socket read staging and
+  the socket write cap** lifted loopback TCP to ~4.4 Mbit/s and UDP to ~15–19 Mbit/s (recv was
+  capped too), and made the durations ~2 s. **All 6 iperf subtests now score 1.0** (incl. the
+  previously-failing PARALLEL_TCP, whose "broken pipe" was a side effect of the 4 KiB throttle).
+  **netperf 5/5 + iperf 6/6 = 11 points.** Regressions clean: `test_sctp_sendrecvmsg` 10/10 alone
+  (incl. fragmented messages), `accept_close` 10/10, poll01/ppoll01 pass, netperf 5/5.
+
 - 2026-06-09 **Dimension B `netperf` + `iperf` benchmark groups: 0 → 8 points (`netperf` 5/5, `iperf` 3/6).**
+  (Superseded by the follow-up above — iperf is now 6/6 after the socket-I/O-cap fix.)
   Both groups were previously 0 (netperf hung on the first subtest; iperf aborted at startup).
   Judge scoring is forgiving: each subtest with a positive throughput on its result line scores
   `>=1.0` (`res<baseline → 1.0`), so this is a *correctness* goal, not a perf goal — every subtest
