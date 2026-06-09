@@ -1,3 +1,40 @@
+- 2026-06-09 **Dimension B `netperf` + `iperf` benchmark groups: 0 → 8 points (`netperf` 5/5, `iperf` 3/6).**
+  Both groups were previously 0 (netperf hung on the first subtest; iperf aborted at startup).
+  Judge scoring is forgiving: each subtest with a positive throughput on its result line scores
+  `>=1.0` (`res<baseline → 1.0`), so this is a *correctness* goal, not a perf goal — every subtest
+  just has to run end-to-end and emit a number. Verified with the actual `judge_netperf-musl.py`
+  / `judge_iperf-musl.py`. Five real bugs fixed (all on `feature-network-next`), none rippling
+  outside networking:
+  1. **ITIMER_REAL delivered on the generic syscall boundary** (`tx-shims` `time.rs`
+     `poll_itimer_real_on_syscall_boundary`, called from `dispatch`). The ping fix only fired the
+     alarm at a *socket wait*; netperf's `UDP_STREAM`/`TCP_STREAM` bursts are a tight `send` loop
+     that never blocks, so SIGALRM (which ends the `-l 1` test) never fired → infinite send. Linux
+     delivers a fired alarm on the next return-to-userspace from any syscall; now we do too. This
+     alone fixed all of netperf (5/5).
+  2. **`/dev/urandom` + `/dev/random` char devices** (`tx-fs` `devfs/mod.rs`, major 1 minor 9/8,
+     SplitMix64 fill). iperf3 reads `/dev/urandom` for its session cookie and aborted with ENOENT.
+  3. **select/poll wake on ANY fd, not just the first** (`tx-shims` `io.rs`
+     `await_any_select_park`, used by `sys_pselect6` + `sys_ppoll`). Both kept only the first
+     not-ready fd's wait token and parked on it alone; iperf3's server waits on its control socket
+     **and** its UDP data socket together, so the arriving datagram never woke a select parked on
+     the quiet control socket. General correctness bug, not iperf-specific.
+  4. **v4-mapped dual-stack UDP delivery** (`tx-subsystems` `table.rs`): an IPv6 socket bound to
+     `[::]` (iperf3's default server) must receive IPv4 loopback datagrams. Added the v4→v6
+     wildcard fallback to `lookup_udp_bound` *and* a `[::]`-wildcard-local connected lookup to
+     `lookup_udp_ingress` (so the server keeps receiving after it `connect()`s its data socket back
+     to the client), mirroring the existing `lookup_tcp_listener_dual_stack_endpoint`.
+  5. **dual-stack connect**: a non-`v6only` IPv6 socket may `connect()` to an IPv4 peer
+     (`require_socket_family` in `predicates.rs`) — iperf3's UDP server connects its `[::]` data
+     socket back to the IPv4 client it just heard from; this was EAFNOSUPPORT.
+  **iperf 3/6** = all UDP (BASIC/PARALLEL/REVERSE, ~2.1–2.2 Mbits/s each). The 3 **TCP** subtests
+  are throughput-walled under QEMU TCG: loopback TCP runs ~0.86 Mbits/s (per-segment ACK
+  round-trips cost ~2.5× UDP), just under the judge's 1 Mbit/s reporting floor (it shows
+  `Kbits/sec`, which the `[MG]bits/sec` regex ignores); PARALLEL_TCP additionally hits a broken
+  pipe. Same class of wall as route4/netload — not a quick correctness fix, and reworking the core
+  TCP transfer loop risks the many passing LTP TCP tests. Regression-checked: `net.sctp`
+  `test_1_to_1_accept_close` still 10/10 (connect/family change safe); netperf+iperf exercise
+  select/poll/connect heavily and run clean.
+
 - 2026-06-09 **Dimension B `net.sctp`: +15 tests this session → 39/41 passing (only 2 libc-blocked left).**
   Verified on rv64-qemu, each committed on `feature-network-next`. Newly passing:
   `test_assoc_abort` (SCTP_ABORT → 24-byte COMM_LOST state 1, vs graceful SHUTDOWN_COMP),

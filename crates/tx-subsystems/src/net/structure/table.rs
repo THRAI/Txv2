@@ -565,6 +565,23 @@ impl SocketTable {
             return Some(socket);
         }
 
+        // Dual-stack: an IPv6 socket bound to `[::]` and connect()ed to an IPv4
+        // peer keys its connection with an IPv6 wildcard local, but an inbound
+        // IPv4 datagram looks up with the IPv4 destination. Match it against the
+        // `[::]:port` connected key so the server keeps receiving after it
+        // connect()s back to the client (iperf3's UDP server connect()s its data
+        // socket to the peer it just heard from; without this the post-connect
+        // datagrams are dropped and the server reports 0 bytes received).
+        if dst.family == AddressFamily::Inet {
+            let wildcard6_local = ConnectionKey::new(
+                IpEndpoint::unspecified_for_family(AddressFamily::Inet6, dst.port),
+                src,
+            );
+            if let Some(socket) = self.lookup_udp_connection(wildcard6_local, guard) {
+                return Some(socket);
+            }
+        }
+
         self.lookup_udp_bound(dst, guard)
     }
 
@@ -648,7 +665,40 @@ impl SocketTable {
         if let Some(socket) = self.lookup_udp_bound_exact(endpoint, guard) {
             return Some(socket);
         }
-        self.lookup_udp_bound_wildcard(endpoint, guard)
+        if let Some(socket) = self.lookup_udp_bound_wildcard(endpoint, guard) {
+            return Some(socket);
+        }
+        // Dual-stack: an inbound IPv4 datagram also matches an IPv6 socket bound
+        // to the unspecified address (`[::]`) on the same port (default
+        // `IPV6_V6ONLY=0`), via v4-mapped delivery. Mirrors
+        // `lookup_tcp_listener_dual_stack_endpoint` — without it the TCP control
+        // path accepts a v4 client onto a `[::]` listener but the UDP data path
+        // drops the v4 datagram. iperf3 binds its UDP data socket to `[::]:PORT`
+        // and the IPv4 client sends to `127.0.0.1:PORT`.
+        if endpoint.family == AddressFamily::Inet {
+            return self.lookup_udp_bound_wildcard6(endpoint.port, guard);
+        }
+        None
+    }
+
+    /// IPv6 unspecified (`[::]`) wildcard match on `port`, for v4-mapped
+    /// delivery of an inbound IPv4 datagram to a dual-stack socket.
+    pub fn lookup_udp_bound_wildcard6(
+        &self,
+        port: u16,
+        guard: &Guard<'_>,
+    ) -> Option<Cap<SocketIdentity>> {
+        self.udp_bound
+            .lookup(
+                &LocalEndpointKey {
+                    family: AddressFamily::Inet6,
+                    addr: Ipv4Address::UNSPECIFIED,
+                    addr6: Ipv6Address::UNSPECIFIED,
+                    port,
+                },
+                guard,
+            )
+            .and_then(|entry| entry.value().try_clone_live())
     }
 
     pub fn lookup_udp_bound_exact(

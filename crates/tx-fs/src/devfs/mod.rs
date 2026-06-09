@@ -103,6 +103,12 @@ pub const DEVFS_MISC_DIR_OBJECT_ID: FsObjectId = FsObjectId::new(0x6465_7804);
 /// Stable `FsObjectId` for the static `/dev/misc/rtc` character device.
 pub const DEVFS_RTC_OBJECT_ID: FsObjectId = FsObjectId::new(0x6465_7805);
 
+/// Stable `FsObjectId` for the static `/dev/urandom` character device.
+pub const DEVFS_URANDOM_OBJECT_ID: FsObjectId = FsObjectId::new(0x6465_7806);
+
+/// Stable `FsObjectId` for the static `/dev/random` character device.
+pub const DEVFS_RANDOM_OBJECT_ID: FsObjectId = FsObjectId::new(0x6465_7807);
+
 /// `/dev/null` character device name as the lookup key.
 const DEVFS_NULL_NAME: &[u8] = b"null";
 
@@ -114,6 +120,12 @@ const DEVFS_MISC_DIR_NAME: &[u8] = b"misc";
 
 /// `/dev/misc/rtc` character device name as the lookup key.
 const DEVFS_RTC_NAME: &[u8] = b"rtc";
+
+/// `/dev/urandom` character device name as the lookup key.
+const DEVFS_URANDOM_NAME: &[u8] = b"urandom";
+
+/// `/dev/random` character device name as the lookup key.
+const DEVFS_RANDOM_NAME: &[u8] = b"random";
 
 /// Mode for any character-device alias resolved by devfs (per the
 /// Phase 3a plan §"devfs FsOps surface": `S_IFCHR | 0o620`).
@@ -201,6 +213,66 @@ pub static RTC_CHAR_BINDING: CharDeviceBinding = CharDeviceBinding {
     devt: DevT::new(10, 135),
     name: "rtc",
     ops: &RTC_CHAR_OPS,
+};
+
+/// Pseudo-random char device backing `/dev/urandom` and `/dev/random`.
+///
+/// `iperf3` (and other tools) generate their session cookie by reading bytes
+/// from `/dev/urandom`; with no node present `open` returns `ENOENT` and the
+/// run aborts before any throughput is measured. There is no hardware entropy
+/// pool here, so reads are served from a self-contained SplitMix64 generator.
+/// The state advances on every read so successive cookies differ within a boot;
+/// this is non-cryptographic and only intended to satisfy callers that want a
+/// stream of varied bytes (matching the `getrandom(2)` shim, which is likewise
+/// a deterministic fill — see `numbers.rs` `GRND_RANDOM`).
+struct RandomCharOps;
+
+/// SplitMix64 state, seeded with the golden-ratio constant. Advanced in place by
+/// [`splitmix64`] on each read; shared by `/dev/urandom` and `/dev/random`.
+static RANDOM_STATE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0x9E37_79B9_7F4A_7C15);
+
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+impl CharDeviceOps for RandomCharOps {
+    fn read(&self, out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
+        use core::sync::atomic::Ordering;
+        let mut state = RANDOM_STATE.load(Ordering::Relaxed);
+        for chunk in out.chunks_mut(8) {
+            let word = splitmix64(&mut state).to_le_bytes();
+            for (dst, src) in chunk.iter_mut().zip(word.iter()) {
+                *dst = *src;
+            }
+        }
+        RANDOM_STATE.store(state, Ordering::Relaxed);
+        StepOutcome::done(out.len())
+    }
+
+    fn write(&self, bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
+        // Writes seed the kernel pool on Linux; here they are accepted and
+        // discarded so `> /dev/random` style callers do not see EINVAL.
+        StepOutcome::done(bytes.len())
+    }
+}
+
+static RANDOM_CHAR_OPS: RandomCharOps = RandomCharOps;
+
+static URANDOM_CHAR_BINDING: CharDeviceBinding = CharDeviceBinding {
+    devt: DevT::new(1, 9),
+    name: "urandom",
+    ops: &RANDOM_CHAR_OPS,
+};
+
+static RANDOM_CHAR_BINDING: CharDeviceBinding = CharDeviceBinding {
+    devt: DevT::new(1, 8),
+    name: "random",
+    ops: &RANDOM_CHAR_OPS,
 };
 
 impl Devfs {
@@ -456,6 +528,12 @@ impl FsOps for Devfs {
         if name == DEVFS_ZERO_NAME {
             return StepOutcome::done(DEVFS_ZERO_OBJECT_ID);
         }
+        if name == DEVFS_URANDOM_NAME {
+            return StepOutcome::done(DEVFS_URANDOM_OBJECT_ID);
+        }
+        if name == DEVFS_RANDOM_NAME {
+            return StepOutcome::done(DEVFS_RANDOM_OBJECT_ID);
+        }
         if name == DEVFS_MISC_DIR_NAME {
             return StepOutcome::done(DEVFS_MISC_DIR_OBJECT_ID);
         }
@@ -496,6 +574,9 @@ impl FsOps for Devfs {
             return StepOutcome::done(InodeMeta::new(InodeKind::CharDevice, DEVFS_NULL_MODE));
         }
         if fs_object_id == DEVFS_ZERO_OBJECT_ID {
+            return StepOutcome::done(InodeMeta::new(InodeKind::CharDevice, DEVFS_NULL_MODE));
+        }
+        if fs_object_id == DEVFS_URANDOM_OBJECT_ID || fs_object_id == DEVFS_RANDOM_OBJECT_ID {
             return StepOutcome::done(InodeMeta::new(InodeKind::CharDevice, DEVFS_NULL_MODE));
         }
         if fs_object_id == DEVFS_RTC_OBJECT_ID {
@@ -691,6 +772,28 @@ impl FsOps for Devfs {
             };
             return StepOutcome::done(Some((dir_entry, DirCursor::from_u64(cursor.as_u64() + 1))));
         }
+        if index == entries.len() + 5 {
+            let dir_entry = match DirEntry::new(
+                DEVFS_URANDOM_OBJECT_ID,
+                InodeKind::CharDevice,
+                DEVFS_URANDOM_NAME,
+            ) {
+                Ok(de) => de,
+                Err(err) => return StepOutcome::err(err.into()),
+            };
+            return StepOutcome::done(Some((dir_entry, DirCursor::from_u64(cursor.as_u64() + 1))));
+        }
+        if index == entries.len() + 6 {
+            let dir_entry = match DirEntry::new(
+                DEVFS_RANDOM_OBJECT_ID,
+                InodeKind::CharDevice,
+                DEVFS_RANDOM_NAME,
+            ) {
+                Ok(de) => de,
+                Err(err) => return StepOutcome::err(err.into()),
+            };
+            return StepOutcome::done(Some((dir_entry, DirCursor::from_u64(cursor.as_u64() + 1))));
+        }
         StepOutcome::done(None)
     }
 
@@ -767,6 +870,24 @@ impl FsOps for Devfs {
                 meta,
                 RNodeBacking::StructBacked {
                     payload: StructPayload::CharDevice(&RTC_CHAR_BINDING),
+                },
+                mount,
+            ) {
+                Ok(rnode) => StepOutcome::done(rnode),
+                Err(_) => StepOutcome::err(Errno::EIO.into()),
+            };
+        }
+        if fs_object_id == DEVFS_URANDOM_OBJECT_ID || fs_object_id == DEVFS_RANDOM_OBJECT_ID {
+            let binding = if fs_object_id == DEVFS_URANDOM_OBJECT_ID {
+                &URANDOM_CHAR_BINDING
+            } else {
+                &RANDOM_CHAR_BINDING
+            };
+            return match RNode::new_cap_in_mount(
+                fs_object_id,
+                meta,
+                RNodeBacking::StructBacked {
+                    payload: StructPayload::CharDevice(binding),
                 },
                 mount,
             ) {

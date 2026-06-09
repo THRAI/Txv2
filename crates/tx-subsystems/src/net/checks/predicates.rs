@@ -69,10 +69,21 @@ fn require_socket_family(
     endpoint: IpEndpoint,
 ) -> Result<IpEndpoint, Errno> {
     if payload.family() == endpoint.family {
-        Ok(endpoint)
-    } else {
-        Err(Errno::EAFNOSUPPORT)
+        return Ok(endpoint);
     }
+    // Dual-stack: a non-v6only IPv6 socket may target an IPv4 peer. Linux exposes
+    // the peer as a v4-mapped `::ffff:a.b.c.d` address; this loopback model carries
+    // it as a native IPv4 endpoint, and the connection/send paths key on that IPv4
+    // endpoint so the reply reaches the IPv4 peer. iperf3's server binds its UDP
+    // data socket to `[::]` and connect()s back to the IPv4 client it just heard
+    // from — without this that connect fails EAFNOSUPPORT and the test aborts.
+    if payload.family() == AddressFamily::Inet6
+        && endpoint.family == AddressFamily::Inet
+        && !payload.with_options(|o| o.ip.ipv6_v6only)
+    {
+        return Ok(endpoint);
+    }
+    Err(Errno::EAFNOSUPPORT)
 }
 
 pub(crate) fn socket_payload_present(socket: &SocketIdentity) -> Result<(), Errno> {

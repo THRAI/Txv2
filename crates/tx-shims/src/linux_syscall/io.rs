@@ -288,6 +288,81 @@ async fn await_select_park(ctx: &SyscallCtx<'_>, park: SelectPark) {
     }
 }
 
+/// Park on EVERY not-ready fd's wait source at once, returning as soon as ANY
+/// of them fires (POSIX select/poll: any ready fd wakes the call), or `true`
+/// when the optional absolute deadline elapses first.
+///
+/// `select`/`poll` previously kept only the first not-ready fd's wait token and
+/// parked on it alone, so readiness on any later fd was missed: iperf3's server
+/// waits on its control socket together with the UDP data socket, and the
+/// arriving datagram never woke a select parked on the (quiet) control socket.
+async fn await_any_select_park<P: tx_hal::TimeIf>(
+    ctx: &SyscallCtx<'_>,
+    parks: alloc::vec::Vec<SelectPark>,
+    deadline_ns: Option<u64>,
+) -> bool {
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::task::Poll;
+
+    let mut futs: alloc::vec::Vec<Pin<alloc::boxed::Box<dyn Future<Output = ()> + Send + '_>>> =
+        alloc::vec::Vec::with_capacity(parks.len());
+    for park in parks {
+        match park {
+            SelectPark::Socket(token) => {
+                if let Some(fut) = tx_subsystems::wait_source::wait_on_token(token) {
+                    futs.push(alloc::boxed::Box::pin(async move {
+                        let _ = fut.await;
+                    }));
+                }
+            }
+            SelectPark::Reactor(source, interests) => {
+                futs.push(alloc::boxed::Box::pin(super::await_wait_source(
+                    ctx, source, interests,
+                )));
+            }
+        }
+    }
+
+    // No live wait sources (e.g. every socket reported ready-with-no-source then
+    // raced away): yield rather than spin, but still honour the deadline so a
+    // finite select/poll terminates.
+    if futs.is_empty() {
+        if let Some(dl) = deadline_ns {
+            if <P as tx_hal::TimeIf>::read_ns() >= dl {
+                return true;
+            }
+        }
+        tx_reactor::yield_now().await;
+        return false;
+    }
+
+    let mut timer = match deadline_ns {
+        Some(dl) => {
+            if <P as tx_hal::TimeIf>::read_ns() >= dl {
+                return true;
+            }
+            tx_subsystems::timer_sleep::sleep_until_ns(dl)
+        }
+        None => None,
+    };
+
+    core::future::poll_fn(|cx| {
+        for fut in futs.iter_mut() {
+            if fut.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(false);
+            }
+        }
+        if let Some(timer) = timer.as_mut() {
+            if Pin::new(timer).poll(cx).is_ready() {
+                return Poll::Ready(true);
+            }
+        }
+        Poll::Pending
+    })
+    .await
+}
+
 async fn wait_for_tty_readable(tty: Cap<tx_subsystems::tty::structure::TtyIdentity>) {
     use reactor_entry::{Mask, WaitProtocol};
     use tx_subsystems::tty::execution::TTY_READABLE;
@@ -760,7 +835,7 @@ pub(super) async fn sys_ppoll<'a, P: tx_hal::TimeIf>(
         // latest delivered data before we sample each fd.
         super::socket::drive_loopback_pending();
         let mut ready: i64 = 0;
-        let mut park_source = None;
+        let mut parks: alloc::vec::Vec<SelectPark> = alloc::vec::Vec::new();
         for i in 0..nfds {
             let ent_ptr = fds_ptr.wrapping_add(i * POLLFD_BYTES);
             let mut ent_bytes = [0u8; POLLFD_BYTES as usize];
@@ -776,16 +851,16 @@ pub(super) async fn sys_ppoll<'a, P: tx_hal::TimeIf>(
                         let (is_ready, source) = select_fd_ready(&file, SelectDir::Read);
                         if is_ready {
                             revents |= POLLIN;
-                        } else if park_source.is_none() {
-                            park_source = source;
+                        } else if let Some(source) = source {
+                            parks.push(source);
                         }
                     }
                     if events & POLLOUT != 0 {
                         let (is_ready, source) = select_fd_ready(&file, SelectDir::Write);
                         if is_ready {
                             revents |= POLLOUT;
-                        } else if park_source.is_none() {
-                            park_source = source;
+                        } else if let Some(source) = source {
+                            parks.push(source);
                         }
                     }
                 } else {
@@ -804,13 +879,12 @@ pub(super) async fn sys_ppoll<'a, P: tx_hal::TimeIf>(
         if ready > 0 {
             break ready;
         }
-        if !wait_allowed {
+        if !wait_allowed || parks.is_empty() {
             break 0;
         }
-        let Some(park) = park_source else {
-            break 0;
-        };
-        await_select_park(ctx, park).await;
+        // Wake on ANY of the not-ready fds (ppoll honours only the NULL/infinite
+        // timeout for parking; finite timeouts already returned via wait_allowed).
+        let _ = await_any_select_park::<P>(ctx, parks, None).await;
     };
 
     SyscallResult::Return(ready)
@@ -897,7 +971,7 @@ pub(super) async fn sys_pselect6<'a, P: tx_hal::TimeIf + tx_hal::ConsoleIf>(
         let mut out_write = writefds.clone();
         let mut out_except = exceptfds.clone();
         let mut ready = 0i64;
-        let mut park_source = None;
+        let mut parks: alloc::vec::Vec<SelectPark> = alloc::vec::Vec::new();
 
         for fd in 0..nfds {
             if readfds_ptr != 0 && fdset_get(&readfds, fd) {
@@ -909,8 +983,8 @@ pub(super) async fn sys_pselect6<'a, P: tx_hal::TimeIf + tx_hal::ConsoleIf>(
                     ready += 1;
                 } else {
                     fdset_clear(&mut out_read, fd);
-                    if park_source.is_none() {
-                        park_source = source;
+                    if let Some(source) = source {
+                        parks.push(source);
                     }
                 }
             }
@@ -923,8 +997,8 @@ pub(super) async fn sys_pselect6<'a, P: tx_hal::TimeIf + tx_hal::ConsoleIf>(
                     ready += 1;
                 } else {
                     fdset_clear(&mut out_write, fd);
-                    if park_source.is_none() {
-                        park_source = source;
+                    if let Some(source) = source {
+                        parks.push(source);
                     }
                 }
             }
@@ -934,7 +1008,7 @@ pub(super) async fn sys_pselect6<'a, P: tx_hal::TimeIf + tx_hal::ConsoleIf>(
             }
         }
 
-        if ready > 0 || !wait_allowed || park_source.is_none() {
+        if ready > 0 || !wait_allowed || parks.is_empty() {
             if readfds_ptr != 0 {
                 if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, readfds_ptr, &out_read) {
                     return SyscallResult::error_from(errno);
@@ -954,75 +1028,35 @@ pub(super) async fn sys_pselect6<'a, P: tx_hal::TimeIf + tx_hal::ConsoleIf>(
             return SyscallResult::Return(ready);
         }
 
-        let Some(park) = park_source else {
-            if let Some(ns) = timeout_ns {
-                if ns != 0 {
-                    sleep_for_select_timeout::<P>(ctx, ns).await;
+        // Park on ALL not-ready fds at once, waking on the first to fire and
+        // racing a finite deadline so the select returns 0 on timeout instead of
+        // parking forever.
+        let timed_out = await_any_select_park::<P>(ctx, parks, deadline_ns).await;
+        if timed_out {
+            if readfds_ptr != 0 {
+                if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, readfds_ptr, &out_read) {
+                    return SyscallResult::error_from(errno);
+                }
+            }
+            if writefds_ptr != 0 {
+                if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, writefds_ptr, &out_write) {
+                    return SyscallResult::error_from(errno);
+                }
+            }
+            if exceptfds_ptr != 0 {
+                if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, exceptfds_ptr, &out_except)
+                {
+                    return SyscallResult::error_from(errno);
                 }
             }
             return SyscallResult::Return(0);
-        };
-        // A socket wait with a finite deadline races the source against a timer
-        // so the select returns 0 on timeout instead of parking forever.
-        if let (SelectPark::Socket(token), Some(dl)) = (&park, deadline_ns) {
-            let token = *token;
-            let timed_out = match tx_subsystems::wait_source::wait_on_token(token) {
-                Some(mut fut) => {
-                    if <P as tx_hal::TimeIf>::read_ns() >= dl {
-                        true
-                    } else if let Some(mut timer) = tx_subsystems::timer_sleep::sleep_until_ns(dl) {
-                        core::future::poll_fn(|cx| {
-                            if core::future::Future::poll(core::pin::Pin::new(&mut fut), cx)
-                                .is_ready()
-                            {
-                                return core::task::Poll::Ready(false);
-                            }
-                            if core::future::Future::poll(core::pin::Pin::new(&mut timer), cx)
-                                .is_ready()
-                            {
-                                return core::task::Poll::Ready(true);
-                            }
-                            core::task::Poll::Pending
-                        })
-                        .await
-                    } else {
-                        let _ = fut.await;
-                        false
-                    }
-                }
-                None => {
-                    tx_reactor::yield_now().await;
-                    false
-                }
-            };
-            if timed_out {
-                if readfds_ptr != 0 {
-                    if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, readfds_ptr, &out_read) {
-                        return SyscallResult::error_from(errno);
-                    }
-                }
-                if writefds_ptr != 0 {
-                    if let Err(errno) =
-                        bootstrap_copy_to_user(&ctx.aspace, writefds_ptr, &out_write)
-                    {
-                        return SyscallResult::error_from(errno);
-                    }
-                }
-                if exceptfds_ptr != 0 {
-                    if let Err(errno) =
-                        bootstrap_copy_to_user(&ctx.aspace, exceptfds_ptr, &out_except)
-                    {
-                        return SyscallResult::error_from(errno);
-                    }
-                }
-                return SyscallResult::Return(0);
-            }
-            continue;
         }
-        await_select_park(ctx, park).await;
     }
 }
 
+// Retained for the select/poll timeout path; `await_any_select_park` now owns
+// the deadline race, but keep this helper available for finite-timeout idioms.
+#[allow(dead_code)]
 async fn sleep_for_select_timeout<'a, P: tx_hal::TimeIf>(ctx: &SyscallCtx<'a>, ns: u64) {
     use tx_scripts::drive;
     use tx_substrate::step::DriveMode;

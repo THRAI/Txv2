@@ -497,6 +497,11 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + tx_h
     // ripple into every test-stub platform.
     let l0_span = emit_syscall_enter(&req);
     let prev = tx_observe::set_current_parent_span(l0_span);
+    // Deliver an expired ITIMER_REAL on the generic syscall boundary (Linux
+    // delivers a fired alarm on the next return-to-userspace from any syscall).
+    // Without this, alarm-armed tight loops that never reach a socket wait
+    // (netperf UDP_STREAM/TCP_STREAM `send` bursts) never see SIGALRM and hang.
+    time::poll_itimer_real_on_syscall_boundary::<P>(ctx);
     let result = dispatch_inner::<P>(req, ctx).await;
     tx_observe::set_current_parent_span(prev);
     emit_syscall_exit(l0_span, &result);

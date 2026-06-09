@@ -699,3 +699,30 @@ pub(super) fn fire_itimer_real<P: TimeIf>(pid: u32) {
 }
 
 const SIGALRM_SIGNUM: u8 = 14;
+
+/// Generic syscall-boundary check for an expired ITIMER_REAL.
+///
+/// The socket recv path ([`super::socket`]) fires the timer at its own wait
+/// deadline, which covers alarm-bounded *blocking* recvs (e.g. busybox `ping`).
+/// But a process spinning in a tight non-blocking loop never reaches a socket
+/// wait: netperf's `UDP_STREAM`/`TCP_STREAM` send burst arms `alarm(N)` (→
+/// `setitimer(ITIMER_REAL)`) and then loops on `send`/`sendto` until its
+/// `SIGALRM` handler sets `times_up`. With delivery gated to the socket-wait
+/// path that handler never runs and the test sends forever (observed as a hang
+/// right after the test banner).
+///
+/// Linux delivers a fired ITIMER_REAL on the next return-to-userspace from ANY
+/// syscall. The dispatcher calls this on every syscall boundary to reproduce
+/// that: when the calling process's ITIMER_REAL deadline has passed, post
+/// SIGALRM (handler-gated, same contract as [`fire_itimer_real`]) so the AST
+/// checkpoint delivers the handler on this syscall's return. The common case —
+/// no armed ITIMER_REAL — is a single `BTreeMap` lookup that returns `None`.
+pub(super) fn poll_itimer_real_on_syscall_boundary<P: TimeIf>(ctx: &SyscallCtx<'_>) {
+    let pid = ctx.process.pid.0;
+    let Some(deadline_ns) = itimer_real_deadline_ns(pid) else {
+        return;
+    };
+    if P::read_ns() >= deadline_ns {
+        fire_itimer_real::<P>(pid);
+    }
+}
