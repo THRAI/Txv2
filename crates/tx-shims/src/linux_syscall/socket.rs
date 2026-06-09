@@ -1257,6 +1257,9 @@ struct SctpSndInfo {
     stream: u16,
     flags: u16,
     ppid: u32,
+    /// sinfo_timetolive (ms): a non-zero value marks a partially-reliable
+    /// (PR-SCTP timed) message that is abandoned if it cannot be delivered in time.
+    ttl: u32,
     assoc_id: u32,
 }
 
@@ -1279,11 +1282,12 @@ fn parse_sctp_sndrcvinfo(ctx: &SyscallCtx<'_>, header: &UserMsghdr) -> Option<Sc
         return None;
     }
     // sctp_sndrcvinfo: sinfo_stream @0, sinfo_flags @4, sinfo_ppid @8,
-    // sinfo_assoc_id @28.
+    // sinfo_timetolive @16, sinfo_assoc_id @28.
     Some(SctpSndInfo {
         stream: u16::from_le_bytes(buf[CMSG_HDR..CMSG_HDR + 2].try_into().ok()?),
         flags: u16::from_le_bytes(buf[CMSG_HDR + 4..CMSG_HDR + 6].try_into().ok()?),
         ppid: u32::from_le_bytes(buf[CMSG_HDR + 8..CMSG_HDR + 12].try_into().ok()?),
+        ttl: u32::from_le_bytes(buf[CMSG_HDR + 16..CMSG_HDR + 20].try_into().ok()?),
         assoc_id: u32::from_le_bytes(buf[CMSG_HDR + 28..CMSG_HDR + 32].try_into().ok()?),
     })
 }
@@ -1556,6 +1560,7 @@ async fn sendmsg_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
                         &bytes,
                         info.stream,
                         info.ppid,
+                        info.ttl,
                         flags,
                         &guard,
                     )

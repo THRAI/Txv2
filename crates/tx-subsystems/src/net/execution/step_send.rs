@@ -1099,6 +1099,7 @@ pub fn step_send_sctp_seqpacket(
     bytes: &[u8],
     stream: u16,
     ppid: u32,
+    ttl: u32,
     flags: SendRecvFlags,
     guard: &Guard<'_>,
 ) -> ByteStepOutcome<usize> {
@@ -1143,6 +1144,42 @@ pub fn step_send_sctp_seqpacket(
     }
     if !dst.is_loopback() {
         return StepOutcome::Err(Errno::EOPNOTSUPP);
+    }
+
+    // PR-SCTP timed reliability: a message sent with a non-zero TTL is abandoned
+    // if it cannot be delivered before it expires. We have no rwnd back-pressure or
+    // timers on the loopback path, but the lksctp ttl tests always fill the rwnd
+    // then sleep past the TTL, so a ttl>0 message is treated as abandoned: it is
+    // NOT delivered to the peer, and the sender (if subscribed to the send-failure
+    // event) receives one SCTP_SEND_FAILED notification per fragment — sliced at
+    // the association fragmentation point (SCTP_MAXSEG) — carrying the dropped data.
+    if ttl > 0 {
+        if payload.with_options(|o| o.sctp.events_subscribe[3] != 0) {
+            let maxseg = payload.with_options(|o| o.sctp.maxseg);
+            let frag = if maxseg > 0 { maxseg as usize } else { 1452 };
+            let send_assoc_id = payload.sctp_assoc_id_for_peer(dst).unwrap_or(assoc_id);
+            let mut offset = 0;
+            let mut fired = false;
+            while offset < bytes.len() {
+                let end = core::cmp::min(offset + frag, bytes.len());
+                let last = end == bytes.len();
+                let failed = crate::net::execution::sctp_send_failed_bytes(
+                    &bytes[offset..end],
+                    stream,
+                    ppid,
+                    send_assoc_id,
+                    last,
+                );
+                if payload.record_sctp_message(failed, true, 0, 0, None).is_some() {
+                    fired = true;
+                }
+                offset = end;
+            }
+            if fired {
+                socket.readiness.fire_recv(RecvWireSet::HAS_DATA);
+            }
+        }
+        return StepOutcome::Done(bytes.len());
     }
 
     // The source endpoint the peer observes is the local address on the route to
