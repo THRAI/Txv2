@@ -3761,6 +3761,35 @@ fn parse_arpreq_ethernet_addr(
     ]))
 }
 
+/// Contiguous IPv4 netmask → prefix length; `None` for a holey mask
+/// (Linux rejects those with `EINVAL`).
+fn ipv4_prefix_from_mask(mask: u32) -> Option<u8> {
+    let ones = mask.leading_ones();
+    if mask.checked_shl(ones).unwrap_or(0) == 0 {
+        Some(ones as u8)
+    } else {
+        None
+    }
+}
+
+fn ipv4_mask_from_prefix(prefix: u8) -> u32 {
+    if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - u32::from(prefix.min(32)))
+    }
+}
+
+/// Classful default prefix Linux assumes for `SIOCSIFADDR` until a
+/// `SIOCSIFNETMASK` follows (`inet_abc_len`): A=8, B=16, C=24.
+fn ipv4_classful_prefix(addr: [u8; 4]) -> u8 {
+    match addr[0] {
+        0..=127 => 8,
+        128..=191 => 16,
+        _ => 24,
+    }
+}
+
 pub(super) fn sys_socket_ioctl<'a>(request: u32, argp: u64, ctx: &SyscallCtx<'a>) -> SyscallResult {
     const IFREQ_NAME_BYTES: usize = 16;
     const IFREQ_BYTES: usize = 40;
@@ -3993,6 +4022,97 @@ pub(super) fn sys_socket_ioctl<'a>(request: u32, argp: u64, ctx: &SyscallCtx<'a>
             match bootstrap_write_user(&ctx.aspace, argp + IFREQ_DATA_OFFSET, ifindex) {
                 Ok(()) => SyscallResult::Return(0),
                 Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+            }
+        }
+        // busybox `ifconfig IFACE ADDR netmask MASK broadcast BRD` drives
+        // this trio in sequence; LTP net_stress.interface scripts depend
+        // on it (`if4-addr-change` was TBROK `SIOCSIFADDR: Not a tty`).
+        SIOCGIFADDR | SIOCGIFNETMASK | SIOCGIFBRDADDR => {
+            let Some(link) = link else {
+                return SyscallResult::Error(ENODEV_VALUE);
+            };
+            let Some(addr) = link.ipv4_addr else {
+                return SyscallResult::Error(errno_to_i32(Errno::EADDRNOTAVAIL));
+            };
+            let prefix = link
+                .ipv4_prefix_len
+                .unwrap_or_else(|| ipv4_classful_prefix(addr.octets()));
+            let mask = ipv4_mask_from_prefix(prefix);
+            let value: [u8; 4] = match request {
+                SIOCGIFADDR => addr.octets(),
+                SIOCGIFNETMASK => mask.to_be_bytes(),
+                SIOCGIFBRDADDR => {
+                    (u32::from_be_bytes(addr.octets()) | !mask).to_be_bytes()
+                }
+                _ => unreachable!(),
+            };
+            // sockaddr_in image in ifr_addr: family, zero port, addr.
+            let mut sin = [0u8; 8];
+            sin[0..2].copy_from_slice(&AF_INET_U16.to_le_bytes());
+            sin[4..8].copy_from_slice(&value);
+            match bootstrap_write_user(&ctx.aspace, argp + IFREQ_DATA_OFFSET, sin) {
+                Ok(()) => SyscallResult::Return(0),
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+            }
+        }
+        SIOCSIFADDR | SIOCSIFNETMASK | SIOCSIFBRDADDR => {
+            let Some(link) = link else {
+                return SyscallResult::Error(ENODEV_VALUE);
+            };
+            let auth = match require_net_admin() {
+                Ok(auth) => auth,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            let sin: [u8; 8] = match bootstrap_read_user(&ctx.aspace, argp + IFREQ_DATA_OFFSET) {
+                Ok(sin) => sin,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            let family = u16::from_le_bytes(sin[0..2].try_into().unwrap());
+            if family != AF_INET_U16 {
+                return SyscallResult::Error(errno_to_i32(Errno::EAFNOSUPPORT));
+            }
+            let value: [u8; 4] = sin[4..8].try_into().unwrap();
+            match request {
+                SIOCSIFADDR => {
+                    // Linux assumes a classful prefix until SIOCSIFNETMASK
+                    // follows; keep an already-configured prefix instead so
+                    // an addr-only change inside the same subnet holds.
+                    let prefix = link
+                        .ipv4_prefix_len
+                        .unwrap_or_else(|| ipv4_classful_prefix(value));
+                    match netns.set_device_ipv4_addr_by_ifindex(
+                        auth,
+                        link.ifindex,
+                        Some(Ipv4Address::new(value)),
+                        Some(prefix),
+                    ) {
+                        Ok(()) => SyscallResult::Return(0),
+                        Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+                    }
+                }
+                SIOCSIFNETMASK => {
+                    let Some(addr) = link.ipv4_addr else {
+                        return SyscallResult::Error(errno_to_i32(Errno::EADDRNOTAVAIL));
+                    };
+                    let Some(prefix) = ipv4_prefix_from_mask(u32::from_be_bytes(value)) else {
+                        return SyscallResult::Error(EINVAL_VALUE);
+                    };
+                    match netns.set_device_ipv4_addr_by_ifindex(
+                        auth,
+                        link.ifindex,
+                        Some(addr),
+                        Some(prefix),
+                    ) {
+                        Ok(()) => SyscallResult::Return(0),
+                        Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+                    }
+                }
+                SIOCSIFBRDADDR => {
+                    // Broadcast is derived from addr/prefix in our model;
+                    // accept and ack like Linux does for a matching value.
+                    SyscallResult::Return(0)
+                }
+                _ => unreachable!(),
             }
         }
         SIOCGIFTXQLEN => {

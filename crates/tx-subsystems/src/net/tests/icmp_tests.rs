@@ -264,6 +264,132 @@ fn raw_icmpv4_send_to_configured_peer_route_returns_echo_reply() {
     );
 }
 
+/// LTP `net_stress.interface/if4-addr-change` shape: the local address
+/// churns N times (busybox `ifconfig` → SIOCSIFADDR), then the final
+/// connectivity ping must still round-trip from the *new* address.
+#[test]
+fn raw_icmpv4_echo_still_replies_after_local_addr_change_churn() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
+    let guard = tx_substrate::epoch::guard();
+    let local_ip = Ipv4Address::new([10, 0, 0, 2]);
+    let remote_ip = Ipv4Address::new([10, 0, 0, 1]);
+    let local_ns = crate::net::create_isolated_net_namespace_for_test("icmpv4-churn-local")
+        .expect("local namespace")
+        .payload_cap()
+        .expect("local payload");
+    let remote_ns = crate::net::create_isolated_net_namespace_for_test("icmpv4-churn-remote")
+        .expect("remote namespace")
+        .payload_cap()
+        .expect("remote payload");
+    let pair = create_veth_pair_for_test_or_bootstrap(VethPairConfig {
+        left: VethEndpointConfig {
+            name: "icmpv4-churn-local0",
+            devt: DevT::new(91, 186),
+            mac: EthernetAddress::new([0x02, 0, 0, 0, 4, 3]),
+        },
+        right: VethEndpointConfig {
+            name: "icmpv4-churn-remote0",
+            devt: DevT::new(91, 187),
+            mac: EthernetAddress::new([0x02, 0, 0, 0, 4, 4]),
+        },
+        mtu: VETH_DEFAULT_MTU,
+    });
+    local_ns
+        .attach_device_for_test_or_bootstrap(pair.left, None)
+        .expect("attach local veth");
+    remote_ns
+        .attach_device_for_test_or_bootstrap(pair.right, None)
+        .expect("attach remote veth");
+    let auth = NetAdminAuthority::for_test_or_bootstrap();
+    local_ns
+        .set_device_ipv4_addr_by_ifindex(auth, 2, Some(local_ip), Some(24))
+        .expect("set local ipv4");
+    remote_ns
+        .set_device_ipv4_addr_by_ifindex(auth, 2, Some(remote_ip), Some(24))
+        .expect("set remote ipv4");
+
+    let raw = match crate::net::step_socket_create_in_namespace(
+        ValidSocketType::validate(2, 3, 1).expect("AF_INET SOCK_RAW ICMP"),
+        local_ns.clone(),
+        &guard,
+    ) {
+        StepOutcome::Done(socket) => socket,
+        other => panic!("raw icmp socket create failed: {other:?}"),
+    };
+
+    // Baseline: echo round-trips with the initial address.
+    let request = Icmpv4EchoPacket {
+        src: local_ip,
+        dst: remote_ip,
+        ident: 0x6161,
+        seq_no: 1,
+        payload: b"pre-churn".to_vec(),
+    };
+    let request_bytes = build_icmpv4_echo_request_message(&request);
+    assert_eq!(
+        step_send_to_kernel_bytes(
+            &raw,
+            Some(IpEndpoint::new(remote_ip, 0)),
+            &request_bytes,
+            SendRecvFlags::empty(),
+            &guard,
+        ),
+        StepOutcome::Done(request_bytes.len())
+    );
+    let mut out = [0u8; 128];
+    let recv = match step_recv_kernel_bytes(&raw, &mut out, SendRecvFlags::empty(), &guard) {
+        StepOutcome::Done(recv) => recv,
+        other => panic!("expected pre-churn echo reply, got {other:?}"),
+    };
+    assert_eq!(
+        parse_icmpv4_from_ipv4_bytes(&out[..recv.bytes]),
+        Icmpv4Event::EchoReply(request.reply_packet())
+    );
+
+    // Churn the local address like if4-addr-change's 10 ifconfig loops
+    // (10.0.0.2 → 10.0.0.3 → … → 10.0.0.11).
+    let mut churned = local_ip;
+    for host in 2..=11u8 {
+        churned = Ipv4Address::new([10, 0, 0, host]);
+        local_ns
+            .set_device_ipv4_addr_by_ifindex(auth, 2, Some(churned), Some(24))
+            .expect("churn local ipv4");
+    }
+
+    // Final connectivity check from the new address.
+    let request = Icmpv4EchoPacket {
+        src: churned,
+        dst: remote_ip,
+        ident: 0x6161,
+        seq_no: 2,
+        payload: b"post-churn".to_vec(),
+    };
+    let request_bytes = build_icmpv4_echo_request_message(&request);
+    assert_eq!(
+        step_send_to_kernel_bytes(
+            &raw,
+            Some(IpEndpoint::new(remote_ip, 0)),
+            &request_bytes,
+            SendRecvFlags::empty(),
+            &guard,
+        ),
+        StepOutcome::Done(request_bytes.len())
+    );
+    let mut out = [0u8; 128];
+    let recv = match step_recv_kernel_bytes(&raw, &mut out, SendRecvFlags::empty(), &guard) {
+        StepOutcome::Done(recv) => recv,
+        other => panic!("expected post-churn echo reply, got {other:?}"),
+    };
+    assert_eq!(
+        parse_icmpv4_from_ipv4_bytes(&out[..recv.bytes]),
+        Icmpv4Event::EchoReply(request.reply_packet())
+    );
+}
+
 #[test]
 fn raw_icmpv6_send_to_configured_peer_addr_returns_echo_reply() {
     init_zones();

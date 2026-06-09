@@ -1636,8 +1636,8 @@ case \"$lh $rh\" in\n\
         echo \"IPV4_RBROADCAST='$ra.$rb.$rc.255'\"\n\
         echo \"IPV4_LNETMASK='255.255.255.0'\"\n\
         echo \"IPV4_RNETMASK='255.255.255.0'\"\n\
-        echo \"IPV4_LNETWORK='$la.$lb.$lc.0'\"\n\
-        echo \"IPV4_RNETWORK='$ra.$rb.$rc.0'\"\n\
+        echo \"IPV4_LNETWORK='$la.$lb.$lc'\"\n\
+        echo \"IPV4_RNETWORK='$ra.$rb.$rc'\"\n\
         echo \"LHOST_IPV4_HOST='$ld'\"\n\
         echo \"RHOST_IPV4_HOST='$rd'\"\n\
         echo \"IPV4_NET16_UNUSED='10.23'\"\n\
