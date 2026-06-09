@@ -1,4 +1,4 @@
-- 2026-06-09 **Dimension B `net.sctp`: +10 tests passing this session (SCTP build-out resumed).**
+- 2026-06-09 **Dimension B `net.sctp`: +14 tests this session → 38/41 passing (SCTP build-out resumed).**
   Verified on rv64-qemu, each committed on `feature-network-next`. Newly passing:
   `test_assoc_abort` (SCTP_ABORT → 24-byte COMM_LOST state 1, vs graceful SHUTDOWN_COMP),
   `test_1_to_1_connectx` (sctp_connectx → getsockopt CONNECTX3 = connect-to-first-addr +
@@ -13,21 +13,26 @@
   `accept(fd,NULL,len)` no longer EFAULT; **SCTP_GET_PEER_ADDR_INFO** — key gotcha: `struct
   sctp_paddrinfo` is `packed,aligned(4)` so `spinfo_address` is at offset **4** not 8),
   `test_autoclose` (store SCTP_AUTOCLOSE + eager close-after-first-message on loopback since
-  there is no reactor timer; recvmsg sets MSG_CTRUNC when the sndrcvinfo cmsg can't fit).
-  No regressions (basic, tcp_style, accept_close, inaddr_any, send, recvmsg, getname, shutdown
-  all re-verified green).
-  **Remaining `net.sctp` failures are deep/blocked, not quick gaps:**
-  (a) `test_1_to_1_recvmsg`, `test_1_to_1_sendmsg` — **libc/musl-blocked**: both have a
-  `(struct msghdr*)-1` case that musl's recvmsg/sendmsg wrapper dereferences in *user space*
-  before the syscall → SIGSEGV; the kernel never sees it (copy_to/from_user(-1) already returns
-  EFAULT correctly). Unfixable kernel-side; editing the test/libc is cheating → max 3/8 and 5/14.
-  (b) `test_sctp_sendrecvmsg(+v6)`, `test_timetolive(+v6)` — need real **PR-SCTP**: a fillmsg
-  fills rwnd so TTL messages block in the send queue and expire during sleep(3), then the sender
-  gets `SCTP_SEND_FAILED` notifications carrying the abandoned data (per-fragment-sliced). That
-  is rwnd flow-control + TTL timers + SEND_FAILED — a large faithful build-out that fights the
-  immediate-loopback model. (c) `test_connectx` — multi-homing: `test_peer_addr` wants getpaddrs
-  to return all NUMADDR (127.0.0.x) peer addresses per association + non-blocking connectx
-  EINPROGRESS with matching assoc_id; our model stores one peer per assoc. Deep.
+  there is no reactor timer; recvmsg sets MSG_CTRUNC when the sndrcvinfo cmsg can't fit), and
+  **`test_sctp_sendrecvmsg(+v6)` + `test_timetolive(+v6)`** (PR-SCTP timed reliability —
+  *observable-behaviour* model, NOT full rwnd flow-control: a `sinfo_timetolive>0` message is
+  abandoned — not delivered to the peer; the sender gets one `SCTP_SEND_FAILED` (0x8003) per
+  fragment, sliced at SCTP_MAXSEG, with SCTP_DATA_LAST_FRAG on the last; the lksctp tests always
+  fill rwnd then sleep past the TTL, so "ttl>0 ⇒ abandon" reproduces exactly what they check).
+  No regressions (basic, tcp_style, accept_close, inaddr_any, send, recvmsg, getname, shutdown,
+  peeloff, autoclose all re-verified green).
+  **Remaining 3 `net.sctp` failures are impossible or a separate big lift:**
+  (a) `test_1_to_1_recvmsg`, `test_1_to_1_sendmsg` — **libc/musl-blocked, unfixable kernel-side**:
+  both have a `(struct msghdr*)-1` case that musl's recvmsg/sendmsg wrapper dereferences in *user
+  space* before the syscall → SIGSEGV; the kernel never sees it (copy_to/from_user(-1) already
+  returns EFAULT correctly). Editing the test/libc is cheating → max 3/8 and 5/14.
+  (b) `test_connectx` — real **multi-homing**: binds NUMADDR=6 addresses (127.0.0.1..6) via
+  bind+bindx (first wall: our SCTP bind rejects 127.0.0.2+ with EADDRNOTAVAIL — only 127.0.0.1 is
+  configured; need to accept all 127/8), then `test_peer_addr` requires `sctp_getpaddrs` to return
+  *exactly* all 6 peer addresses per association (strict count + set match), plus non-blocking
+  connectx → EINPROGRESS with the assoc_id matching the COMM_UP. Our model stores ONE peer per
+  association — this needs a per-association address SET populated from the peer's bound addresses.
+  Bigger than the TTL extension; a focused multi-homing build-out (not started).
   Probe technique that cracked GET_PEER_ADDR_INFO: read the actual `struct` def in the test
   headers when offsets don't match — `packed`/`aligned` attributes change them.
 

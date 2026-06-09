@@ -10,21 +10,22 @@ Date: 2026-06-04
 
 ## 当前状态
 
-**2026-06-09 续做:+10 个条目通过**(`feature-network-next`,逐个 rv64-qemu 验证 + 提交):
+**2026-06-09 续做:+14 个条目通过 → 38/41**(`feature-network-next`,逐个 rv64-qemu 验证 + 提交):
 `test_assoc_abort`、`test_1_to_1_connectx`、`test_peeloff`(+v6)、`test_connect`、
-`test_fragments`(+v6)、`test_sockopt`(+v6,44/44)、`test_autoclose`。要点见
-`docs/progress/STATUS.md` 2026-06-09 条。**剩余 7 个未过,均为深层/受限(非快速缺口)**:
-- `test_1_to_1_recvmsg`/`test_1_to_1_sendmsg`:**musl libc 阻塞** —— `(struct msghdr*)-1`
+`test_fragments`(+v6)、`test_sockopt`(+v6,44/44)、`test_autoclose`、
+`test_sctp_sendrecvmsg`(+v6)、`test_timetolive`(+v6)。要点见 `docs/progress/STATUS.md` 2026-06-09 条。
+**PR-SCTP TTL 已做(取"可观察行为"模型,非完整 rwnd 流控):** `sinfo_timetolive>0` 的消息直接丢弃
+——不投给对端;发送端按分片(SCTP_MAXSEG 切片、末片置 SCTP_DATA_LAST_FRAG)收到 `SCTP_SEND_FAILED`
+(0x8003)携带被丢数据。lksctp 的 ttl 测试都是先 fillmsg 填满 rwnd 再 sleep 过 TTL,所以
+"ttl>0 ⇒ 丢弃"正好复现它们检查的行为(无需 rwnd/定时器)。
+**剩余 3 个未过 —— 2 个物理无解 + 1 个大活:**
+- `test_1_to_1_recvmsg`/`test_1_to_1_sendmsg`:**musl libc 阻塞,内核侧无解** —— `(struct msghdr*)-1`
   在 musl 的 recvmsg/sendmsg wrapper 里**用户态**解引用即段错误,内核根本看不到这次调用
-  (内核的 copy_to/from_user(-1) 本身已正确返 EFAULT)。内核侧无解,改测试/libc 属作弊。
-  最多 3/8、5/14。
-- `test_sctp_sendrecvmsg`(+v6)、`test_timetolive`(+v6):需真正的 **PR-SCTP** —— fillmsg
-  填满 rwnd 使带 TTL 的消息卡在发送队列、在 sleep(3) 期间过期,然后发送端收到
-  `SCTP_SEND_FAILED` 通知(携带被丢弃消息、按分片切片)。= rwnd 流控 + TTL 定时器 +
-  SEND_FAILED,体量大且与"loopback 即时投递"模型冲突。
-- `test_connectx`:**多宿主** —— test_peer_addr 要 getpaddrs 返回每个关联的全部 NUMADDR
-  (127.0.0.x)对端地址 + 非阻塞 connectx EINPROGRESS 且 assoc_id 对齐;当前模型每关联只存
-  一个 peer。(bindx + CONNECTX3 已做,多宿主模型未做。)
+  (内核的 copy_to/from_user(-1) 本身已正确返 EFAULT)。改测试/libc 属作弊。最多 3/8、5/14。
+- `test_connectx`:真**多宿主**(NUMADDR=6)—— 第一道墙:SCTP bind 拒绝 127.0.0.2+(EADDRNOTAVAIL,
+  只配了 127.0.0.1 → 要接受整个 127/8);再 test_peer_addr 要 `sctp_getpaddrs` 严格返回每个关联的
+  **全部 6 个**对端地址 + 非阻塞 connectx EINPROGRESS 且 assoc_id 对齐。要给每个关联存一个从对端 bound
+  地址来的地址**集合**。比 TTL 那次大,**未动手**。(bindx + CONNECTX3 单地址已做,多宿主模型未做。)
 > 排错经验:sockopt 结构偏移对不上时,去读测试头文件里的真实 `struct` 定义 ——
 > `packed`/`aligned` 属性会改偏移(本次 `struct sctp_paddrinfo` 是 packed,aligned(4),
 > `spinfo_address` 在偏移 **4** 而非 8,卡了好几轮)。
