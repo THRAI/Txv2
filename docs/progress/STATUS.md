@@ -1,3 +1,39 @@
+- 2026-06-10 **netperf + iperf now pass all FOUR judged combos — rv64/la64 × musl/glibc — 22/22 subtests per arch (44 bench points, was 11 on rv-musl only).**
+  Commit `87ae1d21` on `feature-network-next`. The glibc lane had been dropped wholesale by the
+  main rebase (no `*-glibc` group selectors, no `LD_LIBRARY_PATH`), and behind it sat four kernel
+  gaps that glibc binaries trip but musl never did:
+  1. **`*-glibc` oscomp boot selectors re-homed** (`exec.rs`): `cd /musl/glibc; busybox sh
+     <script>` per group, `netperf-glibc` + `iperf-glibc` added to the **default judged boot
+     list** (the official run boots with no groups cmdline — without this the glibc suites score 0
+     no matter what the kernel can do), `LD_LIBRARY_PATH=/musl/glibc/lib:/lib` restored.
+  2. **PT_INTERP fallback for glibc loaders** (`script.rs`, the live execve path): glibc
+     `netserver`/`netperf` are **dynamic PIE** requesting `/lib/ld-linux-riscv64-lp64d.so.1`
+     (rv) / `/lib64/ld-linux-loongarch-lp64d.so.1` (la); map `ld-linux` interps to
+     `/musl/glibc/lib/<basename>`. (glibc iperf3 is static — that's why it execed all along.)
+     Failure signature was `./netserver: I/O error` (exec_script maps interp-open errors to EIO).
+  3. **glibc `fork()` clone flags** (`proc.rs` oneshot fork shape): accept `CLONE_CHILD_SETTID |
+     CLONE_CHILD_CLEARTID | CLONE_PARENT_SETTID` (musl passes bare SIGCHLD; glibc's arch_fork got
+     EINVAL → `spawn_child: fork() error`). Child tid stamped into the child's COW TCB,
+     exit-time clear armed.
+  4. **`st_rdev` for devfs char nodes** (`fs_basic.rs` fstat/statx + `devfs::devt_for_object_id`):
+     glibc `daemon()` fstats `/dev/null` and demands `S_ISCHR` + `rdev == makedev(1,3)`, else it
+     sets **ENODEV** itself → iperf3 `-s -D` died. (Its earlier "pass" in a 4-group boot was the
+     musl group's daemonized server still serving port 5001 — a false positive.)
+  5. **`step_exit_group` releases socket port bindings** (`execution.rs`): the socket-close
+     teardown existed only in `step_process_exit`; `kill -9` (route_gewalt →
+     `step_exit_group_with_signal`) left the musl netserver's port 12865 reserved →
+     glibc netserver `EADDRINUSE` + dead-listener control timeouts in the one-boot judged run.
+     This is the same EADDRINUSE class noted for back-to-back net.sctp runs.
+  **Verified:** single-boot `netperf-musl,iperf-musl,netperf-glibc,iperf-glibc` runs:
+  rv64 22/22 success (judge: netperf-musl 5/5, netperf-glibc 5/5, iperf-musl 6/6, iperf-glibc
+  6/6) and la64 22/22 success (same judge scores) — la64 needed **zero arch-specific changes**
+  (la boot uses `-fw_cfg opt/tx.cmdline` with `,,`-escaped commas; sdcard-la.img downloaded to
+  `target/oscomp/testdata/`). musl groups regression-clean in the same boots; exec.rs host unit
+  tests 12/12 (incl. new glibc-lane mapping tests).
+  **Next:** the wider glibc suites (basic/busybox/libctest/lua/lmbench/iozone/ltp `-glibc`) now
+  have working selectors but are NOT in the default boot list — each needs its own validation
+  pass before joining the judged run. **Blocker:** none for the bench groups.
+
 - 2026-06-09 (follow-up) **`iperf` 3/6 → 6/6: the TCP "throughput wall" was a rebase regression, not a TCG limit.**
   A timestamped socket-syscall trace showed iperf3's `write(128 KiB)` returning only **4096** — the
   socket `read`/`write` path was capped at `TTY_WRITE_MAX_INLINE` (4 KiB) instead of the intended
