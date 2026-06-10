@@ -11,6 +11,12 @@
   `msp/ltp-full-official-scoring-table-2026-06-10-zh.md`; harness additions (pidns+cgroup cage):
   `tools/ltp-host-ceiling/run-one-full.sh`, `judge-full.py`. Safety note: full-image sweeps MUST
   use the pidns cage — kill06-class tests issue kill(-1) which would nuke the host session.
+  Correction (user-prompted): tst_fd matrix tests are LOWER BOUNDS in the table — splice07's case
+  count is (creatable fd types)²; sandbox blocked 4 types (fanotify/userfaultfd/perf_event/bpf,
+  EPERM) → 22²→431, real-root Linux ≈600-667 (a competing team scores 600). Actionable: stubbing
+  exotic fd-creating syscalls (bpf, perf_event_open, fanotify_init, userfaultfd, fsopen,
+  memfd_secret...) to return anon fds multiplies splice07 quadratically; readahead01/accept03
+  scale linearly the same way.
 
 - 2026-06-10 (net scoring ledger) **Empirically measured the official-scoring ceiling for ALL 223 net
   files in the judged image's bin/ — on real Linux, the official way (no-args + Summary-passed).**
