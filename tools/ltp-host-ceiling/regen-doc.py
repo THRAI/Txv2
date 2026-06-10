@@ -95,6 +95,7 @@ v2 修订：(1) 每个不算分文件都给出原因；(2) 修复三类沙箱伪
 | **glibc judge 总分** | **{tg}** |
 | 沙箱测不准类（真 root 上限>0，表内逐行已标） | 需 loop 块设备 ~146；userns 单 uid 映射(setuid 类) ~91；需写全局 /proc//sys/cgroup ~100；其余 EPERM 特权类若干 |
 | legacy 框架（官方两 judge 均 0，不可救） | ~257 |
+| 算分文件中 Summary 带 skipped>0（该行分数为下限） | 24（大头已标注：splice07 skip88、select03 skip16、accept03/readahead01 skip4…） |
 
 ⚠️ tst_fd 矩阵测试（splice07/readahead01/accept03）为沙箱下限：
 splice07 真 root ≈600-667（fd 可创建类型数平方；stub 化 bpf/perf_event_open/
