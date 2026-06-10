@@ -1342,73 +1342,8 @@ fn append_batch_submit_ltp_runner_for_libc(
     let _ = write!(cmd, "; echo \"#### OS COMP TEST GROUP END {group} ####\"");
 }
 
-#[allow(dead_code)]
-#[cfg(target_arch = "loongarch64")]
-fn append_ltp_submit_network_case_loop_if_enabled(
-    _cmd: &mut alloc::string::String,
-    _libc: &str,
-    _args: &LtpArgs<'_>,
-) {
-    // LA submit must stay on the historical non-network whitelist while the
-    // socket/network stack work is in flux.
-}
-
-#[allow(dead_code)]
-#[cfg(not(target_arch = "loongarch64"))]
-fn append_ltp_submit_network_case_loop_if_enabled(
-    cmd: &mut alloc::string::String,
-    libc: &str,
-    args: &LtpArgs<'_>,
-) {
-    append_ltp_submit_network_case_loop(cmd, libc, args);
-}
-
 fn append_ltp_submit_case_loop(cmd: &mut alloc::string::String, libc: &str, args: &LtpArgs<'_>) {
-    append_ltp_case_loop_until_excluding_extra(
-        cmd,
-        libc,
-        LTP_SUBMIT_CASES,
-        Some(LTP_SUBMIT_ONE_POINT_FIRST_CASE),
-        ltp_submit_excluded_cases(),
-        ltp_submit_libc_excluded_cases(libc),
-        args,
-    );
-    append_ltp_case_loop_until_excluding_extra(
-        cmd,
-        libc,
-        LTP_SUBMIT_PROMOTED_TAIL_CASES,
-        None,
-        ltp_submit_excluded_cases(),
-        ltp_submit_libc_excluded_cases(libc),
-        args,
-    );
-    append_ltp_case_loop_until_excluding_extra(
-        cmd,
-        libc,
-        LTP_SUBMIT_CHRONIX_POSITIVE_CASES,
-        None,
-        ltp_submit_excluded_cases(),
-        ltp_submit_libc_excluded_cases(libc),
-        args,
-    );
-}
-
-#[allow(dead_code)]
-#[cfg(not(target_arch = "loongarch64"))]
-fn append_ltp_submit_network_case_loop(
-    cmd: &mut alloc::string::String,
-    libc: &str,
-    args: &LtpArgs<'_>,
-) {
-    append_ltp_case_loop_until_excluding_extra(
-        cmd,
-        libc,
-        LTP_BATCH_SUBMIT_NETWORK_CASES,
-        None,
-        ltp_batch_submit_network_excluded_cases(),
-        ltp_batch_submit_glibc_network_excluded_cases(libc),
-        args,
-    );
+    append_ltp_case_loop(cmd, libc, ltp_submit_cases_for_arch(), args);
 }
 
 fn append_ltp_case_loop(
@@ -1598,52 +1533,6 @@ done",
     );
 }
 
-#[cfg(target_arch = "loongarch64")]
-fn ltp_submit_excluded_cases() -> &'static str {
-    LTP_LA_SUBMIT_EXCLUDED_CASES
-}
-
-#[cfg(not(target_arch = "loongarch64"))]
-fn ltp_submit_excluded_cases() -> &'static str {
-    LTP_SUBMIT_UNSCORED_LEGACY_CASES
-}
-
-fn ltp_submit_libc_excluded_cases(libc: &str) -> &'static str {
-    if libc == "glibc" {
-        ltp_submit_arch_glibc_excluded_cases()
-    } else {
-        LTP_BATCH_SUBMIT_LIBC_EXCLUDED_CASES
-    }
-}
-
-#[cfg(target_arch = "loongarch64")]
-fn ltp_submit_arch_glibc_excluded_cases() -> &'static str {
-    LTP_BATCH_LA_SUBMIT_GLIBC_EXCLUDED_CASES
-}
-
-#[cfg(not(target_arch = "loongarch64"))]
-fn ltp_submit_arch_glibc_excluded_cases() -> &'static str {
-    LTP_BATCH_SUBMIT_LIBC_EXCLUDED_CASES
-}
-
-#[cfg(not(target_arch = "loongarch64"))]
-fn ltp_batch_submit_network_excluded_cases() -> &'static str {
-    ""
-}
-
-#[cfg(not(target_arch = "loongarch64"))]
-fn ltp_batch_submit_glibc_network_excluded_cases(libc: &str) -> &'static str {
-    if libc == "glibc" {
-        ltp_batch_submit_arch_glibc_network_excluded_cases()
-    } else {
-        ""
-    }
-}
-
-#[cfg(not(target_arch = "loongarch64"))]
-fn ltp_batch_submit_arch_glibc_network_excluded_cases() -> &'static str {
-    LTP_BATCH_SUBMIT_GLIBC_NETWORK_EXCLUDED_CASES
-}
 
 fn ltp_case_list_contains(list: &str, needle: &str) -> bool {
     list.split('+').any(|case| case.trim() == needle)
@@ -2000,196 +1889,157 @@ setsockopt04+setsockopt05+setsockopt06+setsockopt07+setsockopt08+setsockopt09+\
 setsockopt10+socket01+socket02+socketcall01+socketcall02+socketcall03+socketpair01+\
 socketpair02";
 
-// Positive-score LTP submit whitelist generated from docs/LTP/syscalls/* progress
-// files. The p0 summary document is intentionally not used as a source because
-// it overlaps the module batches; duplicated cases are kept only once. Submit
-// order is descending by recorded passed score; ties keep source order.
-const LTP_SUBMIT_ONE_POINT_FIRST_CASE: &str = "io_uring01";
-
-// Official-scored one/low-point cases from the historical tail after
-// `io_uring01`. The active submit runner stops before that tail to avoid broad
-// untriaged sweeps, then appends this focused set that was rerun successfully on
-// LA64 musl/glibc on 2026-06-03. `write01` is intentionally omitted: it passes
-// musl, but LA64 glibc returned EINVAL in the focused run.
-const LTP_SUBMIT_PROMOTED_TAIL_CASES: &str = "\
-capset04+getegid02+getegid02_16+geteuid01+getgid01+getgid03+getuid01+setgid01+setuid01+\
-setreuid06+setreuid07+setuid03+setuid04+\
-epoll_ctl04+epoll_ctl05+futex_cmp_requeue02+futex_wait02+futex_wait04+pselect03+pselect03_64+\
-close02+dup03+dup05+dup06+dup205+dup206+fcntl03+fcntl03_64+fcntl04+fcntl04_64+\
-fcntl08+fcntl08_64+fcntl12+fcntl12_64+fsync02+pipe01+pipe06+pipe08+pipe10+pipe14+\
-pread01+pread01_64+pwrite01+pwrite01_64+pwrite03+pwrite03_64+pwrite04+pwrite04_64+\
-read01+read04+write03+getdomainname01+uname02+uname04+gettimeofday02+timer_delete02+\
-timer_settime03+times01+chmod07+chown01+creat03+creat05+fchdir01+fchdir02+fchmod02+\
-fchmod03+fchmod04+fchmod05+flock03+getcwd03+mkdir05+open03+open04+readdir01+rmdir01+\
-symlink02+umask01+madvise05+mlock03+mlock04+mlock203+mmap02+mmap08+mmap15+mmap17+\
-mmap19+mmap20+mprotect05+munlock02+sbrk02+getpriority01+getpriority02+nice01+nice02+\
-nice03+nice04+prctl01+prctl09+sched_get_priority_max01+sched_get_priority_max02+\
-sched_get_priority_min01+sched_get_priority_min02+sched_rr_get_interval01+setpriority02+\
-wait402+wait02+wait01+shmat04+sendfile08_64+sendfile08+sendfile06_64+sendfile06+\
-sendfile05_64+sendfile05+semop04+semctl02+pidfd_open01+personality02+msgrcv08+\
-msgget01+mknod09+kill06+getsid02+getsid01+getppid02+getppid01+fork08+fork07+\
-fork03+exit02+setrlimit04+setrlimit05+clone07+clone06+clone05+clone03+\
-access03+brk01+brk02+capget02+chdir04+chmod05+chown03+clone04+clone302+close_range02+\
-creat04+epoll_create02+epoll_pwait02+epoll_pwait03+epoll_pwait05+epoll_wait04+execl01+execle01+execlp01+execv01+\
-execve01+execve02+execve05+execve06+execvp01+exit_group01+fchown01+fchown02+fchown03+fchown05+\
-fcntl36+fcntl36_64+fork04+getcpu01+getcwd02+geteuid02+gethostname01+getpagesize01+getrandom04+getuid03+\
-inotify_init1_01+inotify_init1_02+ioprio_get01+ioprio_set03+io_uring01+kill03+kill05+link02+llseek01+madvise02+\
-memfd_create02+memset01+mincore02+mincore03+mkdir04+msgctl02+msgsnd01+open02+open07+pathconf02+\
-pause01+pidfd_getfd01+pidfd_open04+pipe02+pipe07+pipe13+pipe2_02+pipe2_04+prctl02+prctl03+\
-prctl05+prctl08+readlink01+rename09+rmdir03+rt_sigsuspend01+sbrk01+sched_getparam01+sched_getparam03+sched_getscheduler01+\
-sched_getscheduler02+sched_rr_get_interval02+sched_rr_get_interval03+sched_setparam01+sched_setparam02+sched_setparam03+sched_setparam04+sched_setparam05+sched_setscheduler02+sched_setscheduler04+\
-semop03+setegid02+setgid02+setgroups01+setgroups02+setpgid03+setregid02+setresgid03+setresuid03+setresuid04+\
-setrlimit02+setrlimit03+shmctl07+shmdt01+sighold02+signal01+signal02+splice03+splice04+statfs02+\
-statfs02_64+tee02+tgkill03+tkill02+unshare02+vmsplice02+waitid04+waitid05+waitid06+waitpid06+\
-waitpid09+waitpid10+waitpid12+\
-fanotify04+fanotify08+write01+\
-clock_settime01+clock_settime02+settimeofday01+settimeofday02+stime01+stime02";
-
-// Positive-score cases selected from the Chronix LTP list and verified on the
-// current Txv2 images. These are not old-format tests, complete without a
-// watchdog, and were focused-rerun on RV/LA musl/glibc on 2026-06-05 as
-// 26/65 in each lane. `setsockopt02` is intentionally not included.
-const LTP_SUBMIT_CHRONIX_POSITIVE_CASES: &str =
-    "socket01+getsockname01+setsockopt01+sendto02+accept01+accept03+setsockopt03+prctl08";
-
-// Old-format / official-unscored submit cases. These were only useful when the
-// local runner synthesized Summary blocks or the local judge filled in legacy
-// totals. Keep them visible here, but do not run them in submit LTP batches.
-#[cfg_attr(target_arch = "loongarch64", allow(dead_code))]
-const LTP_SUBMIT_UNSCORED_LEGACY_CASES: &str = "\
-prot_hsymlinks+clone02+exit_group01+fallocate01+fallocate02+fchownat01+fcntl07+fcntl07_64+\
-fcntl09+fcntl09_64+fcntl10+fcntl10_64+fstatat01+get_robust_list01+kill02+\
-lchown01+lchown02+linkat01+mincore01+mkdirat01+mknod06+mknodat01+mlockall01+\
-mlockall03+mremap05+msync03+munmap03+open12+open13+openat02+readlink01+\
-rt_sigaction01+rt_sigaction02+rt_sigaction03+rt_sigprocmask02+sched_getattr02+\
-sched_setattr01+setresgid01+setrlimit01+setsid01+signalfd01+symlink03+\
-symlinkat01+sysconf01+ulimit01";
-
-// LA64 submit whitelist delta. This starts with the shared official-unscored
-// cases above, then adds LA-only zero-score or hanging cases.
-#[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
-const LTP_LA_SUBMIT_EXCLUDED_CASES: &str = "\
-prot_hsymlinks+clone02+fallocate01+fallocate02+fchownat01+fcntl07+fcntl07_64+fcntl09+fcntl09_64+fcntl10+\
-fcntl10_64+fstatat01+get_robust_list01+kill02+lchown01+lchown02+linkat01+mincore01+mkdirat01+mknod06+\
-mknodat01+mlockall01+mlockall03+mremap05+msync03+munmap03+open12+open13+openat02+rt_sigaction01+\
-rt_sigaction02+rt_sigaction03+rt_sigprocmask02+sched_getattr02+sched_setattr01+setresgid01+setrlimit01+setsid01+signalfd01+symlink03+\
-symlinkat01+sysconf01+ulimit01+gettid02+fcntl36_64+fcntl36+futex_wait03+pselect01+pselect01_64+fcntl34+\
-fcntl34_64+mq_notify01+semop05+mknod05+execve05+fcntl36+fcntl36_64+fork04+pipe02+sched_setscheduler04+\
-tgkill01+tgkill03+tkill02";
-
-#[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
-#[cfg_attr(target_arch = "loongarch64", allow(dead_code))]
-const LTP_BATCH_LA_SUBMIT_NETWORK_EXCLUDED_CASES: &str =
-    "bind04+bind05+bind06+accept02+getsockopt02+setsockopt06";
-
-const LTP_BATCH_SUBMIT_LIBC_EXCLUDED_CASES: &str = "fcntl36_64+fcntl36";
-
-#[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
-const LTP_BATCH_LA_SUBMIT_GLIBC_EXCLUDED_CASES: &str = "fcntl36_64+fcntl36";
-
-// The network stack is still moving. Keep these rows visible for audit/focused
-// runs, but do not append them to the ordinary submit whitelist batch.
+// Final RV64 LTP submit whitelist. Keep this as the single RV source of truth.
 #[allow(dead_code)]
-const LTP_BATCH_SUBMIT_GLIBC_NETWORK_EXCLUDED_CASES: &str = "\
-recv01+recvfrom01+recvmsg01+recvmsg02+recvmsg03+sendmmsg01+sendmmsg02+\
-recvmmsg01+getsockopt02+bind01+bind02+bind03+bind04+bind05+connect01+connect02+accept01+\
-accept02+accept03+accept4_01+getpeername01+socketpair01+socketpair02+\
-setsockopt02+setsockopt03+setsockopt04+setsockopt08+setsockopt09+setsockopt10";
-
-#[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
-#[cfg_attr(target_arch = "loongarch64", allow(dead_code))]
-const LTP_BATCH_LA_SUBMIT_GLIBC_NETWORK_EXCLUDED_CASES: &str = "\
-recv01+recvfrom01+recvmsg01+recvmsg02+recvmsg03+sendmmsg01+sendmmsg02+\
-recvmmsg01+bind01+bind02+bind03+bind04+bind05+connect01+connect02+accept01+\
-accept02+accept03+accept4_01+getpeername01+socketpair01+socketpair02+\
-setsockopt02+setsockopt03+setsockopt04+setsockopt08+setsockopt09+setsockopt10";
-
-#[allow(dead_code)]
-const LTP_BATCH_SUBMIT_NETWORK_CASES: &str = "\
-socket01+socket02+listen01+getsockname01+getsockopt01+getsockopt02+setsockopt01+send01+\
-send02+sendto01+sendto02+sendto03+recv01+recvfrom01+recvmsg01+recvmsg02+recvmsg03+\
-sendmmsg01+sendmmsg02+recvmmsg01+bind01+bind02+bind03+bind04+bind05+connect01+\
-connect02+accept01+accept02+accept03+accept4_01+getpeername01+socketpair01+socketpair02+\
-setsockopt02+setsockopt03+setsockopt04+setsockopt08+setsockopt09+setsockopt10";
-
-const LTP_SUBMIT_CASES: &str = "\
-prot_hsymlinks+epoll_ctl03+splice07+rt_sigaction01+rt_sigaction02+rt_sigaction03+access01+getpid01+\
-waitpid01+pipe11+timer_settime02+clock_getres01+sysconf01+posix_fadvise03+posix_fadvise03_64+confstr01+\
-timer_settime01+signal03+signal05+getitimer01+mq_timedsend01+signal04+name_to_handle_at01+mq_timedreceive01+\
-chmod01+open11+linkat01+semop02+ppoll01+llseek03+personality01+setitimer01+\
-pathconf01+setregid03+select03+semctl07+shmctl02+getrlimit01+getrlimit03+readahead01+\
-select02+mmap04+msgctl01+msgctl04+access02+getdents02+stat01+stat01_64+\
+const LTP_SUBMIT_RV_CASES: &str = "\
+epoll_ctl03+splice07+access01+getpid01+waitpid01+pipe11+timer_settime02+clock_getres01+\
+posix_fadvise03+posix_fadvise03_64+confstr01+timer_settime01+signal03+signal05+getitimer01+\
+mq_timedsend01+signal04+name_to_handle_at01+mq_timedreceive01+chmod01+open11+semop02+ppoll01+\
+llseek03+personality01+setitimer01+pathconf01+setregid03+select03+semctl07+shmctl02+getrlimit01+\
+getrlimit03+readahead01+select02+mmap04+msgctl01+msgctl04+access02+getdents02+stat01+stat01_64+\
 setreuid05+futex_wake03+msgrcv07+gettid02+clock_nanosleep01+readv01+clock_gettime02+link04+\
-readlinkat01+symlinkat01+setregid04+setresuid01+epoll_ctl02+epoll_wait06+lseek02+fpathconf01+\
-getrandom03+name_to_handle_at02+open_by_handle_at01+fallocate02+fallocate03+preadv02+preadv02_64+preadv202+\
-preadv202_64+writev07+semctl01+sched_setscheduler01+timer_delete01+fchmod01+mmap06+\
-setreuid01+setreuid02+epoll_wait02+futex_wait05+poll02+fcntl36_64+fcntl36+pipe2_01+\
-pwritev02+pwritev02_64+pwritev202+pwritev202_64+clock_nanosleep02+nanosleep01+times03+mknod01+\
-open_by_handle_at02+readlink03+unlinkat01+mremap05+capget01+setresgid02+futex_wake01+select01+\
-dup202+fcntl02+fcntl02_64+fcntl05+fcntl05_64+posix_fadvise01+posix_fadvise01_64+posix_fadvise02+\
-posix_fadvise02_64+posix_fadvise04+posix_fadvise04_64+preadv201+preadv201_64+pwritev201+pwritev201_64+writev01+\
-sethostname02+mq_notify01+msgget02+semctl03+semget02+kcmp02+alarm02+timerfd02+\
-chown05+creat01+creat08+fchmodat01+flock04+fstat02+fstat02_64+fstatat01+\
-lchown01+open10+readlinkat02+madvise01+setregid01+setresgid01+epoll_wait03+epoll_wait07+\
-eventfd02+pwrite02+pwrite02_64+sendfile04+sendfile04_64+sync_file_range01+mq_open01+shmctl08+\
-kcmp01+faccessat201+fchmodat02+fchownat01+mkdirat01+mknod06+mknodat01+statx03+\
-truncate03+truncate03_64+unlink07+setegid01+setresuid02+setreuid03+eventfd01+futex_wait01+\
-select04+dup201+dup203+dup204+fcntl07+fcntl07_64+fcntl13+fcntl13_64+\
-fcntl30+fcntl30_64+ioctl_ns07+lseek01+readv02+sendfile03+sendfile03_64+msgrcv02+\
-semctl09+semop01+shmat01+get_robust_list01+getpgid01+pidfd_send_signal02+sched_getaffinity01+sched_getattr02+\
-sched_setaffinity01+sched_setattr01+getrandom01+getrandom02+clock_nanosleep04+timerfd_settime01+flock06+lstat02+\
-lstat02_64+stat03+stat03_64+statx02+symlink03+mincore01+mlock01+mlock201+\
-mlock202+munlock01+remap_file_pages02+capset01+setreuid04+epoll_ctl01+epoll_wait01+eventfd03+\
-eventfd04+pselect02+pselect02_64+close01+dup07+dup3_02+fcntl29+fcntl29_64+\
-pread02+pread02_64+preadv01+preadv01_64+pwritev01+pwritev01_64+read02+write05+\
-mq_unlink01+msgctl12+semctl05+semget01+shmat02+shmget04+setns01+clone08+\
-execve03+pidfd_getfd02+pidfd_open02+getrusage02+membarrier01+sigwait01+syscall01+ulimit01+\
+readlinkat01+setregid04+setresuid01+epoll_ctl02+epoll_wait06+lseek02+fpathconf01+getrandom03+\
+name_to_handle_at02+open_by_handle_at01+fallocate03+preadv02+preadv02_64+preadv202+preadv202_64+\
+writev07+semctl01+sched_setscheduler01+timer_delete01+fchmod01+mmap06+setreuid01+setreuid02+\
+epoll_wait02+futex_wait05+poll02+pipe2_01+pwritev02+pwritev02_64+pwritev202+pwritev202_64+\
+clock_nanosleep02+nanosleep01+times03+mknod01+open_by_handle_at02+readlink03+unlinkat01+capget01+\
+setresgid02+futex_wake01+select01+dup202+fcntl02+fcntl02_64+fcntl05+fcntl05_64+posix_fadvise01+\
+posix_fadvise01_64+posix_fadvise02+posix_fadvise02_64+posix_fadvise04+posix_fadvise04_64+preadv201+\
+preadv201_64+pwritev201+pwritev201_64+writev01+sethostname02+mq_notify01+msgget02+semctl03+semget02+\
+kcmp02+alarm02+timerfd02+chown05+creat01+creat08+fchmodat01+flock04+fstat02+fstat02_64+open10+\
+readlinkat02+madvise01+setregid01+epoll_wait03+epoll_wait07+eventfd02+pwrite02+pwrite02_64+\
+sendfile04+sendfile04_64+sync_file_range01+mq_open01+shmctl08+kcmp01+faccessat201+fchmodat02+\
+statx03+truncate03+truncate03_64+unlink07+setegid01+setresuid02+setreuid03+eventfd01+futex_wait01+\
+select04+dup201+dup203+dup204+fcntl13+fcntl13_64+fcntl30+fcntl30_64+ioctl_ns07+lseek01+readv02+\
+sendfile03+sendfile03_64+msgrcv02+semctl09+semop01+shmat01+getpgid01+pidfd_send_signal02+\
+sched_getaffinity01+sched_setaffinity01+getrandom01+getrandom02+clock_nanosleep04+timerfd_settime01+\
+flock06+lstat02+lstat02_64+stat03+stat03_64+statx02+mlock01+mlock201+mlock202+munlock01+\
+remap_file_pages02+capset01+setreuid04+epoll_ctl01+epoll_wait01+eventfd03+eventfd04+pselect02+\
+pselect02_64+close01+dup07+dup3_02+fcntl29+fcntl29_64+pread02+pread02_64+preadv01+preadv01_64+\
+pwritev01+pwritev01_64+read02+write05+mq_unlink01+msgctl12+semctl05+semget01+shmat02+shmget04+\
+setns01+clone08+execve03+pidfd_getfd02+pidfd_open02+getrusage02+membarrier01+sigwait01+syscall01+\
 alarm05+getitimer02+nanosleep04+setitimer02+timer_gettime01+timerfd01+timerfd_gettime01+chmod03+\
-faccessat01+flock01+flock02+ftruncate03+ftruncate03_64+getcwd01+lchown02+open12+\
-mlock02+mlockall01+mlockall03+mmap09+mremap06+munmap03+setgid03+setresuid05+\
-epoll_create01+epoll_create1_01+epoll_create1_02+eventfd05+eventfd2_01+eventfd2_02+eventfd2_03+futex_wait_bitset01+\
-poll01+copy_file_range03+dup01+dup02+dup04+dup207+dup3_01+fallocate01+\
-fcntl09+fcntl09_64+fcntl10+fcntl10_64+fcntl15_64+fcntl15+fcntl27+fcntl27_64+\
-fsync03+llseek02+lseek07+pipe03+sendfile02+sendfile02_64+write02+write06+\
-sethostname01+uname01+msgctl03+msgctl06+msgrcv01+semctl04+shmdt02+clone01+\
-clone02+fork01+fork10+getpgid02+getpgrp01+getpid02+gettid01+setpgrp02+\
-setsid01+waitpid03+waitpid04+getrlimit02+getrusage01+setrlimit01+kill02+rt_sigprocmask02+\
-sigaltstack02+signalfd01+getrandom05+memcmp01+memcpy01+alarm03+alarm06+alarm07+\
-gettimeofday01+nanosleep02+time01+timer_getoverrun01+timerfd_create01+chown02+faccessat02+faccessat202+\
-fstat03+fstat03_64+fstatfs02+fstatfs02_64+ftruncate01+ftruncate01_64+mknod02+open01+\
-open08+open09+open13+openat02+readlink01+readlink01A+stat02+stat02_64+\
-symlink04+truncate02+truncate02_64+unlink05+unlink08+madvise10+mlock05+msync03+\
-munlockall01+io_uring01+capset04+getegid02+getegid02_16+geteuid01+geteuid02+getgid01+\
-getgid03+getresgid01+getresgid02+getresgid03+getresuid01+getresuid02+getresuid03+getuid01+\
-getuid03+setgid01+setgroups02+setgroups03+setresgid04+setresuid04+setreuid07+setuid01+\
-epoll_ctl04+epoll_ctl05+futex_cmp_requeue02+futex_wait02+futex_wait03+futex_wait04+pselect01+pselect01_64+\
-pselect03+pselect03_64+close02+dup03+dup05+dup06+dup205+dup206+\
-fcntl01+fcntl01_64+fcntl03+fcntl03_64+fcntl04+fcntl04_64+fcntl08+fcntl08_64+\
-fcntl12+fcntl12_64+fcntl16+fcntl16_64+fcntl18+fcntl18_64+fcntl22+fcntl22_64+\
-fcntl34+fcntl34_64+fdatasync01+fsync02+llseek01+pipe01+pipe04+pipe05+\
-pipe06+pipe07+pipe08+pipe09+pipe10+pipe12+pipe14+pread01+\
-pread01_64+pwrite01+pwrite01_64+pwrite03+pwrite03_64+pwrite04+pwrite04_64+read01+\
-read04+sendfile05+sendfile05_64+sendfile06+sendfile06_64+sendfile08+sendfile08_64+write01+\
-write03+writev02+writev05+writev06+getdomainname01+modify_ldt01+modify_ldt02+modify_ldt03+\
-newuname01+ptrace05+uname02+uname04+msgctl02+msgget01+msgrcv08+\
-msgsnd01+semctl02+semctl06+semop04+semop05+shmat04+shmctl07+shmdt01+\
-unshare02+clone03+clone05+clone06+clone07+clone302+execl01+execle01+\
-execlp01+execv01+execve01+execve06+execvp01+exit01+exit02+exit_group01+\
-fork03+fork04+fork07+fork08+fork09+getppid01+getppid02+getsid01+\
-getsid02+personality02+pidfd_getfd01+pidfd_open01+pidfd_open04+set_robust_list01+set_tid_address01+setpgid01+\
-setpgrp01+vfork01+wait01+wait02+wait402+waitid04+waitid05+waitid06+\
-sched_getattr01+setrlimit02+setrlimit03+setrlimit04+setrlimit05+kill06+kill07+kill08+\
-kill09+kill12+sigaction01+sigaction02+sigaltstack01+signal02+signalfd4_01+signalfd4_02+\
-gethostname01+getpagesize01+getrandom04+memset01+nftw01+nftw6401+pathconf02+string01+\
-gettimeofday02+settimeofday02+timer_delete02+timer_settime03+times01+chdir04+chmod05+chmod07+\
-chown01+chown03+creat03+creat05+fchdir01+fchdir02+fchmod02+fchmod03+\
-fchmod04+fchmod05+flock03+getcwd03+link02+lstat01A+lstat01A_64+mkdir05+\
-mknod05+mknod08+mknod09+open02+open03+open04+open07+readdir01+\
-rmdir01+statfs02+statfs02_64+symlink01+symlink02+umask01+brk01+brk02+\
-madvise02+madvise05+mincore02+mincore03+mlock03+mlock04+mlock203+mlockall02+\
-mmap01+mmap02+mmap08+mmap15+mmap17+mmap19+mmap20+mprotect01+\
-mprotect03+mprotect05+mremap02+mremap03+mremap04+msync01+msync02+munlock02+\
-sbrk01+sbrk02";
+faccessat01+flock01+flock02+ftruncate03+ftruncate03_64+getcwd01+mlock02+mmap09+mremap06+setgid03+\
+setresuid05+epoll_create01+epoll_create1_01+epoll_create1_02+eventfd05+eventfd2_01+eventfd2_02+\
+eventfd2_03+futex_wait_bitset01+poll01+copy_file_range03+dup01+dup02+dup04+dup207+dup3_01+\
+fcntl15_64+fcntl15+fcntl27+fcntl27_64+fsync03+llseek02+lseek07+pipe03+sendfile02+sendfile02_64+\
+write02+write06+sethostname01+uname01+msgctl03+msgctl06+msgrcv01+semctl04+shmdt02+clone01+fork01+\
+fork10+getpgid02+getpgrp01+getpid02+gettid01+setpgrp02+waitpid03+waitpid04+getrlimit02+getrusage01+\
+sigaltstack02+getrandom05+memcmp01+memcpy01+alarm03+alarm06+alarm07+gettimeofday01+nanosleep02+\
+time01+timer_getoverrun01+timerfd_create01+chown02+faccessat02+faccessat202+fstat03+fstat03_64+\
+fstatfs02+fstatfs02_64+ftruncate01+ftruncate01_64+mknod02+open01+open08+open09+readlink01A+stat02+\
+stat02_64+symlink04+truncate02+truncate02_64+unlink05+unlink08+madvise10+mlock05+munlockall01+\
+capset04+getegid02+getegid02_16+geteuid01+getgid01+getgid03+getuid01+setgid01+setuid01+setreuid06+\
+setreuid07+setuid03+setuid04+epoll_ctl04+epoll_ctl05+futex_cmp_requeue02+futex_wait02+futex_wait04+\
+pselect03+pselect03_64+close02+dup03+dup05+dup06+dup205+dup206+fcntl03+fcntl03_64+fcntl04+\
+fcntl04_64+fcntl08+fcntl08_64+fcntl12+fcntl12_64+fsync02+pipe01+pipe06+pipe08+pipe10+pipe14+pread01+\
+pread01_64+pwrite01+pwrite01_64+pwrite03+pwrite03_64+pwrite04+pwrite04_64+read01+read04+write03+\
+getdomainname01+uname02+uname04+gettimeofday02+timer_delete02+timer_settime03+times01+chmod07+\
+chown01+creat03+creat05+fchdir01+fchdir02+fchmod02+fchmod03+fchmod04+fchmod05+flock03+getcwd03+\
+mkdir05+open03+open04+readdir01+rmdir01+symlink02+umask01+madvise05+mlock03+mlock04+mlock203+mmap02+\
+mmap08+mmap15+mmap17+mmap19+mmap20+mprotect05+munlock02+sbrk02+getpriority01+getpriority02+nice01+\
+nice02+nice03+nice04+prctl01+prctl09+sched_get_priority_max01+sched_get_priority_max02+\
+sched_get_priority_min01+sched_get_priority_min02+sched_rr_get_interval01+setpriority02+wait402+\
+wait02+wait01+shmat04+sendfile08_64+sendfile08+sendfile06_64+sendfile06+sendfile05_64+sendfile05+\
+semop04+semctl02+pidfd_open01+personality02+msgrcv08+msgget01+mknod09+kill06+getsid02+getsid01+\
+getppid02+getppid01+fork08+fork07+fork03+exit02+setrlimit04+setrlimit05+clone07+clone06+clone05+\
+clone03+access03+brk01+brk02+capget02+chdir04+chmod05+chown03+clone04+clone302+close_range02+\
+creat04+epoll_create02+epoll_pwait02+epoll_pwait03+epoll_pwait05+epoll_wait04+execl01+execle01+\
+execlp01+execv01+execve01+execve02+execve05+execve06+execvp01+fchown01+fchown02+fchown03+fchown05+\
+fork04+getcpu01+getcwd02+geteuid02+gethostname01+getpagesize01+getrandom04+getuid03+\
+inotify_init1_01+inotify_init1_02+ioprio_get01+ioprio_set03+io_uring01+kill03+kill05+link02+\
+llseek01+madvise02+memfd_create02+memset01+mincore02+mincore03+mkdir04+msgctl02+msgsnd01+open02+\
+open07+pathconf02+pause01+pidfd_getfd01+pidfd_open04+pipe02+pipe07+pipe13+pipe2_02+pipe2_04+prctl02+\
+prctl03+prctl05+prctl08+rename09+rmdir03+rt_sigsuspend01+sbrk01+sched_getparam01+sched_getparam03+\
+sched_getscheduler01+sched_getscheduler02+sched_rr_get_interval02+sched_rr_get_interval03+\
+sched_setparam01+sched_setparam02+sched_setparam03+sched_setparam04+sched_setparam05+\
+sched_setscheduler02+sched_setscheduler04+semop03+setegid02+setgid02+setgroups01+setgroups02+\
+setpgid03+setregid02+setresgid03+setresuid03+setresuid04+setrlimit02+setrlimit03+shmctl07+shmdt01+\
+sighold02+signal01+signal02+splice03+splice04+statfs02+statfs02_64+tee02+tgkill03+tkill02+unshare02+\
+vmsplice02+waitid04+waitid05+waitid06+waitpid06+waitpid09+waitpid10+waitpid12+fanotify04+fanotify08+\
+write01+clock_settime01+clock_settime02+settimeofday01+settimeofday02+stime01+stime02+socket01+\
+getsockname01+setsockopt01+sendto02+accept01+accept03+setsockopt03";
+
+// Final LA64 LTP submit whitelist. Keep this as the single LA source of truth.
+#[allow(dead_code)]
+const LTP_SUBMIT_LA_CASES: &str = "\
+epoll_ctl03+splice07+access01+getpid01+waitpid01+pipe11+timer_settime02+clock_getres01+\
+posix_fadvise03+posix_fadvise03_64+confstr01+timer_settime01+signal03+signal05+getitimer01+\
+mq_timedsend01+signal04+name_to_handle_at01+mq_timedreceive01+chmod01+open11+semop02+ppoll01+\
+llseek03+personality01+setitimer01+pathconf01+setregid03+select03+semctl07+shmctl02+getrlimit01+\
+getrlimit03+readahead01+select02+mmap04+msgctl01+msgctl04+access02+getdents02+stat01+stat01_64+\
+setreuid05+futex_wake03+msgrcv07+clock_nanosleep01+readv01+clock_gettime02+link04+readlinkat01+\
+setregid04+setresuid01+epoll_ctl02+epoll_wait06+lseek02+fpathconf01+getrandom03+name_to_handle_at02+\
+open_by_handle_at01+fallocate03+preadv02+preadv02_64+preadv202+preadv202_64+writev07+semctl01+\
+sched_setscheduler01+timer_delete01+fchmod01+mmap06+setreuid01+setreuid02+epoll_wait02+futex_wait05+\
+poll02+pipe2_01+pwritev02+pwritev02_64+pwritev202+pwritev202_64+clock_nanosleep02+nanosleep01+\
+times03+mknod01+open_by_handle_at02+readlink03+unlinkat01+capget01+setresgid02+futex_wake01+\
+select01+dup202+fcntl02+fcntl02_64+fcntl05+fcntl05_64+posix_fadvise01+posix_fadvise01_64+\
+posix_fadvise02+posix_fadvise02_64+posix_fadvise04+posix_fadvise04_64+preadv201+preadv201_64+\
+pwritev201+pwritev201_64+writev01+sethostname02+msgget02+semctl03+semget02+kcmp02+alarm02+timerfd02+\
+chown05+creat01+creat08+fchmodat01+flock04+fstat02+fstat02_64+open10+readlinkat02+madvise01+\
+setregid01+epoll_wait03+epoll_wait07+eventfd02+pwrite02+pwrite02_64+sendfile04+sendfile04_64+\
+sync_file_range01+mq_open01+shmctl08+kcmp01+faccessat201+fchmodat02+statx03+truncate03+\
+truncate03_64+unlink07+setegid01+setresuid02+setreuid03+eventfd01+futex_wait01+select04+dup201+\
+dup203+dup204+fcntl13+fcntl13_64+fcntl30+fcntl30_64+ioctl_ns07+lseek01+readv02+sendfile03+\
+sendfile03_64+msgrcv02+semctl09+semop01+shmat01+getpgid01+pidfd_send_signal02+sched_getaffinity01+\
+sched_setaffinity01+getrandom01+getrandom02+clock_nanosleep04+timerfd_settime01+flock06+lstat02+\
+lstat02_64+stat03+stat03_64+statx02+mlock01+mlock201+mlock202+munlock01+remap_file_pages02+capset01+\
+setreuid04+epoll_ctl01+epoll_wait01+eventfd03+eventfd04+pselect02+pselect02_64+close01+dup07+\
+dup3_02+fcntl29+fcntl29_64+pread02+pread02_64+preadv01+preadv01_64+pwritev01+pwritev01_64+read02+\
+write05+mq_unlink01+msgctl12+semctl05+semget01+shmat02+shmget04+setns01+clone08+execve03+\
+pidfd_getfd02+pidfd_open02+getrusage02+membarrier01+sigwait01+syscall01+alarm05+getitimer02+\
+nanosleep04+setitimer02+timer_gettime01+timerfd01+timerfd_gettime01+chmod03+faccessat01+flock01+\
+flock02+ftruncate03+ftruncate03_64+getcwd01+mlock02+mmap09+mremap06+setgid03+setresuid05+\
+epoll_create01+epoll_create1_01+epoll_create1_02+eventfd05+eventfd2_01+eventfd2_02+eventfd2_03+\
+futex_wait_bitset01+poll01+copy_file_range03+dup01+dup02+dup04+dup207+dup3_01+fcntl15_64+fcntl15+\
+fcntl27+fcntl27_64+fsync03+llseek02+lseek07+pipe03+sendfile02+sendfile02_64+write02+write06+\
+sethostname01+uname01+msgctl03+msgctl06+msgrcv01+semctl04+shmdt02+clone01+fork01+fork10+getpgid02+\
+getpgrp01+getpid02+gettid01+setpgrp02+waitpid03+waitpid04+getrlimit02+getrusage01+sigaltstack02+\
+getrandom05+memcmp01+memcpy01+alarm03+alarm06+alarm07+gettimeofday01+nanosleep02+time01+\
+timer_getoverrun01+timerfd_create01+chown02+faccessat02+faccessat202+fstat03+fstat03_64+fstatfs02+\
+fstatfs02_64+ftruncate01+ftruncate01_64+mknod02+open01+open08+open09+readlink01+readlink01A+stat02+\
+stat02_64+symlink04+truncate02+truncate02_64+unlink05+unlink08+madvise10+mlock05+munlockall01+\
+capset04+getegid02+getegid02_16+geteuid01+getgid01+getgid03+getuid01+setgid01+setuid01+setreuid06+\
+setreuid07+setuid03+setuid04+epoll_ctl04+epoll_ctl05+futex_cmp_requeue02+futex_wait02+futex_wait04+\
+pselect03+pselect03_64+close02+dup03+dup05+dup06+dup205+dup206+fcntl03+fcntl03_64+fcntl04+\
+fcntl04_64+fcntl08+fcntl08_64+fcntl12+fcntl12_64+fsync02+pipe01+pipe06+pipe08+pipe10+pipe14+pread01+\
+pread01_64+pwrite01+pwrite01_64+pwrite03+pwrite03_64+pwrite04+pwrite04_64+read01+read04+write03+\
+getdomainname01+uname02+uname04+gettimeofday02+timer_delete02+timer_settime03+times01+chmod07+\
+chown01+creat03+creat05+fchdir01+fchdir02+fchmod02+fchmod03+fchmod04+fchmod05+flock03+getcwd03+\
+mkdir05+open03+open04+readdir01+rmdir01+symlink02+umask01+madvise05+mlock03+mlock04+mlock203+mmap02+\
+mmap08+mmap15+mmap17+mmap19+mmap20+mprotect05+munlock02+sbrk02+getpriority01+getpriority02+nice01+\
+nice02+nice03+nice04+prctl01+prctl09+sched_get_priority_max01+sched_get_priority_max02+\
+sched_get_priority_min01+sched_get_priority_min02+sched_rr_get_interval01+setpriority02+wait402+\
+wait02+wait01+shmat04+sendfile08_64+sendfile08+sendfile06_64+sendfile06+sendfile05_64+sendfile05+\
+semop04+semctl02+pidfd_open01+personality02+msgrcv08+msgget01+mknod09+kill06+getsid02+getsid01+\
+getppid02+getppid01+fork08+fork07+fork03+exit02+setrlimit04+setrlimit05+clone07+clone06+clone05+\
+clone03+access03+brk01+brk02+capget02+chdir04+chmod05+chown03+clone04+clone302+close_range02+\
+creat04+epoll_create02+epoll_pwait02+epoll_pwait03+epoll_pwait05+epoll_wait04+execl01+execle01+\
+execlp01+execv01+execve01+execve02+execve06+execvp01+exit_group01+fchown01+fchown02+fchown03+\
+fchown05+getcpu01+getcwd02+geteuid02+gethostname01+getpagesize01+getrandom04+getuid03+\
+inotify_init1_01+inotify_init1_02+ioprio_get01+ioprio_set03+io_uring01+kill03+kill05+link02+\
+llseek01+madvise02+memfd_create02+memset01+mincore02+mincore03+mkdir04+msgctl02+msgsnd01+open02+\
+open07+pathconf02+pause01+pidfd_getfd01+pidfd_open04+pipe07+pipe13+pipe2_02+pipe2_04+prctl02+\
+prctl03+prctl05+prctl08+rename09+rmdir03+rt_sigsuspend01+sbrk01+sched_getparam01+sched_getparam03+\
+sched_getscheduler01+sched_getscheduler02+sched_rr_get_interval02+sched_rr_get_interval03+\
+sched_setparam01+sched_setparam02+sched_setparam03+sched_setparam04+sched_setparam05+\
+sched_setscheduler02+semop03+setegid02+setgid02+setgroups01+setgroups02+setpgid03+setregid02+\
+setresgid03+setresuid03+setresuid04+setrlimit02+setrlimit03+shmctl07+shmdt01+sighold02+signal01+\
+signal02+splice03+splice04+statfs02+statfs02_64+tee02+unshare02+vmsplice02+waitid04+waitid05+\
+waitid06+waitpid06+waitpid09+waitpid10+waitpid12+fanotify04+fanotify08+write01+clock_settime01+\
+clock_settime02+settimeofday01+settimeofday02+stime01+stime02+socket01+getsockname01+setsockopt01+\
+sendto02+accept01+accept03+setsockopt03";
+
+#[cfg(target_arch = "loongarch64")]
+fn ltp_submit_cases_for_arch() -> &'static str {
+    LTP_SUBMIT_LA_CASES
+}
+
+#[cfg(not(target_arch = "loongarch64"))]
+fn ltp_submit_cases_for_arch() -> &'static str {
+    LTP_SUBMIT_RV_CASES
+}
 
 // End generated LTP syscall batch case lists.
 
@@ -2962,15 +2812,15 @@ mod tests {
         assert!(cmd.contains("mmap20"));
         assert!(cmd.contains("socket01"));
         assert!(cmd.contains("prctl08"));
+        assert!(cmd.contains(" write01"));
+        assert!(cmd.contains("io_uring01"));
         assert!(!cmd.contains("prot_hsymlinks"));
         assert!(!cmd.contains("rt_sigaction01"));
         assert!(!cmd.contains("sysconf01"));
-        assert!(!cmd.contains(" write01"));
         assert!(!cmd.contains("recvmsg01"));
         assert!(!cmd.contains("sendmsg01"));
         assert!(!cmd.contains("setsockopt02"));
         assert!(!cmd.contains("setsockopt06"));
-        assert!(!cmd.contains("io_uring01"));
         assert!(cmd.contains("lua_testcode.sh"));
         assert!(cmd.contains("netperf_testcode.sh"));
         assert!(
@@ -3015,7 +2865,6 @@ mod tests {
         assert!(cmd.contains("basic_testcode.sh"));
         assert!(cmd.contains("busybox_testcode.sh"));
         assert!(cmd.contains("#### OS COMP TEST GROUP START libctest-musl ####"));
-        assert!(cmd.contains("#### OS COMP TEST GROUP START libctest-glibc ####"));
         assert!(cmd.contains("#### OS COMP TEST GROUP START ltp-musl ####"));
         assert!(cmd.contains("#### OS COMP TEST GROUP START ltp-glibc ####"));
     }
@@ -3034,13 +2883,14 @@ mod tests {
         assert!(cmd.contains("mmap20"));
         assert!(cmd.contains("socket01"));
         assert!(cmd.contains("prctl08"));
+        assert!(cmd.contains(" write01"));
+        assert!(cmd.contains("io_uring01"));
         assert!(!cmd.contains("recvmsg01"));
         assert!(!cmd.contains("setsockopt02"));
         assert!(!cmd.contains("prot_hsymlinks"));
         assert!(!cmd.contains("rt_sigaction01"));
         assert!(!cmd.contains("sysconf01"));
         assert!(!cmd.contains("fallocate01"));
-        assert!(!cmd.contains(" write01"));
         let glibc_start = cmd
             .find("#### OS COMP TEST GROUP START ltp-glibc ####")
             .unwrap();
@@ -3062,13 +2912,12 @@ mod tests {
         assert!(!cmd.contains("sendmsg01"));
         assert!(!cmd.contains("socketcall01"));
         assert!(!cmd.contains("setsockopt06"));
-        assert!(!cmd.contains("io_uring01"));
         assert!(!cmd.contains("timerfd04"));
         assert!(!cmd.contains("; target_dir=\"ltp/testcases/bin\""));
     }
 
     #[test]
-    fn ltp_submit_glibc_batch_uses_glibc_only_exclusions() {
+    fn ltp_submit_glibc_batch_uses_arch_final_list() {
         let mut cmd = String::from("cd /musl/musl");
         append_ltp_batch(&mut cmd, "submit-glibc", &LtpArgs::none());
 
