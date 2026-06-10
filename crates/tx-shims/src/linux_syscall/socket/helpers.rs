@@ -1446,6 +1446,33 @@ pub(super) fn read_sockopt_ipv4_mcast_group_req<'a>(
     Ok(Ipv4MulticastGroup::new(interface, group))
 }
 
+/// `struct ip_mreq { struct in_addr imr_multiaddr; struct in_addr
+/// imr_interface; }` for the classic `IP_ADD_MEMBERSHIP` /
+/// `IP_DROP_MEMBERSHIP`. The interface here is an IPv4 address (0 =
+/// any), not an ifindex; we key membership by group only, so just
+/// validate the group is multicast.
+pub(super) fn read_sockopt_ipv4_ip_mreq<'a>(
+    ctx: &SyscallCtx<'a>,
+    optval: u64,
+    optlen: u32,
+) -> Result<Ipv4MulticastGroup, Errno> {
+    if optval == 0 {
+        return Err(Errno::EFAULT);
+    }
+    // Linux accepts ip_mreq (8) or ip_mreqn (12); only the first 8 bytes
+    // (multiaddr + interface addr) matter for membership keying.
+    if optlen < 8 {
+        return Err(Errno::EINVAL);
+    }
+    let mut bytes = [0u8; 8];
+    bootstrap_copy_from_user(&ctx.aspace, &mut bytes, optval)?;
+    let group = Ipv4Address::new([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    if !group.is_multicast() {
+        return Err(Errno::EINVAL);
+    }
+    Ok(Ipv4MulticastGroup::new(0, group))
+}
+
 pub(super) fn read_sockopt_linger<'a>(
     ctx: &SyscallCtx<'a>,
     optval: u64,

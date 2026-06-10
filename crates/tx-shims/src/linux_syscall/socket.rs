@@ -2652,6 +2652,25 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
                 _ => unreachable!(),
             }
         }
+        // Classic `struct ip_mreq` join/leave (LTP ns-mcast_join). Same
+        // membership store as the protocol-independent form.
+        (IPPROTO_IP, IP_ADD_MEMBERSHIP | IP_DROP_MEMBERSHIP) => {
+            if !matches!(
+                socket.kind,
+                SocketKind::Tcp | SocketKind::Udp | SocketKind::RawIcmp
+            ) {
+                return SyscallResult::Error(errno_to_i32(Errno::ENOPROTOOPT));
+            }
+            let group = match read_sockopt_ipv4_ip_mreq(ctx, optval, optlen) {
+                Ok(group) => group,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            match optname {
+                IP_ADD_MEMBERSHIP => payload.join_ipv4_multicast_group(group),
+                IP_DROP_MEMBERSHIP => payload.leave_ipv4_multicast_group(group),
+                _ => unreachable!(),
+            }
+        }
         (IPPROTO_TCP, TCP_NODELAY) => {
             let on = match read_sockopt_bool(ctx, optval, optlen) {
                 Ok(on) => on,

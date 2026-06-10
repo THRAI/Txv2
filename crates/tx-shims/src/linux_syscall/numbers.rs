@@ -2010,6 +2010,11 @@ pub const IP_RECVERR: i32 = 11;
 pub const IP_MULTICAST_IF: i32 = 32;
 pub const IP_MULTICAST_TTL: i32 = 33;
 pub const IP_MULTICAST_LOOP: i32 = 34;
+/// `IP_ADD_MEMBERSHIP` / `IP_DROP_MEMBERSHIP` — classic `struct ip_mreq`
+/// multicast join/leave (what LTP `ns-mcast_join` and most apps use, vs
+/// the protocol-independent `MCAST_JOIN_GROUP`).
+pub const IP_ADD_MEMBERSHIP: i32 = 35;
+pub const IP_DROP_MEMBERSHIP: i32 = 36;
 pub const ICMP6_FILTER: i32 = 1;
 
 // IPPROTO_TCP options.
