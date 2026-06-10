@@ -1,3 +1,28 @@
+- 2026-06-10 (net scoring ledger) **Empirically measured the official-scoring ceiling for ALL 223 net
+  files in the judged image's bin/ — on real Linux, the official way (no-args + Summary-passed).**
+  Built LTP 20240930 natively, ran every file in isolated userns/netns sandboxes, scored with the
+  judge's exact logic. **Only 58/223 files can score at all; single-lane ceiling 946 points.**
+  Headlines: ipsec 11 files = 0 even on Linux (empirical confirmation); all 39 lksctp funtests = 0
+  officially (exit 0, NO Summary block — the 39/41 sctp campaign doesn't monetize; only
+  test_1_to_1_initmsg_connect(2)+sctp_big_chunk(1) do); legacy net.multicast mc_* = 0 (TPASS but no
+  Summary); NFS/RPC/appl/wireguard dead (daemons absent from image). New viable targets:
+  getaddrinfo_01(22), asapi_02(12)+in6_01(5)+in6_02(3), broken_ip family(47),
+  mcast-group/queryfld(16), route-change-netlink×3(6); budget-walled giants if-mtu-change(396),
+  route-change-dst/gw/if(300). Full per-file ledger + action tiers:
+  `msp/ltp-net-official-scoring-ledger-2026-06-10-zh.md`; rerun harness: `tools/ltp-host-ceiling/`.
+  Next: tier-1 quick wins (getaddrinfo_01, ipv6_lib trio, netlink route trio, tcp_cmds re-witness).
+
+- 2026-06-10 (ipsec triage) **net_stress.ipsec family = structurally 0 points; do not charter.**
+  All 9 ipsec scripts in the judged image's `bin/` score 0 in the official no-args sweep *even on
+  real Linux*: the non-vti four (tcp/udp/dccp/sctp_ipsec.sh) never configure IPsec without `-m`/`-p`
+  and then hand netstress a malformed `-n -N` (empty `$2`) → client TBROK → TFAIL; the five vti
+  scripts TCONF at `tst_check_drivers ip_vti` / `ipsec_set_algoline` proto-mismatch before testing
+  anything. No xfrm/crypto/vti kernel work can change this. Evidence chain + the
+  "if-we-ever-want-real-IPsec" dependency list (RustCrypto no_std crates, smoltcp-asterinas ESP/AH
+  wire layer, current nfnetlink xfrm stub) in
+  `docs/progress/research/2026-06-10-ipsec-family-scoring-analysis.md`. Next: pick a different
+  scoring target.
+
 - 2026-06-10 (scoring addendum) **How LTP is actually judged — and what net_stress.interface is worth: +3 official case points.**
   The official `ltp_testcode.sh` (24 lines, extracted from the judged image) **walks
   `ltp/testcases/bin/*` (~2824 files) executing each with NO ARGUMENTS** — runtest manifests are
