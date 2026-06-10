@@ -613,7 +613,11 @@ impl FsOps for Procfs {
             return StepOutcome::err(Errno::ENOENT.into());
         }
         if parent == PROCFS_SYS_NET_IPV4_CONF_ID {
-            if !name.is_empty() {
+            // Reject dotted names: busybox sysctl probes dot→slash splits
+            // with access(); a catch-all that resolves
+            // "eth0.force_igmp_version" as a directory makes it pick the
+            // wrong split and EISDIR on the write.
+            if !name.is_empty() && !name.contains(&b'.') {
                 return StepOutcome::done(ipv4_conf_dir_id(name));
             }
             return StepOutcome::err(Errno::ENOENT.into());

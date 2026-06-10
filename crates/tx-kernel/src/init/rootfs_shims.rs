@@ -486,6 +486,30 @@ if [ \"$1\" = -b ]; then\n\
     \"$bb\" tr -d '\\n' < \"$path\"\n\
     exit 0\n\
 fi\n\
+tx_writing=\n\
+for arg in \"$@\"; do\n\
+    case \"$arg\" in\n\
+        -*w*) tx_writing=1 ;;\n\
+    esac\n\
+done\n\
+if [ -n \"$tx_writing\" ]; then\n\
+    rc=0\n\
+    for arg in \"$@\"; do\n\
+        case \"$arg\" in\n\
+            -*) continue ;;\n\
+        esac\n\
+        key=${arg%%=*}\n\
+        val=${arg#*=}\n\
+        [ \"$key\" = \"$arg\" ] && continue\n\
+        path=/proc/sys/$(echo \"$key\" | \"$bb\" tr . /)\n\
+        if [ -e \"$path\" ]; then\n\
+            printf %s \"$val\" > \"$path\" || rc=1\n\
+        else\n\
+            rc=1\n\
+        fi\n\
+    done\n\
+    exit $rc\n\
+fi\n\
 exec \"$bb\" sysctl \"$@\"\n";
         if !create_file_with_data(&create_ctx, tx_ltp_bin_id, b"sysctl", 0o755, sysctl_script) {
             Self::write_board_sentinel_prefix();
