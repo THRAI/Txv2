@@ -11,13 +11,19 @@
   route-change-dst/gw/if(300). Full per-file ledger + action tiers:
   `msp/ltp-net-official-scoring-ledger-2026-06-10-zh.md`; rerun harness: `tools/ltp-host-ceiling/`.
   Next: tier-1 quick wins (getaddrinfo_01, ipv6_lib trio, netlink route trio, tcp_cmds re-witness).
-  Addendum (same day): **the two judges differ** — judge_ltp-musl counts Summary `passed`;
-  judge_ltp-glibc counts ANSI-colored `TPASS: ` lines (no Summary needed). Net effect on this
-  subset: +1 each for mc_cmds/mc_opts on the glibc lane only (musl 946 / glibc 948); lksctp
-  funtests and legacy `TPASS  :` output match neither judge — still 0 both lanes. txKernel serial
-  output verified to carry ANSI color (ipneigh01 log), so the glibc lane's color precondition
-  holds; keep it that way when touching console/redirect. Test sets are identical across lanes
-  for net (glibc's 20 extra bin files are all cpuset_*).
+  Addendum (same day, REAL-JUDGE closed loop): **the two judges differ in mechanism but produce
+  identical per-file scores** — verified by re-running all 223 files with LTP_COLORIZE_OUTPUT=y
+  and feeding every colored log to the actual judge_ltp-{musl,glibc}.py (no homemade parser):
+  musl=glibc=947/lane, zero per-file divergence (mcast-pktfld01 flaps 0↔1 across runs; everything
+  else byte-stable). judge_ltp-musl counts Summary `passed`; judge_ltp-glibc counts ANSI-colored
+  `TPASS: \x1b[0m` lines. Byte-level rule: new C/new shell framework matches both; legacy-API
+  shell (test.sh tst_resm emits `TPASS:\x1b[0m ` — space outside color) and legacy C
+  (`TPASS\x1b[0m  :`) match NEITHER → mc_cmds/mc_opts/mc_member/mc_commo, tcpdump01,
+  http/ftp/dns-stress, lksctp funtests, asapi_01/03 are 0 on BOTH lanes (earlier same-day claim
+  of glibc +1 for mc_cmds/mc_opts was a proxy-counting error, refuted by the real judge).
+  txKernel serial output verified to carry ANSI color (ipneigh01 log), so the glibc lane's color
+  precondition holds; keep it that way when touching console/redirect. Test sets are identical
+  across lanes for net (glibc's 20 extra bin files are all cpuset_*).
 
 - 2026-06-10 (ipsec triage) **net_stress.ipsec family = structurally 0 points; do not charter.**
   All 9 ipsec scripts in the judged image's `bin/` score 0 in the official no-args sweep *even on

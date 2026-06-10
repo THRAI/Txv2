@@ -53,3 +53,20 @@ python3 parse.py
   TFAIL（ip_tests 第 1 步 MTU）——分数按下限解读。
 - net-sweep-list.txt = 官方镜像 bin/ ∩（LTP net.* / net_stress.* 清单 ∪
   testcases/network 源码树），2026-06 镜像口径。
+
+## 真-judge 闭环（推荐口径，2026-06-10 深夜新增）
+
+`parse.py` 是 musl judge 的复刻；**glibc judge 数的是带 ANSI 颜色的
+`TPASS: \x1b[0m` 行，不能用"数 TPASS 子串"代理**（legacy-API 输出
+`TPASS:\x1b[0m␣` 差一个字节，代理会错判——mc_cmds 教训）。硬真相流程：
+
+```sh
+# 彩色重扫(LTP_COLORIZE_OUTPUT=y + /etc/hosts 垫层)
+xargs -P 8 -I{} ./run-one-color.sh {} results-color < net-sweep-list.txt
+# 用两个原版 judge 本体逐文件打分(零自写解析层)
+python3 judge-all.py   # 读 results-color/,输出 judged-real.json
+```
+
+字节级判定速查：新 C/新 shell 框架 `ESC[1;32mTPASS: ESC[0m` 两 judge 都认；
+legacy-API shell（test.sh tst_resm）`ESC[1;32mTPASS:ESC[0m␣` 与 legacy C
+`ESC[1;32mTPASSESC[0m␣␣:` 两 judge 都不认（且无 Summary）→ 两 lane 皆 0。
