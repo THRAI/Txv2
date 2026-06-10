@@ -10,6 +10,8 @@
   mcast-group/queryfld(16), route-change-netlink×3(6); budget-walled giants if-mtu-change(396),
   route-change-dst/gw/if(300). Full per-file ledger + action tiers:
   `msp/ltp-net-official-scoring-ledger-2026-06-10-zh.md`; rerun harness: `tools/ltp-host-ceiling/`.
+  Per-test progress tracker (58 rows in recommended attack order, four-lane score columns to fill
+  as each lands): `msp/ltp-net-progress-table-2026-06-10-zh.md`.
   Next: tier-1 quick wins (getaddrinfo_01, ipv6_lib trio, netlink route trio, tcp_cmds re-witness).
   Addendum (same day, REAL-JUDGE closed loop): **the two judges differ in mechanism but produce
   identical per-file scores** — verified by re-running all 223 files with LTP_COLORIZE_OUTPUT=y
