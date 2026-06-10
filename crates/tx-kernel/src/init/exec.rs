@@ -2467,15 +2467,18 @@ fn oscomp_groups_from_cmdline<P: tx_hal::TxPlatform>() -> Option<&'static str> {
 }
 
 fn oscomp_bench_observe_enabled_from_cmdline(cmdline: Option<&str>) -> bool {
+    // Off by default: the bench-observe trace dump floods the serial output
+    // (megabytes of mostly-empty trace ring buffer) for high-event-rate
+    // benchmarks like lmbench. Opt in with `tx.oscomp.observe=1` when profiling.
     let Some(cmdline) = cmdline else {
-        return true;
+        return false;
     };
     for token in cmdline.split_ascii_whitespace() {
         if let Some(value) = token.strip_prefix("tx.oscomp.observe=") {
-            return !matches!(value, "0" | "false" | "off" | "no");
+            return matches!(value, "1" | "true" | "on" | "yes");
         }
     }
-    true
+    false
 }
 
 fn oscomp_bench_observe_threshold_from_cmdline(cmdline: Option<&str>) -> Option<u64> {
@@ -2551,6 +2554,17 @@ fn append_default_oscomp_scripts_with_observe(
     }
     append_submit_ltp_runner(cmd, "musl", args);
     append_submit_ltp_runner(cmd, "glibc", args);
+    // lmbench runs dead last (musl + glibc together, after everything incl.
+    // LTP): on some configs it can fault or hang mid-run, so keeping it at the
+    // very end means a stall never blocks the other suites' results.
+    append_oscomp_musl_script_with_observe(
+        cmd,
+        "lmbench_testcode.sh",
+        args,
+        bench_observe_enabled,
+        bench_observe_threshold,
+    );
+    append_oscomp_glibc_script(cmd, "lmbench_testcode.sh");
 }
 
 fn append_oscomp_musl_script(cmd: &mut alloc::string::String, script: &str, args: &LtpArgs<'_>) {
@@ -2674,6 +2688,7 @@ const DEFAULT_OSCOMP_MUSL_PRE_LTP_SCRIPTS: &[(&str, &str)] = &[
     ("netperf-musl", "netperf_testcode.sh"),
     ("iozone-musl", "iozone_testcode.sh"),
     ("cyclictest-musl", "cyclictest_testcode.sh"),
+    ("libcbench-musl", "libcbench_testcode.sh"),
 ];
 
 const DEFAULT_OSCOMP_GLIBC_PRE_LTP_SCRIPTS: &[(&str, &str)] = &[
@@ -2684,6 +2699,7 @@ const DEFAULT_OSCOMP_GLIBC_PRE_LTP_SCRIPTS: &[(&str, &str)] = &[
     ("netperf-glibc", "netperf_testcode.sh"),
     ("iozone-glibc", "iozone_testcode.sh"),
     ("cyclictest-glibc", "cyclictest_testcode.sh"),
+    ("libcbench-glibc", "libcbench_testcode.sh"),
 ];
 
 fn oscomp_musl_script_for_group(group: &str) -> Option<&'static str> {
@@ -2963,8 +2979,16 @@ mod tests {
                     .find("#### OS COMP TEST GROUP START ltp-glibc ####")
                     .unwrap()
         );
-        assert!(!cmd.contains("libcbench_testcode.sh"));
-        assert!(!cmd.contains("lmbench_testcode.sh"));
+        assert!(cmd.contains("libcbench_testcode.sh"));
+        // lmbench is present and runs dead last (after the LTP groups) so a
+        // stall never blocks the other suites.
+        assert!(cmd.contains("lmbench_testcode.sh"));
+        assert!(
+            cmd.rfind("lmbench_testcode.sh").unwrap()
+                > cmd
+                    .find("#### OS COMP TEST GROUP START ltp-glibc ####")
+                    .unwrap()
+        );
         assert!(cmd.contains("iozone_testcode.sh"));
         assert!(!cmd.contains("iperf_testcode.sh"));
         assert!(cmd.contains("cyclictest_testcode.sh"));

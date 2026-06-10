@@ -400,6 +400,13 @@ fn bench_child_add<P: TxPlatform>(phase: &str, counter: &AtomicU64, amount: u64,
 }
 
 fn write_bench_child_count<P: TxPlatform>(phase: &str, n: u64) {
+    // Bench/debug trace of reactor child-thread submission counts. Off by
+    // default to keep oscomp/test serial output clean; flip the cfg to debug
+    // child-submission scheduling.
+    if !cfg!(tx_thread_roundtrip_metrics) {
+        let _ = (phase, n);
+        return;
+    }
     tx_hal::console_write_str::<P>("txkernel:");
     tx_hal::console_write_str::<P>(P::BOARD);
     tx_hal::console_write_str::<P>(":bench:child_submit:");
