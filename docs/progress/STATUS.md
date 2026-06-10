@@ -1,3 +1,17 @@
+- 2026-06-10 (FULL-image scoring table) **Swept ALL 2822 files in the judged image's bin/ on host
+  Linux the official way (no-args, colored, real judges both lanes).** 1028 files can score;
+  **musl judge total 8594, glibc 8574** (7 files differ — exec/timing color loss). 28 files hit
+  the 330s cap; ~165 unmeasurable in the userns sandbox (146 need loop block devices, 16 need
+  global sysctl writes, 3 need modules) — true ceiling >0 there, needs real-root rerun to pin.
+  **257 files emit TPASS but score 0 under BOTH official judges** (legacy framework formats),
+  including local-whitelist heavyweights prot_hsymlinks (396 local) and rt_sigaction01-03
+  (150 local each) — the local stitched tally materially overstates official value. Upstream
+  check: pre-20250615 is still the newest pre- (预赛) release; the only newer tags are 2025
+  on-site-final Alpine images (different stage). Full per-file table:
+  `msp/ltp-full-official-scoring-table-2026-06-10-zh.md`; harness additions (pidns+cgroup cage):
+  `tools/ltp-host-ceiling/run-one-full.sh`, `judge-full.py`. Safety note: full-image sweeps MUST
+  use the pidns cage — kill06-class tests issue kill(-1) which would nuke the host session.
+
 - 2026-06-10 (net scoring ledger) **Empirically measured the official-scoring ceiling for ALL 223 net
   files in the judged image's bin/ — on real Linux, the official way (no-args + Summary-passed).**
   Built LTP 20240930 natively, ran every file in isolated userns/netns sandboxes, scored with the
