@@ -265,23 +265,32 @@ pub(super) fn commit_mapping_from_root(
     register_committed_intermediates(reservation.intermediates());
     let pte = encode_leaf_pte_with_permissions(reservation.phys(), permissions);
     let root = unsafe { page_table_mut_from_phys(root) };
-    match reservation.kind() {
+    let previous = match reservation.kind() {
         PmapReserveKind::Superpage1G => {
-            root.0[rv64_1g_leaf_index(reservation.virt().0)] = pte;
+            let slot = &mut root.0[rv64_1g_leaf_index(reservation.virt().0)];
+            core::mem::replace(slot, pte)
         }
         PmapReserveKind::Superpage2M => {
             let l1 = l1_table_mut_from_root(root, reservation.virt()).expect("reserved L1 table");
-            l1.0[rv64_2m_leaf_index(reservation.virt().0)] = pte;
+            let slot = &mut l1.0[rv64_2m_leaf_index(reservation.virt().0)];
+            core::mem::replace(slot, pte)
         }
         PmapReserveKind::Page4K => {
             let l1 = l1_table_mut_from_root(root, reservation.virt()).expect("reserved L1 table");
             let l0 = l0_table_mut(l1, reservation.virt()).expect("reserved L0 table");
-            l0.0[rv64_4k_leaf_index(reservation.virt().0)] = pte;
+            let slot = &mut l0.0[rv64_4k_leaf_index(reservation.virt().0)];
+            core::mem::replace(slot, pte)
         }
+    };
+    // Invalid→valid commits need no fence (the spec forbids caching V=0
+    // PTEs; the next hardware walk picks the new leaf up). Only an
+    // overwrite of a previously-VALID leaf (remap / permission change in
+    // place) must invalidate the stale translation — fence just that
+    // address. `activate_user_pmap` no longer issues a global sfence.vma
+    // on userspace entry, so this is the only fence map-commit gets.
+    if previous & 1 != 0 && previous != pte {
+        sfence_vma_all();
     }
-    // User pmap commits are consumed at the next userspace entry, where
-    // `activate_user_pmap` writes `satp` and issues `sfence.vma`. Avoid a
-    // second per-PTE fence here; unmap/protect still fence at invalidation.
 }
 
 pub(crate) fn unmap_mapping(

@@ -465,9 +465,29 @@ impl PmapIf for Platform {
             let ppn = root.phys().0 >> 12;
             let asid = root.asid().0 as usize;
             let satp = SATP_MODE_SV39 | (asid << 44) | ppn;
+            // Fast path: returning to the same address space (the common
+            // syscall return). No CSR write, no fence — TLB entries for
+            // this ASID are still valid.
+            let current: usize;
+            core::arch::asm!("csrr {satp}, satp", satp = out(reg) current, options(nomem, nostack));
+            if current == satp {
+                return;
+            }
+            // Different root/ASID: write satp WITHOUT a global sfence.vma.
+            // Correctness per the RISC-V privileged spec:
+            //  - TLB entries are ASID-tagged; switching ASIDs needs no fence.
+            //  - Invalid (V=0) PTEs are never cached, so invalid→valid map
+            //    commits are picked up by the next hardware walk unfenced
+            //    (`fill_mapping` fences only when overwriting a valid PTE).
+            //  - ASID reuse is fenced at root teardown
+            //    (`invalidate_root_translations` switches to the bootstrap
+            //    root and issues sfence.vma there).
+            // The previous unconditional `sfence.vma` here flushed the whole
+            // TLB on EVERY userspace entry — under QEMU TCG that meant a
+            // full tlb_flush per syscall return (~ms each), the dominant
+            // term of LTP shell-test runtime (net_stress budget battle).
             core::arch::asm!(
                 "csrw satp, {satp}",
-                "sfence.vma",
                 satp = in(reg) satp,
                 options(nostack)
             );
