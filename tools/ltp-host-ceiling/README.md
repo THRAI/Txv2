@@ -70,3 +70,13 @@ python3 judge-all.py   # 读 results-color/,输出 judged-real.json
 字节级判定速查：新 C/新 shell 框架 `ESC[1;32mTPASS: ESC[0m` 两 judge 都认；
 legacy-API shell（test.sh tst_resm）`ESC[1;32mTPASS:ESC[0m␣` 与 legacy C
 `ESC[1;32mTPASSESC[0m␣␣:` 两 judge 都不认（且无 Summary）→ 两 lane 皆 0。
+
+## 全量扫描（2026-06-10 深夜新增）
+
+`run-one-full.sh`：全镜像 bin/*（2822 文件）安全跑法 —— 在网络版基础上加
+pidns（`unshare -p --fork --mount-proc`，防 kill(-1)/泄漏守护进程）+
+systemd 用户笼（MemoryMax=2G、TasksMax=1024，防 oom/fork 类打挂宿主）+
+磁盘工作目录（/tmp 是 tmpfs，别用）。`judge-full.py` 双 judge 全量打分。
+全量结果表：`msp/ltp-full-official-scoring-table-2026-06-10-zh.md`
+（1028 个算分文件，musl 8594 / glibc 8574；146 个 fs 类需真 root loop
+设备才能测准）。2821 文件 12 路并行约 35 分钟。
