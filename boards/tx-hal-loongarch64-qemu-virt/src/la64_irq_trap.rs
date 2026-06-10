@@ -724,12 +724,59 @@ pub(crate) fn tx_la64_qemu_trap_panic(frame: &La64TrapFrame) -> ! {
     console_write_literal(b"txkernel:qemu-loongarch64-virt:trap\nreason=trap-action-terminate\n");
     console_write_trap_summary(frame);
     console_write_trapframe(frame);
+    // Kernel-mode traps (CRMD.PLV == 0) carry a usable kernel stack; scan it
+    // for return-address candidates so a wild-jump/corrupted-ra crash can be
+    // back-traced offline (objdump-resolve each printed addr). Userspace
+    // traps (PLV != 0) have a user stack here — skip.
+    if frame.crmd & 0x3 == 0 {
+        console_write_kernel_stack_scan(frame.r[3]);
+    }
 
     loop {
         unsafe {
             core::arch::asm!("idle 0", options(nomem, nostack));
         }
         core::hint::spin_loop();
+    }
+}
+
+/// Scan the kernel stack from `sp` upward for words that look like kernel
+/// `.text` return addresses and print them. Offline, objdump-resolving each
+/// gives the call chain that led to a wild jump / corrupted-ra crash.
+#[cfg(target_arch = "loongarch64")]
+pub(crate) fn console_write_kernel_stack_scan(sp: usize) {
+    // Kernel text bounds (see linker symbols __kernel_start / __text_end).
+    const TEXT_LO: usize = 0x9000_0000_0020_0000;
+    const TEXT_HI: usize = 0x9000_0000_0085_929c;
+    // sp must be a plausible kernel direct-map address; bail if obviously bad.
+    if sp < 0x9000_0000_0000_0000 || sp & 0x7 != 0 {
+        console_write_literal(b"kstack: <unusable sp>\n");
+        return;
+    }
+    console_write_literal(b"kstack-ra-candidates (sp=0x");
+    console_write_hex(sp);
+    console_write_literal(b"):\n");
+    // Walk up to 512 words (4 KiB) of stack.
+    let mut printed = 0usize;
+    for i in 0..512usize {
+        let addr = sp + i * 8;
+        // SAFETY: kernel direct-map read; sp validated above. A bad page
+        // would re-trap, but kernel stacks are mapped for this depth.
+        let word = unsafe { core::ptr::read_volatile(addr as *const usize) };
+        if (TEXT_LO..TEXT_HI).contains(&word) {
+            console_write_literal(b"  +0x");
+            console_write_hex(i * 8);
+            console_write_literal(b": 0x");
+            console_write_hex(word);
+            console_write_literal(b"\n");
+            printed += 1;
+            if printed >= 40 {
+                break;
+            }
+        }
+    }
+    if printed == 0 {
+        console_write_literal(b"  <none>\n");
     }
 }
 

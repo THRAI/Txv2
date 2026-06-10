@@ -9,6 +9,17 @@ linker = "rust-lld"
 
 [target.loongarch64-unknown-none-softfloat]
 linker = "rust-lld"
+# la64 debug-codegen workaround (per-target so rv is untouched). The
+# LoongArch backend miscompiles `core::sync::atomic`'s out-of-line
+# compare_exchange dispatcher in unoptimized builds: its
+# success/failure-ordering `match` panic arm jumps to the panic-string
+# `&str` descriptor in `.rodata` (or a stale stack addr) instead of calling
+# panic, faulting INE — a kernel-mode wild jump that broke the entire
+# la.glibc lane (every page-backed/ext4/zone atomic path glibc exercises).
+# opt-level=2 inlines compare_exchange so the const orderings fold and the
+# broken dispatcher is never emitted. Scoped to la64 targets only.
+rustflags = ["-Copt-level=1"]
 
 [target.loongarch64-unknown-none]
 linker = "rust-lld"
+rustflags = ["-Copt-level=1"]
