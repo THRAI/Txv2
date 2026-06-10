@@ -153,77 +153,61 @@ impl BlockImage for BlockDeviceImage {
     }
 }
 
-const READ_BLOCK_CACHE_ENTRIES: usize = 128;
+// 4096 × 4 KiB = 16 MiB. 128 entries (512 KiB) thrashed on every exec: the
+// sdcard busybox alone is ~1.4 MiB (~350 ext4 blocks), so each shell command
+// re-read most of the binary through virtio (~5-10 ms/block under TCG ≈
+// seconds per command) — the dominant cost of every LTP shell test. The hot
+// set (busybox + ash scripts + libc + common test binaries) fits in a few MiB.
+const READ_BLOCK_CACHE_ENTRIES: usize = 4096;
 
 struct ReadBlockCache {
     clock: u64,
-    entries: Vec<ReadBlockCacheEntry>,
+    // block -> (last_used, data). O(log n) lookup; the previous Vec scan was
+    // O(entries) per get and at 4096 entries × ~350 block reads per exec the
+    // index walk itself dominated (every shell command pays one exec).
+    entries: alloc::collections::BTreeMap<u64, (u64, Arc<Page4K>)>,
+    // last_used -> block mirror for O(log n) LRU eviction. last_used values
+    // are unique (clock strictly increases on every touch).
+    lru: alloc::collections::BTreeMap<u64, u64>,
 }
 
 impl ReadBlockCache {
     fn new() -> Self {
         Self {
             clock: 0,
-            entries: Vec::with_capacity(READ_BLOCK_CACHE_ENTRIES),
+            entries: alloc::collections::BTreeMap::new(),
+            lru: alloc::collections::BTreeMap::new(),
         }
     }
 
     fn get(&mut self, block: u64) -> Option<Arc<Page4K>> {
-        let Some(index) = self
-            .entries
-            .iter()
-            .position(|entry| entry.valid && entry.block == block)
-        else {
-            return None;
-        };
         self.clock = self.clock.wrapping_add(1);
-        let entry = &mut self.entries[index];
-        entry.last_used = self.clock;
-        Some(entry.data.clone())
+        let clock = self.clock;
+        let (last_used, data) = self.entries.get_mut(&block)?;
+        self.lru.remove(last_used);
+        *last_used = clock;
+        self.lru.insert(clock, block);
+        Some(data.clone())
     }
 
     fn insert(&mut self, block: u64, data: Arc<Page4K>) {
         self.clock = self.clock.wrapping_add(1);
-        let victim = self
-            .entries
-            .iter()
-            .position(|entry| !entry.valid || entry.block == block)
-            .unwrap_or_else(|| {
-                if self.entries.len() < READ_BLOCK_CACHE_ENTRIES {
-                    self.entries.push(ReadBlockCacheEntry::empty());
-                    self.entries.len() - 1
-                } else {
-                    self.entries
-                        .iter()
-                        .enumerate()
-                        .min_by_key(|(_, entry)| entry.last_used)
-                        .map(|(index, _)| index)
-                        .unwrap_or(0)
-                }
-            });
-        let entry = &mut self.entries[victim];
-        entry.valid = true;
-        entry.block = block;
-        entry.last_used = self.clock;
-        entry.data = data;
-    }
-}
-
-struct ReadBlockCacheEntry {
-    valid: bool,
-    block: u64,
-    last_used: u64,
-    data: Arc<Page4K>,
-}
-
-impl ReadBlockCacheEntry {
-    fn empty() -> Self {
-        Self {
-            valid: false,
-            block: 0,
-            last_used: 0,
-            data: Arc::new([0; BLOCK_SIZE]),
+        let clock = self.clock;
+        if let Some((last_used, slot)) = self.entries.get_mut(&block) {
+            self.lru.remove(last_used);
+            *last_used = clock;
+            *slot = data;
+            self.lru.insert(clock, block);
+            return;
         }
+        if self.entries.len() >= READ_BLOCK_CACHE_ENTRIES {
+            if let Some((&oldest, &victim_block)) = self.lru.iter().next() {
+                self.lru.remove(&oldest);
+                self.entries.remove(&victim_block);
+            }
+        }
+        self.entries.insert(block, (clock, data));
+        self.lru.insert(clock, block);
     }
 }
 
