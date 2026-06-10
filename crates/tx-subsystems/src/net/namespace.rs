@@ -759,6 +759,56 @@ impl NetNamespacePayload {
             });
         }
 
+        // Secondary addresses contribute connected routes too (Linux: every
+        // `ip addr add` installs one; only the first address per subnet/oif
+        // keeps it). Without this, source selection for a peer reached via a
+        // secondary's subnet finds no route — `ping 10.0.0.1` after
+        // `ip addr add 10.0.0.2/24 dev eth0` on the boot NIC got EOPNOTSUPP
+        // (LTP ping01 netns flow).
+        let links = self.link_snapshot();
+        for extra in self.ipv4_extra_snapshot() {
+            let Some(link) = links.iter().find(|link| link.ifindex == extra.ifindex) else {
+                continue;
+            };
+            if link.is_loopback {
+                continue;
+            }
+            let prefix_len = extra.prefix_len.min(32);
+            let key = NetNamespaceConnectedRouteKey {
+                dst: ipv4_network(extra.addr, prefix_len),
+                prefix_len,
+                oif_name: link.name,
+                table: 254,
+            };
+            if suppressed_connected_routes
+                .iter()
+                .any(|suppressed| *suppressed == key)
+            {
+                continue;
+            }
+            let duplicate = routes.iter().any(|route| {
+                route.kind == NetNamespaceRouteKind::Connected
+                    && route.dst == key.dst
+                    && route.prefix_len == prefix_len
+                    && route.oif_name == Some(link.name)
+            });
+            if duplicate {
+                continue;
+            }
+            routes.push(NetNamespaceRouteInfo {
+                kind: NetNamespaceRouteKind::Connected,
+                dst: key.dst,
+                prefix_len,
+                gateway: None,
+                oif_name: Some(link.name),
+                preferred_src: Some(extra.addr),
+                table: 254,
+                protocol: 2,
+                scope: 253,
+                route_type: 1,
+            });
+        }
+
         routes.extend(
             self.routes
                 .lock()
