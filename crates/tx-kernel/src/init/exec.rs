@@ -1338,6 +1338,11 @@ const LTP_TRACE_CASE_PATH: &str =
 struct LtpArgs<'a> {
     max_runtime: Option<&'a str>,
     max_runtime_cases: Option<&'a str>,
+    /// `tx.ltp.timeout_mul=N` → export `LTP_TIMEOUT_MUL=N` to every case.
+    /// The shell-lib tests (tst_net stress family) don't accept `-I`
+    /// (max_runtime is a C-test option; passing it exits 2 with usage) —
+    /// LTP's own slow-machine guidance is this multiplier env.
+    timeout_mul: Option<&'a str>,
     trace_runtime: bool,
 }
 
@@ -1346,6 +1351,7 @@ impl<'a> LtpArgs<'a> {
         Self {
             max_runtime: None,
             max_runtime_cases: None,
+            timeout_mul: None,
             trace_runtime: false,
         }
     }
@@ -1354,6 +1360,7 @@ impl<'a> LtpArgs<'a> {
         Self {
             max_runtime: Some(max_runtime),
             max_runtime_cases: None,
+            timeout_mul: None,
             trace_runtime: false,
         }
     }
@@ -1362,8 +1369,22 @@ impl<'a> LtpArgs<'a> {
         Self {
             max_runtime: Some(max_runtime),
             max_runtime_cases: Some(cases),
+            timeout_mul: None,
             trace_runtime: false,
         }
+    }
+
+    fn shell_timeout_mul_assignment(&self) -> alloc::string::String {
+        use alloc::string::String;
+        use core::fmt::Write as _;
+        let mut assignment = String::new();
+        if let Some(value) = self.timeout_mul.filter(|value| is_positive_int_token(value)) {
+            let _ = write!(
+                assignment,
+                "LTP_TIMEOUT_MUL='{value}'; export LTP_TIMEOUT_MUL; "
+            );
+        }
+        assignment
     }
 
     fn shell_max_runtime_assignment(&self, case_var: &str) -> alloc::string::String {
@@ -1421,12 +1442,14 @@ fn ltp_args_from_cmdline<P: tx_hal::TxPlatform>() -> LtpArgs<'static> {
     let max_runtime = cmdline_value::<P>("tx.ltp.max_runtime").filter(|v| is_positive_int_token(v));
     let max_runtime_cases = cmdline_value::<P>("tx.ltp.max_runtime_cases");
     let trace_runtime = cmdline_bool::<P>("tx.ltp.trace_runtime");
+    let timeout_mul = cmdline_value::<P>("tx.ltp.timeout_mul").filter(|v| is_positive_int_token(v));
     let mut args = match (max_runtime, max_runtime_cases) {
         (Some(max_runtime), Some(cases)) => LtpArgs::max_runtime_for_cases(max_runtime, cases),
         (Some(max_runtime), None) => LtpArgs::max_runtime(max_runtime),
         _ => LtpArgs::none(),
     };
     args.trace_runtime = trace_runtime;
+    args.timeout_mul = timeout_mul;
     args
 }
 
@@ -1558,10 +1581,11 @@ fn append_ltp_runtest(
     let skip_pattern = LOCAL_LTP_SKIP_SHELL_PATTERN;
     let runtime_assignment = args.shell_max_runtime_assignment("tag");
     let trace_assignment = args.shell_trace_runtime_assignment();
+    let timeout_mul_assignment = args.shell_timeout_mul_assignment();
     let ltp_case_path = args.ltp_case_path();
     let _ = write!(
         cmd,
-        "; selected_tags='{selected_tags}'; {trace_assignment} if [ -f ltp/runtest/{module} ]; then while read tag rest; do case \"$tag\" in ''|\\#*) continue;; esac; if [ -n \"$selected_tags\" ]; then case \"$selected_tags\" in *\"|$tag|\"*) ;; *) continue;; esac; fi; case \"$tag\" in {skip_pattern}) ./busybox echo \"SKIP LTP CASE $tag : local skip\"; continue;; esac; cmdline=${{rest:-$tag}}; {runtime_assignment} if [ -n \"$ltp_max_runtime\" ]; then cmdline=\"$cmdline -I $ltp_max_runtime\"; fi; ./busybox echo \"RUN LTP CASE $tag : $cmdline\"; if [ -n \"$tx_ltp_trace_runtime\" ]; then ./busybox echo \"TX-LTP-RUNTIME begin $tag $(./busybox date +%s 2>/dev/null)\"; PS4=\"TX-LTP-CMD:$tag: \" PATH={ltp_case_path} LTPROOT=/musl/musl/ltp KCONFIG_PATH=/proc/config ./busybox setsid ./busybox sh -x -c \"$cmdline\"; ret=$?; ./busybox echo \"TX-LTP-RUNTIME end $tag $ret $(./busybox date +%s 2>/dev/null)\"; else PATH={ltp_case_path} LTPROOT=/musl/musl/ltp KCONFIG_PATH=/proc/config ./busybox setsid ./busybox sh -c \"$cmdline\"; ret=$?; fi; if [ $ret = 0 ]; then ./busybox echo \"PASS LTP CASE $tag : $ret\"; fi; ./busybox echo \"FAIL LTP CASE $tag : $ret\"; done < ltp/runtest/{module}; else ./busybox echo \"FAIL LTP RUNTEST {module} : missing runtest file\"; fi"
+        "; selected_tags='{selected_tags}'; {trace_assignment} {timeout_mul_assignment}if [ -f ltp/runtest/{module} ]; then while read tag rest; do case \"$tag\" in ''|\\#*) continue;; esac; if [ -n \"$selected_tags\" ]; then case \"$selected_tags\" in *\"|$tag|\"*) ;; *) continue;; esac; fi; case \"$tag\" in {skip_pattern}) ./busybox echo \"SKIP LTP CASE $tag : local skip\"; continue;; esac; cmdline=${{rest:-$tag}}; {runtime_assignment} if [ -n \"$ltp_max_runtime\" ]; then cmdline=\"$cmdline -I $ltp_max_runtime\"; fi; ./busybox echo \"RUN LTP CASE $tag : $cmdline\"; if [ -n \"$tx_ltp_trace_runtime\" ]; then ./busybox echo \"TX-LTP-RUNTIME begin $tag $(./busybox date +%s 2>/dev/null)\"; PS4=\"TX-LTP-CMD:$tag: \" PATH={ltp_case_path} LTPROOT=/musl/musl/ltp KCONFIG_PATH=/proc/config ./busybox setsid ./busybox sh -x -c \"$cmdline\"; ret=$?; ./busybox echo \"TX-LTP-RUNTIME end $tag $ret $(./busybox date +%s 2>/dev/null)\"; else PATH={ltp_case_path} LTPROOT=/musl/musl/ltp KCONFIG_PATH=/proc/config ./busybox setsid ./busybox sh -c \"$cmdline\"; ret=$?; fi; if [ $ret = 0 ]; then ./busybox echo \"PASS LTP CASE $tag : $ret\"; fi; ./busybox echo \"FAIL LTP CASE $tag : $ret\"; done < ltp/runtest/{module}; else ./busybox echo \"FAIL LTP RUNTEST {module} : missing runtest file\"; fi"
     );
     let _ = write!(
         cmd,
