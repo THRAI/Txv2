@@ -425,6 +425,31 @@ nobody:x:65534:65534:nobody:/nonexistent:/bin/sh\n";
             }
         };
 
+        // la64: the judged image's busybox has only 73 applets and no awk;
+        // the LTP shell library hard-depends on awk (timeout multiply,
+        // tst_net parsing), so every shell test died at
+        // "TWARN: timeout need to be >= 1" + instant watchdog kill. Ship a
+        // Txv2-built full-applet static busybox; the walk env's /bin
+        // install prefers it (see append_busybox_bin_install).
+        #[cfg(target_arch = "loongarch64")]
+        {
+            static LA_BUSYBOX_FULL: &[u8] = include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tools/images/vendor/busybox-loongarch64-musl"
+            ));
+            if !create_file_with_data(
+                &create_ctx,
+                tx_ltp_id,
+                b"busybox-full",
+                0o755,
+                LA_BUSYBOX_FULL,
+            ) {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":network-db:err:create-busybox-full\n");
+                return;
+            }
+        }
+
         for name in [
             b"arp".as_slice(),
             b"cat".as_slice(),

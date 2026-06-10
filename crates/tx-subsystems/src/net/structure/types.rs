@@ -130,7 +130,10 @@ impl SocketKind {
             (AddressFamily::Inet6, SocketType::Stream, 132) => Ok(Self::Sctp),
             (AddressFamily::Inet6, SocketType::SeqPacket, 132) => Ok(Self::Sctp),
             (AddressFamily::Inet6, SocketType::Dgram, 0 | 17 | 136) => Ok(Self::Udp),
-            (AddressFamily::Inet6, SocketType::Raw, 58 | 159) => Ok(Self::RawIcmp),
+            // 255 = IPPROTO_RAW (header-included injector; LTP
+            // sctp_big_chunk forges an SCTP INIT through it — the send
+            // path accepts and delivers to raw listeners only).
+            (AddressFamily::Inet6, SocketType::Raw, 58 | 159 | 255) => Ok(Self::RawIcmp),
             (AddressFamily::Inet6, _, _) => Err(Errno::EPROTONOSUPPORT),
             (AddressFamily::Netlink, SocketType::Raw | SocketType::Dgram, 0) => {
                 Ok(Self::NetlinkRoute)

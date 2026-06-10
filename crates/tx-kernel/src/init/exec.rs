@@ -1549,9 +1549,12 @@ fn is_native_network_runtest(module: &str) -> bool {
 fn append_busybox_bin_install(cmd: &mut alloc::string::String) {
     use core::fmt::Write as _;
 
+    // /tx-ltp/busybox-full is the kernel-embedded full-applet busybox
+    // (la64 only — the la image's busybox has no awk, which the LTP shell
+    // library needs). Prefer it; fall back to the image's busybox.
     let _ = write!(
         cmd,
-        "; /musl/musl/busybox mkdir -p /bin; if [ ! -f /tmp/tx-busybox-copied ]; then /musl/musl/busybox rm -f /tmp/tx-busybox-stage; if /musl/musl/busybox cp /musl/musl/busybox /tmp/tx-busybox-stage; then /musl/musl/busybox chmod 755 /tmp/tx-busybox-stage; /musl/musl/busybox rm -f /bin/busybox /bin/sh /bin/cat /bin/true /bin/ls /bin/basename /bin/ip /bin/ifconfig /bin/grep /bin/seq /bin/ping /bin/arp; /musl/musl/busybox mv /tmp/tx-busybox-stage /bin/busybox; /bin/busybox --install -s /bin; /bin/busybox touch /tmp/tx-busybox-copied; fi; fi"
+        "; /musl/musl/busybox mkdir -p /bin; if [ ! -f /tmp/tx-busybox-copied ]; then /musl/musl/busybox rm -f /tmp/tx-busybox-stage; tx_bb_src=/musl/musl/busybox; [ -x /tx-ltp/busybox-full ] && tx_bb_src=/tx-ltp/busybox-full; if /musl/musl/busybox cp \"$tx_bb_src\" /tmp/tx-busybox-stage; then /musl/musl/busybox chmod 755 /tmp/tx-busybox-stage; /musl/musl/busybox rm -f /bin/busybox /bin/sh /bin/cat /bin/true /bin/ls /bin/basename /bin/ip /bin/ifconfig /bin/grep /bin/seq /bin/ping /bin/arp; /musl/musl/busybox mv /tmp/tx-busybox-stage /bin/busybox; /bin/busybox --install -s /bin; /bin/busybox touch /tmp/tx-busybox-copied; fi; fi"
     );
 }
 

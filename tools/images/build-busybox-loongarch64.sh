@@ -122,8 +122,51 @@ main() {
   src="$(resolve_source)"
   mkdir -p "$VENDOR_DIR"
 
-  log "building minimal static busybox from $src"
+  # BUSYBOX_PROFILE=minimal restores the original tiny applet set; the
+  # default "full" profile exists because the judged la64 sdcard's own
+  # busybox has only 73 applets and no awk — the LTP shell library
+  # (timeout multiply, tst_net parsing) hard-depends on awk, sed, etc.
+  # The kernel embeds this binary and installs it as /bin/busybox for
+  # the LTP walk (see init/rootfs_shims.rs + append_busybox_bin_install).
+  BUSYBOX_PROFILE="${BUSYBOX_PROFILE:-full}"
+
+  log "building $BUSYBOX_PROFILE static busybox from $src"
   make -C "$src" ARCH=loongarch CROSS_COMPILE="$CROSS_COMPILE" distclean
+  if [ "$BUSYBOX_PROFILE" = full ]; then
+    make -C "$src" ARCH=loongarch CROSS_COMPILE="$CROSS_COMPILE" defconfig
+    set_config "$src/.config" CONFIG_STATIC y
+    set_config "$src/.config" CONFIG_STATIC_LIBGCC y
+    set_config "$src/.config" CONFIG_BUSYBOX_EXEC_PATH '"/bin/busybox"'
+    unset_config "$src/.config" CONFIG_BUILD_LIBBUSYBOX
+    # tc's CBQ support doesn't build against modern kernel headers.
+    unset_config "$src/.config" CONFIG_TC
+    set +o pipefail
+    yes '' | make -C "$src" ARCH=loongarch CROSS_COMPILE="$CROSS_COMPILE" oldconfig
+    oldconfig_status="${PIPESTATUS[1]}"
+    set -o pipefail
+    if [ "$oldconfig_status" -ne 0 ]; then
+      exit "$oldconfig_status"
+    fi
+    make -C "$src" ARCH=loongarch CROSS_COMPILE="$CROSS_COMPILE" SKIP_STRIP=y -j"$JOBS" busybox
+
+    install -m 0755 "$src/busybox" "$OUT"
+
+    local file_out
+    file_out="$(file -b "$OUT")"
+    case "$file_out" in
+      *"ELF 64-bit"*"LoongArch"*"statically linked"*) ;;
+      *)
+        log "unexpected output binary: $file_out"
+        exit 1
+        ;;
+    esac
+
+    printf '%s  %s\n' "$(sha256_of "$OUT")" "$(basename "$OUT")" > "$SHA_FILE"
+    write_source "$src"
+    log "wrote $OUT"
+    log "file: $file_out"
+    return
+  fi
   make -C "$src" ARCH=loongarch CROSS_COMPILE="$CROSS_COMPILE" allnoconfig
 
   set_config "$src/.config" CONFIG_SHOW_USAGE y

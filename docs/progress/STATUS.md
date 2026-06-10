@@ -1,3 +1,35 @@
+- 2026-06-11 (net progress-table campaign, tier-1 sweep) **Official-walk witness harness built;
+  tier-1 quick wins largely banked on rv.musl/rv.glibc/la.musl; four kernel bugs found, three
+  fixed.** New boot selector `ltp-bin:<lane>:<file>+...` runs listed `ltp/testcases/bin` files
+  exactly the official `ltp_testcode.sh` shape (no args, RUN/FAIL markers, lane GROUP block) so
+  serial logs feed the real `judge_ltp-{musl,glibc}.py` unchanged; `tools/ltp-bin-witness.sh`
+  boots all four lanes in parallel (per-lane image copies, grep-gated early exit; **la64 cmdline
+  must use `-append`** — the fw_cfg path is dead behind the EFI/DTB early-return). The judged
+  boot's `ltp_testcode.sh` now runs under `append_ltp_walk_env` (busybox `/bin` install,
+  lane-rooted LTPROOT/PATH, LHOST_IFACES=eth0, LTP_TIMEOUT_MUL=10) — without PATH every shell
+  test is a structural 0 in the judged run. Kernel fixes: (1) boot NIC renamed
+  `virtio-net0`→`eth0` (netlink/ioctl/libc name split broke in6_02 subtest 3: glibc
+  TFAIL+SIGSEGV, musl hang); (2) **vdso embedded RISC-V machine code on la64**
+  (`tx-vdso/build.rs` ignored target arch; glibc jumped into wrong-ISA bytes → FPD trap; non-rv64
+  now gets the stub, 640a9fee); (3) **secondary IPv4 addrs now contribute connected routes**
+  (`route_snapshot` only used primaries; LTP's `ip addr add 10.0.0.2/24` landed as secondary on
+  the boot NIC → source selection for the netns peer failed → raw-ICMP sendto EOPNOTSUPP; fixed
+  5d1f181b, unlocked ping01/ping02 10+10 and traceroute01 2→5). Witnessed per-file (real
+  judges), rv.musl=rv.glibc unless noted: getaddrinfo_01 22, asapi_02 12, in6_01 5, in6_02 3,
+  ping01 10, ping02 10, ip_tests 6 (>host 5), traceroute01 5 (>host 3), tracepath01 1,
+  netstat01 5 (>host 1), nft01 5 (>host 2), iptables01 6 (>host 3), accept02 1,
+  test_1_to_1_initmsg_connect 2; la.musl matches on the C tests it ran (quad 42 + initmsg 2).
+  **Open**: (a) la.glibc lane wedges at first glibc exec — kernel-mode wild jump into rodata
+  (FPD, era in fmt-vtable neighborhood), pre-existing (la libctest clock crash shares the
+  signature), blocks ALL la.glibc LTP witnessing; (b) la image busybox has 73 applets and NO awk
+  → every la shell test dies at "timeout need to be >= 1" — built a full-applet static la64
+  busybox (390 applets, `tools/images/build-busybox-loongarch64.sh` BUSYBOX_PROFILE=full,
+  vendored) and embedded it in the la kernel (`/tx-ltp/busybox-full`, walk env prefers it) —
+  witness pending; (c) sendfile01 TBROK (`ss -ltp` can't see the netns testsf listener);
+  (d) route-change-netlink trio TCONFs silently after setup; (e) nft02 TCONF "unavailable
+  netfilter features"; (f) sctp_big_chunk needed AF_INET6/SOCK_RAW/IPPROTO_RAW — creation arm
+  added, witness pending. Score table updated per-row: `msp/ltp-net-progress-table-2026-06-10-zh.md`.
+
 - 2026-06-11 (root rerun + HOST CRASH incident) **The root re-measurement froze the host (black
   screen + reboot); root cause `pty03`.** With user-granted sudo, re-ran the 375 sandbox-blocked
   files as real root; at 287/375 the host kernel (6.14) hung. Culprit: `pty03` — mkiss/N_AX25 tty
