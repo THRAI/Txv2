@@ -1,3 +1,21 @@
+- 2026-06-11 (root rerun + HOST CRASH incident) **The root re-measurement froze the host (black
+  screen + reboot); root cause `pty03`.** With user-granted sudo, re-ran the 375 sandbox-blocked
+  files as real root; at 287/375 the host kernel (6.14) hung. Culprit: `pty03` — mkiss/N_AX25 tty
+  line-discipline race via tst_fuzzy_sync, flooded dmesg with `mkiss: ax0: crc mode is auto` then
+  livelocked. **Key lesson: tty line disciplines are NOT namespaced** — netns/pidns/mountns do not
+  contain them, and real root supplies CAP_NET_ADMIN which unlocks N_AX25 (non-root runs got EPERM,
+  which is why the earlier two sweeps were safe). Permanently deny-listed the ldisc-race family
+  `pty03/pty04/pty06/pty07` (guard added to `run-one-root.sh`). No data loss (everything under
+  `target/` survived; only ephemeral `/tmp` build wiped). The 287 completed root results were
+  salvaged and merged, EXCEPT 11 runaway time-dependent counters (cgroup_core01/02/03, clone303,
+  cpuset01, ksm04, oom05, memcontrol02/03/04, madvise06 — loop and emit thousands of Summary
+  blocks; score is machine-speed noise, e.g. memcontrol04 logged 16458 Summary blocks = 164580
+  "passed"). Full table now v3: **1234 scoring files, musl 13826 / glibc 13798** (big legit gains:
+  fanotify10=1047, fanotify16=845, fanotify01=494, df01.sh=84, mount/fs*/quotactl/pkey families).
+  13 host-global-state tests (clock/swap/module) still never measured. The NET progress table is
+  UNAFFECTED (net targets measured non-root, stable). Tools: `tools/ltp-host-ceiling/` (merge-root.py
+  has the runaway>5-Summary-block guard; run-one-root.sh has the ldisc deny-list).
+
 - 2026-06-10 (FULL-image scoring table) **Swept ALL 2822 files in the judged image's bin/ on host
   Linux the official way (no-args, colored, real judges both lanes).** 1028 files can score;
   **musl judge total 8594, glibc 8574** (7 files differ — exec/timing color loss). 28 files hit
