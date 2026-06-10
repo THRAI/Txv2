@@ -1,3 +1,38 @@
+- 2026-06-10 (later) **net_stress.interface: 6 cases newly green (addr-change, addr-adddel_ip/_ifconfig, route-adddel_ip/_route, updown-mechanics) — and the "TCG wall" myth fell: the hangs were the page allocator.**
+  Three infra root causes, all witnessed on rv64-musl:
+  1. **Page allocator contiguous-path O(total) rescan** (separate commit, `tx-substrate`):
+     `reserve_contiguous_ppns` had no scan hint — first-fit from base every call, while the ext4
+     bridge does `reserve_run(1,1)` per block read. Once a fork-heavy boot fills low memory,
+     each scan walks ~256K frame metas under TCG (seconds); exec'ing a 1.4MB binary ≈ 350 blocks
+     → the minutes-long "freezes" previously blamed on TCG. QEMU-monitor PC sampling (8/8 in the
+     scan loop) pinned it. Fix: next-fit hint shared with the single-frame path + whole-word
+     bitmap fast-skip + two-leg wraparound. **Bimodal ping solved by the same fix**: rounds went
+     48ms(fast)/0.96s(slow) → **17.9ms** (itmrdbg probe, 631 rounds; fire lateness avg 0.43ms).
+  2. **Blocking socket waits ignored pending signals**: a one-shot ITIMER_REAL consumed at a
+     syscall boundary left ping's recvfrom parked with a pending SIGALRM and no deadline (361.8s
+     stall probed in if-updown). New `signal::pending_signal_interrupts_wait` consulted at
+     `wait_on_socket_or_itimer` entry — **disposition-aware** (Handler or default-Term/Core
+     only; the naive deliverable-bit version spun ping on ignored SIGCHLD and was reverted).
+  3. **LTP timeout reaper could never kill hung tests**: `kill(-pgid)` ESRCH because tests
+     weren't group leaders (our runner used bare `sh -c`; ltp-pan setpgids on Linux). Runner now
+     wraps cases in `busybox setsid` (execs in place for non-leaders, exit code preserved) —
+     timeouts now SIGTERM→SIGKILL→`FAIL : 137`→next case instead of wedging the boot.
+  Feature gaps closed for the lane: **secondary IPv4/IPv6 addresses** (extras store in
+  `NetNamespacePayload` + add/del APIs; rtnetlink NEWADDR is now additive, DELADDR removes
+  secondaries, GETADDR dumps them with IFA_LABEL/IFA_F_SECONDARY; `eth0:1` alias parsing in the
+  SIOC ioctls incl. alias-down deletes the labeled addr; loopback DELADDR reverts the override)
+  and **SIOCADDRT/SIOCDELRT** (`struct rtentry` LP64 → add/delete_ipv4_route, table=main,
+  proto=boot). Unit tests: secondary add/del keeps primary; page_allocator 21/21, slab 5/5.
+  **Witnessed green:** if4-addr-change_ifconfig, if4-addr-adddel_ip, if4-addr-adddel_ifconfig,
+  if4-route-adddel_ip, if4-route-adddel_route (judge PASS lines in
+  `target/oscomp/stress_{adddel_v2,route_v4}.txt`). if4-updown mechanics verified (8/20
+  connectivity checks TPASS before runner cutoff; full pass needs a ~1500s single-case boot —
+  check cycle ≈77s is fork-chain-bound, logged in the 2026-06-10 msp ledger).
+  **Parked (documented in ledger):** mtu-change×4 (200K pings/case under TCG),
+  if6 `ifconfig`-addr variants (in6_ifreq needs per-family ioctl routing), if6 route `_route`
+  variants (no v6 route table model). **Next:** addlarge×2 + route-addlarge×2 + if6 `_ip` lane
+  witnesses in flight; updown×2 full-length boots; then net_stress.broken_ip / multicast.
+
 - 2026-06-10 **netperf + iperf now pass all FOUR judged combos — rv64/la64 × musl/glibc — 22/22 subtests per arch (44 bench points, was 11 on rv-musl only).**
   Commit `87ae1d21` on `feature-network-next`. The glibc lane had been dropped wholesale by the
   main rebase (no `*-glibc` group selectors, no `LD_LIBRARY_PATH`), and behind it sat four kernel
