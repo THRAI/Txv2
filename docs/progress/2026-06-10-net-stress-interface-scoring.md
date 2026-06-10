@@ -39,6 +39,23 @@ bin/ 里这些脚本文件的无参默认形态(CMD=ip、IPv4)计分**;runtest �
 4. fork/exec 基础成本(ipneigh 台账测过 ~20-25ms/链,与现状差 1-2 个量级,
    提示 1/2 类结构性开销而非纯 TCG)。
 
+## 砍成本战役结果(同日 17:00-19:00 追记)
+
+检查周期 **77s → 22s(3.5×)**,三件全局性修复落地(也惠及官方 2824-case
+遍历的所有 shell 测试):
+1. ext4 读块缓存 128→4096 项 + O(log n) 索引(`d796fcb7`)——每条 shell
+   命令的 exec 曾重读 busybox ~350 块。
+2. ext4 negative lookup 缓存(`3a9a4e76`)——PATH 搜索对 2824 项 bin 目录
+   的 ENOENT 全扫,fstatat 48→8.9ms。
+3. rv64 satp 同空间快路径 + 撤销每次入用户态的全量 sfence.vma
+   (`9fb0d6d1`)——TCG 下原为每 syscall 一次全 TLB flush。
+
+`if4-updown_ip` 在 `tx.ltp.timeout_mul=5` 下**完整 PASS(20/20 连通性
+检查)**,全程 ~510s——功能闭环,距官方 300s 限时仍差 ~1.7×。剩余票
+(台账有测量明细):每命令全程 ~300-400ms 的 fork/调度交接/ash-TCG 链、
+ping 轮均 24ms(地板 10ms)。addlarge_ip(~680s 当量,修后预估 ~400s)
+与 route-addlarge_ip 同受益但同样未过线;mtu-change 维持 PARK。
+
 ## 验收口径
 
 - 攻坚见证统一跑 **`_ip` 变体**(与官方无参形态同代码路径),普通
