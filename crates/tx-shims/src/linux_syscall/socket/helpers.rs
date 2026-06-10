@@ -1662,8 +1662,18 @@ pub(super) enum SocketWaitWake {
 
 pub(super) async fn wait_on_socket_or_itimer<P: TimeIf>(
     mut socket_future: wait_source::RegisteredWaitFuture,
-    pid: u32,
+    ctx: &SyscallCtx<'_>,
 ) -> SocketWaitWake {
+    let pid = ctx.process.pid.0;
+    // Linux never parks a task in a slow syscall while a signal that would be
+    // delivered is already pending — the syscall aborts with EINTR and the AST
+    // checkpoint delivers on return. Without this, a one-shot ITIMER_REAL
+    // consumed at a syscall boundary leaves busybox ping's blocking recvfrom
+    // with no armed deadline AND a pending SIGALRM: it parked until unrelated
+    // traffic woke the socket (observed as a 361s stall in if-updown).
+    if tx_subsystems::signal::pending_signal_interrupts_wait(&ctx.thread, &ctx.process) {
+        return SocketWaitWake::ItimerExpired;
+    }
     if super::time::consume_itimer_real_delivered_interrupt(pid) {
         return SocketWaitWake::ItimerExpired;
     }

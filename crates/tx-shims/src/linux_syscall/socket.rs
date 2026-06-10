@@ -390,7 +390,7 @@ async fn accept_impl<'a, P: TimeIf>(
                 }
                 if let Some(future) = wait_on_yield_shape(shape) {
                     if matches!(
-                        wait_on_socket_or_itimer::<P>(future, ctx.process.pid.0).await,
+                        wait_on_socket_or_itimer::<P>(future, ctx).await,
                         SocketWaitWake::ItimerExpired
                     ) {
                         return SyscallResult::Error(EINTR_VALUE);
@@ -1094,7 +1094,7 @@ async fn recvfrom_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
                     return SyscallResult::Error(EIO_VALUE);
                 };
                 if matches!(
-                    wait_on_socket_or_itimer::<P>(future, ctx.process.pid.0).await,
+                    wait_on_socket_or_itimer::<P>(future, ctx).await,
                     SocketWaitWake::ItimerExpired
                 ) {
                     if recv_queued_len(&socket) > 0 {
@@ -1158,7 +1158,7 @@ async fn recvfrom_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
                 }
                 if let Some(future) = wait_on_yield_shape(shape) {
                     if matches!(
-                        wait_on_socket_or_itimer::<P>(future, ctx.process.pid.0).await,
+                        wait_on_socket_or_itimer::<P>(future, ctx).await,
                         SocketWaitWake::ItimerExpired
                     ) {
                         if recv_queued_len(&socket) > 0 {
@@ -1991,7 +1991,7 @@ async fn recvmsg_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
                 }
                 if let Some(future) = wait_on_yield_shape(shape) {
                     if matches!(
-                        wait_on_socket_or_itimer::<P>(future, ctx.process.pid.0).await,
+                        wait_on_socket_or_itimer::<P>(future, ctx).await,
                         SocketWaitWake::ItimerExpired
                     ) {
                         if recv_queued_len(&socket) > 0 {
@@ -3790,6 +3790,167 @@ fn ipv4_classful_prefix(addr: [u8; 4]) -> u8 {
     }
 }
 
+/// `SIOCADDRT`/`SIOCDELRT` — route(8)'s `struct rtentry` route add/delete
+/// (LTP net_stress.interface `if4-route-adddel_route` drives these). LP64
+/// layout: rt_pad1@0, rt_dst@8, rt_gateway@24, rt_genmask@40 (16-byte
+/// `struct sockaddr` images), rt_flags@56 (u16), rt_dev@88 (user char*).
+fn socket_route_ioctl(request: u32, argp: u64, ctx: &SyscallCtx<'_>) -> SyscallResult {
+    const RTENTRY_BYTES: usize = 120;
+    const RT_DST_OFFSET: usize = 8;
+    const RT_GATEWAY_OFFSET: usize = 24;
+    const RT_GENMASK_OFFSET: usize = 40;
+    const RT_FLAGS_OFFSET: usize = 56;
+    const RT_DEV_OFFSET: usize = 88;
+    const RTF_GATEWAY: u16 = 0x0002;
+    const RTF_HOST: u16 = 0x0004;
+    const AF_INET_U16: u16 = 2;
+    const AF_UNSPEC_U16: u16 = 0;
+    // Linux fib conventions for ioctl-added routes: main table, proto boot,
+    // link scope without a gateway / universe with one, unicast type.
+    const RT_TABLE_MAIN: u8 = 254;
+    const RTPROT_BOOT: u8 = 3;
+    const RT_SCOPE_UNIVERSE: u8 = 0;
+    const RT_SCOPE_LINK: u8 = 253;
+    const RTN_UNICAST: u8 = 1;
+
+    let Some(netns) = ctx.process.net_namespace() else {
+        return SyscallResult::Error(ESRCH_VALUE);
+    };
+    let mut rtentry = [0u8; RTENTRY_BYTES];
+    if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut rtentry, argp) {
+        return SyscallResult::Error(errno_to_i32(errno));
+    }
+    let sockaddr_in_ipv4 = |offset: usize| -> Result<Option<[u8; 4]>, Errno> {
+        let family = u16::from_le_bytes(rtentry[offset..offset + 2].try_into().unwrap());
+        match family {
+            AF_INET_U16 => Ok(Some(rtentry[offset + 4..offset + 8].try_into().unwrap())),
+            AF_UNSPEC_U16 => Ok(None),
+            _ => Err(Errno::EAFNOSUPPORT),
+        }
+    };
+    let dst = match sockaddr_in_ipv4(RT_DST_OFFSET) {
+        Ok(Some(dst)) => dst,
+        Ok(None) => [0; 4],
+        Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+    };
+    let flags = u16::from_le_bytes(
+        rtentry[RT_FLAGS_OFFSET..RT_FLAGS_OFFSET + 2]
+            .try_into()
+            .unwrap(),
+    );
+    let gateway = match sockaddr_in_ipv4(RT_GATEWAY_OFFSET) {
+        Ok(gateway) if flags & RTF_GATEWAY != 0 => {
+            gateway.filter(|addr| *addr != [0; 4]).map(Ipv4Address::new)
+        }
+        Ok(_) => None,
+        Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+    };
+    let prefix = if flags & RTF_HOST != 0 {
+        32
+    } else {
+        match sockaddr_in_ipv4(RT_GENMASK_OFFSET) {
+            Ok(Some(mask)) => match ipv4_prefix_from_mask(u32::from_be_bytes(mask)) {
+                Some(prefix) => prefix,
+                None => return SyscallResult::Error(EINVAL_VALUE),
+            },
+            Ok(None) => 0,
+            Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+        }
+    };
+    // rt_dev is a user pointer to the NUL-terminated iface name.
+    let dev_ptr = u64::from_le_bytes(
+        rtentry[RT_DEV_OFFSET..RT_DEV_OFFSET + 8]
+            .try_into()
+            .unwrap(),
+    );
+    let dev_name = if dev_ptr == 0 {
+        Vec::new()
+    } else {
+        match bootstrap_read_user_cstr(&ctx.aspace, dev_ptr, 16) {
+            Ok(name) => name,
+            Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+        }
+    };
+    let oif_name = if dev_name.is_empty() {
+        None
+    } else {
+        let Ok(dev_name) = core::str::from_utf8(&dev_name) else {
+            return SyscallResult::Error(ENODEV_VALUE);
+        };
+        match netns
+            .link_snapshot()
+            .into_iter()
+            .find(|link| link.name == dev_name)
+        {
+            Some(link) => Some(link.name),
+            None => return SyscallResult::Error(ENODEV_VALUE),
+        }
+    };
+
+    let auth = if let Some(owner) = netns.owner_user_namespace() {
+        let Some(current) = ctx.process.nsproxy_cap() else {
+            return SyscallResult::Error(ESRCH_VALUE);
+        };
+        match tx_subsystems::net::require_net_admin_in_user_namespace(
+            ctx.cred(),
+            &current.user_ns,
+            &owner,
+        ) {
+            Ok(auth) => auth,
+            Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+        }
+    } else {
+        match tx_subsystems::net::require_net_admin(ctx.cred()) {
+            Ok(auth) => auth,
+            Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+        }
+    };
+
+    // Mask the destination like fib does so `route add -net X.Y.Z.7/24`
+    // stores the network address.
+    let mask = ipv4_mask_from_prefix(prefix);
+    let dst = Ipv4Address::new((u32::from_be_bytes(dst) & mask).to_be_bytes());
+
+    match request {
+        SIOCADDRT => {
+            let config = tx_subsystems::net::NetNamespaceRouteConfig {
+                dst,
+                prefix_len: prefix,
+                gateway,
+                oif_name,
+                preferred_src: None,
+                table: RT_TABLE_MAIN,
+                protocol: RTPROT_BOOT,
+                scope: if gateway.is_some() {
+                    RT_SCOPE_UNIVERSE
+                } else {
+                    RT_SCOPE_LINK
+                },
+                route_type: RTN_UNICAST,
+            };
+            match netns.add_ipv4_route(auth, config) {
+                Ok(()) => SyscallResult::Return(0),
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+            }
+        }
+        SIOCDELRT => {
+            let selector = tx_subsystems::net::NetNamespaceRouteSelector {
+                dst,
+                prefix_len: prefix,
+                gateway,
+                oif_name,
+                table: RT_TABLE_MAIN,
+            };
+            match netns.delete_ipv4_route(auth, selector) {
+                Ok(()) => SyscallResult::Return(0),
+                Err(Errno::ENOENT) => SyscallResult::Error(errno_to_i32(Errno::ESRCH)),
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+            }
+        }
+        _ => SyscallResult::Error(errno_to_i32(Errno::ENOTTY)),
+    }
+}
+
 pub(super) fn sys_socket_ioctl<'a>(request: u32, argp: u64, ctx: &SyscallCtx<'a>) -> SyscallResult {
     const IFREQ_NAME_BYTES: usize = 16;
     const IFREQ_BYTES: usize = 40;
@@ -3920,6 +4081,10 @@ pub(super) fn sys_socket_ioctl<'a>(request: u32, argp: u64, ctx: &SyscallCtx<'a>
         };
     }
 
+    if request == SIOCADDRT || request == SIOCDELRT {
+        return socket_route_ioctl(request, argp, ctx);
+    }
+
     let mut name_bytes = [0u8; IFREQ_NAME_BYTES];
     if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut name_bytes, argp) {
         return SyscallResult::Error(errno_to_i32(errno));
@@ -3943,16 +4108,30 @@ pub(super) fn sys_socket_ioctl<'a>(request: u32, argp: u64, ctx: &SyscallCtx<'a>
             tx_subsystems::net::require_net_admin(ctx.cred())
         }
     };
+    // `eth0:1`-style names address a labeled IPv4 alias on the base link
+    // (Linux strips the colon for link-level ioctls; the SIOC*IFADDR family
+    // resolves the label against the per-address labels).
+    let (base_name, alias_label) = match ifname.split_once(':') {
+        Some((base, _)) if !base.is_empty() => (base, Some(ifname)),
+        _ => (ifname, None),
+    };
     let link = netns
         .link_snapshot()
         .into_iter()
-        .find(|link| link.name == ifname);
+        .find(|link| link.name == base_name);
 
     match request {
         SIOCGIFFLAGS => {
             let Some(link) = link else {
                 return SyscallResult::Error(ENODEV_VALUE);
             };
+            // A labeled alias is only visible while its address exists
+            // (`ifconfig eth0:1` on a never-created alias is ENODEV).
+            if let Some(label) = alias_label {
+                if netns.ipv4_extra_by_label(link.ifindex, label).is_none() {
+                    return SyscallResult::Error(ENODEV_VALUE);
+                }
+            }
             let mut flags = IFF_RUNNING;
             if link.is_up {
                 flags |= IFF_UP;
@@ -3979,6 +4158,18 @@ pub(super) fn sys_socket_ioctl<'a>(request: u32, argp: u64, ctx: &SyscallCtx<'a>
                 Ok(flags) => flags,
                 Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
             };
+            if let Some(label) = alias_label {
+                // Downing a labeled alias deletes its address (Linux devinet
+                // semantics, what `ifconfig eth0:1 down` relies on); upping it
+                // is a no-op ack — the address arrives via SIOCSIFADDR.
+                if requested & IFF_UP == 0 {
+                    return match netns.del_device_ipv4_addr_by_label(auth, link.ifindex, label) {
+                        Ok(_) => SyscallResult::Return(0),
+                        Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+                    };
+                }
+                return SyscallResult::Return(0);
+            }
             match netns.set_device_up_by_ifindex(auth, link.ifindex, requested & IFF_UP != 0) {
                 Ok(()) => SyscallResult::Return(0),
                 Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
@@ -4031,12 +4222,20 @@ pub(super) fn sys_socket_ioctl<'a>(request: u32, argp: u64, ctx: &SyscallCtx<'a>
             let Some(link) = link else {
                 return SyscallResult::Error(ENODEV_VALUE);
             };
-            let Some(addr) = link.ipv4_addr else {
-                return SyscallResult::Error(errno_to_i32(Errno::EADDRNOTAVAIL));
+            let (addr, prefix) = if let Some(label) = alias_label {
+                match netns.ipv4_extra_by_label(link.ifindex, label) {
+                    Some(found) => found,
+                    None => return SyscallResult::Error(errno_to_i32(Errno::EADDRNOTAVAIL)),
+                }
+            } else {
+                let Some(addr) = link.ipv4_addr else {
+                    return SyscallResult::Error(errno_to_i32(Errno::EADDRNOTAVAIL));
+                };
+                let prefix = link
+                    .ipv4_prefix_len
+                    .unwrap_or_else(|| ipv4_classful_prefix(addr.octets()));
+                (addr, prefix)
             };
-            let prefix = link
-                .ipv4_prefix_len
-                .unwrap_or_else(|| ipv4_classful_prefix(addr.octets()));
             let mask = ipv4_mask_from_prefix(prefix);
             let value: [u8; 4] = match request {
                 SIOCGIFADDR => addr.octets(),
@@ -4077,6 +4276,24 @@ pub(super) fn sys_socket_ioctl<'a>(request: u32, argp: u64, ctx: &SyscallCtx<'a>
                     // Linux assumes a classful prefix until SIOCSIFNETMASK
                     // follows; keep an already-configured prefix instead so
                     // an addr-only change inside the same subnet holds.
+                    if let Some(label) = alias_label {
+                        // `ifconfig eth0:1 ADDR` creates/updates the labeled
+                        // secondary; the primary keeps carrying traffic.
+                        let prefix = netns
+                            .ipv4_extra_by_label(link.ifindex, label)
+                            .map(|(_, prefix)| prefix)
+                            .unwrap_or_else(|| ipv4_classful_prefix(value));
+                        return match netns.add_device_ipv4_addr_by_ifindex(
+                            auth,
+                            link.ifindex,
+                            Ipv4Address::new(value),
+                            prefix,
+                            Some(label),
+                        ) {
+                            Ok(()) => SyscallResult::Return(0),
+                            Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+                        };
+                    }
                     let prefix = link
                         .ipv4_prefix_len
                         .unwrap_or_else(|| ipv4_classful_prefix(value));
@@ -4091,11 +4308,27 @@ pub(super) fn sys_socket_ioctl<'a>(request: u32, argp: u64, ctx: &SyscallCtx<'a>
                     }
                 }
                 SIOCSIFNETMASK => {
-                    let Some(addr) = link.ipv4_addr else {
-                        return SyscallResult::Error(errno_to_i32(Errno::EADDRNOTAVAIL));
-                    };
                     let Some(prefix) = ipv4_prefix_from_mask(u32::from_be_bytes(value)) else {
                         return SyscallResult::Error(EINVAL_VALUE);
+                    };
+                    if let Some(label) = alias_label {
+                        let Some((addr, _)) = netns.ipv4_extra_by_label(link.ifindex, label)
+                        else {
+                            return SyscallResult::Error(errno_to_i32(Errno::EADDRNOTAVAIL));
+                        };
+                        return match netns.add_device_ipv4_addr_by_ifindex(
+                            auth,
+                            link.ifindex,
+                            addr,
+                            prefix,
+                            Some(label),
+                        ) {
+                            Ok(()) => SyscallResult::Return(0),
+                            Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+                        };
+                    }
+                    let Some(addr) = link.ipv4_addr else {
+                        return SyscallResult::Error(errno_to_i32(Errno::EADDRNOTAVAIL));
                     };
                     match netns.set_device_ipv4_addr_by_ifindex(
                         auth,

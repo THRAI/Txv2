@@ -837,23 +837,13 @@ fn preferred_ipv6_source_for(
 fn ipv6_addr_is_configured(addr: Ipv6Address) -> bool {
     net_namespace_payloads_snapshot()
         .into_iter()
-        .any(|namespace| {
-            namespace
-                .link_snapshot()
-                .into_iter()
-                .any(|link| link.is_up && link.ipv6_addr == Some(addr))
-        })
+        .any(|namespace| namespace.ipv6_addr_is_local_up(addr))
 }
 
 fn ipv4_addr_is_configured(addr: Ipv4Address) -> bool {
     net_namespace_payloads_snapshot()
         .into_iter()
-        .any(|namespace| {
-            namespace
-                .link_snapshot()
-                .into_iter()
-                .any(|link| link.is_up && link.ipv4_addr == Some(addr))
-        })
+        .any(|namespace| namespace.ipv4_addr_is_local_up(addr))
 }
 
 const IPV4_ALL_HOSTS_GROUP: Ipv4Address = Ipv4Address::new([224, 0, 0, 1]);

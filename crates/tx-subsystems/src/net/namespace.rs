@@ -11,6 +11,7 @@ use tx_substrate::zone::{
 
 use crate::execution::{Errno, Guard, StepOutcome};
 use crate::net::admin::NetAdminAuthority;
+use crate::device::DevT;
 use crate::net::device::{
     net_device_registry_len, net_device_snapshot, BridgeForwardOutcome, BridgeSnapshot,
     EthernetAddress, NetDeviceKind, NetDeviceRegistration,
@@ -73,8 +74,48 @@ pub struct NetNamespacePayload {
     ipv6_disabled: AtomicBool,
     ipv6_accept_dad: AtomicBool,
     pending_ipv4_forwards: SpinMutex<Vec<PendingIpv4Forward>>,
+    ipv4_extra_addrs: SpinMutex<Vec<ExtraIpv4Addr>>,
+    ipv6_extra_addrs: SpinMutex<Vec<ExtraIpv6Addr>>,
     link_snapshot_generation: AtomicU64,
     link_snapshot_cache: SpinMutex<Option<LinkSnapshotCache>>,
+}
+
+/// A secondary IPv4 address on a link (`ip addr add` beyond the primary, or a
+/// labeled `ifconfig eth0:1` alias). The primary stays in
+/// [`NetNamespaceDeviceLink::ipv4_addr`]; extras only extend local-address
+/// ownership, the RTM_GETADDR dump, and labeled SIOC ioctl lookups — the
+/// dataplane iface keeps running on the primary.
+#[derive(Clone)]
+struct ExtraIpv4Addr {
+    devt: DevT,
+    addr: Ipv4Address,
+    prefix_len: u8,
+    label: Option<alloc::string::String>,
+}
+
+/// A secondary IPv6 address on a link (`ip -6 addr add` beyond the primary).
+#[derive(Clone)]
+struct ExtraIpv6Addr {
+    devt: DevT,
+    addr: Ipv6Address,
+    prefix_len: u8,
+}
+
+/// Public projection of one extra (secondary) IPv4 address.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NetNamespaceExtraIpv4Info {
+    pub ifindex: u32,
+    pub addr: Ipv4Address,
+    pub prefix_len: u8,
+    pub label: Option<alloc::string::String>,
+}
+
+/// Public projection of one extra (secondary) IPv6 address.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NetNamespaceExtraIpv6Info {
+    pub ifindex: u32,
+    pub addr: Ipv6Address,
+    pub prefix_len: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -321,6 +362,8 @@ impl NetNamespacePayload {
             ipv6_disabled: AtomicBool::new(false),
             ipv6_accept_dad: AtomicBool::new(false),
             pending_ipv4_forwards: SpinMutex::new(Vec::new()),
+            ipv4_extra_addrs: SpinMutex::new(Vec::new()),
+            ipv6_extra_addrs: SpinMutex::new(Vec::new()),
             link_snapshot_generation: AtomicU64::new(0),
             link_snapshot_cache: SpinMutex::new(None),
         }
@@ -574,16 +617,75 @@ impl NetNamespacePayload {
         links
     }
 
+    /// Whether `addr` is a local IPv4 address (primary or secondary) on an up
+    /// link — the "is this mine" check the inline ICMP echo path uses.
+    pub fn ipv4_addr_is_local_up(&self, addr: Ipv4Address) -> bool {
+        if self
+            .link_snapshot()
+            .into_iter()
+            .any(|link| link.is_up && link.ipv4_addr == Some(addr))
+        {
+            return true;
+        }
+        let matching: Vec<DevT> = self
+            .ipv4_extra_addrs
+            .lock()
+            .iter()
+            .filter(|extra| extra.addr == addr)
+            .map(|extra| extra.devt)
+            .collect();
+        if matching.is_empty() {
+            return false;
+        }
+        self.device_snapshot()
+            .into_iter()
+            .any(|reg| matching.contains(&reg.devt) && self.is_device_up(reg))
+    }
+
+    /// IPv6 counterpart of [`Self::ipv4_addr_is_local_up`].
+    pub fn ipv6_addr_is_local_up(&self, addr: Ipv6Address) -> bool {
+        if self
+            .link_snapshot()
+            .into_iter()
+            .any(|link| link.is_up && link.ipv6_addr == Some(addr))
+        {
+            return true;
+        }
+        let matching: Vec<DevT> = self
+            .ipv6_extra_addrs
+            .lock()
+            .iter()
+            .filter(|extra| extra.addr == addr)
+            .map(|extra| extra.devt)
+            .collect();
+        if matching.is_empty() {
+            return false;
+        }
+        self.device_snapshot()
+            .into_iter()
+            .any(|reg| matching.contains(&reg.devt) && self.is_device_up(reg))
+    }
+
     pub fn owns_ipv4_addr(&self, addr: Ipv4Address) -> bool {
         self.link_snapshot()
             .into_iter()
             .any(|link| link.ipv4_addr == Some(addr))
+            || self
+                .ipv4_extra_addrs
+                .lock()
+                .iter()
+                .any(|extra| extra.addr == addr)
     }
 
     pub fn owns_ipv6_addr(&self, addr: Ipv6Address) -> bool {
         self.link_snapshot()
             .into_iter()
             .any(|link| link.ipv6_addr == Some(addr))
+            || self
+                .ipv6_extra_addrs
+                .lock()
+                .iter()
+                .any(|extra| extra.addr == addr)
     }
 
     pub fn device_snapshot(&self) -> Vec<&'static NetDeviceRegistration> {
@@ -989,6 +1091,259 @@ impl NetNamespacePayload {
         });
         self.invalidate_link_snapshot_cache();
         Ok(())
+    }
+
+    /// Add an IPv4 address to a link. The first address becomes the primary
+    /// (same as [`Self::set_device_ipv4_addr_by_ifindex`]); further distinct
+    /// addresses become secondaries, optionally labeled (`ifconfig eth0:1`).
+    /// Re-adding the primary or an existing secondary updates its prefix/label.
+    pub fn add_device_ipv4_addr_by_ifindex(
+        &self,
+        authority: NetAdminAuthority,
+        ifindex: u32,
+        addr: Ipv4Address,
+        prefix_len: u8,
+        label: Option<&str>,
+    ) -> Result<(), Errno> {
+        if ifindex == 1 {
+            return self.set_device_ipv4_addr_by_ifindex(
+                authority,
+                ifindex,
+                Some(addr),
+                Some(prefix_len),
+            );
+        }
+        let registration = self.find_device_by_ifindex(ifindex).ok_or(Errno::ENODEV)?;
+        let primary = self.ipv4_for_device(registration);
+        if primary.is_none() || primary == Some(addr) {
+            return self.set_device_ipv4_addr_by_ifindex(
+                authority,
+                ifindex,
+                Some(addr),
+                Some(prefix_len),
+            );
+        }
+        {
+            let mut extras = self.ipv4_extra_addrs.lock();
+            if let Some(extra) = extras
+                .iter_mut()
+                .find(|extra| extra.devt == registration.devt && extra.addr == addr)
+            {
+                extra.prefix_len = prefix_len;
+                if label.is_some() {
+                    extra.label = label.map(alloc::string::String::from);
+                }
+            } else {
+                extras.push(ExtraIpv4Addr {
+                    devt: registration.devt,
+                    addr,
+                    prefix_len,
+                    label: label.map(alloc::string::String::from),
+                });
+            }
+        }
+        // Address sets are generation-tracked (the RTM_GETADDR dump template
+        // cache keys on it), so secondaries must bump it too.
+        self.invalidate_link_snapshot_cache();
+        Ok(())
+    }
+
+    /// Delete one IPv4 address from a link: a matching secondary is removed;
+    /// a matching primary is cleared (secondaries stay). Returns whether an
+    /// address was actually removed.
+    pub fn del_device_ipv4_addr_by_ifindex(
+        &self,
+        authority: NetAdminAuthority,
+        ifindex: u32,
+        addr: Ipv4Address,
+    ) -> Result<bool, Errno> {
+        if ifindex == 1 {
+            // Loopback is override-modelled, not a registered device: deleting
+            // the effective address reverts to the 127.0.0.1/8 default.
+            let current = self
+                .link_snapshot()
+                .into_iter()
+                .find(|link| link.ifindex == 1)
+                .and_then(|link| link.ipv4_addr);
+            if current == Some(addr) {
+                self.set_device_ipv4_addr_by_ifindex(authority, ifindex, None, None)?;
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+        let registration = self.find_device_by_ifindex(ifindex).ok_or(Errno::ENODEV)?;
+        {
+            let mut extras = self.ipv4_extra_addrs.lock();
+            let before = extras.len();
+            extras.retain(|extra| !(extra.devt == registration.devt && extra.addr == addr));
+            if extras.len() != before {
+                drop(extras);
+                self.invalidate_link_snapshot_cache();
+                return Ok(true);
+            }
+        }
+        if self.ipv4_for_device(registration) == Some(addr) {
+            self.set_device_ipv4_addr_by_ifindex(authority, ifindex, None, None)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Delete the labeled IPv4 alias (`ifconfig eth0:1 down`). Returns whether
+    /// the label existed.
+    pub fn del_device_ipv4_addr_by_label(
+        &self,
+        _authority: NetAdminAuthority,
+        ifindex: u32,
+        label: &str,
+    ) -> Result<bool, Errno> {
+        let registration = self.find_device_by_ifindex(ifindex).ok_or(Errno::ENODEV)?;
+        let mut extras = self.ipv4_extra_addrs.lock();
+        let before = extras.len();
+        extras.retain(|extra| {
+            !(extra.devt == registration.devt && extra.label.as_deref() == Some(label))
+        });
+        let removed = extras.len() != before;
+        drop(extras);
+        if removed {
+            self.invalidate_link_snapshot_cache();
+        }
+        Ok(removed)
+    }
+
+    /// Look up a labeled IPv4 alias for the SIOCGIF* ioctls.
+    pub fn ipv4_extra_by_label(&self, ifindex: u32, label: &str) -> Option<(Ipv4Address, u8)> {
+        let registration = self.find_device_by_ifindex(ifindex)?;
+        self.ipv4_extra_addrs
+            .lock()
+            .iter()
+            .find(|extra| extra.devt == registration.devt && extra.label.as_deref() == Some(label))
+            .map(|extra| (extra.addr, extra.prefix_len))
+    }
+
+    /// All secondary IPv4 addresses, with the same positional ifindex mapping
+    /// as [`Self::link_snapshot`] (for the RTM_GETADDR dump).
+    pub fn ipv4_extra_snapshot(&self) -> Vec<NetNamespaceExtraIpv4Info> {
+        let mut out = Vec::new();
+        let extras = self.ipv4_extra_addrs.lock();
+        if extras.is_empty() {
+            return out;
+        }
+        for (ifindex, reg) in (2..).zip(self.device_snapshot()) {
+            for extra in extras.iter().filter(|extra| extra.devt == reg.devt) {
+                out.push(NetNamespaceExtraIpv4Info {
+                    ifindex,
+                    addr: extra.addr,
+                    prefix_len: extra.prefix_len,
+                    label: extra.label.clone(),
+                });
+            }
+        }
+        out
+    }
+
+    /// Add an IPv6 address to a link; the first becomes the primary, further
+    /// distinct addresses become secondaries.
+    pub fn add_device_ipv6_addr_by_ifindex(
+        &self,
+        authority: NetAdminAuthority,
+        ifindex: u32,
+        addr: Ipv6Address,
+        prefix_len: u8,
+    ) -> Result<(), Errno> {
+        if ifindex == 1 {
+            return self.set_device_ipv6_addr_by_ifindex(
+                authority,
+                ifindex,
+                Some(addr),
+                Some(prefix_len),
+            );
+        }
+        let registration = self.find_device_by_ifindex(ifindex).ok_or(Errno::ENODEV)?;
+        let primary = self.ipv6_for_device(registration);
+        if primary.is_none() || primary == Some(addr) {
+            return self.set_device_ipv6_addr_by_ifindex(
+                authority,
+                ifindex,
+                Some(addr),
+                Some(prefix_len),
+            );
+        }
+        {
+            let mut extras = self.ipv6_extra_addrs.lock();
+            if let Some(extra) = extras
+                .iter_mut()
+                .find(|extra| extra.devt == registration.devt && extra.addr == addr)
+            {
+                extra.prefix_len = prefix_len;
+            } else {
+                extras.push(ExtraIpv6Addr {
+                    devt: registration.devt,
+                    addr,
+                    prefix_len,
+                });
+            }
+        }
+        self.invalidate_link_snapshot_cache();
+        Ok(())
+    }
+
+    /// Delete one IPv6 address from a link (secondary removed, or primary
+    /// cleared). Returns whether an address was actually removed.
+    pub fn del_device_ipv6_addr_by_ifindex(
+        &self,
+        authority: NetAdminAuthority,
+        ifindex: u32,
+        addr: Ipv6Address,
+    ) -> Result<bool, Errno> {
+        if ifindex == 1 {
+            let current = self
+                .link_snapshot()
+                .into_iter()
+                .find(|link| link.ifindex == 1)
+                .and_then(|link| link.ipv6_addr);
+            if current == Some(addr) {
+                self.set_device_ipv6_addr_by_ifindex(authority, ifindex, None, None)?;
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+        let registration = self.find_device_by_ifindex(ifindex).ok_or(Errno::ENODEV)?;
+        {
+            let mut extras = self.ipv6_extra_addrs.lock();
+            let before = extras.len();
+            extras.retain(|extra| !(extra.devt == registration.devt && extra.addr == addr));
+            if extras.len() != before {
+                drop(extras);
+                self.invalidate_link_snapshot_cache();
+                return Ok(true);
+            }
+        }
+        if self.ipv6_for_device(registration) == Some(addr) {
+            self.set_device_ipv6_addr_by_ifindex(authority, ifindex, None, None)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// All secondary IPv6 addresses (positional ifindex mapping, see
+    /// [`Self::ipv4_extra_snapshot`]).
+    pub fn ipv6_extra_snapshot(&self) -> Vec<NetNamespaceExtraIpv6Info> {
+        let mut out = Vec::new();
+        let extras = self.ipv6_extra_addrs.lock();
+        if extras.is_empty() {
+            return out;
+        }
+        for (ifindex, reg) in (2..).zip(self.device_snapshot()) {
+            for extra in extras.iter().filter(|extra| extra.devt == reg.devt) {
+                out.push(NetNamespaceExtraIpv6Info {
+                    ifindex,
+                    addr: extra.addr,
+                    prefix_len: extra.prefix_len,
+                });
+            }
+        }
+        out
     }
 
     pub fn set_device_ipv6_addr_by_ifindex(

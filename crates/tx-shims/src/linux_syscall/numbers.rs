@@ -978,6 +978,10 @@ pub const TIOCSWINSZ: u32 = 0x5414;
 /// `TIOCNOTTY = 0x5422` — detach this TTY as the calling session's
 /// controlling terminal.
 pub const TIOCNOTTY: u32 = 0x5422;
+/// `SIOCADDRT = 0x890b` — add an IPv4 route via `struct rtentry` (route(8)).
+pub const SIOCADDRT: u32 = 0x890b;
+/// `SIOCDELRT = 0x890c` — delete an IPv4 route via `struct rtentry`.
+pub const SIOCDELRT: u32 = 0x890c;
 /// `SIOCGIFNAME = 0x8910` — resolve `struct ifreq.ifr_ifindex` to ifname.
 pub const SIOCGIFNAME: u32 = 0x8910;
 /// `SIOCGIFCONF = 0x8912` — enumerate interface `struct ifreq` entries.

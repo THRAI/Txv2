@@ -390,6 +390,95 @@ fn raw_icmpv4_echo_still_replies_after_local_addr_change_churn() {
     );
 }
 
+/// LTP `net_stress.interface/if-addr-adddel` shape: a secondary address (with
+/// an `eth0:1`-style label) is added next to the primary, must be visible and
+/// locally owned, and its removal must leave the primary configured.
+#[test]
+fn secondary_ipv4_addr_add_del_keeps_primary() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
+    let primary = Ipv4Address::new([10, 0, 0, 2]);
+    let secondary = Ipv4Address::new([172, 16, 1, 57]);
+    let local_ns = crate::net::create_isolated_net_namespace_for_test("ipv4-secondary-local")
+        .expect("local namespace")
+        .payload_cap()
+        .expect("local payload");
+    let pair = create_veth_pair_for_test_or_bootstrap(VethPairConfig {
+        left: VethEndpointConfig {
+            name: "ipv4-secondary0",
+            devt: DevT::new(91, 190),
+            mac: EthernetAddress::new([0x02, 0, 0, 0, 5, 0]),
+        },
+        right: VethEndpointConfig {
+            name: "ipv4-secondary1",
+            devt: DevT::new(91, 191),
+            mac: EthernetAddress::new([0x02, 0, 0, 0, 5, 1]),
+        },
+        mtu: VETH_DEFAULT_MTU,
+    });
+    local_ns
+        .attach_device_for_test_or_bootstrap(pair.left, None)
+        .expect("attach local veth");
+    let auth = NetAdminAuthority::for_test_or_bootstrap();
+    local_ns
+        .set_device_ipv4_addr_by_ifindex(auth, 2, Some(primary), Some(24))
+        .expect("set primary ipv4");
+
+    // Add: primary untouched, secondary owned + dumped + label-addressable.
+    local_ns
+        .add_device_ipv4_addr_by_ifindex(auth, 2, secondary, 24, Some("ipv4-secondary0:1"))
+        .expect("add secondary ipv4");
+    let link = local_ns
+        .link_snapshot()
+        .into_iter()
+        .find(|link| link.ifindex == 2)
+        .expect("local link");
+    assert_eq!(link.ipv4_addr, Some(primary));
+    assert!(local_ns.ipv4_addr_is_local_up(secondary));
+    assert!(local_ns.ipv4_addr_is_local_up(primary));
+    let extras = local_ns.ipv4_extra_snapshot();
+    assert_eq!(extras.len(), 1);
+    assert_eq!(extras[0].ifindex, 2);
+    assert_eq!(extras[0].addr, secondary);
+    assert_eq!(extras[0].prefix_len, 24);
+    assert_eq!(extras[0].label.as_deref(), Some("ipv4-secondary0:1"));
+    assert_eq!(
+        local_ns.ipv4_extra_by_label(2, "ipv4-secondary0:1"),
+        Some((secondary, 24))
+    );
+
+    // Delete by address: secondary gone, primary still configured.
+    assert_eq!(
+        local_ns.del_device_ipv4_addr_by_ifindex(auth, 2, secondary),
+        Ok(true)
+    );
+    assert!(local_ns.ipv4_extra_snapshot().is_empty());
+    assert!(!local_ns.ipv4_addr_is_local_up(secondary));
+    let link = local_ns
+        .link_snapshot()
+        .into_iter()
+        .find(|link| link.ifindex == 2)
+        .expect("local link after del");
+    assert_eq!(link.ipv4_addr, Some(primary));
+
+    // Delete by label (`ifconfig eth0:1 down` shape).
+    local_ns
+        .add_device_ipv4_addr_by_ifindex(auth, 2, secondary, 16, Some("ipv4-secondary0:1"))
+        .expect("re-add secondary ipv4");
+    assert_eq!(
+        local_ns.del_device_ipv4_addr_by_label(auth, 2, "ipv4-secondary0:1"),
+        Ok(true)
+    );
+    assert!(local_ns.ipv4_extra_snapshot().is_empty());
+    assert_eq!(
+        local_ns.del_device_ipv4_addr_by_label(auth, 2, "ipv4-secondary0:1"),
+        Ok(false)
+    );
+}
+
 #[test]
 fn raw_icmpv6_send_to_configured_peer_addr_returns_echo_reply() {
     init_zones();

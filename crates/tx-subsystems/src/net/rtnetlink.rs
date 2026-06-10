@@ -722,6 +722,15 @@ fn render_getaddr_dump(
     for link in &links {
         append_addr_messages_as_vec(&mut out, header.seq, header.pid, NLM_F_MULTI, link, family);
     }
+    append_extra_addr_messages(
+        &mut out,
+        header.seq,
+        header.pid,
+        NLM_F_MULTI,
+        netns,
+        &links,
+        family,
+    );
     out.push(build_done_message(header.seq, header.pid));
     out
 }
@@ -765,6 +774,11 @@ fn build_getaddr_dump_template(netns: &NetNamespacePayload) -> Vec<u8> {
     let mut out = Vec::with_capacity(links.len() * 80 + align4(NLMSG_HDR_LEN + 4));
     for link in &links {
         append_addr_messages(&mut out, 0, 0, NLM_F_MULTI, link, AF_UNSPEC);
+    }
+    let mut extra_messages = Vec::new();
+    append_extra_addr_messages(&mut extra_messages, 0, 0, NLM_F_MULTI, netns, &links, AF_UNSPEC);
+    for message in extra_messages {
+        out.extend_from_slice(&message);
     }
     append_done_message(&mut out, 0, 0);
     out
@@ -951,11 +965,22 @@ fn handle_newaddr(netns: &NetNamespacePayload, cred: Cred, payload: &[u8]) -> Re
     match info.family {
         AF_INET => {
             let addr = ipv4_addr_from_payload(addr_attr.payload)?;
-            netns.set_device_ipv4_addr_by_ifindex(auth, ifindex, Some(addr), Some(info.prefix_len))
+            // `ip addr add` is additive: the first address becomes the
+            // primary, further ones become secondaries (net_stress.interface
+            // if-addr-adddel/-addlarge add test addresses next to the primary
+            // and the primary must keep carrying traffic).
+            let label = attr_string(&attrs, IFA_LABEL);
+            netns.add_device_ipv4_addr_by_ifindex(
+                auth,
+                ifindex,
+                addr,
+                info.prefix_len,
+                label.as_deref(),
+            )
         }
         AF_INET6 => {
             let addr = ipv6_addr_from_payload(addr_attr.payload)?;
-            netns.set_device_ipv6_addr_by_ifindex(auth, ifindex, Some(addr), Some(info.prefix_len))
+            netns.add_device_ipv6_addr_by_ifindex(auth, ifindex, addr, info.prefix_len)
         }
         _ => Err(Errno::EAFNOSUPPORT),
     }
@@ -976,10 +1001,13 @@ fn handle_deladdr(netns: &NetNamespacePayload, cred: Cred, payload: &[u8]) -> Re
         AF_INET => {
             if let Some(addr_attr) = addr_attr {
                 let requested = ipv4_addr_from_payload(addr_attr.payload)?;
-                if current.ipv4_addr != Some(requested) {
-                    return Ok(());
-                }
-            } else if current.ipv4_addr.is_none() {
+                // Removes a matching secondary, or clears a matching primary;
+                // an unknown address stays a tolerated no-op (matching the
+                // pre-secondary behaviour relied on by setup scripts).
+                let _ = netns.del_device_ipv4_addr_by_ifindex(auth, ifindex, requested)?;
+                return Ok(());
+            }
+            if current.ipv4_addr.is_none() {
                 return Ok(());
             }
             netns.set_device_ipv4_addr_by_ifindex(auth, ifindex, None, None)
@@ -987,10 +1015,10 @@ fn handle_deladdr(netns: &NetNamespacePayload, cred: Cred, payload: &[u8]) -> Re
         AF_INET6 => {
             if let Some(addr_attr) = addr_attr {
                 let requested = ipv6_addr_from_payload(addr_attr.payload)?;
-                if current.ipv6_addr != Some(requested) {
-                    return Ok(());
-                }
-            } else if current.ipv6_addr.is_none() {
+                let _ = netns.del_device_ipv6_addr_by_ifindex(auth, ifindex, requested)?;
+                return Ok(());
+            }
+            if current.ipv6_addr.is_none() {
                 return Ok(());
             }
             netns.set_device_ipv6_addr_by_ifindex(auth, ifindex, None, None)
@@ -1307,6 +1335,58 @@ fn append_addr_message_with_ipv4_addr(
     push_attr(&mut payload, IFA_LOCAL, &addr.octets());
     push_attr_string(&mut payload, IFA_LABEL, link.name);
     append_nlmsg(out, RTM_NEWADDR, flags, seq, pid, &payload);
+}
+
+const IFA_F_SECONDARY: u8 = 0x01;
+
+/// Emit the RTM_NEWADDR records for every secondary (extra) address in the
+/// namespace, after the per-link primaries. `family` filters like the dump
+/// request; labeled IPv4 extras carry their alias label, unlabeled ones the
+/// owning link name.
+fn append_extra_addr_messages(
+    out: &mut Vec<Vec<u8>>,
+    seq: u32,
+    pid: u32,
+    flags: u16,
+    netns: &NetNamespacePayload,
+    links: &[NetNamespaceLinkInfo],
+    family: u8,
+) {
+    let link_name = |ifindex: u32| {
+        links
+            .iter()
+            .find(|link| link.ifindex == ifindex)
+            .map(|link| link.name)
+            .unwrap_or("")
+    };
+    if family == AF_UNSPEC || family == AF_INET {
+        for extra in netns.ipv4_extra_snapshot() {
+            let mut payload = vec![AF_INET, extra.prefix_len, IFA_F_SECONDARY, 0];
+            payload.extend_from_slice(&extra.ifindex.to_le_bytes());
+            push_attr(&mut payload, IFA_ADDRESS, &extra.addr.octets());
+            push_attr(&mut payload, IFA_LOCAL, &extra.addr.octets());
+            let label = extra
+                .label
+                .as_deref()
+                .unwrap_or_else(|| link_name(extra.ifindex));
+            push_attr_string(&mut payload, IFA_LABEL, label);
+            let mut message = Vec::new();
+            append_nlmsg(&mut message, RTM_NEWADDR, flags, seq, pid, &payload);
+            out.push(message);
+        }
+    }
+    if family == AF_UNSPEC || family == AF_INET6 {
+        for extra in netns.ipv6_extra_snapshot() {
+            let mut payload = vec![AF_INET6, extra.prefix_len, IFA_F_SECONDARY, 0];
+            payload.extend_from_slice(&extra.ifindex.to_le_bytes());
+            push_attr(&mut payload, IFA_ADDRESS, &extra.addr.octets());
+            push_attr(&mut payload, IFA_LOCAL, &extra.addr.octets());
+            push_attr_string(&mut payload, IFA_LABEL, link_name(extra.ifindex));
+            let mut message = Vec::new();
+            append_nlmsg(&mut message, RTM_NEWADDR, flags, seq, pid, &payload);
+            out.push(message);
+        }
+    }
 }
 
 fn append_addr_message_with_ipv6_addr(
