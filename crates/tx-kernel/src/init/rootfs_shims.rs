@@ -470,12 +470,22 @@ nobody:x:65534:65534:nobody:/nonexistent:/bin/sh\n";
         // which aborts `tst_init_iface` before `ip link set <iface> up` — leaving
         // the interface down and unconfigured. No-op the IPv6 conf writes (DAD is
         // already off / the addresses are permanent) and forward everything else.
+        // `sysctl -b <key>` (value, no trailing newline) is procps-only;
+        // busybox rejects -b and the LTP mcast-lib setup dies on it. Serve
+        // -b straight from /proc/sys.
         let sysctl_script = b"#!/bin/sh\n\
 bb=/bin/busybox\n\
 [ -x \"$bb\" ] || bb=/musl/musl/busybox\n\
 case \"$*\" in\n\
     *net.ipv6.conf.*) exit 0 ;;\n\
 esac\n\
+if [ \"$1\" = -b ]; then\n\
+    key=$2\n\
+    path=/proc/sys/$(echo \"$key\" | \"$bb\" tr . /)\n\
+    [ -r \"$path\" ] || exit 1\n\
+    \"$bb\" tr -d '\\n' < \"$path\"\n\
+    exit 0\n\
+fi\n\
 exec \"$bb\" sysctl \"$@\"\n";
         if !create_file_with_data(&create_ctx, tx_ltp_bin_id, b"sysctl", 0o755, sysctl_script) {
             Self::write_board_sentinel_prefix();

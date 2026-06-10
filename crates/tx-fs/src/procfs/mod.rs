@@ -96,6 +96,25 @@ pub const PROCFS_NET_TX_NEIGH_CTL_ID: FsObjectId = FsObjectId::new(0x7072_6F15);
 // `arp -an` (the LTP ipneigh01 `arp` variant).
 pub const PROCFS_NET_ARP_ID: FsObjectId = FsObjectId::new(0x7072_6F16);
 
+// `/proc/sys/net/ipv4/` — the IGMP knobs LTP's mcast-lib.sh saves, sets and
+// restores in setup/cleanup (`sysctl -b` reads, `sysctl -qw` writes via ROD:
+// a missing node TBROKs every net_stress.multicast test before its body).
+// Values are accepted and stored; the IGMP emulation currently behaves as
+// IGMPv2-compatible regardless.
+pub const PROCFS_SYS_NET_IPV4_ID: FsObjectId = FsObjectId::new(0x7072_6F17);
+pub const PROCFS_SYS_NET_IPV4_CONF_ID: FsObjectId = FsObjectId::new(0x7072_6F18);
+pub const PROCFS_SYS_NET_IPV4_IGMP_MAX_MEMBERSHIPS_ID: FsObjectId =
+    FsObjectId::new(0x7072_6F19);
+pub const PROCFS_SYS_NET_IPV4_IGMP_MAX_MSF_ID: FsObjectId = FsObjectId::new(0x7072_6F1A);
+
+static IGMP_MAX_MEMBERSHIPS: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(20);
+static IGMP_MAX_MSF: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(10);
+// One shared knob for `all` and every per-iface dir (mcast-lib only ever
+// writes 0 and restores the saved value).
+static FORCE_IGMP_VERSION: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
 // `conf/<name>/` entries live in their own high id region: dir = base + tag*4,
 // disable_ipv6 = dir+1, accept_dad = dir+2, where tag = FNV-1a(name) (30-bit).
 const PROCFS_IPV6_CONF_BASE: u64 = PROCFS_PID_BASE + 0x80_0000_0000;
@@ -115,6 +134,21 @@ fn ipv6_conf_dir_id(name: &[u8]) -> FsObjectId {
 fn ipv6_conf_kind(id: FsObjectId) -> Option<u8> {
     let r = id.as_u64();
     if r >= PROCFS_IPV6_CONF_BASE && r < PROCFS_IPV6_CONF_BASE + PROCFS_IPV6_CONF_SPAN * 4 {
+        Some((r & 3) as u8)
+    } else {
+        None
+    }
+}
+// `/proc/sys/net/ipv4/conf/<name>/` mirrors the ipv6 conf id scheme in its
+// own region: dir = base + tag*4, force_igmp_version = dir+1.
+const PROCFS_IPV4_CONF_BASE: u64 = PROCFS_PID_BASE + 0x100_0000_0000;
+fn ipv4_conf_dir_id(name: &[u8]) -> FsObjectId {
+    FsObjectId::new(PROCFS_IPV4_CONF_BASE + ipv6_conf_tag(name) * 4)
+}
+/// 0 = directory, 1 = force_igmp_version, or `None` if not an ipv4 conf id.
+fn ipv4_conf_kind(id: FsObjectId) -> Option<u8> {
+    let r = id.as_u64();
+    if r >= PROCFS_IPV4_CONF_BASE && r < PROCFS_IPV4_CONF_BASE + PROCFS_IPV6_CONF_SPAN * 4 {
         Some((r & 3) as u8)
     } else {
         None
@@ -547,11 +581,26 @@ impl FsOps for Procfs {
             if name == b"ipv6" {
                 return StepOutcome::done(PROCFS_SYS_NET_IPV6_ID);
             }
+            if name == b"ipv4" {
+                return StepOutcome::done(PROCFS_SYS_NET_IPV4_ID);
+            }
             return StepOutcome::err(Errno::ENOENT.into());
         }
         if parent == PROCFS_SYS_NET_IPV6_ID {
             if name == b"conf" {
                 return StepOutcome::done(PROCFS_SYS_NET_IPV6_CONF_ID);
+            }
+            return StepOutcome::err(Errno::ENOENT.into());
+        }
+        if parent == PROCFS_SYS_NET_IPV4_ID {
+            if name == b"conf" {
+                return StepOutcome::done(PROCFS_SYS_NET_IPV4_CONF_ID);
+            }
+            if name == b"igmp_max_memberships" {
+                return StepOutcome::done(PROCFS_SYS_NET_IPV4_IGMP_MAX_MEMBERSHIPS_ID);
+            }
+            if name == b"igmp_max_msf" {
+                return StepOutcome::done(PROCFS_SYS_NET_IPV4_IGMP_MAX_MSF_ID);
             }
             return StepOutcome::err(Errno::ENOENT.into());
         }
@@ -563,12 +612,24 @@ impl FsOps for Procfs {
             }
             return StepOutcome::err(Errno::ENOENT.into());
         }
+        if parent == PROCFS_SYS_NET_IPV4_CONF_ID {
+            if !name.is_empty() {
+                return StepOutcome::done(ipv4_conf_dir_id(name));
+            }
+            return StepOutcome::err(Errno::ENOENT.into());
+        }
         if ipv6_conf_kind(parent) == Some(0) {
             if name == b"disable_ipv6" {
                 return StepOutcome::done(FsObjectId::new(parent.as_u64() + 1));
             }
             if name == b"accept_dad" {
                 return StepOutcome::done(FsObjectId::new(parent.as_u64() + 2));
+            }
+            return StepOutcome::err(Errno::ENOENT.into());
+        }
+        if ipv4_conf_kind(parent) == Some(0) {
+            if name == b"force_igmp_version" {
+                return StepOutcome::done(FsObjectId::new(parent.as_u64() + 1));
             }
             return StepOutcome::err(Errno::ENOENT.into());
         }
@@ -695,6 +756,19 @@ impl FsOps for Procfs {
             // `sysctl -qw net.ipv6.conf.<iface>.accept_dad=0` (and may clear
             // disable_ipv6), which `open(O_WRONLY)`s the file.
             id if matches!(ipv6_conf_kind(id), Some(1) | Some(2)) => {
+                StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_RW_FILE_MODE))
+            }
+            PROCFS_SYS_NET_IPV4_ID | PROCFS_SYS_NET_IPV4_CONF_ID => {
+                StepOutcome::done(InodeMeta::new(InodeKind::Directory, PROCFS_DIR_MODE))
+            }
+            PROCFS_SYS_NET_IPV4_IGMP_MAX_MEMBERSHIPS_ID
+            | PROCFS_SYS_NET_IPV4_IGMP_MAX_MSF_ID => {
+                StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_RW_FILE_MODE))
+            }
+            id if ipv4_conf_kind(id) == Some(0) => {
+                StepOutcome::done(InodeMeta::new(InodeKind::Directory, PROCFS_DIR_MODE))
+            }
+            id if ipv4_conf_kind(id) == Some(1) => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_RW_FILE_MODE))
             }
             id if pid_from_dir(id).is_some() => {
@@ -1262,6 +1336,26 @@ impl FsOps for Procfs {
         // tst_net setup. We have no per-iface IPv6 toggle state; accept the write
         // (report all bytes consumed) so setup proceeds. disable_ipv6 stays 0.
         if matches!(ipv6_conf_kind(fs_object_id), Some(1) | Some(2)) {
+            return StepOutcome::done(bytes.len() as u64);
+        }
+        // IGMP knobs (mcast-lib.sh setup/cleanup). Store the integer so the
+        // save/restore round-trip reads back what was written.
+        if fs_object_id == PROCFS_SYS_NET_IPV4_IGMP_MAX_MEMBERSHIPS_ID
+            || fs_object_id == PROCFS_SYS_NET_IPV4_IGMP_MAX_MSF_ID
+            || ipv4_conf_kind(fs_object_id) == Some(1)
+        {
+            let text = core::str::from_utf8(bytes).unwrap_or("").trim();
+            let Ok(value) = text.parse::<u32>() else {
+                return StepOutcome::err(Errno::EINVAL.into());
+            };
+            let target = if fs_object_id == PROCFS_SYS_NET_IPV4_IGMP_MAX_MEMBERSHIPS_ID {
+                &IGMP_MAX_MEMBERSHIPS
+            } else if fs_object_id == PROCFS_SYS_NET_IPV4_IGMP_MAX_MSF_ID {
+                &IGMP_MAX_MSF
+            } else {
+                &FORCE_IGMP_VERSION
+            };
+            target.store(value, core::sync::atomic::Ordering::Relaxed);
             return StepOutcome::done(bytes.len() as u64);
         }
         // `ip neigh del` writes "<addr> <dev>" here to drop a neighbor entry.

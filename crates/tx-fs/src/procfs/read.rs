@@ -44,6 +44,13 @@ pub fn render(fs_object_id: FsObjectId) -> String {
     if matches!(super::ipv6_conf_kind(fs_object_id), Some(1) | Some(2)) {
         return String::from("0\n");
     }
+    // `/proc/sys/net/ipv4/conf/<iface>/force_igmp_version` — shared stored knob.
+    if super::ipv4_conf_kind(fs_object_id) == Some(1) {
+        return alloc::format!(
+            "{}\n",
+            super::FORCE_IGMP_VERSION.load(core::sync::atomic::Ordering::Relaxed)
+        );
+    }
     match fs_object_id {
         PROCFS_MOUNTS_ID => render_mounts(),
         PROCFS_CPUINFO_ID => render_cpuinfo(),
@@ -52,6 +59,14 @@ pub fn render(fs_object_id: FsObjectId) -> String {
         PROCFS_CONFIG_ID => render_config(),
         PROCFS_SYS_KERNEL_TAINTED_ID => String::from("0\n"),
         PROCFS_SYS_KERNEL_PID_MAX_ID => String::from("4194304\n"),
+        id if id == super::PROCFS_SYS_NET_IPV4_IGMP_MAX_MEMBERSHIPS_ID => alloc::format!(
+            "{}\n",
+            super::IGMP_MAX_MEMBERSHIPS.load(core::sync::atomic::Ordering::Relaxed)
+        ),
+        id if id == super::PROCFS_SYS_NET_IPV4_IGMP_MAX_MSF_ID => alloc::format!(
+            "{}\n",
+            super::IGMP_MAX_MSF.load(core::sync::atomic::Ordering::Relaxed)
+        ),
         PROCFS_NET_IF_INET6_ID => render_if_inet6(),
         PROCFS_NET_TX_NEIGH_ID => {
             let netns = tx_subsystems::net::namespace::initial_net_namespace_payload();
