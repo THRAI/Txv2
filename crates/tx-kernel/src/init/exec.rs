@@ -909,6 +909,18 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
                 selected += 1;
                 continue;
             }
+            // `ltp-bin:<lane>:<file>[+<file>...]` runs the listed
+            // `ltp/testcases/bin` files the official `ltp_testcode.sh` way
+            // (no-args, RUN/FAIL markers, no runtest manifest) inside the
+            // lane's GROUP block, so a serial log feeds the real per-lane
+            // judge unchanged. lane = musl | glibc.
+            if let Some(spec) = group.strip_prefix("ltp-bin:") {
+                let (lane, files) = spec.split_once(':').unwrap_or(("musl", spec));
+                let ltp_args = ltp_args_from_cmdline::<P>();
+                append_ltp_bin_walk(&mut cmd, lane, files, &ltp_args);
+                selected += 1;
+                continue;
+            }
             if is_libctest_musl_group(group) {
                 append_full_libctest(&mut cmd);
                 selected += 1;
@@ -1202,6 +1214,14 @@ fn append_oscomp_musl_script_with_observe(
             tx_observe::reset_ring_and_arm(bench_observe_threshold.unwrap_or(5_000));
         }
     }
+    if script == "ltp_testcode.sh" {
+        // Walk env in a subshell so the LTP LTPROOT/PATH exports don't
+        // leak into groups queued after this one.
+        let mut env = alloc::string::String::new();
+        append_ltp_walk_env(&mut env, "/musl/musl");
+        let _ = write!(cmd, "; (true{env}; ./busybox sh {script})");
+        return;
+    }
     let _ = write!(cmd, "; ./busybox sh {script}");
 }
 
@@ -1282,6 +1302,18 @@ fn oscomp_glibc_script_for_group(group: &str) -> Option<&'static str> {
 fn append_oscomp_glibc_script(cmd: &mut alloc::string::String, script: &str) {
     use core::fmt::Write as _;
 
+    if script == "ltp_testcode.sh" {
+        // Same env contract as the musl walk, rooted at the glibc tree;
+        // run in a subshell so the glibc LTPROOT/PATH don't leak into
+        // groups queued after this one.
+        let mut env = alloc::string::String::new();
+        append_ltp_walk_env(&mut env, "/musl/glibc");
+        let _ = write!(
+            cmd,
+            "; cd /musl/glibc; (true{env}; /musl/musl/busybox sh {script}); cd /musl/musl"
+        );
+        return;
+    }
     let _ = write!(
         cmd,
         "; cd /musl/glibc; /musl/musl/busybox sh {script}; cd /musl/musl"
@@ -1514,34 +1546,65 @@ fn is_native_network_runtest(module: &str) -> bool {
     module.starts_with("net.") || module.starts_with("net_stress.") || module == "can"
 }
 
+fn append_busybox_bin_install(cmd: &mut alloc::string::String) {
+    use core::fmt::Write as _;
+
+    let _ = write!(
+        cmd,
+        "; /musl/musl/busybox mkdir -p /bin; if [ ! -f /tmp/tx-busybox-copied ]; then /musl/musl/busybox rm -f /tmp/tx-busybox-stage; if /musl/musl/busybox cp /musl/musl/busybox /tmp/tx-busybox-stage; then /musl/musl/busybox chmod 755 /tmp/tx-busybox-stage; /musl/musl/busybox rm -f /bin/busybox /bin/sh /bin/cat /bin/true /bin/ls /bin/basename /bin/ip /bin/ifconfig /bin/grep /bin/seq /bin/ping /bin/arp; /musl/musl/busybox mv /tmp/tx-busybox-stage /bin/busybox; /bin/busybox --install -s /bin; /bin/busybox touch /tmp/tx-busybox-copied; fi; fi"
+    );
+}
+
 fn append_ltp_script_env_with_default_ifaces(
     cmd: &mut alloc::string::String,
     install_default_ifaces: bool,
 ) {
     use core::fmt::Write as _;
 
+    append_busybox_bin_install(cmd);
     let _ = write!(
         cmd,
-        "; /musl/musl/busybox mkdir -p /bin; if [ ! -f /tmp/tx-busybox-copied ]; then /musl/musl/busybox rm -f /tmp/tx-busybox-stage; if /musl/musl/busybox cp /musl/musl/busybox /tmp/tx-busybox-stage; then /musl/musl/busybox chmod 755 /tmp/tx-busybox-stage; /musl/musl/busybox rm -f /bin/busybox /bin/sh /bin/cat /bin/true /bin/ls /bin/basename /bin/ip /bin/ifconfig /bin/grep /bin/seq /bin/ping /bin/arp; /musl/musl/busybox mv /tmp/tx-busybox-stage /bin/busybox; /bin/busybox --install -s /bin; /bin/busybox touch /tmp/tx-busybox-copied; fi; fi; export LTPROOT=/musl/musl/ltp; export PATH=/tx-ltp/bin:/bin:/musl/glibc:/musl/musl:/musl/musl/ltp/testcases/bin"
+        "; export LTPROOT=/musl/musl/ltp; export PATH=/tx-ltp/bin:/bin:/musl/glibc:/musl/musl:/musl/musl/ltp/testcases/bin"
     );
     if install_default_ifaces {
         let _ = write!(
             cmd,
-            "; [ -n \"$LHOST_IFACES\" ] || export LHOST_IFACES=virtio-net0; [ -n \"$RHOST_IFACES\" ] || export RHOST_IFACES=virtio-net0"
+            "; [ -n \"$LHOST_IFACES\" ] || export LHOST_IFACES=eth0; [ -n \"$RHOST_IFACES\" ] || export RHOST_IFACES=eth0"
         );
     }
+}
+
+/// Env the official `ltp_testcode.sh` walk runs under for one lane root —
+/// also used verbatim by the `ltp-bin:` witness walk. The image script
+/// itself exports nothing; without LTPROOT/PATH every shell test fails to
+/// source `tst_net.sh` (structural 0 in the judged run). LHOST_IFACES
+/// names the boot NIC; LTP_TIMEOUT_MUL is LTP's slow-machine knob (TCG is
+/// ~20-30x slower; 10x = the official 300s per-file budget). Witness env
+/// and judged-run env must stay identical or witnessed scores don't
+/// reproduce.
+fn append_ltp_walk_env(cmd: &mut alloc::string::String, lane_root: &str) {
+    use core::fmt::Write as _;
+
+    append_busybox_bin_install(cmd);
+    let _ = write!(
+        cmd,
+        "; export LTPROOT={lane_root}/ltp; export PATH=/tx-ltp/bin:/bin:{lane_root}/ltp/testcases/bin:{lane_root}/ltp/bin:{lane_root}/ltp/testscripts:/musl/glibc:/musl/musl"
+    );
+    let _ = write!(
+        cmd,
+        "; [ -n \"$LHOST_IFACES\" ] || export LHOST_IFACES=eth0"
+    );
+    let _ = write!(
+        cmd,
+        "; [ -n \"$LTP_TIMEOUT_MUL\" ] || export LTP_TIMEOUT_MUL=10"
+    );
 }
 
 fn append_ltp_runtest_env(cmd: &mut alloc::string::String, module: &str) {
     use core::fmt::Write as _;
 
     append_ltp_script_env_with_default_ifaces(cmd, false);
-    if module == "net.ipv6_lib" {
-        let _ = write!(
-            cmd,
-            "; [ -n \"$LHOST_IFACES\" ] || export LHOST_IFACES=virtio-net0"
-        );
-    } else if is_native_network_runtest(module) {
+    if module == "net.ipv6_lib" || is_native_network_runtest(module) {
         let _ = write!(cmd, "; [ -n \"$LHOST_IFACES\" ] || export LHOST_IFACES=eth0");
     }
 }
@@ -1590,6 +1653,85 @@ fn append_ltp_runtest(
     let _ = write!(
         cmd,
         "; ./busybox echo \"#### OS COMP TEST GROUP END ltp-musl ####\""
+    );
+}
+
+/// Per-case PATH for the official-walk witness, rooted at one lane's LTP
+/// tree. Mirrors `LTP_CASE_PATH` with the lane root substituted.
+fn ltp_bin_case_path(lane_root: &str, trace: bool) -> alloc::string::String {
+    use core::fmt::Write as _;
+
+    let mut path = alloc::string::String::new();
+    if trace {
+        let _ = write!(path, "/tx-ltp/trace-bin:");
+    }
+    let _ = write!(
+        path,
+        "/tx-ltp/bin:{lane_root}/ltp/testcases/bin:{lane_root}/ltp/bin:{lane_root}/ltp/testscripts:{lane_root}:$PATH"
+    );
+    path
+}
+
+/// `ltp-bin:<lane>:<file>[+<file>...]` — run the listed
+/// `ltp/testcases/bin` files exactly the official `ltp_testcode.sh` shape:
+/// no arguments, `RUN LTP CASE <name>` / `FAIL LTP CASE <name> : <ret>`
+/// markers, names taken from the file name, all inside the lane's GROUP
+/// block. This is the per-file official-scoring witness tool: the serial
+/// log feeds `judge_ltp-{musl,glibc}.py` unchanged. Differences from the
+/// image script are env-only (LTPROOT/PATH/LHOST_IFACES exports and a
+/// `setsid` leader so a hung case can be reaped) — the same env our init
+/// provides around the real judged walk.
+fn append_ltp_bin_walk(
+    cmd: &mut alloc::string::String,
+    lane: &str,
+    files: &str,
+    args: &LtpArgs<'_>,
+) {
+    use core::fmt::Write as _;
+
+    let lane = lane.trim();
+    let files = files.trim();
+    let (group, lane_root) = match lane {
+        "glibc" => ("ltp-glibc", "/musl/glibc"),
+        _ => ("ltp-musl", "/musl/musl"),
+    };
+    let lane_ok = matches!(lane, "musl" | "glibc");
+    let files_ok = !files.is_empty()
+        && files
+            .split('+')
+            .all(|f| !f.is_empty() && is_safe_ltp_runtest_name(f));
+    if !lane_ok || !files_ok {
+        let _ = write!(
+            cmd,
+            "; ./busybox echo \"#### OS COMP TEST GROUP START {group} ####\""
+        );
+        let _ = write!(
+            cmd,
+            "; ./busybox echo \"FAIL LTP BIN {lane}:{files} : invalid spec\""
+        );
+        let _ = write!(
+            cmd,
+            "; ./busybox echo \"#### OS COMP TEST GROUP END {group} ####\""
+        );
+        return;
+    }
+
+    append_ltp_walk_env(cmd, lane_root);
+    let _ = write!(
+        cmd,
+        "; /bin/busybox echo \"#### OS COMP TEST GROUP START {group} ####\""
+    );
+    let case_path = ltp_bin_case_path(lane_root, args.trace_runtime);
+    let trace_assignment = args.shell_trace_runtime_assignment();
+    let timeout_mul_assignment = args.shell_timeout_mul_assignment();
+    let file_list = files.split('+').collect::<alloc::vec::Vec<_>>().join(" ");
+    let _ = write!(
+        cmd,
+        "; cd {lane_root}; {trace_assignment} {timeout_mul_assignment}for tx_f in {file_list}; do /bin/busybox echo \"RUN LTP CASE $tx_f\"; if [ -f \"ltp/testcases/bin/$tx_f\" ]; then if [ -n \"$tx_ltp_trace_runtime\" ]; then /bin/busybox echo \"TX-LTP-RUNTIME begin $tx_f $(/bin/busybox date +%s 2>/dev/null)\"; PS4=\"TX-LTP-CMD:$tx_f: \" PATH={case_path} LTPROOT={lane_root}/ltp KCONFIG_PATH=/proc/config /bin/busybox setsid /bin/busybox sh -x -c \"ltp/testcases/bin/$tx_f\"; ret=$?; /bin/busybox echo \"TX-LTP-RUNTIME end $tx_f $ret $(/bin/busybox date +%s 2>/dev/null)\"; else PATH={case_path} LTPROOT={lane_root}/ltp KCONFIG_PATH=/proc/config /bin/busybox setsid \"ltp/testcases/bin/$tx_f\"; ret=$?; fi; else ret=127; fi; /bin/busybox echo \"FAIL LTP CASE $tx_f : $ret\"; done; cd /musl/musl"
+    );
+    let _ = write!(
+        cmd,
+        "; /bin/busybox echo \"#### OS COMP TEST GROUP END {group} ####\""
     );
 }
 
@@ -1797,6 +1939,60 @@ mod tests {
         let mut cmd = alloc::string::String::from("cd /musl/musl");
         append_oscomp_glibc_script(&mut cmd, "netperf_testcode.sh");
         assert!(cmd.contains("; cd /musl/glibc; /musl/musl/busybox sh netperf_testcode.sh; cd /musl/musl"));
+    }
+
+    #[test]
+    fn ltp_bin_walk_emits_official_shape_per_lane() {
+        let mut cmd = String::from("cd /musl/musl");
+        append_ltp_bin_walk(
+            &mut cmd,
+            "musl",
+            "getaddrinfo_01+route-redirect.sh",
+            &LtpArgs::none(),
+        );
+        assert!(cmd.contains("#### OS COMP TEST GROUP START ltp-musl ####"));
+        assert!(cmd.contains("for tx_f in getaddrinfo_01 route-redirect.sh; do"));
+        assert!(cmd.contains("RUN LTP CASE $tx_f"));
+        assert!(cmd.contains("FAIL LTP CASE $tx_f : $ret"));
+        assert!(cmd.contains("LTPROOT=/musl/musl/ltp"));
+        assert!(cmd.contains("export LHOST_IFACES=eth0"));
+        // Official no-args shape: the file itself is the command, no -I.
+        assert!(cmd.contains("setsid \"ltp/testcases/bin/$tx_f\""));
+        assert!(!cmd.contains("-I "));
+
+        let mut glibc_cmd = String::from("cd /musl/musl");
+        append_ltp_bin_walk(&mut glibc_cmd, "glibc", "getaddrinfo_01", &LtpArgs::none());
+        assert!(glibc_cmd.contains("#### OS COMP TEST GROUP START ltp-glibc ####"));
+        assert!(glibc_cmd.contains("; cd /musl/glibc;"));
+        assert!(glibc_cmd.contains("LTPROOT=/musl/glibc/ltp"));
+        assert!(glibc_cmd.contains("/musl/glibc/ltp/testcases/bin"));
+        assert!(glibc_cmd.contains("; cd /musl/musl"));
+
+        let mut bad = String::new();
+        append_ltp_bin_walk(&mut bad, "musl", "evil;rm", &LtpArgs::none());
+        assert!(bad.contains("invalid spec"));
+        assert!(!bad.contains("for tx_f"));
+    }
+
+    #[test]
+    fn ltp_testcode_scripts_get_walk_env_in_subshell() {
+        let mut cmd = String::from("cd /musl/musl");
+        append_oscomp_musl_script(&mut cmd, "ltp_testcode.sh");
+        assert!(cmd.contains("; (true;"));
+        assert!(cmd.contains("export LTPROOT=/musl/musl/ltp"));
+        assert!(cmd.contains("export LTP_TIMEOUT_MUL=10"));
+        assert!(cmd.contains("./busybox sh ltp_testcode.sh)"));
+
+        let mut glibc_cmd = String::from("cd /musl/musl");
+        append_oscomp_glibc_script(&mut glibc_cmd, "ltp_testcode.sh");
+        assert!(glibc_cmd.contains("export LTPROOT=/musl/glibc/ltp"));
+        assert!(glibc_cmd.contains("/musl/musl/busybox sh ltp_testcode.sh)"));
+        assert!(glibc_cmd.ends_with("cd /musl/musl"));
+
+        // Non-LTP scripts stay bare — no env leak, no subshell.
+        let mut bench = String::from("cd /musl/musl");
+        append_oscomp_glibc_script(&mut bench, "netperf_testcode.sh");
+        assert!(bench.contains("; cd /musl/glibc; /musl/musl/busybox sh netperf_testcode.sh; cd /musl/musl"));
     }
 
     #[test]
