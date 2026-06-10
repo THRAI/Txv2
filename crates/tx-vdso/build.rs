@@ -19,6 +19,18 @@ fn main() {
     let vdso_so = out_dir.join("vdso.so");
     let vdso_asm = manifest_dir.join("src").join("vdso.S");
 
+    // `src/vdso.S` is RISC-V machine code. Embedding it on any other
+    // target hands userspace a wrong-ISA vDSO — la64 glibc jumps into it
+    // and the CPU decodes garbage (FPD trap inside the direct-mapped
+    // image; killed every la glibc LTP boot and the libctest clock
+    // tests). Until a LoongArch vdso.S exists, non-rv64 targets get the
+    // stub and libc falls back to real syscalls.
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    if target_arch != "riscv64" {
+        emit_stub(&out_dir);
+        return;
+    }
+
     let as_path = match find_tool("riscv64-linux-musl-as") {
         Some(p) => p,
         None => {
