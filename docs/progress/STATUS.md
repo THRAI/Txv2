@@ -11,6 +11,13 @@
   route-change-dst/gw/if(300). Full per-file ledger + action tiers:
   `msp/ltp-net-official-scoring-ledger-2026-06-10-zh.md`; rerun harness: `tools/ltp-host-ceiling/`.
   Next: tier-1 quick wins (getaddrinfo_01, ipv6_lib trio, netlink route trio, tcp_cmds re-witness).
+  Addendum (same day): **the two judges differ** — judge_ltp-musl counts Summary `passed`;
+  judge_ltp-glibc counts ANSI-colored `TPASS: ` lines (no Summary needed). Net effect on this
+  subset: +1 each for mc_cmds/mc_opts on the glibc lane only (musl 946 / glibc 948); lksctp
+  funtests and legacy `TPASS  :` output match neither judge — still 0 both lanes. txKernel serial
+  output verified to carry ANSI color (ipneigh01 log), so the glibc lane's color precondition
+  holds; keep it that way when touching console/redirect. Test sets are identical across lanes
+  for net (glibc's 20 extra bin files are all cpuset_*).
 
 - 2026-06-10 (ipsec triage) **net_stress.ipsec family = structurally 0 points; do not charter.**
   All 9 ipsec scripts in the judged image's `bin/` score 0 in the official no-args sweep *even on
