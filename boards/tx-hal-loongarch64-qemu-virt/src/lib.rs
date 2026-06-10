@@ -76,15 +76,6 @@ static LA64_FIXUP_TABLE: [La64RawFixupEntry; 2] = [
 const QEMU_LA64_RAM_BASE: usize = 0;
 const QEMU_LA64_RAM_SIZE: usize = 0x1000_0000;
 const QEMU_LA64_RAM_END: usize = QEMU_LA64_RAM_BASE + QEMU_LA64_RAM_SIZE;
-
-// LoongArch qemu-virt splits guest RAM: the low 256 MiB lives at 0x0, and any
-// memory beyond that sits above the MMIO/PCI hole at the high-memory base.
-// For `-m 1G` qemu places the remaining 768 MiB at 0x9000_0000..0xC000_0000.
-// Without registering this high region the kernel only manages the low 256 MiB
-// even though qemu provides 1 GiB (matching the RISC-V board's full 1 GiB).
-const QEMU_LA64_HIGHMEM_BASE: usize = 0x9000_0000;
-const QEMU_LA64_HIGHMEM_SIZE: usize = 0x3000_0000;
-const QEMU_LA64_HIGHMEM_END: usize = QEMU_LA64_HIGHMEM_BASE + QEMU_LA64_HIGHMEM_SIZE;
 const QEMU_LA64_KERNEL_LOAD_BASE: usize = 0x0020_0000;
 #[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
 const QEMU_LA64_PCH_PIC_BASE: usize = 0x1000_0000;
@@ -876,10 +867,7 @@ impl PlatformConfig for Platform {
     const PHYS_ADDR_BITS: u8 = 48;
     const VIRT_ADDR_BITS: u8 = 48;
     const DIRECT_MAP_BASE: VirtAddr = VirtAddr(LA64_DMW_CACHED_BASE);
-    // Cover the whole [0, high-memory end) span. The MMIO/PCI hole in the
-    // middle is mapped by the same DMW window but never registered as usable
-    // RAM, so direct-mapping past it is a software bookkeeping bound only.
-    const DIRECT_MAP_SIZE: usize = QEMU_LA64_HIGHMEM_END;
+    const DIRECT_MAP_SIZE: usize = QEMU_LA64_RAM_SIZE;
     const KERNEL_VIRT_BASE: VirtAddr = VirtAddr(la64_cached_virt(QEMU_LA64_KERNEL_LOAD_BASE));
     const USER_TOP: VirtAddr = VirtAddr(LA64_USER_TOP);
     const KERNEL_STACK_SIZE: usize = 128 * 1024;

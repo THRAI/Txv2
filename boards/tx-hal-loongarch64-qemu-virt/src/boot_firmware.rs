@@ -634,26 +634,7 @@ unsafe fn populate_boot_memory_regions_from_dtb(
         out_count += 1;
     }
 
-    append_la64_highmem_region(out, out_count)
-}
-
-/// Append the qemu-virt high-memory region (guest RAM above the MMIO/PCI hole)
-/// as a usable region. qemu places memory beyond the low 256 MiB at
-/// `QEMU_LA64_HIGHMEM_BASE`; without this the kernel only manages 256 MiB even
-/// though `-m 1G` provides 1 GiB. Returns the updated region count.
-unsafe fn append_la64_highmem_region(out: *mut MemoryRegion, out_count: usize) -> usize {
-    if QEMU_LA64_HIGHMEM_SIZE == 0 || out_count >= LA64_BOOT_MEMORY_REGION_CAPACITY {
-        return out_count;
-    }
-    core::ptr::write(
-        out.add(out_count),
-        MemoryRegion {
-            base: PhysAddr(QEMU_LA64_HIGHMEM_BASE),
-            size: QEMU_LA64_HIGHMEM_SIZE,
-            kind: MemoryRegionKind::Usable,
-        },
-    );
-    out_count + 1
+    out_count
 }
 
 unsafe fn populate_fallback_boot_memory_regions(reserved_end: usize) -> usize {
@@ -677,5 +658,5 @@ unsafe fn populate_fallback_boot_memory_regions(reserved_end: usize) -> usize {
             },
         );
     }
-    append_la64_highmem_region(out, 2)
+    2
 }

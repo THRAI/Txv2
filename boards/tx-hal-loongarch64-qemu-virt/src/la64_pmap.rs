@@ -41,12 +41,9 @@ pub(crate) const fn la64_uncached_virt(phys: usize) -> usize {
 }
 
 pub(crate) const fn la64_dmw_direct_map() -> VirtRange {
-    // The cached DMW window direct-maps the whole physical space, so record
-    // coverage up to the high-memory end (past the MMIO hole) — otherwise the
-    // boot-memory plan's direct-map validation rejects the high RAM region.
     VirtRange {
         start: VirtAddr(LA64_DMW_CACHED_BASE),
-        size: QEMU_LA64_HIGHMEM_END,
+        size: QEMU_LA64_RAM_SIZE,
     }
 }
 

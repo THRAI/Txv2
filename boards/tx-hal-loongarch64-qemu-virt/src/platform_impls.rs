@@ -183,11 +183,7 @@ impl PmapIf for Platform {
     }
 
     fn extend_direct_map(phys_end: PhysAddr) -> Result<(), PmapError> {
-        // The cached DMW window covers the entire physical address space
-        // (PALEN bits), so both the low 256 MiB and the high-memory region
-        // above the MMIO hole are already direct-mapped — no page-table work
-        // needed. Accept any phys end within the high-memory top.
-        if phys_end.0 <= QEMU_LA64_HIGHMEM_END {
+        if phys_end.0 <= QEMU_LA64_RAM_END {
             Ok(())
         } else {
             Err(PmapError::Unsupported)

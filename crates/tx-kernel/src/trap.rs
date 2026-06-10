@@ -33,10 +33,6 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
     }
 
     fn on_syscall(mut view: TrapFrameMut<'_>) -> TrapAction {
-        // DEBUG(leak-hunt): print live PageContainer count when it crosses a
-        // new 2000 bucket, interleaved with lmbench sub-test output, to localise
-        // the lat_fs OOM leak. Remove once fixed.
-        maybe_log_container_live::<P>();
         // Phase 1: translate, snapshot context into the active
         // payload, resolve the userspace-run wait, and reschedule.
         // No trap-frame writeback (Plan B); the userspace-entry
@@ -403,29 +399,6 @@ fn log_page_fault_handoff_failure<P: TxPlatform>(
     tx_hal::console_write_str::<P>(":clears=");
     write_u64::<P>(clear_count);
     tx_hal::console_write_str::<P>("\n");
-}
-
-fn maybe_log_container_live<P: TxPlatform>() {
-    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    // DEBUG(mem-verify): print the total managed physical frame count once, so
-    // we can confirm how much RAM the kernel actually manages (256 MiB = 65536
-    // frames, 1 GiB = 262144 frames).
-    static LOGGED_TOTAL: AtomicBool = AtomicBool::new(false);
-    if !LOGGED_TOTAL.swap(true, Ordering::Relaxed) {
-        if let Ok(total) = tx_substrate::page_allocator::total_count() {
-            tx_hal::console_write_str::<P>("txkernel:mem:total_frames=");
-            write_u64::<P>(total as u64);
-            tx_hal::console_write_str::<P>("\n");
-        }
-    }
-    static LAST_BUCKET: AtomicU64 = AtomicU64::new(0);
-    let live = tx_subsystems::page_backed::page_container_live();
-    let bucket = live / 2000;
-    if bucket != LAST_BUCKET.swap(bucket, Ordering::Relaxed) {
-        tx_hal::console_write_str::<P>("txkernel:leak:pc_live=");
-        write_u64::<P>(live);
-        tx_hal::console_write_str::<P>("\n");
-    }
 }
 
 fn write_usize<P: TxPlatform>(value: usize) {

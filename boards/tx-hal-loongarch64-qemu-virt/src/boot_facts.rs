@@ -225,19 +225,10 @@ pub(crate) fn publish_static_boot_facts() {
                         kind: MemoryRegionKind::Usable,
                     },
                 );
-                // High-memory RAM above the MMIO/PCI hole (the rest of `-m 1G`).
-                core::ptr::write(
-                    regions.add(2),
-                    MemoryRegion {
-                        base: PhysAddr(QEMU_LA64_HIGHMEM_BASE),
-                        size: QEMU_LA64_HIGHMEM_SIZE,
-                        kind: MemoryRegionKind::Usable,
-                    },
-                );
             }
 
             (
-                3usize,
+                2usize,
                 None,
                 0usize,
                 la64_detect_timebase_frequency_hz(),

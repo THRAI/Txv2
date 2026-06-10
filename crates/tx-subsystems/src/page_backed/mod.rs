@@ -386,28 +386,12 @@ impl MaterializedPageSnapshot {
     }
 }
 
-/// DEBUG(leak-hunt): live PageContainer count (alloc'd minus reclaimed).
-/// Tracks the same quantity as the zone `alloc=` line so we can watch which
-/// lmbench sub-test grows it. Remove once the lat_fs OOM leak is fixed.
-pub static PAGE_CONTAINER_LIVE: AtomicU64 = AtomicU64::new(0);
-
-/// DEBUG(leak-hunt): read the live PageContainer count.
-pub fn page_container_live() -> u64 {
-    PAGE_CONTAINER_LIVE.load(core::sync::atomic::Ordering::Relaxed)
-}
-
 #[derive(Debug)]
 pub struct PageContainer {
     kind: PageContainerKind,
     page_count: u64,
     size_bytes: AtomicU64,
     state: PageContainerStateCell,
-}
-
-impl Drop for PageContainer {
-    fn drop(&mut self) {
-        PAGE_CONTAINER_LIVE.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
-    }
 }
 
 // `PageCacheIndex` (inside `PageContainerState`) is a `BTreeMap<PageIndex,
@@ -585,7 +569,6 @@ fn record_map_pin_for_test() {
 
 impl PageContainer {
     pub fn new(kind: PageContainerKind, page_count: u64) -> Self {
-        PAGE_CONTAINER_LIVE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let capacity = page_count.saturating_mul(crate::vm::USER_PAGE_SIZE as u64);
         Self {
             kind,
