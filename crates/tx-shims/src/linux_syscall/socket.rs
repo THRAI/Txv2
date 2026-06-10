@@ -4234,6 +4234,30 @@ pub(super) fn sys_socket_ioctl<'a>(request: u32, argp: u64, ctx: &SyscallCtx<'a>
                 Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
             }
         }
+        // `ifr_hwaddr` = `struct sockaddr { u16 sa_family; u8 sa_data[14] }`:
+        // family ARPHRD_ETHER, then the 6-byte MAC. LTP's AF_PACKET injectors
+        // (ns-icmpv4_sender for net_stress.broken_ip, ns-udpsender, …) read
+        // the source MAC this way before building a raw frame; without it
+        // get_ifinfo()'s ioctl fatal_errors and the whole broken_ip family
+        // TFAILs at the sender.
+        SIOCGIFHWADDR => {
+            let Some(link) = link else {
+                return SyscallResult::Error(ENODEV_VALUE);
+            };
+            let mut hwaddr = [0u8; 16];
+            if link.is_loopback {
+                hwaddr[0..2].copy_from_slice(&ARPHRD_LOOPBACK.to_le_bytes());
+            } else {
+                hwaddr[0..2].copy_from_slice(&ARPHRD_ETHER.to_le_bytes());
+                if let Some(mac) = link.mac {
+                    hwaddr[2..8].copy_from_slice(&mac.octets());
+                }
+            }
+            match bootstrap_write_user(&ctx.aspace, argp + IFREQ_DATA_OFFSET, hwaddr) {
+                Ok(()) => SyscallResult::Return(0),
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+            }
+        }
         // busybox `ifconfig IFACE ADDR netmask MASK broadcast BRD` drives
         // this trio in sequence; LTP net_stress.interface scripts depend
         // on it (`if4-addr-change` was TBROK `SIOCSIFADDR: Not a tty`).
