@@ -28,18 +28,17 @@ for t, dur in fixdur.items():
         try: sc[lane] = sum(e['score'] for e in json.loads(out))
         except Exception: sc[lane] = 0
     r = byname[t]
+    r['logdir'] = fixdir  # rerun log is authoritative for reasons
     if sc['musl'] > r['musl'] or sc['glibc'] > r['glibc']:
         improved.append((t, r['musl'], sc['musl']))
         r['musl'], r['glibc'], r['dur'] = sc['musl'], sc['glibc'], dur
         r['fixed'] = True
-        # use fixed log for reason extraction
-        r['logdir'] = fixdir
 
 def reason_for(r):
     logdir = r.get('logdir', f'{BASE}/results')
     try: txt = ansi.sub('', open(f"{logdir}/{r['t']}.log", errors='replace').read())
     except Exception: return '日志缺失'
-    m = re.search(r'(TBROK|TCONF):\s*(.*)', txt)
+    m = re.search(r'(TBROK|TCONF)\s*:\s*(.*)', txt)
     first = m.group(2).strip()[:90] if m else ''
     low = first.lower()
     if 'failed to acquire device' in low or 'free loop device' in low:
@@ -50,12 +49,16 @@ def reason_for(r):
         return '沙箱:需写全局 /proc//sys/cgroup(真 root 上限>0) — ' + first
     if 'eperm' in low or 'eacces' in low:
         return '沙箱:特权操作被 userns 挡(真 root 可复测) — ' + first
+    if 'command rsh not found' in low:
+        return '结构性 0:legacy 双机测试,需 rsh+远端主机(镜像无 rsh,评测单机)'
     if 'not found' in low:
         return '镜像缺命令 — ' + first
     if 'must call tst_run' in low:
         return '库文件被当测试执行'
     if 'requires libaio' in low or 'requires libnuma' in low:
         return '宿主缺开发库(已补建重测)'
+    if 'numa node' in low or 'numa memory nodes' in low:
+        return '需≥2 NUMA 节点(宿主单节点;评测 QEMU 大概率同样 TCONF) — ' + first
     if 'kernel config' in low:
         return '内核配置条件 — ' + first
     if first:
