@@ -390,6 +390,67 @@ fn raw_icmpv4_echo_still_replies_after_local_addr_change_churn() {
     );
 }
 
+/// LTP `net_stress.interface/if-addr-addlarge_ifconfig` shape: 40 labeled
+/// add → del-by-label rounds (the witnessed guest failure was round 32's
+/// `ifconfig eth0:1:32 down` leaving the address behind).
+#[test]
+fn secondary_ipv4_label_add_del_loop_40_rounds() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
+    let primary = Ipv4Address::new([10, 0, 0, 2]);
+    let ns = crate::net::create_isolated_net_namespace_for_test("ipv4-label-loop")
+        .expect("ns")
+        .payload_cap()
+        .expect("payload");
+    let pair = create_veth_pair_for_test_or_bootstrap(VethPairConfig {
+        left: VethEndpointConfig {
+            name: "ipv4-label-loop0",
+            devt: DevT::new(91, 200),
+            mac: EthernetAddress::new([0x02, 0, 0, 0, 7, 0]),
+        },
+        right: VethEndpointConfig {
+            name: "ipv4-label-loop1",
+            devt: DevT::new(91, 201),
+            mac: EthernetAddress::new([0x02, 0, 0, 0, 7, 1]),
+        },
+        mtu: VETH_DEFAULT_MTU,
+    });
+    ns.attach_device_for_test_or_bootstrap(pair.left, None)
+        .expect("attach");
+    let auth = NetAdminAuthority::for_test_or_bootstrap();
+    ns.set_device_ipv4_addr_by_ifindex(auth, 2, Some(primary), Some(24))
+        .expect("primary");
+    for y in 1..=40u8 {
+        let addr = Ipv4Address::new([10, 23, 1, y]);
+        let label = alloc::format!("ipv4-label-loop0:1:{y}");
+        ns.add_device_ipv4_addr_by_ifindex(auth, 2, addr, 16, Some(&label))
+            .unwrap_or_else(|e| panic!("add y={y}: {e:?}"));
+        assert!(ns.ipv4_addr_is_local_up(addr), "y={y} not local after add");
+        assert_eq!(
+            ns.ipv4_extra_by_label(2, &label),
+            Some((addr, 16)),
+            "y={y} label lookup"
+        );
+        let removed = ns
+            .del_device_ipv4_addr_by_label(auth, 2, &label)
+            .unwrap_or_else(|e| panic!("del y={y}: {e:?}"));
+        assert!(removed, "y={y} label del returned false");
+        assert!(
+            ns.ipv4_extra_snapshot().is_empty(),
+            "y={y} extras not empty after del"
+        );
+    }
+    let link = ns
+        .link_snapshot()
+        .into_iter()
+        .find(|link| link.ifindex == 2)
+        .expect("link");
+    assert_eq!(link.ipv4_addr, Some(primary));
+}
+
 /// LTP `net_stress.interface/if-addr-adddel` shape: a secondary address (with
 /// an `eth0:1`-style label) is added next to the primary, must be visible and
 /// locally owned, and its removal must leave the primary configured.
