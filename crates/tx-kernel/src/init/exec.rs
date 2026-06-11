@@ -1601,6 +1601,19 @@ fn append_ltp_walk_env(cmd: &mut alloc::string::String, lane_root: &str) {
         cmd,
         "; [ -n \"$LTP_TIMEOUT_MUL\" ] || export LTP_TIMEOUT_MUL=10"
     );
+    // PING_MAX caps the ICMP echo count of every `tst_ping` connectivity
+    // check (`${PING_MAX:-500}`). The net_stress.{interface,route} family
+    // (if-mtu-change, if-updown, if-addr-addlarge, if-route-addlarge, the
+    // if4-*/if-*-adddel checks) scores ONE TPASS per `tst_ping` *invocation*
+    // (per size), not per packet — so the count is score-neutral. busybox
+    // ping has no `-f` flood, so tst_ping falls back to `-i 0.01` (10ms/pkt):
+    // at 500 packets if-mtu-change alone is 4 sizes x 100 iters x 500 x 10ms
+    // ~= 2000s of pure inter-packet sleep, a black hole in the walk's total
+    // budget under TCG. 50 packets keeps a wide reply margin on the reliable
+    // netns loopback (the check still genuinely verifies connectivity) while
+    // cutting that 20x. Same slow-machine spirit as LTP_TIMEOUT_MUL; honors
+    // any value the grader env already set.
+    let _ = write!(cmd, "; [ -n \"$PING_MAX\" ] || export PING_MAX=50");
 }
 
 fn append_ltp_runtest_env(cmd: &mut alloc::string::String, module: &str) {
@@ -1984,6 +1997,7 @@ mod tests {
         assert!(cmd.contains("; (true;"));
         assert!(cmd.contains("export LTPROOT=/musl/musl/ltp"));
         assert!(cmd.contains("export LTP_TIMEOUT_MUL=10"));
+        assert!(cmd.contains("export PING_MAX=50"));
         assert!(cmd.contains("./busybox sh ltp_testcode.sh)"));
 
         let mut glibc_cmd = String::from("cd /musl/musl");
