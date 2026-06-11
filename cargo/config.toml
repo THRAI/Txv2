@@ -16,7 +16,7 @@ linker = "rust-lld"
 # `&str` descriptor in `.rodata` (or a stale stack addr) instead of calling
 # panic, faulting INE — a kernel-mode wild jump that broke the entire
 # la.glibc lane (every page-backed/ext4/zone atomic path glibc exercises).
-# opt-level=2 inlines compare_exchange so the const orderings fold and the
+# opt-level=1 inlines compare_exchange so the const orderings fold and the
 # broken dispatcher is never emitted. Scoped to la64 targets only.
 rustflags = ["-Copt-level=1"]
 
