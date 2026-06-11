@@ -1,3 +1,31 @@
+- 2026-06-11 (la lane unblock + broken_ip start) **Fixed the deep la64 codegen bug that blocked
+  the ENTIRE la.glibc LTP lane (0 → matching rv on C tests), and unblocked the broken_ip AF_PACKET
+  sender setup.** (1) **la.glibc lane was 100% blocked** by a kernel-mode INE wild-jump: the
+  LoongArch backend miscompiles `core::sync::atomic`'s out-of-line `compare_exchange` dispatcher in
+  **unoptimized (debug) builds** — the success/failure-ordering `match` panic arm jumps to the
+  panic-string `&str` descriptor in `.rodata` instead of calling panic, so the CPU executes data
+  and faults INE (CRMD.PLV=0). Hit on every page-backed/ext4/zone atomic path a glibc binary
+  exercises (musl static binaries churn pages less and dodged it; rv relocates the same code
+  fine). Diagnosed with a NEW `console_write_kernel_stack_scan` added to the la64 fatal-trap
+  handler (prints stack words in .text → offline objdump backtrace). Fix = build la64 at
+  **opt-level=1 via per-target `.cargo/config` rustflags** (rv byte-unchanged); at opt>=1
+  compare_exchange inlines, const orderings fold, broken dispatcher never emitted. **Verified:
+  la.glibc + la.musl now score getaddrinfo_01 22, in6_01 5, in6_02 3, sctp_big_chunk 1,
+  initmsg_connect 2 = 33, matching rv** (commit 7a09fe00). (2) **SIOCGIFHWADDR ioctl** (4c939ad1):
+  AF_PACKET frame injectors (ns-icmpv4_sender for broken_ip) read the source MAC via
+  ioctl(SIOCGIFHWADDR); the arm was missing so every broken_ip-* TFAILed at the sender. Now the
+  sender runs setup. **OPEN (handoff, top priority): broken_ip send_packets loop doesn't terminate**
+  — `for(;;){sendto; if(timeout < difftime(time(NULL),start)) break;}` never breaks. Verified the
+  whole kernel time path is correct (scounteren.TM=2 enables user rdtime, WALL_CLOCK mult=100/
+  shift=0, read_cycle_counter & vDSO both use `rdtime`, vdso.S extrapolation math correct). Suspect
+  the sender's `-t` arg computed empty/0 by tst_net.sh's `$(($timeout/$num))` (→ SIGHUP-only loop =
+  infinite; may share root with the la-shell "out of range" arithmetic, task #8) OR a TCG time-CSR
+  issue — next step: trace-capture the actual ns-icmpv4_sender argv. **Remaining la-specific gaps**
+  (separate tasks): asapi_02 hangs on la at ICMP6_FILTER expect-block (recv-timeout, 12pts ×2
+  lanes), la shell tests (timeout arithmetic + userspace helper segv pc=0x104e950), nft02/accept02
+  on la.musl. Full per-row scores + handoff at `msp/ltp-net-progress-table-2026-06-10-zh.md` (see
+  the "交接说明" section at the bottom).
+
 - 2026-06-11 (net progress-table campaign, tier-1 sweep) **Official-walk witness harness built;
   tier-1 quick wins largely banked on rv.musl/rv.glibc/la.musl; four kernel bugs found, three
   fixed.** New boot selector `ltp-bin:<lane>:<file>+...` runs listed `ltp/testcases/bin` files
