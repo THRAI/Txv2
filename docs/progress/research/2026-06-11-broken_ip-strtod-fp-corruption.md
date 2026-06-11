@@ -204,6 +204,40 @@ after mapping (reuse-while-mapped). Cross-reference with `emit_vm_trace`
 (`debug.vm.fault.*`) which is already wired through the observe system. The
 deterministic failure ⇒ a deterministic mapping/content bug, not a pure race.
 
+## In-situ instrumentation results (2026-06-11, round 2) — corruption is in WRITABLE data
+
+Built the probe above (flag in `tx_hal` set on `icmpv4_sender` exec; logger in
+`boards/.../pmap/address_space.rs::commit_mapping_from_root`, which has VA, PA,
+perms via `reservation`, and frame content via `topology::direct_map_virt`).
+Ran the real broken_ip-version.sh (image sender, hangs). Findings:
+
+- **Sender read-only (code/rodata) page commits look VALID at commit time.**
+  76 read-only USER commits; the strtod code page that *was* re-committed
+  (`va=0x3e007ca000`) holds valid RISC-V (`b0=4086843b0885cc63 …`). Only two
+  pa's were aliased to 2 VAs each, both legitimate: an ELF segment-boundary
+  page (adjacent VAs, same file page) and a shared zero page.
+- **A content-change detector (record each sender read-only frame's first 16
+  bytes at commit; re-verify all recorded frames on every later commit) fired
+  `VMCHANGED = 0`.** So no sender code/rodata frame is reused-while-mapped or
+  otherwise corrupted after mapping.
+- Combined with the earlier register-preservation proof: **strtod executes
+  correct code with correct rodata constants and preserved registers, yet
+  returns 0.0.** Therefore the corruption is in **WRITABLE data** — the input
+  `"2"` string (in argv on the initial stack) that strtod parses, or the
+  long-double soft-float's **stack spills** — most likely an **anon writable
+  page mapped to a reused frame** (or the argv page corrupted). NOTE: most of
+  the strtod *execution* pages from the FP trace were NOT re-committed after the
+  sender exec (they were shared-cached from earlier in boot), so a from-boot
+  log would be needed to cover those too.
+
+Next instrumentation (round 3): widen the probe to WRITABLE USER commits and
+detect anon-page frame reuse (a pa committed for two distinct anon-writable VAs
+without an intervening unmap — illegitimate for private anon), and/or dump the
+sender's argv `"2"` string region at the first AF_PACKET sendto (sender already
+spinning, strtod done) to confirm whether the *input* was corrupted vs a spill.
+Focus the VM fix on the anon/private-page materialization + frame-allocation
+path rather than the file-backed/page-cache path (the latter is verified clean).
+
 ## Bottom line for scoring
 
 broken_ip ×8 (~47 pts/lane) stays blocked behind a VM-under-load correctness
