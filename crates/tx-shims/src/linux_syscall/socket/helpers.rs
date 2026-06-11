@@ -565,7 +565,46 @@ pub(super) fn read_sockaddr_un_path<'a>(
     if path_len == 0 {
         return Err(Errno::EINVAL);
     }
-    UnixSocketPath::new(&raw_path[..path_len])
+    unix_pathname_key(ctx, &raw_path[..path_len])
+}
+
+/// Resolve a pathname AF_UNIX address to a cwd-absolute key.
+///
+/// AF_UNIX pathname bindings live in one global per-netns table keyed by the
+/// raw `sun_path`. LTP tests (e.g. `bind03`) bind a fixed relative name like
+/// `socket.1` after chdir-ing into a fresh per-run temp dir; the musl and
+/// glibc runs use different temp dirs but the same relative name, so a raw key
+/// collides across runs (musl's leftover node makes glibc's bind EADDRINUSE).
+/// Linux keys on the resolved inode, which is naturally per-directory; we
+/// approximate that by prefixing the process cwd so the same relative name in
+/// different directories yields distinct keys.
+///
+/// Abstract (leading NUL) and already-absolute paths are used verbatim. Bind,
+/// connect, sendto (all via `read_sockaddr_un_path`) and unlink
+/// (`try_unlink_unix_socket_path`) must all route through this so their keys
+/// agree. Falls back to the raw path if the cwd cannot be rendered or the
+/// absolute form would exceed `UNIX_SOCKET_PATH_MAX`.
+pub(crate) fn unix_pathname_key(
+    ctx: &SyscallCtx<'_>,
+    raw_path: &[u8],
+) -> Result<UnixSocketPath, Errno> {
+    match raw_path.first() {
+        Some(&0) | Some(&b'/') | None => UnixSocketPath::new(raw_path),
+        Some(_) => {
+            if let Some(cwd) = ctx.process.cwd() {
+                if let Some(mut abs) = tx_subsystems::vfs::render_dentry_path(&cwd) {
+                    if abs.last() != Some(&b'/') {
+                        abs.push(b'/');
+                    }
+                    abs.extend_from_slice(raw_path);
+                    if let Ok(path) = UnixSocketPath::new(&abs) {
+                        return Ok(path);
+                    }
+                }
+            }
+            UnixSocketPath::new(raw_path)
+        }
+    }
 }
 
 pub(super) fn unix_pathname_bind_precheck<'a>(

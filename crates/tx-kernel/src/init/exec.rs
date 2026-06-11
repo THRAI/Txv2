@@ -1958,7 +1958,7 @@ setpgid03+setregid02+setresgid03+setresuid03+setresuid04+setrlimit02+setrlimit03
 sighold02+signal01+signal02+splice03+splice04+statfs02+statfs02_64+tee02+tgkill03+tkill02+unshare02+\
 vmsplice02+waitid04+waitid05+waitid06+waitpid06+waitpid09+waitpid10+waitpid12+fanotify04+fanotify08+\
 write01+clock_settime01+clock_settime02+settimeofday01+settimeofday02+stime01+stime02+socket01+\
-getsockname01+setsockopt01+sendto02+accept01+accept03+setsockopt03";
+getsockname01+setsockopt01+sendto02+accept01+accept03+setsockopt03+bind04+bind05+socketpair01+recvmsg01+getsockopt01+accept4_01+getpeername01+fcntl36_64+fcntl36+bind01+in6_01+socketpair02+socket02+sendmmsg02+sendmmsg01+send02+bind03+utsname04+utsname02+setsockopt02+setgroups03+semtest_2ns+utsname01+thp01+tgkill01+shmnstest+shmem_2nstest+shm_comm+setsockopt10+setsockopt04+sem_nstest+sem_comm+recvmsg03+recvmsg02+recvmmsg01+mqns_02+mqns_01+mmapstress04+mmapstress01+mesgq_nstest+getsockopt02+futex_wait03+fsx-linux+fork_procs+cve-2017-17052+connect02+bind02+accept02";
 
 // Final LA64 LTP submit whitelist. Keep this as the single LA source of truth.
 #[allow(dead_code)]
@@ -2029,7 +2029,7 @@ setresgid03+setresuid03+setresuid04+setrlimit02+setrlimit03+shmctl07+shmdt01+sig
 signal02+splice03+splice04+statfs02+statfs02_64+tee02+unshare02+vmsplice02+waitid04+waitid05+\
 waitid06+waitpid06+waitpid09+waitpid10+waitpid12+fanotify04+fanotify08+write01+clock_settime01+\
 clock_settime02+settimeofday01+settimeofday02+stime01+stime02+socket01+getsockname01+setsockopt01+\
-sendto02+accept01+accept03+setsockopt03";
+sendto02+accept01+accept03+setsockopt03+bind04+bind05+socketpair01+recvmsg01+getsockopt01+accept4_01+getpeername01+fcntl36_64+fcntl36+bind01+in6_01+socketpair02+socket02+sendmmsg02+sendmmsg01+send02+bind03+utsname04+utsname02+setsockopt02+setgroups03+semtest_2ns+utsname01+thp01+tgkill01+shmnstest+shmem_2nstest+shm_comm+setsockopt10+setsockopt04+sem_nstest+sem_comm+recvmsg03+recvmsg02+recvmmsg01+mqns_02+mqns_01+mmapstress04+mmapstress01+mesgq_nstest+getsockopt02+futex_wait03+fsx-linux+fork_procs+fcntl34_64+fcntl34+cve-2017-17052+connect02+bind02+accept02";
 
 #[cfg(target_arch = "loongarch64")]
 fn ltp_submit_cases_for_arch() -> &'static str {

@@ -398,7 +398,9 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
 }
 
 fn try_unlink_unix_socket_path(ctx: &SyscallCtx<'_>, path: &[u8], guard: &Guard<'_>) -> bool {
-    let Ok(path) = UnixSocketPath::new(path) else {
+    // Same cwd-absolute key derivation as bind/connect (read_sockaddr_un_path)
+    // so unlink(2) matches the bound key for relative pathname sockets.
+    let Ok(path) = crate::linux_syscall::socket::unix_pathname_key(ctx, path) else {
         return false;
     };
     let Some(net_namespace) = ctx.process.net_namespace() else {
