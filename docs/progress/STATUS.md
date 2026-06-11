@@ -8,6 +8,9 @@
   cross-test-safe: each var is read ONLY by its own bin script (+ the tst_net.sh default), grep'd
   across all bin/*.sh. **Verified rv.musl real judge:** if-addr-addlarge 21/21 (~194s exec),
   if-route-addlarge 21/21 (~183s exec) — both under 300s; if-addr-adddel still 1/1 (no regression).
+  **rv.glibc also verified: if-addr-addlarge 21/21, if-route-addlarge 21/21 (~218s) → +84 total across
+  rv.musl+rv.glibc.** (la lanes get the same env injection but were not re-witnessed — la has separate
+  busybox/codegen blockers; likely +42/la-lane once those clear.)
   **if-updown does NOT cross (~360s):** its checks pass `restore_ip`, so each of the 20 (fixed) checks
   runs `restore_ipaddr` = tst_init_iface + 2x tst_add_ipaddr via remote `tst_rhost_run` ns-exec
   (~17s/check, ns-exec-bound, NOT a removable DAD/sleep — tst_wait_ipv6_dad returns fast, 0 "DAD
