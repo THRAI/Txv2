@@ -1899,11 +1899,17 @@ static int main_ping(int argc, char **argv, int v6_name)
         t0 = now_us();
         for (;;) {
             u64 now = now_us();
+            int can_send;
             if (o.deadline_s && now - t0 >= (u64)o.deadline_s * 1000000ull)
                 break;
-            if (sent < o.count &&
-                (sent == 0 || o.flood ||
-                 now - tlast_send >= o.interval_us)) {
+            /* flood: keep up to 8 echoes in flight (strictly >= the
+             * window-1 iputils pacing: when replies lag, fall back to a
+             * 10ms-per-send floor exactly like `ping -f`). */
+            can_send = sent == 0 ||
+                       (o.flood ? (sent - recvd < 8 ||
+                                   now - tlast_send >= 10000)
+                                : now - tlast_send >= o.interval_us);
+            if (sent < o.count && can_send) {
                 /* build echo request */
                 pkt[0] = o.v6 ? 128 : 8;
                 pkt[1] = 0;
@@ -1943,10 +1949,13 @@ static int main_ping(int argc, char **argv, int v6_name)
                     if (recvd >= sent || now - tlast_send >= linger)
                         break;
                     window_us = 20000;
+                } else if (o.flood) {
+                    /* pipeline open -> drain without blocking and keep
+                     * sending; pipeline full -> wait for replies (10ms
+                     * floor mirrors iputils flood pacing) */
+                    window_us = (sent - recvd < 8) ? 0 : 10000;
                 } else {
-                    window_us = o.flood
-                                    ? 10000
-                                    : (o.interval_us - (now - tlast_send));
+                    window_us = o.interval_us - (now - tlast_send);
                     if ((long)window_us < 0)
                         window_us = 0;
                     if (window_us > 50000)
@@ -2284,6 +2293,38 @@ static int main_tst_ns_exec(int argc, char **argv)
 }
 
 /* ------------------------------------------------------------------ */
+/* applet: bench-syscall (diagnostic: end-to-end null-syscall cost)    */
+/* ------------------------------------------------------------------ */
+
+static int main_bench_syscall(int argc, char **argv)
+{
+    u64 t0, t1;
+    int i;
+    const int n = 10000;
+    if (argc > 1 && !nf_strcmp(argv[1], "spin")) {
+        /* endless getpid loop for host-side PC-sampling profiles */
+        for (;;)
+            sys0(NR_getpid);
+    }
+    t0 = now_us();
+    for (i = 0; i < n; i++)
+        sys0(NR_getpid);
+    t1 = now_us();
+    fmt2(1, "TX-BENCH-SYSCALL getpid x%d total_us=%d", n, (long)(t1 - t0));
+    fmt1(1, " ns_per_call=%d\n", (long)((t1 - t0) * 1000 / (u64)n));
+    t0 = now_us();
+    for (i = 0; i < n; i++) {
+        struct timespec_k ts;
+        sys2(NR_clock_gettime, 1, &ts);
+    }
+    t1 = now_us();
+    fmt2(1, "TX-BENCH-SYSCALL clock_gettime x%d total_us=%d", n,
+         (long)(t1 - t0));
+    fmt1(1, " ns_per_call=%d\n", (long)((t1 - t0) * 1000 / (u64)n));
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* dispatch                                                            */
 /* ------------------------------------------------------------------ */
 
@@ -2332,6 +2373,8 @@ static int applet_main(int argc, char **argv)
         return main_pgrep(argc, argv);
     if (!nf_strcmp(name, "tst_sleep"))
         return main_tst_sleep(argc, argv);
+    if (!nf_strcmp(name, "bench-syscall"))
+        return main_bench_syscall(argc, argv);
     puts_fd(2, "tx-netfast: unknown applet\n");
     return 127;
 }

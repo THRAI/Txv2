@@ -218,6 +218,14 @@ fn slot_from_key<T: 'static>(erased: *const (), key: SlotKey) -> Option<*mut ()>
 struct ZoneRegistry {
     lock: SpinLock,
     entries: [UnsafeCell<Option<RegisteredZone>>; MAX_REGISTERED_ZONES],
+    /// Lock-free read gate per entry. `register` publishes with `Release`
+    /// after writing the entry under `lock`; `entry_at` reads the entry
+    /// without the lock once it observes `true` with `Acquire`. Entries are
+    /// write-once for the kernel's lifetime (`clear` is boot/test-only), so
+    /// a published entry is immutable and the unguarded read is sound. This
+    /// keeps the global registry SpinLock off the per-Cap resolution path —
+    /// it was acquired on every Cap deref/clone/drop in every subsystem.
+    published: [core::sync::atomic::AtomicBool; MAX_REGISTERED_ZONES],
 }
 
 unsafe impl Sync for ZoneRegistry {}
@@ -227,6 +235,8 @@ impl ZoneRegistry {
         Self {
             lock: SpinLock::new(),
             entries: [const { UnsafeCell::new(None) }; MAX_REGISTERED_ZONES],
+            published: [const { core::sync::atomic::AtomicBool::new(false) };
+                MAX_REGISTERED_ZONES],
         }
     }
 
@@ -237,7 +247,8 @@ impl ZoneRegistry {
 
         let _guard = self.lock.lock();
         unsafe {
-            let slot = &mut *self.entries[entry.zone_id.0 - 1].get();
+            let index = entry.zone_id.0 - 1;
+            let slot = &mut *self.entries[index].get();
             match *slot {
                 Some(existing)
                     if existing.erased == entry.erased && existing.type_id == entry.type_id =>
@@ -247,6 +258,7 @@ impl ZoneRegistry {
                 Some(_) => Err(ZoneError::InvalidState),
                 None => {
                     *slot = Some(entry);
+                    self.published[index].store(true, Ordering::Release);
                     Ok(())
                 }
             }
@@ -347,13 +359,19 @@ impl ZoneRegistry {
         if index >= MAX_REGISTERED_ZONES {
             return None;
         }
-        let _guard = self.lock.lock();
+        // Lock-free fast path: a published entry is write-once immutable
+        // (see `published` field docs), so the unguarded read after the
+        // Acquire gate observes the fully-written entry from `register`.
+        if !self.published[index].load(Ordering::Acquire) {
+            return None;
+        }
         unsafe { *self.entries[index].get() }
     }
 
     fn clear(&self) {
         let _guard = self.lock.lock();
-        for entry in &self.entries {
+        for (index, entry) in self.entries.iter().enumerate() {
+            self.published[index].store(false, Ordering::Release);
             unsafe {
                 *entry.get() = None;
             }

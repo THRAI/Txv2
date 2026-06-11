@@ -190,7 +190,7 @@ fn try_direct_trap_syscall<P: TxPlatform>(
     );
 
     let dispatch_start = direct_sigprocmask_detail_now(req.nr);
-    let Some(result) = tx_shims::linux_syscall::dispatch_direct_trap_payload_oneshot(
+    let Some(result) = tx_shims::linux_syscall::dispatch_direct_trap_payload_oneshot::<P>(
         req, &process, &thread, &payload, &aspace,
     ) else {
         emit_direct_sigprocmask_detail_duration(
@@ -269,6 +269,10 @@ fn direct_syscall_preconditions(
     payload: &tx_subsystems::thread_runtime::ThreadPayload,
     process: &tx_subsystems::process::ProcessIdentity,
 ) -> bool {
+    use tx_shims::linux_syscall::numbers::{
+        NR_CLOCK_GETTIME, NR_GETEGID, NR_GETEUID, NR_GETGID, NR_GETPID, NR_GETTID,
+        NR_GETTIMEOFDAY, NR_GETUID,
+    };
     match nr {
         NR_RT_SIGPROCMASK => {
             payload.pending().snapshot() == 0
@@ -277,6 +281,15 @@ fn direct_syscall_preconditions(
         }
         NR_SET_TID_ADDRESS => {
             payload.interrupt_summary() == tx_subsystems::signal::InterruptSummary::EMPTY
+        }
+        // Direct query lane (getpid-class + clock reads): only bypass the
+        // run_thread AST checkpoint when no signal work is pending, so
+        // delivery timing is identical to the slow path.
+        NR_GETPID | NR_GETTID | NR_GETUID | NR_GETEUID | NR_GETGID | NR_GETEGID
+        | NR_CLOCK_GETTIME | NR_GETTIMEOFDAY => {
+            payload.pending().snapshot() == 0
+                && process.group_pending_snapshot() == 0
+                && payload.interrupt_summary() == tx_subsystems::signal::InterruptSummary::EMPTY
         }
         _ => true,
     }

@@ -924,6 +924,24 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
                 selected += 1;
                 continue;
             }
+            // `bench-syscall-spin` — endless in-guest getpid loop for
+            // host-side QEMU-monitor PC-sampling profiles of the syscall
+            // round-trip (witness-only diagnostic).
+            if group == "bench-syscall-spin" {
+                use core::fmt::Write as _;
+                let _ = write!(cmd, "; /tx-ltp/bin/tx-netfast bench-syscall spin");
+                selected += 1;
+                continue;
+            }
+            // `bench-fork-spin` — endless bare-subshell loop for host-side
+            // PC-sampling profiles of the fork/exit/wait lifecycle
+            // (witness-only diagnostic).
+            if group == "bench-fork-spin" {
+                use core::fmt::Write as _;
+                let _ = write!(cmd, "; while :; do ( : ); done");
+                selected += 1;
+                continue;
+            }
             if let Some(spec) = group.strip_prefix("ltp-bin:") {
                 let (lane, files) = spec.split_once(':').unwrap_or(("musl", spec));
                 let ltp_args = ltp_args_from_cmdline::<P>();
@@ -1772,6 +1790,7 @@ fn append_spawn_bench(cmd: &mut alloc::string::String) {
          ; tx_bench tiny-exec tx_spawn_null\
          ; tx_bench bb-exec tx_bb_null\
          ; tx_bench pipe-grep tx_pipe\
+         ; /tx-ltp/bin/tx-netfast bench-syscall\
          ; /bin/busybox echo \"#### OS COMP TEST GROUP END bench-spawn ####\""
     );
 }

@@ -692,7 +692,7 @@ pub fn dispatch_vm_try_oneshot(
 /// the userspace-run wait. The caller is responsible for proving any
 /// syscall-specific safety preconditions, such as signal quiescence for
 /// `rt_sigprocmask`.
-pub fn dispatch_direct_trap_oneshot(
+pub fn dispatch_direct_trap_oneshot<P: tx_hal::TimeIf>(
     req: &SyscallRequest,
     process: &Cap<ProcessIdentity>,
     thread: &Cap<ThreadIdentity>,
@@ -700,6 +700,32 @@ pub fn dispatch_direct_trap_oneshot(
 ) -> Option<SyscallResult> {
     match req.nr {
         NR_GETPPID => dispatch_cap_only_immediate(req, process),
+        // Pure queries / clock reads: never yield, never touch
+        // VFS/VM/reactor state. They reuse the same Lane-1 immediate
+        // handlers the generic dispatcher runs; serving them from the
+        // trap shell skips the full run_thread reactor round-trip
+        // (~576us measured end-to-end for getpid under TCG). The trap
+        // shell only routes here when no signal is pending (see
+        // `direct_syscall_preconditions`), so AST delivery timing is
+        // unchanged.
+        NR_GETPID | NR_GETTID | NR_GETUID | NR_GETEUID | NR_GETGID | NR_GETEGID
+        | NR_CLOCK_GETTIME | NR_GETTIMEOFDAY => {
+            let l0_span = emit_syscall_enter(req);
+            let ctx = SyscallCtx::new(process.clone(), thread.clone(), aspace.clone());
+            let result = match req.nr {
+                NR_GETPID => sys_getpid(&ctx),
+                NR_GETTID => sys_gettid(&ctx),
+                nr if nr == NR_GETUID => sys_getuid(&ctx),
+                nr if nr == NR_GETEUID => sys_geteuid(&ctx),
+                nr if nr == NR_GETGID => sys_getgid(&ctx),
+                nr if nr == NR_GETEGID => sys_getegid(&ctx),
+                nr if nr == NR_CLOCK_GETTIME => sys_clock_gettime::<P>(req.args, &ctx),
+                nr if nr == NR_GETTIMEOFDAY => sys_gettimeofday::<P>(req.args, &ctx),
+                _ => unreachable!("direct query prefilter covers all arms"),
+            };
+            emit_syscall_exit(l0_span, &result);
+            Some(result)
+        }
         NR_FUTEX => {
             let l0_span = emit_syscall_enter(req);
             let prev = tx_observe::set_current_parent_span(l0_span);
@@ -729,7 +755,7 @@ pub fn dispatch_direct_trap_oneshot(
 
 /// Direct trap-resume lane variant for call sites that already hold the
 /// current userspace thread payload.
-pub fn dispatch_direct_trap_payload_oneshot(
+pub fn dispatch_direct_trap_payload_oneshot<P: tx_hal::TimeIf>(
     req: &SyscallRequest,
     process: &Cap<ProcessIdentity>,
     thread: &Cap<ThreadIdentity>,
@@ -738,7 +764,7 @@ pub fn dispatch_direct_trap_payload_oneshot(
 ) -> Option<SyscallResult> {
     match req.nr {
         NR_RT_SIGPROCMASK => dispatch_thread_payload_aspace_oneshot(req, thread, payload, aspace),
-        _ => dispatch_direct_trap_oneshot(req, process, thread, aspace),
+        _ => dispatch_direct_trap_oneshot::<P>(req, process, thread, aspace),
     }
 }
 
