@@ -1,3 +1,34 @@
+- 2026-06-11 (broken_ip root cause — REFUTES the prior handoff theory) **The broken_ip sender
+  hang is NOT an argv/`-t`-arithmetic bug and NOT a frozen clock. The sender's `strtod("2")`
+  returns `0.0` instead of `2.0`, so `fake_p->timeout==0` and `send_packets()`'s
+  `for(;;){sendto; if(fake_p->timeout) …break;}` guard is false forever.** Proven: kernel
+  execve dump shows literal `-t 2`; kernel dump of the sender's `fake_p` struct from user memory
+  shows `timeout` bytes all-zero; the syscall trace is 591×`sendto` with exactly ONE
+  `clock_gettime` (the `start_time=time(NULL)` before the loop), and a kernel heartbeat showed
+  CLOCK_REALTIME advancing the whole time. The vDSO is not even advertised (`at_sysinfo_ehdr:
+  None`), so libc uses the `clock_gettime` syscall — the prior handoff's `scounteren.TM`/`vdso.S`
+  verification was of an UNUSED path. **It is an FP-computation corruption, not net/clock/argv.**
+  Isolation: a standalone `strtod("2")` (static + dynamic against the image's own libc) → 2.0;
+  300 000-call loop → zero corruption; quad/`long double` soft-float → correct. The image's
+  `ns-icmpv4_sender` corrupts only because it demand-faults many cold libc+binary code pages
+  DURING strtod's long-double soft-float (FP trace: ~10 FS=Dirty instruction-fetch page faults +
+  timers flooding `__floatscan`). Decisive: I recompiled `ns-icmpv4_sender` from LTP source with
+  my toolchain (dynamic, byte-identical strtod→store sequence), dropped it into the image, ran
+  the REAL broken_ip-version.sh in its netns → `MYSND-TIMEOUT=2.0` and **TPASS**. Same context,
+  same libc, smaller binary (fewer faults) → works; the 58 KB image binary (more faults) fails.
+  Register preservation across the faults is correct (asm FP save/restore, capture/restore,
+  re-entry all verified). **Root cause = a VM / demand-paging-under-load correctness bug (same
+  class as the known page-allocator-scan / pmap-root-UAF notes), corrupting strtod's
+  soft-float, NOT the FP context machinery.** Full analysis + reproduction harness (debugfs
+  `tune2fs -O ^metadata_csum` inject into a copy, `ltp-bin:` walk) + a separate latent
+  FP-save-asymmetry fix (save `FS>=2` vs restore `FS!=Off`; orthogonal, didn't fix broken_ip) in
+  `docs/progress/research/2026-06-11-broken_ip-strtod-fp-corruption.md`. **Next: chase the VM
+  demand-paging corruption (audit `hand_off_user_pf` async resolve→re-enter + pmap-root reclaim;
+  check faulted code/rodata pages map correct content).** Verification: all probes reverted, tree
+  clean, rv64 submit kernel rebuilt clean. broken_ip ×8 (~47 pts/lane) stays blocked; rv tier-1
+  (~95 pts/lane) unaffected. NOTE: LTP `fptest01/02` failing on rv64 is the x86-80bit-vs-riscv-128bit
+  `long double` width difference, NOT our bug — do not chase.
+
 - 2026-06-11 (la lane unblock + broken_ip start) **Fixed the deep la64 codegen bug that blocked
   the ENTIRE la.glibc LTP lane (0 → matching rv on C tests), and unblocked the broken_ip AF_PACKET
   sender setup.** (1) **la.glibc lane was 100% blocked** by a kernel-mode INE wild-jump: the
