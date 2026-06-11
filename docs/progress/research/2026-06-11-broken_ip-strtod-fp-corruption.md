@@ -238,6 +238,43 @@ spinning, strtod done) to confirm whether the *input* was corrupted vs a spill.
 Focus the VM fix on the anon/private-page materialization + frame-allocation
 path rather than the file-backed/page-cache path (the latter is verified clean).
 
+## Round 3 + TLB test (2026-06-11) — mappings are fully correct; NOT a stale TLB
+
+- **No frame reuse / aliasing.** Logged EVERY user-page commit (va, pa, perms)
+  after the sender execs (86 commits — the test is hung waiting, so little
+  concurrent activity during strtod). Only 3 physical frames were mapped to >1
+  va, all **legitimate**: a shared zero page, an ELF segment-boundary page
+  (adjacent VAs, same file page), and one RO→RW **CoW** permission change on a
+  single va. The X∩W "intersection" is just the 3 RWX stack pages (the stack is
+  mapped executable for the signal trampoline). So **the page tables and frame
+  contents are entirely correct.**
+- Also confirmed **argv is intact**: the `fake_p` dump shows saddr/daddr/MAC all
+  correct (parsed from -S/-D/-M by getopt+inet_pton), so the strtod **input
+  `"2"` is not corrupted** either.
+- **Stale-TLB hypothesis REFUTED.** `activate_user_pmap` writes `satp` without an
+  `sfence.vma` on address-space switch (an optimization that removed the old
+  unconditional flush; comment at `boards/.../lib.rs` ~476-488). Re-added a
+  per-switch `sfence.vma` → broken_ip **still hangs** (0 TPASS). So it is not a
+  stale TLB on switch (and under QEMU TCG a `satp` write flushes anyway).
+
+So: correct code, correct rodata constants, correct input, preserved registers,
+correct page tables, no TLB staleness — **yet `strtod("2")` returns 0.0.** The
+remaining candidates are a **stack-spill of the long-double soft-float** that is
+re-faulted/lost across a cold-page fault at a precise moment, or a libc-internal
+data path, both extremely timing-specific. After ~6 instrumentation rounds the
+exact faulting step has not been isolated by static logging.
+
+## Recommended definitive next tool: QEMU gdbstub single-step
+
+Static commit/content logging has exhausted its usefulness. The decisive next
+step is **QEMU `-s -S` gdbstub** (as used for the route4 livelock): break at the
+sender's `strtod` return / the `fsd fa0,1568(s0)` store in `parse_options`
+(`0x…15d8` + PIE base), single-step the soft-float, and watch the exact
+instruction where the running value diverges from 2.0 — then correlate that VA
+with `info mem` / the page tables. That pinpoints whether it's a spill reload, a
+specific FP op, or a memory read returning the wrong byte, which static logging
+cannot see.
+
 ## Bottom line for scoring
 
 broken_ip ×8 (~47 pts/lane) stays blocked behind a VM-under-load correctness
