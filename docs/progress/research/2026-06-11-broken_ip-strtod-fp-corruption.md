@@ -275,6 +275,44 @@ with `info mem` / the page tables. That pinpoints whether it's a spill reload, a
 specific FP op, or a memory read returning the wrong byte, which static logging
 cannot see.
 
+## gdbstub session results (2026-06-11, round 4) — confirmed: corruption is in the soft-float compute
+
+Built a working harness: `qemu-system-riscv64 … -S -s` (gdbstub on :1234, halted)
++ `gdb-multiarch --batch -x script` (`set architecture riscv:rv64`,
+`target remote :1234`, `hbreak *0x3e007cadfc`). The libc runtime VAs from the FP
+trace are deterministic, so no PIE-base wrangling is needed to break inside the
+soft-float. (Note: write gdb scripts into the repo dir, NOT /tmp — a tmp-cleaner
+deletes them mid-session; and start QEMU with run_in_background then drive gdb in
+a separate foreground call, else the `( qemu ) &` + port-:1234 reuse races.)
+
+Findings, stepping from strtod's first FP op (`frrm` at `0x3e007cadfc`):
+- At the frrm: `a1=0x3fff000000000000` (the long double **1.0L**), `s5=2` (the
+  parsed digit), `fa0=0`. The code is the quad→double conversion (extracts
+  exponent/mantissa from the `a1:a0` quad).
+- Single-stepped ~56 instructions; the soft-float then **jumps to `0x3e007cb0e4`,
+  a COLD page** (gdb: "Cannot access memory") — exactly one of the FP-trace
+  fault sites. So the soft-float executes across **cold instruction-fetch
+  faults**.
+- Broke *after* that fault (hbreak `*0x3e007cb0e4` + continue): the page maps in
+  and **registers are preserved** across the fault (a0=0x1, a1=0xe,
+  s3=0x8000000000000, s5=0x1 — identical before/after). So the fault does NOT
+  corrupt registers, and (per round 2) the page content is correct.
+- **Conclusion: the corruption is in the soft-float COMPUTATION itself** during
+  the fault-heavy execution — not registers, not page content, not TLB.
+
+gdb limits hit: (a) `finish` fails ("not meaningful in the outermost frame") —
+the stripped soft-float has no frame info, so you cannot climb out to read
+strtod's return; (b) `stepi` cannot advance past a cold page (gdb reads the next
+insn first), and the platform exposes only **2 hardware breakpoint triggers**
+(`sdtrig`), while software breakpoints cannot be set on unmapped pages.
+
+**Next (round 5): a Python-gdb stepper.** On `gdb.MemoryError` from `stepi`,
+fault the cold page in by `hbreak *($pc+2)` + `hbreak *($pc+4)` + `continue`
+(executes the faulting insn, stops at the next, page now mapped), delete the
+temp hbreaks, resume `stepi` — logging `a0/a1/fa0` each step. That walks the
+whole soft-float across cold pages and pinpoints the instruction where the
+value diverges from 2.0. Then correlate that VA's frame/content.
+
 ## Bottom line for scoring
 
 broken_ip ×8 (~47 pts/lane) stays blocked behind a VM-under-load correctness
