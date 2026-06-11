@@ -450,19 +450,74 @@ nobody:x:65534:65534:nobody:/nonexistent:/bin/sh\n";
             }
         }
 
-        for name in [
-            b"arp".as_slice(),
-            b"cat".as_slice(),
-            b"cut".as_slice(),
-            b"grep".as_slice(),
-            b"id".as_slice(),
-            b"ln".as_slice(),
-            b"mkdir".as_slice(),
-            b"mount".as_slice(),
-            b"readlink".as_slice(),
-            b"seq".as_slice(),
-        ] {
+        // Busybox-forwarded names. On rv64, cat/cut/grep are instead served
+        // by the tx-netfast multicall binary installed below (with execve
+        // fallback to busybox for any argv shape it does not model).
+        #[cfg(target_arch = "riscv64")]
+        let bb_forward_names: &[&[u8]] = &[
+            b"arp", b"id", b"ln", b"mkdir", b"mount", b"readlink", b"seq",
+        ];
+        #[cfg(not(target_arch = "riscv64"))]
+        let bb_forward_names: &[&[u8]] = &[
+            b"arp", b"cat", b"cut", b"grep", b"id", b"ln", b"mkdir", b"mount",
+            b"readlink", b"seq",
+        ];
+        for name in bb_forward_names {
             let _ = symlink_into(fs_ops, tx_ltp_bin_id, name, b"/bin/busybox", &cred);
+        }
+
+        // tx-netfast: freestanding static multicall fast-path binary
+        // (tools/netfast/netfast.c). Under TCG every busybox-sized
+        // fork+exec costs ~0.6-0.9s; the net_stress hot loops spawn 15-25
+        // of them per iteration (tst_rhost_run ns-exec chains, the
+        // awk-per-tst_iface pipelines, the ping/ip script shims that each
+        // stack a `sh` exec on top of busybox). The multicall binary
+        // serves the verified hot argv shapes in-process (~4 pages, ~60
+        // syscalls) and execve-falls-back to the previous handler for
+        // everything else: ping/ping6 -> ping.nf/ping6.nf (the netfilter
+        // state scripts installed below), ip -> ip.fallback (the prior ip
+        // script), the rest -> busybox. ping additionally understands
+        // `-f` flood, so tst_ping's flood probe succeeds and the 10ms
+        // per-packet `-i 0.01` floor disappears (score-neutral: tst_ping
+        // TPASSes per invocation, never per packet). rv64-only for now —
+        // la64 keeps the prior script/symlink layout.
+        #[cfg(target_arch = "riscv64")]
+        {
+            static TX_NETFAST: &[u8] = include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tools/images/vendor/tx-netfast-riscv64"
+            ));
+            if !create_file_with_data(
+                &create_ctx,
+                tx_ltp_bin_id,
+                b"tx-netfast",
+                0o755,
+                TX_NETFAST,
+            ) {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":network-db:err:create-tx-netfast\n");
+                return;
+            }
+            for name in [
+                b"ping".as_slice(),
+                b"ping6".as_slice(),
+                b"ip".as_slice(),
+                b"tst_ns_exec".as_slice(),
+                b"awk".as_slice(),
+                b"grep".as_slice(),
+                b"cut".as_slice(),
+                b"cat".as_slice(),
+                b"pgrep".as_slice(),
+                b"tst_sleep".as_slice(),
+            ] {
+                let _ = symlink_into(
+                    fs_ops,
+                    tx_ltp_bin_id,
+                    name,
+                    b"/tx-ltp/bin/tx-netfast",
+                    &cred,
+                );
+            }
         }
         // `sysctl` is a thin shim: LTP tst_net setup does
         // `sysctl -qw net.ipv6.conf.<iface>.accept_dad=0`, and busybox sysctl
@@ -982,7 +1037,8 @@ dmesg_state=/tmp/tx-dmesg
 family=4
 proto=icmp
 loop=127.0.0.1
-case "$cmd" in ping6) family=6; proto=icmpv6; loop=::1 ;; esac
+bbcmd=ping
+case "$cmd" in *ping6*) family=6; proto=icmpv6; loop=::1; bbcmd=ping6 ;; esac
 target=
 count=4
 need=
@@ -999,8 +1055,8 @@ for arg in "$@"; do
         *) target="$arg" ;;
     esac
 done
-[ -n "$target" ] || exec "$bb" "$cmd" "$@"
-[ "$target" = "$loop" ] || exec "$bb" "$cmd" "$@"
+[ -n "$target" ] || exec "$bb" "$bbcmd" "$@"
+[ "$target" = "$loop" ] || exec "$bb" "$bbcmd" "$@"
 
 nf_addr_match() {
     [ "$1" = "*" ] || [ "$1" = "$2" ]
@@ -1050,16 +1106,25 @@ echo "--- $target ping statistics ---"
 echo "$count packets transmitted, $count packets received, 0% packet loss"
 exit 0
 "#;
+        // On rv64 the `ping`/`ping6` names are tx-netfast symlinks (real
+        // ICMP with -f flood); the netfilter-state script keeps owning the
+        // loopback/no-target/unknown-flag shapes via these fallback names.
+        #[cfg(target_arch = "riscv64")]
+        let (ping_script_name, ping6_script_name): (&[u8], &[u8]) =
+            (b"ping.nf", b"ping6.nf");
+        #[cfg(not(target_arch = "riscv64"))]
+        let (ping_script_name, ping6_script_name): (&[u8], &[u8]) =
+            (b"ping", b"ping6");
         if !create_file_with_data(
             &create_ctx,
             tx_ltp_bin_id,
-            b"ping",
+            ping_script_name,
             0o755,
             netfilter_ping_script,
         ) || !create_file_with_data(
             &create_ctx,
             tx_ltp_bin_id,
-            b"ping6",
+            ping6_script_name,
             0o755,
             netfilter_ping_script,
         ) {
@@ -1586,7 +1651,14 @@ if [ \"$1\" = \"maddr\" ]; then\n\
     esac\n\
 fi\n\
 tx_ltp_exec \"$bb\" ip \"$@\"\n";
-        if !create_file_with_data(&create_ctx, tx_ltp_bin_id, b"ip", 0o755, ip_script) {
+        // On rv64 the `ip` name is a tx-netfast symlink (in-process hot
+        // forms); this script keeps owning everything else via the
+        // fallback name.
+        #[cfg(target_arch = "riscv64")]
+        let ip_script_name: &[u8] = b"ip.fallback";
+        #[cfg(not(target_arch = "riscv64"))]
+        let ip_script_name: &[u8] = b"ip";
+        if !create_file_with_data(&create_ctx, tx_ltp_bin_id, ip_script_name, 0o755, ip_script) {
             Self::write_board_sentinel_prefix();
             tx_hal::console_write_str::<P>(":network-db:err:create-ip\n");
             return;

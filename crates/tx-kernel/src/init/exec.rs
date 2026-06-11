@@ -914,6 +914,16 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
             // (no-args, RUN/FAIL markers, no runtest manifest) inside the
             // lane's GROUP block, so a serial log feeds the real per-lane
             // judge unchanged. lane = musl | glibc.
+            // `bench-spawn` — in-guest spawn-cost microbench (witness-only
+            // diagnostic; never part of a judged group list). Times 50
+            // bare subshells, 50 fork+exec of the tiny tx-netfast, and 50
+            // fork+exec of busybox, via /proc/uptime, to attribute the
+            // per-spawn TCG cost between fork lifecycle and exec side.
+            if group == "bench-spawn" {
+                append_spawn_bench(&mut cmd);
+                selected += 1;
+                continue;
+            }
             if let Some(spec) = group.strip_prefix("ltp-bin:") {
                 let (lane, files) = spec.split_once(':').unwrap_or(("musl", spec));
                 let ltp_args = ltp_args_from_cmdline::<P>();
@@ -1376,6 +1386,11 @@ struct LtpArgs<'a> {
     /// LTP's own slow-machine guidance is this multiplier env.
     timeout_mul: Option<&'a str>,
     trace_runtime: bool,
+    /// `tx.ltp.env=K=V[,K=V...]` → exported into the witness walk before
+    /// the case loop. Measurement-only knob (stress-count overrides like
+    /// `ROUTE_CHANGE_IP=5` for per-iteration timing); the judged-run walk
+    /// never sets it.
+    extra_env: Option<&'a str>,
 }
 
 impl<'a> LtpArgs<'a> {
@@ -1385,6 +1400,7 @@ impl<'a> LtpArgs<'a> {
             max_runtime_cases: None,
             timeout_mul: None,
             trace_runtime: false,
+            extra_env: None,
         }
     }
 
@@ -1394,6 +1410,7 @@ impl<'a> LtpArgs<'a> {
             max_runtime_cases: None,
             timeout_mul: None,
             trace_runtime: false,
+            extra_env: None,
         }
     }
 
@@ -1403,7 +1420,36 @@ impl<'a> LtpArgs<'a> {
             max_runtime_cases: Some(cases),
             timeout_mul: None,
             trace_runtime: false,
+            extra_env: None,
         }
+    }
+
+    /// `tx.ltp.env=K=V[,K=V...]` → `export K=V; ` pairs for the witness
+    /// case loop. Strictly alphanumeric/underscore/dot tokens only — this
+    /// is interpolated into a shell line.
+    fn shell_extra_env_assignment(&self) -> alloc::string::String {
+        use alloc::string::String;
+        use core::fmt::Write as _;
+        let mut assignment = String::new();
+        let Some(spec) = self.extra_env else {
+            return assignment;
+        };
+        for pair in spec.split(',') {
+            let Some((key, value)) = pair.split_once('=') else {
+                continue;
+            };
+            let key_ok = !key.is_empty()
+                && key
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_');
+            let value_ok = value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.');
+            if key_ok && value_ok {
+                let _ = write!(assignment, "export {key}={value}; ");
+            }
+        }
+        assignment
     }
 
     fn shell_timeout_mul_assignment(&self) -> alloc::string::String {
@@ -1482,6 +1528,7 @@ fn ltp_args_from_cmdline<P: tx_hal::TxPlatform>() -> LtpArgs<'static> {
     };
     args.trace_runtime = trace_runtime;
     args.timeout_mul = timeout_mul;
+    args.extra_env = cmdline_value::<P>("tx.ltp.env");
     args
 }
 
@@ -1700,6 +1747,35 @@ fn append_ltp_runtest(
     );
 }
 
+/// In-guest spawn-cost microbench (see `bench-spawn` group). Each probe
+/// prints `TX-BENCH <name> <t0> <t1>` with /proc/uptime seconds around 50
+/// iterations; (t1-t0)/50*1000 ms is the per-spawn cost of that shape.
+fn append_spawn_bench(cmd: &mut alloc::string::String) {
+    use core::fmt::Write as _;
+
+    let _ = write!(
+        cmd,
+        "; /bin/busybox echo \"#### OS COMP TEST GROUP START bench-spawn ####\"\
+         ; tx_bench() {{ name=$1; shift; read t0 _ < /proc/uptime; i=0; while [ $i -lt 50 ]; do \"$@\"; i=$((i+1)); done; read t1 _ < /proc/uptime; /bin/busybox echo \"TX-BENCH $name $t0 $t1\"; }}\
+         ; tx_sub() {{ ( : ); }}\
+         ; tx_rednull() {{ : > /dev/null 2>&1; }}\
+         ; tx_redtmp() {{ : > /tmp/tx-bench-sink; }}\
+         ; tx_readproc() {{ read tx_rp _ < /proc/uptime; }}\
+         ; tx_spawn_null() {{ /tx-ltp/bin/tx-netfast tst_sleep 0us > /dev/null 2>&1; }}\
+         ; tx_bb_null() {{ /bin/busybox true > /dev/null 2>&1; }}\
+         ; tx_pipe() {{ /bin/busybox echo x | /tx-ltp/bin/grep -q x; }}\
+         ; tx_bench noop :\
+         ; tx_bench rednull tx_rednull\
+         ; tx_bench redtmp tx_redtmp\
+         ; tx_bench readproc tx_readproc\
+         ; tx_bench subshell tx_sub\
+         ; tx_bench tiny-exec tx_spawn_null\
+         ; tx_bench bb-exec tx_bb_null\
+         ; tx_bench pipe-grep tx_pipe\
+         ; /bin/busybox echo \"#### OS COMP TEST GROUP END bench-spawn ####\""
+    );
+}
+
 /// Per-case PATH for the official-walk witness, rooted at one lane's LTP
 /// tree. Mirrors `LTP_CASE_PATH` with the lane root substituted.
 fn ltp_bin_case_path(lane_root: &str, trace: bool) -> alloc::string::String {
@@ -1768,10 +1844,11 @@ fn append_ltp_bin_walk(
     let case_path = ltp_bin_case_path(lane_root, args.trace_runtime);
     let trace_assignment = args.shell_trace_runtime_assignment();
     let timeout_mul_assignment = args.shell_timeout_mul_assignment();
+    let extra_env_assignment = args.shell_extra_env_assignment();
     let file_list = files.split('+').collect::<alloc::vec::Vec<_>>().join(" ");
     let _ = write!(
         cmd,
-        "; cd {lane_root}; {trace_assignment} {timeout_mul_assignment}for tx_f in {file_list}; do /bin/busybox echo \"RUN LTP CASE $tx_f\"; if [ -f \"ltp/testcases/bin/$tx_f\" ]; then if [ -n \"$tx_ltp_trace_runtime\" ]; then /bin/busybox echo \"TX-LTP-RUNTIME begin $tx_f $(/bin/busybox date +%s 2>/dev/null)\"; PS4=\"TX-LTP-CMD:$tx_f: \" PATH={case_path} LTPROOT={lane_root}/ltp KCONFIG_PATH=/proc/config /bin/busybox setsid /bin/busybox sh -x -c \"ltp/testcases/bin/$tx_f\"; ret=$?; /bin/busybox echo \"TX-LTP-RUNTIME end $tx_f $ret $(/bin/busybox date +%s 2>/dev/null)\"; else PATH={case_path} LTPROOT={lane_root}/ltp KCONFIG_PATH=/proc/config /bin/busybox setsid \"ltp/testcases/bin/$tx_f\"; ret=$?; fi; else ret=127; fi; /bin/busybox echo \"FAIL LTP CASE $tx_f : $ret\"; done; cd /musl/musl"
+        "; cd {lane_root}; {trace_assignment} {timeout_mul_assignment}{extra_env_assignment}for tx_f in {file_list}; do /bin/busybox echo \"RUN LTP CASE $tx_f\"; if [ -f \"ltp/testcases/bin/$tx_f\" ]; then if [ -n \"$tx_ltp_trace_runtime\" ]; then /bin/busybox echo \"TX-LTP-RUNTIME begin $tx_f $(/bin/busybox date +%s 2>/dev/null)\"; PS4=\"TX-LTP-CMD:$tx_f: \" PATH={case_path} LTPROOT={lane_root}/ltp KCONFIG_PATH=/proc/config /bin/busybox setsid /bin/busybox sh -x -c \"ltp/testcases/bin/$tx_f\"; ret=$?; /bin/busybox echo \"TX-LTP-RUNTIME end $tx_f $ret $(/bin/busybox date +%s 2>/dev/null)\"; else PATH={case_path} LTPROOT={lane_root}/ltp KCONFIG_PATH=/proc/config /bin/busybox setsid \"ltp/testcases/bin/$tx_f\"; ret=$?; fi; else ret=127; fi; /bin/busybox echo \"FAIL LTP CASE $tx_f : $ret\"; done; cd /musl/musl"
     );
     let _ = write!(
         cmd,

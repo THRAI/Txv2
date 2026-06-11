@@ -161,8 +161,30 @@ fn render_cpuinfo() -> String {
     String::from("processor\t: 0\nhart\t\t: 0\nisa\t\t: rv64imafdc\nmmu\t\t: sv39\n")
 }
 
+/// Monotonic-nanosecond reader registered by kernel init (mirrors the
+/// `tx_observe` TS_FN pattern: procfs is not generic over the platform,
+/// so the concrete `TimeIf::read_ns` is injected as a fn pointer).
+/// 0 (unregistered) renders the previous static "0.00 0.00".
+static UPTIME_NS_FN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub fn procfs_register_uptime_clock(f: fn() -> u64) {
+    UPTIME_NS_FN.store(f as usize as u64, core::sync::atomic::Ordering::Relaxed);
+}
+
 fn render_uptime() -> String {
-    String::from("0.00 0.00\n")
+    let raw = UPTIME_NS_FN.load(core::sync::atomic::Ordering::Relaxed);
+    if raw == 0 {
+        return String::from("0.00 0.00\n");
+    }
+    // SAFETY: `raw` was written by `procfs_register_uptime_clock` from a
+    // valid `fn() -> u64` pointer.
+    let f: fn() -> u64 = unsafe { core::mem::transmute(raw as usize) };
+    let ns = f();
+    let secs = ns / 1_000_000_000;
+    let hundredths = (ns % 1_000_000_000) / 10_000_000;
+    // Render the idle column equal to uptime (single-purpose appliance
+    // kernel; LTP consumers only parse the first column).
+    format!("{secs}.{hundredths:02} {secs}.{hundredths:02}\n")
 }
 
 fn render_maps(pid: Pid) -> String {

@@ -719,6 +719,11 @@ impl<P: TxPlatform> CoreInit<P> {
     ///
     /// **Order invariant:** runs after `mount_rootfs_from_boot_media`.
     pub(crate) fn mount_procfs_at_proc() {
+        // /proc/uptime needs a monotonic clock, but procfs is not generic
+        // over the platform — inject the concrete `TimeIf::read_ns` once
+        // (same fn-pointer pattern as `tx_observe`'s TS_FN).
+        tx_fs::procfs::procfs_register_uptime_clock(<P as tx_hal::TimeIf>::read_ns);
+
         let root_mount = ROOT_MOUNT
             .lock()
             .clone()
