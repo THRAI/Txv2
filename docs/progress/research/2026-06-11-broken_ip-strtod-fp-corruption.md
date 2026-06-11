@@ -153,8 +153,61 @@ All in `tx-shims/src/linux_syscall` (execve in `proc.rs`, syscall heartbeat in
    `beqz t0,1f`. (Tested: no FP regression in basic tests; did NOT fix
    broken_ip, confirming the asymmetry is orthogonal.)
 
+## VM dive (2026-06-11, continued) — narrowing, what's ruled out
+
+The QEMU runs **`-smp 1` (single hart)**, so this is NOT a multi-hart race
+(cross-hart pmap-root reclaim / concurrent frame allocation are impossible).
+It is a **single-hart, deterministic, cooperative-async** fault-path bug.
+
+Ruled out by experiment:
+- **Not memory pressure / page-cache eviction:** `-m 4G` (vs `-m 1G`) still
+  hangs (0 TPASS). More RAM doesn't help.
+- **Not simple concurrent file-backed faulting:** a binary with 6 children
+  looping `mmap(/lib/ld-musl…, MAP_PRIVATE)` + touch-256-pages + `munmap`
+  while the parent runs `strtod("2")` 200 000× → **0 corruptions**.
+- **Not plain exec-churn:** a harness with 4 children looping
+  `fork+exec(self,"x")+wait` while the parent repeatedly `fork+exec`'d a fresh
+  `strtod("2")` child → reached 512+ child submits with **no child hang/wrong
+  result** (didn't reproduce; 4000-run harness too slow under TCG to finish).
+
+Key constraint: **my recompiled `ns-icmpv4_sender` PASSES in the exact same
+broken_ip netns context** (see above). So the trigger is the **image binary's
+specific fault pattern × the specific pre-sender system state** built by the
+broken_ip setup (netns + veth + many `ip`/netlink ops + the larger 58 KB
+binary's cold-page faults), not concurrency or exec-churn alone. **It does not
+reproduce in isolation** — the corruption needs that exact in-situ state.
+
+Demand-paging architecture map (for the in-situ instrumentation step):
+1. `crates/tx-kernel/src/trap.rs:13` `on_page_fault` → `trap_handoff.rs:279`
+   `hand_off_user_pf` (capture ctx, resolve wait — synchronous, ctx preserved).
+2. `crates/tx-kernel/src/thread_future.rs:909` `aspace.fault_script(fault).await`
+   (resolves fully before re-entering userspace).
+3. `crates/tx-subsystems/src/vm/execution.rs:255` `fault_script_with_ufd_dispatch`
+   → `try_fault_script_resolve` (Materializer range-lock + `require_fault_recipe`)
+   → `try_fault_script_materialize_and_publish` (loop, await_range_lock on Wait).
+4. File-backed page: `crates/tx-subsystems/src/page_backed/mod.rs:806`
+   `materialize_file_page` (offset = `page*4096`, `fetch_page`, Owner/Joined
+   handshake) → `:971` `install_fetched_file_page_from_owner` (page cache).
+5. PTE publish: `crates/tx-subsystems/src/vm/pmap.rs:237`
+   `publish_page_with_replacement` → `(ops.commit_mapping)(root, reservation,
+   perms)`.
+
+## Concrete next step (in-situ instrumentation — the bug won't repro otherwise)
+
+Re-add a `tx_hal` flag set when an `icmpv4_sender` execs (as the diagnosis
+probes did), and in the BOARD pmap commit (which has console access) log
+`(fault_va, ppn)` **and the first 8–16 bytes of the just-mapped frame** for the
+sender's faults. Run the real broken_ip-version.sh and look for: a ppn aliased
+to two distinct VAs in one address space; a code page whose mapped bytes are
+not valid RISC-V / differ from the libc file; or a frame whose content changes
+after mapping (reuse-while-mapped). Cross-reference with `emit_vm_trace`
+(`debug.vm.fault.*`) which is already wired through the observe system. The
+deterministic failure ⇒ a deterministic mapping/content bug, not a pure race.
+
 ## Bottom line for scoring
 
 broken_ip ×8 (~47 pts/lane) stays blocked behind a VM-under-load correctness
-bug, not a net/clock/argv bug. It is a deeper subsystem fix than the prior
-handoff anticipated. The rv tier-1 bankings (~95 pts/lane) are unaffected.
+bug, not a net/clock/argv bug. It does NOT reproduce outside the exact
+broken_ip context, so the next step is in-situ instrumentation of the real run
+(above), not a standalone repro. It is a deep, possibly multi-session VM fix.
+The rv tier-1 bankings (~95 pts/lane) are unaffected.
