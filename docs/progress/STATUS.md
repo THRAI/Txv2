@@ -1,3 +1,29 @@
+- 2026-06-12 (net_stress RX-wake fix ATTEMPTED + REFUTED by measurement — boot net delegate is dormant;
+  ICMP replies are synchronous in step_send; mtu/route are fork/ns-exec bound, not RX bound — code reverted)
+  **Pursued the prior handoff's "virtio-net has no RX IRQ → ping RTT locked" plan (option B: activity-window
+  deadline clamp).** Implemented it twice — first keyed on virtio device TX/RX in `BootNetRuntime`, then
+  broadened to ANY traffic-moving delegate step (new `net_delegate_last_activity_micros()` global stamped in
+  `net_delegate_step_once` when `moved_traffic()`) + `net_delegate_kick_poll()` on every deadline-timer wake.
+  Built clean (rv64), staged, real-judge witnessed. **if-mtu-change stayed at ~7s/iter (was 6.3) — zero
+  improvement.** Added three exit-dumped diagnostic counters and got the decisive data: **if-mtu-change →
+  clamp=0 dl_polls=0 dl_calls=6 last_act=0; route-change-dst → clamp=0 dl_polls=0 dl_calls=0 last_act=0.**
+  The boot net delegate runs ZERO/near-zero steps during net_stress and never moves traffic — it is DORMANT.
+  **Root cause of the dormancy:** `step_send_raw_icmp` (net/execution/step_send.rs) synthesizes the ICMP echo
+  reply in-line and delivers it to the socket table via `deliver_icmpv4_reply_to_table` — the kernel answers
+  pings INSIDE the sender's `sendto` syscall (SOCK_RAW ICMP short-circuits before any device/veth/delegate
+  path). Both gateway pings (route) and netns/veth pings (mtu) take this synchronous path. **So the RX-wake
+  premise (option A virtio IRQ AND option B clamp) targets a path net_stress never uses — neither can move
+  mtu/route under the wall.** Corrected cost model via score-neutral PING_MAX sweep: if-mtu-change ≈ 7s@PM50,
+  ≈5s@PM5 → ping is only ~1.5-2s/iter (per-syscall TCG cost, not RX latency) and the irreducible floor is
+  **~5s/iter of fork + ns-exec** (≈28 forks + 4 tst_rhost_run setns chains), already >> the ≤2.8s wall.
+  Bench-spawn microbench unchanged (subshell 44.6ms, tiny-exec 53.8ms, getpid 181µs) → no regression; mtu
+  correctness held 12/12 every run. **ALL option-B + diagnostic code REVERTED — working tree clean at HEAD
+  ae8fffd9.** Deliverable = the measurement (full writeup appended to
+  docs/progress/research/2026-06-12-net-stress-tcg-cost-attack.md). **Next levers for the tier are unchanged
+  and net-external:** cheaper `tst_rhost_run` ns-exec (setns+fork+exec) under TCG, and the general
+  subshell/fork lifecycle cut (reactor round-trip + cap-op volume + sbi_set_timer) — both ripple outside net.
+  Net delegate / virtio RX wake is a dead end for this scoring tier.
+
 - 2026-06-12 (net_stress mtu/route TCG campaign: tx-netfast fast-path shims ~4x + kernel syscall-path
   fixes — route 15-20s→3.7s/round, mtu →6.3s/iter; both still over the 300s wall, handoff below)
   **Round 1 — userspace hot-command shims (commit 95059dd9).** New `tx-netfast` freestanding static

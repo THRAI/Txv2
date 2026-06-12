@@ -112,3 +112,67 @@ banking (≈400s wall each at current speed — run with TMO≥500).
   link creation. Its 100 pts are gated on a macvlan feature, not on this
   campaign's speed work. Descoped here: the speed targets are
   dst+gw (200) + mtu (396).
+
+---
+
+## 2026-06-12 (later session) — RX-WAKE ROOT CAUSE REFUTED BY MEASUREMENT
+
+**The "net RX has no interrupt path → ping RTT locked" premise above is WRONG
+for net_stress.** Implemented option B (activity-window deadline clamp) two
+ways — first keyed on virtio device TX/RX, then broadened to *any* delegate
+step that moved traffic (new `net_delegate_last_activity_micros()` global,
+stamped in `net_delegate_step_once` when `moved_traffic()`), plus a
+`net_delegate_kick_poll()` on every deadline-timer wake. Built clean, staged,
+witnessed. **Both versions left if-mtu-change at ~7s/iter — no change.** Then
+instrumented with three exit-dumped counters (clamp engagements, deadline
+polls, delegate-hook calls + last_activity):
+
+| test (rv.musl witness, exit dump) | clamp | dl_polls | dl_calls | last_act |
+| --- | ---: | ---: | ---: | ---: |
+| if-mtu-change (MTU_CHANGE_TIMES=3) | 0 | 0 | 6 | 0 |
+| route-change-dst (ROUTE_CHANGE_IP=5) | 0 | 0 | **0** | 0 |
+
+**The boot net delegate is DORMANT during net_stress.** `dl_calls=0` for
+route-dst means its task loop ran zero steps the entire test; `last_act=0`
+means no delegate step ever moved traffic. So the virtio ring + delegate path
+the RX-wake fix targets is **not on the critical path for these tests.**
+
+**Why:** `step_send_raw_icmp` (`net/execution/step_send.rs:~530-604`)
+SYNTHESIZES the ICMP echo reply in-line and delivers it straight to the socket
+table via `deliver_icmpv4_reply_to_table` — the kernel answers the ping inside
+the sender's `sendto` syscall. No virtio TX, no veth `transmit`, no delegate,
+no RX wake. (veth `transmit` does sync-push to the peer rx queue, but the LTP
+pings are SOCK_RAW ICMP and never reach it — the echo responder short-circuits
+first.) Both gateway pings (route-dst) and netns/veth pings (mtu) take this
+synchronous path.
+
+**Corrected cost model (measured via score-neutral PING_MAX sweep):**
+if-mtu-change per-iter ≈ **7s @ PING_MAX=50, ≈5s @ PING_MAX=5**. So the ping
+component is only ~1.5-2s/iter (4 tst_ping invocations × PING_MAX packets ×
+~per-syscall TCG cost — NOT RX latency, since the reply is synchronous) and
+the **irreducible floor is ~5s/iter of fork + ns-exec** (≈28 forks + 4
+tst_rhost_run setns chains). That floor alone is >> the ≤2.8s wall.
+
+**Conclusion: neither option A (virtio IRQ) nor option B (delegate clamp) can
+bring mtu/route under the wall.** Both target a dormant path. The earlier
+"~10-17ms RTT locked to sender pacing" was a mis-measurement / mis-attribution
+(likely conflated with a genuinely virtio-bound path like a real-internet
+gateway probe, which net_stress does not exercise). All option-B + diagnostic
+code was REVERTED (working tree clean at HEAD ae8fffd9); the deliverable is
+this measurement.
+
+**Real levers for mtu/route (unchanged from 2026-06-11), all fork/ns-exec/
+syscall-cost bound under TCG:**
+1. Make `tst_rhost_run` ns-exec (setns + fork + exec `sh -c`) cheaper — 4
+   chains/iter dominate. The kernel `setns`/spawn path under TCG, not net.
+2. Cut subshell/fork lifecycle (47ms) — reactor round-trip + cap-op volume +
+   `cpu_id` TLS + `sbi_set_timer`; the long-tail campaign from the zone-cache
+   session. This is a general spawn-cost problem, rippling outside net.
+3. PING_MAX is the only ping lever and is already banked at 50 (score-neutral);
+   lowering it further trims the ~1.5-2s ping slice but cannot touch the ~5s
+   fork floor. Not sufficient.
+
+Net delegate / virtio RX wake is a dead end for this scoring tier. If a future
+workload IS virtio-RX-bound (TCP throughput to the QEMU user-net gateway, real
+DNS/HTTP), the option-B clamp or option-A IRQ would help *that* — but no
+scored net_stress test is.
