@@ -1003,13 +1003,16 @@ fn cpu_id_from_kernel_tls(kernel_tls: usize) -> Option<CpuId> {
         return None;
     }
 
-    let offset = kernel_tls - base;
-    if !offset.is_multiple_of(stride) {
-        return None;
-    }
-
-    let cpu = offset / stride;
-    Some(RV64_PERCPU_AREAS[cpu].cpu_id())
+    // `install_early_percpu` only ever writes `&RV64_PERCPU_AREAS[i]` into
+    // tp, so an in-range `kernel_tls` points exactly at one per-CPU area and
+    // its `cpu_id` is the first field. Read it directly rather than recovering
+    // the index with a divide+modulo by the non-power-of-two stride: this leaf
+    // is on every `current_cpu_id()` call (~3.6% of fork-path PC samples, and
+    // inlined into many hot callers). The range check above is the only
+    // validation needed — it is load-bearing for the early-boot window where
+    // tp still holds the raw cpu_id (handled by `current_cpu_id`'s fallback).
+    let area = unsafe { &*(kernel_tls as *const Rv64PerCpuArea) };
+    Some(area.cpu_id())
 }
 
 fn installed_irq_table() -> Option<&'static IrqDispatchTable> {
