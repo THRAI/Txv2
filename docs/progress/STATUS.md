@@ -41,6 +41,15 @@
   (43→~21ms) — a broad, high-risk, net-external campaign.** ⛔ DECISION POINT: mtu/route tier is fork-bound
   with no net-local / low-risk path; choose (a) broad fork/exec campaign or (b) pivot to other bankable net
   tests. Fork surgery is the explicit "ripples outside net" stop condition → surfaced to user.
+  **User chose (a); rollback tag `pre-fork-exec-campaign`=c6bf83b2 created first. Campaign step 1: cpu_id_from_kernel_tls
+  reads the area field directly (drops divmod), committed c836c209, board host 81/81 — but BELOW the bench floor
+  (unverifiable; fork micro-opts are individually unmeasurable here).** Step 2 = structural analysis: per fork-exit
+  ≈30+ zone lookups (9 namespace caps rebuilt into a fresh NsProxy even w/o new-ns flags, fd clones, identity/payload
+  signs, mirrored at exit); biggest lever = **share nsproxy on fork** (1 clone vs 9+sign). **⛔ CEILING:** even
+  nsproxy-share (~−15% fork → mtu ~4.25s/iter) doesn't clear 2.8s; halving fork needs rearchitecting cap-duplication
+  AND the reactor round-trip (core scheduler, multi-week, high-risk); AND nsproxy-share risks regressing BANKED netns
+  tests (net ns lives in BOTH the process-payload slot and nsproxy.net_ns — sharing could desync isolation).
+  **NO fork opt clears the wall at acceptable risk → recommend stopping the wall-chase. Re-surfaced to user.**
 
 - 2026-06-12 (net_stress mtu/route TCG campaign: tx-netfast fast-path shims ~4x + kernel syscall-path
   fixes — route 15-20s→3.7s/round, mtu →6.3s/iter; both still over the 300s wall, handoff below)

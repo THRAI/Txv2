@@ -261,3 +261,50 @@ with NO net-local and NO low-risk path. Options are (a) commit to the broad
 fork/exec campaign (high risk, touches all spawn), or (b) pivot off mtu/route
 to other bankable net tests. Surfaced to the user — fork surgery is the
 explicit "ripples outside networking" stop condition for autonomous net work.
+**User chose (a)** — proceed with the general fork/exec speedup (rollback tag
+`pre-fork-exec-campaign` = c6bf83b2 created first).
+
+## 2026-06-12 (later session) — fork campaign: cpu_id done, structural CEILING hit
+
+**Step 1 (committed c836c209): `cpu_id_from_kernel_tls` reads the per-CPU area
+field directly, dropping the divide+modulo by the non-power-of-2 stride.** tp
+always points at `&RV64_PERCPU_AREAS[i]`, so an in-range tls points exactly at
+one area; read its `cpu_id` field instead of recovering the index. Board host
+tests 81/81. **BUT the win is below the bench floor** — subshell 44.6ms / getpid
+193.6µs are within run-to-run noise (the /proc/uptime bench resolves ~0.2ms over
+50 iters; the change is ~3.6% of fork ≈ 1.5ms, unverifiable). Kept as a correct
+simplification, not a demonstrated speedup. **Lesson: fork micro-opts are
+individually unmeasurable here.**
+
+**Step 2: structural analysis of the fork cap-duplication path** (agent-mapped
+`step_fork_with_options` / `clone_nsproxy_for_fork` / `clone_fds_for_fork` /
+`step_exit_group` + `Cap::clone`/`drop`). Per bare-`( : )` fork-exit cycle ≈
+**30+ zone lookups**: clone path ~16-20 (the **9 namespace caps rebuilt into a
+fresh NsProxy even when no new namespace is requested**, fd-table clones,
+identity + payload `sign`s), mirrored by ~14-20 drops at exit. Every
+`Cap::clone`/`drop` independently re-resolves its slot via
+`registry::slot_for` → `Keg::slot_from_key` (takes the keg SpinLock even on a
+slab-cache hit). The single biggest structural lever is **sharing the parent's
+nsproxy on fork** (1 cap clone instead of 9 clones + 1 sign) when no `CLONE_NEW*`
+flag is set.
+
+**CEILING (the decisive finding):** even the biggest lever doesn't clear the
+wall, and it's high-risk to *banked* tests.
+- nsproxy-share saves ~9 clones/fork + ~9 drops/exit ≈ half the zone ops ≈
+  **~15% of fork → 43ms→~36ms → mtu 5s→~4.25s/iter. Still ≫ the 2.8s wall.**
+- To reach ≤2.8s needs ~**halving** fork (43→~21ms): the zone/cap rearchitect
+  AND halving the reactor scheduling round-trip (`run_thread` + the diffuse
+  ~12% trait-impl tail) — i.e. touching the core scheduler. Multi-week,
+  highest-risk, uncertain.
+- nsproxy-share itself is **risky to the banked netns net_stress tests**: net
+  namespace is tracked at TWO levels — a `net_namespace` AtomicSlot on the
+  process payload (authoritative for the net stack, `replace_net_namespace`)
+  AND `nsproxy.net_ns` — so sharing the bundle could desync isolation. A wrong
+  move here regresses the very tests this campaign banked.
+
+**Conclusion: NO fork/exec optimization brings mtu/route under the 2.8s wall at
+acceptable risk.** The general fork campaign is a research-grade kernel-perf
+project (rearchitect cap-duplication + reactor round-trip), and its biggest
+single piece endangers banked netns tests for a result that still misses the
+wall by ~1.5s/iter. Recommend stopping the wall-chase; the cpu_id cleanup
+stands as a correct (if unmeasurable) simplification. Re-surfaced to the user.
