@@ -1782,6 +1782,9 @@ fn append_spawn_bench(cmd: &mut alloc::string::String) {
          ; tx_spawn_null() {{ /tx-ltp/bin/tx-netfast tst_sleep 0us > /dev/null 2>&1; }}\
          ; tx_bb_null() {{ /bin/busybox true > /dev/null 2>&1; }}\
          ; tx_pipe() {{ /bin/busybox echo x | /tx-ltp/bin/grep -q x; }}\
+         ; tx_nsx_prog() {{ /tx-ltp/bin/tst_ns_exec $$ net /bin/busybox true > /dev/null 2>&1; }}\
+         ; tx_nsx_cat() {{ /tx-ltp/bin/tst_ns_exec $$ net sh -c \"cat /proc/uptime || echo RTERR\" > /dev/null 2>&1; }}\
+         ; tx_nsx_sub() {{ tx_nsx_rp=$(/tx-ltp/bin/tst_ns_exec $$ net sh -c \"cat /proc/uptime || echo RTERR\"); }}\
          ; tx_bench noop :\
          ; tx_bench rednull tx_rednull\
          ; tx_bench redtmp tx_redtmp\
@@ -1790,6 +1793,9 @@ fn append_spawn_bench(cmd: &mut alloc::string::String) {
          ; tx_bench tiny-exec tx_spawn_null\
          ; tx_bench bb-exec tx_bb_null\
          ; tx_bench pipe-grep tx_pipe\
+         ; tx_bench nsexec-prog tx_nsx_prog\
+         ; tx_bench nsexec-cat tx_nsx_cat\
+         ; tx_bench nsexec-sub tx_nsx_sub\
          ; /tx-ltp/bin/tx-netfast bench-syscall\
          ; /bin/busybox echo \"#### OS COMP TEST GROUP END bench-spawn ####\""
     );

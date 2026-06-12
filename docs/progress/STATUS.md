@@ -23,6 +23,15 @@
   and net-external:** cheaper `tst_rhost_run` ns-exec (setns+fork+exec) under TCG, and the general
   subshell/fork lifecycle cut (reactor round-trip + cap-op volume + sbi_set_timer) — both ripple outside net.
   Net delegate / virtio RX wake is a dead end for this scoring tier.
+  **Follow-up: decomposed one tst_rhost_run ns-exec chain (bench harness extended w/ nsexec + setns/openat-ns
+  probes, kept).** Real chain `$(tst_ns_exec $$ net sh -c "cat … || echo RTERR")` ≈ **76ms/chain**, split:
+  fork+exec spawn ≈ **51ms (67%)**, openat(/proc/pid/ns/net) procfs materialize ≈ **4.5ms**, **setns ≈ 0.68ms
+  (cheap AtomicSlot swap — NOT a lever)**, in-proc cat+$() ≈ 20ms. **The "ns-exec lever" COLLAPSES into the
+  general spawn-cost campaign:** no ns-specific bottleneck (setns 0.68ms; openat-ns ×4/round = 18ms is noise
+  vs route 3.7s). A route round = 4 chains (~0.3s) + ~33 general ash forks (~2.5-3s, 43-121ms each) — the ash
+  forks dominate and bottleneck on the SAME ~43-70ms/spawn TCG lifecycle. So speeding tst_rhost_run ≡ speeding
+  fork/exec/subshell under TCG (CoW/vfork, exec demand-paging, reactor round-trip) — net-external, high-risk.
+  netns/setns is NOT worth touching for this tier.
 
 - 2026-06-12 (net_stress mtu/route TCG campaign: tx-netfast fast-path shims ~4x + kernel syscall-path
   fixes — route 15-20s→3.7s/round, mtu →6.3s/iter; both still over the 300s wall, handoff below)

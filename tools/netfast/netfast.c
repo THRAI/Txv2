@@ -2321,6 +2321,40 @@ static int main_bench_syscall(int argc, char **argv)
     fmt2(1, "TX-BENCH-SYSCALL clock_gettime x%d total_us=%d", n,
          (long)(t1 - t0));
     fmt1(1, " ns_per_call=%d\n", (long)((t1 - t0) * 1000 / (u64)n));
+
+    /* ns-exec chain decomposition: the two extra syscalls a tst_rhost_run
+     * chain adds on top of the bare spawn lifecycle — opening the netns
+     * file and switching into it. /proc/self resolves to a real netns file;
+     * setns to the current netns succeeds (no same-ns rejection) and is the
+     * same atomic-swap path a cross-ns switch takes. */
+    {
+        const char *nspath = "/proc/self/ns/net";
+        long fd;
+        t0 = now_us();
+        for (i = 0; i < n; i++) {
+            fd = sys4(NR_openat, AT_FDCWD, nspath, O_RDONLY, 0);
+            if (fd >= 0)
+                sys1(NR_close, fd);
+        }
+        t1 = now_us();
+        fmt2(1, "TX-BENCH-SYSCALL openat-ns x%d total_us=%d", n,
+             (long)(t1 - t0));
+        fmt1(1, " ns_per_call=%d\n", (long)((t1 - t0) * 1000 / (u64)n));
+
+        fd = sys4(NR_openat, AT_FDCWD, nspath, O_RDONLY, 0);
+        if (fd >= 0) {
+            t0 = now_us();
+            for (i = 0; i < n; i++)
+                sys2(NR_setns, fd, 0);
+            t1 = now_us();
+            fmt2(1, "TX-BENCH-SYSCALL setns x%d total_us=%d", n,
+                 (long)(t1 - t0));
+            fmt1(1, " ns_per_call=%d\n", (long)((t1 - t0) * 1000 / (u64)n));
+            sys1(NR_close, fd);
+        } else {
+            fmt1(1, "TX-BENCH-SYSCALL setns SKIP openat-ns-fd=%d\n", (long)fd);
+        }
+    }
     return 0;
 }
 

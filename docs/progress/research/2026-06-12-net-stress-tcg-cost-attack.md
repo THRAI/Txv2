@@ -176,3 +176,50 @@ Net delegate / virtio RX wake is a dead end for this scoring tier. If a future
 workload IS virtio-RX-bound (TCP throughput to the QEMU user-net gateway, real
 DNS/HTTP), the option-B clamp or option-A IRQ would help *that* — but no
 scored net_stress test is.
+
+## 2026-06-12 (later session) — ns-exec chain cost DECOMPOSED
+
+Followed up the "make `tst_rhost_run` ns-exec cheaper" lever by measuring one
+chain end-to-end. Extended the bench harness: netfast `bench-syscall` now also
+times `openat(/proc/self/ns/net)` + `setns` (10k-iter loops); `bench-spawn`
+now has `nsexec-{prog,cat,sub}` (50-iter, full chain via the real
+`tst_ns_exec` binary, setns-to-`$$` — same-ns succeeds and takes the same
+atomic-swap path as cross-ns, confirmed by reading `sys_setns` →
+`replace_net_namespace` → `AtomicSlot::swap`). Kept (inert diagnostics).
+
+**Per-iter wall (rv64 TCG):**
+
+| shape | per-iter | what it is |
+| --- | ---: | --- |
+| subshell `( : )` | ~43ms | fork-only baseline |
+| tiny-exec (tx-netfast) | ~51ms | fork+exec+wait baseline |
+| bb-exec (busybox true) | ~70ms | fork+exec(big binary) |
+| **nsexec-sub** = `$(tst_ns_exec $$ net sh -c "cat … \|\| echo RTERR")` | **~76ms** | the REAL tst_rhost_run shape |
+| nsexec-cat (same, no `$()` wrap) | ~68ms | chain w/o the subst subshell |
+| nsexec-prog = `tst_ns_exec $$ net busybox true` | ~88ms | direct-program form (2nd exec) |
+
+**Per-syscall (10k-iter):** `openat(/proc/self/ns/net)+close` = **4.47ms** ·
+`setns(fd)` = **0.68ms** · getpid 0.20ms · clock_gettime 0.22ms.
+
+**Decomposition of the ~76ms real chain:**
+- **fork + exec(tst_ns_exec) ≈ 51ms (≈67%)** — the bare spawn lifecycle,
+  identical to tiny-exec. Net-external; this is the general TCG fork/exec cost.
+- **openat ns-file ≈ 4.5ms (≈6%)** — procfs RNode materialization per chain;
+  the *only* ns-specific cost of any size, but 6.5× the setns it feeds.
+- **setns ≈ 0.68ms (≈1%)** — cheap `AtomicSlot::swap` of the netns cap; the
+  nsproxy is NOT rebuilt. NOT a lever.
+- in-proc `cat` + close + exit + `$()` read ≈ 20ms (≈26%) — more fork/syscall.
+
+**Conclusion — the "ns-exec lever" collapses into the general spawn-cost
+campaign.** There is no ns-specific bottleneck: setns is 0.68ms, and even the
+4.5ms openat-ns × 4 chains/round = ~18ms is noise against route's 3.7s/round.
+A route round is ~4 ns-exec chains (≈0.3s) **plus ~33 general ash forks**
+(subshells, pipeline halves, tiny execs ≈ 43-121ms each ≈ 2.5-3s) — the ash
+forks dominate, and they bottleneck on the *same* ~43-70ms/spawn TCG lifecycle
+as the chains. So "speed up tst_rhost_run" ≡ "speed up fork/exec/subshell
+under TCG" (CoW/vfork, exec demand-paging, reactor round-trip + cap-op volume +
+sbi_set_timer) — net-external, high-risk, the long-tail campaign flagged
+2026-06-11. The netns/setns path is NOT worth touching for this tier.
+
+Bench-spawn baselines unchanged from earlier this session (getpid 198µs,
+subshell 43ms, tiny-exec 51ms) → no regression from the bench-harness edits.
