@@ -32,6 +32,15 @@
   forks dominate and bottleneck on the SAME ~43-70ms/spawn TCG lifecycle. So speeding tst_rhost_run ≡ speeding
   fork/exec/subshell under TCG (CoW/vfork, exec demand-paging, reactor round-trip) — net-external, high-risk.
   netns/setns is NOT worth touching for this tier.
+  **Follow-up 2: PC-profiled the bare subshell lifecycle (bench-fork-spin, 1500 samples, addr2line-clustered).**
+  89% kernel; dominant bucket = **zone/cap/slab/lock machinery ~27-30%** (fork clones/drops the child's cap
+  tables — call-volume bound; the O(1) slab cache already fixed unit cost), then cpu_id_from_kernel_tls 3.6%,
+  memcpy 3.6%, sbi_set_timer 1.7%, run_thread 1.5%. **No low-risk local win:** hottest leaf is 3.6%; cleanest
+  micro-opts stack to ~5% of the 43ms fork (mtu 5s→~4.75s, nowhere near 2.8s). Even halving the ~30% zone/cap
+  bucket (invasive) only reaches ~4.25s/iter. **Clearing ≤2.8s needs ~halving the whole fork/exec lifecycle
+  (43→~21ms) — a broad, high-risk, net-external campaign.** ⛔ DECISION POINT: mtu/route tier is fork-bound
+  with no net-local / low-risk path; choose (a) broad fork/exec campaign or (b) pivot to other bankable net
+  tests. Fork surgery is the explicit "ripples outside net" stop condition → surfaced to user.
 
 - 2026-06-12 (net_stress mtu/route TCG campaign: tx-netfast fast-path shims ~4x + kernel syscall-path
   fixes — route 15-20s→3.7s/round, mtu →6.3s/iter; both still over the 300s wall, handoff below)

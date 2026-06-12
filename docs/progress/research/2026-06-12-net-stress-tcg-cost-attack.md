@@ -223,3 +223,41 @@ sbi_set_timer) — net-external, high-risk, the long-tail campaign flagged
 
 Bench-spawn baselines unchanged from earlier this session (getpid 198µs,
 subshell 43ms, tiny-exec 51ms) → no regression from the bench-harness edits.
+
+## 2026-06-12 (later session) — fork lifecycle PC profile → NO low-risk win
+
+Since the ns-exec chain collapses into the general fork/exec cost, profiled the
+bare subshell lifecycle to see if a low-risk local fix exists.
+`tx.oscomp.groups=bench-fork-spin` (`while :; do ( : ); done`) + QEMU-monitor PC
+sampler (1500 samples @4ms), addr2line-clustered against the high-VMA kernel
+ELF (symbols at `0xffffffff80…`, sample directly — no offset). 1341/1500 (89%)
+in kernel, 159 (11%) user (the ash loop).
+
+**Top kernel buckets (% of all 1500 samples):**
+
+| bucket | ~% | notes |
+| --- | ---: | --- |
+| **zone / cap / slab / lock machinery** | **~27-30%** | slot_for, Keg/Zone::slot_from_key, Cap clone/deref/drop, ZoneSlab, Slot, align_up, SlotKey, atomic_load, Option::map/branch (zone slot plumbing), SpinMutex lock+guard-drop, AtomicBool cas/store |
+| cpu_id_from_kernel_tls | 3.6% | top single leaf; division-by-stride index calc |
+| memcpy family (copy_forward + memcpy) | 3.6% | context/frame/page copies |
+| sbi_set_timer | 1.7% | per-round timer reprogram |
+| thread_future::run_thread | 1.5% | reactor scheduling round |
+| page_allocator::return_to_free_pool | 0.7% | page free at exit |
+
+**Conclusion — no low-risk lever clears the wall.** The cost is genuinely
+diffuse: the single hottest leaf is 3.6%, and the dominant ~30% is zone/cap
+*call volume* (fork clones the child's cap tables, exit drops them — the prior
+O(1) slab cache already cut the per-op UNIT cost, so this is now count-bound).
+Math: the cleanest micro-opts stack to ~5% of the 43ms fork (cpu_id ~1.5ms +
+sbi_set_timer + memcpy) → mtu 5s→~4.75s/iter, nowhere near 2.8s. Even halving
+the entire ~30% zone/cap bucket (invasive fork-resource-duplication surgery)
+only reaches ~4.25s/iter. **Clearing the ≤2.8s wall requires ~HALVING the whole
+general fork/exec lifecycle (43→~21ms)** — a multi-front, high-risk campaign
+across every process-creation path (CoW/vfork + zone-op-count reduction +
+reactor round-trip trim + cpu_id/timer leaves), all rippling outside net.
+
+**Decision point reached:** the net_stress mtu/route tier is fork/exec-bound
+with NO net-local and NO low-risk path. Options are (a) commit to the broad
+fork/exec campaign (high risk, touches all spawn), or (b) pivot off mtu/route
+to other bankable net tests. Surfaced to the user — fork surgery is the
+explicit "ripples outside networking" stop condition for autonomous net work.
