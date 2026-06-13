@@ -1,3 +1,23 @@
+- 2026-06-13 (main→feature-network-next merge REDONE via git + LTP parity ACHIEVED — 0 regressions, net
+  preserved). **Problem:** the prior staged merge (d654f9b7) kept feature's OLD non-net code instead of main's
+  syscall improvements → 86 la.musl LTP regressions vs main. **Fix:** `git reset --hard 271e62ed && git merge
+  main`, resolved 26 conflicts by policy — net layer→feature (socket.rs/helpers/netlink via d654), non-net
+  regression sources→main (cred/fs_basic/fs_mut/proc/vfs_execution/vfs_structure/io.rs select-poll/RV HAL),
+  process/zones/wait_source/nsproxy→main (supersets w/ netns), syscall mod.rs/numbers.rs→union (deduped errno
+  + ~59 dup consts + itimer block: kept main poll_due_itimers + feature fire_itimer_real), procfs+init
+  harness→feature(d654). Re-applied session fixes (LA HAL OOM full-PA direct map, net-leak Drop/retain_count,
+  devfs urandom, exec LA-unblock). **Cross-crate bridges** (feature net ↔ main vfs/process API): restored
+  StructPayload::MountNamespace variant+arms, ProcessIdentity::open_fds, process_group_by_pgid,
+  OpenFile::socket_identity, socket_identity_from_file/unix_pathname_key re-exports, procfs pid_*_id pub.
+  **Post-build LTP found 7 la.musl regressions from procfs gaps** (feature procfs lacked main's /proc/sys/fs +
+  smaps): grafted /proc/sys/fs/{pipe-max-size,lease-break-time,protected_*}, /proc/<pid>/smaps, status VmLck
+  (summed from locked aspace regions), + restored open_tree-fd accept→EBADF. **Verification:** la.musl FULL
+  SWEEP (451 cases) = **0 regressions, 9 improvements** (epoll_pwait03 4→14, poll02 3→7, select02 11→14,
+  access01 198→199, …); la.glibc spot = 0 reg + 4 improvements; rv.musl = merged healthy (procfs fixes + net
+  work; main rv baseline won't boot in witness — infra). Net stack confirmed (socket/socketpair/getsockname/
+  getsockopt/getpeername all green across lanes). Both arches build clean. Commits: 62158ead (merge) +
+  4fc49eb6 (procfs/accept fixes). HEAD=4fc49eb6 on feature-network-next. **Next:** main rv baseline boot
+  (feature-sdcard vs main-kernel divergence) for a clean rv comparison; optional full la.glibc/rv sweeps.
 - 2026-06-12 (net_stress RX-wake fix ATTEMPTED + REFUTED by measurement — boot net delegate is dormant;
   ICMP replies are synchronous in step_send; mtu/route are fork/ns-exec bound, not RX bound — code reverted)
   **Pursued the prior handoff's "virtio-net has no RX IRQ → ping RTT locked" plan (option B: activity-window
