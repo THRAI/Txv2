@@ -71,6 +71,14 @@ pub const PROCFS_SYS_ID: FsObjectId = FsObjectId::new(0x7072_6F0B);
 pub const PROCFS_SYS_KERNEL_ID: FsObjectId = FsObjectId::new(0x7072_6F0C);
 pub const PROCFS_SYS_KERNEL_TAINTED_ID: FsObjectId = FsObjectId::new(0x7072_6F0D);
 pub const PROCFS_SYS_KERNEL_PID_MAX_ID: FsObjectId = FsObjectId::new(0x7072_6F0E);
+// `/proc/sys/fs/*` sysctls (re-homed from main; the net re-home took feature's
+// procfs which lacked these). LTP `fcntl30`/`splice04` read `pipe-max-size`,
+// fcntl-lease tests read `lease-break-time`; missing files make them TBROK.
+pub const PROCFS_SYS_FS_ID: FsObjectId = FsObjectId::new(0x7072_6F40);
+pub const PROCFS_SYS_FS_PIPE_MAX_SIZE_ID: FsObjectId = FsObjectId::new(0x7072_6F41);
+pub const PROCFS_SYS_FS_LEASE_BREAK_TIME_ID: FsObjectId = FsObjectId::new(0x7072_6F42);
+pub const PROCFS_SYS_FS_PROTECTED_HARDLINKS_ID: FsObjectId = FsObjectId::new(0x7072_6F43);
+pub const PROCFS_SYS_FS_PROTECTED_SYMLINKS_ID: FsObjectId = FsObjectId::new(0x7072_6F44);
 
 // `/proc/net/` + `/proc/sys/net/ipv6/` subtree (re-homed; the PR#50 net re-home
 // dropped all of `/proc/sys/net` and `/proc/net/if_inet6`). LTP's
@@ -178,6 +186,9 @@ const PROCFS_CMDLINE_BASE: u64 = PROCFS_PID_BASE + 0x40_0000_0000;
 const PROCFS_MEM_BASE: u64 = PROCFS_PID_BASE + 0x50_0000_0000;
 const PROCFS_MAPS_BASE: u64 = PROCFS_PID_BASE + 0x60_0000_0000;
 const PROCFS_EXE_BASE: u64 = PROCFS_PID_BASE + 0x70_0000_0000;
+// `/proc/<pid>/smaps` (re-homed from main; LTP mlock05/mlock201/mlock203 read
+// it to confirm pages are `lck` after `mlock`). Distinct 4 GiB-per-pid slot.
+const PROCFS_SMAPS_BASE: u64 = PROCFS_PID_BASE + 0x90_0000_0000;
 const PROCFS_FD_OFFSET: u64 = 0x20000;
 const PROCFS_FDINFO_OFFSET: u64 = 0x30000;
 // `/proc/<pid>/{uid_map,gid_map,setgroups}` (user-namespace map writes used by
@@ -367,6 +378,9 @@ const fn pid_mem_id(pid: Pid) -> FsObjectId {
 const fn pid_maps_id(pid: Pid) -> FsObjectId {
     FsObjectId::new(PROCFS_MAPS_BASE + pid.0 as u64)
 }
+const fn pid_smaps_id(pid: Pid) -> FsObjectId {
+    FsObjectId::new(PROCFS_SMAPS_BASE + pid.0 as u64)
+}
 const fn pid_exe_id(pid: Pid) -> FsObjectId {
     FsObjectId::new(PROCFS_EXE_BASE + pid.0 as u64)
 }
@@ -389,6 +403,14 @@ pub fn pid_from_mem_id(id: FsObjectId) -> Option<Pid> {
     let r = id.as_u64();
     if r >= PROCFS_MEM_BASE && r < PROCFS_MEM_BASE + PROCFS_PID_FILE_SPAN {
         Some(Pid((r - PROCFS_MEM_BASE) as u32))
+    } else {
+        None
+    }
+}
+pub fn pid_from_smaps_id(id: FsObjectId) -> Option<Pid> {
+    let r = id.as_u64();
+    if r >= PROCFS_SMAPS_BASE && r < PROCFS_SMAPS_BASE + PROCFS_PID_FILE_SPAN {
+        Some(Pid((r - PROCFS_SMAPS_BASE) as u32))
     } else {
         None
     }
@@ -562,6 +584,24 @@ impl FsOps for Procfs {
             if name == b"net" {
                 return StepOutcome::done(PROCFS_SYS_NET_ID);
             }
+            if name == b"fs" {
+                return StepOutcome::done(PROCFS_SYS_FS_ID);
+            }
+            return StepOutcome::err(Errno::ENOENT.into());
+        }
+        if parent == PROCFS_SYS_FS_ID {
+            if name == b"pipe-max-size" {
+                return StepOutcome::done(PROCFS_SYS_FS_PIPE_MAX_SIZE_ID);
+            }
+            if name == b"lease-break-time" {
+                return StepOutcome::done(PROCFS_SYS_FS_LEASE_BREAK_TIME_ID);
+            }
+            if name == b"protected_hardlinks" {
+                return StepOutcome::done(PROCFS_SYS_FS_PROTECTED_HARDLINKS_ID);
+            }
+            if name == b"protected_symlinks" {
+                return StepOutcome::done(PROCFS_SYS_FS_PROTECTED_SYMLINKS_ID);
+            }
             return StepOutcome::err(Errno::ENOENT.into());
         }
         if parent == PROCFS_NET_ID {
@@ -661,6 +701,9 @@ impl FsOps for Procfs {
             if name == b"maps" && process::process_by_pid(pid).is_some() {
                 return StepOutcome::done(pid_maps_id(pid));
             }
+            if name == b"smaps" && process::process_by_pid(pid).is_some() {
+                return StepOutcome::done(pid_smaps_id(pid));
+            }
             if name == b"exe" && process::process_by_pid(pid).is_some() {
                 return StepOutcome::done(pid_exe_id(pid));
             }
@@ -736,10 +779,15 @@ impl FsOps for Procfs {
             PROCFS_SYSVIPC_MSG_ID | PROCFS_SYSVIPC_SEM_ID | PROCFS_SYSVIPC_SHM_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
             }
-            PROCFS_SYS_ID | PROCFS_SYS_KERNEL_ID => {
+            PROCFS_SYS_ID | PROCFS_SYS_KERNEL_ID | PROCFS_SYS_FS_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Directory, PROCFS_DIR_MODE))
             }
-            PROCFS_SYS_KERNEL_TAINTED_ID | PROCFS_SYS_KERNEL_PID_MAX_ID => {
+            PROCFS_SYS_KERNEL_TAINTED_ID
+            | PROCFS_SYS_KERNEL_PID_MAX_ID
+            | PROCFS_SYS_FS_PIPE_MAX_SIZE_ID
+            | PROCFS_SYS_FS_LEASE_BREAK_TIME_ID
+            | PROCFS_SYS_FS_PROTECTED_HARDLINKS_ID
+            | PROCFS_SYS_FS_PROTECTED_SYMLINKS_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
             }
             PROCFS_NET_ID
@@ -807,6 +855,9 @@ impl FsOps for Procfs {
             id if pid_from_maps_id(id).is_some() => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
             }
+            id if pid_from_smaps_id(id).is_some() => {
+                StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
+            }
             id if pid_from_exe_id(id).is_some() => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Symlink, PROCFS_SYMLINK_MODE))
             }
@@ -847,6 +898,7 @@ impl FsOps for Procfs {
                 (b"cmdline", pid_cmdline_id(pid), InodeKind::Regular),
                 (b"mem", pid_mem_id(pid), InodeKind::Regular),
                 (b"maps", pid_maps_id(pid), InodeKind::Regular),
+                (b"smaps", pid_smaps_id(pid), InodeKind::Regular),
                 (b"exe", pid_exe_id(pid), InodeKind::Symlink),
                 (b"fd", pid_fd_dir_id(pid), InodeKind::Directory),
                 (b"fdinfo", pid_fdinfo_dir_id(pid), InodeKind::Directory),
@@ -937,6 +989,7 @@ impl FsOps for Procfs {
                 let files: &[(&[u8], FsObjectId, InodeKind)] = &[
                     (b"kernel", PROCFS_SYS_KERNEL_ID, InodeKind::Directory),
                     (b"net", PROCFS_SYS_NET_ID, InodeKind::Directory),
+                    (b"fs", PROCFS_SYS_FS_ID, InodeKind::Directory),
                 ];
                 let fi = idx.saturating_sub(2);
                 if fi < files.len() {
@@ -955,6 +1008,38 @@ impl FsOps for Procfs {
                 let files: &[(&[u8], FsObjectId, InodeKind)] = &[
                     (b"tainted", PROCFS_SYS_KERNEL_TAINTED_ID, InodeKind::Regular),
                     (b"pid_max", PROCFS_SYS_KERNEL_PID_MAX_ID, InodeKind::Regular),
+                ];
+                let fi = idx.saturating_sub(2);
+                if fi < files.len() {
+                    let (name, oid, kind) = files[fi];
+                    return StepOutcome::done(Some((
+                        dir_entry(oid, kind, name),
+                        DirCursor([2, (fi + 1) as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                    )));
+                }
+                return StepOutcome::done(None);
+            }
+            if id == PROCFS_SYS_FS_ID {
+                if state_byte < 2 {
+                    return finish_dots(state_byte, idx, id);
+                }
+                let files: &[(&[u8], FsObjectId, InodeKind)] = &[
+                    (b"pipe-max-size", PROCFS_SYS_FS_PIPE_MAX_SIZE_ID, InodeKind::Regular),
+                    (
+                        b"lease-break-time",
+                        PROCFS_SYS_FS_LEASE_BREAK_TIME_ID,
+                        InodeKind::Regular,
+                    ),
+                    (
+                        b"protected_hardlinks",
+                        PROCFS_SYS_FS_PROTECTED_HARDLINKS_ID,
+                        InodeKind::Regular,
+                    ),
+                    (
+                        b"protected_symlinks",
+                        PROCFS_SYS_FS_PROTECTED_SYMLINKS_ID,
+                        InodeKind::Regular,
+                    ),
                 ];
                 let fi = idx.saturating_sub(2);
                 if fi < files.len() {

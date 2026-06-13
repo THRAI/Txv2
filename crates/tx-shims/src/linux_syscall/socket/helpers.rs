@@ -485,10 +485,14 @@ pub(crate) fn socket_identity_from_file(
             _ if open_file_is_path_only(file) => Err(Errno::EBADF),
             _ => Err(Errno::ENOTSOCK),
         },
-        // NOTE: the feature branch had an `OpenFileBacking::MountApi` arm here
-        // (returning EBADF for an `open_tree` fd passed to a socket syscall).
-        // main does not carry the new mount-API fd kind, so non-socket
-        // backings fall through to ENOTSOCK.
+        // An `open_tree(2)` fd is path-only (like `O_PATH`), so a socket syscall
+        // on it returns EBADF; `fsopen`/`fspick` mount-API fds are readable, so
+        // they fall through to ENOTSOCK. Matches `accept03`'s expectations.
+        OpenFileBacking::MountApi { file }
+            if file.kind() == tx_subsystems::mount::MountApiFileKind::OpenTree =>
+        {
+            Err(Errno::EBADF)
+        }
         _ => Err(Errno::ENOTSOCK),
     }
 }

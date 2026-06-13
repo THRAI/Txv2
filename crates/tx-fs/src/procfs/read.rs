@@ -2,12 +2,15 @@
 
 use crate::procfs::{
     pid_from_cmdline_id, pid_from_fdinfo_id, pid_from_gid_map_id, pid_from_maps_id,
-    pid_from_setgroups_id, pid_from_stat_id, pid_from_status_id, pid_from_uid_map_id,
+    pid_from_setgroups_id, pid_from_smaps_id, pid_from_stat_id, pid_from_status_id,
+    pid_from_uid_map_id,
     KERNEL_CONFIG_TEXT,
     PROCFS_CONFIG_ID, PROCFS_CPUINFO_ID, PROCFS_MEMINFO_ID, PROCFS_MOUNTS_ID,
-    PROCFS_NET_ARP_ID, PROCFS_NET_IF_INET6_ID, PROCFS_NET_TX_NEIGH_ID, PROCFS_SYS_KERNEL_PID_MAX_ID,
-    PROCFS_SYS_KERNEL_TAINTED_ID, PROCFS_SYSVIPC_MSG_ID, PROCFS_SYSVIPC_SEM_ID,
-    PROCFS_SYSVIPC_SHM_ID, PROCFS_UPTIME_ID,
+    PROCFS_NET_ARP_ID, PROCFS_NET_IF_INET6_ID, PROCFS_NET_TX_NEIGH_ID,
+    PROCFS_SYS_FS_LEASE_BREAK_TIME_ID, PROCFS_SYS_FS_PIPE_MAX_SIZE_ID,
+    PROCFS_SYS_FS_PROTECTED_HARDLINKS_ID, PROCFS_SYS_FS_PROTECTED_SYMLINKS_ID,
+    PROCFS_SYS_KERNEL_PID_MAX_ID, PROCFS_SYS_KERNEL_TAINTED_ID, PROCFS_SYSVIPC_MSG_ID,
+    PROCFS_SYSVIPC_SEM_ID, PROCFS_SYSVIPC_SHM_ID, PROCFS_UPTIME_ID,
 };
 use alloc::format;
 use alloc::string::String;
@@ -26,6 +29,9 @@ pub fn render(fs_object_id: FsObjectId) -> String {
     }
     if let Some(pid) = pid_from_maps_id(fs_object_id) {
         return render_maps(pid);
+    }
+    if let Some(pid) = pid_from_smaps_id(fs_object_id) {
+        return render_smaps(pid);
     }
     if let Some(pid) = pid_from_uid_map_id(fs_object_id) {
         return render_userns_id_map(pid, false);
@@ -59,6 +65,11 @@ pub fn render(fs_object_id: FsObjectId) -> String {
         PROCFS_CONFIG_ID => render_config(),
         PROCFS_SYS_KERNEL_TAINTED_ID => String::from("0\n"),
         PROCFS_SYS_KERNEL_PID_MAX_ID => String::from("4194304\n"),
+        PROCFS_SYS_FS_PIPE_MAX_SIZE_ID => String::from("4096\n"),
+        PROCFS_SYS_FS_LEASE_BREAK_TIME_ID => String::from("45\n"),
+        PROCFS_SYS_FS_PROTECTED_HARDLINKS_ID | PROCFS_SYS_FS_PROTECTED_SYMLINKS_ID => {
+            String::from("1\n")
+        }
         id if id == super::PROCFS_SYS_NET_IPV4_IGMP_MAX_MEMBERSHIPS_ID => alloc::format!(
             "{}\n",
             super::IGMP_MAX_MEMBERSHIPS.load(core::sync::atomic::Ordering::Relaxed)
@@ -243,6 +254,74 @@ fn render_maps(pid: Pid) -> String {
     out
 }
 
+/// `/proc/<pid>/smaps`: each mapping's header line (as in `maps`) followed by
+/// the per-mapping size/rss/locked block. mlock LTP tests read the `Locked:`
+/// field to confirm the region is resident after `mlock`/`mlockall`.
+fn render_smaps(pid: Pid) -> String {
+    use tx_subsystems::vm::{VmEntryBacking, USER_PAGE_SIZE};
+
+    let Some(proc) = process::process_by_pid(pid) else {
+        return String::new();
+    };
+    let Some(aspace) = proc.aspace_cap() else {
+        return String::new();
+    };
+
+    let mut entries = aspace.recipes_snapshot();
+    entries.sort_by_key(|e| e.range.start());
+
+    let mut out = String::new();
+    for entry in entries {
+        let start = entry.range.start().as_usize();
+        let end = entry.range.end().as_usize();
+
+        let r = if entry.prot.read { 'r' } else { '-' };
+        let w = if entry.prot.write { 'w' } else { '-' };
+        let x = if entry.prot.execute { 'x' } else { '-' };
+        let p = if entry.flags.shared { 's' } else { 'p' };
+
+        let (offset, backing_desc) = match entry.backing_kind() {
+            VmEntryBacking::None => (0u64, "[none]"),
+            VmEntryBacking::PrivateAnon => (0u64, "[anon]"),
+            VmEntryBacking::Page { offset } => {
+                use tx_subsystems::page_backed::PageContainerKind;
+                let Some((pc, _)) = entry.page_backing() else {
+                    continue;
+                };
+                let desc = match pc.kind() {
+                    PageContainerKind::Anon { .. } => "[anon]",
+                    PageContainerKind::File { .. } => "[file]",
+                    PageContainerKind::Device { .. } => "[device]",
+                };
+                (offset, desc)
+            }
+        };
+
+        let size_kb = entry.range.page_count() * (USER_PAGE_SIZE / 1024);
+        let locked_kb = if entry.flags.locked { size_kb } else { 0 };
+
+        out.push_str(&format!(
+            "{:x}-{:x} {}{}{}{} {:08x} 00:00 0 {}\n",
+            start, end, r, w, x, p, offset, backing_desc,
+        ));
+        out.push_str(&format!(
+            "Size:           {:8} kB\n\
+             Rss:            {:8} kB\n\
+             Pss:            {:8} kB\n\
+             Shared_Clean:   {:8} kB\n\
+             Shared_Dirty:   {:8} kB\n\
+             Private_Clean:  {:8} kB\n\
+             Private_Dirty:  {:8} kB\n\
+             Referenced:     {:8} kB\n\
+             Anonymous:      {:8} kB\n\
+             Locked:         {:8} kB\n",
+            size_kb, size_kb, size_kb, 0, 0, size_kb, 0, size_kb, size_kb, locked_kb,
+        ));
+    }
+
+    out
+}
+
 fn render_fdinfo(pid: Pid, fd: u32) -> String {
     let Some(proc) = process::process_by_pid(pid) else {
         return String::new();
@@ -315,6 +394,16 @@ fn render_status(pid: Pid) -> String {
     let name =
         core::str::from_utf8(&name_buf[..name_buf.iter().position(|&b| b == 0).unwrap_or(16)])
             .unwrap_or("?");
+    // VmLck: sum of locked (mlock/mlockall) regions, in kB. LTP mlock201/mlock203
+    // read this field from /proc/self/status to confirm pages are locked.
+    let mut vm_lck_kb = 0usize;
+    if let Some(aspace) = proc.aspace_cap() {
+        for entry in aspace.recipes_snapshot() {
+            if entry.flags.locked {
+                vm_lck_kb += entry.range.page_count() * (tx_subsystems::vm::USER_PAGE_SIZE / 1024);
+            }
+        }
+    }
     format!(
         "Name:\t{}\nState:\t{} ({})\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nThreads:\t{}\n\
 VmData:\t{:8} kB\nVmLck:\t{:8} kB\n",
@@ -326,7 +415,7 @@ VmData:\t{:8} kB\nVmLck:\t{:8} kB\n",
         proc.parent_pid().0,
         proc.live_thread_count(),
         0,
-        0,
+        vm_lck_kb,
     )
 }
 
