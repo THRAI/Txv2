@@ -82,6 +82,11 @@ pub mod wait_routing {
         source
     }
 
+    /// Remove a waiter-owned v3 `WaitSource` from the global registry.
+    pub fn unregister_source(source_id: u64) {
+        tx_substrate::wake::unregister_source(tx_substrate::step::WaitSourceId::new(source_id));
+    }
+
     /// Fire the legacy `Channel` for one futex bucket — D2
     /// coexistence wake path.
     ///

@@ -522,6 +522,99 @@ fn htree_dx_records_and_legacy_hash_roundtrip() {
     );
 }
 
+#[test]
+fn append_multiple_dir_entries_all_findable() {
+    // Reproduces the iozone -t dirent layer: several files created
+    // back-to-back in one directory must all stay findable by name.
+    let image = mock_image();
+    let mut pager = Ext4Pager::open(image).unwrap();
+    let names: [&[u8]; 4] = [b"dummy.0", b"dummy.1", b"dummy.2", b"dummy.3"];
+    for (i, name) in names.iter().enumerate() {
+        pager
+            .append_dir_entry(InodeNo::new(2), name, InodeNo::new(20 + i as u32), 1)
+            .unwrap();
+    }
+    for (i, name) in names.iter().enumerate() {
+        assert_eq!(
+            pager.lookup(InodeNo::new(2), name).unwrap(),
+            Some(InodeNo::new(20 + i as u32)),
+            "dir entry {:?} lost after subsequent appends",
+            core::str::from_utf8(name).unwrap()
+        );
+    }
+}
+
+#[test]
+fn write_page_to_hole_and_tail_reads_back() {
+    // Exercises the iozone write-back primitive (write_page →
+    // allocate_block + attach_data_block): fill a hole and extend the
+    // tail of inode 12, read every page back, confirm pre-existing data
+    // is untouched.
+    let mut image = mock_image();
+    mark_block_bitmap_used(&mut image, 48); // free blocks start at 48
+    let mut pager = Ext4Pager::open(image).unwrap();
+    let writes = [(2u64, 0xC2u8), (4, 0xC4), (5, 0xC5)];
+    for (lb, fill) in writes {
+        pager
+            .write_page(InodeNo::new(12), lb, &filled_page(fill))
+            .unwrap();
+    }
+    // The VFS sets the logical size via serialize_inode_meta; mirror that
+    // so read_page doesn't treat logical 4/5 as past-EOF.
+    pager
+        .set_inode_size(InodeNo::new(12), 6 * BLOCK_SIZE as u64)
+        .unwrap();
+    for (lb, fill) in writes {
+        let mut got = [0u8; BLOCK_SIZE];
+        pager.read_page(InodeNo::new(12), lb, &mut got).unwrap();
+        assert_eq!(got, filled_page(fill), "logical {lb} readback mismatch");
+    }
+    let mut got = [0u8; BLOCK_SIZE];
+    pager.read_page(InodeNo::new(12), 0, &mut got).unwrap();
+    assert_eq!(got, filled_page(0x20), "logical 0 clobbered by writeback");
+}
+
+fn mark_block_bitmap_used(image: &mut MemImage, count: usize) {
+    let mut bm = BitmapMut::new(image.block_mut(2));
+    for bit in 0..count {
+        bm.set(bit).unwrap();
+    }
+}
+
+#[test]
+fn create_multiple_regular_files_all_findable() {
+    // Full iozone -t create path: create several regular files back-to-back
+    // in one directory (allocate_inode + write_inode + append_dir_entry),
+    // then confirm every one is findable by name.
+    let mut image = mock_image();
+    mark_inode_bitmap_used(&mut image, 13); // inodes 1..=13 already used
+    let mut pager = Ext4Pager::open(image).unwrap();
+    let names: [&[u8]; 4] = [b"dummy.0", b"dummy.1", b"dummy.2", b"dummy.3"];
+    let mut inos = Vec::new();
+    for name in names {
+        inos.push(
+            pager
+                .create_regular_file(InodeNo::new(2), name, 0o644, 0, 0, 0)
+                .unwrap(),
+        );
+    }
+    for (i, name) in names.iter().enumerate() {
+        assert_eq!(
+            pager.lookup(InodeNo::new(2), name).unwrap(),
+            Some(inos[i]),
+            "created file {:?} not findable",
+            core::str::from_utf8(name).unwrap()
+        );
+    }
+}
+
+fn mark_inode_bitmap_used(image: &mut MemImage, count: usize) {
+    let mut bm = BitmapMut::new(image.block_mut(3));
+    for bit in 0..count {
+        bm.set(bit).unwrap();
+    }
+}
+
 fn mock_image() -> MemImage {
     let mut image = MemImage::new(128);
 

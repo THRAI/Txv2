@@ -202,7 +202,6 @@ version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bfb9eb618601c89945a70e254898da93b13be0388091d42117462b265bb3fad"
 dependencies = [
- "defmt 0.3.100",
  "hash32",
  "stable_deref_trait",
 ]
@@ -437,7 +436,6 @@ dependencies = [
  "cfg-if",
  "defmt 0.3.100",
  "heapless",
- "libc",
  "log",
  "managed",
 ]
@@ -700,6 +698,7 @@ version = "0.1.0"
 name = "tx-shims"
 version = "0.1.0"
 dependencies = [
+ "smoltcp",
  "tx-fs",
  "tx-hal",
  "tx-observe",

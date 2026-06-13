@@ -82,7 +82,7 @@ use tx_subsystems::vm::AddressSpace;
 
 use super::{
     bootstrap_copy_from_user, bootstrap_copy_to_user, next_stdio_fd_below_nofile, SyscallCtx,
-    SyscallResult,
+    SyscallResult, SOCKET_IO_MAX_INLINE,
 };
 use super::{EBADF_VALUE, EFAULT_VALUE, EINVAL_VALUE, ENOMEM_VALUE};
 use crate::adapter::step_engine::StepOutcome as V3Out;
@@ -102,6 +102,7 @@ const NEG_EBADF: i64 = -(EBADF_VALUE as i64);
 const NEG_EINVAL: i64 = -(EINVAL_VALUE as i64);
 const NEG_EIO: i64 = -5;
 const NEG_EFAULT: i64 = -(EFAULT_VALUE as i64);
+const AIO_STAGING_MAX: usize = SOCKET_IO_MAX_INLINE;
 
 /// Construct the per-context iocb dispatcher.
 ///
@@ -161,27 +162,38 @@ fn dispatch_pread(
     if len == 0 {
         return IoEvent::new(cookie, cookie, 0, 0);
     }
-    // Seek to the requested offset. SEEK_SET = 0. step_lseek returns
-    // ESPIPE for non-seekable backings; surface as -EINVAL since
-    // PREAD against a non-seekable backing is not meaningful.
-    if !run_lseek_set(&file, iocb.aio_offset) {
-        return IoEvent::new(cookie, cookie, NEG_EINVAL, 0);
-    }
-    let mut staging: alloc::vec::Vec<u8> = alloc::vec![0u8; len];
-    let read_result = run_read(&file, &mut staging);
-    match read_result {
-        Ok(bytes) => {
-            if bytes > 0 {
-                if let Err(errno) = bootstrap_copy_to_user(aspace, iocb.aio_buf, &staging[..bytes])
-                {
-                    let _ = errno;
-                    return IoEvent::new(cookie, cookie, NEG_EFAULT, 0);
+
+    let mut staging: alloc::vec::Vec<u8> = alloc::vec![0u8; len.min(AIO_STAGING_MAX)];
+    let mut total = 0usize;
+    while total < len {
+        let Some(offset) = add_iocb_offset(iocb.aio_offset, total) else {
+            return partial_or_error(cookie, total, NEG_EINVAL);
+        };
+        if !run_lseek_set(&file, offset) {
+            return partial_or_error(cookie, total, NEG_EINVAL);
+        }
+
+        let chunk = (len - total).min(staging.len());
+        let read_result = run_read(&file, &mut staging[..chunk]);
+        match read_result {
+            Ok(bytes) => {
+                if bytes > 0 {
+                    let Some(dst) = add_user_offset(iocb.aio_buf, total) else {
+                        return partial_or_error(cookie, total, NEG_EINVAL);
+                    };
+                    if bootstrap_copy_to_user(aspace, dst, &staging[..bytes]).is_err() {
+                        return partial_or_error(cookie, total, NEG_EFAULT);
+                    }
+                    total += bytes;
+                }
+                if bytes < chunk {
+                    return IoEvent::new(cookie, cookie, total as i64, 0);
                 }
             }
-            IoEvent::new(cookie, cookie, bytes as i64, 0)
+            Err(neg) => return partial_or_error(cookie, total, neg),
         }
-        Err(neg) => IoEvent::new(cookie, cookie, neg, 0),
     }
+    IoEvent::new(cookie, cookie, total as i64, 0)
 }
 
 /// Dispatch one `IOCB_CMD_PWRITE`. Resolves `aio_fildes`, seeks to
@@ -201,16 +213,53 @@ fn dispatch_pwrite(
     if len == 0 {
         return IoEvent::new(cookie, cookie, 0, 0);
     }
-    let mut staging: alloc::vec::Vec<u8> = alloc::vec![0u8; len];
-    if let Err(_errno) = bootstrap_copy_from_user(aspace, &mut staging, iocb.aio_buf) {
-        return IoEvent::new(cookie, cookie, NEG_EFAULT, 0);
+
+    let mut staging: alloc::vec::Vec<u8> = alloc::vec![0u8; len.min(AIO_STAGING_MAX)];
+    let mut total = 0usize;
+    while total < len {
+        let chunk = (len - total).min(staging.len());
+        let Some(src) = add_user_offset(iocb.aio_buf, total) else {
+            return partial_or_error(cookie, total, NEG_EINVAL);
+        };
+        if bootstrap_copy_from_user(aspace, &mut staging[..chunk], src).is_err() {
+            return partial_or_error(cookie, total, NEG_EFAULT);
+        }
+
+        let Some(offset) = add_iocb_offset(iocb.aio_offset, total) else {
+            return partial_or_error(cookie, total, NEG_EINVAL);
+        };
+        if !run_lseek_set(&file, offset) {
+            return partial_or_error(cookie, total, NEG_EINVAL);
+        }
+
+        match run_write(&file, &staging[..chunk]) {
+            Ok(bytes) => {
+                total += bytes;
+                if bytes < chunk {
+                    return IoEvent::new(cookie, cookie, total as i64, 0);
+                }
+            }
+            Err(neg) => return partial_or_error(cookie, total, neg),
+        }
     }
-    if !run_lseek_set(&file, iocb.aio_offset) {
-        return IoEvent::new(cookie, cookie, NEG_EINVAL, 0);
-    }
-    match run_write(&file, &staging) {
-        Ok(bytes) => IoEvent::new(cookie, cookie, bytes as i64, 0),
-        Err(neg) => IoEvent::new(cookie, cookie, neg, 0),
+    IoEvent::new(cookie, cookie, total as i64, 0)
+}
+
+fn add_iocb_offset(base: i64, delta: usize) -> Option<i64> {
+    let delta = i64::try_from(delta).ok()?;
+    base.checked_add(delta)
+}
+
+fn add_user_offset(base: u64, delta: usize) -> Option<u64> {
+    let delta = u64::try_from(delta).ok()?;
+    base.checked_add(delta)
+}
+
+fn partial_or_error(cookie: u64, total: usize, err: i64) -> IoEvent {
+    if total > 0 {
+        IoEvent::new(cookie, cookie, total as i64, 0)
+    } else {
+        IoEvent::new(cookie, cookie, err, 0)
     }
 }
 
@@ -246,6 +295,7 @@ fn run_read(file: &Cap<OpenFile>, out: &mut [u8]) -> Result<usize, i64> {
             let mut op = OpenFileReadOp {
                 file,
                 out: &mut out[total..],
+                caller_netns: None,
                 cursor: 0,
             };
             op.step(&mut script_ctx)
@@ -292,6 +342,7 @@ fn run_write(file: &Cap<OpenFile>, bytes: &[u8]) -> Result<usize, i64> {
             let mut op = OpenFileWriteOp {
                 file,
                 bytes: remaining,
+                caller_netns: None,
                 cursor: 0,
             };
             op.step(&mut script_ctx)

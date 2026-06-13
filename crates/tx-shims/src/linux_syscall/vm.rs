@@ -67,6 +67,7 @@ fn emit_futex_result(name: &[u8], result: &SyscallResult) {
         SyscallResult::NoReturn => i64::MIN + 1,
         SyscallResult::ExecCommitted => i64::MIN + 2,
         SyscallResult::SigreturnRestored => i64::MIN + 3,
+        SyscallResult::SigreturnContextRestored => i64::MIN + 4,
     };
     emit_futex_trace(name, code);
     tx_observe::dump_registered_if_requested();
@@ -303,6 +304,15 @@ pub(super) async fn sys_mmap(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRes
             Some(f) => f,
             None => return SyscallResult::Error(EBADF_VALUE),
         };
+        // Linux file-mapping access checks (mm/mmap.c): every file
+        // mapping requires the descriptor be open for reading, and a
+        // writable shared mapping additionally requires write access.
+        if !file.flags().read {
+            return SyscallResult::error_from(Errno::EACCES);
+        }
+        if shared && (prot_bits & PROT_WRITE) != 0 && !file.flags().write {
+            return SyscallResult::error_from(Errno::EACCES);
+        }
         match extract_page_container(&file) {
             Some(pc) => VmBacking::Page {
                 pc: pc.into(),
@@ -563,6 +573,12 @@ pub(super) async fn sys_mlock(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRe
     let Ok(range) = UserRange::new_aligned(UserVirtAddr(start as usize), len) else {
         return SyscallResult::Error(EINVAL_VALUE);
     };
+    if let Some(errno) = memlock_limit_error(ctx, range.len() as u64) {
+        return SyscallResult::Error(errno);
+    }
+    if !range_fully_mapped(ctx, range) {
+        return SyscallResult::Error(ENOMEM_VALUE);
+    }
 
     let op = VmMlockOp {
         aspace: &ctx.aspace,
@@ -605,6 +621,9 @@ pub(super) async fn sys_munlock(args: [u64; 6], ctx: &SyscallCtx<'_>) -> Syscall
     let Ok(range) = UserRange::new_aligned(UserVirtAddr(start as usize), len) else {
         return SyscallResult::Error(EINVAL_VALUE);
     };
+    if !range_fully_mapped(ctx, range) {
+        return SyscallResult::Error(ENOMEM_VALUE);
+    }
 
     let op = VmMunlockOp {
         aspace: &ctx.aspace,
@@ -627,6 +646,173 @@ pub(super) async fn sys_munlock(args: [u64; 6], ctx: &SyscallCtx<'_>) -> Syscall
         Ok(_commit) => SyscallResult::Return(0),
         Err(errno) => SyscallResult::error_from(Into::<Errno>::into(errno)),
     }
+}
+
+const MCL_CURRENT: u64 = 0x1;
+const MCL_FUTURE: u64 = 0x2;
+const MCL_ONFAULT: u64 = 0x4;
+const MLOCK_ONFAULT: u64 = 0x1;
+
+fn range_fully_mapped(ctx: &SyscallCtx<'_>, range: UserRange) -> bool {
+    range
+        .iter_pages()
+        .all(|page| ctx.aspace.lookup(page.start_addr()).is_some())
+}
+
+fn memlock_limit_error(ctx: &SyscallCtx<'_>, bytes: u64) -> Option<i32> {
+    if ctx.cred().euid.is_root() {
+        return None;
+    }
+    let (cur, _) = ctx.process.rlimit_memlock();
+    if bytes <= cur {
+        None
+    } else if cur == 0 {
+        Some(EPERM_VALUE)
+    } else {
+        Some(ENOMEM_VALUE)
+    }
+}
+
+/// `mlockall(flags)` — Linux RV64 generic syscall #230.
+pub(super) async fn sys_mlockall(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let flags = args[0];
+    if flags == 0 || flags & !(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT) != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if flags & MCL_CURRENT != 0 {
+        let locked_len = ctx
+            .aspace
+            .recipes_snapshot()
+            .into_iter()
+            .try_fold(0u64, |acc, entry| acc.checked_add(entry.range.len() as u64));
+        let Some(locked_len) = locked_len else {
+            return SyscallResult::Error(ENOMEM_VALUE);
+        };
+        if let Some(errno) = memlock_limit_error(ctx, locked_len) {
+            return SyscallResult::Error(errno);
+        }
+    }
+    if flags & MCL_CURRENT != 0 {
+        for entry in ctx.aspace.recipes_snapshot() {
+            if let Err(errno) = drive_vm_lock(ctx, entry.range, true).await {
+                return SyscallResult::error_from(Into::<Errno>::into(errno));
+            }
+        }
+    }
+    SyscallResult::Return(0)
+}
+
+/// `munlockall()` — Linux RV64 generic syscall #231.
+pub(super) async fn sys_munlockall(_args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    for entry in ctx.aspace.recipes_snapshot() {
+        if let Err(errno) = drive_vm_lock(ctx, entry.range, false).await {
+            return SyscallResult::error_from(Into::<Errno>::into(errno));
+        }
+    }
+    SyscallResult::Return(0)
+}
+
+async fn drive_vm_lock(
+    ctx: &SyscallCtx<'_>,
+    range: UserRange,
+    locked: bool,
+) -> Result<tx_subsystems::vm::VmMapCommit, V3Errno> {
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox_arc = script_ctx.mailbox().cloned();
+    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let delegate_registry_arc = script_ctx.delegate_registry().cloned();
+    if locked {
+        drive(
+            VmMlockOp {
+                aspace: &ctx.aspace,
+                range,
+            },
+            &mut script_ctx,
+            DriveMode::Waiting,
+            mailbox_arc.as_ref(),
+            delegate_registry_arc.as_deref(),
+            timer_wheel_arc.as_ref(),
+        )
+        .await
+    } else {
+        drive(
+            VmMunlockOp {
+                aspace: &ctx.aspace,
+                range,
+            },
+            &mut script_ctx,
+            DriveMode::Waiting,
+            mailbox_arc.as_ref(),
+            delegate_registry_arc.as_deref(),
+            timer_wheel_arc.as_ref(),
+        )
+        .await
+    }
+}
+
+/// `mlock2(addr, len, flags)` — Linux RV64 generic syscall #284.
+pub(super) async fn sys_mlock2(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let flags = args[2];
+    if flags & !MLOCK_ONFAULT != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    sys_mlock(args, ctx).await
+}
+
+/// `mincore(addr, length, vec)` — Linux RV64 generic syscall #232.
+pub(super) fn sys_mincore(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
+    let addr = args[0];
+    let length_in = args[1] as usize;
+    let vec_uaddr = args[2];
+
+    if length_in == 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if !UserVirtAddr::new(addr as usize).is_page_aligned() {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let length = match length_in.checked_next_multiple_of(USER_PAGE_SIZE) {
+        Some(rounded) => rounded,
+        None => return SyscallResult::Error(ENOMEM_VALUE),
+    };
+    let range = match UserRange::new_aligned(UserVirtAddr::new(addr as usize), length) {
+        Ok(range) => range,
+        Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+    };
+
+    if range
+        .iter_pages()
+        .any(|page| ctx.aspace.lookup(page.start_addr()).is_none())
+    {
+        return SyscallResult::Error(ENOMEM_VALUE);
+    }
+
+    let resident = ctx.aspace.mincore(range);
+    for (index, is_resident) in resident.into_iter().enumerate() {
+        let byte = if is_resident { 1u8 } else { 0u8 };
+        if let Err(errno) = bootstrap_write_user::<u8>(&ctx.aspace, vec_uaddr + index as u64, byte)
+        {
+            return SyscallResult::Error(errno_to_i32(errno));
+        }
+    }
+
+    SyscallResult::Return(0)
+}
+
+/// `remap_file_pages(start, size, prot, pgoff, flags)` — Linux generic
+/// syscall #234.
+pub(super) fn sys_remap_file_pages(args: [u64; 6]) -> SyscallResult {
+    let start = args[0];
+    let size = args[1];
+    let prot = args[2];
+    let pgoff = args[3];
+    let flags = args[4];
+
+    if start == 0 && size == 0 && prot == 0 && pgoff == 0 && flags == 0 {
+        return SyscallResult::Error(ENOSYS_VALUE);
+    }
+
+    SyscallResult::Error(EINVAL_VALUE)
 }
 
 /// `mprotect(addr, length, prot)` — Linux RV64 generic syscall #226.
@@ -841,6 +1027,14 @@ pub(super) fn sys_madvise<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRe
         MADV_WILLNEED => MadviseAdvice::WillNeed,
         MADV_DONTNEED => MadviseAdvice::DontNeed,
         MADV_FREE => MadviseAdvice::Free,
+        // Advisory hints we do not act on yet — fork-inheritance
+        // (DONTFORK/DOFORK), KSM (MERGEABLE/UNMERGEABLE), THP
+        // (HUGEPAGE/NOHUGEPAGE), coredump (DONTDUMP/DODUMP),
+        // WIPEONFORK/KEEPONFORK, and COLD/PAGEOUT. These are valid
+        // Linux advices, so accept them as no-ops rather than failing
+        // (LTP madvise01). Values are the stable generic
+        // `<linux/mman.h>` numbers REMOVE(9)..PAGEOUT(21).
+        9..=21 => return SyscallResult::Return(0),
         _ => return SyscallResult::Error(ENOSYS_VALUE),
     };
     let range = match UserRange::new_aligned(UserVirtAddr::new(addr as usize), length) {
@@ -914,7 +1108,16 @@ pub(super) async fn sys_msync<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
 pub(super) fn extract_page_container(
     file: &Cap<OpenFile>,
 ) -> Option<Cap<tx_subsystems::page_backed::PageContainer>> {
-    use tx_subsystems::vfs::structure::RNodeBacking;
+    use tx_subsystems::vfs::structure::{OpenFileBacking, RNodeBacking};
+    // Only VFS rnode-backed files have an rnode at all. Special fds
+    // (epoll, eventfd, signalfd, timerfd, userfaultfd, io_uring, …) carry
+    // no rnode and `OpenFile::rnode()` panics on them, so guard on the
+    // OpenFile backing before touching it — callers (mmap, close-time
+    // writeback) treat `None` as "no page container", which is correct
+    // for these fd types.
+    if !matches!(file.backing(), OpenFileBacking::Rnode { .. }) {
+        return None;
+    }
     match file.rnode().backing() {
         RNodeBacking::PageBacked { pc } => Some(pc.clone()),
         _ => None,
@@ -966,15 +1169,13 @@ pub(super) fn vmmap_error_to_i32(error: VmMapError) -> i32 {
 /// trip on `-ENOSYS` within the first few thousand instructions of
 /// `__init_libc`.
 ///
-/// v1 supports `FUTEX_WAIT` and `FUTEX_WAKE` only; other ops
-/// (`REQUEUE`, `CMP_REQUEUE`, `WAKE_OP`, `LOCK_PI`, `WAIT_BITSET`
-/// etc.) return `-ENOSYS`. `FUTEX_PRIVATE_FLAG` and
-/// `FUTEX_CLOCK_REALTIME` flag bits are accepted but ignored —
-/// per-process isolation is implicit (each process has its own
-/// aspace and the user word at `uaddr` lives in that aspace), and
-/// timeout support is deferred to Slice 4 with the timer-wait
-/// carrier. The `timeout` (args[3]), `uaddr2` (args[4]), and
-/// `val3` (args[5]) arguments are ignored in v1.
+/// Current support covers wait/wake, bitset wait/wake, requeue /
+/// cmp-requeue, wake-op, and best-effort PI lock/trylock/unlock.
+/// `FUTEX_PRIVATE_FLAG` is implicit in the per-aspace futex key.
+/// `FUTEX_WAIT` treats `timeout` as a relative duration, while
+/// `FUTEX_WAIT_BITSET` treats it as an absolute deadline
+/// (`FUTEX_CLOCK_REALTIME` converts that absolute realtime value to
+/// the monotonic timer base used by the reactor).
 ///
 /// **`FUTEX_WAIT` semantics.** Loops on the canonical wait-carrier
 /// discipline:
@@ -1047,7 +1248,17 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
                 let Some(timeout_ns) = read_timespec_at(&ctx.aspace, timeout_uaddr) else {
                     return SyscallResult::Error(EINVAL_VALUE);
                 };
-                if timeout_ns == 0 {
+                let now_ns = <P as TimeIf>::read_ns();
+                let next_deadline_ns = if op == FUTEX_WAIT_BITSET {
+                    if (op_full & FUTEX_CLOCK_REALTIME) != 0 {
+                        tx_subsystems::wall_clock::monotonic_deadline_from_realtime_ns(timeout_ns)
+                    } else {
+                        timeout_ns
+                    }
+                } else {
+                    now_ns.saturating_add(timeout_ns)
+                };
+                if next_deadline_ns <= now_ns {
                     let guard = step_engine::guard();
                     let user_ptr = UserPtr::<u32>::new(uaddr as usize);
                     match ctx.aspace.read_user(user_ptr, &guard) {
@@ -1081,7 +1292,7 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
                         }
                     }
                 }
-                deadline_ns = Some(<P as TimeIf>::read_ns().saturating_add(timeout_ns));
+                deadline_ns = Some(next_deadline_ns);
             }
 
             let mut script_ctx = build_subject_script_ctx(ctx);
@@ -1107,8 +1318,10 @@ pub(super) async fn sys_futex<'a, P: TimeIf>(
                 val,
                 aspace: &ctx.aspace,
                 interest_mask: wait_mask,
+                tid: Some(ctx.thread.tid.0),
                 woken: false,
                 waiting: false,
+                registered_source_id: None,
             };
             match drive(
                 op,

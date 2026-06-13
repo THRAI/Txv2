@@ -178,6 +178,9 @@ fn userfaultfd_phase0_fd_scaffold_invariants_round_trip() {
         | OpenFileBacking::Eventfd { .. }
         | OpenFileBacking::Timerfd { .. }
         | OpenFileBacking::PosixMq { .. }
+        | OpenFileBacking::Pidfd { .. }
+        | OpenFileBacking::KernelObject { .. }
+        | OpenFileBacking::MountApi { .. }
         | OpenFileBacking::SocketPair { .. } => {
             panic!("expected OpenFileBacking::Ufd")
         }

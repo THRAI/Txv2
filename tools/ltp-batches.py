@@ -20,6 +20,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 CACHE_DIR = ROOT / "target" / "codex-tmp"
 CACHE_FILE = CACHE_DIR / "ltp-cases.txt"
+EXEC_RS = ROOT / "crates" / "tx-kernel" / "src" / "init" / "exec.rs"
 
 
 def is_valid_case_name(case: str) -> bool:
@@ -228,6 +229,8 @@ CUSTOM_BATCHES: dict[str, list[str]] = {
 CUSTOM_BATCHES["vfs-after-lgetxattr"] = CUSTOM_BATCHES["vfs-tail"]
 
 BATCH_ORDER = [
+    "submit",
+    "submit-glibc",
     "p0",
     "smoke",
     "fd-io",
@@ -246,6 +249,10 @@ BATCH_ORDER = [
     "heavy",
     "aio",
 ]
+
+SUBMIT_BATCH_ALIASES = {"submit", "whitelist"}
+SUBMIT_GLIBC_BATCH_ALIASES = {"submit-glibc", "whitelist-glibc"}
+LA_SUBMIT_ARCHES = {"la64", "loongarch64", "loongarch64-qemu"}
 
 
 def case_prefix(case: str) -> str:
@@ -290,7 +297,32 @@ def parse_cases(lines: list[str]) -> list[str]:
     return cases
 
 
-def cases_for_batch(cases: list[str], batch: str) -> list[str]:
+def load_rust_const_string(name: str) -> str:
+    text = EXEC_RS.read_text()
+    pattern = rf'const\s+{re.escape(name)}\s*:\s*&str\s*=\s*"(?P<value>(?:\\\n)?.*?)";'
+    match = re.search(pattern, text, re.S)
+    if not match:
+        raise SystemExit(f"failed to find {name} in {EXEC_RS}")
+    return re.sub(r"[\\\s]", "", match.group("value"))
+
+
+def load_submit_cases(arch: str = "") -> list[str]:
+    const_name = "LTP_SUBMIT_LA_CASES" if arch in LA_SUBMIT_ARCHES else "LTP_SUBMIT_RV_CASES"
+    return [case for case in load_rust_const_string(const_name).split("+") if case]
+
+
+def cases_for_batch(
+    cases: list[str], batch: str, arch: str = "", libc: str = ""
+) -> list[str]:
+    if batch in SUBMIT_BATCH_ALIASES or batch in SUBMIT_GLIBC_BATCH_ALIASES:
+        if batch in SUBMIT_GLIBC_BATCH_ALIASES:
+            libc = "glibc"
+        available = set(cases)
+        return [
+            case
+            for case in load_submit_cases(arch)
+            if case in available and is_valid_case_name(case)
+        ]
     if batch == "all":
         return [
             case
@@ -310,7 +342,7 @@ def cases_for_batch(cases: list[str], batch: str) -> list[str]:
     try:
         prefixes = set(BATCH_PREFIXES[batch])
     except KeyError:
-        known = ", ".join(BATCH_ORDER + ["all"])
+        known = ", ".join(BATCH_ORDER + ["whitelist", "whitelist-glibc", "all"])
         raise SystemExit(f"unknown LTP batch {batch!r}; known: {known}")
     return [
         case
@@ -325,6 +357,13 @@ def cases_for_batch(cases: list[str], batch: str) -> list[str]:
 def main() -> int:
     parser = argparse.ArgumentParser(description="List OSComp/LTP syscall batches")
     parser.add_argument("--batch", default=None, help="batch name to print")
+    parser.add_argument("--arch", default="", help="optional target arch for arch-specific batches")
+    parser.add_argument(
+        "--libc",
+        choices=["", "musl", "glibc"],
+        default="",
+        help="optional libc lane for submit-specific exclusions",
+    )
     parser.add_argument("--csv", action="store_true", help="print comma-separated cases")
     parser.add_argument("--list", action="store_true", help="list batch names and counts")
     parser.add_argument("--refresh", action="store_true", help="refresh case cache from sdcard")
@@ -334,13 +373,13 @@ def main() -> int:
 
     if args.list:
         for name in BATCH_ORDER:
-            selected = cases_for_batch(cases, name)
+            selected = cases_for_batch(cases, name, args.arch, args.libc)
             print(f"{name:8s} {len(selected):4d}")
-        print(f"{'all':8s} {len(cases_for_batch(cases, 'all')):4d}")
+        print(f"{'all':8s} {len(cases_for_batch(cases, 'all', args.arch, args.libc)):4d}")
         return 0
 
     batch = args.batch or "p0"
-    selected = cases_for_batch(cases, batch)
+    selected = cases_for_batch(cases, batch, args.arch, args.libc)
     if args.csv:
         print(",".join(selected))
     else:

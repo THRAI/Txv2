@@ -69,8 +69,8 @@ pub mod notification;
 pub mod ops;
 
 use adapter::step_engine::{
-    guard, sign, ByteProgress, Cap, OperationalCapExt, SpinMutex, StepOutcome, V3Errno, WaitSource,
-    Weak, Zone, ZoneAllocated, ZoneError,
+    borrow_current_guard, guard, sign, ByteProgress, Cap, OperationalCapExt, SpinMutex,
+    StepOutcome, V3Errno, WaitSource, Weak, Zone, ZoneAllocated, ZoneError,
 };
 use adapter::wait_routing::Channel;
 
@@ -302,7 +302,7 @@ fn unregister_subscription(proc_key: u32, sfd_id: u64) {
         // Retain entries that either fail to upgrade (already gone) or
         // upgrade to a different `sfd_id`. The matching entry drops out
         // of the list.
-        let guard = guard();
+        let guard = borrow_current_guard().unwrap_or_else(guard);
         list.retain(|w| match w.upgrade(&guard) {
             Some(cap) => cap.sfd_id() != sfd_id,
             None => false,
@@ -333,7 +333,7 @@ pub fn notify_process_signal(proc_key: u32, signum: Signum) -> usize {
     if snapshot.is_empty() {
         return 0;
     }
-    let guard = guard();
+    let guard = borrow_current_guard().unwrap_or_else(guard);
     let mut delivered = 0usize;
     for weak in &snapshot {
         let Some(cap) = weak.upgrade(&guard) else {
@@ -369,7 +369,7 @@ pub fn signalfd_create(
 /// semantics (signalfd and signal handlers are independent
 /// consumers).
 fn drain_pending_signals(sfd: &SignalFd) {
-    let guard = guard();
+    let guard = borrow_current_guard().unwrap_or_else(guard);
     let owner_weak = match &sfd.owner_proc {
         Some(w) => w,
         None => return,

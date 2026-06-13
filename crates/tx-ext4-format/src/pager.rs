@@ -1,9 +1,9 @@
 use crate::ondisk::{
     encode_dir_entry, encode_journal_commit, encode_journal_descriptor, parse_journal_descriptor,
-    BitmapMut, BitmapView, BlockMapping, CommitHeader, DirEntry, DirEntryIter, Extent, ExtentNode,
-    GroupDesc, Inode, InodeLocation, InodeTableLayout, Superblock,
+    BitmapMut, BitmapView, BlockMapping, CommitHeader, DirEntry, DirEntryIter, Extent, ExtentIdx,
+    ExtentNode, GroupDesc, Inode, InodeLocation, InodeTableLayout, Superblock,
 };
-use crate::ondisk::{read_u16_le, write_u16_le};
+use crate::ondisk::{read_u16_le, read_u32_le, write_u16_le};
 use crate::{Ext4FormatError, Result};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -219,6 +219,124 @@ impl<I: BlockImage> Ext4Pager<I> {
         })
     }
 
+    /// Write a file page back to disk, allocating a fresh block and
+    /// extending the inode's extent map when the target page is a hole.
+    /// Backs `FsPageBacking::flush_page` (the read-only
+    /// `write_existing_page` above only handles already-mapped blocks).
+    pub fn write_page(
+        &mut self,
+        inode: InodeNo,
+        file_page_index: u64,
+        page: &Page4K,
+    ) -> Result<()> {
+        let mut disk_inode = self.read_inode(inode)?;
+        let logical = logical_block(file_page_index)?;
+        let block = match self.resolve_inode_block(&disk_inode, logical)? {
+            BlockMapping::Data(block) => block,
+            BlockMapping::Hole => {
+                let new_block = self.allocate_block()?;
+                self.attach_data_block(&mut disk_inode, logical, new_block)?;
+                disk_inode.blocks_512 = disk_inode
+                    .blocks_512
+                    .saturating_add((BLOCK_SIZE / 512) as u64);
+                // Size is owned by `serialize_inode_meta` (exact logical
+                // size) and `set_inode_size`; writeback only persists the
+                // data block + extent, never the size.
+                self.write_inode(inode, &disk_inode)?;
+                new_block
+            }
+            BlockMapping::NeedNode(_) => return Err(Ext4FormatError::Unsupported),
+        };
+        self.image.write_block(block, page)?;
+        Ok(())
+    }
+
+    /// Attach a newly allocated `physical` block at `logical` to the inode's
+    /// extent map, growing the trailing extent when the block continues it
+    /// contiguously, otherwise inserting a fresh extent.
+    ///
+    /// The inode's inline root holds at most 4 extents. When a 5th distinct
+    /// extent is needed (e.g. a file fragmented by concurrent multi-process
+    /// writeback, or random-order writes), the extents spill into a freshly
+    /// allocated extent block and the inode root becomes a single-entry,
+    /// depth-1 index node pointing at it. A 4 KiB extent block holds up to 340
+    /// extents, which covers the file sizes the test workloads use; deeper
+    /// trees / multiple child blocks remain `Unsupported`.
+    fn attach_data_block(
+        &mut self,
+        inode: &mut Inode,
+        logical: u32,
+        physical: u64,
+    ) -> Result<()> {
+        const INLINE_MAX_EXTENTS: usize = 4;
+        let block_max_extents = (BLOCK_SIZE - 12) / 12;
+        match ExtentNode::parse(inode.extent_root_bytes())? {
+            ExtentNode::Leaf(mut extents) => {
+                coalesce_insert_extent(&mut extents, logical, physical);
+                if extents.len() <= INLINE_MAX_EXTENTS {
+                    inode.set_extent_root(&extents)?;
+                    return Ok(());
+                }
+                // Inline root full: spill all extents into a fresh extent block
+                // and turn the inode root into a single-entry index node.
+                let child = self.allocate_block()?;
+                let mut block = [0u8; BLOCK_SIZE];
+                ExtentNode::encode_leaf(&extents, &mut block)?;
+                self.image.write_block(child, &block)?;
+                inode.blocks_512 = inode.blocks_512.saturating_add((BLOCK_SIZE / 512) as u64);
+                inode.set_extent_index_root(
+                    &[ExtentIdx {
+                        logical_block: extents[0].logical_block,
+                        child,
+                    }],
+                    1,
+                )?;
+                Ok(())
+            }
+            ExtentNode::Index(indexes) => {
+                if indexes.is_empty() {
+                    return Err(Ext4FormatError::Corrupt);
+                }
+                // depth-1, single child block. Pick the child covering `logical`.
+                let idx_pos = indexes
+                    .iter()
+                    .rposition(|i| i.logical_block <= logical)
+                    .unwrap_or(0);
+                let child = indexes[idx_pos].child;
+                let mut block = [0u8; BLOCK_SIZE];
+                self.image.read_block(child, &mut block)?;
+                let mut extents = match ExtentNode::parse(&block)? {
+                    ExtentNode::Leaf(list) => list,
+                    ExtentNode::Index(_) => return Err(Ext4FormatError::Unsupported),
+                };
+                coalesce_insert_extent(&mut extents, logical, physical);
+                if extents.len() > block_max_extents {
+                    return Err(Ext4FormatError::Unsupported);
+                }
+                ExtentNode::encode_leaf(&extents, &mut block)?;
+                self.image.write_block(child, &block)?;
+                // Keep the index entry's key in sync if the lowest logical moved.
+                let new_low = extents[0].logical_block;
+                if new_low != indexes[idx_pos].logical_block {
+                    let mut idxs = indexes.clone();
+                    idxs[idx_pos].logical_block = new_low;
+                    inode.set_extent_index_root(&idxs, 1)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Set the inode's logical size — backs `FsPageBacking::truncate`.
+    /// Block reclamation on shrink is not yet implemented; the `size`
+    /// field governs how many bytes reads return.
+    pub fn set_inode_size(&mut self, inode: InodeNo, new_size: u64) -> Result<()> {
+        let mut disk_inode = self.read_inode(inode)?;
+        disk_inode.size = new_size;
+        self.write_inode(inode, &disk_inode)?;
+        Ok(())
+    }
+
     pub fn lookup(&mut self, directory: InodeNo, name: &[u8]) -> Result<Option<InodeNo>> {
         let mut entries = [DirEntryLite::empty(); 8];
         let mut offset = 0u64;
@@ -370,19 +488,34 @@ impl<I: BlockImage> Ext4Pager<I> {
     }
 
     /// Allocate a free inode in group 0, mark it used in the bitmap, and return
-    /// its number.  Panics on group-desc absence, returns `OutOfBounds` when
-    /// the bitmap is full.
+    /// its number. Returns `OutOfBounds` when every group bitmap is full.
     pub fn allocate_inode(&mut self) -> Result<InodeNo> {
-        let group = *self.groups.first().ok_or(Ext4FormatError::Corrupt)?;
-        let bitmap_block = group.inode_bitmap_block();
-        let mut bitmap = [0u8; BLOCK_SIZE];
-        self.image.read_block(bitmap_block, &mut bitmap)?;
-        let bit = BitmapView::new(&bitmap)
-            .first_zero()
-            .ok_or(Ext4FormatError::OutOfBounds)?;
-        BitmapMut::new(&mut bitmap).set(bit)?;
-        self.image.write_block(bitmap_block, &bitmap)?;
-        Ok(InodeNo::new(bit as u32 + 1))
+        if self.superblock.inodes_per_group == 0 {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        let inodes_per_group = self.superblock.inodes_per_group as u64;
+        let total_inodes = self.superblock.inodes_count as u64;
+
+        for (group_index, group) in self.groups.iter().copied().enumerate() {
+            let group_first_index = group_index as u64 * inodes_per_group;
+            if group_first_index >= total_inodes {
+                break;
+            }
+            let group_inode_count =
+                core::cmp::min(inodes_per_group, total_inodes - group_first_index);
+            let bitmap_block = group.inode_bitmap_block();
+            let mut bitmap = [0u8; BLOCK_SIZE];
+            self.image.read_block(bitmap_block, &mut bitmap)?;
+            let view = BitmapView::new(&bitmap);
+            let Some(bit) = (0..group_inode_count as usize).find(|bit| !view.is_set(*bit)) else {
+                continue;
+            };
+            BitmapMut::new(&mut bitmap).set(bit)?;
+            self.image.write_block(bitmap_block, &bitmap)?;
+            return Ok(InodeNo::new((group_first_index + bit as u64 + 1) as u32));
+        }
+
+        Err(Ext4FormatError::OutOfBounds)
     }
 
     /// Write `inode` directly into the inode table (no journal).
@@ -398,16 +531,32 @@ impl<I: BlockImage> Ext4Pager<I> {
     /// Allocate a free data block in group 0, mark it used, and return its
     /// absolute block number.
     pub fn allocate_block(&mut self) -> Result<u64> {
-        let group = *self.groups.first().ok_or(Ext4FormatError::Corrupt)?;
-        let bitmap_block = group.block_bitmap_block();
-        let mut bitmap = [0u8; BLOCK_SIZE];
-        self.image.read_block(bitmap_block, &mut bitmap)?;
-        let bit = BitmapView::new(&bitmap)
-            .first_zero()
-            .ok_or(Ext4FormatError::OutOfBounds)?;
-        BitmapMut::new(&mut bitmap).set(bit)?;
-        self.image.write_block(bitmap_block, &bitmap)?;
-        Ok(self.superblock.first_data_block as u64 + bit as u64)
+        if self.superblock.blocks_per_group == 0 {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        let blocks_per_group = self.superblock.blocks_per_group as u64;
+        let first_data_block = self.superblock.first_data_block as u64;
+        let total_blocks = core::cmp::min(self.superblock.blocks_count, self.image.total_blocks());
+
+        for (group_index, group) in self.groups.iter().copied().enumerate() {
+            let group_start = first_data_block + group_index as u64 * blocks_per_group;
+            if group_start >= total_blocks {
+                break;
+            }
+            let group_block_count = core::cmp::min(blocks_per_group, total_blocks - group_start);
+            let bitmap_block = group.block_bitmap_block();
+            let mut bitmap = [0u8; BLOCK_SIZE];
+            self.image.read_block(bitmap_block, &mut bitmap)?;
+            let view = BitmapView::new(&bitmap);
+            let Some(bit) = (0..group_block_count as usize).find(|bit| !view.is_set(*bit)) else {
+                continue;
+            };
+            BitmapMut::new(&mut bitmap).set(bit)?;
+            self.image.write_block(bitmap_block, &bitmap)?;
+            return Ok(group_start + bit as u64);
+        }
+
+        Err(Ext4FormatError::OutOfBounds)
     }
 
     /// Insert a new directory entry `(name → new_ino)` into an existing
@@ -651,6 +800,91 @@ impl<I: BlockImage> Ext4Pager<I> {
         Ok(written)
     }
 
+    pub fn read_dir_entries_from_offset(
+        &mut self,
+        directory: InodeNo,
+        start_offset: u64,
+        out: &mut [DirEntryLite],
+        next_offsets: &mut [u64],
+    ) -> Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        if next_offsets.len() < out.len() {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        let disk_inode = self.read_inode(directory)?;
+        if !disk_inode.is_dir() {
+            return Err(Ext4FormatError::Unsupported);
+        }
+        if start_offset >= disk_inode.size {
+            return Ok(0);
+        }
+
+        let mut written = 0usize;
+        let page_count = div_ceil_u64(disk_inode.size, BLOCK_SIZE as u64);
+        let mut page_index = start_offset / BLOCK_SIZE as u64;
+        let mut offset_in_page = (start_offset % BLOCK_SIZE as u64) as usize;
+
+        while page_index < page_count {
+            let mut page = [0u8; BLOCK_SIZE];
+            match self.resolve_inode_block(&disk_inode, logical_block(page_index)?)? {
+                BlockMapping::Data(block) => self.image.read_block(block, &mut page)?,
+                BlockMapping::Hole => {
+                    page_index += 1;
+                    offset_in_page = 0;
+                    continue;
+                }
+                BlockMapping::NeedNode(_) => return Err(Ext4FormatError::Unsupported),
+            }
+
+            while offset_in_page < BLOCK_SIZE {
+                let absolute_offset = page_index * BLOCK_SIZE as u64 + offset_in_page as u64;
+                if absolute_offset >= disk_inode.size {
+                    return Ok(written);
+                }
+                if BLOCK_SIZE - offset_in_page < 8 {
+                    return Err(Ext4FormatError::Truncated);
+                }
+
+                let rec_len = read_u16_le(&page, offset_in_page + 4)? as usize;
+                if rec_len == 0 {
+                    break;
+                }
+                if rec_len < 8 || offset_in_page + rec_len > BLOCK_SIZE {
+                    return Err(Ext4FormatError::Corrupt);
+                }
+
+                let next_offset = absolute_offset + rec_len as u64;
+                let inode = read_u32_le(&page, offset_in_page)?;
+                if inode != 0 {
+                    let name_len = page[offset_in_page + 6] as usize;
+                    if name_len > rec_len - 8 {
+                        return Err(Ext4FormatError::Corrupt);
+                    }
+                    let entry = DirEntry {
+                        inode,
+                        rec_len: rec_len as u16,
+                        file_type: page[offset_in_page + 7],
+                        name: &page[offset_in_page + 8..offset_in_page + 8 + name_len],
+                    };
+                    out[written] = DirEntryLite::from_ondisk(entry)?;
+                    next_offsets[written] = next_offset;
+                    written += 1;
+                    if written == out.len() {
+                        return Ok(written);
+                    }
+                }
+                offset_in_page += rec_len;
+            }
+
+            page_index += 1;
+            offset_in_page = 0;
+        }
+
+        Ok(written)
+    }
+
     fn inode_location(&self, inode: InodeNo) -> Result<InodeLocation> {
         if inode.get() == 0 {
             return Err(Ext4FormatError::OutOfBounds);
@@ -706,6 +940,35 @@ impl<I: BlockImage> Ext4Pager<I> {
         }
         Err(Ext4FormatError::Corrupt)
     }
+}
+
+/// Insert `(logical → physical)` into a logical-sorted extent list, growing the
+/// preceding extent in place when the new block continues it contiguously
+/// (the common sequential case → one growing extent), otherwise inserting a
+/// fresh single-block extent at the sorted position.
+fn coalesce_insert_extent(extents: &mut Vec<Extent>, logical: u32, physical: u64) {
+    let pos = extents
+        .iter()
+        .position(|e| e.logical_block > logical)
+        .unwrap_or(extents.len());
+    if pos > 0 {
+        let prev = &mut extents[pos - 1];
+        let contiguous = prev.logical_block + prev.len as u32 == logical
+            && prev.physical_start + prev.len as u64 == physical
+            && (prev.len as u32) < Extent::UNINITIALIZED_MASK as u32;
+        if contiguous {
+            prev.len += 1;
+            return;
+        }
+    }
+    extents.insert(
+        pos,
+        Extent {
+            logical_block: logical,
+            len: 1,
+            physical_start: physical,
+        },
+    );
 }
 
 fn read_group_descs<I: BlockImage>(image: &I, superblock: &Superblock) -> Result<Vec<GroupDesc>> {

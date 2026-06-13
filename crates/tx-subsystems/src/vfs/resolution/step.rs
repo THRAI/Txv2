@@ -18,7 +18,7 @@ use crate::execution::Guard;
 use crate::mount::{MountNamespace, MountPayload};
 use crate::vfs::adapter::step_engine::{self, Cap, StepOutcome};
 use crate::vfs::structure::{
-    Credential, DEntry, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking,
+    Credential, DEntry, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking, S_ISVTX,
 };
 use crate::vfs::walker::{self, SYMLOOP_MAX};
 use crate::vfs::FsOps;
@@ -292,6 +292,13 @@ pub fn kernel_step(
             };
             return KernelStep::Continue(WalkState::Terminal(resolved));
         }
+        let protected_parent_meta = match fs_ops.load_inode_meta(parent_fs_object_id, guard) {
+            StepOutcome::Done(meta) => meta,
+            _ => parent_meta,
+        };
+        if protected_symlink_follow_denied(cred, &protected_parent_meta, &child_meta) {
+            return KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::EACCES));
+        }
         hop_count += 1;
         if hop_count > SYMLOOP_MAX {
             return KernelStep::Error(WalkCause::SymlinkLimit);
@@ -370,6 +377,16 @@ pub fn kernel_step(
     }))
 }
 
+fn protected_symlink_follow_denied(
+    cred: &Credential,
+    parent_meta: &InodeMeta,
+    link_meta: &InodeMeta,
+) -> bool {
+    let sticky_world_writable =
+        (parent_meta.mode & S_ISVTX) != 0 && (parent_meta.mode & 0o002) != 0;
+    sticky_world_writable && cred.uid != link_meta.uid && parent_meta.uid != link_meta.uid
+}
+
 pub(super) fn kernel_step_after_lookup_io(
     walking: WalkingState,
     fs_ops: Arc<dyn FsOps>,
@@ -437,6 +454,7 @@ pub(super) fn kernel_step_after_lookup_io(
         mount_namespace,
         child_fs_object_id,
         child_meta,
+        cred,
         rules,
         guard,
     )
@@ -464,6 +482,7 @@ pub(super) fn kernel_step_after_meta_io(
         mount_namespace,
         child_fs_object_id,
         child_meta,
+        cred,
         rules,
         guard,
     )
@@ -501,6 +520,7 @@ pub(super) fn kernel_step_after_readlink_io(
         child_fs_object_id,
         child_meta,
         child_rnode_cap,
+        cred,
         rules,
         guard,
     )
@@ -528,6 +548,7 @@ pub(super) fn kernel_step_after_materialise_io(
         child_fs_object_id,
         child_meta,
         child_rnode_cap,
+        cred,
         rules,
         guard,
     )
@@ -594,6 +615,7 @@ fn continue_after_child_meta(
     mount_namespace: Option<&Cap<MountNamespace>>,
     child_fs_object_id: crate::vfs::FsObjectId,
     child_meta: InodeMeta,
+    cred: &Credential,
     rules: TerminalRules,
     guard: &Guard<'_>,
 ) -> KernelStep {
@@ -625,6 +647,7 @@ fn continue_after_child_meta(
         child_fs_object_id,
         child_meta,
         child_rnode_cap,
+        cred,
         rules,
         guard,
     )
@@ -637,6 +660,7 @@ fn continue_after_child_rnode(
     child_fs_object_id: crate::vfs::FsObjectId,
     child_meta: InodeMeta,
     child_rnode_cap: Cap<RNode>,
+    cred: &Credential,
     rules: TerminalRules,
     guard: &Guard<'_>,
 ) -> KernelStep {
@@ -679,6 +703,10 @@ fn continue_after_child_rnode(
                 meta,
             };
             return KernelStep::Continue(WalkState::Terminal(resolved));
+        }
+        let parent_meta = current.rnode().meta();
+        if protected_symlink_follow_denied(cred, &parent_meta, &child_meta) {
+            return KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::EACCES));
         }
         hop_count += 1;
         if hop_count > SYMLOOP_MAX {

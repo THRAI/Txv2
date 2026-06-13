@@ -848,12 +848,26 @@ fn dmw_direct_map_reservation_is_precovered_for_ram() {
         Platform::reserve_kernel_direct_map_1g(PhysAddr(0)),
         Ok(None)
     );
+    // The DMW statically covers the whole physical space, so low RAM, high RAM
+    // (above the MMIO hole), and the full DMW limit are all precovered.
     assert_eq!(
         Platform::extend_direct_map(PhysAddr(QEMU_LA64_RAM_END)),
         Ok(())
     );
     assert_eq!(
-        Platform::extend_direct_map(PhysAddr(QEMU_LA64_RAM_END + 1)),
+        Platform::extend_direct_map(PhysAddr(QEMU_LA64_HIGH_RAM_BASE)),
+        Ok(())
+    );
+    assert_eq!(
+        Platform::extend_direct_map(PhysAddr(
+            QEMU_LA64_RAM_BASE + QEMU_LA64_DIRECT_MAP_SIZE
+        )),
+        Ok(())
+    );
+    assert_eq!(
+        Platform::extend_direct_map(PhysAddr(
+            (QEMU_LA64_RAM_BASE + QEMU_LA64_DIRECT_MAP_SIZE).wrapping_add(1)
+        )),
         Err(PmapError::Unsupported)
     );
 }
@@ -978,6 +992,8 @@ fn la64_user_page_mapping_reserve_commit_protect_and_unmap() {
     let leaf = l0[la64_l0_index(virt.0)];
     assert!(la64_pte_is_leaf(leaf));
     assert_eq!(la64_pte_phys(leaf), phys);
+    assert_eq!(leaf & LA64_PTE_PLV_USER, LA64_PTE_PLV_USER);
+    assert_eq!(leaf & LA64_PTE_RPLV, 0);
     assert_eq!(
         Platform::reserve_mapping(&root, virt, phys, PmapReserveKind::Page4K),
         Err(PmapError::AlreadyMapped)
@@ -1326,7 +1342,9 @@ fn reset_pt_node_allocator_for_test() {
 }
 
 fn reset_la64_asids_for_test() {
-    LA64_ALLOCATED_ASIDS.store(1, Ordering::Release);
+    for word in LA64_ALLOCATED_ASIDS.iter() {
+        word.store(0, Ordering::Release);
+    }
 }
 
 fn reset_pmap_test_state() {

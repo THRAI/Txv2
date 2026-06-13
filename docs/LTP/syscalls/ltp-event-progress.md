@@ -8,10 +8,25 @@ Runs are split into explicit 5-case groups with `make oscomp-local-rv64-ltp-musl
 | Item | Value | Note |
 | --- | ---: | --- |
 | cases | 90 | from `make ltp-batch-cases LTP_BATCH=event` |
-| latest local run | timeout triage | 2026-05-26 single-case reruns for previously hung event cases |
-| cumulative scored | `439/562` | recorded rows in this document |
+| latest local run | focused LA64 submit-tail rerun | 2026-06-03 promoted whitelist candidates, musl+glibc |
+| cumulative scored | `441/562` | recorded rows in this document |
 | reached case | `userfaultfd01` | batch completed |
 | logs | `target/oscomp/ltp-progress/event`, `target/oscomp/ltp-timeout-triage/event` | per-group stdout, single-case timeout triage logs, and serial snapshots |
+
+## 2026-06-03 focused submit-tail rerun
+
+复测日志：
+
+- LA musl: `target/oscomp/ltp-extra-core-a-la-musl-20260603.txt`
+- LA glibc: `target/oscomp/ltp-extra-core-g1-la-glibc-20260603.txt`
+
+确认可作为 active submit 尾部补充分的 event case：
+
+`epoll_ctl04`, `epoll_ctl05`, `futex_cmp_requeue02`, `futex_wait02`,
+`futex_wait04`, `pselect03`, `pselect03_64`。
+
+`futex_cmp_requeue02` 在这次 LA musl/glibc focused run 中为 `3/3`，
+修正此前单测记录的 `1/3`。
 
 ## 2026-05-26 failure notes
 
@@ -73,7 +88,7 @@ Runs are split into explicit 5-case groups with `make oscomp-local-rv64-ltp-musl
 | `fanotify22` | 0/1 | skip | TCONF: Couldn't find 'debugfs' in $PATH |
 | `fanotify23` | 0/2 | fail | TBROK: Failed to acquire device |
 | `futex_cmp_requeue01` | 0/0 | hang | single-case rerun still host-times out; multiple waiters are not woken/requeued and report `ETIMEDOUT` |
-| `futex_cmp_requeue02` | 1/3 | partial | single-case rerun exits cleanly; invalid `FUTEX_CMP_REQUEUE` cases succeed unexpectedly, EAGAIN path passes |
+| `futex_cmp_requeue02` | 3/3 | pass | 2026-06-03 LA musl/glibc focused submit-tail rerun passes all Summary checks |
 | `futex_wait01` | 4/4 | pass | single-case rerun exits cleanly; timeout and EAGAIN paths pass |
 | `futex_wait02` | 1/1 | pass |  |
 | `futex_wait03` | 1/1 | pass |  |

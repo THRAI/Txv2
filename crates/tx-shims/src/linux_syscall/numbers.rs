@@ -55,12 +55,84 @@ pub const NR_SETSOCKOPT: u64 = 208;
 pub const NR_GETSOCKOPT: u64 = 209;
 /// `shutdown(sockfd, how)`. Linux generic ABI `__NR_shutdown`.
 pub const NR_SHUTDOWN: u64 = 210;
+/// `sendmsg(sockfd, msg, flags)`. Linux generic ABI `__NR_sendmsg`.
+pub const NR_SENDMSG: u64 = 211;
+/// `recvmsg(sockfd, msg, flags)`. Linux generic ABI `__NR_recvmsg`.
+pub const NR_RECVMSG: u64 = 212;
 /// `accept4(sockfd, addr, addrlen, flags)`. Linux generic ABI `__NR_accept4`.
 pub const NR_ACCEPT4: u64 = 242;
+/// `recvmmsg(sockfd, msgvec, vlen, flags, timeout)`. Linux generic ABI `__NR_recvmmsg`.
+pub const NR_RECVMMSG: u64 = 243;
 /// `fanotify_init(flags, event_f_flags)`. Linux RV64 generic ABI.
 pub const NR_FANOTIFY_INIT: u64 = 262;
 /// `fanotify_mark(fanotify_fd, flags, mask, dfd, pathname)`. Linux RV64 generic ABI.
 pub const NR_FANOTIFY_MARK: u64 = 263;
+/// `name_to_handle_at(dfd, name, handle, mnt_id, flags)`. Linux RV64 generic ABI.
+pub const NR_NAME_TO_HANDLE_AT: u64 = 264;
+/// `open_by_handle_at(mount_fd, handle, flags)`. Linux RV64 generic ABI.
+pub const NR_OPEN_BY_HANDLE_AT: u64 = 265;
+/// `sendmmsg(sockfd, msgvec, vlen, flags)`. Linux generic ABI `__NR_sendmmsg`.
+pub const NR_SENDMMSG: u64 = 269;
+
+pub const AF_UNIX: u16 = 1;
+pub const AF_INET: u16 = 2;
+pub const AF_INET6: u16 = 10;
+pub const AF_NETLINK: u16 = 16;
+pub const AF_PACKET: u16 = 17;
+pub const NETLINK_ROUTE: i32 = 0;
+pub const NETLINK_NETFILTER: i32 = 12;
+pub const SOL_NETLINK: i32 = 270;
+pub const SOL_PACKET: i32 = 263;
+pub const SOL_TLS: i32 = 282;
+pub const NETLINK_EXT_ACK: i32 = 11;
+pub const SOL_SOCKET: i32 = 1;
+pub const IPPROTO_IP: i32 = 0;
+pub const IPPROTO_ICMP: i32 = 1;
+pub const IPPROTO_TCP: i32 = 6;
+pub const IPPROTO_UDP: i32 = 17;
+pub const IPPROTO_IPV6: i32 = 41;
+pub const IPPROTO_UDPLITE: i32 = 136;
+pub const SOL_IPV6: i32 = 41;
+pub const IPV6_ADDRFORM: i32 = 1;
+pub const IPV6_V6ONLY: i32 = 26;
+pub const IP_RECVERR: i32 = 11;
+pub const IP_HDRINCL: i32 = 3;
+pub const MCAST_JOIN_GROUP: i32 = 42;
+pub const MCAST_LEAVE_GROUP: i32 = 45;
+pub const SO_REUSEADDR: i32 = 2;
+pub const SO_TYPE: i32 = 3;
+pub const SO_ERROR: i32 = 4;
+pub const SO_DONTROUTE: i32 = 5;
+pub const SO_KEEPALIVE: i32 = 9;
+pub const SO_OOBINLINE: i32 = 10;
+pub const SO_NO_CHECK: i32 = 11;
+pub const SO_BROADCAST: i32 = 6;
+pub const SO_LINGER: i32 = 13;
+pub const SO_REUSEPORT: i32 = 15;
+pub const SO_PEERCRED: i32 = 17;
+pub const SO_SNDBUF: i32 = 7;
+pub const SO_RCVBUF: i32 = 8;
+pub const SO_SNDBUFFORCE: i32 = 32;
+pub const SO_RCVTIMEO: i32 = 20;
+pub const SO_SNDTIMEO: i32 = 21;
+pub const PACKET_RX_RING: i32 = 5;
+pub const PACKET_VERSION: i32 = 10;
+pub const PACKET_RESERVE: i32 = 12;
+pub const PACKET_VNET_HDR: i32 = 15;
+pub const TPACKET_V1: i32 = 0;
+pub const TPACKET_V2: i32 = 1;
+pub const TPACKET_V3: i32 = 2;
+pub const TCP_NODELAY: i32 = 1;
+pub const TCP_MAXSEG: i32 = 2;
+pub const TCP_INFO: i32 = 11;
+pub const TCP_CONGESTION: i32 = 13;
+pub const TCP_ULP: i32 = 31;
+pub const TLS_TX: i32 = 1;
+pub const IPT_SO_SET_REPLACE: i32 = 64;
+pub const IPT_SO_SET_ADD_COUNTERS: i32 = 65;
+pub const IPT_SO_GET_INFO: i32 = 64;
+pub const IPT_SO_GET_ENTRIES: i32 = 65;
+
 /// `sendfile64(out_fd, in_fd, offset, count)`. Linux generic ABI
 /// `__NR_sendfile64`. Copies data from `in_fd` to `out_fd` via
 /// page-level transfer without an intermediate userspace buffer.
@@ -79,6 +151,8 @@ pub const NR_SYNC_FILE_RANGE: u64 = 84;
 /// v1 stub: returns 0 (success, no-op) — real priority
 /// inheritance deferred to the scheduler slice.
 pub const NR_SCHED_SETSCHEDULER: u64 = 119;
+/// `prctl(option, ...)`. Linux generic ABI.
+pub const NR_PRCTL: u64 = 167;
 /// `ppoll(fds, nfds, tmo_p, sigmask)`. Linux generic ABI
 /// `__NR_ppoll`. busybox sh's interactive read loop polls stdin
 /// before reading. The v1 implementation is a minimal stub: walk
@@ -93,6 +167,8 @@ pub const NR_PPOLL: u64 = 73;
 /// wrapper routes through this syscall on RISC-V, and lmbench's
 /// `benchmp` pipe handshake depends on fd-set readiness.
 pub const NR_PSELECT6: u64 = 72;
+/// Legacy 32-bit time64 alias used by some LTP harness paths.
+pub const NR_PSELECT6_TIME64: u64 = 413;
 /// `exit(status)`. Linux generic ABI `__NR_exit`. Per-thread exit per
 /// `PROCESS_v1` §7.3.1 — for a single-threaded process, the
 /// `step_thread_exit` chain triggers `step_process_exit` internally.
@@ -110,6 +186,10 @@ pub const NR_GETPID: u64 = 172;
 /// Linux semantics: brk *never* returns a negative errno; on failure
 /// the unchanged current break is returned.
 pub const NR_BRK: u64 = 214;
+/// `capget(hdrp, datap)`. Linux generic ABI `__NR_capget = 90`.
+pub const NR_CAPGET: u64 = 90;
+/// `capset(hdrp, datap)`. Linux generic ABI `__NR_capset = 91`.
+pub const NR_CAPSET: u64 = 91;
 /// `rt_sigaction(signum, act, oldact, sigsetsize)`. Linux generic ABI
 /// `__NR_rt_sigaction`. Per `SIGNAL_v1` §15.1; routes through
 /// `signal::step_sigaction`. Rejects `sigsetsize != 8`.
@@ -166,6 +246,10 @@ pub const NR_EXECVE: u64 = 221;
 /// `__NR_getgroups = 158`. txKernel v1 does not model supplementary
 /// groups, so this reports zero entries and performs no writes.
 pub const NR_GETGROUPS: u64 = 158;
+/// `setgroups(size, list)`. Linux RV64 generic ABI `__NR_setgroups = 159`.
+/// Supplementary groups are not modelled yet; the syscall validates
+/// privilege and pointer shape, then records success as a compatibility no-op.
+pub const NR_SETGROUPS: u64 = 159;
 
 // ---------------------------------------------------------------------
 // fcntl command numbers + flag bits.
@@ -233,10 +317,24 @@ pub const O_TRUNC: u32 = 0o1000;
 /// is positioned at end-of-file regardless of the per-fd offset.
 /// Threads through to `OpenFileFlags::append`.
 pub const O_APPEND: u32 = 0o2000;
+/// `openat(2)` flag bit: require the resolved path to be a directory.
+/// Linux returns `ENOTDIR` when the terminal component exists but is not
+/// a directory.
+pub const O_DIRECTORY: u32 = 0o200000;
+/// Internal bit used by Linux to form `O_TMPFILE`. The public
+/// `O_TMPFILE` value intentionally includes `O_DIRECTORY`, so openat
+/// must recognize it before applying ordinary O_DIRECTORY handling.
+pub const __O_TMPFILE: u32 = 0o20000000;
+/// `openat(2)` flag bit: create an unnamed regular file in the
+/// directory named by the path.
+pub const O_TMPFILE: u32 = __O_TMPFILE | O_DIRECTORY;
 /// `openat(2)` flag bit: non-blocking open + non-blocking I/O on the
 /// resulting fd. Wave 2 accepts but ignores this bit — there is no
 /// blocking-flag plumbing on `OpenFile` yet (`TODO(phase-nonblock)`).
 pub const O_NONBLOCK: u32 = 0o4000;
+/// `openat(2)` flag bit: path-only fd with no read/write capability.
+/// Linux ignores most other open flags when this is set.
+pub const O_PATH: u32 = 0o10000000;
 
 // ---------------------------------------------------------------------
 // Wave 2 of the fd-ops slice — fd-management syscall numbers.
@@ -358,18 +456,16 @@ pub const CLONE_VFORK: u64 = 0x4000;
 pub const CLONE_PARENT: u64 = 0x8000;
 pub const CLONE_THREAD: u64 = 0x10000;
 pub const CLONE_CHILD_CLEARTID: u64 = 0x200000;
+pub const CLONE_CHILD_SETTID: u64 = 0x1000000;
 pub const CLONE_PARENT_SETTID: u64 = 0x100000;
-/// glibc's `arch_fork` passes `CLONE_CHILD_SETTID |
-/// CLONE_CHILD_CLEARTID | SIGCHLD` with `ctid = &self->tid` so the
-/// kernel stamps the child's tid into the child's TCB.
-pub const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
 /// Ignored by Linux since 2.5.32; musl sets it unconditionally.
 pub const CLONE_DETACHED: u64 = 0x400000;
 /// System-V semaphore undo on exit; musl sets this in pthread_create.
 pub const CLONE_SYSVSEM: u64 = 0x40000;
 /// Namespace flags. `CLONE_NEWIPC` is wired to the process nsproxy
-/// clone path; the others are still silently accepted by pthread_create
-/// compatibility paths and remain namespace stubs.
+/// clone path; `CLONE_NEWUSER` and `CLONE_NEWNET` are wired to
+/// `unshare(2)` / `setns(2)`. The others are still silently accepted
+/// by pthread_create compatibility paths and remain namespace stubs.
 pub const CLONE_NEWNS: u64 = 0x20000;
 pub const CLONE_NEWCGROUP: u64 = 0x2000000;
 pub const CLONE_NEWUTS: u64 = 0x4000000;
@@ -417,6 +513,10 @@ pub const NR_SETSID: u64 = 157;
 /// semantic (futex wakeup on thread exit via `clear_child_tid`) is
 /// deferred to the pthread/futex slice (`TODO(phase-tls)`).
 pub const NR_SET_TID_ADDRESS: u64 = 96;
+/// `getitimer(which, curr_value)`. Linux RV64 generic ABI.
+pub const NR_GETITIMER: u64 = 102;
+/// `setitimer(which, new_value, old_value)`. Linux RV64 generic ABI.
+pub const NR_SETITIMER: u64 = 103;
 
 /// `set_robust_list(head, len)`. Linux generic ABI
 /// `__NR_set_robust_list`. Wave 2 ships a stub-success arm that
@@ -431,10 +531,18 @@ pub const NR_GET_ROBUST_LIST: u64 = 100;
 pub const NR_SCHED_SETAFFINITY: u64 = 122;
 /// `sched_getaffinity(pid, cpusetsize, mask)`. Linux generic ABI.
 pub const NR_SCHED_GETAFFINITY: u64 = 123;
+/// `sched_setattr(pid, attr, flags)`. Linux generic ABI.
+pub const NR_SCHED_SETATTR: u64 = 274;
+/// `sched_getattr(pid, attr, size, flags)`. Linux generic ABI.
+pub const NR_SCHED_GETATTR: u64 = 275;
 /// `sched_getscheduler(pid)`. Linux RV64 generic ABI.
 pub const NR_SCHED_GETSCHEDULER: u64 = 120;
 /// `sched_getparam(pid, param)`. Linux RV64 generic ABI.
 pub const NR_SCHED_GETPARAM: u64 = 121;
+/// `get_mempolicy(policy, nmask, maxnode, addr, flags)`. Linux generic ABI.
+/// cyclictest (NUMA-enabled la build) calls this; unimplemented it returned
+/// ENOSYS and cyclictest bailed with "unable to get scheduler parameters".
+pub const NR_GET_MEMPOLICY: u64 = 236;
 /// `sched_yield()`. Linux RV64 generic ABI.
 pub const NR_SCHED_YIELD: u64 = 124;
 /// `sched_get_priority_max(policy)`. Linux RV64 generic ABI.
@@ -666,9 +774,21 @@ pub const NR_MLOCK: u64 = 228;
 /// `munlock(addr, len)`. Linux RV64 generic ABI `__NR_munlock = 229`.
 /// Clears `VmEntryFlags.locked`.
 pub const NR_MUNLOCK: u64 = 229;
+/// `mlockall(flags)`. Linux RV64 generic ABI `__NR_mlockall = 230`.
+pub const NR_MLOCKALL: u64 = 230;
+/// `munlockall()`. Linux RV64 generic ABI `__NR_munlockall = 231`.
+pub const NR_MUNLOCKALL: u64 = 231;
+/// `mincore(addr, length, vec)`. Linux RV64 generic ABI
+/// `__NR_mincore = 232`.
+pub const NR_MINCORE: u64 = 232;
 /// `madvise(addr, length, advice)`. Linux RV64 generic ABI
 /// `__NR_madvise = 233`. Wraps `AddressSpace::madvise`.
 pub const NR_MADVISE: u64 = 233;
+/// `remap_file_pages(start, size, prot, pgoff, flags)`. Linux generic
+/// ABI `__NR_remap_file_pages = 234`.
+pub const NR_REMAP_FILE_PAGES: u64 = 234;
+/// `mlock2(addr, len, flags)`. Linux RV64 generic ABI `__NR_mlock2 = 284`.
+pub const NR_MLOCK2: u64 = 284;
 
 // ---------------------------------------------------------------------
 // `PROT_*` flag bits — Linux generic uapi `<sys/mman.h>`. Slice 2 acts
@@ -823,7 +943,9 @@ pub const FUTEX_WAKE_BITSET: u32 = 10;
 /// (`= FUTEX_WAIT | FUTEX_PRIVATE_FLAG`) for in-process guards.
 pub const FUTEX_PRIVATE_FLAG: u32 = 0x80;
 /// `FUTEX_CLOCK_REALTIME = 0x100` flag bit OR'd into the op word.
-/// Recognised but ignored (timeout support is deferred to Slice 4).
+/// For `FUTEX_WAIT_BITSET`, selects an absolute realtime timeout
+/// instead of an absolute monotonic timeout. For wake operations it is
+/// ignored after command decoding, matching Linux's flag masking.
 pub const FUTEX_CLOCK_REALTIME: u32 = 0x100;
 /// Mask applied to the `op` argument before matching the op
 /// selector — strips `FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME`.
@@ -914,6 +1036,12 @@ pub const CLOCK_MONOTONIC_COARSE: u32 = 6;
 /// `CLOCK_MONOTONIC` — txKernel's monotonic clock starts at boot, so
 /// "boot time" and "monotonic" are equivalent.
 pub const CLOCK_BOOTTIME: u32 = 7;
+/// `CLOCK_REALTIME_ALARM` is treated as realtime in the current shim.
+pub const CLOCK_REALTIME_ALARM: u32 = 8;
+/// `CLOCK_BOOTTIME_ALARM` is treated as boottime in the current shim.
+pub const CLOCK_BOOTTIME_ALARM: u32 = 9;
+/// `CLOCK_TAI` currently aliases realtime.
+pub const CLOCK_TAI: u32 = 11;
 
 /// `clock_nanosleep` flag bit: `TIMER_ABSTIME = 0x1`. When set, the
 /// `req` value is interpreted as an absolute deadline (against the
@@ -1068,6 +1196,44 @@ pub const NR_FLOCK: u64 = 32;
 pub const NR_MOUNT: u64 = 40;
 /// `umount2(target, flags)`. Linux RV64 ABI `__NR_umount2 = 39`.
 pub const NR_UMOUNT2: u64 = 39;
+/// `open_tree(dirfd, path, flags)`. Linux generic ABI.
+pub const NR_OPEN_TREE: u64 = 428;
+/// `fsopen(fsname, flags)`. Linux generic ABI.
+pub const NR_FSOPEN: u64 = 430;
+/// `fspick(dirfd, path, flags)`. Linux generic ABI.
+pub const NR_FSPICK: u64 = 433;
+/// `OPEN_TREE_CLONE`.
+pub const OPEN_TREE_CLONE: u32 = 0x0000_0001;
+/// `OPEN_TREE_CLOEXEC`.
+pub const OPEN_TREE_CLOEXEC: u32 = O_CLOEXEC;
+/// `FSOPEN_CLOEXEC`.
+pub const FSOPEN_CLOEXEC: u32 = 0x0000_0001;
+/// `FSPICK_CLOEXEC`.
+pub const FSPICK_CLOEXEC: u32 = 0x0000_0001;
+/// `FSPICK_SYMLINK_NOFOLLOW`.
+pub const FSPICK_SYMLINK_NOFOLLOW: u32 = 0x0000_0002;
+/// `FSPICK_NO_AUTOMOUNT`.
+pub const FSPICK_NO_AUTOMOUNT: u32 = 0x0000_0004;
+/// `FSPICK_EMPTY_PATH`.
+pub const FSPICK_EMPTY_PATH: u32 = 0x0000_0008;
+/// `perf_event_open(attr, pid, cpu, group_fd, flags)`. Linux generic ABI.
+pub const NR_PERF_EVENT_OPEN: u64 = 241;
+/// `memfd_create(name, flags)`. Linux generic ABI `__NR_memfd_create`.
+/// Returns an anonymous PageBacked regular-file fd with no path presence.
+pub const NR_MEMFD_CREATE: u64 = 279;
+/// `bpf(cmd, attr, size)`. Linux generic ABI.
+pub const NR_BPF: u64 = 280;
+/// `memfd_secret(flags)`. Linux generic ABI `__NR_memfd_secret`.
+/// Full secret-memory isolation is deferred; this stage provides an
+/// anonymous fd-shaped backing.
+pub const NR_MEMFD_SECRET: u64 = 447;
+/// `memfd_create(2)` flag: mark the returned fd close-on-exec.
+pub const MFD_CLOEXEC: u32 = 0x0001;
+/// `memfd_create(2)` flag: allow file seals. Currently rejected until
+/// `F_ADD_SEALS`/`F_GET_SEALS` semantics exist.
+pub const MFD_ALLOW_SEALING: u32 = 0x0002;
+/// `memfd_create(2)` flag for hugetlb-backed memfds. Unsupported.
+pub const MFD_HUGETLB: u32 = 0x0004;
 /// `mknodat(dirfd, path, mode, dev)`. Linux RV64 ABI `__NR_mknodat = 33`.
 pub const NR_MKNODAT: u64 = 33;
 /// `getdents64(fd, dirp, count)`. Linux RV64 generic ABI
@@ -1222,12 +1388,18 @@ pub const NR_PIDFD_OPEN: u64 = 434;
 /// `pidfd_send_signal(pidfd, sig, info, flags)` — Linux RV64.
 /// Phase J: returns `-ENOSYS`; TODO full implementation.
 pub const NR_PIDFD_SEND_SIGNAL: u64 = 424;
+/// `pidfd_getfd(pidfd, targetfd, flags)` — Linux RV64.
+pub const NR_PIDFD_GETFD: u64 = 438;
+/// `kcmp(pid1, pid2, type, idx1, idx2)` — Linux generic ABI.
+pub const NR_KCMP: u64 = 272;
 /// `uname(buf)`. Linux RV64 generic ABI `__NR_uname = 160`. Writes
 /// the static utsname (`sysname` / `nodename` / `release` / `version`
 /// / `machine` / `domainname`, each `[u8; 65]`) to `buf`. Slice 7
 /// pins `release = "6.1.0-txkernel"` so musl's runtime version probes
 /// see a Linux 2.6.16+ kernel.
 pub const NR_UNAME: u64 = 160;
+/// `sethostname(name, len)`. Linux generic ABI `__NR_sethostname = 161`.
+pub const NR_SETHOSTNAME: u64 = 161;
 /// `prlimit64(pid, resource, new_rlim, old_rlim)`. Linux RV64 generic
 /// ABI `__NR_prlimit64 = 261`.
 ///
@@ -1254,6 +1426,9 @@ pub const NR_GETRANDOM: u64 = 278;
 pub const NR_READAHEAD: u64 = 213;
 /// `fadvise64_64(fd, offset, len, advice)`. Linux RV64 generic ABI.
 pub const NR_FADVISE64_64: u64 = 223;
+/// Historical alias used by older in-tree LTP notes for the same generic
+/// `fadvise64_64` number.
+pub const NR_FADVISE64: u64 = NR_FADVISE64_64;
 /// `copy_file_range(fd_in, off_in, fd_out, off_out, len, flags)`.
 /// Linux RV64 generic ABI.
 pub const NR_COPY_FILE_RANGE: u64 = 285;
@@ -1291,6 +1466,22 @@ pub const F_GETFL: i32 = 3;
 /// `O_DIRECT` packet mode; other status flags are ignored until their
 /// owner implements them.
 pub const F_SETFL: i32 = 4;
+/// `F_GETLK` cmd: query POSIX advisory record locks.
+pub const F_GETLK: i32 = 5;
+/// `F_SETLK` cmd: set/clear POSIX advisory record locks without waiting.
+pub const F_SETLK: i32 = 6;
+/// `F_SETLKW` cmd: set/clear POSIX advisory record locks, waiting if needed.
+pub const F_SETLKW: i32 = 7;
+/// `F_OFD_GETLK` cmd: query open-file-description advisory locks.
+pub const F_OFD_GETLK: i32 = 36;
+/// `F_OFD_SETLK` cmd: set/clear open-file-description advisory locks.
+pub const F_OFD_SETLK: i32 = 37;
+/// `F_OFD_SETLKW` cmd: set/clear open-file-description locks, waiting if needed.
+pub const F_OFD_SETLKW: i32 = 38;
+/// `F_SETLEASE` cmd: request a file lease.
+pub const F_SETLEASE: i32 = 1024;
+/// `F_GETLEASE` cmd: query a file lease.
+pub const F_GETLEASE: i32 = 1025;
 /// `F_DUPFD_CLOEXEC` cmd: like [`F_DUPFD`] but the new fd is marked
 /// close-on-exec (the per-fd CLOEXEC bit is set on the result).
 pub const F_DUPFD_CLOEXEC: i32 = 1030;
@@ -1708,6 +1899,10 @@ pub const NR_IO_URING_ENTER: u64 = 426;
 /// one. Returns the fd. Recognised `flags`: `SFD_CLOEXEC`,
 /// `SFD_NONBLOCK`; other bits return `-EINVAL`.
 pub const NR_SIGNALFD4: u64 = 74;
+/// Historical `signalfd(fd, &mask, sizemask)` compatibility entry. Generic
+/// Linux userspace normally uses `signalfd4`, but some legacy probes still
+/// exercise the three-argument shape.
+pub const NR_SIGNALFD: u64 = 282;
 
 /// `SFD_CLOEXEC` — set close-on-exec on the resulting fd. Same bit
 /// value as `O_CLOEXEC` per Linux's signalfd4 flag convention.
@@ -1838,6 +2033,17 @@ pub const NR_TIMERFD_SETTIME: u64 = 86;
 /// `__NR_timerfd_gettime = 87`. Returns the current timer state.
 pub const NR_TIMERFD_GETTIME: u64 = 87;
 
+/// `timer_create(clockid, sevp, timerid)`. Linux generic uapi.
+pub const NR_TIMER_CREATE: u64 = 107;
+/// `timer_gettime(timerid, curr_value)`. Linux generic uapi.
+pub const NR_TIMER_GETTIME: u64 = 108;
+/// `timer_getoverrun(timerid)`. Linux generic uapi.
+pub const NR_TIMER_GETOVERRUN: u64 = 109;
+/// `timer_settime(timerid, flags, new_value, old_value)`. Linux generic uapi.
+pub const NR_TIMER_SETTIME: u64 = 110;
+/// `timer_delete(timerid)`. Linux generic uapi.
+pub const NR_TIMER_DELETE: u64 = 111;
+
 /// Recognised `timerfd_create` flags. TFD_CLOEXEC / TFD_NONBLOCK are
 /// translated to OpenFileFlags.
 pub const TFD_CLOEXEC_FLAG: u32 = O_CLOEXEC;
@@ -1907,36 +2113,14 @@ pub const MEMBARRIER_SUPPORTED_MASK: u64 = MEMBARRIER_CMD_QUERY
 // syscall surface; SIOCGIF* live with the ioctl block above.
 // ---------------------------------------------------------------------------
 
-/// `AF_UNIX` / `AF_LOCAL` — local interprocess sockets.
-pub const AF_UNIX: u16 = 1;
-/// `AF_INET` — IPv4 Internet protocols.
-pub const AF_INET: u16 = 2;
-/// `AF_INET6` — IPv6 Internet protocols.
-pub const AF_INET6: u16 = 10;
-/// `AF_NETLINK` — kernel/user-space netlink sockets.
-pub const AF_NETLINK: u16 = 16;
-/// `AF_PACKET` — low-level packet interface.
-pub const AF_PACKET: u16 = 17;
 
-/// `IPPROTO_IP` — dummy protocol / IPv4-level socket options.
-pub const IPPROTO_IP: i32 = 0;
-/// `IPPROTO_TCP` — Transmission Control Protocol.
-pub const IPPROTO_TCP: i32 = 6;
 /// `IPPROTO_ICMPV6` — ICMPv6.
 pub const IPPROTO_ICMPV6: i32 = 58;
 
-/// `SOL_SOCKET` — socket-level options.
-pub const SOL_SOCKET: i32 = 1;
 /// `SOL_SCTP` — SCTP-level options.
 pub const SOL_SCTP: i32 = 132;
-/// `SOL_IPV6` — IPv6-level options.
-pub const SOL_IPV6: i32 = 41;
 /// `SOL_RAW` — raw-socket-level options.
 pub const SOL_RAW: i32 = 255;
-/// `SOL_PACKET` — AF_PACKET-level options.
-pub const SOL_PACKET: i32 = 263;
-/// `SOL_NETLINK` — netlink-level options.
-pub const SOL_NETLINK: i32 = 270;
 
 /// `IPV6_2292PKTINFO` — RFC 2292 packet info.
 pub const IPV6_2292PKTINFO: i32 = 2;
@@ -1967,15 +2151,7 @@ pub const IPV6_RECVTCLASS: i32 = 66;
 /// `IPV6_TCLASS` — ancillary/sticky traffic class.
 pub const IPV6_TCLASS: i32 = 67;
 
-/// `MCAST_JOIN_GROUP` — protocol-independent multicast join.
-pub const MCAST_JOIN_GROUP: i32 = 42;
-/// `MCAST_LEAVE_GROUP` — protocol-independent multicast leave.
-pub const MCAST_LEAVE_GROUP: i32 = 45;
 
-/// `TPACKET_V1` — AF_PACKET v1 ring format.
-pub const TPACKET_V1: i32 = 0;
-/// `TPACKET_V3` — AF_PACKET v3 ring format.
-pub const TPACKET_V3: i32 = 2;
 
 // Socket-option *names* (the `optname` arg to set/getsockopt), grouped by level.
 // CRITICAL: these MUST be defined — the set/getsockopt dispatch matches on
@@ -1984,29 +2160,10 @@ pub const TPACKET_V3: i32 = 2;
 // (76 unreachable arms). Re-homed after PR#50 stripped them. Values are the
 // Linux generic-ABI numbers.
 
-// SOL_SOCKET options.
-pub const SO_REUSEADDR: i32 = 2;
-pub const SO_TYPE: i32 = 3;
-pub const SO_ERROR: i32 = 4;
-pub const SO_DONTROUTE: i32 = 5;
-pub const SO_BROADCAST: i32 = 6;
-pub const SO_SNDBUF: i32 = 7;
-pub const SO_RCVBUF: i32 = 8;
-pub const SO_KEEPALIVE: i32 = 9;
-pub const SO_OOBINLINE: i32 = 10;
-pub const SO_NO_CHECK: i32 = 11;
-pub const SO_LINGER: i32 = 13;
-pub const SO_REUSEPORT: i32 = 15;
-pub const SO_PEERCRED: i32 = 17;
-pub const SO_RCVTIMEO: i32 = 20;
-pub const SO_SNDTIMEO: i32 = 21;
 pub const SO_BINDTODEVICE: i32 = 25;
-pub const SO_SNDBUFFORCE: i32 = 32;
 
 // IPPROTO_IP options.
 pub const IP_TTL: i32 = 2;
-pub const IP_HDRINCL: i32 = 3;
-pub const IP_RECVERR: i32 = 11;
 pub const IP_MULTICAST_IF: i32 = 32;
 pub const IP_MULTICAST_TTL: i32 = 33;
 pub const IP_MULTICAST_LOOP: i32 = 34;
@@ -2017,13 +2174,6 @@ pub const IP_ADD_MEMBERSHIP: i32 = 35;
 pub const IP_DROP_MEMBERSHIP: i32 = 36;
 pub const ICMP6_FILTER: i32 = 1;
 
-// IPPROTO_TCP options.
-pub const TCP_NODELAY: i32 = 1;
-pub const TCP_MAXSEG: i32 = 2;
-pub const TCP_INFO: i32 = 11;
-pub const TCP_CONGESTION: i32 = 13;
-pub const TCP_ULP: i32 = 31;
-pub const TLS_TX: i32 = 1;
 
 // IPPROTO_SCTP options.
 pub const SCTP_RTOINFO: i32 = 0;
@@ -2048,41 +2198,10 @@ pub const SCTP_GET_LOCAL_ADDRS: i32 = 109;
 pub const SCTP_SOCKOPT_CONNECTX: i32 = 110;
 pub const SCTP_SOCKOPT_CONNECTX3: i32 = 111;
 
-// AF_PACKET (SOL_PACKET) options.
-pub const PACKET_RX_RING: i32 = 5;
-pub const PACKET_VERSION: i32 = 10;
-pub const PACKET_RESERVE: i32 = 12;
-pub const PACKET_VNET_HDR: i32 = 15;
 
-// SOL_NETLINK options.
-pub const NETLINK_EXT_ACK: i32 = 11;
 
-// iptables (SOL_IP get/set) options.
-pub const IPT_SO_SET_REPLACE: i32 = 64;
-pub const IPT_SO_SET_ADD_COUNTERS: i32 = 65;
-pub const IPT_SO_GET_INFO: i32 = 64;
-pub const IPT_SO_GET_ENTRIES: i32 = 65;
 
-/// `IPPROTO_UDP` — User Datagram Protocol.
-pub const IPPROTO_UDP: i32 = 17;
-/// `SOL_TLS` — kernel TLS socket-option level.
-pub const SOL_TLS: i32 = 282;
 
-// Message-based socket syscall numbers (RV64 generic ABI). Re-homed: their
-// handlers (sys_sendmsg/recvmsg/sendmmsg/recvmmsg) exist but were undispatched,
-// so sendmsg(2) fell through to ENOSYS — breaking every SCTP/UDP/TCP test that
-// sends ancillary-data messages.
-pub const NR_SENDMSG: u64 = 211;
-pub const NR_RECVMSG: u64 = 212;
-pub const NR_RECVMMSG: u64 = 243;
-pub const NR_SENDMMSG: u64 = 269;
 
-// Interval timers — setitimer arms the ITIMER_REAL deadline that bounds blocking
-// recv (LTP alarm-bounded recv tests hung without it).
-pub const NR_GETITIMER: u64 = 102;
-pub const NR_SETITIMER: u64 = 103;
-// More IPPROTO_IPV6 (SOL_IPV6) options.
-pub const IPV6_ADDRFORM: i32 = 1;
 pub const IPV6_CHECKSUM: i32 = 7;
 pub const IPV6_UNICAST_HOPS: i32 = 16;
-pub const IPV6_V6ONLY: i32 = 26;

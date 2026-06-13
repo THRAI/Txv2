@@ -19,6 +19,50 @@ use crate::thread_runtime::structure::{
 static CLEAR_CHILD_TID_WAKE_SAMPLE: AtomicU64 = AtomicU64::new(0);
 static THREAD_EXIT_PHASE_SAMPLE: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Clone, Copy)]
+struct ThreadExitUserCleanup {
+    ctid: Option<u64>,
+    robust: Option<(u64, usize)>,
+}
+
+fn snapshot_thread_exit_user_cleanup(thread: &Cap<ThreadIdentity>) -> ThreadExitUserCleanup {
+    let payload_guard = thread.payload.lock();
+    let Some(payload) = payload_guard.as_ref() else {
+        return ThreadExitUserCleanup {
+            ctid: None,
+            robust: None,
+        };
+    };
+    let ctid = *payload.clear_child_tid.lock();
+    let robust = {
+        let head = *payload.robust_list_head.lock();
+        let len = *payload.robust_list_len.lock();
+        head.map(|h| (h, len))
+    };
+    ThreadExitUserCleanup { ctid, robust }
+}
+
+fn apply_thread_exit_user_cleanup(
+    aspace: &crate::vm::AddressSpace,
+    cleanup: ThreadExitUserCleanup,
+) {
+    let guard = crate::thread_runtime::adapter::step_engine::guard();
+    if let Some(ctid_ptr) = cleanup.ctid {
+        clear_and_wake_child_tid(aspace, ctid_ptr, &guard);
+    }
+    if let Some((head, len)) = cleanup.robust {
+        walk_robust_list_in_aspace(aspace, head, len, &guard);
+    }
+}
+
+pub(crate) fn notify_thread_exit_userspace_in_aspace(
+    thread: &Cap<ThreadIdentity>,
+    aspace: &crate::vm::AddressSpace,
+) {
+    let cleanup = snapshot_thread_exit_user_cleanup(thread);
+    apply_thread_exit_user_cleanup(aspace, cleanup);
+}
+
 pub(crate) const THREAD_RUNTIME_LOCK_SERVICE_TRACE_NAMES: &[&[u8]] = &[
     b"debug.lock_service.thread.payload.sigprocmask.payload_lock_wait.duration_ns",
     b"debug.lock_service.thread.payload.sigprocmask.payload_lock_held.duration_ns",
@@ -416,6 +460,42 @@ fn walk_robust_list(thread: &Cap<ThreadIdentity>, head: u64, _offset: u64) {
     }
 
     drop(guard);
+}
+
+fn walk_robust_list_in_aspace(
+    aspace: &crate::vm::AddressSpace,
+    head: u64,
+    _len: usize,
+    guard: &step_engine::Guard<'_>,
+) {
+    let Some(first) = read_user_u64(aspace, head, guard) else {
+        return;
+    };
+    let Some(futex_offset) = read_user_i64(aspace, head + 8, guard) else {
+        return;
+    };
+    let Some(pending) = read_user_u64(aspace, head + 16, guard) else {
+        return;
+    };
+
+    let mut entry = first;
+    for _ in 0..2048 {
+        if entry == 0 || entry == head {
+            break;
+        }
+        mark_robust_entry_owner_died(aspace, entry, futex_offset, guard);
+        let Some(next) = read_user_u64(aspace, entry, guard) else {
+            break;
+        };
+        if next == entry {
+            break;
+        }
+        entry = next;
+    }
+
+    if pending != 0 {
+        mark_robust_entry_owner_died(aspace, pending, futex_offset, guard);
+    }
 }
 
 fn read_user_u64(

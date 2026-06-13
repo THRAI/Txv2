@@ -1,6 +1,6 @@
 use crate::adapter::step_engine::{self as step_engine, Cap, NoProgress, StepOutcome};
 use step_engine::Guard;
-use tx_ext4_format::pager::{BlockImage, DirEntryLite};
+use tx_ext4_format::pager::{BlockImage, DirEntryLite, InodeMetaLite};
 use tx_subsystems::execution::Errno;
 use tx_subsystems::mount::MountPayload;
 use tx_subsystems::page_backed::{PageContainer, PageContainerKind};
@@ -10,8 +10,8 @@ use tx_subsystems::vfs::structure::{
 };
 
 use crate::read_backend::{
-    cursor_from_index, cursor_index, fs_object_id as inode_fs_object_id, inode_no, map_inode_meta,
-    Ext4FsInstance, READDIR_WINDOW_ENTRIES,
+    cursor_from_offset, cursor_offset, fs_object_id as inode_fs_object_id, inode_no,
+    map_inode_meta, Ext4FsInstance, READDIR_WINDOW_ENTRIES,
 };
 
 // ext4 dir-entry file_type codes (POSIX-shaped). Maps the on-disk byte
@@ -112,11 +112,25 @@ where
 
     fn serialize_inode_meta(
         &self,
-        _fs_object_id: FsObjectId,
-        _meta: &InodeMeta,
+        fs_object_id: FsObjectId,
+        meta: &InodeMeta,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::ENOSYS.into())
+        if self.is_read_only() {
+            return StepOutcome::err(Errno::EROFS.into());
+        }
+        let inode = match inode_no(fs_object_id) {
+            Ok(inode) => inode,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        match self.with_pager(|pager| {
+            pager
+                .write_inode_meta_journaled(inode, inode_meta_lite(meta))
+                .map(|_| ())
+        }) {
+            Ok(()) => StepOutcome::done(()),
+            Err(err) => StepOutcome::err(err.into()),
+        }
     }
 
     fn create_inode(
@@ -259,6 +273,11 @@ where
             Ok(v) => v,
             Err(e) => return StepOutcome::err(e.into()),
         };
+        match self.with_pager(|pager| pager.lookup(parent_ino, name)) {
+            Ok(Some(_)) => return StepOutcome::err(Errno::EEXIST.into()),
+            Ok(None) => {}
+            Err(e) => return StepOutcome::err(e.into()),
+        }
         match self.with_pager(|pager| {
             pager.create_directory(parent_ino, name, mode, cred.uid, cred.gid, 0)
         }) {
@@ -322,24 +341,22 @@ where
             Ok(inode) => inode,
             Err(err) => return StepOutcome::err(err.into()),
         };
-        let index = match cursor_index(cursor) {
-            Ok(index) => index,
+        let offset = match cursor_offset(cursor) {
+            Ok(offset) => offset,
             Err(err) => return StepOutcome::err(err.into()),
         };
-        if index >= READDIR_WINDOW_ENTRIES {
-            return StepOutcome::err(Errno::ENOSYS.into());
-        }
-
         let mut entries = [DirEntryLite::empty(); READDIR_WINDOW_ENTRIES];
-        let count = match self.read_dir_entries_cached(inode, &mut entries) {
-            Ok(count) => count,
-            Err(err) => return StepOutcome::err(err.into()),
-        };
-        if index >= count {
+        let mut next_offsets = [0u64; READDIR_WINDOW_ENTRIES];
+        let count =
+            match self.read_dir_entries_cached(inode, offset, &mut entries, &mut next_offsets) {
+                Ok(count) => count,
+                Err(err) => return StepOutcome::err(err.into()),
+            };
+        if count == 0 {
             return StepOutcome::done(None);
         }
 
-        let entry = entries[index];
+        let entry = entries[0];
         let name = match InlineName::new(entry.name()) {
             Ok(name) => name,
             Err(err) => return StepOutcome::err(err.into()),
@@ -350,7 +367,7 @@ where
                 fs_object_id: inode_fs_object_id(entry.inode),
                 kind: ext4_file_type_to_kind(entry.file_type),
             },
-            cursor_from_index(index + 1),
+            cursor_from_offset(next_offsets[0]),
         )))
     }
 
@@ -415,5 +432,28 @@ where
         }
     }
 
-    // `step_chmod`, `step_chown` inherit the trait-default `ENOSYS`.
+    // `step_chmod`, `step_chown` commit through `serialize_inode_meta`.
+}
+
+fn inode_meta_lite(meta: &InodeMeta) -> InodeMetaLite {
+    fn sec_to_u32(sec: i64) -> u32 {
+        if sec <= 0 {
+            0
+        } else {
+            sec.min(u32::MAX as i64) as u32
+        }
+    }
+
+    InodeMetaLite {
+        mode: meta.mode,
+        uid: meta.uid,
+        gid: meta.gid,
+        size: meta.size,
+        nlinks: meta.nlinks,
+        blocks_512: meta.blocks,
+        flags: meta.flags,
+        atime: sec_to_u32(meta.atime.sec),
+        ctime: sec_to_u32(meta.ctime.sec),
+        mtime: sec_to_u32(meta.mtime.sec),
+    }
 }

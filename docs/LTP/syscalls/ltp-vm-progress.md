@@ -8,10 +8,25 @@ Runs are split into explicit 5-case groups with `make oscomp-local-rv64-ltp-musl
 | Item | Value | Note |
 | --- | ---: | --- |
 | cases | 103 | from `make ltp-batch-cases LTP_BATCH=vm` |
-| latest local run | mremap missing old range errno | 2026-05-26 targeted RV/LA reruns for `mremap03` |
+| latest local run | focused LA64 submit-tail rerun | 2026-06-03 promoted whitelist candidates, musl+glibc |
 | cumulative scored | `113/253` | recorded rows in this document |
 | reached case | `set_mempolicy04` | batch completed |
 | logs | `target/oscomp/ltp-progress/vm` | per-group stdout and serial snapshots |
+
+## 2026-06-03 focused submit-tail rerun
+
+复测日志：
+
+- LA musl: `target/oscomp/ltp-extra-core-c-la-musl-20260603.txt`
+- LA glibc: `target/oscomp/ltp-extra-core-g5-la-glibc-20260603.txt`
+
+确认可作为 active submit 尾部补充分的 VM case：
+
+`madvise05`, `mlock03`, `mlock04`, `mlock203`, `mmap02`, `mmap08`,
+`mmap15`, `mmap17`, `mmap19`, `mmap20`, `mprotect05`, `munlock02`,
+`sbrk02`。
+
+这些 case 在 LA musl/glibc focused run 中均为 Summary 满分。
 
 ## 2026-05-26 failure notes
 

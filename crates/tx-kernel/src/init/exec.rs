@@ -871,7 +871,7 @@ fn oscomp_sdcard_boot_enabled<P: tx_hal::TxPlatform>() -> bool {
 fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
     use alloc::string::String;
 
-    let mut cmd = String::from("cd /musl/musl");
+    let mut cmd = String::from("cd /musl/musl 2>/dev/null || cd /musl");
     let bench_observe_enabled = oscomp_bench_observe_enabled::<P>();
     let bench_observe_threshold = oscomp_bench_observe_threshold::<P>();
     let mut selected = 0usize;
@@ -1616,10 +1616,21 @@ fn append_busybox_bin_install(cmd: &mut alloc::string::String) {
 
     // /tx-ltp/busybox-full is the kernel-embedded full-applet busybox
     // (la64 only — the la image's busybox has no awk, which the LTP shell
-    // library needs). Prefer it; fall back to the image's busybox.
+    // library needs for the timeout multiply and tst_net PID/iface parsing;
+    // without it every shell test dies at "timeout need to be >= 1" and the
+    // awk-derived `$pid` empties into `/proc//stat`). Prefer it.
+    //
+    // The bootstrap busybox (the one that runs mkdir/cp/mv here) must be a
+    // path that actually EXISTS for this lane's image: the la image lays the
+    // userland out flat under `/musl` (so `/musl/musl/busybox` is absent and
+    // the old hardcoded bootstrap silently no-op'd → awk never installed),
+    // while the rv image nests it under `/musl/musl`. Resolve `tx_bb` to the
+    // first busybox that exists — preferring the kernel-shipped full one — and
+    // run every install step through it. rv is unchanged (it has no
+    // /tx-ltp/busybox-full, so `tx_bb` falls back to /musl/musl/busybox).
     let _ = write!(
         cmd,
-        "; /musl/musl/busybox mkdir -p /bin; if [ ! -f /tmp/tx-busybox-copied ]; then /musl/musl/busybox rm -f /tmp/tx-busybox-stage; tx_bb_src=/musl/musl/busybox; [ -x /tx-ltp/busybox-full ] && tx_bb_src=/tx-ltp/busybox-full; if /musl/musl/busybox cp \"$tx_bb_src\" /tmp/tx-busybox-stage; then /musl/musl/busybox chmod 755 /tmp/tx-busybox-stage; /musl/musl/busybox rm -f /bin/busybox /bin/sh /bin/cat /bin/true /bin/ls /bin/basename /bin/ip /bin/ifconfig /bin/grep /bin/seq /bin/ping /bin/arp; /musl/musl/busybox mv /tmp/tx-busybox-stage /bin/busybox; /bin/busybox --install -s /bin; /bin/busybox touch /tmp/tx-busybox-copied; fi; fi"
+        "; tx_bb=/musl/musl/busybox; [ -x /tx-ltp/busybox-full ] && tx_bb=/tx-ltp/busybox-full; [ -x \"$tx_bb\" ] || tx_bb=/musl/busybox; [ -x \"$tx_bb\" ] || tx_bb=/bin/busybox; \"$tx_bb\" mkdir -p /bin; if [ ! -f /tmp/tx-busybox-copied ]; then \"$tx_bb\" rm -f /tmp/tx-busybox-stage; tx_bb_src=\"$tx_bb\"; [ -x /tx-ltp/busybox-full ] && tx_bb_src=/tx-ltp/busybox-full; if \"$tx_bb\" cp \"$tx_bb_src\" /tmp/tx-busybox-stage; then \"$tx_bb\" chmod 755 /tmp/tx-busybox-stage; \"$tx_bb\" rm -f /bin/busybox /bin/sh /bin/cat /bin/true /bin/ls /bin/basename /bin/ip /bin/ifconfig /bin/grep /bin/seq /bin/ping /bin/arp; \"$tx_bb\" mv /tmp/tx-busybox-stage /bin/busybox; /bin/busybox --install -s /bin; /bin/busybox touch /tmp/tx-busybox-copied; fi; fi"
     );
 }
 
@@ -1654,9 +1665,13 @@ fn append_ltp_walk_env(cmd: &mut alloc::string::String, lane_root: &str) {
     use core::fmt::Write as _;
 
     append_busybox_bin_install(cmd);
+    // Resolve the LTP root at runtime: the rv image nests it under
+    // `{lane_root}/ltp` (e.g. /musl/musl/ltp), the la image lays it flat under
+    // /musl/ltp. Without a valid LTPROOT the LTP shell library can't find its
+    // helpers and every test TBROKs ("timeout need to be >= 1", empty `$!`).
     let _ = write!(
         cmd,
-        "; export LTPROOT={lane_root}/ltp; export PATH=/tx-ltp/bin:/bin:{lane_root}/ltp/testcases/bin:{lane_root}/ltp/bin:{lane_root}/ltp/testscripts:/musl/glibc:/musl/musl"
+        "; if [ -d {lane_root}/ltp ]; then LROOT={lane_root}; elif [ -d /musl/ltp ]; then LROOT=/musl; else LROOT={lane_root}; fi; export LTPROOT=$LROOT/ltp; export PATH=/tx-ltp/bin:/bin:$LROOT/ltp/testcases/bin:$LROOT/ltp/bin:$LROOT/ltp/testscripts:$LROOT:/musl/glibc:/musl/musl"
     );
     let _ = write!(
         cmd,
@@ -1707,6 +1722,16 @@ fn append_ltp_walk_env(cmd: &mut alloc::string::String, lane_root: &str) {
          ; [ -n \"$IP_TOTAL\" ] || export IP_TOTAL=20\
          ; [ -n \"$ROUTE_TOTAL\" ] || export ROUTE_TOTAL=20"
     );
+    // busybox ash on some builds (the la image's v1.33.1 and the kernel-shipped
+    // full busybox) mis-handles `eval "local x=\$$1"`: it leaves the variable
+    // empty. LTP's `_tst_multiply_timeout` uses exactly that idiom, so every
+    // shell test TBROKs at "timeout need to be >= 1 ()" (and the timer's `$!`
+    // empties into a `/proc//stat` spin). Probe the broken combo at runtime and
+    // ONLY then disable LTP's internal per-test timer (TST_TIMEOUT=-1); the
+    // witness / official `ltp_testcode.sh` harness already bounds each file. rv's
+    // busybox handles eval+local, so it keeps the real timeout. push_str so the
+    // `{}`/`$` in the probe are literal (write! would treat them as format args).
+    cmd.push_str("; _txevok=0; _txevp=5; _txevchk() { eval \"local _zz=\\$$1\"; [ -n \"$_zz\" ] && _txevok=1; }; _txevchk _txevp; [ \"$_txevok\" = 1 ] || export TST_TIMEOUT=-1");
 }
 
 fn append_ltp_runtest_env(cmd: &mut alloc::string::String, module: &str) {
@@ -2043,7 +2068,7 @@ mod tests {
 
     #[test]
     fn append_lmbench_probe_builds_copy_integrity_probe() {
-        let mut cmd = String::from("cd /musl/musl");
+        let mut cmd = String::from("cd /musl/musl 2>/dev/null || cd /musl");
         append_lmbench_probe(&mut cmd);
         assert!(cmd.contains("lmbench-probe:cp-status"));
         assert!(cmd.contains("lmbench-probe:cmp-status"));
@@ -2053,7 +2078,7 @@ mod tests {
 
     #[test]
     fn oscomp_suite_chain_does_not_gate_later_group_markers_on_previous_scripts() {
-        let mut cmd = String::from("cd /musl/musl");
+        let mut cmd = String::from("cd /musl/musl 2>/dev/null || cd /musl");
         append_oscomp_musl_script(&mut cmd, "basic_testcode.sh");
         append_full_libctest(&mut cmd);
 
@@ -2089,7 +2114,7 @@ mod tests {
 
     #[test]
     fn ltp_bin_walk_emits_official_shape_per_lane() {
-        let mut cmd = String::from("cd /musl/musl");
+        let mut cmd = String::from("cd /musl/musl 2>/dev/null || cd /musl");
         append_ltp_bin_walk(
             &mut cmd,
             "musl",
@@ -2122,10 +2147,11 @@ mod tests {
 
     #[test]
     fn ltp_testcode_scripts_get_walk_env_in_subshell() {
-        let mut cmd = String::from("cd /musl/musl");
+        let mut cmd = String::from("cd /musl/musl 2>/dev/null || cd /musl");
         append_oscomp_musl_script(&mut cmd, "ltp_testcode.sh");
         assert!(cmd.contains("; (true;"));
-        assert!(cmd.contains("export LTPROOT=/musl/musl/ltp"));
+        assert!(cmd.contains("if [ -d /musl/musl/ltp ]; then LROOT=/musl/musl;"));
+        assert!(cmd.contains("export LTPROOT=$LROOT/ltp"));
         assert!(cmd.contains("export LTP_TIMEOUT_MUL=10"));
         assert!(cmd.contains("export PING_MAX=50"));
         assert!(cmd.contains("export IF_UPDOWN_TIMES=20"));
@@ -2135,7 +2161,8 @@ mod tests {
 
         let mut glibc_cmd = String::from("cd /musl/musl");
         append_oscomp_glibc_script(&mut glibc_cmd, "ltp_testcode.sh");
-        assert!(glibc_cmd.contains("export LTPROOT=/musl/glibc/ltp"));
+        assert!(glibc_cmd.contains("if [ -d /musl/glibc/ltp ]; then LROOT=/musl/glibc;"));
+        assert!(glibc_cmd.contains("export LTPROOT=$LROOT/ltp"));
         assert!(glibc_cmd.contains("/musl/musl/busybox sh ltp_testcode.sh)"));
         assert!(glibc_cmd.ends_with("cd /musl/musl"));
 

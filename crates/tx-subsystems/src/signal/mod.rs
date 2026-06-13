@@ -352,6 +352,14 @@ pub struct SigActionTable {
     entries: SpinMutex<[SigActionEntry; Signum::MAX as usize]>,
 }
 
+impl Clone for SigActionTable {
+    fn clone(&self) -> Self {
+        Self {
+            entries: SpinMutex::new(*self.entries.lock()),
+        }
+    }
+}
+
 impl Default for SigActionTable {
     fn default() -> Self {
         Self::new()
@@ -628,6 +636,44 @@ pub fn select_next_signal(
         if result.is_some() { 2 } else { 0 },
     );
     result
+}
+
+/// True iff the thread has a pending, deliverable signal that should interrupt
+/// a blocking syscall with EINTR, per POSIX:
+///   - ignored signal (explicit Ignore, or default action Ignore e.g. SIGCHLD)
+///     → does NOT interrupt;
+///   - default disposition with a non-ignore action (Term/Core/Stop/Cont, e.g.
+///     SIGTERM) → interrupts (the AST checkpoint then terminates/stops);
+///   - caught (handler) without SA_RESTART → interrupts (handler delivery);
+///   - caught with SA_RESTART → does NOT interrupt (syscall restarts).
+///
+/// Blocking syscalls (`ppoll`/`pselect`/`recv`/`send`/`wait4`) use this instead
+/// of a broad "any pending signal" test. The broad test spuriously interrupted
+/// `select`/`ppoll` on benign signals (notably SIGCHLD, which netserver gets as
+/// it reaps connection children) and broke netperf. This precise test still lets
+/// `kill`'s SIGTERM tear down a process blocked in a syscall (hackbench workers
+/// parked in ppoll) without disturbing programs that ignore or SA_RESTART-handle
+/// signals while polling.
+pub fn thread_pending_signal_interrupts(
+    thread: &Cap<crate::thread_runtime::ThreadIdentity>,
+) -> bool {
+    let Some((sig, _)) = select_next_signal(thread) else {
+        return false;
+    };
+    let guard = step_engine::guard();
+    let Some(proc) = thread.owner_proc.upgrade(&guard) else {
+        return false;
+    };
+    drop(guard);
+    let Ok(payload) = proc.upgrade_operational() else {
+        return false;
+    };
+    let entry = payload.sig_actions().get_entry(sig);
+    match entry.disposition {
+        SigDisposition::Ignore => false,
+        SigDisposition::Default => !matches!(default_action(sig), DefaultAction::Ignore),
+        SigDisposition::Handler(_) => !entry.flags.contains(SaFlags::RESTART),
+    }
 }
 
 fn refresh_deliverable_signal_summary_fast(

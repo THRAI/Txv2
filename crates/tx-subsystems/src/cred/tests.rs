@@ -136,6 +136,47 @@ fn setuid_privileged_changes_both_uid_and_euid() {
 }
 
 #[test]
+fn setuid_privileged_to_nonroot_drops_capabilities() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let outcome = step_setuid(&proc_cap, Uid(1000));
+
+    let CredChange::Replaced { new, .. } = outcome else {
+        panic!("expected Replaced, got {outcome:?}");
+    };
+    assert_eq!(new.uid, Uid(1000));
+    assert_eq!(new.euid, Uid(1000));
+    assert_eq!(new.suid, Uid(1000));
+    assert_eq!(new.effective_caps, CapabilitySet::EMPTY);
+    assert_eq!(new.permitted_caps, CapabilitySet::EMPTY);
+    assert!(!new.is_privileged_for(Capability::KILL));
+}
+
+#[test]
+fn setresuid_effective_root_transition_updates_effective_caps_only() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+
+    let outcome = step_setresuid(&proc_cap, None, Some(Uid(1000)), None);
+    let CredChange::Replaced { new, .. } = outcome else {
+        panic!("expected Replaced, got {outcome:?}");
+    };
+    assert_eq!(new.uid, Uid::ROOT);
+    assert_eq!(new.euid, Uid(1000));
+    assert_eq!(new.suid, Uid::ROOT);
+    assert_eq!(new.effective_caps, CapabilitySet::EMPTY);
+    assert_eq!(new.permitted_caps, CapabilitySet::FULL);
+
+    let outcome = step_setresuid(&proc_cap, None, Some(Uid::ROOT), None);
+    let CredChange::Replaced { new, .. } = outcome else {
+        panic!("expected Replaced, got {outcome:?}");
+    };
+    assert_eq!(new.euid, Uid::ROOT);
+    assert_eq!(new.effective_caps, CapabilitySet::FULL);
+    assert_eq!(new.permitted_caps, CapabilitySet::FULL);
+}
+
+#[test]
 fn setuid_unprivileged_can_swap_among_existing_ids_only() {
     let _g = setup();
     let proc_cap = bootstrap();

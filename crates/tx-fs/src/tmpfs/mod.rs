@@ -35,7 +35,8 @@ use tx_subsystems::page_backed::{
 };
 use tx_subsystems::vfs::{
     Credential, DirCursor, DirEntry, FsObjectId, InlineName, InodeKind, InodeMeta, MountOutput,
-    RNode, RNodeBacking, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, S_ISGID, S_ISUID, VFS_NAME_MAX,
+    RNode, RNodeBacking, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK,
+    S_ISGID, S_ISUID, VFS_NAME_MAX,
 };
 
 /// Mode for the tmpfs root directory.
@@ -70,9 +71,15 @@ pub const TMPFS_SYMLINK_MAX: usize = VFS_NAME_MAX;
 /// Per-inode payload. Variants line up with the inode kinds tmpfs
 /// supports today. Block-device, fifo, and socket variants are not
 /// yet in scope; `create_inode` rejects those modes with `EINVAL`.
+#[derive(Clone, Copy, Debug)]
+struct TmpfsDirEntry {
+    object_id: FsObjectId,
+    cookie: u64,
+}
+
 enum TmpfsPayload {
     /// Directory: child name → inode id.
-    Directory(BTreeMap<InlineName, FsObjectId>),
+    Directory(BTreeMap<InlineName, TmpfsDirEntry>),
     /// Regular file: anon `PageContainer` plus the visible byte size.
     /// `size` tracks the externally-visible size (POSIX `st_size`),
     /// which is what `serialize_inode_meta` and `truncate` mutate.
@@ -165,7 +172,7 @@ fn directory_subtree_contains(state: &TmpfsState, root: FsObjectId, needle: FsOb
         let TmpfsPayload::Directory(children) = &inode.payload else {
             continue;
         };
-        stack.extend(children.values().copied());
+        stack.extend(children.values().map(|entry| entry.object_id));
     }
 
     false
@@ -193,6 +200,7 @@ fn adjust_directory_nlink(state: &mut TmpfsState, dir: FsObjectId, delta: i32) {
 pub struct Tmpfs {
     state: crate::sync::TmpfsSpinMutex<TmpfsState>,
     next_object_id: AtomicU64,
+    next_dirent_cookie: AtomicU64,
 }
 
 impl Tmpfs {
@@ -200,6 +208,7 @@ impl Tmpfs {
         Self {
             state: crate::sync::tmpfs_spin_mutex(TmpfsState::new(), b"debug.lock.fs.tmpfs.state"),
             next_object_id: AtomicU64::new(TMPFS_FIRST_FREE_OBJECT_ID),
+            next_dirent_cookie: AtomicU64::new(1),
         }
     }
 
@@ -228,6 +237,13 @@ impl Tmpfs {
     fn alloc_object_id(&self) -> FsObjectId {
         let raw = self.next_object_id.fetch_add(1, Ordering::AcqRel);
         FsObjectId::new(raw)
+    }
+
+    fn alloc_dirent(&self, object_id: FsObjectId) -> TmpfsDirEntry {
+        TmpfsDirEntry {
+            object_id,
+            cookie: self.next_dirent_cookie.fetch_add(1, Ordering::AcqRel),
+        }
     }
 }
 
@@ -299,7 +315,7 @@ impl FsOps for Tmpfs {
             return StepOutcome::err(step_engine::Errno::ENOTDIR);
         };
         match children.get(&inline) {
-            Some(id) => StepOutcome::done(*id),
+            Some(entry) => StepOutcome::done(entry.object_id),
             None => StepOutcome::err(step_engine::Errno::ENOENT),
         }
     }
@@ -375,16 +391,29 @@ impl FsOps for Tmpfs {
             Ok(n) => n,
             Err(err) => return StepOutcome::err(err.into()),
         };
-        // Day-1 tmpfs only handles regular files via `create_inode`.
-        // Directories arrive through `mkdir`, symlinks through
-        // `symlink`. Reject anything else with `EINVAL`.
+        // `mknod(2)` file types. Directories and symlinks have their own
+        // entry points (`mkdir` / `symlink`); everything else — regular,
+        // FIFO, char/block device, socket — is created here with the
+        // S_IFMT-derived kind, matching the ext4 backend so e.g.
+        // `mkfifo(3)` works on a tmpfs cwd (LTP open11/lseek02/select01).
+        // Special nodes carry an (empty) page-cache container like a
+        // zero-length regular file; their kind drives open/stat/lseek.
         let kind_bits = mode & S_IFMT;
-        if kind_bits != 0 && kind_bits != S_IFREG {
-            return StepOutcome::err(step_engine::Errno::EINVAL);
-        }
-        let mode = (mode & !S_IFMT) | S_IFREG;
+        let kind = match kind_bits {
+            0 | S_IFREG => InodeKind::Regular,
+            S_IFIFO => InodeKind::Fifo,
+            S_IFCHR => InodeKind::CharDevice,
+            S_IFBLK => InodeKind::BlockDevice,
+            S_IFSOCK => InodeKind::Socket,
+            _ => return StepOutcome::err(step_engine::Errno::EINVAL),
+        };
+        let mode = if kind_bits == 0 {
+            (mode & !S_IFMT) | S_IFREG
+        } else {
+            mode
+        };
 
-        {
+        let (parent_setgid, parent_gid) = {
             let state = self.state.lock();
             let Some(parent_inode) = state.inodes.get(&parent) else {
                 return StepOutcome::err(step_engine::Errno::ENOENT);
@@ -395,7 +424,8 @@ impl FsOps for Tmpfs {
             if children.contains_key(&inline) {
                 return StepOutcome::err(step_engine::Errno::EEXIST);
             }
-        }
+            (parent_inode.meta.mode & S_ISGID != 0, parent_inode.meta.gid)
+        };
 
         let container = match PageContainer::new_cap(
             PageContainerKind::Anon {
@@ -419,9 +449,12 @@ impl FsOps for Tmpfs {
         // the actual content.
         container.set_size_bytes(0);
 
-        let mut meta = InodeMeta::new(InodeKind::Regular, mode);
+        let mut meta = InodeMeta::new(kind, mode);
         meta.uid = cred.uid;
-        meta.gid = cred.gid;
+        // System V S_ISGID-directory semantics: a new entry created in a
+        // set-group-ID directory inherits that directory's group instead
+        // of the caller's egid (LTP open10/creat08).
+        meta.gid = if parent_setgid { parent_gid } else { cred.gid };
         meta.size = 0;
 
         let mut state = self.state.lock();
@@ -435,7 +468,7 @@ impl FsOps for Tmpfs {
             return StepOutcome::err(step_engine::Errno::EEXIST);
         }
         let new_id = self.alloc_object_id();
-        children.insert(inline, new_id);
+        children.insert(inline, self.alloc_dirent(new_id));
 
         state.inodes.insert(
             new_id,
@@ -471,7 +504,7 @@ impl FsOps for Tmpfs {
         let TmpfsPayload::Directory(children) = &mut parent_inode.payload else {
             return StepOutcome::err(step_engine::Errno::ENOTDIR);
         };
-        let Some(found_id) = children.get(&inline).copied() else {
+        let Some(found_id) = children.get(&inline).map(|entry| entry.object_id) else {
             return StepOutcome::err(step_engine::Errno::ENOENT);
         };
         if found_id != target {
@@ -531,7 +564,7 @@ impl FsOps for Tmpfs {
             let TmpfsPayload::Directory(children) = &parent_inode.payload else {
                 return StepOutcome::err(step_engine::Errno::ENOTDIR);
             };
-            let Some(target_id) = children.get(&old_key).copied() else {
+            let Some(target_id) = children.get(&old_key).map(|entry| entry.object_id) else {
                 return StepOutcome::err(step_engine::Errno::ENOENT);
             };
             let Some(target_inode) = state.inodes.get(&target_id) else {
@@ -551,7 +584,7 @@ impl FsOps for Tmpfs {
             let TmpfsPayload::Directory(new_children) = &new_parent_inode.payload else {
                 return StepOutcome::err(step_engine::Errno::ENOTDIR);
             };
-            let displaced_id = new_children.get(&new_key).copied();
+            let displaced_id = new_children.get(&new_key).map(|entry| entry.object_id);
             if displaced_id == Some(target_id) {
                 return StepOutcome::done(());
             }
@@ -585,7 +618,7 @@ impl FsOps for Tmpfs {
                 return StepOutcome::err(step_engine::Errno::ENOTDIR);
             };
             let removed = children.remove(&old_key);
-            debug_assert_eq!(removed, Some(target_id));
+            debug_assert_eq!(removed.map(|entry| entry.object_id), Some(target_id));
         }
         // If a same-type object exists at the destination, replace it
         // with POSIX-shaped rename semantics. Cross-type collisions
@@ -597,9 +630,9 @@ impl FsOps for Tmpfs {
             let TmpfsPayload::Directory(children) = &mut new_parent_inode.payload else {
                 return StepOutcome::err(step_engine::Errno::ENOTDIR);
             };
-            children.insert(new_key, target_id)
+            children.insert(new_key, self.alloc_dirent(target_id))
         };
-        debug_assert_eq!(displaced, displaced_id);
+        debug_assert_eq!(displaced.map(|entry| entry.object_id), displaced_id);
         if target_is_dir && old_parent != new_parent {
             adjust_directory_nlink(&mut state, old_parent, -1);
             adjust_directory_nlink(&mut state, new_parent, 1);
@@ -607,7 +640,7 @@ impl FsOps for Tmpfs {
         if displaced_is_dir {
             adjust_directory_nlink(&mut state, new_parent, -1);
         }
-        if let Some(displaced_id) = displaced {
+        if let Some(displaced_id) = displaced.map(|entry| entry.object_id) {
             if displaced_is_dir {
                 if let Some(displaced_inode) = state.inodes.get_mut(&displaced_id) {
                     displaced_inode.nlink = 0;
@@ -670,7 +703,7 @@ impl FsOps for Tmpfs {
             None => return StepOutcome::err(step_engine::Errno::ENOTDIR),
         };
         if let TmpfsPayload::Directory(ref mut children) = parent_inode.payload {
-            children.insert(iname, target);
+            children.insert(iname, self.alloc_dirent(target));
         }
         StepOutcome::done(())
     }
@@ -708,7 +741,7 @@ impl FsOps for Tmpfs {
             return StepOutcome::err(step_engine::Errno::EEXIST);
         }
         let new_id = self.alloc_object_id();
-        children.insert(inline, new_id);
+        children.insert(inline, self.alloc_dirent(new_id));
         parent_inode.nlink = parent_inode.nlink.saturating_add(1);
         parent_inode.meta.nlinks = parent_inode.nlink;
 
@@ -747,7 +780,7 @@ impl FsOps for Tmpfs {
             let TmpfsPayload::Directory(children) = &parent_inode.payload else {
                 return StepOutcome::err(step_engine::Errno::ENOTDIR);
             };
-            let Some(found_id) = children.get(&inline).copied() else {
+            let Some(found_id) = children.get(&inline).map(|entry| entry.object_id) else {
                 return StepOutcome::err(step_engine::Errno::ENOENT);
             };
             if found_id != target {
@@ -773,7 +806,7 @@ impl FsOps for Tmpfs {
             return StepOutcome::err(step_engine::Errno::ENOTDIR);
         };
         let removed = children.remove(&inline);
-        debug_assert_eq!(removed, Some(target));
+        debug_assert_eq!(removed.map(|entry| entry.object_id), Some(target));
         parent_inode.nlink = parent_inode.nlink.saturating_sub(1);
         parent_inode.meta.nlinks = parent_inode.nlink;
         if let Some(target_inode) = state.inodes.get_mut(&target) {
@@ -833,7 +866,7 @@ impl FsOps for Tmpfs {
             return StepOutcome::err(step_engine::Errno::EEXIST);
         }
         let new_id = self.alloc_object_id();
-        children.insert(inline, new_id);
+        children.insert(inline, self.alloc_dirent(new_id));
 
         state.inodes.insert(
             new_id,
@@ -861,18 +894,23 @@ impl FsOps for Tmpfs {
             let TmpfsPayload::Directory(children) = &parent_inode.payload else {
                 return StepOutcome::err(step_engine::Errno::ENOTDIR);
             };
-            let index = cursor.as_u64() as usize;
-            let Some((name, child_id)) = children.iter().nth(index) else {
+            let cursor_id = cursor.as_u64();
+            let Some((name, entry)) = children
+                .iter()
+                .filter(|(_, entry)| entry.cookie > cursor_id)
+                .min_by_key(|(_, entry)| entry.cookie)
+            else {
                 return StepOutcome::done(None);
             };
-            let Some(child_inode) = state.inodes.get(child_id) else {
+            let child_id = entry.object_id;
+            let Some(child_inode) = state.inodes.get(&child_id) else {
                 return StepOutcome::err(step_engine::Errno::ENOENT);
             };
             ReaddirEntrySnapshot {
-                child_id: *child_id,
+                child_id,
                 kind: child_inode.meta.kind(),
                 name: *name,
-                next_cursor: DirCursor::from_u64(cursor.as_u64() + 1),
+                next_cursor: DirCursor::from_u64(entry.cookie),
             }
         };
 

@@ -357,6 +357,37 @@ fn first_thread(proc_cap: &Cap<ProcessIdentity>) -> Cap<ThreadIdentity> {
 }
 
 #[test]
+fn subject_identity_signal_pending_checks_authoritative_pending_state() {
+    let _g = setup();
+    let proc = bootstrap();
+    let leader = first_thread(&proc);
+
+    crate::thread_runtime::execution::post_signal(
+        &leader,
+        Signum::SIGCHLD,
+        tx_substrate::wake::SignalRouting::ProcessDirected,
+        None,
+    );
+    assert!(
+        <ProcessIdentity as crate::process::adapter::step_engine::SubjectIdentity>::
+            thread_deliverable_signal_pending(&leader),
+        "posted signal should be observable through the subject predicate"
+    );
+
+    leader
+        .payload_cap()
+        .expect("leader payload")
+        .pending()
+        .clear(Signum::SIGCHLD);
+
+    assert!(
+        !<ProcessIdentity as crate::process::adapter::step_engine::SubjectIdentity>::
+            thread_deliverable_signal_pending(&leader),
+        "predicate must follow the pending queues even if the cached summary bit is stale"
+    );
+}
+
+#[test]
 fn bootstrap_init_creates_pid_1_with_session_and_pgrp() {
     let _g = setup();
     let init = bootstrap();
@@ -1321,6 +1352,23 @@ fn chdir_then_getcwd_renders_nested_path() {
 }
 
 #[test]
+fn chdir_pins_cwd_parent_chain_after_external_refs_drop() {
+    let _g = setup();
+    let init = bootstrap();
+    let root = fresh_root_dentry();
+    let usr = fresh_dentry_under(&root, b"usr", 100);
+    let bin = fresh_dentry_under(&usr, b"bin", 101);
+
+    step_chdir(&init, bin);
+    drop(usr);
+    drop(root);
+    tx_test_support::drain_to_quiescence();
+
+    let path = step_getcwd(&init).expect("nested path after parent refs drop");
+    assert_eq!(path.as_slice(), b"/usr/bin");
+}
+
+#[test]
 fn chdir_returns_previous_cwd_in_replaced() {
     let _g = setup();
     let init = bootstrap();
@@ -1624,6 +1672,57 @@ fn non_init_parent_exit_reparents_children_to_init() {
     assert_eq!(init.child_count(), init_children_before + 1);
     // middle's children list is now empty.
     assert_eq!(middle.child_count(), 0);
+}
+
+#[test]
+fn adopted_live_child_auto_reaps_when_it_exits() {
+    let _g = setup();
+    let init = bootstrap();
+    let middle = step_fork::<TestPmap>(&init, false, false).expect("fork middle");
+    let leaf = step_fork::<TestPmap>(&middle, false, false).expect("fork leaf");
+    let leaf_pid = leaf.pid;
+    let init_children_before = init.child_count();
+
+    step_exit_group(&middle, ExitStatus::Exited(0));
+    assert_eq!(leaf.parent_pid(), init.pid);
+    assert_eq!(init.child_count(), init_children_before + 1);
+
+    step_exit_group(&leaf, ExitStatus::Exited(0));
+
+    assert_eq!(
+        init.child_count(),
+        init_children_before,
+        "adopted leaf is auto-reaped; direct child middle remains waitable"
+    );
+    assert!(
+        resolve_pid_number_as(leaf_pid.0 as u64, PidNameKind::Process).is_none(),
+        "auto-reap must withdraw adopted orphan from the pid namespace"
+    );
+}
+
+#[test]
+fn adopted_zombie_child_reaped_during_reparent_to_init() {
+    let _g = setup();
+    let init = bootstrap();
+    let middle = step_fork::<TestPmap>(&init, false, false).expect("fork middle");
+    let leaf = step_fork::<TestPmap>(&middle, false, false).expect("fork leaf");
+    let leaf_pid = leaf.pid;
+    let init_children_before = init.child_count();
+
+    step_exit_group(&leaf, ExitStatus::Exited(0));
+    assert!(leaf.is_zombie());
+
+    step_exit_group(&middle, ExitStatus::Exited(0));
+
+    assert_eq!(
+        init.child_count(),
+        init_children_before,
+        "already-zombie adopted leaf is reaped immediately; middle stays waitable"
+    );
+    assert!(
+        resolve_pid_number_as(leaf_pid.0 as u64, PidNameKind::Process).is_none(),
+        "reparent-time reap must withdraw zombie orphan from pid namespace"
+    );
 }
 
 #[test]

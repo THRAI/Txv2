@@ -150,7 +150,7 @@ fn dispatch_sched_setparam_accepts_priority_zero_for_self_and_rejects_bad_inputs
 }
 
 #[test]
-fn dispatch_priority_syscalls_expose_fixed_nice_zero_for_self_process_only() {
+fn dispatch_priority_syscalls_store_nice_for_self_process() {
     let _setup = setup();
     let proc_cap = bootstrap();
     let thread = first_thread(&proc_cap);
@@ -164,12 +164,22 @@ fn dispatch_priority_syscalls_expose_fixed_nice_zero_for_self_process_only() {
             )),
             SyscallResult::Return(20)
         );
+    }
+
+    for who in [0, proc_cap.pid.0 as u64] {
         assert_eq!(
             block_on(dispatch::<ShimsTestPmap>(
                 SyscallRequest::new(NR_SETPRIORITY, [PRIO_PROCESS, who, 19, 0, 0, 0]),
                 &ctx,
             )),
             SyscallResult::Return(0)
+        );
+        assert_eq!(
+            block_on(dispatch::<ShimsTestPmap>(
+                SyscallRequest::new(NR_GETPRIORITY, [PRIO_PROCESS, who, 0, 0, 0, 0]),
+                &ctx,
+            )),
+            SyscallResult::Return(1)
         );
         assert_eq!(
             block_on(dispatch::<ShimsTestPmap>(
@@ -181,6 +191,13 @@ fn dispatch_priority_syscalls_expose_fixed_nice_zero_for_self_process_only() {
             )),
             SyscallResult::Return(0)
         );
+        assert_eq!(
+            block_on(dispatch::<ShimsTestPmap>(
+                SyscallRequest::new(NR_GETPRIORITY, [PRIO_PROCESS, who, 0, 0, 0, 0]),
+                &ctx,
+            )),
+            SyscallResult::Return(40)
+        );
     }
 
     assert_eq!(
@@ -188,14 +205,21 @@ fn dispatch_priority_syscalls_expose_fixed_nice_zero_for_self_process_only() {
             SyscallRequest::new(NR_SETPRIORITY, [PRIO_PROCESS, 0, 20, 0, 0, 0]),
             &ctx,
         )),
-        SyscallResult::Error(EINVAL_VALUE)
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(NR_GETPRIORITY, [PRIO_PROCESS, 0, 0, 0, 0, 0]),
+            &ctx,
+        )),
+        SyscallResult::Return(1)
     );
     assert_eq!(
         block_on(dispatch::<ShimsTestPmap>(
             SyscallRequest::new(NR_GETPRIORITY, [PRIO_PGRP, 0, 0, 0, 0, 0]),
             &ctx,
         )),
-        SyscallResult::Error(EINVAL_VALUE)
+        SyscallResult::Return(1)
     );
     assert_eq!(
         block_on(dispatch::<ShimsTestPmap>(

@@ -25,6 +25,7 @@ use std::sync::Mutex;
 
 use crate::adapter::reactor_entry::userspace::SyscallRequest;
 use crate::adapter::step_engine::{self as step_engine, guard, Cap, StepOutcome};
+use crate::linux_syscall::reset_uts_nodename_for_test;
 use tx_subsystems::cross_crate_test_support::{
     reset_init_process, reset_pid_counter, reset_reactor_affinity_seam, reset_tid_counter,
 };
@@ -218,6 +219,12 @@ fn setup() -> TestSetup {
     reset_init_process();
     reset_reactor_affinity_seam();
     tx_subsystems::wall_clock::reset_for_test();
+    reset_uts_nodename_for_test();
+    tx_subsystems::net::reset_initial_net_namespace_for_test();
+    tx_subsystems::net::initial_loopback_iface().clear_for_test_or_bootstrap();
+    tx_subsystems::net::device::reset_net_registry_for_test();
+    tx_subsystems::net::reset_netfilter_for_test();
+    super::reset_itimer_registry_for_test();
     TestSetup { _lock: lock }
 }
 
@@ -406,6 +413,22 @@ fn block_on<F: Future>(mut fut: F) -> F::Output {
         }
     }
     panic!("block_on: future did not resolve in 1024 polls");
+}
+
+#[test]
+fn dispatch_future_size_stays_bounded() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread);
+    let req = SyscallRequest::new(NR_READ, [0, 0, 0, 0, 0, 0]);
+    let fut = dispatch::<ShimsTestPmap>(req, &ctx);
+    let size = core::mem::size_of_val(&fut);
+
+    assert!(
+        size < 64 * 1024,
+        "dispatch future grew to {size} bytes; syscall arms should stay boxed"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1407,9 +1430,12 @@ fn dispatch_fcntl_unknown_cmd_returns_neg_enosys() {
     proc_cap.set_fd(3, Some(tx_fs::devfs::open_console_for_init()));
     let ctx = make_ctx(proc_cap, thread);
 
-    // F_GETLK = 5 (file locking) is not in any in-tree fcntl surface.
+    // 9999 is not a real fcntl command, so it must fall to the default
+    // ENOSYS arm. (F_GETLK = 5 used to stand in for "unknown command",
+    // but the POSIX record-lock surface now implements it, so a clearly
+    // unassigned command number is required here.)
     let r = block_on(dispatch::<ShimsTestPmap>(
-        SyscallRequest::new(NR_FCNTL, [3, 5, 0, 0, 0, 0]),
+        SyscallRequest::new(NR_FCNTL, [3, 9999, 0, 0, 0, 0]),
         &ctx,
     ));
     assert_eq!(r, SyscallResult::Error(38));
@@ -1890,6 +1916,16 @@ mod io_uring_dispatch;
 // `struct mq_attr` layout from `<mqueue.h>`.
 // ===========================================================================
 mod mq_dispatch;
+
+// ===========================================================================
+// Network socket fdtable/syscall bridge.
+// ===========================================================================
+mod socket_fdtable;
+
+// ===========================================================================
+// Network namespace syscall ABI (`unshare`, `setns`, `/proc/self/ns/net`).
+// ===========================================================================
+mod netns_syscalls;
 
 // ===========================================================================
 // Kernel-to-user layout marker registry used by the musl ABI detector.

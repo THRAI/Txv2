@@ -1,19 +1,20 @@
 services:
   # Main development / CI / qemu container.
-  # Rust toolchain is mounted from host cache to keep image lean.
+  # Rust toolchain is installed in the image; cargo registry/git caches are
+  # named volumes so an empty host environment still works.
   oscomp:
     build:
       context: .
       dockerfile: Dockerfile
     volumes:
       - .:/workspace
-      - ${HOME}/.cargo:/root/.cargo
-      - ${HOME}/.rustup:/root/.rustup
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
     working_dir: /workspace
     environment:
-      RUSTUP_HOME: /root/.rustup
-      CARGO_HOME: /root/.cargo
-      RUSTUP_TOOLCHAIN: nightly
+      RUSTUP_HOME: /usr/local/rustup
+      CARGO_HOME: /usr/local/cargo
+      RUSTUP_TOOLCHAIN: nightly-2025-05-20
 
   # Dedicated LA64 busybox builder.
   busybox-la64:
@@ -27,3 +28,7 @@ services:
       - .:/workspace
     working_dir: /workspace
     command: tools/images/build-busybox-loongarch64.sh
+
+volumes:
+  cargo-registry:
+  cargo-git:

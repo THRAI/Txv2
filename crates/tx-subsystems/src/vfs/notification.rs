@@ -7,6 +7,7 @@ use tx_platform_adapter::notification_adapter;
 
 pub(crate) use readiness::{
     new_rnode_wait_points, notify_readable, notify_writable, ppoll_wait, release_rnode_wait_points,
+    RNodeWaitPoints,
 };
 pub use readiness::{VFS_READABLE, VFS_WRITABLE};
 

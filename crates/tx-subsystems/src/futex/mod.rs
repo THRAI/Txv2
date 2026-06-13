@@ -17,15 +17,16 @@
 //! spurious wakees re-park on their next iteration). Future
 //! tightening can add per-bucket waiter counts.
 //!
-//! **Timeout deferred to Slice 4.** v1 ignores the `timeout`
-//! argument; `FUTEX_WAIT` parks indefinitely until `FUTEX_WAKE`
-//! fires. Slice 4's `nanosleep` lands the timer-wait-source
-//! infrastructure futex needs for proper timeout support.
+//! **Timeout split.** The futex subsystem publishes and cancels exact
+//! wait-source registrations. Timeout decoding lives in the Linux
+//! syscall shim: `FUTEX_WAIT` uses a relative timeout, while
+//! `FUTEX_WAIT_BITSET` uses an absolute deadline. On timeout the
+//! shim-driven `FutexWaitOp` calls back into this module to unregister
+//! the waiter before returning `ETIMEDOUT`.
 //!
-//! **PRIVATE / CLOCK_REALTIME flags.** Recognised but ignored at
-//! the syscall arm. Per-process isolation is implicit — each process
-//! has its own aspace and the user word at `uaddr` is in that
-//! aspace.
+//! **PRIVATE / CLOCK_REALTIME flags.** PRIVATE is implicit in the
+//! `(AddressSpace, uaddr)` key. CLOCK_REALTIME is handled by the
+//! syscall shim for `FUTEX_WAIT_BITSET` absolute timeouts.
 //!
 //! **User-VA discipline.** v1 reads `*uaddr` via direct kernel
 //! pointer deref under the bootstrap kernel-buffer exemption
@@ -55,7 +56,7 @@
 //! `WaitSource`.
 
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -67,7 +68,7 @@ use adapter::step_engine::{
     self, Errno, NoProgress, OneShotStepOp, ScriptCtx, SpinMutex, StepOp, StepOutcome,
     SubjectIdentity, ZoneError,
 };
-use adapter::wait_routing::{Channel, WaitSource};
+use adapter::wait_routing::{self, Channel, WaitSource};
 
 use crate::execution::Guard;
 use crate::vm::AddressSpace;
@@ -174,7 +175,7 @@ fn emit_exact_waiter_table_snapshot(
 ) {
     let mut total_waiters = 0usize;
     for entry in table.values() {
-        total_waiters = total_waiters.saturating_add(entry.waiters);
+        total_waiters = total_waiters.saturating_add(entry_waiter_count(entry));
     }
     emit_futex_debug_value(entries_name, table.len() as i64);
     emit_futex_debug_value(total_name, total_waiters as i64);
@@ -182,12 +183,12 @@ fn emit_exact_waiter_table_snapshot(
 
     for (key, entry) in table.iter().take(4) {
         emit_futex_debug_value(sample_uaddr_name, key.uaddr as i64);
-        emit_futex_debug_value(sample_waiters_name, entry.waiters as i64);
-        emit_futex_debug_value(sample_mask_name, entry.interest_mask as i64);
-        emit_futex_debug_value(sample_source_name, entry.source_id as i64);
+        emit_futex_debug_value(sample_waiters_name, entry_waiter_count(entry) as i64);
+        emit_futex_debug_value(sample_mask_name, entry_interest_mask(entry) as i64);
+        emit_futex_debug_value(sample_source_name, entry_sample_source_id(entry) as i64);
         emit_futex_debug_value(
             sample_subscribers_name,
-            entry.wait_source.subscriber_count() as i64,
+            entry_sample_subscribers(entry) as i64,
         );
     }
 }
@@ -306,14 +307,19 @@ struct FutexKey {
 }
 
 struct FutexEntry {
+    waiters: VecDeque<FutexWaiter>,
+}
+
+struct FutexWaiter {
     channel: Channel,
     source_id: u64,
     wait_source: Arc<WaitSource>,
-    waiters: usize,
+    tid: Option<u32>,
     interest_mask: u64,
 }
 
 static EXACT_WAITERS: SpinMutex<Option<BTreeMap<FutexKey, FutexEntry>>> = SpinMutex::new(None);
+static WAITING_TIDS: SpinMutex<BTreeMap<u32, usize>> = SpinMutex::new(BTreeMap::new());
 
 fn key_for(aspace: &AddressSpace, uaddr: u64) -> FutexKey {
     let _ = aspace;
@@ -328,14 +334,131 @@ fn key_for(aspace: &AddressSpace, uaddr: u64) -> FutexKey {
 }
 
 fn new_entry() -> FutexEntry {
-    let wait_point = notification::new_wait_point();
     FutexEntry {
+        waiters: VecDeque::new(),
+    }
+}
+
+fn register_waiting_tid(tid: Option<u32>) {
+    let Some(tid) = tid else {
+        return;
+    };
+    let mut tids = WAITING_TIDS.lock();
+    let count = tids.entry(tid).or_insert(0);
+    *count = count.saturating_add(1);
+}
+
+fn unregister_waiting_tid(tid: Option<u32>) {
+    let Some(tid) = tid else {
+        return;
+    };
+    let mut tids = WAITING_TIDS.lock();
+    if let Some(count) = tids.get_mut(&tid) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            tids.remove(&tid);
+        }
+    }
+}
+
+pub fn thread_has_waiter(tid: u32) -> bool {
+    if WAITING_TIDS.lock().get(&tid).copied().unwrap_or(0) != 0 {
+        return true;
+    }
+    EXACT_WAITERS
+        .lock()
+        .as_ref()
+        .map(|table| {
+            table
+                .values()
+                .any(|entry| entry.waiters.iter().any(|waiter| waiter.tid == Some(tid)))
+        })
+        .unwrap_or(false)
+}
+
+fn new_waiter(tid: Option<u32>, interest_mask: u64) -> FutexWaiter {
+    let wait_point = notification::new_wait_point();
+    register_waiting_tid(tid);
+    FutexWaiter {
         channel: wait_point.channel,
         source_id: wait_point.source_id,
         wait_source: wait_point.wait_source,
-        waiters: 0,
-        interest_mask: 0,
+        tid,
+        interest_mask,
     }
+}
+
+fn release_waiter_source(source_id: u64) {
+    crate::wait_source::release_wait_channel(source_id);
+    wait_routing::unregister_source(source_id);
+}
+
+fn unregister_exact_waiter(aspace: &AddressSpace, uaddr: u64, source_id: u64) -> bool {
+    let key = key_for(aspace, uaddr);
+    let mut table_guard = EXACT_WAITERS.lock();
+    let Some(table) = table_guard.as_mut() else {
+        return false;
+    };
+    let Some(entry) = table.get_mut(&key) else {
+        return false;
+    };
+    let Some(pos) = entry
+        .waiters
+        .iter()
+        .position(|waiter| waiter.source_id == source_id)
+    else {
+        return false;
+    };
+    let Some(waiter) = entry.waiters.remove(pos) else {
+        return false;
+    };
+    unregister_waiting_tid(waiter.tid);
+    if entry.waiters.is_empty() {
+        table.remove(&key);
+    }
+    true
+}
+
+fn exact_waiter_registered(aspace: &AddressSpace, uaddr: u64, source_id: u64) -> bool {
+    let key = key_for(aspace, uaddr);
+    EXACT_WAITERS
+        .lock()
+        .as_ref()
+        .and_then(|table| table.get(&key))
+        .map(|entry| {
+            entry
+                .waiters
+                .iter()
+                .any(|waiter| waiter.source_id == source_id)
+        })
+        .unwrap_or(false)
+}
+
+fn entry_waiter_count(entry: &FutexEntry) -> usize {
+    entry.waiters.len()
+}
+
+fn entry_interest_mask(entry: &FutexEntry) -> u64 {
+    entry
+        .waiters
+        .iter()
+        .fold(0u64, |mask, waiter| mask | waiter.interest_mask)
+}
+
+fn entry_sample_source_id(entry: &FutexEntry) -> u64 {
+    entry
+        .waiters
+        .front()
+        .map(|waiter| waiter.source_id)
+        .unwrap_or(0)
+}
+
+fn entry_sample_subscribers(entry: &FutexEntry) -> usize {
+    entry
+        .waiters
+        .front()
+        .map(|waiter| waiter.wait_source.subscriber_count())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -352,7 +475,7 @@ fn debug_exact_waiter_total() -> usize {
     EXACT_WAITERS
         .lock()
         .as_ref()
-        .map(|table| table.values().map(|entry| entry.waiters).sum())
+        .map(|table| table.values().map(entry_waiter_count).sum())
         .unwrap_or(0)
 }
 
@@ -376,10 +499,10 @@ fn debug_exact_waiter_snapshot() -> Vec<FutexWaiterDebugRow> {
                 .iter()
                 .map(|(key, entry)| FutexWaiterDebugRow {
                     uaddr: key.uaddr,
-                    waiters: entry.waiters,
-                    interest_mask: entry.interest_mask,
-                    source_id: entry.source_id,
-                    subscribers: entry.wait_source.subscriber_count(),
+                    waiters: entry_waiter_count(entry),
+                    interest_mask: entry_interest_mask(entry),
+                    source_id: entry_sample_source_id(entry),
+                    subscribers: entry_sample_subscribers(entry),
                 })
                 .collect()
         })
@@ -392,13 +515,22 @@ fn exact_wait_source_for_source_id(source_id: u64) -> Option<Arc<WaitSource>> {
         .lock()
         .as_ref()?
         .values()
-        .find(|entry| entry.source_id == source_id)
-        .map(|entry| entry.wait_source.clone())
+        .flat_map(|entry| entry.waiters.iter())
+        .find(|waiter| waiter.source_id == source_id)
+        .map(|waiter| waiter.wait_source.clone())
 }
 
 #[cfg(test)]
 fn reset_exact_waiters_for_tests() {
-    *EXACT_WAITERS.lock() = None;
+    if let Some(table) = EXACT_WAITERS.lock().take() {
+        for (_, entry) in table {
+            for waiter in entry.waiters {
+                release_waiter_source(waiter.source_id);
+                unregister_waiting_tid(waiter.tid);
+            }
+        }
+    }
+    WAITING_TIDS.lock().clear();
 }
 
 /// Initialise the bucket table. Idempotent: a second call is a
@@ -461,7 +593,7 @@ pub fn step_futex_wait(
     // reserve: reserve namespace, memory, or wait-source effects.
     // commit: apply the state transition.
     // publish: emit readiness, signal, or observable outcome.
-    step_futex_wait_masked(aspace, uaddr, val, FUTEX_WAKE_MASK, guard)
+    step_futex_wait_masked_with_tid(aspace, uaddr, val, FUTEX_WAKE_MASK, guard, None)
 }
 
 pub fn step_futex_wait_masked(
@@ -470,6 +602,17 @@ pub fn step_futex_wait_masked(
     val: u32,
     interest_mask: u64,
     guard: &Guard<'_>,
+) -> StepOutcome<(), NoProgress> {
+    step_futex_wait_masked_with_tid(aspace, uaddr, val, interest_mask, guard, None)
+}
+
+fn step_futex_wait_masked_with_tid(
+    aspace: &AddressSpace,
+    uaddr: u64,
+    val: u32,
+    interest_mask: u64,
+    guard: &Guard<'_>,
+    tid: Option<u32>,
 ) -> StepOutcome<(), NoProgress> {
     // observe
     // upgrade
@@ -532,12 +675,13 @@ pub fn step_futex_wait_masked(
             );
             return StepOutcome::Err(Errno::EAGAIN);
         }
-        let source_id = {
-            let entry = table.entry(key).or_insert_with(new_entry);
-            entry.waiters = entry.waiters.saturating_add(1);
-            entry.interest_mask |= interest_mask;
-            entry.source_id
-        };
+        let waiter = new_waiter(tid, interest_mask);
+        let source_id = waiter.source_id;
+        table
+            .entry(key)
+            .or_insert_with(new_entry)
+            .waiters
+            .push_back(waiter);
         maybe_emit_wait_publish_table_snapshot(table, uaddr);
         source_id
     };
@@ -632,9 +776,9 @@ pub fn step_futex_wake_masked_with_hint_in(
     }
 
     let key = key_for(aspace, uaddr);
-    let (exact_channel, exact_wait_source, woken, fired_mask, waiters_before, subscribers_before) = {
-        let table_guard = EXACT_WAITERS.lock();
-        let Some(table) = table_guard.as_ref() else {
+    let (waiters, waiters_before, subscribers_before) = {
+        let mut table_guard = EXACT_WAITERS.lock();
+        let Some(table) = table_guard.as_mut() else {
             emit_empty_wake_table_snapshot(uaddr);
             emit_futex_debug_sample(
                 b"debug.futex.step_wake_miss",
@@ -645,7 +789,7 @@ pub fn step_futex_wake_masked_with_hint_in(
             return StepOutcome::Done(0);
         };
         maybe_emit_wake_table_snapshot(table, uaddr);
-        let Some(entry) = table.get(&key) else {
+        let Some(entry) = table.get_mut(&key) else {
             emit_futex_debug_sample(
                 b"debug.futex.step_wake_miss",
                 uaddr as i64,
@@ -654,8 +798,24 @@ pub fn step_futex_wake_masked_with_hint_in(
             );
             return StepOutcome::Done(0);
         };
-        let fired_mask = entry.interest_mask & wake_mask;
-        if fired_mask == 0 {
+        let waiters_before = entry_waiter_count(entry);
+        let subscribers_before = entry
+            .waiters
+            .iter()
+            .map(|waiter| waiter.wait_source.subscriber_count())
+            .sum();
+        let mut waiters = Vec::new();
+        let mut remaining = VecDeque::new();
+        while let Some(waiter) = entry.waiters.pop_front() {
+            if waiters.len() < n as usize && (waiter.interest_mask & wake_mask) != 0 {
+                unregister_waiting_tid(waiter.tid);
+                waiters.push(waiter);
+            } else {
+                remaining.push_back(waiter);
+            }
+        }
+        if waiters.is_empty() {
+            entry.waiters = remaining;
             emit_futex_debug_sample(
                 b"debug.futex.step_wake_miss",
                 uaddr as i64,
@@ -664,33 +824,29 @@ pub fn step_futex_wake_masked_with_hint_in(
             );
             return StepOutcome::Done(0);
         }
-        let woken = entry.waiters.min(n as usize) as u32;
-        if woken == 0 {
-            emit_futex_debug_sample(
-                b"debug.futex.step_wake_miss",
-                uaddr as i64,
-                &FUTEX_WAKE_MISS_SAMPLE,
-                1,
-            );
-            return StepOutcome::Done(0);
+        entry.waiters = remaining;
+        if entry.waiters.is_empty() {
+            table.remove(&key);
         }
-        (
-            entry.channel.clone(),
-            entry.wait_source.clone(),
-            woken,
-            fired_mask,
-            entry.waiters,
-            entry.wait_source.subscriber_count(),
-        )
+        maybe_emit_wake_table_snapshot(table, uaddr);
+        (waiters, waiters_before, subscribers_before)
     };
-    let posted = notification::notify_exact_limit_with_hint(
-        &exact_channel,
-        &exact_wait_source,
-        fired_mask,
-        woken as usize,
-        hint,
-    );
-    let subscribers_after = exact_wait_source.subscriber_count();
+    let woken = waiters.len() as u32;
+    let mut fired_mask = 0u64;
+    let mut posted = 0u32;
+    let mut subscribers_after = 0usize;
+    for waiter in &waiters {
+        let mask = waiter.interest_mask & wake_mask;
+        fired_mask |= mask;
+        posted = posted.saturating_add(notification::notify_exact_limit_with_hint(
+            &waiter.channel,
+            &waiter.wait_source,
+            mask,
+            1,
+            hint,
+        ));
+        subscribers_after = subscribers_after.saturating_add(waiter.wait_source.subscriber_count());
+    }
     emit_wake_decision_debug(
         uaddr,
         n,
@@ -701,21 +857,6 @@ pub fn step_futex_wake_masked_with_hint_in(
         subscribers_before,
         subscribers_after,
     );
-    {
-        let mut table_guard = EXACT_WAITERS.lock();
-        if let Some(table) = table_guard.as_mut() {
-            let remove = if let Some(entry) = table.get_mut(&key) {
-                entry.waiters = entry.waiters.saturating_sub(woken as usize);
-                entry.waiters == 0
-            } else {
-                false
-            };
-            if remove {
-                table.remove(&key);
-            }
-            maybe_emit_wake_table_snapshot(table, uaddr);
-        }
-    }
     emit_futex_debug_sample(
         b"debug.futex.step_wake_hit",
         i64::from(posted),
@@ -744,15 +885,24 @@ pub fn step_futex_cancel_wait_in(
     let Some(table) = table_guard.as_mut() else {
         return StepOutcome::Done(());
     };
-    let remove = if let Some(entry) = table.get_mut(&key) {
-        entry.waiters = entry.waiters.saturating_sub(1);
-        entry.interest_mask &= !interest_mask;
-        entry.waiters == 0
-    } else {
-        false
-    };
-    if remove {
+    let mut cancelled = None;
+    let mut remove_entry = false;
+    if let Some(entry) = table.get_mut(&key) {
+        if let Some(pos) = entry
+            .waiters
+            .iter()
+            .position(|waiter| (waiter.interest_mask & interest_mask) != 0)
+        {
+            cancelled = entry.waiters.remove(pos);
+        }
+        remove_entry = entry.waiters.is_empty();
+    }
+    if remove_entry {
         table.remove(&key);
+    }
+    if let Some(waiter) = cancelled {
+        unregister_waiting_tid(waiter.tid);
+        release_waiter_source(waiter.source_id);
     }
     if let Some(table) = table_guard.as_ref() {
         maybe_emit_cancel_table_snapshot(table, uaddr);
@@ -798,29 +948,23 @@ pub fn step_futex_requeue_in(
         let Some(source_entry) = table.get_mut(&source_key) else {
             return StepOutcome::Done(total);
         };
-        let moved = source_entry.waiters.min(requeue_n as usize);
+        let mut moved_waiters = VecDeque::new();
+        for _ in 0..requeue_n {
+            let Some(waiter) = source_entry.waiters.pop_front() else {
+                break;
+            };
+            moved_waiters.push_back(waiter);
+        }
+        let moved = moved_waiters.len();
         if moved == 0 {
             return StepOutcome::Done(total);
         }
-        source_entry.waiters -= moved;
-        let source_now_empty = source_entry.waiters == 0;
-        let moved_entry = if source_now_empty {
-            table.remove(&source_key).expect("source entry present")
-        } else {
-            FutexEntry {
-                channel: source_entry.channel.clone(),
-                source_id: source_entry.source_id,
-                wait_source: source_entry.wait_source.clone(),
-                waiters: moved,
-                interest_mask: source_entry.interest_mask,
-            }
-        };
+        let source_now_empty = source_entry.waiters.is_empty();
+        if source_now_empty {
+            table.remove(&source_key);
+        }
         let target_entry = table.entry(target_key).or_insert_with(new_entry);
-        target_entry.channel = moved_entry.channel;
-        target_entry.source_id = moved_entry.source_id;
-        target_entry.wait_source = moved_entry.wait_source;
-        target_entry.waiters = target_entry.waiters.saturating_add(moved);
-        target_entry.interest_mask |= moved_entry.interest_mask;
+        target_entry.waiters.append(&mut moved_waiters);
         maybe_emit_requeue_table_snapshot(table, uaddr2);
         moved as u32
     };
@@ -1021,8 +1165,10 @@ pub struct FutexWaitOp<'a> {
     pub val: u32,
     pub aspace: &'a AddressSpace,
     pub interest_mask: u64,
+    pub tid: Option<u32>,
     pub woken: bool,
     pub waiting: bool,
+    pub registered_source_id: Option<u64>,
 }
 
 impl<I: SubjectIdentity> StepOp<I> for FutexWaitOp<'_> {
@@ -1033,16 +1179,26 @@ impl<I: SubjectIdentity> StepOp<I> for FutexWaitOp<'_> {
         if self.woken {
             return StepOutcome::Done(());
         }
-        let guard = adapter::step_engine::guard();
-        let outcome = step_futex_wait_masked(
+        if let Some(source_id) = self.registered_source_id {
+            return step_engine::yield_until_wake(source_id, self.interest_mask);
+        }
+        let guard =
+            tx_substrate::epoch::borrow_current_guard().unwrap_or_else(adapter::step_engine::guard);
+        let outcome = step_futex_wait_masked_with_tid(
             self.aspace,
             self.uaddr,
             self.val,
             self.interest_mask,
             &guard,
+            self.tid,
         );
-        if matches!(outcome, StepOutcome::Yield { .. }) {
+        if let StepOutcome::Yield {
+            shape: adapter::step_engine::YieldShape::OnWaitSource { source, .. },
+            ..
+        } = &outcome
+        {
             self.waiting = true;
+            self.registered_source_id = Some(source.raw());
         }
         outcome
     }
@@ -1050,6 +1206,12 @@ impl<I: SubjectIdentity> StepOp<I> for FutexWaitOp<'_> {
     fn apply_resume(&mut self, resume: adapter::step_engine::ResumeOutcome) -> Result<(), Errno> {
         match resume {
             adapter::step_engine::ResumeOutcome::Retry => {
+                if let Some(source_id) = self.registered_source_id {
+                    if exact_waiter_registered(self.aspace, self.uaddr, source_id) {
+                        return Ok(());
+                    }
+                }
+                self.unregister();
                 self.waiting = false;
                 self.woken = true;
                 Ok(())
@@ -1057,20 +1219,27 @@ impl<I: SubjectIdentity> StepOp<I> for FutexWaitOp<'_> {
             adapter::step_engine::ResumeOutcome::Aborted(
                 adapter::step_engine::AbortReason::TimedOut,
             ) => {
-                if self.waiting {
-                    let guard = adapter::step_engine::guard();
-                    let _ = step_futex_cancel_wait_in(
-                        self.aspace,
-                        self.uaddr,
-                        self.interest_mask,
-                        &guard,
-                    );
-                    self.waiting = false;
-                }
+                self.unregister();
                 Err(Errno::ETIMEDOUT)
             }
             _ => Err(Errno::EINVAL),
         }
+    }
+}
+
+impl FutexWaitOp<'_> {
+    fn unregister(&mut self) {
+        if let Some(source_id) = self.registered_source_id.take() {
+            unregister_exact_waiter(self.aspace, self.uaddr, source_id);
+            release_waiter_source(source_id);
+            self.waiting = false;
+        }
+    }
+}
+
+impl Drop for FutexWaitOp<'_> {
+    fn drop(&mut self) {
+        self.unregister();
     }
 }
 
@@ -1533,7 +1702,7 @@ mod tests {
     fn step_futex_wake_in_limits_exact_wait_source_posts() {
         let _setup = setup();
         let (aspace, uaddr) = setup_aspace_with_word(0x9600_0000, 0);
-        let mut source_id = None;
+        let mut source_ids = Vec::new();
         for _ in 0..3 {
             let eguard = guard();
             let wait = step_futex_wait(&aspace, uaddr, 0, &eguard);
@@ -1545,30 +1714,36 @@ mod tests {
                 } => source.raw(),
                 other => panic!("expected wait-source yield, got {other:?}"),
             };
-            if let Some(previous) = source_id {
-                assert_eq!(previous, id, "same exact futex key should reuse source");
-            }
-            source_id = Some(id);
+            source_ids.push(id);
         }
         assert_eq!(debug_exact_waiter_count(), 1);
         assert_eq!(debug_exact_waiter_total(), 3);
+        assert_ne!(
+            source_ids[0], source_ids[1],
+            "each exact waiter owns its own wake source"
+        );
+        assert_ne!(
+            source_ids[1], source_ids[2],
+            "each exact waiter owns its own wake source"
+        );
 
-        let source =
-            exact_wait_source_for_source_id(source_id.expect("source id")).expect("exact source");
+        let source_a = exact_wait_source_for_source_id(source_ids[0]).expect("exact source a");
+        let source_b = exact_wait_source_for_source_id(source_ids[1]).expect("exact source b");
+        let source_c = exact_wait_source_for_source_id(source_ids[2]).expect("exact source c");
         let mailbox_a = Arc::new(TaskMailbox::new());
         let mailbox_b = Arc::new(TaskMailbox::new());
         let mailbox_c = Arc::new(TaskMailbox::new());
-        let sub_a = source.register(
+        let sub_a = source_a.register(
             Arc::downgrade(&mailbox_a),
             WaitGeneration::new(21),
             InterestMask::new(FUTEX_WAKE_MASK),
         );
-        let sub_b = source.register(
+        let sub_b = source_b.register(
             Arc::downgrade(&mailbox_b),
             WaitGeneration::new(22),
             InterestMask::new(FUTEX_WAKE_MASK),
         );
-        let sub_c = source.register(
+        let sub_c = source_c.register(
             Arc::downgrade(&mailbox_c),
             WaitGeneration::new(23),
             InterestMask::new(FUTEX_WAKE_MASK),
@@ -1595,13 +1770,13 @@ mod tests {
             "FUTEX_WAKE n=1 must not broadcast exact wait-source posts",
         );
         if first_delivered[0] {
-            source.unregister(sub_a);
+            source_a.unregister(sub_a);
             let _ = mailbox_a.poll();
         } else if first_delivered[1] {
-            source.unregister(sub_b);
+            source_b.unregister(sub_b);
             let _ = mailbox_b.poll();
         } else {
-            source.unregister(sub_c);
+            source_c.unregister(sub_c);
             let _ = mailbox_c.poll();
         }
 
@@ -1677,6 +1852,36 @@ mod tests {
         let wake = step_futex_wake_in(&aspace, uaddr, 1, &eguard);
         drop(eguard);
         assert_eq!(wake, StepOutcome::Done(0));
+        assert_eq!(debug_exact_waiter_count(), 0);
+    }
+
+    #[test]
+    fn step_futex_cancel_keeps_remaining_waiters_wakeable() {
+        let _setup = setup();
+        let (aspace, uaddr) = setup_aspace_with_word(0x9510_0000, 0);
+        for _ in 0..2 {
+            let eguard = guard();
+            let wait_outcome = step_futex_wait(&aspace, uaddr, 0, &eguard);
+            drop(eguard);
+            assert!(matches!(wait_outcome, StepOutcome::Yield { .. }));
+        }
+        assert_eq!(debug_exact_waiter_total(), 2);
+
+        let eguard = guard();
+        assert_eq!(
+            step_futex_cancel_wait_in(&aspace, uaddr, FUTEX_WAKE_MASK, &eguard),
+            StepOutcome::Done(())
+        );
+        assert_eq!(debug_exact_waiter_total(), 1);
+        assert_eq!(
+            debug_exact_waiter_snapshot()[0].interest_mask,
+            FUTEX_WAKE_MASK,
+            "aggregate wait-source mask must stay armed while waiters remain"
+        );
+
+        let wake = step_futex_wake_in(&aspace, uaddr, 1, &eguard);
+        drop(eguard);
+        assert_eq!(wake, StepOutcome::Done(1));
         assert_eq!(debug_exact_waiter_count(), 0);
     }
 
@@ -1770,8 +1975,10 @@ mod tests {
                 aspace: &aspace,
                 val: 0xdead_beef,
                 interest_mask: FUTEX_WAKE_MASK,
+                tid: None,
                 woken: false,
                 waiting: false,
+                registered_source_id: None,
             };
             let mut ctx = ScriptCtx::<ProcessIdentity>::new();
             let outcome = op.step(&mut ctx);

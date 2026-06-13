@@ -11,14 +11,15 @@
 //!   device.rs, execution.rs, and initramfs/mod.rs.
 //! * `wait_routing` — reactor: Channel, Mask, WaitFuture. Used by
 //!   wait_source.rs.
+//! * `wait_mailbox` — substrate wake mailbox types used by wait_source.rs.
 
 use tx_platform_adapter::platform_adapter;
 
 #[platform_adapter(
     platform = "substrate",
     domain = "step_engine",
-    apis = ["step", "zone", "epoch", "page_allocator"],
-    reason = "expose substrate step engine outcome/error/progress types, zone Cap, EBR Guard/guard, and page_allocator frame_kernel_addr used by crate-root shared infrastructure files (execution.rs, device.rs, initramfs/mod.rs, zones.rs)"
+    apis = ["step", "zone", "epoch", "page_allocator", "wake"],
+    reason = "expose substrate step engine outcome/error/progress types, zone Cap, EBR Guard/guard, page_allocator frame_kernel_addr, and wake registry diagnostics used by crate-root shared infrastructure files (execution.rs, device.rs, initramfs/mod.rs, zones.rs)"
 )]
 pub mod step_engine {
     pub(crate) use crate::sync::SpinMutex;
@@ -27,6 +28,7 @@ pub mod step_engine {
     pub use tx_substrate::step::{
         ByteProgress, Errno as V3Errno, NoProgress, RestrictionStackHandle, StepOutcome,
     };
+    pub use tx_substrate::wake;
     pub use tx_substrate::zone::{
         self as zone, register_zone_for, reserve_for, sign, sign_for, Cap, CapProducingPolicy,
         CoLocatedEntity, Dead, Entity, IdentRef, IdentitySlot, IsPayloadPolicy, ObserverNodePolicy,

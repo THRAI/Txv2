@@ -60,6 +60,10 @@ pub struct NetNamespaceIdentity {
 pub struct NetNamespacePayload {
     owner_user_ns: SpinMutex<Option<Cap<UserNamespace>>>,
     socket_table: &'static SocketTable,
+    /// True when `socket_table` is a per-namespace heap allocation (from
+    /// `alloc_zeroed`) owned by this payload and freed in `Drop`; false when it
+    /// is the shared `INITIAL_SOCKET_TABLE` static (never freed).
+    socket_table_owned: bool,
     loopback_iface: &'static LoopbackIface,
     loopback_mtu: SpinMutex<u16>,
     loopback_ipv4_override: SpinMutex<Option<(Ipv4Address, u8)>>,
@@ -300,6 +304,32 @@ unsafe impl ZoneAllocated for NetNamespacePayload {
     }
 }
 
+impl Drop for NetNamespacePayload {
+    fn drop(&mut self) {
+        // Free the per-namespace `SocketTable` heap allocation when this payload
+        // is reclaimed. The zone slot is only reclaimed (via EBR) after the last
+        // strong payload cap is dropped — see `prune_dead_net_namespaces`, which
+        // drops the runtime list's reference once no identity/socket holds the
+        // namespace — so no live `socket_table()` reference exists here.
+        if self.socket_table_owned {
+            let ptr = self.socket_table as *const SocketTable as *mut SocketTable;
+            // SAFETY: `socket_table_owned` => the table was heap-allocated by
+            // `create_isolated_net_namespace_with_owner` via `alloc_zeroed` with
+            // `Layout::new::<SocketTable>()` and is uniquely owned by this
+            // payload. `SocketTable`'s `Index`/`Entry` keep keys/values in
+            // `MaybeUninit` (no `Drop`), so `drop_in_place` is a no-op and there
+            // are no double-frees of committed entries.
+            unsafe {
+                core::ptr::drop_in_place(ptr);
+                alloc::alloc::dealloc(
+                    ptr as *mut u8,
+                    core::alloc::Layout::new::<SocketTable>(),
+                );
+            }
+        }
+    }
+}
+
 impl NetNamespaceIdentity {
     pub fn new(name: &'static str) -> Self {
         Self {
@@ -334,6 +364,7 @@ impl NetNamespacePayload {
         Self::new(
             None,
             initial_socket_table_for_namespace(),
+            false,
             loopback_iface(),
             true,
         )
@@ -342,12 +373,14 @@ impl NetNamespacePayload {
     fn new(
         owner_user_ns: Option<Cap<UserNamespace>>,
         socket_table: &'static SocketTable,
+        socket_table_owned: bool,
         loopback_iface: &'static LoopbackIface,
         host_devices_visible: bool,
     ) -> Self {
         Self {
             owner_user_ns: SpinMutex::new(owner_user_ns),
             socket_table,
+            socket_table_owned,
             loopback_iface,
             loopback_mtu: SpinMutex::new(loopback_iface.mtu()),
             loopback_ipv4_override: SpinMutex::new(None),
@@ -2250,8 +2283,24 @@ impl NetNamespaceConnectedRouteKey {
     }
 }
 
+/// Drop runtime-list references to dead namespaces.
+///
+/// The list previously held a strong `PayloadCap` for every namespace ever
+/// created and never released them, so each `unshare -n` permanently leaked a
+/// ~256 KB `SocketTable` (the la net_stress walk OOM'd after a handful). A
+/// namespace whose payload `retain_count()` is `1` is held ONLY by this list —
+/// every identity, socket-registry, and process reference has already dropped,
+/// so it is dead. Removing it drops the last strong ref, which retires the slot
+/// (EBR) and runs `NetNamespacePayload::drop`, freeing the `SocketTable`. The
+/// initial namespace is pinned by `INITIAL_NET_NAMESPACE` + boot state
+/// (retain > 1) and its table is the shared static, so it is never pruned/freed.
+fn prune_dead_net_namespaces(namespaces: &mut Vec<PayloadCap<NetNamespacePayload>>) {
+    namespaces.retain(|namespace| namespace.retain_count() > 1);
+}
+
 fn remember_net_namespace_payload(payload: PayloadCap<NetNamespacePayload>) {
     let mut namespaces = NET_NAMESPACE_RUNTIME_LIST.lock();
+    prune_dead_net_namespaces(&mut namespaces);
     if namespaces
         .iter()
         .any(|namespace| namespace.trace_id() == payload.trace_id())
@@ -2262,7 +2311,9 @@ fn remember_net_namespace_payload(payload: PayloadCap<NetNamespacePayload>) {
 }
 
 pub fn net_namespace_payloads_snapshot() -> Vec<PayloadCap<NetNamespacePayload>> {
-    NET_NAMESPACE_RUNTIME_LIST.lock().clone()
+    let mut namespaces = NET_NAMESPACE_RUNTIME_LIST.lock();
+    prune_dead_net_namespaces(&mut namespaces);
+    namespaces.clone()
 }
 
 pub(crate) fn register_zones() -> Result<(), ZoneError> {
@@ -2484,10 +2535,33 @@ pub fn create_isolated_net_namespace_with_owner(
     name: &'static str,
     owner_user_ns: Option<Cap<UserNamespace>>,
 ) -> Result<Cap<NetNamespaceIdentity>, ZoneError> {
-    let table = Box::leak(Box::new(SocketTable::new()));
+    // A `SocketTable` is large (one `Index` per protocol, each with hundreds of
+    // slots). `Box::new(SocketTable::new())` materialises the whole table as a
+    // stack temporary before moving it into the heap; if the slot counts grow
+    // (e.g. `UNIX_STREAM_PEER_SLOTS`), that temporary can overflow the boot
+    // stack into adjacent `.bss` and silently corrupt the `BootStaticBag`
+    // (kernel panic "BootStaticBag not constructed" — see git history). Allocate
+    // the table directly on the heap, zeroed, to avoid the stack temporary (and
+    // the matching memcpy) entirely: every field of an empty table is all-zero
+    // bytes — each `Index`/`Entry` starts in state `EMPTY` (0) with an unlocked
+    // `SpinLock` (`false`/0) and an uninitialised key/value — so a zeroed
+    // allocation is a valid `SocketTable::new()`.
+    let table: &'static mut SocketTable = {
+        let layout = core::alloc::Layout::new::<SocketTable>();
+        // SAFETY: `SocketTable` has non-zero size; a zeroed `SocketTable` is a
+        // valid empty table (see the comment above).
+        let ptr = unsafe { alloc::alloc::alloc_zeroed(layout) } as *mut SocketTable;
+        if ptr.is_null() {
+            alloc::alloc::handle_alloc_error(layout);
+        }
+        // SAFETY: `ptr` is a fresh, properly-aligned, zero-initialised
+        // allocation sized for `SocketTable`; leaked for the namespace lifetime
+        // to match the previous `Box::leak`.
+        unsafe { &mut *ptr }
+    };
     create_net_namespace(
         name,
-        NetNamespacePayload::new(owner_user_ns, table, loopback_iface(), false),
+        NetNamespacePayload::new(owner_user_ns, table, true, loopback_iface(), false),
     )
 }
 

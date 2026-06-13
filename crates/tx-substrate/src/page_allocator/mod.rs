@@ -404,7 +404,7 @@ pub fn free_count() -> Result<usize, AllocError> {
 ///
 /// This is for substrate components that intentionally hold a raw PPN after
 /// committing an `OwnedFrame` token into their own lifetime protocol.
-pub(crate) fn release_owned_frame(ppn: Ppn) -> Result<(), AllocError> {
+pub fn release_owned_frame(ppn: Ppn) -> Result<(), AllocError> {
     measure_page_allocator!(b"debug.ds.substrate.page_allocator.release_owned_frame", {
         installed_bitmap_allocator()?.release_owned(ppn);
         Ok(())

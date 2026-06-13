@@ -583,6 +583,7 @@ use helpers::*;
 pub(super) use helpers::{
     drive_loopback_pending, socket_poll_mask_from_file, socket_poll_wait_token_from_file,
 };
+pub(crate) use helpers::{socket_identity_from_file, unix_pathname_key};
 
 pub(super) fn sys_getsockname<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let socket = match resolve_socket_fd(ctx, args[0] as i32) {

@@ -215,13 +215,17 @@ pub(super) fn sys_fchmodat<P: PmapIf>(
     let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
+    if path.is_empty() {
+        return SyscallResult::Error(ENOENT_VALUE);
+    }
     let rooted_at = match resolve_cwd(dirfd, ctx) {
         Ok(d) => d,
         Err(e) => return SyscallResult::Error(e),
     };
     let walker_cred = ctx.walker_cred();
-    let new_mode = (mode & 0o7777) as u16;
+    let requested_mode = (mode & 0o7777) as u16;
 
     // Cred check at the syscall arm using ctx.cred_snapshot().
     // Per-FS step_chmod impls (tmpfs / devfs / bdevfs / procfs)
@@ -234,9 +238,11 @@ pub(super) fn sys_fchmodat<P: PmapIf>(
         Err(e) => return SyscallResult::Error(e),
     };
     let target_meta = target_dentry.rnode().meta();
-    if let Err(e) = cred_checks::authorize_chmod(ctx.cred_snapshot(), &target_meta, new_mode) {
+    if let Err(e) = cred_checks::authorize_chmod(ctx.cred_snapshot(), &target_meta, requested_mode)
+    {
         return SyscallResult::error_from(e);
     }
+    let new_mode = chmod_mode_after_linux_fsetid_clear(requested_mode, &target_meta, ctx);
 
     let result = {
         let mut script_ctx = build_subject_script_ctx(ctx);
@@ -269,11 +275,13 @@ pub(super) fn sys_fchmod(fd: u32, mode: u32, ctx: &SyscallCtx<'_>) -> SyscallRes
         OpenFileBacking::Rnode { rnode } => rnode.clone(),
         _ => return SyscallResult::Error(EBADF_VALUE),
     };
-    let new_mode = (mode & 0o7777) as u16;
+    let requested_mode = (mode & 0o7777) as u16;
     let target_meta = rnode.meta();
-    if let Err(e) = cred_checks::authorize_chmod(ctx.cred_snapshot(), &target_meta, new_mode) {
+    if let Err(e) = cred_checks::authorize_chmod(ctx.cred_snapshot(), &target_meta, requested_mode)
+    {
         return SyscallResult::error_from(e);
     }
+    let new_mode = chmod_mode_after_linux_fsetid_clear(requested_mode, &target_meta, ctx);
     let fs_ops = match crate::linux_syscall::fs_basic::fs_ops_for_rnode(&rnode) {
         Some(fs_ops) => fs_ops,
         None => return SyscallResult::Error(ENOSYS_VALUE),
@@ -285,6 +293,20 @@ pub(super) fn sys_fchmod(fd: u32, mode: u32, ctx: &SyscallCtx<'_>) -> SyscallRes
             SyscallResult::Error(fs_change_errno_magnitude(Errno::from(errno)))
         }
         StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => SyscallResult::Error(EIO_VALUE),
+    }
+}
+
+fn chmod_mode_after_linux_fsetid_clear(
+    requested_mode: u16,
+    target_meta: &InodeMeta,
+    ctx: &SyscallCtx<'_>,
+) -> u16 {
+    let cred = ctx.cred_snapshot().cred();
+    if (requested_mode & S_ISGID) != 0 && cred.euid.raw() != 0 && cred.egid.raw() != target_meta.gid
+    {
+        requested_mode & !S_ISGID
+    } else {
+        requested_mode
     }
 }
 
@@ -307,6 +329,7 @@ pub(super) fn sys_fchownat<P: PmapIf>(
     let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
     let walker_cred = ctx.walker_cred();
     let uid = decode_uid_arg(uid_arg).map(|u| u.0);
@@ -438,6 +461,7 @@ pub(super) fn sys_faccessat2_impl<P: PmapIf>(
     let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
 
     // Pick which uid/gid to check against per POSIX: `access(2)` and
@@ -557,6 +581,7 @@ pub(super) async fn sys_chdir<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     let path = match read_user_cstr(&ctx.aspace, path_uaddr, EXECVE_PATH_MAX) {
         Ok(p) => p,
         Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
     };
     if path.is_empty() {
         return SyscallResult::Error(ENOENT_VALUE);

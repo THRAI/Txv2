@@ -45,37 +45,16 @@ pub extern "C" fn tx_kernel_loongarch64_qemu_trap_dispatch(
 
 #[panic_handler]
 fn panic(info: &PanicInfo<'_>) -> ! {
-    <ActivePlatform as tx_hal::ConsoleIf>::write_bytes(b"txkernel:panic:");
-    if let Some(location) = info.location() {
-        <ActivePlatform as tx_hal::ConsoleIf>::write_bytes(location.file().as_bytes());
-        <ActivePlatform as tx_hal::ConsoleIf>::write_bytes(b":");
-        write_decimal(location.line() as usize);
-        <ActivePlatform as tx_hal::ConsoleIf>::write_bytes(b":");
-        write_decimal(location.column() as usize);
-        <ActivePlatform as tx_hal::ConsoleIf>::write_bytes(b":");
+    use core::fmt::Write;
+
+    struct ConsoleWriter;
+    impl Write for ConsoleWriter {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            tx_hal::console_write_str::<ActivePlatform>(s);
+            Ok(())
+        }
     }
-    if let Some(message) = info.message().as_str() {
-        <ActivePlatform as tx_hal::ConsoleIf>::write_bytes(message.as_bytes());
-    }
-    <ActivePlatform as tx_hal::ConsoleIf>::write_bytes(b"\n");
+
+    let _ = writeln!(ConsoleWriter, "txkernel:panic:{info}");
     tx_kernel::panic_shutdown::<ActivePlatform>()
-}
-
-fn write_decimal(mut value: usize) {
-    if value == 0 {
-        <ActivePlatform as tx_hal::ConsoleIf>::write_bytes(b"0");
-        return;
-    }
-
-    let mut digits = [0u8; 20];
-    let mut len = 0;
-    while value != 0 {
-        digits[len] = b'0' + (value % 10) as u8;
-        len += 1;
-        value /= 10;
-    }
-    while len != 0 {
-        len -= 1;
-        <ActivePlatform as tx_hal::ConsoleIf>::write_bytes(&digits[len..len + 1]);
-    }
 }

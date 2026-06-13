@@ -7,7 +7,7 @@
 //! fast-check atomic land alongside the delivery pass.
 
 use alloc::sync::Weak as ArcWeak;
-use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
 use tx_hal::UserTrapContext;
 
@@ -54,6 +54,23 @@ impl ThreadIdentity {
     /// retained until reaped or the parent process drops).
     pub fn is_zombie(&self) -> bool {
         self.payload.lock().is_none()
+    }
+
+    /// Thread state character for `/proc/<pid>/task/<tid>/stat`.
+    pub fn proc_state_char(&self) -> u8 {
+        let Some(payload) = self.payload.lock().as_ref().cloned() else {
+            return b'Z';
+        };
+        if payload.is_stopped() {
+            return b'T';
+        }
+        if payload.proc_sleeping() {
+            return b'S';
+        }
+        if crate::futex::thread_has_waiter(self.tid.0) {
+            return b'S';
+        }
+        b'R'
     }
 
     /// Snapshot the owning process via `Weak::upgrade` under a fresh
@@ -160,6 +177,9 @@ pub struct ThreadPayload {
     /// execution state.  `None` when no handler is currently
     /// executing.
     pub(crate) saved_signal_context: SpinMutex<Option<UserTrapContext>>,
+    /// Signal mask active before the most recent handler delivery.
+    /// Restored together with `saved_signal_context` by `rt_sigreturn`.
+    pub(crate) saved_signal_mask: SpinMutex<Option<SignalMask>>,
     /// Result of the last completed syscall, drained by the
     /// userspace-entry checkpoint and written into the (then-fresh)
     /// trap frame via `set_syscall_return` / `set_syscall_error`
@@ -220,6 +240,10 @@ pub struct ThreadPayload {
     /// "no alternate stack" (deliver on the normal stack).
     /// `Some((base, size))` gives the alternate stack range.
     pub(crate) alt_stack: SpinMutex<Option<(usize, usize)>>,
+    /// Best-effort procfs state hint. Set while the thread future is
+    /// awaiting syscall dispatch; blocking syscall futures should
+    /// appear as sleeping to procfs observers.
+    pub(crate) proc_sleeping: AtomicBool,
     /// `clear_child_tid` pointer from `set_tid_address`.  Written
     /// atomically to 0 on thread exit when futex wake is supported.
     pub clear_child_tid: SpinMutex<Option<u64>>,
@@ -246,10 +270,12 @@ impl ThreadPayload {
             active_request: SpinMutex::new(None),
             saved_user_context: SpinMutex::new(None),
             saved_signal_context: SpinMutex::new(None),
+            saved_signal_mask: SpinMutex::new(None),
             pending_syscall_return: SpinMutex::new(None),
             mailbox: SpinMutex::new(None),
             stopped: core::sync::atomic::AtomicBool::new(false),
             alt_stack: SpinMutex::new(None),
+            proc_sleeping: AtomicBool::new(false),
             clear_child_tid: SpinMutex::new(None),
             robust_list_head: SpinMutex::new(None),
             robust_list_len: SpinMutex::new(0),
@@ -282,6 +308,16 @@ impl ThreadPayload {
     /// `None` until the reactor coupling lands.
     pub fn task(&self) -> Option<TaskKey> {
         *self.task.lock()
+    }
+
+    /// Snapshot whether this thread should be shown as sleeping in procfs.
+    pub fn proc_sleeping(&self) -> bool {
+        self.proc_sleeping.load(Ordering::Acquire)
+    }
+
+    /// Update the procfs sleep-state hint for syscall dispatch.
+    pub fn set_proc_sleeping(&self, sleeping: bool) {
+        self.proc_sleeping.store(sleeping, Ordering::Release);
     }
 
     /// Borrow the userspace-run slot owned by this thread. The trap
@@ -321,12 +357,27 @@ impl ThreadPayload {
         *self.saved_signal_context.lock() = ctx;
     }
 
+    /// Whether a signal handler frame is currently in flight.
+    pub fn has_saved_signal_context(&self) -> bool {
+        self.saved_signal_context.lock().is_some()
+    }
+
     /// Take (consume) the saved signal context. Called by
     /// `rt_sigreturn` to retrieve the pre-handler context for
     /// restoration into `saved_user_context`. Returns `None` if no
     /// signal frame is in flight (stray `rt_sigreturn` call).
     pub fn take_saved_signal_context(&self) -> Option<UserTrapContext> {
         self.saved_signal_context.lock().take()
+    }
+
+    /// Replace the signal mask saved for the active signal frame.
+    pub fn store_saved_signal_mask(&self, mask: Option<SignalMask>) {
+        *self.saved_signal_mask.lock() = mask;
+    }
+
+    /// Take the signal mask saved for the active signal frame.
+    pub fn take_saved_signal_mask(&self) -> Option<SignalMask> {
+        self.saved_signal_mask.lock().take()
     }
 
     /// Push a pending syscall return into the per-thread slot. The

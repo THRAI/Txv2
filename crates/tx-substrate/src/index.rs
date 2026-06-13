@@ -153,28 +153,6 @@ impl<K: Eq, V, const N: usize> Index<K, V, N> {
         None
     }
 
-    /// Snapshot all committed values, mapping each through `f` and collecting
-    /// the `Some` results. Restored after PR#50 stripped it; used by the net
-    /// subsystem (link/route/neighbor enumeration).
-    pub fn snapshot_values_filter_map<R>(
-        &self,
-        _guard: &Guard<'_>,
-        mut f: impl FnMut(&V) -> Option<R>,
-    ) -> Vec<R> {
-        let _lock = self.lock.lock();
-        let mut values = Vec::new();
-        for entry in &self.entries {
-            let state = unsafe { *entry.state.get() };
-            if state == COMMITTED {
-                let value = unsafe { (*entry.value.get()).assume_init_ref() };
-                if let Some(mapped) = f(value) {
-                    values.push(mapped);
-                }
-            }
-        }
-        values
-    }
-
     pub(crate) fn reserve_committed(
         &self,
         key: &K,
@@ -202,6 +180,30 @@ impl<K: Eq, V, const N: usize> Index<K, V, N> {
         }
 
         Err(IndexError::Missing)
+    }
+}
+
+impl<K, V, const N: usize> Index<K, V, N> {
+    /// Snapshot committed values through a caller-supplied projection.
+    pub fn snapshot_values_filter_map<R>(
+        &self,
+        _guard: &Guard<'_>,
+        mut f: impl FnMut(&V) -> Option<R>,
+    ) -> Vec<R> {
+        let _lock = self.lock.lock();
+        let mut values = Vec::new();
+
+        for entry in &self.entries {
+            let state = unsafe { *entry.state.get() };
+            if state == COMMITTED {
+                let value = unsafe { (*entry.value.get()).assume_init_ref() };
+                if let Some(mapped) = f(value) {
+                    values.push(mapped);
+                }
+            }
+        }
+
+        values
     }
 }
 

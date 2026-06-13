@@ -63,6 +63,49 @@ fn msg_namespace_entry_is_identity_cap_authority() {
 }
 
 #[test]
+fn msg_queue_rmid_releases_legacy_and_wake_sources() {
+    let _g = setup();
+
+    let legacy_before = crate::wait_source::registry_summary().total;
+    let wake_before = tx_substrate::wake::registry_summary().live;
+
+    {
+        let owner = cred(1000, 1000);
+        let ns = crate::process::nsproxy::sign_init_nsproxy().expect("nsproxy cap");
+        let key = 0x4d534702;
+        let msqid = execution::step_msgget(key, IPC_CREAT | IPC_EXCL | 0o600, &owner, &ns)
+            .expect("msgget keyed");
+
+        assert_eq!(
+            crate::wait_source::registry_summary().total,
+            legacy_before + 2,
+            "msg queue creation registers send and recv legacy channels"
+        );
+        assert_eq!(
+            tx_substrate::wake::registry_summary().live,
+            wake_before + 2,
+            "msg queue creation registers send and recv wake sources"
+        );
+
+        execution::step_msgctl_in_ns(msqid, execution::IPC_RMID, None, &owner, &ns)
+            .expect("IPC_RMID");
+    }
+
+    tx_test_support::drain_to_quiescence();
+
+    assert_eq!(
+        crate::wait_source::registry_summary().total,
+        legacy_before,
+        "IPC_RMID must release msg queue legacy wait channels"
+    );
+    assert_eq!(
+        tx_substrate::wake::registry_summary().live,
+        wake_before,
+        "IPC_RMID must unregister msg queue wake sources"
+    );
+}
+
+#[test]
 fn msgrcv_blocking_wait_yields_and_rmid_wakes_receiver() {
     let _g = setup();
 

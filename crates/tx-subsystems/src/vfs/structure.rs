@@ -8,7 +8,7 @@
 //! pure observation helpers belong here.
 
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicI8, AtomicU64, Ordering};
 
@@ -25,9 +25,8 @@ use crate::eventfd::EventFd;
 use crate::execution::Errno;
 use crate::io_uring::IoUring;
 use crate::ipc::posix_mq::structure::PosixMqInstance;
-use crate::mount::{MountIdentity, MountPayload};
-use crate::net::namespace::NetNamespacePayload;
-use crate::net::structure::SocketIdentity;
+use crate::mount::{MountApiFile, MountIdentity, MountPayload};
+use crate::net::{NetNamespacePayload, SocketIdentity};
 use crate::page_backed::PageContainer;
 use crate::process::{ProcessGroup, ProcessIdentity};
 use crate::signalfd::SignalFd;
@@ -57,6 +56,14 @@ pub const VFS_NAME_MAX: usize = 255;
 static DENTRY_ZONE: Zone<DEntry> = Zone::const_new();
 static RNODE_ZONE: Zone<RNode> = Zone::const_new();
 static OPEN_FILE_ZONE: Zone<OpenFile> = Zone::const_new();
+static FSNOTIFY_INSTANCE_ZONE: Zone<FsNotifyInstance> = Zone::const_new();
+static FLOCK_TABLE: SpinMutex<BTreeMap<FsObjectId, FlockRecord>> = SpinMutex::new(BTreeMap::new());
+
+#[derive(Default)]
+struct FlockRecord {
+    exclusive_owner: Option<u64>,
+    shared_owners: BTreeSet<u64>,
+}
 
 unsafe impl ZoneAllocated for DEntry {
     fn zone() -> &'static Zone<Self> {
@@ -73,6 +80,12 @@ unsafe impl ZoneAllocated for RNode {
 unsafe impl ZoneAllocated for OpenFile {
     fn zone() -> &'static Zone<Self> {
         &OPEN_FILE_ZONE
+    }
+}
+
+unsafe impl ZoneAllocated for FsNotifyInstance {
+    fn zone() -> &'static Zone<Self> {
+        &FSNOTIFY_INSTANCE_ZONE
     }
 }
 
@@ -504,11 +517,39 @@ impl ProjectionKey {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FsNotifyKind {
+    Inotify,
+    Fanotify,
+}
+
+#[derive(Debug)]
+pub struct FsNotifyInstance {
+    kind: FsNotifyKind,
+}
+
+impl FsNotifyInstance {
+    pub const fn new(kind: FsNotifyKind) -> Self {
+        Self { kind }
+    }
+
+    pub fn new_cap(kind: FsNotifyKind) -> Result<Cap<Self>, ZoneError> {
+        step_engine::sign(Self::new(kind))
+    }
+
+    pub const fn kind(&self) -> FsNotifyKind {
+        self.kind
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum StructPayload {
     Tty(Cap<TtyIdentity>),
     CharDevice(&'static CharDeviceBinding),
     BlockDevice(&'static BlockDeviceRegistration),
+    FsNotify {
+        instance: Cap<FsNotifyInstance>,
+    },
     /// Anonymous pipe — `pipe2(2)`. `side` distinguishes the
     /// reader-end RNode from the writer-end RNode; both share a
     /// single `Cap<PipePayload>`. fd-ops Wave 3.
@@ -517,16 +558,14 @@ pub enum StructPayload {
         side: crate::pipe::PipeSide,
     },
     /// Socket-backed open file used by the network syscall facade.
-    /// Restored after PR#50 accidentally dropped it; required by the net
-    /// subsystem and the socket.rs syscall layer.
     Socket {
         identity: Cap<SocketIdentity>,
     },
-    /// Internal network-namespace fd used by the staged rtnetlink path.
     NetNamespace {
         payload: PayloadCap<NetNamespacePayload>,
     },
-    /// Mount-namespace fd backing `/proc/<pid>/ns/mnt`, consumed by `setns(2)`.
+    /// Mount-namespace-backed open file for `/proc/<pid>/ns/mnt`, consumed by
+    /// `setns(2)`. Restored alongside the net subsystem re-home.
     MountNamespace {
         payload: Cap<crate::mount::MountNamespace>,
     },
@@ -539,65 +578,23 @@ pub struct RNode {
     meta: InodeMeta,
     backing: RNodeBacking,
     containing_mount: Option<Weak<MountPayload>>,
-    /// Legacy reactor wait channel paired with [`Self::read_wait_source`].
-    /// Fires on every per-inode "newly readable" transition. PR-3D-5
-    /// (D2/D4 coexistence): callers landing v3 blocking-IO step bodies
-    /// against a regular-file / future-socket RNode park on the matching
-    /// `WaitToken` via [`crate::wait_source::wait_on_token`] resolved
-    /// through [`Self::read_wait_source_id`]; the parallel
-    /// `WaitSource` path is fired on the same transition so v3 callers
-    /// holding a `TaskMailbox` see the same wake.
-    ///
-    /// Today no in-tree fire site exists for non-pipe/non-tty backings
-    /// (pipe + tty manage their own wait channels on the backing
-    /// payload); this slot is the durable wake-publication endpoint for
-    /// future page-backed-blocking, socket, and `inotify` wires per
-    /// the per-inode unbounded-count flag W-M raised. The Drop impl
-    /// releases the registry slot when the inode retires (EBR), so the
-    /// large-N inode-create-destroy stress path does not leak registry
-    /// rows.
-    read_wait_channel: Channel,
-    /// Legacy registry carrier id for [`Self::read_wait_channel`].
-    /// Shares the `u64` namespace with [`Self::read_wait_source`]'s
-    /// `WaitSourceId` so a v3 caller's `YieldShape::OnWaitSource
-    /// { source: WaitSourceId(id), .. }` resolves to this same slot.
-    read_wait_source_id: u64,
-    /// PR-3D-5 (D2/D4 coexistence). Per-inode `WaitSource` for the new
-    /// mailbox-based wake path, fired in parallel with
-    /// [`Self::read_wait_channel`] on every "newly readable" transition.
-    /// Shape mirrors `Cap<RNode>`'s EBR semantics — the source is held
-    /// by `Arc<WaitSource>` on the RNode, so subscribers cloning the
-    /// strong ref retain it across the wait window independent of inode
-    /// retirement; once the inode drops, the registry slot is released
-    /// (see `Drop for RNode`) and no further notifies arrive.
-    read_wait_source: Arc<WaitSource>,
-    /// Companion to [`Self::read_wait_channel`] for the writable
-    /// direction. Fires on every "newly writable" transition (space
-    /// available in a future socket / page-backed-blocking ring,
-    /// reader-closed-EPIPE on a future socket reset path, etc.).
-    write_wait_channel: Channel,
-    /// Companion to [`Self::read_wait_source_id`] for the writable
-    /// direction.
-    write_wait_source_id: u64,
-    /// Companion to [`Self::read_wait_source`] for the writable
-    /// direction.
-    write_wait_source: Arc<WaitSource>,
+    /// Optional per-inode readiness endpoints. Most RNodes in the current
+    /// tree never expose VFS-level blocking readiness (pipes, tty, sockets,
+    /// timerfd, eventfd, etc. own their wait sources on the backing object),
+    /// so allocating two global wait-source slots for every path lookup
+    /// turns long LTP runs into unbounded registry pressure. The endpoints
+    /// are still available to future callers, but only once requested.
+    wait_points: SpinMutex<Option<notification::RNodeWaitPoints>>,
 }
 
 impl RNode {
     pub fn new(fs_object_id: FsObjectId, meta: InodeMeta, backing: RNodeBacking) -> Self {
-        let wait_points = notification::new_rnode_wait_points();
         Self {
             fs_object_id,
             meta,
             backing,
             containing_mount: None,
-            read_wait_channel: wait_points.read_channel,
-            read_wait_source_id: wait_points.read_source_id,
-            read_wait_source: wait_points.read_source,
-            write_wait_channel: wait_points.write_channel,
-            write_wait_source_id: wait_points.write_source_id,
-            write_wait_source: wait_points.write_source,
+            wait_points: SpinMutex::new(None),
         }
     }
 
@@ -640,6 +637,75 @@ impl RNode {
         &self.backing
     }
 
+    pub fn flock_try_acquire(
+        &self,
+        owner: u64,
+        lock_type: u32,
+        blocking: bool,
+    ) -> Result<(), Errno> {
+        if owner == 0 {
+            return Err(Errno::EINVAL);
+        }
+
+        loop {
+            {
+                let mut locks = FLOCK_TABLE.lock();
+                let record = locks.entry(self.fs_object_id).or_default();
+                let can_lock = match lock_type {
+                    1 => record.exclusive_owner.is_none() || record.exclusive_owner == Some(owner),
+                    2 => {
+                        (record.exclusive_owner.is_none()
+                            && (record.shared_owners.is_empty()
+                                || (record.shared_owners.len() == 1
+                                    && record.shared_owners.contains(&owner))))
+                            || record.exclusive_owner == Some(owner)
+                    }
+                    _ => return Err(Errno::EINVAL),
+                };
+
+                if can_lock {
+                    match lock_type {
+                        1 => {
+                            record.exclusive_owner = None;
+                            record.shared_owners.insert(owner);
+                        }
+                        2 => {
+                            record.shared_owners.remove(&owner);
+                            record.exclusive_owner = Some(owner);
+                        }
+                        _ => unreachable!(),
+                    }
+                    return Ok(());
+                }
+
+                if !blocking {
+                    return Err(Errno::EAGAIN);
+                }
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    pub fn flock_release_owner(&self, owner: u64) {
+        if owner == 0 {
+            return;
+        }
+
+        let mut locks = FLOCK_TABLE.lock();
+        let Some(record) = locks.get_mut(&self.fs_object_id) else {
+            return;
+        };
+
+        if record.exclusive_owner == Some(owner) {
+            record.exclusive_owner = None;
+        }
+        record.shared_owners.remove(&owner);
+
+        if record.exclusive_owner.is_none() && record.shared_owners.is_empty() {
+            locks.remove(&self.fs_object_id);
+        }
+    }
+
     pub fn with_containing_mount(mut self, mount: &Cap<MountPayload>) -> Self {
         self.containing_mount = Some(mount.downgrade());
         self
@@ -658,14 +724,36 @@ impl RNode {
         self.containing_mount
     }
 
+    fn with_wait_points<R>(&self, f: impl FnOnce(&notification::RNodeWaitPoints) -> R) -> R {
+        let mut wait_points = self.wait_points.lock();
+        if wait_points.is_none() {
+            *wait_points = Some(notification::new_rnode_wait_points());
+        }
+        f(wait_points.as_ref().expect("wait points were initialized"))
+    }
+
+    fn read_wait_snapshot(&self) -> Option<(Channel, Arc<WaitSource>)> {
+        let wait_points = self.wait_points.lock();
+        wait_points
+            .as_ref()
+            .map(|points| (points.read_channel.clone(), points.read_source.clone()))
+    }
+
+    fn write_wait_snapshot(&self) -> Option<(Channel, Arc<WaitSource>)> {
+        let wait_points = self.wait_points.lock();
+        wait_points
+            .as_ref()
+            .map(|points| (points.write_channel.clone(), points.write_source.clone()))
+    }
+
     /// Legacy reactor `Channel` paired with [`Self::read_wait_source`].
     /// Production callers fire this and the new `WaitSource` in tandem
     /// from the per-inode "newly readable" transition site (see module
     /// docs); v3 callers awaiting via
     /// [`crate::wait_source::wait_on_token`] resolve the carrier id from
     /// [`Self::read_wait_source_id`].
-    pub fn read_wait_channel(&self) -> &Channel {
-        &self.read_wait_channel
+    pub fn read_wait_channel(&self) -> Channel {
+        self.with_wait_points(|points| points.read_channel.clone())
     }
 
     /// Legacy registry carrier id for [`Self::read_wait_channel`].
@@ -673,7 +761,7 @@ impl RNode {
     /// `WaitSourceId` so a v3 caller's `YieldShape::OnWaitSource
     /// { source: WaitSourceId(id), .. }` resolves to this same slot.
     pub fn read_wait_source_id(&self) -> u64 {
-        self.read_wait_source_id
+        self.with_wait_points(|points| points.read_source_id)
     }
 
     /// PR-3D-5: per-inode `WaitSource` for the new mailbox-based wake
@@ -682,26 +770,26 @@ impl RNode {
     /// `WaitSource::prepare(..).install_if(..)` independent of the
     /// inode's EBR retirement. `WaitSource::id()` matches
     /// [`Self::read_wait_source_id`].
-    pub fn read_wait_source(&self) -> &Arc<WaitSource> {
-        &self.read_wait_source
+    pub fn read_wait_source(&self) -> Arc<WaitSource> {
+        self.with_wait_points(|points| points.read_source.clone())
     }
 
     /// Companion to [`Self::read_wait_channel`] for the writable
     /// direction.
-    pub fn write_wait_channel(&self) -> &Channel {
-        &self.write_wait_channel
+    pub fn write_wait_channel(&self) -> Channel {
+        self.with_wait_points(|points| points.write_channel.clone())
     }
 
     /// Companion to [`Self::read_wait_source_id`] for the writable
     /// direction.
     pub fn write_wait_source_id(&self) -> u64 {
-        self.write_wait_source_id
+        self.with_wait_points(|points| points.write_source_id)
     }
 
     /// Companion to [`Self::read_wait_source`] for the writable
     /// direction.
-    pub fn write_wait_source(&self) -> &Arc<WaitSource> {
-        &self.write_wait_source
+    pub fn write_wait_source(&self) -> Arc<WaitSource> {
+        self.with_wait_points(|points| points.write_source.clone())
     }
 
     /// Fire the per-inode read wake path on both the legacy `Channel`
@@ -718,12 +806,18 @@ impl RNode {
     /// either both paths fire or neither does, matching the
     /// exit_source / tty templates).
     pub fn fire_read_wait(&self, mask: u64) -> usize {
-        notification::notify_readable(&self.read_wait_channel, &self.read_wait_source, mask)
+        let Some((channel, source)) = self.read_wait_snapshot() else {
+            return 0;
+        };
+        notification::notify_readable(&channel, &source, mask)
     }
 
     /// Companion to [`Self::fire_read_wait`] for the writable direction.
     pub fn fire_write_wait(&self, mask: u64) -> usize {
-        notification::notify_writable(&self.write_wait_channel, &self.write_wait_source, mask)
+        let Some((channel, source)) = self.write_wait_snapshot() else {
+            return 0;
+        };
+        notification::notify_writable(&channel, &source, mask)
     }
 }
 
@@ -739,9 +833,12 @@ impl RNode {
 /// rows per inode.
 impl Drop for RNode {
     fn drop(&mut self) {
+        let Some(wait_points) = self.wait_points.lock().take() else {
+            return;
+        };
         notification::release_rnode_wait_points(
-            self.read_wait_source_id,
-            self.write_wait_source_id,
+            wait_points.read_source_id,
+            wait_points.write_source_id,
         );
     }
 }
@@ -760,8 +857,7 @@ impl core::fmt::Debug for RNode {
             .field("meta", &self.meta)
             .field("backing", &self.backing)
             .field("containing_mount", &self.containing_mount)
-            .field("read_wait_source_id", &self.read_wait_source_id)
-            .field("write_wait_source_id", &self.write_wait_source_id)
+            .field("wait_points_allocated", &self.wait_points.lock().is_some())
             .finish()
     }
 }
@@ -772,7 +868,7 @@ pub struct DEntry {
     parent: Option<Cap<DEntry>>,
     rnode: Cap<RNode>,
     mounted: Option<Weak<MountIdentity>>,
-    children: SpinMutex<BTreeMap<InlineName, Cap<DEntry>>>,
+    children: SpinMutex<BTreeMap<InlineName, Weak<DEntry>>>,
 }
 
 impl DEntry {
@@ -807,7 +903,9 @@ impl DEntry {
     }
 
     /// Return the parent-hint `Cap<DEntry>` if installed. The parent is held
-    /// by strong reference so the chain remains valid after any `chdir`.
+    /// strongly so live cwd/path dentries keep their ancestor chain renderable;
+    /// the child cache is weak, so parent/child cache cycles do not retain
+    /// removed directory subtrees.
     pub fn parent_hint(&self) -> Option<Cap<DEntry>> {
         self.parent.clone()
     }
@@ -823,11 +921,20 @@ impl DEntry {
     }
 
     pub fn cached_child(&self, name: InlineName) -> Option<Cap<DEntry>> {
-        self.children.lock().get(&name).cloned()
+        let mut children = self.children.lock();
+        let child = children.get(&name).copied()?;
+        let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
+        match child.upgrade(&guard) {
+            Some(cap) => Some(cap),
+            None => {
+                children.remove(&name);
+                None
+            }
+        }
     }
 
     pub fn cache_child(&self, child: Cap<DEntry>) {
-        self.children.lock().insert(child.name(), child);
+        self.children.lock().insert(child.name(), child.downgrade());
     }
 
     pub fn remove_cached_child(&self, name: InlineName) {
@@ -978,6 +1085,15 @@ pub enum OpenFileBacking {
     /// descriptor is a normal fd-table entry whose backing carries the
     /// POSIX mq identity and per-open flags.
     PosixMq { mq: Cap<PosixMqInstance> },
+    /// `pidfd_open(2)` open file. The fd keeps a capability reference
+    /// to the target process identity; exit/readiness lives on the
+    /// process side, so this adapter does not duplicate signal truth.
+    Pidfd { process: Cap<ProcessIdentity> },
+    /// Minimal typed kernel-object fds for syscall surfaces whose full
+    /// subsystem semantics are intentionally staged.
+    KernelObject { object: KernelObjectFile },
+    /// Linux new mount API fd (`fsopen`, `fspick`, `fsmount`, `open_tree`).
+    MountApi { file: Cap<MountApiFile> },
     /// Minimal anonymous `socketpair(AF_UNIX, SOCK_STREAM)` open file.
     /// Each endpoint is backed by two pipe payloads: `rx` receives
     /// bytes from the peer, and `tx` carries bytes written by this fd
@@ -988,6 +1104,34 @@ pub enum OpenFileBacking {
         rx: Cap<crate::pipe::PipePayload>,
         tx: Cap<crate::pipe::PipePayload>,
     },
+}
+
+/// Metadata carried by phase-0 kernel-object fds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelObjectFile {
+    PerfEvent(PerfEventFile),
+    BpfMap(BpfMapFile),
+}
+
+/// `perf_event_open(2)` phase-0 fd metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PerfEventFile {
+    pub attr_type: u32,
+    pub config: u64,
+    pub pid: i32,
+    pub cpu: i32,
+    pub group_fd: i32,
+    pub flags: u64,
+}
+
+/// `bpf(BPF_MAP_CREATE)` phase-0 fd metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BpfMapFile {
+    pub map_type: u32,
+    pub key_size: u32,
+    pub value_size: u32,
+    pub max_entries: u32,
+    pub map_flags: u32,
 }
 
 /// Per-fd file-position carrier.
@@ -1030,10 +1174,6 @@ pub struct OpenFile {
     /// Best-effort DEntry hint set by `step_open`. `None` for
     /// non-VFS shapes (ufd, aio, etc.). Used by `fchdir`.
     opendir_dentry: Option<Cap<DEntry>>,
-
-    /// Advisory file lock state: 0 = unlocked, non-zero = exclusive-locked.
-    /// Per open-file-description, not per-inode (POSIX flock semantics).
-    flock_state: core::sync::atomic::AtomicU64,
 }
 
 impl OpenFile {
@@ -1046,7 +1186,6 @@ impl OpenFile {
             packet_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
-            flock_state: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1081,7 +1220,6 @@ impl OpenFile {
             packet_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
-            flock_state: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1112,7 +1250,6 @@ impl OpenFile {
             packet_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
-            flock_state: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1139,7 +1276,6 @@ impl OpenFile {
             packet_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
-            flock_state: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1163,7 +1299,6 @@ impl OpenFile {
             packet_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
-            flock_state: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1184,7 +1319,6 @@ impl OpenFile {
             packet_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
-            flock_state: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1208,7 +1342,6 @@ impl OpenFile {
             packet_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
-            flock_state: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1230,7 +1363,6 @@ impl OpenFile {
             packet_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
-            flock_state: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1240,6 +1372,69 @@ impl OpenFile {
         flags: OpenFileFlags,
     ) -> Result<Cap<Self>, ZoneError> {
         step_engine::sign(Self::new_posix_mq(mq, flags))
+    }
+
+    /// Construct a pidfd-backed `OpenFile`.
+    pub fn new_pidfd(process: Cap<ProcessIdentity>, flags: OpenFileFlags) -> Self {
+        Self {
+            backing: OpenFileBacking::Pidfd { process },
+            offset: AtomicU64::new(0),
+            readdir_cursor: AtomicU64::new(0),
+            nonblocking_override: AtomicI8::new(-1),
+            packet_override: AtomicI8::new(-1),
+            flags,
+            opendir_dentry: None,
+        }
+    }
+
+    /// Zone-sign a fresh pidfd-backed `OpenFile`.
+    pub fn new_pidfd_cap(
+        process: Cap<ProcessIdentity>,
+        flags: OpenFileFlags,
+    ) -> Result<Cap<Self>, ZoneError> {
+        step_engine::sign(Self::new_pidfd(process, flags))
+    }
+
+    /// Construct a phase-0 kernel-object-backed `OpenFile`.
+    pub fn new_kernel_object(object: KernelObjectFile, flags: OpenFileFlags) -> Self {
+        Self {
+            backing: OpenFileBacking::KernelObject { object },
+            offset: AtomicU64::new(0),
+            readdir_cursor: AtomicU64::new(0),
+            nonblocking_override: AtomicI8::new(-1),
+            packet_override: AtomicI8::new(-1),
+            flags,
+            opendir_dentry: None,
+        }
+    }
+
+    /// Zone-sign a fresh phase-0 kernel-object-backed `OpenFile`.
+    pub fn new_kernel_object_cap(
+        object: KernelObjectFile,
+        flags: OpenFileFlags,
+    ) -> Result<Cap<Self>, ZoneError> {
+        step_engine::sign(Self::new_kernel_object(object, flags))
+    }
+
+    /// Construct a new-mount-API-backed `OpenFile`.
+    pub fn new_mount_api(file: Cap<MountApiFile>, flags: OpenFileFlags) -> Self {
+        Self {
+            backing: OpenFileBacking::MountApi { file },
+            offset: AtomicU64::new(0),
+            readdir_cursor: AtomicU64::new(0),
+            nonblocking_override: AtomicI8::new(-1),
+            packet_override: AtomicI8::new(-1),
+            flags,
+            opendir_dentry: None,
+        }
+    }
+
+    /// Zone-sign a fresh new-mount-API-backed `OpenFile`.
+    pub fn new_mount_api_cap(
+        file: Cap<MountApiFile>,
+        flags: OpenFileFlags,
+    ) -> Result<Cap<Self>, ZoneError> {
+        step_engine::sign(Self::new_mount_api(file, flags))
     }
 
     /// Construct one endpoint of an anonymous stream socketpair.
@@ -1256,7 +1451,6 @@ impl OpenFile {
             packet_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
-            flock_state: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1284,7 +1478,6 @@ impl OpenFile {
             packet_override: AtomicI8::new(-1),
             flags,
             opendir_dentry: None,
-            flock_state: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1323,21 +1516,6 @@ impl OpenFile {
         Some((payload.clone(), *side))
     }
 
-    /// Return the socket identity carried by this file, if it is a
-    /// socket fd. Used by net-diag projections (`net/project.rs`) to
-    /// enumerate a process's open sockets.
-    pub fn socket_identity(&self) -> Option<&Cap<SocketIdentity>> {
-        match &self.backing {
-            OpenFileBacking::Rnode { rnode } => match rnode.backing() {
-                RNodeBacking::StructBacked {
-                    payload: StructPayload::Socket { identity },
-                } => Some(identity),
-                _ => None,
-            },
-            _ => None,
-        }
-    }
-
     /// Return the anonymous stream socketpair endpoint, if this fd is
     /// one. The first payload is the readable side for this fd; the
     /// second is the writable side toward the peer.
@@ -1346,6 +1524,21 @@ impl OpenFile {
     ) -> Option<(Cap<crate::pipe::PipePayload>, Cap<crate::pipe::PipePayload>)> {
         match &self.backing {
             OpenFileBacking::SocketPair { rx, tx } => Some((rx.clone(), tx.clone())),
+            _ => None,
+        }
+    }
+
+    /// Socket identity backing this open file, if it is a network socket.
+    /// Restored alongside the net subsystem re-home; used by
+    /// `/proc/net/{tcp,udp,...}` enumeration to walk a process's open sockets.
+    pub fn socket_identity(&self) -> Option<&Cap<SocketIdentity>> {
+        match &self.backing {
+            OpenFileBacking::Rnode { rnode } => match rnode.backing() {
+                RNodeBacking::StructBacked {
+                    payload: StructPayload::Socket { identity },
+                } => Some(identity),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -1395,6 +1588,18 @@ impl OpenFile {
                 "OpenFile::rnode() called on a POSIX-mq-backed OpenFile; \
                  dispatch via OpenFile::backing() / OpenFile::posix_mq() first",
             ),
+            OpenFileBacking::Pidfd { .. } => panic!(
+                "OpenFile::rnode() called on a pidfd-backed OpenFile; \
+                 dispatch via OpenFile::backing() / OpenFile::pidfd_process() first",
+            ),
+            OpenFileBacking::KernelObject { .. } => panic!(
+                "OpenFile::rnode() called on a kernel-object-backed OpenFile; \
+                 dispatch via OpenFile::backing() / OpenFile::kernel_object() first",
+            ),
+            OpenFileBacking::MountApi { .. } => panic!(
+                "OpenFile::rnode() called on a mount-api-backed OpenFile; \
+                 dispatch via OpenFile::backing() / OpenFile::mount_api_file() first",
+            ),
             OpenFileBacking::SocketPair { .. } => panic!(
                 "OpenFile::rnode() called on a socketpair-backed OpenFile; \
                  dispatch via OpenFile::backing() / OpenFile::socketpair_endpoint() first",
@@ -1415,44 +1620,19 @@ impl OpenFile {
     /// `blocking`: `false` = `LOCK_NB`.
     pub fn flock_acquire(
         &self,
-        _lock_type: u32,
+        lock_type: u32,
         blocking: bool,
     ) -> Result<(), crate::execution::Errno> {
-        // v1: exclusive-only, per-open-file-description.
-        // Any shared lock maps to exclusive.
-        if blocking {
-            // Simple spin-wait for v1.
-            loop {
-                if self
-                    .flock_state
-                    .compare_exchange(
-                        0,
-                        1,
-                        core::sync::atomic::Ordering::Acquire,
-                        core::sync::atomic::Ordering::Relaxed,
-                    )
-                    .is_ok()
-                {
-                    return Ok(());
-                }
-            }
-        } else {
-            self.flock_state
-                .compare_exchange(
-                    0,
-                    1,
-                    core::sync::atomic::Ordering::Acquire,
-                    core::sync::atomic::Ordering::Relaxed,
-                )
-                .map_err(|_| crate::execution::Errno::EAGAIN)?;
-            Ok(())
-        }
+        let owner = self as *const Self as u64;
+        self.rnode().flock_try_acquire(owner, lock_type, blocking)
     }
 
     /// Release a held advisory lock.
     pub fn flock_release(&self) {
-        self.flock_state
-            .store(0, core::sync::atomic::Ordering::Release);
+        let owner = self as *const Self as u64;
+        if let OpenFileBacking::Rnode { rnode } = &self.backing {
+            rnode.flock_release_owner(owner);
+        }
     }
 
     /// `Some(&Cap<UserfaultFd>)` iff this `OpenFile` is the
@@ -1472,6 +1652,9 @@ impl OpenFile {
             | OpenFileBacking::Eventfd { .. }
             | OpenFileBacking::Timerfd { .. }
             | OpenFileBacking::PosixMq { .. }
+            | OpenFileBacking::Pidfd { .. }
+            | OpenFileBacking::KernelObject { .. }
+            | OpenFileBacking::MountApi { .. }
             | OpenFileBacking::SocketPair { .. } => None,
         }
     }
@@ -1494,6 +1677,9 @@ impl OpenFile {
             | OpenFileBacking::Eventfd { .. }
             | OpenFileBacking::Timerfd { .. }
             | OpenFileBacking::PosixMq { .. }
+            | OpenFileBacking::Pidfd { .. }
+            | OpenFileBacking::KernelObject { .. }
+            | OpenFileBacking::MountApi { .. }
             | OpenFileBacking::SocketPair { .. } => None,
         }
     }
@@ -1515,6 +1701,9 @@ impl OpenFile {
             | OpenFileBacking::Eventfd { .. }
             | OpenFileBacking::Timerfd { .. }
             | OpenFileBacking::PosixMq { .. }
+            | OpenFileBacking::Pidfd { .. }
+            | OpenFileBacking::KernelObject { .. }
+            | OpenFileBacking::MountApi { .. }
             | OpenFileBacking::SocketPair { .. } => None,
         }
     }
@@ -1532,6 +1721,9 @@ impl OpenFile {
             | OpenFileBacking::Eventfd { .. }
             | OpenFileBacking::Timerfd { .. }
             | OpenFileBacking::PosixMq { .. }
+            | OpenFileBacking::Pidfd { .. }
+            | OpenFileBacking::KernelObject { .. }
+            | OpenFileBacking::MountApi { .. }
             | OpenFileBacking::SocketPair { .. } => None,
         }
     }
@@ -1549,6 +1741,9 @@ impl OpenFile {
             | OpenFileBacking::Epoll { .. }
             | OpenFileBacking::Timerfd { .. }
             | OpenFileBacking::PosixMq { .. }
+            | OpenFileBacking::Pidfd { .. }
+            | OpenFileBacking::KernelObject { .. }
+            | OpenFileBacking::MountApi { .. }
             | OpenFileBacking::SocketPair { .. } => None,
         }
     }
@@ -1566,6 +1761,9 @@ impl OpenFile {
             | OpenFileBacking::Epoll { .. }
             | OpenFileBacking::Eventfd { .. }
             | OpenFileBacking::PosixMq { .. }
+            | OpenFileBacking::Pidfd { .. }
+            | OpenFileBacking::KernelObject { .. }
+            | OpenFileBacking::MountApi { .. }
             | OpenFileBacking::SocketPair { .. } => None,
         }
     }
@@ -1588,6 +1786,9 @@ impl OpenFile {
             | OpenFileBacking::Eventfd { .. }
             | OpenFileBacking::Timerfd { .. }
             | OpenFileBacking::PosixMq { .. }
+            | OpenFileBacking::Pidfd { .. }
+            | OpenFileBacking::KernelObject { .. }
+            | OpenFileBacking::MountApi { .. }
             | OpenFileBacking::SocketPair { .. } => None,
         }
     }
@@ -1605,6 +1806,68 @@ impl OpenFile {
             | OpenFileBacking::Eventfd { .. }
             | OpenFileBacking::Timerfd { .. }
             | OpenFileBacking::IoUring { .. }
+            | OpenFileBacking::Pidfd { .. }
+            | OpenFileBacking::KernelObject { .. }
+            | OpenFileBacking::MountApi { .. }
+            | OpenFileBacking::SocketPair { .. } => None,
+        }
+    }
+
+    /// `Some(&Cap<ProcessIdentity>)` iff this `OpenFile` is a pidfd.
+    pub fn pidfd_process(&self) -> Option<&Cap<ProcessIdentity>> {
+        match &self.backing {
+            OpenFileBacking::Pidfd { process } => Some(process),
+            OpenFileBacking::Rnode { .. }
+            | OpenFileBacking::Ufd { .. }
+            | OpenFileBacking::AioContext { .. }
+            | OpenFileBacking::SignalFd { .. }
+            | OpenFileBacking::Epoll { .. }
+            | OpenFileBacking::Eventfd { .. }
+            | OpenFileBacking::Timerfd { .. }
+            | OpenFileBacking::IoUring { .. }
+            | OpenFileBacking::PosixMq { .. }
+            | OpenFileBacking::KernelObject { .. }
+            | OpenFileBacking::MountApi { .. }
+            | OpenFileBacking::SocketPair { .. } => None,
+        }
+    }
+
+    /// `Some(&KernelObjectFile)` iff this `OpenFile` is a phase-0
+    /// kernel-object fd.
+    pub fn kernel_object(&self) -> Option<&KernelObjectFile> {
+        match &self.backing {
+            OpenFileBacking::KernelObject { object } => Some(object),
+            OpenFileBacking::Rnode { .. }
+            | OpenFileBacking::Ufd { .. }
+            | OpenFileBacking::AioContext { .. }
+            | OpenFileBacking::SignalFd { .. }
+            | OpenFileBacking::Epoll { .. }
+            | OpenFileBacking::Eventfd { .. }
+            | OpenFileBacking::Timerfd { .. }
+            | OpenFileBacking::IoUring { .. }
+            | OpenFileBacking::PosixMq { .. }
+            | OpenFileBacking::Pidfd { .. }
+            | OpenFileBacking::MountApi { .. }
+            | OpenFileBacking::SocketPair { .. } => None,
+        }
+    }
+
+    /// `Some(&Cap<MountApiFile>)` iff this `OpenFile` is a Linux new
+    /// mount API fd.
+    pub fn mount_api_file(&self) -> Option<&Cap<MountApiFile>> {
+        match &self.backing {
+            OpenFileBacking::MountApi { file } => Some(file),
+            OpenFileBacking::Rnode { .. }
+            | OpenFileBacking::Ufd { .. }
+            | OpenFileBacking::AioContext { .. }
+            | OpenFileBacking::SignalFd { .. }
+            | OpenFileBacking::Epoll { .. }
+            | OpenFileBacking::Eventfd { .. }
+            | OpenFileBacking::Timerfd { .. }
+            | OpenFileBacking::IoUring { .. }
+            | OpenFileBacking::PosixMq { .. }
+            | OpenFileBacking::Pidfd { .. }
+            | OpenFileBacking::KernelObject { .. }
             | OpenFileBacking::SocketPair { .. } => None,
         }
     }

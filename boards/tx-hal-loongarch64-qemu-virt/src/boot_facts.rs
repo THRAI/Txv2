@@ -62,7 +62,7 @@ static mut BOOT_MEMORY_REGIONS: [MemoryRegion; LA64_BOOT_MEMORY_REGION_CAPACITY]
 ];
 
 static mut BOOT_INFO: BootInfo = BootInfo::empty();
-pub(crate) const LA64_BOOT_CMDLINE_CAPACITY: usize = 256;
+pub(crate) const LA64_BOOT_CMDLINE_CAPACITY: usize = 16384;
 static mut BOOT_CMDLINE: [u8; LA64_BOOT_CMDLINE_CAPACITY] = [0; LA64_BOOT_CMDLINE_CAPACITY];
 
 static mut BOOTSTRAP_PMAP_INFO: BootstrapPmapInfo = BootstrapPmapInfo {

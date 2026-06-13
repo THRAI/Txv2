@@ -20,7 +20,7 @@ struct TestTimespec {
 }
 
 #[test]
-fn dispatch_clock_getres_writes_one_nanosecond_resolution_for_known_clocks() {
+fn dispatch_clock_getres_writes_effective_resolution_for_known_clocks() {
     let _setup = setup();
     let proc_cap = bootstrap();
     let thread = first_thread(&proc_cap);
@@ -44,7 +44,7 @@ fn dispatch_clock_getres_writes_one_nanosecond_resolution_for_known_clocks() {
             res,
             TestTimespec {
                 tv_sec: 0,
-                tv_nsec: 1
+                tv_nsec: 2_000_000
             }
         );
     }
@@ -147,7 +147,7 @@ fn dispatch_personality_rejects_unsupported_changes() {
     let ctx = make_ctx(proc_cap, thread);
 
     let result = block_on(dispatch::<ShimsTestPmap>(
-        SyscallRequest::new(NR_PERSONALITY, [0x0008_0000, 0, 0, 0, 0, 0]),
+        SyscallRequest::new(NR_PERSONALITY, [0x8000_0000, 0, 0, 0, 0, 0]),
         &ctx,
     ));
 

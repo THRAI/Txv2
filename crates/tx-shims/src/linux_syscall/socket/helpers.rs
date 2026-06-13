@@ -474,7 +474,7 @@ pub(super) fn resolve_socket_fd<'a>(
     Ok((file, socket))
 }
 
-pub(super) fn socket_identity_from_file(
+pub(crate) fn socket_identity_from_file(
     file: &Cap<OpenFile>,
 ) -> Result<Cap<SocketIdentity>, Errno> {
     match file.backing() {
@@ -577,6 +577,32 @@ pub(super) fn read_sockaddr_in<'a>(
         }
         0 => Ok(KernelSockAddr::Unspec),
         _ => Err(Errno::EAFNOSUPPORT),
+    }
+}
+
+/// Derive the cwd-absolute bind/connect key for an `AF_UNIX` pathname socket.
+/// Used by `unlink(2)` (fs_mut) to match the bound key for relative pathname
+/// sockets. Restored alongside the net subsystem re-home.
+pub(crate) fn unix_pathname_key(
+    ctx: &SyscallCtx<'_>,
+    raw_path: &[u8],
+) -> Result<UnixSocketPath, Errno> {
+    match raw_path.first() {
+        Some(&0) | Some(&b'/') | None => UnixSocketPath::new(raw_path),
+        Some(_) => {
+            if let Some(cwd) = ctx.process.cwd() {
+                if let Some(mut abs) = tx_subsystems::vfs::render_dentry_path(&cwd) {
+                    if abs.last() != Some(&b'/') {
+                        abs.push(b'/');
+                    }
+                    abs.extend_from_slice(raw_path);
+                    if let Ok(path) = UnixSocketPath::new(&abs) {
+                        return Ok(path);
+                    }
+                }
+            }
+            UnixSocketPath::new(raw_path)
+        }
     }
 }
 

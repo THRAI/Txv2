@@ -220,7 +220,8 @@ fn try_direct_trap_syscall<P: TxPlatform>(
         SyscallResult::Error(errno) => view.set_syscall_error(errno),
         SyscallResult::NoReturn
         | SyscallResult::ExecCommitted
-        | SyscallResult::SigreturnRestored => return None,
+        | SyscallResult::SigreturnRestored
+        | SyscallResult::SigreturnContextRestored => return None,
     }
 
     const RV64_ECALL_INSN_BYTES: usize = 4;

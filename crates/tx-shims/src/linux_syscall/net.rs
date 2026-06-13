@@ -138,11 +138,11 @@ pub(super) fn sys_socketpair(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRes
         Ok(file) => file,
         Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
     };
-    let b_file =
-        match OpenFile::new_socketpair_endpoint_cap(b_rx_payload, a_rx_payload, open_flags) {
-            Ok(file) => file,
-            Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
-        };
+    let b_file = match OpenFile::new_socketpair_endpoint_cap(b_rx_payload, a_rx_payload, open_flags)
+    {
+        Ok(file) => file,
+        Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+    };
 
     let fd0 = match next_stdio_fd_below_nofile(&ctx.process) {
         Ok(fd) => fd,

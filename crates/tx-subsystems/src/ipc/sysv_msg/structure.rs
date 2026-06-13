@@ -101,6 +101,15 @@ pub struct MsgQueuePayload {
     pub recv_source: alloc::sync::Arc<crate::process::adapter::wait_routing::WaitSource>,
 }
 
+impl Drop for MsgQueuePayload {
+    fn drop(&mut self) {
+        crate::ipc::sysv_msg::notification::release_wait_channels(
+            self.send_source_id,
+            self.recv_source_id,
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Global msg registry — day-1 single-namespace
 // ---------------------------------------------------------------------------

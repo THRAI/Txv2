@@ -8,7 +8,7 @@
 
 use super::*;
 use crate::adapter::step_engine::StepOutcome;
-use tx_subsystems::vfs::structure::{OpenFileBacking, RNodeBacking, StructPayload};
+use tx_subsystems::vfs::structure::{InodeKind, OpenFileBacking, RNodeBacking, StructPayload};
 
 const SPLICE_F_MOVE: u32 = 0x01;
 const SPLICE_F_NONBLOCK: u32 = 0x02;
@@ -54,6 +54,42 @@ fn validate_flags(flags: u32) -> Option<SyscallResult> {
     } else {
         None
     }
+}
+
+fn splice_validate_read_file(file: &Cap<OpenFile>) -> Result<(), i32> {
+    let OpenFileBacking::Rnode { rnode } = file.backing() else {
+        return Err(EINVAL_VALUE);
+    };
+    if !file.flags().read {
+        return Err(EBADF_VALUE);
+    }
+    if rnode.meta().kind() == InodeKind::Directory {
+        return Err(EINVAL_VALUE);
+    }
+    if super::socket::socket_identity_from_file(file).is_ok()
+        || file.socketpair_endpoint().is_some()
+    {
+        return Err(EINVAL_VALUE);
+    }
+    Ok(())
+}
+
+fn splice_validate_write_file(file: &Cap<OpenFile>) -> Result<(), i32> {
+    let OpenFileBacking::Rnode { rnode } = file.backing() else {
+        return Err(EINVAL_VALUE);
+    };
+    if !file.flags().write {
+        return Err(EBADF_VALUE);
+    }
+    if rnode.meta().kind() == InodeKind::Directory {
+        return Err(EINVAL_VALUE);
+    }
+    if super::socket::socket_identity_from_file(file).is_ok()
+        || file.socketpair_endpoint().is_some()
+    {
+        return Err(EINVAL_VALUE);
+    }
+    Ok(())
 }
 
 pub(super) async fn sys_vmsplice<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
@@ -334,6 +370,13 @@ async fn splice_pipe_to_file<'a, P: tx_hal::TimeIf>(
         Some(end) => end,
         None => return SyscallResult::Error(EINVAL_VALUE),
     };
+    let out_file = match resolve_fd(&ctx.process, fd_out as u32) {
+        Some(file) => file,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+    if let Err(errno) = splice_validate_write_file(&out_file) {
+        return SyscallResult::Error(errno);
+    }
     if let Some(result) = try_splice_pipe_gift_to_file(fd_out, off_out_ptr, &in_pipe, len, ctx) {
         return result;
     }
@@ -530,6 +573,13 @@ async fn splice_file_to_pipe<'a, P: tx_hal::TimeIf>(
     if let Some(result) = try_splice_file_lease_to_pipe(fd_in, off_in_ptr, fd_out, len, ctx) {
         return result;
     }
+    let in_file = match resolve_fd(&ctx.process, fd_in as u32) {
+        Some(file) => file,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+    if let Err(errno) = splice_validate_read_file(&in_file) {
+        return SyscallResult::Error(errno);
+    }
     let mut buf = alloc::vec::Vec::new();
     buf.resize(len, 0);
     let saved = if off_in_ptr != 0 {
@@ -668,14 +718,18 @@ async fn read_file_to_kernel<'a, P: tx_hal::TimeIf>(
         Some(file) => file,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
-    if let OpenFileBacking::Rnode { rnode } = file.backing() {
-        if let RNodeBacking::PageBacked { pc } = rnode.backing() {
-            let outcome = {
-                let guard = step_engine::guard();
-                tx_subsystems::page_backed::step_read_to_kernel(pc, &file, buf, &guard)
-            };
-            return splice_outcome_to_result(outcome);
-        }
+    let OpenFileBacking::Rnode { rnode } = file.backing() else {
+        return SyscallResult::Error(EINVAL_VALUE);
+    };
+    if let Err(errno) = splice_validate_read_file(&file) {
+        return SyscallResult::Error(errno);
+    }
+    if let RNodeBacking::PageBacked { pc } = rnode.backing() {
+        let outcome = {
+            let guard = step_engine::guard();
+            tx_subsystems::page_backed::step_read_to_kernel(pc, &file, buf, &guard)
+        };
+        return splice_outcome_to_result(outcome);
     }
     sys_read::<P>(
         [
@@ -696,14 +750,18 @@ async fn write_file_from_kernel<'a>(fd: i32, buf: &[u8], ctx: &SyscallCtx<'a>) -
         Some(file) => file,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
-    if let OpenFileBacking::Rnode { rnode } = file.backing() {
-        if let RNodeBacking::PageBacked { pc } = rnode.backing() {
-            let outcome = {
-                let guard = step_engine::guard();
-                tx_subsystems::page_backed::step_write_from_kernel(pc, &file, buf, &guard)
-            };
-            return splice_outcome_to_result(outcome);
-        }
+    let OpenFileBacking::Rnode { rnode } = file.backing() else {
+        return SyscallResult::Error(EINVAL_VALUE);
+    };
+    if let Err(errno) = splice_validate_write_file(&file) {
+        return SyscallResult::Error(errno);
+    }
+    if let RNodeBacking::PageBacked { pc } = rnode.backing() {
+        let outcome = {
+            let guard = step_engine::guard();
+            tx_subsystems::page_backed::step_write_from_kernel(pc, &file, buf, &guard)
+        };
+        return splice_outcome_to_result(outcome);
     }
     sys_write(
         [fd as u64, buf.as_ptr() as u64, buf.len() as u64, 0, 0, 0],

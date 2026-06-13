@@ -22,13 +22,53 @@ Runs are split into explicit 5-case groups with `make oscomp-local-rv64-ltp-musl
 - EINVAL observed: 1 recorded case(s); see per-case notes below.
 - `getrlimit(2)` old generic ABI now mirrors `prlimit64(pid=0, old_rlim)`; `getrlimit03` passes all 16 resource comparisons on RV/LA.
 
+## 2026-06-04 priority/prctl focused rerun
+
+Focused RV/LA musl reruns were made without `LTP_MAX_RUNTIME`; the earlier
+`-I 25` runs are not used for scoring because `-I` makes LTP loop for the
+given interval and inflates `Summary: passed`.
+
+Logs:
+
+- `target/oscomp/ltp-sched-prctl-a-rv-musl-noI-20260604.txt`
+- `target/oscomp/ltp-sched-prctl-a-la-musl-noI-20260603.txt`
+
+Correct no-`-I` result on both RV and LA: `41/51`.
+
+Stable full-pass submit candidates from this slice: `getpriority01`,
+`getpriority02`, `nice01`, `nice02`, `nice03`, `nice04`, `prctl01`,
+and `prctl09` (`22/22` per arch/libc lane when counted only as full-pass
+rows). `prctl02` (`10/18`) and `prctl08` (`9/11`, case return nonzero) are
+recorded as partial only and should not be promoted under the full-pass-only
+rule.
+
+## 2026-06-04 sched priority focused rerun
+
+Focused RV/LA musl reruns were made without `LTP_MAX_RUNTIME`.
+
+Logs:
+
+- `target/oscomp/ltp-sched-extra-a-rv-musl-noI-20260604.txt`
+- `target/oscomp/ltp-sched-extra-a-la-musl-noI-20260604.txt`
+- `target/oscomp/ltp-sched-extra-b-rv-musl-noI-20260604.txt`
+- `target/oscomp/ltp-sched-extra-b-la-musl-noI-20260604.txt`
+- RV glibc focused candidate run: `target/oscomp/os_serial_out_rv.txt`
+
+Stable full-pass submit candidates from this slice are
+`sched_get_priority_max01`, `sched_get_priority_max02`,
+`sched_get_priority_min01`, `sched_get_priority_min02`,
+`sched_rr_get_interval01`, and `setpriority02` (`29/29` per lane). RV also
+passes several `sched_setparam*` rows, but LA musl reports `TCONF` for libc
+variants and `sched_setscheduler04` fails, so those rows stay out of the
+default submit whitelist.
+
 ## Cases
 
 | Case | Score | Status | Note |
 | --- | ---: | --- | --- |
 | `getcpu01` | 0/1 | skip | TCONF: syscall(168) __NR_getcpu not supported on your arch |
-| `getpriority01` | 0/3 | fail | TFAIL: getpriority(0, 0) failed: ENOSYS (38) |
-| `getpriority02` | 0/4 | fail | TFAIL: getpriority(-1, 0) should fail with EINVAL: ENOSYS (38) |
+| `getpriority01` | 3/3 | pass | RV/LA musl no-`-I` focused rerun passes |
+| `getpriority02` | 4/4 | pass | RV/LA musl no-`-I` focused rerun passes |
 | `getrlimit01` | 16/16 | pass |  |
 | `getrlimit02` | 2/2 | pass | EINVAL observed |
 | `getrlimit03` | 16/16 | pass | old `getrlimit(2)` ABI returns the same rlimit table as `prlimit64`; RV/LA pass |
@@ -41,25 +81,25 @@ Runs are split into explicit 5-case groups with `make oscomp-local-rv64-ltp-musl
 | `ioprio_set02` | 0/1 | skip | TCONF: syscall(30) __NR_ioprio_set not supported on your arch |
 | `ioprio_set03` | 0/1 | skip | TCONF: syscall(30) __NR_ioprio_set not supported on your arch |
 | `membarrier01` | 3/4 | partial | TBROK: Test 3 haven't reported results! |
-| `nice01` | 0/1 | fail | TBROK: getpriority(0, 0) failed: ENOSYS (38) |
-| `nice02` | 0/1 | fail | TFAIL: nice(50) returned -1: ENOSYS (38) |
-| `nice03` | 0/1 | fail | TBROK: getpriority(0, 0) failed: ENOSYS (38) |
-| `nice04` | 0/1 | fail | TFAIL: nice(-10) should fail with EPERM: ENOSYS (38) |
+| `nice01` | 3/3 | pass | RV/LA musl no-`-I` focused rerun passes |
+| `nice02` | 1/1 | pass | RV/LA musl no-`-I` focused rerun passes |
+| `nice03` | 1/1 | pass | RV/LA musl no-`-I` focused rerun passes |
+| `nice04` | 1/1 | pass | RV/LA musl no-`-I` focused rerun passes |
 | `nice05` | 0/2 | fail | TBROK: getpriority(0, 0) failed: ENOSYS (38) |
-| `prctl01` | 0/1 | fail | TFAIL: prctl(PR_SET_PDEATHSIG) failed: ENOSYS (38) |
-| `prctl02` | 0/18 | fail | TFAIL: prctl() failed unexpectedly, expected EINVAL: ENOSYS (38) |
+| `prctl01` | 2/2 | pass | RV/LA musl no-`-I` focused rerun passes |
+| `prctl02` | 10/18 | partial | RV/LA musl no-`-I` focused rerun; partial only, not a full-pass promotion candidate |
 | `prctl03` | 0/1 | fail | TFAIL: prctl(PR_SET_CHILD_SUBREAPER) failed: ENOSYS (38) |
 | `prctl04` | 0/1 | fail | TBROK: current environment doesn't permit PR_GET/SET_SECCOMP: ENOSYS (38) |
 | `prctl05` | 0/2 | fail | TFAIL: prctl(PR_SET_NAME) failed: ENOSYS (38) |
 | `prctl06` | 0/2 | fail | TBROK: Failed to acquire device |
 | `prctl07` | 0/1 | fail | TBROK: current environment doesn't permit PR_CAP_AMBIENT: ENOSYS (38) |
-| `prctl08` | 0/6 | fail | TFAIL: prctl(PR_SET_TIMERSLACK, 0) failed: ENOSYS (38) |
-| `prctl09` | 0/1 | fail | TBROK: prctl set timerslack 200us failed: ENOSYS (38) |
+| `prctl08` | 9/11 | partial | RV/LA musl no-`-I` focused rerun; case returns nonzero, not a full-pass promotion candidate |
+| `prctl09` | 7/7 | pass | RV/LA musl no-`-I` focused rerun passes |
 | `prctl10` | 0/1 | skip | TCONF: This arch 'unknown' is not supported for test! |
-| `sched_get_priority_max01` | 0/1 | skip | TCONF: syscall(125) __NR_sched_get_priority_max not supported on your arch |
-| `sched_get_priority_max02` | 0/1 | skip | TCONF: syscall(125) __NR_sched_get_priority_max not supported on your arch |
-| `sched_get_priority_min01` | 0/1 | skip | TCONF: syscall(126) __NR_sched_get_priority_min not supported on your arch |
-| `sched_get_priority_min02` | 0/1 | skip | TCONF: syscall(126) __NR_sched_get_priority_min not supported on your arch |
+| `sched_get_priority_max01` | 6/6 | pass | RV/LA musl no-`-I` focused rerun passes; RV glibc focused candidate passes |
+| `sched_get_priority_max02` | 1/1 | pass | RV/LA musl no-`-I` focused rerun passes; RV glibc focused candidate passes |
+| `sched_get_priority_min01` | 6/6 | pass | RV/LA musl no-`-I` focused rerun passes; RV glibc focused candidate passes |
+| `sched_get_priority_min02` | 1/1 | pass | RV/LA musl no-`-I` focused rerun passes; RV glibc focused candidate passes |
 | `sched_getaffinity01` | 4/4 | pass | `/proc/sys/kernel/pid_max` projection added; invalid pid now reaches ESRCH path |
 | `sched_getattr01` | 1/1 | pass | deadline attributes are stored per tid by the validation-only `sched_setattr` shim and read back by `sched_getattr` |
 | `sched_getattr02` | 4/4 | pass | single-case run passes ESRCH/EINVAL validation after adding `/proc/sys/kernel/pid_max` and minimal `sched_getattr` ABI |
@@ -67,7 +107,7 @@ Runs are split into explicit 5-case groups with `make oscomp-local-rv64-ltp-musl
 | `sched_getparam03` | 0/2 | skip | single-case rerun exits cleanly; libc and syscall variants report `sched_getparam` unsupported |
 | `sched_getscheduler01` | 0/2 | skip | single-case rerun exits cleanly; libc and syscall variants report `sched_getscheduler` unsupported |
 | `sched_getscheduler02` | 0/2 | skip | TCONF: `sched_getscheduler` syscall/libc path unsupported after pid_max unblock |
-| `sched_rr_get_interval01` | 0/3 | fail | TFAIL: Test Failed, sched_rr_get_interval() returned -1: ENOSYS (38) |
+| `sched_rr_get_interval01` | 4/4 | pass | RV/LA musl no-`-I` focused rerun passes; RV glibc focused candidate passes |
 | `sched_rr_get_interval02` | 0/2 | fail | TFAIL: sched_rr_get_interval() returned -1, tp.tv_sec = 99, tp.tv_nsec = 99: ENOSYS (38) |
 | `sched_rr_get_interval03` | 0/4 | fail | pid_max unblock exposes real gap: `sched_rr_get_interval` returns ENOSYS instead of EINVAL/ESRCH |
 | `sched_setaffinity01` | 4/4 | pass | added cross-process EPERM check while keeping same-process/thread affinity behavior |
@@ -83,7 +123,7 @@ Runs are split into explicit 5-case groups with `make oscomp-local-rv64-ltp-musl
 | `sched_setscheduler04` | 0/8 | fail | TFAIL: Policy NOT reset to SCHED_NORMAL |
 | `sched_yield01` | 0/1 | fail | TFAIL: sched_yield01.c:72: call failed - errno 38 : Function not implemented |
 | `setpriority01` | 0/1 | fail | TBROK: getpwnam(ltp_setpriority01) failed: ENOENT (2) |
-| `setpriority02` | 0/7 | fail | TFAIL: setpriority(-1, 0, -2) should fail with EINVAL: ENOSYS (38) |
+| `setpriority02` | 7/7 | pass | RV/LA musl no-`-I` focused rerun passes; RV glibc focused candidate passes |
 | `setrlimit01` | 2/4 | partial | TFAIL: setrlimit01.c:183: setrlimit failed, expected 10 got 26 |
 | `setrlimit02` | 1/2 | partial | TFAIL: call succeeded unexpectedly |
 | `setrlimit03` | 1/2 | partial | TFAIL: call succeeded unexpectedly (nr_open=1048576 rlim_cur=1024 rlim_max=1048577) |

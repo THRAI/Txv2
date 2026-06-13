@@ -336,11 +336,7 @@ fn ext4_materialise_new_regular_file_has_iozone_growth_capacity() {
     let mount = test_mount_payload(&fs);
     fs.bind_mount_payload(&mount);
     let rnode = match <Ext4FsInstance<MemImage> as FsOps>::materialise_rnode(
-        &*fs,
-        file_id,
-        meta,
-        &mount,
-        &guard,
+        &*fs, file_id, meta, &mount, &guard,
     ) {
         V3::Done(rnode) => rnode,
         other => panic!("materialise_rnode should succeed: {other:?}"),

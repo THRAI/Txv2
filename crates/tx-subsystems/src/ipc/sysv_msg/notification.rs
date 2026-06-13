@@ -6,7 +6,7 @@
 
 pub(crate) use readiness::{
     abort_removed, new_wait_channels, notify_message_available, notify_space_available,
-    wait_for_message, wait_for_send_space,
+    release_wait_channels, wait_for_message, wait_for_send_space,
 };
 
 use tx_platform_adapter::notification_adapter;
@@ -45,6 +45,13 @@ mod readiness {
             send_source,
             recv_source,
         )
+    }
+
+    pub(crate) fn release_wait_channels(send_source_id: u64, recv_source_id: u64) {
+        crate::wait_source::release_wait_channel(send_source_id);
+        crate::wait_source::release_wait_channel(recv_source_id);
+        wait_routing::unregister_source(send_source_id);
+        wait_routing::unregister_source(recv_source_id);
     }
 
     pub(crate) fn wait_for_send_space(source_id: u64) -> StepOutcome<usize, ByteProgress> {

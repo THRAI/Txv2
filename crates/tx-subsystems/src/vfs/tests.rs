@@ -104,6 +104,58 @@ fn rnode_backing_uses_page_container_cap_without_backend_live_nodes() {
 }
 
 #[test]
+fn cached_removed_directory_subtree_does_not_retain_parent_cycle() {
+    let _g = setup_process_world();
+
+    let root_rnode = RNode::new_cap(
+        FsObjectId::new(100),
+        InodeMeta::new(InodeKind::Directory, 0o040755),
+        RNodeBacking::Directory,
+    )
+    .expect("root rnode");
+    let root = DEntry::new_cap(InlineName::ROOT, root_rnode).expect("root dentry");
+
+    let child_rnode = RNode::new_cap(
+        FsObjectId::new(101),
+        InodeMeta::new(InodeKind::Directory, 0o040755),
+        RNodeBacking::Directory,
+    )
+    .expect("child rnode");
+    let mut child_raw = DEntry::new(InlineName::new(b"child").unwrap(), child_rnode);
+    child_raw.set_parent_hint(&root);
+    let child = sign_for(
+        reserve_for::<DEntry>().expect("child dentry reservation"),
+        child_raw,
+    );
+    root.cache_child(child.clone());
+
+    let grand_rnode = RNode::new_cap(
+        FsObjectId::new(102),
+        InodeMeta::new(InodeKind::Directory, 0o040755),
+        RNodeBacking::Directory,
+    )
+    .expect("grandchild rnode");
+    let mut grand_raw = DEntry::new(InlineName::new(b"grand").unwrap(), grand_rnode);
+    grand_raw.set_parent_hint(&child);
+    let grand = sign_for(
+        reserve_for::<DEntry>().expect("grandchild dentry reservation"),
+        grand_raw,
+    );
+    child.cache_child(grand.clone());
+
+    let weak_child = child.downgrade();
+    let weak_grand = grand.downgrade();
+    root.remove_cached_child(InlineName::new(b"child").unwrap());
+    drop(grand);
+    drop(child);
+    tx_test_support::drain_to_quiescence();
+
+    let guard = guard();
+    assert!(weak_child.upgrade(&guard).is_none());
+    assert!(weak_grand.upgrade(&guard).is_none());
+}
+
+#[test]
 fn rnode_backing_carries_tty_identity_payload() {
     let _g = setup_process_world();
     init_tty_zones();

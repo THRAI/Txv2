@@ -13,8 +13,8 @@ use crate::ipc::sysv_shm::structure::{self, IpcPerm, ShmAttach};
 use crate::process::adapter::step_engine::Cap;
 use crate::process::nsproxy::SysvKey;
 use crate::vm::{
-    AddressSpace, MapPlacement, Prot, USER_PAGE_SIZE, UserRange, UserVirtAddr, VmBacking,
-    VmEntryFlags, VmMapError, VmMapRequest,
+    AddressSpace, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntryFlags, VmMapError,
+    VmMapRequest, USER_PAGE_SIZE,
 };
 
 // ---------------------------------------------------------------------------

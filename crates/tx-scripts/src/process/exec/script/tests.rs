@@ -573,6 +573,7 @@ fn exec_script_collapses_sibling_threads_before_aspace_swap() {
             status: 0,
             fp: tx_hal::UserFpContext::empty(),
         },
+        tx_subsystems::signal::SignalMask::EMPTY,
         0,
         0,
         0,

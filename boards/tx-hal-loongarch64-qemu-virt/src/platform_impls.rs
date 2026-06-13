@@ -42,6 +42,10 @@ fn enable_uart_rx_irq() {
 #[cfg(all(not(target_arch = "loongarch64"), test))]
 static LA64_HOST_UART_IER: AtomicU8 = AtomicU8::new(0);
 
+#[cfg(target_arch = "loongarch64")]
+static LA64_USER_ENTRY_PROBE_COUNT: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
 #[cfg(all(not(target_arch = "loongarch64"), test))]
 pub(crate) fn la64_reset_host_uart_ier_for_test() {
     LA64_HOST_UART_IER.store(0, Ordering::Release);
@@ -179,7 +183,11 @@ impl PmapIf for Platform {
     }
 
     fn extend_direct_map(phys_end: PhysAddr) -> Result<(), PmapError> {
-        if phys_end.0 <= QEMU_LA64_RAM_END {
+        // The cached DMW window statically covers the whole physical address
+        // space, so no page-table work is needed to reach any RAM the firmware
+        // reports — including high RAM above the MMIO hole. Succeed for anything
+        // inside the DMW-mapped limit.
+        if phys_end.0 <= QEMU_LA64_RAM_BASE.saturating_add(QEMU_LA64_DIRECT_MAP_SIZE) {
             Ok(())
         } else {
             Err(PmapError::Unsupported)
@@ -316,6 +324,7 @@ impl TrapIf for Platform {
             }
             let resume_ctx = la64_kernel_resume_ctx_ptr_for_cpu(cpu);
             let stack_top = la64_trap_stack_top_for_cpu(cpu);
+            trace_la64_user_entry_probe(cpu, ctx, &*frame, &pmap_switch, stack_top);
             tx_la64_qemu_activate_enter_userspace(
                 resume_ctx,
                 frame,
@@ -339,6 +348,61 @@ impl TrapIf for Platform {
             return_to_userspace(&frame)
         }
     }
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn trace_la64_user_entry_probe(
+    cpu: CpuId,
+    ctx: &UserTrapContext,
+    frame: &La64TrapFrame,
+    pmap_switch: &La64PmapSwitch,
+    stack_top: usize,
+) {
+    let pc_is_user = (ctx.pc < LA64_USER_TOP) as usize;
+    let frame_pc_is_user = (frame.era < LA64_USER_TOP) as usize;
+    let probe_index =
+        LA64_USER_ENTRY_PROBE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+
+    if probe_index >= 8 && pc_is_user != 0 && frame_pc_is_user != 0 {
+        return;
+    }
+
+    console_write_literal(b"txkernel:qemu-loongarch64-virt:probe:user-entry");
+    console_write_literal(b":idx=0x");
+    console_write_hex(probe_index);
+    console_write_literal(b":cpu=0x");
+    console_write_hex(cpu.0);
+    console_write_literal(b":ctx_pc=0x");
+    console_write_hex(ctx.pc);
+    console_write_literal(b":ctx_sp=0x");
+    console_write_hex(ctx.regs[LA64_R_SP]);
+    console_write_literal(b":ctx_ra=0x");
+    console_write_hex(ctx.regs[LA64_R_RA]);
+    console_write_literal(b":ctx_prmd=0x");
+    console_write_hex(ctx.status);
+    console_write_literal(b":ctx_user=0x");
+    console_write_hex(pc_is_user);
+    console_write_literal(b":frame_pc=0x");
+    console_write_hex(frame.era);
+    console_write_literal(b":frame_sp=0x");
+    console_write_hex(frame.r[LA64_R_SP]);
+    console_write_literal(b":frame_ra=0x");
+    console_write_hex(frame.r[LA64_R_RA]);
+    console_write_literal(b":frame_prmd=0x");
+    console_write_hex(frame.prmd);
+    console_write_literal(b":frame_user=0x");
+    console_write_hex(frame_pc_is_user);
+    console_write_literal(b":asid=0x");
+    console_write_hex(pmap_switch.asid);
+    console_write_literal(b":pgdl=0x");
+    console_write_hex(pmap_switch.pgdl);
+    console_write_literal(b":pgdh=0x");
+    console_write_hex(pmap_switch.pgdh);
+    console_write_literal(b":switch=0x");
+    console_write_hex(pmap_switch.switch_required as usize);
+    console_write_literal(b":trap_stack=0x");
+    console_write_hex(stack_top);
+    console_write_literal(b"\n");
 }
 impl SignalFrameIf for Platform {
     fn write_signal_frame(
@@ -559,7 +623,10 @@ impl TimeIf for Platform {
         let delta = round_up_to_tcfg_ticks(delta);
 
         write_la64_csr(LA64_CSR_TICLR, LA64_TICLR_CLEAR_TIMER);
-        write_la64_csr(LA64_CSR_TCFG, delta as usize | LA64_TCFG_ENABLE);
+        write_la64_csr(
+            LA64_CSR_TCFG,
+            delta as usize | LA64_TCFG_ENABLE | LA64_TCFG_PERIODIC,
+        );
     }
 
     fn cancel_deadline() {

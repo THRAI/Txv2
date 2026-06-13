@@ -44,14 +44,14 @@ use alloc::sync::Arc;
 pub mod adapter;
 
 use adapter::step_engine::{
-    self as step_engine, Cap, NoProgress, PayloadCap, SpinMutex, StepOutcome, Weak, ZeroPolicy,
-    page_allocator,
+    self as step_engine, page_allocator, Cap, NoProgress, PayloadCap, SpinMutex, StepOutcome, Weak,
+    ZeroPolicy,
 };
 
 use tx_subsystems::device::{self, BlockDeviceHandle, DevT};
 use tx_subsystems::execution::{Errno, Guard};
 use tx_subsystems::mount::{MountPayload, MountPayloadPin};
-use tx_subsystems::page_backed::{Frame, FsPageBacking, PageContainer};
+use tx_subsystems::page_backed::{reserve_frame_with_reclaim, Frame, FsPageBacking, PageContainer};
 use tx_subsystems::vfs::{
     Credential, DirCursor, DirEntry, FsObjectId, FsOps, InodeKind, InodeMeta, RNode, RNodeBacking,
     S_IFBLK, S_IFDIR,
@@ -1216,7 +1216,7 @@ fn allocate_owned_page() -> Option<
         tx_substrate::page_allocator::BitmapPageAllocator<'static>,
     >,
 > {
-    page_allocator::reserve_frame(ZeroPolicy::Zeroed)
+    reserve_frame_with_reclaim(ZeroPolicy::Zeroed)
         .ok()
         .map(|r| r.commit())
 }
@@ -1226,7 +1226,7 @@ mod tests {
     use super::*;
     use tx_subsystems::device::{BlockDevice, BlockDeviceOps, PhysicalBlockNumber};
     use tx_subsystems::mount::{DevId, MountOptions, SourceLabel};
-    use tx_subsystems::page_backed::{PageContainerKind, read_exact_at};
+    use tx_subsystems::page_backed::{read_exact_at, PageContainerKind};
 
     struct PatternBlockDevice;
 

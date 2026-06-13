@@ -15,7 +15,7 @@ use tx_platform_adapter::platform_adapter;
 )]
 pub mod step_engine {
     pub(crate) use crate::sync::SpinMutex;
-    pub use tx_substrate::epoch::{guard, Guard};
+    pub use tx_substrate::epoch::{borrow_current_guard, guard, Guard};
     pub use tx_substrate::step::{
         drive_oneshot, ByteProgress, Errno as V3Errno, InterestMask, NoProgress, OneShotStepOp,
         ProcessIdentity, ScriptCtx, StepOp, StepOutcome, StepProgress, SubjectIdentity,
@@ -72,6 +72,10 @@ pub mod wait_routing {
         let source = tx_substrate::wake::new_source(source_id);
         tx_substrate::wake::register_source(Arc::clone(&source));
         source
+    }
+
+    pub fn unregister_source(source_id: u64) {
+        tx_substrate::wake::unregister_source(tx_substrate::step::WaitSourceId::new(source_id));
     }
 
     pub fn fire_legacy_channel(channel: &Channel, mask_bits: u64) -> usize {

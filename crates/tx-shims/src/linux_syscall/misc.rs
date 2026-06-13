@@ -4,6 +4,27 @@
 //! either in this submodule or in the shared parent (`super::*`).
 
 use super::*;
+use crate::adapter::step_engine::SpinMutex;
+
+static UTS_NODENAME: SpinMutex<[u8; UTSNAME_FIELD]> = SpinMutex::new(default_nodename());
+
+#[cfg(test)]
+pub(crate) fn reset_uts_nodename_for_test() {
+    *UTS_NODENAME.lock() = default_nodename();
+}
+
+const fn default_nodename() -> [u8; UTSNAME_FIELD] {
+    let mut out = [0u8; UTSNAME_FIELD];
+    out[0] = b't';
+    out[1] = b'x';
+    out[2] = b'k';
+    out[3] = b'e';
+    out[4] = b'r';
+    out[5] = b'n';
+    out[6] = b'e';
+    out[7] = b'l';
+    out
+}
 
 /// Private txKernel debug syscall: enable and start a bounded observe trace.
 pub(super) fn sys_tx_observe_begin(args: [u64; 6]) -> SyscallResult {
@@ -51,7 +72,12 @@ pub(super) fn sys_tx_observe_trace_off() -> SyscallResult {
 pub(super) fn sys_getrandom<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
     let buf_uaddr = args[0];
     let buf_len = args[1] as usize;
-    let _flags = args[2] as u32; // GRND_* recognised but ignored.
+    let flags = args[2] as u32;
+    let supported_flags = GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE;
+
+    if flags & !supported_flags != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
 
     if buf_len == 0 {
         return SyscallResult::Return(0);
@@ -68,6 +94,28 @@ pub(super) fn sys_getrandom<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
         return SyscallResult::error_from(errno);
     }
     SyscallResult::Return(buf_len as i64)
+}
+
+/// `sethostname(name, len)` — Linux generic ABI `__NR_sethostname = 161`.
+pub(super) fn sys_sethostname<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+    let name_uaddr = args[0];
+    let len = args[1] as usize;
+
+    if len > UTSNAME_FIELD - 1 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if len != 0 && name_uaddr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+
+    let mut next = [0u8; UTSNAME_FIELD];
+    if len != 0 {
+        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut next[..len], name_uaddr) {
+            return SyscallResult::error_from(errno);
+        }
+    }
+    *UTS_NODENAME.lock() = next;
+    SyscallResult::Return(0)
 }
 
 /// `uname(buf)` — Linux generic ABI `__NR_uname = 160`.
@@ -123,16 +171,27 @@ pub(super) fn sys_prlimit64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
         return SyscallResult::Error(EPERM_VALUE);
     }
 
-    if resource == RLIMIT_NOFILE && new_uaddr != 0 {
+    if matches!(resource, RLIMIT_NOFILE | RLIMIT_MEMLOCK) && new_uaddr != 0 {
         let new_limit = match bootstrap_read_user::<RlimitLayout>(&ctx.aspace, new_uaddr) {
             Ok(limit) => limit,
             Err(errno) => return SyscallResult::error_from(errno),
         };
-        if new_limit.rlim_cur > new_limit.rlim_max || new_limit.rlim_max > u32::MAX as u64 {
+        if new_limit.rlim_cur > new_limit.rlim_max {
             return SyscallResult::Error(EINVAL_VALUE);
         }
-        ctx.process
-            .set_rlimit_nofile(new_limit.rlim_cur as u32, new_limit.rlim_max as u32);
+        match resource {
+            RLIMIT_NOFILE => {
+                if new_limit.rlim_max > u32::MAX as u64 {
+                    return SyscallResult::Error(EINVAL_VALUE);
+                }
+                ctx.process
+                    .set_rlimit_nofile(new_limit.rlim_cur as u32, new_limit.rlim_max as u32);
+            }
+            RLIMIT_MEMLOCK => ctx
+                .process
+                .set_rlimit_memlock(new_limit.rlim_cur, new_limit.rlim_max),
+            _ => {}
+        }
     }
 
     let limit = match resource {
@@ -151,9 +210,16 @@ pub(super) fn sys_prlimit64<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscall
             rlim_cur: 0,
             rlim_max: RLIM_INFINITY,
         },
-        RLIMIT_CPU | RLIMIT_FSIZE | RLIMIT_DATA | RLIMIT_RSS | RLIMIT_NPROC | RLIMIT_MEMLOCK
-        | RLIMIT_AS | RLIMIT_LOCKS | RLIMIT_SIGPENDING | RLIMIT_MSGQUEUE | RLIMIT_NICE
-        | RLIMIT_RTPRIO | RLIMIT_RTTIME => RlimitLayout {
+        RLIMIT_MEMLOCK => {
+            let (cur, max) = ctx.process.rlimit_memlock();
+            RlimitLayout {
+                rlim_cur: cur,
+                rlim_max: max,
+            }
+        }
+        RLIMIT_CPU | RLIMIT_FSIZE | RLIMIT_DATA | RLIMIT_RSS | RLIMIT_NPROC | RLIMIT_AS
+        | RLIMIT_LOCKS | RLIMIT_SIGPENDING | RLIMIT_MSGQUEUE | RLIMIT_NICE | RLIMIT_RTPRIO
+        | RLIMIT_RTTIME => RlimitLayout {
             rlim_cur: RLIM_INFINITY,
             rlim_max: RLIM_INFINITY,
         },
@@ -198,9 +264,10 @@ pub(super) fn build_utsname_for_machine(machine: &str) -> UtsnameLayout {
         head.copy_from_slice(&bytes[..n]);
         out
     }
+    let nodename = *UTS_NODENAME.lock();
     UtsnameLayout {
         sysname: pad("Linux"),
-        nodename: pad("txkernel"),
+        nodename,
         // Linux 6.1.0 is the LTS line musl 1.2.x runtime probes treat
         // as fully featured.
         release: pad("6.1.0-txkernel"),

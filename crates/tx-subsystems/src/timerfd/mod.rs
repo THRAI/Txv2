@@ -12,12 +12,14 @@ use core::sync::atomic::{AtomicU64, Ordering};
 pub mod adapter;
 pub mod notification;
 
+use crate::wait_source;
 use adapter::step_engine::V3Errno;
 use adapter::step_engine::{
-    eagain, guard, sign, ByteOutcome, Cap, NoProgress, OneShotStepOp, ScriptCtx, SpinMutex, StepOp,
-    StepOutcome, SubjectIdentity, WaitSource, Weak, Zone, ZoneAllocated, ZoneError,
+    borrow_current_guard, eagain, guard, sign, ByteOutcome, Cap, NoProgress, OneShotStepOp,
+    ScriptCtx, SpinMutex, StepOp, StepOutcome, SubjectIdentity, WaitSource, Weak, Zone,
+    ZoneAllocated, ZoneError,
 };
-use adapter::wait_routing::Channel;
+use adapter::wait_routing::{self, Channel};
 
 pub const TFD_CLOEXEC: u32 = 0o2000000;
 pub const TFD_NONBLOCK: u32 = 0o4000;
@@ -241,6 +243,14 @@ impl TimerFd {
     }
 }
 
+impl Drop for TimerFd {
+    fn drop(&mut self) {
+        wait_source::release_wait_channel(self.source_id);
+        wait_routing::unregister_source(self.source_id);
+        unregister_wallclock_timerfd(self.timerfd_id);
+    }
+}
+
 static TIMERFD_ZONE: Zone<TimerFd> = Zone::const_new();
 static NEXT_TIMERFD_ID: AtomicU64 = AtomicU64::new(1);
 static WALLCLOCK_TIMERFDS: SpinMutex<Vec<Weak<TimerFd>>> = SpinMutex::new(Vec::new());
@@ -335,7 +345,7 @@ pub fn timerfd_clock_was_set(generation: u64) -> usize {
     if snapshot.is_empty() {
         return 0;
     }
-    let guard = guard();
+    let guard = borrow_current_guard().unwrap_or_else(guard);
     let mut canceled = 0usize;
     for weak in &snapshot {
         let Some(cap) = weak.upgrade(&guard) else {
@@ -395,12 +405,6 @@ impl<I: SubjectIdentity> StepOp<I> for TimerfdCreateOp {
 }
 impl<I: SubjectIdentity> OneShotStepOp<I> for TimerfdCreateOp {}
 
-impl Drop for TimerFd {
-    fn drop(&mut self) {
-        unregister_wallclock_timerfd(self.timerfd_id);
-    }
-}
-
 fn allocate_timerfd_id() -> u64 {
     NEXT_TIMERFD_ID.fetch_add(1, Ordering::Relaxed)
 }
@@ -411,7 +415,7 @@ fn register_wallclock_timerfd(weak: Weak<TimerFd>) {
 
 fn unregister_wallclock_timerfd(timerfd_id: u64) {
     let mut list = WALLCLOCK_TIMERFDS.lock();
-    let guard = guard();
+    let guard = borrow_current_guard().unwrap_or_else(guard);
     list.retain(|weak| match weak.upgrade(&guard) {
         Some(cap) => cap.timerfd_id() != timerfd_id,
         None => false,

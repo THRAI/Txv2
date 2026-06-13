@@ -13,12 +13,13 @@ use core::sync::atomic::{AtomicU64, Ordering};
 pub mod adapter;
 pub mod notification;
 
+use crate::wait_source;
 use adapter::step_engine::{
     eagain, eagain_no_progress, sign, ByteOutcome, ByteProgress, Cap, NoProgress, OneShotStepOp,
     ScriptCtx, StepOp, StepOutcome, SubjectIdentity, V3Errno, WaitSource, Zone, ZoneAllocated,
     ZoneError,
 };
-use adapter::wait_routing::Channel;
+use adapter::wait_routing::{self, Channel};
 
 pub const EFD_CLOEXEC: u32 = 0o2000000;
 pub const EFD_NONBLOCK: u32 = 0o4000;
@@ -87,6 +88,15 @@ impl EventFd {
     #[allow(dead_code)] // txdoc:vfs-full-bringup-scaffold
     fn is_nonblocking(&self) -> bool {
         (self.flags() & EFD_NONBLOCK) != 0
+    }
+}
+
+impl Drop for EventFd {
+    fn drop(&mut self) {
+        wait_source::release_wait_channel(self.reader_source_id);
+        wait_source::release_wait_channel(self.writer_source_id);
+        wait_routing::unregister_source(self.reader_source_id);
+        wait_routing::unregister_source(self.writer_source_id);
     }
 }
 

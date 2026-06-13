@@ -13,6 +13,16 @@ const CONNECTION_SLOTS: usize = 256;
 const RAW_ICMP_SLOTS: usize = 128;
 const UNIX_PATH_NODE_SLOTS: usize = 256;
 const UNIX_BOUND_SLOTS: usize = 256;
+// hackbench (cyclictest's stress phase) creates hundreds of AF_UNIX
+// socketpairs concurrently; each pair inserts two peer entries. main bumped
+// this to 4096 to clear an `insert_unix_peer` ENOMEM ("Creating fdpair
+// (error: Out of memory)"). But each net namespace owns a whole `SocketTable`
+// and the per-namespace table is currently `Box::leak`-ed (never freed), so a
+// 4096-slot index makes every namespace leak ~500KB; a handful of LTP net
+// tests (each in its own netns) then exhaust the kernel heap
+// ("memory allocation of N bytes failed"). Until the namespace teardown frees
+// its `SocketTable`, keep the feature-tested 256 (the leak stays at ~30KB/ns).
+// Re-raising this requires fixing the per-namespace `SocketTable` leak first.
 const UNIX_STREAM_PEER_SLOTS: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

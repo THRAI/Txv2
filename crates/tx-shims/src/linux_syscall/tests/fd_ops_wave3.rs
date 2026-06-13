@@ -358,10 +358,7 @@ fn dispatch_socketpair_blocking_write_parks_until_peer_read() {
         block_on(dispatch::<ShimsTestPmap>(read_req, &ctx)),
         SyscallResult::Return(read_buf.len() as i64)
     );
-    assert_eq!(
-        block_on(write),
-        SyscallResult::Return(extra.len() as i64)
-    );
+    assert_eq!(block_on(write), SyscallResult::Return(extra.len() as i64));
 }
 
 #[test]

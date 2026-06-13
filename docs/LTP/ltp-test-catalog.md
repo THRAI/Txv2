@@ -1,0 +1,428 @@
+# LTP syscalls 全部用例分类目录树（2026-06-07）
+
+全集 **1411** 个用例，白名单已收录 **626** 个（标注 ✓=该家族有用例入白名单）。
+
+> 白名单只收"能得分"的;未入的多为内核未实现/特权/会 hang 的功能。
+
+
+## 文件读写/描述符  (303 用例, 158 入白名单)
+- ✓ **close** (2/2): close01 close02
+- ✓ **close_range** (1/2): close_range01 close_range02
+- ✓ **copy_file_range** (1/3): copy_file_range01 copy_file_range02 copy_file_range03
+- ✓ **creat** (5/8): creat01 creat03 creat04 creat05 creat06 creat07 creat08 creat09
+- ✓ **dup** (14/14): dup01 dup02 dup03 dup04 dup05 dup06 dup07 dup201 dup202 dup203 dup204 dup205 dup206 dup207
+- ✓ **dup3_** (2/2): dup3_01 dup3_02
+- ✓ **fallocate** (1/6): fallocate01 fallocate02 fallocate03 fallocate04 fallocate05 fallocate06
+- ✓ **fcntl** (22/74): fcntl01 fcntl01_64 fcntl02 fcntl02_64 fcntl03 fcntl03_64 fcntl04 fcntl04_64 fcntl05 fcntl05_64 fcntl07 fcntl07_64 fcntl08 fcntl08_64 fcntl09 fcntl09_64 fcntl10 fcntl10_64 fcntl11 fcntl11_64 fcntl12 fcntl12_64 fcntl13 fcntl13_64 fcntl14 fcntl14_64 fcntl15 fcntl15_64 fcntl16 fcntl16_64 fcntl17 fcntl17_64 fcntl18 fcntl18_64 fcntl19 fcntl19_64 fcntl20 fcntl20_64 fcntl21 fcntl21_64 fcntl22 fcntl22_64 fcntl23 fcntl23_64 fcntl24 fcntl24_64 fcntl25 fcntl25_64 fcntl26 fcntl26_64 fcntl27 fcntl27_64 fcntl29 fcntl29_64 fcntl30 fcntl30_64 fcntl31 fcntl31_64 fcntl32 fcntl32_64 fcntl33 fcntl33_64 fcntl34 fcntl34_64 fcntl35 fcntl35_64 fcntl36 fcntl36_64 fcntl37 fcntl37_64 fcntl38 fcntl38_64 fcntl39 fcntl39_64
+- · **fdatasync** (0/3): fdatasync01 fdatasync02 fdatasync03
+- ✓ **flock** (5/5): flock01 flock02 flock03 flock04 flock06
+- ✓ **fsync** (2/4): fsync01 fsync02 fsync03 fsync04
+- ✓ **ftruncate** (4/6): ftruncate01 ftruncate01_64 ftruncate03 ftruncate03_64 ftruncate04 ftruncate04_64
+- · **ioctl** (0/9): ioctl01 ioctl02 ioctl03 ioctl04 ioctl05 ioctl06 ioctl07 ioctl08 ioctl09
+- · **ioctl_loop** (0/7): ioctl_loop01 ioctl_loop02 ioctl_loop03 ioctl_loop04 ioctl_loop05 ioctl_loop06 ioctl_loop07
+- ✓ **ioctl_ns** (1/7): ioctl_ns01 ioctl_ns02 ioctl_ns03 ioctl_ns04 ioctl_ns05 ioctl_ns06 ioctl_ns07
+- · **ioctl_sg** (0/1): ioctl_sg01
+- ✓ **llseek** (3/3): llseek01 llseek02 llseek03
+- ✓ **lseek** (3/4): lseek01 lseek02 lseek07 lseek11
+- ✓ **open** (9/14): open01 open01A open02 open03 open04 open06 open07 open08 open09 open10 open11 open12 open13 open14
+- ✓ **open_by_handle_at** (2/2): open_by_handle_at01 open_by_handle_at02
+- · **open_tree** (0/2): open_tree01 open_tree02
+- · **openat** (0/7): openat01 openat02 openat03 openat04 openat201 openat202 openat203
+- ✓ **pipe** (10/15): pipe01 pipe02 pipe03 pipe04 pipe05 pipe06 pipe07 pipe08 pipe09 pipe10 pipe11 pipe12 pipe13 pipe14 pipe15
+- ✓ **pipe2_** (3/3): pipe2_01 pipe2_02 pipe2_04
+- ✓ **pread** (4/4): pread01 pread01_64 pread02 pread02_64
+- ✓ **preadv** (8/12): preadv01 preadv01_64 preadv02 preadv02_64 preadv03 preadv03_64 preadv201 preadv201_64 preadv202 preadv202_64 preadv203 preadv203_64
+- ✓ **pwrite** (8/8): pwrite01 pwrite01_64 pwrite02 pwrite02_64 pwrite03 pwrite03_64 pwrite04 pwrite04_64
+- ✓ **pwritev** (8/10): pwritev01 pwritev01_64 pwritev02 pwritev02_64 pwritev03 pwritev03_64 pwritev201 pwritev201_64 pwritev202 pwritev202_64
+- ✓ **read** (3/4): read01 read02 read03 read04
+- ✓ **readahead** (1/2): readahead01 readahead02
+- ✓ **readdir** (1/2): readdir01 readdir21
+- ✓ **readlink** (2/3): readlink01 readlink01A readlink03
+- ✓ **readlinkat** (2/2): readlinkat01 readlinkat02
+- ✓ **readv** (2/2): readv01 readv02
+- ✓ **sendfile** (12/16): sendfile02 sendfile02_64 sendfile03 sendfile03_64 sendfile04 sendfile04_64 sendfile05 sendfile05_64 sendfile06 sendfile06_64 sendfile07 sendfile07_64 sendfile08 sendfile08_64 sendfile09 sendfile09_64
+- ✓ **splice** (3/9): splice01 splice02 splice03 splice04 splice05 splice06 splice07 splice08 splice09
+- · **sync** (0/1): sync01
+- ✓ **sync_file_range** (1/2): sync_file_range01 sync_file_range02
+- · **syncfs** (0/1): syncfs01
+- ✓ **tee** (1/2): tee01 tee02
+- ✓ **truncate** (4/4): truncate02 truncate02_64 truncate03 truncate03_64
+- ✓ **vmsplice** (1/4): vmsplice01 vmsplice02 vmsplice03 vmsplice04
+- ✓ **write** (5/6): write01 write02 write03 write04 write05 write06
+- ✓ **writev** (2/6): writev01 writev02 writev03 writev05 writev06 writev07
+
+## 文件元数据/路径  (179 用例, 70 入白名单)
+- ✓ **access** (3/4): access01 access02 access03 access04
+- ✓ **chdir** (1/3): chdir01 chdir01A chdir04
+- ✓ **chmod** (4/6): chmod01 chmod01A chmod03 chmod05 chmod06 chmod07
+- ✓ **chown** (4/10): chown01 chown01_16 chown02 chown02_16 chown03 chown03_16 chown04 chown04_16 chown05 chown05_16
+- · **chroot** (0/4): chroot01 chroot02 chroot03 chroot04
+- ✓ **faccessat** (4/4): faccessat01 faccessat02 faccessat201 faccessat202
+- ✓ **fchdir** (2/3): fchdir01 fchdir02 fchdir03
+- ✓ **fchmod** (5/6): fchmod01 fchmod02 fchmod03 fchmod04 fchmod05 fchmod06
+- ✓ **fchmodat** (2/2): fchmodat01 fchmodat02
+- ✓ **fchown** (4/10): fchown01 fchown01_16 fchown02 fchown02_16 fchown03 fchown03_16 fchown04 fchown04_16 fchown05 fchown05_16
+- · **fchownat** (0/2): fchownat01 fchownat02
+- ✓ **fstat** (4/4): fstat02 fstat02_64 fstat03 fstat03_64
+- · **fstatat** (0/1): fstatat01
+- ✓ **fstatfs** (2/4): fstatfs01 fstatfs01_64 fstatfs02 fstatfs02_64
+- · **futimesat** (0/1): futimesat01
+- ✓ **getcwd** (3/4): getcwd01 getcwd02 getcwd03 getcwd04
+- ✓ **getdents** (1/2): getdents01 getdents02
+- · **lchown** (0/6): lchown01 lchown01_16 lchown02 lchown02_16 lchown03 lchown03_16
+- ✓ **link** (2/5): link01 link02 link04 link05 link08
+- · **linkat** (0/2): linkat01 linkat02
+- ✓ **lstat** (2/5): lstat01 lstat01A lstat01_64 lstat02 lstat02_64
+- · **lstat01A** (0/1): lstat01A_64
+- ✓ **mkdir** (2/5): mkdir02 mkdir03 mkdir04 mkdir05 mkdir09
+- · **mkdirat** (0/2): mkdirat01 mkdirat02
+- ✓ **mknod** (3/9): mknod01 mknod02 mknod03 mknod04 mknod05 mknod06 mknod07 mknod08 mknod09
+- · **mknodat** (0/2): mknodat01 mknodat02
+- ✓ **pathconf** (2/2): pathconf01 pathconf02
+- ✓ **rename** (1/14): rename01 rename01A rename03 rename04 rename05 rename06 rename07 rename08 rename09 rename10 rename11 rename12 rename13 rename14
+- · **renameat** (0/3): renameat01 renameat201 renameat202
+- ✓ **rmdir** (2/4): rmdir01 rmdir02 rmdir03 rmdir03A
+- ✓ **stat** (6/8): stat01 stat01_64 stat02 stat02_64 stat03 stat03_64 stat04 stat04_64
+- ✓ **statfs** (2/6): statfs01 statfs01_64 statfs02 statfs02_64 statfs03 statfs03_64
+- · **statvfs** (0/2): statvfs01 statvfs02
+- ✓ **statx** (2/12): statx01 statx02 statx03 statx04 statx05 statx06 statx07 statx08 statx09 statx10 statx11 statx12
+- ✓ **symlink** (2/4): symlink01 symlink02 symlink03 symlink04
+- · **symlinkat** (0/1): symlinkat01
+- ✓ **umask** (1/1): umask01
+- ✓ **unlink** (3/5): unlink01 unlink05 unlink07 unlink08 unlink09
+- ✓ **unlinkat** (1/1): unlinkat01
+- · **utime** (0/7): utime01 utime02 utime03 utime04 utime05 utime06 utime07
+- · **utimensat** (0/1): utimensat01
+- · **utimes** (0/1): utimes01
+
+## 文件系统  (30 用例, 0 入白名单)
+- · **mount** (0/7): mount01 mount02 mount03 mount04 mount05 mount06 mount07
+- · **mount_setattr** (0/1): mount_setattr01
+- · **pivot_root** (0/1): pivot_root01
+- · **quotactl** (0/9): quotactl01 quotactl02 quotactl03 quotactl04 quotactl05 quotactl06 quotactl07 quotactl08 quotactl09
+- · **swapoff** (0/2): swapoff01 swapoff02
+- · **swapon** (0/3): swapon01 swapon02 swapon03
+- · **umount** (0/3): umount01 umount02 umount03
+- · **umount2_** (0/2): umount2_01 umount2_02
+- · **ustat** (0/2): ustat01 ustat02
+
+## 扩展属性  (20 用例, 0 入白名单)
+- · **fgetxattr** (0/3): fgetxattr01 fgetxattr02 fgetxattr03
+- · **fsetxattr** (0/2): fsetxattr01 fsetxattr02
+- · **getxattr** (0/5): getxattr01 getxattr02 getxattr03 getxattr04 getxattr05
+- · **lgetxattr** (0/2): lgetxattr01 lgetxattr02
+- · **listxattr** (0/3): listxattr01 listxattr02 listxattr03
+- · **removexattr** (0/2): removexattr01 removexattr02
+- · **setxattr** (0/3): setxattr01 setxattr02 setxattr03
+
+## 内存管理  (98 用例, 39 入白名单)
+- ✓ **brk** (2/2): brk01 brk02
+- ✓ **madvise** (4/10): madvise01 madvise02 madvise03 madvise05 madvise06 madvise07 madvise08 madvise09 madvise10 madvise11
+- · **mbind** (0/4): mbind01 mbind02 mbind03 mbind04
+- ✓ **memfd_create** (1/4): memfd_create01 memfd_create02 memfd_create03 memfd_create04
+- · **migrate_pages** (0/3): migrate_pages01 migrate_pages02 migrate_pages03
+- ✓ **mincore** (2/4): mincore01 mincore02 mincore03 mincore04
+- ✓ **mlock** (8/8): mlock01 mlock02 mlock03 mlock04 mlock05 mlock201 mlock202 mlock203
+- · **mlockall** (0/3): mlockall01 mlockall02 mlockall03
+- ✓ **mmap** (9/17): mmap01 mmap02 mmap03 mmap04 mmap05 mmap06 mmap08 mmap09 mmap12 mmap13 mmap14 mmap15 mmap16 mmap17 mmap18 mmap19 mmap20
+- · **move_pages** (0/11): move_pages01 move_pages02 move_pages03 move_pages04 move_pages05 move_pages06 move_pages07 move_pages09 move_pages10 move_pages11 move_pages12
+- ✓ **mprotect** (1/5): mprotect01 mprotect02 mprotect03 mprotect04 mprotect05
+- ✓ **mremap** (1/6): mremap01 mremap02 mremap03 mremap04 mremap05 mremap06
+- · **msync** (0/4): msync01 msync02 msync03 msync04
+- ✓ **munlock** (2/2): munlock01 munlock02
+- ✓ **munlockall** (1/1): munlockall01
+- · **munmap** (0/3): munmap01 munmap02 munmap03
+- ✓ **remap_file_pages** (1/2): remap_file_pages01 remap_file_pages02
+- ✓ **sbrk** (2/3): sbrk01 sbrk02 sbrk03
+- ✓ **shmat** (3/4): shmat01 shmat02 shmat03 shmat04
+- ✓ **shmdt** (2/2): shmdt01 shmdt02
+
+## 进程生命周期  (102 用例, 61 入白名单)
+- · **arch_prctl** (0/1): arch_prctl01
+- ✓ **clone** (8/12): clone01 clone02 clone03 clone04 clone05 clone06 clone07 clone08 clone09 clone301 clone302 clone303
+- ✓ **execl** (1/1): execl01
+- ✓ **execle** (1/1): execle01
+- ✓ **execlp** (1/1): execlp01
+- ✓ **execv** (1/1): execv01
+- ✓ **execve** (5/6): execve01 execve02 execve03 execve04 execve05 execve06
+- · **execveat** (0/3): execveat01 execveat02 execveat03
+- ✓ **execvp** (1/1): execvp01
+- ✓ **exit** (1/2): exit01 exit02
+- · **exit_group** (0/1): exit_group01
+- ✓ **fork** (6/12): fork01 fork03 fork04 fork05 fork06 fork07 fork08 fork09 fork10 fork11 fork13 fork14
+- ✓ **getpgid** (2/2): getpgid01 getpgid02
+- ✓ **getpgrp** (1/1): getpgrp01
+- ✓ **getpid** (2/2): getpid01 getpid02
+- ✓ **getppid** (2/2): getppid01 getppid02
+- ✓ **getpriority** (2/2): getpriority01 getpriority02
+- ✓ **getsid** (2/2): getsid01 getsid02
+- ✓ **gettid** (2/2): gettid01 gettid02
+- ✓ **personality** (2/2): personality01 personality02
+- ✓ **prctl** (6/10): prctl01 prctl02 prctl03 prctl04 prctl05 prctl06 prctl07 prctl08 prctl09 prctl10
+- ✓ **setpgid** (1/3): setpgid01 setpgid02 setpgid03
+- ✓ **setpriority** (1/2): setpriority01 setpriority02
+- · **setsid** (0/1): setsid01
+- · **vfork** (0/2): vfork01 vfork02
+- ✓ **wait** (3/5): wait01 wait02 wait401 wait402 wait403
+- ✓ **waitid** (3/11): waitid01 waitid02 waitid03 waitid04 waitid05 waitid06 waitid07 waitid08 waitid09 waitid10 waitid11
+- ✓ **waitpid** (7/11): waitpid01 waitpid03 waitpid04 waitpid06 waitpid07 waitpid08 waitpid09 waitpid10 waitpid11 waitpid12 waitpid13
+
+## 信号  (47 用例, 14 入白名单)
+- · **abort** (0/1): abort01
+- ✓ **kill** (3/11): kill02 kill03 kill05 kill06 kill07 kill08 kill09 kill10 kill11 kill12 kill13
+- ✓ **pause** (1/3): pause01 pause02 pause03
+- · **rt_sigaction** (0/3): rt_sigaction01 rt_sigaction02 rt_sigaction03
+- · **rt_sigprocmask** (0/2): rt_sigprocmask01 rt_sigprocmask02
+- · **rt_sigqueueinfo** (0/1): rt_sigqueueinfo01
+- ✓ **rt_sigsuspend** (1/1): rt_sigsuspend01
+- · **rt_sigtimedwait** (0/1): rt_sigtimedwait01
+- · **sigaction** (0/2): sigaction01 sigaction02
+- ✓ **sigaltstack** (1/2): sigaltstack01 sigaltstack02
+- ✓ **signal** (5/6): signal01 signal02 signal03 signal04 signal05 signal06
+- · **signalfd** (0/1): signalfd01
+- · **signalfd4_** (0/2): signalfd4_01 signalfd4_02
+- · **sigpending** (0/1): sigpending02
+- · **sigprocmask** (0/1): sigprocmask01
+- · **sigsuspend** (0/1): sigsuspend01
+- · **sigtimedwait** (0/1): sigtimedwait01
+- ✓ **sigwait** (1/1): sigwait01
+- · **sigwaitinfo** (0/1): sigwaitinfo01
+- ✓ **tgkill** (1/3): tgkill01 tgkill02 tgkill03
+- ✓ **tkill** (1/2): tkill01 tkill02
+
+## 时间/定时器  (56 用例, 40 入白名单)
+- · **adjtimex** (0/3): adjtimex01 adjtimex02 adjtimex03
+- ✓ **alarm** (5/5): alarm02 alarm03 alarm05 alarm06 alarm07
+- · **clock_adjtime** (0/2): clock_adjtime01 clock_adjtime02
+- ✓ **clock_getres** (1/1): clock_getres01
+- ✓ **clock_gettime** (1/4): clock_gettime01 clock_gettime02 clock_gettime03 clock_gettime04
+- ✓ **clock_nanosleep** (3/4): clock_nanosleep01 clock_nanosleep02 clock_nanosleep03 clock_nanosleep04
+- ✓ **clock_settime** (2/3): clock_settime01 clock_settime02 clock_settime03
+- ✓ **getitimer** (2/2): getitimer01 getitimer02
+- ✓ **gettimeofday** (2/2): gettimeofday01 gettimeofday02
+- · **leapsec** (0/1): leapsec01
+- ✓ **nanosleep** (3/3): nanosleep01 nanosleep02 nanosleep04
+- ✓ **setitimer** (2/2): setitimer01 setitimer02
+- ✓ **settimeofday** (2/2): settimeofday01 settimeofday02
+- ✓ **stime** (2/2): stime01 stime02
+- ✓ **time** (1/1): time01
+- · **timer_create** (0/3): timer_create01 timer_create02 timer_create03
+- ✓ **timer_delete** (2/2): timer_delete01 timer_delete02
+- ✓ **timer_getoverrun** (1/1): timer_getoverrun01
+- ✓ **timer_gettime** (1/1): timer_gettime01
+- ✓ **timer_settime** (3/3): timer_settime01 timer_settime02 timer_settime03
+- ✓ **timerfd** (2/3): timerfd01 timerfd02 timerfd04
+- ✓ **timerfd_create** (1/1): timerfd_create01
+- ✓ **timerfd_gettime** (1/1): timerfd_gettime01
+- ✓ **timerfd_settime** (1/2): timerfd_settime01 timerfd_settime02
+- ✓ **times** (2/2): times01 times03
+
+## 调度  (32 用例, 26 入白名单)
+- ✓ **getcpu** (1/1): getcpu01
+- ✓ **nice** (4/5): nice01 nice02 nice03 nice04 nice05
+- ✓ **sched_get_priority_max** (2/2): sched_get_priority_max01 sched_get_priority_max02
+- ✓ **sched_get_priority_min** (2/2): sched_get_priority_min01 sched_get_priority_min02
+- ✓ **sched_getaffinity** (1/1): sched_getaffinity01
+- · **sched_getattr** (0/2): sched_getattr01 sched_getattr02
+- ✓ **sched_getparam** (2/2): sched_getparam01 sched_getparam03
+- ✓ **sched_getscheduler** (2/2): sched_getscheduler01 sched_getscheduler02
+- ✓ **sched_rr_get_interval** (3/3): sched_rr_get_interval01 sched_rr_get_interval02 sched_rr_get_interval03
+- ✓ **sched_setaffinity** (1/1): sched_setaffinity01
+- · **sched_setattr** (0/1): sched_setattr01
+- ✓ **sched_setparam** (5/5): sched_setparam01 sched_setparam02 sched_setparam03 sched_setparam04 sched_setparam05
+- ✓ **sched_setscheduler** (3/4): sched_setscheduler01 sched_setscheduler02 sched_setscheduler03 sched_setscheduler04
+- · **sched_yield** (0/1): sched_yield01
+
+## SysV IPC  (53 用例, 30 入白名单)
+- ✓ **msgctl** (6/7): msgctl01 msgctl02 msgctl03 msgctl04 msgctl05 msgctl06 msgctl12
+- ✓ **msgget** (2/5): msgget01 msgget02 msgget03 msgget04 msgget05
+- ✓ **msgrcv** (4/7): msgrcv01 msgrcv02 msgrcv03 msgrcv05 msgrcv06 msgrcv07 msgrcv08
+- ✓ **msgsnd** (1/4): msgsnd01 msgsnd02 msgsnd05 msgsnd06
+- ✓ **semctl** (7/9): semctl01 semctl02 semctl03 semctl04 semctl05 semctl06 semctl07 semctl08 semctl09
+- ✓ **semget** (2/3): semget01 semget02 semget05
+- ✓ **semop** (4/5): semop01 semop02 semop03 semop04 semop05
+- ✓ **shmctl** (3/8): shmctl01 shmctl02 shmctl03 shmctl04 shmctl05 shmctl06 shmctl07 shmctl08
+- ✓ **shmget** (1/5): shmget02 shmget03 shmget04 shmget05 shmget06
+
+## POSIX 消息队列  (7 用例, 5 入白名单)
+- ✓ **mq_notify** (1/3): mq_notify01 mq_notify02 mq_notify03
+- ✓ **mq_open** (1/1): mq_open01
+- ✓ **mq_timedreceive** (1/1): mq_timedreceive01
+- ✓ **mq_timedsend** (1/1): mq_timedsend01
+- ✓ **mq_unlink** (1/1): mq_unlink01
+
+## 事件/轮询  (90 用例, 47 入白名单)
+- · **epoll** (0/1): epoll01
+- ✓ **epoll_create** (2/2): epoll_create01 epoll_create02
+- ✓ **epoll_create1_** (2/2): epoll_create1_01 epoll_create1_02
+- ✓ **epoll_ctl** (5/5): epoll_ctl01 epoll_ctl02 epoll_ctl03 epoll_ctl04 epoll_ctl05
+- ✓ **epoll_pwait** (3/5): epoll_pwait01 epoll_pwait02 epoll_pwait03 epoll_pwait04 epoll_pwait05
+- ✓ **epoll_wait** (6/7): epoll_wait01 epoll_wait02 epoll_wait03 epoll_wait04 epoll_wait05 epoll_wait06 epoll_wait07
+- ✓ **eventfd** (5/6): eventfd01 eventfd02 eventfd03 eventfd04 eventfd05 eventfd06
+- ✓ **eventfd2_** (3/3): eventfd2_01 eventfd2_02 eventfd2_03
+- ✓ **fanotify** (2/23): fanotify01 fanotify02 fanotify03 fanotify04 fanotify05 fanotify06 fanotify07 fanotify08 fanotify09 fanotify10 fanotify11 fanotify12 fanotify13 fanotify14 fanotify15 fanotify16 fanotify17 fanotify18 fanotify19 fanotify20 fanotify21 fanotify22 fanotify23
+- · **inotify** (0/12): inotify01 inotify02 inotify03 inotify04 inotify05 inotify06 inotify07 inotify08 inotify09 inotify10 inotify11 inotify12
+- ✓ **inotify_init1_** (2/2): inotify_init1_01 inotify_init1_02
+- ✓ **pidfd_getfd** (2/2): pidfd_getfd01 pidfd_getfd02
+- ✓ **pidfd_open** (3/4): pidfd_open01 pidfd_open02 pidfd_open03 pidfd_open04
+- ✓ **pidfd_send_signal** (1/3): pidfd_send_signal01 pidfd_send_signal02 pidfd_send_signal03
+- ✓ **poll** (2/2): poll01 poll02
+- ✓ **ppoll** (1/1): ppoll01
+- ✓ **pselect** (4/6): pselect01 pselect01_64 pselect02 pselect02_64 pselect03 pselect03_64
+- ✓ **select** (4/4): select01 select02 select03 select04
+
+## 网络  (50 用例, 40 入白名单)
+- ✓ **accept** (3/3): accept01 accept02 accept03
+- ✓ **accept4_** (1/1): accept4_01
+- ✓ **bind** (5/6): bind01 bind02 bind03 bind04 bind05 bind06
+- ✓ **connect** (2/2): connect01 connect02
+- ✓ **getpeername** (1/1): getpeername01
+- ✓ **getsockname** (1/1): getsockname01
+- ✓ **getsockopt** (2/2): getsockopt01 getsockopt02
+- ✓ **listen** (1/1): listen01
+- ✓ **recv** (1/1): recv01
+- ✓ **recvfrom** (1/1): recvfrom01
+- ✓ **recvmmsg** (1/1): recvmmsg01
+- ✓ **recvmsg** (3/3): recvmsg01 recvmsg02 recvmsg03
+- ✓ **send** (2/2): send01 send02
+- ✓ **sendmmsg** (2/2): sendmmsg01 sendmmsg02
+- · **sendmsg** (0/3): sendmsg01 sendmsg02 sendmsg03
+- ✓ **sendto** (3/3): sendto01 sendto02 sendto03
+- ✓ **setsockopt** (7/10): setsockopt01 setsockopt02 setsockopt03 setsockopt04 setsockopt05 setsockopt06 setsockopt07 setsockopt08 setsockopt09 setsockopt10
+- ✓ **socket** (2/2): socket01 socket02
+- · **socketcall** (0/3): socketcall01 socketcall02 socketcall03
+- ✓ **socketpair** (2/2): socketpair01 socketpair02
+
+## 凭证/安全  (119 用例, 38 入白名单)
+- · **acct** (0/2): acct01 acct02
+- · **add_key** (0/5): add_key01 add_key02 add_key03 add_key04 add_key05
+- ✓ **capget** (2/2): capget01 capget02
+- ✓ **capset** (2/4): capset01 capset02 capset03 capset04
+- ✓ **getegid** (2/4): getegid01 getegid01_16 getegid02 getegid02_16
+- ✓ **geteuid** (2/4): geteuid01 geteuid01_16 geteuid02 geteuid02_16
+- ✓ **getgid** (2/4): getgid01 getgid01_16 getgid03 getgid03_16
+- · **getgroups** (0/4): getgroups01 getgroups01_16 getgroups03 getgroups03_16
+- ✓ **getuid** (2/4): getuid01 getuid01_16 getuid03 getuid03_16
+- · **keyctl** (0/9): keyctl01 keyctl02 keyctl03 keyctl04 keyctl05 keyctl06 keyctl07 keyctl08 keyctl09
+- · **request_key** (0/5): request_key01 request_key02 request_key03 request_key04 request_key05
+- · **setfsgid** (0/6): setfsgid01 setfsgid01_16 setfsgid02 setfsgid02_16 setfsgid03 setfsgid03_16
+- · **setfsuid** (0/8): setfsuid01 setfsuid01_16 setfsuid02 setfsuid02_16 setfsuid03 setfsuid03_16 setfsuid04 setfsuid04_16
+- ✓ **setgid** (3/6): setgid01 setgid01_16 setgid02 setgid02_16 setgid03 setgid03_16
+- ✓ **setgroups** (2/6): setgroups01 setgroups01_16 setgroups02 setgroups02_16 setgroups03 setgroups03_16
+- ✓ **setregid** (4/8): setregid01 setregid01_16 setregid02 setregid02_16 setregid03 setregid03_16 setregid04 setregid04_16
+- ✓ **setresgid** (2/8): setresgid01 setresgid01_16 setresgid02 setresgid02_16 setresgid03 setresgid03_16 setresgid04 setresgid04_16
+- ✓ **setresuid** (5/10): setresuid01 setresuid01_16 setresuid02 setresuid02_16 setresuid03 setresuid03_16 setresuid04 setresuid04_16 setresuid05 setresuid05_16
+- ✓ **setreuid** (7/14): setreuid01 setreuid01_16 setreuid02 setreuid02_16 setreuid03 setreuid03_16 setreuid04 setreuid04_16 setreuid05 setreuid05_16 setreuid06 setreuid06_16 setreuid07 setreuid07_16
+- ✓ **setuid** (3/6): setuid01 setuid01_16 setuid03 setuid03_16 setuid04 setuid04_16
+
+## 命名空间/容器  (4 用例, 2 入白名单)
+- ✓ **setns** (1/2): setns01 setns02
+- ✓ **unshare** (1/2): unshare01 unshare02
+
+## 内核模块/BPF  (34 用例, 2 入白名单)
+- · **bpf_map** (0/1): bpf_map01
+- · **bpf_prog** (0/7): bpf_prog01 bpf_prog02 bpf_prog03 bpf_prog04 bpf_prog05 bpf_prog06 bpf_prog07
+- · **delete_module** (0/3): delete_module01 delete_module02 delete_module03
+- · **finit_module** (0/2): finit_module01 finit_module02
+- · **init_module** (0/2): init_module01 init_module02
+- ✓ **kcmp** (2/3): kcmp01 kcmp02 kcmp03
+- · **process_vm_readv** (0/3): process_vm_readv01 process_vm_readv02 process_vm_readv03
+- · **process_vm_writev** (0/2): process_vm_writev01 process_vm_writev02
+- · **ptrace** (0/11): ptrace01 ptrace02 ptrace03 ptrace04 ptrace05 ptrace06 ptrace07 ptrace08 ptrace09 ptrace10 ptrace11
+
+## 系统信息/资源  (44 用例, 23 入白名单)
+- ✓ **confstr** (1/1): confstr01
+- ✓ **getdomainname** (1/1): getdomainname01
+- ✓ **gethostname** (1/2): gethostname01 gethostname02
+- ✓ **getpagesize** (1/1): getpagesize01
+- ✓ **getrandom** (5/5): getrandom01 getrandom02 getrandom03 getrandom04 getrandom05
+- ✓ **getrlimit** (3/3): getrlimit01 getrlimit02 getrlimit03
+- ✓ **getrusage** (2/4): getrusage01 getrusage02 getrusage03 getrusage04
+- · **reboot** (0/2): reboot01 reboot02
+- · **setdomainname** (0/3): setdomainname01 setdomainname02 setdomainname03
+- ✓ **sethostname** (2/3): sethostname01 sethostname02 sethostname03
+- ✓ **setrlimit** (4/6): setrlimit01 setrlimit02 setrlimit03 setrlimit04 setrlimit05 setrlimit06
+- · **sysconf** (0/1): sysconf01
+- · **sysctl** (0/3): sysctl01 sysctl03 sysctl04
+- · **sysinfo** (0/3): sysinfo01 sysinfo02 sysinfo03
+- · **syslog** (0/2): syslog11 syslog12
+- · **ulimit** (0/1): ulimit01
+- ✓ **uname** (3/3): uname01 uname02 uname04
+
+## 杂项/其他  (143 用例, 31 入白名单)
+- · **cacheflush** (0/1): cacheflush01
+- · **dirtyc0w** (0/1): dirtyc0w
+- · **dirtyc0w_shmem** (0/1): dirtyc0w_shmem
+- · **dirtypipe** (0/1): dirtypipe
+- · **flistxattr** (0/3): flistxattr01 flistxattr02 flistxattr03
+- · **fmtmsg** (0/1): fmtmsg01
+- ✓ **fpathconf** (1/1): fpathconf01
+- · **fremovexattr** (0/2): fremovexattr01 fremovexattr02
+- · **fsconfig** (0/3): fsconfig01 fsconfig02 fsconfig03
+- · **fsmount** (0/2): fsmount01 fsmount02
+- · **fsopen** (0/2): fsopen01 fsopen02
+- · **fspick** (0/2): fspick01 fspick02
+- ✓ **futex_cmp_requeue** (1/2): futex_cmp_requeue01 futex_cmp_requeue02
+- ✓ **futex_wait** (4/5): futex_wait01 futex_wait02 futex_wait03 futex_wait04 futex_wait05
+- ✓ **futex_wait_bitset** (1/1): futex_wait_bitset01
+- · **futex_waitv** (0/3): futex_waitv01 futex_waitv02 futex_waitv03
+- ✓ **futex_wake** (2/4): futex_wake01 futex_wake02 futex_wake03 futex_wake04
+- · **get_mempolicy** (0/2): get_mempolicy01 get_mempolicy02
+- · **get_robust_list** (0/1): get_robust_list01
+- · **getcontext** (0/1): getcontext01
+- · **gethostbyname_r** (0/1): gethostbyname_r01
+- · **gethostid** (0/1): gethostid01
+- · **getresgid** (0/6): getresgid01 getresgid01_16 getresgid02 getresgid02_16 getresgid03 getresgid03_16
+- · **getresuid** (0/6): getresuid01 getresuid01_16 getresuid02 getresuid02_16 getresuid03 getresuid03_16
+- · **io_cancel** (0/2): io_cancel01 io_cancel02
+- · **io_destroy** (0/2): io_destroy01 io_destroy02
+- · **io_getevents** (0/2): io_getevents01 io_getevents02
+- · **io_pgetevents** (0/2): io_pgetevents01 io_pgetevents02
+- · **io_setup** (0/2): io_setup01 io_setup02
+- · **io_submit** (0/3): io_submit01 io_submit02 io_submit03
+- ✓ **io_uring** (1/2): io_uring01 io_uring02
+- · **ioperm** (0/2): ioperm01 ioperm02
+- · **iopl** (0/2): iopl01 iopl02
+- ✓ **ioprio_get** (1/1): ioprio_get01
+- ✓ **ioprio_set** (1/3): ioprio_set01 ioprio_set02 ioprio_set03
+- · **llistxattr** (0/3): llistxattr01 llistxattr02 llistxattr03
+- · **lremovexattr** (0/1): lremovexattr01
+- · **mallinfo** (0/1): mallinfo02
+- · **mallinfo2_** (0/1): mallinfo2_01
+- · **mallopt** (0/1): mallopt01
+- ✓ **membarrier** (1/1): membarrier01
+- ✓ **memcmp** (1/1): memcmp01
+- ✓ **memcpy** (1/1): memcpy01
+- ✓ **memset** (1/1): memset01
+- · **modify_ldt** (0/3): modify_ldt01 modify_ldt02 modify_ldt03
+- · **move_mount** (0/2): move_mount01 move_mount02
+- · **msgstress** (0/1): msgstress01
+- ✓ **name_to_handle_at** (2/2): name_to_handle_at01 name_to_handle_at02
+- · **newuname** (0/1): newuname01
+- · **nftw** (0/2): nftw01 nftw6401
+- · **perf_event_open** (0/3): perf_event_open01 perf_event_open02 perf_event_open03
+- · **pkey** (0/1): pkey01
+- ✓ **posix_fadvise** (8/8): posix_fadvise01 posix_fadvise01_64 posix_fadvise02 posix_fadvise02_64 posix_fadvise03 posix_fadvise03_64 posix_fadvise04 posix_fadvise04_64
+- · **process_madvise** (0/1): process_madvise01
+- · **profil** (0/1): profil01
+- · **prot_hsymlinks** (0/1): prot_hsymlinks
+- · **qmm** (0/1): qmm01
+- · **realpath** (0/1): realpath01
+- · **rt_tgsigqueueinfo** (0/1): rt_tgsigqueueinfo01
+- · **set_mempolicy** (0/4): set_mempolicy01 set_mempolicy02 set_mempolicy03 set_mempolicy04
+- · **set_robust_list** (0/1): set_robust_list01
+- · **set_thread_area** (0/1): set_thread_area01
+- · **set_tid_address** (0/1): set_tid_address01
+- ✓ **setegid** (2/2): setegid01 setegid02
+- ✓ **setpgrp** (1/2): setpgrp01 setpgrp02
+- · **sgetmask** (0/1): sgetmask01
+- ✓ **sighold** (1/1): sighold02
+- · **sigrelse** (0/1): sigrelse01
+- · **sockioctl** (0/1): sockioctl01
+- · **ssetmask** (0/1): ssetmask01
+- · **string** (0/1): string01
+- · **switch** (0/1): switch01
+- ✓ **syscall** (1/1): syscall01
+- · **sysfs** (0/5): sysfs01 sysfs02 sysfs03 sysfs04 sysfs05
+- · **userfaultfd** (0/1): userfaultfd01
+- · **vhangup** (0/2): vhangup01 vhangup02

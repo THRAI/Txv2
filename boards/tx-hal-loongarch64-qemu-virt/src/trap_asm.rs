@@ -59,6 +59,8 @@ core::arch::global_asm!(
     .equ TX_LA64_CSR_TLBRELO0_TRAP, 0x8c
     .equ TX_LA64_CSR_TLBRELO1_TRAP, 0x8d
     .equ TX_LA64_CSR_MERRENTRY_TRAP, 0x93
+    .equ TX_LA64_CSR_LLBCTL_TRAP, 0x60
+    .equ TX_LA64_LLBCTL_KLO_TRAP, 0x4
     .equ TX_LA64_DMW_CACHED_BASE_TRAP, 0x9000000000000000
     .equ TX_LA64_UART0_UNCACHED_TRAP, 0x800000001fe00000
     .equ TX_LA64_UART_THR_TRAP, 0
@@ -187,6 +189,8 @@ tx_la64_qemu_exception_vector:
     bne     $r12, $r13, .Ltx_la64_restore_gprs
     addi.d  $r13, $r31, TX_LA64_TF_SIZE
     csrwr   $r13, TX_LA64_CSR_KSAVE0_TRAP
+    li.w    $r13, TX_LA64_LLBCTL_KLO_TRAP
+    csrxchg $r13, $r13, TX_LA64_CSR_LLBCTL_TRAP
 .Ltx_la64_restore_gprs:
     ld.d    $r1, $r31, TX_LA64_TF_R1
     ld.d    $r2, $r31, TX_LA64_TF_R2
@@ -254,6 +258,9 @@ tx_la64_qemu_tlb_refill_vector:
     ldpte   $r12, 0
     ldpte   $r12, 1
     tlbfill
+    li.w    $r13, TX_LA64_LLBCTL_KLO_TRAP
+    csrxchg $r13, $r13, TX_LA64_CSR_LLBCTL_TRAP
+    csrrd   $r13, TX_LA64_CSR_KSAVE3_TRAP
     csrrd   $r12, TX_LA64_CSR_TLBRSAVE_TRAP
     ertn
 
@@ -263,6 +270,9 @@ tx_la64_qemu_tlb_refill_vector:
     csrwr   $zero, TX_LA64_CSR_TLBRELO0_TRAP
     csrwr   $zero, TX_LA64_CSR_TLBRELO1_TRAP
     tlbfill
+    li.w    $r13, TX_LA64_LLBCTL_KLO_TRAP
+    csrxchg $r13, $r13, TX_LA64_CSR_LLBCTL_TRAP
+    csrrd   $r13, TX_LA64_CSR_KSAVE3_TRAP
     csrrd   $r12, TX_LA64_CSR_TLBRSAVE_TRAP
     ertn
     .size tx_la64_qemu_tlb_refill_vector, . - tx_la64_qemu_tlb_refill_vector
@@ -280,6 +290,8 @@ tx_la64_qemu_return_to_userspace:
     ld.d    $r12, $r31, TX_LA64_TF_PRMD
     csrwr   $r12, TX_LA64_CSR_PRMD_TRAP
     csrwr   $zero, TX_LA64_CSR_TLBRERA_TRAP
+    li.w    $r12, TX_LA64_LLBCTL_KLO_TRAP
+    csrxchg $r12, $r12, TX_LA64_CSR_LLBCTL_TRAP
     ld.d    $r1, $r31, TX_LA64_TF_R1
     ld.d    $r2, $r31, TX_LA64_TF_R2
     ld.d    $r4, $r31, TX_LA64_TF_R4
@@ -366,6 +378,8 @@ tx_la64_qemu_activate_enter_userspace:
     or      $r12, $r12, $r13
     jirl    $zero, $r12, 0
 .Ltx_la64_activate_done:
+    li.w    $r12, TX_LA64_LLBCTL_KLO_TRAP
+    csrxchg $r12, $r12, TX_LA64_CSR_LLBCTL_TRAP
     ld.d    $r1, $r31, TX_LA64_TF_R1
     ld.d    $r2, $r31, TX_LA64_TF_R2
     ld.d    $r4, $r31, TX_LA64_TF_R4

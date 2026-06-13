@@ -4,8 +4,8 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::page_backed::{
-    MaterializeAccess, MaterializedPage, MaterializedPagePin, PageCacheError, PageContainer,
-    PageIndex,
+    reclaim_clean_file_pages_if_low, reserve_frame_with_reclaim, MaterializeAccess,
+    MaterializedPage, MaterializedPagePin, PageCacheError, PageContainer, PageIndex,
 };
 use crate::vm::adapter::step_engine::Cap;
 use step_engine::page_allocator::{self, ZeroPolicy};
@@ -1577,8 +1577,8 @@ fn materialize_zero_frame() -> Result<MaterializedPage, VmFaultError> {
 
 fn allocate_private_materialized_page(dirty: bool) -> Result<MaterializedPage, VmFaultError> {
     emit_vm_materialize_trace(b"debug.vm.private_anon.allocate.phase", 0);
-    let reservation =
-        page_allocator::reserve_frame(ZeroPolicy::Zeroed).map_err(page_alloc_error)?;
+    reclaim_clean_file_pages_if_low();
+    let reservation = reserve_frame_with_reclaim(ZeroPolicy::Zeroed).map_err(page_alloc_error)?;
     emit_vm_materialize_trace(b"debug.vm.private_anon.allocate.phase", 1);
     let frame = reservation.commit();
     emit_vm_materialize_trace(b"debug.vm.private_anon.allocate.phase", 2);
@@ -1604,7 +1604,8 @@ fn allocate_private_materialized_page(dirty: bool) -> Result<MaterializedPage, V
 fn allocate_private_materialized_page_unzeroed(
     dirty: bool,
 ) -> Result<MaterializedPage, VmFaultError> {
-    let frame = page_allocator::reserve_frame(ZeroPolicy::UninitFullOverwrite)
+    reclaim_clean_file_pages_if_low();
+    let frame = reserve_frame_with_reclaim(ZeroPolicy::UninitFullOverwrite)
         .map_err(page_alloc_error)?
         .commit();
     let ppn = frame.ppn();
@@ -1622,8 +1623,9 @@ fn allocate_private_materialized_page_from_source(
     source: tx_hal::Ppn,
     dirty: bool,
 ) -> Result<MaterializedPage, VmFaultError> {
+    reclaim_clean_file_pages_if_low();
     let reservation =
-        page_allocator::reserve_frame(ZeroPolicy::UninitFullOverwrite).map_err(page_alloc_error)?;
+        reserve_frame_with_reclaim(ZeroPolicy::UninitFullOverwrite).map_err(page_alloc_error)?;
     page_allocator::copy_frame_contents(source, reservation.ppn()).map_err(page_alloc_error)?;
     let frame = reservation.commit();
     let ppn = frame.ppn();

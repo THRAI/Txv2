@@ -190,23 +190,24 @@ fn oscomp_submit(root: &Path, args: &[String]) -> Result<()> {
         .map(PathBuf::from)
         .map(|path| resolve_path(root, path))
         .unwrap_or_else(|| root.join("target").join("oscomp").join("submit"));
-    let target = optional_option_value(args, "--target")
-        .map(|value| TxTarget::parse(&value))
-        .transpose()?;
+    let target = optional_option_value(args, "--target");
+    let release = oscomp_release_profile(args);
     fs::create_dir_all(&submit).map_err(|err| err.to_string())?;
-    match target {
-        Some(TxTarget::Rv64Qemu) => {
-            copy_kernel_for_oscomp(root, TxTarget::Rv64Qemu, &submit.join("kernel-rv"))?;
+    match target.as_deref() {
+        Some("rv64-qemu") => {
+            copy_kernel_for_oscomp(root, TxTarget::Rv64Qemu, &submit.join("kernel-rv"), release)?;
         }
-        Some(TxTarget::La64Qemu) => {
-            copy_kernel_for_oscomp(root, TxTarget::La64Qemu, &submit.join("kernel-la"))?;
+        Some("la64-qemu") => {
+            copy_kernel_for_oscomp(root, TxTarget::La64Qemu, &submit.join("kernel-la"), release)?;
         }
-        Some(TxTarget::Rv64M1DockMock) => {
-            return Err("OSComp submit supports rv64-qemu and la64-qemu".into());
+        Some("all") | None => {
+            copy_kernel_for_oscomp(root, TxTarget::Rv64Qemu, &submit.join("kernel-rv"), release)?;
+            copy_kernel_for_oscomp(root, TxTarget::La64Qemu, &submit.join("kernel-la"), release)?;
         }
-        None => {
-            copy_kernel_for_oscomp(root, TxTarget::Rv64Qemu, &submit.join("kernel-rv"))?;
-            copy_kernel_for_oscomp(root, TxTarget::La64Qemu, &submit.join("kernel-la"))?;
+        Some(other) => {
+            return Err(format!(
+                "OSComp submit supports rv64-qemu, la64-qemu, or all, not {other}"
+            ))
         }
     }
     println!("prepared OSComp submit dir at {}", submit.display());
@@ -597,7 +598,12 @@ fn oscomp_test(root: &Path, args: &[String]) -> Result<()> {
     );
     if !dry_run {
         fs::create_dir_all(&submit).map_err(|e| e.to_string())?;
-        copy_kernel_for_oscomp(root, target, &submit.join(kernel_dest_name))?;
+        copy_kernel_for_oscomp(
+            root,
+            target,
+            &submit.join(kernel_dest_name),
+            oscomp_release_profile(args),
+        )?;
     }
 
     // Step 3: run QEMU (all suites from sdcard)
@@ -667,13 +673,22 @@ fn oscomp_data_dir(root: &Path, args: &[String]) -> PathBuf {
     resolve_path(root, path)
 }
 
-fn copy_kernel_for_oscomp(root: &Path, target: TxTarget, dest: &Path) -> Result<()> {
-    let source = target.kernel_path(root);
+fn oscomp_release_profile(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == "--release")
+        || env::var("TX_OSCOMP_KERNEL_PROFILE")
+            .map(|value| value == "release")
+            .unwrap_or(false)
+}
+
+fn copy_kernel_for_oscomp(root: &Path, target: TxTarget, dest: &Path, release: bool) -> Result<()> {
+    let source = target.kernel_path_for_profile(root, release);
     if !source.exists() {
+        let profile = if release { " --release" } else { "" };
         return Err(format!(
-            "missing {}; run `cargo xtask build --target {}` first",
+            "missing {}; run `cargo xtask build --target {}{}` first",
             source.display(),
-            target.name()
+            target.name(),
+            profile
         ));
     }
     fs::copy(&source, dest).map_err(|err| err.to_string())?;

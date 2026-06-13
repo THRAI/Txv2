@@ -191,6 +191,60 @@ fn tmpfs_mkdir_then_readdir_yields_dir_entry() {
 }
 
 #[test]
+fn tmpfs_readdir_cursor_survives_unlink_of_previous_entry() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = guard();
+    let cred = Credential::root();
+
+    let (a_id, _) = match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"a", 0o100644, &cred, &guard) {
+        StepOutcome::Done(out) => out,
+        other => panic!("create a failed: {other:?}"),
+    };
+    let (b_id, _) = match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"b", 0o100644, &cred, &guard) {
+        StepOutcome::Done(out) => out,
+        other => panic!("create b failed: {other:?}"),
+    };
+    let (c_id, _) = match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"c", 0o100644, &cred, &guard) {
+        StepOutcome::Done(out) => out,
+        other => panic!("create c failed: {other:?}"),
+    };
+
+    let first_cursor = match tmpfs.readdir(TMPFS_ROOT_OBJECT_ID, DirCursor::START, &guard) {
+        StepOutcome::Done(Some((entry, next))) => {
+            assert_eq!(entry.fs_object_id, a_id);
+            next
+        }
+        other => panic!("first readdir failed: {other:?}"),
+    };
+
+    assert_eq!(
+        tmpfs.unlink(TMPFS_ROOT_OBJECT_ID, b"a", a_id, &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(tmpfs.destroy_inode(a_id, &guard), StepOutcome::Done(()));
+
+    let second_cursor = match tmpfs.readdir(TMPFS_ROOT_OBJECT_ID, first_cursor, &guard) {
+        StepOutcome::Done(Some((entry, next))) => {
+            assert_eq!(
+                entry.fs_object_id, b_id,
+                "cursor must not skip b after a was removed"
+            );
+            next
+        }
+        other => panic!("second readdir failed: {other:?}"),
+    };
+    match tmpfs.readdir(TMPFS_ROOT_OBJECT_ID, second_cursor, &guard) {
+        StepOutcome::Done(Some((entry, _))) => assert_eq!(entry.fs_object_id, c_id),
+        other => panic!("third readdir failed: {other:?}"),
+    }
+}
+
+#[test]
 fn tmpfs_mkdir_and_rmdir_update_parent_directory_nlinks() {
     let _serial = crate::test_support::FS_TEST_LOCK
         .lock()
@@ -274,7 +328,7 @@ fn tmpfs_readdir_stale_child_returns_enoent() {
         let TmpfsPayload::Directory(children) = &mut root_inode.payload else {
             panic!("root must be directory");
         };
-        children.insert(ghost_name, ghost_id);
+        children.insert(ghost_name, tmpfs.alloc_dirent(ghost_id));
     }
 
     assert_eq!(
@@ -355,7 +409,7 @@ fn tmpfs_unlink_missing_target_inode_returns_enoent_without_mutating_namespace()
         let TmpfsPayload::Directory(children) = &mut root_inode.payload else {
             panic!("root must be directory");
         };
-        children.insert(ghost_name, ghost_id);
+        children.insert(ghost_name, tmpfs.alloc_dirent(ghost_id));
     }
 
     assert_eq!(
@@ -371,7 +425,10 @@ fn tmpfs_unlink_missing_target_inode_returns_enoent_without_mutating_namespace()
     let TmpfsPayload::Directory(children) = &root_inode.payload else {
         panic!("root must be directory");
     };
-    assert_eq!(children.get(&ghost_name).copied(), Some(ghost_id));
+    assert_eq!(
+        children.get(&ghost_name).map(|entry| entry.object_id),
+        Some(ghost_id)
+    );
 }
 
 #[test]
@@ -444,6 +501,51 @@ fn tmpfs_link_increments_nlink_and_unlink_decrements_one_name() {
     assert_eq!(
         tmpfs.lookup(TMPFS_ROOT_OBJECT_ID, b"alias", &guard),
         StepOutcome::Done(file_id)
+    );
+}
+
+#[test]
+fn tmpfs_readdir_returns_each_hardlink_directory_entry() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+
+    let tmpfs = Arc::new(Tmpfs::new());
+    let guard = guard();
+    let cred = Credential::root();
+
+    let (file_id, _) =
+        match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"primary", 0o100644, &cred, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("create_inode failed: {other:?}"),
+        };
+    assert_eq!(
+        tmpfs.link(TMPFS_ROOT_OBJECT_ID, b"alias", file_id, &guard),
+        StepOutcome::Done(())
+    );
+
+    let mut cursor = DirCursor::START;
+    let mut names = alloc::vec::Vec::new();
+    loop {
+        match tmpfs.readdir(TMPFS_ROOT_OBJECT_ID, cursor, &guard) {
+            StepOutcome::Done(Some((entry, next))) => {
+                assert_eq!(entry.fs_object_id, file_id);
+                names.push(entry.name);
+                cursor = next;
+            }
+            StepOutcome::Done(None) => break,
+            other => panic!("readdir failed: {other:?}"),
+        }
+    }
+
+    names.sort();
+    assert_eq!(
+        names,
+        alloc::vec![
+            InlineName::new(b"alias").unwrap(),
+            InlineName::new(b"primary").unwrap(),
+        ]
     );
 }
 

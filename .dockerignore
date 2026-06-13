@@ -1,0 +1,9 @@
+target/
+.git/
+.cargo/
+**/*.img
+**/*.img.xz
+**/*.log
+**/*.serial
+**/*.serial.log
+**/__pycache__/

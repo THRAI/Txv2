@@ -23,6 +23,7 @@ use crate::vfs::{
 static MOUNT_IDENTITY_ZONE: Zone<MountIdentity> = Zone::const_new();
 static MOUNT_PAYLOAD_ZONE: Zone<MountPayload> = Zone::const_new();
 static MOUNT_NAMESPACE_ZONE: Zone<MountNamespace> = Zone::const_new();
+static MOUNT_API_FILE_ZONE: Zone<MountApiFile> = Zone::const_new();
 
 unsafe impl ZoneAllocated for MountIdentity {
     fn zone() -> &'static Zone<Self> {
@@ -40,6 +41,12 @@ unsafe impl ZoneAllocated for MountPayload {
 unsafe impl ZoneAllocated for MountNamespace {
     fn zone() -> &'static Zone<Self> {
         &MOUNT_NAMESPACE_ZONE
+    }
+}
+
+unsafe impl ZoneAllocated for MountApiFile {
+    fn zone() -> &'static Zone<Self> {
+        &MOUNT_API_FILE_ZONE
     }
 }
 
@@ -87,12 +94,148 @@ impl MountFlags {
         self.0
     }
 
+    pub const fn from_bits(bits: u64) -> Self {
+        Self(bits)
+    }
+
     pub const fn contains(self, flag: Self) -> bool {
         (self.0 & flag.0) != 0
     }
 
     pub const fn union(self, flag: Self) -> Self {
         Self(self.0 | flag.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MountApiFileKind {
+    FsContext,
+    DetachedMount,
+    OpenTree,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FsContextMode {
+    New,
+    Reconfigure,
+}
+
+#[derive(Clone, Debug)]
+pub struct DetachedMountState {
+    pub payload: Cap<MountPayload>,
+    pub root: Cap<RNode>,
+    pub flags: MountFlags,
+}
+
+#[derive(Debug)]
+pub struct MountApiFile {
+    kind: MountApiFileKind,
+    mode: Option<FsContextMode>,
+    fstype: &'static str,
+    source: SpinMutex<Option<Vec<u8>>>,
+    mount_flags: AtomicU64,
+    picked_mount: SpinMutex<Option<Cap<MountIdentity>>>,
+    detached: SpinMutex<Option<DetachedMountState>>,
+}
+
+impl MountApiFile {
+    pub fn new_fs_context(
+        fstype: &'static str,
+        mode: FsContextMode,
+        picked_mount: Option<Cap<MountIdentity>>,
+    ) -> Self {
+        Self {
+            kind: MountApiFileKind::FsContext,
+            mode: Some(mode),
+            fstype,
+            source: SpinMutex::new(None),
+            mount_flags: AtomicU64::new(0),
+            picked_mount: SpinMutex::new(picked_mount),
+            detached: SpinMutex::new(None),
+        }
+    }
+
+    pub fn new_fs_context_cap(
+        fstype: &'static str,
+        mode: FsContextMode,
+        picked_mount: Option<Cap<MountIdentity>>,
+    ) -> Result<Cap<Self>, ZoneError> {
+        runtime::sign(Self::new_fs_context(fstype, mode, picked_mount))
+    }
+
+    pub fn new_detached_mount(
+        kind: MountApiFileKind,
+        payload: Cap<MountPayload>,
+        root: Cap<RNode>,
+        flags: MountFlags,
+    ) -> Self {
+        debug_assert!(matches!(
+            kind,
+            MountApiFileKind::DetachedMount | MountApiFileKind::OpenTree
+        ));
+        let fstype = payload.fstype;
+        Self {
+            kind,
+            mode: None,
+            fstype,
+            source: SpinMutex::new(None),
+            mount_flags: AtomicU64::new(flags.bits()),
+            picked_mount: SpinMutex::new(None),
+            detached: SpinMutex::new(Some(DetachedMountState {
+                payload,
+                root,
+                flags,
+            })),
+        }
+    }
+
+    pub fn new_detached_mount_cap(
+        kind: MountApiFileKind,
+        payload: Cap<MountPayload>,
+        root: Cap<RNode>,
+        flags: MountFlags,
+    ) -> Result<Cap<Self>, ZoneError> {
+        runtime::sign(Self::new_detached_mount(kind, payload, root, flags))
+    }
+
+    pub const fn kind(&self) -> MountApiFileKind {
+        self.kind
+    }
+
+    pub const fn mode(&self) -> Option<FsContextMode> {
+        self.mode
+    }
+
+    pub const fn fstype(&self) -> &'static str {
+        self.fstype
+    }
+
+    pub fn source(&self) -> Option<Vec<u8>> {
+        self.source.lock().clone()
+    }
+
+    pub fn set_source(&self, source: Vec<u8>) {
+        *self.source.lock() = Some(source);
+    }
+
+    pub fn mount_flags(&self) -> MountFlags {
+        MountFlags::from_bits(self.mount_flags.load(Ordering::Acquire))
+    }
+
+    pub fn set_mount_flags(&self, flags: MountFlags) {
+        self.mount_flags.store(flags.bits(), Ordering::Release);
+    }
+
+    pub fn picked_mount(&self) -> Option<Cap<MountIdentity>> {
+        self.picked_mount.lock().clone()
+    }
+
+    pub fn detached(&self) -> Option<DetachedMountState> {
+        self.detached.lock().clone()
+    }
+
+    pub fn replace_detached(&self, next: Option<DetachedMountState>) -> Option<DetachedMountState> {
+        core::mem::replace(&mut *self.detached.lock(), next)
     }
 }
 

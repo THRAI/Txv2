@@ -447,6 +447,22 @@ pub struct GlobalPageProvider;
 static GLOBAL_DIRECT_MAP_BASE: AtomicUsize = AtomicUsize::new(0);
 static GLOBAL_PAGE_SIZE: AtomicUsize = AtomicUsize::new(0);
 static GLOBAL_HEAP: SlabHeap<GlobalPageProvider> = SlabHeap::new(GlobalPageProvider);
+static LAST_ALLOC_FAIL_SIZE: AtomicUsize = AtomicUsize::new(0);
+static LAST_ALLOC_FAIL_ALIGN: AtomicUsize = AtomicUsize::new(0);
+static LAST_ALLOC_FAIL_PAGES: AtomicUsize = AtomicUsize::new(0);
+static LAST_ALLOC_FAIL_FREE: AtomicUsize = AtomicUsize::new(0);
+static LAST_ALLOC_FAIL_TOTAL: AtomicUsize = AtomicUsize::new(0);
+static LAST_ALLOC_FAIL_MAX_RUN: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GlobalAllocationFailureDiagnostics {
+    pub size: usize,
+    pub align: usize,
+    pub pages: usize,
+    pub free_count: usize,
+    pub total_count: usize,
+    pub max_contiguous_free_run: usize,
+}
 
 unsafe impl SlabPageProvider for GlobalPageProvider {
     fn page_size(&self) -> usize {
@@ -505,10 +521,13 @@ pub struct KernelGlobalAllocator;
 
 unsafe impl GlobalAlloc for KernelGlobalAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        GLOBAL_HEAP
-            .try_alloc(layout)
-            .map(|ptr| ptr.as_ptr())
-            .unwrap_or(ptr::null_mut())
+        match GLOBAL_HEAP.try_alloc(layout) {
+            Ok(ptr) => ptr.as_ptr(),
+            Err(_) => {
+                record_global_alloc_failure(layout);
+                ptr::null_mut()
+            }
+        }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -516,6 +535,46 @@ unsafe impl GlobalAlloc for KernelGlobalAllocator {
             GLOBAL_HEAP.dealloc(ptr, layout);
         }
     }
+}
+
+fn record_global_alloc_failure(layout: Layout) {
+    let page_size = GLOBAL_PAGE_SIZE
+        .load(Ordering::Acquire)
+        .max(DEFAULT_PAGE_SIZE);
+    let pages = div_ceil(layout.size(), page_size).unwrap_or(usize::MAX);
+    let (free_count, total_count, max_run) = installed_bitmap_allocator()
+        .map(|allocator| {
+            let diagnostics = allocator.backend_diagnostics();
+            (
+                diagnostics.free_count,
+                diagnostics.total_count,
+                diagnostics.max_contiguous_free_run,
+            )
+        })
+        .unwrap_or((0, 0, 0));
+
+    LAST_ALLOC_FAIL_ALIGN.store(layout.align(), Ordering::Release);
+    LAST_ALLOC_FAIL_PAGES.store(pages, Ordering::Release);
+    LAST_ALLOC_FAIL_FREE.store(free_count, Ordering::Release);
+    LAST_ALLOC_FAIL_TOTAL.store(total_count, Ordering::Release);
+    LAST_ALLOC_FAIL_MAX_RUN.store(max_run, Ordering::Release);
+    LAST_ALLOC_FAIL_SIZE.store(layout.size(), Ordering::Release);
+}
+
+pub fn last_allocation_failure() -> Option<GlobalAllocationFailureDiagnostics> {
+    let size = LAST_ALLOC_FAIL_SIZE.load(Ordering::Acquire);
+    if size == 0 {
+        return None;
+    }
+
+    Some(GlobalAllocationFailureDiagnostics {
+        size,
+        align: LAST_ALLOC_FAIL_ALIGN.load(Ordering::Acquire),
+        pages: LAST_ALLOC_FAIL_PAGES.load(Ordering::Acquire),
+        free_count: LAST_ALLOC_FAIL_FREE.load(Ordering::Acquire),
+        total_count: LAST_ALLOC_FAIL_TOTAL.load(Ordering::Acquire),
+        max_contiguous_free_run: LAST_ALLOC_FAIL_MAX_RUN.load(Ordering::Acquire),
+    })
 }
 
 #[cfg(target_os = "none")]

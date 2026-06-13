@@ -8,10 +8,23 @@ Runs are split into explicit 5-case groups with `make oscomp-local-rv64-ltp-musl
 | Item | Value | Note |
 | --- | ---: | --- |
 | cases | 55 | from `make ltp-batch-cases LTP_BATCH=time` |
-| latest local run | timeout triage | 2026-05-26 single-case reruns for previously hung time cases |
+| latest local run | focused LA64 submit-tail rerun | 2026-06-03 promoted whitelist candidates, musl+glibc |
 | cumulative scored | `284/351` | recorded rows in this document |
 | reached case | `times03` | batch completed |
 | logs | `target/oscomp/ltp-progress/time`, `target/oscomp/ltp-timeout-triage/time` | per-group stdout, single-case timeout triage logs, and serial snapshots |
+
+## 2026-06-03 focused submit-tail rerun
+
+复测日志：
+
+- LA musl: `target/oscomp/ltp-extra-core-b1-la-musl-20260603.txt`
+- LA glibc: `target/oscomp/ltp-extra-core-g3-la-glibc-20260603.txt`
+
+确认可作为 active submit 尾部补充分的 time case：
+
+`gettimeofday02`, `timer_delete02`, `timer_settime03`, `times01`。
+
+这些 case 在 LA musl/glibc focused run 中均为 Summary 满分。
 
 ## 2026-05-26 failure notes
 

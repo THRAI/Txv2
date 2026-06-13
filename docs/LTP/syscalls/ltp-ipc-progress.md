@@ -8,8 +8,8 @@ Runs are split into explicit 5-case groups with `make oscomp-local-rv64-ltp-musl
 | Item | Value | Note |
 | --- | ---: | --- |
 | cases | 67 | from `make ltp-batch-cases LTP_BATCH=ipc` |
-| latest local run | timeout triage | 2026-05-26 single-case reruns for previously hung IPC cases |
-| cumulative scored | `245/343` | recorded rows in this document |
+| latest local run | focused high-score rerun | 2026-06-03 `semop02` RV/LA musl+glibc |
+| cumulative scored | `247/343` | recorded rows in this document |
 | reached case | `shmget06` | batch completed |
 | logs | `target/oscomp/ltp-progress/ipc`, `target/oscomp/ltp-timeout-triage/ipc` | per-group stdout, single-case timeout triage logs, and serial snapshots |
 
@@ -21,6 +21,23 @@ Runs are split into explicit 5-case groups with `make oscomp-local-rv64-ltp-musl
 - host timeout before case completed: 5 recorded case(s); see per-case notes below.
 - EINVAL observed: 4 recorded case(s); see per-case notes below.
 - panicked at: 1 recorded case(s); see per-case notes below.
+
+## 2026-06-03 focused high-score rerun
+
+`semop02` 复测结果：
+
+- LA musl: `21/26`
+- LA glibc: `21/26`
+- RV musl: `21/26`
+- RV glibc: `21/26`
+
+修正点是 `nsops > SEMOPM` 返回 `E2BIG`，不再返回 `EINVAL`。剩下两处
+失败是 `semop` / `semtimedop` 变体仍然“unexpectedly succeeded”，后续需要继续
+补 System V semaphore 的错误路径。对应日志：
+`target/oscomp/ltp-highfix-open11-semop02-la-musl-20260603.txt`,
+`target/oscomp/ltp-highfix-open11-semop02-la-glibc-20260603.txt`,
+`target/oscomp/ltp-highfix-open11-semop02-rv-musl-20260603.txt`, and
+`target/oscomp/ltp-highfix-open11-semop02-rv-glibc-20260603.txt`.
 
 ## Cases
 
@@ -70,7 +87,7 @@ Runs are split into explicit 5-case groups with `make oscomp-local-rv64-ltp-musl
 | `semget02` | 6/6 | pass | EINVAL observed |
 | `semget05` | 0/1 | skip | TCONF: Path not found: /proc/sys/kernel/sem: ENOENT (2) |
 | `semop01` | 4/4 | pass |  |
-| `semop02` | 19/26 | partial | TFAIL: semop failed unexpectedly; expected: E2BIG: EINVAL (22) |
+| `semop02` | 21/26 | partial | `nsops > SEMOPM` now returns E2BIG; two semop/semtimedop variants still succeed unexpectedly |
 | `semop03` | 8/8 | pass |  |
 | `semop04` | 1/1 | pass |  |
 | `semop05` | 1/1 | pass |  |

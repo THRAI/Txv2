@@ -6,6 +6,7 @@
 use super::*;
 #[cfg(tx_sigprocmask_detail_metrics)]
 use core::sync::atomic::{AtomicU64, Ordering};
+use tx_substrate::verbs::OperationalCapExt;
 use tx_subsystems::process::numbers::{resolve_pid_number_as, PidName, PidNameKind};
 use tx_subsystems::signal::{step_kill_pgrp, SigInfo, SI_USER};
 use tx_subsystems::signal::{KillOutcome, SignalTarget};
@@ -392,10 +393,91 @@ fn sys_rt_sigprocmask_impl(
     SyscallResult::Return(0)
 }
 
-// --- Stub syscalls (deferred to post-bringup) -------------------------
+fn set_thread_signal_mask(
+    ctx: &SyscallCtx<'_>,
+    next: SignalMask,
+) -> Result<SignalMask, SyscallResult> {
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mut op = SigprocmaskOp {
+        thread: ctx.thread.clone(),
+        how: SigmaskHow::SetMask,
+        next,
+    };
+    match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+        Ok(SigprocmaskChange::Replaced { prev, .. }) => Ok(prev),
+        Ok(SigprocmaskChange::ZombieIgnored) => Err(SyscallResult::Error(ESRCH_VALUE)),
+        Err(v3errno) => Err(SyscallResult::error_from(Errno::from(v3errno))),
+    }
+}
 
-pub(super) fn sys_rt_sigsuspend(_args: [u64; 6], _ctx: &SyscallCtx) -> SyscallResult {
-    SyscallResult::Error(ENOSYS_VALUE)
+pub(super) async fn sys_rt_sigsuspend<P: tx_hal::TimeIf>(
+    args: [u64; 6],
+    ctx: &SyscallCtx<'_>,
+) -> SyscallResult {
+    let mask_ptr = args[0];
+    let sigset_size = args[1];
+    if mask_ptr == 0 {
+        return SyscallResult::Error(EFAULT_VALUE);
+    }
+    if sigset_size != core::mem::size_of::<u64>() as u64 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    let mask_bits = match bootstrap_read_user::<u64>(&ctx.aspace, mask_ptr) {
+        Ok(bits) => bits,
+        Err(errno) => return SyscallResult::error_from(errno),
+    };
+    let old_mask = match set_thread_signal_mask(ctx, SignalMask::new(mask_bits)) {
+        Ok(mask) => mask,
+        Err(result) => return result,
+    };
+
+    let restore_and_eintr = |ctx: &SyscallCtx<'_>, old_mask: SignalMask| {
+        let _ = set_thread_signal_mask(ctx, old_mask);
+        SyscallResult::Error(EINTR_VALUE)
+    };
+
+    const CHUNK_NS: u64 = 5_000_000;
+    loop {
+        if let Some(deadline_ns) = poll_due_itimers::<P>(&ctx.process) {
+            P::set_deadline_ns(deadline_ns);
+        }
+        if tx_subsystems::signal::select_next_signal(&ctx.thread).is_some() {
+            return restore_and_eintr(ctx, old_mask);
+        }
+
+        use crate::adapter::step_engine::DriveMode;
+        use tx_scripts::drive;
+        let now_ns = <P as tx_hal::TimeIf>::read_ns();
+        let mut script_ctx = build_subject_script_ctx(ctx);
+        let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+        let mailbox = ctx.mailbox.clone();
+        let op = NanosleepOp {
+            nanos: CHUNK_NS,
+            deadline_ns: now_ns.saturating_add(CHUNK_NS),
+            started: false,
+        };
+        match drive(
+            op,
+            &mut script_ctx,
+            DriveMode::Waiting,
+            mailbox.as_ref(),
+            None,
+            timer_wheel_arc.as_ref(),
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(v3errno) => {
+                let errno: Errno = v3errno.into();
+                if errno == Errno::EINTR {
+                    return restore_and_eintr(ctx, old_mask);
+                }
+                let _ = set_thread_signal_mask(ctx, old_mask);
+                return SyscallResult::error_from(errno);
+            }
+        }
+    }
 }
 
 /// `sigaltstack(ss, old_ss)` — Linux LP64 `stack_t` query/update.
@@ -455,169 +537,248 @@ pub(super) fn sys_rt_sigqueueinfo(_args: [u64; 6], _ctx: &SyscallCtx) -> Syscall
     SyscallResult::Error(ENOSYS_VALUE)
 }
 
+fn lowest_sigtimedwait_bit(bits: u64) -> Option<Signum> {
+    if bits == 0 {
+        return None;
+    }
+    let raw = bits.trailing_zeros() as u8 + 1;
+    Signum::new(raw)
+}
+
+fn take_matching_pending_signal(ctx: &SyscallCtx<'_>, wait_bits: u64) -> Option<Signum> {
+    let thread_payload = ctx.thread.payload_cap()?;
+    let thread_match = thread_payload.pending().snapshot() & wait_bits;
+    if let Some(sig) = lowest_sigtimedwait_bit(thread_match) {
+        thread_payload.pending().clear(sig);
+        tx_subsystems::signal::refresh_deliverable_signal_summary(&ctx.thread);
+        return Some(sig);
+    }
+
+    let proc_payload = ctx.process.upgrade_operational().ok()?;
+    let group_match = proc_payload.group_pending().snapshot() & wait_bits;
+    let sig = lowest_sigtimedwait_bit(group_match)?;
+    proc_payload.group_pending().clear(sig);
+    tx_subsystems::signal::refresh_deliverable_signal_summary(&ctx.thread);
+    Some(sig)
+}
+
+fn write_sigtimedwait_siginfo(ctx: &SyscallCtx<'_>, info_ptr: u64, sig: Signum) -> Result<(), i32> {
+    if info_ptr == 0 {
+        return Ok(());
+    }
+
+    let mut image = [0u8; 128];
+    image[0..4].copy_from_slice(&(sig.raw() as u32).to_le_bytes());
+    image[8..12].copy_from_slice(&0i32.to_le_bytes());
+    bootstrap_copy_to_user(&ctx.aspace, info_ptr, &image).map_err(errno_to_i32)
+}
+
+async fn park_sigtimedwait_tick<P: tx_hal::TimeIf>(
+    ctx: &SyscallCtx<'_>,
+    wait_bits: u64,
+    deadline_ns: Option<u64>,
+) {
+    const SIGTIMEDWAIT_POLL_NS: u64 = 1_000_000;
+
+    if wait_bits & Signum::SIGCHLD.bit() != 0 && deadline_ns.is_none() {
+        if let Some(token) = ctx.process.exit_source_wait_token() {
+            if let Some(future) = tx_subsystems::wait_source::wait_on_token(token) {
+                future.await;
+                return;
+            }
+        }
+    }
+
+    let now = <P as tx_hal::TimeIf>::read_ns();
+    let next = match deadline_ns {
+        Some(deadline) => core::cmp::min(deadline, now.saturating_add(SIGTIMEDWAIT_POLL_NS)),
+        None => now.saturating_add(SIGTIMEDWAIT_POLL_NS),
+    };
+    if let Some(future) = tx_subsystems::timer_sleep::sleep_until_ns(next) {
+        future.await;
+    } else {
+        tx_reactor::yield_now().await;
+    }
+}
+
 /// `rt_sigtimedwait(set, info, timeout, sigsetsize)` — Linux RV64
 /// ABI `__NR_rt_sigtimedwait = 137`.
 ///
-/// Polls the calling thread's pending-signal bitset for any signal
-/// in `set`, with the given timeout (NULL = block forever).
-/// Returns the first matching signum on success, `-EAGAIN` on
-/// timeout. Does NOT invoke the signal handler — the signal is
-/// consumed from `payload.pending()` instead.
-///
-/// Implementation: synchronous poll loop. Each iteration reads
-/// `payload.pending()`, checks for any bit also set in `set`, and
-/// if found, clears that bit and returns its signum. Between
-/// polls the calling task awaits a short [`NanosleepOp`] so other
-/// reactor tasks (notably any sibling thread that will post the
-/// signal — usually `post_sigchld_to_parent` for a child exit)
-/// get a chance to run.
-///
-/// Carved out as the libctest unblock per `SYSCALL_STATUS.md`'s
-/// "wire `sys_rt_sigtimedwait`" high-stakes row (libctest's
-/// `runtest.c` uses `sigtimedwait(SIGCHLD, …)` to wait for child
-/// processes; without a real implementation it returns `-ENOSYS`
-/// and every test scores 0/220 with `[signal Killed]`).
+/// Consumes a pending signal named by `set`, optionally waits until
+/// `timeout` expires, and writes the leading Linux `siginfo_t` fields.
+/// Signal-mask interaction is intentionally different from normal
+/// delivery: `sigtimedwait(2)` observes pending signals in `set` even
+/// when they are blocked, which is how runtest waits for child SIGCHLD.
 pub(super) async fn sys_rt_sigtimedwait<'a, P: tx_hal::TimeIf>(
     args: [u64; 6],
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
-    let set_uaddr = args[0];
-    let info_uaddr = args[1];
-    let timeout_uaddr = args[2];
-    let sigsetsize = args[3] as usize;
+    let set_ptr = args[0];
+    let info_ptr = args[1];
+    let timeout_ptr = args[2];
+    let sigsetsize = args[3];
 
-    // The slice only supports the canonical 8-byte sigset_t on RV64;
-    // mirrors the `sys_rt_sigprocmask` precedent (`SIGSETSIZE_BYTES`).
-    if sigsetsize != SIGSETSIZE_BYTES as usize {
+    if sigsetsize != SIGSETSIZE_BYTES {
         return SyscallResult::Error(EINVAL_VALUE);
     }
-    if set_uaddr == 0 {
+    if set_ptr == 0 {
         return SyscallResult::Error(EFAULT_VALUE);
     }
 
-    // Read the requested signal set (64-bit bitset).
-    let set_bits: u64 = match bootstrap_read_user::<u64>(&ctx.aspace, set_uaddr) {
-        Ok(v) => v,
-        Err(_) => return SyscallResult::Error(EFAULT_VALUE),
+    let wait_bits = match bootstrap_read_user::<u64>(&ctx.aspace, set_ptr) {
+        Ok(bits) => bits,
+        Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
     };
-    if set_bits == 0 {
-        // Empty set — no signal can ever match. Block until timeout.
-    }
-
-    // Read the timeout. NULL means block forever (we cap at a
-    // generous u64::MAX/2 sentinel below since the reactor doesn't
-    // actually park us for years — each polling iteration sleeps
-    // ~5ms and re-checks).
-    let timeout_ns: u64 = if timeout_uaddr == 0 {
-        u64::MAX / 2
+    let timeout_ns = if timeout_ptr == 0 {
+        None
     } else {
-        match read_timespec_at(&ctx.aspace, timeout_uaddr) {
-            Some(ns) => ns,
+        match read_timespec_at(&ctx.aspace, timeout_ptr) {
+            Some(ns) => Some(ns),
             None => return SyscallResult::Error(EINVAL_VALUE),
         }
     };
-
-    let Some(payload) = ctx.thread.payload_cap() else {
-        return SyscallResult::Error(EFAULT_VALUE);
-    };
-
-    let start_ns = <P as tx_hal::TimeIf>::read_ns();
-    let deadline_ns = start_ns.saturating_add(timeout_ns);
+    let deadline_ns = timeout_ns.map(|ns| <P as tx_hal::TimeIf>::read_ns().saturating_add(ns));
 
     // `await_mailbox_event` (in `tx-scripts::drive::resolve_on_timer`)
-    // RE-POSTS any `SignalDelivered` event it consumes back to the
-    // mailbox so the caller's main loop can observe it. For
-    // sigtimedwait, the "main loop" IS this loop, and we consume
-    // signals directly from `payload.pending()` — so the re-posted
-    // event is stale information. If left in the queue it traps every
-    // subsequent `drive(NanosleepOp)` call into returning Ready(true)
-    // immediately, creating a no-actual-sleep tight loop. Drain any
-    // pre-existing `SignalDelivered` events left over from a previous
-    // sigtimedwait call on this same thread before the poll loop
-    // starts; the per-iteration drain below handles new arrivals.
+    // re-posts any SignalDelivered event it consumes. sigtimedwait
+    // consumes pending bits directly, so stale signal events would make
+    // the timer wait return immediately and spin; drain them around
+    // the polling loop.
     let mailbox_for_drain = ctx.mailbox.clone();
     if let Some(ref mbox) = mailbox_for_drain {
         drain_stale_signal_events(mbox);
     }
-
-    // Poll-and-yield loop. 5 ms chunks: long enough that we don't
-    // spin-burn the reactor, short enough that libctest tests with
-    // sub-second test bodies (most of them) react promptly to a
-    // child-exit-posted SIGCHLD.
-    const CHUNK_NS: u64 = 5_000_000;
     loop {
-        // Fast path: consume the first matching pending bit.
-        let pending = payload.pending().snapshot() & set_bits;
-        if pending != 0 {
-            let signum_raw = (pending.trailing_zeros() + 1) as u8;
-            if let Some(sig) = tx_subsystems::signal::Signum::new(signum_raw) {
-                payload.pending().clear(sig);
-                // Optionally write the siginfo struct. We don't
-                // synthesise full siginfo — kernel-posted SIGCHLD
-                // carries enough state via wait4 — but a non-zero
-                // `info_uaddr` deserves at least a zeroed-out buffer
-                // so the caller sees a valid struct shape rather
-                // than uninitialised stack memory.
-                if info_uaddr != 0 {
-                    let zeros = [0u8; 128];
-                    let _ = bootstrap_copy_to_user(&ctx.aspace, info_uaddr, &zeros);
-                }
-                return SyscallResult::Return(signum_raw as i64);
+        if let Some(sig) = take_matching_pending_signal(ctx, wait_bits) {
+            if let Err(errno) = write_sigtimedwait_siginfo(ctx, info_ptr, sig) {
+                return SyscallResult::Error(errno);
             }
+            return SyscallResult::Return(sig.raw() as i64);
         }
 
-        // Timeout check before the next yield.
-        let now_ns = <P as tx_hal::TimeIf>::read_ns();
-        if now_ns >= deadline_ns {
-            return SyscallResult::Error(EAGAIN_VALUE);
-        }
-
-        // Async-friendly chunk wait. Reuse the `NanosleepOp`
-        // machinery so we yield on the timer wheel; the next reactor
-        // poll re-enters this loop. **Critically**, pass the calling
-        // task's mailbox to `drive()` — without it,
-        // `resolve_on_timer` short-circuits to `Retry` immediately
-        // and the "5 ms sleep" becomes a no-op spin (parent then
-        // hogs the reactor so the child never runs).
-        let chunk = CHUNK_NS.min(deadline_ns.saturating_sub(now_ns));
-        use crate::adapter::step_engine::DriveMode;
-        use tx_scripts::drive;
-        let mut script_ctx = build_subject_script_ctx(ctx);
-        let timer_wheel_arc = script_ctx.timer_wheel().cloned();
-        let mailbox = ctx.mailbox.clone();
-        let op = super::NanosleepOp {
-            nanos: chunk,
-            deadline_ns: now_ns.saturating_add(chunk),
-            started: false,
-        };
-        let _ = drive(
-            op,
-            &mut script_ctx,
-            DriveMode::Waiting,
-            mailbox.as_ref(),
-            None,
-            timer_wheel_arc.as_ref(),
-        )
-        .await;
-
-        // After drive returns, drain any `SignalDelivered` events
-        // the inner mailbox-await re-posted. See the matching
-        // comment at the top of this function — without this
-        // drain, a single stale SignalDelivered traps every
-        // subsequent drive iteration into a tight loop and the
-        // 5 ms sleep degenerates to a no-op spin.
-        if let Some(ref mbox) = mailbox {
-            drain_stale_signal_events(mbox);
+        match deadline_ns {
+            Some(deadline) if <P as tx_hal::TimeIf>::read_ns() >= deadline => {
+                return SyscallResult::Error(EAGAIN_VALUE);
+            }
+            Some(_) | None => {
+                park_sigtimedwait_tick::<P>(ctx, wait_bits, deadline_ns).await;
+                if let Some(ref mbox) = ctx.mailbox {
+                    drain_stale_signal_events(mbox);
+                }
+            }
         }
     }
 }
 
-pub(super) fn sys_pidfd_open(_args: [u64; 6], _ctx: &SyscallCtx) -> SyscallResult {
-    SyscallResult::Error(ENOSYS_VALUE)
+pub(super) fn sys_pidfd_open(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
+    let pid_raw = args[0];
+    let flags = args[1] as u32;
+
+    if pid_raw == 0 || pid_raw > i32::MAX as u64 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if flags & !O_NONBLOCK != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    let target = match resolve_pid_number_as(pid_raw, PidNameKind::Process) {
+        Some(PidName::Process(process)) => process,
+        _ => return SyscallResult::Error(ESRCH_VALUE),
+    };
+
+    let fd = ctx.process.allocate_fd();
+    let (soft_limit, _) = ctx.process.rlimit_nofile();
+    if fd >= soft_limit {
+        return SyscallResult::Error(EMFILE_VALUE);
+    }
+
+    let open_flags = OpenFileFlags {
+        read: true,
+        write: false,
+        append: false,
+        cloexec: true,
+        nonblocking: (flags & O_NONBLOCK) != 0,
+        packet: false,
+    };
+    let open_cap = match OpenFile::new_pidfd_cap(target, open_flags) {
+        Ok(cap) => cap,
+        Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+    };
+    let _ = ctx.process.install_fd(fd, open_cap);
+    ctx.process.set_fd_cloexec(fd, true);
+    SyscallResult::Return(fd as i64)
 }
 
-pub(super) fn sys_pidfd_send_signal(_args: [u64; 6], _ctx: &SyscallCtx) -> SyscallResult {
-    SyscallResult::Error(ENOSYS_VALUE)
+fn process_from_pidfd_like_file(file: &OpenFile) -> Option<Cap<ProcessIdentity>> {
+    if let Some(process) = file.pidfd_process() {
+        return Some(process.clone());
+    }
+    match file.backing() {
+        OpenFileBacking::Rnode { rnode } => {
+            tx_fs::procfs::pid_from_dir(rnode.fs_object_id()).and_then(process_by_pid)
+        }
+        _ => None,
+    }
+}
+
+pub(super) fn sys_pidfd_send_signal(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
+    let fd = args[0] as u32;
+    let sig = args[1] as u32;
+    let info_ptr = args[2];
+    let flags = args[3] as u32;
+
+    if flags != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+
+    let file = match ctx.process.fd(fd) {
+        Some(file) => file,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+    let target = match process_from_pidfd_like_file(&file) {
+        Some(target) => target,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+
+    if sig > 64 {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    if info_ptr != 0 {
+        let mut signo_bytes = [0u8; 4];
+        if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut signo_bytes, info_ptr) {
+            return SyscallResult::error_from(errno);
+        }
+        let info_signo = u32::from_le_bytes(signo_bytes);
+        if info_signo != sig {
+            return SyscallResult::Error(EINVAL_VALUE);
+        }
+    }
+    if sig == 0 {
+        return SyscallResult::Return(0);
+    }
+    let signum = match u8::try_from(sig).ok().and_then(Signum::new) {
+        Some(signum) => signum,
+        None => return SyscallResult::Error(EINVAL_VALUE),
+    };
+    let siginfo = Some(SigInfo {
+        si_signo: signum.raw() as u32,
+        si_code: SI_USER,
+        si_pid: ctx.process.pid.0,
+        si_uid: 0,
+    });
+
+    dispatch_errno(
+        tx_subsystems::signal::script_deliver_signal(
+            &ctx.process,
+            SignalTarget::Process(target),
+            signum,
+            siginfo,
+        ),
+        |outcome| match outcome {
+            KillOutcome::Delivered => SyscallResult::Return(0),
+            KillOutcome::NoLiveThread => SyscallResult::Error(ESRCH_VALUE),
+        },
+    )
 }
 
 /// `rt_sigaction(signum, act, oldact, sigsetsize)` per `SIGNAL_v1`
@@ -998,11 +1159,48 @@ pub(super) fn sys_rt_sigreturn(ctx: &SyscallCtx) -> SyscallResult {
     let Some(payload) = ctx.thread.payload_cap() else {
         return SyscallResult::Error(EFAULT_VALUE);
     };
-    let Some(saved) = payload.take_saved_signal_context() else {
+
+    let current = payload.saved_user_context();
+    if let Some(current_ctx) = current {
+        if let Ok(frame) = read_compat_signal_frame(&ctx.aspace, current_ctx.regs[2] as u64) {
+            let mut script_ctx = build_subject_script_ctx(ctx);
+            let mut op = SigprocmaskOp {
+                thread: ctx.thread.clone(),
+                how: SigmaskHow::SetMask,
+                next: SignalMask::new(frame.saved_mask.bits),
+            };
+            let _ = step_engine::drive_oneshot(&mut op, &mut script_ctx);
+            let _ = payload.take_saved_signal_context();
+            let _ = payload.take_saved_signal_mask();
+            payload.store_saved_user_context(Some(frame.user_context));
+            return SyscallResult::SigreturnContextRestored;
+        }
+    }
+
+    if let Some(saved) = payload.take_saved_signal_context() {
+        if let Some(mask) = payload.take_saved_signal_mask() {
+            payload.store_signal_mask(mask);
+        }
+        payload.store_saved_user_context(Some(saved));
+        return SyscallResult::SigreturnRestored;
+    }
+
+    let Some(current) = current else {
         return SyscallResult::Error(EFAULT_VALUE);
     };
-    payload.store_saved_user_context(Some(saved));
-    SyscallResult::SigreturnRestored
+    let frame = match read_compat_signal_frame(&ctx.aspace, current.regs[2] as u64) {
+        Ok(frame) => frame,
+        Err(errno) => return SyscallResult::Error(errno),
+    };
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mut op = SigprocmaskOp {
+        thread: ctx.thread.clone(),
+        how: SigmaskHow::SetMask,
+        next: SignalMask::new(frame.saved_mask.bits),
+    };
+    let _ = step_engine::drive_oneshot(&mut op, &mut script_ctx);
+    payload.store_saved_user_context(Some(frame.user_context));
+    SyscallResult::SigreturnContextRestored
 }
 
 /// `rt_sigpending(set, sigsetsize)` — Linux RV64 generic ABI
@@ -1019,9 +1217,10 @@ pub(super) fn sys_rt_sigpending(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResu
         return SyscallResult::Error(EINVAL_VALUE);
     }
 
-    // TODO(merge-fixup): upgrade_operational removed from Cap<ThreadIdentity>;
-    // stub with empty pending set until thread payload accessor lands.
-    let pending: u64 = 0;
+    let Some(payload) = ctx.thread.payload_cap() else {
+        return SyscallResult::Error(ESRCH_VALUE);
+    };
+    let pending = payload.pending().snapshot() | ctx.process.group_pending_snapshot();
     if let Err(errno) = bootstrap_write_user::<u64>(&ctx.aspace, set_ptr as u64, pending) {
         return SyscallResult::error_from(errno);
     }

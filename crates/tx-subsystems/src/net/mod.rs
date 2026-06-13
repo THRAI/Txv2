@@ -121,7 +121,7 @@ pub use project::{
 pub use protocol::{
     ArpEntry, EtherIface, EtherPacketSource, EtherPacketTxSink, Icmpv4EchoPacket, Icmpv4Event,
     NetStats, RawIcmpSocket, RawTcpSocket, RawUdpSocket, SmoltcpAdapter, SmoltcpAdapterConfig,
-    SmoltcpPacketSource, SmoltcpPacketTxSink,
+    SmoltcpPacketSource, SmoltcpPacketTxSink, UDP_IPV4_MAX_PAYLOAD_BYTES,
 };
 pub use rtnetlink::{
     create_vlan_link, netlink_route_recv, netlink_route_recv_available, netlink_route_recv_packet,

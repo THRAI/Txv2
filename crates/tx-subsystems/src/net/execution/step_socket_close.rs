@@ -403,6 +403,11 @@ fn withdraw_unix_binding_on_close(
     if local.is_abstract() {
         withdraw_ok(table.unlink_unix_path(local))
     } else {
+        // Pathname sockets follow Linux persist-until-unlink semantics: close
+        // withdraws the live binding but the path node survives until an
+        // explicit unlink(2). Cross-test name collisions are prevented by
+        // cwd-normalizing the path key at bind/connect time (see helpers.rs),
+        // not by releasing the node here (that breaks bind/close/unlink tests).
         withdraw_ok(table.withdraw_unix_bound(local))
     }
 }

@@ -3,7 +3,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use tx_hal::{PmapIf, UserTrapContext};
 
@@ -19,8 +19,10 @@ use crate::process::structure::{
 use crate::process::topology::{
     ProcessChildren, ProcessGroupMembers, ProcessThreads, SessionMembers,
 };
-use crate::signal::{sync_thread_group_pending_summary, PendingSignalQueue, SigActionTable};
-use crate::thread_runtime::execution::set_thread_zombie;
+use crate::signal::{
+    sync_thread_group_pending_summary, PendingSignalQueue, SigActionTable, SignalMask,
+};
+use crate::thread_runtime::execution::{notify_thread_exit_userspace_in_aspace, set_thread_zombie};
 use crate::thread_runtime::structure::{allocate_tid, ThreadIdentity, ThreadPayload, Tid};
 use crate::vfs::OpenFile;
 use crate::vm::{AddressSpace, VmMapError};
@@ -111,7 +113,8 @@ pub fn process_by_pid(pid: Pid) -> Option<Cap<ProcessIdentity>> {
     }
 }
 
-/// Look up a process group by PGID (for `kill(-pgid, sig)`).
+/// Look up a process group by PGID. Restored alongside the net subsystem
+/// re-home; used by signal delivery to a process group (`kill(-pgid, ...)`).
 pub fn process_group_by_pgid(pgid: Pgid) -> Option<Cap<ProcessGroup>> {
     match resolve_pid_number_as(pgid.0 as u64, PidNameKind::ProcessGroup) {
         Some(PidName::ProcessGroup(cap)) => Some(cap),
@@ -365,18 +368,20 @@ pub fn bootstrap_init_process(
         aspace,
         vec![leader.clone()],
         nsproxy,
-        init_net_namespace,
         Cred::root(),
         None,
         BTreeMap::new(),
         BTreeSet::new(),
         (1024, 4096),
+        (u64::MAX, u64::MAX),
+        init_net_namespace,
         BOOTSTRAP_BRK_BASE,
         BOOTSTRAP_BRK_BASE,
         // Slice 6 of the shell-prompt roadmap. init's file-creation
         // mask defaults to `0o022` per Linux convention; children
         // inherit through `step_fork`'s umask thread-through.
         0o022,
+        0,
         Arc::new(SigActionTable::new()),
     )?;
     *proc_cap.payload.lock() = Some(payload);
@@ -418,8 +423,6 @@ pub fn step_fork<P: PmapIf>(
             clone_vm,
             clone_sighand,
             clone_newipc: false,
-            clone_newnet: false,
-            clone_newns: false,
         },
     )
 }
@@ -429,12 +432,6 @@ pub struct ForkOptions {
     pub clone_vm: bool,
     pub clone_sighand: bool,
     pub clone_newipc: bool,
-    /// `CLONE_NEWNET` — give the child a fresh, isolated network namespace
-    /// instead of inheriting the parent's. Used by `tst_ns_create net,mnt`.
-    pub clone_newnet: bool,
-    /// `CLONE_NEWNS` — accepted so clone(CLONE_NEWNS) succeeds; full mount-
-    /// namespace isolation is deferred (child currently shares parent mnt_ns).
-    pub clone_newns: bool,
 }
 
 pub fn step_fork_with_options<P: PmapIf>(
@@ -459,41 +456,48 @@ pub fn step_fork_with_options<P: PmapIf>(
     let (
         parent_aspace,
         parent_nsproxy,
-        parent_net_namespace,
         parent_cred,
         parent_cwd,
         parent_fds,
         parent_fd_cloexec,
         parent_rlimit_nofile,
+        parent_rlimit_memlock,
+        parent_net_namespace,
         parent_brk_base,
         parent_current_brk,
         parent_umask,
+        parent_personality,
     ) = {
         let payload_guard = parent.payload.lock();
         let payload = payload_guard.as_ref().ok_or(ForkError::ParentZombie)?;
         (
             payload.aspace_cap(),
             payload.nsproxy_cap(),
-            payload.net_namespace(),
             payload.cred(),
             payload.cwd(),
             payload.clone_fds_for_fork(),
             payload.fd_cloexec_snapshot(),
             payload.rlimit_nofile(),
+            payload.rlimit_memlock(),
+            payload.net_namespace(),
             payload.brk_base(),
             payload.current_brk(),
             payload.umask(),
+            payload.personality(),
         )
     };
     let parent_pgrp = parent.pgrp.lock().clone();
 
-    // Signal-action table: share via Arc (CLONE_SIGHAND) or fresh.
+    // Signal-action table: share via Arc for CLONE_SIGHAND; otherwise
+    // fork snapshots the parent's dispositions.
     let child_sig_actions = if options.clone_sighand {
         let payload_guard = parent.payload.lock();
         let payload = payload_guard.as_ref().ok_or(ForkError::ParentZombie)?;
         Arc::clone(&payload.frame.sig_actions)
     } else {
-        Arc::new(SigActionTable::new())
+        let payload_guard = parent.payload.lock();
+        let payload = payload_guard.as_ref().ok_or(ForkError::ParentZombie)?;
+        Arc::new((*payload.frame.sig_actions).clone())
     };
 
     // Address space: fork (CoW clone) or share (CLONE_VM).
@@ -527,35 +531,21 @@ pub fn step_fork_with_options<P: PmapIf>(
     let child_nsproxy =
         crate::process::nsproxy::clone_nsproxy_for_fork(&parent_nsproxy, options.clone_newipc)
             .map_err(ForkError::Zone)?;
-    // CLONE_NEWNET: publish a fresh isolated network namespace for the child
-    // (owned by the parent's user namespace) instead of inheriting the
-    // parent's. Required by LTP's `tst_ns_create net,mnt`. CLONE_NEWNS is
-    // accepted but mount-namespace isolation is deferred (see ForkOptions).
-    let child_net_namespace = if options.clone_newnet {
-        let namespace = crate::net::create_isolated_net_namespace_with_owner(
-            "clone",
-            Some(parent_nsproxy.user_ns.clone()),
-        )
-        .map_err(ForkError::Zone)?;
-        namespace
-            .payload_cap()
-            .ok_or(ForkError::Zone(ZoneError::InvalidState))?
-    } else {
-        parent_net_namespace
-    };
     let payload = sign_process_payload(
         child_aspace_cap,
         vec![leader],
         child_nsproxy,
-        child_net_namespace,
         parent_cred,
         parent_cwd,
         parent_fds,
         parent_fd_cloexec,
         parent_rlimit_nofile,
+        parent_rlimit_memlock,
+        parent_net_namespace,
         parent_brk_base,
         parent_current_brk,
         parent_umask,
+        parent_personality,
         child_sig_actions,
     )
     .map_err(ForkError::Zone)?;
@@ -701,15 +691,20 @@ pub fn seed_child_leader_context(
     //     that stack); a zero `newsp` means "the child shares the
     //     parent's sp" (bare fork convention).
     //
-    //     Also seed the ABI frame pointer to the same value. Some libc
-    //     clone wrappers use fp-relative addressing in the post-syscall
-    //     path shared by parent and child. fp inherits the parent's
-    //     frame pointer from the trap context; if the child stack is
-    //     smaller, the fp-relative store/load can land outside the
-    //     child's allocation and turn into a userspace SIGSEGV.
+    //     On LoongArch64, musl's clone child path explicitly clears
+    //     `$fp` before it starts consuming the new stack. Mirroring
+    //     that shape avoids inheriting a parent frame chain into the
+    //     child. RV64 keeps the old "fp follows sp" workaround.
     if stack != 0 {
         child_ctx.regs[STACK_REG_INDEX] = stack;
-        child_ctx.regs[FRAME_REG_INDEX] = stack;
+        #[cfg(target_arch = "loongarch64")]
+        {
+            child_ctx.regs[FRAME_REG_INDEX] = 0;
+        }
+        #[cfg(not(target_arch = "loongarch64"))]
+        {
+            child_ctx.regs[FRAME_REG_INDEX] = stack;
+        }
     }
     // (4) PC already points past `ecall`: the trap shell
     // (`tx-kernel::trap_handoff::hand_off_syscall`) added the 4-byte
@@ -741,6 +736,7 @@ pub fn seed_child_leader_context(
 pub fn step_clone_thread(
     process: &Cap<ProcessIdentity>,
     parent_user_ctx: &UserTrapContext,
+    parent_signal_mask: SignalMask,
     stack: usize,
     tls: usize,
     ctid_ptr: u64,
@@ -781,6 +777,11 @@ pub fn step_clone_thread(
     );
     emit_clone_thread_marker(b"debug.clone_thread.seed_context.after", tid.0 as i64);
     let clear_ctid_start = clone_path_clock_now();
+    if let Some(payload) = child.payload_cap() {
+        payload
+            .signal_mask
+            .store(parent_signal_mask.raw_bits(), Ordering::Release);
+    }
     if ctid_ptr != 0 {
         let payload = child
             .payload_cap()
@@ -880,30 +881,16 @@ pub fn step_exit_group(process: &Cap<ProcessIdentity>, status: ExitStatus) {
 
     let mut payload_guard = process.payload.lock();
     if let Some(payload) = payload_guard.as_ref() {
+        let aspace = payload.aspace_cap();
         let _shm_detach = measure_process_lock_service(
             b"debug.lock_service.process.payload.exit_group.shm_detach.duration_ns",
-            || crate::ipc::sysv_shm::execution::detach_all_for_aspace(&payload.aspace_cap()),
+            || crate::ipc::sysv_shm::execution::detach_all_for_aspace(&aspace),
         );
         let closed_fds = measure_process_lock_service(
             b"debug.lock_service.process.payload.exit_group.drain_fds.duration_ns",
             || payload.drain_fds(),
         );
-        // Release socket port/table bindings, mirroring step_process_exit:
-        // fd-Cap drop alone never runs the socket-close teardown, so a
-        // SIGKILLed listener (route_gewalt → step_exit_group_with_signal
-        // lands here, not in step_process_exit) kept its port reserved and
-        // the next bind failed EADDRINUSE — netperf_testcode.sh kill -9's
-        // its netserver between the musl and glibc groups. Skip fds still
-        // shared (dup/fork) so a forked child keeps the listener.
-        for file in closed_fds.values() {
-            if file.retain_count() > 1 {
-                continue;
-            }
-            if let Some(socket) = file.socket_identity() {
-                let guard = tx_substrate::epoch::guard();
-                let _ = crate::net::execution::step_socket_close(socket, &guard);
-            }
-        }
+        close_socket_files_for_process_exit(&closed_fds);
         let drained: Vec<Cap<ThreadIdentity>> = measure_process_lock_service(
             b"debug.lock_service.process.payload.exit_group.threads_drain.duration_ns",
             || payload.threads.drain(),
@@ -912,6 +899,7 @@ pub fn step_exit_group(process: &Cap<ProcessIdentity>, status: ExitStatus) {
             b"debug.lock_service.process.payload.exit_group.zombify_threads.duration_ns",
             || {
                 for thread in &drained {
+                    notify_thread_exit_userspace_in_aspace(thread, &aspace);
                     set_thread_zombie(thread, status.wait_status_word());
                     if thread.tid.0 != process.pid.0 {
                         unregister_tid_number(thread.tid.0 as u64);
@@ -933,6 +921,10 @@ pub fn step_exit_group(process: &Cap<ProcessIdentity>, status: ExitStatus) {
     );
     drop(payload_guard);
     *process.exit_status.lock() = Some(status);
+
+    if try_auto_reap_adopted_by_init(process) {
+        return;
+    }
 
     // §7.3.3 phase 5: notify the parent. Posted after zombification so
     // the parent observes a complete zombie when it acts on SIGCHLD.
@@ -974,24 +966,7 @@ pub(crate) fn step_process_exit(process: &Cap<ProcessIdentity>, status: ExitStat
             b"debug.lock_service.process.payload.process_exit.drain_fds.duration_ns",
             || payload.drain_fds(),
         );
-        // Release socket port/table bindings for any socket fd this process was
-        // the last owner of. Process exit drops the fd Caps but — unlike the
-        // explicit close(2) path (maybe_close_socket_file_after_fd_remove ->
-        // step_socket_close) — never ran the socket-close teardown, so a bound
-        // port stayed reserved in the socket table and the next process binding
-        // the same endpoint failed EADDRINUSE. This bites back-to-back LTP test
-        // processes, especially a test that exits via early TBROK before closing
-        // its sockets. Skip fds still shared (dup/fork) so a forked child keeps
-        // the listener until it too exits.
-        for file in closed_fds.values() {
-            if file.retain_count() > 1 {
-                continue;
-            }
-            if let Some(socket) = file.socket_identity() {
-                let guard = tx_substrate::epoch::guard();
-                let _ = crate::net::execution::step_socket_close(socket, &guard);
-            }
-        }
+        close_socket_files_for_process_exit(&closed_fds);
         measure_process_lock_service(
             b"debug.lock_service.process.payload.process_exit.drop_closed_fds.duration_ns",
             || drop(closed_fds),
@@ -1001,7 +976,42 @@ pub(crate) fn step_process_exit(process: &Cap<ProcessIdentity>, status: ExitStat
         b"debug.lock_service.process.payload.process_exit.payload_drop.duration_ns",
         || *payload_guard = None,
     );
+    if try_auto_reap_adopted_by_init(process) {
+        return;
+    }
     post_sigchld_to_parent(process);
+}
+
+fn close_socket_files_for_process_exit(fds: &BTreeMap<u32, Cap<OpenFile>>) {
+    let mut seen_files = Vec::new();
+    for file in fds.values() {
+        let raw_file = file.raw();
+        if seen_files.contains(&raw_file) {
+            continue;
+        }
+        seen_files.push(raw_file);
+
+        let drained_refs = fds
+            .values()
+            .filter(|candidate| candidate.raw() == raw_file)
+            .count() as u32;
+        if file.retain_count() > drained_refs {
+            continue;
+        }
+
+        let crate::vfs::structure::OpenFileBacking::Rnode { rnode } = file.backing() else {
+            continue;
+        };
+        let crate::vfs::structure::RNodeBacking::StructBacked {
+            payload: crate::vfs::structure::StructPayload::Socket { identity },
+        } = rnode.backing()
+        else {
+            continue;
+        };
+
+        let guard = step_engine::guard();
+        let _ = crate::net::execution::step_socket_close(identity, &guard);
+    }
 }
 
 /// Children reparenting per `PROCESS_v1` §8.1. Three cases:
@@ -1029,7 +1039,12 @@ fn sever_children(process: &Cap<ProcessIdentity>) {
         let init_weak = init.downgrade();
         for child in children {
             *child.parent.lock() = Some(init_weak);
-            init.children.attach(child);
+            child.adopted_by_init.store(true, Ordering::Release);
+            if child.is_zombie() {
+                reap_child_from_parent(init, &child);
+            } else {
+                init.children.attach(child);
+            }
         }
     } else {
         for child in children {
@@ -1154,6 +1169,49 @@ fn post_sigchld_to_parent(process: &Cap<ProcessIdentity>) {
     }
 }
 
+fn reap_child_from_parent(parent: &Cap<ProcessIdentity>, child: &Cap<ProcessIdentity>) {
+    let key = child.key();
+
+    parent.children.retain(|c| c.key() != key);
+
+    let pgrp = child.pgrp_cap();
+    pgrp.members.retain(|weak| {
+        weak.observe_with_guard(|ident| ident.key() != key)
+            .unwrap_or(true)
+    });
+
+    unregister_pid(child.pid);
+}
+
+fn maintenance_after_process_reap() {
+    if step_engine::borrow_current_guard().is_some() {
+        return;
+    }
+
+    let _ = step_engine::drain_with_budget(128);
+    let _ = step_engine::drain_with_budget(128);
+    let _ = crate::vm::drain_deferred_recipe_reclaims(128);
+}
+
+fn try_auto_reap_adopted_by_init(process: &Cap<ProcessIdentity>) -> bool {
+    if !process.adopted_by_init.load(Ordering::Acquire) {
+        return false;
+    }
+    let Some(parent) = process.parent_cap() else {
+        return false;
+    };
+    let Some(init) = init_process() else {
+        return false;
+    };
+    if parent.key() != init.key() {
+        return false;
+    }
+
+    reap_child_from_parent(&parent, process);
+    maintenance_after_process_reap();
+    true
+}
+
 /// Exit the entire thread group due to a fatal signal. Records
 /// `ExitStatus::Signaled(sig)` and runs the same payload teardown as
 /// `step_exit_group`.
@@ -1241,18 +1299,9 @@ pub fn step_waitpid_nohang(
     // eligible for reclamation after epoch drain.
     let pid = child.pid;
     let status = child.exit_status().expect("zombie has exit_status");
-    let key = child.key();
-
-    parent.children.retain(|c| c.key() != key);
-
-    let pgrp = child.pgrp_cap();
-    pgrp.members.retain(|weak| {
-        weak.observe_with_guard(|ident| ident.key() != key)
-            .unwrap_or(true)
-    });
-
-    unregister_pid(pid);
+    reap_child_from_parent(parent, &child);
     drop(child);
+    maintenance_after_process_reap();
 
     Ok((pid, status))
 }
@@ -1432,6 +1481,7 @@ fn sign_process_identity(
         children: ProcessChildren::new(),
         pgrp: process_spin_mutex(pgrp, b"debug.lock.process.identity.pgrp"),
         exit_status: process_spin_mutex(None, b"debug.lock.process.identity.exit_status"),
+        adopted_by_init: AtomicBool::new(false),
         payload: process_spin_mutex(None, b"debug.lock.process.identity.payload"),
     })
 }
@@ -1441,15 +1491,17 @@ fn sign_process_payload(
     aspace: Cap<AddressSpace>,
     threads: Vec<Cap<ThreadIdentity>>,
     nsproxy: Cap<crate::process::nsproxy::NsProxy>,
-    net_namespace: PayloadCap<crate::net::NetNamespacePayload>,
     cred: Cred,
     cwd: Option<Cap<crate::vfs::DEntry>>,
     fds: BTreeMap<u32, Cap<OpenFile>>,
     fd_cloexec: BTreeSet<u32>,
     rlimit_nofile: (u32, u32),
+    rlimit_memlock: (u64, u64),
+    net_namespace: PayloadCap<crate::net::NetNamespacePayload>,
     brk_base: u64,
     current_brk: u64,
     umask: u16,
+    personality: u32,
     sig_actions: Arc<SigActionTable>,
 ) -> Result<PayloadCap<ProcessPayload>, ZoneError> {
     use crate::process::adapter::step_engine::AtomicSlot;
@@ -1475,10 +1527,6 @@ fn sign_process_payload(
     // fork, or a new bundle for unshare).
     let nsproxy_slot: AtomicSlot<Cap<crate::process::nsproxy::NsProxy>> = AtomicSlot::empty();
     nsproxy_slot.store(Some(nsproxy));
-
-    // Network namespace slot — the caller provides the initial namespace
-    // payload (seeded from `initial_net_namespace_payload_with_owner` at
-    // bootstrap, cloned from the parent at fork).
     let net_namespace_slot: AtomicSlot<PayloadCap<crate::net::NetNamespacePayload>> =
         AtomicSlot::empty();
     net_namespace_slot.store(Some(net_namespace));
@@ -1516,8 +1564,10 @@ fn sign_process_payload(
         fd_cloexec: process_spin_mutex(fd_cloexec, b"debug.lock.process.payload.fd_cloexec"),
         rlimit_nofile_cur: AtomicU32::new(rlimit_nofile.0),
         rlimit_nofile_max: AtomicU32::new(rlimit_nofile.1),
-        brk_base: core::sync::atomic::AtomicU64::new(brk_base),
-        current_brk: core::sync::atomic::AtomicU64::new(current_brk),
+        rlimit_memlock_cur: AtomicU64::new(rlimit_memlock.0),
+        rlimit_memlock_max: AtomicU64::new(rlimit_memlock.1),
+        brk_base: AtomicU64::new(brk_base),
+        current_brk: AtomicU64::new(current_brk),
         // Slice 6 of the shell-prompt roadmap. Per-process
         // file-creation mask. `bootstrap_init_process` seeds with
         // the Linux default `0o022` (owner keeps full perms,
@@ -1526,6 +1576,7 @@ fn sign_process_payload(
         // per-process, copied across fork). `step_exec` preserves
         // the umask (umask survives `exec` per POSIX).
         umask: core::sync::atomic::AtomicU16::new(umask & 0o777),
+        personality: AtomicU32::new(personality),
         sem_undos: process_spin_mutex(BTreeMap::new(), b"debug.lock.process.payload.sem_undos"),
         exit_source: exit_wait_point.channel,
         exit_source_id: exit_wait_point.source_id,
@@ -1663,8 +1714,6 @@ pub struct ForkOp<'a, P: PmapIf> {
     pub clone_vm: bool,
     pub clone_sighand: bool,
     pub clone_newipc: bool,
-    pub clone_newnet: bool,
-    pub clone_newns: bool,
     pub _pmap: core::marker::PhantomData<P>,
 }
 
@@ -1678,8 +1727,6 @@ impl<'a, P: PmapIf, I: SubjectIdentity> StepOp<I> for ForkOp<'a, P> {
                 clone_vm: self.clone_vm,
                 clone_sighand: self.clone_sighand,
                 clone_newipc: self.clone_newipc,
-                clone_newnet: self.clone_newnet,
-                clone_newns: self.clone_newns,
             },
         ))
     }
@@ -1696,6 +1743,7 @@ impl<P: PmapIf, I: SubjectIdentity> OneShotStepOp<I> for ForkOp<'_, P> {}
 pub struct CloneThreadOp<'a> {
     pub process: &'a Cap<ProcessIdentity>,
     pub parent_user_ctx: &'a UserTrapContext,
+    pub parent_signal_mask: SignalMask,
     pub stack: usize,
     pub tls: usize,
     pub ctid_ptr: u64,
@@ -1709,6 +1757,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for CloneThreadOp<'a> {
         StepOutcome::Done(step_clone_thread(
             self.process,
             self.parent_user_ctx,
+            self.parent_signal_mask,
             self.stack,
             self.tls,
             self.ctid_ptr,

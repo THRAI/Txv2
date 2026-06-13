@@ -314,6 +314,23 @@ pub async fn run_thread<P: TxPlatform>(
             core::hint::spin_loop();
         }
 
+        if let Some(process) = thread.upgrade_owner_proc() {
+            let posix_deadline = tx_shims::linux_syscall::poll_due_posix_timers::<P>(&process);
+            let itimer_deadline = tx_shims::linux_syscall::poll_due_itimers::<P>(&process);
+            match (posix_deadline, itimer_deadline) {
+                (Some(left), Some(right)) => P::set_deadline_ns(left.min(right)),
+                (Some(deadline_ns), None) | (None, Some(deadline_ns)) => {
+                    P::set_deadline_ns(deadline_ns);
+                }
+                (None, None) => {}
+            }
+            if thread.payload_cap().is_none() || process.aspace_cap().is_none() {
+                return;
+            }
+        } else {
+            return;
+        }
+
         // Phase D (AST checkpoint): run ast_dispatch *before* entering
         // userspace. This is the entry-side AST checkpoint — it drains
         // pending signals and, for handler-disposition signals, modifies
@@ -398,6 +415,7 @@ pub async fn run_thread<P: TxPlatform>(
                     // Read current mask to pass to the handler, and
                     // compute the handler-entry mask per sigaction(2).
                     let old_mask = payload.signal_mask();
+                    payload.store_saved_signal_mask(Some(old_mask));
                     let mut new_mask = old_mask.union(action.sa_mask);
                     if !action
                         .flags
@@ -589,6 +607,9 @@ pub async fn run_thread<P: TxPlatform>(
                 let _prev_userspace_thread =
                     set_current_userspace_thread_identity(entry_hart, thread.clone());
                 let _prev_userspace = set_current_userspace_payload(entry_hart, payload.clone());
+                ctx = tx_shims::linux_syscall::maybe_deliver_itimer_signal::<P>(
+                    ctx, &process, &thread, &aspace,
+                );
                 if let Some(sysno) = last_entry_sysno {
                     emit_syscall_roundtrip_marker(sysno, b"debug.thread.enter.before");
                 }
@@ -647,6 +668,7 @@ pub async fn run_thread<P: TxPlatform>(
                 };
                 emit_syscall_roundtrip_marker(req.nr, b"debug.thread.process.after");
                 let sigreturn_ctx = payload.saved_user_context();
+                payload.set_proc_sleeping(true);
                 let result = if let Some(result) =
                     tx_shims::linux_syscall::dispatch_thread_exit_oneshot(&req, &thread)
                 {
@@ -779,6 +801,7 @@ pub async fn run_thread<P: TxPlatform>(
                         result
                     }
                 };
+                payload.set_proc_sleeping(false);
 
                 dump_observe_threshold_if_ready::<P>();
 
@@ -823,6 +846,13 @@ pub async fn run_thread<P: TxPlatform>(
                         // carries (zero from the script's fresh
                         // `UserTrapContext`, per
                         // `make_initial_user_trap_context`).
+                    }
+                    tx_shims::linux_syscall::SyscallResult::SigreturnContextRestored => {
+                        // The syscall arm already restored a
+                        // syscall-layer compatibility frame (currently
+                        // the itimer/SIGALRM frame). Do not decode a
+                        // second platform frame from the same stack
+                        // pointer.
                     }
                     tx_shims::linux_syscall::SyscallResult::SigreturnRestored => {
                         // `rt_sigreturn` is special: musl cancellation

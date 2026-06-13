@@ -43,6 +43,19 @@ use tx_hal::{
 
 pub struct Platform;
 
+fn for_each_console_byte_for_sbi(bytes: &[u8], mut emit: impl FnMut(u8)) {
+    let mut idx = 0;
+    while idx < bytes.len() {
+        if bytes[idx] == b'\r' && bytes.get(idx + 1) == Some(&b'\n') {
+            emit(b'\n');
+            idx += 2;
+            continue;
+        }
+        emit(bytes[idx]);
+        idx += 1;
+    }
+}
+
 const QEMU_VIRT_RAM_BASE: usize = 0x8000_0000;
 const QEMU_VIRT_FALLBACK_RAM_SIZE: usize = 256 * 1024 * 1024;
 const MAX_BOOT_CPUS: usize = 4;
@@ -319,9 +332,12 @@ impl ConsoleIf for Platform {
     fn write_bytes(bytes: &[u8]) {
         #[cfg(target_arch = "riscv64")]
         {
-            for &byte in bytes {
-                sbi_console_putchar(byte);
-            }
+            // The console TTY already expands `\n` to `\r\n` via ONLCR.
+            // QEMU virt's SBI console path renders bare `\n` as a host newline,
+            // so forwarding the cooked `\r\n` pair byte-for-byte produces
+            // `\r\r\n` in captured logs. Collapse cooked CRLF back to LF before
+            // handing bytes to SBI so the final host-visible stream is `\r\n`.
+            for_each_console_byte_for_sbi(bytes, sbi_console_putchar);
         }
 
         #[cfg(not(target_arch = "riscv64"))]

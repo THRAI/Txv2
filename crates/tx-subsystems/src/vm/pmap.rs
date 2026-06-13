@@ -774,7 +774,9 @@ fn phys_for_ppn(ppn: Ppn) -> Result<PhysAddr, VmPmapError> {
 
 fn permissions_for_prot(prot: Prot) -> PmapPermissions {
     let mut permissions = PmapPermissions::USER;
-    if prot.read {
+    // RISC-V Sv39 and LA64 both reject W-only leaves, while Linux user
+    // protections treat writable mappings as readable for normal memory.
+    if prot.read || prot.write {
         permissions = permissions.union(PmapPermissions::READ);
     }
     if prot.write {
@@ -784,6 +786,21 @@ fn permissions_for_prot(prot: Prot) -> PmapPermissions {
         permissions = permissions.union(PmapPermissions::EXECUTE);
     }
     permissions
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_only_user_prot_normalizes_to_read_write_pmap_permissions() {
+        let permissions = permissions_for_prot(Prot::new(false, true, false));
+
+        assert!(permissions.contains(PmapPermissions::USER));
+        assert!(permissions.contains(PmapPermissions::READ));
+        assert!(permissions.contains(PmapPermissions::WRITE));
+        assert!(!permissions.contains(PmapPermissions::EXECUTE));
+    }
 }
 
 #[cfg(test)]

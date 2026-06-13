@@ -164,6 +164,10 @@ pub struct ProcessIdentity {
     /// explicit-int exits from signal-driven termination per
     /// `PROCESS_v1` §6.2.
     pub(crate) exit_status: ProcessSpinMutex<Option<ExitStatus>>,
+    /// True once this process was reparented to init because its
+    /// original parent exited. Direct children of init keep this false so
+    /// the userspace runner can still reap them with wait4.
+    pub(crate) adopted_by_init: AtomicBool,
     pub(crate) payload: ProcessSpinMutex<Option<PayloadCap<ProcessPayload>>>,
 }
 
@@ -204,10 +208,7 @@ impl step_engine::SubjectIdentity for ProcessIdentity {
     }
 
     fn thread_deliverable_signal_pending(thread: &Cap<Self::ThreadIdentity>) -> bool {
-        thread
-            .payload_cap()
-            .map(|payload| payload.interrupt_summary().deliverable_signal)
-            .unwrap_or(false)
+        crate::signal::select_next_signal(thread).is_some()
     }
 
     fn thread_termination_in_force(thread: &Cap<Self::ThreadIdentity>) -> bool {
@@ -294,18 +295,12 @@ impl ProcessIdentity {
 
     /// Process state char for /proc/<pid>/stat.
     pub fn state_char(&self) -> u8 {
-        // We don't track fine-grained per-thread run/sleep state in this tree
-        // (the backup's `proc_state_char`/`thread_has_waiter` machinery wasn't
-        // re-homed). A live process inspected via `/proc/<pid>/stat` by another
-        // process is, in this single-core cooperative model, parked rather than
-        // on-CPU, so report interruptible-sleep. LTP's `_tst_setup_timer` polls
-        // `/proc/<watchdog>/stat` field 3 until it reads "S"; reporting "R"
-        // forever wedged that loop (then the watchdog timed out).
         if self.is_zombie() {
-            b'Z'
-        } else {
-            b'S'
+            return b'Z';
         }
+        self.nth_thread(0)
+            .map(|thread| thread.proc_state_char())
+            .unwrap_or(b'R')
     }
 
     /// Process command-line (delegates to payload).
@@ -337,6 +332,12 @@ impl ProcessIdentity {
     /// Find a thread by its tid within this process.
     pub fn thread_by_tid(&self, tid: u32) -> Option<Cap<ThreadIdentity>> {
         self.payload.lock().as_ref()?.threads.find_by_tid(tid)
+    }
+
+    /// Snapshot all threads currently attached to this live process.
+    /// Returns `None` for zombies.
+    pub fn threads_snapshot(&self) -> Option<alloc::vec::Vec<Cap<ThreadIdentity>>> {
+        self.payload.lock().as_ref().map(|p| p.threads.snapshot())
     }
 
     /// Collapse all sibling threads for exec, leaving `initiator`
@@ -424,10 +425,14 @@ impl ProcessIdentity {
         self.payload.lock().as_ref().map(|p| p.nsproxy_cap())
     }
 
-    /// Install `new` as the process nsproxy, returning the previous cap (or
-    /// `None` for a zombie). Used by `unshare(CLONE_NEWUSER)` to publish a fresh
-    /// user-namespace bundle. Re-homed with the net subsystem (PR#50 kept only
-    /// the `pub(crate)` ProcessPayload variant and dropped this wrapper).
+    pub fn mount_namespace_cap(&self) -> Option<Cap<crate::mount::MountNamespace>> {
+        self.nsproxy_cap()?.mnt_ns.clone()
+    }
+
+    pub fn user_namespace_cap(&self) -> Option<Cap<crate::process::nsproxy::UserNamespace>> {
+        Some(self.nsproxy_cap()?.user_ns.clone())
+    }
+
     pub fn replace_nsproxy(
         &self,
         new: Cap<crate::process::nsproxy::NsProxy>,
@@ -435,8 +440,18 @@ impl ProcessIdentity {
         self.payload.lock().as_ref().map(|p| p.replace_nsproxy(new))
     }
 
-    pub fn mount_namespace_cap(&self) -> Option<Cap<crate::mount::MountNamespace>> {
-        self.nsproxy_cap()?.mnt_ns.clone()
+    pub fn net_namespace(&self) -> Option<PayloadCap<crate::net::NetNamespacePayload>> {
+        self.payload.lock().as_ref().map(|p| p.net_namespace())
+    }
+
+    pub fn replace_net_namespace(
+        &self,
+        new: PayloadCap<crate::net::NetNamespacePayload>,
+    ) -> Option<PayloadCap<crate::net::NetNamespacePayload>> {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.replace_net_namespace(new))
     }
 
     /// Process short name (for `/proc/<pid>/stat`). Returns `"?"` for
@@ -447,6 +462,17 @@ impl ProcessIdentity {
             .as_ref()
             .map(|p| p.comm())
             .unwrap_or([b'?', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+    }
+
+    /// Replace the process short name used by `/proc/<pid>/stat`.
+    /// Returns `false` if the process is already zombie.
+    pub fn set_comm(&self, comm: [u8; 16]) -> bool {
+        let payload = self.payload.lock();
+        let Some(payload) = payload.as_ref() else {
+            return false;
+        };
+        *payload._comm.lock() = comm;
+        true
     }
 
     /// Process command-line (for `/proc/<pid>/cmdline`). Returns
@@ -487,35 +513,6 @@ impl ProcessIdentity {
     /// `.await`.
     pub fn fd(&self, idx: u32) -> Option<Cap<crate::vfs::OpenFile>> {
         self.payload.lock().as_ref().and_then(|p| p.fd(idx))
-    }
-
-    /// Snapshot the process's current network namespace. Day-1 all
-    /// processes are seeded with the initial namespace; fork inherits
-    /// the parent's namespace cap. Returns `None` for zombies.
-    pub fn net_namespace(&self) -> Option<PayloadCap<crate::net::NetNamespacePayload>> {
-        self.payload.lock().as_ref().map(|p| p.net_namespace())
-    }
-
-    /// Replace the process's current network namespace, returning the
-    /// previous namespace cap. Returns `None` for zombies.
-    pub fn replace_net_namespace(
-        &self,
-        new: PayloadCap<crate::net::NetNamespacePayload>,
-    ) -> Option<PayloadCap<crate::net::NetNamespacePayload>> {
-        self.payload
-            .lock()
-            .as_ref()
-            .map(|p| p.replace_net_namespace(new))
-    }
-
-    /// Snapshot the full fd table for procfs / net-diag projections.
-    /// Returns an empty map for zombies (no payload).
-    pub fn open_fds(&self) -> BTreeMap<u32, Cap<crate::vfs::OpenFile>> {
-        self.payload
-            .lock()
-            .as_ref()
-            .map(|p| p.open_fds())
-            .unwrap_or_default()
     }
 
     /// Snapshot the current working-directory `Cap<DEntry>` if one is
@@ -602,6 +599,20 @@ impl ProcessIdentity {
         }
     }
 
+    pub fn rlimit_memlock(&self) -> (u64, u64) {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.rlimit_memlock())
+            .unwrap_or((0, 0))
+    }
+
+    pub fn set_rlimit_memlock(&self, cur: u64, max: u64) {
+        if let Some(payload) = self.payload.lock().as_ref() {
+            payload.set_rlimit_memlock(cur, max);
+        }
+    }
+
     /// Install `file` at the specific fd `fd`, returning the
     /// previously installed `Cap<OpenFile>` if any so the caller can
     /// drop it under their own EBR guard. Returns `None` for zombies
@@ -674,6 +685,17 @@ impl ProcessIdentity {
             .lock()
             .as_ref()
             .map(|p| p.open_fd_numbers())
+            .unwrap_or_default()
+    }
+
+    /// Snapshot the current open fd → `OpenFile` map. Restored alongside the
+    /// net subsystem re-home; used by `/proc/net/{tcp,udp,...}` enumeration to
+    /// walk every process's socket fds.
+    pub fn open_fds(&self) -> BTreeMap<u32, Cap<OpenFile>> {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.open_fds())
             .unwrap_or_default()
     }
 
@@ -774,6 +796,26 @@ impl ProcessIdentity {
             .lock()
             .as_ref()
             .map(|p| p.swap_umask(new))
+            .unwrap_or(0)
+    }
+
+    /// Snapshot the Linux `personality(2)` value. Returns `0`
+    /// for zombies, matching the default Linux personality.
+    pub fn personality(&self) -> u32 {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.personality())
+            .unwrap_or(0)
+    }
+
+    /// Atomically replace the process personality, returning the
+    /// previous value. No-op for zombies.
+    pub fn swap_personality(&self, new: u32) -> u32 {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.swap_personality(new))
             .unwrap_or(0)
     }
 
@@ -1068,11 +1110,9 @@ pub struct ProcessPayload {
     /// Day-1: all namespace caps point at the init namespace.
     /// `mnt_ns` is deferred (`MountNamespace` bootstrap not yet wired).
     pub(crate) nsproxy: AtomicSlot<Cap<crate::process::nsproxy::NsProxy>>,
-    /// Current network namespace, seeded at construction by
-    /// `initial_net_namespace_payload()`; `step_fork` clones the
-    /// parent's cap. `AtomicSlot` lets `unshare(CLONE_NEWNET)` / `setns`
-    /// publish a replacement. The slot is always populated for a live
-    /// process (see `net_namespace()` accessor expectation).
+    /// Per-process network namespace. Init receives the initial net
+    /// namespace payload; fork clones the parent namespace unless an
+    /// explicit namespace operation replaces it.
     pub(crate) net_namespace: AtomicSlot<PayloadCap<crate::net::NetNamespacePayload>>,
     /// Current working directory as a `DEntry` `Cap`.
     ///
@@ -1129,6 +1169,10 @@ pub struct ProcessPayload {
     /// `RLIMIT_NOFILE`; fork copies it and exec preserves it.
     pub(crate) rlimit_nofile_cur: AtomicU32,
     pub(crate) rlimit_nofile_max: AtomicU32,
+    /// Per-process locked-memory resource limit. Linux exposes this as
+    /// `RLIMIT_MEMLOCK`; fork copies it and exec preserves it.
+    pub(crate) rlimit_memlock_cur: AtomicU64,
+    pub(crate) rlimit_memlock_max: AtomicU64,
     /// Base of the program-break (heap) region for this process.
     ///
     /// Set once at exec time (per `txdoc:VM-5-8-BRK`); never changes
@@ -1168,6 +1212,8 @@ pub struct ProcessPayload {
     /// `SpinMutex<u16>` would be heavier than necessary for a 16-bit
     /// scalar with swap semantics.
     pub(crate) umask: AtomicU16,
+    /// Linux `personality(2)` value for this process.
+    pub(crate) personality: AtomicU32,
     /// SysV semaphore undo records owned by this process.
     ///
     /// Per `docs/Txv3/08_SYSV_IPC_v1.md` §4.4 / IPC-3, `SEM_UNDO`
@@ -1200,10 +1246,9 @@ pub struct ProcessPayload {
     /// [`ProcessIdentity::exit_source_wait_token`] so the syscall arm
     /// can park on the carrier without reaching the channel directly.
     ///
-    /// Carrier-lifetime cleanup (release on payload drop) is tracked
-    /// as Cross-cutting Risk #1 in the slice plan and not addressed
-    /// in Wave 1; see plan §"Cross-cutting risks #1" for the
-    /// follow-up.
+    /// Released from the global wait-source registry when the payload
+    /// drops; otherwise long-running fork/exit workloads retain a
+    /// stale channel clone per process.
     pub(crate) exit_source_id: u64,
     /// PR-3D-3 (D2/D4 coexistence). Per-process `WaitSource` minted at
     /// `sign_process_payload` time alongside the legacy
@@ -1258,6 +1303,13 @@ pub struct ProcessPayload {
     /// for this process to exec or exit.  Set by the parent before
     /// parking; taken and fired by the child's exec and exit paths.
     pub(crate) vfork_waiter: ProcessSpinMutex<Option<core::task::Waker>>,
+}
+
+impl Drop for ProcessPayload {
+    fn drop(&mut self) {
+        crate::wait_source::release_wait_channel(self.exit_source_id);
+        wait_routing::unregister_source(self.exit_source_id);
+    }
 }
 
 impl ProcessPayload {
@@ -1378,6 +1430,21 @@ impl ProcessPayload {
             .expect("ProcessPayload.nsproxy slot is always populated")
     }
 
+    pub fn net_namespace(&self) -> PayloadCap<crate::net::NetNamespacePayload> {
+        self.net_namespace
+            .load()
+            .expect("ProcessPayload.net_namespace slot is always populated")
+    }
+
+    pub fn replace_net_namespace(
+        &self,
+        new: PayloadCap<crate::net::NetNamespacePayload>,
+    ) -> PayloadCap<crate::net::NetNamespacePayload> {
+        self.net_namespace
+            .swap(Some(new))
+            .expect("ProcessPayload.net_namespace slot is always populated")
+    }
+
     /// Atomically install `new` as the current cred-cap and return
     /// the previously installed cap. Used by the 7 cred-mutator
     /// `step_*` functions and their test-only siblings.
@@ -1398,25 +1465,6 @@ impl ProcessPayload {
     /// set (init pre-rootfs).
     pub fn cwd(&self) -> Option<Cap<DEntry>> {
         self.cwd.lock().clone()
-    }
-
-    /// Snapshot this payload's current network namespace cap. The slot
-    /// is seeded at construction and always populated for a live process.
-    pub fn net_namespace(&self) -> PayloadCap<crate::net::NetNamespacePayload> {
-        self.net_namespace
-            .load()
-            .expect("ProcessPayload.net_namespace slot is always populated")
-    }
-
-    /// Replace this payload's network namespace cap, returning the
-    /// previous one. Used by `unshare(CLONE_NEWNET)` / `setns`.
-    pub fn replace_net_namespace(
-        &self,
-        new: PayloadCap<crate::net::NetNamespacePayload>,
-    ) -> PayloadCap<crate::net::NetNamespacePayload> {
-        self.net_namespace
-            .swap(Some(new))
-            .expect("ProcessPayload.net_namespace slot is always populated")
     }
 
     /// Snapshot the `Cap<OpenFile>` registered at fd `idx`, if any.
@@ -1625,6 +1673,18 @@ impl ProcessPayload {
         self.rlimit_nofile_max.store(max, Ordering::Release);
     }
 
+    pub fn rlimit_memlock(&self) -> (u64, u64) {
+        (
+            self.rlimit_memlock_cur.load(Ordering::Acquire),
+            self.rlimit_memlock_max.load(Ordering::Acquire),
+        )
+    }
+
+    pub fn set_rlimit_memlock(&self, cur: u64, max: u64) {
+        self.rlimit_memlock_cur.store(cur, Ordering::Release);
+        self.rlimit_memlock_max.store(max, Ordering::Release);
+    }
+
     /// Read the close-on-exec bit for fd `idx`.
     ///
     /// Per fd-ops Wave 1 the underlying storage is a sparse
@@ -1697,6 +1757,17 @@ impl ProcessPayload {
     /// kind / setuid / setgid / sticky bits per Linux semantics.
     pub fn swap_umask(&self, new: u16) -> u16 {
         self.umask.swap(new & 0o777, Ordering::AcqRel)
+    }
+
+    /// Read the Linux `personality(2)` value.
+    pub fn personality(&self) -> u32 {
+        self.personality.load(Ordering::Acquire)
+    }
+
+    /// Replace the Linux `personality(2)` value, returning the old
+    /// value.
+    pub fn swap_personality(&self, new: u32) -> u32 {
+        self.personality.swap(new, Ordering::AcqRel)
     }
 
     /// Borrow the per-process `exit_source` wait channel.

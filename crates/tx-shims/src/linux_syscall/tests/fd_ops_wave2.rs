@@ -21,18 +21,20 @@ use tx_subsystems::vfs::structure::{
 use tx_subsystems::vfs::FsOps;
 
 use crate::linux_syscall::{
-    AT_FDCWD, EXECVE_PATH_MAX, NR_CLOSE, NR_DUP, NR_DUP3, NR_OPENAT, O_CLOEXEC, O_CREAT, O_EXCL,
-    O_RDONLY, O_RDWR, O_TRUNC,
+    AT_FDCWD, EXECVE_PATH_MAX, NR_CLOSE, NR_DUP, NR_DUP3, NR_OPENAT, O_CLOEXEC, O_CREAT,
+    O_DIRECTORY, O_EXCL, O_RDONLY, O_RDWR, O_TRUNC,
 };
 
 /// errno magnitudes: positive Linux RV64 generic ABI values.
 const E_BADF: i32 = 9;
 const E_NOENT: i32 = 2;
 const E_EXIST: i32 = 17;
+const E_NOTDIR: i32 = 20;
 const E_INVAL: i32 = 22;
 const E_ACCES: i32 = 13;
 const E_NAMETOOLONG: i32 = 36;
 const E_MFILE: i32 = 24;
+const E_ISDIR: i32 = 21;
 
 fn ensure_zero_frame_claimed() {
     match page_allocator::claim_zero_frame() {
@@ -234,6 +236,123 @@ fn dispatch_openat_full_fd_table_returns_neg_emfile_before_enoent() {
     drop(missing);
 }
 
+/// `openat(AT_FDCWD, "/f", O_RDONLY | O_DIRECTORY)` against a
+/// regular file returns `-ENOTDIR`. LTP's recursive tmpdir cleanup
+/// uses exactly this probe before deciding whether to recurse or
+/// `unlink(2)` the entry.
+#[test]
+fn dispatch_openat_o_directory_regular_file_returns_neg_enotdir() {
+    let _setup = fd_ops_setup();
+    let (root_dentry, tmpfs) = build_tmpfs_root();
+    let owner_cred = Credential {
+        uid: 0,
+        gid: 0,
+        effective_caps: CapabilitySet::FULL,
+    };
+    let guard = ebr_guard();
+    let _ = tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner_cred, &guard);
+    drop(guard);
+
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let path = nul_terminate(b"/f");
+    let req = SyscallRequest::new(
+        NR_OPENAT,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            (O_RDONLY | O_DIRECTORY) as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Error(E_NOTDIR));
+    drop(path);
+}
+
+/// `O_DIRECTORY` succeeds when the terminal path is actually a
+/// directory.
+#[test]
+fn dispatch_openat_o_directory_directory_returns_fd() {
+    let _setup = fd_ops_setup();
+    let (root_dentry, _tmpfs) = build_tmpfs_root();
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    let path = nul_terminate(b"/");
+    let req = SyscallRequest::new(
+        NR_OPENAT,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            (O_RDONLY | O_DIRECTORY) as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    match result {
+        SyscallResult::Return(fd) => assert!(proc_cap.fd(fd as u32).is_some()),
+        other => panic!("openat O_DIRECTORY on directory: {other:?}"),
+    }
+    drop(path);
+}
+
+/// Linux rejects write-capable opens of directory targets with `EISDIR`.
+#[test]
+fn dispatch_openat_rdwr_directory_returns_neg_eisdir() {
+    let _setup = fd_ops_setup();
+    let (root_dentry, _tmpfs) = build_tmpfs_root();
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let path = nul_terminate(b"/");
+    let req = SyscallRequest::new(
+        NR_OPENAT,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            O_RDWR as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Error(E_ISDIR));
+    drop(path);
+}
+
+/// Existing directory targets are not creatable regular files, even if the
+/// requested access mode is read-only.
+#[test]
+fn dispatch_openat_creat_directory_returns_neg_eisdir() {
+    let _setup = fd_ops_setup();
+    let (root_dentry, _tmpfs) = build_tmpfs_root();
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let path = nul_terminate(b"/");
+    let req = SyscallRequest::new(
+        NR_OPENAT,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            (O_RDONLY | O_CREAT) as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Error(E_ISDIR));
+    drop(path);
+}
+
 /// `openat(AT_FDCWD, "/new", O_RDWR | O_CREAT, 0o644)` against a
 /// missing file creates it via `FsOps::create_inode` and opens
 /// the result. The new inode's mode is the supplied 0o644 plus
@@ -371,6 +490,84 @@ fn dispatch_openat_o_trunc_truncates_existing() {
         other => panic!("load_inode_meta: {other:?}"),
     };
     assert_eq!(meta.size, 0, "O_TRUNC should have truncated to 0");
+    drop(path);
+}
+
+/// `openat(O_TRUNC)` must not trust the cached `RNode` size. A prior
+/// path walk can cache a dentry while the tmpfs inode is still empty;
+/// later writes/truncates update the backend inode size, not that cached
+/// metadata snapshot.
+#[test]
+fn dispatch_openat_o_trunc_truncates_stale_cached_dentry() {
+    let _setup = fd_ops_setup();
+    let (root_dentry, tmpfs) = build_tmpfs_root();
+    let owner_cred = Credential {
+        uid: 0,
+        gid: 0,
+        effective_caps: CapabilitySet::FULL,
+    };
+    let guard = ebr_guard();
+    let (file_id, _) = match tmpfs.create_inode(
+        TMPFS_ROOT_OBJECT_ID,
+        b"stale",
+        0o100644,
+        &owner_cred,
+        &guard,
+    ) {
+        StepOutcome::Done(out) => out,
+        other => panic!("create_inode: {other:?}"),
+    };
+    drop(guard);
+
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap, thread);
+    let path = nul_terminate(b"/stale");
+
+    let first_open = SyscallRequest::new(
+        NR_OPENAT,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            O_RDWR as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    match block_on(dispatch::<ShimsTestPmap>(first_open, &ctx)) {
+        SyscallResult::Return(_) => {}
+        other => panic!("initial openat: {other:?}"),
+    }
+
+    let guard = ebr_guard();
+    match tmpfs.truncate(file_id, 4096, &guard) {
+        StepOutcome::Done(()) => {}
+        other => panic!("backend truncate: {other:?}"),
+    }
+    drop(guard);
+
+    let trunc_open = SyscallRequest::new(
+        NR_OPENAT,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            (O_RDWR | O_TRUNC) as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    match block_on(dispatch::<ShimsTestPmap>(trunc_open, &ctx)) {
+        SyscallResult::Return(_) => {}
+        other => panic!("openat O_TRUNC stale dentry: {other:?}"),
+    }
+
+    let guard = ebr_guard();
+    let meta = match tmpfs.load_inode_meta(file_id, &guard) {
+        StepOutcome::Done(m) => m,
+        other => panic!("load_inode_meta: {other:?}"),
+    };
+    assert_eq!(meta.size, 0, "O_TRUNC must clear backend size");
     drop(path);
 }
 

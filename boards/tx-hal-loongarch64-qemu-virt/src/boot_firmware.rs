@@ -590,11 +590,16 @@ unsafe fn populate_boot_memory_regions_from_dtb(
         }
 
         let start = region.base.0;
+        // Clamp to the DMW-mapped physical limit, NOT to low-RAM end: QEMU `virt`
+        // reports high RAM at `QEMU_LA64_HIGH_RAM_BASE` (above the MMIO hole), and
+        // the cached DMW window covers the whole physical space. Clamping at
+        // `QEMU_LA64_RAM_END` (256 MiB) silently dropped every high-RAM region,
+        // capping the allocator at 256 MiB regardless of `-m`.
         let end = region
             .base
             .0
             .saturating_add(region.size)
-            .min(QEMU_LA64_RAM_END);
+            .min(QEMU_LA64_RAM_BASE.saturating_add(QEMU_LA64_DIRECT_MAP_SIZE));
         if end <= start {
             continue;
         }

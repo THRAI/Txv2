@@ -386,6 +386,13 @@ impl<T: 'static> PayloadCap<T> {
     pub fn trace_id(&self) -> u64 {
         self.inner.trace_id()
     }
+
+    /// Live retain (strong) count of the backing slot.  Delegates to
+    /// [`Cap::retain_count`].  A value of `1` means this is the sole remaining
+    /// strong reference; dropping it retires the slot.
+    pub fn retain_count(&self) -> u32 {
+        self.inner.retain_count()
+    }
 }
 
 impl<T: 'static> Clone for PayloadCap<T> {

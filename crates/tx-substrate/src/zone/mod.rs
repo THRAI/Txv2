@@ -133,6 +133,7 @@ impl<T: 'static> Zone<T> {
         ZoneInfo {
             id: self.id(),
             type_id: TypeId::of::<T>(),
+            type_name: core::any::type_name::<T>(),
             allocated_slots: self.allocated_slots(),
             slab_count: self.slab_count(),
             empty_slab_count: self.empty_slab_count(),

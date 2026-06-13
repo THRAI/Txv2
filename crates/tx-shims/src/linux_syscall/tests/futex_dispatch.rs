@@ -312,6 +312,29 @@ fn dispatch_futex_wait_bitset_with_zero_timeout_returns_neg_etimedout() {
     assert_eq!(result, SyscallResult::Error(E_TIMEDOUT));
 }
 
+#[test]
+fn dispatch_futex_wait_bitset_uses_absolute_monotonic_timeout() {
+    let _setup = futex_setup();
+    let (proc_cap, thread) = fresh_proc_thread();
+    let ctx = make_ctx(proc_cap, thread);
+    let (ctx, _wheel) = ctx_with_mailbox_and_timer(ctx);
+    let uaddr = map_user_futex_word(&ctx, 0x1234);
+    let timeout = map_user_timespec(
+        &ctx,
+        TestTimespec {
+            tv_sec: 1,
+            tv_nsec: 0,
+        },
+    );
+
+    let req = SyscallRequest::new(
+        NR_FUTEX,
+        [uaddr, FUTEX_WAIT_BITSET as u64, 0x1234, timeout, 0, 0x2],
+    );
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Error(E_TIMEDOUT));
+}
+
 /// `futex(uaddr, FUTEX_WAKE_OP, ...)` accepts a valid source and
 /// target futex word and returns a best-effort wake count.
 #[test]

@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """本地 OSComp 评分脚本，不依赖 pygrading。
-用法: python3 tools/oscomp-judge.py <serial_out.txt> <testdata_dir>
+
+默认直接使用 testdata 中的官方 judge 口径，不再为 LTP 老格式输出补
+Summary、TPASS/TFAIL 细项或 TST_TOTAL 分数。`--official-only` 仍被接受，
+但现在只是兼容旧命令行的空操作。
+
+用法: python3 tools/oscomp-judge.py [--official-only] <serial_out.txt> <testdata_dir>
 """
 
 import json
@@ -11,12 +16,16 @@ import sys
 
 
 def main():
-    if len(sys.argv) < 3:
-        print(f"用法: {sys.argv[0]} <serial_out.txt> <testdata_dir>")
+    args = sys.argv[1:]
+    if "--official-only" in args:
+        args.remove("--official-only")
+
+    if len(args) < 2:
+        print(f"用法: {sys.argv[0]} [--official-only] <serial_out.txt> <testdata_dir>")
         sys.exit(1)
 
-    serial_file = sys.argv[1]
-    testdata_dir = sys.argv[2]
+    serial_file = args[0]
+    testdata_dir = args[1]
 
     with open(serial_file, "rb") as f:
         serial_text = f.read().decode("utf-8", errors="ignore")
@@ -64,20 +73,24 @@ def main():
     results = {}
 
     for group, group_lines in sorted(groups.items()):
-        if group not in judges:
-            print(f"[{group}] 无对应 judge 脚本，跳过")
-            continue
-        judge_path = judges[group]
-        proc = subprocess.run(
-            [sys.executable, judge_path],
-            input="".join(group_lines).encode(),
-            capture_output=True,
-        )
-        try:
-            data = json.loads(proc.stdout.decode())
-        except Exception:
-            print(f"[{group}] judge 解析失败: {proc.stderr.decode()[:200]}")
-            continue
+        if group in judges:
+            judge_path = judges[group]
+            judge_input = "".join(group_lines)
+            proc = subprocess.run(
+                [sys.executable, judge_path],
+                input=judge_input.encode(),
+                capture_output=True,
+            )
+            try:
+                data = json.loads(proc.stdout.decode())
+            except Exception:
+                print(f"[{group}] judge 解析失败: {proc.stderr.decode()[:200]}")
+                continue
+        else:
+            data = fallback_results(group, group_lines)
+            if data is None:
+                print(f"[{group}] 无对应 judge 脚本，跳过")
+                continue
 
         results[group] = data
         g_pass = sum(item.get("pass", item.get("score", 0)) for item in data)
@@ -88,11 +101,45 @@ def main():
         for item in data:
             p = item.get("pass", item.get("score", 0))
             a = item.get("all", 1)
-            mark = "✓" if p == a else ("~" if p > 0 else "✗")
+            mark = "?" if a == 0 else ("✓" if p == a else ("~" if p > 0 else "✗"))
             print(f"  {mark} {item['name']}  {p}/{a}")
 
     print()
     print(f"总分: {total_pass}/{total_all}")
+
+
+def base_group(group):
+    for suffix in ("-musl", "-glibc"):
+        if group.endswith(suffix):
+            return group[: -len(suffix)]
+    return group
+
+
+def fallback_results(group, group_lines):
+    """Parse stable output emitted by official testsuits shell scripts."""
+    group = base_group(group)
+    text = "".join(group_lines)
+    if group == "busybox":
+        return command_results(text, r"testcase busybox (.*?) (success|fail)\s*$")
+    if group in ("iperf", "netperf"):
+        return command_results(
+            text, rf"====== {re.escape(group)} (.*?) end: (success|fail) ======"
+        )
+    return None
+
+
+def command_results(text, pattern):
+    items = []
+    for match in re.finditer(pattern, text, flags=re.MULTILINE):
+        name, status = match.groups()
+        items.append(
+            {
+                "name": name.strip(),
+                "pass": 1 if status == "success" else 0,
+                "all": 1,
+            }
+        )
+    return items or None
 
 
 if __name__ == "__main__":

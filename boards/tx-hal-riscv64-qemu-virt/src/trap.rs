@@ -89,6 +89,8 @@ core::arch::global_asm!(
     .equ TX_RV64_TF_F31, TX_RV64_TF_F_BASE + 31*8
     .equ TX_RV64_TF_FCSR, TX_RV64_TF_F_BASE + 256
     .equ TX_RV64_TF_SIZE, 552
+    .equ TX_RV64_TF_TMP_T0, TX_RV64_TF_SIZE - 16
+    .equ TX_RV64_TF_TMP_SSCRATCH, TX_RV64_TF_SIZE - 8
 
     # Per-hart KernelResumeCtx field offsets — must match
     # `boards::tx_hal_riscv64_qemu_virt::KernelResumeCtx` in lib.rs.
@@ -106,6 +108,37 @@ tx_rv64_qemu_minimal_trap_vector:
     # On entry: sp = trap-time sp (user sp for from-user, kernel sp
     # for from-kernel); sscratch = trap_stack_top.
     # After swap: sp = trap_stack_top; sscratch = trap-time sp.
+    #
+    # If the trap arrives while S-mode is already running in the trap
+    # epilogue, sscratch may still contain the interrupted user sp.
+    # Only use the current high-half stack directly in that narrow
+    # case. Normal kernel traps keep sscratch primed with the per-hart
+    # trap-stack top and should still swap onto that stack; otherwise an
+    # interrupt in a large kernel frame can trample the interrupted
+    # function's locals.
+    bgez sp, 7f
+    addi sp, sp, -16
+    sd t0, 0(sp)
+    csrr t0, sscratch
+    sd t0, 8(sp)
+    bgez t0, 6f
+    ld t0, 0(sp)
+    addi sp, sp, 16
+    j 7f
+
+6:
+    # Trap-time sp is already a trap stack pointer.
+    addi sp, sp, -(TX_RV64_TF_SIZE - 16)
+    ld t0, TX_RV64_TF_TMP_T0(sp)
+    sd t0, TX_RV64_TF_X5(sp)
+    ld t0, TX_RV64_TF_TMP_SSCRATCH(sp)
+    sd t0, TX_RV64_TF_X0(sp)
+    sd ra, TX_RV64_TF_X1(sp)
+    addi t0, sp, TX_RV64_TF_SIZE
+    sd t0, TX_RV64_TF_X2(sp)
+    j 8f
+
+7:
     csrrw sp, sscratch, sp
 
     # Allocate the trap frame on the trap stack.
@@ -117,6 +150,7 @@ tx_rv64_qemu_minimal_trap_vector:
     # frame's X_SP slot. Subsystems read it via TrapFrameView.
     csrr t0, sscratch
     sd t0, TX_RV64_TF_X2(sp)
+8:
     sd gp, TX_RV64_TF_X3(sp)
     sd tp, TX_RV64_TF_X4(sp)
     sd t1, TX_RV64_TF_X6(sp)

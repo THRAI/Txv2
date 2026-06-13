@@ -4,12 +4,11 @@ use super::*;
 
 use crate::linux_syscall::{
     F_DUPFD, F_DUPFD_CLOEXEC, F_GETFL, F_SETFL, NR_FCNTL, NR_GETRANDOM, NR_KILL, NR_PIDFD_OPEN,
-    NR_PIDFD_SEND_SIGNAL, NR_PRLIMIT64, NR_RT_SIGRETURN, NR_TGKILL, NR_TKILL, NR_UNAME, O_RDWR,
-    RLIMIT_AS, RLIMIT_NOFILE, RLIM_INFINITY,
+    NR_PIDFD_SEND_SIGNAL, NR_PRLIMIT64, NR_RT_SIGRETURN, NR_TGKILL, NR_TKILL, NR_UNAME, O_NONBLOCK,
+    O_RDWR, RLIMIT_AS, RLIMIT_NOFILE, RLIM_INFINITY,
 };
 
 const E_BADF: i32 = 9;
-const E_NOSYS: i32 = 38;
 const E_INVAL: i32 = 22;
 const E_FAULT: i32 = 14;
 const E_PERM: i32 = 1;
@@ -27,37 +26,59 @@ fn uts_field(buf: &[u8; 6 * 65], index: usize) -> &[u8] {
 // F_DUPFD / F_DUPFD_CLOEXEC / F_GETFL / F_SETFL.
 // -----------------------------------------------------------------
 
-/// `pidfd_open` is numbered and dispatch-routed, but the pidfd
-/// bus-adapter fd entity is still future work.
+/// `pidfd_open` installs a pidfd-backed OpenFile and preserves the
+/// Linux pidfd flag surface.
 #[test]
-fn dispatch_pidfd_open_returns_neg_enosys_until_pidfd_entity_lands() {
+fn dispatch_pidfd_open_installs_pidfd_backing_for_self() {
     let _setup = setup();
     let proc_cap = bootstrap();
     let thread = first_thread(&proc_cap);
-    let ctx = make_ctx(proc_cap, thread);
+    let pid = proc_cap.pid.0 as u64;
+    let ctx = make_ctx(proc_cap.clone(), thread);
 
     let r = block_on(dispatch::<ShimsTestPmap>(
-        SyscallRequest::new(NR_PIDFD_OPEN, [1, 0, 0, 0, 0, 0]),
+        SyscallRequest::new(NR_PIDFD_OPEN, [pid, O_NONBLOCK as u64, 0, 0, 0, 0]),
         &ctx,
     ));
-    assert_eq!(r, SyscallResult::Error(E_NOSYS));
+    let fd = match r {
+        SyscallResult::Return(fd) => fd as u32,
+        other => panic!("expected pidfd fd, got {other:?}"),
+    };
+    let file = proc_cap.fd(fd).expect("pidfd installed");
+    assert!(file.pidfd_process().is_some());
+    assert!(file.flags().cloexec);
+    assert!(file.flags().nonblocking);
+
+    let bad = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_PIDFD_OPEN, [pid, 0x8000_0000, 0, 0, 0, 0]),
+        &ctx,
+    ));
+    assert_eq!(bad, SyscallResult::Error(E_INVAL));
 }
 
-/// `pidfd_send_signal` is likewise intentionally routed to the
-/// explicit stub so syscall-status can distinguish it from an
-/// unclassified missing arm.
+/// `pidfd_send_signal(pidfd, 0, NULL, 0)` probes a valid pidfd target
+/// and returns success without posting a signal.
 #[test]
-fn dispatch_pidfd_send_signal_returns_neg_enosys_until_pidfd_entity_lands() {
+fn dispatch_pidfd_send_signal_zero_probes_pidfd_target() {
     let _setup = setup();
     let proc_cap = bootstrap();
     let thread = first_thread(&proc_cap);
+    let pid = proc_cap.pid.0 as u64;
     let ctx = make_ctx(proc_cap, thread);
 
+    let fd = match block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_PIDFD_OPEN, [pid, 0, 0, 0, 0, 0]),
+        &ctx,
+    )) {
+        SyscallResult::Return(fd) => fd as u64,
+        other => panic!("expected pidfd fd, got {other:?}"),
+    };
+
     let r = block_on(dispatch::<ShimsTestPmap>(
-        SyscallRequest::new(NR_PIDFD_SEND_SIGNAL, [3, 15, 0, 0, 0, 0]),
+        SyscallRequest::new(NR_PIDFD_SEND_SIGNAL, [fd, 0, 0, 0, 0, 0]),
         &ctx,
     ));
-    assert_eq!(r, SyscallResult::Error(E_NOSYS));
+    assert_eq!(r, SyscallResult::Return(0));
 }
 
 /// `fcntl(fd, F_DUPFD, min)` returns the lowest unused fd ≥ min,

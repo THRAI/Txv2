@@ -186,13 +186,13 @@ const PROCFS_FDINFO_OFFSET: u64 = 0x30000;
 // bits) so these ids never alias the stat/fd inode ids. Three files per pid:
 // pid*4 + {0=uid_map, 1=gid_map, 2=setgroups}.
 const PROCFS_USERNS_BASE: u64 = PROCFS_PID_BASE + 0x2_0000_0000;
-const fn pid_uid_map_id(pid: Pid) -> FsObjectId {
+pub const fn pid_uid_map_id(pid: Pid) -> FsObjectId {
     FsObjectId::new(PROCFS_USERNS_BASE + (pid.0 as u64) * 4)
 }
-const fn pid_gid_map_id(pid: Pid) -> FsObjectId {
+pub const fn pid_gid_map_id(pid: Pid) -> FsObjectId {
     FsObjectId::new(PROCFS_USERNS_BASE + (pid.0 as u64) * 4 + 1)
 }
-const fn pid_setgroups_id(pid: Pid) -> FsObjectId {
+pub const fn pid_setgroups_id(pid: Pid) -> FsObjectId {
     FsObjectId::new(PROCFS_USERNS_BASE + (pid.0 as u64) * 4 + 2)
 }
 pub fn pid_from_uid_map_id(id: FsObjectId) -> Option<Pid> {
@@ -452,7 +452,7 @@ pub fn pid_from_fdinfo_id(id: FsObjectId) -> Option<(Pid, u32)> {
     }
 }
 
-fn pid_from_dir(id: FsObjectId) -> Option<Pid> {
+pub fn pid_from_dir(id: FsObjectId) -> Option<Pid> {
     let r = id.as_u64();
     if r > PROCFS_PID_BASE && r < PROCFS_PID_BASE + PROCFS_PID_DIR_LIMIT {
         Some(Pid((r - PROCFS_PID_BASE) as u32))

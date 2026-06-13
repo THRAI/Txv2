@@ -208,19 +208,25 @@ fn dispatch_epoll_pwait2_rejects_invalid_timespec() {
 }
 
 #[test]
-fn dispatch_inotify_scaffold_validates_flags_then_reports_deferred_storage() {
+fn dispatch_inotify_init1_creates_fd_but_watch_ops_remain_deferred() {
     let (_setup, proc_cap, thread) = event_notify_setup();
     let ctx = make_ctx(proc_cap, thread);
-    assert_eq!(
-        block_on(dispatch::<ShimsTestPmap>(
-            SyscallRequest::new(
-                NR_INOTIFY_INIT1,
-                [IN_CLOEXEC as u64 | IN_NONBLOCK as u64, 0, 0, 0, 0, 0]
-            ),
-            &ctx,
-        )),
-        SyscallResult::Error(E_NOSYS)
-    );
+    let fd = match block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_INOTIFY_INIT1,
+            [IN_CLOEXEC as u64 | IN_NONBLOCK as u64, 0, 0, 0, 0, 0],
+        ),
+        &ctx,
+    )) {
+        SyscallResult::Return(fd) => fd as u32,
+        other => panic!("inotify_init1 should return fd, got {other:?}"),
+    };
+    let file = ctx.process.fd(fd).expect("inotify fd installed");
+    let flags = file.flags();
+    assert!(flags.read);
+    assert!(flags.cloexec);
+    assert!(flags.nonblocking);
+    assert!(ctx.process.fd_cloexec(fd));
     assert_eq!(
         block_on(dispatch::<ShimsTestPmap>(
             SyscallRequest::new(NR_INOTIFY_INIT1, [0x8000_0000, 0, 0, 0, 0, 0]),
@@ -245,19 +251,25 @@ fn dispatch_inotify_scaffold_validates_flags_then_reports_deferred_storage() {
 }
 
 #[test]
-fn dispatch_fanotify_scaffold_validates_init_flags_then_reports_deferred_storage() {
+fn dispatch_fanotify_init_creates_fd_but_mark_remains_deferred() {
     let (_setup, proc_cap, thread) = event_notify_setup();
     let ctx = make_ctx(proc_cap, thread);
-    assert_eq!(
-        block_on(dispatch::<ShimsTestPmap>(
-            SyscallRequest::new(
-                NR_FANOTIFY_INIT,
-                [FAN_CLOEXEC as u64 | FAN_NONBLOCK as u64, 0, 0, 0, 0, 0]
-            ),
-            &ctx,
-        )),
-        SyscallResult::Error(E_NOSYS)
-    );
+    let fd = match block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_FANOTIFY_INIT,
+            [FAN_CLOEXEC as u64 | FAN_NONBLOCK as u64, 0, 0, 0, 0, 0],
+        ),
+        &ctx,
+    )) {
+        SyscallResult::Return(fd) => fd as u32,
+        other => panic!("fanotify_init should return fd, got {other:?}"),
+    };
+    let file = ctx.process.fd(fd).expect("fanotify fd installed");
+    let flags = file.flags();
+    assert!(flags.read);
+    assert!(flags.cloexec);
+    assert!(flags.nonblocking);
+    assert!(ctx.process.fd_cloexec(fd));
     assert_eq!(
         block_on(dispatch::<ShimsTestPmap>(
             SyscallRequest::new(NR_FANOTIFY_INIT, [0x8000_0000, 0, 0, 0, 0, 0]),

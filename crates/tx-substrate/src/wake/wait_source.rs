@@ -443,6 +443,13 @@ use alloc::sync::Arc;
 /// try to materialize billions of empty entries during early boot.
 static REGISTRY: SpinMutex<BTreeMap<u64, Arc<WaitSource>>> = SpinMutex::new(BTreeMap::new());
 
+/// Snapshot of the global wait-source registry.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RegistrySummary {
+    pub slots: usize,
+    pub live: usize,
+}
+
 /// Register a source in the global registry so the driver can find it
 /// by [`WaitSourceId`] during yield resolution.
 pub fn register_source(source: Arc<WaitSource>) {
@@ -452,6 +459,15 @@ pub fn register_source(source: Arc<WaitSource>) {
 /// Remove a source from the global registry.
 pub fn unregister_source(id: WaitSourceId) {
     REGISTRY.lock().remove(&id.raw());
+}
+
+/// Return the current registry slot count and live source count.
+pub fn registry_summary() -> RegistrySummary {
+    let reg = REGISTRY.lock();
+    RegistrySummary {
+        slots: reg.len(),
+        live: reg.len(),
+    }
 }
 
 /// Look up a source by id. Returns `None` if the id is unknown or

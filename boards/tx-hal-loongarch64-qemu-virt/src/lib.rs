@@ -74,8 +74,24 @@ static LA64_FIXUP_TABLE: [La64RawFixupEntry; 2] = [
 ];
 
 const QEMU_LA64_RAM_BASE: usize = 0;
+// Low-RAM window only. On QEMU `virt`, [0, 256 MiB) is low RAM; the rest of the
+// guest RAM (anything past `-m 256M`) lives in the *high* aperture at
+// `QEMU_LA64_HIGH_RAM_BASE`, separated by the MMIO/PCIe hole. `RAM_END` is the
+// low-RAM/IO-hole boundary and the no-firmware fallback size — NOT the total.
 const QEMU_LA64_RAM_SIZE: usize = 0x1000_0000;
 const QEMU_LA64_RAM_END: usize = QEMU_LA64_RAM_BASE + QEMU_LA64_RAM_SIZE;
+// QEMU `virt` places high RAM (guest memory beyond the low 256 MiB) at this
+// physical base, above the MMIO/PCIe apertures. Documents the layout the DTB
+// high-RAM region (recovered by the DMW-wide direct map) lands in; referenced
+// by the direct-map coverage test.
+#[allow(dead_code)]
+const QEMU_LA64_HIGH_RAM_BASE: usize = 0x9000_0000;
+// The cached DMW window (VSEG 0x9) hardware-maps the *entire* physical address
+// space at a fixed offset, so the kernel direct map spans all of it — high RAM
+// is reachable with no per-page mappings. This bounds the direct-map bookkeeping
+// (`direct_map_covers_phys_end`, `extend_direct_map`); the actual frame-metadata
+// span is still carved from the real firmware memory map, not from this size.
+const QEMU_LA64_DIRECT_MAP_SIZE: usize = LA64_PHYS_ADDR_MASK + 1;
 const QEMU_LA64_KERNEL_LOAD_BASE: usize = 0x0020_0000;
 #[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
 const QEMU_LA64_PCH_PIC_BASE: usize = 0x1000_0000;
@@ -132,6 +148,7 @@ const LA64_CRMD_DATM_CC: usize = 0b01 << 7;
 const LA64_EUEN_FPE: usize = 1 << 0;
 const LA64_ASID_MASK: usize = 0x3ff;
 const LA64_TCFG_ENABLE: usize = 1 << 0;
+const LA64_TCFG_PERIODIC: usize = 1 << 1;
 const LA64_TCFG_TICK_MASK: usize = !0x3;
 const LA64_TICLR_CLEAR_TIMER: usize = 1 << 0;
 const LA64_CPUCFG2_LLFTP: u32 = 1 << 14;
@@ -217,15 +234,26 @@ static LA64_IRQ_CONTEXT_DEPTHS: [AtomicUsize; LA64_MAX_BOOT_CPUS] = [
     AtomicUsize::new(0),
 ];
 static LA64_IRQ_DISPATCH_TABLE: AtomicUsize = AtomicUsize::new(0);
-static LA64_ALLOCATED_ASIDS: AtomicU64 = AtomicU64::new(1);
+/// LA64 supports a 10-bit ASID space (`ASID_BITS = 10`, `LA64_ASID_MASK =
+/// 0x3ff`), i.e. 1024 ASIDs. The allocator must cover that whole space so that
+/// EBR-deferred address-space reclaim (retired-but-not-yet-freed `PmapRoot`s
+/// each still holding their ASID) cannot exhaust the pool under fork-heavy
+/// workloads — a single `u64` (63 usable ASIDs) starved `fork()` with `EAGAIN`
+/// once ~63 roots were in flight. Mirrors the RV64 16-word bitmap.
+const LA64_ASID_BITMAP_WORDS: usize = 16;
+const LA64_ASID_CAPACITY: usize = LA64_ASID_BITMAP_WORDS * u64::BITS as usize;
+static LA64_ALLOCATED_ASIDS: [AtomicU64; LA64_ASID_BITMAP_WORDS] =
+    [const { AtomicU64::new(0) }; LA64_ASID_BITMAP_WORDS];
 static LA64_KERNEL_PGDH_PHYS: AtomicUsize = AtomicUsize::new(0);
 static LA64_KERNEL_PGDH_BOOTSTRAP_MAPPED: AtomicBool = AtomicBool::new(false);
 static LA64_ACTIVE_PGDL: AtomicUsize = AtomicUsize::new(0);
 static LA64_ACTIVE_PGDH: AtomicUsize = AtomicUsize::new(0);
 static LA64_ACTIVE_ASID: AtomicUsize = AtomicUsize::new(0);
 static LA64_COMMITTED_PT_NODE_REGISTRY_LOCK: AtomicBool = AtomicBool::new(false);
-static LA64_COMMITTED_PT_NODES: La64CommittedPtNodeRegistry =
-    La64CommittedPtNodeRegistry(UnsafeCell::new([None; 256]));
+const LA64_COMMITTED_PT_NODE_REGISTRY_SLOTS: usize = 4096;
+static LA64_COMMITTED_PT_NODES: La64CommittedPtNodeRegistry = La64CommittedPtNodeRegistry(
+    UnsafeCell::new([None; LA64_COMMITTED_PT_NODE_REGISTRY_SLOTS]),
+);
 #[cfg(target_arch = "loongarch64")]
 static LA64_KERNEL_TLS_VALID: [AtomicBool; LA64_MAX_BOOT_CPUS] = [
     AtomicBool::new(false),
@@ -382,7 +410,9 @@ pub(crate) fn la64_entry_trap_frame_ptr_for_cpu(cpu: CpuId) -> *mut La64TrapFram
     }
 }
 
-struct La64CommittedPtNodeRegistry(UnsafeCell<[Option<PtNode>; 256]>);
+struct La64CommittedPtNodeRegistry(
+    UnsafeCell<[Option<PtNode>; LA64_COMMITTED_PT_NODE_REGISTRY_SLOTS]>,
+);
 
 unsafe impl Sync for La64CommittedPtNodeRegistry {}
 
@@ -853,7 +883,7 @@ impl PlatformConfig for Platform {
     const PHYS_ADDR_BITS: u8 = 48;
     const VIRT_ADDR_BITS: u8 = 48;
     const DIRECT_MAP_BASE: VirtAddr = VirtAddr(LA64_DMW_CACHED_BASE);
-    const DIRECT_MAP_SIZE: usize = QEMU_LA64_RAM_SIZE;
+    const DIRECT_MAP_SIZE: usize = QEMU_LA64_DIRECT_MAP_SIZE;
     const KERNEL_VIRT_BASE: VirtAddr = VirtAddr(la64_cached_virt(QEMU_LA64_KERNEL_LOAD_BASE));
     const USER_TOP: VirtAddr = VirtAddr(LA64_USER_TOP);
     const KERNEL_STACK_SIZE: usize = 128 * 1024;

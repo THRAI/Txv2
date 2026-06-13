@@ -83,6 +83,8 @@ impl Capability {
     pub const CHOWN: Self = Self(0);
     /// `CAP_DAC_OVERRIDE` — bypass discretionary access control.
     pub const DAC_OVERRIDE: Self = Self(1);
+    /// `CAP_DAC_READ_SEARCH` — bypass file read/search permission checks.
+    pub const DAC_READ_SEARCH: Self = Self(2);
     /// `CAP_FOWNER` — bypass file-owner-only checks (chmod, chown,
     /// utimes, etc.) for files the caller does not own. Per Linux's
     /// POSIX cap-FOWNER number (3).
@@ -95,7 +97,7 @@ impl Capability {
     pub const SETUID: Self = Self(7);
     /// `CAP_NET_ADMIN` — network administration.
     pub const NET_ADMIN: Self = Self(12);
-    /// `CAP_NET_RAW` — raw and packet socket creation.
+    /// `CAP_NET_RAW` — raw and packet sockets.
     pub const NET_RAW: Self = Self(13);
     /// `CAP_SYS_ADMIN` — generic privileged operations.
     pub const SYS_ADMIN: Self = Self(21);
@@ -216,6 +218,32 @@ pub fn sign_cred(cred: Cred) -> Result<Cap<Cred>, ZoneError> {
     step_engine::sign(cred)
 }
 
+/// Replace the current process capability masks.
+///
+/// The syscall layer performs Linux ABI validation for `capset(2)` before
+/// reaching this helper; this primitive only publishes the already-checked
+/// effective/permitted masks.
+pub fn step_set_capability_sets(
+    target: &Cap<ProcessIdentity>,
+    effective_caps: CapabilitySet,
+    permitted_caps: CapabilitySet,
+) -> CredChange {
+    let payload_guard = target.payload.lock();
+    let Some(payload) = payload_guard.as_ref() else {
+        return CredChange::Zombie;
+    };
+    let prev_cap = payload.cred_cap();
+    let prev = *prev_cap;
+    let mut new = prev;
+    new.effective_caps = effective_caps;
+    new.permitted_caps = permitted_caps;
+    let Ok(new_cap) = sign_cred(new) else {
+        return CredChange::Zombie;
+    };
+    let _old_cap = payload.replace_cred(new_cap);
+    CredChange::Replaced { prev, new }
+}
+
 /// PR-9 phase 5 — D5 §7. Mint a placeholder
 /// `Cap<RestrictionStackHandle>` for `SubjectAuthority::new` calls in
 /// the syscall arms.
@@ -261,6 +289,22 @@ impl Cred {
     /// (future) signal-delivery permission check.
     pub fn shares_euid(self, other: Cred) -> bool {
         self.euid == other.euid
+    }
+}
+
+fn apply_uid_capability_transition(prev: Cred, new: &mut Cred) {
+    let prev_had_root_uid = prev.uid.is_root() || prev.euid.is_root() || prev.suid.is_root();
+    let new_has_root_uid = new.uid.is_root() || new.euid.is_root() || new.suid.is_root();
+
+    if prev.euid.is_root() && !new.euid.is_root() {
+        new.effective_caps = CapabilitySet::EMPTY;
+    } else if !prev.euid.is_root() && new.euid.is_root() {
+        new.effective_caps = new.permitted_caps;
+    }
+
+    if prev_had_root_uid && !new_has_root_uid {
+        new.effective_caps = CapabilitySet::EMPTY;
+        new.permitted_caps = CapabilitySet::EMPTY;
     }
 }
 
@@ -378,6 +422,7 @@ pub fn step_setuid(target: &Cap<ProcessIdentity>, new_uid: Uid) -> CredChange {
     } else {
         return CredChange::PermissionDenied;
     }
+    apply_uid_capability_transition(prev, &mut new);
 
     let new_cap = match sign_cred(new) {
         Ok(cap) => cap,
@@ -491,6 +536,7 @@ pub fn step_setresuid(
     if let Some(s) = suid {
         new.suid = s;
     }
+    apply_uid_capability_transition(prev, &mut new);
 
     let new_cap = match sign_cred(new) {
         Ok(cap) => cap,
@@ -618,6 +664,7 @@ pub fn step_setreuid(
     if ruid.is_some() || new.euid != prev.uid {
         new.suid = new.euid;
     }
+    apply_uid_capability_transition(prev, &mut new);
 
     let new_cap = match sign_cred(new) {
         Ok(cap) => cap,

@@ -33,7 +33,7 @@ pub mod step_engine {
     pub(crate) use crate::process::lock_metrics::{process_spin_mutex, ProcessSpinMutex};
     pub(crate) use crate::sync::SpinMutex;
     pub use tx_substrate::bus::{RawPort, RawQueue};
-    pub use tx_substrate::epoch::{borrow_current_guard, guard, Guard};
+    pub use tx_substrate::epoch::{borrow_current_guard, drain_with_budget, guard, Guard};
     pub use tx_substrate::step::ProcessIdentity as PlaceholderProcessSubject;
     pub use tx_substrate::step::{
         drive_oneshot, Errno, InterestMask, NoProgress, OneShotStepOp, RestrictionStackHandle,
@@ -74,6 +74,11 @@ pub mod wait_routing {
         let source = tx_substrate::wake::new_source(source_id);
         tx_substrate::wake::register_source(Arc::clone(&source));
         source
+    }
+
+    /// Delegates to `tx_substrate::wake::unregister_source`.
+    pub fn unregister_source(source_id: u64) {
+        tx_substrate::wake::unregister_source(tx_substrate::step::WaitSourceId::new(source_id));
     }
 
     /// Delegates to `tx_reactor::wait::fire_legacy`.

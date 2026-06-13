@@ -36,10 +36,14 @@ use crate::zone::Cap;
 pub enum Errno {
     E2BIG,
     EACCES,
+    EADDRINUSE,
+    EADDRNOTAVAIL,
+    EAFNOSUPPORT,
     /// Resource temporarily unavailable. Surfaced by `O_NONBLOCK` I/O
     /// paths (e.g. fd-ops Wave 3 `pipe::step_read` / `step_write` with
     /// `nonblocking = true` and no progress yet).
     EAGAIN,
+    EALREADY,
     /// Bad file descriptor. Today only surfaced by fd-ops Wave 3
     /// pipe dispatch when a wrong-side `step_read` / `step_write`
     /// reaches the dispatcher despite the OpenFileFlags read/write
@@ -53,24 +57,31 @@ pub enum Errno {
     /// `TFD_TIMER_CANCEL_ON_SET` after a realtime clock change.
     /// Linux value: 125.
     ECANCELED,
+    ECONNREFUSED,
+    EDESTADDRREQ,
     EDQUOT,
     EEXIST,
     EFBIG,
     EIDRM,
     EFAULT,
     EINVAL,
+    EINPROGRESS,
     /// Interrupted system call (e.g. by signal delivery during a
     /// blocked wait — D9-A EINTR path).
     EINTR,
     EIO,
+    EISCONN,
     EISDIR,
     ELOOP,
     ENAMETOOLONG,
     ENODEV,
     ENOEXEC,
+    EMSGSIZE,
     ENOMEM,
     ENOENT,
+    ENOPROTOOPT,
     ENOSYS,
+    ENOTCONN,
     ENOTDIR,
     ENOTEMPTY,
     /// Inappropriate ioctl for device. Surfaced by Slice 5 of the
@@ -79,11 +90,14 @@ pub enum Errno {
     /// or the request code is not one of the eight TTY ioctls v1
     /// implements. Linux value: 25.
     ENOTTY,
+    ENOTSOCK,
+    EOPNOTSUPP,
     EPERM,
     /// Broken pipe: write to a pipe with all readers closed. The
     /// caller is responsible for delivering SIGPIPE before returning
     /// `-EPIPE` to userspace (fd-ops Wave 3, Q2 DECIDED 2026-05-07).
     EPIPE,
+    EPROTONOSUPPORT,
     /// Numerical result out of range. Surfaced by Slice 6's
     /// `getcwd(2)` arm when the user buffer is smaller than the
     /// rendered path (NUL terminator inclusive). Linux value: 34.
@@ -97,23 +111,9 @@ pub enum Errno {
     ESTALE,
     /// Wait deadline expired. Linux value: 110.
     ETIMEDOUT,
-    // Network errno catalog — restored after PR#50 stripped these; required by
-    // the net subsystem (socket/bind/connect/send/recv error paths).
-    EADDRINUSE,
-    EADDRNOTAVAIL,
-    EAFNOSUPPORT,
-    EALREADY,
-    ECONNREFUSED,
-    EDESTADDRREQ,
-    EINPROGRESS,
-    EISCONN,
+    // Net/link errnos required by the net subsystem that are not in main's
+    // alphabetical errno set (the rest were already restored above).
     EMLINK,
-    EMSGSIZE,
-    ENOPROTOOPT,
-    ENOTCONN,
-    ENOTSOCK,
-    EOPNOTSUPP,
-    EPROTONOSUPPORT,
     ESOCKTNOSUPPORT,
 }
 
@@ -127,30 +127,44 @@ impl Errno {
         match self {
             Errno::E2BIG => 7,
             Errno::EACCES => 13,
+            Errno::EADDRINUSE => 98,
+            Errno::EADDRNOTAVAIL => 99,
+            Errno::EAFNOSUPPORT => 97,
             Errno::EAGAIN => 11,
+            Errno::EALREADY => 114,
             Errno::EBADF => 9,
             Errno::EBUSY => 16,
             Errno::ECANCELED => 125,
+            Errno::ECONNREFUSED => 111,
+            Errno::EDESTADDRREQ => 89,
             Errno::EDQUOT => 122,
             Errno::EEXIST => 17,
             Errno::EFAULT => 14,
             Errno::EFBIG => 27,
             Errno::EIDRM => 43,
             Errno::EINVAL => 22,
+            Errno::EINPROGRESS => 115,
             Errno::EIO => 5,
+            Errno::EISCONN => 106,
             Errno::EISDIR => 21,
             Errno::ELOOP => 40,
             Errno::ENAMETOOLONG => 36,
             Errno::ENODEV => 19,
             Errno::ENOEXEC => 8,
+            Errno::EMSGSIZE => 90,
             Errno::ENOMEM => 12,
             Errno::ENOENT => 2,
+            Errno::ENOPROTOOPT => 92,
             Errno::ENOSYS => 38,
+            Errno::ENOTCONN => 107,
             Errno::ENOTDIR => 20,
             Errno::ENOTEMPTY => 39,
             Errno::ENOTTY => 25,
+            Errno::ENOTSOCK => 88,
+            Errno::EOPNOTSUPP => 95,
             Errno::EPERM => 1,
             Errno::EPIPE => 32,
+            Errno::EPROTONOSUPPORT => 93,
             Errno::ERANGE => 34,
             Errno::EROFS => 30,
             Errno::ESPIPE => 29,
@@ -158,21 +172,7 @@ impl Errno {
             Errno::ESTALE => 116,
             Errno::ETIMEDOUT => 110,
             Errno::EINTR => 4,
-            Errno::EADDRINUSE => 98,
-            Errno::EADDRNOTAVAIL => 99,
-            Errno::EAFNOSUPPORT => 97,
-            Errno::EALREADY => 114,
-            Errno::ECONNREFUSED => 111,
-            Errno::EDESTADDRREQ => 89,
-            Errno::EINPROGRESS => 115,
-            Errno::EISCONN => 106,
             Errno::EMLINK => 31,
-            Errno::EMSGSIZE => 90,
-            Errno::ENOPROTOOPT => 92,
-            Errno::ENOTCONN => 107,
-            Errno::ENOTSOCK => 88,
-            Errno::EOPNOTSUPP => 95,
-            Errno::EPROTONOSUPPORT => 93,
             Errno::ESOCKTNOSUPPORT => 94,
         }
     }

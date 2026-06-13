@@ -3,8 +3,8 @@ use crate::cred::{CapabilitySet, Cred, Gid, Uid};
 use crate::execution::Errno;
 use crate::test_support::EPOCH_TEST_LOCK;
 use crate::vm::{
-    AddressSpace, MapPlacement, Prot, USER_PAGE_SIZE, UserRange, UserVirtAddr, VmBacking,
-    VmEntryBacking, VmEntryFlags, VmMapRequest,
+    AddressSpace, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking, VmEntryBacking,
+    VmEntryFlags, VmMapRequest, USER_PAGE_SIZE,
 };
 use crate::zones;
 use core::future::Future;

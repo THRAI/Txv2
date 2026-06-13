@@ -14,7 +14,7 @@ use crate::time::QEMU_VIRT_FALLBACK_TIMEBASE_HZ;
 use crate::Platform;
 
 pub(crate) const MAX_MEMORY_REGIONS: usize = 8;
-pub(crate) const CMDLINE_CAPACITY: usize = 256;
+pub(crate) const CMDLINE_CAPACITY: usize = 16384;
 pub(crate) const BOOTSTRAP_PMAP_RESERVED_RANGES: usize = 4;
 
 pub(crate) struct IdentityLive;

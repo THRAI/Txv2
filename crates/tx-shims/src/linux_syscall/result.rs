@@ -48,20 +48,16 @@ pub enum SyscallResult {
     ///
     /// Cites: `txdoc:EXEC-12-1-INSTALL-USER-TRAP-CONTEXT`.
     ExecCommitted,
-    /// `rt_sigreturn` restored the saved signal frame into the
-    /// thread's `saved_user_context`.  The thread future MUST NOT
-    /// drain `pending_syscall_return` for this iteration — the next
-    /// userspace re-entry uses the restored context (which carries
-    /// the original registers saved before the signal handler was
-    /// invoked).  Same fall-through semantics as `ExecCommitted`:
-    /// AST drain + `prepare_userspace_entry_payload` +
-    /// `enter_userspace_with_context`.
-    ///
-    /// Phase B (first pass): the variant is declared and the thread
-    /// future handles it, but the actual `SignalFrameIf` restore
-    /// (reading `SavedSignalFrame` from user stack) lands in
-    /// Phase D with full handler delivery.
+    /// `rt_sigreturn` reached the kernel's platform signal-frame
+    /// path. The thread future must decode the on-stack frame with
+    /// `SignalFrameIf` before re-entering userspace, so musl-style
+    /// handlers that edit the saved ucontext are honored.
     SigreturnRestored,
+    /// `rt_sigreturn` already restored a syscall-layer compatibility
+    /// signal frame into `saved_user_context`. The thread future MUST
+    /// NOT drain `pending_syscall_return` and MUST NOT decode another
+    /// platform frame for this iteration.
+    SigreturnContextRestored,
 }
 
 impl SyscallResult {

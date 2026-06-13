@@ -12,7 +12,7 @@ use crate::process::adapter::step_engine::{
     PlaceholderProcessSubject, ScriptCtx, StepOp, StepOutcome,
 };
 use crate::process::structure::reset_pid_counter_for_test;
-use crate::signal::Signum;
+use crate::signal::{SignalMask, Signum};
 use crate::test_support::EPOCH_TEST_LOCK;
 use crate::thread_runtime::structure::reset_tid_counter_for_test;
 use crate::vm::{AddressSpace, TestPmap};
@@ -76,6 +76,7 @@ fn clone_thread_op_delegates_to_step_clone_thread() {
     let mut op = CloneThreadOp {
         process: &parent,
         parent_user_ctx: &parent_ctx,
+        parent_signal_mask: SignalMask::EMPTY,
         stack,
         tls,
         ctid_ptr,

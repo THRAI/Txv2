@@ -14,16 +14,16 @@ use tx_platform_adapter::platform_adapter;
 )]
 pub mod step_engine {
     pub(crate) use crate::sync::SpinMutex;
-    pub use tx_substrate::epoch::{self as epoch, Guard, guard};
+    pub use tx_substrate::epoch::{self as epoch, guard, Guard};
     pub use tx_substrate::page_allocator::{self, ZeroPolicy};
     pub use tx_substrate::step::{
         ByteProgress, Errno, NoProgress, ProcessIdentity, ScriptCtx, StepOp, StepOutcome,
         SubjectIdentity,
     };
     pub use tx_substrate::zone::{
-        Cap, CapProducingPolicy, CoLocatedEntity, Dead, Entity, IdentRef, IdentitySlot,
-        IsPayloadPolicy, ObserverNodePolicy, OperationalCapExt, OperationalRefExt, PayloadBinding,
-        PayloadCap, PayloadPolicy, RetainedEntityPolicy, Weak, Zone, ZoneAllocated, ZoneError,
-        ZonePolicy, register_zone_for, reserve_for, sign, sign_for,
+        register_zone_for, reserve_for, sign, sign_for, Cap, CapProducingPolicy, CoLocatedEntity,
+        Dead, Entity, IdentRef, IdentitySlot, IsPayloadPolicy, ObserverNodePolicy,
+        OperationalCapExt, OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy,
+        RetainedEntityPolicy, Weak, Zone, ZoneAllocated, ZoneError, ZonePolicy,
     };
 }

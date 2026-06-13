@@ -1,9 +1,12 @@
-use crate::adapter::step_engine::{epoch, zone, Zone, ZoneAllocated, ZoneError};
+use crate::adapter::step_engine::{epoch, page_allocator, zone, Zone, ZoneAllocated, ZoneError};
 use tx_hal::{console_write_str, TxPlatform};
+use tx_substrate::slab;
 
 use crate::{
     mount::{MountIdentity, MountNamespace, MountPayload},
+    net,
     page_backed::PageContainer,
+    vfs::structure::FsNotifyInstance,
     vfs::{DEntry, OpenFile, RNode},
     vm::AddressSpace,
 };
@@ -41,12 +44,7 @@ pub fn register_all() -> Result<(), ZoneError> {
     epoll::register_zones()?;
     eventfd::register_zones()?;
     timerfd::register_zones()?;
-    // Network subsystem zones (net namespace identity/payload + socket
-    // identity/payload registries). Re-homed after PR#50 stripped the net
-    // stack: without this, `initial_net_namespace_payload_with_owner` (seeded
-    // into every ProcessPayload at bootstrap/fork) panics on an unregistered
-    // zone.
-    crate::net::register_zones()?;
+    net::register_zones()?;
     subject_placeholders::register_zones()?;
     Ok(())
 }
@@ -78,19 +76,21 @@ pub fn run_smoke<P: TxPlatform>() -> Result<(), ZoneError> {
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KernelZoneSummary {
     pub epoch: crate::adapter::step_engine::EpochSummary,
     pub zone_count: usize,
-    pub zones: [Option<crate::adapter::step_engine::ZoneInfo>; 32],
+    pub captured_zones: usize,
+    pub zones: [Option<crate::adapter::step_engine::ZoneInfo>; 64],
 }
 
 pub(crate) fn summary() -> KernelZoneSummary {
-    let mut zones = [const { None }; 32];
-    let zone_count = zone::snapshot(&mut zones);
+    let mut zones = [const { None }; 64];
+    let captured_zones = zone::snapshot(&mut zones);
     KernelZoneSummary {
         epoch: epoch::summary(),
-        zone_count,
+        zone_count: zone::registered_zone_count(),
+        captured_zones,
         zones,
     }
 }
@@ -142,7 +142,13 @@ pub fn shutdown_with_zone_cleanup<P: TxPlatform>() -> ! {
     P::system_off()
 }
 
-pub(crate) fn dump_summary<P: TxPlatform>() {
+pub fn shutdown_with_quiet_zone_cleanup<P: TxPlatform>() -> ! {
+    let _ = freeze_for_shutdown();
+    try_best_effort_maintenance_tick();
+    P::system_off()
+}
+
+pub fn dump_summary<P: TxPlatform>() {
     let summary = summary();
     console_write_str::<P>("txkernel:zone:summary:epoch=");
     write_usize::<P>(summary.epoch.global_epoch as usize);
@@ -150,7 +156,146 @@ pub(crate) fn dump_summary<P: TxPlatform>() {
     write_usize::<P>(summary.epoch.active_guards);
     console_write_str::<P>(":zones=");
     write_usize::<P>(summary.zone_count);
+    console_write_str::<P>(":captured=");
+    write_usize::<P>(summary.captured_zones);
     console_write_str::<P>("\n");
+
+    if let Ok(diag) = page_allocator::backend_diagnostics() {
+        console_write_str::<P>("txkernel:pagealloc:free=");
+        write_usize::<P>(diag.free_count);
+        console_write_str::<P>(":total=");
+        write_usize::<P>(diag.total_count);
+        console_write_str::<P>(":max_run=");
+        write_usize::<P>(diag.max_contiguous_free_run);
+        console_write_str::<P>("\n");
+    }
+    if let Some(fail) = slab::last_allocation_failure() {
+        console_write_str::<P>("txkernel:heap:last_alloc_fail:size=");
+        write_usize::<P>(fail.size);
+        console_write_str::<P>(":align=");
+        write_usize::<P>(fail.align);
+        console_write_str::<P>(":pages=");
+        write_usize::<P>(fail.pages);
+        console_write_str::<P>(":free=");
+        write_usize::<P>(fail.free_count);
+        console_write_str::<P>(":total=");
+        write_usize::<P>(fail.total_count);
+        console_write_str::<P>(":max_run=");
+        write_usize::<P>(fail.max_contiguous_free_run);
+        console_write_str::<P>("\n");
+    }
+
+    let wait_sources = tx_substrate::wake::registry_summary();
+    console_write_str::<P>("txkernel:wait_source:registered=");
+    write_usize::<P>(wait_sources.live);
+    console_write_str::<P>(":slots=");
+    write_usize::<P>(wait_sources.slots);
+    console_write_str::<P>("\n");
+
+    let wake_sources = crate::adapter::step_engine::wake::registry_summary();
+    console_write_str::<P>("txkernel:wake_source:slots=");
+    write_usize::<P>(wake_sources.slots);
+    console_write_str::<P>(":live=");
+    write_usize::<P>(wake_sources.live);
+    console_write_str::<P>("\n");
+
+    dump_process_summary::<P>();
+
+    for zone in summary.zones.iter().flatten() {
+        if zone.allocated_slots == 0 && zone.slab_count == 0 {
+            continue;
+        }
+        console_write_str::<P>("txkernel:zone:detail:id=");
+        write_usize::<P>(zone.id.0);
+        console_write_str::<P>(":type=");
+        console_write_str::<P>(zone.type_name);
+        console_write_str::<P>(":alloc=");
+        write_usize::<P>(zone.allocated_slots);
+        console_write_str::<P>(":slabs=");
+        write_usize::<P>(zone.slab_count);
+        console_write_str::<P>(":empty=");
+        write_usize::<P>(zone.empty_slab_count);
+        console_write_str::<P>("\n");
+    }
+}
+
+fn dump_process_summary<P: TxPlatform>() {
+    let pids = crate::process::all_pids();
+    let mut live = 0usize;
+    let mut zombies = 0usize;
+    let mut total_threads = 0usize;
+    let mut total_recipes = 0usize;
+    let mut total_mapped_pages = 0usize;
+    let mut total_vm_bytes = 0usize;
+
+    for (pid, _) in pids {
+        let Some(proc_cap) = crate::process::process_by_pid(pid) else {
+            continue;
+        };
+        let state = proc_cap.state_char() as char;
+        let threads = proc_cap.live_thread_count();
+        let comm_bytes = proc_cap.comm();
+        let comm = proc_comm_bytes(&comm_bytes);
+        let (recipes, vm_size, mapped_pages, zombie) = match proc_cap.aspace_cap() {
+            Some(aspace) => {
+                let stats = aspace.stats();
+                let pmap = aspace.pmap().stats();
+                (stats.recipe_count, stats.vm_size, pmap.mapped_pages, false)
+            }
+            None => (0, 0, 0, true),
+        };
+
+        if zombie {
+            zombies += 1;
+        } else {
+            live += 1;
+        }
+        total_threads += threads;
+        total_recipes += recipes;
+        total_mapped_pages += mapped_pages;
+        total_vm_bytes += vm_size;
+
+        console_write_str::<P>("txkernel:proc:pid=");
+        write_usize::<P>(pid.0 as usize);
+        console_write_str::<P>(":state=");
+        write_char::<P>(state);
+        console_write_str::<P>(":threads=");
+        write_usize::<P>(threads);
+        console_write_str::<P>(":recipes=");
+        write_usize::<P>(recipes);
+        console_write_str::<P>(":mapped=");
+        write_usize::<P>(mapped_pages);
+        console_write_str::<P>(":vm=");
+        write_usize::<P>(vm_size);
+        console_write_str::<P>(":comm=");
+        console_write_str::<P>(comm);
+        console_write_str::<P>("\n");
+    }
+
+    console_write_str::<P>("txkernel:proc:summary:live=");
+    write_usize::<P>(live);
+    console_write_str::<P>(":zombies=");
+    write_usize::<P>(zombies);
+    console_write_str::<P>(":threads=");
+    write_usize::<P>(total_threads);
+    console_write_str::<P>(":recipes=");
+    write_usize::<P>(total_recipes);
+    console_write_str::<P>(":mapped=");
+    write_usize::<P>(total_mapped_pages);
+    console_write_str::<P>(":vm=");
+    write_usize::<P>(total_vm_bytes);
+    console_write_str::<P>("\n");
+}
+
+fn proc_comm_bytes(bytes: &[u8; 16]) -> &str {
+    let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    core::str::from_utf8(&bytes[..len]).unwrap_or("?")
+}
+
+fn write_char<P: TxPlatform>(value: char) {
+    let mut buf = [0u8; 4];
+    let s = value.encode_utf8(&mut buf);
+    console_write_str::<P>(s);
 }
 
 fn write_usize<P: TxPlatform>(value: usize) {
@@ -233,6 +378,7 @@ mod mount {
         zone::register_zone_for::<MountIdentity>()?;
         zone::register_zone_for::<MountPayload>()?;
         zone::register_zone_for::<MountNamespace>()?;
+        zone::register_zone_for::<crate::mount::MountApiFile>()?;
         Ok(())
     }
 }
@@ -244,6 +390,7 @@ mod vfs {
         zone::register_zone_for::<DEntry>()?;
         zone::register_zone_for::<RNode>()?;
         zone::register_zone_for::<OpenFile>()?;
+        zone::register_zone_for::<FsNotifyInstance>()?;
         Ok(())
     }
 }

@@ -22,8 +22,8 @@ use tx_subsystems::vfs::structure::{
 use tx_subsystems::vfs::{FsOps, OpenFile};
 
 use crate::linux_syscall::{
-    AT_EMPTY_PATH, AT_FDCWD, NR_CHDIR, NR_FCHDIR, NR_FSTAT, NR_FSTATFS, NR_GETCWD, NR_GETDENTS64,
-    NR_NEWFSTATAT, NR_STATFS, NR_STATX, NR_UMASK,
+    AT_EMPTY_PATH, AT_FDCWD, NR_CHDIR, NR_FCHDIR, NR_FCHMODAT, NR_FSTAT, NR_FSTATFS, NR_GETCWD,
+    NR_GETDENTS64, NR_LSEEK, NR_NEWFSTATAT, NR_STATFS, NR_STATX, NR_UMASK, SEEK_SET,
 };
 
 /// errno magnitudes the tests check against (positive Linux RV64
@@ -490,7 +490,7 @@ fn dispatch_statx_on_root_writes_statx_struct() {
         crate::linux_syscall::numbers::STATX_BASIC_STATS
     );
     assert_eq!(read_u32_at(&statxbuf, STATX_BLKSIZE_OFF), 4096);
-    assert_eq!(read_u32_at(&statxbuf, STATX_NLINK_OFF), 1);
+    assert_eq!(read_u32_at(&statxbuf, STATX_NLINK_OFF), 2);
     let mode = read_u16_at(&statxbuf, STATX_MODE_OFF);
     assert_eq!(mode & 0o170000, 0o040000, "expected S_IFDIR; got {mode:#o}");
     assert_eq!(
@@ -559,6 +559,56 @@ fn dispatch_statx_at_empty_path_stats_fd() {
     assert_eq!(read_u64_at(&statxbuf, STATX_INO_OFF), file_id.as_u64());
     assert_eq!(read_u16_at(&statxbuf, STATX_MODE_OFF), 0o100644);
     drop(empty);
+}
+
+#[test]
+fn dispatch_statx_after_fchmodat_observes_live_mode() {
+    let _setup = stat_setup();
+    let (root_dentry, tmpfs, _root_rnode) = build_tmpfs_root();
+    let owner_cred = Credential {
+        uid: 0,
+        gid: 0,
+        effective_caps: CapabilitySet::FULL,
+    };
+    {
+        let guard = guard();
+        match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner_cred, &guard) {
+            StepOutcome::Done(_) => {}
+            other => panic!("create_inode: {other:?}"),
+        }
+    }
+
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+    let path = nul_terminate(b"/f");
+
+    let chmod_req = SyscallRequest::new(
+        NR_FCHMODAT,
+        [AT_FDCWD as i64 as u64, path.as_ptr() as u64, 0o600, 0, 0, 0],
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(chmod_req, &ctx)),
+        SyscallResult::Return(0)
+    );
+
+    let mut statxbuf = vec![0u8; STATX_BYTES];
+    let statx_req = SyscallRequest::new(
+        NR_STATX,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            0,
+            crate::linux_syscall::numbers::STATX_BASIC_STATS as u64,
+            statxbuf.as_mut_ptr() as u64,
+            0,
+        ],
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(statx_req, &ctx)),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(read_u16_at(&statxbuf, STATX_MODE_OFF), 0o100600);
+    drop(path);
 }
 
 // -----------------------------------------------------------------
@@ -806,6 +856,78 @@ fn dispatch_getdents64_on_directory_fd_writes_entries() {
     );
     let result2 = block_on(dispatch::<ShimsTestPmap>(req2, &ctx));
     assert_eq!(result2, SyscallResult::Return(0));
+}
+
+/// Directory fds are seekable as directory streams: `rewinddir()` in libc
+/// is an `lseek(fd, 0, SEEK_SET)` underneath. LTP cleanup relies on this
+/// when recursively removing large temporary directories.
+#[test]
+fn dispatch_lseek_directory_fd_resets_getdents64_cursor() {
+    let _setup = stat_setup();
+    let (_root_dentry, tmpfs, root_rnode) = build_tmpfs_root();
+    let owner_cred = Credential {
+        uid: 0,
+        gid: 0,
+        effective_caps: CapabilitySet::FULL,
+    };
+    let id_a = {
+        let guard = guard();
+        match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"a", 0o100644, &owner_cred, &guard) {
+            StepOutcome::Done((id, _)) => id,
+            other => panic!("create_inode a: {other:?}"),
+        }
+    };
+    let id_b = {
+        let guard = guard();
+        match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"b", 0o100644, &owner_cred, &guard) {
+            StepOutcome::Done((id, _)) => id,
+            other => panic!("create_inode b: {other:?}"),
+        }
+    };
+
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    proc_cap.set_fd(7, Some(directory_open_file(root_rnode)));
+    let ctx = make_ctx(proc_cap.clone(), thread);
+
+    let mut first = vec![0u8; 24];
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_GETDENTS64,
+            [7, first.as_mut_ptr() as u64, first.len() as u64, 0, 0, 0],
+        ),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Return(24));
+
+    let rewind = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_LSEEK, [7, 0, SEEK_SET as u64, 0, 0, 0]),
+        &ctx,
+    ));
+    assert_eq!(rewind, SyscallResult::Return(0));
+
+    let mut all = vec![0u8; 128];
+    let total = match block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_GETDENTS64,
+            [7, all.as_mut_ptr() as u64, all.len() as u64, 0, 0, 0],
+        ),
+        &ctx,
+    )) {
+        SyscallResult::Return(n) => n as usize,
+        other => panic!("getdents64 after rewind: {other:?}"),
+    };
+
+    let mut seen = alloc::collections::BTreeSet::new();
+    let mut off = 0usize;
+    while off < total {
+        let ino = read_u64_at(&all, off);
+        let reclen = read_u16_at(&all, off + 16) as usize;
+        seen.insert(ino);
+        off += reclen;
+    }
+    assert!(seen.contains(&id_a.as_u64()));
+    assert!(seen.contains(&id_b.as_u64()));
 }
 
 /// `getdents64(pipe_fd, buf, buf_len)` returns `-ENOTDIR`. Pipes

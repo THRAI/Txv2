@@ -22,7 +22,9 @@ use crate::linux_syscall::SIGSETSIZE_BYTES;
 use tx_subsystems::signal::Signum;
 
 const NR_RT_SIGTIMEDWAIT: u64 = 137;
+const NR_RT_SIGSUSPEND: u64 = 133;
 const E_AGAIN: i32 = 11;
+const E_INTR: i32 = 4;
 const E_INVAL: i32 = 22;
 const E_FAULT: i32 = 14;
 
@@ -36,6 +38,46 @@ struct TestTimespec {
 /// Bit position of `SIGCHLD` (17) in the 64-bit kernel sigset_t:
 /// signal `n` → bit `n-1`. SIGCHLD lives at bit 16.
 const SIGCHLD_BIT: u64 = 1u64 << (17 - 1);
+
+#[test]
+fn sigsuspend_pending_signal_returns_eintr_and_restores_mask() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread.clone());
+    let payload = thread.payload_cap().expect("thread payload alive");
+
+    payload.pending().post(Signum::SIGTERM);
+    assert!(payload.pending().is_pending(Signum::SIGTERM));
+    assert_eq!(payload.signal_mask().raw_bits(), 0);
+
+    let suspend_mask = SIGCHLD_BIT;
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_RT_SIGSUSPEND,
+            [
+                &suspend_mask as *const u64 as u64,
+                SIGSETSIZE_BYTES,
+                0,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Error(E_INTR));
+    assert_eq!(
+        payload.signal_mask().raw_bits(),
+        0,
+        "sigsuspend must restore the caller's previous signal mask"
+    );
+    assert!(
+        payload.pending().is_pending(Signum::SIGTERM),
+        "sigsuspend observes delivery readiness but leaves actual consumption to AST delivery"
+    );
+}
 
 /// Happy path: SIGCHLD is pending on the calling thread when
 /// `rt_sigtimedwait(&{SIGCHLD}, NULL, &10s)` runs. The call must
@@ -161,6 +203,32 @@ fn sigtimedwait_ignores_signals_outside_set_returns_neg_eagain() {
     // The unrelated SIGTERM bit is still pending — sigtimedwait
     // must not have consumed it.
     assert!(payload.pending().is_pending(Signum::SIGTERM));
+}
+
+/// A finite `SIGCHLD` wait must still honor its timeout when no child
+/// exits. The libctest `runtest` wrapper relies on this to kill a stuck
+/// child test instead of waiting forever on the process exit wait-source.
+#[test]
+fn sigtimedwait_sigchld_finite_timeout_expires_without_child_exit() {
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let set: u64 = SIGCHLD_BIT;
+    let set_uaddr = &set as *const u64 as u64;
+    let timeout = TestTimespec {
+        tv_sec: 0,
+        tv_nsec: 1,
+    };
+    let timeout_uaddr = &timeout as *const TestTimespec as u64;
+
+    let req = SyscallRequest::new(
+        NR_RT_SIGTIMEDWAIT,
+        [set_uaddr, 0, timeout_uaddr, SIGSETSIZE_BYTES, 0, 0],
+    );
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Error(E_AGAIN));
 }
 
 /// End-to-end libctest shape: fork a child, zombify it via

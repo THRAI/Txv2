@@ -18,6 +18,8 @@ pub struct AllocatorDiagnostics {
     pub total_count: usize,
     /// Number of frames currently available to the allocator.
     pub free_count: usize,
+    /// Longest currently free contiguous PPN run observed by diagnostics.
+    pub max_contiguous_free_run: usize,
     /// Backend-local scan word hint, useful for debugging fragmentation.
     pub scan_hint: usize,
 }

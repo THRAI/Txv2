@@ -212,6 +212,21 @@ fn resolve_path_target(
     }
 }
 
+fn resolve_cwd_for_path(
+    dirfd: i32,
+    _path: &[u8],
+    ctx: &SyscallCtx<'_>,
+) -> Result<Cap<DEntry>, i32> {
+    if dirfd == AT_FDCWD {
+        return ctx.process.cwd().ok_or(ENOENT_VALUE);
+    }
+    if dirfd < 0 {
+        return Err(EBADF_VALUE);
+    }
+    let open_file = ctx.process.fd(dirfd as u32).ok_or(EBADF_VALUE)?;
+    open_file.opendir_dentry().ok_or(ENOTDIR_VALUE)
+}
+
 pub(super) fn sys_name_to_handle_at<P: PmapIf>(
     dfd: i32,
     path_uaddr: u64,
@@ -311,6 +326,7 @@ pub(super) fn sys_open_by_handle_at(
         append: flags & O_APPEND != 0,
         cloexec: flags & O_CLOEXEC != 0,
         nonblocking: flags & O_NONBLOCK != 0,
+        packet: false,
     };
 
     let rnode = if meta.kind() == InodeKind::Directory {

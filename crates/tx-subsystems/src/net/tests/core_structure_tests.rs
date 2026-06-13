@@ -487,7 +487,7 @@ fn raw_tcp_socket_owns_smoltcp_buffers_from_socket_options() {
 }
 
 #[test]
-fn raw_udp_socket_owns_smoltcp_packet_buffers_from_socket_options() {
+fn raw_udp_socket_preserves_option_capacity_with_compact_backing_buffers() {
     let mut options = SocketOptionSet::default_udp();
     options.socket.recv_buf_size = 4096;
     options.socket.send_buf_size = 2048;
@@ -500,6 +500,30 @@ fn raw_udp_socket_owns_smoltcp_packet_buffers_from_socket_options() {
     assert_eq!(raw.send_packet_capacity(), 2);
     assert!(!raw.can_recv());
     assert!(raw.can_send());
+}
+
+#[test]
+fn raw_udp_socket_close_releases_corked_and_queued_payloads() {
+    let mut options = SocketOptionSet::default_udp();
+    options.socket.send_buf_size = 8192;
+
+    let raw = RawUdpSocket::new(&options);
+    let dst = IpEndpoint::new(Ipv4Address::LOOPBACK, 12345);
+
+    assert_eq!(
+        raw.enqueue_tx_datagram_with_more(dst, alloc::vec![0xAA; 4000], true),
+        Some((4000, false))
+    );
+    assert_eq!(
+        raw.enqueue_tx_datagram_with_more(dst, alloc::vec![0xBB; 1], false),
+        Some((1, false))
+    );
+    assert_eq!(raw.send_available(), 8192 - 4001);
+
+    raw.close();
+
+    assert_eq!(raw.send_available(), 8192);
+    assert!(raw.pop_tx_datagram().is_none());
 }
 
 #[test]

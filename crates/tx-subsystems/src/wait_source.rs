@@ -60,6 +60,14 @@ pub struct RawPortWaitFuture {
 static REGISTRY: SpinMutex<BTreeMap<u64, RegisteredWaitSource>> = SpinMutex::new(BTreeMap::new());
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WaitSourceRegistrySummary {
+    pub total: usize,
+    pub channels: usize,
+    pub raw_queues: usize,
+    pub raw_ports: usize,
+}
+
 fn register_wait_source(source: RegisteredWaitSource) -> u64 {
     let id = NEXT_ID.fetch_add(1, Ordering::AcqRel);
     REGISTRY.lock().insert(id, source);
@@ -74,6 +82,15 @@ pub fn register_wait_channel(channel: Channel) -> u64 {
     register_wait_source(RegisteredWaitSource::Channel(channel))
 }
 
+/// Register `channel` under an id minted by the v3 notification-source
+/// namespace. This keeps `YieldShape::OnWaitSource { source }` and legacy
+/// `WaitToken(source)` resolution aligned during the coexistence window.
+pub fn register_wait_channel_with_id(id: u64, channel: Channel) {
+    REGISTRY
+        .lock()
+        .insert(id, RegisteredWaitSource::Channel(channel));
+}
+
 /// Register a level-triggered readiness queue for wait-source resolution.
 pub fn register_wait_queue(queue: RawQueue) -> u64 {
     register_wait_source(RegisteredWaitSource::RawQueue(queue))
@@ -82,17 +99,6 @@ pub fn register_wait_queue(queue: RawQueue) -> u64 {
 /// Register an edge-triggered port for wait-source resolution.
 pub fn register_wait_port(port: RawPort) -> u64 {
     register_wait_source(RegisteredWaitSource::RawPort(port))
-}
-
-/// Register `channel` under an id minted by the v3 notification-source
-/// namespace. This keeps `YieldShape::OnWaitSource { source }` and legacy
-/// `WaitToken(source)` resolution aligned during the coexistence window.
-/// Main-side addition (PR#50 era); preserved alongside the net subsystem's
-/// `RawQueue`/`RawPort` wait-source model.
-pub fn register_wait_channel_with_id(id: u64, channel: Channel) {
-    REGISTRY
-        .lock()
-        .insert(id, RegisteredWaitSource::Channel(channel));
 }
 
 /// Drop the registry's clone of the channel registered under `id`.
@@ -105,6 +111,27 @@ pub fn release_wait_channel(id: u64) {
 /// Drop the registry's clone of any wait source registered under `id`.
 pub fn release_wait_source(id: u64) {
     REGISTRY.lock().remove(&id);
+}
+
+/// Current number of registered wait sources.
+pub fn registered_wait_source_count() -> usize {
+    REGISTRY.lock().len()
+}
+
+pub fn registry_summary() -> WaitSourceRegistrySummary {
+    let registry = REGISTRY.lock();
+    let mut summary = WaitSourceRegistrySummary {
+        total: registry.len(),
+        ..WaitSourceRegistrySummary::default()
+    };
+    for source in registry.values() {
+        match source {
+            RegisteredWaitSource::Channel(_) => summary.channels += 1,
+            RegisteredWaitSource::RawQueue(_) => summary.raw_queues += 1,
+            RegisteredWaitSource::RawPort(_) => summary.raw_ports += 1,
+        }
+    }
+    summary
 }
 
 /// Return a clone of the channel registered under `id`, or `None` if no
@@ -299,6 +326,15 @@ mod tests {
     #[test]
     fn wait_source_lookup_returns_some_for_registered_id_and_none_after_release() {
         let id = register_wait_channel(Channel::new());
+        assert!(lookup_wait_channel(id).is_some());
+        release_wait_channel(id);
+        assert!(lookup_wait_channel(id).is_none());
+    }
+
+    #[test]
+    fn wait_source_can_register_already_minted_notification_id() {
+        let id = u64::from(u32::MAX) + 17;
+        register_wait_channel_with_id(id, Channel::new());
         assert!(lookup_wait_channel(id).is_some());
         release_wait_channel(id);
         assert!(lookup_wait_channel(id).is_none());

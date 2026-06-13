@@ -10,7 +10,7 @@ pub mod step_engine {
     use tx_substrate::zone;
 
     pub(crate) use crate::sync::SpinMutex;
-    pub use tx_substrate::epoch::guard;
+    pub use tx_substrate::epoch::{borrow_current_guard, guard};
     pub use tx_substrate::step::{
         ByteProgress, Errno as V3Errno, InterestMask, StepOutcome, WaitSourceId, YieldShape,
     };

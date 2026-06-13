@@ -7,10 +7,11 @@ use super::*;
 use crate::adapter::step_engine::{guard, page_allocator, reserve_for, sign_for, StepOutcome};
 use crate::linux_syscall::{
     CLOSE_RANGE_CLOEXEC, CLOSE_RANGE_UNSHARE, NR_CLOSE_RANGE, NR_COPY_FILE_RANGE, NR_FADVISE64_64,
-    NR_FALLOCATE, NR_GETRLIMIT, NR_GETRUSAGE, NR_PREADV, NR_PREADV2, NR_PWRITE64, NR_PWRITEV,
-    NR_PWRITEV2, NR_READAHEAD, NR_SCHED_GETPARAM, NR_SCHED_GETSCHEDULER, NR_SCHED_GET_PRIORITY_MAX,
-    NR_SCHED_GET_PRIORITY_MIN, NR_SCHED_RR_GET_INTERVAL, NR_SCHED_YIELD, NR_SETRLIMIT,
-    NR_SYNC_FILE_RANGE, RLIMIT_NOFILE,
+    NR_FALLOCATE, NR_GETRLIMIT, NR_GETRUSAGE, NR_PRCTL, NR_PREADV, NR_PREADV2, NR_PWRITE64,
+    NR_PWRITEV, NR_PWRITEV2, NR_READAHEAD, NR_SCHED_GETATTR, NR_SCHED_GETPARAM,
+    NR_SCHED_GETSCHEDULER, NR_SCHED_GET_PRIORITY_MAX, NR_SCHED_GET_PRIORITY_MIN,
+    NR_SCHED_RR_GET_INTERVAL, NR_SCHED_SETATTR, NR_SCHED_SETSCHEDULER, NR_SCHED_YIELD,
+    NR_SETRLIMIT, NR_SYNC_FILE_RANGE, RLIMIT_NOFILE,
 };
 use alloc::vec;
 use tx_subsystems::page_backed::{
@@ -26,6 +27,7 @@ use tx_subsystems::vm::{
 
 const E_INVAL: i32 = 22;
 const E_NOSYS: i32 = 38;
+const E_OPNOTSUPP: i32 = 95;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -38,6 +40,19 @@ struct TestRlimit {
 #[derive(Clone, Copy)]
 struct TestSchedParam {
     sched_priority: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TestSchedAttr {
+    size: u32,
+    sched_policy: u32,
+    sched_flags: u64,
+    sched_nice: i32,
+    sched_priority: u32,
+    sched_runtime: u64,
+    sched_deadline: u64,
+    sched_period: u64,
 }
 
 #[repr(C)]
@@ -374,6 +389,179 @@ fn dispatch_scheduler_queries_return_fixed_sched_other_model() {
 }
 
 #[test]
+fn dispatch_scheduler_attr_and_policy_round_trip_compat_state() {
+    const SCHED_BATCH: u32 = 3;
+    const SCHED_IDLE: u64 = 5;
+
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread);
+    let mut attr = TestSchedAttr {
+        size: core::mem::size_of::<TestSchedAttr>() as u32,
+        sched_policy: SCHED_BATCH,
+        sched_flags: 0,
+        sched_nice: 0,
+        sched_priority: 0,
+        sched_runtime: 0,
+        sched_deadline: 0,
+        sched_period: 0,
+    };
+    let mut out = TestSchedAttr {
+        size: core::mem::size_of::<TestSchedAttr>() as u32,
+        sched_policy: 0xff,
+        sched_flags: 0xff,
+        sched_nice: -99,
+        sched_priority: 99,
+        sched_runtime: 1,
+        sched_deadline: 1,
+        sched_period: 1,
+    };
+
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_SCHED_SETATTR,
+                [0, &mut attr as *mut TestSchedAttr as u64, 0, 0, 0, 0],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_SCHED_GETATTR,
+                [
+                    0,
+                    &mut out as *mut TestSchedAttr as u64,
+                    core::mem::size_of::<TestSchedAttr>() as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(out.sched_policy, SCHED_BATCH);
+
+    let mut param = TestSchedParam { sched_priority: 0 };
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_SCHED_SETSCHEDULER,
+                [
+                    0,
+                    SCHED_IDLE,
+                    &mut param as *mut TestSchedParam as u64,
+                    0,
+                    0,
+                    0
+                ],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(NR_SCHED_GETSCHEDULER, [0, 0, 0, 0, 0, 0]),
+            &ctx,
+        )),
+        SyscallResult::Return(SCHED_IDLE as i64)
+    );
+
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_SCHED_SETSCHEDULER,
+                [0, 0, &mut param as *mut TestSchedParam as u64, 0, 0, 0],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Return(0)
+    );
+}
+
+#[test]
+fn dispatch_prctl_common_options_round_trip_process_state() {
+    const PR_SET_PDEATHSIG: u64 = 1;
+    const PR_GET_PDEATHSIG: u64 = 2;
+    const PR_SET_NAME: u64 = 15;
+    const PR_GET_NAME: u64 = 16;
+    const PR_SET_TIMERSLACK: u64 = 29;
+    const PR_GET_TIMERSLACK: u64 = 30;
+
+    let _setup = setup();
+    let proc_cap = bootstrap();
+    let thread = first_thread(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread);
+    let mut name = [0u8; 16];
+    name[..8].copy_from_slice(b"txv2-ltp");
+    let mut out = [0xA5u8; 16];
+    let mut pdeathsig = 0i32;
+
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(NR_PRCTL, [PR_SET_NAME, name.as_ptr() as u64, 0, 0, 0, 0]),
+            &ctx,
+        )),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(NR_PRCTL, [PR_GET_NAME, out.as_mut_ptr() as u64, 0, 0, 0, 0],),
+            &ctx,
+        )),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(&out[..8], b"txv2-ltp");
+
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(NR_PRCTL, [PR_SET_TIMERSLACK, 123_456, 0, 0, 0, 0]),
+            &ctx,
+        )),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(NR_PRCTL, [PR_GET_TIMERSLACK, 0, 0, 0, 0, 0]),
+            &ctx,
+        )),
+        SyscallResult::Return(123_456)
+    );
+
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(NR_PRCTL, [PR_SET_PDEATHSIG, 15, 0, 0, 0, 0]),
+            &ctx,
+        )),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_PRCTL,
+                [
+                    PR_GET_PDEATHSIG,
+                    &mut pdeathsig as *mut i32 as u64,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(pdeathsig, 15);
+}
+
+#[test]
 fn dispatch_positioned_write_and_vector_io_restore_original_offset() {
     let _setup = hs_setup();
     let proc_cap = bootstrap();
@@ -448,7 +636,7 @@ fn dispatch_positioned_write_and_vector_io_restore_original_offset() {
         SyscallRequest::new(NR_PWRITEV2, [6, iov_ptr, 1, 0, 0, 1]),
         &ctx,
     ));
-    assert_eq!(unsupported, SyscallResult::Error(E_NOSYS));
+    assert_eq!(unsupported, SyscallResult::Error(E_OPNOTSUPP));
 }
 
 #[test]
@@ -513,7 +701,16 @@ fn dispatch_fallocate_grows_pagebacked_file_and_rejects_modes() {
             SyscallRequest::new(NR_FALLOCATE, [6, 1, 0, 1, 0, 0]),
             &ctx,
         )),
-        SyscallResult::Error(E_NOSYS)
+        SyscallResult::Return(0)
+    );
+    assert_eq!(pc.size_bytes(), 24);
+
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(NR_FALLOCATE, [6, 2, 0, 1, 0, 0]),
+            &ctx,
+        )),
+        SyscallResult::Error(E_OPNOTSUPP)
     );
 }
 

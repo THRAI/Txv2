@@ -57,8 +57,8 @@ use tx_observe_types::{
 };
 use tx_scripts::process::exec::{exec_script, ExecError};
 use tx_subsystems::cred::{
-    Capability, CredChange, Gid, SetgidOp, SetregidOp, SetresgidOp, SetresuidOp, SetreuidOp,
-    SetuidOp, Uid,
+    Capability, CapabilitySet, CredChange, Gid, SetgidOp, SetregidOp, SetresgidOp, SetresuidOp,
+    SetreuidOp, SetuidOp, Uid,
 };
 use tx_subsystems::execution::Errno;
 use tx_subsystems::page_backed::{
@@ -75,7 +75,7 @@ use tx_subsystems::signal::{
     SigactionOp, SignalMask, Signum,
 };
 use tx_subsystems::thread_runtime::execution::{
-    step_sigprocmask, step_sigprocmask_with_payload, SigmaskHow, SigprocmaskChange,
+    step_sigprocmask, step_sigprocmask_with_payload, SigmaskHow, SigprocmaskChange, SigprocmaskOp,
 };
 use tx_subsystems::thread_runtime::{
     step_thread_exit, ThreadExitOp, ThreadIdentity, ThreadKillOp, ThreadPayload,
@@ -90,7 +90,8 @@ use tx_subsystems::vfs::composite::{
     AccessOp, ChmodOp, ChownOp, MknodOp, NanosleepOp, RenameOp, StatOp, StatxOp, StatxResult,
 };
 use tx_subsystems::vfs::structure::{
-    Credential, InodeKind, InodeMeta, OpenFileFlags, RNodeBacking, StructPayload,
+    Credential, FsNotifyInstance, FsNotifyKind, InodeKind, InodeMeta, OpenFileBacking,
+    OpenFileFlags, RNodeBacking, StructPayload, S_ISGID,
 };
 use tx_subsystems::vfs::{
     step_open, step_walk, DEntry, FileFsyncOp, FlockOp, OpenFile, OpenFileGetFlOp, OpenFileSetFlOp,
@@ -100,12 +101,14 @@ use tx_subsystems::vm::{
     AddressSpace, MadviseAdvice, MapPlacement, Prot, UserRange, UserVirtAddr, VmBacking,
     VmEntryFlags, VmMapError, VmMapRequest, VmRemapRequest, FULL_USER_V1_TOP, USER_PAGE_SIZE,
 };
+use tx_subsystems::wait_source;
 
 pub mod numbers;
 
 mod cred;
 use cred::*;
 mod time;
+pub use time::poll_due_itimers;
 use time::*;
 mod signal;
 use signal::*;
@@ -115,12 +118,16 @@ mod vm;
 use vm::*;
 pub mod io;
 use io::*;
+mod socket;
+use socket::*;
 pub mod fs_basic;
 use fs_basic::*;
 mod fs_path;
 use fs_path::*;
 mod fs_mut;
 use fs_mut::*;
+mod fs_handle;
+use fs_handle::*;
 pub mod proc;
 use proc::*;
 mod misc;
@@ -146,14 +153,17 @@ mod eventfd;
 use eventfd::*;
 mod timerfd;
 use timerfd::*;
+mod posix_timer;
+pub use posix_timer::poll_due_posix_timers;
+use posix_timer::*;
 mod epoll;
 use epoll::*;
+mod kernel_object;
+use kernel_object::*;
 mod event_notify;
 use event_notify::*;
 mod splice;
 use splice::*;
-mod socket;
-use socket::*;
 
 mod ctx;
 pub use ctx::*;
@@ -171,6 +181,8 @@ pub(super) use helpers::*;
 mod wait;
 pub(super) use wait::*;
 
+pub use time::maybe_deliver_itimer_signal;
+
 #[cfg(test)]
 mod tests;
 
@@ -178,59 +190,68 @@ pub use numbers::{
     AT_EACCESS, AT_EMPTY_PATH, AT_FDCWD, AT_NO_AUTOMOUNT, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW,
     CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_MONOTONIC_COARSE, CLOCK_MONOTONIC_RAW,
     CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME, CLOCK_REALTIME_COARSE, CLOCK_THREAD_CPUTIME_ID,
-    CLONE_CHILD_CLEARTID, CLONE_DETACHED, CLONE_FILES, CLONE_FS, CLONE_NEWCGROUP, CLONE_NEWUTS,
-    CLONE_PARENT, CLONE_PARENT_SETTID, CLONE_SETTLS, CLONE_SIGHAND, CLONE_SYSVSEM, CLONE_THREAD,
-    CLONE_VFORK, CLONE_VM, CLOSE_RANGE_CLOEXEC, CLOSE_RANGE_UNSHARE, DT_BLK, DT_CHR, DT_DIR,
-    DT_FIFO, DT_LNK, DT_REG, DT_SOCK, DT_UNKNOWN, FD_CLOEXEC, FUTEX_CLOCK_REALTIME, FUTEX_CMD_MASK,
-    FUTEX_CMP_REQUEUE, FUTEX_LOCK_PI, FUTEX_PRIVATE_FLAG, FUTEX_REQUEUE, FUTEX_TRYLOCK_PI,
-    FUTEX_UNLOCK_PI, FUTEX_WAIT, FUTEX_WAIT_BITSET, FUTEX_WAKE, FUTEX_WAKE_BITSET, FUTEX_WAKE_OP,
-    F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_GETPIPE_SZ, F_OK, F_SETFD, F_SETFL, F_SETPIPE_SZ,
+    CLONE_CHILD_CLEARTID, CLONE_CHILD_SETTID, CLONE_DETACHED, CLONE_FILES, CLONE_FS,
+    CLONE_NEWCGROUP, CLONE_NEWNET, CLONE_NEWUSER, CLONE_NEWUTS, CLONE_PARENT, CLONE_PARENT_SETTID,
+    CLONE_SETTLS, CLONE_SIGHAND, CLONE_SYSVSEM, CLONE_THREAD, CLONE_VFORK, CLONE_VM,
+    CLOSE_RANGE_CLOEXEC, CLOSE_RANGE_UNSHARE, DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_LNK, DT_REG,
+    DT_SOCK, DT_UNKNOWN, FD_CLOEXEC, FUTEX_CLOCK_REALTIME, FUTEX_CMD_MASK, FUTEX_CMP_REQUEUE,
+    FUTEX_LOCK_PI, FUTEX_PRIVATE_FLAG, FUTEX_REQUEUE, FUTEX_TRYLOCK_PI, FUTEX_UNLOCK_PI,
+    FUTEX_WAIT, FUTEX_WAIT_BITSET, FUTEX_WAKE, FUTEX_WAKE_BITSET, FUTEX_WAKE_OP, F_DUPFD,
+    F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_GETLEASE, F_GETLK, F_GETPIPE_SZ, F_OFD_GETLK, F_OFD_SETLK,
+    F_OFD_SETLKW, F_OK, F_SETFD, F_SETFL, F_SETLEASE, F_SETLK, F_SETLKW, F_SETPIPE_SZ,
     GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM, MADV_DONTNEED, MADV_FREE, MADV_NORMAL, MADV_RANDOM,
     MADV_SEQUENTIAL, MADV_WILLNEED, MAP_ANONYMOUS, MAP_DENYWRITE, MAP_EXECUTABLE, MAP_FIXED,
     MAP_FIXED_NOREPLACE, MAP_GROWSDOWN, MAP_HUGETLB, MAP_LOCKED, MAP_NONBLOCK, MAP_NORESERVE,
-    MAP_POPULATE, MAP_PRIVATE, MAP_SHARED, MAP_STACK, MAP_SYNC, MREMAP_DONTUNMAP, MREMAP_FIXED,
-    MREMAP_MAYMOVE, NR_ACCEPT, NR_ACCEPT4, NR_BIND, NR_BRK, NR_CHDIR, NR_CLOCK_GETRES,
-    NR_CLOCK_GETTIME, NR_CLOCK_NANOSLEEP, NR_CLOCK_SETTIME, NR_CLONE, NR_CLOSE, NR_CLOSE_RANGE,
-    NR_CONNECT, NR_COPY_FILE_RANGE, NR_DUP, NR_DUP3, NR_EPOLL_CREATE1, NR_EPOLL_CTL,
-    NR_EPOLL_PWAIT, NR_EPOLL_PWAIT2, NR_EVENTFD2, NR_EXECVE, NR_EXIT, NR_EXIT_GROUP, NR_FACCESSAT,
-    NR_FACCESSAT2, NR_FADVISE64_64, NR_FALLOCATE, NR_FANOTIFY_INIT, NR_FANOTIFY_MARK, NR_FCHDIR,
-    NR_FCHMOD, NR_FCHMODAT, NR_FCHMODAT2, NR_FCHOWN, NR_FCHOWNAT, NR_FCNTL, NR_FDATASYNC, NR_FLOCK,
-    NR_FSTAT, NR_FSTATFS, NR_FSYNC, NR_FTRUNCATE, NR_FUTEX, NR_GETCPU, NR_GETCWD, NR_GETDENTS64,
-    NR_GETEGID, NR_GETEUID, NR_GETGID, NR_GETGROUPS, NR_GETPEERNAME, NR_GETPGID, NR_GETPID,
-    NR_GETPPID, NR_GETPRIORITY, NR_GETRANDOM, NR_GETRESGID, NR_GETRESUID, NR_GETRLIMIT,
-    NR_GETRUSAGE, NR_GETSID, NR_GETSOCKNAME, NR_GETSOCKOPT, NR_GETTID, NR_GETTIMEOFDAY, NR_GETUID,
-    NR_GET_ROBUST_LIST, NR_INOTIFY_ADD_WATCH, NR_INOTIFY_INIT1, NR_INOTIFY_RM_WATCH, NR_IOCTL,
-    NR_IOPRIO_GET, NR_IOPRIO_SET, NR_IO_DESTROY, NR_IO_GETEVENTS, NR_IO_SETUP, NR_IO_SUBMIT,
-    NR_IO_URING_ENTER, NR_IO_URING_SETUP, NR_KILL, NR_LINKAT, NR_LISTEN, NR_LSEEK, NR_MADVISE,
-    NR_MKDIRAT, NR_MKNODAT, NR_MLOCK, NR_MMAP, NR_MOUNT, NR_MPROTECT, NR_MQ_GETSETATTR,
-    NR_MQ_NOTIFY, NR_MQ_OPEN, NR_MQ_TIMEDRECEIVE, NR_MQ_TIMEDSEND, NR_MQ_UNLINK, NR_MREMAP,
-    NR_MSGCTL, NR_MSGGET, NR_MSGRCV, NR_MSGSND, NR_MSYNC, NR_MUNLOCK, NR_MUNMAP, NR_NANOSLEEP,
-    NR_NEWFSTATAT, NR_OPENAT, NR_PERSONALITY, NR_PIDFD_OPEN, NR_PIDFD_SEND_SIGNAL, NR_PIPE2,
-    NR_PPOLL, NR_PREAD64, NR_PREADV, NR_PREADV2, NR_PRLIMIT64, NR_PSELECT6, NR_PWRITE64,
-    NR_PWRITEV, NR_PWRITEV2, NR_READ, NR_READAHEAD, NR_READLINKAT, NR_READV, NR_RECVFROM,
-    NR_RENAMEAT2, NR_RESTART_SYSCALL, NR_RT_SIGACTION, NR_RT_SIGPENDING, NR_RT_SIGPROCMASK,
-    NR_RT_SIGQUEUEINFO, NR_RT_SIGRETURN, NR_RT_SIGSUSPEND, NR_RT_SIGTIMEDWAIT,
-    NR_SCHED_GETAFFINITY, NR_SCHED_GETPARAM, NR_SCHED_GETSCHEDULER, NR_SCHED_GET_PRIORITY_MAX,
-    NR_SCHED_GET_PRIORITY_MIN, NR_SCHED_RR_GET_INTERVAL, NR_SCHED_SETAFFINITY, NR_SCHED_SETPARAM,
-    NR_SCHED_SETSCHEDULER, NR_SCHED_YIELD, NR_SEMCTL, NR_SEMGET, NR_SEMOP, NR_SEMTIMEDOP,
-    NR_SENDTO, NR_SETGID, NR_SETPGID, NR_SETPRIORITY, NR_SETREGID, NR_SETRESGID, NR_SETRESUID,
-    NR_SETREUID, NR_SETRLIMIT, NR_SETSID, NR_SETSOCKOPT, NR_SETTIMEOFDAY, NR_SETUID,
-    NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS, NR_SHMAT, NR_SHMCTL, NR_SHMDT, NR_SHMGET, NR_SHUTDOWN,
-    NR_SIGALTSTACK, NR_SIGNALFD4, NR_SOCKET, NR_SOCKETPAIR, NR_SPLICE, NR_STATFS, NR_STATX,
-    NR_SYMLINKAT, NR_SYNC, NR_SYNCFS, NR_SYNC_FILE_RANGE, NR_SYSLOG, NR_TEE, NR_TGKILL,
-    NR_TIMERFD_CREATE, NR_TIMERFD_GETTIME, NR_TIMERFD_SETTIME, NR_TIMES, NR_TKILL, NR_TRUNCATE,
-    NR_TX_OBSERVE_BEGIN, NR_TX_OBSERVE_TRACE_OFF, NR_TX_OBSERVE_TRACE_ON, NR_UMASK, NR_UMOUNT2,
-    NR_SETNS, NR_UNAME, NR_UNLINKAT, NR_UNSHARE, NR_USERFAULTFD, NR_UTIMENSAT, NR_VMSPLICE,
-    NR_WAIT4, NR_WRITE,
-    NR_WRITEV, O_ACCMODE, O_APPEND, O_CLOEXEC, O_CREAT, O_DIRECT, O_EXCL, O_NONBLOCK, O_RDONLY,
-    O_RDWR, O_TRUNC, O_WRONLY, PROT_EXEC, PROT_GROWSDOWN, PROT_GROWSUP, PROT_NONE, PROT_READ,
+    MAP_POPULATE, MAP_PRIVATE, MAP_SHARED, MAP_STACK, MAP_SYNC, MFD_ALLOW_SEALING, MFD_CLOEXEC,
+    MFD_HUGETLB, MREMAP_DONTUNMAP, MREMAP_FIXED, MREMAP_MAYMOVE, NR_ACCEPT, NR_ACCEPT4, NR_BIND,
+    NR_BPF, NR_BRK, NR_CHDIR, NR_CLOCK_GETRES, NR_CLOCK_GETTIME, NR_CLOCK_NANOSLEEP,
+    NR_CLOCK_SETTIME, NR_CLONE, NR_CLOSE, NR_CLOSE_RANGE, NR_CONNECT, NR_COPY_FILE_RANGE, NR_DUP,
+    NR_DUP3, NR_EPOLL_CREATE1, NR_EPOLL_CTL, NR_EPOLL_PWAIT, NR_EPOLL_PWAIT2, NR_EVENTFD2,
+    NR_EXECVE, NR_EXIT, NR_EXIT_GROUP, NR_FACCESSAT, NR_FACCESSAT2, NR_FADVISE64_64, NR_FALLOCATE,
+    NR_FANOTIFY_INIT, NR_FANOTIFY_MARK, NR_FCHDIR, NR_FCHMOD, NR_FCHMODAT, NR_FCHMODAT2, NR_FCHOWN,
+    NR_FCHOWNAT, NR_FCNTL, NR_FDATASYNC, NR_FLOCK, NR_FSTAT, NR_FSTATFS, NR_FSYNC, NR_FTRUNCATE,
+    NR_FUTEX, NR_GETCPU, NR_GETCWD, NR_GETDENTS64, NR_GETEGID, NR_GETEUID, NR_GETGID, NR_GETGROUPS,
+    NR_GETITIMER, NR_GETPEERNAME, NR_GETPGID, NR_GETPID, NR_GETPPID, NR_GETPRIORITY, NR_GETRANDOM,
+    NR_GETRESGID, NR_GETRESUID, NR_GETRLIMIT, NR_GETRUSAGE, NR_GETSID, NR_GETSOCKNAME,
+    NR_GETSOCKOPT, NR_GETTID, NR_GETTIMEOFDAY, NR_GETUID, NR_GET_ROBUST_LIST, NR_INOTIFY_ADD_WATCH,
+    NR_INOTIFY_INIT1, NR_INOTIFY_RM_WATCH, NR_IOCTL, NR_IOPRIO_GET, NR_IOPRIO_SET, NR_IO_DESTROY,
+    NR_IO_GETEVENTS, NR_IO_SETUP, NR_IO_SUBMIT, NR_IO_URING_ENTER, NR_IO_URING_SETUP, NR_KILL,
+    NR_LINKAT, NR_LISTEN, NR_LSEEK, NR_MADVISE, NR_MEMFD_CREATE, NR_MEMFD_SECRET, NR_MKDIRAT,
+    NR_MKNODAT, NR_MLOCK, NR_MMAP, NR_MOUNT, NR_MPROTECT, NR_MQ_GETSETATTR, NR_MQ_NOTIFY,
+    NR_MQ_OPEN, NR_MQ_TIMEDRECEIVE, NR_MQ_TIMEDSEND, NR_MQ_UNLINK, NR_MREMAP, NR_MSGCTL, NR_MSGGET,
+    NR_MSGRCV, NR_MSGSND, NR_MSYNC, NR_MUNLOCK, NR_MUNMAP, NR_NAME_TO_HANDLE_AT, NR_NANOSLEEP,
+    NR_NEWFSTATAT, NR_OPENAT, NR_OPEN_BY_HANDLE_AT, NR_PERF_EVENT_OPEN, NR_PERSONALITY,
+    NR_PIDFD_OPEN, NR_PIDFD_SEND_SIGNAL, NR_PIPE2, NR_PPOLL, NR_PRCTL, NR_PREAD64, NR_PREADV,
+    NR_PREADV2, NR_PRLIMIT64, NR_PSELECT6, NR_PSELECT6_TIME64, NR_PWRITE64, NR_PWRITEV,
+    NR_PWRITEV2, NR_READ, NR_READAHEAD, NR_READLINKAT, NR_READV, NR_RECVFROM, NR_RECVMMSG,
+    NR_RECVMSG, NR_RENAMEAT2, NR_RESTART_SYSCALL, NR_RT_SIGACTION, NR_RT_SIGPENDING,
+    NR_RT_SIGPROCMASK, NR_RT_SIGQUEUEINFO, NR_RT_SIGRETURN, NR_RT_SIGSUSPEND, NR_RT_SIGTIMEDWAIT,
+    NR_GET_MEMPOLICY, NR_SCHED_GETAFFINITY, NR_SCHED_GETATTR, NR_SCHED_GETPARAM,
+    NR_SCHED_GETSCHEDULER,
+    NR_SCHED_GET_PRIORITY_MAX, NR_SCHED_GET_PRIORITY_MIN, NR_SCHED_RR_GET_INTERVAL,
+    NR_SCHED_SETAFFINITY, NR_SCHED_SETATTR, NR_SCHED_SETPARAM, NR_SCHED_SETSCHEDULER,
+    NR_SCHED_YIELD, NR_SEMCTL, NR_SEMGET, NR_SEMOP, NR_SEMTIMEDOP, NR_SENDMMSG, NR_SENDMSG,
+    NR_SENDTO, NR_SETGID, NR_SETITIMER, NR_SETNS, NR_SETPGID, NR_SETPRIORITY, NR_SETREGID,
+    NR_SETRESGID, NR_SETRESUID, NR_SETREUID, NR_SETRLIMIT, NR_SETSID, NR_SETSOCKOPT,
+    NR_SETTIMEOFDAY, NR_SETUID, NR_SET_ROBUST_LIST, NR_SET_TID_ADDRESS, NR_SHMAT, NR_SHMCTL,
+    NR_SHMDT, NR_SHMGET, NR_SHUTDOWN, NR_SIGALTSTACK, NR_SIGNALFD4, NR_SOCKET, NR_SOCKETPAIR,
+    NR_SPLICE, NR_STATFS, NR_STATX, NR_SYMLINKAT, NR_SYNC, NR_SYNCFS, NR_SYNC_FILE_RANGE,
+    NR_SYSLOG, NR_TEE, NR_TGKILL, NR_TIMERFD_CREATE, NR_TIMERFD_GETTIME, NR_TIMERFD_SETTIME,
+    NR_TIMER_CREATE, NR_TIMER_DELETE, NR_TIMER_GETOVERRUN, NR_TIMER_GETTIME, NR_TIMER_SETTIME,
+    NR_TIMES, NR_TKILL, NR_TRUNCATE, NR_TX_OBSERVE_BEGIN, NR_TX_OBSERVE_TRACE_OFF,
+    NR_TX_OBSERVE_TRACE_ON, NR_UMASK, NR_UMOUNT2, NR_UNAME, NR_UNLINKAT, NR_UNSHARE,
+    NR_USERFAULTFD, NR_UTIMENSAT, NR_VMSPLICE, NR_WAIT4, NR_WRITE, NR_WRITEV, O_ACCMODE, O_APPEND,
+    O_CLOEXEC, O_CREAT, O_DIRECT, O_DIRECTORY, O_EXCL, O_NONBLOCK, O_PATH, O_RDONLY, O_RDWR,
+    O_TMPFILE, O_TRUNC, O_WRONLY, PROT_EXEC, PROT_GROWSDOWN, PROT_GROWSUP, PROT_NONE, PROT_READ,
     PROT_WRITE, RENAME_EXCHANGE, RENAME_NOREPLACE, RENAME_WHITEOUT, RLIMIT_AS, RLIMIT_CORE,
     RLIMIT_CPU, RLIMIT_DATA, RLIMIT_FSIZE, RLIMIT_LOCKS, RLIMIT_MEMLOCK, RLIMIT_MSGQUEUE,
     RLIMIT_NICE, RLIMIT_NOFILE, RLIMIT_NPROC, RLIMIT_RSS, RLIMIT_RTPRIO, RLIMIT_RTTIME,
     RLIMIT_SIGPENDING, RLIMIT_STACK, RLIM_INFINITY, R_OK, SEEK_CUR, SEEK_END, SEEK_SET,
-    SFD_CLOEXEC, SFD_NONBLOCK, SIGCHLD, TCGETS, TCSETS, TCSETSF, TCSETSW, TFD_TIMER_ABSTIME_FLAG,
+    SFD_CLOEXEC, SFD_NONBLOCK, SIGCHLD, SIOCGIFFLAGS, SIOCGIFINDEX, SIOCGIFMTU, SIOCGIFTXQLEN,
+    SIOCSIFFLAGS, SIOCSIFMTU, TCGETS, TCSETS, TCSETSF, TCSETSW, TFD_TIMER_ABSTIME_FLAG,
     TFD_TIMER_CANCEL_ON_SET_FLAG, TIMER_ABSTIME, TIMES_NS_PER_TICK, TIOCGPGRP, TIOCGWINSZ,
     TIOCNOTTY, TIOCSCTTY, TIOCSPGRP, TIOCSWINSZ, UTIME_NOW, UTIME_OMIT, WNOHANG, W_OK, X_OK,
+    __O_TMPFILE,
 };
 
 pub use numbers::{
@@ -241,47 +262,36 @@ pub use numbers::{
     NR_SENDFILE64,
 };
 
-// Socket / network constants used by the socket syscall layer.
+// Socket / network + non-net syscall constants
+// (feature socket layer import; numbers already pulled above are omitted).
 pub use numbers::{
-    AF_INET, AF_INET6, AF_NETLINK, AF_PACKET, AF_UNIX, IPPROTO_ICMPV6, IPPROTO_IP, IPPROTO_TCP,
-    IPV6_2292DSTOPTS, IPV6_2292HOPLIMIT, IPV6_2292HOPOPTS, IPV6_2292PKTINFO, IPV6_2292RTHDR,
-    IPV6_HOPLIMIT, IPV6_PKTINFO, IPV6_RECVDSTOPTS, IPV6_RECVHOPLIMIT, IPV6_RECVHOPOPTS,
-    IPV6_RECVPKTINFO, IPV6_RECVRTHDR, IPV6_RECVTCLASS, IPV6_TCLASS, MCAST_JOIN_GROUP,
-    MCAST_LEAVE_GROUP, SIOCADDRT, SIOCDARP, SIOCDELRT, SIOCGIFCONF, SIOCGIFNAME, SIOCSARP,
-    SOL_IPV6, SOL_NETLINK, SOL_PACKET, SOL_RAW, SOL_SCTP, SOL_SOCKET, TPACKET_V1, TPACKET_V3,
-};
-
-// Socket-option *names* (the optname arg) — without these the (level, OPTNAME)
-// set/getsockopt match arms collapse to binding patterns (see numbers.rs).
-pub use numbers::{
-    ICMP6_FILTER, IPT_SO_GET_ENTRIES, IPT_SO_GET_INFO, IPT_SO_SET_ADD_COUNTERS, IPT_SO_SET_REPLACE,
-    IP_ADD_MEMBERSHIP, IP_DROP_MEMBERSHIP, IP_HDRINCL, IP_MULTICAST_IF, IP_MULTICAST_LOOP,
-    IP_MULTICAST_TTL, IP_RECVERR, IP_TTL,
-    NETLINK_EXT_ACK, PACKET_RESERVE, PACKET_RX_RING, PACKET_VERSION, PACKET_VNET_HDR,
-    SCTP_ASSOCINFO, SCTP_AUTOCLOSE, SCTP_DEFAULT_SEND_PARAM, SCTP_DELAYED_ACK_TIME,
-    SCTP_DISABLE_FRAGMENTS, SCTP_EVENTS, SCTP_GET_LOCAL_ADDRS, SCTP_GET_PEER_ADDRS,
-    SCTP_GET_PEER_ADDR_INFO, SCTP_INITMSG,
+    AF_INET, AF_INET6, AF_NETLINK, AF_PACKET, AF_UNIX, CLOCK_BOOTTIME_ALARM,
+    CLOCK_REALTIME_ALARM, CLOCK_TAI, FSOPEN_CLOEXEC, FSPICK_CLOEXEC, FSPICK_EMPTY_PATH,
+    FSPICK_NO_AUTOMOUNT, FSPICK_SYMLINK_NOFOLLOW, ICMP6_FILTER, IPPROTO_ICMP, IPPROTO_ICMPV6,
+    IPPROTO_IP, IPPROTO_IPV6, IPPROTO_TCP, IPPROTO_UDP, IPPROTO_UDPLITE, IPT_SO_GET_ENTRIES,
+    IPT_SO_GET_INFO, IPT_SO_SET_ADD_COUNTERS, IPT_SO_SET_REPLACE, IPV6_2292DSTOPTS,
+    IPV6_2292HOPLIMIT, IPV6_2292HOPOPTS, IPV6_2292PKTINFO, IPV6_2292RTHDR, IPV6_ADDRFORM,
+    IPV6_CHECKSUM, IPV6_HOPLIMIT, IPV6_PKTINFO, IPV6_RECVDSTOPTS, IPV6_RECVHOPLIMIT,
+    IPV6_RECVHOPOPTS, IPV6_RECVPKTINFO, IPV6_RECVRTHDR, IPV6_RECVTCLASS, IPV6_TCLASS,
+    IPV6_UNICAST_HOPS, IPV6_V6ONLY, IP_ADD_MEMBERSHIP, IP_DROP_MEMBERSHIP, IP_HDRINCL,
+    IP_MULTICAST_IF, IP_MULTICAST_LOOP, IP_MULTICAST_TTL, IP_RECVERR, IP_TTL, MCAST_JOIN_GROUP,
+    MCAST_LEAVE_GROUP, NETLINK_EXT_ACK, NETLINK_NETFILTER, NETLINK_ROUTE, NR_CAPGET, NR_CAPSET,
+    NR_FADVISE64, NR_FSOPEN, NR_FSPICK, NR_KCMP, NR_MINCORE, NR_MLOCK2, NR_MLOCKALL,
+    NR_MUNLOCKALL, NR_OPEN_TREE, NR_PIDFD_GETFD, NR_REMAP_FILE_PAGES, NR_SETGROUPS,
+    NR_SETHOSTNAME, NR_SIGNALFD, OPEN_TREE_CLOEXEC, OPEN_TREE_CLONE, PACKET_RESERVE,
+    PACKET_RX_RING, PACKET_VERSION, PACKET_VNET_HDR, SCTP_ASSOCINFO, SCTP_AUTOCLOSE,
+    SCTP_DEFAULT_SEND_PARAM, SCTP_DELAYED_ACK_TIME, SCTP_DISABLE_FRAGMENTS, SCTP_EVENTS,
+    SCTP_GET_LOCAL_ADDRS, SCTP_GET_PEER_ADDRS, SCTP_GET_PEER_ADDR_INFO, SCTP_INITMSG,
     SCTP_MAXSEG, SCTP_PEER_ADDR_PARAMS, SCTP_PRIMARY_ADDR, SCTP_RTOINFO, SCTP_SOCKOPT_BINDX_ADD,
-    SCTP_SOCKOPT_BINDX_REM, SCTP_SOCKOPT_CONNECTX3, SCTP_SOCKOPT_PEELOFF,
-    SCTP_STATUS, SO_BINDTODEVICE, SO_BROADCAST, SO_DONTROUTE, SO_ERROR, SO_KEEPALIVE, SO_LINGER,
-    SO_NO_CHECK, SO_OOBINLINE, SO_PEERCRED, SO_RCVBUF, SO_RCVTIMEO, SO_REUSEADDR, SO_REUSEPORT,
-    SO_SNDBUF, SO_SNDBUFFORCE, SO_SNDTIMEO, SO_TYPE, TCP_CONGESTION, TCP_INFO, TCP_MAXSEG,
-    TCP_NODELAY, TCP_ULP, TLS_TX,
+    SCTP_SOCKOPT_BINDX_REM, SCTP_SOCKOPT_CONNECTX3, SCTP_SOCKOPT_PEELOFF, SCTP_STATUS,
+    SIOCADDRT, SIOCDARP, SIOCDELRT, SIOCGIFADDR, SIOCGIFBRDADDR, SIOCGIFCONF, SIOCGIFHWADDR,
+    SIOCGIFNAME, SIOCGIFNETMASK, SIOCSARP, SIOCSIFADDR, SIOCSIFBRDADDR, SIOCSIFNETMASK,
+    SOL_IPV6, SOL_NETLINK, SOL_PACKET, SOL_RAW, SOL_SCTP, SOL_SOCKET, SOL_TLS, SO_BINDTODEVICE,
+    SO_BROADCAST, SO_DONTROUTE, SO_ERROR, SO_KEEPALIVE, SO_LINGER, SO_NO_CHECK, SO_OOBINLINE,
+    SO_PEERCRED, SO_RCVBUF, SO_RCVTIMEO, SO_REUSEADDR, SO_REUSEPORT, SO_SNDBUF, SO_SNDBUFFORCE,
+    SO_SNDTIMEO, SO_TYPE, TCP_CONGESTION, TCP_INFO, TCP_MAXSEG, TCP_NODELAY, TCP_ULP, TLS_TX,
+    TPACKET_V1, TPACKET_V2, TPACKET_V3,
 };
-
-// More socket-option names + the SIOC* interface ioctls used by socket.rs.
-pub use numbers::{
-    IPPROTO_UDP, IPV6_ADDRFORM, IPV6_CHECKSUM, IPV6_UNICAST_HOPS, IPV6_V6ONLY, SIOCGIFADDR,
-    SIOCGIFBRDADDR, SIOCGIFFLAGS, SIOCGIFHWADDR, SIOCGIFINDEX, SIOCGIFMTU, SIOCGIFNETMASK,
-    SIOCGIFTXQLEN, SIOCSIFADDR, SIOCSIFBRDADDR, SIOCSIFFLAGS, SIOCSIFMTU, SIOCSIFNETMASK, SOL_TLS,
-};
-
-// Message-based socket syscall numbers (their handlers were undispatched).
-pub use numbers::{NR_RECVMMSG, NR_RECVMSG, NR_SENDMMSG, NR_SENDMSG};
-
-// Interval-timer syscalls (setitimer arms the recv-timeout deadline).
-pub use numbers::{NR_GETITIMER, NR_SETITIMER};
-
 /// Maximum number of input bytes the Phase 2a `write` syscall accepts
 /// in a single call. The dispatcher copies `[buf_ptr, buf_ptr+len)` into
 /// a kernel-side stack-bounded slice (via `from_raw_parts`); higher-level
@@ -320,6 +330,10 @@ pub const EXECVE_VEC_MAX: usize = 256;
 /// Used as the `-ENOSYS` magnitude returned from `dispatch` for every
 /// syscall number not handled by Phase 2a / 2b.
 pub(super) const ENOSYS_VALUE: i32 = 38;
+/// Linux generic ABI errno value for "operation not supported" (`EOPNOTSUPP`).
+/// Used when a syscall surface exists but the requested object/clock flavor is
+/// outside txKernel's current emulation contract.
+pub(super) const EOPNOTSUPP_VALUE: i32 = 95;
 pub(super) const ENODEV_VALUE: i32 = 19;
 /// Linux generic ABI errno value for "no such device or address" (`ENXIO`).
 /// Used by interface-index lookup helpers when an ifindex has no backing link.
@@ -870,6 +884,8 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + tx
         nr if nr == NR_GETPPID => return sys_getppid(ctx),
         nr if nr == NR_GETPGID => return sys_getpgid(req.args, ctx),
         nr if nr == NR_GETSID => return sys_getsid(req.args, ctx),
+        nr if nr == NR_KCMP => return sys_kcmp(req.args, ctx),
+        nr if nr == NR_PIDFD_GETFD => return sys_pidfd_getfd(req.args, ctx),
         nr if nr == NR_GETUID => return sys_getuid(ctx),
         nr if nr == NR_GETEUID => return sys_geteuid(ctx),
         nr if nr == NR_GETGID => return sys_getgid(ctx),
@@ -881,25 +897,32 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + tx
         nr if nr == NR_SETPRIORITY => return sys_setpriority(req.args, ctx),
         nr if nr == NR_TIMES => return sys_times::<P>(req.args, ctx),
         nr if nr == NR_GETTIMEOFDAY => return sys_gettimeofday::<P>(req.args, ctx),
+        nr if nr == NR_GETITIMER => return sys_getitimer::<P>(req.args, ctx),
+        nr if nr == NR_SETITIMER => return sys_setitimer::<P>(req.args, ctx),
         nr if nr == NR_SETTIMEOFDAY => return sys_settimeofday::<P>(req.args, ctx),
         nr if nr == NR_UMASK => return sys_umask(req.args, ctx),
         nr if nr == NR_UNAME => return sys_uname::<P>(req.args, ctx),
+        nr if nr == NR_SETHOSTNAME => return sys_sethostname(req.args, ctx),
         nr if nr == NR_GETRANDOM => return sys_getrandom(req.args, ctx),
         nr if nr == NR_PRLIMIT64 => return sys_prlimit64(req.args, ctx),
         nr if nr == NR_GETRLIMIT => return sys_getrlimit(req.args, ctx),
         nr if nr == NR_SETRLIMIT => return sys_setrlimit(req.args, ctx),
         nr if nr == NR_GETRUSAGE => return sys_getrusage(req.args, ctx),
         nr if nr == NR_RT_SIGRETURN => return sys_rt_sigreturn(ctx),
+        nr if nr == NR_SCHED_GETATTR => return sys_sched_getattr(req.args, ctx),
+        nr if nr == NR_SCHED_SETATTR => return sys_sched_setattr(req.args, ctx),
         nr if nr == NR_SCHED_GETAFFINITY => return sys_sched_getaffinity(req.args, ctx),
         nr if nr == NR_SCHED_SETAFFINITY => return sys_sched_setaffinity(req.args, ctx),
-        nr if nr == NR_SCHED_SETSCHEDULER => return sys_sched_setscheduler(),
+        nr if nr == NR_SCHED_SETSCHEDULER => return sys_sched_setscheduler(req.args, ctx),
         nr if nr == NR_SCHED_SETPARAM => return sys_sched_setparam(req.args, ctx),
         nr if nr == NR_SCHED_GETSCHEDULER => return sys_sched_getscheduler(req.args, ctx),
         nr if nr == NR_SCHED_GETPARAM => return sys_sched_getparam(req.args, ctx),
+        nr if nr == NR_GET_MEMPOLICY => return sys_get_mempolicy(req.args, ctx),
         nr if nr == NR_SCHED_YIELD => return sys_sched_yield(),
         nr if nr == NR_SCHED_GET_PRIORITY_MAX => return sys_sched_get_priority_max(req.args),
         nr if nr == NR_SCHED_GET_PRIORITY_MIN => return sys_sched_get_priority_min(req.args),
         nr if nr == NR_SCHED_RR_GET_INTERVAL => return sys_sched_rr_get_interval(req.args, ctx),
+        nr if nr == NR_PRCTL => return sys_prctl(req.args, ctx),
         nr if nr == NR_SET_TID_ADDRESS => return sys_set_tid_address(req.args, ctx),
         nr if nr == NR_SET_ROBUST_LIST => return sys_set_robust_list(req.args, ctx),
         nr if nr == NR_GET_ROBUST_LIST => return sys_get_robust_list(req.args, ctx),
@@ -907,6 +930,11 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + tx
         nr if nr == NR_MADVISE => return sys_madvise(req.args, ctx),
         nr if nr == NR_MLOCK => return sys_mlock(req.args, ctx).await,
         nr if nr == NR_MUNLOCK => return sys_munlock(req.args, ctx).await,
+        nr if nr == NR_MLOCKALL => return sys_mlockall(req.args, ctx).await,
+        nr if nr == NR_MUNLOCKALL => return sys_munlockall(req.args, ctx).await,
+        nr if nr == NR_MINCORE => return sys_mincore(req.args, ctx),
+        nr if nr == NR_REMAP_FILE_PAGES => return sys_remap_file_pages(req.args),
+        nr if nr == NR_MLOCK2 => return sys_mlock2(req.args, ctx).await,
         nr if nr == NR_UTIMENSAT => return sys_utimensat::<P>(req.args, ctx),
         nr if nr == NR_SHMGET => return sys_shmget(req.args, ctx),
         nr if nr == NR_SHMDT => return sys_shmdt(req.args, ctx).await,
@@ -941,7 +969,7 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + tx
         nr if nr == NR_PWRITEV => sys_pwritev(req.args, ctx).await,
         nr if nr == NR_PREADV2 => sys_preadv2::<P>(req.args, ctx).await,
         nr if nr == NR_PWRITEV2 => sys_pwritev2(req.args, ctx).await,
-        nr if nr == NR_FADVISE64_64 => sys_fadvise64_64(req.args, ctx),
+        nr if nr == NR_FADVISE64_64 || nr == NR_FADVISE64 => sys_fadvise64(req.args, ctx),
         nr if nr == NR_READAHEAD => sys_readahead(req.args, ctx),
         nr if nr == NR_SYNC_FILE_RANGE => sys_sync_file_range(req.args, ctx),
         nr if nr == NR_COPY_FILE_RANGE => sys_copy_file_range(req.args, ctx).await,
@@ -971,23 +999,26 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + tx
         nr if nr == NR_SENDFILE64 => sys_sendfile64(req.args, ctx).await,
         nr if nr == NR_PPOLL => sys_ppoll::<P>(req.args, ctx).await,
         nr if nr == NR_PSELECT6 => sys_pselect6::<P>(req.args, ctx).await,
+        nr if nr == NR_PSELECT6_TIME64 => sys_pselect6::<P>(req.args, ctx).await,
         nr if nr == NR_EXIT => sys_exit(req.args, ctx),
         nr if nr == NR_EXIT_GROUP => sys_exit_group(req.args, ctx),
         nr if nr == NR_BRK => sys_brk(req.args, ctx).await,
         nr if nr == NR_RT_SIGPROCMASK => sys_rt_sigprocmask(req.args, ctx),
         nr if nr == NR_RT_SIGACTION => sys_rt_sigaction(req.args, ctx),
         nr if nr == NR_RT_SIGPENDING => sys_rt_sigpending(req.args, ctx),
-        nr if nr == NR_RT_SIGSUSPEND => sys_rt_sigsuspend(req.args, ctx),
+        nr if nr == NR_RT_SIGSUSPEND => return sys_rt_sigsuspend::<P>(req.args, ctx).await,
         nr if nr == NR_RT_SIGQUEUEINFO => sys_rt_sigqueueinfo(req.args, ctx),
         nr if nr == NR_RT_SIGTIMEDWAIT => sys_rt_sigtimedwait::<P>(req.args, ctx).await,
         nr if nr == NR_SIGALTSTACK => sys_sigaltstack(req.args, ctx),
+        nr if nr == NR_CAPGET => sys_capget(req.args, ctx),
+        nr if nr == NR_CAPSET => sys_capset(req.args, ctx),
         nr if nr == NR_PIDFD_OPEN => sys_pidfd_open(req.args, ctx),
         nr if nr == NR_PIDFD_SEND_SIGNAL => sys_pidfd_send_signal(req.args, ctx),
         nr if nr == NR_FCNTL => sys_fcntl(req.args, ctx),
         nr if nr == NR_SHMCTL => sys_shmctl(req.args, ctx),
         nr if nr == NR_MSGCTL => sys_msgctl(req.args, ctx),
-        nr if nr == NR_SEMOP => sys_semop(req.args, ctx),
-        nr if nr == NR_SEMTIMEDOP => sys_semtimedop(req.args, ctx),
+        nr if nr == NR_SEMOP => sys_semop(req.args, ctx).await,
+        nr if nr == NR_SEMTIMEDOP => sys_semtimedop::<P>(req.args, ctx).await,
         nr if nr == NR_SEMCTL => sys_semctl(req.args, ctx),
         nr if nr == NR_SHMAT => sys_shmat(req.args, ctx).await,
         nr if nr == NR_EXECVE => sys_execve::<P>(req.args, ctx).await,
@@ -1001,12 +1032,13 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + tx
         nr if nr == NR_SET_ROBUST_LIST => sys_set_robust_list(req.args, ctx),
         nr if nr == NR_GET_ROBUST_LIST => sys_get_robust_list(req.args, ctx),
         nr if nr == NR_GETCPU => sys_getcpu(req.args, ctx),
-        nr if nr == NR_PERSONALITY => sys_personality(req.args),
+        nr if nr == NR_PERSONALITY => sys_personality(req.args, ctx),
         // Wave 2 of the DAC + setuid slice — Part 3 (cred-mutation /
         // cred-reading arms). Each wraps a Wave 1 `cred::step_*`
         // helper through the new `ctx.cred()` accessor.
         nr if nr == NR_SETUID => sys_setuid(req.args, ctx),
         nr if nr == NR_SETGID => sys_setgid(req.args, ctx),
+        nr if nr == NR_SETGROUPS => sys_setgroups(req.args, ctx),
         nr if nr == NR_SETREUID => sys_setreuid(req.args, ctx),
         nr if nr == NR_SETREGID => sys_setregid(req.args, ctx),
         nr if nr == NR_SETRESUID => sys_setresuid(req.args, ctx),
@@ -1142,6 +1174,9 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + tx
         nr if nr == NR_FSYNC => sys_fsync::<P>(req.args, ctx).await,
         nr if nr == NR_FDATASYNC => sys_fdatasync::<P>(req.args, ctx).await,
         nr if nr == NR_FLOCK => sys_flock::<P>(req.args, ctx).await,
+        nr if nr == NR_OPEN_TREE => sys_open_tree::<P>(req.args, ctx).await,
+        nr if nr == NR_FSOPEN => sys_fsopen::<P>(req.args, ctx).await,
+        nr if nr == NR_FSPICK => sys_fspick::<P>(req.args, ctx).await,
         nr if nr == NR_MOUNT => sys_mount::<P>(req.args, ctx).await,
         nr if nr == NR_UMOUNT2 => sys_umount2::<P>(req.args, ctx).await,
         nr if nr == NR_MKNODAT => sys_mknodat::<P>(req.args, ctx).await,
@@ -1182,6 +1217,10 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + tx
         // syslog(2) / klogctl — kernel ring-buffer read/control.
         // Stubbed: type 2 (READ) returns 0 bytes so `dmesg(1)` exits 0.
         nr if nr == NR_SYSLOG => sys_syslog(req.args, ctx),
+        nr if nr == NR_PERF_EVENT_OPEN => sys_perf_event_open(req.args, ctx),
+        nr if nr == NR_MEMFD_CREATE => sys_memfd_create(req.args, ctx),
+        nr if nr == NR_BPF => sys_bpf(req.args, ctx),
+        nr if nr == NR_MEMFD_SECRET => sys_memfd_secret(req.args, ctx),
         // PR-10 phase 2 — `userfaultfd(2)` scaffold. Mints a fresh
         // `Cap<UserfaultFd>` (W-Q phase 0 zone), wraps in an
         // `OpenFile` with `OpenFileBacking::Ufd`, installs in the fd
@@ -1242,6 +1281,7 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + tx
         // existing signalfd. Returns the fd. The companion
         // signalfd-shaped read(2) arm lives in sys_read after the
         // ufd discriminator.
+        nr if nr == NR_SIGNALFD => sys_signalfd(req.args, ctx),
         nr if nr == NR_SIGNALFD4 => sys_signalfd4(
             req.args[0] as i32,
             req.args[1],
@@ -1267,6 +1307,22 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + tx
         nr if nr == NR_TIMERFD_GETTIME => {
             sys_timerfd_gettime::<P>(req.args[0] as u32, req.args[1], ctx)
         }
+        // POSIX timer syscalls.
+        nr if nr == NR_TIMER_CREATE => {
+            sys_timer_create(req.args[0] as u32, req.args[1], req.args[2], ctx)
+        }
+        nr if nr == NR_TIMER_DELETE => sys_timer_delete(req.args[0] as u32, ctx),
+        nr if nr == NR_TIMER_GETOVERRUN => sys_timer_getoverrun(req.args[0] as u32, ctx),
+        nr if nr == NR_TIMER_GETTIME => {
+            sys_timer_gettime::<P>(req.args[0] as u32, req.args[1], ctx)
+        }
+        nr if nr == NR_TIMER_SETTIME => sys_timer_settime::<P>(
+            req.args[0] as u32,
+            req.args[1] as u32,
+            req.args[2],
+            req.args[3],
+            ctx,
+        ),
         // epoll_create1 / epoll_ctl / epoll_pwait — generic Linux
         // numbers used by musl on RV64 and LoongArch64. musl's
         // epoll_wait wrapper calls epoll_pwait with a null mask on
@@ -1304,6 +1360,17 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + tx
         nr if nr == NR_INOTIFY_RM_WATCH => sys_inotify_rm_watch(req.args, ctx),
         nr if nr == NR_FANOTIFY_INIT => sys_fanotify_init(req.args, ctx),
         nr if nr == NR_FANOTIFY_MARK => sys_fanotify_mark(req.args, ctx),
+        nr if nr == NR_NAME_TO_HANDLE_AT => sys_name_to_handle_at::<P>(
+            req.args[0] as i32,
+            req.args[1],
+            req.args[2],
+            req.args[3],
+            req.args[4] as u32,
+            ctx,
+        ),
+        nr if nr == NR_OPEN_BY_HANDLE_AT => {
+            sys_open_by_handle_at(req.args[0] as i32, req.args[1], req.args[2] as u32, ctx)
+        }
         _ => SyscallResult::Error(ENOSYS_VALUE),
     }
 }
@@ -1330,16 +1397,6 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + tx
 ///   expedited plus instruction-fetch barrier (`fence.i` on RV64).
 /// - `MEMBARRIER_CMD_REGISTER_*` — registration is a no-op; always
 ///   returns 0.
-///   `sched_setscheduler(pid, policy, param)` — v1 stub.
-///
-/// musl calls this during `pthread_create` to set the new thread's
-/// scheduling policy. Returns 0 unconditionally (success, no-op);
-/// real priority inheritance is deferred to the scheduler slice.
-fn sys_sched_setscheduler() -> SyscallResult {
-    SyscallResult::Return(0)
-}
-
-///
 /// `flags` and `cpu_id` are currently ignored (must be 0).
 fn sys_membarrier<P: SmpIf>(args: &[u64; 6]) -> SyscallResult {
     let cmd = args[0];
@@ -1392,30 +1449,44 @@ pub(super) fn errno_to_i32(errno: Errno) -> i32 {
     match errno {
         Errno::E2BIG => 7,
         Errno::EACCES => 13,
+        Errno::EADDRINUSE => 98,
+        Errno::EADDRNOTAVAIL => 99,
+        Errno::EAFNOSUPPORT => 97,
         Errno::EAGAIN => EAGAIN_VALUE,
+        Errno::EALREADY => 114,
         Errno::EBADF => EBADF_VALUE,
         Errno::EBUSY => 16,
         Errno::ECANCELED => 125,
+        Errno::ECONNREFUSED => 111,
+        Errno::EDESTADDRREQ => 89,
         Errno::EDQUOT => 122,
         Errno::EEXIST => 17,
         Errno::EFBIG => 27,
         Errno::EIDRM => 43,
         Errno::EFAULT => 14,
         Errno::EINVAL => 22,
+        Errno::EINPROGRESS => 115,
         Errno::EIO => 5,
+        Errno::EISCONN => 106,
         Errno::EISDIR => 21,
         Errno::ELOOP => 40,
         Errno::ENAMETOOLONG => 36,
         Errno::ENODEV => 19,
         Errno::ENOEXEC => 8,
+        Errno::EMSGSIZE => 90,
         Errno::ENOMEM => 12,
         Errno::ENOENT => 2,
+        Errno::ENOPROTOOPT => 92,
         Errno::ENOSYS => ENOSYS_VALUE,
+        Errno::ENOTCONN => 107,
         Errno::ENOTDIR => 20,
         Errno::ENOTEMPTY => 39,
         Errno::ENOTTY => 25,
+        Errno::ENOTSOCK => 88,
+        Errno::EOPNOTSUPP => EOPNOTSUPP_VALUE,
         Errno::EPERM => 1,
         Errno::EPIPE => 32,
+        Errno::EPROTONOSUPPORT => 93,
         Errno::ERANGE => 34,
         Errno::EROFS => 30,
         Errno::ESPIPE => 29,
@@ -1531,10 +1602,11 @@ fn emit_syscall_exit(span: SpanId, result: &SyscallResult) {
     };
     // result_kind: 0=Ok, 1=Err, 2=Restart, 3=Fatal, 4=NoReturn (per
     // OBSERVATION_SERIALIZATION_v0 §8.1). `ExecCommitted` and
-    // `SigreturnRestored` are kernel-internal control-flow markers that
-    // never surface as a userspace return value; classify both as NoReturn
-    // for the trace so the daemon's syscall slice closes cleanly even
-    // though no `a0` write occurs.
+    // `SigreturnRestored` and `SigreturnContextRestored` are
+    // kernel-internal control-flow markers that never surface as a
+    // userspace return value; classify them as NoReturn for the trace so
+    // the daemon's syscall slice closes cleanly even though no `a0` write
+    // occurs.
     let (ret, errno, result_kind) = match result {
         SyscallResult::Return(v) => (*v, 0, 0u8),
         SyscallResult::CloneReturn { value, .. } => (*value, 0, 0u8),
@@ -1542,6 +1614,7 @@ fn emit_syscall_exit(span: SpanId, result: &SyscallResult) {
         SyscallResult::NoReturn => (0, 0, 4u8),
         SyscallResult::ExecCommitted => (0, 0, 4u8),
         SyscallResult::SigreturnRestored => (0, 0, 4u8),
+        SyscallResult::SigreturnContextRestored => (0, 0, 4u8),
     };
     let payload = PayloadSyscallExit {
         ret,

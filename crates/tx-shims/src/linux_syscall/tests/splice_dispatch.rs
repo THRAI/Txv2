@@ -3,7 +3,9 @@
 
 use super::*;
 use crate::adapter::step_engine::{guard, page_allocator, reserve_for, sign_for, StepOutcome};
-use crate::linux_syscall::{NR_PIPE2, NR_READ, NR_SPLICE, NR_TEE, NR_VMSPLICE, NR_WRITE, O_DIRECT};
+use crate::linux_syscall::{
+    NR_EPOLL_CREATE1, NR_PIPE2, NR_READ, NR_SPLICE, NR_TEE, NR_VMSPLICE, NR_WRITE, O_DIRECT,
+};
 use alloc::vec;
 use tx_subsystems::page_backed::{
     step_read_to_kernel, step_truncate, step_write_from_kernel, AnonSwapPolicy, MaterializeAccess,
@@ -60,6 +62,16 @@ fn pipe_pair_with_flags(ctx: &SyscallCtx<'_>, flags: u32) -> (u32, u32) {
     ));
     assert_eq!(result, SyscallResult::Return(0));
     (pipefd[0], pipefd[1])
+}
+
+fn create_epoll(ctx: &SyscallCtx<'_>) -> u32 {
+    match block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_EPOLL_CREATE1, [0, 0, 0, 0, 0, 0]),
+        ctx,
+    )) {
+        SyscallResult::Return(fd) => fd as u32,
+        other => panic!("epoll_create1: {other:?}"),
+    }
 }
 
 fn write_all(ctx: &SyscallCtx<'_>, fd: u32, bytes: &[u8]) {
@@ -495,6 +507,38 @@ fn dispatch_splice_unknown_flags_return_einval() {
         &ctx,
     ));
     assert_eq!(result, SyscallResult::Error(E_INVAL));
+}
+
+#[test]
+fn dispatch_splice_epoll_to_pipe_returns_einval_without_rnode_panic() {
+    let _setup = splice_setup();
+    let (proc_cap, thread) = fresh_proc_thread();
+    let ctx = make_ctx(proc_cap, thread);
+    let epfd = create_epoll(&ctx);
+    let (_read_fd, write_fd) = pipe_pair(&ctx);
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_SPLICE, [epfd as u64, 0, write_fd as u64, 0, 1, 0]),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Error(E_INVAL));
+}
+
+#[test]
+fn dispatch_splice_pipe_to_epoll_returns_einval_without_consuming_pipe() {
+    let _setup = splice_setup();
+    let (proc_cap, thread) = fresh_proc_thread();
+    let ctx = make_ctx(proc_cap, thread);
+    let epfd = create_epoll(&ctx);
+    let (read_fd, write_fd) = pipe_pair(&ctx);
+    write_all(&ctx, write_fd, b"kept");
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_SPLICE, [read_fd as u64, 0, epfd as u64, 0, 4, 0]),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Error(E_INVAL));
+    assert_eq!(read_exact(&ctx, read_fd, 4), b"kept");
 }
 
 #[test]

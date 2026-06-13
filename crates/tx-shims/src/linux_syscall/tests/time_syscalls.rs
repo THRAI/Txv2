@@ -4,8 +4,8 @@ use super::*;
 
 use crate::linux_syscall::{
     CLOCK_MONOTONIC, CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME, CLOCK_THREAD_CPUTIME_ID,
-    NR_CLOCK_GETTIME, NR_CLOCK_NANOSLEEP, NR_CLOCK_SETTIME, NR_GETTIMEOFDAY, NR_NANOSLEEP,
-    NR_SETTIMEOFDAY, NR_TIMES, TIMER_ABSTIME, TIMES_NS_PER_TICK,
+    NR_CLOCK_GETTIME, NR_CLOCK_NANOSLEEP, NR_CLOCK_SETTIME, NR_GETITIMER, NR_GETTIMEOFDAY,
+    NR_NANOSLEEP, NR_SETITIMER, NR_SETTIMEOFDAY, NR_TIMES, TIMER_ABSTIME, TIMES_NS_PER_TICK,
 };
 use tx_subsystems::cred::{step_setresuid, Uid};
 
@@ -30,6 +30,13 @@ struct TestTimespec {
 struct TestTimeval {
     tv_sec: i64,
     tv_usec: i64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct TestItimerval {
+    it_interval: TestTimeval,
+    it_value: TestTimeval,
 }
 
 #[repr(C)]
@@ -136,6 +143,65 @@ fn dispatch_gettimeofday_writes_timeval_to_user() {
         (0..1_000_000).contains(&tv.tv_usec),
         "tv_usec must be in [0, 1e6): got {}",
         tv.tv_usec,
+    );
+}
+
+#[test]
+fn dispatch_setitimer_and_getitimer_round_trip_real_timer() {
+    const ITIMER_REAL: u64 = 0;
+
+    let (_setup, proc_cap, thread) = time_setup();
+    let ctx = make_ctx(proc_cap, thread);
+    let new_timer = TestItimerval {
+        it_interval: TestTimeval {
+            tv_sec: 2,
+            tv_usec: 0,
+        },
+        it_value: TestTimeval {
+            tv_sec: 10,
+            tv_usec: 0,
+        },
+    };
+    let mut old_timer = TestItimerval::default();
+    let mut current = TestItimerval::default();
+
+    let set = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_SETITIMER,
+            [
+                ITIMER_REAL,
+                &new_timer as *const TestItimerval as u64,
+                &mut old_timer as *mut TestItimerval as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(set, SyscallResult::Return(0));
+    assert_eq!(old_timer, TestItimerval::default());
+
+    let get = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_GETITIMER,
+            [
+                ITIMER_REAL,
+                &mut current as *mut TestItimerval as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(get, SyscallResult::Return(0));
+    assert_eq!(current.it_interval.tv_sec, 2);
+    assert_eq!(current.it_interval.tv_usec, 0);
+    assert!(
+        current.it_value.tv_sec > 0 || current.it_value.tv_usec > 0,
+        "active interval timer should report non-zero remaining time"
     );
 }
 

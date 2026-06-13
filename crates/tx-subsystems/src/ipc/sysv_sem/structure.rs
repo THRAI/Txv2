@@ -13,7 +13,7 @@ use crate::ipc::sysv_shm::structure::IpcPerm;
 use crate::process::adapter::step_engine::{
     Cap, PayloadCap, SpinMutex, Zone, ZoneAllocated, ZoneError,
 };
-use crate::process::adapter::wait_routing::Channel;
+use crate::process::adapter::wait_routing::{self, Channel};
 use crate::process::nsproxy::SysvKey;
 
 // ---------------------------------------------------------------------------
@@ -90,6 +90,13 @@ pub struct SemArrayPayload {
     pub changed_channel: Channel,
     pub changed_source_id: u64,
     pub changed_source: alloc::sync::Arc<crate::process::adapter::wait_routing::WaitSource>,
+}
+
+impl Drop for SemArrayPayload {
+    fn drop(&mut self) {
+        crate::wait_source::release_wait_channel(self.changed_source_id);
+        wait_routing::unregister_source(self.changed_source_id);
+    }
 }
 
 // ---------------------------------------------------------------------------

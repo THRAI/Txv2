@@ -421,6 +421,29 @@ fn diagnostics_report_bitmap_backend_counts() {
     assert_eq!(diagnostics.base_ppn, Ppn(0));
     assert_eq!(diagnostics.total_count, 2);
     assert_eq!(diagnostics.free_count, 1);
+    assert_eq!(diagnostics.max_contiguous_free_run, 1);
+}
+
+#[test]
+fn diagnostics_report_fragmented_max_contiguous_free_run() {
+    let metas = [
+        FrameMeta::new(),
+        FrameMeta::new(),
+        FrameMeta::new(),
+        FrameMeta::new(),
+        FrameMeta::new(),
+        FrameMeta::new(),
+    ];
+    let bitmap = [AtomicU64::new(0)];
+    let allocator = BitmapPageAllocator::new_for_test(&metas, &bitmap, 6);
+    for ppn in [0, 1, 3, 4, 5] {
+        allocator.mark_free_for_test(Ppn(ppn));
+    }
+
+    let diagnostics = allocator.backend_diagnostics();
+
+    assert_eq!(diagnostics.free_count, 5);
+    assert_eq!(diagnostics.max_contiguous_free_run, 3);
 }
 
 #[test]
