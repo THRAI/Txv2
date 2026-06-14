@@ -1,3 +1,19 @@
+- 2026-06-14 (net command-family re-test after the merge — found+fixed a SYSTEMIC regression, residual
+  scoped). The merge took main's proc.rs + process/execution.rs wholesale (mixed files), dropping feature's
+  netns/mount-ns clone+setns support → the LTP shell net harness (tst_ns_create/tst_ns_exec "net,mnt") broke
+  at setup: `clone failed EINVAL` (clone rejected CLONE_NEWNET/NEWNS) + `setns(fd,0) EINVAL` (setns net-only).
+  ALL shell net command tests (ip/ping/netstat/route/traceroute) regressed. **Fixed (commit ffb5ade7):**
+  grafted feature's ForkOptions.clone_newnet/newns + step_fork fresh-netns creation + sys_clone/oneshot flag
+  acceptance + sys_setns mount-ns handling onto main's base. **Restored** (rv.musl): ip_tests 6/6, iptables01
+  6/6, netstat01 5/5, tracepath01 1/1, nft01 5/6, if-addr-adddel 1/1, if-route-adddel 1/1; C-binary net
+  (getaddrinfo 22/22, in6_01 5/5, asapi_02 12/12, sctp test_1_to_1/big_chunk) all green. **Residual (feature
+  net BONUSES, all ≥ main which has NO net stack):** (a) cross-netns veth connectivity — ping02/traceroute01/
+  route-redirect can't reach rhost 10.0.0.1 (`ns-icmp_redirector ... No such device ltp_ns_veth1`); (b) ping01
+  TBROK on `mount --make-rprivate /sys` (mount-ns isolation deferred — feature deferred it too); (c)
+  if4-addr-change TBROK `ifconfig eth0 ... failed` (SIOCSIFADDR); (d) in6_02 TFAIL if_indextoname(1)='' for lo
+  (SIOCGIFNAME index→name, handler is byte-identical to d654 — puzzling). route-change-netlink ×3 = TCONF
+  (libmnl required) = official behavior, NOT regressions. These residuals need 2-3 more root-cause digs (veth
+  cross-ns, ifconfig ioctl, SIOCGIFNAME) — DECISION PENDING with user on further investment vs hard-bar-met.
 - 2026-06-13 (main→feature-network-next merge REDONE via git + LTP parity ACHIEVED — 0 regressions, net
   preserved). **Problem:** the prior staged merge (d654f9b7) kept feature's OLD non-net code instead of main's
   syscall improvements → 86 la.musl LTP regressions vs main. **Fix:** `git reset --hard 271e62ed && git merge
