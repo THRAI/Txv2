@@ -1,3 +1,15 @@
+- 2026-06-14 (complete main-regression sweep across lanes — la both 0 regressions; rv blocked on main's own
+  boot). User clarified the goal is COMPLETE main parity (not just net). Ran ltp-rt-sweep (586 whitelist, same
+  口径) merged-vs-main per lane: **la.musl = 0 regressions + 9 improvements** (done earlier); **la.glibc =
+  0 regressions across 360+ scored cases** (same kernel-la as la.musl → converges identically; main la.glibc
+  baseline runs ~8× slower because MAIN's kernel hangs on net/unshare cases that merged handles — itself proof
+  merged ≥ main). **rv.musl/rv.glibc BLOCKED**: main's rv kernel won't boot in the witness (stalls at OpenSBI,
+  never reaches LTP) even though its board/boot stub is byte-identical to merged's; main rv was never validated
+  in the witness last session (only LA). main worktree has no testdata (empty) so can't self-build an rv image
+  without copying 6.5G. So rv main baseline ≈ unmeasurable/0, and merged rv (boots+runs LTP healthily) is
+  trivially ≥ main rv. DECISION PENDING with user: (A) gdb-dig main rv boot / copy 6.5G + build main rv image,
+  or (B) accept the arch-independence argument (la both lanes 0 reg + fixes are arch-independent + merged rv
+  healthy). Recommendation: (B). All fixes committed (merge + procfs/accept + clone/setns), tree clean.
 - 2026-06-14 (net command-family re-test after the merge — found+fixed a SYSTEMIC regression, residual
   scoped). The merge took main's proc.rs + process/execution.rs wholesale (mixed files), dropping feature's
   netns/mount-ns clone+setns support → the LTP shell net harness (tst_ns_create/tst_ns_exec "net,mnt") broke
