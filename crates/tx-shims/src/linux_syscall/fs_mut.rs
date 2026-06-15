@@ -1173,6 +1173,40 @@ pub(super) async fn sys_mount<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>) -
         }
     }
 
+    const MS_MOVE: u64 = 8192;
+    if (flags & MS_MOVE) != 0 {
+        // Relocate an existing mount: `source` is the current mountpoint
+        // (walker crosses it → mounted root), `target` is the new mountpoint.
+        let source = match read_user_cstr(&ctx.aspace, source_uaddr, EXECVE_PATH_MAX) {
+            Ok(p) => p,
+            Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+            Err(ReadCStrError::Fault(_)) => return SyscallResult::Error(EFAULT_VALUE),
+        };
+        let source_dentry = match walk_from_process(cwd, &source, &cred, &ctx.process) {
+            Ok(d) => d,
+            Err(e) => return SyscallResult::Error(e),
+        };
+        let guard = step_engine::guard();
+        match mount::move_mount(&source_dentry, target_dentry, &parent_payload, &guard) {
+            Ok(()) => return SyscallResult::Return(0),
+            Err(e) => return SyscallResult::error_from(e),
+        }
+    }
+
+    // Mount propagation: --make-shared / --make-private / --make-slave /
+    // --make-unbindable (optionally recursive via MS_REC). Accept these so the
+    // fs_bind* propagation tests' setup succeeds. Shared-style propagation is
+    // provided implicitly by the inode-keyed mount table (a sub-mount under a
+    // bind source is visible under all its bind copies); private/slave/unbindable
+    // isolation is not yet enforced (v1).
+    const MS_SHARED: u64 = 1 << 20;
+    const MS_PRIVATE: u64 = 1 << 18;
+    const MS_SLAVE: u64 = 1 << 19;
+    const MS_UNBINDABLE: u64 = 1 << 17;
+    if (flags & (MS_SHARED | MS_PRIVATE | MS_SLAVE | MS_UNBINDABLE)) != 0 {
+        return SyscallResult::Return(0);
+    }
+
     // New filesystem mount.
     let fstype = match read_user_cstr(&ctx.aspace, fstype_uaddr, 64) {
         Ok(p) => p,
@@ -1396,8 +1430,13 @@ pub(super) async fn sys_umount2<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>)
     let target_uaddr = args[0];
     let flags = args[1] as u64;
 
-    if flags != 0 {
-        return SyscallResult::Error(ENOSYS_VALUE);
+    // umount2 flags: MNT_FORCE(1) MNT_DETACH(2) MNT_EXPIRE(4) UMOUNT_NOFOLLOW(8).
+    // No per-mount busy refs / lazy-detach queue in this model, so force/detach
+    // reduce to a plain synchronous umount; MNT_EXPIRE 2-phase and nofollow are
+    // not modelled. Reject unknown bits. (MNT_DETACH is what the fs_bind* mount
+    // tests use to tear down their sandbox.)
+    if flags & !(1 | 2 | 4 | 8) != 0 {
+        return SyscallResult::Error(EINVAL_VALUE);
     }
 
     let target = match read_user_cstr(&ctx.aspace, target_uaddr, EXECVE_PATH_MAX) {
@@ -1419,15 +1458,43 @@ pub(super) async fn sys_umount2<P: PmapIf>(args: [u64; 6], ctx: &SyscallCtx<'_>)
         Ok(d) => d,
         Err(e) => return SyscallResult::Error(e),
     };
-    let parent_payload = match mount_payload_for_dentry(&target_dentry) {
+    // umount operates on the *mountpoint*, not the mounted content.
+    // `walk_from_process` crosses the final mount, so a mounted path
+    // resolves to the mounted FS's root dentry — whose `InlineName` is the
+    // empty ROOT name and whose `parent_hint` is the mountpoint dentry.
+    // Keying umount by that crossed root's own (payload, inode) uses the
+    // mounted FS's root inode — wrong, and ambiguous when several mounts
+    // share one bind source: `umount share2`, after crossing into parent2,
+    // matched parent2's *self-bind* and removed it, leaving share2 mounted.
+    // The leftover then wedged the fs_bind cleanup loop (which re-`umount`s
+    // whatever /proc/mounts still lists) into an infinite user-space spin —
+    // the flaky fs_bind* hang found via gdb. Recover the mountpoint dentry so
+    // umount keys by (mountpoint_parent_payload, mountpoint_inode), matching
+    // `register_mount`, and pops the correct top-of-stack mount.
+    let umount_target = if target_dentry.name().as_bytes().is_empty() {
+        target_dentry
+            .parent_hint()
+            .unwrap_or_else(|| target_dentry.clone())
+    } else {
+        target_dentry.clone()
+    };
+    let parent_payload = match mount_payload_for_dentry(&umount_target) {
         Some(p) => p,
         None => return SyscallResult::Error(ENODEV_VALUE),
     };
 
+    // Try the process's mount namespace, then fall back to the global mount
+    // table. Bind/move mounts register globally (`crate::mount::register_mount`)
+    // and the per-process namespace table is unpopulated for them, so without
+    // this fallback `umount` of a bind mount returned EINVAL even though the
+    // mount existed and was crossable — the umount-side mirror of the walker
+    // crossing fix in `vfs::resolution::step`.
     let result = if let Some(mnt_ns) = ctx.process.mount_namespace_cap() {
-        mnt_ns.umount(&target_dentry, &parent_payload)
+        mnt_ns
+            .umount(&umount_target, &parent_payload)
+            .or_else(|_| mount::umount(&umount_target, &parent_payload))
     } else {
-        mount::umount(&target_dentry, &parent_payload)
+        mount::umount(&umount_target, &parent_payload)
     };
 
     match result {

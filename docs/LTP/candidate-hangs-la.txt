@@ -1,5 +1,0 @@
-sched_setattr01
-gettid02
-futex_wait03
-fcntl36
-tgkill01

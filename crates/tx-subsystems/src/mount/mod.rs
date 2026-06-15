@@ -107,6 +107,44 @@ impl MountFlags {
     }
 }
 
+/// Mount propagation type (Linux shared-subtree semantics).
+///
+/// - `Private` (default): mounts/umounts under this mount do not propagate.
+/// - `Shared`: this mount belongs to a peer group (`peer_group` id). A
+///   mount or umount at a mountpoint within a shared mount's subtree is
+///   replicated at the corresponding location under every peer.
+/// - `Slave`: receives propagation from its master peer group but does not
+///   send. (v1: recorded but treated like `Private` for send; receive is a
+///   follow-up.)
+/// - `Unbindable`: private and cannot be bind-mounted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Propagation {
+    Private,
+    Shared,
+    Slave,
+    Unbindable,
+}
+
+impl Propagation {
+    pub const fn to_bits(self) -> u64 {
+        match self {
+            Propagation::Private => 0,
+            Propagation::Shared => 1,
+            Propagation::Slave => 2,
+            Propagation::Unbindable => 3,
+        }
+    }
+
+    pub const fn from_bits(bits: u64) -> Self {
+        match bits {
+            1 => Propagation::Shared,
+            2 => Propagation::Slave,
+            3 => Propagation::Unbindable,
+            _ => Propagation::Private,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MountApiFileKind {
     FsContext,
@@ -379,6 +417,12 @@ pub struct MountIdentity {
     parent: Option<Cap<MountIdentity>>,
     payload: PayloadBinding<MountPayload>,
     flags: AtomicU64,
+    /// Propagation type bits (`Propagation::to_bits`). Default `Private`.
+    propagation: AtomicU64,
+    /// Peer-group id for `Shared` mounts (0 = not in any group). Mounts
+    /// sharing a non-zero `peer_group` are peers and propagate to each
+    /// other. Allocated by `allocate_peer_group_id`.
+    peer_group: AtomicU64,
 }
 
 impl MountIdentity {
@@ -397,6 +441,8 @@ impl MountIdentity {
             parent,
             payload,
             flags: AtomicU64::new(flags.bits()),
+            propagation: AtomicU64::new(Propagation::Private.to_bits()),
+            peer_group: AtomicU64::new(0),
         }
     }
 
@@ -443,6 +489,26 @@ impl MountIdentity {
     /// Atomically replace mount flags (for `MS_REMOUNT`).
     pub fn set_flags(&self, new_flags: MountFlags) {
         self.flags.store(new_flags.bits(), Ordering::Release);
+    }
+
+    /// Current propagation type.
+    pub fn propagation(&self) -> Propagation {
+        Propagation::from_bits(self.propagation.load(Ordering::Acquire))
+    }
+
+    /// Set the propagation type (`mount --make-{shared,private,slave,unbindable}`).
+    pub fn set_propagation(&self, prop: Propagation) {
+        self.propagation.store(prop.to_bits(), Ordering::Release);
+    }
+
+    /// Peer-group id (0 = none). Mounts with the same non-zero id are peers.
+    pub fn peer_group(&self) -> u64 {
+        self.peer_group.load(Ordering::Acquire)
+    }
+
+    /// Assign the peer-group id (used when joining/forming a shared group).
+    pub fn set_peer_group(&self, id: u64) {
+        self.peer_group.store(id, Ordering::Release);
     }
 }
 
@@ -659,17 +725,12 @@ pub fn register_mount(
 ) {
     let parent_payload_ptr = cap_payload_ptr(parent_payload);
     let mut table = MOUNT_TABLE.lock();
-    // Idempotent on identical parent + child_fs_object_id: if a
-    // pre-existing entry matches, replace it with the new mount.
-    // This matches `register_console_alias`'s upsert shape.
-    for entry in table.iter_mut() {
-        if entry.parent_payload_ptr == parent_payload_ptr
-            && entry.child_fs_object_id == mountpoint_fs_object_id
-        {
-            entry.mount = IdentitySlot::from_cap(mount);
-            return;
-        }
-    }
+    // Stack semantics: always push, allowing multiple mounts on the same
+    // `(parent_payload, inode)` mountpoint. fs_bind tests stack binds on
+    // overlapping inodes (e.g. `mount --bind dir dir` then `mount --bind src
+    // dir`); the old upsert overwrote the earlier mount, which lost it and made
+    // umount return EINVAL. `mount_for` returns the top (newest) of the stack
+    // and `umount` pops it, matching Linux LIFO mountpoint semantics.
     table.push(MountTableEntry {
         parent_payload_ptr,
         child_fs_object_id: mountpoint_fs_object_id,
@@ -687,7 +748,8 @@ pub fn mount_for(
 ) -> Option<Cap<MountIdentity>> {
     let parent_payload_ptr = cap_payload_ptr(parent_payload);
     let table = MOUNT_TABLE.lock();
-    for entry in table.iter() {
+    // Top of stack = newest mount at this mountpoint (LIFO): iterate in reverse.
+    for entry in table.iter().rev() {
         if entry.parent_payload_ptr == parent_payload_ptr
             && entry.child_fs_object_id == child_fs_object_id
         {
@@ -764,6 +826,67 @@ pub fn bind_mount(
     Ok(BindMountOutput { mount: mount_cap })
 }
 
+/// Relocate an existing mount (`mount --move source target`, MS_MOVE).
+///
+/// `source_dentry` is the *resolved* source (walker already crossed the
+/// mount, so it's the moved subtree's root rnode). Re-key the same subtree
+/// under `target` and drop the source registration in one critical section.
+pub fn move_mount(
+    source_dentry: &Cap<DEntry>,
+    target_dentry: Cap<DEntry>,
+    target_parent_payload: &Cap<MountPayload>,
+    guard: &Guard<'_>,
+) -> Result<(), crate::execution::Errno> {
+    use crate::execution::Errno;
+
+    let source_payload =
+        crate::vfs::walker::mount_payload_for(source_dentry, guard).ok_or(Errno::ENODEV)?;
+    let source_rnode = source_dentry.rnode().clone();
+    let source_rnode_addr = cap_raw_addr(source_dentry.rnode());
+    let source_rnode_id = source_rnode.fs_object_id();
+    let target_fs_object_id = target_dentry.rnode().fs_object_id();
+    let target_parent_ptr = cap_payload_ptr(target_parent_payload);
+
+    let mount_id = allocate_mount_id();
+    let mount_cap = MountIdentity::new_cap(
+        mount_id,
+        Some(target_dentry),
+        source_rnode,
+        None,
+        source_payload,
+        MountFlags::empty(),
+    )
+    .map_err(|_| Errno::ENOMEM)?;
+
+    let mut table = MOUNT_TABLE.lock();
+    let src_idx = table
+        .iter()
+        .position(|entry| {
+            let root = entry.mount.root();
+            cap_raw_addr(root) == source_rnode_addr || root.fs_object_id() == source_rnode_id
+        })
+        .ok_or(Errno::EINVAL)?;
+    table.remove(src_idx);
+    let mut replaced = false;
+    for entry in table.iter_mut() {
+        if entry.parent_payload_ptr == target_parent_ptr
+            && entry.child_fs_object_id == target_fs_object_id
+        {
+            entry.mount = IdentitySlot::from_cap(mount_cap.clone());
+            replaced = true;
+            break;
+        }
+    }
+    if !replaced {
+        table.push(MountTableEntry {
+            parent_payload_ptr: target_parent_ptr,
+            child_fs_object_id: target_fs_object_id,
+            mount: IdentitySlot::from_cap(mount_cap),
+        });
+    }
+    Ok(())
+}
+
 // ============================================================================
 // Umount
 // ============================================================================
@@ -796,9 +919,11 @@ pub fn umount(
     let target_rnode_cap_addr = cap_raw_addr(target_dentry.rnode());
 
     let mut table = MOUNT_TABLE.lock();
+    // Pop the top (newest) matching mount — `rposition` finds the LAST entry,
+    // matching the LIFO stack semantics of `register_mount`/`mount_for`.
     // First try the registration key. If the user passed the
     // mountpoint dentry (matches the parent FS) the key is sound.
-    let pos = table.iter().position(|entry| {
+    let pos = table.iter().rposition(|entry| {
         entry.parent_payload_ptr == parent_payload_ptr
             && entry.child_fs_object_id == child_fs_object_id
     });
@@ -806,7 +931,7 @@ pub fn umount(
     // and handed us the mounted FS's root dentry. Scan for an entry
     // whose registered mount has this rnode as its root.
     let pos = pos.or_else(|| {
-        table.iter().position(|entry| {
+        table.iter().rposition(|entry| {
             let root = entry.mount.root();
             cap_raw_addr(root) == target_rnode_cap_addr || root.fs_object_id() == target_rnode_id
         })
@@ -990,6 +1115,14 @@ static NEXT_DEV_ID: AtomicU32 = AtomicU32::new(1);
 /// `crate::thread_runtime::structure`.
 pub fn allocate_mount_id() -> MountId {
     MountId(NEXT_MOUNT_ID.fetch_add(1, Ordering::Relaxed))
+}
+
+static NEXT_PEER_GROUP_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Allocate a fresh peer-group id for `mount --make-shared`. Always
+/// non-zero (0 means "not in any peer group").
+pub fn allocate_peer_group_id() -> u64 {
+    NEXT_PEER_GROUP_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Allocate a fresh `DevId`. Deterministic from cold start: the first

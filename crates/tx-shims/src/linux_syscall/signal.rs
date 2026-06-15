@@ -432,17 +432,38 @@ pub(super) async fn sys_rt_sigsuspend<P: tx_hal::TimeIf>(
         Err(result) => return result,
     };
 
-    let restore_and_eintr = |ctx: &SyscallCtx<'_>, old_mask: SignalMask| {
-        let _ = set_thread_signal_mask(ctx, old_mask);
-        SyscallResult::Error(EINTR_VALUE)
-    };
+    // Return EINTR for an interrupting signal WITHOUT restoring the pre-suspend
+    // mask first. POSIX sigsuspend runs the signal's handler *while the suspend
+    // mask is active* (the suspend mask is what unblocks the awaited signal; the
+    // caller's normal mask typically blocks it, e.g. a shell blocks SIGCHLD then
+    // sigsuspends with it unblocked to wait for a child). run_thread's AST
+    // checkpoint delivers the pending handler immediately after this syscall
+    // returns — so the mask in effect at that point must still unblock the
+    // signal. Restoring the (blocking) mask here left the handler permanently
+    // undeliverable: the signal stayed pending, every re-`sigsuspend` saw it
+    // again, and the caller span forever (the flaky fs_bind* hang, root-caused
+    // by gdb to a busy rt_sigsuspend loop). The pre-suspend mask is re-applied
+    // by the delivered handler's `sigreturn` frame / the caller's own SETMASK
+    // after its wait loop.
+    let restore_and_eintr =
+        |_ctx: &SyscallCtx<'_>, _old_mask: SignalMask| SyscallResult::Error(EINTR_VALUE);
 
     const CHUNK_NS: u64 = 5_000_000;
     loop {
         if let Some(deadline_ns) = poll_due_itimers::<P>(&ctx.process) {
             P::set_deadline_ns(deadline_ns);
         }
-        if tx_subsystems::signal::select_next_signal(&ctx.thread).is_some() {
+        // Interrupt only on a signal that POSIX says should break a blocking
+        // syscall — NOT on benign pending signals such as SIGCHLD (default
+        // action Ignore), which the shell accrues while reaping the children
+        // it forks (e.g. the `$(sed | awk)` in fs_bind's cleanup loop). Using
+        // the broad `select_next_signal(...).is_some()` here made every such
+        // SIGCHLD spuriously return EINTR; the shell then re-`sigsuspend`ed,
+        // saw the same still-pending SIGCHLD, and span forever — the flaky
+        // fs_bind* hang. This is the rt_sigsuspend counterpart of the
+        // ppoll/pselect/recv/send/wait4 fix that already switched to
+        // `thread_pending_signal_interrupts` (it broke netperf identically).
+        if tx_subsystems::signal::thread_pending_signal_interrupts(&ctx.thread) {
             return restore_and_eintr(ctx, old_mask);
         }
 
@@ -936,11 +957,77 @@ pub(super) fn sys_kill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
             },
         );
     }
-    if pid <= 0 {
-        // TODO(phase-pgrp-kill): pgrp-targeted (`pid < 0` /
-        // `pid == 0` / `pid == -1`) kills need a global pid-to-pgrp
-        // lookup the slice does not yet wire.
-        return SyscallResult::Error(ENOSYS_VALUE);
+    if pid < 0 {
+        // `pid < -1`: signal process group `|pid|`. `pid == -1`:
+        // broadcast to every process the caller may signal (POSIX),
+        // excluding init (pid 1) and self.
+        //
+        // txKernel has no standalone pgid→group index, so we resolve
+        // membership from the global pid registry (`all_pids`) plus each
+        // live process's `pgrp_cap().pgid`. This is an authoritative live
+        // snapshot that does not depend on the group leader still being
+        // alive — important for harnesses (LTP) that `kill(-pgid)` after
+        // the leader has reaped but children remain.
+        let broadcast = pid == -1;
+        let target_pgid = pid.unsigned_abs();
+
+        let signum_opt = if sig == 0 {
+            None
+        } else {
+            match u8::try_from(sig).ok().and_then(Signum::new) {
+                Some(s) => Some(s),
+                None => return SyscallResult::Error(EINVAL_VALUE),
+            }
+        };
+
+        let self_pid = ctx.process.pid.0;
+        let mut matched = 0u32;
+        let mut delivered = 0u32;
+        for (member_pid, _) in tx_subsystems::process::all_pids() {
+            let proc = match tx_subsystems::process::process_by_pid(member_pid) {
+                Some(p) => p,
+                None => continue,
+            };
+            if broadcast {
+                if member_pid.0 == 1 || member_pid.0 == self_pid {
+                    continue;
+                }
+            } else if proc.pgrp_cap().pgid.0 != target_pgid {
+                continue;
+            }
+            matched += 1;
+            let Some(signum) = signum_opt else {
+                continue;
+            };
+            let siginfo = Some(SigInfo {
+                si_signo: signum.raw() as u32,
+                si_code: SI_USER,
+                si_pid: self_pid,
+                si_uid: 0,
+            });
+            if matches!(
+                tx_subsystems::signal::script_kill_process(&ctx.process, &proc, signum, siginfo),
+                Ok(tx_subsystems::signal::KillScriptOutcome::Delivered)
+            ) {
+                delivered += 1;
+            }
+        }
+
+        if matched == 0 {
+            return SyscallResult::Error(ESRCH_VALUE);
+        }
+        if sig == 0 {
+            // Existence probe (`kill(-pgid, 0)`): the group has at least
+            // one live member.
+            return SyscallResult::Return(0);
+        }
+        return if delivered > 0 {
+            SyscallResult::Return(0)
+        } else {
+            // Members existed but none accepted the signal (cred denial
+            // or raced exit) → EPERM, matching the `pid == 0` path.
+            SyscallResult::Error(EPERM_VALUE)
+        };
     }
 
     let target = match process_by_pid(Pid(pid as u32)) {

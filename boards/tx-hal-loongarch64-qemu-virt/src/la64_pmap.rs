@@ -43,14 +43,14 @@ pub(crate) const fn la64_uncached_virt(phys: usize) -> usize {
 pub(crate) const fn la64_dmw_direct_map() -> VirtRange {
     VirtRange {
         start: VirtAddr(LA64_DMW_CACHED_BASE),
-        size: QEMU_LA64_RAM_SIZE,
+        size: LA64_DIRECT_MAP_SIZE,
     }
 }
 
 pub(crate) const fn la64_dmw_mapped_phys() -> PhysRange {
     PhysRange {
         start: PhysAddr(QEMU_LA64_RAM_BASE),
-        size: QEMU_LA64_RAM_SIZE,
+        size: LA64_DIRECT_MAP_SIZE,
     }
 }
 

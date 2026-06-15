@@ -137,7 +137,7 @@ fn bootstrap_pmap_info_describes_dmw_direct_ram() {
         pmap.mapped,
         PhysRange {
             start: PhysAddr(0),
-            size: 0x1000_0000,
+            size: LA64_DIRECT_MAP_SIZE,
         }
     );
     assert_eq!(pmap.direct_map_base, VirtAddr(LA64_DMW_CACHED_BASE));
@@ -145,7 +145,7 @@ fn bootstrap_pmap_info_describes_dmw_direct_ram() {
         pmap.direct_map,
         VirtRange {
             start: VirtAddr(LA64_DMW_CACHED_BASE),
-            size: 0x1000_0000,
+            size: LA64_DIRECT_MAP_SIZE,
         }
     );
     assert_eq!(pmap.identity, None);
@@ -852,8 +852,18 @@ fn dmw_direct_map_reservation_is_precovered_for_ram() {
         Platform::extend_direct_map(PhysAddr(QEMU_LA64_RAM_END)),
         Ok(())
     );
+    // High memory (`memory@80000000`, above the 256 MiB low window) must be
+    // covered by the DMW direct map now that we follow FDT-reported RAM.
     assert_eq!(
-        Platform::extend_direct_map(PhysAddr(QEMU_LA64_RAM_END + 1)),
+        Platform::extend_direct_map(PhysAddr(0x8000_0000)),
+        Ok(())
+    );
+    assert_eq!(
+        Platform::extend_direct_map(PhysAddr(LA64_DIRECT_MAP_PHYS_END)),
+        Ok(())
+    );
+    assert_eq!(
+        Platform::extend_direct_map(PhysAddr(LA64_DIRECT_MAP_PHYS_END + 1)),
         Err(PmapError::Unsupported)
     );
 }

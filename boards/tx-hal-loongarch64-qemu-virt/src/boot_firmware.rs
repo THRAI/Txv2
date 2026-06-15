@@ -590,11 +590,14 @@ unsafe fn populate_boot_memory_regions_from_dtb(
         }
 
         let start = region.base.0;
+        // Follow FDT-reported RAM up to the DMW direct-map coverage, not the
+        // 256 MiB low-RAM window. This is what registers the high-memory region
+        // (`memory@80000000`) the `virt` machine adds for `-m` above 256M.
         let end = region
             .base
             .0
             .saturating_add(region.size)
-            .min(QEMU_LA64_RAM_END);
+            .min(LA64_DIRECT_MAP_PHYS_END);
         if end <= start {
             continue;
         }

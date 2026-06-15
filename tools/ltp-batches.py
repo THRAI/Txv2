@@ -317,11 +317,10 @@ def cases_for_batch(
     if batch in SUBMIT_BATCH_ALIASES or batch in SUBMIT_GLIBC_BATCH_ALIASES:
         if batch in SUBMIT_GLIBC_BATCH_ALIASES:
             libc = "glibc"
-        available = set(cases)
         return [
             case
             for case in load_submit_cases(arch)
-            if case in available and is_valid_case_name(case)
+            if is_valid_case_name(case)
         ]
     if batch == "all":
         return [

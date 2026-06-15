@@ -74,8 +74,18 @@ static LA64_FIXUP_TABLE: [La64RawFixupEntry; 2] = [
 ];
 
 const QEMU_LA64_RAM_BASE: usize = 0;
+// Low RAM window the LoongArch `virt` machine maps at physical 0. QEMU places
+// the first 256 MiB here; anything beyond `-m 256M` lands in the high-memory
+// region at `memory@80000000` (above the PCIe MMIO32 hole at 0x40000000).
 const QEMU_LA64_RAM_SIZE: usize = 0x1000_0000;
 const QEMU_LA64_RAM_END: usize = QEMU_LA64_RAM_BASE + QEMU_LA64_RAM_SIZE;
+// Physical span the cached DMW direct-map window logically covers. The DMW is a
+// hardware window (no page tables), so this is bookkeeping only: it bounds how
+// far `extend_direct_map`/region registration will follow FDT-reported RAM,
+// letting us register the high-memory region (`memory@80000000`) for any
+// realistic `-m`. Kept well under the 48-bit PALEN the DMW can reach.
+const LA64_DIRECT_MAP_SIZE: usize = 64 * 1024 * 1024 * 1024;
+const LA64_DIRECT_MAP_PHYS_END: usize = QEMU_LA64_RAM_BASE + LA64_DIRECT_MAP_SIZE;
 const QEMU_LA64_KERNEL_LOAD_BASE: usize = 0x0020_0000;
 #[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
 const QEMU_LA64_PCH_PIC_BASE: usize = 0x1000_0000;
@@ -867,7 +877,7 @@ impl PlatformConfig for Platform {
     const PHYS_ADDR_BITS: u8 = 48;
     const VIRT_ADDR_BITS: u8 = 48;
     const DIRECT_MAP_BASE: VirtAddr = VirtAddr(LA64_DMW_CACHED_BASE);
-    const DIRECT_MAP_SIZE: usize = QEMU_LA64_RAM_SIZE;
+    const DIRECT_MAP_SIZE: usize = LA64_DIRECT_MAP_SIZE;
     const KERNEL_VIRT_BASE: VirtAddr = VirtAddr(la64_cached_virt(QEMU_LA64_KERNEL_LOAD_BASE));
     const USER_TOP: VirtAddr = VirtAddr(LA64_USER_TOP);
     const KERNEL_STACK_SIZE: usize = 128 * 1024;

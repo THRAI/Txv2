@@ -196,7 +196,6 @@ fn timeval_to_ns(tv: TimevalLayout) -> Option<u64> {
         .and_then(|sec_ns| sec_ns.checked_add((tv.tv_usec as u64).saturating_mul(1_000)))
 }
 
-const MAX_CLOCK_NANOSLEEP_NS: u64 = 30_000_000_000;
 const CLOCK_GETRES_NS: i64 = 2_000_000;
 
 // Keep CLOCK_REALTIME ahead of the OSComp ext4 image mtimes; libc
@@ -901,9 +900,13 @@ pub(super) async fn sys_clock_nanosleep<'a, P: TimeIf>(
     } else {
         req_ns
     };
-    if sleep_ns > MAX_CLOCK_NANOSLEEP_NS {
-        return SyscallResult::Error(EOPNOTSUPP_VALUE);
-    }
+    // No upper bound on the relative sleep: `nanosleep` (the syscall musl
+    // routes `usleep`/`sleep` through) parks for arbitrarily long deadlines
+    // via the reactor, and `clock_nanosleep` must match it. glibc's
+    // `usleep`/`sleep` lower onto `clock_nanosleep`, so an artificial cap
+    // here made e.g. the LTP shell watchdog's `usleep(300s)` return
+    // EOPNOTSUPP immediately — firing a bogus "Test timed out" and
+    // live-locking the test's `/proc/<pid>/stat` setup spin.
     let deadline_ns = platform_now.saturating_add(sleep_ns);
     match sleep_until_deadline::<P>(deadline_ns, sleep_ns, ctx).await {
         SyscallResult::Error(errno) if errno == EINTR_VALUE => {

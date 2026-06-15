@@ -1,3 +1,0 @@
-mmapstress01
-mmapstress04
-thp01
