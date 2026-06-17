@@ -4,6 +4,7 @@
 //! lists so allocation prefers partially used slabs, then empty slabs, and only
 //! allocates a new frame-backed slab when no reusable storage exists.
 
+use alloc::collections::BTreeMap;
 use core::cell::UnsafeCell;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -39,6 +40,15 @@ pub(crate) struct Keg<T: 'static> {
     empty_count: AtomicUsize,
     /// Monotonic slab ID source for `SlotKey`.
     next_slab_id: AtomicUsize,
+    /// `slab_id` → live slab pointer index. Replaces the O(n) slab-list
+    /// scan in [`Keg::slot_from_key`] with an O(log n) map lookup so that
+    /// `Cap` deref/clone stay cheap even after a workload (e.g. hackbench's
+    /// 400 processes) inflates and fragments the slab lists. Guarded by
+    /// `lock`; mutated only at slab allocate (insert) and retire (remove),
+    /// never on inter-list moves. The stored pointer is valid until
+    /// `reclaim_slab` frees the frame, which only runs after the slab is
+    /// removed here (it is empty at retire, so no live `Cap` resolves to it).
+    slab_index: UnsafeCell<BTreeMap<usize, NonNull<ZoneSlab<T>>>>,
 }
 
 unsafe impl<T: 'static> Sync for Keg<T> {}
@@ -53,6 +63,7 @@ impl<T: 'static> Keg<T> {
             slab_count: AtomicUsize::new(0),
             empty_count: AtomicUsize::new(0),
             next_slab_id: AtomicUsize::new(1),
+            slab_index: UnsafeCell::new(BTreeMap::new()),
         }
     }
 
@@ -118,6 +129,7 @@ impl<T: 'static> Keg<T> {
                     && self.empty_count.load(Ordering::Acquire) > EMPTY_SLAB_LOW_WATER
                 {
                     self.remove_slab_locked(slab, SlabList::Empty);
+                    (*self.slab_index.get()).remove(&slab.as_ref().id());
                     Some(slab)
                 } else {
                     None
@@ -144,20 +156,23 @@ impl<T: 'static> Keg<T> {
         }
 
         // If EBR cannot accept the slab, put it back on the empty list so the
-        // frame is not lost.
+        // frame is not lost — and re-index it, since the retire decision
+        // already removed it from the index.
         let _guard = self.lock.lock();
         unsafe {
             self.push_slab_locked(slab, SlabList::Empty);
+            (*self.slab_index.get()).insert(slab.as_ref().id(), slab);
         }
     }
 
     pub(crate) fn slot_from_key(&self, key: SlotKey) -> Option<NonNull<Slot<T>>> {
         let _guard = self.lock.lock();
-        unsafe {
-            self.find_slot_in_list(*self.partial_head.get(), key)
-                .or_else(|| self.find_slot_in_list(*self.full_head.get(), key))
-                .or_else(|| self.find_slot_in_list(*self.empty_head.get(), key))
-        }
+        // O(log n) `slab_id` → slab lookup, then O(1) slot offset within the
+        // slab. Replaces the former O(n) walk of all three slab lists, which
+        // made every `Cap` deref/clone scale with slab count and tanked
+        // throughput once a workload fragmented the lists across many slabs.
+        let slab = unsafe { *(*self.slab_index.get()).get(&key.slab_id())? };
+        unsafe { slab.as_ref().slot_at(key.slot_index()) }
     }
 
     pub(crate) fn refill_bucket<const N: usize>(
@@ -189,6 +204,7 @@ impl<T: 'static> Keg<T> {
                     if let Some(slab) = slab {
                         unsafe {
                             self.remove_slab_locked(slab, SlabList::Empty);
+                            (*self.slab_index.get()).remove(&slab.as_ref().id());
                         }
                     }
                     slab
@@ -229,6 +245,7 @@ impl<T: 'static> Keg<T> {
             let _guard = self.lock.lock();
             unsafe {
                 self.push_slab_locked(slab, SlabList::Empty);
+                (*self.slab_index.get()).insert(slab.as_ref().id(), slab);
             }
             break;
         }
@@ -242,6 +259,11 @@ impl<T: 'static> Keg<T> {
     ) -> Result<NonNull<ZoneSlab<T>>, ZoneError> {
         let id = self.next_slab_id.fetch_add(1, Ordering::AcqRel);
         let slab = ZoneSlab::allocate(zone, id)?;
+        // Register in the slab_id index (caller holds `lock`). Removed only
+        // when the slab is retired (see `return_slot_inner` / `trim_empty_slabs`).
+        unsafe {
+            (*self.slab_index.get()).insert(id, slab);
+        }
         self.slab_count.fetch_add(1, Ordering::AcqRel);
         unsafe {
             zone.note_allocated_slots(slab.as_ref().slot_count());
@@ -338,19 +360,4 @@ impl<T: 'static> Keg<T> {
         }
     }
 
-    unsafe fn find_slot_in_list(
-        &self,
-        mut current: *mut ZoneSlab<T>,
-        key: SlotKey,
-    ) -> Option<NonNull<Slot<T>>> {
-        unsafe {
-            while !current.is_null() {
-                if (*current).id() == key.slab_id() {
-                    return (*current).slot_at(key.slot_index());
-                }
-                current = (*current).next();
-            }
-        }
-        None
-    }
 }

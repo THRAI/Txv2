@@ -1000,7 +1000,7 @@ fn close_socket_files_for_process_exit(fds: &BTreeMap<u32, Cap<OpenFile>>) {
             continue;
         };
 
-        let guard = step_engine::guard();
+        let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
         let _ = crate::net::execution::step_socket_close(identity, &guard);
     }
 }
@@ -1673,7 +1673,11 @@ impl<T: 'static> WeakObserveExt<T> for Weak<T> {
     where
         F: FnOnce(IdentRef<'_, T>) -> R,
     {
-        let guard = step_engine::guard();
+        // Process-group / children cleanup runs this helper from the
+        // process-exit path, which a fatal-signal teardown can reach while an
+        // epoch guard is already active. Borrow that guard instead of opening a
+        // nested one (the EBR domain asserts guards never nest).
+        let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
         self.observe(&guard).map(f)
     }
 }

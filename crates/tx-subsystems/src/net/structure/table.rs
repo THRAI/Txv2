@@ -569,7 +569,52 @@ impl SocketTable {
             return Some(socket);
         }
 
-        self.lookup_udp_bound(dst, guard)
+        // Dual-stack: a socket bound to the IPv6 wildcard `[::]:port` that
+        // `connect`s back to an IPv4 peer stores a mixed-family connection key
+        // — `local = {Inet6, ::, port}` (the dual-stack bind) with `remote` kept
+        // as the IPv4 peer (`require_socket_family` passes the v4 endpoint
+        // through unchanged). An incoming IPv4 datagram's pure-v4 `wildcard_local`
+        // key above cannot match that IPv6 local, so retry with the IPv6
+        // wildcard local. This is the connected counterpart of the bound
+        // dual-stack fallback below; without it iperf3's forward-UDP server
+        // (which connects its `[::]` socket to the v4 client after the first
+        // datagram) silently drops every subsequent datagram → receiver = 0.
+        if dst.family == AddressFamily::Inet {
+            let wildcard6_local =
+                ConnectionKey::new(IpEndpoint::new_v6(Ipv6Address::UNSPECIFIED, dst.port), src);
+            if let Some(socket) = self.lookup_udp_connection(wildcard6_local, guard) {
+                if !udp_socket_is_v6only(&socket) {
+                    return Some(socket);
+                }
+            }
+        }
+
+        if let Some(socket) = self.lookup_udp_bound(dst, guard) {
+            return Some(socket);
+        }
+
+        // Dual-stack: an IPv4 datagram may target a socket bound to the IPv6
+        // wildcard `[::]:port` (e.g. iperf3's server, which binds dual-stack)
+        // unless that socket set IPV6_V6ONLY. Mirrors the TCP listener path.
+        if dst.family == AddressFamily::Inet {
+            let wildcard6 = LocalEndpointKey {
+                family: AddressFamily::Inet6,
+                addr: Ipv4Address::UNSPECIFIED,
+                addr6: Ipv6Address::UNSPECIFIED,
+                port: dst.port,
+            };
+            if let Some(socket) = self
+                .udp_bound
+                .lookup(&wildcard6, guard)
+                .and_then(|entry| entry.value().try_clone_live())
+            {
+                if !udp_socket_is_v6only(&socket) {
+                    return Some(socket);
+                }
+            }
+        }
+
+        None
     }
 
     pub fn lookup_unix_bound(
@@ -975,6 +1020,14 @@ impl InitialSocketTableProxy {
     pub fn snapshot_unix_bound(&self, guard: &Guard<'_>) -> Vec<Cap<SocketIdentity>> {
         self.with_table(|table| table.snapshot_unix_bound(guard))
     }
+}
+
+/// True when a socket set `IPV6_V6ONLY`, meaning it must not receive IPv4
+/// traffic via the dual-stack IPv6 wildcard.
+fn udp_socket_is_v6only(socket: &Cap<SocketIdentity>) -> bool {
+    socket
+        .acquire_operational()
+        .is_some_and(|payload| payload.with_options(|options| options.ip.ipv6_v6only))
 }
 
 pub static SOCKET_TABLE: InitialSocketTableProxy = InitialSocketTableProxy;

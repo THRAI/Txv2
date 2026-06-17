@@ -1572,6 +1572,13 @@ pub(super) enum SocketWaitWake {
     /// its workers parked forever — they never woke to process the signal,
     /// never exited, and leaked as `[]` tasks.
     SignalInterrupted,
+    /// The socket's `SO_RCVTIMEO` receive timeout elapsed before data arrived.
+    /// The caller returns `EAGAIN`/`EWOULDBLOCK`. Without honouring this,
+    /// iperf3's reverse-mode UDP receiver (which arms `SO_RCVTIMEO` and blocks
+    /// in recv, polling the control connection between timeouts) parks forever
+    /// once the server stops sending, never seeing the TEST_END on the control
+    /// socket — a hard deadlock.
+    RecvTimedOut,
 }
 
 /// Park on a socket wait future, but wake (returning `true`) if a signal is
@@ -1612,10 +1619,17 @@ pub(super) async fn wait_on_socket_or_itimer<P: TimeIf>(
     mut socket_future: wait_source::RegisteredWaitFuture,
     pid: u32,
     mailbox: Option<&tx_substrate::wake::mailbox::TaskMailbox>,
+    recv_deadline_ns: Option<u64>,
 ) -> SocketWaitWake {
     if super::time::consume_itimer_real_delivered_interrupt(pid) {
         return SocketWaitWake::ItimerExpired;
     }
+    if let Some(recv_deadline_ns) = recv_deadline_ns {
+        if <P as TimeIf>::read_ns() >= recv_deadline_ns {
+            return SocketWaitWake::RecvTimedOut;
+        }
+    }
+    let mut recv_timer = recv_deadline_ns.and_then(tx_subsystems::timer_sleep::sleep_until_ns);
     // The blocked socket future registers its task waker on its OWN private
     // wait-source mailbox, NOT on the thread's signal mailbox. So a signal
     // posted via `post_signal` (which fires the thread mailbox) would never
@@ -1657,6 +1671,11 @@ pub(super) async fn wait_on_socket_or_itimer<P: TimeIf>(
         if let Some(ref mut timer_future) = timer_future {
             if core::future::Future::poll(core::pin::Pin::new(timer_future), cx).is_ready() {
                 return core::task::Poll::Ready(SocketWaitWake::ItimerExpired);
+            }
+        }
+        if let Some(ref mut recv_timer) = recv_timer {
+            if core::future::Future::poll(core::pin::Pin::new(recv_timer), cx).is_ready() {
+                return core::task::Poll::Ready(SocketWaitWake::RecvTimedOut);
             }
         }
         core::task::Poll::Pending

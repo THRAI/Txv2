@@ -46,7 +46,13 @@ fn apply_thread_exit_user_cleanup(
     aspace: &crate::vm::AddressSpace,
     cleanup: ThreadExitUserCleanup,
 ) {
-    let guard = crate::thread_runtime::adapter::step_engine::guard();
+    // This cleanup can run from a context that already holds an epoch guard
+    // (e.g. a fatal signal that tears the process down mid-syscall reaches
+    // `step_exit_group` while the delivering path's guard is still active).
+    // Creating a fresh `guard()` there trips the EBR no-nesting assertion, so
+    // borrow the active guard when one exists and only open a new one otherwise.
+    let guard = crate::thread_runtime::adapter::step_engine::borrow_current_guard()
+        .unwrap_or_else(crate::thread_runtime::adapter::step_engine::guard);
     if let Some(ctid_ptr) = cleanup.ctid {
         clear_and_wake_child_tid(aspace, ctid_ptr, &guard);
     }

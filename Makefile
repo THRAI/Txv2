@@ -245,7 +245,7 @@ OSCOMP_LTP_MAX_RUNTIME_CMDLINE = $(if $(strip $(LTP_MAX_RUNTIME)),tx.ltp.max_run
 OSCOMP_LTP_MAX_RUNTIME_CASES_CMDLINE = $(if $(strip $(LTP_MAX_RUNTIME_CASES)),tx.ltp.max_runtime_cases=$(subst $(COMMA),+,$(LTP_MAX_RUNTIME_CASES)),)
 OSCOMP_CMDLINE = $(strip $(if $(strip $(OSCOMP_EFFECTIVE_GROUPS)),tx.oscomp.groups=$(OSCOMP_EFFECTIVE_GROUPS),) $(OSCOMP_LTP_MAX_RUNTIME_CMDLINE) $(OSCOMP_LTP_MAX_RUNTIME_CASES_CMDLINE))
 OSCOMP_APPEND_RV = $(if $(strip $(OSCOMP_CMDLINE)),-append '$(OSCOMP_CMDLINE)',)
-OSCOMP_APPEND_LA = $(if $(strip $(OSCOMP_CMDLINE)),-fw_cfg name=opt/cmdline$(COMMA)string='$(OSCOMP_CMDLINE)',)
+OSCOMP_APPEND_LA = $(if $(strip $(OSCOMP_CMDLINE)),-append '$(OSCOMP_CMDLINE)',)
 OSCOMP_TESTCASE_OUT ?= target/oscomp/testcase
 OSCOMP_SERIAL_NORMALIZE = stdbuf -o0 tr -d '\000\r'
 OSCOMP_CONSOLE_FILTER = sed -u '/^[[:space:]]*$$/d'

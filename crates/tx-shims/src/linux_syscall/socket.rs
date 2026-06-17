@@ -349,6 +349,7 @@ async fn accept_impl<'a, P: TimeIf>(
                         future,
                         ctx.process.pid.0,
                         ctx.mailbox.as_deref(),
+                        None,
                     )
                     .await;
                     if matches!(wake, SocketWaitWake::ItimerExpired)
@@ -429,7 +430,18 @@ async fn connect_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
                 }
                 if let Some(future) = wait_on_yield_shape(shape) {
                     waited_for_connect = true;
-                    let _ = future.await;
+                    // A blocking connect must be interruptible by a signal
+                    // (POSIX EINTR). Wait on the thread signal mailbox too —
+                    // not just the bare socket future — otherwise a SIGTERM
+                    // cannot tear down a process parked in connect(). This was
+                    // the one socket blocking path that skipped the mailbox
+                    // (recv/send/accept already wrap it), so hackbench TCP
+                    // clients still connecting at kill time leaked.
+                    if wait_on_socket_or_signal(future, ctx.mailbox.as_deref()).await
+                        && tx_subsystems::signal::thread_pending_signal_interrupts(&ctx.thread)
+                    {
+                        return SyscallResult::Error(EINTR_VALUE);
+                    }
                 } else {
                     return SyscallResult::Error(EIO_VALUE);
                 }
@@ -862,6 +874,17 @@ async fn recvfrom_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
         return SyscallResult::Return(recv as i64);
     }
 
+    // SO_RCVTIMEO: a blocking recv must wake with EAGAIN after this many ns even
+    // if no data arrives. iperf3's reverse-mode UDP receiver relies on it to
+    // poll the control connection between recv timeouts; without it the recv
+    // parks forever once the server stops sending. Computed once for the whole
+    // call (the deadline is the total blocking budget, like Linux).
+    let recv_deadline_ns = socket
+        .acquire_operational()
+        .and_then(|payload| payload.with_options(|opts| opts.socket.recv_timeout))
+        .filter(|timeout| !timeout.is_zero())
+        .map(|timeout| <P as TimeIf>::read_ns().saturating_add(timeout.as_nanos() as u64));
+
     let mut yielded_before_wait = false;
     loop {
         drive_loopback_pending();
@@ -899,9 +922,20 @@ async fn recvfrom_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
                 let Some(future) = wait_source::wait_on_token(wait_token) else {
                     return SyscallResult::Error(EIO_VALUE);
                 };
-                let wake =
-                    wait_on_socket_or_itimer::<P>(future, ctx.process.pid.0, ctx.mailbox.as_deref())
-                        .await;
+                let wake = wait_on_socket_or_itimer::<P>(
+                    future,
+                    ctx.process.pid.0,
+                    ctx.mailbox.as_deref(),
+                    recv_deadline_ns,
+                )
+                .await;
+                if matches!(wake, SocketWaitWake::RecvTimedOut) {
+                    if recv_queued_len(&socket) > 0 {
+                        yielded_before_wait = false;
+                        continue;
+                    }
+                    return SyscallResult::Error(EAGAIN_VALUE);
+                }
                 if matches!(wake, SocketWaitWake::ItimerExpired)
                     || (matches!(wake, SocketWaitWake::SignalInterrupted)
                         && tx_subsystems::signal::thread_pending_signal_interrupts(&ctx.thread))
@@ -955,8 +989,15 @@ async fn recvfrom_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
                         future,
                         ctx.process.pid.0,
                         ctx.mailbox.as_deref(),
+                        recv_deadline_ns,
                     )
                     .await;
+                    if matches!(wake, SocketWaitWake::RecvTimedOut) {
+                        if recv_queued_len(&socket) > 0 {
+                            continue;
+                        }
+                        return SyscallResult::Error(EAGAIN_VALUE);
+                    }
                     if matches!(wake, SocketWaitWake::ItimerExpired)
                         || (matches!(wake, SocketWaitWake::SignalInterrupted)
                             && tx_subsystems::signal::thread_pending_signal_interrupts(&ctx.thread))

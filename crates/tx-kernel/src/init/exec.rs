@@ -832,6 +832,7 @@ impl<P: TxPlatform> CoreInit<P> {
                 Some(step) => step,
                 None => break,
             };
+
             let drained_terminal_after_poll = Self::drain_terminal_thread_reactor_tasks();
             let submitted_child_after_poll = Self::drain_pending_child_submits();
 
@@ -1014,16 +1015,13 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
     let ltp_args = ltp_args_from_cmdline::<P>();
     let bench_observe_enabled = oscomp_bench_observe_enabled::<P>();
     let bench_observe_threshold = oscomp_bench_observe_threshold::<P>();
-    // cyclictest leaks frames on exit (multithreaded RT process teardown does
-    // not reclaim everything). The leaked frames degrade every later
-    // memory-allocation path: measured on RV, a single cyclictest run already
-    // slows lmbench fork+execve ~2.2x, and across the full suite the cumulative
-    // leak inflates even trivial syscall latency ~20x by the time lmbench-glibc
-    // runs (RV ran cyclictest, LA skipped it and stayed fast — that asymmetry is
-    // what surfaced the leak). Exclude cyclictest from the default suite on both
-    // arches until the teardown leak is fixed; it scores marginally and tanks
-    // lmbench (which scores more).
-    let skip_cyclictest = true;
+    // cyclictest previously tanked lmbench: its hackbench stress phase left
+    // ~400 children alive (glibc SIGINT handler never ran under SA_RESTART) and
+    // every `Cap` deref hit an O(n) slab scan once the zones fragmented, which
+    // inflated lmbench-glibc syscall latency ~20x. Both root causes are fixed
+    // (keg O(1) slab index + SA_RESTART terminate-signal delivery), so cyclictest
+    // can run in the default suite again without degrading lmbench.
+    let skip_cyclictest = false;
     let mut selected = 0usize;
     if let Some(groups) = oscomp_groups_from_cmdline::<P>()
         .or_else(|| oscomp_boot_suite(<P as tx_hal::BootInfoIf>::boot_info().cmdline))
@@ -2596,6 +2594,7 @@ const DEFAULT_OSCOMP_MUSL_PRE_LTP_SCRIPTS: &[(&str, &str)] = &[
     ("libctest-musl", "libctest_testcode.sh"),
     ("lua-musl", "lua_testcode.sh"),
     ("netperf-musl", "netperf_testcode.sh"),
+    ("iperf-musl", "iperf_testcode.sh"),
     ("iozone-musl", "iozone_testcode.sh"),
     ("libcbench-musl", "libcbench_testcode.sh"),
     // cyclictest + lmbench run LAST in this libc block (after libcbench):
@@ -2611,6 +2610,7 @@ const DEFAULT_OSCOMP_GLIBC_PRE_LTP_SCRIPTS: &[(&str, &str)] = &[
     // libctest-glibc removed: official scoring counts only musl libctest.
     ("lua-glibc", "lua_testcode.sh"),
     ("netperf-glibc", "netperf_testcode.sh"),
+    ("iperf-glibc", "iperf_testcode.sh"),
     ("iozone-glibc", "iozone_testcode.sh"),
     ("libcbench-glibc", "libcbench_testcode.sh"),
     // cyclictest + lmbench last in this libc block (see the musl list note).
@@ -2909,7 +2909,7 @@ mod tests {
                 > cmd.rfind("libcbench_testcode.sh").unwrap()
         );
         assert!(cmd.contains("iozone_testcode.sh"));
-        assert!(!cmd.contains("iperf_testcode.sh"));
+        assert!(cmd.contains("iperf_testcode.sh"));
         assert!(cmd.contains("cyclictest_testcode.sh"));
         assert!(!cmd.contains("; target_dir=\"ltp/testcases/bin\""));
         assert!(!cmd.contains("; /bin/setsid \"$file\""));

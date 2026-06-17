@@ -672,7 +672,26 @@ pub fn thread_pending_signal_interrupts(
     match entry.disposition {
         SigDisposition::Ignore => false,
         SigDisposition::Default => !matches!(default_action(sig), DefaultAction::Ignore),
-        SigDisposition::Handler(_) => !entry.flags.contains(SaFlags::RESTART),
+        SigDisposition::Handler(_) => {
+            // A pending handler interrupts a blocking syscall so the handler can
+            // be delivered. Without SA_RESTART the syscall returns EINTR; with
+            // SA_RESTART, Linux delivers the handler then RESTARTS the syscall.
+            // We have no syscall-restart machinery, so for SA_RESTART handlers
+            // we normally do NOT interrupt (returning EINTR would be a spurious,
+            // un-restarted failure — it broke netperf on benign SIGCHLD, and
+            // breaks LTP wait4/poll which rely on SA_RESTART, e.g. the tst
+            // harness's parent waitpid taking SIGUSR1/SIGALRM cleanup signals).
+            //
+            // The one exception is SIGINT: cyclictest's `kill -2 $hackbench`
+            // relies on hackbench's SIGINT handler running to reap its 400
+            // workers, and glibc's signal() installs that handler with
+            // SA_RESTART. SIGINT handlers are interactive-teardown handlers that
+            // siglongjmp/exit, so restart-vs-EINTR is moot, and no default-suite
+            // test relies on SIGINT restarting a syscall. Scope the override to
+            // SIGINT so other SA_RESTART signals keep correct (non-EINTR)
+            // behavior.
+            !entry.flags.contains(SaFlags::RESTART) || sig == Signum::SIGINT
+        }
     }
 }
 

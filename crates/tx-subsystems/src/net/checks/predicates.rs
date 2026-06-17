@@ -66,10 +66,20 @@ fn require_socket_family(
     endpoint: IpEndpoint,
 ) -> Result<IpEndpoint, Errno> {
     if payload.family() == endpoint.family {
-        Ok(endpoint)
-    } else {
-        Err(Errno::EAFNOSUPPORT)
+        return Ok(endpoint);
     }
+    // Dual-stack: a non-`IPV6_V6ONLY` IPv6 socket may target an IPv4 peer (Linux
+    // maps it to `::ffff:a.b.c.d`). iperf3's UDP server binds dual-stack `[::]`
+    // and connects back to the IPv4 client; this is the connect that path needs.
+    // The loopback stack keeps the IPv4 endpoint and resolves the source family
+    // at egress, so the IPv4 endpoint flows through unchanged.
+    if payload.family() == AddressFamily::Inet6
+        && endpoint.family == AddressFamily::Inet
+        && !payload.with_options(|options| options.ip.ipv6_v6only)
+    {
+        return Ok(endpoint);
+    }
+    Err(Errno::EAFNOSUPPORT)
 }
 
 pub(crate) fn socket_payload_present(socket: &SocketIdentity) -> Result<(), Errno> {
