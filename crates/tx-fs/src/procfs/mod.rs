@@ -23,43 +23,50 @@ use tx_subsystems::vfs::{
     S_IFREG,
 };
 
-pub const PROCFS_ROOT_ID: FsObjectId = FsObjectId::new(0x7072_6F00);
-pub const PROCFS_SELF_ID: FsObjectId = FsObjectId::new(0x7072_6F01);
-pub const PROCFS_MOUNTS_ID: FsObjectId = FsObjectId::new(0x7072_6F02);
-pub const PROCFS_CPUINFO_ID: FsObjectId = FsObjectId::new(0x7072_6F03);
-pub const PROCFS_UPTIME_ID: FsObjectId = FsObjectId::new(0x7072_6F04);
-pub const PROCFS_MEMINFO_ID: FsObjectId = FsObjectId::new(0x7072_6F05);
-pub const PROCFS_SYS_ID: FsObjectId = FsObjectId::new(0x7072_6F06);
-pub const PROCFS_SYS_KERNEL_ID: FsObjectId = FsObjectId::new(0x7072_6F07);
-pub const PROCFS_SYS_KERNEL_TAINTED_ID: FsObjectId = FsObjectId::new(0x7072_6F08);
-pub const PROCFS_CONFIG_ID: FsObjectId = FsObjectId::new(0x7072_6F09);
-pub const PROCFS_SYS_FS_ID: FsObjectId = FsObjectId::new(0x7072_6F0A);
-pub const PROCFS_SYS_FS_PIPE_MAX_SIZE_ID: FsObjectId = FsObjectId::new(0x7072_6F0B);
-pub const PROCFS_SYS_FS_LEASE_BREAK_TIME_ID: FsObjectId = FsObjectId::new(0x7072_6F0C);
-pub const PROCFS_SYS_FS_PROTECTED_HARDLINKS_ID: FsObjectId = FsObjectId::new(0x7072_6F0D);
-pub const PROCFS_SYS_FS_PROTECTED_SYMLINKS_ID: FsObjectId = FsObjectId::new(0x7072_6F0E);
-pub const PROCFS_SYSVIPC_ID: FsObjectId = FsObjectId::new(0x7072_6F0F);
-pub const PROCFS_SYSVIPC_MSG_ID: FsObjectId = FsObjectId::new(0x7072_6F10);
-pub const PROCFS_SYSVIPC_SEM_ID: FsObjectId = FsObjectId::new(0x7072_6F11);
-pub const PROCFS_SYSVIPC_SHM_ID: FsObjectId = FsObjectId::new(0x7072_6F12);
-pub const PROCFS_NET_ID: FsObjectId = FsObjectId::new(0x7072_6F13);
-pub const PROCFS_NET_ROUTE_ID: FsObjectId = FsObjectId::new(0x7072_6F14);
-pub const PROCFS_NET_ARP_ID: FsObjectId = FsObjectId::new(0x7072_6F15);
-pub const PROCFS_NET_DEV_ID: FsObjectId = FsObjectId::new(0x7072_6F16);
-pub const PROCFS_SYS_NET_ID: FsObjectId = FsObjectId::new(0x7072_6F17);
-pub const PROCFS_SYS_NET_IPV4_ID: FsObjectId = FsObjectId::new(0x7072_6F18);
-pub const PROCFS_SYS_NET_IPV4_IP_FORWARD_ID: FsObjectId = FsObjectId::new(0x7072_6F19);
-pub const PROCFS_NET_TX_NF_RULES_ID: FsObjectId = FsObjectId::new(0x7072_6F1A);
-pub const PROCFS_NET_NF_CONNTRACK_ID: FsObjectId = FsObjectId::new(0x7072_6F1B);
-pub const PROCFS_NET_TCP_ID: FsObjectId = FsObjectId::new(0x7072_6F1C);
-pub const PROCFS_NET_UDP_ID: FsObjectId = FsObjectId::new(0x7072_6F1D);
-pub const PROCFS_NET_RAW_ID: FsObjectId = FsObjectId::new(0x7072_6F1E);
-pub const PROCFS_NET_SNMP_ID: FsObjectId = FsObjectId::new(0x7072_6F1F);
-pub const PROCFS_NET_NETLINK_ID: FsObjectId = FsObjectId::new(0x7072_6F20);
-pub const PROCFS_NET_IF_INET6_ID: FsObjectId = FsObjectId::new(0x7072_6F21);
-pub const PROCFS_SYS_KERNEL_PID_MAX_ID: FsObjectId = FsObjectId::new(0x7072_6F22);
-pub const PROCFS_SYS_USER_ID: FsObjectId = FsObjectId::new(0x7072_6F23);
-pub const PROCFS_SYS_USER_MAX_USER_NAMESPACES_ID: FsObjectId = FsObjectId::new(0x7072_6F24);
+// Fixed procfs node IDs live in the 0x7071_6Fxx block, deliberately BELOW
+// `PROCFS_PID_BASE` (0x7072_0000). They must never overlap the per-pid id range
+// `pid_dir_id(pid) = PROCFS_PID_BASE + pid` (0x7072_0001..0x7072_FFFF): a shared
+// id makes `/proc/<pid>` alias a fixed file node, so descending to
+// `/proc/<pid>/stat` returns ENOTDIR. That bit LTP fs_bind once pids climbed
+// into the old 0x7072_6F00..0x7072_6F24 block (pid 28416..28452). Keep new
+// fixed nodes in 0x7071_6Fxx; never put one at 0x7072_xxxx.
+pub const PROCFS_ROOT_ID: FsObjectId = FsObjectId::new(0x7071_6F00);
+pub const PROCFS_SELF_ID: FsObjectId = FsObjectId::new(0x7071_6F01);
+pub const PROCFS_MOUNTS_ID: FsObjectId = FsObjectId::new(0x7071_6F02);
+pub const PROCFS_CPUINFO_ID: FsObjectId = FsObjectId::new(0x7071_6F03);
+pub const PROCFS_UPTIME_ID: FsObjectId = FsObjectId::new(0x7071_6F04);
+pub const PROCFS_MEMINFO_ID: FsObjectId = FsObjectId::new(0x7071_6F05);
+pub const PROCFS_SYS_ID: FsObjectId = FsObjectId::new(0x7071_6F06);
+pub const PROCFS_SYS_KERNEL_ID: FsObjectId = FsObjectId::new(0x7071_6F07);
+pub const PROCFS_SYS_KERNEL_TAINTED_ID: FsObjectId = FsObjectId::new(0x7071_6F08);
+pub const PROCFS_CONFIG_ID: FsObjectId = FsObjectId::new(0x7071_6F09);
+pub const PROCFS_SYS_FS_ID: FsObjectId = FsObjectId::new(0x7071_6F0A);
+pub const PROCFS_SYS_FS_PIPE_MAX_SIZE_ID: FsObjectId = FsObjectId::new(0x7071_6F0B);
+pub const PROCFS_SYS_FS_LEASE_BREAK_TIME_ID: FsObjectId = FsObjectId::new(0x7071_6F0C);
+pub const PROCFS_SYS_FS_PROTECTED_HARDLINKS_ID: FsObjectId = FsObjectId::new(0x7071_6F0D);
+pub const PROCFS_SYS_FS_PROTECTED_SYMLINKS_ID: FsObjectId = FsObjectId::new(0x7071_6F0E);
+pub const PROCFS_SYSVIPC_ID: FsObjectId = FsObjectId::new(0x7071_6F0F);
+pub const PROCFS_SYSVIPC_MSG_ID: FsObjectId = FsObjectId::new(0x7071_6F10);
+pub const PROCFS_SYSVIPC_SEM_ID: FsObjectId = FsObjectId::new(0x7071_6F11);
+pub const PROCFS_SYSVIPC_SHM_ID: FsObjectId = FsObjectId::new(0x7071_6F12);
+pub const PROCFS_NET_ID: FsObjectId = FsObjectId::new(0x7071_6F13);
+pub const PROCFS_NET_ROUTE_ID: FsObjectId = FsObjectId::new(0x7071_6F14);
+pub const PROCFS_NET_ARP_ID: FsObjectId = FsObjectId::new(0x7071_6F15);
+pub const PROCFS_NET_DEV_ID: FsObjectId = FsObjectId::new(0x7071_6F16);
+pub const PROCFS_SYS_NET_ID: FsObjectId = FsObjectId::new(0x7071_6F17);
+pub const PROCFS_SYS_NET_IPV4_ID: FsObjectId = FsObjectId::new(0x7071_6F18);
+pub const PROCFS_SYS_NET_IPV4_IP_FORWARD_ID: FsObjectId = FsObjectId::new(0x7071_6F19);
+pub const PROCFS_NET_TX_NF_RULES_ID: FsObjectId = FsObjectId::new(0x7071_6F1A);
+pub const PROCFS_NET_NF_CONNTRACK_ID: FsObjectId = FsObjectId::new(0x7071_6F1B);
+pub const PROCFS_NET_TCP_ID: FsObjectId = FsObjectId::new(0x7071_6F1C);
+pub const PROCFS_NET_UDP_ID: FsObjectId = FsObjectId::new(0x7071_6F1D);
+pub const PROCFS_NET_RAW_ID: FsObjectId = FsObjectId::new(0x7071_6F1E);
+pub const PROCFS_NET_SNMP_ID: FsObjectId = FsObjectId::new(0x7071_6F1F);
+pub const PROCFS_NET_NETLINK_ID: FsObjectId = FsObjectId::new(0x7071_6F20);
+pub const PROCFS_NET_IF_INET6_ID: FsObjectId = FsObjectId::new(0x7071_6F21);
+pub const PROCFS_SYS_KERNEL_PID_MAX_ID: FsObjectId = FsObjectId::new(0x7071_6F22);
+pub const PROCFS_SYS_USER_ID: FsObjectId = FsObjectId::new(0x7071_6F23);
+pub const PROCFS_SYS_USER_MAX_USER_NAMESPACES_ID: FsObjectId = FsObjectId::new(0x7071_6F24);
 pub const KERNEL_CONFIG_TEXT: &str = "CONFIG_EVENTFD=y\n\
 CONFIG_TIME_NS=y\n\
 CONFIG_HIGH_RES_TIMERS=y\n\
@@ -1533,6 +1540,66 @@ mod tests {
         assert_eq!(mounts_entry.name.as_bytes(), b"mounts");
         let (cpuinfo_entry, _) = read_one(&fs, PROCFS_ROOT_ID, cursor);
         assert_eq!(cpuinfo_entry.name.as_bytes(), b"cpuinfo");
+    }
+
+    #[test]
+    fn pid_dir_ids_never_alias_fixed_nodes() {
+        // Regression: `pid_dir_id(pid) = PROCFS_PID_BASE + pid` must never equal a
+        // fixed procfs node id. A shared id makes `/proc/<pid>` alias a fixed file
+        // node, so `/proc/<pid>/stat` returns ENOTDIR — which hung LTP fs_bind once
+        // pids reached 28442 (0x7072_6F1A == old PROCFS_NET_TX_NF_RULES_ID). Every
+        // pid_dir id must also round-trip through `pid_from_dir`.
+        let fixed: &[FsObjectId] = &[
+            PROCFS_ROOT_ID,
+            PROCFS_SELF_ID,
+            PROCFS_MOUNTS_ID,
+            PROCFS_CPUINFO_ID,
+            PROCFS_UPTIME_ID,
+            PROCFS_MEMINFO_ID,
+            PROCFS_SYS_ID,
+            PROCFS_SYS_KERNEL_ID,
+            PROCFS_SYS_KERNEL_TAINTED_ID,
+            PROCFS_CONFIG_ID,
+            PROCFS_SYS_FS_ID,
+            PROCFS_SYS_FS_PIPE_MAX_SIZE_ID,
+            PROCFS_SYS_FS_LEASE_BREAK_TIME_ID,
+            PROCFS_SYS_FS_PROTECTED_HARDLINKS_ID,
+            PROCFS_SYS_FS_PROTECTED_SYMLINKS_ID,
+            PROCFS_SYSVIPC_ID,
+            PROCFS_SYSVIPC_MSG_ID,
+            PROCFS_SYSVIPC_SEM_ID,
+            PROCFS_SYSVIPC_SHM_ID,
+            PROCFS_NET_ID,
+            PROCFS_NET_ROUTE_ID,
+            PROCFS_NET_ARP_ID,
+            PROCFS_NET_DEV_ID,
+            PROCFS_SYS_NET_ID,
+            PROCFS_SYS_NET_IPV4_ID,
+            PROCFS_SYS_NET_IPV4_IP_FORWARD_ID,
+            PROCFS_NET_TX_NF_RULES_ID,
+            PROCFS_NET_NF_CONNTRACK_ID,
+            PROCFS_NET_TCP_ID,
+            PROCFS_NET_UDP_ID,
+            PROCFS_NET_RAW_ID,
+            PROCFS_NET_SNMP_ID,
+            PROCFS_NET_NETLINK_ID,
+            PROCFS_NET_IF_INET6_ID,
+            PROCFS_SYS_KERNEL_PID_MAX_ID,
+            PROCFS_SYS_USER_ID,
+            PROCFS_SYS_USER_MAX_USER_NAMESPACES_ID,
+        ];
+        for pid in 1..=0xFFFFu32 {
+            let id = pid_dir_id(Pid(pid));
+            assert!(
+                !fixed.contains(&id),
+                "pid {pid} (0x{pid:x}) pid_dir_id aliases a fixed procfs node"
+            );
+            assert_eq!(
+                pid_from_dir(id),
+                Some(Pid(pid)),
+                "pid {pid} dir id does not round-trip through pid_from_dir"
+            );
+        }
     }
 
     #[test]
