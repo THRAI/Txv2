@@ -32,8 +32,8 @@
 //!   `fault_script` (cannot `.await`).
 
 use boot_runtime::userspace::{
-    PageFaultAccess, PageFaultInfo as ReactorPageFaultInfo, UserAddr, UserspaceRunError,
-    UserspaceRunSlot, UserspaceTrapInfo,
+    FatalTrapInfo, PageFaultAccess, PageFaultInfo as ReactorPageFaultInfo, UserAddr,
+    UserspaceRunError, UserspaceRunSlot, UserspaceTrapInfo,
 };
 use tx_hal::{FaultInfo, TrapAction, TrapFrameMut, TrapFrameView, TxPlatform};
 
@@ -303,6 +303,43 @@ pub fn hand_off_user_pf(
     // raw fault info; downstream policy (SIGSEGV on Err, retry on
     // Ok) lives in the future, not here.
     match slot.complete_interesting_trap(active, UserspaceTrapInfo::PageFault(info.into_reactor()))
+    {
+        Ok(_status) => HandoffOutcome::Resolved,
+        Err(err) => HandoffOutcome::SlotError(err),
+    }
+}
+
+/// Hand off a fatal **user-mode** synchronous fault (illegal
+/// instruction, misaligned access, or any unrecoverable sync trap) to
+/// the active userspace-run slot as `UserspaceTrapInfo::Fatal`.
+///
+/// Mirrors [`hand_off_user_pf`]: snapshot the interrupted user context,
+/// resolve the userspace-run wait, and return `Resolved` so the trap
+/// shell reschedules. The woken thread future runs the canonical
+/// synchronous-fault policy (deliver a fatal signal, tear the process
+/// down) — exactly like an unrecoverable user page fault. This keeps a
+/// crashing *user* process from panicking the *kernel*: one bad user
+/// instruction kills only that process, and the rest of the run
+/// continues. Kernel-mode sync faults must NOT come here — they stay
+/// `TrapAction::Terminate` at the call site.
+pub fn hand_off_user_fatal(
+    hart: usize,
+    view: &TrapFrameMut<'_>,
+    cause: u64,
+    value: u64,
+) -> HandoffOutcome {
+    let Some(payload) = current_payload_for_hart(hart) else {
+        return HandoffOutcome::NoActivePayload;
+    };
+
+    let Some(active) = payload.active_userspace_request() else {
+        return HandoffOutcome::NoActiveRequest;
+    };
+
+    payload.store_saved_user_context(Some(view.capture_user_context()));
+
+    let slot: UserspaceRunSlot = payload.userspace_slot().clone();
+    match slot.complete_interesting_trap(active, UserspaceTrapInfo::Fatal(FatalTrapInfo::new(cause, value)))
     {
         Ok(_status) => HandoffOutcome::Resolved,
         Err(err) => HandoffOutcome::SlotError(err),

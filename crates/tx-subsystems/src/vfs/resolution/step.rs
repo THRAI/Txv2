@@ -342,15 +342,21 @@ pub fn kernel_step(
     let crossing_mount = match crossing_mount {
         Some(m) => Some(m),
         None => mount_payload.as_ref().and_then(|payload| {
+            // Prefer the process's mount namespace, but always fall back to
+            // the global mount table. Bind/move mounts register globally
+            // (`crate::mount::register_mount`), and the per-process namespace
+            // is currently unpopulated for them — so without this fallback a
+            // namespace-carrying walk (every `walk_from_process` caller, e.g.
+            // `sys_mount`) could not cross any bind mount, while plain
+            // `walk_from` (stat/open/ls) crossed it via the global table.
+            // That split made `mount`/`umount` on an already-mounted path
+            // fail (ENOENT/EINVAL) even though `ls` of the same path worked,
+            // breaking every nested/stacked fs_bind case. Falling back keeps
+            // both walk flavours consistent. (True per-namespace isolation is
+            // a follow-up that would register mounts into the namespace.)
             mount_namespace
                 .and_then(|ns| ns.mount_for(payload, child_fs_object_id))
-                .or_else(|| {
-                    if mount_namespace.is_some() {
-                        None
-                    } else {
-                        crate::mount::mount_for(payload, child_fs_object_id)
-                    }
-                })
+                .or_else(|| crate::mount::mount_for(payload, child_fs_object_id))
         }),
     };
     if let Some(mount_cap) = crossing_mount {
@@ -747,15 +753,21 @@ fn continue_after_child_rnode(
     let crossing_mount = match crossing_mount {
         Some(mount) => Some(mount),
         None => mount_payload.as_ref().and_then(|payload| {
+            // Prefer the process's mount namespace, but always fall back to
+            // the global mount table. Bind/move mounts register globally
+            // (`crate::mount::register_mount`), and the per-process namespace
+            // is currently unpopulated for them — so without this fallback a
+            // namespace-carrying walk (every `walk_from_process` caller, e.g.
+            // `sys_mount`) could not cross any bind mount, while plain
+            // `walk_from` (stat/open/ls) crossed it via the global table.
+            // That split made `mount`/`umount` on an already-mounted path
+            // fail (ENOENT/EINVAL) even though `ls` of the same path worked,
+            // breaking every nested/stacked fs_bind case. Falling back keeps
+            // both walk flavours consistent. (True per-namespace isolation is
+            // a follow-up that would register mounts into the namespace.)
             mount_namespace
                 .and_then(|ns| ns.mount_for(payload, child_fs_object_id))
-                .or_else(|| {
-                    if mount_namespace.is_some() {
-                        None
-                    } else {
-                        crate::mount::mount_for(payload, child_fs_object_id)
-                    }
-                })
+                .or_else(|| crate::mount::mount_for(payload, child_fs_object_id))
         }),
     };
     if let Some(mount_cap) = crossing_mount {

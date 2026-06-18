@@ -93,8 +93,29 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
         TrapAction::Resume
     }
 
-    fn on_illegal_or_sync_fault(_view: TrapFrameMut<'_>, _fault: FaultInfo) -> TrapAction {
-        TrapAction::Terminate
+    fn on_illegal_or_sync_fault(view: TrapFrameMut<'_>, fault: FaultInfo) -> TrapAction {
+        // Kernel-mode illegal/sync faults are genuinely fatal: terminate
+        // (the board maps this to a kernel panic, which is correct — a
+        // kernel bug should stop the world).
+        if !fault.from_user {
+            return TrapAction::Terminate;
+        }
+
+        // User-mode illegal instruction / unrecoverable sync fault: deliver
+        // a fatal signal to the offending thread and reschedule, exactly
+        // like an unrecoverable user page fault (see `on_page_fault`). A
+        // crashing *user* process must never panic the *kernel*; otherwise
+        // a single bad user instruction (e.g. a test whose context is
+        // corrupted on signal return) tears down the whole run instead of
+        // just that one process.
+        let hart = <P as PercpuIf>::current_cpu_id().0;
+        let outcome =
+            trap_handoff::hand_off_user_fatal(hart, &view, 0, fault.address.0 as u64);
+        let action = trap_handoff::outcome_to_trap_action(&outcome);
+        if matches!(action, TrapAction::Terminate) {
+            log_page_fault_handoff_failure::<P>(hart, &outcome);
+        }
+        action
     }
 }
 

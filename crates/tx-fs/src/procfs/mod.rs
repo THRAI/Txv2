@@ -22,17 +22,23 @@ use tx_subsystems::vfs::{
 };
 use tx_subsystems::vfs::structure::StructPayload;
 
-pub const PROCFS_ROOT_ID: FsObjectId = FsObjectId::new(0x7072_6F00);
-pub const PROCFS_SELF_ID: FsObjectId = FsObjectId::new(0x7072_6F01);
-pub const PROCFS_MOUNTS_ID: FsObjectId = FsObjectId::new(0x7072_6F02);
-pub const PROCFS_CPUINFO_ID: FsObjectId = FsObjectId::new(0x7072_6F03);
-pub const PROCFS_UPTIME_ID: FsObjectId = FsObjectId::new(0x7072_6F04);
-pub const PROCFS_MEMINFO_ID: FsObjectId = FsObjectId::new(0x7072_6F05);
-pub const PROCFS_SYSVIPC_ID: FsObjectId = FsObjectId::new(0x7072_6F06);
-pub const PROCFS_SYSVIPC_MSG_ID: FsObjectId = FsObjectId::new(0x7072_6F07);
-pub const PROCFS_SYSVIPC_SEM_ID: FsObjectId = FsObjectId::new(0x7072_6F08);
-pub const PROCFS_SYSVIPC_SHM_ID: FsObjectId = FsObjectId::new(0x7072_6F09);
-pub const PROCFS_CONFIG_ID: FsObjectId = FsObjectId::new(0x7072_6F0A);
+// Fixed procfs node IDs live in the 0x7071_6Fxx block, deliberately BELOW
+// `PROCFS_PID_BASE` (0x7072_0000). They must never fall inside the per-pid dir
+// window [PROCFS_PID_BASE, PROCFS_PID_BASE + PROCFS_PID_DIR_LIMIT): a shared id
+// makes `/proc/<pid>` alias a fixed file node, so `/proc/<pid>/stat` returns
+// ENOTDIR. That hung LTP fs_bind once pids climbed into the old 0x7072_6Fxx
+// block (pid 28416+). Keep fixed nodes in 0x7071_6Fxx; never put one at 0x7072_.
+pub const PROCFS_ROOT_ID: FsObjectId = FsObjectId::new(0x7071_6F00);
+pub const PROCFS_SELF_ID: FsObjectId = FsObjectId::new(0x7071_6F01);
+pub const PROCFS_MOUNTS_ID: FsObjectId = FsObjectId::new(0x7071_6F02);
+pub const PROCFS_CPUINFO_ID: FsObjectId = FsObjectId::new(0x7071_6F03);
+pub const PROCFS_UPTIME_ID: FsObjectId = FsObjectId::new(0x7071_6F04);
+pub const PROCFS_MEMINFO_ID: FsObjectId = FsObjectId::new(0x7071_6F05);
+pub const PROCFS_SYSVIPC_ID: FsObjectId = FsObjectId::new(0x7071_6F06);
+pub const PROCFS_SYSVIPC_MSG_ID: FsObjectId = FsObjectId::new(0x7071_6F07);
+pub const PROCFS_SYSVIPC_SEM_ID: FsObjectId = FsObjectId::new(0x7071_6F08);
+pub const PROCFS_SYSVIPC_SHM_ID: FsObjectId = FsObjectId::new(0x7071_6F09);
+pub const PROCFS_CONFIG_ID: FsObjectId = FsObjectId::new(0x7071_6F0A);
 
 /// Minimal plain-text kernel `.config` exposed at `/proc/config` (and seeded as
 /// `/boot/config-6.1.0-txkernel`) so LTP's `tst_kconfig` parser can confirm the
@@ -67,18 +73,18 @@ CONFIG_TLS=y\n";
 // `tst_taint` opens `/proc/sys/kernel/tainted` in setup for many cases, and a
 // missing file makes them TBROK before the test body. `/proc/sys/net/*` and
 // `/proc/sys/fs/*` from the pre-rebase tree remain to be re-homed if needed.
-pub const PROCFS_SYS_ID: FsObjectId = FsObjectId::new(0x7072_6F0B);
-pub const PROCFS_SYS_KERNEL_ID: FsObjectId = FsObjectId::new(0x7072_6F0C);
-pub const PROCFS_SYS_KERNEL_TAINTED_ID: FsObjectId = FsObjectId::new(0x7072_6F0D);
-pub const PROCFS_SYS_KERNEL_PID_MAX_ID: FsObjectId = FsObjectId::new(0x7072_6F0E);
+pub const PROCFS_SYS_ID: FsObjectId = FsObjectId::new(0x7071_6F0B);
+pub const PROCFS_SYS_KERNEL_ID: FsObjectId = FsObjectId::new(0x7071_6F0C);
+pub const PROCFS_SYS_KERNEL_TAINTED_ID: FsObjectId = FsObjectId::new(0x7071_6F0D);
+pub const PROCFS_SYS_KERNEL_PID_MAX_ID: FsObjectId = FsObjectId::new(0x7071_6F0E);
 // `/proc/sys/fs/*` sysctls (re-homed from main; the net re-home took feature's
 // procfs which lacked these). LTP `fcntl30`/`splice04` read `pipe-max-size`,
 // fcntl-lease tests read `lease-break-time`; missing files make them TBROK.
-pub const PROCFS_SYS_FS_ID: FsObjectId = FsObjectId::new(0x7072_6F40);
-pub const PROCFS_SYS_FS_PIPE_MAX_SIZE_ID: FsObjectId = FsObjectId::new(0x7072_6F41);
-pub const PROCFS_SYS_FS_LEASE_BREAK_TIME_ID: FsObjectId = FsObjectId::new(0x7072_6F42);
-pub const PROCFS_SYS_FS_PROTECTED_HARDLINKS_ID: FsObjectId = FsObjectId::new(0x7072_6F43);
-pub const PROCFS_SYS_FS_PROTECTED_SYMLINKS_ID: FsObjectId = FsObjectId::new(0x7072_6F44);
+pub const PROCFS_SYS_FS_ID: FsObjectId = FsObjectId::new(0x7071_6F40);
+pub const PROCFS_SYS_FS_PIPE_MAX_SIZE_ID: FsObjectId = FsObjectId::new(0x7071_6F41);
+pub const PROCFS_SYS_FS_LEASE_BREAK_TIME_ID: FsObjectId = FsObjectId::new(0x7071_6F42);
+pub const PROCFS_SYS_FS_PROTECTED_HARDLINKS_ID: FsObjectId = FsObjectId::new(0x7071_6F43);
+pub const PROCFS_SYS_FS_PROTECTED_SYMLINKS_ID: FsObjectId = FsObjectId::new(0x7071_6F44);
 
 // `/proc/net/` + `/proc/sys/net/ipv6/` subtree (re-homed; the PR#50 net re-home
 // dropped all of `/proc/sys/net` and `/proc/net/if_inet6`). LTP's
@@ -90,32 +96,32 @@ pub const PROCFS_SYS_FS_PROTECTED_SYMLINKS_ID: FsObjectId = FsObjectId::new(0x70
 // directory names must never share one inode or the VFS dcache aliases them
 // (the bug that made `sysctl -w net.ipv6.conf.eth0.accept_dad=0` return EISDIR).
 // Content is name-independent (disable_ipv6=0, accept_dad writable no-op).
-pub const PROCFS_NET_ID: FsObjectId = FsObjectId::new(0x7072_6F0F);
-pub const PROCFS_NET_IF_INET6_ID: FsObjectId = FsObjectId::new(0x7072_6F10);
-pub const PROCFS_SYS_NET_ID: FsObjectId = FsObjectId::new(0x7072_6F11);
-pub const PROCFS_SYS_NET_IPV6_ID: FsObjectId = FsObjectId::new(0x7072_6F12);
-pub const PROCFS_SYS_NET_IPV6_CONF_ID: FsObjectId = FsObjectId::new(0x7072_6F13);
+pub const PROCFS_NET_ID: FsObjectId = FsObjectId::new(0x7071_6F0F);
+pub const PROCFS_NET_IF_INET6_ID: FsObjectId = FsObjectId::new(0x7071_6F10);
+pub const PROCFS_SYS_NET_ID: FsObjectId = FsObjectId::new(0x7071_6F11);
+pub const PROCFS_SYS_NET_IPV6_ID: FsObjectId = FsObjectId::new(0x7071_6F12);
+pub const PROCFS_SYS_NET_IPV6_CONF_ID: FsObjectId = FsObjectId::new(0x7071_6F13);
 // `/proc/net/tx_neigh` — kernel ARP+NDISC neighbor table, one line per entry, read
 // by the `ip neigh show` shim. LTP ipneigh01 pings a peer (auto-creating the entry
 // via learn_configured_icmpv*_neighbor) then expects `ip neigh show` to list it.
 // `/proc/net/tx_neigh_ctl` — write "<addr> <dev>" to delete an entry (the `ip
 // neigh del` shim path).
-pub const PROCFS_NET_TX_NEIGH_ID: FsObjectId = FsObjectId::new(0x7072_6F14);
-pub const PROCFS_NET_TX_NEIGH_CTL_ID: FsObjectId = FsObjectId::new(0x7072_6F15);
+pub const PROCFS_NET_TX_NEIGH_ID: FsObjectId = FsObjectId::new(0x7071_6F14);
+pub const PROCFS_NET_TX_NEIGH_CTL_ID: FsObjectId = FsObjectId::new(0x7071_6F15);
 // `/proc/net/arp` — kernel IPv4 ARP table in the classic format, read by busybox
 // `arp -an` (the LTP ipneigh01 `arp` variant).
-pub const PROCFS_NET_ARP_ID: FsObjectId = FsObjectId::new(0x7072_6F16);
+pub const PROCFS_NET_ARP_ID: FsObjectId = FsObjectId::new(0x7071_6F16);
 
 // `/proc/sys/net/ipv4/` — the IGMP knobs LTP's mcast-lib.sh saves, sets and
 // restores in setup/cleanup (`sysctl -b` reads, `sysctl -qw` writes via ROD:
 // a missing node TBROKs every net_stress.multicast test before its body).
 // Values are accepted and stored; the IGMP emulation currently behaves as
 // IGMPv2-compatible regardless.
-pub const PROCFS_SYS_NET_IPV4_ID: FsObjectId = FsObjectId::new(0x7072_6F17);
-pub const PROCFS_SYS_NET_IPV4_CONF_ID: FsObjectId = FsObjectId::new(0x7072_6F18);
+pub const PROCFS_SYS_NET_IPV4_ID: FsObjectId = FsObjectId::new(0x7071_6F17);
+pub const PROCFS_SYS_NET_IPV4_CONF_ID: FsObjectId = FsObjectId::new(0x7071_6F18);
 pub const PROCFS_SYS_NET_IPV4_IGMP_MAX_MEMBERSHIPS_ID: FsObjectId =
-    FsObjectId::new(0x7072_6F19);
-pub const PROCFS_SYS_NET_IPV4_IGMP_MAX_MSF_ID: FsObjectId = FsObjectId::new(0x7072_6F1A);
+    FsObjectId::new(0x7071_6F19);
+pub const PROCFS_SYS_NET_IPV4_IGMP_MAX_MSF_ID: FsObjectId = FsObjectId::new(0x7071_6F1A);
 
 static IGMP_MAX_MEMBERSHIPS: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(20);
