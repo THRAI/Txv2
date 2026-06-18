@@ -1,3 +1,53 @@
+- 2026-06-18 (6-suite regression sweep vs main — 0 regressions, 4 lanes, many improvements). User asked to
+  regression-test basic/busybox/libctest/libcbench/lmbench/iozone vs main (main "已经测试过了"), on BOTH
+  musl AND glibc lanes. Method: per-suite selector boots `tx.oscomp.groups=<suite>-{musl,glibc}` with
+  **`tx.oscomp.observe=0`** (CRITICAL: the bench-observe trace-off path does a 655KB TXTRACE dump +
+  `system_off()` after the first instrumented op → killed basic-musl at 12/102 mid-suite until observe was
+  disabled — NOT a regression, a measurement artifact). MERGED=target/oscomp/submit vs
+  MAIN=/home/msp/learning/Txv2-main-baseline/target/oscomp/submit, one QEMU at a time. Drivers:
+  tools/suite-regression-driver.sh (musl) + tools/suite-regression-glibc-driver.sh (glibc, self-waits for musl
+  ALL DONE). **Result — every one of 24 suite-lane cells has merged >= main (0 regressions):** test suites
+  (basic/busybox/libctest) complete naturally (GROUP END) and are exact ties on musl (102/102, 53-54/55,
+  220/220); on glibc libctest merged is far ahead (rv 178 vs main 132, la 179 vs 130 — main runs slow/wall-cut).
+  Benchmarks (libcbench/lmbench/iozone) are throughput-scored and mostly WALL-KILLED at ~380s (fixed-budget
+  comparison, not natural scores) — merged equal-or-faster everywhere; **iozone is a dramatic merged speedup**
+  (rv.musl 1→16, la.musl 6→20 natural, rv.glibc 1→17, la.glibc 5→20 natural; la libcbench 30.4→39.4) tracing to
+  the net-branch's page-allocator next-fit / fs fixes. Per-suite judges: target/oscomp/ltp-bin/sreg(g)-<kernel>-
+  <suite>-<lane>.judge; logs suite-regression{,-glibc}.log. **Verdict: merge introduces no suite regression vs
+  main on any lane; several real improvements.** Note: main rv kernel DOES boot in this oscomp-group witness
+  (the 2026-06-14 "main rv won't boot" was the LTP witness w/ a different sdcard).
+- 2026-06-18 (la.glibc iperf regression FIXED — statx rdev for device nodes). User flagged that la.glibc
+  iperf passed on feature-network-next (commit 87ea21a1 had ALL 4 combos 22/22) but merged scored **0/6**;
+  my earlier "feature la.glibc iperf 没跑→非退化" was a premerge-worktree measurement artifact (that worktree's
+  la kernel hung), so this was a real regression. **Root cause:** glibc `daemon()` open()s /dev/null, fstat()s
+  it, and returns **ENODEV** unless `S_ISCHR && st_rdev == makedev(1,3)`. iperf3's server daemonizes via that
+  path → "unable to become a daemon: No such device" → every client connect refused → 0/6. la.musl passed
+  because musl's daemon() skips the rdev check; rv.glibc passed because RV64 glibc routes fstat() through
+  `newfstatat`→`sys_fstat` (rdev already correct). **LA64 glibc routes fstat() through
+  `statx(fd,"",AT_EMPTY_PATH)`**, and `inode_meta_to_statx` hard-coded `stx_rdev_major/minor = 0`. **Fix**
+  (crates/tx-shims/src/linux_syscall/fs_basic.rs): added `rdev_major_minor_for_open_file`, threaded the real
+  (major,minor) into the statx fd branch + `inode_meta_to_statx`. **Verified all 4 lanes 11/11**
+  (iperf 6/6 + netperf 5/5): la.glibc 0/6→6/6, la.musl/rv.glibc/rv.musl unchanged 6/6 (no regression — change
+  is device-node-only, regular files still rdev 0). Harness: tools/iperf-rdev-verify-driver.sh +
+  tools/oscomp-group-witness.sh (KERNEL_DIR=target/oscomp/submit). NOT committed (awaiting user). Still owed
+  vs feature: ltp-bin ping01/ping02/in6_02 (mount-ns/cross-netns-veth) + epoch::guard panic on rv.glibc net cmds.
+- 2026-06-17 (FULL 586/592 LTP parity PROVEN on both kernels — 0 regressions, all 4 lanes; corrected an
+  earlier over-claim). User pushed back on "complete" (docs say rv=592, la=586). Audit found the ltp-rt-sweep
+  only *measured* 451 la / 580 rv per lane, not the full lists: the in-kernel `ltp-runtest:syscalls` runner
+  hits a **~38-48-cases-per-group cap** and emits GROUP END early, silently dropping each 60-case chunk's tail
+  (proven: the 12 dropped chunk-0 cases score 12/12 when run as their own ≤30 batch). Also an earlier
+  "0 regressions" relied on a `join` run on `LC_ALL=C sort`ed files — join's locale collation disagreed and
+  paired mismatched rows (phantom "hundreds of regressions"); the correct method is an awk associative-array
+  diff. **Closure:** (1) re-ran all dropped cases on BOTH kernels in ≤30 batches (tools/miss-coverage-driver.sh)
+  + combined sweep+miss diff → 0 regressions on every both-covered case; (2) re-ran the 9 rv + 17 la cases that
+  were kill06-panic collateral WITHOUT kill06 (tools/rv9-verify-driver.sh, tools/la17-close-driver.sh) → all
+  merged_pass >= main_pass (futex_wait05 merged 7 > main 5). **Verdict: rv.musl/rv.glibc/la.musl/la.glibc all
+  0 regressions across the full whitelist.** The ONLY merged-uncovered case anywhere is `kill06`, which **panics
+  merged** (epoch::guard nested, thread_runtime/execution.rs:49) — but main FAILS kill06 too (0/2), so it is
+  NOT a regression (score-neutral; main also 0). rv execve05/mlock03 absent-on-both (no Summary block either
+  kernel). Verification: per-lane awk diffs in target/oscomp/ltp-runtest/*.scores; sweep+miss combined diff in
+  miss-coverage-FINALDIFF.txt. Next: final net-stack score merged-vs-main (net-final-driver.sh re-running;
+  earlier run died at netf-merged la.musl). No blocker on the regression goal — it is met.
 - 2026-06-14 (complete main-regression sweep across lanes — la both 0 regressions; rv blocked on main's own
   boot). User clarified the goal is COMPLETE main parity (not just net). Ran ltp-rt-sweep (586 whitelist, same
   口径) merged-vs-main per lane: **la.musl = 0 regressions + 9 improvements** (done earlier); **la.glibc =
