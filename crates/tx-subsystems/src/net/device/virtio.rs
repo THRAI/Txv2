@@ -25,7 +25,12 @@ pub static VIRTIO_NET0_DEVICE: VirtioNetDevice = VirtioNetDevice::new(
 
 pub static VIRTIO_NET0_REGISTRATION: NetDeviceRegistration = NetDeviceRegistration {
     devt: DevT::new(VIRTIO_NET_STAGING_MAJOR, 0),
-    name: "virtio-net0",
+    // Linux-conventional boot NIC name. The netlink link table, ioctl
+    // SIOC* lookups, /proc/net rows, and libc if_nameindex all read this
+    // one registration name — `eth0` lets `if_nametoindex($LHOST_IFACES)`
+    // resolve in the initial namespace (LTP in6_02) without an
+    // ioctl-only alias split.
+    name: "eth0",
     ops: &VIRTIO_NET0_DEVICE,
 };
 

@@ -1351,6 +1351,67 @@ fn dispatch_setsockopt_getsockopt_round_trips_ip_recverr() {
 }
 
 #[test]
+fn dispatch_setsockopt_getsockopt_round_trips_ip_ttl() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_icmp(&ctx, SOCK_RAW);
+
+    let ttl: i32 = 1;
+    assert_eq!(
+        socket_req(
+            NR_SETSOCKOPT,
+            [
+                fd as u64,
+                IPPROTO_IP as u64,
+                IP_TTL as u64,
+                (&ttl as *const i32) as u64,
+                core::mem::size_of::<i32>() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let mut out: i32 = 0;
+    let mut out_len: u32 = core::mem::size_of::<i32>() as u32;
+    assert_eq!(
+        socket_req(
+            NR_GETSOCKOPT,
+            [
+                fd as u64,
+                IPPROTO_IP as u64,
+                IP_TTL as u64,
+                (&mut out as *mut i32) as u64,
+                (&mut out_len as *mut u32) as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(out, ttl);
+    assert_eq!(out_len, core::mem::size_of::<i32>() as u32);
+
+    let invalid: i32 = 0;
+    assert_eq!(
+        socket_req(
+            NR_SETSOCKOPT,
+            [
+                fd as u64,
+                IPPROTO_IP as u64,
+                IP_TTL as u64,
+                (&invalid as *const i32) as u64,
+                core::mem::size_of::<i32>() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Error(errno_to_i32(Errno::EINVAL))
+    );
+}
+
+#[test]
 fn dispatch_netlink_setsockopt_accepts_ext_ack() {
     let _setup = socket_setup();
     let (_process, ctx) = socket_ctx();

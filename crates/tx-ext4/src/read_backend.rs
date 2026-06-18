@@ -68,19 +68,23 @@ impl<I: BlockImage> Ext4FsInstance<I> {
         parent: InodeNo,
         name: &[u8],
     ) -> Result<Option<InodeNo>, Errno> {
-        if let Some(inode) = self.lookup_cache.lock().get(parent, name) {
-            return Ok(Some(inode));
+        if let Some(cached) = self.lookup_cache.lock().get(parent, name) {
+            return Ok(cached);
         }
         if let Some(cached) = self.dir_cache.lock().lookup(parent, name) {
-            if let Some(inode) = cached {
-                self.lookup_cache.lock().insert(parent, name, inode);
-            }
+            self.lookup_cache
+                .lock()
+                .insert(parent, name, cached.unwrap_or(InodeNo::new(0)));
             return Ok(cached);
         }
         let found = self.with_pager(|pager| pager.lookup(parent, name))?;
-        if let Some(inode) = found {
-            self.lookup_cache.lock().insert(parent, name, inode);
-        }
+        // Cache negatives too (inode 0 sentinel): every shell command's PATH
+        // search stats mostly-nonexistent names against testcases/bin
+        // (~2800 entries); an uncached miss is a full linear directory scan
+        // (~48 ms under TCG, measured) repeated for every command.
+        self.lookup_cache
+            .lock()
+            .insert(parent, name, found.unwrap_or(InodeNo::new(0)));
         Ok(found)
     }
 
@@ -392,7 +396,10 @@ impl InodeMetaCacheEntry {
     }
 }
 
-const LOOKUP_CACHE_ENTRIES: usize = 64;
+// 512 entries: PATH searches alone touch (commands × 7 PATH dirs) names per
+// shell test, most of them misses against a ~2800-entry testcases/bin — the
+// negative entries below only pay off if the working set fits.
+const LOOKUP_CACHE_ENTRIES: usize = 512;
 const LOOKUP_CACHE_NAME_BYTES: usize = 96;
 
 struct LookupCache {
@@ -408,14 +415,23 @@ impl LookupCache {
         }
     }
 
-    fn get(&mut self, parent: InodeNo, name: &[u8]) -> Option<InodeNo> {
+    /// `None` = not cached; `Some(None)` = cached-negative (ENOENT);
+    /// `Some(Some(ino))` = cached hit. Negative entries reuse `inode == 0`
+    /// (ext4 inode numbers start at 1) and are invalidated by the same
+    /// `invalidate_parent` calls that cover create/unlink/rename.
+    fn get(&mut self, parent: InodeNo, name: &[u8]) -> Option<Option<InodeNo>> {
         let index = self
             .entries
             .iter()
             .position(|entry| entry.matches(parent, name))?;
         self.clock = self.clock.wrapping_add(1);
         self.entries[index].last_used = self.clock;
-        Some(self.entries[index].inode)
+        let inode = self.entries[index].inode;
+        if inode == InodeNo::new(0) {
+            Some(None)
+        } else {
+            Some(Some(inode))
+        }
     }
 
     fn insert(&mut self, parent: InodeNo, name: &[u8], inode: InodeNo) {

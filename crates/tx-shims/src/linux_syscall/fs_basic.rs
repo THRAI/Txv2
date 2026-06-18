@@ -2362,22 +2362,30 @@ fn linux_encode_dev_t(major: u32, minor: u32) -> u64 {
         | (((major & !0xfff) as u64) << 32)
 }
 
-fn stat_rdev_for_open_file(file: &Cap<OpenFile>) -> u64 {
+/// Raw (major, minor) of an open file's device backing, or (0, 0) for
+/// non-device files. The `statx` ABI carries split major/minor fields, so we
+/// expose the pair directly rather than only the packed `dev_t`.
+fn rdev_major_minor_for_open_file(file: &Cap<OpenFile>) -> (u32, u32) {
     match file.backing() {
         OpenFileBacking::Rnode { rnode } => match rnode.backing() {
             RNodeBacking::StructBacked {
                 payload: StructPayload::CharDevice(binding),
-            } => linux_encode_dev_t(binding.devt.major(), binding.devt.minor()),
+            } => (binding.devt.major(), binding.devt.minor()),
             RNodeBacking::StructBacked {
                 payload: StructPayload::BlockDevice(reg),
-            } => linux_encode_dev_t(reg.devt.major(), reg.devt.minor()),
-            _ => 0,
+            } => (reg.devt.major(), reg.devt.minor()),
+            _ => (0, 0),
         },
-        _ => 0,
+        _ => (0, 0),
     }
 }
 
-fn inode_meta_to_statx(meta: &InodeMeta, ino: u64) -> StatxLayout {
+fn stat_rdev_for_open_file(file: &Cap<OpenFile>) -> u64 {
+    let (major, minor) = rdev_major_minor_for_open_file(file);
+    linux_encode_dev_t(major, minor)
+}
+
+fn inode_meta_to_statx(meta: &InodeMeta, ino: u64, rdev_major: u32, rdev_minor: u32) -> StatxLayout {
     let ts = |sec, nsec| StatxTimestamp {
         tv_sec: sec,
         tv_nsec: nsec as u32,
@@ -2401,8 +2409,8 @@ fn inode_meta_to_statx(meta: &InodeMeta, ino: u64) -> StatxLayout {
         stx_btime: ts(0, 0),
         stx_ctime: ts(meta.ctime.sec, meta.ctime.nsec),
         stx_mtime: ts(meta.mtime.sec, meta.mtime.nsec),
-        stx_rdev_major: 0,
-        stx_rdev_minor: 0,
+        stx_rdev_major: rdev_major,
+        stx_rdev_minor: rdev_minor,
         stx_dev_major: 0,
         stx_dev_minor: 0,
         stx_mnt_id: 0,
@@ -2577,61 +2585,74 @@ pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         Some(d) => d,
         None => return SyscallResult::Error(ENOENT_VALUE),
     };
-    let (mut statx_result, ino) = if path.is_empty() && (flags & AT_EMPTY_PATH != 0) {
-        if dirfd == AT_FDCWD {
-            (
-                StatxResult {
-                    meta: cwd.rnode().meta(),
-                },
-                cwd.rnode().fs_object_id(),
-            )
+    // Device nodes carry a (major, minor) rdev that glibc reads back from
+    // statx — notably `daemon()` fstat()s /dev/null and rejects it with
+    // ENODEV unless st_rdev == makedev(1, 3). LA64 glibc routes fstat()
+    // through statx(fd, "", AT_EMPTY_PATH), so the fd branch must surface the
+    // real rdev (RV64 glibc uses newfstatat → sys_fstat, which already does).
+    let (mut statx_result, ino, rdev_major, rdev_minor) =
+        if path.is_empty() && (flags & AT_EMPTY_PATH != 0) {
+            if dirfd == AT_FDCWD {
+                (
+                    StatxResult {
+                        meta: cwd.rnode().meta(),
+                    },
+                    cwd.rnode().fs_object_id(),
+                    0,
+                    0,
+                )
+            } else {
+                let fd = dirfd;
+                if fd < 0 {
+                    return SyscallResult::Error(EBADF_VALUE);
+                }
+                let file = match resolve_fd(&ctx.process, fd as u32) {
+                    Some(f) => f,
+                    None => return SyscallResult::Error(EBADF_VALUE),
+                };
+                let (rmaj, rmin) = rdev_major_minor_for_open_file(&file);
+                match file.backing() {
+                    OpenFileBacking::Rnode { rnode } => (
+                        StatxResult {
+                            meta: stat_meta_for_open_file(&file),
+                        },
+                        rnode.fs_object_id(),
+                        rmaj,
+                        rmin,
+                    ),
+                    _ => (
+                        StatxResult {
+                            meta: stat_meta_for_open_file(&file),
+                        },
+                        FsObjectId::new(fd as u64),
+                        rmaj,
+                        rmin,
+                    ),
+                }
+            }
         } else {
-            let fd = dirfd;
-            if fd < 0 {
+            if dirfd != AT_FDCWD {
                 return SyscallResult::Error(EBADF_VALUE);
             }
-            let file = match resolve_fd(&ctx.process, fd as u32) {
-                Some(f) => f,
-                None => return SyscallResult::Error(EBADF_VALUE),
+            let walker_cred = ctx.walker_cred();
+            let result = {
+                let mut script_ctx = build_subject_script_ctx(ctx);
+                let mut op = StatxOp {
+                    rooted_at: &cwd,
+                    path: &path,
+                    cred: &walker_cred,
+                    target: None,
+                };
+                step_engine::drive_oneshot(&mut op, &mut script_ctx)
             };
-            match file.backing() {
-                OpenFileBacking::Rnode { rnode } => (
-                    StatxResult {
-                        meta: stat_meta_for_open_file(&file),
-                    },
-                    rnode.fs_object_id(),
-                ),
-                _ => (
-                    StatxResult {
-                        meta: stat_meta_for_open_file(&file),
-                    },
-                    FsObjectId::new(fd as u64),
-                ),
+            match result {
+                Ok((sr, id)) => (sr, id, 0, 0),
+                Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
             }
-        }
-    } else {
-        if dirfd != AT_FDCWD {
-            return SyscallResult::Error(EBADF_VALUE);
-        }
-        let walker_cred = ctx.walker_cred();
-        let result = {
-            let mut script_ctx = build_subject_script_ctx(ctx);
-            let mut op = StatxOp {
-                rooted_at: &cwd,
-                path: &path,
-                cred: &walker_cred,
-                target: None,
-            };
-            step_engine::drive_oneshot(&mut op, &mut script_ctx)
         };
-        match result {
-            Ok((sr, id)) => (sr, id),
-            Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
-        }
-    };
 
     apply_stat_meta_override(ino, &mut statx_result.meta);
-    let statx = inode_meta_to_statx(&statx_result.meta, ino.as_u64());
+    let statx = inode_meta_to_statx(&statx_result.meta, ino.as_u64(), rdev_major, rdev_minor);
     if let Err(errno) = bootstrap_write_user::<StatxLayout>(&ctx.aspace, statxbuf_uaddr, statx) {
         return SyscallResult::error_from(errno);
     }

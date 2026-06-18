@@ -301,21 +301,97 @@ impl<'a> BitmapPageAllocator<'a> {
             .0
             .checked_add(self.total)
             .ok_or(AllocError::InvalidRequest)?;
-        let mut base = align_up(self.base_ppn.0, align).ok_or(AllocError::InvalidRequest)?;
+        let range_base = align_up(self.base_ppn.0, align).ok_or(AllocError::InvalidRequest)?;
 
-        while base.checked_add(count).is_some_and(|end| end <= range_end) {
-            if self.try_reserve_run_at(Ppn(base), count) {
-                self.free.fetch_sub(count, Ordering::AcqRel);
-                return Ok(Ppn(base));
+        // Next-fit with a free-bit fast-skip. First-fit from the range base
+        // walks the whole allocated low-memory prefix on every call — once a
+        // long-running boot fills low frames, each reserve_run(1, ..) (the
+        // ext4 block-read path) degrades to an O(total) meta scan and a large
+        // exec crawls for minutes. Resume near the word the singles/runs hint
+        // points at instead, wrap around once, and skip allocated stretches
+        // via the bitmap words rather than per-frame meta loads.
+        let word_count = self.word_count();
+        if self.total == 0 || word_count == 0 {
+            return Err(AllocError::Exhausted);
+        }
+        let hint_word = self.hint.load(Ordering::Relaxed) % word_count;
+        let hint_ppn = self.ppn_from_dense_index(hint_word * 64).0;
+        let hint_base = align_up(hint_ppn.max(range_base), align)
+            .unwrap_or(range_base)
+            .min(range_end);
+
+        // Pass 1 scans bases in [hint, range_end); pass 2 wraps to bases in
+        // [range_base, hint). A run may always extend up to range_end — only
+        // the candidate BASE is bounded per pass, so runs straddling the hint
+        // stay reachable from pass 2.
+        for (start, base_limit) in [(hint_base, range_end), (range_base, hint_base)] {
+            let mut base = start;
+            while base < base_limit
+                && base.checked_add(count).is_some_and(|run_end| run_end <= range_end)
+            {
+                if !self.frame_bit_is_free(Ppn(base)) {
+                    let Some(next_free) = self.next_free_ppn_at_or_after(base + 1, base_limit)
+                    else {
+                        break;
+                    };
+                    let Some(aligned) = align_up(next_free, align) else {
+                        break;
+                    };
+                    base = aligned;
+                    continue;
+                }
+                if self.try_reserve_run_at(Ppn(base), count) {
+                    self.free.fetch_sub(count, Ordering::AcqRel);
+                    self.hint
+                        .store(self.dense_index(Ppn(base)) / 64, Ordering::Relaxed);
+                    return Ok(Ppn(base));
+                }
+
+                base = match base.checked_add(align) {
+                    Some(next) => next,
+                    None => break,
+                };
             }
-
-            base = match base.checked_add(align) {
-                Some(next) => next,
-                None => break,
-            };
         }
 
         Err(AllocError::Exhausted)
+    }
+
+    /// Whether `ppn`'s free bit is currently set (candidate for reservation).
+    fn frame_bit_is_free(&self, ppn: Ppn) -> bool {
+        let dense = self.dense_index(ppn);
+        let word = self.bitmap[dense / 64].load(Ordering::Acquire);
+        self.mask_word(dense / 64, word) & (1u64 << (dense % 64)) != 0
+    }
+
+    /// First ppn in `[from, end)` whose free bit is set, scanning whole bitmap
+    /// words so fully-allocated stretches cost one load per 64 frames.
+    fn next_free_ppn_at_or_after(&self, from: usize, end: usize) -> Option<usize> {
+        if from >= end {
+            return None;
+        }
+        let from_dense = self.dense_index(Ppn(from));
+        let end_dense = from_dense + (end - from);
+        let mut word_index = from_dense / 64;
+        let mut bit_floor = from_dense % 64;
+        while word_index * 64 < end_dense {
+            let word = self.mask_word(word_index, self.bitmap[word_index].load(Ordering::Acquire));
+            let word = if bit_floor == 0 {
+                word
+            } else {
+                word & !((1u64 << bit_floor) - 1)
+            };
+            if word != 0 {
+                let dense = word_index * 64 + word.trailing_zeros() as usize;
+                if dense >= end_dense {
+                    return None;
+                }
+                return Some(self.ppn_from_dense_index(dense).0);
+            }
+            word_index += 1;
+            bit_floor = 0;
+        }
+        None
     }
 
     fn try_reserve_run_at(&self, base: Ppn, count: usize) -> bool {

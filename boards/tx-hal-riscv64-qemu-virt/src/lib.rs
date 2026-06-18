@@ -481,9 +481,29 @@ impl PmapIf for Platform {
             let ppn = root.phys().0 >> 12;
             let asid = root.asid().0 as usize;
             let satp = SATP_MODE_SV39 | (asid << 44) | ppn;
+            // Fast path: returning to the same address space (the common
+            // syscall return). No CSR write, no fence — TLB entries for
+            // this ASID are still valid.
+            let current: usize;
+            core::arch::asm!("csrr {satp}, satp", satp = out(reg) current, options(nomem, nostack));
+            if current == satp {
+                return;
+            }
+            // Different root/ASID: write satp WITHOUT a global sfence.vma.
+            // Correctness per the RISC-V privileged spec:
+            //  - TLB entries are ASID-tagged; switching ASIDs needs no fence.
+            //  - Invalid (V=0) PTEs are never cached, so invalid→valid map
+            //    commits are picked up by the next hardware walk unfenced
+            //    (`fill_mapping` fences only when overwriting a valid PTE).
+            //  - ASID reuse is fenced at root teardown
+            //    (`invalidate_root_translations` switches to the bootstrap
+            //    root and issues sfence.vma there).
+            // The previous unconditional `sfence.vma` here flushed the whole
+            // TLB on EVERY userspace entry — under QEMU TCG that meant a
+            // full tlb_flush per syscall return (~ms each), the dominant
+            // term of LTP shell-test runtime (net_stress budget battle).
             core::arch::asm!(
                 "csrw satp, {satp}",
-                "sfence.vma",
                 satp = in(reg) satp,
                 options(nostack)
             );
@@ -999,13 +1019,16 @@ fn cpu_id_from_kernel_tls(kernel_tls: usize) -> Option<CpuId> {
         return None;
     }
 
-    let offset = kernel_tls - base;
-    if !offset.is_multiple_of(stride) {
-        return None;
-    }
-
-    let cpu = offset / stride;
-    Some(RV64_PERCPU_AREAS[cpu].cpu_id())
+    // `install_early_percpu` only ever writes `&RV64_PERCPU_AREAS[i]` into
+    // tp, so an in-range `kernel_tls` points exactly at one per-CPU area and
+    // its `cpu_id` is the first field. Read it directly rather than recovering
+    // the index with a divide+modulo by the non-power-of-two stride: this leaf
+    // is on every `current_cpu_id()` call (~3.6% of fork-path PC samples, and
+    // inlined into many hot callers). The range check above is the only
+    // validation needed — it is load-bearing for the early-boot window where
+    // tp still holds the raw cpu_id (handled by `current_cpu_id`'s fallback).
+    let area = unsafe { &*(kernel_tls as *const Rv64PerCpuArea) };
+    Some(area.cpu_id())
 }
 
 fn installed_irq_table() -> Option<&'static IrqDispatchTable> {

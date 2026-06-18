@@ -1,0 +1,21 @@
+# tx-ltp-builtin-pipe.txt - focused smoke for LTP helper builtins.
+
+wait "/ # " within 30000
+sleep 500
+
+send "PATH=/tx-ltp/bin:/bin:/musl/musl:/musl/musl/ltp/testcases/bin:$PATH\n"
+expect "/ # " within 5000
+
+send "for i in $(seq 1 3); do echo loop-$i; done\n"
+expect "loop-3" within 8000
+expect "/ # " within 5000
+
+send "echo 10.0.0.1 | grep -q 10.0.0.1; echo grep-hit-$?\n"
+expect "grep-hit-0" within 8000
+expect "/ # " within 5000
+
+send "echo 10.0.0.2 | grep -q 10.0.0.1; echo grep-miss-$?\n"
+expect "grep-miss-1" within 8000
+expect "/ # " within 5000
+
+quit

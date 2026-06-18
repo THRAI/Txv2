@@ -1,6 +1,8 @@
 //! Read-only network projection helpers.
 
+use alloc::format;
 use alloc::string::String;
+use alloc::vec::Vec;
 use core::fmt::Write;
 
 use smoltcp::time::Instant;
@@ -12,8 +14,11 @@ use crate::net::netfilter::{
     NetfilterTarget,
 };
 use crate::net::protocol::{ArpSnapshotState, EtherIface, NetStatsSnapshot};
-use crate::net::structure::Ipv4Address;
-use crate::net::{NetNamespacePayload, NetNamespaceRouteInfo};
+use crate::net::structure::{Ipv4Address, Ipv6Address};
+use crate::net::{
+    AddressFamily, IpAddress, IpEndpoint, NetNamespacePayload, NetNamespaceRouteInfo,
+    SocketProtocol, TcpState,
+};
 
 pub fn proc_net_arp_snapshot_text(ifaces: &[&EtherIface], now: Instant) -> String {
     let mut out = String::new();
@@ -50,6 +55,55 @@ pub fn proc_net_arp_snapshot_text(ifaces: &[&EtherIface], now: Instant) -> Strin
 
 pub fn proc_net_arp_snapshot_zero_text(ifaces: &[&EtherIface]) -> String {
     proc_net_arp_snapshot_text(ifaces, Instant::ZERO)
+}
+
+pub fn proc_net_neigh_snapshot_text(ifaces: &[&EtherIface], now: Instant) -> String {
+    let mut out = String::new();
+    for iface in ifaces {
+        for entry in iface.arp_snapshot(now) {
+            let mac = entry
+                .mac
+                .map(format_mac)
+                .unwrap_or_else(|| String::from("00:00:00:00:00:00"));
+            let nud = match entry.state {
+                ArpSnapshotState::Resolved => "REACHABLE",
+                ArpSnapshotState::Pending => "INCOMPLETE",
+                ArpSnapshotState::Failed => "FAILED",
+            };
+            let _ = writeln!(
+                out,
+                "{} dev {} lladdr {} {}",
+                format_ipv4(entry.ip),
+                entry.iface_name,
+                mac,
+                nud
+            );
+        }
+        for entry in iface.ndisc_snapshot(now) {
+            let mac = entry
+                .mac
+                .map(format_mac)
+                .unwrap_or_else(|| String::from("00:00:00:00:00:00"));
+            let nud = match entry.state {
+                ArpSnapshotState::Resolved => "REACHABLE",
+                ArpSnapshotState::Pending => "INCOMPLETE",
+                ArpSnapshotState::Failed => "FAILED",
+            };
+            let _ = writeln!(
+                out,
+                "{} dev {} lladdr {} {}",
+                format_ipv6(entry.ip),
+                entry.iface_name,
+                mac,
+                nud
+            );
+        }
+    }
+    out
+}
+
+pub fn proc_net_neigh_snapshot_text_for_namespace(netns: &NetNamespacePayload) -> String {
+    proc_net_neigh_snapshot_text(&netns.ether_ifaces_snapshot(), Instant::ZERO)
 }
 
 pub fn proc_net_dev_snapshot_text(ifaces: &[&EtherIface]) -> String {
@@ -208,6 +262,205 @@ pub fn proc_net_nf_conntrack_text_for_namespace(netns: &NetNamespacePayload) -> 
     out
 }
 
+#[derive(Clone)]
+struct TcpProcRow {
+    local: IpEndpoint,
+    remote: IpEndpoint,
+    state: u8,
+    uid: u32,
+    inode: u64,
+    pid: u32,
+    fd: u32,
+    comm: String,
+}
+
+pub fn proc_net_tcp_socket_table_text(
+    family: AddressFamily,
+    netns: Option<&NetNamespacePayload>,
+) -> String {
+    let mut out = proc_socket_table_header();
+    for (idx, row) in tcp_proc_rows(family, netns, false).into_iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "{:4}: {} {} {:02X} 00000000:00000000 00:00000000 00000000 {:5}        0 {} 1 0000000000000000 100 0 0 10 0",
+            idx,
+            proc_endpoint(row.local),
+            proc_endpoint(row.remote),
+            row.state,
+            row.uid,
+            row.inode
+        );
+    }
+    out
+}
+
+pub fn proc_net_tcp_listener_process_table_text(
+    family: AddressFamily,
+    netns: Option<&NetNamespacePayload>,
+) -> String {
+    let mut out =
+        String::from("State Recv-Q Send-Q Local Address:Port Peer Address:Port Process\n");
+    for row in tcp_proc_rows(family, netns, true) {
+        let _ = writeln!(
+            out,
+            "LISTEN 0 0 {} *:* users:((\"{}\",pid={},fd={}))",
+            ss_endpoint(row.local),
+            row.comm,
+            row.pid,
+            row.fd
+        );
+    }
+    out
+}
+
+fn proc_socket_table_header() -> String {
+    String::from(
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n",
+    )
+}
+
+fn tcp_proc_rows(
+    family: AddressFamily,
+    netns: Option<&NetNamespacePayload>,
+    listeners_only: bool,
+) -> Vec<TcpProcRow> {
+    let mut rows = Vec::new();
+    for (pid, alive) in crate::process::all_pids() {
+        if !alive {
+            continue;
+        }
+        let Some(process) = crate::process::process_by_pid(pid) else {
+            continue;
+        };
+        if let Some(netns) = netns {
+            let Some(process_netns) = process.net_namespace() else {
+                continue;
+            };
+            if !core::ptr::eq(&*process_netns, netns) {
+                continue;
+            }
+        }
+        let comm = process_comm_string(&process);
+        for (fd, file) in process.open_fds() {
+            let Some(socket) = file.socket_identity().cloned() else {
+                continue;
+            };
+            let Some(payload) = socket.acquire_operational() else {
+                continue;
+            };
+            let Some((local, remote, state)) = tcp_proc_state(payload.protocol_snapshot()) else {
+                continue;
+            };
+            if socket.family != family && local.family != family {
+                continue;
+            }
+            if listeners_only && state != 0x0A {
+                continue;
+            }
+            rows.push(TcpProcRow {
+                local,
+                remote,
+                state,
+                uid: 0,
+                inode: file.rnode().fs_object_id().as_u64(),
+                pid: pid.0,
+                fd,
+                comm: comm.clone(),
+            });
+        }
+    }
+    rows
+}
+
+fn tcp_proc_state(protocol: SocketProtocol) -> Option<(IpEndpoint, IpEndpoint, u8)> {
+    match protocol {
+        SocketProtocol::Tcp(TcpState::Listening { local, .. }) => {
+            Some((local, unspecified_peer(local.family), 0x0A))
+        }
+        SocketProtocol::Tcp(TcpState::Connected { local, remote }) => Some((local, remote, 0x01)),
+        SocketProtocol::Tcp(TcpState::Connecting { local, remote }) => Some((local, remote, 0x02)),
+        SocketProtocol::Tcp(TcpState::Bound { local }) => {
+            Some((local, unspecified_peer(local.family), 0x07))
+        }
+        _ => None,
+    }
+}
+
+fn unspecified_peer(family: AddressFamily) -> IpEndpoint {
+    IpEndpoint::unspecified_for_family(family, 0)
+}
+
+fn process_comm_string(
+    process: &tx_substrate::zone::Cap<crate::process::ProcessIdentity>,
+) -> String {
+    if let Some(cmdline) = process.ident_cmdline() {
+        if let Some(argv0) = cmdline.split(|b| *b == 0).find(|s| !s.is_empty()) {
+            let name = argv0.rsplit(|b| *b == b'/').next().unwrap_or(argv0);
+            if !name.is_empty() {
+                return String::from_utf8_lossy(name).into_owned();
+            }
+        }
+    }
+
+    let comm = process.ident_comm().unwrap_or([0; 16]);
+    let len = comm.iter().position(|b| *b == 0).unwrap_or(comm.len());
+    if len == 0 {
+        String::from("?")
+    } else {
+        String::from_utf8_lossy(&comm[..len]).into_owned()
+    }
+}
+
+fn proc_endpoint(endpoint: IpEndpoint) -> String {
+    match endpoint.ip_addr() {
+        IpAddress::V4(addr) => {
+            let [a, b, c, d] = addr.octets();
+            format!("{d:02X}{c:02X}{b:02X}{a:02X}:{:04X}", endpoint.port)
+        }
+        IpAddress::V6(addr) => {
+            let octets = addr.octets();
+            let mut out = String::new();
+            for chunk in octets.chunks_exact(4).rev() {
+                let _ = write!(
+                    out,
+                    "{:02X}{:02X}{:02X}{:02X}",
+                    chunk[3], chunk[2], chunk[1], chunk[0]
+                );
+            }
+            let _ = write!(out, ":{:04X}", endpoint.port);
+            out
+        }
+    }
+}
+
+fn ss_endpoint(endpoint: IpEndpoint) -> String {
+    match endpoint.ip_addr() {
+        IpAddress::V4(addr) => {
+            let [a, b, c, d] = addr.octets();
+            format!("{a}.{b}.{c}.{d}:{}", endpoint.port)
+        }
+        IpAddress::V6(addr) => {
+            let octets = addr.octets();
+            let mut groups = [0u16; 8];
+            for (idx, chunk) in octets.chunks_exact(2).enumerate() {
+                groups[idx] = u16::from_be_bytes([chunk[0], chunk[1]]);
+            }
+            format!(
+                "[{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}]:{}",
+                groups[0],
+                groups[1],
+                groups[2],
+                groups[3],
+                groups[4],
+                groups[5],
+                groups[6],
+                groups[7],
+                endpoint.port
+            )
+        }
+    }
+}
+
 fn push_proc_net_dev_header(out: &mut String) {
     let _ = writeln!(
         out,
@@ -246,6 +499,55 @@ fn format_ipv4(addr: Ipv4Address) -> String {
     let [a, b, c, d] = addr.octets();
     let mut out = String::new();
     let _ = write!(out, "{a}.{b}.{c}.{d}");
+    out
+}
+
+fn format_ipv6(addr: Ipv6Address) -> String {
+    let octets = addr.octets();
+    let mut hextets = [0u16; 8];
+    for idx in 0..8 {
+        hextets[idx] = u16::from_be_bytes([octets[idx * 2], octets[idx * 2 + 1]]);
+    }
+
+    let mut best_start = None;
+    let mut best_len = 0usize;
+    let mut idx = 0usize;
+    while idx < hextets.len() {
+        if hextets[idx] != 0 {
+            idx += 1;
+            continue;
+        }
+        let start = idx;
+        while idx < hextets.len() && hextets[idx] == 0 {
+            idx += 1;
+        }
+        let len = idx - start;
+        if len >= 2 && len > best_len {
+            best_start = Some(start);
+            best_len = len;
+        }
+    }
+
+    let mut out = String::new();
+    let mut idx = 0usize;
+    while idx < hextets.len() {
+        if best_start == Some(idx) {
+            out.push_str("::");
+            idx += best_len;
+            if idx >= hextets.len() {
+                break;
+            }
+            continue;
+        }
+        if !out.is_empty() && !out.ends_with(':') {
+            out.push(':');
+        }
+        let _ = write!(out, "{:x}", hextets[idx]);
+        idx += 1;
+    }
+    if out.is_empty() {
+        out.push_str("::");
+    }
     out
 }
 

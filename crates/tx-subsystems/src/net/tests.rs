@@ -34,7 +34,7 @@ use crate::net::execution::{
     step_process_network_tick, step_process_network_tick_loopback, step_recv,
     step_recv_kernel_bytes, step_send, step_send_kernel_bytes, step_send_to_kernel_bytes,
     step_send_to_kernel_bytes_with_poll_kick, step_send_udp_loopback_kernel_bytes, step_shutdown,
-    step_socket_create, step_tcp_backlog_cleanup, step_tcp_close_staging,
+    step_socket_close, step_socket_create, step_tcp_backlog_cleanup, step_tcp_close_staging,
     step_tcp_connection_cleanup, step_tcp_loopback_handshake, step_tcp_loopback_handshake_on_iface,
     step_tcp_loopback_transfer, DeviceTxBudget, LoopbackPollBudget, NET_EVENT_BUDGET,
     TCP_BACKLOG_RETRANSMIT_BACKOFF_MILLIS, TCP_BACKLOG_TIMEOUT_STAGING_MILLIS,
@@ -48,11 +48,11 @@ use crate::net::packet::{
     PacketTxResult, PacketTxSink, RxFrame, TcpPacketEvent, TcpPacketFlags, UdpPacketEvent,
 };
 use crate::net::protocol::{
-    build_icmpv4_echo_request_message, decide_ipv4_route, loopback_iface, parse_icmpv4_payload,
-    ArpSnapshotState, EtherIface, EtherPacketSource, EtherPacketTxSink, Icmpv4EchoPacket,
-    Icmpv4Event, IfaceCommon, Ipv4RouteDecision, LoopbackIface, PollContext, RawTcpSocket,
-    RawUdpSocket, SmoltcpAdapter, SmoltcpAdapterConfig, SmoltcpPacketSource, SmoltcpPacketTxSink,
-    UdpTxDatagram, ARP_REQUEST_RETRY_LIMIT, TCP_CORK_AUTO_FLUSH_BYTES,
+    build_icmpv4_echo_request_message, decide_ipv4_route, loopback_iface, ArpSnapshotState,
+    EtherIface, EtherPacketSource, EtherPacketTxSink, Icmpv4EchoPacket, Icmpv4Event, IfaceCommon,
+    Ipv4RouteDecision, LoopbackIface, PollContext, RawTcpSocket, RawUdpSocket, SmoltcpAdapter,
+    SmoltcpAdapterConfig, SmoltcpPacketSource, SmoltcpPacketTxSink, UdpTxDatagram,
+    ARP_REQUEST_RETRY_LIMIT, TCP_CORK_AUTO_FLUSH_BYTES,
 };
 use crate::net::structure::table::SOCKET_TABLE;
 use crate::net::{

@@ -524,6 +524,145 @@ fn namespace_runtime_drives_container_ping_host_gateway() {
 }
 
 #[test]
+fn namespace_runtime_relearns_container_gateway_after_arp_delete() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
+
+    let guard = tx_substrate::epoch::guard();
+    let now = smoltcp::time::Instant::ZERO;
+    let host_ip = Ipv4Address::new([172, 17, 1, 1]);
+    let container_ip = Ipv4Address::new([172, 17, 1, 2]);
+    let host = crate::net::initial_net_namespace_payload();
+    let container = crate::net::create_isolated_net_namespace_for_test("runtime-relearn-container")
+        .expect("container namespace")
+        .payload_cap()
+        .expect("container payload");
+    let bridge = new_test_bridge("docker-relearn0", 97);
+    let pair = new_bridge_veth_pair("eth-relearn0", "veth-relearn0", 97);
+
+    bridge
+        .device
+        .add_port_for_test_or_bootstrap(pair.right)
+        .expect("bridge port");
+    host.attach_device_for_test_or_bootstrap(bridge.registration, None)
+        .expect("attach docker bridge");
+    host.attach_device_for_test_or_bootstrap(pair.right, None)
+        .expect("attach host veth");
+    container
+        .attach_device_for_test_or_bootstrap(pair.left, None)
+        .expect("attach container eth");
+    let auth = NetAdminAuthority::for_test_or_bootstrap();
+    let docker_ifindex = bridge_ifindex_for(&host.link_snapshot(), "docker-relearn0");
+    host.set_device_ipv4_addr_by_ifindex(auth, docker_ifindex, Some(host_ip), Some(16))
+        .expect("set docker bridge addr");
+    let eth_ifindex = bridge_ifindex_for(&container.link_snapshot(), "eth-relearn0");
+    container
+        .set_device_ipv4_addr_by_ifindex(auth, eth_ifindex, Some(container_ip), Some(16))
+        .expect("set container eth addr");
+
+    let raw = match crate::net::step_socket_create_in_namespace(
+        ValidSocketType::validate(2, 3, 1).expect("AF_INET SOCK_RAW ICMP"),
+        container.clone(),
+        &guard,
+    ) {
+        StepOutcome::Done(socket) => socket,
+        other => panic!("raw icmp socket create failed: {other:?}"),
+    };
+
+    let send_echo = |seq_no: u16, payload: &[u8]| {
+        let echo = Icmpv4EchoPacket {
+            src: container_ip,
+            dst: host_ip,
+            ident: 0x72d0,
+            seq_no,
+            payload: payload.to_vec(),
+        };
+        let message = crate::net::protocol::build_icmpv4_echo_request_message(&echo);
+        assert_eq!(
+            step_send_to_kernel_bytes(
+                &raw,
+                Some(IpEndpoint::new(host_ip, 0)),
+                &message,
+                SendRecvFlags::empty(),
+                &guard,
+            ),
+            StepOutcome::Done(message.len())
+        );
+
+        let mut total = crate::net::NetNamespaceRuntimeOutcome::default();
+        let mut reply = [0u8; 96];
+        let mut received = None;
+        for _ in 0..12 {
+            let outcome = crate::net::drive_all_net_namespace_runtimes_at(now, &guard);
+            total.merge(outcome);
+            if let StepOutcome::Done(recv) =
+                step_recv_kernel_bytes(&raw, &mut reply, SendRecvFlags::empty(), &guard)
+            {
+                received = Some(recv.bytes);
+                break;
+            }
+        }
+
+        assert_eq!(received, Some(message.len()), "runtime outcome: {total:?}");
+        total
+    };
+
+    let first = send_echo(1, b"runtime-relearn-first");
+    assert!(first.arp_sent >= 1, "first runtime outcome: {first:?}");
+    assert!(container.ether_ifaces_snapshot()[0]
+        .arp_entry(host_ip, now)
+        .is_some());
+    container
+        .add_ipv4_route(
+            auth,
+            crate::net::NetNamespaceRouteConfig {
+                dst: Ipv4Address::UNSPECIFIED,
+                prefix_len: 0,
+                gateway: Some(host_ip),
+                oif_name: Some("eth-relearn0"),
+                preferred_src: Some(container_ip),
+                table: 254,
+                protocol: 4,
+                scope: 0,
+                route_type: 1,
+            },
+        )
+        .expect("add default route through learned gateway");
+    assert!(container.ether_ifaces_snapshot()[0]
+        .arp_entry(host_ip, now)
+        .is_some());
+    let neigh_req = rtnl_getneigh_dump_req(0x72d0, 2);
+    let neigh =
+        crate::net::rtnetlink_handle_request(&container, crate::cred::Cred::root(), &neigh_req);
+    assert!(
+        neigh.iter().any(|msg| {
+            bridge_nlmsg_type(msg) == crate::net::RTM_NEWNEIGH
+                && bridge_contains_bytes(msg, &host_ip.octets())
+        }),
+        "runtime-learned ARP entry should be visible through RTM_GETNEIGH: {neigh:?}"
+    );
+
+    container
+        .delete_static_neighbor_by_ifindex(auth, eth_ifindex, host_ip)
+        .expect("delete learned gateway arp");
+    assert!(container.ether_ifaces_snapshot()[0]
+        .arp_entry(host_ip, now)
+        .is_none());
+
+    let second = send_echo(2, b"runtime-relearn-second");
+    assert!(
+        second.arp_sent >= 1,
+        "second ping should re-issue ARP after delete: {second:?}"
+    );
+    assert!(container.ether_ifaces_snapshot()[0]
+        .arp_entry(host_ip, now)
+        .is_some());
+}
+
+#[test]
 fn namespace_runtime_drives_container_ping_container_through_bridge() {
     init_zones();
     let _lock = crate::test_support::EPOCH_TEST_LOCK
@@ -1564,6 +1703,43 @@ fn new_bridge_veth_pair(left_name: &'static str, right_name: &'static str, minor
         },
         mtu: VETH_DEFAULT_MTU,
     })
+}
+
+fn rtnl_getneigh_dump_req(seq: u32, family: u8) -> std::vec::Vec<u8> {
+    let mut payload = std::vec::Vec::new();
+    payload.push(family);
+    payload.push(0);
+    payload.extend_from_slice(&0u16.to_le_bytes());
+    payload.extend_from_slice(&0i32.to_le_bytes());
+    payload.extend_from_slice(&0u16.to_le_bytes());
+    payload.push(0);
+    payload.push(0);
+    bridge_nlmsg(
+        crate::net::RTM_GETNEIGH,
+        crate::net::NLM_F_REQUEST | crate::net::NLM_F_DUMP,
+        seq,
+        &payload,
+    )
+}
+
+fn bridge_nlmsg(kind: u16, flags: u16, seq: u32, payload: &[u8]) -> std::vec::Vec<u8> {
+    let len = 16 + payload.len();
+    let mut out = std::vec::Vec::new();
+    out.extend_from_slice(&(len as u32).to_le_bytes());
+    out.extend_from_slice(&kind.to_le_bytes());
+    out.extend_from_slice(&flags.to_le_bytes());
+    out.extend_from_slice(&seq.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+fn bridge_nlmsg_type(msg: &[u8]) -> u16 {
+    u16::from_le_bytes(msg[4..6].try_into().expect("nlmsg type"))
+}
+
+fn bridge_contains_bytes(msg: &[u8], needle: &[u8]) -> bool {
+    msg.windows(needle.len()).any(|window| window == needle)
 }
 
 fn new_bridge_ether_iface(

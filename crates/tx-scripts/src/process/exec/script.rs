@@ -655,6 +655,42 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
                     &guard,
                 );
             }
+            // The glibc OSComp images ship the dynamic linker under
+            // /musl/glibc/lib/<basename> while PT_INTERP names the
+            // Linux path (/lib/ld-linux-riscv64-lp64d.so.1 on rv64,
+            // /lib64/ld-linux-loongarch-lp64d.so.1 on la64).
+            if matches!(outcome, V3::Err(_))
+                && interp_path
+                    .windows(b"ld-linux".len())
+                    .any(|window| window == b"ld-linux")
+            {
+                let basename = interp_path
+                    .rsplit(|&b| b == b'/')
+                    .next()
+                    .map(|b| b.to_vec())
+                    .unwrap_or_else(|| interp_path.to_vec());
+                let mut glibc_path = alloc::vec::Vec::with_capacity(
+                    b"/musl/glibc/lib/".len() + basename.len(),
+                );
+                glibc_path.extend_from_slice(b"/musl/glibc/lib/");
+                glibc_path.extend_from_slice(&basename);
+                let glibc_root = exec_root_for_path(&rooted_at, &glibc_path);
+                outcome = step_open(
+                    glibc_root,
+                    &glibc_path,
+                    OpenFileFlags {
+                        read: true,
+                        write: false,
+                        append: false,
+                        cloexec: false,
+                        nonblocking: false,
+                        packet: false,
+                    },
+                    0,
+                    cred,
+                    &guard,
+                );
+            }
             // The musl OSComp images ship the dynamic linker as
             // /musl/musl/lib/libc.so, while PT_INTERP names the Linux
             // compatibility path (/lib*/ld-musl-*.so.1). Try the

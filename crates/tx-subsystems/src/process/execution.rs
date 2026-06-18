@@ -113,6 +113,15 @@ pub fn process_by_pid(pid: Pid) -> Option<Cap<ProcessIdentity>> {
     }
 }
 
+/// Look up a process group by PGID. Restored alongside the net subsystem
+/// re-home; used by signal delivery to a process group (`kill(-pgid, ...)`).
+pub fn process_group_by_pgid(pgid: Pgid) -> Option<Cap<ProcessGroup>> {
+    match resolve_pid_number_as(pgid.0 as u64, PidNameKind::ProcessGroup) {
+        Some(PidName::ProcessGroup(cap)) => Some(cap),
+        _ => None,
+    }
+}
+
 /// Return all registered PIDs with alive status (for procfs).
 pub fn all_pids() -> alloc::vec::Vec<(Pid, bool)> {
     let mut out = alloc::vec::Vec::new();
@@ -414,6 +423,8 @@ pub fn step_fork<P: PmapIf>(
             clone_vm,
             clone_sighand,
             clone_newipc: false,
+            clone_newnet: false,
+            clone_newns: false,
         },
     )
 }
@@ -423,6 +434,12 @@ pub struct ForkOptions {
     pub clone_vm: bool,
     pub clone_sighand: bool,
     pub clone_newipc: bool,
+    /// `CLONE_NEWNET` — give the child a fresh, isolated network namespace
+    /// instead of inheriting the parent's. Used by `tst_ns_create net,mnt`.
+    pub clone_newnet: bool,
+    /// `CLONE_NEWNS` — accepted so `clone(CLONE_NEWNS)` succeeds; full mount-
+    /// namespace isolation is deferred (child currently shares parent mnt_ns).
+    pub clone_newns: bool,
 }
 
 pub fn step_fork_with_options<P: PmapIf>(
@@ -522,6 +539,22 @@ pub fn step_fork_with_options<P: PmapIf>(
     let child_nsproxy =
         crate::process::nsproxy::clone_nsproxy_for_fork(&parent_nsproxy, options.clone_newipc)
             .map_err(ForkError::Zone)?;
+    // CLONE_NEWNET: publish a fresh isolated network namespace for the child
+    // (owned by the parent's user namespace) instead of inheriting the parent's.
+    // Required by LTP's `tst_ns_create net,mnt` (the shell net command harness).
+    // CLONE_NEWNS is accepted but mount-namespace isolation is deferred.
+    let child_net_namespace = if options.clone_newnet {
+        let namespace = crate::net::create_isolated_net_namespace_with_owner(
+            "clone",
+            Some(parent_nsproxy.user_ns.clone()),
+        )
+        .map_err(ForkError::Zone)?;
+        namespace
+            .payload_cap()
+            .ok_or(ForkError::Zone(ZoneError::InvalidState))?
+    } else {
+        parent_net_namespace
+    };
     let payload = sign_process_payload(
         child_aspace_cap,
         vec![leader],
@@ -532,7 +565,7 @@ pub fn step_fork_with_options<P: PmapIf>(
         parent_fd_cloexec,
         parent_rlimit_nofile,
         parent_rlimit_memlock,
-        parent_net_namespace,
+        child_net_namespace,
         parent_brk_base,
         parent_current_brk,
         parent_umask,
@@ -1709,6 +1742,8 @@ pub struct ForkOp<'a, P: PmapIf> {
     pub clone_vm: bool,
     pub clone_sighand: bool,
     pub clone_newipc: bool,
+    pub clone_newnet: bool,
+    pub clone_newns: bool,
     pub _pmap: core::marker::PhantomData<P>,
 }
 
@@ -1722,6 +1757,8 @@ impl<'a, P: PmapIf, I: SubjectIdentity> StepOp<I> for ForkOp<'a, P> {
                 clone_vm: self.clone_vm,
                 clone_sighand: self.clone_sighand,
                 clone_newipc: self.clone_newipc,
+                clone_newnet: self.clone_newnet,
+                clone_newns: self.clone_newns,
             },
         ))
     }

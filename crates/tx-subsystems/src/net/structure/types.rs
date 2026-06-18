@@ -107,6 +107,7 @@ pub enum SocketKind {
     RdsSeqPacket,
     RawIcmp,
     NetlinkRoute,
+    NetlinkXfrm,
     NetlinkNetfilter,
     Packet,
 }
@@ -120,16 +121,25 @@ impl SocketKind {
             }
             (AddressFamily::Inet, SocketType::Stream, 0 | 6) => Ok(Self::Tcp),
             (AddressFamily::Inet, SocketType::Stream, 132) => Ok(Self::Sctp),
+            (AddressFamily::Inet, SocketType::SeqPacket, 132) => Ok(Self::Sctp),
             (AddressFamily::Inet, SocketType::Dgram, 0 | 17 | 136) => Ok(Self::Udp),
             (AddressFamily::Inet, SocketType::Dgram, 1)
             | (AddressFamily::Inet, SocketType::Raw, 1) => Ok(Self::RawIcmp),
             (AddressFamily::Inet, _, _) => Err(Errno::EPROTONOSUPPORT),
             (AddressFamily::Inet6, SocketType::Stream, 0 | 6) => Ok(Self::Tcp),
             (AddressFamily::Inet6, SocketType::Stream, 132) => Ok(Self::Sctp),
+            (AddressFamily::Inet6, SocketType::SeqPacket, 132) => Ok(Self::Sctp),
             (AddressFamily::Inet6, SocketType::Dgram, 0 | 17 | 136) => Ok(Self::Udp),
+            // 255 = IPPROTO_RAW (header-included injector; LTP
+            // sctp_big_chunk forges an SCTP INIT through it — the send
+            // path accepts and delivers to raw listeners only).
+            (AddressFamily::Inet6, SocketType::Raw, 58 | 159 | 255) => Ok(Self::RawIcmp),
             (AddressFamily::Inet6, _, _) => Err(Errno::EPROTONOSUPPORT),
             (AddressFamily::Netlink, SocketType::Raw | SocketType::Dgram, 0) => {
                 Ok(Self::NetlinkRoute)
+            }
+            (AddressFamily::Netlink, SocketType::Raw | SocketType::Dgram, 6) => {
+                Ok(Self::NetlinkXfrm)
             }
             (AddressFamily::Netlink, SocketType::Raw | SocketType::Dgram, 12) => {
                 Ok(Self::NetlinkNetfilter)
@@ -418,6 +428,10 @@ pub struct SockAddrLl {
     pub family: u16,
     pub protocol: u16,
     pub ifindex: i32,
+    pub hatype: u16,
+    pub pkttype: u8,
+    pub halen: u8,
+    pub addr: [u8; 8],
 }
 
 impl SockAddrLl {
@@ -428,6 +442,29 @@ impl SockAddrLl {
             family: Self::AF_PACKET,
             protocol,
             ifindex,
+            hatype: 0,
+            pkttype: 0,
+            halen: 0,
+            addr: [0; 8],
+        }
+    }
+
+    pub const fn with_link_layer_addr(
+        protocol: u16,
+        ifindex: i32,
+        hatype: u16,
+        pkttype: u8,
+        addr: [u8; 8],
+        halen: u8,
+    ) -> Self {
+        Self {
+            family: Self::AF_PACKET,
+            protocol,
+            ifindex,
+            hatype,
+            pkttype,
+            halen,
+            addr,
         }
     }
 }
@@ -457,12 +494,15 @@ pub struct SendRecvFlags {
 
 impl SendRecvFlags {
     pub const MSG_OOB: Self = Self { bits: 0x01 };
-    pub const MSG_DONTWAIT: Self = Self { bits: 0x40 };
     pub const MSG_PEEK: Self = Self { bits: 0x02 };
-    pub const MSG_ERRQUEUE: Self = Self { bits: 0x2000 };
-    pub const MSG_WAITALL: Self = Self { bits: 0x100 };
-    pub const MSG_NOSIGNAL: Self = Self { bits: 0x4000 };
+    pub const MSG_DONTROUTE: Self = Self { bits: 0x04 };
+    pub const MSG_PROBE: Self = Self { bits: 0x10 };
     pub const MSG_TRUNC: Self = Self { bits: 0x20 };
+    pub const MSG_DONTWAIT: Self = Self { bits: 0x40 };
+    pub const MSG_WAITALL: Self = Self { bits: 0x100 };
+    pub const MSG_CONFIRM: Self = Self { bits: 0x800 };
+    pub const MSG_ERRQUEUE: Self = Self { bits: 0x2000 };
+    pub const MSG_NOSIGNAL: Self = Self { bits: 0x4000 };
     pub const MSG_MORE: Self = Self { bits: 0x8000 };
 
     pub const fn empty() -> Self {
@@ -474,8 +514,11 @@ impl SendRecvFlags {
             bits: Self::MSG_OOB.bits
                 | Self::MSG_DONTWAIT.bits
                 | Self::MSG_PEEK.bits
+                | Self::MSG_DONTROUTE.bits
+                | Self::MSG_PROBE.bits
                 | Self::MSG_ERRQUEUE.bits
                 | Self::MSG_WAITALL.bits
+                | Self::MSG_CONFIRM.bits
                 | Self::MSG_NOSIGNAL.bits
                 | Self::MSG_TRUNC.bits
                 | Self::MSG_MORE.bits,
@@ -538,11 +581,61 @@ impl LingerOption {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SctpLevelOptions {
+    pub rto_initial: u32,
+    pub rto_max: u32,
+    pub rto_min: u32,
+    pub initmsg_num_ostreams: u16,
+    pub initmsg_max_instreams: u16,
+    pub initmsg_max_attempts: u16,
+    pub initmsg_max_init_timeo: u16,
+    pub assoc_asocmaxrxt: u16,
+    pub assoc_number_peer_destinations: u16,
+    pub assoc_peer_rwnd: u32,
+    pub assoc_local_rwnd: u32,
+    pub assoc_cookie_life: u32,
+    /// SCTP_EVENTS subscription: raw `struct sctp_event_subscribe` bytes
+    /// (one u8 flag per event, offsets per the uapi struct). Byte 1 is
+    /// `sctp_association_event`, byte 5 is `sctp_shutdown_event`.
+    pub events_subscribe: [u8; 16],
+    /// SCTP_PEER_ADDR_PARAMS (struct sctp_paddrparams) endpoint defaults.
+    /// `paddr_sackdelay` is shared with SCTP_DELAYED_ACK_TIME's assoc_value.
+    pub paddr_hbinterval: u32,
+    pub paddr_pathmaxrxt: u16,
+    pub paddr_pathmtu: u32,
+    pub paddr_sackdelay: u32,
+    pub paddr_flags: u32,
+    /// SCTP_DEFAULT_SEND_PARAM: raw `struct sctp_sndrcvinfo` (32 bytes) used as
+    /// the socket-level default for sends without an explicit sndrcvinfo.
+    pub default_send_param: [u8; 32],
+    /// SCTP_MAXSEG: maximum fragment size (0 = use the path default).
+    pub maxseg: u32,
+    /// SCTP_DISABLE_FRAGMENTS: reject messages larger than the fragment point.
+    pub disable_fragments: bool,
+    /// SCTP_AUTOCLOSE: idle seconds after which a 1-to-many association closes
+    /// automatically (0 = disabled).
+    pub autoclose: u32,
+}
+
+impl SctpLevelOptions {
+    /// Subscribed to SCTP_ASSOC_CHANGE notifications (sctp_association_event).
+    pub fn event_assoc_change(&self) -> bool {
+        self.events_subscribe[1] != 0
+    }
+
+    /// Subscribed to SCTP_SHUTDOWN_EVENT notifications (sctp_shutdown_event).
+    pub fn event_shutdown(&self) -> bool {
+        self.events_subscribe[5] != 0
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SocketOptionSet {
     pub socket: SocketLevelOptions,
     pub ip: IpLevelOptions,
     pub tcp: TcpLevelOptions,
+    pub sctp: SctpLevelOptions,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -558,6 +651,7 @@ pub struct SocketLevelOptions {
     pub send_buf_size: usize,
     pub recv_timeout: Option<Duration>,
     pub send_timeout: Option<Duration>,
+    pub bind_to_device_ifindex: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -565,9 +659,24 @@ pub struct IpLevelOptions {
     pub tos: u8,
     pub ttl: u8,
     pub multicast_ttl: u8,
+    pub multicast_loop: bool,
+    pub ipv4_multicast_if: Ipv4Address,
     pub recv_err: bool,
     pub hdr_incl: bool,
     pub ipv6_v6only: bool,
+    pub ipv6_unicast_hops: u8,
+    pub ipv6_checksum: i32,
+    pub ipv6_recv_pktinfo: bool,
+    pub ipv6_recv_hoplimit: bool,
+    pub ipv6_recv_rthdr: bool,
+    pub ipv6_recv_hopopts: bool,
+    pub ipv6_recv_dstopts: bool,
+    pub ipv6_recv_tclass: bool,
+    pub ipv6_2292_pktinfo: bool,
+    pub ipv6_2292_hoplimit: bool,
+    pub ipv6_2292_rthdr: bool,
+    pub ipv6_2292_hopopts: bool,
+    pub ipv6_2292_dstopts: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -616,14 +725,30 @@ impl SocketOptionSet {
                 send_buf_size: 65_536,
                 recv_timeout: None,
                 send_timeout: None,
+                bind_to_device_ifindex: None,
             },
             ip: IpLevelOptions {
                 tos: 0,
                 ttl: 64,
                 multicast_ttl: 1,
+                multicast_loop: true,
+                ipv4_multicast_if: Ipv4Address::UNSPECIFIED,
                 recv_err: false,
                 hdr_incl: false,
                 ipv6_v6only: false,
+                ipv6_unicast_hops: 64,
+                ipv6_checksum: -1,
+                ipv6_recv_pktinfo: false,
+                ipv6_recv_hoplimit: false,
+                ipv6_recv_rthdr: false,
+                ipv6_recv_hopopts: false,
+                ipv6_recv_dstopts: false,
+                ipv6_recv_tclass: false,
+                ipv6_2292_pktinfo: false,
+                ipv6_2292_hoplimit: false,
+                ipv6_2292_rthdr: false,
+                ipv6_2292_hopopts: false,
+                ipv6_2292_dstopts: false,
             },
             tcp: TcpLevelOptions {
                 nodelay: false,
@@ -634,6 +759,30 @@ impl SocketOptionSet {
                 cork: false,
                 window_clamp: 0,
                 tls_ulp: None,
+            },
+            sctp: SctpLevelOptions {
+                rto_initial: 3000,
+                rto_max: 60000,
+                rto_min: 1000,
+                initmsg_num_ostreams: 10,
+                initmsg_max_instreams: 65535,
+                initmsg_max_attempts: 8,
+                initmsg_max_init_timeo: 0,
+                assoc_asocmaxrxt: 10,
+                assoc_number_peer_destinations: 0,
+                assoc_peer_rwnd: 0,
+                assoc_local_rwnd: 0,
+                assoc_cookie_life: 60000,
+                events_subscribe: [0u8; 16],
+                paddr_hbinterval: 0,
+                paddr_pathmaxrxt: 5,
+                paddr_pathmtu: 0,
+                paddr_sackdelay: 0,
+                paddr_flags: 0,
+                default_send_param: [0u8; 32],
+                maxseg: 0,
+                disable_fragments: false,
+                autoclose: 0,
             },
         }
     }
@@ -652,14 +801,30 @@ impl SocketOptionSet {
                 send_buf_size: 262_144,
                 recv_timeout: None,
                 send_timeout: None,
+                bind_to_device_ifindex: None,
             },
             ip: IpLevelOptions {
                 tos: 0,
                 ttl: 64,
                 multicast_ttl: 1,
+                multicast_loop: true,
+                ipv4_multicast_if: Ipv4Address::UNSPECIFIED,
                 recv_err: false,
                 hdr_incl: false,
                 ipv6_v6only: false,
+                ipv6_unicast_hops: 64,
+                ipv6_checksum: -1,
+                ipv6_recv_pktinfo: false,
+                ipv6_recv_hoplimit: false,
+                ipv6_recv_rthdr: false,
+                ipv6_recv_hopopts: false,
+                ipv6_recv_dstopts: false,
+                ipv6_recv_tclass: false,
+                ipv6_2292_pktinfo: false,
+                ipv6_2292_hoplimit: false,
+                ipv6_2292_rthdr: false,
+                ipv6_2292_hopopts: false,
+                ipv6_2292_dstopts: false,
             },
             tcp: TcpLevelOptions {
                 nodelay: false,
@@ -670,6 +835,30 @@ impl SocketOptionSet {
                 cork: false,
                 window_clamp: 0,
                 tls_ulp: None,
+            },
+            sctp: SctpLevelOptions {
+                rto_initial: 3000,
+                rto_max: 60000,
+                rto_min: 1000,
+                initmsg_num_ostreams: 10,
+                initmsg_max_instreams: 65535,
+                initmsg_max_attempts: 8,
+                initmsg_max_init_timeo: 0,
+                assoc_asocmaxrxt: 10,
+                assoc_number_peer_destinations: 0,
+                assoc_peer_rwnd: 0,
+                assoc_local_rwnd: 0,
+                assoc_cookie_life: 60000,
+                events_subscribe: [0u8; 16],
+                paddr_hbinterval: 0,
+                paddr_pathmaxrxt: 5,
+                paddr_pathmtu: 0,
+                paddr_sackdelay: 0,
+                paddr_flags: 0,
+                default_send_param: [0u8; 32],
+                maxseg: 0,
+                disable_fragments: false,
+                autoclose: 0,
             },
         }
     }
@@ -682,6 +871,7 @@ impl SocketOptionSet {
             | SocketKind::RdsSeqPacket
             | SocketKind::RawIcmp
             | SocketKind::NetlinkRoute
+            | SocketKind::NetlinkXfrm
             | SocketKind::NetlinkNetfilter
             | SocketKind::Packet => Self::default_udp(),
         };
@@ -691,6 +881,7 @@ impl SocketOptionSet {
             SocketKind::RdsSeqPacket => SocketType::SeqPacket,
             SocketKind::RawIcmp
             | SocketKind::NetlinkRoute
+            | SocketKind::NetlinkXfrm
             | SocketKind::NetlinkNetfilter
             | SocketKind::Packet => SocketType::Raw,
         };
@@ -798,14 +989,25 @@ pub enum RdsState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RawIcmpState {
     pub bound_local: Option<Ipv4Address>,
+    pub bound_local6: Option<Ipv6Address>,
     pub protocol: ProtocolNumber,
+    pub icmp6_filter: [u32; 8],
 }
 
 impl RawIcmpState {
     pub const fn new(protocol: ProtocolNumber) -> Self {
         Self {
             bound_local: None,
+            bound_local6: None,
             protocol,
+            icmp6_filter: [0; 8],
+        }
+    }
+
+    pub fn accepts_ipv4_reply_to(&self, dst: Ipv4Address) -> bool {
+        match self.bound_local {
+            None => true,
+            Some(local) => local == Ipv4Address::UNSPECIFIED || local == dst,
         }
     }
 }

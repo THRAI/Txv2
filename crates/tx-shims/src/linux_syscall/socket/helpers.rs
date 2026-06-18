@@ -33,11 +33,7 @@ pub(super) fn maybe_autobind_connect_client(
     }
 
     let remote_endpoint = remote.as_ip_endpoint();
-    let local_endpoint_base = if remote_endpoint.is_loopback() || remote_endpoint.is_unspecified() {
-        IpEndpoint::loopback_for_family(remote_endpoint.family, 0)
-    } else {
-        IpEndpoint::unspecified_for_family(remote_endpoint.family, 0)
-    };
+    let local_endpoint_base = connect_autobind_local_base(socket, remote_endpoint);
 
     for port in EPHEMERAL_PORT_START..EPHEMERAL_PORT_END {
         let local_endpoint = IpEndpoint::from_ip(local_endpoint_base.ip_addr(), port);
@@ -63,6 +59,55 @@ pub(super) fn maybe_autobind_connect_client(
         }
     }
     Err(Errno::EADDRINUSE)
+}
+
+fn connect_autobind_local_base(
+    socket: &Cap<SocketIdentity>,
+    remote_endpoint: IpEndpoint,
+) -> IpEndpoint {
+    if remote_endpoint.is_loopback() || remote_endpoint.is_unspecified() {
+        return IpEndpoint::loopback_for_family(remote_endpoint.family, 0);
+    }
+    if !matches!(socket.kind, SocketKind::Tcp | SocketKind::Sctp) {
+        return IpEndpoint::unspecified_for_family(remote_endpoint.family, 0);
+    }
+    let Some(payload) = socket.acquire_operational() else {
+        return IpEndpoint::unspecified_for_family(remote_endpoint.family, 0);
+    };
+    match remote_endpoint.ip_addr() {
+        tx_subsystems::net::structure::IpAddress::V4(dst) => payload
+            .net_namespace()
+            .best_ipv4_route(dst)
+            .and_then(|route| {
+                route.preferred_src.or_else(|| {
+                    payload
+                        .net_namespace()
+                        .link_snapshot()
+                        .into_iter()
+                        .find(|link| {
+                            link.name == route.oif_name
+                                && link.is_up
+                                && !link.is_loopback
+                                && link.ipv4_addr.is_some()
+                        })
+                        .and_then(|link| link.ipv4_addr)
+                })
+            })
+            .map_or_else(
+                || IpEndpoint::unspecified_for_family(remote_endpoint.family, 0),
+                |src| IpEndpoint::new(src, 0),
+            ),
+        tx_subsystems::net::structure::IpAddress::V6(_) => payload
+            .net_namespace()
+            .link_snapshot()
+            .into_iter()
+            .find(|link| link.is_up && !link.is_loopback && link.ipv6_addr.is_some())
+            .and_then(|link| link.ipv6_addr)
+            .map_or_else(
+                || IpEndpoint::unspecified_for_family(remote_endpoint.family, 0),
+                |src| IpEndpoint::new_v6(src, 0),
+            ),
+    }
 }
 
 pub(super) fn tcp_connect_tuple_in_use(
@@ -331,7 +376,13 @@ pub(super) fn recv_ready_mask(mask: PollMask) -> bool {
 }
 
 pub(super) fn recv_staging_len(socket: &Cap<SocketIdentity>, requested: usize) -> usize {
-    let capped = requested.min(TTY_WRITE_MAX_INLINE);
+    // Socket recv stages onto the heap, so cap at the socket I/O size
+    // (`SOCKET_IO_MAX_INLINE`, 64 KiB) rather than the TTY 4 KiB inline limit.
+    // The rebase that dropped the socket I/O lane left this at 4 KiB, which
+    // throttled a streaming TCP receiver to ~4 KiB/syscall (iperf3's server did
+    // ~320 recvs for one 1.25 MB test → ~0.86 Mbit/s under TCG). Still
+    // `min(requested, queued)`-bounded, so small reads stay small.
+    let capped = requested.min(SOCKET_IO_MAX_INLINE);
     let ready = recv_queued_len(socket);
     if ready == 0 {
         capped
@@ -434,6 +485,9 @@ pub(crate) fn socket_identity_from_file(
             _ if open_file_is_path_only(file) => Err(Errno::EBADF),
             _ => Err(Errno::ENOTSOCK),
         },
+        // An `open_tree(2)` fd is path-only (like `O_PATH`), so a socket syscall
+        // on it returns EBADF; `fsopen`/`fspick` mount-API fds are readable, so
+        // they fall through to ENOTSOCK. Matches `accept03`'s expectations.
         OpenFileBacking::MountApi { file }
             if file.kind() == tx_subsystems::mount::MountApiFileKind::OpenTree =>
         {
@@ -530,6 +584,32 @@ pub(super) fn read_sockaddr_in<'a>(
     }
 }
 
+/// Derive the cwd-absolute bind/connect key for an `AF_UNIX` pathname socket.
+/// Used by `unlink(2)` (fs_mut) to match the bound key for relative pathname
+/// sockets. Restored alongside the net subsystem re-home.
+pub(crate) fn unix_pathname_key(
+    ctx: &SyscallCtx<'_>,
+    raw_path: &[u8],
+) -> Result<UnixSocketPath, Errno> {
+    match raw_path.first() {
+        Some(&0) | Some(&b'/') | None => UnixSocketPath::new(raw_path),
+        Some(_) => {
+            if let Some(cwd) = ctx.process.cwd() {
+                if let Some(mut abs) = tx_subsystems::vfs::render_dentry_path(&cwd) {
+                    if abs.last() != Some(&b'/') {
+                        abs.push(b'/');
+                    }
+                    abs.extend_from_slice(raw_path);
+                    if let Ok(path) = UnixSocketPath::new(&abs) {
+                        return Ok(path);
+                    }
+                }
+            }
+            UnixSocketPath::new(raw_path)
+        }
+    }
+}
+
 pub(super) fn read_sockaddr_un_path<'a>(
     ctx: &SyscallCtx<'a>,
     sockaddr_ptr: u64,
@@ -565,46 +645,7 @@ pub(super) fn read_sockaddr_un_path<'a>(
     if path_len == 0 {
         return Err(Errno::EINVAL);
     }
-    unix_pathname_key(ctx, &raw_path[..path_len])
-}
-
-/// Resolve a pathname AF_UNIX address to a cwd-absolute key.
-///
-/// AF_UNIX pathname bindings live in one global per-netns table keyed by the
-/// raw `sun_path`. LTP tests (e.g. `bind03`) bind a fixed relative name like
-/// `socket.1` after chdir-ing into a fresh per-run temp dir; the musl and
-/// glibc runs use different temp dirs but the same relative name, so a raw key
-/// collides across runs (musl's leftover node makes glibc's bind EADDRINUSE).
-/// Linux keys on the resolved inode, which is naturally per-directory; we
-/// approximate that by prefixing the process cwd so the same relative name in
-/// different directories yields distinct keys.
-///
-/// Abstract (leading NUL) and already-absolute paths are used verbatim. Bind,
-/// connect, sendto (all via `read_sockaddr_un_path`) and unlink
-/// (`try_unlink_unix_socket_path`) must all route through this so their keys
-/// agree. Falls back to the raw path if the cwd cannot be rendered or the
-/// absolute form would exceed `UNIX_SOCKET_PATH_MAX`.
-pub(crate) fn unix_pathname_key(
-    ctx: &SyscallCtx<'_>,
-    raw_path: &[u8],
-) -> Result<UnixSocketPath, Errno> {
-    match raw_path.first() {
-        Some(&0) | Some(&b'/') | None => UnixSocketPath::new(raw_path),
-        Some(_) => {
-            if let Some(cwd) = ctx.process.cwd() {
-                if let Some(mut abs) = tx_subsystems::vfs::render_dentry_path(&cwd) {
-                    if abs.last() != Some(&b'/') {
-                        abs.push(b'/');
-                    }
-                    abs.extend_from_slice(raw_path);
-                    if let Ok(path) = UnixSocketPath::new(&abs) {
-                        return Ok(path);
-                    }
-                }
-            }
-            UnixSocketPath::new(raw_path)
-        }
-    }
+    UnixSocketPath::new(&raw_path[..path_len])
 }
 
 pub(super) fn unix_pathname_bind_precheck<'a>(
@@ -665,7 +706,14 @@ pub(super) fn read_sockaddr_ll<'a>(
     }
     let protocol = u16::from_be_bytes([bytes[2], bytes[3]]);
     let ifindex = i32::from_le_bytes(bytes[4..8].try_into().unwrap());
-    Ok(SockAddrLl::new(protocol, ifindex))
+    let hatype = u16::from_le_bytes(bytes[8..10].try_into().unwrap());
+    let pkttype = bytes[10];
+    let halen = bytes[11];
+    let mut addr = [0u8; 8];
+    addr.copy_from_slice(&bytes[12..20]);
+    Ok(SockAddrLl::with_link_layer_addr(
+        protocol, ifindex, hatype, pkttype, addr, halen,
+    ))
 }
 
 pub(super) fn read_msghdr<'a>(ctx: &SyscallCtx<'a>, msghdr_ptr: u64) -> Result<UserMsghdr, Errno> {
@@ -952,6 +1000,31 @@ pub(super) fn write_sockaddr_nl_into_msghdr<'a>(
     bootstrap_copy_to_user(&ctx.aspace, header.name, &bytes)
 }
 
+pub(super) fn write_sockaddr_ll_into_msghdr<'a>(
+    ctx: &SyscallCtx<'a>,
+    msghdr_ptr: u64,
+    header: UserMsghdr,
+    sockaddr: SockAddrLl,
+) -> Result<(), Errno> {
+    if header.name == 0 {
+        return Ok(());
+    }
+    write_msghdr_namelen(ctx, msghdr_ptr, SOCKADDR_LL_BYTES)?;
+    if header.namelen < SOCKADDR_LL_BYTES {
+        return Err(Errno::EINVAL);
+    }
+
+    let mut bytes = [0u8; SOCKADDR_LL_BYTES as usize];
+    bytes[0..2].copy_from_slice(&AF_PACKET.to_le_bytes());
+    bytes[2..4].copy_from_slice(&sockaddr.protocol.to_be_bytes());
+    bytes[4..8].copy_from_slice(&sockaddr.ifindex.to_le_bytes());
+    bytes[8..10].copy_from_slice(&sockaddr.hatype.to_le_bytes());
+    bytes[10] = sockaddr.pkttype;
+    bytes[11] = sockaddr.halen;
+    bytes[12..20].copy_from_slice(&sockaddr.addr);
+    bootstrap_copy_to_user(&ctx.aspace, header.name, &bytes)
+}
+
 pub(super) fn write_sockaddr_un_into_msghdr<'a>(
     ctx: &SyscallCtx<'a>,
     msghdr_ptr: u64,
@@ -1022,6 +1095,10 @@ pub(super) fn write_sockaddr_ll<'a>(
     bytes[0..2].copy_from_slice(&AF_PACKET.to_le_bytes());
     bytes[2..4].copy_from_slice(&sockaddr.protocol.to_be_bytes());
     bytes[4..8].copy_from_slice(&sockaddr.ifindex.to_le_bytes());
+    bytes[8..10].copy_from_slice(&sockaddr.hatype.to_le_bytes());
+    bytes[10] = sockaddr.pkttype;
+    bytes[11] = sockaddr.halen;
+    bytes[12..20].copy_from_slice(&sockaddr.addr);
     bootstrap_copy_to_user(&ctx.aspace, sockaddr_ptr, &bytes)
 }
 
@@ -1099,16 +1176,15 @@ pub(super) fn write_sockaddr_endpoint<'a>(
     if invalid_socklen(len) {
         return Err(Errno::EINVAL);
     }
-    if len < out_len {
-        return Err(Errno::EINVAL);
-    }
 
     if endpoint.family == AddressFamily::Inet6 {
         let bytes = sockaddr_in6_bytes(endpoint);
-        bootstrap_copy_to_user(&ctx.aspace, sockaddr_ptr, &bytes)
+        let copy_len = core::cmp::min(len, out_len) as usize;
+        bootstrap_copy_to_user(&ctx.aspace, sockaddr_ptr, &bytes[..copy_len])
     } else {
         let bytes = sockaddr_in_bytes(endpoint);
-        bootstrap_copy_to_user(&ctx.aspace, sockaddr_ptr, &bytes)
+        let copy_len = core::cmp::min(len, out_len) as usize;
+        bootstrap_copy_to_user(&ctx.aspace, sockaddr_ptr, &bytes[..copy_len])
     }
 }
 
@@ -1142,6 +1218,9 @@ pub(super) fn socket_local_endpoint(socket: &Cap<SocketIdentity>) -> Result<IpEn
         | SocketProtocol::Rds(tx_subsystems::net::RdsState::Bound { local })
         | SocketProtocol::Udp(UdpInner::Bound { local })
         | SocketProtocol::Udp(UdpInner::Connected { local, .. }) => Ok(local),
+        SocketProtocol::RawIcmp(state) if payload.family() == AddressFamily::Inet6 => Ok(
+            IpEndpoint::new_v6(state.bound_local6.unwrap_or(Ipv6Address::UNSPECIFIED), 0),
+        ),
         SocketProtocol::RawIcmp(state) => Ok(IpEndpoint::new(
             state.bound_local.unwrap_or(Ipv4Address::UNSPECIFIED),
             0,
@@ -1230,6 +1309,27 @@ pub(super) fn socket_is_tcp_connecting(socket: &Cap<SocketIdentity>) -> bool {
     })
 }
 
+/// True when a recv with no buffered data on this SCTP socket must report
+/// ENOTCONN instead of blocking: the association is not established (never
+/// connected, or locally shut down via SHUT_WR). Mirrors the step_recv check;
+/// needed because recvfrom()/recv() block in a poll-wait loop before reaching
+/// the recv step.
+pub(super) fn sctp_recv_disconnected(socket: &Cap<SocketIdentity>) -> bool {
+    let Some(payload) = socket.acquire_operational() else {
+        return true;
+    };
+    let seqpacket = payload.with_options(|o| o.socket.sock_type == SocketType::SeqPacket);
+    match payload.protocol_snapshot() {
+        SocketProtocol::Sctp(TcpState::Connected { .. }) => payload.shutdown_wr(),
+        // 1-to-many: listening or associated can still receive (block); neither
+        // listening nor associated reports ENOTCONN.
+        SocketProtocol::Sctp(TcpState::Listening { .. }) if seqpacket => false,
+        SocketProtocol::Sctp(_) if seqpacket => payload.sctp_assoc_count() == 0,
+        SocketProtocol::Sctp(_) => true,
+        _ => false,
+    }
+}
+
 pub(super) fn validate_recvfrom_addrlen<'a>(
     ctx: &SyscallCtx<'a>,
     sockaddr_len_ptr: u64,
@@ -1277,6 +1377,27 @@ pub(super) fn read_sockopt_i32<'a>(
         return Err(Errno::EINVAL);
     }
     bootstrap_read_user(&ctx.aspace, optval)
+}
+
+/// Read an `int`-or-`unsigned char` socket option value. `IP_MULTICAST_TTL` and
+/// `IP_MULTICAST_LOOP` accept either a 4-byte `int` or a 1-byte `char`; Linux
+/// reads a `char` when `optlen < sizeof(int)`.
+pub(super) fn read_sockopt_byte_or_i32<'a>(
+    ctx: &SyscallCtx<'a>,
+    optval: u64,
+    optlen: u32,
+) -> Result<i32, Errno> {
+    if optval == 0 {
+        return Err(Errno::EFAULT);
+    }
+    if optlen >= core::mem::size_of::<i32>() as u32 {
+        bootstrap_read_user(&ctx.aspace, optval)
+    } else if optlen >= 1 {
+        let byte: u8 = bootstrap_read_user(&ctx.aspace, optval)?;
+        Ok(byte as i32)
+    } else {
+        Err(Errno::EINVAL)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1353,6 +1474,33 @@ pub(super) fn read_sockopt_ipv4_mcast_group_req<'a>(
         return Err(Errno::EINVAL);
     }
     Ok(Ipv4MulticastGroup::new(interface, group))
+}
+
+/// `struct ip_mreq { struct in_addr imr_multiaddr; struct in_addr
+/// imr_interface; }` for the classic `IP_ADD_MEMBERSHIP` /
+/// `IP_DROP_MEMBERSHIP`. The interface here is an IPv4 address (0 =
+/// any), not an ifindex; we key membership by group only, so just
+/// validate the group is multicast.
+pub(super) fn read_sockopt_ipv4_ip_mreq<'a>(
+    ctx: &SyscallCtx<'a>,
+    optval: u64,
+    optlen: u32,
+) -> Result<Ipv4MulticastGroup, Errno> {
+    if optval == 0 {
+        return Err(Errno::EFAULT);
+    }
+    // Linux accepts ip_mreq (8) or ip_mreqn (12); only the first 8 bytes
+    // (multiaddr + interface addr) matter for membership keying.
+    if optlen < 8 {
+        return Err(Errno::EINVAL);
+    }
+    let mut bytes = [0u8; 8];
+    bootstrap_copy_from_user(&ctx.aspace, &mut bytes, optval)?;
+    let group = Ipv4Address::new([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    if !group.is_multicast() {
+        return Err(Errno::EINVAL);
+    }
+    Ok(Ipv4MulticastGroup::new(0, group))
 }
 
 pub(super) fn read_sockopt_linger<'a>(
@@ -1537,7 +1685,10 @@ pub(super) fn socket_type_i32(socket: &Cap<SocketIdentity>) -> i32 {
         SocketKind::Udp => 2,
         SocketKind::RdsSeqPacket => 5,
         SocketKind::RawIcmp => 3,
-        SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter | SocketKind::Packet => 3,
+        SocketKind::NetlinkRoute
+        | SocketKind::NetlinkXfrm
+        | SocketKind::NetlinkNetfilter
+        | SocketKind::Packet => 3,
     }
 }
 
@@ -1564,123 +1715,52 @@ pub(super) fn wait_on_yield_shape(shape: YieldShape) -> Option<wait_source::Regi
 pub(super) enum SocketWaitWake {
     SocketReady,
     ItimerExpired,
-    /// The thread's signal mailbox fired while parked on the socket wait.
-    /// The caller must check for a deliverable pending signal and return
-    /// EINTR if one is present. Without this, a process blocked in a
-    /// socketpair `recv`/`accept`/`connect` could never be interrupted by a
-    /// catchable signal (e.g. SIGTERM from `kill`), so `kill hackbench` left
-    /// its workers parked forever — they never woke to process the signal,
-    /// never exited, and leaked as `[]` tasks.
-    SignalInterrupted,
-    /// The socket's `SO_RCVTIMEO` receive timeout elapsed before data arrived.
-    /// The caller returns `EAGAIN`/`EWOULDBLOCK`. Without honouring this,
-    /// iperf3's reverse-mode UDP receiver (which arms `SO_RCVTIMEO` and blocks
-    /// in recv, polling the control connection between timeouts) parks forever
-    /// once the server stops sending, never seeing the TEST_END on the control
-    /// socket — a hard deadlock.
-    RecvTimedOut,
-}
-
-/// Park on a socket wait future, but wake (returning `true`) if a signal is
-/// posted to this thread while parked. Used by the blocking `send`/`sendto`
-/// paths, which have no itimer deadline and are not generic over a `TimeIf`
-/// platform, so they cannot use [`wait_on_socket_or_itimer`]. The caller must
-/// confirm a deliverable signal via `select_next_signal` before returning
-/// EINTR. See [`SocketWaitWake::SignalInterrupted`] for why this matters.
-pub(super) async fn wait_on_socket_or_signal(
-    mut socket_future: wait_source::RegisteredWaitFuture,
-    mailbox: Option<&tx_substrate::wake::mailbox::TaskMailbox>,
-) -> bool {
-    core::future::poll_fn(|cx| {
-        if let Some(mailbox) = mailbox {
-            mailbox.register_waker(cx.waker().clone());
-            let mut signalled = false;
-            while let Some(event) = mailbox.poll() {
-                if matches!(
-                    event,
-                    tx_substrate::wake::mailbox::MailboxEvent::SignalDelivered { .. }
-                ) {
-                    signalled = true;
-                }
-            }
-            if signalled {
-                return core::task::Poll::Ready(true);
-            }
-        }
-        if core::future::Future::poll(core::pin::Pin::new(&mut socket_future), cx).is_ready() {
-            return core::task::Poll::Ready(false);
-        }
-        core::task::Poll::Pending
-    })
-    .await
 }
 
 pub(super) async fn wait_on_socket_or_itimer<P: TimeIf>(
     mut socket_future: wait_source::RegisteredWaitFuture,
-    pid: u32,
-    mailbox: Option<&tx_substrate::wake::mailbox::TaskMailbox>,
-    recv_deadline_ns: Option<u64>,
+    ctx: &SyscallCtx<'_>,
 ) -> SocketWaitWake {
+    let pid = ctx.process.pid.0;
+    // Linux never parks a task in a slow syscall while a signal that would be
+    // delivered is already pending — the syscall aborts with EINTR and the AST
+    // checkpoint delivers on return. Without this, a one-shot ITIMER_REAL
+    // consumed at a syscall boundary leaves busybox ping's blocking recvfrom
+    // with no armed deadline AND a pending SIGALRM: it parked until unrelated
+    // traffic woke the socket (observed as a 361s stall in if-updown).
+    if tx_subsystems::signal::pending_signal_interrupts_wait(&ctx.thread, &ctx.process) {
+        return SocketWaitWake::ItimerExpired;
+    }
     if super::time::consume_itimer_real_delivered_interrupt(pid) {
         return SocketWaitWake::ItimerExpired;
     }
-    if let Some(recv_deadline_ns) = recv_deadline_ns {
-        if <P as TimeIf>::read_ns() >= recv_deadline_ns {
-            return SocketWaitWake::RecvTimedOut;
-        }
+    let Some(deadline_ns) = super::time::itimer_real_deadline_ns(pid) else {
+        let _ = socket_future.await;
+        return SocketWaitWake::SocketReady;
+    };
+    if <P as TimeIf>::read_ns() >= deadline_ns {
+        super::time::fire_itimer_real::<P>(pid);
+        return SocketWaitWake::ItimerExpired;
     }
-    let mut recv_timer = recv_deadline_ns.and_then(tx_subsystems::timer_sleep::sleep_until_ns);
-    // The blocked socket future registers its task waker on its OWN private
-    // wait-source mailbox, NOT on the thread's signal mailbox. So a signal
-    // posted via `post_signal` (which fires the thread mailbox) would never
-    // wake a task parked here. Register our waker on the thread mailbox too,
-    // so a signal post wakes us; then on each poll drain the thread mailbox
-    // and, if a `SignalDelivered` event arrived, report it so the caller
-    // returns EINTR. Draining (not peeking) prevents a busy-loop on a stale
-    // event. This mirrors how `drive(..., mailbox)` makes blocked pipe/file IO
-    // interruptible, and is what lets `kill` terminate a process blocked in a
-    // socketpair recv (previously hackbench workers leaked because their
-    // blocked read could not be interrupted).
-    let deadline_ns = super::time::itimer_real_deadline_ns(pid);
-    if let Some(deadline_ns) = deadline_ns {
-        if <P as TimeIf>::read_ns() >= deadline_ns {
-            return SocketWaitWake::ItimerExpired;
-        }
-    }
-    let mut timer_future = deadline_ns.and_then(tx_subsystems::timer_sleep::sleep_until_ns);
+    let Some(mut timer_future) = tx_subsystems::timer_sleep::sleep_until_ns(deadline_ns) else {
+        let _ = socket_future.await;
+        return SocketWaitWake::SocketReady;
+    };
 
-    core::future::poll_fn(|cx| {
-        if let Some(mailbox) = mailbox {
-            mailbox.register_waker(cx.waker().clone());
-            let mut signalled = false;
-            while let Some(event) = mailbox.poll() {
-                if matches!(
-                    event,
-                    tx_substrate::wake::mailbox::MailboxEvent::SignalDelivered { .. }
-                ) {
-                    signalled = true;
-                }
-            }
-            if signalled {
-                return core::task::Poll::Ready(SocketWaitWake::SignalInterrupted);
-            }
-        }
+    let wake = core::future::poll_fn(|cx| {
         if core::future::Future::poll(core::pin::Pin::new(&mut socket_future), cx).is_ready() {
             return core::task::Poll::Ready(SocketWaitWake::SocketReady);
         }
-        if let Some(ref mut timer_future) = timer_future {
-            if core::future::Future::poll(core::pin::Pin::new(timer_future), cx).is_ready() {
-                return core::task::Poll::Ready(SocketWaitWake::ItimerExpired);
-            }
-        }
-        if let Some(ref mut recv_timer) = recv_timer {
-            if core::future::Future::poll(core::pin::Pin::new(recv_timer), cx).is_ready() {
-                return core::task::Poll::Ready(SocketWaitWake::RecvTimedOut);
-            }
+        if core::future::Future::poll(core::pin::Pin::new(&mut timer_future), cx).is_ready() {
+            return core::task::Poll::Ready(SocketWaitWake::ItimerExpired);
         }
         core::task::Poll::Pending
     })
-    .await
+    .await;
+    if wake == SocketWaitWake::ItimerExpired {
+        super::time::fire_itimer_real::<P>(pid);
+    }
+    wake
 }
 
 pub(super) fn recv_special_flags_errno(flags: SendRecvFlags) -> Option<i32> {

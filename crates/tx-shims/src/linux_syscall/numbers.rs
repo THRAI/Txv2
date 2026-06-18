@@ -466,16 +466,12 @@ pub const CLONE_SYSVSEM: u64 = 0x40000;
 /// clone path; `CLONE_NEWUSER` and `CLONE_NEWNET` are wired to
 /// `unshare(2)` / `setns(2)`. The others are still silently accepted
 /// by pthread_create compatibility paths and remain namespace stubs.
+pub const CLONE_NEWNS: u64 = 0x20000;
 pub const CLONE_NEWCGROUP: u64 = 0x2000000;
 pub const CLONE_NEWUTS: u64 = 0x4000000;
 pub const CLONE_NEWIPC: u64 = 0x8000000;
 pub const CLONE_NEWUSER: u64 = 0x1000_0000;
 pub const CLONE_NEWNET: u64 = 0x4000_0000;
-
-/// `unshare(flags)`. Linux RV64 generic ABI `__NR_unshare`.
-pub const NR_UNSHARE: u64 = 97;
-/// `setns(fd, nstype)`. Linux RV64 generic ABI `__NR_setns`.
-pub const NR_SETNS: u64 = 268;
 
 /// `getppid()`. Linux generic ABI `__NR_getppid`. Wraps
 /// `ProcessIdentity::parent_pid()`. Returns `0` (`Pid::RESERVED`)
@@ -1110,18 +1106,45 @@ pub const TIOCSWINSZ: u32 = 0x5414;
 /// `TIOCNOTTY = 0x5422` — detach this TTY as the calling session's
 /// controlling terminal.
 pub const TIOCNOTTY: u32 = 0x5422;
+/// `SIOCADDRT = 0x890b` — add an IPv4 route via `struct rtentry` (route(8)).
+pub const SIOCADDRT: u32 = 0x890b;
+/// `SIOCDELRT = 0x890c` — delete an IPv4 route via `struct rtentry`.
+pub const SIOCDELRT: u32 = 0x890c;
+/// `SIOCGIFNAME = 0x8910` — resolve `struct ifreq.ifr_ifindex` to ifname.
+pub const SIOCGIFNAME: u32 = 0x8910;
+/// `SIOCGIFCONF = 0x8912` — enumerate interface `struct ifreq` entries.
+pub const SIOCGIFCONF: u32 = 0x8912;
 /// `SIOCGIFFLAGS = 0x8913` — read `struct ifreq.ifr_flags`.
 pub const SIOCGIFFLAGS: u32 = 0x8913;
 /// `SIOCSIFFLAGS = 0x8914` — write `struct ifreq.ifr_flags`.
 pub const SIOCSIFFLAGS: u32 = 0x8914;
+/// `SIOCGIFADDR = 0x8915` — read the primary IPv4 address (`ifr_addr`).
+pub const SIOCGIFADDR: u32 = 0x8915;
+/// `SIOCSIFADDR = 0x8916` — set the primary IPv4 address (busybox
+/// `ifconfig IFACE ADDR` issues this, then SIOCSIFNETMASK/SIOCSIFBRDADDR).
+pub const SIOCSIFADDR: u32 = 0x8916;
+/// `SIOCGIFBRDADDR = 0x8919` — read the IPv4 broadcast address.
+pub const SIOCGIFBRDADDR: u32 = 0x8919;
+/// `SIOCSIFBRDADDR = 0x891a` — set the IPv4 broadcast address.
+pub const SIOCSIFBRDADDR: u32 = 0x891a;
+/// `SIOCGIFNETMASK = 0x891b` — read the IPv4 netmask.
+pub const SIOCGIFNETMASK: u32 = 0x891b;
+/// `SIOCSIFNETMASK = 0x891c` — set the IPv4 netmask.
+pub const SIOCSIFNETMASK: u32 = 0x891c;
 /// `SIOCGIFMTU = 0x8921` — read `struct ifreq.ifr_mtu`.
 pub const SIOCGIFMTU: u32 = 0x8921;
 /// `SIOCSIFMTU = 0x8922` — write `struct ifreq.ifr_mtu`.
 pub const SIOCSIFMTU: u32 = 0x8922;
+/// `SIOCGIFHWADDR = 0x8927` — read `struct ifreq.ifr_hwaddr`.
+pub const SIOCGIFHWADDR: u32 = 0x8927;
 /// `SIOCGIFINDEX = 0x8933` — resolve `struct ifreq.ifr_name` to ifindex.
 pub const SIOCGIFINDEX: u32 = 0x8933;
 /// `SIOCGIFTXQLEN = 0x8942` — query `struct ifreq.ifr_qlen`.
 pub const SIOCGIFTXQLEN: u32 = 0x8942;
+/// `SIOCDARP = 0x8953` — delete an IPv4 ARP cache entry via `struct arpreq`.
+pub const SIOCDARP: u32 = 0x8953;
+/// `SIOCSARP = 0x8955` — install an IPv4 ARP cache entry via `struct arpreq`.
+pub const SIOCSARP: u32 = 0x8955;
 
 // ---------------------------------------------------------------------
 // Slice 6 of the shell-prompt roadmap — stat family syscalls.
@@ -1516,6 +1539,10 @@ pub const NR_GETRLIMIT: u64 = 163;
 pub const NR_SETRLIMIT: u64 = 164;
 /// `getrusage(who, usage)`. Linux RV64 generic ABI.
 pub const NR_GETRUSAGE: u64 = 165;
+/// `unshare(flags)`. Linux RV64 generic ABI. Wired for CLONE_NEWUSER /
+/// CLONE_NEWNET (network-namespace LTP setup).
+pub const NR_UNSHARE: u64 = 97;
+pub const NR_SETNS: u64 = 268;
 
 /// `close_range(first, last, flags)`. Linux RV64 generic ABI.
 pub const NR_CLOSE_RANGE: u64 = 436;
@@ -2075,3 +2102,106 @@ pub const MEMBARRIER_SUPPORTED_MASK: u64 = MEMBARRIER_CMD_QUERY
     | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED
     | MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE
     | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE;
+
+// ---------------------------------------------------------------------------
+// Socket / network constants
+//
+// Address families, protocols, socket-option levels, IPv6 ancillary option
+// names, multicast group ops, and AF_PACKET ring versions used by the socket
+// syscall layer (`linux_syscall/socket.rs` + `socket/helpers.rs`). Values are
+// the Linux generic-ABI numbers. Re-homed after PR#50 stripped the net
+// syscall surface; SIOCGIF* live with the ioctl block above.
+// ---------------------------------------------------------------------------
+
+
+/// `IPPROTO_ICMPV6` — ICMPv6.
+pub const IPPROTO_ICMPV6: i32 = 58;
+
+/// `SOL_SCTP` — SCTP-level options.
+pub const SOL_SCTP: i32 = 132;
+/// `SOL_RAW` — raw-socket-level options.
+pub const SOL_RAW: i32 = 255;
+
+/// `IPV6_2292PKTINFO` — RFC 2292 packet info.
+pub const IPV6_2292PKTINFO: i32 = 2;
+/// `IPV6_2292HOPOPTS` — RFC 2292 hop-by-hop options.
+pub const IPV6_2292HOPOPTS: i32 = 3;
+/// `IPV6_2292DSTOPTS` — RFC 2292 destination options.
+pub const IPV6_2292DSTOPTS: i32 = 4;
+/// `IPV6_2292RTHDR` — RFC 2292 routing header.
+pub const IPV6_2292RTHDR: i32 = 5;
+/// `IPV6_2292HOPLIMIT` — RFC 2292 hop limit.
+pub const IPV6_2292HOPLIMIT: i32 = 8;
+/// `IPV6_PKTINFO` — sticky/ancillary packet info.
+pub const IPV6_PKTINFO: i32 = 50;
+/// `IPV6_RECVPKTINFO` — receive packet info.
+pub const IPV6_RECVPKTINFO: i32 = 49;
+/// `IPV6_RECVHOPLIMIT` — receive hop limit.
+pub const IPV6_RECVHOPLIMIT: i32 = 51;
+/// `IPV6_HOPLIMIT` — ancillary hop limit.
+pub const IPV6_HOPLIMIT: i32 = 52;
+/// `IPV6_RECVHOPOPTS` — receive hop-by-hop options.
+pub const IPV6_RECVHOPOPTS: i32 = 53;
+/// `IPV6_RECVRTHDR` — receive routing header.
+pub const IPV6_RECVRTHDR: i32 = 56;
+/// `IPV6_RECVDSTOPTS` — receive destination options.
+pub const IPV6_RECVDSTOPTS: i32 = 58;
+/// `IPV6_RECVTCLASS` — receive traffic class.
+pub const IPV6_RECVTCLASS: i32 = 66;
+/// `IPV6_TCLASS` — ancillary/sticky traffic class.
+pub const IPV6_TCLASS: i32 = 67;
+
+
+
+// Socket-option *names* (the `optname` arg to set/getsockopt), grouped by level.
+// CRITICAL: these MUST be defined — the set/getsockopt dispatch matches on
+// `(level, OPTNAME)`; an undefined OPTNAME silently becomes an irrefutable
+// binding pattern, so the first arm in a level group swallows every option
+// (76 unreachable arms). Re-homed after PR#50 stripped them. Values are the
+// Linux generic-ABI numbers.
+
+pub const SO_BINDTODEVICE: i32 = 25;
+
+// IPPROTO_IP options.
+pub const IP_TTL: i32 = 2;
+pub const IP_MULTICAST_IF: i32 = 32;
+pub const IP_MULTICAST_TTL: i32 = 33;
+pub const IP_MULTICAST_LOOP: i32 = 34;
+/// `IP_ADD_MEMBERSHIP` / `IP_DROP_MEMBERSHIP` — classic `struct ip_mreq`
+/// multicast join/leave (what LTP `ns-mcast_join` and most apps use, vs
+/// the protocol-independent `MCAST_JOIN_GROUP`).
+pub const IP_ADD_MEMBERSHIP: i32 = 35;
+pub const IP_DROP_MEMBERSHIP: i32 = 36;
+pub const ICMP6_FILTER: i32 = 1;
+
+
+// IPPROTO_SCTP options.
+pub const SCTP_RTOINFO: i32 = 0;
+pub const SCTP_ASSOCINFO: i32 = 1;
+pub const SCTP_INITMSG: i32 = 2;
+pub const SCTP_AUTOCLOSE: i32 = 4;
+pub const SCTP_PRIMARY_ADDR: i32 = 6;
+pub const SCTP_DISABLE_FRAGMENTS: i32 = 8;
+pub const SCTP_PEER_ADDR_PARAMS: i32 = 9;
+pub const SCTP_DEFAULT_SEND_PARAM: i32 = 10;
+pub const SCTP_EVENTS: i32 = 11;
+pub const SCTP_MAXSEG: i32 = 13;
+pub const SCTP_STATUS: i32 = 14;
+pub const SCTP_GET_PEER_ADDR_INFO: i32 = 15;
+pub const SCTP_DELAYED_ACK_TIME: i32 = 16;
+pub const SCTP_SOCKOPT_BINDX_ADD: i32 = 100;
+pub const SCTP_SOCKOPT_BINDX_REM: i32 = 101;
+pub const SCTP_SOCKOPT_PEELOFF: i32 = 102;
+pub const SCTP_SOCKOPT_CONNECTX_OLD: i32 = 107;
+pub const SCTP_GET_PEER_ADDRS: i32 = 108;
+pub const SCTP_GET_LOCAL_ADDRS: i32 = 109;
+pub const SCTP_SOCKOPT_CONNECTX: i32 = 110;
+pub const SCTP_SOCKOPT_CONNECTX3: i32 = 111;
+
+
+
+
+
+
+pub const IPV6_CHECKSUM: i32 = 7;
+pub const IPV6_UNICAST_HOPS: i32 = 16;

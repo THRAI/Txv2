@@ -5,7 +5,9 @@
 
 use super::*;
 use crate::adapter::step_engine::{self as step_engine, SpinMutex};
-use crate::linux_syscall::numbers::{CLONE_NEWIPC, CLONE_NEWNET, CLONE_NEWUSER, NR_CLONE};
+use crate::linux_syscall::numbers::{
+    CLONE_NEWIPC, CLONE_NEWNET, CLONE_NEWNS, CLONE_NEWUSER, NR_CLONE,
+};
 use alloc::collections::BTreeMap;
 
 /// Linux raw `wait4`/`getrusage` rusage image for musl LP64:
@@ -429,33 +431,58 @@ pub(super) fn sys_setns(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult {
     if fd < 0 {
         return SyscallResult::Error(EBADF_VALUE);
     }
-    if nstype != 0 && nstype != CLONE_NEWNET {
+    if nstype != 0 && nstype != CLONE_NEWNET && nstype != CLONE_NEWNS {
         return SyscallResult::Error(EINVAL_VALUE);
     }
 
     let Some(file) = resolve_fd(&ctx.process, fd as u32) else {
         return SyscallResult::Error(EBADF_VALUE);
     };
-    let Some(payload) = tx_subsystems::net::net_namespace_payload_from_file(&file) else {
-        return SyscallResult::Error(EINVAL_VALUE);
-    };
     let Some(current) = ctx.process.nsproxy_cap() else {
         return SyscallResult::Error(ESRCH_VALUE);
     };
-    let authorized = payload.owner_user_namespace().is_some_and(|owner| {
-        tx_subsystems::process::nsproxy::has_capability_in_user_namespace(
-            ctx.cred(),
-            &current.user_ns,
-            &owner,
-            Capability::SYS_ADMIN,
-        )
-    });
-    if !authorized {
-        return SyscallResult::Error(EPERM_VALUE);
+
+    if nstype == 0 || nstype == CLONE_NEWNET {
+        if let Some(payload) = tx_subsystems::net::net_namespace_payload_from_file(&file) {
+            let authorized = payload.owner_user_namespace().is_some_and(|owner| {
+                tx_subsystems::process::nsproxy::has_capability_in_user_namespace(
+                    ctx.cred(),
+                    &current.user_ns,
+                    &owner,
+                    Capability::SYS_ADMIN,
+                )
+            });
+            if !authorized {
+                return SyscallResult::Error(EPERM_VALUE);
+            }
+            let _old = ctx.process.replace_net_namespace(payload);
+            return SyscallResult::Return(0);
+        }
     }
 
-    let _old = ctx.process.replace_net_namespace(payload);
-    SyscallResult::Return(0)
+    if nstype == 0 || nstype == CLONE_NEWNS {
+        if let Some(payload) = tx_subsystems::mount::mount_namespace_cap_from_file(&file) {
+            if !tx_subsystems::process::nsproxy::has_capability_in_user_namespace(
+                ctx.cred(),
+                &current.user_ns,
+                &current.user_ns,
+                Capability::SYS_ADMIN,
+            ) {
+                return SyscallResult::Error(EPERM_VALUE);
+            }
+            let replacement =
+                match tx_subsystems::process::nsproxy::clone_nsproxy_with_mount_namespace(
+                    &current, payload,
+                ) {
+                    Ok(replacement) => replacement,
+                    Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
+                };
+            let _old = ctx.process.replace_nsproxy(replacement);
+            return SyscallResult::Return(0);
+        }
+    }
+
+    SyscallResult::Error(EINVAL_VALUE)
 }
 
 /// `execve(path, argv, envp)` — Wave 4 / Phase 6 of the ELF-loader
@@ -686,6 +713,8 @@ pub(super) fn sys_clone_oneshot<P: PmapIf>(
     let clone_child_settid = (flags & CLONE_CHILD_SETTID) != 0;
     let clone_parent_settid = (flags & CLONE_PARENT_SETTID) != 0;
     let clone_newipc = (flags & CLONE_NEWIPC) != 0;
+    let clone_newnet = (flags & CLONE_NEWNET) != 0;
+    let clone_newns = (flags & CLONE_NEWNS) != 0;
 
     let allowed_mask = if clone_thread {
         // CLONE_THREAD requires CLONE_SIGHAND per Linux semantics.
@@ -718,6 +747,8 @@ pub(super) fn sys_clone_oneshot<P: PmapIf>(
             | CLONE_FILES
             | CLONE_FS
             | CLONE_NEWIPC
+            | CLONE_NEWNET
+            | CLONE_NEWNS
             | CLONE_CHILD_CLEARTID
             | CLONE_CHILD_SETTID
             | CLONE_PARENT_SETTID
@@ -873,6 +904,8 @@ pub(super) fn sys_clone_oneshot<P: PmapIf>(
             clone_vm,
             clone_sighand,
             clone_newipc,
+            clone_newnet,
+            clone_newns,
             _pmap: core::marker::PhantomData,
         };
         match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
@@ -979,6 +1012,11 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
     let clone_child_settid = (flags & CLONE_CHILD_SETTID) != 0;
     let clone_parent_settid = (flags & CLONE_PARENT_SETTID) != 0;
     let clone_newipc = (flags & CLONE_NEWIPC) != 0;
+    // CLONE_NEWNET gives the child a fresh isolated network namespace;
+    // CLONE_NEWNS is accepted (mount-ns isolation deferred). LTP's
+    // `tst_ns_create net,mnt` (the shell net command harness) clones with both.
+    let clone_newnet = (flags & CLONE_NEWNET) != 0;
+    let clone_newns = (flags & CLONE_NEWNS) != 0;
 
     let allowed_mask = SIGCHLD
         | CLONE_SETTLS
@@ -988,6 +1026,8 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
         | CLONE_FILES
         | CLONE_FS
         | CLONE_NEWIPC
+        | CLONE_NEWNET
+        | CLONE_NEWNS
         | CLONE_CHILD_CLEARTID
         | CLONE_CHILD_SETTID
         | CLONE_PARENT_SETTID;
@@ -1021,6 +1061,8 @@ pub(super) async fn sys_clone<'a, P: PmapIf>(
             clone_vm,
             clone_sighand,
             clone_newipc,
+            clone_newnet,
+            clone_newns,
             _pmap: core::marker::PhantomData,
         };
         match step_engine::drive_oneshot(&mut op, &mut script_ctx) {

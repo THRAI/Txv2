@@ -122,6 +122,31 @@ unsafe impl<T: Send + Sync> Send for Cap<T> {}
 unsafe impl<T: Send + Sync> Sync for Cap<T> {}
 
 impl<T: 'static> Cap<T> {
+    /// Clone this cap iff its slot is still `Live`, atomically bumping the
+    /// retain count. Returns `None` if the object has been retired.
+    /// Restored after PR#50 stripped it; used by the net subsystem's
+    /// connection/socket tables.
+    pub fn try_clone_live(&self) -> Option<Self> {
+        let slot = self.slot()?;
+        let meta = unsafe { slot.as_ref().meta() };
+        loop {
+            let cur = meta.load(Ordering::Acquire);
+            if cur.state() != SlotState::Live {
+                return None;
+            }
+            let new = cur.inc_retain().ok()?;
+            match meta.compare_exchange(cur, new, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => {
+                    return Some(Self {
+                        raw: self.raw,
+                        _marker: PhantomData,
+                    });
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+
     pub(crate) fn try_retire_slot(slot: NonNull<Slot<T>>) {
         let meta = unsafe { slot.as_ref().meta() };
         loop {
@@ -243,27 +268,6 @@ impl<T: 'static> Cap<T> {
         unsafe { slot.as_ref().meta().load(Ordering::Acquire).retain() }
     }
 
-    pub fn try_clone_live(&self) -> Option<Self> {
-        let slot = self.slot()?;
-        let meta = unsafe { slot.as_ref().meta() };
-        loop {
-            let cur = meta.load(Ordering::Acquire);
-            if cur.state() != SlotState::Live {
-                return None;
-            }
-            let new = cur.inc_retain().ok()?;
-            match meta.compare_exchange(cur, new, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => {
-                    return Some(Self {
-                        raw: self.raw,
-                        _marker: PhantomData,
-                    });
-                }
-                Err(_) => continue,
-            }
-        }
-    }
-
     fn try_retire(slot: NonNull<Slot<T>>) {
         Self::try_retire_slot(slot);
     }
@@ -381,6 +385,13 @@ impl<T: 'static> PayloadCap<T> {
     /// Packed trace object id.  Delegates to [`Cap::trace_id`].
     pub fn trace_id(&self) -> u64 {
         self.inner.trace_id()
+    }
+
+    /// Live retain (strong) count of the backing slot.  Delegates to
+    /// [`Cap::retain_count`].  A value of `1` means this is the sole remaining
+    /// strong reference; dropping it retires the slot.
+    pub fn retain_count(&self) -> u32 {
+        self.inner.retain_count()
     }
 }
 

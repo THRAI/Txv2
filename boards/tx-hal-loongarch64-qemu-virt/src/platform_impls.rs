@@ -183,10 +183,11 @@ impl PmapIf for Platform {
     }
 
     fn extend_direct_map(phys_end: PhysAddr) -> Result<(), PmapError> {
-        // The cached DMW already maps all physical addresses it can reach with
-        // no page tables, so growing the direct map to follow high memory is a
-        // no-op as long as we stay within the window we advertise.
-        if phys_end.0 <= LA64_DIRECT_MAP_PHYS_END {
+        // The cached DMW window statically covers the whole physical address
+        // space, so no page-table work is needed to reach any RAM the firmware
+        // reports — including high RAM above the MMIO hole. Succeed for anything
+        // inside the DMW-mapped limit.
+        if phys_end.0 <= QEMU_LA64_RAM_BASE.saturating_add(QEMU_LA64_DIRECT_MAP_SIZE) {
             Ok(())
         } else {
             Err(PmapError::Unsupported)

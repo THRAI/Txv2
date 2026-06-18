@@ -1,4 +1,4 @@
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use alloc::vec::Vec;
 use smoltcp::socket::tcp;
@@ -13,15 +13,16 @@ use crate::net::structure::SocketTable;
 use crate::sync::SpinMutex;
 
 use super::super::protocol::{
-    parse_icmpv4_payload, Icmpv4EchoPacket, Icmpv4Event, RawIcmpSocket, RawTcpSocket, RawUdpSocket,
-    UdpTxDatagram,
+    parse_icmpv4_echo_payload_unchecked, parse_icmpv4_payload,
+    parse_raw_icmpv4_echo_payload_unchecked, Icmpv4EchoPacket, Icmpv4Event, RawIcmpSocket,
+    RawIpAddress, RawIpv6Packet, RawTcpSocket, RawUdpSocket, UdpTxDatagram,
 };
 use super::identity::SocketIdentity;
 use super::multicast::{Ipv4MulticastGroup, Ipv4MulticastMemberships};
 use super::types::{
-    AddressFamily, IpEndpoint, Ipv4Address, PacketSocketState, ProtocolNumber, RawIcmpState,
-    RdsState, SockAddrLl, SockShutdownCmd, SocketKind, SocketOptionSet, TcpState, UdpInner,
-    UnixSocketPath,
+    AddressFamily, IpEndpoint, Ipv4Address, Ipv6Address, PacketSocketState, ProtocolNumber,
+    RawIcmpState, RdsState, SockAddrLl, SockShutdownCmd, SocketKind, SocketOptionSet, SocketType,
+    TcpState, UdpInner, UnixSocketPath,
 };
 
 pub type SocketOperationalEvidence = PayloadCap<SocketPayload>;
@@ -41,6 +42,7 @@ pub struct SocketPayload {
     pub(crate) raw_unix: Option<RawUnixSocket>,
     pub(crate) raw_rds: Option<RawRdsSocket>,
     pub(crate) raw_sctp: Option<RawSctpSocket>,
+    pub(crate) raw_packet: Option<RawPacketSocket>,
     pub(crate) raw_netlink_route: Option<RawNetlinkRouteSocket>,
     pub(crate) raw_netlink_netfilter: Option<RawNetlinkNetfilterSocket>,
     pub(crate) io: SpinMutex<SocketIoState>,
@@ -74,6 +76,7 @@ impl SocketPayload {
         options: SocketOptionSet,
         net_namespace: PayloadCap<NetNamespacePayload>,
     ) -> Self {
+        let raw_packet = matches!(kind, SocketKind::Packet).then(|| RawPacketSocket::new(&options));
         let (
             protocol,
             raw_tcp,
@@ -173,6 +176,17 @@ impl SocketPayload {
                 Some(RawNetlinkRouteSocket::new()),
                 None,
             ),
+            SocketKind::NetlinkXfrm => (
+                SocketProtocol::NetlinkNetfilter(NetlinkNetfilterState),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(RawNetlinkNetfilterSocket::new()),
+            ),
             SocketKind::NetlinkNetfilter => (
                 SocketProtocol::NetlinkNetfilter(NetlinkNetfilterState),
                 None,
@@ -208,6 +222,7 @@ impl SocketPayload {
             raw_unix,
             raw_rds,
             raw_sctp,
+            raw_packet,
             raw_netlink_route,
             raw_netlink_netfilter,
             io: SpinMutex::new(SocketIoState::new()),
@@ -490,9 +505,101 @@ impl SocketPayload {
         Some(became_readable)
     }
 
-    pub(crate) fn record_sctp_stream_bytes(&self, payload: Vec<u8>) -> Option<bool> {
+    pub(crate) fn record_sctp_message(
+        &self,
+        payload: Vec<u8>,
+        notification: bool,
+        stream: u16,
+        ppid: u32,
+        source: Option<IpEndpoint>,
+    ) -> Option<bool> {
         let raw_sctp = self.raw_sctp.as_ref()?;
-        let became_readable = raw_sctp.ingest_stream_bytes(payload)?;
+        let became_readable =
+            raw_sctp.ingest_message(payload, notification, stream, ppid, source)?;
+        self.refresh_io_from_raw();
+        Some(became_readable)
+    }
+
+    /// 1-to-many: find or create the association to `peer`; returns (id, is_new).
+    pub(crate) fn sctp_ensure_assoc(&self, peer: IpEndpoint) -> Option<(u32, bool)> {
+        Some(self.raw_sctp.as_ref()?.ensure_assoc(peer))
+    }
+
+    pub(crate) fn sctp_peers(&self) -> Vec<SctpAssoc> {
+        self.raw_sctp
+            .as_ref()
+            .map_or_else(Vec::new, RawSctpSocket::peers_snapshot)
+    }
+
+    /// Remove the 1-to-many association named by `assoc_id`, returning its peer
+    /// endpoint if it existed.
+    pub fn sctp_remove_assoc(&self, assoc_id: u32) -> Option<IpEndpoint> {
+        self.raw_sctp.as_ref()?.remove_assoc(assoc_id)
+    }
+
+    /// Peer endpoint of the 1-to-many (SEQPACKET) association named by
+    /// `assoc_id`, for SCTP_GET_PEER_ADDRS (sctp_getpaddrs). None if no such
+    /// association exists.
+    pub fn sctp_peer_addr_by_assoc(&self, assoc_id: u32) -> Option<IpEndpoint> {
+        self.sctp_peers()
+            .into_iter()
+            .find(|assoc| assoc.assoc_id == assoc_id)
+            .map(|assoc| assoc.peer)
+    }
+
+    /// 1-to-many (SEQPACKET): the association id whose peer endpoint is `peer`,
+    /// if such an association exists (used to report sctp_connectx's assoc id).
+    pub fn sctp_assoc_id_for_peer(&self, peer: IpEndpoint) -> Option<u32> {
+        self.sctp_peers()
+            .into_iter()
+            .find(|assoc| assoc.peer == peer)
+            .map(|assoc| assoc.assoc_id)
+    }
+
+    /// All local addresses this socket is bound to (primary bind + sctp_bindx).
+    pub fn sctp_local_addrs(&self) -> Vec<IpEndpoint> {
+        self.raw_sctp
+            .as_ref()
+            .map_or_else(Vec::new, RawSctpSocket::local_addrs)
+    }
+
+    /// Record an additional bound local address (bind primary / sctp_bindx).
+    pub fn sctp_add_local_addr(&self, endpoint: IpEndpoint) {
+        if let Some(raw) = self.raw_sctp.as_ref() {
+            raw.add_local_addr(endpoint);
+        }
+    }
+
+    /// The full multi-homed address set of the peer reachable at `peer`, for
+    /// SCTP_GET_PEER_ADDRS: resolve the peer socket and return its bound address
+    /// set. Falls back to just `peer` if the peer socket can't be resolved or
+    /// reports no addresses.
+    pub fn sctp_peer_local_addrs(&self, peer: IpEndpoint) -> Vec<IpEndpoint> {
+        let guard = tx_substrate::epoch::guard();
+        let table = self.socket_table();
+        let addrs = table
+            .lookup_sctp_listener_dual_stack_endpoint(peer, &guard)
+            .or_else(|| table.lookup_sctp_bound(peer, &guard))
+            .and_then(|sock| sock.acquire_operational())
+            .map(|payload| payload.sctp_local_addrs())
+            .unwrap_or_default();
+        if addrs.is_empty() {
+            alloc::vec![peer]
+        } else {
+            addrs
+        }
+    }
+
+    /// Number of 1-to-many (SEQPACKET) associations on this socket.
+    pub fn sctp_assoc_count(&self) -> usize {
+        self.raw_sctp
+            .as_ref()
+            .map_or(0, |raw| raw.peers_snapshot().len())
+    }
+
+    pub fn record_packet_frame(&self, source: SockAddrLl, payload: Vec<u8>) -> Option<bool> {
+        let raw_packet = self.raw_packet.as_ref()?;
+        let became_readable = raw_packet.ingest_frame(source, payload)?;
         self.refresh_io_from_raw();
         Some(became_readable)
     }
@@ -524,6 +631,13 @@ impl SocketPayload {
         became_readable
     }
 
+    pub(crate) fn record_tcp_stream_bytes(&self, payload: &[u8]) -> Option<bool> {
+        let raw_tcp = self.raw_tcp.as_ref()?;
+        let became_readable = raw_tcp.ingest_rx_bytes_unbounded(payload);
+        self.refresh_io_from_raw();
+        Some(became_readable)
+    }
+
     pub(crate) fn record_send_space(&self, bytes: usize) -> bool {
         let became_available = match &self.raw_tcp {
             Some(raw_tcp) => raw_tcp.ack_tx_bytes(bytes),
@@ -548,6 +662,23 @@ impl SocketPayload {
         flags: super::types::SendRecvFlags,
     ) -> Option<SocketRecvBytesOutcome> {
         let peek = flags.contains(super::types::SendRecvFlags::MSG_PEEK);
+        if let Some(raw_packet) = &self.raw_packet {
+            let drain = raw_packet.recv_frame_bytes(out, peek)?;
+            self.refresh_io_from_raw();
+            return Some(SocketRecvBytesOutcome {
+                bytes: drain.bytes,
+                source: None,
+                unix_source: None,
+                packet_source: Some(drain.source),
+                destination: None,
+                truncated: drain.truncated,
+                became_empty: drain.became_empty,
+                eor: false,
+                sctp_notification: false,
+                sctp_stream: 0,
+                sctp_ppid: 0,
+            });
+        }
         let unix_stream = self.with_protocol(|protocol| {
             matches!(
                 protocol,
@@ -567,17 +698,27 @@ impl SocketPayload {
                     bytes,
                     source: None,
                     unix_source: None,
+                    packet_source: None,
                     destination: None,
                     truncated: false,
                     became_empty,
+                    eor: false,
+                    sctp_notification: false,
+                    sctp_stream: 0,
+                    sctp_ppid: 0,
                 },
                 None if raw_tcp.is_recv_closed() => SocketRecvBytesOutcome {
                     bytes: 0,
                     source: None,
                     unix_source: None,
+                    packet_source: None,
                     destination: None,
                     truncated: false,
                     became_empty: false,
+                    eor: false,
+                    sctp_notification: false,
+                    sctp_stream: 0,
+                    sctp_ppid: 0,
                 },
                 None => return None,
             },
@@ -587,20 +728,38 @@ impl SocketPayload {
                     bytes: drain.bytes,
                     source: Some(drain.source),
                     unix_source: None,
+                    packet_source: None,
                     destination: Some(drain.destination),
                     truncated: drain.truncated,
                     became_empty: drain.became_empty,
+                    eor: false,
+                    sctp_notification: false,
+                    sctp_stream: 0,
+                    sctp_ppid: 0,
                 }
             }
             (None, None, Some(raw_icmp), None, None, None) => {
-                let drain = raw_icmp.recv_echo_reply_bytes(out, peek)?;
+                let drain = raw_icmp.recv_bytes(out, peek)?;
+                let source = match drain.source {
+                    RawIpAddress::V4(addr) => IpEndpoint::new(addr, 0),
+                    RawIpAddress::V6(addr) => IpEndpoint::new_v6(addr, 0),
+                };
+                let destination = match drain.destination {
+                    RawIpAddress::V4(addr) => IpEndpoint::new(addr, 0),
+                    RawIpAddress::V6(addr) => IpEndpoint::new_v6(addr, 0),
+                };
                 SocketRecvBytesOutcome {
                     bytes: drain.bytes,
-                    source: Some(IpEndpoint::new(drain.source, 0)),
+                    source: Some(source),
                     unix_source: None,
-                    destination: Some(IpEndpoint::new(drain.destination, 0)),
+                    packet_source: None,
+                    destination: Some(destination),
                     truncated: drain.truncated,
                     became_empty: drain.became_empty,
+                    eor: false,
+                    sctp_notification: false,
+                    sctp_stream: 0,
+                    sctp_ppid: 0,
                 }
             }
             (None, None, None, Some(raw_unix), None, None) => {
@@ -609,9 +768,14 @@ impl SocketPayload {
                     bytes: drain.bytes,
                     source: None,
                     unix_source: drain.source,
+                    packet_source: None,
                     destination: None,
                     truncated: drain.truncated,
                     became_empty: drain.became_empty,
+                    eor: false,
+                    sctp_notification: false,
+                    sctp_stream: 0,
+                    sctp_ppid: 0,
                 }
             }
             (None, None, None, None, Some(raw_rds), None) => {
@@ -620,20 +784,30 @@ impl SocketPayload {
                     bytes: drain.bytes,
                     source: Some(drain.source),
                     unix_source: None,
+                    packet_source: None,
                     destination: Some(drain.destination),
                     truncated: drain.truncated,
                     became_empty: drain.became_empty,
+                    eor: false,
+                    sctp_notification: false,
+                    sctp_stream: 0,
+                    sctp_ppid: 0,
                 }
             }
             (None, None, None, None, None, Some(raw_sctp)) => {
-                let drain = raw_sctp.recv_stream_bytes(out, peek)?;
+                let drain = raw_sctp.recv_message(out, peek)?;
                 SocketRecvBytesOutcome {
                     bytes: drain.bytes,
-                    source: None,
+                    source: drain.source,
                     unix_source: None,
+                    packet_source: None,
                     destination: None,
                     truncated: false,
                     became_empty: drain.became_empty,
+                    eor: drain.eor,
+                    sctp_notification: drain.notification,
+                    sctp_stream: drain.stream,
+                    sctp_ppid: drain.ppid,
                 }
             }
             _ => return None,
@@ -759,8 +933,20 @@ impl SocketPayload {
                         Some(dst) => dst,
                         None => return Err(crate::execution::Errno::EDESTADDRREQ),
                     };
+                    if dst.family != AddressFamily::Inet {
+                        return Err(crate::execution::Errno::EAFNOSUPPORT);
+                    }
                     let local = self.raw_icmp_bound_local().unwrap_or(Ipv4Address::LOOPBACK);
-                    let packet = match parse_icmpv4_payload(local, dst.addr, bytes) {
+                    let event = match parse_icmpv4_payload(local, dst.addr, bytes) {
+                        Icmpv4Event::Malformed if self.is_icmp_datagram_socket() => {
+                            parse_icmpv4_echo_payload_unchecked(local, dst.addr, bytes)
+                        }
+                        Icmpv4Event::Malformed if self.is_raw_icmp_socket() => {
+                            parse_raw_icmpv4_echo_payload_unchecked(local, dst.addr, bytes)
+                        }
+                        event => event,
+                    };
+                    let packet = match event {
                         Icmpv4Event::EchoRequest(packet) | Icmpv4Event::EchoReply(packet) => packet,
                         Icmpv4Event::Malformed => return Err(crate::execution::Errno::EINVAL),
                         Icmpv4Event::Unsupported => {
@@ -833,6 +1019,63 @@ impl SocketPayload {
             .is_some_and(|raw_icmp| raw_icmp.ingest_rx_echo_reply(packet));
         self.refresh_io_from_raw();
         became_readable
+    }
+
+    pub(crate) fn record_raw_ipv6_packet(&self, packet: RawIpv6Packet) -> bool {
+        let became_readable = self
+            .raw_icmp
+            .as_ref()
+            .is_some_and(|raw_icmp| raw_icmp.ingest_rx_ipv6_packet(packet));
+        self.refresh_io_from_raw();
+        became_readable
+    }
+
+    pub(crate) fn set_raw_icmp_protocol(
+        &self,
+        protocol: ProtocolNumber,
+    ) -> Result<(), crate::execution::Errno> {
+        self.with_protocol_mut(|socket_protocol| match socket_protocol {
+            SocketProtocol::RawIcmp(state) => {
+                state.protocol = protocol;
+                true
+            }
+            _ => false,
+        })
+        .then_some(())
+        .ok_or(crate::execution::Errno::EINVAL)
+    }
+
+    pub fn raw_icmp_protocol(&self) -> Option<ProtocolNumber> {
+        match &*self.protocol.lock() {
+            SocketProtocol::RawIcmp(state) => Some(state.protocol),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn raw_icmp_bound_local6(&self) -> Option<Ipv6Address> {
+        match &*self.protocol.lock() {
+            SocketProtocol::RawIcmp(state) => state.bound_local6,
+            _ => None,
+        }
+    }
+
+    pub fn raw_icmp6_filter(&self) -> Option<[u32; 8]> {
+        match &*self.protocol.lock() {
+            SocketProtocol::RawIcmp(state) => Some(state.icmp6_filter),
+            _ => None,
+        }
+    }
+
+    pub fn set_raw_icmp6_filter(&self, filter: [u32; 8]) -> Result<(), crate::execution::Errno> {
+        self.with_protocol_mut(|socket_protocol| match socket_protocol {
+            SocketProtocol::RawIcmp(state) => {
+                state.icmp6_filter = filter;
+                true
+            }
+            _ => false,
+        })
+        .then_some(())
+        .ok_or(crate::execution::Errno::EINVAL)
     }
 
     pub(crate) fn peek_udp_tx_datagram(&self) -> Option<UdpTxDatagram> {
@@ -911,6 +1154,9 @@ impl SocketPayload {
     }
 
     fn raw_recv_len(&self, len: usize, peek: bool) -> Option<(usize, bool)> {
+        if let Some(raw_packet) = &self.raw_packet {
+            return raw_packet.recv_len(len, peek);
+        }
         let unix_stream = self.with_protocol(|protocol| {
             matches!(
                 protocol,
@@ -956,6 +1202,9 @@ impl SocketPayload {
     }
 
     fn raw_recv_available(&self) -> usize {
+        if let Some(raw_packet) = &self.raw_packet {
+            return raw_packet.recv_available();
+        }
         let unix_stream = self.with_protocol(|protocol| {
             matches!(
                 protocol,
@@ -991,6 +1240,9 @@ impl SocketPayload {
     }
 
     fn raw_send_available(&self) -> usize {
+        if let Some(raw_packet) = &self.raw_packet {
+            return raw_packet.send_available();
+        }
         match (
             &self.raw_tcp,
             &self.raw_udp,
@@ -1017,11 +1269,19 @@ impl SocketPayload {
         }
     }
 
-    fn raw_icmp_bound_local(&self) -> Option<Ipv4Address> {
+    pub(crate) fn raw_icmp_bound_local(&self) -> Option<Ipv4Address> {
         match &*self.protocol.lock() {
             SocketProtocol::RawIcmp(state) => state.bound_local,
             _ => None,
         }
+    }
+
+    fn is_icmp_datagram_socket(&self) -> bool {
+        self.with_options(|options| options.socket.sock_type == SocketType::Dgram)
+    }
+
+    fn is_raw_icmp_socket(&self) -> bool {
+        self.with_options(|options| options.socket.sock_type == SocketType::Raw)
     }
 
     fn udp_connected_remote(&self) -> Option<IpEndpoint> {
@@ -1047,7 +1307,9 @@ const fn default_family_for_kind(kind: SocketKind) -> AddressFamily {
         SocketKind::Tcp | SocketKind::Udp | SocketKind::Sctp | SocketKind::RawIcmp => {
             AddressFamily::Inet
         }
-        SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter => AddressFamily::Netlink,
+        SocketKind::NetlinkRoute | SocketKind::NetlinkXfrm | SocketKind::NetlinkNetfilter => {
+            AddressFamily::Netlink
+        }
         SocketKind::Packet => AddressFamily::Packet,
         SocketKind::RdsSeqPacket => AddressFamily::Rds,
     }
@@ -1088,9 +1350,18 @@ pub struct SocketRecvBytesOutcome {
     pub bytes: usize,
     pub source: Option<IpEndpoint>,
     pub unix_source: Option<UnixSocketPath>,
+    pub packet_source: Option<SockAddrLl>,
     pub destination: Option<IpEndpoint>,
     pub truncated: bool,
     pub became_empty: bool,
+    /// End-of-record: the read consumed a complete message (SCTP message
+    /// boundary). Maps to `MSG_EOR` in recvmsg. Always false for byte streams.
+    pub eor: bool,
+    /// The delivered message is an SCTP control notification (`MSG_NOTIFICATION`).
+    pub sctp_notification: bool,
+    /// sctp_sndrcvinfo stream id / payload protocol id for an SCTP data message.
+    pub sctp_stream: u16,
+    pub sctp_ppid: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1116,6 +1387,113 @@ pub(crate) struct SocketUdpTxDrain {
 pub(crate) struct SocketIcmpTxDrain {
     pub packet: Icmpv4EchoPacket,
     pub became_available: bool,
+}
+
+pub(crate) struct RawPacketSocket {
+    state: SpinMutex<RawPacketState>,
+    recv_limit: usize,
+    send_space: usize,
+}
+
+impl RawPacketSocket {
+    pub fn new(options: &SocketOptionSet) -> Self {
+        Self {
+            state: SpinMutex::new(RawPacketState::new()),
+            recv_limit: options.socket.recv_buf_size.max(1),
+            send_space: options.socket.send_buf_size.max(1),
+        }
+    }
+
+    pub fn ingest_frame(&self, source: SockAddrLl, bytes: Vec<u8>) -> Option<bool> {
+        self.state
+            .lock()
+            .push_frame(PacketFrame { source, bytes }, self.recv_limit)
+    }
+
+    pub fn recv_len(&self, len: usize, peek: bool) -> Option<(usize, bool)> {
+        self.state.lock().recv_len(len, peek)
+    }
+
+    pub fn recv_frame_bytes(&self, out: &mut [u8], peek: bool) -> Option<PacketRecvDrain> {
+        self.state.lock().recv_frame_bytes(out, peek)
+    }
+
+    pub fn recv_available(&self) -> usize {
+        self.state.lock().recv_available()
+    }
+
+    pub const fn send_available(&self) -> usize {
+        self.send_space
+    }
+}
+
+struct RawPacketState {
+    frames: Vec<PacketFrame>,
+    queued_bytes: usize,
+}
+
+impl RawPacketState {
+    const fn new() -> Self {
+        Self {
+            frames: Vec::new(),
+            queued_bytes: 0,
+        }
+    }
+
+    fn push_frame(&mut self, frame: PacketFrame, recv_limit: usize) -> Option<bool> {
+        let was_empty = self.frames.is_empty();
+        let len = frame.bytes.len();
+        if self.queued_bytes.saturating_add(len) > recv_limit {
+            return None;
+        }
+        self.queued_bytes += len;
+        self.frames.push(frame);
+        Some(was_empty)
+    }
+
+    fn recv_len(&mut self, len: usize, peek: bool) -> Option<(usize, bool)> {
+        let frame_len = self.frames.first()?.bytes.len();
+        let bytes = core::cmp::min(len, frame_len);
+        if !peek {
+            let frame = self.frames.remove(0);
+            self.queued_bytes = self.queued_bytes.saturating_sub(frame.bytes.len());
+        }
+        Some((bytes, !peek && self.frames.is_empty()))
+    }
+
+    fn recv_frame_bytes(&mut self, out: &mut [u8], peek: bool) -> Option<PacketRecvDrain> {
+        let frame = self.frames.first()?;
+        let bytes = core::cmp::min(out.len(), frame.bytes.len());
+        out[..bytes].copy_from_slice(&frame.bytes[..bytes]);
+        let source = frame.source;
+        let truncated = frame.bytes.len() > out.len();
+        if !peek {
+            let frame = self.frames.remove(0);
+            self.queued_bytes = self.queued_bytes.saturating_sub(frame.bytes.len());
+        }
+        Some(PacketRecvDrain {
+            bytes,
+            source,
+            truncated,
+            became_empty: !peek && self.frames.is_empty(),
+        })
+    }
+
+    fn recv_available(&self) -> usize {
+        self.frames.first().map_or(0, |frame| frame.bytes.len())
+    }
+}
+
+struct PacketFrame {
+    source: SockAddrLl,
+    bytes: Vec<u8>,
+}
+
+pub(crate) struct PacketRecvDrain {
+    pub bytes: usize,
+    pub source: SockAddrLl,
+    pub truncated: bool,
+    pub became_empty: bool,
 }
 
 pub(crate) struct RawRdsSocket {
@@ -1239,6 +1617,28 @@ pub(crate) struct RdsRecvDrain {
     pub became_empty: bool,
 }
 
+/// One queued SCTP message (boundary-preserved) plus its ancillary metadata.
+/// `notification` marks a control event (assoc_change / shutdown) that recvmsg
+/// surfaces with MSG_NOTIFICATION; `stream`/`ppid` carry the sctp_sndrcvinfo;
+/// `source` is the sender's endpoint for 1-to-many recvmsg msg_name (None for
+/// 1-to-1, where there is a single fixed peer).
+#[derive(Clone)]
+struct SctpFrame {
+    data: Vec<u8>,
+    notification: bool,
+    stream: u16,
+    ppid: u32,
+    source: Option<IpEndpoint>,
+}
+
+/// A 1-to-many (SEQPACKET) association tracked on a socket: the peer endpoint and
+/// the locally-assigned association id.
+#[derive(Clone, Copy)]
+pub(crate) struct SctpAssoc {
+    pub peer: IpEndpoint,
+    pub assoc_id: u32,
+}
+
 pub(crate) struct RawSctpSocket {
     state: SpinMutex<RawSctpState>,
     recv_limit: usize,
@@ -1254,16 +1654,45 @@ impl RawSctpSocket {
         }
     }
 
-    pub fn ingest_stream_bytes(&self, bytes: Vec<u8>) -> Option<bool> {
-        self.state.lock().push_bytes(bytes, self.recv_limit)
+    pub fn ingest_message(
+        &self,
+        bytes: Vec<u8>,
+        notification: bool,
+        stream: u16,
+        ppid: u32,
+        source: Option<IpEndpoint>,
+    ) -> Option<bool> {
+        self.state
+            .lock()
+            .push_message(bytes, notification, stream, ppid, source, self.recv_limit)
+    }
+
+    pub fn ensure_assoc(&self, peer: IpEndpoint) -> (u32, bool) {
+        self.state.lock().ensure_assoc(peer)
+    }
+
+    pub fn remove_assoc(&self, assoc_id: u32) -> Option<IpEndpoint> {
+        self.state.lock().remove_assoc(assoc_id)
+    }
+
+    pub fn add_local_addr(&self, endpoint: IpEndpoint) {
+        self.state.lock().add_local_addr(endpoint);
+    }
+
+    pub fn local_addrs(&self) -> Vec<IpEndpoint> {
+        self.state.lock().local_addrs()
+    }
+
+    pub fn peers_snapshot(&self) -> Vec<SctpAssoc> {
+        self.state.lock().peers_snapshot()
     }
 
     pub fn recv_len(&self, len: usize, peek: bool) -> Option<(usize, bool)> {
         self.state.lock().recv_len(len, peek)
     }
 
-    pub fn recv_stream_bytes(&self, out: &mut [u8], peek: bool) -> Option<SctpRecvDrain> {
-        self.state.lock().recv_stream_bytes(out, peek)
+    pub fn recv_message(&self, out: &mut [u8], peek: bool) -> Option<SctpRecvDrain> {
+        self.state.lock().recv_message(out, peek)
     }
 
     pub fn recv_available(&self) -> usize {
@@ -1276,26 +1705,85 @@ impl RawSctpSocket {
 }
 
 struct RawSctpState {
-    frames: Vec<Vec<u8>>,
+    frames: Vec<SctpFrame>,
     queued_bytes: usize,
+    /// 1-to-many peer associations (SEQPACKET). Empty for 1-to-1 sockets.
+    peers: Vec<SctpAssoc>,
+    /// All local addresses this socket is bound to (primary bind + sctp_bindx),
+    /// used to report the full multi-homed address set to peers via getpaddrs.
+    local_addrs: Vec<IpEndpoint>,
 }
+
+/// Association ids are drawn from a process-global monotonic counter so that
+/// ids are unique across sockets: a peer's association id never coincides with
+/// this socket's, which the SCTP API tests rely on when probing an "incorrect"
+/// association id from the other end.
+static NEXT_SCTP_ASSOC_ID: AtomicU32 = AtomicU32::new(1);
 
 impl RawSctpState {
     const fn new() -> Self {
         Self {
             frames: Vec::new(),
             queued_bytes: 0,
+            peers: Vec::new(),
+            local_addrs: Vec::new(),
         }
     }
 
-    fn push_bytes(&mut self, bytes: Vec<u8>, recv_limit: usize) -> Option<bool> {
+    fn add_local_addr(&mut self, endpoint: IpEndpoint) {
+        if !self.local_addrs.contains(&endpoint) {
+            self.local_addrs.push(endpoint);
+        }
+    }
+
+    fn local_addrs(&self) -> Vec<IpEndpoint> {
+        self.local_addrs.clone()
+    }
+
+    fn push_message(
+        &mut self,
+        bytes: Vec<u8>,
+        notification: bool,
+        stream: u16,
+        ppid: u32,
+        source: Option<IpEndpoint>,
+        recv_limit: usize,
+    ) -> Option<bool> {
         let was_empty = self.queued_bytes == 0;
         if self.queued_bytes.saturating_add(bytes.len()) > recv_limit {
             return None;
         }
         self.queued_bytes += bytes.len();
-        self.frames.push(bytes);
+        self.frames.push(SctpFrame {
+            data: bytes,
+            notification,
+            stream,
+            ppid,
+            source,
+        });
         Some(was_empty)
+    }
+
+    /// Find an existing 1-to-many association to `peer`, or create one. Returns
+    /// (assoc_id, is_new).
+    fn ensure_assoc(&mut self, peer: IpEndpoint) -> (u32, bool) {
+        if let Some(assoc) = self.peers.iter().find(|a| a.peer == peer) {
+            return (assoc.assoc_id, false);
+        }
+        let assoc_id = NEXT_SCTP_ASSOC_ID.fetch_add(1, Ordering::Relaxed).max(1);
+        self.peers.push(SctpAssoc { peer, assoc_id });
+        (assoc_id, true)
+    }
+
+    /// Remove the association named by `assoc_id`, returning its peer endpoint if
+    /// it existed.
+    fn remove_assoc(&mut self, assoc_id: u32) -> Option<IpEndpoint> {
+        let idx = self.peers.iter().position(|a| a.assoc_id == assoc_id)?;
+        Some(self.peers.remove(idx).peer)
+    }
+
+    fn peers_snapshot(&self) -> Vec<SctpAssoc> {
+        self.peers.clone()
     }
 
     fn recv_len(&mut self, len: usize, peek: bool) -> Option<(usize, bool)> {
@@ -1309,25 +1797,31 @@ impl RawSctpState {
         Some((bytes, !peek && self.queued_bytes == 0))
     }
 
-    fn recv_stream_bytes(&mut self, out: &mut [u8], peek: bool) -> Option<SctpRecvDrain> {
-        if self.queued_bytes == 0 {
-            return None;
-        }
-        let mut copied = 0usize;
-        for frame in &self.frames {
-            if copied >= out.len() {
-                break;
-            }
-            let n = core::cmp::min(out.len() - copied, frame.len());
-            out[copied..copied + n].copy_from_slice(&frame[..n]);
-            copied += n;
-        }
+    /// Message-oriented receive: deliver bytes from the FRONT message only
+    /// (SCTP preserves message boundaries). `eor` is set when the whole front
+    /// message fit in `out`; otherwise the remainder stays queued for the next
+    /// recv and `eor` is false (partial delivery).
+    fn recv_message(&mut self, out: &mut [u8], peek: bool) -> Option<SctpRecvDrain> {
+        let front = self.frames.first()?;
+        let front_len = front.data.len();
+        let notification = front.notification;
+        let stream = front.stream;
+        let ppid = front.ppid;
+        let source = front.source;
+        let n = core::cmp::min(out.len(), front_len);
+        out[..n].copy_from_slice(&front.data[..n]);
+        let eor = n == front_len;
         if !peek {
-            self.drop_front_bytes(copied)?;
+            self.drop_front_bytes(n)?;
         }
         Some(SctpRecvDrain {
-            bytes: copied,
+            bytes: n,
             became_empty: !peek && self.queued_bytes == 0,
+            eor,
+            notification,
+            stream,
+            ppid,
+            source,
         })
     }
 
@@ -1337,14 +1831,14 @@ impl RawSctpState {
 
     fn drop_front_bytes(&mut self, mut remaining: usize) -> Option<()> {
         while remaining > 0 {
-            let front_len = self.frames.first()?.len();
+            let front_len = self.frames.first()?.data.len();
             if front_len <= remaining {
                 let frame = self.frames.remove(0);
-                self.queued_bytes = self.queued_bytes.saturating_sub(frame.len());
-                remaining -= frame.len();
+                self.queued_bytes = self.queued_bytes.saturating_sub(frame.data.len());
+                remaining -= frame.data.len();
             } else {
                 let front = self.frames.first_mut()?;
-                front.drain(..remaining);
+                front.data.drain(..remaining);
                 self.queued_bytes = self.queued_bytes.saturating_sub(remaining);
                 remaining = 0;
             }
@@ -1356,6 +1850,15 @@ impl RawSctpState {
 pub(crate) struct SctpRecvDrain {
     pub bytes: usize,
     pub became_empty: bool,
+    /// The returned bytes completed a whole SCTP message (set `MSG_EOR`).
+    pub eor: bool,
+    /// The message is a control notification (set `MSG_NOTIFICATION`).
+    pub notification: bool,
+    /// sctp_sndrcvinfo stream id / payload protocol id for the message.
+    pub stream: u16,
+    pub ppid: u32,
+    /// Sender endpoint for 1-to-many recvmsg msg_name (None for 1-to-1).
+    pub source: Option<IpEndpoint>,
 }
 
 pub(crate) struct RawUnixSocket {
@@ -1719,7 +2222,11 @@ impl TcpBacklog {
     }
 
     fn is_full(&self) -> bool {
-        self.limit == 0 || self.connecting.len() + self.connected.len() >= self.limit
+        // Linux semantics: the accept queue is full when the pending count
+        // EXCEEDS the backlog (`sk_ack_backlog > sk_max_ack_backlog`), so a
+        // listen(N) admits N+1 pending connections. `limit == 0` means the
+        // socket is not listening, so it accepts nothing.
+        self.limit == 0 || self.connecting.len() + self.connected.len() > self.limit
     }
 
     fn find_connecting(&self, local: IpEndpoint, peer: IpEndpoint) -> Option<usize> {
@@ -1776,7 +2283,10 @@ impl SocketAcceptQueue {
     }
 
     pub fn push(&mut self, entry: SocketAcceptEntry) -> bool {
-        if self.entries.len() >= self.limit {
+        // Matches `TcpBacklog::is_full`: a listen(N) accept queue holds N+1
+        // entries (Linux `sk_ack_backlog > sk_max_ack_backlog`). Only reached
+        // when the backlog is not full, so `limit` is always > 0 here.
+        if self.entries.len() > self.limit {
             return false;
         }
         self.entries.push(entry);

@@ -1,9 +1,11 @@
-use tx_substrate::zone::Cap;
+use tx_substrate::zone::{Cap, PayloadCap};
 
-use crate::execution::{Guard, StepOutcome};
+use crate::execution::{Errno, Guard, StepOutcome};
+use crate::net::namespace::net_namespace_payloads_snapshot;
 use crate::net::structure::table::SocketTable;
+use crate::net::structure::SocketPayload;
 use crate::net::structure::{
-    AcceptWireSet, ConnectionKey, RdsState, RecvWireSet, SendWireSet, SocketIdentity,
+    AcceptWireSet, ConnectionKey, IpEndpoint, RdsState, RecvWireSet, SendWireSet, SocketIdentity,
     SocketProtocol, TcpState, UdpInner, UnixDatagramState, UnixStreamState,
 };
 
@@ -50,9 +52,7 @@ pub fn step_socket_close(
         SocketProtocol::Tcp(TcpState::Connecting { local, remote })
         | SocketProtocol::Tcp(TcpState::Connected { local, remote }) => {
             tcp_flushed_bytes += flush_tcp_tx_before_close(socket, guard);
-            if let Some(peer) =
-                table.lookup_tcp_connection(ConnectionKey::new(remote, local), guard)
-            {
+            if let Some(peer) = lookup_tcp_peer_connection(table, remote, local, guard) {
                 let peer_wakes = mark_tcp_peer_closed(&peer);
                 peer_recv_woken += peer_wakes.recv_woken;
                 peer_send_woken += peer_wakes.send_woken;
@@ -63,9 +63,11 @@ pub fn step_socket_close(
         }
         SocketProtocol::Tcp(TcpState::Init | TcpState::Closed) => {}
         SocketProtocol::Sctp(TcpState::Bound { local }) => {
+            peer_recv_woken += notify_sctp_seqpacket_peers_closed(&payload, table, guard);
             bindings_withdrawn += withdraw_ok(table.withdraw_sctp_bound(local));
         }
         SocketProtocol::Sctp(TcpState::Listening { local, .. }) => {
+            peer_recv_woken += notify_sctp_seqpacket_peers_closed(&payload, table, guard);
             bindings_withdrawn += withdraw_ok(table.withdraw_sctp_listener(local));
             bindings_withdrawn += withdraw_ok(table.withdraw_sctp_bound(local));
         }
@@ -74,9 +76,18 @@ pub fn step_socket_close(
             if let Some(peer) =
                 table.lookup_sctp_connection(ConnectionKey::new(remote, local), guard)
             {
+                // Notify the peer's event subscription that the association is
+                // going down (SCTP_SHUTDOWN_EVENT), queued ahead of the EOF mark.
+                enqueue_sctp_shutdown_event(&peer);
                 let peer_wakes = mark_sctp_peer_closed(&peer);
                 peer_recv_woken += peer_wakes.recv_woken;
                 peer_send_woken += peer_wakes.send_woken;
+            } else {
+                // No 1-to-1 connection peer: a peeled-off socket whose peer is a
+                // 1-to-many client. Deliver the SHUTDOWN_COMP assoc_change to the
+                // client's association.
+                peer_recv_woken +=
+                    notify_sctp_peer_assoc_closed(local, remote, 0, false, table, guard);
             }
             bindings_withdrawn +=
                 withdraw_ok(table.withdraw_sctp_connection(ConnectionKey::new(local, remote)));
@@ -212,12 +223,172 @@ fn mark_tcp_peer_closed(peer: &Cap<SocketIdentity>) -> PeerCloseWakes {
     }
 }
 
+fn lookup_tcp_peer_connection(
+    table: &SocketTable,
+    remote: IpEndpoint,
+    local: IpEndpoint,
+    guard: &Guard<'_>,
+) -> Option<Cap<SocketIdentity>> {
+    let key = ConnectionKey::new(remote, local);
+    table.lookup_tcp_connection(key, guard).or_else(|| {
+        net_namespace_payloads_snapshot()
+            .into_iter()
+            .find_map(|namespace| namespace.socket_table().lookup_tcp_connection(key, guard))
+    })
+}
+
 fn mark_sctp_peer_closed(peer: &Cap<SocketIdentity>) -> PeerCloseWakes {
     let recv_woken = peer.readiness.fire_recv(RecvWireSet::BROKEN);
     let send_woken = peer.readiness.fire_send(SendWireSet::BROKEN);
     PeerCloseWakes {
         recv_woken,
         send_woken,
+    }
+}
+
+/// When a 1-to-many (SEQPACKET) socket closes, deliver SCTP_SHUTDOWN_COMP to each
+/// peer association whose socket subscribed to association events. Returns the
+/// number of peer recv waiters woken.
+fn notify_sctp_seqpacket_peers_closed(
+    payload: &PayloadCap<SocketPayload>,
+    table: &SocketTable,
+    guard: &Guard<'_>,
+) -> usize {
+    let mut woken = 0;
+    // This socket's local address, used to compute the source address each peer
+    // observed for it (a wildcard bind resolves to the peer's loopback address).
+    let local = match payload.protocol_snapshot() {
+        SocketProtocol::Sctp(TcpState::Bound { local })
+        | SocketProtocol::Sctp(TcpState::Listening { local, .. })
+        | SocketProtocol::Sctp(TcpState::Connecting { local, .. })
+        | SocketProtocol::Sctp(TcpState::Connected { local, .. }) => local,
+        _ => return woken,
+    };
+    for assoc in payload.sctp_peers() {
+        woken +=
+            notify_sctp_peer_assoc_closed(local, assoc.peer, assoc.assoc_id, false, table, guard);
+    }
+    woken
+}
+
+/// Deliver the teardown notification(s) for a single 1-to-many association to its
+/// peer socket: SCTP_SHUTDOWN_EVENT and/or SHUTDOWN_COMP (assoc_change) per the
+/// peer's subscription, each carrying the source (the peer's view of this
+/// socket's local address) and the peer's own association id. Returns the number
+/// of tasks woken. `local` is this socket's local address; `peer_endpoint` is the
+/// association's peer; `fallback_assoc_id` is used if the peer has no matching
+/// association recorded. When `abort` is set the teardown was an ungraceful
+/// SCTP_ABORT: the peer gets a single COMM_LOST assoc_change (24 bytes) and no
+/// SHUTDOWN_EVENT, matching Linux/lksctp.
+fn notify_sctp_peer_assoc_closed(
+    local: IpEndpoint,
+    peer_endpoint: IpEndpoint,
+    fallback_assoc_id: u32,
+    abort: bool,
+    table: &SocketTable,
+    guard: &Guard<'_>,
+) -> usize {
+    let Some(peer) = table
+        .lookup_sctp_listener_dual_stack_endpoint(peer_endpoint, guard)
+        .or_else(|| table.lookup_sctp_bound(peer_endpoint, guard))
+    else {
+        return 0;
+    };
+    let Some(peer_payload) = peer.acquire_operational() else {
+        return 0;
+    };
+    let wants_shutdown = peer_payload.with_options(|o| o.sctp.event_shutdown());
+    let wants_assoc_change = peer_payload.with_options(|o| o.sctp.event_assoc_change());
+    if !wants_shutdown && !wants_assoc_change {
+        return 0;
+    }
+    let source = if local.is_unspecified() {
+        IpEndpoint::from_ip(peer_endpoint.ip_addr(), local.port)
+    } else {
+        local
+    };
+    let peer_assoc_id = peer_payload
+        .sctp_peers()
+        .into_iter()
+        .find(|a| a.peer == source)
+        .map_or(fallback_assoc_id, |a| a.assoc_id);
+    let mut fired = false;
+    // SCTP_SHUTDOWN_EVENT is delivered when the peer receives SHUTDOWN;
+    // SHUTDOWN_COMP (an assoc_change) when the association is fully torn down. A
+    // 1-to-many socket may subscribe to either or both. An ungraceful ABORT has
+    // no graceful SHUTDOWN phase, so it emits no SHUTDOWN_EVENT.
+    if wants_shutdown && !abort {
+        let bytes = crate::net::execution::sctp_shutdown_event_bytes();
+        fired |= peer_payload
+            .record_sctp_message(bytes, true, 0, 0, Some(source))
+            .is_some();
+    }
+    if wants_assoc_change {
+        let streams = peer_payload.with_options(|o| o.sctp.initmsg_num_ostreams);
+        let bytes = if abort {
+            crate::net::execution::sctp_assoc_change_abort_bytes(streams, peer_assoc_id)
+        } else {
+            crate::net::execution::sctp_assoc_change_bytes(
+                3, /* SHUTDOWN_COMP */
+                streams,
+                peer_assoc_id,
+            )
+        };
+        fired |= peer_payload
+            .record_sctp_message(bytes, true, 0, 0, Some(source))
+            .is_some();
+    }
+    if fired {
+        peer.readiness.fire_recv(RecvWireSet::HAS_DATA)
+    } else {
+        0
+    }
+}
+
+/// SCTP_EOF/SCTP_ABORT on a 1-to-many (SEQPACKET) socket: tear down the single
+/// association named by `assoc_id` — notify its peer (SHUTDOWN_EVENT/COMP for a
+/// graceful EOF, or a single COMM_LOST for an ungraceful `abort`) and drop the
+/// association from this socket. A no-op if no such association exists.
+pub fn step_sctp_shutdown_assoc(
+    socket: &Cap<SocketIdentity>,
+    assoc_id: u32,
+    abort: bool,
+    guard: &Guard<'_>,
+) -> StepOutcome<()> {
+    let Some(payload) = socket.acquire_operational() else {
+        return StepOutcome::Err(Errno::ENOTCONN);
+    };
+    let local = match payload.protocol_snapshot() {
+        SocketProtocol::Sctp(TcpState::Bound { local })
+        | SocketProtocol::Sctp(TcpState::Listening { local, .. })
+        | SocketProtocol::Sctp(TcpState::Connecting { local, .. })
+        | SocketProtocol::Sctp(TcpState::Connected { local, .. }) => local,
+        _ => return StepOutcome::Err(Errno::EINVAL),
+    };
+    let Some(peer_endpoint) = payload.sctp_peer_addr_by_assoc(assoc_id) else {
+        return StepOutcome::Done(());
+    };
+    let table = payload.socket_table();
+    notify_sctp_peer_assoc_closed(local, peer_endpoint, assoc_id, abort, table, guard);
+    payload.sctp_remove_assoc(assoc_id);
+    StepOutcome::Done(())
+}
+
+/// Queue an SCTP_SHUTDOWN_EVENT notification on `peer`'s receive queue if it
+/// subscribed to shutdown events, so its next recvmsg surfaces the teardown.
+fn enqueue_sctp_shutdown_event(peer: &Cap<SocketIdentity>) {
+    let Some(payload) = peer.acquire_operational() else {
+        return;
+    };
+    if !payload.with_options(|o| o.sctp.event_shutdown()) {
+        return;
+    }
+    let bytes = crate::net::execution::sctp_shutdown_event_bytes();
+    if payload
+        .record_sctp_message(bytes, true, 0, 0, None)
+        .is_some()
+    {
+        peer.readiness.fire_recv(RecvWireSet::HAS_DATA);
     }
 }
 

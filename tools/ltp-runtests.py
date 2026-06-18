@@ -9,12 +9,20 @@ LTP's own files under target/sources/ltp-20240524/runtest.
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-RUNTEST_DIR = ROOT / "target" / "sources" / "ltp-20240524" / "runtest"
+DEFAULT_RUNTEST_DIR = ROOT / "target" / "sources" / "ltp-20240524" / "runtest"
 SKIP = {"Makefile", "syscalls", "staging"}
+
+
+def runtest_dir() -> Path:
+    override = os.environ.get("LTP_RUNTEST_DIR")
+    if override:
+        return Path(override)
+    return DEFAULT_RUNTEST_DIR
 
 
 def entries_for(path: Path) -> list[tuple[str, str]]:
@@ -31,11 +39,12 @@ def entries_for(path: Path) -> list[tuple[str, str]]:
 
 
 def module_files() -> list[Path]:
-    if not RUNTEST_DIR.exists():
-        raise SystemExit(f"missing runtest dir: {RUNTEST_DIR}")
+    root = runtest_dir()
+    if not root.exists():
+        raise SystemExit(f"missing runtest dir: {root}")
     return [
         path
-        for path in sorted(RUNTEST_DIR.iterdir())
+        for path in sorted(root.iterdir())
         if path.is_file() and path.name not in SKIP
     ]
 
@@ -53,7 +62,7 @@ def main() -> int:
         return 0
 
     if args.module:
-        path = RUNTEST_DIR / args.module
+        path = runtest_dir() / args.module
         if not path.is_file() or path.name in SKIP:
             known = ", ".join(path.name for path in module_files())
             raise SystemExit(f"unknown runtest module {args.module!r}; known: {known}")

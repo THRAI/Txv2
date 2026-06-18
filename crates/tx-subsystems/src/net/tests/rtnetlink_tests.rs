@@ -5,15 +5,19 @@ use alloc::vec::Vec;
 
 use crate::net::rtnetlink::{
     rtnetlink_handle_request, rtnetlink_handle_request_with_netns_resolver, NLMSG_DONE,
-    NLMSG_ERROR, NLM_F_ACK, NLM_F_DUMP, NLM_F_REQUEST, RTM_DELLINK, RTM_DELROUTE, RTM_GETADDR,
-    RTM_GETLINK, RTM_GETNEIGH, RTM_GETROUTE, RTM_NEWADDR, RTM_NEWLINK, RTM_NEWNEIGH, RTM_NEWROUTE,
-    RTM_SETLINK,
+    NLMSG_ERROR, NLM_F_ACK, NLM_F_DUMP, NLM_F_REQUEST, RTM_DELADDR, RTM_DELLINK, RTM_DELNEIGH,
+    RTM_DELROUTE, RTM_GETADDR, RTM_GETLINK, RTM_GETNEIGH, RTM_GETROUTE, RTM_NEWADDR, RTM_NEWLINK,
+    RTM_NEWNEIGH, RTM_NEWROUTE, RTM_SETLINK,
 };
 
 const NLM_F_CREATE: u16 = 0x0400;
 const NLM_F_EXCL: u16 = 0x0200;
+const AF_UNSPEC: u8 = 0;
+const AF_INET: u8 = 2;
+const AF_INET6: u8 = 10;
 const IFF_UP: u32 = 0x1;
 const IFLA_IFNAME: u16 = 3;
+const IFLA_MTU: u16 = 4;
 const IFLA_MASTER: u16 = 10;
 const IFLA_LINKINFO: u16 = 18;
 const IFLA_NET_NS_PID: u16 = 19;
@@ -26,6 +30,8 @@ const IFA_LABEL: u16 = 3;
 const RTA_DST: u16 = 1;
 const RTA_OIF: u16 = 4;
 const RTA_GATEWAY: u16 = 5;
+const NDA_DST: u16 = 1;
+const NDA_LLADDR: u16 = 2;
 const VETH_INFO_PEER: u16 = 1;
 const NLA_F_NESTED: u16 = 0x8000;
 
@@ -179,6 +185,20 @@ fn rtnetlink_newlink_setlink_and_newaddr_mutate_namespace_snapshot() {
     assert!(getaddr
         .iter()
         .any(|msg| nlmsg_type(msg) == RTM_NEWADDR && contains_bytes(msg, &[172, 17, 0, 2])));
+
+    let del_eth_addr = nlmsg(
+        RTM_DELADDR,
+        NLM_F_REQUEST | NLM_F_ACK,
+        27,
+        &newaddr_payload(eth_ifindex, 16, [172, 17, 0, 2]),
+    );
+    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &del_eth_addr)[0]);
+
+    let snapshot = ns.network_snapshot();
+    assert!(snapshot
+        .links
+        .iter()
+        .any(|link| link.name == "eth0" && link.ipv4_addr.is_none()));
 }
 
 #[test]
@@ -226,6 +246,223 @@ fn rtnetlink_newlink_without_create_updates_existing_link_flags() {
         .link_snapshot()
         .iter()
         .any(|link| link.name == "docker0" && link.is_up));
+}
+
+#[test]
+fn rtnetlink_newlink_dummy_and_setlink_mtu() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
+    let ns = crate::net::create_isolated_net_namespace_for_test("rtnl-dummy")
+        .expect("namespace")
+        .payload_cap()
+        .expect("namespace payload");
+    let root = crate::cred::Cred::root();
+
+    let dummy_req = nlmsg(
+        RTM_NEWLINK,
+        NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+        31,
+        &newlink_payload("dummy0", dummy_linkinfo()),
+    );
+    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &dummy_req)[0]);
+
+    let dummy = ns
+        .link_snapshot()
+        .into_iter()
+        .find(|link| link.name == "dummy0")
+        .expect("dummy link");
+    assert_eq!(dummy.kind, NetDeviceKind::Dummy);
+    assert_eq!(dummy.mtu, 1500);
+
+    let mut set_mtu = ifinfomsg(dummy.ifindex, 0, 0);
+    push_attr_u32(&mut set_mtu, IFLA_MTU, 1281);
+    let set_mtu_req = nlmsg(RTM_SETLINK, NLM_F_REQUEST | NLM_F_ACK, 32, &set_mtu);
+    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &set_mtu_req)[0]);
+
+    assert!(ns
+        .link_snapshot()
+        .iter()
+        .any(|link| link.name == "dummy0" && link.mtu == 1281));
+}
+
+#[test]
+fn rtnetlink_newaddr_and_deladdr_support_loopback_alias() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
+    let ns = crate::net::create_isolated_net_namespace_for_test("rtnl-lo-addr")
+        .expect("namespace")
+        .payload_cap()
+        .expect("namespace payload");
+    let root = crate::cred::Cred::root();
+
+    let add = nlmsg(
+        RTM_NEWADDR,
+        NLM_F_REQUEST | NLM_F_ACK,
+        33,
+        &newaddr_payload(1, 24, [127, 6, 6, 6]),
+    );
+    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &add)[0]);
+    assert!(ns.link_snapshot().iter().any(|link| {
+        link.name == "lo"
+            && link.ipv4_addr == Some(Ipv4Address::new([127, 6, 6, 6]))
+            && link.ipv4_prefix_len == Some(24)
+    }));
+
+    let del = nlmsg(
+        RTM_DELADDR,
+        NLM_F_REQUEST | NLM_F_ACK,
+        34,
+        &newaddr_payload(1, 24, [127, 6, 6, 6]),
+    );
+    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &del)[0]);
+    assert!(ns.link_snapshot().iter().any(|link| {
+        link.name == "lo"
+            && link.ipv4_addr == Some(Ipv4Address::new([127, 0, 0, 1]))
+            && link.ipv4_prefix_len == Some(8)
+    }));
+}
+
+#[test]
+fn rtnetlink_ipv6_newaddr_getaddr_and_deladdr_mutate_namespace_snapshot() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
+    let ns = crate::net::create_isolated_net_namespace_for_test("rtnl-ipv6-addr")
+        .expect("namespace")
+        .payload_cap()
+        .expect("namespace payload");
+    let root = crate::cred::Cred::root();
+
+    let dummy_req = nlmsg(
+        RTM_NEWLINK,
+        NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+        35,
+        &newlink_payload("dummy6", dummy_linkinfo()),
+    );
+    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &dummy_req)[0]);
+    let ifindex = ifindex_for(&ns.link_snapshot(), "dummy6");
+
+    let addr = [0xfd, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2];
+    let add = nlmsg(
+        RTM_NEWADDR,
+        NLM_F_REQUEST | NLM_F_ACK,
+        36,
+        &newaddr6_payload(ifindex, 64, addr),
+    );
+    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &add)[0]);
+    assert!(ns.link_snapshot().iter().any(|link| {
+        link.name == "dummy6"
+            && link.ipv6_addr == Some(Ipv6Address::new(addr))
+            && link.ipv6_prefix_len == Some(64)
+    }));
+
+    let getaddr_req = nlmsg(
+        RTM_GETADDR,
+        NLM_F_REQUEST | NLM_F_DUMP,
+        37,
+        &ifaddrmsg_family(AF_INET6, 0, 0),
+    );
+    let getaddr = rtnetlink_handle_request(&ns, root, &getaddr_req);
+    assert!(getaddr
+        .iter()
+        .any(|msg| nlmsg_type(msg) == RTM_NEWADDR && contains_bytes(msg, &addr)));
+    assert!(!getaddr
+        .iter()
+        .any(|msg| nlmsg_type(msg) == RTM_NEWADDR && contains_bytes(msg, &[127, 0, 0, 1])));
+
+    let del = nlmsg(
+        RTM_DELADDR,
+        NLM_F_REQUEST | NLM_F_ACK,
+        38,
+        &newaddr6_payload(ifindex, 64, addr),
+    );
+    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &del)[0]);
+    assert!(ns
+        .link_snapshot()
+        .iter()
+        .any(|link| link.name == "dummy6" && link.ipv6_addr.is_none()));
+}
+
+#[test]
+fn rtnetlink_addr_flush_without_addresses_is_idempotent() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
+    let ns = crate::net::create_isolated_net_namespace_for_test("rtnl-addr-flush")
+        .expect("namespace")
+        .payload_cap()
+        .expect("namespace payload");
+    let root = crate::cred::Cred::root();
+
+    let dummy_req = nlmsg(
+        RTM_NEWLINK,
+        NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+        39,
+        &newlink_payload("flush0", dummy_linkinfo()),
+    );
+    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &dummy_req)[0]);
+    let ifindex = ifindex_for(&ns.link_snapshot(), "flush0");
+
+    let flush_empty = nlmsg(
+        RTM_DELADDR,
+        NLM_F_REQUEST | NLM_F_ACK,
+        40,
+        &ifaddrmsg_family(AF_UNSPEC, ifindex, 0),
+    );
+    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &flush_empty)[0]);
+
+    let ipv4 = nlmsg(
+        RTM_NEWADDR,
+        NLM_F_REQUEST | NLM_F_ACK,
+        41,
+        &newaddr_payload(ifindex, 24, [10, 9, 8, 7]),
+    );
+    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &ipv4)[0]);
+    let ipv6_addr = [0xfd, 0, 0, 9, 0, 8, 0, 7, 0, 0, 0, 0, 0, 0, 0, 6];
+    let ipv6 = nlmsg(
+        RTM_NEWADDR,
+        NLM_F_REQUEST | NLM_F_ACK,
+        42,
+        &newaddr6_payload(ifindex, 64, ipv6_addr),
+    );
+    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &ipv6)[0]);
+
+    let flush = nlmsg(
+        RTM_DELADDR,
+        NLM_F_REQUEST | NLM_F_ACK,
+        43,
+        &ifaddrmsg_family(AF_UNSPEC, ifindex, 0),
+    );
+    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &flush)[0]);
+    assert!(ns.link_snapshot().iter().any(|link| {
+        link.name == "flush0" && link.ipv4_addr.is_none() && link.ipv6_addr.is_none()
+    }));
+    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &flush_empty)[0]);
+
+    let stale_ipv4_delete = nlmsg(
+        RTM_DELADDR,
+        NLM_F_REQUEST | NLM_F_ACK,
+        44,
+        &newaddr_payload(ifindex, 24, [10, 9, 8, 7]),
+    );
+    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &stale_ipv4_delete)[0]);
+    let stale_ipv6_delete = nlmsg(
+        RTM_DELADDR,
+        NLM_F_REQUEST | NLM_F_ACK,
+        45,
+        &newaddr6_payload(ifindex, 64, ipv6_addr),
+    );
+    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &stale_ipv6_delete)[0]);
 }
 
 #[test]
@@ -286,12 +523,84 @@ fn rtnetlink_getroute_and_getneigh_dump_configured_namespace_iface() {
 
     let neigh_req = nlmsg(RTM_GETNEIGH, NLM_F_REQUEST | NLM_F_DUMP, 31, &ndmsg(0));
     let neigh = rtnetlink_handle_request(&ns, crate::cred::Cred::root(), &neigh_req);
+    let neigh_msg = neigh
+        .iter()
+        .find(|msg| {
+            nlmsg_type(msg) == RTM_NEWNEIGH
+                && contains_bytes(msg, &peer_ip.octets())
+                && contains_bytes(msg, &peer_mac.octets())
+        })
+        .expect("neighbor dump entry");
+    assert_eq!(neigh_msg[27], 1, "ndm_type should be RTN_UNICAST");
     assert!(neigh.iter().any(|msg| {
         nlmsg_type(msg) == RTM_NEWNEIGH
             && contains_bytes(msg, &peer_ip.octets())
             && contains_bytes(msg, &peer_mac.octets())
     }));
     assert!(neigh.iter().any(|msg| nlmsg_type(msg) == NLMSG_DONE));
+}
+
+#[test]
+fn rtnetlink_newneigh_and_delneigh_mutate_neighbor_dump() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
+    let ns = crate::net::create_isolated_net_namespace_for_test("rtnl-neigh-mut")
+        .expect("namespace")
+        .payload_cap()
+        .expect("namespace payload");
+    let root = crate::cred::Cred::root();
+
+    let dummy_req = nlmsg(
+        RTM_NEWLINK,
+        NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+        35,
+        &newlink_payload("dummy0", dummy_linkinfo()),
+    );
+    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &dummy_req)[0]);
+    let ifindex = ifindex_for(&ns.link_snapshot(), "dummy0");
+
+    let addr_req = nlmsg(
+        RTM_NEWADDR,
+        NLM_F_REQUEST | NLM_F_ACK,
+        36,
+        &newaddr_payload(ifindex, 24, [192, 0, 2, 1]),
+    );
+    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &addr_req)[0]);
+
+    let peer_ip = [192, 0, 2, 99];
+    let peer_mac = [0x02, 0, 0, 0, 0, 0x63];
+    let add_req = nlmsg(
+        RTM_NEWNEIGH,
+        NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE,
+        37,
+        &newneigh_payload(ifindex, peer_ip, peer_mac),
+    );
+    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &add_req)[0]);
+
+    let neigh_req = nlmsg(RTM_GETNEIGH, NLM_F_REQUEST | NLM_F_DUMP, 38, &ndmsg(0));
+    let neigh = rtnetlink_handle_request(&ns, root, &neigh_req);
+    assert!(neigh.iter().any(|msg| {
+        nlmsg_type(msg) == RTM_NEWNEIGH
+            && contains_bytes(msg, &peer_ip)
+            && contains_bytes(msg, &peer_mac)
+    }));
+
+    let del_req = nlmsg(
+        RTM_DELNEIGH,
+        NLM_F_REQUEST | NLM_F_ACK,
+        39,
+        &delneigh_payload(ifindex, peer_ip),
+    );
+    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &del_req)[0]);
+
+    let after_del = rtnetlink_handle_request(&ns, root, &neigh_req);
+    assert!(!after_del
+        .iter()
+        .any(|msg| nlmsg_type(msg) == RTM_NEWNEIGH && contains_bytes(msg, &peer_ip)));
+    assert!(after_del.iter().any(|msg| nlmsg_type(msg) == NLMSG_DONE));
 }
 
 #[test]
@@ -363,6 +672,118 @@ fn rtnetlink_newroute_delroute_default_gateway_updates_namespace_routes() {
 }
 
 #[test]
+fn rtnetlink_delroute_connected_route_is_idempotent_until_addr_changes() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
+    let ns = crate::net::create_isolated_net_namespace_for_test("rtnl-route-flush")
+        .expect("namespace")
+        .payload_cap()
+        .expect("namespace payload");
+    let root = crate::cred::Cred::root();
+
+    let dummy_req = nlmsg(
+        RTM_NEWLINK,
+        NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+        65,
+        &newlink_payload("routeflush0", dummy_linkinfo()),
+    );
+    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &dummy_req)[0]);
+    let ifindex = ifindex_for(&ns.link_snapshot(), "routeflush0");
+
+    let addr_req = nlmsg(
+        RTM_NEWADDR,
+        NLM_F_REQUEST | NLM_F_ACK,
+        66,
+        &newaddr_payload(ifindex, 24, [192, 0, 2, 7]),
+    );
+    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &addr_req)[0]);
+    assert!(ns.route_snapshot().iter().any(|route| {
+        route.dst == Ipv4Address::new([192, 0, 2, 0])
+            && route.prefix_len == 24
+            && route.oif_name == Some("routeflush0")
+            && route.gateway.is_none()
+    }));
+
+    let del_connected_no_ack = nlmsg(
+        RTM_DELROUTE,
+        NLM_F_REQUEST,
+        67,
+        &newroute_payload(24, Some([192, 0, 2, 0]), None, ifindex),
+    );
+    assert!(rtnetlink_handle_request(&ns, root, &del_connected_no_ack).is_empty());
+    assert!(!ns.route_snapshot().iter().any(|route| {
+        route.dst == Ipv4Address::new([192, 0, 2, 0])
+            && route.prefix_len == 24
+            && route.oif_name == Some("routeflush0")
+            && route.gateway.is_none()
+    }));
+
+    let del_connected = nlmsg(
+        RTM_DELROUTE,
+        NLM_F_REQUEST | NLM_F_ACK,
+        68,
+        &newroute_payload(24, Some([192, 0, 2, 0]), None, ifindex),
+    );
+    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &del_connected)[0]);
+    assert!(!ns.route_snapshot().iter().any(|route| {
+        route.dst == Ipv4Address::new([192, 0, 2, 0])
+            && route.prefix_len == 24
+            && route.oif_name == Some("routeflush0")
+            && route.gateway.is_none()
+    }));
+    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &del_connected)[0]);
+
+    let restore_addr = nlmsg(
+        RTM_NEWADDR,
+        NLM_F_REQUEST | NLM_F_ACK,
+        69,
+        &newaddr_payload(ifindex, 24, [192, 0, 2, 7]),
+    );
+    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &restore_addr)[0]);
+    assert!(ns.route_snapshot().iter().any(|route| {
+        route.dst == Ipv4Address::new([192, 0, 2, 0])
+            && route.prefix_len == 24
+            && route.oif_name == Some("routeflush0")
+            && route.gateway.is_none()
+    }));
+}
+
+#[test]
+fn rtnetlink_newroute_infers_loopback_oif_for_loopback_gateway() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
+    let ns = crate::net::create_isolated_net_namespace_for_test("rtnl-route-lo")
+        .expect("namespace")
+        .payload_cap()
+        .expect("namespace payload");
+    let root = crate::cred::Cred::root();
+    let lo_ifindex = ifindex_for(&ns.link_snapshot(), "lo");
+
+    let add_req = nlmsg(
+        RTM_NEWROUTE,
+        NLM_F_REQUEST | NLM_F_ACK,
+        63,
+        &newroute_payload(32, Some([10, 6, 6, 6]), Some([127, 0, 0, 1]), 0),
+    );
+    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &add_req)[0]);
+
+    let dump_req = nlmsg(RTM_GETROUTE, NLM_F_REQUEST | NLM_F_DUMP, 64, &rtmsg());
+    let routes = rtnetlink_handle_request(&ns, root, &dump_req);
+    assert!(routes.iter().any(|msg| {
+        nlmsg_type(msg) == RTM_NEWROUTE
+            && contains_bytes(msg, &[10, 6, 6, 6])
+            && contains_bytes(msg, &[127, 0, 0, 1])
+            && contains_bytes(msg, &lo_ifindex.to_le_bytes())
+    }));
+}
+
+#[test]
 fn net_namespace_fd_round_trips_payload() {
     init_zones();
     let _lock = crate::test_support::EPOCH_TEST_LOCK
@@ -411,6 +832,41 @@ fn rtnetlink_newlink_veth_without_peer_attr_uses_default_eth_peer() {
         .links
         .iter()
         .any(|link| link.name == "eth0" && link.kind == NetDeviceKind::Veth));
+}
+
+#[test]
+fn rtnetlink_newlink_veth_accepts_peer_payload_without_ifinfomsg_header() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
+    let ns = crate::net::create_isolated_net_namespace_for_test("rtnl-veth-busybox-peer")
+        .expect("namespace")
+        .payload_cap()
+        .expect("namespace payload");
+    let root = crate::cred::Cred::root();
+
+    let veth_req = nlmsg(
+        RTM_NEWLINK,
+        NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+        27,
+        &newlink_payload(
+            "ltp_ns_veth1",
+            veth_linkinfo_peer_attrs_only("ltp_ns_veth2"),
+        ),
+    );
+    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &veth_req)[0]);
+
+    let snapshot = ns.network_snapshot();
+    assert!(snapshot
+        .links
+        .iter()
+        .any(|link| link.name == "ltp_ns_veth1" && link.kind == NetDeviceKind::Veth));
+    assert!(snapshot
+        .links
+        .iter()
+        .any(|link| link.name == "ltp_ns_veth2" && link.kind == NetDeviceKind::Veth));
 }
 
 #[test]
@@ -764,11 +1220,28 @@ fn bridge_linkinfo() -> Vec<u8> {
     out
 }
 
+fn dummy_linkinfo() -> Vec<u8> {
+    let mut out = Vec::new();
+    push_attr_string(&mut out, IFLA_INFO_KIND, "dummy");
+    out
+}
+
 fn veth_linkinfo(peer_name: &str) -> Vec<u8> {
     let mut out = Vec::new();
     push_attr_string(&mut out, IFLA_INFO_KIND, "veth");
     let mut data = Vec::new();
     let mut peer = ifinfomsg(0, 0, 0);
+    push_attr_string(&mut peer, IFLA_IFNAME, peer_name);
+    push_attr(&mut data, VETH_INFO_PEER | NLA_F_NESTED, &peer);
+    push_attr(&mut out, IFLA_INFO_DATA | NLA_F_NESTED, &data);
+    out
+}
+
+fn veth_linkinfo_peer_attrs_only(peer_name: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_attr_string(&mut out, IFLA_INFO_KIND, "veth");
+    let mut data = Vec::new();
+    let mut peer = Vec::new();
     push_attr_string(&mut peer, IFLA_IFNAME, peer_name);
     push_attr(&mut data, VETH_INFO_PEER | NLA_F_NESTED, &peer);
     push_attr(&mut out, IFLA_INFO_DATA | NLA_F_NESTED, &data);
@@ -783,7 +1256,15 @@ fn veth_linkinfo_without_peer() -> Vec<u8> {
 }
 
 fn newaddr_payload(ifindex: u32, prefix_len: u8, addr: [u8; 4]) -> Vec<u8> {
-    let mut payload = vec![2, prefix_len, 0, 0];
+    let mut payload = vec![AF_INET, prefix_len, 0, 0];
+    payload.extend_from_slice(&ifindex.to_le_bytes());
+    push_attr(&mut payload, IFA_ADDRESS, &addr);
+    push_attr(&mut payload, IFA_LOCAL, &addr);
+    payload
+}
+
+fn newaddr6_payload(ifindex: u32, prefix_len: u8, addr: [u8; 16]) -> Vec<u8> {
+    let mut payload = vec![AF_INET6, prefix_len, 0, 0];
     payload.extend_from_slice(&ifindex.to_le_bytes());
     push_attr(&mut payload, IFA_ADDRESS, &addr);
     push_attr(&mut payload, IFA_LOCAL, &addr);
@@ -808,7 +1289,11 @@ fn ifinfomsg(index: u32, flags: u32, change: u32) -> Vec<u8> {
 }
 
 fn ifaddrmsg(index: u32, prefix_len: u8) -> Vec<u8> {
-    let mut payload = vec![2, prefix_len, 0, 0];
+    ifaddrmsg_family(AF_INET, index, prefix_len)
+}
+
+fn ifaddrmsg_family(family: u8, index: u32, prefix_len: u8) -> Vec<u8> {
+    let mut payload = vec![family, prefix_len, 0, 0];
     payload.extend_from_slice(&index.to_le_bytes());
     payload
 }
@@ -856,6 +1341,20 @@ fn ndmsg(ifindex: u32) -> Vec<u8> {
     payload.extend_from_slice(&0u16.to_le_bytes());
     payload.push(0);
     payload.push(0);
+    payload
+}
+
+fn newneigh_payload(ifindex: u32, ip: [u8; 4], mac: [u8; 6]) -> Vec<u8> {
+    let mut payload = ndmsg(ifindex);
+    payload[8..10].copy_from_slice(&2u16.to_le_bytes());
+    push_attr(&mut payload, NDA_DST, &ip);
+    push_attr(&mut payload, NDA_LLADDR, &mac);
+    payload
+}
+
+fn delneigh_payload(ifindex: u32, ip: [u8; 4]) -> Vec<u8> {
+    let mut payload = ndmsg(ifindex);
+    push_attr(&mut payload, NDA_DST, &ip);
     payload
 }
 

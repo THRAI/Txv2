@@ -1,0 +1,4 @@
+interface:
+  display_name: "tx Test Runtime Optimizer"
+  short_description: "Find and fix slow txKernel tests"
+  default_prompt: "Use $tx-test-runtime-optimizer to diagnose why this txKernel test is taking too long and propose the next optimization."

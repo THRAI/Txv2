@@ -111,6 +111,10 @@ pub enum Errno {
     ESTALE,
     /// Wait deadline expired. Linux value: 110.
     ETIMEDOUT,
+    // Net/link errnos required by the net subsystem that are not in main's
+    // alphabetical errno set (the rest were already restored above).
+    EMLINK,
+    ESOCKTNOSUPPORT,
 }
 
 impl Errno {
@@ -168,6 +172,8 @@ impl Errno {
             Errno::ESTALE => 116,
             Errno::ETIMEDOUT => 110,
             Errno::EINTR => 4,
+            Errno::EMLINK => 31,
+            Errno::ESOCKTNOSUPPORT => 94,
         }
     }
 }

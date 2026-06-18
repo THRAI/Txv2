@@ -688,6 +688,17 @@ impl ProcessIdentity {
             .unwrap_or_default()
     }
 
+    /// Snapshot the current open fd → `OpenFile` map. Restored alongside the
+    /// net subsystem re-home; used by `/proc/net/{tcp,udp,...}` enumeration to
+    /// walk every process's socket fds.
+    pub fn open_fds(&self) -> BTreeMap<u32, Cap<OpenFile>> {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.open_fds())
+            .unwrap_or_default()
+    }
+
     /// Internal: clear the entire close-on-exec set. Used by
     /// [`crate::process::execution::step_close_cloexec_fds`] after the
     /// sweep so future `fcntl(F_SETFD)` calls start from a clean

@@ -9,12 +9,17 @@ use crate::net::admin::NetAdminAuthority;
 use crate::net::packet::{PacketTxReadiness, RxFrame};
 
 mod bridge;
+mod dummy;
 mod veth;
 mod virtio;
+mod vlan;
 
 pub use bridge::{
     create_bridge_for_test_or_bootstrap, BridgeConfig, BridgeDevice, BridgeForwardOutcome,
     BridgeInstance, BridgePortSnapshot, BridgeSnapshot, BRIDGE_FORWARD_BUDGET_DEFAULT,
+};
+pub use dummy::{
+    create_dummy_for_test_or_bootstrap, DummyConfig, DummyDevice, DummyInstance, DUMMY_DEFAULT_MTU,
 };
 pub use veth::{
     create_veth_pair_for_test_or_bootstrap, VethDevice, VethEndpointConfig, VethPair,
@@ -25,6 +30,9 @@ pub use virtio::{
     VirtioNetQueueConfig, VirtioNetRxInjectOutcome, VirtioNetStats, VirtioNetStatsSnapshot,
     VirtioNetTxCompleteOutcome, VIRTIO_NET0_DEVICE, VIRTIO_NET0_REGISTRATION,
     VIRTIO_NET_DEFAULT_MTU, VIRTIO_NET_STAGING_MAJOR,
+};
+pub use vlan::{
+    create_vlan_for_test_or_bootstrap, VlanConfig, VlanDevice, VlanInstance, VLAN_DEFAULT_MTU,
 };
 
 pub type NetDeviceIrqOutcome = VirtioNetIrqOutcome;
@@ -56,8 +64,10 @@ impl EthernetAddress {
 pub enum NetDeviceKind {
     Loopback,
     Ethernet,
+    Dummy,
     Veth,
     Bridge,
+    Vlan,
 }
 
 pub trait NetDeviceOps: Send + Sync + 'static {
@@ -166,6 +176,10 @@ pub fn net_device_snapshot() -> Vec<&'static NetDeviceRegistration> {
         idx += 1;
     }
     out
+}
+
+pub fn net_device_registry_len() -> usize {
+    NET_REGISTRY_LEN.load(Ordering::Acquire)
 }
 
 #[cfg(any(test, feature = "test-support"))]

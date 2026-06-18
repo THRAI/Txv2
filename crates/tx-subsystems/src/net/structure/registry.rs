@@ -80,7 +80,24 @@ pub(crate) fn create_connected_stream_for_accept_in_namespace(
     options: SocketOptionSet,
     net_namespace: PayloadCap<NetNamespacePayload>,
 ) -> Result<Cap<SocketIdentity>, ZoneError> {
-    let child = create_socket_in_namespace(SocketKind::Tcp, options, net_namespace)?;
+    create_connected_stream_for_accept_in_namespace_with_family(
+        local,
+        peer,
+        default_family_for_kind(SocketKind::Tcp),
+        options,
+        net_namespace,
+    )
+}
+
+pub(crate) fn create_connected_stream_for_accept_in_namespace_with_family(
+    local: IpEndpoint,
+    peer: IpEndpoint,
+    family: AddressFamily,
+    options: SocketOptionSet,
+    net_namespace: PayloadCap<NetNamespacePayload>,
+) -> Result<Cap<SocketIdentity>, ZoneError> {
+    let child =
+        create_socket_in_namespace_with_family(SocketKind::Tcp, family, options, net_namespace)?;
     set_connected_stream_state(&child, local, peer);
     Ok(child)
 }
@@ -127,7 +144,9 @@ const fn default_family_for_kind(kind: SocketKind) -> AddressFamily {
         SocketKind::Tcp | SocketKind::Udp | SocketKind::Sctp | SocketKind::RawIcmp => {
             AddressFamily::Inet
         }
-        SocketKind::NetlinkRoute | SocketKind::NetlinkNetfilter => AddressFamily::Netlink,
+        SocketKind::NetlinkRoute | SocketKind::NetlinkXfrm | SocketKind::NetlinkNetfilter => {
+            AddressFamily::Netlink
+        }
         SocketKind::Packet => AddressFamily::Packet,
         SocketKind::RdsSeqPacket => AddressFamily::Rds,
     }

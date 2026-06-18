@@ -281,9 +281,14 @@ fn udp_loopback_wildcard_server_reply_reaches_connected_client() {
             bytes: 4,
             source: Some(endpoint(40_197)),
             unix_source: None,
+            packet_source: None,
             destination: Some(endpoint(50_197)),
             truncated: false,
             became_empty: true,
+            eor: false,
+            sctp_notification: false,
+            sctp_stream: 0,
+            sctp_ppid: 0,
         })
     );
     assert_eq!(&response[..4], b"pong");
@@ -515,9 +520,14 @@ fn udp_loopback_msg_more_defers_until_uncork_send() {
             bytes: 6,
             source: Some(endpoint(50_208)),
             unix_source: None,
+            packet_source: None,
             destination: Some(IpEndpoint::new(Ipv4Address::LOOPBACK, 40_208)),
             truncated: false,
             became_empty: true,
+            eor: false,
+            sctp_notification: false,
+            sctp_stream: 0,
+            sctp_ppid: 0,
         })
     );
     assert_eq!(&out[..6], b"hello!");

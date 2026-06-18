@@ -1044,6 +1044,68 @@ pub fn deliver_posix_signal(target: SignalTarget, sig: Signum) -> KillOutcome {
     }
 }
 
+/// Deliver `sig` to `process` only when it has a user handler installed.
+///
+/// Returns `true` if a handler was present (signal posted; the AST runs it on
+/// return to userspace), `false` otherwise (no-op). The ITIMER_REAL expiry path
+/// uses this so an alarm-bounded blocking recv on a process *without* a SIGALRM
+/// handler keeps its EINTR-only behaviour — delivering the default action would
+/// terminate the process and regress e.g. LTP `recvfrom01` — while a process
+/// that registered a handler (e.g. busybox `ping`'s interval-driven sender)
+/// actually gets it run.
+/// Whether a pending unblocked signal on `thread` would actually interrupt a
+/// blocked slow syscall: a user handler is installed (EINTR + AST delivery on
+/// return) or the default action terminates the process. Pending-but-ignored
+/// signals (a shell's SIGCHLD churn) must NOT abort waits — Linux leaves the
+/// task parked for those. Consulted by blocking socket waits before parking.
+pub fn pending_signal_interrupts_wait(
+    thread: &Cap<crate::thread_runtime::ThreadIdentity>,
+    process: &Cap<ProcessIdentity>,
+) -> bool {
+    let Some(summary) = thread
+        .payload_cap()
+        .map(|payload| payload.interrupt_summary())
+    else {
+        return false;
+    };
+    if summary.termination {
+        return true;
+    }
+    if !summary.deliverable_signal {
+        return false;
+    }
+    // The summary bit is a denormalised hint; consult the real queues (the
+    // bit can be momentarily stale after an AST delivery).
+    let Some((sig, _source)) = select_next_signal(thread) else {
+        return false;
+    };
+    let disposition = match process.upgrade_operational() {
+        Ok(payload) => payload.sig_actions().get(sig),
+        Err(_) => return false,
+    };
+    match disposition {
+        SigDisposition::Handler(_) => true,
+        SigDisposition::Default => matches!(
+            default_action(sig),
+            DefaultAction::Term | DefaultAction::Core
+        ),
+        SigDisposition::Ignore => false,
+    }
+}
+
+pub fn deliver_signal_if_handler(process: &Cap<ProcessIdentity>, sig: Signum) -> bool {
+    let disposition = match process.upgrade_operational() {
+        Ok(payload) => payload.sig_actions().get(sig),
+        Err(_) => return false,
+    };
+    if matches!(disposition, SigDisposition::Handler(_)) {
+        step_kill_process(process, sig, None);
+        true
+    } else {
+        false
+    }
+}
+
 /// Target for `deliver_posix_signal`.
 ///
 /// Per `SIGNAL_v1` §12, a signal can be addressed to a process

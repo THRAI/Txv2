@@ -564,6 +564,11 @@ pub enum StructPayload {
     NetNamespace {
         payload: PayloadCap<NetNamespacePayload>,
     },
+    /// Mount-namespace-backed open file for `/proc/<pid>/ns/mnt`, consumed by
+    /// `setns(2)`. Restored alongside the net subsystem re-home.
+    MountNamespace {
+        payload: Cap<crate::mount::MountNamespace>,
+    },
 }
 
 // === live-node entities ===============================================
@@ -1519,6 +1524,21 @@ impl OpenFile {
     ) -> Option<(Cap<crate::pipe::PipePayload>, Cap<crate::pipe::PipePayload>)> {
         match &self.backing {
             OpenFileBacking::SocketPair { rx, tx } => Some((rx.clone(), tx.clone())),
+            _ => None,
+        }
+    }
+
+    /// Socket identity backing this open file, if it is a network socket.
+    /// Restored alongside the net subsystem re-home; used by
+    /// `/proc/net/{tcp,udp,...}` enumeration to walk a process's open sockets.
+    pub fn socket_identity(&self) -> Option<&Cap<SocketIdentity>> {
+        match &self.backing {
+            OpenFileBacking::Rnode { rnode } => match rnode.backing() {
+                RNodeBacking::StructBacked {
+                    payload: StructPayload::Socket { identity },
+                } => Some(identity),
+                _ => None,
+            },
             _ => None,
         }
     }

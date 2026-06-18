@@ -51,6 +51,13 @@ hardware/security-module heavy tests (`kvm`, `scsi_debug.part1`, `tpm_tools`,
 `ima`, `smack`), and large AIO/hugetlb/NUMA stress until core syscall and FS/VM
 coverage is stronger.
 
+Network native runtest progress is tracked separately in
+`docs/LTP/runtests/ltp-runtest-network-progress.md`. As of 2026-05-31,
+`net.ipv6_lib` judges `76/77`: `in6_01`, `in6_02`, `getaddrinfo_01`,
+`asapi_02`, and `asapi_03` pass under the local judge, while the only remaining
+`asapi_01` point is `getprotobyname("hopopt")` in the musl-linked test image,
+not a kernel networking gap.
+
 ## Full Module Commands
 
 ```bash

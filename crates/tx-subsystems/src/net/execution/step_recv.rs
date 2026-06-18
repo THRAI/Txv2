@@ -6,8 +6,8 @@ use crate::net::checks::require::require_socket_read_target;
 use crate::net::delegate::net_delegate_kick_poll;
 use crate::net::execution::{socket_recv_wait_token, yield_bytes_on_token, ByteStepOutcome};
 use crate::net::structure::{
-    RecvWireSet, SendRecvFlags, SocketIdentity, SocketPayload, SocketProtocol,
-    SocketRecvBytesOutcome, TcpState,
+    RecvWireSet, SendRecvFlags, SocketIdentity, SocketKind, SocketPayload, SocketProtocol,
+    SocketRecvBytesOutcome, SocketType, TcpState,
 };
 
 pub fn step_recv(
@@ -89,6 +89,13 @@ pub fn step_recv_kernel_bytes(
     }
 
     let Some(outcome) = payload.consume_recv_bytes_into(out, witness.flags) else {
+        // SCTP 1-to-1: with no data to drain, a recv on a socket whose
+        // association is not established — never connected (listening/bound/init)
+        // or locally shut down via SHUT_WR — returns ENOTCONN rather than
+        // blocking, matching Linux SCTP recvmsg.
+        if socket.kind == SocketKind::Sctp && sctp_recv_disconnected(&payload) {
+            return StepOutcome::Err(Errno::ENOTCONN);
+        }
         if recv_peer_closed(socket, &payload) {
             return StepOutcome::Done(SocketRecvBytesOutcome::default());
         }
@@ -114,6 +121,26 @@ fn kick_tcp_loopback_after_recv(payload: &SocketPayload, bytes: usize) {
         SocketProtocol::Tcp(TcpState::Connected { .. })
     ) {
         net_delegate_kick_poll();
+    }
+}
+
+/// True when an SCTP recv with no buffered data should report ENOTCONN. This is
+/// a 1-to-1 (TCP-style) concept only: the socket either never had an established
+/// association (listening/bound/init/closed/connecting) or has locally shut down
+/// the write side (SHUT_WR), tearing the association down. A 1-to-many
+/// (SEQPACKET) socket can receive from any peer, so an empty recv blocks instead.
+fn sctp_recv_disconnected(payload: &SocketPayload) -> bool {
+    let seqpacket = payload.with_options(|o| o.socket.sock_type == SocketType::SeqPacket);
+    match payload.protocol_snapshot() {
+        SocketProtocol::Sctp(TcpState::Connected { .. }) => payload.shutdown_wr(),
+        // 1-to-many: a listening socket (or one with associations) can still
+        // receive, so it blocks; one that is neither listening nor associated
+        // reports ENOTCONN.
+        SocketProtocol::Sctp(TcpState::Listening { .. }) if seqpacket => false,
+        SocketProtocol::Sctp(_) if seqpacket => payload.sctp_assoc_count() == 0,
+        // 1-to-1 (Stream): anything other than Connected is ENOTCONN.
+        SocketProtocol::Sctp(_) => true,
+        _ => false,
     }
 }
 

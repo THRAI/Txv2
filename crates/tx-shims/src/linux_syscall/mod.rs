@@ -164,7 +164,6 @@ mod event_notify;
 use event_notify::*;
 mod splice;
 use splice::*;
-mod net;
 
 mod ctx;
 pub use ctx::*;
@@ -263,27 +262,36 @@ pub use numbers::{
     NR_SENDFILE64,
 };
 
+// Socket / network + non-net syscall constants
+// (feature socket layer import; numbers already pulled above are omitted).
 pub use numbers::{
-    FSOPEN_CLOEXEC, FSPICK_CLOEXEC, FSPICK_EMPTY_PATH, FSPICK_NO_AUTOMOUNT,
-    FSPICK_SYMLINK_NOFOLLOW, NR_CAPGET, NR_CAPSET, NR_FADVISE64, NR_FSOPEN, NR_FSPICK, NR_KCMP,
-    NR_MINCORE, NR_MLOCK2, NR_MLOCKALL, NR_MUNLOCKALL, NR_OPEN_TREE, NR_PIDFD_GETFD,
-    NR_REMAP_FILE_PAGES, NR_SETGROUPS, NR_SETHOSTNAME, NR_SIGNALFD, OPEN_TREE_CLOEXEC,
-    OPEN_TREE_CLONE,
-};
-
-pub use numbers::{
-    AF_INET, AF_INET6, AF_NETLINK, AF_PACKET, AF_UNIX, CLOCK_BOOTTIME_ALARM, CLOCK_REALTIME_ALARM,
-    CLOCK_TAI, IPPROTO_ICMP, IPPROTO_IP, IPPROTO_IPV6, IPPROTO_TCP, IPPROTO_UDP, IPPROTO_UDPLITE,
-    IPT_SO_GET_ENTRIES, IPT_SO_GET_INFO, IPT_SO_SET_ADD_COUNTERS, IPT_SO_SET_REPLACE,
-    IPV6_ADDRFORM, IPV6_V6ONLY, IP_HDRINCL, IP_RECVERR, MCAST_JOIN_GROUP, MCAST_LEAVE_GROUP,
-    NETLINK_EXT_ACK, NETLINK_NETFILTER, NETLINK_ROUTE, PACKET_RESERVE, PACKET_RX_RING,
-    PACKET_VERSION, PACKET_VNET_HDR, SOL_IPV6, SOL_NETLINK, SOL_PACKET, SOL_SOCKET, SOL_TLS,
+    AF_INET, AF_INET6, AF_NETLINK, AF_PACKET, AF_UNIX, CLOCK_BOOTTIME_ALARM,
+    CLOCK_REALTIME_ALARM, CLOCK_TAI, FSOPEN_CLOEXEC, FSPICK_CLOEXEC, FSPICK_EMPTY_PATH,
+    FSPICK_NO_AUTOMOUNT, FSPICK_SYMLINK_NOFOLLOW, ICMP6_FILTER, IPPROTO_ICMP, IPPROTO_ICMPV6,
+    IPPROTO_IP, IPPROTO_IPV6, IPPROTO_TCP, IPPROTO_UDP, IPPROTO_UDPLITE, IPT_SO_GET_ENTRIES,
+    IPT_SO_GET_INFO, IPT_SO_SET_ADD_COUNTERS, IPT_SO_SET_REPLACE, IPV6_2292DSTOPTS,
+    IPV6_2292HOPLIMIT, IPV6_2292HOPOPTS, IPV6_2292PKTINFO, IPV6_2292RTHDR, IPV6_ADDRFORM,
+    IPV6_CHECKSUM, IPV6_HOPLIMIT, IPV6_PKTINFO, IPV6_RECVDSTOPTS, IPV6_RECVHOPLIMIT,
+    IPV6_RECVHOPOPTS, IPV6_RECVPKTINFO, IPV6_RECVRTHDR, IPV6_RECVTCLASS, IPV6_TCLASS,
+    IPV6_UNICAST_HOPS, IPV6_V6ONLY, IP_ADD_MEMBERSHIP, IP_DROP_MEMBERSHIP, IP_HDRINCL,
+    IP_MULTICAST_IF, IP_MULTICAST_LOOP, IP_MULTICAST_TTL, IP_RECVERR, IP_TTL, MCAST_JOIN_GROUP,
+    MCAST_LEAVE_GROUP, NETLINK_EXT_ACK, NETLINK_NETFILTER, NETLINK_ROUTE, NR_CAPGET, NR_CAPSET,
+    NR_FADVISE64, NR_FSOPEN, NR_FSPICK, NR_KCMP, NR_MINCORE, NR_MLOCK2, NR_MLOCKALL,
+    NR_MUNLOCKALL, NR_OPEN_TREE, NR_PIDFD_GETFD, NR_REMAP_FILE_PAGES, NR_SETGROUPS,
+    NR_SETHOSTNAME, NR_SIGNALFD, OPEN_TREE_CLOEXEC, OPEN_TREE_CLONE, PACKET_RESERVE,
+    PACKET_RX_RING, PACKET_VERSION, PACKET_VNET_HDR, SCTP_ASSOCINFO, SCTP_AUTOCLOSE,
+    SCTP_DEFAULT_SEND_PARAM, SCTP_DELAYED_ACK_TIME, SCTP_DISABLE_FRAGMENTS, SCTP_EVENTS,
+    SCTP_GET_LOCAL_ADDRS, SCTP_GET_PEER_ADDRS, SCTP_GET_PEER_ADDR_INFO, SCTP_INITMSG,
+    SCTP_MAXSEG, SCTP_PEER_ADDR_PARAMS, SCTP_PRIMARY_ADDR, SCTP_RTOINFO, SCTP_SOCKOPT_BINDX_ADD,
+    SCTP_SOCKOPT_BINDX_REM, SCTP_SOCKOPT_CONNECTX3, SCTP_SOCKOPT_PEELOFF, SCTP_STATUS,
+    SIOCADDRT, SIOCDARP, SIOCDELRT, SIOCGIFADDR, SIOCGIFBRDADDR, SIOCGIFCONF, SIOCGIFHWADDR,
+    SIOCGIFNAME, SIOCGIFNETMASK, SIOCSARP, SIOCSIFADDR, SIOCSIFBRDADDR, SIOCSIFNETMASK,
+    SOL_IPV6, SOL_NETLINK, SOL_PACKET, SOL_RAW, SOL_SCTP, SOL_SOCKET, SOL_TLS, SO_BINDTODEVICE,
     SO_BROADCAST, SO_DONTROUTE, SO_ERROR, SO_KEEPALIVE, SO_LINGER, SO_NO_CHECK, SO_OOBINLINE,
     SO_PEERCRED, SO_RCVBUF, SO_RCVTIMEO, SO_REUSEADDR, SO_REUSEPORT, SO_SNDBUF, SO_SNDBUFFORCE,
     SO_SNDTIMEO, SO_TYPE, TCP_CONGESTION, TCP_INFO, TCP_MAXSEG, TCP_NODELAY, TCP_ULP, TLS_TX,
     TPACKET_V1, TPACKET_V2, TPACKET_V3,
 };
-
 /// Maximum number of input bytes the Phase 2a `write` syscall accepts
 /// in a single call. The dispatcher copies `[buf_ptr, buf_ptr+len)` into
 /// a kernel-side stack-bounded slice (via `from_raw_parts`); higher-level
@@ -291,6 +299,10 @@ pub use numbers::{
 /// scope". 4 KiB matches a single page; values above that should batch
 /// across multiple write calls until the userspace-VA copy lane lands.
 pub const TTY_WRITE_MAX_INLINE: usize = 4096;
+
+/// Maximum bytes staged per inline socket `read(2)`/`write(2)` step (re-homed
+/// from the pre-rebase net tree; the rebase dropped it with the socket I/O lane).
+pub const SOCKET_IO_MAX_INLINE: usize = 64 * 1024;
 
 /// Maximum path-name length accepted by `execve(2)` (Linux's
 /// `PATH_MAX`). Mirrors the `TTY_WRITE_MAX_INLINE = 4096` discipline
@@ -323,6 +335,9 @@ pub(super) const ENOSYS_VALUE: i32 = 38;
 /// outside txKernel's current emulation contract.
 pub(super) const EOPNOTSUPP_VALUE: i32 = 95;
 pub(super) const ENODEV_VALUE: i32 = 19;
+/// Linux generic ABI errno value for "no such device or address" (`ENXIO`).
+/// Used by interface-index lookup helpers when an ifindex has no backing link.
+pub(super) const ENXIO_VALUE: i32 = 6;
 /// Linux generic ABI errno value for "bad file descriptor" (`EBADF`).
 pub(super) const EBADF_VALUE: i32 = 9;
 /// Linux generic ABI errno value for "too many open files" (`EMFILE`).
@@ -391,7 +406,6 @@ pub(super) const EROFS_VALUE: i32 = 30;
 /// cannot produce today (chmod/chown/access never block in
 /// tmpfs/devfs); matches `errno_to_i32`'s `Errno::EIO` row.
 pub(super) const EIO_VALUE: i32 = 5;
-pub const SOCKET_IO_MAX_INLINE: usize = 64 * 1024;
 /// Soft `RLIMIT_NOFILE` value exported by `prlimit64`.
 pub(super) const RLIMIT_NOFILE_CUR: u32 = 1024;
 
@@ -499,6 +513,11 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + tx_h
     // ripple into every test-stub platform.
     let l0_span = emit_syscall_enter(&req);
     let prev = tx_observe::set_current_parent_span(l0_span);
+    // Deliver an expired ITIMER_REAL on the generic syscall boundary (Linux
+    // delivers a fired alarm on the next return-to-userspace from any syscall).
+    // Without this, alarm-armed tight loops that never reach a socket wait
+    // (netperf UDP_STREAM/TCP_STREAM `send` bursts) never see SIGALRM and hang.
+    time::poll_itimer_real_on_syscall_boundary::<P>(ctx);
     let result = dispatch_inner::<P>(req, ctx).await;
     tx_observe::set_current_parent_span(prev);
     emit_syscall_exit(l0_span, &result);
@@ -551,6 +570,12 @@ pub fn dispatch_clone_oneshot<P: PmapIf>(
     }
     let flags = req.args[0];
     if (flags & CLONE_VFORK) != 0 && (flags & CLONE_THREAD) == 0 {
+        return None;
+    }
+    // Net/mount-namespace clones take the async fork path (namespace creation +
+    // SYS_ADMIN check); sys_clone_oneshot returns None for them, so this fast
+    // path must defer rather than `.expect(...)` a Some.
+    if (flags & (numbers::CLONE_NEWNET | numbers::CLONE_NEWNS)) != 0 {
         return None;
     }
 
@@ -681,7 +706,7 @@ pub fn dispatch_vm_try_oneshot(
 /// the userspace-run wait. The caller is responsible for proving any
 /// syscall-specific safety preconditions, such as signal quiescence for
 /// `rt_sigprocmask`.
-pub fn dispatch_direct_trap_oneshot(
+pub fn dispatch_direct_trap_oneshot<P: tx_hal::TimeIf>(
     req: &SyscallRequest,
     process: &Cap<ProcessIdentity>,
     thread: &Cap<ThreadIdentity>,
@@ -689,6 +714,32 @@ pub fn dispatch_direct_trap_oneshot(
 ) -> Option<SyscallResult> {
     match req.nr {
         NR_GETPPID => dispatch_cap_only_immediate(req, process),
+        // Pure queries / clock reads: never yield, never touch
+        // VFS/VM/reactor state. They reuse the same Lane-1 immediate
+        // handlers the generic dispatcher runs; serving them from the
+        // trap shell skips the full run_thread reactor round-trip
+        // (~576us measured end-to-end for getpid under TCG). The trap
+        // shell only routes here when no signal is pending (see
+        // `direct_syscall_preconditions`), so AST delivery timing is
+        // unchanged.
+        NR_GETPID | NR_GETTID | NR_GETUID | NR_GETEUID | NR_GETGID | NR_GETEGID
+        | NR_CLOCK_GETTIME | NR_GETTIMEOFDAY => {
+            let l0_span = emit_syscall_enter(req);
+            let ctx = SyscallCtx::new(process.clone(), thread.clone(), aspace.clone());
+            let result = match req.nr {
+                NR_GETPID => sys_getpid(&ctx),
+                NR_GETTID => sys_gettid(&ctx),
+                nr if nr == NR_GETUID => sys_getuid(&ctx),
+                nr if nr == NR_GETEUID => sys_geteuid(&ctx),
+                nr if nr == NR_GETGID => sys_getgid(&ctx),
+                nr if nr == NR_GETEGID => sys_getegid(&ctx),
+                nr if nr == NR_CLOCK_GETTIME => sys_clock_gettime::<P>(req.args, &ctx),
+                nr if nr == NR_GETTIMEOFDAY => sys_gettimeofday::<P>(req.args, &ctx),
+                _ => unreachable!("direct query prefilter covers all arms"),
+            };
+            emit_syscall_exit(l0_span, &result);
+            Some(result)
+        }
         NR_FUTEX => {
             let l0_span = emit_syscall_enter(req);
             let prev = tx_observe::set_current_parent_span(l0_span);
@@ -718,7 +769,7 @@ pub fn dispatch_direct_trap_oneshot(
 
 /// Direct trap-resume lane variant for call sites that already hold the
 /// current userspace thread payload.
-pub fn dispatch_direct_trap_payload_oneshot(
+pub fn dispatch_direct_trap_payload_oneshot<P: tx_hal::TimeIf>(
     req: &SyscallRequest,
     process: &Cap<ProcessIdentity>,
     thread: &Cap<ThreadIdentity>,
@@ -727,7 +778,7 @@ pub fn dispatch_direct_trap_payload_oneshot(
 ) -> Option<SyscallResult> {
     match req.nr {
         NR_RT_SIGPROCMASK => dispatch_thread_payload_aspace_oneshot(req, thread, payload, aspace),
-        _ => dispatch_direct_trap_oneshot(req, process, thread, aspace),
+        _ => dispatch_direct_trap_oneshot::<P>(req, process, thread, aspace),
     }
 }
 
@@ -928,21 +979,23 @@ async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + tx
         nr if nr == NR_SOCKET => sys_socket(req.args, ctx),
         nr if nr == NR_SOCKETPAIR => sys_socketpair(req.args, ctx),
         nr if nr == NR_BIND => sys_bind(req.args, ctx),
-        nr if nr == NR_LISTEN => sys_listen(req.args, ctx),
-        nr if nr == NR_ACCEPT => sys_accept::<P>(req.args, ctx).await,
-        nr if nr == NR_ACCEPT4 => sys_accept4::<P>(req.args, ctx).await,
-        nr if nr == NR_CONNECT => sys_connect(req.args, ctx).await,
         nr if nr == NR_GETSOCKNAME => sys_getsockname(req.args, ctx),
-        nr if nr == NR_GETPEERNAME => sys_getpeername(req.args, ctx),
+        nr if nr == NR_SETSOCKOPT => sys_setsockopt(req.args, ctx),
         nr if nr == NR_SENDTO => sys_sendto(req.args, ctx).await,
         nr if nr == NR_RECVFROM => sys_recvfrom::<P>(req.args, ctx).await,
-        nr if nr == NR_SENDMSG => sys_sendmsg(req.args, ctx).await,
-        nr if nr == NR_RECVMSG => sys_recvmsg(req.args, ctx).await,
-        nr if nr == NR_RECVMMSG => sys_recvmmsg::<P>(req.args, ctx).await,
-        nr if nr == NR_SENDMMSG => sys_sendmmsg(req.args, ctx).await,
-        nr if nr == NR_SETSOCKOPT => sys_setsockopt(req.args, ctx),
+        nr if nr == NR_LISTEN => sys_listen(req.args, ctx),
+        nr if nr == NR_CONNECT => sys_connect(req.args, ctx).await,
+        nr if nr == NR_ACCEPT => sys_accept::<P>(req.args, ctx).await,
+        nr if nr == NR_ACCEPT4 => sys_accept4::<P>(req.args, ctx).await,
+        nr if nr == NR_GETPEERNAME => sys_getpeername(req.args, ctx),
         nr if nr == NR_GETSOCKOPT => sys_getsockopt(req.args, ctx),
         nr if nr == NR_SHUTDOWN => sys_shutdown(req.args, ctx),
+        nr if nr == NR_SENDMSG => sys_sendmsg(req.args, ctx).await,
+        nr if nr == NR_RECVMSG => sys_recvmsg::<P>(req.args, ctx).await,
+        nr if nr == NR_SENDMMSG => sys_sendmmsg(req.args, ctx).await,
+        nr if nr == NR_RECVMMSG => sys_recvmmsg::<P>(req.args, ctx).await,
+        nr if nr == NR_SETITIMER => time::sys_setitimer::<P>(req.args, ctx),
+        nr if nr == NR_GETITIMER => time::sys_getitimer::<P>(req.args, ctx),
         nr if nr == NR_SENDFILE64 => sys_sendfile64(req.args, ctx).await,
         nr if nr == NR_PPOLL => sys_ppoll::<P>(req.args, ctx).await,
         nr if nr == NR_PSELECT6 => sys_pselect6::<P>(req.args, ctx).await,
@@ -1441,6 +1494,24 @@ pub(super) fn errno_to_i32(errno: Errno) -> i32 {
         Errno::ESTALE => 116,
         Errno::ETIMEDOUT => 110,
         Errno::EINTR => 4,
+        // Socket / network errnos (re-homed with the net syscall surface).
+        // Values mirror `tx_substrate::step::Errno::linux_i32`.
+        Errno::EADDRINUSE => 98,
+        Errno::EADDRNOTAVAIL => 99,
+        Errno::EAFNOSUPPORT => 97,
+        Errno::EALREADY => 114,
+        Errno::ECONNREFUSED => 111,
+        Errno::EDESTADDRREQ => 89,
+        Errno::EINPROGRESS => 115,
+        Errno::EISCONN => 106,
+        Errno::EMLINK => 31,
+        Errno::EMSGSIZE => 90,
+        Errno::ENOPROTOOPT => 92,
+        Errno::ENOTCONN => 107,
+        Errno::ENOTSOCK => 88,
+        Errno::EOPNOTSUPP => 95,
+        Errno::EPROTONOSUPPORT => 93,
+        Errno::ESOCKTNOSUPPORT => 94,
     }
 }
 

@@ -14,6 +14,7 @@ use tx_hal::{UserSaFlagsAbi, UserSigInfoAbi, UserSignalMaskAbi, UserTrapContext}
 use tx_subsystems::signal::step_kill_process;
 use tx_subsystems::thread_runtime::ThreadIdentity;
 
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(super) struct TimespecLayout {
@@ -917,5 +918,81 @@ pub(super) async fn sys_clock_nanosleep<'a, P: TimeIf>(
             }
         }
         other => other,
+    }
+}
+
+
+/// Fire `pid`'s ITIMER_REAL at expiry: re-arm the deadline and deliver SIGALRM
+/// to the process when it has a handler installed.
+///
+/// The socket recv wait calls this the moment the deadline is reached. Two
+/// effects matter:
+///
+///  1. **Re-arm.** A periodic timer (`it_interval > 0`) advances to `now +
+///     interval` (not `deadline + interval`, which under slow TCG could stay in
+///     the past and make a blocked recv spin returning EINTR); a one-shot timer
+///     is disarmed. Without this the passed deadline made every recv wake
+///     immediately — the busy loop seen on `ping01`.
+///  2. **SIGALRM.** Delivered only when a handler is installed (see
+///     [`tx_subsystems::signal::deliver_signal_if_handler`]). busybox `ping`
+///     sends each subsequent probe from its SIGALRM handler, so without delivery
+///     it only ever sent one packet; handler-less alarm users keep EINTR-only
+///     semantics and are not terminated.
+pub(super) fn fire_itimer_real<P: TimeIf>(pid: u32) {
+    let Some(process) = tx_subsystems::process::execution::process_by_pid(
+        tx_subsystems::process::structure::Pid(pid),
+    ) else {
+        return;
+    };
+    let Some(sigalrm) = tx_subsystems::signal::Signum::new(SIGALRM_SIGNUM) else {
+        return;
+    };
+    // No handler → preserve the existing EINTR-only contract: do not deliver and
+    // do not re-arm (the caller still returns EINTR for this expiry).
+    if !tx_subsystems::signal::deliver_signal_if_handler(&process, sigalrm) {
+        return;
+    }
+    let now_ns = P::read_ns();
+    let key = (pid, ITIMER_REAL);
+    let interval_ns = with_interval_timers(|timers| timers.get(&key).map(|timer| timer.interval_ns));
+    match interval_ns {
+        Some(interval) if interval > 0 => with_interval_timers(|timers| {
+            if let Some(timer) = timers.get_mut(&key) {
+                timer.deadline_ns = now_ns.saturating_add(interval);
+            }
+        }),
+        Some(_) => with_interval_timers(|timers| {
+            timers.remove(&key);
+        }),
+        None => {}
+    }
+}
+
+const SIGALRM_SIGNUM: u8 = 14;
+
+/// Generic syscall-boundary check for an expired ITIMER_REAL.
+///
+/// The socket recv path ([`super::socket`]) fires the timer at its own wait
+/// deadline, which covers alarm-bounded *blocking* recvs (e.g. busybox `ping`).
+/// But a process spinning in a tight non-blocking loop never reaches a socket
+/// wait: netperf's `UDP_STREAM`/`TCP_STREAM` send burst arms `alarm(N)` (→
+/// `setitimer(ITIMER_REAL)`) and then loops on `send`/`sendto` until its
+/// `SIGALRM` handler sets `times_up`. With delivery gated to the socket-wait
+/// path that handler never runs and the test sends forever (observed as a hang
+/// right after the test banner).
+///
+/// Linux delivers a fired ITIMER_REAL on the next return-to-userspace from ANY
+/// syscall. The dispatcher calls this on every syscall boundary to reproduce
+/// that: when the calling process's ITIMER_REAL deadline has passed, post
+/// SIGALRM (handler-gated, same contract as [`fire_itimer_real`]) so the AST
+/// checkpoint delivers the handler on this syscall's return. The common case —
+/// no armed ITIMER_REAL — is a single `BTreeMap` lookup that returns `None`.
+pub(super) fn poll_itimer_real_on_syscall_boundary<P: TimeIf>(ctx: &SyscallCtx<'_>) {
+    let pid = ctx.process.pid.0;
+    let Some(deadline_ns) = itimer_real_deadline_ns(pid) else {
+        return;
+    };
+    if P::read_ns() >= deadline_ns {
+        fire_itimer_real::<P>(pid);
     }
 }

@@ -12,9 +12,8 @@ use crate::net::protocol::{
 use crate::net::structure::registry;
 use crate::net::structure::table::{SocketTable, SOCKET_TABLE};
 use crate::net::structure::{
-    AddressFamily, ConnectionKey, IpEndpoint, Ipv4Address, RawIcmpState, RecvWireSet,
-    SocketIdentity, SocketKind, SocketProtocol, TcpBacklogEntry, TcpState, UdpInner,
-    TCP_BACKLOG_TIMEOUT_STAGING_MILLIS,
+    AddressFamily, ConnectionKey, IpEndpoint, Ipv4Address, RecvWireSet, SocketIdentity, SocketKind,
+    SocketProtocol, TcpBacklogEntry, TcpState, UdpInner, TCP_BACKLOG_TIMEOUT_STAGING_MILLIS,
 };
 
 use super::SmoltcpTcpSegment;
@@ -605,9 +604,7 @@ fn accepts_loopback_icmp_destination(iface: &LoopbackIface, dst: Ipv4Address) ->
 
 fn raw_icmp_accepts_reply(protocol: &SocketProtocol, dst: Ipv4Address) -> bool {
     match protocol {
-        SocketProtocol::RawIcmp(RawIcmpState { bound_local, .. }) => {
-            bound_local.is_none_or(|local| local == dst)
-        }
+        SocketProtocol::RawIcmp(state) => state.accepts_ipv4_reply_to(dst),
         _ => false,
     }
 }

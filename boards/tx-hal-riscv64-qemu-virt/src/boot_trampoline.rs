@@ -19,7 +19,11 @@ core::arch::global_asm!(
     .equ TX_RV64_IDENTITY_ROOT_SLOT, 2
     .equ TX_RV64_KERNEL_ROOT_SLOT, 510
     .equ TX_RV64_KERNEL_L1_START_SLOT, 1
-    .equ TX_RV64_KERNEL_ALIAS_L0_TABLES, 8
+    // Must equal `topology.rs::KERNEL_ALIAS_L0_TABLES` (= KERNEL_BOOTSTRAP_ALIAS_SIZE / 2M).
+    // 32M window / 2M per L0 table = 16. Bumped 8→16 so the grown debug kernel
+    // image (>16M after main's observe rings + the net subsystem) is fully mapped
+    // before satp turns on; an under-mapped kernel page-faults into a trap-vector loop.
+    .equ TX_RV64_KERNEL_ALIAS_L0_TABLES, 16
     .equ TX_RV64_PAGE_SIZE, 4096
     .equ TX_RV64_MAX_BOOT_CPUS, 4
     .equ TX_RV64_BOOT_STACK_STRIDE, 131072

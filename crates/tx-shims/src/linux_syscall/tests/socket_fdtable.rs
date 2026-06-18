@@ -6,18 +6,20 @@ use super::*;
 use super::super::{errno_to_i32, Errno};
 use crate::linux_syscall::{
     AF_INET, AF_INET6, AF_NETLINK, AF_PACKET, AF_UNIX, EACCES_VALUE, EAGAIN_VALUE, EBADF_VALUE,
-    EFAULT_VALUE, FD_CLOEXEC, F_GETFD, F_GETFL, F_SETFL, IPPROTO_ICMP, IPPROTO_IP, IPPROTO_IPV6,
-    IPPROTO_TCP, IPPROTO_UDP, IPPROTO_UDPLITE, IPT_SO_GET_ENTRIES, IPT_SO_GET_INFO,
-    IPT_SO_SET_REPLACE, IPV6_ADDRFORM, IP_HDRINCL, IP_RECVERR, NETLINK_EXT_ACK, NETLINK_NETFILTER,
-    NETLINK_ROUTE, NR_ACCEPT, NR_BIND, NR_CLOSE, NR_CONNECT, NR_DUP, NR_FCNTL, NR_GETSOCKNAME,
-    NR_GETSOCKOPT, NR_IOCTL, NR_LISTEN, NR_PIPE2, NR_PPOLL, NR_PSELECT6, NR_PSELECT6_TIME64,
-    NR_READ, NR_RECVFROM, NR_RECVMMSG, NR_RECVMSG, NR_SENDMMSG, NR_SENDMSG, NR_SENDTO,
-    NR_SETSOCKOPT, NR_SOCKET, NR_SOCKETPAIR, NR_WRITE, O_CLOEXEC, O_NONBLOCK, O_RDWR,
-    PACKET_RESERVE, PACKET_RX_RING, PACKET_VERSION, PACKET_VNET_HDR, SIOCGIFFLAGS, SIOCGIFINDEX,
-    SIOCGIFMTU, SIOCGIFTXQLEN, SIOCSIFFLAGS, SIOCSIFMTU, SOCKET_IO_MAX_INLINE, SOL_IPV6,
-    SOL_NETLINK, SOL_PACKET, SOL_SOCKET, SOL_TLS, SO_DONTROUTE, SO_ERROR, SO_PEERCRED, SO_RCVTIMEO,
-    SO_REUSEADDR, SO_SNDBUF, SO_SNDBUFFORCE, SO_TYPE, TCP_MAXSEG, TCP_ULP, TLS_TX, TPACKET_V3,
-    TTY_WRITE_MAX_INLINE,
+    EFAULT_VALUE, EINTR_VALUE, ENXIO_VALUE, FD_CLOEXEC, F_GETFD, F_GETFL, F_SETFL, IPPROTO_ICMP,
+    IPPROTO_ICMPV6, IPPROTO_IP, IPPROTO_IPV6, IPPROTO_TCP, IPPROTO_UDP, IPPROTO_UDPLITE,
+    IPT_SO_GET_ENTRIES, IPT_SO_GET_INFO, IPT_SO_SET_REPLACE, IPV6_ADDRFORM, IPV6_UNICAST_HOPS,
+    IP_HDRINCL, IP_MULTICAST_IF, IP_RECVERR, IP_TTL, ITIMER_REAL, NETLINK_EXT_ACK,
+    NETLINK_NETFILTER, NETLINK_ROUTE, NETLINK_XFRM, NR_ACCEPT, NR_BIND, NR_CLOSE, NR_CONNECT,
+    NR_DUP, NR_FCNTL, NR_GETSOCKNAME, NR_GETSOCKOPT, NR_IOCTL, NR_LISTEN, NR_PIPE2, NR_PPOLL,
+    NR_PSELECT6, NR_PSELECT6_TIME64, NR_READ, NR_RECVFROM, NR_RECVMMSG, NR_RECVMSG, NR_SENDMMSG,
+    NR_SENDMSG, NR_SENDTO, NR_SETITIMER, NR_SETSOCKOPT, NR_SOCKET, NR_SOCKETPAIR, NR_WRITE,
+    O_CLOEXEC, O_NONBLOCK, O_RDWR, PACKET_RESERVE, PACKET_RX_RING, PACKET_VERSION, PACKET_VNET_HDR,
+    SIOCDARP, SIOCGIFCONF, SIOCGIFFLAGS, SIOCGIFHWADDR, SIOCGIFINDEX, SIOCGIFMTU, SIOCGIFNAME,
+    SIOCGIFTXQLEN, SIOCSARP, SIOCSIFFLAGS, SIOCSIFMTU, SOCKET_IO_MAX_INLINE, SOL_IPV6, SOL_NETLINK,
+    SOL_PACKET, SOL_SOCKET, SOL_TLS, SO_BINDTODEVICE, SO_DONTROUTE, SO_ERROR, SO_PEERCRED,
+    SO_RCVTIMEO, SO_REUSEADDR, SO_SNDBUF, SO_SNDBUFFORCE, SO_TYPE, TCP_MAXSEG, TCP_ULP, TLS_TX,
+    TPACKET_V3, TTY_WRITE_MAX_INLINE,
 };
 use alloc::boxed::Box;
 use alloc::vec;
@@ -29,7 +31,11 @@ use tx_subsystems::net::protocol::{
     build_icmpv4_echo_request_message, loopback_iface, parse_icmpv4_payload,
 };
 use tx_subsystems::net::PollMask;
-use tx_subsystems::net::{Icmpv4EchoPacket, Icmpv4Event, Ipv4Address, UnixSocketPath};
+use tx_subsystems::net::{
+    create_veth_pair_for_test_or_bootstrap, EthernetAddress, Icmpv4EchoPacket, Icmpv4Event,
+    Ipv4Address, NetAdminAuthority, UnixSocketPath, VethEndpointConfig, VethPairConfig,
+    VETH_DEFAULT_MTU,
+};
 use tx_subsystems::vfs::structure::{RNodeBacking, StructPayload};
 
 const SOCK_STREAM: u64 = 1;
@@ -44,16 +50,23 @@ const SOCKADDR_LL_BYTES: u32 = 20;
 const TEST_POLLIN: i16 = 0x0001;
 const TEST_POLLOUT: i16 = 0x0004;
 const ETH_P_ALL: u16 = 0x0003;
+const ETH_P_ARP: u16 = 0x0806;
 const ETH_P_ALL_NET: u16 = 0x0300;
+const ARPHRD_ETHER: u16 = 1;
+const ATF_COM: i32 = 0x02;
+const ATF_PERM: i32 = 0x04;
 const MSG_DONTWAIT: u64 = 0x40;
 const MSG_MORE: u64 = 0x8000;
 const E_PERM: i32 = 1;
 const NLM_F_REQUEST: u16 = 0x0001;
+const NLM_F_MULTI: u16 = 0x0002;
 const NLM_F_DUMP: u16 = 0x0300;
 const MSG_PEEK: u64 = 0x02;
 const MSG_TRUNC: u64 = 0x20;
 const RTM_NEWLINK: u16 = 16;
 const RTM_GETLINK: u16 = 18;
+const NLMSG_DONE: u16 = 3;
+const XFRM_MSG_GETSA: u16 = 0x12;
 const NFNL_SUBSYS_NFTABLES: u16 = 10;
 const NFT_MSG_GETTABLE: u16 = 1;
 const NFT_MSG_NEWTABLE: u16 = 0;
@@ -98,6 +111,18 @@ struct TestMmsghdr {
 struct TestTimespec {
     tv_sec: i64,
     tv_nsec: i64,
+}
+
+#[repr(C)]
+struct TestTimeval {
+    tv_sec: i64,
+    tv_usec: i64,
+}
+
+#[repr(C)]
+struct TestItimerval {
+    interval: TestTimeval,
+    value: TestTimeval,
 }
 
 #[repr(C)]
@@ -174,6 +199,21 @@ fn sockaddr_ll(protocol: u16, ifindex: i32) -> [u8; SOCKADDR_LL_BYTES as usize] 
     bytes
 }
 
+fn arpreq(ip: [u8; 4], dev: &str, mac: Option<EthernetAddress>) -> [u8; 68] {
+    let mut bytes = [0u8; 68];
+    bytes[0..2].copy_from_slice(&AF_INET.to_le_bytes());
+    bytes[4..8].copy_from_slice(&ip);
+    if let Some(mac) = mac {
+        bytes[16..18].copy_from_slice(&ARPHRD_ETHER.to_le_bytes());
+        bytes[18..24].copy_from_slice(&mac.octets());
+        bytes[32..36].copy_from_slice(&(ATF_COM | ATF_PERM).to_le_bytes());
+    }
+    let name = dev.as_bytes();
+    let copy_len = core::cmp::min(name.len(), 15);
+    bytes[52..52 + copy_len].copy_from_slice(&name[..copy_len]);
+    bytes
+}
+
 fn rtnl_getlink_request(seq: u32) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(0);
@@ -238,12 +278,27 @@ fn nft_table_request(seq: u32, op: u16, name: &str) -> Vec<u8> {
     out
 }
 
+fn xfrm_dump_request(seq: u32) -> Vec<u8> {
+    let len = 16u32;
+    let mut out = Vec::new();
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(&XFRM_MSG_GETSA.to_le_bytes());
+    out.extend_from_slice(&(NLM_F_REQUEST | NLM_F_DUMP).to_le_bytes());
+    out.extend_from_slice(&seq.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out
+}
+
 fn nft_msg(op: u16) -> u16 {
     (NFNL_SUBSYS_NFTABLES << 8) | op
 }
 
 fn nlmsg_type(msg: &[u8]) -> u16 {
     u16::from_le_bytes([msg[4], msg[5]])
+}
+
+fn nlmsg_flags(msg: &[u8]) -> u16 {
+    u16::from_le_bytes([msg[6], msg[7]])
 }
 
 fn nlmsg_error_code(msg: &[u8]) -> i32 {
@@ -270,6 +325,24 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
         .any(|window| window == needle)
+}
+
+fn contains_nlmsg_type(mut bytes: &[u8], kind: u16) -> bool {
+    while bytes.len() >= 16 {
+        let len = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        if len < 16 || len > bytes.len() {
+            return false;
+        }
+        if u16::from_le_bytes(bytes[4..6].try_into().unwrap()) == kind {
+            return true;
+        }
+        let aligned = (len + 3) & !3;
+        if aligned > bytes.len() {
+            return false;
+        }
+        bytes = &bytes[aligned..];
+    }
+    false
 }
 
 fn socket_stream(ctx: &SyscallCtx<'static>, type_flags: u64) -> i64 {
@@ -320,6 +393,17 @@ fn socket_icmp(ctx: &SyscallCtx<'static>, type_flags: u64) -> i64 {
     ) {
         SyscallResult::Return(fd) => fd,
         other => panic!("socket(AF_INET, ICMP) failed: {other:?}"),
+    }
+}
+
+fn socket_icmp6(ctx: &SyscallCtx<'static>, type_flags: u64) -> i64 {
+    match socket_req(
+        NR_SOCKET,
+        [AF_INET6 as u64, type_flags, IPPROTO_ICMPV6 as u64, 0, 0, 0],
+        ctx,
+    ) {
+        SyscallResult::Return(fd) => fd,
+        other => panic!("socket(AF_INET6, ICMPV6) failed: {other:?}"),
     }
 }
 
@@ -404,6 +488,135 @@ fn dispatch_udplite_socket_reports_datagram_type() {
 }
 
 #[test]
+fn dispatch_setsockopt_so_bindtodevice_accepts_existing_link() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = match socket_req(
+        NR_SOCKET,
+        [AF_INET as u64, SOCK_DGRAM, IPPROTO_ICMP as u64, 0, 0, 0],
+        &ctx,
+    ) {
+        SyscallResult::Return(fd) => fd,
+        other => panic!("socket(AF_INET, DGRAM, ICMP) failed: {other:?}"),
+    };
+
+    let iface = b"lo\0";
+    assert_eq!(
+        socket_req(
+            NR_SETSOCKOPT,
+            [
+                fd as u64,
+                SOL_SOCKET as u64,
+                SO_BINDTODEVICE as u64,
+                iface.as_ptr() as u64,
+                iface.len() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let mut out = [0u8; 16];
+    let mut out_len = out.len() as u32;
+    assert_eq!(
+        socket_req(
+            NR_GETSOCKOPT,
+            [
+                fd as u64,
+                SOL_SOCKET as u64,
+                SO_BINDTODEVICE as u64,
+                out.as_mut_ptr() as u64,
+                (&mut out_len as *mut u32) as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(out_len, iface.len() as u32);
+    assert_eq!(&out[..iface.len()], iface);
+
+    let missing = b"missing0\0";
+    assert_eq!(
+        socket_req(
+            NR_SETSOCKOPT,
+            [
+                fd as u64,
+                SOL_SOCKET as u64,
+                SO_BINDTODEVICE as u64,
+                missing.as_ptr() as u64,
+                missing.len() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Error(errno_to_i32(Errno::ENODEV))
+    );
+}
+
+#[test]
+fn dispatch_setsockopt_ip_multicast_if_round_trips_local_ipv4() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_icmp(&ctx, SOCK_RAW);
+    let loopback = [127u8, 0, 0, 1];
+
+    assert_eq!(
+        socket_req(
+            NR_SETSOCKOPT,
+            [
+                fd as u64,
+                IPPROTO_IP as u64,
+                IP_MULTICAST_IF as u64,
+                loopback.as_ptr() as u64,
+                loopback.len() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let mut out = [0u8; 4];
+    let mut out_len = out.len() as u32;
+    assert_eq!(
+        socket_req(
+            NR_GETSOCKOPT,
+            [
+                fd as u64,
+                IPPROTO_IP as u64,
+                IP_MULTICAST_IF as u64,
+                out.as_mut_ptr() as u64,
+                (&mut out_len as *mut u32) as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(out_len, loopback.len() as u32);
+    assert_eq!(out, loopback);
+
+    let missing = [203u8, 0, 113, 44];
+    assert_eq!(
+        socket_req(
+            NR_SETSOCKOPT,
+            [
+                fd as u64,
+                IPPROTO_IP as u64,
+                IP_MULTICAST_IF as u64,
+                missing.as_ptr() as u64,
+                missing.len() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Error(errno_to_i32(Errno::EADDRNOTAVAIL))
+    );
+}
+
+#[test]
 fn dispatch_inet6_udp_bind_getsockname_round_trips_sockaddr_in6() {
     let _setup = socket_setup();
     let (_process, ctx) = socket_ctx();
@@ -448,6 +661,95 @@ fn dispatch_inet6_udp_bind_getsockname_round_trips_sockaddr_in6() {
     assert_eq!(u16::from_le_bytes([out[0], out[1]]), AF_INET6);
     assert_ne!(u16::from_be_bytes([out[2], out[3]]), 0);
     assert_eq!(&out[8..24], &loopback);
+}
+
+#[test]
+fn dispatch_raw_icmpv6_getsockname_reports_sockaddr_in6() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_icmp6(&ctx, SOCK_RAW);
+
+    let mut out = [0u8; SOCKADDR_IN6_BYTES as usize];
+    let mut out_len = SOCKADDR_IN6_BYTES;
+    assert_eq!(
+        socket_req(
+            NR_GETSOCKNAME,
+            [
+                fd as u64,
+                out.as_mut_ptr() as u64,
+                (&mut out_len as *mut u32) as u64,
+                0,
+                0,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(out_len, SOCKADDR_IN6_BYTES);
+    assert_eq!(u16::from_le_bytes([out[0], out[1]]), AF_INET6);
+    assert_eq!(&out[8..24], &[0u8; 16]);
+}
+
+#[test]
+fn dispatch_raw_icmpv6_unicast_hops_round_trips() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = socket_icmp6(&ctx, SOCK_RAW);
+
+    let hops: i32 = 1;
+    assert_eq!(
+        socket_req(
+            NR_SETSOCKOPT,
+            [
+                fd as u64,
+                SOL_IPV6 as u64,
+                IPV6_UNICAST_HOPS as u64,
+                (&hops as *const i32) as u64,
+                core::mem::size_of::<i32>() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+
+    let mut out: i32 = 0;
+    let mut out_len: u32 = core::mem::size_of::<i32>() as u32;
+    assert_eq!(
+        socket_req(
+            NR_GETSOCKOPT,
+            [
+                fd as u64,
+                SOL_IPV6 as u64,
+                IPV6_UNICAST_HOPS as u64,
+                (&mut out as *mut i32) as u64,
+                (&mut out_len as *mut u32) as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(out, hops);
+    assert_eq!(out_len, core::mem::size_of::<i32>() as u32);
+
+    let invalid: i32 = 0;
+    assert_eq!(
+        socket_req(
+            NR_SETSOCKOPT,
+            [
+                fd as u64,
+                SOL_IPV6 as u64,
+                IPV6_UNICAST_HOPS as u64,
+                (&invalid as *const i32) as u64,
+                core::mem::size_of::<i32>() as u64,
+                0,
+            ],
+            &ctx,
+        ),
+        SyscallResult::Error(errno_to_i32(Errno::EINVAL))
+    );
 }
 
 #[test]
@@ -614,6 +916,24 @@ fn socket_netfilter(ctx: &SyscallCtx<'static>) -> i64 {
     ) {
         SyscallResult::Return(fd) => fd,
         other => panic!("socket(AF_NETLINK, RAW, NETLINK_NETFILTER) failed: {other:?}"),
+    }
+}
+
+fn socket_xfrm(ctx: &SyscallCtx<'static>) -> i64 {
+    match socket_req(
+        NR_SOCKET,
+        [
+            AF_NETLINK as u64,
+            SOCK_RAW | O_CLOEXEC as u64,
+            NETLINK_XFRM as u64,
+            0,
+            0,
+            0,
+        ],
+        ctx,
+    ) {
+        SyscallResult::Return(fd) => fd,
+        other => panic!("socket(AF_NETLINK, RAW, NETLINK_XFRM) failed: {other:?}"),
     }
 }
 

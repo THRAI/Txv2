@@ -395,7 +395,8 @@ impl OpenFile {
                 } => StepOutcome::Err(Errno::EBADF),
                 StructPayload::FsNotify { .. }
                 | StructPayload::Socket { .. }
-                | StructPayload::NetNamespace { .. } => StepOutcome::Err(Errno::EINVAL),
+                | StructPayload::NetNamespace { .. }
+                | StructPayload::MountNamespace { .. } => StepOutcome::Err(Errno::EINVAL),
             },
             RNodeBacking::Directory => StepOutcome::Err(Errno::EISDIR),
             // PR-11 follow-up (W-KK, closing the ENOSYS gap W-JJ flagged
@@ -508,7 +509,8 @@ impl OpenFile {
                 | StructPayload::Pipe { .. }
                 | StructPayload::FsNotify { .. }
                 | StructPayload::Socket { .. }
-                | StructPayload::NetNamespace { .. } => return StepOutcome::Err(Errno::ESPIPE),
+                | StructPayload::NetNamespace { .. }
+                | StructPayload::MountNamespace { .. } => return StepOutcome::Err(Errno::ESPIPE),
             },
             RNodeBacking::Directory => {
                 let current = self.readdir_cursor().as_u64() as i64;
@@ -646,7 +648,8 @@ impl OpenFile {
                 } => StepOutcome::Err(Errno::EBADF),
                 StructPayload::FsNotify { .. }
                 | StructPayload::Socket { .. }
-                | StructPayload::NetNamespace { .. } => StepOutcome::Err(Errno::EINVAL),
+                | StructPayload::NetNamespace { .. }
+                | StructPayload::MountNamespace { .. } => StepOutcome::Err(Errno::EINVAL),
             },
             RNodeBacking::Directory => StepOutcome::Err(Errno::EISDIR),
             // Symmetric to the PageBacked step_read arm above — route
@@ -741,7 +744,8 @@ impl OpenFile {
                 StructPayload::Pipe { .. } => StepOutcome::Err(Errno::ENOTTY),
                 StructPayload::FsNotify { .. }
                 | StructPayload::Socket { .. }
-                | StructPayload::NetNamespace { .. } => StepOutcome::Err(Errno::ENOTTY),
+                | StructPayload::NetNamespace { .. }
+                | StructPayload::MountNamespace { .. } => StepOutcome::Err(Errno::ENOTTY),
             },
             RNodeBacking::Directory => StepOutcome::Err(Errno::EISDIR),
             RNodeBacking::PageBacked { .. }

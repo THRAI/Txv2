@@ -7,15 +7,16 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use tx_subsystems::cross_crate_test_support::{clear_caps_for_test, set_cred_ids_for_test};
 use tx_subsystems::mount::{
-    DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, SourceLabel,
+    DevId, MountFlags, MountId, MountIdentity, MountNamespace, MountOptions, MountPayload,
+    SourceLabel,
 };
-use tx_subsystems::process::step_chdir;
+use tx_subsystems::process::{step_chdir, step_set_mount_namespace};
 use tx_subsystems::vfs::structure::{DEntry, InlineName, RNodeBacking, StructPayload, S_IFREG};
 use tx_subsystems::vfs::FsOps;
 
 use crate::linux_syscall::{
-    AT_FDCWD, CLONE_NEWNET, CLONE_NEWUSER, EPERM_VALUE, NR_OPENAT, NR_SETNS, NR_UNSHARE, NR_WRITE,
-    O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY,
+    AT_FDCWD, CLONE_NEWNET, CLONE_NEWNS, CLONE_NEWUSER, EPERM_VALUE, NR_OPENAT, NR_SETNS,
+    NR_UNSHARE, NR_WRITE, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY,
 };
 
 fn netns_req(nr: u64, args: [u64; 6], ctx: &SyscallCtx<'static>) -> SyscallResult {
@@ -427,6 +428,64 @@ fn dispatch_setns_clone_newnet_joins_namespace_fd_payload() {
     assert_eq!(
         process.net_namespace().expect("joined net namespace").key(),
         target.key()
+    );
+}
+
+#[test]
+fn dispatch_setns_clone_newns_joins_proc_mnt_namespace_fd_payload() {
+    let _setup = setup();
+    let procfs_root = build_procfs_root(74, 74);
+    let (_root_dentry, root_mount) = build_mount_api_test_root();
+    let process = bootstrap();
+    let parent_mnt_ns = MountNamespace::new_cap(root_mount).expect("parent mount namespace");
+    step_set_mount_namespace(&process, parent_mnt_ns.clone()).expect("install parent mnt ns");
+    match step_chdir(&process, procfs_root) {
+        tx_subsystems::process::ChdirOutcome::Replaced { .. } => {}
+        tx_subsystems::process::ChdirOutcome::ZombieIgnored => {
+            panic!("parent process zombified")
+        }
+    }
+    let child = tx_subsystems::process::step_fork_with_options::<ShimsTestPmap>(
+        &process,
+        tx_subsystems::process::ForkOptions {
+            clone_newns: true,
+            ..tx_subsystems::process::ForkOptions::default()
+        },
+    )
+    .expect("fork child process with CLONE_NEWNS");
+    let child_mnt_ns = child.mount_namespace_cap().expect("child mount namespace");
+    assert_ne!(parent_mnt_ns.key().raw(), child_mnt_ns.key().raw());
+
+    let thread = first_thread(&process);
+    let ctx = make_ctx(process.clone(), thread);
+    let path = nul_terminate(alloc::format!("/{}/ns/mnt", child.pid.0).as_bytes());
+    let result = netns_req(
+        NR_OPENAT,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            O_RDONLY as u64,
+            0,
+            0,
+            0,
+        ],
+        &ctx,
+    );
+    let fd = match result {
+        SyscallResult::Return(fd) if fd >= 0 => fd as u32,
+        other => panic!("openat(/<pid>/ns/mnt) failed: {other:?}"),
+    };
+
+    let result = netns_req(NR_SETNS, [fd as u64, CLONE_NEWNS, 0, 0, 0, 0], &ctx);
+
+    assert_eq!(result, SyscallResult::Return(0));
+    assert_eq!(
+        process
+            .mount_namespace_cap()
+            .expect("joined mount namespace")
+            .key()
+            .raw(),
+        child_mnt_ns.key().raw()
     );
 }
 

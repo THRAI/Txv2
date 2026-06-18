@@ -1,8 +1,8 @@
 use crate::execution::Errno;
 use crate::net::structure::{
     AddressFamily, IpEndpoint, KernelSockAddr, RdsState, SendRecvFlags, SockAddrIn, SockAddrIn6,
-    SockShutdownCmd, SocketIdentity, SocketKind, SocketPayload, SocketProtocol, TcpState, UdpInner,
-    UnixDatagramState, UnixStreamState,
+    SockShutdownCmd, SocketIdentity, SocketKind, SocketPayload, SocketProtocol, SocketType,
+    TcpState, UdpInner, UnixDatagramState, UnixStreamState,
 };
 
 pub(crate) fn endpoint_from_sockaddr(addr: KernelSockAddr) -> Result<IpEndpoint, Errno> {
@@ -40,7 +40,10 @@ fn require_local_bind_addr(
 ) -> Result<IpEndpoint, Errno> {
     match endpoint.family {
         AddressFamily::Inet => {
+            // Linux treats the entire 127.0.0.0/8 as loopback-local, so any such
+            // address is bindable (SCTP multi-homing tests bind 127.0.0.1..6).
             if endpoint.addr == crate::net::structure::Ipv4Address::UNSPECIFIED
+                || endpoint.addr.octets()[0] == 127
                 || payload.net_namespace().owns_ipv4_addr(endpoint.addr)
             {
                 Ok(endpoint)
@@ -50,7 +53,7 @@ fn require_local_bind_addr(
         }
         AddressFamily::Inet6 => {
             if endpoint.addr6 == crate::net::structure::Ipv6Address::UNSPECIFIED
-                || endpoint.addr6 == crate::net::structure::Ipv6Address::LOOPBACK
+                || payload.net_namespace().owns_ipv6_addr(endpoint.addr6)
             {
                 Ok(endpoint)
             } else {
@@ -68,14 +71,15 @@ fn require_socket_family(
     if payload.family() == endpoint.family {
         return Ok(endpoint);
     }
-    // Dual-stack: a non-`IPV6_V6ONLY` IPv6 socket may target an IPv4 peer (Linux
-    // maps it to `::ffff:a.b.c.d`). iperf3's UDP server binds dual-stack `[::]`
-    // and connects back to the IPv4 client; this is the connect that path needs.
-    // The loopback stack keeps the IPv4 endpoint and resolves the source family
-    // at egress, so the IPv4 endpoint flows through unchanged.
+    // Dual-stack: a non-v6only IPv6 socket may target an IPv4 peer. Linux exposes
+    // the peer as a v4-mapped `::ffff:a.b.c.d` address; this loopback model carries
+    // it as a native IPv4 endpoint, and the connection/send paths key on that IPv4
+    // endpoint so the reply reaches the IPv4 peer. iperf3's server binds its UDP
+    // data socket to `[::]` and connect()s back to the IPv4 client it just heard
+    // from — without this that connect fails EAFNOSUPPORT and the test aborts.
     if payload.family() == AddressFamily::Inet6
         && endpoint.family == AddressFamily::Inet
-        && !payload.with_options(|options| options.ip.ipv6_v6only)
+        && !payload.with_options(|o| o.ip.ipv6_v6only)
     {
         return Ok(endpoint);
     }
@@ -150,12 +154,30 @@ pub(crate) fn socket_can_bind(
                 }
                 require_local_bind_addr(payload, endpoint)
             }
-            (SocketKind::RawIcmp, SocketProtocol::RawIcmp(state))
-                if state.bound_local.is_none() =>
-            {
+            (SocketKind::RawIcmp, SocketProtocol::RawIcmp(state)) => {
                 let endpoint = raw_bind_endpoint(addr)?;
                 let endpoint = require_socket_family(payload, endpoint)?;
-                require_local_bind_addr(payload, endpoint)
+                let endpoint = require_local_bind_addr(payload, endpoint)?;
+                match endpoint.family {
+                    AddressFamily::Inet => {
+                        if state.bound_local.is_none_or(|local| local == endpoint.addr) {
+                            Ok(endpoint)
+                        } else {
+                            Err(Errno::EINVAL)
+                        }
+                    }
+                    AddressFamily::Inet6 => {
+                        if state
+                            .bound_local6
+                            .is_none_or(|local| local == endpoint.addr6)
+                        {
+                            Ok(endpoint)
+                        } else {
+                            Err(Errno::EINVAL)
+                        }
+                    }
+                    _ => Err(Errno::EAFNOSUPPORT),
+                }
             }
             _ => Err(Errno::EINVAL),
         }
@@ -248,6 +270,16 @@ pub(crate) fn socket_can_connect(
             (SocketKind::Sctp, SocketProtocol::Sctp(TcpState::Connected { .. })) => {
                 Err(Errno::EISCONN)
             }
+            // A 1-to-many (SEQPACKET) listening socket may also initiate new
+            // associations; a 1-to-1 (TCP-style) connect() on a listening socket
+            // is rejected with EISCONN, like connect() on an established one.
+            (SocketKind::Sctp, SocketProtocol::Sctp(TcpState::Listening { .. })) => {
+                if payload.with_options(|o| o.socket.sock_type == SocketType::SeqPacket) {
+                    require_socket_family(payload, endpoint_from_sockaddr(addr)?)
+                } else {
+                    Err(Errno::EISCONN)
+                }
+            }
             (
                 SocketKind::Udp,
                 SocketProtocol::Udp(
@@ -293,7 +325,22 @@ pub(crate) fn socket_can_shutdown(
     socket: &SocketIdentity,
     _how: SockShutdownCmd,
 ) -> Result<(), Errno> {
-    socket_payload_present(socket)
+    socket.with_payload_for_check(|payload| {
+        let Some(payload) = payload else {
+            return Err(Errno::ENOTCONN);
+        };
+        // SCTP 1-to-1: shutdown() on a socket with no established association
+        // returns ENOTCONN.
+        if socket.kind == SocketKind::Sctp
+            && !matches!(
+                payload.protocol_snapshot(),
+                SocketProtocol::Sctp(TcpState::Connected { .. })
+            )
+        {
+            return Err(Errno::ENOTCONN);
+        }
+        Ok(())
+    })
 }
 
 pub(crate) fn socket_can_poll(socket: &SocketIdentity) -> Result<(), Errno> {

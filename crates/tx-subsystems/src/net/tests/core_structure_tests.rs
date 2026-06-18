@@ -122,6 +122,7 @@ fn socket_type_validation_maps_to_kind() {
     let dgram_udplite = ValidSocketType::validate(2, 2, 136).expect("udplite socket");
     let dgram_icmp = ValidSocketType::validate(2, 2, 1).expect("ping socket");
     let raw_icmp = ValidSocketType::validate(2, 3, 1).expect("raw icmp socket");
+    let xfrm = ValidSocketType::validate(16, 3, 6).expect("netlink xfrm socket");
     let nft = ValidSocketType::validate(16, 3, 12).expect("netlink netfilter socket");
     let packet = ValidSocketType::validate(17, 3, 0x0300).expect("packet socket");
     let default_stream = ValidSocketType::validate(2, 1, 0).expect("default tcp socket");
@@ -166,6 +167,10 @@ fn socket_type_validation_maps_to_kind() {
     assert_eq!(
         SocketKind::from_valid_socket_type(nft),
         Ok(SocketKind::NetlinkNetfilter)
+    );
+    assert_eq!(
+        SocketKind::from_valid_socket_type(xfrm),
+        Ok(SocketKind::NetlinkXfrm)
     );
     assert_eq!(packet.domain, AddressFamily::Packet);
     assert_eq!(
@@ -249,21 +254,120 @@ fn raw_icmp_bind_records_local_addr_without_port() {
             .protocol_snapshot(),
         SocketProtocol::RawIcmp(RawIcmpState {
             bound_local: Some(Ipv4Address::LOOPBACK),
+            bound_local6: None,
             protocol: ProtocolNumber(1),
+            icmp6_filter: [0; 8],
         })
     );
 }
 
 #[test]
+fn raw_icmpv6_bind_accepts_configured_nonloopback_ipv6() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let guard = tx_substrate::epoch::guard();
+    crate::net::reset_initial_net_namespace_for_test();
+    let ns = crate::net::create_isolated_net_namespace_for_test("raw-icmpv6-bind")
+        .expect("net namespace")
+        .payload_cap()
+        .expect("net namespace payload");
+    let auth = NetAdminAuthority::for_test_or_bootstrap();
+    let pair = create_veth_pair_for_test_or_bootstrap(VethPairConfig {
+        left: VethEndpointConfig {
+            name: "eth-icmp6-bind",
+            devt: DevT::new(96, 1),
+            mac: EthernetAddress::new([0x02, 0, 0, 0x96, 0, 1]),
+        },
+        right: VethEndpointConfig {
+            name: "veth-icmp6-bind",
+            devt: DevT::new(96, 2),
+            mac: EthernetAddress::new([0x02, 0, 0, 0x96, 0, 2]),
+        },
+        mtu: VETH_DEFAULT_MTU,
+    });
+    ns.attach_device_for_test_or_bootstrap(pair.left, None)
+        .expect("attach eth-icmp6-bind");
+    let ifindex = ns
+        .link_snapshot()
+        .iter()
+        .find(|link| link.name == "eth-icmp6-bind")
+        .expect("eth-icmp6-bind link")
+        .ifindex;
+    let local = Ipv6Address::new([0xfd, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2]);
+    ns.set_device_ipv6_addr_by_ifindex(auth, ifindex, Some(local), Some(64))
+        .expect("set iface ipv6");
+    let socket = registry::create_socket_in_namespace_with_family(
+        SocketKind::RawIcmp,
+        AddressFamily::Inet6,
+        SocketOptionSet::for_kind(SocketKind::RawIcmp),
+        ns,
+    )
+    .expect("raw icmpv6 socket");
+
+    assert_eq!(
+        step_bind(
+            &socket,
+            KernelSockAddr::V6(SockAddrIn6::new(0, local)),
+            &guard
+        ),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        socket
+            .acquire_operational()
+            .expect("payload")
+            .protocol_snapshot(),
+        SocketProtocol::RawIcmp(RawIcmpState {
+            bound_local: None,
+            bound_local6: Some(local),
+            protocol: ProtocolNumber(1),
+            icmp6_filter: [0; 8],
+        })
+    );
+}
+
+#[test]
+fn raw_icmp_wildcard_bind_accepts_ipv4_replies_to_local_addr() {
+    let local = Ipv4Address::new([10, 0, 0, 2]);
+    let other = Ipv4Address::new([10, 0, 0, 3]);
+
+    assert!(RawIcmpState::new(ProtocolNumber(1)).accepts_ipv4_reply_to(local));
+
+    let wildcard = RawIcmpState {
+        bound_local: Some(Ipv4Address::UNSPECIFIED),
+        bound_local6: None,
+        protocol: ProtocolNumber(1),
+        icmp6_filter: [0; 8],
+    };
+    assert!(wildcard.accepts_ipv4_reply_to(local));
+    assert!(wildcard.accepts_ipv4_reply_to(other));
+
+    let bound = RawIcmpState {
+        bound_local: Some(local),
+        bound_local6: None,
+        protocol: ProtocolNumber(1),
+        icmp6_filter: [0; 8],
+    };
+    assert!(bound.accepts_ipv4_reply_to(local));
+    assert!(!bound.accepts_ipv4_reply_to(other));
+}
+
+#[test]
 fn send_recv_flags_validate_mask() {
     let flags = SendRecvFlags::validate(
-        (SendRecvFlags::MSG_DONTWAIT | SendRecvFlags::MSG_PEEK | SendRecvFlags::MSG_ERRQUEUE)
+        (SendRecvFlags::MSG_DONTWAIT
+            | SendRecvFlags::MSG_PEEK
+            | SendRecvFlags::MSG_CONFIRM
+            | SendRecvFlags::MSG_ERRQUEUE)
             .bits(),
     )
     .expect("known flags");
 
     assert!(flags.is_nonblocking());
     assert!(flags.contains(SendRecvFlags::MSG_PEEK));
+    assert!(flags.contains(SendRecvFlags::MSG_CONFIRM));
     assert!(flags.contains(SendRecvFlags::MSG_ERRQUEUE));
     assert!(SendRecvFlags::empty().is_empty());
     assert_eq!(SendRecvFlags::validate(0x4000_0000), Err(Errno::EINVAL));
@@ -277,6 +381,7 @@ fn socket_option_set_default_has_documented_limits() {
     assert!(options.socket.send_buf_size > 0);
     assert!(!options.socket.linger.enabled);
     assert_eq!(options.ip.ttl, 64);
+    assert_eq!(options.ip.ipv4_multicast_if, Ipv4Address::UNSPECIFIED);
     assert_eq!(options.tcp.maxseg, 0);
 }
 

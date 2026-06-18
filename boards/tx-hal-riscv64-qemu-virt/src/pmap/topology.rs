@@ -44,7 +44,14 @@ pub(crate) const KERNEL_VIRT_BASE: usize = 0xffff_ffff_8020_0000;
 pub(crate) const QEMU_RAM_BASE: usize = 0x8000_0000;
 pub(crate) const QEMU_KERNEL_PHYS_BASE: usize = 0x8020_0000;
 pub(crate) const QEMU_BOOTSTRAP_MAP_SIZE: usize = 1024 * 1024 * 1024;
-pub(crate) const KERNEL_BOOTSTRAP_ALIAS_SIZE: usize = 16 * 1024 * 1024;
+// Bootstrap kernel-alias window: the boot trampoline maps [kernel_phys_base ..
+// +SIZE) before paging is enabled, so the whole kernel image (text + data + bss
+// + boot stack) must fit. Bumped 16M→32M because the debug kernel image grew
+// past 16M (main's 8M `TX_OBSERVE_RINGS` + the re-homed net subsystem push
+// `__kernel_end` to ~16.7M); a kernel larger than this window faults the moment
+// satp turns on and loops in the trap vector. Keep
+// `boot_trampoline.rs::TX_RV64_KERNEL_ALIAS_L0_TABLES` in sync (= SIZE / 2M).
+pub(crate) const KERNEL_BOOTSTRAP_ALIAS_SIZE: usize = 32 * 1024 * 1024;
 pub(crate) const SUPERPAGE_1G_SIZE: usize = 1024 * 1024 * 1024;
 pub(crate) const SUPERPAGE_2M_SIZE: usize = 2 * 1024 * 1024;
 pub(crate) const KERNEL_ALIAS_L0_TABLES: usize = KERNEL_BOOTSTRAP_ALIAS_SIZE / SUPERPAGE_2M_SIZE;
