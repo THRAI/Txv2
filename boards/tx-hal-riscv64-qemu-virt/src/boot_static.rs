@@ -117,7 +117,7 @@ struct BootstrapPmapInfoCell(UnsafeCell<Option<BootstrapPmapInfo>>);
 struct CmdlineCell(UnsafeCell<[u8; CMDLINE_CAPACITY]>);
 struct MemoryRegionsCell(UnsafeCell<[MemoryRegion; MAX_MEMORY_REGIONS]>);
 struct PlatformInfoCell(UnsafeCell<PlatformInfo>);
-struct PlatformMmioRegionsCell(UnsafeCell<[MmioRegion; 4]>);
+struct PlatformMmioRegionsCell(UnsafeCell<[MmioRegion; 5]>);
 struct TimebaseFrequencyCell(UnsafeCell<u64>);
 struct PossibleCpuCountCell(UnsafeCell<usize>);
 struct ReservedPageTablesCell(UnsafeCell<[PhysRange; BOOTSTRAP_PMAP_RESERVED_RANGES]>);
@@ -153,7 +153,7 @@ static PLATFORM_INFO: PlatformInfoCell = PlatformInfoCell(UnsafeCell::new(Platfo
     possible_cpu_count: 1,
 }));
 static PLATFORM_MMIO_REGIONS: PlatformMmioRegionsCell =
-    PlatformMmioRegionsCell(UnsafeCell::new([empty_mmio_region(); 4]));
+    PlatformMmioRegionsCell(UnsafeCell::new([empty_mmio_region(); 5]));
 static TIMEBASE_FREQUENCY_HZ: TimebaseFrequencyCell =
     TimebaseFrequencyCell(UnsafeCell::new(QEMU_VIRT_FALLBACK_TIMEBASE_HZ));
 static POSSIBLE_CPU_COUNT: PossibleCpuCountCell = PossibleCpuCountCell(UnsafeCell::new(1));
@@ -208,7 +208,7 @@ const fn empty_mmio_region() -> MmioRegion {
     }
 }
 
-fn qemu_mmio_regions() -> [MmioRegion; 4] {
+fn qemu_mmio_regions() -> [MmioRegion; 5] {
     [
         MmioRegion {
             name: "clint",
@@ -254,6 +254,24 @@ fn qemu_mmio_regions() -> [MmioRegion; 4] {
             },
             virt: VirtRange {
                 start: VirtAddr(DIRECT_MAP_BASE + 0x1000_1000),
+                size: 0x1000,
+            },
+            flags: MMIO_RW_DEVICE,
+        },
+        // Second QEMU virt virtio-mmio slot (0x1000_2000). The block driver
+        // probes "virtio0"; exposing "virtio1" lets the net driver bind a
+        // SEPARATE device so virtio-blk (root/ext4) and virtio-net (eth0) can
+        // coexist. QEMU: `-device virtio-blk-device,...,bus=virtio-mmio-bus.0`
+        // (-> virtio0) and `-device virtio-net-device,...,bus=virtio-mmio-bus.1`
+        // (-> virtio1). Needed for the git Task2 outbound-network path.
+        MmioRegion {
+            name: "virtio1",
+            phys: PhysRange {
+                start: PhysAddr(0x1000_2000),
+                size: 0x1000,
+            },
+            virt: VirtRange {
+                start: VirtAddr(DIRECT_MAP_BASE + 0x1000_2000),
                 size: 0x1000,
             },
             flags: MMIO_RW_DEVICE,

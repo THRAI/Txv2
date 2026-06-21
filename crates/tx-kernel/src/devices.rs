@@ -149,7 +149,7 @@ impl<P: TxPlatform> KernelNetDevices<P> {
 
     fn init_rv64_qemu_virt(&'static self) -> StepOutcome<(), NoProgress> {
         let net = Box::leak(Box::new(tx_drivers::virtio::VirtioMmioNet::<P, 256>::new(
-            "virtio0",
+            "virtio1",
         )));
         if let Err(err) = net.init() {
             Self::write_net_init_error::<P>(err);
