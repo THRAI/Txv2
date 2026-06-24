@@ -1,53 +1,86 @@
+![校徽](document/校徽.jpg)
+
 # txKernel
 
-txKernel is a Rust kernel architecture and implementation workspace. The active
-architecture docs define a factored kernel model: semantic subsystems own
-entities and transitions; substrate provides zone, index, epoch, mutation, bus,
-page, and reservation primitives; the reactor schedules tasks and waits; HAL is
-an axHal-style static platform family.
+## 项目简介
 
-## Start Here
+- txKernel 是一个使用 Rust 实现、支持 RISC-V64 和 LoongArch64 硬件平台的多核操作系统内核。
+- 执行模型采用**异步无栈协程**:每个线程是一个 future,由 reactor 调度,内核不为线程保留独立内核栈。
+- 内核分为 **substrate(基座)** 与 **语义子系统** 两层;同一份内核源码经编译期平台选择即可在两种架构上运行,兼容 Linux ABI。
 
-- [`docs/design/INDEX.md`](docs/design/INDEX.md) is the active architecture
-  index.
-- [`docs/README.md`](docs/README.md) explains how the docs are organized.
-- [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) covers tooling, QEMU, OSComp,
-  images, and clean submit-tree generation.
-- [`docs/progress/README.md`](docs/progress/README.md) records durable plans,
-  decisions, handoffs, and status.
-- [`AGENTS.md`](AGENTS.md) records agent guidance and canonical read order.
-- [`external/humanlayer-reference/`](external/humanlayer-reference/) contains
-  the reference-only HumanLayer `.claude` workflow prompts.
+## 完成情况
 
-## Workspace Map
+### 排名情况
 
-- `crates/` contains architecture-level Rust crates shared by all boards.
-- `boards/` contains static board HAL crates and board binary crates.
-- `xtask/` is the single developer command surface; see
-  [`xtask/README.md`](xtask/README.md) for the command module layout.
-- `tools/` contains thin wrappers that delegate to `cargo xtask`.
-- `docs/` contains active design docs, imported EBR/Zone references, and
-  durable progress memory.
-- `external/` contains reference submodules used by tooling and agent workflow
-  research.
+*（待写）*
 
-## Common Commands
+### 内核介绍
 
-```sh
-cargo xtask doctor
-cargo xtask ci
-cargo xtask ci-slow
-cargo xtask check
-cargo xtask build --target rv64-qemu
-cargo xtask build --target rv64-m1dock-mock
-cargo xtask qemu --target rv64-qemu --profile smoke --expect-sentinel
-cargo xtask qemu --target rv64-m1dock-mock --profile smoke --dry-run
-cargo xtask progress list all --json
-cargo xtask submit k210
-make docker-build
-make docker-shell
-make docker-busybox-la64
+- **进程管理**：异步无栈协程、多核调度；进程 / 线程按 identity / payload 拆分；支持 fork / clone / exec / exit / wait。
+- **内存管理**：映射的权威描述（recipe）与派生页表（pmap）分离、无锁并发；按需分页、写时复制、懒分配；物理页分配器 + 内核堆 + 对象池（zone）+ EBR 延迟回收。
+- **文件系统**：统一文件身份 RNode + 多种后端；DEntry 路径缓存与挂载（含 bind / 传播）；页缓存与 mmap 共享同一物理页；支持 ext4，以及 tmpfs / procfs / devfs。
+- **进程间通信**：信号（标准 + 实时）、管道、futex、System V IPC（信号量 / 消息队列 / 共享内存）、eventfd / signalfd / timerfd / epoll。
+- **中断与异常**：统一 trap 路径，平台侧 / 内核侧两层 + TrapAction 跨架构复用；无栈协程上下文切换。
+- **设备驱动**：virtio-blk / virtio-net、串口与 TTY（行规程）；静态设备模型 + 设备树（FDT）解析。
+- **网络模块**：基于 smoltcp 的 TCP / UDP，支持 IPv4 / IPv6 与本地回环。
+- **硬件抽象层**：axHal 风格的静态平台族，编译期选定平台，无运行时 HAL 管理器。
+- **应用支持**：支持 busybox 等现实应用，通过 OSComp basic、libc-test、LTP 等测试。
+
+系统整体流程图：*（待写）*
+
+### 文档
+
+- [初赛技术报告](https://lcn3yapaau3r.feishu.cn/wiki/XWSLwnLqji2QTFkFodXcOsjjnyc)
+
+### 项目结构
+
+```
+.
+├── crates/             # 架构无关的内核 crate
+│   ├── tx-substrate/       # 基座：对象池（zone）、EBR、索引、发布总线、帧、预留
+│   ├── tx-reactor/         # 无栈协程 reactor 与调度
+│   ├── tx-subsystems/      # 语义子系统：进程、内存、文件系统、IPC、网络、设备、信号
+│   ├── tx-shims/           # Linux 系统调用语义与 ABI 适配
+│   ├── tx-hal/             # 硬件抽象层
+│   ├── tx-kernel/          # 内核装配：启动、trap 分发、初始化
+│   ├── tx-drivers/         # virtio、串口 / TTY 驱动
+│   ├── tx-ext4/  tx-fat/  tx-fs/   # ext4 / FAT 磁盘文件系统、tmpfs / procfs / devfs
+│   └── ……
+├── boards/             # 板级 HAL 与内核二进制 crate（RISC-V / LoongArch · qemu-virt）
+├── xtask/              # 统一开发命令（构建 / QEMU / OSComp）
+├── docs/               # 设计文档与开发记录
+└── document/           # 竞赛文档（初赛报告、分模块设计）
 ```
 
-Generated build outputs, image roots, and submit trees live under `target/`.
-They are disposable and should be regenerated through `cargo xtask`.
+## 运行方式
+
+> QEMU 需使用 **9.2.1**（LoongArch 的 ll/sc 仿真在更早版本有缺陷）。
+
+### 编译
+
+在项目根目录运行，同时构建 RISC-V64 与 LoongArch64 内核：
+
+```bash
+make all
+```
+
+### 运行
+
+```bash
+make oscomp-local-rv64     # 启动 RISC-V 内核并本地评测
+make oscomp-local-la64     # 启动 LoongArch 内核并本地评测
+```
+
+## 项目人员
+
+*（待补）*
+
+## 参考
+
+- **Chronix**、[Del0n1x](https://github.com/Ya0rk/myOS) —— 异步无栈协程的执行与调度思路
+- **FreeBSD UMA** —— 对象池（zone / keg / bucket / slab）的结构与命名
+- [crossbeam-epoch](https://github.com/crossbeam-rs/crossbeam) —— EBR 延迟回收算法
+- [virtio-drivers](https://github.com/rcore-os/virtio-drivers) —— virtio 块 / 网设备驱动
+- [rsext4（Starry-OS）](https://github.com/Starry-OS/rsext4) —— ext4 磁盘格式参考
+- [smoltcp](https://github.com/smoltcp-rs/smoltcp) —— 网络协议栈
+- [ArceOS / axHal](https://github.com/arceos-org/arceos) —— 静态平台族的 HAL 思路
