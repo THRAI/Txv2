@@ -46,19 +46,21 @@
 
 ```
 .
-├── crates/             # 架构无关的内核 crate
+├── boards/             # 板级HAL与内核二进制crate（RISC-V/LoongArch·qemu-virt）
+├── crates/             # 架构无关的内核crate
 │   ├── tx-substrate/       # 基座：对象池（zone）、EBR、索引、发布总线、帧、预留
-│   ├── tx-reactor/         # 无栈协程 reactor 与调度
+│   ├── tx-reactor/         # 无栈协程reactor与调度
 │   ├── tx-subsystems/      # 语义子系统：进程、内存、文件系统、IPC、网络、设备、信号
-│   ├── tx-shims/           # Linux 系统调用语义与 ABI 适配
+│   ├── tx-shims/           # Linux系统调用语义与ABI适配
 │   ├── tx-hal/             # 硬件抽象层
-│   ├── tx-kernel/          # 内核装配：启动、trap 分发、初始化
-│   ├── tx-drivers/         # virtio、串口 / TTY 驱动
-│   ├── tx-ext4/  tx-fat/  tx-fs/   # ext4 / FAT 磁盘文件系统、tmpfs / procfs / devfs
+│   ├── tx-kernel/          # 内核装配：启动、trap分发、初始化
+│   ├── tx-drivers/         # virtio、串口/TTY驱动
+│   ├── tx-ext4/  tx-fat/  tx-fs/   # ext4/FAT磁盘文件系统、tmpfs/procfs/devfs
 │   └── ……
-├── boards/             # 板级 HAL 与内核二进制 crate（RISC-V / LoongArch · qemu-virt）
-├── xtask/              # 统一开发命令（构建 / QEMU / OSComp）
-└── docs/               # 设计文档与开发记录
+├── docs/               # 设计文档与开发记录
+├── external/           # 第三方依赖与测试套件（musl、lmbench、oscomp-autotest等）
+├── tools/              # 评测、构建与调试脚本（oscomp-judge、LTP运行器等）
+└── xtask/              # 统一开发命令（构建/QEMU/OSComp）
 ```
 
 ## 运行方式
