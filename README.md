@@ -1,4 +1,4 @@
-![校徽](document/校徽.jpg)
+![校徽](docs/image/校徽.jpg)
 
 # txKernel
 
@@ -12,7 +12,15 @@
 
 ### 排名情况
 
-*（待写）*
+### 初赛情况
+
+截至6月27日23点，TxKernel已经通过初赛的大部分测试点，在排行榜上排在第11位：
+
+![board-rank](./docs/image/排名.png)
+
+得分详情如下：
+
+![](./docs/image/得分.png)
 
 ### 内核介绍
 
@@ -26,11 +34,13 @@
 - **硬件抽象层**：axHal 风格的静态平台族，编译期选定平台，无运行时 HAL 管理器。
 - **应用支持**：支持 busybox 等现实应用，通过 OSComp basic、libc-test、LTP 等测试。
 
-系统整体流程图：*（待写）*
+<img src="docs/image/_txKernel的核心设计.png" alt="TxKernel 内核架构" width="500"/>
 
 ### 文档
 
-- [初赛技术报告](https://lcn3yapaau3r.feishu.cn/wiki/XWSLwnLqji2QTFkFodXcOsjjnyc)
+- [初赛技术报告](./TxKernel初赛文档.pdf)
+- [项目开发简介幻灯片](./TxKernel初赛ppt.pdf)
+- [演示视频] https://pan.baidu.com/s/1bsYjpYtcXR_GtTfcPMTy9g 提取码: 1234
 
 ### 项目结构
 
@@ -48,13 +58,11 @@
 │   └── ……
 ├── boards/             # 板级 HAL 与内核二进制 crate（RISC-V / LoongArch · qemu-virt）
 ├── xtask/              # 统一开发命令（构建 / QEMU / OSComp）
-├── docs/               # 设计文档与开发记录
-└── document/           # 竞赛文档（初赛报告、分模块设计）
+└── docs/               # 设计文档与开发记录
 ```
 
 ## 运行方式
 
-> QEMU 需使用 **9.2.1**（LoongArch 的 ll/sc 仿真在更早版本有缺陷）。
 
 ### 编译
 
@@ -73,14 +81,16 @@ make oscomp-local-la64     # 启动 LoongArch 内核并本地评测
 
 ## 项目人员
 
-*（待补）*
+- 杨岩琰（队长）： 负责reactor设计，线程进程设计及VFS设计。
+- 刘佳硕： 负责硬件抽象层设计、RISC-V 与龙芯设计，TTY设计。
+- 孟书培： 负责网络栈设计、网络外设驱动设计。
+- 指导老师：夏文，仇洁婷
 
 ## 参考
 
-- **Chronix**、[Del0n1x](https://github.com/Ya0rk/myOS) —— 异步无栈协程的执行与调度思路
-- **FreeBSD UMA** —— 对象池（zone / keg / bucket / slab）的结构与命名
-- [crossbeam-epoch](https://github.com/crossbeam-rs/crossbeam) —— EBR 延迟回收算法
-- [virtio-drivers](https://github.com/rcore-os/virtio-drivers) —— virtio 块 / 网设备驱动
-- [rsext4（Starry-OS）](https://github.com/Starry-OS/rsext4) —— ext4 磁盘格式参考
-- [smoltcp](https://github.com/smoltcp-rs/smoltcp) —— 网络协议栈
-- [ArceOS / axHal](https://github.com/arceos-org/arceos) —— 静态平台族的 HAL 思路
+- **ArceOS**（#link("https://arceos.org/arceos/axhal/index.html")[axhal]）—— 对其 axhal 进行修改实现了我们的硬件抽象层。
+- **StarryOS**（#link("https://github.com/Starry-OS/rsext4")[rsext4]）—— 抛弃其内部缓存，提取同步逻辑对其做了异步适配。
+- **Asterinas**（#link("https://github.com/asterinas/asterinas")[仓库]）—— 参考其网络栈设计。
+- **《FreeBSD 操作系统设计与实现（第二版）》与 FreeBSD 内核代码** —— 最初的学习资源，提供了第一版内核架构参考，以及第二版内核的消息总线设计。
+- **Chronix**（#link("https://gitlab.eduxiji.net/educg-group-36002-2710490/T202518123995568-675")[仓库]）—— 无栈异步协程设计。
+- **Linux**（#link("https://www.freebsd.org/")[官网]）—— 大量参考，系统调用功能的金标准。
