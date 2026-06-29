@@ -88,9 +88,9 @@ make oscomp-local-la64     # 启动 LoongArch 内核并本地评测
 
 ## 参考
 
-- **ArceOS**（#link("https://arceos.org/arceos/axhal/index.html")[axhal]）—— 对其 axhal 进行修改实现了我们的硬件抽象层。
-- **StarryOS**（#link("https://github.com/Starry-OS/rsext4")[rsext4]）—— 抛弃其内部缓存，提取同步逻辑对其做了异步适配。
-- **Asterinas**（#link("https://github.com/asterinas/asterinas")[仓库]）—— 参考其网络栈设计。
+- **ArceOS**（[axhal](https://arceos.org/arceos/axhal/index.html)）—— 对其 axhal 进行修改实现了我们的硬件抽象层。
+- **StarryOS**（[rsext4](https://github.com/Starry-OS/rsext4)）—— 抛弃其内部缓存，提取同步逻辑对其做了异步适配。
+- **Asterinas**（[仓库](https://github.com/asterinas/asterinas)）—— 参考其网络栈设计。
 - **《FreeBSD 操作系统设计与实现（第二版）》与 FreeBSD 内核代码** —— 最初的学习资源，提供了第一版内核架构参考，以及第二版内核的消息总线设计。
-- **Chronix**（#link("https://gitlab.eduxiji.net/educg-group-36002-2710490/T202518123995568-675")[仓库]）—— 无栈异步协程设计。
-- **Linux**（#link("https://www.freebsd.org/")[官网]）—— 大量参考，系统调用功能的金标准。
+- **Chronix**（[仓库](https://gitlab.eduxiji.net/educg-group-36002-2710490/T202518123995568-675)）—— 无栈异步协程设计。
+- **Linux**（[官网](https://www.kernel.org/)）—— 大量参考，系统调用功能的金标准。
