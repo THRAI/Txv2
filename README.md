@@ -48,15 +48,26 @@
 .
 ├── boards/             # 板级HAL与内核二进制crate（RISC-V/LoongArch·qemu-virt）
 ├── crates/             # 架构无关的内核crate
-│   ├── tx-substrate/       # 基座：对象池（zone）、EBR、索引、发布总线、帧、预留
-│   ├── tx-reactor/         # 无栈协程reactor与调度
-│   ├── tx-subsystems/      # 语义子系统：进程、内存、文件系统、IPC、网络、设备、信号
-│   ├── tx-shims/           # Linux系统调用语义与ABI适配
-│   ├── tx-hal/             # 硬件抽象层
-│   ├── tx-kernel/          # 内核装配：启动、trap分发、初始化
-│   ├── tx-drivers/         # virtio、串口/TTY驱动
-│   ├── tx-ext4/  tx-fat/  tx-fs/   # ext4/FAT磁盘文件系统、tmpfs/procfs/devfs
-│   └── ……
+│   ├── tx-drivers/          # virtio、串口/TTY驱动
+│   ├── tx-ext4/             # ext4文件系统
+│   ├── tx-ext4-format/      # ext4镜像格式化
+│   ├── tx-fat/              # FAT文件系统
+│   ├── tx-fat-format/       # FAT镜像格式化
+│   ├── tx-fs/               # 文件系统框架与tmpfs/procfs/devfs/devpts
+│   ├── tx-hal/              # 硬件抽象层
+│   ├── tx-kernel/           # 内核装配：启动、trap分发、初始化
+│   ├── tx-observe/          # 内核侧观测/追踪运行时
+│   ├── tx-observe-types/    # 观测数据类型定义
+│   ├── tx-platform-adapter/ # 平台边界适配宏（#[platform_adapter]）
+│   ├── tx-policy/           # 调度与cgroup策略
+│   ├── tx-reactor/          # 无栈协程reactor与调度
+│   ├── tx-scripts/          # 操作流程编排（drive、进程、挂载、路由）
+│   ├── tx-services/         # 内核服务：随机数、凭证、rlimit、时间、trace
+│   ├── tx-shims/            # Linux系统调用语义与ABI适配
+│   ├── tx-substrate/        # 基座：对象池（zone）、EBR、索引、发布总线、帧、预留
+│   ├── tx-subsystems/       # 语义子系统：进程、内存、文件系统、IPC、网络、设备、信号
+│   ├── tx-test-support/     # 测试支撑：step引擎、宿主驱动
+│   └── tx-vdso/             # 编译期vDSO ELF镜像
 ├── docs/               # 设计文档与开发记录
 ├── external/           # 第三方依赖与测试套件（musl、lmbench、oscomp-autotest等）
 ├── tools/              # 评测、构建与调试脚本（oscomp-judge、LTP运行器等）
