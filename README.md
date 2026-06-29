@@ -40,7 +40,7 @@
 
 - [初赛技术报告](./TxKernel内核初赛文档.pdf)
 - [项目开发简介幻灯片](./TxKernel初赛ppt.pdf)
-- [演示视频] https://pan.baidu.com/s/1bsYjpYtcXR_GtTfcPMTy9g 提取码: 1234
+- [演示视频](https://pan.baidu.com/s/1bsYjpYtcXR_GtTfcPMTy9g) 提取码: 1234
 
 ### 项目结构
 
