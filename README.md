@@ -14,7 +14,7 @@
 
 ### 初赛情况
 
-截至6月27日23点，TxKernel已经通过初赛的大部分测试点，在排行榜上排在第11位：
+截至6月30日15点，TxKernel已经通过初赛的大部分测试点，在排行榜上排在第12位：
 
 ![board-rank](./docs/image/排名.png)
 
@@ -104,6 +104,6 @@ make oscomp-local-la64     # 启动 LoongArch 内核并本地评测
 - **ArceOS**（[axhal](https://arceos.org/arceos/axhal/index.html)）—— 对其axhal进行修改实现了我们的硬件抽象层。
 - **StarryOS**（[rsext4](https://github.com/Starry-OS/rsext4)）—— 抛弃其内部缓存，提取同步逻辑对其做了异步适配。
 - **Asterinas**（[仓库](https://github.com/asterinas/asterinas)）—— 参考其网络栈设计。
-- **《FreeBSD操作系统设计与实现（第二版）》与FreeBSD内核代码** —— 最初的学习资源，提供了第一版内核架构参考，以及第二版内核的消息总线设计。
+- **《FreeBSD操作系统设计与实现（第二版）》与FreeBSD内核代码**（[仓库]("https://cgit.freebsd.org/src/")） —— 最初的学习资源，提供了第一版内核架构参考，以及第二版内核的消息总线设计。
 - **Chronix**（[仓库](https://gitlab.eduxiji.net/educg-group-36002-2710490/T202518123995568-675)）—— 无栈异步协程设计。
 - **Linux**（[官网](https://www.kernel.org/)）—— 大量参考，系统调用功能的金标准。
