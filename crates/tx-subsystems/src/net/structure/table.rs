@@ -1,3 +1,5 @@
+use core::sync::atomic::{AtomicPtr, Ordering};
+
 use alloc::vec::Vec;
 use tx_substrate::epoch::Guard;
 use tx_substrate::index::{Index, IndexError};
@@ -13,17 +15,18 @@ const CONNECTION_SLOTS: usize = 256;
 const RAW_ICMP_SLOTS: usize = 128;
 const UNIX_PATH_NODE_SLOTS: usize = 256;
 const UNIX_BOUND_SLOTS: usize = 256;
-// hackbench (cyclictest's stress phase) creates hundreds of AF_UNIX
-// socketpairs concurrently; each pair inserts two peer entries. main bumped
-// this to 4096 to clear an `insert_unix_peer` ENOMEM ("Creating fdpair
-// (error: Out of memory)"). But each net namespace owns a whole `SocketTable`
-// and the per-namespace table is currently `Box::leak`-ed (never freed), so a
-// 4096-slot index makes every namespace leak ~500KB; a handful of LTP net
-// tests (each in its own netns) then exhaust the kernel heap
-// ("memory allocation of N bytes failed"). Until the namespace teardown frees
-// its `SocketTable`, keep the feature-tested 256 (the leak stays at ~30KB/ns).
-// Re-raising this requires fixing the per-namespace `SocketTable` leak first.
-const UNIX_STREAM_PEER_SLOTS: usize = 256;
+// hackbench (cyclictest's stress phase) opens hundreds of AF_UNIX socketpairs
+// in the default namespace, each inserting two `unix_stream_peers` entries, so
+// this index must hold a few thousand slots or `insert_unix_peer` returns
+// ENOMEM ("Creating fdpair (error: Out of memory)") and cyclictest scores 0.
+// It is deliberately NOT an inline field of `SocketTable` (see
+// `LazyUnixPeerIndex`): every net namespace owns a `SocketTable` that is leaked
+// for its lifetime, so a 4096-slot inline array would make every leaked
+// per-namespace table cost ~500KB and a handful of `CLONE_NEWNET` LTP tests
+// would exhaust the heap. Instead the index is heap-allocated on first use, so
+// only namespaces that actually register a unix stream peer (the default
+// namespace, for hackbench) pay for it; INET-only namespaces pay nothing.
+const UNIX_STREAM_PEER_SLOTS: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LocalEndpointKey {
@@ -113,6 +116,86 @@ impl ListenerKey {
     }
 }
 
+type UnixStreamPeerIndex = Index<UnixStreamPeerKey, Cap<SocketIdentity>, UNIX_STREAM_PEER_SLOTS>;
+
+/// Lazily heap-allocated `unix_stream_peers` index — see the
+/// `UNIX_STREAM_PEER_SLOTS` comment for why it is not an inline array. The
+/// pointer starts null (so a zeroed `SocketTable` allocation is a valid empty
+/// table) and is populated with a zeroed heap allocation — never a large stack
+/// temporary — on the first peer insert.
+struct LazyUnixPeerIndex {
+    ptr: AtomicPtr<UnixStreamPeerIndex>,
+}
+
+impl LazyUnixPeerIndex {
+    const fn new() -> Self {
+        Self {
+            ptr: AtomicPtr::new(core::ptr::null_mut()),
+        }
+    }
+
+    /// The index if it has been allocated, else `None` — never allocates.
+    fn get(&self) -> Option<&UnixStreamPeerIndex> {
+        // SAFETY: once installed the allocation is leaked for the table's
+        // lifetime, so a non-null pointer stays valid; `null` means unallocated.
+        unsafe { self.ptr.load(Ordering::Acquire).as_ref() }
+    }
+
+    /// The index, allocating a fresh zeroed one on first use.
+    fn get_or_alloc(&self) -> &UnixStreamPeerIndex {
+        if let Some(index) = self.get() {
+            return index;
+        }
+        let layout = core::alloc::Layout::new::<UnixStreamPeerIndex>();
+        // A zeroed `Index` is a valid empty index (every entry starts in the
+        // all-zero `EMPTY` state), so allocate zeroed to avoid materialising the
+        // large array as a stack temporary.
+        // SAFETY: `UnixStreamPeerIndex` is non-zero-sized.
+        let fresh = unsafe { alloc::alloc::alloc_zeroed(layout) } as *mut UnixStreamPeerIndex;
+        if fresh.is_null() {
+            alloc::alloc::handle_alloc_error(layout);
+        }
+        match self.ptr.compare_exchange(
+            core::ptr::null_mut(),
+            fresh,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            // SAFETY: we allocated and exclusively installed `fresh`.
+            Ok(_) => unsafe { &*fresh },
+            Err(existing) => {
+                // Lost the install race: free our unused allocation (freshly
+                // zeroed and never published, so nothing to drop) and use the
+                // winner's.
+                // SAFETY: `fresh` came from `alloc_zeroed(layout)` and the CAS
+                // failure proves it was never shared.
+                unsafe { alloc::alloc::dealloc(fresh as *mut u8, layout) };
+                // SAFETY: `existing` is a valid installed index.
+                unsafe { &*existing }
+            }
+        }
+    }
+}
+
+impl Drop for LazyUnixPeerIndex {
+    fn drop(&mut self) {
+        let ptr = *self.ptr.get_mut();
+        if !ptr.is_null() {
+            // SAFETY: `ptr` was installed from `alloc_zeroed` with the layout of
+            // `UnixStreamPeerIndex` (matching the global allocator's `Box`
+            // layout) and is uniquely owned here, so reclaiming it via `Box`
+            // runs the inner `Index`'s drop (releasing committed `Cap`s) and
+            // frees the allocation. (Leaked per-namespace / static tables are
+            // never dropped, so this only reclaims transient tables.)
+            unsafe { drop(alloc::boxed::Box::from_raw(ptr)) };
+        }
+    }
+}
+
+// SAFETY: the inner `Index` is already `Sync`; the pointer is published with
+// release/acquire ordering and the allocation is immutable-after-install.
+unsafe impl Sync for LazyUnixPeerIndex {}
+
 pub struct SocketTable {
     tcp_bound: Index<LocalEndpointKey, Cap<SocketIdentity>, LOCAL_ENDPOINT_SLOTS>,
     tcp_listeners: Index<ListenerKey, Cap<SocketIdentity>, LISTENER_SLOTS>,
@@ -126,7 +209,7 @@ pub struct SocketTable {
     raw_icmp: Index<RawIcmpSocketKey, Cap<SocketIdentity>, RAW_ICMP_SLOTS>,
     unix_path_nodes: Index<UnixSocketPath, (), UNIX_PATH_NODE_SLOTS>,
     unix_bound: Index<UnixSocketPath, Cap<SocketIdentity>, UNIX_BOUND_SLOTS>,
-    unix_stream_peers: Index<UnixStreamPeerKey, Cap<SocketIdentity>, UNIX_STREAM_PEER_SLOTS>,
+    unix_stream_peers: LazyUnixPeerIndex,
 }
 
 impl SocketTable {
@@ -144,7 +227,7 @@ impl SocketTable {
             raw_icmp: Index::new(),
             unix_path_nodes: Index::new(),
             unix_bound: Index::new(),
-            unix_stream_peers: Index::new(),
+            unix_stream_peers: LazyUnixPeerIndex::new(),
         }
     }
 
@@ -290,6 +373,7 @@ impl SocketTable {
         peer: Cap<SocketIdentity>,
     ) -> Result<(), IndexError> {
         self.unix_stream_peers
+            .get_or_alloc()
             .reserve(UnixStreamPeerKey { socket_raw })?
             .commit(peer);
         Ok(())
@@ -400,7 +484,11 @@ impl SocketTable {
         &self,
         socket_raw: u32,
     ) -> Result<Cap<SocketIdentity>, MutationError> {
-        mutation::withdraw(&self.unix_stream_peers, &UnixStreamPeerKey { socket_raw })
+        match self.unix_stream_peers.get() {
+            Some(index) => mutation::withdraw(index, &UnixStreamPeerKey { socket_raw }),
+            // Never allocated → no such peer to withdraw.
+            None => Err(MutationError::Missing),
+        }
     }
 
     pub fn lookup_tcp_bound(
@@ -623,6 +711,7 @@ impl SocketTable {
         guard: &Guard<'_>,
     ) -> Option<Cap<SocketIdentity>> {
         self.unix_stream_peers
+            .get()?
             .lookup(&UnixStreamPeerKey { socket_raw }, guard)
             .and_then(|entry| entry.value().try_clone_live())
     }

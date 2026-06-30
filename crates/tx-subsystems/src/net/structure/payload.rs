@@ -1153,6 +1153,16 @@ impl SocketPayload {
         })
     }
 
+    /// Drain the whole accept backlog (pending + half-open children) for a
+    /// listener that is being closed, resetting the pending count. The caller
+    /// is responsible for withdrawing each returned child's connection-table
+    /// slot and releasing its payload.
+    pub(crate) fn drain_accept_backlog(&self) -> Vec<(Cap<SocketIdentity>, IpEndpoint, IpEndpoint)> {
+        let drained = self.tcp_backlog.lock().drain_all();
+        self.io.lock().accept_pending = 0;
+        drained
+    }
+
     fn raw_recv_len(&self, len: usize, peek: bool) -> Option<(usize, bool)> {
         if let Some(raw_packet) = &self.raw_packet {
             return raw_packet.recv_len(len, peek);
@@ -2219,6 +2229,24 @@ impl TcpBacklog {
 
     pub fn pop_connected(&mut self) -> Option<SocketAcceptEntry> {
         self.connected.pop_front()
+    }
+
+    /// Drain every pending child — both half-open `connecting` entries and
+    /// established `connected` accept-queue entries — returning each child
+    /// socket with its (local, peer) endpoints. Used on listener close so the
+    /// caller can withdraw each child's connection-table slot and release its
+    /// socket-zone object; without this, unaccepted children leak for the
+    /// kernel's lifetime and eventually exhaust the connection table and the
+    /// shared socket zone.
+    pub fn drain_all(&mut self) -> Vec<(Cap<SocketIdentity>, IpEndpoint, IpEndpoint)> {
+        let mut drained = Vec::with_capacity(self.connecting.len() + self.connected.len());
+        for entry in self.connecting.drain(..) {
+            drained.push((entry.child, entry.local, entry.peer));
+        }
+        while let Some(entry) = self.connected.pop_front() {
+            drained.push((entry.child, entry.local, entry.peer));
+        }
+        drained
     }
 
     fn is_full(&self) -> bool {
