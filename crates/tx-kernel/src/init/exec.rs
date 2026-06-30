@@ -2455,6 +2455,26 @@ fn append_default_oscomp_scripts_with_observe(
     }
     append_submit_ltp_runner(cmd, "musl", args);
     append_submit_ltp_runner(cmd, "glibc", args);
+    // Network throughput tests run last so an intermittent netperf loopback
+    // stall cannot forfeit the preceding (much larger) LTP score. The LTP
+    // runners leave the shell cwd inside the LTP tree, so restore /musl/musl
+    // first — the musl script appends below use a relative `./busybox`.
+    {
+        use core::fmt::Write as _;
+        let _ = write!(cmd, "; cd /musl/musl");
+    }
+    for (_, script) in DEFAULT_OSCOMP_MUSL_POST_LTP_SCRIPTS {
+        append_oscomp_musl_script_with_observe(
+            cmd,
+            script,
+            args,
+            bench_observe_enabled,
+            bench_observe_threshold,
+        );
+    }
+    for (_, script) in DEFAULT_OSCOMP_GLIBC_POST_LTP_SCRIPTS {
+        append_oscomp_glibc_script(cmd, script);
+    }
 }
 
 fn append_oscomp_musl_script(cmd: &mut alloc::string::String, script: &str, args: &LtpArgs<'_>) {
@@ -2593,8 +2613,6 @@ const DEFAULT_OSCOMP_MUSL_PRE_LTP_SCRIPTS: &[(&str, &str)] = &[
     ("busybox-musl", "busybox_testcode.sh"),
     ("libctest-musl", "libctest_testcode.sh"),
     ("lua-musl", "lua_testcode.sh"),
-    ("netperf-musl", "netperf_testcode.sh"),
-    ("iperf-musl", "iperf_testcode.sh"),
     ("iozone-musl", "iozone_testcode.sh"),
     ("libcbench-musl", "libcbench_testcode.sh"),
     // cyclictest + lmbench run LAST in this libc block (after libcbench):
@@ -2609,13 +2627,27 @@ const DEFAULT_OSCOMP_GLIBC_PRE_LTP_SCRIPTS: &[(&str, &str)] = &[
     ("busybox-glibc", "busybox_testcode.sh"),
     // libctest-glibc removed: official scoring counts only musl libctest.
     ("lua-glibc", "lua_testcode.sh"),
-    ("netperf-glibc", "netperf_testcode.sh"),
-    ("iperf-glibc", "iperf_testcode.sh"),
     ("iozone-glibc", "iozone_testcode.sh"),
     ("libcbench-glibc", "libcbench_testcode.sh"),
     // cyclictest + lmbench last in this libc block (see the musl list note).
     ("cyclictest-glibc", "cyclictest_testcode.sh"),
     ("lmbench-glibc", "lmbench_testcode.sh"),
+];
+
+// Network throughput tests (iperf, netperf) run AFTER the LTP suite, with
+// netperf last. netperf's loopback TCP_CRR churn can intermittently stall on
+// single-core TCG; running it before LTP would let one stall forfeit the entire
+// (much larger) LTP score. Running last also gives netserver startup the most
+// warmup, and ordering iperf before netperf means a netperf stall loses nothing
+// after it.
+const DEFAULT_OSCOMP_MUSL_POST_LTP_SCRIPTS: &[(&str, &str)] = &[
+    ("iperf-musl", "iperf_testcode.sh"),
+    ("netperf-musl", "netperf_testcode.sh"),
+];
+
+const DEFAULT_OSCOMP_GLIBC_POST_LTP_SCRIPTS: &[(&str, &str)] = &[
+    ("iperf-glibc", "iperf_testcode.sh"),
+    ("netperf-glibc", "netperf_testcode.sh"),
 ];
 
 fn oscomp_musl_script_for_group(group: &str) -> Option<&'static str> {
