@@ -216,9 +216,14 @@ TX 车道全套（含 Connecting 搬运）、ARP 全套、demux 带段+校验和
 
 **为什么 net-git 能过.** net-git 用 poll-pump（A）间接绕过：poll-pump 让 trap-shell reactor 外循环持续转，`run_thread` 的用户态重入由 trap-shell 自身上下文驱动，longjmp 目标有效。net-git stage5（`a1b7417d`）自述 "with poll-pump, blocking connect() completes"，正是此机制。本轮把它比 net-git 更深钉了一层（net-git 停在"connect succeeds, stuck in post-connect syscall"，未定位到 `enter_userspace` 往返）。
 
-**两条修复路径（待决策）**：
-- **(A) poll-pump 兜底（plan 4-B 内建降级，快、已验证）**：保留已通的 IRQ 收包，补 gated poll-pump 让 trap-shell 循环持续转 → 阻塞 connect 重入成功 → `wget rc=0`。IRQ 管低延迟 RX，pump 管跨任务唤醒后的用户态重入。
-- **(B) 架构修复（正统、大）**：让"跨任务唤醒的阻塞 syscall"的用户态重入 defer 回 trap-shell 上下文（cross-task wake 只标 runnable，用户态 entry 一律由 trap-shell reactor 外循环驱动），需动 trap-vector/reactor/thread-future 核心执行模型，风险高，宜 gdbstub 单步 trap 汇编佐证后独立立项。
+**追加实测（2026-07-03，pump 假设证伪）**：写了一个无条件 ~2ms `net_delegate_kick_poll` pump 任务做经验测试——**connect 仍不恢复**（pcap 仍停在 ACK、无 GET、无 ext-ok）。**证伪"poll-pump 能兜底 connect-resume"**（plan 4-A/4-B 降级假设）：pump 唤醒的是 delegate 任务，而 gap 在 run_thread 的用户态重入路径，两者正交。**推论**：4-A 与 4-B 在当前架构下**共享同一 connect-resume gap**，poll-pump 对它无效（pump 只解决 RX 驱动，而我们的 RX 已由 IRQ 解决）。pump 已撤除。
+
+**net-git 为何能过（复核纠正）**：其 a1b7417d/3b7bfe26 几乎全是诊断，**无专门线程恢复修复**。真机制是 stage3（`c8389512`）的 **RX drive window 在 connect syscall 自己的上下文里同步驱动 RX**——SYN-ACK 在 connect 执行期间被处理、连接在 connect **自身 trap-shell 上下文**内 Established、connect 正常返回，**根本不 park、不经跨任务唤醒**，从源头绕开 enter_userspace 重入 bug。我们的实现让 connect `yield_on_token` park 在 send carrier、靠 delegate 跨任务唤醒完成，正撞此 bug。
+
+**修复路径（更新后，待决策）**：
+- **(A′) inline external-connect drive（正解，仿 loopback）**：给外部 connect 一个**同步驱动循环**（类比 `drive_tcp_loopback_after_connect`），在 connect syscall 自身上下文内驱动设备 RX/TX 直到 Established 或超时，使 connect **不 park**、从 trap-shell 上下文正常返回。障碍：设备驱动在 tx-kernel 的 boot delegate，connect 在 P-无关的 tx-subsystems / 有 P 的 tx-shims——需一个"同步 pump 当前 netns 设备一轮"的 P-having 入口（shim 层 `drive_tcp_loopback_after_connect` 的外部 analog）。**这是 net-git 的实际做法，工作量中等,层次是主要难点。**
+- **(B) 架构修复（正统、大）**：让"跨任务唤醒的阻塞 syscall"的用户态重入 defer 回 trap-shell 上下文，需动 trap-vector/reactor/thread-future 核心执行模型，宜 gdbstub 单步 trap 汇编佐证后独立立项。
+- ~~(A) 简单 poll-pump~~：**已证伪，不可行**（见上）。
 
 ---
 

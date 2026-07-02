@@ -1,3 +1,12 @@
+- 2026-07-03 (P2 connect-resume 追加实测:pump 证伪 + net-git 真机制复核). 无条件 ~2ms delegate pump 实测**仍不恢复
+  connect**(pcap 停 ACK)——**证伪"poll-pump 兜底"**(pump 唤醒 delegate,gap 在 run_thread 用户态重入,正交)。**推论:
+  4-A/4-B 共享同一 gap,pump 无效**。复核 net-git a1b7417d/3b7bfe26 几乎全诊断、无线程恢复修复——真机制=stage3
+  c8389512 的 **RX drive window 在 connect syscall 自身上下文同步驱动 RX**,SYN-ACK 在 connect 执行期处理、连接在
+  connect 自身 trap-shell 上下文 Established、正常返回,**不 park 不跨任务唤醒**,从源头绕开 enter_userspace bug。**正解=
+  A′ inline external-connect drive**(仿 drive_tcp_loopback_after_connect,connect syscall 内同步驱动设备直到 Established);
+  障碍=设备驱动在 tx-kernel boot delegate、connect 在 tx-shims,需 P-having"同步 pump 当前 netns 设备一轮"入口(shim
+  层 loopback drive 的外部 analog)。pump 已撤,工作树干净。根因+路径写入 REFACTOR_P2_v1.md §7。**Next**:实现 A′(中等
+  工作量,层次是难点)or 用户决策。**Blocker**:connect-resume(平台执行模型/层次)。
 - 2026-07-03 (P2 connect-resume 深度调试根因锁定 — 纯 B 死磕). 用户要求死磕。内核 AtomicU32 计数器全链路插桩
   (delegate→process_tcp_event→publish_to→step_connect→connect_impl→run_thread→enter_userspace)+throttled dump。
   **计数器实测**:es=1 bc=1 pr=1 wk=2(收 SYN-ACK/到 Established/晋升/fire SPACE 唤醒 1 订阅者)、ce=2 sy=1(step_connect
