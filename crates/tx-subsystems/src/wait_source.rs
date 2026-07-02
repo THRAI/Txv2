@@ -217,7 +217,16 @@ impl Future for RawQueueWaitFuture {
         this.mailbox.register_waker(cx.waker().clone());
 
         let ready = if this.subscription.is_some() {
+            // Level-triggered fallback: a matching mailbox event resumes us,
+            // but also re-check the queue directly. A `fire` can land between
+            // subscription and re-poll with a generation that no longer
+            // matches our active wait (e.g. an external TCP handshake completed
+            // and fired SPACE while this connect future was parking); the
+            // readiness bit is still asserted, so honor it instead of sleeping
+            // through it. Without this, a blocking connect() over the real
+            // device never resumes after the async connection-complete wake.
             mailbox_ready(&this.mailbox, this.active_wait.as_ref())
+                || (this.queue.peek() & this.mask.bits() != 0)
         } else if this.queue.peek() & this.mask.bits() != 0 {
             true
         } else {

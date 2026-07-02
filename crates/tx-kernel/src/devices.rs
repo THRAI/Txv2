@@ -155,6 +155,10 @@ impl<P: TxPlatform> KernelNetDevices<P> {
             Self::write_net_init_error::<P>(err);
             return StepOutcome::Done(());
         }
+        // RX is interrupt-driven (PLIC NET_IRQ → net_rx_irq_handler →
+        // drain_net_rx_pending kicks the delegate); without this the device
+        // never raises the line and inbound frames sit until a poll kick.
+        net.enable_interrupts();
 
         self.register_eth0(net)
     }

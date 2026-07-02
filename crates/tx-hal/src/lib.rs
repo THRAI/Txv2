@@ -1145,6 +1145,12 @@ pub trait IrqIf {
     /// §"Open questions #6".
     const UART_IRQ: u32 = 0;
 
+    /// Platform-specific IRQ number for the boot virtio-net device
+    /// (`0` sentinel = no net IRQ wired; the net delegate then relies on
+    /// poll kicks alone). On QEMU rv64 virt, virtio-mmio slot N maps to
+    /// PLIC IRQ `1 + N`, so the `virtio1` net slot (0x1000_2000) is IRQ 2.
+    const NET_IRQ: u32 = 0;
+
     fn in_irq_context() -> bool {
         false
     }

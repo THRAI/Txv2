@@ -687,7 +687,10 @@ impl<P: TxPlatform> CoreInit<P> {
             // context before deciding whether there is runnable work.
             let had_uart = Self::drain_pending_uart_rx_into_tty() != 0;
             let had_sbi = Self::drain_sbi_console_into_tty() != 0;
-            if had_uart || had_sbi {
+            // Net RX IRQ bottom half: ack the virtio device, kick the net
+            // delegate, unmask the (level-triggered, handler-masked) line.
+            let had_net = crate::irq::drain_net_rx_pending::<P>();
+            if had_uart || had_sbi || had_net {
                 continue;
             }
 

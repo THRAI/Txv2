@@ -519,6 +519,11 @@ impl IrqIf for Platform {
     /// Source: `qemu/hw/riscv/virt.c::UART0_IRQ`.
     const UART_IRQ: u32 = 10;
 
+    /// virtio-mmio slot N sits at PLIC IRQ `1 + N`
+    /// (`qemu/hw/riscv/virt.c::VIRTIO_IRQ`); the net device binds the
+    /// `virtio1` slot (0x1000_2000), i.e. IRQ 2.
+    const NET_IRQ: u32 = 2;
+
     fn in_irq_context() -> bool {
         irq_context_depth() != 0
     }
