@@ -11,7 +11,7 @@ use crate::net::structure::registry;
 use crate::net::structure::table::SocketTable;
 use crate::net::structure::{
     ConnectionKey, Ipv4Address, RecvWireSet, SocketAcceptEntry, SocketIdentity, SocketProtocol,
-    TcpBacklogRetransmitOutcome,
+    TcpBacklogRetransmitOutcome, TcpState,
 };
 use tx_substrate::zone::Cap;
 
@@ -289,11 +289,28 @@ fn process_tcp_event(
         let raw = payload.raw_tcp_socket()?;
         let bits = raw.process_segment(segment);
         payload.refresh_io_from_raw();
+        // Outbound-client handshake completion: the SYN-ACK just drove
+        // smoltcp into Established. Promote the protocol enum
+        // Connecting -> Connected and make sure SPACE fires so the parked
+        // connect() resumes. (Listener children go through the backlog
+        // promotion instead — P2-S3.)
+        let mut connected_now = false;
+        if bits.connected {
+            connected_now = payload.with_protocol_mut(|protocol| {
+                if let SocketProtocol::Tcp(TcpState::Connecting { local, remote }) = protocol {
+                    let (local, remote) = (*local, *remote);
+                    *protocol = SocketProtocol::Tcp(TcpState::Connected { local, remote });
+                    true
+                } else {
+                    false
+                }
+            });
+        }
         let publish = NetworkPublish {
             recv_has_data: bits.recv_readable
                 || socket.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() == 0
                     && raw.recv_available() > 0,
-            send_has_space: bits.send_writable,
+            send_has_space: connected_now || bits.send_writable,
             recv_broken: bits.broken || bits.recv_closed,
             send_broken: bits.broken || bits.send_closed,
             urgent: event.urgent,

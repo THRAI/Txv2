@@ -344,6 +344,15 @@ impl<P: TxPlatform> CoreInit<P> {
             runtime
         })?;
 
+        // Static ARP for the SLIRP gateway (10.0.2.2 -> 52:55:0a:00:02:02):
+        // dynamic ARP replies are learned by the per-namespace device iface,
+        // not this one, so without this the SYN is dropped pending resolution
+        // and re-ARPs forever. Harmless for loopback-only boots (never routed).
+        runtime.ether_iface.install_static_arp(
+            BOOT_ETH_GATEWAY,
+            tx_subsystems::net::EthernetAddress::new([0x52, 0x55, 0x0a, 0x00, 0x02, 0x02]),
+        );
+
         let mut slot = BOOT_NET_RUNTIME.lock();
         if let Some(existing) = *slot {
             Some(existing)

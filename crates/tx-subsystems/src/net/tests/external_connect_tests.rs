@@ -1,0 +1,326 @@
+//! Outbound TCP connect over the real virtio-net device (OSComp finals git
+//! Task2, kernel side). Verifies that a userspace-shaped `connect()` to an
+//! EXTERNAL host emits a SYN, that an inbound SYN-ACK demuxed from a real wire
+//! frame is fed into smoltcp, and that the handshake completes (smoltcp
+//! Established + `TcpState::Connected` + `SendWireSet::SPACE` fired so the
+//! blocked connect returns).
+//!
+//! Models on `virtio_net_device_tests::virtio_rx_delegate_delivers_udp_payload_to_socket`
+//! for the device/delegate wiring and on `loopback_tests::tcp_loopback` for the
+//! connect/handshake assertions.
+
+use super::*;
+use crate::net::protocol::SmoltcpTcpSegment;
+use std::boxed::Box;
+
+const LOCAL_IP: Ipv4Address = Ipv4Address::new([192, 0, 2, 2]);
+const REMOTE_IP: Ipv4Address = Ipv4Address::new([192, 0, 2, 1]);
+const DEVICE_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 2];
+const PEER_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 1];
+
+struct VirtioEtherDelegateDriver<'a> {
+    source: EtherPacketSource<'a>,
+}
+
+impl NetDelegateDriver for VirtioEtherDelegateDriver<'_> {
+    fn now(&self) -> smoltcp::time::Instant {
+        smoltcp::time::Instant::ZERO
+    }
+
+    fn packet_source(&self) -> &dyn PacketSource {
+        &self.source
+    }
+}
+
+fn setup() -> std::sync::MutexGuard<'static, ()> {
+    init_zones();
+    let lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
+    crate::net::delegate::net_delegate_clear(
+        crate::net::delegate::DelegateWireSet::POLL | crate::net::delegate::DelegateWireSet::TICK,
+    );
+    lock
+}
+
+fn leak_virtio_device(rx_capacity: usize, tx_capacity: usize) -> &'static VirtioNetDevice {
+    Box::leak(Box::new(VirtioNetDevice::new(
+        VirtioNetConfig::new(
+            EthernetAddress::new(DEVICE_MAC),
+            1500,
+            VirtioNetFeatureSet::software_checksum(),
+        ),
+        VirtioNetQueueConfig::new(rx_capacity, tx_capacity),
+    )))
+}
+
+fn leak_virtio_registration(
+    device: &'static VirtioNetDevice,
+    minor: u32,
+) -> &'static NetDeviceRegistration {
+    Box::leak(Box::new(NetDeviceRegistration {
+        devt: DevT::new(VIRTIO_NET_STAGING_MAJOR, minor),
+        name: "virtio-net-test",
+        ops: device,
+    }))
+}
+
+fn smoltcp_ipv4(addr: Ipv4Address) -> smoltcp::wire::Ipv4Address {
+    let [a, b, c, d] = addr.octets();
+    smoltcp::wire::Ipv4Address::new(a, b, c, d)
+}
+
+/// Build a checksummed TCP/IPv4/Ethernet frame (smoltcp emit computes both the
+/// IP and TCP checksums, so `SmoltcpTcpSegment::parse_ipv4_packet` in the demux
+/// path accepts it).
+fn ethernet_tcp_frame(
+    src: IpEndpoint,
+    dst: IpEndpoint,
+    control: smoltcp::wire::TcpControl,
+    seq: i32,
+    ack: Option<i32>,
+) -> std::vec::Vec<u8> {
+    let tcp_repr = smoltcp::wire::TcpRepr {
+        src_port: src.port,
+        dst_port: dst.port,
+        control,
+        seq_number: smoltcp::wire::TcpSeqNumber(seq),
+        ack_number: ack.map(smoltcp::wire::TcpSeqNumber),
+        window_len: 4096,
+        window_scale: None,
+        max_seg_size: None,
+        sack_permitted: false,
+        sack_ranges: [None, None, None],
+        timestamp: None,
+        payload: &[],
+    };
+    let tcp_len = tcp_repr.buffer_len();
+    let ip_repr = smoltcp::wire::IpRepr::Ipv4(smoltcp::wire::Ipv4Repr {
+        src_addr: smoltcp_ipv4(src.addr),
+        dst_addr: smoltcp_ipv4(dst.addr),
+        next_header: smoltcp::wire::IpProtocol::Tcp,
+        payload_len: tcp_len,
+        hop_limit: 64,
+    });
+    let ip_header_len = ip_repr.header_len();
+    let mut ip_bytes = std::vec![0u8; ip_header_len + tcp_len];
+    let checksum_caps = smoltcp::phy::ChecksumCapabilities::default();
+    ip_repr.emit(&mut ip_bytes[..ip_header_len], &checksum_caps);
+    let mut tcp_packet = smoltcp::wire::TcpPacket::new_unchecked(&mut ip_bytes[ip_header_len..]);
+    tcp_repr.emit(
+        &mut tcp_packet,
+        &smoltcp::wire::IpAddress::Ipv4(smoltcp_ipv4(src.addr)),
+        &smoltcp::wire::IpAddress::Ipv4(smoltcp_ipv4(dst.addr)),
+        &checksum_caps,
+    );
+
+    let mut frame = std::vec::Vec::new();
+    frame.extend_from_slice(&DEVICE_MAC); // dst MAC (must match iface ether_addr)
+    frame.extend_from_slice(&PEER_MAC); // src MAC
+    frame.extend_from_slice(&[0x08, 0x00]); // ethertype IPv4
+    frame.extend_from_slice(&ip_bytes);
+    frame
+}
+
+/// Full device-level outbound connect: bind+connect a TCP socket to an external
+/// IP routed via the virtio device, inject a crafted SYN-ACK over the device RX
+/// path, drive the delegate, and assert the handshake completes.
+#[test]
+fn external_tcp_connect_completes_handshake_from_injected_syn_ack() {
+    let _lock = setup();
+
+    let device = leak_virtio_device(4, 4);
+    let registration = leak_virtio_registration(device, 71);
+    crate::net::initial_net_namespace_payload()
+        .attach_device_for_test_or_bootstrap(registration, Some(LOCAL_IP))
+        .expect("attach virtio test device to initial net namespace");
+    let iface = EtherIface::new(
+        registration,
+        IfaceCommon::new(LOCAL_IP, Ipv4Address::new([255, 255, 255, 0]), 1500),
+        EthernetAddress::new(DEVICE_MAC),
+        "virt0",
+    );
+
+    let client_port = 51_271u16;
+    let server_port = 41_271u16;
+    let local = IpEndpoint::new(LOCAL_IP, client_port);
+    let remote = IpEndpoint::new(REMOTE_IP, server_port);
+
+    let guard = tx_substrate::epoch::guard();
+    let client = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Tcp,
+        SocketOptionSet::default_tcp(),
+    )
+    .expect("tcp client");
+    // Bind to the device-local address so the connect local endpoint is concrete
+    // (no dependency on route preferred-src selection).
+    assert_eq!(
+        step_bind(&client, inet_addr(client_port, LOCAL_IP), &guard),
+        StepOutcome::Done(())
+    );
+
+    // connect() to the EXTERNAL remote: no in-kernel namespace owns 192.0.2.1, so
+    // Change B emits the SYN into smoltcp and registers the client connection.
+    assert!(matches!(
+        step_connect(&client, inet_addr(server_port, REMOTE_IP), &guard),
+        StepOutcome::Yield {
+            shape: YieldShape::OnWaitSource { .. },
+            ..
+        }
+    ));
+
+    let client_payload = client.acquire_operational().expect("client payload");
+    assert_eq!(
+        client_payload.protocol_snapshot(),
+        SocketProtocol::Tcp(TcpState::Connecting { local, remote })
+    );
+    let client_raw = client_payload.raw_tcp_socket().expect("client raw tcp");
+    // Change B drove smoltcp into SynSent.
+    assert_eq!(
+        client_raw.protocol_state(),
+        smoltcp::socket::tcp::State::SynSent
+    );
+    // The client is registered under (local, remote) so the inbound SYN-ACK
+    // (src=remote, dst=local) will match lookup_tcp_connection(dst, src).
+    assert!(client_payload
+        .socket_table()
+        .lookup_tcp_connection(ConnectionKey::new(local, remote), &guard)
+        .is_some());
+
+    // Capture the client's initial send sequence number from the SYN smoltcp
+    // wants to dispatch (the same call the device-TX scan makes), so the SYN-ACK
+    // can ACK it correctly.
+    let syn = client_raw.dispatch_segment().expect("client SYN segment");
+    assert_eq!(syn.tcp.control, smoltcp::wire::TcpControl::Syn);
+    assert!(syn.tcp.ack_number.is_none());
+    let client_isn = syn.tcp.seq_number.0;
+
+    // Craft and inject the SYN-ACK (server -> client), acking the client ISN.
+    let syn_ack = ethernet_tcp_frame(
+        remote,
+        local,
+        smoltcp::wire::TcpControl::Syn,
+        0x4242,
+        Some(client_isn.wrapping_add(1)),
+    );
+    let injected = device.inject_rx_for_test_or_irq(RxFrame::new(syn_ack));
+    assert!(injected.accepted);
+    assert_eq!(device.rx_len(), 1);
+
+    // Drive the delegate RX path: device frame -> demux (segment populated) ->
+    // process_tcp_event active-client branch (Change A) -> smoltcp advances ->
+    // promote to Connected + fire SPACE (Change C).
+    let driver = VirtioEtherDelegateDriver {
+        source: EtherPacketSource { iface: &iface },
+    };
+    crate::net::delegate::net_delegate_kick_poll();
+    let outcome = net_delegate_step_once(&driver, &guard);
+
+    assert!(outcome.poll_seen);
+    assert_eq!(outcome.packets_seen, 1);
+    assert_eq!(device.rx_len(), 0);
+
+    // Handshake complete: smoltcp Established, protocol Connected, and the
+    // blocked connect's send carrier woken.
+    assert_eq!(
+        client_raw.protocol_state(),
+        smoltcp::socket::tcp::State::Established
+    );
+    assert_eq!(
+        client_payload.protocol_snapshot(),
+        SocketProtocol::Tcp(TcpState::Connected { local, remote })
+    );
+    assert!(client.readiness.send_wq.peek() & SendWireSet::SPACE.bits() != 0);
+}
+
+/// Focused check of the new active-client branch in process_tcp_event: a
+/// connecting client (smoltcp SynSent) fed a real SYN-ACK segment via the
+/// network-events step promotes to Connected and fires SPACE, while NOT relying
+/// on the device layer. Confirms the strict gate routes Connecting clients to
+/// smoltcp.process_segment (not the lossy record path).
+#[test]
+fn process_tcp_event_active_client_segment_promotes_to_connected() {
+    let _lock = setup();
+
+    // Attach a device so 192.0.2.2 is a local address that the client can bind.
+    let device = leak_virtio_device(2, 2);
+    let registration = leak_virtio_registration(device, 72);
+    crate::net::initial_net_namespace_payload()
+        .attach_device_for_test_or_bootstrap(registration, Some(LOCAL_IP))
+        .expect("attach virtio test device to initial net namespace");
+
+    let guard = tx_substrate::epoch::guard();
+
+    let client_port = 51_272u16;
+    let server_port = 41_272u16;
+    let local = IpEndpoint::new(LOCAL_IP, client_port);
+    let remote = IpEndpoint::new(REMOTE_IP, server_port);
+
+    let client = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Tcp,
+        SocketOptionSet::default_tcp(),
+    )
+    .expect("tcp client");
+    assert_eq!(
+        step_bind(&client, inet_addr(client_port, LOCAL_IP), &guard),
+        StepOutcome::Done(())
+    );
+    assert!(matches!(
+        step_connect(&client, inet_addr(server_port, REMOTE_IP), &guard),
+        StepOutcome::Yield {
+            shape: YieldShape::OnWaitSource { .. },
+            ..
+        }
+    ));
+
+    let client_payload = client.acquire_operational().expect("client payload");
+    let client_raw = client_payload.raw_tcp_socket().expect("client raw tcp");
+    let syn = client_raw.dispatch_segment().expect("client SYN segment");
+    let client_isn = syn.tcp.seq_number.0;
+
+    // Parse a real, checksummed SYN-ACK into a TcpPacketEvent carrying the full
+    // segment (exactly what the real-device demux produces).
+    let ip_bytes = {
+        let frame = ethernet_tcp_frame(
+            remote,
+            local,
+            smoltcp::wire::TcpControl::Syn,
+            0x5151,
+            Some(client_isn.wrapping_add(1)),
+        );
+        frame[14..].to_vec()
+    };
+    let segment = SmoltcpTcpSegment::parse_ipv4_packet(&LoopbackIpPacket::new(ip_bytes))
+        .expect("parsed syn-ack segment");
+    let event = TcpPacketEvent::new(
+        remote,
+        local,
+        TcpPacketFlags {
+            syn: true,
+            ack: true,
+            rst: false,
+        },
+        std::vec::Vec::new(),
+        false,
+    )
+    .with_segment(Some(segment));
+
+    let source = ScriptedPacketSource::new(std::vec![PacketDispatch::Tcp(event)]);
+    let outcome = match step_process_network_events(&source, &guard) {
+        StepOutcome::Done(outcome) => outcome,
+        _ => panic!("network step should complete"),
+    };
+
+    assert_eq!(outcome.packets_seen, 1);
+    assert_eq!(outcome.sockets_touched, 1);
+    assert_eq!(
+        client_raw.protocol_state(),
+        smoltcp::socket::tcp::State::Established
+    );
+    assert_eq!(
+        client_payload.protocol_snapshot(),
+        SocketProtocol::Tcp(TcpState::Connected { local, remote })
+    );
+    assert!(client.readiness.send_wq.peek() & SendWireSet::SPACE.bits() != 0);
+}

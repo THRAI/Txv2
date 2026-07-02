@@ -76,6 +76,7 @@ mod clock_tests;
 mod delegate_loopback_tests;
 mod delegate_supervisor_tests;
 mod ether_iface_arp_tests;
+mod external_connect_tests;
 mod icmp_tests;
 mod loopback_pending_tests;
 mod loopback_tests;

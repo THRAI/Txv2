@@ -340,7 +340,14 @@ fn tcp_connected_peer_error(payload: &SocketPayload, guard: &Guard<'_>) -> Optio
         return None;
     };
     let Some(peer) = lookup_tcp_connected_peer(payload, local, remote, guard) else {
-        return Some(Errno::EPIPE);
+        // No in-kernel peer: this is an external (real-device) TCP connection
+        // whose peer lives on the wire, not a loopback/intra-kernel pair. The
+        // connection is writable as long as its smoltcp socket can still
+        // send; only a socket that can no longer send is a genuine EPIPE.
+        return match payload.raw_tcp_socket() {
+            Some(raw) if raw.may_send() => None,
+            _ => Some(Errno::EPIPE),
+        };
     };
     let Some(peer_payload) = peer.acquire_operational() else {
         return Some(Errno::EPIPE);
