@@ -26,7 +26,6 @@ pub struct RawTcpSocket {
     socket: SpinMutex<Box<tcp::Socket<'static>>>,
     protocol_state: SpinMutex<RawTcpProtocolState>,
     last_syn_ack: SpinMutex<Option<SmoltcpTcpSegment>>,
-    rx_buffer: SpinMutex<VecDeque<u8>>,
     tx_buffer: SpinMutex<VecDeque<u8>>,
     corked_tx: SpinMutex<Vec<u8>>,
     recv_capacity: usize,
@@ -95,7 +94,6 @@ impl RawTcpSocket {
             socket: SpinMutex::new(Box::new(socket)),
             protocol_state: SpinMutex::new(RawTcpProtocolState::default()),
             last_syn_ack: SpinMutex::new(None),
-            rx_buffer: SpinMutex::new(VecDeque::new()),
             tx_buffer: SpinMutex::new(VecDeque::new()),
             corked_tx: SpinMutex::new(Vec::new()),
             recv_capacity,
@@ -111,21 +109,8 @@ impl RawTcpSocket {
         self.send_capacity
     }
 
-    pub fn ingest_rx_bytes(&self, bytes: &[u8]) -> bool {
-        if bytes.is_empty() {
-            return false;
-        }
-
-        let mut rx = self.rx_buffer.lock();
-        let was_empty = rx.is_empty();
-        let available = self.recv_capacity.saturating_sub(rx.len());
-        let accepted = core::cmp::min(available, bytes.len());
-        rx.extend(bytes.iter().copied().take(accepted));
-        was_empty && accepted > 0
-    }
-
     pub fn recv_available(&self) -> usize {
-        self.rx_buffer.lock().len()
+        self.socket.lock().recv_queue()
     }
 
     pub fn recv_len(&self, len: usize, peek: bool) -> Option<(usize, bool)> {
@@ -133,18 +118,33 @@ impl RawTcpSocket {
             return Some((0, false));
         }
 
-        let mut rx = self.rx_buffer.lock();
-        if rx.is_empty() {
+        let mut socket = self.socket.lock();
+        if socket.recv_queue() == 0 {
             return None;
         }
 
-        let bytes = core::cmp::min(rx.len(), len);
-        if !peek {
-            for _ in 0..bytes {
-                let _ = rx.pop_front();
-            }
+        if peek {
+            let bytes = core::cmp::min(socket.recv_queue(), len);
+            return Some((bytes, false));
         }
-        Some((bytes, !peek && rx.is_empty()))
+
+        // Consume-and-discard: the smoltcp ring may wrap, so `recv` can hand
+        // out less than the queued total per call — loop until done.
+        let mut taken_total = 0;
+        while taken_total < len {
+            let want = len - taken_total;
+            let taken = socket
+                .recv(|buf| {
+                    let take = core::cmp::min(buf.len(), want);
+                    (take, take)
+                })
+                .unwrap_or(0);
+            if taken == 0 {
+                break;
+            }
+            taken_total += taken;
+        }
+        Some((taken_total, socket.recv_queue() == 0))
     }
 
     pub fn recv_bytes(&self, out: &mut [u8], peek: bool) -> Option<(usize, bool)> {
@@ -152,24 +152,20 @@ impl RawTcpSocket {
             return Some((0, false));
         }
 
-        let mut rx = self.rx_buffer.lock();
-        if rx.is_empty() {
+        let mut socket = self.socket.lock();
+        if socket.recv_queue() == 0 {
             return None;
         }
 
-        let bytes = core::cmp::min(rx.len(), out.len());
-        if peek {
-            for (dst, src) in out.iter_mut().take(bytes).zip(rx.iter()) {
-                *dst = *src;
-            }
+        let bytes = if peek {
+            socket.peek_slice(out).unwrap_or(0)
         } else {
-            for dst in out.iter_mut().take(bytes) {
-                if let Some(byte) = rx.pop_front() {
-                    *dst = byte;
-                }
-            }
+            socket.recv_slice(out).unwrap_or(0)
+        };
+        if bytes == 0 {
+            return None;
         }
-        Some((bytes, !peek && rx.is_empty()))
+        Some((bytes, !peek && socket.recv_queue() == 0))
     }
 
     pub fn send_available(&self) -> usize {
@@ -291,20 +287,6 @@ impl RawTcpSocket {
         accepted
     }
 
-    pub fn ack_tx_bytes(&self, bytes: usize) -> bool {
-        if bytes == 0 {
-            return false;
-        }
-
-        let had_no_space = self.send_available() == 0;
-        let mut tx = self.tx_buffer.lock();
-        let released = core::cmp::min(bytes, tx.len());
-        for _ in 0..released {
-            let _ = tx.pop_front();
-        }
-        drop(tx);
-        had_no_space && released > 0 && self.send_available() > 0
-    }
 
     pub fn dequeue_tx_bytes(&self, max_len: usize) -> Option<(Vec<u8>, bool)> {
         if max_len == 0 {
@@ -370,7 +352,6 @@ impl RawTcpSocket {
         ));
         *self.protocol_state.lock() = RawTcpProtocolState::default();
         *self.last_syn_ack.lock() = None;
-        self.rx_buffer.lock().clear();
         self.tx_buffer.lock().clear();
         self.corked_tx.lock().clear();
     }
@@ -473,28 +454,6 @@ impl RawTcpSocket {
             }
             publish
         })
-    }
-
-    pub fn drain_protocol_recv_to_staging(&self) -> bool {
-        let mut became_readable = false;
-        let mut scratch = [0u8; 1024];
-
-        loop {
-            let read = {
-                let mut socket = self.socket.lock();
-                if !socket.can_recv() {
-                    0
-                } else {
-                    socket.recv_slice(&mut scratch).unwrap_or_default()
-                }
-            };
-            if read == 0 {
-                break;
-            }
-            became_readable |= self.ingest_rx_bytes(&scratch[..read]);
-        }
-
-        became_readable
     }
 
     fn enqueue_protocol_tx_bytes(&self, bytes: &[u8]) -> Result<usize, tcp::SendError> {

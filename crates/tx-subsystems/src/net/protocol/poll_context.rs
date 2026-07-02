@@ -495,8 +495,9 @@ impl PollContext {
     ) -> Option<SegmentProcessTarget> {
         let target_raw = target_payload.raw_tcp_socket()?;
 
+        // Data now lands directly in the smoltcp rx ring inside
+        // `process_segment`; readability is derived from the ring below.
         let protocol_publish = target_raw.process_segment(segment);
-        let became_readable = target_raw.drain_protocol_recv_to_staging();
         target_payload.refresh_io_from_raw();
         self.sockets_touched += 1;
 
@@ -513,8 +514,7 @@ impl PollContext {
         }
 
         let publish = NetworkPublish {
-            recv_has_data: became_readable
-                || protocol_publish.recv_readable
+            recv_has_data: protocol_publish.recv_readable
                 || target.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() == 0
                     && target_raw.recv_available() > 0,
             send_has_space: protocol_publish.send_writable,

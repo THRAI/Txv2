@@ -1,26 +1,21 @@
 use super::*;
 
-#[test]
-fn raw_tcp_socket_ingests_and_drains_rx_bytes() {
-    let mut options = SocketOptionSet::default_tcp();
-    options.socket.recv_buf_size = 8;
-    let raw = RawTcpSocket::new(&options);
-
-    assert!(raw.ingest_rx_bytes(b"abcdef"));
-    assert_eq!(raw.recv_available(), 6);
-    assert_eq!(raw.recv_len(3, false), Some((3, false)));
-    assert_eq!(raw.recv_available(), 3);
-    assert_eq!(raw.recv_len(8, false), Some((3, true)));
-    assert_eq!(raw.recv_available(), 0);
-}
+// P1-S1 note: the old `raw_tcp_socket_ingests_and_drains_rx_bytes` /
+// `raw_tcp_socket_peek_does_not_drain_rx_bytes` tests asserted the staging
+// `rx_buffer`'s bounded-ingest contract. That buffer is gone — TCP recv now
+// reads the smoltcp rx ring directly; end-to-end recv coverage lives in
+// `loopback_tests` (segment path) and the empty-ring contract below.
 
 #[test]
-fn raw_tcp_socket_peek_does_not_drain_rx_bytes() {
+fn raw_tcp_socket_recv_reports_empty_smoltcp_ring() {
     let raw = RawTcpSocket::new(&SocketOptionSet::default_tcp());
 
-    assert!(raw.ingest_rx_bytes(b"abcdef"));
-    assert_eq!(raw.recv_len(3, true), Some((3, false)));
-    assert_eq!(raw.recv_available(), 6);
+    assert_eq!(raw.recv_available(), 0);
+    assert_eq!(raw.recv_len(3, false), None);
+    assert_eq!(raw.recv_len(0, false), Some((0, false)));
+    let mut out = [0u8; 4];
+    assert_eq!(raw.recv_bytes(&mut out, false), None);
+    assert_eq!(raw.recv_bytes(&mut [], false), Some((0, false)));
 }
 
 #[test]
@@ -39,7 +34,11 @@ fn raw_udp_socket_preserves_datagram_boundary() {
 }
 
 #[test]
-fn tcp_packet_event_payload_bytes_are_consumed_by_step_recv() {
+fn tcp_packet_event_without_segment_is_dropped() {
+    // P1-S1: established-connection RX only accepts events carrying a full
+    // parsed segment (fed to smoltcp `process_segment`). A bare-byte event —
+    // the shape the old rx bypass consumed — no longer reaches user-visible
+    // data.
     init_zones();
     let _lock = crate::test_support::EPOCH_TEST_LOCK
         .lock()
@@ -72,23 +71,15 @@ fn tcp_packet_event_payload_bytes_are_consumed_by_step_recv() {
         StepOutcome::Done(_)
     ));
     let payload = tcp.acquire_operational().expect("payload");
-    assert_eq!(payload.io_snapshot().recv_len, 3);
-
-    assert_eq!(
-        step_recv(&tcp, 2, SendRecvFlags::empty(), &guard),
-        StepOutcome::Done(2)
-    );
-    assert_eq!(payload.io_snapshot().recv_len, 1);
-    assert!(tcp.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() != 0);
-    assert_eq!(
-        step_recv(&tcp, 2, SendRecvFlags::empty(), &guard),
-        StepOutcome::Done(1)
-    );
     assert_eq!(payload.io_snapshot().recv_len, 0);
     assert_eq!(
         tcp.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits(),
         0
     );
+    assert!(matches!(
+        step_recv(&tcp, 2, SendRecvFlags::empty(), &guard),
+        StepOutcome::Yield { .. }
+    ));
 }
 
 #[test]

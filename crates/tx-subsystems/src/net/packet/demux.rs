@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 
-use crate::net::protocol::Icmpv4Event;
+use crate::net::protocol::{Icmpv4Event, SmoltcpTcpSegment};
 use crate::net::structure::IpEndpoint;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -19,6 +19,11 @@ pub struct TcpPacketEvent {
     pub flags: TcpPacketFlags,
     pub payload: Vec<u8>,
     pub urgent: bool,
+    /// Fully parsed segment (seq/ack/window) for feeding smoltcp
+    /// `process_segment`. `None` when the producer only had bare fields
+    /// (e.g. hand-built test events); such events cannot carry data into
+    /// an established connection.
+    pub segment: Option<SmoltcpTcpSegment>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -49,7 +54,13 @@ impl TcpPacketEvent {
             flags,
             payload,
             urgent,
+            segment: None,
         }
+    }
+
+    pub fn with_segment(mut self, segment: Option<SmoltcpTcpSegment>) -> Self {
+        self.segment = segment;
+        self
     }
 
     pub fn with_payload_len(

@@ -622,22 +622,14 @@ impl SocketPayload {
         dst: IpEndpoint,
         payload: Vec<u8>,
     ) -> bool {
+        // TCP RX no longer lands here: established-connection segments feed
+        // smoltcp via `process_segment` and the data lives in its rx ring.
         let became_readable = match (&self.raw_tcp, &self.raw_udp) {
-            (Some(raw_tcp), None) => raw_tcp.ingest_rx_bytes(&payload),
             (None, Some(raw_udp)) => raw_udp.ingest_rx_datagram(src, dst, payload),
             _ => false,
         };
         self.refresh_io_from_raw();
         became_readable
-    }
-
-    pub(crate) fn record_send_space(&self, bytes: usize) -> bool {
-        let became_available = match &self.raw_tcp {
-            Some(raw_tcp) => raw_tcp.ack_tx_bytes(bytes),
-            None => false,
-        };
-        self.refresh_io_from_raw();
-        became_available
     }
 
     pub(crate) fn consume_recv_bytes(&self, len: usize) -> Option<SocketIoConsume> {

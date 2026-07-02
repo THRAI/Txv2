@@ -10,7 +10,7 @@ use crate::net::protocol::{Icmpv4Event, LoopbackIface};
 use crate::net::structure::registry;
 use crate::net::structure::table::SocketTable;
 use crate::net::structure::{
-    ConnectionKey, Ipv4Address, SocketAcceptEntry, SocketIdentity, SocketProtocol,
+    ConnectionKey, Ipv4Address, RecvWireSet, SocketAcceptEntry, SocketIdentity, SocketProtocol,
     TcpBacklogRetransmitOutcome,
 };
 use tx_substrate::zone::Cap;
@@ -281,17 +281,24 @@ fn process_tcp_event(
     let key = ConnectionKey::new(event.dst, event.src);
     if let Some(socket) = table.lookup_tcp_connection(key, guard) {
         let payload = socket.acquire_operational()?;
-        let mut publish = NetworkPublish::none();
-        let flags = event.flags;
-        let urgent = event.urgent;
-        let ack_bytes = core::cmp::max(1, event.payload_len());
-        if payload.record_recv_payload(event.src, event.dst, event.payload) {
-            publish.recv_has_data = true;
-        }
-        if flags.ack && payload.record_send_space(ack_bytes) {
-            publish.send_has_space = true;
-        }
-        publish.urgent = urgent;
+        // Established-connection RX feeds smoltcp: seq/ack/checksum are the
+        // state machine's verdict, not hand bookkeeping. Events without a
+        // parsed segment (hand-built) cannot enter an established
+        // connection and are dropped.
+        let segment = event.segment.as_ref()?;
+        let raw = payload.raw_tcp_socket()?;
+        let bits = raw.process_segment(segment);
+        payload.refresh_io_from_raw();
+        let publish = NetworkPublish {
+            recv_has_data: bits.recv_readable
+                || socket.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() == 0
+                    && raw.recv_available() > 0,
+            send_has_space: bits.send_writable,
+            recv_broken: bits.broken || bits.recv_closed,
+            send_broken: bits.broken || bits.send_closed,
+            urgent: event.urgent,
+            ..NetworkPublish::none()
+        };
         return Some((socket, publish));
     }
 
