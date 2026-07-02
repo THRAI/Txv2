@@ -73,8 +73,8 @@ impl NetworkPublishTarget {
         // 对端退休后才被处理)。对死 socket 的唤醒是空操作,不是 panic:
         // 经 observe(guard) 检活,避免 Cap 裸解引用。调用方多半已持
         // guard——EBR 禁止嵌套,先借当前窗口,没有再新开。
-        let guard = tx_substrate::epoch::borrow_current_guard()
-            .unwrap_or_else(tx_substrate::epoch::guard);
+        let guard =
+            tx_substrate::epoch::borrow_current_guard().unwrap_or_else(tx_substrate::epoch::guard);
         let Some(socket) = self.socket.downgrade().observe(&guard) else {
             return 0;
         };

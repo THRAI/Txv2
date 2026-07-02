@@ -951,9 +951,13 @@ fn send_sctp_stream_bytes(
                 if peer_payload.shutdown_rd() {
                     return StepOutcome::Done(bytes.len());
                 }
-                if let Some(became_readable) =
-                    peer_payload.record_sctp_message(bytes.to_vec(), false, stream, ppid, Some(local))
-                {
+                if let Some(became_readable) = peer_payload.record_sctp_message(
+                    bytes.to_vec(),
+                    false,
+                    stream,
+                    ppid,
+                    Some(local),
+                ) {
                     if became_readable {
                         peer.readiness.fire_recv(RecvWireSet::HAS_DATA);
                     }
@@ -1106,7 +1110,10 @@ pub fn step_send_sctp_seqpacket(
                     send_assoc_id,
                     last,
                 );
-                if payload.record_sctp_message(failed, true, 0, 0, None).is_some() {
+                if payload
+                    .record_sctp_message(failed, true, 0, 0, None)
+                    .is_some()
+                {
                     fired = true;
                 }
                 offset = end;

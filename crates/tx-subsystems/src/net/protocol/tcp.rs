@@ -432,7 +432,6 @@ impl RawTcpSocket {
         combined.extend(corked.iter().copied());
         *corked = combined;
     }
-
 }
 
 fn new_smoltcp_tcp_socket(

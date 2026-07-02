@@ -185,8 +185,10 @@ pub fn step_process_loopback_tcp(
         .raw_tcp_socket()
         .is_some_and(|raw| raw.send_available() == 0);
 
-    let mut ctx =
-        PollContext::new_with_table(smoltcp::time::Instant::ZERO, source_payload.socket_table());
+    let mut ctx = PollContext::new_with_table(
+        crate::net::clock::net_now_instant(),
+        source_payload.socket_table(),
+    );
     let mut publish_targets = alloc::vec::Vec::new();
     let mut bytes_moved = 0;
     let mut peer_wake_fired = false;
@@ -315,8 +317,10 @@ fn establish_smoltcp_loopback_on_iface(
 
     client_raw.connect_endpoint(local, remote).ok()?;
 
-    let mut ctx =
-        PollContext::new_with_table(smoltcp::time::Instant::ZERO, client_payload.socket_table());
+    let mut ctx = PollContext::new_with_table(
+        crate::net::clock::net_now_instant(),
+        client_payload.socket_table(),
+    );
     let mut publishes = alloc::vec::Vec::new();
 
     publishes.push(ctx.poll_egress_one(client, iface, guard)?);

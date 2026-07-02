@@ -51,8 +51,10 @@ pub fn step_process_loopback_udp_on_iface(
 
     // P1-S4: 单通路——loopback UDP 一律经 lo 队列真包转运（egress 编包
     // → 队列 → ingress 解析投递），直拷捷径已删除。
-    let mut ctx =
-        PollContext::new_with_table(smoltcp::time::Instant::ZERO, source_payload.socket_table());
+    let mut ctx = PollContext::new_with_table(
+        crate::net::clock::net_now_instant(),
+        source_payload.socket_table(),
+    );
     let mut source_wake_fired = false;
 
     if let Some(publish) = ctx.poll_udp_egress_one(source, iface, guard) {
@@ -175,7 +177,7 @@ pub fn step_send_udp_loopback_kernel_bytes_on_iface(
     // P1-S4: 数据报经 lo 队列真包转运（不再查表直塞对端）。同步驱动
     // 一轮 egress+ingress，保持发送路径的内联时延特性。
     let mut ctx = PollContext::new_with_table(
-        smoltcp::time::Instant::ZERO,
+        crate::net::clock::net_now_instant(),
         source_payload.socket_table(),
     );
     if let Some(publish) = ctx.poll_udp_egress_one(socket, iface, guard) {

@@ -9,9 +9,9 @@ use tx_substrate::zone::{
     ZoneError,
 };
 
+use crate::device::DevT;
 use crate::execution::{Errno, Guard, StepOutcome};
 use crate::net::admin::NetAdminAuthority;
-use crate::device::DevT;
 use crate::net::device::{
     net_device_registry_len, net_device_snapshot, BridgeForwardOutcome, BridgeSnapshot,
     EthernetAddress, NetDeviceKind, NetDeviceRegistration,
@@ -321,10 +321,7 @@ impl Drop for NetNamespacePayload {
             // are no double-frees of committed entries.
             unsafe {
                 core::ptr::drop_in_place(ptr);
-                alloc::alloc::dealloc(
-                    ptr as *mut u8,
-                    core::alloc::Layout::new::<SocketTable>(),
-                );
+                alloc::alloc::dealloc(ptr as *mut u8, core::alloc::Layout::new::<SocketTable>());
             }
         }
     }

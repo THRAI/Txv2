@@ -915,10 +915,8 @@ fn tcp_loopback_lost_data_segment_is_retransmitted_after_rto() {
     let client_raw = client_payload.raw_tcp_socket().expect("client raw");
     assert!(client_raw.enqueue_tx_bytes(b"hello").is_some());
 
-    let mut ctx = PollContext::new_with_table(
-        smoltcp::time::Instant::ZERO,
-        client_payload.socket_table(),
-    );
+    let mut ctx =
+        PollContext::new_with_table(smoltcp::time::Instant::ZERO, client_payload.socket_table());
     assert!(ctx.poll_egress_one(&client, iface, &guard).is_some());
     assert!(
         iface.pop_ingress().is_some(),

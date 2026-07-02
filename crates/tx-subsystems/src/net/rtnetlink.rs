@@ -776,7 +776,15 @@ fn build_getaddr_dump_template(netns: &NetNamespacePayload) -> Vec<u8> {
         append_addr_messages(&mut out, 0, 0, NLM_F_MULTI, link, AF_UNSPEC);
     }
     let mut extra_messages = Vec::new();
-    append_extra_addr_messages(&mut extra_messages, 0, 0, NLM_F_MULTI, netns, &links, AF_UNSPEC);
+    append_extra_addr_messages(
+        &mut extra_messages,
+        0,
+        0,
+        NLM_F_MULTI,
+        netns,
+        &links,
+        AF_UNSPEC,
+    );
     for message in extra_messages {
         out.extend_from_slice(&message);
     }
