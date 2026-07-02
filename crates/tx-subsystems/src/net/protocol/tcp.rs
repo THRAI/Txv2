@@ -24,7 +24,6 @@ pub const TCP_CORK_AUTO_FLUSH_BYTES: usize = 1460;
 pub struct RawTcpSocket {
     socket: SpinMutex<Box<tcp::Socket<'static>>>,
     protocol_state: SpinMutex<RawTcpProtocolState>,
-    last_syn_ack: SpinMutex<Option<SmoltcpTcpSegment>>,
     corked_tx: SpinMutex<Vec<u8>>,
     recv_capacity: usize,
     send_capacity: usize,
@@ -32,7 +31,6 @@ pub struct RawTcpSocket {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RawTcpProtocolState {
-    pub has_connected: bool,
     pub is_recv_shut: bool,
     pub is_rst_closed: bool,
 }
@@ -91,7 +89,6 @@ impl RawTcpSocket {
         Self {
             socket: SpinMutex::new(Box::new(socket)),
             protocol_state: SpinMutex::new(RawTcpProtocolState::default()),
-            last_syn_ack: SpinMutex::new(None),
             corked_tx: SpinMutex::new(Vec::new()),
             recv_capacity,
             send_capacity,
@@ -317,7 +314,6 @@ impl RawTcpSocket {
             options,
         ));
         *self.protocol_state.lock() = RawTcpProtocolState::default();
-        *self.last_syn_ack.lock() = None;
         self.corked_tx.lock().clear();
     }
 
@@ -371,14 +367,8 @@ impl RawTcpSocket {
             if result.is_err() {
                 return None;
             }
-            let segment = segment?;
-            self.remember_syn_ack(&segment);
-            Some(segment)
+            segment
         })
-    }
-
-    pub fn retransmit_syn_ack_segment(&self) -> Option<SmoltcpTcpSegment> {
-        self.last_syn_ack.lock().clone()
     }
 
     pub fn process_segment(&self, segment: &SmoltcpTcpSegment) -> SmoltcpTcpProcessPublish {
@@ -396,8 +386,10 @@ impl RawTcpSocket {
 
             let mut protocol_state = self.protocol_state.lock();
             let mut publish = SmoltcpTcpProcessPublish::default();
-            if !protocol_state.has_connected && after.is_active {
-                protocol_state.has_connected = true;
+            // Edge-detect "just became connected" from the smoltcp state
+            // itself: TCP never re-enters the active set without a reset,
+            // so this fires exactly once per connection.
+            if !before.is_active && after.is_active {
                 publish.connected = true;
             }
             if before.can_send != after.can_send && after.can_send {
@@ -441,11 +433,6 @@ impl RawTcpSocket {
         *corked = combined;
     }
 
-    fn remember_syn_ack(&self, segment: &SmoltcpTcpSegment) {
-        if segment.tcp.control == TcpControl::Syn && segment.tcp.ack_number.is_some() {
-            *self.last_syn_ack.lock() = Some(segment.clone());
-        }
-    }
 }
 
 fn new_smoltcp_tcp_socket(
