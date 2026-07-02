@@ -259,6 +259,8 @@ v1（[`REFACTOR_PLAN_A_v1.md`](REFACTOR_PLAN_A_v1.md)，保留作留痕）的引
 
 ### P1 — loopback 恢复 smoltcp 委托 + 瘦 TcpConnection
 
+> **可执行细化见 [`REFACTOR_P1_v1.md`](REFACTOR_P1_v1.md)**（三路调查后的现状全景 + S0–S5 分步 + 判决性丢段重传测试 + 4 个待拍板设计点）。注意其 §1 对本节的修正：loopback 握手/段级传输**已是**真 smoltcp，真正要删的是并存的直拷旁路 + 影子缓冲。
+
 - loopback `lo` 当设备走手写 poll；loopback RX 走 `socket.process()`、TX 走 `socket.dispatch()`；`connect`/`listen`/accept 走 smoltcp 真握手。
 - **删**：`step_tcp_loopback` 直拷、`LoopbackIface`、RawTcpSocket 5 缓冲（先 loopback 路径）。
 - **修**：①（loopback 重传）、②（双份/双通路）、③（loopback UDP 旁路）。

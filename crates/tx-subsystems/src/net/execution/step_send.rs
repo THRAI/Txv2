@@ -120,9 +120,6 @@ pub fn step_send_kernel_bytes(
     if socket.kind == SocketKind::UnixStream {
         return send_unix_stream_bytes(socket, &payload, bytes, guard);
     }
-    if socket.kind == SocketKind::Tcp && tcp_uses_direct_stream(&payload) {
-        return send_tcp_stream_bytes(socket, &payload, bytes, guard);
-    }
     if socket.kind == SocketKind::Sctp {
         return send_sctp_stream_bytes(socket, &payload, bytes, 0, 0, guard);
     }
@@ -263,9 +260,6 @@ pub fn step_send_to_kernel_bytes_with_poll_kick(
     if socket.kind == SocketKind::UnixStream {
         return send_unix_stream_bytes(socket, &payload, bytes, guard);
     }
-    if socket.kind == SocketKind::Tcp && tcp_uses_direct_stream(&payload) {
-        return send_tcp_stream_bytes(socket, &payload, bytes, guard);
-    }
     if socket.kind == SocketKind::Sctp {
         return send_sctp_stream_bytes(socket, &payload, bytes, 0, 0, guard);
     }
@@ -360,15 +354,6 @@ fn tcp_connected_peer_error(payload: &SocketPayload, guard: &Guard<'_>) -> Optio
     }
 }
 
-fn tcp_uses_direct_stream(payload: &SocketPayload) -> bool {
-    matches!(
-        payload.protocol_snapshot(),
-        SocketProtocol::Tcp(TcpState::Connected { .. })
-    ) && payload
-        .raw_tcp_socket()
-        .is_some_and(|raw| !raw.protocol_runtime_state().has_connected)
-}
-
 fn lookup_tcp_connected_peer(
     payload: &SocketPayload,
     local: IpEndpoint,
@@ -384,45 +369,6 @@ fn lookup_tcp_connected_peer(
                 .into_iter()
                 .find_map(|namespace| namespace.socket_table().lookup_tcp_connection(key, guard))
         })
-}
-
-fn send_tcp_stream_bytes(
-    _socket: &Cap<SocketIdentity>,
-    payload: &SocketPayload,
-    bytes: &[u8],
-    guard: &Guard<'_>,
-) -> ByteStepOutcome<usize> {
-    let (local, remote) = match payload.protocol_snapshot() {
-        SocketProtocol::Tcp(TcpState::Connected { local, remote }) => (local, remote),
-        SocketProtocol::Tcp(TcpState::Closed) => return StepOutcome::Err(Errno::ENOTCONN),
-        SocketProtocol::Tcp(_) => return StepOutcome::Err(Errno::EPIPE),
-        _ => return StepOutcome::Err(Errno::EINVAL),
-    };
-    let Some(peer) = lookup_tcp_connected_peer(payload, local, remote, guard) else {
-        return StepOutcome::Err(Errno::EPIPE);
-    };
-    let Some(peer_payload) = peer.acquire_operational() else {
-        return StepOutcome::Err(Errno::EPIPE);
-    };
-    if !matches!(
-        peer_payload.protocol_snapshot(),
-        SocketProtocol::Tcp(TcpState::Connected {
-            local: peer_local,
-            remote: peer_remote,
-        }) if peer_local == remote && peer_remote == local
-    ) {
-        return StepOutcome::Err(Errno::EPIPE);
-    }
-    if peer_payload.shutdown_rd() {
-        return StepOutcome::Err(Errno::EPIPE);
-    }
-    let Some(became_readable) = peer_payload.record_tcp_stream_bytes(bytes) else {
-        return StepOutcome::Err(Errno::EPIPE);
-    };
-    if became_readable {
-        peer.readiness.fire_recv(RecvWireSet::HAS_DATA);
-    }
-    StepOutcome::Done(bytes.len())
 }
 
 fn send_unix_datagram_connected(

@@ -124,17 +124,6 @@ impl RawTcpSocket {
         was_empty && accepted > 0
     }
 
-    pub fn ingest_rx_bytes_unbounded(&self, bytes: &[u8]) -> bool {
-        if bytes.is_empty() {
-            return false;
-        }
-
-        let mut rx = self.rx_buffer.lock();
-        let was_empty = rx.is_empty();
-        rx.extend(bytes.iter().copied());
-        was_empty
-    }
-
     pub fn recv_available(&self) -> usize {
         self.rx_buffer.lock().len()
     }

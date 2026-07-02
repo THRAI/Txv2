@@ -2,7 +2,7 @@
 
 <!-- txdoc:07-NET-P0-V1 -->
 
-**Status.** v1.1 (2026-07-02)。[`REFACTOR_PLAN_A_v2.md`](REFACTOR_PLAN_A_v2.md) 阶段 **P0** 的可执行细化。属"下半·引擎"战线第一步。§6 设计点已拍板 **A（全局 `NET_NOW_NS`）**，四处改动已实施并按 §7 验证记录通过全部四层验证。
+**Status.** v1.1 (2026-07-02)。[`REFACTOR_PLAN_A_v2.md`](REFACTOR_PLAN_A_v2.md) 阶段 **P0** 的可执行细化。属"下半·引擎"战线第一步。§6 设计点已拍板 **A（全局 `NET_NOW_NS`）**，四处改动已实施并按 §7 验证记录通过全部四层验证。逐文件教学讲解（含改动后代码流程图）见 [`REFACTOR_P0_WALKTHROUGH_v1.md`](REFACTOR_P0_WALKTHROUGH_v1.md)。
 
 **Purpose.** 把 smoltcp TCP 状态机的**冻结时钟**解开——这是审计 [`NET_AUDIT_v1.md`](NET_AUDIT_v1.md) ① + R2a 的总根。P0 只做"解冻"，**不碰** 5 缓冲（P1）、loopback 直拷（P1）、外部 TCP（P2）、per-netns Interface（P5）。
 
@@ -79,7 +79,6 @@ fn with_context<R>(f: impl FnOnce(&mut smoltcp::iface::Context) -> R) -> R {
       Instant::from_micros(micros.min(i64::MAX as u64) as i64)
   }
   ```
-
 - **但真实时间传到 `PollContext.timestamp`（`poll_context.rs:21-27`）就断了，从没接进 `with_context`**——后者无视一切、自造 0 时钟。
 
 ### 1.3 为什么当初会断（也是 D3 的由来）
@@ -259,10 +258,10 @@ assert!(syn3.is_some(), "时钟解冻后，超时应重传 SYN");
 
 <!-- txdoc:07-NET-P0-V1-DECISION -->
 
-| 方案 | 做法 | 取舍 |
-| ---- | ---- | ---- |
-| **A. 全局 `NET_NOW_NS`（推荐，= v2 D3，本文按此写）** | 加全局桥，只改 `with_context` 一处，调用点签名全不动 | 改动最小、最好实现；代价是引入一个全局可变量（但只是单调时钟提示，弱一致无害） |
-| B. 显式穿参 | 给 `process_segment(…, now)`/`dispatch_segment(…, now)` 加 `now` 参数，从 `PollContext.timestamp` 传下去 | 数据流显式、更"干净"、好测；但要改每个调用点签名，且 `connect` 的 syscall inline 路径没有 `PollContext`，仍需另找时钟 → 反而更碎 |
+| 方案                                                          | 做法                                                                                                              | 取舍                                                                                                                                 |
+| ------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| **A. 全局 `NET_NOW_NS`（推荐，= v2 D3，本文按此写）** | 加全局桥，只改`with_context` 一处，调用点签名全不动                                                             | 改动最小、最好实现；代价是引入一个全局可变量（但只是单调时钟提示，弱一致无害）                                                       |
+| B. 显式穿参                                                   | 给`process_segment(…, now)`/`dispatch_segment(…, now)` 加 `now` 参数，从 `PollContext.timestamp` 传下去 | 数据流显式、更"干净"、好测；但要改每个调用点签名，且`connect` 的 syscall inline 路径没有 `PollContext`，仍需另找时钟 → 反而更碎 |
 
 **推荐 A**：P0 要小、要稳、要能手写，少动几处更不易错；B 的"显式"优点留到 P3 socket 收敛时一并拿到更合适。**若改选 B，本文 §2 改动 2/3/4 需相应重写。**
 
@@ -276,12 +275,12 @@ assert!(syn3.is_some(), "时钟解冻后，超时应重传 SYN");
 
 四处改动落点（与 §2 一致）：
 
-| 改动 | 文件 | 内容 |
-| ---- | ---- | ---- |
-| 1 | `crates/tx-subsystems/src/net/clock.rs`（新建）+ `net/mod.rs` | `NET_NOW_NS` / `net_set_now_ns` / `net_now_instant` |
-| 2 | `net/protocol/tcp.rs` `with_context` | 常驻 `static CONTEXT_IFACE: SpinMutex<Option<Interface>>` + 每次 `cx.now = net_now_instant()` |
-| 3 | `net/delegate/runtime.rs` `net_delegate_step_once` 开头 | `net_set_now_ns(driver.now() → ns)`（负值截 0、饱和乘） |
-| 4 | `tx-shims/linux_syscall/mod.rs` `dispatch_inner` | `syscall_publishes_net_clock(nr)`（connect/send*/recv*/accept*/shutdown/setsockopt/ppoll/pselect6）→ `net_set_now_ns(P::read_ns())` |
+| 改动 | 文件                                                              | 内容                                                                                                                                     |
+| ---- | ----------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| 1    | `crates/tx-subsystems/src/net/clock.rs`（新建）+ `net/mod.rs` | `NET_NOW_NS` / `net_set_now_ns` / `net_now_instant`                                                                                |
+| 2    | `net/protocol/tcp.rs` `with_context`                          | 常驻`static CONTEXT_IFACE: SpinMutex<Option<Interface>>` + 每次 `cx.now = net_now_instant()`                                         |
+| 3    | `net/delegate/runtime.rs` `net_delegate_step_once` 开头       | `net_set_now_ns(driver.now() → ns)`（负值截 0、饱和乘）                                                                               |
+| 4    | `tx-shims/linux_syscall/mod.rs` `dispatch_inner`              | `syscall_publishes_net_clock(nr)`（connect/send*/recv*/accept*/shutdown/setsockopt/ppoll/pselect6）→ `net_set_now_ns(P::read_ns())` |
 
 四层验证结果（全过）：
 
@@ -302,6 +301,7 @@ assert!(syn3.is_some(), "时钟解冻后，超时应重传 SYN");
 <!-- txdoc:07-NET-P0-V1-EVIDENCE -->
 
 **当前代码（`feature-network-refactor @ fd64ba24`）**：
+
 - 冻结点：`crates/tx-subsystems/src/net/protocol/tcp.rs:712-720`（`with_context` 一次性 `Interface(ZERO)`）。
 - 三个调用点：`tcp.rs:408`（connect_endpoint）、`tcp.rs:428`（dispatch_segment）、`tcp.rs:449`（process_segment）。
 - socket 本体与 5 缓冲：`tcp.rs:24-33`。
@@ -311,6 +311,7 @@ assert!(syn3.is_some(), "时钟解冻后，超时应重传 SYN");
 - P-泛型时钟：`crates/tx-subsystems/src/wall_clock.rs:128`（`monotonic_now_ns::<P: TimeIf>`）。
 
 **smoltcp fork（`external/smoltcp-asterinas`）**：
+
 - 读 `cx.now()`：`src/socket/tcp.rs:287/1439/1711/1785`。
 - 设 `now` 接口：`src/iface/interface/mod.rs:128`（`pub now`）、`:275`（`context()`）、`:799`（`set_now`）。
 
