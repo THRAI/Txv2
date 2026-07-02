@@ -49,29 +49,8 @@ pub fn step_process_loopback_udp_on_iface(
         return StepOutcome::Done(LoopbackUdpTransferOutcome::default());
     };
 
-    if budget > 0 {
-        let mut ctx = PollContext::new_with_table(
-            smoltcp::time::Instant::ZERO,
-            source_payload.socket_table(),
-        );
-        if let Some(outcome) = ctx.poll_udp_loopback_direct_one(source, iface, guard) {
-            let mut source_wake_fired = false;
-            let mut peer_wake_fired = false;
-            for publish in outcome.publishes {
-                source_wake_fired |= publish.publish.send_has_space;
-                peer_wake_fired |= publish.publish.recv_has_data;
-                publish.publish();
-            }
-            return StepOutcome::Done(LoopbackUdpTransferOutcome {
-                tx_packets: outcome.tx_packets,
-                packets_seen: outcome.packets_seen,
-                sockets_touched: outcome.sockets_touched,
-                bytes_moved: outcome.bytes_moved,
-                source_wake_fired,
-                peer_wake_fired,
-            });
-        }
-    }
+    // P1-S4: 单通路——loopback UDP 一律经 lo 队列真包转运（egress 编包
+    // → 队列 → ingress 解析投递），直拷捷径已删除。
     let mut ctx =
         PollContext::new_with_table(smoltcp::time::Instant::ZERO, source_payload.socket_table());
     let mut source_wake_fired = false;
@@ -193,27 +172,18 @@ pub fn step_send_udp_loopback_kernel_bytes_on_iface(
         return tx_substrate::step::StepOutcome::Err(Errno::EINVAL);
     }
 
-    let Some(drain) = source_payload.commit_udp_tx_datagram_sent() else {
-        return tx_substrate::step::StepOutcome::Done(reserve.bytes);
-    };
-    let Some(target) =
-        source_payload
-            .socket_table()
-            .lookup_udp_ingress(source, drain.datagram.dst, guard)
-    else {
-        return tx_substrate::step::StepOutcome::Done(reserve.bytes);
-    };
-    let Some(target_payload) = target.acquire_operational() else {
-        return tx_substrate::step::StepOutcome::Done(reserve.bytes);
-    };
-
-    if target_payload.record_recv_payload(source, drain.datagram.dst, drain.datagram.payload) {
-        target
-            .readiness
-            .fire_recv(crate::net::structure::RecvWireSet::HAS_DATA);
+    // P1-S4: 数据报经 lo 队列真包转运（不再查表直塞对端）。同步驱动
+    // 一轮 egress+ingress，保持发送路径的内联时延特性。
+    let mut ctx = PollContext::new_with_table(
+        smoltcp::time::Instant::ZERO,
+        source_payload.socket_table(),
+    );
+    if let Some(publish) = ctx.poll_udp_egress_one(socket, iface, guard) {
+        publish.publish();
     }
-    if drain.became_available {
-        socket.readiness.fire_send(SendWireSet::SPACE);
+    let ingress = ctx.poll_udp_ingress(iface, guard, 1);
+    for publish in ingress.publishes {
+        publish.publish();
     }
     tx_substrate::step::StepOutcome::Done(reserve.bytes)
 }

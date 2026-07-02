@@ -5,10 +5,14 @@ use alloc::vec::Vec;
 
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::socket::udp;
-use smoltcp::wire::{IpAddress, IpProtocol, IpRepr, Ipv4Packet, Ipv4Repr, UdpPacket, UdpRepr};
+use smoltcp::wire::{
+    IpAddress, IpProtocol, IpRepr, Ipv4Packet, Ipv4Repr, Ipv6Packet, Ipv6Repr, UdpPacket, UdpRepr,
+};
 
 use crate::net::packet::LoopbackIpPacket;
-use crate::net::structure::{IpEndpoint, Ipv4Address, SocketOptionSet};
+use crate::net::structure::{
+    AddressFamily, IpEndpoint, Ipv4Address, Ipv6Address as TxIpv6Address, SocketOptionSet,
+};
 use crate::sync::SpinMutex;
 
 const MAX_UDP_PACKET_METADATA_CAPACITY: usize = 64;
@@ -293,10 +297,32 @@ impl RawUdpSocket {
 }
 
 impl UdpRxDatagram {
+    // 名字沿革:与 TCP 的 parse_ipv4_packet 同款——实际同时处理 v4/v6。
     pub fn parse_ipv4_packet(packet: &LoopbackIpPacket) -> Option<Self> {
         let checksum_caps = ChecksumCapabilities::default();
+        if let Some(datagram) = Self::parse_v4(packet, &checksum_caps) {
+            return Some(datagram);
+        }
+
+        let ipv6 = Ipv6Packet::new_checked(packet.as_bytes()).ok()?;
+        let ipv6_repr = Ipv6Repr::parse(&ipv6).ok()?;
+        if ipv6_repr.next_header != IpProtocol::Udp {
+            return None;
+        }
+        let udp_packet = UdpPacket::new_checked(ipv6.payload()).ok()?;
+        let src_addr = IpAddress::Ipv6(ipv6_repr.src_addr);
+        let dst_addr = IpAddress::Ipv6(ipv6_repr.dst_addr);
+        let udp_repr = UdpRepr::parse(&udp_packet, &src_addr, &dst_addr, &checksum_caps).ok()?;
+        Some(Self {
+            src: IpEndpoint::new_v6(from_smoltcp_ipv6(ipv6_repr.src_addr), udp_repr.src_port),
+            dst: IpEndpoint::new_v6(from_smoltcp_ipv6(ipv6_repr.dst_addr), udp_repr.dst_port),
+            payload: udp_packet.payload().to_vec(),
+        })
+    }
+
+    fn parse_v4(packet: &LoopbackIpPacket, checksum_caps: &ChecksumCapabilities) -> Option<Self> {
         let ipv4 = Ipv4Packet::new_checked(packet.as_bytes()).ok()?;
-        let ipv4_repr = Ipv4Repr::parse(&ipv4, &checksum_caps).ok()?;
+        let ipv4_repr = Ipv4Repr::parse(&ipv4, checksum_caps).ok()?;
         if ipv4_repr.next_header != IpProtocol::Udp {
             return None;
         }
@@ -304,7 +330,7 @@ impl UdpRxDatagram {
         let udp_packet = UdpPacket::new_checked(ipv4.payload()).ok()?;
         let src_addr = IpAddress::Ipv4(ipv4_repr.src_addr);
         let dst_addr = IpAddress::Ipv4(ipv4_repr.dst_addr);
-        let udp_repr = UdpRepr::parse(&udp_packet, &src_addr, &dst_addr, &checksum_caps).ok()?;
+        let udp_repr = UdpRepr::parse(&udp_packet, &src_addr, &dst_addr, checksum_caps).ok()?;
         Some(Self {
             src: IpEndpoint::new(from_smoltcp_ipv4(ipv4_repr.src_addr), udp_repr.src_port),
             dst: IpEndpoint::new(from_smoltcp_ipv4(ipv4_repr.dst_addr), udp_repr.dst_port),
@@ -314,9 +340,13 @@ impl UdpRxDatagram {
 }
 
 impl UdpTxDatagram {
+    // 名字沿革:同 parse——按 dst 家族分派 v4/v6。
     pub fn emit_ipv4_packet(&self, src: IpEndpoint) -> Option<LoopbackIpPacket> {
         if src.port == 0 || self.dst.port == 0 || self.payload.is_empty() {
             return None;
+        }
+        if self.dst.family == AddressFamily::Inet6 {
+            return self.emit_v6(src);
         }
 
         let udp_repr = UdpRepr {
@@ -338,6 +368,39 @@ impl UdpTxDatagram {
         ip_repr.emit(&mut bytes[..ip_header_len], &checksum_caps);
         let src_addr = IpAddress::Ipv4(to_smoltcp_ipv4(src.addr));
         let dst_addr = IpAddress::Ipv4(to_smoltcp_ipv4(self.dst.addr));
+        let mut udp_packet = UdpPacket::new_unchecked(&mut bytes[ip_header_len..]);
+        udp_repr.emit(
+            &mut udp_packet,
+            &src_addr,
+            &dst_addr,
+            self.payload.len(),
+            |payload| payload.copy_from_slice(&self.payload),
+            &checksum_caps,
+        );
+
+        Some(LoopbackIpPacket::new(bytes))
+    }
+
+    fn emit_v6(&self, src: IpEndpoint) -> Option<LoopbackIpPacket> {
+        let udp_repr = UdpRepr {
+            src_port: src.port,
+            dst_port: self.dst.port,
+        };
+        let udp_len = udp_repr.header_len() + self.payload.len();
+        let ip_repr = IpRepr::Ipv6(Ipv6Repr {
+            src_addr: to_smoltcp_ipv6(src.addr6),
+            dst_addr: to_smoltcp_ipv6(self.dst.addr6),
+            next_header: IpProtocol::Udp,
+            payload_len: udp_len,
+            hop_limit: 64,
+        });
+        let ip_header_len = ip_repr.header_len();
+        let mut bytes = vec![0u8; ip_header_len + udp_len];
+        let checksum_caps = ChecksumCapabilities::default();
+
+        ip_repr.emit(&mut bytes[..ip_header_len], &checksum_caps);
+        let src_addr = IpAddress::Ipv6(to_smoltcp_ipv6(src.addr6));
+        let dst_addr = IpAddress::Ipv6(to_smoltcp_ipv6(self.dst.addr6));
         let mut udp_packet = UdpPacket::new_unchecked(&mut bytes[ip_header_len..]);
         udp_repr.emit(
             &mut udp_packet,
@@ -393,4 +456,12 @@ fn to_smoltcp_ipv4(addr: Ipv4Address) -> smoltcp::wire::Ipv4Address {
 
 fn from_smoltcp_ipv4(addr: smoltcp::wire::Ipv4Address) -> Ipv4Address {
     Ipv4Address::new(addr.octets())
+}
+
+fn to_smoltcp_ipv6(addr: TxIpv6Address) -> smoltcp::wire::Ipv6Address {
+    smoltcp::wire::Ipv6Address::from(addr.octets())
+}
+
+fn from_smoltcp_ipv6(addr: smoltcp::wire::Ipv6Address) -> TxIpv6Address {
+    TxIpv6Address::new(addr.octets())
 }
