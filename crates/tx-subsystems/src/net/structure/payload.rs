@@ -953,16 +953,6 @@ impl SocketPayload {
         }))
     }
 
-    pub(crate) fn take_tcp_tx_bytes(&self, max_len: usize) -> Option<SocketTxDrain> {
-        let raw_tcp = self.raw_tcp.as_ref()?;
-        let (bytes, became_available) = raw_tcp.dequeue_tx_bytes(max_len)?;
-        self.refresh_io_from_raw();
-        Some(SocketTxDrain {
-            bytes,
-            became_available,
-        })
-    }
-
     pub(crate) fn take_udp_tx_datagram(&self) -> Option<SocketUdpTxDrain> {
         let raw_udp = self.raw_udp.as_ref()?;
         let drain = raw_udp.pop_tx_datagram()?;
@@ -1354,12 +1344,6 @@ pub struct SocketSendReserve {
     pub bytes: usize,
     pub became_full: bool,
     pub needs_poll_kick: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct SocketTxDrain {
-    pub bytes: Vec<u8>,
-    pub became_available: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

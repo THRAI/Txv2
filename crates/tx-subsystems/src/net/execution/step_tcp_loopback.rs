@@ -174,17 +174,16 @@ pub fn step_process_loopback_tcp(
         return StepOutcome::Err(Errno::ENOTCONN);
     }
 
-    let Some(peer_raw) = peer_payload.raw_tcp_socket() else {
+    if peer_payload.raw_tcp_socket().is_none() {
         return StepOutcome::Err(Errno::EOPNOTSUPP);
-    };
-
-    let peer_space = peer_raw
-        .recv_capacity()
-        .saturating_sub(peer_raw.recv_available());
-    let transfer_limit = core::cmp::min(max_bytes, peer_space);
-    if transfer_limit == 0 {
-        return StepOutcome::Done(LoopbackTcpTransferOutcome::default());
     }
+
+    // Flow control is smoltcp's job now: the peer's advertised window
+    // derives from its rx ring, so dispatch stops by itself when full.
+    let transfer_limit = max_bytes;
+    let source_had_no_send_space = source_payload
+        .raw_tcp_socket()
+        .is_some_and(|raw| raw.send_available() == 0);
 
     let mut ctx =
         PollContext::new_with_table(smoltcp::time::Instant::ZERO, source_payload.socket_table());
@@ -224,13 +223,14 @@ pub fn step_process_loopback_tcp(
         return StepOutcome::Done(LoopbackTcpTransferOutcome::default());
     }
 
-    let drain = source_payload.take_tcp_tx_bytes(bytes_moved);
     source_payload.refresh_io_from_raw();
     peer_payload.refresh_io_from_raw();
-    let source_wake_fired = drain
-        .as_ref()
-        .map(|drain| drain.became_available)
-        .unwrap_or(false);
+    // Send space opens when the transfer's ACKs release smoltcp tx ring
+    // bytes — derive the wake from the ring, no shadow drain to account.
+    let source_wake_fired = source_had_no_send_space
+        && source_payload
+            .raw_tcp_socket()
+            .is_some_and(|raw| raw.send_available() > 0);
     publish_targets.extend(send_space_publish_for_drain(source, source_wake_fired));
     for target in publish_targets {
         target.publish();

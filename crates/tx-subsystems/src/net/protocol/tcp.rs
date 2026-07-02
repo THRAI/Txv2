@@ -1,5 +1,4 @@
 use alloc::boxed::Box;
-use alloc::collections::VecDeque;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -26,7 +25,6 @@ pub struct RawTcpSocket {
     socket: SpinMutex<Box<tcp::Socket<'static>>>,
     protocol_state: SpinMutex<RawTcpProtocolState>,
     last_syn_ack: SpinMutex<Option<SmoltcpTcpSegment>>,
-    tx_buffer: SpinMutex<VecDeque<u8>>,
     corked_tx: SpinMutex<Vec<u8>>,
     recv_capacity: usize,
     send_capacity: usize,
@@ -94,7 +92,6 @@ impl RawTcpSocket {
             socket: SpinMutex::new(Box::new(socket)),
             protocol_state: SpinMutex::new(RawTcpProtocolState::default()),
             last_syn_ack: SpinMutex::new(None),
-            tx_buffer: SpinMutex::new(VecDeque::new()),
             corked_tx: SpinMutex::new(Vec::new()),
             recv_capacity,
             send_capacity,
@@ -169,24 +166,22 @@ impl RawTcpSocket {
     }
 
     pub fn send_available(&self) -> usize {
-        let queued = self.tx_buffer.lock().len();
+        // Space = smoltcp tx ring headroom minus corked (not-yet-committed)
+        // bytes, which will need ring space when flushed.
         let corked = self.corked_tx.lock().len();
-        let staged_available = self
-            .send_capacity
-            .saturating_sub(queued.saturating_add(corked));
-        let protocol_available = {
-            let socket = self.socket.lock();
-            if socket.may_send() {
-                socket.send_capacity().saturating_sub(socket.send_queue())
-            } else {
-                0
-            }
-        };
-        core::cmp::min(staged_available, protocol_available)
+        let socket = self.socket.lock();
+        if socket.may_send() {
+            socket
+                .send_capacity()
+                .saturating_sub(socket.send_queue())
+                .saturating_sub(corked)
+        } else {
+            0
+        }
     }
 
     pub fn send_queued(&self) -> usize {
-        self.tx_buffer.lock().len()
+        self.socket.lock().send_queue()
     }
 
     pub fn enqueue_tx_len(&self, len: usize) -> Option<RawTcpSendReserve> {
@@ -246,9 +241,6 @@ impl RawTcpSocket {
         if corked_len != 0 {
             self.corked_tx.lock().clear();
         }
-        self.tx_buffer
-            .lock()
-            .extend(combined.iter().copied().take(accepted));
         let accepted_new = accepted.saturating_sub(corked_len).min(requested);
         Some(RawTcpSendReserve {
             bytes: accepted_new,
@@ -278,36 +270,10 @@ impl RawTcpSocket {
             return 0;
         }
 
-        self.tx_buffer
-            .lock()
-            .extend(bytes.iter().copied().take(accepted));
         if accepted < bytes.len() {
             self.prepend_corked_tx(&bytes[accepted..]);
         }
         accepted
-    }
-
-
-    pub fn dequeue_tx_bytes(&self, max_len: usize) -> Option<(Vec<u8>, bool)> {
-        if max_len == 0 {
-            return None;
-        }
-
-        let had_no_space = self.send_available() == 0;
-        let mut tx = self.tx_buffer.lock();
-        if tx.is_empty() {
-            return None;
-        }
-
-        let bytes = core::cmp::min(tx.len(), max_len);
-        let mut drained = Vec::with_capacity(bytes);
-        for _ in 0..bytes {
-            if let Some(byte) = tx.pop_front() {
-                drained.push(byte);
-            }
-        }
-
-        Some((drained, had_no_space))
     }
 
     pub fn can_recv(&self) -> bool {
@@ -352,7 +318,6 @@ impl RawTcpSocket {
         ));
         *self.protocol_state.lock() = RawTcpProtocolState::default();
         *self.last_syn_ack.lock() = None;
-        self.tx_buffer.lock().clear();
         self.corked_tx.lock().clear();
     }
 
