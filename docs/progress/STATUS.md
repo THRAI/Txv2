@@ -1,3 +1,18 @@
+- 2026-07-02 (P2 执行计划落盘 — docs/design/07_net/REFACTOR_P2_v1.md). 三路取证:2 并行 Explore(外部 TX/路由、外部
+  RX/connect 断点)+orchestrator 自采 net-git 分支闯关实录(旧架构打通外部 TCP 的完整 commit 序列=参考答案)。**核心
+  发现**:外部路径"四肢健全、心跳缺失"——TX 车道(组帧/ARP/virtio,含 is_tcp_connecting 搬运)齐备空转,RX 链 P1 后已通
+  到 process_segment;真正断点只有两处:①出站无人调 connect_endpoint(全仓唯 loopback 握手调过,smoltcp 停 Closed,
+  dispatch 恒 None);②入站 SYN 被手工假 child 劫持(smoltcp Closed+枚举直标 Connected+跳过 backlog 直进 accept,
+  SYN-ACK 不发;连锁:P1 established-RX 对假 child 无效,accepts() 拒收)。**net-git 八关对照表**(文档灵魂):时钟/
+  established-RX/ISN 三关已被 P0/P1 结构性拆掉;剩余=virtio1 MMIO(51fc5e5b 可借)/出站 connect(6e63bd29)/RX 驱动窗
+  (c8389512)/静态 ARP+poll-pump+坑5 阻塞 connect 不续跑(44d7895c,D14 族!)/EPIPE 假设(3b7bfe26,本分支原样在)/端口
+  轮转(9d840ecb)/多段 TX(9c919782,本分支同款单段)/UDP+DNS 三小坑。**方案**:S0 设备就位→S1 出站心跳(connect_endpoint
+  +静态网关 ARP+EPIPE 修,灵魂测试=移植 external_connect_tests 326 行)→S2 RX 驱动窗+坑5 专项→S3 入站真握手
+  (process_first_syn 泛化,需 iface 回程 trait)→S4 多段抽干→S5 端口轮转→S6 UDP 进 smoltcp(完成 P1 遗留)+DNS→S7
+  IPv6 demux 放行+Cap 加固先行块。验收=guest wget http://10.0.2.2:8000 rc=0(slirp 转宿主 http.server);外网验证
+  矩阵+pcap 方法已写入。**待拍板 4 设计点**:①iface 回程 trait(推荐)vs 复制握手;②IPv6 demux P2 放行(推荐)vs 全推
+  P4;③UDP 收敛 P2 内做(推荐)vs 再缓;④poll-pump(推荐,net-git 已验证)vs virtio IRQ。**Next**:用户拍板→S0 开工。
+  **Blocker**:无。
 - 2026-07-02 (P1 实施完成 — S0–S5 六连 commit 2fc0a3ea…402a441d,loopback 收敛 smoltcp 单通路). 用户拍板四设计点全 A。
   S0 断 TCP 直拷(选择器+直拷函数+无界塞);S1 删 rx_buffer(recv_len/recv_bytes/recv_available 换 smoltcp recv/
   recv_slice/peek_slice/recv_queue 实现,签名不变上层零改;通路C=demux 附带完整段喂 process_segment,删 ack_bytes=

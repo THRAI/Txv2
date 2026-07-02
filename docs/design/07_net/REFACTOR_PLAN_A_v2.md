@@ -268,6 +268,8 @@ v1（[`REFACTOR_PLAN_A_v1.md`](REFACTOR_PLAN_A_v1.md)，保留作留痕）的引
 
 ### P2 — 外部网卡走同一手写 poll（打通外部 TCP/UDP/IPv6）
 
+> **可执行细化见 [`REFACTOR_P2_v1.md`](REFACTOR_P2_v1.md)**（外部路径解剖 + net-git 八关对照表 + S0–S7 分步 + 外网验证矩阵 + 4 个待拍板设计点）。关键修正：TX 车道与 RX 链其实已就位，真正断的只有"出站无人调 connect_endpoint"与"入站假握手"两处心跳。
+
 - `eth0`（virtio）走与 loopback 相同手写 poll：RX `ops.receive`→解析→`socket.process(cx,…)`（验校验和）；TX `socket.dispatch`；`socket.connect()` 真发 SYN。
 - **修**：①（外部 TCP 结构性不可用 → 可用）、③（外部 UDP）、R3a（RX 验校验和）、⑩（IPv6 数据路径随常驻 Interface + smoltcp process 复活）。
 - **验证**：git-over-HTTPS rc=0（对照 `feature-network-next` 已通）、外部 ping/UDP、net_stress、`-smp 4` 并发不卡死。
