@@ -72,6 +72,7 @@ use tx_substrate::step::{NoProgress, StepOutcome, YieldShape};
 
 mod bridge_tests;
 mod byte_io_tests;
+mod clock_tests;
 mod delegate_loopback_tests;
 mod delegate_supervisor_tests;
 mod ether_iface_arp_tests;

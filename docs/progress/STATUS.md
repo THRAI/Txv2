@@ -1,3 +1,92 @@
+- 2026-07-02 (P0 实施完成 — 解冻时钟,A 方案落地,全四层验证过). 用户拍板 §6 **A 全局 `NET_NOW_NS`** 并要我实现。
+  **四改动**(=P0 doc §2/§7):① 新建 `crates/tx-subsystems/src/net/clock.rs`(`NET_NOW_NS:AtomicU64` 默认0 +
+  `net_set_now_ns`/`net_now_instant`,`net/mod.rs` 挂 `pub mod clock`);② `protocol/tcp.rs` `with_context` 换常驻
+  `static CONTEXT_IFACE:SpinMutex<Option<Interface>>`(SpinMutex::new 是 const、Interface 全字段自动 Send,已验)+
+  每次 `cx.now=net_now_instant()`;③ `delegate/runtime.rs` `net_delegate_step_once` 开头
+  `net_set_now_ns(try_from(total_micros).unwrap_or(0).saturating_mul(1000))`;④ `tx-shims/linux_syscall/mod.rs`
+  `dispatch_inner` 入口 `syscall_publishes_net_clock(nr)`(connect/send*/recv*/accept*/shutdown/setsockopt/ppoll/
+  pselect6*)→`net_set_now_ns(P::read_ns())`。**测试**(net/tests/clock_tests.rs 新建,mod 挂 tests.rs):桥接单测绿;
+  判决性重传单测绿且**红判实测**(把 cx.now 钉回 ZERO → 恰在 syn3 断言红,证明精确区分新旧;smoltcp dispatch 逻辑亲读
+  fork tcp.rs:2278-2326/2535 确认 SYN→set_for_retransmit→时间不动 None→越 RTO(300+4×100≈700ms) 重发)。
+  **验证**:tx-subsystems 全量 816过/305败,失败集合与 stash 基线 comm 集合差**为空**(305=分支既有 bridge/namespace 系,
+  P0 零新增,+2=新测试);`xtask unit` tx-kernel 75/tx-scripts 56 过,tx-shims 编译错+tx-ext4 truncate 败 stash 对照
+  **均既有**(注意:xtask unit HOST_PACKAGES 不含 tx-subsystems,须手动 `cargo test -p tx-subsystems --lib`);QEMU
+  rv64:busybox-boot 哨兵 ok,`init=/bin/tcp-loopback-smoke`→`tx-n68-tcp-ok`,udp→`tx-n68-udp-ok`,临时打印观测
+  `NET_NOW_NS` 跨 delegate 步 588807500→611921000→641242000 ns **单调递增**且首步前已非零(=改动④先行写入),打印已删。
+  **发现**:busybox profile 的 `/bin/busybox` bootstrap exec 报 path-not-found 落回内嵌 fixture(既有,与 P0 无关,
+  故 shell-test 无交互 shell;绕道 `init=` 直启冒烟 bin)。**Next**:P0 一个 commit 入库 → P1(loopback 恢复 smoltcp
+  委托+瘦 socket)细化。**Blocker**:无。
+- 2026-07-01 (P0 执行计划落盘 — docs/design/07_net/REFACTOR_P0_v1.md). 用户要求逐阶段推进,先做 P0"解冻时钟"
+  并要求教学式写清(现场赛要脱离大模型手写)。**调查实证**(全带行号):① `RawTcpSocket.socket` 就是
+  `Box<tcp::Socket>`(tcp.rs:25)——TCP 状态机走 smoltcp,非绕过(当场纠正我打断前的口误);② smoltcp 干活读
+  `cx.now()`(fork socket/tcp.rs:287/1439/1711/1785 重传/RTT/keepalive);③ 冻结点 = `with_context`(tcp.rs:712-720)
+  每次新造 `Interface(Instant::ZERO)`,3 调用点 connect/dispatch/process(tcp.rs:408/428/449);④ **反直觉**:delegate
+  生产路径早有真实时间(`driver.now()` runtime.rs:206;init/net.rs:227-229 用 `P::read_ns()`),但传到
+  `PollContext.timestamp` 就断,从没接进 `with_context`;⑤ 断因=`with_context` 在 P-无关的 tx-subsystems 层,够不着
+  `P::read_ns()`/`monotonic_now_ns::<P>`(wall_clock.rs:128)→ 当初填 ZERO=D3 `NET_NOW_NS` 的由来;⑥ fork 已备设 now
+  接口(interface/mod.rs:128 `pub now`/:275 context/:799 set_now,无需改 fork)。**P0 方案**(四改动带代码):新建
+  `net/clock.rs` 全局 `NET_NOW_NS:AtomicU64`+`net_set_now_ns/net_now_instant`;`with_context` 改常驻
+  `CONTEXT_IFACE:SpinMutex<Option<Interface>>`+用前 `cx.now=net_now_instant()`;delegate `net_delegate_step_once`
+  开头 store `driver.now()`;syscall 入口 store `P::read_ns()`。**安全性质**:NET_NOW_NS 默认0→不写它的代码(含多数现有
+  单测)行为不变,只 delegate/syscall 解冻;常驻 Interface 对 loopback(Medium::Ip 无ARP)零行为变化;代价=CONTEXT_IFACE
+  全局锁串行化(锁序统一不死锁,P3 收敛)。**测试**(四层):桥接单测/**判决性重传单测**(connect→SYN→立刻dispatch=None→
+  NET_NOW_NS+2s→dispatch=Some 重传;旧码恒None红新码绿)/QEMU观测now递增/`xtask unit`+loopback LTP 不退化。
+  **Verification**:P0 doc 内部链接 2/2 有效,v2 §5 P0 段已回链;file:line 均亲验(本轮逐个 Read/grep)。**待确认**:§6
+  设计点 A 全局桥(推荐,本文按此写)vs B 显式穿参。**Next**:用户确认 A/B → 可开写 P0 代码。**Blocker**:无。
+- 2026-07-01 (v2 补回漏写的"上半·接入"战线 — docs/design/07_net/REFACTOR_PLAN_A_v2.md). 用户核对 v2 后指出
+  两条亲点怀疑没写进计划:**⑤ 无文件系统接口**(socket 非 file-ops、靠 syscall `if 是 socket` 特判)与
+  **⑥ wait_shim 与其他子系统不同**。复核:审计 NET_AUDIT_v1.md §5.1/§5.2 两条证据齐全,但 **v1 与 v2 初稿都漏/降级
+  了它们**(不属引擎四主轴 → 被漏在外;⑥ 曾被埋在 D7 就绪子条目)。**修正**:把 v2 重构为**两条战线**——① 下半·引擎
+  (D1-D4 不变) + ② **上半·接入**(socket 融入统一 fd/file 抽象):新增 **§1-bis「两条战线」框架 + 决策 D13**(引入
+  `FileOps` trait 同形 `CharDeviceBinding.ops`,socket 实现之、`step_read/write` 的 socket arm 从 EINVAL
+  `vfs/execution.rs:396-399,649-652` 改委派 ops、删 `io.rs:1946/2229`+`fs_basic.rs:1516`+`epoll.rs:119`+
+  `splice.rs:69` 全部特判=Linux `socket_file_ops`/asterinas `Socket: FileLike`)+ **决策 D14**(socket park 从
+  legacy `WaitToken`+`yield_now` 忙让步 `net/execution/mod.rs:97-131`/`helpers.rs:1703-1707`/`socket.rs:877-1078`
+  收敛到 `await_wait_source`,同其余 8 fd 子系统,连带修 R4a epoll 对 socket 无法阻塞)。同步进 §2 架构图、§4 模块
+  (新建 FileOps/修 EINVAL+wait/删特判)、P3(标题+②⑤⑥⑨...)、附录证据锚点、footer、记忆 `net-refactor-audit`。
+  **同根**:socket 一旦是一等 FileLike(⑤),就绪/等待自然与其他 fd 同构(⑥+R4a)。**Verification**:grep 复核 ⑤/D13/
+  D14/FileOps/await_wait_source 已进 §0/§1-bis/§2/§3/§4/§5/附录/footer 全部位置且连贯;file:line 均引自审计既有锚点
+  (未新造)。**Next**:待用户确认 v2 §9 四个开放问题 → 拆 P0 执行计划。**Blocker**:无。
+- 2026-06-30 (网络栈重构方案修订 A1→asterinas-true — docs/design/07_net/REFACTOR_PLAN_A_v2.md). 用户追问
+  "全交给 smoltcp 是否效率低/缺功能/上真机有问题"+"我当初为何设计成 smoltcp 不负责全部模块"。2 个并行调查员
+  (general-purpose)亲验 `/home/msp/learning/asterinas` + `external/smoltcp-asterinas` 源码 → **推翻 v1 的 A1
+  形态**(拥抱 smoltcp `Interface`+`SocketSet`+`iface.poll()`)。硬证据：① smoltcp `SocketSet` 平铺无索引、
+  `poll()`=O(socket×包)、每包 O(n) 线性 `accepts()`(`socket_set.rs:44-46`,`iface/interface/tcp.rs:21-30`,
+  `mod.rs:447-453/536-549/654-755`)；② asterinas(fork 来源)**刻意不用** SocketSet/poll(`aster-bigtcp/lib.rs:3-11`
+  "cannot satisfy general-purpose OS in efficiency")，改自有 `SocketTable` 哈希 + 手写 `poll_ingress/egress` +
+  真实 jiffies 时钟(`common.rs:43/225-267/242`,`time.rs:5-8`)，smoltcp 只做 per-socket `process/dispatch/accepts/
+  connect`(`tcp_conn.rs:318/569/616/651`)，每 iface 一常驻 `Interface`(`poll_iface.rs:18-21`)，socket=`enum State`
+  (`stream/mod.rs:57-78`)——**= 用户 v9 §9.1 原设计**。**病根精确化**：§9.1 说"不调 poll()"对，但漏写"须持有一个
+  常驻 Interface 供 `context_mut()`+时钟"→ 实现填成 `with_context` 一次性 `Interface(ZERO)` → 冻结 = ①③⑩R2a 总
+  源头(设计漏一句 + AI 无监督填错)。**smoltcp 固有限制(已记账)**：Go-Back-N/SACK 解析却忽略(`tcp.rs:2283-2286`)、
+  无 PMTUD、`max_burst` 窗口钳(`packet.rs:144-161`)、单线程每 iface 一锁(`mod.rs:433-438`)、IPv6 分片缺
+  (`mod.rs:1300-1301`)。**用户决定**：单 netns 先行(多 netns/veth/bridge 留 P5；难点不在多核而在跨 netns 转发)、
+  真机网卡驱动暂缓(QEMU/virtio 范围内重构)、SACK 想要但后说(当前接受 Go-Back-N)。**交付**：REFACTOR_PLAN_A_v2.md
+  (四主轴定 D1 asterinas-true/D2 单netns/D3 NET_NOW_NS/D4 每iface单锁；P0 解冻常驻Interface+真实时钟 → P1 loopback
+  恢复smoltcp委托+瘦socket → P2 外部网卡同一poll → P3 socket瘦身+单锁+就绪/等待统一 → P4 分层+IPv6+ICMP/DNS →
+  P5 多netns)；v1 标记被取代留痕；记忆 `net-refactor-audit` 已同步。**Verification**：v2 内部链接 2/2 有效；证据
+  三方合一(用户原设计 + asterinas 实测 + smoltcp 源码)，逐条 file:line。**Next**：待用户回应 v2 §9 开放问题
+  (netfilter/smoltcp 协同边界、范围确认 netlink/SCTP 不动、是否先做 loopback-only 最小原型、P5 时机) → 拆 P0
+  执行计划。**Blocker**：无。
+- 2026-06-29 (网络栈重构前审计 — docs/design/07_net/NET_AUDIT_v1.md). 用户基于 origin/main 新建
+  `feature-network-refactor` 分支准备重构网络栈，要求**先调研现状问题、验证、不无中生有**。方法：5 个并行
+  调查员(general-purpose)按正交维度取证 `crates/tx-subsystems/src/net/`(41080 行)，orchestrator 逐条复核
+  行号。**核心病根**：smoltcp 被降格为"wire 编解码 + 仅 loopback 单连接状态机"；**无持久 Interface**
+  (`protocol/tcp.rs:712-720` 每次 `new` 一次性 `Interface(Instant::ZERO)` 用完即弃)→ 时钟永久冻结 → 无真
+  重传 / 外部 TCP RX 旁路且丢 seq/ack(`packet/demux.rs:31-36`) / 外部 connect 不发 SYN(`step_connect.rs:58-118`)
+  → **外部 TCP 结构性不可用**(loopback 靠同步直拷 `step_send.rs:363-426`)；socket 模型双数据通路 + 9 个
+  `Option<RawXSocket>` 平铺(`payload.rs:33-53`) + TCP 5 份缓冲(`tcp.rs:24-33`)；`ether.rs:121-133` 单结构体
+  融合 L2/L3/ICMP/设备TX + RX 重复编解码；socket 经 syscall `if 是 socket` 特判(非 file-ops)接入，统一
+  `step_read/write` 主动对 socket 返 EINVAL(`vfs/execution.rs:396-399,649-652`)。⑩ IPv6 数据路径几乎全断(外部RX `ether.rs:279` Unsupported / 无以太v6 TX / loopback 0 v6 / 无v6路由 / NDISC只写不学 / ICMPv6只收不发；仅控制面有形)。**修正/证伪用户怀疑**：
+  ⑥ **改判◐部分证实**(底层 `WaitSource` 原语统一, 但 net/socket 接入停在 legacy `WaitToken`+`yield_now` 忙让步、其余 8 个 fd 子系统已迁 `await_wait_source` → net 接入形态确与其他不同)；⑦ 4 万行非无用测试/死
+  代码(测试 ~34% 健康 / `#[ignore]`=0 / net 内 `#[allow(dead_code)]`=0 / `todo!`=0；膨胀=协议广度)；
+  ⑧ net core 与子系统边界其实较健康(不碰 fd 表、process 仅 `Cap` 传入)。**Verification**：companion 链接
+  4/4 有效；关键论断已亲验(`with_context`/`SocketPayload`/`tcp_uses_direct_stream`/`ether` 三层融合/规模 grep)；
+  2 处调查员数字误差已用实测修正(net 硬编码 10.0.2.x 实为 0；crate dead_code 实测 55 非 69)。**重要**：
+  HEAD=`fd64ba24`，"unified step path Phase 0/1" 与先前 HTTPS 时钟/feed-ACK 修复均在 `feature-network-next`、
+  **未入 main** → 本审计=main 真实态(用户怀疑全部成立)。**Next**：待用户拍板 smoltcp 定位(A 拥抱：持久
+  Interface+真实时钟周期 poll，loopback 也喂 smoltcp；B 自研：删 smoltcp socket)，再立详细重构设计文档
+  (P0=持久 Interface+真实时钟、数据所有者单一化)。**第二轮主动发现(质量/安全)**：解析路径崩溃类全干净(预判证伪);真问题全是病根并发症——R4a epoll对socket无法阻塞(wait-source两套注册表错配 subsystems `wait_source.rs:60` vs substrate `wake/wait_source.rs:444`=⑥后果)、R1a边沿丢唤醒(`step_recv.rs:55-57` SMP卡死)、R2a时钟冻结致老化全失效(泄漏根源)、R2b监听漏排backlog、R2d 320KB/socket+无记账、R2e conntrack无界、R3a RX不验校验和;B冲突亲验裁决:SocketTable有Drop不泄漏(注释过时);详见 NET_AUDIT_v1.md §6-bis。**进展**：用户已选 **A 方案**,正在写详细重构方案。**Blocker**：无。
 - 2026-06-18 (6-suite regression sweep vs main — 0 regressions, 4 lanes, many improvements). User asked to
   regression-test basic/busybox/libctest/libcbench/lmbench/iozone vs main (main "已经测试过了"), on BOTH
   musl AND glibc lanes. Method: per-suite selector boots `tx.oscomp.groups=<suite>-{musl,glibc}` with

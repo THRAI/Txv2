@@ -7,6 +7,7 @@
 
 pub mod admin;
 pub mod checks;
+pub mod clock;
 pub mod delegate;
 pub mod device;
 pub mod execution;

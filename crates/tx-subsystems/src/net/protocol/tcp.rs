@@ -12,6 +12,7 @@ use smoltcp::wire::{
     Ipv4Repr, Ipv6Packet, Ipv6Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber, TcpTimestampRepr,
 };
 
+use crate::net::clock::net_now_instant;
 use crate::net::packet::LoopbackIpPacket;
 use crate::net::structure::{
     AddressFamily, IpEndpoint, Ipv4Address, Ipv6Address as TxIpv6Address, SocketOptionSet,
@@ -709,14 +710,25 @@ fn observe_socket(socket: &tcp::Socket<'_>) -> SocketProtocolObservation {
     }
 }
 
+// Single-netns skeleton: one persistent Interface acting only as the
+// `Context` provider (checksum caps + `now`). Lock order is CONTEXT_IFACE
+// outer, `self.socket` inner at every call site. Per-netns Interfaces are a
+// later phase (REFACTOR_PLAN_A_v2 P5).
+static CONTEXT_IFACE: SpinMutex<Option<Interface>> = SpinMutex::new(None);
+
 fn with_context<R>(f: impl FnOnce(&mut smoltcp::iface::Context) -> R) -> R {
-    let mut device = Loopback::new(Medium::Ip);
-    let mut iface = Interface::new(
-        Config::new(HardwareAddress::Ip),
-        &mut device,
-        smoltcp::time::Instant::ZERO,
-    );
-    f(iface.context())
+    let mut slot = CONTEXT_IFACE.lock();
+    let iface = slot.get_or_insert_with(|| {
+        let mut device = Loopback::new(Medium::Ip);
+        Interface::new(
+            Config::new(HardwareAddress::Ip),
+            &mut device,
+            smoltcp::time::Instant::ZERO,
+        )
+    });
+    let cx = iface.context();
+    cx.now = net_now_instant();
+    f(cx)
 }
 
 fn to_smoltcp_endpoint(endpoint: IpEndpoint) -> SmoltcpIpEndpoint {

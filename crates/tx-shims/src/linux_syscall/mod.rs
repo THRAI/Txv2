@@ -870,10 +870,33 @@ pub fn dispatch_writev_pagebacked_oneshot(
     Some(result)
 }
 
+/// Socket-family syscalls can drive smoltcp inline (connect SYN, send/recv,
+/// shutdown FIN, cork flush on setsockopt); they publish the real clock so
+/// `with_context` sees fresh time on those paths, not only on delegate steps.
+fn syscall_publishes_net_clock(nr: u64) -> bool {
+    nr == NR_CONNECT
+        || nr == NR_SENDTO
+        || nr == NR_RECVFROM
+        || nr == NR_SENDMSG
+        || nr == NR_RECVMSG
+        || nr == NR_SENDMMSG
+        || nr == NR_RECVMMSG
+        || nr == NR_ACCEPT
+        || nr == NR_ACCEPT4
+        || nr == NR_SHUTDOWN
+        || nr == NR_SETSOCKOPT
+        || nr == NR_PPOLL
+        || nr == NR_PSELECT6
+        || nr == NR_PSELECT6_TIME64
+}
+
 async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + tx_hal::ConsoleIf>(
     req: SyscallRequest,
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
+    if syscall_publishes_net_clock(req.nr) {
+        tx_subsystems::net::clock::net_set_now_ns(P::read_ns());
+    }
     // ── Lane 1: ImmediateSyscall (pure ABI queries, never yield) ──
     // Per `docs/Txv3/04_SYSCALL_SHAPE_v1.md §6.1`: these syscalls
     // do not call drive(), do not enter StepOp, do not construct
