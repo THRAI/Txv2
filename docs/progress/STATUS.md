@@ -1,3 +1,40 @@
+- 2026-07-02 (P1 实施完成 — S0–S5 六连 commit 2fc0a3ea…402a441d,loopback 收敛 smoltcp 单通路). 用户拍板四设计点全 A。
+  S0 断 TCP 直拷(选择器+直拷函数+无界塞);S1 删 rx_buffer(recv_len/recv_bytes/recv_available 换 smoltcp recv/
+  recv_slice/peek_slice/recv_queue 实现,签名不变上层零改;通路C=demux 附带完整段喂 process_segment,删 ack_bytes=
+  max(1,payload_len) 假记账);S2 删 tx_buffer 影子(send_available=ring 头寸-corked,删平账/手工 peer_space 流控,
+  背压=smoltcp 窗口);S3 删 last_syn_ack(backlog 重传闭包改纯 dispatch_segment,**语义修正:RTO 未到返回 true 保留
+  半连接,原 false 语义会误杀**;has_connected 闩锁→before/after is_active 边沿);S4 UDP 杀两处直拷全走 lo 队列真包
+  转运+emit/parse 补 v6 臂(直拷曾家族无关,不补则 v6 回环 UDP 静默丢包)——**范围修订:UDP 队列保留**(实施中查实其同时
+  服务外部 UDP 车道 step_device_tx+外部 RX,smoltcp 接管 UDP 数据推 P2 统一);S5 内联 5 处 PollContext(ZERO) 解冻。
+  **灵魂测试绿**:丢数据段→RTO 内不重传→拨钟→重传→收齐(tcp_lifecycle.rs 尾部)。**S4 抓出并修复 SMP 竞态**:smp4 下
+  UDP smoke 1/3 概率 panic(cap.rs:349)=poll 路径触碰并发 close 退休的外来 Cap,裸 deref/clone 对退休槽 panic;修复=
+  observe(guard) 检活取 IdentRef 无 Cap deref+publish 用 borrow_current_guard(**EBR 禁嵌套 guard,直接 guard()
+  6/6 必炸,epoch/mod.rs:59-61 自述**);修后 smp4 8/8 绿。同形裸 deref 遍布 net(TCP poll 同暴露),系统性加固归 P3。
+  **验证**:host 套件失败集合与基线逐条相同(305 既有,每步 stash/集合差核对);UDP 测试族单跑 10/10;单核冒烟 tcp/udp
+  各 2/2(用户告知本机多核不稳,后续验证单核为准)。**未做**:LTP 全量对照(本机无 sdcard 镜像)——接触 LTP 环境时补验
+  recv01/recvfrom01 单跑。**Next**:P2(外部网卡同一 poll)细化。**Blocker**:无。
+- 2026-07-02 (P1 执行计划落盘 — docs/design/07_net/REFACTOR_P1_v1.md). 2 并行 Explore 调查员(五缓冲用途图/UDP+就绪链)
+  + orchestrator 亲验(直拷选择器/段级路径/外部旁路/LoopbackIface/NetDeviceOps)。**核心修正**(对 v2 §5 P1 与审计粗颗粒
+  结论):loopback TCP 握手与段级传输**已是真 smoltcp**(establish_smoltcp_loopback_on_iface 两端真到 Established;
+  poll_egress_one=dispatch_segment);真正病灶=**三条 TCP 通路并存**(A 直拷流:tcp_uses_direct_stream 按 has_connected
+  分流,手工Connected连接走 record_tcp_stream_bytes+ingest_rx_bytes_unbounded 无界直塞;B 段级+影子记账:字节双住
+  smoltcp ring+tx_buffer 镜像、rx 经 drain_staging 搬进 rx_buffer 用户才读到;C 外部 demux 旁路:裸塞+按收到载荷长度
+  猜测性释放 ack_bytes=max(1,payload_len) events.rs:287)+**两条 UDP 通路全直拷**(smoltcp udp::Socket 纯摆设,数据住
+  rx/tx_datagrams)。**方案**:S0 断直拷→S1 删 rx_buffer(recv 直读 recv_slice,通路C改喂 process_segment)→S2 删
+  tx_buffer 影子(背压=smoltcp 窗口)→S3 删 last_syn_ack(P0 解冻后 smoltcp 自重传)+protocol_state 瘦身→S4 UDP 进
+  smoltcp→S5 扫尾(两处 PollContext ZERO 时戳+内联驱动改跑 poll);每步独立提交可回滚。**灵魂测试**=loopback 丢段重传
+  (从 LoopbackIface 队列人为丢段+拨钟越 RTO→仍收齐;直拷世界无"段"概念,只有段级+活钟能过)。**风险已录**:recv01/
+  recvfrom01 冷启动假阳前科须每步单跑;无界塞→背压是修 bug 型行为变化。**待拍板 4 设计点**:①LoopbackIface P1 留骨架
+  P2 设备化(推荐)vs 即改 NetDeviceOps;②通路C P1 改喂真段(推荐,否则 rx_buffer 删不净)vs 留 P2;③corked_tx 保留
+  (推荐,MSG_MORE 暂存非双份)vs 删;④send 后同步跑一轮 poll(推荐,时延等价)vs 纯 kick 异步。**Verification**:文档链接
+  3/3 有效,v2 §5 P1 已回链并标注口径修正;全部 file:line 按 5ab58517,orchestrator 对关键锚点逐个 Read 亲验。
+  **Next**:用户拍板 §6 四点 → 按 S0 开工。**Blocker**:无。
+- 2026-07-02 (P0 教学讲解落盘 — docs/design/07_net/REFACTOR_P0_WALKTHROUGH_v1.md). 用户读不懂原始 diff,要求逐文件
+  总结改动并配流程图,写进文档。新文档=提交 5ab58517 的配套读物:§0 桥的整体图景+8 文件角色表;§1-8 逐文件"改动前/
+  改动后"代码+要点(默认0安全带/Relaxed 理由/纳秒-微秒换算/锁序/为何 A 方案调用点零改动/判决性测试三步对应 smoltcp
+  dispatch 三分支);§9 两张图——9.1 全局数据流(syscall 写端②+delegate 写端①→NET_NOW_NS 桥→with_context 读端→smoltcp
+  定时器)、9.2 SYN 重传时间线(旧代码卡死在"定时器永不到期"步)。P0_v1 Status 行已回链;链接检查通过。**Next**:该文档
+  未提交(用户在读),随下批改动一并入库;P1 细化待用户发话。**Blocker**:无。
 - 2026-07-02 (P0 实施完成 — 解冻时钟,A 方案落地,全四层验证过). 用户拍板 §6 **A 全局 `NET_NOW_NS`** 并要我实现。
   **四改动**(=P0 doc §2/§7):① 新建 `crates/tx-subsystems/src/net/clock.rs`(`NET_NOW_NS:AtomicU64` 默认0 +
   `net_set_now_ns`/`net_now_instant`,`net/mod.rs` 挂 `pub mod clock`);② `protocol/tcp.rs` `with_context` 换常驻

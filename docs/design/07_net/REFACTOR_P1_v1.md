@@ -2,7 +2,7 @@
 
 <!-- txdoc:07-NET-P1-V1 -->
 
-**Status.** v1 (2026-07-02)。[`REFACTOR_PLAN_A_v2.md`](REFACTOR_PLAN_A_v2.md) 阶段 **P1** 的可执行细化。前置：P0 已完成（时钟桥 `NET_NOW_NS` + 常驻 `CONTEXT_IFACE`，提交 `5ab58517`，见 [`REFACTOR_P0_v1.md`](REFACTOR_P0_v1.md) §7）。§6 有 **4 个设计点待拍板**；分步骨架（§3 S0–S5）已细化到可逐步手写。
+**Status.** v1.1 (2026-07-02)。[`REFACTOR_PLAN_A_v2.md`](REFACTOR_PLAN_A_v2.md) 阶段 **P1** 的可执行细化。前置：P0 已完成（`5ab58517`，见 [`REFACTOR_P0_v1.md`](REFACTOR_P0_v1.md) §7）。§6 四设计点已拍板全 A；**S0–S5 已全部实施并提交**（`2fc0a3ea…402a441d`），验证记录与范围修订见 §8。
 
 **Purpose.** 把 loopback 的 TCP/UDP 数据路径收敛成**唯一的 smoltcp 段级通路**，删除直拷旁路与双份缓冲——修审计 ①（loopback 重传）②（双通路/双份记账）③（UDP 旁路）的 loopback 部分。**不碰**：外部握手（P2）、FileOps/等待机制（P3/D13/D14）、IPv6（P4）、`SocketPayload` 9×Option（P3）。
 
@@ -202,6 +202,31 @@ fn tcp_uses_direct_stream(payload: &SocketPayload) -> bool {
 - **验收**：§2 五条不变量成立；灵魂测试（丢段重传）绿；`recv01/recvfrom01` 单跑绿；LTP loopback 子集对照 P1 前不退化（305 基线集合差为空）；QEMU 双 smoke 绿。
 - **提交**：每 S 步一个 commit（`net: P1-S0 断 TCP 直拷旁路` 依此类推），全程可回滚。
 - **明确不做**：外部握手/外部 TCP 打通（P2）、loopback 设备化+统一 poll（P2，若 §6-1 选 A）、FileOps/等待机制（P3/D13/D14）、`SocketPayload` 9×Option（P3）、IPv6 数据路径（P4）、`SO_RCVBUF` 动态生效（另立小项）。
+
+---
+
+## 8. 实施与验证记录（2026-07-02，S0–S5 全部完成）
+
+<!-- txdoc:07-NET-P1-V1-VERIFIED -->
+
+**提交序列**（每步独立验证后提交，可逐步回滚）：
+
+| 步 | commit | 内容 |
+| -- | ------ | ---- |
+| S0 | `2fc0a3ea` | 断 TCP 直拷旁路（选择器/直拷函数/无界塞全删） |
+| S1 | `12183e11` | 删 `rx_buffer`，recv 直读 smoltcp ring（API 签名不变换后备存储）；通路 C 改喂 `process_segment`（demux 附带校验和验证过的完整段）；删假 ACK 记账 |
+| S2 | `3553fac1` | 删 `tx_buffer` 影子，`send_available` 纯 ring 派生，背压归 smoltcp 窗口，删平账/手工流控 |
+| S3 | `baca7045` | 删 `last_syn_ack`，SYN-ACK 重传归 smoltcp 定时器（backlog 闭包语义修正：RTO 未到 ≠ 失败）；`has_connected` 闩锁改 before/after 边沿 |
+| S4 | `123faf5d` | 杀 UDP 两处直拷，loopback UDP 一律经 lo 队列真包转运；UDP emit/parse 补 v6 臂；**修 SMP 竞态**（见下） |
+| S5 | `402a441d` | 内联路径 5 处 `PollContext(ZERO)` 时间戳解冻；死代码清扫 |
+
+**灵魂测试**：`tcp_loopback_lost_data_segment_is_retransmitted_after_rto` 绿——丢数据段 → RTO 内不重传 → 拨钟越 700ms → 重传 → 对端收齐。§2 五条不变量达成（例外见下"范围修订"）。
+
+**范围修订（对 §3-S4 的诚实偏离）**：实施中查实 `rx_datagrams`/`tx_datagrams` **同时服务外部 UDP 路径**（`step_device_tx.rs` 有完整 UDP 车道 + ARP 解析；外部 RX 经 `record_recv_payload` 落队列），而外部真网卡 UDP 目前是通的，P1 不能碰坏 → S4 收窄为"杀直拷、单通路转运，UDP 队列保留为唯一缓冲（smoltcp udp::Socket 本就不持数据，无双份）"；**"smoltcp 接管 UDP 数据"随 P2 外部统一时一并做**（单次重写优于两次）。
+
+**S4 发现并修复的 SMP 竞态**（重要副产物）：`-smp 4` 下 UDP smoke ~1/3 概率内核 panic（`cap.rs:349`，S3 基线 6/6 绿）。机理：队列转运使 poll 路径高频触碰可能被并发 close 退休的外来 socket `Cap`，而 **`Cap` 裸解引用/clone 对已退休槽是 panic**（`cap.rs:349/280`）。修复 = `poll_udp_egress/ingress` 与 `NetworkPublishTarget::publish` 改经 `downgrade().observe(guard)` 检活取 `IdentRef`（guard 钉内存 + 无 Cap deref）；`publish` 内取 guard 必须用 `borrow_current_guard()`——**EBR 禁嵌套 guard，直接 `guard()` 实测 6/6 必炸**（`epoch/mod.rs:59-61` 自述）。修后 smp4 8/8 绿。**遗留**：同形 `Cap` 裸 deref 遍布 net 代码（TCP poll 路径同样有此暴露），系统性加固归 P3；用户告知本机多核环境本就不稳，后续验证以单核为准。
+
+**验证总账**：host 套件失败集合与 P0 基线逐条相同（305 既有 + 新灵魂测试全量挂于同族毒化级联、单跑绿）；UDP loopback 测试族单跑 10/10；QEMU 冒烟——S4 修复后 smp4 UDP 8/8 + TCP 3/3，S5 后单核 tcp/udp 各 2/2。**未做**：LTP 全量对照（本机无 sdcard 镜像，`recv01/recvfrom01` 单跑以 cold-start smoke 为代理）——下次接触 LTP 环境时按 §4-3 补验。
 
 ---
 
