@@ -1,3 +1,17 @@
+- 2026-07-03 (P2 S0-S2 实施 — 外部 TCP 三次握手在真网卡完成,4-B IRQ). 用户拍板 1-A/2-A/3-A/**4-B(改选 virtio IRQ)**。
+  S0=cherry-pick net-git 51fc5e5b(virtio1 @0x1000_2000,eth0 注册成功,启动 devices:net:eth0:ok 替代 init-skip:mmio)。
+  S1=step_connect 增 try_tcp_external_connect(无本地 ns 拥有 remote 时 connect_endpoint 进 SynSent+连接表注册,device_tx
+  既有 Connecting 车道自动送 SYN)+process_tcp_event established 分支 Connecting→Connected 晋升(fire SPACE)+EPIPE
+  假设修(无内核对端按 may_send 判)+boot 静态网关 ARP 10.0.2.2;灵魂测试移植 net-git external_connect_tests 326 行
+  2/2 绿(commit 285585ab)。S2(4-B)=IrqIf 增 NET_IRQ(rv64 virtio1=PLIC IRQ2)+irq.rs net_rx_irq_handler(顶半部
+  mask+pending)/drain_net_rx_pending(底半部 ack+kick+unmask)+反应器循环挂 drain+设备开中断;wait_source 补 level
+  peek 回退;新增 tcp-external-smoke.c 验收载体(commit 1e96a5e1)。**里程碑(pcap 实测)**:外部 TCP 三次握手在真
+  virtio-net 上完整完成 SYN→ARP→SYN-ACK→ACK,稳定复现——S1 发 SYN + S2 IRQ 收 SYN-ACK 驱动 smoltcp 端到端работает。
+  loopback 冒烟不退化,host 零新增失败。**KNOWN-REMAINING 坑5(已根因)**:阻塞 connect() 握手完成后不恢复——net-git
+  stage5(a1b7417d)实测证明该恢复**依赖 poll-pump(A)的主动周期 re-poll**,纯 IRQ 单次 fire SPACE 唤醒不足以让反应器
+  重跑 step_connect(deadline WFI 唤醒也无效,静态分析 fire→publish_to→wake_by_ref 链齐全但实测不恢复,需内核插桩
+  定位)。这正是 4-B 文档纪律预告的降级点。**Next**:补 gated poll-pump(A)闭合 connect-resube→wget rc=0,或用户决策。
+  **Blocker**:connect-resume(非 RX,RX 经 IRQ 已通)。
 - 2026-07-02 (P2 执行计划落盘 — docs/design/07_net/REFACTOR_P2_v1.md). 三路取证:2 并行 Explore(外部 TX/路由、外部
   RX/connect 断点)+orchestrator 自采 net-git 分支闯关实录(旧架构打通外部 TCP 的完整 commit 序列=参考答案)。**核心
   发现**:外部路径"四肢健全、心跳缺失"——TX 车道(组帧/ARP/virtio,含 is_tcp_connecting 搬运)齐备空转,RX 链 P1 后已通
