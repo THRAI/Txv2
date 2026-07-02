@@ -51,19 +51,19 @@ delegate 每步 → step_process_device_tx_pending（step_device_tx.rs:118-189�
 
 `net-git` 分支在**旧架构**上把外部 TCP 打通的完整闯关史（每关一个 commit，可 `git show` 复查）：
 
-| # | 关卡（旧架构的坑） | net-git 解法 | 我们的新架构 |
-| - | ------------------ | ------------ | ------------ |
-| 1 | virtio0 被 blk 抢占，eth0 注册不上 | `51fc5e5b` HAL 加 virtio1 @0x10002000（2 文件） | **要做**（S0，可直接借） |
-| 2 | 外部 connect 不发 SYN | `6e63bd29` try_tcp_external_connect：`connect_endpoint` + 注册连接 + demux 带段喂 Connecting | **要做**（S1）；demux 带段部分 P1-S1 已做 |
-| 3 | connect 阻塞期间无人收 SYN-ACK | `c8389512` RX drive window（10ms clamp+deadline 发 POLL） | **要做**（S2） |
-| 4 | ARP 学习断层（回应学进别的 iface）+ RX 不推进 | `44d7895c` 静态网关 ARP + poll-pump task（有节制不饿死用户态） | **要做**（S1 静态 ARP + S2 pump） |
-| 5 | 握手完成但阻塞 connect 不续跑（wake 后 syscall 载体不重跑） | 同上 commit：RawQueueWaitFuture 电平 peek fallback | **风险项**（S2 验证；本质是⑥/D14 族 wait 坑，可能前置 P3 小块） |
-| 6 | 每个 Connected 都被假设有内核内对端 → 外部首写 EPIPE | `3b7bfe26` 无内核对端时以 `may_send` 判 EPIPE | **要做**（S1；`tcp_connected_peer_error` 在本分支原样存在 step_send.rs） |
-| 7 | 顺序连接撞死：端口固定起扫 + 一次性 context ISN 恒同 | `9d840ecb` 端口轮转 + RNG nonce | **半结构性解决**：持久 `CONTEXT_IFACE`（P0）使 rand 持续前进 → ISN 已异；connect-autobind 端口轮转**要做**（S5） |
-| 8 | 多段 TX：每轮只发一段，>MSS 的 TLS ClientHello 卡死 | `9c919782` device_tx 每轮抽干可发段 | **要做**（S4；本分支 process_tcp_tx_socket 同款单段） |
-| + | UDP/DNS egress 三小坑：DNS 10.0.2.3 无 ARP、外部 UDP 发送不开驱动窗、loopback step 吞外部报 | `9c919782` 后半 | 第三坑 P1-S4 已有 dst 过滤；前两坑**要做**（S6） |
-| + | 时钟冻结 | `9c919782` NET_NOW_MICROS 补丁 | ✅ **P0 结构性解决** |
-| + | established 外部连接的 RX 喂养 | `9c919782` process_tcp_event_external_connected | ✅ **P1-S1 结构性解决**（所有 established 统一喂 process_segment） |
+| # | 关卡（旧架构的坑）                                                                          | net-git 解法                                                                                     | 我们的新架构                                                                                                                    |
+| - | ------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------- |
+| 1 | virtio0 被 blk 抢占，eth0 注册不上                                                          | `51fc5e5b` HAL 加 virtio1 @0x10002000（2 文件）                                                | **要做**（S0，可直接借）                                                                                                  |
+| 2 | 外部 connect 不发 SYN                                                                       | `6e63bd29` try_tcp_external_connect：`connect_endpoint` + 注册连接 + demux 带段喂 Connecting | **要做**（S1）；demux 带段部分 P1-S1 已做                                                                                 |
+| 3 | connect 阻塞期间无人收 SYN-ACK                                                              | `c8389512` RX drive window（10ms clamp+deadline 发 POLL）                                      | **要做**（S2）                                                                                                            |
+| 4 | ARP 学习断层（回应学进别的 iface）+ RX 不推进                                               | `44d7895c` 静态网关 ARP + poll-pump task（有节制不饿死用户态）                                 | **要做**（S1 静态 ARP + S2 pump）                                                                                         |
+| 5 | 握手完成但阻塞 connect 不续跑（wake 后 syscall 载体不重跑）                                 | 同上 commit：RawQueueWaitFuture 电平 peek fallback                                               | **风险项**（S2 验证；本质是⑥/D14 族 wait 坑，可能前置 P3 小块）                                                          |
+| 6 | 每个 Connected 都被假设有内核内对端 → 外部首写 EPIPE                                       | `3b7bfe26` 无内核对端时以 `may_send` 判 EPIPE                                                | **要做**（S1；`tcp_connected_peer_error` 在本分支原样存在 step_send.rs）                                                |
+| 7 | 顺序连接撞死：端口固定起扫 + 一次性 context ISN 恒同                                        | `9d840ecb` 端口轮转 + RNG nonce                                                                | **半结构性解决**：持久 `CONTEXT_IFACE`（P0）使 rand 持续前进 → ISN 已异；connect-autobind 端口轮转**要做**（S5） |
+| 8 | 多段 TX：每轮只发一段，>MSS 的 TLS ClientHello 卡死                                         | `9c919782` device_tx 每轮抽干可发段                                                            | **要做**（S4；本分支 process_tcp_tx_socket 同款单段）                                                                     |
+| + | UDP/DNS egress 三小坑：DNS 10.0.2.3 无 ARP、外部 UDP 发送不开驱动窗、loopback step 吞外部报 | `9c919782` 后半                                                                                | 第三坑 P1-S4 已有 dst 过滤；前两坑**要做**（S6）                                                                          |
+| + | 时钟冻结                                                                                    | `9c919782` NET_NOW_MICROS 补丁                                                                 | ✅**P0 结构性解决**                                                                                                       |
+| + | established 外部连接的 RX 喂养                                                              | `9c919782` process_tcp_event_external_connected                                                | ✅**P1-S1 结构性解决**（所有 established 统一喂 process_segment）                                                         |
 
 > 借用纪律：net-git 的 commit 是**旧架构上的补丁**，思路可借、代码需按新架构重写（那边是一次性 context/RX 旁路世界）；唯 #1（HAL）与测试文件（`external_connect_tests.rs`，326 行）接近可直接移植。
 
@@ -90,6 +90,7 @@ TX 车道全套（含 Connecting 搬运）、ARP 全套、demux 带段+校验和
 ```
 
 验收不变量：
+
 1. **出站三次握手在真网卡上完成**（pcap 可见 SYN/SYN-ACK/ACK），`connect()` 返回 0；
 2. **`wget http://10.0.2.2:8000/marker` rc=0**（连接+多段收发+FIN 全链路）；
 3. **DNS 解析通**（`nslookup` 经 10.0.2.3，UDP 出站+入站）；
@@ -187,12 +188,37 @@ TX 车道全套（含 Connecting 搬运）、ARP 全套、demux 带段+校验和
 
 <!-- txdoc:07-NET-P2-V1-DECISIONS -->
 
-| # | 问题 | A（推荐） | B |
-| - | ---- | --------- | - |
-| 1 | 入站真握手怎么复用到外部 iface | **抽一个极小的"iface 回程发送"trait**（loopback=入队 `dispatch_ip`，ether=`dispatch_ip_at` 组帧发卡），`process_first_syn`/握手回程按 trait 走——一套机制两种后端 | 给外部路径复制一份握手代码（快但立即产生双份逻辑，违背 P1 刚建立的单通路原则） |
-| 2 | IPv6 范围 | **P2 只放行 demux/ether 入口的 v6 帧**（下层解析 P1 已通，TCP/UDP v6 事件直接复活），NDISC 用静态表；ping6/邻居/路由全家归 P4 | v6 全推 P4（省 S7 半步，但 v6 数据路径继续全断，审计⑩多欠一期） |
-| 3 | UDP 收敛时点 | **P2 内做（S6）**——外部+loopback 两类用户此时同时在场，一次换源；再拖则 P3/P4 每期都背着双队列 | 再缓（若 S6 实施中发现设备车道耦合超预期，允许拆成独立后续，但须写明理由） |
-| 4 | RX 驱动形态 | **poll-pump/驱动窗口**（net-git 已验证的形态，可控、不碰驱动） | 接 virtio IRQ（架构上更正统——IRQ kick_poll 管道其实已在 `ack_interrupt_and_fire`，缺的是 irq.rs 注册；但驱动层风险大，QEMU RX 疑案未破前不建议首选） |
+| # | 问题                           | A（推荐）                                                                                                                                                                      | B                                                                                                                                                       |
+| - | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1 | 入站真握手怎么复用到外部 iface | **抽一个极小的"iface 回程发送"trait**（loopback=入队 `dispatch_ip`，ether=`dispatch_ip_at` 组帧发卡），`process_first_syn`/握手回程按 trait 走——一套机制两种后端 | 给外部路径复制一份握手代码（快但立即产生双份逻辑，违背 P1 刚建立的单通路原则）                                                                          |
+| 2 | IPv6 范围                      | **P2 只放行 demux/ether 入口的 v6 帧**（下层解析 P1 已通，TCP/UDP v6 事件直接复活），NDISC 用静态表；ping6/邻居/路由全家归 P4                                            | v6 全推 P4（省 S7 半步，但 v6 数据路径继续全断，审计⑩多欠一期）                                                                                        |
+| 3 | UDP 收敛时点                   | **P2 内做（S6）**——外部+loopback 两类用户此时同时在场，一次换源；再拖则 P3/P4 每期都背着双队列                                                                         | 再缓（若 S6 实施中发现设备车道耦合超预期，允许拆成独立后续，但须写明理由）                                                                              |
+| 4 | RX 驱动形态                    | **poll-pump/驱动窗口**（net-git 已验证的形态，可控、不碰驱动）                                                                                                           | 接 virtio IRQ（架构上更正统——IRQ kick_poll 管道其实已在`ack_interrupt_and_fire`，缺的是 irq.rs 注册；但驱动层风险大，QEMU RX 疑案未破前不建议首选） |
+
+> **拍板（2026-07-03）：1-A / 2-A / 3-A / 4-B（用户改选 IRQ 方案）**。4-B 执行纪律：S2 优先接 virtio IRQ（中断 handler 只 `kick_poll`，处理仍留在 delegate）；若撞上 net-git stage3 的 RX 描述符悬案且短期无法定位，**降级 A（poll-pump）保 P2 主线**，IRQ 单独立项再攻。
+
+---
+
+## 7. 深度调试根因（2026-07-03，纯 B 死磕结论）
+
+<!-- txdoc:07-NET-P2-V1-ROOTCAUSE -->
+
+**背景.** 4-B（IRQ）落地后，外部 TCP 三次握手在真 virtio-net 上完整完成（pcap 实测 SYN/SYN-ACK/ACK 稳定复现），但阻塞 `connect()` 之后 `wget` 不出 HTTP GET。用户要求纯 B 死磕，遂用内核 AtomicU32 计数器全链路插桩（`net_delegate_step_once`→`process_tcp_event`→`publish_to`→`step_connect`→`connect_impl`→`run_thread`→`enter_userspace_with_context`），throttled `console_write_str` dump。**插桩已全部撤除，工作树干净。**
+
+**计数器实测（一次外部 connect）**：`es=1 bc=1 pr=1 wk=2`（收 1 个带段 SYN-ACK、smoltcp 到 Established、Connecting→Connected 晋升、fire SPACE **唤醒 1 个订阅者**）；`ce=2 sy=1 st=Bound1/Connected1`（step_connect 跑两次：首次 Bound→Connecting yield，二次见 Connected）；`ci=park1/woke1/eisc-ok1`（connect_impl park→**await 返回**→`Err(EISCONN) if waited_for_connect` 命中→**`return Return(0)` 执行**）；`as/be=1/1`（run_thread 存 `pending_syscall_return(Ok(0))`→**到达并调用 `enter_userspace_with_context`**）；**但 `tr=connect1/write0/nr=203`——线程从没 trap 到 write**。
+
+**逐层判决**：
+- 网络栈**全对**：握手/段处理/晋升/唤醒链无一环断（`wk=2` 证明 fire 确实唤醒了 parked connect 的订阅者，非丢唤醒）。
+- syscall 层**全对**：`connect_impl` 收到唤醒、await 返回、走 EISCONN 分支、`return Return(0)`；`run_thread` 存返回值、调用 `enter_userspace_with_context`。
+- **断点在 `enter_userspace_with_context` 的用户态往返**：它被调用了（`be=1`），但用户态 `write` 的 ecall 往返没回到 `run_thread`（`tr write=0`、`nr` 停在 203）。
+
+**根因.** 一个**被跨任务事件唤醒**的阻塞 syscall（外部 connect 由 net IRQ→delegate→`fire_send(SPACE)` 完成）在 `run_thread` 重入用户态时，`enter_userspace_with_context`（`board trap.rs:813`→`tx_rv64_enter_userspace_save_resume`）的 per-hart reschedule-longjmp 往返**在"net 唤醒的 reactor poll 上下文"下不完整**——`sret` 进用户态后，`write` 的 trap 未经 `TrapAction::Reschedule` longjmp 回本次 poll 的 `enter_userspace` 调用点，线程不推进到下一条 syscall。这是**平台 trap-shell / 线程 future 重入的架构限制**，与网络栈无关。
+
+**为什么 net-git 能过.** net-git 用 poll-pump（A）间接绕过：poll-pump 让 trap-shell reactor 外循环持续转，`run_thread` 的用户态重入由 trap-shell 自身上下文驱动，longjmp 目标有效。net-git stage5（`a1b7417d`）自述 "with poll-pump, blocking connect() completes"，正是此机制。本轮把它比 net-git 更深钉了一层（net-git 停在"connect succeeds, stuck in post-connect syscall"，未定位到 `enter_userspace` 往返）。
+
+**两条修复路径（待决策）**：
+- **(A) poll-pump 兜底（plan 4-B 内建降级，快、已验证）**：保留已通的 IRQ 收包，补 gated poll-pump 让 trap-shell 循环持续转 → 阻塞 connect 重入成功 → `wget rc=0`。IRQ 管低延迟 RX，pump 管跨任务唤醒后的用户态重入。
+- **(B) 架构修复（正统、大）**：让"跨任务唤醒的阻塞 syscall"的用户态重入 defer 回 trap-shell 上下文（cross-task wake 只标 runnable，用户态 entry 一律由 trap-shell reactor 外循环驱动），需动 trap-vector/reactor/thread-future 核心执行模型，风险高，宜 gdbstub 单步 trap 汇编佐证后独立立项。
 
 ---
 

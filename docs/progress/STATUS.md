@@ -1,3 +1,16 @@
+- 2026-07-03 (P2 connect-resume 深度调试根因锁定 — 纯 B 死磕). 用户要求死磕。内核 AtomicU32 计数器全链路插桩
+  (delegate→process_tcp_event→publish_to→step_connect→connect_impl→run_thread→enter_userspace)+throttled dump。
+  **计数器实测**:es=1 bc=1 pr=1 wk=2(收 SYN-ACK/到 Established/晋升/fire SPACE 唤醒 1 订阅者)、ce=2 sy=1(step_connect
+  跑两次,二次见 Connected)、ci=park1/woke1/eisc-ok1(connect_impl await 返回、EISCONN 分支命中、**return Return(0)
+  执行**)、as/be=1/1(run_thread 存返回值、**调用 enter_userspace_with_context**)、**tr=connect1/write0/nr=203(线程从没
+  trap 到 write)**。**逐层判决**:网络栈全对(wk=2 证明非丢唤醒)、syscall 层全对(connect_impl 返回 0)、断点在
+  enter_userspace_with_context 用户态往返。**根因**:被跨任务事件(net IRQ→delegate→fire_send)唤醒的阻塞 syscall,
+  run_thread 重入用户态时 enter_userspace(board trap.rs:813→tx_rv64_enter_userspace_save_resume)的 per-hart
+  reschedule-longjmp 往返在"net 唤醒的 reactor poll 上下文"下不完整——sret 进用户态后 write 的 trap 未 longjmp 回本次
+  poll,线程不推进。**平台 trap-shell/thread-future 重入架构限制,与网络栈无关**。net-git 用 poll-pump(A)间接绕过
+  (stage5 a1b7417d 自述),本轮比其更深钉一层。**插桩已全撤,工作树干净,编译通过**。根因写入 REFACTOR_P2_v1.md §7,
+  含两修复路径(A poll-pump 兜底=plan 4-B 内建降级/B 架构修复 defer 回 trap-shell)。**Next**:用户决策 A(快、已验证、
+  wget rc=0)vs B(正统大工程,gdbstub 佐证后独立立项)。**Blocker**:connect-resume(非网络,平台执行模型)。
 - 2026-07-03 (P2 S0-S2 实施 — 外部 TCP 三次握手在真网卡完成,4-B IRQ). 用户拍板 1-A/2-A/3-A/**4-B(改选 virtio IRQ)**。
   S0=cherry-pick net-git 51fc5e5b(virtio1 @0x1000_2000,eth0 注册成功,启动 devices:net:eth0:ok 替代 init-skip:mmio)。
   S1=step_connect 增 try_tcp_external_connect(无本地 ns 拥有 remote 时 connect_endpoint 进 SynSent+连接表注册,device_tx
