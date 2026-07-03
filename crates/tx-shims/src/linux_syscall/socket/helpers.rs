@@ -513,20 +513,18 @@ pub(super) fn open_file_is_path_only(file: &OpenFile) -> bool {
     !flags.read && !flags.write
 }
 
+// P3-S4 (D13): both poll helpers now dispatch through the file's
+// `FileOps` implementation (`OpenFile::file_ops()`), not a socket type
+// check — the socket impl routes to the same net steps as before, and
+// other rich fd kinds can join by implementing the trait. `None` keeps
+// the old ENOTSOCK-shaped contract: "not a FileOps kind, caller falls
+// through to its per-kind branches".
 pub(crate) fn socket_poll_mask_from_file(
     file: &Cap<OpenFile>,
     guard: &tx_substrate::epoch::Guard<'_>,
 ) -> Option<Result<PollMask, Errno>> {
-    let socket = match socket_identity_from_file(file) {
-        Ok(socket) => socket,
-        Err(Errno::ENOTSOCK) => return None,
-        Err(errno) => return Some(Err(errno)),
-    };
-    Some(match step_poll_ready(&socket, guard) {
-        StepOutcome::Done(mask) => Ok(mask),
-        StepOutcome::Err(errno) => Err(errno),
-        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => Ok(PollMask::empty()),
-    })
+    let ops = file.file_ops()?;
+    Some(ops.poll_mask(guard))
 }
 
 pub(crate) fn socket_poll_wait_token_from_file(
@@ -534,16 +532,8 @@ pub(crate) fn socket_poll_wait_token_from_file(
     interests: PollMask,
     guard: &tx_substrate::epoch::Guard<'_>,
 ) -> Option<Result<Option<tx_subsystems::execution::WaitToken>, Errno>> {
-    let socket = match socket_identity_from_file(file) {
-        Ok(socket) => socket,
-        Err(Errno::ENOTSOCK) => return None,
-        Err(errno) => return Some(Err(errno)),
-    };
-    Some(match step_poll_wait_token(&socket, interests, guard) {
-        StepOutcome::Done(token) => Ok(token),
-        StepOutcome::Err(errno) => Err(errno),
-        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => Ok(None),
-    })
+    let ops = file.file_ops()?;
+    Some(ops.poll_wait_token(interests, guard))
 }
 
 pub(super) fn read_sockaddr_in<'a>(

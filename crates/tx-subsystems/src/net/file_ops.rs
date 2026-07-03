@@ -12,9 +12,12 @@ use tx_substrate::zone::Cap;
 
 use crate::adapter::step_engine::{ByteProgress, StepOutcome};
 use crate::device::FileOps;
-use crate::execution::Guard;
-use crate::net::execution::{step_recv_kernel_bytes, step_send_kernel_bytes};
+use crate::execution::{Errno, Guard, WaitToken};
+use crate::net::execution::{
+    step_poll_ready, step_poll_wait_token, step_recv_kernel_bytes, step_send_kernel_bytes,
+};
 use crate::net::structure::{SendRecvFlags, SocketIdentity};
+use crate::net::PollMask;
 
 fn flags_for(nonblocking: bool) -> SendRecvFlags {
     if nonblocking {
@@ -46,5 +49,25 @@ impl FileOps for Cap<SocketIdentity> {
         guard: &Guard<'_>,
     ) -> StepOutcome<usize, ByteProgress> {
         step_send_kernel_bytes(self, bytes, flags_for(nonblocking), guard)
+    }
+
+    fn poll_mask(&self, guard: &Guard<'_>) -> Result<PollMask, Errno> {
+        match step_poll_ready(self, guard) {
+            StepOutcome::Done(mask) => Ok(mask),
+            StepOutcome::Err(errno) => Err(errno),
+            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => Ok(PollMask::empty()),
+        }
+    }
+
+    fn poll_wait_token(
+        &self,
+        interests: PollMask,
+        guard: &Guard<'_>,
+    ) -> Result<Option<WaitToken>, Errno> {
+        match step_poll_wait_token(self, interests, guard) {
+            StepOutcome::Done(token) => Ok(token),
+            StepOutcome::Err(errno) => Err(errno),
+            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => Ok(None),
+        }
     }
 }
