@@ -1,3 +1,23 @@
+- 2026-07-03 NIGHT (P4.1 LA64/LS2K1000 GROUNDWORK — unified high link boots QEMU 9.2.1 to an
+  interactive busybox shell). One binary now serves QEMU virt and the 2K1000 board, mirroring the
+  RV64 0x80200000 arrangement: KERNEL_LOAD_BASE moved 0x0020_0000 -> 0x9000_0000 (link base
+  0x9000000090000000 = NPUcore-BLOSSOM's board-proven U-Boot -a/-e address; QEMU 9.2.1's high RAM
+  region covers it). Fallout fixed along the way: ① boot_facts' kernel-image reservation assumed a
+  low-RAM kernel (`.min(QEMU_LA64_RAM_END)`) and left the high-region image registered Usable —
+  allocator metadata memset over live kernel; now reserved_end = kernel end and the populate
+  helpers write a fixed low-window barrier instead. ② QEMU 9.2.1 direct boot rejects `-initrd` for
+  high-RAM kernels ("memory too small"), so the la lane ships the initramfs via
+  `-fw_cfg opt/tx.initrd` only, and the EFI boot branch gained a fw_cfg initrd fallback (it only
+  consulted /chosen before). ③ `cargo xtask image la-uimage` packages txv2-la.uimage +
+  txv2-la-initrd.uimage via tools/mkimage-loongarch (vendored from NPUcore, distro mkimage predates
+  LoongArch; provenance in tools/README.md). ④ `la64-boot-trace` feature now also dumps the
+  boot-memory region table and scans low RAM for the FDT magic — this is how we caught the SYSTEM
+  qemu 8.2.2 sneaking into ad-hoc runs (its virt machine reports a different memory map at
+  0x2_00000000+; la work MUST use qemu-local/install-9.2.1, PATH-first). ⑤ no-firmware fallback now
+  admits a conservative 256MiB window past the kernel instead of a degenerate zero-size region
+  (board static map lands in P4.2). Host tests updated (la board 45/45; rv smoke unaffected).
+  Next (P4.2): 2K1000 UART base 0x1fe20000 via uncached window + probe/static fallback, eiointc
+  probe-or-skip (timer is a core CSR), board static memory map, la single-core default parity.
 - 2026-07-03 LATE (VF2 SHELL FULLY WORKING — P2 COMPLETE; full battle log ljs/11). The fork-command
   hang had TWO stacked hardware truths, both with standard Linux-kernel treatments: ① the JH7110
   U74 implements ZERO satp.ASID bits (boot probe: write all-ones, read back — QEMU=16) so every

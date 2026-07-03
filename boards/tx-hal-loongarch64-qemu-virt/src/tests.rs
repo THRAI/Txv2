@@ -104,22 +104,22 @@ fn boot_info_publishes_qemu_ram_and_kernel_image() {
 
     assert_eq!(info.initrd, None);
     assert_eq!(info.cmdline, None);
-    assert_eq!(info.kernel_image.start, PhysAddr(0x0020_0000));
+    // Unified high load base shared with the LS2K1000 board.
+    assert_eq!(info.kernel_image.start, PhysAddr(0x9000_0000));
     assert!(info.kernel_image.size > 0);
 
+    // No-firmware fallback shape: whole low window Reserved (firmware
+    // tables), conservative high window past the kernel Usable.
     assert_eq!(info.memory_regions.len(), 2);
     assert_eq!(info.memory_regions[0].base, PhysAddr(0));
     assert_eq!(info.memory_regions[0].kind, MemoryRegionKind::Reserved);
-    assert!(info.memory_regions[0].size >= info.kernel_image.end().0);
+    assert_eq!(info.memory_regions[0].size, 0x1000_0000);
 
     assert_eq!(info.memory_regions[1].kind, MemoryRegionKind::Usable);
-    assert_eq!(
-        info.memory_regions[1].base,
-        PhysAddr(info.memory_regions[0].size)
-    );
+    assert!(info.memory_regions[1].base.0 >= info.kernel_image.end().0);
     assert_eq!(
         info.memory_regions[1].base.0 + info.memory_regions[1].size,
-        0x1000_0000
+        0x9000_0000 + 0x1000_0000
     );
 }
 
@@ -133,21 +133,11 @@ fn bootstrap_pmap_info_describes_dmw_direct_ram() {
     assert_eq!(mapping.bootstrap_root(), PhysAddr(0));
     assert_eq!(mapping.direct_map_phys(), la64_dmw_mapped_phys());
     assert_eq!(pmap.root, PhysAddr(0));
-    assert_eq!(
-        pmap.mapped,
-        PhysRange {
-            start: PhysAddr(0),
-            size: 0x1000_0000,
-        }
-    );
+    // The cached DMW window hardware-maps the whole physical space —
+    // both the low firmware window and the high-RAM kernel image.
+    assert_eq!(pmap.mapped, la64_dmw_mapped_phys());
     assert_eq!(pmap.direct_map_base, VirtAddr(LA64_DMW_CACHED_BASE));
-    assert_eq!(
-        pmap.direct_map,
-        VirtRange {
-            start: VirtAddr(LA64_DMW_CACHED_BASE),
-            size: 0x1000_0000,
-        }
-    );
+    assert_eq!(pmap.direct_map, la64_dmw_direct_map());
     assert_eq!(pmap.identity, None);
     assert_eq!(
         pmap.kernel_image.start,

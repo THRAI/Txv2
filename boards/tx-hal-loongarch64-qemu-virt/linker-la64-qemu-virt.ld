@@ -1,8 +1,15 @@
 OUTPUT_ARCH(loongarch64)
 ENTRY(_start)
 
-KERNEL_LOAD_BASE = 0x00200000;
-KERNEL_LINK_BASE = 0x9000000000200000;
+/* Unified load base for QEMU virt AND the LS2K1000 board: both have
+ * RAM at phys 0x9000_0000 (QEMU: the >256M high region, always
+ * present at our -m 1152M; 2K1000: the high DDR window). The 2K1000
+ * U-Boot flow loads the uImage payload at 0x9000000090000000 (the
+ * cached-DMW alias of this base — NPUcore's proven -a/-e address),
+ * so one binary serves both worlds, mirroring the RV64 0x80200000
+ * arrangement. */
+KERNEL_LOAD_BASE = 0x90000000;
+KERNEL_LINK_BASE = 0x9000000090000000;
 KERNEL_BOOT_PHYS_SIZE = 0x1000;
 KERNEL_LINK_OFFSET = KERNEL_LINK_BASE - KERNEL_LOAD_BASE;
 

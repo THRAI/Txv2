@@ -45,7 +45,20 @@ pub(crate) fn parse_firmware_boot_info(
             .min(cmdline.len());
             let initrd = efi
                 .and_then(|info| info.initrd)
-                .or_else(|| parsed_dtb.and_then(|parsed| parsed.initrd));
+                .or_else(|| parsed_dtb.and_then(|parsed| parsed.initrd))
+                .or_else(|| {
+                    // QEMU 9.2.1 direct boot refuses `-initrd` for
+                    // kernels loaded in high RAM ("memory too small"),
+                    // so the unified-high-base flow ships the initrd
+                    // via `-fw_cfg name=opt/tx.initrd` instead. The
+                    // EFI branch must consult that channel too, not
+                    // just /chosen.
+                    if fw_cfg_available() {
+                        fw_cfg_copy_initrd(fw_cfg_find_boot_files().initrd)
+                    } else {
+                        None
+                    }
+                });
 
             if parsed_dtb.is_some() || initrd.is_some() || cmdline_len > 0 {
                 let memory_region_count = if let Some(parsed) = parsed_dtb {
@@ -570,11 +583,18 @@ unsafe fn populate_boot_memory_regions_from_dtb(
     let out = boot_memory_regions_ptr();
     let mut out_count = 0usize;
 
+    // Fixed low-RAM barrier: the whole low window stays Reserved. It
+    // hosts the firmware handoff structures (QEMU parks the FDT and
+    // EFI tables there) and, with the unified high load base, no
+    // longer contains the kernel image — `reserved_end` now points at
+    // the kernel's end inside the HIGH region and is applied per
+    // usable region below. Re-admitting the firmware-free part of low
+    // RAM as Usable is a follow-up (needs a precise firmware carve).
     core::ptr::write(
         out.add(out_count),
         MemoryRegion {
             base: PhysAddr(QEMU_LA64_RAM_BASE),
-            size: reserved_end.saturating_sub(QEMU_LA64_RAM_BASE),
+            size: QEMU_LA64_RAM_END.saturating_sub(QEMU_LA64_RAM_BASE),
             kind: MemoryRegionKind::Reserved,
         },
     );
@@ -643,14 +663,16 @@ unsafe fn populate_boot_memory_regions_from_dtb(
 }
 
 unsafe fn populate_fallback_boot_memory_regions(reserved_end: usize) -> usize {
-    let usable_size = QEMU_LA64_RAM_END.saturating_sub(reserved_end);
+    // Mirror publish_static_boot_facts' no-firmware shape: whole low
+    // window Reserved + conservative high window past the kernel.
+    let usable_size = QEMU_LA64_FALLBACK_HIGH_USABLE_END.saturating_sub(reserved_end);
     let out = boot_memory_regions_ptr();
     unsafe {
         core::ptr::write(
             out,
             MemoryRegion {
                 base: PhysAddr(QEMU_LA64_RAM_BASE),
-                size: reserved_end - QEMU_LA64_RAM_BASE,
+                size: QEMU_LA64_RAM_END - QEMU_LA64_RAM_BASE,
                 kind: MemoryRegionKind::Reserved,
             },
         );

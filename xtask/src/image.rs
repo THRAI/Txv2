@@ -13,10 +13,13 @@ use crate::Result;
 
 pub(crate) fn image(root: &Path, args: Vec<String>) -> Result<()> {
     let Some(kind) = args.first() else {
-        return Err("image command needs a kind: cpio, initramfs, ext4, or vf2-uimage".into());
+        return Err("image command needs a kind: cpio, initramfs, ext4, vf2-uimage, or la-uimage".into());
     };
     if kind.as_str() == "vf2-uimage" {
         return image_vf2_uimage(root, &args[1..]);
+    }
+    if kind.as_str() == "la-uimage" {
+        return image_la_uimage(root, &args[1..]);
     }
     let profile = Profile::parse(&option_value(&args[1..], "--profile")?)?;
     let target = image_target(&args[1..])?;
@@ -162,6 +165,127 @@ fn image_vf2_uimage(root: &Path, args: &[String]) -> Result<()> {
         println!("U-Boot> tftpboot {VF2_LOAD_ADDR} txv2-vf2.uimage");
         println!("U-Boot> bootm {VF2_LOAD_ADDR} - ${{fdtcontroladdr}}");
     }
+    Ok(())
+}
+
+/// LS2K1000 U-Boot load/entry address, via the cached DMW window —
+/// NPUcore-BLOSSOM's board-proven `mkimage -a/-e` value (their
+/// `os/make/la_board/la64board.mk`). Physical base 0x9000_0000 equals
+/// our unified `KERNEL_LOAD_BASE`, so the same kernel binary boots
+/// QEMU 9.2.1 (whose high RAM covers it) and the board.
+const LA_LOAD_ADDR: &str = "0x9000000090000000";
+
+/// Package the la64 kernel ELF as an LS2K1000 boot artifact: strip to
+/// a raw binary, then wrap as a U-Boot uImage (mkimage -T kernel).
+///
+///   cargo xtask build --target la64-qemu [--release]
+///   cargo xtask image la-uimage [--release]
+///   cp target/images/txv2-la.uimage /srv/tftp/
+///   # U-Boot:  tftpboot txv2-la.uimage   (default $loadaddr)
+///   #          bootm                     (relocates to -a and jumps)
+fn image_la_uimage(root: &Path, args: &[String]) -> Result<()> {
+    let release = args.iter().any(|arg| arg == "--release");
+    let kernel = TxTarget::La64Qemu.kernel_path_for_profile(root, release);
+    if !kernel.exists() {
+        return Err(format!(
+            "kernel ELF not found at {}; run `cargo xtask build --target la64-qemu{}` first",
+            kernel.display(),
+            if release { " --release" } else { "" }
+        ));
+    }
+
+    let objcopy = [
+        "rust-objcopy",
+        "llvm-objcopy",
+        "loongarch64-unknown-linux-gnu-objcopy",
+        "loongarch64-linux-gnu-objcopy",
+    ]
+    .into_iter()
+    .find(|program| command_exists(program))
+    .ok_or("no objcopy found; install cargo-binutils (rust-objcopy) or llvm/loongarch binutils")?;
+    // Distro u-boot-tools mkimage predates LoongArch; prefer the
+    // vendored NPUcore binary (tools/README.md for provenance).
+    let vendored_mkimage = root.join("tools").join("mkimage-loongarch");
+    let mkimage = if vendored_mkimage.exists() {
+        vendored_mkimage.display().to_string()
+    } else if command_exists("mkimage") {
+        "mkimage".to_string()
+    } else {
+        return Err("no mkimage found; expected tools/mkimage-loongarch or u-boot-tools".into());
+    };
+
+    let out_dir = root.join("target").join("images");
+    fs::create_dir_all(&out_dir).map_err(|err| err.to_string())?;
+    let bin = out_dir.join("txv2-la.bin");
+    let uimage = out_dir.join("txv2-la.uimage");
+
+    run_cmd_owned(
+        root,
+        objcopy,
+        &[
+            "--strip-all".to_string(),
+            "-O".to_string(),
+            "binary".to_string(),
+            kernel.display().to_string(),
+            bin.display().to_string(),
+        ],
+    )?;
+    run_cmd_owned(
+        root,
+        &mkimage,
+        &[
+            "-A".to_string(),
+            "loongarch".to_string(),
+            "-O".to_string(),
+            "linux".to_string(),
+            "-T".to_string(),
+            "kernel".to_string(),
+            "-C".to_string(),
+            "none".to_string(),
+            "-a".to_string(),
+            LA_LOAD_ADDR.to_string(),
+            "-e".to_string(),
+            LA_LOAD_ADDR.to_string(),
+            "-n".to_string(),
+            "Txv2-la".to_string(),
+            "-d".to_string(),
+            bin.display().to_string(),
+            uimage.display().to_string(),
+        ],
+    )?;
+
+    let initramfs = out_dir.join(busybox_initramfs_name(TxTarget::La64Qemu));
+    let initrd_uimage = out_dir.join("txv2-la-initrd.uimage");
+    let have_initrd = initramfs.exists();
+    if have_initrd {
+        run_cmd_owned(
+            root,
+            &mkimage,
+            &[
+                "-A".to_string(),
+                "loongarch".to_string(),
+                "-O".to_string(),
+                "linux".to_string(),
+                "-T".to_string(),
+                "ramdisk".to_string(),
+                "-C".to_string(),
+                "none".to_string(),
+                "-n".to_string(),
+                "Txv2-la-initrd".to_string(),
+                "-d".to_string(),
+                initramfs.display().to_string(),
+                initrd_uimage.display().to_string(),
+            ],
+        )?;
+    }
+
+    println!("la uimage ready: {}", uimage.display());
+    if have_initrd {
+        println!("la initrd ready: {}", initrd_uimage.display());
+    }
+    println!("next: cp target/images/txv2-la*.uimage /srv/tftp/");
+    println!("U-Boot> tftpboot txv2-la.uimage");
+    println!("U-Boot> bootm    # relocates payload to {LA_LOAD_ADDR} and jumps");
     Ok(())
 }
 

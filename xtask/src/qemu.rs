@@ -326,8 +326,16 @@ fn qemu_command(
             (Profile::Smoke, _) => unreachable!("handled by outer profile match"),
         };
         let cmdline = format!("{cmdline}{maxcpus_suffix}");
-        args.push("-initrd".into());
-        args.push(initramfs.display().to_string());
+        // LA64 ships the initramfs via fw_cfg only: with the unified
+        // high load base (0x9000_0000, shared with the LS2K1000
+        // board) QEMU 9.2.1's direct-boot loader rejects `-initrd`
+        // for high-RAM kernels ("memory too small for initial ram
+        // disk"); the board HAL copies opt/tx.initrd out of fw_cfg
+        // instead.
+        if target != TxTarget::La64Qemu {
+            args.push("-initrd".into());
+            args.push(initramfs.display().to_string());
+        }
         args.push("-append".into());
         args.push(cmdline.clone());
         if target == TxTarget::La64Qemu {

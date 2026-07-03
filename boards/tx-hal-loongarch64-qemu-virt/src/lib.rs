@@ -92,7 +92,15 @@ const QEMU_LA64_HIGH_RAM_BASE: usize = 0x9000_0000;
 // (`direct_map_covers_phys_end`, `extend_direct_map`); the actual frame-metadata
 // span is still carved from the real firmware memory map, not from this size.
 const QEMU_LA64_DIRECT_MAP_SIZE: usize = LA64_PHYS_ADDR_MASK + 1;
-const QEMU_LA64_KERNEL_LOAD_BASE: usize = 0x0020_0000;
+// Must match KERNEL_LOAD_BASE in linker-la64-qemu-virt.ld: the
+// unified QEMU-virt/LS2K1000 load base in the high RAM region.
+const QEMU_LA64_KERNEL_LOAD_BASE: usize = 0x9000_0000;
+// No-firmware fallback: with nothing describing RAM, trust only a
+// conservative 256 MiB window from the load base — the kernel is
+// demonstrably executing there, and every supported machine (QEMU
+// virt with -m >= 768M, LS2K1000 DDR) backs at least this much at
+// 0x9000_0000. The board's exact static map replaces this in P4.2.
+const QEMU_LA64_FALLBACK_HIGH_USABLE_END: usize = QEMU_LA64_KERNEL_LOAD_BASE + 0x1000_0000;
 #[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
 const QEMU_LA64_PCH_PIC_BASE: usize = 0x1000_0000;
 #[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
