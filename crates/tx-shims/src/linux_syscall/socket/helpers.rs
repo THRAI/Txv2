@@ -35,7 +35,7 @@ pub(super) fn maybe_autobind_connect_client(
     let remote_endpoint = remote.as_ip_endpoint();
     let local_endpoint_base = connect_autobind_local_base(socket, remote_endpoint);
 
-    for port in EPHEMERAL_PORT_START..EPHEMERAL_PORT_END {
+    for port in ephemeral_port_candidates() {
         let local_endpoint = IpEndpoint::from_ip(local_endpoint_base.ip_addr(), port);
         if ephemeral_port_in_use(socket, port) {
             continue;
@@ -167,7 +167,7 @@ pub(super) fn maybe_autobind_udp_sendto(
         IpEndpoint::unspecified_for_family(family, 0)
     };
 
-    for port in EPHEMERAL_PORT_START..EPHEMERAL_PORT_END {
+    for port in ephemeral_port_candidates() {
         let local =
             sockaddr_from_endpoint(IpEndpoint::from_ip(local_endpoint_base.ip_addr(), port));
         let outcome = {
@@ -219,7 +219,7 @@ pub(super) fn bind_with_ephemeral_port(
         return step_unit_result(outcome);
     }
 
-    for port in EPHEMERAL_PORT_START..EPHEMERAL_PORT_END {
+    for port in ephemeral_port_candidates() {
         if ephemeral_port_in_use(socket, port) {
             continue;
         }

@@ -444,3 +444,48 @@ fn device_tx_single_pass_drains_multiple_segments() {
         frames
     );
 }
+
+/// P2-S5: sequential external connects must carry distinct ISNs (the
+/// persistent CONTEXT_IFACE keeps advancing smoltcp's RNG; the frozen
+/// throwaway-iface world dealt identical ISNs, confusing peers that hold
+/// state for the previous incarnation of the tuple).
+#[test]
+fn sequential_connects_use_distinct_isns() {
+    let _lock = setup();
+
+    let device = leak_virtio_device(2, 2);
+    let registration = leak_virtio_registration(device, 74);
+    crate::net::initial_net_namespace_payload()
+        .attach_device_for_test_or_bootstrap(registration, Some(LOCAL_IP))
+        .expect("attach virtio test device to initial net namespace");
+
+    let guard = tx_substrate::epoch::guard();
+    let remote = IpEndpoint::new(REMOTE_IP, 41_274);
+
+    let mut isns = std::vec::Vec::new();
+    for (i, client_port) in [51_274u16, 51_275u16].into_iter().enumerate() {
+        let client = registry::create_socket_for_test_or_bootstrap(
+            SocketKind::Tcp,
+            SocketOptionSet::default_tcp(),
+        )
+        .unwrap_or_else(|e| panic!("tcp client {i}: {e:?}"));
+        assert_eq!(
+            step_bind(&client, inet_addr(client_port, LOCAL_IP), &guard),
+            StepOutcome::Done(())
+        );
+        assert!(matches!(
+            step_connect(&client, inet_addr(41_274, REMOTE_IP), &guard),
+            StepOutcome::Yield {
+                shape: YieldShape::OnWaitSource { .. },
+                ..
+            }
+        ));
+        let payload = client.acquire_operational().expect("client payload");
+        let raw = payload.raw_tcp_socket().expect("client raw tcp");
+        let syn = raw.dispatch_segment().expect("client SYN segment");
+        assert_eq!(syn.tcp.control, smoltcp::wire::TcpControl::Syn);
+        assert_eq!(syn.dst_endpoint(), Some(remote));
+        isns.push(syn.tcp.seq_number.0);
+    }
+    assert_ne!(isns[0], isns[1], "sequential connects reused the same ISN");
+}

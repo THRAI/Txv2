@@ -41,6 +41,22 @@ const SOCKADDR_LL_BYTES: u32 = 20;
 const ACCEPT4_KNOWN_FLAGS: u32 = O_CLOEXEC | O_NONBLOCK;
 const EPHEMERAL_PORT_START: u16 = 49_152;
 const EPHEMERAL_PORT_END: u16 = 49_216;
+
+/// Shared rotation offset for ephemeral-port allocation (P2-S5). Every
+/// scan (connect autobind and bind(port=0) alike) starts one slot past
+/// the previous scan's start, so back-to-back connects do not re-pick
+/// the port a just-closed connection used — the peer (e.g. QEMU slirp)
+/// may still hold that tuple in TIME_WAIT-ish state.
+static NEXT_EPHEMERAL_PORT_OFFSET: core::sync::atomic::AtomicU16 =
+    core::sync::atomic::AtomicU16::new(0);
+
+pub(super) fn ephemeral_port_candidates() -> impl Iterator<Item = u16> {
+    const LEN: u16 = EPHEMERAL_PORT_END - EPHEMERAL_PORT_START;
+    let start = NEXT_EPHEMERAL_PORT_OFFSET
+        .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+        % LEN;
+    (0..LEN).map(move |i| EPHEMERAL_PORT_START + (start + i) % LEN)
+}
 const IOVEC_BYTES: u64 = 16;
 const MSGHDR_BYTES: u64 = 56;
 const MSGHDR_NAMELEN_OFFSET: u64 = 8;
