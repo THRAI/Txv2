@@ -225,6 +225,17 @@ TX 车道全套（含 Connecting 搬运）、ARP 全套、demux 带段+校验和
 - **(B) 架构修复（正统、大）**：让"跨任务唤醒的阻塞 syscall"的用户态重入 defer 回 trap-shell 上下文，需动 trap-vector/reactor/thread-future 核心执行模型，宜 gdbstub 单步 trap 汇编佐证后独立立项。
 - ~~(A) 简单 poll-pump~~：**已证伪，不可行**（见上）。
 
+### 7.1 终局改判（2026-07-03 三轮死磕）：真凶 = 两个可修 bug，"平台架构限制"说被证伪，A′ 不再必要
+
+<!-- txdoc:07-NET-P2-V1-ROOTCAUSE-FINAL -->
+
+上文"平台 trap-shell 重入架构限制"的判决**被更深一层的调查证伪**。新证据（探针 = `eu-ret`/`await-ok`/`extirq-wake` 三标记，`probe1.serial`）：**longjmp 其实回来了**——旧插桩只数了"出发"（`be=1`），没数"回程落点"；新探针显示第 4 次往返 `eu-ret` 打印（控制流回到 `enter_userspace_with_context` 调用点之后）但 `await-ok` 永不出现——线程 park 在 `entry_wait.await`（thread_future.rs:635）。用排除法收口：能触发 from-user longjmp 的所有 trap 路径中，syscall/缺页会 resolve slot、时钟会 `record_timer_preemption`，**唯一"longjmp 但不留记号"的是 `on_external_irq` 的 `Wake→Reschedule`**——且它恰在最后一次 `eu-ret` 前打印。
+
+**真凶 ①（trap 纪律违反，tx-kernel/src/trap.rs `on_external_irq`）**：时钟中断打断用户态时先 `hand_off_timer_preempt`（存用户现场 + 给 userspace-run slot 记 Preempted）再返 `Reschedule`；外部设备中断路径**两样都没做**（连 trap frame 都拿不到），直接 `Reschedule`。板级 shell 对 from-user Reschedule 无条件 longjmp（board trap.rs:1051），`run_thread` 回来后 `entry_wait.await` 等一个**永远无人解决的 slot**——线程静默死亡。P2-S2 第一次打开 virtio-net 中断，"设备中断打在用户态时间片上"是内核史上首次发生的事件（此前该路径也威胁 UART：用户态时间片内敲键盘同样致死，只是从未被触发注意）。**修复**：`on_external_irq` 签名增 `TrapFrameMut`（HAL trait + rv64/la64 两板 + 3 测试桩），from-user 的 `Wake` 先走 `hand_off_timer_preempt` 同款纪律再 Reschedule。
+**真凶 ②（virtio-net 驱动半拉子 NAPI，tx-drivers/src/virtio/net.rs）**：`ack_interrupt_and_fire` 在 rx_ready 时 `disable_interrupts()`（NAPI 式"忙时关中断"），但**全仓无任何重新开启点**（`enable_interrupts` 仅 boot 一次）——第一次网卡中断即把设备通知永久关闭，后续帧静默堆积（修①后：GET 发出、服务器响应 185+335+FIN 到网卡，但无中断→delegate 不 poll→不 ACK→read 不醒，服务器重传 6 次）。**修复**：删除抑制逻辑——PLIC 层 mask 窗口（顶半部 mask→底半部 ack+kick+unmask）已提供节流，设备层抑制冗余且缺另一半。
+**旧判决为何错**：poll-pump 证伪实验时 IRQ 仍开着，真凶①照常杀线程，故 pump"无效"——正确结论应是"pump 治不了①"而非"跨任务重入不可修"；net-git 的 poll-pump 能过是因为**从未打开设备中断**，from-user 设备 IRQ 路径根本不存在。
+**验收（2026-07-03，全实测）**：`tcp-external-smoke` **ext-ok ×4 稳定**，pcap 完整生命周期 SYN→SYN-ACK→ACK→GET→响应→FIN→**全 ACK 零重传**（35ms）；回归矩阵全绿——xtask unit 仅分支既有 ext4 失败（stash 对照）、tx-subsystems --lib 失败集合 308=308 完全一致、la64 构建过、busybox-boot(-smp 4) sentinel ok、loopback tcp/udp 冒烟 ok。**推论**：A′/B 决策作废——阻塞 connect/read 经 park→IRQ 唤醒→重入的正路已通，无需内联驱动；坑 5 关闭。
+
 ---
 
 ## 附录 A. 证据锚点（三路调查汇总）

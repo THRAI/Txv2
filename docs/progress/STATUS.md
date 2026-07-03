@@ -1,4 +1,19 @@
-- 2026-07-03 (P2 connect-resume 追加实测:pump 证伪 + net-git 真机制复核). 无条件 ~2ms delegate pump 实测**仍不恢复
+- 2026-07-03 (P2 connect-resume 终局:真凶=两个可修 bug,"平台限制"说证伪,坑5 关闭,外部 TCP 全生命周期打通). 用户
+  追问真因,三轮死磕改判。新探针(eu-ret/await-ok/extirq-wake)证明 **longjmp 其实回来了**(旧插桩只数"出发"未数"回程
+  落点"),线程 park 在 entry_wait.await(thread_future.rs:635)等一个永远无人解决的 slot。排除法收口:唯一"longjmp 但
+  不留 slot 记号"的路径 = **on_external_irq 的 Wake→Reschedule**。**真凶①(trap 纪律违反)**:时钟中断打断用户态先
+  hand_off_timer_preempt 再 Reschedule,外部设备中断什么都不做直接 Reschedule→板级 from-user 无条件 longjmp→线程
+  静默死亡;P2-S2 首开 virtio-net 中断,"设备 IRQ 打在用户态时间片"是内核史上首次(UART 同威胁:用户态时间片内敲键盘
+  同样致死,从未被注意)。修复=on_external_irq 增 TrapFrameMut(HAL trait+rv64/la64 两板+3 测试桩),from-user Wake 走
+  时钟同款 hand-off。**真凶②(virtio-net 半拉子 NAPI)**:ack_interrupt_and_fire 忙时 disable_interrupts 但全仓无重开
+  点(enable 仅 boot 一次)→首次中断即永久关闭设备通知→修①后 GET 已发、响应到网卡但不 ACK/read 不醒(服务器重传×6)。
+  修复=删设备层抑制(PLIC mask 窗口已节流)。**旧判决为何错**:pump 实验时 IRQ 开着、真凶①照常杀线程;net-git pump 能过
+  是因为从未开设备中断。**验收全实测**:tcp-external-smoke ext-ok ×4 稳定,pcap 全生命周期零重传(35ms);回归全绿=
+  xtask unit 仅既有 ext4 失败(stash 对照)/tx-subsystems 失败集合 308=308 全同/la64 构建过/busybox-boot smp4 ok/
+  loopback tcp+udp ok。**推论**:A′/B 决策作废,阻塞 connect/read 的 park→IRQ 唤醒→重入正路已通。详见
+  REFACTOR_P2_v1.md §7.1。**Next**:P2 剩余 S3(入站真握手)→S4(多段 TX)→S5(端口轮转)→S6(UDP/DNS)→S7;§4 矩阵补
+  busybox wget rc=0。**Blocker**:无。
+- 2026-07-03 (P2 connect-resume 追加实测:pump 证伪 + net-git 真机制复核)【已被终局改判取代,见上条】. 无条件 ~2ms delegate pump 实测**仍不恢复
   connect**(pcap 停 ACK)——**证伪"poll-pump 兜底"**(pump 唤醒 delegate,gap 在 run_thread 用户态重入,正交)。**推论:
   4-A/4-B 共享同一 gap,pump 无效**。复核 net-git a1b7417d/3b7bfe26 几乎全诊断、无线程恢复修复——真机制=stage3
   c8389512 的 **RX drive window 在 connect syscall 自身上下文同步驱动 RX**,SYN-ACK 在 connect 执行期处理、连接在
@@ -7,7 +22,7 @@
   障碍=设备驱动在 tx-kernel boot delegate、connect 在 tx-shims,需 P-having"同步 pump 当前 netns 设备一轮"入口(shim
   层 loopback drive 的外部 analog)。pump 已撤,工作树干净。根因+路径写入 REFACTOR_P2_v1.md §7。**Next**:实现 A′(中等
   工作量,层次是难点)or 用户决策。**Blocker**:connect-resume(平台执行模型/层次)。
-- 2026-07-03 (P2 connect-resume 深度调试根因锁定 — 纯 B 死磕). 用户要求死磕。内核 AtomicU32 计数器全链路插桩
+- 2026-07-03 (P2 connect-resume 深度调试根因锁定 — 纯 B 死磕)【"平台限制"结论已被终局改判证伪,见最上条】. 用户要求死磕。内核 AtomicU32 计数器全链路插桩
   (delegate→process_tcp_event→publish_to→step_connect→connect_impl→run_thread→enter_userspace)+throttled dump。
   **计数器实测**:es=1 bc=1 pr=1 wk=2(收 SYN-ACK/到 Established/晋升/fire SPACE 唤醒 1 订阅者)、ce=2 sy=1(step_connect
   跑两次,二次见 Connected)、ci=park1/woke1/eisc-ok1(connect_impl await 返回、EISCONN 分支命中、**return Return(0)

@@ -51,7 +51,7 @@ impl KernelTrapSink<Platform> for RecordingTrapSink {
         TrapAction::Resume
     }
 
-    fn on_external_irq(_cpu: CpuId) -> TrapAction {
+    fn on_external_irq(_cpu: CpuId, _view: TrapFrameMut<'_>) -> TrapAction {
         panic!("unexpected external irq")
     }
 
@@ -85,7 +85,7 @@ impl KernelTrapSink<Platform> for RecordingSyscallSink {
         panic!("unexpected timer")
     }
 
-    fn on_external_irq(_cpu: CpuId) -> TrapAction {
+    fn on_external_irq(_cpu: CpuId, _view: TrapFrameMut<'_>) -> TrapAction {
         panic!("unexpected external irq")
     }
 
