@@ -49,6 +49,29 @@ pub trait CharDeviceOps: Send + Sync + 'static {
     fn write(&self, bytes: &[u8], guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress>;
 }
 
+/// P3-S2 (D13): file-object operations for `StructPayload` kinds richer
+/// than plain byte devices — the socket arm implements this so the VFS
+/// `step_read`/`step_write` dispatch can delegate instead of returning
+/// `EINVAL` (which forced every socket I/O through syscall-layer special
+/// cases). Same dispatch shape as [`CharDeviceOps`]; carries
+/// `nonblocking` because these objects have O_NONBLOCK semantics, and
+/// grows poll/ioctl/close arms in later P3 steps. See
+/// `docs/design/07_net/REFACTOR_P3_v1.md` §3.
+pub trait FileOps: Send + Sync {
+    fn read(
+        &self,
+        out: &mut [u8],
+        nonblocking: bool,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<usize, ByteProgress>;
+    fn write(
+        &self,
+        bytes: &[u8],
+        nonblocking: bool,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<usize, ByteProgress>;
+}
+
 #[derive(Clone, Copy)]
 pub struct CharDeviceBinding {
     pub devt: DevT,

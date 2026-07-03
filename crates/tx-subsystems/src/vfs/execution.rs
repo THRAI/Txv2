@@ -393,8 +393,14 @@ impl OpenFile {
                     side: crate::pipe::PipeSide::Writer,
                     ..
                 } => StepOutcome::Err(Errno::EBADF),
+                // P3-S2 (D13): sockets delegate to their FileOps impl —
+                // `read(fd)` ≡ `recv(fd, buf, len, 0)` — instead of the
+                // former EINVAL that forced socket I/O through
+                // syscall-layer special cases.
+                StructPayload::Socket { identity } => {
+                    crate::device::FileOps::read(identity, out, flags.nonblocking, guard)
+                }
                 StructPayload::FsNotify { .. }
-                | StructPayload::Socket { .. }
                 | StructPayload::NetNamespace { .. }
                 | StructPayload::MountNamespace { .. } => StepOutcome::Err(Errno::EINVAL),
             },
@@ -646,8 +652,12 @@ impl OpenFile {
                     side: crate::pipe::PipeSide::Reader,
                     ..
                 } => StepOutcome::Err(Errno::EBADF),
+                // P3-S2 (D13): `write(fd)` ≡ `send(fd, buf, len, 0)` via
+                // the socket FileOps impl (was EINVAL).
+                StructPayload::Socket { identity } => {
+                    crate::device::FileOps::write(identity, bytes, flags.nonblocking, guard)
+                }
                 StructPayload::FsNotify { .. }
-                | StructPayload::Socket { .. }
                 | StructPayload::NetNamespace { .. }
                 | StructPayload::MountNamespace { .. } => StepOutcome::Err(Errno::EINVAL),
             },

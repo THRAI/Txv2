@@ -321,3 +321,81 @@ fn smoltcp_demux_extracts_ipv6_tcp_event_flags() {
         other => panic!("expected v6 tcp dispatch, got {other:?}"),
     }
 }
+
+/// P3-S2 (D13) decisive test: `OpenFile::step_read`/`step_write` on a
+/// socket-backed file delegate to the socket `FileOps` impl —
+/// `write(fd)` ≡ `send(...,0)`, `read(fd)` ≡ `recv(...,0)` — instead of
+/// the former `EINVAL` that forced socket I/O through syscall-layer
+/// special cases. Full loopback ping: client writes via the FILE op,
+/// bytes travel the lo queue, the accepted child reads via the FILE op.
+#[test]
+fn open_file_read_write_delegate_to_socket_file_ops() {
+    let _lock = setup();
+    let guard = tx_substrate::epoch::guard();
+
+    let listener_open = match crate::net::execution::step_socket_open_file(2, 1, 6, &guard) {
+        StepOutcome::Done(output) => output,
+        _ => panic!("listener open_file failed"),
+    };
+    let client_open = match crate::net::execution::step_socket_open_file(2, 1, 6, &guard) {
+        StepOutcome::Done(output) => output,
+        _ => panic!("client open_file failed"),
+    };
+    let listener = listener_open.identity;
+    let client = client_open.identity;
+    let local = endpoint(40_460);
+    let remote_port = 40_461;
+
+    assert_eq!(
+        step_bind(&listener, inet(local.port), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(step_listen(&listener, 8, &guard), StepOutcome::Done(()));
+    assert_eq!(
+        step_bind(&client, inet(remote_port), &guard),
+        StepOutcome::Done(())
+    );
+    assert!(matches!(
+        step_connect(&client, inet(local.port), &guard),
+        StepOutcome::Yield {
+            shape: YieldShape::OnWaitSource { .. },
+            ..
+        }
+    ));
+    assert!(matches!(
+        step_tcp_loopback_handshake(&client, &guard),
+        StepOutcome::Done(_)
+    ));
+    let accepted = match step_accept(&listener, &guard) {
+        StepOutcome::Done(accepted) => accepted.child,
+        _ => panic!("accept should return queued child"),
+    };
+
+    // write(fd) on the client's OpenFile — the P3-S2 delegation path.
+    assert_eq!(
+        client_open.file.step_write(b"ping", &guard),
+        StepOutcome::Done(4),
+        "socket-backed OpenFile write must delegate to FileOps (was EINVAL)"
+    );
+    // Move the bytes across the loopback queue.
+    assert!(matches!(
+        step_process_loopback_tcp(&client, 4096, loopback_iface(), &guard),
+        StepOutcome::Done(_)
+    ));
+
+    // read(fd) on a temporary OpenFile wrapping the accepted child.
+    let accepted_file = crate::net::execution::socket_open_file_from_identity(
+        accepted.clone(),
+        crate::net::facade::SocketHandleFlags {
+            cloexec: false,
+            nonblock: false,
+        },
+    )
+    .expect("accepted open file")
+    .file;
+    let mut buf = [0u8; 8];
+    match accepted_file.step_read(&mut buf, &guard) {
+        StepOutcome::Done(4) => assert_eq!(&buf[..4], b"ping"),
+        other => panic!("socket-backed OpenFile read must return the payload: {other:?}"),
+    }
+}
