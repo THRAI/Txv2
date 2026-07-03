@@ -24,6 +24,8 @@ fn raw_udp_socket_preserves_datagram_boundary() {
     let src_a = endpoint(50_010);
     let src_b = endpoint(50_011);
     let dst = endpoint(40_010);
+    // P2-S6: inbound datagrams pass smoltcp `accepts`; bind the dst first.
+    assert!(raw.bind_endpoint(dst));
 
     assert!(raw.ingest_rx_datagram(src_a, dst, std::vec![1, 2, 3, 4, 5]));
     assert!(!raw.ingest_rx_datagram(src_b, dst, std::vec![6, 7]));

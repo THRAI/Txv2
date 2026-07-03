@@ -1,3 +1,15 @@
+- 2026-07-03 (P2-S4/S5/S6 三连完成 — 多段 TX 32KB 零差/端口轮转 4 连各新/UDP 收敛 smoltcp+DNS 打通). **S4**(137482ea):
+  process_tcp_tx_socket 改有界抽干(16 段/轮,Busy 背压保留);灵魂单测一轮 ≥2 段;QEMU tcp-external-bulk-smoke 32768/32768
+  字节到宿主(24 段 97ms)。**S5**(4ae7117c):三处临时端口扫描换共享 AtomicU16 轮转;ISN 相异单测绿;tcp-external-seq-smoke
+  连续 4 连各用 49152-55。**S6**:RawUdpSocket 双 VecDeque 删除,smoltcp ring 即队列(RX=accepts/process+bind 钩子挂
+  step_bind、recv=recv/peek+UdpMetadata、TX=send_slice/dispatch+MSG_MORE cork 留外);源地址=入队时 payload 层解析
+  (绑定/loopback 规则/路由 preferred_src)写 tx_src_hint,DrainSocketUdpTxDrain 增 src;fork 增 peek_send/payload_recv_bytes/
+  payload_send_bytes 三访问器;容量=ring 实配(上限 32KB);close 排空双 ring;5 个 raw 合同测试更新 bind-first。**两只
+  拦路虎全实测抓获**:①sendto 收尾 drive_udp_loopback_after_sendto 无条件 pop 灌 lo 队列偷走外部数据报(DNS 查询死在
+  loopback)→peek 谓词 gate 修复;②车道 emit 用 0.0.0.0 当源→改 dispatch 解析的 drain.src。10.0.2.3 静态 ARP 就位。
+  **验收**:udp-external-dns-smoke dns-ok(13ms 查询/应答,A 198.18.0.251);四冒烟+accept 全绿;集合差=基线+3 新测试名
+  (毒锁区单跑全绿);la64 构建/busybox-boot 过。**Next**:S7 扫尾(IPv6 demux 放行+Cap 加固先行块+死代码清扫)→§4 矩阵。
+  **Blocker**:无。
 - 2026-07-03 (P2-S3 入站真握手完成 — 外部 accept 真机打通,附带证实 net-git stage3 冷 RX 悬案+落混合 pump). 外部 SYN
   分支废除假握手(手工 Connected child 直进 accept、SYN-ACK 不发),重写为真握手三分支:表命中喂段/首 SYN 建半开 child
   (`listen_endpoint`+喂 SYN,smoltcp 排 SYN-ACK)/半开兜底喂段(终 ACK 走此路);晋升复用 loopback 的

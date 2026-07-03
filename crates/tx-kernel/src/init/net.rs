@@ -352,6 +352,13 @@ impl<P: TxPlatform> CoreInit<P> {
             BOOT_ETH_GATEWAY,
             tx_subsystems::net::EthernetAddress::new([0x52, 0x55, 0x0a, 0x00, 0x02, 0x02]),
         );
+        // P2-S6: SLIRP's DNS server (10.0.2.3) uses the same synthetic-MAC
+        // convention as the gateway; the static entry unblocks the first
+        // query (ARP learning hardening is P4/D10).
+        runtime.ether_iface.install_static_arp(
+            Ipv4Address::new([10, 0, 2, 3]),
+            tx_subsystems::net::EthernetAddress::new([0x52, 0x55, 0x0a, 0x00, 0x02, 0x03]),
+        );
 
         let mut slot = BOOT_NET_RUNTIME.lock();
         if let Some(existing) = *slot {

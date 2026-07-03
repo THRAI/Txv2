@@ -489,3 +489,73 @@ fn sequential_connects_use_distinct_isns() {
     }
     assert_ne!(isns[0], isns[1], "sequential connects reused the same ISN");
 }
+
+/// P2-S6 debug repro: external UDP sendto must surface a wire packet from
+/// one device-TX pass (the DNS smoke path: autobind 0.0.0.0 + sendto
+/// 10.0.2.3).
+#[test]
+fn external_udp_sendto_reaches_device_tx() {
+    let _lock = setup();
+
+    let device = leak_virtio_device(2, 2);
+    let registration = leak_virtio_registration(device, 75);
+    crate::net::initial_net_namespace_payload()
+        .attach_device_for_test_or_bootstrap(registration, Some(LOCAL_IP))
+        .expect("attach virtio test device to initial net namespace");
+
+    let guard = tx_substrate::epoch::guard();
+    let udp = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Udp,
+        SocketOptionSet::default_udp(),
+    )
+    .expect("udp socket");
+    // Mirror maybe_autobind_udp_sendto: bind 0.0.0.0:ephemeral.
+    assert_eq!(
+        step_bind(&udp, inet(49_180), &guard),
+        StepOutcome::Done(())
+    );
+
+    let dst = IpEndpoint::new(REMOTE_IP, 53);
+    let outcome = step_send_to_kernel_bytes(
+        &udp,
+        Some(dst),
+        b"dns-query-bytes",
+        SendRecvFlags::empty(),
+        &guard,
+    );
+    assert_eq!(outcome, StepOutcome::Done(15), "sendto must accept the datagram");
+    let _ = dst;
+
+    struct CountingSink {
+        frames: core::sync::atomic::AtomicUsize,
+    }
+    impl PacketTxSink for CountingSink {
+        fn transmit(&self, frame: &[u8], _guard: &Guard<'_>) -> PacketTxResult {
+            self.frames
+                .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+            PacketTxResult::Accepted {
+                frame_len: frame.len(),
+            }
+        }
+    }
+    let sink = CountingSink {
+        frames: core::sync::atomic::AtomicUsize::new(0),
+    };
+    let StepOutcome::Done(tx) = step_process_device_tx_pending_in_namespace_at(
+        &sink,
+        crate::net::initial_net_namespace_payload(),
+        smoltcp::time::Instant::from_millis(5),
+        DeviceTxBudget::default(),
+        &guard,
+    ) else {
+        panic!("device tx pass should complete");
+    };
+    assert_eq!(tx.udp_failed, 0, "udp lane must not fail");
+    assert!(
+        tx.udp_packets >= 1,
+        "udp datagram must reach the sink (attempted={}, busy={}, pending={})",
+        tx.udp_attempted,
+        tx.udp_busy,
+        tx.udp_resolution_pending
+    );
+}

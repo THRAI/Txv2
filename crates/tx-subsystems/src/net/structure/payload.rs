@@ -825,6 +825,7 @@ impl SocketPayload {
                 }
                 (None, Some(raw_udp), None) => match self.udp_connected_remote() {
                     Some(dst) => {
+                        raw_udp.set_tx_src_hint(self.udp_tx_src_hint(dst));
                         let (bytes, became_full) = raw_udp.enqueue_tx_len_to(dst, len)?;
                         (bytes, became_full, false)
                     }
@@ -861,6 +862,7 @@ impl SocketPayload {
                 }
                 (None, Some(raw_udp), None) => match self.udp_connected_remote() {
                     Some(dst) => {
+                        raw_udp.set_tx_src_hint(self.udp_tx_src_hint(dst));
                         let (bytes, became_full) =
                             raw_udp.enqueue_tx_bytes_to_with_more(dst, bytes, more)?;
                         (bytes, became_full, false)
@@ -908,6 +910,7 @@ impl SocketPayload {
                         Some(dst) => dst,
                         None => return Err(crate::execution::Errno::EDESTADDRREQ),
                     };
+                    raw_udp.set_tx_src_hint(self.udp_tx_src_hint(dst));
                     match raw_udp.enqueue_tx_bytes_to_with_more(dst, bytes, more) {
                         Some((bytes, became_full)) => (bytes, became_full, false),
                         None => return Ok(None),
@@ -959,6 +962,7 @@ impl SocketPayload {
         self.refresh_io_from_raw();
         Some(SocketUdpTxDrain {
             datagram: drain.datagram,
+            src: drain.src,
             became_available: drain.became_available,
         })
     }
@@ -1055,16 +1059,6 @@ impl SocketPayload {
 
     pub(crate) fn peek_udp_tx_datagram(&self) -> Option<UdpTxDatagram> {
         self.raw_udp.as_ref()?.peek_tx_datagram()
-    }
-
-    pub(crate) fn commit_udp_tx_datagram_sent(&self) -> Option<SocketUdpTxDrain> {
-        let raw_udp = self.raw_udp.as_ref()?;
-        let drain = raw_udp.commit_tx_datagram_sent()?;
-        self.refresh_io_from_raw();
-        Some(SocketUdpTxDrain {
-            datagram: drain.datagram,
-            became_available: drain.became_available,
-        })
     }
 
     pub(crate) fn set_accept_limit(&self, limit: usize) {
@@ -1275,6 +1269,51 @@ impl SocketPayload {
         .copied()
     }
 
+    fn udp_bound_local(&self) -> Option<IpEndpoint> {
+        match &*self.protocol.lock() {
+            SocketProtocol::Udp(UdpInner::Bound { local })
+            | SocketProtocol::Udp(UdpInner::Connected { local, .. }) => Some(*local),
+            _ => None,
+        }
+    }
+
+    /// Resolve the source address to stamp on outgoing UDP datagrams
+    /// (P2-S6). The context iface carries no addresses, so smoltcp's
+    /// dispatch-side source selection cannot be relied on: use the bound
+    /// address when concrete, the loopback rule for loopback-destined
+    /// datagrams, else the namespace route's preferred source.
+    fn udp_tx_src_hint(&self, dst: IpEndpoint) -> Option<IpEndpoint> {
+        if let Some(local) = self.udp_bound_local() {
+            if !local.is_unspecified() {
+                return Some(local);
+            }
+        }
+        if dst.is_loopback() || dst.is_unspecified() {
+            return Some(IpEndpoint::loopback_for_family(dst.family, 0));
+        }
+        match dst.ip_addr() {
+            super::IpAddress::V4(addr) => self
+                .net_namespace()
+                .best_ipv4_route(addr)
+                .and_then(|route| {
+                    route.preferred_src.or_else(|| {
+                        self.net_namespace()
+                            .link_snapshot()
+                            .into_iter()
+                            .find(|link| {
+                                link.name == route.oif_name
+                                    && link.is_up
+                                    && !link.is_loopback
+                                    && link.ipv4_addr.is_some()
+                            })
+                            .and_then(|link| link.ipv4_addr)
+                    })
+                })
+                .map(|src| IpEndpoint::new(src, 0)),
+            super::IpAddress::V6(_) => None,
+        }
+    }
+
     pub(crate) fn refresh_io_from_raw(&self) {
         let recv_len = self.raw_recv_available();
         let send_space = self.raw_send_available();
@@ -1357,6 +1396,8 @@ pub struct SocketSendReserve {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SocketUdpTxDrain {
     pub datagram: UdpTxDatagram,
+    /// Dispatch-resolved source endpoint (see `UdpTxDatagramDrain::src`).
+    pub src: IpEndpoint,
     pub became_available: bool,
 }
 

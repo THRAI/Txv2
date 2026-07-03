@@ -615,7 +615,7 @@ fn observe_socket(socket: &tcp::Socket<'_>) -> SocketProtocolObservation {
 // later phase (REFACTOR_PLAN_A_v2 P5).
 static CONTEXT_IFACE: SpinMutex<Option<Interface>> = SpinMutex::new(None);
 
-fn with_context<R>(f: impl FnOnce(&mut smoltcp::iface::Context) -> R) -> R {
+pub(crate) fn with_context<R>(f: impl FnOnce(&mut smoltcp::iface::Context) -> R) -> R {
     let mut slot = CONTEXT_IFACE.lock();
     let iface = slot.get_or_insert_with(|| {
         let mut device = Loopback::new(Medium::Ip);

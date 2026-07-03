@@ -332,6 +332,17 @@ pub(super) fn drive_udp_loopback_after_sendto(
     ) {
         return false;
     }
+    // P2-S6: only drive datagrams that are actually loopback-destined.
+    // The egress pop is destructive and routes into the lo queue; an
+    // external datagram (e.g. a DNS query to 10.0.2.3) stolen here never
+    // reaches the device-TX lane — it dies unclaimed on loopback.
+    match payload
+        .raw_udp_socket()
+        .and_then(|raw| raw.peek_tx_datagram())
+    {
+        Some(datagram) if datagram.dst.is_loopback() => {}
+        _ => return false,
+    }
     let guard = tx_substrate::epoch::guard();
     matches!(
         step_process_loopback_udp(socket, 8, &guard),

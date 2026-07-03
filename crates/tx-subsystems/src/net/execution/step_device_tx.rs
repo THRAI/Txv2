@@ -286,24 +286,33 @@ fn process_udp_tx_socket(
     let Some(local) = udp_local_endpoint(&payload.protocol_snapshot()) else {
         return;
     };
-    let Some(datagram) = payload.peek_udp_tx_datagram() else {
+    if payload.peek_udp_tx_datagram().is_none() {
         return;
-    };
+    }
     if sink.readiness_at(now, guard) == PacketTxReadiness::Busy {
         outcome.udp_busy += 1;
         return;
     }
-    let Some(packet) = datagram.emit_ipv4_packet(local) else {
+    // P2-S6: pop through smoltcp dispatch so the wire source is the
+    // dispatch-resolved endpoint (bound address or enqueue-time hint) —
+    // sockets autobound to 0.0.0.0 must not emit src-unspecified packets.
+    // The pop is destructive; a sink refusal drops the datagram (UDP is
+    // best-effort and the readiness probe above keeps that window small).
+    let Some(drain) = payload.take_udp_tx_datagram() else {
+        return;
+    };
+    let packet_src = if !drain.src.is_unspecified() && drain.src.port != 0 {
+        drain.src
+    } else {
+        local
+    };
+    let Some(packet) = drain.datagram.emit_ipv4_packet(packet_src) else {
         return;
     };
 
     outcome.udp_attempted += 1;
     match sink.transmit_at(packet.as_bytes(), now, guard) {
         PacketTxResult::Accepted { frame_len } => {
-            let Some(drain) = payload.commit_udp_tx_datagram_sent() else {
-                outcome.udp_failed += 1;
-                return;
-            };
             outcome.udp_packets += 1;
             outcome.tx_bytes += frame_len;
             outcome.sockets_touched += 1;

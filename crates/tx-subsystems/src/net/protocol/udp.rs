@@ -1,14 +1,15 @@
 use alloc::boxed::Box;
-use alloc::collections::VecDeque;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use smoltcp::phy::ChecksumCapabilities;
+use smoltcp::phy::{ChecksumCapabilities, PacketMeta};
 use smoltcp::socket::udp;
 use smoltcp::wire::{
-    IpAddress, IpProtocol, IpRepr, Ipv4Packet, Ipv4Repr, Ipv6Packet, Ipv6Repr, UdpPacket, UdpRepr,
+    IpAddress, IpListenEndpoint, IpProtocol, IpRepr, Ipv4Packet, Ipv4Repr, Ipv6Packet, Ipv6Repr,
+    UdpPacket, UdpRepr,
 };
 
+use super::tcp::with_context;
 use crate::net::packet::LoopbackIpPacket;
 use crate::net::structure::{
     AddressFamily, IpEndpoint, Ipv4Address, Ipv6Address as TxIpv6Address, SocketOptionSet,
@@ -16,16 +17,29 @@ use crate::net::structure::{
 use crate::sync::SpinMutex;
 
 const MAX_UDP_PACKET_METADATA_CAPACITY: usize = 64;
-const UDP_SMOLTCP_BACKING_BYTES: usize = 2048;
+/// Upper bound on the smoltcp ring backing (P2-S6): the ring IS the
+/// datagram queue now, so it must track the socket buffer size — but a
+/// default SO_SNDBUF/SO_RCVBUF of ~208 KiB per direction per socket would
+/// be a real allocation (audit R2d), so cap it.
+const UDP_SMOLTCP_BACKING_MAX_BYTES: usize = 32_768;
 const UDP_PACKET_CAPACITY_DIVISOR: usize = 1500;
 pub const UDP_IPV4_MAX_PAYLOAD_BYTES: usize = u16::MAX as usize - 20 - 8;
 
 /// Doc-named owner for the smoltcp UDP socket and its packet buffers.
+///
+/// P2-S6: the smoltcp socket IS the data path — RX lands via
+/// `accepts`/`process`, TX leaves via `send_slice`/`dispatch`/`peek_send`.
+/// The former shadow `VecDeque` datagram queues are gone; only the
+/// MSG_MORE corking staging survives outside smoltcp (same shape as TCP's
+/// `corked_tx`).
 pub struct RawUdpSocket {
     socket: SpinMutex<Box<udp::Socket<'static>>>,
-    rx_datagrams: SpinMutex<VecDeque<UdpRxDatagram>>,
-    tx_datagrams: SpinMutex<VecDeque<UdpTxDatagram>>,
     corked_tx: SpinMutex<Option<UdpTxDatagram>>,
+    /// Source-address hint for corked/queued datagrams (resolved by the
+    /// payload layer at enqueue time: bound address, loopback rule, or the
+    /// namespace route's preferred source). The context iface carries no
+    /// addresses, so dispatch-side source selection cannot be relied on.
+    tx_src_hint: SpinMutex<Option<IpAddress>>,
     recv_capacity: usize,
     send_capacity: usize,
     recv_packet_capacity: usize,
@@ -48,6 +62,10 @@ pub struct UdpTxDatagram {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UdpTxDatagramDrain {
     pub datagram: UdpTxDatagram,
+    /// Source endpoint smoltcp resolved at dispatch (bound address or the
+    /// enqueue-time hint). The emit path must use this — the socket may be
+    /// bound to 0.0.0.0 and a src-unspecified wire packet is garbage.
+    pub src: IpEndpoint,
     pub became_available: bool,
 }
 
@@ -62,8 +80,10 @@ pub struct UdpRecvDrain {
 
 impl RawUdpSocket {
     pub fn new(options: &SocketOptionSet) -> Self {
-        let recv_capacity = options.socket.recv_buf_size;
-        let send_capacity = options.socket.send_buf_size;
+        // Capacity == ring size (P2-S6): the smoltcp ring is the queue, so
+        // availability arithmetic must match what the ring can hold.
+        let recv_capacity = smoltcp_backing_bytes(options.socket.recv_buf_size);
+        let send_capacity = smoltcp_backing_bytes(options.socket.send_buf_size);
         let recv_packet_capacity = packet_capacity_for_bytes(recv_capacity);
         let send_packet_capacity = packet_capacity_for_bytes(send_capacity);
         let rx_buf = udp::PacketBuffer::new(
@@ -82,14 +102,39 @@ impl RawUdpSocket {
 
         Self {
             socket: SpinMutex::new(Box::new(socket)),
-            rx_datagrams: SpinMutex::new(VecDeque::new()),
-            tx_datagrams: SpinMutex::new(VecDeque::new()),
             corked_tx: SpinMutex::new(None),
+            tx_src_hint: SpinMutex::new(None),
             recv_capacity,
             send_capacity,
             recv_packet_capacity,
             send_packet_capacity,
         }
+    }
+
+    /// Bind the smoltcp socket so `accepts`/`process` admit inbound
+    /// datagrams and `send` becomes addressable. Idempotent on the same
+    /// port; a rebind to a different port closes and rebinds.
+    pub fn bind_endpoint(&self, local: IpEndpoint) -> bool {
+        if local.port == 0 {
+            return false;
+        }
+        let mut socket = self.socket.lock();
+        let current = socket.endpoint();
+        if current.port == local.port {
+            return true;
+        }
+        if current.port != 0 {
+            socket.close();
+        }
+        let listen = IpListenEndpoint {
+            addr: if local.is_unspecified() {
+                None
+            } else {
+                Some(to_smol_ip(&local))
+            },
+            port: local.port,
+        };
+        socket.bind(listen).is_ok()
     }
 
     pub fn recv_capacity(&self) -> usize {
@@ -105,19 +150,27 @@ impl RawUdpSocket {
             return false;
         }
 
-        let mut rx = self.rx_datagrams.lock();
-        let was_empty = rx.is_empty();
-        let available = self.recv_capacity.saturating_sub(rx_payload_len(&rx));
-        if payload.len() > available {
-            return false;
-        }
-
-        rx.push_back(UdpRxDatagram { src, dst, payload });
-        was_empty
+        with_context(|cx| {
+            let mut socket = self.socket.lock();
+            let was_empty = !socket.can_recv();
+            let udp_repr = UdpRepr {
+                src_port: src.port,
+                dst_port: dst.port,
+            };
+            let ip_repr = ip_repr_for(&src, &dst, udp_repr.header_len() + payload.len());
+            if !socket.accepts(cx, &ip_repr, &udp_repr) {
+                return false;
+            }
+            socket.process(cx, PacketMeta::default(), &ip_repr, &udp_repr, &payload);
+            // Edge semantics as before: report only the empty→non-empty
+            // transition (a full ring drops the datagram inside process,
+            // in which case can_recv stays false and we report false).
+            was_empty && socket.can_recv()
+        })
     }
 
     pub fn recv_available(&self) -> usize {
-        rx_payload_len(&self.rx_datagrams.lock())
+        self.socket.lock().payload_recv_bytes()
     }
 
     pub fn recv_len(&self, len: usize, peek: bool) -> Option<(usize, bool)> {
@@ -125,13 +178,15 @@ impl RawUdpSocket {
             return Some((0, false));
         }
 
-        let mut rx = self.rx_datagrams.lock();
-        let datagram = rx.front()?;
-        let bytes = core::cmp::min(datagram.payload.len(), len);
-        if !peek {
-            let _ = rx.pop_front();
+        let mut socket = self.socket.lock();
+        if peek {
+            let (payload, _meta) = socket.peek().ok()?;
+            return Some((core::cmp::min(payload.len(), len), false));
         }
-        Some((bytes, !peek && rx.is_empty()))
+        let (payload, _meta) = socket.recv().ok()?;
+        let bytes = core::cmp::min(payload.len(), len);
+        let became_empty = !socket.can_recv();
+        Some((bytes, became_empty))
     }
 
     pub fn recv_datagram_bytes(&self, out: &mut [u8], peek: bool) -> Option<UdpRecvDrain> {
@@ -145,27 +200,51 @@ impl RawUdpSocket {
             });
         }
 
-        let mut rx = self.rx_datagrams.lock();
-        let datagram = rx.front()?;
-        let bytes = core::cmp::min(datagram.payload.len(), out.len());
-        out[..bytes].copy_from_slice(&datagram.payload[..bytes]);
-        let source = datagram.src;
-        let destination = datagram.dst;
-        let truncated = bytes < datagram.payload.len();
-        if !peek {
-            let _ = rx.pop_front();
+        let mut socket = self.socket.lock();
+        let bound_port = socket.endpoint().port;
+        if peek {
+            let (payload, meta) = socket.peek().ok()?;
+            let bytes = core::cmp::min(payload.len(), out.len());
+            out[..bytes].copy_from_slice(&payload[..bytes]);
+            let truncated = bytes < payload.len();
+            let source = from_smol_endpoint(meta.endpoint);
+            let destination = meta
+                .local_address
+                .map(|addr| endpoint_from_smol_ip(addr, bound_port))
+                .unwrap_or_else(unspecified_endpoint);
+            return Some(UdpRecvDrain {
+                bytes,
+                source,
+                destination,
+                truncated,
+                became_empty: false,
+            });
         }
+
+        let (bytes, source, destination, truncated) = {
+            let (payload, meta) = socket.recv().ok()?;
+            let bytes = core::cmp::min(payload.len(), out.len());
+            out[..bytes].copy_from_slice(&payload[..bytes]);
+            (
+                bytes,
+                from_smol_endpoint(meta.endpoint),
+                meta.local_address
+                    .map(|addr| endpoint_from_smol_ip(addr, bound_port))
+                    .unwrap_or_else(unspecified_endpoint),
+                bytes < payload.len(),
+            )
+        };
         Some(UdpRecvDrain {
             bytes,
             source,
             destination,
             truncated,
-            became_empty: !peek && rx.is_empty(),
+            became_empty: !socket.can_recv(),
         })
     }
 
     pub fn send_available(&self) -> usize {
-        let queued = tx_payload_len(&self.tx_datagrams.lock());
+        let queued = self.socket.lock().payload_send_bytes();
         let corked = self.corked_tx_len();
         self.send_capacity.saturating_sub(queued + corked)
     }
@@ -191,6 +270,14 @@ impl RawUdpSocket {
         self.enqueue_tx_datagram_with_more(dst, payload, false)
     }
 
+    /// Record the source-address hint the payload layer resolved for
+    /// outgoing datagrams (bound address / loopback rule / route
+    /// preferred-src). Consulted when flushing into the smoltcp tx ring.
+    pub fn set_tx_src_hint(&self, src: Option<IpEndpoint>) {
+        *self.tx_src_hint.lock() =
+            src.filter(|endpoint| !endpoint.is_unspecified()).map(|endpoint| to_smol_ip(&endpoint));
+    }
+
     pub fn enqueue_tx_datagram_with_more(
         &self,
         dst: IpEndpoint,
@@ -201,17 +288,20 @@ impl RawUdpSocket {
             return Some((0, false));
         }
 
-        let mut tx = self.tx_datagrams.lock();
-        let mut corked = self.corked_tx.lock();
-        let available = self
-            .send_capacity
-            .saturating_sub(tx_payload_len(&tx) + corked_payload_len(&corked));
-        if payload.len() > available {
-            return None;
+        {
+            let corked = self.corked_tx.lock();
+            let queued = self.socket.lock().payload_send_bytes();
+            let available = self
+                .send_capacity
+                .saturating_sub(queued + corked_payload_len(&corked));
+            if payload.len() > available {
+                return None;
+            }
         }
 
         let bytes = payload.len();
         if more {
+            let mut corked = self.corked_tx.lock();
             match corked.as_mut() {
                 Some(datagram) => {
                     datagram.payload.extend(payload);
@@ -223,19 +313,39 @@ impl RawUdpSocket {
                     *corked = Some(UdpTxDatagram { dst, payload });
                 }
             }
-        } else if let Some(mut datagram) = corked.take() {
-            if datagram.dst.port == 0 {
-                datagram.dst = dst;
-            }
-            datagram.payload.extend(payload);
-            tx.push_back(datagram);
         } else {
-            tx.push_back(UdpTxDatagram { dst, payload });
+            let flushed = if let Some(mut datagram) = self.corked_tx.lock().take() {
+                if datagram.dst.port == 0 {
+                    datagram.dst = dst;
+                }
+                datagram.payload.extend(payload);
+                datagram
+            } else {
+                UdpTxDatagram { dst, payload }
+            };
+            self.push_datagram_to_socket(flushed)?;
         }
+        let queued = self.socket.lock().payload_send_bytes();
         Some((
             bytes,
-            tx_payload_len(&tx) + corked_payload_len(&corked) == self.send_capacity,
+            queued + self.corked_tx_len() >= self.send_capacity,
         ))
+    }
+
+    /// Flush one staged datagram into the smoltcp tx ring. A datagram with
+    /// an unaddressable destination is accepted and dropped (legacy queue
+    /// behaviour: it would sit until the drain failed to emit it).
+    fn push_datagram_to_socket(&self, datagram: UdpTxDatagram) -> Option<()> {
+        if datagram.dst.port == 0 || datagram.dst.is_unspecified() {
+            return Some(());
+        }
+        let meta = udp::UdpMetadata {
+            endpoint: to_smol_endpoint(&datagram.dst),
+            local_address: *self.tx_src_hint.lock(),
+            meta: PacketMeta::default(),
+        };
+        let mut socket = self.socket.lock();
+        socket.send_slice(&datagram.payload, meta).ok().map(|_| ())
     }
 
     pub fn enqueue_tx_bytes(&self, bytes: &[u8]) -> Option<(usize, bool)> {
@@ -256,20 +366,36 @@ impl RawUdpSocket {
     }
 
     pub fn pop_tx_datagram(&self) -> Option<UdpTxDatagramDrain> {
-        let mut tx = self.tx_datagrams.lock();
-        let datagram = tx.pop_front()?;
-        Some(UdpTxDatagramDrain {
-            datagram,
-            became_available: true,
+        with_context(|cx| {
+            let mut socket = self.socket.lock();
+            let mut out = None;
+            let result: Result<(), ()> =
+                socket.dispatch(cx, |_cx, _meta, (ip_repr, udp_repr, payload)| {
+                    out = Some((
+                        UdpTxDatagram {
+                            dst: endpoint_from_smol_ip(ip_repr.dst_addr(), udp_repr.dst_port),
+                            payload: payload.to_vec(),
+                        },
+                        endpoint_from_smol_ip(ip_repr.src_addr(), udp_repr.src_port),
+                    ));
+                    Ok(())
+                });
+            result.ok()?;
+            out.map(|(datagram, src)| UdpTxDatagramDrain {
+                datagram,
+                src,
+                became_available: true,
+            })
         })
     }
 
     pub fn peek_tx_datagram(&self) -> Option<UdpTxDatagram> {
-        self.tx_datagrams.lock().front().cloned()
-    }
-
-    pub fn commit_tx_datagram_sent(&self) -> Option<UdpTxDatagramDrain> {
-        self.pop_tx_datagram()
+        let mut socket = self.socket.lock();
+        let (payload, meta) = socket.peek_send().ok()?;
+        Some(UdpTxDatagram {
+            dst: from_smol_endpoint(meta.endpoint),
+            payload: payload.to_vec(),
+        })
     }
 
     pub fn recv_packet_capacity(&self) -> usize {
@@ -289,9 +415,23 @@ impl RawUdpSocket {
     }
 
     pub fn close(&self) {
-        self.socket.lock().close();
-        self.rx_datagrams.lock().clear();
-        self.tx_datagrams.lock().clear();
+        // Drain both rings so queued payloads are released (queue-era
+        // `close` cleared the VecDeques; smoltcp `close` only unbinds).
+        with_context(|cx| {
+            let mut socket = self.socket.lock();
+            while socket.recv().is_ok() {}
+            loop {
+                let mut popped = false;
+                let result: Result<(), ()> = socket.dispatch(cx, |_cx, _meta, _emit| {
+                    popped = true;
+                    Ok(())
+                });
+                if result.is_err() || !popped {
+                    break;
+                }
+            }
+            socket.close();
+        });
         let _ = self.corked_tx.lock().take();
     }
 }
@@ -421,21 +561,49 @@ fn packet_capacity_for_bytes(bytes: usize) -> usize {
 }
 
 fn smoltcp_backing_bytes(bytes: usize) -> usize {
-    bytes.clamp(1, UDP_SMOLTCP_BACKING_BYTES)
+    bytes.clamp(1, UDP_SMOLTCP_BACKING_MAX_BYTES)
 }
 
-fn rx_payload_len(datagrams: &VecDeque<UdpRxDatagram>) -> usize {
-    datagrams
-        .iter()
-        .map(|datagram| datagram.payload.len())
-        .sum()
+fn to_smol_ip(endpoint: &IpEndpoint) -> IpAddress {
+    match endpoint.family {
+        AddressFamily::Inet6 => IpAddress::Ipv6(to_smoltcp_ipv6(endpoint.addr6)),
+        _ => IpAddress::Ipv4(to_smoltcp_ipv4(endpoint.addr)),
+    }
 }
 
-fn tx_payload_len(datagrams: &VecDeque<UdpTxDatagram>) -> usize {
-    datagrams
-        .iter()
-        .map(|datagram| datagram.payload.len())
-        .sum()
+fn to_smol_endpoint(endpoint: &IpEndpoint) -> smoltcp::wire::IpEndpoint {
+    smoltcp::wire::IpEndpoint::new(to_smol_ip(endpoint), endpoint.port)
+}
+
+fn from_smol_endpoint(endpoint: smoltcp::wire::IpEndpoint) -> IpEndpoint {
+    endpoint_from_smol_ip(endpoint.addr, endpoint.port)
+}
+
+fn endpoint_from_smol_ip(addr: IpAddress, port: u16) -> IpEndpoint {
+    match addr {
+        IpAddress::Ipv4(v4) => IpEndpoint::new(from_smoltcp_ipv4(v4), port),
+        IpAddress::Ipv6(v6) => IpEndpoint::new_v6(from_smoltcp_ipv6(v6), port),
+    }
+}
+
+fn ip_repr_for(src: &IpEndpoint, dst: &IpEndpoint, udp_len: usize) -> IpRepr {
+    if src.family == AddressFamily::Inet6 || dst.family == AddressFamily::Inet6 {
+        IpRepr::Ipv6(Ipv6Repr {
+            src_addr: to_smoltcp_ipv6(src.addr6),
+            dst_addr: to_smoltcp_ipv6(dst.addr6),
+            next_header: IpProtocol::Udp,
+            payload_len: udp_len,
+            hop_limit: 64,
+        })
+    } else {
+        IpRepr::Ipv4(Ipv4Repr {
+            src_addr: to_smoltcp_ipv4(src.addr),
+            dst_addr: to_smoltcp_ipv4(dst.addr),
+            next_header: IpProtocol::Udp,
+            payload_len: udp_len,
+            hop_limit: 64,
+        })
+    }
 }
 
 fn corked_payload_len(datagram: &Option<UdpTxDatagram>) -> usize {

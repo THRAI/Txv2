@@ -495,6 +495,7 @@ fn install_optional_user_smokes(root: &Path, target: TxTarget, layout: &Path) ->
         "tcp-external-accept-smoke",
         "tcp-external-bulk-smoke",
         "tcp-external-seq-smoke",
+        "udp-external-dns-smoke",
         "netns-helper",
         "nft-probe",
         "packet-probe",

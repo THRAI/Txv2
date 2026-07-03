@@ -509,6 +509,8 @@ fn raw_udp_socket_close_releases_corked_and_queued_payloads() {
 
     let raw = RawUdpSocket::new(&options);
     let dst = IpEndpoint::new(Ipv4Address::LOOPBACK, 12345);
+    // P2-S6: the smoltcp ring is the queue; `send` needs a bound socket.
+    assert!(raw.bind_endpoint(IpEndpoint::new(Ipv4Address::LOOPBACK, 40_242)));
 
     assert_eq!(
         raw.enqueue_tx_datagram_with_more(dst, alloc::vec![0xAA; 4000], true),

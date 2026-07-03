@@ -144,7 +144,11 @@ TX 车道全套（含 Connecting 搬运）、ARP 全套、demux 带段+校验和
 - connect-autobind（tx-shims `maybe_autobind_connect_client`）临时端口改走共享轮转（借 `9d840ecb` 前半，对齐 `bind_with_ephemeral_port`）。
 - **验证 ISN 已异**（持久 iface 的 rand 前进）：单测两次 connect 的 ISN 不同；QEMU 连续 4 次 wget 全成。
 
-### S6 —— UDP 收敛进 smoltcp（完成 P1 遗留）+ DNS
+### S6 —— UDP 收敛进 smoltcp（完成 P1 遗留）+ DNS ✅（2026-07-03 完成）
+
+> **实施记录**：`RawUdpSocket` 双 `VecDeque` 删除，smoltcp ring 即队列——RX 走 `accepts`/`process`（bind 钩子挂在 step_bind 的 UDP 臂，否则 accepts 全拒）、recv 走 `recv`/`peek`（dst 从 `UdpMetadata.local_address` 取）、TX 走 `send_slice`+`dispatch`；MSG_MORE corking 留在 smoltcp 外（同 TCP corked_tx 形态）。**源地址提示**：context iface 无地址，dispatch 侧源选择不可依赖 → payload 层在入队时解析（绑定地址/loopback 规则/命名空间路由 preferred_src）写 `tx_src_hint`，`UdpTxDatagramDrain` 新增 `src` 字段供 emit 用。fork 增 3 个诚实访问器（`peek_send`/`payload_recv_bytes`/`payload_send_bytes`），容量=ring 实配（上限 32KB，R2d 记账）。close 补双 ring 排空。5 个队列时代 raw 合同测试更新为 bind-first 语义。
+> **两只拦路虎（全实测抓获）**：① sendto 收尾例程 `drive_udp_loopback_after_sendto` **无条件 pop 队首灌 lo 队列**——外部数据报（DNS 查询）被偷走死在 loopback，网卡永远看不到；修复=peek 谓词 gate（仅 loopback 目的地才 drive），与 step_loopback_pending 既有谓词对称。② 车道 emit 曾用 0.0.0.0 绑定地址当源——改用 dispatch 解析的 `drain.src`。诊断路数：宿主级最小复现单测（通）↔ QEMU 计数器探针（`s/a/k/w` 四值定位 delegate 步数与 kick 计数）二分。
+> **验收**：`udp-external-dns-smoke`（手搓 A 查询→10.0.2.3:53）**dns-ok**，pcap 13ms 查询/应答（src=10.0.2.15 hint 生效，`A 198.18.0.251`）；10.0.2.3 静态 ARP 就位；四冒烟矩阵+accept 冒烟全绿；集合差=基线+3 个新测试名（毒锁区，单跑全绿）；la64 构建过、busybox-boot 过。
 
 - `RawUdpSocket`：bind 时同步 `socket.bind`；send 走 `send_slice(payload, meta)`；recv 走 `recv/peek`（src 从 `UdpMetadata` 取）；**删 `rx_datagrams`/`tx_datagrams`**——此时两类用户（loopback 转运 + 外部 device_tx/RX）一起换源：loopback egress/ingress 与 device_tx 的 UDP 车道改为 `socket.dispatch/process`；外部 RX 的 `record_recv_payload` UDP 分支改喂 `process`。
 - DNS 两小修（借 `9c919782` 后半）：10.0.2.3 静态 ARP；外部 UDP 发送打开驱动窗口。

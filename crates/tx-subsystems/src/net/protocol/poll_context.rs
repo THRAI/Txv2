@@ -89,7 +89,14 @@ impl PollContext {
         if drain.datagram.dst.port == 0 {
             drain.datagram.dst = connected_remote?;
         }
-        let packet_src = select_udp_packet_source(local, drain.datagram.dst, iface);
+        // P2-S6: prefer the dispatch-resolved source (bound address or
+        // enqueue-time hint); fall back to the loopback selection rule for
+        // datagrams that predate the hint.
+        let packet_src = if !drain.src.is_unspecified() && drain.src.port != 0 {
+            drain.src
+        } else {
+            select_udp_packet_source(local, drain.datagram.dst, iface)
+        };
         let packet = drain.datagram.emit_ipv4_packet(packet_src)?;
         if !iface.dispatch_ip(packet) {
             return None;
