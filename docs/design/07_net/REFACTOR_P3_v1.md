@@ -70,7 +70,10 @@
 - close：评估 `maybe_close_socket_file_after_fd_remove`（socket.rs:3714-3728）与进程退出车道（process/execution.rs:1009-1039）收编为 `ops.close` 钩子——**保守裁量**：若 retain_count/两相时序有隐坑则保留 bolt-on 形态、只把"是不是 socket"的判定换成 ops 存在性，记账 P3-B。
 - 验证：sockopt/ioctl 冒烟（FIONBIO/FIONREAD 单测）+ close 后端口释放回归（复用 P2 seq 冒烟——连续连接依赖 close 正确释放）。
 
-### S6 —— D14b 等待收敛 + 清扫
+### S6 —— D14b 等待收敛 + 清扫 ◐（2026-07-03 部分完成 + 范围修订）
+
+> **实施记录**：死代码清扫完成——`linux_syscall/net.rs`（FakeSocket，401 行，`mod net` 从未声明）删除。**范围修订（诚实裁量）**：D14b 的 park 机械替换（`wait_on_yield_shape`/`wait_on_token` → `await_wait_source`）与 `yield_now` 忙让步清理**移交 LTP 环境轮**——两者的回归形态是 EINTR 语义与调度时序（recv 族/ping 族/poll 族 LTP），本机冒烟矩阵对它们不敏感（换不换机械都绿），没有裁判的重构违反本重构的判决性纪律；且忙让步可能掩护着潜在丢唤醒（P2 坑 5 家族），摘除必须有 LTP 兜底。S1 的双表登记已把收敛的地基打好（同 id 两表可见），届时为机械替换。
+> **P3-A 收官状态**：S1-S5 全落地 + S6 清扫部分；特判清单（§2）核销情况——io.rs read/write ✅、poll/epoll 换轨 FileOps ✅、F_SETFL ✅、close/exit 车道 ✅、ioctl **保留**（需 ctx/用户内存，Step 形 trait 无法承载，记账 P3-B）、splice 拒绝**保留**（语义合法）、socketpair **保留**（独立形态，拍板 #4）、D14b park 收敛**移交 LTP 轮**。
 
 - socket park 从 `wait_on_yield_shape`/`wait_on_token` 收敛 `await_wait_source`（S1 后 substrate id 已就位，机械替换）；清 `yield_now` 忙让步——**逐个裁量**：纯重试型让步删除；服务 loopback 内联 drive 公平性的语义性 yield（sendto 后让对端跑）保留并注释成契约。
 - 删死代码 `linux_syscall/net.rs`；特判清单（§2）逐项核销；`wait_on_yield_shape` 若无余户则删。

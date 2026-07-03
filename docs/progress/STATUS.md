@@ -1,3 +1,12 @@
+- 2026-07-03 (P3-A S4-S6 收官 — poll/F_SETFL/close 全进 FileOps,死代码清扫,D14b 移交 LTP 轮). **S4**(5a097f37):FileOps
+  增 poll_mask/poll_wait_token,OpenFile 增 file_ops() 访问器,shim 两 poll 助手换轨 trait 分派(ppoll/pselect/epoll 调用
+  点零改动)。**S5**(e3b426b4):增 on_set_fl_nonblock/on_last_close 带默认钩子;F_SETFL 特判、close 双相 bolt-on、进程
+  退出批量关闭车道三处换轨 file_ops();ioctl 保留(需 ctx/用户内存,Step 形 trait 无法承载,记账 P3-B)。**S6◐**:删死代码
+  linux_syscall/net.rs(FakeSocket 401 行,mod 从未声明);**范围修订**=D14b park 机械替换+yield_now 忙让步清理移交 LTP
+  环境轮(回归形态是 EINTR/调度时序,本机冒烟不敏感,无裁判不重构;忙让步可能掩护潜在丢唤醒,摘除须 LTP 兜底;S1 双表已
+  打好收敛地基)。**P3-A 特判核销**:read/write✅ poll/epoll✅ F_SETFL✅ close/exit✅;保留=ioctl(P3-B)/splice(语义合法)/
+  socketpair(拍板#4)/D14b(LTP 轮)。**验收**:七冒烟+accept 全绿,seq=close 见证;集合差稳定;boot/la64 过。**Next**:
+  P3-B(模型瘦身/单锁/D7)另立执行文档,或 LTP 环境轮补 D14b+全量回归。**Blocker**:无。
 - 2026-07-03 (P3-A 计划+S1-S3 落地 — R4a 修复/epoll 真阻塞,socket read/write 成一等 file 路径). 计划=REFACTOR_P3_v1.md
   (P3 拆 A/B/C 三波,本波=上半接入 D13/D14)。**S1**(9abf8a9c) R4a 判决修复:两套 wait 注册表错配实锤(socket 载体只进
   subsystems 表,epoll 只查 substrate 表→纯 socket 集合 epoll_wait 立即 0);照抄 eventfd 双表范式(同 id 双表登记+fire
