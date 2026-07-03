@@ -96,9 +96,27 @@ pub fn register_wait_queue(queue: RawQueue) -> u64 {
     register_wait_source(RegisteredWaitSource::RawQueue(queue))
 }
 
+/// Register `queue` under an id minted by the v3 notification-source
+/// namespace (P3-S1). Mirrors [`register_wait_channel_with_id`]: the same
+/// id can then be registered as a substrate `WaitSource`, making the
+/// carrier visible to BOTH `wait_on_token` (this registry) and
+/// `await_wait_source`/epoll (substrate registry).
+pub fn register_wait_queue_with_id(id: u64, queue: RawQueue) {
+    REGISTRY
+        .lock()
+        .insert(id, RegisteredWaitSource::RawQueue(queue));
+}
+
 /// Register an edge-triggered port for wait-source resolution.
 pub fn register_wait_port(port: RawPort) -> u64 {
     register_wait_source(RegisteredWaitSource::RawPort(port))
+}
+
+/// Port sibling of [`register_wait_queue_with_id`] (P3-S1).
+pub fn register_wait_port_with_id(id: u64, port: RawPort) {
+    REGISTRY
+        .lock()
+        .insert(id, RegisteredWaitSource::RawPort(port));
 }
 
 /// Drop the registry's clone of the channel registered under `id`.

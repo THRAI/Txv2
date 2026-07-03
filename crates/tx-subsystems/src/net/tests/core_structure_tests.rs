@@ -707,3 +707,50 @@ fn checks_require_witnesses_preserve_guard_scoped_identity() {
     let poll = require_socket_poll_target(&tcp, &guard).expect("poll witness");
     assert_eq!(poll.identity.raw(), tcp.raw());
 }
+
+/// P3-S1 (R4a) decisive test: socket readiness carriers must be visible
+/// to the SUBSTRATE wait-source registry (the one epoll's
+/// `await_wait_source` looks up) and `fire_*` must wake a substrate
+/// subscriber. Before S1, `lookup_source` returned None for socket
+/// carriers, so `epoll_wait` on a pure-socket set returned 0 immediately
+/// instead of blocking (registry mismatch, audit R4a).
+#[test]
+fn socket_readiness_carriers_visible_to_substrate_registry() {
+    init_zones();
+    let socket = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Tcp,
+        SocketOptionSet::default_tcp(),
+    )
+    .expect("tcp socket");
+
+    use crate::adapter::step_engine::wake;
+
+    for (name, id) in [
+        ("recv", socket.wait_carriers.recv),
+        ("send", socket.wait_carriers.send),
+        ("accept", socket.wait_carriers.accept),
+    ] {
+        assert!(
+            wake::lookup_source(tx_substrate::step::WaitSourceId::new(id)).is_some(),
+            "socket {name} carrier must resolve in the substrate registry (R4a)"
+        );
+    }
+
+    let source = wake::lookup_source(tx_substrate::step::WaitSourceId::new(
+        socket.wait_carriers.recv,
+    ))
+    .expect("recv carrier");
+    let mailbox = alloc::sync::Arc::new(wake::mailbox::TaskMailbox::new());
+    let generation = mailbox.next_generation();
+    let _sub = source.register(
+        alloc::sync::Arc::downgrade(&mailbox),
+        generation,
+        tx_substrate::step::InterestMask::new(RecvWireSet::HAS_DATA.bits()),
+    );
+    assert!(mailbox.poll().is_none(), "no event before fire");
+    socket.readiness.fire_recv(RecvWireSet::HAS_DATA);
+    assert!(
+        mailbox.poll().is_some(),
+        "fire_recv must notify the substrate mirror (epoll wake path)"
+    );
+}

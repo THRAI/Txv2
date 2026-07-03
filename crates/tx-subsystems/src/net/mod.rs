@@ -5,6 +5,7 @@
 //! and net-only execution steps.  Syscall wiring, VFS socket backing,
 //! protocol I/O, and reactor delegate tasks are later slices.
 
+pub(crate) mod adapter;
 pub mod admin;
 pub mod checks;
 pub mod clock;
