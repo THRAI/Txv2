@@ -1,3 +1,116 @@
+- 2026-07-03 LATE (VF2 SHELL FULLY WORKING — P2 COMPLETE; full battle log ljs/11). The fork-command
+  hang had TWO stacked hardware truths, both with standard Linux-kernel treatments: ① the JH7110
+  U74 implements ZERO satp.ASID bits (boot probe: write all-ones, read back — QEMU=16) so every
+  address space shares hardware tag 0 and the fenceless-switch optimization fed the parent shell's
+  stale RO TLB entries to forked children (COW store looped forever). Fix: probe-driven degrade in
+  the rv64 board HAL — satp always ASID 0 + full sfence.vma on every address-space switch; QEMU
+  keeps the tagged fast path untouched; `tx.pmap.asid-bits=N` cmdline forces the degrade lane for
+  QEMU regression. Sentinel `txkernel:pmap:asid-bits=0x..` prints once at first user activation.
+  ② SiFive erratum CIP-1200: address-qualified `sfence.vma addr[, asid]` does NOT reliably
+  invalidate translation caches on U74 — exposed when the second fork reused the first child's
+  freed page-table pages; proven by ISA-impossible evidence (satp==root, full V|R|W|X|U|A|D
+  three-level chain read back in hardware order, per-VA fence every iteration, hardware still
+  faulting 0xf at the same VA). Fix: in degrade mode every per-VA shootdown/commit fence is
+  upgraded to FULL sfence.vma (Linux's CIP-1200 workaround). After both: consecutive ls/cd/mixed
+  commands all pass on the board with each COW fault resolving in exactly one round trip.
+  Methodology that cracked it (for finals reuse): narrowly-gated hardware-truth prints
+  (scause/sepc/stval + satp/root/pte + l2e/l1e/l0e walk-back), QEMU forced-degrade regression,
+  "impossible-per-ISA => check errata", probe hardware capabilities instead of trusting device
+  trees (this U-Boot FDT misdescribes hart0). Left for later: remote (SBI) sfence also needs the
+  CIP-1200 full-flush treatment when SMP unlocks; degrade-mode full-flush cost unmeasured under
+  fork/COW-heavy loads (judge lane unaffected — QEMU tagged path byte-identical).
+- 2026-07-03 (VF2 FIRST BOOT TO SHELL + the remaining blocker reproduced on QEMU). Board bring-up
+  battle log (incidents in ljs/09, ljs/10): ① DTB at 0xfffc5dd0 (U-Boot top-of-RAM) unmapped -> load
+  fault reading FDT header; board-side fix `fdt_high/initrd_high=0x8ff00000` saveenv'd (kernel-side
+  early-map of the DTB gigabyte remains backlog). ② OpenSBI's PMP-protected home at DDR base
+  0x40000000 was registered usable -> allocator memset -> store ACCESS fault (scause 0x7); fixed by
+  parsing /reserved-memory + header memreserve into Reserved regions (Linux's rule; QEMU dumpdtb has
+  neither -> no-op, locked by test). ③ initramfs' real /bin/busybox was EEXIST-shadowed by the
+  earlier-seeded /musl shebang shim symlink -> shims now seed AFTER the initramfs overlay (QEMU
+  busybox lane now boots the initramfs busybox: fallback:path-not-found line GONE). ④ UART input:
+  IrqIf::uart_irq() + IER at index<<reg-shift with reg-io-width write (VF2 irq32/stride4). ⑤
+  SINGLE-CORE BY DEFAULT: userspace pins to one hart by design (init.rs:1935, since 2026-05-21) and
+  the official autotest (external/oscomp-autotest run_qemu.py) compiles via `make all` and runs
+  -smp {config,default 1} with NO -append -> kernel now boots only the BSP unless tx.maxcpus=N
+  (xtask qemu injects it to match --smp; judge unchanged). Bonus: sidesteps the U-Boot control FDT
+  LYING about hart0 (claims u74+sv39+okay for the MMU-less S7 — `fdt print` verified; DTB cpu
+  filtering via mmu-type+status added but untrustworthy on this board). ⑥ possible_cpu_count()
+  contract changed to "id-space bound" (highest possible id + 1, not popcount): VF2 boots on hart 1,
+  and epoch/zone dense per-cpu domains range-check by raw CpuId — sparse mask {1} panicked
+  InvalidCpu; contiguous masks unchanged. **Board state: clean single-core boot to busybox shell,
+  input echo works. Remaining blocker REPRODUCED ON QEMU** (fifo-fed -serial pipe input): typing
+  `ls` in the initramfs-busybox shell -> fork/exec -> panic "zone Cap key no longer resolves to a
+  live slot" (tx-substrate zone/cap.rs) + wild jump to 0xa — the interactive+initramfs-busybox+
+  second-exec path was never exercised before (interactive shells historically came from the ext4
+  disk). Board-independent; debug on QEMU next. Also: `make oscomp-local-rv64` full-regression
+  re-run still owed before any submission push (procfs pid-window fix + eth0-now-initializes both
+  await score confirmation).
+- 2026-07-02 (REGRESSION FIX: ltp-glibc fs_bind_move hang = 16-bit procfs pid window). User's full rv
+  oscomp regression wedged at glibc fs_bind_move01 spamming `cut: /proc/65571/stat: ENOENT` until the
+  lane died. Root cause: PROCFS_PID_DIR_LIMIT=0x10000 while the pid/tid allocator is one shared
+  monotone never-recycling counter — pid 65536+ made /proc/<pid> unresolvable and LTP's watchdog spun.
+  Trigger: eth0 now initializes in the judge lane (slot-probing fix) → net cases run full bodies →
+  more pids burned; ceiling was latent. Fix (tx-fs procfs/mod.rs + process/numbers.rs + init.rs):
+  PROCFS_PID_LIMIT=0x40_0000 (Linux pid_max max), fd/fdinfo stripes re-homed to PID_BASE+0x200/0x600
+  _0000_0000 (old +0x2/0x30000 slots both sat inside a widened window AND self-capped at 64k pids),
+  decoders gained block bounds, 3M one-shot console tripwire via install_pid_tripwire_sink, regression
+  test pid_ids_round_trip_past_16_bit_pids (65571 + boundaries + cross-block isolation). Verified:
+  tx-fs 85/85 single-threaded (parallel-mode sysvipc flake reproduced WITHOUT the fix — pre-existing
+  shared-global test race, logged), rv64 cross-check clean. Full analysis + backlog (bitmap pid
+  allocator per PROCESS_v1; Chronix uses rCore recycle-stack; Linux wraps at pid_max) in
+  ljs/08-pid分配与procfs窗口事故.md. **Awaiting: full oscomp rerun to confirm glibc lane completes.**
+- 2026-07-02 (board bring-up P1.0–P1.2: real-dtb fixtures + device discovery table). Plan: ljs/03 (上板
+  完整计划) + ljs/07 (P1 设备探测化设计); board facts: VF2 8GB V1.3B verified over serial (U-Boot
+  2021.10, OpenSBI v1.2, 5 harts, 4MHz timebase). **P1.0:** boards/dtbs/ fixtures (qemu 9.2.1 rv/la
+  dumpdtb w/ xtask flags + jh7110-v1.3b from Chronix) + fixture host tests. Fixtures immediately caught
+  2 real bugs in rv dtb.rs, both fixed: timebase-frequency read from root only (real trees put it on
+  /cpus — VF2 would have run timers 2.5x off) and count_cpu_nodes name-matching overcount (VF2 /cpus
+  has non-CPU children → 7 instead of 5; now filters device_type=="cpu"). **P1.1:** tx-hal DeviceKind/
+  DeviceInfo + PlatformInfoIf::devices() default-empty trait hook (zero churn at test platforms).
+  **P1.2:** rv dtb.rs parse_devices_from_fdt walks /soc by compatible (virtio,mmio / ns16550a+dw-apb /
+  plic / pci-ecam / jh7110-sdio|mmc|dw-mshc — vendor v1.3b dtb says jh7110-**sdio**, mainline says -mmc,
+  both matched), published via boot_static PLATFORM_DEVICES (cap 24) in publish_boot_info_from_fdt;
+  Platform::devices() serves it. Verified: 87/87 rv-hal host tests (incl. discovery asserts: qemu=8
+  virtio+uart irq10+plic+ecam; vf2=uart reg-shift2/io-width4 irq32, plic@c000000, 2x SD w/ slot
+  0x16020000 irq75, 0 virtio), rv64 cross-check clean, rv64 busybox-boot sentinel OK. Also synced 4
+  stale pre-existing unit-gate tests (tx-ext4 truncate now Done post-iozone-writeback; 3 exec.rs LTP
+  whitelist guards vs 82d66f17 net-fix whitelist adds; fs_bind06.sh substring false-hit → " bind06").
+  **Known pre-existing breakage left alone:** tx-shims lib tests don't compile (missing ITIMER_REAL/
+  NETLINK_XFRM/CLONE_NEWNS imports + dispatch type-annotation errors — predates this work).
+  **P1.3 (same day):** dtb.rs parse_plic_scontexts_from_fdt derives per-hart S-mode PLIC contexts from
+  interrupts-extended (2-pass: cpu-intc phandle->hart, then pair-index=context, irq9=S); published via
+  boot_static PLIC_SCONTEXTS + PLIC phys base from device table (QEMU formula/const as fallback).
+  Fixture asserts: qemu 1/3/5/7, vf2 hart0=None + 2/4/6/8 (QEMU formula wrong on every VF2 hart).
+  Chronix onsite comparison: they skip derivation (enable on ALL contexts + claim at hart*2 empirical) —
+  we derive per spec and keep their-style fallback. **P1.4 (same day):** rv block+net registration is
+  now slot-probing over the device table (Chronix-style probe-what-you-find): boot_static
+  build_mmio_regions publishes a named MmioRegion per discovered device (all 8 virtio slots mapped;
+  "virtio0" name kept; clint static entry retained; legacy qemu_mmio_regions when table empty);
+  tx-drivers VirtioMmioBlock/Net gained from_region() + a no-touch device-type peek (block reused net's
+  peek trick — constructing+dropping MmioTransport resets the device); tx-kernel devices.rs rv paths
+  probe every VirtioMmio entry and register what answers (QEMU slot-ordering quirks no longer matter).
+  LA untouched (empty devices() -> legacy named-region path). Verified: rv-hal 89 + tx-kernel 82 +
+  tx-drivers 5 host tests, rv64 busybox-boot sentinel, la64 -Zbuild-std check clean.
+  **P2 board-prep (same day, while user runs oscomp regression — no QEMU touched):** ① A/D-bit audit
+  CLOSED with no changes needed: encode_leaf_pte unconditionally sets V|A|D (sole leaf encoder; protect
+  path re-encodes through it; boot-asm leaves carry A|D; pmap/tests.rs:279 already locks it). ② xtask
+  `image vf2-uimage [--release]`: objcopy->raw bin + mkimage uImage @0x80200000 (Chronix command),
+  outputs target/images/txv2-vf2.{bin,uimage} + prints tftpboot/bootm lines; needs u-boot-tools
+  (mkimage) installed. ③ VF2 low-memory direct-map coverage: pmap cover_direct_map_low_from_bag writes
+  1G root leaves below the bootstrap base and lowers published mapped/direct_map facts, hooked in
+  publish_boot_info_from_fdt after region parse (identity live, root writable); QEMU no-op. Host test
+  low_memory_regions_extend_direct_map_downward (root slot 257 leaf + lowered facts) green; rv-hal 90
+  host tests + rv64 cross-check clean.
+  **UART input de-QEMU-ification (same day):** IrqIf gained `fn uart_irq()` (defaults to the UART_IRQ
+  const; rv board overrides with the probed device-table irq — VF2 uart0 is 32, QEMU 10);
+  install_irq_handlers consumes uart_irq(); enable_uart_rx_irq derives the IER address from the
+  probed uart (index 1 << reg-shift, reg-io-width-sized write — VF2 dw-apb is 32-bit @ stride 4,
+  QEMU byte-adjacent) with const fallback. rv-hal 90 + tx-kernel 82 host tests, rv64 + la64
+  cross-checks clean; QEMU busybox smoke + interactive-input check pending (user's oscomp regression
+  owns QEMU). **Next:** oscomp regression verdict (watch: eth0 now initializes in the judge lane —
+  previously blk/net both gambled on "virtio0" and only one lane's device won); QEMU smoke; then
+  on-board tftpboot bring-up (needs u-boot-tools for `cargo xtask image vf2-uimage`); P1.5 la64
+  parity deferred.
 - 2026-06-18 (6-suite regression sweep vs main — 0 regressions, 4 lanes, many improvements). User asked to
   regression-test basic/busybox/libctest/libcbench/lmbench/iozone vs main (main "已经测试过了"), on BOTH
   musl AND glibc lanes. Method: per-suite selector boots `tx.oscomp.groups=<suite>-{musl,glibc}` with

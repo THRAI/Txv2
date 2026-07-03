@@ -242,6 +242,42 @@ pub struct PlatformInfo {
     pub possible_cpu_count: usize,
 }
 
+/// Kind of platform device a board publishes for generic device
+/// registration. Boards derive entries from their firmware-provided
+/// device tree (or static knowledge); the FDT itself never crosses
+/// the HAL boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeviceKind {
+    /// 16550-family UART (ns16550a, snps,dw-apb-uart, ...).
+    Uart,
+    /// Platform interrupt controller (RISC-V PLIC / LoongArch extioi).
+    IntController,
+    /// virtio-mmio transport slot.
+    VirtioMmio,
+    /// PCI host bridge ECAM window.
+    PciEcam,
+    /// SD/MMC host controller (DesignWare MSHC on VisionFive 2).
+    SdController,
+}
+
+/// One discovered platform device, published through
+/// [`PlatformInfoIf::devices`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeviceInfo {
+    pub kind: DeviceKind,
+    /// Register window (physical).
+    pub mmio: PhysRange,
+    /// Platform interrupt number wired to the parent interrupt
+    /// controller, when the node declares one.
+    pub irq: Option<u32>,
+    /// 16550-style register stride from `reg-shift` (log2 bytes);
+    /// 0 for byte-adjacent registers.
+    pub reg_shift: u8,
+    /// 16550-style register access width in bytes from
+    /// `reg-io-width`; 1 for byte registers (QEMU), 4 on dw-apb.
+    pub reg_io_width: u8,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArchAuxvFacts {
     pub page_size: usize,
@@ -323,6 +359,14 @@ pub trait BootInfoIf {
 
 pub trait PlatformInfoIf {
     fn platform_info() -> &'static PlatformInfo;
+
+    /// Platform devices discovered at boot (typically from the
+    /// firmware-provided device tree). Defaults to none so mock and
+    /// test platforms need no wiring; boards with device discovery
+    /// override this.
+    fn devices() -> &'static [DeviceInfo] {
+        &[]
+    }
 }
 
 pub trait AuxvIf: PlatformConfig {
@@ -1145,6 +1189,14 @@ pub trait IrqIf {
     /// §"Open questions #6".
     const UART_IRQ: u32 = 0;
 
+    /// Runtime UART IRQ number. Defaults to the static constant;
+    /// boards with device-tree discovery override this to serve the
+    /// probed value (QEMU virt wires the UART at 10, VisionFive 2 at
+    /// 32 — same kernel, different trees).
+    fn uart_irq() -> u32 {
+        Self::UART_IRQ
+    }
+
     fn in_irq_context() -> bool {
         false
     }
@@ -1316,8 +1368,18 @@ pub trait SmpIf {
         CpuMask::single(CpuId(0))
     }
 
+    /// Size of the possible-CPU **id space**: highest possible cpu id
+    /// plus one — deliberately NOT the population count. Dense-index
+    /// consumers (epoch/zone per-cpu domains) allocate and range-check
+    /// per-cpu slots by raw `CpuId`, and real boards boot on a
+    /// non-zero hart (VisionFive 2's BSP is hart 1), so a sparse mask
+    /// like {1} must report 2, and {1,2,3} must report 4. For
+    /// contiguous masks starting at 0 (QEMU, host tests) this equals
+    /// the count, so existing platforms see no change. Popcount
+    /// consumers should use `possible_cpus().count()` directly.
     fn possible_cpu_count() -> usize {
-        Self::possible_cpus().count()
+        let bits = Self::possible_cpus().bits();
+        (u64::BITS - bits.leading_zeros()) as usize
     }
 
     fn online_cpu_count() -> usize {

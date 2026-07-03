@@ -251,10 +251,23 @@ impl VmPmap {
         let mut replaced = false;
         if let Some(existing) = state.mappings.get(&page) {
             if existing.ppn == ppn && existing.prot == prot {
-                return Ok(PmapPublishOutcome {
-                    page,
-                    replaced: false,
-                });
+                if !replace_existing {
+                    // Idempotent republish from non-fault callers:
+                    // nothing to do.
+                    return Ok(PmapPublishOutcome {
+                        page,
+                        replaced: false,
+                    });
+                }
+                // Fault context (replace_existing) with bookkeeping
+                // claiming the requested mapping is already in place:
+                // the hardware fault is proof that the REAL PTE (or a
+                // cached translation) disagrees with our state. A
+                // TLB-flush-only self-heal was NOT sufficient on the
+                // zero-ASID U74 (second `ls` still looped a stack
+                // store, 2026-07-03), which indicts the in-memory PTE
+                // itself. Do not trust the bookkeeping — fall through
+                // to the full unmap+commit+fence rewrite below.
             }
             if !replace_existing {
                 return Err(VmPmapError::MappingMismatch);

@@ -157,7 +157,7 @@ fn dispatch_table_static() -> &'static IrqDispatchTable {
 /// the platform. One-shot; called from `init.rs` after
 /// `register_console_hardware` has populated the `CONSOLE_TTY` slot.
 pub(crate) fn install_irq_handlers<P: IrqIf + ConsoleIf>() {
-    let irq = <P as IrqIf>::UART_IRQ;
+    let irq = <P as IrqIf>::uart_irq();
     register_irq_handler(irq, uart_rx_irq_handler::<P>);
     <P as IrqIf>::install_dispatch_table(dispatch_table_static());
     <P as IrqIf>::set_priority(irq, 1);

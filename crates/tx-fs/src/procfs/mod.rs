@@ -24,7 +24,7 @@ use tx_subsystems::vfs::structure::StructPayload;
 
 // Fixed procfs node IDs live in the 0x7071_6Fxx block, deliberately BELOW
 // `PROCFS_PID_BASE` (0x7072_0000). They must never fall inside the per-pid dir
-// window [PROCFS_PID_BASE, PROCFS_PID_BASE + PROCFS_PID_DIR_LIMIT): a shared id
+// window [PROCFS_PID_BASE, PROCFS_PID_BASE + PROCFS_PID_LIMIT): a shared id
 // makes `/proc/<pid>` alias a fixed file node, so `/proc/<pid>/stat` returns
 // ENOTDIR. That hung LTP fs_bind once pids climbed into the old 0x7072_6Fxx
 // block (pid 28416+). Keep fixed nodes in 0x7071_6Fxx; never put one at 0x7072_.
@@ -171,8 +171,15 @@ fn ipv4_conf_kind(id: FsObjectId) -> Option<u8> {
     }
 }
 const PROCFS_PID_BASE: u64 = 0x7072_0000;
-// `/proc/<pid>` directory ids occupy [PROCFS_PID_BASE, PROCFS_PID_BASE + PROCFS_PID_DIR_LIMIT).
-const PROCFS_PID_DIR_LIMIT: u64 = 0x10000;
+// Ceiling for pid-keyed procfs ids (`/proc/<pid>` dirs and the fd/fdinfo
+// stripes). 4M matches Linux's maximum pid_max. This MUST comfortably exceed
+// any real pid: the kernel's pid/tid allocator is one shared monotone counter
+// that never recycles, so a full OSComp suite burns ~100k+ ids in one boot.
+// The old ceiling was 0x10000 — at pid 65536 `/proc/<pid>` stopped resolving
+// (ENOENT), and LTP's shell watchdog spun forever polling `/proc/<pid>/stat`,
+// wedging the whole ltp-glibc lane at fs_bind_move01 (2026-07-02 regression).
+const PROCFS_PID_LIMIT: u64 = 0x40_0000;
+// `/proc/<pid>` directory ids occupy [PROCFS_PID_BASE, PROCFS_PID_BASE + PROCFS_PID_LIMIT).
 // Per-pid scalar pseudo-files (stat/cmdline/mem/maps/exe). Each file type owns a
 // distinct region wide enough for any u32 pid (PROCFS_PID_FILE_SPAN), and the
 // regions are spaced far apart so `id = base + pid` never aliases across types or
@@ -195,12 +202,19 @@ const PROCFS_EXE_BASE: u64 = PROCFS_PID_BASE + 0x70_0000_0000;
 // `/proc/<pid>/smaps` (re-homed from main; LTP mlock05/mlock201/mlock203 read
 // it to confirm pages are `lck` after `mlock`). Distinct 4 GiB-per-pid slot.
 const PROCFS_SMAPS_BASE: u64 = PROCFS_PID_BASE + 0x90_0000_0000;
-const PROCFS_FD_OFFSET: u64 = 0x20000;
-const PROCFS_FDINFO_OFFSET: u64 = 0x30000;
+// `/proc/<pid>/fd` and `/proc/<pid>/fdinfo` stripes: each pid owns a 0x10000
+// slot (dir at +0, entries at +1+fd), so a block must span
+// PROCFS_PID_LIMIT * 0x10000 = 0x400_0000_0000. The old scheme parked these at
+// PID_BASE+0x20000/+0x30000 — which both capped pids at 65536 (the interleaved
+// stripes relied on it) and sat INSIDE any widened pid-dir window. Re-homed to
+// spacious blocks above every other region.
+const PROCFS_FD_BASE: u64 = PROCFS_PID_BASE + 0x200_0000_0000;
+const PROCFS_FDINFO_BASE: u64 = PROCFS_PID_BASE + 0x600_0000_0000;
+const PROCFS_FD_STRIPE: u64 = 0x10000;
+const PROCFS_FD_BLOCK_SPAN: u64 = PROCFS_PID_LIMIT * PROCFS_FD_STRIPE;
 // `/proc/<pid>/{uid_map,gid_map,setgroups}` (user-namespace map writes used by
-// LTP netns setup). Sits in a dedicated id region far above the fd/fdinfo space
-// (which spans up to ~PID_BASE+0x1_0003_xxxx because it keys pid in the high
-// bits) so these ids never alias the stat/fd inode ids. Three files per pid:
+// LTP netns setup). Sits in a dedicated id region so these ids never alias the
+// stat/fd inode ids. Three files per pid:
 // pid*4 + {0=uid_map, 1=gid_map, 2=setgroups}.
 const PROCFS_USERNS_BASE: u64 = PROCFS_PID_BASE + 0x2_0000_0000;
 pub const fn pid_uid_map_id(pid: Pid) -> FsObjectId {
@@ -391,19 +405,17 @@ const fn pid_exe_id(pid: Pid) -> FsObjectId {
     FsObjectId::new(PROCFS_EXE_BASE + pid.0 as u64)
 }
 const fn pid_fd_dir_id(pid: Pid) -> FsObjectId {
-    FsObjectId::new(PROCFS_PID_BASE + PROCFS_FD_OFFSET + (pid.0 as u64 * 0x10000))
+    FsObjectId::new(PROCFS_FD_BASE + (pid.0 as u64 * PROCFS_FD_STRIPE))
 }
 #[allow(dead_code)] // txdoc:vfs-full-bringup-scaffold
 const fn pid_fd_id(pid: Pid, fd: u32) -> FsObjectId {
-    FsObjectId::new(PROCFS_PID_BASE + PROCFS_FD_OFFSET + (pid.0 as u64 * 0x10000) + 1 + fd as u64)
+    FsObjectId::new(PROCFS_FD_BASE + (pid.0 as u64 * PROCFS_FD_STRIPE) + 1 + fd as u64)
 }
 const fn pid_fdinfo_dir_id(pid: Pid) -> FsObjectId {
-    FsObjectId::new(PROCFS_PID_BASE + PROCFS_FDINFO_OFFSET + (pid.0 as u64 * 0x10000))
+    FsObjectId::new(PROCFS_FDINFO_BASE + (pid.0 as u64 * PROCFS_FD_STRIPE))
 }
 const fn pid_fdinfo_id(pid: Pid, fd: u32) -> FsObjectId {
-    FsObjectId::new(
-        PROCFS_PID_BASE + PROCFS_FDINFO_OFFSET + (pid.0 as u64 * 0x10000) + 1 + fd as u64,
-    )
+    FsObjectId::new(PROCFS_FDINFO_BASE + (pid.0 as u64 * PROCFS_FD_STRIPE) + 1 + fd as u64)
 }
 pub fn pid_from_mem_id(id: FsObjectId) -> Option<Pid> {
     let r = id.as_u64();
@@ -439,20 +451,22 @@ pub fn pid_from_exe_id(id: FsObjectId) -> Option<Pid> {
 }
 fn pid_from_fd_dir(id: FsObjectId) -> Option<Pid> {
     let r = id.as_u64();
-    let base = PROCFS_PID_BASE + PROCFS_FD_OFFSET;
-    if r >= base && r < base + (0x10000 * 0x10000) && (r - base).is_multiple_of(0x10000) {
-        Some(Pid(((r - base) / 0x10000) as u32))
+    if r >= PROCFS_FD_BASE
+        && r < PROCFS_FD_BASE + PROCFS_FD_BLOCK_SPAN
+        && (r - PROCFS_FD_BASE).is_multiple_of(PROCFS_FD_STRIPE)
+    {
+        Some(Pid(((r - PROCFS_FD_BASE) / PROCFS_FD_STRIPE) as u32))
     } else {
         None
     }
 }
 fn pid_from_fd_id(id: FsObjectId) -> Option<(Pid, u32)> {
     let r = id.as_u64();
-    let base = PROCFS_PID_BASE + PROCFS_FD_OFFSET + 1;
-    if r >= base {
+    let base = PROCFS_FD_BASE + 1;
+    if r >= base && r < PROCFS_FD_BASE + PROCFS_FD_BLOCK_SPAN {
         let offset = r - base;
-        let pid = Pid((offset / 0x10000) as u32);
-        let fd = (offset % 0x10000) as u32;
+        let pid = Pid((offset / PROCFS_FD_STRIPE) as u32);
+        let fd = (offset % PROCFS_FD_STRIPE) as u32;
         Some((pid, fd))
     } else {
         None
@@ -460,20 +474,22 @@ fn pid_from_fd_id(id: FsObjectId) -> Option<(Pid, u32)> {
 }
 fn pid_from_fdinfo_dir(id: FsObjectId) -> Option<Pid> {
     let r = id.as_u64();
-    let base = PROCFS_PID_BASE + PROCFS_FDINFO_OFFSET;
-    if r >= base && r < base + (0x10000 * 0x10000) && (r - base).is_multiple_of(0x10000) {
-        Some(Pid(((r - base) / 0x10000) as u32))
+    if r >= PROCFS_FDINFO_BASE
+        && r < PROCFS_FDINFO_BASE + PROCFS_FD_BLOCK_SPAN
+        && (r - PROCFS_FDINFO_BASE).is_multiple_of(PROCFS_FD_STRIPE)
+    {
+        Some(Pid(((r - PROCFS_FDINFO_BASE) / PROCFS_FD_STRIPE) as u32))
     } else {
         None
     }
 }
 pub fn pid_from_fdinfo_id(id: FsObjectId) -> Option<(Pid, u32)> {
     let r = id.as_u64();
-    let base = PROCFS_PID_BASE + PROCFS_FDINFO_OFFSET + 1;
-    if r >= base {
+    let base = PROCFS_FDINFO_BASE + 1;
+    if r >= base && r < PROCFS_FDINFO_BASE + PROCFS_FD_BLOCK_SPAN {
         let offset = r - base;
-        let pid = Pid((offset / 0x10000) as u32);
-        let fd = (offset % 0x10000) as u32;
+        let pid = Pid((offset / PROCFS_FD_STRIPE) as u32);
+        let fd = (offset % PROCFS_FD_STRIPE) as u32;
         Some((pid, fd))
     } else {
         None
@@ -482,7 +498,7 @@ pub fn pid_from_fdinfo_id(id: FsObjectId) -> Option<(Pid, u32)> {
 
 pub fn pid_from_dir(id: FsObjectId) -> Option<Pid> {
     let r = id.as_u64();
-    if r > PROCFS_PID_BASE && r < PROCFS_PID_BASE + PROCFS_PID_DIR_LIMIT {
+    if r > PROCFS_PID_BASE && r < PROCFS_PID_BASE + PROCFS_PID_LIMIT {
         Some(Pid((r - PROCFS_PID_BASE) as u32))
     } else {
         None
@@ -1541,6 +1557,55 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::sync::{LazyLock, Mutex};
+
+    /// Regression for the 2026-07-02 judge hang: pid 65571 (just past the
+    /// old 0x10000 ceiling) stopped resolving as a /proc/<pid> dir, and
+    /// LTP's watchdog spun on /proc/<pid>/stat until the lane died. All
+    /// pid-keyed encodings must round-trip well past 16 bits, and ids
+    /// from different blocks must never cross-decode.
+    #[test]
+    fn pid_ids_round_trip_past_16_bit_pids() {
+        // Pure id arithmetic, but hold the same serialization lock as the
+        // other procfs tests so this doesn't perturb their scheduling.
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for pid in [1u32, 65_535, 65_571, 100_000, (PROCFS_PID_LIMIT - 1) as u32] {
+            let pid = Pid(pid);
+            assert_eq!(pid_from_dir(pid_dir_id(pid)), Some(pid), "dir {pid:?}");
+            assert_eq!(
+                pid_from_stat_id(pid_stat_id(pid)),
+                Some(pid),
+                "stat {pid:?}"
+            );
+            assert_eq!(pid_from_fd_dir(pid_fd_dir_id(pid)), Some(pid), "fd dir");
+            assert_eq!(pid_from_fd_id(pid_fd_id(pid, 42)), Some((pid, 42)), "fd");
+            assert_eq!(
+                pid_from_fdinfo_dir(pid_fdinfo_dir_id(pid)),
+                Some(pid),
+                "fdinfo dir"
+            );
+            assert_eq!(
+                pid_from_fdinfo_id(pid_fdinfo_id(pid, 7)),
+                Some((pid, 7)),
+                "fdinfo"
+            );
+        }
+
+        // Past the ceiling: dir id must NOT decode (and the ceiling is
+        // far above any pid a full suite can burn).
+        let over = Pid(PROCFS_PID_LIMIT as u32);
+        assert_eq!(pid_from_dir(pid_dir_id(over)), None);
+
+        // Cross-block isolation at a high pid: no decoder claims another
+        // block's ids.
+        let pid = Pid(100_000);
+        assert_eq!(pid_from_fd_id(pid_dir_id(pid)), None);
+        assert_eq!(pid_from_dir(pid_fd_dir_id(pid)), None);
+        assert_eq!(pid_from_fd_dir(pid_fdinfo_dir_id(pid)), None);
+        assert_eq!(pid_from_fdinfo_dir(pid_fd_dir_id(pid)), None);
+        assert_eq!(pid_from_dir(pid_uid_map_id(pid)), None);
+        assert_eq!(pid_from_dir(pid_status_id(pid)), None);
+        assert_eq!(pid_from_stat_id(pid_fd_dir_id(pid)), None);
+    }
     use tx_hal::{
         Arch, Asid, PhysAddr, PlatformConfig, PmapError, PmapIf, PmapReservation, PmapReserveKind,
         PmapRoot, PmapUnmapResult, PtNode, VirtAddr,

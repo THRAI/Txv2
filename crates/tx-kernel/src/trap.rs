@@ -439,6 +439,7 @@ fn write_usize<P: TxPlatform>(value: usize) {
     write_u64::<P>(value as u64);
 }
 
+
 fn write_u64<P: TxPlatform>(value: u64) {
     if value == 0 {
         tx_hal::console_write_str::<P>("0");

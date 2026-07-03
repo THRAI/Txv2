@@ -1121,10 +1121,8 @@ fn log_user_segv<P: TxPlatform>(
     kind: &str,
     error: tx_subsystems::vm::VmFaultError,
 ) {
-    let pc = payload
-        .saved_user_context()
-        .map(|ctx| ctx.pc as u64)
-        .unwrap_or(0);
+    let ctx = payload.saved_user_context();
+    let pc = ctx.as_ref().map(|c| c.pc as u64).unwrap_or(0);
     tx_hal::console_write_str::<P>("txkernel:");
     tx_hal::console_write_str::<P>(P::BOARD);
     tx_hal::console_write_str::<P>(":user-segv:");
@@ -1142,6 +1140,21 @@ fn log_user_segv<P: TxPlatform>(
     write_hex_u64::<P>(pc);
     tx_hal::console_write_str::<P>(":addr=0x");
     write_hex_u64::<P>(fault_addr);
+    // DIAG (board ls-crash): ra/sp/a0/a1/a2 to tell "bad entry PC" from
+    // "ran a few instrs then jumped wild", and to inspect the stack ptr
+    // and first args the loader/_start received.
+    if let Some(c) = ctx.as_ref() {
+        tx_hal::console_write_str::<P>(":ra=0x");
+        write_hex_u64::<P>(c.regs[1] as u64);
+        tx_hal::console_write_str::<P>(":sp=0x");
+        write_hex_u64::<P>(c.regs[2] as u64);
+        tx_hal::console_write_str::<P>(":a0=0x");
+        write_hex_u64::<P>(c.regs[10] as u64);
+        tx_hal::console_write_str::<P>(":a1=0x");
+        write_hex_u64::<P>(c.regs[11] as u64);
+        tx_hal::console_write_str::<P>(":a2=0x");
+        write_hex_u64::<P>(c.regs[12] as u64);
+    }
     tx_hal::console_write_str::<P>("\n");
 }
 

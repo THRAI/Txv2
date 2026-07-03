@@ -35,14 +35,15 @@ impl<P: TxPlatform> CoreInit<P> {
     /// scores 0/N (libctest 0/220, lua 0/9 in the 2026-05-18
     /// scoreboard — see `docs/progress/SYSCALL_STATUS.md`).
     ///
-    /// **Order invariant:** must run after
-    /// [`Self::mount_sdcard_at_musl`] so `/musl/musl/busybox` is a
-    /// reachable target (symlink resolution happens at exec time,
-    /// not at symlink-creation time, so the order isn't strictly
-    /// required for the symlink to succeed — but if the target's
-    /// mount isn't yet attached the very first exec attempt fails,
-    /// not a later one). Runs after [`Self::mount_procfs_at_proc`]
-    /// so its sentinel comes first in the boot log.
+    /// **Order invariant (updated 2026-07-02):** must run after
+    /// [`Self::mount_sdcard_at_musl`] (so the `/musl/musl/busybox`
+    /// target is attachable) AND after
+    /// `register_initramfs_if_present` — the cpio's REAL
+    /// `/bin/busybox` must land first so these shims EEXIST-skip it.
+    /// Seeding the shims earlier made the initramfs unpack skip its
+    /// busybox, and boards without a block device (VF2 before the SD
+    /// driver) then resolved `/bin/busybox` to a dead `/musl` target
+    /// and lost the initramfs shell entirely.
     ///
     /// Failures are non-fatal — the helper logs a sentinel and
     /// returns. The kernel boots; the libctest / lua suites stay

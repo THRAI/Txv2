@@ -59,10 +59,7 @@ fn for_each_console_byte_for_sbi(bytes: &[u8], mut emit: impl FnMut(u8)) {
 const QEMU_VIRT_RAM_BASE: usize = 0x8000_0000;
 const QEMU_VIRT_FALLBACK_RAM_SIZE: usize = 256 * 1024 * 1024;
 const MAX_BOOT_CPUS: usize = 4;
-#[cfg(target_arch = "riscv64")]
-const PLIC_PHYS_BASE: usize = 0x0c00_0000;
-#[cfg(target_arch = "riscv64")]
-const PLIC_BASE: usize = pmap_topology::DIRECT_MAP_BASE + PLIC_PHYS_BASE;
+pub(crate) const PLIC_PHYS_BASE: usize = 0x0c00_0000;
 /// QEMU virt machine's NS16550-compatible UART. PLIC IRQ 10
 /// ([`IrqIf::UART_IRQ`]) is wired to this UART, but the device
 /// itself only raises RX-data-available IRQs when its IER (offset
@@ -321,6 +318,10 @@ impl PlatformInfoIf for Platform {
     fn platform_info() -> &'static PlatformInfo {
         BootStaticBag::<IdentityDropped>::global_ref().platform_info_ref()
     }
+
+    fn devices() -> &'static [tx_hal::DeviceInfo] {
+        BootStaticBag::<IdentityDropped>::global_ref().platform_devices_ref()
+    }
 }
 
 impl AuxvIf for Platform {
@@ -474,23 +475,35 @@ impl PmapIf for Platform {
     /// user mappings), and every user-mode instruction fetch would
     /// fault forever.
     fn activate_user_pmap(root: &PmapRoot) {
+        let asid_usable = hw_asid_tagging_usable();
         mark_asid_resident_on_current_cpu(root.asid());
         #[cfg(target_arch = "riscv64")]
         unsafe {
             const SATP_MODE_SV39: usize = 0x8 << 60;
             let ppn = root.phys().0 >> 12;
-            let asid = root.asid().0 as usize;
+            // Zero-/narrow-ASID hardware (VF2 U74 implements 0 bits):
+            // hardware would truncate the tag anyway; write 0 so the
+            // fast-path compare below stays meaningful (a readback of
+            // a truncated field would otherwise never equal our
+            // computed satp and force the slow path every entry).
+            let asid = if asid_usable {
+                root.asid().0 as usize
+            } else {
+                0
+            };
             let satp = SATP_MODE_SV39 | (asid << 44) | ppn;
             // Fast path: returning to the same address space (the common
             // syscall return). No CSR write, no fence — TLB entries for
-            // this ASID are still valid.
+            // this root are still valid (per-ASID on tagged hardware; on
+            // degraded hardware the flush-on-switch below guarantees the
+            // TLB only ever holds the current space's entries).
             let current: usize;
             core::arch::asm!("csrr {satp}, satp", satp = out(reg) current, options(nomem, nostack));
             if current == satp {
                 return;
             }
-            // Different root/ASID: write satp WITHOUT a global sfence.vma.
-            // Correctness per the RISC-V privileged spec:
+            // Different root: write satp. On ASID-tagged hardware (QEMU:
+            // 16 bits) no fence is needed per the privileged spec:
             //  - TLB entries are ASID-tagged; switching ASIDs needs no fence.
             //  - Invalid (V=0) PTEs are never cached, so invalid→valid map
             //    commits are picked up by the next hardware walk unfenced
@@ -507,17 +520,33 @@ impl PmapIf for Platform {
                 satp = in(reg) satp,
                 options(nostack)
             );
+            // Degraded (zero-ASID) hardware: every space shares tag 0,
+            // so the previous space's entries are live for this one —
+            // flush on switch (board `ls` fork/COW loop root cause,
+            // 2026-07-03). QEMU never takes this branch.
+            if !asid_usable {
+                core::arch::asm!("sfence.vma", options(nostack));
+            }
         }
         #[cfg(not(target_arch = "riscv64"))]
-        let _ = root;
+        let _ = (root, asid_usable);
     }
 }
 impl IrqIf for Platform {
     const MAX_IRQ: u32 = PLIC_MAX_IRQ;
 
     /// QEMU `virt` machine's 16550 UART is wired at PLIC IRQ 10.
-    /// Source: `qemu/hw/riscv/virt.c::UART0_IRQ`.
+    /// Source: `qemu/hw/riscv/virt.c::UART0_IRQ`. Fallback only —
+    /// `uart_irq()` serves the device-tree value when one was probed.
     const UART_IRQ: u32 = 10;
+
+    /// Device-tree probed UART IRQ (VisionFive 2 wires uart0 at 32,
+    /// QEMU virt at 10); constant fallback when no table was parsed.
+    fn uart_irq() -> u32 {
+        uart_device_info()
+            .and_then(|uart| uart.irq)
+            .unwrap_or(Self::UART_IRQ)
+    }
 
     fn in_irq_context() -> bool {
         irq_context_depth() != 0
@@ -671,7 +700,29 @@ impl SmpIf for Platform {
     }
 
     fn possible_cpus() -> CpuMask {
-        CpuMask::first(Self::platform_info().possible_cpu_count.min(MAX_BOOT_CPUS))
+        // SINGLE-CORE BY DEFAULT: the userspace scheduling contract
+        // is single-hart until cross-hart handoff lands, and the
+        // judge lane has always run -smp 1. More cores are an
+        // explicit opt-in via `tx.maxcpus=N` on the boot cmdline
+        // (xtask qemu injects it to match --smp; boards simply omit
+        // it). This also sidesteps firmware trees that misdescribe
+        // cpu topology — the VF2 U-Boot FDT claims hart0 (physically
+        // an MMU-less S7) is an S-mode-capable u74.
+        let requested = max_cpus_from_cmdline().unwrap_or(1);
+        if requested <= 1 {
+            return CpuMask::single(current_cpu_id());
+        }
+        // Opt-in multi-core: DTB-derived S-mode-capable harts
+        // (Linux's mmu-type + status rule), falling back to the
+        // count-prefix mask, capped by the request and the boot-asm
+        // stack budget. The boot hart always stays in the set.
+        let dtb_mask = boot_static::startable_harts();
+        let base = if dtb_mask != 0 {
+            CpuMask::from_bits(dtb_mask & CpuMask::first(MAX_BOOT_CPUS).bits())
+        } else {
+            CpuMask::first(Self::platform_info().possible_cpu_count.min(MAX_BOOT_CPUS))
+        };
+        limit_cpus(base, requested, current_cpu_id())
     }
 
     fn online_cpus() -> CpuMask {
@@ -1040,11 +1091,143 @@ fn valid_plic_irq(irq: u32) -> bool {
     irq != 0 && irq < PLIC_MAX_IRQ
 }
 
+/// Parse `tx.maxcpus=N` from the boot cmdline. Boards without a
+/// cmdline (host tests, missing chosen node) get `None` = no cap.
+///
+/// Rationale: the VF2 U-Boot control FDT MISDESCRIBES hart0 (claims
+/// u74-mc + mmu-type sv39 + status okay for what is physically an
+/// MMU-less S7 monitor core — verified with `fdt print /cpus/cpu@0`
+/// on the board, 2026-07-02), so device-tree cpu filtering cannot be
+/// trusted there. The cmdline knob sidesteps firmware-tree lies and
+/// also enforces the single-core requirement while userspace
+/// cross-hart handoff remains unfinished.
+fn max_cpus_from_cmdline() -> Option<usize> {
+    let cmdline = BootStaticBag::<IdentityDropped>::global_ref()
+        .boot_info_ref()
+        .cmdline?;
+    for token in cmdline.split_whitespace() {
+        if let Some(value) = token.strip_prefix("tx.maxcpus=") {
+            return value.parse().ok();
+        }
+    }
+    None
+}
+
+/// Keep at most `limit` cpus from `base`, always retaining `keep`
+/// (the boot hart), then lowest hart ids first.
+fn limit_cpus(base: CpuMask, limit: usize, keep: CpuId) -> CpuMask {
+    let mut bits = 0u64;
+    let mut taken = 0usize;
+    if base.contains(keep) {
+        bits |= CpuMask::single(keep).bits();
+        taken = 1;
+    }
+    for cpu in 0..u64::BITS as usize {
+        if taken >= limit {
+            break;
+        }
+        let cpu = CpuId(cpu);
+        if cpu == keep || !base.contains(cpu) {
+            continue;
+        }
+        bits |= CpuMask::single(cpu).bits();
+        taken += 1;
+    }
+    CpuMask::from_bits(bits)
+}
+
+/// Hardware-implemented `satp.ASID` width in bits, probed once via
+/// Linux's boot trick: write all-ones into the WARL ASID field, read
+/// back, count surviving bits (`usize::MAX` = not probed yet).
+///
+/// Board reality (2026-07-03, `ls`-loop root cause): the VF2's
+/// JH7110 U74 implements **zero** ASID bits — hardware truncates
+/// every satp ASID write, so ALL address spaces share hardware tag 0
+/// and the "ASID-tagged TLB entries need no fence on address-space
+/// switch" fast path is physically void there: a parent shell's
+/// stale read-only TLB entry stays live for the forked child at the
+/// same VA, and the child's COW store faults forever (asid-qualified
+/// sfences can't name the truncated tag either). QEMU implements the
+/// full 16 bits, which hid all of this. When the implemented width
+/// cannot represent `pmap::ASID_CAPACITY`, we degrade: satp always
+/// carries ASID 0, every address-space switch issues a full local
+/// `sfence.vma`, and per-VA shootdowns flush across all ASIDs — the
+/// scheme Chronix/Del0n1x use unconditionally on this board.
+static HW_ASID_BITS: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+fn hw_asid_bits() -> usize {
+    let cached = HW_ASID_BITS.load(Ordering::Relaxed);
+    if cached != usize::MAX {
+        return cached;
+    }
+    let mut probed = probe_hw_asid_bits();
+    // Debug knob: `tx.pmap.asid-bits=N` caps the detected width so the
+    // zero-ASID degrade path (VF2 U74 reality) can be exercised and
+    // debugged under QEMU, which implements the full 16 bits.
+    if let Some(forced) = asid_bits_cap_from_cmdline() {
+        probed = probed.min(forced);
+    }
+    HW_ASID_BITS.store(probed, Ordering::Relaxed);
+    #[cfg(target_arch = "riscv64")]
+    {
+        trap::console_write_literal(b"txkernel:pmap:asid-bits=0x");
+        trap::console_write_hex(probed);
+        trap::console_write_literal(b"\n");
+    }
+    probed
+}
+
+#[cfg(target_arch = "riscv64")]
+fn probe_hw_asid_bits() -> usize {
+    unsafe {
+        let orig: usize;
+        core::arch::asm!("csrr {0}, satp", out(reg) orig, options(nomem, nostack));
+        let probe = orig | (0xFFFFusize << 44);
+        let read: usize;
+        core::arch::asm!("csrw satp, {0}", in(reg) probe, options(nostack));
+        core::arch::asm!("csrr {0}, satp", out(reg) read, options(nomem, nostack));
+        core::arch::asm!("csrw satp, {0}", in(reg) orig, options(nostack));
+        core::arch::asm!("sfence.vma", options(nostack));
+        ((read >> 44) & 0xFFFF).count_ones() as usize
+    }
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+fn probe_hw_asid_bits() -> usize {
+    // Host builds have no satp; report the full RISC-V field width so
+    // host tests exercise the (QEMU-equivalent) tagged fast path.
+    16
+}
+
+/// True when the hardware ASID width can uniquely tag our whole
+/// software ASID space; false = degrade to flush-on-switch.
+pub(crate) fn hw_asid_tagging_usable() -> bool {
+    hw_asid_bits() >= pmap::ASID_CAPACITY.trailing_zeros() as usize
+}
+
+fn asid_bits_cap_from_cmdline() -> Option<usize> {
+    let cmdline = BootStaticBag::<IdentityDropped>::global_ref()
+        .boot_info_ref()
+        .cmdline?;
+    for token in cmdline.split_whitespace() {
+        if let Some(value) = token.strip_prefix("tx.pmap.asid-bits=") {
+            return value.parse().ok();
+        }
+    }
+    None
+}
+
 fn current_plic_context() -> usize {
     plic_context_for_cpu(current_cpu_id())
 }
 
 fn plic_context_for_cpu(cpu: CpuId) -> usize {
+    // Device-tree derived S-mode context when boot resolved one (on
+    // VF2 hart0 has no S context and the formula below is wrong for
+    // every hart); QEMU virt formula as fallback.
+    if let Some(context) = boot_static::plic_scontext_for_hart(cpu.0) {
+        return context as usize;
+    }
     cpu.0.saturating_mul(2).saturating_add(1)
 }
 
@@ -1087,13 +1270,18 @@ fn plic_set_enabled(context: usize, irq: u32, enabled: bool) {
 }
 
 #[cfg(target_arch = "riscv64")]
+fn plic_virt_base() -> usize {
+    pmap_topology::DIRECT_MAP_BASE + boot_static::plic_phys_base()
+}
+
+#[cfg(target_arch = "riscv64")]
 fn plic_read_u32(offset: usize) -> u32 {
-    unsafe { ((PLIC_BASE + offset) as *const u32).read_volatile() }
+    unsafe { ((plic_virt_base() + offset) as *const u32).read_volatile() }
 }
 
 #[cfg(target_arch = "riscv64")]
 fn plic_write_u32(offset: usize, value: u32) {
-    unsafe { ((PLIC_BASE + offset) as *mut u32).write_volatile(value) };
+    unsafe { ((plic_virt_base() + offset) as *mut u32).write_volatile(value) };
 }
 
 /// Enable the 16550 UART's "received-data-available" interrupt
@@ -1111,15 +1299,40 @@ fn plic_write_u32(offset: usize, value: u32) {
 ///
 /// Idempotent: writing IER and `csrs` instructions just set the
 /// same bits.
+/// First probed UART from the published device table (None on boards
+/// without a table, e.g. before FDT parse or in host tests).
+fn uart_device_info() -> Option<tx_hal::DeviceInfo> {
+    BootStaticBag::<IdentityDropped>::global_ref()
+        .platform_devices_ref()
+        .iter()
+        .copied()
+        .find(|device| device.kind == tx_hal::DeviceKind::Uart)
+}
+
 #[cfg(target_arch = "riscv64")]
 fn enable_uart_rx_irq() {
-    // 16550 IER offset = 1; bit 0 = ERBFI (Enable Received Data
-    // Available Interrupt).
-    const UART_IER_OFFSET: usize = 1;
+    // 16550 IER register index = 1; bit 0 = ERBFI (Enable Received
+    // Data Available Interrupt). Real 16550 derivatives place it at
+    // index << reg-shift with reg-io-width-sized registers: QEMU's
+    // ns16550a is byte-adjacent (shift 0, width 1), VF2's dw-apb-uart
+    // uses 32-bit registers at stride 4 (shift 2, width 4).
+    const UART_IER_INDEX: usize = 1;
     const UART_IER_ERBFI: u8 = 0x01;
+    let (uart_base, reg_shift, reg_io_width) = match uart_device_info() {
+        Some(uart) => (
+            pmap_topology::DIRECT_MAP_BASE + uart.mmio.start.0,
+            uart.reg_shift as usize,
+            uart.reg_io_width,
+        ),
+        None => (UART_BASE, 0, 1),
+    };
     unsafe {
-        let ier = (UART_BASE + UART_IER_OFFSET) as *mut u8;
-        ier.write_volatile(UART_IER_ERBFI);
+        let ier_addr = uart_base + (UART_IER_INDEX << reg_shift);
+        if reg_io_width == 4 {
+            (ier_addr as *mut u32).write_volatile(u32::from(UART_IER_ERBFI));
+        } else {
+            (ier_addr as *mut u8).write_volatile(UART_IER_ERBFI);
+        }
 
         // sie |= SEIE (bit 9) and sstatus |= SIE (bit 1).
         let seie = 1usize << 9;
@@ -1416,15 +1629,27 @@ pub(crate) fn remote_sfence_vma_asid_batch(asid: Asid, invalidations: &[PmapInva
 
     #[cfg(target_arch = "riscv64")]
     {
+        let asid_usable = hw_asid_tagging_usable();
         for invalidation in invalidations {
-            let error = sbi_remote_sfence_vma_asid(
-                targets.bits(),
-                0,
-                invalidation.virt().0,
-                invalidation.size(),
-                asid.0 as usize,
-            );
-            assert_eq!(error, 0, "SBI remote sfence.vma.asid failed");
+            let error = if asid_usable {
+                sbi_remote_sfence_vma_asid(
+                    targets.bits(),
+                    0,
+                    invalidation.virt().0,
+                    invalidation.size(),
+                    asid.0 as usize,
+                )
+            } else {
+                // Zero-ASID hardware: remote harts can't match the
+                // truncated tag either; use the unqualified form.
+                sbi_remote_sfence_vma(
+                    targets.bits(),
+                    0,
+                    invalidation.virt().0,
+                    invalidation.size(),
+                )
+            };
+            assert_eq!(error, 0, "SBI remote sfence.vma failed");
         }
     }
 
@@ -1562,6 +1787,20 @@ impl BootStaticBag<IdentityLive> {
         cmdline.fill(0);
 
         let parsed = parse_boot_info_from_fdt(dtb_addr, memory_regions, cmdline);
+
+        let devices = unsafe { self.platform_devices_mut() };
+        let device_count = unsafe { dtb::parse_devices_from_fdt(dtb_addr, &mut devices[..]) };
+        self.publish_platform_device_count(device_count);
+
+        if let Some(plic) = devices[..device_count]
+            .iter()
+            .find(|device| device.kind == tx_hal::DeviceKind::IntController)
+        {
+            self.publish_plic_phys_base(plic.mmio.start.0);
+        }
+        let scontexts = unsafe { self.plic_scontexts_mut() };
+        unsafe { dtb::parse_plic_scontexts_from_fdt(dtb_addr, scontexts) };
+
         let (memory_region_count, initrd, cmdline_len, timebase_frequency_hz, possible_cpu_count) =
             if let Some(parsed) = parsed {
                 (
@@ -1583,6 +1822,34 @@ impl BootStaticBag<IdentityLive> {
             };
         self.publish_timebase_frequency_hz(timebase_frequency_hz);
         self.publish_possible_cpu_count(possible_cpu_count);
+        if let Some(parsed) = parsed {
+            self.publish_startable_harts(parsed.startable_harts);
+        }
+
+        // Firmware-reserved RAM (OpenSBI's PMP-protected home, exposed
+        // via /reserved-memory + the header memreserve block) must be
+        // excluded before the allocator plans metadata placement. On
+        // VF2 the firmware sits at the very bottom of DDR.
+        let reserved_count = unsafe {
+            dtb::parse_reserved_regions_from_fdt(
+                dtb_addr,
+                &mut memory_regions[memory_region_count..],
+            )
+        };
+        let memory_region_count = memory_region_count + reserved_count;
+
+        // Boards like the VisionFive 2 report DDR from 0x4000_0000; the
+        // asm boot tables only cover the QEMU gigabyte at 0x8000_0000.
+        // Add the missing low direct-map leaves before anyone allocates
+        // from those regions. No-op on QEMU.
+        if let Some(lowest) = memory_regions[..memory_region_count]
+            .iter()
+            .map(|region| region.base.0)
+            .min()
+        {
+            let _ = pmap::cover_direct_map_low_from_bag(self, PhysAddr(lowest));
+        }
+
         let memory_region_count =
             reserve_firmware_loader_region(memory_regions, memory_region_count);
 

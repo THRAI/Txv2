@@ -2907,9 +2907,11 @@ mod tests {
         assert!(!cmd.contains("prot_hsymlinks"));
         assert!(!cmd.contains("rt_sigaction01"));
         assert!(!cmd.contains("sysconf01"));
-        assert!(!cmd.contains("recvmsg01"));
+        // Network cases restored to the submit whitelist by the 2026-06
+        // network-leak fixes (82d66f17): now expected present.
+        assert!(cmd.contains("recvmsg01"));
+        assert!(cmd.contains("setsockopt02"));
         assert!(!cmd.contains("sendmsg01"));
-        assert!(!cmd.contains("setsockopt02"));
         assert!(!cmd.contains("setsockopt06"));
         assert!(cmd.contains("lua_testcode.sh"));
         assert!(cmd.contains("netperf_testcode.sh"));
@@ -2975,8 +2977,11 @@ mod tests {
         assert!(cmd.contains("prctl08"));
         assert!(cmd.contains(" write01"));
         assert!(cmd.contains("io_uring01"));
-        assert!(!cmd.contains("recvmsg01"));
-        assert!(!cmd.contains("setsockopt02"));
+        // Network cases restored to both submit whitelists by the 2026-06
+        // network-leak fixes (82d66f17): now expected in musl and glibc
+        // sections alike.
+        assert!(cmd.contains("recvmsg01"));
+        assert!(cmd.contains("setsockopt02"));
         assert!(!cmd.contains("prot_hsymlinks"));
         assert!(!cmd.contains("rt_sigaction01"));
         assert!(!cmd.contains("sysconf01"));
@@ -2984,21 +2989,23 @@ mod tests {
         let glibc_start = cmd
             .find("#### OS COMP TEST GROUP START ltp-glibc ####")
             .unwrap();
-        assert!(!cmd[..glibc_start].contains("fcntl36_64"));
-        assert!(!cmd[..glibc_start].contains("fcntl36"));
-        assert!(!cmd[..glibc_start].contains("getsockopt02"));
-        assert!(!cmd[..glibc_start].contains("bind03"));
+        assert!(cmd[..glibc_start].contains("fcntl36_64"));
+        assert!(cmd[..glibc_start].contains("fcntl36"));
+        assert!(cmd[..glibc_start].contains("getsockopt02"));
+        assert!(cmd[..glibc_start].contains("bind03"));
         #[cfg(target_arch = "loongarch64")]
         assert!(cmd[..glibc_start].contains("readv01"));
-        assert!(!cmd[glibc_start..].contains("fcntl36_64"));
-        assert!(!cmd[glibc_start..].contains("fcntl36"));
+        assert!(cmd[glibc_start..].contains("fcntl36_64"));
+        assert!(cmd[glibc_start..].contains("fcntl36"));
         #[cfg(target_arch = "loongarch64")]
         assert!(cmd[glibc_start..].contains("readv01"));
-        assert!(!cmd[glibc_start..].contains("getsockopt02"));
+        assert!(cmd[glibc_start..].contains("getsockopt02"));
         assert!(!cmd[glibc_start..].contains("sendto03"));
         assert!(!cmd[glibc_start..].contains("recv01"));
-        assert!(!cmd[glibc_start..].contains("bind03"));
-        assert!(!cmd.contains("bind06"));
+        assert!(cmd[glibc_start..].contains("bind03"));
+        // Leading space keeps this from matching the fs_bind06.sh
+        // whitelist entry — bind06 itself must stay excluded.
+        assert!(!cmd.contains(" bind06"));
         assert!(!cmd.contains("sendmsg01"));
         assert!(!cmd.contains("socketcall01"));
         assert!(!cmd.contains("setsockopt06"));
@@ -3016,17 +3023,19 @@ mod tests {
             cmd.contains("; cd /musl/glibc; echo \"#### OS COMP TEST GROUP START ltp-glibc ####\"")
         );
         assert!(!cmd.contains("#### OS COMP TEST GROUP START ltp-musl ####"));
-        assert!(!cmd.contains("fcntl36"));
-        assert!(!cmd.contains("fcntl36_64"));
+        // fcntl36/getsockopt02/setsockopt02/bind03 joined the glibc final
+        // list with the 2026-06 network-leak fixes (82d66f17).
+        assert!(cmd.contains("fcntl36"));
+        assert!(cmd.contains("fcntl36_64"));
         #[cfg(target_arch = "loongarch64")]
         assert!(cmd.contains("readv01"));
         assert!(cmd.contains("socket01"));
         assert!(cmd.contains("prctl08"));
-        assert!(!cmd.contains("getsockopt02"));
-        assert!(!cmd.contains("setsockopt02"));
+        assert!(cmd.contains("getsockopt02"));
+        assert!(cmd.contains("setsockopt02"));
         assert!(!cmd.contains("sendto03"));
         assert!(!cmd.contains("recv01"));
-        assert!(!cmd.contains("bind03"));
+        assert!(cmd.contains("bind03"));
         assert!(!cmd.contains("setsockopt06"));
     }
 

@@ -306,6 +306,10 @@ fn qemu_command(
         args.push("-no-shutdown".into());
     }
 
+    // The kernel is single-core by default (userspace contract);
+    // wanting the harts QEMU provides is expressed explicitly so
+    // `--smp N` lanes keep exercising SMP.
+    let maxcpus_suffix = format!(" tx.maxcpus={}", qemu_smp(target, options));
     if matches!(profile, Profile::Busybox | Profile::Alpine) {
         let initramfs_name = match profile {
             Profile::Busybox => busybox_initramfs_name(target),
@@ -321,10 +325,11 @@ fn qemu_command(
             (Profile::Alpine, _) => "tx.profile=alpine init=/bin/sh console=ttyS0",
             (Profile::Smoke, _) => unreachable!("handled by outer profile match"),
         };
+        let cmdline = format!("{cmdline}{maxcpus_suffix}");
         args.push("-initrd".into());
         args.push(initramfs.display().to_string());
         args.push("-append".into());
-        args.push(cmdline.into());
+        args.push(cmdline.clone());
         if target == TxTarget::La64Qemu {
             args.push("-fw_cfg".into());
             args.push(format!("name=opt/tx.cmdline,string={cmdline}"));
@@ -337,8 +342,9 @@ fn qemu_command(
         } else {
             "tx.profile=smoke console=ttyS0"
         };
+        let cmdline = format!("{cmdline}{maxcpus_suffix}");
         args.push("-append".into());
-        args.push(cmdline.into());
+        args.push(cmdline.clone());
         if target == TxTarget::La64Qemu {
             args.push("-fw_cfg".into());
             args.push(format!("name=opt/tx.cmdline,string={cmdline}"));

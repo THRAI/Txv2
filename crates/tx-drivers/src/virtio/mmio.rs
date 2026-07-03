@@ -27,8 +27,41 @@ pub enum VirtioMmioError {
     Device,
 }
 
+/// Where a virtio-mmio driver finds its register window: a named
+/// PlatformInfo region (legacy static boards) or a concrete region
+/// handed over from the discovered device table.
+#[derive(Clone, Copy)]
+pub(crate) enum RegionSource {
+    Name(&'static str),
+    Region(MmioRegion),
+}
+
+const VIRTIO_MMIO_MAGIC: u32 = 0x7472_6976;
+const VIRTIO_MMIO_DEVICE_ID_OFFSET: usize = 0x08;
+
+/// Read a virtio-mmio slot's device type without constructing a
+/// transport: constructing and then dropping an `MmioTransport`
+/// resets the device, which would wipe out whatever driver already
+/// owns the slot. `None` means no virtio device (bad magic) or an
+/// unknown device id.
+pub(crate) fn peek_device_type(
+    region: MmioRegion,
+) -> Option<virtio_drivers::transport::DeviceType> {
+    let base = region.virt.start.0 as *const u8;
+    if base.is_null() {
+        return None;
+    }
+    let magic = unsafe { core::ptr::read_volatile(base.cast::<u32>()) };
+    if magic != VIRTIO_MMIO_MAGIC {
+        return None;
+    }
+    let device_id =
+        unsafe { core::ptr::read_volatile(base.add(VIRTIO_MMIO_DEVICE_ID_OFFSET).cast::<u32>()) };
+    virtio_drivers::transport::DeviceType::try_from(device_id).ok()
+}
+
 pub struct VirtioMmioBlock<P: TxPlatform> {
-    mmio_region_name: &'static str,
+    region_source: RegionSource,
     inner: SpinMutex<Option<VirtIOBlk<TxVirtioHal<P>, MmioTransport<'static>>>>,
     initialized: AtomicBool,
     total_blocks: AtomicU64,
@@ -46,8 +79,18 @@ unsafe impl<P: TxPlatform> Sync for VirtioMmioBlock<P> {}
 
 impl<P: TxPlatform> VirtioMmioBlock<P> {
     pub const fn new(mmio_region_name: &'static str) -> Self {
+        Self::with_source(RegionSource::Name(mmio_region_name))
+    }
+
+    /// Build a block driver directly on a discovered device's region
+    /// (device-table registration path; no name lookup involved).
+    pub const fn from_region(region: MmioRegion) -> Self {
+        Self::with_source(RegionSource::Region(region))
+    }
+
+    const fn with_source(region_source: RegionSource) -> Self {
         Self {
-            mmio_region_name,
+            region_source,
             inner: SpinMutex::new(None),
             initialized: AtomicBool::new(false),
             total_blocks: AtomicU64::new(0),
@@ -61,7 +104,15 @@ impl<P: TxPlatform> VirtioMmioBlock<P> {
             return Ok(());
         }
 
-        let region = mmio_region::<P>(self.mmio_region_name)?;
+        let region = match self.region_source {
+            RegionSource::Name(name) => mmio_region::<P>(name)?,
+            RegionSource::Region(region) => region,
+        };
+        // Only claim slots that actually host a block device — probing a
+        // net slot (or an empty one) must not touch it.
+        if peek_device_type(region) != Some(virtio_drivers::transport::DeviceType::Block) {
+            return Err(VirtioMmioError::Device);
+        }
         let header = NonNull::new(region.virt.start.0 as *mut VirtIOHeader)
             .ok_or(VirtioMmioError::NullHeader)?;
 

@@ -13,8 +13,11 @@ use crate::Result;
 
 pub(crate) fn image(root: &Path, args: Vec<String>) -> Result<()> {
     let Some(kind) = args.first() else {
-        return Err("image command needs a kind: cpio, initramfs, or ext4".into());
+        return Err("image command needs a kind: cpio, initramfs, ext4, or vf2-uimage".into());
     };
+    if kind.as_str() == "vf2-uimage" {
+        return image_vf2_uimage(root, &args[1..]);
+    }
     let profile = Profile::parse(&option_value(&args[1..], "--profile")?)?;
     let target = image_target(&args[1..])?;
     match (kind.as_str(), profile) {
@@ -37,6 +40,129 @@ pub(crate) fn image(root: &Path, args: Vec<String>) -> Result<()> {
             "unknown image kind '{other}', expected cpio, ext4, or m1dock-sd"
         )),
     }
+}
+
+/// VF2 U-Boot load/entry address. Intentionally the QEMU link address:
+/// VF2 DDR spans 0x4000_0000..(+2..8 GiB), so 0x8020_0000 is valid RAM
+/// there and the same kernel binary boots QEMU and the board (see
+/// ljs/03-上板完整计划.md P2; proven by Chronix onsite).
+const VF2_LOAD_ADDR: &str = "0x80200000";
+
+/// Package the rv64 kernel ELF as a VF2 boot artifact: strip to a raw
+/// binary, then wrap as a U-Boot uImage (mkimage -T kernel).
+///
+///   cargo xtask build --target rv64-qemu [--release]
+///   cargo xtask image vf2-uimage [--release]
+///   cp target/images/txv2-vf2.uimage /srv/tftp/
+///   # U-Boot:  tftpboot 0x80200000 txv2-vf2.uimage
+///   #          bootm 0x80200000 - ${fdtcontroladdr}
+fn image_vf2_uimage(root: &Path, args: &[String]) -> Result<()> {
+    let release = args.iter().any(|arg| arg == "--release");
+    let kernel = TxTarget::Rv64Qemu.kernel_path_for_profile(root, release);
+    if !kernel.exists() {
+        return Err(format!(
+            "kernel ELF not found at {}; run `cargo xtask build --target rv64-qemu{}` first",
+            kernel.display(),
+            if release { " --release" } else { "" }
+        ));
+    }
+
+    let objcopy = [
+        "rust-objcopy",
+        "llvm-objcopy",
+        "riscv64-unknown-elf-objcopy",
+        "riscv64-linux-gnu-objcopy",
+    ]
+    .into_iter()
+    .find(|program| command_exists(program))
+    .ok_or("no objcopy found; install cargo-binutils (rust-objcopy) or llvm/riscv binutils")?;
+    if !command_exists("mkimage") {
+        return Err("mkimage not found; install u-boot-tools".into());
+    }
+
+    let out_dir = root.join("target").join("images");
+    fs::create_dir_all(&out_dir).map_err(|err| err.to_string())?;
+    let bin = out_dir.join("txv2-vf2.bin");
+    let uimage = out_dir.join("txv2-vf2.uimage");
+
+    run_cmd_owned(
+        root,
+        objcopy,
+        &[
+            "--strip-all".to_string(),
+            "-O".to_string(),
+            "binary".to_string(),
+            kernel.display().to_string(),
+            bin.display().to_string(),
+        ],
+    )?;
+    run_cmd_owned(
+        root,
+        "mkimage",
+        &[
+            "-A".to_string(),
+            "riscv".to_string(),
+            "-O".to_string(),
+            "linux".to_string(),
+            "-T".to_string(),
+            "kernel".to_string(),
+            "-C".to_string(),
+            "none".to_string(),
+            "-a".to_string(),
+            VF2_LOAD_ADDR.to_string(),
+            "-e".to_string(),
+            VF2_LOAD_ADDR.to_string(),
+            "-n".to_string(),
+            "Txv2".to_string(),
+            "-d".to_string(),
+            bin.display().to_string(),
+            uimage.display().to_string(),
+        ],
+    )?;
+
+    // Wrap the busybox initramfs as a legacy uImage ramdisk when one
+    // has been built: `bootm <kernel> <ramdisk> <fdt>` with a wrapped
+    // ramdisk is unambiguous on the VF2's 2021.10 U-Boot, unlike the
+    // raw `addr:size` notation (only board-proven with booti).
+    let initramfs = out_dir.join(busybox_initramfs_name(TxTarget::Rv64Qemu));
+    let initrd_uimage = out_dir.join("txv2-vf2-initrd.uimage");
+    let have_initrd = initramfs.exists();
+    if have_initrd {
+        run_cmd_owned(
+            root,
+            "mkimage",
+            &[
+                "-A".to_string(),
+                "riscv".to_string(),
+                "-O".to_string(),
+                "linux".to_string(),
+                "-T".to_string(),
+                "ramdisk".to_string(),
+                "-C".to_string(),
+                "none".to_string(),
+                "-n".to_string(),
+                "Txv2-initrd".to_string(),
+                "-d".to_string(),
+                initramfs.display().to_string(),
+                initrd_uimage.display().to_string(),
+            ],
+        )?;
+    }
+
+    println!("vf2 uimage ready: {}", uimage.display());
+    if have_initrd {
+        println!("vf2 initrd ready: {}", initrd_uimage.display());
+        println!("next: cp {} {} /srv/tftp/", uimage.display(), initrd_uimage.display());
+        println!("U-Boot> tftpboot {VF2_LOAD_ADDR} txv2-vf2.uimage");
+        println!("U-Boot> tftpboot 0x88300000 txv2-vf2-initrd.uimage");
+        println!("U-Boot> bootm {VF2_LOAD_ADDR} 0x88300000 ${{fdtcontroladdr}}");
+    } else {
+        println!("(no busybox initramfs found; build with `cargo xtask image cpio --profile busybox --target rv64-qemu` for an interactive shell)");
+        println!("next: cp {} /srv/tftp/", uimage.display());
+        println!("U-Boot> tftpboot {VF2_LOAD_ADDR} txv2-vf2.uimage");
+        println!("U-Boot> bootm {VF2_LOAD_ADDR} - ${{fdtcontroladdr}}");
+    }
+    Ok(())
 }
 
 pub(crate) fn busybox_initramfs_name(target: TxTarget) -> String {

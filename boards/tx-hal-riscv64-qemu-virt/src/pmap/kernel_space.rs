@@ -403,6 +403,78 @@ pub(super) fn direct_map_phys_end_from_bag<State>(
         .ok_or(PmapError::InvalidRequest)
 }
 
+pub(super) fn direct_map_phys_start_from_bag<State>(
+    bag: &BootStaticBag<State>,
+) -> Result<usize, PmapError> {
+    let Some(info) = bag.bootstrap_pmap_info_ref() else {
+        return Err(PmapError::InvalidRequest);
+    };
+    info.direct_map
+        .start
+        .0
+        .checked_sub(info.direct_map_base.0)
+        .ok_or(PmapError::InvalidRequest)
+}
+
+/// Cover RAM below the bootstrap direct-map start with 1 GiB leaves.
+///
+/// The boot page tables only map the QEMU-virt gigabyte at
+/// 0x8000_0000, but boards like the VisionFive 2 report DDR from
+/// 0x4000_0000 in their device tree. Called while boot facts are
+/// being published (identity still live, root writable): writes the
+/// missing root leaves and lowers the published direct_map/mapped
+/// ranges so the substrate coverage check and frame allocator see the
+/// real span. No-op on QEMU (regions start at the current base).
+pub(crate) fn cover_direct_map_low_from_bag<State>(
+    bag: &BootStaticBag<State>,
+    lowest_phys: PhysAddr,
+) -> Result<(), PmapError> {
+    let current_start = direct_map_phys_start_from_bag(bag)?;
+    let new_start = lowest_phys.0 - (lowest_phys.0 % SUPERPAGE_1G_SIZE);
+    if new_start >= current_start {
+        return Ok(());
+    }
+
+    let mut phys = new_start;
+    while phys < current_start {
+        let virt = direct_map_virt(phys);
+        let expected = encode_leaf_pte(PhysAddr(phys), PTE_R | PTE_W | PTE_G);
+        let root = unsafe { bag.bootstrap_root_mut() };
+        let slot = &mut root.0[rv64_1g_leaf_index(virt)];
+        if *slot == 0 {
+            *slot = expected;
+        } else if *slot != expected {
+            return Err(PmapError::AlreadyMapped);
+        }
+        phys = phys
+            .checked_add(SUPERPAGE_1G_SIZE)
+            .ok_or(PmapError::InvalidRequest)?;
+    }
+
+    unsafe {
+        lower_bootstrap_direct_map_info(bag, new_start, current_start);
+    }
+    sfence_vma_all();
+    Ok(())
+}
+
+unsafe fn lower_bootstrap_direct_map_info<State>(
+    bag: &BootStaticBag<State>,
+    new_start: usize,
+    old_start: usize,
+) {
+    let grown = old_start - new_start;
+    unsafe {
+        let Some(info) = bag.bootstrap_pmap_info_mut().as_mut() else {
+            return;
+        };
+        info.direct_map.start = VirtAddr(info.direct_map_base.0 + new_start);
+        info.direct_map.size += grown;
+        info.mapped.start = PhysAddr(new_start);
+        info.mapped.size += grown;
+    }
+}
+
 unsafe fn extend_bootstrap_direct_map_info<State>(bag: &BootStaticBag<State>, phys_end: usize) {
     unsafe {
         let Some(info) = bag.bootstrap_pmap_info_mut().as_mut() else {

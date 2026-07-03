@@ -107,6 +107,19 @@ pub fn root_mount() -> Option<Cap<MountIdentity>> {
     ROOT_MOUNT.lock().clone()
 }
 
+/// One-shot console alarm installed via
+/// `tx_subsystems::process::numbers::install_pid_tripwire_sink`. Fires
+/// when the monotone pid/tid counter crosses 3M in a single boot —
+/// 75% of the procfs pid-id window. See ljs/08-pid分配与procfs窗口事故.md.
+fn pid_tripwire_warning<P: TxPlatform>() {
+    tx_hal::console_write_str::<P>("txkernel:");
+    tx_hal::console_write_str::<P>(P::BOARD);
+    tx_hal::console_write_str::<P>(
+        ":pid:tripwire:3145728: pid space 75% of procfs window (0x400000); \
+         monotone allocator never recycles — reboot before exhaustion\n",
+    );
+}
+
 fn init_mount_namespace() -> Option<Cap<MountNamespace>> {
     tx_subsystems::process::init_process()?.mount_namespace_cap()
 }
@@ -316,7 +329,13 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::mount_sysfs_at_sys();
             Self::mount_bdevfs_at_dev_block();
             Self::mount_sdcard_at_musl();
-            Self::populate_rootfs_shebang_shims();
+            // populate_rootfs_shebang_shims moved to run AFTER
+            // register_initramfs_if_present (see bootstrap exec stage):
+            // seeding /bin/{sh,busybox} -> /musl/musl/busybox symlinks
+            // here made the initramfs unpack EEXIST-skip its REAL
+            // busybox, so boards without a block device (VF2 before the
+            // SD driver) resolved /bin/busybox to a dead /musl target
+            // and lost the initramfs shell (2026-07-02 on-board find).
             Self::populate_rootfs_tmp_dirs();
             Self::populate_rootfs_identity_files();
             Self::populate_rootfs_kernel_config();
@@ -353,6 +372,13 @@ impl<P: TxPlatform> CoreInit<P> {
         // The local `Cap` returned by `bootstrap_init_process` is
         // dropped at end-of-scope; `INIT_PROCESS` retains the strong
         // reference for the entire kernel lifetime.
+        // Pid-space tripwire: the shared pid/tid counter is monotone
+        // (no recycling); if a single boot burns 3M ids we are 75% of
+        // the way to the procfs pid-id window (0x40_0000) where
+        // /proc/<pid> stops resolving. Make that ceiling loud instead
+        // of a silent LTP watchdog hang.
+        tx_subsystems::process::numbers::install_pid_tripwire_sink(pid_tripwire_warning::<P>);
+
         let aspace =
             tx_subsystems::vm::AddressSpace::new_cap_for_platform::<P>().expect("init aspace");
         let _init = tx_subsystems::process::bootstrap_init_process(aspace).expect("bootstrap init");
@@ -1552,6 +1578,12 @@ impl<P: TxPlatform> CoreInit<P> {
         // wins. Entries unique to the cpio (e.g. `/bin/busybox`,
         // `/bin/sh` symlink) get added.
         Self::register_initramfs_if_present();
+        // Shebang shims AFTER the initramfs overlay: symlink_into
+        // EEXIST-skips names the cpio already provided, so a real
+        // initramfs busybox wins over the /musl/musl/busybox shim
+        // (which only resolves once a block device backs /musl).
+        // Without an initramfs the shims land exactly as before.
+        Self::populate_rootfs_shebang_shims();
         Self::drive_bootstrap_exec();
     }
 

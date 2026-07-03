@@ -2,8 +2,8 @@ use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 
 use tx_hal::{
-    BootInfo, BootstrapPmapInfo, MemoryRegion, MemoryRegionKind, MmioFlags, MmioRegion, PhysAddr,
-    PhysRange, PlatformConfig, PlatformInfo, VirtAddr, VirtRange,
+    BootInfo, BootstrapPmapInfo, DeviceInfo, DeviceKind, MemoryRegion, MemoryRegionKind, MmioFlags,
+    MmioRegion, PhysAddr, PhysRange, PlatformConfig, PlatformInfo, VirtAddr, VirtRange,
 };
 
 use crate::pmap::topology::{
@@ -13,9 +13,35 @@ use crate::pmap::topology::{
 use crate::time::QEMU_VIRT_FALLBACK_TIMEBASE_HZ;
 use crate::Platform;
 
-pub(crate) const MAX_MEMORY_REGIONS: usize = 8;
+// Usable DTB memory nodes + /reserved-memory children + header
+// memreserve entries + the firmware-loader reservation all share this
+// array; vendor board trees carry several reserved nodes.
+pub(crate) const MAX_MEMORY_REGIONS: usize = 16;
 pub(crate) const CMDLINE_CAPACITY: usize = 16384;
 pub(crate) const BOOTSTRAP_PMAP_RESERVED_RANGES: usize = 4;
+// QEMU virt publishes 11 recognised nodes (8x virtio-mmio + uart +
+// plic + pci ecam); VF2 publishes fewer. Headroom for board dtbs.
+pub(crate) const MAX_PLATFORM_DEVICES: usize = 24;
+// One MmioRegion per discovered device, plus the static clint entry
+// (the clint has no DeviceKind but its MMIO must stay mapped).
+const GENERATED_MMIO_REGIONS: usize = MAX_PLATFORM_DEVICES + 1;
+
+// &'static names for generated regions, indexed per kind in tree
+// order. "virtio0" intentionally matches the legacy static name.
+const VIRTIO_REGION_NAMES: [&str; 12] = [
+    "virtio0", "virtio1", "virtio2", "virtio3", "virtio4", "virtio5", "virtio6", "virtio7",
+    "virtio8", "virtio9", "virtio10", "virtio11",
+];
+const UART_REGION_NAMES: [&str; 6] = ["uart0", "uart1", "uart2", "uart3", "uart4", "uart5"];
+const SDIO_REGION_NAMES: [&str; 4] = ["sdio0", "sdio1", "sdio2", "sdio3"];
+
+const EMPTY_DEVICE: DeviceInfo = DeviceInfo {
+    kind: DeviceKind::Uart,
+    mmio: PhysRange::empty(),
+    irq: None,
+    reg_shift: 0,
+    reg_io_width: 1,
+};
 
 pub(crate) struct IdentityLive;
 pub(crate) struct IdentityDropped;
@@ -117,8 +143,13 @@ struct BootstrapPmapInfoCell(UnsafeCell<Option<BootstrapPmapInfo>>);
 struct CmdlineCell(UnsafeCell<[u8; CMDLINE_CAPACITY]>);
 struct MemoryRegionsCell(UnsafeCell<[MemoryRegion; MAX_MEMORY_REGIONS]>);
 struct PlatformInfoCell(UnsafeCell<PlatformInfo>);
-struct PlatformMmioRegionsCell(UnsafeCell<[MmioRegion; 4]>);
+struct PlatformMmioRegionsCell(UnsafeCell<[MmioRegion; GENERATED_MMIO_REGIONS]>);
 struct TimebaseFrequencyCell(UnsafeCell<u64>);
+struct PlatformDevicesCell(UnsafeCell<[DeviceInfo; MAX_PLATFORM_DEVICES]>);
+struct PlatformDeviceCountCell(UnsafeCell<usize>);
+struct PlicScontextsCell(UnsafeCell<[Option<u32>; crate::dtb::MAX_PLIC_HARTS]>);
+struct PlicPhysBaseCell(UnsafeCell<usize>);
+struct StartableHartsCell(UnsafeCell<u64>);
 struct PossibleCpuCountCell(UnsafeCell<usize>);
 struct ReservedPageTablesCell(UnsafeCell<[PhysRange; BOOTSTRAP_PMAP_RESERVED_RANGES]>);
 struct PageTableCell(UnsafeCell<PageTable>);
@@ -133,6 +164,11 @@ unsafe impl Sync for MemoryRegionsCell {}
 unsafe impl Sync for PlatformInfoCell {}
 unsafe impl Sync for PlatformMmioRegionsCell {}
 unsafe impl Sync for TimebaseFrequencyCell {}
+unsafe impl Sync for PlatformDevicesCell {}
+unsafe impl Sync for PlatformDeviceCountCell {}
+unsafe impl Sync for PlicScontextsCell {}
+unsafe impl Sync for PlicPhysBaseCell {}
+unsafe impl Sync for StartableHartsCell {}
 unsafe impl Sync for PossibleCpuCountCell {}
 unsafe impl Sync for ReservedPageTablesCell {}
 unsafe impl Sync for PageTableCell {}
@@ -152,10 +188,42 @@ static PLATFORM_INFO: PlatformInfoCell = PlatformInfoCell(UnsafeCell::new(Platfo
     timebase_frequency_hz: QEMU_VIRT_FALLBACK_TIMEBASE_HZ,
     possible_cpu_count: 1,
 }));
-static PLATFORM_MMIO_REGIONS: PlatformMmioRegionsCell =
-    PlatformMmioRegionsCell(UnsafeCell::new([empty_mmio_region(); 4]));
+static PLATFORM_MMIO_REGIONS: PlatformMmioRegionsCell = PlatformMmioRegionsCell(UnsafeCell::new(
+    [empty_mmio_region(); GENERATED_MMIO_REGIONS],
+));
 static TIMEBASE_FREQUENCY_HZ: TimebaseFrequencyCell =
     TimebaseFrequencyCell(UnsafeCell::new(QEMU_VIRT_FALLBACK_TIMEBASE_HZ));
+static PLATFORM_DEVICES: PlatformDevicesCell =
+    PlatformDevicesCell(UnsafeCell::new([EMPTY_DEVICE; MAX_PLATFORM_DEVICES]));
+static PLATFORM_DEVICE_COUNT: PlatformDeviceCountCell =
+    PlatformDeviceCountCell(UnsafeCell::new(0));
+static PLIC_SCONTEXTS: PlicScontextsCell =
+    PlicScontextsCell(UnsafeCell::new([None; crate::dtb::MAX_PLIC_HARTS]));
+static PLIC_PHYS_BASE_PUBLISHED: PlicPhysBaseCell =
+    PlicPhysBaseCell(UnsafeCell::new(crate::PLIC_PHYS_BASE));
+static STARTABLE_HARTS: StartableHartsCell = StartableHartsCell(UnsafeCell::new(0));
+
+/// DTB-derived bitmap of S-mode-capable harts (0 = no data; callers
+/// fall back to the possible_cpu_count prefix mask).
+pub(crate) fn startable_harts() -> u64 {
+    unsafe { *STARTABLE_HARTS.0.get() }
+}
+
+/// PLIC S-mode context for `hart` when boot derived one from the
+/// device tree; `None` sends the caller to the QEMU-formula fallback.
+pub(crate) fn plic_scontext_for_hart(hart: usize) -> Option<u32> {
+    unsafe {
+        let table: &[Option<u32>; crate::dtb::MAX_PLIC_HARTS] = &*PLIC_SCONTEXTS.0.get();
+        table.get(hart).copied().flatten()
+    }
+}
+
+/// PLIC register-window physical base: device-tree value once boot
+/// publishes it, QEMU-virt constant before that (and as fallback).
+#[cfg_attr(not(target_arch = "riscv64"), allow(dead_code))]
+pub(crate) fn plic_phys_base() -> usize {
+    unsafe { *PLIC_PHYS_BASE_PUBLISHED.0.get() }
+}
 static POSSIBLE_CPU_COUNT: PossibleCpuCountCell = PossibleCpuCountCell(UnsafeCell::new(1));
 static RESERVED_PAGE_TABLES: ReservedPageTablesCell = ReservedPageTablesCell(UnsafeCell::new(
     [PhysRange::empty(); BOOTSTRAP_PMAP_RESERVED_RANGES],
@@ -205,6 +273,84 @@ const fn empty_mmio_region() -> MmioRegion {
         phys: PhysRange::empty(),
         virt: VirtRange::empty(),
         flags: MmioFlags::empty(),
+    }
+}
+
+/// Build the published MMIO region list. With a device table (parsed
+/// from the firmware DTB) every discovered device gets a mapped,
+/// named region — all virtio slots included, so slot-probing device
+/// registration works regardless of QEMU's device-to-slot ordering.
+/// Without one (parse failed), fall back to the legacy static QEMU
+/// list. The clint keeps a static entry either way: it has no
+/// DeviceKind, but its MMIO must stay mapped.
+fn build_mmio_regions(
+    devices: &[DeviceInfo],
+    out: &mut [MmioRegion; GENERATED_MMIO_REGIONS],
+) -> usize {
+    *out = [empty_mmio_region(); GENERATED_MMIO_REGIONS];
+    if devices.is_empty() {
+        let legacy = qemu_mmio_regions();
+        out[..legacy.len()].copy_from_slice(&legacy);
+        return legacy.len();
+    }
+
+    out[0] = clint_mmio_region();
+    let mut count = 1usize;
+    let mut virtio_index = 0usize;
+    let mut uart_index = 0usize;
+    let mut sdio_index = 0usize;
+    for device in devices {
+        if count == out.len() {
+            break;
+        }
+        let name = match device.kind {
+            DeviceKind::VirtioMmio => {
+                let name = VIRTIO_REGION_NAMES.get(virtio_index);
+                virtio_index += 1;
+                name
+            }
+            DeviceKind::Uart => {
+                let name = UART_REGION_NAMES.get(uart_index);
+                uart_index += 1;
+                name
+            }
+            DeviceKind::SdController => {
+                let name = SDIO_REGION_NAMES.get(sdio_index);
+                sdio_index += 1;
+                name
+            }
+            DeviceKind::IntController => Some(&"plic"),
+            DeviceKind::PciEcam => Some(&"pcie-ecam"),
+        };
+        let Some(&name) = name else {
+            continue;
+        };
+        out[count] = MmioRegion {
+            name,
+            phys: device.mmio,
+            virt: VirtRange {
+                start: VirtAddr(DIRECT_MAP_BASE + device.mmio.start.0),
+                size: device.mmio.size,
+            },
+            flags: MMIO_RW_DEVICE,
+        };
+        count += 1;
+    }
+    count
+}
+
+fn clint_mmio_region() -> MmioRegion {
+    MmioRegion {
+        name: "clint",
+        phys: PhysRange {
+            start: PhysAddr(0x0200_0000),
+            size: 0x1_0000,
+        },
+        virt: VirtRange {
+            start: VirtAddr(DIRECT_MAP_BASE + 0x0200_0000),
+            size: 0x1_0000,
+        },
+        flags: MMIO_RW_DEVICE,
     }
 }
 
@@ -611,20 +757,61 @@ impl<State> BootStaticBag<State> {
         unsafe { &mut *CMDLINE.0.get() }
     }
 
+    pub(crate) fn platform_devices_ref(&self) -> &'static [DeviceInfo] {
+        unsafe {
+            let count = (*PLATFORM_DEVICE_COUNT.0.get()).min(MAX_PLATFORM_DEVICES);
+            let devices: &'static [DeviceInfo; MAX_PLATFORM_DEVICES] =
+                &*PLATFORM_DEVICES.0.get();
+            &devices[..count]
+        }
+    }
+
     pub(crate) fn platform_info_ref(&self) -> &'static PlatformInfo {
         unsafe {
             let mmio_regions = &mut *PLATFORM_MMIO_REGIONS.0.get();
-            *mmio_regions = qemu_mmio_regions();
+            let region_count = build_mmio_regions(self.platform_devices_ref(), mmio_regions);
+            let mmio_regions: &'static [MmioRegion; GENERATED_MMIO_REGIONS] =
+                &*PLATFORM_MMIO_REGIONS.0.get();
 
             let platform_info = &mut *PLATFORM_INFO.0.get();
             *platform_info = PlatformInfo {
                 board: Platform::BOARD,
                 spi_sd: None,
-                mmio_regions: &mmio_regions[..],
+                mmio_regions: &mmio_regions[..region_count],
                 timebase_frequency_hz: *TIMEBASE_FREQUENCY_HZ.0.get(),
                 possible_cpu_count: *POSSIBLE_CPU_COUNT.0.get(),
             };
             platform_info
+        }
+    }
+
+    pub(crate) unsafe fn platform_devices_mut(
+        &self,
+    ) -> &'static mut [DeviceInfo; MAX_PLATFORM_DEVICES] {
+        unsafe { &mut *PLATFORM_DEVICES.0.get() }
+    }
+
+    pub(crate) fn publish_platform_device_count(&self, count: usize) {
+        unsafe {
+            *PLATFORM_DEVICE_COUNT.0.get() = count.min(MAX_PLATFORM_DEVICES);
+        }
+    }
+
+    pub(crate) unsafe fn plic_scontexts_mut(
+        &self,
+    ) -> &'static mut [Option<u32>; crate::dtb::MAX_PLIC_HARTS] {
+        unsafe { &mut *PLIC_SCONTEXTS.0.get() }
+    }
+
+    pub(crate) fn publish_plic_phys_base(&self, phys_base: usize) {
+        unsafe {
+            *PLIC_PHYS_BASE_PUBLISHED.0.get() = phys_base;
+        }
+    }
+
+    pub(crate) fn publish_startable_harts(&self, mask: u64) {
+        unsafe {
+            *STARTABLE_HARTS.0.get() = mask;
         }
     }
 
