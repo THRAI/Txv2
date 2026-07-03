@@ -1,3 +1,13 @@
+- 2026-07-03 (P3-A 计划+S1-S3 落地 — R4a 修复/epoll 真阻塞,socket read/write 成一等 file 路径). 计划=REFACTOR_P3_v1.md
+  (P3 拆 A/B/C 三波,本波=上半接入 D13/D14)。**S1**(9abf8a9c) R4a 判决修复:两套 wait 注册表错配实锤(socket 载体只进
+  subsystems 表,epoll 只查 substrate 表→纯 socket 集合 epoll_wait 立即 0);照抄 eventfd 双表范式(同 id 双表登记+fire
+  双通知,新增 net/adapter.rs wait_routing+register_wait_queue/port_with_id);判决单测+QEMU epoll-external-smoke 双相
+  见证(未就绪真阻塞 1500ms+就绪 fire 真唤醒)。**S2**(1fea8ea7) FileOps trait(device.rs,同形 CharDeviceOps+nonblocking)
+  +net/file_ops.rs 为 Cap<SocketIdentity> 实现(read≡recv/write≡send,直调 step 族)+VFS Socket 臂 EINVAL→委派;判决单测
+  =loopback 对经 OpenFile::step_write/step_read 乒乓。**S3**(372a352a) io.rs read/write socket 特判摘除,socket 与 pipe
+  同走 v3 drive() 通用路径(S1 双表是 Yield 解析前提);保留 mailbox-less poll-gate;记账=短写可能/itimer-EINTR 打断待
+  LTP 复核。**验收**:七冒烟(ext/tcp-lo/udp-lo/dns/seq/bulk32768/epoll)+accept 全绿;集合差=基线+4 新测试名(毒锁区单跑
+  绿);unit 仅既有 ext4;busybox-boot 过。**Next**:S4 poll 家族统一→S5 ioctl/F_SETFL/close→S6 等待收敛+清扫。**Blocker**:无。
 - 2026-07-03 (P2-S7 扫尾完成 — **P2 全部 S 步收官**,外部网络真实可用). ①IPv6 demux 放行:ether 入口 v6 帧走 demux 新增
   v6 臂(TCP/UDP 事件带 v6 端点+完整段,解析器 P1-S4 起双栈),ICMPv6/NDISC/分片归 P4,判决单测×2 绿。②Cap 加固先行块:
   events/device_tx 全部入口(3 process fn/半开车道 listener/3 过滤谓词/feed readiness)换 downgrade().observe(guard),
