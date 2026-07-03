@@ -1023,18 +1023,14 @@ fn close_socket_files_for_process_exit(fds: &BTreeMap<u32, Cap<OpenFile>>) {
             continue;
         }
 
-        let crate::vfs::structure::OpenFileBacking::Rnode { rnode } = file.backing() else {
-            continue;
-        };
-        let crate::vfs::structure::RNodeBacking::StructBacked {
-            payload: crate::vfs::structure::StructPayload::Socket { identity },
-        } = rnode.backing()
-        else {
+        // P3-S5 (D13): the close protocol is the kind's FileOps hook now
+        // (sockets run step_socket_close inside).
+        let Some(ops) = file.file_ops() else {
             continue;
         };
 
         let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
-        let _ = crate::net::execution::step_socket_close(identity, &guard);
+        ops.on_last_close(&guard);
     }
 }
 

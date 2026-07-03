@@ -70,4 +70,13 @@ impl FileOps for Cap<SocketIdentity> {
             StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => Ok(None),
         }
     }
+
+    fn on_set_fl_nonblock(&self) {
+        self.readiness
+            .fire_send(crate::net::structure::SendWireSet::SPACE);
+    }
+
+    fn on_last_close(&self, guard: &Guard<'_>) {
+        let _ = crate::net::execution::step_socket_close(self, guard);
+    }
 }

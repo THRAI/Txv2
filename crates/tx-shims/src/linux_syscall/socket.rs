@@ -3719,12 +3719,14 @@ pub(super) fn maybe_close_socket_file_after_fd_remove(file: &Cap<OpenFile>) {
     if file.retain_count() > 1 {
         return;
     }
-    let socket = match socket_identity_from_file(file) {
-        Ok(socket) => socket,
-        Err(_) => return,
+    // P3-S5 (D13): the close protocol is the kind's FileOps hook now
+    // (sockets run step_socket_close); the retain-count two-phase timing
+    // stays here per the plan's conservative ruling.
+    let Some(ops) = file.file_ops() else {
+        return;
     };
     let guard = tx_substrate::epoch::guard();
-    let _ = step_socket_close(&socket, &guard);
+    ops.on_last_close(&guard);
 }
 
 pub(super) fn can_fast_close_stateless_netlink_socket(file: &Cap<OpenFile>) -> bool {

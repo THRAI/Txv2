@@ -79,6 +79,18 @@ pub trait FileOps: Send + Sync {
         interests: crate::net::PollMask,
         guard: &Guard<'_>,
     ) -> Result<Option<crate::execution::WaitToken>, Errno>;
+
+    /// F_SETFL O_NONBLOCK side-effect hook (P3-S5). Sockets re-kick send
+    /// readiness so writers parked behind a formerly-blocking fd re-poll.
+    fn on_set_fl_nonblock(&self) {}
+
+    /// Last-close teardown (P3-S5): the kind's close protocol, run by the
+    /// close/exit lanes once no other retainer holds the open-file
+    /// description. Sockets run `step_socket_close` (fd removal alone
+    /// does not drive the network close handshake).
+    fn on_last_close(&self, guard: &Guard<'_>) {
+        let _ = guard;
+    }
 }
 
 #[derive(Clone, Copy)]
