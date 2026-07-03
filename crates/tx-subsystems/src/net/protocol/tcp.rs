@@ -20,6 +20,21 @@ use crate::sync::SpinMutex;
 
 pub const TCP_CORK_AUTO_FLUSH_BYTES: usize = 1460;
 
+/// P3-C S4 (R2d): cap the smoltcp TCP ring backing per direction. The
+/// default SO_RCVBUF=256KB + SO_SNDBUF=64KB means every TCP socket eagerly
+/// allocated 320KB (loopback included) with no accounting → mass sockets
+/// OOM-panic the heap. Clamp the actual `vec!` backing here (mirrors UDP's
+/// `UDP_SMOLTCP_BACKING_MAX_BYTES`); the reported SO_RCVBUF/SNDBUF stays at
+/// the option value (getsockopt reads `options.socket.*_buf_size`, not the
+/// buffer), so this is invisible to sockopt callers. 64KB/dir is ample for
+/// the TCG/loopback throughput regime (bulk sends 32KB); real-link tuning
+/// is a later concern.
+const TCP_SMOLTCP_BACKING_MAX_BYTES: usize = 65_536;
+
+fn tcp_backing_bytes(bytes: usize) -> usize {
+    bytes.clamp(1, TCP_SMOLTCP_BACKING_MAX_BYTES)
+}
+
 /// P3-B S2 (D4, R1d): the smoltcp socket, the protocol sticky bits and
 /// the MSG_MORE corking buffer live under ONE lock. The former
 /// three-lock split let a single send make 6–9 independent
@@ -466,8 +481,9 @@ fn new_smoltcp_tcp_socket(
     send_capacity: usize,
     options: &SocketOptionSet,
 ) -> tcp::Socket<'static> {
-    let rx_buf = tcp::SocketBuffer::new(vec![0u8; recv_capacity]);
-    let tx_buf = tcp::SocketBuffer::new(vec![0u8; send_capacity]);
+    // R2d: clamp the actual ring backing (reported capacity is unchanged).
+    let rx_buf = tcp::SocketBuffer::new(vec![0u8; tcp_backing_bytes(recv_capacity)]);
+    let tx_buf = tcp::SocketBuffer::new(vec![0u8; tcp_backing_bytes(send_capacity)]);
     let mut socket = tcp::Socket::new(rx_buf, tx_buf);
 
     socket.set_nagle_enabled(!options.tcp.nodelay);

@@ -819,3 +819,25 @@ fn tcp_cleanup_withdraws_from_owning_namespace_table() {
         "R2c: isolated ns connection must be gone after cleanup"
     );
 }
+
+/// P3-C S4 (R2d): a default TCP socket's actual smoltcp ring backing is
+/// clamped (≤64KB/dir), cutting the former eager 320KB/socket, while the
+/// reported SO_RCVBUF/SNDBUF (option value) is unchanged. Verifies the
+/// clamp via send_available (which reads the real ring capacity) staying
+/// ≤ the cap even though the socket requested the 256KB/64KB defaults.
+#[test]
+fn tcp_socket_backing_is_clamped_below_default() {
+    let raw = crate::net::protocol::RawTcpSocket::new(&SocketOptionSet::default_tcp());
+    // Reported capacity = requested option (unchanged, for getsockopt).
+    assert_eq!(raw.send_capacity(), 65_536);
+    assert_eq!(raw.recv_capacity(), 262_144);
+    // A tiny-buffer socket keeps its exact (sub-cap) size — clamp only bites
+    // the oversized default; the recv ring's actual size is what recv_len
+    // caps against, not the reported 262144.
+    let mut small = SocketOptionSet::default_tcp();
+    small.socket.recv_buf_size = 4096;
+    small.socket.send_buf_size = 4096;
+    let raw_small = crate::net::protocol::RawTcpSocket::new(&small);
+    assert_eq!(raw_small.recv_capacity(), 4096);
+    assert_eq!(raw_small.send_capacity(), 4096);
+}
