@@ -133,7 +133,7 @@ pub fn step_process_device_tx_pending_in_namespace_at(
     for socket in table
         .snapshot_tcp_bound(guard)
         .into_iter()
-        .filter(is_tcp_connecting)
+        .filter(|socket| is_tcp_connecting(socket, guard))
         .take(budget.tcp_connecting)
     {
         process_tcp_tx_socket(&socket, sink, now, guard, &mut outcome);
@@ -151,7 +151,10 @@ pub fn step_process_device_tx_pending_in_namespace_at(
         .into_iter()
         .take(budget.tcp_connecting)
     {
-        let Some(listener_payload) = listener.acquire_operational() else {
+        let Some(listener_ident) = listener.downgrade().observe(guard) else {
+            continue;
+        };
+        let Some(listener_payload) = listener_ident.acquire_operational() else {
             continue;
         };
         for child in listener_payload.connecting_children() {
@@ -166,7 +169,7 @@ pub fn step_process_device_tx_pending_in_namespace_at(
     for socket in table
         .snapshot_tcp_connections(guard)
         .into_iter()
-        .filter(is_tcp_connected)
+        .filter(|socket| is_tcp_connected(socket, guard))
     {
         if !remember_socket(&mut tcp_connections_seen, &socket) {
             continue;
@@ -182,7 +185,7 @@ pub fn step_process_device_tx_pending_in_namespace_at(
         .snapshot_udp_bound(guard)
         .into_iter()
         .chain(table.snapshot_udp_connections(guard))
-        .filter(is_udp_bound_or_connected)
+        .filter(|socket| is_udp_bound_or_connected(socket, guard))
     {
         if !remember_socket(&mut udp_bound_seen, &socket) {
             continue;
@@ -223,7 +226,13 @@ fn process_tcp_tx_socket(
     guard: &Guard<'_>,
     outcome: &mut DeviceTxOutcome,
 ) {
-    let Some(payload) = socket.acquire_operational() else {
+    // P2-S7 hardening (P1-S4 race family): the socket may be concurrently
+    // close-retired; observe(guard) instead of bare Cap deref (which
+    // panics on a retired slot).
+    let Some(ident) = socket.downgrade().observe(guard) else {
+        return;
+    };
+    let Some(payload) = ident.acquire_operational() else {
         return;
     };
     let Some(raw_tcp) = payload.raw_tcp_socket() else {
@@ -280,7 +289,11 @@ fn process_udp_tx_socket(
     guard: &Guard<'_>,
     outcome: &mut DeviceTxOutcome,
 ) {
-    let Some(payload) = socket.acquire_operational() else {
+    // P2-S7 hardening (P1-S4 race family): observe(guard), no bare deref.
+    let Some(ident) = socket.downgrade().observe(guard) else {
+        return;
+    };
+    let Some(payload) = ident.acquire_operational() else {
         return;
     };
     let Some(local) = udp_local_endpoint(&payload.protocol_snapshot()) else {
@@ -317,7 +330,7 @@ fn process_udp_tx_socket(
             outcome.tx_bytes += frame_len;
             outcome.sockets_touched += 1;
             if drain.became_available {
-                outcome.wakes_fired += socket.readiness.fire_send(SendWireSet::SPACE);
+                outcome.wakes_fired += ident.readiness.fire_send(SendWireSet::SPACE);
             }
         }
         PacketTxResult::Busy => {
@@ -339,7 +352,11 @@ fn process_raw_icmp_tx_socket(
     guard: &Guard<'_>,
     outcome: &mut DeviceTxOutcome,
 ) {
-    let Some(payload) = socket.acquire_operational() else {
+    // P2-S7 hardening (P1-S4 race family): observe(guard), no bare deref.
+    let Some(ident) = socket.downgrade().observe(guard) else {
+        return;
+    };
+    let Some(payload) = ident.acquire_operational() else {
         return;
     };
     let Some(mut echo) = payload.peek_icmp_tx_echo() else {
@@ -369,7 +386,7 @@ fn process_raw_icmp_tx_socket(
             outcome.tx_bytes += frame_len;
             outcome.sockets_touched += 1;
             if drain.became_available {
-                outcome.wakes_fired += socket.readiness.fire_send(SendWireSet::SPACE);
+                outcome.wakes_fired += ident.readiness.fire_send(SendWireSet::SPACE);
             }
         }
         PacketTxResult::Busy => {
@@ -388,31 +405,43 @@ fn is_external_ipv4(addr: Ipv4Address) -> bool {
     addr != Ipv4Address::LOOPBACK && addr != Ipv4Address::BROADCAST
 }
 
-fn is_tcp_connecting(socket: &Cap<SocketIdentity>) -> bool {
-    socket.acquire_operational().is_some_and(|payload| {
-        matches!(
-            payload.protocol_snapshot(),
-            SocketProtocol::Tcp(TcpState::Connecting { .. })
-        )
-    })
+fn is_tcp_connecting(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> bool {
+    socket
+        .downgrade()
+        .observe(guard)
+        .and_then(|ident| ident.acquire_operational())
+        .is_some_and(|payload| {
+            matches!(
+                payload.protocol_snapshot(),
+                SocketProtocol::Tcp(TcpState::Connecting { .. })
+            )
+        })
 }
 
-fn is_tcp_connected(socket: &Cap<SocketIdentity>) -> bool {
-    socket.acquire_operational().is_some_and(|payload| {
-        matches!(
-            payload.protocol_snapshot(),
-            SocketProtocol::Tcp(TcpState::Connected { .. })
-        )
-    })
+fn is_tcp_connected(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> bool {
+    socket
+        .downgrade()
+        .observe(guard)
+        .and_then(|ident| ident.acquire_operational())
+        .is_some_and(|payload| {
+            matches!(
+                payload.protocol_snapshot(),
+                SocketProtocol::Tcp(TcpState::Connected { .. })
+            )
+        })
 }
 
-fn is_udp_bound_or_connected(socket: &Cap<SocketIdentity>) -> bool {
-    socket.acquire_operational().is_some_and(|payload| {
-        matches!(
-            payload.protocol_snapshot(),
-            SocketProtocol::Udp(UdpInner::Bound { .. } | UdpInner::Connected { .. })
-        )
-    })
+fn is_udp_bound_or_connected(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> bool {
+    socket
+        .downgrade()
+        .observe(guard)
+        .and_then(|ident| ident.acquire_operational())
+        .is_some_and(|payload| {
+            matches!(
+                payload.protocol_snapshot(),
+                SocketProtocol::Udp(UdpInner::Bound { .. } | UdpInner::Connected { .. })
+            )
+        })
 }
 
 fn udp_local_endpoint(protocol: &SocketProtocol) -> Option<IpEndpoint> {

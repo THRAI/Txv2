@@ -270,3 +270,54 @@ fn tcp_syn_to_listener_sets_accept_readiness() {
     );
     assert!(listener.readiness.accept_wq.peek() & AcceptWireSet::HAS_PENDING.bits() != 0);
 }
+
+/// P2-S7 (§6-2-A): IPv6 UDP frames pass the demux — same event shape as
+/// v4, endpoints carried as v6. Frame built by hand (UDP checksum 0 is
+/// tolerated by the byte-level demux, which defers verification to the
+/// segment/datagram consumers).
+#[test]
+fn smoltcp_demux_extracts_ipv6_udp_event() {
+    let transport = udp_transport(53_001, 8081, &[5, 6, 7]);
+    let frame = RxFrame::new(ethernet_ipv6_frame(17, &transport));
+
+    let src_ip = crate::net::structure::Ipv6Address::new([
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+    ]);
+    let dst_ip = crate::net::structure::Ipv6Address::new([
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02,
+    ]);
+    assert_eq!(
+        demux_rx_frame_with_smoltcp(&frame),
+        PacketDispatch::Udp(UdpPacketEvent::new(
+            IpEndpoint::new_v6(src_ip, 53_001),
+            IpEndpoint::new_v6(dst_ip, 8081),
+            std::vec![5, 6, 7],
+        ))
+    );
+}
+
+/// P2-S7 (§6-2-A): IPv6 TCP frames pass the demux with flags + v6
+/// endpoints (the checksum-verified segment attach happens for wire
+/// frames with real checksums; a zero-checksum hand frame yields
+/// segment=None, same contract as malformed-checksum v4).
+#[test]
+fn smoltcp_demux_extracts_ipv6_tcp_event_flags() {
+    let transport = tcp_transport(49_001, 8443, 0x12, &[0xaa]);
+    let frame = RxFrame::new(ethernet_ipv6_frame(6, &transport));
+
+    match demux_rx_frame_with_smoltcp(&frame) {
+        PacketDispatch::Tcp(event) => {
+            assert_eq!(event.src.port, 49_001);
+            assert_eq!(event.dst.port, 8443);
+            assert_eq!(
+                event.src.family,
+                crate::net::structure::AddressFamily::Inet6
+            );
+            assert!(event.flags.syn);
+            assert!(event.flags.ack);
+            assert!(!event.flags.rst);
+            assert_eq!(event.payload, std::vec![0xaa]);
+        }
+        other => panic!("expected v6 tcp dispatch, got {other:?}"),
+    }
+}

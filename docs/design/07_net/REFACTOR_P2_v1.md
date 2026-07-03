@@ -154,7 +154,10 @@ TX 车道全套（含 Connecting 搬运）、ARP 全套、demux 带段+校验和
 - DNS 两小修（借 `9c919782` 后半）：10.0.2.3 静态 ARP；外部 UDP 发送打开驱动窗口。
 - **验证**：UDP 回环测试族 10/10 不退化；`nslookup example.com 10.0.2.3` 返回记录；`udp-loopback-smoke` 绿。
 
-### S7 —— 扫尾
+### S7 —— 扫尾 ✅（2026-07-03 完成，P2 全部 S 步收官）
+
+> **实施记录**：① IPv6 demux 放行（§6-2-A）——ether 入口 v6 帧改走 `demux_rx_frame_with_smoltcp` 新增 v6 臂（TCP/UDP 事件带 v6 端点+完整段；解析器 P1-S4 起已双栈），ICMPv6/NDISC/v6 分片仍归 P4；判决单测 ×2 绿。② Cap 加固先行块——events/device_tx 全部入口（3 个 process fn、半开车道 listener、3 个车道过滤谓词、feed 的 readiness 读取）换 `downgrade().observe(guard)` 模式，裸 deref 清零（clone 加固与全面收敛仍归 P3）。③ 死代码核查——假握手 wrapper 已在 S3 删除；`_with_family` 变体仍被 step_connect 内核内跨 netns connect 合法使用（其退役随上半接入重构，P3+），无新增死代码。
+> **P2 验收状态**：五冒烟矩阵全绿（ext/tcp-lo/udp-lo/dns/seq）+ accept 冒烟（hostfwd）+ bulk 32KB；集合差=基线+3 已知新测试名（毒锁区，单跑全绿）；la64 构建、busybox-boot 过。**§4 的字面 "busybox wget rc=0" 受限于分支既有的 busybox bootstrap path-not-found（非网络问题），由等价 C 冒烟矩阵覆盖**——bootstrap 修复后补跑。既有测试债（packet_event_tests 三件断言 P1 前语义,基线内）留账。
 
 - IPv6 demux 放行（设计点 §6-2 若拍 A）：以太入口 `EthernetProtocol::Ipv6` 走 v6 解析（下层已支持），NDISC 仍静态表；ping6/路由归 P4。
 - `Cap` 裸 deref 加固**先行小块**：外部 RX/device_tx 高频触碰外来 socket（P1-S4 竞态教训同族），把 events/device_tx 的 `acquire_operational` 入口换 `observe(guard)` 模式（全面收敛仍归 P3）。

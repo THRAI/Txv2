@@ -276,7 +276,11 @@ impl EtherIface {
                 dispatch
             }
             EthernetProtocol::Arp => self.process_arp(ethernet.payload(), now, guard),
-            EthernetProtocol::Ipv6 | EthernetProtocol::Unknown(_) => PacketDispatch::Unsupported,
+            // P2-S7 (§6-2-A): v6 TCP/UDP frames go through the same demux
+            // (its v6 arm parses them); no v4-style reassembly staging yet
+            // (v6 fragmentation is a P4 concern).
+            EthernetProtocol::Ipv6 => demux_rx_frame_with_smoltcp(&frame),
+            EthernetProtocol::Unknown(_) => PacketDispatch::Unsupported,
         }
     }
 

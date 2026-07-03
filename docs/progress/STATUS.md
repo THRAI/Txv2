@@ -1,3 +1,11 @@
+- 2026-07-03 (P2-S7 扫尾完成 — **P2 全部 S 步收官**,外部网络真实可用). ①IPv6 demux 放行:ether 入口 v6 帧走 demux 新增
+  v6 臂(TCP/UDP 事件带 v6 端点+完整段,解析器 P1-S4 起双栈),ICMPv6/NDISC/分片归 P4,判决单测×2 绿。②Cap 加固先行块:
+  events/device_tx 全部入口(3 process fn/半开车道 listener/3 过滤谓词/feed readiness)换 downgrade().observe(guard),
+  裸 deref 清零(clone 加固归 P3)。③死代码核查:假握手 wrapper S3 已删,_with_family 仍被内核内跨 netns connect 合法
+  使用(退役归 P3+),无新增死代码。**P2 验收**:五冒烟矩阵全绿(ext/tcp-lo/udp-lo/dns/seq)+accept(hostfwd)+bulk 32KB;
+  集合差=基线+3 已知新测试名(毒锁区单跑全绿);la64 构建/busybox-boot 过;字面 wget rc=0 受限分支既有 busybox
+  bootstrap path-not-found(非网络),由等价 C 冒烟覆盖。**Next**:P3(上半接入:FileOps trait D13+await_wait_source D14
+  连带修 epoll-on-socket R4a)或用户决策;既有测试债(packet_event_tests 三件 P1 前语义)留账。**Blocker**:无。
 - 2026-07-03 (P2-S4/S5/S6 三连完成 — 多段 TX 32KB 零差/端口轮转 4 连各新/UDP 收敛 smoltcp+DNS 打通). **S4**(137482ea):
   process_tcp_tx_socket 改有界抽干(16 段/轮,Busy 背压保留);灵魂单测一轮 ≥2 段;QEMU tcp-external-bulk-smoke 32768/32768
   字节到宿主(24 段 97ms)。**S5**(4ae7117c):三处临时端口扫描换共享 AtomicU16 轮转;ISN 相异单测绿;tcp-external-seq-smoke

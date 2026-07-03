@@ -286,7 +286,10 @@ fn process_tcp_event(
 ) -> Option<Vec<NetworkPublishTarget>> {
     let key = ConnectionKey::new(event.dst, event.src);
     if let Some(socket) = table.lookup_tcp_connection(key, guard) {
-        let payload = socket.acquire_operational()?;
+        // P2-S7 hardening (P1-S4 race family): observe(guard) before any
+        // payload access — the socket may be concurrently close-retired.
+        let ident = socket.downgrade().observe(guard)?;
+        let payload = ident.acquire_operational()?;
         // Established-connection RX feeds smoltcp: seq/ack/checksum are the
         // state machine's verdict, not hand bookkeeping. Events without a
         // parsed segment (hand-built) cannot enter an established
@@ -312,7 +315,8 @@ fn process_tcp_event(
     // connecting backlog until the final ACK promotes it (loopback
     // parity); mid-handshake segments route via the backlog below.
     let listener = table.lookup_tcp_listener_dual_stack_endpoint(event.dst, guard)?;
-    let listener_payload = listener.acquire_operational()?;
+    let listener_ident = listener.downgrade().observe(guard)?;
+    let listener_payload = listener_ident.acquire_operational()?;
     if !listener_accepts_incoming(&listener_payload, event.dst) {
         return None;
     }
@@ -321,7 +325,8 @@ fn process_tcp_event(
         // Half-open child exists: the final ACK completes the handshake
         // (feed → connected edge → accept promotion); a retransmitted SYN
         // re-queues the SYN-ACK inside smoltcp. Either way, feed it.
-        let child_payload = child.acquire_operational()?;
+        let child_ident = child.downgrade().observe(guard)?;
+        let child_payload = child_ident.acquire_operational()?;
         return Some(feed_tcp_segment(
             table,
             &child,
@@ -406,9 +411,14 @@ fn feed_tcp_segment(
         }
     }
 
+    // P2-S7 hardening: readiness is a field on the identity — read it via
+    // an observed IdentRef, not a bare Cap deref (panics on retired slots).
+    let Some(ident) = socket.downgrade().observe(guard) else {
+        return publishes;
+    };
     let publish = NetworkPublish {
         recv_has_data: bits.recv_readable
-            || socket.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() == 0
+            || ident.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() == 0
                 && raw.recv_available() > 0,
         send_has_space: bits.connected || bits.send_writable,
         recv_broken: bits.broken || bits.recv_closed,

@@ -180,6 +180,27 @@ fn ethernet_ipv4_frame(protocol: u8, transport: &[u8]) -> std::vec::Vec<u8> {
     frame
 }
 
+fn ethernet_ipv6_frame(protocol: u8, transport: &[u8]) -> std::vec::Vec<u8> {
+    let mut frame = std::vec::Vec::new();
+    frame.extend_from_slice(&[0x02, 0, 0, 0, 0, 2]);
+    frame.extend_from_slice(&[0x02, 0, 0, 0, 0, 1]);
+    frame.extend_from_slice(&[0x86, 0xdd]);
+    frame.extend_from_slice(&[0x60, 0, 0, 0]); // version 6, tc/flow 0
+    let payload_len = u16::try_from(transport.len()).expect("test frame length");
+    frame.extend_from_slice(&payload_len.to_be_bytes());
+    frame.push(protocol); // next header
+    frame.push(64); // hop limit
+    // 2001:db8::1 -> 2001:db8::2
+    frame.extend_from_slice(&[
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+    ]);
+    frame.extend_from_slice(&[
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02,
+    ]);
+    frame.extend_from_slice(transport);
+    frame
+}
+
 fn udp_transport(src_port: u16, dst_port: u16, payload: &[u8]) -> std::vec::Vec<u8> {
     let mut transport = std::vec::Vec::new();
     transport.extend_from_slice(&src_port.to_be_bytes());
