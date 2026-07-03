@@ -32,14 +32,22 @@ pub const UDP_IPV4_MAX_PAYLOAD_BYTES: usize = u16::MAX as usize - 20 - 8;
 /// The former shadow `VecDeque` datagram queues are gone; only the
 /// MSG_MORE corking staging survives outside smoltcp (same shape as TCP's
 /// `corked_tx`).
-pub struct RawUdpSocket {
-    socket: SpinMutex<Box<udp::Socket<'static>>>,
-    corked_tx: SpinMutex<Option<UdpTxDatagram>>,
+/// P3-B S2 (D4): socket + corking + src-hint under ONE lock — the
+/// capacity check and the actual `send_slice` become a composite atomic
+/// (same R1d family as TCP). Lock order unchanged: CONTEXT_IFACE outer,
+/// `inner` inner.
+struct UdpInnerState {
+    socket: Box<udp::Socket<'static>>,
+    corked_tx: Option<UdpTxDatagram>,
     /// Source-address hint for corked/queued datagrams (resolved by the
     /// payload layer at enqueue time: bound address, loopback rule, or the
     /// namespace route's preferred source). The context iface carries no
     /// addresses, so dispatch-side source selection cannot be relied on.
-    tx_src_hint: SpinMutex<Option<IpAddress>>,
+    tx_src_hint: Option<IpAddress>,
+}
+
+pub struct RawUdpSocket {
+    inner: SpinMutex<UdpInnerState>,
     recv_capacity: usize,
     send_capacity: usize,
     recv_packet_capacity: usize,
@@ -101,9 +109,11 @@ impl RawUdpSocket {
         }
 
         Self {
-            socket: SpinMutex::new(Box::new(socket)),
-            corked_tx: SpinMutex::new(None),
-            tx_src_hint: SpinMutex::new(None),
+            inner: SpinMutex::new(UdpInnerState {
+                socket: Box::new(socket),
+                corked_tx: None,
+                tx_src_hint: None,
+            }),
             recv_capacity,
             send_capacity,
             recv_packet_capacity,
@@ -118,7 +128,8 @@ impl RawUdpSocket {
         if local.port == 0 {
             return false;
         }
-        let mut socket = self.socket.lock();
+        let inner = &mut *self.inner.lock();
+        let socket = &mut inner.socket;
         let current = socket.endpoint();
         if current.port == local.port {
             return true;
@@ -151,7 +162,8 @@ impl RawUdpSocket {
         }
 
         with_context(|cx| {
-            let mut socket = self.socket.lock();
+            let inner = &mut *self.inner.lock();
+        let socket = &mut inner.socket;
             let was_empty = !socket.can_recv();
             let udp_repr = UdpRepr {
                 src_port: src.port,
@@ -170,7 +182,7 @@ impl RawUdpSocket {
     }
 
     pub fn recv_available(&self) -> usize {
-        self.socket.lock().payload_recv_bytes()
+        self.inner.lock().socket.payload_recv_bytes()
     }
 
     pub fn recv_len(&self, len: usize, peek: bool) -> Option<(usize, bool)> {
@@ -178,7 +190,8 @@ impl RawUdpSocket {
             return Some((0, false));
         }
 
-        let mut socket = self.socket.lock();
+        let inner = &mut *self.inner.lock();
+        let socket = &mut inner.socket;
         if peek {
             let (payload, _meta) = socket.peek().ok()?;
             return Some((core::cmp::min(payload.len(), len), false));
@@ -200,7 +213,8 @@ impl RawUdpSocket {
             });
         }
 
-        let mut socket = self.socket.lock();
+        let inner = &mut *self.inner.lock();
+        let socket = &mut inner.socket;
         let bound_port = socket.endpoint().port;
         if peek {
             let (payload, meta) = socket.peek().ok()?;
@@ -244,14 +258,14 @@ impl RawUdpSocket {
     }
 
     pub fn send_available(&self) -> usize {
-        let queued = self.socket.lock().payload_send_bytes();
-        let corked = self.corked_tx_len();
-        self.send_capacity.saturating_sub(queued + corked)
+        let inner = self.inner.lock();
+        udp_send_available_inner(&inner, self.send_capacity)
     }
 
     pub fn corked_tx_len(&self) -> usize {
-        self.corked_tx
+        self.inner
             .lock()
+            .corked_tx
             .as_ref()
             .map(|datagram| datagram.payload.len())
             .unwrap_or(0)
@@ -274,8 +288,9 @@ impl RawUdpSocket {
     /// outgoing datagrams (bound address / loopback rule / route
     /// preferred-src). Consulted when flushing into the smoltcp tx ring.
     pub fn set_tx_src_hint(&self, src: Option<IpEndpoint>) {
-        *self.tx_src_hint.lock() =
-            src.filter(|endpoint| !endpoint.is_unspecified()).map(|endpoint| to_smol_ip(&endpoint));
+        self.inner.lock().tx_src_hint = src
+            .filter(|endpoint| !endpoint.is_unspecified())
+            .map(|endpoint| to_smol_ip(&endpoint));
     }
 
     pub fn enqueue_tx_datagram_with_more(
@@ -288,21 +303,17 @@ impl RawUdpSocket {
             return Some((0, false));
         }
 
-        {
-            let corked = self.corked_tx.lock();
-            let queued = self.socket.lock().payload_send_bytes();
-            let available = self
-                .send_capacity
-                .saturating_sub(queued + corked_payload_len(&corked));
-            if payload.len() > available {
-                return None;
-            }
+        // D4 composite atomic: capacity check, corking and the actual
+        // send_slice all under one lock acquisition.
+        let inner = &mut *self.inner.lock();
+        let available = udp_send_available_inner(inner, self.send_capacity);
+        if payload.len() > available {
+            return None;
         }
 
         let bytes = payload.len();
         if more {
-            let mut corked = self.corked_tx.lock();
-            match corked.as_mut() {
+            match inner.corked_tx.as_mut() {
                 Some(datagram) => {
                     datagram.payload.extend(payload);
                     if datagram.dst.port == 0 {
@@ -310,11 +321,11 @@ impl RawUdpSocket {
                     }
                 }
                 None => {
-                    *corked = Some(UdpTxDatagram { dst, payload });
+                    inner.corked_tx = Some(UdpTxDatagram { dst, payload });
                 }
             }
         } else {
-            let flushed = if let Some(mut datagram) = self.corked_tx.lock().take() {
+            let flushed = if let Some(mut datagram) = inner.corked_tx.take() {
                 if datagram.dst.port == 0 {
                     datagram.dst = dst;
                 }
@@ -323,29 +334,12 @@ impl RawUdpSocket {
             } else {
                 UdpTxDatagram { dst, payload }
             };
-            self.push_datagram_to_socket(flushed)?;
+            push_datagram_inner(inner, flushed)?;
         }
-        let queued = self.socket.lock().payload_send_bytes();
         Some((
             bytes,
-            queued + self.corked_tx_len() >= self.send_capacity,
+            udp_send_available_inner(inner, self.send_capacity) == 0,
         ))
-    }
-
-    /// Flush one staged datagram into the smoltcp tx ring. A datagram with
-    /// an unaddressable destination is accepted and dropped (legacy queue
-    /// behaviour: it would sit until the drain failed to emit it).
-    fn push_datagram_to_socket(&self, datagram: UdpTxDatagram) -> Option<()> {
-        if datagram.dst.port == 0 || datagram.dst.is_unspecified() {
-            return Some(());
-        }
-        let meta = udp::UdpMetadata {
-            endpoint: to_smol_endpoint(&datagram.dst),
-            local_address: *self.tx_src_hint.lock(),
-            meta: PacketMeta::default(),
-        };
-        let mut socket = self.socket.lock();
-        socket.send_slice(&datagram.payload, meta).ok().map(|_| ())
     }
 
     pub fn enqueue_tx_bytes(&self, bytes: &[u8]) -> Option<(usize, bool)> {
@@ -367,7 +361,8 @@ impl RawUdpSocket {
 
     pub fn pop_tx_datagram(&self) -> Option<UdpTxDatagramDrain> {
         with_context(|cx| {
-            let mut socket = self.socket.lock();
+            let inner = &mut *self.inner.lock();
+        let socket = &mut inner.socket;
             let mut out = None;
             let result: Result<(), ()> =
                 socket.dispatch(cx, |_cx, _meta, (ip_repr, udp_repr, payload)| {
@@ -390,7 +385,8 @@ impl RawUdpSocket {
     }
 
     pub fn peek_tx_datagram(&self) -> Option<UdpTxDatagram> {
-        let mut socket = self.socket.lock();
+        let inner = &mut *self.inner.lock();
+        let socket = &mut inner.socket;
         let (payload, meta) = socket.peek_send().ok()?;
         Some(UdpTxDatagram {
             dst: from_smol_endpoint(meta.endpoint),
@@ -407,18 +403,19 @@ impl RawUdpSocket {
     }
 
     pub fn can_recv(&self) -> bool {
-        self.socket.lock().can_recv()
+        self.inner.lock().socket.can_recv()
     }
 
     pub fn can_send(&self) -> bool {
-        self.socket.lock().can_send()
+        self.inner.lock().socket.can_send()
     }
 
     pub fn close(&self) {
         // Drain both rings so queued payloads are released (queue-era
         // `close` cleared the VecDeques; smoltcp `close` only unbinds).
         with_context(|cx| {
-            let mut socket = self.socket.lock();
+            let inner = &mut *self.inner.lock();
+        let socket = &mut inner.socket;
             while socket.recv().is_ok() {}
             loop {
                 let mut popped = false;
@@ -431,8 +428,8 @@ impl RawUdpSocket {
                 }
             }
             socket.close();
+            let _ = inner.corked_tx.take();
         });
-        let _ = self.corked_tx.lock().take();
     }
 }
 
@@ -606,11 +603,33 @@ fn ip_repr_for(src: &IpEndpoint, dst: &IpEndpoint, udp_len: usize) -> IpRepr {
     }
 }
 
-fn corked_payload_len(datagram: &Option<UdpTxDatagram>) -> usize {
-    datagram
+fn udp_send_available_inner(inner: &UdpInnerState, send_capacity: usize) -> usize {
+    let queued = inner.socket.payload_send_bytes();
+    let corked = inner
+        .corked_tx
         .as_ref()
         .map(|datagram| datagram.payload.len())
-        .unwrap_or(0)
+        .unwrap_or(0);
+    send_capacity.saturating_sub(queued + corked)
+}
+
+/// Flush one staged datagram into the smoltcp tx ring. A datagram with
+/// an unaddressable destination is accepted and dropped (legacy queue
+/// behaviour: it would sit until the drain failed to emit it).
+fn push_datagram_inner(inner: &mut UdpInnerState, datagram: UdpTxDatagram) -> Option<()> {
+    if datagram.dst.port == 0 || datagram.dst.is_unspecified() {
+        return Some(());
+    }
+    let meta = udp::UdpMetadata {
+        endpoint: to_smol_endpoint(&datagram.dst),
+        local_address: inner.tx_src_hint,
+        meta: PacketMeta::default(),
+    };
+    inner
+        .socket
+        .send_slice(&datagram.payload, meta)
+        .ok()
+        .map(|_| ())
 }
 
 fn unspecified_endpoint() -> IpEndpoint {

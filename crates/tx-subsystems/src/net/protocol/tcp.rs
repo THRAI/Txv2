@@ -20,11 +20,26 @@ use crate::sync::SpinMutex;
 
 pub const TCP_CORK_AUTO_FLUSH_BYTES: usize = 1460;
 
+/// P3-B S2 (D4, R1d): the smoltcp socket, the protocol sticky bits and
+/// the MSG_MORE corking buffer live under ONE lock. The former
+/// three-lock split let a single send make 6–9 independent
+/// acquire/release round-trips — `send_available` was read and released
+/// before `send_slice` used the stale value, and the corked
+/// read→clear window could wipe bytes a concurrent MSG_MORE append had
+/// just staged. With one lock the whole
+/// available→combine→send_slice→clear composite is atomic by
+/// construction. Lock order vs the global context is unchanged:
+/// CONTEXT_IFACE outer, `inner` inner (taken inside `with_context`
+/// closures only).
+struct TcpInner {
+    socket: Box<tcp::Socket<'static>>,
+    protocol_state: RawTcpProtocolState,
+    corked_tx: Vec<u8>,
+}
+
 /// Doc-named owner for the smoltcp TCP socket and its backing buffers.
 pub struct RawTcpSocket {
-    socket: SpinMutex<Box<tcp::Socket<'static>>>,
-    protocol_state: SpinMutex<RawTcpProtocolState>,
-    corked_tx: SpinMutex<Vec<u8>>,
+    inner: SpinMutex<TcpInner>,
     recv_capacity: usize,
     send_capacity: usize,
 }
@@ -87,9 +102,11 @@ impl RawTcpSocket {
         let socket = new_smoltcp_tcp_socket(recv_capacity, send_capacity, options);
 
         Self {
-            socket: SpinMutex::new(Box::new(socket)),
-            protocol_state: SpinMutex::new(RawTcpProtocolState::default()),
-            corked_tx: SpinMutex::new(Vec::new()),
+            inner: SpinMutex::new(TcpInner {
+                socket: Box::new(socket),
+                protocol_state: RawTcpProtocolState::default(),
+                corked_tx: Vec::new(),
+            }),
             recv_capacity,
             send_capacity,
         }
@@ -104,7 +121,7 @@ impl RawTcpSocket {
     }
 
     pub fn recv_available(&self) -> usize {
-        self.socket.lock().recv_queue()
+        self.inner.lock().socket.recv_queue()
     }
 
     pub fn recv_len(&self, len: usize, peek: bool) -> Option<(usize, bool)> {
@@ -112,7 +129,8 @@ impl RawTcpSocket {
             return Some((0, false));
         }
 
-        let mut socket = self.socket.lock();
+        let inner = &mut *self.inner.lock();
+        let socket = &mut inner.socket;
         if socket.recv_queue() == 0 {
             return None;
         }
@@ -146,7 +164,8 @@ impl RawTcpSocket {
             return Some((0, false));
         }
 
-        let mut socket = self.socket.lock();
+        let inner = &mut *self.inner.lock();
+        let socket = &mut inner.socket;
         if socket.recv_queue() == 0 {
             return None;
         }
@@ -163,22 +182,11 @@ impl RawTcpSocket {
     }
 
     pub fn send_available(&self) -> usize {
-        // Space = smoltcp tx ring headroom minus corked (not-yet-committed)
-        // bytes, which will need ring space when flushed.
-        let corked = self.corked_tx.lock().len();
-        let socket = self.socket.lock();
-        if socket.may_send() {
-            socket
-                .send_capacity()
-                .saturating_sub(socket.send_queue())
-                .saturating_sub(corked)
-        } else {
-            0
-        }
+        send_available_inner(&self.inner.lock())
     }
 
     pub fn send_queued(&self) -> usize {
-        self.socket.lock().send_queue()
+        self.inner.lock().socket.send_queue()
     }
 
     pub fn enqueue_tx_len(&self, len: usize) -> Option<RawTcpSendReserve> {
@@ -202,129 +210,114 @@ impl RawTcpSocket {
             });
         }
 
-        let available = self.send_available();
+        // R1d fix: the whole available→combine→send_slice→clear composite
+        // runs under one lock acquisition — no stale-available window, no
+        // corked read→clear overwrite window.
+        let inner = &mut *self.inner.lock();
+        let available = send_available_inner(inner);
         if available == 0 {
             return None;
         }
 
         let requested = core::cmp::min(available, bytes.len());
         if more {
-            self.corked_tx
-                .lock()
+            inner
+                .corked_tx
                 .extend(bytes.iter().copied().take(requested));
-            let flushed_to_protocol = if self.corked_tx.lock().len() >= TCP_CORK_AUTO_FLUSH_BYTES {
-                self.flush_corked_tx() > 0
+            let flushed_to_protocol = if inner.corked_tx.len() >= TCP_CORK_AUTO_FLUSH_BYTES {
+                flush_corked_inner(inner) > 0
             } else {
                 false
             };
             return Some(RawTcpSendReserve {
                 bytes: requested,
-                became_full: self.send_available() == 0,
+                became_full: send_available_inner(inner) == 0,
                 flushed_to_protocol,
             });
         }
 
-        let corked_len = self.corked_tx.lock().len();
+        let corked_len = inner.corked_tx.len();
         let mut combined = Vec::with_capacity(corked_len + requested);
         if corked_len != 0 {
-            combined.extend(self.corked_tx.lock().iter().copied());
+            combined.extend(inner.corked_tx.iter().copied());
         }
         combined.extend_from_slice(&bytes[..requested]);
 
-        let accepted = self.enqueue_protocol_tx_bytes(&combined).ok()?;
+        let accepted = inner.socket.send_slice(&combined).ok()?;
         if accepted == 0 {
             return None;
         }
         if corked_len != 0 {
-            self.corked_tx.lock().clear();
+            inner.corked_tx.clear();
         }
         let accepted_new = accepted.saturating_sub(corked_len).min(requested);
         Some(RawTcpSendReserve {
             bytes: accepted_new,
-            became_full: self.send_available() == 0,
+            became_full: send_available_inner(inner) == 0,
             flushed_to_protocol: accepted > 0,
         })
     }
 
     pub fn flush_corked_tx(&self) -> usize {
-        let bytes = {
-            let mut corked = self.corked_tx.lock();
-            if corked.is_empty() {
-                return 0;
-            }
-            core::mem::take(&mut *corked)
-        };
-
-        let accepted = match self.enqueue_protocol_tx_bytes(&bytes) {
-            Ok(accepted) => accepted,
-            Err(_) => {
-                self.prepend_corked_tx(&bytes);
-                return 0;
-            }
-        };
-        if accepted == 0 {
-            self.prepend_corked_tx(&bytes);
-            return 0;
-        }
-
-        if accepted < bytes.len() {
-            self.prepend_corked_tx(&bytes[accepted..]);
-        }
-        accepted
+        flush_corked_inner(&mut self.inner.lock())
     }
 
     pub fn can_recv(&self) -> bool {
-        self.socket.lock().can_recv()
+        self.inner.lock().socket.can_recv()
     }
 
     pub fn can_send(&self) -> bool {
-        self.socket.lock().can_send()
+        self.inner.lock().socket.can_send()
     }
 
     pub fn may_recv(&self) -> bool {
-        self.socket.lock().may_recv()
+        self.inner.lock().socket.may_recv()
     }
 
     pub fn may_send(&self) -> bool {
-        self.socket.lock().may_send()
+        self.inner.lock().socket.may_send()
     }
 
     pub fn is_recv_closed(&self) -> bool {
-        self.protocol_state.lock().is_recv_shut
+        self.inner.lock().protocol_state.is_recv_shut
     }
 
     pub fn is_send_closed(&self) -> bool {
-        !self.socket.lock().may_send()
+        !self.inner.lock().socket.may_send()
     }
 
     pub fn close(&self) {
-        let _ = self.flush_corked_tx();
-        self.socket.lock().close();
+        let inner = &mut *self.inner.lock();
+        let _ = flush_corked_inner(inner);
+        inner.socket.close();
     }
 
     pub fn abort(&self) {
-        self.corked_tx.lock().clear();
-        self.socket.lock().abort();
+        let inner = &mut *self.inner.lock();
+        inner.corked_tx.clear();
+        inner.socket.abort();
     }
 
     pub fn reset(&self, options: &SocketOptionSet) {
-        *self.socket.lock() = Box::new(new_smoltcp_tcp_socket(
+        let inner = &mut *self.inner.lock();
+        inner.socket = Box::new(new_smoltcp_tcp_socket(
             self.recv_capacity,
             self.send_capacity,
             options,
         ));
-        *self.protocol_state.lock() = RawTcpProtocolState::default();
-        self.corked_tx.lock().clear();
+        inner.protocol_state = RawTcpProtocolState::default();
+        inner.corked_tx.clear();
     }
 
     pub fn mark_recv_closed_by_peer(&self) {
-        self.protocol_state.lock().is_recv_shut = true;
+        self.inner.lock().protocol_state.is_recv_shut = true;
     }
 
     pub fn listen_endpoint(&self, local: IpEndpoint) -> Result<(), RawTcpSocketError> {
         let endpoint = to_smoltcp_endpoint(local);
-        self.socket
+        self.inner
             .lock()
+            .socket
             .listen(endpoint)
             .map_err(|error| match error {
                 tcp::ListenError::InvalidState => RawTcpSocketError::InvalidState,
@@ -338,8 +331,9 @@ impl RawTcpSocket {
         remote: IpEndpoint,
     ) -> Result<(), RawTcpSocketError> {
         with_context(|cx| {
-            self.socket
+            self.inner
                 .lock()
+                .socket
                 .connect(cx, to_smoltcp_endpoint(remote), to_smoltcp_endpoint(local))
                 .map_err(|error| match error {
                     tcp::ConnectError::InvalidState => RawTcpSocketError::InvalidState,
@@ -349,16 +343,17 @@ impl RawTcpSocket {
     }
 
     pub fn protocol_state(&self) -> tcp::State {
-        self.socket.lock().state()
+        self.inner.lock().socket.state()
     }
 
     pub fn protocol_runtime_state(&self) -> RawTcpProtocolState {
-        *self.protocol_state.lock()
+        self.inner.lock().protocol_state
     }
 
     pub fn dispatch_segment(&self) -> Option<SmoltcpTcpSegment> {
         with_context(|cx| {
-            let mut socket = self.socket.lock();
+            let inner = &mut *self.inner.lock();
+            let socket = &mut inner.socket;
             let mut segment = None;
             let result = socket.dispatch(cx, |_, (ip_repr, tcp_repr)| {
                 segment = Some(SmoltcpTcpSegment::from_reprs(ip_repr, tcp_repr));
@@ -373,18 +368,16 @@ impl RawTcpSocket {
 
     pub fn process_segment(&self, segment: &SmoltcpTcpSegment) -> SmoltcpTcpProcessPublish {
         with_context(|cx| {
-            let mut socket = self.socket.lock();
-            let before = observe_socket(&socket);
+            let inner = &mut *self.inner.lock();
+            let before = observe_socket(&inner.socket);
             let tcp_repr = segment.tcp.as_repr(&segment.payload);
-            let _reply = if socket.accepts(cx, &segment.ip_repr, &tcp_repr) {
-                socket.process(cx, &segment.ip_repr, &tcp_repr)
+            let _reply = if inner.socket.accepts(cx, &segment.ip_repr, &tcp_repr) {
+                inner.socket.process(cx, &segment.ip_repr, &tcp_repr)
             } else {
                 None
             };
-            let after = observe_socket(&socket);
-            drop(socket);
-
-            let mut protocol_state = self.protocol_state.lock();
+            let after = observe_socket(&inner.socket);
+            let protocol_state = &mut inner.protocol_state;
             let mut publish = SmoltcpTcpProcessPublish::default();
             // Edge-detect "just became connected" from the smoltcp state
             // itself: TCP never re-enters the active set without a reset,
@@ -413,25 +406,59 @@ impl RawTcpSocket {
         })
     }
 
-    fn enqueue_protocol_tx_bytes(&self, bytes: &[u8]) -> Result<usize, tcp::SendError> {
-        self.socket.lock().send_slice(bytes)
+}
+
+/// Space = smoltcp tx ring headroom minus corked (not-yet-committed)
+/// bytes, which will need ring space when flushed.
+fn send_available_inner(inner: &TcpInner) -> usize {
+    if inner.socket.may_send() {
+        inner
+            .socket
+            .send_capacity()
+            .saturating_sub(inner.socket.send_queue())
+            .saturating_sub(inner.corked_tx.len())
+    } else {
+        0
+    }
+}
+
+fn flush_corked_inner(inner: &mut TcpInner) -> usize {
+    if inner.corked_tx.is_empty() {
+        return 0;
+    }
+    let bytes = core::mem::take(&mut inner.corked_tx);
+
+    let accepted = match inner.socket.send_slice(&bytes) {
+        Ok(accepted) => accepted,
+        Err(_) => {
+            prepend_corked_inner(inner, &bytes);
+            return 0;
+        }
+    };
+    if accepted == 0 {
+        prepend_corked_inner(inner, &bytes);
+        return 0;
     }
 
-    fn prepend_corked_tx(&self, bytes: &[u8]) {
-        if bytes.is_empty() {
-            return;
-        }
-        let mut corked = self.corked_tx.lock();
-        if corked.is_empty() {
-            corked.extend_from_slice(bytes);
-            return;
-        }
-
-        let mut combined = Vec::with_capacity(bytes.len() + corked.len());
-        combined.extend_from_slice(bytes);
-        combined.extend(corked.iter().copied());
-        *corked = combined;
+    if accepted < bytes.len() {
+        prepend_corked_inner(inner, &bytes[accepted..]);
     }
+    accepted
+}
+
+fn prepend_corked_inner(inner: &mut TcpInner, bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    if inner.corked_tx.is_empty() {
+        inner.corked_tx.extend_from_slice(bytes);
+        return;
+    }
+
+    let mut combined = Vec::with_capacity(bytes.len() + inner.corked_tx.len());
+    combined.extend_from_slice(bytes);
+    combined.extend(inner.corked_tx.iter().copied());
+    inner.corked_tx = combined;
 }
 
 fn new_smoltcp_tcp_socket(
