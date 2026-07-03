@@ -446,3 +446,75 @@ fn listener_close_drains_backlog_and_withdraws_connections() {
         "R2b: child connection must be withdrawn from the table on listener close"
     );
 }
+
+/// P3-C S3 (R2f): the ns↔socket strong cycle (ns→table→Cap→payload→
+/// net_namespace→ns) must be broken by close. With S1 (backlog drain +
+/// table withdraw) and S2 (owning-ns cleanup), closing a listener that
+/// had an accept-ready child releases both the listener's payload (its
+/// strong PayloadCap→ns ref) AND the connections-table strong Cap on the
+/// child. Asserts is_payload_live()==false for the listener and that the
+/// child's table registration is gone so nothing pins the ns.
+#[test]
+fn listener_close_breaks_namespace_reference_cycle() {
+    let _lock = setup();
+    let guard = tx_substrate::epoch::guard();
+    let listener = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Tcp,
+        SocketOptionSet::default_tcp(),
+    )
+    .expect("listener");
+    let local = endpoint(40_961);
+    let remote = endpoint(50_961);
+    let client_isn = 0x8000;
+
+    assert_eq!(
+        step_bind(&listener, inet(local.port), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(step_listen(&listener, 8, &guard), StepOutcome::Done(()));
+
+    let source = ScriptedPacketSource::new(std::vec![PacketDispatch::Tcp(tcp_segment_event(
+        remote, local, smoltcp::wire::TcpControl::Syn, client_isn, None,
+    ))]);
+    let _ = step_process_network_events(&source, &guard);
+    let child_isn = {
+        let payload = listener.acquire_operational().expect("payload");
+        let child = payload.connecting_child(local, remote).expect("child");
+        let cp = child.acquire_operational().expect("cp");
+        cp.raw_tcp_socket().unwrap().dispatch_segment().unwrap().tcp.seq_number.0
+    };
+    let source = ScriptedPacketSource::new(std::vec![PacketDispatch::Tcp(tcp_segment_event(
+        remote,
+        local,
+        smoltcp::wire::TcpControl::None,
+        client_isn.wrapping_add(1),
+        Some(child_isn.wrapping_add(1)),
+    ))]);
+    let _ = step_process_network_events(&source, &guard);
+
+    // Capture the child Cap and its table-inflated retain count.
+    let conn_key = ConnectionKey::new(local, remote);
+    let table = crate::net::structure::table::SOCKET_TABLE.as_table();
+    let child = table.lookup_tcp_connection(conn_key, &guard).expect("child in table");
+    let retain_with_table = child.retain_count();
+
+    let StepOutcome::Done(_) = step_socket_close(&listener, &guard) else {
+        panic!("close");
+    };
+
+    // R2f: listener payload released (its strong ns ref dropped).
+    assert!(
+        !listener.is_payload_live(),
+        "listener payload must be released on close (breaks socket→ns strong ref)"
+    );
+    // R2f: child no longer strong-held by the connections table.
+    assert!(
+        table.lookup_tcp_connection(conn_key, &guard).is_none(),
+        "child connection withdrawn"
+    );
+    assert!(
+        child.retain_count() < retain_with_table,
+        "child retain count must drop once the table no longer holds it \
+         (was {retain_with_table})"
+    );
+}

@@ -754,3 +754,68 @@ fn socket_readiness_carriers_visible_to_substrate_registry() {
         "fire_recv must notify the substrate mirror (epoll wake path)"
     );
 }
+
+/// P3-C S2 (R2c): the graceful-close cleanup path must withdraw the
+/// connection from the socket's OWN netns table, not the global
+/// initial-ns SOCKET_TABLE. Before the fix a non-initial-netns
+/// connection routed through cleanup left its real ns entry undeleted
+/// (leak + R2f ns pin). Registers a Connected socket in an isolated ns,
+/// runs cleanup, and asserts the isolated ns table entry is gone while
+/// the initial SOCKET_TABLE was never touched.
+#[test]
+fn tcp_cleanup_withdraws_from_owning_namespace_table() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let guard = tx_substrate::epoch::guard();
+    let ns = crate::net::create_isolated_net_namespace_for_test("r2c-ns")
+        .expect("isolated ns")
+        .payload_cap()
+        .expect("ns payload");
+    let sock = registry::create_socket_in_namespace(
+        SocketKind::Tcp,
+        SocketOptionSet::default_tcp(),
+        ns.clone(),
+    )
+    .expect("socket");
+    let local = endpoint(41_920);
+    let remote = endpoint(51_920);
+    let key = ConnectionKey::new(local, remote);
+
+    // Force the socket into Connected and register the connection in the
+    // isolated ns table (mirrors what a completed handshake does).
+    sock.acquire_operational()
+        .expect("payload")
+        .with_protocol_mut(|p| {
+            *p = SocketProtocol::Tcp(TcpState::Connected { local, remote });
+        });
+    ns.socket_table()
+        .insert_tcp_connection(key, sock.clone())
+        .expect("register connection in isolated ns");
+    assert!(
+        ns.socket_table().lookup_tcp_connection(key, &guard).is_some(),
+        "precondition: connection registered in isolated ns"
+    );
+    // The global initial-ns table must NOT have it (that's the whole point).
+    assert!(
+        SOCKET_TABLE
+            .as_table()
+            .lookup_tcp_connection(key, &guard)
+            .is_none(),
+        "connection must live only in the isolated ns table"
+    );
+
+    let StepOutcome::Done(outcome) = step_tcp_connection_cleanup(&sock, &guard) else {
+        panic!("cleanup should complete");
+    };
+    assert!(outcome.was_connected);
+    assert!(
+        outcome.local_withdrawn,
+        "R2c: cleanup must withdraw from the owning ns table"
+    );
+    assert!(
+        ns.socket_table().lookup_tcp_connection(key, &guard).is_none(),
+        "R2c: isolated ns connection must be gone after cleanup"
+    );
+}
