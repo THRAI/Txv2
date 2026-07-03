@@ -284,6 +284,8 @@ v1（[`REFACTOR_PLAN_A_v1.md`](REFACTOR_PLAN_A_v1.md)，保留作留痕）的引
 > **可执行细化见 [`REFACTOR_P3_v1.md`](REFACTOR_P3_v1.md)**（= P3-A 上半接入的 S1–S6：R4a 双表可见判决修复 + FileOps trait + 特判摘除 + 等待收敛；模型瘦身与 R 族修复拆为 P3-B/P3-C 另立文档）。关键取证：socket 早已是 fd 表一等公民（StructPayload::Socket 与 CharDevice 同壳，只是分发臂选了 EINVAL）；R4a 有 eventfd"双表登记"现成范式可照抄。
 >
 > **P3-B 细化见 [`REFACTOR_P3B_v1.md`](REFACTOR_P3B_v1.md)**（= 模型瘦身 S1–S4：enum SocketImpl 九槽收敛 + 每 socket 单锁/R1d 构造性消除 + 就绪单源/删 io 缓存）。关键取证：重写面全在 payload.rs 单文件（8 元组 match+63 触点）、kind→槽无例外满射、io 缓存唯一读方是 step_poll 可整体删除；D4"每 iface 锁"端态挂 P5，本波交付 socket 级复合原子。
+>
+> **P3-C 细化见 [`REFACTOR_P3C_v1.md`](REFACTOR_P3C_v1.md)**（= R 族资源修复 S1–S6：R2b listener-close 排空 backlog + R2c cleanup 用所属 ns 表 + R2f 引用环自解验证 + R2d TCP backing clamp + R2e conntrack 界/老化/非线性）。关键取证：R2b connected child 双注册(连接表+accept 队列)是泄漏核心；R2c 仅在 graceful-close 次路径(主路径已正确);同模块已有 ARP expires_at/重组容量上限/UDP 32KB clamp 三个现成范式可照抄;R2f 靠排表自解不需 Weak 化。
 
 ### P4 — 收尾：分层 + IPv6 + ICMP/DNS feature
 
