@@ -48,6 +48,15 @@ pub fn step_socket_close(
         SocketProtocol::Tcp(TcpState::Listening { local, .. }) => {
             bindings_withdrawn += withdraw_ok(table.withdraw_tcp_listener(local));
             bindings_withdrawn += withdraw_ok(table.withdraw_tcp_bound(local));
+            // R2b: drain the accept backlog. Accept-ready children were
+            // double-registered into the connections table at handshake
+            // time; withdraw them so their strong Cap (and the ns it
+            // pins) is released. Half-open children drop with the queue.
+            for entry in payload.drain_backlog_for_close() {
+                bindings_withdrawn += withdraw_ok(
+                    table.withdraw_tcp_connection(ConnectionKey::new(entry.local, entry.peer)),
+                );
+            }
         }
         SocketProtocol::Tcp(TcpState::Connecting { local, remote })
         | SocketProtocol::Tcp(TcpState::Connected { local, remote }) => {
@@ -70,6 +79,13 @@ pub fn step_socket_close(
             peer_recv_woken += notify_sctp_seqpacket_peers_closed(&payload, table, guard);
             bindings_withdrawn += withdraw_ok(table.withdraw_sctp_listener(local));
             bindings_withdrawn += withdraw_ok(table.withdraw_sctp_bound(local));
+            // R2b: SCTP listeners share the same backlog; accept-ready
+            // children were registered into the sctp connections table.
+            for entry in payload.drain_backlog_for_close() {
+                bindings_withdrawn += withdraw_ok(
+                    table.withdraw_sctp_connection(ConnectionKey::new(entry.local, entry.peer)),
+                );
+            }
         }
         SocketProtocol::Sctp(TcpState::Connecting { local, remote })
         | SocketProtocol::Sctp(TcpState::Connected { local, remote }) => {
@@ -128,9 +144,17 @@ pub fn step_socket_close(
             bindings_withdrawn += withdraw_ok(table.withdraw_unix_peer(socket.raw()));
         }
         SocketProtocol::UnixDatagram(UnixDatagramState::Unbound) => {}
-        SocketProtocol::UnixStream(UnixStreamState::Bound { local })
-        | SocketProtocol::UnixStream(UnixStreamState::Listening { local, .. }) => {
+        SocketProtocol::UnixStream(UnixStreamState::Bound { local }) => {
             bindings_withdrawn += withdraw_unix_binding_on_close(table, local);
+        }
+        SocketProtocol::UnixStream(UnixStreamState::Listening { local, .. }) => {
+            bindings_withdrawn += withdraw_unix_binding_on_close(table, local);
+            // R2b: UnixStream listeners share the backlog; accept-ready
+            // children were registered as stream peers keyed by raw().
+            for entry in payload.drain_backlog_for_close() {
+                bindings_withdrawn +=
+                    withdraw_ok(table.withdraw_unix_stream_peer(entry.child.raw()));
+            }
         }
         SocketProtocol::UnixStream(UnixStreamState::Connected { peer_raw, .. }) => {
             if let Some(peer) = table.lookup_unix_stream_peer(socket.raw(), guard) {

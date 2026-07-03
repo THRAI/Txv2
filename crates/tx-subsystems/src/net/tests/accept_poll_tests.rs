@@ -356,3 +356,93 @@ fn execution_poll_udp_readiness_tracks_io_snapshot() {
     assert!(mask.contains(PollMask::IN));
     assert!(mask.contains(PollMask::OUT));
 }
+
+/// P3-C S1 (R2b): closing a listener with accept-ready children in its
+/// backlog must withdraw those children from the connections table (they
+/// were double-registered at handshake). Before the fix, the child's
+/// strong Cap stayed in `tcp_connections` forever, pinning the child
+/// (320KB + identity + ns). Drives a full SYN→SYN-ACK→ACK handshake so a
+/// connected child lands in both the accept queue and the connections
+/// table, then closes the listener and asserts the table entry is gone.
+#[test]
+fn listener_close_drains_backlog_and_withdraws_connections() {
+    let _lock = setup();
+    let guard = tx_substrate::epoch::guard();
+    let listener = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Tcp,
+        SocketOptionSet::default_tcp(),
+    )
+    .expect("listener");
+    let local = endpoint(40_960);
+    let remote = endpoint(50_960);
+    let client_isn = 0x7000;
+
+    assert_eq!(
+        step_bind(&listener, inet(local.port), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(step_listen(&listener, 8, &guard), StepOutcome::Done(()));
+
+    // SYN → half-open child.
+    let source = ScriptedPacketSource::new(std::vec![PacketDispatch::Tcp(tcp_segment_event(
+        remote,
+        local,
+        smoltcp::wire::TcpControl::Syn,
+        client_isn,
+        None,
+    ))]);
+    assert!(matches!(
+        step_process_network_events(&source, &guard),
+        StepOutcome::Done(_)
+    ));
+    let child_isn = {
+        let payload = listener.acquire_operational().expect("payload");
+        let child = payload
+            .connecting_child(local, remote)
+            .expect("connecting child");
+        let cp = child.acquire_operational().expect("child payload");
+        cp.raw_tcp_socket()
+            .expect("child raw")
+            .dispatch_segment()
+            .expect("SYN-ACK")
+            .tcp
+            .seq_number
+            .0
+    };
+    // Final ACK → promote to accept queue + register in connections table.
+    let source = ScriptedPacketSource::new(std::vec![PacketDispatch::Tcp(tcp_segment_event(
+        remote,
+        local,
+        smoltcp::wire::TcpControl::None,
+        client_isn.wrapping_add(1),
+        Some(child_isn.wrapping_add(1)),
+    ))]);
+    assert!(matches!(
+        step_process_network_events(&source, &guard),
+        StepOutcome::Done(_)
+    ));
+
+    // Precondition: the child is registered under (local, remote) —
+    // step_connect keys the server child as (dst=local, src=remote).
+    let conn_key = ConnectionKey::new(local, remote);
+    let table = crate::net::structure::table::SOCKET_TABLE.as_table();
+    assert!(
+        table.lookup_tcp_connection(conn_key, &guard).is_some(),
+        "connected child must be in the connections table before close"
+    );
+    let payload = listener.acquire_operational().expect("payload");
+    assert_eq!(payload.accept_queue_len(), 1);
+
+    // Close the listener → backlog drained, connection withdrawn.
+    let StepOutcome::Done(outcome) = step_socket_close(&listener, &guard) else {
+        panic!("close should complete");
+    };
+    assert!(
+        outcome.bindings_withdrawn >= 1,
+        "close must withdraw the child connection (R2b)"
+    );
+    assert!(
+        table.lookup_tcp_connection(conn_key, &guard).is_none(),
+        "R2b: child connection must be withdrawn from the table on listener close"
+    );
+}

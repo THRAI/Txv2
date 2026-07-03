@@ -1057,6 +1057,25 @@ impl SocketPayload {
         self.tcp_backlog.lock().connecting_children()
     }
 
+    /// P3-C S1 (R2b): drain BOTH backlog queues on listener close and
+    /// return the `connected` (accept-ready) children — those were
+    /// double-registered into a connections table at handshake time
+    /// (step_connect.rs `insert_*_connection`/`insert_unix_stream_peer` +
+    /// `enqueue_accept_entry`), so the caller must withdraw them from the
+    /// right table (keyed by `(local, peer)` for TCP/SCTP, by `child.raw()`
+    /// for UnixStream) to release the strong `Cap` that otherwise pins the
+    /// child (and its ns) forever. `connecting` (half-open) children live
+    /// only in the backlog Vec and are freed as the drained entries drop.
+    pub(crate) fn drain_backlog_for_close(&self) -> Vec<SocketAcceptEntry> {
+        let mut backlog = self.tcp_backlog.lock();
+        let mut connected = Vec::new();
+        while let Some(entry) = backlog.pop_connected() {
+            connected.push(entry);
+        }
+        backlog.clear_connecting();
+        connected
+    }
+
     pub(crate) fn promote_connecting_to_accept(
         &self,
         local: IpEndpoint,
@@ -2058,6 +2077,13 @@ impl TcpBacklog {
             .iter()
             .map(|entry| entry.child.clone())
             .collect()
+    }
+
+    /// P3-C S1 (R2b): drop every half-open child on listener close. These
+    /// are not in the connections table (promoted only on final ACK), so
+    /// clearing the Vec releases their `Cap` directly.
+    pub fn clear_connecting(&mut self) {
+        self.connecting.clear();
     }
 
     pub fn cleanup_connecting(&mut self, now: Instant) -> (usize, usize, usize, usize) {
