@@ -95,4 +95,17 @@
 
 ---
 
-*P3-B 完成后：socket 模型 = 一个 enum、每 socket 一把锁、就绪一个来源；P3-C（R 族修复：R1c/e 残余、R2b/c/d/e/f 资源回收）在干净地基上另立执行文档。*
+## 7. 实施记录（2026-07-03 完成，S1–S4）
+
+<!-- txdoc:07-NET-P3B-V1-DONE -->
+
+- **S1**（ed037dc2）9 槽 → `enum SocketImpl`：18 字段 struct 收成"公共字段 + `imp: SocketImpl`"；构造 match 从九元组瘦成 `(protocol, imp)` 对，`Packet` 场外填充归一、`NetlinkXfrm/Netfilter` 合并臂；8 处元组 match（2~8 元）全收敛单臂、19 处 early-guard 改经 `SocketImpl` 访问器。5 访问器保签名 → 外部 72 调用点零改动。重写面如取证全落 payload.rs 单文件。
+- **S2**（92862a45）每 socket 单锁：`RawTcpSocket` 三锁（socket/protocol_state/corked_tx）并入 `inner: SpinMutex<TcpInner>`，`RawUdpSocket` 三锁（socket/corked_tx/tx_src_hint）同构。R1d 双窗口（stale-available、corked read→clear 覆盖）构造性消除——`available→combine→send_slice→clear` 一次锁获取。`process_segment` 的 socket→drop→protocol_state 两段锁舞消失。内部套用改 inner 级自由函数避免自锁。pub API 全保签名，锁序不变。
+- **S3**（b07b8f98）就绪单源：`io_snapshot` 从读缓存改实时派生（recv=raw_recv_available/send=raw_send_available/accept=backlog.connected_len）；删 `io` 字段 + `refresh_io_from_raw` + 27 调用点 + 3 处 accept 缓存写。R1b 撕裂随缓存消失。**过程抓修一个自锁死锁**：io_snapshot 实时派生内经 `raw_recv_available→with_protocol` 重锁 `protocol`，而 `step_poll_ready` 在 `with_protocol` 闭包内调 io_snapshot → SpinMutex 自旋死锁（dns recvfrom 挂起 / epoll_pwait 不返回）；修法=step_poll_ready 把 io_snapshot 提到 `with_protocol` 前算一次。宿主级冒烟二分定位。
+- **S4**（本提交）清扫：删无引用的 `SocketIoState::new()`（保 struct + Default）；文档/STATUS/记忆同步。
+
+**验收**：每步 host 集合差 312=312 全同 + 六冒烟（ext/tcp-lo/udp-lo/dns/seq/epoll）+ accept + bulk 32KB；la64 构建、busybox-boot 过。**R1 并发家族**以"窗口构造性不可能"论证交付，`-smp 4` 并发实证挂多核环境轮（本机多核不稳，与 D14b 同列）。
+
+---
+
+*P3-B 完成：socket 模型 = 一个 enum、每 socket 一把锁、就绪一个来源；P3-C（R 族修复：R1c/e 残余、R2b/c/d/e/f 资源回收）在干净地基上另立执行文档。*

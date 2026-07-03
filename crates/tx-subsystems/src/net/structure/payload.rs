@@ -1258,16 +1258,6 @@ pub struct SocketIoState {
     pub accept_pending: usize,
 }
 
-impl SocketIoState {
-    pub const fn new() -> Self {
-        Self {
-            recv_len: 0,
-            send_space: 0,
-            accept_pending: 0,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UnixPeerCred {
     pub pid: u32,

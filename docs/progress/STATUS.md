@@ -1,3 +1,13 @@
+- 2026-07-03 (P3-B 模型瘦身完成 — enum SocketImpl/每socket单锁/就绪单源,R1d+R1b 构造性消除). 计划=REFACTOR_P3B_v1.md
+  (两路取证:迁移面全在 payload.rs 单文件+kind→槽无例外满射;io 缓存唯一读方 step_poll)。**S1**(ed037dc2):9 槽 Option
+  换 enum SocketImpl 单字段,8 元组 match 收单臂,5 访问器保签名→外部 72 调用零改。**S2**(92862a45):RawTcp/RawUdp 三锁
+  各并一(inner: SpinMutex<TcpInner/UdpInnerState>),R1d 双窗口(stale-available/corked read→clear 覆盖)构造性消除,
+  available→combine→send_slice→clear 一次锁获取,pub API 全保签名。**S3**(b07b8f98):io_snapshot 改实时派生,删 io 字段+
+  refresh_io_from_raw+27 调用点+3 accept 缓存写,R1b 撕裂随缓存消失。**过程抓修自锁死锁**:io_snapshot 派生内经
+  raw_recv_available→with_protocol 重锁 protocol,step_poll_ready 在 with_protocol 内调 io_snapshot→SpinMutex 自旋死锁
+  (dns 挂/epoll 不返回);修法=io_snapshot 提到 with_protocol 前算一次。**S4**(本轮):删无引用 SocketIoState::new。**验收**:
+  每步集合差 312=312+六冒烟+accept+bulk32K;la64/boot 过。R1 并发以构造性论证交付,-smp4 实证挂多核轮。**Next**:P3-C
+  (R 族资源修复 R1c/e/R2b-f)另立文档,或 LTP 环境轮补 D14b+全量+并发。**Blocker**:无。
 - 2026-07-03 (P3-A S4-S6 收官 — poll/F_SETFL/close 全进 FileOps,死代码清扫,D14b 移交 LTP 轮). **S4**(5a097f37):FileOps
   增 poll_mask/poll_wait_token,OpenFile 增 file_ops() 访问器,shim 两 poll 助手换轨 trait 分派(ppoll/pselect/epoll 调用
   点零改动)。**S5**(e3b426b4):增 on_set_fl_nonblock/on_last_close 带默认钩子;F_SETFL 特判、close 双相 bolt-on、进程
