@@ -281,6 +281,8 @@ v1（[`REFACTOR_PLAN_A_v1.md`](REFACTOR_PLAN_A_v1.md)，保留作留痕）的引
 - **修**：⑤（FileOps 取代特判）、⑥/R4a（wait 收敛 `await_wait_source`、epoll 对 socket 阻塞注册表统一）、⑨（字段）、②（双份/三处记账）、R1b–e（并发）、R2b/c/d/f（close 排空 backlog、所属 ns 表、补 Drop、断引用环）、R2e（conntrack 加界+老化）。
 - **验证**：全 LTP net 不退化 + 并发压力 + 内存（大量连接不 OOM、close 不泄漏）。
 
+> **可执行细化见 [`REFACTOR_P3_v1.md`](REFACTOR_P3_v1.md)**（= P3-A 上半接入的 S1–S6：R4a 双表可见判决修复 + FileOps trait + 特判摘除 + 等待收敛；模型瘦身与 R 族修复拆为 P3-B/P3-C 另立文档）。关键取证：socket 早已是 fd 表一等公民（StructPayload::Socket 与 CharDevice 同壳，只是分发臂选了 EINVAL）；R4a 有 eventfd"双表登记"现成范式可照抄。
+
 ### P4 — 收尾：分层 + IPv6 + ICMP/DNS feature
 
 - `ether.rs` 拆 `link/`（L2 帧编解码）/ `net/`（L3）；开 `socket-icmp`（ping 走 smoltcp）、按需 `proto-dns`；netfilter/bridge 移出 device 层、桥接确定化（D9）。
