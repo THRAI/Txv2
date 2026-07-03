@@ -1,3 +1,14 @@
+- 2026-07-03 (P3-C R 族资源修复完成 — backlog 排空/所属 ns 表/引用环/TCP 记账/conntrack 界老化). 计划=REFACTOR_P3C_v1.md
+  (两路取证钉死每条 R2)。**S1**(c7db9a7f)R2b:listener close 排空 backlog+撤连接表(connected child 双注册是泄漏核心;
+  TCP/SCTP/UnixStream 三分支各撤对应表)。**S2**(a39e5669)R2c:step_tcp_cleanup 用 payload.socket_table() 所属 ns 表
+  (原硬编码 SOCKET_TABLE,仅 graceful-close 次路径中招)。**S3**(a39e5669)R2f:验证测试证 close 后 is_payload_live=false+
+  child retain_count 降,引用环随 S1/S2 自解(不需 Weak)。**S4**(167b9e2f)R2d:TCP backing clamp 64KB(仿 UDP),320KB→
+  ≤128KB,上报值不变;bulk 尾段 flaky 经 stash 对照证实既有非 clamp。**S5**(b98821e6)R2e:conntrack 两 Vec 加
+  last_seen+TTL120s+cap4096,insert expire_and_cap+命中刷新,bounded 表消无界增长与退化;裁量不改 BTreeMap(reply 非对称
+  需反向索引)。**S6 挂账**:R1e bind 原子需 -smp4 验证,与 R1c/D14b/多核同族移交环境轮。判决单测各步齐(R2b 握手→撤表/
+  R2c 隔离 ns/R2f 引用环/R2d clamp/R2e 老化 cap)。**验收**:每步集合差零真回归(唯一入列 R2c 单跑绿=毒锁级联)+六冒烟+
+  bridge netfilter_* 单跑绿+bulk32K+la64/boot。**P3 三波(A 接入/B 瘦身/C 资源)全部收官,审计 ①-⑩+R1-R4 主体落地**。
+  **Next**:P4(分层+IPv6 控制面+ICMP/DNS feature+R3a 校验和)或环境轮(LTP 全量+D14b+多核并发+net_stress)。**Blocker**:无。
 - 2026-07-03 (P3-B 模型瘦身完成 — enum SocketImpl/每socket单锁/就绪单源,R1d+R1b 构造性消除). 计划=REFACTOR_P3B_v1.md
   (两路取证:迁移面全在 payload.rs 单文件+kind→槽无例外满射;io 缓存唯一读方 step_poll)。**S1**(ed037dc2):9 槽 Option
   换 enum SocketImpl 单字段,8 元组 match 收单臂,5 访问器保签名→外部 72 调用零改。**S2**(92862a45):RawTcp/RawUdp 三锁

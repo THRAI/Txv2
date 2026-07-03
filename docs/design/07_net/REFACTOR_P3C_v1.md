@@ -90,4 +90,19 @@
 
 ---
 
-*P3-C 完成后：socket/conntrack 资源在 close 与转发路径上有界、可回收、非线性；P3 三波（A 接入 / B 瘦身 / C 资源）全部收官，审计 ①–⑩ + R1-R4 主体落地，余 R3a 校验和（归 P4 输入验证）、D14b 等待收敛（LTP 轮）、多核并发实证（环境轮）、D4 每 iface 锁端态（P5）。*
+## 6. 实施记录（2026-07-03 完成，S1–S5 + S6 挂账）
+
+<!-- txdoc:07-NET-P3C-V1-DONE -->
+
+- **S1**（c7db9a7f）R2b：`step_socket_close` 三种 listener 分支（TCP/SCTP/UnixStream 共用 tcp_backlog）close 前 `drain_backlog_for_close` 排空两队列，connected child 从对应连接表撤销（TCP `withdraw_tcp_connection`/SCTP `withdraw_sctp_connection`/UnixStream `withdraw_unix_stream_peer(child.raw())`）；`TcpBacklog::clear_connecting` 新增。判决单测=完整握手→connected child 双注册→close→断言连接表撤销。
+- **S2**（a39e5669）R2c：`step_tcp_cleanup` 的 `withdraw_connection_key` 从硬编码 `SOCKET_TABLE` 改经 `payload.socket_table()` 用所属 ns 表。判决单测=隔离 ns Connected 连接→cleanup→断言该 ns 表删、初始 SOCKET_TABLE 未动。
+- **S3**（a39e5669）R2f：无代码改动，验证测试证明 close 后 `is_payload_live()==false`（断 socket→ns 强链）+ child retain_count 下降（断 table→Cap），引用环随 S1/S2 自解。
+- **S4**（167b9e2f）R2d：`TCP_SMOLTCP_BACKING_MAX_BYTES=64KB` clamp（仿 UDP），vec 分配经 `tcp_backing_bytes`；每 socket 320KB→≤128KB。上报值不变（getsockopt 读 options）。**吞吐严格对照**：bulk 32KB 尾段 flaky 经 stash pre-S4 证实为既有外部 close-flush + nc 时序,非 clamp。
+- **S5**（b98821e6）R2e：两 conntrack entry 加 `last_seen`；`CONNTRACK_TTL=120s`+`CONNTRACK_MAX_ENTRIES=4096`；insert `expire_and_cap`（retain 过期+满驱逐 LRS）、dedup/reply 命中刷新。bounded 表→bounded 扫描。判决单测（受控 Instant）=过期剔除+cap 驱逐。**裁量**：不改 BTreeMap（reply 非对称查找需反向索引=NAT 方向 bug 藏身处），cap 已把 O(n) 有界化。
+- **S6（挂账，未做）** R1e bind check-then-act：需 SocketTable `bind_if_absent` 复合原子入口，且只能 `-smp 4` 决定性验证（本机多核不稳）——与 R1c（FSM 分离记账不改）、D14b、多核并发同族，**移交环境轮**，不做无法验证的改动。
+
+**验收**：每步 host 集合差零真回归（唯一入列的 R2c 测试单跑绿=毒锁级联，同 P3-A/B 惯例）+ 六冒烟 + bridge conntrack netfilter_* 单跑绿 + bulk32K + la64/boot。R2b/c/f 以"表撤销+payload 释放"结构性断言交付；conntrack 无界压力实证挂 net_stress 环境轮。
+
+---
+
+*P3-C 完成：socket/conntrack 资源在 close 与转发路径上有界、可回收；P3 三波（A 接入 / B 瘦身 / C 资源）全部收官，审计 ①–⑩ + R1-R4 主体落地。余账（均已记录）：R1e bind 原子（S6，环境轮）、R1c FSM 双读（记账不改）、R3a 校验和（P4 输入验证）、D14b 等待收敛（LTP 轮）、多核并发实证+net_stress 内存压力（环境轮）、D4 每 iface 锁端态（P5）。*
