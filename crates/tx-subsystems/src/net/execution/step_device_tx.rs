@@ -211,6 +211,11 @@ pub fn step_process_device_tx_pending_in_namespace_at(
     StepOutcome::Done(outcome)
 }
 
+/// Per-socket drain bound for one device-TX pass (P2-S4). Keeps a single
+/// bulk sender from monopolising the delegate round while still letting a
+/// multi-MSS send queue empty in one pass instead of one-segment-per-wake.
+const TCP_TX_SOCKET_DRAIN_BUDGET: usize = 16;
+
 fn process_tcp_tx_socket(
     socket: &Cap<SocketIdentity>,
     sink: &dyn PacketTxSink,
@@ -224,33 +229,47 @@ fn process_tcp_tx_socket(
     let Some(raw_tcp) = payload.raw_tcp_socket() else {
         return;
     };
-    if sink.readiness_at(now, guard) == PacketTxReadiness::Busy {
-        outcome.tcp_busy += 1;
-        return;
-    }
-    let Some(packet) = raw_tcp
-        .dispatch_segment()
-        .and_then(|segment| segment.emit_ipv4_packet())
-    else {
-        return;
-    };
-
-    outcome.tcp_attempted += 1;
-    match sink.transmit_at(packet.as_bytes(), now, guard) {
-        PacketTxResult::Accepted { frame_len } => {
-            outcome.tcp_packets += 1;
-            outcome.tx_bytes += frame_len;
-            outcome.sockets_touched += 1;
-        }
-        PacketTxResult::Busy => {
+    // P2-S4 drain loop: keep dispatching until smoltcp has nothing to send,
+    // the sink backpressures, or the per-socket budget is spent. A segment
+    // popped by `dispatch_segment` that the sink then refuses is recovered
+    // by smoltcp's RTO (same exposure as the previous single-shot shape);
+    // the readiness probe before each dispatch keeps that window small.
+    let mut sent = false;
+    for _ in 0..TCP_TX_SOCKET_DRAIN_BUDGET {
+        if sink.readiness_at(now, guard) == PacketTxReadiness::Busy {
             outcome.tcp_busy += 1;
+            break;
         }
-        PacketTxResult::PendingResolution { .. } => {
-            outcome.tcp_resolution_pending += 1;
+        let Some(packet) = raw_tcp
+            .dispatch_segment()
+            .and_then(|segment| segment.emit_ipv4_packet())
+        else {
+            break;
+        };
+
+        outcome.tcp_attempted += 1;
+        match sink.transmit_at(packet.as_bytes(), now, guard) {
+            PacketTxResult::Accepted { frame_len } => {
+                outcome.tcp_packets += 1;
+                outcome.tx_bytes += frame_len;
+                sent = true;
+            }
+            PacketTxResult::Busy => {
+                outcome.tcp_busy += 1;
+                break;
+            }
+            PacketTxResult::PendingResolution { .. } => {
+                outcome.tcp_resolution_pending += 1;
+                break;
+            }
+            PacketTxResult::Failed { .. } => {
+                outcome.tcp_failed += 1;
+                break;
+            }
         }
-        PacketTxResult::Failed { .. } => {
-            outcome.tcp_failed += 1;
-        }
+    }
+    if sent {
+        outcome.sockets_touched += 1;
     }
 }
 

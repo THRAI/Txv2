@@ -324,3 +324,123 @@ fn process_tcp_event_active_client_segment_promotes_to_connected() {
     );
     assert!(client.readiness.send_wq.peek() & SendWireSet::SPACE.bits() != 0);
 }
+
+/// P2-S4 soul test: one device-TX pass drains a multi-segment send queue
+/// (>=2 segments) instead of the previous one-segment-per-delegate-wake
+/// shape. Establishes an external client exactly like the focused test
+/// above, enqueues >2xMSS of payload, and counts frames a single
+/// `step_process_device_tx_pending` pass hands the sink.
+#[test]
+fn device_tx_single_pass_drains_multiple_segments() {
+    let _lock = setup();
+
+    let device = leak_virtio_device(2, 2);
+    let registration = leak_virtio_registration(device, 73);
+    crate::net::initial_net_namespace_payload()
+        .attach_device_for_test_or_bootstrap(registration, Some(LOCAL_IP))
+        .expect("attach virtio test device to initial net namespace");
+
+    let guard = tx_substrate::epoch::guard();
+
+    let client_port = 51_273u16;
+    let server_port = 41_273u16;
+    let local = IpEndpoint::new(LOCAL_IP, client_port);
+    let remote = IpEndpoint::new(REMOTE_IP, server_port);
+
+    let client = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Tcp,
+        SocketOptionSet::default_tcp(),
+    )
+    .expect("tcp client");
+    assert_eq!(
+        step_bind(&client, inet_addr(client_port, LOCAL_IP), &guard),
+        StepOutcome::Done(())
+    );
+    assert!(matches!(
+        step_connect(&client, inet_addr(server_port, REMOTE_IP), &guard),
+        StepOutcome::Yield {
+            shape: YieldShape::OnWaitSource { .. },
+            ..
+        }
+    ));
+
+    let client_payload = client.acquire_operational().expect("client payload");
+    let client_raw = client_payload.raw_tcp_socket().expect("client raw tcp");
+    let syn = client_raw.dispatch_segment().expect("client SYN segment");
+    let client_isn = syn.tcp.seq_number.0;
+
+    let ip_bytes = {
+        let frame = ethernet_tcp_frame(
+            remote,
+            local,
+            smoltcp::wire::TcpControl::Syn,
+            0x6161,
+            Some(client_isn.wrapping_add(1)),
+        );
+        frame[14..].to_vec()
+    };
+    let segment = SmoltcpTcpSegment::parse_ipv4_packet(&LoopbackIpPacket::new(ip_bytes))
+        .expect("parsed syn-ack segment");
+    let event = TcpPacketEvent::new(
+        remote,
+        local,
+        TcpPacketFlags {
+            syn: true,
+            ack: true,
+            rst: false,
+        },
+        std::vec::Vec::new(),
+        false,
+    )
+    .with_segment(Some(segment));
+    let source = ScriptedPacketSource::new(std::vec![PacketDispatch::Tcp(event)]);
+    assert!(matches!(
+        step_process_network_events(&source, &guard),
+        StepOutcome::Done(_)
+    ));
+    assert_eq!(
+        client_raw.protocol_state(),
+        smoltcp::socket::tcp::State::Established
+    );
+
+    // >2xMSS payload: the crafted SYN-ACK advertised no MSS option, so
+    // smoltcp caps outgoing segments at its default remote MSS; 4000
+    // bytes must split into several segments (peer window is 4096).
+    let reserve = client_raw
+        .enqueue_tx_bytes(&std::vec![0xa5u8; 4000])
+        .expect("enqueue tx bytes");
+    assert!(reserve.bytes >= 2000, "send queue too small: {}", reserve.bytes);
+
+    struct CountingSink {
+        frames: core::sync::atomic::AtomicUsize,
+    }
+    impl PacketTxSink for CountingSink {
+        fn transmit(&self, frame: &[u8], _guard: &Guard<'_>) -> PacketTxResult {
+            self.frames
+                .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+            PacketTxResult::Accepted {
+                frame_len: frame.len(),
+            }
+        }
+    }
+    let sink = CountingSink {
+        frames: core::sync::atomic::AtomicUsize::new(0),
+    };
+
+    let StepOutcome::Done(tx) = step_process_device_tx_pending_in_namespace_at(
+        &sink,
+        crate::net::initial_net_namespace_payload(),
+        smoltcp::time::Instant::from_millis(5),
+        DeviceTxBudget::default(),
+        &guard,
+    ) else {
+        panic!("device tx pass should complete");
+    };
+    let frames = sink.frames.load(core::sync::atomic::Ordering::Acquire);
+    assert!(
+        tx.tcp_packets >= 2 && frames >= 2,
+        "one pass must drain multiple segments (tcp_packets={}, frames={})",
+        tx.tcp_packets,
+        frames
+    );
+}
