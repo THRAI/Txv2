@@ -1,3 +1,14 @@
+- 2026-07-03 (P2-S3 入站真握手完成 — 外部 accept 真机打通,附带证实 net-git stage3 冷 RX 悬案+落混合 pump). 外部 SYN
+  分支废除假握手(手工 Connected child 直进 accept、SYN-ACK 不发),重写为真握手三分支:表命中喂段/首 SYN 建半开 child
+  (`listen_endpoint`+喂 SYN,smoltcp 排 SYN-ACK)/半开兜底喂段(终 ACK 走此路);晋升复用 loopback 的
+  promote_connected_stream_and_publish_accept(晋升时才入连接表,完全对称);SYN-ACK 初发+RTO 重传=device-TX 新增
+  **半开车道**(遍历 listener connecting backlog 调 dispatch_segment,smoltcp 门控)——**§6-1 iface trait 免了**(P1 后
+  握手机制已 iface 无关)。假握手 wrapper 删除;镜像灵魂测试重写(SYN→断言半开+SYN-ACK ack 号→ACK→断言晋升)。新增
+  tools/user/tcp-external-accept-smoke.c 验收载体。**验收**:hostfwd+宿主 nc 真机 3/3(pcap: SYN→SYN-ACK→ACK→双向
+  数据);回归全绿(tx-subsystems 308=308 集合全同/unit 仅既有 ext4/出站 ext-ok/loopback tcp+udp/busybox-boot)。
+  **附带发现**:QEMU virtio-mmio 冷空闲态 RX 帧进缓冲但不举中断(探针 pump-rx-ready=1/extirq=0)=net-git stage3 悬案
+  证实;按 §6-4 预案落混合形态=IRQ(活跃流)+反应器 WFI 空闲拍 5ms pump 兜底(exec.rs);纯 IRQ 之谜单独立项。**Next**:
+  S4 多段 TX。**Blocker**:无。
 - 2026-07-03 (P2 connect-resume 终局:真凶=两个可修 bug,"平台限制"说证伪,坑5 关闭,外部 TCP 全生命周期打通). 用户
   追问真因,三轮死磕改判。新探针(eu-ret/await-ok/extirq-wake)证明 **longjmp 其实回来了**(旧插桩只数"出发"未数"回程
   落点"),线程 park 在 entry_wait.await(thread_future.rs:635)等一个永远无人解决的 slot。排除法收口:唯一"longjmp 但

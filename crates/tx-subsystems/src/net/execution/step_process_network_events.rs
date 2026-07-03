@@ -1,17 +1,22 @@
-use smoltcp::time::Instant;
+use alloc::vec::Vec;
+use smoltcp::time::{Duration, Instant};
 use tx_substrate::zone::PayloadCap;
 
 use crate::execution::{Guard, StepOutcome};
 use crate::net::namespace::{initial_net_namespace_payload, NetNamespacePayload};
 use crate::net::packet::{
-    NetworkPublish, PacketDispatch, PacketSource, TcpPacketEvent, UdpPacketEvent,
+    NetworkPublish, NetworkPublishTarget, PacketDispatch, PacketSource, TcpPacketEvent,
+    UdpPacketEvent,
 };
-use crate::net::protocol::{Icmpv4Event, LoopbackIface};
+use crate::net::protocol::{
+    is_first_syn, listener_accepts_incoming, promote_connected_stream_and_publish_accept,
+    Icmpv4Event, LoopbackIface, SmoltcpTcpSegment,
+};
 use crate::net::structure::registry;
 use crate::net::structure::table::SocketTable;
 use crate::net::structure::{
-    ConnectionKey, Ipv4Address, RecvWireSet, SocketAcceptEntry, SocketIdentity, SocketProtocol,
-    TcpBacklogRetransmitOutcome, TcpState,
+    ConnectionKey, Ipv4Address, RecvWireSet, SocketIdentity, SocketKind, SocketProtocol,
+    TcpBacklogEntry, TcpBacklogRetransmitOutcome, TcpState, TCP_BACKLOG_TIMEOUT_STAGING_MILLIS,
 };
 use tx_substrate::zone::Cap;
 
@@ -93,11 +98,11 @@ pub fn step_process_network_events_in_namespace_at(
 
         match packet {
             PacketDispatch::Tcp(event) => {
-                if let Some((socket, publish)) =
-                    process_tcp_event(table, &net_namespace, event, guard)
-                {
+                if let Some(targets) = process_tcp_event(table, &net_namespace, event, now, guard) {
                     outcome.sockets_touched += 1;
-                    outcome.wakes_fired += publish.publish_to(&socket);
+                    for target in targets {
+                        outcome.wakes_fired += target.publish();
+                    }
                 }
             }
             PacketDispatch::Udp(event) => {
@@ -274,10 +279,11 @@ fn earliest_deadline(current: Option<Instant>, candidate: Instant) -> Option<Ins
 
 fn process_tcp_event(
     table: &SocketTable,
-    net_namespace: &PayloadCap<NetNamespacePayload>,
+    _net_namespace: &PayloadCap<NetNamespacePayload>,
     event: TcpPacketEvent,
+    now: Instant,
     guard: &Guard<'_>,
-) -> Option<(Cap<SocketIdentity>, NetworkPublish)> {
+) -> Option<Vec<NetworkPublishTarget>> {
     let key = ConnectionKey::new(event.dst, event.src);
     if let Some(socket) = table.lookup_tcp_connection(key, guard) {
         let payload = socket.acquire_operational()?;
@@ -286,65 +292,134 @@ fn process_tcp_event(
         // parsed segment (hand-built) cannot enter an established
         // connection and are dropped.
         let segment = event.segment.as_ref()?;
-        let raw = payload.raw_tcp_socket()?;
-        let bits = raw.process_segment(segment);
-        payload.refresh_io_from_raw();
-        // Outbound-client handshake completion: the SYN-ACK just drove
-        // smoltcp into Established. Promote the protocol enum
-        // Connecting -> Connected and make sure SPACE fires so the parked
-        // connect() resumes. (Listener children go through the backlog
-        // promotion instead — P2-S3.)
-        let mut connected_now = false;
-        if bits.connected {
-            connected_now = payload.with_protocol_mut(|protocol| {
-                if let SocketProtocol::Tcp(TcpState::Connecting { local, remote }) = protocol {
-                    let (local, remote) = (*local, *remote);
-                    *protocol = SocketProtocol::Tcp(TcpState::Connected { local, remote });
-                    true
-                } else {
-                    false
-                }
-            });
-        }
-        let publish = NetworkPublish {
-            recv_has_data: bits.recv_readable
-                || socket.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() == 0
-                    && raw.recv_available() > 0,
-            send_has_space: connected_now || bits.send_writable,
-            recv_broken: bits.broken || bits.recv_closed,
-            send_broken: bits.broken || bits.send_closed,
-            urgent: event.urgent,
-            ..NetworkPublish::none()
-        };
-        return Some((socket, publish));
+        return Some(feed_tcp_segment(
+            table,
+            &socket,
+            &payload,
+            segment,
+            event.urgent,
+            guard,
+        ));
     }
 
-    if event.flags.syn && !event.flags.ack {
-        let socket = table.lookup_tcp_listener_endpoint(event.dst, guard)?;
-        let payload = socket.acquire_operational()?;
-        let options = payload.with_options(Clone::clone);
-        let child = registry::create_connected_stream_for_accept_in_namespace(
-            event.dst,
-            event.src,
-            options,
-            net_namespace.clone(),
-        )
-        .ok()?;
-        table.insert_tcp_connection(key, child.clone()).ok()?;
-        let entry = SocketAcceptEntry {
-            child,
+    // No connection matched: only checksum-verified parsed segments may
+    // participate in handshakes (hand-built events cannot).
+    let segment = event.segment.as_ref()?;
+
+    // P2-S3: real inbound handshake (mirror of the loopback
+    // `process_first_syn_for_listener` flow). The child is NOT inserted
+    // into the connections table here — it lives in the listener's
+    // connecting backlog until the final ACK promotes it (loopback
+    // parity); mid-handshake segments route via the backlog below.
+    let listener = table.lookup_tcp_listener_dual_stack_endpoint(event.dst, guard)?;
+    let listener_payload = listener.acquire_operational()?;
+    if !listener_accepts_incoming(&listener_payload, event.dst) {
+        return None;
+    }
+
+    if let Some(child) = listener_payload.connecting_child(event.dst, event.src) {
+        // Half-open child exists: the final ACK completes the handshake
+        // (feed → connected edge → accept promotion); a retransmitted SYN
+        // re-queues the SYN-ACK inside smoltcp. Either way, feed it.
+        let child_payload = child.acquire_operational()?;
+        return Some(feed_tcp_segment(
+            table,
+            &child,
+            &child_payload,
+            segment,
+            event.urgent,
+            guard,
+        ));
+    }
+
+    if !is_first_syn(segment) {
+        return None;
+    }
+
+    let options = listener_payload.with_options(Clone::clone);
+    let child = registry::create_socket_in_namespace_with_family(
+        SocketKind::Tcp,
+        listener_payload.family(),
+        options,
+        listener_payload.net_namespace(),
+    )
+    .ok()?;
+    let child_payload = child.acquire_operational()?;
+    child_payload.with_protocol_mut(|protocol| {
+        *protocol = SocketProtocol::Tcp(TcpState::Connecting {
             local: event.dst,
-            peer: event.src,
-            unix_peer: None,
-        };
-        let mut publish = NetworkPublish::none();
-        if payload.enqueue_accept_entry(entry)? {
-            publish.accept_has_pending = true;
+            remote: event.src,
+        });
+    });
+    child_payload.raw_tcp_socket()?.listen_endpoint(event.dst).ok()?;
+    // Backlog full ⇒ enqueue fails ⇒ drop the SYN (Linux semantics: the
+    // client retries; the just-created child is reclaimed with its Cap).
+    listener_payload.enqueue_connecting_entry(TcpBacklogEntry {
+        child: child.clone(),
+        local: event.dst,
+        peer: event.src,
+        created_at: now,
+        deadline: now + Duration::from_millis(TCP_BACKLOG_TIMEOUT_STAGING_MILLIS as u64),
+        attempts: 1,
+    })?;
+    // Feed the SYN: smoltcp moves to SynReceived and queues the SYN-ACK.
+    // The device-TX half-open lane emits it (and its RTO retransmits).
+    Some(feed_tcp_segment(
+        table,
+        &child,
+        &child_payload,
+        segment,
+        event.urgent,
+        guard,
+    ))
+}
+
+/// Feed one checksum-verified segment into a socket's smoltcp state
+/// machine and derive the publish set. Shared by the established branch,
+/// the half-open backlog branch, and the first-SYN feed.
+fn feed_tcp_segment(
+    table: &SocketTable,
+    socket: &Cap<SocketIdentity>,
+    payload: &crate::net::structure::SocketOperationalEvidence,
+    segment: &SmoltcpTcpSegment,
+    urgent: bool,
+    guard: &Guard<'_>,
+) -> Vec<NetworkPublishTarget> {
+    let Some(raw) = payload.raw_tcp_socket() else {
+        return Vec::new();
+    };
+    let bits = raw.process_segment(segment);
+    payload.refresh_io_from_raw();
+
+    let mut publishes = Vec::new();
+    if bits.connected {
+        // Inbound child: flip Connecting→Connected, register the
+        // connection in the table, move the backlog entry to the accept
+        // queue, and publish accept-readiness to the listener. Outbound
+        // client: the enum flip still happens inside, but no listener
+        // matches its ephemeral local port, so this returns None and the
+        // SPACE publish below resumes the parked connect().
+        if let Some(accept_publish) =
+            promote_connected_stream_and_publish_accept(table, socket, payload, guard)
+        {
+            publishes.push(accept_publish);
         }
-        return Some((socket, publish));
     }
 
-    None
+    let publish = NetworkPublish {
+        recv_has_data: bits.recv_readable
+            || socket.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() == 0
+                && raw.recv_available() > 0,
+        send_has_space: bits.connected || bits.send_writable,
+        recv_broken: bits.broken || bits.recv_closed,
+        send_broken: bits.broken || bits.send_closed,
+        urgent,
+        ..NetworkPublish::none()
+    };
+    if publish.has_any() {
+        publishes.push(NetworkPublishTarget::new(socket.clone(), publish));
+    }
+    publishes
 }
 
 fn process_icmp_event(

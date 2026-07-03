@@ -797,6 +797,20 @@ impl<P: TxPlatform> CoreInit<P> {
                 // PLIC path is active since `read_bytes` returns 0 once the
                 // FIFO has already been drained by the IRQ handler.
                 Self::drain_sbi_console_into_tty();
+                // Net RX idle backstop pump (P2-S3). QEMU's virtio-mmio
+                // net device demonstrably delivers frames into primed RX
+                // buffers WITHOUT raising the interrupt line when the
+                // guest has been idle (the net-git "stage3 RX descriptor"
+                // mystery, reconfirmed 2026-07-03 with a pcap + probe
+                // matrix: cold ARP/SYN frames sat in the used ring, PLIC
+                // saw nothing). Until that device-model quirk is pinned,
+                // poll the device once per idle tick (~5 ms, WFI branch
+                // only — never on hot syscall paths). IRQs still deliver
+                // low-latency RX during active flows; this recovers the
+                // cold-start / missed-interrupt case.
+                if let Some(reg) = tx_subsystems::net::net_device_by_name(b"eth0") {
+                    let _ = reg.ops.ack_interrupt_and_fire();
+                }
                 // Flush deferred EBR drops so pipe write-end close
                 // propagates to blocked readers. OpenFile::drop() (which
                 // calls decr_writer → EOF signal) fires only when EBR

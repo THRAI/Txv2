@@ -469,11 +469,11 @@ struct SegmentProcessTarget {
     publishes: Vec<NetworkPublishTarget>,
 }
 
-fn is_first_syn(segment: &SmoltcpTcpSegment) -> bool {
+pub(crate) fn is_first_syn(segment: &SmoltcpTcpSegment) -> bool {
     segment.tcp.control == TcpControl::Syn && segment.tcp.ack_number.is_none()
 }
 
-fn listener_accepts_incoming(
+pub(crate) fn listener_accepts_incoming(
     listener_payload: &crate::net::structure::SocketOperationalEvidence,
     dst: IpEndpoint,
 ) -> bool {
@@ -524,7 +524,7 @@ fn raw_icmp_accepts_reply(protocol: &SocketProtocol, dst: Ipv4Address) -> bool {
     }
 }
 
-fn promote_connected_stream_and_publish_accept(
+pub(crate) fn promote_connected_stream_and_publish_accept(
     table: &SocketTable,
     socket: &Cap<SocketIdentity>,
     payload: &crate::net::structure::SocketOperationalEvidence,

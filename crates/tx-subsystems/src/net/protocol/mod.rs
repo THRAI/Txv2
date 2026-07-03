@@ -25,6 +25,9 @@ pub use icmp::{
 };
 pub use loopback::{loopback_iface, IfaceCommon, LoopbackIface};
 pub use poll_context::{PollContext, PollContextOutcome};
+pub(crate) use poll_context::{
+    is_first_syn, listener_accepts_incoming, promote_connected_stream_and_publish_accept,
+};
 pub use smoltcp_adapter::{
     SmoltcpAdapter, SmoltcpAdapterConfig, SmoltcpPacketSource, SmoltcpPacketTxSink,
 };

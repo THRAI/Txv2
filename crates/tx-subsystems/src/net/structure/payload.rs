@@ -1105,6 +1105,14 @@ impl SocketPayload {
         self.tcp_backlog.lock().connecting_child(local, peer)
     }
 
+    /// Snapshot of every half-open child in the connecting backlog. The
+    /// device-TX half-open lane drives their pending smoltcp segments
+    /// (initial SYN-ACK + RTO retransmits) — they are not in the
+    /// connections table until the final ACK promotes them (P2-S3).
+    pub(crate) fn connecting_children(&self) -> Vec<Cap<SocketIdentity>> {
+        self.tcp_backlog.lock().connecting_children()
+    }
+
     pub(crate) fn promote_connecting_to_accept(
         &self,
         local: IpEndpoint,
@@ -2098,6 +2106,13 @@ impl TcpBacklog {
     ) -> Option<Cap<SocketIdentity>> {
         self.find_connecting(local, peer)
             .map(|index| self.connecting[index].child.clone())
+    }
+
+    pub fn connecting_children(&self) -> Vec<Cap<SocketIdentity>> {
+        self.connecting
+            .iter()
+            .map(|entry| entry.child.clone())
+            .collect()
     }
 
     pub fn cleanup_connecting(&mut self, now: Instant) -> (usize, usize, usize, usize) {

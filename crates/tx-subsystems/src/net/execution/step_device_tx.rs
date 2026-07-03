@@ -139,6 +139,29 @@ pub fn step_process_device_tx_pending_in_namespace_at(
         process_tcp_tx_socket(&socket, sink, now, guard, &mut outcome);
     }
 
+    // Half-open inbound children (P2-S3): their SYN-ACK (initial send and
+    // RTO retransmits) is queued inside smoltcp by the SYN feed, but they
+    // are not in the connections table until the final ACK promotes them,
+    // so the lanes above cannot see them. Walk the listeners' connecting
+    // backlogs; `dispatch_segment` inside `process_tcp_tx_socket` is the
+    // only gate needed (it emits nothing unless smoltcp wants to send).
+    let mut half_open_seen = Vec::new();
+    for listener in table
+        .snapshot_tcp_listeners(guard)
+        .into_iter()
+        .take(budget.tcp_connecting)
+    {
+        let Some(listener_payload) = listener.acquire_operational() else {
+            continue;
+        };
+        for child in listener_payload.connecting_children() {
+            if !remember_socket(&mut half_open_seen, &child) {
+                continue;
+            }
+            process_tcp_tx_socket(&child, sink, now, guard, &mut outcome);
+        }
+    }
+
     let mut tcp_connections_seen = Vec::new();
     for socket in table
         .snapshot_tcp_connections(guard)

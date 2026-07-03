@@ -492,6 +492,7 @@ fn install_optional_user_smokes(root: &Path, target: TxTarget, layout: &Path) ->
         "udp-loopback-smoke",
         "tcp-loopback-smoke",
         "tcp-external-smoke",
+        "tcp-external-accept-smoke",
         "netns-helper",
         "nft-probe",
         "packet-probe",

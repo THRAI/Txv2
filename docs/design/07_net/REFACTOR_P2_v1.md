@@ -124,7 +124,10 @@ TX 车道全套（含 Connecting 搬运）、ARP 全套、demux 带段+校验和
 - **专项验证坑 5（阻塞 connect 续跑）**：握手完成 wake 之后，阻塞的 connect syscall 必须重跑 step_connect 观察到 Connected。net-git 在这里栽过（wake 发了、载体不动）。若复现：最小修复 = wait 载体的电平 peek fallback（借 `44d7895c` 该 hunk），并在 P3/D14 记账。
 - **验证**：QEMU + user-net 里 `nc 10.0.2.2 8000`/自写 smoke 完成三次握手（pcap 佐证）；阻塞与 O_NONBLOCK 两种 connect 都必须测。
 
-### S3 —— 入站心跳：真握手取代假 child
+### S3 —— 入站心跳：真握手取代假 child ✅（2026-07-03 完成）
+
+> **实施记录**：外部 SYN 分支重写为真握手三分支（表命中喂段 / 首 SYN 建半开 child + `listen_endpoint` + 喂 SYN / 半开兜底喂段），与 loopback 共享 `promote_connected_stream_and_publish_accept`（晋升时才入连接表，loopback 对称）；SYN-ACK 初发+RTO 重传走 device-TX 新增**半开车道**（遍历 listener connecting backlog 调 `dispatch_segment`，smoltcp 自身门控，无 deadline 簿记）——**§6-1 的 iface trait 未再需要**（P1 后握手机制已 iface 无关，出口天然复用 sink）。假握手包装函数删除。镜像灵魂测试重写 accept_poll_tests（SYN→断言半开+SYN-ACK ack 号→ACK→断言晋升 accept）。**验收**：hostfwd 宿主 `nc` 真机三跑全过（SYN→SYN-ACK→ACK→双向数据，pcap 佐证）；回归 308=308 集合全同 + 出站/loopback/busybox-boot 全绿。
+> **⚠️ 附带发现（§5-1 悬案证实）**：QEMU virtio-mmio 冷空闲态 RX **帧进缓冲但不举中断线**（探针矩阵：pump-rx-ready=1 / extirq=0），即 net-git stage3 悬案本尊。按 §6-4 预案落**混合形态**：IRQ（活跃流低延迟，实测有效）+ 反应器 WFI 空闲拍 ~5ms 低频 pump 兜底（exec.rs，零热路径开销）。纯 IRQ 之谜（疑 EVENT_IDX/QEMU 设备模型）单独立项再攻。
 
 - `process_tcp_event` 的 SYN 分支（events.rs:305）废弃 `create_connected_stream_for_accept*`，改走 `process_first_syn` 的真握手（child `listen_endpoint` → 喂 SYN → 产 SYN-ACK → 半开 backlog → ACK 到达经 established 分支 process_segment → connected 边沿晋升 accept 队列）。
 - 结构前提：`process_first_syn`/`PollContext` 目前吃 `&LoopbackIface`（SYN-ACK 回程要 `iface.dispatch_ip`）。泛化方式见设计点 §6-1（推荐抽 IfaceTx 小 trait：loopback=入队，ether=dispatch_ip_at）。
