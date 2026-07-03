@@ -394,7 +394,6 @@ fn feed_tcp_segment(
         return Vec::new();
     };
     let bits = raw.process_segment(segment);
-    payload.refresh_io_from_raw();
 
     let mut publishes = Vec::new();
     if bits.connected {

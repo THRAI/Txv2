@@ -214,7 +214,6 @@ fn mark_tcp_peer_closed(peer: &Cap<SocketIdentity>) -> PeerCloseWakes {
     if let Some(raw_tcp) = payload.raw_tcp_socket() {
         raw_tcp.mark_recv_closed_by_peer();
     }
-    payload.refresh_io_from_raw();
     let recv_woken = peer.readiness.fire_recv(RecvWireSet::BROKEN);
     let send_woken = peer.readiness.fire_send(SendWireSet::BROKEN);
     PeerCloseWakes {

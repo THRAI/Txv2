@@ -95,10 +95,6 @@ pub fn step_tcp_loopback_handshake_on_iface(
         return StepOutcome::Err(table_error_to_errno(error));
     }
 
-    client_payload.refresh_io_from_raw();
-    if let Some(child_payload) = child.acquire_operational() {
-        child_payload.refresh_io_from_raw();
-    }
     publish_targets.push(NetworkPublishTarget::new(
         client.clone(),
         NetworkPublish {
@@ -225,8 +221,6 @@ pub fn step_process_loopback_tcp(
         return StepOutcome::Done(LoopbackTcpTransferOutcome::default());
     }
 
-    source_payload.refresh_io_from_raw();
-    peer_payload.refresh_io_from_raw();
     // Send space opens when the transfer's ACKs release smoltcp tx ring
     // bytes — derive the wake from the ring, no shadow drain to account.
     let source_wake_fired = source_had_no_send_space

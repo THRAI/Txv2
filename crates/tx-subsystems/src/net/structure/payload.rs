@@ -120,7 +120,6 @@ pub struct SocketPayload {
     pub(crate) options: SpinMutex<SocketOptionSet>,
     pub(crate) ip_multicast: SpinMutex<Ipv4MulticastMemberships>,
     pub(crate) imp: SocketImpl,
-    pub(crate) io: SpinMutex<SocketIoState>,
     pub(crate) unix_peer_cred: SpinMutex<Option<UnixPeerCred>>,
     pub(crate) tcp_backlog: SpinMutex<TcpBacklog>,
     pub shutdown_rd: AtomicBool,
@@ -204,13 +203,11 @@ impl SocketPayload {
             options: SpinMutex::new(options),
             ip_multicast: SpinMutex::new(Ipv4MulticastMemberships::empty()),
             imp,
-            io: SpinMutex::new(SocketIoState::new()),
             unix_peer_cred: SpinMutex::new(None),
             tcp_backlog: SpinMutex::new(TcpBacklog::new()),
             shutdown_rd: AtomicBool::new(false),
             shutdown_wr: AtomicBool::new(false),
         };
-        payload.refresh_io_from_raw();
         payload
     }
 
@@ -407,8 +404,17 @@ impl SocketPayload {
         self.ip_multicast.lock().leave(group)
     }
 
+    /// P3-B S3 (D7): readiness derived live from the engine + backlog on
+    /// every call — there is no cached `io` field to tear (R1b gone). The
+    /// per-engine single lock (S2) makes each field's read atomic; this
+    /// snapshot is not atomic across the three fields, which is fine —
+    /// poll re-reads each independently anyway.
     pub fn io_snapshot(&self) -> SocketIoState {
-        *self.io.lock()
+        SocketIoState {
+            recv_len: self.raw_recv_available(),
+            send_space: self.raw_send_available(),
+            accept_pending: self.tcp_backlog.lock().connected_len(),
+        }
     }
 
     pub fn unix_peer_cred(&self) -> Option<UnixPeerCred> {
@@ -428,7 +434,6 @@ impl SocketPayload {
             return Err(crate::execution::Errno::EOPNOTSUPP);
         };
         self.with_options(|options| raw_tcp.reset(options));
-        self.refresh_io_from_raw();
         Ok(())
     }
 
@@ -460,14 +465,12 @@ impl SocketPayload {
     ) -> Option<bool> {
         let raw_unix = self.imp.unix()?;
         let became_readable = raw_unix.ingest_datagram(source, payload)?;
-        self.refresh_io_from_raw();
         Some(became_readable)
     }
 
     pub(crate) fn record_unix_stream_bytes(&self, payload: Vec<u8>) -> Option<bool> {
         let raw_unix = self.imp.unix()?;
         let became_readable = raw_unix.ingest_stream_bytes(payload)?;
-        self.refresh_io_from_raw();
         Some(became_readable)
     }
 
@@ -479,7 +482,6 @@ impl SocketPayload {
     ) -> Option<bool> {
         let raw_rds = self.imp.rds()?;
         let became_readable = raw_rds.ingest_packet(source, destination, payload)?;
-        self.refresh_io_from_raw();
         Some(became_readable)
     }
 
@@ -494,7 +496,6 @@ impl SocketPayload {
         let raw_sctp = self.imp.sctp()?;
         let became_readable =
             raw_sctp.ingest_message(payload, notification, stream, ppid, source)?;
-        self.refresh_io_from_raw();
         Some(became_readable)
     }
 
@@ -575,7 +576,6 @@ impl SocketPayload {
     pub fn record_packet_frame(&self, source: SockAddrLl, payload: Vec<u8>) -> Option<bool> {
         let raw_packet = self.imp.packet()?;
         let became_readable = raw_packet.ingest_frame(source, payload)?;
-        self.refresh_io_from_raw();
         Some(became_readable)
     }
 
@@ -603,13 +603,11 @@ impl SocketPayload {
             Some(raw_udp) => raw_udp.ingest_rx_datagram(src, dst, payload),
             None => false,
         };
-        self.refresh_io_from_raw();
         became_readable
     }
 
     pub(crate) fn consume_recv_bytes(&self, len: usize) -> Option<SocketIoConsume> {
         let (bytes, became_empty) = self.raw_recv_len(len, false)?;
-        self.refresh_io_from_raw();
         Some(SocketIoConsume {
             bytes,
             became_empty,
@@ -624,7 +622,6 @@ impl SocketPayload {
         let peek = flags.contains(super::types::SendRecvFlags::MSG_PEEK);
         if let Some(raw_packet) = self.imp.packet() {
             let drain = raw_packet.recv_frame_bytes(out, peek)?;
-            self.refresh_io_from_raw();
             return Some(SocketRecvBytesOutcome {
                 bytes: drain.bytes,
                 source: None,
@@ -765,7 +762,6 @@ impl SocketPayload {
             }
             _ => return None,
         };
-        self.refresh_io_from_raw();
         Some(outcome)
     }
 
@@ -803,7 +799,6 @@ impl SocketPayload {
                 },
                 _ => return None,
             };
-        self.refresh_io_from_raw();
         Some(SocketSendReserve {
             bytes,
             became_full,
@@ -845,7 +840,6 @@ impl SocketPayload {
                 },
                 _ => return None,
             };
-        self.refresh_io_from_raw();
         Some(SocketSendReserve {
             bytes,
             became_full,
@@ -915,7 +909,6 @@ impl SocketPayload {
                 }
                 _ => return Ok(None),
             };
-        self.refresh_io_from_raw();
         Ok(Some(SocketSendReserve {
             bytes,
             became_full,
@@ -926,7 +919,6 @@ impl SocketPayload {
     pub(crate) fn take_udp_tx_datagram(&self) -> Option<SocketUdpTxDrain> {
         let raw_udp = self.imp.udp()?;
         let drain = raw_udp.pop_tx_datagram()?;
-        self.refresh_io_from_raw();
         Some(SocketUdpTxDrain {
             datagram: drain.datagram,
             src: drain.src,
@@ -937,7 +929,6 @@ impl SocketPayload {
     pub(crate) fn take_icmp_tx_echo(&self) -> Option<SocketIcmpTxDrain> {
         let raw_icmp = self.imp.icmp()?;
         let drain = raw_icmp.pop_tx_echo()?;
-        self.refresh_io_from_raw();
         Some(SocketIcmpTxDrain {
             packet: drain.packet,
             became_available: drain.became_available,
@@ -951,7 +942,6 @@ impl SocketPayload {
     pub(crate) fn commit_icmp_tx_echo_sent(&self) -> Option<SocketIcmpTxDrain> {
         let raw_icmp = self.imp.icmp()?;
         let drain = raw_icmp.commit_tx_echo_sent()?;
-        self.refresh_io_from_raw();
         Some(SocketIcmpTxDrain {
             packet: drain.packet,
             became_available: drain.became_available,
@@ -961,14 +951,12 @@ impl SocketPayload {
     pub(crate) fn record_icmp_recv_echo_reply(&self, packet: Icmpv4EchoPacket) -> bool {
         let became_readable = self.imp.icmp()
             .is_some_and(|raw_icmp| raw_icmp.ingest_rx_echo_reply(packet));
-        self.refresh_io_from_raw();
         became_readable
     }
 
     pub(crate) fn record_raw_ipv6_packet(&self, packet: RawIpv6Packet) -> bool {
         let became_readable = self.imp.icmp()
             .is_some_and(|raw_icmp| raw_icmp.ingest_rx_ipv6_packet(packet));
-        self.refresh_io_from_raw();
         became_readable
     }
 
@@ -1032,7 +1020,6 @@ impl SocketPayload {
         let mut backlog = self.tcp_backlog.lock();
         let was_empty = backlog.connected_is_empty();
         backlog.push_connected(entry)?;
-        self.io.lock().accept_pending = backlog.connected_len();
         Some(was_empty)
     }
 
@@ -1078,7 +1065,6 @@ impl SocketPayload {
         let mut backlog = self.tcp_backlog.lock();
         let was_empty = backlog.connected_is_empty();
         backlog.promote_connecting(local, peer)?;
-        self.io.lock().accept_pending = backlog.connected_len();
         Some(was_empty)
     }
 
@@ -1086,7 +1072,6 @@ impl SocketPayload {
         let mut backlog = self.tcp_backlog.lock();
         let entry = backlog.pop_connected()?;
         let became_empty = backlog.connected_is_empty();
-        self.io.lock().accept_pending = backlog.connected_len();
         Some(SocketAcceptPop {
             entry,
             became_empty,
@@ -1250,13 +1235,6 @@ impl SocketPayload {
         }
     }
 
-    pub(crate) fn refresh_io_from_raw(&self) {
-        let recv_len = self.raw_recv_available();
-        let send_space = self.raw_send_available();
-        let mut io = self.io.lock();
-        io.recv_len = recv_len;
-        io.send_space = send_space;
-    }
 }
 
 const fn default_family_for_kind(kind: SocketKind) -> AddressFamily {

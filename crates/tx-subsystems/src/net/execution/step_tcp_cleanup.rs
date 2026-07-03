@@ -56,7 +56,6 @@ pub(crate) fn cleanup_tcp_connection(
     if let Some(raw_tcp) = payload.raw_tcp_socket() {
         raw_tcp.abort();
     }
-    payload.refresh_io_from_raw();
 
     Ok(TcpConnectionCleanupOutcome {
         local_withdrawn,

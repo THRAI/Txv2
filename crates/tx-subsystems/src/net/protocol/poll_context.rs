@@ -431,7 +431,6 @@ impl PollContext {
         // Data now lands directly in the smoltcp rx ring inside
         // `process_segment`; readability is derived from the ring below.
         let protocol_publish = target_raw.process_segment(segment);
-        target_payload.refresh_io_from_raw();
         self.sockets_touched += 1;
 
         let mut publishes = Vec::new();

@@ -324,7 +324,6 @@ where
         .ok_or(Errno::EOPNOTSUPP)?;
 
     if try_queue_fast_dump(raw, &payload.net_namespace(), bytes) {
-        payload.refresh_io_from_raw();
         socket.readiness.fire_recv(RecvWireSet::HAS_DATA);
         return Ok(bytes.len());
     }
@@ -348,7 +347,6 @@ where
         }
         raw.queue_response(combined);
     }
-    payload.refresh_io_from_raw();
     if !raw.is_empty() {
         socket.readiness.fire_recv(RecvWireSet::HAS_DATA);
     }
@@ -384,7 +382,6 @@ pub fn netlink_route_recv_packet(
         .ok_or(Errno::EOPNOTSUPP)?;
     let peek = flags.contains(SendRecvFlags::MSG_PEEK);
     let response = raw.pop_response(peek).ok_or(Errno::EAGAIN)?;
-    payload.refresh_io_from_raw();
     if !peek && raw.is_empty() {
         socket.readiness.clear_recv(RecvWireSet::HAS_DATA);
     }
