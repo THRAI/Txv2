@@ -315,16 +315,19 @@ pub const EXECVE_PATH_MAX: usize = 4096;
 
 /// Maximum total argv + envp byte budget per `execve(2)` call.
 ///
-/// Linux's `ARG_MAX` is 128 KiB but the Phase 6 plan caps the inline
-/// buffer at 8 KiB to keep the same discipline as the `write` /
-/// `sigaction` arms. Overflow returns `-E2BIG`. Could be lifted to
-/// 128 KiB now that the user-VA `copy_from_user` lane has landed.
-pub const EXECVE_ARG_MAX_INLINE: usize = 8192;
+/// Set to Linux's `ARG_MAX` (128 KiB). The Phase 6 plan originally capped the
+/// inline buffer at 8 KiB, but git spawns its remote helpers / index-pack with
+/// a large inherited environment ("cannot exec 'remote-http': Argument list too
+/// long"), so the cap is lifted to the real `ARG_MAX`. The user-VA
+/// `copy_from_user` lane makes the larger transient buffer safe; overflow still
+/// returns `-E2BIG`. (Ported from net-git e7992ef8 — git Task2.)
+pub const EXECVE_ARG_MAX_INLINE: usize = 131_072;
 
-/// Maximum number of pointer slots walked through `argv` / `envp`
-/// before we give up. The Phase 6 plan caps at 256; in practice the
-/// total-byte cap (`EXECVE_ARG_MAX_INLINE`) bounds well below this.
-pub const EXECVE_VEC_MAX: usize = 256;
+/// Maximum number of pointer slots walked through `argv` / `envp` before we
+/// give up. Raised from 256 to 1024 so a large inherited git environment (Task2
+/// remote-helper spawn) fits; the total-byte cap (`EXECVE_ARG_MAX_INLINE`) still
+/// bounds the aggregate. (Ported from net-git e7992ef8.)
+pub const EXECVE_VEC_MAX: usize = 1024;
 
 /// Linux generic ABI errno value for "function not implemented" (`ENOSYS`).
 /// Used as the `-ENOSYS` magnitude returned from `dispatch` for every
