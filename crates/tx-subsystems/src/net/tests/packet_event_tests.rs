@@ -95,18 +95,84 @@ fn smoltcp_demux_extracts_ipv4_tcp_event_flags() {
     let transport = tcp_transport(49_000, 443, 0x32, &[9, 8, 7]);
     let frame = RxFrame::new(ethernet_ipv4_frame(6, &transport));
 
+    // Asserted segment-agnostically (like the v6 case): R3a now attaches a
+    // checksum-verified segment for a valid-checksum wire frame, so the whole
+    // event no longer equals a bare `TcpPacketEvent::new(..)` (segment=None).
+    match demux_rx_frame_with_smoltcp(&frame) {
+        PacketDispatch::Tcp(event) => {
+            assert_eq!(
+                event.src,
+                IpEndpoint::new(Ipv4Address::new([192, 0, 2, 1]), 49_000)
+            );
+            assert_eq!(
+                event.dst,
+                IpEndpoint::new(Ipv4Address::new([192, 0, 2, 2]), 443)
+            );
+            assert!(event.flags.syn);
+            assert!(event.flags.ack);
+            assert!(!event.flags.rst);
+            assert_eq!(event.payload, std::vec![9, 8, 7]);
+            assert!(event.urgent);
+            assert!(
+                event.segment.is_some(),
+                "a valid TCP checksum must attach a verified segment"
+            );
+        }
+        other => panic!("expected v4 tcp dispatch, got {other:?}"),
+    }
+}
+
+/// R3a decisive tests: hardware demux verifies checksums (virtio-net has no
+/// CSUM offload), so a corrupt IPv4 header / TCP / UDP checksum must be rejected
+/// as `Malformed` instead of dispatched — while the legal omitted (==0) UDP
+/// checksum over IPv4 stays accepted. Frame builders fill valid checksums; these
+/// tests damage one byte afterwards. Forensics confirmed such tests were absent.
+#[test]
+fn smoltcp_demux_rejects_bad_ipv4_header_checksum() {
+    let mut bytes = ethernet_ipv4_frame(17, &udp_transport(53_000, 8080, &[1, 2, 3, 4]));
+    bytes[14 + 10] ^= 0xff; // IPv4 header checksum field
     assert_eq!(
-        demux_rx_frame_with_smoltcp(&frame),
-        PacketDispatch::Tcp(TcpPacketEvent::new(
-            IpEndpoint::new(Ipv4Address::new([192, 0, 2, 1]), 49_000),
-            IpEndpoint::new(Ipv4Address::new([192, 0, 2, 2]), 443),
-            TcpPacketFlags {
-                syn: true,
-                ack: true,
-                rst: false,
-            },
-            std::vec![9, 8, 7],
-            true
+        demux_rx_frame_with_smoltcp(&RxFrame::new(bytes)),
+        PacketDispatch::Malformed
+    );
+}
+
+#[test]
+fn smoltcp_demux_rejects_corrupt_udp_checksum() {
+    // The builder fills a valid (non-zero) UDP checksum; flipping a payload byte
+    // makes it no longer match — a present-but-wrong checksum must be rejected.
+    let mut bytes = ethernet_ipv4_frame(17, &udp_transport(53_000, 8080, &[1, 2, 3, 4]));
+    bytes[14 + 20 + 8] ^= 0xff; // first UDP payload byte
+    assert_eq!(
+        demux_rx_frame_with_smoltcp(&RxFrame::new(bytes)),
+        PacketDispatch::Malformed
+    );
+}
+
+#[test]
+fn smoltcp_demux_rejects_corrupt_tcp_checksum() {
+    let mut bytes = ethernet_ipv4_frame(6, &tcp_transport(49_000, 443, 0x10, &[9, 8, 7]));
+    bytes[14 + 20 + 16] ^= 0xff; // TCP checksum field
+    assert_eq!(
+        demux_rx_frame_with_smoltcp(&RxFrame::new(bytes)),
+        PacketDispatch::Malformed
+    );
+}
+
+#[test]
+fn smoltcp_demux_accepts_omitted_udp_checksum_over_ipv4() {
+    // checksum==0 means "no checksum" for UDP-over-IPv4 (RFC 768) and is legal —
+    // the demux must not treat the omitted case as corrupt (regression guard for
+    // the loopback-parity semantics).
+    let mut bytes = ethernet_ipv4_frame(17, &udp_transport(53_000, 8080, &[1, 2, 3, 4]));
+    bytes[14 + 20 + 6] = 0; // UDP checksum high byte
+    bytes[14 + 20 + 7] = 0; // UDP checksum low byte
+    assert_eq!(
+        demux_rx_frame_with_smoltcp(&RxFrame::new(bytes)),
+        PacketDispatch::Udp(UdpPacketEvent::new(
+            IpEndpoint::new(Ipv4Address::new([192, 0, 2, 1]), 53_000),
+            IpEndpoint::new(Ipv4Address::new([192, 0, 2, 2]), 8080),
+            std::vec![1, 2, 3, 4],
         ))
     );
 }
@@ -272,9 +338,9 @@ fn tcp_syn_to_listener_sets_accept_readiness() {
 }
 
 /// P2-S7 (§6-2-A): IPv6 UDP frames pass the demux — same event shape as
-/// v4, endpoints carried as v6. Frame built by hand (UDP checksum 0 is
-/// tolerated by the byte-level demux, which defers verification to the
-/// segment/datagram consumers).
+/// v4, endpoints carried as v6. The builder fills a valid UDP checksum, which
+/// R3a now verifies via the shared `UdpRxDatagram` parser (v6 has no IP header
+/// checksum), so this is the good-checksum v6 path.
 #[test]
 fn smoltcp_demux_extracts_ipv6_udp_event() {
     let transport = udp_transport(53_001, 8081, &[5, 6, 7]);
@@ -297,9 +363,8 @@ fn smoltcp_demux_extracts_ipv6_udp_event() {
 }
 
 /// P2-S7 (§6-2-A): IPv6 TCP frames pass the demux with flags + v6
-/// endpoints (the checksum-verified segment attach happens for wire
-/// frames with real checksums; a zero-checksum hand frame yields
-/// segment=None, same contract as malformed-checksum v4).
+/// endpoints. The builder fills a valid TCP checksum, so R3a attaches the
+/// checksum-verified segment; fields are asserted segment-agnostically.
 #[test]
 fn smoltcp_demux_extracts_ipv6_tcp_event_flags() {
     let transport = tcp_transport(49_001, 8443, 0x12, &[0xaa]);

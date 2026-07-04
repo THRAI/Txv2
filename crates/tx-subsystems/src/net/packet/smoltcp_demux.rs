@@ -1,11 +1,11 @@
 use smoltcp::wire::{
-    EthernetFrame, EthernetProtocol, IpProtocol, Ipv4Packet, Ipv6Packet, TcpPacket, UdpPacket,
+    EthernetFrame, EthernetProtocol, IpProtocol, Ipv4Packet, Ipv6Packet, TcpPacket,
 };
 
 use crate::net::packet::{
     LoopbackIpPacket, PacketDispatch, RxFrame, TcpPacketEvent, TcpPacketFlags, UdpPacketEvent,
 };
-use crate::net::protocol::{parse_icmpv4_payload, SmoltcpTcpSegment};
+use crate::net::protocol::{parse_icmpv4_payload, SmoltcpTcpSegment, UdpRxDatagram};
 use crate::net::structure::{IpEndpoint, Ipv4Address, Ipv6Address};
 
 pub fn demux_rx_frame_with_smoltcp(frame: &RxFrame) -> PacketDispatch {
@@ -33,7 +33,9 @@ fn demux_ipv6(packet: &[u8]) -> PacketDispatch {
 
     match ipv6.next_header() {
         IpProtocol::Tcp => demux_tcp_v6(&ipv6, packet),
-        IpProtocol::Udp => demux_udp_v6(&ipv6),
+        // R3a: UDP checksum verification is shared with the v4 path via the
+        // dual-family `UdpRxDatagram` parser (v6 carries no IP header checksum).
+        IpProtocol::Udp => demux_udp(packet),
         _ => PacketDispatch::Unsupported,
     }
 }
@@ -46,9 +48,14 @@ fn demux_tcp_v6(ipv6: &Ipv6Packet<&[u8]>, ip_bytes: &[u8]) -> PacketDispatch {
     let src = IpEndpoint::new_v6(local_ipv6(ipv6.src_addr()), packet.src_port());
     let dst = IpEndpoint::new_v6(local_ipv6(ipv6.dst_addr()), packet.dst_port());
 
-    // Same full-segment contract as the v4 arm (the parser despite its
-    // name handles both families).
-    let segment = SmoltcpTcpSegment::parse_ipv4_packet(&LoopbackIpPacket::new(ip_bytes.to_vec()));
+    // R3a: the full-segment parse verifies the TCP checksum (dual-family
+    // despite the name). `None` => bad checksum => reject as Malformed instead
+    // of forwarding a bare-flags event.
+    let Some(segment) =
+        SmoltcpTcpSegment::parse_ipv4_packet(&LoopbackIpPacket::new(ip_bytes.to_vec()))
+    else {
+        return PacketDispatch::Malformed;
+    };
 
     PacketDispatch::Tcp(
         TcpPacketEvent::new(
@@ -62,19 +69,8 @@ fn demux_tcp_v6(ipv6: &Ipv6Packet<&[u8]>, ip_bytes: &[u8]) -> PacketDispatch {
             packet.payload().to_vec(),
             packet.urg(),
         )
-        .with_segment(segment),
+        .with_segment(Some(segment)),
     )
-}
-
-fn demux_udp_v6(ipv6: &Ipv6Packet<&[u8]>) -> PacketDispatch {
-    let packet = match UdpPacket::new_checked(ipv6.payload()) {
-        Ok(packet) => packet,
-        Err(_) => return PacketDispatch::Malformed,
-    };
-    let src = IpEndpoint::new_v6(local_ipv6(ipv6.src_addr()), packet.src_port());
-    let dst = IpEndpoint::new_v6(local_ipv6(ipv6.dst_addr()), packet.dst_port());
-
-    PacketDispatch::Udp(UdpPacketEvent::new(src, dst, packet.payload().to_vec()))
 }
 
 fn demux_ipv4(packet: &[u8]) -> PacketDispatch {
@@ -83,9 +79,15 @@ fn demux_ipv4(packet: &[u8]) -> PacketDispatch {
         Err(_) => return PacketDispatch::Malformed,
     };
 
+    // R3a: verify the IPv4 header checksum. virtio-net negotiates no checksum
+    // offload, so without this a corrupt header would be dispatched as valid.
+    if !ipv4.verify_checksum() {
+        return PacketDispatch::Malformed;
+    }
+
     match ipv4.next_header() {
         IpProtocol::Tcp => demux_tcp(&ipv4, packet),
-        IpProtocol::Udp => demux_udp(&ipv4),
+        IpProtocol::Udp => demux_udp(packet),
         IpProtocol::Icmp => PacketDispatch::Icmp(parse_icmpv4_payload(
             local_ipv4(ipv4.src_addr()),
             local_ipv4(ipv4.dst_addr()),
@@ -103,10 +105,14 @@ fn demux_tcp(ipv4: &Ipv4Packet<&[u8]>, ip_bytes: &[u8]) -> PacketDispatch {
     let src = IpEndpoint::new(local_ipv4(ipv4.src_addr()), packet.src_port());
     let dst = IpEndpoint::new(local_ipv4(ipv4.dst_addr()), packet.dst_port());
 
-    // Full segment (seq/ack/window, checksum-verified) so established
-    // connections feed smoltcp `process_segment` instead of the old
-    // bare-byte rx bypass.
-    let segment = SmoltcpTcpSegment::parse_ipv4_packet(&LoopbackIpPacket::new(ip_bytes.to_vec()));
+    // R3a: full segment (seq/ack/window) is checksum-verified so established
+    // connections feed smoltcp `process_segment`. `None` => bad checksum =>
+    // Malformed instead of the old bare-byte forward.
+    let Some(segment) =
+        SmoltcpTcpSegment::parse_ipv4_packet(&LoopbackIpPacket::new(ip_bytes.to_vec()))
+    else {
+        return PacketDispatch::Malformed;
+    };
 
     PacketDispatch::Tcp(
         TcpPacketEvent::new(
@@ -120,19 +126,25 @@ fn demux_tcp(ipv4: &Ipv4Packet<&[u8]>, ip_bytes: &[u8]) -> PacketDispatch {
             packet.payload().to_vec(),
             packet.urg(),
         )
-        .with_segment(segment),
+        .with_segment(Some(segment)),
     )
 }
 
-fn demux_udp(ipv4: &Ipv4Packet<&[u8]>) -> PacketDispatch {
-    let packet = match UdpPacket::new_checked(ipv4.payload()) {
-        Ok(packet) => packet,
-        Err(_) => return PacketDispatch::Malformed,
+// R3a: shared v4/v6 UDP demux. `UdpRxDatagram::parse_ipv4_packet` verifies the
+// IP header and UDP checksum — tolerating the legal checksum==0 for
+// UDP-over-IPv4 — exactly as the loopback ingress path does, so hardware RX and
+// loopback reject corrupt datagrams identically.
+fn demux_udp(ip_bytes: &[u8]) -> PacketDispatch {
+    let Some(datagram) =
+        UdpRxDatagram::parse_ipv4_packet(&LoopbackIpPacket::new(ip_bytes.to_vec()))
+    else {
+        return PacketDispatch::Malformed;
     };
-    let src = IpEndpoint::new(local_ipv4(ipv4.src_addr()), packet.src_port());
-    let dst = IpEndpoint::new(local_ipv4(ipv4.dst_addr()), packet.dst_port());
-
-    PacketDispatch::Udp(UdpPacketEvent::new(src, dst, packet.payload().to_vec()))
+    PacketDispatch::Udp(UdpPacketEvent::new(
+        datagram.src,
+        datagram.dst,
+        datagram.payload,
+    ))
 }
 
 fn local_ipv4(addr: smoltcp::wire::Ipv4Address) -> Ipv4Address {
