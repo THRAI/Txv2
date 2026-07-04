@@ -1,3 +1,18 @@
+- 2026-07-04 (P4-S1..S3 落地 — 收尾三件正确性修:SAFETY 注释/分片 LRU/demux 校验和). 计划=REFACTOR_P4_v1.md
+  (三路取证)。**S1**(02793947)B 裁决:修正 NetNamespacePayload::drop 的错误 SAFETY 注释——原称 Index 无 Drop、
+  drop_in_place 是 no-op,与 index.rs:216 真 Drop(对 COMMITTED 槽 assume_init_drop)矛盾;SocketTable=13 个
+  Index<K,Cap<SocketIdentity>,N>,值带引用计数,drop_in_place 递归跑各 Index::drop,soundness 靠"表 drop 时已空"。纯注释零行为。
+  **S2**(580b8f3d)R3b:分片重组表满(上限 64)时 fragments.clear() 整表全清(65 伪造源首片冲掉全部合法在途=低危 DoS)→
+  照抄 conntrack 范式,Ipv4ReassemblyEntry 加 last_seen,抽 expire_and_cap_ipv4_fragments(TTL30s 惰性清扫+满时驱逐单个
+  最久未见,非全清);判决单测 ×3。**S3**(9488a7cc)R3a:硬件 demux 主路径全 new_checked(仅校长度)+virtio-net 无 CSUM
+  offload → 坏 UDP/TCP/IPv4 头被当合法投递;修=demux_ipv4 加 verify_checksum、demux_tcp/_v6 段=None→Malformed(删
+  demux_udp_v6)、demux_udp(v4/v6 合流)复用 UdpRxDatagram::parse_ipv4_packet(与 loopback 同款,保 UDP-over-IPv4
+  checksum==0 放行);帧构造器改填有效校验和(仿真实线路),判决单测 ×4(坏 IPv4头/UDP/TCP→Malformed,checksum==0→放行),
+  v4 TCP 提取测试改按字段断言。**验收**:每步 tx-subsystems 集合差 313 与基线逐字相同(零回归,830 通过=+3+4 新测试);
+  no_std rv64 full-build ok;虚拟 net→demux→socket 真路径单测单跑绿。**Blocker(环境)**:QEMU 外部冒烟矩阵(dns/ext/seq)+
+  la64/boot 本环境受阻——**virtio-net 存在时启动挂在 devices:block:ok(stash 对照证实 S2 无 S3 时同样挂,非 P4 引入,pre-existing)**;
+  无 net 设备时 boot:ok 正常。demux 正确性由 host 判决单测+真路径单测覆盖;真流量校验和有效性由 virtio 无 GUEST_CSUM 契约保证。
+  **Next**:P4-S4(ether.rs 分层拆分,纯重构;需 virtio-net 可启动环境补 全冒烟/la64)+S5(IPv6 零成本放行,可选,§0 默认不做真外部 v6)。
 - 2026-07-03 (P3-C R 族资源修复完成 — backlog 排空/所属 ns 表/引用环/TCP 记账/conntrack 界老化). 计划=REFACTOR_P3C_v1.md
   (两路取证钉死每条 R2)。**S1**(c7db9a7f)R2b:listener close 排空 backlog+撤连接表(connected child 双注册是泄漏核心;
   TCP/SCTP/UnixStream 三分支各撤对应表)。**S2**(a39e5669)R2c:step_tcp_cleanup 用 payload.socket_table() 所属 ns 表
