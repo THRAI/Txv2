@@ -293,6 +293,8 @@ v1（[`REFACTOR_PLAN_A_v1.md`](REFACTOR_PLAN_A_v1.md)，保留作留痕）的引
 - **修**：④（分层）、⑩（IPv6 ping6/路由/邻居）、R3b（分片表 LRU）、§4 device 泄漏、B 裁决的 `Box::leak` 与错误 SAFETY 注释。
 - **验证**：IPv6 LTP（ping6/ipv6_lib）、netns/bridge/netfilter LTP、全量 whitelist 对照 main。
 
+> **可执行细化见 [`REFACTOR_P4_v1.md`](REFACTOR_P4_v1.md)**（= S1 SAFETY 注释订正 + S2 分片 LRU + S3 demux 验校验和 + S4 ether 按文件拆 + S5 IPv6 可选放行）。**关键取证纠偏**：审计⑩"v6 全断"是 P2-S7 前的态——当前 net.ipv6 46/46 + ipv6_lib 76/77 已计分(全走 loopback/synthetic/控制面),**零 LTP 靶依赖真外部 v6 wire**;故 P4 IPv6 只零成本放行,真外部 v6 收发(TX 组帧/FIB/NDISC 学习/ICMPv6 RX)投产比存疑挂 P5/需求驱动。ether 拆分保单结构体单锁(ARP 三角循环);socket-icmp 不开(非纯开关)。
+
 ### P5（后续阶段，非核心）— 多 netns
 
 - per-netns Interface 集 + veth pair 跨 netns 转发 + bridge + 多 iface poll 调度 + per-netns Drop。难点见 D2。**在 P0–P4 核心稳定后独立立项**，旧 per-netns 代码大概率整段重写。
