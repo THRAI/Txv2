@@ -1,3 +1,16 @@
+- 2026-07-04 (P4-S4a+S5 收官 — ether 分层拆分完成 + IPv6 放行裁决跳过,**P4 五阶段全收官**). **S4a**(946dc87e)审计④:
+  ether.rs(1373 行)按文件拆 mod.rs(1011,结构体/类型/常量/4 跨层方法/trait/自由函数/pub 访问器)+link.rs(231,
+  L2/ARP 内部机制)+l3.rs(151,L3 重组/分片);单结构体单锁(按 impl 块拆非拆结构体,避 ARP 三角循环);子模块
+  use super::* 继承导入+私有自由函数,跨模块方法私有 fn→pub(super)(仅 ether 树内可见),字段经后代模块可访问;
+  net::protocol re-export 全在 mod.rs 外部零改。纯移动验收:集合差 313 逐字同基线(零回归,830 通过)+rv64/la64
+  双 no_std full-build ok(跨 crate re-export 保住)+重组集成测试单跑绿+rustfmt 后不变。**S4b(bridge 移出 device 层)
+  挂 P5**(风险大触 rtnetlink/namespace 多点)。**S5**(裁决跳过,取证):build_ipv6_ethernet_frame/dispatch_ipv6_at/
+  best_ipv6_route 均不存在(无真 v6 wire);现有 Icmpv6Event 处理是 synthetic/loopback(step_send.rs)已给 net.ipv6
+  46/46+ipv6_lib 76/77;demux Icmpv6 变体无 RX 消费者+零 LTP 靶依赖外部 v6 wire(§0)→零成本放行=未消费变体+死骨架,
+  按 §0/§5-1"可选/判决单测证价值"裁决跳过,真外部 v6 wire(TX 组帧/FIB/NDISC 学习/ICMPv6 RX)挂 P5/需求驱动。
+  **P4 全收官:审计 ①-⑩+R1-R4 主体全部落地;P0-P4 五阶段 asterinas-true 网络栈重构主体完成。** **余账(全景,REFACTOR_P4_v1.md §6)**:
+  真外部 v6 wire/S4b bridge 移出/D4 每 iface 锁/多 netns=P5;R1e bind 原子/多核并发/net_stress/D14b=环境轮。**Blocker(环境)**:
+  QEMU virtio-net 启动挂 devices:block:ok(pre-existing)→外部冒烟/la64 boot 本环境跑不了,纯重构由 compile+集合差+双架构覆盖。
 - 2026-07-04 (P4-S1..S3 落地 — 收尾三件正确性修:SAFETY 注释/分片 LRU/demux 校验和). 计划=REFACTOR_P4_v1.md
   (三路取证)。**S1**(02793947)B 裁决:修正 NetNamespacePayload::drop 的错误 SAFETY 注释——原称 Index 无 Drop、
   drop_in_place 是 no-op,与 index.rs:216 真 Drop(对 COMMITTED 槽 assume_init_drop)矛盾;SocketTable=13 个
