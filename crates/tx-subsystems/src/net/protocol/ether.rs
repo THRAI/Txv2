@@ -167,12 +167,28 @@ struct Ipv4FragmentRange {
     end: usize,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Ipv4ReassemblyEntry {
     header: Option<Vec<u8>>,
     payload: Vec<u8>,
     ranges: Vec<Ipv4FragmentRange>,
     total_payload_len: Option<usize>,
+    /// R3b: wall-clock stamp of this flow's most recent fragment. Refreshed on
+    /// every insert/hit; drives LRU eviction + TTL expiry so a forged-source
+    /// fragment flood cannot wipe legitimate in-flight reassemblies.
+    last_seen: Instant,
+}
+
+impl Default for Ipv4ReassemblyEntry {
+    fn default() -> Self {
+        Self {
+            header: None,
+            payload: Vec::new(),
+            ranges: Vec::new(),
+            total_payload_len: None,
+            last_seen: Instant::ZERO,
+        }
+    }
 }
 
 enum Ipv4IngressPacket<'a> {
@@ -193,6 +209,9 @@ const IPV4_FLAG_DONT_FRAGMENT: u16 = 0x4000;
 const IPV4_FLAG_MORE_FRAGMENTS: u16 = 0x2000;
 const IPV4_FRAGMENT_OFFSET_MASK: u16 = 0x1fff;
 const IPV4_REASSEMBLY_FLOW_LIMIT: usize = 64;
+/// R3b: abandon a partial reassembly this long after its last fragment. Matches
+/// Linux `net.ipv4.ipfrag_time` (30 s); `now` is the P0-unfrozen wall clock.
+const IPV4_REASSEMBLY_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ArpFlushOutcome {
@@ -790,13 +809,12 @@ impl EtherIface {
             protocol: meta.protocol,
         };
 
+        let now = crate::net::clock::net_now_instant();
         let mut fragments = self.ipv4_fragments.lock();
-        if !fragments.contains_key(&key) && fragments.len() >= IPV4_REASSEMBLY_FLOW_LIMIT {
-            fragments.clear();
-        }
-        fragments.entry(key).or_default();
+        expire_and_cap_ipv4_fragments(&mut fragments, &key, now);
 
-        let entry = fragments.get_mut(&key)?;
+        let entry = fragments.entry(key).or_default();
+        entry.last_seen = now;
         if meta.fragment_offset == 0 {
             entry.header = Some(packet[..meta.header_len].to_vec());
         }
@@ -1150,6 +1168,34 @@ fn parse_ipv4_meta(packet: &[u8]) -> Option<Ipv4PacketMeta> {
     })
 }
 
+/// R3b: keep the reassembly table bounded. First drop every flow whose
+/// `last_seen + TTL` has passed, then — only when `incoming` is a genuinely new
+/// flow and the table is still at capacity — evict the single least-recently-seen
+/// flow. This replaces the previous wholesale `clear()`, which let 65 forged
+/// first-fragments wipe all 64 legitimate in-flight reassemblies (a low-severity
+/// DoS). Mirrors the P3-C conntrack `expire_and_cap_*` pattern; `now` is the
+/// P0-unfrozen `net_now_instant()`.
+fn expire_and_cap_ipv4_fragments(
+    fragments: &mut BTreeMap<Ipv4FragmentKey, Ipv4ReassemblyEntry>,
+    incoming: &Ipv4FragmentKey,
+    now: Instant,
+) {
+    fragments.retain(|_, entry| entry.last_seen + IPV4_REASSEMBLY_TTL > now);
+    if fragments.contains_key(incoming) {
+        return;
+    }
+    while fragments.len() >= IPV4_REASSEMBLY_FLOW_LIMIT {
+        let Some(oldest) = fragments
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_seen.total_micros())
+            .map(|(key, _)| *key)
+        else {
+            break;
+        };
+        fragments.remove(&oldest);
+    }
+}
+
 fn assemble_ipv4_packet(entry: Ipv4ReassemblyEntry) -> Option<Vec<u8>> {
     let mut packet = entry.header?;
     let header_len = usize::from(packet[0] & 0x0f) * 4;
@@ -1240,4 +1286,88 @@ fn same_ipv4_subnet(common: IfaceCommon, dst: Ipv4Address) -> bool {
 
 fn ipv4_to_u32(addr: Ipv4Address) -> u32 {
     u32::from_be_bytes(addr.octets())
+}
+
+#[cfg(test)]
+mod fragment_reassembly_bound_tests {
+    use super::*;
+
+    fn frag_key(ident: u16) -> Ipv4FragmentKey {
+        Ipv4FragmentKey {
+            src: Ipv4Address::new([10, 0, 0, 1]),
+            dst: Ipv4Address::new([10, 0, 0, 2]),
+            ident,
+            protocol: 17,
+        }
+    }
+
+    fn entry_at(micros: i64) -> Ipv4ReassemblyEntry {
+        Ipv4ReassemblyEntry {
+            last_seen: Instant::from_micros(micros),
+            ..Ipv4ReassemblyEntry::default()
+        }
+    }
+
+    // R3b: a full table + a brand-new flow must evict exactly the single
+    // least-recently-seen flow — NOT clear the whole table. The old code did
+    // `fragments.clear()`, so 65 forged first-fragments wiped all 64 legitimate
+    // in-flight reassemblies (a low-severity DoS).
+    #[test]
+    fn overflow_evicts_only_oldest_flow_not_whole_table() {
+        let mut fragments = BTreeMap::new();
+        for i in 0..IPV4_REASSEMBLY_FLOW_LIMIT {
+            // Distinct, increasing last_seen so "oldest" is deterministic.
+            fragments.insert(frag_key(i as u16), entry_at(1_000 + i as i64));
+        }
+        assert_eq!(fragments.len(), IPV4_REASSEMBLY_FLOW_LIMIT);
+
+        let incoming = frag_key(IPV4_REASSEMBLY_FLOW_LIMIT as u16);
+        let now = Instant::from_micros(1_000 + IPV4_REASSEMBLY_FLOW_LIMIT as i64);
+        expire_and_cap_ipv4_fragments(&mut fragments, &incoming, now);
+
+        // Exactly one slot freed for the newcomer; every other flow survives.
+        assert_eq!(fragments.len(), IPV4_REASSEMBLY_FLOW_LIMIT - 1);
+        assert!(
+            !fragments.contains_key(&frag_key(0)),
+            "the oldest flow must be the one evicted"
+        );
+        for i in 1..IPV4_REASSEMBLY_FLOW_LIMIT {
+            assert!(
+                fragments.contains_key(&frag_key(i as u16)),
+                "legitimate flow {i} must not be evicted"
+            );
+        }
+    }
+
+    // R3b: flows past their TTL are swept once `now` advances, independent of
+    // table pressure.
+    #[test]
+    fn ttl_sweep_drops_stale_flows() {
+        let mut fragments = BTreeMap::new();
+        fragments.insert(frag_key(1), entry_at(0));
+        fragments.insert(frag_key(2), entry_at(0));
+
+        let now = Instant::ZERO + IPV4_REASSEMBLY_TTL + Duration::from_micros(1);
+        expire_and_cap_ipv4_fragments(&mut fragments, &frag_key(3), now);
+
+        assert!(fragments.is_empty(), "flows past their TTL must be swept");
+    }
+
+    // R3b: a later fragment of an ALREADY-present flow never evicts anyone,
+    // even at capacity — reassembly in progress is left untouched.
+    #[test]
+    fn later_fragment_of_existing_flow_never_evicts() {
+        let mut fragments = BTreeMap::new();
+        for i in 0..IPV4_REASSEMBLY_FLOW_LIMIT {
+            fragments.insert(frag_key(i as u16), entry_at(1_000 + i as i64));
+        }
+        let existing = frag_key(5);
+        let now = Instant::from_micros(2_000);
+        expire_and_cap_ipv4_fragments(&mut fragments, &existing, now);
+        assert_eq!(
+            fragments.len(),
+            IPV4_REASSEMBLY_FLOW_LIMIT,
+            "an in-progress flow must not trigger eviction"
+        );
+    }
 }
