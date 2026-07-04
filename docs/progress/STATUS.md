@@ -1,3 +1,12 @@
+- 2026-07-04 (排查并修复 virtio-net 启动卡死 — qemu.rs virtio-mmio 总线分配错). commit a82e4738。**症状**:`cargo xtask qemu --net user`
+  带 virtio-net 时启动挂 `devices:block:ok`,永不到 boot:ok(挡 P4 外部冒烟/la64 boot/LTP/git 联网)。**根因**:rv64 板
+  (boot_static.rs:249-278)硬编码 virtio0@0x1000_1000(块驱动)+virtio1@0x1000_2000(网驱动),板注释要求 QEMU
+  块→bus.0/网→bus.1;但 qemu.rs 自 c5691ce3 把 net 放 bus.0 且块设备未固定槽→net 抢 bus.0 后块设备漂移,启动期 ext4
+  超块读挂死。**修复**:块设备固定 bus.0、net 改 bus.1(对齐板注释)+更新测试断言(xtask 128/128)。实测块读恢复
+  (ext4-superblock:ok)+eth0 被发现+boot:ok。**与 P4 无关**(P4 不碰块/设备枚举)。**暴露下游偶发 panic 已证伪为非 net**:
+  bus 修复后 -smp4 仍 ~50% panic(BootStaticBag/PPN overflow 多点=corruption),但**判决实测 -smp1 带 net 5/5 全绿、
+  -smp4 不带 net 也 3/5 panic → 一般多核 boot 竞态(substrate/HAL,非 net,用户早记录"多核不稳跑 -smp1")**。用户裁决:
+  接受 -smp1(net 已可靠可用),多核竞态不立项。**→ P4 外部冒烟/la64 boot 现可在 -smp1 跑(启动阻塞已解)**。见记忆 [[virtio-net-boot-bus-fix]]。
 - 2026-07-04 (P4-S4a+S5 收官 — ether 分层拆分完成 + IPv6 放行裁决跳过,**P4 五阶段全收官**). **S4a**(946dc87e)审计④:
   ether.rs(1373 行)按文件拆 mod.rs(1011,结构体/类型/常量/4 跨层方法/trait/自由函数/pub 访问器)+link.rs(231,
   L2/ARP 内部机制)+l3.rs(151,L3 重组/分片);单结构体单锁(按 impl 块拆非拆结构体,避 ARP 三角循环);子模块
