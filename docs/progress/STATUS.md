@@ -1,3 +1,9 @@
+- 2026-07-04 (la64 git 验证也过 — 重构栈 git **rv64+la64 双架构都 8/8**). 下载官方 la64 Alpine 镜像
+  (alpine-linux-loongarch64-ext4fs.img,release tag alpine-linux-loongarch64-ext4fs;wget -c 续传绕过 SSL 中断)+适配
+  tools/verify-git-net-la64.sh(qemu-system-loongarch64 -cpu la464 -m1152M/**PCI virtio**(blk-pci+net-pci,非 MMIO)/
+  cmdline 走 -fw_cfg/无 bios)。**la64 kernel verify-git-net-la64.sh 8/8**:Task0 git2.47.3/Task1 init·add·commit+内容/
+  Task2 clone HTTP+HTTPS+push+pull/DNS。**坑**:首测 2/8(仅 Task0+DNS)——la64 kernel 是 B2 时构建的旧件(缺 B4 ext4
+  chmod),重建后 8/8(同 rv64 那次 chmod 故事)。**git clone/push/pull 在重构网络栈上 rv64+la64 双架构完整可用**。
 - 2026-07-04 (git 任务迁移到重构栈完成 — feature-network-refactor kernel 跑 verify-git-net.sh **8/8 全过**). 目标:把 git
   能力从 net-git(老网络栈)迁到干净 P0-P4 重构栈。**调研结论**:8 个 net commit 不移(重构栈 P2 自有等价外连TCP+DNS),只移
   非网络 git 使能。**移植四件**:**B1**(54fba845)fork eager-copy CoW(vm/execution.rs,移植 2c97491b,修 git helper argv
