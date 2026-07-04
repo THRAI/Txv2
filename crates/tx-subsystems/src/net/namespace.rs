@@ -316,9 +316,17 @@ impl Drop for NetNamespacePayload {
             // SAFETY: `socket_table_owned` => the table was heap-allocated by
             // `create_isolated_net_namespace_with_owner` via `alloc_zeroed` with
             // `Layout::new::<SocketTable>()` and is uniquely owned by this
-            // payload. `SocketTable`'s `Index`/`Entry` keep keys/values in
-            // `MaybeUninit` (no `Drop`), so `drop_in_place` is a no-op and there
-            // are no double-frees of committed entries.
+            // payload. `SocketTable` bundles `Index` maps whose keys and values
+            // (`Cap<SocketIdentity>`) live in `MaybeUninit`, and `Index` *does*
+            // have a real `Drop` (see `index.rs`) that `assume_init_drop`s the
+            // key/value of every committed entry — so `drop_in_place` is not a
+            // no-op; it recursively runs those `Index::drop`s. Soundness rests on
+            // the table being empty by the time the payload is reclaimed (see the
+            // prose above: the namespace is pruned only once no identity/socket
+            // holds it, so all entries have already been removed), which leaves
+            // every `Index::drop` on its empty branch. `ptr` is uniquely owned, so
+            // each drop runs at most once and the following `dealloc` frees the
+            // zeroed backing without re-running `Drop` — no double-free.
             unsafe {
                 core::ptr::drop_in_place(ptr);
                 alloc::alloc::dealloc(ptr as *mut u8, core::alloc::Layout::new::<SocketTable>());
