@@ -432,7 +432,39 @@ where
         }
     }
 
-    // `step_chmod`, `step_chown` commit through `serialize_inode_meta`.
+    /// Update the inode's mode bits (chmod). The file kind (`S_IFMT`) is
+    /// immutable through chmod; only the `0o7777` perm/setid/sticky bits change.
+    /// DAC ownership is enforced upstream by the syscall arm (`sys_fchmodat` ->
+    /// `authorize_chmod`), so this commits the new mode straight through
+    /// `serialize_inode_meta` (-> `write_inode_meta_journaled`). git's `init`
+    /// chmods `.git/config.lock` to probe `core.filemode`; without this it failed
+    /// with ENOSYS. (Ported from net-git ca0ae657 — git Task0/1.)
+    fn step_chmod(
+        &self,
+        fs_object_id: FsObjectId,
+        new_mode: u16,
+        _cred: &Credential,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        if self.is_read_only() {
+            return StepOutcome::err(Errno::EROFS.into());
+        }
+        let inode = match inode_no(fs_object_id) {
+            Ok(v) => v,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        let mut meta = match self.inode_meta_cached(inode) {
+            Ok(m) => map_inode_meta(m),
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        // `S_IFMT` (0o170000) is immutable through chmod; mask the request to the
+        // perm/setid/sticky bits.
+        meta.mode = (meta.mode & 0o170000) | (new_mode & 0o7777);
+        self.serialize_inode_meta(fs_object_id, &meta, guard)
+    }
+
+    // `step_chown` would commit the same way via `serialize_inode_meta` if a
+    // workload needs it.
 }
 
 fn inode_meta_lite(meta: &InodeMeta) -> InodeMetaLite {
