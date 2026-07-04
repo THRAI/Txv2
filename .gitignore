@@ -15,4 +15,5 @@ __pycache__/
 /third_party/
 .claude/worktrees/
 librust_out.rlib
-/target-codex-checklocal-images/
+/target-codex-check
+local-images
