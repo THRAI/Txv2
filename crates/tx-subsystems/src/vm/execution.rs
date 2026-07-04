@@ -13,7 +13,7 @@ use tx_hal::PmapIf;
 
 use crate::execution::Guard;
 use crate::execution::WaitToken;
-use crate::page_backed::{step_fsync, PageContainerKind};
+use crate::page_backed::{step_fsync, MaterializedPagePin, PageContainerKind};
 use crate::vm::adapter::step_engine::{
     self as step_engine, AbortReason, AgentCancelPolicy, DelegateRegistry, DelegateReply,
     DelegateRequest, StepOutcome, StepOutcome as V3StepOutcome, TaskMailbox, TokenDropPolicy,
@@ -133,6 +133,29 @@ impl AddressSpace {
                 parent
                     .pmap
                     .protect_range(range, entry.prot.without_write())?;
+                // Eager-copy the parent's resident pages into the child's pmap
+                // as read-only, so the child's pmap-first user-access lane
+                // (`resolve_user_page_addr`) sees the parent's *exact* resident
+                // content. Without this the child starts with an empty pmap and
+                // re-derives each page via the materialize/refault path; for a
+                // file-backed-private page the parent had CoW-modified (or a page
+                // written via the kernel copy_to_user pmap-first lane, which never
+                // updates the per-VmEntry set), that refault returns the
+                // file-cache / zero version instead of the parent's data — which
+                // silently zeroed a forked git helper's argv strings ("git ''").
+                // Both sides are now read-only over the shared frame; the first
+                // write on either faults and CoWs as before. (Ported from net-git
+                // 2c97491b — git clone/push/pull Task2.)
+                for (page, snap) in parent.pmap.walk_range(range) {
+                    if let Ok(map_pin) = step_engine::page_allocator::acquire_map_pin(snap.ppn) {
+                        let _ = child.pmap.publish_page(
+                            page,
+                            snap.ppn,
+                            snap.prot.without_write(),
+                            MaterializedPagePin::Allocated(map_pin),
+                        );
+                    }
+                }
             }
         }
 
