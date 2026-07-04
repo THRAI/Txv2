@@ -1,3 +1,15 @@
+- 2026-07-04 (git 任务迁移到重构栈完成 — feature-network-refactor kernel 跑 verify-git-net.sh **8/8 全过**). 目标:把 git
+  能力从 net-git(老网络栈)迁到干净 P0-P4 重构栈。**调研结论**:8 个 net commit 不移(重构栈 P2 自有等价外连TCP+DNS),只移
+  非网络 git 使能。**移植四件**:**B1**(54fba845)fork eager-copy CoW(vm/execution.rs,移植 2c97491b,修 git helper argv
+  清零)·**B3**(ce618c6b)ARG_MAX 8192→131072+VEC_MAX 256→1024(linux_syscall/mod.rs,移植 e7992ef8,修 remote-helper
+  Argument list too long)·**B2**(d76a6063)tx.runsh 引导 lane+overlay_image_dirs_for_runsh(init/exec.rs+init.rs,移植
+  ca0ae657+e7992ef8,跑 git 脚本+bind /musl/{usr,lib,bin,sbin}→根)·**B4**(12c596e9)ext4 FsOps::step_chmod(tx-ext4/
+  namespace.rs,移植 ca0ae657)——**调研遗漏、实测抓获**:重构栈 ext4 无 step_chmod 落 trait 默认 ENOSYS→git init chmod
+  core.filemode 挂(先测 2/8:仅 Task0+DNS 过,git init/clone 挂 'could not set core.filemode';补 chmod 后 8/8)。
+  **验收**:重构栈 kernel verify-git-net.sh 8/8(Task0 git2.49.1/Task1 init·add·commit+内容/Task2 clone HTTP+HTTPS+push+pull/
+  DNS);rv64+la64 双 kernel full-build ok;B1 tx-subsystems 集合差 313 零回归。**git clone/push/pull 在干净重构网络栈上完整
+  可用,与 net-git 同(8/8)**。harness+镜像(local-images/ 已 gitignore)。**教训:调研靠注释判 API 存在会错(namespace.rs:435
+  注释称 chmod 走 serialize_inode_meta 但实无 fn),必须实测**。见记忆 [[oscomp-2025-finals-git-task]]。
 - 2026-07-04 (排查并修复 virtio-net 启动卡死 — qemu.rs virtio-mmio 总线分配错). commit a82e4738。**症状**:`cargo xtask qemu --net user`
   带 virtio-net 时启动挂 `devices:block:ok`,永不到 boot:ok(挡 P4 外部冒烟/la64 boot/LTP/git 联网)。**根因**:rv64 板
   (boot_static.rs:249-278)硬编码 virtio0@0x1000_1000(块驱动)+virtio1@0x1000_2000(网驱动),板注释要求 QEMU
