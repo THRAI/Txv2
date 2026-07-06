@@ -1701,15 +1701,132 @@ pub(super) fn step_unit_result(outcome: StepOutcome<(), NoProgress>) -> SyscallR
     }
 }
 
-pub(super) fn wait_on_yield_shape(shape: YieldShape) -> Option<wait_source::RegisteredWaitFuture> {
+/// Wait-registry unification (Stage 1): a socket readiness wait that parks
+/// on the substrate `WaitSource` — the registry `epoll`/`await_wait_source`
+/// and the other fd subsystems already use — instead of the legacy
+/// subsystems `wait_on_token` registry. It mirrors the proven
+/// `RawQueueWaitFuture` shape exactly (fresh per-wait mailbox, lazy
+/// subscribe-on-first-poll, drop-safe unsubscribe, `Unpin`), so the ONLY
+/// behavioural change is WHICH registry the wait subscribes to. Socket
+/// carriers that have no substrate mirror yet (the urgent/OOB `RawPort`,
+/// which is never reached on the recv/send/accept/connect blocking paths)
+/// transparently fall back to the legacy path.
+pub(super) enum SocketReadyWait {
+    Substrate(SubstrateReadyWait),
+    Legacy(wait_source::RegisteredWaitFuture),
+}
+
+pub(super) struct SubstrateReadyWait {
+    source: alloc::sync::Arc<crate::adapter::reactor_entry::WaitSource>,
+    interests: crate::adapter::step_engine::InterestMask,
+    mailbox: alloc::sync::Arc<crate::adapter::reactor_entry::TaskMailbox>,
+    active: Option<crate::adapter::reactor_entry::ActiveWait>,
+    subscriber: Option<crate::adapter::reactor_entry::SubscriberId>,
+}
+
+impl SubstrateReadyWait {
+    fn new(
+        source: alloc::sync::Arc<crate::adapter::reactor_entry::WaitSource>,
+        interests: crate::adapter::step_engine::InterestMask,
+    ) -> Self {
+        Self {
+            source,
+            interests,
+            mailbox: alloc::sync::Arc::new(crate::adapter::reactor_entry::TaskMailbox::new()),
+            active: None,
+            subscriber: None,
+        }
+    }
+}
+
+impl core::future::Future for SubstrateReadyWait {
+    type Output = ();
+
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<()> {
+        let this = self.get_mut();
+        this.mailbox.register_waker(cx.waker().clone());
+        if this.subscriber.is_none() {
+            // Lazy subscribe on first poll (matches `RawQueueWaitFuture`): a
+            // wait constructed but never awaited never touches the source.
+            // `register` delivers any already-pending mask to the fresh
+            // mailbox, closing the notify-before-subscribe race.
+            let generation = this.mailbox.next_generation();
+            this.active = Some(crate::adapter::reactor_entry::ActiveWait::new(
+                generation,
+                this.source.id(),
+                this.interests,
+            ));
+            let id = this.source.register(
+                alloc::sync::Arc::downgrade(&this.mailbox),
+                generation,
+                this.interests,
+            );
+            this.subscriber = Some(id);
+        }
+        while let Some(event) = this.mailbox.poll() {
+            if this.active.as_ref().is_some_and(|wait| wait.matches(&event)) {
+                return core::task::Poll::Ready(());
+            }
+        }
+        core::task::Poll::Pending
+    }
+}
+
+impl Drop for SubstrateReadyWait {
+    fn drop(&mut self) {
+        if let Some(id) = self.subscriber.take() {
+            self.source.unregister(id);
+        }
+    }
+}
+
+impl core::future::Future for SocketReadyWait {
+    type Output = ();
+
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<()> {
+        match self.get_mut() {
+            SocketReadyWait::Substrate(future) => core::pin::Pin::new(future).poll(cx),
+            SocketReadyWait::Legacy(future) => core::pin::Pin::new(future).poll(cx).map(|_| ()),
+        }
+    }
+}
+
+/// Resolve a socket wait carrier to a [`SocketReadyWait`]: the substrate
+/// `WaitSource` when the carrier has a mirror (recv/send/accept — the
+/// common case), else the legacy `wait_on_token` registry.
+fn socket_ready_wait(source_id: u64, interest_bits: u64) -> Option<SocketReadyWait> {
+    let interests = crate::adapter::step_engine::InterestMask::new(interest_bits);
+    if let Some(source) = crate::adapter::reactor_entry::lookup_source(
+        crate::adapter::step_engine::WaitSourceId::new(source_id),
+    ) {
+        return Some(SocketReadyWait::Substrate(SubstrateReadyWait::new(source, interests)));
+    }
+    let token = tx_subsystems::execution::WaitToken::new(source_id, interest_bits);
+    wait_source::wait_on_token(token).map(SocketReadyWait::Legacy)
+}
+
+pub(super) fn wait_on_yield_shape(shape: YieldShape) -> Option<SocketReadyWait> {
     match shape {
         YieldShape::OnWaitSource { source, interests }
         | YieldShape::OnEdge { source, interests } => {
-            let token = tx_subsystems::execution::WaitToken::new(source.raw(), interests.raw());
-            wait_source::wait_on_token(token)
+            socket_ready_wait(source.raw(), interests.raw())
         }
         YieldShape::OnAgent { .. } | YieldShape::OnTimer { .. } => None,
     }
+}
+
+/// Build a [`SocketReadyWait`] from a raw poll wait token — the recv
+/// blocking arm that resolves its carrier via `step_poll_wait_token`.
+pub(super) fn socket_ready_wait_from_token(
+    token: tx_subsystems::execution::WaitToken,
+) -> Option<SocketReadyWait> {
+    socket_ready_wait(token.source_id(), token.interest())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1719,7 +1836,7 @@ pub(super) enum SocketWaitWake {
 }
 
 pub(super) async fn wait_on_socket_or_itimer<P: TimeIf>(
-    mut socket_future: wait_source::RegisteredWaitFuture,
+    mut socket_future: SocketReadyWait,
     ctx: &SyscallCtx<'_>,
 ) -> SocketWaitWake {
     let pid = ctx.process.pid.0;

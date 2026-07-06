@@ -1,3 +1,18 @@
+- 2026-07-06 (Wait 注册表统一 **Stage 1** — net 阻塞路径迁到 substrate WaitSource,对齐 eventfd). 目标:消除审计⑥/R4a
+  遗留——net socket 阻塞 recv/send/accept/connect 从 subsystems `wait_on_token` 迁到 substrate `await_wait_source`。
+  **调研纠正**:"两套注册表"**非 net 独有**——实为 3 原语(reactor `Channel`/net `RawQueue`/substrate `WaitSource`)的
+  **共存期迁移**,11 子系统仍双注册(eventfd/futex/net/pipe/process/signalfd/timerfd/tty/vfs/ipc_msg/ipc_sem),
+  5 已纯 substrate(aio/io_uring/page_backed/userfaultfd/vm)。net 独家怪 = 阻塞单 fd 路径仍停 `wait_on_token`
+  (其余可读 fd 子系统已迁 await_wait_source)。**改动**(tx-shims,net-contained):新增 `SocketReadyWait`(Unpin+
+  drop 自动退订,substrate 优先 / urgent 无镜像回落 legacy;镜像 `RawQueueWaitFuture` 形状,只换订阅的注册表)+
+  reshaped `wait_on_yield_shape` 返回类型 + `wait_on_socket_or_itimer` 入参类型 + socket.rs:1110 直连站点;
+  **8 个 call site 零改动**(靠类型透传)。**验证**:交叉编译 rv64 ok;**git-net 8/8**(阻塞外部 connect/recv/send/
+  push/pull/DNS);**LTP net 定向 rv.musl 18/27 逐项 = 基线**(accept01·accept4_01·epoll_ctl01·poll01 通过;
+  epoll_wait01·pselect01 **基线也失败=预存非我造成**;recv01 等 0/0 未进 runtest 集)→ **0 回归**;**无旁路证明**:
+  grep 确认所有 recv 唤醒经 `fire_recv`→notify_mirror→substrate(无直接 `recv_wq.fire()` 旁路)→ ping raw ICMP recv
+  也醒(git 测不到的 itimer 分支由此排除)。**下一步**:Stage 2(退遗留全家桶:ppoll/pselect/select 迁
+  await_any_wait_source[枢纽,epoll 已迁=模板]→11 子系统去双注册→删 reactor Channel+subsystems 表+wait_on_token)
+  作为独立跨内核 epic 立项。**Blocker**:无。
 - 2026-07-04 (la64 git 验证也过 — 重构栈 git **rv64+la64 双架构都 8/8**). 下载官方 la64 Alpine 镜像
   (alpine-linux-loongarch64-ext4fs.img,release tag alpine-linux-loongarch64-ext4fs;wget -c 续传绕过 SSL 中断)+适配
   tools/verify-git-net-la64.sh(qemu-system-loongarch64 -cpu la464 -m1152M/**PCI virtio**(blk-pci+net-pci,非 MMIO)/

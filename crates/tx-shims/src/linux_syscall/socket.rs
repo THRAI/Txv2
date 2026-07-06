@@ -1107,7 +1107,7 @@ async fn recvfrom_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
                 let Some(wait_token) = wait_token else {
                     return SyscallResult::Error(EIO_VALUE);
                 };
-                let Some(future) = wait_source::wait_on_token(wait_token) else {
+                let Some(future) = socket_ready_wait_from_token(wait_token) else {
                     return SyscallResult::Error(EIO_VALUE);
                 };
                 if matches!(
