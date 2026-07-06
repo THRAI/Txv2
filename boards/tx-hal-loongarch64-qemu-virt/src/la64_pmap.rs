@@ -5,7 +5,7 @@ use super::la64_irq_trap::{console_write_hex, console_write_literal};
 use super::*;
 
 pub(crate) fn uart_put_byte(byte: u8) {
-    let base = la64_uncached_virt(QEMU_LA64_UART0_BASE) as *mut u8;
+    let base = la64_uncached_virt(la64_uart_base()) as *mut u8;
 
     unsafe {
         while core::ptr::read_volatile(base.add(UART_LSR)) & UART_LSR_THRE == 0 {
@@ -18,7 +18,7 @@ pub(crate) fn uart_put_byte(byte: u8) {
 pub(crate) fn uart_try_get_byte() -> Option<u8> {
     #[cfg(target_arch = "loongarch64")]
     unsafe {
-        let base = la64_uncached_virt(QEMU_LA64_UART0_BASE) as *const u8;
+        let base = la64_uncached_virt(la64_uart_base()) as *const u8;
         if core::ptr::read_volatile(base.add(UART_LSR)) & UART_LSR_DR == 0 {
             return None;
         }
@@ -1253,8 +1253,26 @@ pub(crate) unsafe fn la64_install_kernel_stack(top: VirtAddr) {
 
 pub(crate) fn la64_wait_for_interrupt_once() {
     #[cfg(target_arch = "loongarch64")]
-    unsafe {
-        core::arch::asm!("idle 0", options(nomem, nostack));
+    {
+        // CRMD.IE must be set before `idle`: real silicon only leaves
+        // idle when an interrupt can actually be TAKEN, and the
+        // longjmp-like kernel resume path
+        // (`tx_la64_resume_kernel_after_reschedule`) returns to the
+        // reactor loop with the trap entry's IE=0 still in effect —
+        // the LS2K1000 first flights parked here forever (timer armed,
+        // UART routed, nothing ever woke). QEMU's idle emulation wakes
+        // on pending interrupts regardless of IE, which hid this.
+        // RISC-V is immune by spec (WFI resumes on pending interrupts
+        // even when globally masked), which is why the identical loop
+        // works on the VF2. Mirrors Linux loongarch `arch_cpu_idle`
+        // (local_irq_enable before idle).
+        let crmd = super::la64_irq_trap::read_la64_csr(super::LA64_CSR_CRMD);
+        if crmd & super::LA64_CRMD_IE == 0 {
+            write_la64_csr(super::LA64_CSR_CRMD, crmd | super::LA64_CRMD_IE);
+        }
+        unsafe {
+            core::arch::asm!("idle 0", options(nomem, nostack));
+        }
     }
 
     #[cfg(not(target_arch = "loongarch64"))]

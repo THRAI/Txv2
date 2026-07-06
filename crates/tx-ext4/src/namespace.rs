@@ -133,6 +133,50 @@ where
         }
     }
 
+    fn step_chmod(
+        &self,
+        fs_object_id: FsObjectId,
+        new_mode: u16,
+        cred: &Credential,
+        _guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress> {
+        // ext4 previously inherited the trait's ENOSYS default; with
+        // the onsite alpine image mounted as an ext4 root, git init's
+        // core.filemode probe (chmod on .git/config.lock) hit it and
+        // aborted. Semantics mirror the tmpfs implementation: keep
+        // IFMT, replace the low 12 permission bits, persist through
+        // the journaled inode-meta write.
+        if self.is_read_only() {
+            return StepOutcome::err(Errno::EROFS.into());
+        }
+        let inode = match inode_no(fs_object_id) {
+            Ok(inode) => inode,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        let meta = match self.inode_meta_cached(inode) {
+            Ok(meta) => map_inode_meta(meta),
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        if let Err(e) = tx_subsystems::vfs::predicates::check_chmod_perm(&meta, cred) {
+            return StepOutcome::err(e.into());
+        }
+        let mut updated = meta;
+        updated.mode =
+            (updated.mode & tx_subsystems::vfs::structure::S_IFMT) | (new_mode & 0o7777);
+        let write = self.with_pager(|pager| {
+            pager
+                .write_inode_meta_journaled(inode, inode_meta_lite(&updated))
+                .map(|_| ())
+        });
+        match write {
+            Ok(()) => {
+                self.invalidate_inode_meta(inode);
+                StepOutcome::done(())
+            }
+            Err(err) => StepOutcome::err(err.into()),
+        }
+    }
+
     fn create_inode(
         &self,
         parent: FsObjectId,

@@ -164,6 +164,20 @@ pub(crate) fn boot_cmdline_ptr() -> *mut u8 {
     core::ptr::addr_of_mut!(BOOT_CMDLINE) as *mut u8
 }
 
+/// Parse `tx.maxcpus=N` from the published boot cmdline (None before
+/// boot facts are published or when the knob is absent — callers
+/// default to single-core). Mirrors the rv64 board's knob.
+pub(crate) fn max_cpus_from_cmdline() -> Option<usize> {
+    let info = unsafe { &*(boot_info_ptr() as *const BootInfo) };
+    let cmdline = info.cmdline?;
+    for token in cmdline.split_whitespace() {
+        if let Some(value) = token.strip_prefix("tx.maxcpus=") {
+            return value.parse().ok();
+        }
+    }
+    None
+}
+
 pub(crate) fn boot_info_ptr() -> *mut BootInfo {
     core::ptr::addr_of_mut!(BOOT_INFO)
 }
@@ -286,6 +300,18 @@ pub(crate) fn publish_static_boot_facts() {
     } else {
         None
     };
+
+    // Board profile switch. Must happen before the first boot
+    // sentinel prints so regular console output already targets the
+    // right UART (LS2K1000: 0x1fe2_0000 via the uncached window).
+    if let Some(cmdline) = cmdline {
+        if cmdline
+            .split_whitespace()
+            .any(|token| token == "tx.board=ls2k1000")
+        {
+            la64_select_board_ls2k1000();
+        }
+    }
 
     unsafe {
         let regions = boot_memory_regions_ptr() as *const MemoryRegion;

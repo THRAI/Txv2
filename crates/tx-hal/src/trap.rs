@@ -315,7 +315,7 @@ pub trait KernelTrapSink<P: TxPlatform> {
 
     fn on_timer_interrupt(cpu: CpuId, view: TrapFrameMut<'_>) -> TrapAction;
 
-    fn on_external_irq(cpu: CpuId) -> TrapAction;
+    fn on_external_irq(cpu: CpuId, view: TrapFrameMut<'_>) -> TrapAction;
 
     fn on_ipi(cpu: CpuId) -> TrapAction;
 

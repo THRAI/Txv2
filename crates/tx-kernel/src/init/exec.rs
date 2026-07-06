@@ -17,7 +17,7 @@
 
 use super::helpers::{bootstrap_block_on, exec_error_tag, parse_init_from_cmdline};
 use super::*;
-use crate::adapter::step_engine::{self as step_engine, page_allocator, StepOutcome};
+use crate::adapter::step_engine::{self as step_engine, StepOutcome, page_allocator};
 use core::fmt::Write;
 
 fn oscomp_boot_suite(cmdline: Option<&str>) -> Option<&str> {
@@ -31,6 +31,15 @@ fn oscomp_boot_suite(cmdline: Option<&str>) -> Option<&str> {
         }
     }
     None
+}
+
+fn onsite_profile_enabled<P: tx_hal::TxPlatform>() -> bool {
+    let Some(cmdline) = <P as tx_hal::BootInfoIf>::boot_info().cmdline else {
+        return false;
+    };
+    cmdline
+        .split_ascii_whitespace()
+        .any(|token| token == "tx.profile=onsite")
 }
 
 fn oscomp_libctest_network_cmd(libc: &str) -> alloc::string::String {
@@ -547,7 +556,18 @@ impl<P: TxPlatform> CoreInit<P> {
         // ever runs, and the prompt never returns from the failing
         // command. `/bin` is where our cpio rootfs places every
         // applet symlink.
-        let envp: &[&[u8]] = &[b"PATH=/bin"];
+        let envp: &[&[u8]] = if onsite_profile_enabled::<P>() {
+            &[
+                b"PATH=/bin:/sbin:/usr/bin:/usr/sbin",
+                b"LD_LIBRARY_PATH=/lib:/usr/lib",
+                b"HOME=/root",
+                b"TERM=xterm",
+                b"GIT_PAGER=cat",
+                b"PAGER=cat",
+            ]
+        } else {
+            &[b"PATH=/bin"]
+        };
 
         // Cmdline-driven init path (initramfs slice):
         //   `init=/some/path` -> exec that path with argv=[basename]
@@ -984,9 +1004,12 @@ fn oscomp_sdcard_boot_enabled<P: tx_hal::TxPlatform>() -> bool {
     let Some(cmdline) = boot_info.cmdline else {
         return true;
     };
-    !cmdline
-        .split_ascii_whitespace()
-        .any(|token| token.starts_with("init=") || token == "tx.profile=busybox")
+    !cmdline.split_ascii_whitespace().any(|token| {
+        token.starts_with("init=")
+            || token == "tx.profile=busybox"
+            || token == "tx.profile=onsite"
+            || token == "tx.root=sdcard"
+    })
 }
 
 fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
@@ -1536,7 +1559,6 @@ done",
         workdir = LTP_CASE_WORKDIR,
     );
 }
-
 
 fn ltp_case_list_contains(list: &str, needle: &str) -> bool {
     list.split('+').any(|case| case.trim() == needle)
@@ -2714,8 +2736,7 @@ fn oscomp_glibc_script_for_group(group: &str) -> Option<&'static str> {
     }
 }
 
-const LIBCTEST_STATIC_SAFE_CASES: &str =
-    "argv basename clocale_mbfuncs clock_gettime dirname env fdopen fnmatch fscanf fwscanf \
+const LIBCTEST_STATIC_SAFE_CASES: &str = "argv basename clocale_mbfuncs clock_gettime dirname env fdopen fnmatch fscanf fwscanf \
      iconv_open inet_pton mbc memstream pthread_cond pthread_tsd qsort random search_hsearch \
      search_insque search_lsearch search_tsearch setjmp snprintf socket sscanf sscanf_long stat \
      strftime string string_memcpy string_memmem string_memset string_strchr string_strcspn \
@@ -2733,8 +2754,7 @@ const LIBCTEST_STATIC_SAFE_CASES: &str =
      scanf_nullbyte_char setvbuf_unget sigprocmask_internal sscanf_eof statvfs strverscmp \
      syscall_sign_extend uselocale_0 wcsncpy_read_overflow wcsstr_false_negative";
 
-const LIBCTEST_DYNAMIC_SAFE_CASES: &str =
-    "argv basename clocale_mbfuncs clock_gettime dirname dlopen env fdopen fnmatch fscanf fwscanf \
+const LIBCTEST_DYNAMIC_SAFE_CASES: &str = "argv basename clocale_mbfuncs clock_gettime dirname dlopen env fdopen fnmatch fscanf fwscanf \
      iconv_open inet_pton mbc memstream pthread_cond pthread_tsd qsort random search_hsearch \
      search_insque search_lsearch search_tsearch sem_init setjmp snprintf socket sscanf \
      sscanf_long stat strftime string string_memcpy string_memmem string_memset string_strchr \
@@ -2935,8 +2955,7 @@ mod tests {
         // starve the heavier libcbench.
         assert!(cmd.contains("lmbench_testcode.sh"));
         assert!(
-            cmd.rfind("lmbench_testcode.sh").unwrap()
-                > cmd.rfind("libcbench_testcode.sh").unwrap()
+            cmd.rfind("lmbench_testcode.sh").unwrap() > cmd.rfind("libcbench_testcode.sh").unwrap()
         );
         assert!(
             cmd.rfind("cyclictest_testcode.sh").unwrap()

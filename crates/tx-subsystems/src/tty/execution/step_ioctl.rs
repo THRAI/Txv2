@@ -560,9 +560,19 @@ pub fn step_ioctl_tiocgwinsz(
         Ok(payload) => payload,
         Err(err) => return V3::Err(err.into()),
     };
-    V3::Done(Winsize::from_u64(
-        payload.window_size.load(Ordering::Acquire),
-    ))
+    let stored = Winsize::from_u64(payload.window_size.load(Ordering::Acquire));
+    // A serial console has no inherent geometry, so nothing sets the
+    // window size unless a program issues TIOCSWINSZ. Reporting the
+    // literal 0×0 makes full-screen TUIs (vim, less, top) unable to lay
+    // out a screen: vim stalls trying to recover the real size through
+    // a cursor-position query round-trip. Fall back to the classic
+    // 24×80 when unset — the standard default terminals assume.
+    let ws = if stored.ws_row == 0 && stored.ws_col == 0 {
+        Winsize::new(24, 80)
+    } else {
+        stored
+    };
+    V3::Done(ws)
 }
 
 pub fn step_ioctl_tiocswinsz(

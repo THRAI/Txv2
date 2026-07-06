@@ -136,16 +136,26 @@ pub(crate) fn wait_for_online_secondaries(target: CpuMask) -> usize {
     (LA64_ONLINE_CPUS.load(Ordering::Acquire) & target).count_ones() as usize
 }
 
-pub(crate) fn boot_secondary_cpus(entry: SecondaryEntry) -> usize {
+pub(crate) fn boot_secondary_cpus(possible: CpuMask, entry: SecondaryEntry) -> usize {
     #[cfg(target_arch = "loongarch64")]
     {
-        let possible = CpuMask::first(
+        // Wake set = policy mask (SmpIf::possible_cpus: single-core
+        // default, tx.maxcpus opt-in) ∩ discovered CPU count. This
+        // loop previously used the raw discovered count alone; on the
+        // LS2K1000 (no FDT → fallback bootinfo claims 4 CPUs, stock
+        // bootargs → policy says 1) it woke the real core 1, which
+        // then failed epoch AP init (substrate sized for 1 CPU) and
+        // panicked. QEMU never exposed the split because xtask pairs
+        // -smp with tx.maxcpus, keeping both notions equal.
+        let discovered = CpuMask::first(
             LA64_POSSIBLE_CPU_COUNT
                 .load(Ordering::Acquire)
                 .clamp(1, LA64_MAX_BOOT_CPUS),
         );
         let current = la64_current_cpu_id();
-        let target_mask = CpuMask::from_bits(possible.bits() & !CpuMask::single(current).bits());
+        let target_mask = CpuMask::from_bits(
+            possible.bits() & discovered.bits() & !CpuMask::single(current).bits(),
+        );
         if target_mask.is_empty() {
             return 0;
         }
@@ -164,7 +174,7 @@ pub(crate) fn boot_secondary_cpus(entry: SecondaryEntry) -> usize {
 
     #[cfg(not(target_arch = "loongarch64"))]
     {
-        let _ = entry;
+        let _ = (possible, entry);
         0
     }
 }

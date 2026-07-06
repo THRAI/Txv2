@@ -47,7 +47,7 @@ impl KernelTrapSink<Platform> for RecordingTrapSink {
         TrapAction::Reschedule
     }
 
-    fn on_external_irq(_cpu: CpuId) -> TrapAction {
+    fn on_external_irq(_cpu: CpuId, _view: TrapFrameMut<'_>) -> TrapAction {
         assert!(<Platform as IrqIf>::in_irq_context());
         TrapAction::Resume
     }

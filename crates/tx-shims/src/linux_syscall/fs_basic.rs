@@ -1470,6 +1470,65 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
         None => return SyscallResult::Error(EBADF_VALUE),
     };
 
+    // Generic (non-terminal) fd ioctls: valid on ANY fd type — pipes,
+    // regular files, sockets — and must NOT fall through to the
+    // TTY-shaped `-ENOTTY` path below. Rust std's
+    // `FileDesc::set_nonblocking` is `ioctl(fd, FIONBIO, &val)`, so
+    // `Child::wait_with_output` (which sets both output pipes
+    // non-blocking to interleave stdout/stderr reads) tripped ENOTTY
+    // and panicked mid-link — observed as rustc failing to link
+    // hello-world even though the linker produced a working binary.
+    const FIONCLEX: u32 = 0x5450;
+    const FIOCLEX: u32 = 0x5451;
+    const FIONBIO: u32 = 0x5421;
+    const FIONREAD: u32 = 0x541B;
+    match request {
+        FIOCLEX => {
+            ctx.process.set_fd_cloexec(fd as u32, true);
+            return SyscallResult::Return(0);
+        }
+        FIONCLEX => {
+            ctx.process.set_fd_cloexec(fd as u32, false);
+            return SyscallResult::Return(0);
+        }
+        FIONBIO => {
+            let requested: u32 = match bootstrap_read_user::<u32>(&ctx.aspace, argp) {
+                Ok(v) => v,
+                Err(errno) => return SyscallResult::error_from(errno),
+            };
+            let nonblocking = requested != 0;
+            let mut script_ctx = build_subject_script_ctx(ctx);
+            // Preserve the current packet-mode flag; FIONBIO only
+            // toggles non-blocking.
+            let packet = {
+                let mut getop = OpenFileGetFlOp { file: &file };
+                match step_engine::drive_oneshot(&mut getop, &mut script_ctx) {
+                    Ok(flags) => flags.packet,
+                    Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
+                }
+            };
+            let mut op = OpenFileSetFlOp {
+                file: &file,
+                nonblocking,
+                packet,
+            };
+            return match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
+                Ok(()) => SyscallResult::Return(0),
+                Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+            };
+        }
+        FIONREAD => {
+            // Bytes immediately readable. A best-effort 0 keeps callers
+            // that only check for success (and then read/poll) working;
+            // pipes/sockets that want a precise count use poll/read.
+            return match bootstrap_write_user::<u32>(&ctx.aspace, argp, 0) {
+                Ok(()) => SyscallResult::Return(0),
+                Err(errno) => SyscallResult::error_from(errno),
+            };
+        }
+        _ => {}
+    }
+
     // PR-10 phase 2: route userfaultfd-shape ioctls before the
     // VFS/TTY discriminator. The `OpenFile::rnode()` accessor panics
     // for `OpenFileBacking::Ufd`, so any ufd-shape ioctl must be

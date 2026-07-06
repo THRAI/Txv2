@@ -58,7 +58,8 @@ pub(crate) fn parse_firmware_boot_info(
                     } else {
                         None
                     }
-                });
+                })
+                .or_else(|| rd_start_copy_initrd(&cmdline[..cmdline_len]));
 
             if parsed_dtb.is_some() || initrd.is_some() || cmdline_len > 0 {
                 let memory_region_count = if let Some(parsed) = parsed_dtb {
@@ -390,6 +391,72 @@ unsafe fn fw_cfg_read_u8() -> u8 {
 #[cfg(target_arch = "loongarch64")]
 unsafe fn fw_cfg_initrd_buffer_ptr() -> *mut u8 {
     core::ptr::addr_of_mut!(LA64_FW_CFG_INITRD_BUFFER.bytes) as *mut u8
+}
+
+/// Parse the Loongson/2K U-Boot lineage initrd handoff from the kernel
+/// command line: `rd_start=<addr> rd_size=<bytes>` (hex with `0x` or
+/// decimal). Returns `(start, size)` only when both keys are present
+/// and non-zero.
+pub(crate) fn parse_rd_start_request(text: &str) -> Option<(usize, usize)> {
+    let mut rd_start: Option<usize> = None;
+    let mut rd_size: Option<usize> = None;
+    for token in text.split_whitespace() {
+        if let Some(value) = token.strip_prefix("rd_start=") {
+            rd_start = parse_usize_maybe_hex(value);
+        } else if let Some(value) = token.strip_prefix("rd_size=") {
+            rd_size = parse_usize_maybe_hex(value);
+        }
+    }
+    match (rd_start, rd_size) {
+        (Some(start), Some(size)) if size > 0 => Some((start, size)),
+        _ => None,
+    }
+}
+
+fn parse_usize_maybe_hex(value: &str) -> Option<usize> {
+    if let Some(hex) = value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")) {
+        usize::from_str_radix(hex, 16).ok()
+    } else {
+        value.parse::<usize>().ok()
+    }
+}
+
+/// Board-flow initrd channel: the LS2K1000 has no FDT and no fw_cfg,
+/// so after tftp'ing the initramfs cpio to a free high-RAM staging
+/// address the command line is the only way to tell the kernel where
+/// it lives (`rd_start=`/`rd_size=`, the convention the stock U-Boot
+/// env already carries for its own ramdisk flow). The bytes are copied
+/// into the same static buffer the fw_cfg path uses — kernel .bss,
+/// inside the reserved kernel-image range — so the staging window in
+/// usable RAM needs no reservation carve-out and may be reused by the
+/// page allocator afterwards.
+#[cfg(target_arch = "loongarch64")]
+fn rd_start_copy_initrd(cmdline: &[u8]) -> Option<PhysRange> {
+    let text = core::str::from_utf8(cmdline).ok()?;
+    let (start, size) = parse_rd_start_request(text)?;
+    if size > LA64_FW_CFG_INITRD_CAPACITY {
+        return None;
+    }
+    // Accept both DMW virtual (0x9000_0000_xxxx_xxxx) and raw physical
+    // staging addresses.
+    let phys = start & ((1usize << 48) - 1);
+    unsafe {
+        let src = la64_cached_virt(phys) as *const u8;
+        let dst = fw_cfg_initrd_buffer_ptr();
+        for offset in 0..size {
+            core::ptr::write_volatile(dst.add(offset), core::ptr::read_volatile(src.add(offset)));
+        }
+        Some(PhysRange {
+            start: PhysAddr(la64_kernel_addr_to_phys(dst as usize)),
+            size,
+        })
+    }
+}
+
+#[cfg(not(target_arch = "loongarch64"))]
+fn rd_start_copy_initrd(cmdline: &[u8]) -> Option<PhysRange> {
+    let _ = cmdline;
+    None
 }
 
 #[derive(Clone, Copy)]

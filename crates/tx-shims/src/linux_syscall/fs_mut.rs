@@ -238,12 +238,24 @@ pub(super) async fn sys_mkdirat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
         Err(e) => return SyscallResult::Error(e),
     };
     let cred = ctx.walker_cred();
-    let (parent_path, basename) = split_path(&path);
+    // POSIX pathname resolution: trailing slashes on a to-be-created
+    // directory are legal and refer to the directory itself —
+    // `mkdir("a/b/")` must create `b`. Strip them before splitting;
+    // without this the empty-basename arm below fired for ANY
+    // trailing-slash path and lied `-EEXIST` while creating nothing
+    // (observed: `git init`'s template copy passes `.git/hooks/`,
+    // believed the dir existed, then died ENOENT copying into it).
+    let trimmed = {
+        let mut end = path.len();
+        while end > 1 && path[end - 1] == b'/' {
+            end -= 1;
+        }
+        &path[..end]
+    };
+    let (parent_path, basename) = split_path(trimmed);
     if basename.is_empty() {
-        // Trailing-slash-only basename, e.g. `mkdir("/")` — the FsOps
-        // layer rejects an empty `InlineName`. Linux's behaviour for
-        // `mkdir("/")` is `-EEXIST`; we surface the more conservative
-        // `-EINVAL` (matches `InlineName::new(b"")`'s rejection).
+        // Only reachable for the root itself now (`mkdir("/")`).
+        // Linux returns `-EEXIST` for it.
         return SyscallResult::Error(EEXIST_VALUE);
     }
     let parent_dentry = if parent_path.is_empty() {

@@ -91,15 +91,16 @@ pub(super) fn exec_error_tag(error: &tx_scripts::process::exec::ExecError) -> &'
     }
 }
 
-/// Parse the firmware command line for an `init=` token and the
-/// `tx.profile=busybox` profile flag.
+/// Parse the firmware command line for an `init=` token and profile flags.
 ///
 /// Resolution order (matches the Linux kernel's classic ordering):
 ///   1. If the cmdline contains `init=PATH`, use `PATH` (argv0 set
 ///      to `PATH`'s basename).
 ///   2. Otherwise, if the cmdline contains the standalone token
+///      `tx.profile=onsite`, default to `/bin/bash` argv0=`bash`.
+///   3. Otherwise, if the cmdline contains the standalone token
 ///      `tx.profile=busybox`, default to `/bin/sh` argv0=`sh`.
-///   3. Otherwise, fall back to the bake-in `/init` fixture.
+///   4. Otherwise, fall back to the bake-in `/init` fixture.
 ///
 /// The cmdline is borrowed from `<P as BootInfoIf>::boot_info()`,
 /// which the firmware (or QEMU `-append`) populates with a
@@ -117,6 +118,12 @@ pub(super) fn parse_init_from_cmdline<P: TxPlatform>() -> (&'static [u8], &'stat
             };
             return (path.as_bytes(), argv0.as_bytes());
         }
+    }
+    if cmdline
+        .split_ascii_whitespace()
+        .any(|t| t == "tx.profile=onsite")
+    {
+        return (b"/bin/bash", b"bash");
     }
     if cmdline
         .split_ascii_whitespace()

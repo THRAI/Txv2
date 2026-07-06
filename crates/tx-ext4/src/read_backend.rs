@@ -138,6 +138,12 @@ impl<I: BlockImage> Ext4FsInstance<I> {
         Ok(count)
     }
 
+    /// Drop one inode's cached metadata after an in-place update
+    /// (chmod/chown), so the next `inode_meta_cached` re-reads disk.
+    pub(crate) fn invalidate_inode_meta(&self, inode: InodeNo) {
+        self.inode_meta_cache.lock().invalidate(inode);
+    }
+
     pub(crate) fn invalidate_lookup_cache_for(&self, parent: InodeNo) {
         self.lookup_cache.lock().invalidate_parent(parent);
         self.dir_cache.lock().invalidate(parent);

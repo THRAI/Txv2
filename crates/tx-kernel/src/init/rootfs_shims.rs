@@ -13,7 +13,7 @@
 // `populate_rootfs_shebang_shims` for the full design rationale.
 
 use super::*;
-use crate::adapter::step_engine::{self as step_engine, page_allocator, StepOutcome};
+use crate::adapter::step_engine::{self as step_engine, StepOutcome, page_allocator};
 use tx_subsystems::page_backed::{FsPageBacking, MaterializeAccess, PageIndex};
 
 impl<P: TxPlatform> CoreInit<P> {
@@ -456,12 +456,26 @@ nobody:x:65534:65534:nobody:/nonexistent:/bin/sh\n";
         // fallback to busybox for any argv shape it does not model).
         #[cfg(target_arch = "riscv64")]
         let bb_forward_names: &[&[u8]] = &[
-            b"arp", b"id", b"ln", b"mkdir", b"mount", b"readlink", b"seq",
+            b"arp",
+            b"id",
+            b"ln",
+            b"mkdir",
+            b"mount",
+            b"readlink",
+            b"seq",
         ];
         #[cfg(not(target_arch = "riscv64"))]
         let bb_forward_names: &[&[u8]] = &[
-            b"arp", b"cat", b"cut", b"grep", b"id", b"ln", b"mkdir", b"mount",
-            b"readlink", b"seq",
+            b"arp",
+            b"cat",
+            b"cut",
+            b"grep",
+            b"id",
+            b"ln",
+            b"mkdir",
+            b"mount",
+            b"readlink",
+            b"seq",
         ];
         for name in bb_forward_names {
             let _ = symlink_into(fs_ops, tx_ltp_bin_id, name, b"/bin/busybox", &cred);
@@ -488,13 +502,8 @@ nobody:x:65534:65534:nobody:/nonexistent:/bin/sh\n";
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../tools/images/vendor/tx-netfast-riscv64"
             ));
-            if !create_file_with_data(
-                &create_ctx,
-                tx_ltp_bin_id,
-                b"tx-netfast",
-                0o755,
-                TX_NETFAST,
-            ) {
+            if !create_file_with_data(&create_ctx, tx_ltp_bin_id, b"tx-netfast", 0o755, TX_NETFAST)
+            {
                 Self::write_board_sentinel_prefix();
                 tx_hal::console_write_str::<P>(":network-db:err:create-tx-netfast\n");
                 return;
@@ -1111,11 +1120,9 @@ exit 0
         // ICMP with -f flood); the netfilter-state script keeps owning the
         // loopback/no-target/unknown-flag shapes via these fallback names.
         #[cfg(target_arch = "riscv64")]
-        let (ping_script_name, ping6_script_name): (&[u8], &[u8]) =
-            (b"ping.nf", b"ping6.nf");
+        let (ping_script_name, ping6_script_name): (&[u8], &[u8]) = (b"ping.nf", b"ping6.nf");
         #[cfg(not(target_arch = "riscv64"))]
-        let (ping_script_name, ping6_script_name): (&[u8], &[u8]) =
-            (b"ping", b"ping6");
+        let (ping_script_name, ping6_script_name): (&[u8], &[u8]) = (b"ping", b"ping6");
         if !create_file_with_data(
             &create_ctx,
             tx_ltp_bin_id,
@@ -1837,7 +1844,10 @@ fn create_file_with_data(
 ) -> bool {
     let (file_id, file_meta) = {
         let guard = step_engine::guard();
-        match ctx.fs_ops.create_inode(parent, name, mode, ctx.cred, &guard) {
+        match ctx
+            .fs_ops
+            .create_inode(parent, name, mode, ctx.cred, &guard)
+        {
             StepOutcome::Done(out) => out,
             StepOutcome::Err(step_engine::Errno::EEXIST) => return true,
             _ => return false,

@@ -601,6 +601,44 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
         seg.vaddr = (seg.vaddr as i64 + aslr_delta) as u64;
     }
 
+    // ===== Phase 3a.5 — resolve a far PT_INTERP string ================
+    //
+    // The parser only inlines the interpreter path when it lands inside
+    // the header window it was handed. Binaries that place `.interp`
+    // deeper in the file (rustc: file offset 0x2028, past the 4 KiB
+    // header read) parse with `interpreter_path == None` but still
+    // report `interp_file_range`. Fetch the path from the file here so
+    // the dynamic-linker load below runs — otherwise the kernel would
+    // jump straight to the main binary's entry with nothing relocated
+    // (observed as a SIGSEGV into the unrelocated PLT at link-time
+    // 0x6f0 on rustc).
+    if parsed.interpreter_path.is_none() {
+        if let Some((interp_off, interp_len)) = parsed.interp_file_range {
+            let want = core::cmp::min(interp_len as usize, USER_PAGE_SIZE as usize);
+            if want > 0 {
+                let mut path_buf: Vec<u8> = alloc::vec![0u8; want];
+                use StepOutcome as V3;
+                let guard = step_engine::guard();
+                let outcome = read_exact_at(&file_pc, interp_off, &mut path_buf, &guard);
+                drop(guard);
+                match outcome {
+                    V3::Done(()) => {
+                        let path = path_buf
+                            .split(|&b| b == 0)
+                            .next()
+                            .unwrap_or(&[])
+                            .to_vec();
+                        if !path.is_empty() {
+                            parsed.interpreter_path = Some(path);
+                        }
+                    }
+                    V3::Continue { .. } | V3::Yield { .. } => return Err(ExecError::Busy),
+                    V3::Err(err) => return Err(ExecError::from_read_errno(err.into())),
+                }
+            }
+        }
+    }
+
     // ===== Phase 3b — load interpreter (if PT_INTERP present) =========
     //
     // When the main binary carries PT_INTERP, open and parse the

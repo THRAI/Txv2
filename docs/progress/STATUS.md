@@ -1,3 +1,99 @@
+- 2026-07-06 LATE (GIT TASK1 GREEN — two more onsite fixes). ① mkdir with a TRAILING SLASH
+  (`mkdir("a/b/")`) returned a bogus -EEXIST without creating anything: sys_mkdirat's
+  empty-basename arm (written for `mkdir("/")`) caught every trailing-slash path. git init's
+  template copy passes `.git/hooks/`, believed the dir existed, then died ENOENT copying into
+  it. Fix: strip trailing slashes before split_path (POSIX pathname resolution); the
+  empty-basename arm now only fires for the root itself. ② ext4 was the only filesystem
+  without a step_chmod override (trait default = ENOSYS); with the alpine image as ext4 root,
+  git init's core.filemode probe (chmod .git/config.lock) aborted. Implemented mirroring
+  tmpfs semantics (keep IFMT, replace low 12 bits, journaled inode-meta write + meta-cache
+  invalidation via new read_backend::invalidate_inode_meta). Verified end-to-end on the
+  official image: git init → add → commit ("[master (root-commit) 79f5a2a] add, 1 file
+  changed"). Onsite rv tally: gcc 15 + rustc 15 + vim 15 + git Task0/Task1 25 = 70/100;
+  only git Task2 (network, 30) remains. tx-ext4 9/9, rv board 91/91 serial green (the 2 dtb
+  "failures" in the parallel sweep are the known cross-crate global-state flake; serial
+  clean). Diagnostic traces (fs-path trace) stripped after the win.
+- 2026-07-06 (ONSITE-FINALS APP CAMPAIGN — gcc/rustc/vim ALL WORKING ON THE OFFICIAL ALPINE
+  IMAGE; five kernel bugs root-caused and fixed). Setup: official on-site-final-2025 alpine
+  ext4 image as virtio root (`tx.profile=onsite tx.root=sdcard`). ① rustc SIGSEGV at load —
+  the ELF parser only inlines PT_INTERP strings that fall inside its 4 KiB header window;
+  rustc's `.interp` sits at 0x2028, so the dynamic linker was silently skipped and the
+  unrelocated PLT jumped to link-time 0x6f0. Parser now records `interp_file_range` and
+  exec_script fetches the path from the file (loader.rs/script.rs). ② rustc panic at link
+  ("Not a tty"): generic fd ioctls (FIONBIO/FIONREAD/FIOCLEX/FIONCLEX) fell through to the
+  TTY -ENOTTY arm; Rust std's set_nonblocking is ioctl(FIONBIO) on the wait_with_output
+  pipes. Now handled first in sys_ioctl for any fd type. ③ TIOCGWINSZ returned 0×0 on the
+  serial console → vim can't lay out a screen; unset winsize now defaults to 24×80.
+  ④ Non-canonical VMIN=0/VTIME>0 reads blocked forever (mod.rs had "VTIME not implemented");
+  sys_read now races the read op against timer_sleep at the syscall layer (pselect's own
+  pattern) and returns 0 on expiry — verified by hand (stty min 0 time 20 + dd returns ~2s).
+  ⑤ THE BIG ONE — user-mode external interrupts lost the thread: KernelTrapSink::
+  on_external_irq returned bare `Reschedule` with no context handoff, so serial RX landing
+  while USER code ran longjmp'd to the reactor with the user context unsaved and the
+  userspace wait unresolved — thread parked forever, session "randomly" frozen. vim died
+  reliably (terminal answers its startup queries while vim is busy in userspace); interactive
+  typing survived (process parked in kernel when bytes arrive). Diagnosed with a paired
+  S/E syscall trace + L/U/T resume markers + V/W trap-boundary markers (fatal signature:
+  E72→L→U→V→W09i→silence). Fix: on_external_irq now takes the trap frame view and, for
+  Wake-from-user, routes through hand_off_timer_preempt exactly like timer preemption
+  (tx-hal trait + both boards + kernel sink). All diagnostics stripped after the win.
+  Verified: vim renders the full screen, enters INSERT, accepts text on the fatal-race
+  path; gcc hello.c && ./a.out ✓; rustc hi.rs && ./hi ✓. Board tests 47/91/56 green;
+  3 tx-subsystems net test failures are pre-existing (untouched subsystem). Remaining for
+  the onsite set: git Task0/1 validation, vim interactive hand-check, git Task2 (network).
+- 2026-07-04 NIGHT (LS2K1000 FIRST FLIGHT CAMPAIGN — INTERACTIVE BUSYBOX SHELL ON REAL SILICON).
+  Five stacked QEMU-vs-board divergences fixed across five flights, each root-caused before
+  patching: ① LA64_ECODE table mistranscription — ADEF/ADEM were listed as Ecodes 8/9 (they are
+  EsubCodes of ADE=8) pushing ALE to 10; real LA264 raises ALE=9 on unaligned access (QEMU
+  emulates unaligned silently, so the wrong constant was unreachable for years). Kernel-mode ALE
+  emulation added alongside (byte-assembled DMW access, reuses the user-mode decoder); numeric
+  pins now in tests (`la64_ecode_table_matches_reference_manual`, asserts classify(0x90000)).
+  ② AP wake mask split-brain — boot_secondary_cpus woke from the raw discovered CPU count
+  (fallback bootinfo says 4; the real core 1 answered the IOCSR mailbox) while epoch substrate
+  sized from SmpIf::possible_cpus (policy: 1) → AP panicked Epoch(InvalidCpu), two cores
+  interleaving UART. Wake set is now policy ∩ discovered; xtask always pairing -smp with
+  tx.maxcpus is why QEMU never showed it. ③ Initrd delivery: the board has no FDT and no fw_cfg,
+  so `rd_start=`/`rd_size=` (Loongson U-Boot lineage convention; the stock env carries those
+  names) is now parsed from the cmdline and the cpio is copied into the fw_cfg initrd buffer
+  (kernel .bss — no reservation carve needed). tftp the RAW cpio to 0x9000000098800000 (kernel
+  uimage stages at 0x98000000, 7.4MiB, 600KiB margin), `bootm 0x9000000098000000`. Validated on
+  QEMU via `-device loader` + rd_start cmdline before flying. ④ liointc driver (2K1000 legacy
+  INT_* block at 0x1fe01400, ISR/EN/ENSET/ENCLR/EDGE/POL + per-source route bytes, UART0=src 0 →
+  core0/pin0=0x11) replacing the P4.2 "no external irq" stub; register map verified live on the
+  board by post-enable read-back (inten=0x1, route0=0x11). ⑤ THE SLEEPER: CRMD.IE=0 at `idle`.
+  The longjmp-like kernel resume (tx_la64_resume_kernel_after_reschedule) returns to the reactor
+  loop with the trap entry's IE=0; LoongArch silicon only leaves idle when an interrupt can be
+  TAKEN → BSP parked forever after the shell blocked on read (timer armed, UART routed, nothing
+  woke; input dead). QEMU idle wakes on pending regardless of IE (hid it); RISC-V WFI resumes by
+  spec even when masked (why VF2 never hit it); Chronix/Del0n1x/NPUcore never execute `idle` at
+  all (pure spin schedulers). Fix mirrors Linux loongarch arch_cpu_idle: ensure CRMD.IE before
+  `idle` in la64_wait_for_interrupt_once. Diagnosed with a three-generation probe chain
+  (tick-gated chain dump → console-poll call counter+LSR → +CRMD field); probes stripped after
+  the win, liointc read-back note kept as a comment. Board now boots tftp'd kernel + raw-cpio
+  initramfs to an interactive busybox shell (ls/cd verified); host tests 47/47; QEMU la lane
+  interactive-regressed each step. U-Boot env persisted via saveenv (bootargs
+  `tx.profile=busybox tx.board=ls2k1000 console=ttyS0 rd_start=0x9000000098800000
+  rd_size=0x3c800` — rd_size must track the cpio byte size). Remaining: P4.3 full la oscomp
+  regression, AHCI groundwork (P4.4), boot-trace probes removal from the board flavor once
+  bring-up stabilizes, exec e_machine validation (deferred; fixture is still RV64-only bytes).
+- 2026-07-04 EARLY (P4.2 LA64 BOARD PARAMETRIZATION — all QEMU-regressed green). ① Single-core by
+  default + `tx.maxcpus=N` opt-in on the la board too (boot_facts::max_cpus_from_cmdline;
+  possible_cpus returns the boot core unless raised), matching the rv64 contract and the -smp 1
+  judge. ② Board profile switch, belt AND braces: runtime `tx.board=ls2k1000` (parsed in
+  publish_static_boot_facts before the first sentinel print) plus compile-time feature
+  `la-board-ls2k1000` that bakes the profile in — board uimages MUST use the feature build, because
+  a U-Boot that hands over neither cmdline nor FDT would otherwise leave the console on the wrong
+  UART forever. ③ UART base is now runtime-selected: QEMU 0x1fe0_01e0 vs LS2K1000 0x1fe2_0000
+  (NPUcore's proven base, reached through the uncached DMW window); put/get/IER paths all go
+  through la64_uart_base(). ④ eiointc claim/complete/mask/unmask all no-op on the 2k1000 profile —
+  the bring-up route runs with zero external interrupts (timer is a core CSR, console is
+  reactor-polled; NPUcore/Chronix onsite route). ⑤ Board packaging flow:
+  `cargo build -p tx-kernel-loongarch64-qemu-virt -Zbuild-std=core,alloc --target
+  loongarch64-unknown-none-softfloat --features la-board-ls2k1000 --release` then
+  `cargo xtask image la-uimage --release`. Host tests 45/45; default QEMU 9.2.1 lane: shell + ls
+  healthy (la initramfs busybox lacks the uname applet — image trim, not a bug). Remaining: P4.3
+  full la oscomp regression, P4.4 board tftp bring-up (suggested bootargs `tx.profile=busybox
+  tx.board=ls2k1000 console=ttyS0`) + AHCI groundwork (NPUcore sata_blk.rs, QEMU-emulable).
 - 2026-07-03 NIGHT (P4.1 LA64/LS2K1000 GROUNDWORK — unified high link boots QEMU 9.2.1 to an
   interactive busybox shell). One binary now serves QEMU virt and the 2K1000 board, mirroring the
   RV64 0x80200000 arrangement: KERNEL_LOAD_BASE moved 0x0020_0000 -> 0x9000_0000 (link base

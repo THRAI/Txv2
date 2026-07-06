@@ -51,7 +51,7 @@ impl KernelTrapSink<Platform> for RecordingTrapSink {
         TrapAction::Resume
     }
 
-    fn on_external_irq(_cpu: CpuId) -> TrapAction {
+    fn on_external_irq(_cpu: CpuId, _view: TrapFrameMut<'_>) -> TrapAction {
         panic!("unexpected external irq")
     }
 
@@ -85,7 +85,7 @@ impl KernelTrapSink<Platform> for RecordingSyscallSink {
         panic!("unexpected timer")
     }
 
-    fn on_external_irq(_cpu: CpuId) -> TrapAction {
+    fn on_external_irq(_cpu: CpuId, _view: TrapFrameMut<'_>) -> TrapAction {
         panic!("unexpected external irq")
     }
 
@@ -283,6 +283,77 @@ fn la64_trap_classification_decodes_interrupts_and_sync_faults() {
         TrapClass::PageFault {
             write: false,
             instruction: true,
+        }
+    );
+}
+
+#[test]
+fn rd_start_request_parses_vendor_cmdline_convention() {
+    use crate::boot_firmware::parse_rd_start_request;
+
+    // Board flow: bootargs carry the tftp staging window explicitly.
+    assert_eq!(
+        parse_rd_start_request(
+            "tx.profile=busybox tx.board=ls2k1000 console=ttyS0 \
+             rd_start=0x9000000098800000 rd_size=0x3c800"
+        ),
+        Some((0x9000_0000_9880_0000, 0x3c800))
+    );
+    // Decimal values and raw physical addresses are accepted too.
+    assert_eq!(
+        parse_rd_start_request("rd_start=2558525440 rd_size=247808"),
+        Some((0x9880_0000, 247808))
+    );
+    // Both keys required; zero size rejected.
+    assert_eq!(parse_rd_start_request("rd_start=0x98800000"), None);
+    assert_eq!(parse_rd_start_request("rd_size=0x3c800"), None);
+    assert_eq!(
+        parse_rd_start_request("rd_start=0x98800000 rd_size=0"),
+        None
+    );
+    assert_eq!(parse_rd_start_request("console=ttyS0"), None);
+}
+
+#[test]
+fn la64_ecode_table_matches_reference_manual() {
+    // Numeric pins against the LoongArch reference manual (Linux
+    // EXCCODE_*). A symbolically self-consistent but mistranscribed
+    // table passed every other test yet terminated the LS2K1000 first
+    // flight: ALE was listed as 10 (real silicon raises 9; QEMU never
+    // raises ALE at all), so kernel unaligned traps skipped the
+    // emulator. ADEF/ADEM are EsubCodes of ADE (Ecode 8), not Ecodes.
+    assert_eq!(LA64_ECODE_ADE, 8);
+    assert_eq!(LA64_ECODE_ALE, 9);
+    assert_eq!(LA64_ECODE_SYS, 11);
+    assert_eq!(LA64_ECODE_BRK, 12);
+    assert_eq!(LA64_ECODE_INE, 13);
+    assert_eq!(LA64_ECODE_IPE, 14);
+    assert_eq!(LA64_ECODE_FPD, 15);
+
+    // Raw estat 0x90000 is exactly what the board dumped on the first
+    // flight: Ecode 9 (ALE), EsubCode 0 — must classify as alignment.
+    assert_eq!(
+        classify_la64_trap(0x90000),
+        TrapClass::AlignmentFault {
+            write: false,
+            instruction: false,
+        }
+    );
+    // ADE fetch/mem split via EsubCode.
+    assert_eq!(
+        classify_la64_trap(LA64_ECODE_ADE << LA64_ESTAT_ECODE_SHIFT),
+        TrapClass::AlignmentFault {
+            write: false,
+            instruction: true,
+        }
+    );
+    assert_eq!(
+        classify_la64_trap(
+            (LA64_ECODE_ADE << LA64_ESTAT_ECODE_SHIFT) | (1 << LA64_ESTAT_ESUBCODE_SHIFT)
+        ),
+        TrapClass::AlignmentFault {
+            write: false,
+            instruction: false,
         }
     );
 }

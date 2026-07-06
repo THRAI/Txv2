@@ -847,6 +847,11 @@ pub(super) fn sys_writev_pagebacked_oneshot<'a>(
         drop(step_engine::guard());
     }
 
+    if total > 0 {
+        if let Err(errno) = flush_pagebacked_file(&file) {
+            return Some(SyscallResult::error_from(errno));
+        }
+    }
     Some(SyscallResult::Return(total))
 }
 
@@ -1785,6 +1790,11 @@ async fn sys_write_pagebacked<'a>(
     .await
     {
         Ok(total) => {
+            if total > 0 {
+                if let Err(errno) = flush_pagebacked_file(file) {
+                    return SyscallResult::error_from(errno);
+                }
+            }
             emit_debug_counter(b"debug.write.pagebacked.done", total as i64);
             emit_debug_counter(b"debug.write.pagebacked.phase", 4);
             SyscallResult::Return(total as i64)
@@ -1801,6 +1811,20 @@ async fn sys_write_pagebacked<'a>(
             }
             SyscallResult::error_from(errno)
         }
+    }
+}
+
+fn flush_pagebacked_file(file: &Cap<OpenFile>) -> Result<(), tx_subsystems::execution::Errno> {
+    use tx_substrate::step::StepOutcome as V3;
+
+    let Some(pc) = crate::linux_syscall::vm::extract_page_container(file) else {
+        return Ok(());
+    };
+    let guard = crate::adapter::step_engine::guard();
+    match tx_subsystems::page_backed::step_fsync(&pc, &guard) {
+        V3::Done(()) => Ok(()),
+        V3::Err(errno) => Err(errno.into()),
+        V3::Continue { .. } | V3::Yield { .. } => Err(tx_subsystems::execution::Errno::EIO),
     }
 }
 
@@ -2302,6 +2326,40 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
         return sys_read_pagebacked::<P>(&file, buf_ptr, len, ctx).await;
     }
 
+    // Non-canonical VMIN=0/VTIME>0 ("timed read", POSIX termios):
+    // return 0 after VTIME deciseconds when no byte arrives. The TTY
+    // step op itself has no deadline concept — it parks on the
+    // readable wait source indefinitely — so the timeout is imposed
+    // here by racing the drive() future against a timer, the same
+    // pattern sys_pselect6 uses. Without this, vim's terminal-response
+    // probes (write `ESC[6n`, timed-read the reply, give up on
+    // timeout) hang forever on consoles that never answer.
+    let vtime_deadline_ns: Option<u64> = if file.flags().nonblocking {
+        None
+    } else if let tx_subsystems::vfs::RNodeBacking::StructBacked {
+        payload: tx_subsystems::vfs::StructPayload::Tty(tty),
+    } = file.rnode().backing()
+    {
+        use tx_subsystems::tty::structure::termios::{ICANON, VMIN, VTIME};
+        let termios = {
+            let guard = crate::adapter::step_engine::guard();
+            match tx_subsystems::tty::execution::step_ioctl_tcgets(tty, &guard) {
+                tx_subsystems::execution::StepOutcome::Done(t) => Some(t),
+                _ => None,
+            }
+        };
+        termios.and_then(|t| {
+            if t.c_lflag & ICANON == 0 && t.c_cc[VMIN] == 0 && t.c_cc[VTIME] != 0 {
+                let vtime_ns = (t.c_cc[VTIME] as u64).saturating_mul(100_000_000);
+                Some(<P as tx_hal::TimeIf>::read_ns().saturating_add(vtime_ns))
+            } else {
+                None
+            }
+        })
+    } else {
+        None
+    };
+
     // Read into a kernel-side staging buffer, then copy out through
     // the canonical user-VA lane (`bootstrap_copy_to_user` bridges
     // via `aspace.copy_to_user`, falling back to the kernel-pointer
@@ -2334,16 +2392,46 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
         caller_netns: ctx.process.net_namespace(),
         cursor: 0,
     };
-    match drive(
+    let drive_fut = drive(
         op,
         &mut script_ctx,
         mode,
         mailbox_arc.as_ref(),
         delegate_registry_arc.as_deref(),
         timer_wheel_arc.as_ref(),
-    )
-    .await
-    {
+    );
+    // VTIME race: whichever completes first wins. A `None` from the
+    // race means the timer expired with no byte — POSIX says return 0.
+    let driven = if let Some(deadline_ns) = vtime_deadline_ns {
+        let timer = tx_subsystems::timer_sleep::sleep_until_ns(deadline_ns);
+        match timer {
+            Some(mut timer_fut) => {
+                let mut drive_fut = core::pin::pin!(drive_fut);
+                let raced = core::future::poll_fn(|cx| {
+                    if let core::task::Poll::Ready(r) =
+                        core::future::Future::poll(drive_fut.as_mut(), cx)
+                    {
+                        return core::task::Poll::Ready(Some(r));
+                    }
+                    if core::future::Future::poll(core::pin::Pin::new(&mut timer_fut), cx)
+                        .is_ready()
+                    {
+                        return core::task::Poll::Ready(None);
+                    }
+                    core::task::Poll::Pending
+                })
+                .await;
+                match raced {
+                    Some(result) => result,
+                    None => return SyscallResult::Return(0),
+                }
+            }
+            None => drive_fut.await,
+        }
+    } else {
+        drive_fut.await
+    };
+    match driven {
         Ok(total) => {
             if total > 0 {
                 if let Err(errno) =

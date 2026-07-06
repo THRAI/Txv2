@@ -1,11 +1,11 @@
 use core::{
     marker::PhantomData,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use crate::adapter::boot_runtime;
 use crate::adapter::step_engine::{
-    self as step_engine, init, init_on_ap, spin_mutex, ByteProgress, Cap, SpinMutex, StepOutcome,
+    self as step_engine, ByteProgress, Cap, SpinMutex, StepOutcome, init, init_on_ap, spin_mutex,
 };
 use crate::init::helpers::SmpRescheduleSignal;
 use tx_hal::{BootHandoff, CpuId, CpuMask, IpiKind, TxPlatform};
@@ -47,9 +47,12 @@ static BSP_REACTOR_TIMER_DONE_CPUS: AtomicU64 = AtomicU64::new(0);
 static BSP_REACTOR_TIMER_DEADLINE_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Global root-mount slot retained for the kernel lifetime after
-/// `mount_rootfs_tmpfs` bootstraps the process subsystem.
+/// `mount_rootfs_from_boot_media` bootstraps the process subsystem.
 static ROOT_MOUNT: SpinMutex<Option<Cap<MountIdentity>>> =
     spin_mutex(None, b"debug.lock.kernel.root_mount");
+
+/// True when `vda` is mounted directly as `/` for the onsite Alpine image.
+static ROOTFS_FROM_BOOT_MEDIA: AtomicBool = AtomicBool::new(false);
 
 /// Pin slot for the rootfs's root `DEntry` identity. Populated by
 /// `bind_init_cwd_and_root` with a clone of the same `Cap<DEntry>`
@@ -99,7 +102,7 @@ static CONSOLE_TTY: SpinMutex<Option<Cap<TtyIdentity>>> =
     spin_mutex(None, b"debug.lock.kernel.console_tty");
 
 /// Snapshot the boot-time root mount cap. Returns `None` until
-/// `mount_rootfs_tmpfs` has run (test pre-bootstrap or boot-time
+/// `mount_rootfs_from_boot_media` has run (test pre-bootstrap or boot-time
 /// pre-mount). Pairs with `ROOT_MOUNT`'s strong-retainer slot so
 /// integration tests can observe the mount-table contents without
 /// reaching inside `init.rs`.
@@ -157,6 +160,7 @@ pub(crate) fn boot_reactor_hart_is_polling_idle(hart: boot_runtime::HartId) -> b
 #[cfg(test)]
 pub fn reset_boot_state_for_test() {
     *ROOT_MOUNT.lock() = None;
+    ROOTFS_FROM_BOOT_MEDIA.store(false, Ordering::Release);
     *DEV_MOUNT.lock() = None;
     *DEV_SHM_MOUNT.lock() = None;
     *PROC_MOUNT.lock() = None;
@@ -336,10 +340,15 @@ impl<P: TxPlatform> CoreInit<P> {
             // busybox, so boards without a block device (VF2 before the
             // SD driver) resolved /bin/busybox to a dead /musl target
             // and lost the initramfs shell (2026-07-02 on-board find).
-            Self::populate_rootfs_tmp_dirs();
-            Self::populate_rootfs_identity_files();
-            Self::populate_rootfs_kernel_config();
-            Self::populate_rootfs_network_databases();
+            if ROOTFS_FROM_BOOT_MEDIA.load(Ordering::Acquire) {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":rootfs-shims:skip:rootfs\n");
+            } else {
+                Self::populate_rootfs_tmp_dirs();
+                Self::populate_rootfs_identity_files();
+                Self::populate_rootfs_kernel_config();
+                Self::populate_rootfs_network_databases();
+            }
             Self::init_csprng();
             Self::bind_init_cwd_and_root();
             // Boot net bring-up: publish the boot net device (virtio-net0) into
@@ -498,7 +507,7 @@ impl<P: TxPlatform> CoreInit<P> {
     /// whether the bytes at offset 1024+56 spell the ext4 magic (`0x53 0xef`).
     /// Boards without a block device (e.g. m1dock-mock) silently no-op.
     fn probe_ext4_superblock_smoke() {
-        use tx_fs::tx_ext4::{BlockDeviceImage, BlockImage, BLOCK_SIZE};
+        use tx_fs::tx_ext4::{BLOCK_SIZE, BlockDeviceImage, BlockImage};
         use tx_subsystems::device::block_device_by_name;
 
         let Some(reg) = block_device_by_name(b"vda") else {
@@ -546,12 +555,24 @@ impl<P: TxPlatform> CoreInit<P> {
 
     /// Mount tmpfs as the boot rootfs.
     ///
-    /// Keep LA64 aligned with RV64: `/` is a writable tmpfs used for
-    /// devfs, initramfs overlays, and bootstrap fixtures; block-backed
-    /// ext4 media is mounted later under `/musl` by
+    /// Keep LA64 aligned with RV64 by default: `/` is a writable tmpfs
+    /// used for devfs, initramfs overlays, and bootstrap fixtures;
+    /// block-backed ext4 media is mounted later under `/musl` by
     /// `mount_sdcard_at_musl`.
+    ///
+    /// For the onsite final profile (`tx.root=sdcard` or
+    /// `tx.profile=onsite`), mount the virtio-blk ext4 image directly as
+    /// `/` so Alpine's natural `/bin`, `/usr`, `/lib`, and `/etc` paths
+    /// are visible without compatibility symlinks.
     pub(crate) fn mount_rootfs_from_boot_media() {
-        Self::mount_rootfs_tmpfs();
+        if !Self::mount_sdcard_as_root_if_requested() {
+            Self::mount_rootfs_tmpfs();
+        }
+
+        Self::init_vdso_after_rootfs_mount();
+    }
+
+    fn init_vdso_after_rootfs_mount() {
         // Initialise the vDSO image and high-res clock parameters.
         // Must run after the substrate page allocator is ready.
         if let Err(e) = crate::vdso::init::<P>() {
@@ -564,6 +585,89 @@ impl<P: TxPlatform> CoreInit<P> {
             });
             tx_hal::console_write_str::<P>("\n");
         }
+    }
+
+    fn mount_sdcard_as_root_if_requested() -> bool {
+        if !Self::sdcard_root_requested() {
+            return false;
+        }
+
+        use tx_fs::tx_ext4::{BlockDeviceImage, mount_ext4_read_write};
+        use tx_subsystems::device::block_device_by_name;
+
+        let Some(reg) = block_device_by_name(b"vda") else {
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":mount:rootfs:ext4:vda:missing\n");
+            return false;
+        };
+
+        let image = BlockDeviceImage::new(reg.ops);
+        let mount_output = match mount_ext4_read_write(image) {
+            Ok(out) => out,
+            Err(_) => {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":mount:rootfs:ext4:vda:err\n");
+                return false;
+            }
+        };
+
+        let ext4_payload = MountPayload::new_cap(
+            mount_output.fs_ops().clone(),
+            mount_output.fs_page_backing().clone(),
+            None,
+            mount::allocate_dev_id(),
+            MountOptions::default(),
+            "ext4",
+            SourceLabel::Static("vda-root"),
+        )
+        .expect("mount_sdcard_as_root_if_requested: payload reservation");
+
+        mount_output.bind_mount_payload(&ext4_payload);
+
+        let ext4_root_rnode = {
+            let raw = RNode::new(
+                mount_output.root_fs_object_id,
+                mount_output.root_inode_meta,
+                RNodeBacking::Directory,
+            )
+            .with_containing_mount(&ext4_payload);
+            let res = step_engine::reserve_for::<RNode>()
+                .expect("mount_sdcard_as_root_if_requested: root rnode reservation");
+            step_engine::sign_for(res, raw)
+        };
+
+        let mount = MountIdentity::new_cap(
+            mount::allocate_mount_id(),
+            None,
+            ext4_root_rnode,
+            None,
+            ext4_payload,
+            MountFlags::empty(),
+        )
+        .expect("mount_sdcard_as_root_if_requested: mount identity reservation");
+
+        let mnt_ns = MountNamespace::new_cap(mount.clone())
+            .expect("mount_sdcard_as_root_if_requested: mount namespace reservation");
+        if let Some(init) = tx_subsystems::process::init_process() {
+            tx_subsystems::process::step_set_mount_namespace(&init, mnt_ns)
+                .expect("mount_sdcard_as_root_if_requested: publish init mount namespace");
+        }
+
+        *ROOT_MOUNT.lock() = Some(mount);
+        ROOTFS_FROM_BOOT_MEDIA.store(true, Ordering::Release);
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":mount:rootfs:ext4:vda:ok\n");
+        true
+    }
+
+    fn sdcard_root_requested() -> bool {
+        let Some(cmdline) = <P as tx_hal::BootInfoIf>::boot_info().cmdline else {
+            return false;
+        };
+        cmdline
+            .split_ascii_whitespace()
+            .any(|token| token == "tx.root=sdcard" || token == "tx.profile=onsite")
     }
 
     /// Mount tmpfs as the rootfs.
@@ -655,7 +759,7 @@ impl<P: TxPlatform> CoreInit<P> {
     /// FsObjectId::new(2)`). The resulting directory inode then
     /// serves as the mountpoint for devfs.
     ///
-    /// **Order invariant:** must follow `mount_rootfs_tmpfs` (needs
+    /// **Order invariant:** must follow `mount_rootfs_from_boot_media` (needs
     /// the rootfs DEntry) and precede `register_devfs_console_alias`
     /// (the alias is republished after the mount publication so its
     /// observation window matches devfs's).
@@ -682,6 +786,25 @@ impl<P: TxPlatform> CoreInit<P> {
             .mkdir(root_fs_object_id, b"dev", 0o755, &cred, &guard)
         {
             V3::Done(out) => out,
+            V3::Err(step_engine::Errno::EEXIST) => {
+                let rootfs_payload = root_mount
+                    .payload_cap()
+                    .expect("rootfs payload alive during boot")
+                    .into_cap()
+                    .clone();
+                let id = match rootfs_payload
+                    .fs_ops
+                    .lookup(root_fs_object_id, b"dev", &guard)
+                {
+                    V3::Done(id) => id,
+                    other => panic!("mount_devfs_at_dev: /dev lookup after EEXIST: {other:?}"),
+                };
+                let meta = match rootfs_payload.fs_ops.load_inode_meta(id, &guard) {
+                    V3::Done(meta) => meta,
+                    other => panic!("mount_devfs_at_dev: /dev meta after EEXIST: {other:?}"),
+                };
+                (id, meta)
+            }
             V3::Err(step_engine::Errno::ENOSYS) | V3::Err(step_engine::Errno::EROFS) => {
                 (root_fs_object_id, root_mount.root().meta())
             }
@@ -1216,7 +1339,11 @@ impl<P: TxPlatform> CoreInit<P> {
     /// already populated, `/dev` already created in tmpfs) and precede
     /// `bind_init_cwd_and_root`.
     pub(crate) fn mount_sdcard_at_musl() {
-        use tx_fs::tx_ext4::{mount_ext4_read_write, BlockDeviceImage};
+        if ROOTFS_FROM_BOOT_MEDIA.load(Ordering::Acquire) {
+            return;
+        }
+
+        use tx_fs::tx_ext4::{BlockDeviceImage, mount_ext4_read_write};
         use tx_subsystems::device::block_device_by_name;
 
         let Some(reg) = block_device_by_name(b"vda") else {
@@ -1559,7 +1686,12 @@ impl<P: TxPlatform> CoreInit<P> {
         // already overlays its own /init on top of the fixture
         // when present — so the EEXIST-tolerant idempotent call is
         // both correct and simpler.
-        Self::register_init_fixture_into_tmpfs();
+        if ROOTFS_FROM_BOOT_MEDIA.load(Ordering::Acquire) {
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":bootstrap-fixtures:skip:rootfs\n");
+        } else {
+            Self::register_init_fixture_into_tmpfs();
+        }
         // Shell-prompt roadmap Slice 10 (2026-05-08): when the build
         // script bakes a busybox binary via `TX_BUSYBOX`, also
         // register it at `/bin/sh` so the bootstrap fixture's
@@ -1568,7 +1700,9 @@ impl<P: TxPlatform> CoreInit<P> {
         // it the fall-through is the legacy `/init` fixture path
         // exclusively.
         #[cfg(busybox_baked)]
-        Self::register_busybox_into_tmpfs();
+        if !ROOTFS_FROM_BOOT_MEDIA.load(Ordering::Acquire) {
+            Self::register_busybox_into_tmpfs();
+        }
         // Initramfs slice (2026-05-08): when the firmware (or QEMU
         // `-initrd`) supplied a cpio archive, walk it and overlay
         // its contents on top of the bake-in fixture. Entries that
@@ -1577,13 +1711,17 @@ impl<P: TxPlatform> CoreInit<P> {
         // `symlink` as a non-fatal skip, so the bake-in always
         // wins. Entries unique to the cpio (e.g. `/bin/busybox`,
         // `/bin/sh` symlink) get added.
-        Self::register_initramfs_if_present();
+        if !ROOTFS_FROM_BOOT_MEDIA.load(Ordering::Acquire) {
+            Self::register_initramfs_if_present();
+        }
         // Shebang shims AFTER the initramfs overlay: symlink_into
         // EEXIST-skips names the cpio already provided, so a real
         // initramfs busybox wins over the /musl/musl/busybox shim
         // (which only resolves once a block device backs /musl).
         // Without an initramfs the shims land exactly as before.
-        Self::populate_rootfs_shebang_shims();
+        if !ROOTFS_FROM_BOOT_MEDIA.load(Ordering::Acquire) {
+            Self::populate_rootfs_shebang_shims();
+        }
         Self::drive_bootstrap_exec();
     }
 

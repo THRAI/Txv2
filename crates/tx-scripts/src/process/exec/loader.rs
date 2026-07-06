@@ -183,7 +183,20 @@ pub struct ExecImagePlan {
     /// Default false; true only when the binary explicitly adds PF_X.
     pub executable_stack: bool,
     /// Interpreter plan (from PT_INTERP).  None for static binaries.
+    ///
+    /// Only populated when the PT_INTERP string lies within the
+    /// header window the parser was handed. When it doesn't (e.g.
+    /// rustc, whose `.interp` sits at file offset 0x2028 — past the
+    /// 4 KiB header read), this is `None` but `interp_file_range` still
+    /// records where to read it, so the caller can fetch the path from
+    /// the file. Consult `interp_file_range` first to decide whether
+    /// the binary is dynamic; a `None` here with `Some` there is a
+    /// dynamic binary whose path just needs a second read.
     pub interpreter_path: Option<Vec<u8>>,
+    /// `(file_offset, filesz)` of the PT_INTERP segment, if present.
+    /// Authoritative "is this dynamic?" signal — independent of whether
+    /// the path string fell inside the parser's header window.
+    pub interp_file_range: Option<(u64, u64)>,
 }
 
 /// Parse the ELF header + program headers and produce an image plan.
@@ -259,12 +272,18 @@ pub fn parse_image_plan(elf_bytes: &[u8]) -> Result<ExecImagePlan, ParseError> {
     let mut pt_phdr_vaddr: Option<u64> = None;
     let mut exec_stack: bool = false;
     let mut interp_path: Option<Vec<u8>> = None;
+    let mut interp_file_range: Option<(u64, u64)> = None;
     let mut has_dynamic = false;
 
     for phdr in &phdrs {
         match phdr.p_type {
             PT_INTERP => {
-                // Extract interpreter path from ELF bytes.
+                // Always record where the interpreter string lives so
+                // the caller can fetch it from the file even when it
+                // falls outside this header window (rustc: .interp at
+                // 0x2028, past the 4 KiB parser read).
+                interp_file_range = Some((phdr.p_offset, phdr.p_filesz));
+                // Fast path: extract inline when it fits the buffer.
                 let off = phdr.p_offset as usize;
                 let len = (phdr.p_filesz as usize).min(4096);
                 if off + len <= elf_bytes.len() {
@@ -352,6 +371,7 @@ pub fn parse_image_plan(elf_bytes: &[u8]) -> Result<ExecImagePlan, ParseError> {
         load_bias,
         executable_stack: exec_stack,
         interpreter_path: interp_path,
+        interp_file_range,
     })
 }
 

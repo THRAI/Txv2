@@ -64,7 +64,7 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
         TrapAction::Resume
     }
 
-    fn on_external_irq(_cpu: CpuId) -> TrapAction {
+    fn on_external_irq(cpu: CpuId, view: TrapFrameMut<'_>) -> TrapAction {
         let irq = P::claim();
         if irq == 0 {
             return TrapAction::Resume;
@@ -74,7 +74,31 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
         P::complete(irq);
 
         match handled {
-            IrqHandled::Wake => TrapAction::Reschedule,
+            IrqHandled::Wake => {
+                // An external interrupt that lands while USER code is
+                // running must park the interrupted thread exactly like
+                // a timer preempt: save the user context and resolve
+                // the thread's userspace wait so the reactor can resume
+                // it later. Returning a bare `Reschedule` here (the
+                // pre-2026-07-06 behaviour) longjmps to the reactor
+                // with the user context unsaved and the wait
+                // unresolved — the thread is parked forever and the
+                // session appears to freeze. Trigger: serial RX
+                // arriving in the window where the process is
+                // executing userspace (vim startup racing the
+                // terminal's query responses; bursty paste input).
+                // Kernel-mode interrupts (WFI wake) keep the plain
+                // Reschedule path.
+                if view.view().previous_mode == tx_hal::TrapPreviousMode::User {
+                    let hart = <P as PercpuIf>::current_cpu_id().0;
+                    let outcome = trap_handoff::hand_off_timer_preempt(hart, &view);
+                    if matches!(outcome, trap_handoff::TimerPreemptOutcome::Preempted) {
+                        crate::init::mark_boot_reactor_userspace_preempt(cpu);
+                    }
+                    return trap_handoff::timer_preempt_outcome_to_trap_action(&outcome);
+                }
+                TrapAction::Reschedule
+            }
             IrqHandled::Done | IrqHandled::NotMine => TrapAction::Resume,
         }
     }
