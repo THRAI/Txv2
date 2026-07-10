@@ -199,3 +199,19 @@ L2 以太帧          build_ipv4_ethernet_frame(:664)     │ 无 build_ipv6_eth
 **验证**:rv64 build 干净;`rtnetlink_tests` 隔离 24/24(既有 v4 route + 新 v6 route 同过);全量集合差唯一新增=3 个新 v6 route 测试(级联,隔离过),**0 既有回归**(v4 路由/数据面未动)。功能门(QEMU `ip -6 route`)需真机。
 
 **下一步**:**V3b 数据面**(`emit_ipv6_packet` + step_device_tx v6 分支 + step_send/connect v6 选路 + `decide_ipv6_route` 网关)——解锁外部 off-link v6 TCP/UDP 真流量,先出调研文档。
+
+---
+
+## 10. V3b 已落地(2026-07-10)
+
+§5 表 **V3 行的数据面**(外部 off-link v6 TCP/UDP 路由)已实现。正本计划 [[IPV6_V3B_PLAN_v1]]。**调研发现**:emit / 源选择 / on-link 路由**早已就绪**(`emit_ipv4_packet` 双族、UDP `local` 双族、connect 源选择双族、on-link→Direct→NDP),真缺口仅 off-link 网关,故 V3b ~100 LOC(远小于 [[IPV6_V3_PLAN_v1]] §4 估计)。
+
+- **`IfaceCommon.ipv6_gateway`**(loopback.rs):`with_ipv6_gateway` 链式 setter + getter(V1a 注释早留坑)。
+- **`decide_ipv6_route` 网关分支**(ether/mod.rs):off-link + 有 v6 网关 → `Ipv6RouteDecision::Gateway{next_hop}`;`dispatch_ipv6_at` 零改(网关 next_hop 经 `resolve_ndisc` 走 NDP 解析)。
+- **v6 网关灌入**(namespace.rs):`gateway6_for_device`(从 `routes6` ::/0 默认路由解析,镜像 v4 `gateway_for_device`)+ `NetNamespaceIfaceRuntime.ipv6_gateway` + `ensure_ether_iface_for_link` 灌入 + 缓存键。
+
+**验证**:rv64 build 干净;2 测试隔离全 ok(`decide_ipv6_route` 四路径 + off-link 排网关不排 dst);decide 纯函数测试连全量都过;集合差新增失败仅 off-link 集成测试(级联,隔离过),**0 既有回归**。**边界**:socket→emit_v6 段代码复核双族、未写 socket 级端到端 v6 UDP 测试;功能门(QEMU 外部 v6 iperf)需真机。
+
+**结果**:外部 off-link v6 TCP/UDP 收发链内核侧齐了 = 路由(V3b)+ emit 双族 + 源选择双族 + NDP(V2)。
+
+**下一步**:V4(v6 分片/重组 + `ipv6_forwarding` + sysctl 真值),或按 LTP v6 靶优先。

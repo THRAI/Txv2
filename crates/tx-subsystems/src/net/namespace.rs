@@ -223,6 +223,7 @@ struct NetNamespaceIfaceRuntime {
     gateway: Option<Ipv4Address>,
     ipv6_addr: Option<Ipv6Address>,
     ipv6_prefix_len: Option<u8>,
+    ipv6_gateway: Option<Ipv6Address>,
     iface: &'static EtherIface,
 }
 
@@ -1350,6 +1351,27 @@ impl NetNamespacePayload {
         })
     }
 
+    /// IPv6 V3b: the ::/0 default route's gateway for `name` (mirror of
+    /// [`gateway_for_device`], over the v6 `routes6` FIB).
+    fn gateway6_for_device(&self, name: &'static str) -> Option<Ipv6Address> {
+        let routes = self.routes6.lock().clone();
+        routes.iter().find_map(|route| {
+            let gateway = route.gateway?;
+            if route.prefix_len == 0
+                && (route.oif_name == Some(name)
+                    || if route.oif_name.is_none() {
+                        self.oif6_for_gateway(gateway) == Some(name)
+                    } else {
+                        false
+                    })
+            {
+                Some(gateway)
+            } else {
+                None
+            }
+        })
+    }
+
     pub fn set_device_up_by_ifindex(
         &self,
         _authority: NetAdminAuthority,
@@ -1946,6 +1968,10 @@ impl NetNamespacePayload {
         // rebuild cache key so a v6-addr change re-leaks the iface.
         let ipv6_addr = link.ipv6_addr;
         let ipv6_prefix_len = link.ipv6_prefix_len;
+        // IPv6 V3b: off-link v6 next-hop from the ::/0 default route (mirror of
+        // the v4 `gateway`); part of the rebuild cache key so a v6-gateway change
+        // re-leaks the iface.
+        let ipv6_gateway = self.gateway6_for_device(link.name);
         let mut runtime = self.iface_runtime.lock();
 
         if let Some(entry) = runtime.iter().find(|entry| {
@@ -1955,6 +1981,7 @@ impl NetNamespacePayload {
                 && entry.gateway == gateway
                 && entry.ipv6_addr == ipv6_addr
                 && entry.ipv6_prefix_len == ipv6_prefix_len
+                && entry.ipv6_gateway == ipv6_gateway
         }) {
             return Some(entry.iface);
         }
@@ -1967,7 +1994,8 @@ impl NetNamespacePayload {
                 gateway,
                 registration.ops.mtu(),
             )
-            .with_ipv6(ipv6_addr, ipv6_prefix_len),
+            .with_ipv6(ipv6_addr, ipv6_prefix_len)
+            .with_ipv6_gateway(ipv6_gateway),
             registration.ops.mac_addr(),
             registration.name,
         )));
@@ -1984,6 +2012,7 @@ impl NetNamespacePayload {
                 gateway,
                 ipv6_addr,
                 ipv6_prefix_len,
+                ipv6_gateway,
                 iface,
             };
         } else {
@@ -1994,6 +2023,7 @@ impl NetNamespacePayload {
                 gateway,
                 ipv6_addr,
                 ipv6_prefix_len,
+                ipv6_gateway,
                 iface,
             });
         }

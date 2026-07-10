@@ -875,13 +875,16 @@ fn build_ipv6_ethernet_frame(
     frame
 }
 
-/// IPv6 V1 route decision — **on-link only** (no v6 gateway yet; the full FIB
-/// with v6 gateways lands in V3). Mirror of [`decide_ipv4_route`].
+/// IPv6 V3b route decision — multicast / on-link direct / off-link via the
+/// configured v6 gateway (default route's next-hop) / unreachable. Mirror of
+/// [`decide_ipv4_route`].
 pub fn decide_ipv6_route(common: IfaceCommon, dst: Ipv6Address) -> Ipv6RouteDecision {
     if dst.is_multicast() {
         Ipv6RouteDecision::Multicast { next_hop: dst }
     } else if same_ipv6_prefix(common, dst) {
         Ipv6RouteDecision::Direct { next_hop: dst }
+    } else if let Some(gateway) = common.ipv6_gateway() {
+        Ipv6RouteDecision::Gateway { next_hop: gateway }
     } else {
         Ipv6RouteDecision::Unreachable { dst }
     }
@@ -942,13 +945,16 @@ fn ether_from_lladdr(raw: RawHardwareAddress) -> Option<EthernetAddress> {
 pub enum Ipv6RouteDecision {
     Direct { next_hop: Ipv6Address },
     Multicast { next_hop: Ipv6Address },
+    Gateway { next_hop: Ipv6Address },
     Unreachable { dst: Ipv6Address },
 }
 
 impl Ipv6RouteDecision {
     pub const fn next_hop(self) -> Option<Ipv6Address> {
         match self {
-            Self::Direct { next_hop } | Self::Multicast { next_hop } => Some(next_hop),
+            Self::Direct { next_hop }
+            | Self::Multicast { next_hop }
+            | Self::Gateway { next_hop } => Some(next_hop),
             Self::Unreachable { .. } => None,
         }
     }

@@ -1,3 +1,15 @@
+- 2026-07-10 (IPv6 V3b 落地 — v6 数据面外部 off-link 路由). 目标:外部 off-link v6 TCP/UDP 真流量。**调研关键发现**:计划
+  估的 emit_ipv6 / step_device_tx / 源选择三大块**其实早已就绪**——emit 双族(TCP 用存储 `ip_repr`、UDP 首行
+  `dst.family==Inet6`→`emit_v6`);UDP `local`=socket 绑定端点(双族);connect 源选择双族;on-link `decide_ipv6_route`→Direct→NDP。
+  真缺口仅 `decide_ipv6_route` 的 off-link 网关,故 V3b ~100 LOC。**实现**(全加法,零碰 v4/数据面):loopback.rs
+  `IfaceCommon.ipv6_gateway` + `with_ipv6_gateway`;ether/mod.rs `Ipv6RouteDecision::Gateway` + `decide_ipv6_route` 网关分支
+  (dispatch 侧零改,网关 next_hop 经 `resolve_ndisc`→NDP);namespace.rs `gateway6_for_device`(从 `routes6` ::/0 解析)+
+  `NetNamespaceIfaceRuntime.ipv6_gateway` + `ensure_ether_iface_for_link` 灌入 + 缓存键;导出 `decide_ipv6_route`/`Ipv6RouteDecision`;
+  2 测试(decide 四路径 + off-link 排网关)。**验证**:rv64 build 干净;2 测试隔离全 ok(decide 纯函数连全量都过);集合差
+  新增失败**仅** off-link 集成测试(级联,隔离过),**0 既有回归**(v4 路由/emit/step_device_tx 未动)。**边界**:socket→emit_v6
+  段代码复核双族、未写 socket 级 v6 UDP 端到端测试;功能门(QEMU 外部 v6 iperf)需真机。**结果**:外部 off-link v6 收发链
+  内核侧齐了 = 路由(V3b)+ emit 双族 + 源选择双族 + NDP(V2)。**下一步**:V4(v6 分片/重组 + `ipv6_forwarding` + sysctl 真值)
+  或按 LTP v6 靶。**Blocker**:无。正本 docs/design/07_net/IPV6_V3B_PLAN_v1.md。
 - 2026-07-10 (IPv6 V3a 落地 — v6 路由/FIB 管理面). 目标:v6 路由表 + rtnetlink v6 route + `/proc/net/ipv6_route`,解锁
   `ip -6 route`。**调研关键发现**:"外部 v6 TCP/UDP"不止路由——数据面(socket→wire `emit`)也纯 v4;故 V3 拆 **V3a(管理面,
   本轮)+ V3b(数据面,后续)**。**实现**(独立 `routes6` 表镜像 v4,零碰数据面):namespace.rs(+380)`NetNamespaceRoute6

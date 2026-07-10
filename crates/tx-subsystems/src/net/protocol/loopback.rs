@@ -14,10 +14,11 @@ pub struct IfaceCommon {
     netmask: Ipv4Address,
     gateway: Option<Ipv4Address>,
     mtu: u16,
-    // IPv6 V1: on-link config only (no v6 gateway yet — decide_ipv6_route is
-    // multicast/on-link/unreachable; gateway lands with the V3 FIB).
+    // IPv6 V1: on-link v6 config. IPv6 V3b added `ipv6_gateway` so
+    // decide_ipv6_route forwards off-link v6 via the default route's gateway.
     ipv6_addr: Option<Ipv6Address>,
     ipv6_prefix_len: Option<u8>,
+    ipv6_gateway: Option<Ipv6Address>,
 }
 
 pub struct LoopbackIface {
@@ -34,6 +35,7 @@ impl IfaceCommon {
             mtu,
             ipv6_addr: None,
             ipv6_prefix_len: None,
+            ipv6_gateway: None,
         }
     }
 
@@ -50,6 +52,7 @@ impl IfaceCommon {
             mtu,
             ipv6_addr: None,
             ipv6_prefix_len: None,
+            ipv6_gateway: None,
         }
     }
 
@@ -93,6 +96,19 @@ impl IfaceCommon {
 
     pub const fn ipv6_prefix_len(self) -> Option<u8> {
         self.ipv6_prefix_len
+    }
+
+    /// IPv6 V3b: attach the off-link v6 next-hop (default route's gateway).
+    /// Chained after `with_ipv6` at the namespace iface-build site.
+    pub fn with_ipv6_gateway(self, ipv6_gateway: Option<Ipv6Address>) -> Self {
+        Self {
+            ipv6_gateway,
+            ..self
+        }
+    }
+
+    pub const fn ipv6_gateway(self) -> Option<Ipv6Address> {
+        self.ipv6_gateway
     }
 }
 

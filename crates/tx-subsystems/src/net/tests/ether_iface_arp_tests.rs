@@ -1060,3 +1060,89 @@ fn ether_iface_ndisc_solicit_retry_limit_marks_failed() {
         .last_error
         .is_some());
 }
+
+// ===== IPv6 V3b: off-link routing via the v6 gateway =====
+
+fn leak_ether_iface_v6_gw(
+    registration: &'static NetDeviceRegistration,
+    local_ip: Ipv4Address,
+    local_v6: Ipv6Address,
+    gateway: Ipv6Address,
+    local_mac: EthernetAddress,
+) -> &'static EtherIface {
+    Box::leak(Box::new(EtherIface::new(
+        registration,
+        IfaceCommon::new(local_ip, Ipv4Address::new([255, 255, 255, 0]), 1500)
+            .with_ipv6(Some(local_v6), Some(64))
+            .with_ipv6_gateway(Some(gateway)),
+        local_mac,
+        "eth6gw-test",
+    )))
+}
+
+#[test]
+fn decide_ipv6_route_uses_direct_gateway_and_unreachable_paths() {
+    let local_v6 = Ipv6Address::new([0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let gateway = Ipv6Address::new([0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff]);
+    let on_link = Ipv6Address::new([0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    let off_link = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let mcast = Ipv6Address::new([0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+
+    let common = IfaceCommon::new(
+        Ipv4Address::new([10, 0, 0, 1]),
+        Ipv4Address::new([255, 255, 255, 0]),
+        1500,
+    )
+    .with_ipv6(Some(local_v6), Some(64))
+    .with_ipv6_gateway(Some(gateway));
+
+    assert_eq!(
+        decide_ipv6_route(common, mcast),
+        Ipv6RouteDecision::Multicast { next_hop: mcast }
+    );
+    assert_eq!(
+        decide_ipv6_route(common, on_link),
+        Ipv6RouteDecision::Direct { next_hop: on_link }
+    );
+    // Off-link with a configured gateway → route via the gateway next-hop.
+    assert_eq!(
+        decide_ipv6_route(common, off_link),
+        Ipv6RouteDecision::Gateway { next_hop: gateway }
+    );
+    // Off-link without a gateway → unreachable.
+    assert_eq!(
+        decide_ipv6_route(common.with_ipv6_gateway(None), off_link),
+        Ipv6RouteDecision::Unreachable { dst: off_link }
+    );
+}
+
+#[test]
+fn ether_iface_v6_offlink_solicits_gateway_not_dst() {
+    let _lock = setup();
+
+    let local_ip = Ipv4Address::new([10, 0, 0, 1]);
+    let local_v6 = Ipv6Address::new([0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let gateway = Ipv6Address::new([0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff]);
+    let off_link = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let local_mac = EthernetAddress::new([0x02, 0, 0, 0, 0, 1]);
+    let device = leak_ether_device(local_mac, 64);
+    let iface = leak_ether_iface_v6_gw(device.registration, local_ip, local_v6, gateway, local_mac);
+    let guard = tx_substrate::epoch::guard();
+
+    // Off-link v6 send → decide_ipv6_route returns Gateway → resolve_ndisc(gateway)
+    // → the neighbour solicitation targets the GATEWAY, not the off-link dst.
+    let pending = iface.dispatch_ip_at(
+        &ipv6_echo_packet(local_v6, off_link),
+        smoltcp::time::Instant::ZERO,
+        &guard,
+    );
+    assert!(matches!(pending, PacketTxResult::PendingResolution { .. }));
+    assert!(
+        iface.pending_ndisc_entry(gateway).is_some(),
+        "off-link route must solicit the gateway"
+    );
+    assert!(
+        iface.pending_ndisc_entry(off_link).is_none(),
+        "off-link dst must not be solicited directly"
+    );
+}

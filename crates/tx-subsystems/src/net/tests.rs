@@ -48,9 +48,10 @@ use crate::net::packet::{
     PacketTxResult, PacketTxSink, RxFrame, TcpPacketEvent, TcpPacketFlags, UdpPacketEvent,
 };
 use crate::net::protocol::{
-    build_icmpv4_echo_request_message, decide_ipv4_route, loopback_iface, ArpSnapshotState,
-    EtherIface, EtherPacketSource, EtherPacketTxSink, Icmpv4EchoPacket, Icmpv4Event, IfaceCommon,
-    Ipv4RouteDecision, LoopbackIface, PollContext, RawTcpSocket, RawUdpSocket, SmoltcpAdapter,
+    build_icmpv4_echo_request_message, decide_ipv4_route, decide_ipv6_route, loopback_iface,
+    ArpSnapshotState, EtherIface, EtherPacketSource, EtherPacketTxSink, Icmpv4EchoPacket,
+    Icmpv4Event, IfaceCommon, Ipv4RouteDecision, Ipv6RouteDecision, LoopbackIface, PollContext,
+    RawTcpSocket, RawUdpSocket, SmoltcpAdapter,
     SmoltcpAdapterConfig, SmoltcpPacketSource, SmoltcpPacketTxSink, UdpTxDatagram,
     ARP_REQUEST_RETRY_LIMIT, TCP_CORK_AUTO_FLUSH_BYTES,
 };

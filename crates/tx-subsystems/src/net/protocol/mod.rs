@@ -9,10 +9,10 @@ mod tcp;
 mod udp;
 
 pub use ether::{
-    decide_ipv4_route, ArpEntry, ArpFlushOutcome, ArpPendingEntry, ArpSnapshotEntry,
-    ArpSnapshotState, ArpStats, EtherIface, EtherPacketSource, EtherPacketTxSink,
-    Ipv4RouteDecision, NdiscEntry, NdiscSnapshotEntry, NetStats, NetStatsSnapshot, ARP_CACHE_TTL,
-    ARP_REQUEST_RETRY_DELAY, ARP_REQUEST_RETRY_LIMIT,
+    decide_ipv4_route, decide_ipv6_route, ArpEntry, ArpFlushOutcome, ArpPendingEntry,
+    ArpSnapshotEntry, ArpSnapshotState, ArpStats, EtherIface, EtherPacketSource, EtherPacketTxSink,
+    Ipv4RouteDecision, Ipv6RouteDecision, NdiscEntry, NdiscSnapshotEntry, NetStats,
+    NetStatsSnapshot, ARP_CACHE_TTL, ARP_REQUEST_RETRY_DELAY, ARP_REQUEST_RETRY_LIMIT,
 };
 pub use icmp::{
     build_icmpv4_echo_reply, build_icmpv4_echo_reply_message, build_icmpv4_echo_request,
