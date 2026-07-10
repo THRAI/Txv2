@@ -4,9 +4,12 @@ use std::boxed::Box;
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
+use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::wire::{
     ArpOperation, ArpPacket, ArpRepr, EthernetAddress as SmoltcpEthernetAddress, EthernetFrame,
-    EthernetProtocol, EthernetRepr, Ipv4Address as SmoltcpIpv4Address,
+    EthernetProtocol, EthernetRepr, Icmpv6Packet, Icmpv6Repr, IpProtocol, IpRepr,
+    Ipv4Address as SmoltcpIpv4Address, Ipv6Address as SmoltcpIpv6Address, Ipv6Packet, Ipv6Repr,
+    NdiscNeighborFlags, NdiscRepr,
 };
 
 struct MockEtherDevice {
@@ -747,4 +750,313 @@ fn clear_delegate_queue() {
     crate::net::delegate::net_delegate_clear(
         crate::net::delegate::DelegateWireSet::POLL | crate::net::delegate::DelegateWireSet::TICK,
     );
+}
+
+// ===== IPv6 V2: dynamic NDP tests (mirror of the ARP neighbour tests) =====
+
+fn to_smoltcp_ipv6(addr: Ipv6Address) -> SmoltcpIpv6Address {
+    SmoltcpIpv6Address::from(addr.octets())
+}
+
+fn solicited_node_v6(target: Ipv6Address) -> Ipv6Address {
+    let t = target.octets();
+    Ipv6Address::new([
+        0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0xff, t[13], t[14], t[15],
+    ])
+}
+
+fn solicited_node_mac(target: Ipv6Address) -> EthernetAddress {
+    let t = target.octets();
+    EthernetAddress::new([0x33, 0x33, 0xff, t[13], t[14], t[15]])
+}
+
+fn leak_ether_iface_v6(
+    registration: &'static NetDeviceRegistration,
+    local_ip: Ipv4Address,
+    local_v6: Ipv6Address,
+    local_mac: EthernetAddress,
+) -> &'static EtherIface {
+    Box::leak(Box::new(EtherIface::new(
+        registration,
+        IfaceCommon::new(local_ip, Ipv4Address::new([255, 255, 255, 0]), 1500)
+            .with_ipv6(Some(local_v6), Some(64)),
+        local_mac,
+        "eth6-test",
+    )))
+}
+
+/// Emit an ICMPv6 NDP message inside an IPv6/Ethernet frame (independent of the
+/// production builder, so the RX path is verified against a separate encoder).
+fn ndisc_eth_frame(
+    src_mac: EthernetAddress,
+    dst_mac: EthernetAddress,
+    src_ip: Ipv6Address,
+    dst_ip: Ipv6Address,
+    icmp_repr: Icmpv6Repr,
+) -> std::vec::Vec<u8> {
+    let checksum = ChecksumCapabilities::default();
+    let mut icmp_bytes = std::vec![0u8; icmp_repr.buffer_len()];
+    let mut icmp_packet = Icmpv6Packet::new_unchecked(&mut icmp_bytes);
+    icmp_repr.emit(
+        &to_smoltcp_ipv6(src_ip),
+        &to_smoltcp_ipv6(dst_ip),
+        &mut icmp_packet,
+        &checksum,
+    );
+    let ip_repr = IpRepr::Ipv6(Ipv6Repr {
+        src_addr: to_smoltcp_ipv6(src_ip),
+        dst_addr: to_smoltcp_ipv6(dst_ip),
+        next_header: IpProtocol::Icmpv6,
+        payload_len: icmp_bytes.len(),
+        hop_limit: 255,
+    });
+    let ip_header_len = ip_repr.header_len();
+    let mut ip_bytes = std::vec![0u8; ip_header_len + icmp_bytes.len()];
+    ip_repr.emit(&mut ip_bytes[..ip_header_len], &checksum);
+    ip_bytes[ip_header_len..].copy_from_slice(&icmp_bytes);
+    let ether = EthernetRepr {
+        src_addr: to_smoltcp_ether(src_mac),
+        dst_addr: to_smoltcp_ether(dst_mac),
+        ethertype: EthernetProtocol::Ipv6,
+    };
+    let mut frame = std::vec![0u8; ether.buffer_len() + ip_bytes.len()];
+    let mut ethernet = EthernetFrame::new_unchecked(frame.as_mut_slice());
+    ether.emit(&mut ethernet);
+    ethernet.payload_mut().copy_from_slice(&ip_bytes);
+    frame
+}
+
+fn ipv6_echo_packet(src: Ipv6Address, dst: Ipv6Address) -> std::vec::Vec<u8> {
+    let icmp_repr = Icmpv6Repr::EchoRequest {
+        ident: 0x11,
+        seq_no: 1,
+        data: b"nd",
+    };
+    let checksum = ChecksumCapabilities::default();
+    let mut icmp_bytes = std::vec![0u8; icmp_repr.buffer_len()];
+    let mut icmp_packet = Icmpv6Packet::new_unchecked(&mut icmp_bytes);
+    icmp_repr.emit(
+        &to_smoltcp_ipv6(src),
+        &to_smoltcp_ipv6(dst),
+        &mut icmp_packet,
+        &checksum,
+    );
+    let ip_repr = IpRepr::Ipv6(Ipv6Repr {
+        src_addr: to_smoltcp_ipv6(src),
+        dst_addr: to_smoltcp_ipv6(dst),
+        next_header: IpProtocol::Icmpv6,
+        payload_len: icmp_bytes.len(),
+        hop_limit: 64,
+    });
+    let ip_header_len = ip_repr.header_len();
+    let mut ip_bytes = std::vec![0u8; ip_header_len + icmp_bytes.len()];
+    ip_repr.emit(&mut ip_bytes[..ip_header_len], &checksum);
+    ip_bytes[ip_header_len..].copy_from_slice(&icmp_bytes);
+    ip_bytes
+}
+
+fn ndisc_advert_target(frame: &[u8]) -> SmoltcpIpv6Address {
+    let ethernet = EthernetFrame::new_checked(frame).expect("ethernet frame");
+    assert_eq!(ethernet.ethertype(), EthernetProtocol::Ipv6);
+    let ipv6 = Ipv6Packet::new_checked(ethernet.payload()).expect("ipv6 packet");
+    let icmp = Icmpv6Packet::new_checked(ipv6.payload()).expect("icmpv6 packet");
+    match Icmpv6Repr::parse(
+        &ipv6.src_addr(),
+        &ipv6.dst_addr(),
+        &icmp,
+        &ChecksumCapabilities::default(),
+    )
+    .expect("icmpv6 repr")
+    {
+        Icmpv6Repr::Ndisc(NdiscRepr::NeighborAdvert { target_addr, .. }) => target_addr,
+        _ => panic!("expected neighbor advertisement"),
+    }
+}
+
+fn ndisc_solicit_target(frame: &[u8]) -> SmoltcpIpv6Address {
+    let ethernet = EthernetFrame::new_checked(frame).expect("ethernet frame");
+    assert_eq!(ethernet.ethertype(), EthernetProtocol::Ipv6);
+    let ipv6 = Ipv6Packet::new_checked(ethernet.payload()).expect("ipv6 packet");
+    let icmp = Icmpv6Packet::new_checked(ipv6.payload()).expect("icmpv6 packet");
+    match Icmpv6Repr::parse(
+        &ipv6.src_addr(),
+        &ipv6.dst_addr(),
+        &icmp,
+        &ChecksumCapabilities::default(),
+    )
+    .expect("icmpv6 repr")
+    {
+        Icmpv6Repr::Ndisc(NdiscRepr::NeighborSolicit { target_addr, .. }) => target_addr,
+        _ => panic!("expected neighbor solicitation"),
+    }
+}
+
+#[test]
+fn ether_iface_ndisc_advert_learns_neighbor() {
+    let _lock = setup();
+
+    let local_ip = Ipv4Address::new([10, 0, 0, 1]);
+    let local_v6 = Ipv6Address::new([0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let remote_v6 = Ipv6Address::new([0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    let local_mac = EthernetAddress::new([0x02, 0, 0, 0, 0, 1]);
+    let remote_mac = EthernetAddress::new([0x02, 0, 0, 0, 0, 2]);
+    let device = leak_ether_device(local_mac, 60);
+    let iface = leak_ether_iface_v6(device.registration, local_ip, local_v6, local_mac);
+
+    let na = ndisc_eth_frame(
+        remote_mac,
+        local_mac,
+        remote_v6,
+        local_v6,
+        Icmpv6Repr::Ndisc(NdiscRepr::NeighborAdvert {
+            flags: NdiscNeighborFlags::SOLICITED | NdiscNeighborFlags::OVERRIDE,
+            target_addr: to_smoltcp_ipv6(remote_v6),
+            lladdr: Some(to_smoltcp_ether(remote_mac).into()),
+        }),
+    );
+    let guard = tx_substrate::epoch::guard();
+    iface.process_frame_at(RxFrame::new(na), smoltcp::time::Instant::ZERO, Some(&guard));
+
+    assert_eq!(
+        iface
+            .ndisc_entry(remote_v6, smoltcp::time::Instant::ZERO)
+            .expect("learned ndisc")
+            .mac,
+        remote_mac
+    );
+}
+
+#[test]
+fn ether_iface_ndisc_solicit_for_local_learns_and_replies() {
+    let _lock = setup();
+
+    let local_ip = Ipv4Address::new([10, 0, 0, 1]);
+    let local_v6 = Ipv6Address::new([0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let remote_v6 = Ipv6Address::new([0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    let local_mac = EthernetAddress::new([0x02, 0, 0, 0, 0, 1]);
+    let remote_mac = EthernetAddress::new([0x02, 0, 0, 0, 0, 2]);
+    let device = leak_ether_device(local_mac, 61);
+    let iface = leak_ether_iface_v6(device.registration, local_ip, local_v6, local_mac);
+
+    let ns = ndisc_eth_frame(
+        remote_mac,
+        solicited_node_mac(local_v6),
+        remote_v6,
+        solicited_node_v6(local_v6),
+        Icmpv6Repr::Ndisc(NdiscRepr::NeighborSolicit {
+            target_addr: to_smoltcp_ipv6(local_v6),
+            lladdr: Some(to_smoltcp_ether(remote_mac).into()),
+        }),
+    );
+    let guard = tx_substrate::epoch::guard();
+    iface.process_frame_at(RxFrame::new(ns), smoltcp::time::Instant::ZERO, Some(&guard));
+
+    // Learned the solicitor's mapping.
+    assert_eq!(
+        iface
+            .ndisc_entry(remote_v6, smoltcp::time::Instant::ZERO)
+            .expect("learned solicitor")
+            .mac,
+        remote_mac
+    );
+
+    // Answered with a solicited NA targeting our address, unicast to the peer.
+    let tx = device.ops.tx_frames();
+    assert_eq!(tx.len(), 1);
+    let ethernet = EthernetFrame::new_checked(&tx[0]).expect("ethernet frame");
+    assert_eq!(ethernet.src_addr(), to_smoltcp_ether(local_mac));
+    assert_eq!(ethernet.dst_addr(), to_smoltcp_ether(remote_mac));
+    assert_eq!(ndisc_advert_target(&tx[0]), to_smoltcp_ipv6(local_v6));
+}
+
+#[test]
+fn ether_iface_ndisc_miss_sends_solicit_and_advert_resolves() {
+    let _lock = setup();
+
+    let local_ip = Ipv4Address::new([10, 0, 0, 1]);
+    let local_v6 = Ipv6Address::new([0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let remote_v6 = Ipv6Address::new([0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    let local_mac = EthernetAddress::new([0x02, 0, 0, 0, 0, 1]);
+    let remote_mac = EthernetAddress::new([0x02, 0, 0, 0, 0, 2]);
+    let device = leak_ether_device(local_mac, 62);
+    let iface = leak_ether_iface_v6(device.registration, local_ip, local_v6, local_mac);
+    let guard = tx_substrate::epoch::guard();
+
+    // On-link v6 send to an unresolved neighbour → pending + NS queued.
+    let pending = iface.dispatch_ip_at(
+        &ipv6_echo_packet(local_v6, remote_v6),
+        smoltcp::time::Instant::ZERO,
+        &guard,
+    );
+    assert!(matches!(pending, PacketTxResult::PendingResolution { .. }));
+    assert_eq!(iface.pending_ndisc_len(), 1);
+
+    // Flush drives one neighbour solicitation to the solicited-node group.
+    let out = iface.flush_pending_ndisc_at(smoltcp::time::Instant::ZERO, 8, &guard);
+    assert_eq!(out.sent, 1);
+    let tx = device.ops.tx_frames();
+    assert_eq!(tx.len(), 1);
+    let ethernet = EthernetFrame::new_checked(&tx[0]).expect("ethernet frame");
+    assert_eq!(
+        ethernet.dst_addr(),
+        to_smoltcp_ether(solicited_node_mac(remote_v6))
+    );
+    assert_eq!(ndisc_solicit_target(&tx[0]), to_smoltcp_ipv6(remote_v6));
+
+    // The neighbour's advertisement resolves the pending entry.
+    let na = ndisc_eth_frame(
+        remote_mac,
+        local_mac,
+        remote_v6,
+        local_v6,
+        Icmpv6Repr::Ndisc(NdiscRepr::NeighborAdvert {
+            flags: NdiscNeighborFlags::SOLICITED | NdiscNeighborFlags::OVERRIDE,
+            target_addr: to_smoltcp_ipv6(remote_v6),
+            lladdr: Some(to_smoltcp_ether(remote_mac).into()),
+        }),
+    );
+    iface.process_frame_at(RxFrame::new(na), smoltcp::time::Instant::ZERO, Some(&guard));
+    assert_eq!(
+        iface
+            .ndisc_entry(remote_v6, smoltcp::time::Instant::ZERO)
+            .expect("resolved neighbour")
+            .mac,
+        remote_mac
+    );
+    assert_eq!(iface.pending_ndisc_len(), 0);
+}
+
+#[test]
+fn ether_iface_ndisc_solicit_retry_limit_marks_failed() {
+    let _lock = setup();
+
+    let local_ip = Ipv4Address::new([10, 0, 0, 1]);
+    let local_v6 = Ipv6Address::new([0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let remote_v6 = Ipv6Address::new([0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    let local_mac = EthernetAddress::new([0x02, 0, 0, 0, 0, 1]);
+    let device = leak_ether_device(local_mac, 63);
+    let iface = leak_ether_iface_v6(device.registration, local_ip, local_v6, local_mac);
+    let guard = tx_substrate::epoch::guard();
+
+    let _ = iface.dispatch_ip_at(
+        &ipv6_echo_packet(local_v6, remote_v6),
+        smoltcp::time::Instant::ZERO,
+        &guard,
+    );
+
+    // One solicitation per retry-delay window, up to the retry limit.
+    for ms in [0i64, 1_000, 2_000] {
+        let out = iface.flush_pending_ndisc_at(smoltcp::time::Instant::from_millis(ms), 8, &guard);
+        assert_eq!(out.sent, 1);
+    }
+    // Past the limit the entry is marked failed rather than re-probed.
+    let failed =
+        iface.flush_pending_ndisc_at(smoltcp::time::Instant::from_millis(3_000), 8, &guard);
+    assert_eq!(failed.sent, 0);
+    assert_eq!(failed.failed, 1);
+    assert!(iface
+        .pending_ndisc_entry(remote_v6)
+        .expect("pending entry")
+        .last_error
+        .is_some());
 }

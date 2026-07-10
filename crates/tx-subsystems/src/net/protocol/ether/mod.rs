@@ -3,11 +3,12 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use smoltcp::phy::Medium;
 use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{
     ArpOperation, ArpPacket, ArpRepr, EthernetAddress as SmoltcpEthernetAddress, EthernetFrame,
-    EthernetProtocol, EthernetRepr, Ipv4Address as SmoltcpIpv4Address, Ipv4Packet,
-    Ipv6Address as SmoltcpIpv6Address, Ipv6Packet,
+    EthernetProtocol, EthernetRepr, HardwareAddress, Ipv4Address as SmoltcpIpv4Address, Ipv4Packet,
+    Ipv6Address as SmoltcpIpv6Address, Ipv6Packet, RawHardwareAddress,
 };
 
 use crate::execution::{Errno, Guard, StepOutcome};
@@ -26,6 +27,12 @@ mod link;
 pub const ARP_CACHE_TTL: Duration = Duration::from_secs(300);
 pub const ARP_REQUEST_RETRY_LIMIT: u8 = 3;
 pub const ARP_REQUEST_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+// IPv6 V2 (dynamic NDP): the neighbour-solicitation retry/aging budget mirrors
+// ARP one-for-one (D7). Named aliases keep the v6 knobs tunable independently.
+pub const NDISC_CACHE_TTL: Duration = ARP_CACHE_TTL;
+pub const NDISC_SOLICIT_RETRY_LIMIT: u8 = ARP_REQUEST_RETRY_LIMIT;
+pub const NDISC_SOLICIT_RETRY_DELAY: Duration = ARP_REQUEST_RETRY_DELAY;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Ipv4RouteDecision {
@@ -53,6 +60,15 @@ pub struct ArpPendingEntry {
 pub struct NdiscEntry {
     pub mac: EthernetAddress,
     pub expires_at: Instant,
+}
+
+/// IPv6 V2: an in-flight neighbour solicitation (mirror of [`ArpPendingEntry`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NdiscPendingEntry {
+    pub addr: Ipv6Address,
+    pub attempts: u8,
+    pub next_probe_at: Instant,
+    pub last_error: Option<Errno>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -128,6 +144,7 @@ pub struct EtherIface {
     arp_table: SpinMutex<BTreeMap<Ipv4Address, ArpEntry>>,
     pending_arp: SpinMutex<BTreeMap<Ipv4Address, ArpPendingEntry>>,
     ndisc_table: SpinMutex<BTreeMap<Ipv6Address, NdiscEntry>>,
+    pending_ndisc: SpinMutex<BTreeMap<Ipv6Address, NdiscPendingEntry>>,
     ipv4_fragments: SpinMutex<BTreeMap<Ipv4FragmentKey, Ipv4ReassemblyEntry>>,
     next_ipv4_ident: AtomicU64,
     pub name: &'static str,
@@ -226,6 +243,18 @@ pub struct ArpFlushOutcome {
     pub remaining: usize,
 }
 
+impl ArpFlushOutcome {
+    /// Fold another flush's counters in (v4 ARP + v6 NDP share one step).
+    pub fn absorb(&mut self, other: ArpFlushOutcome) {
+        self.attempted += other.attempted;
+        self.sent += other.sent;
+        self.busy += other.busy;
+        self.failed += other.failed;
+        self.tx_bytes += other.tx_bytes;
+        self.remaining += other.remaining;
+    }
+}
+
 impl EtherIface {
     pub fn new(
         netdev: &'static NetDeviceRegistration,
@@ -240,6 +269,7 @@ impl EtherIface {
             arp_table: SpinMutex::new(BTreeMap::new()),
             pending_arp: SpinMutex::new(BTreeMap::new()),
             ndisc_table: SpinMutex::new(BTreeMap::new()),
+            pending_ndisc: SpinMutex::new(BTreeMap::new()),
             ipv4_fragments: SpinMutex::new(BTreeMap::new()),
             next_ipv4_ident: AtomicU64::new(1),
             name,
@@ -301,7 +331,14 @@ impl EtherIface {
             // P2-S7 (§6-2-A): v6 TCP/UDP frames go through the same demux
             // (its v6 arm parses them); no v4-style reassembly staging yet
             // (v6 fragmentation is a P4 concern).
-            EthernetProtocol::Ipv6 => demux_rx_frame_with_smoltcp(&frame),
+            EthernetProtocol::Ipv6 => {
+                let dispatch = demux_rx_frame_with_smoltcp(&frame);
+                // IPv6 V2: side-effect peek for NDP (mirror of `maybe_reply_icmpv4`).
+                // NS/NA are learned + answered here; the dispatch still flows to
+                // raw ICMPv6 sockets (echo replies, and harmlessly NS/NA too).
+                self.maybe_process_ndisc(&dispatch, now, guard);
+                dispatch
+            }
             EthernetProtocol::Unknown(_) => PacketDispatch::Unsupported,
         }
     }
@@ -406,8 +443,57 @@ impl EtherIface {
         outcome
     }
 
+    /// IPv6 V2: send due neighbour solicitations for pending v6 next-hops
+    /// (mirror of [`flush_pending_arp_at`]). Driven by the same reactor step so
+    /// one tick flushes both v4 ARP and v6 NDP probes.
+    pub fn flush_pending_ndisc_at(
+        &self,
+        now: Instant,
+        budget: usize,
+        guard: &Guard<'_>,
+    ) -> ArpFlushOutcome {
+        let mut outcome = ArpFlushOutcome::default();
+
+        let ready = self.ready_pending_ndisc(now, budget);
+        for target in ready {
+            let Some(entry) = self.pending_entry_for_ndisc_probe(target, now) else {
+                if self
+                    .pending_ndisc_entry(target)
+                    .is_some_and(|entry| entry.last_error.is_some())
+                {
+                    outcome.failed += 1;
+                }
+                continue;
+            };
+            outcome.attempted += 1;
+
+            let frame = self.build_neighbor_solicit(entry.addr);
+            match self.transmit_frame(&frame, guard) {
+                PacketTxResult::Accepted { frame_len } => {
+                    outcome.sent += 1;
+                    outcome.tx_bytes += frame_len;
+                    self.mark_ndisc_probe_sent(target, now);
+                }
+                PacketTxResult::Busy => {
+                    outcome.busy += 1;
+                    break;
+                }
+                PacketTxResult::PendingResolution { .. } | PacketTxResult::Failed { .. } => {
+                    outcome.failed += 1;
+                }
+            }
+        }
+
+        outcome.remaining = self.pending_ndisc.lock().len();
+        outcome
+    }
+
     pub fn arp_entry(&self, ip: Ipv4Address, now: Instant) -> Option<ArpEntry> {
         self.lookup_arp_entry(ip, now)
+    }
+
+    pub fn ndisc_entry(&self, ip: Ipv6Address, now: Instant) -> Option<NdiscEntry> {
+        self.lookup_ndisc_entry(ip, now)
     }
 
     pub fn install_arp_for_test_or_bootstrap(
@@ -456,13 +542,19 @@ impl EtherIface {
         let arp_entries = other.arp_table.lock().clone();
         let pending_entries = other.pending_arp.lock().clone();
         let ndisc_entries = other.ndisc_table.lock().clone();
+        let pending_ndisc_entries = other.pending_ndisc.lock().clone();
         self.arp_table.lock().extend(arp_entries);
         self.pending_arp.lock().extend(pending_entries);
         self.ndisc_table.lock().extend(ndisc_entries);
+        self.pending_ndisc.lock().extend(pending_ndisc_entries);
     }
 
     pub fn pending_arp_len(&self) -> usize {
         self.pending_arp.lock().len()
+    }
+
+    pub fn pending_ndisc_len(&self) -> usize {
+        self.pending_ndisc.lock().len()
     }
 
     pub fn pending_arp_entry(&self, ip: Ipv4Address) -> Option<ArpPendingEntry> {
@@ -611,6 +703,15 @@ impl EtherIface {
         };
         let dst_mac = match self.resolve_ndisc(next_hop, now) {
             NdiscResolution::Resolved { mac } => mac,
+            NdiscResolution::Pending { .. } => {
+                // Mirror the v4 path: retry-able miss. `PendingResolution`'s
+                // `next_hop` field is v4-typed and informational only (read by
+                // tests); the real v6 next-hop lives in `pending_ndisc`, which
+                // the flush driver walks to send the NS. Use a v4 sentinel.
+                return PacketTxResult::PendingResolution {
+                    next_hop: Ipv4Address::new([0, 0, 0, 0]),
+                };
+            }
             NdiscResolution::Failed { errno } => {
                 self.stats.tx_errors.fetch_add(1, Ordering::Relaxed);
                 return PacketTxResult::Failed { errno };
@@ -619,22 +720,20 @@ impl EtherIface {
         self.transmit_ipv6_packet(dst_mac, packet, guard)
     }
 
-    /// V1: static NDISC table only (+ multicast MAC derivation). Dynamic NS/NA
-    /// solicitation + aging land in V2, which is why `now` is threaded through.
+    /// V2: dynamic NDISC — multicast resolves to its derived MAC; unicast hits
+    /// the TTL-checked cache, else queues a neighbour solicitation and reports
+    /// `Pending` (the flush driver sends the NS; the caller retries). Mirror of
+    /// [`resolve_or_request`].
     fn resolve_ndisc(&self, next_hop: Ipv6Address, now: Instant) -> NdiscResolution {
-        let _ = now;
         if next_hop.is_multicast() {
             return NdiscResolution::Resolved {
                 mac: multicast_mac_for(next_hop),
             };
         }
-        match self.ndisc_table.lock().get(&next_hop) {
-            Some(entry) => NdiscResolution::Resolved { mac: entry.mac },
-            None => NdiscResolution::Failed {
-                // Matches the ARP path's "can't resolve next hop" errno.
-                errno: Errno::EADDRNOTAVAIL,
-            },
+        if let Some(entry) = self.lookup_ndisc_entry(next_hop, now) {
+            return NdiscResolution::Resolved { mac: entry.mac };
         }
+        self.queue_pending_ndisc(next_hop, now)
     }
 
     fn transmit_ipv6_packet(
@@ -818,6 +917,27 @@ fn from_smoltcp_ipv6(addr: SmoltcpIpv6Address) -> Ipv6Address {
     Ipv6Address::new(addr.octets())
 }
 
+fn to_smoltcp_ipv6(addr: Ipv6Address) -> SmoltcpIpv6Address {
+    SmoltcpIpv6Address::from(addr.octets())
+}
+
+/// RFC 4861 §2: the solicited-node multicast address `ff02::1:ffXX:XXXX` carries
+/// the target's low 24 bits — where a neighbour solicitation for it is sent.
+fn solicited_node_multicast(target: Ipv6Address) -> Ipv6Address {
+    let t = target.octets();
+    Ipv6Address::new([
+        0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0xff, t[13], t[14], t[15],
+    ])
+}
+
+/// Extract an Ethernet address from an NDP source/target link-layer option.
+fn ether_from_lladdr(raw: RawHardwareAddress) -> Option<EthernetAddress> {
+    match raw.parse(Medium::Ethernet) {
+        Ok(HardwareAddress::Ethernet(addr)) => Some(from_smoltcp_ether(addr)),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Ipv6RouteDecision {
     Direct { next_hop: Ipv6Address },
@@ -837,6 +957,7 @@ impl Ipv6RouteDecision {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NdiscResolution {
     Resolved { mac: EthernetAddress },
+    Pending { next_hop: Ipv6Address },
     Failed { errno: Errno },
 }
 

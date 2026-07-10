@@ -1,3 +1,16 @@
+- 2026-07-10 (IPv6 V2 落地 — 动态 NDP 邻居发现,替静态 ndisc 表). 目标:v6 下一跳 MAC 解析从静态升级为动态 NS/NA
+  收发学习(v4 ARP 的 v6 对应物)。**复用** smoltcp-asterinas 的 `NdiscRepr`/`Icmpv6Repr::Ndisc`(NS/NA parse+emit 都有),
+  不手搓 wire。**实现**(照抄 ARP 状态机,ether/link.rs):RX `maybe_process_ndisc`(side-effect peek 镜像 maybe_reply_icmpv4,
+  挂 RX 的 Ipv6 臂)学 NS/NA 邻居 + 对 NS-for-us 回 NA;`resolve_ndisc` 动态化(TTL 缓存命中 / miss 排 pending 返 Pending →
+  `dispatch_ipv6_at` 转 PendingResolution 上层重传);`flush_pending_ndisc_at` 发 NS 探测(solicited-node 组播 33:33:ff:..,
+  退避 `NDISC_SOLICIT_RETRY_LIMIT=3` 超限标 EADDRNOTAVAIL);`step_flush_pending_arp` 一个 tick 同驱 v4+v6。**计划外必需
+  修正**:`accepts_ethernet_destination` 增收本机 solicited-node 组播 MAC——否则入站 NS 被丢、回 NA 永不触发(写测试时
+  发现)。**决策 D1-D7 全按推荐**(peek / 静态保留 / 回 NA / 不缓存报文 / 扩展现有 step / link.rs / NDISC_* 别名)。
+  **验证**:`cargo xtask build --target rv64-qemu` 干净;4 个 ndisc 单测隔离 4/4 ok(NA 学习 / NS-for-us 回 NA /
+  miss→NS→NA 解析 / retry-limit→Failed);全量 `cargo test -p tx-subsystems` 集合差唯一新增 = 这 4 个新测试(host-harness
+  全量级联,隔离全过),**0 既有回归**(v4 ARP + v6 loopback 未动;既有 7 个 arp-模块失败原样保留)。**功能门**(QEMU
+  外部 ping6 动态解析)未跑,需真机。**下一步**:V3(v6 路由/FIB 泛化 + `/proc/net/ipv6_route`,解锁 `ip -6 route`/外部
+  v6 TCP·UDP)先出调研文档。**Blocker**:无。正本 docs/design/07_net/IPV6_V2_PLAN_v1.md。
 - 2026-07-10 (IPv6 V1 落地 — 对外 v6 L3 发送 + ICMPv6 RX demux,B 路增量). 目标:补审计⑩「v6 有壳无数据路径」的
   外部收发两半(loopback/demux 本已通)。**V1a 发送**(4 文件 +211):`Ipv6Address::is_multicast`(types.rs)·`IfaceCommon`
   v6 地址/前缀字段 + `with_ipv6`(loopback.rs)·v6 地址串到 `EtherIface` + 纳入 iface 缓存键(namespace.rs)·

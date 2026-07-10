@@ -170,3 +170,18 @@ L2 以太帧          build_ipv4_ethernet_frame(:664)     │ 无 build_ipv6_eth
 **验证**:`cargo xtask build --target rv64-qemu` 干净;`cargo test -p tx-subsystems` 集合差 **313==313 零回归**(v6 loopback 无退化);0 新增 warning。**功能门(QEMU 外部 ping6)未跑**——host net 套被 1.94 污染基线掩盖,端到端需真机 + 预置静态邻居。
 
 **下一步**:V2 动态 NDP(NS/NA 收发 + 邻居学习,替静态 `ndisc_table`),先出调研文档再实现。
+
+---
+
+## 8. V2 已落地(2026-07-10)
+
+§5 表 **V2 行**(动态 NDP)已实现并过回归门。正本计划 [[IPV6_V2_PLAN_v1]]。**复用** smoltcp-asterinas 的 `NdiscRepr` / `Icmpv6Repr::Ndisc`(NS/NA parse+emit),不手搓 wire。
+
+- **RX**(`ether/link.rs` `maybe_process_ndisc`,side-effect peek 镜像 `maybe_reply_icmpv4`,挂 RX 的 Ipv6 臂):学 NS/NA 邻居(NS 源 lladdr / NA 目标 lladdr → `ndisc_table`),对目标为本机的 NS 回单播 NA。
+- **TX**(`resolve_ndisc` 动态化):multicast→MAC;unicast 命中 TTL 缓存→Resolved;miss→`queue_pending_ndisc` 返回 `Pending`(`dispatch_ipv6_at` 转 `PendingResolution`,上层重传)。
+- **探测**(`flush_pending_ndisc_at`,`step_flush_pending_arp` 一个 tick 同驱 v4+v6):对 pending 发 NS 到 solicited-node 组播(`33:33:ff:..`),退避 retry `NDISC_SOLICIT_RETRY_LIMIT=3`,超限标 `EADDRNOTAVAIL`。
+- **计划外必需修正**:`accepts_ethernet_destination` 增收本机 solicited-node 组播 MAC——否则入站 NS 被丢、回 NA 永不触发。
+
+**验证**:rv64 build 干净;`ether_iface_arp_tests` 4 个 ndisc 单测隔离 4/4 ok(NA 学习 / NS-for-us 学+回 NA / miss→NS→NA 解析 / retry-limit→Failed);全量集合差唯一新增 = 这 4 个新测试(host-harness 全量级联,隔离全过),**0 既有回归**。功能门(QEMU 外部 ping6)需真机。
+
+**下一步**:V3(v6 路由/FIB 泛化 + `/proc/net/ipv6_route`)先出调研文档。

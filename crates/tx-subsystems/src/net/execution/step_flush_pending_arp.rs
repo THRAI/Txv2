@@ -18,5 +18,8 @@ pub fn step_flush_pending_arp(
     // reserve
     // commit
     // publish
-    StepOutcome::Done(iface.flush_pending_arp_at(now, budget, guard))
+    let mut outcome = iface.flush_pending_arp_at(now, budget, guard);
+    // IPv6 V2: one reactor tick flushes both v4 ARP and v6 NDP probes.
+    outcome.absorb(iface.flush_pending_ndisc_at(now, budget, guard));
+    StepOutcome::Done(outcome)
 }
