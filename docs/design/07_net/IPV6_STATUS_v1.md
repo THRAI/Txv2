@@ -215,3 +215,21 @@ L2 以太帧          build_ipv4_ethernet_frame(:664)     │ 无 build_ipv6_eth
 **结果**:外部 off-link v6 TCP/UDP 收发链内核侧齐了 = 路由(V3b)+ emit 双族 + 源选择双族 + NDP(V2)。
 
 **下一步**:V4(v6 分片/重组 + `ipv6_forwarding` + sysctl 真值),或按 LTP v6 靶优先。
+
+---
+
+## 11. V4 延后 + B 路收官(2026-07-10)
+
+**V4 已延后**(用户确认)。调研正本 [[IPV6_V4_PLAN_v1]]:V4(v6 分片 ~200 + `ipv6_forwarding` ~100 + sysctl ~30)是架构完整性收尾,**已知 LTP 计分价值近零**——账本无 v6 分片/转发靶,可计分 v6 靶(ipv6_lib/ping6/tracepath601/tcpdump601)V1-V2 已覆盖,v6 分片实务罕见。§5 表列进 V4 的 **UDP v6 源 hint 实为已就绪**(`preferred_ipv6_source_for`)。触发条件 + 实现草图见 [[IPV6_V4_PLAN_v1]] §5/§6。
+
+**IPv6 B 路 V1-V3b 收官**——补齐审计⑩「v6 有壳无数据路径」的核心,外部 off-link v6 TCP/UDP 收发链内核侧已齐:
+
+| 阶段 | 提交 | 能力 |
+|---|---|---|
+| V1 | a90988d0 | 对外 v6 L3 发送 + ICMPv6 RX demux |
+| V2 | ccae95c8 | 动态 NDP 邻居发现 |
+| V3a | 6ee95e0b | v6 路由/FIB 管理面(`ip -6 route` + `/proc/net/ipv6_route`) |
+| V3b | 28a05d02 | 外部 off-link v6 路由(`decide_ipv6_route` 网关) |
+| V4 | — | 分片/转发/sysctl:**延后**(LTP 价值近零) |
+
+**未跑的功能门**:QEMU 真机外部 v6(ping6/iperf)——V1-V3b 均为回归门(集合差 0)+ 隔离单测验证,端到端真机验证待做。

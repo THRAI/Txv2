@@ -1,3 +1,12 @@
+- 2026-07-10 (IPv6 V4 延后 + B 路 V1-V3b 收官 — 分片/转发/sysctl 价值评估). 调研结论:V4 是架构完整性收尾,**已知
+  LTP 计分价值近零**——网络计分账本(58 靶/天花板 946)**无 v6 分片/转发靶**(唯一 `fragments` 是 SCTP 层已覆盖;
+  `forwarding` 提及全是 v4 Docker/Alpine 容器场景);可计分 v6 靶(ipv6_lib/ping6/tracepath601/tcpdump601)V1-V2 已覆盖;
+  v6 分片实务罕见(PMTUD + 1280 最小 MTU)。**UDP v6 源 hint**(§5 表列进 V4)实为已就绪(`preferred_ipv6_source_for`
+  step_send.rs:766)。剩三块已知收益 0:v6 分片 TX+RX(~200 LOC 大)、`ipv6_forwarding`(~100)、v6 forwarding sysctl(~30)。
+  **决定:延后 V4**(用户确认);触发条件 + 实现草图存 docs/design/07_net/IPV6_V4_PLAN_v1.md §5/§6。**IPv6 B 路 V1-V3b
+  收官**:外部 off-link v6 TCP/UDP 收发链内核侧已齐 = V1(a90988d0 收发 + ICMPv6 RX)+ V2(ccae95c8 动态 NDP)+ V3a
+  (6ee95e0b 路由/FIB 管理面)+ V3b(28a05d02 off-link 网关)。全程每阶段调研文档→审查→实现→集合差 0 回归→提交。
+  **Blocker**:无。**下一可选方向**:QEMU 真机功能验证(外部 v6 ping6/iperf)、或 V4 某子块(触发时)、或转他向。
 - 2026-07-10 (IPv6 V3b 落地 — v6 数据面外部 off-link 路由). 目标:外部 off-link v6 TCP/UDP 真流量。**调研关键发现**:计划
   估的 emit_ipv6 / step_device_tx / 源选择三大块**其实早已就绪**——emit 双族(TCP 用存储 `ip_repr`、UDP 首行
   `dst.family==Inet6`→`emit_v6`);UDP `local`=socket 绑定端点(双族);connect 源选择双族;on-link `decide_ipv6_route`→Direct→NDP。
