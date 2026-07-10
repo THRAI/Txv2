@@ -1,3 +1,16 @@
+- 2026-07-10 (IPv6 V3a 落地 — v6 路由/FIB 管理面). 目标:v6 路由表 + rtnetlink v6 route + `/proc/net/ipv6_route`,解锁
+  `ip -6 route`。**调研关键发现**:"外部 v6 TCP/UDP"不止路由——数据面(socket→wire `emit`)也纯 v4;故 V3 拆 **V3a(管理面,
+  本轮)+ V3b(数据面,后续)**。**实现**(独立 `routes6` 表镜像 v4,零碰数据面):namespace.rs(+380)`NetNamespaceRoute6
+  {Info,Config,Selector,Decision,Entry}` + `routes6` + `route6_snapshot`/`best_ipv6_route`/`add`/`delete_ipv6_route`/
+  `route6_decision_for_info` + v6 前缀数学(u128 大端掩码,`plen==0` 守卫);rtnetlink.rs(+147)`handle_newroute/delroute`
+  按 family 分流(v4 分支保留)+ `parse_route6_config/selector` + `ipv6_attr` + `render_getroute_dump` v6 门控 +
+  `build_route6_message`;project.rs(+45)`proc_net_ipv6_route_snapshot_text`(Linux 格式);tx-fs procfs 布线
+  `/proc/net/ipv6_route`(ID 0x..1B);rtnetlink_tests.rs(+238)3 个 v6 route 测试。**协作**:~500 LOC 机械镜像交子代理执行,
+  我独立复核(亲跑 build+测试+逐点 diff——子代理"clean"报告与 harness 残留诊断矛盾,以实测为准,最终态干净;子代理纠正规格
+  procfs ID 冲突 0x17→0x1B)。**验证**:rv64 build 干净;`rtnetlink_tests` 隔离 **24/24**(既有 v4 route + 新 v6 route 同过);
+  全量集合差唯一新增=3 个新测试(host-harness 级联,隔离过),**0 既有回归**(v4 路由/数据面未动)。**功能门**(QEMU
+  `ip -6 route add/del/show`)未跑,需真机。**下一步**:V3b(v6 数据面:`emit_ipv6` + step_device_tx v6 分支 + step_send/connect
+  v6 选路 + `decide_ipv6_route` 网关)——先出调研文档。**Blocker**:无。正本 docs/design/07_net/IPV6_V3_PLAN_v1.md。
 - 2026-07-10 (IPv6 V2 落地 — 动态 NDP 邻居发现,替静态 ndisc 表). 目标:v6 下一跳 MAC 解析从静态升级为动态 NS/NA
   收发学习(v4 ARP 的 v6 对应物)。**复用** smoltcp-asterinas 的 `NdiscRepr`/`Icmpv6Repr::Ndisc`(NS/NA parse+emit 都有),
   不手搓 wire。**实现**(照抄 ARP 状态机,ether/link.rs):RX `maybe_process_ndisc`(side-effect peek 镜像 maybe_reply_icmpv4,

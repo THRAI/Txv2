@@ -111,6 +111,10 @@ pub const PROCFS_NET_TX_NEIGH_CTL_ID: FsObjectId = FsObjectId::new(0x7071_6F15);
 // `/proc/net/arp` — kernel IPv4 ARP table in the classic format, read by busybox
 // `arp -an` (the LTP ipneigh01 `arp` variant).
 pub const PROCFS_NET_ARP_ID: FsObjectId = FsObjectId::new(0x7071_6F16);
+// `/proc/net/ipv6_route` — kernel IPv6 FIB in the native per-route hex format,
+// read by `ip -6 route`. (0x..17 through 0x..1A are the IPv4 sysctl IGMP knobs
+// below, so this claims the next free id after that block.)
+pub const PROCFS_NET_IPV6_ROUTE_ID: FsObjectId = FsObjectId::new(0x7071_6F1B);
 
 // `/proc/sys/net/ipv4/` — the IGMP knobs LTP's mcast-lib.sh saves, sets and
 // restores in setup/cleanup (`sysctl -b` reads, `sysctl -qw` writes via ROD:
@@ -623,6 +627,9 @@ impl FsOps for Procfs {
             if name == b"arp" {
                 return StepOutcome::done(PROCFS_NET_ARP_ID);
             }
+            if name == b"ipv6_route" {
+                return StepOutcome::done(PROCFS_NET_IPV6_ROUTE_ID);
+            }
             return StepOutcome::err(Errno::ENOENT.into());
         }
         if parent == PROCFS_SYS_NET_ID {
@@ -802,7 +809,10 @@ impl FsOps for Procfs {
             | PROCFS_SYS_NET_IPV6_CONF_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Directory, PROCFS_DIR_MODE))
             }
-            PROCFS_NET_IF_INET6_ID | PROCFS_NET_TX_NEIGH_ID | PROCFS_NET_ARP_ID => {
+            PROCFS_NET_IF_INET6_ID
+            | PROCFS_NET_TX_NEIGH_ID
+            | PROCFS_NET_ARP_ID
+            | PROCFS_NET_IPV6_ROUTE_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
             }
             PROCFS_NET_TX_NEIGH_CTL_ID => {
@@ -1066,6 +1076,7 @@ impl FsOps for Procfs {
                     (b"tx_neigh", PROCFS_NET_TX_NEIGH_ID, InodeKind::Regular),
                     (b"tx_neigh_ctl", PROCFS_NET_TX_NEIGH_CTL_ID, InodeKind::Regular),
                     (b"arp", PROCFS_NET_ARP_ID, InodeKind::Regular),
+                    (b"ipv6_route", PROCFS_NET_IPV6_ROUTE_ID, InodeKind::Regular),
                 ];
                 let fi = idx.saturating_sub(2);
                 if fi < files.len() {

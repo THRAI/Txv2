@@ -185,3 +185,17 @@ L2 以太帧          build_ipv4_ethernet_frame(:664)     │ 无 build_ipv6_eth
 **验证**:rv64 build 干净;`ether_iface_arp_tests` 4 个 ndisc 单测隔离 4/4 ok(NA 学习 / NS-for-us 学+回 NA / miss→NS→NA 解析 / retry-limit→Failed);全量集合差唯一新增 = 这 4 个新测试(host-harness 全量级联,隔离全过),**0 既有回归**。功能门(QEMU 外部 ping6)需真机。
 
 **下一步**:V3(v6 路由/FIB 泛化 + `/proc/net/ipv6_route`)先出调研文档。
+
+---
+
+## 9. V3a 已落地(2026-07-10)
+
+§5 表 **V3 行的管理面**(v6 FIB + rtnetlink v6 route + `/proc/net/ipv6_route`)已实现。正本计划 [[IPV6_V3_PLAN_v1]]。**调研发现**:外部 v6 TCP/UDP 还需数据面(`emit_ipv6`,socket→wire 也纯 v4),故 V3 拆 **V3a(管理面,本节)+ V3b(数据面,待做)**。
+
+- **v6 FIB**(namespace.rs,独立 `routes6` 表镜像 v4):`NetNamespaceRoute6{Info,Config,Selector,Decision,Entry}` + `route6_snapshot`(连接路由从 iface v6 地址合成 + 显式 + 最长前缀)+ `best_ipv6_route` + `add`/`delete_ipv6_route`;v6 前缀数学用 u128 大端掩码(`plen==0` 守卫)。
+- **rtnetlink v6 route**:`handle_newroute/delroute` 按 `rtmsg.family` 分流(AF_INET6→v6,v4 分支原样)+ `parse_route6_config/selector` + `ipv6_attr` + `render_getroute_dump` 按 family 门控 v6 + `build_route6_message`。
+- **`/proc/net/ipv6_route`**:`proc_net_ipv6_route_snapshot_text`(Linux 格式:dst/src/nexthop 各 32hex + prefixlen + flags UP|GATEWAY)+ tx-fs procfs 布线(`PROCFS_NET_IPV6_ROUTE_ID`)。
+
+**验证**:rv64 build 干净;`rtnetlink_tests` 隔离 24/24(既有 v4 route + 新 v6 route 同过);全量集合差唯一新增=3 个新 v6 route 测试(级联,隔离过),**0 既有回归**(v4 路由/数据面未动)。功能门(QEMU `ip -6 route`)需真机。
+
+**下一步**:**V3b 数据面**(`emit_ipv6_packet` + step_device_tx v6 分支 + step_send/connect v6 选路 + `decide_ipv6_route` 网关)——解锁外部 off-link v6 TCP/UDP 真流量,先出调研文档。
