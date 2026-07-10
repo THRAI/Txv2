@@ -21,7 +21,20 @@ const MAX_UDP_PACKET_METADATA_CAPACITY: usize = 64;
 /// datagram queue now, so it must track the socket buffer size — but a
 /// default SO_SNDBUF/SO_RCVBUF of ~208 KiB per direction per socket would
 /// be a real allocation (audit R2d), so cap it.
-const UDP_SMOLTCP_BACKING_MAX_BYTES: usize = 32_768;
+///
+/// **Hard floor = one whole datagram.** The ring must hold at least one
+/// maximum-size UDP datagram (`UDP_IPV4_MAX_PAYLOAD_BYTES` = 65507); a cap
+/// below that cannot store even a single large datagram intact, so smoltcp
+/// truncates/drops it and the receiver reads garbage (iperf3's default UDP
+/// len is 65495 → its BASIC/REVERSE UDP tests corrupt at a 32 KiB cap).
+/// Matches TCP's `TCP_SMOLTCP_BACKING_MAX_BYTES` (64 KiB) — the correctness
+/// minimum for holding one datagram. (Raising it holds more back-to-back
+/// datagrams → less UDP loss under a fast sender, at more per-socket memory:
+/// the R2d tradeoff.) NOTE: the primary large-datagram corruption cause was
+/// the 4 KiB `read`/`write` syscall cap (`TTY_WRITE_MAX_INLINE`) shredding
+/// datagrams *before* they reached this ring; this floor only lets the
+/// (now-intact) large datagram be stored.
+const UDP_SMOLTCP_BACKING_MAX_BYTES: usize = 65_536;
 const UDP_PACKET_CAPACITY_DIVISOR: usize = 1500;
 pub const UDP_IPV4_MAX_PAYLOAD_BYTES: usize = u16::MAX as usize - 20 - 8;
 

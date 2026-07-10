@@ -1977,6 +1977,13 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         tx_subsystems::vfs::RNodeBacking::PageBacked { .. }
     ) {
         len
+    } else if super::socket::socket_identity_from_file(&file).is_ok() {
+        // Sockets are datagram/stream fds, not the TTY line discipline: a
+        // UDP `read`/`write` must move the whole datagram in one call.
+        // Truncating to `TTY_WRITE_MAX_INLINE` (4 KiB) shreds any datagram
+        // >4 KiB into fragments (corrupting iperf3 UDP `-l 65495`); use the
+        // socket I/O size (64 KiB), matching the sendto/recvfrom staging cap.
+        core::cmp::min(len, SOCKET_IO_MAX_INLINE)
     } else {
         core::cmp::min(len, TTY_WRITE_MAX_INLINE)
     };
@@ -2272,6 +2279,13 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
         tx_subsystems::vfs::RNodeBacking::PageBacked { .. }
     ) {
         len
+    } else if super::socket::socket_identity_from_file(&file).is_ok() {
+        // Sockets are datagram/stream fds, not the TTY line discipline: a
+        // UDP `read`/`write` must move the whole datagram in one call.
+        // Truncating to `TTY_WRITE_MAX_INLINE` (4 KiB) shreds any datagram
+        // >4 KiB into fragments (corrupting iperf3 UDP `-l 65495`); use the
+        // socket I/O size (64 KiB), matching the sendto/recvfrom staging cap.
+        core::cmp::min(len, SOCKET_IO_MAX_INLINE)
     } else {
         core::cmp::min(len, TTY_WRITE_MAX_INLINE)
     };
