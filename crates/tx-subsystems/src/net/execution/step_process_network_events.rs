@@ -20,6 +20,7 @@ use crate::net::structure::{
 };
 use tx_substrate::zone::Cap;
 
+use super::step_send::deliver_raw_ipv6_packet_to_table;
 use super::step_tcp_backlog_cleanup::{cleanup_tcp_backlog_for_listener, TcpBacklogCleanupOutcome};
 use super::step_tcp_backlog_poll::poll_tcp_backlog_for_listener_loopback;
 
@@ -116,6 +117,15 @@ pub fn step_process_network_events_in_namespace_at(
                     outcome.sockets_touched += 1;
                     outcome.wakes_fired += publish.publish_to(&socket);
                 }
+            }
+            // IPv6 V1b: raw ICMPv6 (ping6 echo replies) fans out to matching
+            // raw-icmp6 sockets. `deliver_raw_ipv6_packet_to_table` publishes
+            // readiness to each target internally (shared with the send path).
+            PacketDispatch::Icmp6(packet) => {
+                let packet_type = packet.payload.first().copied();
+                let protocol = packet.next_header;
+                let dst = packet.dst;
+                deliver_raw_ipv6_packet_to_table(table, protocol, dst, packet_type, packet, guard);
             }
             PacketDispatch::Unsupported | PacketDispatch::Malformed => {}
         }

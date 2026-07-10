@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 
-use crate::net::protocol::{Icmpv4Event, SmoltcpTcpSegment};
+use crate::net::protocol::{Icmpv4Event, RawIpv6Packet, SmoltcpTcpSegment};
 use crate::net::structure::IpEndpoint;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -8,6 +8,9 @@ pub enum PacketDispatch {
     Tcp(TcpPacketEvent),
     Udp(UdpPacketEvent),
     Icmp(Icmpv4Event),
+    /// IPv6 V1b: a raw ICMPv6 packet lifted off the wire, routed to raw-icmp6
+    /// sockets (ping6 echo replies). NDISC processing is V2.
+    Icmp6(RawIpv6Packet),
     Unsupported,
     Malformed,
 }

@@ -16,6 +16,7 @@ use crate::net::structure::{
     RecvWireSet, SendRecvFlags, SendWireSet, SocketIdentity, SocketKind, SocketPayload,
     SocketProtocol, TcpState, UnixDatagramState, UnixSocketPath, UnixStreamState,
 };
+use crate::net::structure::table::SocketTable;
 use crate::net::NetAdminAuthority;
 use tx_substrate::zone::PayloadCap;
 
@@ -632,7 +633,7 @@ fn send_raw_ipv6(
     };
 
     deliver_raw_ipv6_packet_to_table(
-        payload,
+        payload.socket_table(),
         protocol,
         dst_addr,
         bytes.first().copied(),
@@ -674,7 +675,7 @@ fn send_configured_icmpv6_echo(
     };
     let packet_type = reply_packet.payload.first().copied();
     deliver_raw_ipv6_packet_to_table(
-        payload,
+        payload.socket_table(),
         protocol,
         reply.dst,
         packet_type,
@@ -709,15 +710,15 @@ fn learn_configured_icmpv6_neighbor(
     );
 }
 
-fn deliver_raw_ipv6_packet_to_table(
-    payload: &SocketPayload,
+pub(crate) fn deliver_raw_ipv6_packet_to_table(
+    table: &SocketTable,
     protocol: ProtocolNumber,
     dst_addr: Ipv6Address,
     packet_type: Option<u8>,
     packet: RawIpv6Packet,
     guard: &Guard<'_>,
 ) {
-    for target in payload.socket_table().snapshot_raw_icmp(guard) {
+    for target in table.snapshot_raw_icmp(guard) {
         if target.kind != SocketKind::RawIcmp {
             continue;
         }

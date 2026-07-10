@@ -5,8 +5,8 @@ use smoltcp::wire::{
 use crate::net::packet::{
     LoopbackIpPacket, PacketDispatch, RxFrame, TcpPacketEvent, TcpPacketFlags, UdpPacketEvent,
 };
-use crate::net::protocol::{parse_icmpv4_payload, SmoltcpTcpSegment, UdpRxDatagram};
-use crate::net::structure::{IpEndpoint, Ipv4Address, Ipv6Address};
+use crate::net::protocol::{parse_icmpv4_payload, RawIpv6Packet, SmoltcpTcpSegment, UdpRxDatagram};
+use crate::net::structure::{IpEndpoint, Ipv4Address, Ipv6Address, ProtocolNumber};
 
 pub fn demux_rx_frame_with_smoltcp(frame: &RxFrame) -> PacketDispatch {
     let ethernet = match EthernetFrame::new_checked(frame.as_bytes()) {
@@ -36,6 +36,15 @@ fn demux_ipv6(packet: &[u8]) -> PacketDispatch {
         // R3a: UDP checksum verification is shared with the v4 path via the
         // dual-family `UdpRxDatagram` parser (v6 carries no IP header checksum).
         IpProtocol::Udp => demux_udp(packet),
+        // IPv6 V1b: hand ICMPv6 to the raw-icmp6 RX path (ping6 echo replies).
+        // NDISC (NS/NA/RS/RA) parsing + learning is V2; here it only reaches
+        // raw sockets, matching the v4 ICMP RX behaviour.
+        IpProtocol::Icmpv6 => PacketDispatch::Icmp6(RawIpv6Packet {
+            src: local_ipv6(ipv6.src_addr()),
+            dst: local_ipv6(ipv6.dst_addr()),
+            next_header: ProtocolNumber(58),
+            payload: ipv6.payload().to_vec(),
+        }),
         _ => PacketDispatch::Unsupported,
     }
 }

@@ -219,6 +219,8 @@ struct NetNamespaceIfaceRuntime {
     ipv4_addr: Ipv4Address,
     ipv4_prefix_len: u8,
     gateway: Option<Ipv4Address>,
+    ipv6_addr: Option<Ipv6Address>,
+    ipv6_prefix_len: Option<u8>,
     iface: &'static EtherIface,
 }
 
@@ -1659,6 +1661,11 @@ impl NetNamespacePayload {
         let ipv4_addr = link.ipv4_addr?;
         let ipv4_prefix_len = link.ipv4_prefix_len.unwrap_or(32).min(32);
         let gateway = self.gateway_for_device(link.name);
+        // IPv6 V1: carry the iface's on-link v6 config into IfaceCommon so
+        // decide_ipv6_route can do the on-link prefix check; part of the
+        // rebuild cache key so a v6-addr change re-leaks the iface.
+        let ipv6_addr = link.ipv6_addr;
+        let ipv6_prefix_len = link.ipv6_prefix_len;
         let mut runtime = self.iface_runtime.lock();
 
         if let Some(entry) = runtime.iter().find(|entry| {
@@ -1666,6 +1673,8 @@ impl NetNamespacePayload {
                 && entry.ipv4_addr == ipv4_addr
                 && entry.ipv4_prefix_len == ipv4_prefix_len
                 && entry.gateway == gateway
+                && entry.ipv6_addr == ipv6_addr
+                && entry.ipv6_prefix_len == ipv6_prefix_len
         }) {
             return Some(entry.iface);
         }
@@ -1677,7 +1686,8 @@ impl NetNamespacePayload {
                 prefix_len_to_netmask(ipv4_prefix_len),
                 gateway,
                 registration.ops.mtu(),
-            ),
+            )
+            .with_ipv6(ipv6_addr, ipv6_prefix_len),
             registration.ops.mac_addr(),
             registration.name,
         )));
@@ -1692,6 +1702,8 @@ impl NetNamespacePayload {
                 ipv4_addr,
                 ipv4_prefix_len,
                 gateway,
+                ipv6_addr,
+                ipv6_prefix_len,
                 iface,
             };
         } else {
@@ -1700,6 +1712,8 @@ impl NetNamespacePayload {
                 ipv4_addr,
                 ipv4_prefix_len,
                 gateway,
+                ipv6_addr,
+                ipv6_prefix_len,
                 iface,
             });
         }

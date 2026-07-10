@@ -7,6 +7,7 @@ use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{
     ArpOperation, ArpPacket, ArpRepr, EthernetAddress as SmoltcpEthernetAddress, EthernetFrame,
     EthernetProtocol, EthernetRepr, Ipv4Address as SmoltcpIpv4Address, Ipv4Packet,
+    Ipv6Address as SmoltcpIpv6Address, Ipv6Packet,
 };
 
 use crate::execution::{Errno, Guard, StepOutcome};
@@ -306,6 +307,18 @@ impl EtherIface {
     }
 
     pub fn dispatch_ip_at(&self, packet: &[u8], now: Instant, guard: &Guard<'_>) -> PacketTxResult {
+        // IPv6 V1: branch by IP version nibble. v6 → mirrored v6 L3 path;
+        // v4 → fall through to the existing path; non-IP/empty → EINVAL.
+        match packet.first().map(|b| b >> 4) {
+            Some(6) => return self.dispatch_ipv6_at(packet, now, guard),
+            Some(4) => {}
+            _ => {
+                self.stats.tx_errors.fetch_add(1, Ordering::Relaxed);
+                return PacketTxResult::Failed {
+                    errno: Errno::EINVAL,
+                };
+            }
+        }
         if packet.len() > IPV4_MAX_PACKET_LEN {
             self.stats.tx_errors.fetch_add(1, Ordering::Relaxed);
             return PacketTxResult::Failed {
@@ -573,6 +586,74 @@ impl EtherIface {
         }
         self.transmit_ipv4_fragments(dst_mac, packet, guard)
     }
+
+    // ===== IPv6 V1: external L3 TX — mirror of the IPv4 dispatch chain =====
+
+    fn dispatch_ipv6_at(&self, packet: &[u8], now: Instant, guard: &Guard<'_>) -> PacketTxResult {
+        let ipv6 = match Ipv6Packet::new_checked(packet) {
+            Ok(ipv6) => ipv6,
+            Err(_) => {
+                self.stats.tx_errors.fetch_add(1, Ordering::Relaxed);
+                return PacketTxResult::Failed {
+                    errno: Errno::EINVAL,
+                };
+            }
+        };
+        let route = decide_ipv6_route(self.common, from_smoltcp_ipv6(ipv6.dst_addr()));
+        let next_hop = match route.next_hop() {
+            Some(next_hop) => next_hop,
+            None => {
+                self.stats.tx_errors.fetch_add(1, Ordering::Relaxed);
+                return PacketTxResult::Failed {
+                    errno: Errno::EADDRNOTAVAIL,
+                };
+            }
+        };
+        let dst_mac = match self.resolve_ndisc(next_hop, now) {
+            NdiscResolution::Resolved { mac } => mac,
+            NdiscResolution::Failed { errno } => {
+                self.stats.tx_errors.fetch_add(1, Ordering::Relaxed);
+                return PacketTxResult::Failed { errno };
+            }
+        };
+        self.transmit_ipv6_packet(dst_mac, packet, guard)
+    }
+
+    /// V1: static NDISC table only (+ multicast MAC derivation). Dynamic NS/NA
+    /// solicitation + aging land in V2, which is why `now` is threaded through.
+    fn resolve_ndisc(&self, next_hop: Ipv6Address, now: Instant) -> NdiscResolution {
+        let _ = now;
+        if next_hop.is_multicast() {
+            return NdiscResolution::Resolved {
+                mac: multicast_mac_for(next_hop),
+            };
+        }
+        match self.ndisc_table.lock().get(&next_hop) {
+            Some(entry) => NdiscResolution::Resolved { mac: entry.mac },
+            None => NdiscResolution::Failed {
+                // Matches the ARP path's "can't resolve next hop" errno.
+                errno: Errno::EADDRNOTAVAIL,
+            },
+        }
+    }
+
+    fn transmit_ipv6_packet(
+        &self,
+        dst_mac: EthernetAddress,
+        packet: &[u8],
+        guard: &Guard<'_>,
+    ) -> PacketTxResult {
+        if packet.len() <= usize::from(self.common.mtu()) {
+            let frame = build_ipv6_ethernet_frame(self.ether_addr, dst_mac, packet);
+            return self.transmit_frame(&frame, guard);
+        }
+        // V1: no on-TX fragmentation (IPv6 routers never fragment; source-side
+        // fragment headers land in V4). Oversized → EMSGSIZE.
+        self.stats.tx_errors.fetch_add(1, Ordering::Relaxed);
+        PacketTxResult::Failed {
+            errno: Errno::EMSGSIZE,
+        }
+    }
 }
 
 impl Ipv4RouteDecision {
@@ -676,6 +757,87 @@ fn build_ipv4_ethernet_frame(
     repr.emit(&mut ethernet);
     ethernet.payload_mut().copy_from_slice(ipv4_packet);
     frame
+}
+
+fn build_ipv6_ethernet_frame(
+    src: EthernetAddress,
+    dst: EthernetAddress,
+    ipv6_packet: &[u8],
+) -> Vec<u8> {
+    let repr = EthernetRepr {
+        src_addr: to_smoltcp_ether(src),
+        dst_addr: to_smoltcp_ether(dst),
+        ethertype: EthernetProtocol::Ipv6,
+    };
+    let mut frame = vec![0; repr.buffer_len() + ipv6_packet.len()];
+    let mut ethernet = EthernetFrame::new_unchecked(frame.as_mut_slice());
+    repr.emit(&mut ethernet);
+    ethernet.payload_mut().copy_from_slice(ipv6_packet);
+    frame
+}
+
+/// IPv6 V1 route decision — **on-link only** (no v6 gateway yet; the full FIB
+/// with v6 gateways lands in V3). Mirror of [`decide_ipv4_route`].
+pub fn decide_ipv6_route(common: IfaceCommon, dst: Ipv6Address) -> Ipv6RouteDecision {
+    if dst.is_multicast() {
+        Ipv6RouteDecision::Multicast { next_hop: dst }
+    } else if same_ipv6_prefix(common, dst) {
+        Ipv6RouteDecision::Direct { next_hop: dst }
+    } else {
+        Ipv6RouteDecision::Unreachable { dst }
+    }
+}
+
+fn same_ipv6_prefix(common: IfaceCommon, dst: Ipv6Address) -> bool {
+    let (Some(local), Some(plen)) = (common.ipv6_addr(), common.ipv6_prefix_len()) else {
+        return false;
+    };
+    let local = local.octets();
+    let dst = dst.octets();
+    let full = (plen / 8) as usize;
+    let rem = plen % 8;
+    if local[..full] != dst[..full] {
+        return false;
+    }
+    if rem != 0 {
+        let mask = 0xffu8 << (8 - rem);
+        if (local[full] & mask) != (dst[full] & mask) {
+            return false;
+        }
+    }
+    true
+}
+
+/// RFC 2464: IPv6 multicast maps to Ethernet `33:33` + the low 4 address bytes.
+fn multicast_mac_for(addr: Ipv6Address) -> EthernetAddress {
+    let o = addr.octets();
+    EthernetAddress::new([0x33, 0x33, o[12], o[13], o[14], o[15]])
+}
+
+fn from_smoltcp_ipv6(addr: SmoltcpIpv6Address) -> Ipv6Address {
+    Ipv6Address::new(addr.octets())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Ipv6RouteDecision {
+    Direct { next_hop: Ipv6Address },
+    Multicast { next_hop: Ipv6Address },
+    Unreachable { dst: Ipv6Address },
+}
+
+impl Ipv6RouteDecision {
+    pub const fn next_hop(self) -> Option<Ipv6Address> {
+        match self {
+            Self::Direct { next_hop } | Self::Multicast { next_hop } => Some(next_hop),
+            Self::Unreachable { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NdiscResolution {
+    Resolved { mac: EthernetAddress },
+    Failed { errno: Errno },
 }
 
 fn build_arp_frame(repr: &ArpRepr) -> Vec<u8> {

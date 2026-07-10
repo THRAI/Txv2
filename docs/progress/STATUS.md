@@ -1,3 +1,16 @@
+- 2026-07-10 (IPv6 V1 落地 — 对外 v6 L3 发送 + ICMPv6 RX demux,B 路增量). 目标:补审计⑩「v6 有壳无数据路径」的
+  外部收发两半(loopback/demux 本已通)。**V1a 发送**(4 文件 +211):`Ipv6Address::is_multicast`(types.rs)·`IfaceCommon`
+  v6 地址/前缀字段 + `with_ipv6`(loopback.rs)·v6 地址串到 `EtherIface` + 纳入 iface 缓存键(namespace.rs)·
+  `dispatch_ipv6_at`→`decide_ipv6_route`(multicast/同前缀→Direct)→`resolve_ndisc`(静态 ndisc 表 + `multicast_mac_for`
+  33:33+低4字节)→`transmit_ipv6_packet`(≤MTU 建帧/超则 EMSGSIZE)(ether/mod.rs +162),镜像 v4 `dispatch_ip_at` 链。
+  **V1b 接收**(4 文件 +29):`PacketDispatch::Icmp6(RawIpv6Packet)`(demux.rs)·`demux_ipv6` 加 `IpProtocol::Icmpv6` 臂
+  (smoltcp_demux.rs)·`deliver_raw_ipv6_packet_to_table` 改 pub(crate)收 `&SocketTable`→**发送/接收共用同一分发器**
+  (step_send.rs,2 caller 改传 socket_table())·`Icmp6` 臂扇出到 raw-icmp6 socket(step_process_network_events.rs)。
+  合起 = 对外 ping6 的 TX(echo request 上线)+ RX(echo reply 落 raw socket)两半通,邻居走静态 ndisc(同 v4 静态 ARP;
+  动态 NDP=V2)。**验证**:`cargo xtask build --target rv64-qemu` 干净;`cargo test -p tx-subsystems` 集合差
+  **313==313 零回归**(v6 loopback 无退化);0 新增 warning。**功能门未跑**(host net 套被 1.94 污染基线掩盖,端到端
+  ICMPv6 RX 落 socket 需 QEMU 外部 ping6 + 预置静态邻居)。**下一步**:V2 动态 NDP(NS/NA 收发 + 邻居学习,替静态
+  ndisc 表)先出调研文档再实现。**Blocker**:无。调研正本 docs/design/07_net/{IPV6_STATUS_v1,IPV6_V1_PLAN_v1}.md。
 - 2026-07-06 (Wait 注册表统一 **Stage 1** — net 阻塞路径迁到 substrate WaitSource,对齐 eventfd). 目标:消除审计⑥/R4a
   遗留——net socket 阻塞 recv/send/accept/connect 从 subsystems `wait_on_token` 迁到 substrate `await_wait_source`。
   **调研纠正**:"两套注册表"**非 net 独有**——实为 3 原语(reactor `Channel`/net `RawQueue`/substrate `WaitSource`)的
