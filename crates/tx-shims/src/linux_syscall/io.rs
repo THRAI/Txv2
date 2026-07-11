@@ -1943,6 +1943,27 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     if file.eventfd().is_some() {
         return super::eventfd::sys_eventfd_write(&file, args[1], len, ctx).await;
     }
+    // Netlink `write(fd, msg)` == `sendto(fd, msg, 0, NULL, 0)`: route it to the
+    // netlink send path. The generic socket FileOps write (step_send_kernel_bytes)
+    // has no netlink handling and blocks forever waiting for send readiness that
+    // never fires — iproute2/busybox `ip` emit their RTM_GET* dump requests via
+    // write(), so this hung `ip` (and thus all v6/v4 config) entirely.
+    if let Ok(socket) = super::socket::socket_identity_from_file(&file) {
+        if super::socket::is_netlink_socket_kind(socket.kind) {
+            if !file.flags().write {
+                return SyscallResult::Error(EBADF_VALUE);
+            }
+            let copy_len = core::cmp::min(len, SOCKET_IO_MAX_INLINE);
+            let mut bytes: alloc::vec::Vec<u8> = alloc::vec![0u8; copy_len];
+            if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut bytes, buf_ptr as u64) {
+                return SyscallResult::error_from(errno);
+            }
+            return match super::socket::dispatch_netlink_send(ctx, &socket, &bytes) {
+                Ok(sent) => SyscallResult::Return(sent as i64),
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+            };
+        }
+    }
     // P3-S3 (D13): sockets no longer detour to sys_sendto here —
     // `write(fd)` flows the generic VFS path into the socket FileOps arm
     // (`step_write` → `FileOps::write` ≡ `send(...,0)`), blocking via the

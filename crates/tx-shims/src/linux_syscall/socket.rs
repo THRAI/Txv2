@@ -111,7 +111,7 @@ const ARPOP_REQUEST: u16 = 1;
 const ARPOP_REPLY: u16 = 2;
 const ARP_ETH_IPV4_PACKET_BYTES: usize = 28;
 
-fn is_netlink_socket_kind(kind: SocketKind) -> bool {
+pub(super) fn is_netlink_socket_kind(kind: SocketKind) -> bool {
     matches!(
         kind,
         SocketKind::NetlinkRoute | SocketKind::NetlinkXfrm | SocketKind::NetlinkNetfilter
@@ -703,7 +703,7 @@ pub(super) fn sys_sendto<'a>(
     sendto_impl(args, ctx)
 }
 
-fn dispatch_netlink_send(
+pub(super) fn dispatch_netlink_send(
     ctx: &SyscallCtx<'_>,
     socket: &Cap<SocketIdentity>,
     bytes: &[u8],

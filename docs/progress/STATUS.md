@@ -1,3 +1,15 @@
+- 2026-07-10 (修复 netlink `ip` 挂死 — write() 未路由到 netlink_route_send;真机验证 V3a). 症状:refactor 分支 tx.runsh
+  lane 上 userspace `ip`(iproute2 + busybox 两种实现)全挂,挡住一切 netlink 网络配置(v4/v6 addr/route)。**QEMU 真机 +
+  逐 syscall 原子探针定位**:`ip` 完成 socket/bind/getsockname 后挂在 **write(64)**——`ip` 用 `write(netlink_fd, RTM_GET*)`
+  发 dump 请求(非 sendto),而 sys_write 把 socket 写走通用 VFS→socket FileOps→`step_send_kernel_bytes`(TCP/UDP 通用发送,
+  **零 netlink 处理**)→ netlink socket 永不 fire send readiness → 永久阻塞。**误判纠正**:先以为"挂 recv/poll"(lost-wakeup),
+  探针证伪(send/recv/poll 计数全 0,唯 write 到);逻辑逐层读都对,靠 ground truth 才定位。**修复**(io.rs +21 / socket.rs
+  2 fn 提 pub(super)):sys_write 检测 netlink socket → 路由到 `dispatch_netlink_send`(等价 `sendto(...,0)`);非 netlink 写
+  字节级不变。**验证**:rv64 build 干净;QEMU `ip link show`/`ip -6 addr add`/`ip -6 route add default via`/`ip -6 route show`
+  全 rc0(fec0::10 配上、两条 v6 路由在)→ **V3a rtnetlink v6 真机端到端验证**;git-net **8/8**(TCP clone/push/pull/DNS 零
+  回归);tx-subsystems 未动。**遗留(独立缺口,非本修复)**:外部 ping6 仍 `sendto: Not supported`——raw ICMPv6/v4 echo 只对
+  已配置本地地址合成回显(step_send.rs `send_configured_icmpv6_echo`:`!ipv6_addr_is_configured(dst)→EOPNOTSUPP`),对外部
+  (网关/真机)未接设备 TX,是独立特性(对外 raw ICMP→`dispatch_ipv6_at`),非 netlink 问题。**Blocker**:无。
 - 2026-07-10 (IPv6 V4 延后 + B 路 V1-V3b 收官 — 分片/转发/sysctl 价值评估). 调研结论:V4 是架构完整性收尾,**已知
   LTP 计分价值近零**——网络计分账本(58 靶/天花板 946)**无 v6 分片/转发靶**(唯一 `fragments` 是 SCTP 层已覆盖;
   `forwarding` 提及全是 v4 Docker/Alpine 容器场景);可计分 v6 靶(ipv6_lib/ping6/tracepath601/tcpdump601)V1-V2 已覆盖;
