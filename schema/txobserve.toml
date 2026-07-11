@@ -1137,6 +1137,248 @@ payloads = ["panic"]
 control_group = "always_on_when_observe_enabled"
 projection = ["records", "repairs", "ndjson", "perfetto", "text_report"]
 
+[kernel]
+generated_catalog = "crates/tx-observe/src/generated/schema_catalog.rs"
+
+[[kernel.hart_emitter_methods]]
+name = "span_begin"
+surface = "raw_facade"
+record_kind = "span_begin"
+levels = ["boundary", "script", "drive", "yield", "step", "phase", "mutation", "sched"]
+payloads = []
+producer_allowed = false
+
+[[kernel.hart_emitter_methods]]
+name = "span_end"
+surface = "raw_facade"
+record_kind = "span_end"
+levels = ["boundary"]
+payloads = []
+producer_allowed = false
+
+[[kernel.hart_emitter_methods]]
+name = "span_end_empty"
+surface = "raw_facade"
+record_kind = "span_end"
+levels = ["boundary"]
+payloads = ["none"]
+producer_allowed = false
+
+[[kernel.hart_emitter_methods]]
+name = "instant"
+surface = "raw_facade"
+record_kind = "instant"
+levels = ["boundary", "script", "drive", "yield", "step", "phase", "mutation", "sched"]
+payloads = []
+producer_allowed = false
+
+[[kernel.hart_emitter_methods]]
+name = "counter"
+surface = "raw_facade"
+record_kind = "counter"
+levels = ["boundary"]
+payloads = ["counter_value"]
+event_family = "allocation"
+producer_allowed = false
+
+[[kernel.hart_emitter_methods]]
+name = "debug_counter"
+surface = "typed_producer"
+record_kind = "counter"
+levels = ["boundary"]
+payloads = ["counter_value"]
+event_family = "allocation"
+producer_allowed = true
+
+[[kernel.hart_emitter_methods]]
+name = "syscall_enter"
+surface = "typed_producer"
+record_kind = "span_begin"
+levels = ["boundary"]
+payloads = ["syscall_enter", "arg_value"]
+event_family = "syscall"
+producer_allowed = true
+
+[[kernel.hart_emitter_methods]]
+name = "syscall_exit"
+surface = "typed_producer"
+record_kind = "span_end"
+levels = ["boundary"]
+payloads = ["syscall_exit"]
+event_family = "syscall"
+producer_allowed = true
+
+[[kernel.hart_emitter_methods]]
+name = "drive_begin"
+surface = "typed_producer"
+record_kind = "span_begin"
+levels = ["drive"]
+payloads = ["drive_begin"]
+event_family = "drive"
+producer_allowed = true
+
+[[kernel.hart_emitter_methods]]
+name = "drive_end"
+surface = "typed_producer"
+record_kind = "span_end"
+levels = ["boundary"]
+payloads = ["drive_end"]
+event_family = "drive"
+producer_allowed = true
+
+[[kernel.hart_emitter_methods]]
+name = "step_begin"
+surface = "typed_producer"
+record_kind = "span_begin"
+levels = ["step"]
+payloads = ["none"]
+event_family = "drive"
+producer_allowed = true
+
+[[kernel.hart_emitter_methods]]
+name = "step_end"
+surface = "typed_producer"
+record_kind = "span_end"
+levels = ["boundary"]
+payloads = ["step_outcome"]
+event_family = "drive"
+producer_allowed = true
+
+[[kernel.hart_emitter_methods]]
+name = "yield_begin"
+surface = "typed_producer"
+record_kind = "span_begin"
+levels = ["yield"]
+payloads = ["yield_begin"]
+event_family = "yield"
+producer_allowed = true
+
+[[kernel.hart_emitter_methods]]
+name = "resume"
+surface = "typed_producer"
+record_kind = "instant"
+levels = ["yield"]
+payloads = ["resume"]
+event_family = "yield"
+producer_allowed = true
+
+[[kernel.hart_emitter_methods]]
+name = "phase_begin"
+surface = "typed_producer"
+record_kind = "span_begin"
+levels = ["phase"]
+payloads = ["phase_transition"]
+event_family = "phase"
+producer_allowed = true
+
+[[kernel.hart_emitter_methods]]
+name = "phase_end"
+surface = "typed_producer"
+record_kind = "span_end"
+levels = ["boundary"]
+payloads = ["none"]
+event_family = "phase"
+producer_allowed = true
+
+[[kernel.hart_emitter_methods]]
+name = "mutation_zone_sign"
+surface = "typed_producer"
+record_kind = "instant"
+levels = ["mutation"]
+payloads = ["mutation_zone_sign"]
+event_family = "mutation"
+producer_allowed = true
+
+[[kernel.hart_emitter_methods]]
+name = "mutation_index_commit"
+surface = "typed_producer"
+record_kind = "instant"
+levels = ["mutation"]
+payloads = ["mutation_index_commit"]
+event_family = "mutation"
+producer_allowed = true
+
+[[kernel.hart_emitter_methods]]
+name = "process_label"
+surface = "typed_producer"
+record_kind = "instant"
+levels = ["sched"]
+payloads = ["process_label"]
+event_family = "scheduler"
+producer_allowed = true
+
+[[kernel.hart_emitter_methods]]
+name = "process_group"
+surface = "typed_producer"
+record_kind = "instant"
+levels = ["sched"]
+payloads = ["process_group"]
+event_family = "scheduler"
+producer_allowed = true
+
+[[kernel.hart_emitter_methods]]
+name = "allocation"
+surface = "typed_producer"
+record_kind = "instant"
+levels = ["mutation"]
+payloads = ["arg_value"]
+event_family = "allocation"
+producer_allowed = true
+
+[[kernel.hart_emitter_methods]]
+name = "lock_metric"
+surface = "typed_producer"
+record_kind = "instant"
+levels = ["mutation"]
+payloads = ["arg_value"]
+event_family = "lock"
+producer_allowed = true
+
+[[kernel.hart_emitter_methods]]
+name = "ds_method_metric"
+surface = "typed_producer"
+record_kind = "instant"
+levels = ["mutation"]
+payloads = ["arg_value"]
+event_family = "ds_method"
+producer_allowed = true
+
+[[kernel.hart_emitter_methods]]
+name = "ds_method_metric_for_zone"
+surface = "typed_producer"
+record_kind = "instant"
+levels = ["mutation"]
+payloads = ["arg_value"]
+event_family = "ds_method"
+producer_allowed = true
+
+[[kernel.hart_emitter_methods]]
+name = "wait_source_notify"
+surface = "typed_producer"
+record_kind = "instant"
+levels = ["yield"]
+payloads = ["wait_source_notify"]
+event_family = "yield"
+producer_allowed = true
+
+[[kernel.producer_boundary_rules]]
+name = "raw observe payload encoder"
+replacement = "Add or use a typed HartEmitter helper in tx-observe."
+needles = ["tx_observe::encode::", "use tx_observe::encode"]
+
+[[kernel.producer_boundary_rules]]
+name = "raw debug counter emit"
+replacement = "Use HartEmitter::debug_counter(name, value)."
+needles = ["observer.counter("]
+
+[[kernel.producer_boundary_rules]]
+name = "ad-hoc event-name hash"
+replacement = "Use EventNameId::from_name(name) or a typed HartEmitter helper."
+needles = [
+  "EventNameId::from_raw(tx_observe::fnv1a32(",
+  "tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(",
+]
+
 [[migration.checks]]
 id = "payload-tags-match-rust"
 description = "Compare [[payloads]].tag and rust_tag against TxPayloadTag."
@@ -1175,6 +1417,21 @@ status = "enforced"
 [[migration.checks]]
 id = "explicit-tracks-match-rust-host"
 description = "Compare [[tracks.explicit]] against ALLOC_TRACK_* constants and Perfetto explicit track names."
+status = "enforced"
+
+[[migration.checks]]
+id = "hart-emitter-methods-match-rust"
+description = "Compare [[kernel.hart_emitter_methods]] against the public HartEmitter method surface."
+status = "enforced"
+
+[[migration.checks]]
+id = "kernel-catalog-codegen-check"
+description = "Compare generated schema_catalog.rs against the TOML kernel catalog."
+status = "enforced"
+
+[[migration.checks]]
+id = "producer-boundary-rules-from-schema"
+description = "Load observe-producer-boundary lint rules from [[kernel.producer_boundary_rules]]."
 status = "enforced"
 
 [[migration.checks]]

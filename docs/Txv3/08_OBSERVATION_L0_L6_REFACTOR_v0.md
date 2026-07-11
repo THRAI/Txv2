@@ -3,9 +3,10 @@
 <!-- txdoc:TXV3-OBSERVATION-L0-L6-REFACTOR-V0 -->
 
 **Status.** Architecture contract / staged refactor, 2026-07-11. L0 schema
-inventory and the first schema check gate have landed. L1-L6 remain staged
-migration targets unless explicitly marked as landed below. This document does
-not by itself bump `txtrace-v0` or require a new record layout.
+inventory, schema check, kernel helper catalog codegen, and schema-owned
+producer-boundary lint rules have landed. L1-L6 remain staged migration targets
+unless explicitly marked as landed below. This document does not by itself bump
+`txtrace-v0` or require a new record layout.
 **Purpose.** Define the L0-L6 module boundaries for `tx-observe`, identify
 which contracts are already mechanically checked, name which external systems
 each layer borrows organizational discipline from, and give a staged migration
@@ -64,19 +65,25 @@ flowchart TD
 
   subgraph Existing["Existing implementation truth checked today"]
     R["tx-observe-types\nTxTraceLevel / TxTraceKind / TxPayloadTag / Payload*"]
+    K["tx-observe\nHartEmitter helper surface"]
     C["Cargo.toml\nunexpected_cfgs allowlist"]
     A["tools/tx-observe-analyze.py\nSQL schemas / Parquet tables / reports"]
     P["tx-trace-daemon Perfetto writer\nexplicit tracks"]
   end
 
   X["cargo xtask observe-schema check"]
+  G["cargo xtask observe-schema codegen --check\nschema_catalog.rs"]
+  L["cargo xtask lint invariants observe-producer-boundary\nrules read from TOML"]
   D["Architecture docs\nthis document + companion specs"]
 
   T --> X
   R --> X
+  K --> X
   C --> X
   A --> X
   P --> X
+  T --> G
+  T --> L
   X -->|"fails on drift"| D
 ```
 
@@ -84,7 +91,8 @@ The current `observe-schema check` gate validates the inventory against the
 live tree:
 
 ```text
-observe-schema check: ok (levels=8 record_kinds=11 payloads=23 payload_structs=20 cfgs=34 projections=9 tracks=16)
+observe-schema check: ok (levels=8 record_kinds=11 payloads=23 payload_structs=20 cfgs=34 projections=9 tracks=16 hart_emitter_methods=25)
+observe-schema codegen --check: ok (crates/tx-observe/src/generated/schema_catalog.rs)
 ```
 
 Target topology:
@@ -204,6 +212,8 @@ the live implementation before generation becomes authoritative:
 | `[[host.inputs]]` | accepted host input modes: `.txtrace`, `.rawrecords`, and live guest memory | parseable TOML |
 | `[[host.projections]]` | NDJSON, Perfetto, text report, SQL views, and Parquet-derived table schemas | exact analyzer table columns for checked views |
 | `[[event_families]]` | family-level level/payload/control/projection mapping | referenced ids exist |
+| `[[kernel.hart_emitter_methods]]` | `HartEmitter` public method catalog, split into raw facade and typed producer surfaces | exact method-name match against `crates/tx-observe/src/lib.rs`; raw facade methods cannot be producer-allowed |
+| `[[kernel.producer_boundary_rules]]` | production-side forbidden raw observe API needles and replacement guidance | consumed by `observe-producer-boundary` lint and generated into the kernel catalog |
 | `[[migration.checks]]` | migration gates that document current and planned enforcement | parseable TOML |
 
 The TOML schema is never parsed in the kernel hot path. The intended flow is:
@@ -212,8 +222,8 @@ The TOML schema is never parsed in the kernel hot path. The intended flow is:
 flowchart LR
   TOML["schema/txobserve.toml"]
   Check["xtask observe-schema check"]
-  Codegen["xtask observe-schema codegen\nplanned"]
-  Kernel["generated kernel catalog\nplanned"]
+  Codegen["xtask observe-schema codegen\nlanded for kernel catalog"]
+  Kernel["crates/tx-observe/src/generated/schema_catalog.rs"]
   Host["generated host catalog\nplanned"]
   TUI["generated menu/profile\nplanned"]
 
@@ -974,12 +984,12 @@ The migration should land in small slices:
    projections, and event-family mappings. No runtime behavior change.
 2. **Schema check gate.** Landed: `xtask observe-schema check` validates the
    highest-drift L0 surfaces against live Rust/Python/daemon sources.
-3. **Stable name/event catalog closure.** Next: make every raw
-   `EventNameId::from_raw(fnv1a32(...))`, `KERNEL_FNV1A_STABLE_NAMES` entry,
-   and event-family mapping concrete enough for codegen.
-4. **Schema codegen.** Next: add `xtask observe-schema codegen --check` so
-   generated Rust, host catalog, menu JSON, docs tables, and projection matrix
-   cannot drift.
+3. **Kernel helper catalog closure.** Landed: `[[kernel.hart_emitter_methods]]`
+   records the current `HartEmitter` public surface and separates raw facade
+   methods from typed producer helpers.
+4. **Schema codegen.** Partially landed: `xtask observe-schema codegen
+   --check` now protects the generated kernel catalog. Generated host catalog,
+   menu JSON, docs tables, and projection matrix remain future slices.
 5. **Typed semantic wrappers.** Add L1 `ObserveEvent` and wrappers for the main
    event families while keeping compatibility shims.
 6. **Producer status.** Teach L2 emit to return `EmitStatus`; introduce

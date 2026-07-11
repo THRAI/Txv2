@@ -1,3 +1,24 @@
+- 2026-07-11 (tx-observe schema codegen automation).
+  Continued the observe L0 schema consolidation by making kernel-side automation
+  concrete. `schema/txobserve.toml` now owns the `HartEmitter` public helper
+  catalog, split between raw facade methods and typed producer helpers, plus the
+  producer-boundary lint rules. `cargo xtask observe-schema check` now compares
+  that catalog against `crates/tx-observe/src/lib.rs`, and `cargo xtask
+  observe-schema codegen --check` protects the generated kernel catalog at
+  `crates/tx-observe/src/generated/schema_catalog.rs`. The
+  `observe-producer-boundary` invariant now reads forbidden raw producer API
+  needles from the TOML schema instead of a hardcoded xtask table. Verification:
+  `cargo test -p xtask --lib observe_schema::tests -- --nocapture` passed 9/9;
+  `cargo test -p xtask --lib lint_invariants_observe::tests -- --nocapture`
+  passed 3/3; `cargo xtask observe-schema check`, `cargo xtask
+  observe-schema codegen --check`, and `cargo xtask lint invariants
+  observe-producer-boundary` passed; `cargo test -p tx-observe --test smoke --
+  --nocapture` passed 14/14; scoped rustfmt, scoped `git diff --check`, `cargo
+  xtask progress validate`, and `cargo xtask lint docs` passed. Remaining
+  automation work: generated host catalog/projection matrix, menuconfig-style
+  TUI output, docs table generation, and eventually generated typed
+  `EventToken`/macro wrappers for producer callsites.
+
 - 2026-07-11 (tx-observe kernel-side structured/helper migration).
   Continued the kernel-side L0-L6 observe migration beyond the initial
   `WaitSourceNotify` slice. Added typed `HartEmitter` helpers for L0 syscall

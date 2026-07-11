@@ -47,6 +47,7 @@ mod hart_local;
 use hart_local::{HartLocalArray, HartLocalOptionArray};
 
 pub mod encode;
+pub mod generated;
 mod macros;
 
 #[cfg(any(test, feature = "testing"))]
@@ -1523,7 +1524,7 @@ where
     P: ConsoleIf + ObserverIf + MonotonicCounterIf,
 {
     run_pre_dump_hook();
-    use tx_observe_types::{TxTraceClockId, TxTraceHeader, TxTraceHeaderFlags, TX_TRACE_MAGIC};
+    use tx_observe_types::{TX_TRACE_MAGIC, TxTraceClockId, TxTraceHeader, TxTraceHeaderFlags};
 
     let mut hart_count = 0usize;
     let mut max_records = 0usize;

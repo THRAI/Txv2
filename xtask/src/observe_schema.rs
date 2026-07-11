@@ -4,37 +4,47 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use crate::util::{optional_option_value, resolve_path};
 use crate::Result;
+use crate::util::{optional_option_value, resolve_path};
 
 pub(crate) fn observe_schema(root: &Path, args: Vec<String>) -> Result<()> {
     let Some(subcmd) = args.first() else {
         return Err("observe-schema command needs check\n\
              usage:\n\
-             \tcargo xtask observe-schema check [--schema schema/txobserve.toml]"
+             \tcargo xtask observe-schema check [--schema schema/txobserve.toml]\n\
+             \tcargo xtask observe-schema codegen [--schema schema/txobserve.toml] [--output crates/tx-observe/src/generated/schema_catalog.rs] [--check]"
             .into());
     };
     match subcmd.as_str() {
         "check" => observe_schema_check(root, &args[1..]),
+        "codegen" => observe_schema_codegen(root, &args[1..]),
         other => Err(format!(
-            "unknown observe-schema subcommand '{other}'; expected check"
+            "unknown observe-schema subcommand '{other}'; expected check or codegen"
         )),
     }
 }
 
-fn observe_schema_check(root: &Path, args: &[String]) -> Result<()> {
-    let schema_path = optional_option_value(args, "--schema")
+fn schema_path_from_args(root: &Path, args: &[String]) -> std::path::PathBuf {
+    optional_option_value(args, "--schema")
         .map(PathBufLike::from)
         .map(|path| resolve_path(root, path.0))
-        .unwrap_or_else(|| root.join("schema/txobserve.toml"));
-    let schema = fs::read_to_string(&schema_path)
-        .map_err(|err| format!("failed to read {}: {err}", schema_path.display()))?;
+        .unwrap_or_else(|| root.join("schema/txobserve.toml"))
+}
+
+fn read_schema_file(path: &Path) -> Result<String> {
+    fs::read_to_string(path).map_err(|err| format!("failed to read {}: {err}", path.display()))
+}
+
+fn observe_schema_check(root: &Path, args: &[String]) -> Result<()> {
+    let schema_path = schema_path_from_args(root, args);
+    let schema = read_schema_file(&schema_path)?;
     let record_rs_path = root.join("crates/tx-observe-types/src/record.rs");
     let payload_rs_path = root.join("crates/tx-observe-types/src/payload.rs");
     let types_lib_rs_path = root.join("crates/tx-observe-types/src/lib.rs");
     let cargo_toml_path = root.join("Cargo.toml");
     let analyzer_path = root.join("tools/tx-observe-analyze.py");
     let perfetto_writer_path = root.join("tools/tx-trace-daemon/src/perfetto/writer.rs");
+    let tx_observe_lib_path = root.join("crates/tx-observe/src/lib.rs");
     let record_rs = fs::read_to_string(&record_rs_path)
         .map_err(|err| format!("failed to read {}: {err}", record_rs_path.display()))?;
     let payload_rs = fs::read_to_string(&payload_rs_path)
@@ -47,6 +57,8 @@ fn observe_schema_check(root: &Path, args: &[String]) -> Result<()> {
         .map_err(|err| format!("failed to read {}: {err}", analyzer_path.display()))?;
     let perfetto_writer = fs::read_to_string(&perfetto_writer_path)
         .map_err(|err| format!("failed to read {}: {err}", perfetto_writer_path.display()))?;
+    let tx_observe_lib = fs::read_to_string(&tx_observe_lib_path)
+        .map_err(|err| format!("failed to read {}: {err}", tx_observe_lib_path.display()))?;
 
     let report = check_schema_text(
         &schema,
@@ -56,17 +68,62 @@ fn observe_schema_check(root: &Path, args: &[String]) -> Result<()> {
         &cargo_toml,
         &analyzer_py,
         &perfetto_writer,
+        &tx_observe_lib,
     )?;
     println!(
-        "observe-schema check: ok (levels={} record_kinds={} payloads={} payload_structs={} cfgs={} projections={} tracks={})",
+        "observe-schema check: ok (levels={} record_kinds={} payloads={} payload_structs={} cfgs={} projections={} tracks={} hart_emitter_methods={})",
         report.levels,
         report.record_kinds,
         report.payloads,
         report.payload_structs,
         report.cfgs,
         report.projections,
-        report.tracks
+        report.tracks,
+        report.hart_emitter_methods
     );
+    Ok(())
+}
+
+fn observe_schema_codegen(root: &Path, args: &[String]) -> Result<()> {
+    let schema_path = schema_path_from_args(root, args);
+    let schema_text = read_schema_file(&schema_path)?;
+    let schema: ObserveSchema =
+        toml::from_str(&schema_text).map_err(|err| format!("schema TOML parse failed: {err}"))?;
+    let generated = render_schema_catalog(&schema)?;
+    let output_path = optional_option_value(args, "--output")
+        .map(PathBufLike::from)
+        .map(|path| resolve_path(root, path.0))
+        .or_else(|| {
+            schema
+                .kernel
+                .as_ref()
+                .and_then(|kernel| kernel.generated_catalog.as_ref())
+                .map(|path| resolve_path(root, path.into()))
+        })
+        .unwrap_or_else(|| root.join("crates/tx-observe/src/generated/schema_catalog.rs"));
+
+    if args.iter().any(|arg| arg == "--check") {
+        let current = read_schema_file(&output_path)?;
+        if current == generated {
+            println!(
+                "observe-schema codegen --check: ok ({})",
+                output_path.display()
+            );
+            return Ok(());
+        }
+        return Err(format!(
+            "observe-schema generated catalog is stale: run `cargo xtask observe-schema codegen` to update {}",
+            output_path.display()
+        ));
+    }
+
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+    }
+    fs::write(&output_path, generated)
+        .map_err(|err| format!("failed to write {}: {err}", output_path.display()))?;
+    println!("observe-schema codegen: wrote {}", output_path.display());
     Ok(())
 }
 
@@ -86,6 +143,7 @@ struct ObserveSchema {
     host: HostSchema,
     tracks: Option<TracksSchema>,
     names: Option<NamesSchema>,
+    kernel: Option<KernelSchema>,
     #[serde(default)]
     event_families: Vec<EventFamilyEntry>,
 }
@@ -200,6 +258,36 @@ struct NameFamilyEntry {
     pattern: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct KernelSchema {
+    generated_catalog: Option<String>,
+    #[serde(default)]
+    hart_emitter_methods: Vec<HartEmitterMethodEntry>,
+    #[serde(default)]
+    producer_boundary_rules: Vec<ProducerBoundaryRuleEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HartEmitterMethodEntry {
+    name: String,
+    surface: String,
+    record_kind: String,
+    #[serde(default)]
+    levels: Vec<String>,
+    #[serde(default)]
+    payloads: Vec<String>,
+    event_family: Option<String>,
+    producer_allowed: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProducerBoundaryRuleEntry {
+    name: String,
+    replacement: String,
+    #[serde(default)]
+    needles: Vec<String>,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct CheckReport {
     levels: usize,
@@ -209,6 +297,7 @@ struct CheckReport {
     cfgs: usize,
     projections: usize,
     tracks: usize,
+    hart_emitter_methods: usize,
 }
 
 fn check_schema_text(
@@ -219,6 +308,7 @@ fn check_schema_text(
     cargo_toml: &str,
     analyzer_py: &str,
     perfetto_writer: &str,
+    tx_observe_lib_rs: &str,
 ) -> Result<CheckReport> {
     let schema: ObserveSchema =
         toml::from_str(schema).map_err(|err| format!("schema TOML parse failed: {err}"))?;
@@ -263,8 +353,10 @@ fn check_schema_text(
     let schema_projections = projection_schemas_from_schema(&schema.host.projections)?;
     let track_consts = parse_explicit_track_consts(payload_rs)?;
     let writer_track_names = parse_explicit_track_names(perfetto_writer)?;
+    let hart_emitter_methods = parse_hart_emitter_public_methods(tx_observe_lib_rs)?;
     check_event_family_refs(&schema)?;
     check_explicit_tracks(&schema, &track_consts, &writer_track_names)?;
+    check_hart_emitter_methods(&schema, &hart_emitter_methods)?;
 
     compare_maps("TxTraceLevel", &levels, &level_schema)?;
     compare_maps("TxTraceKind", &record_kinds, &kind_schema)?;
@@ -292,6 +384,11 @@ fn check_schema_text(
             .tracks
             .as_ref()
             .map(|tracks| tracks.explicit.len())
+            .unwrap_or(0),
+        hart_emitter_methods: schema
+            .kernel
+            .as_ref()
+            .map(|kernel| kernel.hart_emitter_methods.len())
             .unwrap_or(0),
     })
 }
@@ -579,6 +676,230 @@ fn check_explicit_tracks(
         return Ok(());
     }
     Err(format!("explicit track mismatch: {mismatches:?}"))
+}
+
+fn parse_hart_emitter_public_methods(text: &str) -> Result<BTreeSet<String>> {
+    let needle = "impl HartEmitter";
+    let Some(start) = text.find(needle) else {
+        return Err("missing impl HartEmitter".into());
+    };
+    let after = &text[start..];
+    let Some(open_rel) = after.find('{') else {
+        return Err("missing '{' for impl HartEmitter".into());
+    };
+    let open = start + open_rel;
+    let close = matching_delimiter(text, open, '{', '}')?;
+    let body = &text[open + 1..close];
+    let mut methods = BTreeSet::new();
+    for raw_line in body.lines() {
+        let line = raw_line.split("//").next().unwrap_or("").trim();
+        let Some(rest) = line.strip_prefix("pub fn ") else {
+            continue;
+        };
+        let Some(name_end) = rest.find('(') else {
+            return Err(format!(
+                "HartEmitter method line missing '(' after name: {line}"
+            ));
+        };
+        let name = rest[..name_end].trim();
+        if name.is_empty() {
+            return Err(format!("HartEmitter method line has empty name: {line}"));
+        }
+        methods.insert(name.to_string());
+    }
+    Ok(methods)
+}
+
+fn check_hart_emitter_methods(
+    schema: &ObserveSchema,
+    rust_methods: &BTreeSet<String>,
+) -> Result<()> {
+    let Some(kernel) = &schema.kernel else {
+        return Ok(());
+    };
+    let schema_methods: BTreeSet<_> = kernel
+        .hart_emitter_methods
+        .iter()
+        .map(|method| method.name.clone())
+        .collect();
+    let missing: Vec<_> = rust_methods.difference(&schema_methods).cloned().collect();
+    let extra: Vec<_> = schema_methods.difference(rust_methods).cloned().collect();
+    let mut mismatches = Vec::new();
+    if !missing.is_empty() || !extra.is_empty() {
+        mismatches.push(format!("missing={missing:?} extra={extra:?}"));
+    }
+
+    let level_ids: BTreeSet<_> = schema
+        .abi
+        .levels
+        .iter()
+        .filter_map(|level| level.rust.strip_prefix("TxTraceLevel::"))
+        .map(camel_to_snake)
+        .collect();
+    let payload_ids: BTreeSet<_> = schema
+        .payloads
+        .iter()
+        .map(|payload| payload.id.as_str())
+        .collect();
+    let record_kind_ids: BTreeSet<_> = schema
+        .abi
+        .record_kinds
+        .iter()
+        .filter_map(|kind| kind.rust.strip_prefix("TxTraceKind::"))
+        .map(camel_to_snake)
+        .collect();
+    let event_family_ids: BTreeSet<_> = schema
+        .event_families
+        .iter()
+        .map(|family| family.id.as_str())
+        .collect();
+
+    for method in &kernel.hart_emitter_methods {
+        if method.surface != "raw_facade" && method.surface != "typed_producer" {
+            mismatches.push(format!(
+                "{} surface '{}' is not raw_facade or typed_producer",
+                method.name, method.surface
+            ));
+        }
+        if !record_kind_ids.contains(method.record_kind.as_str()) {
+            mismatches.push(format!(
+                "{} record_kind -> {}",
+                method.name, method.record_kind
+            ));
+        }
+        for level in &method.levels {
+            if !level_ids.contains(level.as_str()) {
+                mismatches.push(format!("{} level -> {}", method.name, level));
+            }
+        }
+        for payload in &method.payloads {
+            if !payload_ids.contains(payload.as_str()) {
+                mismatches.push(format!("{} payload -> {}", method.name, payload));
+            }
+        }
+        if let Some(event_family) = &method.event_family {
+            if !event_family_ids.contains(event_family.as_str()) {
+                mismatches.push(format!("{} event_family -> {}", method.name, event_family));
+            }
+        }
+        if method.surface == "raw_facade" && method.producer_allowed {
+            mismatches.push(format!(
+                "{} raw_facade method cannot be producer_allowed",
+                method.name
+            ));
+        }
+    }
+
+    if mismatches.is_empty() {
+        return Ok(());
+    }
+    Err(format!("HartEmitter method mismatch: {mismatches:?}"))
+}
+
+fn render_schema_catalog(schema: &ObserveSchema) -> Result<String> {
+    let Some(kernel) = &schema.kernel else {
+        return Err("schema has no [kernel] catalog section".into());
+    };
+    let mut out = String::new();
+    out.push_str("// @generated by `cargo xtask observe-schema codegen`; do not edit by hand.\n");
+    out.push_str("// Source of truth: schema/txobserve.toml\n\n");
+    out.push_str("#[derive(Copy, Clone, Debug, Eq, PartialEq)]\n");
+    out.push_str("pub struct HartEmitterMethodCatalog {\n");
+    out.push_str("    pub name: &'static str,\n");
+    out.push_str("    pub surface: &'static str,\n");
+    out.push_str("    pub record_kind: &'static str,\n");
+    out.push_str("    pub levels: &'static [&'static str],\n");
+    out.push_str("    pub payloads: &'static [&'static str],\n");
+    out.push_str("    pub event_family: Option<&'static str>,\n");
+    out.push_str("    pub producer_allowed: bool,\n");
+    out.push_str("}\n\n");
+    out.push_str("pub const HART_EMITTER_METHODS: &[HartEmitterMethodCatalog] = &[\n");
+    for method in &kernel.hart_emitter_methods {
+        out.push_str("    HartEmitterMethodCatalog {\n");
+        out.push_str(&format!(
+            "        name: \"{}\",\n",
+            rust_escape(&method.name)
+        ));
+        out.push_str(&format!(
+            "        surface: \"{}\",\n",
+            rust_escape(&method.surface)
+        ));
+        out.push_str(&format!(
+            "        record_kind: \"{}\",\n",
+            rust_escape(&method.record_kind)
+        ));
+        out.push_str(&format!(
+            "        levels: {},\n",
+            render_string_slice(&method.levels)
+        ));
+        out.push_str(&format!(
+            "        payloads: {},\n",
+            render_string_slice(&method.payloads)
+        ));
+        let event_family = method
+            .event_family
+            .as_ref()
+            .map(|value| format!("Some(\"{}\")", rust_escape(value)))
+            .unwrap_or_else(|| "None".to_string());
+        out.push_str(&format!("        event_family: {event_family},\n"));
+        out.push_str(&format!(
+            "        producer_allowed: {},\n",
+            method.producer_allowed
+        ));
+        out.push_str("    },\n");
+    }
+    out.push_str("];\n\n");
+
+    out.push_str("#[derive(Copy, Clone, Debug, Eq, PartialEq)]\n");
+    out.push_str("pub struct ProducerBoundaryRuleCatalog {\n");
+    out.push_str("    pub name: &'static str,\n");
+    out.push_str("    pub replacement: &'static str,\n");
+    out.push_str("    pub needles: &'static [&'static str],\n");
+    out.push_str("}\n\n");
+    out.push_str("pub const PRODUCER_BOUNDARY_RULES: &[ProducerBoundaryRuleCatalog] = &[\n");
+    for rule in &kernel.producer_boundary_rules {
+        out.push_str("    ProducerBoundaryRuleCatalog {\n");
+        out.push_str(&format!("        name: \"{}\",\n", rust_escape(&rule.name)));
+        out.push_str(&format!(
+            "        replacement: \"{}\",\n",
+            rust_escape(&rule.replacement)
+        ));
+        out.push_str(&format!(
+            "        needles: {},\n",
+            render_string_slice(&rule.needles)
+        ));
+        out.push_str("    },\n");
+    }
+    out.push_str("];\n");
+    Ok(out)
+}
+
+fn render_string_slice(values: &[String]) -> String {
+    if values.is_empty() {
+        return "&[]".to_string();
+    }
+    let inline_items = values
+        .iter()
+        .map(|value| format!("\"{}\"", rust_escape(value)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let inline = format!("&[{inline_items}]");
+    if inline.len() <= 72 {
+        return inline;
+    }
+    if values.iter().all(|value| value.len() <= 16) {
+        return format!("&[\n            {inline_items},\n        ]");
+    }
+    let mut out = String::from("&[\n");
+    for value in values {
+        out.push_str(&format!("            \"{}\",\n", rust_escape(value)));
+    }
+    out.push_str("        ]");
+    out
+}
+
+fn rust_escape(value: &str) -> String {
+    value.escape_default().collect()
 }
 
 fn name_matches_pattern(name: &str, pattern: &str) -> bool {
@@ -1050,7 +1371,8 @@ NAME_SQL_SCHEMA = []
                 minimal_types_lib_rs(),
                 cargo_toml,
                 analyzer_py,
-                minimal_perfetto_writer()
+                minimal_perfetto_writer(),
+                minimal_hart_emitter_rs()
             )
             .unwrap(),
             CheckReport {
@@ -1061,6 +1383,7 @@ NAME_SQL_SCHEMA = []
                 cfgs: 1,
                 projections: 2,
                 tracks: 0,
+                hart_emitter_methods: 0,
             }
         );
     }
@@ -1110,6 +1433,7 @@ pub enum TxTraceLevel { Boundary = 0 }
             cargo_toml,
             analyzer_py,
             minimal_perfetto_writer(),
+            minimal_hart_emitter_rs(),
         )
         .unwrap_err();
         assert!(
@@ -1174,6 +1498,7 @@ NAME_SQL_SCHEMA = []
             cargo_toml,
             analyzer_py,
             minimal_perfetto_writer(),
+            minimal_hart_emitter_rs(),
         )
         .unwrap_err();
         assert!(
@@ -1240,6 +1565,7 @@ NAME_SQL_SCHEMA = []
             cargo_toml,
             analyzer_py,
             minimal_perfetto_writer(),
+            minimal_hart_emitter_rs(),
         )
         .unwrap_err();
         assert!(
@@ -1310,6 +1636,7 @@ NAME_SQL_SCHEMA = []
             cargo_toml,
             analyzer_py,
             minimal_perfetto_writer(),
+            minimal_hart_emitter_rs(),
         )
         .unwrap_err();
         assert!(
@@ -1375,6 +1702,7 @@ pub struct PayloadCounterValue {
             cargo_toml,
             analyzer_py,
             minimal_perfetto_writer(),
+            minimal_hart_emitter_rs(),
         )
         .unwrap_err();
         assert!(
@@ -1450,6 +1778,7 @@ fn explicit_track_descriptor(track_id: u64) -> Option<(&'static str, u8)> {
             cargo_toml,
             analyzer_py,
             perfetto_writer,
+            minimal_hart_emitter_rs(),
         )
         .unwrap_err();
         assert!(
@@ -1458,11 +1787,128 @@ fn explicit_track_descriptor(track_id: u64) -> Option<(&'static str, u8)> {
         );
     }
 
+    #[test]
+    fn check_schema_text_rejects_missing_hart_emitter_method() {
+        let schema = r#"
+[schema]
+id = "txobserve"
+version = 0
+
+[[abi.levels]]
+rust = "TxTraceLevel::Boundary"
+value = 0
+
+[[abi.record_kinds]]
+rust = "TxTraceKind::Counter"
+value = 13
+
+[[payloads]]
+id = "counter_value"
+rust_tag = "TxPayloadTag::CounterValue"
+tag = 31
+
+[[controls.cfgs]]
+name = "tx_lock_metrics"
+
+[[host.projections]]
+id = "records"
+kind = "sql_view"
+columns = []
+
+[[kernel.hart_emitter_methods]]
+name = "debug_counter"
+surface = "typed_producer"
+record_kind = "counter"
+levels = ["boundary"]
+payloads = ["counter_value"]
+event_family = "counter"
+producer_allowed = true
+"#;
+        let record_rs = r#"
+pub enum TxTraceKind { Counter = 13 }
+pub enum TxTraceLevel { Boundary = 0 }
+"#;
+        let payload_rs = r#"pub enum TxPayloadTag { CounterValue = 31 }"#;
+        let cargo_toml =
+            "[workspace.lints.rust]\nunexpected_cfgs = { check-cfg = ['cfg(tx_lock_metrics)'] }";
+        let analyzer_py = "PARQUET_SCHEMAS = {}\nRECORD_SQL_SCHEMA = []\nREPAIR_SQL_SCHEMA = []\nNAME_SQL_SCHEMA = []";
+        let tx_observe_lib_rs = r#"
+pub struct HartEmitter;
+impl HartEmitter {
+    pub fn counter(&self) {}
+}
+"#;
+
+        let err = check_schema_text(
+            schema,
+            record_rs,
+            payload_rs,
+            minimal_types_lib_rs(),
+            cargo_toml,
+            analyzer_py,
+            minimal_perfetto_writer(),
+            tx_observe_lib_rs,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("HartEmitter method mismatch") && err.contains("debug_counter"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn render_schema_catalog_lists_hart_emitter_methods() {
+        let schema = r#"
+[schema]
+id = "txobserve"
+version = 0
+
+[[abi.levels]]
+rust = "TxTraceLevel::Boundary"
+value = 0
+
+[[abi.record_kinds]]
+rust = "TxTraceKind::Counter"
+value = 13
+
+[[payloads]]
+id = "counter_value"
+rust_tag = "TxPayloadTag::CounterValue"
+tag = 31
+
+[[controls.cfgs]]
+name = "tx_lock_metrics"
+
+[[host.projections]]
+id = "records"
+kind = "sql_view"
+columns = []
+
+[[kernel.hart_emitter_methods]]
+name = "debug_counter"
+surface = "typed_producer"
+record_kind = "counter"
+levels = ["boundary"]
+payloads = ["counter_value"]
+event_family = "counter"
+producer_allowed = true
+"#;
+        let schema: ObserveSchema = toml::from_str(schema).expect("parse schema");
+        let catalog = render_schema_catalog(&schema).expect("render catalog");
+        assert!(catalog.contains("pub const HART_EMITTER_METHODS"));
+        assert!(catalog.contains("name: \"debug_counter\""));
+        assert!(catalog.contains("producer_allowed: true"));
+    }
+
     fn minimal_types_lib_rs() -> &'static str {
         ""
     }
 
     fn minimal_perfetto_writer() -> &'static str {
         "fn explicit_track_descriptor(track_id: u64) -> Option<(&'static str, u8)> { None }"
+    }
+
+    fn minimal_hart_emitter_rs() -> &'static str {
+        "pub struct HartEmitter;\nimpl HartEmitter {}"
     }
 }
