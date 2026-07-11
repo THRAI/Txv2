@@ -16,6 +16,7 @@ mod lint_invariants_checks;
 mod lint_invariants_cred_check;
 mod lint_invariants_drive;
 mod lint_invariants_notification;
+mod lint_invariants_observe;
 mod lint_invariants_script;
 mod lint_invariants_signal;
 mod lint_invariants_step;
@@ -28,6 +29,7 @@ mod lint_invariants_witness;
 mod lint_step_guard;
 mod observe;
 mod observe_discipline;
+mod observe_schema;
 mod oscomp;
 mod progress;
 mod qemu;
@@ -80,6 +82,7 @@ pub fn run() -> Result<()> {
         "boundary-report" => boundary_report::boundary_report(&root, args.collect()),
         "unit" => unit::unit(&root),
         "observe" => observe::observe(&root, args.collect()),
+        "observe-schema" => observe_schema::observe_schema(&root, args.collect()),
         "observe-discipline" => observe_discipline::observe_discipline(&root),
         "syscall-status" => syscall_status::syscall_status(&root, args.collect()),
         "-h" | "--help" | "help" => {
@@ -123,6 +126,7 @@ fn print_usage() {
            cargo xtask progress close plan|handoff|worktree --id ID --status STATUS\n\
            cargo xtask lint arch|docs|unused|boundary|invariants [rule|all]|kernel-user-layouts|syscall-status\n\
            cargo xtask boundary-report [--top N] [--json]\n\
+           cargo xtask observe-schema check [--schema schema/txobserve.toml]\n\
            cargo xtask syscall-status [<NAME>...] [--regen|--check|--list-missing]\n\
            cargo xtask unit\n"
     );

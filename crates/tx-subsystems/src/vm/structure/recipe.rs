@@ -1617,10 +1617,7 @@ fn stats_delta_between(before: &RecipeTree, after: &RecipeTree) -> AddressSpaceS
 
 fn emit_vm_recipe_trace(name: &[u8], value: i64) {
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            value,
-        );
+        observer.debug_counter(name, value);
     }
 }
 
@@ -1658,10 +1655,7 @@ fn emit_recipe_phase_count(name: &[u8], value: u64) {
         return;
     }
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            value as i64,
-        );
+        observer.debug_counter(name, value as i64);
     }
 }
 
@@ -1669,7 +1663,7 @@ fn emit_vm_recipe_allocation(name: &[u8], value: u64) {
     if let Some(observer) = tx_observe::current() {
         observer.allocation(
             tx_observe::AllocationTrack::VmRecipeNode,
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            tx_observe::EventNameId::from_name(name),
             value,
         );
     }

@@ -2087,10 +2087,7 @@ async fn sys_write_buffered<'a>(
 
 fn emit_debug_counter(name: &[u8], value: i64) {
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            value,
-        );
+        observer.debug_counter(name, value);
         tx_observe::dump_registered_if_requested();
     }
 }

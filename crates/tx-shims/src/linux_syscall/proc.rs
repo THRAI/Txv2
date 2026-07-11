@@ -95,10 +95,7 @@ fn emit_clone_marker(name: &[u8]) {
         return;
     }
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            NR_CLONE as i64,
-        );
+        observer.debug_counter(name, NR_CLONE as i64);
         tx_observe::dump_registered_if_requested();
     }
 }
@@ -130,10 +127,7 @@ fn emit_clone_path_count(name: &[u8], value: u64) {
         return;
     }
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            value as i64,
-        );
+        observer.debug_counter(name, value as i64);
     }
 }
 

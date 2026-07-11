@@ -523,23 +523,7 @@ fn emit_phase_span_begin(
     hart_id: u8,
 ) -> tx_observe::SpanId {
     if let Some(em) = tx_observe::current() {
-        use tx_observe::encode::{encode_phase_transition, phase_transition_tag};
-        use tx_observe::{EventNameId, TxTraceLevel};
-        use tx_observe_types::PayloadPhaseTransition;
-
-        let p = PayloadPhaseTransition {
-            phase_kind: phase_kind as u8,
-            hart_id,
-            _pad: [0u8; 14],
-        };
-        let (payload_bytes, _) = encode_phase_transition(&p);
-        em.span_begin(
-            TxTraceLevel::Phase,
-            EventNameId::from_raw(phase_kind as u32),
-            tx_observe::SpanId::NONE,
-            phase_transition_tag(),
-            &payload_bytes,
-        )
+        em.phase_begin(phase_kind as u8, hart_id)
     } else {
         tx_observe::SpanId::NONE
     }
@@ -553,7 +537,6 @@ fn emit_phase_span_end(span: tx_observe::SpanId) {
         return;
     }
     if let Some(em) = tx_observe::current() {
-        use tx_observe_types::TxPayloadTag;
-        em.span_end(span, TxPayloadTag::None, &[]);
+        em.phase_end(span);
     }
 }

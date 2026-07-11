@@ -209,10 +209,7 @@ fn emit_wake_debug(name: &[u8], task: TaskId, value: i64) {
         return;
     }
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            ((task.0 as i64) << 8) | value,
-        );
+        observer.debug_counter(name, ((task.0 as i64) << 8) | value);
         tx_observe::dump_registered_if_requested();
     }
 }
@@ -222,10 +219,7 @@ fn emit_submit_debug(name: &[u8], task: TaskId) {
         return;
     }
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            task.0 as i64,
-        );
+        observer.debug_counter(name, task.0 as i64);
         tx_observe::dump_registered_if_requested();
     }
 }
@@ -235,10 +229,7 @@ fn emit_poll_task_debug(name: &[u8], task: TaskId) {
         return;
     }
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            task.0 as i64,
-        );
+        observer.debug_counter(name, task.0 as i64);
         tx_observe::dump_registered_if_requested();
     }
 }
@@ -249,10 +240,8 @@ fn emit_poll_duration_debug(task: TaskId, consumed_ns: u64) {
     }
     if let Some(observer) = tx_observe::current() {
         let consumed_us = (consumed_ns / 1_000).min(u32::MAX as u64) as i64;
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(
-                b"debug.reactor.poll.consumed_us",
-            )),
+        observer.debug_counter(
+            b"debug.reactor.poll.consumed_us",
             ((task.0 as i64) << 32) | consumed_us,
         );
         tx_observe::dump_registered_if_requested();

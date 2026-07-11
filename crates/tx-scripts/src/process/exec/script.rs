@@ -108,28 +108,7 @@ fn emit_process_label_for(pid_low: u32, comm: &[u8; 16]) {
     let Some(em) = tx_observe::current() else {
         return;
     };
-    let mut truncated = [0u8; 12];
-    let n = core::cmp::min(comm.len(), truncated.len());
-    truncated[..n].copy_from_slice(&comm[..n]);
-    if !truncated.contains(&0) {
-        truncated[truncated.len() - 1] = 0;
-    }
-    let payload = tx_observe::PayloadProcessLabel {
-        process_id_low: pid_low,
-        comm: truncated,
-    };
-    let (enc, len) = tx_observe::encode::encode_process_label(&payload);
-    em.instant(
-        tx_observe::TxTraceLevel::Sched,
-        // Same `0x9000_0000 | pid` namespace as
-        // `tx-kernel::init::emit_process_label` so the daemon's
-        // dedupe sees both submit-time and post-exec re-emits as the
-        // same logical event.
-        tx_observe::EventNameId::from_raw(0x9000_0000 | pid_low),
-        tx_observe::current_parent_span(),
-        tx_observe::encode::process_label_tag(),
-        &enc[..len as usize],
-    );
+    em.process_label(tx_observe::current_parent_span(), pid_low, comm);
 }
 
 /// Companion to [`emit_process_label_for`] — emits the OBS-V1 §15.8
@@ -143,21 +122,11 @@ fn emit_process_group_for(pid_low: u32, pgid_low: u32, sid_low: u32) {
     let Some(em) = tx_observe::current() else {
         return;
     };
-    let payload = tx_observe::PayloadProcessGroup {
-        process_id_low: pid_low,
+    em.process_group(
+        tx_observe::current_parent_span(),
+        pid_low,
         pgid_low,
         sid_low,
-        _pad: 0,
-    };
-    let (enc, len) = tx_observe::encode::encode_process_group(&payload);
-    em.instant(
-        tx_observe::TxTraceLevel::Sched,
-        // Same `0xA000_0000 | pid` namespace as
-        // `tx-kernel::init::emit_process_group`.
-        tx_observe::EventNameId::from_raw(0xA000_0000 | pid_low),
-        tx_observe::current_parent_span(),
-        tx_observe::encode::process_group_tag(),
-        &enc[..len as usize],
     );
 }
 

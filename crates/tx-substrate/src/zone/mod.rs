@@ -55,9 +55,7 @@ macro_rules! measure_zone {
         {
             crate::ds_metrics::measure_for_zone(
                 $method_name,
-                tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(
-                    core::any::type_name::<$zone_ty>().as_bytes(),
-                )),
+                tx_observe::EventNameId::from_name(core::any::type_name::<$zone_ty>().as_bytes()),
                 || $body,
             )
         }

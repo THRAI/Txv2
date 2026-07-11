@@ -38,15 +38,7 @@ use crate::adapter::wake::{
 };
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicBool, Ordering};
-use tx_observe::encode::{
-    drive_begin_tag, drive_end_tag, encode_drive_begin, encode_drive_end, encode_resume,
-    encode_step_outcome, encode_yield_begin, resume_tag, step_outcome_tag, yield_begin_tag,
-};
-use tx_observe::{EventNameId, HartEmitter, SpanId, TxTraceLevel};
-use tx_observe_types::{
-    PayloadDriveBegin, PayloadDriveEnd, PayloadResume, PayloadStepOutcome, PayloadYieldBegin,
-    TxPayloadTag,
-};
+use tx_observe::{EventNameId, HartEmitter, SpanId};
 
 /// Central `StepOp` driver.
 ///
@@ -252,24 +244,9 @@ where
         DriveMode::Selecting => 2,
     };
     let name = op_name_id::<S>();
-    let payload = PayloadDriveBegin {
-        op_type: name.raw(),
-        mode: mode_wire,
-        // Interrupt policy is not yet plumbed through the drive signature;
-        // default to Interruptible (1) per the spec's MVP scope.
-        interrupt: 1,
-        has_deadline: has_deadline as u8,
-        _pad: 0,
-        task_id_low,
-    };
-    let (enc, len) = encode_drive_begin(&payload);
-    em.span_begin(
-        TxTraceLevel::Drive,
-        name,
-        parent,
-        drive_begin_tag(),
-        &enc[..len as usize],
-    )
+    // Interrupt policy is not yet plumbed through the drive signature; default
+    // to Interruptible (1) per the spec's MVP scope.
+    em.drive_begin(name, mode_wire, 1, has_deadline, task_id_low, parent)
 }
 
 /// Stable `EventNameId` for a [`StepOp`] type without requiring `'static`.
@@ -281,23 +258,8 @@ where
 /// human name from a build-emitted `names.json` per OBS-V1-OPNAME.
 #[inline]
 fn op_name_id<S: ?Sized>() -> EventNameId {
-    EventNameId::from_raw(tx_observe::fnv1a32(core::any::type_name::<S>().as_bytes()))
+    EventNameId::from_name(core::any::type_name::<S>().as_bytes())
 }
-
-// Stable event names for the records that have no per-instance
-// discriminant. Computed at compile time via `tx_observe::fnv1a32` so the
-// trace carries the hash and the host-side `names.json` carries the
-// string. Reuses the same FNV-1a 32 hash that `op_name_id::<S>()` uses
-// for drive-level type-name hashes — single hash space for every
-// `EventNameId` source so any name collision is visible at the daemon.
-const RESUME_NAME: EventNameId = EventNameId::from_raw(tx_observe::fnv1a32(b"resume"));
-const STEP_NAME: EventNameId = EventNameId::from_raw(tx_observe::fnv1a32(b"step"));
-const YIELD_ON_WAIT_SOURCE_NAME: EventNameId =
-    EventNameId::from_raw(tx_observe::fnv1a32(b"yield.OnWaitSource"));
-const YIELD_ON_AGENT_NAME: EventNameId =
-    EventNameId::from_raw(tx_observe::fnv1a32(b"yield.OnAgent"));
-const YIELD_ON_TIMER_NAME: EventNameId =
-    EventNameId::from_raw(tx_observe::fnv1a32(b"yield.OnTimer"));
 
 #[inline]
 fn emit_step_begin(_iteration: u32, parent: SpanId) -> SpanId {
@@ -312,13 +274,7 @@ fn emit_step_begin(_iteration: u32, parent: SpanId) -> SpanId {
     let Some(em) = tx_observe::current() else {
         return SpanId::NONE;
     };
-    em.span_begin(
-        TxTraceLevel::Step,
-        STEP_NAME,
-        parent,
-        TxPayloadTag::None,
-        &[],
-    )
+    em.step_begin(parent)
 }
 
 #[inline]
@@ -332,17 +288,15 @@ fn emit_step_end<P: StepProgress>(
     let Some(em) = current_if_active(step_span) else {
         return;
     };
-    let payload = PayloadStepOutcome {
+    em.step_end(
+        step_span,
         variant,
-        progress_empty: progress.is_empty() as u8,
-        progress_kind: progress.trace_kind(),
+        progress.is_empty(),
+        progress.trace_kind(),
         shape_kind,
         errno,
-        progress_value: progress.trace_value(),
-        _pad: 0,
-    };
-    let (enc, len) = encode_step_outcome(&payload);
-    em.span_end(step_span, step_outcome_tag(), &enc[..len as usize]);
+        progress.trace_value(),
+    );
 }
 
 #[inline]
@@ -350,29 +304,10 @@ fn emit_yield_begin(drive_span: SpanId, task_id_low: u32, shape_kind: u8) -> Spa
     let Some(em) = tx_observe::current() else {
         return SpanId::NONE;
     };
-    let payload = PayloadYieldBegin {
-        shape_kind,
-        _pad: [0; 3],
-        task_id_low,
-        // `wait_generation` is populated once reactor parking writes it
-        // to the mailbox; OBS-3b-followup will replace 0 with the real
-        // generation pulled from the resume path.
-        wait_generation: 0,
-    };
-    let (enc, len) = encode_yield_begin(&payload);
-    let name = match shape_kind {
-        1 => YIELD_ON_WAIT_SOURCE_NAME,
-        2 => YIELD_ON_AGENT_NAME,
-        3 => YIELD_ON_TIMER_NAME,
-        _ => YIELD_ON_WAIT_SOURCE_NAME,
-    };
-    em.span_begin(
-        TxTraceLevel::Yield,
-        name,
-        drive_span,
-        yield_begin_tag(),
-        &enc[..len as usize],
-    )
+    // `wait_generation` is populated once reactor parking writes it to the
+    // mailbox; OBS-3b-followup will replace 0 with the real generation pulled
+    // from the resume path.
+    em.yield_begin(drive_span, shape_kind, task_id_low, 0)
 }
 
 #[inline]
@@ -381,26 +316,11 @@ fn emit_resume_end(yield_span: SpanId, resume: &ResumeOutcome, wait_gen: u64) {
         return;
     };
     let (resume_kind, abort_reason) = resume_wire_fields(resume);
-    let payload = PayloadResume {
-        resume_kind,
-        abort_reason,
-        _pad: [0; 2],
-        object_id_low: 0,
-        // `wait_gen` is the `WaitGeneration::raw()` minted by
-        // `resolve_yield`; matches `PayloadWaitSourceNotify.wait_generation_low`
-        // on the producer side so the daemon's flow-id hash matches
-        // both ends.
-        wait_generation: wait_gen,
-    };
-    let (enc, len) = encode_resume(&payload);
-    em.instant(
-        TxTraceLevel::Yield,
-        RESUME_NAME,
-        yield_span,
-        resume_tag(),
-        &enc[..len as usize],
-    );
-    em.span_end(yield_span, TxPayloadTag::None, &[]);
+    // `wait_gen` is the `WaitGeneration::raw()` minted by `resolve_yield`;
+    // matches `PayloadWaitSourceNotify.wait_generation_low` on the producer
+    // side so the daemon's flow-id hash matches both ends.
+    em.resume(yield_span, resume_kind, abort_reason, 0, wait_gen);
+    em.span_end_empty(yield_span);
 }
 
 #[inline]
@@ -412,14 +332,7 @@ fn emit_drive_end<T>(drive_span: SpanId, result: &Result<T, Errno>) {
         Ok(_) => (0i32, 0u8),
         Err(e) => (e.linux_i32(), 1u8),
     };
-    let payload = PayloadDriveEnd {
-        ret: 0,
-        errno,
-        result_kind,
-        _pad: [0; 3],
-    };
-    let (enc, len) = encode_drive_end(&payload);
-    em.span_end(drive_span, drive_end_tag(), &enc[..len as usize]);
+    em.drive_end(drive_span, 0, errno, result_kind);
 }
 
 /// Returns `Some(emitter)` only when the span was successfully opened.

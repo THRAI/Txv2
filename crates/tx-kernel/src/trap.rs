@@ -322,10 +322,7 @@ fn emit_debug_counter(name: &[u8], value: i64) {
         return;
     }
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            value,
-        );
+        observer.debug_counter(name, value);
         tx_observe::dump_registered_if_requested();
     }
 }
@@ -351,10 +348,7 @@ fn emit_direct_sigprocmask_detail_duration(nr: u64, name: &[u8], start_ns: u64) 
     }
     if let Some(observer) = tx_observe::current() {
         let dur = tx_observe::clock_now_ns().saturating_sub(start_ns);
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            dur.min(i64::MAX as u64) as i64,
-        );
+        observer.debug_counter(name, dur.min(i64::MAX as u64) as i64);
         tx_observe::dump_registered_if_requested();
     }
 }
@@ -368,10 +362,7 @@ fn emit_direct_sigprocmask_detail_value(nr: u64, name: &[u8], value: i64) {
         return;
     }
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            value,
-        );
+        observer.debug_counter(name, value);
         tx_observe::dump_registered_if_requested();
     }
 }

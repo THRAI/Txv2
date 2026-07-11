@@ -61,6 +61,7 @@ class WorkflowLayout:
     submit: Path
     build_dir: Path
     serial: Path
+    test_initrd: Path
     names: Path
     rawrecords: Path
     analysis_dir: Path
@@ -188,6 +189,7 @@ def build_layout(root: Path, name: str, output_dir: Path | None = None) -> Workf
         submit=base / "submit",
         build_dir=base / "build",
         serial=base / "serial.txt",
+        test_initrd=root / "target/images/test-init-initramfs-rv64-qemu.cpio",
         names=base / "names.json",
         rawrecords=host_dir / "trace.rawrecords",
         analysis_dir=analysis_dir,
@@ -199,7 +201,7 @@ def build_layout(root: Path, name: str, output_dir: Path | None = None) -> Workf
 
 
 def qemu_command(layout: WorkflowLayout, args: WorkflowArgs) -> list[str]:
-    cmdline = "tx.oscomp.observe=0 tx.oscomp.observe_live_drain=1 tx.oscomp.groups=libcbench-musl"
+    cmdline = "tx.boot.mode=oscomp init=/tx-test-init tx.test_init=1 tx.oscomp.observe=0 tx.oscomp.observe_live_drain=1 tx.oscomp.groups=libcbench-musl"
     return [
         "qemu-system-riscv64",
         "-object",
@@ -228,6 +230,8 @@ def qemu_command(layout: WorkflowLayout, args: WorkflowArgs) -> list[str]:
         "base=utc",
         "-serial",
         f"file:{layout.serial}",
+        "-initrd",
+        str(layout.test_initrd),
         "-append",
         cmdline,
     ]
@@ -294,6 +298,10 @@ def build_plan(root: Path, args: WorkflowArgs, layout: WorkflowLayout) -> Workfl
                 ],
             ),
             PlannedCommand("truncate-guest-mem", ["truncate", "-s", args.ram_size, str(layout.guest_mem)]),
+            PlannedCommand(
+                "test-initramfs",
+                ["cargo", "xtask", "image", "test-init", "--profile", "busybox", "--target", "rv64-qemu"],
+            ),
             PlannedCommand("qemu", qemu_command(layout, args)),
             PlannedCommand(
                 "live-drain",

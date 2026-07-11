@@ -1743,10 +1743,7 @@ impl<P: TxPlatform> CoreInit<P> {
 
     fn emit_ap_observe_marker(cpu_id: CpuId) {
         if let Some(observer) = tx_observe::current() {
-            observer.counter(
-                tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(b"debug.observe.ap.init")),
-                cpu_id.0 as i64,
-            );
+            observer.debug_counter(b"debug.observe.ap.init", cpu_id.0 as i64);
         }
     }
 

@@ -61,10 +61,7 @@ fn emit_clone_path_count(name: &[u8], value: u64) {
         return;
     }
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            value as i64,
-        );
+        observer.debug_counter(name, value as i64);
     }
 }
 
@@ -364,10 +361,7 @@ fn emit_child_submit_marker(name: &str, value: i64) {
         return;
     }
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name.as_bytes())),
-            value,
-        );
+        observer.debug_counter(name.as_bytes(), value);
         tx_observe::dump_registered_if_requested();
     }
 }

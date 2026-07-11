@@ -39,10 +39,7 @@ const SLOW_CAP_UPGRADE_NS: u64 = 100_000;
 fn emit_cap_upgrade_trace(name: &'static [u8], value: i64) {
     debug_assert!(CAP_UPGRADE_TRACE_NAMES.contains(&name));
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            value,
-        );
+        observer.debug_counter(name, value);
     }
 }
 

@@ -32,10 +32,12 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use tx_hal::{ConsoleIf, CpuId, ObserverIf, PercpuIf, PowerIf, TimeIf};
+use tx_hal::{ConsoleIf, CpuId, MonotonicCounterIf, ObserverIf, PercpuIf, PowerIf};
 use tx_observe_types::{
-    PayloadArgValue, PayloadCounterValue, TxPayloadTag, TxTraceHartRing, TxTraceKind,
-    TxTraceRecord, TxValueKind,
+    PayloadArgValue, PayloadCounterValue, PayloadDriveBegin, PayloadDriveEnd,
+    PayloadMutationIndexCommit, PayloadMutationZoneSign, PayloadPhaseTransition, PayloadResume,
+    PayloadStepOutcome, PayloadWaitSourceNotify, PayloadYieldBegin, TxPayloadTag, TxTraceHartRing,
+    TxTraceKind, TxTraceRecord, TxValueKind,
 };
 // TxTraceLevel is imported via pub use below so the same name is available
 // both inside this module and as a macro-accessible re-export.
@@ -187,6 +189,12 @@ impl EventNameId {
     #[inline]
     pub const fn from_raw(v: u32) -> Self {
         Self(v)
+    }
+
+    /// Derive an event name id from a stable byte-string name.
+    #[inline]
+    pub const fn from_name(name: &[u8]) -> Self {
+        Self(fnv1a32(name))
     }
 
     /// Raw inner value for wire records.
@@ -403,6 +411,11 @@ impl HartEmitter {
         );
     }
 
+    /// Emit a payload-less `SpanEnd` record closing `span`.
+    pub fn span_end_empty(&self, span: SpanId) {
+        self.span_end(span, TxPayloadTag::None, &[]);
+    }
+
     // -----------------------------------------------------------------------
     // Instant
     // -----------------------------------------------------------------------
@@ -467,6 +480,316 @@ impl HartEmitter {
         );
     }
 
+    /// Emit a debug counter by stable byte-string name.
+    pub fn debug_counter(&self, name: &[u8], value: i64) {
+        self.counter(EventNameId::from_raw(fnv1a32(name)), value);
+    }
+
+    /// Emit an L0 syscall boundary begin span plus raw register arguments.
+    pub fn syscall_enter(&self, sysno: u32, abi: u16, args: &[u64]) -> SpanId {
+        let argc = args.len().min(6) as u16;
+        let payload = PayloadSyscallEnter { sysno, abi, argc };
+        let (payload_bytes, payload_len) = encode::encode_syscall_enter(&payload);
+        let syscall_span = self.span_begin(
+            TxTraceLevel::Boundary,
+            EventNameId::from_raw(sysno),
+            SpanId::NONE,
+            encode::syscall_enter_tag(),
+            &payload_bytes[..payload_len as usize],
+        );
+
+        if syscall_span != SpanId::NONE {
+            for (i, &raw) in args.iter().enumerate().take(argc as usize) {
+                let arg_name: &[u8] = match i {
+                    0 => b"a0",
+                    1 => b"a1",
+                    2 => b"a2",
+                    3 => b"a3",
+                    4 => b"a4",
+                    _ => b"a5",
+                };
+                let key = fnv1a32(arg_name);
+                let payload = PayloadArgValue {
+                    key,
+                    value_kind: TxValueKind::U64 as u8,
+                    _pad: [0; 3],
+                    value0: raw,
+                };
+                let (payload_bytes, payload_len) = encode::encode_arg_value(&payload);
+                self.instant(
+                    TxTraceLevel::Boundary,
+                    EventNameId::from_raw(key),
+                    syscall_span,
+                    encode::arg_value_tag(),
+                    &payload_bytes[..payload_len as usize],
+                );
+            }
+        }
+
+        syscall_span
+    }
+
+    /// Emit an L0 syscall boundary end span close.
+    pub fn syscall_exit(&self, syscall_span: SpanId, ret: i64, errno: i32, result_kind: u8) {
+        let payload = PayloadSyscallExit {
+            ret,
+            errno,
+            result_kind,
+            _pad: [0; 3],
+        };
+        let (payload_bytes, payload_len) = encode::encode_syscall_exit(&payload);
+        self.span_end(
+            syscall_span,
+            encode::syscall_exit_tag(),
+            &payload_bytes[..payload_len as usize],
+        );
+    }
+
+    /// Emit an L2 drive-loop begin span.
+    pub fn drive_begin(
+        &self,
+        op_name: EventNameId,
+        mode: u8,
+        interrupt: u8,
+        has_deadline: bool,
+        task_id_low: u32,
+        parent: SpanId,
+    ) -> SpanId {
+        let payload = PayloadDriveBegin {
+            op_type: op_name.raw(),
+            mode,
+            interrupt,
+            has_deadline: has_deadline as u8,
+            _pad: 0,
+            task_id_low,
+        };
+        let (payload_bytes, payload_len) = encode::encode_drive_begin(&payload);
+        self.span_begin(
+            TxTraceLevel::Drive,
+            op_name,
+            parent,
+            encode::drive_begin_tag(),
+            &payload_bytes[..payload_len as usize],
+        )
+    }
+
+    /// Emit an L2 drive-loop end span close.
+    pub fn drive_end(&self, drive_span: SpanId, ret: i64, errno: i32, result_kind: u8) {
+        let payload = PayloadDriveEnd {
+            ret,
+            errno,
+            result_kind,
+            _pad: [0; 3],
+        };
+        let (payload_bytes, payload_len) = encode::encode_drive_end(&payload);
+        self.span_end(
+            drive_span,
+            encode::drive_end_tag(),
+            &payload_bytes[..payload_len as usize],
+        );
+    }
+
+    /// Emit an L4 step iteration begin span.
+    pub fn step_begin(&self, parent: SpanId) -> SpanId {
+        const STEP_NAME: EventNameId = EventNameId::from_raw(fnv1a32(b"step"));
+        self.span_begin(
+            TxTraceLevel::Step,
+            STEP_NAME,
+            parent,
+            TxPayloadTag::None,
+            &[],
+        )
+    }
+
+    /// Emit an L4 step outcome span close.
+    pub fn step_end(
+        &self,
+        step_span: SpanId,
+        variant: u8,
+        progress_empty: bool,
+        progress_kind: u8,
+        shape_kind: u8,
+        errno: i32,
+        progress_value: u32,
+    ) {
+        let payload = PayloadStepOutcome {
+            variant,
+            progress_empty: progress_empty as u8,
+            progress_kind,
+            shape_kind,
+            errno,
+            progress_value,
+            _pad: 0,
+        };
+        let (payload_bytes, payload_len) = encode::encode_step_outcome(&payload);
+        self.span_end(
+            step_span,
+            encode::step_outcome_tag(),
+            &payload_bytes[..payload_len as usize],
+        );
+    }
+
+    /// Emit an L3 yield begin span.
+    pub fn yield_begin(
+        &self,
+        drive_span: SpanId,
+        shape_kind: u8,
+        task_id_low: u32,
+        wait_generation: u64,
+    ) -> SpanId {
+        const YIELD_ON_WAIT_SOURCE_NAME: EventNameId =
+            EventNameId::from_raw(fnv1a32(b"yield.OnWaitSource"));
+        const YIELD_ON_AGENT_NAME: EventNameId = EventNameId::from_raw(fnv1a32(b"yield.OnAgent"));
+        const YIELD_ON_TIMER_NAME: EventNameId = EventNameId::from_raw(fnv1a32(b"yield.OnTimer"));
+
+        let payload = PayloadYieldBegin {
+            shape_kind,
+            _pad: [0; 3],
+            task_id_low,
+            wait_generation,
+        };
+        let (payload_bytes, payload_len) = encode::encode_yield_begin(&payload);
+        let name = match shape_kind {
+            1 => YIELD_ON_WAIT_SOURCE_NAME,
+            2 => YIELD_ON_AGENT_NAME,
+            3 => YIELD_ON_TIMER_NAME,
+            _ => YIELD_ON_WAIT_SOURCE_NAME,
+        };
+        self.span_begin(
+            TxTraceLevel::Yield,
+            name,
+            drive_span,
+            encode::yield_begin_tag(),
+            &payload_bytes[..payload_len as usize],
+        )
+    }
+
+    /// Emit an L3 resume instant attached to an open yield span.
+    pub fn resume(
+        &self,
+        yield_span: SpanId,
+        resume_kind: u8,
+        abort_reason: u8,
+        object_id_low: u32,
+        wait_generation: u64,
+    ) {
+        const RESUME_NAME: EventNameId = EventNameId::from_raw(fnv1a32(b"resume"));
+        let payload = PayloadResume {
+            resume_kind,
+            abort_reason,
+            _pad: [0; 2],
+            object_id_low,
+            wait_generation,
+        };
+        let (payload_bytes, payload_len) = encode::encode_resume(&payload);
+        self.instant(
+            TxTraceLevel::Yield,
+            RESUME_NAME,
+            yield_span,
+            encode::resume_tag(),
+            &payload_bytes[..payload_len as usize],
+        );
+    }
+
+    /// Emit an L5 boot/substrate phase begin span.
+    pub fn phase_begin(&self, phase_kind: u8, hart_id: u8) -> SpanId {
+        let payload = PayloadPhaseTransition {
+            phase_kind,
+            hart_id,
+            _pad: [0; 14],
+        };
+        let (payload_bytes, payload_len) = encode::encode_phase_transition(&payload);
+        self.span_begin(
+            TxTraceLevel::Phase,
+            EventNameId::from_raw(phase_kind as u32),
+            SpanId::NONE,
+            encode::phase_transition_tag(),
+            &payload_bytes[..payload_len as usize],
+        )
+    }
+
+    /// Emit an L5 boot/substrate phase end span close.
+    pub fn phase_end(&self, phase_span: SpanId) {
+        self.span_end_empty(phase_span);
+    }
+
+    /// Emit an L6 zone-sign mutation instant.
+    pub fn mutation_zone_sign(&self, object_id: u64, kind: u8) {
+        const MUTATION_ZONE_SIGN_NAME: EventNameId = EventNameId::from_raw(0x4d5a5347);
+        let payload = PayloadMutationZoneSign {
+            object_id,
+            kind,
+            _pad: [0; 7],
+        };
+        let (payload_bytes, payload_len) = encode::encode_mutation_zone_sign(&payload);
+        self.instant(
+            TxTraceLevel::Mutation,
+            MUTATION_ZONE_SIGN_NAME,
+            SpanId::NONE,
+            encode::mutation_zone_sign_tag(),
+            &payload_bytes[..payload_len as usize],
+        );
+    }
+
+    /// Emit an L6 index-commit mutation instant.
+    pub fn mutation_index_commit(&self, index_id: u32, key_low: u32, value_object_id: u64) {
+        const MUTATION_INDEX_COMMIT_NAME: EventNameId = EventNameId::from_raw(0x4d494358);
+        let payload = PayloadMutationIndexCommit {
+            index_id,
+            key_low,
+            value_object_id,
+        };
+        let (payload_bytes, payload_len) = encode::encode_mutation_index_commit(&payload);
+        self.instant(
+            TxTraceLevel::Mutation,
+            MUTATION_INDEX_COMMIT_NAME,
+            SpanId::NONE,
+            encode::mutation_index_commit_tag(),
+            &payload_bytes[..payload_len as usize],
+        );
+    }
+
+    /// Emit a synthetic process-label scheduler instant.
+    pub fn process_label(&self, parent: SpanId, process_id_low: u32, comm: &[u8; 16]) {
+        let mut truncated = [0u8; 12];
+        let n = core::cmp::min(comm.len(), truncated.len());
+        truncated[..n].copy_from_slice(&comm[..n]);
+        if !truncated.contains(&0) {
+            truncated[truncated.len() - 1] = 0;
+        }
+
+        let payload = PayloadProcessLabel {
+            process_id_low,
+            comm: truncated,
+        };
+        let (payload_bytes, payload_len) = encode::encode_process_label(&payload);
+        self.instant(
+            TxTraceLevel::Sched,
+            EventNameId::from_raw(0x9000_0000 | process_id_low),
+            parent,
+            encode::process_label_tag(),
+            &payload_bytes[..payload_len as usize],
+        );
+    }
+
+    /// Emit a synthetic process-group scheduler instant.
+    pub fn process_group(&self, parent: SpanId, process_id_low: u32, pgid_low: u32, sid_low: u32) {
+        let payload = PayloadProcessGroup {
+            process_id_low,
+            pgid_low,
+            sid_low,
+            _pad: 0,
+        };
+        let (payload_bytes, payload_len) = encode::encode_process_group(&payload);
+        self.instant(
+            TxTraceLevel::Sched,
+            EventNameId::from_raw(0xA000_0000 | process_id_low),
+            parent,
+            encode::process_group_tag(),
+            &payload_bytes[..payload_len as usize],
+        );
+    }
+
     /// Emit a point-in-time allocation marker on an explicit DS allocation
     /// track. The `parent` field carries the explicit track id and the
     /// `ArgValue` payload carries one unsigned value chosen by the call site
@@ -522,6 +845,31 @@ impl HartEmitter {
             method,
             metric,
             value,
+        );
+    }
+
+    /// Emit a producer-side wait-source wake notification.
+    pub fn wait_source_notify(
+        &self,
+        source_id_low: u32,
+        mask_bits: u32,
+        task_id_low: u32,
+        wait_generation_low: u32,
+    ) {
+        const WAKE_NOTIFY_NAME: EventNameId = EventNameId::from_raw(fnv1a32(b"wake.notify"));
+        let payload = PayloadWaitSourceNotify {
+            source_id_low,
+            mask_bits,
+            task_id_low,
+            wait_generation_low,
+        };
+        let (payload_bytes, payload_len) = encode::encode_wait_source_notify(&payload);
+        self.instant(
+            TxTraceLevel::Yield,
+            WAKE_NOTIFY_NAME,
+            SpanId::NONE,
+            encode::wait_source_notify_tag(),
+            &payload_bytes[..payload_len as usize],
         );
     }
 
@@ -922,7 +1270,7 @@ fn run_pre_dump_hook() {
 
 fn dump_shutdown_for<P>() -> !
 where
-    P: ConsoleIf + ObserverIf + TimeIf + PercpuIf + PowerIf + tx_hal::SmpIf,
+    P: ConsoleIf + ObserverIf + MonotonicCounterIf + PercpuIf + PowerIf + tx_hal::SmpIf,
 {
     dump_console_hex_all::<P>();
     tx_hal::console_write_str::<P>(":observe:dump:threshold\n");
@@ -936,7 +1284,7 @@ where
 /// requested it.
 pub fn register_dump_shutdown<P>()
 where
-    P: ConsoleIf + ObserverIf + TimeIf + PercpuIf + PowerIf + tx_hal::SmpIf,
+    P: ConsoleIf + ObserverIf + MonotonicCounterIf + PercpuIf + PowerIf + tx_hal::SmpIf,
 {
     DUMP_SHUTDOWN_FN.store(
         dump_shutdown_for::<P> as *const () as usize as u64,
@@ -1086,7 +1434,7 @@ pub fn reset_all_rings_and_arm(threshold: u64) {
 // The synthesised header carries the same fields the daemon would expect
 // from a live transport: magic, version, hart_count, ring_order,
 // boot_id (always 0 here — single-run captures don't need a unique boot
-// id), clock_id (RiscvTime), and clock_freq_hz (from `TimeIf`).
+// id), clock_id (RiscvTime), and clock_freq_hz (from `MonotonicCounterIf`).
 //
 // This path is `unsafe` only at the FFI boundary (raw ring pointer
 // access); the visible surface stays no_std/safe.
@@ -1109,14 +1457,14 @@ pub fn reset_all_rings_and_arm(threshold: u64) {
 /// hart id used to keep cross-hart dumps disambiguated.
 ///
 /// The 72-byte `TxTraceHeader` is emitted first (synthesised here from
-/// `P`'s `clock_shared`/`TimeIf::clock_freq_hz` and the buffer size),
+/// `P`'s `clock_shared`/`MonotonicCounterIf::frequency_hz` and the buffer size),
 /// followed by the ring bytes. The combined hex stream is exactly the
 /// shape `cargo xtask observe validate / replay / pftrace` expect for
 /// a normal `.txtrace` file — so post-extraction the file is a regular
 /// member of the observation pipeline.
 pub fn dump_console_hex<P>(hart: CpuId)
 where
-    P: ConsoleIf + ObserverIf + TimeIf,
+    P: ConsoleIf + ObserverIf + MonotonicCounterIf,
 {
     dump_console_hex_mask::<P>(tx_hal::CpuMask::single(hart), Some(hart.0 as u64));
 }
@@ -1124,7 +1472,7 @@ where
 /// Dump all platform-possible hart rings as one compact txtrace frame.
 pub fn dump_console_hex_all<P>()
 where
-    P: ConsoleIf + ObserverIf + TimeIf + tx_hal::SmpIf,
+    P: ConsoleIf + ObserverIf + MonotonicCounterIf + tx_hal::SmpIf,
 {
     dump_console_hex_mask::<P>(P::possible_cpus(), None);
 }
@@ -1172,7 +1520,7 @@ fn ring_snapshot(desc: tx_hal::RingDescriptor) -> Option<RingSnapshot> {
 
 fn dump_console_hex_mask<P>(mask: tx_hal::CpuMask, hart_label: Option<u64>)
 where
-    P: ConsoleIf + ObserverIf + TimeIf,
+    P: ConsoleIf + ObserverIf + MonotonicCounterIf,
 {
     run_pre_dump_hook();
     use tx_observe_types::{TxTraceClockId, TxTraceHeader, TxTraceHeaderFlags, TX_TRACE_MAGIC};
@@ -1371,7 +1719,7 @@ fn write_u64_decimal<P: ConsoleIf>(mut v: u64) {
 ///
 /// Returns `Err(InitError::NoRing)` when the board has no transport — not a
 /// fatal error; emit becomes a no-op via `current` returning `None`.
-pub fn init<P: ObserverIf + TimeIf + PercpuIf>(hart: CpuId) -> Result<(), InitError> {
+pub fn init<P: ObserverIf + MonotonicCounterIf + PercpuIf>(hart: CpuId) -> Result<(), InitError> {
     let idx = hart.0;
     if idx >= MAX_HARTS {
         return Err(InitError::HartIndexTooLarge);

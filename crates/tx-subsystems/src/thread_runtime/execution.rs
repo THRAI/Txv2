@@ -87,10 +87,7 @@ fn emit_thread_lock_service_trace(name: &'static [u8], value: i64) {
     #[cfg(tx_sigprocmask_phase_metrics)]
     {
         if let Some(observer) = tx_observe::current() {
-            observer.counter(
-                tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-                value,
-            );
+            observer.debug_counter(name, value);
         }
     }
     #[cfg(not(tx_sigprocmask_phase_metrics))]
@@ -124,10 +121,7 @@ fn clear_child_tid_debug_sample() -> bool {
 
 fn emit_clear_child_tid_debug(name: &[u8], value: i64) {
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            value,
-        );
+        observer.debug_counter(name, value);
         tx_observe::dump_registered_if_requested();
     }
 }
@@ -139,10 +133,7 @@ fn thread_exit_debug_sample() -> bool {
 
 fn emit_thread_exit_debug(name: &[u8], value: i64) {
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            value,
-        );
+        observer.debug_counter(name, value);
         tx_observe::dump_registered_if_requested();
     }
 }

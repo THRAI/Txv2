@@ -115,9 +115,6 @@ fn reclaim_slot_trace_sample() -> Option<i64> {
 
 fn emit_reclaim_slot_trace(name: &[u8], value: i64) {
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            value,
-        );
+        observer.debug_counter(name, value);
     }
 }

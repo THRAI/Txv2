@@ -106,10 +106,7 @@ fn sigprocmask_trace_sample() -> Option<i64> {
 #[cfg(tx_sigprocmask_detail_metrics)]
 fn emit_sigprocmask_debug(name: &[u8], value: i64) {
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            value,
-        );
+        observer.debug_counter(name, value);
         tx_observe::dump_registered_if_requested();
     }
 }
@@ -131,10 +128,7 @@ fn sigprocmask_detail_now() -> u64 {
 fn emit_sigprocmask_detail_duration(name: &[u8], start_ns: u64) {
     if let Some(observer) = tx_observe::current() {
         let dur = tx_observe::clock_now_ns().saturating_sub(start_ns);
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            dur.min(i64::MAX as u64) as i64,
-        );
+        observer.debug_counter(name, dur.min(i64::MAX as u64) as i64);
         tx_observe::dump_registered_if_requested();
     }
 }

@@ -72,10 +72,7 @@ pub(crate) fn emit_process_lock_service_trace(name: &'static [u8], value: i64) {
     #[cfg(tx_lock_metrics_process)]
     {
         if let Some(observer) = tx_observe::current() {
-            observer.counter(
-                tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-                value,
-            );
+            observer.debug_counter(name, value);
         }
     }
     #[cfg(not(tx_lock_metrics_process))]
@@ -838,10 +835,7 @@ fn emit_clone_thread_marker(name: &[u8], value: i64) {
         return;
     }
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            value,
-        );
+        observer.debug_counter(name, value);
         tx_observe::dump_registered_if_requested();
     }
 }
@@ -873,10 +867,7 @@ fn emit_clone_path_count(name: &[u8], value: u64) {
         return;
     }
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            value as i64,
-        );
+        observer.debug_counter(name, value as i64);
     }
 }
 

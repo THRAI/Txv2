@@ -273,9 +273,6 @@ impl WaitSource {
         limit: usize,
         hint: MailboxSchedulerHint,
     ) -> usize {
-        use tx_observe::encode::{encode_wait_source_notify, wait_source_notify_tag};
-        use tx_observe::EventNameId;
-
         if limit == 0 || mask.raw() == 0 {
             return 0;
         }
@@ -295,19 +292,11 @@ impl WaitSource {
                 if mailbox.post_with_scheduler_hint(evt, hint) {
                     posted += 1;
                     if let Some(em) = tx_observe::current() {
-                        let payload = PayloadWaitSourceNotify {
-                            source_id_low: self.id.raw() as u32,
-                            mask_bits: overlap as u32,
-                            task_id_low: mailbox.task_id_low(),
-                            wait_generation_low: sub.generation.raw() as u32,
-                        };
-                        let (payload_bytes, _) = encode_wait_source_notify(&payload);
-                        em.instant(
-                            TxTraceLevel::Yield,
-                            EventNameId::from_raw(tx_observe::fnv1a32(b"wake.notify")),
-                            tx_observe::SpanId::NONE,
-                            wait_source_notify_tag(),
-                            &payload_bytes,
+                        em.wait_source_notify(
+                            self.id.raw() as u32,
+                            overlap as u32,
+                            mailbox.task_id_low(),
+                            sub.generation.raw() as u32,
                         );
                     }
                 }
@@ -347,9 +336,6 @@ impl WaitSource {
     /// Fire `mask` with an explicit scheduler hint and emit one
     /// `WaitSourceNotify` observation record per woken task.
     pub fn notify_emit_with_hint(&self, mask: InterestMask, hint: MailboxSchedulerHint) -> usize {
-        use tx_observe::encode::{encode_wait_source_notify, wait_source_notify_tag};
-        use tx_observe::EventNameId;
-
         self.pending_mask.fetch_or(mask.raw(), Ordering::AcqRel);
         let mut subs = self.subscribers.lock();
         let mut posted = 0usize;
@@ -369,19 +355,11 @@ impl WaitSource {
                     posted += 1;
                     // Emit one Instant record per woken task (OBS-4 / γ-fix).
                     if let Some(em) = tx_observe::current() {
-                        let payload = PayloadWaitSourceNotify {
-                            source_id_low: self.id.raw() as u32,
-                            mask_bits: overlap as u32,
-                            task_id_low: mailbox.task_id_low(),
-                            wait_generation_low: sub.generation.raw() as u32,
-                        };
-                        let (payload_bytes, _) = encode_wait_source_notify(&payload);
-                        em.instant(
-                            TxTraceLevel::Yield,
-                            EventNameId::from_raw(tx_observe::fnv1a32(b"wake.notify")),
-                            tx_observe::SpanId::NONE,
-                            wait_source_notify_tag(),
-                            &payload_bytes,
+                        em.wait_source_notify(
+                            self.id.raw() as u32,
+                            overlap as u32,
+                            mailbox.task_id_low(),
+                            sub.generation.raw() as u32,
                         );
                     }
                 }

@@ -47,14 +47,7 @@ use alloc::vec::Vec;
 
 use reactor_entry::userspace::SyscallRequest;
 use tx_hal::{AuxvIf, EntropyIf, IpiKind, PmapIf, SmpIf, TimeIf};
-use tx_observe::encode::{
-    arg_value_tag, encode_arg_value, encode_syscall_enter, encode_syscall_exit, syscall_enter_tag,
-    syscall_exit_tag,
-};
-use tx_observe::{EventNameId, SpanId, TxTraceLevel};
-use tx_observe_types::{
-    PayloadArgValue, PayloadSyscallEnter, PayloadSyscallExit, TxPayloadTag, TxValueKind,
-};
+use tx_observe::SpanId;
 use tx_scripts::process::exec::{exec_script, ExecError};
 use tx_subsystems::cred::{
     Capability, CapabilitySet, CredChange, Gid, SetgidOp, SetregidOp, SetresgidOp, SetresuidOp,
@@ -838,7 +831,7 @@ pub async fn dispatch_writev_hot(
 
 fn emit_writev_hot_trace(name: &[u8], value: i64) {
     if let Some(observer) = tx_observe::current() {
-        observer.counter(EventNameId::from_raw(tx_observe::fnv1a32(name)), value);
+        observer.debug_counter(name, value);
     }
 }
 
@@ -1534,63 +1527,11 @@ fn emit_syscall_enter(req: &SyscallRequest) -> SpanId {
     let Some(em) = tx_observe::current() else {
         return SpanId::NONE;
     };
-    let payload = PayloadSyscallEnter {
-        sysno: req.nr as u32,
-        // Linux RV64 = 0 today; LoongArch64 will use 1 once its shim lands.
-        // Threading the per-board ABI through the call chain is OBS follow-up
-        // work; emitting 0 is correct for the only board currently emitting.
-        abi: 0,
-        // argc reflects the register-shaped arg slots — `req.args` is `[u64; 6]`
-        // for the Linux generic ABI. The daemon walks `argc` `ArgValue`
-        // continuation records after this `SpanBegin`.
-        argc: 6,
-    };
-    let (enc, len) = encode_syscall_enter(&payload);
-    let syscall_span = em.span_begin(
-        TxTraceLevel::Boundary,
-        EventNameId::from_raw(req.nr as u32),
-        SpanId::NONE,
-        syscall_enter_tag(),
-        &enc[..len as usize],
-    );
-
-    // Per OBS-V1 §6 / `08_OBSERVATION_SERIALIZATION_v0.md §8.6`: emit one
-    // `ArgValue` `Instant` per register-shaped syscall arg right after
-    // `SpanBegin(SyscallEnter)`. The daemon attaches them as debug
-    // annotations on the syscall slice so each `sys_*` chip in Perfetto
-    // shows `a0`/`a1`/…/`a5` with the raw u64 the userspace process
-    // passed in. OBS-2 compliance: the wire carries the raw register
-    // bits as `TxValueKind::U64`; no `UserPtr<T>` deref. The shim's
-    // arg-parsing code later decodes individual args as `Ptr` /
-    // `ObjectId` / etc. via separate `ArgValue` records once the
-    // higher-fidelity arg-classification pass lands.
-    if syscall_span != SpanId::NONE {
-        for (i, &raw) in req.args.iter().enumerate().take(6) {
-            let arg_payload = PayloadArgValue {
-                key: tx_observe::fnv1a32(SYSCALL_ARG_NAMES[i].as_bytes()),
-                value_kind: TxValueKind::U64 as u8,
-                _pad: [0; 3],
-                value0: raw,
-            };
-            let (enc, len) = encode_arg_value(&arg_payload);
-            em.instant(
-                TxTraceLevel::Boundary,
-                EventNameId::from_raw(tx_observe::fnv1a32(SYSCALL_ARG_NAMES[i].as_bytes())),
-                syscall_span,
-                arg_value_tag(),
-                &enc[..len as usize],
-            );
-        }
-    }
-
-    syscall_span
+    // Linux RV64 = 0 today; LoongArch64 will use 1 once its shim lands.
+    // Threading the per-board ABI through the call chain is OBS follow-up
+    // work; emitting 0 is correct for the only board currently emitting.
+    em.syscall_enter(req.nr as u32, 0, &req.args)
 }
-
-/// Stable register-position labels used as the `key` for syscall
-/// `ArgValue` continuations. Matches the Linux ABI's call-clobbered
-/// register names (a0..a5 on rv64, $a0..$a7 on la64, %rdi..%r9 on x86_64);
-/// using the position-agnostic `aN` form keeps the names ABI-portable.
-const SYSCALL_ARG_NAMES: [&str; 6] = ["a0", "a1", "a2", "a3", "a4", "a5"];
 
 #[inline]
 fn emit_syscall_exit(span: SpanId, result: &SyscallResult) {
@@ -1616,14 +1557,7 @@ fn emit_syscall_exit(span: SpanId, result: &SyscallResult) {
         SyscallResult::SigreturnRestored => (0, 0, 4u8),
         SyscallResult::SigreturnContextRestored => (0, 0, 4u8),
     };
-    let payload = PayloadSyscallExit {
-        ret,
-        errno,
-        result_kind,
-        _pad: [0; 3],
-    };
-    let (enc, len) = encode_syscall_exit(&payload);
-    em.span_end(span, syscall_exit_tag(), &enc[..len as usize]);
+    em.syscall_exit(span, ret, errno, result_kind);
 }
 
 /// Linux generic ABI errno value for "no such file or directory"

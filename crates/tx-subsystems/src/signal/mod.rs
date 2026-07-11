@@ -542,10 +542,7 @@ fn emit_signal_select_trace(name: &[u8], value: i64) {
         let _ = value;
         if let Some(observer) = tx_observe::current() {
             debug_assert!(SIGNAL_SELECT_TRACE_NAMES.contains(&name));
-            observer.counter(
-                tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-                value,
-            );
+            observer.debug_counter(name, value);
         }
     }
     #[cfg(not(tx_signal_select_metrics))]

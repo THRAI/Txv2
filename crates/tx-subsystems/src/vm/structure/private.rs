@@ -1116,10 +1116,7 @@ fn emit_private_page_trace(name: &[u8], value: i64) {
         return;
     }
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            value,
-        );
+        observer.debug_counter(name, value);
     }
 }
 
@@ -1130,7 +1127,7 @@ fn emit_private_page_allocation(name: &[u8], value: u64) {
     if let Some(observer) = tx_observe::current() {
         observer.allocation(
             tx_observe::AllocationTrack::VmPrivatePageNode,
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            tx_observe::EventNameId::from_name(name),
             value,
         );
     }

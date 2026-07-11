@@ -167,6 +167,7 @@ fn lint_invariants(root: &Path, sub: &str) -> Result<()> {
         "cred-check" => crate::lint_invariants_cred_check::lint_invariants_cred_check(root),
         "legacy-wait-channel" => crate::lint_invariants_wait::lint_invariants_legacy_wait_channel(root),
         "notification-boundary" => crate::lint_invariants_notification::lint_invariants_notification_boundary(root),
+        "observe-producer-boundary" => crate::lint_invariants_observe::lint_invariants_observe_producer_boundary(root),
         "step-guard" => crate::lint_step_guard::lint_invariants_step_guard(root),
         "no-adhoc-drive" => crate::lint_invariants_drive::lint_invariants_no_adhoc_drive(root),
         "syscall-adhoc-loop" => crate::lint_invariants_syscall::lint_invariants_syscall_adhoc_loop(root),
@@ -188,6 +189,7 @@ fn lint_invariants(root: &Path, sub: &str) -> Result<()> {
                 ("step-guard", crate::lint_step_guard::lint_invariants_step_guard),
                 ("legacy-wait-channel", crate::lint_invariants_wait::lint_invariants_legacy_wait_channel),
                 ("notification-boundary", crate::lint_invariants_notification::lint_invariants_notification_boundary),
+                ("observe-producer-boundary", crate::lint_invariants_observe::lint_invariants_observe_producer_boundary),
                 ("no-adhoc-drive", crate::lint_invariants_drive::lint_invariants_no_adhoc_drive),
                 ("syscall-adhoc-loop", crate::lint_invariants_syscall::lint_invariants_syscall_adhoc_loop),
                 ("syscall-no-await", crate::lint_invariants_syscall::lint_invariants_syscall_no_await),
@@ -207,7 +209,7 @@ fn lint_invariants(root: &Path, sub: &str) -> Result<()> {
             }
         }
         other => Err(format!(
-            "unknown invariants sub-rule '{other}'. Expected: step-discipline, step-v4-vocabulary, step-no-await, step-sync-signature, step, subject-context, witness-scope, signal-publish, script-boundary, checks-purity, cred-check, legacy-wait-channel, notification-boundary, no-adhoc-drive, syscall-adhoc-loop, syscall-no-await, syscall-ctx-bridge, all"
+            "unknown invariants sub-rule '{other}'. Expected: step-discipline, step-v4-vocabulary, step-no-await, step-sync-signature, step, subject-context, witness-scope, signal-publish, script-boundary, checks-purity, cred-check, legacy-wait-channel, notification-boundary, observe-producer-boundary, no-adhoc-drive, syscall-adhoc-loop, syscall-no-await, syscall-ctx-bridge, all"
         )),
     }
 }

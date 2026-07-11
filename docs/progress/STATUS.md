@@ -1,3 +1,38 @@
+- 2026-07-11 (tx-observe kernel-side structured/helper migration).
+  Continued the kernel-side L0-L6 observe migration beyond the initial
+  `WaitSourceNotify` slice. Added typed `HartEmitter` helpers for L0 syscall
+  enter/exit plus raw arg continuations, L2 drive begin/end, L4 step begin/end,
+  L3 yield/resume, L5 phase begin/end, L6 mutation zone-sign/index-commit,
+  synthetic process label/group, and debug counter name emission. Added
+  `EventNameId::from_name` so producer code no longer constructs event ids with
+  `EventNameId::from_raw(fnv1a32(...))`. Migrated `crates/tx-scripts`,
+  `crates/tx-shims`, `crates/tx-substrate`, `crates/tx-subsystems`,
+  `crates/tx-reactor`, and `crates/tx-kernel` observe producers away from
+  local payload/tag encoding, direct `observer.counter(...)`, and direct
+  `fnv1a32` name hashing for producer-side observe records. Current production
+  scans for `tx_observe::encode::*`, `observer.counter(...)`, and
+  `EventNameId::from_raw(tx_observe::fnv1a32(...))` are clean; remaining hits
+  are comments/tests or non-observe domain methods such as `eventfd.counter()`.
+  Added `cargo xtask lint invariants observe-producer-boundary` as a hard
+  ceiling-0 gate over production Rust in `crates/` and `boards/`, excluding the
+  observe implementation crates and test paths. The new gate rejects producer
+  uses of raw payload encoders, direct `observer.counter(...)`, and ad-hoc
+  `fnv1a32` event-name hashing, with a focused negative/positive unit witness
+  in `xtask`.
+  Verification: the new helper tests first failed RED on missing methods; after
+  implementation, `cargo test -p tx-observe --test smoke -- --nocapture`
+  passed 14/14, `cargo test -p tx-scripts --test drive_observe --
+  --nocapture` passed 6/6, and `cargo check -p tx-kernel -p tx-shims -p
+  tx-scripts -p tx-reactor -p tx-substrate -p tx-subsystems` passed with
+  existing warnings. Earlier focused OBS-8 gates also passed:
+  `cargo test -p tx-substrate --test obs8_zone_sign_emit -- --nocapture` 2/2
+  and `cargo test -p tx-substrate --test obs8_index_commit_emit --
+  --nocapture` 2/2. Enforcement verification: `cargo test -p xtask
+  observe_producer_boundary -- --nocapture` passed 2/2, and `cargo xtask lint
+  invariants observe-producer-boundary` scanned 515 files with 0 findings.
+  Remaining follow-up is schema/codegen ownership of helper names, not
+  unchecked kernel producer migration.
+
 - 2026-06-18 (6-suite regression sweep vs main — 0 regressions, 4 lanes, many improvements). User asked to
   regression-test basic/busybox/libctest/libcbench/lmbench/iozone vs main (main "已经测试过了"), on BOTH
   musl AND glibc lanes. Method: per-suite selector boots `tx.oscomp.groups=<suite>-{musl,glibc}` with

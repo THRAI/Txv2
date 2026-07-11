@@ -1,0 +1,1183 @@
+# tx-observe core schema inventory.
+#
+# This is the single handwritten L0 schema seed for the L0-L6 refactor.  The
+# first version mirrors current truth without changing txtrace-v0, generated
+# Rust, daemon decode, or analyzer projections.  Follow-up
+# `xtask observe-schema check` work should compare this file against the
+# current Rust/Python tables before any codegen becomes authoritative.
+
+[schema]
+id = "txobserve"
+version = 0
+status = "inventory"
+date = "2026-07-11"
+wire_format = "txtrace-v0"
+record_size_bytes = 80
+payload_size_bytes = 16
+hot_path_parse = false
+
+[sources]
+design = "docs/Txv3/08_OBSERVATION_L0_L6_REFACTOR_v0.md"
+current_framework = "docs/Txv3/08_OBSERVATION_v1.md"
+serialization = "docs/Txv3/08_OBSERVATION_SERIALIZATION_v0.md"
+host = "docs/Txv3/08_OBSERVATION_HOST_v0.md"
+record_abi = "crates/tx-observe-types/src/record.rs"
+payload_abi = "crates/tx-observe-types/src/payload.rs"
+producer = "crates/tx-observe/src/lib.rs"
+xtask_surface = "xtask/src/observe.rs"
+daemon_decode = "tools/tx-trace-daemon/src/decode.rs"
+daemon_replay = "tools/tx-trace-daemon/src/replay.rs"
+perfetto_writer = "tools/tx-trace-daemon/src/perfetto/writer.rs"
+analyzer = "tools/tx-observe-analyze.py"
+workspace_cfg = "Cargo.toml"
+
+[[abi.levels]]
+id = "boundary"
+rust = "TxTraceLevel::Boundary"
+value = 0
+description = "Syscall and external boundary records."
+
+[[abi.levels]]
+id = "script"
+rust = "TxTraceLevel::Script"
+value = 1
+description = "Script-level operation records."
+
+[[abi.levels]]
+id = "drive"
+rust = "TxTraceLevel::Drive"
+value = 2
+description = "Drive-loop records."
+
+[[abi.levels]]
+id = "yield"
+rust = "TxTraceLevel::Yield"
+value = 3
+description = "Yield, resume, and wake records."
+
+[[abi.levels]]
+id = "step"
+rust = "TxTraceLevel::Step"
+value = 4
+description = "Step iteration records."
+
+[[abi.levels]]
+id = "phase"
+rust = "TxTraceLevel::Phase"
+value = 5
+description = "Phase transition records."
+
+[[abi.levels]]
+id = "mutation"
+rust = "TxTraceLevel::Mutation"
+value = 6
+description = "Mutation diagnostic records."
+
+[[abi.levels]]
+id = "sched"
+rust = "TxTraceLevel::Sched"
+value = 7
+description = "Reactor scheduler task-on-hart intervals."
+
+[[abi.record_kinds]]
+id = "nop"
+rust = "TxTraceKind::Nop"
+value = 0
+canonical_event = "ignore"
+
+[[abi.record_kinds]]
+id = "clock_snapshot"
+rust = "TxTraceKind::ClockSnapshot"
+value = 1
+canonical_event = "record"
+
+[[abi.record_kinds]]
+id = "track_descriptor"
+rust = "TxTraceKind::TrackDescriptor"
+value = 2
+canonical_event = "record"
+
+[[abi.record_kinds]]
+id = "string_descriptor"
+rust = "TxTraceKind::StringDescriptor"
+value = 3
+canonical_event = "record"
+
+[[abi.record_kinds]]
+id = "span_begin"
+rust = "TxTraceKind::SpanBegin"
+value = 10
+canonical_event = "span_begin"
+
+[[abi.record_kinds]]
+id = "span_end"
+rust = "TxTraceKind::SpanEnd"
+value = 11
+canonical_event = "span_end"
+
+[[abi.record_kinds]]
+id = "instant"
+rust = "TxTraceKind::Instant"
+value = 12
+canonical_event = "instant"
+
+[[abi.record_kinds]]
+id = "counter"
+rust = "TxTraceKind::Counter"
+value = 13
+canonical_event = "counter"
+
+[[abi.record_kinds]]
+id = "track_tombstone"
+rust = "TxTraceKind::TrackTombstone"
+value = 14
+canonical_event = "record"
+
+[[abi.record_kinds]]
+id = "panic_marker"
+rust = "TxTraceKind::PanicMarker"
+value = 31
+canonical_event = "panic"
+
+[[abi.record_kinds]]
+id = "arg_continuation"
+rust = "TxTraceKind::ArgContinuation"
+value = 40
+canonical_event = "arg"
+
+[[payloads]]
+id = "none"
+rust_tag = "TxPayloadTag::None"
+tag = 0
+struct = "None"
+size_bytes = 0
+family = "metadata"
+fields = []
+
+[[payloads]]
+id = "syscall_enter"
+rust_tag = "TxPayloadTag::SyscallEnter"
+tag = 1
+struct = "PayloadSyscallEnter"
+size_bytes = 8
+family = "syscall"
+fields = [
+  { name = "sysno", type = "u32" },
+  { name = "abi", type = "u16" },
+  { name = "argc", type = "u16" },
+]
+
+[[payloads]]
+id = "syscall_exit"
+rust_tag = "TxPayloadTag::SyscallExit"
+tag = 2
+struct = "PayloadSyscallExit"
+size_bytes = 16
+family = "syscall"
+fields = [
+  { name = "ret", type = "i64" },
+  { name = "errno", type = "i32" },
+  { name = "result_kind", type = "u8", enum = "SyscallResultKind" },
+  { name = "_pad", type = "[u8; 3]", reserved = true },
+]
+
+[[payloads]]
+id = "drive_begin"
+rust_tag = "TxPayloadTag::DriveBegin"
+tag = 10
+struct = "PayloadDriveBegin"
+size_bytes = 12
+family = "drive"
+fields = [
+  { name = "op_type", type = "u32" },
+  { name = "mode", type = "u8", enum = "DriveMode" },
+  { name = "interrupt", type = "u8", enum = "DriveInterrupt" },
+  { name = "has_deadline", type = "u8" },
+  { name = "_pad", type = "u8", reserved = true },
+  { name = "task_id_low", type = "u32" },
+]
+
+[[payloads]]
+id = "drive_end"
+rust_tag = "TxPayloadTag::DriveEnd"
+tag = 11
+struct = "PayloadDriveEnd"
+size_bytes = 16
+family = "drive"
+fields = [
+  { name = "ret", type = "i64" },
+  { name = "errno", type = "i32" },
+  { name = "result_kind", type = "u8", enum = "DriveResultKind" },
+  { name = "_pad", type = "[u8; 3]", reserved = true },
+]
+
+[[payloads]]
+id = "step_outcome"
+rust_tag = "TxPayloadTag::StepOutcome"
+tag = 12
+struct = "PayloadStepOutcome"
+size_bytes = 16
+family = "step"
+fields = [
+  { name = "variant", type = "u8", enum = "StepOutcomeVariant" },
+  { name = "progress_empty", type = "u8" },
+  { name = "progress_kind", type = "u8", enum = "TxProgressKind" },
+  { name = "shape_kind", type = "u8", enum = "YieldShapeKind" },
+  { name = "errno", type = "i32" },
+  { name = "progress_value", type = "u32" },
+  { name = "_pad", type = "u32", reserved = true },
+]
+
+[[payloads]]
+id = "yield_begin"
+rust_tag = "TxPayloadTag::YieldBegin"
+tag = 20
+struct = "PayloadYieldBegin"
+size_bytes = 16
+family = "yield"
+fields = [
+  { name = "shape_kind", type = "u8", enum = "YieldShapeKind" },
+  { name = "_pad", type = "[u8; 3]", reserved = true },
+  { name = "task_id_low", type = "u32" },
+  { name = "wait_generation", type = "u64" },
+]
+
+[[payloads]]
+id = "resume"
+rust_tag = "TxPayloadTag::Resume"
+tag = 21
+struct = "PayloadResume"
+size_bytes = 16
+family = "yield"
+fields = [
+  { name = "resume_kind", type = "u8", enum = "ResumeKind" },
+  { name = "abort_reason", type = "u8", enum = "AbortReason" },
+  { name = "_pad", type = "[u8; 2]", reserved = true },
+  { name = "object_id_low", type = "u32" },
+  { name = "wait_generation", type = "u64" },
+]
+
+[[payloads]]
+id = "wait_source_notify"
+rust_tag = "TxPayloadTag::WaitSourceNotify"
+tag = 22
+struct = "PayloadWaitSourceNotify"
+size_bytes = 16
+family = "yield"
+fields = [
+  { name = "source_id_low", type = "u32" },
+  { name = "mask_bits", type = "u32" },
+  { name = "task_id_low", type = "u32" },
+  { name = "wait_generation_low", type = "u32" },
+]
+
+[[payloads]]
+id = "agent_state_change"
+rust_tag = "TxPayloadTag::AgentStateChange"
+tag = 23
+struct = "reserved"
+size_bytes = 16
+family = "yield"
+status = "reserved"
+fields = []
+
+[[payloads]]
+id = "track_descriptor"
+rust_tag = "TxPayloadTag::TrackDescriptor"
+tag = 30
+struct = "PayloadTrackDescriptor"
+size_bytes = 16
+family = "metadata"
+fields = [
+  { name = "track_id", type = "u64" },
+  { name = "name", type = "u32", semantic = "EventNameId" },
+  { name = "track_kind", type = "u8", enum = "TrackKind" },
+  { name = "_pad", type = "[u8; 3]", reserved = true },
+]
+
+[[payloads]]
+id = "counter_value"
+rust_tag = "TxPayloadTag::CounterValue"
+tag = 31
+struct = "PayloadCounterValue"
+size_bytes = 16
+family = "counter"
+fields = [
+  { name = "counter_id", type = "u32" },
+  { name = "_pad", type = "u32", reserved = true },
+  { name = "value", type = "u64" },
+]
+
+[[payloads]]
+id = "string_descriptor"
+rust_tag = "TxPayloadTag::StringDescriptor"
+tag = 32
+struct = "reserved"
+size_bytes = 16
+family = "metadata"
+status = "reserved"
+fields = []
+
+[[payloads]]
+id = "clock_snapshot"
+rust_tag = "TxPayloadTag::ClockSnapshot"
+tag = 33
+struct = "PayloadClockSnapshot"
+size_bytes = 16
+family = "metadata"
+fields = [
+  { name = "trace_ns", type = "u64" },
+  { name = "wall_ns", type = "u64" },
+]
+
+[[payloads]]
+id = "arg_value"
+rust_tag = "TxPayloadTag::ArgValue"
+tag = 40
+struct = "PayloadArgValue"
+size_bytes = 16
+family = "arg"
+fields = [
+  { name = "key", type = "u32", semantic = "DebugAnnotationNameId" },
+  { name = "value_kind", type = "u8", enum = "TxValueKind" },
+  { name = "_pad", type = "[u8; 3]", reserved = true },
+  { name = "value0", type = "u64" },
+]
+
+[[payloads]]
+id = "mutation_zone_sign"
+rust_tag = "TxPayloadTag::MutationZoneSign"
+tag = 50
+struct = "PayloadMutationZoneSign"
+size_bytes = 16
+family = "mutation"
+fields = [
+  { name = "object_id", type = "u64", semantic = "TraceObjectId" },
+  { name = "kind", type = "u8", semantic = "ZoneKindTag" },
+  { name = "_pad", type = "[u8; 7]", reserved = true },
+]
+
+[[payloads]]
+id = "mutation_index_commit"
+rust_tag = "TxPayloadTag::MutationIndexCommit"
+tag = 51
+struct = "PayloadMutationIndexCommit"
+size_bytes = 16
+family = "mutation"
+fields = [
+  { name = "index_id", type = "u32" },
+  { name = "key_low", type = "u32" },
+  { name = "value_object_id", type = "u64" },
+]
+
+[[payloads]]
+id = "phase_transition"
+rust_tag = "TxPayloadTag::PhaseTransition"
+tag = 52
+struct = "PayloadPhaseTransition"
+size_bytes = 16
+family = "phase"
+fields = [
+  { name = "phase_kind", type = "u8", enum = "BootPhaseKind" },
+  { name = "hart_id", type = "u8" },
+  { name = "_pad", type = "[u8; 14]", reserved = true },
+]
+
+[[payloads]]
+id = "sched_switch"
+rust_tag = "TxPayloadTag::SchedSwitch"
+tag = 53
+struct = "PayloadSchedSwitch"
+size_bytes = 16
+family = "sched"
+fields = [
+  { name = "task_id_low", type = "u32" },
+  { name = "process_id_low", type = "u32" },
+  { name = "hart_id", type = "u8" },
+  { name = "kind", type = "u8", enum = "SchedKind" },
+  { name = "reason", type = "u8", enum = "SchedReason" },
+  { name = "_pad", type = "[u8; 5]", reserved = true },
+]
+
+[[payloads]]
+id = "process_label"
+rust_tag = "TxPayloadTag::ProcessLabel"
+tag = 54
+struct = "PayloadProcessLabel"
+size_bytes = 16
+family = "process"
+fields = [
+  { name = "process_id_low", type = "u32" },
+  { name = "comm", type = "[u8; 12]" },
+]
+
+[[payloads]]
+id = "process_group"
+rust_tag = "TxPayloadTag::ProcessGroup"
+tag = 55
+struct = "PayloadProcessGroup"
+size_bytes = 16
+family = "process"
+fields = [
+  { name = "process_id_low", type = "u32" },
+  { name = "pgid_low", type = "u32" },
+  { name = "sid_low", type = "u32" },
+  { name = "_pad", type = "u32", reserved = true },
+]
+
+[[payloads]]
+id = "process_fork"
+rust_tag = "TxPayloadTag::ProcessFork"
+tag = 56
+struct = "PayloadProcessFork"
+size_bytes = 16
+family = "process"
+fields = [
+  { name = "parent_pid_low", type = "u32" },
+  { name = "child_pid_low", type = "u32" },
+  { name = "_flags", type = "u32", reserved = true },
+  { name = "_pad", type = "u32", reserved = true },
+]
+
+[[payloads]]
+id = "panic"
+rust_tag = "TxPayloadTag::Panic"
+tag = 60
+struct = "PayloadPanic"
+size_bytes = 16
+family = "panic"
+fields = [
+  { name = "site_name", type = "u32", semantic = "EventNameId" },
+  { name = "_pad", type = "u32", reserved = true },
+  { name = "panic_hart", type = "u16" },
+  { name = "flags", type = "u16" },
+  { name = "_pad2", type = "u32", reserved = true },
+]
+
+[[enums]]
+id = "TxProgressKind"
+source = "crates/tx-observe-types/src/payload.rs"
+variants = [
+  { name = "NoProgress", value = 0 },
+  { name = "ByteProgress", value = 1 },
+  { name = "PageProgress", value = 2 },
+  { name = "EntryProgress", value = 3 },
+  { name = "IoVecProgress", value = 4 },
+]
+
+[[enums]]
+id = "YieldShapeKind"
+source = "crates/tx-observe-types/src/payload.rs"
+variants = [
+  { name = "OnWaitSource", value = 1 },
+  { name = "OnAgent", value = 2 },
+  { name = "OnTimer", value = 3 },
+]
+
+[[enums]]
+id = "TxValueKind"
+source = "crates/tx-observe-types/src/payload.rs"
+variants = [
+  { name = "None", value = 0 },
+  { name = "U64", value = 1 },
+  { name = "I64", value = 2 },
+  { name = "Bool", value = 3 },
+  { name = "Ptr", value = 4 },
+  { name = "Errno", value = 5 },
+  { name = "NameId", value = 6 },
+  { name = "ObjectId", value = 7 },
+  { name = "FlowId", value = 8 },
+]
+
+[[enums]]
+id = "BootPhaseKind"
+source = "crates/tx-observe-types/src/payload.rs"
+variants = [
+  { name = "SubstrateBsp", value = 0 },
+  { name = "SubstrateAp", value = 1 },
+]
+
+[[enums]]
+id = "SchedKind"
+source = "crates/tx-observe-types/src/payload.rs"
+variants = [
+  { name = "Dispatch", value = 0 },
+  { name = "Yield", value = 1 },
+]
+
+[[enums]]
+id = "SchedReason"
+source = "crates/tx-observe-types/src/payload.rs"
+variants = [
+  { name = "None", value = 0 },
+  { name = "Parked", value = 1 },
+  { name = "Completed", value = 2 },
+  { name = "WokeDuringPoll", value = 3 },
+]
+
+[[enums]]
+id = "FlowKind"
+source = "crates/tx-observe-types/src/payload.rs"
+variants = [
+  { name = "SourceWake", value = 1 },
+  { name = "AgentReply", value = 2 },
+  { name = "TimerExpire", value = 3 },
+  { name = "AbortDelivery", value = 4 },
+]
+
+[[controls.groups]]
+id = "lock_metrics"
+title = "Lock metrics"
+default = false
+requires_cfg = ["tx_lock_metrics"]
+local_cfgs = [
+  "tx_lock_metrics_vm",
+  "tx_lock_metrics_process",
+  "tx_lock_metrics_kernel",
+  "tx_lock_metrics_fs",
+]
+events = ["lock_metric"]
+
+[[controls.groups]]
+id = "ds_metrics"
+title = "Data-structure method metrics"
+default = false
+requires_cfg = ["tx_ds_metrics"]
+local_cfgs = [
+  "tx_ds_metrics_page_allocator",
+  "tx_ds_metrics_zone",
+  "tx_ds_metrics_process",
+]
+events = ["ds_method_metric"]
+
+[[controls.groups]]
+id = "vm_metrics"
+title = "VM path metrics"
+default = false
+requires_cfg = [
+  "tx_vm_recipe_bplus_arc_metrics",
+  "tx_vm_recipe_bplus_shape_metrics",
+  "tx_vm_recipe_node_alloc_metrics",
+  "tx_vm_recipe_publish_shape_metrics",
+  "tx_vm_recipe_reclaim_shape_metrics",
+  "tx_vm_recipe_phase_metrics",
+  "tx_vm_user_access_metrics",
+  "tx_vm_phase_metrics",
+  "tx_vm_map_path_metrics",
+  "tx_vm_pmap_metrics",
+  "tx_vm_private_page_metrics",
+]
+events = ["debug.vm.*", "debug.pagebacked.*"]
+
+[[controls.groups]]
+id = "process_clone_metrics"
+title = "Process and clone path metrics"
+default = false
+requires_cfg = [
+  "tx_clone_path_metrics",
+  "tx_thread_roundtrip_metrics",
+  "tx_thread_lifecycle_metrics",
+]
+events = ["debug.clone_path.*", "debug.thread.*"]
+
+[[controls.groups]]
+id = "scheduler_reactor_metrics"
+title = "Scheduler and reactor metrics"
+default = false
+requires_cfg = ["tx_sched_metrics", "tx_reactor_poll_metrics"]
+events = ["sched_switch", "debug.sched.*", "debug.reactor.*"]
+
+[[controls.groups]]
+id = "signal_futex_metrics"
+title = "Signal and futex debug metrics"
+default = false
+requires_cfg = [
+  "tx_sigprocmask_phase_metrics",
+  "tx_sigprocmask_detail_metrics",
+  "tx_signal_select_metrics",
+  "tx_futex_debug_metrics",
+]
+events = ["debug.signal.*", "debug.futex.*"]
+
+[[controls.groups]]
+id = "capability_and_pmap_debug"
+title = "Capability and pmap debug metrics"
+default = false
+requires_cfg = ["tx_cap_upgrade_metrics", "tx_pmap_debug"]
+events = ["debug.cap.*", "debug.vm.pmap.*"]
+
+[[controls.groups]]
+id = "demo_boot"
+title = "Demo boot probes"
+default = false
+requires_cfg = ["tx_demo_boot"]
+events = ["debug.observe.*"]
+
+[[controls.cfgs]]
+name = "tx_demo_boot"
+source = "Cargo.toml workspace.lints.rust.unexpected_cfgs"
+
+[[controls.cfgs]]
+name = "tx_lock_metrics"
+source = "Cargo.toml workspace.lints.rust.unexpected_cfgs"
+
+[[controls.cfgs]]
+name = "tx_lock_metrics_vm"
+source = "Cargo.toml workspace.lints.rust.unexpected_cfgs"
+
+[[controls.cfgs]]
+name = "tx_lock_metrics_process"
+source = "Cargo.toml workspace.lints.rust.unexpected_cfgs"
+
+[[controls.cfgs]]
+name = "tx_lock_metrics_kernel"
+source = "Cargo.toml workspace.lints.rust.unexpected_cfgs"
+
+[[controls.cfgs]]
+name = "tx_lock_metrics_fs"
+source = "Cargo.toml workspace.lints.rust.unexpected_cfgs"
+
+[[controls.cfgs]]
+name = "tx_sigprocmask_phase_metrics"
+source = "Cargo.toml workspace.lints.rust.unexpected_cfgs"
+
+[[controls.cfgs]]
+name = "tx_sigprocmask_detail_metrics"
+source = "Cargo.toml workspace.lints.rust.unexpected_cfgs"
+
+[[controls.cfgs]]
+name = "tx_signal_select_metrics"
+source = "Cargo.toml workspace.lints.rust.unexpected_cfgs"
+
+[[controls.cfgs]]
+name = "tx_cap_upgrade_metrics"
+source = "Cargo.toml workspace.lints.rust.unexpected_cfgs"
+
+[[controls.cfgs]]
+name = "tx_ds_metrics"
+source = "Cargo.toml workspace.lints.rust.unexpected_cfgs"
+
+[[controls.cfgs]]
+name = "tx_ds_metrics_page_allocator"
+source = "Cargo.toml workspace.lints.rust.unexpected_cfgs"
+
+[[controls.cfgs]]
+name = "tx_ds_metrics_zone"
+source = "Cargo.toml workspace.lints.rust.unexpected_cfgs"
+
+[[controls.cfgs]]
+name = "tx_ds_metrics_process"
+source = "Cargo.toml workspace.lints.rust.unexpected_cfgs"
+
+[[controls.cfgs]]
+name = "tx_vm_recipe_bplus"
+source = "Cargo.toml workspace.lints.rust.unexpected_cfgs"
+
+[[controls.cfgs]]
+name = "tx_vm_recipe_bplus_arc_metrics"
+source = "Cargo.toml workspace.lints.rust.unexpected_cfgs"
+
+[[controls.cfgs]]
+name = "tx_vm_recipe_bplus_shape_metrics"
+source = "Cargo.toml workspace.lints.rust.unexpected_cfgs"
+
+[[controls.cfgs]]
+name = "tx_vm_recipe_node_alloc_metrics"
+source = "Cargo.toml workspace.lints.rust.unexpected_cfgs"
+
+[[controls.cfgs]]
+name = "tx_vm_recipe_publish_shape_metrics"
+source = "Cargo.toml workspace.lints.rust.unexpected_cfgs"
+
+[[controls.cfgs]]
+name = "tx_vm_recipe_reclaim_shape_metrics"
+source = "Cargo.toml workspace.lints.rust.unexpected_cfgs"
+
+[[controls.cfgs]]
+name = "tx_vm_recipe_phase_metrics"
+source = "Cargo.toml workspace.lints.rust.unexpected_cfgs"
+
+[[controls.cfgs]]
+name = "tx_vm_user_access_metrics"
+source = "Cargo.toml workspace.lints.rust.unexpected_cfgs"
+
+[[controls.cfgs]]
+name = "tx_vm_phase_metrics"
+source = "Cargo.toml workspace.lints.rust.unexpected_cfgs"
+
+[[controls.cfgs]]
+name = "tx_vm_map_path_metrics"
+source = "Cargo.toml workspace.lints.rust.unexpected_cfgs"
+
+[[controls.cfgs]]
+name = "tx_vm_pmap_metrics"
+source = "Cargo.toml workspace.lints.rust.unexpected_cfgs"
+
+[[controls.cfgs]]
+name = "tx_vm_pmap_chunked_resident"
+source = "Cargo.toml workspace.lints.rust.unexpected_cfgs"
+
+[[controls.cfgs]]
+name = "tx_vm_private_page_metrics"
+source = "Cargo.toml workspace.lints.rust.unexpected_cfgs"
+
+[[controls.cfgs]]
+name = "tx_clone_path_metrics"
+source = "Cargo.toml workspace.lints.rust.unexpected_cfgs"
+
+[[controls.cfgs]]
+name = "tx_thread_roundtrip_metrics"
+source = "Cargo.toml workspace.lints.rust.unexpected_cfgs"
+
+[[controls.cfgs]]
+name = "tx_thread_lifecycle_metrics"
+source = "Cargo.toml workspace.lints.rust.unexpected_cfgs"
+
+[[controls.cfgs]]
+name = "tx_sched_metrics"
+source = "Cargo.toml workspace.lints.rust.unexpected_cfgs"
+
+[[controls.cfgs]]
+name = "tx_reactor_poll_metrics"
+source = "Cargo.toml workspace.lints.rust.unexpected_cfgs"
+
+[[controls.cfgs]]
+name = "tx_futex_debug_metrics"
+source = "Cargo.toml workspace.lints.rust.unexpected_cfgs"
+
+[[controls.cfgs]]
+name = "tx_pmap_debug"
+source = "Cargo.toml workspace.lints.rust.unexpected_cfgs"
+
+[[names.families]]
+id = "allocation"
+pattern = "debug.alloc.*"
+source = "xtask/src/observe.rs KERNEL_FNV1A_STABLE_NAMES; tools/tx-trace-daemon/src/perfetto/writer.rs allocation_track_name"
+projection = ["perfetto", "allocation_rows", "text_report"]
+
+[[names.families]]
+id = "vm"
+pattern = "debug.vm.*"
+source = "tools/tx-observe-analyze.py DEBUG_COUNTER_NAMES; xtask/src/observe.rs KERNEL_FNV1A_STABLE_NAMES"
+projection = ["counters", "text_report"]
+
+[[names.families]]
+id = "pagebacked"
+pattern = "debug.pagebacked.*"
+source = "tools/tx-observe-analyze.py DEBUG_COUNTER_NAMES; xtask/src/observe.rs KERNEL_FNV1A_STABLE_NAMES"
+projection = ["counters", "text_report"]
+
+[[names.families]]
+id = "clone_path"
+pattern = "debug.clone_path.*"
+source = "tools/tx-observe-analyze.py DEBUG_COUNTER_NAMES; xtask/src/observe.rs KERNEL_FNV1A_STABLE_NAMES"
+projection = ["counters", "text_report"]
+
+[[names.families]]
+id = "lock"
+pattern = "debug.lock.*"
+source = "crates/tx-observe/src/lib.rs lock_metric; tools/tx-observe-analyze.py lock_rows"
+projection = ["lock_rows", "text_report", "perfetto"]
+
+[[names.families]]
+id = "lock_track"
+pattern = "debug.lock"
+source = "tools/tx-trace-daemon/src/perfetto/writer.rs explicit_track_descriptor"
+projection = ["perfetto"]
+
+[[names.families]]
+id = "ds_method"
+pattern = "debug.ds.*"
+source = "crates/tx-observe/src/lib.rs ds_method_metric; tools/tx-observe-analyze.py ds_method_rows"
+projection = ["ds_method_rows", "text_report", "perfetto"]
+
+[[names.families]]
+id = "ds_method_track"
+pattern = "debug.ds.method"
+source = "tools/tx-trace-daemon/src/perfetto/writer.rs explicit_track_descriptor"
+projection = ["perfetto"]
+
+[[names.families]]
+id = "sched"
+pattern = "debug.sched.*"
+source = "crates/tx-reactor; tools/tx-observe-analyze.py scheduler reports"
+projection = ["sched_intervals", "counters", "perfetto", "text_report"]
+
+[[names.families]]
+id = "futex"
+pattern = "debug.futex.*"
+source = "crates/tx-subsystems/src/futex; tools/tx-observe-analyze.py futex reports"
+projection = ["counters", "text_report"]
+
+[[tracks.explicit]]
+id = "zone_slab"
+const = "ALLOC_TRACK_ZONE_SLAB"
+track_id_hex = "0xd500000000000001"
+name = "debug.alloc.zone.slab"
+
+[[tracks.explicit]]
+id = "page_frame"
+const = "ALLOC_TRACK_PAGE_FRAME"
+track_id_hex = "0xd500000000000002"
+name = "debug.alloc.page_frame"
+
+[[tracks.explicit]]
+id = "page_run"
+const = "ALLOC_TRACK_PAGE_RUN"
+track_id_hex = "0xd500000000000003"
+name = "debug.alloc.page_run"
+
+[[tracks.explicit]]
+id = "vm_recipe_node"
+const = "ALLOC_TRACK_VM_RECIPE_NODE"
+track_id_hex = "0xd500000000000004"
+name = "debug.alloc.vm.recipe_node"
+
+[[tracks.explicit]]
+id = "vm_private_page_node"
+const = "ALLOC_TRACK_VM_PRIVATE_PAGE_NODE"
+track_id_hex = "0xd500000000000005"
+name = "debug.alloc.vm.private_page_node"
+
+[[tracks.explicit]]
+id = "pagebacked_cache"
+const = "ALLOC_TRACK_PAGEBACKED_CACHE"
+track_id_hex = "0xd500000000000006"
+name = "debug.alloc.pagebacked.cache"
+
+[[tracks.explicit]]
+id = "vm_address_space"
+const = "ALLOC_TRACK_VM_ADDRESS_SPACE"
+track_id_hex = "0xd500000000000007"
+name = "debug.alloc.vm.address_space"
+
+[[tracks.explicit]]
+id = "pagebacked_container"
+const = "ALLOC_TRACK_PAGEBACKED_CONTAINER"
+track_id_hex = "0xd500000000000008"
+name = "debug.alloc.pagebacked.container"
+
+[[tracks.explicit]]
+id = "thread_payload"
+const = "ALLOC_TRACK_THREAD_PAYLOAD"
+track_id_hex = "0xd500000000000009"
+name = "debug.alloc.thread.payload"
+
+[[tracks.explicit]]
+id = "thread_identity"
+const = "ALLOC_TRACK_THREAD_IDENTITY"
+track_id_hex = "0xd50000000000000a"
+name = "debug.alloc.thread.identity"
+
+[[tracks.explicit]]
+id = "process_payload"
+const = "ALLOC_TRACK_PROCESS_PAYLOAD"
+track_id_hex = "0xd50000000000000b"
+name = "debug.alloc.process.payload"
+
+[[tracks.explicit]]
+id = "process_identity"
+const = "ALLOC_TRACK_PROCESS_IDENTITY"
+track_id_hex = "0xd50000000000000c"
+name = "debug.alloc.process.identity"
+
+[[tracks.explicit]]
+id = "process_threads"
+const = "ALLOC_TRACK_PROCESS_THREADS"
+track_id_hex = "0xd50000000000000d"
+name = "debug.alloc.process.threads"
+
+[[tracks.explicit]]
+id = "pid_namespace"
+const = "ALLOC_TRACK_PID_NAMESPACE"
+track_id_hex = "0xd50000000000000e"
+name = "debug.alloc.pidns"
+
+[[tracks.explicit]]
+id = "lock"
+const = "ALLOC_TRACK_LOCK"
+track_id_hex = "0xd50000000000000f"
+name = "debug.lock"
+
+[[tracks.explicit]]
+id = "ds_method"
+const = "ALLOC_TRACK_DS_METHOD"
+track_id_hex = "0xd500000000000010"
+name = "debug.ds.method"
+
+[[host.inputs]]
+id = "txtrace"
+extension = ".txtrace"
+reader_target = "TraceReader::TxtraceRegion"
+current_source = "tools/tx-trace-daemon/src/replay.rs decode_file_bytes; tools/tx-observe-analyze.py load_txtrace_records"
+
+[[host.inputs]]
+id = "rawrecords"
+extension = ".rawrecords"
+reader_target = "TraceReader::RawRecords"
+current_source = "tools/tx-trace-daemon/src/replay.rs live finalize; tools/tx-observe-analyze.py load_rawrecords"
+
+[[host.inputs]]
+id = "live_guest_mem"
+reader_target = "TraceReader::LiveGuestMem"
+current_source = "tools/tx-trace-daemon/src/replay.rs live_guest_mem"
+
+[[host.projections]]
+id = "ndjson"
+kind = "transcoder"
+target_type = "NdjsonTranscoder"
+current_source = "tools/tx-trace-daemon/src/replay.rs"
+coverage_default = "emit"
+
+[[host.projections]]
+id = "perfetto"
+kind = "transcoder"
+target_type = "PerfettoTranscoder"
+current_source = "tools/tx-trace-daemon/src/perfetto/writer.rs"
+coverage_default = "event_specific"
+
+[[host.projections]]
+id = "text_report"
+kind = "report"
+current_source = "tools/tx-observe-analyze.py analyze_* report functions"
+coverage_default = "event_specific"
+
+[[host.projections]]
+id = "records"
+kind = "sql_view"
+current_source = "tools/tx-observe-analyze.py RECORD_SQL_SCHEMA"
+columns = [
+  { name = "ts", type = "UBIGINT" },
+  { name = "hart", type = "UINTEGER" },
+  { name = "seq", type = "UBIGINT" },
+  { name = "kind", type = "VARCHAR" },
+  { name = "level", type = "VARCHAR" },
+  { name = "span", type = "VARCHAR" },
+  { name = "parent", type = "VARCHAR" },
+  { name = "name_id", type = "UINTEGER" },
+  { name = "payload_tag", type = "UINTEGER" },
+]
+
+[[host.projections]]
+id = "repairs"
+kind = "sql_view"
+current_source = "tools/tx-observe-analyze.py REPAIR_SQL_SCHEMA"
+columns = [
+  { name = "hart", type = "UINTEGER" },
+  { name = "seq_around", type = "UBIGINT" },
+  { name = "category", type = "VARCHAR" },
+  { name = "details", type = "VARCHAR" },
+]
+
+[[host.projections]]
+id = "spans"
+kind = "derived_table"
+file = "spans.parquet"
+current_source = "tools/tx-observe-analyze.py PARQUET_SCHEMAS"
+columns = [
+  { name = "span", type = "VARCHAR" },
+  { name = "name_id", type = "UINTEGER" },
+  { name = "sysno", type = "UBIGINT" },
+  { name = "begin", type = "UBIGINT" },
+  { name = "end", type = "UBIGINT" },
+  { name = "dur", type = "UBIGINT" },
+  { name = "begin_hart", type = "UINTEGER" },
+  { name = "end_hart", type = "UINTEGER" },
+  { name = "task_id", type = "UBIGINT" },
+  { name = "process_id", type = "UBIGINT" },
+  { name = "ret", type = "BIGINT" },
+  { name = "errno", type = "BIGINT" },
+  { name = "dangling", type = "BOOLEAN" },
+  { name = "sched_harts", type = "UINTEGER[]" },
+  { name = "sched_segments", type = "UBIGINT" },
+  { name = "sched_coverage", type = "UBIGINT" },
+  { name = "sched_migrated", type = "BOOLEAN" },
+]
+
+[[host.projections]]
+id = "counters"
+kind = "derived_table"
+file = "counters.parquet"
+current_source = "tools/tx-observe-analyze.py PARQUET_SCHEMAS"
+columns = [
+  { name = "ts", type = "UBIGINT" },
+  { name = "counter_id", type = "UINTEGER" },
+  { name = "value", type = "UBIGINT" },
+]
+
+[[host.projections]]
+id = "allocation_rows"
+kind = "derived_table"
+file = "allocation_rows.parquet"
+current_source = "tools/tx-observe-analyze.py PARQUET_SCHEMAS"
+columns = [
+  { name = "ts", type = "UBIGINT" },
+  { name = "track", type = "VARCHAR" },
+  { name = "name_id", type = "UINTEGER" },
+  { name = "value", type = "UBIGINT" },
+]
+
+[[host.projections]]
+id = "sched_intervals"
+kind = "derived_table"
+file = "sched_intervals.parquet"
+current_source = "tools/tx-observe-analyze.py PARQUET_SCHEMAS"
+columns = [
+  { name = "task", type = "UBIGINT" },
+  { name = "pid", type = "UBIGINT" },
+  { name = "hart", type = "UINTEGER" },
+  { name = "begin", type = "UBIGINT" },
+  { name = "end", type = "UBIGINT" },
+  { name = "dur", type = "UBIGINT" },
+]
+
+[[host.projections]]
+id = "lock_rows"
+kind = "derived_table"
+file = "lock_rows.parquet"
+current_source = "tools/tx-observe-analyze.py PARQUET_SCHEMAS"
+columns = [
+  { name = "ts", type = "UBIGINT" },
+  { name = "hart", type = "UINTEGER" },
+  { name = "lock_id", type = "UINTEGER" },
+  { name = "metric_id", type = "UINTEGER" },
+  { name = "value", type = "UBIGINT" },
+]
+
+[[host.projections]]
+id = "ds_method_rows"
+kind = "derived_table"
+file = "ds_method_rows.parquet"
+current_source = "tools/tx-observe-analyze.py PARQUET_SCHEMAS"
+columns = [
+  { name = "ts", type = "UBIGINT" },
+  { name = "hart", type = "UINTEGER" },
+  { name = "method_id", type = "UINTEGER" },
+  { name = "zone_id", type = "UINTEGER" },
+  { name = "metric_id", type = "UINTEGER" },
+  { name = "value", type = "UBIGINT" },
+]
+
+[[host.projections]]
+id = "names"
+kind = "sql_view"
+current_source = "tools/tx-observe-analyze.py NAME_SQL_SCHEMA; xtask/src/observe.rs names"
+columns = [
+  { name = "id", type = "UINTEGER" },
+  { name = "name", type = "VARCHAR" },
+]
+
+[[event_families]]
+id = "syscall"
+levels = ["boundary"]
+payloads = ["syscall_enter", "syscall_exit", "arg_value"]
+control_group = "always_on_when_observe_enabled"
+projection = ["spans", "records", "ndjson", "perfetto", "text_report"]
+
+[[event_families]]
+id = "drive"
+levels = ["drive", "step"]
+payloads = ["drive_begin", "drive_end", "step_outcome"]
+control_group = "always_on_when_observe_enabled"
+projection = ["spans", "records", "ndjson", "perfetto", "text_report"]
+
+[[event_families]]
+id = "yield"
+levels = ["yield"]
+payloads = ["yield_begin", "resume", "wait_source_notify"]
+control_group = "always_on_when_observe_enabled"
+projection = ["spans", "records", "ndjson", "perfetto", "text_report"]
+
+[[event_families]]
+id = "scheduler"
+levels = ["sched"]
+payloads = ["sched_switch", "process_label", "process_group", "process_fork"]
+control_group = "scheduler_reactor_metrics"
+projection = ["sched_intervals", "records", "ndjson", "perfetto", "text_report"]
+
+[[event_families]]
+id = "allocation"
+levels = ["mutation", "phase"]
+payloads = ["arg_value", "counter_value"]
+control_group = "always_on_when_callsite_enabled"
+projection = ["allocation_rows", "records", "perfetto", "text_report"]
+
+[[event_families]]
+id = "lock"
+levels = ["boundary"]
+payloads = ["counter_value"]
+control_group = "lock_metrics"
+projection = ["lock_rows", "records", "perfetto", "text_report"]
+
+[[event_families]]
+id = "ds_method"
+levels = ["boundary"]
+payloads = ["counter_value"]
+control_group = "ds_metrics"
+projection = ["ds_method_rows", "records", "perfetto", "text_report"]
+
+[[event_families]]
+id = "phase"
+levels = ["phase"]
+payloads = ["phase_transition"]
+control_group = "always_on_when_observe_enabled"
+projection = ["spans", "records", "ndjson", "perfetto"]
+
+[[event_families]]
+id = "mutation"
+levels = ["mutation"]
+payloads = ["mutation_zone_sign", "mutation_index_commit"]
+control_group = "always_on_when_callsite_enabled"
+projection = ["records", "ndjson", "perfetto"]
+
+[[event_families]]
+id = "panic"
+levels = ["boundary"]
+payloads = ["panic"]
+control_group = "always_on_when_observe_enabled"
+projection = ["records", "repairs", "ndjson", "perfetto", "text_report"]
+
+[[migration.checks]]
+id = "payload-tags-match-rust"
+description = "Compare [[payloads]].tag and rust_tag against TxPayloadTag."
+status = "enforced"
+
+[[migration.checks]]
+id = "payload-structs-match-rust"
+description = "Compare [[payloads]].struct, size_bytes, and fields against payload.rs structs and lib.rs size assertions."
+status = "enforced"
+
+[[migration.checks]]
+id = "levels-match-rust"
+description = "Compare [[abi.levels]] against TxTraceLevel."
+status = "enforced"
+
+[[migration.checks]]
+id = "record-kinds-match-rust"
+description = "Compare [[abi.record_kinds]] against TxTraceKind."
+status = "enforced"
+
+[[migration.checks]]
+id = "cfgs-match-workspace"
+description = "Compare [[controls.cfgs]] against Cargo.toml unexpected_cfgs."
+status = "enforced"
+
+[[migration.checks]]
+id = "projection-schema-match-analyzer"
+description = "Compare [[host.projections]] table schemas against tools/tx-observe-analyze.py."
+status = "enforced"
+
+[[migration.checks]]
+id = "event-family-refs-resolve"
+description = "Verify event family level, payload, control-group, and projection references resolve inside this schema."
+status = "enforced"
+
+[[migration.checks]]
+id = "explicit-tracks-match-rust-host"
+description = "Compare [[tracks.explicit]] against ALLOC_TRACK_* constants and Perfetto explicit track names."
+status = "enforced"
+
+[[migration.checks]]
+id = "stable-names-match-xtask-analyzer"
+description = "Compare names families and eventual concrete names against xtask/analyzer stable debug-name sources."
+status = "planned"
