@@ -665,8 +665,11 @@ fn icmpv6_unchecked_parser_accepts_busybox_pattern_echo_code() {
     );
 }
 
+/// External (non-configured) v6 destinations queue the echo for the device-TX
+/// lane instead of failing — the old `EOPNOTSUPP` contract was replaced by the
+/// external raw-ICMP TX path (external ping6).
 #[test]
-fn raw_icmpv6_unknown_peer_addr_stays_unsupported() {
+fn raw_icmpv6_unknown_peer_addr_queues_external_echo() {
     init_zones();
     let _lock = crate::test_support::EPOCH_TEST_LOCK
         .lock()
@@ -725,8 +728,11 @@ fn raw_icmpv6_unknown_peer_addr_stays_unsupported() {
             SendRecvFlags::empty(),
             &guard,
         ),
-        StepOutcome::Err(Errno::EOPNOTSUPP)
+        StepOutcome::Done(request_bytes.len())
     );
+    // The echo sits in the v6 device-TX queue with the FIB-selected source.
+    let payload = raw.acquire_operational().expect("raw payload");
+    assert_eq!(payload.peek_icmp6_tx_echo(), Some(request));
 }
 
 #[test]

@@ -948,6 +948,23 @@ impl SocketPayload {
         })
     }
 
+    // External v6 echo TX queue (mirror of the v4 icmp_tx_echo family above).
+    pub(crate) fn enqueue_icmp6_tx_echo(
+        &self,
+        packet: crate::net::protocol::Icmpv6EchoPacket,
+    ) -> Option<(usize, bool)> {
+        self.imp.icmp()?.enqueue_tx6_echo(packet)
+    }
+
+    pub(crate) fn peek_icmp6_tx_echo(&self) -> Option<crate::net::protocol::Icmpv6EchoPacket> {
+        self.imp.icmp()?.peek_tx6_echo()
+    }
+
+    /// Returns `became_available` after the sink accepted the head packet.
+    pub(crate) fn commit_icmp6_tx_echo_sent(&self) -> Option<bool> {
+        self.imp.icmp()?.commit_tx6_echo_sent()
+    }
+
     pub(crate) fn record_icmp_recv_echo_reply(&self, packet: Icmpv4EchoPacket) -> bool {
         let became_readable = self.imp.icmp()
             .is_some_and(|raw_icmp| raw_icmp.ingest_rx_echo_reply(packet));

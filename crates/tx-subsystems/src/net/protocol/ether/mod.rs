@@ -443,6 +443,18 @@ impl EtherIface {
         outcome
     }
 
+    /// Learn NDP neighbours from an already-demuxed RX dispatch WITHOUT
+    /// answering solicitations (`guard: None` skips the NA reply).
+    ///
+    /// External-ping RX/TX split: the boot-lane runtime drains the shared
+    /// netdev RX queue into ITS OWN v4-only `EtherIface`, while v6 TX/pending
+    /// live on the namespace's `ensure_ether_iface_for_link` iface. Without
+    /// this cross-feed the NA lands in the boot iface's table and the
+    /// namespace iface re-solicits forever (echo never leaves).
+    pub fn learn_ndisc_from_dispatch(&self, dispatch: &PacketDispatch, now: Instant) {
+        self.maybe_process_ndisc(dispatch, now, None);
+    }
+
     /// IPv6 V2: send due neighbour solicitations for pending v6 next-hops
     /// (mirror of [`flush_pending_arp_at`]). Driven by the same reactor step so
     /// one tick flushes both v4 ARP and v6 NDP probes.

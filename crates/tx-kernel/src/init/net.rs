@@ -159,14 +159,34 @@ fn publish_boot_net_device_to_namespace(
     let _ = namespace.attach_device_for_test_or_bootstrap(registration, Some(BOOT_ETH_IPV4));
 }
 
+impl BootNetRuntime {
+    /// Cross-feed NDP learning to the namespace's iface for the SAME netdev.
+    ///
+    /// The boot lane drains the shared RX queue into its own v4-only iface,
+    /// but external v6 TX/pending live on the namespace's
+    /// `ensure_ether_iface_for_link` iface — without this, an NA lands in the
+    /// boot iface's table and the namespace iface re-solicits forever.
+    /// `learn_ndisc_from_dispatch` learns without replying (no guard), so the
+    /// boot iface remains the only NS responder.
+    fn cross_feed_ndisc(&self, dispatch: &PacketDispatch, now: Instant) {
+        for iface in initial_net_namespace_payload().ether_ifaces_snapshot() {
+            if iface.netdev.devt == self.ether_iface.netdev.devt {
+                iface.learn_ndisc_from_dispatch(dispatch, now);
+            }
+        }
+    }
+}
+
 impl PacketSource for BootNetRuntime {
     fn next_packet(&self) -> Option<PacketDispatch> {
         let frame = self.ether_iface.netdev.ops.receive()?;
-        Some(self.ether_iface.process_frame_at(
+        let dispatch = self.ether_iface.process_frame_at(
             frame,
             Instant::ZERO,
             Option::<&tx_subsystems::execution::Guard<'_>>::None,
-        ))
+        );
+        self.cross_feed_ndisc(&dispatch, Instant::ZERO);
+        Some(dispatch)
     }
 
     fn next_packet_at(
@@ -175,7 +195,9 @@ impl PacketSource for BootNetRuntime {
         guard: &tx_subsystems::execution::Guard<'_>,
     ) -> Option<PacketDispatch> {
         let frame = self.ether_iface.netdev.ops.receive()?;
-        Some(self.ether_iface.process_frame_at(frame, now, Some(guard)))
+        let dispatch = self.ether_iface.process_frame_at(frame, now, Some(guard));
+        self.cross_feed_ndisc(&dispatch, now);
+        Some(dispatch)
     }
 }
 

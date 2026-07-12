@@ -1,3 +1,19 @@
+- 2026-07-12 (外部 raw ICMP 接设备 TX — QEMU 真机外部 ping6 3/3 全通). 目标:修 [netlink-write 修复后的遗留]外部
+  ping4/6 `sendto: Not supported`。**调研发现 v4 的外部 echo 基建早已在**(通用 reserve→`icmp_tx` 队列→device_tx 车道
+  `process_raw_icmp_tx_socket`,含 src 修正+PendingResolution 保留重试),只是 step_send 分派把所有非 loopback dst 拦去
+  configured-only 合成。**修①外部分派**:step_send v4 分派收窄(configured/组播→合成回显保留 netns/LTP 行为;真外部→
+  通用 reserve 入队);v6 新增 `send_external_icmpv6_echo`(解析 echo→`tx6_queue`→kick)+ icmp.rs v6 TX 队列/
+  `build_icmpv6_echo_request_packet` + payload 包装 + device_tx 车道 v6 分支。**修②双 iface RX/TX 分裂**(pcap 揪出:
+  NS 每秒重发、echo 永不出):boot-lane iface(v4-only)独占 RX drain,NA 学进它的表;v6 TX/pending 在 namespace ensure
+  iface 上,pending 永不清。修=kernel net.rs `cross_feed_ndisc`(RX dispatch 后对同 netdev 的 namespace iface 调
+  `learn_ndisc_from_dispatch`=V2 的 guard-None 只学不回,boot iface 仍是唯一 NS 应答者)。**验证**:QEMU 外部
+  **ping6 fec0::2 = 3/3 0% loss**(首包 59ms 含 NDP 往返都没丢——PendingResolution 保留重试生效;pcap:NS→NA→echo×3
+  全链)——**V1+V2+V3a+本修 全链真机端到端**;v4 echo request 到 wire(pcap+IP/ICMP checksum 手工验算全对),回程
+  **slirp 不回 v4 gateway ping = QEMU slirp 环境限制非内核 bug**(v6 有内建响应);集合差 321==321;**icmp_tests 对照
+  实验**(stash 前后):HEAD 隔离 7 挂→带改动 3 挂(那 3 个 HEAD 本挂=模块内级联,**改动净治好 4 个**);
+  external_connect/ndisc/route6 隔离全绿;git-net **8/8**。过时测试 `raw_icmpv6_unknown_peer_addr_stays_unsupported`
+  更新为新语义(→`_queues_external_echo`:Done+队列断言,单跑 ok)。**遗留**:boot/namespace 双 iface 结构债(本修是
+  cross-feed 补丁,统一 iface 归 P5 结构轮);v4 外部 ping 回程需真实对端(slirp 限制)。**Blocker**:无。
 - 2026-07-10 (修复 netlink `ip` 挂死 — write() 未路由到 netlink_route_send;真机验证 V3a). 症状:refactor 分支 tx.runsh
   lane 上 userspace `ip`(iproute2 + busybox 两种实现)全挂,挡住一切 netlink 网络配置(v4/v6 addr/route)。**QEMU 真机 +
   逐 syscall 原子探针定位**:`ip` 完成 socket/bind/getsockname 后挂在 **write(64)**——`ip` 用 `write(netlink_fd, RTM_GET*)`

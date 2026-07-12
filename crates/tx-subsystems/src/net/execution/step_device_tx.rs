@@ -5,7 +5,7 @@ use tx_substrate::zone::{Cap, PayloadCap};
 use crate::execution::{Guard, StepOutcome};
 use crate::net::namespace::{initial_net_namespace_payload, NetNamespacePayload};
 use crate::net::packet::{PacketTxReadiness, PacketTxResult, PacketTxSink};
-use crate::net::protocol::build_icmpv4_echo_request;
+use crate::net::protocol::{build_icmpv4_echo_request, build_icmpv6_echo_request_packet};
 use crate::net::structure::{
     IpEndpoint, Ipv4Address, SendWireSet, SocketIdentity, SocketProtocol, TcpState, UdpInner,
 };
@@ -360,6 +360,43 @@ fn process_raw_icmp_tx_socket(
         return;
     };
     let Some(mut echo) = payload.peek_icmp_tx_echo() else {
+        // External v6 echo lane (mirror of the v4 flow below): queued by
+        // step_send for a non-configured (real external) v6 destination.
+        // dispatch_ip_at's version nibble routes the packet into
+        // dispatch_ipv6_at (route → NDP → wire); PendingResolution keeps it
+        // queued so the retry after neighbour resolution actually sends it.
+        let Some(echo6) = payload.peek_icmp6_tx_echo() else {
+            return;
+        };
+        if sink.readiness_at(now, guard) == PacketTxReadiness::Busy {
+            outcome.raw_icmp_busy += 1;
+            return;
+        }
+        let packet = build_icmpv6_echo_request_packet(&echo6);
+        outcome.raw_icmp_attempted += 1;
+        match sink.transmit_at(packet.as_bytes(), now, guard) {
+            PacketTxResult::Accepted { frame_len } => {
+                let Some(became_available) = payload.commit_icmp6_tx_echo_sent() else {
+                    outcome.raw_icmp_failed += 1;
+                    return;
+                };
+                outcome.raw_icmp_packets += 1;
+                outcome.tx_bytes += frame_len;
+                outcome.sockets_touched += 1;
+                if became_available {
+                    outcome.wakes_fired += ident.readiness.fire_send(SendWireSet::SPACE);
+                }
+            }
+            PacketTxResult::Busy => {
+                outcome.raw_icmp_busy += 1;
+            }
+            PacketTxResult::PendingResolution { .. } => {
+                outcome.raw_icmp_resolution_pending += 1;
+            }
+            PacketTxResult::Failed { .. } => {
+                outcome.raw_icmp_failed += 1;
+            }
+        }
         return;
     };
     if sink.readiness_at(now, guard) == PacketTxReadiness::Busy {

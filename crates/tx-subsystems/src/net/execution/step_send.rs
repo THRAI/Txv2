@@ -251,7 +251,16 @@ pub fn step_send_to_kernel_bytes_with_poll_kick(
                 return StepOutcome::Err(Errno::EAFNOSUPPORT);
             }
             if !destination.is_loopback() && !destination.is_unspecified() {
-                return send_configured_icmpv4_echo(&payload, destination.addr, bytes, guard);
+                // Configured/local-multicast peers keep the synthesized
+                // loopback-style reply (netns/LTP flows). A real external
+                // destination falls through to the generic reserve below —
+                // icmp tx queue → device-TX lane → wire (replies come back
+                // through the demux → process_icmp_event → raw socket).
+                if ipv4_multicast_group_is_joined_locally(destination.addr)
+                    || ipv4_addr_is_configured(destination.addr)
+                {
+                    return send_configured_icmpv4_echo(&payload, destination.addr, bytes, guard);
+                }
             }
         }
     }
@@ -588,7 +597,7 @@ fn deliver_icmpv4_reply_to_table(
 }
 
 fn send_raw_ipv6(
-    _socket: &Cap<SocketIdentity>,
+    socket: &Cap<SocketIdentity>,
     payload: &SocketPayload,
     dst: Option<IpEndpoint>,
     bytes: &[u8],
@@ -622,7 +631,13 @@ fn send_raw_ipv6(
         .unwrap_or(Ipv6Address::LOOPBACK);
 
     if !destination.is_loopback() && !destination.is_unspecified() {
-        return send_configured_icmpv6_echo(payload, protocol, src_addr, dst_addr, bytes, guard);
+        if ipv6_addr_is_configured(dst_addr) {
+            return send_configured_icmpv6_echo(payload, protocol, src_addr, dst_addr, bytes, guard);
+        }
+        // Real external v6 destination: queue for the device-TX lane (mirror
+        // of the v4 external echo flow). Replies come back through the wire
+        // demux (PacketDispatch::Icmp6) into this raw socket.
+        return send_external_icmpv6_echo(socket, payload, protocol, src_addr, dst_addr, bytes);
     }
 
     let packet = RawIpv6Packet {
@@ -640,6 +655,34 @@ fn send_raw_ipv6(
         packet,
         guard,
     );
+    StepOutcome::Done(bytes.len())
+}
+
+/// External (non-configured) v6 echo: parse the request and queue it for the
+/// device-TX lane, mirroring the v4 external flow through the generic reserve.
+fn send_external_icmpv6_echo(
+    socket: &Cap<SocketIdentity>,
+    payload: &SocketPayload,
+    protocol: ProtocolNumber,
+    src_addr: Ipv6Address,
+    dst_addr: Ipv6Address,
+    bytes: &[u8],
+) -> ByteStepOutcome<usize> {
+    if protocol != ProtocolNumber(58) {
+        return StepOutcome::Err(Errno::EOPNOTSUPP);
+    }
+    let request = match parse_icmpv6_payload_unchecked(src_addr, dst_addr, bytes) {
+        Icmpv6Event::EchoRequest(request) => request,
+        Icmpv6Event::Malformed => return StepOutcome::Err(Errno::EINVAL),
+        Icmpv6Event::EchoReply(_) | Icmpv6Event::Unsupported => {
+            return StepOutcome::Err(Errno::EOPNOTSUPP)
+        }
+    };
+    if payload.enqueue_icmp6_tx_echo(request).is_none() {
+        socket.readiness.clear_send(SendWireSet::SPACE);
+        return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
+    }
+    net_delegate_kick_poll();
     StepOutcome::Done(bytes.len())
 }
 
