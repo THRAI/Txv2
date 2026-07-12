@@ -14,6 +14,14 @@
   external_connect/ndisc/route6 隔离全绿;git-net **8/8**。过时测试 `raw_icmpv6_unknown_peer_addr_stays_unsupported`
   更新为新语义(→`_queues_external_echo`:Done+队列断言,单跑 ok)。**遗留**:boot/namespace 双 iface 结构债(本修是
   cross-feed 补丁,统一 iface 归 P5 结构轮);v4 外部 ping 回程需真实对端(slirp 限制)。**Blocker**:无。
+- 2026-07-12 (vendor 编译必需 blob 白名单入 git — 初赛 0 分事故根治). 症状(初赛实锤,用户文档):评测机 clone 后
+  `include_bytes!` 两处(rootfs_shims.rs:436 la busybox-full / :486 tx-netfast)找不到 `/tools/images/vendor/` 下被
+  gitignore 的 blob → **双架构编译崩、全部测例 0 分**;初赛应急是删嵌入弃功能(06a16d21,评测仓)。**根治(保功能)**:
+  .gitignore 改 `/vendor/*` + `!` 白名单(**坑:整目录忽略时 `!` 例外无效,必须忽略"内容"**)入 git:tx-netfast-riscv64
+  (16KB,sha 验证)+ busybox-loongarch64-musl(1.4MB;**工作树 blob 与 .sha256 漂移 23 分钟——信被全量验证过的 blob,
+  重生成 sha**)+ 全部 .sha256/.SOURCE;rv busybox(1MB,仅 image 组装非编译必需)维持脚本获取。xtask doctor 加
+  tx-netfast 存在性+sha256 漂移检查(改 netfast.c 忘重编的防线)。**纪律:include_bytes! 的文件=白名单入 git 或
+  build.rs 生成,禁止"手工产物+被 ignore";推关键改动后 `git clean -ndx` 预演看会删掉什么编译必需品**。
 - 2026-07-10 (修复 netlink `ip` 挂死 — write() 未路由到 netlink_route_send;真机验证 V3a). 症状:refactor 分支 tx.runsh
   lane 上 userspace `ip`(iproute2 + busybox 两种实现)全挂,挡住一切 netlink 网络配置(v4/v6 addr/route)。**QEMU 真机 +
   逐 syscall 原子探针定位**:`ip` 完成 socket/bind/getsockname 后挂在 **write(64)**——`ip` 用 `write(netlink_fd, RTM_GET*)`
