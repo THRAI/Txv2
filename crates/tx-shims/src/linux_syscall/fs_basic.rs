@@ -1512,7 +1512,12 @@ pub(super) fn sys_ioctl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
     if let RNodeBacking::StructBacked { payload } = rnode.backing() {
         match payload {
             StructPayload::Socket { .. } => {
-                return sys_socket_ioctl(request, argp, ctx);
+                // Route to the FULL socket-ioctl implementation in socket.rs
+                // (SIOCGIFNAME/SIOCSIFADDR/SIOCGIFCONF/ARP/route/...). A local
+                // 6-arm duplicate used to shadow it, silently ENOTTY-ing
+                // if_indextoname (LTP in6_02) and ifconfig address setup
+                // (if4-addr-change) — the full version was dead code.
+                return super::socket::sys_socket_ioctl(request, argp, ctx);
             }
             StructPayload::CharDevice(binding) => {
                 if binding.name == "rtc" && request == RTC_RD_TIME {
@@ -1732,141 +1737,6 @@ impl RtcTime {
             tm_yday: 142,
             tm_isdst: 0,
         }
-    }
-}
-
-fn sys_socket_ioctl<'a>(request: u32, argp: u64, ctx: &SyscallCtx<'a>) -> SyscallResult {
-    const IFREQ_NAME_BYTES: usize = 16;
-    const IFREQ_DATA_OFFSET: u64 = IFREQ_NAME_BYTES as u64;
-    const IFF_UP: i16 = 0x0001;
-    const IFF_BROADCAST: i16 = 0x0002;
-    const IFF_LOOPBACK: i16 = 0x0008;
-    const IFF_RUNNING: i16 = 0x0040;
-    const IFF_MULTICAST: i16 = 0x1000;
-
-    if argp == 0 {
-        return SyscallResult::Error(EFAULT_VALUE);
-    }
-
-    let mut name_bytes = [0u8; IFREQ_NAME_BYTES];
-    if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut name_bytes, argp) {
-        return SyscallResult::Error(errno_to_i32(errno));
-    }
-    let end = name_bytes
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(IFREQ_NAME_BYTES);
-    let Ok(ifname) = core::str::from_utf8(&name_bytes[..end]) else {
-        return SyscallResult::Error(EINVAL_VALUE);
-    };
-
-    let Some(netns) = ctx.process.net_namespace() else {
-        return SyscallResult::Error(ESRCH_VALUE);
-    };
-    let require_net_admin = || {
-        if let Some(owner) = netns.owner_user_namespace() {
-            let current = ctx.process.nsproxy_cap().ok_or(Errno::ESRCH)?;
-            tx_subsystems::net::require_net_admin_in_user_namespace(
-                ctx.cred(),
-                &current.user_ns,
-                &owner,
-            )
-        } else {
-            tx_subsystems::net::require_net_admin(ctx.cred())
-        }
-    };
-    let link = netns
-        .link_snapshot()
-        .into_iter()
-        .find(|link| link.name == ifname);
-
-    match request {
-        SIOCGIFFLAGS => {
-            let Some(link) = link else {
-                return SyscallResult::Error(ENODEV_VALUE);
-            };
-            let mut flags = IFF_RUNNING;
-            if link.is_up {
-                flags |= IFF_UP;
-            }
-            if link.is_loopback {
-                flags |= IFF_LOOPBACK;
-            } else {
-                flags |= IFF_BROADCAST | IFF_MULTICAST;
-            }
-            match bootstrap_write_user(&ctx.aspace, argp + IFREQ_DATA_OFFSET, flags) {
-                Ok(()) => SyscallResult::Return(0),
-                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
-            }
-        }
-        SIOCSIFFLAGS => {
-            let Some(link) = link else {
-                return SyscallResult::Error(ENODEV_VALUE);
-            };
-            let auth = match require_net_admin() {
-                Ok(auth) => auth,
-                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
-            };
-            let requested: i16 = match bootstrap_read_user(&ctx.aspace, argp + IFREQ_DATA_OFFSET) {
-                Ok(flags) => flags,
-                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
-            };
-            match netns.set_device_up_by_ifindex(auth, link.ifindex, requested & IFF_UP != 0) {
-                Ok(()) => SyscallResult::Return(0),
-                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
-            }
-        }
-        SIOCGIFMTU => {
-            let Some(link) = link else {
-                return SyscallResult::Error(ENODEV_VALUE);
-            };
-            let mtu = i32::from(link.mtu);
-            match bootstrap_write_user(&ctx.aspace, argp + IFREQ_DATA_OFFSET, mtu) {
-                Ok(()) => SyscallResult::Return(0),
-                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
-            }
-        }
-        SIOCSIFMTU => {
-            let Some(link) = link else {
-                return SyscallResult::Error(ENODEV_VALUE);
-            };
-            let auth = match require_net_admin() {
-                Ok(auth) => auth,
-                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
-            };
-            let requested: i32 = match bootstrap_read_user(&ctx.aspace, argp + IFREQ_DATA_OFFSET) {
-                Ok(mtu) => mtu,
-                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
-            };
-            let Ok(requested) = u16::try_from(requested) else {
-                return SyscallResult::Error(EINVAL_VALUE);
-            };
-            match netns.set_device_mtu_by_ifindex(auth, link.ifindex, requested) {
-                Ok(()) => SyscallResult::Return(0),
-                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
-            }
-        }
-        SIOCGIFINDEX => {
-            let Some(link) = link else {
-                return SyscallResult::Error(ENODEV_VALUE);
-            };
-            let ifindex = link.ifindex as i32;
-            match bootstrap_write_user(&ctx.aspace, argp + IFREQ_DATA_OFFSET, ifindex) {
-                Ok(()) => SyscallResult::Return(0),
-                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
-            }
-        }
-        SIOCGIFTXQLEN => {
-            if link.is_none() {
-                return SyscallResult::Error(ENODEV_VALUE);
-            }
-            let tx_queue_len = 0i32;
-            match bootstrap_write_user(&ctx.aspace, argp + IFREQ_DATA_OFFSET, tx_queue_len) {
-                Ok(()) => SyscallResult::Return(0),
-                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
-            }
-        }
-        _ => SyscallResult::Error(errno_to_i32(Errno::ENOTTY)),
     }
 }
 

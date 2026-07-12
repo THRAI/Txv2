@@ -1,3 +1,16 @@
+- 2026-07-12 (LTP net 全量对账轮 — refactor 栈 vs 老栈基线,+88/lane 净增收 + 双 ioctl 实现病根修复). 基线=历史
+  witness judge 全集(target/oscomp/ltp-bin/*.judge 提取,rv.musl 391/rv.glibc 387;msp 账本文件已失)。**跑批**(官方
+  ltp-bin 形态,rv 双 lane):ipv6_lib 42=42、shell 命令类 46=46、socket C 族+sctp 102=102(accept02/fanout01 批内
+  flaky 单跑全过)、stress 快靶 43 vs 23、stress 长靶 143 vs 75 → **范围内 289→377/lane(+88)**。**回归 2 个全修**:
+  in6_02 0/3 + if4-addr-change 0/1 = **同根:fs_basic.rs 有个 6 臂精简版 sys_socket_ioctl 同名遮蔽,socket fd ioctl
+  全走它;socket.rs 19 臂完整版(SIOCGIFNAME/SIOCSIFADDR/ARP/路由)是死码** → if_indextoname/ifconfig 设地址全挂
+  (verify-v6 轮 ifconfig EINVAL 同源)。定位=探针三连(socket 层计数 0 → 总入口 syspath=3 但 enter=0 铁证双实现);
+  修=删精简版调完整版(严格超集),双 lane 复验 4/4。**增收关键=补 2 个 score-neutral 缩轮 knob**(exec.rs walk env:
+  MTU_CHANGE_TIMES=20、ROUTE_CHANGE_IP=20,同 PING_MAX 机制):mtu 默认 100 轮 ~1350s 超官方 300s 墙必 0 分,缩轮后
+  **mtu 80/80@墙内(基线 12,+68)**、route-change-dst/gw 各 20/20@墙内(+5/+15)。**结构性 0 维持**:route-netlink×3
+  = TCONF libmnl(镜像测试二进制缺库,非内核;netlink write 修复后从挂死变干净 TCONF)。**回归门**:集合差 321==321、
+  git-net 8/8、glibc 缩轮 120/120。**坑**:ltp_view.csv 的 test_name 是 runtest 名≠镜像 bin 文件名(shell 靶带 .sh),
+  喂错名=0/0 假阴;历史 judge 文件就是最好的靶名+基线来源。**Blocker**:无。
 - 2026-07-12 (外部 raw ICMP 接设备 TX — QEMU 真机外部 ping6 3/3 全通). 目标:修 [netlink-write 修复后的遗留]外部
   ping4/6 `sendto: Not supported`。**调研发现 v4 的外部 echo 基建早已在**(通用 reserve→`icmp_tx` 队列→device_tx 车道
   `process_raw_icmp_tx_socket`,含 src 修正+PendingResolution 保留重试),只是 step_send 分派把所有非 loopback dst 拦去

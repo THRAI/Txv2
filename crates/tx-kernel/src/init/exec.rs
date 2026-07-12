@@ -1787,7 +1787,9 @@ fn append_ltp_walk_env(cmd: &mut alloc::string::String, lane_root: &str) {
         cmd,
         "; [ -n \"$IF_UPDOWN_TIMES\" ] || export IF_UPDOWN_TIMES=20\
          ; [ -n \"$IP_TOTAL\" ] || export IP_TOTAL=20\
-         ; [ -n \"$ROUTE_TOTAL\" ] || export ROUTE_TOTAL=20"
+         ; [ -n \"$ROUTE_TOTAL\" ] || export ROUTE_TOTAL=20\
+         ; [ -n \"$MTU_CHANGE_TIMES\" ] || export MTU_CHANGE_TIMES=20\
+         ; [ -n \"$ROUTE_CHANGE_IP\" ] || export ROUTE_CHANGE_IP=20"
     );
     // busybox ash on some builds (the la image's v1.33.1 and the kernel-shipped
     // full busybox) mis-handles `eval "local x=\$$1"`: it leaves the variable
