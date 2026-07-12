@@ -1,0 +1,6 @@
+tx-netfast-riscv64: freestanding static multicall fast-path binary for the
+LTP walk (/tx-ltp/bin hot-command shims: ping ping6 ip tst_ns_exec awk grep
+cut cat pgrep tst_sleep).
+
+Source:  tools/netfast/netfast.c (this repo)
+Rebuild: tools/netfast/build.sh   (needs riscv64-linux-gnu-gcc)
