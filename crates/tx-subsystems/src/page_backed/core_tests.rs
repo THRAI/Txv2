@@ -1214,6 +1214,27 @@ fn file_page_planned_write_marks_pageslot_dirty() {
 }
 
 #[test]
+fn file_page_compat_write_marks_pageslot_dirty() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let guard = step_engine::guard();
+    let fs = Arc::new(RecordingFs::new());
+    let pc = file_page_container(fs.clone(), fs, FsObjectId::new(94), 4);
+    let page = PageIndex::new(1);
+
+    match pc.materialize_page(page, MaterializeAccess::Write, &guard) {
+        V3Out::Done(_) => {}
+        other => panic!("expected compatibility write materialization, got {other:?}"),
+    }
+
+    let snapshot = pc
+        .file_page_slot_snapshot_for_test(page)
+        .expect("compatibility page slot");
+    assert!(matches!(snapshot.state, PageSlotState::Dirty { .. }));
+    assert!(pc.page_marks(page).expect("compatibility page marks").dirty);
+}
+
+#[test]
 fn file_page_materialize_bio_only_plan_yields_without_compat_fetch() {
     let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
     setup_host_substrate();

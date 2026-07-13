@@ -1863,7 +1863,11 @@ impl PageContainer {
             if matches!(installed_dirty, Ok(Some(_))) {
                 if let Some(slot) = state.file_page_slots.get(&page) {
                     if slot.generation() == fetch_generation {
-                        let _ = slot.complete_fetch(fetch_generation, Ok(ppn));
+                        if slot.complete_fetch(fetch_generation, Ok(ppn)).is_ok()
+                            && access == MaterializeAccess::Write
+                        {
+                            let _ = slot.mark_dirty();
+                        }
                     }
                 }
             }
