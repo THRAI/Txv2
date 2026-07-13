@@ -80,7 +80,7 @@
         "cargo test -p tx-subsystems --lib page_backed",
         "cargo test -p tx-subsystems --lib io_manager"
       ],
-      "notes": "Initial redirty state-machine sub-slice landed and passed the PageBacked suite. Fsync frontier, source-lease installation, and no-lock integration remain pending before this step can complete."
+      "notes": "Landed redirty preservation, fsync-frontier classification, the missing Phase-0 PageContainer L4 compatibility baseline, and PageSlot dirty transitions for both planner and FsPageBacking write materialization. Source-lease installation, writeback completion routing, and live fsync frontier waiting remain pending before this step can complete. Legacy flush_page may Yield without an L4 completion owner, so it must not transition a slot into async Writeback until that bridge exists."
     },
     {
       "id": "6c-ext4-read-planner",
@@ -181,6 +181,11 @@
       "command": "cargo check -p tx-subsystems",
       "status": "passed",
       "notes": "Passed with the existing unused guard warning in net step_connect."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib page_backed -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 119 PageBacked tests after L4 compatibility-path landing and planner/compat PageSlot dirty-state coverage. The serial harness is required because the default parallel host harness can nest same-CPU epoch guards in unrelated tests."
     }
   ],
   "risks": [
