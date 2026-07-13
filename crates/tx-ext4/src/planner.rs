@@ -6,8 +6,8 @@ use alloc::vec;
 
 use tx_subsystems::execution::Errno;
 use tx_subsystems::fs_iface::{
-    BackendPageRequest, BackendPlan, BackendPlanner, BioPlanList, IoDataTarget, PageCompletion,
-    PageCompletionList, PageFrameRef, PagerResumeToken,
+    BackendPageRequest, BackendPlan, BackendPlanner, BioPlanList, IoDataSource, IoDataTarget,
+    PageCompletion, PageCompletionList, PageFrameRef, PagerResumeToken,
 };
 use tx_subsystems::io_manager::block::{BioPlan, BioVec, BlockFlags, BlockOp, DeviceKey, LbaRange};
 
@@ -246,7 +246,10 @@ impl<S: Ext4ReadMappingSource> BackendPlanner for Ext4ReadPlanner<S> {
             | tx_subsystems::io_manager::page::PageIoOp::Readahead => {
                 plan_read_request(self.geometry, &request, self.mapping.map_page(&request))
             }
-            _ => BackendPlan::Err(Errno::ENOSYS),
+            tx_subsystems::io_manager::page::PageIoOp::Writeback => {
+                plan_writeback_request(self.geometry, &request, self.mapping.map_page(&request))
+            }
+            tx_subsystems::io_manager::page::PageIoOp::Fsync => BackendPlan::Err(Errno::ENOSYS),
         }
     }
 
@@ -314,6 +317,31 @@ pub fn plan_read_request(
     }
 }
 
+/// Translate an already-mapped dirty page into one L6 data write.
+///
+/// L4 retains the source lease and releases it only after the matching
+/// generation-checked writeback completion. Allocation, hole conversion, and
+/// journal ordering deliberately stay out of this data-only plan until the
+/// Phase 6D metadata graph and Phase 6E durability fence exist.
+pub fn plan_writeback_request(
+    geometry: Ext4BlockGeometry,
+    request: &BackendPageRequest,
+    mapping: Ext4ReadMapping,
+) -> BackendPlan {
+    match mapping {
+        Ext4ReadMapping::Data { physical_block } => {
+            match geometry.plan_write(physical_block, &request.source) {
+                Ok(bio) => BackendPlan::SubmitBios(BioPlanList::from_vec(vec![bio])),
+                Err(errno) => BackendPlan::Err(errno),
+            }
+        }
+        Ext4ReadMapping::Hole | Ext4ReadMapping::MetadataFirst { .. } => {
+            BackendPlan::Err(Errno::ENOSYS)
+        }
+        Ext4ReadMapping::Err(errno) => BackendPlan::Err(errno),
+    }
+}
+
 impl Ext4BlockGeometry {
     pub const fn new(device: DeviceKey, sectors_per_block: u64) -> Self {
         Self {
@@ -339,6 +367,29 @@ impl Ext4BlockGeometry {
         Ok(BioPlan::new(
             self.device,
             BlockOp::Read,
+            LbaRange::new(lba, self.sectors_per_block),
+            vec![bio_vec(*frame, *offset, *len)],
+            BlockFlags::EMPTY,
+        ))
+    }
+
+    /// Build one L6 write bio for an L4-owned dirty page-cache source.
+    pub fn plan_write(self, physical_block: u64, source: &IoDataSource) -> Result<BioPlan, Errno> {
+        let IoDataSource::PageCache {
+            frame, offset, len, ..
+        } = source
+        else {
+            return Err(Errno::EINVAL);
+        };
+        if self.sectors_per_block == 0 || *len != BLOCK_SIZE as u32 {
+            return Err(Errno::EINVAL);
+        }
+        let lba = physical_block
+            .checked_mul(self.sectors_per_block)
+            .ok_or(Errno::EINVAL)?;
+        Ok(BioPlan::new(
+            self.device,
+            BlockOp::Write,
             LbaRange::new(lba, self.sectors_per_block),
             vec![bio_vec(*frame, *offset, *len)],
             BlockFlags::EMPTY,
@@ -398,6 +449,50 @@ mod tests {
         assert_eq!(plan.device, DeviceKey::new(7));
         assert_eq!(plan.lba, LbaRange::new(88, 8));
         assert_eq!(plan.vecs, vec![BioVec::new(9, 0, BLOCK_SIZE as u32)]);
+    }
+
+    #[test]
+    fn mapped_ext4_block_plans_l6_write_from_page_cache_source() {
+        let source = IoDataSource::page_cache(
+            IoDataLeaseId::new(1),
+            PageFrameRef::new(Ppn(9)),
+            0,
+            BLOCK_SIZE as u32,
+        );
+        let plan = Ext4BlockGeometry::new(DeviceKey::new(7), 8)
+            .plan_write(11, &source)
+            .expect("mapped block write plan");
+        assert_eq!(plan.device, DeviceKey::new(7));
+        assert_eq!(plan.op, BlockOp::Write);
+        assert_eq!(plan.lba, LbaRange::new(88, 8));
+        assert_eq!(plan.vecs, vec![BioVec::new(9, 0, BLOCK_SIZE as u32)]);
+    }
+
+    #[test]
+    fn writeback_plan_rejects_hole_until_metadata_graph_exists() {
+        let request = BackendPageRequest::new_with_source_and_target(
+            tx_subsystems::fs_iface::FsObjectKey::new(3),
+            tx_subsystems::io_manager::page::PageIoRequestId::new(4),
+            tx_subsystems::io_manager::page::PageIoRange::new(5, 1),
+            tx_subsystems::io_manager::page::PageIoOp::Writeback,
+            tx_subsystems::io_manager::page::PageIoFlags::WRITEBACK,
+            Some(tx_subsystems::io_manager::page::PageGeneration::new(6)),
+            IoDataSource::page_cache(
+                IoDataLeaseId::new(2),
+                PageFrameRef::new(Ppn(10)),
+                0,
+                BLOCK_SIZE as u32,
+            ),
+            IoDataTarget::None,
+        );
+        assert_eq!(
+            plan_writeback_request(
+                Ext4BlockGeometry::new(DeviceKey::new(7), 8),
+                &request,
+                Ext4ReadMapping::Hole,
+            ),
+            BackendPlan::Err(Errno::ENOSYS)
+        );
     }
 
     #[test]

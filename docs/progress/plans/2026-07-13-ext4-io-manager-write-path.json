@@ -114,7 +114,7 @@
         "cargo test -p tx-ext4 --lib",
         "cargo test -p tx-subsystems --lib page_backed"
       ],
-      "notes": "This is not a durable fsync claim until the ordered journal slice is complete."
+      "notes": "Mapped data pages now plan `BlockOp::Write` bios directly from the L4-owned PageCache source lease; L5 neither copies nor releases that frame. Hole allocation, extent-child metadata miss, inode/bitmap mutation, and journal ordering remain explicitly ENOSYS until the write metadata graph and 6E ordered JBD2 fence exist. This is not a durable fsync claim."
     },
     {
       "id": "6e-jbd2-durability",
