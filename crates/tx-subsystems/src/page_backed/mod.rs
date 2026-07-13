@@ -21,7 +21,7 @@ use adapter::step_engine::{
 };
 
 use crate::execution::{Errno, Guard};
-use crate::fs_iface::FsObjectKey;
+use crate::fs_iface::{FsObjectKey, IoDataLeaseId, IoDataSource};
 use crate::io_manager::backend::{
     dispatch_backend_plan, BlockPageCompletion, BlockPageRequestTracker, PageFrameRef,
 };
@@ -556,6 +556,7 @@ struct PageContainerState {
     file_page_slots: BTreeMap<PageIndex, PageSlot>,
     in_flight_file_pages: BTreeMap<PageIndex, FilePageFetch>,
     file_io_service: PageService,
+    file_io_leases: BTreeMap<PageIoRequestId, PageLease>,
     file_block_runtime: FileIoBlockRuntime,
     // Page-scoped retry sources are retained so a task that already received
     // `Yield` can still register and consume a pending wake before it retries
@@ -801,6 +802,7 @@ impl PageContainer {
                 file_page_slots: BTreeMap::new(),
                 in_flight_file_pages: BTreeMap::new(),
                 file_io_service: PageService::new(1024),
+                file_io_leases: BTreeMap::new(),
                 file_block_runtime: FileIoBlockRuntime::new(1024, 16),
                 file_page_waits: BTreeMap::new(),
                 next_file_fetch_id: 1,
@@ -989,7 +991,10 @@ impl PageContainer {
                         work.push(PageServiceDrivenWork::Completion(route));
                     }
                     PageServiceWork::Submission(request) => {
-                        let Some(plan) = context.plan_submission(request.clone()) else {
+                        let source = self.file_io_source_for_submission(&request);
+                        let Some(plan) =
+                            context.plan_submission_with_source(request.clone(), source)
+                        else {
                             work.push(PageServiceDrivenWork::UnplannedSubmission(request));
                             continue;
                         };
@@ -1119,12 +1124,33 @@ impl PageContainer {
         &self,
         route: &PageCompletionRoute,
     ) -> Option<Result<PageSlotSnapshot, PageSlotCompletionError>> {
-        if route.completion.kind != PageIoCompletionKind::ReadInstalled
-            || route.completion.range.page_count() != 1
-        {
+        if route.completion.range.page_count() != 1 {
             return None;
         }
         let page = PageIndex::new(route.completion.range.start_page());
+        if route.completion.kind == PageIoCompletionKind::WritebackFinished {
+            let mut state = self.state.lock();
+            let lease = state.file_io_leases.remove(&route.completion.id);
+            let slot = state.file_page_slots.get(&page)?;
+            let result = slot.complete_writeback(
+                route.completion.generation,
+                match route.completion.result {
+                    PageIoResult::Done => Ok(()),
+                    PageIoResult::Err(errno) => Err(errno),
+                },
+            );
+            if let Ok(snapshot) = result {
+                let _ = state.pages.clear_mark(page, PageCacheMark::Writeback);
+                if matches!(snapshot.state, PageSlotState::Resident { .. }) {
+                    let _ = state.pages.clear_mark(page, PageCacheMark::Dirty);
+                }
+            }
+            drop(lease);
+            return Some(result);
+        }
+        if route.completion.kind != PageIoCompletionKind::ReadInstalled {
+            return None;
+        }
         let PageIoResult::Err(errno) = route.completion.result else {
             return route.frame.map(|frame| {
                 let result = self.apply_file_io_read_frame_completion(
@@ -1155,6 +1181,30 @@ impl PageContainer {
             );
         }
         Some(result)
+    }
+
+    fn file_io_source_for_submission(&self, request: &PageIoRequest) -> IoDataSource {
+        if request.op != PageIoOp::Writeback || request.range.page_count() != 1 {
+            return IoDataSource::None;
+        }
+        let page = PageIndex::new(request.range.start_page());
+        let Some(ppn) = self.state.lock().pages.load(page).map(|entry| entry.ppn) else {
+            return IoDataSource::None;
+        };
+        let Ok(cache_pin) = page_allocator::acquire_cache_pin(ppn) else {
+            return IoDataSource::None;
+        };
+        let lease = PageLease {
+            ppn,
+            cache_pin: PageCachePin::Allocated(cache_pin),
+        };
+        self.state.lock().file_io_leases.insert(request.id, lease);
+        IoDataSource::page_cache(
+            IoDataLeaseId::new(request.id.raw()),
+            PageFrameRef::new(ppn),
+            0,
+            crate::vm::USER_PAGE_SIZE as u32,
+        )
     }
 
     fn apply_file_io_read_frame_completion(
