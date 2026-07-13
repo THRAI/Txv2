@@ -1278,6 +1278,11 @@ impl PageContainer {
     }
 
     #[cfg(test)]
+    fn file_io_lease_count_for_test(&self) -> usize {
+        self.state.lock().file_io_leases.len()
+    }
+
+    #[cfg(test)]
     fn file_io_pending_request_for_test(&self, page: PageIndex) -> Option<PageIoRequest> {
         let state = self.state.lock();
         state

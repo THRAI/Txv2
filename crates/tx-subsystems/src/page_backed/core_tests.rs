@@ -1246,6 +1246,64 @@ fn file_page_writeback_admission_transitions_dirty_slot_and_queues_request() {
 }
 
 #[test]
+fn file_page_writeback_leases_source_until_completion() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::new());
+    let planner = Arc::new(SourceRecordingPlanner::new());
+    let pc =
+        file_page_container_with_planner(fs.clone(), fs, FsObjectId::new(96), 4, planner.clone());
+    let page = PageIndex::new(1);
+    let frame = cached_frame_for_test();
+    let ppn = frame.ppn;
+    let generation = {
+        let mut state = pc.state.lock();
+        state
+            .pages
+            .install_if_absent(page, frame)
+            .expect("seed page");
+        let slot = state.file_page_slots.entry(page).or_default();
+        let PageSlotFetch::Owner { generation } = slot.begin_fetch() else {
+            panic!("fetch owner");
+        };
+        slot.complete_fetch(generation, Ok(ppn)).expect("resident");
+        let dirty = slot.mark_dirty().expect("dirty");
+        state.pages.mark_dirty(page).expect("dirty mark");
+        dirty.generation
+    };
+    let id = pc
+        .queue_file_page_writeback(page)
+        .expect("writeback request");
+    let mut block_queue = BlockQueue::new(4);
+    pc.drive_file_io_service_once(ServiceBudget::new(1), &mut block_queue, |_| true)
+        .expect("planner turn");
+    assert!(
+        matches!(*planner.source.lock(), Some(IoDataSource::PageCache { frame, .. }) if frame.ppn() == ppn)
+    );
+    assert_eq!(pc.file_io_lease_count_for_test(), 1);
+    pc.state
+        .lock()
+        .file_io_service
+        .push_completion(PageIoCompletion::new(
+            id,
+            PageIoRange::new(page.as_u64(), 1),
+            PageIoResult::Done,
+            generation,
+            PageIoCompletionKind::WritebackFinished,
+        ));
+    pc.drive_file_io_service_once(ServiceBudget::new(1), &mut block_queue, |_| true)
+        .expect("completion turn");
+    assert_eq!(pc.file_io_lease_count_for_test(), 0);
+    assert_eq!(
+        pc.file_page_slot_snapshot_for_test(page)
+            .expect("slot")
+            .state,
+        PageSlotState::Resident { ppn }
+    );
+    assert!(!pc.page_marks(page).expect("marks").dirty);
+}
+
+#[test]
 fn file_page_materialize_uses_frame_planner_before_compat_fetch() {
     let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
     setup_host_substrate();
