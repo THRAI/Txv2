@@ -96,7 +96,7 @@
         "cargo test -p tx-ext4 --lib",
         "cargo check -p tx-ext4 -p tx-subsystems"
       ],
-      "notes": "Map extents and holes through BackendPlanner while retaining FsPageBacking fallback. BackendPageRequest now carries an L4-owned IoDataTarget for page-cache read DMA, MountPayload transports source plus target into BackendPlanner, and PageContainer leases a CachedFrame target across planning until matching completion installs the same pin into the page index. Unplanned or queue-rejected reads release the target. Next, ext4 must map holes and extents into these target-backed plans without holding its pager lock across device I/O."
+      "notes": "Map extents and holes through BackendPlanner while retaining FsPageBacking fallback. BackendPageRequest now carries an L4-owned IoDataTarget for page-cache read DMA, MountPayload transports source plus target into BackendPlanner, and PageContainer leases a CachedFrame target across planning until matching completion installs the same pin into the page index. Ext4BlockGeometry now converts a resolved ext4 physical block plus target into an L6 read BioPlan. Next, the concrete bridge must expose geometry and the pager must split metadata continuation from data mapping without holding its lock across device I/O."
     },
     {
       "id": "6d-ext4-buffered-writeback",
