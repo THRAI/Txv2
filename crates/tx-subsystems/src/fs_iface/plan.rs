@@ -124,8 +124,8 @@ impl IoDataSource {
 /// DMA-visible destination supplied by L4 for a backend read plan.
 ///
 /// L5 may translate this target into `BioVec`s, but it never owns the frame or
-/// releases the lease. A later direct-I/O slice can extend this with user-page
-/// destinations without changing the page-cache case.
+/// releases the lease. Direct targets contain L4-pinned user-page vectors under
+/// the same ownership rule.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum IoDataTarget {
     None,
@@ -134,6 +134,10 @@ pub enum IoDataTarget {
         frame: PageFrameRef,
         offset: u32,
         len: u32,
+    },
+    Direct {
+        lease: IoDataLeaseId,
+        vecs: Vec<BioVec>,
     },
 }
 
@@ -152,10 +156,14 @@ impl IoDataTarget {
         }
     }
 
+    pub fn direct(lease: IoDataLeaseId, vecs: Vec<BioVec>) -> Self {
+        Self::Direct { lease, vecs }
+    }
+
     pub const fn lease(&self) -> Option<IoDataLeaseId> {
         match self {
             Self::None => None,
-            Self::PageCache { lease, .. } => Some(*lease),
+            Self::PageCache { lease, .. } | Self::Direct { lease, .. } => Some(*lease),
         }
     }
 }
@@ -567,6 +575,27 @@ mod tests {
         );
 
         assert_eq!(request.target, target);
+    }
+
+    #[test]
+    fn backend_page_request_keeps_direct_read_target() {
+        let target = IoDataTarget::direct(
+            IoDataLeaseId::new(10),
+            alloc::vec![BioVec::new(11, 256, 1024)],
+        );
+        let request = BackendPageRequest::new_with_source_and_target(
+            FsObjectKey::new(2),
+            PageIoRequestId::new(5),
+            PageIoRange::new(2, 1),
+            PageIoOp::Read,
+            PageIoFlags::EMPTY,
+            Some(PageGeneration::new(6)),
+            IoDataSource::None,
+            target.clone(),
+        );
+
+        assert_eq!(request.target, target);
+        assert_eq!(request.target.lease(), Some(IoDataLeaseId::new(10)));
     }
 
     #[test]

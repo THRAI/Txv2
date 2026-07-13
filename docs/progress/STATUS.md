@@ -22,7 +22,9 @@
   after either device result. Successful direct writes invalidate clean cache
   entries plus PageSlots, while direct reads preserve the clean cache. This is
   the conservative coherency rule, not an O_DIRECT syscall or DMA
-  implementation. Verification passed: PageBacked 131/131 and
+  implementation. The neutral plan now carries direct target BioVecs under an
+  L4 lease; ext4 explicitly rejects hole direct reads until an L4 zero-fill
+  adapter exists. Verification passed: PageBacked 131/131 and
   no-default-feature `tx-subsystems` check. Next is
   user-buffer direct-I/O planning plus ordered JBD2 durability; no fsync
   durability claim or fetch/flush hot-path removal is made here. See

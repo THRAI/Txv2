@@ -294,6 +294,7 @@ pub fn plan_read_request(
                     .with_frame_ref(frame),
                 ]))
             }
+            IoDataTarget::Direct { .. } => BackendPlan::Err(Errno::ENOSYS),
             IoDataTarget::None => BackendPlan::Err(Errno::EINVAL),
         },
         Ext4ReadMapping::Data { physical_block } => {
@@ -523,6 +524,33 @@ mod tests {
         assert_eq!(
             completions.as_slice()[0].frame,
             Some(PageFrameRef::new(Ppn(10)))
+        );
+    }
+
+    #[test]
+    fn hole_direct_read_rejects_until_l4_installs_a_zero_fill_adapter() {
+        let target = IoDataTarget::direct(
+            IoDataLeaseId::new(2),
+            vec![BioVec::new(10, 0, BLOCK_SIZE as u32)],
+        );
+        let request = BackendPageRequest::new_with_source_and_target(
+            tx_subsystems::fs_iface::FsObjectKey::new(3),
+            tx_subsystems::io_manager::page::PageIoRequestId::new(4),
+            tx_subsystems::io_manager::page::PageIoRange::new(5, 1),
+            tx_subsystems::io_manager::page::PageIoOp::Read,
+            tx_subsystems::io_manager::page::PageIoFlags::DEMAND,
+            Some(tx_subsystems::io_manager::page::PageGeneration::new(6)),
+            tx_subsystems::fs_iface::IoDataSource::None,
+            target,
+        );
+
+        assert_eq!(
+            plan_read_request(
+                Ext4BlockGeometry::new(DeviceKey::new(7), 8),
+                &request,
+                Ext4ReadMapping::Hole,
+            ),
+            BackendPlan::Err(Errno::ENOSYS)
         );
     }
 
