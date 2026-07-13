@@ -11,8 +11,8 @@ use crate::device::{
 };
 use crate::execution::Errno;
 use crate::fs_iface::{
-    BackendPageRequest, BackendPlan, BackendPlanner, BioPlanList, PageCompletion,
-    PageCompletionList, PageFrameRef,
+    BackendPageRequest, BackendPlan, BackendPlanner, BioPlanList, IoDataLeaseId, IoDataSource,
+    PageCompletion, PageCompletionList, PageFrameRef,
 };
 use crate::io_manager::backend::BlockPageRequestTracker;
 use crate::io_manager::block::{
@@ -54,6 +54,25 @@ impl BackendPlanner for RecordingPlanner {
                 crate::io_manager::page::PageIoCompletionKind::ReadInstalled,
             ),
         ]))
+    }
+}
+
+struct SourceRecordingPlanner {
+    source: SpinMutex<Option<IoDataSource>>,
+}
+
+impl SourceRecordingPlanner {
+    const fn new() -> Self {
+        Self {
+            source: SpinMutex::new(None),
+        }
+    }
+}
+
+impl BackendPlanner for SourceRecordingPlanner {
+    fn plan_page_io(&self, request: BackendPageRequest) -> BackendPlan {
+        *self.source.lock() = Some(request.source);
+        BackendPlan::Complete(PageCompletionList::default())
     }
 }
 
@@ -967,6 +986,38 @@ fn file_page_container_builds_mount_payload_backend_context() {
         }
         other => panic!("expected completion plan, got {other:?}"),
     }
+}
+
+#[test]
+fn file_page_backend_context_preserves_explicit_data_source() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::new());
+    let planner = Arc::new(SourceRecordingPlanner::new());
+    let pc =
+        file_page_container_with_planner(fs.clone(), fs, FsObjectId::new(78), 4, planner.clone());
+    let source = IoDataSource::page_cache(
+        IoDataLeaseId::new(17),
+        PageFrameRef::new(Ppn(0x80)),
+        0,
+        crate::vm::USER_PAGE_SIZE as u32,
+    );
+    let request = PageIoRequest::new(
+        PageIoRequestId::new(10),
+        pc.io_manager_key(),
+        PageIoRange::new(1, 1),
+        PageIoOp::Writeback,
+        PageIoPriority::BackgroundWriteback,
+        PageIoFlags::WRITEBACK,
+        Some(PageGeneration::new(6)),
+    );
+
+    pc.file_backend_context()
+        .expect("file page container backend context")
+        .plan_submission_with_source(request, source.clone())
+        .expect("mount-hosted backend planner");
+
+    assert_eq!(*planner.source.lock(), Some(source));
 }
 
 #[test]

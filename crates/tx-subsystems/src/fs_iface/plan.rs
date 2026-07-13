@@ -405,6 +405,22 @@ impl BackendPageRequest {
             request.generation_hint,
         )
     }
+
+    pub fn from_page_io_request_with_source(
+        object: FsObjectKey,
+        request: PageIoRequest,
+        source: IoDataSource,
+    ) -> Self {
+        Self::new_with_source(
+            object,
+            request.id,
+            request.range,
+            request.op,
+            request.flags,
+            request.generation_hint,
+            source,
+        )
+    }
 }
 
 pub trait BackendPlanner: Send + Sync + 'static {

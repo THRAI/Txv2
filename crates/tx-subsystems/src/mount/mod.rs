@@ -14,6 +14,8 @@ use adapter::runtime::{
 use crate::device::BlockDevice;
 use crate::execution::Errno;
 use crate::execution::KernelResult;
+use crate::fs_iface::{BackendPageRequest, BackendPlan, BackendPlanner, FsObjectKey, IoDataSource};
+use crate::io_manager::page::{service::PageServiceBackendContext, PageIoRequest};
 use crate::page_backed::{FsPageBacking, PageContainer};
 use crate::vfs::{
     adapter::step_engine::{Guard, NoProgress, StepOutcome},
@@ -293,6 +295,7 @@ pub struct MountPayload {
     payload_pin_count: AtomicU32,
     pub fs_ops: Arc<dyn FsOps>,
     pub fs_page_backing: Arc<dyn FsPageBacking>,
+    backend_planner: Option<Arc<dyn BackendPlanner>>,
     pub backing: Option<Arc<dyn BlockDevice>>,
     pub dev_id: DevId,
     pub options: MountOptions,
@@ -311,10 +314,34 @@ impl MountPayload {
         fstype: &'static str,
         source_label: SourceLabel,
     ) -> Self {
+        Self::new_with_backend_planner(
+            fs_ops,
+            fs_page_backing,
+            backing,
+            dev_id,
+            options,
+            fstype,
+            source_label,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_backend_planner(
+        fs_ops: Arc<dyn FsOps>,
+        fs_page_backing: Arc<dyn FsPageBacking>,
+        backing: Option<Arc<dyn BlockDevice>>,
+        dev_id: DevId,
+        options: MountOptions,
+        fstype: &'static str,
+        source_label: SourceLabel,
+        backend_planner: Option<Arc<dyn BackendPlanner>>,
+    ) -> Self {
         Self {
             payload_pin_count: AtomicU32::new(0),
             fs_ops,
             fs_page_backing,
+            backend_planner,
             backing,
             dev_id,
             options,
@@ -344,6 +371,29 @@ impl MountPayload {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_cap_with_backend_planner(
+        fs_ops: Arc<dyn FsOps>,
+        fs_page_backing: Arc<dyn FsPageBacking>,
+        backing: Option<Arc<dyn BlockDevice>>,
+        dev_id: DevId,
+        options: MountOptions,
+        fstype: &'static str,
+        source_label: SourceLabel,
+        backend_planner: Option<Arc<dyn BackendPlanner>>,
+    ) -> Result<Cap<Self>, ZoneError> {
+        runtime::sign(Self::new_with_backend_planner(
+            fs_ops,
+            fs_page_backing,
+            backing,
+            dev_id,
+            options,
+            fstype,
+            source_label,
+            backend_planner,
+        ))
+    }
+
     pub fn payload_pin_count(&self) -> u32 {
         self.payload_pin_count.load(Ordering::Acquire)
     }
@@ -355,6 +405,68 @@ impl MountPayload {
     pub fn fs_page_backing(&self) -> &Arc<dyn FsPageBacking> {
         &self.fs_page_backing
     }
+
+    pub fn backend_planner(&self) -> Option<&dyn BackendPlanner> {
+        self.backend_planner.as_deref()
+    }
+
+    pub fn plan_backend_page_request(
+        &self,
+        object: FsObjectKey,
+        request: PageIoRequest,
+    ) -> Option<BackendPlan> {
+        self.backend_planner.as_deref().map(|planner| {
+            planner.plan_page_io(BackendPageRequest::from_page_io_request(object, request))
+        })
+    }
+
+    pub fn plan_backend_page_request_with_source(
+        &self,
+        object: FsObjectKey,
+        request: PageIoRequest,
+        source: IoDataSource,
+    ) -> Option<BackendPlan> {
+        self.backend_planner.as_deref().map(|planner| {
+            planner.plan_page_io(BackendPageRequest::from_page_io_request_with_source(
+                object, request, source,
+            ))
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct MountPayloadBackendContext<'a> {
+    payload: &'a MountPayload,
+    object: FsObjectKey,
+}
+
+impl<'a> MountPayloadBackendContext<'a> {
+    pub const fn new(payload: &'a MountPayload, object: FsObjectKey) -> Self {
+        Self { payload, object }
+    }
+
+    pub const fn payload(self) -> &'a MountPayload {
+        self.payload
+    }
+
+    pub const fn object(self) -> FsObjectKey {
+        self.object
+    }
+}
+
+impl PageServiceBackendContext for MountPayloadBackendContext<'_> {
+    fn plan_submission(&self, request: PageIoRequest) -> Option<BackendPlan> {
+        self.payload.plan_backend_page_request(self.object, request)
+    }
+
+    fn plan_submission_with_source(
+        &self,
+        request: PageIoRequest,
+        source: IoDataSource,
+    ) -> Option<BackendPlan> {
+        self.payload
+            .plan_backend_page_request_with_source(self.object, request, source)
+    }
 }
 
 impl core::fmt::Debug for MountPayload {
@@ -365,6 +477,7 @@ impl core::fmt::Debug for MountPayload {
             .field("options", &self.options)
             .field("fstype", &self.fstype)
             .field("source_label", &self.source_label)
+            .field("has_backend_planner", &self.backend_planner.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -1188,6 +1301,20 @@ fn cap_raw_addr<T>(cap: &Cap<T>) -> usize {
 mod tests {
     use super::*;
     use crate::execution::{Errno, Guard};
+    use crate::fs_iface::{
+        BackendPageRequest, BackendPlan, BackendPlanner, FsObjectKey, PageCompletion,
+        PageCompletionList,
+    };
+    use crate::io_manager::block::BlockQueue;
+    use crate::io_manager::page::{
+        service::{
+            PageService, PageServiceBackendSubmitOutcome, PageServiceDrivenWork, PageServiceDriver,
+            PageServiceNext, PageServiceTurn, PageServiceWake, PageServiceWork,
+        },
+        PageContainerKey, PageGeneration, PageIoCompletionKind, PageIoFlags, PageIoOp,
+        PageIoPriority, PageIoRange, PageIoRequestId, PageIoResult,
+    };
+    use crate::io_manager::runtime::{IoServiceKind, ServiceBudget, ServiceKick};
     use crate::page_backed::{Frame, PageContainerKind};
     use crate::vfs::adapter::step_engine::{Errno as V3Errno, NoProgress, StepOutcome};
     use crate::vfs::{Credential, DirCursor, DirEntry, InodeKind, RNodeBacking};
@@ -1368,6 +1495,22 @@ mod tests {
         }
     }
 
+    struct MockBackendPlanner;
+
+    impl BackendPlanner for MockBackendPlanner {
+        fn plan_page_io(&self, request: BackendPageRequest) -> BackendPlan {
+            BackendPlan::Complete(PageCompletionList::from_vec(alloc::vec![
+                PageCompletion::new(
+                    request.id,
+                    request.range,
+                    PageIoResult::Done,
+                    request.generation_hint.unwrap_or(PageGeneration::new(0)),
+                    PageIoCompletionKind::ReadInstalled,
+                ),
+            ]))
+        }
+    }
+
     #[test]
     fn mount_payload_stores_backend_traits_and_pins_are_explicit() {
         tx_test_support::init_host();
@@ -1394,6 +1537,255 @@ mod tests {
             assert_eq!(payload.payload_pin_count(), 1);
         }
         assert_eq!(payload.payload_pin_count(), 0);
+    }
+
+    #[test]
+    fn mount_payload_hosts_optional_backend_planner_without_replacing_page_backing() {
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        crate::zones::register_all().expect("kernel zones");
+
+        let fs = Arc::new(MockFs);
+        let payload = MountPayload::new_cap_with_backend_planner(
+            fs.clone() as Arc<dyn FsOps>,
+            fs as Arc<dyn FsPageBacking>,
+            None,
+            DevId::new(9),
+            MountOptions::default(),
+            "mockfs",
+            SourceLabel::Static("mock"),
+            Some(Arc::new(MockBackendPlanner) as Arc<dyn BackendPlanner>),
+        )
+        .expect("mount payload");
+
+        assert!(Arc::strong_count(payload.fs_page_backing()) >= 1);
+        let request = BackendPageRequest::new(
+            FsObjectKey::new(123),
+            PageIoRequestId::new(44),
+            PageIoRange::new(7, 1),
+            PageIoOp::Read,
+            PageIoFlags::DEMAND,
+            Some(PageGeneration::new(3)),
+        );
+        let plan = payload
+            .backend_planner()
+            .expect("mount-hosted backend planner")
+            .plan_page_io(request);
+
+        match plan {
+            BackendPlan::Complete(completions) => {
+                assert_eq!(completions.as_slice().len(), 1);
+                assert_eq!(completions.as_slice()[0].id, PageIoRequestId::new(44));
+                assert_eq!(completions.as_slice()[0].range, PageIoRange::new(7, 1));
+            }
+            other => panic!("expected completion plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mount_payload_plans_page_service_submission_through_backend_planner() {
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        crate::zones::register_all().expect("kernel zones");
+
+        let fs = Arc::new(MockFs);
+        let payload = MountPayload::new_cap_with_backend_planner(
+            fs.clone() as Arc<dyn FsOps>,
+            fs as Arc<dyn FsPageBacking>,
+            None,
+            DevId::new(11),
+            MountOptions::default(),
+            "mockfs",
+            SourceLabel::Static("mock"),
+            Some(Arc::new(MockBackendPlanner) as Arc<dyn BackendPlanner>),
+        )
+        .expect("mount payload");
+        let mut service = PageService::new(4);
+        let request_id = service
+            .submit(
+                PageContainerKey::new(88),
+                PageIoRange::new(13, 1),
+                PageIoOp::Read,
+                PageIoPriority::Demand,
+                PageIoFlags::DEMAND,
+                Some(PageGeneration::new(21)),
+            )
+            .expect("submit page request");
+        let request = match service.drain_turn(crate::io_manager::runtime::ServiceBudget::new(1)) {
+            PageServiceTurn::Work(mut work) => match work.remove(0) {
+                PageServiceWork::Submission(request) => request,
+                other => panic!("expected submission work, got {other:?}"),
+            },
+            other => panic!("expected work turn, got {other:?}"),
+        };
+
+        let plan = payload
+            .plan_backend_page_request(FsObjectKey::new(500), request)
+            .expect("mount-hosted planner");
+
+        match plan {
+            BackendPlan::Complete(completions) => {
+                assert_eq!(completions.as_slice().len(), 1);
+                assert_eq!(completions.as_slice()[0].id, request_id);
+                assert_eq!(completions.as_slice()[0].range, PageIoRange::new(13, 1));
+                assert_eq!(
+                    completions.as_slice()[0].generation,
+                    PageGeneration::new(21)
+                );
+            }
+            other => panic!("expected completion plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mount_payload_backend_context_drives_page_service_submission() {
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        crate::zones::register_all().expect("kernel zones");
+
+        let fs = Arc::new(MockFs);
+        let payload = MountPayload::new_cap_with_backend_planner(
+            fs.clone() as Arc<dyn FsOps>,
+            fs as Arc<dyn FsPageBacking>,
+            None,
+            DevId::new(12),
+            MountOptions::default(),
+            "mockfs",
+            SourceLabel::Static("mock"),
+            Some(Arc::new(MockBackendPlanner) as Arc<dyn BackendPlanner>),
+        )
+        .expect("mount payload");
+        let context = MountPayloadBackendContext::new(&payload, FsObjectKey::new(501));
+        let mut service = PageService::new(4);
+        let request_id = service
+            .submit(
+                PageContainerKey::new(89),
+                PageIoRange::new(14, 1),
+                PageIoOp::Read,
+                PageIoPriority::Demand,
+                PageIoFlags::DEMAND,
+                Some(PageGeneration::new(22)),
+            )
+            .expect("submit page request");
+        let mut block_queue = BlockQueue::new(4);
+        let mut driver = PageServiceDriver::new(ServiceBudget::new(1));
+        let mut kicks = Vec::new();
+
+        let driven =
+            driver.drive_once_with_backend(&mut service, &context, &mut block_queue, |kick| {
+                kicks.push(kick);
+                true
+            });
+
+        assert_eq!(
+            driven.work,
+            alloc::vec![PageServiceDrivenWork::BackendSubmission(
+                PageServiceBackendSubmitOutcome::QueuedPageCompletions {
+                    queued: 1,
+                    wake: Some(PageServiceWake::Wake),
+                }
+            )]
+        );
+        assert_eq!(driven.next, PageServiceNext::Runnable);
+        assert_eq!(kicks, alloc::vec![ServiceKick::new(IoServiceKind::Page)]);
+        match service.drain_turn(ServiceBudget::new(1)) {
+            PageServiceTurn::Work(mut work) => match work.remove(0) {
+                PageServiceWork::Completion(route) => {
+                    assert_eq!(route.completion.id, request_id);
+                    assert_eq!(route.completion.range, PageIoRange::new(14, 1));
+                    assert_eq!(route.completion.generation, PageGeneration::new(22));
+                }
+                other => panic!("expected completion work, got {other:?}"),
+            },
+            other => panic!("expected queued completion turn, got {other:?}"),
+        }
+        assert!(block_queue.is_empty());
+    }
+
+    #[test]
+    fn mount_payload_backend_context_returns_none_without_planner() {
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        crate::zones::register_all().expect("kernel zones");
+
+        let fs = Arc::new(MockFs);
+        let payload = MountPayload::new_cap(
+            fs.clone() as Arc<dyn FsOps>,
+            fs as Arc<dyn FsPageBacking>,
+            None,
+            DevId::new(13),
+            MountOptions::default(),
+            "mockfs",
+            SourceLabel::Static("mock"),
+        )
+        .expect("mount payload");
+        let context = MountPayloadBackendContext::new(&payload, FsObjectKey::new(502));
+        let mut service = PageService::new(4);
+        let request_id = service
+            .submit(
+                PageContainerKey::new(90),
+                PageIoRange::new(15, 1),
+                PageIoOp::Read,
+                PageIoPriority::Demand,
+                PageIoFlags::DEMAND,
+                Some(PageGeneration::new(23)),
+            )
+            .expect("submit page request");
+        let mut block_queue = BlockQueue::new(4);
+        let mut driver = PageServiceDriver::new(ServiceBudget::new(1));
+
+        let driven =
+            driver.drive_once_with_backend(&mut service, &context, &mut block_queue, |_| {
+                panic!("unplanned mount payload request must not kick page service")
+            });
+
+        assert_eq!(
+            driven.work,
+            alloc::vec![PageServiceDrivenWork::UnplannedSubmission(
+                crate::io_manager::page::PageIoRequest::new(
+                    request_id,
+                    PageContainerKey::new(90),
+                    PageIoRange::new(15, 1),
+                    PageIoOp::Read,
+                    PageIoPriority::Demand,
+                    PageIoFlags::DEMAND,
+                    Some(PageGeneration::new(23)),
+                )
+            )]
+        );
+        assert_eq!(driven.next, PageServiceNext::Sleeping);
+        assert!(block_queue.is_empty());
+    }
+
+    #[test]
+    fn mount_payload_default_constructor_keeps_backend_planner_absent() {
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        crate::zones::register_all().expect("kernel zones");
+
+        let fs = Arc::new(MockFs);
+        let payload = MountPayload::new_cap(
+            fs.clone() as Arc<dyn FsOps>,
+            fs as Arc<dyn FsPageBacking>,
+            None,
+            DevId::new(10),
+            MountOptions::default(),
+            "mockfs",
+            SourceLabel::Static("mock"),
+        )
+        .expect("mount payload");
+
+        assert!(payload.backend_planner().is_none());
     }
 
     #[test]
