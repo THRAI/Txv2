@@ -15,7 +15,9 @@ use crate::devfs::adapter::step_engine::{
 };
 use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
 use tx_ext4_format::{Ext4FormatError, Result};
+use tx_ext4::planner::Ext4BlockGeometry;
 use tx_subsystems::device::{BlockDevice, PhysicalBlockNumber};
+use tx_subsystems::io_manager::block::DeviceKey;
 use tx_subsystems::page_backed::Frame;
 
 /// A `BlockImage` that reads through a kernel block device.
@@ -42,6 +44,14 @@ impl BlockDeviceImage {
             return None;
         }
         Some(BLOCK_SIZE as u64 / sector)
+    }
+
+    /// Bind this image's 4 KiB ext4 blocks to its registered L6 device key.
+    /// The caller owns the key because `BlockDevice` deliberately exposes no
+    /// registry identity and guessing one would misroute I/O.
+    pub fn block_geometry(&self, device: DeviceKey) -> Option<Ext4BlockGeometry> {
+        self.sectors_per_ext4_block()
+            .map(|sectors_per_block| Ext4BlockGeometry::new(device, sectors_per_block))
     }
 
     fn read_block_uncached(&self, block: u64, out: &mut Page4K) -> Result<()> {
