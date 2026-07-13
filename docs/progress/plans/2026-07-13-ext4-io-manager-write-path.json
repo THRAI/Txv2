@@ -68,7 +68,7 @@
     {
       "id": "6b-page-slot-writeback",
       "title": "Make PageSlot writeback generation-safe under concurrent redirty",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "6a-neutral-write-ir"
       ],
@@ -80,7 +80,7 @@
         "cargo test -p tx-subsystems --lib page_backed",
         "cargo test -p tx-subsystems --lib io_manager"
       ],
-      "notes": "Landed redirty preservation, fsync-frontier classification, the missing Phase-0 PageContainer L4 compatibility baseline, and PageSlot dirty transitions for both planner and FsPageBacking write materialization. PageContainer now admits dirty pages to L4 writeback, retains PageCache leases through planning/execution, routes terminal WritebackFinished completion into the generation-checked slot FSM, and rolls back leases/marks/slots on unplanned or queue-rejected submission. The remaining 6B requirement is a live fsync frontier that submits or waits on these L4 writebacks. Legacy flush_page may Yield without an L4 completion owner, so it must not transition a slot into async Writeback until that bridge exists."
+      "notes": "Landed redirty preservation, fsync-frontier classification, the missing Phase-0 PageContainer L4 compatibility baseline, and PageSlot dirty transitions for both planner and FsPageBacking write materialization. PageContainer now admits dirty pages to L4 writeback, retains PageCache leases through planning/execution, routes terminal WritebackFinished completion into the generation-checked slot FSM, and rolls back leases/marks/slots on unplanned or queue-rejected submission. FileFsyncSession captures the page-generation frontier once, submits only the captured generations, waits without duplicate admission, resubmits a captured redirty after its earlier writeback, and surfaces terminal backend errors. Compatibility FsPageBacking::flush_page remains until 6G hot-path cutover; this slice makes no durable fsync claim before 6E ordered JBD2 fencing."
     },
     {
       "id": "6c-ext4-read-planner",
@@ -185,7 +185,7 @@
     {
       "command": "cargo test -p tx-subsystems --lib page_backed -- --nocapture --test-threads=1",
       "status": "passed",
-      "notes": "Passed 119 PageBacked tests after L4 compatibility-path landing and planner/compat PageSlot dirty-state coverage. The serial harness is required because the default parallel host harness can nest same-CPU epoch guards in unrelated tests."
+      "notes": "Passed 126 PageBacked tests after the persistent fsync-session frontier coverage. The serial harness is required because the default parallel host harness can nest same-CPU epoch guards in unrelated tests."
     }
   ],
   "risks": [

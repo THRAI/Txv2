@@ -471,6 +471,28 @@ impl FileFsyncFrontier {
     }
 }
 
+/// One fsync invocation's immutable view of file-page generations.
+///
+/// The session deliberately captures the frontier once. Re-entering after a
+/// yield therefore waits on the same writeback requests instead of treating
+/// later writes as part of the original fsync operation.
+pub struct FileFsyncSession<'a> {
+    pc: &'a PageContainer,
+    frontier: FileFsyncFrontier,
+}
+
+impl FileFsyncSession<'_> {
+    pub fn frontier(&self) -> &FileFsyncFrontier {
+        &self.frontier
+    }
+
+    /// Submit or observe writeback for the generations captured at entry.
+    /// Callers may issue the filesystem durability fence only after `Complete`.
+    pub fn advance(&self) -> FileFsyncFrontierAdvance {
+        self.pc.advance_file_fsync_frontier(&self.frontier)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FileFsyncFrontierAdvance {
     Complete,
@@ -950,6 +972,12 @@ impl PageContainer {
             }
         }
         Some(FileFsyncFrontier(pages))
+    }
+
+    /// Start an fsync session with a stable dirty/writeback generation frontier.
+    pub fn begin_file_fsync_session(&self) -> Option<FileFsyncSession<'_>> {
+        self.snapshot_file_fsync_frontier()
+            .map(|frontier| FileFsyncSession { pc: self, frontier })
     }
 
     pub fn advance_file_fsync_frontier(

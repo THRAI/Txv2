@@ -1252,6 +1252,229 @@ fn file_page_writeback_admission_transitions_dirty_slot_and_queues_request() {
 }
 
 #[test]
+fn file_fsync_session_waits_for_its_captured_writeback_without_duplicate_submission() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::new());
+    let pc = file_page_container(fs.clone(), fs, FsObjectId::new(97), 4);
+    let page = PageIndex::new(1);
+    let frame = cached_frame_for_test();
+    let ppn = frame.ppn;
+    let generation = {
+        let mut state = pc.state.lock();
+        state
+            .pages
+            .install_if_absent(page, frame)
+            .expect("seed page");
+        let slot = state.file_page_slots.entry(page).or_default();
+        let PageSlotFetch::Owner { generation } = slot.begin_fetch() else {
+            panic!("fetch owner");
+        };
+        slot.complete_fetch(generation, Ok(ppn))
+            .expect("resident slot");
+        let dirty = slot.mark_dirty().expect("dirty slot");
+        state.pages.mark_dirty(page).expect("dirty page cache");
+        dirty.generation
+    };
+
+    let session = pc
+        .begin_file_fsync_session()
+        .expect("file page container has an fsync session");
+    assert_eq!(
+        session.advance(),
+        FileFsyncFrontierAdvance::Submitted { pages: 1 }
+    );
+    assert_eq!(pc.file_io_request_count_for_test(), 1);
+    assert_eq!(session.advance(), FileFsyncFrontierAdvance::Waiting);
+    assert_eq!(
+        pc.file_io_request_count_for_test(),
+        1,
+        "a waiting fsync session must not submit its captured page twice"
+    );
+
+    let request = pc
+        .state
+        .lock()
+        .file_io_service
+        .find_submission(
+            pc.io_manager_key(),
+            PageIoRange::new(page.as_u64(), 1),
+            PageIoOp::Writeback,
+        )
+        .cloned()
+        .expect("queued writeback request");
+    pc.state
+        .lock()
+        .file_io_service
+        .push_completion(PageIoCompletion::new(
+            request.id,
+            PageIoRange::new(page.as_u64(), 1),
+            PageIoResult::Done,
+            generation,
+            PageIoCompletionKind::WritebackFinished,
+        ));
+    let mut block_queue = BlockQueue::new(4);
+    pc.drive_file_io_service_once(ServiceBudget::new(1), &mut block_queue, |_| true)
+        .expect("completion turn");
+
+    assert_eq!(session.advance(), FileFsyncFrontierAdvance::Complete);
+}
+
+#[test]
+fn file_fsync_session_resubmits_a_redirty_after_its_earlier_writeback_finishes() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::new());
+    let pc = file_page_container(fs.clone(), fs, FsObjectId::new(98), 4);
+    let page = PageIndex::new(1);
+    let frame = cached_frame_for_test();
+    let ppn = frame.ppn;
+    let first_generation = {
+        let mut state = pc.state.lock();
+        state
+            .pages
+            .install_if_absent(page, frame)
+            .expect("seed page");
+        let slot = state.file_page_slots.entry(page).or_default();
+        let PageSlotFetch::Owner { generation } = slot.begin_fetch() else {
+            panic!("fetch owner");
+        };
+        slot.complete_fetch(generation, Ok(ppn))
+            .expect("resident slot");
+        let dirty = slot.mark_dirty().expect("first dirty generation");
+        state.pages.mark_dirty(page).expect("dirty page cache");
+        dirty.generation
+    };
+    let first_request = pc
+        .queue_file_page_writeback(page)
+        .expect("first writeback request");
+    let frontier_generation = {
+        let state = pc.state.lock();
+        let slot = state.file_page_slots.get(&page).expect("writeback slot");
+        slot.mark_dirty().expect("redirty generation").generation
+    };
+
+    let session = pc
+        .begin_file_fsync_session()
+        .expect("file page container has an fsync session");
+    assert_eq!(
+        session.frontier().pages(),
+        &[(page, frontier_generation)],
+        "the session must include the redirty generation present at entry"
+    );
+    assert_eq!(session.advance(), FileFsyncFrontierAdvance::Waiting);
+
+    pc.state
+        .lock()
+        .file_io_service
+        .push_completion(PageIoCompletion::new(
+            first_request,
+            PageIoRange::new(page.as_u64(), 1),
+            PageIoResult::Done,
+            first_generation,
+            PageIoCompletionKind::WritebackFinished,
+        ));
+    let mut block_queue = BlockQueue::new(4);
+    pc.drive_file_io_service_once(ServiceBudget::new(1), &mut block_queue, |_| true)
+        .expect("first completion turn");
+
+    assert_eq!(
+        session.advance(),
+        FileFsyncFrontierAdvance::Submitted { pages: 1 },
+        "the captured redirty must receive a second writeback"
+    );
+    let second_request = pc
+        .state
+        .lock()
+        .file_io_service
+        .find_submission(
+            pc.io_manager_key(),
+            PageIoRange::new(page.as_u64(), 1),
+            PageIoOp::Writeback,
+        )
+        .cloned()
+        .expect("second writeback request");
+    pc.state
+        .lock()
+        .file_io_service
+        .push_completion(PageIoCompletion::new(
+            second_request.id,
+            PageIoRange::new(page.as_u64(), 1),
+            PageIoResult::Done,
+            frontier_generation,
+            PageIoCompletionKind::WritebackFinished,
+        ));
+    pc.drive_file_io_service_once(ServiceBudget::new(1), &mut block_queue, |_| true)
+        .expect("second completion turn");
+
+    assert_eq!(session.advance(), FileFsyncFrontierAdvance::Complete);
+}
+
+#[test]
+fn file_fsync_session_propagates_writeback_error_from_its_frontier() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::new());
+    let pc = file_page_container(fs.clone(), fs, FsObjectId::new(99), 4);
+    let page = PageIndex::new(1);
+    let frame = cached_frame_for_test();
+    let ppn = frame.ppn;
+    let generation = {
+        let mut state = pc.state.lock();
+        state
+            .pages
+            .install_if_absent(page, frame)
+            .expect("seed page");
+        let slot = state.file_page_slots.entry(page).or_default();
+        let PageSlotFetch::Owner { generation } = slot.begin_fetch() else {
+            panic!("fetch owner");
+        };
+        slot.complete_fetch(generation, Ok(ppn))
+            .expect("resident slot");
+        let dirty = slot.mark_dirty().expect("dirty slot");
+        state.pages.mark_dirty(page).expect("dirty page cache");
+        dirty.generation
+    };
+
+    let session = pc
+        .begin_file_fsync_session()
+        .expect("file page container has an fsync session");
+    assert_eq!(
+        session.advance(),
+        FileFsyncFrontierAdvance::Submitted { pages: 1 }
+    );
+    let request = pc
+        .state
+        .lock()
+        .file_io_service
+        .find_submission(
+            pc.io_manager_key(),
+            PageIoRange::new(page.as_u64(), 1),
+            PageIoOp::Writeback,
+        )
+        .cloned()
+        .expect("queued writeback request");
+    pc.state
+        .lock()
+        .file_io_service
+        .push_completion(PageIoCompletion::new(
+            request.id,
+            PageIoRange::new(page.as_u64(), 1),
+            PageIoResult::Err(Errno::EIO),
+            generation,
+            PageIoCompletionKind::WritebackFinished,
+        ));
+    let mut block_queue = BlockQueue::new(4);
+    pc.drive_file_io_service_once(ServiceBudget::new(1), &mut block_queue, |_| true)
+        .expect("error completion turn");
+
+    assert_eq!(
+        session.advance(),
+        FileFsyncFrontierAdvance::Error(Errno::EIO)
+    );
+}
+
+#[test]
 fn file_page_writeback_leases_source_until_completion() {
     let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
     setup_host_substrate();
