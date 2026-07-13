@@ -1,3 +1,14 @@
+- 2026-07-14 (ext4 I/O-manager 6F mapped direct-read planner sub-slice).
+  Ext4 mapped data reads now accept an L4-owned `IoDataTarget::Direct` and
+  preserve its non-owning `BioVec` segments in the L6 read bio. Empty,
+  zero-length, overflowing, or non-block-sized direct vectors are rejected;
+  page-cache reads retain their existing single-frame behavior, and hole
+  direct reads remain `ENOSYS` until L4 provides a zero-fill adapter.
+  Verification passed: ext4 planner 10/10, neutral `fs_iface::plan` 6/6,
+  and `cargo check -p tx-ext4 --lib --no-default-features`. The known
+  unrelated network unused-variable warning remains. Next: user-page pinning
+  and direct-write planner/runtime integration; 6F and 6G remain open.
+
 - 2026-07-13 (ext4 I/O-manager 6E graph-runtime integration).
   L4 now owns `BackendBioGraph` execution: it admits only ready graph nodes
   to L6, advances every graph sharing a merged L6 request ID, suppresses

@@ -353,13 +353,19 @@ impl Ext4BlockGeometry {
 
     /// Build one L6 read bio for a mapped ext4 data block and an L4-owned target.
     pub fn plan_read(self, physical_block: u64, target: &IoDataTarget) -> Result<BioPlan, Errno> {
-        let IoDataTarget::PageCache {
-            frame, offset, len, ..
-        } = target
-        else {
-            return Err(Errno::EINVAL);
+        let vecs = match target {
+            IoDataTarget::PageCache {
+                frame, offset, len, ..
+            } => {
+                if *len != BLOCK_SIZE as u32 {
+                    return Err(Errno::EINVAL);
+                }
+                vec![bio_vec(*frame, *offset, *len)]
+            }
+            IoDataTarget::Direct { vecs, .. } => direct_bio_vecs(vecs)?,
+            IoDataTarget::None => return Err(Errno::EINVAL),
         };
-        if self.sectors_per_block == 0 || *len != BLOCK_SIZE as u32 {
+        if self.sectors_per_block == 0 {
             return Err(Errno::EINVAL);
         }
         let lba = physical_block
@@ -369,7 +375,7 @@ impl Ext4BlockGeometry {
             self.device,
             BlockOp::Read,
             LbaRange::new(lba, self.sectors_per_block),
-            vec![bio_vec(*frame, *offset, *len)],
+            vecs,
             BlockFlags::EMPTY,
         ))
     }
@@ -400,6 +406,23 @@ impl Ext4BlockGeometry {
 
 fn bio_vec(frame: PageFrameRef, offset: u32, len: u32) -> BioVec {
     BioVec::new(frame.ppn().0 as u64, offset, len)
+}
+
+fn direct_bio_vecs(vecs: &[BioVec]) -> Result<alloc::vec::Vec<BioVec>, Errno> {
+    if vecs.is_empty() {
+        return Err(Errno::EINVAL);
+    }
+    let mut total = 0u32;
+    for vec in vecs {
+        if vec.len == 0 {
+            return Err(Errno::EINVAL);
+        }
+        total = total.checked_add(vec.len).ok_or(Errno::EINVAL)?;
+    }
+    if total != BLOCK_SIZE as u32 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(vecs.to_vec())
 }
 
 #[cfg(test)]
@@ -450,6 +473,36 @@ mod tests {
         assert_eq!(plan.device, DeviceKey::new(7));
         assert_eq!(plan.lba, LbaRange::new(88, 8));
         assert_eq!(plan.vecs, vec![BioVec::new(9, 0, BLOCK_SIZE as u32)]);
+    }
+
+    #[test]
+    fn mapped_ext4_block_plans_l6_read_into_direct_iovecs() {
+        let target = IoDataTarget::direct(
+            IoDataLeaseId::new(11),
+            vec![BioVec::new(41, 128, 2048), BioVec::new(42, 0, 2048)],
+        );
+        let plan = Ext4BlockGeometry::new(DeviceKey::new(7), 8)
+            .plan_read(11, &target)
+            .expect("mapped direct block plan");
+
+        assert_eq!(plan.device, DeviceKey::new(7));
+        assert_eq!(plan.lba, LbaRange::new(88, 8));
+        assert_eq!(
+            plan.vecs,
+            vec![BioVec::new(41, 128, 2048), BioVec::new(42, 0, 2048)]
+        );
+    }
+
+    #[test]
+    fn mapped_ext4_direct_read_rejects_empty_or_partial_iovecs() {
+        let geometry = Ext4BlockGeometry::new(DeviceKey::new(7), 8);
+        for vecs in [
+            alloc::vec![],
+            alloc::vec![BioVec::new(41, 0, (BLOCK_SIZE as u32) - 1)],
+        ] {
+            let target = IoDataTarget::direct(IoDataLeaseId::new(12), vecs);
+            assert_eq!(geometry.plan_read(11, &target), Err(Errno::EINVAL));
+        }
     }
 
     #[test]
