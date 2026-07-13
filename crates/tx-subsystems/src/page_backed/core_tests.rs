@@ -145,6 +145,37 @@ impl BackendPlanner for FrameReturningPlanner {
     }
 }
 
+struct TargetFramePlanner {
+    target: SpinMutex<Option<crate::fs_iface::IoDataTarget>>,
+}
+
+impl TargetFramePlanner {
+    const fn new() -> Self {
+        Self {
+            target: SpinMutex::new(None),
+        }
+    }
+}
+
+impl BackendPlanner for TargetFramePlanner {
+    fn plan_page_io(&self, request: BackendPageRequest) -> BackendPlan {
+        *self.target.lock() = Some(request.target.clone());
+        let crate::fs_iface::IoDataTarget::PageCache { frame, .. } = request.target else {
+            return BackendPlan::Err(Errno::EINVAL);
+        };
+        BackendPlan::Complete(PageCompletionList::from_vec(alloc::vec![
+            PageCompletion::new(
+                request.id,
+                request.range,
+                PageIoResult::Done,
+                request.generation_hint.expect("read generation"),
+                PageIoCompletionKind::ReadInstalled,
+            )
+            .with_frame_ref(frame),
+        ]))
+    }
+}
+
 struct BioOnlyPlanner {
     calls: AtomicUsize,
 }
@@ -1572,6 +1603,29 @@ fn file_page_materialize_uses_frame_planner_before_compat_fetch() {
         0,
         "frame-backed backend planner completion should bypass compat fetch"
     );
+}
+
+#[test]
+fn file_page_planner_reads_into_l4_leased_target_and_releases_it_on_install() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let guard = step_engine::guard();
+    let fs = Arc::new(RecordingFs::new());
+    let planner = Arc::new(TargetFramePlanner::new());
+    let pc = file_page_container_with_planner(fs.clone(), fs, FsObjectId::new(100), 4, planner.clone());
+
+    let materialized = match pc.materialize_page(PageIndex::new(1), MaterializeAccess::Read, &guard)
+    {
+        V3Out::Done(page) => page,
+        other => panic!("expected target-backed planned read, got {other:?}"),
+    };
+    let target = planner.target.lock().clone().expect("planner read target");
+    let crate::fs_iface::IoDataTarget::PageCache { frame, .. } = target else {
+        panic!("expected page-cache target");
+    };
+
+    assert_eq!(materialized.ppn, frame.ppn());
+    assert_eq!(pc.file_io_read_target_count_for_test(), 0);
 }
 
 #[test]

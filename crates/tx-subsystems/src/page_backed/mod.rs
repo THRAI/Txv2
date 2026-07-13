@@ -21,7 +21,7 @@ use adapter::step_engine::{
 };
 
 use crate::execution::{Errno, Guard};
-use crate::fs_iface::{FsObjectKey, IoDataLeaseId, IoDataSource};
+use crate::fs_iface::{FsObjectKey, IoDataLeaseId, IoDataSource, IoDataTarget};
 use crate::io_manager::backend::{
     dispatch_backend_plan, BlockPageCompletion, BlockPageRequestTracker, PageFrameRef,
 };
@@ -201,6 +201,7 @@ impl core::fmt::Debug for PageCacheEntry {
     }
 }
 
+#[derive(Debug)]
 struct CachedFrame {
     ppn: Ppn,
     pin: PageCachePin,
@@ -596,6 +597,7 @@ struct PageContainerState {
     in_flight_file_pages: BTreeMap<PageIndex, FilePageFetch>,
     file_io_service: PageService,
     file_io_leases: BTreeMap<PageIoRequestId, PageLease>,
+    file_io_read_targets: BTreeMap<PageIoRequestId, CachedFrame>,
     file_block_runtime: FileIoBlockRuntime,
     // Page-scoped retry sources are retained so a task that already received
     // `Yield` can still register and consume a pending wake before it retries
@@ -842,6 +844,7 @@ impl PageContainer {
                 in_flight_file_pages: BTreeMap::new(),
                 file_io_service: PageService::new(1024),
                 file_io_leases: BTreeMap::new(),
+                file_io_read_targets: BTreeMap::new(),
                 file_block_runtime: FileIoBlockRuntime::new(1024, 16),
                 file_page_waits: BTreeMap::new(),
                 next_file_fetch_id: 1,
@@ -1096,10 +1099,16 @@ impl PageContainer {
                     PageServiceWork::Submission(request) => {
                         let rollback_request = request.clone();
                         let source = self.file_io_source_for_submission(&request);
+                        let target = self.file_io_target_for_submission(&request);
                         let Some(plan) =
-                            context.plan_submission_with_source(request.clone(), source)
+                            context.plan_submission_with_source_and_target(
+                                request.clone(),
+                                source,
+                                target,
+                            )
                         else {
                             self.abort_file_writeback_submission(&request);
+                            self.release_file_io_read_target(&request);
                             work.push(PageServiceDrivenWork::UnplannedSubmission(request));
                             continue;
                         };
@@ -1145,6 +1154,7 @@ impl PageContainer {
                             }
                             Err(error) => {
                                 self.abort_file_writeback_submission(&rollback_request);
+                                self.release_file_io_read_target(&rollback_request);
                                 work.push(PageServiceDrivenWork::BackendSubmitError(error));
                             }
                         }
@@ -1257,22 +1267,61 @@ impl PageContainer {
         if route.completion.kind != PageIoCompletionKind::ReadInstalled {
             return None;
         }
+        let target = self
+            .state
+            .lock()
+            .file_io_read_targets
+            .remove(&route.completion.id);
         let PageIoResult::Err(errno) = route.completion.result else {
-            return route.frame.map(|frame| {
-                let result = self.apply_file_io_read_frame_completion(
-                    page,
-                    route.completion.generation,
-                    frame,
-                );
-                if result.is_ok() {
-                    self.finish_file_page_fetch_after_service_completion(
+            return match (route.frame, target) {
+                (Some(frame), Some(target)) if target.ppn == frame.ppn() => {
+                    let result = self.apply_file_io_cached_read_completion(
                         page,
                         route.completion.generation,
-                        !route.waiters.is_empty(),
+                        target,
                     );
+                    if result.is_ok() {
+                        self.finish_file_page_fetch_after_service_completion(
+                            page,
+                            route.completion.generation,
+                            !route.waiters.is_empty(),
+                        );
+                    }
+                    Some(result)
                 }
-                result
-            });
+                (Some(frame), target) => {
+                    drop(target);
+                    let result = self.apply_file_io_read_frame_completion(
+                        page,
+                        route.completion.generation,
+                        frame,
+                    );
+                    if result.is_ok() {
+                        self.finish_file_page_fetch_after_service_completion(
+                            page,
+                            route.completion.generation,
+                            !route.waiters.is_empty(),
+                        );
+                    }
+                    Some(result)
+                }
+                (None, Some(target)) => {
+                    let result = self.apply_file_io_cached_read_completion(
+                        page,
+                        route.completion.generation,
+                        target,
+                    );
+                    if result.is_ok() {
+                        self.finish_file_page_fetch_after_service_completion(
+                            page,
+                            route.completion.generation,
+                            !route.waiters.is_empty(),
+                        );
+                    }
+                    Some(result)
+                }
+                (None, None) => None,
+            };
         };
         let result = {
             let state = self.state.lock();
@@ -1313,6 +1362,44 @@ impl PageContainer {
         )
     }
 
+    fn file_io_target_for_submission(&self, request: &PageIoRequest) -> IoDataTarget {
+        if request.op != PageIoOp::Read || request.range.page_count() != 1 {
+            return IoDataTarget::None;
+        }
+        if !self
+            .state
+            .lock()
+            .in_flight_file_pages
+            .values()
+            .any(|fetch| fetch.request_id == Some(request.id))
+        {
+            return IoDataTarget::None;
+        }
+        let Ok(target) = allocate_cached_frame() else {
+            return IoDataTarget::None;
+        };
+        let frame = PageFrameRef::new(target.ppn);
+        let mut state = self.state.lock();
+        if !state
+            .in_flight_file_pages
+            .values()
+            .any(|fetch| fetch.request_id == Some(request.id))
+        {
+            return IoDataTarget::None;
+        }
+        state.file_io_read_targets.insert(request.id, target);
+        IoDataTarget::page_cache(
+            IoDataLeaseId::new(request.id.raw()),
+            frame,
+            0,
+            crate::vm::USER_PAGE_SIZE as u32,
+        )
+    }
+
+    fn release_file_io_read_target(&self, request: &PageIoRequest) {
+        let _ = self.state.lock().file_io_read_targets.remove(&request.id);
+    }
+
     fn abort_file_writeback_submission(&self, request: &PageIoRequest) {
         if request.op != PageIoOp::Writeback || request.range.page_count() != 1 {
             return;
@@ -1348,6 +1435,15 @@ impl PageContainer {
                 return slot.complete_fetch(generation, Err(page_cache_error_to_errno(error)));
             }
         };
+        self.apply_file_io_cached_read_completion(page, generation, cached)
+    }
+
+    fn apply_file_io_cached_read_completion(
+        &self,
+        page: PageIndex,
+        generation: PageGeneration,
+        cached: CachedFrame,
+    ) -> Result<PageSlotSnapshot, PageSlotCompletionError> {
         let ppn = cached.ppn;
         let mut state = self.state.lock();
         let installed_ppn = match state.pages.lookup(page) {
@@ -1383,6 +1479,11 @@ impl PageContainer {
     #[cfg(test)]
     fn file_io_lease_count_for_test(&self) -> usize {
         self.state.lock().file_io_leases.len()
+    }
+
+    #[cfg(test)]
+    fn file_io_read_target_count_for_test(&self) -> usize {
+        self.state.lock().file_io_read_targets.len()
     }
 
     #[cfg(test)]
