@@ -128,6 +128,10 @@ impl BlockPageRequestTracker {
         self.pending.len()
     }
 
+    pub fn contains(&self, id: BlockRequestId) -> bool {
+        self.pending.contains_key(&id)
+    }
+
     pub fn record_submit_outcomes(&mut self, request: PageIoRequest, outcomes: &[SubmitOutcome]) {
         for outcome in outcomes {
             let id = block_request_id_for_submit_outcome(*outcome);
@@ -212,6 +216,7 @@ pub enum BackendDispatch {
     BlockBios(BioPlanList),
     BlockGraph(BackendBioGraph),
     MetadataFirst {
+        request: BackendPageRequest,
         bios: BioPlanList,
         resume: PagerResumeToken,
     },
@@ -233,9 +238,15 @@ pub fn dispatch_backend_plan(plan: BackendPlan) -> BackendDispatch {
         ),
         BackendPlan::SubmitBios(bios) => BackendDispatch::BlockBios(bios),
         BackendPlan::SubmitGraph(graph) => BackendDispatch::BlockGraph(graph),
-        BackendPlan::MetadataFirst { bios, resume } => {
-            BackendDispatch::MetadataFirst { bios, resume }
-        }
+        BackendPlan::MetadataFirst {
+            request,
+            bios,
+            resume,
+        } => BackendDispatch::MetadataFirst {
+            request,
+            bios,
+            resume,
+        },
         BackendPlan::Yield(wait) => BackendDispatch::Yield(wait),
         BackendPlan::Err(errno) => BackendDispatch::Err(errno),
     }
@@ -456,7 +467,16 @@ mod tests {
             BlockFlags::EMPTY,
         );
         let resume = PagerResumeToken::new(99);
+        let request = BackendPageRequest::new(
+            FsObjectKey::new(3),
+            crate::io_manager::page::PageIoRequestId::new(8),
+            crate::io_manager::page::PageIoRange::new(4, 1),
+            crate::io_manager::page::PageIoOp::Read,
+            crate::io_manager::page::PageIoFlags::DEMAND,
+            Some(crate::io_manager::page::PageGeneration::new(1)),
+        );
         let plan = BackendPlan::MetadataFirst {
+            request,
             bios: BioPlanList::from_vec(alloc::vec![bio.clone()]),
             resume,
         };
@@ -464,7 +484,9 @@ mod tests {
         let dispatch = dispatch_backend_plan(plan);
 
         match dispatch {
-            BackendDispatch::MetadataFirst { bios, resume: seen } => {
+            BackendDispatch::MetadataFirst {
+                bios, resume: seen, ..
+            } => {
                 assert_eq!(bios.as_slice(), &[bio]);
                 assert_eq!(seen, resume);
             }

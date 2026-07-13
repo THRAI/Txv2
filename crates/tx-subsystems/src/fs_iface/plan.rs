@@ -362,11 +362,28 @@ impl BackendBioCompletion {
 pub struct BackendPlanResume {
     pub token: PagerResumeToken,
     pub completions: Vec<BackendBioCompletion>,
+    pub request: Option<BackendPageRequest>,
 }
 
 impl BackendPlanResume {
     pub fn new(token: PagerResumeToken, completions: Vec<BackendBioCompletion>) -> Self {
-        Self { token, completions }
+        Self {
+            token,
+            completions,
+            request: None,
+        }
+    }
+
+    pub fn with_request(
+        token: PagerResumeToken,
+        completions: Vec<BackendBioCompletion>,
+        request: BackendPageRequest,
+    ) -> Self {
+        Self {
+            token,
+            completions,
+            request: Some(request),
+        }
     }
 }
 
@@ -376,6 +393,7 @@ pub enum BackendPlan {
     SubmitBios(BioPlanList),
     SubmitGraph(BackendBioGraph),
     MetadataFirst {
+        request: BackendPageRequest,
         bios: BioPlanList,
         resume: PagerResumeToken,
     },

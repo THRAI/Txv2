@@ -15,29 +15,29 @@ pub mod adapter;
 pub mod notification;
 
 use adapter::step_engine::{
-    self as step_engine, page_allocator, AllocError, BitmapPageAllocator, ByteProgress, CachePin,
-    Cap, DeviceFrame, MapPin, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity, Weak,
-    ZeroPolicy, Zone, ZoneAllocated, ZoneError,
+    self as step_engine, AllocError, BitmapPageAllocator, ByteProgress, CachePin, Cap, DeviceFrame,
+    MapPin, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity, Weak, ZeroPolicy, Zone,
+    ZoneAllocated, ZoneError, page_allocator,
 };
 
 use crate::execution::{Errno, Guard};
 use crate::fs_iface::{FsObjectKey, IoDataLeaseId, IoDataSource, IoDataTarget};
 use crate::io_manager::backend::{
-    dispatch_backend_plan, BlockPageCompletion, BlockPageRequestTracker, PageFrameRef,
+    BlockPageCompletion, BlockPageRequestTracker, PageFrameRef, dispatch_backend_plan,
 };
 use crate::io_manager::block::{
     BlockCompletionSource, BlockDispatchExecutor, BlockQueue, BlockServiceDriver, BlockServiceNext,
     BlockTagTable,
 };
 use crate::io_manager::page::{
+    PageContainerKey, PageGeneration, PageIoCompletionKind, PageIoFlags, PageIoOp, PageIoPriority,
+    PageIoRange, PageIoRequest, PageIoRequestId, PageIoResult,
     service::{
         PageCompletionRoute, PageService, PageServiceBackendContext, PageServiceBackendDriven,
         PageServiceBackendOutcome, PageServiceBackendSubmitError, PageServiceBackendSubmitOutcome,
         PageServiceDrivenWork, PageServiceNext, PageServiceTaggedBlockCompletionError,
         PageServiceTurn, PageServiceWork, PageWaitInterest, PageWaiter,
     },
-    PageContainerKey, PageGeneration, PageIoCompletionKind, PageIoFlags, PageIoOp, PageIoPriority,
-    PageIoRange, PageIoRequest, PageIoRequestId, PageIoResult,
 };
 use crate::io_manager::runtime::{IoServiceKind, QueueDepth, ServiceBudget, ServiceKick};
 use crate::mount::{MountPayloadBackendContext, MountPayloadPin};
@@ -58,7 +58,7 @@ mod targeted_read;
 mod user_buffer;
 pub use cross_variant::step_copy_file_range;
 pub use fs_page_backing::FsPageBacking;
-pub use lifecycle::{step_fallocate, step_fsync, step_truncate, FallocateOp, TruncateOp};
+pub use lifecycle::{FallocateOp, TruncateOp, step_fallocate, step_fsync, step_truncate};
 pub use range::{
     PageRange, RangeReservation, RangeReservationError, RangeReservationId, RangeReservationKind,
     RangeReservationTable,
@@ -71,8 +71,8 @@ pub use slot::{
 use sparse_index::SparseIndex;
 pub use targeted_read::read_exact_at;
 pub use user_buffer::{
-    step_read_to_kernel, step_read_to_user, step_write_from_kernel, step_write_from_user,
-    ReadToUserOp, WriteFromUserOp,
+    ReadToUserOp, WriteFromUserOp, step_read_to_kernel, step_read_to_user, step_write_from_kernel,
+    step_write_from_user,
 };
 
 #[cfg(test)]
@@ -1009,7 +1009,7 @@ impl PageContainer {
                     | PageSlotFsyncStatus::WaitingForEarlierWriteback { .. },
                 ) => waiting = true,
                 Some(PageSlotFsyncStatus::Error { errno }) => {
-                    return FileFsyncFrontierAdvance::Error(errno)
+                    return FileFsyncFrontierAdvance::Error(errno);
                 }
                 Some(PageSlotFsyncStatus::Clean) | None => {}
             }
@@ -1100,13 +1100,11 @@ impl PageContainer {
                         let rollback_request = request.clone();
                         let source = self.file_io_source_for_submission(&request);
                         let target = self.file_io_target_for_submission(&request);
-                        let Some(plan) =
-                            context.plan_submission_with_source_and_target(
-                                request.clone(),
-                                source,
-                                target,
-                            )
-                        else {
+                        let Some(plan) = context.plan_submission_with_source_and_target(
+                            request.clone(),
+                            source,
+                            target,
+                        ) else {
                             self.abort_file_writeback_submission(&request);
                             self.release_file_io_read_target(&request);
                             work.push(PageServiceDrivenWork::UnplannedSubmission(request));
@@ -1125,7 +1123,7 @@ impl PageContainer {
                                 let queued = queue_file_service_backend_outcome(
                                     outcome,
                                     block_queue,
-                                    request,
+                                    request.clone(),
                                 );
                                 if let (Ok(outcome), Some(tracker)) = (&queued, tracker.as_mut()) {
                                     record_file_service_block_submissions(tracker, outcome);
@@ -1137,7 +1135,7 @@ impl PageContainer {
                                 let queued = queue_file_service_backend_outcome(
                                     outcome,
                                     &mut state.file_block_runtime.queue,
-                                    request,
+                                    request.clone(),
                                 );
                                 if let Ok(outcome) = &queued {
                                     record_file_service_block_submissions(
@@ -1148,6 +1146,9 @@ impl PageContainer {
                                 queued
                             }
                         };
+                        if let Ok(outcome) = &queued {
+                            self.register_file_service_metadata(&request, outcome);
+                        }
                         match queued {
                             Ok(outcome) => {
                                 work.push(PageServiceDrivenWork::BackendSubmission(outcome));
@@ -1156,6 +1157,64 @@ impl PageContainer {
                                 self.abort_file_writeback_submission(&rollback_request);
                                 self.release_file_io_read_target(&rollback_request);
                                 work.push(PageServiceDrivenWork::BackendSubmitError(error));
+                            }
+                        }
+                    }
+                    PageServiceWork::BackendResume {
+                        page_request,
+                        resume,
+                    } => {
+                        let Some(plan) = context.resume_submission(resume) else {
+                            self.abort_file_writeback_submission(&page_request);
+                            self.release_file_io_read_target(&page_request);
+                            work.push(PageServiceDrivenWork::UnplannedSubmission(page_request));
+                            continue;
+                        };
+                        let dispatch = dispatch_backend_plan(plan);
+                        let outcome = {
+                            let mut state = self.state.lock();
+                            state.file_io_service.consume_backend_dispatch(dispatch)
+                        };
+                        let queued = match &mut block_target {
+                            FileBlockSubmissionTarget::External {
+                                block_queue,
+                                tracker,
+                            } => {
+                                let queued = queue_file_service_backend_outcome(
+                                    outcome,
+                                    block_queue,
+                                    page_request.clone(),
+                                );
+                                if let (Ok(outcome), Some(tracker)) = (&queued, tracker.as_mut()) {
+                                    record_file_service_block_submissions(tracker, outcome);
+                                }
+                                queued
+                            }
+                            FileBlockSubmissionTarget::Owned => {
+                                let mut state = self.state.lock();
+                                let queued = queue_file_service_backend_outcome(
+                                    outcome,
+                                    &mut state.file_block_runtime.queue,
+                                    page_request.clone(),
+                                );
+                                if let Ok(outcome) = &queued {
+                                    record_file_service_block_submissions(
+                                        &mut state.file_block_runtime.tracker,
+                                        outcome,
+                                    );
+                                }
+                                queued
+                            }
+                        };
+                        if let Ok(outcome) = &queued {
+                            self.register_file_service_metadata(&page_request, outcome);
+                        }
+                        match queued {
+                            Ok(outcome) => {
+                                work.push(PageServiceDrivenWork::BackendSubmission(outcome))
+                            }
+                            Err(error) => {
+                                work.push(PageServiceDrivenWork::BackendSubmitError(error))
                             }
                         }
                     }
@@ -1181,7 +1240,7 @@ impl PageContainer {
         budget: ServiceBudget,
         executor: &mut E,
         mut frame_for: R,
-        kick: F,
+        mut kick: F,
     ) -> Result<FileBlockServiceTurn, PageServiceTaggedBlockCompletionError>
     where
         E: BlockDispatchExecutor + BlockCompletionSource + ?Sized,
@@ -1196,7 +1255,7 @@ impl PageContainer {
                 &mut runtime.queue,
                 &mut runtime.depth,
                 &mut runtime.tags,
-                kick,
+                &mut kick,
             )
         };
 
@@ -1206,6 +1265,7 @@ impl PageContainer {
 
         let mut device_completions = 0usize;
         let mut page_completions = 0usize;
+        let mut kicks = driven.kicks;
         while let Some(completion) = executor.poll_completion() {
             device_completions += 1;
             let outcome = {
@@ -1225,6 +1285,9 @@ impl PageContainer {
                 )?
             };
             page_completions += outcome.queued;
+            if outcome.wake.is_some() {
+                kicks += usize::from(kick(ServiceKick::new(IoServiceKind::Page)));
+            }
         }
 
         Ok(FileBlockServiceTurn {
@@ -1232,7 +1295,7 @@ impl PageContainer {
             device_completions,
             page_completions,
             next: driven.step.next,
-            kicks: driven.kicks,
+            kicks,
         })
     }
 
@@ -1336,6 +1399,31 @@ impl PageContainer {
             );
         }
         Some(result)
+    }
+
+    fn register_file_service_metadata(
+        &self,
+        page_request: &PageIoRequest,
+        outcome: &PageServiceBackendSubmitOutcome,
+    ) {
+        let PageServiceBackendSubmitOutcome::MetadataFirstQueued {
+            backend_request,
+            submitted,
+            resume,
+            ..
+        } = outcome
+        else {
+            return;
+        };
+        self.state
+            .lock()
+            .file_io_service
+            .register_metadata_submission(
+                page_request.clone(),
+                backend_request.clone(),
+                *resume,
+                submitted,
+            );
     }
 
     fn file_io_source_for_submission(&self, request: &PageIoRequest) -> IoDataSource {
@@ -2676,13 +2764,18 @@ fn queue_file_service_backend_outcome(
             }
             Ok(PageServiceBackendSubmitOutcome::BlockBiosQueued { request, submitted })
         }
-        PageServiceBackendOutcome::MetadataFirst { bios, resume } => {
+        PageServiceBackendOutcome::MetadataFirst {
+            request: backend_request,
+            bios,
+            resume,
+        } => {
             let mut submitted = Vec::new();
             for bio in bios.into_vec() {
                 submitted.push(block_queue.submit(bio)?);
             }
             Ok(PageServiceBackendSubmitOutcome::MetadataFirstQueued {
                 request,
+                backend_request,
                 submitted,
                 resume,
             })
@@ -2697,10 +2790,10 @@ fn record_file_service_block_submissions(
     outcome: &PageServiceBackendSubmitOutcome,
 ) {
     match outcome {
-        PageServiceBackendSubmitOutcome::BlockBiosQueued { request, submitted }
-        | PageServiceBackendSubmitOutcome::MetadataFirstQueued {
-            request, submitted, ..
-        } => tracker.record_submit_outcomes(request.clone(), submitted),
+        PageServiceBackendSubmitOutcome::BlockBiosQueued { request, submitted } => {
+            tracker.record_submit_outcomes(request.clone(), submitted)
+        }
+        PageServiceBackendSubmitOutcome::MetadataFirstQueued { .. } => {}
         PageServiceBackendSubmitOutcome::QueuedPageCompletions { .. }
         | PageServiceBackendSubmitOutcome::Yield(_)
         | PageServiceBackendSubmitOutcome::Err(_) => {}

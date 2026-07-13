@@ -1612,7 +1612,8 @@ fn file_page_planner_reads_into_l4_leased_target_and_releases_it_on_install() {
     let guard = step_engine::guard();
     let fs = Arc::new(RecordingFs::new());
     let planner = Arc::new(TargetFramePlanner::new());
-    let pc = file_page_container_with_planner(fs.clone(), fs, FsObjectId::new(100), 4, planner.clone());
+    let pc =
+        file_page_container_with_planner(fs.clone(), fs, FsObjectId::new(100), 4, planner.clone());
 
     let materialized = match pc.materialize_page(PageIndex::new(1), MaterializeAccess::Read, &guard)
     {
@@ -2279,6 +2280,7 @@ fn file_page_owned_l6_runtime_routes_bio_completion_into_page_slot() {
     let mut executor = CompletingExecutor {
         completions: VecDeque::new(),
     };
+    let mut kicks = Vec::new();
     let block_turn = pc
         .drive_file_block_io_service_once(
             ServiceBudget::new(1),
@@ -2287,7 +2289,10 @@ fn file_page_owned_l6_runtime_routes_bio_completion_into_page_slot() {
                 assert_eq!(completion.request().id, request_id);
                 Some(PageFrameRef::new(completion_ppn))
             },
-            |_| true,
+            |kick| {
+                kicks.push(kick);
+                true
+            },
         )
         .expect("owned block service drive");
 
@@ -2295,6 +2300,11 @@ fn file_page_owned_l6_runtime_routes_bio_completion_into_page_slot() {
     assert_eq!(block_turn.device_completions, 1);
     assert_eq!(block_turn.page_completions, 1);
     assert_eq!(block_turn.next, BlockServiceNext::Sleeping);
+    assert_eq!(
+        kicks,
+        alloc::vec![ServiceKick::new(IoServiceKind::Page)],
+        "a tagged L6 completion must wake the sleeping L4 page service"
+    );
     assert_eq!(pc.file_io_block_tracker_len_for_test(), 0);
 
     pc.drive_file_io_service_once_owned(ServiceBudget::new(1), |_| true)

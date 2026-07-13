@@ -15,7 +15,7 @@ use crate::device::BlockDevice;
 use crate::execution::Errno;
 use crate::execution::KernelResult;
 use crate::fs_iface::{
-    BackendPageRequest, BackendPlan, BackendPlanner, FsObjectKey, IoDataSource, IoDataTarget,
+    BackendPageRequest, BackendPlan, BackendPlanResume, BackendPlanner, FsObjectKey, IoDataSource, IoDataTarget,
 };
 use crate::io_manager::page::{service::PageServiceBackendContext, PageIoRequest};
 use crate::page_backed::{FsPageBacking, PageContainer};
@@ -499,6 +499,12 @@ impl PageServiceBackendContext for MountPayloadBackendContext<'_> {
     ) -> Option<BackendPlan> {
         self.payload
             .plan_backend_page_request_with_source_and_target(self.object, request, source, target)
+    }
+
+    fn resume_submission(&self, resume: BackendPlanResume) -> Option<BackendPlan> {
+        self.payload
+            .backend_planner()
+            .map(|planner| planner.resume_page_io(resume))
     }
 }
 

@@ -6,14 +6,15 @@ use alloc::vec::Vec;
 use crate::execution::Errno;
 use crate::fs_iface::{IoDataSource, IoDataTarget};
 use crate::io_manager::backend::{
-    dispatch_backend_plan, plan_backend_request, BackendDispatch, BackendPageRequest, BackendPlan,
-    BackendPlanner, BioPlanList, BlockPageCompletion, BlockPageCompletionError,
+    BackendBioCompletion, BackendBioNodeId, BackendDispatch, BackendPageRequest, BackendPlan,
+    BackendPlanResume, BackendPlanner, BioPlanList, BlockPageCompletion, BlockPageCompletionError,
     BlockPageRequestTracker, BlockPageRequestTrackerError, FsObjectKey, PageCompletion,
-    PageFrameRef, PageIoCompletionEntry, PagerResumeToken, WaitSourceId,
+    PageFrameRef, PageIoCompletionEntry, PagerResumeToken, WaitSourceId, dispatch_backend_plan,
+    plan_backend_request,
 };
 use crate::io_manager::block::{
-    BlockCompletion, BlockCompletionError, BlockQueue, BlockTag, BlockTagTable, QueueError,
-    SubmitOutcome,
+    BlockCompletion, BlockCompletionError, BlockQueue, BlockRequestId, BlockTag, BlockTagTable,
+    QueueError, SubmitOutcome,
 };
 use crate::io_manager::page::{
     PageContainerKey, PageIoCompletion, PageIoFlags, PageIoOp, PageIoPriority, PageIoRange,
@@ -54,6 +55,10 @@ pub enum PageWaitError {
 pub enum PageServiceWork {
     Completion(PageCompletionRoute),
     Submission(PageIoRequest),
+    BackendResume {
+        page_request: PageIoRequest,
+        resume: BackendPlanResume,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -64,6 +69,7 @@ pub enum PageServiceBackendOutcome {
     },
     BlockBios(BioPlanList),
     MetadataFirst {
+        request: BackendPageRequest,
         bios: BioPlanList,
         resume: PagerResumeToken,
     },
@@ -83,6 +89,7 @@ pub enum PageServiceBackendSubmitOutcome {
     },
     MetadataFirstQueued {
         request: PageIoRequest,
+        backend_request: BackendPageRequest,
         submitted: Vec<SubmitOutcome>,
         resume: PagerResumeToken,
     },
@@ -198,6 +205,10 @@ pub trait PageServiceBackendContext {
     ) -> Option<BackendPlan> {
         self.plan_submission_with_source(request, source)
     }
+
+    fn resume_submission(&self, _resume: BackendPlanResume) -> Option<BackendPlan> {
+        None
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -265,8 +276,31 @@ impl PageServiceDriver {
                         };
                         let dispatch = dispatch_backend_plan(plan);
                         let outcome = service.consume_backend_dispatch(dispatch);
+                        let page_request = request.clone();
                         match queue_backend_outcome(outcome, block_queue, request) {
                             Ok(outcome) => {
+                                register_metadata_outcome(service, page_request, &outcome);
+                                work.push(PageServiceDrivenWork::BackendSubmission(outcome));
+                            }
+                            Err(error) => {
+                                work.push(PageServiceDrivenWork::BackendSubmitError(error));
+                            }
+                        }
+                    }
+                    PageServiceWork::BackendResume {
+                        page_request,
+                        resume,
+                    } => {
+                        let Some(plan) = context.resume_submission(resume) else {
+                            work.push(PageServiceDrivenWork::UnplannedSubmission(page_request));
+                            continue;
+                        };
+                        let dispatch = dispatch_backend_plan(plan);
+                        let outcome = service.consume_backend_dispatch(dispatch);
+                        let original_page_request = page_request.clone();
+                        match queue_backend_outcome(outcome, block_queue, page_request) {
+                            Ok(outcome) => {
+                                register_metadata_outcome(service, original_page_request, &outcome);
                                 work.push(PageServiceDrivenWork::BackendSubmission(outcome));
                             }
                             Err(error) => {
@@ -298,8 +332,19 @@ impl PageServiceDriver {
 pub struct PageService {
     submissions: PageRequestQueue,
     completions: VecDeque<PageIoCompletionEntry>,
+    backend_resumes: VecDeque<(PageIoRequest, BackendPlanResume)>,
+    metadata: BTreeMap<BlockRequestId, Vec<MetadataContinuation>>,
     waiters: BTreeMap<PageIoRequestId, Vec<PageWaiter>>,
     next: PageServiceNext,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MetadataContinuation {
+    page_request: PageIoRequest,
+    request: BackendPageRequest,
+    token: PagerResumeToken,
+    pending: Vec<BlockRequestId>,
+    completions: Vec<BackendBioCompletion>,
 }
 
 impl PageService {
@@ -307,6 +352,8 @@ impl PageService {
         Self {
             submissions: PageRequestQueue::new(max_pending_submissions),
             completions: VecDeque::new(),
+            backend_resumes: VecDeque::new(),
+            metadata: BTreeMap::new(),
             waiters: BTreeMap::new(),
             next: PageServiceNext::Sleeping,
         }
@@ -423,7 +470,128 @@ impl PageService {
         F: FnMut(&BlockPageCompletion) -> Option<PageFrameRef>,
     {
         let completion = tags.complete(depth, tag, result)?;
-        Ok(self.push_tracked_block_completion(tracker, completion, frame_for)?)
+        let (metadata_handled, metadata_wake) =
+            self.complete_metadata_block(completion.id, completion.result);
+        if metadata_handled && !tracker.contains(completion.id) {
+            return Ok(PageServiceBlockCompletionOutcome {
+                queued: 0,
+                wake: metadata_wake,
+            });
+        }
+        let mut outcome = self.push_tracked_block_completion(tracker, completion, frame_for)?;
+        outcome.wake = metadata_wake.or(outcome.wake);
+        Ok(outcome)
+    }
+
+    pub fn register_metadata_continuation(
+        &mut self,
+        page_request: PageIoRequest,
+        request: BackendPageRequest,
+        token: PagerResumeToken,
+        submitted: &[SubmitOutcome],
+    ) {
+        let mut pending = submitted
+            .iter()
+            .map(|outcome| match outcome {
+                SubmitOutcome::Queued(id) | SubmitOutcome::Merged(id) => *id,
+            })
+            .collect::<Vec<_>>();
+        pending.sort();
+        pending.dedup();
+        if pending.is_empty() {
+            self.queue_metadata_error(page_request, Errno::ENOSYS);
+            self.note_work_ready();
+            return;
+        }
+        for id in &pending {
+            self.metadata
+                .entry(*id)
+                .or_default()
+                .push(MetadataContinuation {
+                    page_request: page_request.clone(),
+                    request: request.clone(),
+                    token,
+                    pending: pending.clone(),
+                    completions: Vec::new(),
+                });
+        }
+    }
+
+    pub fn register_metadata_submission(
+        &mut self,
+        page_request: PageIoRequest,
+        backend_request: BackendPageRequest,
+        resume: PagerResumeToken,
+        submitted: &[SubmitOutcome],
+    ) {
+        self.register_metadata_continuation(page_request, backend_request, resume, submitted);
+    }
+
+    fn complete_metadata_block(
+        &mut self,
+        id: BlockRequestId,
+        result: Result<(), Errno>,
+    ) -> (bool, Option<PageServiceWake>) {
+        let Some(continuations) = self.metadata.remove(&id) else {
+            return (false, None);
+        };
+        let mut routed = false;
+        for mut continuation in continuations {
+            continuation.completions.push(BackendBioCompletion::new(
+                BackendBioNodeId::new(id.raw()),
+                result,
+            ));
+            continuation.pending.retain(|pending| *pending != id);
+            if continuation.pending.is_empty() {
+                if let Some(errno) = continuation
+                    .completions
+                    .iter()
+                    .find_map(|completion| completion.result.err())
+                {
+                    self.queue_metadata_error(continuation.page_request, errno);
+                } else {
+                    let resume = BackendPlanResume::with_request(
+                        continuation.token,
+                        continuation.completions,
+                        continuation.request.clone(),
+                    );
+                    self.backend_resumes
+                        .push_back((continuation.page_request, resume));
+                }
+                routed = true;
+            } else {
+                for pending in &continuation.pending {
+                    self.metadata
+                        .entry(*pending)
+                        .or_default()
+                        .push(continuation.clone());
+                }
+            }
+        }
+        let wake = routed.then(|| self.note_work_ready());
+        (true, wake)
+    }
+
+    fn queue_metadata_error(&mut self, request: PageIoRequest, errno: Errno) {
+        let kind = match request.op {
+            PageIoOp::Read | PageIoOp::Readahead => {
+                crate::io_manager::page::PageIoCompletionKind::ReadInstalled
+            }
+            PageIoOp::Writeback => crate::io_manager::page::PageIoCompletionKind::WritebackFinished,
+            PageIoOp::Fsync => crate::io_manager::page::PageIoCompletionKind::Noop,
+        };
+        self.completions.push_back(PageIoCompletionEntry::new(
+            PageIoCompletion::new(
+                request.id,
+                request.range,
+                crate::io_manager::page::PageIoResult::Err(errno),
+                request
+                    .generation_hint
+                    .unwrap_or(crate::io_manager::page::PageGeneration::new(0)),
+                kind,
+            ),
+            None,
+        ));
     }
 
     pub fn push_completion_with_kick<F>(
@@ -457,9 +625,15 @@ impl PageService {
             // L4 does not schedule dependency graphs in 6A. Flattening one to
             // ordinary bios would lose the filesystem's durability ordering.
             BackendDispatch::BlockGraph(_) => PageServiceBackendOutcome::Err(Errno::ENOSYS),
-            BackendDispatch::MetadataFirst { bios, resume } => {
-                PageServiceBackendOutcome::MetadataFirst { bios, resume }
-            }
+            BackendDispatch::MetadataFirst {
+                request,
+                bios,
+                resume,
+            } => PageServiceBackendOutcome::MetadataFirst {
+                request,
+                bios,
+                resume,
+            },
             BackendDispatch::Yield(wait) => PageServiceBackendOutcome::Yield(wait),
             BackendDispatch::Err(errno) => PageServiceBackendOutcome::Err(errno),
         }
@@ -522,7 +696,9 @@ impl PageService {
     }
 
     pub fn has_work(&self) -> bool {
-        !self.completions.is_empty() || !self.submissions.is_empty()
+        !self.completions.is_empty()
+            || !self.backend_resumes.is_empty()
+            || !self.submissions.is_empty()
     }
 
     pub fn drain_turn(&mut self, mut budget: ServiceBudget) -> PageServiceTurn {
@@ -544,6 +720,13 @@ impl PageService {
                 }));
                 continue;
             }
+            if let Some((page_request, resume)) = self.backend_resumes.pop_front() {
+                work.push(PageServiceWork::BackendResume {
+                    page_request,
+                    resume,
+                });
+                continue;
+            }
             if let Some(request) = self.submissions.pop_next() {
                 work.push(PageServiceWork::Submission(request));
                 continue;
@@ -556,6 +739,14 @@ impl PageService {
         } else {
             PageServiceTurn::Work(work)
         }
+    }
+
+    pub fn push_metadata_block_completion(
+        &mut self,
+        id: BlockRequestId,
+        result: Result<(), Errno>,
+    ) -> bool {
+        self.complete_metadata_block(id, result).0
     }
 
     pub fn drive_turn(&mut self, budget: ServiceBudget) -> PageServiceStep {
@@ -615,15 +806,39 @@ fn queue_backend_outcome(
                 submitted: queue_bio_plans(block_queue, bios)?,
             })
         }
-        PageServiceBackendOutcome::MetadataFirst { bios, resume } => {
-            Ok(PageServiceBackendSubmitOutcome::MetadataFirstQueued {
-                request,
-                submitted: queue_bio_plans(block_queue, bios)?,
-                resume,
-            })
-        }
+        PageServiceBackendOutcome::MetadataFirst {
+            request: backend_request,
+            bios,
+            resume,
+        } => Ok(PageServiceBackendSubmitOutcome::MetadataFirstQueued {
+            request,
+            backend_request,
+            submitted: queue_bio_plans(block_queue, bios)?,
+            resume,
+        }),
         PageServiceBackendOutcome::Yield(wait) => Ok(PageServiceBackendSubmitOutcome::Yield(wait)),
         PageServiceBackendOutcome::Err(errno) => Ok(PageServiceBackendSubmitOutcome::Err(errno)),
+    }
+}
+
+fn register_metadata_outcome(
+    service: &mut PageService,
+    page_request: PageIoRequest,
+    outcome: &PageServiceBackendSubmitOutcome,
+) {
+    if let PageServiceBackendSubmitOutcome::MetadataFirstQueued {
+        backend_request,
+        submitted,
+        resume,
+        ..
+    } = outcome
+    {
+        service.register_metadata_submission(
+            page_request,
+            backend_request.clone(),
+            *resume,
+            submitted,
+        );
     }
 }
 
@@ -633,8 +848,9 @@ mod tests {
     use crate::execution::Errno;
     use crate::io_manager::backend::{
         BackendBioGraph, BackendBioNode, BackendBioNodeId, BackendDispatch, BackendPageRequest,
-        BackendPlan, BackendPlanner, BioPlanList, FsObjectKey, IoDataSource, PageCompletion,
-        PageCompletionList, PageFrameRef, PageIoCompletionList, PagerResumeToken, WaitSourceId,
+        BackendPlan, BackendPlanner, BioPlanList, FsObjectKey, IoDataSource, IoDataTarget,
+        PageCompletion, PageCompletionList, PageFrameRef, PageIoCompletionList, PagerResumeToken,
+        WaitSourceId,
     };
     use crate::io_manager::block::{
         BioPlan, BioVec, BlockCompletion, BlockFlags, BlockOp, BlockQueue, BlockRequestId,
@@ -685,6 +901,299 @@ mod tests {
             id: BlockRequestId::new(12),
             plan: read_bio(),
             result: Ok(()),
+        }
+    }
+
+    #[test]
+    fn metadata_block_completions_resume_only_after_all_bios_finish() {
+        let mut service = PageService::new(4);
+        let request = BackendPageRequest::new_with_source_and_target(
+            FsObjectKey::new(17),
+            PageIoRequestId::new(70),
+            PageIoRange::new(2, 1),
+            PageIoOp::Read,
+            PageIoFlags::DEMAND,
+            Some(PageGeneration::new(9)),
+            IoDataSource::None,
+            IoDataTarget::None,
+        );
+        let mut block_queue = BlockQueue::new(4);
+        let first = block_queue
+            .submit(BioPlan::new(
+                DeviceKey::new(9),
+                BlockOp::Read,
+                LbaRange::new(64, 1),
+                alloc::vec![BioVec::new(1, 0, 512)],
+                BlockFlags::EMPTY,
+            ))
+            .expect("first metadata bio");
+        let second = block_queue
+            .submit(BioPlan::new(
+                DeviceKey::new(9),
+                BlockOp::Read,
+                LbaRange::new(80, 1),
+                alloc::vec![BioVec::new(2, 0, 512)],
+                BlockFlags::EMPTY,
+            ))
+            .expect("second metadata bio");
+        let mut depth = QueueDepth::new(2);
+        let mut tags = BlockTagTable::new();
+        let first_dispatch = block_queue
+            .pop_dispatchable_tagged(&mut depth, &mut tags)
+            .expect("first dispatch")
+            .expect("first dispatch exists");
+        let second_dispatch = block_queue
+            .pop_dispatchable_tagged(&mut depth, &mut tags)
+            .expect("second dispatch")
+            .expect("second dispatch exists");
+        let submitted = [first, second];
+        let page_request = PageIoRequest::new(
+            PageIoRequestId::new(70),
+            PageContainerKey::new(17),
+            PageIoRange::new(2, 1),
+            PageIoOp::Read,
+            PageIoPriority::Demand,
+            PageIoFlags::DEMAND,
+            Some(PageGeneration::new(9)),
+        );
+        service.register_metadata_continuation(
+            page_request.clone(),
+            request.clone(),
+            PagerResumeToken::new(91),
+            &submitted,
+        );
+        let mut tracker = BlockPageRequestTracker::new();
+
+        let first_outcome = service
+            .push_tagged_block_completion(
+                &mut tags,
+                &mut depth,
+                &mut tracker,
+                first_dispatch.tag,
+                Ok(()),
+                |_| None,
+            )
+            .expect("first metadata completion");
+        assert_eq!(first_outcome.wake, None);
+        assert!(matches!(
+            service.drain_turn(ServiceBudget::new(1)),
+            PageServiceTurn::Sleep
+        ));
+
+        let second_outcome = service
+            .push_tagged_block_completion(
+                &mut tags,
+                &mut depth,
+                &mut tracker,
+                second_dispatch.tag,
+                Ok(()),
+                |_| None,
+            )
+            .expect("second metadata completion");
+        assert_eq!(second_outcome.wake, Some(PageServiceWake::Wake));
+        match service.drain_turn(ServiceBudget::new(1)) {
+            PageServiceTurn::Work(mut work) => match work.remove(0) {
+                PageServiceWork::BackendResume {
+                    page_request: resumed,
+                    resume,
+                } => {
+                    assert_eq!(resumed, page_request);
+                    assert_eq!(resume.token, PagerResumeToken::new(91));
+                    assert_eq!(resume.completions.len(), 2);
+                    assert!(
+                        resume
+                            .completions
+                            .iter()
+                            .all(|completion| completion.result == Ok(()))
+                    );
+                }
+                other => panic!("expected metadata resume, got {other:?}"),
+            },
+            other => panic!("expected metadata resume work, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn metadata_block_error_queues_terminal_page_error_without_resume() {
+        let mut service = PageService::new(4);
+        let page_request = PageIoRequest::new(
+            PageIoRequestId::new(71),
+            PageContainerKey::new(17),
+            PageIoRange::new(2, 1),
+            PageIoOp::Read,
+            PageIoPriority::Demand,
+            PageIoFlags::DEMAND,
+            Some(PageGeneration::new(9)),
+        );
+        let backend_request = BackendPageRequest::new_with_source_and_target(
+            FsObjectKey::new(17),
+            page_request.id,
+            page_request.range,
+            page_request.op,
+            page_request.flags,
+            page_request.generation_hint,
+            IoDataSource::None,
+            IoDataTarget::None,
+        );
+        let mut block_queue = BlockQueue::new(4);
+        let submitted = block_queue
+            .submit(BioPlan::new(
+                DeviceKey::new(9),
+                BlockOp::Read,
+                LbaRange::new(64, 1),
+                alloc::vec![BioVec::new(1, 0, 512)],
+                BlockFlags::EMPTY,
+            ))
+            .expect("metadata bio");
+        let mut depth = QueueDepth::new(1);
+        let mut tags = BlockTagTable::new();
+        let dispatch = block_queue
+            .pop_dispatchable_tagged(&mut depth, &mut tags)
+            .expect("metadata dispatch")
+            .expect("metadata dispatch exists");
+        service.register_metadata_continuation(
+            page_request.clone(),
+            backend_request,
+            PagerResumeToken::new(92),
+            &[submitted],
+        );
+        let mut tracker = BlockPageRequestTracker::new();
+
+        service
+            .push_tagged_block_completion(
+                &mut tags,
+                &mut depth,
+                &mut tracker,
+                dispatch.tag,
+                Err(Errno::EIO),
+                |_| None,
+            )
+            .expect("metadata error completion");
+
+        match service.drain_turn(ServiceBudget::new(1)) {
+            PageServiceTurn::Work(mut work) => match work.remove(0) {
+                PageServiceWork::Completion(route) => {
+                    assert_eq!(route.completion.id, page_request.id);
+                    assert_eq!(route.completion.result, PageIoResult::Err(Errno::EIO));
+                }
+                other => panic!("expected terminal page error, got {other:?}"),
+            },
+            other => panic!("expected terminal page error work, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merged_metadata_bios_resume_once() {
+        let mut service = PageService::new(4);
+        let page_request = PageIoRequest::new(
+            PageIoRequestId::new(72),
+            PageContainerKey::new(17),
+            PageIoRange::new(3, 1),
+            PageIoOp::Read,
+            PageIoPriority::Demand,
+            PageIoFlags::DEMAND,
+            Some(PageGeneration::new(10)),
+        );
+        let backend_request = BackendPageRequest::new_with_source_and_target(
+            FsObjectKey::new(17),
+            page_request.id,
+            page_request.range,
+            page_request.op,
+            page_request.flags,
+            page_request.generation_hint,
+            IoDataSource::None,
+            IoDataTarget::None,
+        );
+        let mut block_queue = BlockQueue::new(4);
+        let first = block_queue
+            .submit(BioPlan::new(
+                DeviceKey::new(9),
+                BlockOp::Read,
+                LbaRange::new(64, 1),
+                alloc::vec![BioVec::new(1, 0, 512)],
+                BlockFlags::EMPTY,
+            ))
+            .expect("first metadata bio");
+        let second = block_queue
+            .submit(BioPlan::new(
+                DeviceKey::new(9),
+                BlockOp::Read,
+                LbaRange::new(65, 1),
+                alloc::vec![BioVec::new(2, 0, 512)],
+                BlockFlags::EMPTY,
+            ))
+            .expect("merged metadata bio");
+        let mut depth = QueueDepth::new(1);
+        let mut tags = BlockTagTable::new();
+        let dispatch = block_queue
+            .pop_dispatchable_tagged(&mut depth, &mut tags)
+            .expect("metadata dispatch")
+            .expect("metadata dispatch exists");
+        service.register_metadata_continuation(
+            page_request,
+            backend_request,
+            PagerResumeToken::new(93),
+            &[first, second],
+        );
+        let mut tracker = BlockPageRequestTracker::new();
+
+        service
+            .push_tagged_block_completion(
+                &mut tags,
+                &mut depth,
+                &mut tracker,
+                dispatch.tag,
+                Ok(()),
+                |_| None,
+            )
+            .expect("merged metadata completion");
+
+        let PageServiceTurn::Work(work) = service.drain_turn(ServiceBudget::new(2)) else {
+            panic!("merged completion must queue one resume");
+        };
+        assert_eq!(work.len(), 1);
+        assert!(matches!(work[0], PageServiceWork::BackendResume { .. }));
+    }
+
+    #[test]
+    fn empty_metadata_plan_fails_instead_of_requeueing_forever() {
+        let mut service = PageService::new(4);
+        let page_request = PageIoRequest::new(
+            PageIoRequestId::new(73),
+            PageContainerKey::new(17),
+            PageIoRange::new(4, 1),
+            PageIoOp::Read,
+            PageIoPriority::Demand,
+            PageIoFlags::DEMAND,
+            Some(PageGeneration::new(11)),
+        );
+        let backend_request = BackendPageRequest::new_with_source_and_target(
+            FsObjectKey::new(17),
+            page_request.id,
+            page_request.range,
+            page_request.op,
+            page_request.flags,
+            page_request.generation_hint,
+            IoDataSource::None,
+            IoDataTarget::None,
+        );
+
+        service.register_metadata_continuation(
+            page_request.clone(),
+            backend_request,
+            PagerResumeToken::new(94),
+            &[],
+        );
+
+        match service.drain_turn(ServiceBudget::new(1)) {
+            PageServiceTurn::Work(mut work) => match work.remove(0) {
+                PageServiceWork::Completion(route) => {
+                    assert_eq!(route.completion.id, page_request.id);
+                    assert_eq!(route.completion.result, PageIoResult::Err(Errno::ENOSYS));
+                }
+                other => panic!("expected terminal empty-plan error, got {other:?}"),
+            },
+            other => panic!("expected terminal empty-plan error work, got {other:?}"),
         }
     }
 
@@ -1036,13 +1545,23 @@ mod tests {
         let mut service = PageService::new(4);
         let bio = read_bio();
         let resume = PagerResumeToken::new(5);
+        let backend_request = BackendPageRequest::new(
+            FsObjectKey::new(1),
+            PageIoRequestId::new(4),
+            PageIoRange::new(1, 1),
+            PageIoOp::Read,
+            PageIoFlags::DEMAND,
+            Some(PageGeneration::new(1)),
+        );
 
         assert_eq!(
             service.consume_backend_dispatch(BackendDispatch::MetadataFirst {
+                request: backend_request.clone(),
                 bios: BioPlanList::from_vec(alloc::vec![bio.clone()]),
                 resume,
             }),
             PageServiceBackendOutcome::MetadataFirst {
+                request: backend_request,
                 bios: BioPlanList::from_vec(alloc::vec![bio]),
                 resume,
             }
