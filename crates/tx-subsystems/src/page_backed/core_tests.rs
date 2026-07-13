@@ -1230,6 +1230,12 @@ fn file_page_writeback_admission_transitions_dirty_slot_and_queues_request() {
     let id = pc
         .queue_file_page_writeback(page)
         .expect("writeback request");
+    assert_eq!(
+        pc.snapshot_file_fsync_frontier()
+            .expect("file frontier")
+            .pages(),
+        &[(page, PageGeneration::new(2))]
+    );
     assert_eq!(pc.file_io_request_count_for_test(), 1);
     assert_eq!(
         pc.file_page_slot_snapshot_for_test(page)

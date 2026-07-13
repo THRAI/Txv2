@@ -462,6 +462,15 @@ pub struct PageLease {
     cache_pin: PageCachePin,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileFsyncFrontier(Vec<(PageIndex, PageGeneration)>);
+
+impl FileFsyncFrontier {
+    pub fn pages(&self) -> &[(PageIndex, PageGeneration)] {
+        &self.0
+    }
+}
+
 // PageLease carries page-cache role evidence for an already-live frame.
 // Like PageContainer's internal PageCacheEntry pins, the token is an owned
 // liveness contribution; moving it between pipe descriptors across harts does
@@ -915,6 +924,24 @@ impl PageContainer {
                 None
             }
         }
+    }
+
+    pub fn snapshot_file_fsync_frontier(&self) -> Option<FileFsyncFrontier> {
+        if !matches!(self.kind, PageContainerKind::File { .. }) {
+            return None;
+        }
+        let state = self.state.lock();
+        let mut pages = Vec::new();
+        for (page, slot) in &state.file_page_slots {
+            let snapshot = slot.snapshot();
+            if matches!(
+                snapshot.state,
+                PageSlotState::Dirty { .. } | PageSlotState::Writeback { .. }
+            ) {
+                pages.push((*page, snapshot.generation));
+            }
+        }
+        Some(FileFsyncFrontier(pages))
     }
 
     pub fn drive_file_io_service_once<F>(
