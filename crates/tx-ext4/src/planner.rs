@@ -3,7 +3,7 @@
 use alloc::vec;
 
 use tx_subsystems::fs_iface::{
-    BackendPageRequest, BackendPlan, BioPlanList, IoDataTarget, PageCompletion,
+    BackendPageRequest, BackendPlan, BackendPlanner, BioPlanList, IoDataTarget, PageCompletion,
     PageCompletionList, PageFrameRef, PagerResumeToken,
 };
 use tx_subsystems::io_manager::block::{BioPlan, BioVec, BlockFlags, BlockOp, DeviceKey, LbaRange};
@@ -24,6 +24,37 @@ pub enum Ext4ReadMapping {
     Hole,
     Data { physical_block: u64 },
     MetadataFirst { resume: PagerResumeToken },
+}
+
+/// Mapping lookup supplied by the ext4 metadata owner.
+///
+/// The provider may return `MetadataFirst` when an extent index block must be
+/// fetched. It never performs block I/O inside this callback.
+pub trait Ext4ReadMappingSource: Send + Sync + 'static {
+    fn map_page(&self, request: &BackendPageRequest) -> Ext4ReadMapping;
+}
+
+pub struct Ext4ReadPlanner<S> {
+    geometry: Ext4BlockGeometry,
+    mapping: S,
+}
+
+impl<S> Ext4ReadPlanner<S> {
+    pub const fn new(geometry: Ext4BlockGeometry, mapping: S) -> Self {
+        Self { geometry, mapping }
+    }
+}
+
+impl<S: Ext4ReadMappingSource> BackendPlanner for Ext4ReadPlanner<S> {
+    fn plan_page_io(&self, request: BackendPageRequest) -> BackendPlan {
+        match request.op {
+            tx_subsystems::io_manager::page::PageIoOp::Read
+            | tx_subsystems::io_manager::page::PageIoOp::Readahead => {
+                plan_read_request(self.geometry, &request, self.mapping.map_page(&request))
+            }
+            _ => BackendPlan::Err(Errno::ENOSYS),
+        }
+    }
 }
 
 /// Translate an ext4 mapping result into the neutral L4/L6 plan IR.
@@ -140,5 +171,42 @@ mod tests {
             panic!("hole must complete without a device bio");
         };
         assert_eq!(completions.as_slice()[0].frame, Some(PageFrameRef::new(Ppn(10))));
+    }
+
+    struct FixedMapping {
+        mapping: Ext4ReadMapping,
+    }
+
+    impl Ext4ReadMappingSource for FixedMapping {
+        fn map_page(&self, _request: &BackendPageRequest) -> Ext4ReadMapping {
+            self.mapping
+        }
+    }
+
+    #[test]
+    fn ext4_read_planner_delegates_mapping_without_owning_io() {
+        let planner = Ext4ReadPlanner::new(
+            Ext4BlockGeometry::new(DeviceKey::new(7), 8),
+            FixedMapping {
+                mapping: Ext4ReadMapping::Hole,
+            },
+        );
+        let request = BackendPageRequest::new_with_source_and_target(
+            tx_subsystems::fs_iface::FsObjectKey::new(3),
+            tx_subsystems::io_manager::page::PageIoRequestId::new(4),
+            tx_subsystems::io_manager::page::PageIoRange::new(5, 1),
+            tx_subsystems::io_manager::page::PageIoOp::Read,
+            tx_subsystems::io_manager::page::PageIoFlags::DEMAND,
+            Some(tx_subsystems::io_manager::page::PageGeneration::new(6)),
+            tx_subsystems::fs_iface::IoDataSource::None,
+            IoDataTarget::page_cache(
+                IoDataLeaseId::new(2),
+                PageFrameRef::new(Ppn(10)),
+                0,
+                BLOCK_SIZE as u32,
+            ),
+        );
+        let plan = planner.plan_page_io(request);
+        assert!(matches!(plan, BackendPlan::Complete(_)));
     }
 }
