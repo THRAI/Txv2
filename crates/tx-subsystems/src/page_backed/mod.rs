@@ -471,6 +471,14 @@ impl FileFsyncFrontier {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FileFsyncFrontierAdvance {
+    Complete,
+    Submitted { pages: u32 },
+    Waiting,
+    Error(Errno),
+}
+
 // PageLease carries page-cache role evidence for an already-live frame.
 // Like PageContainer's internal PageCacheEntry pins, the token is an owned
 // liveness contribution; moving it between pipe descriptors across harts does
@@ -942,6 +950,46 @@ impl PageContainer {
             }
         }
         Some(FileFsyncFrontier(pages))
+    }
+
+    pub fn advance_file_fsync_frontier(
+        &self,
+        frontier: &FileFsyncFrontier,
+    ) -> FileFsyncFrontierAdvance {
+        let mut submitted = 0u32;
+        let mut waiting = false;
+        for &(page, generation) in frontier.pages() {
+            let status = self
+                .state
+                .lock()
+                .file_page_slots
+                .get(&page)
+                .map(|slot| slot.fsync_status(generation));
+            match status {
+                Some(PageSlotFsyncStatus::NeedsWriteback { .. }) => {
+                    if self.queue_file_page_writeback(page).is_some() {
+                        submitted = submitted.saturating_add(1);
+                    } else {
+                        waiting = true;
+                    }
+                }
+                Some(
+                    PageSlotFsyncStatus::WaitingForWriteback { .. }
+                    | PageSlotFsyncStatus::WaitingForEarlierWriteback { .. },
+                ) => waiting = true,
+                Some(PageSlotFsyncStatus::Error { errno }) => {
+                    return FileFsyncFrontierAdvance::Error(errno)
+                }
+                Some(PageSlotFsyncStatus::Clean) | None => {}
+            }
+        }
+        if submitted != 0 {
+            FileFsyncFrontierAdvance::Submitted { pages: submitted }
+        } else if waiting {
+            FileFsyncFrontierAdvance::Waiting
+        } else {
+            FileFsyncFrontierAdvance::Complete
+        }
     }
 
     pub fn drive_file_io_service_once<F>(
