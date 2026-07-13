@@ -2,10 +2,10 @@
   "schema": "tx.progress.plan.v1",
   "id": "2026-07-13-ext4-io-manager-write-path",
   "title": "Ext4 I/O-manager write-path migration",
-  "status": "proposed",
+  "status": "active",
   "created": "2026-07-13",
   "updated": "2026-07-13",
-  "owner": "unassigned",
+  "owner": "codex",
   "summary": "Move ext4 from the direct page-pager compatibility path to a write-capable neutral planner while preserving page-cache ownership and durable journal ordering.",
   "scope": {
     "in": [
@@ -53,7 +53,7 @@
     {
       "id": "6a-neutral-write-ir",
       "title": "Add neutral I/O data-source leases and dependency graph",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [],
       "paths": [
         "crates/tx-subsystems/src/io_manager",
@@ -63,7 +63,7 @@
         "cargo test -p tx-subsystems --lib io_manager",
         "cargo check -p tx-subsystems"
       ],
-      "notes": "Keep old BackendPlan variants as compatibility adapters; do not import concrete filesystems or drivers."
+      "notes": "Completed with leased IoDataSource values, validated BackendBioGraph, default planner resume rejection, and BlockGraph transport. Existing variants remain compatibility adapters; L4 rejects graph execution with ENOSYS until a dependency scheduler exists."
     },
     {
       "id": "6b-page-slot-writeback",
@@ -80,7 +80,7 @@
         "cargo test -p tx-subsystems --lib page_backed",
         "cargo test -p tx-subsystems --lib io_manager"
       ],
-      "notes": "Cover redirty during writeback, stale completion, fsync frontier, and no lock across I/O."
+      "notes": "Initial redirty state-machine sub-slice landed and passed the PageBacked suite. Fsync frontier, source-lease installation, and no-lock integration remain pending before this step can complete."
     },
     {
       "id": "6c-ext4-read-planner",
@@ -166,6 +166,21 @@
       "command": "cargo xtask lint docs",
       "status": "passed",
       "notes": "Passed with the workspace's existing 7 stale-vocabulary warnings."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib io_manager -- --nocapture",
+      "status": "passed",
+      "notes": "Passed 64 I/O-manager tests after BlockGraph transport and L4 rejection landed."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib fs_iface::plan::tests -- --nocapture",
+      "status": "passed",
+      "notes": "Passed 4 neutral IR tests covering source retention, graph ordering/cycle rejection, and default resume rejection."
+    },
+    {
+      "command": "cargo check -p tx-subsystems",
+      "status": "passed",
+      "notes": "Passed with the existing unused guard warning in net step_connect."
     }
   ],
   "risks": [
