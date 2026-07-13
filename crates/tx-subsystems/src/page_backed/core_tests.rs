@@ -59,12 +59,14 @@ impl BackendPlanner for RecordingPlanner {
 
 struct SourceRecordingPlanner {
     source: SpinMutex<Option<IoDataSource>>,
+    target: SpinMutex<Option<crate::fs_iface::IoDataTarget>>,
 }
 
 impl SourceRecordingPlanner {
     const fn new() -> Self {
         Self {
             source: SpinMutex::new(None),
+            target: SpinMutex::new(None),
         }
     }
 }
@@ -72,6 +74,7 @@ impl SourceRecordingPlanner {
 impl BackendPlanner for SourceRecordingPlanner {
     fn plan_page_io(&self, request: BackendPageRequest) -> BackendPlan {
         *self.source.lock() = Some(request.source);
+        *self.target.lock() = Some(request.target);
         BackendPlan::Complete(PageCompletionList::default())
     }
 }
@@ -1002,6 +1005,12 @@ fn file_page_backend_context_preserves_explicit_data_source() {
         0,
         crate::vm::USER_PAGE_SIZE as u32,
     );
+    let target = crate::fs_iface::IoDataTarget::page_cache(
+        IoDataLeaseId::new(18),
+        PageFrameRef::new(Ppn(0x81)),
+        0,
+        crate::vm::USER_PAGE_SIZE as u32,
+    );
     let request = PageIoRequest::new(
         PageIoRequestId::new(10),
         pc.io_manager_key(),
@@ -1014,10 +1023,11 @@ fn file_page_backend_context_preserves_explicit_data_source() {
 
     pc.file_backend_context()
         .expect("file page container backend context")
-        .plan_submission_with_source(request, source.clone())
+        .plan_submission_with_source_and_target(request, source.clone(), target.clone())
         .expect("mount-hosted backend planner");
 
     assert_eq!(*planner.source.lock(), Some(source));
+    assert_eq!(*planner.target.lock(), Some(target));
 }
 
 #[test]

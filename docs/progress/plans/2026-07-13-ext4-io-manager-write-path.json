@@ -96,7 +96,7 @@
         "cargo test -p tx-ext4 --lib",
         "cargo check -p tx-ext4 -p tx-subsystems"
       ],
-      "notes": "Map extents and holes through BackendPlanner while retaining FsPageBacking fallback. The first prerequisite is complete: BackendPageRequest now carries an L4-owned IoDataTarget for page-cache read DMA, while legacy/source-only constructors retain IoDataTarget::None. Next, PageContainer must lease and transport the target before ext4 can emit data BioPlans without holding its pager lock across device I/O."
+      "notes": "Map extents and holes through BackendPlanner while retaining FsPageBacking fallback. The first prerequisites are complete: BackendPageRequest now carries an L4-owned IoDataTarget for page-cache read DMA, legacy/source-only constructors retain IoDataTarget::None, and MountPayload transports source plus target into BackendPlanner. Next, PageContainer must lease the target through asynchronous completion before ext4 can emit data BioPlans without holding its pager lock across device I/O."
     },
     {
       "id": "6d-ext4-buffered-writeback",

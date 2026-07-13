@@ -14,7 +14,9 @@ use adapter::runtime::{
 use crate::device::BlockDevice;
 use crate::execution::Errno;
 use crate::execution::KernelResult;
-use crate::fs_iface::{BackendPageRequest, BackendPlan, BackendPlanner, FsObjectKey, IoDataSource};
+use crate::fs_iface::{
+    BackendPageRequest, BackendPlan, BackendPlanner, FsObjectKey, IoDataSource, IoDataTarget,
+};
 use crate::io_manager::page::{service::PageServiceBackendContext, PageIoRequest};
 use crate::page_backed::{FsPageBacking, PageContainer};
 use crate::vfs::{
@@ -432,6 +434,27 @@ impl MountPayload {
             ))
         })
     }
+
+    pub fn plan_backend_page_request_with_source_and_target(
+        &self,
+        object: FsObjectKey,
+        request: PageIoRequest,
+        source: IoDataSource,
+        target: IoDataTarget,
+    ) -> Option<BackendPlan> {
+        self.backend_planner.as_deref().map(|planner| {
+            planner.plan_page_io(BackendPageRequest::new_with_source_and_target(
+                object,
+                request.id,
+                request.range,
+                request.op,
+                request.flags,
+                request.generation_hint,
+                source,
+                target,
+            ))
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -466,6 +489,16 @@ impl PageServiceBackendContext for MountPayloadBackendContext<'_> {
     ) -> Option<BackendPlan> {
         self.payload
             .plan_backend_page_request_with_source(self.object, request, source)
+    }
+
+    fn plan_submission_with_source_and_target(
+        &self,
+        request: PageIoRequest,
+        source: IoDataSource,
+        target: IoDataTarget,
+    ) -> Option<BackendPlan> {
+        self.payload
+            .plan_backend_page_request_with_source_and_target(self.object, request, source, target)
     }
 }
 
@@ -1307,12 +1340,12 @@ mod tests {
     };
     use crate::io_manager::block::BlockQueue;
     use crate::io_manager::page::{
+        PageContainerKey, PageGeneration, PageIoCompletionKind, PageIoFlags, PageIoOp,
+        PageIoPriority, PageIoRange, PageIoRequestId, PageIoResult,
         service::{
             PageService, PageServiceBackendSubmitOutcome, PageServiceDrivenWork, PageServiceDriver,
             PageServiceNext, PageServiceTurn, PageServiceWake, PageServiceWork,
         },
-        PageContainerKey, PageGeneration, PageIoCompletionKind, PageIoFlags, PageIoOp,
-        PageIoPriority, PageIoRange, PageIoRequestId, PageIoResult,
     };
     use crate::io_manager::runtime::{IoServiceKind, ServiceBudget, ServiceKick};
     use crate::page_backed::{Frame, PageContainerKind};

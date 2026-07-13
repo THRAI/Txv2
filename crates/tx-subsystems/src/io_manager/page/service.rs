@@ -4,7 +4,7 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
 
 use crate::execution::Errno;
-use crate::fs_iface::IoDataSource;
+use crate::fs_iface::{IoDataSource, IoDataTarget};
 use crate::io_manager::backend::{
     dispatch_backend_plan, plan_backend_request, BackendDispatch, BackendPageRequest, BackendPlan,
     BackendPlanner, BioPlanList, BlockPageCompletion, BlockPageCompletionError,
@@ -188,6 +188,15 @@ pub trait PageServiceBackendContext {
         _source: IoDataSource,
     ) -> Option<BackendPlan> {
         self.plan_submission(request)
+    }
+
+    fn plan_submission_with_source_and_target(
+        &self,
+        request: PageIoRequest,
+        source: IoDataSource,
+        _target: IoDataTarget,
+    ) -> Option<BackendPlan> {
+        self.plan_submission_with_source(request, source)
     }
 }
 
