@@ -47,6 +47,7 @@ use tx_hal::{Ppn, UserPtr};
 use tx_substrate::page_allocator::OwnedFrame;
 
 mod cross_variant;
+mod direct_io;
 mod fs_page_backing;
 mod gift;
 mod lifecycle;
@@ -57,6 +58,7 @@ mod sparse_index;
 mod targeted_read;
 mod user_buffer;
 pub use cross_variant::step_copy_file_range;
+pub use direct_io::{DirectIoBuffer, DirectIoBufferError};
 pub use fs_page_backing::FsPageBacking;
 pub use lifecycle::{FallocateOp, TruncateOp, step_fallocate, step_fsync, step_truncate};
 pub use range::{
@@ -3050,6 +3052,8 @@ mod core_tests;
 
 #[cfg(test)]
 mod cross_variant_tests;
+#[cfg(test)]
+mod direct_io_tests;
 #[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]

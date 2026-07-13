@@ -1,3 +1,16 @@
+- 2026-07-14 (ext4 I/O-manager 6F user-page DMA lease foundation).
+  Added the PageBacked-owned `DirectIoBuffer` lease. After the caller has
+  eagerly materialized and permission-checked a user range through VM, L4
+  validates the complete pmap snapshot, acquires one real page-substrate
+  `DmaPin` per page with rollback on partial failure, and builds cross-page
+  `BioVec`s. The lease has a stable opaque id and can produce neutral direct
+  source/target values while retaining all DMA pins until the lease drops;
+  filesystem and driver code never receives the user pointer. Verification
+  passed: direct-I/O tests 2/2, PageBacked 133/133, and
+  `cargo check -p tx-subsystems --lib --no-default-features`. This is a
+  pinning foundation only; syscall submission, completion registry ownership,
+  hole handling, msync/syncfs, and 6G cutover remain open.
+
 - 2026-07-14 (ext4 I/O-manager 6F mapped direct-write planner sub-slice).
   Ext4 mapped data writes now accept an L4-owned `IoDataSource::Direct` and
   preserve validated multi-segment `BioVec`s in the L6 write bio. Page-cache
