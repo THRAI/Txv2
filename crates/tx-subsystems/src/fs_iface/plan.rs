@@ -78,7 +78,7 @@ impl IoDataLeaseId {
     }
 }
 
-/// Data bytes referenced by a backend plan; ownership remains with L4.
+/// Data bytes consumed by a backend plan; ownership remains with L4.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum IoDataSource {
     None,
@@ -117,6 +117,45 @@ impl IoDataSource {
         match self {
             Self::None => None,
             Self::PageCache { lease, .. } | Self::Direct { lease, .. } => Some(*lease),
+        }
+    }
+}
+
+/// DMA-visible destination supplied by L4 for a backend read plan.
+///
+/// L5 may translate this target into `BioVec`s, but it never owns the frame or
+/// releases the lease. A later direct-I/O slice can extend this with user-page
+/// destinations without changing the page-cache case.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IoDataTarget {
+    None,
+    PageCache {
+        lease: IoDataLeaseId,
+        frame: PageFrameRef,
+        offset: u32,
+        len: u32,
+    },
+}
+
+impl IoDataTarget {
+    pub const fn page_cache(
+        lease: IoDataLeaseId,
+        frame: PageFrameRef,
+        offset: u32,
+        len: u32,
+    ) -> Self {
+        Self::PageCache {
+            lease,
+            frame,
+            offset,
+            len,
+        }
+    }
+
+    pub const fn lease(&self) -> Option<IoDataLeaseId> {
+        match self {
+            Self::None => None,
+            Self::PageCache { lease, .. } => Some(*lease),
         }
     }
 }
@@ -353,6 +392,7 @@ pub struct BackendPageRequest {
     pub flags: PageIoFlags,
     pub generation_hint: Option<PageGeneration>,
     pub source: IoDataSource,
+    pub target: IoDataTarget,
 }
 
 impl BackendPageRequest {
@@ -372,6 +412,7 @@ impl BackendPageRequest {
             flags,
             generation_hint,
             source: IoDataSource::None,
+            target: IoDataTarget::None,
         }
     }
 
@@ -384,6 +425,28 @@ impl BackendPageRequest {
         generation_hint: Option<PageGeneration>,
         source: IoDataSource,
     ) -> Self {
+        Self::new_with_source_and_target(
+            object,
+            id,
+            range,
+            op,
+            flags,
+            generation_hint,
+            source,
+            IoDataTarget::None,
+        )
+    }
+
+    pub fn new_with_source_and_target(
+        object: FsObjectKey,
+        id: PageIoRequestId,
+        range: PageIoRange,
+        op: PageIoOp,
+        flags: PageIoFlags,
+        generation_hint: Option<PageGeneration>,
+        source: IoDataSource,
+        target: IoDataTarget,
+    ) -> Self {
         Self {
             object,
             id,
@@ -392,6 +455,7 @@ impl BackendPageRequest {
             flags,
             generation_hint,
             source,
+            target,
         }
     }
 
@@ -466,6 +530,25 @@ mod tests {
         );
 
         assert_eq!(request.source, source);
+        assert_eq!(request.target, IoDataTarget::None);
+    }
+
+    #[test]
+    fn backend_page_request_keeps_page_cache_read_target() {
+        let target =
+            IoDataTarget::page_cache(IoDataLeaseId::new(8), PageFrameRef::new(Ppn(9)), 0, 4096);
+        let request = BackendPageRequest::new_with_source_and_target(
+            FsObjectKey::new(2),
+            PageIoRequestId::new(4),
+            PageIoRange::new(1, 1),
+            PageIoOp::Read,
+            PageIoFlags::EMPTY,
+            Some(PageGeneration::new(5)),
+            IoDataSource::None,
+            target.clone(),
+        );
+
+        assert_eq!(request.target, target);
     }
 
     #[test]

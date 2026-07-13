@@ -11,8 +11,8 @@ use crate::io_manager::page::{
 pub use crate::fs_iface::plan::{
     BackendBioCompletion, BackendBioDependency, BackendBioGraph, BackendBioGraphError,
     BackendBioNode, BackendBioNodeId, BackendPageRequest, BackendPlan, BackendPlanResume,
-    BackendPlanner, BioPlanList, FsObjectKey, IoDataLeaseId, IoDataSource, PageCompletion,
-    PageCompletionList, PageFrameRef, PagerResumeToken, WaitSourceId,
+    BackendPlanner, BioPlanList, FsObjectKey, IoDataLeaseId, IoDataSource, IoDataTarget,
+    PageCompletion, PageCompletionList, PageFrameRef, PagerResumeToken, WaitSourceId,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
