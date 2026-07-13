@@ -96,7 +96,7 @@
         "cargo test -p tx-ext4 --lib",
         "cargo check -p tx-ext4 -p tx-subsystems"
       ],
-      "notes": "Map extents and holes through BackendPlanner while retaining FsPageBacking fallback. BackendPageRequest carries an L4-owned IoDataTarget for page-cache read DMA, MountPayload transports source plus target into BackendPlanner, and PageContainer leases a CachedFrame target across planning until matching completion installs the same pin into the page index. Ext4BlockGeometry and plan_read_request emit complete hole plans, mapped-extent L6 bios, or metadata-first continuations; BlockDeviceImage exposes geometry only when the caller supplies its registered DeviceKey. MetadataFirst now preserves the original BackendPageRequest, L4 waits for every metadata bio, terminalizes metadata errors with the original generation, deduplicates merged request IDs, and wakes the page service when the final continuation is ready. Ext4MappingTable caches inline extent roots and child nodes: an uncached child produces an L6 metadata bio into the already leased target frame, resume parses that frame through the direct map, validates and caches the child, then replans the original data bio without synchronous pager I/O. Ext4FsInstance/MountedExt4 carry an optional BackendPlanner capability and public mount helpers accept injection. 6C remains pending: concrete inode lookup/mount code must seed each inode's extent root and construct/inject this planner for production ext4 mounts before compatibility fetch can be cut over."
+      "notes": "Map extents and holes through BackendPlanner while retaining FsPageBacking fallback. BackendPageRequest carries an L4-owned IoDataTarget for page-cache read DMA, MountPayload transports source plus target into BackendPlanner, and PageContainer leases a CachedFrame target across planning until matching completion installs the same pin into the page index. Ext4BlockGeometry and plan_read_request emit complete hole plans, mapped-extent L6 bios, or metadata-first continuations; BlockDeviceImage exposes geometry only when the caller supplies its registered DeviceKey. MetadataFirst preserves the original BackendPageRequest, L4 waits for every metadata bio, terminalizes metadata errors with the original generation, deduplicates merged request IDs, and wakes the page service when the final continuation is ready. Ext4MappingTable caches inline extent roots and child nodes: an uncached child produces an L6 metadata bio into the already leased target frame, resume parses that frame through the direct map, validates and caches the child, then replans the original data bio without synchronous pager I/O. Ext4PlannerBinding now pairs the planner with the shared mapping table; `Ext4FsInstance::inode_meta_cached` atomically reads and seeds each regular inode's inline root during its existing metadata lookup. New explicit I/O-manager mount helpers construct the binding. 6C remains pending: the concrete device bridge must pass its registered DeviceKey to these helpers and run old/new ext4 read parity before compatibility fetch can be cut over."
     },
     {
       "id": "6d-ext4-buffered-writeback",
@@ -201,6 +201,11 @@
       "command": "cargo check -p tx-subsystems --lib --no-default-features; cargo check -p tx-ext4 --lib --no-default-features",
       "status": "passed",
       "notes": "Both focused no-default-feature library checks passed; existing unrelated warnings remain in net step_connect and unused Ext4FsInstance::open."
+    },
+    {
+      "command": "cargo test -p tx-ext4 --lib --no-default-features -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 15 ext4 library tests, including the Ext4FsInstance metadata lookup to shared L5 extent-root seed and data-bio planning witness."
     }
   ],
   "risks": [

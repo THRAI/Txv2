@@ -169,6 +169,17 @@ impl<I: BlockImage> Ext4Pager<I> {
         self.read_inode(inode).map(inode_to_meta)
     }
 
+    /// Read one inode once and return both its VFS metadata and inline extent
+    /// root. L5 seeds this root during namespace metadata lookup; it must not
+    /// issue this synchronous pager read from a PageContainer miss callback.
+    pub fn inode_meta_and_extent_root(
+        &mut self,
+        inode: InodeNo,
+    ) -> Result<(InodeMetaLite, Vec<u8>)> {
+        let inode = self.read_inode(inode)?;
+        Ok((inode_to_meta(inode), inode.extent_root_bytes().to_vec()))
+    }
+
     pub fn read_page(
         &mut self,
         inode: InodeNo,

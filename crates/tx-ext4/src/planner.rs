@@ -1,6 +1,7 @@
 //! Ext4-to-L6 block-plan helpers.
 
 use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
 use alloc::vec;
 
 use tx_subsystems::execution::Errno;
@@ -189,6 +190,33 @@ pub struct Ext4ReadPlanner<S> {
     mapping: S,
 }
 
+/// Shared ext4 L5 planner state for one mounted filesystem.
+///
+/// The mapping table is held independently from the trait object so the
+/// metadata owner can seed inode roots while L4 holds only `BackendPlanner`.
+#[derive(Clone)]
+pub struct Ext4PlannerBinding {
+    planner: Arc<dyn BackendPlanner>,
+    mapping: Arc<Ext4MappingTable>,
+}
+
+impl Ext4PlannerBinding {
+    pub fn new(geometry: Ext4BlockGeometry) -> Self {
+        let mapping = Arc::new(Ext4MappingTable::new());
+        let planner: Arc<dyn BackendPlanner> =
+            Arc::new(Ext4ReadPlanner::new(geometry, Arc::clone(&mapping)));
+        Self { planner, mapping }
+    }
+
+    pub fn planner(&self) -> Arc<dyn BackendPlanner> {
+        Arc::clone(&self.planner)
+    }
+
+    pub fn mapping(&self) -> Arc<Ext4MappingTable> {
+        Arc::clone(&self.mapping)
+    }
+}
+
 impl<S> Ext4ReadPlanner<S> {
     pub const fn new(geometry: Ext4BlockGeometry, mapping: S) -> Self {
         Self { geometry, mapping }
@@ -198,6 +226,16 @@ impl<S> Ext4ReadPlanner<S> {
 impl Ext4ReadPlanner<Ext4MappingTable> {
     pub fn with_mapping_table(geometry: Ext4BlockGeometry, mapping: Ext4MappingTable) -> Self {
         Self::new(geometry, mapping)
+    }
+}
+
+impl Ext4ReadMappingSource for Arc<Ext4MappingTable> {
+    fn map_page(&self, request: &BackendPageRequest) -> Ext4ReadMapping {
+        self.as_ref().map_page(request)
+    }
+
+    fn resume_metadata(&self, request: &BackendPageRequest) -> Result<(), Errno> {
+        self.as_ref().resume_metadata(request)
     }
 }
 

@@ -25,10 +25,19 @@ use crate::adapter::step_engine::{
 };
 use tx_ext4_format::ondisk::{Extent, GroupDesc, Inode, Superblock};
 use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
+use tx_subsystems::fs_iface::{
+    BackendPageRequest, BackendPlan, FsObjectKey, IoDataLeaseId, IoDataSource, IoDataTarget,
+    PageFrameRef,
+};
+use tx_subsystems::io_manager::block::DeviceKey;
+use tx_subsystems::io_manager::page::{
+    PageGeneration, PageIoFlags, PageIoOp, PageIoRange, PageIoRequestId,
+};
 use tx_subsystems::page_backed::FsPageBacking;
 use tx_subsystems::vfs::structure::{DirCursor, FsObjectId, RNodeBacking};
 use tx_subsystems::vfs::FsOps;
 
+use crate::planner::{Ext4BlockGeometry, Ext4PlannerBinding};
 use crate::read_backend::Ext4FsInstance;
 
 /// Shared serialisation lock. Mirrors `tx_fs::test_support::FS_TEST_LOCK`:
@@ -211,6 +220,18 @@ fn open_fs_read_only() -> Arc<Ext4FsInstance<MemImage>> {
     Ext4FsInstance::open(build_image(), true).expect("open ext4 mem image (RO)")
 }
 
+fn open_fs_with_io_manager_binding() -> (Arc<Ext4FsInstance<MemImage>>, Ext4PlannerBinding) {
+    let binding = Ext4PlannerBinding::new(Ext4BlockGeometry::new(DeviceKey::new(7), 8));
+    let fs = Ext4FsInstance::open_with_backend_planner_and_mapping(
+        build_image(),
+        false,
+        Some(binding.planner()),
+        Some(binding.mapping()),
+    )
+    .expect("open ext4 mem image with planner binding");
+    (fs, binding)
+}
+
 fn test_mount_payload(
     fs: &Arc<Ext4FsInstance<MemImage>>,
 ) -> crate::adapter::step_engine::Cap<tx_subsystems::mount::MountPayload> {
@@ -266,6 +287,40 @@ fn ext4_v3_load_inode_meta_returns_done_for_real_inode() {
     };
     assert_eq!(meta.size, BLOCK_SIZE as u64);
     assert_eq!(meta.uid, 1000);
+}
+
+#[test]
+fn ext4_inode_metadata_seeds_l5_extent_root_for_page_planning() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let (fs, binding) = open_fs_with_io_manager_binding();
+    let guard = epoch::guard();
+
+    assert!(matches!(
+        <Ext4FsInstance<MemImage> as FsOps>::load_inode_meta(&*fs, FsObjectId::new(12), &guard,),
+        V3::Done(_)
+    ));
+
+    let request = BackendPageRequest::new_with_source_and_target(
+        FsObjectKey::new(12),
+        PageIoRequestId::new(41),
+        PageIoRange::new(0, 1),
+        PageIoOp::Read,
+        PageIoFlags::DEMAND,
+        Some(PageGeneration::new(1)),
+        IoDataSource::None,
+        IoDataTarget::page_cache(
+            IoDataLeaseId::new(1),
+            PageFrameRef::new(tx_hal::Ppn(0x42)),
+            0,
+            BLOCK_SIZE as u32,
+        ),
+    );
+
+    let BackendPlan::SubmitBios(bios) = binding.planner().plan_page_io(request) else {
+        panic!("seeded inline extent root must plan the file-data bio");
+    };
+    assert_eq!(bios.as_slice()[0].lba.start_lba(), 20 * 8);
 }
 
 #[test]

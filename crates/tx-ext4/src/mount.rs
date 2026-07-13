@@ -6,10 +6,11 @@ use tx_ext4_format::pager::BlockImage;
 use tx_subsystems::execution::Errno;
 use tx_subsystems::fs_iface::BackendPlanner;
 use tx_subsystems::page_backed::FsPageBacking;
-use tx_subsystems::vfs::structure::{FsObjectId, InodeMeta};
 use tx_subsystems::vfs::FsOps;
+use tx_subsystems::vfs::structure::{FsObjectId, InodeMeta};
 
-use crate::read_backend::{map_inode_meta, Ext4FsInstance, EXT4_ROOT_INODE};
+use crate::planner::{Ext4BlockGeometry, Ext4PlannerBinding};
+use crate::read_backend::{EXT4_ROOT_INODE, Ext4FsInstance, map_inode_meta};
 
 pub struct MountedExt4<I> {
     backend: Arc<Ext4FsInstance<I>>,
@@ -69,6 +70,19 @@ where
     open_ext4_with_backend_planner(image, true, backend_planner)
 }
 
+/// Mount ext4 with the paired L5 planner and metadata cache used by the I/O
+/// manager. Namespace metadata lookup seeds inode extent roots before L4 page
+/// misses ask the planner to resolve file pages.
+pub fn mount_ext4_read_only_with_io_manager_planner<I>(
+    image: I,
+    geometry: Ext4BlockGeometry,
+) -> Result<MountedExt4<I>, Errno>
+where
+    I: BlockImage + Send + 'static,
+{
+    open_ext4_with_planner_binding(image, true, Ext4PlannerBinding::new(geometry))
+}
+
 /// Mount an ext4 image read-write.
 ///
 /// `FsOps::create_inode` / `mkdir` / `unlink` / `rename` / `link`
@@ -95,6 +109,19 @@ where
     open_ext4_with_backend_planner(image, false, backend_planner)
 }
 
+/// Read-write counterpart of [`mount_ext4_read_only_with_io_manager_planner`].
+/// Buffered writeback remains deferred to Phase 6D; this only establishes the
+/// read-planner binding and root-seeding contract.
+pub fn mount_ext4_read_write_with_io_manager_planner<I>(
+    image: I,
+    geometry: Ext4BlockGeometry,
+) -> Result<MountedExt4<I>, Errno>
+where
+    I: BlockImage + Send + 'static,
+{
+    open_ext4_with_planner_binding(image, false, Ext4PlannerBinding::new(geometry))
+}
+
 fn open_ext4_with_backend_planner<I>(
     image: I,
     read_only: bool,
@@ -103,7 +130,40 @@ fn open_ext4_with_backend_planner<I>(
 where
     I: BlockImage + Send + 'static,
 {
-    let backend = Ext4FsInstance::open_with_backend_planner(image, read_only, backend_planner)?;
+    open_ext4_with_backend_planner_and_mapping(image, read_only, backend_planner, None)
+}
+
+fn open_ext4_with_planner_binding<I>(
+    image: I,
+    read_only: bool,
+    binding: Ext4PlannerBinding,
+) -> Result<MountedExt4<I>, Errno>
+where
+    I: BlockImage + Send + 'static,
+{
+    open_ext4_with_backend_planner_and_mapping(
+        image,
+        read_only,
+        Some(binding.planner()),
+        Some(binding.mapping()),
+    )
+}
+
+fn open_ext4_with_backend_planner_and_mapping<I>(
+    image: I,
+    read_only: bool,
+    backend_planner: Option<Arc<dyn BackendPlanner>>,
+    extent_mapping: Option<Arc<crate::planner::Ext4MappingTable>>,
+) -> Result<MountedExt4<I>, Errno>
+where
+    I: BlockImage + Send + 'static,
+{
+    let backend = Ext4FsInstance::open_with_backend_planner_and_mapping(
+        image,
+        read_only,
+        backend_planner,
+        extent_mapping,
+    )?;
     let root_fs_object_id = FsObjectId::new(EXT4_ROOT_INODE as u64);
     let root_inode_meta = backend
         .with_pager(|pager| pager.inode_meta(tx_ext4_format::pager::InodeNo::new(EXT4_ROOT_INODE)))

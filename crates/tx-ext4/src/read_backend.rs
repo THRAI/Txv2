@@ -6,13 +6,15 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::adapter::step_engine::{Cap, PayloadCap, SpinMutex};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use tx_ext4_format::pager::{BlockImage, DirEntryLite, Ext4Pager, InodeMetaLite, InodeNo};
 use tx_ext4_format::Ext4FormatError;
+use tx_ext4_format::pager::{BlockImage, DirEntryLite, Ext4Pager, InodeMetaLite, InodeNo};
 use tx_subsystems::execution::Errno;
 use tx_subsystems::fs_iface::BackendPlanner;
 use tx_subsystems::mount::{MountPayload, MountPayloadPin};
 use tx_subsystems::vfs::structure::DirCursor;
 use tx_subsystems::vfs::structure::{FsObjectId, InodeMeta, Timespec};
+
+use crate::planner::Ext4MappingTable;
 
 pub(crate) const EXT4_ROOT_INODE: u32 = 2;
 pub(crate) const READDIR_WINDOW_ENTRIES: usize = 64;
@@ -20,6 +22,7 @@ pub(crate) const READDIR_WINDOW_ENTRIES: usize = 64;
 pub(crate) struct Ext4FsInstance<I> {
     pager: Ext4PagerCell<I>,
     backend_planner: Option<Arc<dyn BackendPlanner>>,
+    extent_mapping: Option<Arc<Ext4MappingTable>>,
     lookup_cache: SpinMutex<LookupCache>,
     dir_cache: SpinMutex<DirCache>,
     inode_meta_cache: SpinMutex<InodeMetaCache>,
@@ -43,9 +46,19 @@ impl<I: BlockImage> Ext4FsInstance<I> {
         read_only: bool,
         backend_planner: Option<Arc<dyn BackendPlanner>>,
     ) -> Result<Arc<Self>, Errno> {
+        Self::open_with_backend_planner_and_mapping(image, read_only, backend_planner, None)
+    }
+
+    pub(crate) fn open_with_backend_planner_and_mapping(
+        image: I,
+        read_only: bool,
+        backend_planner: Option<Arc<dyn BackendPlanner>>,
+        extent_mapping: Option<Arc<Ext4MappingTable>>,
+    ) -> Result<Arc<Self>, Errno> {
         Ok(Arc::new(Self {
             pager: Ext4PagerCell::new(Ext4Pager::open(image).map_err(map_format_error)?),
             backend_planner,
+            extent_mapping,
             lookup_cache: SpinMutex::new(LookupCache::empty()),
             dir_cache: SpinMutex::new(DirCache::empty()),
             inode_meta_cache: SpinMutex::new(InodeMetaCache::empty()),
@@ -107,7 +120,18 @@ impl<I: BlockImage> Ext4FsInstance<I> {
         if let Some(meta) = self.inode_meta_cache.lock().get(inode) {
             return Ok(meta);
         }
-        let meta = self.with_pager(|pager| pager.inode_meta(inode))?;
+        let (meta, extent_root) = match self.extent_mapping.as_ref() {
+            Some(_) => self.with_pager(|pager| pager.inode_meta_and_extent_root(inode))?,
+            None => (
+                self.with_pager(|pager| pager.inode_meta(inode))?,
+                Vec::new(),
+            ),
+        };
+        if meta.mode & 0xF000 == 0x8000 {
+            if let Some(mapping) = self.extent_mapping.as_ref() {
+                mapping.insert_extent_root(inode.get() as u64, &extent_root)?;
+            }
+        }
         if inode_meta_is_dir(meta) {
             self.inode_meta_cache.lock().insert(inode, meta);
         }
