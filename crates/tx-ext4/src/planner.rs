@@ -2,7 +2,10 @@
 
 use alloc::vec;
 
-use tx_subsystems::fs_iface::{IoDataTarget, PageFrameRef};
+use tx_subsystems::fs_iface::{
+    BackendPageRequest, BackendPlan, BioPlanList, IoDataTarget, PageCompletion,
+    PageCompletionList, PageFrameRef, PagerResumeToken,
+};
 use tx_subsystems::io_manager::block::{BioPlan, BioVec, BlockFlags, BlockOp, DeviceKey, LbaRange};
 use tx_subsystems::execution::Errno;
 
@@ -13,6 +16,50 @@ use tx_ext4_format::pager::BLOCK_SIZE;
 pub struct Ext4BlockGeometry {
     pub device: DeviceKey,
     pub sectors_per_block: u64,
+}
+
+/// Metadata-free result of resolving one logical ext4 page.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Ext4ReadMapping {
+    Hole,
+    Data { physical_block: u64 },
+    MetadataFirst { resume: PagerResumeToken },
+}
+
+/// Translate an ext4 mapping result into the neutral L4/L6 plan IR.
+pub fn plan_read_request(
+    geometry: Ext4BlockGeometry,
+    request: &BackendPageRequest,
+    mapping: Ext4ReadMapping,
+) -> BackendPlan {
+    let Some(generation) = request.generation_hint else {
+        return BackendPlan::Err(Errno::EINVAL);
+    };
+    match mapping {
+        Ext4ReadMapping::Hole => match request.target {
+            IoDataTarget::PageCache { frame, .. } => BackendPlan::Complete(
+                PageCompletionList::from_vec(vec![
+                    PageCompletion::new(
+                        request.id,
+                        request.range,
+                        tx_subsystems::io_manager::page::PageIoResult::Done,
+                        generation,
+                        tx_subsystems::io_manager::page::PageIoCompletionKind::ReadInstalled,
+                    )
+                    .with_frame_ref(frame),
+                ]),
+            ),
+            IoDataTarget::None => BackendPlan::Err(Errno::EINVAL),
+        },
+        Ext4ReadMapping::Data { physical_block } => match geometry.plan_read(physical_block, &request.target) {
+            Ok(bio) => BackendPlan::SubmitBios(BioPlanList::from_vec(vec![bio])),
+            Err(errno) => BackendPlan::Err(errno),
+        },
+        Ext4ReadMapping::MetadataFirst { resume } => BackendPlan::MetadataFirst {
+            bios: BioPlanList::default(),
+            resume,
+        },
+    }
 }
 
 impl Ext4BlockGeometry {
@@ -65,5 +112,33 @@ mod tests {
         assert_eq!(plan.device, DeviceKey::new(7));
         assert_eq!(plan.lba, LbaRange::new(88, 8));
         assert_eq!(plan.vecs, vec![BioVec::new(9, 0, BLOCK_SIZE as u32)]);
+    }
+
+    #[test]
+    fn hole_read_completes_into_l4_zeroed_target() {
+        let target = IoDataTarget::page_cache(
+            IoDataLeaseId::new(2),
+            PageFrameRef::new(Ppn(10)),
+            0,
+            BLOCK_SIZE as u32,
+        );
+        let request = BackendPageRequest::new_with_source_and_target(
+            tx_subsystems::fs_iface::FsObjectKey::new(3),
+            tx_subsystems::io_manager::page::PageIoRequestId::new(4),
+            tx_subsystems::io_manager::page::PageIoRange::new(5, 1),
+            tx_subsystems::io_manager::page::PageIoOp::Read,
+            tx_subsystems::io_manager::page::PageIoFlags::DEMAND,
+            Some(tx_subsystems::io_manager::page::PageGeneration::new(6)),
+            tx_subsystems::fs_iface::IoDataSource::None,
+            target,
+        );
+        let BackendPlan::Complete(completions) = plan_read_request(
+            Ext4BlockGeometry::new(DeviceKey::new(7), 8),
+            &request,
+            Ext4ReadMapping::Hole,
+        ) else {
+            panic!("hole must complete without a device bio");
+        };
+        assert_eq!(completions.as_slice()[0].frame, Some(PageFrameRef::new(Ppn(10))));
     }
 }
