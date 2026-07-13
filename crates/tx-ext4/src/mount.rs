@@ -52,7 +52,21 @@ pub fn mount_ext4_read_only<I>(image: I) -> Result<MountedExt4<I>, Errno>
 where
     I: BlockImage + Send + 'static,
 {
-    open_ext4(image, true)
+    open_ext4_with_backend_planner(image, true, None)
+}
+
+/// Mount an ext4 image read-only with an optional I/O-manager planner.
+///
+/// `None` preserves the compatibility pager path. A concrete device bridge
+/// supplies the planner only after it has a stable geometry and mapping source.
+pub fn mount_ext4_read_only_with_backend_planner<I>(
+    image: I,
+    backend_planner: Option<Arc<dyn BackendPlanner>>,
+) -> Result<MountedExt4<I>, Errno>
+where
+    I: BlockImage + Send + 'static,
+{
+    open_ext4_with_backend_planner(image, true, backend_planner)
 }
 
 /// Mount an ext4 image read-write.
@@ -67,14 +81,29 @@ pub fn mount_ext4_read_write<I>(image: I) -> Result<MountedExt4<I>, Errno>
 where
     I: BlockImage + Send + 'static,
 {
-    open_ext4(image, false)
+    open_ext4_with_backend_planner(image, false, None)
 }
 
-fn open_ext4<I>(image: I, read_only: bool) -> Result<MountedExt4<I>, Errno>
+/// Read-write counterpart of [`mount_ext4_read_only_with_backend_planner`].
+pub fn mount_ext4_read_write_with_backend_planner<I>(
+    image: I,
+    backend_planner: Option<Arc<dyn BackendPlanner>>,
+) -> Result<MountedExt4<I>, Errno>
 where
     I: BlockImage + Send + 'static,
 {
-    let backend = Ext4FsInstance::open(image, read_only)?;
+    open_ext4_with_backend_planner(image, false, backend_planner)
+}
+
+fn open_ext4_with_backend_planner<I>(
+    image: I,
+    read_only: bool,
+    backend_planner: Option<Arc<dyn BackendPlanner>>,
+) -> Result<MountedExt4<I>, Errno>
+where
+    I: BlockImage + Send + 'static,
+{
+    let backend = Ext4FsInstance::open_with_backend_planner(image, read_only, backend_planner)?;
     let root_fs_object_id = FsObjectId::new(EXT4_ROOT_INODE as u64);
     let root_inode_meta = backend
         .with_pager(|pager| pager.inode_meta(tx_ext4_format::pager::InodeNo::new(EXT4_ROOT_INODE)))
