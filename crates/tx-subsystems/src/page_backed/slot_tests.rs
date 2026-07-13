@@ -1,4 +1,4 @@
-use super::{PageSlot, PageSlotCompletionError, PageSlotFetch, PageSlotState};
+use super::{PageSlot, PageSlotCompletionError, PageSlotFetch, PageSlotFsyncStatus, PageSlotState};
 use crate::execution::Errno;
 use tx_hal::Ppn;
 
@@ -106,4 +106,36 @@ fn page_slot_redirty_during_writeback_survives_successful_old_completion() {
         .expect("old completion is still valid");
     assert_eq!(completed.state, PageSlotState::Dirty { ppn: Ppn(12) });
     assert_eq!(completed.generation, redirtied.generation);
+}
+
+#[test]
+fn page_slot_fsync_frontier_waits_for_old_writeback_before_resubmitting_redirty() {
+    let slot = PageSlot::new();
+    let PageSlotFetch::Owner { generation } = slot.begin_fetch() else {
+        panic!("setup fetch owner");
+    };
+    slot.complete_fetch(generation, Ok(Ppn(13)))
+        .expect("setup resident page");
+    let first = slot
+        .mark_dirty()
+        .expect("first dirty generation")
+        .generation;
+    let writeback = slot.begin_writeback().expect("start writeback");
+    assert_eq!(writeback.generation, first);
+    let second = slot.mark_dirty().expect("redirty generation").generation;
+
+    assert_eq!(
+        slot.fsync_status(second),
+        PageSlotFsyncStatus::WaitingForEarlierWriteback {
+            submitted_generation: first,
+            frontier: second,
+        }
+    );
+
+    slot.complete_writeback(first, Ok(()))
+        .expect("old writeback completion");
+    assert_eq!(
+        slot.fsync_status(second),
+        PageSlotFsyncStatus::NeedsWriteback { generation: second }
+    );
 }

@@ -70,6 +70,24 @@ pub enum PageSlotCompletionError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PageSlotFsyncStatus {
+    Clean,
+    NeedsWriteback {
+        generation: PageGeneration,
+    },
+    WaitingForWriteback {
+        submitted_generation: PageGeneration,
+    },
+    WaitingForEarlierWriteback {
+        submitted_generation: PageGeneration,
+        frontier: PageGeneration,
+    },
+    Error {
+        errno: Errno,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PageSlotInner {
     state: PageSlotState,
     generation: PageGeneration,
@@ -114,6 +132,39 @@ impl PageSlot {
 
     pub fn generation(&self) -> PageGeneration {
         self.inner.lock().generation
+    }
+
+    /// Classify this page against an fsync entry frontier without submitting I/O.
+    pub fn fsync_status(&self, frontier: PageGeneration) -> PageSlotFsyncStatus {
+        let inner = self.inner.lock();
+        match inner.state {
+            PageSlotState::Resident { .. } | PageSlotState::Empty | PageSlotState::Fetching => {
+                PageSlotFsyncStatus::Clean
+            }
+            PageSlotState::Dirty { .. } => {
+                if inner.generation <= frontier {
+                    PageSlotFsyncStatus::NeedsWriteback {
+                        generation: inner.generation,
+                    }
+                } else {
+                    PageSlotFsyncStatus::Clean
+                }
+            }
+            PageSlotState::Writeback {
+                submitted_generation,
+                ..
+            } if submitted_generation >= frontier => PageSlotFsyncStatus::WaitingForWriteback {
+                submitted_generation,
+            },
+            PageSlotState::Writeback {
+                submitted_generation,
+                ..
+            } => PageSlotFsyncStatus::WaitingForEarlierWriteback {
+                submitted_generation,
+                frontier,
+            },
+            PageSlotState::Error { errno } => PageSlotFsyncStatus::Error { errno },
+        }
     }
 
     pub fn begin_fetch(&self) -> PageSlotFetch {

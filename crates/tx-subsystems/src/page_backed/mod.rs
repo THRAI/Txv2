@@ -30,12 +30,17 @@ mod fs_page_backing;
 mod gift;
 mod lifecycle;
 mod reflink;
+mod slot;
 mod targeted_read;
 mod user_buffer;
 pub use cross_variant::step_copy_file_range;
 pub use fs_page_backing::FsPageBacking;
 pub use lifecycle::{step_fallocate, step_fsync, step_truncate, FallocateOp, TruncateOp};
 pub use reflink::{cow_replace_into_private, install_shared_page};
+pub use slot::{
+    PageSlot, PageSlotCompletionError, PageSlotFetch, PageSlotFsyncStatus, PageSlotSnapshot,
+    PageSlotState,
+};
 pub use targeted_read::read_exact_at;
 pub use user_buffer::{
     step_read_to_kernel, step_read_to_user, step_write_from_kernel, step_write_from_user,
@@ -1576,6 +1581,8 @@ mod lifecycle_tests;
 mod reflink_tests;
 #[cfg(test)]
 mod size_tests;
+#[cfg(test)]
+mod slot_tests;
 #[cfg(test)]
 mod targeted_read_tests;
 #[cfg(test)]
