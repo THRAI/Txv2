@@ -1,0 +1,184 @@
+{
+  "schema": "tx.progress.plan.v1",
+  "id": "2026-07-13-ext4-io-manager-write-path",
+  "title": "Ext4 I/O-manager write-path migration",
+  "status": "proposed",
+  "created": "2026-07-13",
+  "updated": "2026-07-13",
+  "owner": "unassigned",
+  "summary": "Move ext4 from the direct page-pager compatibility path to a write-capable neutral planner while preserving page-cache ownership and durable journal ordering.",
+  "scope": {
+    "in": [
+      "crates/tx-subsystems/src/io_manager",
+      "crates/tx-subsystems/src/fs_iface",
+      "crates/tx-subsystems/src/page_backed",
+      "crates/tx-ext4/src",
+      "crates/tx-ext4-format/src",
+      "docs/design/05_filesystem",
+      "docs/design/03_memory-vm"
+    ],
+    "out": [
+      "txarray-ebr-index",
+      "virtio-completion-rewrite",
+      "multi-queue-driver-sharding",
+      "fs-page-backing-removal"
+    ],
+    "write_sets": [
+      {
+        "owner": "phase-6-coordinator",
+        "paths": [
+          "docs/superpowers/specs/2026-07-13-ext4-io-manager-write-design.md",
+          "docs/progress/plans/2026-07-13-ext4-io-manager-write-path.json"
+        ],
+        "notes": "This proposed master plan owns only its specification and record. Each implementation slice claims its code write set after prior plans release it."
+      }
+    ]
+  },
+  "context": {
+    "design_docs": [
+      "docs/design/05_filesystem/IO_MANAGER_v1.md",
+      "docs/design/05_filesystem/TX_EXT4_PLAN_v1_2.md",
+      "docs/design/03_memory-vm/PAGE_BACKED_v1.md",
+      "docs/superpowers/specs/2026-07-13-ext4-io-manager-write-design.md"
+    ],
+    "progress_refs": [
+      "docs/progress/plans/2026-07-11-io-manager-phase0-landing.json"
+    ],
+    "external_refs": [
+      "Linux iomap and blk-mq layering",
+      "JBD2 ordered-mode durability model"
+    ]
+  },
+  "steps": [
+    {
+      "id": "6a-neutral-write-ir",
+      "title": "Add neutral I/O data-source leases and dependency graph",
+      "status": "pending",
+      "depends_on": [],
+      "paths": [
+        "crates/tx-subsystems/src/io_manager",
+        "crates/tx-subsystems/src/fs_iface"
+      ],
+      "verification": [
+        "cargo test -p tx-subsystems --lib io_manager",
+        "cargo check -p tx-subsystems"
+      ],
+      "notes": "Keep old BackendPlan variants as compatibility adapters; do not import concrete filesystems or drivers."
+    },
+    {
+      "id": "6b-page-slot-writeback",
+      "title": "Make PageSlot writeback generation-safe under concurrent redirty",
+      "status": "pending",
+      "depends_on": [
+        "6a-neutral-write-ir"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/page_backed",
+        "crates/tx-subsystems/src/io_manager/page"
+      ],
+      "verification": [
+        "cargo test -p tx-subsystems --lib page_backed",
+        "cargo test -p tx-subsystems --lib io_manager"
+      ],
+      "notes": "Cover redirty during writeback, stale completion, fsync frontier, and no lock across I/O."
+    },
+    {
+      "id": "6c-ext4-read-planner",
+      "title": "Implement ext4 read planner parity",
+      "status": "pending",
+      "depends_on": [
+        "6a-neutral-write-ir"
+      ],
+      "paths": [
+        "crates/tx-ext4/src"
+      ],
+      "verification": [
+        "cargo test -p tx-ext4 --lib",
+        "cargo check -p tx-ext4 -p tx-subsystems"
+      ],
+      "notes": "Map extents and holes through BackendPlanner while retaining FsPageBacking fallback."
+    },
+    {
+      "id": "6d-ext4-buffered-writeback",
+      "title": "Plan buffered ext4 writeback from PC frame sources",
+      "status": "pending",
+      "depends_on": [
+        "6b-page-slot-writeback",
+        "6c-ext4-read-planner"
+      ],
+      "paths": [
+        "crates/tx-ext4/src",
+        "crates/tx-ext4-format/src"
+      ],
+      "verification": [
+        "cargo test -p tx-ext4 --lib",
+        "cargo test -p tx-subsystems --lib page_backed"
+      ],
+      "notes": "This is not a durable fsync claim until the ordered journal slice is complete."
+    },
+    {
+      "id": "6e-jbd2-durability",
+      "title": "Add ordered JBD2 transaction graph, replay, and fsync fence",
+      "status": "pending",
+      "depends_on": [
+        "6d-ext4-buffered-writeback"
+      ],
+      "paths": [
+        "crates/tx-ext4/src",
+        "crates/tx-ext4-format/src",
+        "crates/tx-subsystems/src/io_manager"
+      ],
+      "verification": [
+        "QEMU fault-injection remount witness",
+        "e2fsck -n",
+        "Linux ext4 interoperability witness"
+      ],
+      "notes": "Data precedes journal commit; commit record is durable before fsync completes; checkpoint remains asynchronous."
+    },
+    {
+      "id": "6f-direct-io-and-cutover",
+      "title": "Add direct-I/O coherence then switch hot paths incrementally",
+      "status": "pending",
+      "depends_on": [
+        "6e-jbd2-durability"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/page_backed",
+        "crates/tx-subsystems/src/io_manager",
+        "crates/tx-ext4/src",
+        "crates/tx-shims/src"
+      ],
+      "verification": [
+        "overlap reservation tests",
+        "old/new ext4 path parity tests",
+        "cargo -q xtask unit"
+      ],
+      "notes": "O_DIRECT bypasses the PC cache but not range coherency, ext4 planning, or L6 scheduling."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo xtask progress validate",
+      "status": "passed",
+      "notes": "Passed after narrowing this plan to its unclaimed documentation write set."
+    },
+    {
+      "command": "cargo xtask lint docs",
+      "status": "passed",
+      "notes": "Passed with the workspace's existing 7 stale-vocabulary warnings."
+    }
+  ],
+  "risks": [
+    "Treating a completed data bio as durable fsync before ordered JBD2 exists would violate the power-loss contract.",
+    "A writeback completion that clears a page redirtied after submission loses data.",
+    "A plan that holds PC, inode, journal, or range locks across I/O will preserve the current serialization bottleneck.",
+    "Direct I/O without reservation and invalidation creates stale PC data."
+  ],
+  "blockers": [
+    "Active I/O-manager and ext4 design files are already modified in the current worktree; reconcile this plan into those files in their owning change rather than overwriting them."
+  ],
+  "handoff": {
+    "needed": true,
+    "path": null
+  }
+}
