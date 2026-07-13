@@ -2010,6 +2010,50 @@ fn file_direct_write_rejects_dirty_cache_and_releases_after_backend_error() {
 }
 
 #[test]
+fn file_direct_read_blocks_buffered_access_but_preserves_clean_cache() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let guard = step_engine::guard();
+    let fs = Arc::new(RecordingFs::new());
+    let pc = file_page_container(fs.clone(), fs, FsObjectId::new(104), 4);
+    let page = PageIndex::new(1);
+    let frame = cached_frame_for_test();
+    let ppn = frame.ppn;
+    {
+        let mut state = pc.state.lock();
+        state
+            .pages
+            .install_if_absent(page, frame)
+            .expect("install clean cached page");
+        let slot = state.file_page_slots.entry(page).or_default();
+        let PageSlotFetch::Owner { generation } = slot.begin_fetch() else {
+            panic!("fresh slot should grant fetch ownership");
+        };
+        slot.complete_fetch(generation, Ok(ppn))
+            .expect("install resident slot");
+    }
+
+    let reservation = pc
+        .begin_file_direct_read(PageRange::new(page, 1))
+        .expect("clean range can enter direct read");
+    assert!(matches!(
+        pc.materialize_page(page, MaterializeAccess::Write, &guard),
+        V3Out::Err(V3Errno::EBUSY)
+    ));
+    pc.complete_file_direct_read(reservation, Ok(()))
+        .expect("successful direct read completion");
+
+    assert_eq!(pc.lookup(page), Some(ppn));
+    assert!(matches!(
+        pc.file_page_slot_snapshot_for_test(page),
+        Some(PageSlotSnapshot {
+            state: PageSlotState::Resident { ppn: resident },
+            ..
+        }) if resident == ppn
+    ));
+}
+
+#[test]
 fn file_page_bio_only_plan_drives_owned_l6_through_block_device_handle() {
     let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
     setup_host_substrate();

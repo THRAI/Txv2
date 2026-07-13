@@ -153,7 +153,7 @@
         "direct-I/O pinned-buffer tests",
         "msync and syncfs coherence tests"
       ],
-      "notes": "O_DIRECT bypasses the PC cache but not range coherency, ext4 planning, or L6 scheduling. The first 6F sub-slice binds RangeReservationTable into PageContainer: a direct write can reserve only a clean, non-fetching range; the reservation rejects overlapping buffered page materialization; completion releases it on every outcome and invalidates clean overlapping cache entries on success. User-buffer pinning, direct read policy, syscalls, msync, and syncfs are still pending."
+      "notes": "O_DIRECT bypasses the PC cache but not range coherency, ext4 planning, or L6 scheduling. The first 6F sub-slice binds RangeReservationTable into PageContainer: direct reads and writes can reserve only clean, non-fetching ranges; reservations reject overlapping buffered page materialization; every completion releases its reservation; direct-write success invalidates clean overlapping cache entries while direct-read success preserves them. User-buffer pinning, direct planner targets, syscalls, msync, and syncfs are still pending."
     },
     {
       "id": "6g-hot-path-cutover",
@@ -250,7 +250,7 @@
     {
       "command": "cargo test -p tx-subsystems --lib page_backed --no-default-features -- --nocapture --test-threads=1",
       "status": "passed",
-      "notes": "Passed 130 tests after the 6F direct-write reservation/invalidation foundation; the serial harness is required because unrelated parallel host tests can nest same-CPU epoch guards."
+      "notes": "Passed 131 tests after direct read/write range reservation and cache-coherency coverage; the serial harness is required because unrelated parallel host tests can nest same-CPU epoch guards."
     }
   ],
   "risks": [

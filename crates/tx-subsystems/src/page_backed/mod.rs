@@ -980,6 +980,15 @@ impl PageContainer {
         self.begin_file_direct_io(range, RangeReservationKind::DirectWrite)
     }
 
+    /// Reserve an idle range for a direct read. Direct reads preserve clean
+    /// cached data after completion but still exclude overlapping buffered I/O.
+    pub fn begin_file_direct_read(
+        &self,
+        range: PageRange,
+    ) -> Result<RangeReservation, DirectIoAdmissionError> {
+        self.begin_file_direct_io(range, RangeReservationKind::DirectRead)
+    }
+
     /// Complete a direct write and conservatively invalidate overlapped clean
     /// page-cache entries before releasing the direct-write reservation.
     pub fn complete_file_direct_write(
@@ -1009,6 +1018,28 @@ impl PageContainer {
             }
         }
         Ok(invalidated.len())
+    }
+
+    /// Release a direct-read reservation after its device result. The default
+    /// coherency policy preserves clean resident cache pages for direct reads.
+    pub fn complete_file_direct_read(
+        &self,
+        reservation: RangeReservation,
+        result: Result<(), Errno>,
+    ) -> Result<(), DirectIoCompletionError> {
+        if reservation.kind() != RangeReservationKind::DirectRead {
+            return Err(DirectIoCompletionError::WrongReservationKind {
+                expected: RangeReservationKind::DirectRead,
+                actual: reservation.kind(),
+            });
+        }
+        let mut state = self.state.lock();
+        if !state.range_reservations.release(reservation.id()) {
+            return Err(DirectIoCompletionError::UnknownReservation(
+                reservation.id(),
+            ));
+        }
+        result.map_err(DirectIoCompletionError::Backend)
     }
 
     fn begin_file_direct_io(
