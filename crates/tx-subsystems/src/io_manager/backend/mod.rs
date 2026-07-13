@@ -1,5 +1,6 @@
 //! L5 backend-planning facade.
 
+pub mod graph;
 pub mod plan;
 
 pub use plan::{
@@ -11,3 +12,5 @@ pub use plan::{
     PageIoCompletionEntry, PageIoCompletionList, PagerResumeToken, WaitSourceId,
     dispatch_backend_plan, plan_backend_request,
 };
+
+pub use graph::{BackendGraphAdvance, BackendGraphScheduler, BackendGraphSchedulerError};

@@ -133,7 +133,7 @@
         "e2fsck -n",
         "Linux ext4 interoperability witness"
       ],
-      "notes": "Data precedes journal commit; commit record is durable before fsync completes; checkpoint remains asynchronous."
+      "notes": "Data precedes journal commit; commit record is durable before fsync completes; checkpoint remains asynchronous. The first 6E sub-slice adds a standalone BackendGraphScheduler that admits only dependency-ready bios, releases joins only after all predecessors complete, and suppresses dependent admission after an error. Next, wire this scheduler through PageService/tag completion before emitting ext4 allocation or JBD2 graphs."
     },
     {
       "id": "6f-direct-io-and-cutover",
@@ -206,6 +206,11 @@
       "command": "cargo test -p tx-ext4 --lib --no-default-features -- --nocapture --test-threads=1",
       "status": "passed",
       "notes": "Passed 15 ext4 library tests, including the Ext4FsInstance metadata lookup to shared L5 extent-root seed and data-bio planning witness."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib io_manager::backend::graph --no-default-features -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed root/join dependency admission and terminal failure short-circuit tests for the graph scheduler foundation."
     }
   ],
   "risks": [
