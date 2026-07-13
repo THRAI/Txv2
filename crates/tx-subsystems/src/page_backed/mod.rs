@@ -991,10 +991,12 @@ impl PageContainer {
                         work.push(PageServiceDrivenWork::Completion(route));
                     }
                     PageServiceWork::Submission(request) => {
+                        let rollback_request = request.clone();
                         let source = self.file_io_source_for_submission(&request);
                         let Some(plan) =
                             context.plan_submission_with_source(request.clone(), source)
                         else {
+                            self.abort_file_writeback_submission(&request);
                             work.push(PageServiceDrivenWork::UnplannedSubmission(request));
                             continue;
                         };
@@ -1039,6 +1041,7 @@ impl PageContainer {
                                 work.push(PageServiceDrivenWork::BackendSubmission(outcome));
                             }
                             Err(error) => {
+                                self.abort_file_writeback_submission(&rollback_request);
                                 work.push(PageServiceDrivenWork::BackendSubmitError(error));
                             }
                         }
@@ -1205,6 +1208,22 @@ impl PageContainer {
             0,
             crate::vm::USER_PAGE_SIZE as u32,
         )
+    }
+
+    fn abort_file_writeback_submission(&self, request: &PageIoRequest) {
+        if request.op != PageIoOp::Writeback || request.range.page_count() != 1 {
+            return;
+        }
+        let page = PageIndex::new(request.range.start_page());
+        let mut state = self.state.lock();
+        let lease = state.file_io_leases.remove(&request.id);
+        let _ = state.pages.clear_mark(page, PageCacheMark::Writeback);
+        if let (Some(slot), Some(generation)) =
+            (state.file_page_slots.get(&page), request.generation_hint)
+        {
+            let _ = slot.abort_writeback(generation);
+        }
+        drop(lease);
     }
 
     fn apply_file_io_read_frame_completion(
