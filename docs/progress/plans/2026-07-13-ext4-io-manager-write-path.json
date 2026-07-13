@@ -136,8 +136,8 @@
       "notes": "Data precedes journal commit; commit record is durable before fsync completes; checkpoint remains asynchronous. The first 6E sub-slice added a standalone BackendGraphScheduler that admits only dependency-ready bios, releases joins only after all predecessors complete, and suppresses dependent admission after an error. The second sub-slice wires it through PageService and the owned PageContainer block runtime: a terminal tag advances every graph sharing its merged L6 request ID, queues generation-preserving terminal page completion, and kicks L6 when successors become ready. No ext4 allocation or JBD2 transaction graph is emitted yet, so this remains pending and makes no durable fsync claim."
     },
     {
-      "id": "6f-direct-io-and-cutover",
-      "title": "Add direct-I/O coherence then switch hot paths incrementally",
+      "id": "6f-direct-io-coherency",
+      "title": "Add direct-I/O, msync, and syncfs coherence",
       "status": "pending",
       "depends_on": [
         "6e-jbd2-durability"
@@ -150,10 +150,30 @@
       ],
       "verification": [
         "overlap reservation tests",
+        "direct-I/O pinned-buffer tests",
+        "msync and syncfs coherence tests"
+      ],
+      "notes": "O_DIRECT bypasses the PC cache but not range coherency, ext4 planning, or L6 scheduling. The first 6F sub-slice binds RangeReservationTable into PageContainer: a direct write can reserve only a clean, non-fetching range; the reservation rejects overlapping buffered page materialization; completion releases it on every outcome and invalidates clean overlapping cache entries on success. User-buffer pinning, direct read policy, syscalls, msync, and syncfs are still pending."
+    },
+    {
+      "id": "6g-hot-path-cutover",
+      "title": "Cut over hot paths callsite by callsite",
+      "status": "pending",
+      "depends_on": [
+        "6f-direct-io-coherency"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/page_backed",
+        "crates/tx-ext4/src",
+        "crates/tx-fs/src",
+        "crates/tx-shims/src"
+      ],
+      "verification": [
         "old/new ext4 path parity tests",
+        "FsPageBacking fetch/flush callsite removal audit",
         "cargo -q xtask unit"
       ],
-      "notes": "O_DIRECT bypasses the PC cache but not range coherency, ext4 planning, or L6 scheduling."
+      "notes": "Replace compatibility fetch and flush one production callsite at a time only after its planner path has parity and durable-ordering evidence. FsPageBacking remains the regression oracle until each corresponding hot path is removed."
     }
   ],
   "verification": [
@@ -226,6 +246,11 @@
       "command": "cargo check -p tx-subsystems --lib --no-default-features",
       "status": "passed",
       "notes": "Passed; the existing unrelated net step_connect unused-guard warning remains."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib page_backed --no-default-features -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 130 tests after the 6F direct-write reservation/invalidation foundation; the serial harness is required because unrelated parallel host tests can nest same-CPU epoch guards."
     }
   ],
   "risks": [

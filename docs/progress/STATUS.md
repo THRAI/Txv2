@@ -14,6 +14,19 @@
   power-loss durability. No durable fsync claim is made by this slice. See
   `docs/progress/plans/2026-07-13-ext4-io-manager-write-path.json`.
 
+- 2026-07-13 (ext4 I/O-manager 6F direct-write coherency foundation).
+  `PageContainer` now owns its existing `RangeReservationTable` rather than
+  leaving it as a detached value type. A direct write acquires a range only
+  when overlapping slots and cache entries are clean and idle; it blocks
+  overlapping buffered materialization with `EBUSY`, releases its reservation
+  after either device result, and invalidates clean overlapping cache entries
+  plus their PageSlots after success. This is the conservative coherency rule,
+  not an O_DIRECT syscall or DMA implementation. Verification passed:
+  PageBacked 130/130 and no-default-feature `tx-subsystems` check. Next is
+  user-buffer direct-I/O planning plus ordered JBD2 durability; no fsync
+  durability claim or fetch/flush hot-path removal is made here. See
+  `docs/progress/plans/2026-07-13-ext4-io-manager-write-path.json`.
+
 - 2026-07-11 (tx-observe schema codegen automation).
   Continued the observe L0 schema consolidation by making kernel-side automation
   concrete. `schema/txobserve.toml` now owns the `HartEmitter` public helper

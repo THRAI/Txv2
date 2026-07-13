@@ -235,6 +235,40 @@ pub enum PageCacheError {
     Alloc(AllocError),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirectIoBusy {
+    Dirty,
+    Writeback,
+    Fetching,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirectIoAdmissionError {
+    UnsupportedKind,
+    OutOfBounds,
+    Range(RangeReservationError),
+    Busy {
+        page: PageIndex,
+        state: DirectIoBusy,
+    },
+}
+
+impl From<RangeReservationError> for DirectIoAdmissionError {
+    fn from(error: RangeReservationError) -> Self {
+        Self::Range(error)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirectIoCompletionError {
+    UnknownReservation(RangeReservationId),
+    WrongReservationKind {
+        expected: RangeReservationKind,
+        actual: RangeReservationKind,
+    },
+    Backend(Errno),
+}
+
 #[derive(Debug, Default)]
 pub struct PageCacheIndex {
     pages: BTreeMap<PageIndex, PageCacheEntry>,
@@ -323,6 +357,23 @@ impl PageCacheIndex {
             !reclaimable
         });
         reclaimed
+    }
+
+    fn invalidate_clean_range(&mut self, range: PageRange) -> Vec<PageIndex> {
+        let invalidated = self
+            .pages
+            .iter()
+            .filter_map(|(page, entry)| {
+                (range.contains(*page)
+                    && !entry.get_mark(PageCacheMark::Dirty)
+                    && !entry.get_mark(PageCacheMark::Writeback))
+                .then_some(*page)
+            })
+            .collect::<Vec<_>>();
+        for page in &invalidated {
+            let _ = self.pages.remove(page);
+        }
+        invalidated
     }
 }
 
@@ -599,6 +650,7 @@ struct PageContainerState {
     file_io_leases: BTreeMap<PageIoRequestId, PageLease>,
     file_io_read_targets: BTreeMap<PageIoRequestId, CachedFrame>,
     file_block_runtime: FileIoBlockRuntime,
+    range_reservations: RangeReservationTable,
     // Page-scoped retry sources are retained so a task that already received
     // `Yield` can still register and consume a pending wake before it retries
     // and re-observes page state.
@@ -846,6 +898,7 @@ impl PageContainer {
                 file_io_leases: BTreeMap::new(),
                 file_io_read_targets: BTreeMap::new(),
                 file_block_runtime: FileIoBlockRuntime::new(1024, 16),
+                range_reservations: RangeReservationTable::new(),
                 file_page_waits: BTreeMap::new(),
                 next_file_fetch_id: 1,
             }),
@@ -916,6 +969,114 @@ impl PageContainer {
             mount.payload(),
             FsObjectKey::new(fs_object_id.as_u64()),
         ))
+    }
+
+    /// Reserve an idle range for a direct write. The owner keeps the returned
+    /// token until the corresponding direct-I/O completion releases it.
+    pub fn begin_file_direct_write(
+        &self,
+        range: PageRange,
+    ) -> Result<RangeReservation, DirectIoAdmissionError> {
+        self.begin_file_direct_io(range, RangeReservationKind::DirectWrite)
+    }
+
+    /// Complete a direct write and conservatively invalidate overlapped clean
+    /// page-cache entries before releasing the direct-write reservation.
+    pub fn complete_file_direct_write(
+        &self,
+        reservation: RangeReservation,
+        result: Result<(), Errno>,
+    ) -> Result<usize, DirectIoCompletionError> {
+        if reservation.kind() != RangeReservationKind::DirectWrite {
+            return Err(DirectIoCompletionError::WrongReservationKind {
+                expected: RangeReservationKind::DirectWrite,
+                actual: reservation.kind(),
+            });
+        }
+        let mut state = self.state.lock();
+        if !state.range_reservations.release(reservation.id()) {
+            return Err(DirectIoCompletionError::UnknownReservation(
+                reservation.id(),
+            ));
+        }
+        if let Err(errno) = result {
+            return Err(DirectIoCompletionError::Backend(errno));
+        }
+        let invalidated = state.pages.invalidate_clean_range(reservation.range());
+        for page in &invalidated {
+            if let Some(slot) = state.file_page_slots.get(page) {
+                slot.invalidate();
+            }
+        }
+        Ok(invalidated.len())
+    }
+
+    fn begin_file_direct_io(
+        &self,
+        range: PageRange,
+        kind: RangeReservationKind,
+    ) -> Result<RangeReservation, DirectIoAdmissionError> {
+        if !matches!(self.kind, PageContainerKind::File { .. }) {
+            return Err(DirectIoAdmissionError::UnsupportedKind);
+        }
+        let Some(end) = range.end() else {
+            return Err(DirectIoAdmissionError::Range(
+                RangeReservationError::Overflow,
+            ));
+        };
+        if end.as_u64() > self.page_count {
+            return Err(DirectIoAdmissionError::OutOfBounds);
+        }
+
+        let mut state = self.state.lock();
+        for (page, entry) in &state.pages.pages {
+            if !range.contains(*page) {
+                continue;
+            }
+            if entry.get_mark(PageCacheMark::Writeback) {
+                return Err(DirectIoAdmissionError::Busy {
+                    page: *page,
+                    state: DirectIoBusy::Writeback,
+                });
+            }
+            if entry.get_mark(PageCacheMark::Dirty) {
+                return Err(DirectIoAdmissionError::Busy {
+                    page: *page,
+                    state: DirectIoBusy::Dirty,
+                });
+            }
+        }
+        for (page, slot) in &state.file_page_slots {
+            if !range.contains(*page) {
+                continue;
+            }
+            let busy = match slot.snapshot().state {
+                PageSlotState::Dirty { .. } => Some(DirectIoBusy::Dirty),
+                PageSlotState::Writeback { .. } => Some(DirectIoBusy::Writeback),
+                PageSlotState::Fetching => Some(DirectIoBusy::Fetching),
+                PageSlotState::Empty
+                | PageSlotState::Resident { .. }
+                | PageSlotState::Error { .. } => None,
+            };
+            if let Some(state) = busy {
+                return Err(DirectIoAdmissionError::Busy { page: *page, state });
+            }
+        }
+        if let Some(page) = state
+            .in_flight_file_pages
+            .keys()
+            .copied()
+            .find(|page| range.contains(*page))
+        {
+            return Err(DirectIoAdmissionError::Busy {
+                page,
+                state: DirectIoBusy::Fetching,
+            });
+        }
+        state
+            .range_reservations
+            .try_reserve(range, kind)
+            .map_err(Into::into)
     }
 
     /// Move one dirty file page into the L4 writeback queue.
@@ -1885,6 +2046,9 @@ impl PageContainer {
         guard: &Guard<'_>,
     ) -> StepOutcome<MaterializedPage, NoProgress> {
         use adapter::step_engine::Errno as V3Errno;
+        if self.file_page_access_conflicts_with_reservation(page, access) {
+            return StepOutcome::Err(V3Errno::EBUSY);
+        }
         let fetch_id = match self.begin_file_page_fetch(page, access) {
             FilePageFetchStart::Cached(materialized) => {
                 return match materialized {
@@ -1943,6 +2107,21 @@ impl PageContainer {
                 StepOutcome::Err(v3_errno)
             }
         }
+    }
+
+    fn file_page_access_conflicts_with_reservation(
+        &self,
+        page: PageIndex,
+        access: MaterializeAccess,
+    ) -> bool {
+        let kind = match access {
+            MaterializeAccess::Read => RangeReservationKind::BufferedRead,
+            MaterializeAccess::Write => RangeReservationKind::BufferedWrite,
+        };
+        self.state
+            .lock()
+            .range_reservations
+            .conflicts(PageRange::new(page, 1), kind)
     }
 
     fn try_materialize_file_page_from_backend_plan(

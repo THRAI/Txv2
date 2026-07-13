@@ -57,6 +57,12 @@ impl PageRange {
         };
         self.start < other_end && other.start < self_end
     }
+
+    pub fn contains(self, page: PageIndex) -> bool {
+        self.end()
+            .map(|end| self.start <= page && page < end)
+            .unwrap_or(false)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -161,6 +167,12 @@ impl RangeReservationTable {
         self.next_id = self.next_id.wrapping_add(1).max(1);
         self.reservations.push(reservation);
         Ok(reservation)
+    }
+
+    pub fn conflicts(&self, range: PageRange, kind: RangeReservationKind) -> bool {
+        self.reservations
+            .iter()
+            .any(|existing| range.overlaps(existing.range) && kind.conflicts_with(existing.kind))
     }
 
     pub fn release(&mut self, id: RangeReservationId) -> bool {
