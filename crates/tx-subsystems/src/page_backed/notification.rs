@@ -6,9 +6,9 @@
 use tx_platform_adapter::notification_adapter;
 
 pub(crate) use wait_source::{
-    is_wait_source, new_page_ready_wait, notify_page_ready, page_ready_source_id,
-    wait_source_parts, yield_on_page_ready_source, yield_on_wait_source, PageReadyNotifier,
-    PageReadyWait,
+    is_wait_source, new_page_ready_wait, notify_page_ready_with_post, page_ready_endpoint,
+    page_ready_source_id, wait_source_parts, yield_on_page_ready_source, yield_on_wait_source,
+    PageReadyNotifier, PageReadyWait,
 };
 
 #[notification_adapter(
@@ -20,7 +20,7 @@ mod wait_source {
     use alloc::sync::Arc;
 
     use crate::page_backed::adapter::step_engine::{StepOutcome, StepProgress, YieldShape};
-    use crate::page_backed::adapter::wait_routing::{self, WaitSource};
+    use crate::page_backed::adapter::wait_routing::{self, MailboxEvent, TaskMailbox, WaitSource};
 
     const PAGE_READY: u64 = 0x1;
 
@@ -42,8 +42,8 @@ mod wait_source {
             }
         }
 
-        pub(crate) const fn source_id(&self) -> u64 {
-            self.source_id
+        pub(crate) fn ready_endpoint(&self) -> &Arc<WaitSource> {
+            &self.source
         }
 
         pub(crate) fn notifier(&self) -> PageReadyNotifier {
@@ -71,12 +71,19 @@ mod wait_source {
         PageReadyWait::new()
     }
 
-    pub(crate) const fn page_ready_source_id(wait: &PageReadyWait) -> u64 {
-        wait.source_id()
+    pub(crate) fn page_ready_source_id(wait: &PageReadyWait) -> u64 {
+        tx_substrate::wake::WaitEndpoint::source_id(page_ready_endpoint(wait)).raw()
     }
 
-    pub(crate) fn notify_page_ready(notifier: &PageReadyNotifier) {
-        wait_routing::notify_source(&notifier.source, PAGE_READY);
+    pub(crate) fn page_ready_endpoint(wait: &PageReadyWait) -> &Arc<WaitSource> {
+        wait.ready_endpoint()
+    }
+
+    pub(crate) fn notify_page_ready_with_post<F>(notifier: &PageReadyNotifier, post: F)
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+    {
+        wait_routing::notify_source_with_post(&notifier.source, PAGE_READY, post);
     }
 
     pub(crate) fn wait_source_parts(shape: &YieldShape) -> Option<(u64, u64)> {
@@ -100,8 +107,24 @@ mod wait_source {
 
     pub(crate) fn yield_on_page_ready_source<T, P: StepProgress>(
         progress: P,
-        source_id: u64,
+        endpoint: &(impl tx_substrate::wake::WaitEndpoint + ?Sized),
     ) -> StepOutcome<T, P> {
+        let source_id = tx_substrate::wake::WaitEndpoint::source_id(endpoint).raw();
         StepOutcome::yield_on_wait_source(progress, source_id, PAGE_READY)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn page_ready_endpoint_matches_source_id() {
+            let wait = new_page_ready_wait();
+
+            assert_eq!(
+                tx_substrate::wake::WaitEndpoint::source_id(page_ready_endpoint(&wait)).raw(),
+                page_ready_source_id(&wait)
+            );
+        }
     }
 }

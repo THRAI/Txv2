@@ -6,23 +6,26 @@ use alloc::vec::Vec;
 
 impl PageCacheIndex {
     fn withdraw_from(&mut self, first: PageIndex) {
-        drop(self.pages.split_off(&first));
+        self.erase_from(first);
     }
 
     fn dirty_pages(&self) -> Vec<(PageIndex, Ppn)> {
-        self.pages
-            .iter()
-            .filter_map(|(page, entry)| entry.marks.dirty.then_some((*page, entry.ppn)))
+        if !self.marked(PageCacheMark::Dirty) {
+            return Vec::new();
+        }
+        self.collect_marked(PageCacheMark::Dirty)
+            .into_iter()
+            .map(|(page, entry)| (page, entry.ppn))
             .collect()
     }
 
     fn clear_dirty_if_match(&mut self, page: PageIndex, ppn: Ppn) {
-        let Some(entry) = self.pages.get_mut(&page) else {
+        let Some(entry) = self.load(page) else {
             return;
         };
         if entry.ppn == ppn {
-            entry.marks.dirty = false;
-            entry.marks.writeback = false;
+            let _ = self.clear_mark(page, PageCacheMark::Dirty);
+            let _ = self.clear_mark(page, PageCacheMark::Writeback);
         }
     }
 }
@@ -42,7 +45,9 @@ impl PageContainer {
                 .collect()
         };
         for notifier in notify_ready {
-            notification::notify_page_ready(&notifier);
+            notification::notify_page_ready_with_post(&notifier, |mailbox, event| {
+                mailbox.post(event)
+            });
         }
     }
 

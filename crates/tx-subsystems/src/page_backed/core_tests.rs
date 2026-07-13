@@ -5,17 +5,194 @@
 //! `MountPayload` carries `fs_ops` / `fs_page_backing` fields.
 
 use super::*;
+use crate::device::{
+    BlockDevice, BlockDeviceHandle, BlockDeviceOps, BlockDeviceRegistration, DevT,
+    PhysicalBlockNumber,
+};
 use crate::execution::Errno;
+use crate::fs_iface::{
+    BackendPageRequest, BackendPlan, BackendPlanner, BioPlanList, PageCompletion,
+    PageCompletionList, PageFrameRef,
+};
+use crate::io_manager::backend::BlockPageRequestTracker;
+use crate::io_manager::block::{
+    BioPlan, BioVec, BlockCompletion, BlockCompletionSource, BlockDeviceCompletion, BlockDispatch,
+    BlockDispatchExecutor, BlockFlags, BlockOp, BlockQueue, BlockRequestId, BlockServiceNext,
+    BlockTag, DeviceKey, LbaRange,
+};
+use crate::io_manager::page::service::PageServiceBackendContext;
+use crate::io_manager::page::service::{
+    PageServiceBackendSubmitOutcome, PageServiceDrivenWork, PageServiceNext,
+};
+use crate::io_manager::page::{PageIoCompletion, PageIoCompletionKind, PageIoResult};
+use crate::io_manager::runtime::{IoServiceKind, ServiceBudget, ServiceKick, ServiceWakeSource};
 use crate::mount::{DevId, MountOptions, MountPayload, SourceLabel};
 use crate::page_backed::adapter::step_engine::{
-    self as step_engine, Errno as V3Errno, NoProgress, StepOutcome as V3Out,
+    self as step_engine, Errno as V3Errno, NoProgress, PlaceholderProcessSubject, ScriptCtx,
+    StepOp, StepOutcome as V3Out,
 };
 use crate::vfs::{
     Credential, DirCursor, DirEntry, FsObjectId, FsOps, InodeKind, InodeMeta, OpenFile,
     OpenFileFlags, RNode, RNodeBacking,
 };
+use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+struct RecordingPlanner;
+
+impl BackendPlanner for RecordingPlanner {
+    fn plan_page_io(&self, request: BackendPageRequest) -> BackendPlan {
+        BackendPlan::Complete(PageCompletionList::from_vec(alloc::vec![
+            PageCompletion::new(
+                request.id,
+                request.range,
+                crate::io_manager::page::PageIoResult::Done,
+                request
+                    .generation_hint
+                    .unwrap_or(crate::io_manager::page::PageGeneration::new(0)),
+                crate::io_manager::page::PageIoCompletionKind::ReadInstalled,
+            ),
+        ]))
+    }
+}
+
+struct LockCheckingPlanner {
+    calls: AtomicUsize,
+    saw_page_container_lock: AtomicBool,
+}
+
+impl LockCheckingPlanner {
+    fn new() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            saw_page_container_lock: AtomicBool::new(false),
+        }
+    }
+}
+
+impl BackendPlanner for LockCheckingPlanner {
+    fn plan_page_io(&self, request: BackendPageRequest) -> BackendPlan {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        if page_container_state_lock_held_for_test() {
+            self.saw_page_container_lock.store(true, Ordering::Release);
+        }
+        BackendPlan::Complete(PageCompletionList::from_vec(alloc::vec![
+            PageCompletion::new(
+                request.id,
+                request.range,
+                crate::io_manager::page::PageIoResult::Done,
+                request
+                    .generation_hint
+                    .unwrap_or(crate::io_manager::page::PageGeneration::new(0)),
+                crate::io_manager::page::PageIoCompletionKind::ReadInstalled,
+            ),
+        ]))
+    }
+}
+
+struct FrameReturningPlanner {
+    ppn: Ppn,
+    calls: AtomicUsize,
+}
+
+impl FrameReturningPlanner {
+    fn new(ppn: Ppn) -> Self {
+        Self {
+            ppn,
+            calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl BackendPlanner for FrameReturningPlanner {
+    fn plan_page_io(&self, request: BackendPageRequest) -> BackendPlan {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        BackendPlan::Complete(PageCompletionList::from_vec(alloc::vec![
+            PageCompletion::new(
+                request.id,
+                request.range,
+                PageIoResult::Done,
+                request
+                    .generation_hint
+                    .unwrap_or(crate::io_manager::page::PageGeneration::new(0)),
+                PageIoCompletionKind::ReadInstalled,
+            )
+            .with_frame_ref(PageFrameRef::new(self.ppn)),
+        ]))
+    }
+}
+
+struct BioOnlyPlanner {
+    calls: AtomicUsize,
+}
+
+impl BioOnlyPlanner {
+    fn new() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl BackendPlanner for BioOnlyPlanner {
+    fn plan_page_io(&self, _request: BackendPageRequest) -> BackendPlan {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        BackendPlan::SubmitBios(BioPlanList::from_vec(alloc::vec![BioPlan::new(
+            DeviceKey::new(8),
+            BlockOp::Read,
+            LbaRange::new(64, 1),
+            alloc::vec![BioVec::new(0xfeed, 0, crate::vm::USER_PAGE_SIZE as u32)],
+            BlockFlags::EMPTY,
+        )]))
+    }
+}
+
+struct PageBackedServiceBlockDevice;
+
+static PAGE_BACKED_SERVICE_BLOCK_DEVICE: PageBackedServiceBlockDevice =
+    PageBackedServiceBlockDevice;
+static PAGE_BACKED_SERVICE_LAST_READ: AtomicU64 = AtomicU64::new(u64::MAX);
+static PAGE_BACKED_SERVICE_BLOCK_REG: BlockDeviceRegistration = BlockDeviceRegistration {
+    devt: DevT::new(0, 8),
+    name: "pagebacked-service-block",
+    ops: &PAGE_BACKED_SERVICE_BLOCK_DEVICE,
+};
+
+impl BlockDeviceOps for PageBackedServiceBlockDevice {
+    fn read_blocks(
+        &self,
+        block_id: PhysicalBlockNumber,
+        _target: &mut [Frame],
+        _guard: &Guard<'_>,
+    ) -> V3Out<(), NoProgress> {
+        PAGE_BACKED_SERVICE_LAST_READ.store(block_id.as_u64(), Ordering::SeqCst);
+        V3Out::Done(())
+    }
+
+    fn write_blocks(
+        &self,
+        _block_id: PhysicalBlockNumber,
+        _source: &[Frame],
+        _guard: &Guard<'_>,
+    ) -> V3Out<(), NoProgress> {
+        V3Out::Done(())
+    }
+
+    fn barrier(&self, _guard: &Guard<'_>) -> V3Out<(), NoProgress> {
+        V3Out::Done(())
+    }
+}
+
+impl BlockDevice for PageBackedServiceBlockDevice {
+    fn total_blocks(&self) -> u64 {
+        1024
+    }
+
+    fn block_size(&self) -> u32 {
+        crate::vm::USER_PAGE_SIZE as u32
+    }
+}
 
 fn setup_host_substrate() {
     tx_test_support::init_host();
@@ -238,6 +415,10 @@ struct ReentrantFs {
     inner_done: AtomicUsize,
     inner_wait_source: AtomicU64,
     inner_wait_interests: AtomicU64,
+    l4_pending_before_reentry: AtomicUsize,
+    l4_pending_after_reentry: AtomicUsize,
+    l4_waiters_after_reentry: AtomicUsize,
+    l4_generation_hint: AtomicU64,
     pc: std::sync::Mutex<Option<Weak<PageContainer>>>,
 }
 
@@ -264,6 +445,10 @@ impl ReentrantFs {
             inner_done: AtomicUsize::new(0),
             inner_wait_source: AtomicU64::new(0),
             inner_wait_interests: AtomicU64::new(0),
+            l4_pending_before_reentry: AtomicUsize::new(0),
+            l4_pending_after_reentry: AtomicUsize::new(0),
+            l4_waiters_after_reentry: AtomicUsize::new(0),
+            l4_generation_hint: AtomicU64::new(0),
             pc: std::sync::Mutex::new(None),
         }
     }
@@ -408,6 +593,17 @@ impl FsPageBacking for ReentrantFs {
                 .as_ref()
                 .and_then(Weak::upgrade)
                 .expect("reentrant page container");
+            self.l4_pending_before_reentry
+                .store(pc.file_io_request_count_for_test(), Ordering::Release);
+            if let Some(request) = pc.file_io_pending_request_for_test(PageIndex::new(0)) {
+                self.l4_generation_hint.store(
+                    request
+                        .generation_hint
+                        .map(|generation| generation.raw())
+                        .unwrap_or(0),
+                    Ordering::Release,
+                );
+            }
             match pc.materialize_page(PageIndex::new(0), MaterializeAccess::Read, guard) {
                 V3Out::Yield { shape, .. } => {
                     let Some((source, interests)) =
@@ -424,6 +620,12 @@ impl FsPageBacking for ReentrantFs {
                 }
                 other => panic!("unexpected reentrant materialize outcome: {other:?}"),
             }
+            self.l4_pending_after_reentry
+                .store(pc.file_io_request_count_for_test(), Ordering::Release);
+            self.l4_waiters_after_reentry.store(
+                pc.file_io_waiter_count_for_test(PageIndex::new(0)),
+                Ordering::Release,
+            );
         }
         match self.outcome {
             ReentrantFetchOutcome::Done => V3Out::done(Frame::new(
@@ -649,6 +851,61 @@ fn file_page_container(
     )
 }
 
+fn file_page_container_with_planner(
+    fs_v3: Arc<dyn FsOps>,
+    page_backing_v3: Arc<dyn FsPageBacking>,
+    fs_object_id: FsObjectId,
+    page_count: u64,
+    planner: Arc<dyn BackendPlanner>,
+) -> PageContainer {
+    let mount = MountPayload::new_cap_with_backend_planner(
+        fs_v3,
+        page_backing_v3,
+        None,
+        DevId::new(8),
+        MountOptions::default(),
+        "mockfs",
+        SourceLabel::Static("mock"),
+        Some(planner),
+    )
+    .expect("mount payload");
+    PageContainer::new(
+        PageContainerKind::File {
+            mount: MountPayloadPin::acquire(&step_engine::PayloadCap::from_cap(mount)),
+            fs_object_id,
+        },
+        page_count,
+    )
+}
+
+fn file_page_container_cap_with_planner(
+    fs_v3: Arc<dyn FsOps>,
+    page_backing_v3: Arc<dyn FsPageBacking>,
+    fs_object_id: FsObjectId,
+    page_count: u64,
+    planner: Arc<dyn BackendPlanner>,
+) -> step_engine::Cap<PageContainer> {
+    let mount = MountPayload::new_cap_with_backend_planner(
+        fs_v3,
+        page_backing_v3,
+        None,
+        DevId::new(8),
+        MountOptions::default(),
+        "mockfs",
+        SourceLabel::Static("mock"),
+        Some(planner),
+    )
+    .expect("mount payload");
+    PageContainer::new_cap(
+        PageContainerKind::File {
+            mount: MountPayloadPin::acquire(&step_engine::PayloadCap::from_cap(mount)),
+            fs_object_id,
+        },
+        page_count,
+    )
+    .expect("page container cap")
+}
+
 fn open_file_for_pc(pc: &PageContainer) -> OpenFile {
     let pc = PageContainer::new_cap(pc.kind().clone(), pc.page_count())
         .expect("page container cap for open file");
@@ -669,6 +926,924 @@ fn open_file_for_pc(pc: &PageContainer) -> OpenFile {
             packet: false,
         },
     )
+}
+
+#[test]
+fn file_page_container_builds_mount_payload_backend_context() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::new());
+    let pc = file_page_container_with_planner(
+        fs.clone(),
+        fs,
+        FsObjectId::new(77),
+        4,
+        Arc::new(RecordingPlanner),
+    );
+
+    let context = pc
+        .file_backend_context()
+        .expect("file page container backend context");
+
+    assert_eq!(context.object().raw(), 77);
+    let request = PageIoRequest::new(
+        PageIoRequestId::new(9),
+        pc.io_manager_key(),
+        PageIoRange::new(2, 1),
+        PageIoOp::Read,
+        PageIoPriority::Demand,
+        PageIoFlags::DEMAND,
+        Some(PageGeneration::new(5)),
+    );
+    let plan = context
+        .plan_submission(request)
+        .expect("mount-hosted backend planner");
+    match plan {
+        BackendPlan::Complete(completions) => {
+            assert_eq!(completions.as_slice().len(), 1);
+            assert_eq!(completions.as_slice()[0].id, PageIoRequestId::new(9));
+            assert_eq!(completions.as_slice()[0].range, PageIoRange::new(2, 1));
+            assert_eq!(completions.as_slice()[0].generation, PageGeneration::new(5));
+        }
+        other => panic!("expected completion plan, got {other:?}"),
+    }
+}
+
+#[test]
+fn non_file_page_container_has_no_backend_context() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let pc = PageContainer::new(
+        PageContainerKind::Anon {
+            swap_policy: AnonSwapPolicy::Reclaimable,
+        },
+        4,
+    );
+
+    assert!(pc.file_backend_context().is_none());
+}
+
+#[test]
+fn file_page_container_drives_service_submission_through_mount_planner_without_state_lock() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::new());
+    let planner = Arc::new(LockCheckingPlanner::new());
+    let pc =
+        file_page_container_with_planner(fs.clone(), fs, FsObjectId::new(88), 4, planner.clone());
+    {
+        let mut state = pc.state.lock();
+        state
+            .file_io_service
+            .submit(
+                pc.io_manager_key(),
+                PageIoRange::new(1, 1),
+                PageIoOp::Read,
+                PageIoPriority::Demand,
+                PageIoFlags::DEMAND,
+                Some(PageGeneration::new(7)),
+            )
+            .expect("staged file service submission");
+    }
+
+    let mut block_queue = BlockQueue::new(4);
+    let mut kicks = 0usize;
+    let driven = pc
+        .drive_file_io_service_once(ServiceBudget::new(1), &mut block_queue, |_| {
+            kicks += 1;
+            true
+        })
+        .expect("file service drive");
+
+    assert_eq!(planner.calls.load(Ordering::Acquire), 1);
+    assert!(
+        !planner.saw_page_container_lock.load(Ordering::Acquire),
+        "backend planning must run after releasing PageContainer state lock"
+    );
+    assert_eq!(block_queue.len(), 0);
+    assert_eq!(
+        driven.work,
+        alloc::vec![PageServiceDrivenWork::BackendSubmission(
+            PageServiceBackendSubmitOutcome::QueuedPageCompletions {
+                queued: 1,
+                wake: Some(crate::io_manager::page::service::PageServiceWake::Wake),
+            },
+        )]
+    );
+    assert_eq!(driven.next, PageServiceNext::Runnable);
+    assert_eq!(kicks, 1);
+}
+
+#[test]
+fn file_page_service_completion_applies_matching_error_to_pageslot() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::new());
+    let pc = file_page_container(fs.clone(), fs, FsObjectId::new(89), 4);
+    let page = PageIndex::new(2);
+    let generation = {
+        let mut state = pc.state.lock();
+        let slot = state.file_page_slots.entry(page).or_default();
+        let PageSlotFetch::Owner { generation } = slot.begin_fetch() else {
+            panic!("test slot should own fetch");
+        };
+        state.file_io_service.push_completion(PageIoCompletion::new(
+            PageIoRequestId::new(11),
+            PageIoRange::new(page.as_u64(), 1),
+            PageIoResult::Err(Errno::EIO),
+            generation,
+            PageIoCompletionKind::ReadInstalled,
+        ));
+        generation
+    };
+
+    let mut block_queue = BlockQueue::new(4);
+    let driven = pc
+        .drive_file_io_service_once(ServiceBudget::new(1), &mut block_queue, |_| true)
+        .expect("file service drive");
+
+    assert!(matches!(
+        driven.work.as_slice(),
+        [PageServiceDrivenWork::Completion(_)]
+    ));
+    assert_eq!(
+        pc.file_page_slot_snapshot_for_test(page),
+        Some(PageSlotSnapshot {
+            state: PageSlotState::Error { errno: Errno::EIO },
+            generation,
+        })
+    );
+}
+
+#[test]
+fn file_page_service_completion_rejects_stale_pageslot_generation() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::new());
+    let pc = file_page_container(fs.clone(), fs, FsObjectId::new(90), 4);
+    let page = PageIndex::new(2);
+    let stale_generation = {
+        let mut state = pc.state.lock();
+        let slot = state.file_page_slots.entry(page).or_default();
+        let PageSlotFetch::Owner { generation } = slot.begin_fetch() else {
+            panic!("test slot should own fetch");
+        };
+        slot.invalidate();
+        state.file_io_service.push_completion(PageIoCompletion::new(
+            PageIoRequestId::new(12),
+            PageIoRange::new(page.as_u64(), 1),
+            PageIoResult::Err(Errno::EIO),
+            generation,
+            PageIoCompletionKind::ReadInstalled,
+        ));
+        generation
+    };
+
+    let mut block_queue = BlockQueue::new(4);
+    pc.drive_file_io_service_once(ServiceBudget::new(1), &mut block_queue, |_| true)
+        .expect("file service drive");
+
+    let snapshot = pc
+        .file_page_slot_snapshot_for_test(page)
+        .expect("staged slot");
+    assert_eq!(snapshot.state, PageSlotState::Empty);
+    assert_ne!(snapshot.generation, stale_generation);
+}
+
+#[test]
+fn file_page_service_completion_installs_planned_read_frame() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::new());
+    let pc = file_page_container(fs.clone(), fs, FsObjectId::new(91), 4);
+    let page = PageIndex::new(1);
+    let ppn = page_allocator::zero_frame_ppn().expect("zero frame");
+    let generation = {
+        let mut state = pc.state.lock();
+        let slot = state.file_page_slots.entry(page).or_default();
+        let PageSlotFetch::Owner { generation } = slot.begin_fetch() else {
+            panic!("test slot should own fetch");
+        };
+        state.file_io_service.push_page_completion(
+            PageCompletion::new(
+                PageIoRequestId::new(13),
+                PageIoRange::new(page.as_u64(), 1),
+                PageIoResult::Done,
+                generation,
+                PageIoCompletionKind::ReadInstalled,
+            )
+            .with_frame_ref(PageFrameRef::new(ppn)),
+        );
+        generation
+    };
+
+    let mut block_queue = BlockQueue::new(4);
+    pc.drive_file_io_service_once(ServiceBudget::new(1), &mut block_queue, |_| true)
+        .expect("file service drive");
+
+    assert_eq!(pc.lookup(page), Some(ppn));
+    assert_eq!(
+        pc.file_page_slot_snapshot_for_test(page),
+        Some(PageSlotSnapshot {
+            state: PageSlotState::Resident { ppn },
+            generation,
+        })
+    );
+}
+
+#[test]
+fn file_page_materialize_uses_frame_planner_before_compat_fetch() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let guard = step_engine::guard();
+    let fs = Arc::new(RecordingFs::new());
+    let planner = Arc::new(FrameReturningPlanner::new(
+        page_allocator::zero_frame_ppn().expect("zero frame"),
+    ));
+    let pc = file_page_container_with_planner(
+        fs.clone(),
+        fs.clone(),
+        FsObjectId::new(92),
+        4,
+        planner.clone(),
+    );
+
+    let materialized = match pc.materialize_page(PageIndex::new(1), MaterializeAccess::Read, &guard)
+    {
+        V3Out::Done(page) => page,
+        other => panic!("expected planned read materialization, got {other:?}"),
+    };
+
+    assert_eq!(materialized.ppn, planner.ppn);
+    assert_eq!(planner.calls.load(Ordering::Acquire), 1);
+    assert_eq!(
+        fs.fetches.load(Ordering::Acquire),
+        0,
+        "frame-backed backend planner completion should bypass compat fetch"
+    );
+}
+
+#[test]
+fn file_page_planned_write_marks_pageslot_dirty() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let guard = step_engine::guard();
+    let fs = Arc::new(RecordingFs::new());
+    let planner = Arc::new(FrameReturningPlanner::new(
+        page_allocator::zero_frame_ppn().expect("zero frame"),
+    ));
+    let pc = file_page_container_with_planner(
+        fs.clone(),
+        fs.clone(),
+        FsObjectId::new(93),
+        4,
+        planner.clone(),
+    );
+    let page = PageIndex::new(1);
+
+    match pc.materialize_page(page, MaterializeAccess::Write, &guard) {
+        V3Out::Done(materialized) => assert_eq!(materialized.ppn, planner.ppn),
+        other => panic!("expected planned write materialization, got {other:?}"),
+    }
+
+    let snapshot = pc
+        .file_page_slot_snapshot_for_test(page)
+        .expect("planned page slot");
+    assert_eq!(snapshot.state, PageSlotState::Dirty { ppn: planner.ppn });
+    assert!(pc.page_marks(page).expect("planned page marks").dirty);
+}
+
+#[test]
+fn file_page_materialize_bio_only_plan_yields_without_compat_fetch() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let guard = step_engine::guard();
+    let fs = Arc::new(RecordingFs::new());
+    let planner = Arc::new(BioOnlyPlanner::new());
+    let pc = file_page_container_with_planner(
+        fs.clone(),
+        fs.clone(),
+        FsObjectId::new(93),
+        4,
+        planner.clone(),
+    );
+
+    match pc.materialize_page(PageIndex::new(1), MaterializeAccess::Read, &guard) {
+        V3Out::Yield { shape, .. } => {
+            let Some((_source, interests)) =
+                crate::page_backed::notification::wait_source_parts(&shape)
+            else {
+                panic!("expected page-ready wait source after bio-only plan");
+            };
+            assert_eq!(interests, 0x1);
+        }
+        other => panic!("expected async yield after bio-only plan, got {other:?}"),
+    }
+
+    assert_eq!(planner.calls.load(Ordering::Acquire), 1);
+    assert_eq!(
+        fs.fetches.load(Ordering::Acquire),
+        0,
+        "Bio-only backend plans should stay on the owned L6 async path instead of falling back to compat fetch"
+    );
+    assert_eq!(pc.file_io_block_queue_len_for_test(), 1);
+    assert_eq!(pc.file_io_block_tracker_len_for_test(), 1);
+    assert!(pc.file_page_fetch_in_flight_for_test(PageIndex::new(1)));
+
+    struct CompletingExecutor {
+        completions: VecDeque<BlockDeviceCompletion>,
+    }
+
+    impl BlockDispatchExecutor for CompletingExecutor {
+        fn submit(&mut self, dispatch: &BlockDispatch) {
+            self.completions
+                .push_back(BlockDeviceCompletion::new(dispatch.tag, Ok(())));
+        }
+    }
+
+    impl BlockCompletionSource for CompletingExecutor {
+        fn poll_completion(&mut self) -> Option<BlockDeviceCompletion> {
+            self.completions.pop_front()
+        }
+    }
+
+    let completion_ppn = page_allocator::zero_frame_ppn().expect("zero frame");
+    let mut executor = CompletingExecutor {
+        completions: VecDeque::new(),
+    };
+    pc.drive_file_block_io_service_once(
+        ServiceBudget::new(1),
+        &mut executor,
+        |_| Some(PageFrameRef::new(completion_ppn)),
+        |_| true,
+    )
+    .expect("owned block service completion");
+    pc.drive_file_io_service_once_owned(ServiceBudget::new(1), |_| true)
+        .expect("completion apply drive");
+
+    assert!(!pc.file_page_fetch_in_flight_for_test(PageIndex::new(1)));
+    match pc.materialize_page(PageIndex::new(1), MaterializeAccess::Read, &guard) {
+        V3Out::Done(page) => assert_eq!(page.ppn, completion_ppn),
+        other => panic!("expected retry to observe installed async page, got {other:?}"),
+    }
+}
+
+#[test]
+fn file_page_bio_only_plan_drives_owned_l6_through_block_device_handle() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let guard = step_engine::guard();
+    let fs = Arc::new(RecordingFs::new());
+    struct DeviceBioPlanner {
+        buffer_ppn: Ppn,
+    }
+
+    impl BackendPlanner for DeviceBioPlanner {
+        fn plan_page_io(&self, _request: BackendPageRequest) -> BackendPlan {
+            BackendPlan::SubmitBios(BioPlanList::from_vec(alloc::vec![BioPlan::new(
+                DeviceKey::new(8),
+                BlockOp::Read,
+                LbaRange::new(64, 1),
+                alloc::vec![BioVec::new(
+                    self.buffer_ppn.0 as u64,
+                    0,
+                    crate::vm::USER_PAGE_SIZE as u32,
+                )],
+                BlockFlags::EMPTY,
+            )]))
+        }
+    }
+
+    let completion_ppn = page_allocator::zero_frame_ppn().expect("zero frame");
+    let planner = Arc::new(DeviceBioPlanner {
+        buffer_ppn: completion_ppn,
+    });
+    let pc = file_page_container_with_planner(
+        fs.clone(),
+        fs.clone(),
+        FsObjectId::new(96),
+        4,
+        planner.clone(),
+    );
+    let page = PageIndex::new(1);
+
+    match pc.materialize_page(page, MaterializeAccess::Read, &guard) {
+        V3Out::Yield { .. } => {}
+        other => panic!("expected async yield after bio-only plan, got {other:?}"),
+    }
+
+    assert_eq!(pc.file_io_block_queue_len_for_test(), 1);
+    assert_eq!(pc.file_io_block_tracker_len_for_test(), 1);
+    PAGE_BACKED_SERVICE_LAST_READ.store(u64::MAX, Ordering::SeqCst);
+
+    let turn = crate::device::drive_page_container_file_block_device_service_once(
+        &pc,
+        ServiceBudget::new(1),
+        BlockDeviceHandle::whole(&PAGE_BACKED_SERVICE_BLOCK_REG),
+        &guard,
+        |_| true,
+    )
+    .expect("page container block-device service turn");
+
+    assert_eq!(turn.dispatched, 1);
+    assert_eq!(turn.device_completions, 1);
+    assert_eq!(turn.page_completions, 1);
+    assert_eq!(turn.next, BlockServiceNext::Sleeping);
+    assert_eq!(PAGE_BACKED_SERVICE_LAST_READ.load(Ordering::SeqCst), 64);
+
+    pc.drive_file_io_service_once_owned(ServiceBudget::new(1), |_| true)
+        .expect("completion apply drive");
+
+    assert_eq!(pc.lookup(page), Some(completion_ppn));
+    assert!(!pc.file_page_fetch_in_flight_for_test(page));
+    match pc.materialize_page(page, MaterializeAccess::Read, &guard) {
+        V3Out::Done(page) => assert_eq!(page.ppn, completion_ppn),
+        other => panic!("expected retry to observe installed async page, got {other:?}"),
+    }
+}
+
+#[test]
+fn file_page_io_service_turn_plans_dispatches_and_applies_device_completion() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let guard = step_engine::guard();
+    let fs = Arc::new(RecordingFs::new());
+    struct DeviceBioPlanner {
+        buffer_ppn: Ppn,
+    }
+
+    impl BackendPlanner for DeviceBioPlanner {
+        fn plan_page_io(&self, _request: BackendPageRequest) -> BackendPlan {
+            BackendPlan::SubmitBios(BioPlanList::from_vec(alloc::vec![BioPlan::new(
+                DeviceKey::new(8),
+                BlockOp::Read,
+                LbaRange::new(64, 1),
+                alloc::vec![BioVec::new(
+                    self.buffer_ppn.0 as u64,
+                    0,
+                    crate::vm::USER_PAGE_SIZE as u32,
+                )],
+                BlockFlags::EMPTY,
+            )]))
+        }
+    }
+
+    let completion_ppn = page_allocator::zero_frame_ppn().expect("zero frame");
+    let planner = Arc::new(DeviceBioPlanner {
+        buffer_ppn: completion_ppn,
+    });
+    let pc =
+        file_page_container_with_planner(fs.clone(), fs.clone(), FsObjectId::new(97), 4, planner);
+    let page = PageIndex::new(1);
+
+    match pc.materialize_page(page, MaterializeAccess::Read, &guard) {
+        V3Out::Yield { .. } => {}
+        other => panic!("expected async yield after bio-only plan, got {other:?}"),
+    }
+
+    PAGE_BACKED_SERVICE_LAST_READ.store(u64::MAX, Ordering::SeqCst);
+    let turn = crate::device::drive_page_container_file_io_service_once(
+        &pc,
+        ServiceBudget::new(1),
+        ServiceBudget::new(1),
+        BlockDeviceHandle::whole(&PAGE_BACKED_SERVICE_BLOCK_REG),
+        &guard,
+        |_| true,
+    )
+    .expect("page container file I/O service turn");
+
+    assert!(turn.page_before.is_some());
+    assert_eq!(turn.block.dispatched, 1);
+    assert_eq!(turn.block.device_completions, 1);
+    assert_eq!(turn.block.page_completions, 1);
+    assert!(turn.page_after.is_some());
+    assert_eq!(
+        turn.next,
+        crate::device::PageContainerFileIoServiceNext::Sleeping
+    );
+    assert_eq!(PAGE_BACKED_SERVICE_LAST_READ.load(Ordering::SeqCst), 64);
+    assert_eq!(pc.lookup(page), Some(completion_ppn));
+    assert!(!pc.file_page_fetch_in_flight_for_test(page));
+    match pc.materialize_page(page, MaterializeAccess::Read, &guard) {
+        V3Out::Done(page) => assert_eq!(page.ppn, completion_ppn),
+        other => panic!("expected retry to observe installed async page, got {other:?}"),
+    }
+}
+
+#[test]
+fn file_page_io_service_op_drives_aggregate_turn_as_step_op() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let guard = step_engine::guard();
+    let fs = Arc::new(RecordingFs::new());
+    struct DeviceBioPlanner {
+        buffer_ppn: Ppn,
+    }
+
+    impl BackendPlanner for DeviceBioPlanner {
+        fn plan_page_io(&self, _request: BackendPageRequest) -> BackendPlan {
+            BackendPlan::SubmitBios(BioPlanList::from_vec(alloc::vec![BioPlan::new(
+                DeviceKey::new(8),
+                BlockOp::Read,
+                LbaRange::new(64, 1),
+                alloc::vec![BioVec::new(
+                    self.buffer_ppn.0 as u64,
+                    0,
+                    crate::vm::USER_PAGE_SIZE as u32,
+                )],
+                BlockFlags::EMPTY,
+            )]))
+        }
+    }
+
+    let completion_ppn = page_allocator::zero_frame_ppn().expect("zero frame");
+    let planner = Arc::new(DeviceBioPlanner {
+        buffer_ppn: completion_ppn,
+    });
+    let pc =
+        file_page_container_with_planner(fs.clone(), fs.clone(), FsObjectId::new(98), 4, planner);
+    let page = PageIndex::new(1);
+
+    match pc.materialize_page(page, MaterializeAccess::Read, &guard) {
+        V3Out::Yield { .. } => {}
+        other => panic!("expected async yield after bio-only plan, got {other:?}"),
+    }
+    drop(guard);
+
+    PAGE_BACKED_SERVICE_LAST_READ.store(u64::MAX, Ordering::SeqCst);
+    let mut op = crate::device::PageContainerFileIoServiceOp::new(
+        &pc,
+        ServiceBudget::new(1),
+        ServiceBudget::new(1),
+        BlockDeviceHandle::whole(&PAGE_BACKED_SERVICE_BLOCK_REG),
+        |_| true,
+    );
+    let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
+    let outcome = op.step(&mut ctx);
+
+    match outcome {
+        V3Out::Done(turn) => {
+            assert!(turn.page_before.is_some());
+            assert_eq!(turn.block.dispatched, 1);
+            assert_eq!(turn.block.device_completions, 1);
+            assert_eq!(turn.block.page_completions, 1);
+            assert!(turn.page_after.is_some());
+            assert_eq!(
+                turn.next,
+                crate::device::PageContainerFileIoServiceNext::Sleeping
+            );
+        }
+        other => panic!("expected service op Done(_), got {other:?}"),
+    }
+    assert_eq!(PAGE_BACKED_SERVICE_LAST_READ.load(Ordering::SeqCst), 64);
+    assert_eq!(pc.lookup(page), Some(completion_ppn));
+    assert!(!pc.file_page_fetch_in_flight_for_test(page));
+    let guard = step_engine::guard();
+    match pc.materialize_page(page, MaterializeAccess::Read, &guard) {
+        V3Out::Done(page) => assert_eq!(page.ppn, completion_ppn),
+        other => panic!("expected retry to observe installed async page, got {other:?}"),
+    }
+}
+
+#[test]
+fn file_page_io_service_task_loop_waits_for_service_kick_and_drives_turn() {
+    fn block_on_ready<F: core::future::Future>(future: F) -> F::Output {
+        let waker = core::task::Waker::noop();
+        let mut cx = core::task::Context::from_waker(waker);
+        let mut future = core::pin::pin!(future);
+        match future.as_mut().poll(&mut cx) {
+            core::task::Poll::Ready(output) => output,
+            core::task::Poll::Pending => panic!("expected service task loop to complete"),
+        }
+    }
+
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let guard = step_engine::guard();
+    let fs = Arc::new(RecordingFs::new());
+    struct DeviceBioPlanner {
+        buffer_ppn: Ppn,
+    }
+
+    impl BackendPlanner for DeviceBioPlanner {
+        fn plan_page_io(&self, _request: BackendPageRequest) -> BackendPlan {
+            BackendPlan::SubmitBios(BioPlanList::from_vec(alloc::vec![BioPlan::new(
+                DeviceKey::new(8),
+                BlockOp::Read,
+                LbaRange::new(64, 1),
+                alloc::vec![BioVec::new(
+                    self.buffer_ppn.0 as u64,
+                    0,
+                    crate::vm::USER_PAGE_SIZE as u32,
+                )],
+                BlockFlags::EMPTY,
+            )]))
+        }
+    }
+
+    let completion_ppn = page_allocator::zero_frame_ppn().expect("zero frame");
+    let planner = Arc::new(DeviceBioPlanner {
+        buffer_ppn: completion_ppn,
+    });
+    let pc =
+        file_page_container_with_planner(fs.clone(), fs.clone(), FsObjectId::new(99), 4, planner);
+    let page = PageIndex::new(1);
+
+    match pc.materialize_page(page, MaterializeAccess::Read, &guard) {
+        V3Out::Yield { .. } => {}
+        other => panic!("expected async yield after bio-only plan, got {other:?}"),
+    }
+    drop(guard);
+
+    let wake_source = ServiceWakeSource::new(0x7100);
+    let _ = wake_source.kick_with_post(ServiceKick::new(IoServiceKind::Page), |mailbox, event| {
+        mailbox.post(event)
+    });
+    PAGE_BACKED_SERVICE_LAST_READ.store(u64::MAX, Ordering::SeqCst);
+
+    let report = block_on_ready(crate::device::page_container_file_io_service_task_loop(
+        &pc,
+        BlockDeviceHandle::whole(&PAGE_BACKED_SERVICE_BLOCK_REG),
+        &wake_source,
+        crate::device::PageContainerFileIoServiceTaskConfig::run_turns(
+            1,
+            ServiceBudget::new(1),
+            ServiceBudget::new(1),
+        ),
+    ));
+
+    assert_eq!(report.waits_ready, 1);
+    assert_eq!(report.ready_turns, 1);
+    assert_eq!(report.waits_failed, 0);
+    let turn = report.last_turn.expect("service turn");
+    assert_eq!(turn.block.dispatched, 1);
+    assert_eq!(turn.block.device_completions, 1);
+    assert_eq!(turn.block.page_completions, 1);
+    assert_eq!(
+        turn.next,
+        crate::device::PageContainerFileIoServiceNext::Sleeping
+    );
+    assert_eq!(PAGE_BACKED_SERVICE_LAST_READ.load(Ordering::SeqCst), 64);
+    assert_eq!(pc.lookup(page), Some(completion_ppn));
+}
+
+#[test]
+fn file_page_io_service_owned_task_loop_holds_runtime_for_static_submission() {
+    fn block_on_ready<F: core::future::Future>(future: F) -> F::Output {
+        let waker = core::task::Waker::noop();
+        let mut cx = core::task::Context::from_waker(waker);
+        let mut future = core::pin::pin!(future);
+        match future.as_mut().poll(&mut cx) {
+            core::task::Poll::Ready(output) => output,
+            core::task::Poll::Pending => panic!("expected owned service task loop to complete"),
+        }
+    }
+    fn assert_send_static_future<F>(future: F) -> F
+    where
+        F: core::future::Future<Output = crate::device::PageContainerFileIoServiceTaskReport>
+            + Send
+            + 'static,
+    {
+        future
+    }
+
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let guard = step_engine::guard();
+    let fs = Arc::new(RecordingFs::new());
+    struct DeviceBioPlanner {
+        buffer_ppn: Ppn,
+    }
+
+    impl BackendPlanner for DeviceBioPlanner {
+        fn plan_page_io(&self, _request: BackendPageRequest) -> BackendPlan {
+            BackendPlan::SubmitBios(BioPlanList::from_vec(alloc::vec![BioPlan::new(
+                DeviceKey::new(8),
+                BlockOp::Read,
+                LbaRange::new(64, 1),
+                alloc::vec![BioVec::new(
+                    self.buffer_ppn.0 as u64,
+                    0,
+                    crate::vm::USER_PAGE_SIZE as u32,
+                )],
+                BlockFlags::EMPTY,
+            )]))
+        }
+    }
+
+    let completion_ppn = page_allocator::zero_frame_ppn().expect("zero frame");
+    let planner = Arc::new(DeviceBioPlanner {
+        buffer_ppn: completion_ppn,
+    });
+    let pc = file_page_container_cap_with_planner(
+        fs.clone(),
+        fs.clone(),
+        FsObjectId::new(100),
+        4,
+        planner,
+    );
+    let page = PageIndex::new(1);
+
+    match pc.materialize_page(page, MaterializeAccess::Read, &guard) {
+        V3Out::Yield { .. } => {}
+        other => panic!("expected async yield after bio-only plan, got {other:?}"),
+    }
+    drop(guard);
+
+    let runtime = crate::device::PageContainerFileIoServiceRuntime::new(
+        pc.clone(),
+        BlockDeviceHandle::whole(&PAGE_BACKED_SERVICE_BLOCK_REG),
+        Arc::new(ServiceWakeSource::new(0x7101)),
+    );
+    let _ = runtime.kick(IoServiceKind::Page);
+    PAGE_BACKED_SERVICE_LAST_READ.store(u64::MAX, Ordering::SeqCst);
+
+    let report = block_on_ready(assert_send_static_future(
+        crate::device::page_container_file_io_service_task_loop_owned(
+            runtime,
+            crate::device::PageContainerFileIoServiceTaskConfig::run_turns(
+                1,
+                ServiceBudget::new(1),
+                ServiceBudget::new(1),
+            ),
+        ),
+    ));
+
+    assert_eq!(report.waits_ready, 1);
+    assert_eq!(report.ready_turns, 1);
+    assert_eq!(report.waits_failed, 0);
+    let turn = report.last_turn.expect("service turn");
+    assert_eq!(turn.block.dispatched, 1);
+    assert_eq!(turn.block.device_completions, 1);
+    assert_eq!(turn.block.page_completions, 1);
+    assert_eq!(PAGE_BACKED_SERVICE_LAST_READ.load(Ordering::SeqCst), 64);
+    assert_eq!(pc.lookup(page), Some(completion_ppn));
+}
+
+#[test]
+fn file_page_service_records_l6_submit_outcomes_for_later_completion() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::new());
+    let planner = Arc::new(BioOnlyPlanner::new());
+    let pc =
+        file_page_container_with_planner(fs.clone(), fs, FsObjectId::new(94), 4, planner.clone());
+    let page = PageIndex::new(1);
+    let request_id = {
+        let mut state = pc.state.lock();
+        state
+            .file_io_service
+            .submit(
+                pc.io_manager_key(),
+                PageIoRange::new(page.as_u64(), 1),
+                PageIoOp::Read,
+                PageIoPriority::Demand,
+                PageIoFlags::DEMAND,
+                Some(PageGeneration::new(19)),
+            )
+            .expect("staged file service submission")
+    };
+
+    let mut block_queue = BlockQueue::new(4);
+    let mut tracker = BlockPageRequestTracker::new();
+    let driven = pc
+        .drive_file_io_service_once_with_tracker(
+            ServiceBudget::new(1),
+            &mut block_queue,
+            &mut tracker,
+            |_| true,
+        )
+        .expect("file service drive");
+
+    assert_eq!(planner.calls.load(Ordering::Acquire), 1);
+    assert_eq!(block_queue.len(), 1);
+    assert_eq!(tracker.len(), 1);
+    assert!(matches!(
+        driven.work.as_slice(),
+        [PageServiceDrivenWork::BackendSubmission(
+            PageServiceBackendSubmitOutcome::BlockBiosQueued { .. }
+        )]
+    ));
+
+    let block_completion = BlockCompletion {
+        tag: BlockTag::new(1),
+        id: BlockRequestId::new(1),
+        plan: BioPlan::new(
+            DeviceKey::new(8),
+            BlockOp::Read,
+            LbaRange::new(64, 1),
+            alloc::vec![BioVec::new(0xfeed, 0, crate::vm::USER_PAGE_SIZE as u32)],
+            BlockFlags::EMPTY,
+        ),
+        result: Ok(()),
+    };
+    let completions = tracker
+        .complete(block_completion)
+        .expect("tracked block request");
+
+    assert_eq!(completions.len(), 1);
+    assert_eq!(completions[0].request().id, request_id);
+    assert_eq!(
+        completions[0].request().generation_hint,
+        Some(PageGeneration::new(19))
+    );
+}
+
+#[test]
+fn file_page_owned_l6_runtime_routes_bio_completion_into_page_slot() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::new());
+    let planner = Arc::new(BioOnlyPlanner::new());
+    let pc =
+        file_page_container_with_planner(fs.clone(), fs, FsObjectId::new(95), 4, planner.clone());
+    let page = PageIndex::new(1);
+    let completion_ppn = page_allocator::zero_frame_ppn().expect("zero frame");
+    let (request_id, generation) = {
+        let mut state = pc.state.lock();
+        let slot = state.file_page_slots.entry(page).or_default();
+        let PageSlotFetch::Owner { generation } = slot.begin_fetch() else {
+            panic!("test slot should own fetch");
+        };
+        let request_id = state
+            .file_io_service
+            .submit(
+                pc.io_manager_key(),
+                PageIoRange::new(page.as_u64(), 1),
+                PageIoOp::Read,
+                PageIoPriority::Demand,
+                PageIoFlags::DEMAND,
+                Some(generation),
+            )
+            .expect("staged file service submission");
+        (request_id, generation)
+    };
+
+    let page_driven = pc
+        .drive_file_io_service_once_owned(ServiceBudget::new(1), |_| true)
+        .expect("owned file service drive");
+
+    assert_eq!(planner.calls.load(Ordering::Acquire), 1);
+    assert_eq!(pc.file_io_block_queue_len_for_test(), 1);
+    assert_eq!(pc.file_io_block_tracker_len_for_test(), 1);
+    assert!(matches!(
+        page_driven.work.as_slice(),
+        [PageServiceDrivenWork::BackendSubmission(
+            PageServiceBackendSubmitOutcome::BlockBiosQueued { .. }
+        )]
+    ));
+
+    struct CompletingExecutor {
+        completions: VecDeque<BlockDeviceCompletion>,
+    }
+
+    impl BlockDispatchExecutor for CompletingExecutor {
+        fn submit(&mut self, dispatch: &BlockDispatch) {
+            self.completions
+                .push_back(BlockDeviceCompletion::new(dispatch.tag, Ok(())));
+        }
+    }
+
+    impl BlockCompletionSource for CompletingExecutor {
+        fn poll_completion(&mut self) -> Option<BlockDeviceCompletion> {
+            self.completions.pop_front()
+        }
+    }
+
+    let mut executor = CompletingExecutor {
+        completions: VecDeque::new(),
+    };
+    let block_turn = pc
+        .drive_file_block_io_service_once(
+            ServiceBudget::new(1),
+            &mut executor,
+            |completion| {
+                assert_eq!(completion.request().id, request_id);
+                Some(PageFrameRef::new(completion_ppn))
+            },
+            |_| true,
+        )
+        .expect("owned block service drive");
+
+    assert_eq!(block_turn.dispatched, 1);
+    assert_eq!(block_turn.device_completions, 1);
+    assert_eq!(block_turn.page_completions, 1);
+    assert_eq!(block_turn.next, BlockServiceNext::Sleeping);
+    assert_eq!(pc.file_io_block_tracker_len_for_test(), 0);
+
+    pc.drive_file_io_service_once_owned(ServiceBudget::new(1), |_| true)
+        .expect("completion apply drive");
+
+    assert_eq!(pc.lookup(page), Some(completion_ppn));
+    assert_eq!(
+        pc.file_page_slot_snapshot_for_test(page),
+        Some(PageSlotSnapshot {
+            state: PageSlotState::Resident {
+                ppn: completion_ppn
+            },
+            generation,
+        })
+    );
 }
 
 #[test]
@@ -943,6 +2118,102 @@ fn file_page_miss_joins_reentrant_inflight_without_duplicate_fetch() {
         1,
         "only the first caller should issue the backend fetch for a concurrently missing page"
     );
+}
+
+#[test]
+fn file_page_miss_enters_l4_shadow_queue_before_compat_fetch() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let guard = step_engine::guard();
+    let fs = Arc::new(ReentrantFs::new());
+    let pc = Arc::new(file_page_container(
+        fs.clone(),
+        fs.clone(),
+        FsObjectId::new(60),
+        4,
+    ));
+    fs.set_page_container(&pc);
+
+    match pc.materialize_page(PageIndex::new(0), MaterializeAccess::Read, &guard) {
+        V3Out::Done(page) => assert!(page.newly_installed),
+        other => panic!("unexpected materialize outcome: {other:?}"),
+    }
+
+    assert_eq!(
+        fs.l4_pending_before_reentry.load(Ordering::Acquire),
+        1,
+        "owner miss must be admitted to the staged L4 queue before compat backend fetch"
+    );
+    assert_eq!(
+        fs.l4_pending_after_reentry.load(Ordering::Acquire),
+        1,
+        "reentrant same-page miss must join the existing L4 request"
+    );
+    assert_eq!(
+        fs.l4_waiters_after_reentry.load(Ordering::Acquire),
+        1,
+        "reentrant same-page miss must register its wait source with the staged L4 service"
+    );
+    assert_ne!(
+        fs.l4_generation_hint.load(Ordering::Acquire),
+        0,
+        "staged L4 request must carry a generation hint"
+    );
+    assert_eq!(
+        pc.file_io_request_count_for_test(),
+        0,
+        "compat executor must retire the staged L4 request after direct fetch completion"
+    );
+    assert_eq!(fs.fetches.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn file_page_retire_notifies_only_when_l4_route_has_waiter() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::new());
+    let pc = file_page_container(fs.clone(), fs, FsObjectId::new(61), 4);
+    let page = PageIndex::new(0);
+
+    let wait = crate::page_backed::notification::new_page_ready_wait();
+    let source_id = crate::page_backed::notification::page_ready_source_id(&wait);
+    let mut stale_legacy_fetch = FilePageFetch::new(FilePageFetchId(99));
+    stale_legacy_fetch.source_id = Some(source_id);
+    stale_legacy_fetch.joined = true;
+
+    {
+        let mut state = pc.state.lock();
+        state.file_page_waits.insert(page, wait);
+        assert!(
+            PageContainer::retire_file_page_fetch_wait(&mut state, page, stale_legacy_fetch)
+                .is_none(),
+            "legacy joined/source_id alone must not bypass the L4 service route"
+        );
+    }
+
+    let mut state = pc.state.lock();
+    let request_id = state
+        .file_io_service
+        .submit(
+            pc.io_manager_key(),
+            PageIoRange::new(page.as_u64(), 1),
+            PageIoOp::Read,
+            PageIoPriority::Demand,
+            PageIoFlags::DEMAND,
+            Some(PageGeneration::new(1)),
+        )
+        .expect("staged L4 request");
+    state.register_file_io_waiter(Some(request_id), source_id);
+    let mut routed_fetch = FilePageFetch::with_l4_request(FilePageFetchId(100), Some(request_id));
+    routed_fetch.source_id = Some(source_id);
+    routed_fetch.joined = true;
+
+    assert!(
+        PageContainer::retire_file_page_fetch_wait(&mut state, page, routed_fetch).is_some(),
+        "registered L4 waiter should drive the PageBacked notifier"
+    );
+    assert_eq!(state.file_io_service.submission_len(), 0);
+    assert_eq!(state.file_io_service.waiter_count(request_id), 0);
 }
 
 #[test]
