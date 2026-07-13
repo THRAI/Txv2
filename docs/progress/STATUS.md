@@ -1,3 +1,14 @@
+- 2026-07-14 (ext4 I/O-manager 6F mapped direct-write planner sub-slice).
+  Ext4 mapped data writes now accept an L4-owned `IoDataSource::Direct` and
+  preserve validated multi-segment `BioVec`s in the L6 write bio. Page-cache
+  writeback retains its existing frame-source behavior; empty, zero-length,
+  overflowing, or non-block-sized direct vectors are rejected. This slice
+  does not allocate extents, handle holes, pin user pages, implement a direct
+  syscall, or establish JBD2 durability. Verification passed: ext4 planner
+  12/12, neutral `fs_iface::plan` 6/6, and `cargo check -p tx-ext4 --lib
+  --no-default-features`. Next: L4 direct-buffer lease/runtime integration;
+  6F and 6G remain open.
+
 - 2026-07-14 (ext4 I/O-manager 6F mapped direct-read planner sub-slice).
   Ext4 mapped data reads now accept an L4-owned `IoDataTarget::Direct` and
   preserve its non-owning `BioVec` segments in the L6 read bio. Empty,

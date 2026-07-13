@@ -382,13 +382,19 @@ impl Ext4BlockGeometry {
 
     /// Build one L6 write bio for an L4-owned dirty page-cache source.
     pub fn plan_write(self, physical_block: u64, source: &IoDataSource) -> Result<BioPlan, Errno> {
-        let IoDataSource::PageCache {
-            frame, offset, len, ..
-        } = source
-        else {
-            return Err(Errno::EINVAL);
+        let vecs = match source {
+            IoDataSource::PageCache {
+                frame, offset, len, ..
+            } => {
+                if *len != BLOCK_SIZE as u32 {
+                    return Err(Errno::EINVAL);
+                }
+                vec![bio_vec(*frame, *offset, *len)]
+            }
+            IoDataSource::Direct { vecs, .. } => direct_bio_vecs(vecs)?,
+            IoDataSource::None => return Err(Errno::EINVAL),
         };
-        if self.sectors_per_block == 0 || *len != BLOCK_SIZE as u32 {
+        if self.sectors_per_block == 0 {
             return Err(Errno::EINVAL);
         }
         let lba = physical_block
@@ -398,7 +404,7 @@ impl Ext4BlockGeometry {
             self.device,
             BlockOp::Write,
             LbaRange::new(lba, self.sectors_per_block),
-            vec![bio_vec(*frame, *offset, *len)],
+            vecs,
             BlockFlags::EMPTY,
         ))
     }
@@ -520,6 +526,37 @@ mod tests {
         assert_eq!(plan.op, BlockOp::Write);
         assert_eq!(plan.lba, LbaRange::new(88, 8));
         assert_eq!(plan.vecs, vec![BioVec::new(9, 0, BLOCK_SIZE as u32)]);
+    }
+
+    #[test]
+    fn mapped_ext4_block_plans_l6_write_from_direct_iovecs() {
+        let source = IoDataSource::direct(
+            IoDataLeaseId::new(13),
+            vec![BioVec::new(51, 64, 2048), BioVec::new(52, 0, 2048)],
+        );
+        let plan = Ext4BlockGeometry::new(DeviceKey::new(7), 8)
+            .plan_write(11, &source)
+            .expect("mapped direct block write plan");
+
+        assert_eq!(plan.device, DeviceKey::new(7));
+        assert_eq!(plan.op, BlockOp::Write);
+        assert_eq!(plan.lba, LbaRange::new(88, 8));
+        assert_eq!(
+            plan.vecs,
+            vec![BioVec::new(51, 64, 2048), BioVec::new(52, 0, 2048)]
+        );
+    }
+
+    #[test]
+    fn mapped_ext4_direct_write_rejects_empty_or_partial_iovecs() {
+        let geometry = Ext4BlockGeometry::new(DeviceKey::new(7), 8);
+        for vecs in [
+            alloc::vec![],
+            alloc::vec![BioVec::new(51, 0, (BLOCK_SIZE as u32) - 1)],
+        ] {
+            let source = IoDataSource::direct(IoDataLeaseId::new(14), vecs);
+            assert_eq!(geometry.plan_write(11, &source), Err(Errno::EINVAL));
+        }
     }
 
     #[test]
