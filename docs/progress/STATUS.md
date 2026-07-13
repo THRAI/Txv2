@@ -1,3 +1,19 @@
+- 2026-07-13 (ext4 I/O-manager 6E graph-runtime integration).
+  L4 now owns `BackendBioGraph` execution: it admits only ready graph nodes
+  to L6, advances every graph sharing a merged L6 request ID, suppresses
+  dependent admission after an error, and emits generation-preserving terminal
+  page completion. The owned PageContainer block runtime routes tagged
+  completion through that registry and kicks L6 for newly-ready successors or
+  L4 for terminal completion. Generic page-cache data ownership remains in
+  PageContainer; no filesystem or device call occurs under its state lock. The
+  external block-queue compatibility facade still returns `ENOSYS` for graphs
+  because it lacks a tagged-completion route into the private registry.
+  Verification passed: graph scheduler 2/2, PageService 38/38, PageBacked
+  128/128, and `cargo check -p tx-subsystems --lib --no-default-features`.
+  Next: emit ext4 allocation/JBD2 ordered transaction graphs, then verify
+  power-loss durability. No durable fsync claim is made by this slice. See
+  `docs/progress/plans/2026-07-13-ext4-io-manager-write-path.json`.
+
 - 2026-07-11 (tx-observe schema codegen automation).
   Continued the observe L0 schema consolidation by making kernel-side automation
   concrete. `schema/txobserve.toml` now owns the `HartEmitter` public helper

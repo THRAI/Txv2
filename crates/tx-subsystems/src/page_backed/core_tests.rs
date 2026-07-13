@@ -11,8 +11,9 @@ use crate::device::{
 };
 use crate::execution::Errno;
 use crate::fs_iface::{
-    BackendPageRequest, BackendPlan, BackendPlanner, BioPlanList, IoDataLeaseId, IoDataSource,
-    PageCompletion, PageCompletionList, PageFrameRef,
+    BackendBioDependency, BackendBioGraph, BackendBioNode, BackendBioNodeId, BackendPageRequest,
+    BackendPlan, BackendPlanner, BioPlanList, IoDataLeaseId, IoDataSource, PageCompletion,
+    PageCompletionList, PageFrameRef,
 };
 use crate::io_manager::backend::BlockPageRequestTracker;
 use crate::io_manager::block::{
@@ -198,6 +199,68 @@ impl BackendPlanner for BioOnlyPlanner {
             alloc::vec![BioVec::new(0xfeed, 0, crate::vm::USER_PAGE_SIZE as u32)],
             BlockFlags::EMPTY,
         )]))
+    }
+}
+
+struct DependencyGraphPlanner {
+    calls: AtomicUsize,
+}
+
+impl DependencyGraphPlanner {
+    fn new() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl BackendPlanner for DependencyGraphPlanner {
+    fn plan_page_io(&self, _request: BackendPageRequest) -> BackendPlan {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        BackendPlan::SubmitGraph(
+            BackendBioGraph::new(
+                alloc::vec![
+                    BackendBioNode::new(
+                        BackendBioNodeId::new(1),
+                        BioPlan::new(
+                            DeviceKey::new(8),
+                            BlockOp::Read,
+                            LbaRange::new(64, 1),
+                            alloc::vec![BioVec::new(0x100, 0, 512)],
+                            BlockFlags::EMPTY,
+                        ),
+                        IoDataSource::None,
+                    ),
+                    BackendBioNode::new(
+                        BackendBioNodeId::new(2),
+                        BioPlan::new(
+                            DeviceKey::new(8),
+                            BlockOp::Read,
+                            LbaRange::new(72, 1),
+                            alloc::vec![BioVec::new(0x200, 0, 512)],
+                            BlockFlags::EMPTY,
+                        ),
+                        IoDataSource::None,
+                    ),
+                    BackendBioNode::new(
+                        BackendBioNodeId::new(3),
+                        BioPlan::new(
+                            DeviceKey::new(8),
+                            BlockOp::Read,
+                            LbaRange::new(80, 1),
+                            alloc::vec![BioVec::new(0x300, 0, 512)],
+                            BlockFlags::EMPTY,
+                        ),
+                        IoDataSource::None,
+                    ),
+                ],
+                alloc::vec![
+                    BackendBioDependency::new(BackendBioNodeId::new(1), BackendBioNodeId::new(3)),
+                    BackendBioDependency::new(BackendBioNodeId::new(2), BackendBioNodeId::new(3)),
+                ],
+            )
+            .expect("valid dependency graph"),
+        )
     }
 }
 
@@ -1753,6 +1816,105 @@ fn file_page_materialize_bio_only_plan_yields_without_compat_fetch() {
         V3Out::Done(page) => assert_eq!(page.ppn, completion_ppn),
         other => panic!("expected retry to observe installed async page, got {other:?}"),
     }
+}
+
+#[test]
+fn file_page_dependency_graph_releases_successor_through_owned_l6_runtime() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let guard = step_engine::guard();
+    let fs = Arc::new(RecordingFs::new());
+    let planner = Arc::new(DependencyGraphPlanner::new());
+    let pc = file_page_container_with_planner(
+        fs.clone(),
+        fs.clone(),
+        FsObjectId::new(101),
+        4,
+        planner.clone(),
+    );
+    let page = PageIndex::new(1);
+
+    match pc.materialize_page(page, MaterializeAccess::Read, &guard) {
+        V3Out::Yield { .. } => {}
+        other => panic!("expected async yield after dependency graph plan, got {other:?}"),
+    }
+    assert_eq!(planner.calls.load(Ordering::Acquire), 1);
+    assert_eq!(fs.fetches.load(Ordering::Acquire), 0);
+    assert_eq!(pc.file_io_block_queue_len_for_test(), 2);
+    assert_eq!(pc.file_io_block_tracker_len_for_test(), 0);
+
+    struct CompletingExecutor {
+        completions: VecDeque<BlockDeviceCompletion>,
+    }
+
+    impl BlockDispatchExecutor for CompletingExecutor {
+        fn submit(&mut self, dispatch: &BlockDispatch) {
+            self.completions
+                .push_back(BlockDeviceCompletion::new(dispatch.tag, Ok(())));
+        }
+    }
+
+    impl BlockCompletionSource for CompletingExecutor {
+        fn poll_completion(&mut self) -> Option<BlockDeviceCompletion> {
+            self.completions.pop_front()
+        }
+    }
+
+    let mut executor = CompletingExecutor {
+        completions: VecDeque::new(),
+    };
+    let mut root_kicks = Vec::new();
+    let roots = pc
+        .drive_file_block_io_service_once(
+            ServiceBudget::new(2),
+            &mut executor,
+            |_| None,
+            |kick| {
+                root_kicks.push(kick);
+                true
+            },
+        )
+        .expect("root graph block service turn");
+
+    assert_eq!(roots.dispatched, 2);
+    assert_eq!(roots.device_completions, 2);
+    assert_eq!(roots.page_completions, 0);
+    assert_eq!(roots.next, BlockServiceNext::Runnable);
+    assert_eq!(
+        root_kicks,
+        alloc::vec![ServiceKick::new(IoServiceKind::Block)]
+    );
+    assert_eq!(pc.file_io_block_queue_len_for_test(), 1);
+
+    let mut successor_kicks = Vec::new();
+    let successor = pc
+        .drive_file_block_io_service_once(
+            ServiceBudget::new(1),
+            &mut executor,
+            |_| None,
+            |kick| {
+                successor_kicks.push(kick);
+                true
+            },
+        )
+        .expect("successor graph block service turn");
+
+    assert_eq!(successor.dispatched, 1);
+    assert_eq!(successor.device_completions, 1);
+    assert_eq!(successor.page_completions, 1);
+    assert_eq!(
+        successor_kicks,
+        alloc::vec![ServiceKick::new(IoServiceKind::Page)]
+    );
+    assert_eq!(pc.file_io_block_queue_len_for_test(), 0);
+    pc.drive_file_io_service_once_owned(ServiceBudget::new(1), |_| true)
+        .expect("graph terminal completion apply drive");
+
+    assert!(!pc.file_page_fetch_in_flight_for_test(page));
+    assert!(matches!(
+        pc.materialize_page(page, MaterializeAccess::Read, &guard),
+        V3Out::Done(_)
+    ));
 }
 
 #[test]

@@ -34,9 +34,9 @@ use crate::io_manager::page::{
     PageIoRange, PageIoRequest, PageIoRequestId, PageIoResult,
     service::{
         PageCompletionRoute, PageService, PageServiceBackendContext, PageServiceBackendDriven,
-        PageServiceBackendOutcome, PageServiceBackendSubmitError, PageServiceBackendSubmitOutcome,
-        PageServiceDrivenWork, PageServiceNext, PageServiceTaggedBlockCompletionError,
-        PageServiceTurn, PageServiceWork, PageWaitInterest, PageWaiter,
+        PageServiceBackendOutcome, PageServiceBackendSubmitOutcome, PageServiceDrivenWork,
+        PageServiceNext, PageServiceTaggedBlockCompletionError, PageServiceTurn, PageServiceWork,
+        PageWaitInterest, PageWaiter,
     },
 };
 use crate::io_manager::runtime::{IoServiceKind, QueueDepth, ServiceBudget, ServiceKick};
@@ -1120,11 +1120,20 @@ impl PageContainer {
                                 block_queue,
                                 tracker,
                             } => {
-                                let queued = queue_file_service_backend_outcome(
-                                    outcome,
-                                    block_queue,
-                                    request.clone(),
-                                );
+                                // The compatibility caller cannot route tagged completions into
+                                // this PageContainer's private graph registry.
+                                let queued = match outcome {
+                                    PageServiceBackendOutcome::BlockGraph(_) => {
+                                        Ok(PageServiceBackendSubmitOutcome::Err(Errno::ENOSYS))
+                                    }
+                                    outcome => {
+                                        self.state.lock().file_io_service.queue_backend_outcome(
+                                            outcome,
+                                            block_queue,
+                                            request.clone(),
+                                        )
+                                    }
+                                };
                                 if let (Ok(outcome), Some(tracker)) = (&queued, tracker.as_mut()) {
                                     record_file_service_block_submissions(tracker, outcome);
                                 }
@@ -1132,14 +1141,19 @@ impl PageContainer {
                             }
                             FileBlockSubmissionTarget::Owned => {
                                 let mut state = self.state.lock();
-                                let queued = queue_file_service_backend_outcome(
+                                let PageContainerState {
+                                    file_io_service,
+                                    file_block_runtime,
+                                    ..
+                                } = &mut *state;
+                                let queued = file_io_service.queue_backend_outcome(
                                     outcome,
-                                    &mut state.file_block_runtime.queue,
+                                    &mut file_block_runtime.queue,
                                     request.clone(),
                                 );
                                 if let Ok(outcome) = &queued {
                                     record_file_service_block_submissions(
-                                        &mut state.file_block_runtime.tracker,
+                                        &mut file_block_runtime.tracker,
                                         outcome,
                                     );
                                 }
@@ -1180,11 +1194,20 @@ impl PageContainer {
                                 block_queue,
                                 tracker,
                             } => {
-                                let queued = queue_file_service_backend_outcome(
-                                    outcome,
-                                    block_queue,
-                                    page_request.clone(),
-                                );
+                                // The compatibility caller cannot route tagged completions into
+                                // this PageContainer's private graph registry.
+                                let queued = match outcome {
+                                    PageServiceBackendOutcome::BlockGraph(_) => {
+                                        Ok(PageServiceBackendSubmitOutcome::Err(Errno::ENOSYS))
+                                    }
+                                    outcome => {
+                                        self.state.lock().file_io_service.queue_backend_outcome(
+                                            outcome,
+                                            block_queue,
+                                            page_request.clone(),
+                                        )
+                                    }
+                                };
                                 if let (Ok(outcome), Some(tracker)) = (&queued, tracker.as_mut()) {
                                     record_file_service_block_submissions(tracker, outcome);
                                 }
@@ -1192,14 +1215,19 @@ impl PageContainer {
                             }
                             FileBlockSubmissionTarget::Owned => {
                                 let mut state = self.state.lock();
-                                let queued = queue_file_service_backend_outcome(
+                                let PageContainerState {
+                                    file_io_service,
+                                    file_block_runtime,
+                                    ..
+                                } = &mut *state;
+                                let queued = file_io_service.queue_backend_outcome(
                                     outcome,
-                                    &mut state.file_block_runtime.queue,
+                                    &mut file_block_runtime.queue,
                                     page_request.clone(),
                                 );
                                 if let Ok(outcome) = &queued {
                                     record_file_service_block_submissions(
-                                        &mut state.file_block_runtime.tracker,
+                                        &mut file_block_runtime.tracker,
                                         outcome,
                                     );
                                 }
@@ -1266,6 +1294,7 @@ impl PageContainer {
         let mut device_completions = 0usize;
         let mut page_completions = 0usize;
         let mut kicks = driven.kicks;
+        let mut next = driven.step.next;
         while let Some(completion) = executor.poll_completion() {
             device_completions += 1;
             let outcome = {
@@ -1275,10 +1304,11 @@ impl PageContainer {
                     file_block_runtime,
                     ..
                 } = &mut *state;
-                file_io_service.push_tagged_block_completion(
+                file_io_service.push_tagged_block_completion_with_graphs(
                     &mut file_block_runtime.tags,
                     &mut file_block_runtime.depth,
                     &mut file_block_runtime.tracker,
+                    &mut file_block_runtime.queue,
                     completion.tag,
                     completion.result,
                     &mut frame_for,
@@ -1288,13 +1318,17 @@ impl PageContainer {
             if outcome.wake.is_some() {
                 kicks += usize::from(kick(ServiceKick::new(IoServiceKind::Page)));
             }
+            if outcome.block_submitted != 0 {
+                next = BlockServiceNext::Runnable;
+                kicks += usize::from(kick(ServiceKick::new(IoServiceKind::Block)));
+            }
         }
 
         Ok(FileBlockServiceTurn {
             dispatched: driven.step.dispatches.len(),
             device_completions,
             page_completions,
-            next: driven.step.next,
+            next,
             kicks,
         })
     }
@@ -2748,43 +2782,6 @@ fn materialized_snapshot_from_state(
     })
 }
 
-fn queue_file_service_backend_outcome(
-    outcome: PageServiceBackendOutcome,
-    block_queue: &mut BlockQueue,
-    request: PageIoRequest,
-) -> Result<PageServiceBackendSubmitOutcome, PageServiceBackendSubmitError> {
-    match outcome {
-        PageServiceBackendOutcome::QueuedPageCompletions { queued, wake } => {
-            Ok(PageServiceBackendSubmitOutcome::QueuedPageCompletions { queued, wake })
-        }
-        PageServiceBackendOutcome::BlockBios(bios) => {
-            let mut submitted = Vec::new();
-            for bio in bios.into_vec() {
-                submitted.push(block_queue.submit(bio)?);
-            }
-            Ok(PageServiceBackendSubmitOutcome::BlockBiosQueued { request, submitted })
-        }
-        PageServiceBackendOutcome::MetadataFirst {
-            request: backend_request,
-            bios,
-            resume,
-        } => {
-            let mut submitted = Vec::new();
-            for bio in bios.into_vec() {
-                submitted.push(block_queue.submit(bio)?);
-            }
-            Ok(PageServiceBackendSubmitOutcome::MetadataFirstQueued {
-                request,
-                backend_request,
-                submitted,
-                resume,
-            })
-        }
-        PageServiceBackendOutcome::Yield(wait) => Ok(PageServiceBackendSubmitOutcome::Yield(wait)),
-        PageServiceBackendOutcome::Err(errno) => Ok(PageServiceBackendSubmitOutcome::Err(errno)),
-    }
-}
-
 fn record_file_service_block_submissions(
     tracker: &mut BlockPageRequestTracker,
     outcome: &PageServiceBackendSubmitOutcome,
@@ -2793,7 +2790,8 @@ fn record_file_service_block_submissions(
         PageServiceBackendSubmitOutcome::BlockBiosQueued { request, submitted } => {
             tracker.record_submit_outcomes(request.clone(), submitted)
         }
-        PageServiceBackendSubmitOutcome::MetadataFirstQueued { .. } => {}
+        PageServiceBackendSubmitOutcome::BlockGraphQueued { .. }
+        | PageServiceBackendSubmitOutcome::MetadataFirstQueued { .. } => {}
         PageServiceBackendSubmitOutcome::QueuedPageCompletions { .. }
         | PageServiceBackendSubmitOutcome::Yield(_)
         | PageServiceBackendSubmitOutcome::Err(_) => {}
@@ -2806,6 +2804,7 @@ fn file_service_work_waits_for_async_completion(work: &[PageServiceDrivenWork]) 
             item,
             PageServiceDrivenWork::BackendSubmission(
                 PageServiceBackendSubmitOutcome::BlockBiosQueued { .. }
+                    | PageServiceBackendSubmitOutcome::BlockGraphQueued { .. }
                     | PageServiceBackendSubmitOutcome::MetadataFirstQueued { .. }
             )
         )

@@ -85,6 +85,10 @@ impl BackendGraphScheduler {
                     .all(|state| *state == NodeState::Complete))
     }
 
+    pub fn handles_request(&self, request: BlockRequestId) -> bool {
+        self.requests.contains_key(&request)
+    }
+
     fn admit_ready(
         &mut self,
         queue: &mut BlockQueue,
