@@ -139,3 +139,22 @@ fn page_slot_fsync_frontier_waits_for_old_writeback_before_resubmitting_redirty(
         PageSlotFsyncStatus::NeedsWriteback { generation: second }
     );
 }
+
+#[test]
+fn page_slot_aborts_unsubmitted_writeback_back_to_dirty() {
+    let slot = PageSlot::new();
+    let PageSlotFetch::Owner { generation } = slot.begin_fetch() else {
+        panic!("setup fetch owner");
+    };
+    slot.complete_fetch(generation, Ok(Ppn(14)))
+        .expect("setup resident page");
+    let dirty = slot.mark_dirty().expect("dirty generation");
+    let writeback = slot.begin_writeback().expect("start writeback");
+
+    let restored = slot
+        .abort_writeback(writeback.generation)
+        .expect("unsubmitted writeback can be aborted");
+
+    assert_eq!(restored.generation, dirty.generation);
+    assert_eq!(restored.state, PageSlotState::Dirty { ppn: Ppn(14) });
+}

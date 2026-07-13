@@ -292,6 +292,34 @@ impl PageSlot {
         Ok(inner.snapshot())
     }
 
+    /// Restore a writeback that was never handed to a backend executor.
+    pub fn abort_writeback(
+        &self,
+        generation: PageGeneration,
+    ) -> Result<PageSlotSnapshot, PageSlotCompletionError> {
+        let mut inner = self.inner.lock();
+        let PageSlotState::Writeback {
+            ppn,
+            submitted_generation,
+            ..
+        } = inner.state
+        else {
+            return Err(PageSlotCompletionError::NotFetching {
+                state: inner.state,
+                generation: inner.generation,
+            });
+        };
+        if submitted_generation != generation {
+            return Err(PageSlotCompletionError::GenerationMismatch {
+                current: inner.generation,
+                completed: generation,
+            });
+        }
+
+        inner.state = PageSlotState::Dirty { ppn };
+        Ok(inner.snapshot())
+    }
+
     pub fn invalidate(&self) -> PageSlotSnapshot {
         let mut inner = self.inner.lock();
         inner.bump_generation();
