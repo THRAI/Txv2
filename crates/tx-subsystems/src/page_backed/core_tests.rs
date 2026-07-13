@@ -1203,6 +1203,49 @@ fn file_page_service_completion_installs_planned_read_frame() {
 }
 
 #[test]
+fn file_page_writeback_admission_transitions_dirty_slot_and_queues_request() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::new());
+    let pc = file_page_container(fs.clone(), fs, FsObjectId::new(95), 4);
+    let page = PageIndex::new(1);
+    let frame = cached_frame_for_test();
+    let ppn = frame.ppn;
+    {
+        let mut state = pc.state.lock();
+        state
+            .pages
+            .install_if_absent(page, frame)
+            .expect("seed page");
+        let slot = state.file_page_slots.entry(page).or_default();
+        let PageSlotFetch::Owner { generation } = slot.begin_fetch() else {
+            panic!("slot fetch owner");
+        };
+        slot.complete_fetch(generation, Ok(ppn))
+            .expect("resident slot");
+        slot.mark_dirty().expect("dirty slot");
+        state.pages.mark_dirty(page).expect("dirty page cache");
+    }
+
+    let id = pc
+        .queue_file_page_writeback(page)
+        .expect("writeback request");
+    assert_eq!(pc.file_io_request_count_for_test(), 1);
+    assert_eq!(
+        pc.file_page_slot_snapshot_for_test(page)
+            .expect("slot")
+            .state,
+        PageSlotState::Writeback {
+            ppn,
+            submitted_generation: PageGeneration::new(2),
+            redirtied: false,
+        }
+    );
+    assert!(pc.page_marks(page).expect("marks").writeback);
+    assert_ne!(id.raw(), 0);
+}
+
+#[test]
 fn file_page_materialize_uses_frame_planner_before_compat_fetch() {
     let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
     setup_host_substrate();

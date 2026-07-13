@@ -874,6 +874,47 @@ impl PageContainer {
         ))
     }
 
+    /// Move one dirty file page into the L4 writeback queue.
+    ///
+    /// This is only admission: the backend planner and L6 executor own later
+    /// submission and completion. A failed admission restores the slot to
+    /// `Dirty`, so no request is left falsely in flight.
+    pub fn queue_file_page_writeback(&self, page: PageIndex) -> Option<PageIoRequestId> {
+        if !matches!(self.kind, PageContainerKind::File { .. }) {
+            return None;
+        }
+
+        let mut state = self.state.lock();
+        let writeback = state.file_page_slots.get(&page)?.begin_writeback().ok()?;
+        if state
+            .pages
+            .set_mark(page, PageCacheMark::Writeback)
+            .is_err()
+        {
+            if let Some(slot) = state.file_page_slots.get(&page) {
+                let _ = slot.abort_writeback(writeback.generation);
+            }
+            return None;
+        }
+        match state.file_io_service.submit(
+            self.io_manager_key(),
+            PageIoRange::new(page.as_u64(), 1),
+            PageIoOp::Writeback,
+            PageIoPriority::BackgroundWriteback,
+            PageIoFlags::WRITEBACK,
+            Some(writeback.generation),
+        ) {
+            Ok(id) => Some(id),
+            Err(_) => {
+                let _ = state.pages.clear_mark(page, PageCacheMark::Writeback);
+                if let Some(slot) = state.file_page_slots.get(&page) {
+                    let _ = slot.abort_writeback(writeback.generation);
+                }
+                None
+            }
+        }
+    }
+
     pub fn drive_file_io_service_once<F>(
         &self,
         budget: ServiceBudget,
