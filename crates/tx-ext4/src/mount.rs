@@ -4,6 +4,7 @@ use crate::adapter::step_engine::Cap;
 use alloc::sync::Arc;
 use tx_ext4_format::pager::BlockImage;
 use tx_subsystems::execution::Errno;
+use tx_subsystems::fs_iface::BackendPlanner;
 use tx_subsystems::page_backed::FsPageBacking;
 use tx_subsystems::vfs::structure::{FsObjectId, InodeMeta};
 use tx_subsystems::vfs::FsOps;
@@ -26,6 +27,10 @@ where
 
     pub fn fs_page_backing(&self) -> Arc<dyn FsPageBacking> {
         self.backend.clone().fs_page_backing_arc()
+    }
+
+    pub fn backend_planner(&self) -> Option<Arc<dyn BackendPlanner>> {
+        self.backend.backend_planner()
     }
 
     pub fn bind_mount_payload(&self, payload: &Cap<tx_subsystems::mount::MountPayload>) {

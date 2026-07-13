@@ -9,6 +9,7 @@ use alloc::vec::Vec;
 use tx_ext4_format::pager::{BlockImage, DirEntryLite, Ext4Pager, InodeMetaLite, InodeNo};
 use tx_ext4_format::Ext4FormatError;
 use tx_subsystems::execution::Errno;
+use tx_subsystems::fs_iface::BackendPlanner;
 use tx_subsystems::mount::{MountPayload, MountPayloadPin};
 use tx_subsystems::vfs::structure::DirCursor;
 use tx_subsystems::vfs::structure::{FsObjectId, InodeMeta, Timespec};
@@ -18,6 +19,7 @@ pub(crate) const READDIR_WINDOW_ENTRIES: usize = 64;
 
 pub(crate) struct Ext4FsInstance<I> {
     pager: Ext4PagerCell<I>,
+    backend_planner: Option<Arc<dyn BackendPlanner>>,
     lookup_cache: SpinMutex<LookupCache>,
     dir_cache: SpinMutex<DirCache>,
     inode_meta_cache: SpinMutex<InodeMetaCache>,
@@ -33,14 +35,27 @@ pub(crate) struct Ext4FsInstance<I> {
 
 impl<I: BlockImage> Ext4FsInstance<I> {
     pub(crate) fn open(image: I, read_only: bool) -> Result<Arc<Self>, Errno> {
+        Self::open_with_backend_planner(image, read_only, None)
+    }
+
+    pub(crate) fn open_with_backend_planner(
+        image: I,
+        read_only: bool,
+        backend_planner: Option<Arc<dyn BackendPlanner>>,
+    ) -> Result<Arc<Self>, Errno> {
         Ok(Arc::new(Self {
             pager: Ext4PagerCell::new(Ext4Pager::open(image).map_err(map_format_error)?),
+            backend_planner,
             lookup_cache: SpinMutex::new(LookupCache::empty()),
             dir_cache: SpinMutex::new(DirCache::empty()),
             inode_meta_cache: SpinMutex::new(InodeMetaCache::empty()),
             mount_pin: SpinMutex::new(None),
             read_only: AtomicBool::new(read_only),
         }))
+    }
+
+    pub(crate) fn backend_planner(&self) -> Option<Arc<dyn BackendPlanner>> {
+        self.backend_planner.clone()
     }
 
     pub(crate) fn bind_mount_payload(&self, payload: &Cap<MountPayload>) {
