@@ -80,7 +80,7 @@
         "cargo test -p tx-subsystems --lib page_backed",
         "cargo test -p tx-subsystems --lib io_manager"
       ],
-      "notes": "Landed redirty preservation, fsync-frontier classification, the missing Phase-0 PageContainer L4 compatibility baseline, and PageSlot dirty transitions for both planner and FsPageBacking write materialization. Source-lease installation, writeback completion routing, and live fsync frontier waiting remain pending before this step can complete. Legacy flush_page may Yield without an L4 completion owner, so it must not transition a slot into async Writeback until that bridge exists."
+      "notes": "Landed redirty preservation, fsync-frontier classification, the missing Phase-0 PageContainer L4 compatibility baseline, and PageSlot dirty transitions for both planner and FsPageBacking write materialization. PageContainer now admits dirty pages to L4 writeback, retains PageCache leases through planning/execution, routes terminal WritebackFinished completion into the generation-checked slot FSM, and rolls back leases/marks/slots on unplanned or queue-rejected submission. The remaining 6B requirement is a live fsync frontier that submits or waits on these L4 writebacks. Legacy flush_page may Yield without an L4 completion owner, so it must not transition a slot into async Writeback until that bridge exists."
     },
     {
       "id": "6c-ext4-read-planner",
