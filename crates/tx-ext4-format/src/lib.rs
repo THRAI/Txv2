@@ -2,6 +2,7 @@
 
 extern crate alloc;
 
+pub mod journal;
 pub mod ondisk;
 pub mod mapping;
 pub mod pager;
