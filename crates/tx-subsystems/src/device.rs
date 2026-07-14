@@ -1,14 +1,34 @@
 //! Device and block-handle shells shared by devfs, bdev-fs, and backends.
 
+use alloc::collections::VecDeque;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::fmt;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use crate::adapter::step_engine::{ByteProgress, NoProgress, StepOutcome};
+use crate::adapter::step_engine::{
+    self as step_engine, ByteProgress, Cap, NoProgress, ScriptCtx, SpinMutex, StepOp, StepOutcome,
+    SubjectIdentity,
+};
+use crate::adapter::wait_routing::WaitOutcome;
 
 use crate::execution::{Errno, Guard};
-use crate::page_backed::Frame;
+use crate::io_manager::backend::{BlockPageCompletion, BlockPageRequestTracker, PageFrameRef};
+use crate::io_manager::block::{
+    BioVec, BlockCompletionSource, BlockDeviceCompletion, BlockDispatch, BlockDispatchExecutor,
+    BlockOp, BlockQueue, BlockServiceDriver, BlockServiceNext, BlockTagTable, DeviceKey,
+};
+use crate::io_manager::page::service::{
+    PageService, PageServiceBackendDriven, PageServiceTaggedBlockCompletionError,
+};
+use crate::io_manager::page::PageIoOp;
+use crate::io_manager::runtime::{
+    IoServiceKind, QueueDepth, ServiceBudget, ServiceKick, ServiceWakeSource,
+};
+use crate::page_backed::{FileBlockServiceTurn, Frame, PageContainer};
 
 const MAX_STATIC_BLOCK_DEVICES: usize = 16;
+const FILE_IO_SERVICE_SOURCE_ID_BASE: u64 = 0x7200;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct DevT(u64);
@@ -218,6 +238,487 @@ impl fmt::Debug for BlockDeviceHandle {
     }
 }
 
+pub struct BlockDeviceDispatchAdapter<'a, 'g> {
+    handle: BlockDeviceHandle,
+    guard: &'a Guard<'g>,
+    completions: VecDeque<BlockDeviceCompletion>,
+}
+
+impl<'a, 'g> BlockDeviceDispatchAdapter<'a, 'g> {
+    pub fn new(handle: BlockDeviceHandle, guard: &'a Guard<'g>) -> Self {
+        Self {
+            handle,
+            guard,
+            completions: VecDeque::new(),
+        }
+    }
+
+    fn execute_dispatch(&self, dispatch: &BlockDispatch) -> Result<(), Errno> {
+        if dispatch.bio.plan.device != DeviceKey::new(self.handle.registration().devt.raw()) {
+            return Err(Errno::ENODEV);
+        }
+
+        match dispatch.bio.plan.op {
+            BlockOp::Read => {
+                let mut frames = frames_from_bio_vecs(&dispatch.bio.plan.vecs)?;
+                step_result_to_result(self.handle.read_blocks(
+                    dispatch.bio.plan.lba.start_lba(),
+                    &mut frames,
+                    self.guard,
+                ))
+            }
+            BlockOp::Write => {
+                let frames = frames_from_bio_vecs(&dispatch.bio.plan.vecs)?;
+                step_result_to_result(self.handle.write_blocks(
+                    dispatch.bio.plan.lba.start_lba(),
+                    &frames,
+                    self.guard,
+                ))
+            }
+            BlockOp::Flush | BlockOp::Barrier => {
+                step_result_to_result(self.handle.barrier(self.guard))
+            }
+        }
+    }
+}
+
+impl BlockDispatchExecutor for BlockDeviceDispatchAdapter<'_, '_> {
+    fn submit(&mut self, dispatch: &BlockDispatch) {
+        let result = self.execute_dispatch(dispatch);
+        self.completions
+            .push_back(BlockDeviceCompletion::new(dispatch.tag, result));
+    }
+}
+
+impl BlockCompletionSource for BlockDeviceDispatchAdapter<'_, '_> {
+    fn poll_completion(&mut self) -> Option<BlockDeviceCompletion> {
+        self.completions.pop_front()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockDeviceServiceTurn {
+    pub dispatched: usize,
+    pub device_completions: usize,
+    pub page_completions: usize,
+    pub next: BlockServiceNext,
+    pub kicks: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlockDeviceServiceError {
+    Page(PageServiceTaggedBlockCompletionError),
+}
+
+impl From<PageServiceTaggedBlockCompletionError> for BlockDeviceServiceError {
+    fn from(error: PageServiceTaggedBlockCompletionError) -> Self {
+        Self::Page(error)
+    }
+}
+
+pub fn drive_block_device_service_once<F>(
+    handle: BlockDeviceHandle,
+    guard: &Guard<'_>,
+    block_driver: &mut BlockServiceDriver,
+    block_queue: &mut BlockQueue,
+    depth: &mut QueueDepth,
+    tags: &mut BlockTagTable,
+    tracker: &mut BlockPageRequestTracker,
+    page_service: &mut PageService,
+    kick: F,
+) -> Result<BlockDeviceServiceTurn, BlockDeviceServiceError>
+where
+    F: FnMut(ServiceKick) -> bool,
+{
+    let mut adapter = BlockDeviceDispatchAdapter::new(handle, guard);
+    let driven =
+        block_driver.drive_once_with_executor(block_queue, depth, tags, &mut adapter, kick);
+    let mut device_completions = 0usize;
+    let mut page_completions = 0usize;
+
+    while let Some(completion) = adapter.poll_completion() {
+        device_completions += 1;
+        let outcome = page_service.push_tagged_block_completion(
+            tags,
+            depth,
+            tracker,
+            completion.tag,
+            completion.result,
+            page_frame_ref_for_block_completion,
+        )?;
+        page_completions += outcome.queued;
+    }
+
+    Ok(BlockDeviceServiceTurn {
+        dispatched: driven.step.dispatches.len(),
+        device_completions,
+        page_completions,
+        next: driven.step.next,
+        kicks: driven.kicks,
+    })
+}
+
+pub fn drive_page_container_file_block_device_service_once<F>(
+    container: &PageContainer,
+    budget: ServiceBudget,
+    handle: BlockDeviceHandle,
+    guard: &Guard<'_>,
+    kick: F,
+) -> Result<FileBlockServiceTurn, PageServiceTaggedBlockCompletionError>
+where
+    F: FnMut(ServiceKick) -> bool,
+{
+    let mut adapter = BlockDeviceDispatchAdapter::new(handle, guard);
+    container.drive_file_block_io_service_once(
+        budget,
+        &mut adapter,
+        page_frame_ref_for_block_completion,
+        kick,
+    )
+}
+
+#[derive(Debug)]
+pub struct PageContainerFileIoServiceTurn {
+    pub page_before: Option<PageServiceBackendDriven>,
+    pub block: FileBlockServiceTurn,
+    pub page_after: Option<PageServiceBackendDriven>,
+    pub next: PageContainerFileIoServiceNext,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PageContainerFileIoServiceNext {
+    Runnable,
+    WaitingForCompletion,
+    Sleeping,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PageContainerFileIoServiceTaskConfig {
+    pub max_ready_turns: Option<usize>,
+    pub page_budget: ServiceBudget,
+    pub block_budget: ServiceBudget,
+}
+
+impl PageContainerFileIoServiceTaskConfig {
+    pub const fn run_forever(page_budget: ServiceBudget, block_budget: ServiceBudget) -> Self {
+        Self {
+            max_ready_turns: None,
+            page_budget,
+            block_budget,
+        }
+    }
+
+    pub const fn run_turns(
+        max_ready_turns: usize,
+        page_budget: ServiceBudget,
+        block_budget: ServiceBudget,
+    ) -> Self {
+        Self {
+            max_ready_turns: Some(max_ready_turns),
+            page_budget,
+            block_budget,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct PageContainerFileIoServiceTaskReport {
+    pub waits_ready: usize,
+    pub waits_failed: usize,
+    pub ready_turns: usize,
+    pub dispatched: usize,
+    pub device_completions: usize,
+    pub page_completions: usize,
+    pub self_kicks: usize,
+    pub last_turn: Option<PageContainerFileIoServiceTurn>,
+}
+
+#[derive(Clone)]
+pub struct PageContainerFileIoServiceRuntime {
+    container: Cap<PageContainer>,
+    handle: BlockDeviceHandle,
+    wake_source: Arc<ServiceWakeSource>,
+}
+
+impl PageContainerFileIoServiceRuntime {
+    pub fn new(
+        container: Cap<PageContainer>,
+        handle: BlockDeviceHandle,
+        wake_source: Arc<ServiceWakeSource>,
+    ) -> Self {
+        Self {
+            container,
+            handle,
+            wake_source,
+        }
+    }
+
+    pub fn container(&self) -> &Cap<PageContainer> {
+        &self.container
+    }
+
+    pub const fn handle(&self) -> BlockDeviceHandle {
+        self.handle
+    }
+
+    pub fn wake_source(&self) -> &Arc<ServiceWakeSource> {
+        &self.wake_source
+    }
+
+    pub fn kick(&self, service: IoServiceKind) -> usize {
+        post_file_io_service_kick(&self.wake_source, ServiceKick::new(service)) as usize
+    }
+}
+
+static FILE_IO_SERVICE_RUNTIMES: SpinMutex<Vec<PageContainerFileIoServiceRuntime>> =
+    SpinMutex::new(Vec::new());
+static NEXT_FILE_IO_SERVICE_SOURCE_ID: AtomicU64 = AtomicU64::new(FILE_IO_SERVICE_SOURCE_ID_BASE);
+
+pub fn register_page_container_file_io_service(
+    container: Cap<PageContainer>,
+    handle: BlockDeviceHandle,
+) -> PageContainerFileIoServiceRuntime {
+    let source_id = NEXT_FILE_IO_SERVICE_SOURCE_ID.fetch_add(1, Ordering::AcqRel);
+    let wake_source = Arc::new(ServiceWakeSource::new(source_id));
+    let _ = container.attach_file_io_wake_source(Arc::clone(&wake_source));
+    let runtime = PageContainerFileIoServiceRuntime::new(
+        container,
+        handle,
+        wake_source,
+    );
+    FILE_IO_SERVICE_RUNTIMES.lock().push(runtime.clone());
+    runtime
+}
+
+pub fn page_container_file_io_service_runtimes_snapshot() -> Vec<PageContainerFileIoServiceRuntime>
+{
+    FILE_IO_SERVICE_RUNTIMES.lock().clone()
+}
+
+pub fn page_container_file_io_service_runtime_count() -> usize {
+    FILE_IO_SERVICE_RUNTIMES.lock().len()
+}
+
+pub async fn page_container_file_io_service_task_loop_owned(
+    runtime: PageContainerFileIoServiceRuntime,
+    config: PageContainerFileIoServiceTaskConfig,
+) -> PageContainerFileIoServiceTaskReport {
+    page_container_file_io_service_task_loop(
+        &runtime.container,
+        runtime.handle,
+        &runtime.wake_source,
+        config,
+    )
+    .await
+}
+
+pub async fn page_container_file_io_service_task_loop(
+    container: &PageContainer,
+    handle: BlockDeviceHandle,
+    wake_source: &ServiceWakeSource,
+    config: PageContainerFileIoServiceTaskConfig,
+) -> PageContainerFileIoServiceTaskReport {
+    let mut report = PageContainerFileIoServiceTaskReport::default();
+    while config
+        .max_ready_turns
+        .is_none_or(|max_ready_turns| report.ready_turns < max_ready_turns)
+    {
+        let wait = crate::wait_source::wait_on_registered_endpoint(
+            wake_source.wake_endpoint(),
+            file_io_service_interest_mask(),
+        );
+        if wait.await != WaitOutcome::Ready {
+            report.waits_failed += 1;
+            break;
+        }
+
+        report.waits_ready += 1;
+        report.ready_turns += 1;
+        let guard = step_engine::guard();
+        let turn = match drive_page_container_file_io_service_once(
+            container,
+            config.page_budget,
+            config.block_budget,
+            handle,
+            &guard,
+            |kick| post_file_io_service_kick(wake_source, kick),
+        ) {
+            Ok(turn) => turn,
+            Err(_) => {
+                report.waits_failed += 1;
+                break;
+            }
+        };
+
+        report.dispatched += turn.block.dispatched;
+        report.device_completions += turn.block.device_completions;
+        report.page_completions += turn.block.page_completions;
+        report.self_kicks += turn.block.kicks
+            + turn
+                .page_before
+                .as_ref()
+                .map(|turn| turn.kicks)
+                .unwrap_or(0)
+            + turn.page_after.as_ref().map(|turn| turn.kicks).unwrap_or(0);
+        report.last_turn = Some(turn);
+    }
+
+    report
+}
+
+fn file_io_service_interest_mask() -> u64 {
+    IoServiceKind::Page.mask_bits()
+        | IoServiceKind::Block.mask_bits()
+        | IoServiceKind::Driver.mask_bits()
+}
+
+fn post_file_io_service_kick(wake_source: &ServiceWakeSource, kick: ServiceKick) -> bool {
+    wake_source.kick_with_post(kick, |mailbox, event| mailbox.post(event)) != 0
+}
+
+pub fn drive_page_container_file_io_service_once<F>(
+    container: &PageContainer,
+    page_budget: ServiceBudget,
+    block_budget: ServiceBudget,
+    handle: BlockDeviceHandle,
+    guard: &Guard<'_>,
+    mut kick: F,
+) -> Result<PageContainerFileIoServiceTurn, PageServiceTaggedBlockCompletionError>
+where
+    F: FnMut(ServiceKick) -> bool,
+{
+    let page_before = container.drive_file_io_service_once_owned(page_budget, &mut kick);
+    let block = drive_page_container_file_block_device_service_once(
+        container,
+        block_budget,
+        handle,
+        guard,
+        &mut kick,
+    )?;
+    let page_after = if block.page_completions == 0 {
+        None
+    } else {
+        container.drive_file_io_service_once_owned(page_budget, &mut kick)
+    };
+    let next = page_container_file_io_next(&page_before, &block, &page_after);
+
+    Ok(PageContainerFileIoServiceTurn {
+        page_before,
+        block,
+        page_after,
+        next,
+    })
+}
+
+/// `StepOp` wrapper for one bounded PageContainer file-I/O service turn.
+#[allow(dead_code)] // scheduler glue lands incrementally; tests exercise the seam now.
+pub struct PageContainerFileIoServiceOp<'a, F> {
+    pub container: &'a PageContainer,
+    pub page_budget: ServiceBudget,
+    pub block_budget: ServiceBudget,
+    pub handle: BlockDeviceHandle,
+    pub kick: F,
+}
+
+impl<'a, F> PageContainerFileIoServiceOp<'a, F> {
+    pub const fn new(
+        container: &'a PageContainer,
+        page_budget: ServiceBudget,
+        block_budget: ServiceBudget,
+        handle: BlockDeviceHandle,
+        kick: F,
+    ) -> Self {
+        Self {
+            container,
+            page_budget,
+            block_budget,
+            handle,
+            kick,
+        }
+    }
+}
+
+impl<I, F> StepOp<I> for PageContainerFileIoServiceOp<'_, F>
+where
+    I: SubjectIdentity,
+    F: FnMut(ServiceKick) -> bool,
+{
+    type Output = PageContainerFileIoServiceTurn;
+    type Progress = NoProgress;
+
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let guard = step_engine::guard();
+        match drive_page_container_file_io_service_once(
+            self.container,
+            self.page_budget,
+            self.block_budget,
+            self.handle,
+            &guard,
+            &mut self.kick,
+        ) {
+            Ok(turn) => StepOutcome::Done(turn),
+            Err(_) => StepOutcome::Err(Errno::EIO.into()),
+        }
+    }
+}
+
+fn page_container_file_io_next(
+    page_before: &Option<PageServiceBackendDriven>,
+    block: &FileBlockServiceTurn,
+    page_after: &Option<PageServiceBackendDriven>,
+) -> PageContainerFileIoServiceNext {
+    let page_runnable = page_before.as_ref().is_some_and(|turn| {
+        turn.next == crate::io_manager::page::service::PageServiceNext::Runnable
+    }) || page_after.as_ref().is_some_and(|turn| {
+        turn.next == crate::io_manager::page::service::PageServiceNext::Runnable
+    });
+    if page_runnable || block.next == BlockServiceNext::Runnable {
+        PageContainerFileIoServiceNext::Runnable
+    } else if block.next == BlockServiceNext::WaitingForCompletion {
+        PageContainerFileIoServiceNext::WaitingForCompletion
+    } else {
+        PageContainerFileIoServiceNext::Sleeping
+    }
+}
+
+fn page_frame_ref_for_block_completion(completion: &BlockPageCompletion) -> Option<PageFrameRef> {
+    if completion.block_completion().result.is_err()
+        || !matches!(
+            completion.request().op,
+            PageIoOp::Read | PageIoOp::Readahead
+        )
+    {
+        return None;
+    }
+    let vec = completion.block_completion().plan.vecs.first()?;
+    if vec.offset != 0 || vec.len == 0 {
+        return None;
+    }
+    Some(PageFrameRef::new(tx_hal::Ppn(vec.buffer_key as usize)))
+}
+
+fn frames_from_bio_vecs(vecs: &[BioVec]) -> Result<Vec<Frame>, Errno> {
+    if vecs.is_empty() {
+        return Err(Errno::EINVAL);
+    }
+    let mut frames = Vec::with_capacity(vecs.len());
+    for vec in vecs {
+        if vec.offset != 0 || vec.len == 0 {
+            return Err(Errno::EINVAL);
+        }
+        frames.push(Frame::new(tx_hal::Ppn(vec.buffer_key as usize)));
+    }
+    Ok(frames)
+}
+
+fn step_result_to_result(outcome: StepOutcome<(), NoProgress>) -> Result<(), Errno> {
+    match outcome {
+        StepOutcome::Done(()) => Ok(()),
+        StepOutcome::Err(errno) => Err(errno),
+        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => Err(Errno::EAGAIN),
+    }
+}
+
 static BLOCK_REGISTRY_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static BLOCK_REGISTRY_LEN: AtomicUsize = AtomicUsize::new(0);
 static mut BLOCK_REGISTRY: [Option<&'static BlockDeviceRegistration>; MAX_STATIC_BLOCK_DEVICES] =
@@ -288,9 +789,16 @@ pub fn reset_block_registry_for_test() {
     BLOCK_REGISTRY_INITIALIZED.store(false, Ordering::Release);
 }
 
+#[cfg(any(test, feature = "test-support"))]
+pub fn reset_page_container_file_io_service_registry_for_test() {
+    FILE_IO_SERVICE_RUNTIMES.lock().clear();
+    NEXT_FILE_IO_SERVICE_SOURCE_ID.store(FILE_IO_SERVICE_SOURCE_ID_BASE, Ordering::Release);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::page_backed::{AnonSwapPolicy, PageContainerKind};
     use tx_hal::Ppn;
 
     struct RecordingBlockDevice;
@@ -400,5 +908,43 @@ mod tests {
             StepOutcome::Err(Errno::EEXIST.into())
         );
         assert!(block_device_snapshot().is_empty());
+    }
+
+    #[test]
+    fn file_io_service_registry_snapshots_owned_runtime_for_reactor_submission() {
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        crate::zones::register_all().expect("kernel zones");
+        reset_page_container_file_io_service_registry_for_test();
+        let pc = PageContainer::new_cap(
+            PageContainerKind::Anon {
+                swap_policy: AnonSwapPolicy::Reclaimable,
+            },
+            1,
+        )
+        .expect("page container cap");
+
+        let runtime = register_page_container_file_io_service(
+            pc.clone(),
+            BlockDeviceHandle::whole(&BLOCK_REG),
+        );
+        let snapshot = page_container_file_io_service_runtimes_snapshot();
+
+        assert_eq!(page_container_file_io_service_runtime_count(), 1);
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(runtime.container().page_count(), 1);
+        assert_eq!(snapshot[0].container().page_count(), 1);
+        assert_eq!(snapshot[0].handle().registration().devt, BLOCK_REG.devt);
+        assert_eq!(snapshot[0].handle().start_lba(), 0);
+        assert_eq!(snapshot[0].handle().len_lba(), BLOCK_REG.ops.total_blocks());
+        assert_eq!(
+            snapshot[0].wake_source().source_id(),
+            FILE_IO_SERVICE_SOURCE_ID_BASE
+        );
+
+        reset_page_container_file_io_service_registry_for_test();
+        assert!(page_container_file_io_service_runtimes_snapshot().is_empty());
     }
 }
