@@ -17392,6 +17392,21 @@
 
 ## Latest Research
 
+- 2026-07-14 (reactor refactor design approved).
+  The design in
+  `docs/superpowers/specs/2026-07-14-reactor-refactor-design.md` defines a
+  correctness-first convergence: one authoritative `TaskControl`,
+  generation/epoch-bearing run tokens, transition-sensitive wake ingress,
+  scheduler policy separated from hart-owned runqueues, one poll/commit
+  implementation, per-thread userspace rendezvous ownership, and staged
+  compatibility retirement. The initial implementation retains
+  `Vec<TaskSlot>` and a shared wake ingress; segmented storage and per-hart wake
+  sharding require measurements. Verification for this documentation slice is
+  docs lint, progress validation, and diff checking. Next step is user review,
+  then a phase-by-phase implementation plan. Blocker: the dirty checkout has
+  existing Reactor test/API drift that Phase 0 must repair before using focused
+  tests as correctness gates.
+
 - `docs/progress/research/2026-05-07-interface-drift-audit.md`
 - `docs/progress/research/2026-05-04-vm-pagebacked-midway-checkpoint.md`
 - `docs/progress/research/2026-05-04-vm-pagebacked-gap-update.md`
