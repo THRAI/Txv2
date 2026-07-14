@@ -11,12 +11,95 @@ pub const JBD2_MAGIC: u32 = 0xC03B_3998;
 pub const JBD2_BLOCK_DESCRIPTOR: u32 = 1;
 pub const JBD2_BLOCK_COMMIT: u32 = 2;
 pub const JBD2_BLOCK_REVOKE: u32 = 5;
+pub const JBD2_BLOCK_SIZE: usize = 4096;
 
 const TAG_ESCAPE: u16 = 0x0001;
 const TAG_SAME_UUID: u16 = 0x0002;
 const TAG_DELETED: u16 = 0x0004;
 const TAG_LAST: u16 = 0x0008;
 const TAG_UNSUPPORTED: u16 = !(TAG_ESCAPE | TAG_SAME_UUID | TAG_DELETED | TAG_LAST);
+
+/// One metadata home block copied into a JBD2 transaction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Jbd2MetadataUpdate {
+    pub home_block: u32,
+    pub bytes: [u8; JBD2_BLOCK_SIZE],
+}
+
+impl Jbd2MetadataUpdate {
+    pub const fn new(home_block: u32, bytes: [u8; JBD2_BLOCK_SIZE]) -> Self {
+        Self { home_block, bytes }
+    }
+}
+
+/// Encoded record pages for one legacy 32-bit JBD2 transaction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Jbd2TransactionImage {
+    pub descriptor: [u8; JBD2_BLOCK_SIZE],
+    pub metadata_blocks: Vec<[u8; JBD2_BLOCK_SIZE]>,
+    pub commit: [u8; JBD2_BLOCK_SIZE],
+}
+
+impl Jbd2TransactionImage {
+    /// Encode a legacy descriptor, its metadata journal copies, and commit page.
+    ///
+    /// Checksum production and 64-bit tag layouts are deliberately deferred.
+    /// Metadata that begins with the JBD2 magic is escaped in the journal copy;
+    /// replay restores the magic after observing the descriptor tag.
+    pub fn encode_legacy(
+        sequence: u32,
+        journal_uuid: [u8; 16],
+        updates: Vec<Jbd2MetadataUpdate>,
+    ) -> Result<Self> {
+        if updates.is_empty() {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        let update_count = updates.len();
+        let mut tags = Vec::new();
+        let mut metadata_blocks = Vec::new();
+        for (index, update) in updates.into_iter().enumerate() {
+            let mut bytes = update.bytes;
+            let escaped = bytes[..4] == JBD2_MAGIC.to_be_bytes();
+            if escaped {
+                bytes[..4].fill(0);
+            }
+            let mut tag = Jbd2Tag::new(
+                update.home_block,
+                0,
+                (index == 0).then_some(journal_uuid),
+                index != 0,
+            );
+            tag.escaped = escaped;
+            tag.last = index + 1 == update_count;
+            tags.push(tag);
+            metadata_blocks.push(bytes);
+        }
+
+        let mut descriptor = [0; JBD2_BLOCK_SIZE];
+        Jbd2Descriptor {
+            header: Jbd2Header::descriptor(sequence),
+            tags,
+        }
+        .encode_legacy(&mut descriptor)?;
+
+        let mut commit = [0; JBD2_BLOCK_SIZE];
+        Jbd2Commit {
+            header: Jbd2Header::commit(sequence),
+            checksum_type: 0,
+            checksum_size: 0,
+            checksums: [0; 8],
+            seconds: 0,
+            nanoseconds: 0,
+        }
+        .encode(&mut commit)?;
+
+        Ok(Self {
+            descriptor,
+            metadata_blocks,
+            commit,
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Jbd2Header {
