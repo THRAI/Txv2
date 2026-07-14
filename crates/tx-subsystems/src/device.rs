@@ -481,11 +481,7 @@ pub fn register_page_container_file_io_service(
     let source_id = NEXT_FILE_IO_SERVICE_SOURCE_ID.fetch_add(1, Ordering::AcqRel);
     let wake_source = Arc::new(ServiceWakeSource::new(source_id));
     let _ = container.attach_file_io_wake_source(Arc::clone(&wake_source));
-    let runtime = PageContainerFileIoServiceRuntime::new(
-        container,
-        handle,
-        wake_source,
-    );
+    let runtime = PageContainerFileIoServiceRuntime::new(container, handle, wake_source);
     FILE_IO_SERVICE_RUNTIMES.lock().push(runtime.clone());
     runtime
 }

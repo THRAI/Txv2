@@ -1190,8 +1190,8 @@ impl<P: TxPlatform> CoreInit<P> {
     /// already populated, `/dev` already created in tmpfs) and precede
     /// `bind_init_cwd_and_root`.
     pub(crate) fn mount_sdcard_at_musl() {
-        use tx_fs::tx_ext4::{mount_ext4_read_write, BlockDeviceImage};
-        use tx_subsystems::device::block_device_by_name;
+        use tx_fs::tx_ext4::{mount_ext4_read_write, BlockDeviceImage, Ext4FileIoRuntimeBinder};
+        use tx_subsystems::device::{block_device_by_name, BlockDeviceHandle};
 
         let Some(reg) = block_device_by_name(b"vda") else {
             return;
@@ -1215,6 +1215,9 @@ impl<P: TxPlatform> CoreInit<P> {
                 return;
             }
         };
+        mount_output.set_file_page_container_binder(Some(alloc::sync::Arc::new(
+            Ext4FileIoRuntimeBinder::new(BlockDeviceHandle::whole(reg)),
+        )));
 
         let root_mount = ROOT_MOUNT
             .lock()

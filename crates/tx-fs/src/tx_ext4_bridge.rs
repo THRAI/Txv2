@@ -16,9 +16,38 @@ use crate::devfs::adapter::step_engine::{
 use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
 use tx_ext4_format::{Ext4FormatError, Result};
 use tx_ext4::planner::Ext4BlockGeometry;
-use tx_subsystems::device::{BlockDevice, PhysicalBlockNumber};
+use tx_subsystems::device::{self, BlockDevice, BlockDeviceHandle, PhysicalBlockNumber};
 use tx_subsystems::io_manager::block::DeviceKey;
-use tx_subsystems::page_backed::Frame;
+use tx_subsystems::page_backed::{Frame, PageContainer};
+
+/// Concrete L5-to-L6 binder for one mounted ext4 block device.
+///
+/// Mount code supplies the registered handle explicitly.  The bridge never
+/// derives a device identity from the image's `dyn BlockDevice`, because that
+/// would make a partition or layered device indistinguishable from its parent.
+#[derive(Clone, Copy, Debug)]
+pub struct Ext4FileIoRuntimeBinder {
+    handle: BlockDeviceHandle,
+}
+
+impl Ext4FileIoRuntimeBinder {
+    pub const fn new(handle: BlockDeviceHandle) -> Self {
+        Self { handle }
+    }
+
+    pub const fn handle(self) -> BlockDeviceHandle {
+        self.handle
+    }
+}
+
+impl tx_ext4::mount::FilePageContainerBinder for Ext4FileIoRuntimeBinder {
+    fn bind_file_page_container(
+        &self,
+        container: tx_subsystems::adapter::step_engine::Cap<PageContainer>,
+    ) {
+        let _runtime = device::register_page_container_file_io_service(container, self.handle);
+    }
+}
 
 /// A `BlockImage` that reads through a kernel block device.
 ///
@@ -225,7 +254,9 @@ impl ReadBlockCache {
 mod tests {
     use super::*;
     use crate::devfs::adapter::step_engine::{page_allocator, NoProgress};
-    use tx_subsystems::device::{BlockDeviceOps, PhysicalBlockNumber};
+    use tx_subsystems::device::{
+        BlockDeviceHandle, BlockDeviceOps, BlockDeviceRegistration, DevT, PhysicalBlockNumber,
+    };
     use tx_subsystems::execution::Guard;
 
     #[test]
@@ -304,6 +335,11 @@ mod tests {
 
     static CONTINUE_DEVICE: BlockingBlockDevice = BlockingBlockDevice::new(BlockingMode::Continue);
     static YIELD_DEVICE: BlockingBlockDevice = BlockingBlockDevice::new(BlockingMode::Yield);
+    static FILE_IO_REGISTRATION: BlockDeviceRegistration = BlockDeviceRegistration {
+        devt: DevT::new(8, 65),
+        name: "ext4-test",
+        ops: &CONTINUE_DEVICE,
+    };
 
     fn init_bridge_test() {
         tx_test_support::init_host();
@@ -347,5 +383,34 @@ mod tests {
             BlockDeviceImage::new(&YIELD_DEVICE).write_block(0, &data),
             Err(Ext4FormatError::WouldBlock)
         );
+    }
+
+    #[test]
+    fn ext4_file_io_runtime_binder_registers_supplied_block_handle() {
+        let _serial = crate::test_support::FS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        init_bridge_test();
+        tx_subsystems::zones::register_all().expect("tx-subsystems zones");
+        tx_subsystems::device::reset_page_container_file_io_service_registry_for_test();
+
+        let container = tx_subsystems::page_backed::PageContainer::new_cap(
+            tx_subsystems::page_backed::PageContainerKind::Anon {
+                swap_policy: tx_subsystems::page_backed::AnonSwapPolicy::Reclaimable,
+            },
+            1,
+        )
+        .expect("page container cap");
+        let binder = Ext4FileIoRuntimeBinder::new(BlockDeviceHandle::whole(&FILE_IO_REGISTRATION));
+
+        tx_ext4::mount::FilePageContainerBinder::bind_file_page_container(&binder, container);
+
+        let runtimes = tx_subsystems::device::page_container_file_io_service_runtimes_snapshot();
+        assert_eq!(runtimes.len(), 1);
+        assert_eq!(
+            runtimes[0].handle().registration().devt,
+            FILE_IO_REGISTRATION.devt
+        );
+        tx_subsystems::device::reset_page_container_file_io_service_registry_for_test();
     }
 }
