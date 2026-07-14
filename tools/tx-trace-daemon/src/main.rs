@@ -3,10 +3,25 @@
 //! OBS-5: `replay` subcommand with `--out json` (newline-delimited JSON).
 //! OBS-6: `replay` subcommand with `--out pftrace --output <path>` (binary Perfetto trace).
 
-mod decode;
-mod emit_json;
-mod perfetto;
-mod replay;
+mod l4_readers;
+mod l5_canonical;
+mod l6_views;
+
+mod decode {
+    pub use crate::l5_canonical::decode::*;
+}
+
+mod emit_json {
+    pub use crate::l6_views::emit_json::*;
+}
+
+mod perfetto {
+    pub use crate::l6_views::perfetto::*;
+}
+
+mod replay {
+    pub use crate::l4_readers::replay::*;
+}
 
 use clap::{Parser, Subcommand};
 

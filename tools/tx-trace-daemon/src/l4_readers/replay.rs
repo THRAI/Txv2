@@ -30,27 +30,35 @@
 //! the raw bytes at their spec'd offsets in `TxTraceHartRing`.
 
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::fs::{self, File};
+use std::io::{BufWriter, Write};
 use std::mem::size_of;
 use std::path::Path;
-use std::time::{Duration, Instant};
 
-use memmap2::MmapOptions;
-use object::{Object, ObjectSymbol};
 use serde::Serialize;
 use tx_observe_types::header::TX_TRACE_MAGIC;
 use tx_observe_types::{TxTraceHartRing, TxTraceHeader, TxTraceRecord};
 
-use crate::decode::{decode_slot, DecodedEvent};
+use crate::decode::DecodedEvent;
 use crate::emit_json;
+use crate::l4_readers::{RawRecordFrame, TraceInputKind, TraceIntegrity};
+use crate::l5_canonical::decode::decode_frame;
+use crate::l5_canonical::{CanonicalDecoder, DecodeBatch, TraceDecoder, TraceEventStream};
+use crate::l6_views::ProjectionInput;
 use crate::perfetto::writer::PftraceWriter;
 
+#[cfg(test)]
+use super::live::{
+    drain_live_once, finalize_live_raw_records, guest_ram_offset_for_symbol, LiveDrainTotals,
+    LiveRingLayout, LIVE_RAW_RECORD_HEADER_BYTES, RING_SEQ_OFF,
+};
+pub use super::live::{run_live_guest_mem, LiveDrainConfig};
+
 /// Maximum hart count the daemon will accept (§4.1 of the host doc).
-const MAX_HARTS_DAEMON: u16 = 256;
+pub(super) const MAX_HARTS_DAEMON: u16 = 256;
 
 /// Supported header version.
-const SUPPORTED_HEADER_VERSION: u16 = 0;
+pub(super) const SUPPORTED_HEADER_VERSION: u16 = 0;
 
 /// Supported record size (bytes).
 const SUPPORTED_RECORD_SIZE: u16 = 80;
@@ -60,17 +68,11 @@ const SUPPORTED_RECORD_SIZE: u16 = 80;
 /// comment and `08_OBSERVATION_SERIALIZATION_v0.md §4`:
 ///   offset  64: producer: AtomicU64  (8 bytes)
 ///   offset 128: consumer: AtomicU64  (8 bytes)
-const RING_PRODUCER_OFF: usize = 64;
-const RING_CONSUMER_OFF: usize = 128;
-pub(crate) const RING_LOST_OFF: usize = 192;
-const RING_SEQ_OFF: usize = 200;
+pub(super) const RING_PRODUCER_OFF: usize = 64;
+pub(super) const RING_CONSUMER_OFF: usize = 128;
+pub(super) const RING_LOST_OFF: usize = 192;
 
 const RECORD_MAGIC: u16 = 0x5254;
-const RV64_QEMU_RAM_BASE: u64 = 0x8000_0000;
-const RV64_QEMU_KERNEL_PHYS_BASE: u64 = 0x8020_0000;
-const RV64_QEMU_KERNEL_VIRT_BASE: u64 = 0xffff_ffff_8020_0000;
-const DEFAULT_LIVE_POLL_MS: u64 = 2;
-const LIVE_RAW_RECORD_HEADER_BYTES: usize = 8;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct RingStats {
@@ -98,20 +100,6 @@ pub struct TraceStats {
     pub rings: Vec<RingStats>,
 }
 
-pub struct LiveDrainConfig<'a> {
-    pub guest_mem: &'a Path,
-    pub kernel: &'a Path,
-    pub out_dir: &'a Path,
-    pub symbol: &'a str,
-    pub hart_count: usize,
-    pub ring_bytes: usize,
-    pub stop_file: Option<&'a Path>,
-    pub poll_ms: u64,
-    pub max_duration_ms: Option<u64>,
-    pub finalize: bool,
-    pub names_map: Option<HashMap<u32, String>>,
-}
-
 /// Run the file-replay transport.
 ///
 /// Opens `path`, validates the header, then iterates over all hart rings and
@@ -121,10 +109,14 @@ pub struct LiveDrainConfig<'a> {
 /// If `min_level` is `Some(n)`, records whose `level` byte is < n are dropped.
 pub fn run(path: &Path, min_level: Option<u8>) -> std::io::Result<()> {
     let data = std::fs::read(path)?;
-    let events = decode_file_bytes(&data)
+    let stream = decode_file_stream(&data)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-    for event in &events {
+    if min_level.is_none() {
+        return emit_json::emit_projection(ProjectionInput::new(&stream));
+    }
+
+    for event in stream.events() {
         // Apply level filter if requested.
         if let Some(min) = min_level {
             if let DecodedEvent::Record(r) = event {
@@ -156,7 +148,7 @@ pub fn run_pftrace(
     let (clock_id, clock_freq_hz, boot_id) = read_header_meta(&data)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-    let events = decode_file_bytes(&data)
+    let stream = decode_file_stream(&data)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
     let mut writer = PftraceWriter::new(clock_id, clock_freq_hz, boot_id);
@@ -167,7 +159,7 @@ pub fn run_pftrace(
         writer.load_names(map);
     }
 
-    for event in &events {
+    for event in stream.events() {
         writer.push(event);
     }
 
@@ -197,12 +189,12 @@ pub fn write_bundle(
     let data = fs::read(&trace_path)?;
     let stats = trace_stats_from_bytes(&data)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let events = decode_file_bytes(&data)
+    let stream = decode_file_stream(&data)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
     let ndjson_path = out_dir.join("replay.ndjson");
     let mut ndjson = BufWriter::new(File::create(&ndjson_path)?);
-    for event in &events {
+    for event in stream.events() {
         serde_json::to_writer(&mut ndjson, event)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         ndjson.write_all(b"\n")?;
@@ -228,6 +220,8 @@ pub fn write_bundle(
             "names": names_source.map(|_| "names.json"),
         },
         "stats": stats,
+        "integrity": stream.integrity(),
+        "markers": stream.markers(),
     });
     fs::write(
         runtime_path,
@@ -238,450 +232,12 @@ pub fn write_bundle(
     Ok(stats)
 }
 
-pub fn run_live_guest_mem(config: LiveDrainConfig<'_>) -> std::io::Result<TraceStats> {
-    fs::create_dir_all(config.out_dir)?;
-
-    let symbol_addr = resolve_elf_symbol(config.kernel, config.symbol)?;
-    let ring_offset = guest_ram_offset_for_symbol(
-        symbol_addr,
-        RV64_QEMU_KERNEL_VIRT_BASE,
-        RV64_QEMU_KERNEL_PHYS_BASE,
+#[cfg(test)]
+fn empty_stream_from_stats(input_kind: TraceInputKind, stats: &TraceStats) -> TraceEventStream {
+    TraceEventStream::new(
+        Vec::new(),
+        TraceIntegrity::from_trace_stats(input_kind, stats),
     )
-    .ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "symbol {} address 0x{symbol_addr:x} is not in the rv64-qemu kernel alias window",
-                config.symbol
-            ),
-        )
-    })?;
-
-    let ring_layout =
-        LiveRingLayout::new(ring_offset as usize, config.hart_count, config.ring_bytes)?;
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(config.guest_mem)?;
-    let mut mmap = unsafe { MmapOptions::new().map_mut(&file)? };
-    ring_layout.validate_len(mmap.len())?;
-
-    let raw_path = config.out_dir.join("trace.rawrecords");
-    let mut raw = BufWriter::new(File::create(&raw_path)?);
-
-    let poll = Duration::from_millis(if config.poll_ms == 0 {
-        DEFAULT_LIVE_POLL_MS
-    } else {
-        config.poll_ms
-    });
-    let deadline = config
-        .max_duration_ms
-        .map(|ms| Instant::now() + Duration::from_millis(ms));
-    let mut totals = LiveDrainTotals::default();
-
-    loop {
-        let drained = drain_live_once(&mut mmap, &ring_layout, &mut raw, &mut totals)?;
-        let stop_requested = config.stop_file.is_some_and(|path| path.exists());
-        let timed_out = deadline.is_some_and(|deadline| Instant::now() >= deadline);
-        if (stop_requested && drained == 0) || timed_out {
-            break;
-        }
-        std::thread::sleep(poll);
-    }
-    raw.flush()?;
-
-    if config.finalize {
-        let ndjson_path = config.out_dir.join("replay.ndjson");
-        let pftrace_path = config.out_dir.join("trace.pftrace");
-        finalize_live_raw_records(
-            &raw_path,
-            &ndjson_path,
-            &pftrace_path,
-            config.names_map,
-            &mut totals,
-        )?;
-    }
-
-    let stats = ring_layout.stats_from_mmap(&mmap)?;
-    let runtime_path = config.out_dir.join("runtime.json");
-    let generated_unix_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let runtime = serde_json::json!({
-        "schema": "tx-observe-live-runtime-v0",
-        "generated_unix_ms": generated_unix_ms,
-        "mode": "guest-mem-live",
-        "guest_mem": config.guest_mem.display().to_string(),
-        "kernel": config.kernel.display().to_string(),
-        "symbol": config.symbol,
-        "symbol_addr": format!("0x{symbol_addr:x}"),
-        "ring_offset": ring_offset,
-        "ring_bytes": config.ring_bytes,
-        "hart_count": config.hart_count,
-        "finalized": config.finalize,
-        "files": {
-            "raw_records": "trace.rawrecords",
-            "replay_ndjson": if config.finalize { Some("replay.ndjson") } else { None },
-            "pftrace": if config.finalize { Some("trace.pftrace") } else { None },
-        },
-        "drained": totals,
-        "stats": stats,
-    });
-    fs::write(
-        runtime_path,
-        serde_json::to_vec_pretty(&runtime)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
-    )?;
-
-    Ok(stats)
-}
-
-#[derive(Default, Serialize)]
-struct LiveDrainTotals {
-    records: u64,
-    repairs: u64,
-    overwritten_records: u64,
-    lost_records: u64,
-    raw_records: u64,
-    #[serde(skip)]
-    last_lost_by_hart: Vec<u64>,
-    #[serde(skip)]
-    active_harts_mask: u64,
-}
-
-struct LiveRingLayout {
-    ring_offset: usize,
-    hart_count: usize,
-    ring_bytes: usize,
-    slot_count: usize,
-}
-
-impl LiveRingLayout {
-    fn new(ring_offset: usize, hart_count: usize, ring_bytes: usize) -> std::io::Result<Self> {
-        if hart_count == 0 || hart_count > MAX_HARTS_DAEMON as usize {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("hart_count {hart_count} is outside [1, {MAX_HARTS_DAEMON}]"),
-            ));
-        }
-        if ring_bytes <= size_of::<TxTraceHartRing>() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("ring_bytes {ring_bytes} is too small"),
-            ));
-        }
-        let slot_bytes = ring_bytes - size_of::<TxTraceHartRing>();
-        let raw_slots = slot_bytes / size_of::<TxTraceRecord>();
-        let slot_count = prev_power_of_two(raw_slots);
-        if slot_count == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("ring_bytes {ring_bytes} leaves no usable trace slots"),
-            ));
-        }
-        Ok(Self {
-            ring_offset,
-            hart_count,
-            ring_bytes,
-            slot_count,
-        })
-    }
-
-    fn validate_len(&self, len: usize) -> std::io::Result<()> {
-        let required = self.ring_offset + self.hart_count * self.ring_bytes;
-        if len < required {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("guest memory file too small: need {required} bytes, got {len}"),
-            ));
-        }
-        Ok(())
-    }
-
-    fn ring_base(&self, hart: usize) -> usize {
-        self.ring_offset + hart * self.ring_bytes
-    }
-
-    fn stats_from_mmap(&self, mmap: &[u8]) -> std::io::Result<TraceStats> {
-        self.validate_len(mmap.len())?;
-        let mut rings = Vec::with_capacity(self.hart_count);
-        let mut total_records = 0u64;
-        let mut total_lost = 0u64;
-        let mut overwritten_records = 0u64;
-        let framing_errors = 0u64;
-        for h in 0..self.hart_count {
-            let ring_base = self.ring_base(h);
-            let ring = &mmap[ring_base..ring_base + size_of::<TxTraceHartRing>()];
-            let hart = u16::from_le_bytes(ring[0..2].try_into().unwrap());
-            let producer = read_u64_le(ring, RING_PRODUCER_OFF);
-            let consumer = read_u64_le(ring, RING_CONSUMER_OFF);
-            let lost = read_u64_le(ring, RING_LOST_OFF);
-            if !self.ring_header_ready(h, ring) {
-                rings.push(RingStats {
-                    hart: h as u16,
-                    producer,
-                    consumer,
-                    effective_consumer: consumer,
-                    visible_records: 0,
-                    overwritten_records: 0,
-                    lost: 0,
-                    framing_errors: 0,
-                });
-                continue;
-            }
-            let produced_window = producer.wrapping_sub(consumer);
-            let overwritten = produced_window.saturating_sub(self.slot_count as u64);
-            let effective_consumer = if overwritten > 0 {
-                producer.wrapping_sub(self.slot_count as u64)
-            } else {
-                consumer
-            };
-            let visible_records = producer.wrapping_sub(effective_consumer);
-            total_records += visible_records;
-            total_lost += lost;
-            overwritten_records += overwritten;
-            rings.push(RingStats {
-                hart,
-                producer,
-                consumer,
-                effective_consumer,
-                visible_records,
-                overwritten_records: overwritten,
-                lost,
-                framing_errors: 0,
-            });
-        }
-        Ok(TraceStats {
-            version: SUPPORTED_HEADER_VERSION,
-            hart_count: self.hart_count as u16,
-            ring_order: self.slot_count.trailing_zeros() as u8,
-            slots_per_hart: self.slot_count as u64,
-            total_records,
-            total_lost,
-            overwritten_records,
-            framing_errors,
-            complete: total_lost == 0 && overwritten_records == 0 && framing_errors == 0,
-            rings,
-        })
-    }
-
-    fn ring_header_ready(&self, hart_index: usize, ring: &[u8]) -> bool {
-        if ring.len() < size_of::<TxTraceHartRing>() {
-            return false;
-        }
-        let ring_hart = u16::from_le_bytes(ring[0..2].try_into().unwrap());
-        let flags = u16::from_le_bytes(ring[2..4].try_into().unwrap());
-        if usize::from(ring_hart) != hart_index || flags != 0 {
-            return false;
-        }
-
-        let producer = read_u64_le(ring, RING_PRODUCER_OFF);
-        let consumer = read_u64_le(ring, RING_CONSUMER_OFF);
-        let seq = read_u64_le(ring, RING_SEQ_OFF);
-        if consumer > producer || producer - consumer > self.slot_count as u64 {
-            return false;
-        }
-
-        // In a valid initialized ring, seq tracks successful record
-        // publication. A concurrent producer may have reserved the next seq
-        // before publishing producer+1, so allow that one-record transient.
-        seq == producer || seq == producer.saturating_add(1)
-    }
-}
-
-fn drain_live_once(
-    mmap: &mut [u8],
-    layout: &LiveRingLayout,
-    raw: &mut dyn Write,
-    totals: &mut LiveDrainTotals,
-) -> std::io::Result<u64> {
-    let mut drained = 0u64;
-    for h in 0..layout.hart_count {
-        let ring_base = layout.ring_base(h);
-        let ring_end = ring_base + size_of::<TxTraceHartRing>();
-        let ring = &mmap[ring_base..ring_end];
-        if !layout.ring_header_ready(h, ring) {
-            continue;
-        }
-        let ring_hart = u16::from_le_bytes(ring[0..2].try_into().unwrap());
-        let producer = read_u64_le(ring, RING_PRODUCER_OFF);
-        let consumer = read_u64_le(ring, RING_CONSUMER_OFF);
-        let lost = read_u64_le(ring, RING_LOST_OFF);
-        let produced_window = producer.wrapping_sub(consumer);
-        let overwritten = produced_window.saturating_sub(layout.slot_count as u64);
-        let effective_consumer = if overwritten > 0 {
-            totals.overwritten_records += overwritten;
-            producer.wrapping_sub(layout.slot_count as u64)
-        } else {
-            consumer
-        };
-
-        let slots_base = ring_end;
-        let mut c = effective_consumer;
-        let ring_drained_before = drained;
-        while c != producer {
-            let slot_idx = (c & (layout.slot_count as u64 - 1)) as usize;
-            let slot_off = slots_base + slot_idx * size_of::<TxTraceRecord>();
-            let slot = &mmap[slot_off..slot_off + size_of::<TxTraceRecord>()];
-            raw.write_all(&ring_hart.to_le_bytes())?;
-            raw.write_all(&[0u8; LIVE_RAW_RECORD_HEADER_BYTES - 2])?;
-            raw.write_all(slot)?;
-            totals.raw_records += 1;
-            drained += 1;
-            c = c.wrapping_add(1);
-        }
-        if drained != ring_drained_before && ring_hart < 64 {
-            totals.active_harts_mask |= 1u64 << ring_hart;
-        }
-        mmap[ring_base + RING_CONSUMER_OFF..ring_base + RING_CONSUMER_OFF + 8]
-            .copy_from_slice(&producer.to_le_bytes());
-        if totals.last_lost_by_hart.len() <= h {
-            totals.last_lost_by_hart.resize(h + 1, 0);
-        }
-        let previous_lost = totals.last_lost_by_hart[h];
-        totals.lost_records += if lost >= previous_lost {
-            lost - previous_lost
-        } else {
-            lost
-        };
-        totals.last_lost_by_hart[h] = lost;
-    }
-    Ok(drained)
-}
-
-fn finalize_live_raw_records(
-    raw_path: &Path,
-    ndjson_path: &Path,
-    pftrace_path: &Path,
-    names_map: Option<HashMap<u32, String>>,
-    totals: &mut LiveDrainTotals,
-) -> std::io::Result<()> {
-    if totals.active_harts_mask.count_ones() > 1 {
-        return finalize_live_raw_records_sorted(
-            raw_path,
-            ndjson_path,
-            pftrace_path,
-            names_map,
-            totals,
-        );
-    }
-
-    let mut raw = BufReader::new(File::open(raw_path)?);
-    let mut ndjson = BufWriter::new(File::create(ndjson_path)?);
-    let mut pftrace = PftraceWriter::new(0, 10_000_000, 0);
-    if let Some(names_map) = names_map {
-        pftrace.load_names(names_map);
-    }
-
-    let mut header = [0u8; LIVE_RAW_RECORD_HEADER_BYTES];
-    let mut slot = [0u8; size_of::<TxTraceRecord>()];
-    loop {
-        match raw.read_exact(&mut header) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(err) => return Err(err),
-        }
-        raw.read_exact(&mut slot)?;
-        let ring_hart = u16::from_le_bytes(header[0..2].try_into().unwrap());
-        let event = decode_slot(ring_hart, &slot);
-        match &event {
-            DecodedEvent::Record(_) => totals.records += 1,
-            DecodedEvent::Repair(_) => totals.repairs += 1,
-        }
-        serde_json::to_writer(&mut ndjson, &event)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        ndjson.write_all(b"\n")?;
-        pftrace.push(&event);
-    }
-    ndjson.flush()?;
-    pftrace.finish(pftrace_path)
-}
-
-fn finalize_live_raw_records_sorted(
-    raw_path: &Path,
-    ndjson_path: &Path,
-    pftrace_path: &Path,
-    names_map: Option<HashMap<u32, String>>,
-    totals: &mut LiveDrainTotals,
-) -> std::io::Result<()> {
-    let mut raw = BufReader::new(File::open(raw_path)?);
-    let mut events = Vec::new();
-    let mut header = [0u8; LIVE_RAW_RECORD_HEADER_BYTES];
-    let mut slot = [0u8; size_of::<TxTraceRecord>()];
-    loop {
-        match raw.read_exact(&mut header) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(err) => return Err(err),
-        }
-        raw.read_exact(&mut slot)?;
-        let ring_hart = u16::from_le_bytes(header[0..2].try_into().unwrap());
-        events.push(decode_slot(ring_hart, &slot));
-    }
-    events.sort_by_key(event_order_key);
-
-    let mut ndjson = BufWriter::new(File::create(ndjson_path)?);
-    let mut pftrace = PftraceWriter::new(0, 10_000_000, 0);
-    if let Some(names_map) = names_map {
-        pftrace.load_names(names_map);
-    }
-    for event in events {
-        match &event {
-            DecodedEvent::Record(_) => totals.records += 1,
-            DecodedEvent::Repair(_) => totals.repairs += 1,
-        }
-        serde_json::to_writer(&mut ndjson, &event)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        ndjson.write_all(b"\n")?;
-        pftrace.push(&event);
-    }
-    ndjson.flush()?;
-    pftrace.finish(pftrace_path)
-}
-
-pub fn resolve_elf_symbol(path: &Path, symbol: &str) -> std::io::Result<u64> {
-    let bytes = fs::read(path)?;
-    let file = object::File::parse(bytes.as_slice()).map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("ELF parse failed: {e}"),
-        )
-    })?;
-    for sym in file.symbols() {
-        let Ok(name) = sym.name() else { continue };
-        if name == symbol
-            || rustc_demangle::try_demangle(name).is_ok_and(|d| format!("{d:#}") == symbol)
-        {
-            return Ok(sym.address());
-        }
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        format!("symbol {symbol} not found in {}", path.display()),
-    ))
-}
-
-pub fn guest_ram_offset_for_symbol(
-    symbol_addr: u64,
-    kernel_virt_base: u64,
-    kernel_phys_base: u64,
-) -> Option<u64> {
-    let phys = if symbol_addr >= kernel_virt_base {
-        kernel_phys_base.checked_add(symbol_addr.checked_sub(kernel_virt_base)?)?
-    } else if symbol_addr >= kernel_phys_base {
-        symbol_addr
-    } else {
-        return None;
-    };
-    phys.checked_sub(RV64_QEMU_RAM_BASE)
-}
-
-const fn prev_power_of_two(n: usize) -> usize {
-    if n == 0 {
-        return 0;
-    }
-    1usize << ((usize::BITS - 1 - n.leading_zeros()) as usize)
 }
 
 /// Extract `(clock_id, clock_freq_hz, boot_id)` from the raw header bytes.
@@ -808,7 +364,8 @@ pub fn decode_file_bytes(data: &[u8]) -> Result<Vec<DecodedEvent>, String> {
             let slot_idx = (c & (slot_count as u64 - 1)) as usize;
             let slot_off = slots_base + slot_idx * record_size;
             let slot_bytes = &data[slot_off..slot_off + record_size];
-            let event = decode_slot(ring_hart, slot_bytes);
+            let frame = RawRecordFrame::from_slot(ring_hart, Some(c), slot_bytes)?;
+            let event = decode_frame(&frame);
             events.push(event);
             c = c.wrapping_add(1);
         }
@@ -819,6 +376,20 @@ pub fn decode_file_bytes(data: &[u8]) -> Result<Vec<DecodedEvent>, String> {
     }
 
     Ok(events)
+}
+
+/// Decode a txtrace region into the L5 canonical stream.
+pub fn decode_file_stream(data: &[u8]) -> Result<TraceEventStream, String> {
+    let stats = trace_stats_from_bytes(data)?;
+    let events = decode_file_bytes(data)?;
+    let integrity = TraceIntegrity::from_trace_stats(TraceInputKind::TxTraceRegion, &stats);
+    let frames = Vec::new();
+    let mut decoder = CanonicalDecoder;
+    let empty_stream = decoder.decode(DecodeBatch::new(frames, integrity.clone()))?;
+    Ok(TraceEventStream::new(
+        events,
+        empty_stream.integrity().clone(),
+    ))
 }
 
 pub fn trace_stats_from_bytes(data: &[u8]) -> Result<TraceStats, String> {
@@ -966,7 +537,7 @@ fn event_order_key(event: &DecodedEvent) -> (u64, u16, u64, u8) {
 }
 
 /// Read a little-endian `u64` from `buf` at `offset`.
-fn read_u64_le(buf: &[u8], offset: usize) -> u64 {
+pub(super) fn read_u64_le(buf: &[u8], offset: usize) -> u64 {
     let bytes: [u8; 8] = buf[offset..offset + 8].try_into().expect("u64 read");
     u64::from_le_bytes(bytes)
 }
@@ -992,13 +563,41 @@ fn level_str_to_byte(level: &str) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::l4_readers::live::compress_raw_records;
+    use flate2::read::GzDecoder;
+    use std::io::Read;
     use std::mem::size_of;
+    use tempfile::tempdir;
     use tx_observe_types::{
         header::TX_TRACE_MAGIC, payload::TxPayloadTag, TxTraceHeader, TxTraceKind, TxTraceLevel,
         TxTraceRecord,
     };
 
     const RECORD_MAGIC: u16 = 0x5254;
+
+    #[test]
+    fn gzip_raw_capture_is_atomic_and_reports_source_metadata() {
+        let dir = tempdir().unwrap();
+        let raw_path = dir.path().join("trace.rawrecords.tmp");
+        let gzip_path = dir.path().join("trace.rawrecords.gz");
+        let source = b"tx-observe-raw-records\0\x52\x54";
+        std::fs::write(&raw_path, source).unwrap();
+
+        let metadata = compress_raw_records(&raw_path, &gzip_path).unwrap();
+
+        assert!(!raw_path.exists());
+        assert_eq!(metadata.uncompressed_bytes, source.len() as u64);
+        assert!(metadata.compressed_bytes > 0);
+        assert_eq!(
+            metadata.sha256,
+            "2ab3ebfa3becec43d14f6460de3f5ac56f5c971a98f845f0eb325ebcfbc41740"
+        );
+        let mut decoded = Vec::new();
+        GzDecoder::new(std::fs::File::open(gzip_path).unwrap())
+            .read_to_end(&mut decoded)
+            .unwrap();
+        assert_eq!(decoded, source);
+    }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -1336,6 +935,55 @@ mod tests {
         assert_eq!(stats.total_lost, 3);
         assert!(!stats.complete, "lost records make a ring incomplete");
         assert_eq!(stats.rings[0].lost, 3);
+
+        let stream = empty_stream_from_stats(TraceInputKind::LiveGuestMem, &stats);
+        assert_eq!(stream.integrity().lost_records, 3);
+        assert!(matches!(
+            stream.markers()[0],
+            crate::l5_canonical::TraceStreamMarker::CaptureLoss {
+                lost_records: 3,
+                overwritten_records: 0,
+            }
+        ));
+    }
+
+    #[test]
+    fn bundle_runtime_includes_canonical_integrity_and_markers() {
+        let record = make_record_bytes(
+            RECORD_MAGIC,
+            0,
+            TxTraceKind::Instant as u8,
+            TxTraceLevel::Boundary as u8,
+            0,
+            1,
+            1000,
+            0,
+            0,
+            0x10,
+            TxPayloadTag::None as u16,
+            0,
+            [0u8; 16],
+        );
+        let mut file_bytes = make_trace_file(&[record]);
+        let rings_off = size_of::<TxTraceHeader>();
+        write_u64_le(&mut file_bytes, rings_off + RING_LOST_OFF, 3);
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let input = temp.path().join("input.txtrace");
+        let out_dir = temp.path().join("bundle");
+        fs::write(&input, file_bytes).expect("write input trace");
+
+        let stats = write_bundle(&input, &out_dir, None, None).expect("write bundle");
+        let runtime: serde_json::Value =
+            serde_json::from_slice(&fs::read(out_dir.join("runtime.json")).expect("runtime"))
+                .expect("runtime json");
+
+        assert_eq!(stats.total_lost, 3);
+        assert_eq!(runtime["stats"]["total_lost"], 3);
+        assert_eq!(runtime["integrity"]["lost_records"], 3);
+        assert_eq!(runtime["integrity"]["complete"], false);
+        assert_eq!(runtime["markers"][0]["kind"], "CaptureLoss");
+        assert_eq!(runtime["markers"][0]["lost_records"], 3);
     }
 
     #[test]
@@ -1388,7 +1036,8 @@ mod tests {
         let mut raw = Vec::new();
         let mut totals = LiveDrainTotals::default();
 
-        let drained = drain_live_once(&mut mem, &layout, &mut raw, &mut totals).expect("live drain");
+        let drained =
+            drain_live_once(&mut mem, &layout, &mut raw, &mut totals).expect("live drain");
 
         assert_eq!(drained, 1);
         assert_eq!(totals.raw_records, 1);
@@ -1404,7 +1053,9 @@ mod tests {
             LIVE_RAW_RECORD_HEADER_BYTES + size_of::<TxTraceRecord>()
         );
         assert_eq!(&raw[0..2], &0u16.to_le_bytes());
-        let decoded = decode_slot(0, &raw[LIVE_RAW_RECORD_HEADER_BYTES..]);
+        let frame =
+            RawRecordFrame::from_slot(0, None, &raw[LIVE_RAW_RECORD_HEADER_BYTES..]).unwrap();
+        let decoded = decode_frame(&frame);
         assert!(matches!(decoded, DecodedEvent::Record(_)));
     }
 
@@ -1426,7 +1077,8 @@ mod tests {
         let mut raw = Vec::new();
         let mut totals = LiveDrainTotals::default();
 
-        let drained = drain_live_once(&mut mem, &layout, &mut raw, &mut totals).expect("live drain");
+        let drained =
+            drain_live_once(&mut mem, &layout, &mut raw, &mut totals).expect("live drain");
 
         assert_eq!(drained, 0);
         assert_eq!(totals.raw_records, 0);

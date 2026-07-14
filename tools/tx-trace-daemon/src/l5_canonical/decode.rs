@@ -19,6 +19,8 @@ use serde::Serialize;
 use std::mem::size_of;
 use tx_observe_types::{payload::*, TxTraceKind, TxTraceLevel, TxTraceRecord};
 
+use crate::l4_readers::RawRecordFrame;
+
 /// The record-magic constant per the spec (§5).
 pub const RECORD_MAGIC: u16 = 0x5254;
 
@@ -167,6 +169,11 @@ pub fn decode_slot(hart: u16, slot_bytes: &[u8]) -> DecodedEvent {
         payload_tag: rec.payload_tag,
         payload,
     })
+}
+
+/// Decode a frame handed over by L4. This is the intended L4 -> L5 entry point.
+pub fn decode_frame(frame: &RawRecordFrame) -> DecodedEvent {
+    decode_slot(frame.hart, frame.bytes_for_decode())
 }
 
 /// Map `TxTraceKind` raw byte to a static string name.

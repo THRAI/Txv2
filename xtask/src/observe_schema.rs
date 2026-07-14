@@ -4,15 +4,15 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use crate::Result;
 use crate::util::{optional_option_value, resolve_path};
+use crate::Result;
 
 pub(crate) fn observe_schema(root: &Path, args: Vec<String>) -> Result<()> {
     let Some(subcmd) = args.first() else {
         return Err("observe-schema command needs check\n\
              usage:\n\
              \tcargo xtask observe-schema check [--schema schema/txobserve.toml]\n\
-             \tcargo xtask observe-schema codegen [--schema schema/txobserve.toml] [--output crates/tx-observe/src/generated/schema_catalog.rs] [--check]"
+             \tcargo xtask observe-schema codegen [--schema schema/txobserve.toml] [--output crates/tx-observe/src/l0_schema/schema_catalog.rs] [--host-output tools/tx-observe-host-catalog.json] [--check]"
             .into());
     };
     match subcmd.as_str() {
@@ -43,8 +43,8 @@ fn observe_schema_check(root: &Path, args: &[String]) -> Result<()> {
     let types_lib_rs_path = root.join("crates/tx-observe-types/src/lib.rs");
     let cargo_toml_path = root.join("Cargo.toml");
     let analyzer_path = root.join("tools/tx-observe-analyze.py");
-    let perfetto_writer_path = root.join("tools/tx-trace-daemon/src/perfetto/writer.rs");
-    let tx_observe_lib_path = root.join("crates/tx-observe/src/lib.rs");
+    let perfetto_writer_path = root.join("tools/tx-trace-daemon/src/l6_views/perfetto/writer.rs");
+    let tx_observe_runtime_path = root.join("crates/tx-observe/src/l2_producer/runtime.rs");
     let record_rs = fs::read_to_string(&record_rs_path)
         .map_err(|err| format!("failed to read {}: {err}", record_rs_path.display()))?;
     let payload_rs = fs::read_to_string(&payload_rs_path)
@@ -57,8 +57,13 @@ fn observe_schema_check(root: &Path, args: &[String]) -> Result<()> {
         .map_err(|err| format!("failed to read {}: {err}", analyzer_path.display()))?;
     let perfetto_writer = fs::read_to_string(&perfetto_writer_path)
         .map_err(|err| format!("failed to read {}: {err}", perfetto_writer_path.display()))?;
-    let tx_observe_lib = fs::read_to_string(&tx_observe_lib_path)
-        .map_err(|err| format!("failed to read {}: {err}", tx_observe_lib_path.display()))?;
+    let tx_observe_runtime = fs::read_to_string(&tx_observe_runtime_path).map_err(|err| {
+        format!(
+            "failed to read {}: {err}",
+            tx_observe_runtime_path.display()
+        )
+    })?;
+    check_observe_host_layout(root)?;
 
     let report = check_schema_text(
         &schema,
@@ -68,7 +73,7 @@ fn observe_schema_check(root: &Path, args: &[String]) -> Result<()> {
         &cargo_toml,
         &analyzer_py,
         &perfetto_writer,
-        &tx_observe_lib,
+        &tx_observe_runtime,
     )?;
     println!(
         "observe-schema check: ok (levels={} record_kinds={} payloads={} payload_structs={} cfgs={} projections={} tracks={} hart_emitter_methods={})",
@@ -90,6 +95,7 @@ fn observe_schema_codegen(root: &Path, args: &[String]) -> Result<()> {
     let schema: ObserveSchema =
         toml::from_str(&schema_text).map_err(|err| format!("schema TOML parse failed: {err}"))?;
     let generated = render_schema_catalog(&schema)?;
+    let generated_host = render_host_catalog(&schema)?;
     let output_path = optional_option_value(args, "--output")
         .map(PathBufLike::from)
         .map(|path| resolve_path(root, path.0))
@@ -100,16 +106,28 @@ fn observe_schema_codegen(root: &Path, args: &[String]) -> Result<()> {
                 .and_then(|kernel| kernel.generated_catalog.as_ref())
                 .map(|path| resolve_path(root, path.into()))
         })
-        .unwrap_or_else(|| root.join("crates/tx-observe/src/generated/schema_catalog.rs"));
+        .unwrap_or_else(|| root.join("crates/tx-observe/src/l0_schema/schema_catalog.rs"));
+    let host_output_path = optional_option_value(args, "--host-output")
+        .map(PathBufLike::from)
+        .map(|path| resolve_path(root, path.0))
+        .unwrap_or_else(|| root.join("tools/tx-observe-host-catalog.json"));
 
     if args.iter().any(|arg| arg == "--check") {
         let current = read_schema_file(&output_path)?;
-        if current == generated {
+        let current_host = read_schema_file(&host_output_path)?;
+        if current == generated && current_host == generated_host {
             println!(
-                "observe-schema codegen --check: ok ({})",
-                output_path.display()
+                "observe-schema codegen --check: ok ({}, {})",
+                output_path.display(),
+                host_output_path.display()
             );
             return Ok(());
+        }
+        if current_host != generated_host {
+            return Err(format!(
+                "observe-schema generated host catalog is stale: run `cargo xtask observe-schema codegen` to update {}",
+                host_output_path.display()
+            ));
         }
         return Err(format!(
             "observe-schema generated catalog is stale: run `cargo xtask observe-schema codegen` to update {}",
@@ -123,7 +141,17 @@ fn observe_schema_codegen(root: &Path, args: &[String]) -> Result<()> {
     }
     fs::write(&output_path, generated)
         .map_err(|err| format!("failed to write {}: {err}", output_path.display()))?;
-    println!("observe-schema codegen: wrote {}", output_path.display());
+    if let Some(parent) = host_output_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+    }
+    fs::write(&host_output_path, generated_host)
+        .map_err(|err| format!("failed to write {}: {err}", host_output_path.display()))?;
+    println!(
+        "observe-schema codegen: wrote {} and {}",
+        output_path.display(),
+        host_output_path.display()
+    );
     Ok(())
 }
 
@@ -196,11 +224,29 @@ struct CfgEntry {
 #[derive(Debug, Deserialize)]
 struct ControlGroupEntry {
     id: String,
+    title: Option<String>,
+    #[serde(default)]
+    default: bool,
+    #[serde(default)]
+    requires_cfg: Vec<String>,
+    #[serde(default)]
+    local_cfgs: Vec<String>,
+    #[serde(default)]
+    events: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct HostSchema {
+    #[serde(default)]
+    inputs: Vec<HostInputEntry>,
     projections: Vec<ProjectionEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HostInputEntry {
+    id: String,
+    extension: Option<String>,
+    reader_target: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -208,6 +254,9 @@ struct ProjectionEntry {
     id: String,
     kind: String,
     file: Option<String>,
+    target_type: Option<String>,
+    current_source: Option<String>,
+    coverage_default: Option<String>,
     #[serde(default)]
     columns: Vec<ColumnEntry>,
 }
@@ -349,12 +398,12 @@ fn check_schema_text(
     let payload_structs = parse_payload_struct_fields(payload_rs)?;
     let payload_sizes = parse_payload_size_assertions(types_lib_rs)?;
     let cfgs = parse_workspace_cfgs(cargo_toml)?;
-    let analyzer_projections = parse_analyzer_projection_schemas(analyzer_py)?;
     let schema_projections = projection_schemas_from_schema(&schema.host.projections)?;
     let track_consts = parse_explicit_track_consts(payload_rs)?;
     let writer_track_names = parse_explicit_track_names(perfetto_writer)?;
     let hart_emitter_methods = parse_hart_emitter_public_methods(tx_observe_lib_rs)?;
     check_event_family_refs(&schema)?;
+    check_analyzer_host_boundary(analyzer_py)?;
     check_explicit_tracks(&schema, &track_consts, &writer_track_names)?;
     check_hart_emitter_methods(&schema, &hart_emitter_methods)?;
 
@@ -363,11 +412,6 @@ fn check_schema_text(
     compare_maps("TxPayloadTag", &payloads, &payload_schema)?;
     compare_payload_structs(&schema.payloads, &payload_structs, &payload_sizes)?;
     compare_sets("cfg", &cfgs, &cfg_schema)?;
-    compare_columns(
-        "host projection",
-        &analyzer_projections,
-        &schema_projections,
-    )?;
 
     Ok(CheckReport {
         levels: level_schema.len(),
@@ -874,6 +918,96 @@ fn render_schema_catalog(schema: &ObserveSchema) -> Result<String> {
     Ok(out)
 }
 
+fn render_host_catalog(schema: &ObserveSchema) -> Result<String> {
+    let cfgs = schema
+        .controls
+        .cfgs
+        .iter()
+        .map(|cfg| serde_json::json!({ "name": cfg.name }))
+        .collect::<Vec<_>>();
+    let control_groups = schema
+        .controls
+        .groups
+        .iter()
+        .map(|group| {
+            serde_json::json!({
+                "id": group.id,
+                "title": group.title,
+                "default": group.default,
+                "requires_cfg": group.requires_cfg,
+                "local_cfgs": group.local_cfgs,
+                "events": group.events,
+            })
+        })
+        .collect::<Vec<_>>();
+    let inputs = schema
+        .host
+        .inputs
+        .iter()
+        .map(|input| {
+            serde_json::json!({
+                "id": input.id,
+                "extension": input.extension,
+                "reader_target": input.reader_target,
+            })
+        })
+        .collect::<Vec<_>>();
+    let projections = schema
+        .host
+        .projections
+        .iter()
+        .map(|projection| {
+            let columns = projection
+                .columns
+                .iter()
+                .map(|column| {
+                    serde_json::json!({
+                        "name": column.name,
+                        "type": column.ty,
+                    })
+                })
+                .collect::<Vec<_>>();
+            serde_json::json!({
+                "id": projection.id,
+                "kind": projection.kind,
+                "file": projection.file,
+                "target_type": projection.target_type,
+                "current_source": projection.current_source,
+                "coverage_default": projection.coverage_default,
+                "columns": columns,
+            })
+        })
+        .collect::<Vec<_>>();
+    let event_families = schema
+        .event_families
+        .iter()
+        .map(|family| {
+            serde_json::json!({
+                "id": family.id,
+                "levels": family.levels,
+                "payloads": family.payloads,
+                "control_group": family.control_group,
+                "projection": family.projection,
+            })
+        })
+        .collect::<Vec<_>>();
+    let value = serde_json::json!({
+        "schema": "tx-observe-host-catalog-v0",
+        "source": "schema/txobserve.toml",
+        "cfgs": cfgs,
+        "control_groups": control_groups,
+        "inputs": inputs,
+        "projections": projections,
+        "event_families": event_families,
+    });
+    serde_json::to_string_pretty(&value)
+        .map(|mut text| {
+            text.push('\n');
+            text
+        })
+        .map_err(|err| format!("failed to render host catalog JSON: {err}"))
+}
+
 fn render_string_slice(values: &[String]) -> String {
     if values.is_empty() {
         return "&[]".to_string();
@@ -1119,59 +1253,240 @@ fn camel_to_snake(value: &str) -> String {
     out
 }
 
-fn parse_analyzer_projection_schemas(text: &str) -> Result<BTreeMap<String, Vec<ColumnEntry>>> {
-    let mut out = BTreeMap::new();
-    let parquet_body = python_assignment_body(text, "PARQUET_SCHEMAS", '{', '}')?;
-    let mut rest = parquet_body;
-    while let Some(start) = rest.find('"') {
-        rest = &rest[start + 1..];
-        let Some(end) = rest.find('"') else {
-            return Err("unterminated PARQUET_SCHEMAS key".into());
-        };
-        let key = &rest[..end];
-        rest = &rest[end + 1..];
-        let Some(open) = rest.find('[') else {
-            return Err(format!("PARQUET_SCHEMAS['{key}'] missing list"));
-        };
-        let list_start = open + 1;
-        let list_end = matching_delimiter(rest, open, '[', ']')?;
-        let body = &rest[list_start..list_end];
-        out.insert(key.to_string(), parse_python_column_tuples(body)?);
-        rest = &rest[list_end + 1..];
+fn check_analyzer_host_boundary(text: &str) -> Result<()> {
+    if !text.contains("ANALYZER_DECODER_VERSION") {
+        return Ok(());
     }
-
-    for (key, assignment) in [
-        ("records", "RECORD_SQL_SCHEMA"),
-        ("repairs", "REPAIR_SQL_SCHEMA"),
-        ("names", "NAME_SQL_SCHEMA"),
-    ] {
-        let body = python_assignment_body(text, assignment, '[', ']')?;
-        let columns = parse_python_column_tuples(body)?;
-        if !columns.is_empty() {
-            out.insert(key.to_string(), columns);
-        }
+    let forbidden = [
+        "PARQUET_SCHEMAS",
+        "RECORD_SQL_SCHEMA",
+        "REPAIR_SQL_SCHEMA",
+        "NAME_SQL_SCHEMA",
+        "local_projection_schemas",
+        "_PROJECTION_SCHEMA_CATALOG",
+        "def load_host_catalog(",
+        "def validate_host_catalog(",
+        "def projection_schema_catalog(",
+        "def parquet_schema_catalog(",
+        "def parquet_select_sql(",
+        "def typed_select_sql(",
+    ];
+    let present: Vec<_> = forbidden
+        .iter()
+        .copied()
+        .filter(|needle| text.contains(needle))
+        .collect();
+    if !present.is_empty() {
+        return Err(format!(
+            "analyzer host boundary mismatch: local schema constants must not be defined: {present:?}"
+        ));
     }
-    Ok(out)
+    let forbidden_raw_readers = [
+        "import mmap",
+        "import struct",
+        "RECORD_STRUCT =",
+        "def _u32(",
+        "def _u64(",
+        "def decode_payload_bytes(",
+        "def decode_record_bytes(",
+        "def load_txtrace_stream(",
+        "def load_rawrecords_stream(",
+    ];
+    let present_raw_readers: Vec<_> = forbidden_raw_readers
+        .iter()
+        .copied()
+        .filter(|needle| text.contains(needle))
+        .collect();
+    if !present_raw_readers.is_empty() {
+        return Err(format!(
+            "analyzer host boundary mismatch: raw reader/decode ownership must stay under tools/tx_observe_host: {present_raw_readers:?}"
+        ));
+    }
+    let has_local_boundary_types = text.contains("class TraceIntegrity:")
+        && text.contains("class TraceEventStream:")
+        && text.contains("class ProjectionInput:");
+    let has_host_package_facade = text.contains("from tx_observe_host import");
+    if !has_local_boundary_types && !has_host_package_facade {
+        return Err(
+            "analyzer host boundary mismatch: boundary types must be local test fixtures or imported from tx_observe_host"
+                .into(),
+        );
+    }
+    let forbidden_l6_execution = [
+        "ANALYZER_DECODER_VERSION =",
+        "PARQUET_MANIFEST =",
+        "LOCK_TRACK_ID =",
+        "DS_METHOD_TRACK_ID =",
+        "ALLOC_TRACK_NAMES =",
+        "class DerivedTables:",
+        "class DerivedCacheResult:",
+        "def fnv1a32(",
+        "def fmt_ns(",
+        "def event_name(",
+        "def span_display_name(",
+        "def describe(",
+        "def build_derived_tables(",
+        "def file_sha256(",
+        "def derived_cache_path(",
+        "def derived_tables_to_json(",
+        "def derived_tables_from_json(",
+        "def sql_records_rows(",
+        "def sql_repairs_rows(",
+        "def sql_names_rows(",
+        "def write_jsonl(",
+        "def require_duckdb(",
+        "def parquet_manifest_path(",
+        "def parquet_manifest_matches(",
+        "def write_parquet_manifest(",
+        "def export_derived_tables_parquet(",
+        "def run_sql_query(",
+        "def run_sql_projection(",
+        "def analyze_parquet_summary(",
+        "def run_python_file(",
+        "def run_python_projection(",
+        "def export_projection_parquet(",
+        "def run_python_file_with_table_dir(",
+        "def load_or_build_derived_tables(",
+        "def load_derived_tables_cache(",
+        "def fmt_counter_value(",
+        "def analyze(",
+        "def analyze_projection(",
+        "def percentile(",
+        "def roundtrip_points(",
+        "def analyze_roundtrip(",
+        "CLONE_THREAD_PHASES =",
+        "CHILD_SUBMIT_PHASES =",
+        "TASK_SUBMIT_PHASES =",
+        "THREAD_EXIT_PHASES =",
+        "def analyze_clone_thread_phases(",
+        "def analyze_counter_phase_sequence(",
+        "ARG_NAMES =",
+        "FUTEX_OPS =",
+        "QUEUE_NAMES =",
+        "STOP_REASON_NAMES =",
+        "MAILBOX_HINT_NAMES =",
+        "WAKE_HINT_NAMES =",
+        "def decode_task_code(",
+        "def decode_task_duration_us(",
+        "def counter_rows(",
+        "def analyze_futex_ops(",
+        "def allocation_rows(",
+        "def analyze_allocation_tracks(",
+        "def analyze_lock_metrics(",
+        "def analyze_lock_service_counters(",
+        "def analyze_ds_method_metrics(",
+        "def analyze_sched_counters(",
+        "def analyze_wake_hint_counters(",
+        "VM_POLL_ATTR_PHASE_PAIRS =",
+        "VM_WAIT_MARKERS =",
+        "def analyze_vm_poll_attribution(",
+        "def analyze_futex_table_counters(",
+        "def analyze_wait_source_notify(",
+        "def analyze_futex_source_correlation(",
+        "def analyze_futex_wake_latency(",
+    ];
+    let present_l6_execution: Vec<_> = forbidden_l6_execution
+        .iter()
+        .copied()
+        .filter(|needle| text.contains(needle))
+        .collect();
+    if !present_l6_execution.is_empty() {
+        return Err(format!(
+            "analyzer host boundary mismatch: L6 table/projection execution must stay under tools/tx_observe_host/l6_views: {present_l6_execution:?}"
+        ));
+    }
+    let required = [
+        (
+            "TraceIntegrity",
+            &["class TraceIntegrity:", "TraceIntegrity,"][..],
+        ),
+        (
+            "TraceStreamMarker",
+            &["class TraceStreamMarker:", "TraceStreamMarker,"][..],
+        ),
+        (
+            "TraceEventStream",
+            &["class TraceEventStream:", "TraceEventStream,"][..],
+        ),
+        (
+            "ProjectionInput",
+            &["class ProjectionInput:", "ProjectionInput,"][..],
+        ),
+        (
+            "analyze_projection",
+            &["def analyze_projection(", "analyze_projection,"][..],
+        ),
+        (
+            "run_sql_projection",
+            &["def run_sql_projection(", "run_sql_projection,"][..],
+        ),
+        (
+            "export_projection_parquet",
+            &[
+                "def export_projection_parquet(",
+                "export_projection_parquet,",
+            ][..],
+        ),
+        (
+            "run_python_projection",
+            &["def run_python_projection(", "run_python_projection,"][..],
+        ),
+    ];
+    let missing: Vec<_> = required
+        .iter()
+        .filter_map(|(label, alternatives)| {
+            (!alternatives.iter().any(|needle| text.contains(needle))).then_some(*label)
+        })
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "analyzer host boundary mismatch: missing={missing:?}"
+    ))
 }
 
-fn python_assignment_body<'a>(
-    text: &'a str,
-    assignment: &str,
-    open: char,
-    close: char,
-) -> Result<&'a str> {
-    let needle = format!("{assignment} = ");
-    let Some(start) = text.find(&needle) else {
-        return Err(format!("missing Python assignment {assignment}"));
-    };
-    let after = &text[start + needle.len()..];
-    let Some(open_rel) = after.find(open) else {
-        return Err(format!("missing '{open}' for {assignment}"));
-    };
-    let body_start = start + needle.len() + open_rel + 1;
-    let body_end_rel = matching_delimiter(after, open_rel, open, close)?;
-    Ok(&after[open_rel + 1..body_end_rel])
-        .map(|_| &text[body_start..start + needle.len() + body_end_rel])
+fn check_observe_host_layout(root: &Path) -> Result<()> {
+    let required_dirs = [
+        "crates/tx-observe/src/l0_schema",
+        "crates/tx-observe/src/l1_probe_api",
+        "crates/tx-observe/src/l2_producer",
+        "crates/tx-observe/src/l3_wire",
+        "tools/tx-trace-daemon/src/l4_readers",
+        "tools/tx-trace-daemon/src/l5_canonical",
+        "tools/tx-trace-daemon/src/l6_views",
+        "tools/tx_observe_host/l4_readers",
+        "tools/tx_observe_host/l5_canonical",
+        "tools/tx_observe_host/l6_views",
+    ];
+    let missing: Vec<_> = required_dirs
+        .iter()
+        .copied()
+        .filter(|rel| !root.join(rel).is_dir())
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "observe L0-L6 layout mismatch: missing layer directories {missing:?}"
+        ));
+    }
+
+    let forbidden_flat_python_layers = [
+        "tools/tx_observe_host/l4_readers.py",
+        "tools/tx_observe_host/l5_canonical.py",
+        "tools/tx_observe_host/l6_views.py",
+    ];
+    let present: Vec<_> = forbidden_flat_python_layers
+        .iter()
+        .copied()
+        .filter(|rel| root.join(rel).exists())
+        .collect();
+    if !present.is_empty() {
+        return Err(format!(
+            "observe L0-L6 layout mismatch: Python host layers must be package directories, not flat files: {present:?}"
+        ));
+    }
+
+    Ok(())
 }
 
 fn matching_delimiter(text: &str, open_index: usize, open: char, close: char) -> Result<usize> {
@@ -1187,30 +1502,6 @@ fn matching_delimiter(text: &str, open_index: usize, open: char, close: char) ->
         }
     }
     Err(format!("missing closing '{close}'"))
-}
-
-fn parse_python_column_tuples(body: &str) -> Result<Vec<ColumnEntry>> {
-    let mut columns = Vec::new();
-    let mut rest = body;
-    while let Some(open) = rest.find("(\"") {
-        rest = &rest[open + 2..];
-        let Some(name_end) = rest.find('"') else {
-            return Err("unterminated Python column name".into());
-        };
-        let name = rest[..name_end].to_string();
-        rest = &rest[name_end + 1..];
-        let Some(type_start) = rest.find('"') else {
-            return Err(format!("column '{name}' missing type string"));
-        };
-        rest = &rest[type_start + 1..];
-        let Some(type_end) = rest.find('"') else {
-            return Err(format!("column '{name}' has unterminated type string"));
-        };
-        let ty = rest[..type_end].to_string();
-        columns.push(ColumnEntry { name, ty });
-        rest = &rest[type_end + 1..];
-    }
-    Ok(columns)
 }
 
 fn compare_maps(
@@ -1239,32 +1530,6 @@ fn compare_maps(
     ))
 }
 
-fn compare_columns(
-    label: &str,
-    analyzer: &BTreeMap<String, Vec<ColumnEntry>>,
-    schema: &BTreeMap<String, Vec<ColumnEntry>>,
-) -> Result<()> {
-    let analyzer_keys: BTreeSet<_> = analyzer.keys().cloned().collect();
-    let schema_keys: BTreeSet<_> = schema.keys().cloned().collect();
-    let missing: Vec<_> = analyzer_keys.difference(&schema_keys).cloned().collect();
-    let extra: Vec<_> = schema_keys.difference(&analyzer_keys).cloned().collect();
-    let mismatch: Vec<_> = analyzer_keys
-        .intersection(&schema_keys)
-        .filter_map(|key| {
-            let analyzer_cols = &analyzer[key];
-            let schema_cols = &schema[key];
-            (analyzer_cols != schema_cols)
-                .then(|| format!("{key}: analyzer={analyzer_cols:?} schema={schema_cols:?}"))
-        })
-        .collect();
-    if missing.is_empty() && extra.is_empty() && mismatch.is_empty() {
-        return Ok(());
-    }
-    Err(format!(
-        "{label} mismatch: missing={missing:?} extra={extra:?} value_mismatch={mismatch:?}"
-    ))
-}
-
 fn compare_sets(label: &str, rust: &BTreeSet<String>, schema: &BTreeSet<String>) -> Result<()> {
     let missing: Vec<_> = rust.difference(schema).cloned().collect();
     let extra: Vec<_> = schema.difference(rust).cloned().collect();
@@ -1279,6 +1544,23 @@ fn compare_sets(label: &str, rust: &BTreeSet<String>, schema: &BTreeSet<String>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observe_host_layout_requires_layer_directories() {
+        let root = temp_observe_layout_root();
+        create_required_observe_layout(&root);
+        check_observe_host_layout(&root).unwrap();
+
+        let flat_layer = root.join("tools/tx_observe_host/l4_readers.py");
+        fs::write(&flat_layer, "").unwrap();
+        let err = check_observe_host_layout(&root).unwrap_err();
+        assert!(
+            err.contains("Python host layers must be package directories")
+                && err.contains("l4_readers.py"),
+            "unexpected error: {err}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn check_schema_text_accepts_matching_inventory() {
@@ -1346,22 +1628,7 @@ pub enum TxPayloadTag {
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tx_lock_metrics)'] }
 "#;
-        let analyzer_py = r#"
-PARQUET_SCHEMAS = {
-    "spans.parquet": [
-        ("span", "VARCHAR"),
-        ("dur", "UBIGINT"),
-    ],
-}
-
-RECORD_SQL_SCHEMA = [
-    ("ts", "UBIGINT"),
-    ("kind", "VARCHAR"),
-]
-
-REPAIR_SQL_SCHEMA = []
-NAME_SQL_SCHEMA = []
-"#;
+        let analyzer_py = minimal_analyzer_host_boundary();
 
         assert_eq!(
             check_schema_text(
@@ -1423,7 +1690,7 @@ pub enum TxTraceLevel { Boundary = 0 }
         let payload_rs = r#"pub enum TxPayloadTag { CounterValue = 31 }"#;
         let cargo_toml =
             "[workspace.lints.rust]\nunexpected_cfgs = { check-cfg = ['cfg(tx_lock_metrics)'] }";
-        let analyzer_py = "PARQUET_SCHEMAS = {}\nRECORD_SQL_SCHEMA = []\nREPAIR_SQL_SCHEMA = []\nNAME_SQL_SCHEMA = []";
+        let analyzer_py = minimal_analyzer_host_boundary();
 
         let err = check_schema_text(
             schema,
@@ -1443,7 +1710,7 @@ pub enum TxTraceLevel { Boundary = 0 }
     }
 
     #[test]
-    fn check_schema_text_rejects_mismatched_projection_column() {
+    fn check_schema_text_rejects_missing_analyzer_host_boundary() {
         let schema = r#"
 [schema]
 id = "txobserve"
@@ -1468,10 +1735,7 @@ name = "tx_lock_metrics"
 [[host.projections]]
 id = "records"
 kind = "sql_view"
-columns = [
-  { name = "ts", type = "UBIGINT" },
-  { name = "kind", type = "INTEGER" },
-]
+columns = []
 "#;
         let record_rs = r#"
 pub enum TxTraceKind { Counter = 13 }
@@ -1481,13 +1745,7 @@ pub enum TxTraceLevel { Boundary = 0 }
         let cargo_toml =
             "[workspace.lints.rust]\nunexpected_cfgs = { check-cfg = ['cfg(tx_lock_metrics)'] }";
         let analyzer_py = r#"
-PARQUET_SCHEMAS = {}
-RECORD_SQL_SCHEMA = [
-    ("ts", "UBIGINT"),
-    ("kind", "VARCHAR"),
-]
-REPAIR_SQL_SCHEMA = []
-NAME_SQL_SCHEMA = []
+ANALYZER_DECODER_VERSION = "test"
 "#;
 
         let err = check_schema_text(
@@ -1502,7 +1760,216 @@ NAME_SQL_SCHEMA = []
         )
         .unwrap_err();
         assert!(
-            err.contains("host projection mismatch") && err.contains("records"),
+            err.contains("analyzer host boundary mismatch") && err.contains("tx_observe_host"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn check_schema_text_rejects_analyzer_local_projection_schemas() {
+        let schema = r#"
+[schema]
+id = "txobserve"
+version = 0
+
+[[abi.levels]]
+rust = "TxTraceLevel::Boundary"
+value = 0
+
+[[abi.record_kinds]]
+rust = "TxTraceKind::Counter"
+value = 13
+
+[[payloads]]
+id = "counter_value"
+rust_tag = "TxPayloadTag::CounterValue"
+tag = 31
+
+[[controls.cfgs]]
+name = "tx_lock_metrics"
+
+[[host.projections]]
+id = "records"
+kind = "sql_view"
+columns = []
+"#;
+        let record_rs = r#"
+pub enum TxTraceKind { Counter = 13 }
+pub enum TxTraceLevel { Boundary = 0 }
+"#;
+        let payload_rs = r#"pub enum TxPayloadTag { CounterValue = 31 }"#;
+        let cargo_toml =
+            "[workspace.lints.rust]\nunexpected_cfgs = { check-cfg = ['cfg(tx_lock_metrics)'] }";
+        let analyzer_py = r#"
+ANALYZER_DECODER_VERSION = "test"
+class TraceIntegrity:
+    pass
+class TraceStreamMarker:
+    pass
+class TraceEventStream:
+    pass
+class ProjectionInput:
+    pass
+def analyze_projection():
+    pass
+def run_sql_projection():
+    pass
+def export_projection_parquet():
+    pass
+def run_python_projection():
+    pass
+RECORD_SQL_SCHEMA = []
+"#;
+
+        let err = check_schema_text(
+            schema,
+            record_rs,
+            payload_rs,
+            minimal_types_lib_rs(),
+            cargo_toml,
+            analyzer_py,
+            minimal_perfetto_writer(),
+            minimal_hart_emitter_rs(),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("local schema constants") && err.contains("RECORD_SQL_SCHEMA"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn check_schema_text_rejects_analyzer_local_raw_decode() {
+        let schema = r#"
+[schema]
+id = "txobserve"
+version = 0
+
+[[abi.levels]]
+rust = "TxTraceLevel::Boundary"
+value = 0
+
+[[abi.record_kinds]]
+rust = "TxTraceKind::Counter"
+value = 13
+
+[[payloads]]
+id = "counter_value"
+rust_tag = "TxPayloadTag::CounterValue"
+tag = 31
+
+[[controls.cfgs]]
+name = "tx_lock_metrics"
+
+[[host.projections]]
+id = "records"
+kind = "sql_view"
+columns = []
+"#;
+        let record_rs = r#"
+pub enum TxTraceKind { Counter = 13 }
+pub enum TxTraceLevel { Boundary = 0 }
+"#;
+        let payload_rs = r#"pub enum TxPayloadTag { CounterValue = 31 }"#;
+        let cargo_toml =
+            "[workspace.lints.rust]\nunexpected_cfgs = { check-cfg = ['cfg(tx_lock_metrics)'] }";
+        let analyzer_py = r#"
+ANALYZER_DECODER_VERSION = "test"
+from tx_observe_host import TraceIntegrity, TraceEventStream, ProjectionInput
+def decode_record_bytes():
+    pass
+def analyze_projection():
+    pass
+def run_sql_projection():
+    pass
+def export_projection_parquet():
+    pass
+def run_python_projection():
+    pass
+"#;
+
+        let err = check_schema_text(
+            schema,
+            record_rs,
+            payload_rs,
+            minimal_types_lib_rs(),
+            cargo_toml,
+            analyzer_py,
+            minimal_perfetto_writer(),
+            minimal_hart_emitter_rs(),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("raw reader/decode ownership") && err.contains("decode_record_bytes"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn check_schema_text_rejects_analyzer_local_l6_execution() {
+        let schema = r#"
+[schema]
+id = "txobserve"
+version = 0
+
+[[abi.levels]]
+rust = "TxTraceLevel::Boundary"
+value = 0
+
+[[abi.record_kinds]]
+rust = "TxTraceKind::Counter"
+value = 13
+
+[[payloads]]
+id = "counter_value"
+rust_tag = "TxPayloadTag::CounterValue"
+tag = 31
+
+[[controls.cfgs]]
+name = "tx_lock_metrics"
+
+[[host.projections]]
+id = "records"
+kind = "sql_view"
+columns = []
+"#;
+        let record_rs = r#"
+pub enum TxTraceKind { Counter = 13 }
+pub enum TxTraceLevel { Boundary = 0 }
+"#;
+        let payload_rs = r#"pub enum TxPayloadTag { CounterValue = 31 }"#;
+        let cargo_toml =
+            "[workspace.lints.rust]\nunexpected_cfgs = { check-cfg = ['cfg(tx_lock_metrics)'] }";
+        let analyzer_py = r#"
+from tx_observe_host import (
+    ANALYZER_DECODER_VERSION,
+    TraceIntegrity,
+    TraceStreamMarker,
+    TraceEventStream,
+    ProjectionInput,
+    run_sql_projection,
+    export_projection_parquet,
+    run_python_projection,
+)
+def analyze_projection():
+    pass
+def build_derived_tables():
+    pass
+"#;
+
+        let err = check_schema_text(
+            schema,
+            record_rs,
+            payload_rs,
+            minimal_types_lib_rs(),
+            cargo_toml,
+            analyzer_py,
+            minimal_perfetto_writer(),
+            minimal_hart_emitter_rs(),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("L6 table/projection execution") && err.contains("build_derived_tables"),
             "unexpected error: {err}"
         );
     }
@@ -1548,14 +2015,7 @@ pub enum TxTraceLevel { Boundary = 0 }
         let payload_rs = r#"pub enum TxPayloadTag { CounterValue = 31 }"#;
         let cargo_toml =
             "[workspace.lints.rust]\nunexpected_cfgs = { check-cfg = ['cfg(tx_lock_metrics)'] }";
-        let analyzer_py = r#"
-PARQUET_SCHEMAS = {}
-RECORD_SQL_SCHEMA = [
-    ("ts", "UBIGINT"),
-]
-REPAIR_SQL_SCHEMA = []
-NAME_SQL_SCHEMA = []
-"#;
+        let analyzer_py = minimal_analyzer_host_boundary();
 
         let err = check_schema_text(
             schema,
@@ -1619,14 +2079,7 @@ pub enum TxTraceLevel { Boundary = 0 }
         let payload_rs = r#"pub enum TxPayloadTag { CounterValue = 31 }"#;
         let cargo_toml =
             "[workspace.lints.rust]\nunexpected_cfgs = { check-cfg = ['cfg(tx_lock_metrics)'] }";
-        let analyzer_py = r#"
-PARQUET_SCHEMAS = {}
-RECORD_SQL_SCHEMA = [
-    ("ts", "UBIGINT"),
-]
-REPAIR_SQL_SCHEMA = []
-NAME_SQL_SCHEMA = []
-"#;
+        let analyzer_py = minimal_analyzer_host_boundary();
 
         let err = check_schema_text(
             schema,
@@ -1692,7 +2145,7 @@ pub struct PayloadCounterValue {
         let types_lib_rs = "assert!(size_of::<PayloadCounterValue>() == 16);";
         let cargo_toml =
             "[workspace.lints.rust]\nunexpected_cfgs = { check-cfg = ['cfg(tx_lock_metrics)'] }";
-        let analyzer_py = "PARQUET_SCHEMAS = {}\nRECORD_SQL_SCHEMA = []\nREPAIR_SQL_SCHEMA = []\nNAME_SQL_SCHEMA = []";
+        let analyzer_py = minimal_analyzer_host_boundary();
 
         let err = check_schema_text(
             schema,
@@ -1759,7 +2212,7 @@ pub const ALLOC_TRACK_ZONE_SLAB: u64 = EXPLICIT_TRACK_ID_PREFIX | 0x0001;
 "#;
         let cargo_toml =
             "[workspace.lints.rust]\nunexpected_cfgs = { check-cfg = ['cfg(tx_lock_metrics)'] }";
-        let analyzer_py = "PARQUET_SCHEMAS = {}\nRECORD_SQL_SCHEMA = []\nREPAIR_SQL_SCHEMA = []\nNAME_SQL_SCHEMA = []";
+        let analyzer_py = minimal_analyzer_host_boundary();
         let perfetto_writer = r#"
 fn explicit_track_descriptor(track_id: u64) -> Option<(&'static str, u8)> {
     let name = match track_id {
@@ -1831,7 +2284,7 @@ pub enum TxTraceLevel { Boundary = 0 }
         let payload_rs = r#"pub enum TxPayloadTag { CounterValue = 31 }"#;
         let cargo_toml =
             "[workspace.lints.rust]\nunexpected_cfgs = { check-cfg = ['cfg(tx_lock_metrics)'] }";
-        let analyzer_py = "PARQUET_SCHEMAS = {}\nRECORD_SQL_SCHEMA = []\nREPAIR_SQL_SCHEMA = []\nNAME_SQL_SCHEMA = []";
+        let analyzer_py = minimal_analyzer_host_boundary();
         let tx_observe_lib_rs = r#"
 pub struct HartEmitter;
 impl HartEmitter {
@@ -1900,12 +2353,168 @@ producer_allowed = true
         assert!(catalog.contains("producer_allowed: true"));
     }
 
+    #[test]
+    fn render_host_catalog_lists_projection_schemas() {
+        let schema = r#"
+[schema]
+id = "txobserve"
+version = 0
+
+[[abi.levels]]
+rust = "TxTraceLevel::Boundary"
+value = 0
+
+[[abi.record_kinds]]
+rust = "TxTraceKind::Counter"
+value = 13
+
+[[payloads]]
+id = "counter_value"
+rust_tag = "TxPayloadTag::CounterValue"
+tag = 31
+
+[[controls.cfgs]]
+name = "tx_lock_metrics"
+
+[[host.inputs]]
+id = "txtrace"
+extension = ".txtrace"
+reader_target = "TraceReader::TxtraceRegion"
+
+[[host.projections]]
+id = "records"
+kind = "sql_view"
+columns = [
+  { name = "ts", type = "UBIGINT" },
+]
+
+[[host.projections]]
+id = "spans"
+kind = "derived_table"
+file = "spans.parquet"
+columns = [
+  { name = "span", type = "VARCHAR" },
+]
+"#;
+        let schema: ObserveSchema = toml::from_str(schema).expect("parse schema");
+        let catalog = render_host_catalog(&schema).expect("render host catalog");
+
+        assert!(catalog.contains("\"schema\": \"tx-observe-host-catalog-v0\""));
+        assert!(catalog.contains("\"id\": \"txtrace\""));
+        assert!(catalog.contains("\"id\": \"records\""));
+        assert!(catalog.contains("\"file\": \"spans.parquet\""));
+        assert!(catalog.contains("\"columns\""));
+    }
+
+    #[test]
+    fn render_host_catalog_lists_control_groups_and_event_families() {
+        let schema = r#"
+[schema]
+id = "txobserve"
+version = 0
+
+[[abi.levels]]
+rust = "TxTraceLevel::Boundary"
+value = 0
+
+[[abi.record_kinds]]
+rust = "TxTraceKind::Counter"
+value = 13
+
+[[payloads]]
+id = "counter_value"
+rust_tag = "TxPayloadTag::CounterValue"
+tag = 31
+
+[[controls.cfgs]]
+name = "tx_lock_metrics"
+
+[[controls.groups]]
+id = "lock_metrics"
+title = "Lock metrics"
+default = false
+requires_cfg = ["tx_lock_metrics"]
+local_cfgs = ["tx_lock_metrics_vm"]
+events = ["lock_metric"]
+
+[[host.projections]]
+id = "records"
+kind = "sql_view"
+columns = [
+  { name = "ts", type = "UBIGINT" },
+]
+
+[[host.projections]]
+id = "text_report"
+kind = "report"
+coverage_default = "event_specific"
+
+[[event_families]]
+id = "lock"
+levels = ["boundary"]
+payloads = ["counter_value"]
+control_group = "lock_metrics"
+projection = ["records", "text_report"]
+"#;
+        let schema: ObserveSchema = toml::from_str(schema).expect("parse schema");
+        let catalog = render_host_catalog(&schema).expect("render host catalog");
+
+        assert!(catalog.contains("\"cfgs\""));
+        assert!(catalog.contains("\"control_groups\""));
+        assert!(catalog.contains("\"id\": \"lock_metrics\""));
+        assert!(catalog.contains("\"requires_cfg\""));
+        assert!(catalog.contains("\"event_families\""));
+        assert!(catalog.contains("\"control_group\": \"lock_metrics\""));
+        assert!(catalog.contains("\"projection\""));
+    }
+
     fn minimal_types_lib_rs() -> &'static str {
         ""
     }
 
     fn minimal_perfetto_writer() -> &'static str {
         "fn explicit_track_descriptor(track_id: u64) -> Option<(&'static str, u8)> { None }"
+    }
+
+    fn temp_observe_layout_root() -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("tx-observe-layout-{}-{unique}", std::process::id()))
+    }
+
+    fn create_required_observe_layout(root: &Path) {
+        for rel in [
+            "crates/tx-observe/src/l0_schema",
+            "crates/tx-observe/src/l1_probe_api",
+            "crates/tx-observe/src/l2_producer",
+            "crates/tx-observe/src/l3_wire",
+            "tools/tx-trace-daemon/src/l4_readers",
+            "tools/tx-trace-daemon/src/l5_canonical",
+            "tools/tx-trace-daemon/src/l6_views",
+            "tools/tx_observe_host/l4_readers",
+            "tools/tx_observe_host/l5_canonical",
+            "tools/tx_observe_host/l6_views",
+        ] {
+            fs::create_dir_all(root.join(rel)).unwrap();
+        }
+    }
+
+    fn minimal_analyzer_host_boundary() -> &'static str {
+        r#"
+from tx_observe_host import (
+    ANALYZER_DECODER_VERSION,
+    TraceIntegrity,
+    TraceStreamMarker,
+    TraceEventStream,
+    ProjectionInput,
+    analyze_projection,
+    run_sql_projection,
+    export_projection_parquet,
+    run_python_projection,
+)
+"#
     }
 
     fn minimal_hart_emitter_rs() -> &'static str {

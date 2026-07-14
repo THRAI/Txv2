@@ -6,6 +6,7 @@
 use std::io::{self, Write};
 
 use crate::decode::DecodedEvent;
+use crate::l6_views::ProjectionInput;
 
 /// Emit one [`DecodedEvent`] as a newline-delimited JSON record to `stdout`.
 ///
@@ -16,4 +17,13 @@ pub fn emit(event: &DecodedEvent) -> io::Result<()> {
     let mut lock = stdout.lock();
     serde_json::to_writer(&mut lock, event).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     lock.write_all(b"\n")
+}
+
+/// Emit a whole canonical stream as newline-delimited JSON.
+pub fn emit_projection(input: ProjectionInput<'_>) -> io::Result<()> {
+    let _canonical_markers = input.stream.markers();
+    for event in input.stream.events() {
+        emit(event)?;
+    }
+    Ok(())
 }

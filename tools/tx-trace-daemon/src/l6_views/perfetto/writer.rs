@@ -25,12 +25,12 @@ use crate::perfetto::span::{SpanEntry, SpanTable};
 use crate::perfetto::track::TrackRegistry;
 
 use tx_observe_types::payload::{
-    ALLOC_TRACK_DS_METHOD, ALLOC_TRACK_LOCK, ALLOC_TRACK_PAGE_FRAME, ALLOC_TRACK_PAGE_RUN,
-    ALLOC_TRACK_PAGEBACKED_CACHE, ALLOC_TRACK_PAGEBACKED_CONTAINER, ALLOC_TRACK_PID_NAMESPACE,
-    ALLOC_TRACK_PROCESS_IDENTITY, ALLOC_TRACK_PROCESS_PAYLOAD, ALLOC_TRACK_PROCESS_THREADS,
-    ALLOC_TRACK_THREAD_IDENTITY, ALLOC_TRACK_THREAD_PAYLOAD, ALLOC_TRACK_VM_ADDRESS_SPACE,
-    ALLOC_TRACK_VM_PRIVATE_PAGE_NODE, ALLOC_TRACK_VM_RECIPE_NODE, ALLOC_TRACK_ZONE_SLAB,
-    EXPLICIT_TRACK_ID_MASK, EXPLICIT_TRACK_ID_PREFIX,
+    ALLOC_TRACK_DS_METHOD, ALLOC_TRACK_LOCK, ALLOC_TRACK_PAGEBACKED_CACHE,
+    ALLOC_TRACK_PAGEBACKED_CONTAINER, ALLOC_TRACK_PAGE_FRAME, ALLOC_TRACK_PAGE_RUN,
+    ALLOC_TRACK_PID_NAMESPACE, ALLOC_TRACK_PROCESS_IDENTITY, ALLOC_TRACK_PROCESS_PAYLOAD,
+    ALLOC_TRACK_PROCESS_THREADS, ALLOC_TRACK_THREAD_IDENTITY, ALLOC_TRACK_THREAD_PAYLOAD,
+    ALLOC_TRACK_VM_ADDRESS_SPACE, ALLOC_TRACK_VM_PRIVATE_PAGE_NODE, ALLOC_TRACK_VM_RECIPE_NODE,
+    ALLOC_TRACK_ZONE_SLAB, EXPLICIT_TRACK_ID_MASK, EXPLICIT_TRACK_ID_PREFIX,
 };
 use tx_observe_types::{TxPayloadTag, TxTraceKind};
 
@@ -802,12 +802,9 @@ impl PftraceWriter {
             return None;
         }
         let (name, track_kind) = explicit_track_descriptor(track_id)?;
-        let (uuid, maybe_desc) = self.tracks.ensure_kernel_track(
-            track_id,
-            name.to_string(),
-            track_kind,
-            Some(r.hart),
-        );
+        let (uuid, maybe_desc) =
+            self.tracks
+                .ensure_kernel_track(track_id, name.to_string(), track_kind, Some(r.hart));
         if let Some(desc) = maybe_desc {
             self.packets.push(TracePacket {
                 trusted_packet_sequence_id: Some(SEQ_ID),

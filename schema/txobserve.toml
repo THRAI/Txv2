@@ -23,12 +23,20 @@ serialization = "docs/Txv3/08_OBSERVATION_SERIALIZATION_v0.md"
 host = "docs/Txv3/08_OBSERVATION_HOST_v0.md"
 record_abi = "crates/tx-observe-types/src/record.rs"
 payload_abi = "crates/tx-observe-types/src/payload.rs"
-producer = "crates/tx-observe/src/lib.rs"
+producer = "crates/tx-observe/src/l2_producer/runtime.rs"
+kernel_l0_schema = "crates/tx-observe/src/l0_schema/"
+kernel_l1_probe_api = "crates/tx-observe/src/l1_probe_api/"
+kernel_l2_producer = "crates/tx-observe/src/l2_producer/"
+kernel_l3_wire = "crates/tx-observe/src/l3_wire/"
 xtask_surface = "xtask/src/observe.rs"
-daemon_decode = "tools/tx-trace-daemon/src/decode.rs"
-daemon_replay = "tools/tx-trace-daemon/src/replay.rs"
-perfetto_writer = "tools/tx-trace-daemon/src/perfetto/writer.rs"
+host_l4_readers = "tools/tx-trace-daemon/src/l4_readers/"
+host_l5_canonical = "tools/tx-trace-daemon/src/l5_canonical/"
+host_l6_views = "tools/tx-trace-daemon/src/l6_views/"
+daemon_decode = "tools/tx-trace-daemon/src/l5_canonical/decode.rs"
+daemon_replay = "tools/tx-trace-daemon/src/l4_readers/replay.rs"
+perfetto_writer = "tools/tx-trace-daemon/src/l6_views/perfetto/writer.rs"
 analyzer = "tools/tx-observe-analyze.py"
+host_catalog = "tools/tx-observe-host-catalog.json"
 workspace_cfg = "Cargo.toml"
 
 [[abi.levels]]
@@ -752,7 +760,7 @@ source = "Cargo.toml workspace.lints.rust.unexpected_cfgs"
 [[names.families]]
 id = "allocation"
 pattern = "debug.alloc.*"
-source = "xtask/src/observe.rs KERNEL_FNV1A_STABLE_NAMES; tools/tx-trace-daemon/src/perfetto/writer.rs allocation_track_name"
+source = "xtask/src/observe.rs KERNEL_FNV1A_STABLE_NAMES; tools/tx-trace-daemon/src/l6_views/perfetto/writer.rs allocation_track_name"
 projection = ["perfetto", "allocation_rows", "text_report"]
 
 [[names.families]]
@@ -776,25 +784,25 @@ projection = ["counters", "text_report"]
 [[names.families]]
 id = "lock"
 pattern = "debug.lock.*"
-source = "crates/tx-observe/src/lib.rs lock_metric; tools/tx-observe-analyze.py lock_rows"
+source = "crates/tx-observe/src/l2_producer/runtime.rs lock_metric; tools/tx-observe-analyze.py lock_rows"
 projection = ["lock_rows", "text_report", "perfetto"]
 
 [[names.families]]
 id = "lock_track"
 pattern = "debug.lock"
-source = "tools/tx-trace-daemon/src/perfetto/writer.rs explicit_track_descriptor"
+source = "tools/tx-trace-daemon/src/l6_views/perfetto/writer.rs explicit_track_descriptor"
 projection = ["perfetto"]
 
 [[names.families]]
 id = "ds_method"
 pattern = "debug.ds.*"
-source = "crates/tx-observe/src/lib.rs ds_method_metric; tools/tx-observe-analyze.py ds_method_rows"
+source = "crates/tx-observe/src/l2_producer/runtime.rs ds_method_metric; tools/tx-observe-analyze.py ds_method_rows"
 projection = ["ds_method_rows", "text_report", "perfetto"]
 
 [[names.families]]
 id = "ds_method_track"
 pattern = "debug.ds.method"
-source = "tools/tx-trace-daemon/src/perfetto/writer.rs explicit_track_descriptor"
+source = "tools/tx-trace-daemon/src/l6_views/perfetto/writer.rs explicit_track_descriptor"
 projection = ["perfetto"]
 
 [[names.families]]
@@ -909,31 +917,37 @@ name = "debug.ds.method"
 id = "txtrace"
 extension = ".txtrace"
 reader_target = "TraceReader::TxtraceRegion"
-current_source = "tools/tx-trace-daemon/src/replay.rs decode_file_bytes; tools/tx-observe-analyze.py load_txtrace_records"
+current_source = "tools/tx-trace-daemon/src/l4_readers/replay.rs decode_file_bytes; tools/tx-observe-analyze.py load_txtrace_records"
 
 [[host.inputs]]
 id = "rawrecords"
 extension = ".rawrecords"
 reader_target = "TraceReader::RawRecords"
-current_source = "tools/tx-trace-daemon/src/replay.rs live finalize; tools/tx-observe-analyze.py load_rawrecords"
+current_source = "tools/tx-trace-daemon/src/l4_readers/replay.rs live finalize; tools/tx-observe-analyze.py load_rawrecords"
+
+[[host.inputs]]
+id = "rawrecords_gzip"
+extension = ".rawrecords.gz"
+reader_target = "TraceReader::RawRecordsGzip"
+current_source = "tools/tx-trace-daemon/src/l4_readers/live.rs compress_raw_records; tools/tx_observe_host/l4_readers/__init__.py load_rawrecords_stream"
 
 [[host.inputs]]
 id = "live_guest_mem"
 reader_target = "TraceReader::LiveGuestMem"
-current_source = "tools/tx-trace-daemon/src/replay.rs live_guest_mem"
+current_source = "tools/tx-trace-daemon/src/l4_readers/replay.rs live_guest_mem"
 
 [[host.projections]]
 id = "ndjson"
 kind = "transcoder"
 target_type = "NdjsonTranscoder"
-current_source = "tools/tx-trace-daemon/src/replay.rs"
+current_source = "tools/tx-trace-daemon/src/l6_views/emit_json.rs"
 coverage_default = "emit"
 
 [[host.projections]]
 id = "perfetto"
 kind = "transcoder"
 target_type = "PerfettoTranscoder"
-current_source = "tools/tx-trace-daemon/src/perfetto/writer.rs"
+current_source = "tools/tx-trace-daemon/src/l6_views/perfetto/writer.rs"
 coverage_default = "event_specific"
 
 [[host.projections]]
@@ -945,7 +959,7 @@ coverage_default = "event_specific"
 [[host.projections]]
 id = "records"
 kind = "sql_view"
-current_source = "tools/tx-observe-analyze.py RECORD_SQL_SCHEMA"
+current_source = "schema/txobserve.toml host.projections.records; tools/tx-observe-host-catalog.json; tools/tx-observe-analyze.py projection_schema_catalog"
 columns = [
   { name = "ts", type = "UBIGINT" },
   { name = "hart", type = "UINTEGER" },
@@ -961,7 +975,7 @@ columns = [
 [[host.projections]]
 id = "repairs"
 kind = "sql_view"
-current_source = "tools/tx-observe-analyze.py REPAIR_SQL_SCHEMA"
+current_source = "schema/txobserve.toml host.projections.repairs; tools/tx-observe-host-catalog.json; tools/tx-observe-analyze.py projection_schema_catalog"
 columns = [
   { name = "hart", type = "UINTEGER" },
   { name = "seq_around", type = "UBIGINT" },
@@ -973,7 +987,7 @@ columns = [
 id = "spans"
 kind = "derived_table"
 file = "spans.parquet"
-current_source = "tools/tx-observe-analyze.py PARQUET_SCHEMAS"
+current_source = "schema/txobserve.toml host.projections; tools/tx-observe-host-catalog.json; tools/tx-observe-analyze.py projection_schema_catalog"
 columns = [
   { name = "span", type = "VARCHAR" },
   { name = "name_id", type = "UINTEGER" },
@@ -998,7 +1012,7 @@ columns = [
 id = "counters"
 kind = "derived_table"
 file = "counters.parquet"
-current_source = "tools/tx-observe-analyze.py PARQUET_SCHEMAS"
+current_source = "schema/txobserve.toml host.projections; tools/tx-observe-host-catalog.json; tools/tx-observe-analyze.py projection_schema_catalog"
 columns = [
   { name = "ts", type = "UBIGINT" },
   { name = "counter_id", type = "UINTEGER" },
@@ -1009,7 +1023,7 @@ columns = [
 id = "allocation_rows"
 kind = "derived_table"
 file = "allocation_rows.parquet"
-current_source = "tools/tx-observe-analyze.py PARQUET_SCHEMAS"
+current_source = "schema/txobserve.toml host.projections; tools/tx-observe-host-catalog.json; tools/tx-observe-analyze.py projection_schema_catalog"
 columns = [
   { name = "ts", type = "UBIGINT" },
   { name = "track", type = "VARCHAR" },
@@ -1021,7 +1035,7 @@ columns = [
 id = "sched_intervals"
 kind = "derived_table"
 file = "sched_intervals.parquet"
-current_source = "tools/tx-observe-analyze.py PARQUET_SCHEMAS"
+current_source = "schema/txobserve.toml host.projections; tools/tx-observe-host-catalog.json; tools/tx-observe-analyze.py projection_schema_catalog"
 columns = [
   { name = "task", type = "UBIGINT" },
   { name = "pid", type = "UBIGINT" },
@@ -1035,7 +1049,7 @@ columns = [
 id = "lock_rows"
 kind = "derived_table"
 file = "lock_rows.parquet"
-current_source = "tools/tx-observe-analyze.py PARQUET_SCHEMAS"
+current_source = "schema/txobserve.toml host.projections; tools/tx-observe-host-catalog.json; tools/tx-observe-analyze.py projection_schema_catalog"
 columns = [
   { name = "ts", type = "UBIGINT" },
   { name = "hart", type = "UINTEGER" },
@@ -1048,7 +1062,7 @@ columns = [
 id = "ds_method_rows"
 kind = "derived_table"
 file = "ds_method_rows.parquet"
-current_source = "tools/tx-observe-analyze.py PARQUET_SCHEMAS"
+current_source = "schema/txobserve.toml host.projections; tools/tx-observe-host-catalog.json; tools/tx-observe-analyze.py projection_schema_catalog"
 columns = [
   { name = "ts", type = "UBIGINT" },
   { name = "hart", type = "UINTEGER" },
@@ -1061,7 +1075,7 @@ columns = [
 [[host.projections]]
 id = "names"
 kind = "sql_view"
-current_source = "tools/tx-observe-analyze.py NAME_SQL_SCHEMA; xtask/src/observe.rs names"
+current_source = "schema/txobserve.toml host.projections.names; tools/tx-observe-host-catalog.json; tools/tx-observe-analyze.py projection_schema_catalog; xtask/src/observe.rs names"
 columns = [
   { name = "id", type = "UINTEGER" },
   { name = "name", type = "VARCHAR" },
@@ -1138,7 +1152,7 @@ control_group = "always_on_when_observe_enabled"
 projection = ["records", "repairs", "ndjson", "perfetto", "text_report"]
 
 [kernel]
-generated_catalog = "crates/tx-observe/src/generated/schema_catalog.rs"
+generated_catalog = "crates/tx-observe/src/l0_schema/schema_catalog.rs"
 
 [[kernel.hart_emitter_methods]]
 name = "span_begin"
