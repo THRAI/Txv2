@@ -42,6 +42,14 @@ pub struct ServiceWakeSource {
     source: Arc<WaitSource>,
 }
 
+impl core::fmt::Debug for ServiceWakeSource {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ServiceWakeSource")
+            .field("source_id", &self.source_id)
+            .finish_non_exhaustive()
+    }
+}
+
 impl ServiceWakeSource {
     pub fn new(source_id: u64) -> Self {
         Self {

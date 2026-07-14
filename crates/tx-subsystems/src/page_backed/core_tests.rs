@@ -2219,9 +2219,25 @@ fn file_direct_submission_routes_mapped_bio_through_owned_l6_completion() {
     let submission = pc
         .submit_file_direct_read(range, buffer)
         .expect("admit direct read");
+    let wake_source = Arc::new(ServiceWakeSource::new(0x7102));
+    assert!(pc.attach_file_io_wake_source(Arc::clone(&wake_source)));
+    let mailbox = Arc::new(tx_substrate::wake::TaskMailbox::new());
+    let generation = mailbox.next_generation();
+    let _subscription = wake_source.subscribe(
+        IoServiceKind::Block,
+        Arc::downgrade(&mailbox),
+        generation,
+    );
 
     pc.enqueue_file_direct_submission(&submission)
         .expect("plan and enqueue mapped direct bio");
+    assert!(matches!(
+        mailbox.poll(),
+        Some(tx_substrate::wake::MailboxEvent::SourceFired {
+            generation: seen_generation,
+            ..
+        }) if seen_generation == generation
+    ));
     assert_eq!(pc.file_io_block_queue_len_for_test(), 1);
     assert_eq!(pc.direct_io_block_tracker_len_for_test(), 1);
     assert_eq!(pc.direct_io_in_flight_count_for_test(), 1);

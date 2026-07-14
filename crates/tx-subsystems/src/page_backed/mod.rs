@@ -39,7 +39,9 @@ use crate::io_manager::page::{
         PageWaitInterest, PageWaiter,
     },
 };
-use crate::io_manager::runtime::{IoServiceKind, QueueDepth, ServiceBudget, ServiceKick};
+use crate::io_manager::runtime::{
+    IoServiceKind, QueueDepth, ServiceBudget, ServiceKick, ServiceWakeSource,
+};
 use crate::mount::{MountPayloadBackendContext, MountPayloadPin};
 use crate::sync::SpinMutex;
 use crate::vfs::{FsObjectId, OpenFile};
@@ -667,6 +669,7 @@ struct PageContainerState {
     file_io_leases: BTreeMap<PageIoRequestId, PageLease>,
     file_io_read_targets: BTreeMap<PageIoRequestId, CachedFrame>,
     file_block_runtime: FileIoBlockRuntime,
+    file_io_wake: Option<Arc<ServiceWakeSource>>,
     range_reservations: RangeReservationTable,
     direct_io_in_flight: BTreeMap<IoDataLeaseId, direct_io::DirectIoInFlight>,
     // Page-scoped retry sources are retained so a task that already received
@@ -952,6 +955,7 @@ impl PageContainer {
                 file_io_leases: BTreeMap::new(),
                 file_io_read_targets: BTreeMap::new(),
                 file_block_runtime: FileIoBlockRuntime::new(1024, 16),
+                file_io_wake: None,
                 range_reservations: RangeReservationTable::new(),
                 direct_io_in_flight: BTreeMap::new(),
                 file_page_waits: BTreeMap::new(),
@@ -1024,6 +1028,18 @@ impl PageContainer {
             mount.payload(),
             FsObjectKey::new(fs_object_id.as_u64()),
         ))
+    }
+
+    /// Bind the page container to the service wake endpoint owned by its
+    /// registered L6 executor. The endpoint is a neutral I/O-manager runtime
+    /// handle, not a concrete device reference.
+    pub fn attach_file_io_wake_source(&self, wake_source: Arc<ServiceWakeSource>) -> bool {
+        let mut state = self.state.lock();
+        if state.file_io_wake.is_some() {
+            return false;
+        }
+        state.file_io_wake = Some(wake_source);
+        true
     }
 
     /// Reserve an idle range for a direct write. The owner keeps the returned
@@ -1206,7 +1222,13 @@ impl PageContainer {
                 }
             }
         };
-        queued.map_err(|error| DirectIoSubmissionError::Queue(direct_queue_errno(error)))
+        match queued {
+            Ok(()) => {
+                self.kick_file_io_service(IoServiceKind::Block);
+                Ok(())
+            }
+            Err(error) => Err(DirectIoSubmissionError::Queue(direct_queue_errno(error))),
+        }
     }
 
     #[cfg(test)]
@@ -1393,6 +1415,15 @@ impl PageContainer {
         debug_assert!(
             matches!(completion, Err(DirectIoCompletionError::Backend(found)) if found == errno)
         );
+    }
+
+    fn kick_file_io_service(&self, service: IoServiceKind) {
+        let wake_source = self.state.lock().file_io_wake.clone();
+        if let Some(wake_source) = wake_source {
+            let _ = wake_source.kick_with_post(ServiceKick::new(service), |mailbox, event| {
+                mailbox.post(event)
+            });
+        }
     }
 
     /// Move one dirty file page into the L4 writeback queue.

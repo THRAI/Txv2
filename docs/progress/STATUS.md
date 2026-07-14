@@ -1,3 +1,12 @@
+- 2026-07-14 (ext4 I/O-manager 6F direct-I/O service wake attachment).
+  PageContainer now owns an optional neutral ServiceWakeSource. After a direct
+  bio enters owned L6, PageBacked releases state and posts a Block service
+  kick, without retaining a concrete device or driver. PageBacked 135/135 and
+  the focused `tx-subsystems` library check passed. The device runtime must
+  install the attachment during its own registration; completion wait/result,
+  ext4 runtime registration, O_DIRECT syscall, msync/syncfs, and 6G remain
+  open. See `docs/progress/research/2026-07-14-direct-io-service-wake.md`.
+
 - 2026-07-14 (ext4 I/O-manager 6F user-page DMA lease foundation).
   Added the PageBacked-owned `DirectIoBuffer` lease. After the caller has
   eagerly materialized and permission-checked a user range through VM, L4
