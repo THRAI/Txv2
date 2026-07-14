@@ -53,6 +53,24 @@ pub trait Ext4ReadMappingSource: Send + Sync + 'static {
     }
 }
 
+/// Journal-owned fsync planning for one mounted ext4 instance.
+///
+/// The source retains prepared JBD2 records and their page leases while L6
+/// executes the graph. The generic page mapper only asks for the graph; it
+/// never owns journal state or performs I/O under its metadata lock.
+pub trait Ext4FsyncPlanSource: Send + Sync + 'static {
+    fn plan_fsync(&self, request: &BackendPageRequest) -> BackendPlan;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UnsupportedExt4FsyncPlan;
+
+impl Ext4FsyncPlanSource for UnsupportedExt4FsyncPlan {
+    fn plan_fsync(&self, _request: &BackendPageRequest) -> BackendPlan {
+        BackendPlan::Err(Errno::ENOSYS)
+    }
+}
+
 /// Concurrent extent roots and child-node cache owned by the ext4 metadata path.
 ///
 /// An uncached extent child becomes `MetadataFirst`; its L6 completion fills
@@ -185,9 +203,10 @@ impl Ext4ReadMappingSource for Ext4MappingTable {
     }
 }
 
-pub struct Ext4ReadPlanner<S> {
+pub struct Ext4ReadPlanner<S, J = UnsupportedExt4FsyncPlan> {
     geometry: Ext4BlockGeometry,
     mapping: S,
+    fsync: J,
 }
 
 /// Shared ext4 L5 planner state for one mounted filesystem.
@@ -208,6 +227,19 @@ impl Ext4PlannerBinding {
         Self { planner, mapping }
     }
 
+    pub fn with_fsync_plan_source<J>(geometry: Ext4BlockGeometry, fsync: J) -> Self
+    where
+        J: Ext4FsyncPlanSource,
+    {
+        let mapping = Arc::new(Ext4MappingTable::new());
+        let planner: Arc<dyn BackendPlanner> = Arc::new(Ext4ReadPlanner::with_fsync_plan_source(
+            geometry,
+            Arc::clone(&mapping),
+            fsync,
+        ));
+        Self { planner, mapping }
+    }
+
     pub fn planner(&self) -> Arc<dyn BackendPlanner> {
         Arc::clone(&self.planner)
     }
@@ -219,7 +251,25 @@ impl Ext4PlannerBinding {
 
 impl<S> Ext4ReadPlanner<S> {
     pub const fn new(geometry: Ext4BlockGeometry, mapping: S) -> Self {
-        Self { geometry, mapping }
+        Self {
+            geometry,
+            mapping,
+            fsync: UnsupportedExt4FsyncPlan,
+        }
+    }
+}
+
+impl<S, J> Ext4ReadPlanner<S, J> {
+    pub const fn with_fsync_plan_source(
+        geometry: Ext4BlockGeometry,
+        mapping: S,
+        fsync: J,
+    ) -> Self {
+        Self {
+            geometry,
+            mapping,
+            fsync,
+        }
     }
 }
 
@@ -239,7 +289,7 @@ impl Ext4ReadMappingSource for Arc<Ext4MappingTable> {
     }
 }
 
-impl<S: Ext4ReadMappingSource> BackendPlanner for Ext4ReadPlanner<S> {
+impl<S: Ext4ReadMappingSource, J: Ext4FsyncPlanSource> BackendPlanner for Ext4ReadPlanner<S, J> {
     fn plan_page_io(&self, request: BackendPageRequest) -> BackendPlan {
         match request.op {
             tx_subsystems::io_manager::page::PageIoOp::Read
@@ -249,7 +299,7 @@ impl<S: Ext4ReadMappingSource> BackendPlanner for Ext4ReadPlanner<S> {
             tx_subsystems::io_manager::page::PageIoOp::Writeback => {
                 plan_writeback_request(self.geometry, &request, self.mapping.map_page(&request))
             }
-            tx_subsystems::io_manager::page::PageIoOp::Fsync => BackendPlan::Err(Errno::ENOSYS),
+            tx_subsystems::io_manager::page::PageIoOp::Fsync => self.fsync.plan_fsync(&request),
         }
     }
 
@@ -654,6 +704,16 @@ mod tests {
         }
     }
 
+    struct GraphFsyncSource;
+
+    impl Ext4FsyncPlanSource for GraphFsyncSource {
+        fn plan_fsync(&self, _request: &BackendPageRequest) -> BackendPlan {
+            let graph = tx_subsystems::fs_iface::BackendBioGraph::new(vec![], vec![])
+                .expect("empty graph is a valid already-complete transaction");
+            BackendPlan::SubmitGraph(graph)
+        }
+    }
+
     #[test]
     fn ext4_read_planner_delegates_mapping_without_owning_io() {
         let planner = Ext4ReadPlanner::new(
@@ -679,6 +739,29 @@ mod tests {
         );
         let plan = planner.plan_page_io(request);
         assert!(matches!(plan, BackendPlan::Complete(_)));
+    }
+
+    #[test]
+    fn ext4_fsync_planner_delegates_prepared_journal_graph_to_l4() {
+        let planner = Ext4ReadPlanner::with_fsync_plan_source(
+            Ext4BlockGeometry::new(DeviceKey::new(7), 8),
+            FixedMapping {
+                mapping: Ext4ReadMapping::Hole,
+            },
+            GraphFsyncSource,
+        );
+        let request = BackendPageRequest::new_with_source_and_target(
+            tx_subsystems::fs_iface::FsObjectKey::new(3),
+            tx_subsystems::io_manager::page::PageIoRequestId::new(4),
+            tx_subsystems::io_manager::page::PageIoRange::new(0, 1),
+            tx_subsystems::io_manager::page::PageIoOp::Fsync,
+            tx_subsystems::io_manager::page::PageIoFlags::BARRIER,
+            None,
+            IoDataSource::None,
+            IoDataTarget::None,
+        );
+
+        assert!(matches!(planner.plan_page_io(request), BackendPlan::SubmitGraph(_)));
     }
 
     #[test]
