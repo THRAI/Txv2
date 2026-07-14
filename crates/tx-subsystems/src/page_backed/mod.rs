@@ -21,13 +21,13 @@ use adapter::step_engine::{
 };
 
 use crate::execution::{Errno, Guard};
-use crate::fs_iface::{FsObjectKey, IoDataLeaseId, IoDataSource, IoDataTarget};
+use crate::fs_iface::{BackendPlan, FsObjectKey, IoDataLeaseId, IoDataSource, IoDataTarget};
 use crate::io_manager::backend::{
     BlockPageCompletion, BlockPageRequestTracker, PageFrameRef, dispatch_backend_plan,
 };
 use crate::io_manager::block::{
-    BlockCompletionSource, BlockDispatchExecutor, BlockQueue, BlockServiceDriver, BlockServiceNext,
-    BlockTagTable,
+    BlockCompletion, BlockCompletionSource, BlockDispatchExecutor, BlockQueue, BlockRequestId,
+    BlockServiceDriver, BlockServiceNext, BlockTagTable, QueueError, SubmitOutcome,
 };
 use crate::io_manager::page::{
     PageContainerKey, PageGeneration, PageIoCompletionKind, PageIoFlags, PageIoOp, PageIoPriority,
@@ -273,6 +273,17 @@ pub enum DirectIoCompletionError {
         actual: RangeReservationKind,
     },
     Backend(Errno),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirectIoSubmissionError {
+    UnknownLease(IoDataLeaseId),
+    OperationMismatch,
+    Busy(IoDataLeaseId),
+    MissingBackendPlanner,
+    Backend(Errno),
+    UnsupportedBackendPlan,
+    Queue(Errno),
 }
 
 #[derive(Debug, Default)]
@@ -669,6 +680,7 @@ struct PageContainerState {
 struct FileIoBlockRuntime {
     queue: BlockQueue,
     tracker: BlockPageRequestTracker,
+    direct_tracker: DirectIoBlockTracker,
     depth: QueueDepth,
     tags: BlockTagTable,
 }
@@ -678,9 +690,44 @@ impl FileIoBlockRuntime {
         Self {
             queue: BlockQueue::new(max_pending),
             tracker: BlockPageRequestTracker::new(),
+            direct_tracker: DirectIoBlockTracker::default(),
             depth: QueueDepth::new(queue_depth),
             tags: BlockTagTable::new(),
         }
+    }
+}
+
+#[derive(Debug, Default)]
+struct DirectIoBlockTracker {
+    pending: BTreeMap<BlockRequestId, Vec<IoDataLeaseId>>,
+}
+
+impl DirectIoBlockTracker {
+    fn record(&mut self, lease: IoDataLeaseId, outcome: SubmitOutcome) {
+        let id = match outcome {
+            SubmitOutcome::Queued(id) | SubmitOutcome::Merged(id) => id,
+        };
+        let leases = self.pending.entry(id).or_default();
+        if !leases.contains(&lease) {
+            leases.push(lease);
+        }
+    }
+
+    fn complete(
+        &mut self,
+        completion: &BlockCompletion,
+    ) -> Vec<(IoDataLeaseId, Result<(), Errno>)> {
+        self.pending
+            .remove(&completion.id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|lease| (lease, completion.result))
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.pending.len()
     }
 }
 
@@ -1038,6 +1085,7 @@ impl PageContainer {
             reservation,
             buffer,
             operation,
+            ..
         } = in_flight;
         let completion = match operation {
             DirectIoOperation::Read => self
@@ -1051,9 +1099,124 @@ impl PageContainer {
         completion
     }
 
+    /// Plan a previously admitted direct-I/O lease and put its mapped data bio
+    /// on the owned L6 queue. The lease remains PageContainer-owned until the
+    /// matching tagged device completion reaches `complete_file_direct_submission`.
+    pub fn enqueue_file_direct_submission(
+        &self,
+        submission: &DirectIoSubmission,
+    ) -> Result<(), DirectIoSubmissionError> {
+        let lease = submission.lease_id();
+        {
+            let mut state = self.state.lock();
+            let Some(in_flight) = state.direct_io_in_flight.get_mut(&lease) else {
+                return Err(DirectIoSubmissionError::UnknownLease(lease));
+            };
+            if in_flight.operation != submission.operation() {
+                return Err(DirectIoSubmissionError::OperationMismatch);
+            }
+            if !matches!(in_flight.state, direct_io::DirectIoInFlightState::Admitted) {
+                return Err(DirectIoSubmissionError::Busy(lease));
+            }
+            in_flight.state = direct_io::DirectIoInFlightState::Planning;
+        }
+
+        let Some(context) = self.file_backend_context() else {
+            self.fail_file_direct_submission(lease, Errno::ENOSYS);
+            return Err(DirectIoSubmissionError::MissingBackendPlanner);
+        };
+        let (op, priority, flags) = match submission.operation() {
+            DirectIoOperation::Read => {
+                (PageIoOp::Read, PageIoPriority::Demand, PageIoFlags::DEMAND)
+            }
+            DirectIoOperation::Write => (
+                PageIoOp::Writeback,
+                PageIoPriority::ForegroundWrite,
+                PageIoFlags::WRITEBACK,
+            ),
+        };
+        let request = PageIoRequest::new(
+            PageIoRequestId::new(lease.raw()),
+            self.io_manager_key(),
+            PageIoRange::new(
+                submission.range().start().as_u64(),
+                submission.range().page_count(),
+            ),
+            op,
+            priority,
+            flags,
+            Some(PageGeneration::new(lease.raw())),
+        );
+        let Some(plan) = context
+            .payload()
+            .plan_backend_page_request_with_source_and_target(
+                context.object(),
+                request,
+                submission.source().cloned().unwrap_or(IoDataSource::None),
+                submission.target().cloned().unwrap_or(IoDataTarget::None),
+            )
+        else {
+            self.fail_file_direct_submission(lease, Errno::ENOSYS);
+            return Err(DirectIoSubmissionError::MissingBackendPlanner);
+        };
+        let bio = match plan {
+            BackendPlan::SubmitBios(bios) if bios.as_slice().len() == 1 => bios
+                .into_vec()
+                .into_iter()
+                .next()
+                .expect("checked one direct bio"),
+            BackendPlan::Err(errno) => {
+                self.fail_file_direct_submission(lease, errno);
+                return Err(DirectIoSubmissionError::Backend(errno));
+            }
+            _ => {
+                self.fail_file_direct_submission(lease, Errno::ENOSYS);
+                return Err(DirectIoSubmissionError::UnsupportedBackendPlan);
+            }
+        };
+
+        let queued = {
+            let mut state = self.state.lock();
+            let Some(in_flight) = state.direct_io_in_flight.get(&lease) else {
+                return Err(DirectIoSubmissionError::UnknownLease(lease));
+            };
+            if !matches!(in_flight.state, direct_io::DirectIoInFlightState::Planning) {
+                return Err(DirectIoSubmissionError::Busy(lease));
+            }
+            match state.file_block_runtime.queue.submit(bio) {
+                Ok(outcome) => {
+                    state
+                        .file_block_runtime
+                        .direct_tracker
+                        .record(lease, outcome);
+                    state
+                        .direct_io_in_flight
+                        .get_mut(&lease)
+                        .expect("direct lease stayed registered through planning")
+                        .state = direct_io::DirectIoInFlightState::Queued;
+                    Ok(())
+                }
+                Err(error) => {
+                    state
+                        .direct_io_in_flight
+                        .get_mut(&lease)
+                        .expect("direct lease stayed registered through planning")
+                        .state = direct_io::DirectIoInFlightState::Admitted;
+                    Err(error)
+                }
+            }
+        };
+        queued.map_err(|error| DirectIoSubmissionError::Queue(direct_queue_errno(error)))
+    }
+
     #[cfg(test)]
     pub fn direct_io_in_flight_count_for_test(&self) -> usize {
         self.state.lock().direct_io_in_flight.len()
+    }
+
+    #[cfg(test)]
+    pub fn direct_io_block_tracker_len_for_test(&self) -> usize {
+        self.state.lock().file_block_runtime.direct_tracker.len()
     }
 
     /// Complete a direct write and conservatively invalidate overlapped clean
@@ -1203,6 +1366,7 @@ impl PageContainer {
                         reservation,
                         buffer,
                         operation,
+                        state: direct_io::DirectIoInFlightState::Admitted,
                     },
                 );
                 false
@@ -1222,6 +1386,13 @@ impl PageContainer {
         };
         debug_assert!(release.is_ok());
         Err(DirectIoAdmissionError::DuplicateLease(lease))
+    }
+
+    fn fail_file_direct_submission(&self, lease: IoDataLeaseId, errno: Errno) {
+        let completion = self.complete_file_direct_submission(lease, Err(errno));
+        debug_assert!(
+            matches!(completion, Err(DirectIoCompletionError::Backend(found)) if found == errno)
+        );
     }
 
     /// Move one dirty file page into the L4 writeback queue.
@@ -1603,23 +1774,35 @@ impl PageContainer {
         let mut next = driven.step.next;
         while let Some(completion) = executor.poll_completion() {
             device_completions += 1;
-            let outcome = {
+            let (outcome, direct_completions) = {
                 let mut state = self.state.lock();
                 let PageContainerState {
                     file_io_service,
                     file_block_runtime,
                     ..
                 } = &mut *state;
-                file_io_service.push_tagged_block_completion_with_graphs(
-                    &mut file_block_runtime.tags,
+                let block_completion = file_block_runtime.tags.complete(
                     &mut file_block_runtime.depth,
-                    &mut file_block_runtime.tracker,
-                    &mut file_block_runtime.queue,
                     completion.tag,
                     completion.result,
+                )?;
+                let direct_completions = file_block_runtime
+                    .direct_tracker
+                    .complete(&block_completion);
+                let allow_external_completion = !direct_completions.is_empty();
+                let outcome = file_io_service.push_completed_block_completion_with_graphs(
+                    &mut file_block_runtime.tracker,
+                    &mut file_block_runtime.queue,
+                    block_completion,
+                    allow_external_completion,
                     &mut frame_for,
-                )?
+                )?;
+                (outcome, direct_completions)
             };
+            for (lease, result) in direct_completions {
+                self.complete_file_direct_submission(lease, result)
+                    .map_err(|_| PageServiceTaggedBlockCompletionError::ExternalCompletion)?;
+            }
             page_completions += outcome.queued;
             if outcome.wake.is_some() {
                 kicks += usize::from(kick(ServiceKick::new(IoServiceKind::Page)));
@@ -3104,6 +3287,13 @@ fn materialized_snapshot_from_state(
         newly_installed,
         dirty: entry.marks.dirty,
     })
+}
+
+const fn direct_queue_errno(error: QueueError) -> Errno {
+    match error {
+        QueueError::Full | QueueError::DispatchDepthFull => Errno::EAGAIN,
+        QueueError::EmptyRange => Errno::EINVAL,
+    }
 }
 
 fn record_file_service_block_submissions(

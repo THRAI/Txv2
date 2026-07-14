@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::io_manager::block::BioVec;
-use crate::vm::{AccessMode, AddressSpace, UserAccessKind, UserRange, USER_PAGE_SIZE};
+use crate::vm::{AccessMode, AddressSpace, USER_PAGE_SIZE, UserAccessKind, UserRange};
 use tx_hal::UserPtr;
 use tx_substrate::page_allocator::{self, DmaPin};
 
@@ -91,11 +91,19 @@ pub enum DirectIoCompletion {
     Write { invalidated: usize },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DirectIoInFlightState {
+    Admitted,
+    Planning,
+    Queued,
+}
+
 #[derive(Debug)]
 pub(crate) struct DirectIoInFlight {
     pub(crate) reservation: RangeReservation,
     pub(crate) buffer: DirectIoBuffer,
     pub(crate) operation: DirectIoOperation,
+    pub(crate) state: DirectIoInFlightState,
 }
 
 /// A pinned user buffer that can cross the L4 -> L5 -> L6 async boundary.

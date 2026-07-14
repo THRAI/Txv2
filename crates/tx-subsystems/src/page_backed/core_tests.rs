@@ -2154,6 +2154,115 @@ fn file_direct_submission_holds_dma_lease_until_terminal_completion() {
 }
 
 #[test]
+fn file_direct_submission_routes_mapped_bio_through_owned_l6_completion() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+
+    struct DirectBioPlanner;
+
+    impl BackendPlanner for DirectBioPlanner {
+        fn plan_page_io(&self, request: BackendPageRequest) -> BackendPlan {
+            let vecs = match request.target {
+                crate::fs_iface::IoDataTarget::Direct { vecs, .. } => vecs,
+                other => panic!("direct read must keep direct target, got {other:?}"),
+            };
+            BackendPlan::SubmitBios(BioPlanList::from_vec(alloc::vec![BioPlan::new(
+                DeviceKey::new(41),
+                BlockOp::Read,
+                LbaRange::new(128, 8),
+                vecs,
+                BlockFlags::EMPTY,
+            )]))
+        }
+    }
+
+    let fs = Arc::new(RecordingFs::new());
+    let pc = file_page_container_with_planner(
+        fs.clone(),
+        fs,
+        FsObjectId::new(106),
+        4,
+        Arc::new(DirectBioPlanner),
+    );
+    let aspace = crate::vm::AddressSpace::new();
+    let user_range = crate::vm::UserRange::new_aligned(
+        crate::vm::UserVirtAddr::new(0x30_000),
+        crate::vm::USER_PAGE_SIZE,
+    )
+    .expect("aligned user range");
+    let commit = match aspace.reserve_map(
+        crate::vm::VmEntry::new(
+            user_range,
+            crate::vm::Prot::READ_WRITE,
+            crate::vm::VmEntryFlags::PRIVATE,
+            crate::vm::VmBacking::PrivateAnon,
+        ),
+        crate::vm::MapPlacement::RequireFree,
+    ) {
+        crate::vm::MapReserveResult::Reserved(reservation) => reservation.commit(),
+        other => panic!("expected user map reservation, got {other:?}"),
+    };
+    commit.expect("commit user map");
+    assert!(matches!(
+        aspace.reserve_user_range_for_access(user_range, crate::vm::UserAccessKind::Write),
+        V3Out::Done(())
+    ));
+    let buffer = DirectIoBuffer::pin(
+        &aspace,
+        UserPtr::new(0x30_000),
+        crate::vm::USER_PAGE_SIZE,
+        crate::vm::UserAccessKind::Write,
+    )
+    .expect("pin direct read target");
+    let lease = buffer.lease_id();
+    let range = PageRange::new(PageIndex::new(1), 1);
+    let submission = pc
+        .submit_file_direct_read(range, buffer)
+        .expect("admit direct read");
+
+    pc.enqueue_file_direct_submission(&submission)
+        .expect("plan and enqueue mapped direct bio");
+    assert_eq!(pc.file_io_block_queue_len_for_test(), 1);
+    assert_eq!(pc.direct_io_block_tracker_len_for_test(), 1);
+    assert_eq!(pc.direct_io_in_flight_count_for_test(), 1);
+
+    struct CompletingExecutor {
+        completions: VecDeque<BlockDeviceCompletion>,
+    }
+
+    impl BlockDispatchExecutor for CompletingExecutor {
+        fn submit(&mut self, dispatch: &BlockDispatch) {
+            self.completions
+                .push_back(BlockDeviceCompletion::new(dispatch.tag, Ok(())));
+        }
+    }
+
+    impl BlockCompletionSource for CompletingExecutor {
+        fn poll_completion(&mut self) -> Option<BlockDeviceCompletion> {
+            self.completions.pop_front()
+        }
+    }
+
+    let mut executor = CompletingExecutor {
+        completions: VecDeque::new(),
+    };
+    let turn = pc
+        .drive_file_block_io_service_once(ServiceBudget::new(1), &mut executor, |_| None, |_| true)
+        .expect("owned L6 direct completion");
+    assert_eq!(turn.dispatched, 1);
+    assert_eq!(turn.device_completions, 1);
+    assert_eq!(turn.page_completions, 0);
+    assert_eq!(pc.direct_io_block_tracker_len_for_test(), 0);
+    assert_eq!(pc.direct_io_in_flight_count_for_test(), 0);
+    let reread = pc
+        .begin_file_direct_read(range)
+        .expect("terminal direct completion releases range reservation");
+    pc.complete_file_direct_read(reread, Ok(()))
+        .expect("release direct-read verification reservation");
+    assert_eq!(submission.lease_id(), lease);
+}
+
+#[test]
 fn file_page_bio_only_plan_drives_owned_l6_through_block_device_handle() {
     let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
     setup_host_substrate();

@@ -176,6 +176,7 @@ pub enum PageServiceTaggedBlockCompletionError {
     Block(BlockCompletionError),
     Page(PageServiceBlockCompletionError),
     Graph(BackendGraphSchedulerError),
+    ExternalCompletion,
 }
 
 impl From<BlockCompletionError> for PageServiceTaggedBlockCompletionError {
@@ -532,11 +533,40 @@ impl PageService {
         F: FnMut(&BlockPageCompletion) -> Option<PageFrameRef>,
     {
         let completion = tags.complete(depth, tag, result)?;
+        self.push_completed_block_completion_with_graphs(
+            tracker,
+            block_queue,
+            completion,
+            false,
+            frame_for,
+        )
+    }
+
+    /// Route a block completion whose tag/depth ownership was consumed by an
+    /// adjacent L4 client. This keeps page, graph, metadata, and direct-I/O
+    /// users on one L6 queue without making those users masquerade as pages.
+    pub fn push_completed_block_completion_with_graphs<F>(
+        &mut self,
+        tracker: &mut BlockPageRequestTracker,
+        block_queue: &mut BlockQueue,
+        completion: BlockCompletion,
+        allow_external_completion: bool,
+        frame_for: F,
+    ) -> Result<PageServiceBlockCompletionOutcome, PageServiceTaggedBlockCompletionError>
+    where
+        F: FnMut(&BlockPageCompletion) -> Option<PageFrameRef>,
+    {
         let graph = self.complete_graph_block(&completion, block_queue)?;
         let (metadata_handled, metadata_wake) =
             self.complete_metadata_block(completion.id, completion.result);
         let tracked = tracker.contains(completion.id);
-        if !tracked && (metadata_handled || graph.is_some()) {
+        if !tracked {
+            if !metadata_handled && graph.is_none() && !allow_external_completion {
+                return Err(PageServiceBlockCompletionError::Tracker(
+                    BlockPageRequestTrackerError::UnknownBlockRequest(completion.id),
+                )
+                .into());
+            }
             let (queued, graph_wake, block_submitted) = graph.unwrap_or((0, None, 0));
             return Ok(PageServiceBlockCompletionOutcome {
                 queued,
