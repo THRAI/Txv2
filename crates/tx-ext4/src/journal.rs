@@ -5,12 +5,20 @@
 //! state and L6 executes the resulting graph.
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 
+use tx_ext4_format::journal::JBD2_BLOCK_SIZE;
+use tx_substrate::zone::Cap;
+use tx_subsystems::execution::{Guard, StepOutcome};
 use tx_subsystems::fs_iface::{
     BackendBioDependency, BackendBioGraph, BackendBioGraphError, BackendBioNode, BackendBioNodeId,
-    IoDataSource,
+    IoDataLeaseId, IoDataSource, PageFrameRef,
 };
-use tx_subsystems::io_manager::block::{BioPlan, BlockFlags, BlockOp, DeviceKey, LbaRange};
+use tx_subsystems::io_manager::block::{BioPlan, BioVec, BlockFlags, BlockOp, DeviceKey, LbaRange};
+use tx_subsystems::page_backed::{
+    AnonSwapPolicy, MaterializeAccess, PageCacheError, PageContainer, PageContainerKind, PageIndex,
+    PageLease,
+};
 
 /// One L5-owned write buffer retained until its L6 completion.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -217,4 +225,115 @@ fn fence(device: DeviceKey) -> JournalBio {
         ),
         IoDataSource::None,
     )
+}
+
+/// Errors while staging encoded JBD2 records in a private metadata page pool.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JournalPagePoolError {
+    Capacity,
+    UnsupportedPageSize,
+    Page(PageCacheError),
+    FrameAddress,
+    WouldBlock,
+    Zone,
+}
+
+/// One page-backed JBD2 record retained until its L6 request has completed.
+#[derive(Debug)]
+pub struct JournalRecordLease {
+    page: PageIndex,
+    lease: PageLease,
+}
+
+impl JournalRecordLease {
+    pub const fn ppn(&self) -> tx_hal::Ppn {
+        self.lease.ppn()
+    }
+
+    pub const fn page(&self) -> PageIndex {
+        self.page
+    }
+
+    /// Build an L5-owned journal record write without relinquishing this lease.
+    pub fn as_journal_bio(&self, device: DeviceKey, lba: LbaRange) -> JournalBio {
+        let ppn = self.lease.ppn();
+        JournalBio::new(
+            BioPlan::new(
+                device,
+                BlockOp::Write,
+                lba,
+                alloc::vec![BioVec::new(ppn.0 as u64, 0, JBD2_BLOCK_SIZE as u32)],
+                BlockFlags::EMPTY,
+            ),
+            IoDataSource::page_cache(
+                IoDataLeaseId::new(self.page.as_u64().saturating_add(1)),
+                PageFrameRef::new(ppn),
+                0,
+                JBD2_BLOCK_SIZE as u32,
+            ),
+        )
+    }
+}
+
+/// Private persistent metadata pages used for journal descriptor/data/commit records.
+///
+/// A pool page is allocated once and remains owned by the PageContainer. Each
+/// staged record additionally carries a `PageLease`; callers retain that lease
+/// through graph completion before allowing the record to be recycled.
+pub struct JournalPagePool {
+    pages: Cap<PageContainer>,
+    next_page: AtomicU64,
+}
+
+impl JournalPagePool {
+    pub fn new(page_capacity: u64) -> Result<Self, JournalPagePoolError> {
+        if tx_subsystems::vm::USER_PAGE_SIZE != JBD2_BLOCK_SIZE {
+            return Err(JournalPagePoolError::UnsupportedPageSize);
+        }
+        let pages = PageContainer::new_cap(
+            PageContainerKind::Anon {
+                swap_policy: AnonSwapPolicy::Persistent,
+            },
+            page_capacity,
+        )
+        .map_err(|_| JournalPagePoolError::Zone)?;
+        Ok(Self {
+            pages,
+            next_page: AtomicU64::new(0),
+        })
+    }
+
+    pub fn stage(
+        &self,
+        bytes: &[u8; JBD2_BLOCK_SIZE],
+        guard: &Guard<'_>,
+    ) -> Result<JournalRecordLease, JournalPagePoolError> {
+        let page = PageIndex::new(self.next_page.fetch_add(1, Ordering::AcqRel));
+        if page.as_u64() >= self.pages.page_count() {
+            return Err(JournalPagePoolError::Capacity);
+        }
+
+        let materialized = self
+            .pages
+            .materialize_anon(page, MaterializeAccess::Write)
+            .map_err(JournalPagePoolError::Page)?;
+        let address = tx_substrate::page_allocator::frame_kernel_addr(materialized.ppn)
+            .map_err(|_| JournalPagePoolError::FrameAddress)?;
+        // `materialized.map_pin` keeps this page live and mapped until the copy
+        // finishes. The PC's cache pin owns the frame afterwards.
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), address, JBD2_BLOCK_SIZE);
+        }
+        drop(materialized);
+
+        match self.pages.export_page_lease(page, guard) {
+            StepOutcome::Done(lease) => Ok(JournalRecordLease { page, lease }),
+            StepOutcome::Err(errno) => Err(JournalPagePoolError::Page(PageCacheError::Backend(
+                errno.into(),
+            ))),
+            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
+                Err(JournalPagePoolError::WouldBlock)
+            }
+        }
+    }
 }
