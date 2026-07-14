@@ -367,6 +367,54 @@ pub struct PreparedJournalTransaction {
     records: Vec<JournalRecordLease>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JournalTransactionStateError {
+    Busy,
+    Missing,
+    NotCommitted,
+}
+
+/// Mount-owned single-commit lifecycle. The stored value retains every record
+/// lease until a durable commit completion authorizes checkpoint submission.
+pub struct JournalTransactionState<T> {
+    active: Option<(bool, T)>,
+}
+
+impl<T> JournalTransactionState<T> {
+    pub const fn new() -> Self {
+        Self { active: None }
+    }
+    pub fn begin(&mut self, transaction: T) -> Result<(), JournalTransactionStateError> {
+        if self.active.is_some() {
+            return Err(JournalTransactionStateError::Busy);
+        }
+        self.active = Some((false, transaction));
+        Ok(())
+    }
+    pub fn mark_commit_durable(&mut self) -> Result<(), JournalTransactionStateError> {
+        let Some((committed, _)) = self.active.as_mut() else {
+            return Err(JournalTransactionStateError::Missing);
+        };
+        *committed = true;
+        Ok(())
+    }
+    pub fn take_checkpoint_ready(&mut self) -> Result<Option<T>, JournalTransactionStateError> {
+        let Some((committed, _)) = self.active.as_ref() else {
+            return Ok(None);
+        };
+        if !committed {
+            return Err(JournalTransactionStateError::NotCommitted);
+        }
+        Ok(self.active.take().map(|(_, transaction)| transaction))
+    }
+}
+
+impl<T> Default for JournalTransactionState<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PreparedJournalTransaction {
     pub fn stage(
         pool: &JournalPagePool,
