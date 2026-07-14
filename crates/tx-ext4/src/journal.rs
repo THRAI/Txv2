@@ -337,3 +337,91 @@ impl JournalPagePool {
         }
     }
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JournalRecordLayout {
+    pub descriptor: LbaRange,
+    pub metadata: Vec<LbaRange>,
+    pub commit: LbaRange,
+}
+
+impl JournalRecordLayout {
+    pub fn new(descriptor: LbaRange, metadata: Vec<LbaRange>, commit: LbaRange) -> Self {
+        Self {
+            descriptor,
+            metadata,
+            commit,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreparedJournalTransactionError {
+    Layout,
+    Pool(JournalPagePoolError),
+    Plan(JournalTransactionPlanError),
+}
+
+pub struct PreparedJournalTransaction {
+    plan: JournalTransactionPlan,
+    records: Vec<JournalRecordLease>,
+}
+
+impl PreparedJournalTransaction {
+    pub fn stage(
+        pool: &JournalPagePool,
+        image: tx_ext4_format::journal::Jbd2TransactionImage,
+        layout: JournalRecordLayout,
+        device: DeviceKey,
+        data_writes: Vec<JournalBio>,
+        checkpoint_writes: Vec<JournalBio>,
+        guard: &Guard<'_>,
+    ) -> Result<Self, PreparedJournalTransactionError> {
+        if layout.metadata.len() != image.metadata_blocks.len() {
+            return Err(PreparedJournalTransactionError::Layout);
+        }
+        let descriptor = pool
+            .stage(&image.descriptor, guard)
+            .map_err(PreparedJournalTransactionError::Pool)?;
+        let mut records = alloc::vec![descriptor];
+        let mut metadata_writes = Vec::new();
+        for (bytes, lba) in image
+            .metadata_blocks
+            .iter()
+            .zip(layout.metadata.iter().copied())
+        {
+            let record = pool
+                .stage(bytes, guard)
+                .map_err(PreparedJournalTransactionError::Pool)?;
+            metadata_writes.push(record.as_journal_bio(device, lba));
+            records.push(record);
+        }
+        let commit = pool
+            .stage(&image.commit, guard)
+            .map_err(PreparedJournalTransactionError::Pool)?;
+        let descriptor_bio = records[0].as_journal_bio(device, layout.descriptor);
+        let commit_bio = commit.as_journal_bio(device, layout.commit);
+        records.push(commit);
+        let plan = JournalTransactionPlan::new(
+            tx_ext4_format::journal::Jbd2Commit::parse(&image.commit)
+                .map_err(|_| PreparedJournalTransactionError::Layout)?
+                .header
+                .sequence,
+            data_writes,
+            descriptor_bio,
+            metadata_writes,
+            commit_bio,
+            checkpoint_writes,
+        )
+        .map_err(PreparedJournalTransactionError::Plan)?;
+        Ok(Self { plan, records })
+    }
+
+    pub fn plan(&self) -> &JournalTransactionPlan {
+        &self.plan
+    }
+
+    pub fn record_count(&self) -> usize {
+        self.records.len()
+    }
+}
