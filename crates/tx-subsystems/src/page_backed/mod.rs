@@ -2000,7 +2000,9 @@ impl PageContainer {
         route: &PageCompletionRoute,
     ) -> Option<Result<PageSlotSnapshot, PageSlotCompletionError>> {
         if route.completion.kind == PageIoCompletionKind::Noop {
-            let _ = self.terminalize_file_fsync_submission(&route.completion);
+            if self.terminalize_file_fsync_submission(&route.completion) {
+                self.notify_file_backend_completion(&route.completion);
+            }
             return None;
         }
         if route.completion.range.page_count() != 1 {
@@ -2114,6 +2116,28 @@ impl PageContainer {
             .fsync_submissions
             .get_mut(&completion.id)
             .is_some_and(|submission| submission.complete(result))
+    }
+
+    fn notify_file_backend_completion(
+        &self,
+        completion: &crate::io_manager::page::PageIoCompletion,
+    ) {
+        let PageContainerKind::File {
+            mount,
+            fs_object_id,
+        } = &self.kind
+        else {
+            return;
+        };
+        let Some(planner) = mount.payload().backend_planner() else {
+            return;
+        };
+        planner.complete_page_io(crate::fs_iface::BackendPageCompletion::new(
+            FsObjectKey::new(fs_object_id.as_u64()),
+            completion.id,
+            PageIoOp::Fsync,
+            completion.result,
+        ));
     }
 
     fn register_file_service_metadata(

@@ -513,12 +513,43 @@ impl BackendPageRequest {
     }
 }
 
+/// Terminal notification for one L4 request planned by a concrete backend.
+///
+/// Completion is delivered only after PageBacked has installed its own local
+/// state transition, so a backend may release journal record leases or queue
+/// post-commit work without relying on a PageContainer lock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BackendPageCompletion {
+    pub object: FsObjectKey,
+    pub id: PageIoRequestId,
+    pub op: PageIoOp,
+    pub result: PageIoResult,
+}
+
+impl BackendPageCompletion {
+    pub const fn new(
+        object: FsObjectKey,
+        id: PageIoRequestId,
+        op: PageIoOp,
+        result: PageIoResult,
+    ) -> Self {
+        Self {
+            object,
+            id,
+            op,
+            result,
+        }
+    }
+}
+
 pub trait BackendPlanner: Send + Sync + 'static {
     fn plan_page_io(&self, request: BackendPageRequest) -> BackendPlan;
 
     fn resume_page_io(&self, _resume: BackendPlanResume) -> BackendPlan {
         BackendPlan::Err(Errno::ENOSYS)
     }
+
+    fn complete_page_io(&self, _completion: BackendPageCompletion) {}
 }
 
 #[cfg(test)]
