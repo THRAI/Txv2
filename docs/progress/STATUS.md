@@ -1,3 +1,12 @@
+- 2026-07-14 (ext4 I/O-manager 6F direct-I/O completion wait/result).
+  Waitable direct read/write submissions now carry a terminal PageReady wait
+  endpoint while PageContainer keeps the result row until one take operation.
+  Completion performs coherency and drops DMA pins before recording the result
+  and notifying outside the state lock; old direct submission APIs allocate no
+  wait/result row. O_DIRECT syscall wiring, ext4 runtime registration,
+  msync/syncfs coherence, JBD2 durability, and 6G remain open. See
+  `docs/progress/research/2026-07-14-direct-io-completion-wait.md`.
+
 - 2026-07-14 (ext4 I/O-manager 6F direct-I/O service wake attachment).
   PageContainer now owns an optional neutral ServiceWakeSource. After a direct
   bio enters owned L6, PageBacked releases state and posts a Block service

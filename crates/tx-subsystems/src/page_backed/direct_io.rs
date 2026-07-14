@@ -4,6 +4,7 @@
 //! constructor. This module only validates the published pmap snapshot and
 //! holds long-term DMA role evidence until the buffer is dropped.
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -41,6 +42,56 @@ pub struct DirectIoSubmission {
     operation: DirectIoOperation,
     source: Option<crate::fs_iface::IoDataSource>,
     target: Option<crate::fs_iface::IoDataTarget>,
+}
+
+/// A direct-I/O submission whose terminal result can be awaited and consumed.
+///
+/// The PageContainer retains the corresponding `PageReadyWait` until the
+/// caller consumes the result, so the endpoint remains registered through the
+/// terminal completion notification.
+pub struct DirectIoWaitableSubmission {
+    submission: DirectIoSubmission,
+    wait_source_id: u64,
+    wait_endpoint: Arc<tx_substrate::wake::WaitSource>,
+}
+
+impl DirectIoWaitableSubmission {
+    pub(crate) fn new(
+        submission: DirectIoSubmission,
+        wait_source_id: u64,
+        wait_endpoint: Arc<tx_substrate::wake::WaitSource>,
+    ) -> Self {
+        Self {
+            submission,
+            wait_source_id,
+            wait_endpoint,
+        }
+    }
+
+    pub fn submission(&self) -> &DirectIoSubmission {
+        &self.submission
+    }
+
+    pub const fn lease_id(&self) -> crate::fs_iface::IoDataLeaseId {
+        self.submission.lease_id()
+    }
+
+    pub const fn wait_source_id(&self) -> u64 {
+        self.wait_source_id
+    }
+
+    pub fn wait_endpoint(&self) -> &Arc<tx_substrate::wake::WaitSource> {
+        &self.wait_endpoint
+    }
+}
+
+impl core::fmt::Debug for DirectIoWaitableSubmission {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DirectIoWaitableSubmission")
+            .field("submission", &self.submission)
+            .field("wait_source_id", &self.wait_source_id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl DirectIoSubmission {
@@ -104,6 +155,13 @@ pub(crate) struct DirectIoInFlight {
     pub(crate) buffer: DirectIoBuffer,
     pub(crate) operation: DirectIoOperation,
     pub(crate) state: DirectIoInFlightState,
+    pub(crate) completion_wait: Option<super::notification::PageReadyWait>,
+}
+
+#[derive(Debug)]
+pub(crate) struct DirectIoCompleted {
+    pub(crate) result: Result<DirectIoCompletion, super::DirectIoCompletionError>,
+    pub(crate) wait: super::notification::PageReadyWait,
 }
 
 /// A pinned user buffer that can cross the L4 -> L5 -> L6 async boundary.

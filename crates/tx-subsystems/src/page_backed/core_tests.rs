@@ -2106,6 +2106,7 @@ fn file_direct_submission_holds_dma_lease_until_terminal_completion() {
     pc.complete_file_direct_submission(lease, Ok(()))
         .expect("terminal direct-read completion");
     assert_eq!(pc.direct_io_in_flight_count_for_test(), 0);
+    assert_eq!(pc.direct_io_completed_count_for_test(), 0);
     let reread = pc
         .begin_file_direct_read(page_range)
         .expect("terminal completion releases direct range");
@@ -2146,10 +2147,101 @@ fn file_direct_submission_holds_dma_lease_until_terminal_completion() {
         pc.complete_file_direct_submission(write_lease, Ok(())),
         Ok(DirectIoCompletion::Write { invalidated: 1 })
     );
+    assert_eq!(pc.direct_io_completed_count_for_test(), 0);
     assert_eq!(pc.lookup(page_range.start()), None);
     assert_eq!(
         pc.complete_file_direct_submission(write_lease, Ok(())),
         Err(DirectIoCompletionError::UnknownLease(write_lease))
+    );
+}
+
+#[test]
+fn file_waitable_direct_submission_stores_result_and_notifies() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::new());
+    let pc = file_page_container(fs.clone(), fs, FsObjectId::new(107), 4);
+    let aspace = crate::vm::AddressSpace::new();
+    let user_range = crate::vm::UserRange::new_aligned(
+        crate::vm::UserVirtAddr::new(0x40_000),
+        crate::vm::USER_PAGE_SIZE,
+    )
+    .expect("aligned user range");
+    let commit = match aspace.reserve_map(
+        crate::vm::VmEntry::new(
+            user_range,
+            crate::vm::Prot::READ_WRITE,
+            crate::vm::VmEntryFlags::PRIVATE,
+            crate::vm::VmBacking::PrivateAnon,
+        ),
+        crate::vm::MapPlacement::RequireFree,
+    ) {
+        crate::vm::MapReserveResult::Reserved(reservation) => reservation.commit(),
+        other => panic!("expected user map reservation, got {other:?}"),
+    };
+    commit.expect("commit user map");
+    assert!(matches!(
+        aspace.reserve_user_range_for_access(user_range, crate::vm::UserAccessKind::Write),
+        V3Out::Done(())
+    ));
+    let buffer = DirectIoBuffer::pin(
+        &aspace,
+        UserPtr::new(0x40_000),
+        crate::vm::USER_PAGE_SIZE,
+        crate::vm::UserAccessKind::Write,
+    )
+    .expect("pin direct read target");
+    let range = PageRange::new(PageIndex::new(1), 1);
+    let submission = pc
+        .submit_file_direct_read_waitable(range, buffer)
+        .expect("submit waitable direct read");
+    let mailbox = Arc::new(tx_substrate::wake::TaskMailbox::new());
+    let generation = mailbox.next_generation();
+    let _subscription = submission.wait_endpoint().register(
+        Arc::downgrade(&mailbox),
+        generation,
+        tx_substrate::step::InterestMask::new(1),
+    );
+
+    assert!(pc.take_file_direct_submission_result(&submission).is_none());
+    assert_eq!(pc.direct_io_completed_count_for_test(), 0);
+    assert_eq!(
+        pc.complete_file_direct_submission(submission.lease_id(), Ok(())),
+        Ok(DirectIoCompletion::Read)
+    );
+    assert!(matches!(
+        mailbox.poll(),
+        Some(tx_substrate::wake::MailboxEvent::SourceFired {
+            generation: seen_generation,
+            source,
+            ..
+        }) if seen_generation == generation && source.raw() == submission.wait_source_id()
+    ));
+    assert_eq!(pc.direct_io_completed_count_for_test(), 1);
+    assert_eq!(
+        pc.take_file_direct_submission_result(&submission),
+        Some(Ok(DirectIoCompletion::Read))
+    );
+    assert_eq!(pc.direct_io_completed_count_for_test(), 0);
+    assert!(pc.take_file_direct_submission_result(&submission).is_none());
+
+    let failed_buffer = DirectIoBuffer::pin(
+        &aspace,
+        UserPtr::new(0x40_000),
+        crate::vm::USER_PAGE_SIZE,
+        crate::vm::UserAccessKind::Write,
+    )
+    .expect("pin failed direct read target");
+    let failed_submission = pc
+        .submit_file_direct_read_waitable(range, failed_buffer)
+        .expect("submit waitable direct read that fails");
+    assert_eq!(
+        pc.complete_file_direct_submission(failed_submission.lease_id(), Err(Errno::EIO)),
+        Err(DirectIoCompletionError::Backend(Errno::EIO))
+    );
+    assert_eq!(
+        pc.take_file_direct_submission_result(&failed_submission),
+        Some(Err(DirectIoCompletionError::Backend(Errno::EIO)))
     );
 }
 

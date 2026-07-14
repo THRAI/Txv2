@@ -62,6 +62,7 @@ mod user_buffer;
 pub use cross_variant::step_copy_file_range;
 pub use direct_io::{
     DirectIoBuffer, DirectIoBufferError, DirectIoCompletion, DirectIoOperation, DirectIoSubmission,
+    DirectIoWaitableSubmission,
 };
 pub use fs_page_backing::FsPageBacking;
 pub use lifecycle::{FallocateOp, TruncateOp, step_fallocate, step_fsync, step_truncate};
@@ -672,6 +673,7 @@ struct PageContainerState {
     file_io_wake: Option<Arc<ServiceWakeSource>>,
     range_reservations: RangeReservationTable,
     direct_io_in_flight: BTreeMap<IoDataLeaseId, direct_io::DirectIoInFlight>,
+    direct_io_completed: BTreeMap<IoDataLeaseId, direct_io::DirectIoCompleted>,
     // Page-scoped retry sources are retained so a task that already received
     // `Yield` can still register and consume a pending wake before it retries
     // and re-observes page state.
@@ -958,6 +960,7 @@ impl PageContainer {
                 file_io_wake: None,
                 range_reservations: RangeReservationTable::new(),
                 direct_io_in_flight: BTreeMap::new(),
+                direct_io_completed: BTreeMap::new(),
                 file_page_waits: BTreeMap::new(),
                 next_file_fetch_id: 1,
             }),
@@ -1071,6 +1074,15 @@ impl PageContainer {
         self.submit_file_direct_io(range, buffer, DirectIoOperation::Read)
     }
 
+    /// Admit a direct read with a terminal completion wait endpoint.
+    pub fn submit_file_direct_read_waitable(
+        &self,
+        range: PageRange,
+        buffer: DirectIoBuffer,
+    ) -> Result<DirectIoWaitableSubmission, DirectIoAdmissionError> {
+        self.submit_file_direct_io_waitable(range, buffer, DirectIoOperation::Read)
+    }
+
     /// Admit a direct write and retain the user-page DMA pins until its
     /// terminal completion.
     pub fn submit_file_direct_write(
@@ -1079,6 +1091,29 @@ impl PageContainer {
         buffer: DirectIoBuffer,
     ) -> Result<DirectIoSubmission, DirectIoAdmissionError> {
         self.submit_file_direct_io(range, buffer, DirectIoOperation::Write)
+    }
+
+    /// Admit a direct write with a terminal completion wait endpoint.
+    pub fn submit_file_direct_write_waitable(
+        &self,
+        range: PageRange,
+        buffer: DirectIoBuffer,
+    ) -> Result<DirectIoWaitableSubmission, DirectIoAdmissionError> {
+        self.submit_file_direct_io_waitable(range, buffer, DirectIoOperation::Write)
+    }
+
+    /// Consume the terminal result associated with a waitable direct-I/O submission.
+    pub fn take_file_direct_submission_result(
+        &self,
+        submission: &DirectIoWaitableSubmission,
+    ) -> Option<Result<DirectIoCompletion, DirectIoCompletionError>> {
+        let mut state = self.state.lock();
+        let completed = state.direct_io_completed.remove(&submission.lease_id())?;
+        debug_assert_eq!(
+            notification::page_ready_source_id(&completed.wait),
+            submission.wait_source_id()
+        );
+        Some(completed.result)
     }
 
     /// Apply a terminal direct-I/O result and release the associated DMA lease.
@@ -1101,6 +1136,7 @@ impl PageContainer {
             reservation,
             buffer,
             operation,
+            completion_wait,
             ..
         } = in_flight;
         let completion = match operation {
@@ -1112,6 +1148,23 @@ impl PageContainer {
                 .map(|invalidated| DirectIoCompletion::Write { invalidated }),
         };
         drop(buffer);
+        let notifier = completion_wait.map(|wait| {
+            let notifier = wait.notifier();
+            let replaced = self.state.lock().direct_io_completed.insert(
+                lease,
+                direct_io::DirectIoCompleted {
+                    result: completion,
+                    wait,
+                },
+            );
+            debug_assert!(replaced.is_none());
+            notifier
+        });
+        if let Some(notifier) = notifier {
+            notification::notify_page_ready_with_post(&notifier, |mailbox, event| {
+                mailbox.post(event)
+            });
+        }
         completion
     }
 
@@ -1234,6 +1287,11 @@ impl PageContainer {
     #[cfg(test)]
     pub fn direct_io_in_flight_count_for_test(&self) -> usize {
         self.state.lock().direct_io_in_flight.len()
+    }
+
+    #[cfg(test)]
+    pub fn direct_io_completed_count_for_test(&self) -> usize {
+        self.state.lock().direct_io_completed.len()
     }
 
     #[cfg(test)]
@@ -1368,6 +1426,34 @@ impl PageContainer {
         buffer: DirectIoBuffer,
         operation: DirectIoOperation,
     ) -> Result<DirectIoSubmission, DirectIoAdmissionError> {
+        self.submit_file_direct_io_with_wait(range, buffer, operation, None)
+    }
+
+    fn submit_file_direct_io_waitable(
+        &self,
+        range: PageRange,
+        buffer: DirectIoBuffer,
+        operation: DirectIoOperation,
+    ) -> Result<DirectIoWaitableSubmission, DirectIoAdmissionError> {
+        let wait = notification::new_page_ready_wait();
+        let wait_source_id = notification::page_ready_source_id(&wait);
+        let wait_endpoint = Arc::clone(notification::page_ready_endpoint(&wait));
+        let submission =
+            self.submit_file_direct_io_with_wait(range, buffer, operation, Some(wait))?;
+        Ok(DirectIoWaitableSubmission::new(
+            submission,
+            wait_source_id,
+            wait_endpoint,
+        ))
+    }
+
+    fn submit_file_direct_io_with_wait(
+        &self,
+        range: PageRange,
+        buffer: DirectIoBuffer,
+        operation: DirectIoOperation,
+        completion_wait: Option<notification::PageReadyWait>,
+    ) -> Result<DirectIoSubmission, DirectIoAdmissionError> {
         let reservation = match operation {
             DirectIoOperation::Read => self.begin_file_direct_read(range)?,
             DirectIoOperation::Write => self.begin_file_direct_write(range)?,
@@ -1389,6 +1475,7 @@ impl PageContainer {
                         buffer,
                         operation,
                         state: direct_io::DirectIoInFlightState::Admitted,
+                        completion_wait,
                     },
                 );
                 false
