@@ -12,6 +12,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 pub mod adapter;
+mod fsync_submission;
 pub mod notification;
 
 use adapter::step_engine::{
