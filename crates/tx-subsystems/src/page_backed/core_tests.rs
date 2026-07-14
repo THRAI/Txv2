@@ -2054,6 +2054,106 @@ fn file_direct_read_blocks_buffered_access_but_preserves_clean_cache() {
 }
 
 #[test]
+fn file_direct_submission_holds_dma_lease_until_terminal_completion() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::new());
+    let pc = file_page_container(fs.clone(), fs, FsObjectId::new(105), 4);
+    let aspace = crate::vm::AddressSpace::new();
+    let user_range = crate::vm::UserRange::new_aligned(
+        crate::vm::UserVirtAddr::new(0x20_000),
+        crate::vm::USER_PAGE_SIZE,
+    )
+    .expect("aligned user range");
+    let reservation = aspace.reserve_map(
+        crate::vm::VmEntry::new(
+            user_range,
+            crate::vm::Prot::READ_WRITE,
+            crate::vm::VmEntryFlags::PRIVATE,
+            crate::vm::VmBacking::PrivateAnon,
+        ),
+        crate::vm::MapPlacement::RequireFree,
+    );
+    let commit = match reservation {
+        crate::vm::MapReserveResult::Reserved(reservation) => reservation.commit(),
+        other => panic!("expected user map reservation, got {other:?}"),
+    };
+    commit.expect("commit user map");
+    assert!(matches!(
+        aspace.reserve_user_range_for_access(user_range, crate::vm::UserAccessKind::Write),
+        V3Out::Done(())
+    ));
+    let buffer = DirectIoBuffer::pin(
+        &aspace,
+        UserPtr::new(0x20_000),
+        crate::vm::USER_PAGE_SIZE,
+        crate::vm::UserAccessKind::Write,
+    )
+    .expect("pin direct read target");
+    let lease = buffer.lease_id();
+    let page_range = PageRange::new(PageIndex::new(1), 1);
+
+    let submission = pc
+        .submit_file_direct_read(page_range, buffer)
+        .expect("submit direct read");
+    assert_eq!(submission.lease_id(), lease);
+    assert_eq!(pc.direct_io_in_flight_count_for_test(), 1);
+    assert!(matches!(
+        submission.target(),
+        Some(crate::fs_iface::IoDataTarget::Direct { lease: found, .. }) if *found == lease
+    ));
+
+    pc.complete_file_direct_submission(lease, Ok(()))
+        .expect("terminal direct-read completion");
+    assert_eq!(pc.direct_io_in_flight_count_for_test(), 0);
+    let reread = pc
+        .begin_file_direct_read(page_range)
+        .expect("terminal completion releases direct range");
+    pc.complete_file_direct_read(reread, Ok(()))
+        .expect("release direct-read verification reservation");
+
+    let frame = cached_frame_for_test();
+    let ppn = frame.ppn;
+    {
+        let mut state = pc.state.lock();
+        state
+            .pages
+            .install_if_absent(page_range.start(), frame)
+            .expect("install clean cached page");
+        let slot = state.file_page_slots.entry(page_range.start()).or_default();
+        let PageSlotFetch::Owner { generation } = slot.begin_fetch() else {
+            panic!("fresh slot should grant fetch ownership");
+        };
+        slot.complete_fetch(generation, Ok(ppn))
+            .expect("install resident slot");
+    }
+    let write_buffer = DirectIoBuffer::pin(
+        &aspace,
+        UserPtr::new(0x20_000),
+        crate::vm::USER_PAGE_SIZE,
+        crate::vm::UserAccessKind::Read,
+    )
+    .expect("pin direct write source");
+    let write_lease = write_buffer.lease_id();
+    let write_submission = pc
+        .submit_file_direct_write(page_range, write_buffer)
+        .expect("submit direct write");
+    assert!(matches!(
+        write_submission.source(),
+        Some(crate::fs_iface::IoDataSource::Direct { lease: found, .. }) if *found == write_lease
+    ));
+    assert_eq!(
+        pc.complete_file_direct_submission(write_lease, Ok(())),
+        Ok(DirectIoCompletion::Write { invalidated: 1 })
+    );
+    assert_eq!(pc.lookup(page_range.start()), None);
+    assert_eq!(
+        pc.complete_file_direct_submission(write_lease, Ok(())),
+        Err(DirectIoCompletionError::UnknownLease(write_lease))
+    );
+}
+
+#[test]
 fn file_page_bio_only_plan_drives_owned_l6_through_block_device_handle() {
     let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
     setup_host_substrate();

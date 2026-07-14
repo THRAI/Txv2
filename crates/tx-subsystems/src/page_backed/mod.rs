@@ -58,7 +58,9 @@ mod sparse_index;
 mod targeted_read;
 mod user_buffer;
 pub use cross_variant::step_copy_file_range;
-pub use direct_io::{DirectIoBuffer, DirectIoBufferError};
+pub use direct_io::{
+    DirectIoBuffer, DirectIoBufferError, DirectIoCompletion, DirectIoOperation, DirectIoSubmission,
+};
 pub use fs_page_backing::FsPageBacking;
 pub use lifecycle::{FallocateOp, TruncateOp, step_fallocate, step_fsync, step_truncate};
 pub use range::{
@@ -249,6 +251,7 @@ pub enum DirectIoAdmissionError {
     UnsupportedKind,
     OutOfBounds,
     Range(RangeReservationError),
+    DuplicateLease(IoDataLeaseId),
     Busy {
         page: PageIndex,
         state: DirectIoBusy,
@@ -263,6 +266,7 @@ impl From<RangeReservationError> for DirectIoAdmissionError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DirectIoCompletionError {
+    UnknownLease(IoDataLeaseId),
     UnknownReservation(RangeReservationId),
     WrongReservationKind {
         expected: RangeReservationKind,
@@ -653,6 +657,7 @@ struct PageContainerState {
     file_io_read_targets: BTreeMap<PageIoRequestId, CachedFrame>,
     file_block_runtime: FileIoBlockRuntime,
     range_reservations: RangeReservationTable,
+    direct_io_in_flight: BTreeMap<IoDataLeaseId, direct_io::DirectIoInFlight>,
     // Page-scoped retry sources are retained so a task that already received
     // `Yield` can still register and consume a pending wake before it retries
     // and re-observes page state.
@@ -901,6 +906,7 @@ impl PageContainer {
                 file_io_read_targets: BTreeMap::new(),
                 file_block_runtime: FileIoBlockRuntime::new(1024, 16),
                 range_reservations: RangeReservationTable::new(),
+                direct_io_in_flight: BTreeMap::new(),
                 file_page_waits: BTreeMap::new(),
                 next_file_fetch_id: 1,
             }),
@@ -989,6 +995,65 @@ impl PageContainer {
         range: PageRange,
     ) -> Result<RangeReservation, DirectIoAdmissionError> {
         self.begin_file_direct_io(range, RangeReservationKind::DirectRead)
+    }
+
+    /// Admit a direct read and retain the user-page DMA pins until its terminal
+    /// completion. Callers pass the returned neutral descriptor to the
+    /// filesystem planner only after this method has returned.
+    pub fn submit_file_direct_read(
+        &self,
+        range: PageRange,
+        buffer: DirectIoBuffer,
+    ) -> Result<DirectIoSubmission, DirectIoAdmissionError> {
+        self.submit_file_direct_io(range, buffer, DirectIoOperation::Read)
+    }
+
+    /// Admit a direct write and retain the user-page DMA pins until its
+    /// terminal completion.
+    pub fn submit_file_direct_write(
+        &self,
+        range: PageRange,
+        buffer: DirectIoBuffer,
+    ) -> Result<DirectIoSubmission, DirectIoAdmissionError> {
+        self.submit_file_direct_io(range, buffer, DirectIoOperation::Write)
+    }
+
+    /// Apply a terminal direct-I/O result and release the associated DMA lease.
+    ///
+    /// The in-flight entry is withdrawn before cache coherency work begins, so
+    /// no PageContainer state lock is held while invoking the completion path.
+    pub fn complete_file_direct_submission(
+        &self,
+        lease: IoDataLeaseId,
+        result: Result<(), Errno>,
+    ) -> Result<DirectIoCompletion, DirectIoCompletionError> {
+        let in_flight = {
+            let mut state = self.state.lock();
+            state
+                .direct_io_in_flight
+                .remove(&lease)
+                .ok_or(DirectIoCompletionError::UnknownLease(lease))?
+        };
+        let direct_io::DirectIoInFlight {
+            reservation,
+            buffer,
+            operation,
+        } = in_flight;
+        let completion = match operation {
+            DirectIoOperation::Read => self
+                .complete_file_direct_read(reservation, result)
+                .map(|()| DirectIoCompletion::Read),
+            DirectIoOperation::Write => self
+                .complete_file_direct_write(reservation, result)
+                .map(|invalidated| DirectIoCompletion::Write { invalidated }),
+        };
+        drop(buffer);
+        completion
+    }
+
+    #[cfg(test)]
+    pub fn direct_io_in_flight_count_for_test(&self) -> usize {
+        self.state.lock().direct_io_in_flight.len()
     }
 
     /// Complete a direct write and conservatively invalidate overlapped clean
@@ -1110,6 +1175,53 @@ impl PageContainer {
             .range_reservations
             .try_reserve(range, kind)
             .map_err(Into::into)
+    }
+
+    fn submit_file_direct_io(
+        &self,
+        range: PageRange,
+        buffer: DirectIoBuffer,
+        operation: DirectIoOperation,
+    ) -> Result<DirectIoSubmission, DirectIoAdmissionError> {
+        let reservation = match operation {
+            DirectIoOperation::Read => self.begin_file_direct_read(range)?,
+            DirectIoOperation::Write => self.begin_file_direct_write(range)?,
+        };
+        let submission = match operation {
+            DirectIoOperation::Read => DirectIoSubmission::read(range, &buffer),
+            DirectIoOperation::Write => DirectIoSubmission::write(range, &buffer),
+        };
+        let lease = buffer.lease_id();
+        let duplicate = {
+            let mut state = self.state.lock();
+            if state.direct_io_in_flight.contains_key(&lease) {
+                true
+            } else {
+                state.direct_io_in_flight.insert(
+                    lease,
+                    direct_io::DirectIoInFlight {
+                        reservation,
+                        buffer,
+                        operation,
+                    },
+                );
+                false
+            }
+        };
+        if !duplicate {
+            return Ok(submission);
+        }
+
+        // Lease ids are globally allocated, but do not strand a range if an
+        // internal collision is ever introduced by a future buffer provider.
+        let release = match operation {
+            DirectIoOperation::Read => self.complete_file_direct_read(reservation, Ok(())),
+            DirectIoOperation::Write => self
+                .complete_file_direct_write(reservation, Ok(()))
+                .map(|_| ()),
+        };
+        debug_assert!(release.is_ok());
+        Err(DirectIoAdmissionError::DuplicateLease(lease))
     }
 
     /// Move one dirty file page into the L4 writeback queue.

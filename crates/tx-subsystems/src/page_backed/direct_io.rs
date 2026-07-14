@@ -12,6 +12,8 @@ use crate::vm::{AccessMode, AddressSpace, UserAccessKind, UserRange, USER_PAGE_S
 use tx_hal::UserPtr;
 use tx_substrate::page_allocator::{self, DmaPin};
 
+use super::{PageRange, RangeReservation};
+
 static NEXT_DIRECT_IO_LEASE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -20,6 +22,80 @@ pub enum DirectIoBufferError {
     NotMaterialized,
     PermissionDenied,
     DmaPin(page_allocator::AllocError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirectIoOperation {
+    Read,
+    Write,
+}
+
+/// Immutable L4 description handed to the filesystem planner after admission.
+///
+/// The corresponding [`DirectIoBuffer`] remains private to `PageContainer` so
+/// its DMA pins cannot be dropped before terminal completion.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirectIoSubmission {
+    lease: crate::fs_iface::IoDataLeaseId,
+    range: PageRange,
+    operation: DirectIoOperation,
+    source: Option<crate::fs_iface::IoDataSource>,
+    target: Option<crate::fs_iface::IoDataTarget>,
+}
+
+impl DirectIoSubmission {
+    pub(crate) fn read(range: PageRange, buffer: &DirectIoBuffer) -> Self {
+        Self {
+            lease: buffer.lease_id(),
+            range,
+            operation: DirectIoOperation::Read,
+            source: None,
+            target: Some(buffer.as_target()),
+        }
+    }
+
+    pub(crate) fn write(range: PageRange, buffer: &DirectIoBuffer) -> Self {
+        Self {
+            lease: buffer.lease_id(),
+            range,
+            operation: DirectIoOperation::Write,
+            source: Some(buffer.as_source()),
+            target: None,
+        }
+    }
+
+    pub const fn lease_id(&self) -> crate::fs_iface::IoDataLeaseId {
+        self.lease
+    }
+
+    pub const fn range(&self) -> PageRange {
+        self.range
+    }
+
+    pub const fn operation(&self) -> DirectIoOperation {
+        self.operation
+    }
+
+    pub fn source(&self) -> Option<&crate::fs_iface::IoDataSource> {
+        self.source.as_ref()
+    }
+
+    pub fn target(&self) -> Option<&crate::fs_iface::IoDataTarget> {
+        self.target.as_ref()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirectIoCompletion {
+    Read,
+    Write { invalidated: usize },
+}
+
+#[derive(Debug)]
+pub(crate) struct DirectIoInFlight {
+    pub(crate) reservation: RangeReservation,
+    pub(crate) buffer: DirectIoBuffer,
+    pub(crate) operation: DirectIoOperation,
 }
 
 /// A pinned user buffer that can cross the L4 -> L5 -> L6 async boundary.
