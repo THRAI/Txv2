@@ -1280,7 +1280,11 @@ impl PageContainer {
                 self.kick_file_io_service(IoServiceKind::Block);
                 Ok(())
             }
-            Err(error) => Err(DirectIoSubmissionError::Queue(direct_queue_errno(error))),
+            Err(error) => {
+                let errno = direct_queue_errno(error);
+                self.fail_file_direct_submission(lease, errno);
+                Err(DirectIoSubmissionError::Queue(errno))
+            }
         }
     }
 

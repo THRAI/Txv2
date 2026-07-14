@@ -2992,7 +2992,12 @@ async fn sys_direct_pagebacked<'a>(
         Err(_) => return SyscallResult::Error(EINVAL_VALUE),
     };
     if pc.enqueue_file_direct_submission(submission.submission()).is_err() {
-        return SyscallResult::Error(EIO_VALUE);
+        return match pc.take_file_direct_submission_result(&submission) {
+            Some(Err(DirectIoCompletionError::Backend(errno))) => {
+                SyscallResult::error_from(errno)
+            }
+            _ => SyscallResult::Error(EIO_VALUE),
+        };
     }
     let Some(wait) = wait_source::wait_on_registered_source_id(submission.wait_source_id(), 0x1) else {
         return SyscallResult::Error(EIO_VALUE);
