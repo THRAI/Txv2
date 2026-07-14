@@ -5,6 +5,7 @@
 //! state and L6 executes the resulting graph.
 
 use alloc::vec::Vec;
+use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use tx_ext4_format::journal::JBD2_BLOCK_SIZE;
@@ -572,5 +573,15 @@ impl Ext4FsyncPlanSource for JournalFsyncSource {
                 let _ = state.transaction.discard();
             }
         }
+    }
+}
+
+impl Ext4FsyncPlanSource for Arc<JournalFsyncSource> {
+    fn plan_fsync(&self, request: &BackendPageRequest) -> BackendPlan {
+        self.as_ref().plan_fsync(request)
+    }
+
+    fn complete_fsync(&self, completion: BackendPageCompletion) {
+        self.as_ref().complete_fsync(completion);
     }
 }
