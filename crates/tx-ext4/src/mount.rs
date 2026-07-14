@@ -6,11 +6,12 @@ use tx_ext4_format::pager::BlockImage;
 use tx_subsystems::execution::Errno;
 use tx_subsystems::fs_iface::BackendPlanner;
 use tx_subsystems::page_backed::FsPageBacking;
-use tx_subsystems::vfs::FsOps;
 use tx_subsystems::vfs::structure::{FsObjectId, InodeMeta};
+use tx_subsystems::vfs::FsOps;
 
 use crate::planner::{Ext4BlockGeometry, Ext4PlannerBinding};
-use crate::read_backend::{EXT4_ROOT_INODE, Ext4FsInstance, map_inode_meta};
+pub use crate::read_backend::FilePageContainerBinder;
+use crate::read_backend::{map_inode_meta, Ext4FsInstance, EXT4_ROOT_INODE};
 
 pub struct MountedExt4<I> {
     backend: Arc<Ext4FsInstance<I>>,
@@ -36,6 +37,13 @@ where
 
     pub fn bind_mount_payload(&self, payload: &Cap<tx_subsystems::mount::MountPayload>) {
         self.backend.bind_mount_payload(payload);
+    }
+
+    pub fn set_file_page_container_binder(
+        &self,
+        binder: Option<Arc<dyn FilePageContainerBinder>>,
+    ) {
+        self.backend.set_file_page_container_binder(binder);
     }
 }
 

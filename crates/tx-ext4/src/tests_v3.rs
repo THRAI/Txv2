@@ -19,6 +19,7 @@ extern crate alloc;
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::adapter::step_engine::{
     self as epoch, page_allocator, Errno as V3Errno, NoProgress, StepOutcome as V3,
@@ -38,7 +39,7 @@ use tx_subsystems::vfs::structure::{DirCursor, FsObjectId, RNodeBacking};
 use tx_subsystems::vfs::FsOps;
 
 use crate::planner::{Ext4BlockGeometry, Ext4PlannerBinding};
-use crate::read_backend::Ext4FsInstance;
+use crate::read_backend::{Ext4FsInstance, FilePageContainerBinder};
 
 /// Shared serialisation lock. Mirrors `tx_fs::test_support::FS_TEST_LOCK`:
 /// every test in this crate's lib binary observes the same per-CPU
@@ -369,6 +370,17 @@ fn ext4_v3_mutation_methods_create_and_mkdir_succeed() {
 
 #[test]
 fn ext4_materialise_new_regular_file_has_iozone_growth_capacity() {
+    struct CountingBinder(AtomicUsize);
+
+    impl FilePageContainerBinder for CountingBinder {
+        fn bind_file_page_container(
+            &self,
+            _container: crate::adapter::step_engine::Cap<tx_subsystems::page_backed::PageContainer>,
+        ) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
     let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     init_substrate();
     let fs = open_fs();
@@ -390,12 +402,15 @@ fn ext4_materialise_new_regular_file_has_iozone_growth_capacity() {
 
     let mount = test_mount_payload(&fs);
     fs.bind_mount_payload(&mount);
+    let binder = Arc::new(CountingBinder(AtomicUsize::new(0)));
+    fs.set_file_page_container_binder(Some(binder.clone()));
     let rnode = match <Ext4FsInstance<MemImage> as FsOps>::materialise_rnode(
         &*fs, file_id, meta, &mount, &guard,
     ) {
         V3::Done(rnode) => rnode,
         other => panic!("materialise_rnode should succeed: {other:?}"),
     };
+    assert_eq!(binder.0.load(Ordering::Acquire), 1);
 
     match rnode.backing() {
         RNodeBacking::PageBacked { pc } => {

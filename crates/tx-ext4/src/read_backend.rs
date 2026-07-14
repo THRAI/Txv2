@@ -6,11 +6,12 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::adapter::step_engine::{Cap, PayloadCap, SpinMutex};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use tx_ext4_format::Ext4FormatError;
 use tx_ext4_format::pager::{BlockImage, DirEntryLite, Ext4Pager, InodeMetaLite, InodeNo};
+use tx_ext4_format::Ext4FormatError;
 use tx_subsystems::execution::Errno;
 use tx_subsystems::fs_iface::BackendPlanner;
 use tx_subsystems::mount::{MountPayload, MountPayloadPin};
+use tx_subsystems::page_backed::PageContainer;
 use tx_subsystems::vfs::structure::DirCursor;
 use tx_subsystems::vfs::structure::{FsObjectId, InodeMeta, Timespec};
 
@@ -18,6 +19,10 @@ use crate::planner::Ext4MappingTable;
 
 pub(crate) const EXT4_ROOT_INODE: u32 = 2;
 pub(crate) const READDIR_WINDOW_ENTRIES: usize = 64;
+
+pub trait FilePageContainerBinder: Send + Sync {
+    fn bind_file_page_container(&self, container: Cap<PageContainer>);
+}
 
 pub(crate) struct Ext4FsInstance<I> {
     pager: Ext4PagerCell<I>,
@@ -27,6 +32,7 @@ pub(crate) struct Ext4FsInstance<I> {
     dir_cache: SpinMutex<DirCache>,
     inode_meta_cache: SpinMutex<InodeMetaCache>,
     pub(crate) mount_pin: SpinMutex<Option<MountPayloadPin>>,
+    file_page_container_binder: SpinMutex<Option<Arc<dyn FilePageContainerBinder>>>,
     /// Per-mount read-only flag. When `true`, every mutating
     /// `FsOps` method (`create_inode`, `mkdir`, `unlink`, …) and
     /// every page-cache writeback rejects with `EROFS`. The flag is
@@ -63,6 +69,7 @@ impl<I: BlockImage> Ext4FsInstance<I> {
             dir_cache: SpinMutex::new(DirCache::empty()),
             inode_meta_cache: SpinMutex::new(InodeMetaCache::empty()),
             mount_pin: SpinMutex::new(None),
+            file_page_container_binder: SpinMutex::new(None),
             read_only: AtomicBool::new(read_only),
         }))
     }
@@ -74,6 +81,19 @@ impl<I: BlockImage> Ext4FsInstance<I> {
     pub(crate) fn bind_mount_payload(&self, payload: &Cap<MountPayload>) {
         let payload = PayloadCap::from_cap(payload.clone());
         *self.mount_pin.lock() = Some(MountPayloadPin::acquire(&payload));
+    }
+
+    pub(crate) fn set_file_page_container_binder(
+        &self,
+        binder: Option<Arc<dyn FilePageContainerBinder>>,
+    ) {
+        *self.file_page_container_binder.lock() = binder;
+    }
+
+    pub(crate) fn bind_file_page_container(&self, container: Cap<PageContainer>) {
+        if let Some(binder) = self.file_page_container_binder.lock().clone() {
+            binder.bind_file_page_container(container);
+        }
     }
 
     /// Returns `true` when this mount was opened with `MS_RDONLY`

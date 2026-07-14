@@ -410,6 +410,7 @@ where
             Err(_) => return StepOutcome::err(Errno::ENOMEM.into()),
         };
         pc.set_size_bytes(meta.size);
+        self.bind_file_page_container(pc.clone());
 
         match RNode::new_cap_in_mount(fs_object_id, meta, RNodeBacking::PageBacked { pc }, mount) {
             Ok(rnode) => StepOutcome::done(rnode),
