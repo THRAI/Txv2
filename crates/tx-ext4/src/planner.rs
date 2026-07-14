@@ -6,8 +6,9 @@ use alloc::vec;
 
 use tx_subsystems::execution::Errno;
 use tx_subsystems::fs_iface::{
-    BackendPageRequest, BackendPlan, BackendPlanner, BioPlanList, IoDataSource, IoDataTarget,
-    PageCompletion, PageCompletionList, PageFrameRef, PagerResumeToken,
+    BackendPageCompletion, BackendPageRequest, BackendPlan, BackendPlanner, BioPlanList,
+    IoDataSource, IoDataTarget, PageCompletion, PageCompletionList, PageFrameRef,
+    PagerResumeToken,
 };
 use tx_subsystems::io_manager::block::{BioPlan, BioVec, BlockFlags, BlockOp, DeviceKey, LbaRange};
 
@@ -60,6 +61,8 @@ pub trait Ext4ReadMappingSource: Send + Sync + 'static {
 /// never owns journal state or performs I/O under its metadata lock.
 pub trait Ext4FsyncPlanSource: Send + Sync + 'static {
     fn plan_fsync(&self, request: &BackendPageRequest) -> BackendPlan;
+
+    fn complete_fsync(&self, _completion: BackendPageCompletion) {}
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -318,6 +321,12 @@ impl<S: Ext4ReadMappingSource, J: Ext4FsyncPlanSource> BackendPlanner for Ext4Re
             return BackendPlan::Err(errno);
         }
         self.plan_page_io(request)
+    }
+
+    fn complete_page_io(&self, completion: BackendPageCompletion) {
+        if completion.op == tx_subsystems::io_manager::page::PageIoOp::Fsync {
+            self.fsync.complete_fsync(completion);
+        }
     }
 }
 
