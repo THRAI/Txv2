@@ -17392,6 +17392,19 @@
 
 ## Latest Research
 
+- 2026-07-14 (reactor refactor implementation plan ready).
+  `docs/superpowers/plans/2026-07-14-reactor-refactor.md` decomposes the
+  approved design into 13 TDD-oriented tasks: restore the broad test baseline,
+  pin poll/wake/cancel races, introduce authoritative task control and leases,
+  coalesce wake ingress, generation-check runqueues, split policy from hart
+  mechanism, unify the driver, reorganize modules, correct per-thread
+  userspace rendezvous, retire compatibility paths, and run host/target/QEMU
+  gates. Current evidence: lifecycle 8/8 and userspace 16/16 pass;
+  `reactor_smoke --no-run` is blocked by three obsolete sixth arguments to
+  `DelegateRegistry::install_request`. Next step is choosing subagent-driven or
+  inline execution and starting Task 1. Existing dirty Reactor/kernel/runtime
+  edits must be preserved with path-scoped commits.
+
 - 2026-07-14 (reactor refactor design approved).
   The design in
   `docs/superpowers/specs/2026-07-14-reactor-refactor-design.md` defines a
