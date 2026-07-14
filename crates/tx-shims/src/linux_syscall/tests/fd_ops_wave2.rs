@@ -22,7 +22,7 @@ use tx_subsystems::vfs::FsOps;
 
 use crate::linux_syscall::{
     AT_FDCWD, EXECVE_PATH_MAX, NR_CLOSE, NR_DUP, NR_DUP3, NR_OPENAT, O_CLOEXEC, O_CREAT,
-    O_DIRECTORY, O_EXCL, O_RDONLY, O_RDWR, O_TRUNC,
+    O_DIRECTORY, O_DIRECT, O_EXCL, O_RDONLY, O_RDWR, O_TRUNC,
 };
 
 /// errno magnitudes: positive Linux RV64 generic ABI values.
@@ -270,6 +270,44 @@ fn dispatch_openat_o_directory_regular_file_returns_neg_enotdir() {
     );
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Error(E_NOTDIR));
+    drop(path);
+}
+
+#[test]
+fn dispatch_openat_o_direct_preserves_regular_file_status_flag() {
+    let _setup = fd_ops_setup();
+    let (root_dentry, tmpfs) = build_tmpfs_root();
+    let owner_cred = Credential {
+        uid: 0,
+        gid: 0,
+        effective_caps: CapabilitySet::FULL,
+    };
+    let guard = ebr_guard();
+    let _ = tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner_cred, &guard);
+    drop(guard);
+
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap.clone(), thread);
+    let path = nul_terminate(b"/f");
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_OPENAT,
+            [
+                AT_FDCWD as i64 as u64,
+                path.as_ptr() as u64,
+                (O_RDONLY | O_DIRECT) as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    let fd = match result {
+        SyscallResult::Return(fd) => fd as u32,
+        other => panic!("openat O_DIRECT: {other:?}"),
+    };
+    assert!(proc_cap.fd(fd).expect("O_DIRECT fd installed").flags().packet);
     drop(path);
 }
 

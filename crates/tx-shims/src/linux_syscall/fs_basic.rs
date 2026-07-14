@@ -772,7 +772,7 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
         append: want_append,
         cloexec: want_cloexec,
         nonblocking: flags & O_NONBLOCK != 0,
-        packet: false,
+        packet: flags & O_DIRECT != 0,
     };
 
     if dirfd != AT_FDCWD {
