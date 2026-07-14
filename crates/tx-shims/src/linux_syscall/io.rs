@@ -2011,6 +2011,9 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         file.rnode().backing(),
         tx_subsystems::vfs::RNodeBacking::PageBacked { .. }
     ) {
+        if file.flags().packet {
+            return sys_direct_pagebacked(&file, buf_ptr, len, true, ctx).await;
+        }
         return sys_write_pagebacked(&file, buf_ptr, len, ctx).await;
     }
 
@@ -2296,6 +2299,9 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
         file.rnode().backing(),
         tx_subsystems::vfs::RNodeBacking::PageBacked { .. }
     ) {
+        if file.flags().packet {
+            return sys_direct_pagebacked(&file, buf_ptr, len, false, ctx).await;
+        }
         return sys_read_pagebacked::<P>(&file, buf_ptr, len, ctx).await;
     }
 
@@ -2921,4 +2927,89 @@ pub(super) async fn sys_copy_file_range<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>
     }
 
     SyscallResult::Return(transferred as i64)
+}
+async fn sys_direct_pagebacked<'a>(
+    file: &Cap<tx_subsystems::vfs::structure::OpenFile>,
+    buf_ptr: usize,
+    len: usize,
+    write: bool,
+    ctx: &SyscallCtx<'a>,
+) -> SyscallResult {
+    use tx_subsystems::page_backed::{
+        DirectIoBuffer, DirectIoBufferError, DirectIoCompletionError, PageIndex, PageRange,
+    };
+    use tx_subsystems::vm::{UserAccessKind, USER_PAGE_SIZE};
+    use tx_subsystems::vfs::structure::{OpenFileBacking, RNodeBacking};
+
+    if len == 0 {
+        return SyscallResult::Return(0);
+    }
+    let offset = file.offset();
+    if !offset.is_multiple_of(USER_PAGE_SIZE as u64)
+        || !buf_ptr.is_multiple_of(USER_PAGE_SIZE)
+        || !len.is_multiple_of(USER_PAGE_SIZE)
+    {
+        return SyscallResult::Error(EINVAL_VALUE);
+    }
+    let page_count = (len / USER_PAGE_SIZE) as u64;
+    let range = PageRange::new(PageIndex::new(offset / USER_PAGE_SIZE as u64), page_count);
+    let OpenFileBacking::Rnode { rnode } = file.backing() else {
+        return SyscallResult::Error(EINVAL_VALUE);
+    };
+    let RNodeBacking::PageBacked { pc } = rnode.backing() else {
+        return SyscallResult::Error(EINVAL_VALUE);
+    };
+
+    let access = if write {
+        UserAccessKind::Read
+    } else {
+        UserAccessKind::Write
+    };
+    let Some(user_range) = super::user_copy::covering_user_range(buf_ptr as u64, len) else {
+        return SyscallResult::Error(EINVAL_VALUE);
+    };
+    match ctx.aspace.reserve_user_range_for_access(user_range, access) {
+        tx_substrate::step::StepOutcome::Done(()) => {}
+        tx_substrate::step::StepOutcome::Err(errno) => return SyscallResult::error_from(errno.into()),
+        tx_substrate::step::StepOutcome::Continue { .. }
+        | tx_substrate::step::StepOutcome::Yield { .. } => return SyscallResult::Error(EIO_VALUE),
+    }
+    let buffer = match DirectIoBuffer::pin(&ctx.aspace, tx_hal::UserPtr::new(buf_ptr), len, access) {
+        Ok(buffer) => buffer,
+        Err(DirectIoBufferError::PermissionDenied) => return SyscallResult::Error(EACCES_VALUE),
+        Err(_) => return SyscallResult::Error(EINVAL_VALUE),
+    };
+    let submission = if write {
+        pc.submit_file_direct_write_waitable(range, buffer)
+    } else {
+        pc.submit_file_direct_read_waitable(range, buffer)
+    };
+    let submission = match submission {
+        Ok(submission) => submission,
+        Err(tx_subsystems::page_backed::DirectIoAdmissionError::Busy { .. }) => {
+            return SyscallResult::Error(EAGAIN_VALUE)
+        }
+        Err(_) => return SyscallResult::Error(EINVAL_VALUE),
+    };
+    if pc.enqueue_file_direct_submission(submission.submission()).is_err() {
+        return SyscallResult::Error(EIO_VALUE);
+    }
+    let Some(wait) = wait_source::wait_on_registered_source_id(submission.wait_source_id(), 0x1) else {
+        return SyscallResult::Error(EIO_VALUE);
+    };
+    let _ = wait_on_any_registered_source(alloc::vec![wait], None).await;
+    let completion = loop {
+        if let Some(completion) = pc.take_file_direct_submission_result(&submission) {
+            break completion;
+        }
+        tx_reactor::yield_now().await;
+    };
+    match completion {
+        Ok(_) => {
+            file.advance_offset(len as u64);
+            SyscallResult::Return(len as i64)
+        }
+        Err(DirectIoCompletionError::Backend(errno)) => SyscallResult::error_from(errno),
+        Err(_) => SyscallResult::Error(EIO_VALUE),
+    }
 }

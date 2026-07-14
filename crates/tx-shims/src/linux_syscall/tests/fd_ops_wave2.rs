@@ -1224,3 +1224,46 @@ fn dispatch_dup3_target_at_rlimit_nofile_returns_neg_ebadf() {
     assert_eq!(result, SyscallResult::Error(E_BADF));
     drop(path);
 }
+#[test]
+fn dispatch_o_direct_write_rejects_unaligned_user_buffer() {
+    let _setup = fd_ops_setup();
+    let (root_dentry, tmpfs) = build_tmpfs_root();
+    let owner_cred = Credential {
+        uid: 0,
+        gid: 0,
+        effective_caps: CapabilitySet::FULL,
+    };
+    let guard = ebr_guard();
+    let _ = tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner_cred, &guard);
+    drop(guard);
+
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap, thread);
+    let path = nul_terminate(b"/f");
+    let fd = match block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_OPENAT,
+            [
+                AT_FDCWD as i64 as u64,
+                path.as_ptr() as u64,
+                (O_RDWR | O_DIRECT) as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    )) {
+        SyscallResult::Return(fd) => fd as u64,
+        other => panic!("openat O_DIRECT: {other:?}"),
+    };
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            crate::linux_syscall::NR_WRITE,
+            [fd, 1, tx_subsystems::vm::USER_PAGE_SIZE as u64, 0, 0, 0],
+        ),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Error(E_INVAL));
+    drop(path);
+}
