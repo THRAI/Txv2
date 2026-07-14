@@ -785,3 +785,76 @@ fn write_inode_at_table(image: &mut MemImage, inode_table_block: u64, ino: u32, 
 fn filled_page(byte: u8) -> [u8; BLOCK_SIZE] {
     [byte; BLOCK_SIZE]
 }
+
+/// Raw `ee_len` semantics pinned to the on-disk numbers (Linux
+/// `ext4_ext_is_unwritten` / `ext4_ext_get_actual_len`): raw 0x8000 is the
+/// LEGAL MAXIMUM initialized extent (32768 blocks), not an unwritten flag;
+/// only raw values above 0x8000 are unwritten, of `raw - 0x8000` blocks.
+/// Regression: the onsite alpine image's libLLVM.so.19.1 starts with a
+/// maximal 32768-block extent that decoded as "unwritten, length 0", so its
+/// first 128 MiB read back as a hole (all zeroes) and the dynamic loader
+/// rejected the library with "Exec format error".
+#[test]
+fn extent_len_0x8000_is_initialized_maximum_not_unwritten() {
+    let max_initialized = Extent {
+        logical_block: 0,
+        len: 0x8000,
+        physical_start: 124_928,
+    };
+    assert!(max_initialized.is_initialized());
+    assert_eq!(max_initialized.actual_len(), 32768);
+    assert_eq!(max_initialized.physical_for(0), Some(124_928));
+    assert_eq!(max_initialized.physical_for(32767), Some(124_928 + 32767));
+    assert_eq!(max_initialized.physical_for(32768), None);
+
+    let unwritten_one = Extent {
+        logical_block: 0,
+        len: 0x8001,
+        physical_start: 50,
+    };
+    assert!(!unwritten_one.is_initialized());
+    assert_eq!(unwritten_one.actual_len(), 1);
+    // Unwritten extents occupy logical range but read back as zeroes.
+    assert!(unwritten_one.contains(0));
+    assert_eq!(unwritten_one.physical_for(0), None);
+}
+
+/// Inode-level lookup across a maximal extent, mirroring the exact layout
+/// debugfs reported for the corrupted file: (0-32767)->124928 followed by
+/// (32768-38911)->157696.
+#[test]
+fn inode_maps_blocks_through_a_maximal_extent() {
+    let mut inode = Inode::default();
+    inode.mode = 0x8000 | 0o644;
+    inode.size = 162_201_592;
+    inode.links_count = 1;
+    inode.flags = Inode::EXTENTS_FL;
+    inode
+        .set_extent_root(&[
+            Extent {
+                logical_block: 0,
+                len: 0x8000,
+                physical_start: 124_928,
+            },
+            Extent {
+                logical_block: 32768,
+                len: 6144,
+                physical_start: 157_696,
+            },
+        ])
+        .unwrap();
+
+    use tx_ext4_format::ondisk::BlockMapping;
+    assert_eq!(
+        inode.map_extent_block(0).unwrap(),
+        BlockMapping::Data(124_928)
+    );
+    assert_eq!(
+        inode.map_extent_block(32767).unwrap(),
+        BlockMapping::Data(157_695)
+    );
+    assert_eq!(
+        inode.map_extent_block(32768).unwrap(),
+        BlockMapping::Data(157_696)
+    );
+}

@@ -1,4 +1,55 @@
-- 2026-07-06 LATE (GIT TASK1 GREEN — two more onsite fixes). ① mkdir with a TRAILING SLASH
+- 2026-07-14 (EXT4 MAXIMAL-EXTENT DECODE FIX — la onsite rustc "Exec format error" root-caused).
+  On-disk `ee_len` raw 0x8000 (32768 blocks = 128 MiB, the LEGAL MAXIMUM initialized extent)
+  was decoded as "unwritten, length 0" because Extent treated bit 15 as a pure flag
+  (`is_initialized = len & 0x8000 == 0`, `initialized_len = len & !0x8000`). Any file with a
+  maximal extent read that whole extent back as a hole (zeroes). First real victim: the onsite
+  la alpine image's /usr/lib/libLLVM.so.19.1 (162 MB, extents 32768+6144+688) — first 128 MiB
+  read as zeroes, musl ldso rejected it ("Exec format error"), rustc dead on la. Proof was
+  arithmetic, no kernel tracing needed: guest md5 of the file == host md5 of the pristine file
+  with its first 32768 blocks zero-filled, byte-exact; guest first-896-bytes md5 == md5 of 896
+  zero bytes. librustc_driver (~130 MB, no maximal extent) loaded fine, and rv's libLLVM happens
+  to be laid out without a maximal extent — rv rustc passing was layout luck, not arch. Fix in
+  tx-ext4-format ondisk.rs mirrors Linux ext4_ext_is_unwritten/get_actual_len: initialized iff
+  raw <= 0x8000, actual_len = raw <= 0x8000 ? raw : raw - 0x8000; contains() uses actual_len so
+  unwritten extents still occupy logical range and read as zeroes via physical_for -> None. The
+  pager's coalesce cap (`prev.len < 0x8000` before +1) already tops out at exactly 32768 — legal
+  on disk, and now readable by our own decoder (our writeback of >=128 MiB sequential files
+  previously self-corrupted on re-read). Numeric regression tests pinned in pager_mock.rs
+  (raw 0x8000 => initialized/32768, raw 0x8001 => unwritten/1, plus inode-level mapping mirroring
+  the exact debugfs layout of the corrupted file). Verified: tx-ext4-format 14/14 (2 new),
+  cargo xtask unit matches baseline (tx-kernel 82 / tx-ext4 9 / tx-scripts 56 green; tx-shims
+  host-test compile failure pre-exists), la64 full-build green, la64 onsite alpine boot smoke
+  reaches the bash prompt on qemu 9.2.1. Next: in-guest md5 of libLLVM must match host
+  8e8bd7e197466d297459faaa3dacf07f, then rustc -h / full rustc Task1 on la. FOLLOW-UP same
+  day: user confirmed rustc works on la; vim edit/save/quit passed once interactively. ALSO
+  removed the always-on `probe:user-entry` boot probes (8 lines per boot) from the la board's
+  enter_userspace_with_context — the LS2K1000 bring-up leftover the docs said to strip once
+  stable; the rest of the trace family was already behind the off-by-default la64-boot-trace
+  feature. la board host tests 47/47, boot smoke clean (userspace:submitted now goes straight
+  to the bash prompt). OPEN: one la vim session froze hard earlier (guest at 0% CPU, even the
+  reactor heartbeat gone — different signature from the rv lost-thread bug, smells like a
+  wake-source loss); it did not reproduce on retry, no gdb evidence captured. Interactive la
+  runs should keep using the chardev-logfile + `-s` gdbstub qemu command so the next freeze
+  can be autopsied live.
+- 2026-07-10 (BOOT-CHAIN SIMPLIFICATION — `tx_hal::entry` and the `KernelMain` trait deleted).
+  The five-step boot skeleton (minimal trap vector → boot_handoff → early percpu →
+  mark_cpu_online → CoreInit::boot) now lives at the top of
+  `tx_kernel::kernel_main(cpu_id, firmware_arg)`; every board's `rust_entry` calls it
+  directly. Chain shrinks from four hops (asm → rust_entry → tx_hal::entry → trait
+  callback → kernel_main) to three (asm → rust_entry → kernel_main); the three binding
+  crates lose their `struct Kernel` + `impl KernelMain` boilerplate. Instruction order is
+  unchanged — pure structural move. Verified: host unit lanes match baseline exactly
+  (tx-kernel 82 / tx-ext4 9 / tx-scripts 56 green; the tx-shims host-test compile failure
+  PRE-EXISTS this change), rv64-qemu full-build + busybox-boot smoke reaches boot:ok
+  under tx.maxcpus=4, la64-qemu full-build green, and the la64 busybox lane reaches
+  boot:ok on the refactored kernel under qemu 9.2.1
+  (PATH=/data/home-ljs/ljslll/os/qemu-local/install-9.2.1/bin:$PATH cargo xtask qemu
+  --target la64-qemu --profile busybox --expect-sentinel). SIDE FIND: under the system
+  qemu 8.2.2 the same lane dies with ADEM (estat=0x480000, faulting address
+  0x9000000200000000) BEFORE the first sentinel — A/B via git stash shows the
+  byte-identical trap on the pre-refactor kernel, so this is an 8.2.2 emulation artifact
+  (a second 8.2.2 failure mode, distinct from the known ll.w/sc.w one; looks like an
+  early-boot kernel bug but is not). No board-side files touched beyond one stale comment.
   (`mkdir("a/b/")`) returned a bogus -EEXIST without creating anything: sys_mkdirat's
   empty-basename arm (written for `mkdir("/")`) caught every trailing-slash path. git init's
   template copy passes `.git/hooks/`, believed the dir existed, then died ENOENT copying into

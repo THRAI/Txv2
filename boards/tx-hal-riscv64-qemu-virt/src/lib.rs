@@ -972,7 +972,7 @@ fn install_early_percpu(cpu_id: CpuId) {
     // trap-vector prologue does `csrrw sp, sscratch, sp` to swap
     // onto the per-CPU trap-handler stack; sscratch must therefore
     // be primed before any trap can fire on this hart. We are
-    // called from `tx_hal::entry()` on every hart's boot path,
+    // called from `tx_kernel::kernel_main()` on every hart's boot path,
     // immediately after the trap vector is installed, which is
     // the earliest moment we have a valid `cpu_id` and a populated
     // trap-stack array. Subsequent traps re-prime sscratch through

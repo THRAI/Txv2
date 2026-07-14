@@ -16,7 +16,7 @@ pub mod trap;
 pub mod trap_handoff;
 pub mod vdso;
 
-use tx_hal::{BootHandoff, TxPlatform};
+use tx_hal::TxPlatform;
 
 /// Bounded-trace dump threshold.
 ///
@@ -64,7 +64,17 @@ mod host_check_allocator {
     static HOST_CHECK_ALLOCATOR: HostCheckAllocator = HostCheckAllocator;
 }
 
-pub fn kernel_main<P: TxPlatform + 'static>(handoff: BootHandoff) -> ! {
+pub fn kernel_main<P: TxPlatform + 'static>(cpu_id: usize, firmware_arg: usize) -> ! {
+    // Boot skeleton, shared by every board's `rust_entry`. Ordering
+    // invariant: the minimal trap stub must be installed before
+    // `boot_handoff` dereferences any firmware pointer (a poisoned
+    // DTB/systemtable address then dies with a decoded trap dump
+    // instead of running away silently), and the per-CPU area must
+    // exist before the first trap can fire on this hart.
+    P::install_minimal_trap_vector();
+    let handoff = P::boot_handoff(cpu_id, firmware_arg);
+    P::install_early_percpu(handoff.cpu_id);
+    P::mark_cpu_online(handoff.cpu_id);
     init::CoreInit::<P>::boot(handoff)
 }
 

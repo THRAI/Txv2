@@ -563,6 +563,12 @@ pub struct Extent {
 }
 
 impl Extent {
+    /// On-disk `ee_len` encodes state and length together (Linux
+    /// `ext4_ext_is_unwritten` / `ext4_ext_get_actual_len`): raw values
+    /// `1..=32768` are an INITIALIZED extent of that many blocks — a raw
+    /// length of exactly 0x8000 (32768, the maximum) is initialized, not
+    /// a flag bit — while raw values above 32768 mark an UNWRITTEN extent
+    /// of `ee_len - 32768` blocks.
     pub const UNINITIALIZED_MASK: u16 = 0x8000;
 
     pub fn parse(bytes: &[u8]) -> Result<Self> {
@@ -583,17 +589,21 @@ impl Extent {
         Ok(())
     }
 
-    pub fn initialized_len(&self) -> u32 {
-        (self.len & !Self::UNINITIALIZED_MASK) as u32
+    pub fn actual_len(&self) -> u32 {
+        if self.len <= Self::UNINITIALIZED_MASK {
+            self.len as u32
+        } else {
+            (self.len - Self::UNINITIALIZED_MASK) as u32
+        }
     }
 
     pub fn is_initialized(&self) -> bool {
-        self.len & Self::UNINITIALIZED_MASK == 0
+        self.len <= Self::UNINITIALIZED_MASK
     }
 
     pub fn contains(&self, logical_block: u32) -> bool {
         logical_block >= self.logical_block
-            && logical_block < self.logical_block.saturating_add(self.initialized_len())
+            && logical_block < self.logical_block.saturating_add(self.actual_len())
     }
 
     pub fn physical_for(&self, logical_block: u32) -> Option<u64> {

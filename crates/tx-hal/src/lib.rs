@@ -1493,10 +1493,6 @@ impl<T> TxPlatform for T where
 {
 }
 
-pub trait KernelMain<P: TxPlatform> {
-    fn kernel_main(handoff: BootHandoff) -> !;
-}
-
 pub fn console_write_bytes<P: ConsoleIf>(bytes: &[u8]) {
     P::write_bytes(bytes);
 }
@@ -1507,16 +1503,4 @@ pub fn console_read_bytes<P: ConsoleIf>(buf: &mut [u8]) -> usize {
 
 pub fn console_write_str<P: ConsoleIf>(message: &str) {
     P::write_bytes(message.as_bytes());
-}
-
-pub fn entry<P, K>(cpu_id: usize, firmware_arg: usize) -> !
-where
-    P: TxPlatform,
-    K: KernelMain<P>,
-{
-    P::install_minimal_trap_vector();
-    let handoff = P::boot_handoff(cpu_id, firmware_arg);
-    P::install_early_percpu(handoff.cpu_id);
-    P::mark_cpu_online(handoff.cpu_id);
-    K::kernel_main(handoff)
 }
