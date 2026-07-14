@@ -117,7 +117,7 @@ struct BootstrapPmapInfoCell(UnsafeCell<Option<BootstrapPmapInfo>>);
 struct CmdlineCell(UnsafeCell<[u8; CMDLINE_CAPACITY]>);
 struct MemoryRegionsCell(UnsafeCell<[MemoryRegion; MAX_MEMORY_REGIONS]>);
 struct PlatformInfoCell(UnsafeCell<PlatformInfo>);
-struct PlatformMmioRegionsCell(UnsafeCell<[MmioRegion; 5]>);
+struct PlatformMmioRegionsCell(UnsafeCell<[MmioRegion; 6]>);
 struct TimebaseFrequencyCell(UnsafeCell<u64>);
 struct PossibleCpuCountCell(UnsafeCell<usize>);
 struct ReservedPageTablesCell(UnsafeCell<[PhysRange; BOOTSTRAP_PMAP_RESERVED_RANGES]>);
@@ -153,7 +153,7 @@ static PLATFORM_INFO: PlatformInfoCell = PlatformInfoCell(UnsafeCell::new(Platfo
     possible_cpu_count: 1,
 }));
 static PLATFORM_MMIO_REGIONS: PlatformMmioRegionsCell =
-    PlatformMmioRegionsCell(UnsafeCell::new([empty_mmio_region(); 5]));
+    PlatformMmioRegionsCell(UnsafeCell::new([empty_mmio_region(); 6]));
 static TIMEBASE_FREQUENCY_HZ: TimebaseFrequencyCell =
     TimebaseFrequencyCell(UnsafeCell::new(QEMU_VIRT_FALLBACK_TIMEBASE_HZ));
 static POSSIBLE_CPU_COUNT: PossibleCpuCountCell = PossibleCpuCountCell(UnsafeCell::new(1));
@@ -208,8 +208,23 @@ const fn empty_mmio_region() -> MmioRegion {
     }
 }
 
-fn qemu_mmio_regions() -> [MmioRegion; 5] {
+fn qemu_mmio_regions() -> [MmioRegion; 6] {
     [
+        // QEMU virt goldfish-rtc (`rtc@101000`). One page; read once at boot to
+        // seed CLOCK_REALTIME from real host time. Without this mapping the
+        // boot-time RTC read faults (load page fault at the direct-map VA).
+        MmioRegion {
+            name: "rtc",
+            phys: PhysRange {
+                start: PhysAddr(0x0010_1000),
+                size: 0x1000,
+            },
+            virt: VirtRange {
+                start: VirtAddr(DIRECT_MAP_BASE + 0x0010_1000),
+                size: 0x1000,
+            },
+            flags: MMIO_RW_DEVICE,
+        },
         MmioRegion {
             name: "clint",
             phys: PhysRange {

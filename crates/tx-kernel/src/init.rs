@@ -538,6 +538,16 @@ impl<P: TxPlatform> CoreInit<P> {
             });
             tx_hal::console_write_str::<P>("\n");
         }
+        // Seed CLOCK_REALTIME from the platform hardware RTC (if any) so wall
+        // time — `date`, `git` commit timestamps, file mtimes — reflects real
+        // time instead of the fixed epoch base. Runs after vDSO init so the
+        // offset update is republished into the vvar page. Platforms without a
+        // readable RTC return `None` and keep the default base (no change).
+        if let Some(rtc_ns) = P::read_rtc_epoch_ns() {
+            let _ = tx_subsystems::wall_clock::set_realtime_ns::<P>(rtc_ns);
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":rtc:synced\n");
+        }
     }
 
     /// Mount tmpfs as the rootfs.

@@ -606,6 +606,70 @@ impl IrqIf for Platform {
         handler(irq)
     }
 }
+/// Read the QEMU virt loongson ls7a-rtc (`rtc@100d0100`) as Unix-epoch
+/// nanoseconds. The "toy" (time-of-year) read registers hold the current
+/// broken-down time; TOY_READ0 packs month/day/hour/min/sec and TOY_READ1 the
+/// year. Reachable through the DMW uncached window — no page-table entry, so
+/// (unlike RV64's goldfish-rtc) no boot mapping is required.
+#[cfg(target_arch = "loongarch64")]
+fn read_ls7a_rtc_epoch_ns() -> Option<u64> {
+    const LS7A_RTC_PHYS: usize = 0x100d_0100;
+    const TOY_READ0: usize = 0x2c;
+    const TOY_READ1: usize = 0x30;
+    const RTC_CTRL: usize = 0x40;
+    // QEMU gates the toy read registers on the enable bits; firmware normally
+    // sets them, but we boot bare `-kernel`, so enable the toy oscillator +
+    // counter ourselves before reading.
+    const TOY_ENABLE: u32 = 1 << 11;
+    const OSC_ENABLE: u32 = 1 << 8;
+    // SAFETY: the DMW uncached window maps every physical address; this only
+    // touches the ls7a-rtc MMIO registers.
+    let (toy0, year_reg) = unsafe {
+        let ctrl = (la64_uncached_virt(LS7A_RTC_PHYS) + RTC_CTRL) as *mut u32;
+        ctrl.write_volatile(ctrl.read_volatile() | TOY_ENABLE | OSC_ENABLE);
+        let toy0 = ((la64_uncached_virt(LS7A_RTC_PHYS) + TOY_READ0) as *const u32).read_volatile();
+        let year_reg =
+            ((la64_uncached_virt(LS7A_RTC_PHYS) + TOY_READ1) as *const u32).read_volatile();
+        (toy0, year_reg)
+    };
+    // TOY_READ0: mon[31:26] day[25:21] hour[20:16] min[15:10] sec[9:4] 0.1s[3:0].
+    let mon = ((toy0 >> 26) & 0x3f) as i64;
+    let day = ((toy0 >> 21) & 0x1f) as i64;
+    let hour = ((toy0 >> 16) & 0x1f) as i64;
+    let min = ((toy0 >> 10) & 0x3f) as i64;
+    let sec = ((toy0 >> 4) & 0x3f) as i64;
+    // TOY_READ1 is years-since-1900 on some QEMU builds, a full year on others;
+    // disambiguate by magnitude.
+    let year = if year_reg >= 1970 {
+        year_reg as i64
+    } else {
+        year_reg as i64 + 1900
+    };
+    if !(1..=12).contains(&mon) || !(1..=31).contains(&day) || year < 1970 {
+        return None; // toy clock not populated
+    }
+    let secs = civil_to_epoch_secs(year, mon, day, hour, min, sec);
+    (secs > 0).then(|| secs as u64 * 1_000_000_000)
+}
+
+#[cfg(not(target_arch = "loongarch64"))]
+fn read_ls7a_rtc_epoch_ns() -> Option<u64> {
+    None
+}
+
+/// Civil (proleptic Gregorian) date to Unix-epoch seconds — Howard Hinnant's
+/// `days_from_civil` algorithm plus the intra-day seconds.
+#[cfg(target_arch = "loongarch64")]
+fn civil_to_epoch_secs(y: i64, m: i64, d: i64, hh: i64, mm: i64, ss: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    days * 86400 + hh * 3600 + mm * 60 + ss
+}
+
 impl TimeIf for Platform {
     fn read_ns() -> u64 {
         tx_hal::time::ticks_to_ns(la64_read_stable_counter(), Self::frequency_hz())
@@ -644,6 +708,10 @@ impl TimeIf for Platform {
 
     fn frequency_hz() -> u64 {
         la64_timebase_frequency_hz()
+    }
+
+    fn read_rtc_epoch_ns() -> Option<u64> {
+        read_ls7a_rtc_epoch_ns()
     }
 }
 impl PercpuIf for Platform {

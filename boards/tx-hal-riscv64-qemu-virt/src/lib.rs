@@ -73,7 +73,35 @@ const PLIC_BASE: usize = pmap_topology::DIRECT_MAP_BASE + PLIC_PHYS_BASE;
 const UART_PHYS_BASE: usize = 0x1000_0000;
 #[cfg(target_arch = "riscv64")]
 const UART_BASE: usize = pmap_topology::DIRECT_MAP_BASE + UART_PHYS_BASE;
+/// QEMU virt goldfish-rtc (`google,goldfish-rtc`, DTB node `rtc@101000`).
+/// Register `TIME_LOW` (0x00) latches the high half into `TIME_HIGH` (0x04);
+/// the 64-bit pair is nanoseconds since the Unix epoch — real host time under
+/// QEMU's default (`-rtc base=utc`). Reachable through the low-address direct
+/// map like PLIC/UART above.
+#[cfg(target_arch = "riscv64")]
+const RTC_PHYS_BASE: usize = 0x0010_1000;
+#[cfg(target_arch = "riscv64")]
+const RTC_BASE: usize = pmap_topology::DIRECT_MAP_BASE + RTC_PHYS_BASE;
 const PLIC_MAX_IRQ: u32 = tx_hal::IRQ_DISPATCH_TABLE_SIZE as u32;
+
+/// Read the goldfish-rtc as Unix-epoch nanoseconds. `None` if the device reads
+/// back zero (absent / not wired).
+#[cfg(target_arch = "riscv64")]
+fn read_goldfish_rtc_epoch_ns() -> Option<u64> {
+    // SAFETY: `RTC_BASE` is the boot-time direct map of the QEMU virt
+    // goldfish-rtc MMIO block (same low-address window as PLIC/UART). Reading
+    // TIME_LOW first is required — it atomically latches TIME_HIGH.
+    unsafe {
+        let low = (RTC_BASE as *const u32).read_volatile() as u64;
+        let high = ((RTC_BASE + 4) as *const u32).read_volatile() as u64;
+        let ns = (high << 32) | low;
+        (ns != 0).then_some(ns)
+    }
+}
+#[cfg(not(target_arch = "riscv64"))]
+fn read_goldfish_rtc_epoch_ns() -> Option<u64> {
+    None
+}
 #[cfg(all(not(target_arch = "riscv64"), test))]
 const PLIC_IRQ_SOURCES: usize = tx_hal::IRQ_DISPATCH_TABLE_SIZE;
 #[cfg(all(not(target_arch = "riscv64"), test))]
@@ -608,6 +636,10 @@ impl TimeIf for Platform {
 
     fn frequency_hz() -> u64 {
         Self::platform_info().timebase_frequency_hz
+    }
+
+    fn read_rtc_epoch_ns() -> Option<u64> {
+        read_goldfish_rtc_epoch_ns()
     }
 }
 impl PercpuIf for Platform {

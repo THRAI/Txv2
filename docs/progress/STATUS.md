@@ -1,3 +1,15 @@
+- 2026-07-14 (内核墙钟从硬件 RTC 同步真实时间 — 双架构). 之前 CLOCK_REALTIME 锚在写死的 2026-05-23
+  (wall_clock.rs DEFAULT_REALTIME_EPOCH_BASE_NS + RTC ioctl fixed_oscomp_time),导致 git commit/date/文件
+  mtime 都是固定过去日期(GitHub 显示 "2 months ago")。改:开机读真 RTC 硬件,调已存在的
+  wall_clock::set_realtime_ns::<P> 重设 offset + 重发 vvar。**改动 5 文件**:(1) tx-hal TimeIf 加默认方法
+  read_rtc_epoch_ns()->Option<u64>(默认 None,不破坏其他实现);(2) rv64 board 读 goldfish-rtc
+  (DTB rtc@101000,TIME_LOW/HIGH=epoch ns)+ boot_static.rs 补 MMIO 页表映射(设备页是逐个显式映的,
+  5→6 region,不加映射会 load page fault);(3) la64 board 读 ls7a-rtc(DTB rtc@100d0100,TOY 寄存器解码
+  +civil→epoch;**关键坑=TOY 读被使能位门控,必须先写 RTC_CTRL|=TOY_ENABLE|OSC_ENABLE**,DMW 覆盖全 PA 无需
+  页表映射);(4) init.rs vdso init 后调同步+:rtc:synced 哨兵。**验证**:rv64 date=2026-07-14 16:13 与宿主
+  一致、la64 date=16:20:35 与宿主差 1s;两架构 git commit 时间戳真实;**回归门全绿**:rv64+la64 git-net 各
+  8/8、tx-subsystems 集合差 321==321。**部署提醒**:QEMU 默认 RTC=宿主时间,-rtc base=utc 钉 UTC;RTC ioctl
+  仍返回 fixed_oscomp_time(未改,git 不用它)。**Next**:可选把 RTC ioctl 也接真 RTC。Blocker:无。
 - 2026-07-14 (LTP net 对账 la64 双 lane — 补齐 3185f1d6 的另一半架构). 与 rv 同一批靶、同一见证工具
   (tools/ltp-bin-witness.sh 官方 ltp-bin 形态),验证双 ioctl 修复 + 缩轮 knob 在 la 的增收。**la 范围内 377/lane
   = 与 rv 完全对称**:ipv6_lib+socket 核心 107/107(**in6_02 3/3 — ioctl 修复架构无关,la 同样回来**)、socket 剩余

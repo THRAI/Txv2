@@ -1234,6 +1234,15 @@ pub trait TimeIf {
 
     /// Return the hardware timer frequency used for ns/tick conversion.
     fn frequency_hz() -> u64;
+
+    /// Read the platform's hardware real-time clock as nanoseconds since the
+    /// Unix epoch, if the platform exposes a readable RTC. Returns `None` when
+    /// there is none, in which case the kernel wall clock keeps its default
+    /// epoch base. Called once at boot to seed `CLOCK_REALTIME`; never on a
+    /// hot path.
+    fn read_rtc_epoch_ns() -> Option<u64> {
+        None
+    }
 }
 pub trait PercpuIf {
     fn current_cpu_id() -> CpuId {
