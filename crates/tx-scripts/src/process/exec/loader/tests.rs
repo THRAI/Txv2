@@ -15,6 +15,29 @@ use alloc::vec::Vec;
 
 use super::*;
 
+struct FixtureParser;
+
+impl ElfFileParser for FixtureParser {
+    fn parse_header(_: &[u8]) -> Result<ElfHeader, ElfDecodeError> {
+        Ok(ElfHeader::elf64_le(
+            ET_EXEC, EM_RISCV, 0x10080, 64, 56, 2, 0,
+        ))
+    }
+
+    fn parse_program_headers(
+        _: &ElfHeader,
+        _: &[u8],
+    ) -> Result<Vec<ElfProgramHeader>, ElfDecodeError> {
+        Ok(Vec::new())
+    }
+}
+
+#[test]
+fn parser_trait_exposes_only_tx_owned_values() {
+    let header = FixtureParser::parse_header(&[]).unwrap();
+    assert_eq!(header.entry, 0x10080);
+}
+
 // ELF identification offsets (mirrors goblin's constants for clarity).
 const EI_MAG0: usize = 0;
 const ELFMAG: [u8; 4] = [0x7f, b'E', b'L', b'F'];

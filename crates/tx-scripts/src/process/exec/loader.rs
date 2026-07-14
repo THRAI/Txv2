@@ -40,6 +40,12 @@ use goblin::elf::program_header::{
     ProgramHeader, PF_R, PF_W, PF_X, PT_DYNAMIC, PT_INTERP, PT_LOAD, PT_PHDR,
 };
 
+mod model;
+mod parser;
+
+pub use model::{ElfClass, ElfDecodeError, ElfEndian, ElfHeader, ElfProgramHeader};
+pub use parser::ElfFileParser;
+
 /// PT_GNU_STACK program header type (not in goblin's constants).
 const PT_GNU_STACK: u32 = 0x6474_e551;
 
