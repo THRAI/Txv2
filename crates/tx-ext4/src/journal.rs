@@ -12,13 +12,18 @@ use tx_substrate::zone::Cap;
 use tx_subsystems::execution::{Guard, StepOutcome};
 use tx_subsystems::fs_iface::{
     BackendBioDependency, BackendBioGraph, BackendBioGraphError, BackendBioNode, BackendBioNodeId,
-    IoDataLeaseId, IoDataSource, PageFrameRef,
+    BackendPageCompletion, BackendPageRequest, BackendPlan, IoDataLeaseId, IoDataSource,
+    PageFrameRef,
 };
 use tx_subsystems::io_manager::block::{BioPlan, BioVec, BlockFlags, BlockOp, DeviceKey, LbaRange};
+use tx_subsystems::io_manager::page::{PageIoOp, PageIoRequestId, PageIoResult};
 use tx_subsystems::page_backed::{
     AnonSwapPolicy, MaterializeAccess, PageCacheError, PageContainer, PageContainerKind, PageIndex,
     PageLease,
 };
+
+use crate::planner::Ext4FsyncPlanSource;
+use crate::sync::SpinMutex;
 
 /// One L5-owned write buffer retained until its L6 completion.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -398,6 +403,12 @@ impl<T> JournalTransactionState<T> {
         *committed = true;
         Ok(())
     }
+    pub fn active(&self) -> Option<&T> {
+        self.active.as_ref().map(|(_, transaction)| transaction)
+    }
+    pub fn discard(&mut self) -> Option<T> {
+        self.active.take().map(|(_, transaction)| transaction)
+    }
     pub fn take_checkpoint_ready(&mut self) -> Result<Option<T>, JournalTransactionStateError> {
         let Some((committed, _)) = self.active.as_ref() else {
             return Ok(None);
@@ -471,5 +482,95 @@ impl PreparedJournalTransaction {
 
     pub fn record_count(&self) -> usize {
         self.records.len()
+    }
+}
+
+/// Ext4 mount-owned bridge from fsync requests to retained JBD2 transactions.
+///
+/// The source owns the prepared transaction and hence every journal-record
+/// lease until the matching L4 graph completion makes the commit durable.
+pub struct JournalFsyncSource {
+    state: SpinMutex<JournalFsyncSourceState>,
+}
+
+struct JournalFsyncSourceState {
+    transaction: JournalTransactionState<PreparedJournalTransaction>,
+    submitted: Option<PageIoRequestId>,
+}
+
+impl JournalFsyncSource {
+    pub const fn new() -> Self {
+        Self {
+            state: SpinMutex::new(JournalFsyncSourceState {
+                transaction: JournalTransactionState::new(),
+                submitted: None,
+            }),
+        }
+    }
+
+    pub fn begin(
+        &self,
+        transaction: PreparedJournalTransaction,
+    ) -> Result<(), JournalTransactionStateError> {
+        self.state.lock().transaction.begin(transaction)
+    }
+
+    /// Take the post-commit checkpoint graph after a matching durable commit.
+    pub fn take_checkpoint_graph(&self) -> Result<Option<BackendBioGraph>, JournalTransactionStateError> {
+        let mut state = self.state.lock();
+        let Some(transaction) = state.transaction.take_checkpoint_ready()? else {
+            return Ok(None);
+        };
+        state.submitted = None;
+        transaction
+            .plan()
+            .checkpoint_graph_after_commit()
+            .map_err(|_| JournalTransactionStateError::NotCommitted)
+    }
+}
+
+impl Default for JournalFsyncSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Ext4FsyncPlanSource for JournalFsyncSource {
+    fn plan_fsync(&self, request: &BackendPageRequest) -> BackendPlan {
+        if request.op != PageIoOp::Fsync {
+            return BackendPlan::Err(tx_subsystems::execution::Errno::EINVAL);
+        }
+        let mut state = self.state.lock();
+        if state.submitted.is_some() {
+            return BackendPlan::Err(tx_subsystems::execution::Errno::EBUSY);
+        }
+        let Some(transaction) = state.transaction.active() else {
+            return BackendPlan::Err(tx_subsystems::execution::Errno::EAGAIN);
+        };
+        let graph = match transaction.plan().commit_graph() {
+            Ok(graph) => graph,
+            Err(_) => return BackendPlan::Err(tx_subsystems::execution::Errno::EIO),
+        };
+        state.submitted = Some(request.id);
+        BackendPlan::SubmitGraph(graph)
+    }
+
+    fn complete_fsync(&self, completion: BackendPageCompletion) {
+        if completion.op != PageIoOp::Fsync {
+            return;
+        }
+        let mut state = self.state.lock();
+        if state.submitted != Some(completion.id) {
+            return;
+        }
+        state.submitted = None;
+        match completion.result {
+            PageIoResult::Done => {
+                let _ = state.transaction.mark_commit_durable();
+            }
+            PageIoResult::Err(_) => {
+                let _ = state.transaction.discard();
+            }
+        }
     }
 }
