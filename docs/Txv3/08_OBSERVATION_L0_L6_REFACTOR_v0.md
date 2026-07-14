@@ -88,11 +88,12 @@ flowchart TD
 ```
 
 The current `observe-schema check` gate validates the inventory against the
-live tree:
+live tree, and `observe-schema codegen --check` validates both kernel and host
+generated catalogs:
 
 ```text
 observe-schema check: ok (levels=8 record_kinds=11 payloads=23 payload_structs=20 cfgs=34 projections=9 tracks=16 hart_emitter_methods=25)
-observe-schema codegen --check: ok (crates/tx-observe/src/generated/schema_catalog.rs)
+observe-schema codegen --check: ok (crates/tx-observe/src/l0_schema/schema_catalog.rs, tools/tx-observe-host-catalog.json)
 ```
 
 Target topology:
@@ -110,8 +111,8 @@ flowchart TD
   end
 
   subgraph H["Host-side generated/use path"]
-    Gh["Generated host catalog\nmenu.json / projection matrix / decode tables"]
-    L4["L4 Readers and Integrity\ntxtrace / rawrecords / live guest memory"]
+    Gh["Generated host catalog\ntools/tx-observe-host-catalog.json\ninputs / control groups / projections / event-family coverage"]
+    L4["L4 Readers and Integrity\ntxtrace / rawrecords(.gz) / live guest memory"]
     L5["L5 Canonical Representation\nTraceEvent / RepairEvent / LossEvent"]
     L6["L6 Transcoders and Views\nPerfetto / NDJSON / Parquet / SQL / TUI"]
   end
@@ -144,6 +145,65 @@ The direction of dependency is intentionally narrow:
 - L6 views consume canonical events and integrity metadata, not ad hoc raw
   interpretations.
 
+Current kernel-side folder map:
+
+```text
+crates/tx-observe/src/
+  l0_schema/       generated schema catalog from schema/txobserve.toml
+  l1_probe_api/    callsite-facing probe API and syscall-boundary macro facade
+  l2_producer/     HartEmitter and bounded per-hart producer runtime
+  l3_wire/         txtrace-v0 payload encoding helpers
+  lib.rs           compatibility facade and public re-exports
+
+crates/tx-observe-types/src/
+  header.rs        txtrace-v0 file/ring headers
+  record.rs        TxTraceRecord, TxTraceKind, TxTraceLevel
+  payload.rs       TxPayloadTag and fixed-size Payload* structs
+```
+
+Current host-side folder map:
+
+```text
+tools/tx-trace-daemon/src/
+  l4_readers/      TraceInputKind, TraceInput, TraceIntegrity, RawRecordFrame,
+                   and TraceReader boundary types
+    replay.rs      txtrace file replay, bundle writing, file-backed stats
+    live.rs        live guest-memory drain, raw-record finalization,
+                   and ELF symbol-to-guest-RAM offset resolution
+  l5_canonical/    DecodeBatch, TraceEventStream, TraceDecoder,
+                   binary record decode into the current DecodedEvent stream
+  l6_views/        ProjectionInput, TraceTranscoder,
+                   NDJSON and Perfetto projections over decoded events
+  main.rs          CLI facade and compatibility re-exports during migration
+
+tools/tx_observe_host/
+  l4_readers/      Python TraceIntegrity, TraceLoadResult,
+                   txtrace/rawrecords/rawrecords.gz/NDJSON input readers, and capture
+                   completeness accounting
+  l5_canonical/    Python TraceEventStream, TraceStreamMarker, marker
+                   derivation, txtrace record decode, and canonical ordering
+                   helpers
+  l6_views/        Python ProjectionInput, generated host catalog validation,
+                   projection schemas, typed JSON/DuckDB select helpers, and
+                   report/table/export execution
+    tables.py      DerivedTables, SQL views, Parquet export/cache manifests,
+                   and Python-hook table-dir execution
+    reports.py     text report projections over ProjectionInput and
+                   derived tables
+  __init__.py      narrow package re-export facade for analyzer compatibility
+
+tools/tx-observe-analyze.py
+  analyzer CLI compatibility facade; input selection, names loading, argument
+  parsing, and process exit only
+
+xtask/src/observe.rs
+  CLI orchestration wrapper for daemon/analyzer workflows and name extraction
+```
+
+L4-L6 are host-side layers owned by `tools/tx-trace-daemon`,
+`tools/tx-observe-analyze.py`, and `xtask observe`; they must not be created as
+fake kernel crate folders.
+
 ## 3. Borrowed Organization by Layer
 
 <!-- txdoc:OBS-L0L6-BORROWED-ORG-1 -->
@@ -154,7 +214,7 @@ The direction of dependency is intentionally narrow:
 | L1 Semantic Probe API | Generated macros and typed helpers visible to kernel callsites | Linux tracepoints, Rust `tracing` spans/events | Callsites reference schema event ids and typed fields, not raw bytes; span/event vocabulary is stable and reviewable | Heap-backed dynamic fields; string formatting on the producer path |
 | L2 Producer Contract | Bounded per-hart publish semantics | eBPF ringbuf reserve/submit/discard, ftrace per-CPU buffer commit discipline | Only a successful publish yields a handle that can be closed; drops are explicit; producer path remains non-blocking and per-hart | General-purpose ring allocation APIs; blocking backpressure; multi-producer locking |
 | L3 Wire ABI | `txtrace-v0` record and payload layout | CTF/LTTng packet metadata, Perfetto protobuf schema discipline | Binary layout is governed with metadata, size assertions, and version rules; each payload tag has a typed struct | Self-describing variable-length payloads in the kernel hot path |
-| L4 Host Readers and Integrity | Read `.txtrace`, `.rawrecords`, and live guest memory; compute completeness/loss | LTTng relay/session stats, Linux perf lost-sample reporting | Loss is first-class evidence with one interpretation shared by replay, live drain, and analyzer | Treating incomplete captures as fatal when tail samples are still useful |
+| L4 Host Readers and Integrity | Read `.txtrace`, `.rawrecords`, `.rawrecords.gz`, and live guest memory; compute completeness/loss | LTTng relay/session stats, Linux perf lost-sample reporting | Loss is first-class evidence with one interpretation shared by replay, live drain, and analyzer | Treating incomplete captures as fatal when tail samples are still useful |
 | L5 Canonical Representation | Schema-guided raw records to canonical event stream | Babeltrace 2 component graph, Perfetto Trace Processor ingest | Decode once into a canonical stream, then project; repair/loss markers are stream events | Letting each exporter reimplement ABI decoding |
 | L6 Transcoders and Views | Perfetto, NDJSON, Parquet, SQL, reports, TUI/control views | Perfetto SQL tables, DuckDB/Polars typed tables, exporter patterns from OTel | Views are projections with explicit coverage; query tables and menus are regenerated from schema/input | Making a derived table, `.pftrace`, or TUI manifest the source of truth |
 
@@ -209,10 +269,10 @@ the live implementation before generation becomes authoritative:
 | `[[controls.cfgs]]` | all observe-related `cfg` switches that may control generated menus/profiles | exact match against workspace `unexpected_cfgs` allowlist |
 | `[[names.families]]` | stable `debug.*` name-family ownership and projection obligations | parseable TOML |
 | `[[tracks.explicit]]` | explicit Perfetto/allocation tracks and stable track ids | exact const, id, and name match against daemon writer |
-| `[[host.inputs]]` | accepted host input modes: `.txtrace`, `.rawrecords`, and live guest memory | parseable TOML |
-| `[[host.projections]]` | NDJSON, Perfetto, text report, SQL views, and Parquet-derived table schemas | exact analyzer table columns for checked views |
+| `[[host.inputs]]` | accepted host input modes: `.txtrace`, `.rawrecords`, `.rawrecords.gz`, and live guest memory | parseable TOML |
+| `[[host.projections]]` | NDJSON, Perfetto, text report, SQL views, and Parquet-derived table schemas | generated into host catalog; analyzer SQL/Parquet lookup consumes that catalog |
 | `[[event_families]]` | family-level level/payload/control/projection mapping | referenced ids exist |
-| `[[kernel.hart_emitter_methods]]` | `HartEmitter` public method catalog, split into raw facade and typed producer surfaces | exact method-name match against `crates/tx-observe/src/lib.rs`; raw facade methods cannot be producer-allowed |
+| `[[kernel.hart_emitter_methods]]` | `HartEmitter` public method catalog, split into raw facade and typed producer surfaces | exact method-name match against `crates/tx-observe/src/l2_producer/runtime.rs`; raw facade methods cannot be producer-allowed |
 | `[[kernel.producer_boundary_rules]]` | production-side forbidden raw observe API needles and replacement guidance | consumed by `observe-producer-boundary` lint and generated into the kernel catalog |
 | `[[migration.checks]]` | migration gates that document current and planned enforcement | parseable TOML |
 
@@ -222,9 +282,9 @@ The TOML schema is never parsed in the kernel hot path. The intended flow is:
 flowchart LR
   TOML["schema/txobserve.toml"]
   Check["xtask observe-schema check"]
-  Codegen["xtask observe-schema codegen\nlanded for kernel catalog"]
-  Kernel["crates/tx-observe/src/generated/schema_catalog.rs"]
-  Host["generated host catalog\nplanned"]
+  Codegen["xtask observe-schema codegen\nkernel + host catalogs"]
+  Kernel["crates/tx-observe/src/l0_schema/schema_catalog.rs"]
+  Host["tools/tx-observe-host-catalog.json"]
   TUI["generated menu/profile\nplanned"]
 
   TOML --> Check
@@ -234,9 +294,9 @@ flowchart LR
   Codegen --> TUI
 ```
 
-The current gate is a check gate, not a generation gate. Generated Rust,
-generated host catalog tables, generated menu JSON, and generated docs tables
-are still planned follow-up work.
+The current gate now generates and checks the kernel Rust catalog plus the host
+projection catalog. Generated menu JSON and generated docs tables remain
+planned follow-up work.
 
 ### Migration
 
@@ -578,7 +638,7 @@ classDiagram
 L4 is the host input boundary. It reads trace inputs and owns the meaning of
 capture completeness. It separates three questions that are easy to conflate:
 
-- what input was captured (`.txtrace`, `.rawrecords`, live guest memory);
+- what input was captured (`.txtrace`, `.rawrecords`, `.rawrecords.gz`, live guest memory);
 - how many records were drained or retained;
 - what loss, overwrite, framing repair, or late-attach evidence exists.
 
@@ -641,6 +701,12 @@ must agree because they read the same L4 integrity object.
 L4 does not expose `TxTraceRecord` or raw payload fields to L6. The only layer
 allowed to call `RawRecordFrame::bytes_for_decode()` is the L5 canonical
 decoder module. Exporters receive no byte access path.
+
+For long live captures, L4 retains the compressed raw stream plus
+`runtime.json` and `names.json` as the rebuildable evidence set. `runtime.json`
+records the uncompressed SHA-256 and byte counts. The OSComp workflow seals
+copied build/image inputs into `capture.json`, then removes those copies only
+after Parquet materialization succeeds.
 
 ### Migration
 
@@ -757,6 +823,12 @@ L6 owns all derived presentation, export, and control views:
 - DuckDB/SQL views;
 - text reports and Python hooks;
 - menuconfig-style TUI views generated from the same schema.
+
+The default completed-capture materialization is the six typed Parquet tables.
+NDJSON and Perfetto remain explicit compatibility projections; they are not
+created by the default live-capture workflow. Derived caches are shared by
+content identity under `target/tx-observe/cache`, rather than copied into every
+run directory.
 
 ### Borrowed Organization
 
@@ -939,8 +1011,9 @@ truth:
 | payload tags | `crates/tx-observe-types/src/payload.rs::TxPayloadTag` | exact names and discriminants |
 | payload structs | `payload.rs` plus size assertions in `tx-observe-types/src/lib.rs` | field lists and byte sizes |
 | cfg switches | root `Cargo.toml` `unexpected_cfgs` allowlist | exact cfg coverage |
-| host projections | `tools/tx-observe-analyze.py` SQL/Parquet schemas | checked view/table columns |
-| explicit tracks | `tools/tx-trace-daemon/src/perfetto/writer.rs` | stable track consts, ids, and names |
+| host projections | `schema/txobserve.toml` -> `tools/tx-observe-host-catalog.json` | `observe-schema codegen --check` rejects stale generated table/view schemas |
+| analyzer host boundary | `tools/tx-observe-analyze.py` + `tools/tx_observe_host/{l4_readers,l5_canonical,l6_views}/` + `tools/tx-observe-host-catalog.json` | requires Python L4/L5/L6 package directories, rejects old flat Python layer files, requires `TraceIntegrity`, `TraceEventStream`, `ProjectionInput`, `analyze_projection`, projection wrappers for SQL/Parquet/Python hooks, generated host catalog topology/schema validation, and rejects analyzer-local L6 derived table/cache/export/SQL/Python-hook/text-report execution |
+| explicit tracks | `tools/tx-trace-daemon/src/l6_views/perfetto/writer.rs` | stable track consts, ids, and names |
 
 ### Planned Gates
 
@@ -964,13 +1037,13 @@ inputs still decode and project the same way.
 
 | Layer | Current landing state | Gap size | Next boundary to tighten |
 |---|---|---|---|
-| L0 Core Schema | `schema/txobserve.toml` exists and `observe-schema check` validates ABI levels, record kinds, payloads, cfgs, projections, and explicit tracks | small-medium | enumerate stable event/name catalog fully enough for generation |
-| L1 Semantic Probe API | existing callsites still mostly use `tx_observe::emit_*` helpers and raw-ish name/payload concepts | large | introduce generated `EventToken<E>`, sealed event shapes, and typed macro/helper wrappers |
-| L2 Producer Contract | per-hart bounded emitter exists, but status and span-close capability are not yet fully typed | medium | add `EmitStatus`, `DropReason`, and private-field `PublishedSpan` |
-| L3 Wire ABI | `txtrace-v0` structs are stable and size-checked; schema inventory now covers payload fields | small-medium | centralize encode/decode through `WireEncoder` and private `EncodedRecord`; add golden raw fixtures |
-| L4 Host Readers and Integrity | live guest memory, rawrecords, and txtrace replay exist; completeness semantics are still scattered across runtime output and tools | medium | introduce shared `TraceInput` and `TraceIntegrity` object consumed by daemon/analyzer/bundle paths |
-| L5 Canonical Representation | replay/analyzer decode exists but is not yet a single canonical event stream boundary | large | promote repair/loss/span reconstruction into `TraceEventStream` |
-| L6 Transcoders and Views | Perfetto, NDJSON, text report, SQL, and Parquet views exist; projection schemas are now inventoried and partly checked | medium-large | route all exporters through `ProjectionInput` and generated projection specs |
+| L0 Core Schema | `schema/txobserve.toml` exists; `l0_schema/schema_catalog.rs` is generated and `observe-schema check` validates ABI levels, record kinds, payloads, cfgs, projections, explicit tracks, and `HartEmitter` helper catalog | small | enumerate stable event/name catalog fully enough for generated typed wrappers |
+| L1 Semantic Probe API | `l1_probe_api/` exists for callsite-facing API; existing callsites still mostly use compatibility helpers and the syscall-boundary macro | large | introduce generated `EventToken<E>`, sealed event shapes, and typed macro/helper wrappers |
+| L2 Producer Contract | `l2_producer/` owns `HartEmitter`, producer-local support, and per-hart storage; status/span-close capability is not yet fully typed | medium | add `EmitStatus`, `DropReason`, and private-field `PublishedSpan` |
+| L3 Wire ABI | `l3_wire/` owns payload encoding helpers; `txtrace-v0` ABI structs remain in `tx-observe-types` and are size-checked | small-medium | centralize encode/decode through `WireEncoder` and private `EncodedRecord`; add golden raw fixtures |
+| L4 Host Readers and Integrity | `tools/tx-trace-daemon/src/l4_readers/` now owns replay/live-drain entry points plus `TraceInputKind`, `TraceInput`, `TraceIntegrity`, `RawRecordFrame`, and the staged `TraceReader` trait; `tools/tx_observe_host/l4_readers/` now owns Python `TraceIntegrity`, `TraceLoadResult`, `.txtrace` readers, `.rawrecords` readers, NDJSON readers, and capture completeness accounting; Python analyzer load paths return `TraceEventStream` with `TraceIntegrity` while the legacy record-list APIs remain wrappers; daemon bundle and live raw-only `runtime.json` include canonical stream integrity and markers alongside legacy stats | small | expose a shared host library API for live-drain raw-record metadata if the analyzer needs runtime.json loss counters |
+| L5 Canonical Representation | `tools/tx-trace-daemon/src/l5_canonical/` now owns `DecodeBatch`, `TraceEventStream`, `TraceStreamMarker`, `TraceDecoder`, and daemon `DecodedEvent` decode; `tools/tx_observe_host/l5_canonical/` now owns Python `TraceEventStream`, `TraceStreamMarker`, marker derivation, payload/record decode, and ordering helpers; daemon streams derive canonical repair/capture-loss markers from decoded repairs and L4 integrity, and Python analyzer streams expose matching marker metadata | small | reduce the remaining duplicate decode implementation between daemon and analyzer once a shared host library boundary exists |
+| L6 Transcoders and Views | `tools/tx-trace-daemon/src/l6_views/` now owns `ProjectionInput`, `TraceTranscoder`, daemon NDJSON emission, and Perfetto projection modules; `tools/tx_observe_host/l6_views/` now owns Python `ProjectionInput`, generated host catalog validation, projection schema lookup/cache, typed JSON/DuckDB select helpers, `tables.py` for `DerivedTables`, derived-table cache keys, SQL views, Parquet export/cache manifests, and Python-hook table-dir execution, and `reports.py` for text report projections; Python analyzer routes text, SQL, Parquet export, and Python-hook execution through imported L6 APIs and only keeps input selection, names loading, argument parsing, and process exit locally; `tools/tx-observe-host-catalog.json` is generated from TOML and analyzer startup/tests validate table schemas, control groups, and event-family projection topology; SQL and Parquet runtime schema lookup now loads the generated catalog, and analyzer-local schema constants/functions plus L6 table/projection/report execution definitions are rejected | small | reduce duplicate Python/Rust host decode/report logic only if a shared host library boundary becomes worth the extra build-system cost |
 
 ## 13. Migration Plan
 
@@ -988,8 +1061,10 @@ The migration should land in small slices:
    records the current `HartEmitter` public surface and separates raw facade
    methods from typed producer helpers.
 4. **Schema codegen.** Partially landed: `xtask observe-schema codegen
-   --check` now protects the generated kernel catalog. Generated host catalog,
-   menu JSON, docs tables, and projection matrix remain future slices.
+   --check` now protects the generated kernel catalog and generated host
+   catalog. The host catalog includes inputs, cfgs, control groups,
+   projections, and event-family projection coverage. Generated docs tables
+   remain a future slice.
 5. **Typed semantic wrappers.** Add L1 `ObserveEvent` and wrappers for the main
    event families while keeping compatibility shims.
 6. **Producer status.** Teach L2 emit to return `EmitStatus`; introduce
@@ -1001,8 +1076,10 @@ The migration should land in small slices:
    bundle, and analyzer summaries.
 9. **Canonical representation.** Promote current decoded records and repair
    markers to the L5 stream consumed by exporters.
-10. **Projection and TUI hardening.** Make L6 coverage matrix and menu grouping
-   mandatory for new event families and close known missing view routes.
+10. **Projection and TUI hardening.** Landed for generated catalog topology:
+   L6 coverage matrix and menu grouping are emitted from TOML and analyzer
+   validation rejects dangling event-family projection/control references.
+   Remaining work is to have frontends consume that catalog directly.
 11. **Boundary lints.** Convert transitional warnings into CI failures only
    after callsites have migrated.
 

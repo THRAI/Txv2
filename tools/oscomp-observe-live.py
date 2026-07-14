@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -99,6 +101,14 @@ class PlannedCommand:
 class WorkflowPlan:
     layout: WorkflowLayout
     commands: list[PlannedCommand]
+
+
+@dataclass(frozen=True)
+class ObserveStorageSummary:
+    run_bytes: int
+    capture_bytes: int
+    cache_bytes: int
+    total_bytes: int
 
 
 class TargetRunLock:
@@ -191,10 +201,10 @@ def build_layout(root: Path, name: str, output_dir: Path | None = None) -> Workf
         serial=base / "serial.txt",
         test_initrd=root / "target/images/test-init-initramfs-rv64-qemu.cpio",
         names=base / "names.json",
-        rawrecords=host_dir / "trace.rawrecords",
+        rawrecords=host_dir / "trace.rawrecords.gz",
         analysis_dir=analysis_dir,
         parquet_dir=analysis_dir / "parquet",
-        cache_dir=analysis_dir / "cache",
+        cache_dir=root / "target/tx-observe/cache",
         analyze_txt=analysis_dir / "analyze.txt",
         report=base / "report.json",
     )
@@ -395,9 +405,10 @@ def run_workflow(root: Path, args: WorkflowArgs) -> WorkflowLayout:
 
         run_qemu_with_drain(root, layout, plan.commands[qemu_idx], plan.commands[qemu_idx + 1], args.timeout)
         run_command(plan.commands[qemu_idx + 2], cwd=root, stdout_path=layout.analyze_txt)
-        write_report(layout, args)
+        seal_capture(root, layout)
         if not args.keep_guest_mem:
             layout.guest_mem.unlink(missing_ok=True)
+        write_report(layout, args)
     return layout
 
 
@@ -469,9 +480,116 @@ def write_report(layout: WorkflowLayout, args: WorkflowArgs) -> None:
         "runtime": str(runtime_path),
         "analyze": str(layout.analyze_txt),
         "parquet_dir": str(layout.parquet_dir),
+        "capture": str(layout.base / "capture.json"),
         "runtime_summary": runtime,
     }
     layout.report.write_text(json.dumps(report, indent=2) + "\n")
+
+
+def seal_capture(root: Path, layout: WorkflowLayout) -> dict[str, object]:
+    input_roots = [layout.data, layout.submit, layout.build_dir]
+    inputs = [describe_input(layout.base, path) for source in input_roots for path in sorted(source.rglob("*")) if path.is_file()]
+    capture = {
+        "schema": "tx-oscomp-observe-capture-v0",
+        "repo_commit": git_commit(root),
+        "rawrecords": relative_capture_path(layout.base, layout.rawrecords),
+        "names": relative_capture_path(layout.base, layout.names),
+        "runtime": relative_capture_path(layout.base, layout.host_dir / "runtime.json"),
+        "parquet_dir": relative_capture_path(layout.base, layout.parquet_dir),
+        "inputs": inputs,
+    }
+    capture_path = layout.base / "capture.json"
+    capture_path.write_text(json.dumps(capture, indent=2, sort_keys=True) + "\n")
+    for source in input_roots:
+        shutil.rmtree(source, ignore_errors=True)
+    return capture
+
+
+def describe_input(base: Path, path: Path) -> dict[str, object]:
+    return {
+        "path": relative_capture_path(base, path),
+        "bytes": path.stat().st_size,
+        "sha256": file_sha256(path),
+    }
+
+
+def relative_capture_path(base: Path, path: Path) -> str | None:
+    if not path.exists():
+        return None
+    return str(path.relative_to(base))
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        while chunk := file.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def git_commit(root: Path) -> str | None:
+    proc = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+    )
+    return proc.stdout.strip() if proc.returncode == 0 else None
+
+
+def observe_storage_summary(root: Path, layout: WorkflowLayout) -> ObserveStorageSummary:
+    run_bytes = allocated_tree_bytes(layout.base)
+    capture_root = root / "target/oscomp/custom-run"
+    capture_dirs = {
+        runtime.parent.parent
+        for runtime in capture_root.glob("**/host/runtime.json")
+    }
+    capture_dirs.add(layout.base)
+    capture_bytes = sum(allocated_tree_bytes(path) for path in capture_dirs)
+    cache_bytes = allocated_tree_bytes(root / "target/tx-observe/cache")
+    return ObserveStorageSummary(
+        run_bytes=run_bytes,
+        capture_bytes=capture_bytes,
+        cache_bytes=cache_bytes,
+        total_bytes=capture_bytes + cache_bytes,
+    )
+
+
+def allocated_tree_bytes(path: Path) -> int:
+    if not path.exists():
+        return 0
+    seen: set[tuple[int, int]] = set()
+    total = 0
+    for child in [path, *path.rglob("*")]:
+        if not child.is_file():
+            continue
+        stat = child.stat()
+        key = (stat.st_dev, stat.st_ino)
+        if key in seen:
+            continue
+        seen.add(key)
+        total += stat.st_blocks * 512 if stat.st_blocks else stat.st_size
+    return total
+
+
+def format_storage_summary(summary: ObserveStorageSummary) -> str:
+    return (
+        "observe storage: "
+        f"run={format_bytes(summary.run_bytes)} "
+        f"total={format_bytes(summary.total_bytes)} "
+        f"captures={format_bytes(summary.capture_bytes)} "
+        f"cache={format_bytes(summary.cache_bytes)}"
+    )
+
+
+def format_bytes(value: int) -> str:
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    amount = float(value)
+    for unit in units:
+        if amount < 1024 or unit == units[-1]:
+            return f"{amount:.1f}{unit}"
+        amount /= 1024
+    raise AssertionError("unreachable")
 
 
 def parse_args(argv: list[str]) -> WorkflowArgs:
@@ -520,6 +638,7 @@ def main(argv: list[str]) -> int:
     args = parse_args(argv)
     layout = run_workflow(ROOT, args)
     print(f"observe-live: output {layout.base}")
+    print(format_storage_summary(observe_storage_summary(ROOT, layout)))
     return 0
 
 
