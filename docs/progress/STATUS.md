@@ -1,3 +1,12 @@
+- 2026-07-14 (LTP net 对账 la64 双 lane — 补齐 3185f1d6 的另一半架构). 与 rv 同一批靶、同一见证工具
+  (tools/ltp-bin-witness.sh 官方 ltp-bin 形态),验证双 ioctl 修复 + 缩轮 knob 在 la 的增收。**la 范围内 377/lane
+  = 与 rv 完全对称**:ipv6_lib+socket 核心 107/107(**in6_02 3/3 — ioctl 修复架构无关,la 同样回来**)、socket 剩余
+  37/37、shell 命令类 45/45、net_stress 快 45/45(netlink×3=TCONF libmnl 结构性 0,同 rv)、net_stress 长 143/143
+  (**mtu 80/80 — MTU_CHANGE_TIMES knob 在 la 生效**)。**重大意外**:la 的 net shell 族(ping01.sh/route-change*.sh/
+  if-*.sh)在重构栈上全通,历史 [[la-awk-segfault-shell-block]] 记的"busybox awk 段错阻塞 shell 测试"对这些 net
+  shell 靶已不复现(awk 阻塞若仍在只影响非 net shell)。前置:先 build la64-qemu 再 submit(submit 只拷 target
+  现成件,只 build rv 会让 la 内核缺 3185f1d6 的修复)。无新代码改动(双架构共享已提交件)。回归门:git-net/集合差
+  已在 rv 轮验;la 纯见证跑分,无源码改。Blocker:无。
 - 2026-07-12 (LTP net 全量对账轮 — refactor 栈 vs 老栈基线,+88/lane 净增收 + 双 ioctl 实现病根修复). 基线=历史
   witness judge 全集(target/oscomp/ltp-bin/*.judge 提取,rv.musl 391/rv.glibc 387;msp 账本文件已失)。**跑批**(官方
   ltp-bin 形态,rv 双 lane):ipv6_lib 42=42、shell 命令类 46=46、socket C 族+sctp 102=102(accept02/fanout01 批内
