@@ -66,6 +66,7 @@ pub use direct_io::{
     DirectIoWaitableSubmission,
 };
 pub use fs_page_backing::FsPageBacking;
+pub use fsync_submission::FsyncSubmissionState;
 pub use lifecycle::{FallocateOp, TruncateOp, step_fallocate, step_fsync, step_truncate};
 pub use range::{
     PageRange, RangeReservation, RangeReservationError, RangeReservationId, RangeReservationKind,
@@ -670,6 +671,7 @@ struct PageContainerState {
     file_io_service: PageService,
     file_io_leases: BTreeMap<PageIoRequestId, PageLease>,
     file_io_read_targets: BTreeMap<PageIoRequestId, CachedFrame>,
+    fsync_submissions: BTreeMap<PageIoRequestId, fsync_submission::FsyncSubmission>,
     file_block_runtime: FileIoBlockRuntime,
     file_io_wake: Option<Arc<ServiceWakeSource>>,
     range_reservations: RangeReservationTable,
@@ -957,6 +959,7 @@ impl PageContainer {
                 file_io_service: PageService::new(1024),
                 file_io_leases: BTreeMap::new(),
                 file_io_read_targets: BTreeMap::new(),
+                fsync_submissions: BTreeMap::new(),
                 file_block_runtime: FileIoBlockRuntime::new(1024, 16),
                 file_io_wake: None,
                 range_reservations: RangeReservationTable::new(),
@@ -1583,6 +1586,53 @@ impl PageContainer {
             .map(|frontier| FileFsyncSession { pc: self, frontier })
     }
 
+    /// Register one waitable fsync request with L4.
+    ///
+    /// The row remains owned by the PageContainer until terminal L4 completion
+    /// is consumed, so re-entry can retain the request identity rather than
+    /// submit a second journal commit graph.
+    pub fn submit_file_fsync(&self) -> Option<PageIoRequestId> {
+        if !matches!(self.kind, PageContainerKind::File { .. }) || self.page_count == 0 {
+            return None;
+        }
+
+        let mut state = self.state.lock();
+        let id = state
+            .file_io_service
+            .submit(
+                self.io_manager_key(),
+                PageIoRange::new(0, self.page_count),
+                PageIoOp::Fsync,
+                PageIoPriority::Fsync,
+                PageIoFlags::BARRIER,
+                None,
+            )
+            .ok()?;
+        let submission = fsync_submission::FsyncSubmission::new(id);
+        debug_assert_eq!(submission.id(), id);
+        let previous = state.fsync_submissions.insert(id, submission);
+        debug_assert!(previous.is_none(), "L4 request identifiers are unique");
+        Some(id)
+    }
+
+    /// Observe an fsync request without consuming its terminal result.
+    pub fn file_fsync_submission_state(&self, id: PageIoRequestId) -> Option<FsyncSubmissionState> {
+        self.state
+            .lock()
+            .fsync_submissions
+            .get(&id)
+            .map(|submission| submission.state())
+    }
+
+    /// Consume an fsync terminal result exactly once and retire its row.
+    pub fn take_file_fsync_submission(&self, id: PageIoRequestId) -> Option<Result<(), Errno>> {
+        let mut state = self.state.lock();
+        let result = state.fsync_submissions.get_mut(&id)?.take()?;
+        let retired = state.fsync_submissions.remove(&id);
+        debug_assert!(retired.is_some());
+        Some(result)
+    }
+
     pub fn advance_file_fsync_frontier(
         &self,
         frontier: &FileFsyncFrontier,
@@ -1949,6 +1999,10 @@ impl PageContainer {
         &self,
         route: &PageCompletionRoute,
     ) -> Option<Result<PageSlotSnapshot, PageSlotCompletionError>> {
+        if route.completion.kind == PageIoCompletionKind::Noop {
+            let _ = self.terminalize_file_fsync_submission(&route.completion);
+            return None;
+        }
         if route.completion.range.page_count() != 1 {
             return None;
         }
@@ -2045,6 +2099,21 @@ impl PageContainer {
             );
         }
         Some(result)
+    }
+
+    fn terminalize_file_fsync_submission(
+        &self,
+        completion: &crate::io_manager::page::PageIoCompletion,
+    ) -> bool {
+        let result = match completion.result {
+            PageIoResult::Done => Ok(()),
+            PageIoResult::Err(errno) => Err(errno),
+        };
+        self.state
+            .lock()
+            .fsync_submissions
+            .get_mut(&completion.id)
+            .is_some_and(|submission| submission.complete(result))
     }
 
     fn register_file_service_metadata(

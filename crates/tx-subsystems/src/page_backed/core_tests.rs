@@ -2938,6 +2938,67 @@ fn file_page_owned_l6_runtime_routes_bio_completion_into_page_slot() {
 }
 
 #[test]
+fn file_fsync_submission_keeps_terminal_results_per_request_and_consumes_once() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::new());
+    let pc = file_page_container(fs.clone(), fs, FsObjectId::new(101), 2);
+
+    let first = pc.submit_file_fsync().expect("first fsync admission");
+    let second = pc.submit_file_fsync().expect("second fsync admission");
+    assert_ne!(first, second, "each fsync invocation owns a completion row");
+    assert_eq!(
+        pc.file_fsync_submission_state(first),
+        Some(FsyncSubmissionState::Queued)
+    );
+    assert_eq!(
+        pc.file_fsync_submission_state(second),
+        Some(FsyncSubmissionState::Queued)
+    );
+
+    let first_completion = PageCompletionRoute {
+        completion: PageIoCompletion::new(
+            first,
+            PageIoRange::new(0, 2),
+            PageIoResult::Done,
+            PageGeneration::new(0),
+            PageIoCompletionKind::Noop,
+        ),
+        frame: None,
+        waiters: Vec::new(),
+    };
+    assert_eq!(pc.apply_file_io_completion_route(&first_completion), None);
+    assert_eq!(
+        pc.file_fsync_submission_state(first),
+        Some(FsyncSubmissionState::Complete(Ok(())))
+    );
+    assert_eq!(pc.apply_file_io_completion_route(&first_completion), None);
+    assert_eq!(
+        pc.file_fsync_submission_state(first),
+        Some(FsyncSubmissionState::Complete(Ok(()))),
+        "late or duplicate completion cannot overwrite the terminal result"
+    );
+    assert_eq!(pc.take_file_fsync_submission(first), Some(Ok(())));
+    assert_eq!(pc.take_file_fsync_submission(first), None);
+    assert_eq!(pc.file_fsync_submission_state(first), None);
+
+    let second_completion = PageCompletionRoute {
+        completion: PageIoCompletion::new(
+            second,
+            PageIoRange::new(0, 2),
+            PageIoResult::Err(Errno::EIO),
+            PageGeneration::new(0),
+            PageIoCompletionKind::Noop,
+        ),
+        frame: None,
+        waiters: Vec::new(),
+    };
+    assert_eq!(pc.apply_file_io_completion_route(&second_completion), None);
+    assert_eq!(pc.take_file_fsync_submission(second), Some(Err(Errno::EIO)));
+    assert_eq!(pc.take_file_fsync_submission(second), None);
+}
+
+#[test]
 fn page_cache_index_install_if_absent_linearizes_sparse_offsets() {
     let mut index = PageCacheIndex::new();
     let page = PageIndex::new(7);
