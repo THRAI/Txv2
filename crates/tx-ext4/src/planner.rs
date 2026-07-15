@@ -7,8 +7,7 @@ use alloc::vec;
 use tx_subsystems::execution::Errno;
 use tx_subsystems::fs_iface::{
     BackendPageCompletion, BackendPageRequest, BackendPlan, BackendPlanner, BioPlanList,
-    IoDataSource, IoDataTarget, PageCompletion, PageCompletionList, PageFrameRef,
-    PagerResumeToken,
+    IoDataSource, IoDataTarget, PageCompletion, PageCompletionList, PageFrameRef, PagerResumeToken,
 };
 use tx_subsystems::io_manager::block::{BioPlan, BioVec, BlockFlags, BlockOp, DeviceKey, LbaRange};
 
@@ -63,6 +62,34 @@ pub trait Ext4FsyncPlanSource: Send + Sync + 'static {
     fn plan_fsync(&self, request: &BackendPageRequest) -> BackendPlan;
 
     fn complete_fsync(&self, _completion: BackendPageCompletion) {}
+}
+
+/// Ext4-owned writeback planning for one L4-retained data source.
+///
+/// The default covers existing mapped blocks. A mount-owned implementation
+/// may atomically stage bitmap/inode/extent metadata for holes without giving
+/// the generic planner access to live pager state.
+pub trait Ext4WritePlanSource: Send + Sync + 'static {
+    fn plan_writeback(
+        &self,
+        geometry: Ext4BlockGeometry,
+        request: &BackendPageRequest,
+        mapping: Ext4ReadMapping,
+    ) -> BackendPlan;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MappedExt4WritePlan;
+
+impl Ext4WritePlanSource for MappedExt4WritePlan {
+    fn plan_writeback(
+        &self,
+        geometry: Ext4BlockGeometry,
+        request: &BackendPageRequest,
+        mapping: Ext4ReadMapping,
+    ) -> BackendPlan {
+        plan_writeback_request(geometry, request, mapping)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -206,10 +233,11 @@ impl Ext4ReadMappingSource for Ext4MappingTable {
     }
 }
 
-pub struct Ext4ReadPlanner<S, J = UnsupportedExt4FsyncPlan> {
+pub struct Ext4ReadPlanner<S, J = UnsupportedExt4FsyncPlan, W = MappedExt4WritePlan> {
     geometry: Ext4BlockGeometry,
     mapping: S,
     fsync: J,
+    writeback: W,
 }
 
 /// Shared ext4 L5 planner state for one mounted filesystem.
@@ -258,20 +286,34 @@ impl<S> Ext4ReadPlanner<S> {
             geometry,
             mapping,
             fsync: UnsupportedExt4FsyncPlan,
+            writeback: MappedExt4WritePlan,
         }
     }
 }
 
 impl<S, J> Ext4ReadPlanner<S, J> {
-    pub const fn with_fsync_plan_source(
+    pub const fn with_fsync_plan_source(geometry: Ext4BlockGeometry, mapping: S, fsync: J) -> Self {
+        Self {
+            geometry,
+            mapping,
+            fsync,
+            writeback: MappedExt4WritePlan,
+        }
+    }
+}
+
+impl<S, J, W> Ext4ReadPlanner<S, J, W> {
+    pub const fn with_plan_sources(
         geometry: Ext4BlockGeometry,
         mapping: S,
         fsync: J,
+        writeback: W,
     ) -> Self {
         Self {
             geometry,
             mapping,
             fsync,
+            writeback,
         }
     }
 }
@@ -292,16 +334,20 @@ impl Ext4ReadMappingSource for Arc<Ext4MappingTable> {
     }
 }
 
-impl<S: Ext4ReadMappingSource, J: Ext4FsyncPlanSource> BackendPlanner for Ext4ReadPlanner<S, J> {
+impl<S: Ext4ReadMappingSource, J: Ext4FsyncPlanSource, W: Ext4WritePlanSource> BackendPlanner
+    for Ext4ReadPlanner<S, J, W>
+{
     fn plan_page_io(&self, request: BackendPageRequest) -> BackendPlan {
         match request.op {
             tx_subsystems::io_manager::page::PageIoOp::Read
             | tx_subsystems::io_manager::page::PageIoOp::Readahead => {
                 plan_read_request(self.geometry, &request, self.mapping.map_page(&request))
             }
-            tx_subsystems::io_manager::page::PageIoOp::Writeback => {
-                plan_writeback_request(self.geometry, &request, self.mapping.map_page(&request))
-            }
+            tx_subsystems::io_manager::page::PageIoOp::Writeback => self.writeback.plan_writeback(
+                self.geometry,
+                &request,
+                self.mapping.map_page(&request),
+            ),
             tx_subsystems::io_manager::page::PageIoOp::Fsync => self.fsync.plan_fsync(&request),
         }
     }
@@ -342,16 +388,14 @@ pub fn plan_read_request(
     match mapping {
         Ext4ReadMapping::Hole => match request.target {
             IoDataTarget::PageCache { frame, .. } => {
-                BackendPlan::Complete(PageCompletionList::from_vec(vec![
-                    PageCompletion::new(
-                        request.id,
-                        request.range,
-                        tx_subsystems::io_manager::page::PageIoResult::Done,
-                        generation,
-                        tx_subsystems::io_manager::page::PageIoCompletionKind::ReadInstalled,
-                    )
-                    .with_frame_ref(frame),
-                ]))
+                BackendPlan::Complete(PageCompletionList::from_vec(vec![PageCompletion::new(
+                    request.id,
+                    request.range,
+                    tx_subsystems::io_manager::page::PageIoResult::Done,
+                    generation,
+                    tx_subsystems::io_manager::page::PageIoCompletionKind::ReadInstalled,
+                )
+                .with_frame_ref(frame)]))
             }
             IoDataTarget::Direct { .. } => BackendPlan::Err(Errno::ENOSYS),
             IoDataTarget::None => BackendPlan::Err(Errno::EINVAL),
@@ -723,6 +767,47 @@ mod tests {
         }
     }
 
+    struct RejectingWriteSource;
+
+    impl Ext4WritePlanSource for RejectingWriteSource {
+        fn plan_writeback(
+            &self,
+            _geometry: Ext4BlockGeometry,
+            _request: &BackendPageRequest,
+            _mapping: Ext4ReadMapping,
+        ) -> BackendPlan {
+            BackendPlan::Err(Errno::EIO)
+        }
+    }
+
+    #[test]
+    fn ext4_writeback_planner_delegates_to_mount_owned_write_source() {
+        let planner = Ext4ReadPlanner::with_plan_sources(
+            Ext4BlockGeometry::new(DeviceKey::new(7), 8),
+            FixedMapping {
+                mapping: Ext4ReadMapping::Hole,
+            },
+            UnsupportedExt4FsyncPlan,
+            RejectingWriteSource,
+        );
+        let request = BackendPageRequest::new_with_source_and_target(
+            tx_subsystems::fs_iface::FsObjectKey::new(3),
+            tx_subsystems::io_manager::page::PageIoRequestId::new(4),
+            tx_subsystems::io_manager::page::PageIoRange::new(5, 1),
+            tx_subsystems::io_manager::page::PageIoOp::Writeback,
+            tx_subsystems::io_manager::page::PageIoFlags::WRITEBACK,
+            Some(tx_subsystems::io_manager::page::PageGeneration::new(6)),
+            IoDataSource::page_cache(
+                IoDataLeaseId::new(2),
+                PageFrameRef::new(Ppn(10)),
+                0,
+                BLOCK_SIZE as u32,
+            ),
+            IoDataTarget::None,
+        );
+        assert_eq!(planner.plan_page_io(request), BackendPlan::Err(Errno::EIO));
+    }
+
     #[test]
     fn ext4_read_planner_delegates_mapping_without_owning_io() {
         let planner = Ext4ReadPlanner::new(
@@ -770,7 +855,10 @@ mod tests {
             IoDataTarget::None,
         );
 
-        assert!(matches!(planner.plan_page_io(request), BackendPlan::SubmitGraph(_)));
+        assert!(matches!(
+            planner.plan_page_io(request),
+            BackendPlan::SubmitGraph(_)
+        ));
     }
 
     #[test]
