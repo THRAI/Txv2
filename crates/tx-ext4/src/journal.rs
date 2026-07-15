@@ -1026,6 +1026,14 @@ impl JournalMutationRuntime {
             .begin(transaction)
             .map_err(JournalMutationRuntimeError::Busy)
     }
+
+    pub fn plan_data(&self, request: &BackendPageRequest) -> BackendPlan {
+        self.source.plan_data(request)
+    }
+
+    pub fn complete_data(&self, completion: BackendPageCompletion) {
+        self.source.complete_data(completion);
+    }
 }
 
 impl Ext4FsyncPlanSource for JournalFsyncSource {

@@ -301,7 +301,7 @@ fn journal_source_commits_only_after_data_graph_completion() {
         tx_subsystems::fs_iface::IoDataTarget::None,
     );
     assert!(matches!(
-        source.plan_data(&data),
+        runtime.plan_data(&data),
         tx_subsystems::fs_iface::BackendPlan::SubmitGraph(_)
     ));
     let fsync = tx_subsystems::fs_iface::BackendPageRequest::new(
@@ -316,7 +316,7 @@ fn journal_source_commits_only_after_data_graph_completion() {
         source.plan_fsync(&fsync),
         tx_subsystems::fs_iface::BackendPlan::Err(_)
     ));
-    source.complete_data(tx_subsystems::fs_iface::BackendPageCompletion::new(
+    runtime.complete_data(tx_subsystems::fs_iface::BackendPageCompletion::new(
         tx_subsystems::fs_iface::FsObjectKey::new(12),
         data.id,
         data.op,
