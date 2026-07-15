@@ -381,8 +381,7 @@ pub fn step_fallocate(
 #[allow(dead_code)] // txdoc:pr2-step-op-scaffold
 pub struct FsyncOp<'a> {
     pub pc: &'a PageContainer,
-    frontier: Option<FileFsyncFrontier>,
-    request: Option<PageIoRequestId>,
+    state: FileFsyncState,
 }
 
 impl<'a> FsyncOp<'a> {
@@ -390,8 +389,7 @@ impl<'a> FsyncOp<'a> {
     pub const fn new(pc: &'a PageContainer) -> Self {
         Self {
             pc,
-            frontier: None,
-            request: None,
+            state: FileFsyncState::new(),
         }
     }
 }
@@ -410,35 +408,11 @@ impl<'a, I: SubjectIdentity> StepOp<I> for FsyncOp<'a> {
             return step_fsync(self.pc, &guard);
         }
 
-        let frontier = self
-            .frontier
-            .get_or_insert_with(|| {
-                self.pc
-                    .snapshot_file_fsync_frontier()
-                    .expect("file PageContainer has an fsync frontier")
-            });
-        match self.pc.advance_file_fsync_frontier(frontier) {
-            FileFsyncFrontierAdvance::Submitted { .. } | FileFsyncFrontierAdvance::Waiting => {
-                return V3::continue_with(PageProgress::EMPTY);
-            }
-            FileFsyncFrontierAdvance::Error(errno) => return V3::err(errno.into()),
-            FileFsyncFrontierAdvance::Complete => {}
-        }
-
-        let request = match self.request {
-            Some(request) => request,
-            None => {
-                let Some(request) = self.pc.submit_file_fsync() else {
-                    return V3::err(step_engine::Errno::EIO);
-                };
-                self.request = Some(request);
-                request
-            }
-        };
-        match self.pc.take_file_fsync_submission(request) {
-            Some(Ok(())) => V3::done(()),
-            Some(Err(errno)) => V3::err(errno.into()),
-            None => V3::continue_with(PageProgress::EMPTY),
+        match self.state.advance(self.pc) {
+            Err(errno) => V3::err(errno.into()),
+            Ok(None) => V3::continue_with(PageProgress::EMPTY),
+            Ok(Some(Ok(()))) => V3::done(()),
+            Ok(Some(Err(errno))) => V3::err(errno.into()),
         }
     }
 }

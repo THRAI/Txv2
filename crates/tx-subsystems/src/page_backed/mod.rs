@@ -555,6 +555,46 @@ pub struct FileFsyncSession<'a> {
     frontier: FileFsyncFrontier,
 }
 
+/// Owned fsync state that may cross reactor yields without retaining a guard
+/// or a borrow of the PageContainer.
+#[derive(Default)]
+pub struct FileFsyncState {
+    frontier: Option<FileFsyncFrontier>,
+    request: Option<PageIoRequestId>,
+}
+
+impl FileFsyncState {
+    pub const fn new() -> Self {
+        Self {
+            frontier: None,
+            request: None,
+        }
+    }
+
+    pub fn advance(&mut self, pc: &PageContainer) -> Result<Option<Result<(), Errno>>, Errno> {
+        let frontier = self.frontier.get_or_insert_with(|| {
+            pc.snapshot_file_fsync_frontier()
+                .expect("file PageContainer has an fsync frontier")
+        });
+        match pc.advance_file_fsync_frontier(frontier) {
+            FileFsyncFrontierAdvance::Submitted { .. } | FileFsyncFrontierAdvance::Waiting => {
+                return Ok(None);
+            }
+            FileFsyncFrontierAdvance::Error(errno) => return Err(errno),
+            FileFsyncFrontierAdvance::Complete => {}
+        }
+        let request = match self.request {
+            Some(request) => request,
+            None => {
+                let request = pc.submit_file_fsync().ok_or(Errno::EIO)?;
+                self.request = Some(request);
+                request
+            }
+        };
+        Ok(pc.take_file_fsync_submission(request))
+    }
+}
+
 impl FileFsyncSession<'_> {
     pub fn frontier(&self) -> &FileFsyncFrontier {
         &self.frontier
