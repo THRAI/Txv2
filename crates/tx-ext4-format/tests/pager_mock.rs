@@ -344,12 +344,54 @@ fn pager_plans_mapped_write_without_mutating_home_block() {
     assert_eq!(plan.data[0].physical_block, 21);
     assert_eq!(plan.data[0].bytes, page);
     assert_eq!(pager.image().block(21), &original);
+}
+
+#[test]
+fn pager_plans_hole_write_with_bitmap_and_inode_after_images() {
+    let mut image = mock_image();
+    mark_block_bitmap_used(&mut image, 48);
+    let bitmap_before = *image.block(2);
+    let inode_table_before = *image.block(4);
+    let data_before = *image.block(48);
+    let mut pager = Ext4Pager::open(image).unwrap();
+    let page = filled_page(0xE4);
+
+    let plan = pager
+        .plan_write_page(InodeNo::new(12), 4, &page, FsyncStamp::new(11))
+        .unwrap();
+
+    assert_eq!(plan.data.len(), 1);
+    assert_eq!(plan.data[0].logical_page, 4);
+    assert_eq!(plan.data[0].physical_block, 48);
+    assert_eq!(plan.data[0].bytes, page);
+    assert_eq!(plan.allocations.len(), 1);
+    assert_eq!(plan.allocations[0].physical_block, 48);
+
+    let bitmap = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::BlockBitmap)
+        .unwrap();
+    assert_eq!(bitmap.home, 2);
+    assert!(BitmapView::new(&bitmap.after).is_set(48));
+
+    let inode_table = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::InodeTable)
+        .unwrap();
+    assert_eq!(inode_table.home, 4);
+    let inode = Inode::parse(&inode_table.after[11 * 256..12 * 256]).unwrap();
+    assert_eq!(inode.size, 5 * BLOCK_SIZE as u64);
+    assert_eq!(inode.blocks_512, 32);
     assert_eq!(
-        pager
-            .plan_write_page(InodeNo::new(12), 2, &page, FsyncStamp::new(10))
-            .unwrap_err(),
-        Ext4FormatError::Unsupported
+        inode.map_extent_block(4).unwrap(),
+        tx_ext4_format::ondisk::BlockMapping::Data(48)
     );
+
+    assert_eq!(pager.image().block(2), &bitmap_before);
+    assert_eq!(pager.image().block(4), &inode_table_before);
+    assert_eq!(pager.image().block(48), &data_before);
 }
 
 #[test]

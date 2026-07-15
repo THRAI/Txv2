@@ -1,14 +1,18 @@
 use crate::ondisk::{
-    encode_dir_entry, encode_journal_commit, encode_journal_descriptor, parse_journal_descriptor,
-    BitmapMut, BitmapView, BlockMapping, CommitHeader, DirEntry, DirEntryIter, Extent, ExtentIdx,
-    ExtentNode, GroupDesc, Inode, InodeLocation, InodeTableLayout, Superblock,
+    crc32c, encode_dir_entry, encode_journal_commit, encode_journal_descriptor,
+    parse_journal_descriptor, BitmapMut, BitmapView, BlockMapping, CommitHeader, DirEntry,
+    DirEntryIter, Extent, ExtentIdx, ExtentNode, GroupDesc, Inode, InodeLocation, InodeTableLayout,
+    Superblock,
 };
 use crate::ondisk::{read_u16_le, read_u32_le, write_u16_le};
 use crate::{Ext4FormatError, Result};
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::mutation::{Ext4MutationPlan, FsyncStamp, MutationOrigin, SealedDataWrite};
+use crate::mutation::{
+    BlockClaim, Ext4MutationPlan, FsyncStamp, MetaRole, MetadataBlock, MutationOrigin,
+    SealedDataWrite,
+};
 
 pub const BLOCK_SIZE: usize = 4096;
 pub type Page4K = [u8; BLOCK_SIZE];
@@ -234,9 +238,10 @@ impl<I: BlockImage> Ext4Pager<I> {
 
     /// Build an immutable writeback plan for one already-mapped data page.
     ///
-    /// This is deliberately side-effect free: it neither writes the data home
-    /// block nor mutates inode, extent, or bitmap metadata. Hole writes need a
-    /// complete metadata after-image transaction and remain unsupported here.
+    /// This is deliberately side-effect free: it neither writes a data home
+    /// block nor mutates inode, extent, or bitmap metadata. Hole writes are
+    /// supported when their extent update still fits in the inode's inline
+    /// extent root.
     pub fn plan_write_page(
         &mut self,
         inode: InodeNo,
@@ -245,20 +250,100 @@ impl<I: BlockImage> Ext4Pager<I> {
         fsync_stamp: FsyncStamp,
     ) -> Result<Ext4MutationPlan> {
         let disk_inode = self.read_inode(inode)?;
-        let block = match self.resolve_inode_block(&disk_inode, logical_block(file_page_index)?)? {
-            BlockMapping::Data(block) => block,
-            BlockMapping::Hole | BlockMapping::NeedNode(_) => {
-                return Err(Ext4FormatError::Unsupported);
-            }
-        };
+        let logical = logical_block(file_page_index)?;
         let mut plan =
             Ext4MutationPlan::new(MutationOrigin::FlushPage, inode.get() as u64, fsync_stamp);
+        let block = match self.resolve_inode_block(&disk_inode, logical)? {
+            BlockMapping::Data(block) => block,
+            BlockMapping::Hole => {
+                let (physical_block, bitmap_home, bitmap_before, bitmap_after) =
+                    self.plan_block_allocation()?;
+                let mut inode_after = disk_inode;
+                let mut extents = match ExtentNode::parse(inode_after.extent_root_bytes())? {
+                    ExtentNode::Leaf(extents) => extents,
+                    ExtentNode::Index(_) => return Err(Ext4FormatError::Unsupported),
+                };
+                coalesce_insert_extent(&mut extents, logical, physical_block);
+                if extents.len() > 4 {
+                    return Err(Ext4FormatError::Unsupported);
+                }
+                inode_after.set_extent_root(&extents)?;
+                inode_after.blocks_512 = inode_after
+                    .blocks_512
+                    .saturating_add((BLOCK_SIZE / 512) as u64);
+                let page_end = file_page_index
+                    .checked_add(1)
+                    .and_then(|page| page.checked_mul(BLOCK_SIZE as u64))
+                    .ok_or(Ext4FormatError::OutOfBounds)?;
+                inode_after.size = core::cmp::max(inode_after.size, page_end);
+
+                let loc = self.inode_location(inode)?;
+                let mut inode_table_before = [0u8; BLOCK_SIZE];
+                self.image.read_block(loc.block, &mut inode_table_before)?;
+                let mut inode_table_after = inode_table_before;
+                inode_after.encode(&mut inode_table_after[loc.offset..loc.offset + loc.len])?;
+
+                plan.push_metadata(MetadataBlock {
+                    home: bitmap_home,
+                    role: MetaRole::BlockBitmap,
+                    before_version: crc32c(0, &bitmap_before) as u64,
+                    after: bitmap_after,
+                    depends_on: Vec::new(),
+                })
+                .map_err(|_| Ext4FormatError::Corrupt)?;
+                plan.push_metadata(MetadataBlock {
+                    home: loc.block,
+                    role: MetaRole::InodeTable,
+                    before_version: crc32c(0, &inode_table_before) as u64,
+                    after: inode_table_after,
+                    depends_on: Vec::new(),
+                })
+                .map_err(|_| Ext4FormatError::Corrupt)?;
+                plan.allocations.push(BlockClaim { physical_block });
+                physical_block
+            }
+            BlockMapping::NeedNode(_) => return Err(Ext4FormatError::Unsupported),
+        };
         plan.data.push(SealedDataWrite {
             logical_page: file_page_index,
             physical_block: block,
             bytes: *page,
         });
         Ok(plan)
+    }
+
+    fn plan_block_allocation(&self) -> Result<(u64, u64, Page4K, Page4K)> {
+        if self.superblock.blocks_per_group == 0 {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        let blocks_per_group = self.superblock.blocks_per_group as u64;
+        let first_data_block = self.superblock.first_data_block as u64;
+        let total_blocks = core::cmp::min(self.superblock.blocks_count, self.image.total_blocks());
+
+        for (group_index, group) in self.groups.iter().copied().enumerate() {
+            let group_start = first_data_block + group_index as u64 * blocks_per_group;
+            if group_start >= total_blocks {
+                break;
+            }
+            let group_block_count = core::cmp::min(blocks_per_group, total_blocks - group_start);
+            let bitmap_home = group.block_bitmap_block();
+            let mut bitmap_before = [0u8; BLOCK_SIZE];
+            self.image.read_block(bitmap_home, &mut bitmap_before)?;
+            let mut bitmap_after = bitmap_before;
+            let view = BitmapView::new(&bitmap_after);
+            let Some(bit) = (0..group_block_count as usize).find(|bit| !view.is_set(*bit)) else {
+                continue;
+            };
+            BitmapMut::new(&mut bitmap_after).set(bit)?;
+            return Ok((
+                group_start + bit as u64,
+                bitmap_home,
+                bitmap_before,
+                bitmap_after,
+            ));
+        }
+
+        Err(Ext4FormatError::OutOfBounds)
     }
 
     /// Write a file page back to disk, allocating a fresh block and
