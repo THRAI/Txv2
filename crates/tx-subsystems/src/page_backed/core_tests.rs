@@ -3078,6 +3078,46 @@ fn file_fsync_submission_keeps_terminal_results_per_request_and_consumes_once() 
 }
 
 #[test]
+fn fsync_op_waits_for_planner_completion_then_consumes_terminal_result() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::new());
+    let planner: Arc<dyn BackendPlanner> = Arc::new(SourceRecordingPlanner::new());
+    let pc = file_page_container_with_planner(fs.clone(), fs, FsObjectId::new(102), 2, planner);
+    let mut op = crate::page_backed::FsyncOp::new(&pc);
+    let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
+
+    assert_eq!(
+        op.step(&mut ctx),
+        V3Out::continue_with(crate::page_backed::adapter::step_engine::PageProgress::EMPTY)
+    );
+    let request = pc
+        .state
+        .lock()
+        .file_io_service
+        .find_submission(
+            pc.io_manager_key(),
+            PageIoRange::new(0, 2),
+            PageIoOp::Fsync,
+        )
+        .cloned()
+        .expect("queued fsync request");
+    pc.state.lock().file_io_service.push_completion(PageIoCompletion::new(
+        request.id,
+        request.range,
+        PageIoResult::Done,
+        PageGeneration::new(0),
+        PageIoCompletionKind::Noop,
+    ));
+    let mut block_queue = BlockQueue::new(4);
+    pc.drive_file_io_service_once(ServiceBudget::new(1), &mut block_queue, |_| true)
+        .expect("completion drive");
+
+    assert_eq!(op.step(&mut ctx), V3Out::done(()));
+    assert_eq!(pc.take_file_fsync_submission(request.id), None);
+}
+
+#[test]
 fn page_cache_index_install_if_absent_linearizes_sparse_offsets() {
     let mut index = PageCacheIndex::new();
     let page = PageIndex::new(7);

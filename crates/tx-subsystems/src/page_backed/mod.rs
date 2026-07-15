@@ -67,7 +67,7 @@ pub use direct_io::{
 };
 pub use fs_page_backing::FsPageBacking;
 pub use fsync_submission::FsyncSubmissionState;
-pub use lifecycle::{FallocateOp, TruncateOp, step_fallocate, step_fsync, step_truncate};
+pub use lifecycle::{step_fallocate, step_fsync, step_truncate, FallocateOp, FsyncOp, TruncateOp};
 pub use range::{
     PageRange, RangeReservation, RangeReservationError, RangeReservationId, RangeReservationKind,
     RangeReservationTable,
