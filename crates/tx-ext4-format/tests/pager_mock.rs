@@ -1,3 +1,4 @@
+use tx_ext4_format::mutation::{FsyncStamp, MutationOrigin};
 use tx_ext4_format::ondisk::{
     crc32c, crc32c_append, metadata_csum32, BitmapMut, BitmapView, CommitHeader, DirEntryIter,
     DxCountLimit, DxEntry, DxEntryIter, DxRootInfo, Ext4FormatError, Extent, ExtentHeader,
@@ -317,6 +318,35 @@ fn pager_rejects_non_4k_images_and_hole_writeback() {
     assert_eq!(
         pager
             .write_existing_page(InodeNo::new(12), 2, &filled_page(0xAA))
+            .unwrap_err(),
+        Ext4FormatError::Unsupported
+    );
+}
+
+#[test]
+fn pager_plans_mapped_write_without_mutating_home_block() {
+    let image = mock_image();
+    let original = *image.block(21);
+    let mut pager = Ext4Pager::open(image).unwrap();
+    let page = filled_page(0xEE);
+
+    let plan = pager
+        .plan_write_page(InodeNo::new(12), 1, &page, FsyncStamp::new(9))
+        .unwrap();
+
+    assert_eq!(plan.origin, MutationOrigin::FlushPage);
+    assert_eq!(plan.object, 12);
+    assert_eq!(plan.fsync_stamp, FsyncStamp::new(9));
+    assert_eq!(plan.metadata, Vec::new());
+    assert_eq!(plan.allocations, Vec::new());
+    assert_eq!(plan.data.len(), 1);
+    assert_eq!(plan.data[0].logical_page, 1);
+    assert_eq!(plan.data[0].physical_block, 21);
+    assert_eq!(plan.data[0].bytes, page);
+    assert_eq!(pager.image().block(21), &original);
+    assert_eq!(
+        pager
+            .plan_write_page(InodeNo::new(12), 2, &page, FsyncStamp::new(10))
             .unwrap_err(),
         Ext4FormatError::Unsupported
     );

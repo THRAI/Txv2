@@ -84,7 +84,11 @@ impl Ext4MutationPlan {
     }
 
     pub fn push_metadata(&mut self, block: MetadataBlock) -> Result<(), MutationPlanError> {
-        if self.metadata.iter().any(|existing| existing.home == block.home) {
+        if self
+            .metadata
+            .iter()
+            .any(|existing| existing.home == block.home)
+        {
             return Err(MutationPlanError::DuplicateMetadataHome);
         }
         self.metadata.push(block);

@@ -8,6 +8,8 @@ use crate::{Ext4FormatError, Result};
 use alloc::vec;
 use alloc::vec::Vec;
 
+use crate::mutation::{Ext4MutationPlan, FsyncStamp, MutationOrigin, SealedDataWrite};
+
 pub const BLOCK_SIZE: usize = 4096;
 pub type Page4K = [u8; BLOCK_SIZE];
 
@@ -228,6 +230,35 @@ impl<I: BlockImage> Ext4Pager<I> {
             file_page_index,
             physical_block: block,
         })
+    }
+
+    /// Build an immutable writeback plan for one already-mapped data page.
+    ///
+    /// This is deliberately side-effect free: it neither writes the data home
+    /// block nor mutates inode, extent, or bitmap metadata. Hole writes need a
+    /// complete metadata after-image transaction and remain unsupported here.
+    pub fn plan_write_page(
+        &mut self,
+        inode: InodeNo,
+        file_page_index: u64,
+        page: &Page4K,
+        fsync_stamp: FsyncStamp,
+    ) -> Result<Ext4MutationPlan> {
+        let disk_inode = self.read_inode(inode)?;
+        let block = match self.resolve_inode_block(&disk_inode, logical_block(file_page_index)?)? {
+            BlockMapping::Data(block) => block,
+            BlockMapping::Hole | BlockMapping::NeedNode(_) => {
+                return Err(Ext4FormatError::Unsupported);
+            }
+        };
+        let mut plan =
+            Ext4MutationPlan::new(MutationOrigin::FlushPage, inode.get() as u64, fsync_stamp);
+        plan.data.push(SealedDataWrite {
+            logical_page: file_page_index,
+            physical_block: block,
+            bytes: *page,
+        });
+        Ok(plan)
     }
 
     /// Write a file page back to disk, allocating a fresh block and
