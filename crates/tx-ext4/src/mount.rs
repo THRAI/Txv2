@@ -10,6 +10,7 @@ use tx_subsystems::vfs::structure::{FsObjectId, InodeMeta};
 use tx_subsystems::vfs::FsOps;
 
 use crate::planner::{Ext4BlockGeometry, Ext4PlannerBinding};
+use crate::journal::JournalFsyncSource;
 pub use crate::read_backend::FilePageContainerBinder;
 use crate::read_backend::{map_inode_meta, Ext4FsInstance, EXT4_ROOT_INODE};
 
@@ -128,6 +129,26 @@ where
     I: BlockImage + Send + 'static,
 {
     open_ext4_with_planner_binding(image, false, Ext4PlannerBinding::new(geometry))
+}
+
+/// Read-write ext4 mount with an L5 JBD2 fsync source.
+///
+/// The caller retains `journal_fsync` to stage prepared transactions; the
+/// mounted backend planner holds a second strong reference to submit their
+/// commit graphs and receive terminal completion notifications.
+pub fn mount_ext4_read_write_with_journal_io_manager_planner<I>(
+    image: I,
+    geometry: Ext4BlockGeometry,
+    journal_fsync: Arc<JournalFsyncSource>,
+) -> Result<MountedExt4<I>, Errno>
+where
+    I: BlockImage + Send + 'static,
+{
+    open_ext4_with_planner_binding(
+        image,
+        false,
+        Ext4PlannerBinding::with_fsync_plan_source(geometry, journal_fsync),
+    )
 }
 
 fn open_ext4_with_backend_planner<I>(
