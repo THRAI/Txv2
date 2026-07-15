@@ -4,7 +4,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec;
 
-use tx_subsystems::execution::Errno;
+use tx_subsystems::execution::{Errno, Guard};
 use tx_subsystems::fs_iface::{
     BackendPageCompletion, BackendPageRequest, BackendPlan, BackendPlanner, BioPlanList,
     IoDataSource, IoDataTarget, PageCompletion, PageCompletionList, PageFrameRef, PagerResumeToken,
@@ -70,6 +70,16 @@ pub trait Ext4FsyncPlanSource: Send + Sync + 'static {
 /// may atomically stage bitmap/inode/extent metadata for holes without giving
 /// the generic planner access to live pager state.
 pub trait Ext4WritePlanSource: Send + Sync + 'static {
+    /// Stage backend-private writeback state while L4 still owns the source
+    /// lease and its epoch guard. Implementations must not retain `guard`.
+    fn prepare_writeback(
+        &self,
+        _request: &BackendPageRequest,
+        _guard: &Guard<'_>,
+    ) -> Result<(), Errno> {
+        Ok(())
+    }
+
     fn plan_writeback(
         &self,
         geometry: Ext4BlockGeometry,
@@ -339,6 +349,18 @@ impl Ext4ReadMappingSource for Arc<Ext4MappingTable> {
 impl<S: Ext4ReadMappingSource, J: Ext4FsyncPlanSource, W: Ext4WritePlanSource> BackendPlanner
     for Ext4ReadPlanner<S, J, W>
 {
+    fn prepare_page_io(
+        &self,
+        request: &BackendPageRequest,
+        guard: &Guard<'_>,
+    ) -> Result<(), Errno> {
+        if request.op == tx_subsystems::io_manager::page::PageIoOp::Writeback {
+            self.writeback.prepare_writeback(request, guard)
+        } else {
+            Ok(())
+        }
+    }
+
     fn plan_page_io(&self, request: BackendPageRequest) -> BackendPlan {
         match request.op {
             tx_subsystems::io_manager::page::PageIoOp::Read

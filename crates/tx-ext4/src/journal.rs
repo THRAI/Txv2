@@ -14,7 +14,7 @@ use tx_ext4_format::mutation::Ext4MutationPlan;
 use tx_ext4_format::pager::Page4K;
 use tx_ext4_format::Ext4FormatError;
 use tx_substrate::zone::Cap;
-use tx_subsystems::execution::{Guard, StepOutcome};
+use tx_subsystems::execution::{Errno, Guard, StepOutcome};
 use tx_subsystems::fs_iface::{
     BackendBioDependency, BackendBioGraph, BackendBioGraphError, BackendBioNode, BackendBioNodeId,
     BackendPageCompletion, BackendPageRequest, BackendPlan, IoDataLeaseId, IoDataSource,
@@ -27,7 +27,7 @@ use tx_subsystems::page_backed::{
     PageLease,
 };
 
-use crate::planner::Ext4FsyncPlanSource;
+use crate::planner::{Ext4FsyncPlanSource, Ext4WritePlanSource};
 use crate::sync::SpinMutex;
 
 /// One L5-owned write buffer retained until its L6 completion.
@@ -974,6 +974,69 @@ pub enum JournalMutationRuntimeError {
     Image(MutationJournalImageError),
     Stage(PreparedJournalTransactionError),
     Busy(JournalTransactionStateError),
+}
+
+/// L5 metadata owner for a single immutable ext4 writeback mutation.
+///
+/// The provider may inspect its own inode/extent/bitmap state to build a
+/// plan, but it never receives an L4 frame or page-cache lease.
+pub trait Ext4MutationPlanSource: Send + Sync + 'static {
+    fn plan_writeback_mutation(
+        &self,
+        request: &BackendPageRequest,
+    ) -> Result<Ext4MutationPlan, Errno>;
+}
+
+/// Bridges a pure ext4 mutation planner to the mount-local JBD2 runtime.
+///
+/// L4 calls `prepare_writeback` while it still retains the data lease. The
+/// data graph and terminal completion paths then operate only on request ids
+/// and runtime state.
+pub struct JournalMutationWriteSource<P> {
+    planner: P,
+    runtime: Arc<JournalMutationRuntime>,
+}
+
+impl<P> JournalMutationWriteSource<P> {
+    pub const fn new(planner: P, runtime: Arc<JournalMutationRuntime>) -> Self {
+        Self { planner, runtime }
+    }
+}
+
+impl<P: Ext4MutationPlanSource> Ext4WritePlanSource for JournalMutationWriteSource<P> {
+    fn prepare_writeback(
+        &self,
+        request: &BackendPageRequest,
+        guard: &Guard<'_>,
+    ) -> Result<(), Errno> {
+        if request.op != PageIoOp::Writeback || matches!(request.source, IoDataSource::None) {
+            return Err(Errno::EINVAL);
+        }
+        let mutation = self.planner.plan_writeback_mutation(request)?;
+        self.runtime
+            .begin_mutation_with_data_sources(&mutation, vec![request.source.clone()], guard)
+            .map_err(journal_mutation_runtime_errno)
+    }
+
+    fn plan_writeback(
+        &self,
+        _geometry: crate::planner::Ext4BlockGeometry,
+        request: &BackendPageRequest,
+        _mapping: crate::planner::Ext4ReadMapping,
+    ) -> BackendPlan {
+        self.runtime.plan_data(request)
+    }
+
+    fn complete_writeback(&self, completion: BackendPageCompletion) {
+        self.runtime.complete_data(completion);
+    }
+}
+
+fn journal_mutation_runtime_errno(error: JournalMutationRuntimeError) -> Errno {
+    match error {
+        JournalMutationRuntimeError::Busy(_) => Errno::EBUSY,
+        JournalMutationRuntimeError::Image(_) | JournalMutationRuntimeError::Stage(_) => Errno::EIO,
+    }
 }
 
 impl JournalMutationRuntime {
