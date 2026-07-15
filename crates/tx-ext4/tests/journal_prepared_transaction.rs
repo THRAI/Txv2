@@ -1,6 +1,7 @@
+use std::sync::Arc;
 use tx_ext4::journal::{
-    JournalPagePool, JournalRecordLayout, MutationJournalImage, MutationJournalLayout,
-    PreparedJournalTransaction,
+    JournalMutationRuntime, JournalPagePool, JournalRecordLayout, MutationJournalImage,
+    MutationJournalLayout, PreparedJournalTransaction,
 };
 use tx_ext4_format::journal::{Jbd2MetadataUpdate, Jbd2TransactionImage, JBD2_BLOCK_SIZE};
 use tx_ext4_format::mutation::{
@@ -96,4 +97,44 @@ fn prepared_transaction_stages_mutation_data_journal_and_checkpoint_leases() {
         .unwrap();
     assert_eq!(checkpoint.nodes().len(), 1);
     assert_eq!(checkpoint.nodes()[0].bio.lba, LbaRange::new(264, 8));
+}
+
+#[test]
+fn mutation_runtime_stages_plan_into_its_fsync_source() {
+    setup();
+    let source = Arc::new(tx_ext4::journal::JournalFsyncSource::new());
+    let runtime = JournalMutationRuntime::new(
+        Arc::clone(&source),
+        JournalPagePool::new(5).unwrap(),
+        MutationJournalLayout::new(
+            DeviceKey::new(9),
+            8,
+            [1; 16],
+            7,
+            JournalRecordLayout::new(
+                LbaRange::new(80, 8),
+                vec![LbaRange::new(88, 8)],
+                LbaRange::new(96, 8),
+            ),
+        ),
+    );
+    let mut mutation = Ext4MutationPlan::new(MutationOrigin::FlushPage, 12, FsyncStamp::new(7));
+    mutation.data.push(SealedDataWrite {
+        logical_page: 0,
+        physical_block: 7,
+        bytes: [0xD3; JBD2_BLOCK_SIZE],
+    });
+    mutation
+        .push_metadata(MetadataBlock {
+            home: 33,
+            role: MetaRole::InodeTable,
+            before_version: 1,
+            after: [0xC3; JBD2_BLOCK_SIZE],
+            depends_on: Vec::new(),
+        })
+        .unwrap();
+    let guard = tx_substrate::epoch::guard();
+
+    runtime.begin_mutation(&mutation, &guard).unwrap();
+    assert!(source.take_checkpoint_graph().is_err());
 }

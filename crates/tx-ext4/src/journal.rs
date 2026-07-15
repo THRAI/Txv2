@@ -749,6 +749,55 @@ impl Default for JournalFsyncSource {
     }
 }
 
+/// Mount-owned admission path from immutable ext4 mutations into JBD2 state.
+///
+/// PageBacked and VFS never observe its journal records or pool leases; they
+/// only hand ext4 a completed mutation plan at the writeback boundary.
+pub struct JournalMutationRuntime {
+    source: Arc<JournalFsyncSource>,
+    pool: JournalPagePool,
+    layout: MutationJournalLayout,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JournalMutationRuntimeError {
+    Image(MutationJournalImageError),
+    Stage(PreparedJournalTransactionError),
+    Busy(JournalTransactionStateError),
+}
+
+impl JournalMutationRuntime {
+    pub fn new(
+        source: Arc<JournalFsyncSource>,
+        pool: JournalPagePool,
+        layout: MutationJournalLayout,
+    ) -> Self {
+        Self {
+            source,
+            pool,
+            layout,
+        }
+    }
+
+    pub fn source(&self) -> Arc<JournalFsyncSource> {
+        Arc::clone(&self.source)
+    }
+
+    pub fn begin_mutation(
+        &self,
+        mutation: &Ext4MutationPlan,
+        guard: &Guard<'_>,
+    ) -> Result<(), JournalMutationRuntimeError> {
+        let image = MutationJournalImage::from_plan(mutation, self.layout.clone())
+            .map_err(JournalMutationRuntimeError::Image)?;
+        let transaction = PreparedJournalTransaction::stage_mutation(&self.pool, image, guard)
+            .map_err(JournalMutationRuntimeError::Stage)?;
+        self.source
+            .begin(transaction)
+            .map_err(JournalMutationRuntimeError::Busy)
+    }
+}
+
 impl Ext4FsyncPlanSource for JournalFsyncSource {
     fn plan_fsync(&self, request: &BackendPageRequest) -> BackendPlan {
         if request.op != PageIoOp::Fsync {
