@@ -2646,6 +2646,23 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             }
             Ok(())
         }
+        (SOL_IPV6, IPV6_TCLASS) => {
+            if payload.family() != AddressFamily::Inet6 {
+                return SyscallResult::Error(errno_to_i32(Errno::ENOPROTOOPT));
+            }
+            // v6 traffic class (DSCP/ToS) — a QoS hint. Accept and validate
+            // like IP_TOS; the kernel doesn't act on it but ssh/curl set it on
+            // v6 sockets and treat ENOPROTOOPT as a failure.
+            let tclass = match read_sockopt_i32(ctx, optval, optlen) {
+                Ok(tclass) => tclass,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            match tclass {
+                -1..=255 => {}
+                _ => return SyscallResult::Error(errno_to_i32(Errno::EINVAL)),
+            }
+            Ok(())
+        }
         (SOL_IPV6 | SOL_RAW, IPV6_CHECKSUM) => {
             set_ipv6_checksum(&socket, &payload, ctx, optval, optlen)
         }
