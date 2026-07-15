@@ -499,13 +499,23 @@ pub struct PreparedJournalTransaction {
 pub enum JournalTransactionStateError {
     Busy,
     Missing,
+    DataNotDurable,
+    CommitNotSubmitted,
     NotCommitted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JournalTransactionPhase {
+    Draft,
+    DataDurable,
+    CommitSubmitted,
+    CommitDurable,
 }
 
 /// Mount-owned single-commit lifecycle. The stored value retains every record
 /// lease until a durable commit completion authorizes checkpoint submission.
 pub struct JournalTransactionState<T> {
-    active: Option<(bool, T)>,
+    active: Option<(JournalTransactionPhase, T)>,
 }
 
 impl<T> JournalTransactionState<T> {
@@ -516,14 +526,48 @@ impl<T> JournalTransactionState<T> {
         if self.active.is_some() {
             return Err(JournalTransactionStateError::Busy);
         }
-        self.active = Some((false, transaction));
+        self.active = Some((JournalTransactionPhase::Draft, transaction));
+        Ok(())
+    }
+    pub fn mark_data_durable(&mut self) -> Result<(), JournalTransactionStateError> {
+        let Some((phase, _)) = self.active.as_mut() else {
+            return Err(JournalTransactionStateError::Missing);
+        };
+        if *phase != JournalTransactionPhase::Draft {
+            return Err(JournalTransactionStateError::DataNotDurable);
+        }
+        *phase = JournalTransactionPhase::DataDurable;
+        Ok(())
+    }
+    pub fn mark_commit_submitted(&mut self) -> Result<(), JournalTransactionStateError> {
+        let Some((phase, _)) = self.active.as_mut() else {
+            return Err(JournalTransactionStateError::Missing);
+        };
+        if *phase != JournalTransactionPhase::DataDurable {
+            return Err(JournalTransactionStateError::DataNotDurable);
+        }
+        *phase = JournalTransactionPhase::CommitSubmitted;
         Ok(())
     }
     pub fn mark_commit_durable(&mut self) -> Result<(), JournalTransactionStateError> {
-        let Some((committed, _)) = self.active.as_mut() else {
+        let Some((phase, _)) = self.active.as_mut() else {
             return Err(JournalTransactionStateError::Missing);
         };
-        *committed = true;
+        if *phase != JournalTransactionPhase::CommitSubmitted {
+            return Err(JournalTransactionStateError::CommitNotSubmitted);
+        }
+        *phase = JournalTransactionPhase::CommitDurable;
+        Ok(())
+    }
+    /// Compatibility transition for the existing combined data+commit graph.
+    pub fn mark_combined_commit_durable(&mut self) -> Result<(), JournalTransactionStateError> {
+        let Some((phase, _)) = self.active.as_mut() else {
+            return Err(JournalTransactionStateError::Missing);
+        };
+        if *phase != JournalTransactionPhase::Draft {
+            return Err(JournalTransactionStateError::CommitNotSubmitted);
+        }
+        *phase = JournalTransactionPhase::CommitDurable;
         Ok(())
     }
     pub fn active(&self) -> Option<&T> {
@@ -533,10 +577,10 @@ impl<T> JournalTransactionState<T> {
         self.active.take().map(|(_, transaction)| transaction)
     }
     pub fn checkpoint_ready(&self) -> Result<Option<&T>, JournalTransactionStateError> {
-        let Some((committed, transaction)) = self.active.as_ref() else {
+        let Some((phase, transaction)) = self.active.as_ref() else {
             return Ok(None);
         };
-        if !committed {
+        if *phase != JournalTransactionPhase::CommitDurable {
             return Err(JournalTransactionStateError::NotCommitted);
         }
         Ok(Some(transaction))
@@ -939,7 +983,7 @@ impl Ext4FsyncPlanSource for JournalFsyncSource {
         state.submitted = None;
         match completion.result {
             PageIoResult::Done => {
-                let _ = state.transaction.mark_commit_durable();
+                let _ = state.transaction.mark_combined_commit_durable();
             }
             PageIoResult::Err(_) => {
                 let _ = state.transaction.discard();
