@@ -11,3 +11,15 @@ fn transaction_state_rejects_checkpoint_before_durable_commit() {
     state.mark_commit_durable().unwrap();
     assert_eq!(state.take_checkpoint_ready().unwrap(), Some(()));
 }
+
+#[test]
+fn transaction_state_retains_transaction_until_checkpoint_completion() {
+    let mut state = JournalTransactionState::new();
+    state.begin(7u64).unwrap();
+    state.mark_commit_durable().unwrap();
+
+    assert_eq!(state.checkpoint_ready().unwrap(), Some(&7));
+    assert_eq!(state.active(), Some(&7));
+    assert_eq!(state.complete_checkpoint().unwrap(), Some(7));
+    assert_eq!(state.active(), None);
+}

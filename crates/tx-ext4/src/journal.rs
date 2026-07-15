@@ -531,14 +531,21 @@ impl<T> JournalTransactionState<T> {
     pub fn discard(&mut self) -> Option<T> {
         self.active.take().map(|(_, transaction)| transaction)
     }
-    pub fn take_checkpoint_ready(&mut self) -> Result<Option<T>, JournalTransactionStateError> {
-        let Some((committed, _)) = self.active.as_ref() else {
+    pub fn checkpoint_ready(&self) -> Result<Option<&T>, JournalTransactionStateError> {
+        let Some((committed, transaction)) = self.active.as_ref() else {
             return Ok(None);
         };
         if !committed {
             return Err(JournalTransactionStateError::NotCommitted);
         }
+        Ok(Some(transaction))
+    }
+    pub fn complete_checkpoint(&mut self) -> Result<Option<T>, JournalTransactionStateError> {
+        self.checkpoint_ready()?;
         Ok(self.active.take().map(|(_, transaction)| transaction))
+    }
+    pub fn take_checkpoint_ready(&mut self) -> Result<Option<T>, JournalTransactionStateError> {
+        self.complete_checkpoint()
     }
 }
 
@@ -713,17 +720,26 @@ impl JournalFsyncSource {
         self.state.lock().transaction.begin(transaction)
     }
 
-    /// Take the post-commit checkpoint graph after a matching durable commit.
-    pub fn take_checkpoint_graph(&self) -> Result<Option<BackendBioGraph>, JournalTransactionStateError> {
-        let mut state = self.state.lock();
-        let Some(transaction) = state.transaction.take_checkpoint_ready()? else {
+    /// Build the post-commit checkpoint graph while retaining transaction leases.
+    pub fn take_checkpoint_graph(
+        &self,
+    ) -> Result<Option<BackendBioGraph>, JournalTransactionStateError> {
+        let state = self.state.lock();
+        let Some(transaction) = state.transaction.checkpoint_ready()? else {
             return Ok(None);
         };
-        state.submitted = None;
         transaction
             .plan()
             .checkpoint_graph_after_commit()
             .map_err(|_| JournalTransactionStateError::NotCommitted)
+    }
+
+    /// Release retained transaction leases only after checkpoint I/O completes.
+    pub fn complete_checkpoint(&self) -> Result<(), JournalTransactionStateError> {
+        let mut state = self.state.lock();
+        let _ = state.transaction.complete_checkpoint()?;
+        state.submitted = None;
+        Ok(())
     }
 }
 
