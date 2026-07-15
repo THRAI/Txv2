@@ -381,14 +381,65 @@ pub fn step_fallocate(
 #[allow(dead_code)] // txdoc:pr2-step-op-scaffold
 pub struct FsyncOp<'a> {
     pub pc: &'a PageContainer,
+    frontier: Option<FileFsyncFrontier>,
+    request: Option<PageIoRequestId>,
+}
+
+impl<'a> FsyncOp<'a> {
+    #[allow(dead_code)] // constructed by syscall-side StepOp migration next
+    pub const fn new(pc: &'a PageContainer) -> Self {
+        Self {
+            pc,
+            frontier: None,
+            request: None,
+        }
+    }
 }
 
 impl<'a, I: SubjectIdentity> StepOp<I> for FsyncOp<'a> {
     type Output = ();
     type Progress = PageProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        let __guard = step_engine::guard();
-        step_fsync(self.pc, &__guard)
+        use crate::page_backed::adapter::step_engine::StepOutcome as V3;
+
+        let PageContainerKind::File { mount, .. } = self.pc.kind() else {
+            return V3::done(());
+        };
+        if mount.payload().backend_planner().is_none() {
+            let guard = step_engine::guard();
+            return step_fsync(self.pc, &guard);
+        }
+
+        let frontier = self
+            .frontier
+            .get_or_insert_with(|| {
+                self.pc
+                    .snapshot_file_fsync_frontier()
+                    .expect("file PageContainer has an fsync frontier")
+            });
+        match self.pc.advance_file_fsync_frontier(frontier) {
+            FileFsyncFrontierAdvance::Submitted { .. } | FileFsyncFrontierAdvance::Waiting => {
+                return V3::continue_with(PageProgress::EMPTY);
+            }
+            FileFsyncFrontierAdvance::Error(errno) => return V3::err(errno.into()),
+            FileFsyncFrontierAdvance::Complete => {}
+        }
+
+        let request = match self.request {
+            Some(request) => request,
+            None => {
+                let Some(request) = self.pc.submit_file_fsync() else {
+                    return V3::err(step_engine::Errno::EIO);
+                };
+                self.request = Some(request);
+                request
+            }
+        };
+        match self.pc.take_file_fsync_submission(request) {
+            Some(Ok(())) => V3::done(()),
+            Some(Err(errno)) => V3::err(errno.into()),
+            None => V3::continue_with(PageProgress::EMPTY),
+        }
     }
 }
 
@@ -989,7 +1040,7 @@ mod step_op_wraps {
         let _lock = EPOCH_TEST_LOCK.lock().expect("step_op_wraps lock");
         setup();
         let pc = anon_pc(1);
-        let mut op = FsyncOp { pc: &pc };
+        let mut op = FsyncOp::new(&pc);
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         assert_eq!(op.step(&mut ctx), V3Outcome::done(()));
     }
