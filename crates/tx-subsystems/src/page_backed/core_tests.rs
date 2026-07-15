@@ -3118,6 +3118,71 @@ fn fsync_op_waits_for_planner_completion_then_consumes_terminal_result() {
 }
 
 #[test]
+fn fsync_op_waits_for_dirty_frontier_before_submitting_fsync() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::new());
+    let planner: Arc<dyn BackendPlanner> = Arc::new(SourceRecordingPlanner::new());
+    let pc = file_page_container_with_planner(fs.clone(), fs, FsObjectId::new(103), 2, planner);
+    let page = PageIndex::new(0);
+    let frame = cached_frame_for_test();
+    let ppn = frame.ppn;
+    let generation = {
+        let mut state = pc.state.lock();
+        state.pages.install_if_absent(page, frame).expect("seed page");
+        let slot = state.file_page_slots.entry(page).or_default();
+        let PageSlotFetch::Owner { generation } = slot.begin_fetch() else {
+            panic!("fetch owner");
+        };
+        slot.complete_fetch(generation, Ok(ppn)).expect("resident slot");
+        let dirty = slot.mark_dirty().expect("dirty slot");
+        state.pages.mark_dirty(page).expect("dirty page cache");
+        dirty.generation
+    };
+    let mut op = crate::page_backed::FsyncOp::new(&pc);
+    let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
+
+    assert_eq!(
+        op.step(&mut ctx),
+        V3Out::continue_with(crate::page_backed::adapter::step_engine::PageProgress::EMPTY)
+    );
+    let writeback = pc
+        .state
+        .lock()
+        .file_io_service
+        .find_submission(pc.io_manager_key(), PageIoRange::new(0, 1), PageIoOp::Writeback)
+        .cloned()
+        .expect("writeback precedes fsync");
+    assert!(pc
+        .state
+        .lock()
+        .file_io_service
+        .find_submission(pc.io_manager_key(), PageIoRange::new(0, 2), PageIoOp::Fsync)
+        .is_none());
+    pc.state.lock().file_io_service.push_completion(PageIoCompletion::new(
+        writeback.id,
+        writeback.range,
+        PageIoResult::Done,
+        generation,
+        PageIoCompletionKind::WritebackFinished,
+    ));
+    let mut block_queue = BlockQueue::new(4);
+    pc.drive_file_io_service_once(ServiceBudget::new(1), &mut block_queue, |_| true)
+        .expect("writeback completion drive");
+
+    assert_eq!(
+        op.step(&mut ctx),
+        V3Out::continue_with(crate::page_backed::adapter::step_engine::PageProgress::EMPTY)
+    );
+    assert!(pc
+        .state
+        .lock()
+        .file_io_service
+        .find_submission(pc.io_manager_key(), PageIoRange::new(0, 2), PageIoOp::Fsync)
+        .is_some());
+}
+
+#[test]
 fn page_cache_index_install_if_absent_linearizes_sparse_offsets() {
     let mut index = PageCacheIndex::new();
     let page = PageIndex::new(7);
