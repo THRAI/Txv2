@@ -7,6 +7,7 @@ use tx_ext4_format::journal::{Jbd2MetadataUpdate, Jbd2TransactionImage, JBD2_BLO
 use tx_ext4_format::mutation::{
     Ext4MutationPlan, FsyncStamp, MetaRole, MetadataBlock, MutationOrigin, SealedDataWrite,
 };
+use tx_subsystems::fs_iface::{IoDataLeaseId, IoDataSource, PageFrameRef};
 use tx_subsystems::io_manager::block::{DeviceKey, LbaRange};
 
 fn setup() {
@@ -137,4 +138,58 @@ fn mutation_runtime_stages_plan_into_its_fsync_source() {
 
     runtime.begin_mutation(&mutation, &guard).unwrap();
     assert!(source.take_checkpoint_graph().is_err());
+}
+
+#[test]
+fn prepared_transaction_uses_l4_owned_data_source_without_copying_it() {
+    setup();
+    let mut mutation = Ext4MutationPlan::new(MutationOrigin::FlushPage, 12, FsyncStamp::new(7));
+    mutation.data.push(SealedDataWrite {
+        logical_page: 0,
+        physical_block: 7,
+        bytes: [0; JBD2_BLOCK_SIZE],
+    });
+    mutation
+        .push_metadata(MetadataBlock {
+            home: 33,
+            role: MetaRole::InodeTable,
+            before_version: 1,
+            after: [0xC3; JBD2_BLOCK_SIZE],
+            depends_on: Vec::new(),
+        })
+        .unwrap();
+    let image = MutationJournalImage::from_plan(
+        &mutation,
+        MutationJournalLayout::new(
+            DeviceKey::new(9),
+            8,
+            [1; 16],
+            7,
+            JournalRecordLayout::new(
+                LbaRange::new(80, 8),
+                vec![LbaRange::new(88, 8)],
+                LbaRange::new(96, 8),
+            ),
+        ),
+    )
+    .unwrap();
+    let source = IoDataSource::page_cache(
+        IoDataLeaseId::new(77),
+        PageFrameRef::new(tx_hal::Ppn(0x123)),
+        0,
+        JBD2_BLOCK_SIZE as u32,
+    );
+    let pool = JournalPagePool::new(4).unwrap();
+    let guard = tx_substrate::epoch::guard();
+
+    let prepared = PreparedJournalTransaction::stage_mutation_with_data_sources(
+        &pool,
+        image,
+        vec![source.clone()],
+        &guard,
+    )
+    .unwrap();
+    let graph = prepared.plan().commit_graph().unwrap();
+    assert_eq!(graph.nodes()[0].source, source);
+    assert_eq!(graph.nodes()[0].bio.vecs[0].buffer_key, 0x123);
 }

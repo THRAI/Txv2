@@ -5,6 +5,7 @@
 //! state and L6 executes the resulting graph.
 
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -556,6 +557,71 @@ impl<T> Default for JournalTransactionState<T> {
 }
 
 impl PreparedJournalTransaction {
+    pub fn stage_mutation_with_data_sources(
+        pool: &JournalPagePool,
+        mutation: MutationJournalImage,
+        data_sources: Vec<IoDataSource>,
+        guard: &Guard<'_>,
+    ) -> Result<Self, PreparedJournalTransactionError> {
+        if mutation.data_writes.len() != data_sources.len()
+            || mutation.layout.records.metadata.len() != mutation.image.metadata_blocks.len()
+        {
+            return Err(PreparedJournalTransactionError::Layout);
+        }
+        let device = mutation.layout.device;
+        let mut records = Vec::new();
+        let mut data_writes = Vec::new();
+        for (write, source) in mutation.data_writes.into_iter().zip(data_sources) {
+            data_writes.push(journal_bio_from_l4_source(device, write.lba, source)?);
+        }
+
+        let descriptor = pool
+            .stage(&mutation.image.descriptor, guard)
+            .map_err(PreparedJournalTransactionError::Pool)?;
+        let descriptor_bio = descriptor.as_journal_bio(device, mutation.layout.records.descriptor);
+        records.push(descriptor);
+        let mut metadata_writes = Vec::new();
+        for (bytes, lba) in mutation
+            .image
+            .metadata_blocks
+            .iter()
+            .zip(mutation.layout.records.metadata.iter().copied())
+        {
+            let record = pool
+                .stage(bytes, guard)
+                .map_err(PreparedJournalTransactionError::Pool)?;
+            metadata_writes.push(record.as_journal_bio(device, lba));
+            records.push(record);
+        }
+        let commit = pool
+            .stage(&mutation.image.commit, guard)
+            .map_err(PreparedJournalTransactionError::Pool)?;
+        let commit_bio = commit.as_journal_bio(device, mutation.layout.records.commit);
+        records.push(commit);
+        let mut checkpoint_writes = Vec::new();
+        for write in mutation.checkpoint_writes {
+            let record = pool
+                .stage(&write.bytes, guard)
+                .map_err(PreparedJournalTransactionError::Pool)?;
+            checkpoint_writes.push(record.as_journal_bio(device, write.lba));
+            records.push(record);
+        }
+        let sequence = tx_ext4_format::journal::Jbd2Commit::parse(&mutation.image.commit)
+            .map_err(|_| PreparedJournalTransactionError::Layout)?
+            .header
+            .sequence;
+        let plan = JournalTransactionPlan::new(
+            sequence,
+            data_writes,
+            descriptor_bio,
+            metadata_writes,
+            commit_bio,
+            checkpoint_writes,
+        )
+        .map_err(PreparedJournalTransactionError::Plan)?;
+        Ok(Self { plan, records })
+    }
+
     /// Stage a complete immutable ext4 mutation into owned pool pages.
     ///
     /// Data pages feed the ordered-data phase, journal record pages feed the
@@ -688,6 +754,30 @@ impl PreparedJournalTransaction {
     pub fn record_count(&self) -> usize {
         self.records.len()
     }
+}
+
+fn journal_bio_from_l4_source(
+    device: DeviceKey,
+    lba: LbaRange,
+    source: IoDataSource,
+) -> Result<JournalBio, PreparedJournalTransactionError> {
+    let vecs = match &source {
+        IoDataSource::PageCache {
+            frame, offset, len, ..
+        } if *len == JBD2_BLOCK_SIZE as u32 => {
+            vec![BioVec::new(frame.ppn().0 as u64, *offset, *len)]
+        }
+        IoDataSource::Direct { vecs, .. } if !vecs.is_empty() => vecs.clone(),
+        _ => {
+            return Err(PreparedJournalTransactionError::Plan(
+                JournalTransactionPlanError::EmptyWrite,
+            ))
+        }
+    };
+    Ok(JournalBio::new(
+        BioPlan::new(device, BlockOp::Write, lba, vecs, BlockFlags::EMPTY),
+        source,
+    ))
 }
 
 /// Ext4 mount-owned bridge from fsync requests to retained JBD2 transactions.
