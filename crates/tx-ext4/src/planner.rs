@@ -76,6 +76,8 @@ pub trait Ext4WritePlanSource: Send + Sync + 'static {
         request: &BackendPageRequest,
         mapping: Ext4ReadMapping,
     ) -> BackendPlan;
+
+    fn complete_writeback(&self, _completion: BackendPageCompletion) {}
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -370,8 +372,14 @@ impl<S: Ext4ReadMappingSource, J: Ext4FsyncPlanSource, W: Ext4WritePlanSource> B
     }
 
     fn complete_page_io(&self, completion: BackendPageCompletion) {
-        if completion.op == tx_subsystems::io_manager::page::PageIoOp::Fsync {
-            self.fsync.complete_fsync(completion);
+        match completion.op {
+            tx_subsystems::io_manager::page::PageIoOp::Writeback => {
+                self.writeback.complete_writeback(completion);
+            }
+            tx_subsystems::io_manager::page::PageIoOp::Fsync => {
+                self.fsync.complete_fsync(completion);
+            }
+            _ => {}
         }
     }
 }
