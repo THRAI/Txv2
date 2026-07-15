@@ -337,7 +337,12 @@ fn pager_plans_mapped_write_without_mutating_home_block() {
     assert_eq!(plan.origin, MutationOrigin::FlushPage);
     assert_eq!(plan.object, 12);
     assert_eq!(plan.fsync_stamp, FsyncStamp::new(9));
-    assert_eq!(plan.metadata, Vec::new());
+    assert_eq!(plan.metadata.len(), 1);
+    assert_eq!(
+        plan.metadata[0].role,
+        tx_ext4_format::mutation::MetaRole::InodeTable
+    );
+    assert_eq!(plan.metadata[0].home, 4);
     assert_eq!(plan.allocations, Vec::new());
     assert_eq!(plan.data.len(), 1);
     assert_eq!(plan.data[0].logical_page, 1);

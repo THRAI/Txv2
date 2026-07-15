@@ -27,8 +27,8 @@ use crate::adapter::step_engine::{
 use tx_ext4_format::ondisk::{Extent, GroupDesc, Inode, Superblock};
 use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
 use tx_subsystems::fs_iface::{
-    BackendPageRequest, BackendPlan, FsObjectKey, IoDataLeaseId, IoDataSource, IoDataTarget,
-    PageFrameRef,
+    BackendPageCompletion, BackendPageRequest, BackendPlan, FsObjectKey, IoDataLeaseId,
+    IoDataSource, IoDataTarget, PageFrameRef,
 };
 use tx_subsystems::io_manager::block::DeviceKey;
 use tx_subsystems::io_manager::page::{
@@ -38,8 +38,15 @@ use tx_subsystems::page_backed::FsPageBacking;
 use tx_subsystems::vfs::structure::{DirCursor, FsObjectId, RNodeBacking};
 use tx_subsystems::vfs::FsOps;
 
-use crate::planner::{Ext4BlockGeometry, Ext4PlannerBinding};
-use crate::read_backend::{Ext4FsInstance, FilePageContainerBinder};
+use crate::planner::{Ext4BlockGeometry, Ext4FsyncPlanSource, Ext4PlannerBinding};
+use crate::read_backend::{Ext4FsInstance, Ext4PagerMutationPlanSource, FilePageContainerBinder};
+use crate::{
+    journal::{
+        Ext4MutationPlanSource, JournalFsyncSource, JournalMutationRuntime, JournalPagePool,
+        JournalRecordLayout, MutationJournalLayout,
+    },
+    mount::mount_ext4_read_write_with_mutation_journal_io_manager_planner,
+};
 
 /// Shared serialisation lock. Mirrors `tx_fs::test_support::FS_TEST_LOCK`:
 /// every test in this crate's lib binary observes the same per-CPU
@@ -231,6 +238,107 @@ fn open_fs_with_io_manager_binding() -> (Arc<Ext4FsInstance<MemImage>>, Ext4Plan
     )
     .expect("open ext4 mem image with planner binding");
     (fs, binding)
+}
+
+#[test]
+fn ext4_mutation_mount_stages_hole_writeback_at_l4_admission() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let fsync = Arc::new(JournalFsyncSource::new());
+    let runtime = Arc::new(JournalMutationRuntime::new(
+        Arc::clone(&fsync),
+        JournalPagePool::new(6).expect("journal pool"),
+        MutationJournalLayout::new(
+            DeviceKey::new(7),
+            8,
+            [1; 16],
+            7,
+            JournalRecordLayout::new(
+                tx_subsystems::io_manager::block::LbaRange::new(80, 8),
+                alloc::vec![
+                    tx_subsystems::io_manager::block::LbaRange::new(88, 8),
+                    tx_subsystems::io_manager::block::LbaRange::new(96, 8),
+                ],
+                tx_subsystems::io_manager::block::LbaRange::new(104, 8),
+            ),
+        ),
+    ));
+    let mounted = mount_ext4_read_write_with_mutation_journal_io_manager_planner(
+        build_image(),
+        Ext4BlockGeometry::new(DeviceKey::new(7), 8),
+        runtime,
+    )
+    .expect("mutation journal mount");
+    let planner = mounted.backend_planner().expect("backend planner");
+    let request = BackendPageRequest::new_with_source(
+        FsObjectKey::new(12),
+        PageIoRequestId::new(70),
+        PageIoRange::new(1, 1),
+        PageIoOp::Writeback,
+        PageIoFlags::WRITEBACK,
+        Some(PageGeneration::new(7)),
+        IoDataSource::page_cache(
+            IoDataLeaseId::new(77),
+            PageFrameRef::new(tx_hal::Ppn(0x123)),
+            0,
+            BLOCK_SIZE as u32,
+        ),
+    );
+    let guard = epoch::guard();
+
+    planner
+        .prepare_page_io(&request, &guard)
+        .expect("stage mutation");
+    let BackendPlan::SubmitGraph(data) = planner.plan_page_io(request.clone()) else {
+        panic!("prepared mutation must submit ordered data");
+    };
+    assert_eq!(data.nodes()[0].source, request.source);
+    planner.complete_page_io(BackendPageCompletion::new(
+        request.object,
+        request.id,
+        request.op,
+        tx_subsystems::io_manager::page::PageIoResult::Done,
+    ));
+
+    let fsync_request = BackendPageRequest::new(
+        request.object,
+        PageIoRequestId::new(71),
+        PageIoRange::new(0, 2),
+        PageIoOp::Fsync,
+        PageIoFlags::BARRIER,
+        None,
+    );
+    assert!(matches!(
+        fsync.plan_fsync(&fsync_request),
+        BackendPlan::SubmitGraph(_)
+    ));
+}
+
+#[test]
+fn ext4_mapped_write_mutation_carries_inode_after_image_for_fsync() {
+    let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    init_substrate();
+    let fs = open_fs();
+    let provider = Ext4PagerMutationPlanSource::new();
+    provider.bind(&fs);
+    let request = BackendPageRequest::new(
+        FsObjectKey::new(12),
+        PageIoRequestId::new(71),
+        PageIoRange::new(0, 1),
+        PageIoOp::Writeback,
+        PageIoFlags::WRITEBACK,
+        Some(PageGeneration::new(8)),
+    );
+
+    let mutation = provider
+        .plan_writeback_mutation(&request)
+        .expect("mapped write mutation");
+    assert_eq!(mutation.data[0].physical_block, 20);
+    assert_eq!(mutation.metadata.len(), 1);
+    assert!(matches!(
+        mutation.metadata[0].role,
+        tx_ext4_format::mutation::MetaRole::InodeTable
+    ));
 }
 
 fn test_mount_payload(

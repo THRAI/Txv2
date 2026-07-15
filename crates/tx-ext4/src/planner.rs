@@ -283,6 +283,21 @@ impl Ext4PlannerBinding {
         Self { planner, mapping }
     }
 
+    pub fn with_plan_sources<J, W>(geometry: Ext4BlockGeometry, fsync: J, writeback: W) -> Self
+    where
+        J: Ext4FsyncPlanSource,
+        W: Ext4WritePlanSource,
+    {
+        let mapping = Arc::new(Ext4MappingTable::new());
+        let planner: Arc<dyn BackendPlanner> = Arc::new(Ext4ReadPlanner::with_plan_sources(
+            geometry,
+            Arc::clone(&mapping),
+            fsync,
+            writeback,
+        ));
+        Self { planner, mapping }
+    }
+
     pub fn planner(&self) -> Arc<dyn BackendPlanner> {
         Arc::clone(&self.planner)
     }

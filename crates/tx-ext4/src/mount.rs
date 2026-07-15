@@ -9,10 +9,12 @@ use tx_subsystems::page_backed::FsPageBacking;
 use tx_subsystems::vfs::structure::{FsObjectId, InodeMeta};
 use tx_subsystems::vfs::FsOps;
 
+use crate::journal::{JournalFsyncSource, JournalMutationRuntime, JournalMutationWriteSource};
 use crate::planner::{Ext4BlockGeometry, Ext4PlannerBinding};
-use crate::journal::JournalFsyncSource;
 pub use crate::read_backend::FilePageContainerBinder;
-use crate::read_backend::{map_inode_meta, Ext4FsInstance, EXT4_ROOT_INODE};
+use crate::read_backend::{
+    map_inode_meta, Ext4FsInstance, Ext4PagerMutationPlanSource, EXT4_ROOT_INODE,
+};
 
 pub struct MountedExt4<I> {
     backend: Arc<Ext4FsInstance<I>>,
@@ -149,6 +151,27 @@ where
         false,
         Ext4PlannerBinding::with_fsync_plan_source(geometry, journal_fsync),
     )
+}
+
+/// Read-write ext4 mount whose buffered writeback is admitted into the
+/// mount-local JBD2 runtime before L4 submits ordered data I/O.
+pub fn mount_ext4_read_write_with_mutation_journal_io_manager_planner<I>(
+    image: I,
+    geometry: Ext4BlockGeometry,
+    runtime: Arc<JournalMutationRuntime>,
+) -> Result<MountedExt4<I>, Errno>
+where
+    I: BlockImage + Send + 'static,
+{
+    let mutation_provider = Ext4PagerMutationPlanSource::new();
+    let binding = Ext4PlannerBinding::with_plan_sources(
+        geometry,
+        runtime.source(),
+        JournalMutationWriteSource::new(mutation_provider.clone(), runtime),
+    );
+    let mounted = open_ext4_with_planner_binding(image, false, binding)?;
+    mutation_provider.bind(&mounted.backend);
+    Ok(mounted)
 }
 
 fn open_ext4_with_backend_planner<I>(

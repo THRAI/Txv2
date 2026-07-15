@@ -4,17 +4,21 @@ use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::adapter::step_engine::{Cap, PayloadCap, SpinMutex};
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use tx_ext4_format::pager::{BlockImage, DirEntryLite, Ext4Pager, InodeMetaLite, InodeNo};
+use tx_ext4_format::mutation::{Ext4MutationPlan, FsyncStamp};
+use tx_ext4_format::pager::{
+    BlockImage, DirEntryLite, Ext4Pager, InodeMetaLite, InodeNo, BLOCK_SIZE,
+};
 use tx_ext4_format::Ext4FormatError;
 use tx_subsystems::execution::Errno;
-use tx_subsystems::fs_iface::BackendPlanner;
+use tx_subsystems::fs_iface::{BackendPageRequest, BackendPlanner};
 use tx_subsystems::mount::{MountPayload, MountPayloadPin};
 use tx_subsystems::page_backed::PageContainer;
 use tx_subsystems::vfs::structure::DirCursor;
 use tx_subsystems::vfs::structure::{FsObjectId, InodeMeta, Timespec};
 
+use crate::journal::Ext4MutationPlanSource;
 use crate::planner::Ext4MappingTable;
 
 pub(crate) const EXT4_ROOT_INODE: u32 = 2;
@@ -22,6 +26,66 @@ pub(crate) const READDIR_WINDOW_ENTRIES: usize = 64;
 
 pub trait FilePageContainerBinder: Send + Sync {
     fn bind_file_page_container(&self, container: Cap<PageContainer>);
+}
+
+/// Mount-local adapter from a backend request to the pure format mutation
+/// planner. It intentionally has no access to page-cache frames; L4 supplies
+/// those separately to `JournalMutationRuntime` during admission.
+pub(crate) struct Ext4PagerMutationPlanSource<I> {
+    backend: Arc<SpinMutex<Option<Weak<Ext4FsInstance<I>>>>>,
+}
+
+impl<I> Clone for Ext4PagerMutationPlanSource<I> {
+    fn clone(&self) -> Self {
+        Self {
+            backend: Arc::clone(&self.backend),
+        }
+    }
+}
+
+impl<I> Ext4PagerMutationPlanSource<I> {
+    pub(crate) fn new() -> Self {
+        Self {
+            backend: Arc::new(SpinMutex::new(None)),
+        }
+    }
+
+    pub(crate) fn bind(&self, backend: &Arc<Ext4FsInstance<I>>) {
+        *self.backend.lock() = Some(Arc::downgrade(backend));
+    }
+}
+
+impl<I> Ext4MutationPlanSource for Ext4PagerMutationPlanSource<I>
+where
+    I: BlockImage + Send + 'static,
+{
+    fn plan_writeback_mutation(
+        &self,
+        request: &BackendPageRequest,
+    ) -> Result<Ext4MutationPlan, Errno> {
+        if request.range.page_count() != 1 {
+            return Err(Errno::EINVAL);
+        }
+        let generation = request.generation_hint.ok_or(Errno::EINVAL)?;
+        let backend = self
+            .backend
+            .lock()
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .ok_or(Errno::EIO)?;
+        let inode = inode_no(FsObjectId::new(request.object.raw()))?;
+
+        // The runtime replaces this placeholder with the L4-owned source.
+        // The format plan therefore remains metadata-only from L5's view.
+        backend.with_pager(|pager| {
+            pager.plan_write_page(
+                inode,
+                request.range.start_page(),
+                &[0; BLOCK_SIZE],
+                FsyncStamp::new(generation.raw()),
+            )
+        })
+    }
 }
 
 pub(crate) struct Ext4FsInstance<I> {

@@ -304,6 +304,22 @@ impl<I: BlockImage> Ext4Pager<I> {
             }
             BlockMapping::NeedNode(_) => return Err(Ext4FormatError::Unsupported),
         };
+        if plan.metadata.is_empty() {
+            // A mapped data write still needs a committed metadata anchor so
+            // fsync can distinguish ordered-data durability from background
+            // writeback. The inode after-image is intentionally unchanged.
+            let loc = self.inode_location(inode)?;
+            let mut inode_table_before = [0u8; BLOCK_SIZE];
+            self.image.read_block(loc.block, &mut inode_table_before)?;
+            plan.push_metadata(MetadataBlock {
+                home: loc.block,
+                role: MetaRole::InodeTable,
+                before_version: crc32c(0, &inode_table_before) as u64,
+                after: inode_table_before,
+                depends_on: Vec::new(),
+            })
+            .map_err(|_| Ext4FormatError::Corrupt)?;
+        }
         plan.data.push(SealedDataWrite {
             logical_page: file_page_index,
             physical_block: block,
