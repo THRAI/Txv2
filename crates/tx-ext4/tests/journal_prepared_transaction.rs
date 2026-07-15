@@ -193,3 +193,51 @@ fn prepared_transaction_uses_l4_owned_data_source_without_copying_it() {
     assert_eq!(graph.nodes()[0].source, source);
     assert_eq!(graph.nodes()[0].bio.vecs[0].buffer_key, 0x123);
 }
+
+#[test]
+fn mutation_runtime_accepts_l4_owned_data_source() {
+    setup();
+    let source = Arc::new(tx_ext4::journal::JournalFsyncSource::new());
+    let runtime = JournalMutationRuntime::new(
+        Arc::clone(&source),
+        JournalPagePool::new(4).unwrap(),
+        MutationJournalLayout::new(
+            DeviceKey::new(9),
+            8,
+            [1; 16],
+            7,
+            JournalRecordLayout::new(
+                LbaRange::new(80, 8),
+                vec![LbaRange::new(88, 8)],
+                LbaRange::new(96, 8),
+            ),
+        ),
+    );
+    let mut mutation = Ext4MutationPlan::new(MutationOrigin::FlushPage, 12, FsyncStamp::new(7));
+    mutation.data.push(SealedDataWrite {
+        logical_page: 0,
+        physical_block: 7,
+        bytes: [0; JBD2_BLOCK_SIZE],
+    });
+    mutation
+        .push_metadata(MetadataBlock {
+            home: 33,
+            role: MetaRole::InodeTable,
+            before_version: 1,
+            after: [0xC3; JBD2_BLOCK_SIZE],
+            depends_on: Vec::new(),
+        })
+        .unwrap();
+    let data = IoDataSource::page_cache(
+        IoDataLeaseId::new(77),
+        PageFrameRef::new(tx_hal::Ppn(0x123)),
+        0,
+        JBD2_BLOCK_SIZE as u32,
+    );
+    let guard = tx_substrate::epoch::guard();
+
+    runtime
+        .begin_mutation_with_data_sources(&mutation, vec![data], &guard)
+        .unwrap();
+    assert!(source.take_checkpoint_graph().is_err());
+}

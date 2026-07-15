@@ -886,6 +886,26 @@ impl JournalMutationRuntime {
             .begin(transaction)
             .map_err(JournalMutationRuntimeError::Busy)
     }
+
+    pub fn begin_mutation_with_data_sources(
+        &self,
+        mutation: &Ext4MutationPlan,
+        data_sources: Vec<IoDataSource>,
+        guard: &Guard<'_>,
+    ) -> Result<(), JournalMutationRuntimeError> {
+        let image = MutationJournalImage::from_plan(mutation, self.layout.clone())
+            .map_err(JournalMutationRuntimeError::Image)?;
+        let transaction = PreparedJournalTransaction::stage_mutation_with_data_sources(
+            &self.pool,
+            image,
+            data_sources,
+            guard,
+        )
+        .map_err(JournalMutationRuntimeError::Stage)?;
+        self.source
+            .begin(transaction)
+            .map_err(JournalMutationRuntimeError::Busy)
+    }
 }
 
 impl Ext4FsyncPlanSource for JournalFsyncSource {
