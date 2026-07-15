@@ -4,11 +4,14 @@
 //! neither owns metadata/page caches nor executes I/O; L5 keeps transaction
 //! state and L6 executes the resulting graph.
 
-use alloc::vec::Vec;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use tx_ext4_format::journal::JBD2_BLOCK_SIZE;
+use tx_ext4_format::journal::{Jbd2MetadataUpdate, Jbd2TransactionImage, JBD2_BLOCK_SIZE};
+use tx_ext4_format::mutation::Ext4MutationPlan;
+use tx_ext4_format::pager::Page4K;
+use tx_ext4_format::Ext4FormatError;
 use tx_substrate::zone::Cap;
 use tx_subsystems::execution::{Guard, StepOutcome};
 use tx_subsystems::fs_iface::{
@@ -361,6 +364,124 @@ impl JournalRecordLayout {
     }
 }
 
+/// Mount-owned placement and identity needed to encode one mutation plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MutationJournalLayout {
+    pub device: DeviceKey,
+    pub sectors_per_block: u64,
+    pub journal_uuid: [u8; 16],
+    pub sequence: u32,
+    pub records: JournalRecordLayout,
+}
+
+impl MutationJournalLayout {
+    pub const fn new(
+        device: DeviceKey,
+        sectors_per_block: u64,
+        journal_uuid: [u8; 16],
+        sequence: u32,
+        records: JournalRecordLayout,
+    ) -> Self {
+        Self {
+            device,
+            sectors_per_block,
+            journal_uuid,
+            sequence,
+            records,
+        }
+    }
+
+    fn block_lba(&self, physical_block: u64) -> Result<LbaRange, MutationJournalImageError> {
+        if self.sectors_per_block == 0 {
+            return Err(MutationJournalImageError::ZeroSectorsPerBlock);
+        }
+        let start_lba = physical_block
+            .checked_mul(self.sectors_per_block)
+            .ok_or(MutationJournalImageError::LbaOverflow)?;
+        Ok(LbaRange::new(start_lba, self.sectors_per_block))
+    }
+}
+
+/// One owned 4 KiB block write that will be staged into a mount-private pool.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MutationBlockWrite {
+    pub lba: LbaRange,
+    pub bytes: Page4K,
+}
+
+/// Pure JBD2 and block-I/O projection of one immutable ext4 mutation plan.
+///
+/// This does not allocate frames or submit I/O. The later staging step retains
+/// the owned bytes in page leases through durable commit completion.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MutationJournalImage {
+    pub layout: MutationJournalLayout,
+    pub image: Jbd2TransactionImage,
+    pub data_writes: Vec<MutationBlockWrite>,
+    pub checkpoint_writes: Vec<MutationBlockWrite>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MutationJournalImageError {
+    EmptyMetadata,
+    RecordLayout,
+    MetadataHomeOutOfRange,
+    ZeroSectorsPerBlock,
+    LbaOverflow,
+    Format(Ext4FormatError),
+}
+
+impl From<Ext4FormatError> for MutationJournalImageError {
+    fn from(value: Ext4FormatError) -> Self {
+        Self::Format(value)
+    }
+}
+
+impl MutationJournalImage {
+    pub fn from_plan(
+        mutation: &Ext4MutationPlan,
+        layout: MutationJournalLayout,
+    ) -> Result<Self, MutationJournalImageError> {
+        if mutation.metadata.is_empty() {
+            return Err(MutationJournalImageError::EmptyMetadata);
+        }
+        if layout.records.metadata.len() != mutation.metadata.len() {
+            return Err(MutationJournalImageError::RecordLayout);
+        }
+
+        let mut data_writes = Vec::new();
+        for write in &mutation.data {
+            data_writes.push(MutationBlockWrite {
+                lba: layout.block_lba(write.physical_block)?,
+                bytes: write.bytes,
+            });
+        }
+
+        let mut updates = Vec::new();
+        let mut checkpoint_writes = Vec::new();
+        for metadata in &mutation.metadata {
+            let home = u32::try_from(metadata.home)
+                .map_err(|_| MutationJournalImageError::MetadataHomeOutOfRange)?;
+            updates.push(Jbd2MetadataUpdate::new(home, metadata.after));
+            checkpoint_writes.push(MutationBlockWrite {
+                lba: layout.block_lba(metadata.home)?,
+                bytes: metadata.after,
+            });
+        }
+
+        Ok(Self {
+            image: Jbd2TransactionImage::encode_legacy(
+                layout.sequence,
+                layout.journal_uuid,
+                updates,
+            )?,
+            layout,
+            data_writes,
+            checkpoint_writes,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PreparedJournalTransactionError {
     Layout,
@@ -583,5 +704,80 @@ impl Ext4FsyncPlanSource for Arc<JournalFsyncSource> {
 
     fn complete_fsync(&self, completion: BackendPageCompletion) {
         self.as_ref().complete_fsync(completion);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+    use tx_ext4_format::mutation::{
+        Ext4MutationPlan, FsyncStamp, MetaRole, MetadataBlock, MutationOrigin, SealedDataWrite,
+    };
+
+    #[test]
+    fn mutation_journal_image_separates_ordered_data_and_metadata_checkpoint_writes() {
+        let mut mutation = Ext4MutationPlan::new(MutationOrigin::FlushPage, 12, FsyncStamp::new(7));
+        mutation.data.push(SealedDataWrite {
+            logical_page: 3,
+            physical_block: 7,
+            bytes: [0xD3; JBD2_BLOCK_SIZE],
+        });
+        mutation
+            .push_metadata(MetadataBlock {
+                home: 5,
+                role: MetaRole::BlockBitmap,
+                before_version: 1,
+                after: [0xB5; JBD2_BLOCK_SIZE],
+                depends_on: Vec::new(),
+            })
+            .unwrap();
+        mutation
+            .push_metadata(MetadataBlock {
+                home: 6,
+                role: MetaRole::InodeTable,
+                before_version: 2,
+                after: [0xC6; JBD2_BLOCK_SIZE],
+                depends_on: Vec::new(),
+            })
+            .unwrap();
+        let layout = MutationJournalLayout::new(
+            DeviceKey::new(9),
+            8,
+            [0xAB; 16],
+            44,
+            JournalRecordLayout::new(
+                LbaRange::new(100, 8),
+                vec![LbaRange::new(108, 8), LbaRange::new(116, 8)],
+                LbaRange::new(124, 8),
+            ),
+        );
+
+        let image = MutationJournalImage::from_plan(&mutation, layout).unwrap();
+
+        assert_eq!(image.data_writes.len(), 1);
+        assert_eq!(image.data_writes[0].lba, LbaRange::new(56, 8));
+        assert_eq!(image.data_writes[0].bytes, [0xD3; JBD2_BLOCK_SIZE]);
+        assert_eq!(image.checkpoint_writes.len(), 2);
+        assert_eq!(image.checkpoint_writes[0].lba, LbaRange::new(40, 8));
+        assert_eq!(image.checkpoint_writes[1].lba, LbaRange::new(48, 8));
+        let descriptor =
+            tx_ext4_format::journal::Jbd2Descriptor::parse_legacy(&image.image.descriptor).unwrap();
+        assert_eq!(descriptor.header.sequence, 44);
+        assert_eq!(
+            descriptor
+                .tags
+                .iter()
+                .map(|tag| tag.target_block)
+                .collect::<Vec<_>>(),
+            vec![5, 6]
+        );
+        assert_eq!(
+            tx_ext4_format::journal::Jbd2Commit::parse(&image.image.commit)
+                .unwrap()
+                .header
+                .sequence,
+            44
+        );
     }
 }
