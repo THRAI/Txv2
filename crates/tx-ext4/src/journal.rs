@@ -549,6 +549,82 @@ impl<T> Default for JournalTransactionState<T> {
 }
 
 impl PreparedJournalTransaction {
+    /// Stage a complete immutable ext4 mutation into owned pool pages.
+    ///
+    /// Data pages feed the ordered-data phase, journal record pages feed the
+    /// durable commit phase, and separate metadata pages feed checkpointing.
+    /// Every page lease remains in `records` until the transaction is released.
+    pub fn stage_mutation(
+        pool: &JournalPagePool,
+        mutation: MutationJournalImage,
+        guard: &Guard<'_>,
+    ) -> Result<Self, PreparedJournalTransactionError> {
+        if mutation.layout.records.metadata.len() != mutation.image.metadata_blocks.len() {
+            return Err(PreparedJournalTransactionError::Layout);
+        }
+
+        let device = mutation.layout.device;
+        let mut records = Vec::new();
+        let mut data_writes = Vec::new();
+        for write in mutation.data_writes {
+            let record = pool
+                .stage(&write.bytes, guard)
+                .map_err(PreparedJournalTransactionError::Pool)?;
+            data_writes.push(record.as_journal_bio(device, write.lba));
+            records.push(record);
+        }
+
+        let descriptor = pool
+            .stage(&mutation.image.descriptor, guard)
+            .map_err(PreparedJournalTransactionError::Pool)?;
+        let descriptor_bio = descriptor.as_journal_bio(device, mutation.layout.records.descriptor);
+        records.push(descriptor);
+
+        let mut metadata_writes = Vec::new();
+        for (bytes, lba) in mutation
+            .image
+            .metadata_blocks
+            .iter()
+            .zip(mutation.layout.records.metadata.iter().copied())
+        {
+            let record = pool
+                .stage(bytes, guard)
+                .map_err(PreparedJournalTransactionError::Pool)?;
+            metadata_writes.push(record.as_journal_bio(device, lba));
+            records.push(record);
+        }
+
+        let commit = pool
+            .stage(&mutation.image.commit, guard)
+            .map_err(PreparedJournalTransactionError::Pool)?;
+        let commit_bio = commit.as_journal_bio(device, mutation.layout.records.commit);
+        records.push(commit);
+
+        let mut checkpoint_writes = Vec::new();
+        for write in mutation.checkpoint_writes {
+            let record = pool
+                .stage(&write.bytes, guard)
+                .map_err(PreparedJournalTransactionError::Pool)?;
+            checkpoint_writes.push(record.as_journal_bio(device, write.lba));
+            records.push(record);
+        }
+
+        let sequence = tx_ext4_format::journal::Jbd2Commit::parse(&mutation.image.commit)
+            .map_err(|_| PreparedJournalTransactionError::Layout)?
+            .header
+            .sequence;
+        let plan = JournalTransactionPlan::new(
+            sequence,
+            data_writes,
+            descriptor_bio,
+            metadata_writes,
+            commit_bio,
+            checkpoint_writes,
+        )
+        .map_err(PreparedJournalTransactionError::Plan)?;
+        Ok(Self { plan, records })
+    }
+
     pub fn stage(
         pool: &JournalPagePool,
         image: tx_ext4_format::journal::Jbd2TransactionImage,
