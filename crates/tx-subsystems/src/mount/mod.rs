@@ -412,6 +412,16 @@ impl MountPayload {
         self.backend_planner.as_deref()
     }
 
+    pub fn prepare_backend_page_request(
+        &self,
+        request: &BackendPageRequest,
+        guard: &Guard<'_>,
+    ) -> Result<(), Errno> {
+        self.backend_planner
+            .as_deref()
+            .map_or(Ok(()), |planner| planner.prepare_page_io(request, guard))
+    }
+
     pub fn plan_backend_page_request(
         &self,
         object: FsObjectKey,
@@ -480,6 +490,28 @@ impl<'a> MountPayloadBackendContext<'a> {
 impl PageServiceBackendContext for MountPayloadBackendContext<'_> {
     fn plan_submission(&self, request: PageIoRequest) -> Option<BackendPlan> {
         self.payload.plan_backend_page_request(self.object, request)
+    }
+
+    fn prepare_submission_with_source_and_target(
+        &self,
+        request: &PageIoRequest,
+        source: &IoDataSource,
+        target: &IoDataTarget,
+        guard: &Guard<'_>,
+    ) -> Result<(), Errno> {
+        self.payload.prepare_backend_page_request(
+            &BackendPageRequest::new_with_source_and_target(
+                self.object,
+                request.id,
+                request.range,
+                request.op,
+                request.flags,
+                request.generation_hint,
+                source.clone(),
+                target.clone(),
+            ),
+            guard,
+        )
     }
 
     fn plan_submission_with_source(

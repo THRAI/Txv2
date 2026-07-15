@@ -3,7 +3,7 @@
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
 
-use crate::execution::Errno;
+use crate::execution::{Errno, Guard};
 use crate::fs_iface::{IoDataSource, IoDataTarget};
 use crate::io_manager::backend::{
     BackendBioCompletion, BackendBioGraph, BackendBioNodeId, BackendDispatch, BackendGraphAdvance,
@@ -211,6 +211,16 @@ pub struct PageServiceDriven {
 
 pub trait PageServiceBackendContext {
     fn plan_submission(&self, request: PageIoRequest) -> Option<BackendPlan>;
+
+    fn prepare_submission_with_source_and_target(
+        &self,
+        _request: &PageIoRequest,
+        _source: &IoDataSource,
+        _target: &IoDataTarget,
+        _guard: &Guard<'_>,
+    ) -> Result<(), Errno> {
+        Ok(())
+    }
 
     fn plan_submission_with_source(
         &self,

@@ -80,6 +80,42 @@ impl BackendPlanner for SourceRecordingPlanner {
     }
 }
 
+struct PreparedSourceRecordingPlanner {
+    prepared_source: SpinMutex<Option<IoDataSource>>,
+    planned_source: SpinMutex<Option<IoDataSource>>,
+    prepared_before_plan: AtomicBool,
+}
+
+impl PreparedSourceRecordingPlanner {
+    const fn new() -> Self {
+        Self {
+            prepared_source: SpinMutex::new(None),
+            planned_source: SpinMutex::new(None),
+            prepared_before_plan: AtomicBool::new(false),
+        }
+    }
+}
+
+impl BackendPlanner for PreparedSourceRecordingPlanner {
+    fn prepare_page_io(
+        &self,
+        request: &BackendPageRequest,
+        _guard: &crate::execution::Guard<'_>,
+    ) -> Result<(), Errno> {
+        *self.prepared_source.lock() = Some(request.source.clone());
+        Ok(())
+    }
+
+    fn plan_page_io(&self, request: BackendPageRequest) -> BackendPlan {
+        self.prepared_before_plan.store(
+            self.prepared_source.lock().is_some(),
+            Ordering::Release,
+        );
+        *self.planned_source.lock() = Some(request.source);
+        BackendPlan::Complete(PageCompletionList::default())
+    }
+}
+
 struct LockCheckingPlanner {
     calls: AtomicUsize,
     saw_page_container_lock: AtomicBool,
@@ -1634,6 +1670,49 @@ fn file_page_writeback_leases_source_until_completion() {
         PageSlotState::Resident { ppn }
     );
     assert!(!pc.page_marks(page).expect("marks").dirty);
+}
+
+#[test]
+fn file_writeback_prepares_l5_mutation_with_l4_source_before_planning() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::new());
+    let planner = Arc::new(PreparedSourceRecordingPlanner::new());
+    let backend_planner: Arc<dyn BackendPlanner> = planner.clone();
+    let pc = file_page_container_with_planner(
+        fs.clone(),
+        fs,
+        FsObjectId::new(196),
+        4,
+        backend_planner,
+    );
+    let page = PageIndex::new(1);
+    let frame = cached_frame_for_test();
+    let ppn = frame.ppn;
+    {
+        let mut state = pc.state.lock();
+        state.pages.install_if_absent(page, frame).expect("seed page");
+        let slot = state.file_page_slots.entry(page).or_default();
+        let PageSlotFetch::Owner { generation } = slot.begin_fetch() else {
+            panic!("slot fetch owner");
+        };
+        slot.complete_fetch(generation, Ok(ppn)).expect("resident slot");
+        slot.mark_dirty().expect("dirty slot");
+        state.pages.mark_dirty(page).expect("dirty page cache");
+    }
+
+    pc.queue_file_page_writeback(page)
+        .expect("writeback request");
+    let mut block_queue = BlockQueue::new(4);
+    pc.drive_file_io_service_once(ServiceBudget::new(1), &mut block_queue, |_| true)
+        .expect("planner turn");
+
+    assert!(planner.prepared_before_plan.load(Ordering::Acquire));
+    assert_eq!(*planner.prepared_source.lock(), *planner.planned_source.lock());
+    assert!(matches!(
+        *planner.prepared_source.lock(),
+        Some(IoDataSource::PageCache { frame, .. }) if frame.ppn() == ppn
+    ));
 }
 
 #[test]

@@ -2,7 +2,7 @@
 
 use alloc::vec::Vec;
 
-use crate::execution::Errno;
+use crate::execution::{Errno, Guard};
 use crate::io_manager::block::{BioPlan, BioVec};
 use crate::io_manager::page::{
     PageGeneration, PageIoCompletionKind, PageIoFlags, PageIoOp, PageIoRange, PageIoRequest,
@@ -543,6 +543,19 @@ impl BackendPageCompletion {
 }
 
 pub trait BackendPlanner: Send + Sync + 'static {
+    /// Admit an L4-owned source into backend-private state before planning.
+    ///
+    /// This synchronous hook is the only planner entry that receives an epoch
+    /// guard. Backends may copy immutable metadata or stage private journal
+    /// records here, but must not retain the guard or perform device I/O.
+    fn prepare_page_io(
+        &self,
+        _request: &BackendPageRequest,
+        _guard: &Guard<'_>,
+    ) -> Result<(), Errno> {
+        Ok(())
+    }
+
     fn plan_page_io(&self, request: BackendPageRequest) -> BackendPlan;
 
     fn resume_page_io(&self, _resume: BackendPlanResume) -> BackendPlan {

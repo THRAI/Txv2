@@ -1750,11 +1750,18 @@ impl PageContainer {
                         let rollback_request = request.clone();
                         let source = self.file_io_source_for_submission(&request);
                         let target = self.file_io_target_for_submission(&request);
-                        let Some(plan) = context.plan_submission_with_source_and_target(
-                            request.clone(),
-                            source,
-                            target,
-                        ) else {
+                        let guard = step_engine::guard();
+                        let plan = match context.prepare_submission_with_source_and_target(
+                            &request, &source, &target, &guard,
+                        ) {
+                            Ok(()) => context.plan_submission_with_source_and_target(
+                                request.clone(),
+                                source,
+                                target,
+                            ),
+                            Err(errno) => Some(BackendPlan::Err(errno)),
+                        };
+                        let Some(plan) = plan else {
                             self.abort_file_writeback_submission(&request);
                             self.release_file_io_read_target(&request);
                             work.push(PageServiceDrivenWork::UnplannedSubmission(request));
