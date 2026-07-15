@@ -109,6 +109,41 @@ impl JournalTransactionPlan {
         self.device
     }
 
+    /// Submit ordered file data and a durability fence before journal commit.
+    pub fn data_graph(&self) -> Result<BackendBioGraph, JournalTransactionPlanError> {
+        let mut builder = GraphBuilder::new();
+        let mut data_ids = Vec::new();
+        for write in &self.data_writes {
+            data_ids.push(builder.push(write.clone())?);
+        }
+        let fence_id = builder.push(fence(self.device))?;
+        for data in data_ids {
+            builder.depends_on(data, fence_id);
+        }
+        builder.finish()
+    }
+
+    /// Submit journal descriptor, metadata after-images, and FUA commit only
+    /// after [`Self::data_graph`] has completed successfully.
+    pub fn commit_graph_after_data(&self) -> Result<BackendBioGraph, JournalTransactionPlanError> {
+        let mut builder = GraphBuilder::new();
+        let descriptor = builder.push(self.descriptor.clone())?;
+        let mut journal_ids = Vec::new();
+        journal_ids.push(descriptor);
+        for write in &self.metadata_writes {
+            journal_ids.push(builder.push(write.clone())?);
+        }
+        let journal_fence = builder.push(fence(self.device))?;
+        for journal in journal_ids {
+            builder.depends_on(journal, journal_fence);
+        }
+        let mut commit = self.commit.clone();
+        commit.plan.flags = commit.plan.flags.union(BlockFlags::FUA);
+        let commit = builder.push(commit)?;
+        builder.depends_on(journal_fence, commit);
+        builder.finish()
+    }
+
     /// Build the fsync-critical graph.
     ///
     /// L6 completion of this graph means all data writes preceded a durable
