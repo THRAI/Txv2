@@ -869,7 +869,8 @@ pub struct JournalFsyncSource {
 
 struct JournalFsyncSourceState {
     transaction: JournalTransactionState<PreparedJournalTransaction>,
-    submitted: Option<PageIoRequestId>,
+    data_submitted: Option<PageIoRequestId>,
+    commit_submitted: Option<PageIoRequestId>,
 }
 
 impl JournalFsyncSource {
@@ -877,7 +878,8 @@ impl JournalFsyncSource {
         Self {
             state: SpinMutex::new(JournalFsyncSourceState {
                 transaction: JournalTransactionState::new(),
-                submitted: None,
+                data_submitted: None,
+                commit_submitted: None,
             }),
         }
     }
@@ -887,6 +889,44 @@ impl JournalFsyncSource {
         transaction: PreparedJournalTransaction,
     ) -> Result<(), JournalTransactionStateError> {
         self.state.lock().transaction.begin(transaction)
+    }
+
+    pub fn plan_data(&self, request: &BackendPageRequest) -> BackendPlan {
+        if request.op != PageIoOp::Writeback {
+            return BackendPlan::Err(tx_subsystems::execution::Errno::EINVAL);
+        }
+        let mut state = self.state.lock();
+        if state.data_submitted.is_some() || state.commit_submitted.is_some() {
+            return BackendPlan::Err(tx_subsystems::execution::Errno::EBUSY);
+        }
+        let Some(transaction) = state.transaction.active() else {
+            return BackendPlan::Err(tx_subsystems::execution::Errno::EAGAIN);
+        };
+        let graph = match transaction.plan().data_graph() {
+            Ok(graph) => graph,
+            Err(_) => return BackendPlan::Err(tx_subsystems::execution::Errno::EIO),
+        };
+        state.data_submitted = Some(request.id);
+        BackendPlan::SubmitGraph(graph)
+    }
+
+    pub fn complete_data(&self, completion: BackendPageCompletion) {
+        if completion.op != PageIoOp::Writeback {
+            return;
+        }
+        let mut state = self.state.lock();
+        if state.data_submitted != Some(completion.id) {
+            return;
+        }
+        state.data_submitted = None;
+        match completion.result {
+            PageIoResult::Done => {
+                let _ = state.transaction.mark_data_durable();
+            }
+            PageIoResult::Err(_) => {
+                let _ = state.transaction.discard();
+            }
+        }
     }
 
     /// Build the post-commit checkpoint graph while retaining transaction leases.
@@ -907,7 +947,8 @@ impl JournalFsyncSource {
     pub fn complete_checkpoint(&self) -> Result<(), JournalTransactionStateError> {
         let mut state = self.state.lock();
         let _ = state.transaction.complete_checkpoint()?;
-        state.submitted = None;
+        state.data_submitted = None;
+        state.commit_submitted = None;
         Ok(())
     }
 }
@@ -993,17 +1034,20 @@ impl Ext4FsyncPlanSource for JournalFsyncSource {
             return BackendPlan::Err(tx_subsystems::execution::Errno::EINVAL);
         }
         let mut state = self.state.lock();
-        if state.submitted.is_some() {
+        if state.data_submitted.is_some() || state.commit_submitted.is_some() {
             return BackendPlan::Err(tx_subsystems::execution::Errno::EBUSY);
         }
         let Some(transaction) = state.transaction.active() else {
             return BackendPlan::Err(tx_subsystems::execution::Errno::EAGAIN);
         };
-        let graph = match transaction.plan().commit_graph() {
+        let graph = match transaction.plan().commit_graph_after_data() {
             Ok(graph) => graph,
             Err(_) => return BackendPlan::Err(tx_subsystems::execution::Errno::EIO),
         };
-        state.submitted = Some(request.id);
+        if state.transaction.mark_commit_submitted().is_err() {
+            return BackendPlan::Err(tx_subsystems::execution::Errno::EBUSY);
+        }
+        state.commit_submitted = Some(request.id);
         BackendPlan::SubmitGraph(graph)
     }
 
@@ -1012,13 +1056,13 @@ impl Ext4FsyncPlanSource for JournalFsyncSource {
             return;
         }
         let mut state = self.state.lock();
-        if state.submitted != Some(completion.id) {
+        if state.commit_submitted != Some(completion.id) {
             return;
         }
-        state.submitted = None;
+        state.commit_submitted = None;
         match completion.result {
             PageIoResult::Done => {
-                let _ = state.transaction.mark_combined_commit_durable();
+                let _ = state.transaction.mark_commit_durable();
             }
             PageIoResult::Err(_) => {
                 let _ = state.transaction.discard();
