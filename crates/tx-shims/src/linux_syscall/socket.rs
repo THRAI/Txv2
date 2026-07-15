@@ -2276,6 +2276,17 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             payload.with_options_mut(|opts| opts.ip.recv_err = on);
             Ok(())
         }
+        (IPPROTO_IP, IP_TOS) => {
+            // DSCP/ToS QoS hint (Linux stores the low byte). We accept and
+            // record it but don't act on it; programs like ssh and curl set it
+            // and treat ENOPROTOOPT as a hard failure on some paths.
+            let tos = match read_sockopt_i32(ctx, optval, optlen) {
+                Ok(tos) => tos,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            payload.with_options_mut(|opts| opts.ip.tos = (tos & 0xff) as u8);
+            Ok(())
+        }
         (IPPROTO_IP, IP_TTL) => {
             let ttl = match read_sockopt_i32(ctx, optval, optlen) {
                 Ok(ttl) => ttl,

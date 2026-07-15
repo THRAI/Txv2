@@ -1,3 +1,11 @@
+- 2026-07-15 (setsockopt IP_TOS 支持 — SSH 能力探索副产品). 加 `IP_TOS=1` 常量(numbers.rs)+ re-export(mod.rs)
+  + setsockopt IPPROTO_IP/IP_TOS 一臂(socket.rs:接受 DSCP/ToS 低字节存 opts.ip.tos,不再返 ENOPROTOOPT)。动机:
+  OpenSSH 客户端(及 curl)会设 IP_TOS 做 QoS,之前返 "Protocol not available" 警告。**背景=打通 git-over-SSH**:
+  往官方镜像副本注入 openssh 10.0p2(deps libcrypto/libssl/z 镜像已有),内核成功跑真 ssh:ssh -V/ssh-keygen
+  ed25519/**完整 SSH 握手+加密+公钥认证+git clone over ssh 全通**(宿主一次性 sshd@2222 via slirp 10.0.2.2,
+  clone marker+commit 一致)。IP_TOS 补后 ssh 警告消失、clone 输出干净。验证:rv64 build ok + git-net HTTPS 8/8
+  无回归。**注**:官方竞赛镜像无 ssh 客户端(git 题走 HTTPS),此为内核 SSH 能力证明+通用 setsockopt 改进,非直接计分。
+  Next:可选 la64 同验、IPV6_TCLASS 同款补。Blocker:无。
 - 2026-07-14 (内核墙钟从硬件 RTC 同步真实时间 — 双架构). 之前 CLOCK_REALTIME 锚在写死的 2026-05-23
   (wall_clock.rs DEFAULT_REALTIME_EPOCH_BASE_NS + RTC ioctl fixed_oscomp_time),导致 git commit/date/文件
   mtime 都是固定过去日期(GitHub 显示 "2 months ago")。改:开机读真 RTC 硬件,调已存在的
