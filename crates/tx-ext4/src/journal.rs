@@ -362,7 +362,11 @@ impl JournalPagePool {
         bytes: &[u8; JBD2_BLOCK_SIZE],
         guard: &Guard<'_>,
     ) -> Result<JournalRecordLease, JournalPagePoolError> {
-        let page = self.free.lock().pop().unwrap_or_else(|| PageIndex::new(self.next_page.fetch_add(1, Ordering::AcqRel)));
+        let page = self
+            .free
+            .lock()
+            .pop()
+            .unwrap_or_else(|| PageIndex::new(self.next_page.fetch_add(1, Ordering::AcqRel)));
         if page.as_u64() >= self.pages.page_count() {
             return Err(JournalPagePoolError::Capacity);
         }
@@ -381,10 +385,16 @@ impl JournalPagePool {
         drop(materialized);
 
         match self.pages.export_page_lease(page, guard) {
-            StepOutcome::Done(lease) => Ok(JournalRecordLease { page, lease, free: Arc::clone(&self.free) }),
+            StepOutcome::Done(lease) => Ok(JournalRecordLease {
+                page,
+                lease,
+                free: Arc::clone(&self.free),
+            }),
             StepOutcome::Err(errno) => {
                 self.free.lock().push(page);
-                Err(JournalPagePoolError::Page(PageCacheError::Backend(errno.into())))
+                Err(JournalPagePoolError::Page(PageCacheError::Backend(
+                    errno.into(),
+                )))
             }
             StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
                 self.free.lock().push(page);
@@ -419,6 +429,15 @@ pub struct MutationJournalLayout {
     pub journal_uuid: [u8; 16],
     pub sequence: u32,
     pub records: JournalRecordLayout,
+    pub superblock_state: Option<JournalSuperblockState>,
+}
+
+/// JBD2 state pages for one ring reservation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JournalSuperblockState {
+    pub lba: LbaRange,
+    pub activate: Page4K,
+    pub clean: Page4K,
 }
 
 impl MutationJournalLayout {
@@ -435,7 +454,13 @@ impl MutationJournalLayout {
             journal_uuid,
             sequence,
             records,
+            superblock_state: None,
         }
+    }
+
+    pub fn with_superblock_state(mut self, state: JournalSuperblockState) -> Self {
+        self.superblock_state = Some(state);
+        self
     }
 
     fn block_lba(&self, physical_block: u64) -> Result<LbaRange, MutationJournalImageError> {
@@ -459,6 +484,7 @@ pub enum JournalRingError {
     Busy,
     Missing,
     ReservationMismatch,
+    Superblock,
 }
 
 /// One journal record range retained until its checkpoint terminal result.
@@ -487,6 +513,9 @@ pub struct JournalRing {
     journal_uuid: [u8; 16],
     blocks: Vec<u64>,
     first: usize,
+    superblock: tx_ext4_format::journal::Jbd2Superblock,
+    superblock_page: Option<Page4K>,
+    superblock_lba: Option<LbaRange>,
     state: SpinMutex<JournalRingState>,
 }
 
@@ -504,10 +533,18 @@ impl JournalRing {
         if max_len != geometry.blocks.len() || max_len < 2 || first == 0 || first >= max_len {
             return Err(JournalRingError::InvalidGeometry);
         }
+        let superblock_lba = geometry
+            .superblock_page
+            .as_ref()
+            .map(|_| Self::lba_for_parts(&geometry.blocks, sectors_per_block, 0))
+            .transpose()?;
         Ok(Self {
             device,
             sectors_per_block,
             journal_uuid: geometry.superblock.uuid,
+            superblock: geometry.superblock,
+            superblock_page: geometry.superblock_page,
+            superblock_lba,
             blocks: geometry.blocks,
             first,
             state: SpinMutex::new(JournalRingState {
@@ -547,14 +584,30 @@ impl JournalRing {
         for index in cursor + 1..end - 1 {
             metadata.push(self.lba_for(index)?);
         }
+        let mut layout = MutationJournalLayout::new(
+            self.device,
+            self.sectors_per_block,
+            self.journal_uuid,
+            state.sequence,
+            JournalRecordLayout::new(descriptor, metadata, self.lba_for(end - 1)?),
+        );
+        if let (Some(page), Some(lba)) = (self.superblock_page, self.superblock_lba) {
+            let mut activate = page;
+            self.superblock
+                .write_state(&mut activate, state.sequence, cursor as u32)
+                .map_err(|_| JournalRingError::Superblock)?;
+            let mut clean = page;
+            self.superblock
+                .write_state(&mut clean, state.sequence.wrapping_add(1).max(1), 0)
+                .map_err(|_| JournalRingError::Superblock)?;
+            layout = layout.with_superblock_state(JournalSuperblockState {
+                lba,
+                activate,
+                clean,
+            });
+        }
         let reservation = JournalRingReservation {
-            layout: MutationJournalLayout::new(
-                self.device,
-                self.sectors_per_block,
-                self.journal_uuid,
-                state.sequence,
-                JournalRecordLayout::new(descriptor, metadata, self.lba_for(end - 1)?),
-            ),
+            layout,
             id: state.next_reservation_id,
             end,
         };
@@ -581,18 +634,28 @@ impl JournalRing {
             return Err(JournalRingError::ReservationMismatch);
         }
         if checkpoint_succeeded {
-            state.cursor = (active.end == self.blocks.len()).then_some(self.first).unwrap_or(active.end);
+            state.cursor = (active.end == self.blocks.len())
+                .then_some(self.first)
+                .unwrap_or(active.end);
             state.sequence = state.sequence.wrapping_add(1).max(1);
         }
         Ok(())
     }
 
     fn lba_for(&self, logical: usize) -> Result<LbaRange, JournalRingError> {
-        let physical = *self.blocks.get(logical).ok_or(JournalRingError::InvalidGeometry)?;
+        Self::lba_for_parts(&self.blocks, self.sectors_per_block, logical)
+    }
+
+    fn lba_for_parts(
+        blocks: &[u64],
+        sectors_per_block: u64,
+        logical: usize,
+    ) -> Result<LbaRange, JournalRingError> {
+        let physical = *blocks.get(logical).ok_or(JournalRingError::InvalidGeometry)?;
         let start = physical
-            .checked_mul(self.sectors_per_block)
+            .checked_mul(sectors_per_block)
             .ok_or(JournalRingError::LbaOverflow)?;
-        Ok(LbaRange::new(start, self.sectors_per_block))
+        Ok(LbaRange::new(start, sectors_per_block))
     }
 }
 
@@ -1258,8 +1321,17 @@ impl JournalMutationRuntime {
         }
     }
 
-    pub fn with_ring(source: Arc<JournalFsyncSource>, pool: JournalPagePool, ring: Arc<JournalRing>) -> Self {
-        Self { source, pool, layout: None, ring: Some(ring) }
+    pub fn with_ring(
+        source: Arc<JournalFsyncSource>,
+        pool: JournalPagePool,
+        ring: Arc<JournalRing>,
+    ) -> Self {
+        Self {
+            source,
+            pool,
+            layout: None,
+            ring: Some(ring),
+        }
     }
 
     pub fn from_geometry(
@@ -1288,11 +1360,18 @@ impl JournalMutationRuntime {
         let (layout, reservation) = self.layout_for(mutation)?;
         let image = match MutationJournalImage::from_plan(mutation, layout) {
             Ok(image) => image,
-            Err(error) => return Err(self.release_reservation(reservation, JournalMutationRuntimeError::Image(error))),
+            Err(error) => {
+                return Err(self
+                    .release_reservation(reservation, JournalMutationRuntimeError::Image(error)))
+            }
         };
-        let transaction = match PreparedJournalTransaction::stage_mutation(&self.pool, image, guard) {
+        let transaction = match PreparedJournalTransaction::stage_mutation(&self.pool, image, guard)
+        {
             Ok(transaction) => transaction,
-            Err(error) => return Err(self.release_reservation(reservation, JournalMutationRuntimeError::Stage(error))),
+            Err(error) => {
+                return Err(self
+                    .release_reservation(reservation, JournalMutationRuntimeError::Stage(error)))
+            }
         };
         self.begin_transaction(transaction, reservation)
     }
@@ -1306,7 +1385,10 @@ impl JournalMutationRuntime {
         let (layout, reservation) = self.layout_for(mutation)?;
         let image = match MutationJournalImage::from_plan(mutation, layout) {
             Ok(image) => image,
-            Err(error) => return Err(self.release_reservation(reservation, JournalMutationRuntimeError::Image(error))),
+            Err(error) => {
+                return Err(self
+                    .release_reservation(reservation, JournalMutationRuntimeError::Image(error)))
+            }
         };
         let transaction = match PreparedJournalTransaction::stage_mutation_with_data_sources(
             &self.pool,
@@ -1315,7 +1397,10 @@ impl JournalMutationRuntime {
             guard,
         ) {
             Ok(transaction) => transaction,
-            Err(error) => return Err(self.release_reservation(reservation, JournalMutationRuntimeError::Stage(error))),
+            Err(error) => {
+                return Err(self
+                    .release_reservation(reservation, JournalMutationRuntimeError::Stage(error)))
+            }
         };
         self.begin_transaction(transaction, reservation)
     }
@@ -1328,16 +1413,40 @@ impl JournalMutationRuntime {
         self.source.complete_data(completion);
     }
 
-    fn layout_for(&self, mutation: &Ext4MutationPlan) -> Result<(MutationJournalLayout, Option<(Arc<JournalRing>, JournalRingReservation)>), JournalMutationRuntimeError> {
-        if let Some(layout) = &self.layout { return Ok((layout.clone(), None)); }
+    fn layout_for(
+        &self,
+        mutation: &Ext4MutationPlan,
+    ) -> Result<
+        (
+            MutationJournalLayout,
+            Option<(Arc<JournalRing>, JournalRingReservation)>,
+        ),
+        JournalMutationRuntimeError,
+    > {
+        if let Some(layout) = &self.layout {
+            return Ok((layout.clone(), None));
+        }
         let ring = self.ring.as_ref().expect("runtime has layout or ring");
-        let reservation = ring.reserve(mutation.metadata.len()).map_err(|_| JournalMutationRuntimeError::Busy(JournalTransactionStateError::Busy))?;
-        Ok((reservation.layout.clone(), Some((Arc::clone(ring), reservation))))
+        let reservation = ring
+            .reserve(mutation.metadata.len())
+            .map_err(|_| JournalMutationRuntimeError::Busy(JournalTransactionStateError::Busy))?;
+        Ok((
+            reservation.layout.clone(),
+            Some((Arc::clone(ring), reservation)),
+        ))
     }
 
-    fn begin_transaction(&self, transaction: PreparedJournalTransaction, reservation: Option<(Arc<JournalRing>, JournalRingReservation)>) -> Result<(), JournalMutationRuntimeError> {
+    fn begin_transaction(
+        &self,
+        transaction: PreparedJournalTransaction,
+        reservation: Option<(Arc<JournalRing>, JournalRingReservation)>,
+    ) -> Result<(), JournalMutationRuntimeError> {
         match reservation {
-            Some((ring, reservation)) => match self.source.begin_with_ring(transaction, Arc::clone(&ring), reservation.clone()) {
+            Some((ring, reservation)) => match self.source.begin_with_ring(
+                transaction,
+                Arc::clone(&ring),
+                reservation.clone(),
+            ) {
                 Ok(()) => Ok(()),
                 Err(error) => {
                     let _ = ring.complete(&reservation, false);
@@ -1345,11 +1454,18 @@ impl JournalMutationRuntime {
                 }
             },
             None => self.source.begin(transaction),
-        }.map_err(JournalMutationRuntimeError::Busy)
+        }
+        .map_err(JournalMutationRuntimeError::Busy)
     }
 
-    fn release_reservation(&self, reservation: Option<(Arc<JournalRing>, JournalRingReservation)>, error: JournalMutationRuntimeError) -> JournalMutationRuntimeError {
-        if let Some((ring, reservation)) = reservation { let _ = ring.complete(&reservation, false); }
+    fn release_reservation(
+        &self,
+        reservation: Option<(Arc<JournalRing>, JournalRingReservation)>,
+        error: JournalMutationRuntimeError,
+    ) -> JournalMutationRuntimeError {
+        if let Some((ring, reservation)) = reservation {
+            let _ = ring.complete(&reservation, false);
+        }
         error
     }
 }
@@ -1456,26 +1572,95 @@ mod tests {
         let first = ring.reserve(2).expect("reserve first record");
         assert_eq!(first.layout.sequence, 11);
         assert_eq!(first.layout.records.descriptor, LbaRange::new(41 * 8, 8));
-        assert_eq!(first.layout.records.metadata, vec![LbaRange::new(42 * 8, 8), LbaRange::new(50 * 8, 8)]);
+        assert_eq!(
+            first.layout.records.metadata,
+            vec![LbaRange::new(42 * 8, 8), LbaRange::new(50 * 8, 8)]
+        );
         assert_eq!(first.layout.records.commit, LbaRange::new(51 * 8, 8));
         assert_eq!(ring.reserve(1), Err(JournalRingError::Busy));
-        ring.complete(&first, true).expect("checkpoint releases record");
+        ring.complete(&first, true)
+            .expect("checkpoint releases record");
 
         let wrapped = ring.reserve(3).expect("reserve wrapped record");
         assert_eq!(wrapped.layout.sequence, 12);
         assert_eq!(wrapped.layout.records.descriptor, LbaRange::new(41 * 8, 8));
-        assert_eq!(wrapped.layout.records.metadata, vec![LbaRange::new(42 * 8, 8), LbaRange::new(50 * 8, 8), LbaRange::new(51 * 8, 8)]);
+        assert_eq!(
+            wrapped.layout.records.metadata,
+            vec![
+                LbaRange::new(42 * 8, 8),
+                LbaRange::new(50 * 8, 8),
+                LbaRange::new(51 * 8, 8)
+            ]
+        );
         assert_eq!(wrapped.layout.records.commit, LbaRange::new(52 * 8, 8));
-        ring.complete(&wrapped, false).expect("failed checkpoint retains record");
+        ring.complete(&wrapped, false)
+            .expect("failed checkpoint retains record");
 
         let retry = ring.reserve(3).expect("retry retains cursor and sequence");
-        assert_ne!(retry, wrapped, "retry must receive a fresh reservation identity");
+        assert_ne!(
+            retry, wrapped,
+            "retry must receive a fresh reservation identity"
+        );
         assert_eq!(
             ring.complete(&wrapped, true),
             Err(JournalRingError::ReservationMismatch)
         );
         ring.complete(&retry, true)
             .expect("current retry completes after stale completion rejection");
+    }
+
+    #[test]
+    fn journal_ring_reservation_prepares_activation_and_clean_superblock_pages() {
+        let superblock = Jbd2Superblock {
+            block_type: 4,
+            block_size: JBD2_BLOCK_SIZE as u32,
+            max_len: 8,
+            first: 1,
+            sequence: 11,
+            start: 0,
+            uuid: [0x3c; 16],
+        };
+        let mut superblock_page = [0; JBD2_BLOCK_SIZE];
+        superblock_page[..4].copy_from_slice(&tx_ext4_format::journal::JBD2_MAGIC.to_be_bytes());
+        superblock_page[4..8].copy_from_slice(&superblock.block_type.to_be_bytes());
+        superblock_page[8..12].copy_from_slice(&0u32.to_be_bytes());
+        superblock_page[12..16].copy_from_slice(&superblock.block_size.to_be_bytes());
+        superblock_page[16..20].copy_from_slice(&superblock.max_len.to_be_bytes());
+        superblock_page[20..24].copy_from_slice(&superblock.first.to_be_bytes());
+        superblock_page[24..28].copy_from_slice(&superblock.sequence.to_be_bytes());
+        superblock_page[28..32].copy_from_slice(&superblock.start.to_be_bytes());
+        superblock_page[48..64].copy_from_slice(&superblock.uuid);
+        let ring = JournalRing::new(
+            DeviceKey::new(9),
+            8,
+            JournalGeometry {
+                superblock,
+                blocks: vec![40, 41, 42, 50, 51, 52, 53, 54],
+                superblock_page: Some(superblock_page),
+            },
+        )
+        .unwrap();
+
+        let reservation = ring.reserve(1).unwrap();
+        let state = reservation.layout.superblock_state.as_ref().unwrap();
+
+        assert_eq!(state.lba, LbaRange::new(40 * 8, 8));
+        assert_eq!(
+            Jbd2Superblock::parse(&state.activate).unwrap(),
+            Jbd2Superblock {
+                sequence: 11,
+                start: 1,
+                ..superblock
+            }
+        );
+        assert_eq!(
+            Jbd2Superblock::parse(&state.clean).unwrap(),
+            Jbd2Superblock {
+                sequence: 12,
+                start: 0,
+                ..superblock
+            }
+        );
     }
 
     #[test]
