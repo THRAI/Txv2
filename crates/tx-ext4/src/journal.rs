@@ -950,14 +950,32 @@ impl JournalFsyncSource {
         Ok(graph)
     }
 
-    /// Release retained transaction leases only after checkpoint I/O completes.
-    pub fn complete_checkpoint(&self) -> Result<(), JournalTransactionStateError> {
+    /// Record one checkpoint graph terminal result.
+    ///
+    /// An I/O error leaves the committed transaction and its record leases
+    /// intact for a later checkpoint retry. Only a successful home-write graph
+    /// releases journal space.
+    pub fn complete_checkpoint_result(
+        &self,
+        result: Result<(), Errno>,
+    ) -> Result<(), JournalTransactionStateError> {
         let mut state = self.state.lock();
+        if !state.checkpoint_submitted {
+            return Err(JournalTransactionStateError::NotCommitted);
+        }
+        state.checkpoint_submitted = false;
+        if result.is_err() {
+            return Ok(());
+        }
         let _ = state.transaction.complete_checkpoint()?;
         state.data_submitted = None;
         state.commit_submitted = None;
-        state.checkpoint_submitted = false;
         Ok(())
+    }
+
+    /// Release retained transaction leases only after checkpoint I/O completes.
+    pub fn complete_checkpoint(&self) -> Result<(), JournalTransactionStateError> {
+        self.complete_checkpoint_result(Ok(()))
     }
 }
 

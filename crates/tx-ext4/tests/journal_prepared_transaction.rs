@@ -351,6 +351,13 @@ fn journal_source_commits_only_after_data_graph_completion() {
         .expect("durable commit exposes checkpoint")
         .is_some());
     assert!(source.take_checkpoint_graph().is_err());
+    source
+        .complete_checkpoint_result(Err(tx_subsystems::execution::Errno::EIO))
+        .expect("failed checkpoint remains retryable");
+    assert!(source
+        .take_checkpoint_graph()
+        .expect("failed checkpoint retries")
+        .is_some());
 }
 
 #[test]
