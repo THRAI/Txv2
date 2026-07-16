@@ -126,6 +126,10 @@ pub struct ReplayReport {
 pub struct JournalGeometry {
     pub superblock: Jbd2Superblock,
     pub blocks: Vec<u64>,
+    /// Original JBD2 superblock page, retained for a later state update.
+    /// Pure replay only needs parsed geometry; a writer needs this page to
+    /// preserve extension fields and regenerate its checksum.
+    pub superblock_page: Option<Page4K>,
 }
 
 pub struct Ext4Pager<I> {
@@ -210,7 +214,11 @@ impl<I: BlockImage> Ext4Pager<I> {
             return Err(Ext4FormatError::Corrupt);
         }
         blocks.truncate(max_len);
-        Ok(JournalGeometry { superblock, blocks })
+        Ok(JournalGeometry {
+            superblock,
+            blocks,
+            superblock_page: Some(superblock_page),
+        })
     }
 
     /// Read one inode once and return both its VFS metadata and inline extent

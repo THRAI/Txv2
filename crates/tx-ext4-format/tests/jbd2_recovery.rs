@@ -62,6 +62,7 @@ fn geometry() -> JournalGeometry {
             uuid: [0xA5; 16],
         },
         blocks: vec![40, 44, 48, 52, 56, 60, 64, 68],
+        superblock_page: None,
     }
 }
 

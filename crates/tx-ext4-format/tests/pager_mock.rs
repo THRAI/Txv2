@@ -852,6 +852,7 @@ fn pager_derives_journal_ring_from_journal_inode_mapping() {
     journal[24..28].copy_from_slice(&24u32.to_be_bytes());
     journal[28..32].copy_from_slice(&3u32.to_be_bytes());
     journal[48..64].copy_from_slice(&[0x6b; 16]);
+    let expected_journal_superblock_page = *image.block(40);
 
     let mut pager = Ext4Pager::open(image).expect("open journal image");
     let geometry = pager.journal_geometry().expect("derive journal geometry");
@@ -861,6 +862,10 @@ fn pager_derives_journal_ring_from_journal_inode_mapping() {
     assert_eq!(geometry.superblock.sequence, 24);
     assert_eq!(geometry.superblock.start, 3);
     assert_eq!(geometry.blocks.as_slice(), &[40, 41, 42, 50, 51, 52, 53, 54]);
+    assert_eq!(
+        geometry.superblock_page.as_ref(),
+        Some(&expected_journal_superblock_page)
+    );
 }
 
 fn assert_dir_entry(entry: &DirEntryLite, name: &[u8], inode: InodeNo, file_type: u8) {

@@ -290,6 +290,7 @@ fn journal_source_commits_only_after_data_graph_completion() {
                     uuid: [1; 16],
                 },
                 blocks: vec![9, 10, 11, 12, 13, 14, 15, 16],
+                superblock_page: None,
             },
         )
         .unwrap(),

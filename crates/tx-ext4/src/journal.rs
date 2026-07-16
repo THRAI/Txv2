@@ -1449,6 +1449,7 @@ mod tests {
                 uuid: [0x3c; 16],
             },
             blocks: vec![40, 41, 42, 50, 51, 52, 53, 54],
+            superblock_page: None,
         };
         let ring = JournalRing::new(DeviceKey::new(9), 8, geometry).expect("valid journal ring");
 
