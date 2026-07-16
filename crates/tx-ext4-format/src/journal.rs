@@ -10,6 +10,8 @@ use crate::{Ext4FormatError, Result};
 pub const JBD2_MAGIC: u32 = 0xC03B_3998;
 pub const JBD2_BLOCK_DESCRIPTOR: u32 = 1;
 pub const JBD2_BLOCK_COMMIT: u32 = 2;
+pub const JBD2_BLOCK_SUPERBLOCK_V1: u32 = 3;
+pub const JBD2_BLOCK_SUPERBLOCK_V2: u32 = 4;
 pub const JBD2_BLOCK_REVOKE: u32 = 5;
 pub const JBD2_BLOCK_SIZE: usize = 4096;
 
@@ -147,6 +149,58 @@ impl Jbd2Header {
         write_u32(bytes, 0, JBD2_MAGIC)?;
         write_u32(bytes, 4, self.block_type)?;
         write_u32(bytes, 8, self.sequence)
+    }
+}
+
+/// Immutable geometry recorded in JBD2's first journal-file block.
+///
+/// The journal inode supplies the physical mapping for this logical ring. This
+/// record only describes the ring's relative block indices; L5 owns its cursor
+/// and L6 owns submission and durability.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Jbd2Superblock {
+    pub block_type: u32,
+    pub block_size: u32,
+    pub max_len: u32,
+    pub first: u32,
+    pub sequence: u32,
+    pub start: u32,
+    pub uuid: [u8; 16],
+}
+
+impl Jbd2Superblock {
+    pub const ENCODED_LEN: usize = 64;
+
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        require_len(bytes, Self::ENCODED_LEN)?;
+        let header = Jbd2Header::parse(bytes)?;
+        if header.block_type != JBD2_BLOCK_SUPERBLOCK_V1
+            && header.block_type != JBD2_BLOCK_SUPERBLOCK_V2
+        {
+            return Err(Ext4FormatError::Unsupported);
+        }
+        let block_size = read_u32(bytes, 12)?;
+        if block_size != JBD2_BLOCK_SIZE as u32 {
+            return Err(Ext4FormatError::Unsupported);
+        }
+        let max_len = read_u32(bytes, 16)?;
+        let first = read_u32(bytes, 20)?;
+        let start = read_u32(bytes, 28)?;
+        if max_len <= 1 || first == 0 || first >= max_len {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        if start != 0 && (start < first || start >= max_len) {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        Ok(Self {
+            block_type: header.block_type,
+            block_size,
+            max_len,
+            first,
+            sequence: read_u32(bytes, 24)?,
+            start,
+            uuid: bytes[48..64].try_into().unwrap(),
+        })
     }
 }
 

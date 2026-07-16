@@ -818,6 +818,51 @@ fn mock_image() -> MemImage {
     image
 }
 
+#[test]
+fn pager_derives_journal_ring_from_journal_inode_mapping() {
+    let mut image = mock_image();
+    let mut journal_inode = Inode::default();
+    journal_inode.mode = 0x8000 | 0o600;
+    journal_inode.size = 8 * BLOCK_SIZE as u64;
+    journal_inode.blocks_512 = 64;
+    journal_inode.links_count = 1;
+    journal_inode.flags = Inode::EXTENTS_FL;
+    journal_inode
+        .set_extent_root(&[
+            Extent {
+                logical_block: 0,
+                len: 3,
+                physical_start: 40,
+            },
+            Extent {
+                logical_block: 3,
+                len: 5,
+                physical_start: 50,
+            },
+        ])
+        .unwrap();
+    write_inode(&mut image, 8, &journal_inode);
+    let journal = image.block_mut(40);
+    journal[..4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
+    journal[4..8].copy_from_slice(&4u32.to_be_bytes());
+    journal[8..12].copy_from_slice(&23u32.to_be_bytes());
+    journal[12..16].copy_from_slice(&(BLOCK_SIZE as u32).to_be_bytes());
+    journal[16..20].copy_from_slice(&8u32.to_be_bytes());
+    journal[20..24].copy_from_slice(&1u32.to_be_bytes());
+    journal[24..28].copy_from_slice(&24u32.to_be_bytes());
+    journal[28..32].copy_from_slice(&3u32.to_be_bytes());
+    journal[48..64].copy_from_slice(&[0x6b; 16]);
+
+    let mut pager = Ext4Pager::open(image).expect("open journal image");
+    let geometry = pager.journal_geometry().expect("derive journal geometry");
+
+    assert_eq!(geometry.superblock.max_len, 8);
+    assert_eq!(geometry.superblock.first, 1);
+    assert_eq!(geometry.superblock.sequence, 24);
+    assert_eq!(geometry.superblock.start, 3);
+    assert_eq!(geometry.blocks.as_slice(), &[40, 41, 42, 50, 51, 52, 53, 54]);
+}
+
 fn assert_dir_entry(entry: &DirEntryLite, name: &[u8], inode: InodeNo, file_type: u8) {
     assert_eq!(entry.name(), name);
     assert_eq!(entry.inode, inode);

@@ -6,6 +6,7 @@ use crate::ondisk::{
 };
 use crate::ondisk::{read_u16_le, read_u32_le, write_u16_le};
 use crate::{Ext4FormatError, Result};
+use crate::journal::Jbd2Superblock;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -116,6 +117,17 @@ pub struct ReplayReport {
     pub blocks_replayed: u32,
 }
 
+/// Physical mapping and immutable geometry of the mounted JBD2 journal file.
+///
+/// `blocks[logical]` identifies the ext4 physical block backing that journal
+/// ring block. Higher layers use this map to derive device LBAs without
+/// assuming that the journal inode is physically contiguous.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalGeometry {
+    pub superblock: Jbd2Superblock,
+    pub blocks: Vec<u64>,
+}
+
 pub struct Ext4Pager<I> {
     image: I,
     superblock: Superblock,
@@ -173,6 +185,32 @@ impl<I: BlockImage> Ext4Pager<I> {
 
     pub fn inode_meta(&mut self, inode: InodeNo) -> Result<InodeMetaLite> {
         self.read_inode(inode).map(inode_to_meta)
+    }
+
+    pub fn journal_geometry(&mut self) -> Result<JournalGeometry> {
+        let journal_inode = self.read_inode(InodeNo::new(self.superblock.journal_inode))?;
+        let logical_blocks = div_ceil_u64(journal_inode.size, BLOCK_SIZE as u64);
+        if logical_blocks < 2 || logical_blocks > u32::MAX as u64 {
+            return Err(Ext4FormatError::Unsupported);
+        }
+        let mut blocks = Vec::new();
+        for logical in 0..logical_blocks {
+            match self.resolve_inode_block(&journal_inode, logical as u32)? {
+                BlockMapping::Data(block) => blocks.push(block),
+                BlockMapping::Hole | BlockMapping::NeedNode(_) => {
+                    return Err(Ext4FormatError::Corrupt);
+                }
+            }
+        }
+        let mut superblock_page = [0; BLOCK_SIZE];
+        self.image.read_block(blocks[0], &mut superblock_page)?;
+        let superblock = Jbd2Superblock::parse(&superblock_page)?;
+        let max_len = superblock.max_len as usize;
+        if max_len > blocks.len() {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        blocks.truncate(max_len);
+        Ok(JournalGeometry { superblock, blocks })
     }
 
     /// Read one inode once and return both its VFS metadata and inline extent
