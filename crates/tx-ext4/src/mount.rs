@@ -13,7 +13,7 @@ use tx_subsystems::vfs::FsOps;
 
 use crate::journal::{JournalFsyncSource, JournalMutationRuntime, JournalMutationWriteSource, JournalPagePool};
 use crate::planner::{Ext4BlockGeometry, Ext4PlannerBinding};
-use tx_ext4_format::replay_journal;
+use tx_ext4_format::{clean_replayed_journal, replay_journal};
 pub use crate::read_backend::FilePageContainerBinder;
 use crate::read_backend::{
     map_inode_meta, Ext4FsInstance, Ext4PagerMutationPlanSource, EXT4_ROOT_INODE,
@@ -190,6 +190,8 @@ where
     let mut pager = Ext4Pager::open(image).map_err(|_| Errno::EIO)?;
     let journal_geometry = pager.journal_geometry().map_err(|_| Errno::EIO)?;
     let mut image = pager.into_inner();
+    clean_replayed_journal(&mut image, &journal_geometry, replay.next_sequence)
+        .map_err(|_| Errno::EIO)?;
     let replay = replay_journal(&mut image, &journal_geometry).map_err(|_| Errno::EIO)?;
     let source = Arc::new(JournalFsyncSource::new());
     let runtime = Arc::new(

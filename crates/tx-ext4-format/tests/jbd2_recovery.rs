@@ -1,9 +1,9 @@
 use tx_ext4_format::journal::{
     Jbd2MetadataUpdate, Jbd2Superblock, Jbd2TransactionImage, JBD2_BLOCK_SIZE,
-    JBD2_BLOCK_SUPERBLOCK_V2,
+    JBD2_BLOCK_SUPERBLOCK_V2, JBD2_MAGIC,
 };
 use tx_ext4_format::pager::{BlockImage, JournalGeometry, Page4K};
-use tx_ext4_format::{replay_journal, Ext4FormatError};
+use tx_ext4_format::{clean_replayed_journal, replay_journal, Ext4FormatError};
 
 #[derive(Clone)]
 struct MemImage {
@@ -64,6 +64,22 @@ fn geometry() -> JournalGeometry {
         blocks: vec![40, 44, 48, 52, 56, 60, 64, 68],
         superblock_page: None,
     }
+}
+
+fn geometry_with_superblock_page() -> JournalGeometry {
+    let mut geometry = geometry();
+    let superblock = &geometry.superblock;
+    let mut page = [0; JBD2_BLOCK_SIZE];
+    page[..4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
+    page[4..8].copy_from_slice(&superblock.block_type.to_be_bytes());
+    page[12..16].copy_from_slice(&superblock.block_size.to_be_bytes());
+    page[16..20].copy_from_slice(&superblock.max_len.to_be_bytes());
+    page[20..24].copy_from_slice(&superblock.first.to_be_bytes());
+    page[24..28].copy_from_slice(&superblock.sequence.to_be_bytes());
+    page[28..32].copy_from_slice(&superblock.start.to_be_bytes());
+    page[48..64].copy_from_slice(&superblock.uuid);
+    geometry.superblock_page = Some(page);
+    geometry
 }
 
 #[test]
@@ -134,4 +150,41 @@ fn replay_wraps_over_the_ring_tail() {
 
     assert_eq!(report.transactions, 1);
     assert_eq!(image.block(10), &after);
+}
+
+#[test]
+fn replay_cleanup_publishes_a_clean_superblock_for_the_next_mount() {
+    let geometry = geometry_with_superblock_page();
+    let mut image = MemImage::new(80);
+    let after = [0x4C; JBD2_BLOCK_SIZE];
+    let record = Jbd2TransactionImage::encode_legacy(
+        geometry.superblock.sequence,
+        geometry.superblock.uuid,
+        vec![Jbd2MetadataUpdate::new(9, after)],
+    )
+    .unwrap();
+    *image.block_mut(44) = record.descriptor;
+    *image.block_mut(48) = record.metadata_blocks[0];
+    *image.block_mut(52) = record.commit;
+
+    let replay = replay_journal(&mut image, &geometry).unwrap();
+    clean_replayed_journal(&mut image, &geometry, replay.next_sequence).unwrap();
+
+    let clean_page = *image.block(40);
+    let clean_superblock = Jbd2Superblock::parse(&clean_page).unwrap();
+    assert_eq!(clean_superblock.start, 0);
+    assert_eq!(clean_superblock.sequence, replay.next_sequence);
+
+    let clean_geometry = JournalGeometry {
+        superblock: clean_superblock,
+        blocks: geometry.blocks,
+        superblock_page: Some(clean_page),
+    };
+    assert_eq!(
+        replay_journal(&mut image, &clean_geometry)
+            .unwrap()
+            .transactions,
+        0,
+        "a subsequent mount must not rescan a transaction whose home blocks are durable"
+    );
 }

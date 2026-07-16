@@ -111,6 +111,26 @@ pub fn replay_journal<I: BlockImage>(
     })
 }
 
+/// Publish the clean journal state after replay has made recovered home blocks
+/// durable. This prevents the next mount from treating already checkpointed
+/// records as an active log.
+pub fn clean_replayed_journal<I: BlockImage>(
+    image: &mut I,
+    geometry: &JournalGeometry,
+    next_sequence: u32,
+) -> Result<()> {
+    validate_geometry(geometry)?;
+    let mut page = geometry
+        .superblock_page
+        .ok_or(Ext4FormatError::Unsupported)?;
+    geometry
+        .superblock
+        .write_state(&mut page, next_sequence.max(1), 0)?;
+    let superblock_block = *geometry.blocks.first().ok_or(Ext4FormatError::Corrupt)?;
+    image.write_block(superblock_block, &page)?;
+    image.barrier()
+}
+
 fn validate_geometry(geometry: &JournalGeometry) -> Result<()> {
     let max_len = geometry.superblock.max_len as usize;
     let first = geometry.superblock.first as usize;
