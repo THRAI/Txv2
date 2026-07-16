@@ -377,6 +377,23 @@ pub struct JournalPagePool {
 }
 
 impl JournalPagePool {
+    /// Pages needed to stage one owned mutation through checkpoint completion.
+    /// Metadata has one journal copy and one home-checkpoint copy; data is
+    /// staged only when it is not retained by an L4-owned source.
+    pub fn required_pages(
+        owned_data_pages: usize,
+        metadata_pages: usize,
+        has_superblock_state: bool,
+    ) -> Result<u64, JournalPagePoolError> {
+        let superblock_state_pages = usize::from(has_superblock_state) * 2;
+        let pages = owned_data_pages
+            .checked_add(metadata_pages.checked_mul(2).ok_or(JournalPagePoolError::Capacity)?)
+            .and_then(|pages| pages.checked_add(2))
+            .and_then(|pages| pages.checked_add(superblock_state_pages))
+            .ok_or(JournalPagePoolError::Capacity)?;
+        u64::try_from(pages).map_err(|_| JournalPagePoolError::Capacity)
+    }
+
     pub fn new(page_capacity: u64) -> Result<Self, JournalPagePoolError> {
         if tx_subsystems::vm::USER_PAGE_SIZE != JBD2_BLOCK_SIZE {
             return Err(JournalPagePoolError::UnsupportedPageSize);
@@ -393,6 +410,18 @@ impl JournalPagePool {
             next_page: AtomicU64::new(0),
             free: Arc::new(SpinMutex::new(Vec::new())),
         })
+    }
+
+    fn ensure_capacity(&self, required: u64) -> Result<(), JournalPagePoolError> {
+        let free = self.free.lock().len() as u64;
+        let fresh = self
+            .pages
+            .page_count()
+            .saturating_sub(self.next_page.load(Ordering::Acquire));
+        if free.saturating_add(fresh) < required {
+            return Err(JournalPagePoolError::Capacity);
+        }
+        Ok(())
     }
 
     pub fn stage(
@@ -919,6 +948,14 @@ impl PreparedJournalTransaction {
         {
             return Err(PreparedJournalTransactionError::Layout);
         }
+        let required_pages = JournalPagePool::required_pages(
+            0,
+            mutation.image.metadata_blocks.len(),
+            mutation.layout.superblock_state.is_some(),
+        )
+        .map_err(PreparedJournalTransactionError::Pool)?;
+        pool.ensure_capacity(required_pages)
+        .map_err(PreparedJournalTransactionError::Pool)?;
         let device = mutation.layout.device;
         let mut records = Vec::new();
         let mut data_writes = Vec::new();
@@ -996,6 +1033,14 @@ impl PreparedJournalTransaction {
         if mutation.layout.records.metadata.len() != mutation.image.metadata_blocks.len() {
             return Err(PreparedJournalTransactionError::Layout);
         }
+        let required_pages = JournalPagePool::required_pages(
+            mutation.data_writes.len(),
+            mutation.image.metadata_blocks.len(),
+            mutation.layout.superblock_state.is_some(),
+        )
+        .map_err(PreparedJournalTransactionError::Pool)?;
+        pool.ensure_capacity(required_pages)
+        .map_err(PreparedJournalTransactionError::Pool)?;
 
         let device = mutation.layout.device;
         let mut records = Vec::new();
@@ -1662,6 +1707,12 @@ mod tests {
         Ext4MutationPlan, FsyncStamp, MetaRole, MetadataBlock, MutationOrigin, SealedDataWrite,
     };
     use tx_ext4_format::pager::JournalGeometry;
+
+    #[test]
+    fn journal_pool_sizing_counts_owned_data_metadata_checkpoint_and_state_pages() {
+        assert_eq!(JournalPagePool::required_pages(1, 2, true).unwrap(), 9);
+        assert_eq!(JournalPagePool::required_pages(0, 1, false).unwrap(), 4);
+    }
 
     #[test]
     fn journal_ring_reservation_waits_for_checkpoint_and_wraps_without_crossing_tail() {
