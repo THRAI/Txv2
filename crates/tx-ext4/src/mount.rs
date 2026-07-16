@@ -190,9 +190,9 @@ where
     let mut pager = Ext4Pager::open(image).map_err(|_| Errno::EIO)?;
     let journal_geometry = pager.journal_geometry().map_err(|_| Errno::EIO)?;
     let mut image = pager.into_inner();
+    let replay = replay_journal(&mut image, &journal_geometry).map_err(|_| Errno::EIO)?;
     clean_replayed_journal(&mut image, &journal_geometry, replay.next_sequence)
         .map_err(|_| Errno::EIO)?;
-    let replay = replay_journal(&mut image, &journal_geometry).map_err(|_| Errno::EIO)?;
     let source = Arc::new(JournalFsyncSource::new());
     let runtime = Arc::new(
         JournalMutationRuntime::from_geometry_with_sequence(
