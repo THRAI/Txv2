@@ -563,6 +563,19 @@ impl JournalRing {
         sectors_per_block: u64,
         geometry: JournalGeometry,
     ) -> Result<Self, JournalRingError> {
+        let sequence = geometry.superblock.sequence;
+        Self::with_sequence(device, sectors_per_block, geometry, sequence)
+    }
+
+    /// Construct a ring after mount-time replay has established the next
+    /// transaction sequence. The record cursor is clean because replayed
+    /// home blocks have been checkpointed before this runtime is exposed.
+    pub fn with_sequence(
+        device: DeviceKey,
+        sectors_per_block: u64,
+        geometry: JournalGeometry,
+        sequence: u32,
+    ) -> Result<Self, JournalRingError> {
         if sectors_per_block == 0 {
             return Err(JournalRingError::ZeroSectorsPerBlock);
         }
@@ -587,7 +600,7 @@ impl JournalRing {
             first,
             state: SpinMutex::new(JournalRingState {
                 cursor: first,
-                sequence: geometry.superblock.sequence,
+                sequence: sequence.max(1),
                 next_reservation_id: 1,
                 active: None,
             }),
@@ -1422,10 +1435,27 @@ impl JournalMutationRuntime {
         sectors_per_block: u64,
         geometry: JournalGeometry,
     ) -> Result<Self, JournalRingError> {
+        let sequence = geometry.superblock.sequence;
+        Self::from_geometry_with_sequence(source, pool, device, sectors_per_block, geometry, sequence)
+    }
+
+    pub fn from_geometry_with_sequence(
+        source: Arc<JournalFsyncSource>,
+        pool: JournalPagePool,
+        device: DeviceKey,
+        sectors_per_block: u64,
+        geometry: JournalGeometry,
+        sequence: u32,
+    ) -> Result<Self, JournalRingError> {
         Ok(Self::with_ring(
             source,
             pool,
-            Arc::new(JournalRing::new(device, sectors_per_block, geometry)?),
+            Arc::new(JournalRing::with_sequence(
+                device,
+                sectors_per_block,
+                geometry,
+                sequence,
+            )?),
         ))
     }
 
