@@ -20,6 +20,18 @@ fn setup() {
     tx_subsystems::zones::register_all().expect("kernel zones");
 }
 
+#[test]
+fn journal_page_pool_reuses_record_page_after_lease_drop() {
+    setup();
+    let pool = JournalPagePool::new(1).unwrap();
+    let guard = tx_substrate::epoch::guard();
+    let first = pool.stage(&[0; JBD2_BLOCK_SIZE], &guard).unwrap();
+    let page = first.page();
+    drop(first);
+    let second = pool.stage(&[1; JBD2_BLOCK_SIZE], &guard).unwrap();
+    assert_eq!(second.page(), page);
+}
+
 #[derive(Clone)]
 struct FixedMutationPlan(Ext4MutationPlan);
 

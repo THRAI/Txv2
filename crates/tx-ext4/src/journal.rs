@@ -288,6 +288,13 @@ pub enum JournalPagePoolError {
 pub struct JournalRecordLease {
     page: PageIndex,
     lease: PageLease,
+    free: Arc<SpinMutex<Vec<PageIndex>>>,
+}
+
+impl Drop for JournalRecordLease {
+    fn drop(&mut self) {
+        self.free.lock().push(self.page);
+    }
 }
 
 impl JournalRecordLease {
@@ -328,6 +335,7 @@ impl JournalRecordLease {
 pub struct JournalPagePool {
     pages: Cap<PageContainer>,
     next_page: AtomicU64,
+    free: Arc<SpinMutex<Vec<PageIndex>>>,
 }
 
 impl JournalPagePool {
@@ -345,6 +353,7 @@ impl JournalPagePool {
         Ok(Self {
             pages,
             next_page: AtomicU64::new(0),
+            free: Arc::new(SpinMutex::new(Vec::new())),
         })
     }
 
@@ -353,7 +362,7 @@ impl JournalPagePool {
         bytes: &[u8; JBD2_BLOCK_SIZE],
         guard: &Guard<'_>,
     ) -> Result<JournalRecordLease, JournalPagePoolError> {
-        let page = PageIndex::new(self.next_page.fetch_add(1, Ordering::AcqRel));
+        let page = self.free.lock().pop().unwrap_or_else(|| PageIndex::new(self.next_page.fetch_add(1, Ordering::AcqRel)));
         if page.as_u64() >= self.pages.page_count() {
             return Err(JournalPagePoolError::Capacity);
         }
@@ -372,11 +381,13 @@ impl JournalPagePool {
         drop(materialized);
 
         match self.pages.export_page_lease(page, guard) {
-            StepOutcome::Done(lease) => Ok(JournalRecordLease { page, lease }),
-            StepOutcome::Err(errno) => Err(JournalPagePoolError::Page(PageCacheError::Backend(
-                errno.into(),
-            ))),
+            StepOutcome::Done(lease) => Ok(JournalRecordLease { page, lease, free: Arc::clone(&self.free) }),
+            StepOutcome::Err(errno) => {
+                self.free.lock().push(page);
+                Err(JournalPagePoolError::Page(PageCacheError::Backend(errno.into())))
+            }
             StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
+                self.free.lock().push(page);
                 Err(JournalPagePoolError::WouldBlock)
             }
         }
