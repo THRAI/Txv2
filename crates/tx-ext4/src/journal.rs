@@ -73,6 +73,8 @@ pub struct JournalTransactionPlan {
     metadata_writes: Vec<JournalBio>,
     commit: JournalBio,
     checkpoint_writes: Vec<JournalBio>,
+    activation: Option<JournalBio>,
+    clean: Option<JournalBio>,
 }
 
 impl JournalTransactionPlan {
@@ -96,9 +98,17 @@ impl JournalTransactionPlan {
             metadata_writes,
             commit,
             checkpoint_writes,
+            activation: None,
+            clean: None,
         };
         plan.validate()?;
         Ok(plan)
+    }
+
+    pub fn with_superblock_state(mut self, activation: JournalBio, clean: JournalBio) -> Self {
+        self.activation = Some(activation);
+        self.clean = Some(clean);
+        self
     }
 
     pub const fn sequence(&self) -> u32 {
@@ -127,7 +137,16 @@ impl JournalTransactionPlan {
     /// after [`Self::data_graph`] has completed successfully.
     pub fn commit_graph_after_data(&self) -> Result<BackendBioGraph, JournalTransactionPlanError> {
         let mut builder = GraphBuilder::new();
+        let activation_fence = self.activation.as_ref().map(|activation| {
+            let activation = builder.push(activation.clone())?;
+            let fence = builder.push(fence(self.device))?;
+            builder.depends_on(activation, fence);
+            Ok::<_, JournalTransactionPlanError>(fence)
+        }).transpose()?;
         let descriptor = builder.push(self.descriptor.clone())?;
+        if let Some(activation_fence) = activation_fence {
+            builder.depends_on(activation_fence, descriptor);
+        }
         let mut journal_ids = Vec::new();
         journal_ids.push(descriptor);
         for write in &self.metadata_writes {
@@ -161,7 +180,15 @@ impl JournalTransactionPlan {
         }
 
         let descriptor = builder.push(self.descriptor.clone())?;
-        builder.depends_on(data_fence, descriptor);
+        if let Some(activation) = &self.activation {
+            let activation = builder.push(activation.clone())?;
+            builder.depends_on(data_fence, activation);
+            let activation_fence = builder.push(fence(self.device))?;
+            builder.depends_on(activation, activation_fence);
+            builder.depends_on(activation_fence, descriptor);
+        } else {
+            builder.depends_on(data_fence, descriptor);
+        }
         let mut journal_ids = Vec::new();
         journal_ids.push(descriptor);
         for write in &self.metadata_writes {
@@ -190,12 +217,23 @@ impl JournalTransactionPlan {
     pub fn checkpoint_graph_after_commit(
         &self,
     ) -> Result<Option<BackendBioGraph>, JournalTransactionPlanError> {
-        if self.checkpoint_writes.is_empty() {
+        if self.checkpoint_writes.is_empty() && self.clean.is_none() {
             return Ok(None);
         }
         let mut builder = GraphBuilder::new();
+        let mut home_ids = Vec::new();
         for write in &self.checkpoint_writes {
-            builder.push(write.clone())?;
+            home_ids.push(builder.push(write.clone())?);
+        }
+        if let Some(clean) = &self.clean {
+            let fence = builder.push(fence(self.device))?;
+            for home in home_ids {
+                builder.depends_on(home, fence);
+            }
+            let mut clean = clean.clone();
+            clean.plan.flags = clean.plan.flags.union(BlockFlags::FUA);
+            let clean = builder.push(clean)?;
+            builder.depends_on(fence, clean);
         }
         builder.finish().map(Some)
     }
