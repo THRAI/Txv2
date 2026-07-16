@@ -1166,6 +1166,17 @@ impl Ext4FsyncPlanSource for JournalFsyncSource {
             }
         }
     }
+
+    fn take_background_graph(&self) -> Result<Option<BackendBioGraph>, Errno> {
+        self.take_checkpoint_graph().map_err(|error| match error {
+            JournalTransactionStateError::Busy => Errno::EBUSY,
+            _ => Errno::EIO,
+        })
+    }
+
+    fn complete_background_graph(&self, result: Result<(), Errno>) {
+        let _ = self.complete_checkpoint_result(result);
+    }
 }
 
 impl Ext4FsyncPlanSource for Arc<JournalFsyncSource> {
@@ -1175,6 +1186,14 @@ impl Ext4FsyncPlanSource for Arc<JournalFsyncSource> {
 
     fn complete_fsync(&self, completion: BackendPageCompletion) {
         self.as_ref().complete_fsync(completion);
+    }
+
+    fn take_background_graph(&self) -> Result<Option<BackendBioGraph>, Errno> {
+        self.as_ref().take_background_graph()
+    }
+
+    fn complete_background_graph(&self, result: Result<(), Errno>) {
+        self.as_ref().complete_background_graph(result);
     }
 }
 

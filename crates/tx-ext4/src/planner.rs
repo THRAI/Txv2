@@ -6,7 +6,7 @@ use alloc::vec;
 
 use tx_subsystems::execution::{Errno, Guard};
 use tx_subsystems::fs_iface::{
-    BackendPageCompletion, BackendPageRequest, BackendPlan, BackendPlanner, BioPlanList,
+    BackendBioGraph, BackendPageCompletion, BackendPageRequest, BackendPlan, BackendPlanner, BioPlanList,
     IoDataSource, IoDataTarget, PageCompletion, PageCompletionList, PageFrameRef, PagerResumeToken,
 };
 use tx_subsystems::io_manager::block::{BioPlan, BioVec, BlockFlags, BlockOp, DeviceKey, LbaRange};
@@ -62,6 +62,12 @@ pub trait Ext4FsyncPlanSource: Send + Sync + 'static {
     fn plan_fsync(&self, request: &BackendPageRequest) -> BackendPlan;
 
     fn complete_fsync(&self, _completion: BackendPageCompletion) {}
+
+    fn take_background_graph(&self) -> Result<Option<BackendBioGraph>, Errno> {
+        Ok(None)
+    }
+
+    fn complete_background_graph(&self, _result: Result<(), Errno>) {}
 }
 
 /// Ext4-owned writeback planning for one L4-retained data source.
@@ -418,6 +424,21 @@ impl<S: Ext4ReadMappingSource, J: Ext4FsyncPlanSource, W: Ext4WritePlanSource> B
             }
             _ => {}
         }
+    }
+
+    fn take_background_graph(
+        &self,
+        _object: tx_subsystems::fs_iface::FsObjectKey,
+    ) -> Result<Option<BackendBioGraph>, Errno> {
+        self.fsync.take_background_graph()
+    }
+
+    fn complete_background_graph(
+        &self,
+        _object: tx_subsystems::fs_iface::FsObjectKey,
+        result: Result<(), Errno>,
+    ) {
+        self.fsync.complete_background_graph(result);
     }
 }
 

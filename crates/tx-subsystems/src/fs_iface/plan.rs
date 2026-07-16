@@ -563,6 +563,16 @@ pub trait BackendPlanner: Send + Sync + 'static {
     }
 
     fn complete_page_io(&self, _completion: BackendPageCompletion) {}
+
+    /// Yield one backend-owned graph that became runnable after a terminal
+    /// request completion. L4 submits it through its existing block runtime.
+    fn take_background_graph(&self, _object: FsObjectKey) -> Result<Option<BackendBioGraph>, Errno> {
+        Ok(None)
+    }
+
+    /// Report terminal execution of a graph returned by
+    /// [`Self::take_background_graph`].
+    fn complete_background_graph(&self, _object: FsObjectKey, _result: Result<(), Errno>) {}
 }
 
 #[cfg(test)]
