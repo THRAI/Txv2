@@ -173,6 +173,7 @@ where
         JournalMutationWriteSource::new(mutation_provider.clone(), runtime),
     );
     let mounted = open_ext4_with_planner_binding(image, false, binding)?;
+    mounted.backend.disable_legacy_writeback();
     mutation_provider.bind(&mounted.backend);
     Ok(mounted)
 }

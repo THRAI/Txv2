@@ -104,6 +104,10 @@ pub(crate) struct Ext4FsInstance<I> {
     /// `mount_ext4_read_write` entry point clears it. Matches
     /// Linux's `MS_RDONLY` semantics.
     read_only: AtomicBool,
+    /// Mutation-journal mounts must submit writeback through their bound L5
+    /// planner. The compatibility pager would otherwise update home blocks
+    /// before the ordered transaction is committed.
+    legacy_writeback_enabled: AtomicBool,
 }
 
 impl<I: BlockImage> Ext4FsInstance<I> {
@@ -135,6 +139,7 @@ impl<I: BlockImage> Ext4FsInstance<I> {
             mount_pin: SpinMutex::new(None),
             file_page_container_binder: SpinMutex::new(None),
             read_only: AtomicBool::new(read_only),
+            legacy_writeback_enabled: AtomicBool::new(true),
         }))
     }
 
@@ -165,6 +170,15 @@ impl<I: BlockImage> Ext4FsInstance<I> {
     /// consult this and short-circuit with `EROFS`.
     pub(crate) fn is_read_only(&self) -> bool {
         self.read_only.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn disable_legacy_writeback(&self) {
+        self.legacy_writeback_enabled
+            .store(false, Ordering::Release);
+    }
+
+    pub(crate) fn legacy_writeback_enabled(&self) -> bool {
+        self.legacy_writeback_enabled.load(Ordering::Acquire)
     }
 
     pub(crate) fn with_pager<T>(

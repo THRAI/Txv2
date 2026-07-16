@@ -132,6 +132,9 @@ where
         frame: &Frame,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
+        if !self.legacy_writeback_enabled() {
+            return StepOutcome::err(Errno::ENOSYS.into());
+        }
         if !offset.is_multiple_of(BLOCK_SIZE as u64) {
             return StepOutcome::err(Errno::EINVAL.into());
         }
@@ -171,6 +174,9 @@ where
         _fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
+        if !self.legacy_writeback_enabled() {
+            return StepOutcome::err(Errno::ENOSYS.into());
+        }
         StepOutcome::done(())
     }
 

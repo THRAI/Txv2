@@ -150,6 +150,7 @@ fn build_image() -> MemImage {
     let sb = Superblock {
         inodes_count: 64,
         blocks_count: 64,
+        free_blocks_count: 32,
         log_block_size: 2,
         blocks_per_group: 64,
         inodes_per_group: 64,
@@ -247,7 +248,7 @@ fn ext4_mutation_mount_stages_hole_writeback_at_l4_admission() {
     let fsync = Arc::new(JournalFsyncSource::new());
     let runtime = Arc::new(JournalMutationRuntime::new(
         Arc::clone(&fsync),
-        JournalPagePool::new(6).expect("journal pool"),
+        JournalPagePool::new(10).expect("journal pool"),
         MutationJournalLayout::new(
             DeviceKey::new(7),
             8,
@@ -258,8 +259,10 @@ fn ext4_mutation_mount_stages_hole_writeback_at_l4_admission() {
                 alloc::vec![
                     tx_subsystems::io_manager::block::LbaRange::new(88, 8),
                     tx_subsystems::io_manager::block::LbaRange::new(96, 8),
+                    tx_subsystems::io_manager::block::LbaRange::new(104, 8),
+                    tx_subsystems::io_manager::block::LbaRange::new(112, 8),
                 ],
-                tx_subsystems::io_manager::block::LbaRange::new(104, 8),
+                tx_subsystems::io_manager::block::LbaRange::new(120, 8),
             ),
         ),
     ));
@@ -312,6 +315,19 @@ fn ext4_mutation_mount_stages_hole_writeback_at_l4_admission() {
         fsync.plan_fsync(&fsync_request),
         BackendPlan::SubmitGraph(_)
     ));
+
+    let backing = mounted.fs_page_backing();
+    let frame = tx_subsystems::page_backed::Frame::new(
+        page_allocator::zero_frame_ppn().expect("zero frame"),
+    );
+    assert_eq!(
+        backing.flush_page(FsObjectId::new(12), 0, &frame, &guard),
+        V3::<(), NoProgress>::err(V3Errno::ENOSYS)
+    );
+    assert_eq!(
+        backing.fsync_file(FsObjectId::new(12), &guard),
+        V3::<(), NoProgress>::err(V3Errno::ENOSYS)
+    );
 }
 
 #[test]
