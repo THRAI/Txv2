@@ -1190,31 +1190,45 @@ impl<P: TxPlatform> CoreInit<P> {
     /// already populated, `/dev` already created in tmpfs) and precede
     /// `bind_init_cwd_and_root`.
     pub(crate) fn mount_sdcard_at_musl() {
-        use tx_fs::tx_ext4::{mount_ext4_read_write, BlockDeviceImage, Ext4FileIoRuntimeBinder};
+        use tx_fs::tx_ext4::{
+            mount_ext4_read_write_with_discovered_journal, BlockDeviceImage,
+            Ext4FileIoRuntimeBinder, JournalPagePool,
+        };
         use tx_subsystems::device::{block_device_by_name, BlockDeviceHandle};
+        use tx_subsystems::io_manager::block::DeviceKey;
 
         let Some(reg) = block_device_by_name(b"vda") else {
             return;
         };
 
+        let device = DeviceKey::new(reg.devt.raw());
         let image = BlockDeviceImage::new(reg.ops);
-        // Mount read-write so test binaries that create or write to
-        // files under `/musl/musl/basic/` (test_mmap, test_munmap,
-        // test_mkdir, test_openat with O_CREAT, …) don't fall to
-        // -EROFS at every mutation. The ext4 backend's RW path is
-        // wired (`create_inode`/`mkdir`/`unlink` go through the
-        // pager's direct-write path per the 2026-05-13 trail); the
-        // only RW gap is `flush_page` (returns -ENOSYS), which
-        // affects long-running persistence but not the per-syscall
-        // contract these basic tests check.
-        let mount_output = match mount_ext4_read_write(image) {
-            Ok(out) => out,
+        let Some(geometry) = image.block_geometry(device) else {
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":mount:sdcard:ext4:err\n");
+            return;
+        };
+        // The pool holds the active ordered transaction's descriptor, commit,
+        // metadata journal copies, and later home-block checkpoint copies.
+        // Ext4Pager currently supports at most four inline extent mutations,
+        // so 32 pages leaves headroom without allowing unbounded staging.
+        let pool = match JournalPagePool::new(32) {
+            Ok(pool) => pool,
             Err(_) => {
                 Self::write_board_sentinel_prefix();
                 tx_hal::console_write_str::<P>(":mount:sdcard:ext4:err\n");
                 return;
             }
         };
+        let mount_output =
+            match mount_ext4_read_write_with_discovered_journal(image, geometry, device, pool) {
+                Ok(out) => out,
+                Err(_) => {
+                    Self::write_board_sentinel_prefix();
+                    tx_hal::console_write_str::<P>(":mount:sdcard:ext4:err\n");
+                    return;
+                }
+            };
         mount_output.set_file_page_container_binder(Some(alloc::sync::Arc::new(
             Ext4FileIoRuntimeBinder::new(BlockDeviceHandle::whole(reg)),
         )));
@@ -1255,7 +1269,7 @@ impl<P: TxPlatform> CoreInit<P> {
         .expect("mount_sdcard_at_musl: /musl dentry-on-rootfs reservation");
 
         // Build the ext4 mount payload.
-        let ext4_payload = MountPayload::new_cap(
+        let ext4_payload = MountPayload::new_cap_with_backend_planner(
             mount_output.fs_ops().clone(),
             mount_output.fs_page_backing().clone(),
             None,
@@ -1263,6 +1277,7 @@ impl<P: TxPlatform> CoreInit<P> {
             MountOptions::default(),
             "ext4",
             SourceLabel::Static("vda"),
+            mount_output.backend_planner(),
         )
         .expect("mount_sdcard_at_musl: ext4 payload reservation");
 
