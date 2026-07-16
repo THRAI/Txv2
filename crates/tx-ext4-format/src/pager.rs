@@ -1,9 +1,9 @@
 use crate::journal::Jbd2Superblock;
 use crate::ondisk::{
-    crc32c, encode_dir_entry, encode_journal_commit, encode_journal_descriptor,
-    parse_journal_descriptor, BitmapMut, BitmapView, BlockMapping, CommitHeader, DirEntry,
-    DirEntryIter, Extent, ExtentIdx, ExtentNode, GroupDesc, Inode, InodeLocation, InodeTableLayout,
-    Superblock,
+    crc32c, encode_dir_entry, encode_journal_commit, encode_journal_descriptor, group_desc_csum16,
+    parse_journal_descriptor, superblock_csum32, BitmapMut, BitmapView, BlockMapping, CommitHeader,
+    DirEntry, DirEntryIter, Extent, ExtentIdx, ExtentNode, GroupDesc, Inode, InodeLocation,
+    InodeTableLayout, Superblock,
 };
 use crate::ondisk::{read_u16_le, read_u32_le, write_u16_le};
 use crate::{Ext4FormatError, Result};
@@ -430,9 +430,6 @@ impl<I: BlockImage> Ext4Pager<I> {
     }
 
     fn plan_group_free_block_decrement(&self, group_index: usize) -> Result<(u64, Page4K, Page4K)> {
-        if self.superblock.has_metadata_csum() {
-            return Err(Ext4FormatError::Unsupported);
-        }
         let desc_size = self.superblock.group_desc_size();
         let byte_offset = group_index
             .checked_mul(desc_size)
@@ -461,13 +458,20 @@ impl<I: BlockImage> Ext4Pager<I> {
         if desc_size >= 64 {
             after[offset + 44..offset + 46].copy_from_slice(&((next >> 16) as u16).to_le_bytes());
         }
+        if self.superblock.has_metadata_csum() {
+            after[offset + 30..offset + 32].fill(0);
+            let group_id = u32::try_from(group_index).map_err(|_| Ext4FormatError::OutOfBounds)?;
+            let checksum = group_desc_csum16(
+                self.superblock.metadata_csum_seed(),
+                group_id,
+                &after[offset..offset + desc_size],
+            );
+            after[offset + 30..offset + 32].copy_from_slice(&checksum.to_le_bytes());
+        }
         Ok((home, before, after))
     }
 
     fn plan_superblock_free_block_decrement(&self) -> Result<(u64, Page4K, Page4K)> {
-        if self.superblock.has_metadata_csum() {
-            return Err(Ext4FormatError::Unsupported);
-        }
         let mut before = [0u8; BLOCK_SIZE];
         self.image.read_block(0, &mut before)?;
         let observed = Superblock::parse(&before[1024..2048])?;
@@ -478,6 +482,12 @@ impl<I: BlockImage> Ext4Pager<I> {
         let mut after = before;
         after[1024 + 12..1024 + 16].copy_from_slice(&(next as u32).to_le_bytes());
         after[1024 + 0x158..1024 + 0x15c].copy_from_slice(&((next >> 32) as u32).to_le_bytes());
+        if observed.has_metadata_csum() {
+            let superblock = &mut after[1024..2048];
+            superblock[1020..1024].fill(0);
+            let checksum = superblock_csum32(superblock)?;
+            superblock[1020..1024].copy_from_slice(&checksum.to_le_bytes());
+        }
         Ok((0, before, after))
     }
 

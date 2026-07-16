@@ -1,9 +1,10 @@
 use tx_ext4_format::mutation::{FsyncStamp, MutationOrigin};
 use tx_ext4_format::ondisk::{
-    crc32c, crc32c_append, metadata_csum32, BitmapMut, BitmapView, CommitHeader, DirEntryIter,
-    DxCountLimit, DxEntry, DxEntryIter, DxRootInfo, Ext4FormatError, Extent, ExtentHeader,
-    ExtentIdx, ExtentNode, GroupDesc, Inode, JournalBlockTag, JournalHeader, Superblock,
-    JBD2_BLOCK_COMMIT, JBD2_BLOCK_DESCRIPTOR, JBD2_MAGIC,
+    crc32c, crc32c_append, group_desc_csum16, metadata_csum32, superblock_csum32, BitmapMut,
+    BitmapView, CommitHeader, DirEntryIter, DxCountLimit, DxEntry, DxEntryIter, DxRootInfo,
+    Ext4FormatError, Extent, ExtentHeader, ExtentIdx, ExtentNode, GroupDesc, Inode,
+    JournalBlockTag, JournalHeader, Superblock, JBD2_BLOCK_COMMIT, JBD2_BLOCK_DESCRIPTOR,
+    JBD2_MAGIC,
 };
 use tx_ext4_format::pager::{
     BlockImage, DirEntryLite, Ext4Pager, InodeMetaLite, InodeNo, PageRead, WritebackReceipt,
@@ -436,7 +437,7 @@ fn pager_plans_hole_write_with_bitmap_and_inode_after_images() {
 }
 
 #[test]
-fn pager_rejects_hole_plan_when_metadata_checksum_after_images_are_unsupported() {
+fn pager_plans_metadata_checksum_after_images_for_hole_write() {
     let mut image = mock_image();
     let mut superblock = Superblock::parse(&image.block(0)[1024..2048]).unwrap();
     superblock.feature_ro_compat |= Superblock::FEATURE_RO_COMPAT_METADATA_CSUM;
@@ -445,11 +446,32 @@ fn pager_rejects_hole_plan_when_metadata_checksum_after_images_are_unsupported()
         .unwrap();
     let mut pager = Ext4Pager::open(image).unwrap();
 
+    let plan = pager
+        .plan_write_page(InodeNo::new(12), 4, &filled_page(0xD4), FsyncStamp::new(12))
+        .unwrap();
+    let group_desc = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::GroupDescriptor)
+        .unwrap();
+    let mut desc_bytes = group_desc.after[..32].to_vec();
+    let stored_desc_checksum = u16::from_le_bytes(desc_bytes[30..32].try_into().unwrap());
+    desc_bytes[30..32].fill(0);
+    let seed = crc32c_append(0xFFFF_FFFF, &superblock.uuid);
     assert_eq!(
-        pager
-            .plan_write_page(InodeNo::new(12), 4, &filled_page(0xD4), FsyncStamp::new(12),)
-            .unwrap_err(),
-        Ext4FormatError::Unsupported
+        stored_desc_checksum,
+        group_desc_csum16(seed, 0, &desc_bytes)
+    );
+
+    let superblock = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::Superblock)
+        .unwrap();
+    let bytes = &superblock.after[1024..2048];
+    assert_eq!(
+        u32::from_le_bytes(bytes[1020..1024].try_into().unwrap()),
+        superblock_csum32(bytes).unwrap()
     );
 }
 

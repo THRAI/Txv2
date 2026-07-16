@@ -40,6 +40,7 @@ pub struct Superblock {
 impl Superblock {
     pub const FEATURE_INCOMPAT_EXTENTS: u32 = 0x0040;
     pub const FEATURE_INCOMPAT_64BIT: u32 = 0x0080;
+    pub const FEATURE_INCOMPAT_CSUM_SEED: u32 = 0x2000;
     pub const FEATURE_RO_COMPAT_HUGE_FILE: u32 = 0x0008;
     pub const FEATURE_RO_COMPAT_METADATA_CSUM: u32 = 0x0400;
 
@@ -137,6 +138,14 @@ impl Superblock {
 
     pub fn has_metadata_csum(&self) -> bool {
         self.feature_ro_compat & Self::FEATURE_RO_COMPAT_METADATA_CSUM != 0
+    }
+
+    pub fn metadata_csum_seed(&self) -> u32 {
+        if self.feature_incompat & Self::FEATURE_INCOMPAT_CSUM_SEED != 0 {
+            self.checksum_seed
+        } else {
+            crc32c_append(0xFFFF_FFFF, &self.uuid)
+        }
     }
 }
 
