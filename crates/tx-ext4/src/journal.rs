@@ -11,7 +11,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use tx_ext4_format::journal::{Jbd2MetadataUpdate, Jbd2TransactionImage, JBD2_BLOCK_SIZE};
 use tx_ext4_format::mutation::Ext4MutationPlan;
-use tx_ext4_format::pager::Page4K;
+use tx_ext4_format::pager::{JournalGeometry, Page4K};
 use tx_ext4_format::Ext4FormatError;
 use tx_substrate::zone::Cap;
 use tx_subsystems::execution::{Errno, Guard, StepOutcome};
@@ -435,6 +435,153 @@ impl MutationJournalLayout {
             .checked_mul(self.sectors_per_block)
             .ok_or(MutationJournalImageError::LbaOverflow)?;
         Ok(LbaRange::new(start_lba, self.sectors_per_block))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JournalRingError {
+    InvalidGeometry,
+    ZeroSectorsPerBlock,
+    EmptyMetadata,
+    TooLarge,
+    LbaOverflow,
+    Busy,
+    Missing,
+    ReservationMismatch,
+}
+
+/// One journal record range retained until its checkpoint terminal result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JournalRingReservation {
+    pub layout: MutationJournalLayout,
+    id: u64,
+    end: usize,
+}
+
+struct JournalRingState {
+    cursor: usize,
+    sequence: u32,
+    next_reservation_id: u64,
+    active: Option<JournalRingReservation>,
+}
+
+/// Mount-owned allocator for the logical JBD2 journal ring.
+///
+/// The ring grants at most one record at a time. That is intentional for the
+/// current single-open-transaction runtime: a record is not reusable until its
+/// home-block checkpoint succeeds, so allocation cannot outrun reclamation.
+pub struct JournalRing {
+    device: DeviceKey,
+    sectors_per_block: u64,
+    journal_uuid: [u8; 16],
+    blocks: Vec<u64>,
+    first: usize,
+    state: SpinMutex<JournalRingState>,
+}
+
+impl JournalRing {
+    pub fn new(
+        device: DeviceKey,
+        sectors_per_block: u64,
+        geometry: JournalGeometry,
+    ) -> Result<Self, JournalRingError> {
+        if sectors_per_block == 0 {
+            return Err(JournalRingError::ZeroSectorsPerBlock);
+        }
+        let max_len = geometry.superblock.max_len as usize;
+        let first = geometry.superblock.first as usize;
+        if max_len != geometry.blocks.len() || max_len < 2 || first == 0 || first >= max_len {
+            return Err(JournalRingError::InvalidGeometry);
+        }
+        Ok(Self {
+            device,
+            sectors_per_block,
+            journal_uuid: geometry.superblock.uuid,
+            blocks: geometry.blocks,
+            first,
+            state: SpinMutex::new(JournalRingState {
+                cursor: first,
+                sequence: geometry.superblock.sequence,
+                next_reservation_id: 1,
+                active: None,
+            }),
+        })
+    }
+
+    pub fn reserve(
+        &self,
+        metadata_blocks: usize,
+    ) -> Result<JournalRingReservation, JournalRingError> {
+        if metadata_blocks == 0 {
+            return Err(JournalRingError::EmptyMetadata);
+        }
+        let record_blocks = metadata_blocks
+            .checked_add(2)
+            .ok_or(JournalRingError::TooLarge)?;
+        if record_blocks > self.blocks.len() - self.first {
+            return Err(JournalRingError::TooLarge);
+        }
+        let mut state = self.state.lock();
+        if state.active.is_some() {
+            return Err(JournalRingError::Busy);
+        }
+        let cursor = if state.cursor + record_blocks > self.blocks.len() {
+            self.first
+        } else {
+            state.cursor
+        };
+        let end = cursor + record_blocks;
+        let descriptor = self.lba_for(cursor)?;
+        let mut metadata = Vec::new();
+        for index in cursor + 1..end - 1 {
+            metadata.push(self.lba_for(index)?);
+        }
+        let reservation = JournalRingReservation {
+            layout: MutationJournalLayout::new(
+                self.device,
+                self.sectors_per_block,
+                self.journal_uuid,
+                state.sequence,
+                JournalRecordLayout::new(descriptor, metadata, self.lba_for(end - 1)?),
+            ),
+            id: state.next_reservation_id,
+            end,
+        };
+        state.next_reservation_id = state.next_reservation_id.wrapping_add(1).max(1);
+        state.active = Some(reservation.clone());
+        Ok(reservation)
+    }
+
+    /// Finish an active reservation after its checkpoint terminal result.
+    ///
+    /// A failed checkpoint leaves the cursor and sequence unchanged, allowing
+    /// the exact same record to be retried without overwriting it.
+    pub fn complete(
+        &self,
+        reservation: &JournalRingReservation,
+        checkpoint_succeeded: bool,
+    ) -> Result<(), JournalRingError> {
+        let mut state = self.state.lock();
+        let Some(active) = state.active.take() else {
+            return Err(JournalRingError::Missing);
+        };
+        if &active != reservation {
+            state.active = Some(active);
+            return Err(JournalRingError::ReservationMismatch);
+        }
+        if checkpoint_succeeded {
+            state.cursor = (active.end == self.blocks.len()).then_some(self.first).unwrap_or(active.end);
+            state.sequence = state.sequence.wrapping_add(1).max(1);
+        }
+        Ok(())
+    }
+
+    fn lba_for(&self, logical: usize) -> Result<LbaRange, JournalRingError> {
+        let physical = *self.blocks.get(logical).ok_or(JournalRingError::InvalidGeometry)?;
+        let start = physical
+            .checked_mul(self.sectors_per_block)
+            .ok_or(JournalRingError::LbaOverflow)?;
+        Ok(LbaRange::new(start, self.sectors_per_block))
     }
 }
 
@@ -1201,9 +1348,52 @@ impl Ext4FsyncPlanSource for Arc<JournalFsyncSource> {
 mod tests {
     use super::*;
     use alloc::vec;
+    use tx_ext4_format::journal::Jbd2Superblock;
     use tx_ext4_format::mutation::{
         Ext4MutationPlan, FsyncStamp, MetaRole, MetadataBlock, MutationOrigin, SealedDataWrite,
     };
+    use tx_ext4_format::pager::JournalGeometry;
+
+    #[test]
+    fn journal_ring_reservation_waits_for_checkpoint_and_wraps_without_crossing_tail() {
+        let geometry = JournalGeometry {
+            superblock: Jbd2Superblock {
+                block_type: 4,
+                block_size: JBD2_BLOCK_SIZE as u32,
+                max_len: 8,
+                first: 1,
+                sequence: 11,
+                start: 0,
+                uuid: [0x3c; 16],
+            },
+            blocks: vec![40, 41, 42, 50, 51, 52, 53, 54],
+        };
+        let ring = JournalRing::new(DeviceKey::new(9), 8, geometry).expect("valid journal ring");
+
+        let first = ring.reserve(2).expect("reserve first record");
+        assert_eq!(first.layout.sequence, 11);
+        assert_eq!(first.layout.records.descriptor, LbaRange::new(41 * 8, 8));
+        assert_eq!(first.layout.records.metadata, vec![LbaRange::new(42 * 8, 8), LbaRange::new(50 * 8, 8)]);
+        assert_eq!(first.layout.records.commit, LbaRange::new(51 * 8, 8));
+        assert_eq!(ring.reserve(1), Err(JournalRingError::Busy));
+        ring.complete(&first, true).expect("checkpoint releases record");
+
+        let wrapped = ring.reserve(3).expect("reserve wrapped record");
+        assert_eq!(wrapped.layout.sequence, 12);
+        assert_eq!(wrapped.layout.records.descriptor, LbaRange::new(41 * 8, 8));
+        assert_eq!(wrapped.layout.records.metadata, vec![LbaRange::new(42 * 8, 8), LbaRange::new(50 * 8, 8), LbaRange::new(51 * 8, 8)]);
+        assert_eq!(wrapped.layout.records.commit, LbaRange::new(52 * 8, 8));
+        ring.complete(&wrapped, false).expect("failed checkpoint retains record");
+
+        let retry = ring.reserve(3).expect("retry retains cursor and sequence");
+        assert_ne!(retry, wrapped, "retry must receive a fresh reservation identity");
+        assert_eq!(
+            ring.complete(&wrapped, true),
+            Err(JournalRingError::ReservationMismatch)
+        );
+        ring.complete(&retry, true)
+            .expect("current retry completes after stale completion rejection");
+    }
 
     #[test]
     fn mutation_journal_image_separates_ordered_data_and_metadata_checkpoint_writes() {
