@@ -5,6 +5,7 @@
 
 use alloc::vec::Vec;
 
+use crate::ondisk::crc32c_append;
 use crate::{Ext4FormatError, Result};
 
 pub const JBD2_MAGIC: u32 = 0xC03B_3998;
@@ -170,6 +171,11 @@ pub struct Jbd2Superblock {
 
 impl Jbd2Superblock {
     pub const ENCODED_LEN: usize = 64;
+    const INCOMPAT_CSUM_V2: u32 = 0x0000_0008;
+    const INCOMPAT_CSUM_V3: u32 = 0x0000_0010;
+    const CHECKSUM_TYPE_OFFSET: usize = 0x50;
+    const CHECKSUM_OFFSET: usize = 0xFC;
+    const CRC32C_CHECKSUM_TYPE: u8 = 4;
 
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         require_len(bytes, Self::ENCODED_LEN)?;
@@ -201,6 +207,46 @@ impl Jbd2Superblock {
             start,
             uuid: bytes[48..64].try_into().unwrap(),
         })
+    }
+
+    /// Update only the dynamic recovery state of a journal superblock page.
+    ///
+    /// The caller supplies the page it discovered through the journal inode,
+    /// rather than rebuilding the page from this abbreviated parsed view. This
+    /// keeps feature and future-extension fields intact while allowing L5 to
+    /// publish `s_sequence` and `s_start` around transaction commit.
+    pub fn write_state(
+        &self,
+        page: &mut [u8; JBD2_BLOCK_SIZE],
+        sequence: u32,
+        start: u32,
+    ) -> Result<()> {
+        let observed = Self::parse(page)?;
+        if observed.block_type != self.block_type
+            || observed.block_size != self.block_size
+            || observed.max_len != self.max_len
+            || observed.first != self.first
+            || observed.uuid != self.uuid
+        {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        if start != 0 && (start < self.first || start >= self.max_len) {
+            return Err(Ext4FormatError::Corrupt);
+        }
+
+        write_u32(page, 24, sequence)?;
+        write_u32(page, 28, start)?;
+
+        let incompat = read_u32(page, 40)?;
+        if incompat & (Self::INCOMPAT_CSUM_V2 | Self::INCOMPAT_CSUM_V3) != 0 {
+            if page[Self::CHECKSUM_TYPE_OFFSET] != Self::CRC32C_CHECKSUM_TYPE {
+                return Err(Ext4FormatError::Unsupported);
+            }
+            page[Self::CHECKSUM_OFFSET..Self::CHECKSUM_OFFSET + 4].fill(0);
+            let checksum = crc32c_append(0xFFFF_FFFF, page);
+            write_u32(page, Self::CHECKSUM_OFFSET, checksum)?;
+        }
+        Ok(())
     }
 }
 

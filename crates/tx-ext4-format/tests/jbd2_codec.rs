@@ -1,7 +1,8 @@
 use tx_ext4_format::journal::{
-    Jbd2Commit, Jbd2Descriptor, Jbd2Header, Jbd2Revoke, Jbd2Superblock, Jbd2Tag,
-    JBD2_BLOCK_COMMIT, JBD2_BLOCK_DESCRIPTOR, JBD2_BLOCK_REVOKE, JBD2_MAGIC,
+    Jbd2Commit, Jbd2Descriptor, Jbd2Header, Jbd2Revoke, Jbd2Superblock, Jbd2Tag, JBD2_BLOCK_COMMIT,
+    JBD2_BLOCK_DESCRIPTOR, JBD2_BLOCK_REVOKE, JBD2_MAGIC,
 };
+use tx_ext4_format::ondisk::crc32c_append;
 use tx_ext4_format::Ext4FormatError;
 
 const BLOCK_SIZE: usize = 4096;
@@ -115,4 +116,32 @@ fn superblock_parses_journal_ring_geometry_and_rejects_invalid_bounds() {
 
     bytes[20..24].copy_from_slice(&128u32.to_be_bytes());
     assert_eq!(Jbd2Superblock::parse(&bytes), Err(Ext4FormatError::Corrupt));
+}
+
+#[test]
+fn superblock_state_update_preserves_unknown_bytes_and_recomputes_crc32c() {
+    let mut bytes = [0u8; BLOCK_SIZE];
+    bytes[..4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
+    bytes[4..8].copy_from_slice(&4u32.to_be_bytes());
+    bytes[8..12].copy_from_slice(&17u32.to_be_bytes());
+    bytes[12..16].copy_from_slice(&(BLOCK_SIZE as u32).to_be_bytes());
+    bytes[16..20].copy_from_slice(&128u32.to_be_bytes());
+    bytes[20..24].copy_from_slice(&1u32.to_be_bytes());
+    bytes[24..28].copy_from_slice(&18u32.to_be_bytes());
+    bytes[28..32].copy_from_slice(&7u32.to_be_bytes());
+    bytes[40..44].copy_from_slice(&0x0000_0008u32.to_be_bytes());
+    bytes[48..64].copy_from_slice(&[0x5a; 16]);
+    bytes[80] = 4;
+    bytes[84..252].fill(0xC3);
+
+    let superblock = Jbd2Superblock::parse(&bytes).unwrap();
+    superblock.write_state(&mut bytes, 19, 0).unwrap();
+
+    let updated = Jbd2Superblock::parse(&bytes).unwrap();
+    assert_eq!(updated.sequence, 19);
+    assert_eq!(updated.start, 0);
+    assert_eq!(&bytes[84..252], &[0xC3; 168]);
+    let recorded = u32::from_be_bytes(bytes[252..256].try_into().unwrap());
+    bytes[252..256].fill(0);
+    assert_eq!(recorded, crc32c_append(0xFFFF_FFFF, &bytes));
 }
