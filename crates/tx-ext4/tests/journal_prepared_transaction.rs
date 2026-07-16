@@ -1,15 +1,19 @@
 use std::sync::Arc;
 use tx_ext4::journal::{
     Ext4MutationPlanSource, JournalMutationRuntime, JournalMutationWriteSource, JournalPagePool,
-    JournalRecordLayout, MutationJournalImage, MutationJournalLayout, PreparedJournalTransaction,
+    JournalRecordLayout, JournalRing, JournalRingError, MutationJournalImage,
+    MutationJournalLayout, PreparedJournalTransaction,
 };
 use tx_ext4::planner::{Ext4FsyncPlanSource, Ext4WritePlanSource};
-use tx_ext4_format::journal::{Jbd2MetadataUpdate, Jbd2TransactionImage, JBD2_BLOCK_SIZE};
+use tx_ext4_format::journal::{
+    Jbd2MetadataUpdate, Jbd2Superblock, Jbd2TransactionImage, JBD2_BLOCK_SIZE,
+};
 use tx_ext4_format::mutation::{
     Ext4MutationPlan, FsyncStamp, MetaRole, MetadataBlock, MutationOrigin, SealedDataWrite,
 };
 use tx_subsystems::fs_iface::{IoDataLeaseId, IoDataSource, PageFrameRef};
 use tx_subsystems::io_manager::block::{DeviceKey, LbaRange};
+use tx_ext4_format::pager::JournalGeometry;
 
 fn setup() {
     tx_test_support::init_host();
@@ -259,20 +263,29 @@ fn mutation_runtime_accepts_l4_owned_data_source() {
 fn journal_source_commits_only_after_data_graph_completion() {
     setup();
     let source = Arc::new(tx_ext4::journal::JournalFsyncSource::new());
-    let runtime = JournalMutationRuntime::new(
-        Arc::clone(&source),
-        JournalPagePool::new(4).unwrap(),
-        MutationJournalLayout::new(
+    let ring = Arc::new(
+        JournalRing::new(
             DeviceKey::new(9),
             8,
-            [1; 16],
-            7,
-            JournalRecordLayout::new(
-                LbaRange::new(80, 8),
-                vec![LbaRange::new(88, 8)],
-                LbaRange::new(96, 8),
-            ),
-        ),
+            JournalGeometry {
+                superblock: Jbd2Superblock {
+                    block_type: 4,
+                    block_size: JBD2_BLOCK_SIZE as u32,
+                    max_len: 8,
+                    first: 1,
+                    sequence: 7,
+                    start: 0,
+                    uuid: [1; 16],
+                },
+                blocks: vec![9, 10, 11, 12, 13, 14, 15, 16],
+            },
+        )
+        .unwrap(),
+    );
+    let runtime = JournalMutationRuntime::with_ring(
+        Arc::clone(&source),
+        JournalPagePool::new(4).unwrap(),
+        Arc::clone(&ring),
     );
     let mut mutation = Ext4MutationPlan::new(MutationOrigin::FlushPage, 12, FsyncStamp::new(7));
     mutation.data.push(SealedDataWrite {
@@ -354,10 +367,15 @@ fn journal_source_commits_only_after_data_graph_completion() {
     source
         .complete_checkpoint_result(Err(tx_subsystems::execution::Errno::EIO))
         .expect("failed checkpoint remains retryable");
+    assert_eq!(ring.reserve(1), Err(JournalRingError::Busy));
     assert!(source
         .take_checkpoint_graph()
         .expect("failed checkpoint retries")
         .is_some());
+    source
+        .complete_checkpoint_result(Ok(()))
+        .expect("successful retry releases ring reservation");
+    assert!(ring.reserve(1).is_ok());
 }
 
 #[test]

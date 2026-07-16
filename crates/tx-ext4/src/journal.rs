@@ -1019,6 +1019,7 @@ struct JournalFsyncSourceState {
     data_submitted: Option<PageIoRequestId>,
     commit_submitted: Option<PageIoRequestId>,
     checkpoint_submitted: bool,
+    ring_reservation: Option<(Arc<JournalRing>, JournalRingReservation)>,
 }
 
 impl JournalFsyncSource {
@@ -1029,6 +1030,7 @@ impl JournalFsyncSource {
                 data_submitted: None,
                 commit_submitted: None,
                 checkpoint_submitted: false,
+                ring_reservation: None,
             }),
         }
     }
@@ -1038,6 +1040,18 @@ impl JournalFsyncSource {
         transaction: PreparedJournalTransaction,
     ) -> Result<(), JournalTransactionStateError> {
         self.state.lock().transaction.begin(transaction)
+    }
+
+    pub fn begin_with_ring(
+        &self,
+        transaction: PreparedJournalTransaction,
+        ring: Arc<JournalRing>,
+        reservation: JournalRingReservation,
+    ) -> Result<(), JournalTransactionStateError> {
+        let mut state = self.state.lock();
+        state.transaction.begin(transaction)?;
+        state.ring_reservation = Some((ring, reservation));
+        Ok(())
     }
 
     pub fn plan_data(&self, request: &BackendPageRequest) -> BackendPlan {
@@ -1115,8 +1129,14 @@ impl JournalFsyncSource {
             return Ok(());
         }
         let _ = state.transaction.complete_checkpoint()?;
+        let ring_reservation = state.ring_reservation.take();
         state.data_submitted = None;
         state.commit_submitted = None;
+        drop(state);
+        if let Some((ring, reservation)) = ring_reservation {
+            ring.complete(&reservation, true)
+                .map_err(|_| JournalTransactionStateError::NotCommitted)?;
+        }
         Ok(())
     }
 
@@ -1139,7 +1159,8 @@ impl Default for JournalFsyncSource {
 pub struct JournalMutationRuntime {
     source: Arc<JournalFsyncSource>,
     pool: JournalPagePool,
-    layout: MutationJournalLayout,
+    layout: Option<MutationJournalLayout>,
+    ring: Option<Arc<JournalRing>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1221,8 +1242,13 @@ impl JournalMutationRuntime {
         Self {
             source,
             pool,
-            layout,
+            layout: Some(layout),
+            ring: None,
         }
+    }
+
+    pub fn with_ring(source: Arc<JournalFsyncSource>, pool: JournalPagePool, ring: Arc<JournalRing>) -> Self {
+        Self { source, pool, layout: None, ring: Some(ring) }
     }
 
     pub fn source(&self) -> Arc<JournalFsyncSource> {
@@ -1234,13 +1260,16 @@ impl JournalMutationRuntime {
         mutation: &Ext4MutationPlan,
         guard: &Guard<'_>,
     ) -> Result<(), JournalMutationRuntimeError> {
-        let image = MutationJournalImage::from_plan(mutation, self.layout.clone())
-            .map_err(JournalMutationRuntimeError::Image)?;
-        let transaction = PreparedJournalTransaction::stage_mutation(&self.pool, image, guard)
-            .map_err(JournalMutationRuntimeError::Stage)?;
-        self.source
-            .begin(transaction)
-            .map_err(JournalMutationRuntimeError::Busy)
+        let (layout, reservation) = self.layout_for(mutation)?;
+        let image = match MutationJournalImage::from_plan(mutation, layout) {
+            Ok(image) => image,
+            Err(error) => return Err(self.release_reservation(reservation, JournalMutationRuntimeError::Image(error))),
+        };
+        let transaction = match PreparedJournalTransaction::stage_mutation(&self.pool, image, guard) {
+            Ok(transaction) => transaction,
+            Err(error) => return Err(self.release_reservation(reservation, JournalMutationRuntimeError::Stage(error))),
+        };
+        self.begin_transaction(transaction, reservation)
     }
 
     pub fn begin_mutation_with_data_sources(
@@ -1249,18 +1278,21 @@ impl JournalMutationRuntime {
         data_sources: Vec<IoDataSource>,
         guard: &Guard<'_>,
     ) -> Result<(), JournalMutationRuntimeError> {
-        let image = MutationJournalImage::from_plan(mutation, self.layout.clone())
-            .map_err(JournalMutationRuntimeError::Image)?;
-        let transaction = PreparedJournalTransaction::stage_mutation_with_data_sources(
+        let (layout, reservation) = self.layout_for(mutation)?;
+        let image = match MutationJournalImage::from_plan(mutation, layout) {
+            Ok(image) => image,
+            Err(error) => return Err(self.release_reservation(reservation, JournalMutationRuntimeError::Image(error))),
+        };
+        let transaction = match PreparedJournalTransaction::stage_mutation_with_data_sources(
             &self.pool,
             image,
             data_sources,
             guard,
-        )
-        .map_err(JournalMutationRuntimeError::Stage)?;
-        self.source
-            .begin(transaction)
-            .map_err(JournalMutationRuntimeError::Busy)
+        ) {
+            Ok(transaction) => transaction,
+            Err(error) => return Err(self.release_reservation(reservation, JournalMutationRuntimeError::Stage(error))),
+        };
+        self.begin_transaction(transaction, reservation)
     }
 
     pub fn plan_data(&self, request: &BackendPageRequest) -> BackendPlan {
@@ -1269,6 +1301,31 @@ impl JournalMutationRuntime {
 
     pub fn complete_data(&self, completion: BackendPageCompletion) {
         self.source.complete_data(completion);
+    }
+
+    fn layout_for(&self, mutation: &Ext4MutationPlan) -> Result<(MutationJournalLayout, Option<(Arc<JournalRing>, JournalRingReservation)>), JournalMutationRuntimeError> {
+        if let Some(layout) = &self.layout { return Ok((layout.clone(), None)); }
+        let ring = self.ring.as_ref().expect("runtime has layout or ring");
+        let reservation = ring.reserve(mutation.metadata.len()).map_err(|_| JournalMutationRuntimeError::Busy(JournalTransactionStateError::Busy))?;
+        Ok((reservation.layout.clone(), Some((Arc::clone(ring), reservation))))
+    }
+
+    fn begin_transaction(&self, transaction: PreparedJournalTransaction, reservation: Option<(Arc<JournalRing>, JournalRingReservation)>) -> Result<(), JournalMutationRuntimeError> {
+        match reservation {
+            Some((ring, reservation)) => match self.source.begin_with_ring(transaction, Arc::clone(&ring), reservation.clone()) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    let _ = ring.complete(&reservation, false);
+                    Err(error)
+                }
+            },
+            None => self.source.begin(transaction),
+        }.map_err(JournalMutationRuntimeError::Busy)
+    }
+
+    fn release_reservation(&self, reservation: Option<(Arc<JournalRing>, JournalRingReservation)>, error: JournalMutationRuntimeError) -> JournalMutationRuntimeError {
+        if let Some((ring, reservation)) = reservation { let _ = ring.complete(&reservation, false); }
+        error
     }
 }
 
