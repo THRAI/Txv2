@@ -125,8 +125,12 @@ fn prepared_transaction_stages_mutation_data_journal_and_checkpoint_leases() {
         .checkpoint_graph_after_commit()
         .unwrap()
         .unwrap();
-    assert_eq!(checkpoint.nodes().len(), 1);
+    assert_eq!(checkpoint.nodes().len(), 2);
     assert_eq!(checkpoint.nodes()[0].bio.lba, LbaRange::new(264, 8));
+    assert_eq!(
+        checkpoint.nodes()[1].bio.op,
+        tx_subsystems::io_manager::block::BlockOp::Barrier
+    );
 }
 
 #[test]

@@ -225,11 +225,11 @@ impl JournalTransactionPlan {
         for write in &self.checkpoint_writes {
             home_ids.push(builder.push(write.clone())?);
         }
+        let fence = builder.push(fence(self.device))?;
+        for home in home_ids {
+            builder.depends_on(home, fence);
+        }
         if let Some(clean) = &self.clean {
-            let fence = builder.push(fence(self.device))?;
-            for home in home_ids {
-                builder.depends_on(home, fence);
-            }
             let mut clean = clean.clone();
             clean.plan.flags = clean.plan.flags.union(BlockFlags::FUA);
             let clean = builder.push(clean)?;

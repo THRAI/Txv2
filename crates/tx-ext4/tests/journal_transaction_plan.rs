@@ -53,8 +53,16 @@ fn commit_graph_orders_data_journal_fences_and_durable_commit() {
     );
 
     let checkpoint = plan.checkpoint_graph_after_commit().unwrap().unwrap();
-    assert_eq!(checkpoint.nodes().len(), 1);
+    assert_eq!(checkpoint.nodes().len(), 2);
     assert_eq!(checkpoint.nodes()[0].bio.lba, LbaRange::new(300, 8));
+    assert_eq!(checkpoint.nodes()[1].bio.op, BlockOp::Barrier);
+    assert_eq!(
+        checkpoint.dependencies(),
+        [BackendBioDependency::new(
+            BackendBioNodeId::new(1),
+            BackendBioNodeId::new(2)
+        )]
+    );
 }
 
 #[test]
