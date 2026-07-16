@@ -534,6 +534,12 @@ fn fcntl_release_process_locks_for_file(owner: u32, file: &OpenFile) {
     }
 }
 
+fn queue_file_close_writeback(file: &Cap<OpenFile>) {
+    if let Some(pc) = crate::linux_syscall::vm::extract_page_container(file) {
+        let _ = pc.queue_dirty_file_writeback();
+    }
+}
+
 fn fcntl_getlk(ctx: &SyscallCtx<'_>, file: &OpenFile, flock_uaddr: u64) -> SyscallResult {
     let mut flock = match bootstrap_read_user::<FlockLayout>(&ctx.aspace, flock_uaddr) {
         Ok(flock) => flock,
@@ -648,27 +654,19 @@ pub(super) fn sys_close_range<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         return SyscallResult::Error(EINVAL_VALUE);
     }
 
-    let open_keys = ctx.process.open_fd_numbers();
-    let cloexec_keys = ctx.process.fd_cloexec_snapshot();
     if flags & CLOSE_RANGE_CLOEXEC != 0 {
+        let open_keys = ctx.process.open_fd_numbers();
         for fd in open_keys.range(first..=last).copied() {
             ctx.process.set_fd_cloexec(fd, true);
         }
         return SyscallResult::Return(0);
     }
 
-    for fd in open_keys.range(first..=last).copied() {
-        let file_to_close = ctx.process.fd(fd);
-        ctx.process.set_fd(fd, None);
-        ctx.process.set_fd_cloexec(fd, false);
-        if let Some(file) = file_to_close {
-            file.flock_release();
-            fcntl_release_process_locks_for_file(ctx.process.pid.0, &file);
-            maybe_close_socket_file_after_fd_remove(&file);
-        }
-    }
-    for fd in cloexec_keys.range(first..=last).copied() {
-        ctx.process.set_fd_cloexec(fd, false);
+    for file in ctx.process.take_fds_for_close_range(first, last) {
+        queue_file_close_writeback(&file);
+        file.flock_release();
+        fcntl_release_process_locks_for_file(ctx.process.pid.0, &file);
+        maybe_close_socket_file_after_fd_remove(&file);
     }
     SyscallResult::Return(0)
 }
@@ -1165,39 +1163,23 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
 /// same fd number reports a clean state if it gets reused.
 ///
 /// Returns `0` on success, `-EBADF` if the fd was already closed.
-//
-// PR-9 phase 3b: not yet StepOp-driven — pending. `sys_close` does
-// not invoke any `*Op::step(ctx)` call site; it operates directly on
-// the process fd-table via `Cap<ProcessIdentity>` accessors
-// (`fd`, `set_fd`, `set_fd_cloexec`). When fd-table mutation gains a
-// StepOp wrap, thread `&mut KernelScriptCtx` here.
 /// PR-3 migration: `CloseOp` is a `OneShotStepOp` — dispatched via
 /// `drive_oneshot` (no reactor, no yield).
 pub(super) fn sys_close<'a>(fd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
-    let file_to_close = ctx.process.fd(fd);
-    // Write back dirty data + logical size before dropping the fd. There
-    // is no background writeback daemon, so close is the flush point for
-    // page-backed files; without it a fresh reopen reads the stale
-    // (create-time, zero) inode size and empty data. Best-effort — the
-    // ext4 flush path is synchronous (Done).
-    if let Some(file) = &file_to_close {
-        if let Some(pc) = crate::linux_syscall::vm::extract_page_container(file) {
-            let guard = step_engine::guard();
-            let _ = tx_subsystems::page_backed::step_fsync(&pc, &guard);
-        }
-    }
     let mut script_ctx = build_subject_script_ctx(ctx);
     let mut op = CloseOp {
         process: ctx.process.clone(),
         fd,
     };
     match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
-        Ok(()) => {
-            if let Some(file) = file_to_close {
-                file.flock_release();
-                fcntl_release_process_locks_for_file(ctx.process.pid.0, &file);
-                maybe_close_socket_file_after_fd_remove(&file);
-            }
+        Ok(file) => {
+            // Close is not a durability fence. It only admits the file just
+            // removed from the fd table to L4; fsync/fdatasync own the ordered
+            // journal commit.
+            queue_file_close_writeback(&file);
+            file.flock_release();
+            fcntl_release_process_locks_for_file(ctx.process.pid.0, &file);
+            maybe_close_socket_file_after_fd_remove(&file);
             SyscallResult::Return(0)
         }
         Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),

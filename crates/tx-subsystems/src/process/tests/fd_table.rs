@@ -1,4 +1,5 @@
 use super::*;
+use crate::process::execution::CloseOp;
 
 // ----- Wave 2 ELF loader plan: per-fd CLOEXEC bitmap + exec phase-7 -----
 //
@@ -138,6 +139,73 @@ fn process_payload_fds_btreemap_supports_sparse_fd_above_31() {
         proc_cap.fd(100).is_none(),
         "fd 100 must be empty post-remove"
     );
+}
+
+#[test]
+fn close_op_returns_the_atomically_removed_file() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let old_file = fresh_open_file();
+    let old_object = old_file.rnode().fs_object_id();
+    proc_cap.set_fd(10, Some(old_file));
+    proc_cap.set_fd_cloexec(10, true);
+
+    let mut op = CloseOp {
+        process: proc_cap.clone(),
+        fd: 10,
+    };
+    let mut ctx = ScriptCtx::<ProcessIdentity>::new();
+    let closed = match op.step(&mut ctx) {
+        StepOutcome::Done(file) => file,
+        other => panic!("close expected Done(file), got {other:?}"),
+    };
+
+    assert_eq!(closed.rnode().fs_object_id(), old_object);
+    assert!(proc_cap.fd(10).is_none(), "close must remove the old fd");
+    assert!(!proc_cap.fd_cloexec(10), "close must clear FD_CLOEXEC");
+
+    let mut repeated = CloseOp {
+        process: proc_cap.clone(),
+        fd: 10,
+    };
+    assert!(matches!(
+        repeated.step(&mut ctx),
+        StepOutcome::Err(crate::process::adapter::step_engine::Errno::EBADF)
+    ));
+
+    let replacement = fresh_open_file();
+    let replacement_object = replacement.rnode().fs_object_id();
+    proc_cap.set_fd(10, Some(replacement));
+    assert_eq!(
+        proc_cap
+            .fd(10)
+            .expect("replacement remains installed")
+            .rnode()
+            .fs_object_id(),
+        replacement_object
+    );
+}
+
+#[test]
+fn close_range_detaches_current_fds_and_clears_stale_cloexec() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    for fd in [3, 4, 9, 100] {
+        proc_cap.set_fd(fd, Some(fresh_open_file()));
+    }
+    proc_cap.set_fd_cloexec(4, true);
+    proc_cap.set_fd_cloexec(9, true);
+    proc_cap.set_fd_cloexec(500, true);
+
+    let closed = proc_cap.take_fds_for_close_range(4, 500);
+
+    assert_eq!(closed.len(), 3);
+    assert!(proc_cap.fd(3).is_some(), "fd below the range survives");
+    for fd in [4, 9, 100] {
+        assert!(proc_cap.fd(fd).is_none(), "fd {fd} is detached");
+        assert!(!proc_cap.fd_cloexec(fd), "fd {fd} cloexec is cleared");
+    }
+    assert!(!proc_cap.fd_cloexec(500), "stale cloexec is cleared");
 }
 
 /// fd-ops Wave 1: `allocate_fd` returns the lowest unused fd ≥ 0.

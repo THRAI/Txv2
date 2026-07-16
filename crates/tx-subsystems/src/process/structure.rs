@@ -548,6 +548,29 @@ impl ProcessIdentity {
             .and_then(|p| p.set_fd(idx, file))
     }
 
+    /// Atomically remove an fd and its close-on-exec bit, returning the
+    /// detached file capability. This is the close syscall's fd-reuse fence.
+    pub fn take_fd_for_close(&self, idx: u32) -> Option<Cap<crate::vfs::OpenFile>> {
+        self.payload
+            .lock()
+            .as_ref()
+            .and_then(|p| p.take_fd_for_close(idx))
+    }
+
+    /// Atomically detach every currently open fd in an inclusive range and
+    /// clear all close-on-exec state in that range.
+    pub fn take_fds_for_close_range(
+        &self,
+        first: u32,
+        last: u32,
+    ) -> Vec<Cap<crate::vfs::OpenFile>> {
+        self.payload
+            .lock()
+            .as_ref()
+            .map(|p| p.take_fds_for_close_range(first, last))
+            .unwrap_or_default()
+    }
+
     /// Allocate the lowest unused fd ≥ 0 without installing anything.
     /// Returns `0` for zombies (no payload) — the caller must not
     /// install against a zombie regardless.
@@ -1498,6 +1521,53 @@ impl ProcessPayload {
             decr_pipe_fd_ref(file);
         }
         previous
+    }
+
+    /// Atomically detach one fd and clear its close-on-exec state.
+    ///
+    /// The returned capability identifies the exact file that was removed;
+    /// callers must not re-read the fd after this transition because another
+    /// thread may reuse the number immediately.
+    pub fn take_fd_for_close(&self, idx: u32) -> Option<Cap<OpenFile>> {
+        let mut fds = self.fds.lock();
+        let mut cloexec = self.fd_cloexec.lock();
+        let file = fds.remove(&idx);
+        cloexec.remove(&idx);
+        drop(cloexec);
+        drop(fds);
+        if let Some(file) = &file {
+            decr_pipe_fd_ref(file);
+        }
+        file
+    }
+
+    /// Atomically detach every currently open fd in an inclusive range and
+    /// clear all close-on-exec state in that range.
+    pub fn take_fds_for_close_range(&self, first: u32, last: u32) -> Vec<Cap<OpenFile>> {
+        if first > last {
+            return Vec::new();
+        }
+
+        let mut fds = self.fds.lock();
+        let mut cloexec = self.fd_cloexec.lock();
+        let closing: Vec<u32> = fds
+            .range(first..=last)
+            .map(|(&fd, _)| fd)
+            .collect();
+        let files: Vec<Cap<OpenFile>> = closing
+            .into_iter()
+            .filter_map(|fd| fds.remove(&fd))
+            .collect();
+        let cloexec_to_clear: Vec<u32> = cloexec.range(first..=last).copied().collect();
+        for fd in cloexec_to_clear {
+            cloexec.remove(&fd);
+        }
+        drop(cloexec);
+        drop(fds);
+        for file in &files {
+            decr_pipe_fd_ref(file);
+        }
+        files
     }
 
     /// Remove every fd from this payload and return the detached table.

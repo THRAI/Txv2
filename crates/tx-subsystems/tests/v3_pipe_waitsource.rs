@@ -142,7 +142,7 @@ fn close_fd(process: &Cap<ProcessIdentity>, fd: u32) {
     };
     let mut ctx = ScriptCtx::<ProcessIdentity>::new();
     match op.step(&mut ctx) {
-        StepOutcome::Done(()) => {}
+        StepOutcome::Done(_) => {}
         other => panic!("close fd {fd} expected Done, got {other:?}"),
     }
 }

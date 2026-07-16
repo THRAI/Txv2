@@ -1604,6 +1604,28 @@ impl PageContainer {
         }
     }
 
+    /// Admit all currently dirty file pages to background L4 writeback.
+    ///
+    /// This is intentionally nonblocking: close may request background
+    /// visibility writeback, but only an explicit fsync owns a durability
+    /// frontier and waits for its journal commit.
+    pub fn queue_dirty_file_writeback(&self) -> usize {
+        let Some(frontier) = self.snapshot_file_fsync_frontier() else {
+            return 0;
+        };
+
+        let mut admitted = 0usize;
+        for &(page, _) in frontier.pages() {
+            if self.queue_file_page_writeback(page).is_some() {
+                admitted = admitted.saturating_add(1);
+            }
+        }
+        if admitted != 0 {
+            self.kick_file_io_service(IoServiceKind::Page);
+        }
+        admitted
+    }
+
     pub fn snapshot_file_fsync_frontier(&self) -> Option<FileFsyncFrontier> {
         if !matches!(self.kind, PageContainerKind::File { .. }) {
             return None;

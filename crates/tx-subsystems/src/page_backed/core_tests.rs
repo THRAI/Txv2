@@ -1392,6 +1392,80 @@ fn file_page_writeback_admission_transitions_dirty_slot_and_queues_request() {
 }
 
 #[test]
+fn file_close_writeback_admission_queues_dirty_pages_without_fsync() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::new());
+    let pc = file_page_container(fs.clone(), fs, FsObjectId::new(96), 4);
+    let page = PageIndex::new(1);
+    let frame = cached_frame_for_test();
+    let ppn = frame.ppn;
+    {
+        let mut state = pc.state.lock();
+        state
+            .pages
+            .install_if_absent(page, frame)
+            .expect("seed page");
+        let slot = state.file_page_slots.entry(page).or_default();
+        let PageSlotFetch::Owner { generation } = slot.begin_fetch() else {
+            panic!("slot fetch owner");
+        };
+        slot.complete_fetch(generation, Ok(ppn))
+            .expect("resident slot");
+        slot.mark_dirty().expect("dirty slot");
+        state.pages.mark_dirty(page).expect("dirty page cache");
+    }
+
+    let wake_source = Arc::new(ServiceWakeSource::new(0x7103));
+    assert!(pc.attach_file_io_wake_source(Arc::clone(&wake_source)));
+    let mailbox = Arc::new(tx_substrate::wake::TaskMailbox::new());
+    let generation = mailbox.next_generation();
+    let _subscription =
+        wake_source.subscribe(IoServiceKind::Page, Arc::downgrade(&mailbox), generation);
+
+    assert_eq!(pc.queue_dirty_file_writeback(), 1);
+    assert_eq!(pc.file_io_request_count_for_test(), 1);
+    assert!(matches!(
+        mailbox.poll(),
+        Some(tx_substrate::wake::MailboxEvent::SourceFired {
+            generation: seen_generation,
+            source,
+            interests,
+        }) if seen_generation == generation
+            && source.raw() == 0x7103
+            && interests.raw() == IoServiceKind::Page.mask_bits()
+    ));
+    assert!(
+        pc.state
+            .lock()
+            .file_io_service
+            .find_submission(
+                pc.io_manager_key(),
+                PageIoRange::new(page.as_u64(), 1),
+                PageIoOp::Writeback,
+            )
+            .is_some()
+    );
+    assert!(
+        pc.state
+            .lock()
+            .file_io_service
+            .find_submission(pc.io_manager_key(), PageIoRange::new(0, 4), PageIoOp::Fsync)
+            .is_none()
+    );
+    assert_eq!(
+        pc.file_page_slot_snapshot_for_test(page)
+            .expect("slot")
+            .state,
+        PageSlotState::Writeback {
+            ppn,
+            submitted_generation: PageGeneration::new(2),
+            redirtied: false,
+        }
+    );
+}
+
+#[test]
 fn file_fsync_session_waits_for_its_captured_writeback_without_duplicate_submission() {
     let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
     setup_host_substrate();

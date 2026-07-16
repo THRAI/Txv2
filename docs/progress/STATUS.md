@@ -1,3 +1,19 @@
+- 2026-07-16 (ext4 journal-planner close writeback admission).
+  `close` and `close_range` now detach their exact `OpenFile` capabilities
+  before cleanup, then queue any file PageContainer's dirty generations to L4
+  background writeback without waiting or issuing fsync. PageContainer wakes
+  the registered Page service only after its state locks are released.
+  `CloseOp` returns the atomically detached file; process fd helpers hold
+  `fds -> fd_cloexec` while removing one fd or a whole inclusive range, so
+  reuse cannot redirect cleanup/writeback and stale CLOEXEC state is cleared.
+  Verification passed: focused PageBacked admission, atomic single-close,
+  atomic range-close, and `close_range` syscall regressions; `cargo check -p
+  tx-subsystems --lib`, `cargo check -p tx-shims --lib`, and scoped
+  `git diff --check` also passed. Next: retain the recovery/pool/runtime-task
+  gates before routing dynamic RW ext4 mounts through the discovered-journal
+  planner. Known unrelated blocker: `v3_pipe_waitsource` has ten E0624 errors
+  after parallel work made its pipe wait-source accessors private.
+
 - 2026-07-14 (ext4 I/O-manager 6F direct-I/O completion wait/result).
   Waitable direct read/write submissions now carry a terminal PageReady wait
   endpoint while PageContainer keeps the result row until one take operation.

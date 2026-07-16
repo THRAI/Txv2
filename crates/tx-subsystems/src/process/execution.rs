@@ -2008,18 +2008,17 @@ pub struct CloseOp {
 }
 
 impl StepOp<crate::process::ProcessIdentity> for CloseOp {
-    type Output = ();
+    type Output = Cap<crate::vfs::OpenFile>;
     type Progress = NoProgress;
     fn step(
         &mut self,
         _ctx: &mut ScriptCtx<crate::process::ProcessIdentity>,
-    ) -> StepOutcome<(), NoProgress> {
-        if self.process.fd(self.fd).is_none() {
-            return StepOutcome::Err(crate::process::adapter::step_engine::Errno::EBADF);
-        }
-        let _prev = self.process.set_fd(self.fd, None);
-        self.process.set_fd_cloexec(self.fd, false);
-        StepOutcome::Done(())
+    ) -> StepOutcome<Cap<crate::vfs::OpenFile>, NoProgress> {
+        let file = match self.process.take_fd_for_close(self.fd) {
+            Some(file) => file,
+            None => return StepOutcome::Err(crate::process::adapter::step_engine::Errno::EBADF),
+        };
+        StepOutcome::Done(file)
     }
 }
 
