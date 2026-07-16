@@ -1227,6 +1227,8 @@ impl OneShotStepOp<crate::process::ProcessIdentity> for FlockOp<'_> {}
 pub struct FileFsyncOp {
     pub page_backing: alloc::sync::Arc<dyn crate::page_backed::FsPageBacking>,
     pub fs_object_id: super::structure::FsObjectId,
+    pub page_container: Option<crate::adapter::step_engine::Cap<crate::page_backed::PageContainer>>,
+    pub state: crate::page_backed::FileFsyncState,
 }
 
 impl<I: SubjectIdentity> StepOp<I> for FileFsyncOp {
@@ -1234,6 +1236,16 @@ impl<I: SubjectIdentity> StepOp<I> for FileFsyncOp {
     type Progress = NoProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<(), NoProgress> {
         use StepOutcome as V3;
+        if let Some(container) = &self.page_container {
+            return match self.state.advance(container) {
+                Err(errno) => V3::Err(errno.into()),
+                Ok(None) => V3::Continue {
+                    progress: NoProgress,
+                },
+                Ok(Some(Ok(()))) => V3::Done(()),
+                Ok(Some(Err(errno))) => V3::Err(errno.into()),
+            };
+        }
         let guard = step_engine::guard();
         match self.page_backing.fsync_file(self.fs_object_id, &guard) {
             V3::Done(()) => V3::Done(()),

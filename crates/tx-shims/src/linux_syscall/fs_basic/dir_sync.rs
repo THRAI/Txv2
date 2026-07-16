@@ -262,6 +262,7 @@ pub(in crate::linux_syscall) async fn sys_fsync<P: PmapIf>(
     };
     let rnode = open_file.rnode();
     let fs_object_id = rnode.fs_object_id();
+    let page_container = crate::linux_syscall::vm::extract_page_container(&open_file);
     // The mount-weak upgrade and the page-backing clone are done inside
     // a scoped guard so no guard crosses the subsequent
     // `drive(...).await` (INVARIANTS_v5 EBR-7).
@@ -284,6 +285,8 @@ pub(in crate::linux_syscall) async fn sys_fsync<P: PmapIf>(
     let op = FileFsyncOp {
         page_backing,
         fs_object_id,
+        page_container,
+        state: tx_subsystems::page_backed::FileFsyncState::new(),
     };
     match drive(
         op,
