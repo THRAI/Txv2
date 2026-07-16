@@ -944,11 +944,18 @@ impl PreparedJournalTransaction {
             checkpoint_writes.push(record.as_journal_bio(device, write.lba));
             records.push(record);
         }
+        let superblock_state = stage_superblock_state(
+            pool,
+            device,
+            mutation.layout.superblock_state.as_ref(),
+            guard,
+            &mut records,
+        )?;
         let sequence = tx_ext4_format::journal::Jbd2Commit::parse(&mutation.image.commit)
             .map_err(|_| PreparedJournalTransactionError::Layout)?
             .header
             .sequence;
-        let plan = JournalTransactionPlan::new(
+        let mut plan = JournalTransactionPlan::new(
             sequence,
             data_writes,
             descriptor_bio,
@@ -957,6 +964,9 @@ impl PreparedJournalTransaction {
             checkpoint_writes,
         )
         .map_err(PreparedJournalTransactionError::Plan)?;
+        if let Some((activation, clean)) = superblock_state {
+            plan = plan.with_superblock_state(activation, clean);
+        }
         Ok(Self { plan, records })
     }
 
@@ -1019,12 +1029,19 @@ impl PreparedJournalTransaction {
             checkpoint_writes.push(record.as_journal_bio(device, write.lba));
             records.push(record);
         }
+        let superblock_state = stage_superblock_state(
+            pool,
+            device,
+            mutation.layout.superblock_state.as_ref(),
+            guard,
+            &mut records,
+        )?;
 
         let sequence = tx_ext4_format::journal::Jbd2Commit::parse(&mutation.image.commit)
             .map_err(|_| PreparedJournalTransactionError::Layout)?
             .header
             .sequence;
-        let plan = JournalTransactionPlan::new(
+        let mut plan = JournalTransactionPlan::new(
             sequence,
             data_writes,
             descriptor_bio,
@@ -1033,6 +1050,9 @@ impl PreparedJournalTransaction {
             checkpoint_writes,
         )
         .map_err(PreparedJournalTransactionError::Plan)?;
+        if let Some((activation, clean)) = superblock_state {
+            plan = plan.with_superblock_state(activation, clean);
+        }
         Ok(Self { plan, records })
     }
 
@@ -1092,6 +1112,29 @@ impl PreparedJournalTransaction {
     pub fn record_count(&self) -> usize {
         self.records.len()
     }
+}
+
+fn stage_superblock_state(
+    pool: &JournalPagePool,
+    device: DeviceKey,
+    state: Option<&JournalSuperblockState>,
+    guard: &Guard<'_>,
+    records: &mut Vec<JournalRecordLease>,
+) -> Result<Option<(JournalBio, JournalBio)>, PreparedJournalTransactionError> {
+    let Some(state) = state else {
+        return Ok(None);
+    };
+    let activate = pool
+        .stage(&state.activate, guard)
+        .map_err(PreparedJournalTransactionError::Pool)?;
+    let activate_bio = activate.as_journal_bio(device, state.lba);
+    records.push(activate);
+    let clean = pool
+        .stage(&state.clean, guard)
+        .map_err(PreparedJournalTransactionError::Pool)?;
+    let clean_bio = clean.as_journal_bio(device, state.lba);
+    records.push(clean);
+    Ok(Some((activate_bio, clean_bio)))
 }
 
 fn journal_bio_from_l4_source(
