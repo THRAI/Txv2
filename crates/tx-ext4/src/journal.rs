@@ -1251,6 +1251,20 @@ impl JournalMutationRuntime {
         Self { source, pool, layout: None, ring: Some(ring) }
     }
 
+    pub fn from_geometry(
+        source: Arc<JournalFsyncSource>,
+        pool: JournalPagePool,
+        device: DeviceKey,
+        sectors_per_block: u64,
+        geometry: JournalGeometry,
+    ) -> Result<Self, JournalRingError> {
+        Ok(Self::with_ring(
+            source,
+            pool,
+            Arc::new(JournalRing::new(device, sectors_per_block, geometry)?),
+        ))
+    }
+
     pub fn source(&self) -> Arc<JournalFsyncSource> {
         Arc::clone(&self.source)
     }
