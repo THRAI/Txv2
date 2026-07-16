@@ -470,8 +470,24 @@ impl PageContainerFileIoServiceRuntime {
     }
 }
 
-static FILE_IO_SERVICE_RUNTIMES: SpinMutex<Vec<PageContainerFileIoServiceRuntime>> =
+struct RegisteredFileIoServiceRuntime {
+    runtime: PageContainerFileIoServiceRuntime,
+    submitted: bool,
+}
+
+/// Kernel-owned task submission for a registered file-I/O service runtime.
+///
+/// The device subsystem retains the runtime registry and exactly-once claim
+/// state. The reactor owner installs this narrow callback after it is ready to
+/// accept long-lived service futures.
+pub trait FileIoServiceRuntimeSpawner: Send + Sync {
+    fn spawn_file_io_service(&self, runtime: PageContainerFileIoServiceRuntime);
+}
+
+static FILE_IO_SERVICE_RUNTIMES: SpinMutex<Vec<RegisteredFileIoServiceRuntime>> =
     SpinMutex::new(Vec::new());
+static FILE_IO_SERVICE_RUNTIME_SPAWNER: SpinMutex<Option<Arc<dyn FileIoServiceRuntimeSpawner>>> =
+    SpinMutex::new(None);
 static NEXT_FILE_IO_SERVICE_SOURCE_ID: AtomicU64 = AtomicU64::new(FILE_IO_SERVICE_SOURCE_ID_BASE);
 
 pub fn register_page_container_file_io_service(
@@ -482,13 +498,64 @@ pub fn register_page_container_file_io_service(
     let wake_source = Arc::new(ServiceWakeSource::new(source_id));
     let _ = container.attach_file_io_wake_source(Arc::clone(&wake_source));
     let runtime = PageContainerFileIoServiceRuntime::new(container, handle, wake_source);
-    FILE_IO_SERVICE_RUNTIMES.lock().push(runtime.clone());
+    FILE_IO_SERVICE_RUNTIMES
+        .lock()
+        .push(RegisteredFileIoServiceRuntime {
+            runtime: runtime.clone(),
+            submitted: false,
+        });
+    let _ = submit_pending_file_io_service_runtimes();
     runtime
+}
+
+/// Install the single kernel-owned spawner and drain every runtime registered
+/// before reactor availability. A second install is rejected so an already
+/// claimed service can never be submitted through another reactor owner.
+pub fn install_file_io_service_runtime_spawner(
+    spawner: Arc<dyn FileIoServiceRuntimeSpawner>,
+) -> Option<usize> {
+    {
+        let mut slot = FILE_IO_SERVICE_RUNTIME_SPAWNER.lock();
+        if slot.is_some() {
+            return None;
+        }
+        *slot = Some(spawner);
+    }
+    Some(submit_pending_file_io_service_runtimes())
+}
+
+/// Submit each registered runtime at most once after a kernel spawner exists.
+/// Runtime claims happen under the registry lock; invoking the kernel spawner
+/// happens after both the registry and spawner locks have been released.
+pub fn submit_pending_file_io_service_runtimes() -> usize {
+    let Some(spawner) = FILE_IO_SERVICE_RUNTIME_SPAWNER.lock().clone() else {
+        return 0;
+    };
+    let pending = {
+        let mut runtimes = FILE_IO_SERVICE_RUNTIMES.lock();
+        let mut pending = Vec::new();
+        for entry in runtimes.iter_mut() {
+            if !entry.submitted {
+                entry.submitted = true;
+                pending.push(entry.runtime.clone());
+            }
+        }
+        pending
+    };
+    let submitted = pending.len();
+    for runtime in pending {
+        spawner.spawn_file_io_service(runtime);
+    }
+    submitted
 }
 
 pub fn page_container_file_io_service_runtimes_snapshot() -> Vec<PageContainerFileIoServiceRuntime>
 {
-    FILE_IO_SERVICE_RUNTIMES.lock().clone()
+    FILE_IO_SERVICE_RUNTIMES
+        .lock()
+        .iter()
+        .map(|entry| entry.runtime.clone())
+        .collect()
 }
 
 pub fn page_container_file_io_service_runtime_count() -> usize {
@@ -788,6 +855,7 @@ pub fn reset_block_registry_for_test() {
 #[cfg(any(test, feature = "test-support"))]
 pub fn reset_page_container_file_io_service_registry_for_test() {
     FILE_IO_SERVICE_RUNTIMES.lock().clear();
+    *FILE_IO_SERVICE_RUNTIME_SPAWNER.lock() = None;
     NEXT_FILE_IO_SERVICE_SOURCE_ID.store(FILE_IO_SERVICE_SOURCE_ID_BASE, Ordering::Release);
 }
 
@@ -942,5 +1010,60 @@ mod tests {
 
         reset_page_container_file_io_service_registry_for_test();
         assert!(page_container_file_io_service_runtimes_snapshot().is_empty());
+    }
+
+    #[test]
+    fn file_io_runtime_spawner_drains_boot_backlog_and_submits_late_registration_once() {
+        struct CountingSpawner(AtomicUsize);
+
+        impl FileIoServiceRuntimeSpawner for CountingSpawner {
+            fn spawn_file_io_service(&self, _runtime: PageContainerFileIoServiceRuntime) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        crate::zones::register_all().expect("kernel zones");
+        reset_page_container_file_io_service_registry_for_test();
+
+        let first = PageContainer::new_cap(
+            PageContainerKind::Anon {
+                swap_policy: AnonSwapPolicy::Reclaimable,
+            },
+            1,
+        )
+        .expect("first page container");
+        register_page_container_file_io_service(first, BlockDeviceHandle::whole(&BLOCK_REG));
+
+        let spawner = Arc::new(CountingSpawner(AtomicUsize::new(0)));
+        assert_eq!(
+            install_file_io_service_runtime_spawner(spawner.clone()),
+            Some(1)
+        );
+        assert_eq!(spawner.0.load(Ordering::Acquire), 1);
+        assert_eq!(submit_pending_file_io_service_runtimes(), 0);
+
+        let second = PageContainer::new_cap(
+            PageContainerKind::Anon {
+                swap_policy: AnonSwapPolicy::Reclaimable,
+            },
+            1,
+        )
+        .expect("second page container");
+        register_page_container_file_io_service(second, BlockDeviceHandle::whole(&BLOCK_REG));
+
+        assert_eq!(spawner.0.load(Ordering::Acquire), 2);
+        assert_eq!(submit_pending_file_io_service_runtimes(), 0);
+        assert_eq!(
+            install_file_io_service_runtime_spawner(Arc::new(CountingSpawner(AtomicUsize::new(
+                0,
+            )))),
+            None
+        );
+
+        reset_page_container_file_io_service_registry_for_test();
     }
 }

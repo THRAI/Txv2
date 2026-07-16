@@ -1,3 +1,15 @@
+- 2026-07-16 (ext4 6G file-I/O runtime spawner registry).
+  Added the inversion-of-control boundary required before dynamic ext4 mounts
+  can use the discovered-journal planner: `tx-subsystems::device` now records
+  each PageContainer service runtime with an exactly-once claim, while the
+  kernel will install the sole reactor spawner in the next step. Pre-boot
+  runtimes drain on installation; later registrations use the same claim path;
+  neither registry nor spawner locks cross task submission. Verification:
+  focused backlog and late-registration runtime-spawner test passed. Next:
+  implement the kernel `BOOT_REACTOR` spawner and replace the boot snapshot
+  submission. The `mount(2)` discovered-journal conversion remains deferred.
+  Gate: `docs/progress/decisions/2026-07-16-file-io-runtime-spawner-gate.md`.
+
 - 2026-07-16 (ext4 journal-planner close writeback admission).
   `close` and `close_range` now detach their exact `OpenFile` capabilities
   before cleanup, then queue any file PageContainer's dirty generations to L4
