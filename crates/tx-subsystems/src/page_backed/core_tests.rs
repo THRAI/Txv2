@@ -3118,6 +3118,52 @@ fn fsync_op_waits_for_planner_completion_then_consumes_terminal_result() {
 }
 
 #[test]
+fn vfs_fsync_op_waits_for_page_container_planner_completion() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+
+    struct FsyncCompletionPlanner;
+
+    impl BackendPlanner for FsyncCompletionPlanner {
+        fn plan_page_io(&self, request: BackendPageRequest) -> BackendPlan {
+            BackendPlan::Complete(PageCompletionList::from_vec(alloc::vec![
+                PageCompletion::new(
+                    request.id,
+                    request.range,
+                    PageIoResult::Done,
+                    request.generation_hint.unwrap_or(PageGeneration::new(0)),
+                    PageIoCompletionKind::Noop,
+                )
+            ]))
+        }
+    }
+
+    let fs = Arc::new(RecordingFs::new());
+    let planner: Arc<dyn BackendPlanner> = Arc::new(FsyncCompletionPlanner);
+    let pc = file_page_container_cap_with_planner(
+        fs.clone(),
+        fs.clone(),
+        FsObjectId::new(103),
+        2,
+        planner,
+    );
+    let mut op = crate::vfs::FileFsyncOp {
+        page_backing: fs,
+        fs_object_id: FsObjectId::new(103),
+        page_container: Some(pc.clone()),
+        state: FileFsyncState::new(),
+    };
+    let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
+
+    assert!(matches!(op.step(&mut ctx), V3Out::Continue { .. }));
+    for _ in 0..2 {
+        pc.drive_file_io_service_once_owned(ServiceBudget::new(1), |_| true)
+            .expect("fsync service drive");
+    }
+    assert_eq!(op.step(&mut ctx), V3Out::done(()));
+}
+
+#[test]
 fn fsync_op_waits_for_dirty_frontier_before_submitting_fsync() {
     let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
     setup_host_substrate();
