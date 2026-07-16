@@ -1,3 +1,4 @@
+use crate::journal::Jbd2Superblock;
 use crate::ondisk::{
     crc32c, encode_dir_entry, encode_journal_commit, encode_journal_descriptor,
     parse_journal_descriptor, BitmapMut, BitmapView, BlockMapping, CommitHeader, DirEntry,
@@ -6,7 +7,6 @@ use crate::ondisk::{
 };
 use crate::ondisk::{read_u16_le, read_u32_le, write_u16_le};
 use crate::{Ext4FormatError, Result};
-use crate::journal::Jbd2Superblock;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -271,7 +271,7 @@ impl<I: BlockImage> Ext4Pager<I> {
         let block = match self.resolve_inode_block(&disk_inode, logical_block(file_page_index)?)? {
             BlockMapping::Data(block) => block,
             BlockMapping::Hole | BlockMapping::NeedNode(_) => {
-                return Err(Ext4FormatError::Unsupported)
+                return Err(Ext4FormatError::Unsupported);
             }
         };
         self.image.write_block(block, page)?;
@@ -302,8 +302,12 @@ impl<I: BlockImage> Ext4Pager<I> {
         let block = match self.resolve_inode_block(&disk_inode, logical)? {
             BlockMapping::Data(block) => block,
             BlockMapping::Hole => {
-                let (physical_block, bitmap_home, bitmap_before, bitmap_after) =
+                let (physical_block, group_index, bitmap_home, bitmap_before, bitmap_after) =
                     self.plan_block_allocation()?;
+                let (group_desc_home, group_desc_before, group_desc_after) =
+                    self.plan_group_free_block_decrement(group_index)?;
+                let (superblock_home, superblock_before, superblock_after) =
+                    self.plan_superblock_free_block_decrement()?;
                 let mut inode_after = disk_inode;
                 let mut extents = match ExtentNode::parse(inode_after.extent_root_bytes())? {
                     ExtentNode::Leaf(extents) => extents,
@@ -334,6 +338,22 @@ impl<I: BlockImage> Ext4Pager<I> {
                     role: MetaRole::BlockBitmap,
                     before_version: crc32c(0, &bitmap_before) as u64,
                     after: bitmap_after,
+                    depends_on: Vec::new(),
+                })
+                .map_err(|_| Ext4FormatError::Corrupt)?;
+                plan.push_metadata(MetadataBlock {
+                    home: group_desc_home,
+                    role: MetaRole::GroupDescriptor,
+                    before_version: crc32c(0, &group_desc_before) as u64,
+                    after: group_desc_after,
+                    depends_on: Vec::new(),
+                })
+                .map_err(|_| Ext4FormatError::Corrupt)?;
+                plan.push_metadata(MetadataBlock {
+                    home: superblock_home,
+                    role: MetaRole::Superblock,
+                    before_version: crc32c(0, &superblock_before) as u64,
+                    after: superblock_after,
                     depends_on: Vec::new(),
                 })
                 .map_err(|_| Ext4FormatError::Corrupt)?;
@@ -374,7 +394,7 @@ impl<I: BlockImage> Ext4Pager<I> {
         Ok(plan)
     }
 
-    fn plan_block_allocation(&self) -> Result<(u64, u64, Page4K, Page4K)> {
+    fn plan_block_allocation(&self) -> Result<(u64, usize, u64, Page4K, Page4K)> {
         if self.superblock.blocks_per_group == 0 {
             return Err(Ext4FormatError::Corrupt);
         }
@@ -399,6 +419,7 @@ impl<I: BlockImage> Ext4Pager<I> {
             BitmapMut::new(&mut bitmap_after).set(bit)?;
             return Ok((
                 group_start + bit as u64,
+                group_index,
                 bitmap_home,
                 bitmap_before,
                 bitmap_after,
@@ -406,6 +427,58 @@ impl<I: BlockImage> Ext4Pager<I> {
         }
 
         Err(Ext4FormatError::OutOfBounds)
+    }
+
+    fn plan_group_free_block_decrement(&self, group_index: usize) -> Result<(u64, Page4K, Page4K)> {
+        if self.superblock.has_metadata_csum() {
+            return Err(Ext4FormatError::Unsupported);
+        }
+        let desc_size = self.superblock.group_desc_size();
+        let byte_offset = group_index
+            .checked_mul(desc_size)
+            .ok_or(Ext4FormatError::OutOfBounds)?;
+        let gdt_start = if self.superblock.block_size() == 1024 {
+            2
+        } else {
+            1
+        };
+        let home = gdt_start + (byte_offset / BLOCK_SIZE) as u64;
+        let offset = byte_offset % BLOCK_SIZE;
+        if offset + desc_size > BLOCK_SIZE {
+            return Err(Ext4FormatError::Unsupported);
+        }
+        let mut before = [0u8; BLOCK_SIZE];
+        self.image.read_block(home, &mut before)?;
+        let descriptor = GroupDesc::parse_sized(&before[offset..offset + desc_size], desc_size)?;
+        let free = u32::from(descriptor.free_blocks_count)
+            | (u32::from(descriptor.free_blocks_count_hi) << 16);
+        let next = free.checked_sub(1).ok_or(Ext4FormatError::OutOfBounds)?;
+        if desc_size < 64 && next > u16::MAX as u32 {
+            return Err(Ext4FormatError::Corrupt);
+        }
+        let mut after = before;
+        after[offset + 12..offset + 14].copy_from_slice(&(next as u16).to_le_bytes());
+        if desc_size >= 64 {
+            after[offset + 44..offset + 46].copy_from_slice(&((next >> 16) as u16).to_le_bytes());
+        }
+        Ok((home, before, after))
+    }
+
+    fn plan_superblock_free_block_decrement(&self) -> Result<(u64, Page4K, Page4K)> {
+        if self.superblock.has_metadata_csum() {
+            return Err(Ext4FormatError::Unsupported);
+        }
+        let mut before = [0u8; BLOCK_SIZE];
+        self.image.read_block(0, &mut before)?;
+        let observed = Superblock::parse(&before[1024..2048])?;
+        let next = observed
+            .free_blocks_count
+            .checked_sub(1)
+            .ok_or(Ext4FormatError::OutOfBounds)?;
+        let mut after = before;
+        after[1024 + 12..1024 + 16].copy_from_slice(&(next as u32).to_le_bytes());
+        after[1024 + 0x158..1024 + 0x15c].copy_from_slice(&((next >> 32) as u32).to_le_bytes());
+        Ok((0, before, after))
     }
 
     /// Write a file page back to disk, allocating a fresh block and
@@ -451,12 +524,7 @@ impl<I: BlockImage> Ext4Pager<I> {
     /// depth-1 index node pointing at it. A 4 KiB extent block holds up to 340
     /// extents, which covers the file sizes the test workloads use; deeper
     /// trees / multiple child blocks remain `Unsupported`.
-    fn attach_data_block(
-        &mut self,
-        inode: &mut Inode,
-        logical: u32,
-        physical: u64,
-    ) -> Result<()> {
+    fn attach_data_block(&mut self, inode: &mut Inode, logical: u32, physical: u64) -> Result<()> {
         const INLINE_MAX_EXTENTS: usize = 4;
         let block_max_extents = (BLOCK_SIZE - 12) / 12;
         match ExtentNode::parse(inode.extent_root_bytes())? {

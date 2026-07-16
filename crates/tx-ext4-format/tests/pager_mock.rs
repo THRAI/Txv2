@@ -356,6 +356,8 @@ fn pager_plans_hole_write_with_bitmap_and_inode_after_images() {
     let mut image = mock_image();
     mark_block_bitmap_used(&mut image, 48);
     let bitmap_before = *image.block(2);
+    let group_desc_before = *image.block(1);
+    let superblock_before = *image.block(0);
     let inode_table_before = *image.block(4);
     let data_before = *image.block(48);
     let mut pager = Ext4Pager::open(image).unwrap();
@@ -394,9 +396,61 @@ fn pager_plans_hole_write_with_bitmap_and_inode_after_images() {
         tx_ext4_format::ondisk::BlockMapping::Data(48)
     );
 
+    let group_desc = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::GroupDescriptor)
+        .unwrap();
+    assert_eq!(group_desc.home, 1);
+    assert_eq!(
+        GroupDesc::parse(&group_desc.after[..32])
+            .unwrap()
+            .free_blocks_count,
+        GroupDesc::parse(&group_desc_before[..32])
+            .unwrap()
+            .free_blocks_count
+            - 1
+    );
+
+    let superblock = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::Superblock)
+        .unwrap();
+    assert_eq!(superblock.home, 0);
+    assert_eq!(
+        Superblock::parse(&superblock.after[1024..2048])
+            .unwrap()
+            .free_blocks_count,
+        Superblock::parse(&superblock_before[1024..2048])
+            .unwrap()
+            .free_blocks_count
+            - 1
+    );
+
     assert_eq!(pager.image().block(2), &bitmap_before);
+    assert_eq!(pager.image().block(1), &group_desc_before);
+    assert_eq!(pager.image().block(0), &superblock_before);
     assert_eq!(pager.image().block(4), &inode_table_before);
     assert_eq!(pager.image().block(48), &data_before);
+}
+
+#[test]
+fn pager_rejects_hole_plan_when_metadata_checksum_after_images_are_unsupported() {
+    let mut image = mock_image();
+    let mut superblock = Superblock::parse(&image.block(0)[1024..2048]).unwrap();
+    superblock.feature_ro_compat |= Superblock::FEATURE_RO_COMPAT_METADATA_CSUM;
+    superblock
+        .encode(&mut image.block_mut(0)[1024..2048])
+        .unwrap();
+    let mut pager = Ext4Pager::open(image).unwrap();
+
+    assert_eq!(
+        pager
+            .plan_write_page(InodeNo::new(12), 4, &filled_page(0xD4), FsyncStamp::new(12),)
+            .unwrap_err(),
+        Ext4FormatError::Unsupported
+    );
 }
 
 #[test]
@@ -698,6 +752,7 @@ fn mock_image() -> MemImage {
     let sb = Superblock {
         inodes_count: 64,
         blocks_count: 64,
+        free_blocks_count: 32,
         log_block_size: 2,
         blocks_per_group: 64,
         inodes_per_group: 64,
@@ -861,7 +916,10 @@ fn pager_derives_journal_ring_from_journal_inode_mapping() {
     assert_eq!(geometry.superblock.first, 1);
     assert_eq!(geometry.superblock.sequence, 24);
     assert_eq!(geometry.superblock.start, 3);
-    assert_eq!(geometry.blocks.as_slice(), &[40, 41, 42, 50, 51, 52, 53, 54]);
+    assert_eq!(
+        geometry.blocks.as_slice(),
+        &[40, 41, 42, 50, 51, 52, 53, 54]
+    );
     assert_eq!(
         geometry.superblock_page.as_ref(),
         Some(&expected_journal_superblock_page)
