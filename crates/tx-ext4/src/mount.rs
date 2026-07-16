@@ -3,13 +3,15 @@ use core::marker::Send;
 use crate::adapter::step_engine::Cap;
 use alloc::sync::Arc;
 use tx_ext4_format::pager::BlockImage;
+use tx_ext4_format::pager::Ext4Pager;
 use tx_subsystems::execution::Errno;
 use tx_subsystems::fs_iface::BackendPlanner;
+use tx_subsystems::io_manager::block::DeviceKey;
 use tx_subsystems::page_backed::FsPageBacking;
 use tx_subsystems::vfs::structure::{FsObjectId, InodeMeta};
 use tx_subsystems::vfs::FsOps;
 
-use crate::journal::{JournalFsyncSource, JournalMutationRuntime, JournalMutationWriteSource};
+use crate::journal::{JournalFsyncSource, JournalMutationRuntime, JournalMutationWriteSource, JournalPagePool};
 use crate::planner::{Ext4BlockGeometry, Ext4PlannerBinding};
 pub use crate::read_backend::FilePageContainerBinder;
 use crate::read_backend::{
@@ -172,6 +174,27 @@ where
     let mounted = open_ext4_with_planner_binding(image, false, binding)?;
     mutation_provider.bind(&mounted.backend);
     Ok(mounted)
+}
+
+/// Build a mutation-journal mount from the image's own JBD2 geometry.
+pub fn mount_ext4_read_write_with_discovered_journal<I>(
+    image: I,
+    geometry: Ext4BlockGeometry,
+    device: DeviceKey,
+    pool: JournalPagePool,
+) -> Result<MountedExt4<I>, Errno>
+where
+    I: BlockImage + Send + 'static,
+{
+    let mut pager = Ext4Pager::open(image).map_err(|_| Errno::EIO)?;
+    let journal_geometry = pager.journal_geometry().map_err(|_| Errno::EIO)?;
+    let image = pager.into_inner();
+    let source = Arc::new(JournalFsyncSource::new());
+    let runtime = Arc::new(
+        JournalMutationRuntime::from_geometry(source, pool, device, geometry.sectors_per_block, journal_geometry)
+            .map_err(|_| Errno::EIO)?,
+    );
+    mount_ext4_read_write_with_mutation_journal_io_manager_planner(image, geometry, runtime)
 }
 
 fn open_ext4_with_backend_planner<I>(
