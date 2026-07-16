@@ -1,9 +1,9 @@
 use crate::journal::Jbd2Superblock;
 use crate::ondisk::{
-    crc32c, encode_dir_entry, encode_journal_commit, encode_journal_descriptor, group_desc_csum16,
-    parse_journal_descriptor, superblock_csum32, BitmapMut, BitmapView, BlockMapping, CommitHeader,
-    DirEntry, DirEntryIter, Extent, ExtentIdx, ExtentNode, GroupDesc, Inode, InodeLocation,
-    InodeTableLayout, Superblock,
+    block_bitmap_csum32, crc32c, encode_dir_entry, encode_journal_commit,
+    encode_journal_descriptor, group_desc_csum16, inode_csum32, parse_journal_descriptor,
+    superblock_csum32, BitmapMut, BitmapView, BlockMapping, CommitHeader, DirEntry, DirEntryIter,
+    Extent, ExtentIdx, ExtentNode, GroupDesc, Inode, InodeLocation, InodeTableLayout, Superblock,
 };
 use crate::ondisk::{read_u16_le, read_u32_le, write_u16_le};
 use crate::{Ext4FormatError, Result};
@@ -305,7 +305,7 @@ impl<I: BlockImage> Ext4Pager<I> {
                 let (physical_block, group_index, bitmap_home, bitmap_before, bitmap_after) =
                     self.plan_block_allocation()?;
                 let (group_desc_home, group_desc_before, group_desc_after) =
-                    self.plan_group_free_block_decrement(group_index)?;
+                    self.plan_group_free_block_decrement(group_index, &bitmap_after)?;
                 let (superblock_home, superblock_before, superblock_after) =
                     self.plan_superblock_free_block_decrement()?;
                 let mut inode_after = disk_inode;
@@ -331,7 +331,25 @@ impl<I: BlockImage> Ext4Pager<I> {
                 let mut inode_table_before = [0u8; BLOCK_SIZE];
                 self.image.read_block(loc.block, &mut inode_table_before)?;
                 let mut inode_table_after = inode_table_before;
-                inode_after.encode(&mut inode_table_after[loc.offset..loc.offset + loc.len])?;
+                let inode_bytes = &mut inode_table_after[loc.offset..loc.offset + loc.len];
+                inode_after.encode(inode_bytes)?;
+                if self.superblock.has_metadata_csum() {
+                    inode_bytes[124..126].fill(0);
+                    if inode_bytes.len() >= 132 {
+                        inode_bytes[130..132].fill(0);
+                    }
+                    let checksum = inode_csum32(
+                        self.superblock.metadata_csum_seed(),
+                        inode.get(),
+                        inode_after.generation,
+                        inode_bytes,
+                    )?;
+                    inode_bytes[124..126].copy_from_slice(&(checksum as u16).to_le_bytes());
+                    if inode_bytes.len() >= 132 {
+                        inode_bytes[130..132]
+                            .copy_from_slice(&((checksum >> 16) as u16).to_le_bytes());
+                    }
+                }
 
                 plan.push_metadata(MetadataBlock {
                     home: bitmap_home,
@@ -429,7 +447,11 @@ impl<I: BlockImage> Ext4Pager<I> {
         Err(Ext4FormatError::OutOfBounds)
     }
 
-    fn plan_group_free_block_decrement(&self, group_index: usize) -> Result<(u64, Page4K, Page4K)> {
+    fn plan_group_free_block_decrement(
+        &self,
+        group_index: usize,
+        bitmap_after: &Page4K,
+    ) -> Result<(u64, Page4K, Page4K)> {
         let desc_size = self.superblock.group_desc_size();
         let byte_offset = group_index
             .checked_mul(desc_size)
@@ -459,6 +481,17 @@ impl<I: BlockImage> Ext4Pager<I> {
             after[offset + 44..offset + 46].copy_from_slice(&((next >> 16) as u16).to_le_bytes());
         }
         if self.superblock.has_metadata_csum() {
+            let bitmap_checksum = block_bitmap_csum32(
+                self.superblock.metadata_csum_seed(),
+                bitmap_after,
+                self.superblock.blocks_per_group,
+            )?;
+            after[offset + 24..offset + 26]
+                .copy_from_slice(&(bitmap_checksum as u16).to_le_bytes());
+            if desc_size >= 64 {
+                after[offset + 56..offset + 58]
+                    .copy_from_slice(&((bitmap_checksum >> 16) as u16).to_le_bytes());
+            }
             after[offset + 30..offset + 32].fill(0);
             let group_id = u32::try_from(group_index).map_err(|_| Ext4FormatError::OutOfBounds)?;
             let checksum = group_desc_csum16(

@@ -1,10 +1,10 @@
 use tx_ext4_format::mutation::{FsyncStamp, MutationOrigin};
 use tx_ext4_format::ondisk::{
-    crc32c, crc32c_append, group_desc_csum16, metadata_csum32, superblock_csum32, BitmapMut,
-    BitmapView, CommitHeader, DirEntryIter, DxCountLimit, DxEntry, DxEntryIter, DxRootInfo,
-    Ext4FormatError, Extent, ExtentHeader, ExtentIdx, ExtentNode, GroupDesc, Inode,
-    JournalBlockTag, JournalHeader, Superblock, JBD2_BLOCK_COMMIT, JBD2_BLOCK_DESCRIPTOR,
-    JBD2_MAGIC,
+    block_bitmap_csum32, crc32c, crc32c_append, group_desc_csum16, inode_csum32, metadata_csum32,
+    superblock_csum32, BitmapMut, BitmapView, CommitHeader, DirEntryIter, DxCountLimit, DxEntry,
+    DxEntryIter, DxRootInfo, Ext4FormatError, Extent, ExtentHeader, ExtentIdx, ExtentNode,
+    GroupDesc, Inode, JournalBlockTag, JournalHeader, Superblock, JBD2_BLOCK_COMMIT,
+    JBD2_BLOCK_DESCRIPTOR, JBD2_MAGIC,
 };
 use tx_ext4_format::pager::{
     BlockImage, DirEntryLite, Ext4Pager, InodeMetaLite, InodeNo, PageRead, WritebackReceipt,
@@ -461,6 +461,39 @@ fn pager_plans_metadata_checksum_after_images_for_hole_write() {
     assert_eq!(
         stored_desc_checksum,
         group_desc_csum16(seed, 0, &desc_bytes)
+    );
+
+    let bitmap = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::BlockBitmap)
+        .unwrap();
+    let stored_bitmap_checksum = u16::from_le_bytes(group_desc.after[24..26].try_into().unwrap());
+    assert_eq!(
+        stored_bitmap_checksum,
+        block_bitmap_csum32(seed, &bitmap.after, 64).unwrap() as u16
+    );
+
+    let inode_table = plan
+        .metadata
+        .iter()
+        .find(|block| block.role == tx_ext4_format::mutation::MetaRole::InodeTable)
+        .unwrap();
+    let inode_bytes = &inode_table.after[2816..3072];
+    let stored_inode_checksum = u32::from(u16::from_le_bytes(
+        inode_bytes[124..126].try_into().unwrap(),
+    )) | (u32::from(u16::from_le_bytes(
+        inode_bytes[130..132].try_into().unwrap(),
+    )) << 16);
+    assert_eq!(
+        stored_inode_checksum,
+        inode_csum32(
+            seed,
+            12,
+            u32::from_le_bytes(inode_bytes[100..104].try_into().unwrap()),
+            inode_bytes
+        )
+        .unwrap()
     );
 
     let superblock = plan

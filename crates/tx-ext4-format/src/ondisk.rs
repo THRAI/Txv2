@@ -1109,6 +1109,43 @@ pub fn group_desc_csum16(seed: u32, group_id: u32, desc_bytes: &[u8]) -> u16 {
     (metadata_csum32(seed, &[&group, desc_bytes]) & 0xFFFF) as u16
 }
 
+pub fn block_bitmap_csum32(seed: u32, bitmap_bytes: &[u8], block_count: u32) -> Result<u32> {
+    let byte_count = (block_count as usize)
+        .checked_add(7)
+        .ok_or(Ext4FormatError::OutOfBounds)?
+        / 8;
+    Ok(crc32c_append(seed, slice_at(bitmap_bytes, 0, byte_count)?))
+}
+
+pub fn inode_csum32(
+    seed: u32,
+    inode_number: u32,
+    generation: u32,
+    inode_bytes: &[u8],
+) -> Result<u32> {
+    require_len(inode_bytes, 128)?;
+    let inode_number = inode_number.to_le_bytes();
+    let generation = generation.to_le_bytes();
+    let zero = [0u8; 2];
+    let checksum_hi_offset = 130.min(inode_bytes.len());
+    let mut checksum = metadata_csum32(
+        seed,
+        &[
+            &inode_number,
+            &generation,
+            &inode_bytes[..124],
+            &zero,
+            &inode_bytes[126..checksum_hi_offset],
+        ],
+    );
+    if inode_bytes.len() >= 132 {
+        checksum = metadata_csum32(checksum, &[&zero, &inode_bytes[132..]]);
+    } else {
+        checksum = crc32c_append(checksum, &inode_bytes[checksum_hi_offset..]);
+    }
+    Ok(checksum)
+}
+
 pub fn dirblock_csum32(seed: u32, inode: u32, generation: u32, block_bytes: &[u8]) -> u32 {
     let inode = inode.to_le_bytes();
     let generation = generation.to_le_bytes();
