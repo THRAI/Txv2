@@ -871,6 +871,7 @@ struct JournalFsyncSourceState {
     transaction: JournalTransactionState<PreparedJournalTransaction>,
     data_submitted: Option<PageIoRequestId>,
     commit_submitted: Option<PageIoRequestId>,
+    checkpoint_submitted: bool,
 }
 
 impl JournalFsyncSource {
@@ -880,6 +881,7 @@ impl JournalFsyncSource {
                 transaction: JournalTransactionState::new(),
                 data_submitted: None,
                 commit_submitted: None,
+                checkpoint_submitted: false,
             }),
         }
     }
@@ -933,14 +935,19 @@ impl JournalFsyncSource {
     pub fn take_checkpoint_graph(
         &self,
     ) -> Result<Option<BackendBioGraph>, JournalTransactionStateError> {
-        let state = self.state.lock();
+        let mut state = self.state.lock();
+        if state.checkpoint_submitted {
+            return Err(JournalTransactionStateError::Busy);
+        }
         let Some(transaction) = state.transaction.checkpoint_ready()? else {
             return Ok(None);
         };
-        transaction
+        let graph = transaction
             .plan()
             .checkpoint_graph_after_commit()
-            .map_err(|_| JournalTransactionStateError::NotCommitted)
+            .map_err(|_| JournalTransactionStateError::NotCommitted)?;
+        state.checkpoint_submitted = graph.is_some();
+        Ok(graph)
     }
 
     /// Release retained transaction leases only after checkpoint I/O completes.
@@ -949,6 +956,7 @@ impl JournalFsyncSource {
         let _ = state.transaction.complete_checkpoint()?;
         state.data_submitted = None;
         state.commit_submitted = None;
+        state.checkpoint_submitted = false;
         Ok(())
     }
 }

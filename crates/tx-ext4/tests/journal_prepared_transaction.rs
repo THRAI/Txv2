@@ -339,6 +339,18 @@ fn journal_source_commits_only_after_data_graph_completion() {
         panic!("data durable must admit commit");
     };
     assert_eq!(commit.nodes().len(), 4);
+
+    source.complete_fsync(tx_subsystems::fs_iface::BackendPageCompletion::new(
+        fsync.object,
+        fsync.id,
+        fsync.op,
+        tx_subsystems::io_manager::page::PageIoResult::Done,
+    ));
+    assert!(source
+        .take_checkpoint_graph()
+        .expect("durable commit exposes checkpoint")
+        .is_some());
+    assert!(source.take_checkpoint_graph().is_err());
 }
 
 #[test]
