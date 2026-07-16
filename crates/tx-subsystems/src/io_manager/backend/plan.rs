@@ -170,7 +170,7 @@ const fn completion_kind_for_request(op: PageIoOp) -> PageIoCompletionKind {
     match op {
         PageIoOp::Read | PageIoOp::Readahead => PageIoCompletionKind::ReadInstalled,
         PageIoOp::Writeback => PageIoCompletionKind::WritebackFinished,
-        PageIoOp::Fsync => PageIoCompletionKind::Noop,
+        PageIoOp::Fsync | PageIoOp::Checkpoint => PageIoCompletionKind::Noop,
     }
 }
 

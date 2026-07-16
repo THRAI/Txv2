@@ -6,7 +6,7 @@
 //! `Frame` is intentionally not a zone entity: frame liveness is represented by
 //! typed page-substrate contributors.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -712,6 +712,7 @@ struct PageContainerState {
     file_io_leases: BTreeMap<PageIoRequestId, PageLease>,
     file_io_read_targets: BTreeMap<PageIoRequestId, CachedFrame>,
     fsync_submissions: BTreeMap<PageIoRequestId, fsync_submission::FsyncSubmission>,
+    background_graphs: BTreeSet<PageIoRequestId>,
     file_block_runtime: FileIoBlockRuntime,
     file_io_wake: Option<Arc<ServiceWakeSource>>,
     range_reservations: RangeReservationTable,
@@ -1000,6 +1001,7 @@ impl PageContainer {
                 file_io_leases: BTreeMap::new(),
                 file_io_read_targets: BTreeMap::new(),
                 fsync_submissions: BTreeMap::new(),
+                background_graphs: BTreeSet::new(),
                 file_block_runtime: FileIoBlockRuntime::new(1024, 16),
                 file_io_wake: None,
                 range_reservations: RangeReservationTable::new(),
@@ -2047,6 +2049,10 @@ impl PageContainer {
         route: &PageCompletionRoute,
     ) -> Option<Result<PageSlotSnapshot, PageSlotCompletionError>> {
         if route.completion.kind == PageIoCompletionKind::Noop {
+            if self.state.lock().background_graphs.remove(&route.completion.id) {
+                self.notify_file_background_completion(&route.completion);
+                return None;
+            }
             if self.terminalize_file_fsync_submission(&route.completion) {
                 self.notify_file_backend_completion(&route.completion);
             }
@@ -2185,6 +2191,73 @@ impl PageContainer {
             PageIoOp::Fsync,
             completion.result,
         ));
+        if completion.result != PageIoResult::Done {
+            return;
+        }
+        let object = FsObjectKey::new(fs_object_id.as_u64());
+        match planner.take_background_graph(object) {
+            Ok(Some(graph)) => self.queue_file_background_graph(planner, object, graph),
+            Ok(None) => {}
+            Err(_) => {}
+        }
+    }
+
+    fn queue_file_background_graph(
+        &self,
+        planner: &dyn crate::fs_iface::BackendPlanner,
+        object: FsObjectKey,
+        graph: crate::fs_iface::BackendBioGraph,
+    ) {
+        let queued = {
+            let mut state = self.state.lock();
+            let PageContainerState {
+                file_io_service,
+                file_block_runtime,
+                background_graphs,
+                ..
+            } = &mut *state;
+            match file_io_service.reserve_background_request(
+                self.io_manager_key(),
+                PageIoRange::new(0, self.page_count),
+            ) {
+                Ok(request) => match file_io_service.queue_backend_outcome(
+                    PageServiceBackendOutcome::BlockGraph(graph),
+                    &mut file_block_runtime.queue,
+                    request.clone(),
+                ) {
+                    Ok(_) => {
+                        background_graphs.insert(request.id);
+                        Ok(())
+                    }
+                    Err(_) => Err(Errno::EIO),
+                },
+                Err(_) => Err(Errno::EBUSY),
+            }
+        };
+        if let Err(errno) = queued {
+            planner.complete_background_graph(object, Err(errno));
+        }
+    }
+
+    fn notify_file_background_completion(
+        &self,
+        completion: &crate::io_manager::page::PageIoCompletion,
+    ) {
+        let PageContainerKind::File {
+            mount,
+            fs_object_id,
+        } = &self.kind
+        else {
+            return;
+        };
+        let Some(planner) = mount.payload().backend_planner() else {
+            return;
+        };
+        let result = match completion.result {
+            PageIoResult::Done => Ok(()),
+            PageIoResult::Err(errno) => Err(errno),
+        };
+        planner.complete_background_graph(FsObjectKey::new(fs_object_id.as_u64()), result);
     }
 
     fn register_file_service_metadata(

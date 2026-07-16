@@ -83,6 +83,7 @@ pub enum PageIoOp {
     Read,
     Writeback,
     Fsync,
+    Checkpoint,
     Readahead,
 }
 

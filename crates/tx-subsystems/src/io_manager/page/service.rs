@@ -429,6 +429,25 @@ impl PageService {
         Ok(PageServiceSubmit { id, wake })
     }
 
+    pub fn reserve_background_request(
+        &mut self,
+        pc: PageContainerKey,
+        range: PageIoRange,
+    ) -> Result<PageIoRequest, PageQueueError> {
+        let id = self.submissions.submit(
+            pc,
+            range,
+            PageIoOp::Checkpoint,
+            PageIoPriority::BackgroundWriteback,
+            PageIoFlags::EMPTY,
+            None,
+        )?;
+        Ok(self
+            .submissions
+            .remove(id)
+            .expect("newly reserved background request"))
+    }
+
     pub fn submit_with_kick<F>(
         &mut self,
         pc: PageContainerKey,
@@ -746,7 +765,7 @@ impl PageService {
                 crate::io_manager::page::PageIoCompletionKind::ReadInstalled
             }
             PageIoOp::Writeback => crate::io_manager::page::PageIoCompletionKind::WritebackFinished,
-            PageIoOp::Fsync => crate::io_manager::page::PageIoCompletionKind::Noop,
+            PageIoOp::Fsync | PageIoOp::Checkpoint => crate::io_manager::page::PageIoCompletionKind::Noop,
         };
         self.completions.push_back(PageIoCompletionEntry::new(
             PageIoCompletion::new(
@@ -866,7 +885,7 @@ impl PageService {
                 crate::io_manager::page::PageIoCompletionKind::ReadInstalled
             }
             PageIoOp::Writeback => crate::io_manager::page::PageIoCompletionKind::WritebackFinished,
-            PageIoOp::Fsync => crate::io_manager::page::PageIoCompletionKind::Noop,
+            PageIoOp::Fsync | PageIoOp::Checkpoint => crate::io_manager::page::PageIoCompletionKind::Noop,
         };
         let result = match result {
             Ok(()) => crate::io_manager::page::PageIoResult::Done,
@@ -2021,6 +2040,67 @@ mod tests {
                 other => panic!("expected graph terminal error, got {other:?}"),
             },
             other => panic!("expected graph terminal error work, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reserved_background_graph_emits_noop_without_pending_submission() {
+        let mut service = PageService::new(4);
+        let mut block_queue = BlockQueue::new(4);
+        let request = service
+            .reserve_background_request(PageContainerKey::new(7), PageIoRange::new(4, 1))
+            .expect("reserve checkpoint request");
+        assert_eq!(request.op, PageIoOp::Checkpoint);
+        assert_eq!(request.priority, PageIoPriority::BackgroundWriteback);
+        assert_eq!(service.submission_len(), 0);
+
+        let graph = BackendBioGraph::new(
+            alloc::vec![BackendBioNode::new(
+                BackendBioNodeId::new(91),
+                graph_bio(96, 9),
+                IoDataSource::None,
+            )],
+            alloc::vec![],
+        )
+        .expect("valid checkpoint graph");
+        service
+            .queue_backend_outcome(
+                PageServiceBackendOutcome::BlockGraph(graph),
+                &mut block_queue,
+                request.clone(),
+            )
+            .expect("queue checkpoint graph");
+
+        let mut depth = QueueDepth::new(1);
+        let mut tags = BlockTagTable::new();
+        let dispatched = block_queue
+            .pop_dispatchable_tagged(&mut depth, &mut tags)
+            .expect("checkpoint dispatch")
+            .expect("checkpoint graph root");
+        let mut tracker = BlockPageRequestTracker::new();
+        let terminal = service
+            .push_tagged_block_completion_with_graphs(
+                &mut tags,
+                &mut depth,
+                &mut tracker,
+                &mut block_queue,
+                dispatched.tag,
+                Ok(()),
+                |_| None,
+            )
+            .expect("checkpoint completion");
+        assert_eq!(terminal.queued, 1);
+
+        match service.drain_turn(ServiceBudget::new(1)) {
+            PageServiceTurn::Work(mut work) => match work.remove(0) {
+                PageServiceWork::Completion(route) => {
+                    assert_eq!(route.completion.id, request.id);
+                    assert_eq!(route.completion.kind, PageIoCompletionKind::Noop);
+                    assert_eq!(route.completion.result, PageIoResult::Done);
+                }
+                other => panic!("expected checkpoint completion, got {other:?}"),
+            },
+            other => panic!("expected checkpoint completion work, got {other:?}"),
         }
     }
 

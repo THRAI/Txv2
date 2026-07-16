@@ -3078,6 +3078,263 @@ fn file_fsync_submission_keeps_terminal_results_per_request_and_consumes_once() 
 }
 
 #[test]
+fn file_checkpoint_completion_notifies_background_graph_owner_only() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+
+    struct CheckpointPlanner {
+        page_completions: AtomicUsize,
+        background_completions: SpinMutex<Vec<Result<(), Errno>>>,
+    }
+
+    impl BackendPlanner for CheckpointPlanner {
+        fn plan_page_io(&self, _request: BackendPageRequest) -> BackendPlan {
+            BackendPlan::Err(Errno::ENOSYS)
+        }
+
+        fn complete_page_io(&self, _completion: crate::fs_iface::BackendPageCompletion) {
+            self.page_completions.fetch_add(1, Ordering::AcqRel);
+        }
+
+        fn complete_background_graph(
+            &self,
+            _object: crate::fs_iface::FsObjectKey,
+            result: Result<(), Errno>,
+        ) {
+            self.background_completions.lock().push(result);
+        }
+    }
+
+    let fs = Arc::new(RecordingFs::new());
+    let planner = Arc::new(CheckpointPlanner {
+        page_completions: AtomicUsize::new(0),
+        background_completions: SpinMutex::new(Vec::new()),
+    });
+    let pc = file_page_container_with_planner(
+        fs.clone(),
+        fs,
+        FsObjectId::new(102),
+        2,
+        planner.clone(),
+    );
+    let request = {
+        let mut state = pc.state.lock();
+        let request = state
+            .file_io_service
+            .reserve_background_request(pc.io_manager_key(), PageIoRange::new(0, 2))
+            .expect("reserve checkpoint request");
+        assert!(state.background_graphs.insert(request.id));
+        request
+    };
+    let route = PageCompletionRoute {
+        completion: PageIoCompletion::new(
+            request.id,
+            request.range,
+            PageIoResult::Done,
+            PageGeneration::new(0),
+            PageIoCompletionKind::Noop,
+        ),
+        frame: None,
+        waiters: Vec::new(),
+    };
+
+    assert_eq!(pc.apply_file_io_completion_route(&route), None);
+    assert_eq!(planner.page_completions.load(Ordering::Acquire), 0);
+    assert_eq!(*planner.background_completions.lock(), alloc::vec![Ok(())]);
+}
+
+#[test]
+fn file_fsync_completion_runs_checkpoint_graph_through_owned_l6() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+
+    struct CheckpointGraphPlanner {
+        page_completions: AtomicUsize,
+        graph: SpinMutex<Option<BackendBioGraph>>,
+        background_completions: SpinMutex<Vec<Result<(), Errno>>>,
+    }
+
+    impl BackendPlanner for CheckpointGraphPlanner {
+        fn plan_page_io(&self, _request: BackendPageRequest) -> BackendPlan {
+            BackendPlan::Err(Errno::ENOSYS)
+        }
+
+        fn complete_page_io(&self, _completion: crate::fs_iface::BackendPageCompletion) {
+            self.page_completions.fetch_add(1, Ordering::AcqRel);
+        }
+
+        fn take_background_graph(
+            &self,
+            _object: crate::fs_iface::FsObjectKey,
+        ) -> Result<Option<BackendBioGraph>, Errno> {
+            Ok(self.graph.lock().take())
+        }
+
+        fn complete_background_graph(
+            &self,
+            _object: crate::fs_iface::FsObjectKey,
+            result: Result<(), Errno>,
+        ) {
+            self.background_completions.lock().push(result);
+        }
+    }
+
+    let graph = BackendBioGraph::new(
+        alloc::vec![BackendBioNode::new(
+            BackendBioNodeId::new(92),
+            BioPlan::new(
+                DeviceKey::new(8),
+                BlockOp::Write,
+                LbaRange::new(88, 1),
+                alloc::vec![BioVec::new(0x200, 0, 512)],
+                BlockFlags::EMPTY,
+            ),
+            IoDataSource::None,
+        )],
+        alloc::vec![],
+    )
+    .expect("valid checkpoint graph");
+    let fs = Arc::new(RecordingFs::new());
+    let planner = Arc::new(CheckpointGraphPlanner {
+        page_completions: AtomicUsize::new(0),
+        graph: SpinMutex::new(Some(graph)),
+        background_completions: SpinMutex::new(Vec::new()),
+    });
+    let pc = file_page_container_with_planner(
+        fs.clone(),
+        fs,
+        FsObjectId::new(104),
+        2,
+        planner.clone(),
+    );
+    let fsync = pc.submit_file_fsync().expect("submit fsync");
+    let route = PageCompletionRoute {
+        completion: PageIoCompletion::new(
+            fsync,
+            PageIoRange::new(0, 2),
+            PageIoResult::Done,
+            PageGeneration::new(0),
+            PageIoCompletionKind::Noop,
+        ),
+        frame: None,
+        waiters: Vec::new(),
+    };
+
+    assert_eq!(pc.apply_file_io_completion_route(&route), None);
+    assert_eq!(planner.page_completions.load(Ordering::Acquire), 1);
+    assert_eq!(pc.file_io_block_queue_len_for_test(), 1);
+
+    struct CompletingExecutor {
+        completions: VecDeque<BlockDeviceCompletion>,
+    }
+
+    impl BlockDispatchExecutor for CompletingExecutor {
+        fn submit(&mut self, dispatch: &BlockDispatch) {
+            self.completions
+                .push_back(BlockDeviceCompletion::new(dispatch.tag, Ok(())));
+        }
+    }
+
+    impl BlockCompletionSource for CompletingExecutor {
+        fn poll_completion(&mut self) -> Option<BlockDeviceCompletion> {
+            self.completions.pop_front()
+        }
+    }
+
+    let mut executor = CompletingExecutor {
+        completions: VecDeque::new(),
+    };
+    let turn = pc
+        .drive_file_block_io_service_once(ServiceBudget::new(1), &mut executor, |_| None, |_| true)
+        .expect("run checkpoint graph through L6");
+    assert_eq!(turn.page_completions, 1);
+    pc.drive_file_io_service_once_owned(ServiceBudget::new(1), |_| true)
+        .expect("route checkpoint completion through L4");
+    assert_eq!(*planner.background_completions.lock(), alloc::vec![Ok(())]);
+}
+
+#[test]
+fn file_background_admission_failure_notifies_planner_after_releasing_state_lock() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+
+    struct AdmissionFailurePlanner {
+        calls: AtomicUsize,
+        called_under_state_lock: AtomicBool,
+    }
+
+    impl BackendPlanner for AdmissionFailurePlanner {
+        fn plan_page_io(&self, _request: BackendPageRequest) -> BackendPlan {
+            BackendPlan::Err(Errno::ENOSYS)
+        }
+
+        fn complete_background_graph(
+            &self,
+            _object: crate::fs_iface::FsObjectKey,
+            _result: Result<(), Errno>,
+        ) {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            self.called_under_state_lock.store(
+                page_container_state_lock_held_for_test(),
+                Ordering::Release,
+            );
+        }
+    }
+
+    let fs = Arc::new(RecordingFs::new());
+    let planner = Arc::new(AdmissionFailurePlanner {
+        calls: AtomicUsize::new(0),
+        called_under_state_lock: AtomicBool::new(false),
+    });
+    let pc = file_page_container_with_planner(
+        fs.clone(),
+        fs,
+        FsObjectId::new(103),
+        2,
+        planner.clone(),
+    );
+    {
+        let mut state = pc.state.lock();
+        for _ in 0..1024 {
+            state
+                .file_io_service
+                .submit(
+                    pc.io_manager_key(),
+                    PageIoRange::new(0, 1),
+                    PageIoOp::Read,
+                    PageIoPriority::Demand,
+                    PageIoFlags::DEMAND,
+                    None,
+                )
+                .expect("fill ordinary submission queue");
+        }
+    }
+    let graph = BackendBioGraph::new(
+        alloc::vec![BackendBioNode::new(
+            BackendBioNodeId::new(93),
+            BioPlan::new(
+                DeviceKey::new(8),
+                BlockOp::Write,
+                LbaRange::new(96, 1),
+                alloc::vec![BioVec::new(0x300, 0, 512)],
+                BlockFlags::EMPTY,
+            ),
+            IoDataSource::None,
+        )],
+        alloc::vec![],
+    )
+    .expect("valid checkpoint graph");
+
+    pc.queue_file_background_graph(planner.as_ref(), crate::fs_iface::FsObjectKey::new(103), graph);
+
+    assert_eq!(planner.calls.load(Ordering::Acquire), 1);
+    assert!(
+        !planner.called_under_state_lock.load(Ordering::Acquire),
+        "background completion callback must run after releasing PageContainer state lock"
+    );
+}
+
+#[test]
 fn fsync_op_waits_for_planner_completion_then_consumes_terminal_result() {
     let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
     setup_host_substrate();

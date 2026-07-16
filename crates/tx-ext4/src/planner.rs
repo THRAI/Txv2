@@ -394,6 +394,9 @@ impl<S: Ext4ReadMappingSource, J: Ext4FsyncPlanSource, W: Ext4WritePlanSource> B
                 self.mapping.map_page(&request),
             ),
             tx_subsystems::io_manager::page::PageIoOp::Fsync => self.fsync.plan_fsync(&request),
+            tx_subsystems::io_manager::page::PageIoOp::Checkpoint => {
+                BackendPlan::Err(Errno::ENOSYS)
+            }
         }
     }
 
@@ -925,6 +928,20 @@ mod tests {
             planner.plan_page_io(request),
             BackendPlan::SubmitGraph(_)
         ));
+    }
+
+    #[test]
+    fn ext4_read_planner_rejects_checkpoint_from_generic_request_path() {
+        let planner = Ext4ReadPlanner::new(
+            Ext4BlockGeometry::new(DeviceKey::new(7), 8),
+            FixedMapping {
+                mapping: Ext4ReadMapping::Hole,
+            },
+        );
+        let mut request = request(IoDataTarget::None);
+        request.op = tx_subsystems::io_manager::page::PageIoOp::Checkpoint;
+
+        assert_eq!(planner.plan_page_io(request), BackendPlan::Err(Errno::ENOSYS));
     }
 
     #[test]
