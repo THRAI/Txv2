@@ -908,6 +908,11 @@ fn same_ipv6_prefix(common: IfaceCommon, dst: Ipv6Address) -> bool {
     };
     let local = local.octets();
     let dst = dst.octets();
+    // Defensive: octets() is [u8;16], so plen/8 must stay <= 16 or the slice
+    // index below panics the kernel. Callers should already clamp (see
+    // ensure_ether_iface_for_link), but a raw netlink prefix_len must never
+    // reach an out-of-bounds index here.
+    let plen = plen.min(128);
     let full = (plen / 8) as usize;
     let rem = plen % 8;
     if local[..full] != dst[..full] {

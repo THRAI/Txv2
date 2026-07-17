@@ -1967,7 +1967,12 @@ impl NetNamespacePayload {
         // decide_ipv6_route can do the on-link prefix check; part of the
         // rebuild cache key so a v6-addr change re-leaks the iface.
         let ipv6_addr = link.ipv6_addr;
-        let ipv6_prefix_len = link.ipv6_prefix_len;
+        // Clamp to the v6 max (mirror the v4 `.min(32)` above). The netlink
+        // address parse (parse_ifaddrmsg) stores prefix_len as a raw byte and
+        // never bounds it, so `ip -6 addr add .../200` would otherwise reach
+        // decide_ipv6_route -> same_ipv6_prefix, which indexes a [u8;16] by
+        // plen/8 and panics the kernel out of bounds.
+        let ipv6_prefix_len = link.ipv6_prefix_len.map(|p| p.min(128));
         // IPv6 V3b: off-link v6 next-hop from the ::/0 default route (mirror of
         // the v4 `gateway`); part of the rebuild cache key so a v6-gateway change
         // re-leaks the iface.

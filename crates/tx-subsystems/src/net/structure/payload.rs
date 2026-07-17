@@ -810,41 +810,44 @@ impl SocketPayload {
         &self,
         bytes: &[u8],
         flags: super::types::SendRecvFlags,
-    ) -> Option<SocketSendReserve> {
+    ) -> Result<Option<SocketSendReserve>, crate::execution::Errno> {
         let more = flags.contains(super::types::SendRecvFlags::MSG_MORE);
         let (bytes, became_full, needs_poll_kick) =
             match &self.imp {
-                SocketImpl::Tcp(raw_tcp) => {
-                    let reserve = raw_tcp.enqueue_tx_bytes_with_more(bytes, more)?;
-                    (
+                SocketImpl::Tcp(raw_tcp) => match raw_tcp.enqueue_tx_bytes_with_more(bytes, more) {
+                    Some(reserve) => (
                         reserve.bytes,
                         reserve.became_full,
                         reserve.flushed_to_protocol,
-                    )
-                }
-                SocketImpl::Udp(raw_udp) => match self.udp_connected_remote() {
-                    Some(dst) => {
-                        raw_udp.set_tx_src_hint(self.udp_tx_src_hint(dst));
-                        let (bytes, became_full) =
-                            raw_udp.enqueue_tx_bytes_to_with_more(dst, bytes, more)?;
-                        (bytes, became_full, false)
-                    }
-                    None => {
-                        let (bytes, became_full) = raw_udp.enqueue_tx_bytes_to_with_more(
-                            IpEndpoint::new(Ipv4Address::UNSPECIFIED, 0),
-                            bytes,
-                            more,
-                        )?;
-                        (bytes, became_full, false)
-                    }
+                    ),
+                    None => return Ok(None),
                 },
-                _ => return None,
+                SocketImpl::Udp(raw_udp) => {
+                    // A plain send() with no msg_name still needs a destination:
+                    // use the connected peer, or fail EDESTADDRREQ like Linux (and
+                    // like the sendto path in reserve_send_bytes_to_with_flags).
+                    // The pre-refactor VecDeque accepted an unaddressable datagram
+                    // and silently dropped it at drain; the smoltcp tx ring cannot
+                    // stage an unspecified dst, so reject up front rather than
+                    // report success for bytes that never leave (and leave the
+                    // send-buffer accounting inconsistent).
+                    let dst = match self.udp_connected_remote() {
+                        Some(dst) => dst,
+                        None => return Err(crate::execution::Errno::EDESTADDRREQ),
+                    };
+                    raw_udp.set_tx_src_hint(self.udp_tx_src_hint(dst));
+                    match raw_udp.enqueue_tx_bytes_to_with_more(dst, bytes, more) {
+                        Some((bytes, became_full)) => (bytes, became_full, false),
+                        None => return Ok(None),
+                    }
+                }
+                _ => return Ok(None),
             };
-        Some(SocketSendReserve {
+        Ok(Some(SocketSendReserve {
             bytes,
             became_full,
             needs_poll_kick,
-        })
+        }))
     }
 
     pub(crate) fn reserve_send_bytes_to_with_flags(

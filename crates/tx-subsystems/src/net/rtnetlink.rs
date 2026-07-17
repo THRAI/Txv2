@@ -992,6 +992,12 @@ fn handle_newaddr(netns: &NetNamespacePayload, cred: Cred, payload: &[u8]) -> Re
     let ifindex = resolve_ifaddr_ifindex(netns, &info, &attrs)?;
     match info.family {
         AF_INET => {
+            // Reject an out-of-range prefix like Linux does (EINVAL), mirroring
+            // the route handlers' `dst_len > 32/128` guards. The prefix_len is a
+            // raw netlink byte and flows down into netmask/on-link-prefix math.
+            if info.prefix_len > 32 {
+                return Err(Errno::EINVAL);
+            }
             let addr = ipv4_addr_from_payload(addr_attr.payload)?;
             // `ip addr add` is additive: the first address becomes the
             // primary, further ones become secondaries (net_stress.interface
@@ -1007,6 +1013,12 @@ fn handle_newaddr(netns: &NetNamespacePayload, cred: Cred, payload: &[u8]) -> Re
             )
         }
         AF_INET6 => {
+            // Same guard for v6: a raw prefix_len > 128 would otherwise reach
+            // decide_ipv6_route -> same_ipv6_prefix, which indexes a [u8;16] by
+            // prefix_len/8 and panics the kernel out of bounds.
+            if info.prefix_len > 128 {
+                return Err(Errno::EINVAL);
+            }
             let addr = ipv6_addr_from_payload(addr_attr.payload)?;
             netns.add_device_ipv6_addr_by_ifindex(auth, ifindex, addr, info.prefix_len)
         }

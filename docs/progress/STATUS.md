@@ -1,3 +1,19 @@
+- 2026-07-16 (push 前全分支审计修复 — 2 个真 bug). 审计发现 2 个入账-blocking 缺陷,push 前修掉。**① IPv6
+  prefix_len 内核 panic 向量**(CAP_NET_ADMIN 可触发):`ip -6 addr add fe80::1/200` 的裸 prefix_len 未校验,
+  流到 decide_ipv6_route→same_ipv6_prefix 按 plen/8 索引 [u8;16] 越界 panic。**三层防御**:(a) rtnetlink.rs
+  handle_newaddr 按族拒绝 prefix_len>32(v4)/>128(v6) 返 EINVAL(Linux 正确,真源头,对齐 route handler 的
+  dst_len 守卫);(b) namespace.rs:1970 `ipv6_prefix_len.map(|p|p.min(128))`(镜像 v4 的 .min(32));(c)
+  ether/mod.rs same_ipv6_prefix 切片索引前 `plen.min(128)` 防御。**② 未连接 UDP send() 回归 + 红测试**:重构后
+  payload.rs reserve_send_bytes_with_flags 的 None 分支 enqueue 到 UNSPECIFIED:0,push_datagram_inner 静默丢弃且
+  不计账 → send_space 不减,committed 测试 step_send_kernel_bytes_records_tx_bytes_and_clears_when_full 变红
+  (left:4 right:0)。**修**:未连接 send() 无目的地址返 EDESTADDRREQ(Linux 正确,与本文件 sendto 路径一致),
+  改 reserve_send_bytes_with_flags 为 Result + step_send.rs 调用点适配;测试改为 connect 后再 send(真缓冲)+ 新增
+  EDESTADDRREQ 回归测试。**验证**:(1) 干净编译(独立 target dir+pin 工具链,仅 1 个 pre-existing 无关警告);
+  (2) 原红测试隔离转绿 + 新回归测试绿;(3) **零回归**——全量 set-diff(dirty vs clean)唯一差异=我新增的测试,
+  隔离逐测试 diff vs clean 字节级一致(7 个 pre-existing host-test 级联失败在 clean 上同样挂);(4) **端到端
+  netperf 5/5 + iperf 6/6**(rv64 loopback,run1 UDP_STREAM 挂=已知 flaky TCG SIGALRM SEGV a0=0xe/pc=ra=0x2000,
+  重跑即过无 segv,非本改动)。改动 6 文件(4 代码 + byte_io_tests + STATUS)。**Next**:用户 push 分支
+  (首次推 feature-network-refactor)+ 撤销临时 GitHub token。Blocker:无。
 - 2026-07-15 (setsockopt IP_TOS 支持 — SSH 能力探索副产品). 加 `IP_TOS=1` 常量(numbers.rs)+ re-export(mod.rs)
   + setsockopt IPPROTO_IP/IP_TOS 一臂(socket.rs:接受 DSCP/ToS 低字节存 opts.ip.tos,不再返 ENOPROTOOPT)。动机:
   OpenSSH 客户端(及 curl)会设 IP_TOS 做 QoS,之前返 "Protocol not available" 警告。**背景=打通 git-over-SSH**:

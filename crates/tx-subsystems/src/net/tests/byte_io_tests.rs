@@ -96,6 +96,14 @@ fn step_send_kernel_bytes_records_tx_bytes_and_clears_when_full() {
     let udp = registry::create_socket_for_test_or_bootstrap(SocketKind::Udp, options)
         .expect("udp socket");
     assert_eq!(step_bind(&udp, inet(40_139), &guard), StepOutcome::Done(()));
+    // A plain send() needs a destination: connect so the datagram is
+    // addressable and actually consumes the send buffer. (An unconnected
+    // send() with no msg_name now correctly fails EDESTADDRREQ and buffers
+    // nothing, matching Linux and the sendto path.)
+    assert_eq!(
+        step_connect(&udp, inet(40_140), &guard),
+        StepOutcome::Done(())
+    );
     udp.readiness.fire_send(SendWireSet::SPACE);
 
     assert_eq!(
@@ -105,4 +113,31 @@ fn step_send_kernel_bytes_records_tx_bytes_and_clears_when_full() {
     let payload = udp.acquire_operational().expect("payload");
     assert_eq!(payload.io_snapshot().send_space, 0);
     assert_eq!(udp.readiness.send_wq.peek() & SendWireSet::SPACE.bits(), 0);
+}
+
+#[test]
+fn step_send_kernel_bytes_unconnected_udp_fails_edestaddrreq() {
+    // Regression: a plain send() with no msg_name on an unconnected UDP socket
+    // must fail EDESTADDRREQ (like Linux and the sendto path) rather than
+    // silently drop the datagram while reporting success — the latter also left
+    // the send-buffer accounting inconsistent (send_space never dropped).
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    let guard = tx_substrate::epoch::guard();
+    let udp = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Udp,
+        SocketOptionSet::default_udp(),
+    )
+    .expect("udp socket");
+    assert_eq!(step_bind(&udp, inet(40_141), &guard), StepOutcome::Done(()));
+
+    assert_eq!(
+        step_send_kernel_bytes(&udp, &[1, 2, 3, 4], SendRecvFlags::empty(), &guard),
+        StepOutcome::Err(Errno::EDESTADDRREQ)
+    );
+    // Nothing was staged, so the send buffer is untouched.
+    let payload = udp.acquire_operational().expect("payload");
+    assert!(payload.io_snapshot().send_space > 0);
 }

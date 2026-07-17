@@ -128,9 +128,13 @@ pub fn step_send_kernel_bytes(
         return send_unix_datagram_connected(socket, &payload, bytes, guard);
     }
 
-    let Some(reserve) = payload.reserve_send_bytes_with_flags(bytes, flags) else {
-        socket.readiness.clear_send(SendWireSet::SPACE);
-        return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
+    let reserve = match payload.reserve_send_bytes_with_flags(bytes, flags) {
+        Ok(Some(reserve)) => reserve,
+        Ok(None) => {
+            socket.readiness.clear_send(SendWireSet::SPACE);
+            return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
+        }
+        Err(errno) => return StepOutcome::Err(errno),
     };
 
     if reserve.bytes == 0 {
