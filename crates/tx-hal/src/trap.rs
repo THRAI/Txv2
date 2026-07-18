@@ -16,32 +16,6 @@ pub enum TrapClass {
     UnknownInterrupt,
 }
 
-impl TrapClass {
-    #[allow(non_upper_case_globals)]
-    pub const InstructionPageFault: Self = Self::PageFault {
-        write: false,
-        instruction: true,
-    };
-    #[allow(non_upper_case_globals)]
-    pub const LoadPageFault: Self = Self::PageFault {
-        write: false,
-        instruction: false,
-    };
-    #[allow(non_upper_case_globals)]
-    pub const StorePageFault: Self = Self::PageFault {
-        write: true,
-        instruction: false,
-    };
-    #[allow(non_upper_case_globals)]
-    pub const UserEnvCall: Self = Self::Syscall;
-    #[allow(non_upper_case_globals)]
-    pub const SupervisorTimer: Self = Self::TimerInterrupt;
-    #[allow(non_upper_case_globals)]
-    pub const SupervisorExternal: Self = Self::ExternalInterrupt;
-    #[allow(non_upper_case_globals)]
-    pub const Unknown: Self = Self::UnknownSync;
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TrapPreviousMode {
     User,
@@ -60,19 +34,22 @@ pub struct TrapSnapshot {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TrapFrameSnapshot {
-    pub scause: usize,
-    pub sepc: usize,
-    pub stval: usize,
+    /// Architecture trap cause (RV64 `scause`, LA64 `ESTAT`).
+    pub cause: usize,
+    /// Faulting/return program counter (RV64 `sepc`, LA64 `ERA`).
+    pub pc: usize,
+    /// Fault value (RV64 `stval`, LA64 `BADV`).
+    pub fault_value: usize,
 }
 
 impl TrapFrameSnapshot {
     pub const fn portable(self, class: TrapClass) -> TrapSnapshot {
         TrapSnapshot {
             class,
-            pc: VirtAddr(self.sepc),
+            pc: VirtAddr(self.pc),
             fault_address: match class {
                 TrapClass::PageFault { .. } | TrapClass::AlignmentFault { .. } => {
-                    Some(VirtAddr(self.stval))
+                    Some(VirtAddr(self.fault_value))
                 }
                 _ => None,
             },

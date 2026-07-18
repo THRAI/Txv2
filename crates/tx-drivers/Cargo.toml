@@ -15,6 +15,11 @@ tx-platform-adapter = { path = "../tx-platform-adapter" }
 tx-substrate = { path = "../tx-substrate" }
 tx-subsystems = { path = "../tx-subsystems" }
 virtio-drivers = { version = "0.11.0", default-features = false }
+# SD/MMC (DesignWare MSHC) driver register definitions, ported from
+# Chronix (GPLv3). bitflags pinned to the 1.x line to match the ported
+# macro syntax.
+bitflags = "1.3"
+bitfield-struct = "0.8"
 
 [lib]
 path = "src/lib.rs"

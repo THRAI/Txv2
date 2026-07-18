@@ -1,6 +1,6 @@
+use super::la64_percpu::la64_current_cpu_id;
 use super::la64_pmap::{
-    dmw_covers_phys_range, la64_current_cpu_id, la64_fixup_lookup, la64_kernel_addr_to_phys,
-    la64_uncached_virt,
+    dmw_covers_phys_range, la64_fixup_lookup, la64_kernel_addr_to_phys, la64_uncached_virt,
 };
 use super::*;
 
@@ -909,18 +909,6 @@ pub(crate) fn console_write_decimal(mut value: usize) {
         }
     }
     Platform::write_bytes(&buf[cursor..]);
-}
-
-#[no_mangle]
-#[cfg(target_arch = "loongarch64")]
-extern "C" fn tx_la64_qemu_unhandled_exception() -> ! {
-    Platform::write_bytes(b"txkernel:qemu-loongarch64-virt:trap\n");
-    loop {
-        unsafe {
-            core::arch::asm!("idle 0", options(nomem, nostack));
-        }
-        core::hint::spin_loop();
-    }
 }
 
 pub(crate) fn align_up(value: usize, align: usize) -> usize {

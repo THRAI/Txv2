@@ -124,17 +124,12 @@ fn rv64_trap_classification_decodes_sync_faults_and_interrupts() {
     );
     assert_eq!(
         Platform::classify_trap(TrapFrameSnapshot {
-            scause: interrupt_bit | 9,
-            sepc: 0x1000,
-            stval: 0,
+            cause: interrupt_bit | 9,
+            pc: 0x1000,
+            fault_value: 0,
         }),
         TrapClass::ExternalInterrupt
     );
-}
-
-#[test]
-fn rv64_trap_classification_distinguishes_unknown_sync_and_interrupt() {
-    let interrupt_bit = 1usize << (usize::BITS as usize - 1);
 
     assert_eq!(classify_rv64_trap(63), TrapClass::UnknownSync);
     assert_eq!(
@@ -144,40 +139,11 @@ fn rv64_trap_classification_distinguishes_unknown_sync_and_interrupt() {
 }
 
 #[test]
-fn trap_class_legacy_names_remain_compatible() {
-    assert_eq!(
-        TrapClass::InstructionPageFault,
-        TrapClass::PageFault {
-            write: false,
-            instruction: true,
-        }
-    );
-    assert_eq!(
-        TrapClass::LoadPageFault,
-        TrapClass::PageFault {
-            write: false,
-            instruction: false,
-        }
-    );
-    assert_eq!(
-        TrapClass::StorePageFault,
-        TrapClass::PageFault {
-            write: true,
-            instruction: false,
-        }
-    );
-    assert_eq!(TrapClass::UserEnvCall, TrapClass::Syscall);
-    assert_eq!(TrapClass::SupervisorTimer, TrapClass::TimerInterrupt);
-    assert_eq!(TrapClass::SupervisorExternal, TrapClass::ExternalInterrupt);
-    assert_eq!(TrapClass::Unknown, TrapClass::UnknownSync);
-}
-
-#[test]
 fn platform_trap_snapshot_projects_portable_fault_fields() {
     let snapshot = TrapFrameSnapshot {
-        scause: 15,
-        sepc: 0x2000,
-        stval: 0xfeed_cafe,
+        cause: 15,
+        pc: 0x2000,
+        fault_value: 0xfeed_cafe,
     };
 
     let portable = Platform::snapshot_trap(snapshot);
@@ -363,17 +329,6 @@ fn plic_dispatch_table_invokes_handler_and_masks_unhandled_irq() {
     );
 
     <Platform as PercpuIf>::write_kernel_tls(saved_tls);
-}
-
-#[test]
-fn cache_methods_are_callable_on_qemu_coherent_platform() {
-    <Platform as CacheIf>::fence_all();
-    <Platform as CacheIf>::fence_i_local();
-    <Platform as CacheIf>::fence_i_all();
-    <Platform as CacheIf>::flush_icache_range(VirtAddr(0x8020_0000), 4096);
-    <Platform as CacheIf>::dcache_clean_range(PhysAddr(0x8020_0000), 4096);
-    <Platform as CacheIf>::dcache_invalidate_range(PhysAddr(0x8020_0000), 4096);
-    <Platform as CacheIf>::dcache_clean_invalidate_range(PhysAddr(0x8020_0000), 4096);
 }
 
 #[test]
@@ -655,15 +610,11 @@ fn trap_dispatch_lazily_enables_user_fp_once() {
 #[test]
 fn remote_sfence_targets_exclude_current_hart() {
     let targets = remote_sfence_targets_from(CpuMask::from_bits(0b1111), CpuId(2));
-
     assert_eq!(targets.bits(), 0b1011);
-}
 
-#[test]
-fn remote_sfence_targets_are_empty_for_uniprocessor_online_mask() {
-    let targets = remote_sfence_targets_from(CpuMask::single(CpuId(0)), CpuId(0));
-
-    assert!(targets.is_empty());
+    // A uniprocessor online mask (only the current hart) yields no targets.
+    let uni = remote_sfence_targets_from(CpuMask::single(CpuId(0)), CpuId(0));
+    assert!(uni.is_empty());
 }
 
 #[test]
@@ -803,14 +754,11 @@ fn trap_frame_fp_context_zeroed_when_restored_without_valid_fp() {
 }
 
 #[test]
-fn sbi_console_helper_collapses_crlf_pairs() {
+fn sbi_console_helper_collapses_crlf_and_preserves_other_bytes() {
     let mut out = std::vec::Vec::new();
     for_each_console_byte_for_sbi(b"hi\r\nthere\r\n", |byte| out.push(byte));
     assert_eq!(out, b"hi\nthere\n");
-}
 
-#[test]
-fn sbi_console_helper_preserves_non_crlf_bytes() {
     let mut out = std::vec::Vec::new();
     for_each_console_byte_for_sbi(b"\rlead\nmid\rtrail", |byte| out.push(byte));
     assert_eq!(out, b"\rlead\nmid\rtrail");

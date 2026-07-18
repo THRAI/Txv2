@@ -30,9 +30,7 @@ use tx_hal::{PhysAddr, PhysRange, PmapError, PmapPermissions};
 use crate::boot_static::{BootStaticBag, PageTable};
 
 #[cfg(target_arch = "riscv64")]
-use super::topology::{
-    direct_map_virt, DIRECT_MAP_BASE, DIRECT_MAP_SIZE, PAGE_SIZE, QEMU_RAM_BASE,
-};
+use super::topology::direct_map_virt;
 
 pub(crate) const PTE_V: u64 = 1 << 0;
 pub(crate) const PTE_R: u64 = 1 << 1;
@@ -144,8 +142,6 @@ pub(crate) fn pte_phys(pte: u64) -> PhysAddr {
 pub(crate) unsafe fn page_table_mut_from_phys(phys: PhysAddr) -> &'static mut PageTable {
     #[cfg(target_arch = "riscv64")]
     {
-        #[cfg(tx_pmap_debug)]
-        debug_page_table_phys(phys);
         unsafe { &mut *(direct_map_virt(phys.0) as *mut PageTable) }
     }
 
@@ -153,27 +149,4 @@ pub(crate) unsafe fn page_table_mut_from_phys(phys: PhysAddr) -> &'static mut Pa
     {
         unsafe { &mut *(phys.0 as *mut PageTable) }
     }
-}
-
-#[cfg(all(target_arch = "riscv64", tx_pmap_debug))]
-fn debug_page_table_phys(phys: PhysAddr) {
-    let out_of_contract = phys.0 < QEMU_RAM_BASE
-        || phys.0 >= QEMU_RAM_BASE.saturating_add(DIRECT_MAP_SIZE)
-        || !phys.0.is_multiple_of(PAGE_SIZE)
-        || DIRECT_MAP_BASE.checked_add(phys.0).is_none();
-    if !out_of_contract {
-        return;
-    }
-
-    let caller_ra: usize;
-    unsafe {
-        core::arch::asm!("mv {ra}, ra", ra = out(reg) caller_ra, options(nomem, nostack));
-    }
-    crate::trap::console_write_literal(
-        b"txkernel:qemu-riscv64-virt:pmap:bad-page-table-phys:phys=0x",
-    );
-    crate::trap::console_write_hex(phys.0);
-    crate::trap::console_write_literal(b":caller_ra=0x");
-    crate::trap::console_write_hex(caller_ra);
-    crate::trap::console_write_literal(b"\n");
 }

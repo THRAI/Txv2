@@ -47,17 +47,7 @@ use tx_hal::UserTrapContext;
 use crate::trap::Rv64TrapFrame;
 
 #[cfg(all(target_arch = "riscv64", feature = "trap-trace"))]
-const X_RA: usize = 1;
-#[cfg(all(target_arch = "riscv64", feature = "trap-trace"))]
-const X_SP: usize = 2;
-#[cfg(all(target_arch = "riscv64", feature = "trap-trace"))]
-const X_A0: usize = 10;
-#[cfg(all(target_arch = "riscv64", feature = "trap-trace"))]
-const X_A1: usize = 11;
-#[cfg(all(target_arch = "riscv64", feature = "trap-trace"))]
-const X_A2: usize = 12;
-#[cfg(all(target_arch = "riscv64", feature = "trap-trace"))]
-const X_A7: usize = 17;
+use crate::trap::{X_A0, X_A1, X_A2, X_A7, X_RA, X_SP};
 
 #[cfg(all(target_arch = "riscv64", feature = "trap-trace"))]
 use core::sync::atomic::{AtomicUsize, Ordering};

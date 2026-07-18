@@ -287,14 +287,21 @@ impl BootPlatformIf for Platform {
     const BOOT_PROTOCOL: BootProtocol = BootProtocol::RiscvSbi;
 
     fn boot_handoff(cpu_id: usize, firmware_arg: usize) -> BootHandoff {
+        // firmware_arg 是 SBI 交来的 DTB(设备树)物理地址——只是个指针,
+        // 真正的内存/设备信息还锁在它指向的 blob 里,必须现在就地解析。
+        // 解析 DTB,把内存布局/设备等榨进静态包(capture_once 保证全局只解析一次)
         let bag = BootStaticBag::<IdentityLive>::capture_once(firmware_arg);
+        // 建立引导页表:Sv39 无硬件直映射窗口,内核要在高地址跑必须软件建表
         pmap::adopt_high_linked_bootstrap_pmap(bag);
 
+        // 把解析出的事实发布成全局 BootInfo/PlatformInfo(供上层 boot_info() 等读),
+        // 并在拆除低地址恒等映射前完成收尾(IdentityLive -> IdentityDropped 类型状态机)
         BootStaticBag::<IdentityLive>::take_global()
             .publish_boot_info_before_identity_drop(firmware_arg)
             .complete_post_entry_pipeline()
             .install_global();
 
+        // 最后才做契约默认版做的那件事:把裸值套壳成交接单返回
         BootHandoff {
             cpu_id: CpuId(cpu_id),
             firmware_arg: BootArg(firmware_arg),
@@ -308,19 +315,21 @@ impl InitIf for Platform {
     fn init_later(_handoff: BootHandoff) {}
 }
 
+// 三个方法都一样:从那张已定案的启动登记表(BootStaticBag)里把对应字段取出来。
+// 解析设备树、发布这些脏活在 boot_handoff 里干完了,这边只管读。
 impl BootInfoIf for Platform {
     fn boot_info() -> &'static BootInfo {
-        BootStaticBag::<IdentityDropped>::global_ref().boot_info_ref()
+        BootStaticBag::<IdentityDropped>::global_ref().boot_info_ref()   // 取内核初始化信息
     }
 }
 
 impl PlatformInfoIf for Platform {
     fn platform_info() -> &'static PlatformInfo {
-        BootStaticBag::<IdentityDropped>::global_ref().platform_info_ref()
+        BootStaticBag::<IdentityDropped>::global_ref().platform_info_ref()   // 取硬件信息
     }
 
     fn devices() -> &'static [tx_hal::DeviceInfo] {
-        BootStaticBag::<IdentityDropped>::global_ref().platform_devices_ref()
+        BootStaticBag::<IdentityDropped>::global_ref().platform_devices_ref()   // 取设备列表
     }
 }
 
@@ -550,10 +559,6 @@ impl IrqIf for Platform {
 
     fn in_irq_context() -> bool {
         irq_context_depth() != 0
-    }
-
-    fn interrupts_enabled() -> bool {
-        supervisor_interrupts_enabled()
     }
 
     fn claim() -> u32 {
@@ -838,7 +843,7 @@ impl EntropyIf for Platform {
         use core::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0xA5A5_5A5A_DEAD_BEEF);
 
-        let ticks: u64 = read_rdtime_ticks();
+        let ticks: u64 = time::read_time_ticks();
         let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut s = ticks ^ counter.rotate_left(13);
         // Avoid the all-zero xorshift fixed point.
@@ -929,28 +934,6 @@ pub fn obs_ring_bytes(hart: CpuId) -> Option<&'static [u8]> {
     // workload has reached its observation-quiescence point for the selected
     // hart. Live host drain reads the same backing while the guest runs.
     unsafe { Some(&TX_OBSERVE_RINGS[idx].0[..]) }
-}
-
-#[cfg(target_arch = "riscv64")]
-fn read_rdtime_ticks() -> u64 {
-    let ticks: u64;
-    unsafe {
-        core::arch::asm!(
-            "rdtime {ticks}",
-            ticks = out(reg) ticks,
-            options(nomem, nostack)
-        );
-    }
-    ticks
-}
-
-#[cfg(not(target_arch = "riscv64"))]
-fn read_rdtime_ticks() -> u64 {
-    // Host-test fallback: return 0 so the trait default counter
-    // alone provides variance. The host test
-    // `entropy_fill_random_distinct_calls_diverge` exercises this
-    // path.
-    0
 }
 
 fn current_cpu_id() -> CpuId {
@@ -1511,23 +1494,6 @@ fn current_irq_depth_cell() -> &'static AtomicUsize {
 fn current_percpu_area() -> Option<&'static Rv64PerCpuArea> {
     let cpu = cpu_id_from_kernel_tls(read_kernel_tls())?;
     RV64_PERCPU_AREAS.get(cpu.0)
-}
-
-fn supervisor_interrupts_enabled() -> bool {
-    #[cfg(target_arch = "riscv64")]
-    {
-        const RV64_SSTATUS_SIE: usize = 1 << 1;
-        let sstatus: usize;
-        unsafe {
-            core::arch::asm!("csrr {sstatus}, sstatus", sstatus = out(reg) sstatus, options(nomem, nostack));
-        }
-        sstatus & RV64_SSTATUS_SIE != 0
-    }
-
-    #[cfg(not(target_arch = "riscv64"))]
-    {
-        true
-    }
 }
 
 fn enable_supervisor_software_interrupts() {

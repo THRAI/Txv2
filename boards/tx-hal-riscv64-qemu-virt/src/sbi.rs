@@ -2,7 +2,8 @@
 // jumbo split).
 //
 // Thin wrappers over the SBI ecall ABI used by the QEMU-virt board: legacy
-// console putchar / getchar (EID 1, 2), legacy shutdown (EID 8), HSM hart_start
+// set_timer (EID 0), legacy console putchar / getchar (EID 1, 2), legacy
+// shutdown (EID 8), HSM hart_start
 // (EID 0x48534D / fid 0), sPI send_ipi (EID 0x735049), and RFNC remote-fence
 // variants (EID 0x52464E43, fids 0/1/2). Each ecall site owns its own
 // `core::arch::asm!` so the constraint set stays local; non-rv64 builds expose
@@ -157,6 +158,21 @@ pub(super) fn sbi_remote_sfence_vma_asid(
     }
     error
 }
+
+#[cfg(target_arch = "riscv64")]
+pub(super) fn sbi_set_timer(deadline_ticks: u64) {
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            inlateout("a0") deadline_ticks as usize => _,
+            in("a7") 0usize,
+            options(nostack)
+        );
+    }
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+pub(super) fn sbi_set_timer(_deadline_ticks: u64) {}
 
 #[cfg(target_arch = "riscv64")]
 pub(super) fn sbi_shutdown() {

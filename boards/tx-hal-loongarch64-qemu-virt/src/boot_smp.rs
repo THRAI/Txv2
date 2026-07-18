@@ -4,7 +4,7 @@
 //! platform's `SmpIf` implementation.
 
 use super::la64_irq_trap::{read_la64_csr, write_la64_csr};
-use super::la64_pmap::la64_current_cpu_id;
+use super::la64_percpu::la64_current_cpu_id;
 use super::*;
 
 #[cfg(target_arch = "loongarch64")]

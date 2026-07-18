@@ -516,16 +516,16 @@ const RV64_SSTATUS_FS_MASK: usize = 3 << 13;
 const RV64_SSTATUS_FS_OFF: usize = 0 << 13;
 const RV64_SSTATUS_FS_INITIAL: usize = 1 << 13;
 const RV64_SSTATUS_FS_DIRTY: usize = 3 << 13;
-const X_SP: usize = 2;
-const X_RA: usize = 1;
+pub(crate) const X_SP: usize = 2;
+pub(crate) const X_RA: usize = 1;
 const X_TP: usize = 4;
-const X_A0: usize = 10;
-const X_A1: usize = 11;
-const X_A2: usize = 12;
+pub(crate) const X_A0: usize = 10;
+pub(crate) const X_A1: usize = 11;
+pub(crate) const X_A2: usize = 12;
 const X_A3: usize = 13;
 const X_A4: usize = 14;
 const X_A5: usize = 15;
-const X_A7: usize = 17;
+pub(crate) const X_A7: usize = 17;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -544,9 +544,9 @@ pub struct Rv64TrapFrame {
 impl Rv64TrapFrame {
     pub const fn snapshot(&self) -> TrapFrameSnapshot {
         TrapFrameSnapshot {
-            scause: self.scause,
-            sepc: self.sepc,
-            stval: self.stval,
+            cause: self.scause,
+            pc: self.sepc,
+            fault_value: self.stval,
         }
     }
 
@@ -601,24 +601,7 @@ impl Rv64TrapFrame {
     }
 
     pub fn view_mut(&mut self) -> TrapFrameMut<'_> {
-        let view = TrapFrameView::new(
-            VirtAddr(self.sepc),
-            VirtAddr(self.x[X_SP]),
-            self.x[X_A7] as u64,
-            [
-                self.x[X_A0] as u64,
-                self.x[X_A1] as u64,
-                self.x[X_A2] as u64,
-                self.x[X_A3] as u64,
-                self.x[X_A4] as u64,
-                self.x[X_A5] as u64,
-            ],
-            self.fault_address(),
-            self.faulting_instruction(),
-            self.previous_mode(),
-            self.interrupts_enabled_before(),
-            self.x[X_TP] as u64,
-        );
+        let view = self.view();
         let raw = NonNull::from(&mut *self).cast::<()>();
         unsafe { TrapFrameMut::from_raw_parts(view, raw, &RV64_TRAP_FRAME_MUT_VTABLE) }
     }
@@ -786,7 +769,7 @@ impl TrapIf for Platform {
     }
 
     fn classify_trap(snapshot: TrapFrameSnapshot) -> TrapClass {
-        classify_rv64_trap(snapshot.scause)
+        classify_rv64_trap(snapshot.cause)
     }
 
     /// RV64 implementation of the portable userspace-entry hook.

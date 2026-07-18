@@ -178,22 +178,6 @@ struct Rv64SignalFrame {
 unsafe impl Pod for Rv64SignalFrame {}
 
 impl Rv64SignalFrame {
-    fn new(tf: &TrapFrameMut<'_>, setup: &SignalFrameWrite) -> Self {
-        let captured = tf.capture_user_context();
-        Self {
-            magic: RV64_SIGFRAME_MAGIC,
-            version: RV64_SIGFRAME_VERSION,
-            frame_size: size_of::<Self>() as u32,
-            sig_no: setup.sig_no,
-            _reserved0: 0,
-            flags: setup.flags.bits,
-            saved_fp: captured.fp,
-            saved_status: captured.status as u64,
-            siginfo: setup.siginfo,
-            ucontext: LinuxUcontextRv64::from_user_context(&captured, setup.old_mask.bits),
-            trampoline: RV64_SIGRETURN_TRAMPOLINE,
-        }
-    }
 
     fn validate(&self, user_sp: UserPtr<u8>) -> Result<(), FaultInfo> {
         if self.magic == RV64_SIGFRAME_MAGIC
@@ -233,68 +217,6 @@ impl Rv64SignalFrame {
 }
 
 impl SignalFrameIf for Platform {
-    fn write_signal_frame(
-        mut tf: TrapFrameMut<'_>,
-        setup: SignalFrameWrite,
-    ) -> Result<SignalFramePlacement, FaultInfo> {
-        let frame_size = size_of::<Rv64SignalFrame>();
-        let Some(unrounded_frame_addr) = setup.stack_top.addr().checked_sub(frame_size) else {
-            return Err(FaultInfo {
-                address: VirtAddr(setup.stack_top.addr()),
-                write: true,
-                instruction: false,
-                from_user: false,
-            });
-        };
-        let frame_addr = align_down(unrounded_frame_addr, RV64_SIGFRAME_ALIGN);
-
-        let frame = Rv64SignalFrame::new(&tf, &setup);
-        let user_frame = UserPtr::<Rv64SignalFrame>::new(frame_addr);
-
-        // SAFETY: the stack address was selected by signal delivery policy as
-        // a user stack. `board_copy_to_user` performs the actual user copy
-        // through the SUM/fixup-table primitive and converts faults into
-        // FaultInfo.
-        unsafe {
-            let frame_ptr: *const Rv64SignalFrame = &frame;
-            let bytes =
-                core::slice::from_raw_parts(frame_ptr.cast::<u8>(), size_of::<Rv64SignalFrame>());
-            board_copy_to_user(UserPtr::<u8>::new(user_frame.addr()), bytes)?;
-        }
-
-        let siginfo_addr = frame_addr + offset_of!(Rv64SignalFrame, siginfo);
-        let ucontext_addr = frame_addr + offset_of!(Rv64SignalFrame, ucontext);
-        let trampoline_pc = frame_addr + offset_of!(Rv64SignalFrame, trampoline);
-
-        tf.set_pc(VirtAddr(setup.handler_pc.addr()));
-        tf.set_sp(VirtAddr(frame_addr));
-        tf.set_signal_handler_regs(SignalHandlerRegs {
-            return_pc: VirtAddr(trampoline_pc),
-            args: [setup.sig_no as usize, siginfo_addr, ucontext_addr],
-        });
-
-        Ok(SignalFramePlacement {
-            frame_addr: UserPtr::new(frame_addr),
-            trampoline_pc: UserPtr::new(trampoline_pc),
-        })
-    }
-
-    fn read_signal_frame(user_sp: UserPtr<u8>) -> Result<SavedSignalFrame, FaultInfo> {
-        // SAFETY: sigreturn supplies the current user SP.
-        // `board_copy_from_user` performs the checked copy through the
-        // SUM/fixup-table primitive and reports any bad frame pointer.
-        let mut frame = core::mem::MaybeUninit::<Rv64SignalFrame>::uninit();
-        let frame = unsafe {
-            let dst = core::slice::from_raw_parts_mut(
-                frame.as_mut_ptr().cast::<u8>(),
-                size_of::<Rv64SignalFrame>(),
-            );
-            board_copy_from_user(dst, UserPtr::<u8>::new(user_sp.addr()))?;
-            frame.assume_init()
-        };
-
-        frame.saved_frame(user_sp)
-    }
 
     fn signal_frame_size() -> usize {
         size_of::<Rv64SignalFrame>()
@@ -326,10 +248,6 @@ impl SignalFrameIf for Platform {
 
     fn restore_signal_frame(mut tf: TrapFrameMut<'_>, frame: &SavedSignalFrame) {
         tf.restore_user_context(&frame.user_context);
-    }
-
-    fn rewind_syscall_pc(mut tf: TrapFrameMut<'_>) {
-        tf.rewind_pc(4);
     }
 
     fn prepare_signal_frame(

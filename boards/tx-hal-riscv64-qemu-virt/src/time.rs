@@ -8,14 +8,14 @@ pub(crate) fn read_ns(frequency_hz: u64) -> u64 {
 }
 
 pub(crate) fn set_deadline_ns(deadline_ns: u64, frequency_hz: u64) {
-    sbi_set_timer(tx_hal::time::deadline_ns_to_ticks(
+    crate::sbi::sbi_set_timer(tx_hal::time::deadline_ns_to_ticks(
         deadline_ns,
         frequency_hz,
     ));
 }
 
 pub(crate) fn cancel_deadline() {
-    sbi_set_timer(u64::MAX);
+    crate::sbi::sbi_set_timer(u64::MAX);
 }
 
 pub(crate) fn enable_timer_wakeups() {
@@ -32,7 +32,7 @@ pub(crate) fn enable_timer_wakeups() {
 }
 
 #[cfg(target_arch = "riscv64")]
-fn read_time_ticks() -> u64 {
+pub(crate) fn read_time_ticks() -> u64 {
     let ticks: u64;
     unsafe {
         core::arch::asm!("rdtime {ticks}", ticks = out(reg) ticks, options(nomem, nostack));
@@ -41,24 +41,9 @@ fn read_time_ticks() -> u64 {
 }
 
 #[cfg(not(target_arch = "riscv64"))]
-fn read_time_ticks() -> u64 {
+pub(crate) fn read_time_ticks() -> u64 {
     0
 }
-
-#[cfg(target_arch = "riscv64")]
-fn sbi_set_timer(deadline_ticks: u64) {
-    unsafe {
-        core::arch::asm!(
-            "ecall",
-            inlateout("a0") deadline_ticks as usize => _,
-            in("a7") 0usize,
-            options(nostack)
-        );
-    }
-}
-
-#[cfg(not(target_arch = "riscv64"))]
-fn sbi_set_timer(_deadline_ticks: u64) {}
 
 #[cfg(test)]
 mod tests {

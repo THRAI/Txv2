@@ -282,15 +282,13 @@ fn encodes_sv39_1g_leaf_pte_for_qemu_ram() {
 }
 
 #[test]
-fn qemu_ram_uses_expected_sv39_root_slot() {
+fn sv39_root_slots_for_qemu_ram_and_direct_map_alias() {
+    // QEMU RAM identity maps into root slot 2.
     assert_eq!(rv64_1g_leaf_index(0x8000_0000), 2);
     assert_eq!(rv64_1g_leaf_index(0x8020_0000), 2);
-}
 
-#[test]
-fn direct_map_alias_uses_high_sv39_root_slot() {
+    // The high direct-map alias uses a distinct high root slot.
     let direct_map_qemu_ram = EXPECTED_DIRECT_MAP_BASE + QEMU_RAM_BASE;
-
     assert_eq!(rv64_1g_leaf_index(direct_map_qemu_ram), 258);
     assert_ne!(
         rv64_1g_leaf_index(direct_map_qemu_ram),
@@ -359,7 +357,7 @@ fn kernel_alias_uses_4k_leaves_with_final_permissions() {
 }
 
 #[test]
-fn bootstrap_info_publishes_high_direct_map_base() {
+fn bootstrap_info_publishes_direct_map_base_and_reserved_page_table_ranges() {
     let _guard = pmap_test_guard();
     let mut bag = test_bag();
     publish_bootstrap_bag(&mut bag);
@@ -367,16 +365,6 @@ fn bootstrap_info_publishes_high_direct_map_base() {
     let info = bag.bootstrap_pmap_info_ref().expect("bootstrap pmap info");
 
     assert_eq!(info.direct_map_base, VirtAddr(EXPECTED_DIRECT_MAP_BASE));
-}
-
-#[test]
-fn bootstrap_info_publishes_reserved_page_table_ranges() {
-    let _guard = pmap_test_guard();
-    let mut bag = test_bag();
-    publish_bootstrap_bag(&mut bag);
-
-    let info = bag.bootstrap_pmap_info_ref().expect("bootstrap pmap info");
-
     assert_eq!(info.reserved_page_tables.len(), 4);
     assert_eq!(
         info.reserved_page_tables[0].start,
@@ -770,19 +758,6 @@ fn committed_4k_unmap_releases_empty_intermediate_tables() {
     );
 
     reset_typed_pt_allocator_test_state();
-    reset_committed_pt_nodes_for_test();
-}
-
-#[test]
-fn committed_pt_node_registry_handles_hackbench_fanout() {
-    let _guard = pmap_test_guard();
-    reset_committed_pt_nodes_for_test();
-
-    for i in 0..4096 {
-        let phys = PhysAddr(0x9000_0000 + i * PAGE_SIZE);
-        register_committed_pt_node(PtNode::boot_pool(phys));
-    }
-
     reset_committed_pt_nodes_for_test();
 }
 

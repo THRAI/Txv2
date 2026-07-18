@@ -1,5 +1,6 @@
 use super::boot_smp;
 use super::la64_irq_trap::*;
+use super::la64_percpu::*;
 use super::la64_pmap::*;
 use super::*;
 
@@ -305,7 +306,7 @@ impl TrapIf for Platform {
     }
 
     fn classify_trap(snapshot: TrapFrameSnapshot) -> TrapClass {
-        classify_la64_trap(snapshot.scause)
+        classify_la64_trap(snapshot.cause)
     }
 
     fn enter_userspace_with_context(ctx: &UserTrapContext, root: &PmapRoot) {
@@ -346,47 +347,6 @@ impl TrapIf for Platform {
 }
 
 impl SignalFrameIf for Platform {
-    fn write_signal_frame(
-        mut tf: TrapFrameMut<'_>,
-        setup: SignalFrameWrite,
-    ) -> Result<SignalFramePlacement, FaultInfo> {
-        let frame_size = core::mem::size_of::<La64SignalFrame>();
-        let Some(unrounded_frame_addr) = setup.stack_top.addr().checked_sub(frame_size) else {
-            return Err(FaultInfo {
-                address: VirtAddr(setup.stack_top.addr()),
-                write: true,
-                instruction: false,
-                from_user: false,
-            });
-        };
-        let frame_addr = align_down(unrounded_frame_addr, LA64_SIGFRAME_ALIGN);
-        let frame = La64SignalFrame::new(&tf, &setup);
-
-        unsafe {
-            la64_write_user(UserPtr::<La64SignalFrame>::new(frame_addr), frame)?;
-        }
-
-        let siginfo_addr = frame_addr + core::mem::offset_of!(La64SignalFrame, siginfo);
-        let ucontext_addr = frame_addr + core::mem::offset_of!(La64SignalFrame, user_context);
-        let trampoline_pc = frame_addr + core::mem::offset_of!(La64SignalFrame, trampoline);
-
-        tf.set_pc(VirtAddr(setup.handler_pc.addr()));
-        tf.set_sp(VirtAddr(frame_addr));
-        tf.set_signal_handler_regs(SignalHandlerRegs {
-            return_pc: VirtAddr(trampoline_pc),
-            args: [setup.sig_no as usize, siginfo_addr, ucontext_addr],
-        });
-
-        Ok(SignalFramePlacement {
-            frame_addr: UserPtr::new(frame_addr),
-            trampoline_pc: UserPtr::new(trampoline_pc),
-        })
-    }
-
-    fn read_signal_frame(user_sp: UserPtr<u8>) -> Result<SavedSignalFrame, FaultInfo> {
-        let frame = unsafe { la64_read_user(UserPtr::<La64SignalFrame>::new(user_sp.addr()))? };
-        decode_la64_signal_frame(user_sp, frame)
-    }
 
     fn signal_frame_size() -> usize {
         core::mem::size_of::<La64SignalFrame>()
@@ -456,9 +416,6 @@ impl SignalFrameIf for Platform {
         ))
     }
 
-    fn rewind_syscall_pc(mut tf: TrapFrameMut<'_>) {
-        tf.rewind_pc(4);
-    }
 }
 
 fn decode_la64_signal_frame(
@@ -622,6 +579,9 @@ impl CacheIf for Platform {
     }
 
     fn flush_icache_range(_start: VirtAddr, _len: usize) {
+        // LA64 has no range-scoped icache maintenance: `ibar 0` is a full
+        // instruction-fetch barrier, so `start`/`len` are intentionally
+        // ignored (identical to `fence_i_local`/`fence_i_all`).
         la64_ibar();
     }
 }

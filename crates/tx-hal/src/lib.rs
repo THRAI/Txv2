@@ -145,140 +145,6 @@ impl PhysRange {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BootProtocol {
-    RiscvSbi,
-    RiscvDirect,
-    LoongArchFirmware,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BootHandoff {
-    pub cpu_id: CpuId,
-    pub firmware_arg: BootArg,
-    pub protocol: BootProtocol,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BootInfo {
-    pub memory_regions: &'static [MemoryRegion],
-    pub kernel_image: PhysRange,
-    pub initrd: Option<PhysRange>,
-    pub cmdline: Option<&'static str>,
-}
-
-impl BootInfo {
-    pub const fn empty() -> Self {
-        Self {
-            memory_regions: &[],
-            kernel_image: PhysRange::empty(),
-            initrd: None,
-            cmdline: None,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MemoryRegion {
-    pub base: PhysAddr,
-    pub size: usize,
-    pub kind: MemoryRegionKind,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MemoryRegionKind {
-    Usable,
-    Reserved,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SpiSdInfo {
-    pub controller: &'static str,
-    pub chip_select: u8,
-    pub mode: u8,
-    pub max_hz: u32,
-    pub qemu_backing: &'static str,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MmioFlags(pub u32);
-
-impl MmioFlags {
-    pub const DEVICE_NGNRNE: Self = Self(1 << 0);
-    pub const DEVICE_NGNRE: Self = Self(1 << 1);
-    pub const READ: Self = Self(1 << 2);
-    pub const WRITE: Self = Self(1 << 3);
-
-    pub const fn empty() -> Self {
-        Self(0)
-    }
-
-    pub const fn bits(self) -> u32 {
-        self.0
-    }
-
-    pub const fn union(self, other: Self) -> Self {
-        Self(self.0 | other.0)
-    }
-
-    pub const fn contains(self, other: Self) -> bool {
-        self.0 & other.0 == other.0
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MmioRegion {
-    pub name: &'static str,
-    pub phys: PhysRange,
-    pub virt: VirtRange,
-    pub flags: MmioFlags,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PlatformInfo {
-    pub board: &'static str,
-    pub spi_sd: Option<SpiSdInfo>,
-    pub mmio_regions: &'static [MmioRegion],
-    pub timebase_frequency_hz: u64,
-    pub possible_cpu_count: usize,
-}
-
-/// Kind of platform device a board publishes for generic device
-/// registration. Boards derive entries from their firmware-provided
-/// device tree (or static knowledge); the FDT itself never crosses
-/// the HAL boundary.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DeviceKind {
-    /// 16550-family UART (ns16550a, snps,dw-apb-uart, ...).
-    Uart,
-    /// Platform interrupt controller (RISC-V PLIC / LoongArch extioi).
-    IntController,
-    /// virtio-mmio transport slot.
-    VirtioMmio,
-    /// PCI host bridge ECAM window.
-    PciEcam,
-    /// SD/MMC host controller (DesignWare MSHC on VisionFive 2).
-    SdController,
-}
-
-/// One discovered platform device, published through
-/// [`PlatformInfoIf::devices`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DeviceInfo {
-    pub kind: DeviceKind,
-    /// Register window (physical).
-    pub mmio: PhysRange,
-    /// Platform interrupt number wired to the parent interrupt
-    /// controller, when the node declares one.
-    pub irq: Option<u32>,
-    /// 16550-style register stride from `reg-shift` (log2 bytes);
-    /// 0 for byte-adjacent registers.
-    pub reg_shift: u8,
-    /// 16550-style register access width in bytes from
-    /// `reg-io-width`; 1 for byte registers (QEMU), 4 on dw-apb.
-    pub reg_io_width: u8,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArchAuxvFacts {
     pub page_size: usize,
     pub hwcap: u64,
@@ -310,26 +176,27 @@ pub const RISCV_HWCAP_IMAFDC: u64 = RISCV_HWCAP_ISA_I
     | RISCV_HWCAP_ISA_D
     | RISCV_HWCAP_ISA_C;
 
+/// 平台编译期常量表：默认值是占位（多为 0），真值由每块板的 impl 覆盖。
 pub trait PlatformConfig {
-    const ARCH: Arch;
-    const BOARD: &'static str;
-    const SUBSTRATE_BOOT_READY: bool = false;
-    const PAGE_SIZE: usize = 4096;
-    const PAGE_SHIFT: usize = 12;
-    const PHYS_ADDR_BITS: u8 = 0;
-    const VIRT_ADDR_BITS: u8 = 0;
-    const DIRECT_MAP_BASE: VirtAddr = VirtAddr(0);
-    const DIRECT_MAP_SIZE: usize = 0;
-    const KERNEL_VIRT_BASE: VirtAddr = VirtAddr(0);
-    const USER_TOP: VirtAddr = VirtAddr(0);
-    const USER_RESERVED_TOP_SIZE: usize = 0;
-    const USER_ALLOC_TOP: VirtAddr = Self::USER_TOP;
-    const KERNEL_STACK_SIZE: usize = 0;
-    const KERNEL_STACK_ALIGN: usize = Self::PAGE_SIZE;
-    const PAGE_TABLE_LEVELS: u8 = 0;
-    const ASID_BITS: u8 = 0;
-    const CACHE_LINE_SIZE: usize = 0;
-    const DMA_COHERENT: bool = false;
+    const ARCH: Arch;                                 // 架构 Riscv64/LoongArch64，必填
+    const BOARD: &'static str;                        // 板名字符串，必填
+    const SUBSTRATE_BOOT_READY: bool = false;         // 启动是否已对接 substrate
+    const PAGE_SIZE: usize = 4096;                    // 一页字节数（分页最小单位）
+    const PAGE_SHIFT: usize = 12;                     // log2(页大小)，地址右移求页号
+    const PHYS_ADDR_BITS: u8 = 0;                     // 物理地址位数（riscv 56）
+    const VIRT_ADDR_BITS: u8 = 0;                     // 虚拟地址位数（riscv 39=Sv39）
+    const DIRECT_MAP_BASE: VirtAddr = VirtAddr(0);    // 直连区起点，虚拟=物理+此值
+    const DIRECT_MAP_SIZE: usize = 0;                 // 直连区大小（覆盖全物理内存，128GB）
+    const KERNEL_VIRT_BASE: VirtAddr = VirtAddr(0);   // 内核代码虚拟基址（住最高处）
+    const USER_TOP: VirtAddr = VirtAddr(0);           // 用户地址天花板（riscv 256GB）
+    const USER_RESERVED_TOP_SIZE: usize = 0;          // 顶部保留、不给用户的大小（4MB）
+    const USER_ALLOC_TOP: VirtAddr = Self::USER_TOP;  // 用户可分配上限=天花板-保留（派生）
+    const KERNEL_STACK_SIZE: usize = 0;               // 内核栈大小（riscv 128KB）
+    const KERNEL_STACK_ALIGN: usize = Self::PAGE_SIZE; // 内核栈对齐（页对齐）
+    const PAGE_TABLE_LEVELS: u8 = 0;                  // 页表层数（riscv Sv39 = 3 级）
+    const ASID_BITS: u8 = 0;                          // ASID 位数，切进程免清整个 TLB（16）
+    const CACHE_LINE_SIZE: usize = 0;                 // 缓存行字节数，防多核伪共享（64）
+    const DMA_COHERENT: bool = false;                 // DMA 是否与缓存一致，false 需手动刷
 }
 
 pub trait BootPlatformIf {
@@ -353,17 +220,18 @@ pub trait InitIf {
     fn init_later_secondary(_cpu_id: CpuId) {}
 }
 
+/// 读取端:取"内核初始化信息"(内存地图/命令行/initrd/内核镜像)。
+/// 数据由 boot_handoff 开机时发布,这里只负责取出,启动后随时可读。
 pub trait BootInfoIf {
     fn boot_info() -> &'static BootInfo;
 }
 
+/// 读取端:取"平台硬件信息"(设备寄存器窗口/时钟频率/CPU数/设备列表)。
 pub trait PlatformInfoIf {
     fn platform_info() -> &'static PlatformInfo;
 
-    /// Platform devices discovered at boot (typically from the
-    /// firmware-provided device tree). Defaults to none so mock and
-    /// test platforms need no wiring; boards with device discovery
-    /// override this.
+    /// 开机发现的设备列表(通常来自固件设备树)。默认空,mock/测试板免接线;
+    /// 有设备发现的真板覆盖它返回真实列表。
     fn devices() -> &'static [DeviceInfo] {
         &[]
     }
@@ -850,6 +718,12 @@ pub trait PmapIf {
     }
 }
 
+mod platform_info;
+pub use platform_info::*;
+
+mod signal;
+pub use signal::*;
+
 pub mod observer;
 pub use observer::{ObserverIf, RingDescriptor};
 pub mod pmap;
@@ -939,184 +813,6 @@ impl<T> Eq for UserPtr<T> {}
 
 unsafe impl<T: Send> Send for UserPtr<T> {}
 unsafe impl<T: Sync> Sync for UserPtr<T> {}
-
-// ---------------------------------------------------------------------------
-// SignalFrameIf
-// ---------------------------------------------------------------------------
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct UserSigInfoAbi {
-    pub bytes: [u8; 128],
-}
-
-impl UserSigInfoAbi {
-    pub const ZERO: Self = Self { bytes: [0; 128] };
-}
-
-unsafe impl Pod for UserSigInfoAbi {}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct UserSignalMaskAbi {
-    pub bits: u64,
-}
-
-impl UserSignalMaskAbi {
-    pub const EMPTY: Self = Self { bits: 0 };
-}
-
-unsafe impl Pod for UserSignalMaskAbi {}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct UserSaFlagsAbi {
-    pub bits: u64,
-}
-
-impl UserSaFlagsAbi {
-    pub const EMPTY: Self = Self { bits: 0 };
-}
-
-unsafe impl Pod for UserSaFlagsAbi {}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SignalFrameWrite {
-    pub stack_top: UserPtr<u8>,
-    pub sig_no: u32,
-    pub siginfo: UserSigInfoAbi,
-    pub old_mask: UserSignalMaskAbi,
-    pub flags: UserSaFlagsAbi,
-    pub handler_pc: UserPtr<()>,
-    pub restorer_pc: UserPtr<()>,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SignalFramePlacement {
-    pub frame_addr: UserPtr<()>,
-    pub trampoline_pc: UserPtr<()>,
-}
-
-/// Raw bytes of a signal frame (platform-specific layout).
-/// Carried from `prepare_signal_frame` to the caller, who writes
-/// them to the user stack via `AddressSpace::copy_to_user`.
-///
-/// The buffer must be at least as large as the platform-specific
-/// `*SignalFrame` struct (RV64 ~720 bytes including UserTrapContext +
-/// FpContext + trampoline). The previous 512-byte buffer silently
-/// truncated `from_slice`, dropping the trailing fields — most
-/// catastrophically the on-stack `rt_sigreturn` trampoline at
-/// `offset_of!(SignalFrame, trampoline) = 712` — so the handler
-/// returned through `ra = frame_addr + 712` and the CPU fetched
-/// uninitialised stack bytes instead of the trampoline. Musl-compatible
-/// RV64 `ucontext_t` now includes the full floating-point union, so
-/// keep the carrier above the board frame sizes rather than trimming
-/// the userspace ABI shape.
-pub struct SignalFrameBytes {
-    pub data: [u8; Self::CAPACITY],
-    pub len: usize,
-}
-
-impl SignalFrameBytes {
-    pub const CAPACITY: usize = 2048;
-
-    pub fn from_slice(bytes: &[u8]) -> Self {
-        let len = bytes.len();
-        assert!(
-            len <= Self::CAPACITY,
-            "signal frame layout ({len} bytes) exceeds SignalFrameBytes buffer ({})",
-            Self::CAPACITY,
-        );
-        let mut data = [0u8; Self::CAPACITY];
-        data[..len].copy_from_slice(bytes);
-        Self { data, len }
-    }
-
-    pub fn as_slice(&self) -> &[u8] {
-        &self.data[..self.len]
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SavedSignalFrame {
-    pub saved_mask: UserSignalMaskAbi,
-    pub user_context: UserTrapContext,
-}
-
-unsafe impl Pod for SavedSignalFrame {}
-
-pub trait SignalFrameIf: TrapIf {
-    fn write_signal_frame(
-        tf: TrapFrameMut<'_>,
-        setup: SignalFrameWrite,
-    ) -> Result<SignalFramePlacement, FaultInfo> {
-        let _ = tf;
-        Err(FaultInfo {
-            address: VirtAddr(setup.stack_top.addr()),
-            write: true,
-            instruction: false,
-            from_user: false,
-        })
-    }
-
-    fn read_signal_frame(user_sp: UserPtr<u8>) -> Result<SavedSignalFrame, FaultInfo> {
-        Err(FaultInfo {
-            address: VirtAddr(user_sp.addr()),
-            write: false,
-            instruction: false,
-            from_user: false,
-        })
-    }
-
-    fn signal_frame_size() -> usize {
-        0
-    }
-
-    fn decode_signal_frame_bytes(
-        user_sp: UserPtr<u8>,
-        _bytes: &[u8],
-    ) -> Result<SavedSignalFrame, FaultInfo> {
-        Err(FaultInfo {
-            address: VirtAddr(user_sp.addr()),
-            write: false,
-            instruction: false,
-            from_user: false,
-        })
-    }
-
-    fn restore_signal_frame(_tf: TrapFrameMut<'_>, _frame: &SavedSignalFrame) {}
-
-    fn rewind_syscall_pc(mut tf: TrapFrameMut<'_>) {
-        tf.rewind_pc(4);
-    }
-
-    /// Build a signal-handler entry context and frame bytes
-    /// WITHOUT accessing a live TrapFrameMut. Returns the modified
-    /// `UserTrapContext` (sepc=handler, sp=frame_addr, ra=trampoline)
-    /// and the raw signal frame bytes to write to the user stack.
-    ///
-    /// Used by the thread-future AST checkpoint, which runs before
-    /// `enter_userspace_with_context` (where TrapFrameMut is
-    /// available). The caller writes `frame_bytes` to user memory
-    /// via `AddressSpace::copy_to_user`, then stores the modified
-    /// context as `saved_user_context`.
-    ///
-    /// Default: returns `ENOSYS`-shaped fallback.
-    fn prepare_signal_frame(
-        _ctx: &UserTrapContext,
-        _setup: &SignalFrameWrite,
-    ) -> Result<(UserTrapContext, SignalFrameBytes), FaultInfo> {
-        Err(FaultInfo {
-            address: VirtAddr(0),
-            write: true,
-            instruction: false,
-            from_user: false,
-        })
-    }
-}
 
 pub trait FpSimdIf {
     const SUPPORTED: bool;

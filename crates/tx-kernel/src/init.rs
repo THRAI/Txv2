@@ -510,7 +510,8 @@ impl<P: TxPlatform> CoreInit<P> {
         use tx_fs::tx_ext4::{BLOCK_SIZE, BlockDeviceImage, BlockImage};
         use tx_subsystems::device::block_device_by_name;
 
-        let Some(reg) = block_device_by_name(b"vda") else {
+        let dev_name = Self::root_device_name().unwrap_or("vda");
+        let Some(reg) = block_device_by_name(dev_name.as_bytes()) else {
             return;
         };
         let image = BlockDeviceImage::new(reg.ops);
@@ -560,10 +561,12 @@ impl<P: TxPlatform> CoreInit<P> {
     /// block-backed ext4 media is mounted later under `/musl` by
     /// `mount_sdcard_at_musl`.
     ///
-    /// For the onsite final profile (`tx.root=sdcard` or
-    /// `tx.profile=onsite`), mount the virtio-blk ext4 image directly as
-    /// `/` so Alpine's natural `/bin`, `/usr`, `/lib`, and `/etc` paths
-    /// are visible without compatibility symlinks.
+    /// When the boot cmdline requests a root block device (`tx.root=<name>`,
+    /// resolved by `root_device_name`), mount that device's ext4 image
+    /// directly as `/` so Alpine's natural `/bin`, `/usr`, `/lib`, and `/etc`
+    /// paths are visible without compatibility symlinks. QEMU passes
+    /// `tx.root=sdcard`/`tx.profile=onsite` (→ `vda`); the board passes
+    /// `tx.root=mmcblk0` (the SD card).
     pub(crate) fn mount_rootfs_from_boot_media() {
         if !Self::mount_sdcard_as_root_if_requested() {
             Self::mount_rootfs_tmpfs();
@@ -588,16 +591,18 @@ impl<P: TxPlatform> CoreInit<P> {
     }
 
     fn mount_sdcard_as_root_if_requested() -> bool {
-        if !Self::sdcard_root_requested() {
+        let Some(dev_name) = Self::root_device_name() else {
             return false;
-        }
+        };
 
         use tx_fs::tx_ext4::{BlockDeviceImage, mount_ext4_read_write};
         use tx_subsystems::device::block_device_by_name;
 
-        let Some(reg) = block_device_by_name(b"vda") else {
+        let Some(reg) = block_device_by_name(dev_name.as_bytes()) else {
             Self::write_board_sentinel_prefix();
-            tx_hal::console_write_str::<P>(":mount:rootfs:ext4:vda:missing\n");
+            tx_hal::console_write_str::<P>(":mount:rootfs:ext4:");
+            tx_hal::console_write_str::<P>(dev_name);
+            tx_hal::console_write_str::<P>(":missing\n");
             return false;
         };
 
@@ -606,7 +611,9 @@ impl<P: TxPlatform> CoreInit<P> {
             Ok(out) => out,
             Err(_) => {
                 Self::write_board_sentinel_prefix();
-                tx_hal::console_write_str::<P>(":mount:rootfs:ext4:vda:err\n");
+                tx_hal::console_write_str::<P>(":mount:rootfs:ext4:");
+                tx_hal::console_write_str::<P>(dev_name);
+                tx_hal::console_write_str::<P>(":err\n");
                 return false;
             }
         };
@@ -618,7 +625,7 @@ impl<P: TxPlatform> CoreInit<P> {
             mount::allocate_dev_id(),
             MountOptions::default(),
             "ext4",
-            SourceLabel::Static("vda-root"),
+            SourceLabel::Static(dev_name),
         )
         .expect("mount_sdcard_as_root_if_requested: payload reservation");
 
@@ -657,17 +664,33 @@ impl<P: TxPlatform> CoreInit<P> {
         ROOTFS_FROM_BOOT_MEDIA.store(true, Ordering::Release);
 
         Self::write_board_sentinel_prefix();
-        tx_hal::console_write_str::<P>(":mount:rootfs:ext4:vda:ok\n");
+        tx_hal::console_write_str::<P>(":mount:rootfs:ext4:");
+        tx_hal::console_write_str::<P>(dev_name);
+        tx_hal::console_write_str::<P>(":ok\n");
         true
     }
 
-    fn sdcard_root_requested() -> bool {
-        let Some(cmdline) = <P as tx_hal::BootInfoIf>::boot_info().cmdline else {
-            return false;
-        };
-        cmdline
+    /// Resolve the root block device to mount from the boot cmdline, the way
+    /// Linux's `root=` parameter works. `tx.root=<name>` names the block
+    /// device directly (`vda` for the QEMU virtio disk, `mmcblk0` for the
+    /// SD card on the board, …). The legacy `tx.root=sdcard` alias and the
+    /// `tx.profile=onsite` shorthand both resolve to `vda` so existing QEMU
+    /// and judge cmdlines keep working unchanged. Returns `None` when no root
+    /// mount is requested (the caller then falls back to tmpfs).
+    fn root_device_name() -> Option<&'static str> {
+        let cmdline = <P as tx_hal::BootInfoIf>::boot_info().cmdline?;
+        for token in cmdline.split_ascii_whitespace() {
+            if let Some(val) = token.strip_prefix("tx.root=") {
+                return Some(if val == "sdcard" { "vda" } else { val });
+            }
+        }
+        if cmdline
             .split_ascii_whitespace()
-            .any(|token| token == "tx.root=sdcard" || token == "tx.profile=onsite")
+            .any(|token| token == "tx.profile=onsite")
+        {
+            return Some("vda");
+        }
+        None
     }
 
     /// Mount tmpfs as the rootfs.

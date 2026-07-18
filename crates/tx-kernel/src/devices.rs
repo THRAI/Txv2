@@ -54,23 +54,49 @@ impl<P: TxPlatform> KernelBlockDevices<P> {
     }
 
     fn init_rv64_qemu_virt(&'static self) -> StepOutcome<(), NoProgress> {
-        let scratch = scratch_block_registration();
-        let Some(block) = Self::probe_virtio_mmio_block() else {
-            let registrations: &'static [&'static BlockDeviceRegistration] =
-                Box::leak(Box::new([scratch]));
-            return register_block_devices(registrations);
-        };
+        let mut regs: alloc::vec::Vec<&'static BlockDeviceRegistration> = alloc::vec::Vec::new();
 
-        let registration = Box::leak(Box::new(BlockDeviceRegistration {
-            devt: DevT::new(254, 0),
-            name: "vda",
-            ops: block,
-        }));
-        let registrations: &'static [&'static BlockDeviceRegistration] = Box::leak(Box::new([
-            registration as &'static BlockDeviceRegistration,
-            scratch,
-        ]));
+        // QEMU exposes the root disk as virtio-mmio (`vda`). The VisionFive 2
+        // board has no virtio; there the SD card (DesignWare MSHC) is the root
+        // disk and registers as `mmcblk0`. Probe virtio first; fall back to SD.
+        if let Some(block) = Self::probe_virtio_mmio_block() {
+            regs.push(Box::leak(Box::new(BlockDeviceRegistration {
+                devt: DevT::new(254, 0),
+                name: "vda",
+                ops: block,
+            })));
+        } else if let Some(sd) = Self::probe_sd_block() {
+            regs.push(Box::leak(Box::new(BlockDeviceRegistration {
+                devt: DevT::new(179, 0), // Linux mmcblk major
+                name: "mmcblk0",
+                ops: sd,
+            })));
+        }
+
+        regs.push(scratch_block_registration());
+        let registrations: &'static [&'static BlockDeviceRegistration] =
+            Box::leak(regs.into_boxed_slice());
         register_block_devices(registrations)
+    }
+
+    /// Probe the device table for a DesignWare MSHC SD controller (the
+    /// VisionFive 2 SD card slot, discovered from the JH7110 device tree as
+    /// `DeviceKind::SdController`). Maps its registers through the kernel
+    /// direct map and runs the card-init handshake; returns the initialized
+    /// block device, or `None` when no card came ready (or on QEMU, which has
+    /// no such controller).
+    fn probe_sd_block() -> Option<&'static tx_drivers::mmc::Vf2Mmc> {
+        for device in P::devices() {
+            if device.kind != DeviceKind::SdController {
+                continue;
+            }
+            let base = P::DIRECT_MAP_BASE.0 + device.mmio.start.0;
+            let mmc = Box::leak(Box::new(tx_drivers::mmc::Vf2Mmc::new(base)));
+            if mmc.card_init() {
+                return Some(mmc);
+            }
+        }
+        None
     }
 
     /// Find the virtio block device by probing every discovered

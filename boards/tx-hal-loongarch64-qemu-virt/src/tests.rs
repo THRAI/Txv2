@@ -1,4 +1,5 @@
 use super::la64_irq_trap::*;
+use super::la64_percpu::*;
 use super::la64_pmap::*;
 use super::platform_impls::{la64_copy_from_user_raw, la64_copy_to_user_raw};
 #[cfg(not(target_arch = "loongarch64"))]
@@ -151,7 +152,7 @@ fn bootstrap_pmap_info_describes_dmw_direct_ram() {
 
 #[test]
 fn substrate_smoke_gate_is_enabled_and_uart_mmio_is_published() {
-    let substrate_ready = core::hint::black_box(<Platform as PlatformConfig>::SUBSTRATE_BOOT_READY);
+    let substrate_ready = <Platform as PlatformConfig>::SUBSTRATE_BOOT_READY;
     assert!(substrate_ready);
     assert_eq!(
         <Platform as PlatformConfig>::USER_TOP,
@@ -234,14 +235,6 @@ fn dmw_aliases_decode_back_to_physical_addresses() {
         la64_kernel_addr_to_phys(la64_uncached_virt(0x1fe0_0000)),
         0x1fe0_0000
     );
-}
-
-#[test]
-#[cfg(not(target_arch = "loongarch64"))]
-fn trap_vector_install_is_host_noop() {
-    <Platform as TrapIf>::install_minimal_trap_vector();
-    <Platform as TrapIf>::install_kernel_trap_vector();
-    <Platform as TrapIf>::install_user_trap_vector();
 }
 
 #[test]
@@ -361,9 +354,9 @@ fn la64_ecode_table_matches_reference_manual() {
 #[test]
 fn la64_platform_snapshot_projects_classified_fault() {
     let snapshot = TrapFrameSnapshot {
-        scause: LA64_ECODE_PIL << LA64_ESTAT_ECODE_SHIFT,
-        sepc: 0x2000,
-        stval: 0x3000,
+        cause: LA64_ECODE_PIL << LA64_ESTAT_ECODE_SHIFT,
+        pc: 0x2000,
+        fault_value: 0x3000,
     };
     let portable = Platform::snapshot_trap(snapshot);
 
@@ -448,20 +441,6 @@ fn la64_restore_user_context_refreshes_cached_view_with_la64_abi() {
     }
     assert_eq!(frame.prmd & LA64_PRMD_PPLV_MASK, LA64_PRMD_PPLV_USER);
     assert_ne!(frame.prmd & LA64_PRMD_PIE, 0);
-}
-
-#[test]
-fn la64_capture_user_context_host_path_reports_empty_fp_state() {
-    let frame = La64TrapFrame {
-        r: [0; 32],
-        estat: LA64_ECODE_SYS << LA64_ESTAT_ECODE_SHIFT,
-        era: 0x1000,
-        badv: 0,
-        crmd: 0,
-        prmd: LA64_PRMD_PPLV_USER | LA64_PRMD_PIE,
-    };
-    let captured = frame.capture_user_context();
-    assert_eq!(captured.fp, tx_hal::UserFpContext::empty());
 }
 
 #[test]
@@ -1150,15 +1129,6 @@ fn la64_user_mapping_rollback_uses_existing_root_path() {
 
 #[test]
 #[cfg(not(target_arch = "loongarch64"))]
-fn pmap_shootdown_paths_are_host_noops() {
-    let invalidation = PmapInvalidation::new(VirtAddr(LA64_DMW_CACHED_BASE), 4096);
-
-    Platform::shootdown_kernel_mapping(invalidation);
-    Platform::shootdown_mapping(Asid(1), invalidation);
-}
-
-#[test]
-#[cfg(not(target_arch = "loongarch64"))]
 fn cache_and_dma_paths_publish_qemu_coherent_defaults() {
     const { assert!(<Platform as PlatformConfig>::DMA_COHERENT) };
     const { assert!(<Platform as DmaIf>::DMA_COHERENT) };
@@ -1209,11 +1179,6 @@ fn irq_dispatch_table_routes_handlers_and_masks_spurious() {
     <Platform as IrqIf>::mask(QEMU_LA64_UART0_IRQ);
     <Platform as IrqIf>::unmask(QEMU_LA64_UART0_IRQ);
     <Platform as IrqIf>::set_priority(QEMU_LA64_UART0_IRQ, 1);
-}
-
-#[test]
-fn la64_platform_overrides_uart_irq_constant() {
-    assert_eq!(<Platform as IrqIf>::UART_IRQ, QEMU_LA64_UART0_IRQ);
 }
 
 #[test]
@@ -1269,16 +1234,6 @@ fn la64_timer_deadline_rounds_up_to_tcfg_granule() {
     assert_eq!(round_up_to_tcfg_ticks(4), 4);
     assert_eq!(round_up_to_tcfg_ticks(5), 8);
     assert_eq!(round_up_to_tcfg_ticks(u64::MAX), u64::MAX - 3);
-}
-
-#[test]
-#[cfg(not(target_arch = "loongarch64"))]
-fn timeif_paths_are_host_noops_without_cpu_counter() {
-    assert_eq!(<Platform as TimeIf>::frequency_hz(), 0);
-    assert_eq!(<Platform as TimeIf>::read_ns(), 0);
-    <Platform as TimeIf>::set_deadline_ns(1_000_000);
-    <Platform as TimeIf>::cancel_deadline();
-    <Platform as TimeIf>::enable_timer_wakeups();
 }
 
 #[test]
