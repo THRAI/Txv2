@@ -46,9 +46,17 @@ pub fn step_socket_close(
             bindings_withdrawn += withdraw_ok(table.withdraw_tcp_bound(local));
         }
         SocketProtocol::Tcp(TcpState::Listening { local, .. }) => {
-            bindings_withdrawn += drain_listener_accept_backlog(&payload, table);
             bindings_withdrawn += withdraw_ok(table.withdraw_tcp_listener(local));
             bindings_withdrawn += withdraw_ok(table.withdraw_tcp_bound(local));
+            // R2b: drain the accept backlog. Accept-ready children were
+            // double-registered into the connections table at handshake
+            // time; withdraw them so their strong Cap (and the ns it
+            // pins) is released. Half-open children drop with the queue.
+            for entry in payload.drain_backlog_for_close() {
+                bindings_withdrawn += withdraw_ok(
+                    table.withdraw_tcp_connection(ConnectionKey::new(entry.local, entry.peer)),
+                );
+            }
         }
         SocketProtocol::Tcp(TcpState::Connecting { local, remote })
         | SocketProtocol::Tcp(TcpState::Connected { local, remote }) => {
@@ -71,6 +79,13 @@ pub fn step_socket_close(
             peer_recv_woken += notify_sctp_seqpacket_peers_closed(&payload, table, guard);
             bindings_withdrawn += withdraw_ok(table.withdraw_sctp_listener(local));
             bindings_withdrawn += withdraw_ok(table.withdraw_sctp_bound(local));
+            // R2b: SCTP listeners share the same backlog; accept-ready
+            // children were registered into the sctp connections table.
+            for entry in payload.drain_backlog_for_close() {
+                bindings_withdrawn += withdraw_ok(
+                    table.withdraw_sctp_connection(ConnectionKey::new(entry.local, entry.peer)),
+                );
+            }
         }
         SocketProtocol::Sctp(TcpState::Connecting { local, remote })
         | SocketProtocol::Sctp(TcpState::Connected { local, remote }) => {
@@ -129,9 +144,17 @@ pub fn step_socket_close(
             bindings_withdrawn += withdraw_ok(table.withdraw_unix_peer(socket.raw()));
         }
         SocketProtocol::UnixDatagram(UnixDatagramState::Unbound) => {}
-        SocketProtocol::UnixStream(UnixStreamState::Bound { local })
-        | SocketProtocol::UnixStream(UnixStreamState::Listening { local, .. }) => {
+        SocketProtocol::UnixStream(UnixStreamState::Bound { local }) => {
             bindings_withdrawn += withdraw_unix_binding_on_close(table, local);
+        }
+        SocketProtocol::UnixStream(UnixStreamState::Listening { local, .. }) => {
+            bindings_withdrawn += withdraw_unix_binding_on_close(table, local);
+            // R2b: UnixStream listeners share the backlog; accept-ready
+            // children were registered as stream peers keyed by raw().
+            for entry in payload.drain_backlog_for_close() {
+                bindings_withdrawn +=
+                    withdraw_ok(table.withdraw_unix_stream_peer(entry.child.raw()));
+            }
         }
         SocketProtocol::UnixStream(UnixStreamState::Connected { peer_raw, .. }) => {
             if let Some(peer) = table.lookup_unix_stream_peer(socket.raw(), guard) {
@@ -215,7 +238,6 @@ fn mark_tcp_peer_closed(peer: &Cap<SocketIdentity>) -> PeerCloseWakes {
     if let Some(raw_tcp) = payload.raw_tcp_socket() {
         raw_tcp.mark_recv_closed_by_peer();
     }
-    payload.refresh_io_from_raw();
     let recv_woken = peer.readiness.fire_recv(RecvWireSet::BROKEN);
     let send_woken = peer.readiness.fire_send(SendWireSet::BROKEN);
     PeerCloseWakes {
@@ -397,31 +419,6 @@ fn withdraw_ok<T>(result: Result<T, tx_substrate::mutation::MutationError>) -> u
     usize::from(result.is_ok())
 }
 
-/// On listener close, release every child still parked in the accept backlog.
-/// Each established child holds a `tcp_connections` slot keyed
-/// `(listener_local, client)` (see `step_connect`) plus a socket-zone object;
-/// without this drain those leak for the kernel's lifetime, eventually
-/// exhausting the fixed 256-slot connection table (bind/connect → ENOMEM) and
-/// the shared socket zone (socketpair/hackbench → ENOMEM). Half-open
-/// `connecting` children are not yet in the table, so the connection withdraw
-/// is a harmless no-op for them, but we still abort and release their socket.
-fn drain_listener_accept_backlog(
-    payload: &PayloadCap<SocketPayload>,
-    table: &SocketTable,
-) -> usize {
-    let mut withdrawn = 0;
-    for (child, local, peer) in payload.drain_accept_backlog() {
-        withdrawn += withdraw_ok(table.withdraw_tcp_connection(ConnectionKey::new(local, peer)));
-        if let Some(child_payload) = child.live_payload() {
-            if let Some(raw_tcp) = child_payload.raw_tcp_socket() {
-                raw_tcp.abort();
-            }
-        }
-        child.take_payload();
-    }
-    withdrawn
-}
-
 fn withdraw_unix_binding_on_close(
     table: &SocketTable,
     local: crate::net::structure::UnixSocketPath,
@@ -459,26 +456,13 @@ fn withdraw_tcp_bound_if_owner(
     local: crate::net::structure::IpEndpoint,
     guard: &Guard<'_>,
 ) -> usize {
-    if let Some(bound) = table.lookup_tcp_bound(local, guard) {
-        if bound.raw() == socket.raw() {
-            return withdraw_ok(table.withdraw_tcp_bound(local));
-        }
+    let Some(bound) = table.lookup_tcp_bound(local, guard) else {
+        return 0;
+    };
+    if bound.raw() != socket.raw() {
+        return 0;
     }
-    // A socket that bound a wildcard (0.0.0.0:port / [::]:port) and then
-    // connect()ed has its stored local rewritten to the concrete address (see
-    // step_connect::select_tcp_connect_local), so the concrete-key lookup above
-    // misses while the original wildcard `tcp_bound` entry still lingers. Fall
-    // back to the wildcard key for this family/port so close releases it rather
-    // than leaking the 256-slot tcp_bound entry.
-    if !local.is_unspecified() {
-        let wildcard = IpEndpoint::unspecified_for_family(local.family, local.port);
-        if let Some(bound) = table.lookup_tcp_bound(wildcard, guard) {
-            if bound.raw() == socket.raw() {
-                return withdraw_ok(table.withdraw_tcp_bound(wildcard));
-            }
-        }
-    }
-    0
+    withdraw_ok(table.withdraw_tcp_bound(local))
 }
 
 fn withdraw_sctp_bound_if_owner(

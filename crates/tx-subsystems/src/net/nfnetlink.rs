@@ -263,7 +263,6 @@ pub fn netlink_netfilter_send(
     if !packet.is_empty() {
         raw.queue_response(packet);
     }
-    payload.refresh_io_from_raw();
     if !raw.is_empty() {
         socket.readiness.fire_recv(RecvWireSet::HAS_DATA);
     }
@@ -291,7 +290,6 @@ pub fn netlink_netfilter_recv(
     } else {
         copied
     };
-    payload.refresh_io_from_raw();
     if !peek && raw.is_empty() {
         socket.readiness.clear_recv(RecvWireSet::HAS_DATA);
     }
@@ -319,7 +317,6 @@ pub fn netlink_xfrm_send(
     if !packet.is_empty() {
         raw.queue_response(packet);
     }
-    payload.refresh_io_from_raw();
     if !raw.is_empty() {
         socket.readiness.fire_recv(RecvWireSet::HAS_DATA);
     }
@@ -347,7 +344,6 @@ pub fn netlink_xfrm_recv(
     } else {
         copied
     };
-    payload.refresh_io_from_raw();
     if !peek && raw.is_empty() {
         socket.readiness.clear_recv(RecvWireSet::HAS_DATA);
     }

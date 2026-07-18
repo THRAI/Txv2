@@ -56,14 +56,17 @@ fn retransmit_syn_ack_to_loopback(entry: &TcpBacklogEntry, iface: &LoopbackIface
         return false;
     };
 
-    let Some(segment) = raw_tcp
-        .retransmit_syn_ack_segment()
-        .or_else(|| raw_tcp.dispatch_segment())
-    else {
-        return false;
+    // The SYN-ACK retransmit timer lives in smoltcp now (P0 unfroze it).
+    // `dispatch_segment` emitting nothing means the RTO simply has not
+    // expired yet — that is NOT a failed connection, so return true to keep
+    // the backlog entry (false would drop the half-open connection). A
+    // child that smoltcp has given up on turns Closed and is culled by
+    // `connecting_entry_failed` before this closure runs.
+    let Some(segment) = raw_tcp.dispatch_segment() else {
+        return true;
     };
     let Some(packet) = segment.emit_ipv4_packet() else {
-        return false;
+        return true;
     };
 
     iface.dispatch_ip(packet)

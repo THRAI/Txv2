@@ -86,7 +86,8 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
                 // session appears to freeze. Trigger: serial RX
                 // arriving in the window where the process is
                 // executing userspace (vim startup racing the
-                // terminal's query responses; bursty paste input).
+                // terminal's query responses; bursty paste input);
+                // also the P2 external-connect resume hang (2026-07-03).
                 // Kernel-mode interrupts (WFI wake) keep the plain
                 // Reschedule path.
                 if view.view().previous_mode == tx_hal::TrapPreviousMode::User {

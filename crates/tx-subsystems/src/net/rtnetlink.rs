@@ -27,7 +27,8 @@ use crate::net::device::{
     DUMMY_DEFAULT_MTU, VETH_DEFAULT_MTU, VLAN_DEFAULT_MTU,
 };
 use crate::net::namespace::{
-    NetNamespaceLinkInfo, NetNamespacePayload, NetNamespaceRouteConfig, NetNamespaceRouteInfo,
+    NetNamespaceLinkInfo, NetNamespacePayload, NetNamespaceRoute6Config, NetNamespaceRoute6Info,
+    NetNamespaceRoute6Selector, NetNamespaceRouteConfig, NetNamespaceRouteInfo,
     NetNamespaceRouteSelector,
 };
 use crate::net::protocol::ArpSnapshotState;
@@ -324,7 +325,6 @@ where
         .ok_or(Errno::EOPNOTSUPP)?;
 
     if try_queue_fast_dump(raw, &payload.net_namespace(), bytes) {
-        payload.refresh_io_from_raw();
         socket.readiness.fire_recv(RecvWireSet::HAS_DATA);
         return Ok(bytes.len());
     }
@@ -348,7 +348,6 @@ where
         }
         raw.queue_response(combined);
     }
-    payload.refresh_io_from_raw();
     if !raw.is_empty() {
         socket.readiness.fire_recv(RecvWireSet::HAS_DATA);
     }
@@ -384,7 +383,6 @@ pub fn netlink_route_recv_packet(
         .ok_or(Errno::EOPNOTSUPP)?;
     let peek = flags.contains(SendRecvFlags::MSG_PEEK);
     let response = raw.pop_response(peek).ok_or(Errno::EAGAIN)?;
-    payload.refresh_io_from_raw();
     if !peek && raw.is_empty() {
         socket.readiness.clear_recv(RecvWireSet::HAS_DATA);
     }
@@ -507,7 +505,7 @@ fn handle_one_message<F>(
             }
         }
         RTM_GETROUTE => {
-            for msg in render_getroute_dump(netns, header) {
+            for msg in render_getroute_dump(netns, header, payload) {
                 responses.push(msg);
             }
         }
@@ -776,7 +774,15 @@ fn build_getaddr_dump_template(netns: &NetNamespacePayload) -> Vec<u8> {
         append_addr_messages(&mut out, 0, 0, NLM_F_MULTI, link, AF_UNSPEC);
     }
     let mut extra_messages = Vec::new();
-    append_extra_addr_messages(&mut extra_messages, 0, 0, NLM_F_MULTI, netns, &links, AF_UNSPEC);
+    append_extra_addr_messages(
+        &mut extra_messages,
+        0,
+        0,
+        NLM_F_MULTI,
+        netns,
+        &links,
+        AF_UNSPEC,
+    );
     for message in extra_messages {
         out.extend_from_slice(&message);
     }
@@ -784,20 +790,42 @@ fn build_getaddr_dump_template(netns: &NetNamespacePayload) -> Vec<u8> {
     out
 }
 
-fn render_getroute_dump(netns: &NetNamespacePayload, header: NlMsgHeader) -> Vec<Vec<u8>> {
+fn render_getroute_dump(
+    netns: &NetNamespacePayload,
+    header: NlMsgHeader,
+    payload: &[u8],
+) -> Vec<Vec<u8>> {
+    let family = getroute_dump_family(payload);
     let links = netns.link_snapshot();
     let mut out = Vec::new();
-    for route in netns.route_snapshot() {
-        out.push(build_route_message(
-            header.seq,
-            header.pid,
-            NLM_F_MULTI,
-            route,
-            &links,
-        ));
+    if family == AF_UNSPEC || family == AF_INET {
+        for route in netns.route_snapshot() {
+            out.push(build_route_message(
+                header.seq,
+                header.pid,
+                NLM_F_MULTI,
+                route,
+                &links,
+            ));
+        }
+    }
+    if family == AF_UNSPEC || family == AF_INET6 {
+        for route in netns.route6_snapshot() {
+            out.push(build_route6_message(
+                header.seq,
+                header.pid,
+                NLM_F_MULTI,
+                route,
+                &links,
+            ));
+        }
     }
     out.push(build_done_message(header.seq, header.pid));
     out
+}
+
+fn getroute_dump_family(payload: &[u8]) -> u8 {
+    payload.first().copied().unwrap_or(AF_UNSPEC)
 }
 
 fn render_getneigh_dump(netns: &NetNamespacePayload, header: NlMsgHeader) -> Vec<Vec<u8>> {
@@ -964,6 +992,12 @@ fn handle_newaddr(netns: &NetNamespacePayload, cred: Cred, payload: &[u8]) -> Re
     let ifindex = resolve_ifaddr_ifindex(netns, &info, &attrs)?;
     match info.family {
         AF_INET => {
+            // Reject an out-of-range prefix like Linux does (EINVAL), mirroring
+            // the route handlers' `dst_len > 32/128` guards. The prefix_len is a
+            // raw netlink byte and flows down into netmask/on-link-prefix math.
+            if info.prefix_len > 32 {
+                return Err(Errno::EINVAL);
+            }
             let addr = ipv4_addr_from_payload(addr_attr.payload)?;
             // `ip addr add` is additive: the first address becomes the
             // primary, further ones become secondaries (net_stress.interface
@@ -979,6 +1013,12 @@ fn handle_newaddr(netns: &NetNamespacePayload, cred: Cred, payload: &[u8]) -> Re
             )
         }
         AF_INET6 => {
+            // Same guard for v6: a raw prefix_len > 128 would otherwise reach
+            // decide_ipv6_route -> same_ipv6_prefix, which indexes a [u8;16] by
+            // prefix_len/8 and panics the kernel out of bounds.
+            if info.prefix_len > 128 {
+                return Err(Errno::EINVAL);
+            }
             let addr = ipv6_addr_from_payload(addr_attr.payload)?;
             netns.add_device_ipv6_addr_by_ifindex(auth, ifindex, addr, info.prefix_len)
         }
@@ -1071,12 +1111,20 @@ fn ipv6_addr_from_payload(payload: &[u8]) -> Result<Ipv6Address, Errno> {
 
 fn handle_newroute(netns: &NetNamespacePayload, cred: Cred, payload: &[u8]) -> Result<(), Errno> {
     let auth = require_net_admin(cred)?;
+    if parse_rtmsg(payload)?.family == AF_INET6 {
+        let route = parse_route6_config(netns, payload)?;
+        return netns.add_ipv6_route(auth, route);
+    }
     let route = parse_route_config(netns, payload)?;
     netns.add_ipv4_route(auth, route)
 }
 
 fn handle_delroute(netns: &NetNamespacePayload, cred: Cred, payload: &[u8]) -> Result<(), Errno> {
     let auth = require_net_admin(cred)?;
+    if parse_rtmsg(payload)?.family == AF_INET6 {
+        let selector = parse_route6_selector(netns, payload)?;
+        return netns.delete_ipv6_route(auth, selector);
+    }
     let selector = parse_route_selector(netns, payload)?;
     netns.delete_ipv4_route(auth, selector)
 }
@@ -1439,6 +1487,40 @@ fn build_route_message(
     build_nlmsg(RTM_NEWROUTE, flags, seq, pid, &payload)
 }
 
+fn build_route6_message(
+    seq: u32,
+    pid: u32,
+    flags: u16,
+    route: NetNamespaceRoute6Info,
+    links: &[NetNamespaceLinkInfo],
+) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(RTMSG_LEN + 64);
+    payload.push(AF_INET6);
+    payload.push(route.prefix_len);
+    payload.push(0);
+    payload.push(0);
+    payload.push(route.table);
+    payload.push(route.protocol);
+    payload.push(route.scope);
+    payload.push(route.route_type);
+    payload.extend_from_slice(&0u32.to_le_bytes());
+    if route.prefix_len != 0 {
+        push_attr(&mut payload, RTA_DST, &route.dst.octets());
+    }
+    if let Some(gateway) = route.gateway {
+        push_attr(&mut payload, RTA_GATEWAY, &gateway.octets());
+    }
+    if let Some(oif_name) = route.oif_name {
+        if let Some(link) = links.iter().find(|link| link.name == oif_name) {
+            push_attr_u32(&mut payload, RTA_OIF, link.ifindex);
+        }
+    }
+    if let Some(preferred_src) = route.preferred_src {
+        push_attr(&mut payload, RTA_PREFSRC, &preferred_src.octets());
+    }
+    build_nlmsg(RTM_NEWROUTE, flags, seq, pid, &payload)
+}
+
 fn build_neigh_message(
     seq: u32,
     pid: u32,
@@ -1661,6 +1743,54 @@ fn parse_route_selector(
     })
 }
 
+fn parse_route6_config(
+    netns: &NetNamespacePayload,
+    payload: &[u8],
+) -> Result<NetNamespaceRoute6Config, Errno> {
+    let msg = parse_rtmsg(payload)?;
+    if msg.family != AF_INET6 {
+        return Err(Errno::EAFNOSUPPORT);
+    }
+    if msg.dst_len > 128 {
+        return Err(Errno::EINVAL);
+    }
+    let dst = ipv6_attr(&msg.attrs, RTA_DST)?.unwrap_or(Ipv6Address::UNSPECIFIED);
+    let gateway = ipv6_attr(&msg.attrs, RTA_GATEWAY)?;
+    let preferred_src = ipv6_attr(&msg.attrs, RTA_PREFSRC)?;
+    let oif_name = route_oif_name(netns, &msg.attrs)?;
+    Ok(NetNamespaceRoute6Config {
+        dst,
+        prefix_len: msg.dst_len,
+        gateway,
+        oif_name,
+        preferred_src,
+        table: normalize_route_table(msg.table),
+        protocol: normalize_route_protocol(msg.protocol),
+        scope: normalize_route_scope(msg.scope, gateway.map(|_| Ipv4Address::UNSPECIFIED)),
+        route_type: normalize_route_type(msg.route_type),
+    })
+}
+
+fn parse_route6_selector(
+    netns: &NetNamespacePayload,
+    payload: &[u8],
+) -> Result<NetNamespaceRoute6Selector, Errno> {
+    let msg = parse_rtmsg(payload)?;
+    if msg.family != AF_INET6 {
+        return Err(Errno::EAFNOSUPPORT);
+    }
+    if msg.dst_len > 128 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(NetNamespaceRoute6Selector {
+        dst: ipv6_attr(&msg.attrs, RTA_DST)?.unwrap_or(Ipv6Address::UNSPECIFIED),
+        prefix_len: msg.dst_len,
+        gateway: ipv6_attr(&msg.attrs, RTA_GATEWAY)?,
+        oif_name: route_oif_name(netns, &msg.attrs)?,
+        table: normalize_route_table(msg.table),
+    })
+}
+
 fn ipv4_attr(attrs: &[NlAttr<'_>], kind: u16) -> Result<Option<Ipv4Address>, Errno> {
     let Some(attr) = attr_by_kind(attrs, kind) else {
         return Ok(None);
@@ -1674,6 +1804,18 @@ fn ipv4_attr(attrs: &[NlAttr<'_>], kind: u16) -> Result<Option<Ipv4Address>, Err
         attr.payload[2],
         attr.payload[3],
     ])))
+}
+
+fn ipv6_attr(attrs: &[NlAttr<'_>], kind: u16) -> Result<Option<Ipv6Address>, Errno> {
+    let Some(attr) = attr_by_kind(attrs, kind) else {
+        return Ok(None);
+    };
+    if attr.payload.len() < 16 {
+        return Err(Errno::EINVAL);
+    }
+    let mut octets = [0u8; 16];
+    octets.copy_from_slice(&attr.payload[..16]);
+    Ok(Some(Ipv6Address::new(octets)))
 }
 
 fn route_oif_name(

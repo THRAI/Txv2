@@ -96,6 +96,33 @@ pub(crate) fn doctor(root: &Path) -> Result<()> {
             }
         }
     }
+    // tx-netfast: compile-required embed (rootfs_shims `include_bytes!`); the
+    // blob is checked into git. Presence guards a fresh clone's rv64 build;
+    // the sha256 drift check catches "edited netfast.c but forgot to re-run
+    // tools/netfast/build.sh and commit the rebuilt blob".
+    let netfast = root.join("tools/images/vendor/tx-netfast-riscv64");
+    if netfast.exists() {
+        let sha_ok = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("cd tools/netfast && sha256sum -c ../images/vendor/tx-netfast-riscv64.sha256 >/dev/null 2>&1")
+            .current_dir(root)
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(true); // no sh/sha256sum → skip the drift check
+        if sha_ok {
+            println!("ok: vendored tx-netfast blob (sha256 matches)");
+        } else {
+            println!(
+                "warn: tx-netfast blob sha256 drift vs tools/netfast/netfast.c; \
+                 re-run tools/netfast/build.sh and commit the rebuilt blob"
+            );
+        }
+    } else {
+        println!(
+            "warn: tools/images/vendor/tx-netfast-riscv64 missing (rv64 kernel cannot build); \
+             run tools/netfast/build.sh"
+        );
+    }
     if let Ok(path) = env::var("TX_MUSL_LIBC") {
         if Path::new(&path).exists() {
             println!("ok: TX_MUSL_LIBC={path}");

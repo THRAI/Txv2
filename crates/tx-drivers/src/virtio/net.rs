@@ -140,13 +140,7 @@ impl<P: TxPlatform, const QUEUE_SIZE: usize> VirtioMmioNet<P, QUEUE_SIZE> {
     }
 
     pub fn poll_device_and_fire(&self) -> VirtioNetPollOutcome {
-        poll_device_and_fire(
-            &self.inner,
-            &self.stats,
-            &self.initialized,
-            false,
-            QUEUE_SIZE,
-        )
+        poll_device_and_fire(&self.inner, &self.stats, &self.initialized, QUEUE_SIZE)
     }
 
     pub fn ack_interrupt_and_fire(&self) -> VirtioNetPollOutcome {
@@ -156,13 +150,8 @@ impl<P: TxPlatform, const QUEUE_SIZE: usize> VirtioMmioNet<P, QUEUE_SIZE> {
         };
         let claimed = state.raw.ack_interrupt();
         drop(inner);
-        let mut outcome = poll_device_and_fire(
-            &self.inner,
-            &self.stats,
-            &self.initialized,
-            claimed,
-            QUEUE_SIZE,
-        );
+        let mut outcome =
+            poll_device_and_fire(&self.inner, &self.stats, &self.initialized, QUEUE_SIZE);
         outcome.claimed = claimed;
         outcome
     }
@@ -210,13 +199,7 @@ impl<P: TxPlatform, const QUEUE_SIZE: usize> VirtioPciNet<P, QUEUE_SIZE> {
     }
 
     pub fn poll_device_and_fire(&self) -> VirtioNetPollOutcome {
-        poll_device_and_fire(
-            &self.inner,
-            &self.stats,
-            &self.initialized,
-            false,
-            QUEUE_SIZE,
-        )
+        poll_device_and_fire(&self.inner, &self.stats, &self.initialized, QUEUE_SIZE)
     }
 
     pub fn ack_interrupt_and_fire(&self) -> VirtioNetPollOutcome {
@@ -226,13 +209,8 @@ impl<P: TxPlatform, const QUEUE_SIZE: usize> VirtioPciNet<P, QUEUE_SIZE> {
         };
         let claimed = state.raw.ack_interrupt();
         drop(inner);
-        let mut outcome = poll_device_and_fire(
-            &self.inner,
-            &self.stats,
-            &self.initialized,
-            claimed,
-            QUEUE_SIZE,
-        );
+        let mut outcome =
+            poll_device_and_fire(&self.inner, &self.stats, &self.initialized, QUEUE_SIZE);
         outcome.claimed = claimed;
         outcome
     }
@@ -346,7 +324,6 @@ fn poll_device_and_fire<P, T, const QUEUE_SIZE: usize>(
     inner: &SpinMutex<Option<VirtioNetRawState<P, T, QUEUE_SIZE>>>,
     stats: &VirtioNetStats,
     initialized: &AtomicBool,
-    suppress_interrupts_on_ready: bool,
     _rx_budget: usize,
 ) -> VirtioNetPollOutcome
 where
@@ -363,9 +340,14 @@ where
     };
     let tx_completed = complete_tx(state, stats, usize::MAX);
     let rx_ready = state.raw.poll_receive().is_some();
-    if suppress_interrupts_on_ready && (rx_ready || tx_completed != 0) {
-        state.raw.disable_interrupts();
-    }
+    // Do NOT suppress device interrupts when work is pending. An earlier
+    // NAPI-style `disable_interrupts()` here had no matching re-enable
+    // anywhere, so the FIRST net IRQ silenced the device forever (later
+    // frames sat unnoticed until an unrelated delegate poll — root cause
+    // of the P2 "server response never ACKed / read never wakes" stall).
+    // IRQ-rate throttling is already provided one level up by the PLIC
+    // mask window (top half masks the line, bottom half unmasks after
+    // ack+kick), so device-level suppression is unnecessary.
 
     let poll_wakes = if rx_ready || tx_completed != 0 {
         stats.irq_polls.fetch_add(1, Ordering::Relaxed);

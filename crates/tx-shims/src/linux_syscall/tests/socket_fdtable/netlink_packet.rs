@@ -864,6 +864,37 @@ fn dispatch_socket_ioctl_resolves_loopback_ifname_from_index() {
     );
 }
 
+/// musl/glibc `if_indextoname` issues SIOCGIFNAME on an AF_UNIX datagram
+/// socket (LTP in6_02). The interface ioctls must work on any socket fd.
+#[test]
+fn dispatch_socket_ioctl_siocgifname_works_on_unix_socket_fd() {
+    let _setup = socket_setup();
+    let (_process, ctx) = socket_ctx();
+    let fd = match socket_req(NR_SOCKET, [1, SOCK_DGRAM, 0, 0, 0, 0], &ctx) {
+        SyscallResult::Return(fd) => fd,
+        other => panic!("socket(AF_UNIX, DGRAM) failed: {other:?}"),
+    };
+    let mut ifreq = [0u8; 40];
+    ifreq[16..20].copy_from_slice(&1i32.to_le_bytes());
+
+    assert_eq!(
+        socket_req(
+            NR_IOCTL,
+            [
+                fd as u64,
+                SIOCGIFNAME as u64,
+                ifreq.as_mut_ptr() as u64,
+                0,
+                0,
+                0
+            ],
+            &ctx,
+        ),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(&ifreq[..3], b"lo\0");
+}
+
 #[test]
 fn dispatch_socket_ioctl_enumerates_interfaces_with_siocgifconf() {
     let _setup = socket_setup();

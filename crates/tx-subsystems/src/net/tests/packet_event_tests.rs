@@ -95,18 +95,84 @@ fn smoltcp_demux_extracts_ipv4_tcp_event_flags() {
     let transport = tcp_transport(49_000, 443, 0x32, &[9, 8, 7]);
     let frame = RxFrame::new(ethernet_ipv4_frame(6, &transport));
 
+    // Asserted segment-agnostically (like the v6 case): R3a now attaches a
+    // checksum-verified segment for a valid-checksum wire frame, so the whole
+    // event no longer equals a bare `TcpPacketEvent::new(..)` (segment=None).
+    match demux_rx_frame_with_smoltcp(&frame) {
+        PacketDispatch::Tcp(event) => {
+            assert_eq!(
+                event.src,
+                IpEndpoint::new(Ipv4Address::new([192, 0, 2, 1]), 49_000)
+            );
+            assert_eq!(
+                event.dst,
+                IpEndpoint::new(Ipv4Address::new([192, 0, 2, 2]), 443)
+            );
+            assert!(event.flags.syn);
+            assert!(event.flags.ack);
+            assert!(!event.flags.rst);
+            assert_eq!(event.payload, std::vec![9, 8, 7]);
+            assert!(event.urgent);
+            assert!(
+                event.segment.is_some(),
+                "a valid TCP checksum must attach a verified segment"
+            );
+        }
+        other => panic!("expected v4 tcp dispatch, got {other:?}"),
+    }
+}
+
+/// R3a decisive tests: hardware demux verifies checksums (virtio-net has no
+/// CSUM offload), so a corrupt IPv4 header / TCP / UDP checksum must be rejected
+/// as `Malformed` instead of dispatched — while the legal omitted (==0) UDP
+/// checksum over IPv4 stays accepted. Frame builders fill valid checksums; these
+/// tests damage one byte afterwards. Forensics confirmed such tests were absent.
+#[test]
+fn smoltcp_demux_rejects_bad_ipv4_header_checksum() {
+    let mut bytes = ethernet_ipv4_frame(17, &udp_transport(53_000, 8080, &[1, 2, 3, 4]));
+    bytes[14 + 10] ^= 0xff; // IPv4 header checksum field
     assert_eq!(
-        demux_rx_frame_with_smoltcp(&frame),
-        PacketDispatch::Tcp(TcpPacketEvent::new(
-            IpEndpoint::new(Ipv4Address::new([192, 0, 2, 1]), 49_000),
-            IpEndpoint::new(Ipv4Address::new([192, 0, 2, 2]), 443),
-            TcpPacketFlags {
-                syn: true,
-                ack: true,
-                rst: false,
-            },
-            std::vec![9, 8, 7],
-            true
+        demux_rx_frame_with_smoltcp(&RxFrame::new(bytes)),
+        PacketDispatch::Malformed
+    );
+}
+
+#[test]
+fn smoltcp_demux_rejects_corrupt_udp_checksum() {
+    // The builder fills a valid (non-zero) UDP checksum; flipping a payload byte
+    // makes it no longer match — a present-but-wrong checksum must be rejected.
+    let mut bytes = ethernet_ipv4_frame(17, &udp_transport(53_000, 8080, &[1, 2, 3, 4]));
+    bytes[14 + 20 + 8] ^= 0xff; // first UDP payload byte
+    assert_eq!(
+        demux_rx_frame_with_smoltcp(&RxFrame::new(bytes)),
+        PacketDispatch::Malformed
+    );
+}
+
+#[test]
+fn smoltcp_demux_rejects_corrupt_tcp_checksum() {
+    let mut bytes = ethernet_ipv4_frame(6, &tcp_transport(49_000, 443, 0x10, &[9, 8, 7]));
+    bytes[14 + 20 + 16] ^= 0xff; // TCP checksum field
+    assert_eq!(
+        demux_rx_frame_with_smoltcp(&RxFrame::new(bytes)),
+        PacketDispatch::Malformed
+    );
+}
+
+#[test]
+fn smoltcp_demux_accepts_omitted_udp_checksum_over_ipv4() {
+    // checksum==0 means "no checksum" for UDP-over-IPv4 (RFC 768) and is legal —
+    // the demux must not treat the omitted case as corrupt (regression guard for
+    // the loopback-parity semantics).
+    let mut bytes = ethernet_ipv4_frame(17, &udp_transport(53_000, 8080, &[1, 2, 3, 4]));
+    bytes[14 + 20 + 6] = 0; // UDP checksum high byte
+    bytes[14 + 20 + 7] = 0; // UDP checksum low byte
+    assert_eq!(
+        demux_rx_frame_with_smoltcp(&RxFrame::new(bytes)),
+        PacketDispatch::Udp(UdpPacketEvent::new(
+            IpEndpoint::new(Ipv4Address::new([192, 0, 2, 1]), 53_000),
+            IpEndpoint::new(Ipv4Address::new([192, 0, 2, 2]), 8080),
+            std::vec![1, 2, 3, 4],
         ))
     );
 }
@@ -269,4 +335,132 @@ fn tcp_syn_to_listener_sets_accept_readiness() {
         1
     );
     assert!(listener.readiness.accept_wq.peek() & AcceptWireSet::HAS_PENDING.bits() != 0);
+}
+
+/// P2-S7 (§6-2-A): IPv6 UDP frames pass the demux — same event shape as
+/// v4, endpoints carried as v6. The builder fills a valid UDP checksum, which
+/// R3a now verifies via the shared `UdpRxDatagram` parser (v6 has no IP header
+/// checksum), so this is the good-checksum v6 path.
+#[test]
+fn smoltcp_demux_extracts_ipv6_udp_event() {
+    let transport = udp_transport(53_001, 8081, &[5, 6, 7]);
+    let frame = RxFrame::new(ethernet_ipv6_frame(17, &transport));
+
+    let src_ip = crate::net::structure::Ipv6Address::new([
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+    ]);
+    let dst_ip = crate::net::structure::Ipv6Address::new([
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02,
+    ]);
+    assert_eq!(
+        demux_rx_frame_with_smoltcp(&frame),
+        PacketDispatch::Udp(UdpPacketEvent::new(
+            IpEndpoint::new_v6(src_ip, 53_001),
+            IpEndpoint::new_v6(dst_ip, 8081),
+            std::vec![5, 6, 7],
+        ))
+    );
+}
+
+/// P2-S7 (§6-2-A): IPv6 TCP frames pass the demux with flags + v6
+/// endpoints. The builder fills a valid TCP checksum, so R3a attaches the
+/// checksum-verified segment; fields are asserted segment-agnostically.
+#[test]
+fn smoltcp_demux_extracts_ipv6_tcp_event_flags() {
+    let transport = tcp_transport(49_001, 8443, 0x12, &[0xaa]);
+    let frame = RxFrame::new(ethernet_ipv6_frame(6, &transport));
+
+    match demux_rx_frame_with_smoltcp(&frame) {
+        PacketDispatch::Tcp(event) => {
+            assert_eq!(event.src.port, 49_001);
+            assert_eq!(event.dst.port, 8443);
+            assert_eq!(
+                event.src.family,
+                crate::net::structure::AddressFamily::Inet6
+            );
+            assert!(event.flags.syn);
+            assert!(event.flags.ack);
+            assert!(!event.flags.rst);
+            assert_eq!(event.payload, std::vec![0xaa]);
+        }
+        other => panic!("expected v6 tcp dispatch, got {other:?}"),
+    }
+}
+
+/// P3-S2 (D13) decisive test: `OpenFile::step_read`/`step_write` on a
+/// socket-backed file delegate to the socket `FileOps` impl —
+/// `write(fd)` ≡ `send(...,0)`, `read(fd)` ≡ `recv(...,0)` — instead of
+/// the former `EINVAL` that forced socket I/O through syscall-layer
+/// special cases. Full loopback ping: client writes via the FILE op,
+/// bytes travel the lo queue, the accepted child reads via the FILE op.
+#[test]
+fn open_file_read_write_delegate_to_socket_file_ops() {
+    let _lock = setup();
+    let guard = tx_substrate::epoch::guard();
+
+    let listener_open = match crate::net::execution::step_socket_open_file(2, 1, 6, &guard) {
+        StepOutcome::Done(output) => output,
+        _ => panic!("listener open_file failed"),
+    };
+    let client_open = match crate::net::execution::step_socket_open_file(2, 1, 6, &guard) {
+        StepOutcome::Done(output) => output,
+        _ => panic!("client open_file failed"),
+    };
+    let listener = listener_open.identity;
+    let client = client_open.identity;
+    let local = endpoint(40_460);
+    let remote_port = 40_461;
+
+    assert_eq!(
+        step_bind(&listener, inet(local.port), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(step_listen(&listener, 8, &guard), StepOutcome::Done(()));
+    assert_eq!(
+        step_bind(&client, inet(remote_port), &guard),
+        StepOutcome::Done(())
+    );
+    assert!(matches!(
+        step_connect(&client, inet(local.port), &guard),
+        StepOutcome::Yield {
+            shape: YieldShape::OnWaitSource { .. },
+            ..
+        }
+    ));
+    assert!(matches!(
+        step_tcp_loopback_handshake(&client, &guard),
+        StepOutcome::Done(_)
+    ));
+    let accepted = match step_accept(&listener, &guard) {
+        StepOutcome::Done(accepted) => accepted.child,
+        _ => panic!("accept should return queued child"),
+    };
+
+    // write(fd) on the client's OpenFile — the P3-S2 delegation path.
+    assert_eq!(
+        client_open.file.step_write(b"ping", &guard),
+        StepOutcome::Done(4),
+        "socket-backed OpenFile write must delegate to FileOps (was EINVAL)"
+    );
+    // Move the bytes across the loopback queue.
+    assert!(matches!(
+        step_process_loopback_tcp(&client, 4096, loopback_iface(), &guard),
+        StepOutcome::Done(_)
+    ));
+
+    // read(fd) on a temporary OpenFile wrapping the accepted child.
+    let accepted_file = crate::net::execution::socket_open_file_from_identity(
+        accepted.clone(),
+        crate::net::facade::SocketHandleFlags {
+            cloexec: false,
+            nonblock: false,
+        },
+    )
+    .expect("accepted open file")
+    .file;
+    let mut buf = [0u8; 8];
+    match accepted_file.step_read(&mut buf, &guard) {
+        StepOutcome::Done(4) => assert_eq!(&buf[..4], b"ping"),
+        other => panic!("socket-backed OpenFile read must return the payload: {other:?}"),
+    }
 }

@@ -77,6 +77,13 @@ impl UartRxPending {
 static UART_RX_PENDING: SpinMutex<UartRxPending> =
     spin_mutex(UartRxPending::new(), b"debug.lock.kernel.uart_rx_pending");
 
+/// Set by `net_rx_irq_handler` (IRQ context) and consumed by
+/// `drain_net_rx_pending` (reactor loop, task context). The virtio-net
+/// interrupt line stays PLIC-masked between the two, so a level-triggered
+/// line cannot storm while the bottom half is pending.
+static NET_RX_IRQ_PENDING: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Register `handler` as the dispatch entry for IRQ number `irq`.
 ///
 /// Idempotent on identical handler; panics on conflict (same slot,
@@ -159,9 +166,47 @@ fn dispatch_table_static() -> &'static IrqDispatchTable {
 pub(crate) fn install_irq_handlers<P: IrqIf + ConsoleIf>() {
     let irq = <P as IrqIf>::uart_irq();
     register_irq_handler(irq, uart_rx_irq_handler::<P>);
+    let net_irq = <P as IrqIf>::NET_IRQ;
+    if net_irq != 0 {
+        register_irq_handler(net_irq, net_rx_irq_handler::<P>);
+    }
     <P as IrqIf>::install_dispatch_table(dispatch_table_static());
     <P as IrqIf>::set_priority(irq, 1);
     <P as IrqIf>::unmask(irq);
+    if net_irq != 0 {
+        <P as IrqIf>::set_priority(net_irq, 1);
+        <P as IrqIf>::unmask(net_irq);
+    }
+}
+
+/// virtio-net IRQ handler (top half).
+///
+/// **IRQ-context safety**: takes no locks and no epoch guards — the delegate
+/// task may hold the driver's state lock when this interrupt lands, so even
+/// touching the device here could deadlock a single hart. The virtio line is
+/// level-triggered, so the handler masks it at the PLIC (otherwise it
+/// re-fires the instant the trap path `complete()`s) and defers everything
+/// to `drain_net_rx_pending` in the reactor loop.
+pub fn net_rx_irq_handler<P: IrqIf>(irq: u32) -> IrqHandled {
+    <P as IrqIf>::mask(irq);
+    NET_RX_IRQ_PENDING.store(true, core::sync::atomic::Ordering::Release);
+    IrqHandled::Wake
+}
+
+/// Bottom half for the net RX IRQ (task context, epoch guard legal).
+///
+/// Acks the virtio interrupt status, polls the device once (which kicks the
+/// net delegate when frames or TX completions are pending), and unmasks the
+/// line for the next interrupt. Returns true when an IRQ was consumed.
+pub(crate) fn drain_net_rx_pending<P: IrqIf>() -> bool {
+    if !NET_RX_IRQ_PENDING.swap(false, core::sync::atomic::Ordering::AcqRel) {
+        return false;
+    }
+    if let Some(registration) = tx_subsystems::net::net_device_by_name(b"eth0") {
+        let _ = registration.ops.ack_interrupt_and_fire();
+    }
+    <P as IrqIf>::unmask(<P as IrqIf>::NET_IRQ);
+    true
 }
 
 /// UART RX IRQ handler. Drains pending bytes from the platform

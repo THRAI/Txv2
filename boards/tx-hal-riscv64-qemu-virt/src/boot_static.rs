@@ -21,7 +21,7 @@ pub(crate) const BOOTSTRAP_PMAP_RESERVED_RANGES: usize = 4;
 // QEMU virt 有 11 个可识别节点(8×virtio-mmio + uart + plic + pci ecam);VF2 更少,留余量
 pub(crate) const MAX_PLATFORM_DEVICES: usize = 24;
 // 每个设备一条 MmioRegion,外加固定的 clint 项(clint 无 DeviceKind 但其 MMIO 必须保持映射)
-const GENERATED_MMIO_REGIONS: usize = MAX_PLATFORM_DEVICES + 1;
+const GENERATED_MMIO_REGIONS: usize = MAX_PLATFORM_DEVICES + 2;
 
 // 生成的 MMIO 区名字表,按各类型在设备树里出现的顺序取用
 const VIRTIO_REGION_NAMES: [&str; 12] = [
@@ -292,7 +292,11 @@ fn build_mmio_regions(
     }
 
     out[0] = clint_mmio_region();
-    let mut count = 1usize;
+    // The goldfish-rtc has no DeviceKind (same situation as the clint) but
+    // must stay mapped so the boot-time CLOCK_REALTIME seed read from
+    // `rtc@101000` doesn't fault. Add it statically alongside the clint.
+    out[1] = goldfish_rtc_mmio_region();
+    let mut count = 2usize;
     let mut virtio_index = 0usize;
     let mut uart_index = 0usize;
     let mut sdio_index = 0usize;
@@ -351,8 +355,38 @@ fn clint_mmio_region() -> MmioRegion {
     }
 }
 
-fn qemu_mmio_regions() -> [MmioRegion; 4] {
+fn goldfish_rtc_mmio_region() -> MmioRegion {
+    MmioRegion {
+        name: "rtc",
+        phys: PhysRange {
+            start: PhysAddr(0x0010_1000),
+            size: 0x1000,
+        },
+        virt: VirtRange {
+            start: VirtAddr(DIRECT_MAP_BASE + 0x0010_1000),
+            size: 0x1000,
+        },
+        flags: MMIO_RW_DEVICE,
+    }
+}
+
+fn qemu_mmio_regions() -> [MmioRegion; 6] {
     [
+        // QEMU virt goldfish-rtc (`rtc@101000`). One page; read once at boot to
+        // seed CLOCK_REALTIME from real host time. Without this mapping the
+        // boot-time RTC read faults (load page fault at the direct-map VA).
+        MmioRegion {
+            name: "rtc",
+            phys: PhysRange {
+                start: PhysAddr(0x0010_1000),
+                size: 0x1000,
+            },
+            virt: VirtRange {
+                start: VirtAddr(DIRECT_MAP_BASE + 0x0010_1000),
+                size: 0x1000,
+            },
+            flags: MMIO_RW_DEVICE,
+        },
         MmioRegion {
             name: "clint",
             phys: PhysRange {
@@ -397,6 +431,24 @@ fn qemu_mmio_regions() -> [MmioRegion; 4] {
             },
             virt: VirtRange {
                 start: VirtAddr(DIRECT_MAP_BASE + 0x1000_1000),
+                size: 0x1000,
+            },
+            flags: MMIO_RW_DEVICE,
+        },
+        // Second QEMU virt virtio-mmio slot (0x1000_2000). The block driver
+        // probes "virtio0"; exposing "virtio1" lets the net driver bind a
+        // SEPARATE device so virtio-blk (root/ext4) and virtio-net (eth0) can
+        // coexist. QEMU: `-device virtio-blk-device,...,bus=virtio-mmio-bus.0`
+        // (-> virtio0) and `-device virtio-net-device,...,bus=virtio-mmio-bus.1`
+        // (-> virtio1). Needed for the git Task2 outbound-network path.
+        MmioRegion {
+            name: "virtio1",
+            phys: PhysRange {
+                start: PhysAddr(0x1000_2000),
+                size: 0x1000,
+            },
+            virt: VirtRange {
+                start: VirtAddr(DIRECT_MAP_BASE + 0x1000_2000),
                 size: 0x1000,
             },
             flags: MMIO_RW_DEVICE,

@@ -217,6 +217,11 @@ impl<P: TxPlatform> KernelNetDevices<P> {
         let Some(net) = Self::probe_virtio_mmio_net() else {
             return StepOutcome::Done(());
         };
+        // RX is interrupt-driven (PLIC NET_IRQ → net_rx_irq_handler →
+        // drain_net_rx_pending kicks the delegate); without this the device
+        // never raises the line and inbound frames sit until a poll kick.
+        net.enable_interrupts();
+
         self.register_eth0(net)
     }
 

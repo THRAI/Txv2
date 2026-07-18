@@ -1,0 +1,4 @@
+busybox riscv64 musl
+version: 1.32.1
+fetched-from: https://raw.githubusercontent.com/leommxj/prebuilt-multiarch-bin/bin/riscv64_tools/busybox
+fetched-at: 2026-05-12T08:09:13Z

@@ -13,7 +13,7 @@ use tx_hal::PmapIf;
 
 use crate::execution::Guard;
 use crate::execution::WaitToken;
-use crate::page_backed::{step_fsync, PageContainerKind};
+use crate::page_backed::{step_fsync, MaterializedPagePin, PageContainerKind};
 use crate::vm::adapter::step_engine::{
     self as step_engine, AbortReason, AgentCancelPolicy, DelegateRegistry, DelegateReply,
     DelegateRequest, StepOutcome, StepOutcome as V3StepOutcome, TaskMailbox, TokenDropPolicy,
@@ -133,6 +133,39 @@ impl AddressSpace {
                 parent
                     .pmap
                     .protect_range(range, entry.prot.without_write())?;
+                // Eager-copy the parent's resident pages of WRITABLE private
+                // ranges into the child's pmap as read-only, so the child's
+                // pmap-first user-access lane (`resolve_user_page_addr`) sees
+                // the parent's exact resident content. Without this the child
+                // re-derives each page via the materialize/refault path, and a
+                // page the kernel populated through the copy_to_user pmap-first
+                // lane (which does not update the per-VmEntry set) refaults to
+                // the file-cache/zero version — silently zeroing a forked git
+                // helper's argv strings ("git ''" / execve E2BIG). Both sides
+                // stay read-only over the shared frame; the first write on
+                // either side faults and CoWs as before. (From net-git
+                // 2c97491b, narrowed to writable ranges.)
+                //
+                // Read-only private mappings are deliberately SKIPPED: the
+                // parent cannot have modified them (no write prot), so the
+                // child's refault from backing is always correct — and they
+                // are the bulk of a big process's residency (rustc maps
+                // hundreds of MB of .so/.rlib images). Walking those made
+                // every gcc/rustc fork+exec take minutes.
+                if entry.prot.write {
+                    for (page, snap) in parent.pmap.walk_range(range) {
+                        if let Ok(map_pin) =
+                            step_engine::page_allocator::acquire_map_pin(snap.ppn)
+                        {
+                            let _ = child.pmap.publish_page(
+                                page,
+                                snap.ppn,
+                                snap.prot.without_write(),
+                                MaterializedPagePin::Allocated(map_pin),
+                            );
+                        }
+                    }
+                }
             }
         }
 

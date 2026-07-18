@@ -47,7 +47,6 @@ pub fn step_shutdown(
         if let Some(raw_tcp) = payload.raw_tcp_socket() {
             raw_tcp.close();
         }
-        payload.refresh_io_from_raw();
     }
 
     // SCTP: shutting down the write side tears down the (single) 1-to-1

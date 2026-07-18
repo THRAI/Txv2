@@ -45,9 +45,11 @@ use tx_subsystems::vfs::FsOps;
 /// Static writable capacity for ext4 regular-file PageContainers.
 ///
 /// PageContainer currently has a fixed `page_count` capacity. Match tmpfs'
-/// day-1 growth window so newly-created ext4 files can grow through ordinary
-/// PageBacked writes instead of failing after one page.
-const EXT4_FILE_PAGE_CAP: u64 = 2048;
+/// growth window (256 MiB — see `TMPFS_FILE_PAGE_CAP`) so newly-created
+/// ext4 files can grow through ordinary PageBacked writes instead of
+/// failing after one page. The original 8 MiB day-1 cap EINVAL'd git
+/// clone's pack write at ~8 MiB (finals git Task2).
+const EXT4_FILE_PAGE_CAP: u64 = 65536;
 
 /// Factory for `MountOutput::fs_ops`.
 ///
@@ -476,7 +478,7 @@ where
         }
     }
 
-    // `step_chmod`, `step_chown` commit through `serialize_inode_meta`.
+    // `step_chown` would commit the same way if a workload needs it.
 }
 
 fn inode_meta_lite(meta: &InodeMeta) -> InodeMetaLite {

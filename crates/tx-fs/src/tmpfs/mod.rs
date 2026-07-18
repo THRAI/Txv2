@@ -53,13 +53,17 @@ const TMPFS_FIRST_FREE_OBJECT_ID: u64 = 3;
 /// `PageContainer::new` requires a fixed `page_count` capacity at
 /// allocation time (see `PageContainer::check_bounds`); tmpfs files
 /// are created with this cap and `size_bytes` grows lazily through
-/// `step_write` / `step_truncate`. 8 MiB ÷ 4 KiB pages covers the
-/// musl libcbench `tmpfile()` stdio path, which writes 5,000,000
-/// bytes before reading the same file back.
+/// `step_write` / `step_truncate`. 256 MiB ÷ 4 KiB pages: the original
+/// 8 MiB day-1 cap (sized for musl libcbench's 5,000,000-byte
+/// `tmpfile()` path) made every >8 MiB write fail with EINVAL — first
+/// hit by `git clone`'s pack file (~8 MiB for xv6-riscv) at the
+/// index-pack write (finals git Task2). Pages are lazy (sparse
+/// `PageCacheIndex` BTreeMap), so the larger cap costs no memory up
+/// front; it only bounds a single file's resident dirty pages.
 // TODO(phase-vfs-tmpfs-grow): teach `PageContainer` to grow `page_count`
 // on demand so tmpfs files are bounded only by global swap pressure
 // rather than by this static cap.
-const TMPFS_FILE_PAGE_CAP: u64 = 2048;
+const TMPFS_FILE_PAGE_CAP: u64 = 65536;
 
 /// Maximum length of an inline symlink target, in bytes.
 ///

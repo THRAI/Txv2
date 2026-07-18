@@ -6,7 +6,7 @@ use crate::procfs::{
     pid_from_uid_map_id,
     KERNEL_CONFIG_TEXT,
     PROCFS_CONFIG_ID, PROCFS_CPUINFO_ID, PROCFS_MEMINFO_ID, PROCFS_MOUNTS_ID,
-    PROCFS_NET_ARP_ID, PROCFS_NET_IF_INET6_ID, PROCFS_NET_TX_NEIGH_ID,
+    PROCFS_NET_ARP_ID, PROCFS_NET_IF_INET6_ID, PROCFS_NET_IPV6_ROUTE_ID, PROCFS_NET_TX_NEIGH_ID,
     PROCFS_SYS_FS_LEASE_BREAK_TIME_ID, PROCFS_SYS_FS_PIPE_MAX_SIZE_ID,
     PROCFS_SYS_FS_PROTECTED_HARDLINKS_ID, PROCFS_SYS_FS_PROTECTED_SYMLINKS_ID,
     PROCFS_SYS_KERNEL_PID_MAX_ID, PROCFS_SYS_KERNEL_TAINTED_ID, PROCFS_SYSVIPC_MSG_ID,
@@ -86,6 +86,10 @@ pub fn render(fs_object_id: FsObjectId) -> String {
         PROCFS_NET_ARP_ID => {
             let netns = tx_subsystems::net::namespace::initial_net_namespace_payload();
             tx_subsystems::net::proc_net_arp_snapshot_zero_text(&netns.ether_ifaces_snapshot())
+        }
+        PROCFS_NET_IPV6_ROUTE_ID => {
+            let netns = tx_subsystems::net::namespace::initial_net_namespace_payload();
+            tx_subsystems::net::proc_net_ipv6_route_snapshot_text(&netns)
         }
         PROCFS_SYSVIPC_MSG_ID => render_sysvipc_msg(),
         PROCFS_SYSVIPC_SEM_ID => render_sysvipc_sem(),
