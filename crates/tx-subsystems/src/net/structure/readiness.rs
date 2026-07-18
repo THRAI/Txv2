@@ -1,4 +1,9 @@
+use alloc::sync::Arc;
+
 use tx_substrate::bus::{RawPort, RawQueue};
+
+use crate::net::adapter::wait_routing;
+use crate::sync::SpinMutex;
 
 tx_substrate::bus::bus_readiness! {
     pub struct RecvWireSet {
@@ -31,6 +36,14 @@ pub struct SocketReadiness {
     pub recv_wq: RawQueue,
     pub send_wq: RawQueue,
     pub accept_wq: RawQueue,
+    /// P3-S1 (R4a): substrate-side `WaitSource` mirrors sharing the same
+    /// carrier ids as the `RawQueue`s above. Installed by
+    /// `SocketWaitCarriers::register`; `fire_*` notifies BOTH sides so
+    /// `await_wait_source`/epoll subscribers wake alongside
+    /// `wait_on_token` subscribers.
+    recv_src: SpinMutex<Option<Arc<wait_routing::WaitSource>>>,
+    send_src: SpinMutex<Option<Arc<wait_routing::WaitSource>>>,
+    accept_src: SpinMutex<Option<Arc<wait_routing::WaitSource>>>,
 }
 
 impl SocketReadiness {
@@ -39,11 +52,33 @@ impl SocketReadiness {
             recv_wq: RawQueue::new(),
             send_wq: RawQueue::new(),
             accept_wq: RawQueue::new(),
+            recv_src: SpinMutex::new(None),
+            send_src: SpinMutex::new(None),
+            accept_src: SpinMutex::new(None),
+        }
+    }
+
+    pub(crate) fn install_substrate_mirrors(
+        &self,
+        recv: Arc<wait_routing::WaitSource>,
+        send: Arc<wait_routing::WaitSource>,
+        accept: Arc<wait_routing::WaitSource>,
+    ) {
+        *self.recv_src.lock() = Some(recv);
+        *self.send_src.lock() = Some(send);
+        *self.accept_src.lock() = Some(accept);
+    }
+
+    fn notify_mirror(slot: &SpinMutex<Option<Arc<wait_routing::WaitSource>>>, bits: u64) {
+        if let Some(source) = &*slot.lock() {
+            wait_routing::notify_v3_source(source, bits);
         }
     }
 
     pub fn fire_recv(&self, set: RecvWireSet) -> usize {
-        self.recv_wq.fire(set.bits())
+        let wakes = self.recv_wq.fire(set.bits());
+        Self::notify_mirror(&self.recv_src, set.bits());
+        wakes
     }
 
     pub fn clear_recv(&self, set: RecvWireSet) {
@@ -51,7 +86,9 @@ impl SocketReadiness {
     }
 
     pub fn fire_send(&self, set: SendWireSet) -> usize {
-        self.send_wq.fire(set.bits())
+        let wakes = self.send_wq.fire(set.bits());
+        Self::notify_mirror(&self.send_src, set.bits());
+        wakes
     }
 
     pub fn clear_send(&self, set: SendWireSet) {
@@ -59,7 +96,9 @@ impl SocketReadiness {
     }
 
     pub fn fire_accept(&self, set: AcceptWireSet) -> usize {
-        self.accept_wq.fire(set.bits())
+        let wakes = self.accept_wq.fire(set.bits());
+        Self::notify_mirror(&self.accept_src, set.bits());
+        wakes
     }
 
     pub fn clear_accept(&self, set: AcceptWireSet) {

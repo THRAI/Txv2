@@ -156,7 +156,7 @@ pub fn sctp_assoc_change_abort_bytes(streams: u16, assoc_id: u32) -> alloc::vec:
     b[12..14].copy_from_slice(&streams.to_le_bytes()); // sac_outbound_streams
     b[14..16].copy_from_slice(&streams.to_le_bytes()); // sac_inbound_streams
     b[16..20].copy_from_slice(&assoc_id.to_le_bytes()); // sac_assoc_id
-    // sac_info[]: the 4-byte ABORT chunk header (type=6, flags=0, length=4).
+                                                        // sac_info[]: the 4-byte ABORT chunk header (type=6, flags=0, length=4).
     b[20] = 6;
     b[23] = 4;
     b
@@ -179,7 +179,7 @@ pub fn sctp_send_failed_bytes(
     let mut b = alloc::vec![0u8; total];
     b[0..2].copy_from_slice(&0x8003u16.to_le_bytes()); // ssf_type = SCTP_SEND_FAILED
     b[4..8].copy_from_slice(&(total as u32).to_le_bytes()); // ssf_length
-    // ssf_info (sctp_sndrcvinfo) @12: sinfo_stream@12, sinfo_flags@16, sinfo_ppid@20.
+                                                            // ssf_info (sctp_sndrcvinfo) @12: sinfo_stream@12, sinfo_flags@16, sinfo_ppid@20.
     b[12..14].copy_from_slice(&stream.to_le_bytes());
     if last {
         b[16..18].copy_from_slice(&0x0001u16.to_le_bytes()); // SCTP_DATA_LAST_FRAG

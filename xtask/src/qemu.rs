@@ -355,7 +355,12 @@ fn qemu_command(
                 args.push("virtio-blk-pci-non-transitional,drive=txblk0,rombar=0".into());
             }
             TxTarget::Rv64Qemu => {
-                args.push("virtio-blk-device,drive=txblk0".into());
+                // Pin the block device to virtio-mmio-bus.0 (-> "virtio0" @
+                // 0x1000_1000, where the block driver probes — see the rv64
+                // board `boot_static.rs`). Net takes bus.1 (-> "virtio1"); an
+                // unpinned block would drift to another slot when net is present
+                // and the block-0 read would hang.
+                args.push("virtio-blk-device,drive=txblk0,bus=virtio-mmio-bus.0".into());
             }
         }
         args.push("-drive".into());
@@ -423,7 +428,11 @@ fn push_net_device(args: &mut Vec<String>, target: TxTarget) {
     args.push("-device".into());
     match target {
         TxTarget::Rv64Qemu | TxTarget::Rv64M1DockMock => {
-            args.push("virtio-net-device,netdev=net0,bus=virtio-mmio-bus.0".into());
+            // Bus.1 (-> "virtio1" @ 0x1000_2000, where the net driver binds —
+            // see the rv64 board `boot_static.rs`). The block device owns bus.0
+            // (-> "virtio0"); putting net on bus.0 lands it where the block
+            // driver probes and hangs the boot-time ext4 superblock read.
+            args.push("virtio-net-device,netdev=net0,bus=virtio-mmio-bus.1".into());
         }
         TxTarget::La64Qemu => {
             args.push("virtio-net-pci,netdev=net0".into());
@@ -978,7 +987,7 @@ mod tests {
         .unwrap()
         .join(" ");
         assert!(rv64.contains("-netdev user,id=net0"));
-        assert!(rv64.contains("-device virtio-net-device,netdev=net0,bus=virtio-mmio-bus.0"));
+        assert!(rv64.contains("-device virtio-net-device,netdev=net0,bus=virtio-mmio-bus.1"));
 
         let la64 = qemu_command(
             Path::new("/tmp/tx"),

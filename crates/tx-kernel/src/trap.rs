@@ -64,7 +64,7 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
         TrapAction::Resume
     }
 
-    fn on_external_irq(_cpu: CpuId) -> TrapAction {
+    fn on_external_irq(cpu: CpuId, view: TrapFrameMut<'_>) -> TrapAction {
         let irq = P::claim();
         if irq == 0 {
             return TrapAction::Resume;
@@ -74,7 +74,25 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
         P::complete(irq);
 
         match handled {
-            IrqHandled::Wake => TrapAction::Reschedule,
+            IrqHandled::Wake => {
+                // A device IRQ that interrupted a *user* slice must
+                // follow the timer-preemption hand-off discipline
+                // before asking for Reschedule: from-user Reschedule
+                // longjmps back into `run_thread`, whose
+                // userspace-run wait only resolves via a slot record.
+                // Without `hand_off_timer_preempt` the thread parks
+                // forever on an unresolvable wait (P2 external-connect
+                // resume hang, 2026-07-03).
+                if view.view().previous_mode == tx_hal::TrapPreviousMode::User {
+                    let hart = <P as PercpuIf>::current_cpu_id().0;
+                    let outcome = trap_handoff::hand_off_timer_preempt(hart, &view);
+                    if matches!(outcome, trap_handoff::TimerPreemptOutcome::Preempted) {
+                        crate::init::mark_boot_reactor_userspace_preempt(cpu);
+                    }
+                    return trap_handoff::timer_preempt_outcome_to_trap_action(&outcome);
+                }
+                TrapAction::Reschedule
+            }
             IrqHandled::Done | IrqHandled::NotMine => TrapAction::Resume,
         }
     }

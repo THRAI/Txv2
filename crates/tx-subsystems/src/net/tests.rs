@@ -48,9 +48,10 @@ use crate::net::packet::{
     PacketTxResult, PacketTxSink, RxFrame, TcpPacketEvent, TcpPacketFlags, UdpPacketEvent,
 };
 use crate::net::protocol::{
-    build_icmpv4_echo_request_message, decide_ipv4_route, loopback_iface, ArpSnapshotState,
-    EtherIface, EtherPacketSource, EtherPacketTxSink, Icmpv4EchoPacket, Icmpv4Event, IfaceCommon,
-    Ipv4RouteDecision, LoopbackIface, PollContext, RawTcpSocket, RawUdpSocket, SmoltcpAdapter,
+    build_icmpv4_echo_request_message, decide_ipv4_route, decide_ipv6_route, loopback_iface,
+    ArpSnapshotState, EtherIface, EtherPacketSource, EtherPacketTxSink, Icmpv4EchoPacket,
+    Icmpv4Event, IfaceCommon, Ipv4RouteDecision, Ipv6RouteDecision, LoopbackIface, PollContext,
+    RawTcpSocket, RawUdpSocket, SmoltcpAdapter,
     SmoltcpAdapterConfig, SmoltcpPacketSource, SmoltcpPacketTxSink, UdpTxDatagram,
     ARP_REQUEST_RETRY_LIMIT, TCP_CORK_AUTO_FLUSH_BYTES,
 };
@@ -72,9 +73,11 @@ use tx_substrate::step::{NoProgress, StepOutcome, YieldShape};
 
 mod bridge_tests;
 mod byte_io_tests;
+mod clock_tests;
 mod delegate_loopback_tests;
 mod delegate_supervisor_tests;
 mod ether_iface_arp_tests;
+mod external_connect_tests;
 mod icmp_tests;
 mod loopback_pending_tests;
 mod loopback_tests;
@@ -175,7 +178,73 @@ fn ethernet_ipv4_frame(protocol: u8, transport: &[u8]) -> std::vec::Vec<u8> {
     frame.extend_from_slice(&[192, 0, 2, 1]);
     frame.extend_from_slice(&[192, 0, 2, 2]);
     frame.extend_from_slice(transport);
+    fill_frame_checksums(&mut frame);
     frame
+}
+
+fn ethernet_ipv6_frame(protocol: u8, transport: &[u8]) -> std::vec::Vec<u8> {
+    let mut frame = std::vec::Vec::new();
+    frame.extend_from_slice(&[0x02, 0, 0, 0, 0, 2]);
+    frame.extend_from_slice(&[0x02, 0, 0, 0, 0, 1]);
+    frame.extend_from_slice(&[0x86, 0xdd]);
+    frame.extend_from_slice(&[0x60, 0, 0, 0]); // version 6, tc/flow 0
+    let payload_len = u16::try_from(transport.len()).expect("test frame length");
+    frame.extend_from_slice(&payload_len.to_be_bytes());
+    frame.push(protocol); // next header
+    frame.push(64); // hop limit
+    // 2001:db8::1 -> 2001:db8::2
+    frame.extend_from_slice(&[
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+    ]);
+    frame.extend_from_slice(&[
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02,
+    ]);
+    frame.extend_from_slice(transport);
+    fill_frame_checksums(&mut frame);
+    frame
+}
+
+/// Patch the IPv4 header checksum and the L4 (TCP/UDP) checksum of a
+/// hand-assembled ethernet frame so it looks like real wire traffic. The demux
+/// (R3a) verifies these, so test frames must carry valid checksums; corruption
+/// tests deliberately damage a byte afterwards.
+fn fill_frame_checksums(frame: &mut [u8]) {
+    use smoltcp::wire::{IpAddress, Ipv4Packet, Ipv6Packet};
+
+    // Ethernet header is 14 bytes; the IP packet follows.
+    let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+    match ethertype {
+        0x0800 => {
+            let mut ip = Ipv4Packet::new_unchecked(&mut frame[14..]);
+            ip.fill_checksum();
+            let src = IpAddress::Ipv4(ip.src_addr());
+            let dst = IpAddress::Ipv4(ip.dst_addr());
+            let protocol = ip.next_header();
+            fill_l4_checksum(protocol, ip.payload_mut(), &src, &dst);
+        }
+        0x86dd => {
+            let mut ip = Ipv6Packet::new_unchecked(&mut frame[14..]);
+            let src = IpAddress::Ipv6(ip.src_addr());
+            let dst = IpAddress::Ipv6(ip.dst_addr());
+            let protocol = ip.next_header();
+            fill_l4_checksum(protocol, ip.payload_mut(), &src, &dst);
+        }
+        _ => {}
+    }
+}
+
+fn fill_l4_checksum(
+    protocol: smoltcp::wire::IpProtocol,
+    l4: &mut [u8],
+    src: &smoltcp::wire::IpAddress,
+    dst: &smoltcp::wire::IpAddress,
+) {
+    use smoltcp::wire::{IpProtocol, TcpPacket, UdpPacket};
+    match protocol {
+        IpProtocol::Tcp => TcpPacket::new_unchecked(l4).fill_checksum(src, dst),
+        IpProtocol::Udp => UdpPacket::new_unchecked(l4).fill_checksum(src, dst),
+        _ => {}
+    }
 }
 
 fn udp_transport(src_port: u16, dst_port: u16, payload: &[u8]) -> std::vec::Vec<u8> {

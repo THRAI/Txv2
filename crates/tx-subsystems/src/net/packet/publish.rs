@@ -69,6 +69,15 @@ impl NetworkPublishTarget {
     }
 
     pub fn publish(self) -> usize {
-        self.publish.publish_to(&self.socket)
+        // 发布可能晚于目标 socket 的并发 close(如 lo 队列里滞留的包在
+        // 对端退休后才被处理)。对死 socket 的唤醒是空操作,不是 panic:
+        // 经 observe(guard) 检活,避免 Cap 裸解引用。调用方多半已持
+        // guard——EBR 禁止嵌套,先借当前窗口,没有再新开。
+        let guard =
+            tx_substrate::epoch::borrow_current_guard().unwrap_or_else(tx_substrate::epoch::guard);
+        let Some(socket) = self.socket.downgrade().observe(&guard) else {
+            return 0;
+        };
+        self.publish.publish_to(&socket)
     }
 }

@@ -1943,9 +1943,32 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     if file.eventfd().is_some() {
         return super::eventfd::sys_eventfd_write(&file, args[1], len, ctx).await;
     }
-    if super::socket::socket_identity_from_file(&file).is_ok() {
-        return super::socket::sys_sendto([args[0], args[1], args[2], 0, 0, 0], ctx).await;
+    // Netlink `write(fd, msg)` == `sendto(fd, msg, 0, NULL, 0)`: route it to the
+    // netlink send path. The generic socket FileOps write (step_send_kernel_bytes)
+    // has no netlink handling and blocks forever waiting for send readiness that
+    // never fires — iproute2/busybox `ip` emit their RTM_GET* dump requests via
+    // write(), so this hung `ip` (and thus all v6/v4 config) entirely.
+    if let Ok(socket) = super::socket::socket_identity_from_file(&file) {
+        if super::socket::is_netlink_socket_kind(socket.kind) {
+            if !file.flags().write {
+                return SyscallResult::Error(EBADF_VALUE);
+            }
+            let copy_len = core::cmp::min(len, SOCKET_IO_MAX_INLINE);
+            let mut bytes: alloc::vec::Vec<u8> = alloc::vec![0u8; copy_len];
+            if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut bytes, buf_ptr as u64) {
+                return SyscallResult::error_from(errno);
+            }
+            return match super::socket::dispatch_netlink_send(ctx, &socket, &bytes) {
+                Ok(sent) => SyscallResult::Return(sent as i64),
+                Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+            };
+        }
     }
+    // P3-S3 (D13): sockets no longer detour to sys_sendto here —
+    // `write(fd)` flows the generic VFS path into the socket FileOps arm
+    // (`step_write` → `FileOps::write` ≡ `send(...,0)`), blocking via the
+    // same v3 drive() loop as pipes. Loopback transfer progress rides the
+    // delegate kick inside `step_send_kernel_bytes`.
     if let Some((_rx, tx)) = file.socketpair_endpoint() {
         if !file.flags().write {
             return SyscallResult::Error(EINVAL_VALUE);
@@ -1975,6 +1998,13 @@ pub(super) async fn sys_write<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
         tx_subsystems::vfs::RNodeBacking::PageBacked { .. }
     ) {
         len
+    } else if super::socket::socket_identity_from_file(&file).is_ok() {
+        // Sockets are datagram/stream fds, not the TTY line discipline: a
+        // UDP `read`/`write` must move the whole datagram in one call.
+        // Truncating to `TTY_WRITE_MAX_INLINE` (4 KiB) shreds any datagram
+        // >4 KiB into fragments (corrupting iperf3 UDP `-l 65495`); use the
+        // socket I/O size (64 KiB), matching the sendto/recvfrom staging cap.
+        core::cmp::min(len, SOCKET_IO_MAX_INLINE)
     } else {
         core::cmp::min(len, TTY_WRITE_MAX_INLINE)
     };
@@ -2226,22 +2256,24 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
     if file.timerfd().is_some() {
         return super::timerfd::sys_timerfd_read::<P>(&file, args[1], len, ctx).await;
     }
-    if super::socket::socket_identity_from_file(&file).is_ok() {
-        if ctx.mailbox.is_none() {
-            let guard = crate::adapter::step_engine::guard();
-            if let Some(Ok(mask)) = super::socket::socket_poll_mask_from_file(&file, &guard) {
-                let readable = mask.intersects(
-                    tx_subsystems::net::PollMask::IN
-                        | tx_subsystems::net::PollMask::ERR
-                        | tx_subsystems::net::PollMask::HUP
-                        | tx_subsystems::net::PollMask::RDHUP,
-                );
-                if !readable {
-                    return SyscallResult::Error(EAGAIN_VALUE);
-                }
+    // P3-S3 (D13): sockets no longer detour to sys_recvfrom here —
+    // `read(fd)` flows the generic VFS path into the socket FileOps arm
+    // (`step_read` → `FileOps::read` ≡ `recv(...,0)`). The old
+    // mailbox-less poll-gate is preserved because a bootstrap context
+    // cannot block in the drive() loop.
+    if super::socket::socket_identity_from_file(&file).is_ok() && ctx.mailbox.is_none() {
+        let guard = crate::adapter::step_engine::guard();
+        if let Some(Ok(mask)) = super::socket::socket_poll_mask_from_file(&file, &guard) {
+            let readable = mask.intersects(
+                tx_subsystems::net::PollMask::IN
+                    | tx_subsystems::net::PollMask::ERR
+                    | tx_subsystems::net::PollMask::HUP
+                    | tx_subsystems::net::PollMask::RDHUP,
+            );
+            if !readable {
+                return SyscallResult::Error(EAGAIN_VALUE);
             }
         }
-        return super::socket::sys_recvfrom::<P>([args[0], args[1], args[2], 0, 0, 0], ctx).await;
     }
     if let Some((rx, _tx)) = file.socketpair_endpoint() {
         if !file.flags().read {
@@ -2268,6 +2300,13 @@ pub(super) async fn sys_read<'a, P: tx_hal::TimeIf>(
         tx_subsystems::vfs::RNodeBacking::PageBacked { .. }
     ) {
         len
+    } else if super::socket::socket_identity_from_file(&file).is_ok() {
+        // Sockets are datagram/stream fds, not the TTY line discipline: a
+        // UDP `read`/`write` must move the whole datagram in one call.
+        // Truncating to `TTY_WRITE_MAX_INLINE` (4 KiB) shreds any datagram
+        // >4 KiB into fragments (corrupting iperf3 UDP `-l 65495`); use the
+        // socket I/O size (64 KiB), matching the sendto/recvfrom staging cap.
+        core::cmp::min(len, SOCKET_IO_MAX_INLINE)
     } else {
         core::cmp::min(len, TTY_WRITE_MAX_INLINE)
     };

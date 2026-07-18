@@ -538,6 +538,16 @@ impl<P: TxPlatform> CoreInit<P> {
             });
             tx_hal::console_write_str::<P>("\n");
         }
+        // Seed CLOCK_REALTIME from the platform hardware RTC (if any) so wall
+        // time — `date`, `git` commit timestamps, file mtimes — reflects real
+        // time instead of the fixed epoch base. Runs after vDSO init so the
+        // offset update is republished into the vvar page. Platforms without a
+        // readable RTC return `None` and keep the default base (no change).
+        if let Some(rtc_ns) = P::read_rtc_epoch_ns() {
+            let _ = tx_subsystems::wall_clock::set_realtime_ns::<P>(rtc_ns);
+            Self::write_board_sentinel_prefix();
+            tx_hal::console_write_str::<P>(":rtc:synced\n");
+        }
     }
 
     /// Mount tmpfs as the rootfs.
@@ -1177,6 +1187,113 @@ impl<P: TxPlatform> CoreInit<P> {
 
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":mount:bdevfs:ok\n");
+    }
+
+    /// Bind-mount the mounted Alpine ext4 image's top-level subtrees
+    /// (`/musl/usr` -> `/usr`, `/musl/lib` -> `/lib`, `/musl/bin` -> `/bin`,
+    /// `/musl/sbin` -> `/sbin`) over the empty rootfs skeleton directories.
+    ///
+    /// For the `tx.runsh` (on-site-finals git) lane only — call it from the
+    /// bootstrap path when `tx.runsh` is set.
+    ///
+    /// The image is mounted at `/musl`, but its binaries and its own *absolute*
+    /// symlinks assume a real root layout: `/usr/bin/git`, `/bin/sh ->
+    /// /bin/busybox`, the musl loader's default library search (`/lib:/usr/lib`),
+    /// and git's compiled-in `/bin/sh` for spawning helpers (index-pack,
+    /// upload-pack). Those all land on the read-only kernel rootfs, not `/musl`,
+    /// so git clone reaches the network but dies at helper spawn. The
+    /// `populate_rootfs_*` shims already create `/usr`, `/lib`, `/bin`, ... as
+    /// empty tmpfs dirs, so a plain top-level symlink can't take their place
+    /// (EEXIST). Instead, mount the matching ext4 subtree over each empty
+    /// skeleton dir, so the mounted image behaves as the root fs for the
+    /// helper-spawn paths git relies on. Gated to this lane, so the OSComp
+    /// tmpfs layout is untouched. Best-effort: a missing image dir or a backend
+    /// that would block is skipped rather than aborting boot. (Ported from
+    /// net-git e7992ef8 — git Task2.)
+    pub(super) fn overlay_image_dirs_for_runsh() {
+        use step_engine::StepOutcome as V3;
+        let Some(musl_mount) = MUSL_MOUNT.lock().clone() else {
+            return;
+        };
+        let Some(root_mount) = ROOT_MOUNT.lock().clone() else {
+            return;
+        };
+        let Ok(ext4_payload) = musl_mount.payload_cap() else {
+            return;
+        };
+        let ext4_payload = ext4_payload.into_cap();
+        let ext4_fs_ops = ext4_payload.fs_ops.clone();
+        let ext4_root_id = musl_mount.root().fs_object_id();
+        let Ok(rootfs_payload) = root_mount.payload_cap() else {
+            return;
+        };
+        let rootfs_payload = rootfs_payload.into_cap();
+        let rootfs_fs_ops = rootfs_payload.fs_ops.clone();
+
+        for name in [
+            b"usr".as_slice(),
+            b"lib".as_slice(),
+            b"bin".as_slice(),
+            b"sbin".as_slice(),
+        ] {
+            let guard = step_engine::guard();
+            // Source: the ext4 subtree (e.g. /musl/usr).
+            let V3::Done(ext4_sub_id) = ext4_fs_ops.lookup(ext4_root_id, name, &guard) else {
+                drop(guard);
+                continue;
+            };
+            let V3::Done(ext4_sub_meta) = ext4_fs_ops.load_inode_meta(ext4_sub_id, &guard) else {
+                drop(guard);
+                continue;
+            };
+            // Mountpoint: the empty tmpfs skeleton dir (e.g. /usr).
+            let V3::Done(skel_id) =
+                rootfs_fs_ops.lookup(tx_fs::tmpfs::TMPFS_ROOT_OBJECT_ID, name, &guard)
+            else {
+                drop(guard);
+                continue;
+            };
+            let V3::Done(skel_meta) = rootfs_fs_ops.load_inode_meta(skel_id, &guard) else {
+                drop(guard);
+                continue;
+            };
+            drop(guard);
+
+            // ext4 subtree root RNode (with the ext4 containing-mount hint so
+            // the walker resolves the right FsOps after crossing the mount).
+            let ext4_sub_rnode = {
+                let raw = RNode::new(ext4_sub_id, ext4_sub_meta, RNodeBacking::Directory)
+                    .with_containing_mount(&ext4_payload);
+                let Ok(res) = step_engine::reserve_for::<RNode>() else {
+                    continue;
+                };
+                step_engine::sign_for(res, raw)
+            };
+            // Mountpoint DEntry on the rootfs.
+            let Ok(skel_rnode) = RNode::new_cap(skel_id, skel_meta, RNodeBacking::Directory) else {
+                continue;
+            };
+            let Ok(inline) = InlineName::new(name) else {
+                continue;
+            };
+            let Ok(mountpoint_dentry) = DEntry::new_cap(inline, skel_rnode) else {
+                continue;
+            };
+            let Ok(overlay_mount) = MountIdentity::new_cap(
+                mount::allocate_mount_id(),
+                Some(mountpoint_dentry),
+                ext4_sub_rnode,
+                Some(root_mount.clone()),
+                ext4_payload.clone(),
+                MountFlags::empty(),
+            ) else {
+                continue;
+            };
+            mount::register_mount(&rootfs_payload, skel_id, overlay_mount.clone());
+            if let Some(mnt_ns) = init_mount_namespace() {
+                mnt_ns.register_mount(&rootfs_payload, skel_id, overlay_mount);
+            }
+        }
     }
 
     /// Mount the sdcard ext4 image at `/musl` on the rootfs tmpfs.

@@ -274,7 +274,8 @@ pub use numbers::{
     IPV6_CHECKSUM, IPV6_HOPLIMIT, IPV6_PKTINFO, IPV6_RECVDSTOPTS, IPV6_RECVHOPLIMIT,
     IPV6_RECVHOPOPTS, IPV6_RECVPKTINFO, IPV6_RECVRTHDR, IPV6_RECVTCLASS, IPV6_TCLASS,
     IPV6_UNICAST_HOPS, IPV6_V6ONLY, IP_ADD_MEMBERSHIP, IP_DROP_MEMBERSHIP, IP_HDRINCL,
-    IP_MULTICAST_IF, IP_MULTICAST_LOOP, IP_MULTICAST_TTL, IP_RECVERR, IP_TTL, MCAST_JOIN_GROUP,
+    IP_MULTICAST_IF, IP_MULTICAST_LOOP, IP_MULTICAST_TTL, IP_RECVERR, IP_TOS, IP_TTL,
+    MCAST_JOIN_GROUP,
     MCAST_LEAVE_GROUP, NETLINK_EXT_ACK, NETLINK_NETFILTER, NETLINK_ROUTE, NR_CAPGET, NR_CAPSET,
     NR_FADVISE64, NR_FSOPEN, NR_FSPICK, NR_KCMP, NR_MINCORE, NR_MLOCK2, NR_MLOCKALL,
     NR_MUNLOCKALL, NR_OPEN_TREE, NR_PIDFD_GETFD, NR_REMAP_FILE_PAGES, NR_SETGROUPS,
@@ -315,16 +316,19 @@ pub const EXECVE_PATH_MAX: usize = 4096;
 
 /// Maximum total argv + envp byte budget per `execve(2)` call.
 ///
-/// Linux's `ARG_MAX` is 128 KiB but the Phase 6 plan caps the inline
-/// buffer at 8 KiB to keep the same discipline as the `write` /
-/// `sigaction` arms. Overflow returns `-E2BIG`. Could be lifted to
-/// 128 KiB now that the user-VA `copy_from_user` lane has landed.
-pub const EXECVE_ARG_MAX_INLINE: usize = 8192;
+/// Set to Linux's `ARG_MAX` (128 KiB). The Phase 6 plan originally capped the
+/// inline buffer at 8 KiB, but git spawns its remote helpers / index-pack with
+/// a large inherited environment ("cannot exec 'remote-http': Argument list too
+/// long"), so the cap is lifted to the real `ARG_MAX`. The user-VA
+/// `copy_from_user` lane makes the larger transient buffer safe; overflow still
+/// returns `-E2BIG`. (Ported from net-git e7992ef8 — git Task2.)
+pub const EXECVE_ARG_MAX_INLINE: usize = 131_072;
 
-/// Maximum number of pointer slots walked through `argv` / `envp`
-/// before we give up. The Phase 6 plan caps at 256; in practice the
-/// total-byte cap (`EXECVE_ARG_MAX_INLINE`) bounds well below this.
-pub const EXECVE_VEC_MAX: usize = 256;
+/// Maximum number of pointer slots walked through `argv` / `envp` before we
+/// give up. Raised from 256 to 1024 so a large inherited git environment (Task2
+/// remote-helper spawn) fits; the total-byte cap (`EXECVE_ARG_MAX_INLINE`) still
+/// bounds the aggregate. (Ported from net-git e7992ef8.)
+pub const EXECVE_VEC_MAX: usize = 1024;
 
 /// Linux generic ABI errno value for "function not implemented" (`ENOSYS`).
 /// Used as the `-ENOSYS` magnitude returned from `dispatch` for every
@@ -870,10 +874,33 @@ pub fn dispatch_writev_pagebacked_oneshot(
     Some(result)
 }
 
+/// Socket-family syscalls can drive smoltcp inline (connect SYN, send/recv,
+/// shutdown FIN, cork flush on setsockopt); they publish the real clock so
+/// `with_context` sees fresh time on those paths, not only on delegate steps.
+fn syscall_publishes_net_clock(nr: u64) -> bool {
+    nr == NR_CONNECT
+        || nr == NR_SENDTO
+        || nr == NR_RECVFROM
+        || nr == NR_SENDMSG
+        || nr == NR_RECVMSG
+        || nr == NR_SENDMMSG
+        || nr == NR_RECVMMSG
+        || nr == NR_ACCEPT
+        || nr == NR_ACCEPT4
+        || nr == NR_SHUTDOWN
+        || nr == NR_SETSOCKOPT
+        || nr == NR_PPOLL
+        || nr == NR_PSELECT6
+        || nr == NR_PSELECT6_TIME64
+}
+
 async fn dispatch_inner<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + tx_hal::ConsoleIf>(
     req: SyscallRequest,
     ctx: &SyscallCtx<'a>,
 ) -> SyscallResult {
+    if syscall_publishes_net_clock(req.nr) {
+        tx_subsystems::net::clock::net_set_now_ns(P::read_ns());
+    }
     // ── Lane 1: ImmediateSyscall (pure ABI queries, never yield) ──
     // Per `docs/Txv3/04_SYSCALL_SHAPE_v1.md §6.1`: these syscalls
     // do not call drive(), do not enter StepOp, do not construct

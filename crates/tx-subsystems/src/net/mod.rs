@@ -5,8 +5,11 @@
 //! and net-only execution steps.  Syscall wiring, VFS socket backing,
 //! protocol I/O, and reactor delegate tasks are later slices.
 
+pub(crate) mod adapter;
 pub mod admin;
 pub mod checks;
+pub mod clock;
+pub mod file_ops;
 pub mod delegate;
 pub mod device;
 pub mod execution;
@@ -72,9 +75,11 @@ pub use namespace::{
     initial_net_namespace, initial_net_namespace_payload, initial_net_namespace_payload_with_owner,
     net_namespace_open_file_from_payload, net_namespace_payload_from_file,
     net_namespace_payloads_snapshot, NetNamespaceBridgeInfo, NetNamespaceForwardOutcome,
-    NetNamespaceIdentity, NetNamespaceLinkInfo, NetNamespacePayload, NetNamespaceRouteConfig,
-    NetNamespaceRouteDecision, NetNamespaceRouteInfo, NetNamespaceRouteKind,
-    NetNamespaceRouteSelector, NetNamespaceRuntimeOutcome, NetNamespaceSnapshot,
+    NetNamespaceIdentity, NetNamespaceLinkInfo, NetNamespacePayload, NetNamespaceRoute6Config,
+    NetNamespaceRoute6Decision, NetNamespaceRoute6Info, NetNamespaceRoute6Selector,
+    NetNamespaceRouteConfig, NetNamespaceRouteDecision, NetNamespaceRouteInfo,
+    NetNamespaceRouteKind, NetNamespaceRouteSelector, NetNamespaceRuntimeOutcome,
+    NetNamespaceSnapshot,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use namespace::{create_isolated_net_namespace_for_test, reset_initial_net_namespace_for_test};
@@ -113,7 +118,8 @@ pub use packet::{
 pub use project::{
     proc_net_arp_snapshot_text, proc_net_arp_snapshot_zero_text, proc_net_dev_snapshot_text,
     proc_net_dev_snapshot_text_for_namespace, proc_net_neigh_snapshot_text,
-    proc_net_neigh_snapshot_text_for_namespace, proc_net_netfilter_rules_text,
+    proc_net_ipv6_route_snapshot_text, proc_net_neigh_snapshot_text_for_namespace,
+    proc_net_netfilter_rules_text,
     proc_net_netfilter_rules_text_for_namespace, proc_net_nf_conntrack_text,
     proc_net_nf_conntrack_text_for_namespace, proc_net_route_snapshot_text,
     proc_net_tcp_listener_process_table_text, proc_net_tcp_socket_table_text,

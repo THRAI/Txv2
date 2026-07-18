@@ -41,6 +41,22 @@ const SOCKADDR_LL_BYTES: u32 = 20;
 const ACCEPT4_KNOWN_FLAGS: u32 = O_CLOEXEC | O_NONBLOCK;
 const EPHEMERAL_PORT_START: u16 = 49_152;
 const EPHEMERAL_PORT_END: u16 = 49_216;
+
+/// Shared rotation offset for ephemeral-port allocation (P2-S5). Every
+/// scan (connect autobind and bind(port=0) alike) starts one slot past
+/// the previous scan's start, so back-to-back connects do not re-pick
+/// the port a just-closed connection used — the peer (e.g. QEMU slirp)
+/// may still hold that tuple in TIME_WAIT-ish state.
+static NEXT_EPHEMERAL_PORT_OFFSET: core::sync::atomic::AtomicU16 =
+    core::sync::atomic::AtomicU16::new(0);
+
+pub(super) fn ephemeral_port_candidates() -> impl Iterator<Item = u16> {
+    const LEN: u16 = EPHEMERAL_PORT_END - EPHEMERAL_PORT_START;
+    let start = NEXT_EPHEMERAL_PORT_OFFSET
+        .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+        % LEN;
+    (0..LEN).map(move |i| EPHEMERAL_PORT_START + (start + i) % LEN)
+}
 const IOVEC_BYTES: u64 = 16;
 const MSGHDR_BYTES: u64 = 56;
 const MSGHDR_NAMELEN_OFFSET: u64 = 8;
@@ -95,7 +111,7 @@ const ARPOP_REQUEST: u16 = 1;
 const ARPOP_REPLY: u16 = 2;
 const ARP_ETH_IPV4_PACKET_BYTES: usize = 28;
 
-fn is_netlink_socket_kind(kind: SocketKind) -> bool {
+pub(super) fn is_netlink_socket_kind(kind: SocketKind) -> bool {
     matches!(
         kind,
         SocketKind::NetlinkRoute | SocketKind::NetlinkXfrm | SocketKind::NetlinkNetfilter
@@ -687,7 +703,7 @@ pub(super) fn sys_sendto<'a>(
     sendto_impl(args, ctx)
 }
 
-fn dispatch_netlink_send(
+pub(super) fn dispatch_netlink_send(
     ctx: &SyscallCtx<'_>,
     socket: &Cap<SocketIdentity>,
     bytes: &[u8],
@@ -1091,7 +1107,7 @@ async fn recvfrom_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
                 let Some(wait_token) = wait_token else {
                     return SyscallResult::Error(EIO_VALUE);
                 };
-                let Some(future) = wait_source::wait_on_token(wait_token) else {
+                let Some(future) = socket_ready_wait_from_token(wait_token) else {
                     return SyscallResult::Error(EIO_VALUE);
                 };
                 if matches!(
@@ -2260,6 +2276,17 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             payload.with_options_mut(|opts| opts.ip.recv_err = on);
             Ok(())
         }
+        (IPPROTO_IP, IP_TOS) => {
+            // DSCP/ToS QoS hint (Linux stores the low byte). We accept and
+            // record it but don't act on it; programs like ssh and curl set it
+            // and treat ENOPROTOOPT as a hard failure on some paths.
+            let tos = match read_sockopt_i32(ctx, optval, optlen) {
+                Ok(tos) => tos,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            payload.with_options_mut(|opts| opts.ip.tos = (tos & 0xff) as u8);
+            Ok(())
+        }
         (IPPROTO_IP, IP_TTL) => {
             let ttl = match read_sockopt_i32(ctx, optval, optlen) {
                 Ok(ttl) => ttl,
@@ -2615,6 +2642,23 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
             match hops {
                 -1 => payload.with_options_mut(|opts| opts.ip.ipv6_unicast_hops = 64),
                 1..=255 => payload.with_options_mut(|opts| opts.ip.ipv6_unicast_hops = hops as u8),
+                _ => return SyscallResult::Error(errno_to_i32(Errno::EINVAL)),
+            }
+            Ok(())
+        }
+        (SOL_IPV6, IPV6_TCLASS) => {
+            if payload.family() != AddressFamily::Inet6 {
+                return SyscallResult::Error(errno_to_i32(Errno::ENOPROTOOPT));
+            }
+            // v6 traffic class (DSCP/ToS) — a QoS hint. Accept and validate
+            // like IP_TOS; the kernel doesn't act on it but ssh/curl set it on
+            // v6 sockets and treat ENOPROTOOPT as a failure.
+            let tclass = match read_sockopt_i32(ctx, optval, optlen) {
+                Ok(tclass) => tclass,
+                Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
+            };
+            match tclass {
+                -1..=255 => {}
                 _ => return SyscallResult::Error(errno_to_i32(Errno::EINVAL)),
             }
             Ok(())
@@ -3703,12 +3747,14 @@ pub(super) fn maybe_close_socket_file_after_fd_remove(file: &Cap<OpenFile>) {
     if file.retain_count() > 1 {
         return;
     }
-    let socket = match socket_identity_from_file(file) {
-        Ok(socket) => socket,
-        Err(_) => return,
+    // P3-S5 (D13): the close protocol is the kind's FileOps hook now
+    // (sockets run step_socket_close); the retain-count two-phase timing
+    // stays here per the plan's conservative ruling.
+    let Some(ops) = file.file_ops() else {
+        return;
     };
     let guard = tx_substrate::epoch::guard();
-    let _ = step_socket_close(&socket, &guard);
+    ops.on_last_close(&guard);
 }
 
 pub(super) fn can_fast_close_stateless_netlink_socket(file: &Cap<OpenFile>) -> bool {

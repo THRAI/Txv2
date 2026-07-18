@@ -438,6 +438,33 @@ impl<'a> Socket<'a> {
         )
     }
 
+    /// Peek at the next packet queued for transmission, without removing it.
+    ///
+    /// txKernel fork extension: the kernel drives dispatch manually (no
+    /// `iface.poll()`) and its device lane wants to route/emit the front
+    /// datagram before committing the destructive `dispatch`.
+    pub fn peek_send(&mut self) -> Result<(&[u8], &UdpMetadata), RecvError> {
+        self.tx_buffer
+            .peek()
+            .map_err(|_| RecvError::Exhausted)
+            .map(|(meta, payload_buf)| (payload_buf, meta))
+    }
+
+    /// Bytes currently buffered in the receive buffer.
+    ///
+    /// txKernel fork extension: readiness/FIONREAD accounting reads the
+    /// authoritative ring instead of mirroring it.
+    pub fn payload_recv_bytes(&self) -> usize {
+        self.rx_buffer.payload_bytes_count()
+    }
+
+    /// Bytes currently buffered in the transmit buffer.
+    ///
+    /// txKernel fork extension: see [`Self::payload_recv_bytes`].
+    pub fn payload_send_bytes(&self) -> usize {
+        self.tx_buffer.payload_bytes_count()
+    }
+
     /// Peek at a packet received from a remote endpoint, copy the payload into the given slice,
     /// and return the amount of octets copied as well as the endpoint without removing the
     /// packet from the receive buffer.

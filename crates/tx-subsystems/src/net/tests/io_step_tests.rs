@@ -307,6 +307,8 @@ fn raw_udp_send_queue_preserves_datagram_atomicity() {
     options.socket.send_buf_size = 8;
     let udp = RawUdpSocket::new(&options);
     let dst = IpEndpoint::new(Ipv4Address::LOOPBACK, 40_138);
+    // P2-S6: the smoltcp ring is the queue; `send` needs a bound socket.
+    assert!(udp.bind_endpoint(IpEndpoint::new(Ipv4Address::LOOPBACK, 40_240)));
 
     assert_eq!(udp.enqueue_tx_bytes_to(dst, b"12345"), Some((5, false)));
     assert_eq!(udp.send_available(), 3);
@@ -325,6 +327,8 @@ fn raw_udp_msg_more_corks_until_uncork_send() {
     options.socket.send_buf_size = 8;
     let udp = RawUdpSocket::new(&options);
     let dst = IpEndpoint::new(Ipv4Address::LOOPBACK, 40_139);
+    // P2-S6: the smoltcp ring is the queue; `send` needs a bound socket.
+    assert!(udp.bind_endpoint(IpEndpoint::new(Ipv4Address::LOOPBACK, 40_241)));
 
     assert_eq!(
         udp.enqueue_tx_bytes_to_with_more(dst, b"12345", true),
@@ -351,6 +355,8 @@ fn raw_udp_recv_queue_drops_when_datagram_would_not_fit() {
     let udp = RawUdpSocket::new(&options);
     let src = IpEndpoint::new(Ipv4Address::LOOPBACK, 50_138);
     let dst = IpEndpoint::new(Ipv4Address::LOOPBACK, 40_138);
+    // P2-S6: inbound datagrams pass smoltcp `accepts`; bind the dst first.
+    assert!(udp.bind_endpoint(dst));
 
     assert!(udp.ingest_rx_datagram(src, dst, b"123456".to_vec()));
     assert!(!udp.ingest_rx_datagram(src, dst, b"abcd".to_vec()));

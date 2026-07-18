@@ -187,6 +187,15 @@ pub fn net_delegate_step_once(
     driver: &dyn NetDelegateDriver,
     guard: &Guard<'_>,
 ) -> NetDelegateRuntimeOutcome {
+    // Publish the driver's clock before any step below reaches
+    // `with_context`, so smoltcp timers (retransmit/RTT/TIME-WAIT) see
+    // fresh time on the poll path.
+    crate::net::clock::net_set_now_ns(
+        u64::try_from(driver.now().total_micros())
+            .unwrap_or(0)
+            .saturating_mul(1_000),
+    );
+
     let ready = net_delegate_queue().peek();
     let poll_seen = ready & DelegateWireSet::POLL.bits() != 0;
     let tick_seen = ready & DelegateWireSet::TICK.bits() != 0;

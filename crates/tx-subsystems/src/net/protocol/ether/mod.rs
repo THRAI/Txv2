@@ -3,10 +3,12 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use smoltcp::phy::Medium;
 use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{
     ArpOperation, ArpPacket, ArpRepr, EthernetAddress as SmoltcpEthernetAddress, EthernetFrame,
-    EthernetProtocol, EthernetRepr, Ipv4Address as SmoltcpIpv4Address, Ipv4Packet,
+    EthernetProtocol, EthernetRepr, HardwareAddress, Ipv4Address as SmoltcpIpv4Address, Ipv4Packet,
+    Ipv6Address as SmoltcpIpv6Address, Ipv6Packet, RawHardwareAddress,
 };
 
 use crate::execution::{Errno, Guard, StepOutcome};
@@ -19,10 +21,18 @@ use crate::net::structure::{Ipv4Address, Ipv6Address};
 use crate::sync::SpinMutex;
 
 use super::{build_icmpv4_echo_reply, Icmpv4Event, IfaceCommon};
+mod l3;
+mod link;
 
 pub const ARP_CACHE_TTL: Duration = Duration::from_secs(300);
 pub const ARP_REQUEST_RETRY_LIMIT: u8 = 3;
 pub const ARP_REQUEST_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+// IPv6 V2 (dynamic NDP): the neighbour-solicitation retry/aging budget mirrors
+// ARP one-for-one (D7). Named aliases keep the v6 knobs tunable independently.
+pub const NDISC_CACHE_TTL: Duration = ARP_CACHE_TTL;
+pub const NDISC_SOLICIT_RETRY_LIMIT: u8 = ARP_REQUEST_RETRY_LIMIT;
+pub const NDISC_SOLICIT_RETRY_DELAY: Duration = ARP_REQUEST_RETRY_DELAY;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Ipv4RouteDecision {
@@ -50,6 +60,15 @@ pub struct ArpPendingEntry {
 pub struct NdiscEntry {
     pub mac: EthernetAddress,
     pub expires_at: Instant,
+}
+
+/// IPv6 V2: an in-flight neighbour solicitation (mirror of [`ArpPendingEntry`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NdiscPendingEntry {
+    pub addr: Ipv6Address,
+    pub attempts: u8,
+    pub next_probe_at: Instant,
+    pub last_error: Option<Errno>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -125,6 +144,7 @@ pub struct EtherIface {
     arp_table: SpinMutex<BTreeMap<Ipv4Address, ArpEntry>>,
     pending_arp: SpinMutex<BTreeMap<Ipv4Address, ArpPendingEntry>>,
     ndisc_table: SpinMutex<BTreeMap<Ipv6Address, NdiscEntry>>,
+    pending_ndisc: SpinMutex<BTreeMap<Ipv6Address, NdiscPendingEntry>>,
     ipv4_fragments: SpinMutex<BTreeMap<Ipv4FragmentKey, Ipv4ReassemblyEntry>>,
     next_ipv4_ident: AtomicU64,
     pub name: &'static str,
@@ -167,12 +187,28 @@ struct Ipv4FragmentRange {
     end: usize,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Ipv4ReassemblyEntry {
     header: Option<Vec<u8>>,
     payload: Vec<u8>,
     ranges: Vec<Ipv4FragmentRange>,
     total_payload_len: Option<usize>,
+    /// R3b: wall-clock stamp of this flow's most recent fragment. Refreshed on
+    /// every insert/hit; drives LRU eviction + TTL expiry so a forged-source
+    /// fragment flood cannot wipe legitimate in-flight reassemblies.
+    last_seen: Instant,
+}
+
+impl Default for Ipv4ReassemblyEntry {
+    fn default() -> Self {
+        Self {
+            header: None,
+            payload: Vec::new(),
+            ranges: Vec::new(),
+            total_payload_len: None,
+            last_seen: Instant::ZERO,
+        }
+    }
 }
 
 enum Ipv4IngressPacket<'a> {
@@ -193,6 +229,9 @@ const IPV4_FLAG_DONT_FRAGMENT: u16 = 0x4000;
 const IPV4_FLAG_MORE_FRAGMENTS: u16 = 0x2000;
 const IPV4_FRAGMENT_OFFSET_MASK: u16 = 0x1fff;
 const IPV4_REASSEMBLY_FLOW_LIMIT: usize = 64;
+/// R3b: abandon a partial reassembly this long after its last fragment. Matches
+/// Linux `net.ipv4.ipfrag_time` (30 s); `now` is the P0-unfrozen wall clock.
+const IPV4_REASSEMBLY_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ArpFlushOutcome {
@@ -202,6 +241,18 @@ pub struct ArpFlushOutcome {
     pub failed: usize,
     pub tx_bytes: usize,
     pub remaining: usize,
+}
+
+impl ArpFlushOutcome {
+    /// Fold another flush's counters in (v4 ARP + v6 NDP share one step).
+    pub fn absorb(&mut self, other: ArpFlushOutcome) {
+        self.attempted += other.attempted;
+        self.sent += other.sent;
+        self.busy += other.busy;
+        self.failed += other.failed;
+        self.tx_bytes += other.tx_bytes;
+        self.remaining += other.remaining;
+    }
 }
 
 impl EtherIface {
@@ -218,6 +269,7 @@ impl EtherIface {
             arp_table: SpinMutex::new(BTreeMap::new()),
             pending_arp: SpinMutex::new(BTreeMap::new()),
             ndisc_table: SpinMutex::new(BTreeMap::new()),
+            pending_ndisc: SpinMutex::new(BTreeMap::new()),
             ipv4_fragments: SpinMutex::new(BTreeMap::new()),
             next_ipv4_ident: AtomicU64::new(1),
             name,
@@ -276,11 +328,34 @@ impl EtherIface {
                 dispatch
             }
             EthernetProtocol::Arp => self.process_arp(ethernet.payload(), now, guard),
-            EthernetProtocol::Ipv6 | EthernetProtocol::Unknown(_) => PacketDispatch::Unsupported,
+            // P2-S7 (§6-2-A): v6 TCP/UDP frames go through the same demux
+            // (its v6 arm parses them); no v4-style reassembly staging yet
+            // (v6 fragmentation is a P4 concern).
+            EthernetProtocol::Ipv6 => {
+                let dispatch = demux_rx_frame_with_smoltcp(&frame);
+                // IPv6 V2: side-effect peek for NDP (mirror of `maybe_reply_icmpv4`).
+                // NS/NA are learned + answered here; the dispatch still flows to
+                // raw ICMPv6 sockets (echo replies, and harmlessly NS/NA too).
+                self.maybe_process_ndisc(&dispatch, now, guard);
+                dispatch
+            }
+            EthernetProtocol::Unknown(_) => PacketDispatch::Unsupported,
         }
     }
 
     pub fn dispatch_ip_at(&self, packet: &[u8], now: Instant, guard: &Guard<'_>) -> PacketTxResult {
+        // IPv6 V1: branch by IP version nibble. v6 → mirrored v6 L3 path;
+        // v4 → fall through to the existing path; non-IP/empty → EINVAL.
+        match packet.first().map(|b| b >> 4) {
+            Some(6) => return self.dispatch_ipv6_at(packet, now, guard),
+            Some(4) => {}
+            _ => {
+                self.stats.tx_errors.fetch_add(1, Ordering::Relaxed);
+                return PacketTxResult::Failed {
+                    errno: Errno::EINVAL,
+                };
+            }
+        }
         if packet.len() > IPV4_MAX_PACKET_LEN {
             self.stats.tx_errors.fetch_add(1, Ordering::Relaxed);
             return PacketTxResult::Failed {
@@ -368,8 +443,69 @@ impl EtherIface {
         outcome
     }
 
+    /// Learn NDP neighbours from an already-demuxed RX dispatch WITHOUT
+    /// answering solicitations (`guard: None` skips the NA reply).
+    ///
+    /// External-ping RX/TX split: the boot-lane runtime drains the shared
+    /// netdev RX queue into ITS OWN v4-only `EtherIface`, while v6 TX/pending
+    /// live on the namespace's `ensure_ether_iface_for_link` iface. Without
+    /// this cross-feed the NA lands in the boot iface's table and the
+    /// namespace iface re-solicits forever (echo never leaves).
+    pub fn learn_ndisc_from_dispatch(&self, dispatch: &PacketDispatch, now: Instant) {
+        self.maybe_process_ndisc(dispatch, now, None);
+    }
+
+    /// IPv6 V2: send due neighbour solicitations for pending v6 next-hops
+    /// (mirror of [`flush_pending_arp_at`]). Driven by the same reactor step so
+    /// one tick flushes both v4 ARP and v6 NDP probes.
+    pub fn flush_pending_ndisc_at(
+        &self,
+        now: Instant,
+        budget: usize,
+        guard: &Guard<'_>,
+    ) -> ArpFlushOutcome {
+        let mut outcome = ArpFlushOutcome::default();
+
+        let ready = self.ready_pending_ndisc(now, budget);
+        for target in ready {
+            let Some(entry) = self.pending_entry_for_ndisc_probe(target, now) else {
+                if self
+                    .pending_ndisc_entry(target)
+                    .is_some_and(|entry| entry.last_error.is_some())
+                {
+                    outcome.failed += 1;
+                }
+                continue;
+            };
+            outcome.attempted += 1;
+
+            let frame = self.build_neighbor_solicit(entry.addr);
+            match self.transmit_frame(&frame, guard) {
+                PacketTxResult::Accepted { frame_len } => {
+                    outcome.sent += 1;
+                    outcome.tx_bytes += frame_len;
+                    self.mark_ndisc_probe_sent(target, now);
+                }
+                PacketTxResult::Busy => {
+                    outcome.busy += 1;
+                    break;
+                }
+                PacketTxResult::PendingResolution { .. } | PacketTxResult::Failed { .. } => {
+                    outcome.failed += 1;
+                }
+            }
+        }
+
+        outcome.remaining = self.pending_ndisc.lock().len();
+        outcome
+    }
+
     pub fn arp_entry(&self, ip: Ipv4Address, now: Instant) -> Option<ArpEntry> {
         self.lookup_arp_entry(ip, now)
+    }
+
+    pub fn ndisc_entry(&self, ip: Ipv6Address, now: Instant) -> Option<NdiscEntry> {
+        self.lookup_ndisc_entry(ip, now)
     }
 
     pub fn install_arp_for_test_or_bootstrap(
@@ -418,13 +554,19 @@ impl EtherIface {
         let arp_entries = other.arp_table.lock().clone();
         let pending_entries = other.pending_arp.lock().clone();
         let ndisc_entries = other.ndisc_table.lock().clone();
+        let pending_ndisc_entries = other.pending_ndisc.lock().clone();
         self.arp_table.lock().extend(arp_entries);
         self.pending_arp.lock().extend(pending_entries);
         self.ndisc_table.lock().extend(ndisc_entries);
+        self.pending_ndisc.lock().extend(pending_ndisc_entries);
     }
 
     pub fn pending_arp_len(&self) -> usize {
         self.pending_arp.lock().len()
+    }
+
+    pub fn pending_ndisc_len(&self) -> usize {
+        self.pending_ndisc.lock().len()
     }
 
     pub fn pending_arp_entry(&self, ip: Ipv4Address) -> Option<ArpPendingEntry> {
@@ -512,77 +654,6 @@ impl EtherIface {
         self.accepts_ipv4_destination(dst)
     }
 
-    fn process_arp(
-        &self,
-        payload: &[u8],
-        now: Instant,
-        guard: Option<&Guard<'_>>,
-    ) -> PacketDispatch {
-        let packet = match ArpPacket::new_checked(payload) {
-            Ok(packet) => packet,
-            Err(_) => {
-                self.stats.rx_errors.fetch_add(1, Ordering::Relaxed);
-                return PacketDispatch::Malformed;
-            }
-        };
-        let repr = match ArpRepr::parse(&packet) {
-            Ok(repr) => repr,
-            Err(_) => {
-                self.stats.rx_errors.fetch_add(1, Ordering::Relaxed);
-                return PacketDispatch::Malformed;
-            }
-        };
-
-        match repr {
-            ArpRepr::EthernetIpv4 {
-                operation: ArpOperation::Reply,
-                source_hardware_addr,
-                source_protocol_addr,
-                ..
-            } => {
-                if source_hardware_addr.is_unicast() {
-                    self.learn_arp(
-                        from_smoltcp_ipv4(source_protocol_addr),
-                        from_smoltcp_ether(source_hardware_addr),
-                        now,
-                    );
-                }
-                PacketDispatch::Unsupported
-            }
-            ArpRepr::EthernetIpv4 {
-                operation: ArpOperation::Request,
-                source_hardware_addr,
-                source_protocol_addr,
-                target_protocol_addr,
-                ..
-            } => {
-                if source_hardware_addr.is_unicast() {
-                    self.learn_arp(
-                        from_smoltcp_ipv4(source_protocol_addr),
-                        from_smoltcp_ether(source_hardware_addr),
-                        now,
-                    );
-                }
-                if from_smoltcp_ipv4(target_protocol_addr) == self.common.ipv4_addr() {
-                    if let Some(guard) = guard {
-                        let reply = self.build_arp_reply(
-                            from_smoltcp_ipv4(source_protocol_addr),
-                            from_smoltcp_ether(source_hardware_addr),
-                        );
-                        if matches!(
-                            self.transmit_frame(&reply, guard),
-                            PacketTxResult::Accepted { .. }
-                        ) {
-                            self.arp_stats.replies_tx.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                }
-                PacketDispatch::Unsupported
-            }
-            _ => PacketDispatch::Unsupported,
-        }
-    }
-
     fn maybe_reply_icmpv4(
         &self,
         dispatch: &PacketDispatch,
@@ -607,215 +678,6 @@ impl EtherIface {
         }
     }
 
-    fn learn_arp(&self, ip: Ipv4Address, mac: EthernetAddress, now: Instant) {
-        self.arp_table.lock().insert(
-            ip,
-            ArpEntry {
-                mac,
-                expires_at: now + ARP_CACHE_TTL,
-            },
-        );
-        self.pending_arp.lock().remove(&ip);
-        self.arp_stats.resolved.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn lookup_arp_entry(&self, ip: Ipv4Address, now: Instant) -> Option<ArpEntry> {
-        let mut table = self.arp_table.lock();
-        match table.get(&ip).copied() {
-            Some(entry) if entry.expires_at > now => Some(entry),
-            Some(_) => {
-                table.remove(&ip);
-                None
-            }
-            None => None,
-        }
-    }
-
-    fn resolve_or_request(&self, next_hop: Ipv4Address, now: Instant) -> ArpResolution {
-        if next_hop == Ipv4Address::BROADCAST {
-            return ArpResolution::Resolved {
-                mac: EthernetAddress::BROADCAST,
-            };
-        }
-
-        if let Some(entry) = self.lookup_arp_entry(next_hop, now) {
-            self.arp_stats.cache_hits.fetch_add(1, Ordering::Relaxed);
-            return ArpResolution::Resolved { mac: entry.mac };
-        }
-
-        self.arp_stats.cache_misses.fetch_add(1, Ordering::Relaxed);
-        self.queue_pending_arp(next_hop, now)
-    }
-
-    fn queue_pending_arp(&self, ip: Ipv4Address, now: Instant) -> ArpResolution {
-        let mut pending = self.pending_arp.lock();
-        match pending.get(&ip).copied() {
-            Some(ArpPendingEntry {
-                last_error: Some(errno),
-                ..
-            }) => ArpResolution::Failed {
-                next_hop: ip,
-                errno,
-            },
-            Some(_) => ArpResolution::Pending { next_hop: ip },
-            None => {
-                pending.insert(
-                    ip,
-                    ArpPendingEntry {
-                        ip,
-                        attempts: 0,
-                        next_probe_at: now,
-                        last_error: None,
-                    },
-                );
-                ArpResolution::Pending { next_hop: ip }
-            }
-        }
-    }
-
-    fn ready_pending_arp(&self, now: Instant, budget: usize) -> Vec<Ipv4Address> {
-        self.pending_arp
-            .lock()
-            .iter()
-            .filter_map(|(ip, entry)| {
-                (entry.last_error.is_none() && entry.next_probe_at <= now).then_some(*ip)
-            })
-            .take(budget)
-            .collect()
-    }
-
-    fn pending_entry_for_probe(&self, ip: Ipv4Address, now: Instant) -> Option<ArpPendingEntry> {
-        let mut pending = self.pending_arp.lock();
-        let entry = pending.get_mut(&ip)?;
-        if entry.last_error.is_some() || entry.next_probe_at > now {
-            return None;
-        }
-        if entry.attempts >= ARP_REQUEST_RETRY_LIMIT {
-            entry.last_error = Some(Errno::EADDRNOTAVAIL);
-            self.arp_stats
-                .retry_limit_exceeded
-                .fetch_add(1, Ordering::Relaxed);
-            return None;
-        }
-        Some(*entry)
-    }
-
-    fn mark_arp_probe_sent(&self, ip: Ipv4Address, now: Instant) {
-        if let Some(entry) = self.pending_arp.lock().get_mut(&ip) {
-            entry.attempts = entry.attempts.saturating_add(1);
-            entry.next_probe_at = now + ARP_REQUEST_RETRY_DELAY;
-        }
-    }
-
-    fn accepts_ethernet_destination(&self, dst: SmoltcpEthernetAddress) -> bool {
-        dst.is_broadcast() || dst == to_smoltcp_ether(self.ether_addr)
-    }
-
-    fn accepts_ipv4_destination(&self, dst: Ipv4Address) -> bool {
-        dst == self.common.ipv4_addr() || dst == Ipv4Address::BROADCAST
-    }
-
-    fn build_arp_request(&self, target_ip: Ipv4Address) -> Vec<u8> {
-        let repr = ArpRepr::EthernetIpv4 {
-            operation: ArpOperation::Request,
-            source_hardware_addr: to_smoltcp_ether(self.ether_addr),
-            source_protocol_addr: to_smoltcp_ipv4(self.common.ipv4_addr()),
-            target_hardware_addr: SmoltcpEthernetAddress::BROADCAST,
-            target_protocol_addr: to_smoltcp_ipv4(target_ip),
-        };
-        build_arp_frame(&repr)
-    }
-
-    fn build_arp_reply(&self, target_ip: Ipv4Address, target_mac: EthernetAddress) -> Vec<u8> {
-        let repr = ArpRepr::EthernetIpv4 {
-            operation: ArpOperation::Reply,
-            source_hardware_addr: to_smoltcp_ether(self.ether_addr),
-            source_protocol_addr: to_smoltcp_ipv4(self.common.ipv4_addr()),
-            target_hardware_addr: to_smoltcp_ether(target_mac),
-            target_protocol_addr: to_smoltcp_ipv4(target_ip),
-        };
-        build_arp_frame(&repr)
-    }
-
-    fn transmit_frame(&self, frame: &[u8], guard: &Guard<'_>) -> PacketTxResult {
-        match self.netdev.ops.transmit(frame, guard) {
-            StepOutcome::Done(()) | StepOutcome::Continue { .. } => {
-                self.stats
-                    .tx_bytes
-                    .fetch_add(frame.len() as u64, Ordering::Relaxed);
-                self.stats.tx_packets.fetch_add(1, Ordering::Relaxed);
-                PacketTxResult::Accepted {
-                    frame_len: frame.len(),
-                }
-            }
-            StepOutcome::Yield { .. } => PacketTxResult::Busy,
-            StepOutcome::Err(errno) => {
-                self.stats.tx_errors.fetch_add(1, Ordering::Relaxed);
-                PacketTxResult::Failed { errno }
-            }
-        }
-    }
-
-    fn prepare_ipv4_ingress<'a>(&self, packet: &'a [u8]) -> Ipv4IngressOutcome<'a> {
-        let Some(meta) = parse_ipv4_meta(packet) else {
-            return Ipv4IngressOutcome::Malformed;
-        };
-        if !meta.is_fragmented() {
-            return Ipv4IngressOutcome::Complete(Ipv4IngressPacket::Borrowed(
-                &packet[..meta.total_len],
-            ));
-        }
-        if meta.more_fragments && meta.payload_len() % 8 != 0 {
-            return Ipv4IngressOutcome::Malformed;
-        }
-        if meta.fragment_end() > IPV4_MAX_PACKET_LEN {
-            return Ipv4IngressOutcome::Malformed;
-        }
-
-        match self.ingest_ipv4_fragment(packet, meta) {
-            Some(packet) => Ipv4IngressOutcome::Complete(Ipv4IngressPacket::Owned(packet)),
-            None => Ipv4IngressOutcome::Pending,
-        }
-    }
-
-    fn ingest_ipv4_fragment(&self, packet: &[u8], meta: Ipv4PacketMeta) -> Option<Vec<u8>> {
-        let key = Ipv4FragmentKey {
-            src: meta.src,
-            dst: meta.dst,
-            ident: meta.ident,
-            protocol: meta.protocol,
-        };
-
-        let mut fragments = self.ipv4_fragments.lock();
-        if !fragments.contains_key(&key) && fragments.len() >= IPV4_REASSEMBLY_FLOW_LIMIT {
-            fragments.clear();
-        }
-        fragments.entry(key).or_default();
-
-        let entry = fragments.get_mut(&key)?;
-        if meta.fragment_offset == 0 {
-            entry.header = Some(packet[..meta.header_len].to_vec());
-        }
-
-        let payload = &packet[meta.header_len..meta.total_len];
-        let end = meta.fragment_offset + payload.len();
-        if entry.payload.len() < end {
-            entry.payload.resize(end, 0);
-        }
-        entry.payload[meta.fragment_offset..end].copy_from_slice(payload);
-        entry.record_range(meta.fragment_offset, end);
-        if !meta.more_fragments {
-            entry.total_payload_len = Some(end);
-        }
-
-        if !entry.is_complete() {
-            return None;
-        }
-
-        let entry = fragments.remove(&key)?;
-        assemble_ipv4_packet(entry)
-    }
-
     fn transmit_ipv4_packet(
         &self,
         dst_mac: EthernetAddress,
@@ -829,89 +691,79 @@ impl EtherIface {
         self.transmit_ipv4_fragments(dst_mac, packet, guard)
     }
 
-    fn transmit_ipv4_fragments(
+    // ===== IPv6 V1: external L3 TX — mirror of the IPv4 dispatch chain =====
+
+    fn dispatch_ipv6_at(&self, packet: &[u8], now: Instant, guard: &Guard<'_>) -> PacketTxResult {
+        let ipv6 = match Ipv6Packet::new_checked(packet) {
+            Ok(ipv6) => ipv6,
+            Err(_) => {
+                self.stats.tx_errors.fetch_add(1, Ordering::Relaxed);
+                return PacketTxResult::Failed {
+                    errno: Errno::EINVAL,
+                };
+            }
+        };
+        let route = decide_ipv6_route(self.common, from_smoltcp_ipv6(ipv6.dst_addr()));
+        let next_hop = match route.next_hop() {
+            Some(next_hop) => next_hop,
+            None => {
+                self.stats.tx_errors.fetch_add(1, Ordering::Relaxed);
+                return PacketTxResult::Failed {
+                    errno: Errno::EADDRNOTAVAIL,
+                };
+            }
+        };
+        let dst_mac = match self.resolve_ndisc(next_hop, now) {
+            NdiscResolution::Resolved { mac } => mac,
+            NdiscResolution::Pending { .. } => {
+                // Mirror the v4 path: retry-able miss. `PendingResolution`'s
+                // `next_hop` field is v4-typed and informational only (read by
+                // tests); the real v6 next-hop lives in `pending_ndisc`, which
+                // the flush driver walks to send the NS. Use a v4 sentinel.
+                return PacketTxResult::PendingResolution {
+                    next_hop: Ipv4Address::new([0, 0, 0, 0]),
+                };
+            }
+            NdiscResolution::Failed { errno } => {
+                self.stats.tx_errors.fetch_add(1, Ordering::Relaxed);
+                return PacketTxResult::Failed { errno };
+            }
+        };
+        self.transmit_ipv6_packet(dst_mac, packet, guard)
+    }
+
+    /// V2: dynamic NDISC — multicast resolves to its derived MAC; unicast hits
+    /// the TTL-checked cache, else queues a neighbour solicitation and reports
+    /// `Pending` (the flush driver sends the NS; the caller retries). Mirror of
+    /// [`resolve_or_request`].
+    fn resolve_ndisc(&self, next_hop: Ipv6Address, now: Instant) -> NdiscResolution {
+        if next_hop.is_multicast() {
+            return NdiscResolution::Resolved {
+                mac: multicast_mac_for(next_hop),
+            };
+        }
+        if let Some(entry) = self.lookup_ndisc_entry(next_hop, now) {
+            return NdiscResolution::Resolved { mac: entry.mac };
+        }
+        self.queue_pending_ndisc(next_hop, now)
+    }
+
+    fn transmit_ipv6_packet(
         &self,
         dst_mac: EthernetAddress,
         packet: &[u8],
         guard: &Guard<'_>,
     ) -> PacketTxResult {
-        let Some(meta) = parse_ipv4_meta(packet) else {
-            self.stats.tx_errors.fetch_add(1, Ordering::Relaxed);
-            return PacketTxResult::Failed {
-                errno: Errno::EINVAL,
-            };
-        };
-        // smoltcp-emitted local packets carry DF with identification zero because
-        // smoltcp does not fragment; once txKernel fragments here, that internal
-        // default must not make ordinary large ping payloads fail.
-        if meta.flags_fragment & IPV4_FLAG_DONT_FRAGMENT != 0 && meta.ident != 0 {
-            self.stats.tx_errors.fetch_add(1, Ordering::Relaxed);
-            return PacketTxResult::Failed {
-                errno: Errno::EMSGSIZE,
-            };
+        if packet.len() <= usize::from(self.common.mtu()) {
+            let frame = build_ipv6_ethernet_frame(self.ether_addr, dst_mac, packet);
+            return self.transmit_frame(&frame, guard);
         }
-
-        let mtu = usize::from(self.common.mtu());
-        if mtu <= meta.header_len + 8 {
-            self.stats.tx_errors.fetch_add(1, Ordering::Relaxed);
-            return PacketTxResult::Failed {
-                errno: Errno::EMSGSIZE,
-            };
+        // V1: no on-TX fragmentation (IPv6 routers never fragment; source-side
+        // fragment headers land in V4). Oversized → EMSGSIZE.
+        self.stats.tx_errors.fetch_add(1, Ordering::Relaxed);
+        PacketTxResult::Failed {
+            errno: Errno::EMSGSIZE,
         }
-        let fragment_payload_limit = ((mtu - meta.header_len) / 8) * 8;
-        if fragment_payload_limit == 0 {
-            self.stats.tx_errors.fetch_add(1, Ordering::Relaxed);
-            return PacketTxResult::Failed {
-                errno: Errno::EMSGSIZE,
-            };
-        }
-
-        let payload = &packet[meta.header_len..meta.total_len];
-        let ident = if meta.ident == 0 {
-            self.allocate_ipv4_ident()
-        } else {
-            meta.ident
-        };
-        let base_fragment_offset = meta.fragment_offset;
-        let mut offset = 0usize;
-        let mut tx_bytes = 0usize;
-
-        while offset < payload.len() {
-            let remaining = payload.len() - offset;
-            let chunk_len = remaining.min(fragment_payload_limit);
-            let more_fragments = offset + chunk_len < payload.len() || meta.more_fragments;
-            let mut fragment = packet[..meta.header_len + chunk_len.min(remaining)].to_vec();
-            fragment[..meta.header_len].copy_from_slice(&packet[..meta.header_len]);
-            fragment[meta.header_len..].copy_from_slice(&payload[offset..offset + chunk_len]);
-
-            let total_len = meta.header_len + chunk_len;
-            write_u16(&mut fragment, 2, total_len as u16);
-            write_u16(&mut fragment, 4, ident);
-            let offset_units = ((base_fragment_offset + offset) / 8) as u16;
-            let mut flags_fragment = meta.flags_fragment & IPV4_FLAG_RESERVED;
-            if more_fragments {
-                flags_fragment |= IPV4_FLAG_MORE_FRAGMENTS;
-            }
-            flags_fragment |= offset_units & IPV4_FRAGMENT_OFFSET_MASK;
-            write_u16(&mut fragment, 6, flags_fragment);
-            fill_ipv4_header_checksum(&mut fragment);
-
-            let frame = build_ipv4_ethernet_frame(self.ether_addr, dst_mac, &fragment);
-            match self.transmit_frame(&frame, guard) {
-                PacketTxResult::Accepted { frame_len } => tx_bytes += frame_len,
-                other => return other,
-            }
-            offset += chunk_len;
-        }
-
-        PacketTxResult::Accepted {
-            frame_len: tx_bytes,
-        }
-    }
-
-    fn allocate_ipv4_ident(&self) -> u16 {
-        let next = self.next_ipv4_ident.fetch_add(1, Ordering::Relaxed);
-        (next as u16).max(1)
     }
 }
 
@@ -1016,6 +868,120 @@ fn build_ipv4_ethernet_frame(
     repr.emit(&mut ethernet);
     ethernet.payload_mut().copy_from_slice(ipv4_packet);
     frame
+}
+
+fn build_ipv6_ethernet_frame(
+    src: EthernetAddress,
+    dst: EthernetAddress,
+    ipv6_packet: &[u8],
+) -> Vec<u8> {
+    let repr = EthernetRepr {
+        src_addr: to_smoltcp_ether(src),
+        dst_addr: to_smoltcp_ether(dst),
+        ethertype: EthernetProtocol::Ipv6,
+    };
+    let mut frame = vec![0; repr.buffer_len() + ipv6_packet.len()];
+    let mut ethernet = EthernetFrame::new_unchecked(frame.as_mut_slice());
+    repr.emit(&mut ethernet);
+    ethernet.payload_mut().copy_from_slice(ipv6_packet);
+    frame
+}
+
+/// IPv6 V3b route decision — multicast / on-link direct / off-link via the
+/// configured v6 gateway (default route's next-hop) / unreachable. Mirror of
+/// [`decide_ipv4_route`].
+pub fn decide_ipv6_route(common: IfaceCommon, dst: Ipv6Address) -> Ipv6RouteDecision {
+    if dst.is_multicast() {
+        Ipv6RouteDecision::Multicast { next_hop: dst }
+    } else if same_ipv6_prefix(common, dst) {
+        Ipv6RouteDecision::Direct { next_hop: dst }
+    } else if let Some(gateway) = common.ipv6_gateway() {
+        Ipv6RouteDecision::Gateway { next_hop: gateway }
+    } else {
+        Ipv6RouteDecision::Unreachable { dst }
+    }
+}
+
+fn same_ipv6_prefix(common: IfaceCommon, dst: Ipv6Address) -> bool {
+    let (Some(local), Some(plen)) = (common.ipv6_addr(), common.ipv6_prefix_len()) else {
+        return false;
+    };
+    let local = local.octets();
+    let dst = dst.octets();
+    // Defensive: octets() is [u8;16], so plen/8 must stay <= 16 or the slice
+    // index below panics the kernel. Callers should already clamp (see
+    // ensure_ether_iface_for_link), but a raw netlink prefix_len must never
+    // reach an out-of-bounds index here.
+    let plen = plen.min(128);
+    let full = (plen / 8) as usize;
+    let rem = plen % 8;
+    if local[..full] != dst[..full] {
+        return false;
+    }
+    if rem != 0 {
+        let mask = 0xffu8 << (8 - rem);
+        if (local[full] & mask) != (dst[full] & mask) {
+            return false;
+        }
+    }
+    true
+}
+
+/// RFC 2464: IPv6 multicast maps to Ethernet `33:33` + the low 4 address bytes.
+fn multicast_mac_for(addr: Ipv6Address) -> EthernetAddress {
+    let o = addr.octets();
+    EthernetAddress::new([0x33, 0x33, o[12], o[13], o[14], o[15]])
+}
+
+fn from_smoltcp_ipv6(addr: SmoltcpIpv6Address) -> Ipv6Address {
+    Ipv6Address::new(addr.octets())
+}
+
+fn to_smoltcp_ipv6(addr: Ipv6Address) -> SmoltcpIpv6Address {
+    SmoltcpIpv6Address::from(addr.octets())
+}
+
+/// RFC 4861 §2: the solicited-node multicast address `ff02::1:ffXX:XXXX` carries
+/// the target's low 24 bits — where a neighbour solicitation for it is sent.
+fn solicited_node_multicast(target: Ipv6Address) -> Ipv6Address {
+    let t = target.octets();
+    Ipv6Address::new([
+        0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0xff, t[13], t[14], t[15],
+    ])
+}
+
+/// Extract an Ethernet address from an NDP source/target link-layer option.
+fn ether_from_lladdr(raw: RawHardwareAddress) -> Option<EthernetAddress> {
+    match raw.parse(Medium::Ethernet) {
+        Ok(HardwareAddress::Ethernet(addr)) => Some(from_smoltcp_ether(addr)),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Ipv6RouteDecision {
+    Direct { next_hop: Ipv6Address },
+    Multicast { next_hop: Ipv6Address },
+    Gateway { next_hop: Ipv6Address },
+    Unreachable { dst: Ipv6Address },
+}
+
+impl Ipv6RouteDecision {
+    pub const fn next_hop(self) -> Option<Ipv6Address> {
+        match self {
+            Self::Direct { next_hop }
+            | Self::Multicast { next_hop }
+            | Self::Gateway { next_hop } => Some(next_hop),
+            Self::Unreachable { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NdiscResolution {
+    Resolved { mac: EthernetAddress },
+    Pending { next_hop: Ipv6Address },
+    Failed { errno: Errno },
 }
 
 fn build_arp_frame(repr: &ArpRepr) -> Vec<u8> {
@@ -1146,6 +1112,34 @@ fn parse_ipv4_meta(packet: &[u8]) -> Option<Ipv4PacketMeta> {
     })
 }
 
+/// R3b: keep the reassembly table bounded. First drop every flow whose
+/// `last_seen + TTL` has passed, then — only when `incoming` is a genuinely new
+/// flow and the table is still at capacity — evict the single least-recently-seen
+/// flow. This replaces the previous wholesale `clear()`, which let 65 forged
+/// first-fragments wipe all 64 legitimate in-flight reassemblies (a low-severity
+/// DoS). Mirrors the P3-C conntrack `expire_and_cap_*` pattern; `now` is the
+/// P0-unfrozen `net_now_instant()`.
+fn expire_and_cap_ipv4_fragments(
+    fragments: &mut BTreeMap<Ipv4FragmentKey, Ipv4ReassemblyEntry>,
+    incoming: &Ipv4FragmentKey,
+    now: Instant,
+) {
+    fragments.retain(|_, entry| entry.last_seen + IPV4_REASSEMBLY_TTL > now);
+    if fragments.contains_key(incoming) {
+        return;
+    }
+    while fragments.len() >= IPV4_REASSEMBLY_FLOW_LIMIT {
+        let Some(oldest) = fragments
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_seen.total_micros())
+            .map(|(key, _)| *key)
+        else {
+            break;
+        };
+        fragments.remove(&oldest);
+    }
+}
+
 fn assemble_ipv4_packet(entry: Ipv4ReassemblyEntry) -> Option<Vec<u8>> {
     let mut packet = entry.header?;
     let header_len = usize::from(packet[0] & 0x0f) * 4;
@@ -1236,4 +1230,88 @@ fn same_ipv4_subnet(common: IfaceCommon, dst: Ipv4Address) -> bool {
 
 fn ipv4_to_u32(addr: Ipv4Address) -> u32 {
     u32::from_be_bytes(addr.octets())
+}
+
+#[cfg(test)]
+mod fragment_reassembly_bound_tests {
+    use super::*;
+
+    fn frag_key(ident: u16) -> Ipv4FragmentKey {
+        Ipv4FragmentKey {
+            src: Ipv4Address::new([10, 0, 0, 1]),
+            dst: Ipv4Address::new([10, 0, 0, 2]),
+            ident,
+            protocol: 17,
+        }
+    }
+
+    fn entry_at(micros: i64) -> Ipv4ReassemblyEntry {
+        Ipv4ReassemblyEntry {
+            last_seen: Instant::from_micros(micros),
+            ..Ipv4ReassemblyEntry::default()
+        }
+    }
+
+    // R3b: a full table + a brand-new flow must evict exactly the single
+    // least-recently-seen flow — NOT clear the whole table. The old code did
+    // `fragments.clear()`, so 65 forged first-fragments wiped all 64 legitimate
+    // in-flight reassemblies (a low-severity DoS).
+    #[test]
+    fn overflow_evicts_only_oldest_flow_not_whole_table() {
+        let mut fragments = BTreeMap::new();
+        for i in 0..IPV4_REASSEMBLY_FLOW_LIMIT {
+            // Distinct, increasing last_seen so "oldest" is deterministic.
+            fragments.insert(frag_key(i as u16), entry_at(1_000 + i as i64));
+        }
+        assert_eq!(fragments.len(), IPV4_REASSEMBLY_FLOW_LIMIT);
+
+        let incoming = frag_key(IPV4_REASSEMBLY_FLOW_LIMIT as u16);
+        let now = Instant::from_micros(1_000 + IPV4_REASSEMBLY_FLOW_LIMIT as i64);
+        expire_and_cap_ipv4_fragments(&mut fragments, &incoming, now);
+
+        // Exactly one slot freed for the newcomer; every other flow survives.
+        assert_eq!(fragments.len(), IPV4_REASSEMBLY_FLOW_LIMIT - 1);
+        assert!(
+            !fragments.contains_key(&frag_key(0)),
+            "the oldest flow must be the one evicted"
+        );
+        for i in 1..IPV4_REASSEMBLY_FLOW_LIMIT {
+            assert!(
+                fragments.contains_key(&frag_key(i as u16)),
+                "legitimate flow {i} must not be evicted"
+            );
+        }
+    }
+
+    // R3b: flows past their TTL are swept once `now` advances, independent of
+    // table pressure.
+    #[test]
+    fn ttl_sweep_drops_stale_flows() {
+        let mut fragments = BTreeMap::new();
+        fragments.insert(frag_key(1), entry_at(0));
+        fragments.insert(frag_key(2), entry_at(0));
+
+        let now = Instant::ZERO + IPV4_REASSEMBLY_TTL + Duration::from_micros(1);
+        expire_and_cap_ipv4_fragments(&mut fragments, &frag_key(3), now);
+
+        assert!(fragments.is_empty(), "flows past their TTL must be swept");
+    }
+
+    // R3b: a later fragment of an ALREADY-present flow never evicts anyone,
+    // even at capacity — reassembly in progress is left untouched.
+    #[test]
+    fn later_fragment_of_existing_flow_never_evicts() {
+        let mut fragments = BTreeMap::new();
+        for i in 0..IPV4_REASSEMBLY_FLOW_LIMIT {
+            fragments.insert(frag_key(i as u16), entry_at(1_000 + i as i64));
+        }
+        let existing = frag_key(5);
+        let now = Instant::from_micros(2_000);
+        expire_and_cap_ipv4_fragments(&mut fragments, &existing, now);
+        assert_eq!(
+            fragments.len(),
+            IPV4_REASSEMBLY_FLOW_LIMIT,
+            "an in-progress flow must not trigger eviction"
+        );
+    }
 }

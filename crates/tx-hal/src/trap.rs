@@ -315,7 +315,13 @@ pub trait KernelTrapSink<P: TxPlatform> {
 
     fn on_timer_interrupt(cpu: CpuId, view: TrapFrameMut<'_>) -> TrapAction;
 
-    fn on_external_irq(cpu: CpuId) -> TrapAction;
+    /// External device IRQ. `view` is the interrupted context's trap
+    /// frame: implementations that return `Reschedule` for a trap that
+    /// interrupted a *user* slice must first hand the preemption off to
+    /// the userspace-run slot (same discipline as `on_timer_interrupt`),
+    /// because from-user `Reschedule` longjmps back into the thread
+    /// future, whose wait would otherwise never resolve.
+    fn on_external_irq(cpu: CpuId, view: TrapFrameMut<'_>) -> TrapAction;
 
     fn on_ipi(cpu: CpuId) -> TrapAction;
 

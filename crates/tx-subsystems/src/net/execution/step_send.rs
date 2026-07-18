@@ -16,6 +16,7 @@ use crate::net::structure::{
     RecvWireSet, SendRecvFlags, SendWireSet, SocketIdentity, SocketKind, SocketPayload,
     SocketProtocol, TcpState, UnixDatagramState, UnixSocketPath, UnixStreamState,
 };
+use crate::net::structure::table::SocketTable;
 use crate::net::NetAdminAuthority;
 use tx_substrate::zone::PayloadCap;
 
@@ -120,9 +121,6 @@ pub fn step_send_kernel_bytes(
     if socket.kind == SocketKind::UnixStream {
         return send_unix_stream_bytes(socket, &payload, bytes, guard);
     }
-    if socket.kind == SocketKind::Tcp && tcp_uses_direct_stream(&payload) {
-        return send_tcp_stream_bytes(socket, &payload, bytes, guard);
-    }
     if socket.kind == SocketKind::Sctp {
         return send_sctp_stream_bytes(socket, &payload, bytes, 0, 0, guard);
     }
@@ -130,9 +128,13 @@ pub fn step_send_kernel_bytes(
         return send_unix_datagram_connected(socket, &payload, bytes, guard);
     }
 
-    let Some(reserve) = payload.reserve_send_bytes_with_flags(bytes, flags) else {
-        socket.readiness.clear_send(SendWireSet::SPACE);
-        return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
+    let reserve = match payload.reserve_send_bytes_with_flags(bytes, flags) {
+        Ok(Some(reserve)) => reserve,
+        Ok(None) => {
+            socket.readiness.clear_send(SendWireSet::SPACE);
+            return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
+        }
+        Err(errno) => return StepOutcome::Err(errno),
     };
 
     if reserve.bytes == 0 {
@@ -253,7 +255,16 @@ pub fn step_send_to_kernel_bytes_with_poll_kick(
                 return StepOutcome::Err(Errno::EAFNOSUPPORT);
             }
             if !destination.is_loopback() && !destination.is_unspecified() {
-                return send_configured_icmpv4_echo(&payload, destination.addr, bytes, guard);
+                // Configured/local-multicast peers keep the synthesized
+                // loopback-style reply (netns/LTP flows). A real external
+                // destination falls through to the generic reserve below —
+                // icmp tx queue → device-TX lane → wire (replies come back
+                // through the demux → process_icmp_event → raw socket).
+                if ipv4_multicast_group_is_joined_locally(destination.addr)
+                    || ipv4_addr_is_configured(destination.addr)
+                {
+                    return send_configured_icmpv4_echo(&payload, destination.addr, bytes, guard);
+                }
             }
         }
     }
@@ -262,9 +273,6 @@ pub fn step_send_to_kernel_bytes_with_poll_kick(
     }
     if socket.kind == SocketKind::UnixStream {
         return send_unix_stream_bytes(socket, &payload, bytes, guard);
-    }
-    if socket.kind == SocketKind::Tcp && tcp_uses_direct_stream(&payload) {
-        return send_tcp_stream_bytes(socket, &payload, bytes, guard);
     }
     if socket.kind == SocketKind::Sctp {
         return send_sctp_stream_bytes(socket, &payload, bytes, 0, 0, guard);
@@ -346,7 +354,14 @@ fn tcp_connected_peer_error(payload: &SocketPayload, guard: &Guard<'_>) -> Optio
         return None;
     };
     let Some(peer) = lookup_tcp_connected_peer(payload, local, remote, guard) else {
-        return Some(Errno::EPIPE);
+        // No in-kernel peer: this is an external (real-device) TCP connection
+        // whose peer lives on the wire, not a loopback/intra-kernel pair. The
+        // connection is writable as long as its smoltcp socket can still
+        // send; only a socket that can no longer send is a genuine EPIPE.
+        return match payload.raw_tcp_socket() {
+            Some(raw) if raw.may_send() => None,
+            _ => Some(Errno::EPIPE),
+        };
     };
     let Some(peer_payload) = peer.acquire_operational() else {
         return Some(Errno::EPIPE);
@@ -358,15 +373,6 @@ fn tcp_connected_peer_error(payload: &SocketPayload, guard: &Guard<'_>) -> Optio
         }) if peer_local == remote && peer_remote == local => None,
         _ => Some(Errno::EPIPE),
     }
-}
-
-fn tcp_uses_direct_stream(payload: &SocketPayload) -> bool {
-    matches!(
-        payload.protocol_snapshot(),
-        SocketProtocol::Tcp(TcpState::Connected { .. })
-    ) && payload
-        .raw_tcp_socket()
-        .is_some_and(|raw| !raw.protocol_runtime_state().has_connected)
 }
 
 fn lookup_tcp_connected_peer(
@@ -384,45 +390,6 @@ fn lookup_tcp_connected_peer(
                 .into_iter()
                 .find_map(|namespace| namespace.socket_table().lookup_tcp_connection(key, guard))
         })
-}
-
-fn send_tcp_stream_bytes(
-    _socket: &Cap<SocketIdentity>,
-    payload: &SocketPayload,
-    bytes: &[u8],
-    guard: &Guard<'_>,
-) -> ByteStepOutcome<usize> {
-    let (local, remote) = match payload.protocol_snapshot() {
-        SocketProtocol::Tcp(TcpState::Connected { local, remote }) => (local, remote),
-        SocketProtocol::Tcp(TcpState::Closed) => return StepOutcome::Err(Errno::ENOTCONN),
-        SocketProtocol::Tcp(_) => return StepOutcome::Err(Errno::EPIPE),
-        _ => return StepOutcome::Err(Errno::EINVAL),
-    };
-    let Some(peer) = lookup_tcp_connected_peer(payload, local, remote, guard) else {
-        return StepOutcome::Err(Errno::EPIPE);
-    };
-    let Some(peer_payload) = peer.acquire_operational() else {
-        return StepOutcome::Err(Errno::EPIPE);
-    };
-    if !matches!(
-        peer_payload.protocol_snapshot(),
-        SocketProtocol::Tcp(TcpState::Connected {
-            local: peer_local,
-            remote: peer_remote,
-        }) if peer_local == remote && peer_remote == local
-    ) {
-        return StepOutcome::Err(Errno::EPIPE);
-    }
-    if peer_payload.shutdown_rd() {
-        return StepOutcome::Err(Errno::EPIPE);
-    }
-    let Some(became_readable) = peer_payload.record_tcp_stream_bytes(bytes) else {
-        return StepOutcome::Err(Errno::EPIPE);
-    };
-    if became_readable {
-        peer.readiness.fire_recv(RecvWireSet::HAS_DATA);
-    }
-    StepOutcome::Done(bytes.len())
 }
 
 fn send_unix_datagram_connected(
@@ -634,7 +601,7 @@ fn deliver_icmpv4_reply_to_table(
 }
 
 fn send_raw_ipv6(
-    _socket: &Cap<SocketIdentity>,
+    socket: &Cap<SocketIdentity>,
     payload: &SocketPayload,
     dst: Option<IpEndpoint>,
     bytes: &[u8],
@@ -668,7 +635,13 @@ fn send_raw_ipv6(
         .unwrap_or(Ipv6Address::LOOPBACK);
 
     if !destination.is_loopback() && !destination.is_unspecified() {
-        return send_configured_icmpv6_echo(payload, protocol, src_addr, dst_addr, bytes, guard);
+        if ipv6_addr_is_configured(dst_addr) {
+            return send_configured_icmpv6_echo(payload, protocol, src_addr, dst_addr, bytes, guard);
+        }
+        // Real external v6 destination: queue for the device-TX lane (mirror
+        // of the v4 external echo flow). Replies come back through the wire
+        // demux (PacketDispatch::Icmp6) into this raw socket.
+        return send_external_icmpv6_echo(socket, payload, protocol, src_addr, dst_addr, bytes);
     }
 
     let packet = RawIpv6Packet {
@@ -679,13 +652,41 @@ fn send_raw_ipv6(
     };
 
     deliver_raw_ipv6_packet_to_table(
-        payload,
+        payload.socket_table(),
         protocol,
         dst_addr,
         bytes.first().copied(),
         packet,
         guard,
     );
+    StepOutcome::Done(bytes.len())
+}
+
+/// External (non-configured) v6 echo: parse the request and queue it for the
+/// device-TX lane, mirroring the v4 external flow through the generic reserve.
+fn send_external_icmpv6_echo(
+    socket: &Cap<SocketIdentity>,
+    payload: &SocketPayload,
+    protocol: ProtocolNumber,
+    src_addr: Ipv6Address,
+    dst_addr: Ipv6Address,
+    bytes: &[u8],
+) -> ByteStepOutcome<usize> {
+    if protocol != ProtocolNumber(58) {
+        return StepOutcome::Err(Errno::EOPNOTSUPP);
+    }
+    let request = match parse_icmpv6_payload_unchecked(src_addr, dst_addr, bytes) {
+        Icmpv6Event::EchoRequest(request) => request,
+        Icmpv6Event::Malformed => return StepOutcome::Err(Errno::EINVAL),
+        Icmpv6Event::EchoReply(_) | Icmpv6Event::Unsupported => {
+            return StepOutcome::Err(Errno::EOPNOTSUPP)
+        }
+    };
+    if payload.enqueue_icmp6_tx_echo(request).is_none() {
+        socket.readiness.clear_send(SendWireSet::SPACE);
+        return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
+    }
+    net_delegate_kick_poll();
     StepOutcome::Done(bytes.len())
 }
 
@@ -721,7 +722,7 @@ fn send_configured_icmpv6_echo(
     };
     let packet_type = reply_packet.payload.first().copied();
     deliver_raw_ipv6_packet_to_table(
-        payload,
+        payload.socket_table(),
         protocol,
         reply.dst,
         packet_type,
@@ -756,15 +757,15 @@ fn learn_configured_icmpv6_neighbor(
     );
 }
 
-fn deliver_raw_ipv6_packet_to_table(
-    payload: &SocketPayload,
+pub(crate) fn deliver_raw_ipv6_packet_to_table(
+    table: &SocketTable,
     protocol: ProtocolNumber,
     dst_addr: Ipv6Address,
     packet_type: Option<u8>,
     packet: RawIpv6Packet,
     guard: &Guard<'_>,
 ) {
-    for target in payload.socket_table().snapshot_raw_icmp(guard) {
+    for target in table.snapshot_raw_icmp(guard) {
         if target.kind != SocketKind::RawIcmp {
             continue;
         }
@@ -1005,9 +1006,13 @@ fn send_sctp_stream_bytes(
                 if peer_payload.shutdown_rd() {
                     return StepOutcome::Done(bytes.len());
                 }
-                if let Some(became_readable) =
-                    peer_payload.record_sctp_message(bytes.to_vec(), false, stream, ppid, Some(local))
-                {
+                if let Some(became_readable) = peer_payload.record_sctp_message(
+                    bytes.to_vec(),
+                    false,
+                    stream,
+                    ppid,
+                    Some(local),
+                ) {
                     if became_readable {
                         peer.readiness.fire_recv(RecvWireSet::HAS_DATA);
                     }
@@ -1160,7 +1165,10 @@ pub fn step_send_sctp_seqpacket(
                     send_assoc_id,
                     last,
                 );
-                if payload.record_sctp_message(failed, true, 0, 0, None).is_some() {
+                if payload
+                    .record_sctp_message(failed, true, 0, 0, None)
+                    .is_some()
+                {
                     fired = true;
                 }
                 offset = end;

@@ -1,3 +1,490 @@
+- 2026-07-16 (push 前全分支审计修复 — 2 个真 bug). 审计发现 2 个入账-blocking 缺陷,push 前修掉。**① IPv6
+  prefix_len 内核 panic 向量**(CAP_NET_ADMIN 可触发):`ip -6 addr add fe80::1/200` 的裸 prefix_len 未校验,
+  流到 decide_ipv6_route→same_ipv6_prefix 按 plen/8 索引 [u8;16] 越界 panic。**三层防御**:(a) rtnetlink.rs
+  handle_newaddr 按族拒绝 prefix_len>32(v4)/>128(v6) 返 EINVAL(Linux 正确,真源头,对齐 route handler 的
+  dst_len 守卫);(b) namespace.rs:1970 `ipv6_prefix_len.map(|p|p.min(128))`(镜像 v4 的 .min(32));(c)
+  ether/mod.rs same_ipv6_prefix 切片索引前 `plen.min(128)` 防御。**② 未连接 UDP send() 回归 + 红测试**:重构后
+  payload.rs reserve_send_bytes_with_flags 的 None 分支 enqueue 到 UNSPECIFIED:0,push_datagram_inner 静默丢弃且
+  不计账 → send_space 不减,committed 测试 step_send_kernel_bytes_records_tx_bytes_and_clears_when_full 变红
+  (left:4 right:0)。**修**:未连接 send() 无目的地址返 EDESTADDRREQ(Linux 正确,与本文件 sendto 路径一致),
+  改 reserve_send_bytes_with_flags 为 Result + step_send.rs 调用点适配;测试改为 connect 后再 send(真缓冲)+ 新增
+  EDESTADDRREQ 回归测试。**验证**:(1) 干净编译(独立 target dir+pin 工具链,仅 1 个 pre-existing 无关警告);
+  (2) 原红测试隔离转绿 + 新回归测试绿;(3) **零回归**——全量 set-diff(dirty vs clean)唯一差异=我新增的测试,
+  隔离逐测试 diff vs clean 字节级一致(7 个 pre-existing host-test 级联失败在 clean 上同样挂);(4) **端到端
+  netperf 5/5 + iperf 6/6**(rv64 loopback,run1 UDP_STREAM 挂=已知 flaky TCG SIGALRM SEGV a0=0xe/pc=ra=0x2000,
+  重跑即过无 segv,非本改动)。改动 6 文件(4 代码 + byte_io_tests + STATUS)。**Next**:用户 push 分支
+  (首次推 feature-network-refactor)+ 撤销临时 GitHub token。Blocker:无。
+- 2026-07-15 (setsockopt IP_TOS 支持 — SSH 能力探索副产品). 加 `IP_TOS=1` 常量(numbers.rs)+ re-export(mod.rs)
+  + setsockopt IPPROTO_IP/IP_TOS 一臂(socket.rs:接受 DSCP/ToS 低字节存 opts.ip.tos,不再返 ENOPROTOOPT)。动机:
+  OpenSSH 客户端(及 curl)会设 IP_TOS 做 QoS,之前返 "Protocol not available" 警告。**背景=打通 git-over-SSH**:
+  往官方镜像副本注入 openssh 10.0p2(deps libcrypto/libssl/z 镜像已有),内核成功跑真 ssh:ssh -V/ssh-keygen
+  ed25519/**完整 SSH 握手+加密+公钥认证+git clone over ssh 全通**(宿主一次性 sshd@2222 via slirp 10.0.2.2,
+  clone marker+commit 一致)。IP_TOS 补后 ssh 警告消失、clone 输出干净。验证:rv64 build ok + git-net HTTPS 8/8
+  无回归。**注**:官方竞赛镜像无 ssh 客户端(git 题走 HTTPS),此为内核 SSH 能力证明+通用 setsockopt 改进,非直接计分。
+  Next:可选 la64 同验、IPV6_TCLASS 同款补。Blocker:无。
+- 2026-07-14 (内核墙钟从硬件 RTC 同步真实时间 — 双架构). 之前 CLOCK_REALTIME 锚在写死的 2026-05-23
+  (wall_clock.rs DEFAULT_REALTIME_EPOCH_BASE_NS + RTC ioctl fixed_oscomp_time),导致 git commit/date/文件
+  mtime 都是固定过去日期(GitHub 显示 "2 months ago")。改:开机读真 RTC 硬件,调已存在的
+  wall_clock::set_realtime_ns::<P> 重设 offset + 重发 vvar。**改动 5 文件**:(1) tx-hal TimeIf 加默认方法
+  read_rtc_epoch_ns()->Option<u64>(默认 None,不破坏其他实现);(2) rv64 board 读 goldfish-rtc
+  (DTB rtc@101000,TIME_LOW/HIGH=epoch ns)+ boot_static.rs 补 MMIO 页表映射(设备页是逐个显式映的,
+  5→6 region,不加映射会 load page fault);(3) la64 board 读 ls7a-rtc(DTB rtc@100d0100,TOY 寄存器解码
+  +civil→epoch;**关键坑=TOY 读被使能位门控,必须先写 RTC_CTRL|=TOY_ENABLE|OSC_ENABLE**,DMW 覆盖全 PA 无需
+  页表映射);(4) init.rs vdso init 后调同步+:rtc:synced 哨兵。**验证**:rv64 date=2026-07-14 16:13 与宿主
+  一致、la64 date=16:20:35 与宿主差 1s;两架构 git commit 时间戳真实;**回归门全绿**:rv64+la64 git-net 各
+  8/8、tx-subsystems 集合差 321==321。**部署提醒**:QEMU 默认 RTC=宿主时间,-rtc base=utc 钉 UTC;RTC ioctl
+  仍返回 fixed_oscomp_time(未改,git 不用它)。**Next**:可选把 RTC ioctl 也接真 RTC。Blocker:无。
+- 2026-07-14 (LTP net 对账 la64 双 lane — 补齐 3185f1d6 的另一半架构). 与 rv 同一批靶、同一见证工具
+  (tools/ltp-bin-witness.sh 官方 ltp-bin 形态),验证双 ioctl 修复 + 缩轮 knob 在 la 的增收。**la 范围内 377/lane
+  = 与 rv 完全对称**:ipv6_lib+socket 核心 107/107(**in6_02 3/3 — ioctl 修复架构无关,la 同样回来**)、socket 剩余
+  37/37、shell 命令类 45/45、net_stress 快 45/45(netlink×3=TCONF libmnl 结构性 0,同 rv)、net_stress 长 143/143
+  (**mtu 80/80 — MTU_CHANGE_TIMES knob 在 la 生效**)。**重大意外**:la 的 net shell 族(ping01.sh/route-change*.sh/
+  if-*.sh)在重构栈上全通,历史 [[la-awk-segfault-shell-block]] 记的"busybox awk 段错阻塞 shell 测试"对这些 net
+  shell 靶已不复现(awk 阻塞若仍在只影响非 net shell)。前置:先 build la64-qemu 再 submit(submit 只拷 target
+  现成件,只 build rv 会让 la 内核缺 3185f1d6 的修复)。无新代码改动(双架构共享已提交件)。回归门:git-net/集合差
+  已在 rv 轮验;la 纯见证跑分,无源码改。Blocker:无。
+- 2026-07-12 (LTP net 全量对账轮 — refactor 栈 vs 老栈基线,+88/lane 净增收 + 双 ioctl 实现病根修复). 基线=历史
+  witness judge 全集(target/oscomp/ltp-bin/*.judge 提取,rv.musl 391/rv.glibc 387;msp 账本文件已失)。**跑批**(官方
+  ltp-bin 形态,rv 双 lane):ipv6_lib 42=42、shell 命令类 46=46、socket C 族+sctp 102=102(accept02/fanout01 批内
+  flaky 单跑全过)、stress 快靶 43 vs 23、stress 长靶 143 vs 75 → **范围内 289→377/lane(+88)**。**回归 2 个全修**:
+  in6_02 0/3 + if4-addr-change 0/1 = **同根:fs_basic.rs 有个 6 臂精简版 sys_socket_ioctl 同名遮蔽,socket fd ioctl
+  全走它;socket.rs 19 臂完整版(SIOCGIFNAME/SIOCSIFADDR/ARP/路由)是死码** → if_indextoname/ifconfig 设地址全挂
+  (verify-v6 轮 ifconfig EINVAL 同源)。定位=探针三连(socket 层计数 0 → 总入口 syspath=3 但 enter=0 铁证双实现);
+  修=删精简版调完整版(严格超集),双 lane 复验 4/4。**增收关键=补 2 个 score-neutral 缩轮 knob**(exec.rs walk env:
+  MTU_CHANGE_TIMES=20、ROUTE_CHANGE_IP=20,同 PING_MAX 机制):mtu 默认 100 轮 ~1350s 超官方 300s 墙必 0 分,缩轮后
+  **mtu 80/80@墙内(基线 12,+68)**、route-change-dst/gw 各 20/20@墙内(+5/+15)。**结构性 0 维持**:route-netlink×3
+  = TCONF libmnl(镜像测试二进制缺库,非内核;netlink write 修复后从挂死变干净 TCONF)。**回归门**:集合差 321==321、
+  git-net 8/8、glibc 缩轮 120/120。**坑**:ltp_view.csv 的 test_name 是 runtest 名≠镜像 bin 文件名(shell 靶带 .sh),
+  喂错名=0/0 假阴;历史 judge 文件就是最好的靶名+基线来源。**Blocker**:无。
+- 2026-07-12 (外部 raw ICMP 接设备 TX — QEMU 真机外部 ping6 3/3 全通). 目标:修 [netlink-write 修复后的遗留]外部
+  ping4/6 `sendto: Not supported`。**调研发现 v4 的外部 echo 基建早已在**(通用 reserve→`icmp_tx` 队列→device_tx 车道
+  `process_raw_icmp_tx_socket`,含 src 修正+PendingResolution 保留重试),只是 step_send 分派把所有非 loopback dst 拦去
+  configured-only 合成。**修①外部分派**:step_send v4 分派收窄(configured/组播→合成回显保留 netns/LTP 行为;真外部→
+  通用 reserve 入队);v6 新增 `send_external_icmpv6_echo`(解析 echo→`tx6_queue`→kick)+ icmp.rs v6 TX 队列/
+  `build_icmpv6_echo_request_packet` + payload 包装 + device_tx 车道 v6 分支。**修②双 iface RX/TX 分裂**(pcap 揪出:
+  NS 每秒重发、echo 永不出):boot-lane iface(v4-only)独占 RX drain,NA 学进它的表;v6 TX/pending 在 namespace ensure
+  iface 上,pending 永不清。修=kernel net.rs `cross_feed_ndisc`(RX dispatch 后对同 netdev 的 namespace iface 调
+  `learn_ndisc_from_dispatch`=V2 的 guard-None 只学不回,boot iface 仍是唯一 NS 应答者)。**验证**:QEMU 外部
+  **ping6 fec0::2 = 3/3 0% loss**(首包 59ms 含 NDP 往返都没丢——PendingResolution 保留重试生效;pcap:NS→NA→echo×3
+  全链)——**V1+V2+V3a+本修 全链真机端到端**;v4 echo request 到 wire(pcap+IP/ICMP checksum 手工验算全对),回程
+  **slirp 不回 v4 gateway ping = QEMU slirp 环境限制非内核 bug**(v6 有内建响应);集合差 321==321;**icmp_tests 对照
+  实验**(stash 前后):HEAD 隔离 7 挂→带改动 3 挂(那 3 个 HEAD 本挂=模块内级联,**改动净治好 4 个**);
+  external_connect/ndisc/route6 隔离全绿;git-net **8/8**。过时测试 `raw_icmpv6_unknown_peer_addr_stays_unsupported`
+  更新为新语义(→`_queues_external_echo`:Done+队列断言,单跑 ok)。**遗留**:boot/namespace 双 iface 结构债(本修是
+  cross-feed 补丁,统一 iface 归 P5 结构轮);v4 外部 ping 回程需真实对端(slirp 限制)。**Blocker**:无。
+- 2026-07-12 (vendor 编译必需 blob 白名单入 git — 初赛 0 分事故根治). 症状(初赛实锤,用户文档):评测机 clone 后
+  `include_bytes!` 两处(rootfs_shims.rs:436 la busybox-full / :486 tx-netfast)找不到 `/tools/images/vendor/` 下被
+  gitignore 的 blob → **双架构编译崩、全部测例 0 分**;初赛应急是删嵌入弃功能(06a16d21,评测仓)。**根治(保功能)**:
+  .gitignore 改 `/vendor/*` + `!` 白名单(**坑:整目录忽略时 `!` 例外无效,必须忽略"内容"**)入 git:tx-netfast-riscv64
+  (16KB,sha 验证)+ busybox-loongarch64-musl(1.4MB;**工作树 blob 与 .sha256 漂移 23 分钟——信被全量验证过的 blob,
+  重生成 sha**)+ 全部 .sha256/.SOURCE;rv busybox(1MB,仅 image 组装非编译必需)维持脚本获取。xtask doctor 加
+  tx-netfast 存在性+sha256 漂移检查(改 netfast.c 忘重编的防线)。**纪律:include_bytes! 的文件=白名单入 git 或
+  build.rs 生成,禁止"手工产物+被 ignore";推关键改动后 `git clean -ndx` 预演看会删掉什么编译必需品**。
+- 2026-07-10 (修复 netlink `ip` 挂死 — write() 未路由到 netlink_route_send;真机验证 V3a). 症状:refactor 分支 tx.runsh
+  lane 上 userspace `ip`(iproute2 + busybox 两种实现)全挂,挡住一切 netlink 网络配置(v4/v6 addr/route)。**QEMU 真机 +
+  逐 syscall 原子探针定位**:`ip` 完成 socket/bind/getsockname 后挂在 **write(64)**——`ip` 用 `write(netlink_fd, RTM_GET*)`
+  发 dump 请求(非 sendto),而 sys_write 把 socket 写走通用 VFS→socket FileOps→`step_send_kernel_bytes`(TCP/UDP 通用发送,
+  **零 netlink 处理**)→ netlink socket 永不 fire send readiness → 永久阻塞。**误判纠正**:先以为"挂 recv/poll"(lost-wakeup),
+  探针证伪(send/recv/poll 计数全 0,唯 write 到);逻辑逐层读都对,靠 ground truth 才定位。**修复**(io.rs +21 / socket.rs
+  2 fn 提 pub(super)):sys_write 检测 netlink socket → 路由到 `dispatch_netlink_send`(等价 `sendto(...,0)`);非 netlink 写
+  字节级不变。**验证**:rv64 build 干净;QEMU `ip link show`/`ip -6 addr add`/`ip -6 route add default via`/`ip -6 route show`
+  全 rc0(fec0::10 配上、两条 v6 路由在)→ **V3a rtnetlink v6 真机端到端验证**;git-net **8/8**(TCP clone/push/pull/DNS 零
+  回归);tx-subsystems 未动。**遗留(独立缺口,非本修复)**:外部 ping6 仍 `sendto: Not supported`——raw ICMPv6/v4 echo 只对
+  已配置本地地址合成回显(step_send.rs `send_configured_icmpv6_echo`:`!ipv6_addr_is_configured(dst)→EOPNOTSUPP`),对外部
+  (网关/真机)未接设备 TX,是独立特性(对外 raw ICMP→`dispatch_ipv6_at`),非 netlink 问题。**Blocker**:无。
+- 2026-07-10 (IPv6 V4 延后 + B 路 V1-V3b 收官 — 分片/转发/sysctl 价值评估). 调研结论:V4 是架构完整性收尾,**已知
+  LTP 计分价值近零**——网络计分账本(58 靶/天花板 946)**无 v6 分片/转发靶**(唯一 `fragments` 是 SCTP 层已覆盖;
+  `forwarding` 提及全是 v4 Docker/Alpine 容器场景);可计分 v6 靶(ipv6_lib/ping6/tracepath601/tcpdump601)V1-V2 已覆盖;
+  v6 分片实务罕见(PMTUD + 1280 最小 MTU)。**UDP v6 源 hint**(§5 表列进 V4)实为已就绪(`preferred_ipv6_source_for`
+  step_send.rs:766)。剩三块已知收益 0:v6 分片 TX+RX(~200 LOC 大)、`ipv6_forwarding`(~100)、v6 forwarding sysctl(~30)。
+  **决定:延后 V4**(用户确认);触发条件 + 实现草图存 docs/design/07_net/IPV6_V4_PLAN_v1.md §5/§6。**IPv6 B 路 V1-V3b
+  收官**:外部 off-link v6 TCP/UDP 收发链内核侧已齐 = V1(a90988d0 收发 + ICMPv6 RX)+ V2(ccae95c8 动态 NDP)+ V3a
+  (6ee95e0b 路由/FIB 管理面)+ V3b(28a05d02 off-link 网关)。全程每阶段调研文档→审查→实现→集合差 0 回归→提交。
+  **Blocker**:无。**下一可选方向**:QEMU 真机功能验证(外部 v6 ping6/iperf)、或 V4 某子块(触发时)、或转他向。
+- 2026-07-10 (IPv6 V3b 落地 — v6 数据面外部 off-link 路由). 目标:外部 off-link v6 TCP/UDP 真流量。**调研关键发现**:计划
+  估的 emit_ipv6 / step_device_tx / 源选择三大块**其实早已就绪**——emit 双族(TCP 用存储 `ip_repr`、UDP 首行
+  `dst.family==Inet6`→`emit_v6`);UDP `local`=socket 绑定端点(双族);connect 源选择双族;on-link `decide_ipv6_route`→Direct→NDP。
+  真缺口仅 `decide_ipv6_route` 的 off-link 网关,故 V3b ~100 LOC。**实现**(全加法,零碰 v4/数据面):loopback.rs
+  `IfaceCommon.ipv6_gateway` + `with_ipv6_gateway`;ether/mod.rs `Ipv6RouteDecision::Gateway` + `decide_ipv6_route` 网关分支
+  (dispatch 侧零改,网关 next_hop 经 `resolve_ndisc`→NDP);namespace.rs `gateway6_for_device`(从 `routes6` ::/0 解析)+
+  `NetNamespaceIfaceRuntime.ipv6_gateway` + `ensure_ether_iface_for_link` 灌入 + 缓存键;导出 `decide_ipv6_route`/`Ipv6RouteDecision`;
+  2 测试(decide 四路径 + off-link 排网关)。**验证**:rv64 build 干净;2 测试隔离全 ok(decide 纯函数连全量都过);集合差
+  新增失败**仅** off-link 集成测试(级联,隔离过),**0 既有回归**(v4 路由/emit/step_device_tx 未动)。**边界**:socket→emit_v6
+  段代码复核双族、未写 socket 级 v6 UDP 端到端测试;功能门(QEMU 外部 v6 iperf)需真机。**结果**:外部 off-link v6 收发链
+  内核侧齐了 = 路由(V3b)+ emit 双族 + 源选择双族 + NDP(V2)。**下一步**:V4(v6 分片/重组 + `ipv6_forwarding` + sysctl 真值)
+  或按 LTP v6 靶。**Blocker**:无。正本 docs/design/07_net/IPV6_V3B_PLAN_v1.md。
+- 2026-07-10 (IPv6 V3a 落地 — v6 路由/FIB 管理面). 目标:v6 路由表 + rtnetlink v6 route + `/proc/net/ipv6_route`,解锁
+  `ip -6 route`。**调研关键发现**:"外部 v6 TCP/UDP"不止路由——数据面(socket→wire `emit`)也纯 v4;故 V3 拆 **V3a(管理面,
+  本轮)+ V3b(数据面,后续)**。**实现**(独立 `routes6` 表镜像 v4,零碰数据面):namespace.rs(+380)`NetNamespaceRoute6
+  {Info,Config,Selector,Decision,Entry}` + `routes6` + `route6_snapshot`/`best_ipv6_route`/`add`/`delete_ipv6_route`/
+  `route6_decision_for_info` + v6 前缀数学(u128 大端掩码,`plen==0` 守卫);rtnetlink.rs(+147)`handle_newroute/delroute`
+  按 family 分流(v4 分支保留)+ `parse_route6_config/selector` + `ipv6_attr` + `render_getroute_dump` v6 门控 +
+  `build_route6_message`;project.rs(+45)`proc_net_ipv6_route_snapshot_text`(Linux 格式);tx-fs procfs 布线
+  `/proc/net/ipv6_route`(ID 0x..1B);rtnetlink_tests.rs(+238)3 个 v6 route 测试。**协作**:~500 LOC 机械镜像交子代理执行,
+  我独立复核(亲跑 build+测试+逐点 diff——子代理"clean"报告与 harness 残留诊断矛盾,以实测为准,最终态干净;子代理纠正规格
+  procfs ID 冲突 0x17→0x1B)。**验证**:rv64 build 干净;`rtnetlink_tests` 隔离 **24/24**(既有 v4 route + 新 v6 route 同过);
+  全量集合差唯一新增=3 个新测试(host-harness 级联,隔离过),**0 既有回归**(v4 路由/数据面未动)。**功能门**(QEMU
+  `ip -6 route add/del/show`)未跑,需真机。**下一步**:V3b(v6 数据面:`emit_ipv6` + step_device_tx v6 分支 + step_send/connect
+  v6 选路 + `decide_ipv6_route` 网关)——先出调研文档。**Blocker**:无。正本 docs/design/07_net/IPV6_V3_PLAN_v1.md。
+- 2026-07-10 (IPv6 V2 落地 — 动态 NDP 邻居发现,替静态 ndisc 表). 目标:v6 下一跳 MAC 解析从静态升级为动态 NS/NA
+  收发学习(v4 ARP 的 v6 对应物)。**复用** smoltcp-asterinas 的 `NdiscRepr`/`Icmpv6Repr::Ndisc`(NS/NA parse+emit 都有),
+  不手搓 wire。**实现**(照抄 ARP 状态机,ether/link.rs):RX `maybe_process_ndisc`(side-effect peek 镜像 maybe_reply_icmpv4,
+  挂 RX 的 Ipv6 臂)学 NS/NA 邻居 + 对 NS-for-us 回 NA;`resolve_ndisc` 动态化(TTL 缓存命中 / miss 排 pending 返 Pending →
+  `dispatch_ipv6_at` 转 PendingResolution 上层重传);`flush_pending_ndisc_at` 发 NS 探测(solicited-node 组播 33:33:ff:..,
+  退避 `NDISC_SOLICIT_RETRY_LIMIT=3` 超限标 EADDRNOTAVAIL);`step_flush_pending_arp` 一个 tick 同驱 v4+v6。**计划外必需
+  修正**:`accepts_ethernet_destination` 增收本机 solicited-node 组播 MAC——否则入站 NS 被丢、回 NA 永不触发(写测试时
+  发现)。**决策 D1-D7 全按推荐**(peek / 静态保留 / 回 NA / 不缓存报文 / 扩展现有 step / link.rs / NDISC_* 别名)。
+  **验证**:`cargo xtask build --target rv64-qemu` 干净;4 个 ndisc 单测隔离 4/4 ok(NA 学习 / NS-for-us 回 NA /
+  miss→NS→NA 解析 / retry-limit→Failed);全量 `cargo test -p tx-subsystems` 集合差唯一新增 = 这 4 个新测试(host-harness
+  全量级联,隔离全过),**0 既有回归**(v4 ARP + v6 loopback 未动;既有 7 个 arp-模块失败原样保留)。**功能门**(QEMU
+  外部 ping6 动态解析)未跑,需真机。**下一步**:V3(v6 路由/FIB 泛化 + `/proc/net/ipv6_route`,解锁 `ip -6 route`/外部
+  v6 TCP·UDP)先出调研文档。**Blocker**:无。正本 docs/design/07_net/IPV6_V2_PLAN_v1.md。
+- 2026-07-10 (IPv6 V1 落地 — 对外 v6 L3 发送 + ICMPv6 RX demux,B 路增量). 目标:补审计⑩「v6 有壳无数据路径」的
+  外部收发两半(loopback/demux 本已通)。**V1a 发送**(4 文件 +211):`Ipv6Address::is_multicast`(types.rs)·`IfaceCommon`
+  v6 地址/前缀字段 + `with_ipv6`(loopback.rs)·v6 地址串到 `EtherIface` + 纳入 iface 缓存键(namespace.rs)·
+  `dispatch_ipv6_at`→`decide_ipv6_route`(multicast/同前缀→Direct)→`resolve_ndisc`(静态 ndisc 表 + `multicast_mac_for`
+  33:33+低4字节)→`transmit_ipv6_packet`(≤MTU 建帧/超则 EMSGSIZE)(ether/mod.rs +162),镜像 v4 `dispatch_ip_at` 链。
+  **V1b 接收**(4 文件 +29):`PacketDispatch::Icmp6(RawIpv6Packet)`(demux.rs)·`demux_ipv6` 加 `IpProtocol::Icmpv6` 臂
+  (smoltcp_demux.rs)·`deliver_raw_ipv6_packet_to_table` 改 pub(crate)收 `&SocketTable`→**发送/接收共用同一分发器**
+  (step_send.rs,2 caller 改传 socket_table())·`Icmp6` 臂扇出到 raw-icmp6 socket(step_process_network_events.rs)。
+  合起 = 对外 ping6 的 TX(echo request 上线)+ RX(echo reply 落 raw socket)两半通,邻居走静态 ndisc(同 v4 静态 ARP;
+  动态 NDP=V2)。**验证**:`cargo xtask build --target rv64-qemu` 干净;`cargo test -p tx-subsystems` 集合差
+  **313==313 零回归**(v6 loopback 无退化);0 新增 warning。**功能门未跑**(host net 套被 1.94 污染基线掩盖,端到端
+  ICMPv6 RX 落 socket 需 QEMU 外部 ping6 + 预置静态邻居)。**下一步**:V2 动态 NDP(NS/NA 收发 + 邻居学习,替静态
+  ndisc 表)先出调研文档再实现。**Blocker**:无。调研正本 docs/design/07_net/{IPV6_STATUS_v1,IPV6_V1_PLAN_v1}.md。
+- 2026-07-06 (Wait 注册表统一 **Stage 1** — net 阻塞路径迁到 substrate WaitSource,对齐 eventfd). 目标:消除审计⑥/R4a
+  遗留——net socket 阻塞 recv/send/accept/connect 从 subsystems `wait_on_token` 迁到 substrate `await_wait_source`。
+  **调研纠正**:"两套注册表"**非 net 独有**——实为 3 原语(reactor `Channel`/net `RawQueue`/substrate `WaitSource`)的
+  **共存期迁移**,11 子系统仍双注册(eventfd/futex/net/pipe/process/signalfd/timerfd/tty/vfs/ipc_msg/ipc_sem),
+  5 已纯 substrate(aio/io_uring/page_backed/userfaultfd/vm)。net 独家怪 = 阻塞单 fd 路径仍停 `wait_on_token`
+  (其余可读 fd 子系统已迁 await_wait_source)。**改动**(tx-shims,net-contained):新增 `SocketReadyWait`(Unpin+
+  drop 自动退订,substrate 优先 / urgent 无镜像回落 legacy;镜像 `RawQueueWaitFuture` 形状,只换订阅的注册表)+
+  reshaped `wait_on_yield_shape` 返回类型 + `wait_on_socket_or_itimer` 入参类型 + socket.rs:1110 直连站点;
+  **8 个 call site 零改动**(靠类型透传)。**验证**:交叉编译 rv64 ok;**git-net 8/8**(阻塞外部 connect/recv/send/
+  push/pull/DNS);**LTP net 定向 rv.musl 18/27 逐项 = 基线**(accept01·accept4_01·epoll_ctl01·poll01 通过;
+  epoll_wait01·pselect01 **基线也失败=预存非我造成**;recv01 等 0/0 未进 runtest 集)→ **0 回归**;**无旁路证明**:
+  grep 确认所有 recv 唤醒经 `fire_recv`→notify_mirror→substrate(无直接 `recv_wq.fire()` 旁路)→ ping raw ICMP recv
+  也醒(git 测不到的 itimer 分支由此排除)。**下一步**:Stage 2(退遗留全家桶:ppoll/pselect/select 迁
+  await_any_wait_source[枢纽,epoll 已迁=模板]→11 子系统去双注册→删 reactor Channel+subsystems 表+wait_on_token)
+  作为独立跨内核 epic 立项。**Blocker**:无。
+- 2026-07-04 (la64 git 验证也过 — 重构栈 git **rv64+la64 双架构都 8/8**). 下载官方 la64 Alpine 镜像
+  (alpine-linux-loongarch64-ext4fs.img,release tag alpine-linux-loongarch64-ext4fs;wget -c 续传绕过 SSL 中断)+适配
+  tools/verify-git-net-la64.sh(qemu-system-loongarch64 -cpu la464 -m1152M/**PCI virtio**(blk-pci+net-pci,非 MMIO)/
+  cmdline 走 -fw_cfg/无 bios)。**la64 kernel verify-git-net-la64.sh 8/8**:Task0 git2.47.3/Task1 init·add·commit+内容/
+  Task2 clone HTTP+HTTPS+push+pull/DNS。**坑**:首测 2/8(仅 Task0+DNS)——la64 kernel 是 B2 时构建的旧件(缺 B4 ext4
+  chmod),重建后 8/8(同 rv64 那次 chmod 故事)。**git clone/push/pull 在重构网络栈上 rv64+la64 双架构完整可用**。
+- 2026-07-04 (git 任务迁移到重构栈完成 — feature-network-refactor kernel 跑 verify-git-net.sh **8/8 全过**). 目标:把 git
+  能力从 net-git(老网络栈)迁到干净 P0-P4 重构栈。**调研结论**:8 个 net commit 不移(重构栈 P2 自有等价外连TCP+DNS),只移
+  非网络 git 使能。**移植四件**:**B1**(54fba845)fork eager-copy CoW(vm/execution.rs,移植 2c97491b,修 git helper argv
+  清零)·**B3**(ce618c6b)ARG_MAX 8192→131072+VEC_MAX 256→1024(linux_syscall/mod.rs,移植 e7992ef8,修 remote-helper
+  Argument list too long)·**B2**(d76a6063)tx.runsh 引导 lane+overlay_image_dirs_for_runsh(init/exec.rs+init.rs,移植
+  ca0ae657+e7992ef8,跑 git 脚本+bind /musl/{usr,lib,bin,sbin}→根)·**B4**(12c596e9)ext4 FsOps::step_chmod(tx-ext4/
+  namespace.rs,移植 ca0ae657)——**调研遗漏、实测抓获**:重构栈 ext4 无 step_chmod 落 trait 默认 ENOSYS→git init chmod
+  core.filemode 挂(先测 2/8:仅 Task0+DNS 过,git init/clone 挂 'could not set core.filemode';补 chmod 后 8/8)。
+  **验收**:重构栈 kernel verify-git-net.sh 8/8(Task0 git2.49.1/Task1 init·add·commit+内容/Task2 clone HTTP+HTTPS+push+pull/
+  DNS);rv64+la64 双 kernel full-build ok;B1 tx-subsystems 集合差 313 零回归。**git clone/push/pull 在干净重构网络栈上完整
+  可用,与 net-git 同(8/8)**。harness+镜像(local-images/ 已 gitignore)。**教训:调研靠注释判 API 存在会错(namespace.rs:435
+  注释称 chmod 走 serialize_inode_meta 但实无 fn),必须实测**。见记忆 [[oscomp-2025-finals-git-task]]。
+- 2026-07-04 (排查并修复 virtio-net 启动卡死 — qemu.rs virtio-mmio 总线分配错). commit a82e4738。**症状**:`cargo xtask qemu --net user`
+  带 virtio-net 时启动挂 `devices:block:ok`,永不到 boot:ok(挡 P4 外部冒烟/la64 boot/LTP/git 联网)。**根因**:rv64 板
+  (boot_static.rs:249-278)硬编码 virtio0@0x1000_1000(块驱动)+virtio1@0x1000_2000(网驱动),板注释要求 QEMU
+  块→bus.0/网→bus.1;但 qemu.rs 自 c5691ce3 把 net 放 bus.0 且块设备未固定槽→net 抢 bus.0 后块设备漂移,启动期 ext4
+  超块读挂死。**修复**:块设备固定 bus.0、net 改 bus.1(对齐板注释)+更新测试断言(xtask 128/128)。实测块读恢复
+  (ext4-superblock:ok)+eth0 被发现+boot:ok。**与 P4 无关**(P4 不碰块/设备枚举)。**暴露下游偶发 panic 已证伪为非 net**:
+  bus 修复后 -smp4 仍 ~50% panic(BootStaticBag/PPN overflow 多点=corruption),但**判决实测 -smp1 带 net 5/5 全绿、
+  -smp4 不带 net 也 3/5 panic → 一般多核 boot 竞态(substrate/HAL,非 net,用户早记录"多核不稳跑 -smp1")**。用户裁决:
+  接受 -smp1(net 已可靠可用),多核竞态不立项。**→ P4 外部冒烟/la64 boot 现可在 -smp1 跑(启动阻塞已解)**。见记忆 [[virtio-net-boot-bus-fix]]。
+- 2026-07-04 (P4-S4a+S5 收官 — ether 分层拆分完成 + IPv6 放行裁决跳过,**P4 五阶段全收官**). **S4a**(946dc87e)审计④:
+  ether.rs(1373 行)按文件拆 mod.rs(1011,结构体/类型/常量/4 跨层方法/trait/自由函数/pub 访问器)+link.rs(231,
+  L2/ARP 内部机制)+l3.rs(151,L3 重组/分片);单结构体单锁(按 impl 块拆非拆结构体,避 ARP 三角循环);子模块
+  use super::* 继承导入+私有自由函数,跨模块方法私有 fn→pub(super)(仅 ether 树内可见),字段经后代模块可访问;
+  net::protocol re-export 全在 mod.rs 外部零改。纯移动验收:集合差 313 逐字同基线(零回归,830 通过)+rv64/la64
+  双 no_std full-build ok(跨 crate re-export 保住)+重组集成测试单跑绿+rustfmt 后不变。**S4b(bridge 移出 device 层)
+  挂 P5**(风险大触 rtnetlink/namespace 多点)。**S5**(裁决跳过,取证):build_ipv6_ethernet_frame/dispatch_ipv6_at/
+  best_ipv6_route 均不存在(无真 v6 wire);现有 Icmpv6Event 处理是 synthetic/loopback(step_send.rs)已给 net.ipv6
+  46/46+ipv6_lib 76/77;demux Icmpv6 变体无 RX 消费者+零 LTP 靶依赖外部 v6 wire(§0)→零成本放行=未消费变体+死骨架,
+  按 §0/§5-1"可选/判决单测证价值"裁决跳过,真外部 v6 wire(TX 组帧/FIB/NDISC 学习/ICMPv6 RX)挂 P5/需求驱动。
+  **P4 全收官:审计 ①-⑩+R1-R4 主体全部落地;P0-P4 五阶段 asterinas-true 网络栈重构主体完成。** **余账(全景,REFACTOR_P4_v1.md §6)**:
+  真外部 v6 wire/S4b bridge 移出/D4 每 iface 锁/多 netns=P5;R1e bind 原子/多核并发/net_stress/D14b=环境轮。**Blocker(环境)**:
+  QEMU virtio-net 启动挂 devices:block:ok(pre-existing)→外部冒烟/la64 boot 本环境跑不了,纯重构由 compile+集合差+双架构覆盖。
+- 2026-07-04 (P4-S1..S3 落地 — 收尾三件正确性修:SAFETY 注释/分片 LRU/demux 校验和). 计划=REFACTOR_P4_v1.md
+  (三路取证)。**S1**(02793947)B 裁决:修正 NetNamespacePayload::drop 的错误 SAFETY 注释——原称 Index 无 Drop、
+  drop_in_place 是 no-op,与 index.rs:216 真 Drop(对 COMMITTED 槽 assume_init_drop)矛盾;SocketTable=13 个
+  Index<K,Cap<SocketIdentity>,N>,值带引用计数,drop_in_place 递归跑各 Index::drop,soundness 靠"表 drop 时已空"。纯注释零行为。
+  **S2**(580b8f3d)R3b:分片重组表满(上限 64)时 fragments.clear() 整表全清(65 伪造源首片冲掉全部合法在途=低危 DoS)→
+  照抄 conntrack 范式,Ipv4ReassemblyEntry 加 last_seen,抽 expire_and_cap_ipv4_fragments(TTL30s 惰性清扫+满时驱逐单个
+  最久未见,非全清);判决单测 ×3。**S3**(9488a7cc)R3a:硬件 demux 主路径全 new_checked(仅校长度)+virtio-net 无 CSUM
+  offload → 坏 UDP/TCP/IPv4 头被当合法投递;修=demux_ipv4 加 verify_checksum、demux_tcp/_v6 段=None→Malformed(删
+  demux_udp_v6)、demux_udp(v4/v6 合流)复用 UdpRxDatagram::parse_ipv4_packet(与 loopback 同款,保 UDP-over-IPv4
+  checksum==0 放行);帧构造器改填有效校验和(仿真实线路),判决单测 ×4(坏 IPv4头/UDP/TCP→Malformed,checksum==0→放行),
+  v4 TCP 提取测试改按字段断言。**验收**:每步 tx-subsystems 集合差 313 与基线逐字相同(零回归,830 通过=+3+4 新测试);
+  no_std rv64 full-build ok;虚拟 net→demux→socket 真路径单测单跑绿。**Blocker(环境)**:QEMU 外部冒烟矩阵(dns/ext/seq)+
+  la64/boot 本环境受阻——**virtio-net 存在时启动挂在 devices:block:ok(stash 对照证实 S2 无 S3 时同样挂,非 P4 引入,pre-existing)**;
+  无 net 设备时 boot:ok 正常。demux 正确性由 host 判决单测+真路径单测覆盖;真流量校验和有效性由 virtio 无 GUEST_CSUM 契约保证。
+  **Next**:P4-S4(ether.rs 分层拆分,纯重构;需 virtio-net 可启动环境补 全冒烟/la64)+S5(IPv6 零成本放行,可选,§0 默认不做真外部 v6)。
+- 2026-07-03 (P3-C R 族资源修复完成 — backlog 排空/所属 ns 表/引用环/TCP 记账/conntrack 界老化). 计划=REFACTOR_P3C_v1.md
+  (两路取证钉死每条 R2)。**S1**(c7db9a7f)R2b:listener close 排空 backlog+撤连接表(connected child 双注册是泄漏核心;
+  TCP/SCTP/UnixStream 三分支各撤对应表)。**S2**(a39e5669)R2c:step_tcp_cleanup 用 payload.socket_table() 所属 ns 表
+  (原硬编码 SOCKET_TABLE,仅 graceful-close 次路径中招)。**S3**(a39e5669)R2f:验证测试证 close 后 is_payload_live=false+
+  child retain_count 降,引用环随 S1/S2 自解(不需 Weak)。**S4**(167b9e2f)R2d:TCP backing clamp 64KB(仿 UDP),320KB→
+  ≤128KB,上报值不变;bulk 尾段 flaky 经 stash 对照证实既有非 clamp。**S5**(b98821e6)R2e:conntrack 两 Vec 加
+  last_seen+TTL120s+cap4096,insert expire_and_cap+命中刷新,bounded 表消无界增长与退化;裁量不改 BTreeMap(reply 非对称
+  需反向索引)。**S6 挂账**:R1e bind 原子需 -smp4 验证,与 R1c/D14b/多核同族移交环境轮。判决单测各步齐(R2b 握手→撤表/
+  R2c 隔离 ns/R2f 引用环/R2d clamp/R2e 老化 cap)。**验收**:每步集合差零真回归(唯一入列 R2c 单跑绿=毒锁级联)+六冒烟+
+  bridge netfilter_* 单跑绿+bulk32K+la64/boot。**P3 三波(A 接入/B 瘦身/C 资源)全部收官,审计 ①-⑩+R1-R4 主体落地**。
+  **Next**:P4(分层+IPv6 控制面+ICMP/DNS feature+R3a 校验和)或环境轮(LTP 全量+D14b+多核并发+net_stress)。**Blocker**:无。
+- 2026-07-03 (P3-B 模型瘦身完成 — enum SocketImpl/每socket单锁/就绪单源,R1d+R1b 构造性消除). 计划=REFACTOR_P3B_v1.md
+  (两路取证:迁移面全在 payload.rs 单文件+kind→槽无例外满射;io 缓存唯一读方 step_poll)。**S1**(ed037dc2):9 槽 Option
+  换 enum SocketImpl 单字段,8 元组 match 收单臂,5 访问器保签名→外部 72 调用零改。**S2**(92862a45):RawTcp/RawUdp 三锁
+  各并一(inner: SpinMutex<TcpInner/UdpInnerState>),R1d 双窗口(stale-available/corked read→clear 覆盖)构造性消除,
+  available→combine→send_slice→clear 一次锁获取,pub API 全保签名。**S3**(b07b8f98):io_snapshot 改实时派生,删 io 字段+
+  refresh_io_from_raw+27 调用点+3 accept 缓存写,R1b 撕裂随缓存消失。**过程抓修自锁死锁**:io_snapshot 派生内经
+  raw_recv_available→with_protocol 重锁 protocol,step_poll_ready 在 with_protocol 内调 io_snapshot→SpinMutex 自旋死锁
+  (dns 挂/epoll 不返回);修法=io_snapshot 提到 with_protocol 前算一次。**S4**(本轮):删无引用 SocketIoState::new。**验收**:
+  每步集合差 312=312+六冒烟+accept+bulk32K;la64/boot 过。R1 并发以构造性论证交付,-smp4 实证挂多核轮。**Next**:P3-C
+  (R 族资源修复 R1c/e/R2b-f)另立文档,或 LTP 环境轮补 D14b+全量+并发。**Blocker**:无。
+- 2026-07-03 (P3-A S4-S6 收官 — poll/F_SETFL/close 全进 FileOps,死代码清扫,D14b 移交 LTP 轮). **S4**(5a097f37):FileOps
+  增 poll_mask/poll_wait_token,OpenFile 增 file_ops() 访问器,shim 两 poll 助手换轨 trait 分派(ppoll/pselect/epoll 调用
+  点零改动)。**S5**(e3b426b4):增 on_set_fl_nonblock/on_last_close 带默认钩子;F_SETFL 特判、close 双相 bolt-on、进程
+  退出批量关闭车道三处换轨 file_ops();ioctl 保留(需 ctx/用户内存,Step 形 trait 无法承载,记账 P3-B)。**S6◐**:删死代码
+  linux_syscall/net.rs(FakeSocket 401 行,mod 从未声明);**范围修订**=D14b park 机械替换+yield_now 忙让步清理移交 LTP
+  环境轮(回归形态是 EINTR/调度时序,本机冒烟不敏感,无裁判不重构;忙让步可能掩护潜在丢唤醒,摘除须 LTP 兜底;S1 双表已
+  打好收敛地基)。**P3-A 特判核销**:read/write✅ poll/epoll✅ F_SETFL✅ close/exit✅;保留=ioctl(P3-B)/splice(语义合法)/
+  socketpair(拍板#4)/D14b(LTP 轮)。**验收**:七冒烟+accept 全绿,seq=close 见证;集合差稳定;boot/la64 过。**Next**:
+  P3-B(模型瘦身/单锁/D7)另立执行文档,或 LTP 环境轮补 D14b+全量回归。**Blocker**:无。
+- 2026-07-03 (P3-A 计划+S1-S3 落地 — R4a 修复/epoll 真阻塞,socket read/write 成一等 file 路径). 计划=REFACTOR_P3_v1.md
+  (P3 拆 A/B/C 三波,本波=上半接入 D13/D14)。**S1**(9abf8a9c) R4a 判决修复:两套 wait 注册表错配实锤(socket 载体只进
+  subsystems 表,epoll 只查 substrate 表→纯 socket 集合 epoll_wait 立即 0);照抄 eventfd 双表范式(同 id 双表登记+fire
+  双通知,新增 net/adapter.rs wait_routing+register_wait_queue/port_with_id);判决单测+QEMU epoll-external-smoke 双相
+  见证(未就绪真阻塞 1500ms+就绪 fire 真唤醒)。**S2**(1fea8ea7) FileOps trait(device.rs,同形 CharDeviceOps+nonblocking)
+  +net/file_ops.rs 为 Cap<SocketIdentity> 实现(read≡recv/write≡send,直调 step 族)+VFS Socket 臂 EINVAL→委派;判决单测
+  =loopback 对经 OpenFile::step_write/step_read 乒乓。**S3**(372a352a) io.rs read/write socket 特判摘除,socket 与 pipe
+  同走 v3 drive() 通用路径(S1 双表是 Yield 解析前提);保留 mailbox-less poll-gate;记账=短写可能/itimer-EINTR 打断待
+  LTP 复核。**验收**:七冒烟(ext/tcp-lo/udp-lo/dns/seq/bulk32768/epoll)+accept 全绿;集合差=基线+4 新测试名(毒锁区单跑
+  绿);unit 仅既有 ext4;busybox-boot 过。**Next**:S4 poll 家族统一→S5 ioctl/F_SETFL/close→S6 等待收敛+清扫。**Blocker**:无。
+- 2026-07-03 (P2-S7 扫尾完成 — **P2 全部 S 步收官**,外部网络真实可用). ①IPv6 demux 放行:ether 入口 v6 帧走 demux 新增
+  v6 臂(TCP/UDP 事件带 v6 端点+完整段,解析器 P1-S4 起双栈),ICMPv6/NDISC/分片归 P4,判决单测×2 绿。②Cap 加固先行块:
+  events/device_tx 全部入口(3 process fn/半开车道 listener/3 过滤谓词/feed readiness)换 downgrade().observe(guard),
+  裸 deref 清零(clone 加固归 P3)。③死代码核查:假握手 wrapper S3 已删,_with_family 仍被内核内跨 netns connect 合法
+  使用(退役归 P3+),无新增死代码。**P2 验收**:五冒烟矩阵全绿(ext/tcp-lo/udp-lo/dns/seq)+accept(hostfwd)+bulk 32KB;
+  集合差=基线+3 已知新测试名(毒锁区单跑全绿);la64 构建/busybox-boot 过;字面 wget rc=0 受限分支既有 busybox
+  bootstrap path-not-found(非网络),由等价 C 冒烟覆盖。**Next**:P3(上半接入:FileOps trait D13+await_wait_source D14
+  连带修 epoll-on-socket R4a)或用户决策;既有测试债(packet_event_tests 三件 P1 前语义)留账。**Blocker**:无。
+- 2026-07-03 (P2-S4/S5/S6 三连完成 — 多段 TX 32KB 零差/端口轮转 4 连各新/UDP 收敛 smoltcp+DNS 打通). **S4**(137482ea):
+  process_tcp_tx_socket 改有界抽干(16 段/轮,Busy 背压保留);灵魂单测一轮 ≥2 段;QEMU tcp-external-bulk-smoke 32768/32768
+  字节到宿主(24 段 97ms)。**S5**(4ae7117c):三处临时端口扫描换共享 AtomicU16 轮转;ISN 相异单测绿;tcp-external-seq-smoke
+  连续 4 连各用 49152-55。**S6**:RawUdpSocket 双 VecDeque 删除,smoltcp ring 即队列(RX=accepts/process+bind 钩子挂
+  step_bind、recv=recv/peek+UdpMetadata、TX=send_slice/dispatch+MSG_MORE cork 留外);源地址=入队时 payload 层解析
+  (绑定/loopback 规则/路由 preferred_src)写 tx_src_hint,DrainSocketUdpTxDrain 增 src;fork 增 peek_send/payload_recv_bytes/
+  payload_send_bytes 三访问器;容量=ring 实配(上限 32KB);close 排空双 ring;5 个 raw 合同测试更新 bind-first。**两只
+  拦路虎全实测抓获**:①sendto 收尾 drive_udp_loopback_after_sendto 无条件 pop 灌 lo 队列偷走外部数据报(DNS 查询死在
+  loopback)→peek 谓词 gate 修复;②车道 emit 用 0.0.0.0 当源→改 dispatch 解析的 drain.src。10.0.2.3 静态 ARP 就位。
+  **验收**:udp-external-dns-smoke dns-ok(13ms 查询/应答,A 198.18.0.251);四冒烟+accept 全绿;集合差=基线+3 新测试名
+  (毒锁区单跑全绿);la64 构建/busybox-boot 过。**Next**:S7 扫尾(IPv6 demux 放行+Cap 加固先行块+死代码清扫)→§4 矩阵。
+  **Blocker**:无。
+- 2026-07-03 (P2-S3 入站真握手完成 — 外部 accept 真机打通,附带证实 net-git stage3 冷 RX 悬案+落混合 pump). 外部 SYN
+  分支废除假握手(手工 Connected child 直进 accept、SYN-ACK 不发),重写为真握手三分支:表命中喂段/首 SYN 建半开 child
+  (`listen_endpoint`+喂 SYN,smoltcp 排 SYN-ACK)/半开兜底喂段(终 ACK 走此路);晋升复用 loopback 的
+  promote_connected_stream_and_publish_accept(晋升时才入连接表,完全对称);SYN-ACK 初发+RTO 重传=device-TX 新增
+  **半开车道**(遍历 listener connecting backlog 调 dispatch_segment,smoltcp 门控)——**§6-1 iface trait 免了**(P1 后
+  握手机制已 iface 无关)。假握手 wrapper 删除;镜像灵魂测试重写(SYN→断言半开+SYN-ACK ack 号→ACK→断言晋升)。新增
+  tools/user/tcp-external-accept-smoke.c 验收载体。**验收**:hostfwd+宿主 nc 真机 3/3(pcap: SYN→SYN-ACK→ACK→双向
+  数据);回归全绿(tx-subsystems 308=308 集合全同/unit 仅既有 ext4/出站 ext-ok/loopback tcp+udp/busybox-boot)。
+  **附带发现**:QEMU virtio-mmio 冷空闲态 RX 帧进缓冲但不举中断(探针 pump-rx-ready=1/extirq=0)=net-git stage3 悬案
+  证实;按 §6-4 预案落混合形态=IRQ(活跃流)+反应器 WFI 空闲拍 5ms pump 兜底(exec.rs);纯 IRQ 之谜单独立项。**Next**:
+  S4 多段 TX。**Blocker**:无。
+- 2026-07-03 (P2 connect-resume 终局:真凶=两个可修 bug,"平台限制"说证伪,坑5 关闭,外部 TCP 全生命周期打通). 用户
+  追问真因,三轮死磕改判。新探针(eu-ret/await-ok/extirq-wake)证明 **longjmp 其实回来了**(旧插桩只数"出发"未数"回程
+  落点"),线程 park 在 entry_wait.await(thread_future.rs:635)等一个永远无人解决的 slot。排除法收口:唯一"longjmp 但
+  不留 slot 记号"的路径 = **on_external_irq 的 Wake→Reschedule**。**真凶①(trap 纪律违反)**:时钟中断打断用户态先
+  hand_off_timer_preempt 再 Reschedule,外部设备中断什么都不做直接 Reschedule→板级 from-user 无条件 longjmp→线程
+  静默死亡;P2-S2 首开 virtio-net 中断,"设备 IRQ 打在用户态时间片"是内核史上首次(UART 同威胁:用户态时间片内敲键盘
+  同样致死,从未被注意)。修复=on_external_irq 增 TrapFrameMut(HAL trait+rv64/la64 两板+3 测试桩),from-user Wake 走
+  时钟同款 hand-off。**真凶②(virtio-net 半拉子 NAPI)**:ack_interrupt_and_fire 忙时 disable_interrupts 但全仓无重开
+  点(enable 仅 boot 一次)→首次中断即永久关闭设备通知→修①后 GET 已发、响应到网卡但不 ACK/read 不醒(服务器重传×6)。
+  修复=删设备层抑制(PLIC mask 窗口已节流)。**旧判决为何错**:pump 实验时 IRQ 开着、真凶①照常杀线程;net-git pump 能过
+  是因为从未开设备中断。**验收全实测**:tcp-external-smoke ext-ok ×4 稳定,pcap 全生命周期零重传(35ms);回归全绿=
+  xtask unit 仅既有 ext4 失败(stash 对照)/tx-subsystems 失败集合 308=308 全同/la64 构建过/busybox-boot smp4 ok/
+  loopback tcp+udp ok。**推论**:A′/B 决策作废,阻塞 connect/read 的 park→IRQ 唤醒→重入正路已通。详见
+  REFACTOR_P2_v1.md §7.1。**Next**:P2 剩余 S3(入站真握手)→S4(多段 TX)→S5(端口轮转)→S6(UDP/DNS)→S7;§4 矩阵补
+  busybox wget rc=0。**Blocker**:无。
+- 2026-07-03 (P2 connect-resume 追加实测:pump 证伪 + net-git 真机制复核)【已被终局改判取代,见上条】. 无条件 ~2ms delegate pump 实测**仍不恢复
+  connect**(pcap 停 ACK)——**证伪"poll-pump 兜底"**(pump 唤醒 delegate,gap 在 run_thread 用户态重入,正交)。**推论:
+  4-A/4-B 共享同一 gap,pump 无效**。复核 net-git a1b7417d/3b7bfe26 几乎全诊断、无线程恢复修复——真机制=stage3
+  c8389512 的 **RX drive window 在 connect syscall 自身上下文同步驱动 RX**,SYN-ACK 在 connect 执行期处理、连接在
+  connect 自身 trap-shell 上下文 Established、正常返回,**不 park 不跨任务唤醒**,从源头绕开 enter_userspace bug。**正解=
+  A′ inline external-connect drive**(仿 drive_tcp_loopback_after_connect,connect syscall 内同步驱动设备直到 Established);
+  障碍=设备驱动在 tx-kernel boot delegate、connect 在 tx-shims,需 P-having"同步 pump 当前 netns 设备一轮"入口(shim
+  层 loopback drive 的外部 analog)。pump 已撤,工作树干净。根因+路径写入 REFACTOR_P2_v1.md §7。**Next**:实现 A′(中等
+  工作量,层次是难点)or 用户决策。**Blocker**:connect-resume(平台执行模型/层次)。
+- 2026-07-03 (P2 connect-resume 深度调试根因锁定 — 纯 B 死磕)【"平台限制"结论已被终局改判证伪,见最上条】. 用户要求死磕。内核 AtomicU32 计数器全链路插桩
+  (delegate→process_tcp_event→publish_to→step_connect→connect_impl→run_thread→enter_userspace)+throttled dump。
+  **计数器实测**:es=1 bc=1 pr=1 wk=2(收 SYN-ACK/到 Established/晋升/fire SPACE 唤醒 1 订阅者)、ce=2 sy=1(step_connect
+  跑两次,二次见 Connected)、ci=park1/woke1/eisc-ok1(connect_impl await 返回、EISCONN 分支命中、**return Return(0)
+  执行**)、as/be=1/1(run_thread 存返回值、**调用 enter_userspace_with_context**)、**tr=connect1/write0/nr=203(线程从没
+  trap 到 write)**。**逐层判决**:网络栈全对(wk=2 证明非丢唤醒)、syscall 层全对(connect_impl 返回 0)、断点在
+  enter_userspace_with_context 用户态往返。**根因**:被跨任务事件(net IRQ→delegate→fire_send)唤醒的阻塞 syscall,
+  run_thread 重入用户态时 enter_userspace(board trap.rs:813→tx_rv64_enter_userspace_save_resume)的 per-hart
+  reschedule-longjmp 往返在"net 唤醒的 reactor poll 上下文"下不完整——sret 进用户态后 write 的 trap 未 longjmp 回本次
+  poll,线程不推进。**平台 trap-shell/thread-future 重入架构限制,与网络栈无关**。net-git 用 poll-pump(A)间接绕过
+  (stage5 a1b7417d 自述),本轮比其更深钉一层。**插桩已全撤,工作树干净,编译通过**。根因写入 REFACTOR_P2_v1.md §7,
+  含两修复路径(A poll-pump 兜底=plan 4-B 内建降级/B 架构修复 defer 回 trap-shell)。**Next**:用户决策 A(快、已验证、
+  wget rc=0)vs B(正统大工程,gdbstub 佐证后独立立项)。**Blocker**:connect-resume(非网络,平台执行模型)。
+- 2026-07-03 (P2 S0-S2 实施 — 外部 TCP 三次握手在真网卡完成,4-B IRQ). 用户拍板 1-A/2-A/3-A/**4-B(改选 virtio IRQ)**。
+  S0=cherry-pick net-git 51fc5e5b(virtio1 @0x1000_2000,eth0 注册成功,启动 devices:net:eth0:ok 替代 init-skip:mmio)。
+  S1=step_connect 增 try_tcp_external_connect(无本地 ns 拥有 remote 时 connect_endpoint 进 SynSent+连接表注册,device_tx
+  既有 Connecting 车道自动送 SYN)+process_tcp_event established 分支 Connecting→Connected 晋升(fire SPACE)+EPIPE
+  假设修(无内核对端按 may_send 判)+boot 静态网关 ARP 10.0.2.2;灵魂测试移植 net-git external_connect_tests 326 行
+  2/2 绿(commit 285585ab)。S2(4-B)=IrqIf 增 NET_IRQ(rv64 virtio1=PLIC IRQ2)+irq.rs net_rx_irq_handler(顶半部
+  mask+pending)/drain_net_rx_pending(底半部 ack+kick+unmask)+反应器循环挂 drain+设备开中断;wait_source 补 level
+  peek 回退;新增 tcp-external-smoke.c 验收载体(commit 1e96a5e1)。**里程碑(pcap 实测)**:外部 TCP 三次握手在真
+  virtio-net 上完整完成 SYN→ARP→SYN-ACK→ACK,稳定复现——S1 发 SYN + S2 IRQ 收 SYN-ACK 驱动 smoltcp 端到端работает。
+  loopback 冒烟不退化,host 零新增失败。**KNOWN-REMAINING 坑5(已根因)**:阻塞 connect() 握手完成后不恢复——net-git
+  stage5(a1b7417d)实测证明该恢复**依赖 poll-pump(A)的主动周期 re-poll**,纯 IRQ 单次 fire SPACE 唤醒不足以让反应器
+  重跑 step_connect(deadline WFI 唤醒也无效,静态分析 fire→publish_to→wake_by_ref 链齐全但实测不恢复,需内核插桩
+  定位)。这正是 4-B 文档纪律预告的降级点。**Next**:补 gated poll-pump(A)闭合 connect-resube→wget rc=0,或用户决策。
+  **Blocker**:connect-resume(非 RX,RX 经 IRQ 已通)。
+- 2026-07-02 (P2 执行计划落盘 — docs/design/07_net/REFACTOR_P2_v1.md). 三路取证:2 并行 Explore(外部 TX/路由、外部
+  RX/connect 断点)+orchestrator 自采 net-git 分支闯关实录(旧架构打通外部 TCP 的完整 commit 序列=参考答案)。**核心
+  发现**:外部路径"四肢健全、心跳缺失"——TX 车道(组帧/ARP/virtio,含 is_tcp_connecting 搬运)齐备空转,RX 链 P1 后已通
+  到 process_segment;真正断点只有两处:①出站无人调 connect_endpoint(全仓唯 loopback 握手调过,smoltcp 停 Closed,
+  dispatch 恒 None);②入站 SYN 被手工假 child 劫持(smoltcp Closed+枚举直标 Connected+跳过 backlog 直进 accept,
+  SYN-ACK 不发;连锁:P1 established-RX 对假 child 无效,accepts() 拒收)。**net-git 八关对照表**(文档灵魂):时钟/
+  established-RX/ISN 三关已被 P0/P1 结构性拆掉;剩余=virtio1 MMIO(51fc5e5b 可借)/出站 connect(6e63bd29)/RX 驱动窗
+  (c8389512)/静态 ARP+poll-pump+坑5 阻塞 connect 不续跑(44d7895c,D14 族!)/EPIPE 假设(3b7bfe26,本分支原样在)/端口
+  轮转(9d840ecb)/多段 TX(9c919782,本分支同款单段)/UDP+DNS 三小坑。**方案**:S0 设备就位→S1 出站心跳(connect_endpoint
+  +静态网关 ARP+EPIPE 修,灵魂测试=移植 external_connect_tests 326 行)→S2 RX 驱动窗+坑5 专项→S3 入站真握手
+  (process_first_syn 泛化,需 iface 回程 trait)→S4 多段抽干→S5 端口轮转→S6 UDP 进 smoltcp(完成 P1 遗留)+DNS→S7
+  IPv6 demux 放行+Cap 加固先行块。验收=guest wget http://10.0.2.2:8000 rc=0(slirp 转宿主 http.server);外网验证
+  矩阵+pcap 方法已写入。**待拍板 4 设计点**:①iface 回程 trait(推荐)vs 复制握手;②IPv6 demux P2 放行(推荐)vs 全推
+  P4;③UDP 收敛 P2 内做(推荐)vs 再缓;④poll-pump(推荐,net-git 已验证)vs virtio IRQ。**Next**:用户拍板→S0 开工。
+  **Blocker**:无。
+- 2026-07-02 (P1 实施完成 — S0–S5 六连 commit 2fc0a3ea…402a441d,loopback 收敛 smoltcp 单通路). 用户拍板四设计点全 A。
+  S0 断 TCP 直拷(选择器+直拷函数+无界塞);S1 删 rx_buffer(recv_len/recv_bytes/recv_available 换 smoltcp recv/
+  recv_slice/peek_slice/recv_queue 实现,签名不变上层零改;通路C=demux 附带完整段喂 process_segment,删 ack_bytes=
+  max(1,payload_len) 假记账);S2 删 tx_buffer 影子(send_available=ring 头寸-corked,删平账/手工 peer_space 流控,
+  背压=smoltcp 窗口);S3 删 last_syn_ack(backlog 重传闭包改纯 dispatch_segment,**语义修正:RTO 未到返回 true 保留
+  半连接,原 false 语义会误杀**;has_connected 闩锁→before/after is_active 边沿);S4 UDP 杀两处直拷全走 lo 队列真包
+  转运+emit/parse 补 v6 臂(直拷曾家族无关,不补则 v6 回环 UDP 静默丢包)——**范围修订:UDP 队列保留**(实施中查实其同时
+  服务外部 UDP 车道 step_device_tx+外部 RX,smoltcp 接管 UDP 数据推 P2 统一);S5 内联 5 处 PollContext(ZERO) 解冻。
+  **灵魂测试绿**:丢数据段→RTO 内不重传→拨钟→重传→收齐(tcp_lifecycle.rs 尾部)。**S4 抓出并修复 SMP 竞态**:smp4 下
+  UDP smoke 1/3 概率 panic(cap.rs:349)=poll 路径触碰并发 close 退休的外来 Cap,裸 deref/clone 对退休槽 panic;修复=
+  observe(guard) 检活取 IdentRef 无 Cap deref+publish 用 borrow_current_guard(**EBR 禁嵌套 guard,直接 guard()
+  6/6 必炸,epoch/mod.rs:59-61 自述**);修后 smp4 8/8 绿。同形裸 deref 遍布 net(TCP poll 同暴露),系统性加固归 P3。
+  **验证**:host 套件失败集合与基线逐条相同(305 既有,每步 stash/集合差核对);UDP 测试族单跑 10/10;单核冒烟 tcp/udp
+  各 2/2(用户告知本机多核不稳,后续验证单核为准)。**未做**:LTP 全量对照(本机无 sdcard 镜像)——接触 LTP 环境时补验
+  recv01/recvfrom01 单跑。**Next**:P2(外部网卡同一 poll)细化。**Blocker**:无。
+- 2026-07-02 (P1 执行计划落盘 — docs/design/07_net/REFACTOR_P1_v1.md). 2 并行 Explore 调查员(五缓冲用途图/UDP+就绪链)
+  + orchestrator 亲验(直拷选择器/段级路径/外部旁路/LoopbackIface/NetDeviceOps)。**核心修正**(对 v2 §5 P1 与审计粗颗粒
+  结论):loopback TCP 握手与段级传输**已是真 smoltcp**(establish_smoltcp_loopback_on_iface 两端真到 Established;
+  poll_egress_one=dispatch_segment);真正病灶=**三条 TCP 通路并存**(A 直拷流:tcp_uses_direct_stream 按 has_connected
+  分流,手工Connected连接走 record_tcp_stream_bytes+ingest_rx_bytes_unbounded 无界直塞;B 段级+影子记账:字节双住
+  smoltcp ring+tx_buffer 镜像、rx 经 drain_staging 搬进 rx_buffer 用户才读到;C 外部 demux 旁路:裸塞+按收到载荷长度
+  猜测性释放 ack_bytes=max(1,payload_len) events.rs:287)+**两条 UDP 通路全直拷**(smoltcp udp::Socket 纯摆设,数据住
+  rx/tx_datagrams)。**方案**:S0 断直拷→S1 删 rx_buffer(recv 直读 recv_slice,通路C改喂 process_segment)→S2 删
+  tx_buffer 影子(背压=smoltcp 窗口)→S3 删 last_syn_ack(P0 解冻后 smoltcp 自重传)+protocol_state 瘦身→S4 UDP 进
+  smoltcp→S5 扫尾(两处 PollContext ZERO 时戳+内联驱动改跑 poll);每步独立提交可回滚。**灵魂测试**=loopback 丢段重传
+  (从 LoopbackIface 队列人为丢段+拨钟越 RTO→仍收齐;直拷世界无"段"概念,只有段级+活钟能过)。**风险已录**:recv01/
+  recvfrom01 冷启动假阳前科须每步单跑;无界塞→背压是修 bug 型行为变化。**待拍板 4 设计点**:①LoopbackIface P1 留骨架
+  P2 设备化(推荐)vs 即改 NetDeviceOps;②通路C P1 改喂真段(推荐,否则 rx_buffer 删不净)vs 留 P2;③corked_tx 保留
+  (推荐,MSG_MORE 暂存非双份)vs 删;④send 后同步跑一轮 poll(推荐,时延等价)vs 纯 kick 异步。**Verification**:文档链接
+  3/3 有效,v2 §5 P1 已回链并标注口径修正;全部 file:line 按 5ab58517,orchestrator 对关键锚点逐个 Read 亲验。
+  **Next**:用户拍板 §6 四点 → 按 S0 开工。**Blocker**:无。
+- 2026-07-02 (P0 教学讲解落盘 — docs/design/07_net/REFACTOR_P0_WALKTHROUGH_v1.md). 用户读不懂原始 diff,要求逐文件
+  总结改动并配流程图,写进文档。新文档=提交 5ab58517 的配套读物:§0 桥的整体图景+8 文件角色表;§1-8 逐文件"改动前/
+  改动后"代码+要点(默认0安全带/Relaxed 理由/纳秒-微秒换算/锁序/为何 A 方案调用点零改动/判决性测试三步对应 smoltcp
+  dispatch 三分支);§9 两张图——9.1 全局数据流(syscall 写端②+delegate 写端①→NET_NOW_NS 桥→with_context 读端→smoltcp
+  定时器)、9.2 SYN 重传时间线(旧代码卡死在"定时器永不到期"步)。P0_v1 Status 行已回链;链接检查通过。**Next**:该文档
+  未提交(用户在读),随下批改动一并入库;P1 细化待用户发话。**Blocker**:无。
+- 2026-07-02 (P0 实施完成 — 解冻时钟,A 方案落地,全四层验证过). 用户拍板 §6 **A 全局 `NET_NOW_NS`** 并要我实现。
+  **四改动**(=P0 doc §2/§7):① 新建 `crates/tx-subsystems/src/net/clock.rs`(`NET_NOW_NS:AtomicU64` 默认0 +
+  `net_set_now_ns`/`net_now_instant`,`net/mod.rs` 挂 `pub mod clock`);② `protocol/tcp.rs` `with_context` 换常驻
+  `static CONTEXT_IFACE:SpinMutex<Option<Interface>>`(SpinMutex::new 是 const、Interface 全字段自动 Send,已验)+
+  每次 `cx.now=net_now_instant()`;③ `delegate/runtime.rs` `net_delegate_step_once` 开头
+  `net_set_now_ns(try_from(total_micros).unwrap_or(0).saturating_mul(1000))`;④ `tx-shims/linux_syscall/mod.rs`
+  `dispatch_inner` 入口 `syscall_publishes_net_clock(nr)`(connect/send*/recv*/accept*/shutdown/setsockopt/ppoll/
+  pselect6*)→`net_set_now_ns(P::read_ns())`。**测试**(net/tests/clock_tests.rs 新建,mod 挂 tests.rs):桥接单测绿;
+  判决性重传单测绿且**红判实测**(把 cx.now 钉回 ZERO → 恰在 syn3 断言红,证明精确区分新旧;smoltcp dispatch 逻辑亲读
+  fork tcp.rs:2278-2326/2535 确认 SYN→set_for_retransmit→时间不动 None→越 RTO(300+4×100≈700ms) 重发)。
+  **验证**:tx-subsystems 全量 816过/305败,失败集合与 stash 基线 comm 集合差**为空**(305=分支既有 bridge/namespace 系,
+  P0 零新增,+2=新测试);`xtask unit` tx-kernel 75/tx-scripts 56 过,tx-shims 编译错+tx-ext4 truncate 败 stash 对照
+  **均既有**(注意:xtask unit HOST_PACKAGES 不含 tx-subsystems,须手动 `cargo test -p tx-subsystems --lib`);QEMU
+  rv64:busybox-boot 哨兵 ok,`init=/bin/tcp-loopback-smoke`→`tx-n68-tcp-ok`,udp→`tx-n68-udp-ok`,临时打印观测
+  `NET_NOW_NS` 跨 delegate 步 588807500→611921000→641242000 ns **单调递增**且首步前已非零(=改动④先行写入),打印已删。
+  **发现**:busybox profile 的 `/bin/busybox` bootstrap exec 报 path-not-found 落回内嵌 fixture(既有,与 P0 无关,
+  故 shell-test 无交互 shell;绕道 `init=` 直启冒烟 bin)。**Next**:P0 一个 commit 入库 → P1(loopback 恢复 smoltcp
+  委托+瘦 socket)细化。**Blocker**:无。
+- 2026-07-01 (P0 执行计划落盘 — docs/design/07_net/REFACTOR_P0_v1.md). 用户要求逐阶段推进,先做 P0"解冻时钟"
+  并要求教学式写清(现场赛要脱离大模型手写)。**调查实证**(全带行号):① `RawTcpSocket.socket` 就是
+  `Box<tcp::Socket>`(tcp.rs:25)——TCP 状态机走 smoltcp,非绕过(当场纠正我打断前的口误);② smoltcp 干活读
+  `cx.now()`(fork socket/tcp.rs:287/1439/1711/1785 重传/RTT/keepalive);③ 冻结点 = `with_context`(tcp.rs:712-720)
+  每次新造 `Interface(Instant::ZERO)`,3 调用点 connect/dispatch/process(tcp.rs:408/428/449);④ **反直觉**:delegate
+  生产路径早有真实时间(`driver.now()` runtime.rs:206;init/net.rs:227-229 用 `P::read_ns()`),但传到
+  `PollContext.timestamp` 就断,从没接进 `with_context`;⑤ 断因=`with_context` 在 P-无关的 tx-subsystems 层,够不着
+  `P::read_ns()`/`monotonic_now_ns::<P>`(wall_clock.rs:128)→ 当初填 ZERO=D3 `NET_NOW_NS` 的由来;⑥ fork 已备设 now
+  接口(interface/mod.rs:128 `pub now`/:275 context/:799 set_now,无需改 fork)。**P0 方案**(四改动带代码):新建
+  `net/clock.rs` 全局 `NET_NOW_NS:AtomicU64`+`net_set_now_ns/net_now_instant`;`with_context` 改常驻
+  `CONTEXT_IFACE:SpinMutex<Option<Interface>>`+用前 `cx.now=net_now_instant()`;delegate `net_delegate_step_once`
+  开头 store `driver.now()`;syscall 入口 store `P::read_ns()`。**安全性质**:NET_NOW_NS 默认0→不写它的代码(含多数现有
+  单测)行为不变,只 delegate/syscall 解冻;常驻 Interface 对 loopback(Medium::Ip 无ARP)零行为变化;代价=CONTEXT_IFACE
+  全局锁串行化(锁序统一不死锁,P3 收敛)。**测试**(四层):桥接单测/**判决性重传单测**(connect→SYN→立刻dispatch=None→
+  NET_NOW_NS+2s→dispatch=Some 重传;旧码恒None红新码绿)/QEMU观测now递增/`xtask unit`+loopback LTP 不退化。
+  **Verification**:P0 doc 内部链接 2/2 有效,v2 §5 P0 段已回链;file:line 均亲验(本轮逐个 Read/grep)。**待确认**:§6
+  设计点 A 全局桥(推荐,本文按此写)vs B 显式穿参。**Next**:用户确认 A/B → 可开写 P0 代码。**Blocker**:无。
+- 2026-07-01 (v2 补回漏写的"上半·接入"战线 — docs/design/07_net/REFACTOR_PLAN_A_v2.md). 用户核对 v2 后指出
+  两条亲点怀疑没写进计划:**⑤ 无文件系统接口**(socket 非 file-ops、靠 syscall `if 是 socket` 特判)与
+  **⑥ wait_shim 与其他子系统不同**。复核:审计 NET_AUDIT_v1.md §5.1/§5.2 两条证据齐全,但 **v1 与 v2 初稿都漏/降级
+  了它们**(不属引擎四主轴 → 被漏在外;⑥ 曾被埋在 D7 就绪子条目)。**修正**:把 v2 重构为**两条战线**——① 下半·引擎
+  (D1-D4 不变) + ② **上半·接入**(socket 融入统一 fd/file 抽象):新增 **§1-bis「两条战线」框架 + 决策 D13**(引入
+  `FileOps` trait 同形 `CharDeviceBinding.ops`,socket 实现之、`step_read/write` 的 socket arm 从 EINVAL
+  `vfs/execution.rs:396-399,649-652` 改委派 ops、删 `io.rs:1946/2229`+`fs_basic.rs:1516`+`epoll.rs:119`+
+  `splice.rs:69` 全部特判=Linux `socket_file_ops`/asterinas `Socket: FileLike`)+ **决策 D14**(socket park 从
+  legacy `WaitToken`+`yield_now` 忙让步 `net/execution/mod.rs:97-131`/`helpers.rs:1703-1707`/`socket.rs:877-1078`
+  收敛到 `await_wait_source`,同其余 8 fd 子系统,连带修 R4a epoll 对 socket 无法阻塞)。同步进 §2 架构图、§4 模块
+  (新建 FileOps/修 EINVAL+wait/删特判)、P3(标题+②⑤⑥⑨...)、附录证据锚点、footer、记忆 `net-refactor-audit`。
+  **同根**:socket 一旦是一等 FileLike(⑤),就绪/等待自然与其他 fd 同构(⑥+R4a)。**Verification**:grep 复核 ⑤/D13/
+  D14/FileOps/await_wait_source 已进 §0/§1-bis/§2/§3/§4/§5/附录/footer 全部位置且连贯;file:line 均引自审计既有锚点
+  (未新造)。**Next**:待用户确认 v2 §9 四个开放问题 → 拆 P0 执行计划。**Blocker**:无。
+- 2026-06-30 (网络栈重构方案修订 A1→asterinas-true — docs/design/07_net/REFACTOR_PLAN_A_v2.md). 用户追问
+  "全交给 smoltcp 是否效率低/缺功能/上真机有问题"+"我当初为何设计成 smoltcp 不负责全部模块"。2 个并行调查员
+  (general-purpose)亲验 `/home/msp/learning/asterinas` + `external/smoltcp-asterinas` 源码 → **推翻 v1 的 A1
+  形态**(拥抱 smoltcp `Interface`+`SocketSet`+`iface.poll()`)。硬证据：① smoltcp `SocketSet` 平铺无索引、
+  `poll()`=O(socket×包)、每包 O(n) 线性 `accepts()`(`socket_set.rs:44-46`,`iface/interface/tcp.rs:21-30`,
+  `mod.rs:447-453/536-549/654-755`)；② asterinas(fork 来源)**刻意不用** SocketSet/poll(`aster-bigtcp/lib.rs:3-11`
+  "cannot satisfy general-purpose OS in efficiency")，改自有 `SocketTable` 哈希 + 手写 `poll_ingress/egress` +
+  真实 jiffies 时钟(`common.rs:43/225-267/242`,`time.rs:5-8`)，smoltcp 只做 per-socket `process/dispatch/accepts/
+  connect`(`tcp_conn.rs:318/569/616/651`)，每 iface 一常驻 `Interface`(`poll_iface.rs:18-21`)，socket=`enum State`
+  (`stream/mod.rs:57-78`)——**= 用户 v9 §9.1 原设计**。**病根精确化**：§9.1 说"不调 poll()"对，但漏写"须持有一个
+  常驻 Interface 供 `context_mut()`+时钟"→ 实现填成 `with_context` 一次性 `Interface(ZERO)` → 冻结 = ①③⑩R2a 总
+  源头(设计漏一句 + AI 无监督填错)。**smoltcp 固有限制(已记账)**：Go-Back-N/SACK 解析却忽略(`tcp.rs:2283-2286`)、
+  无 PMTUD、`max_burst` 窗口钳(`packet.rs:144-161`)、单线程每 iface 一锁(`mod.rs:433-438`)、IPv6 分片缺
+  (`mod.rs:1300-1301`)。**用户决定**：单 netns 先行(多 netns/veth/bridge 留 P5；难点不在多核而在跨 netns 转发)、
+  真机网卡驱动暂缓(QEMU/virtio 范围内重构)、SACK 想要但后说(当前接受 Go-Back-N)。**交付**：REFACTOR_PLAN_A_v2.md
+  (四主轴定 D1 asterinas-true/D2 单netns/D3 NET_NOW_NS/D4 每iface单锁；P0 解冻常驻Interface+真实时钟 → P1 loopback
+  恢复smoltcp委托+瘦socket → P2 外部网卡同一poll → P3 socket瘦身+单锁+就绪/等待统一 → P4 分层+IPv6+ICMP/DNS →
+  P5 多netns)；v1 标记被取代留痕；记忆 `net-refactor-audit` 已同步。**Verification**：v2 内部链接 2/2 有效；证据
+  三方合一(用户原设计 + asterinas 实测 + smoltcp 源码)，逐条 file:line。**Next**：待用户回应 v2 §9 开放问题
+  (netfilter/smoltcp 协同边界、范围确认 netlink/SCTP 不动、是否先做 loopback-only 最小原型、P5 时机) → 拆 P0
+  执行计划。**Blocker**：无。
+- 2026-06-29 (网络栈重构前审计 — docs/design/07_net/NET_AUDIT_v1.md). 用户基于 origin/main 新建
+  `feature-network-refactor` 分支准备重构网络栈，要求**先调研现状问题、验证、不无中生有**。方法：5 个并行
+  调查员(general-purpose)按正交维度取证 `crates/tx-subsystems/src/net/`(41080 行)，orchestrator 逐条复核
+  行号。**核心病根**：smoltcp 被降格为"wire 编解码 + 仅 loopback 单连接状态机"；**无持久 Interface**
+  (`protocol/tcp.rs:712-720` 每次 `new` 一次性 `Interface(Instant::ZERO)` 用完即弃)→ 时钟永久冻结 → 无真
+  重传 / 外部 TCP RX 旁路且丢 seq/ack(`packet/demux.rs:31-36`) / 外部 connect 不发 SYN(`step_connect.rs:58-118`)
+  → **外部 TCP 结构性不可用**(loopback 靠同步直拷 `step_send.rs:363-426`)；socket 模型双数据通路 + 9 个
+  `Option<RawXSocket>` 平铺(`payload.rs:33-53`) + TCP 5 份缓冲(`tcp.rs:24-33`)；`ether.rs:121-133` 单结构体
+  融合 L2/L3/ICMP/设备TX + RX 重复编解码；socket 经 syscall `if 是 socket` 特判(非 file-ops)接入，统一
+  `step_read/write` 主动对 socket 返 EINVAL(`vfs/execution.rs:396-399,649-652`)。⑩ IPv6 数据路径几乎全断(外部RX `ether.rs:279` Unsupported / 无以太v6 TX / loopback 0 v6 / 无v6路由 / NDISC只写不学 / ICMPv6只收不发；仅控制面有形)。**修正/证伪用户怀疑**：
+  ⑥ **改判◐部分证实**(底层 `WaitSource` 原语统一, 但 net/socket 接入停在 legacy `WaitToken`+`yield_now` 忙让步、其余 8 个 fd 子系统已迁 `await_wait_source` → net 接入形态确与其他不同)；⑦ 4 万行非无用测试/死
+  代码(测试 ~34% 健康 / `#[ignore]`=0 / net 内 `#[allow(dead_code)]`=0 / `todo!`=0；膨胀=协议广度)；
+  ⑧ net core 与子系统边界其实较健康(不碰 fd 表、process 仅 `Cap` 传入)。**Verification**：companion 链接
+  4/4 有效；关键论断已亲验(`with_context`/`SocketPayload`/`tcp_uses_direct_stream`/`ether` 三层融合/规模 grep)；
+  2 处调查员数字误差已用实测修正(net 硬编码 10.0.2.x 实为 0；crate dead_code 实测 55 非 69)。**重要**：
+  HEAD=`fd64ba24`，"unified step path Phase 0/1" 与先前 HTTPS 时钟/feed-ACK 修复均在 `feature-network-next`、
+  **未入 main** → 本审计=main 真实态(用户怀疑全部成立)。**Next**：待用户拍板 smoltcp 定位(A 拥抱：持久
+  Interface+真实时钟周期 poll，loopback 也喂 smoltcp；B 自研：删 smoltcp socket)，再立详细重构设计文档
+  (P0=持久 Interface+真实时钟、数据所有者单一化)。**第二轮主动发现(质量/安全)**：解析路径崩溃类全干净(预判证伪);真问题全是病根并发症——R4a epoll对socket无法阻塞(wait-source两套注册表错配 subsystems `wait_source.rs:60` vs substrate `wake/wait_source.rs:444`=⑥后果)、R1a边沿丢唤醒(`step_recv.rs:55-57` SMP卡死)、R2a时钟冻结致老化全失效(泄漏根源)、R2b监听漏排backlog、R2d 320KB/socket+无记账、R2e conntrack无界、R3a RX不验校验和;B冲突亲验裁决:SocketTable有Drop不泄漏(注释过时);详见 NET_AUDIT_v1.md §6-bis。**进展**：用户已选 **A 方案**,正在写详细重构方案。**Blocker**：无。
 - 2026-06-18 (6-suite regression sweep vs main — 0 regressions, 4 lanes, many improvements). User asked to
   regression-test basic/busybox/libctest/libcbench/lmbench/iozone vs main (main "已经测试过了"), on BOTH
   musl AND glibc lanes. Method: per-suite selector boots `tx.oscomp.groups=<suite>-{musl,glibc}` with

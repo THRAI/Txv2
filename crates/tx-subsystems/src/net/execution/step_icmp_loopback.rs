@@ -42,8 +42,10 @@ pub fn step_process_loopback_icmp_on_iface(
     let Some(source_payload) = source.acquire_operational() else {
         return StepOutcome::Done(LoopbackIcmpTransferOutcome::default());
     };
-    let mut ctx =
-        PollContext::new_with_table(smoltcp::time::Instant::ZERO, source_payload.socket_table());
+    let mut ctx = PollContext::new_with_table(
+        crate::net::clock::net_now_instant(),
+        source_payload.socket_table(),
+    );
     let mut source_wake_fired = false;
 
     if let Some(publish) = ctx.poll_icmp_egress_one(source, iface, guard) {
