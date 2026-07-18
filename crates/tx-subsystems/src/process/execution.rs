@@ -915,6 +915,7 @@ pub fn step_exit_group(process: &Cap<ProcessIdentity>, status: ExitStatus) {
             || payload.drain_fds(),
         );
         close_socket_files_for_process_exit(&closed_fds);
+        flush_page_backed_files_for_process_exit(&closed_fds);
         let drained: Vec<Cap<ThreadIdentity>> = measure_process_lock_service(
             b"debug.lock_service.process.payload.exit_group.threads_drain.duration_ns",
             || payload.threads.drain(),
@@ -991,6 +992,7 @@ pub(crate) fn step_process_exit(process: &Cap<ProcessIdentity>, status: ExitStat
             || payload.drain_fds(),
         );
         close_socket_files_for_process_exit(&closed_fds);
+        flush_page_backed_files_for_process_exit(&closed_fds);
         measure_process_lock_service(
             b"debug.lock_service.process.payload.process_exit.drop_closed_fds.duration_ns",
             || drop(closed_fds),
@@ -1031,6 +1033,34 @@ fn close_socket_files_for_process_exit(fds: &BTreeMap<u32, Cap<OpenFile>>) {
 
         let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
         ops.on_last_close(&guard);
+    }
+}
+
+/// Flush dirty data + logical size for page-backed files dropped on process
+/// exit. There is no background writeback daemon, so close is the flush point
+/// for page-backed files. The explicit `close(2)` syscall already flushes
+/// (see `sys_close`), but a process that never calls `close` on a written file
+/// — e.g. a busybox applet whose redirected stdout (`cat >f`) is reaped only
+/// by exit — otherwise has its fd dropped here without a flush, so a fresh
+/// cross-process reopen sees the stale (create-time, zero) inode size and reads
+/// nothing. Best-effort and idempotent: a clean PC flushes nothing, and the
+/// ext4 flush path is synchronous (`Done`).
+fn flush_page_backed_files_for_process_exit(fds: &BTreeMap<u32, Cap<OpenFile>>) {
+    use crate::vfs::structure::{OpenFileBacking, RNodeBacking};
+    let mut seen_files = Vec::new();
+    for file in fds.values() {
+        if !matches!(file.backing(), OpenFileBacking::Rnode { .. }) {
+            continue;
+        }
+        let raw_file = file.raw();
+        if seen_files.contains(&raw_file) {
+            continue;
+        }
+        seen_files.push(raw_file);
+        if let RNodeBacking::PageBacked { pc } = file.rnode().backing() {
+            let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
+            let _ = crate::page_backed::step_fsync(&pc, &guard);
+        }
     }
 }
 
