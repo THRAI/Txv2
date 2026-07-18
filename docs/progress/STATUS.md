@@ -12,6 +12,21 @@
   git clone 真 xv6 **7/7**(git:// ext4+tmpfs、https+宿主代理×5,均全新启动)。**已知遗留**:index-pack 偶发
   内存正确性 bug(用户两次异症:NULL segv pc=0x2b9960 / write ENOENT,我方 7 连过;疑与 0.4% argv 页竞态同族,
   或首崩后同会话状态污染)。Next:全新启动复测 clone;可选 user-segv 现场 VMA dump 诊断;根因排决赛后。Blocker:无。
+- 2026-07-16 (修复 busybox writev→ext4 跨进程写丢失 — 决赛 git 题隐患). 病象:shell 重定向写
+  ext4 文件(`echo>f`/`cat>f`/`printf>f`,builtin 与 applet 都算),**另一个进程读到空**(git 提交进去的
+  README 是空的);`write()`/`cp`/`dd`/git 自己写正常,`sync` 无效,同进程读正常。**逐步实验定根因**(非
+  writev-oneshot、非漏标脏、非进程退出边界):**无后台回写守护,close 是 page-backed 的唯一 flush 点,但
+  step_fsync 只接在显式 `sys_close` 系统调用里**——进程退出(drain_fds)、dup2/dup3 关旧 fd、exec cloexec
+  这些 fd 释放路径**全绕过**,故写完靠退出/dup2 收 fd 的写者(applet 的重定向 stdout、shell builtin 的重定向
+  恢复)数据+inode size 从不持久化,跨进程重开按磁盘 size=0 读空。cp/dd 通=它们**显式 close(2)**。**修复**(2
+  文件,镜像 sys_close 逻辑):(1) process/execution.rs 加 `flush_page_backed_files_for_process_exit`,在
+  `step_exit_group`+`step_process_exit` 的 drain_fds 后对每个 page-backed 文件 step_fsync(覆盖 applet/
+  subshell/_exit);(2) fs_basic.rs sys_dup3 在替换 newfd 前 flush 旧 page-backed 文件(覆盖 shell builtin
+  重定向)。**验证**:6 条关闭路径实测全绿(echo builtin/applet、cat from-file、cp/dd、subshell)、
+  **`echo>README`+git commit 内容=真值**(之前空);回归门全绿——git-net 8/8、tx-subsystems 全量 set-diff
+  mine≡HEAD(322==322 字节一致)+ process 120/120+page_backed 91/91+fsync 9/9、netperf 5/5+iperf 6/6。
+  **意义**:官方 Task1 `cat >README.md` + Task2 改 README 若查内容,之前会丢分;现在任何写法都持久化。更新
+  memory busybox-writev-ext4-crossproc-writeloss 为已修。Blocker:无。
 - 2026-07-16 (push 前全分支审计修复 — 2 个真 bug). 审计发现 2 个入账-blocking 缺陷,push 前修掉。**① IPv6
   prefix_len 内核 panic 向量**(CAP_NET_ADMIN 可触发):`ip -6 addr add fe80::1/200` 的裸 prefix_len 未校验,
   流到 decide_ipv6_route→same_ipv6_prefix 按 plen/8 索引 [u8;16] 越界 panic。**三层防御**:(a) rtnetlink.rs
