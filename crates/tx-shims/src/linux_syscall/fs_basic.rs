@@ -1252,6 +1252,19 @@ pub(super) fn sys_dup3<'a>(
     if newfd >= soft_limit {
         return SyscallResult::Error(EBADF_VALUE);
     }
+    // dup2/dup3 silently closes whatever is currently at `newfd`. That close
+    // is a flush point for page-backed files (same as `sys_close`) — a shell
+    // restoring a redirected fd (`echo >f`) reaps the file only this way, so
+    // without the flush its data + inode size never persist for a fresh
+    // cross-process reopen. No-op when newfd == oldfd (POSIX: no close).
+    if oldfd != newfd {
+        if let Some(file) = ctx.process.fd(newfd) {
+            if let Some(pc) = crate::linux_syscall::vm::extract_page_container(&file) {
+                let guard = step_engine::guard();
+                let _ = tx_subsystems::page_backed::step_fsync(&pc, &guard);
+            }
+        }
+    }
     let mut script_ctx = build_subject_script_ctx(ctx);
     let mut op = Dup3Op {
         process: ctx.process.clone(),
