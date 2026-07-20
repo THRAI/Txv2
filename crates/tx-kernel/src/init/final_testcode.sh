@@ -34,28 +34,39 @@ run_cagent() {
 
     cd "$TEST_BASE" || return 1
     echo "TX_FINAL_INIT cagent=start base=$TEST_BASE script=$TEST_SCRIPT"
-    /bin/bash "$TEST_SCRIPT" &
-    cagent_runner=$!
 
     # The published CAgent script starts simple_llm_server before its ten
     # background cases and then uses a bare `wait`.  Because the server is
     # persistent, that wait cannot finish by itself.  All cases have a maximum
-    # timeout of 35 seconds, so stop only the server after 45 seconds; the
-    # official script then prints its END marker and performs its own cleanup.
-    (
-        sleep 45
-        if [ -x ./busybox ]; then
-            ./busybox killall simple_llm_server 2>/dev/null
-        else
-            killall simple_llm_server 2>/dev/null
-        fi
-    ) &
-    cagent_watchdog=$!
+    # timeout of 35 seconds.  Patch a temporary copy immediately after it has
+    # captured the exact server PID; using killall here is not reliable because
+    # execve does not yet refresh Txv2's /proc comm field.
+    cagent_patched=/tmp/tx-cagent_testcode.sh
+    if [ -x ./busybox ]; then
+        ./busybox sed '/^SERVER_PID=\$!$/a\
+( sleep 45; kill -9 "$SERVER_PID" 2>/dev/null ) \& # TX_CAGENT_SERVER_WATCHDOG' \
+            "$TEST_SCRIPT" > "$cagent_patched"
+        patch_rc=$?
+        ./busybox grep -q TX_CAGENT_SERVER_WATCHDOG "$cagent_patched"
+        marker_rc=$?
+    else
+        sed '/^SERVER_PID=\$!$/a\
+( sleep 45; kill -9 "$SERVER_PID" 2>/dev/null ) \& # TX_CAGENT_SERVER_WATCHDOG' \
+            "$TEST_SCRIPT" > "$cagent_patched"
+        patch_rc=$?
+        grep -q TX_CAGENT_SERVER_WATCHDOG "$cagent_patched"
+        marker_rc=$?
+    fi
+    if [ "$patch_rc" -ne 0 ] || [ "$marker_rc" -ne 0 ]; then
+        echo "TX_FINAL_INIT cagent=patch-failed sed_rc=$patch_rc marker_rc=$marker_rc"
+        rm -f "$cagent_patched"
+        return 126
+    fi
 
-    wait "$cagent_runner"
+    echo "TX_FINAL_INIT cagent=server-watchdog mode=pid timeout=45s"
+    /bin/bash "$cagent_patched"
     cagent_rc=$?
-    kill "$cagent_watchdog" 2>/dev/null
-    wait "$cagent_watchdog" 2>/dev/null
+    rm -f "$cagent_patched"
     echo "TX_FINAL_INIT cagent=done rc=$cagent_rc"
     return "$cagent_rc"
 }

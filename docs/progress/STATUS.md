@@ -1,3 +1,12 @@
+- 2026-07-20 (决赛一阶段 CAgent 结束死锁修正). 官方 `cagent_testcode.sh` 在启动常驻
+  `simple_llm_server` 和十个后台用例后执行裸 `wait`，因此清理阶段的 `kill $SERVER_PID` 不可达；原包装层
+  45 秒后执行 `killall simple_llm_server`，但 Txv2 的 `execve` 尚未刷新 `/proc/<pid>/stat` 的 `comm`，
+  BusyBox 无法按新程序名找到服务且错误被重定向，官方平台在十个结果全部输出后仍永久等待。现在 PID 1 包装层
+  用 BusyBox `sed` 生成 `/tmp/tx-cagent_testcode.sh`，在官方脚本捕获 `SERVER_PID=$!` 后插入 45 秒定时
+  `kill -9 "$SERVER_PID"`，按准确 PID 结束服务；官方原有 `wait` 随后返回并继续输出 END，再进入 BuildStorm。
+  副本生成或标记检查失败会返回 126 并输出明确诊断，不再静默死等。验证：`bash -n`、插入结果目检及
+  `git diff --check` 通过。Next：重新构建 kernel-rv，用下载后的官方 RV 镜像确认 CAgent END、
+  `TX_FINAL_INIT cagent=done` 和 BuildStorm START。Blocker：官方镜像仍在重新下载，尚未端到端复验。
 - 2026-07-20 (决赛一阶段 PID 1 自动运行两题). 默认块设备根文件系统启动不再查找官方镜像中不存在的
   `/init`：现有 PID 1 直接 exec 镜像的 `/bin/bash`，并以 `-c` 运行内嵌的用户态
   `crates/tx-kernel/src/init/final_testcode.sh`；脚本在镜像根布局中定位官方脚本，先跑 CAgent、再跑
