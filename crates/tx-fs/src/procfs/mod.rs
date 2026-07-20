@@ -9,7 +9,7 @@ use tx_hal::UserPtr;
 pub mod adapter;
 mod read;
 
-pub use read::procfs_register_uptime_clock;
+pub use read::{procfs_register_uptime_clock, procfs_set_mounts};
 
 use adapter::step_engine::{Cap, NoProgress, StepOutcome};
 use tx_subsystems::execution::{Errno, Guard};

@@ -1,36 +1,35 @@
-//! Kernel-space pmap operations.
+//! 内核半区（高地址）pmap 操作。
 //!
-//! This module owns direct-map extension, MMIO/kernel mapping reserve/commit,
-//! in-place kernel protect, and kernel unmap/prune behavior.
+//! 本模块负责：直接映射扩展、MMIO/内核映射的预约/提交、内核权限原地修改，
+//! 以及内核解除映射/剪空表的行为。这里是内核半区页表的所有写操作，对应
+//! `PmapIf` 的 `*_kernel_mapping` / `direct_map` 接口。
 //!
-//! Core data structures/state maintained here:
-//! - the global bootstrap root stored in `BootStaticBag<IdentityDropped>`;
-//! - `BootstrapPmapInfo`, especially the direct-map range substrate consumes;
-//! - `PmapReservation` intermediates for not-yet-published kernel mappings;
-//! - committed PT-node registry entries for branch tables that may later prune.
+//! 这里维护的核心数据结构/状态：
+//! - 存放于 `BootStaticBag<IdentityDropped>` 的全局引导根页表；
+//! - `BootstrapPmapInfo`，尤其是 substrate 要消费的直接映射范围；
+//! - 尚未发布的内核映射所用的 `PmapReservation` 中间表；
+//! - 已提交的分支表在 PT-node 登记表中的条目（后续剪空时用到）。
 //!
-//! Main state modification functions:
-//! - `reserve_kernel_direct_map_1g()`, `commit_kernel_direct_map_1g()`, and
-//!   `extend_direct_map()` grow the permanent direct map in 1 GiB leaves.
-//! - `reserve_kernel_mapping()`, `rollback_kernel_mapping()`, and
-//!   `commit_kernel_mapping()` publish MMIO/direct-map leaves through the global
-//!   root.
-//! - `unmap_kernel_mapping()` and `protect_kernel_mapping()` clear or rewrite
-//!   existing same-granularity leaves and produce invalidation evidence.
-//! - `shootdown_kernel_mapping()` is the local v1 global invalidation hook.
+//! 主要修改状态的函数：
+//! - `reserve_kernel_direct_map_1g()`、`commit_kernel_direct_map_1g()`、
+//!   `extend_direct_map()` 以 1 GiB 叶子扩展永久直接映射。
+//! - `reserve_kernel_mapping()`、`rollback_kernel_mapping()`、
+//!   `commit_kernel_mapping()` 通过全局根发布 MMIO/直接映射叶子。
+//! - `unmap_kernel_mapping()` 和 `protect_kernel_mapping()` 清除或改写
+//!   已存在的同粒度叶子，并产出失效凭据。
+//! - `shootdown_kernel_mapping()` 是本地 v1 全局失效钩子。
 //!
-//! Helper groups:
-//! - reservation helpers decide whether a slot is already mapped, empty, or
-//!   conflicting;
-//! - leaf helpers implement safe same-granularity unmap/protect;
-//! - prune helpers release empty committed L0/L1 tables through PT-node
-//!   ownership.
+//! 辅助函数分组：
+//! - 预约辅助函数判定某个槽位是已映射、空闲、还是冲突；
+//! - 叶子辅助函数实现安全的同粒度解除映射/权限修改；
+//! - 剪空辅助函数通过 PT-node 所有权归还空的已提交 L0/L1 表。
 //!
-//! It is still board-specific Sv39 code; the portable range API lives in
-//! `tx_hal::pmap` and frame-accounting shootdown lives in substrate. See
-//! `docs/progress/decisions/2026-04-28-rv64-direct-map-extension.md`,
-//! `docs/progress/decisions/2026-04-28-rv64-mmio-pmap-reserve-commit.md`, and
-//! `docs/progress/decisions/2026-04-29-pmap-kernel-protect-in-place.md`.
+//! 模式约定：薄壳 + `_from_bag`——薄壳取全局根，`_from_bag` 真正干活，也便于
+//! 测试注入。这里仍是板卡专属的 Sv39 代码；可移植的范围 API 在
+//! `tx_hal::pmap`，带帧记账的 shootdown 在 substrate。参见
+//! `docs/progress/decisions/2026-04-28-rv64-direct-map-extension.md`、
+//! `docs/progress/decisions/2026-04-28-rv64-mmio-pmap-reserve-commit.md`、
+//! `docs/progress/decisions/2026-04-29-pmap-kernel-protect-in-place.md`。
 
 use tx_hal::{
     BootstrapPmapInfo, PhysAddr, PmapError, PmapInvalidation, PmapPermissions, PmapReservation,
@@ -50,20 +49,22 @@ use super::{
     QEMU_RAM_BASE, SUPERPAGE_1G_SIZE, SUPERPAGE_2M_SIZE,
 };
 
-// Bootstrap pmap facts and direct-map extension are grouped because substrate
-// consumes the facts first, then asks the board to extend the direct map before
-// placing allocator metadata in RAM that was not covered by the initial 1 GiB
-// bootstrap leaf.
+// 引导 pmap 事实与直接映射扩展放在一起：substrate 先消费这些事实，再请板卡
+// 扩展直接映射，然后才能把分配器元数据放进那些初始 1 GiB 引导叶子没覆盖到的
+// 内存里。
+// 返回引导阶段发布的 pmap 事实（直接映射范围等）。
 pub(crate) fn bootstrap_pmap_info() -> Option<&'static BootstrapPmapInfo> {
     BootStaticBag::<IdentityDropped>::global_ref().bootstrap_pmap_info_ref()
 }
 
+// 薄壳：为直连区某个 1 GiB 物理页预约根叶子（取全局根后转交 `_from_bag`）。
 pub(crate) fn reserve_kernel_direct_map_1g(
     phys: PhysAddr,
 ) -> Result<Option<PmapReservation>, PmapError> {
     reserve_direct_map_1g_from_bag(BootStaticBag::<IdentityDropped>::global_ref(), phys)
 }
 
+// 校验对齐后检查根叶子槽位：已是目标返回 None，非空冲突报错，空则返回预约。
 pub(super) fn reserve_direct_map_1g_from_bag<State>(
     bag: &BootStaticBag<State>,
     phys: PhysAddr,
@@ -89,10 +90,12 @@ pub(super) fn reserve_direct_map_1g_from_bag<State>(
     )))
 }
 
+// 薄壳：提交直连区 1 GiB 叶子预约（取全局根后转交 `_from_bag`）。
 pub(crate) fn commit_kernel_direct_map_1g(reservation: PmapReservation) {
     commit_direct_map_1g_from_bag(BootStaticBag::<IdentityDropped>::global_ref(), reservation);
 }
 
+// 写入根叶子 PTE 并把已发布的直接映射事实向后扩展，最后本地刷 TLB。
 pub(super) fn commit_direct_map_1g_from_bag<State>(
     bag: &BootStaticBag<State>,
     reservation: PmapReservation,
@@ -110,10 +113,12 @@ pub(super) fn commit_direct_map_1g_from_bag<State>(
     sfence_vma_all();
 }
 
+// 薄壳：substrate 建堆时把直接映射扩展到 `phys_end`（取全局根后转交）。
 pub(crate) fn extend_direct_map(phys_end: PhysAddr) -> Result<(), PmapError> {
     extend_direct_map_from_bag(BootStaticBag::<IdentityDropped>::global_ref(), phys_end)
 }
 
+// 从当前直接映射末端起，按 1 GiB 叶子逐个预约并提交，直到覆盖到 `phys_end`。
 pub(super) fn extend_direct_map_from_bag<State>(
     bag: &BootStaticBag<State>,
     phys_end: PhysAddr,
@@ -137,10 +142,9 @@ pub(super) fn extend_direct_map_from_bag<State>(
     Ok(())
 }
 
-// Kernel mapping reservation mirrors process-root reservation but targets the
-// bootstrap/global root. New intermediates stay attached to the reservation
-// until commit, which lets rollback return PT nodes cleanly if a later step
-// fails.
+// 内核映射预约与进程根预约类似，但目标是引导/全局根。新建的中间表在提交前
+// 一直挂在预约上，这样若后续某步失败，回滚就能干净地归还这些 PT 节点。
+// 薄壳：预约内核映射（投机建中间表，不写叶子；取全局根后转交 `_from_bag`）。
 pub(crate) fn reserve_kernel_mapping(
     virt: VirtAddr,
     phys: PhysAddr,
@@ -154,6 +158,8 @@ pub(crate) fn reserve_kernel_mapping(
     )
 }
 
+// 按粒度（1G/2M/4K）按需建好中间表，检查目标叶子槽位后返回预约；建表失败或
+// 槽位冲突时回滚本次新建的中间表。
 pub(super) fn reserve_kernel_mapping_from_bag<State>(
     bag: &BootStaticBag<State>,
     virt: VirtAddr,
@@ -227,13 +233,14 @@ pub(super) fn reserve_kernel_mapping_from_bag<State>(
     }
 }
 
-// Commit/rollback publish or abandon kernel mappings after reservation.
-// Committed intermediates are registered so later unmap/prune can recover their
-// `PtNode` authority from a raw branch PTE.
+// 预约之后，commit/rollback 负责发布或放弃内核映射。已提交的中间表会被登记，
+// 这样后续 unmap/prune 才能从一个裸分支 PTE 恢复出对应的 `PtNode` 所有权。
+// 薄壳：回滚一次内核映射预约（取全局根后转交 `_from_bag`）。
 pub(crate) fn rollback_kernel_mapping(reservation: PmapReservation) {
     rollback_kernel_mapping_from_bag(BootStaticBag::<IdentityDropped>::global_ref(), reservation);
 }
 
+// 归还预约投机建出的中间表，然后本地刷 TLB。
 pub(super) fn rollback_kernel_mapping_from_bag<State>(
     bag: &BootStaticBag<State>,
     reservation: PmapReservation,
@@ -242,6 +249,7 @@ pub(super) fn rollback_kernel_mapping_from_bag<State>(
     sfence_vma_all();
 }
 
+// 薄壳：提交内核映射（写叶子并登记中间表；取全局根后转交 `_from_bag`）。
 pub(crate) fn commit_kernel_mapping(reservation: PmapReservation, permissions: PmapPermissions) {
     commit_kernel_mapping_from_bag(
         BootStaticBag::<IdentityDropped>::global_ref(),
@@ -250,6 +258,7 @@ pub(crate) fn commit_kernel_mapping(reservation: PmapReservation, permissions: P
     );
 }
 
+// 登记中间表所有权，按粒度写入叶子 PTE，最后本地刷 TLB。
 pub(super) fn commit_kernel_mapping_from_bag<State>(
     bag: &BootStaticBag<State>,
     reservation: PmapReservation,
@@ -275,9 +284,9 @@ pub(super) fn commit_kernel_mapping_from_bag<State>(
     sfence_vma_all();
 }
 
-// Kernel unmap/protect work on existing same-granularity leaves only. Absent
-// slots are no-ops, and unsafe transformations such as splitting a superpage are
-// rejected so higher VM policy can rematerialize through faults later.
+// 内核 unmap/protect 只作用于已存在的同粒度叶子。空槽位是 no-op；拆分大页这类
+// 不安全变换会被拒绝，留给上层 VM 策略之后靠缺页重新物化。
+// 薄壳：解除内核映射（取全局根后转交 `_from_bag`）。
 pub(crate) fn unmap_kernel_mapping(
     virt: VirtAddr,
     kind: PmapReserveKind,
@@ -285,6 +294,7 @@ pub(crate) fn unmap_kernel_mapping(
     unmap_kernel_mapping_from_bag(BootStaticBag::<IdentityDropped>::global_ref(), virt, kind)
 }
 
+// 定位到叶子槽位并清零（只动同粒度已存在叶子），成功后剪掉可能变空的中间表。
 pub(super) fn unmap_kernel_mapping_from_bag<State>(
     bag: &BootStaticBag<State>,
     virt: VirtAddr,
@@ -331,6 +341,7 @@ pub(super) fn unmap_kernel_mapping_from_bag<State>(
     }
 }
 
+// 薄壳：修改内核映射叶子的权限（取全局根后转交 `_from_bag`）。
 pub(crate) fn protect_kernel_mapping(
     virt: VirtAddr,
     kind: PmapReserveKind,
@@ -344,6 +355,7 @@ pub(crate) fn protect_kernel_mapping(
     )
 }
 
+// 定位同粒度已存在叶子并改写其权限位，返回失效凭据（不在此刷 TLB）。
 pub(super) fn protect_kernel_mapping_from_bag<State>(
     bag: &BootStaticBag<State>,
     virt: VirtAddr,
@@ -379,13 +391,14 @@ pub(super) fn protect_kernel_mapping_from_bag<State>(
     }
 }
 
+// 内核映射失效执行：本地 sfence.vma 全刷（远程核的 IPI 在 lib.rs 里补）。
 pub(crate) fn shootdown_kernel_mapping(_invalidation: PmapInvalidation) {
     sfence_vma_all();
 }
 
-// Direct-map helpers keep the public extension path small: one function
-// computes the mapped physical end from published HAL facts, and one updates
-// those facts after the root leaf is committed.
+// 直接映射辅助函数让对外的扩展路径保持精简：一个从已发布的 HAL 事实算出映射的
+// 物理末端，另一个在根叶子提交后更新这些事实。
+// 从已发布事实算出直接映射覆盖到的物理末端地址。
 pub(super) fn direct_map_phys_end_from_bag<State>(
     bag: &BootStaticBag<State>,
 ) -> Result<usize, PmapError> {
@@ -403,6 +416,7 @@ pub(super) fn direct_map_phys_end_from_bag<State>(
         .ok_or(PmapError::InvalidRequest)
 }
 
+// 从已发布事实算出直接映射覆盖的物理起始地址。
 pub(super) fn direct_map_phys_start_from_bag<State>(
     bag: &BootStaticBag<State>,
 ) -> Result<usize, PmapError> {
@@ -416,15 +430,13 @@ pub(super) fn direct_map_phys_start_from_bag<State>(
         .ok_or(PmapError::InvalidRequest)
 }
 
-/// Cover RAM below the bootstrap direct-map start with 1 GiB leaves.
+/// 用 1 GiB 叶子覆盖引导直接映射起点以下的那段 RAM。
 ///
-/// The boot page tables only map the QEMU-virt gigabyte at
-/// 0x8000_0000, but boards like the VisionFive 2 report DDR from
-/// 0x4000_0000 in their device tree. Called while boot facts are
-/// being published (identity still live, root writable): writes the
-/// missing root leaves and lowers the published direct_map/mapped
-/// ranges so the substrate coverage check and frame allocator see the
-/// real span. No-op on QEMU (regions start at the current base).
+/// 引导页表只映射了 QEMU-virt 位于 0x8000_0000 的那 1 GiB，但像
+/// VisionFive 2 这类板卡在设备树里报告 DDR 从 0x4000_0000 开始。
+/// 本函数在引导事实发布期间调用（此时恒等映射仍在、根可写）：补写
+/// 缺失的根叶子，并把已发布的 direct_map/mapped 范围下压，使 substrate
+/// 覆盖检查和帧分配器看到真实跨度。QEMU 上是 no-op（区域正好从当前基址起）。
 pub(crate) fn cover_direct_map_low_from_bag<State>(
     bag: &BootStaticBag<State>,
     lowest_phys: PhysAddr,
@@ -458,6 +470,7 @@ pub(crate) fn cover_direct_map_low_from_bag<State>(
     Ok(())
 }
 
+// 把已发布的直接映射事实起点下压到 new_start，并相应增大 size。
 unsafe fn lower_bootstrap_direct_map_info<State>(
     bag: &BootStaticBag<State>,
     new_start: usize,
@@ -475,6 +488,7 @@ unsafe fn lower_bootstrap_direct_map_info<State>(
     }
 }
 
+// 把已发布的直接映射事实末端向后扩展到 phys_end（取 max，不缩小）。
 unsafe fn extend_bootstrap_direct_map_info<State>(bag: &BootStaticBag<State>, phys_end: usize) {
     unsafe {
         let Some(info) = bag.bootstrap_pmap_info_mut().as_mut() else {
@@ -491,9 +505,9 @@ unsafe fn extend_bootstrap_direct_map_info<State>(bag: &BootStaticBag<State>, ph
     }
 }
 
-// Reservation helpers are deliberately side-effect-light. They classify a
-// candidate slot as already satisfied, conflicting, or open for a reservation
-// token that still owns any fresh intermediates.
+// 预约辅助函数刻意保持几乎无副作用：把候选槽位归类为“已满足”、“冲突”、或
+// “空闲可预约”，并让预约凭据继续持有本次新建的中间表。
+// 按当前/期望 PTE 分类槽位：相等返回 None，非空冲突报错，空则生成预约凭据。
 fn reservation_for_slot(
     virt: VirtAddr,
     phys: PhysAddr,
@@ -516,9 +530,9 @@ fn reservation_for_slot(
     )))
 }
 
-// Leaf helpers are shared by kernel and process-root pmap code. They only
-// accept present leaves of the exact requested granularity; absent leaves are
-// benign no-ops and branch/split cases stay with VM rematerialization policy.
+// 叶子辅助函数由内核和进程根 pmap 代码共用。它们只接受恰好请求粒度的已存在
+// 叶子；空叶子是良性 no-op，分支/拆分情形交给 VM 重新物化策略处理。
+// 清除一个同粒度叶子槽位：空则 no-op，非叶子或错位报错，成功返回解除结果。
 pub(super) fn unmap_leaf_slot(
     slot: &mut u64,
     virt: VirtAddr,
@@ -539,6 +553,8 @@ pub(super) fn unmap_leaf_slot(
     Ok(Some(PmapUnmapResult::new(virt, phys, kind)))
 }
 
+// 改写一个同粒度叶子槽位的权限：空则 no-op，非叶子/错位报错；权限不变返回
+// None，否则写入新 PTE 并返回失效凭据。
 pub(super) fn protect_leaf_slot(
     slot: &mut u64,
     virt: VirtAddr,
@@ -565,9 +581,9 @@ pub(super) fn protect_leaf_slot(
     Ok(Some(PmapInvalidation::new(virt, kind.size())))
 }
 
-// Prune helpers release empty committed branch tables after unmap. The PT-node
-// registry is the pmap-only authority that turns a branch PTE physical address
-// back into the typed owner that may be freed.
+// 剪空辅助函数在 unmap 之后归还变空的已提交分支表。PT-node 登记表是 pmap 专属
+// 的权威，负责把一个分支 PTE 的物理地址还原成可释放的带类型所有者。
+// 若 L0 表已空则清掉 L1 中指向它的分支槽位，并经登记表归还该 L0 表内存。
 fn prune_empty_l0_table_from_bag<State>(bag: &BootStaticBag<State>, virt: VirtAddr) {
     let Some(l1) = l1_table_mut(bag, virt) else {
         return;
@@ -587,6 +603,7 @@ fn prune_empty_l0_table_from_bag<State>(bag: &BootStaticBag<State>, virt: VirtAd
     release_committed_pt_node_from_bag(bag, phys);
 }
 
+// 若 L1 表已空则清掉根中指向它的分支槽位，并经登记表归还该 L1 表内存。
 fn prune_empty_l1_table_from_bag<State>(bag: &BootStaticBag<State>, virt: VirtAddr) {
     let slot = unsafe { &mut bag.bootstrap_root_mut().0[rv64_1g_leaf_index(virt.0)] };
     if !pte_is_branch(*slot) {
@@ -603,6 +620,7 @@ fn prune_empty_l1_table_from_bag<State>(bag: &BootStaticBag<State>, virt: VirtAd
     release_committed_pt_node_from_bag(bag, phys);
 }
 
+// 判断一张页表是否全零（所有条目为空）。
 pub(super) fn page_table_is_empty(table: &PageTable) -> bool {
     table.0.iter().all(|entry| *entry == 0)
 }

@@ -328,6 +328,42 @@ fn drive_boot_wiring() {
 // --- tests --------------------------------------------------------
 
 #[test]
+fn root_device_policy_defaults_final_qemu_to_vda_and_preserves_compatibility_roots() {
+    assert_eq!(
+        CoreInit::<TestPlatform>::root_device_name_from_boot("", false),
+        Some("vda")
+    );
+    assert_eq!(
+        CoreInit::<TestPlatform>::root_device_name_from_boot("tx.profile=onsite", false),
+        Some("vda")
+    );
+    assert_eq!(
+        CoreInit::<TestPlatform>::root_device_name_from_boot("tx.root=mmcblk0", false),
+        Some("mmcblk0")
+    );
+    assert_eq!(
+        CoreInit::<TestPlatform>::root_device_name_from_boot("tx.root=sdcard", false),
+        Some("vda")
+    );
+    assert_eq!(
+        CoreInit::<TestPlatform>::root_device_name_from_boot("tx.profile=pretest", false),
+        None
+    );
+    assert_eq!(
+        CoreInit::<TestPlatform>::root_device_name_from_boot("tx.profile=busybox", false),
+        None
+    );
+    assert_eq!(
+        CoreInit::<TestPlatform>::root_device_name_from_boot("", true),
+        None
+    );
+    assert_eq!(
+        CoreInit::<TestPlatform>::root_device_name_from_boot("tx.root=vda", true),
+        Some("vda")
+    );
+}
+
+#[test]
 fn initial_userspace_sched_meta_stays_on_cpu0_when_boot_hart_is_nonzero() {
     let _serial = setup();
     TEST_CURRENT_CPU.store(3, Ordering::Release);

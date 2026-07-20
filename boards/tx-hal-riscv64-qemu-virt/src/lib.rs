@@ -386,6 +386,9 @@ impl ConsoleIf for Platform {
         read_sbi_console_bytes(buf)
     }
 }
+// PmapIf 的板级实现:除 activate_user_pmap(写 satp)外,几乎每个方法都是一行转发到
+// pmap 模块的对应函数(内核映射→kernel_space,用户映射→address_space,节点→pt_node);
+// shootdown 系列在本地 sfence 之外额外追加 SBI 远程 IPI(remote_sfence_vma*)。
 impl PmapIf for Platform {
     fn bootstrap_pmap_info() -> Option<&'static BootstrapPmapInfo> {
         pmap::bootstrap_pmap_info()
@@ -502,15 +505,11 @@ impl PmapIf for Platform {
         pmap::shootdown_mappings(asid, invalidations);
     }
 
-    /// Write `satp` to point at `root.phys()` with Sv39 mode bits and
-    /// the root's ASID, then issue a local `sfence.vma`.
+    /// 写 satp 指向 `root.phys()`(带 Sv39 模式位 + 该 root 的 ASID),再发一条本地 sfence.vma。
     ///
-    /// Called from the thread runtime right before
-    /// `TrapIf::enter_userspace_with_context` so user-mode fetches see
-    /// the per-process pmap. Without this satp would still point at the
-    /// kernel bootstrap root from the boot trampoline (which has no
-    /// user mappings), and every user-mode instruction fetch would
-    /// fault forever.
+    /// 线程运行时在 `TrapIf::enter_userspace_with_context` 之前紧接着调它,好让用户态取指
+    /// 看到本进程的页表。不调的话 satp 还指着引导 trampoline 留下的内核引导根(没有用户映射),
+    /// 用户态每条取指都会永久缺页。
     fn activate_user_pmap(root: &PmapRoot) {
         let asid_usable = hw_asid_tagging_usable();
         mark_asid_resident_on_current_cpu(root.asid());
@@ -518,49 +517,37 @@ impl PmapIf for Platform {
         unsafe {
             const SATP_MODE_SV39: usize = 0x8 << 60;
             let ppn = root.phys().0 >> 12;
-            // Zero-/narrow-ASID hardware (VF2 U74 implements 0 bits):
-            // hardware would truncate the tag anyway; write 0 so the
-            // fast-path compare below stays meaningful (a readback of
-            // a truncated field would otherwise never equal our
-            // computed satp and force the slow path every entry).
+            // 零/窄 ASID 硬件(VF2 U74 实现 0 位):硬件反正会截断标签;这里写 0,
+            // 让下面的快路径比较仍有意义(否则读回被截断的字段永远不等于我们算的 satp,
+            // 每次进用户态都被迫走慢路径)。
             let asid = if asid_usable {
                 root.asid().0 as usize
             } else {
                 0
             };
             let satp = SATP_MODE_SV39 | (asid << 44) | ppn;
-            // Fast path: returning to the same address space (the common
-            // syscall return). No CSR write, no fence — TLB entries for
-            // this root are still valid (per-ASID on tagged hardware; on
-            // degraded hardware the flush-on-switch below guarantees the
-            // TLB only ever holds the current space's entries).
+            // 快路径:回到同一个地址空间(常见的 syscall 返回)。不写 CSR、不 fence——
+            // 这个 root 的 TLB 项仍有效(ASID 硬件按 ASID 隔离;退化硬件靠下面的切换即刷
+            // 保证 TLB 里只留当前空间的项)。
             let current: usize;
             core::arch::asm!("csrr {satp}, satp", satp = out(reg) current, options(nomem, nostack));
             if current == satp {
                 return;
             }
-            // Different root: write satp. On ASID-tagged hardware (QEMU:
-            // 16 bits) no fence is needed per the privileged spec:
-            //  - TLB entries are ASID-tagged; switching ASIDs needs no fence.
-            //  - Invalid (V=0) PTEs are never cached, so invalid→valid map
-            //    commits are picked up by the next hardware walk unfenced
-            //    (`fill_mapping` fences only when overwriting a valid PTE).
-            //  - ASID reuse is fenced at root teardown
-            //    (`invalidate_root_translations` switches to the bootstrap
-            //    root and issues sfence.vma there).
-            // The previous unconditional `sfence.vma` here flushed the whole
-            // TLB on EVERY userspace entry — under QEMU TCG that meant a
-            // full tlb_flush per syscall return (~ms each), the dominant
-            // term of LTP shell-test runtime (net_stress budget battle).
+            // 换了 root:写 satp。ASID 硬件(QEMU:16 位)上按特权规范无需 fence:
+            //  - TLB 项带 ASID 标签,切 ASID 不用 fence。
+            //  - 无效(V=0)PTE 从不缓存,所以 invalid→valid 的映射提交下次硬件游走就能看到,
+            //    无需 fence(fill_mapping 只在覆盖已有的有效 PTE 时才 fence)。
+            //  - ASID 复用在 root 销毁时 fence(invalidate_root_translations 切到引导根并在那 sfence.vma)。
+            // 以前这里无条件 sfence.vma 会在每次进用户态时全刷 TLB——QEMU TCG 下相当于每次
+            // syscall 返回都 full tlb_flush(约 ms 级),是 LTP shell 测试耗时的主项(net_stress 预算之战)。
             core::arch::asm!(
                 "csrw satp, {satp}",
                 satp = in(reg) satp,
                 options(nostack)
             );
-            // Degraded (zero-ASID) hardware: every space shares tag 0,
-            // so the previous space's entries are live for this one —
-            // flush on switch (board `ls` fork/COW loop root cause,
-            // 2026-07-03). QEMU never takes this branch.
+            // 退化(零 ASID)硬件:所有空间共享标签 0,上个空间的项对这个空间仍生效——
+            // 所以切换即刷(board `ls` fork/COW 死循环的根因,2026-07-03)。QEMU 从不走这个分支。
             if !asid_usable {
                 core::arch::asm!("sfence.vma", options(nostack));
             }

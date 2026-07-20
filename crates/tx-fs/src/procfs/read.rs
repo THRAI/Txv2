@@ -168,7 +168,40 @@ fn render_cmdline(pid: Pid) -> String {
     }
 }
 
+/// Real mount table registered by kernel init (mirrors the
+/// `procfs_register_uptime_clock` injection pattern: procfs is not
+/// generic over the platform / boot mode, so init composes the table
+/// from the mounts it actually performed and hands it over once).
+/// Write-once before userspace starts; read-only afterwards. Runtime
+/// `mount(2)` calls are not reflected (boot-time snapshot).
+static MOUNTS_PTR: core::sync::atomic::AtomicPtr<u8> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+static MOUNTS_LEN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+pub fn procfs_set_mounts(table: String) {
+    let leaked: &'static str = alloc::boxed::Box::leak(table.into_boxed_str());
+    // Store len before ptr (Release) so a reader that Acquires a
+    // non-null ptr observes the matching len.
+    MOUNTS_LEN.store(leaked.len(), core::sync::atomic::Ordering::Release);
+    MOUNTS_PTR.store(
+        leaked.as_ptr() as *mut u8,
+        core::sync::atomic::Ordering::Release,
+    );
+}
+
 fn render_mounts() -> String {
+    let ptr = MOUNTS_PTR.load(core::sync::atomic::Ordering::Acquire);
+    if !ptr.is_null() {
+        let len = MOUNTS_LEN.load(core::sync::atomic::Ordering::Acquire);
+        // SAFETY: ptr/len come from a `Box::leak`ed `&'static str`
+        // published once by `procfs_set_mounts`.
+        let table =
+            unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(ptr, len)) };
+        return String::from(table);
+    }
+    // Fallback before init registers (or in host tests): the historical
+    // stub line. Note busybox/coreutils `df` skip fstype `rootfs`
+    // entries, so real `df` support requires the registered table.
     String::from("rootfs / rootfs rw 0 0\n")
 }
 

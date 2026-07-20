@@ -339,6 +339,7 @@ impl PartialEq for PtNode {
 impl Eq for PtNode {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// pmap 操作的错误类型:非法请求 / 已映射冲突 / 内存耗尽 / 不支持
 pub enum PmapError {
     InvalidRequest,
     AlreadyMapped,
@@ -347,6 +348,7 @@ pub enum PmapError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// 映射粒度:1GB 大页 / 2MB 大页 / 4KB 普通页(决定走几级 Sv39 页表)
 pub enum PmapReserveKind {
     Superpage1G,
     Superpage2M,
@@ -364,6 +366,7 @@ impl PmapReserveKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// 一页的访问权限位图(READ/WRITE/EXECUTE/USER/GLOBAL/DEVICE 及常用组合)
 pub struct PmapPermissions {
     bits: u8,
 }
@@ -406,6 +409,7 @@ impl PmapPermissions {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// 预约时新分配的中间层页表节点(L2/L1/L0),挂在预约单上,提交前可回滚
 pub struct PmapReservationIntermediates {
     pub l2: Option<PtNode>,
     pub l1: Option<PtNode>,
@@ -422,6 +426,9 @@ impl PmapReservationIntermediates {
     }
 }
 
+/// 一次"加映射"的预约单(reserve→commit 两阶段的载体):
+/// 记着要映射的虚拟/物理地址、粒度、以及预分配好的中间节点。
+/// `#[must_use]`:预约了必须 commit 或 rollback,不能丢弃(否则中间节点泄漏)。
 #[derive(Debug, Eq, PartialEq)]
 #[must_use]
 pub struct PmapReservation {
@@ -473,8 +480,11 @@ impl PmapReservation {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// 地址空间编号(TLB 优化:切进程不必清整个 TLB,不同 ASID 的翻译可共存)
 pub struct Asid(pub u16);
 
+/// 一个进程整套页表的入口 = 根页表物理页 + ASID。切进程 = 换它写进 satp。
+/// `#[must_use]`:建出来必须激活或销毁。
 #[derive(Debug)]
 #[must_use]
 pub struct PmapRoot {
@@ -505,6 +515,7 @@ impl PmapRoot {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// TLB 失效凭据:"这段虚拟地址的旧翻译作废了",交给 shootdown 去刷 TLB
 pub struct PmapInvalidation {
     virt: VirtAddr,
     size: usize,
@@ -525,6 +536,8 @@ impl PmapInvalidation {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// 删映射的结果:被删的虚拟/物理地址、粒度,外加一个 TLB 失效凭据。
+/// 物理地址供上层把这页归还给页分配器。
 pub struct PmapUnmapResult {
     virt: VirtAddr,
     phys: PhysAddr,
@@ -568,6 +581,8 @@ impl PmapUnmapResult {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// 引导页表的自述事实(启动时发布,substrate 建堆时读):
+/// 根表地址、已映射物理范围、直接映射区、内核镜像、临时恒等桥、页表节点池、保留的页表页。
 pub struct BootstrapPmapInfo {
     pub root: PhysAddr,
     pub mapped: PhysRange,
@@ -579,21 +594,28 @@ pub struct BootstrapPmapInfo {
     pub reserved_page_tables: &'static [PhysRange],
 }
 
+/// 虚拟内存/页表子系统的接口:让通用内核建/改/删地址空间映射,不碰架构页表格式。
+/// HAL 最大的 trait;fork/mmap/exec/缺页/切进程全靠它。方法几乎都有默认实现
+/// (返回 Unsupported 或空),mock/测试板不实现也能链接,真板覆盖。约分五组(见下)。
 pub trait PmapIf {
-    fn bootstrap_pmap_info() -> Option<&'static BootstrapPmapInfo> {
+    // ===== 组1:页表节点分配(建页表要内存,来源是 boot_static 的 pt_node 池) =====
+    fn bootstrap_pmap_info() -> Option<&'static BootstrapPmapInfo> {  // 引导页表自述事实
         None
     }
 
-    fn alloc_pt_node() -> Result<PtNode, AllocError> {
+    fn alloc_pt_node() -> Result<PtNode, AllocError> {   // 要一页当页表节点
         Err(AllocError::Exhausted)
     }
 
-    fn free_pt_node(_node: PtNode) {}
+    fn free_pt_node(_node: PtNode) {}                    // 还回去
 
-    fn install_pt_node_allocator(_allocator: PtNodeAllocator) -> Result<(), PmapError> {
+    fn install_pt_node_allocator(_allocator: PtNodeAllocator) -> Result<(), PmapError> {  // 装 substrate 的正式分配器
         Err(PmapError::Unsupported)
     }
 
+    // ===== 组2:内核空间映射(操作全局唯一的内核页表,所有进程共享的那半) =====
+    // reserve→commit 两阶段:reserve 干会失败的分配,commit 干不会失败的写入;
+    // 下面 direct_map 是直接映射区专用,extend_direct_map 供 substrate 建堆时扩展。
     fn reserve_kernel_direct_map_1g(_phys: PhysAddr) -> Result<Option<PmapReservation>, PmapError> {
         Err(PmapError::Unsupported)
     }
@@ -639,23 +661,24 @@ pub trait PmapIf {
         }
     }
 
-    fn create_pmap_root() -> Result<PmapRoot, PmapError> {
+    // ===== 组3:用户地址空间的创建/销毁/激活(fork/exec/切进程的核心) =====
+    fn create_pmap_root() -> Result<PmapRoot, PmapError> {   // 建一个新进程的页表根
         Err(PmapError::Unsupported)
     }
 
-    fn destroy_pmap_root(_root: PmapRoot) {}
+    fn destroy_pmap_root(_root: PmapRoot) {}                 // 销毁
 
-    /// VM-facing alias for activating a user address-space root.
+    /// 激活一个用户地址空间根(面向 VM 的别名,默认转调 activate_user_pmap)。
     ///
-    /// `PmapRoot` is intentionally architecture-defined. RV64 boards may make
-    /// it a complete root containing both user and copied kernel-half entries;
-    /// LA64 boards may make it the per-process PGDL while keeping kernel
-    /// mappings in a board-global PGDH.
+    /// `PmapRoot` 有意做成架构自定义:RV64 板可以让它是包含用户半+拷贝内核半的完整根;
+    /// LA64 板可以让它是每进程的 PGDL,而内核映射放在板级全局的 PGDH。
     fn activate_pmap(root: &PmapRoot) -> Result<(), PmapError> {
         Self::activate_user_pmap(root);
         Ok(())
     }
 
+    // ===== 组4:用户空间映射(针对某个进程 root,与组2内核版镜像,只多了 root 参数) =====
+    // mmap 走 reserve_mapping + commit_mapping。
     fn reserve_mapping(
         _root: &PmapRoot,
         _virt: VirtAddr,
@@ -691,30 +714,25 @@ pub trait PmapIf {
         Err(PmapError::Unsupported)
     }
 
+    // ===== 组5:用户映射的 TLB shootdown(带 asid,只刷该地址空间的 TLB 项) =====
     fn shootdown_mapping(_asid: Asid, _invalidation: PmapInvalidation) {}
 
-    fn shootdown_mappings(asid: Asid, invalidations: &[PmapInvalidation]) {
+    fn shootdown_mappings(asid: Asid, invalidations: &[PmapInvalidation]) {   // 批量版
         for invalidation in invalidations {
             Self::shootdown_mapping(asid, *invalidation);
         }
     }
 
-    /// Activate `root` as the current hart's user pmap.
+    /// 把 `root` 激活为当前 hart 的用户页表。
     ///
-    /// On RV64 this is `csrw satp, ((root.phys >> 12) | SV_MODE_BITS)
-    ///     + sfence.vma`. On LA64 this writes the active ASID/PGDL/PGDH state:
-    ///     `root` is the user PGDL and kernel mappings live in the board-global
-    ///     PGDH.
+    /// RV64 上就是 `csrw satp, ((root.phys >> 12) | Sv39 模式位) + sfence.vma`。
+    /// LA64 上写 ASID/PGDL/PGDH 状态:`root` 是用户 PGDL,内核映射在板级全局 PGDH。
     ///
-    /// Called by the thread runtime immediately before
-    /// `TrapIf::enter_userspace_with_context` so the MMU consults the
-    /// process's per-aspace pmap on the upcoming user fetches/loads.
-    /// Without this, satp keeps pointing at the kernel bootstrap root
-    /// (which has no user mappings), and every user-mode instruction
-    /// fetch faults.
+    /// 线程运行时在 `TrapIf::enter_userspace_with_context` 之前紧接着调它,
+    /// 好让 MMU 在接下来的用户取指/取数时查这个进程自己的页表。
+    /// 不调的话 satp 一直指着内核引导根(没有用户映射),用户态每条取指都缺页。
     fn activate_user_pmap(_root: &PmapRoot) {
-        // Default impl is a no-op so host platforms link; production
-        // boards override.
+        // 默认空实现,好让 host 平台能链接;产品板覆盖它。
     }
 }
 

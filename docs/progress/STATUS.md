@@ -1,3 +1,11 @@
+- 2026-07-20 (决赛一阶段默认根挂载策略). 无 cmdline、无 initrd 的 QEMU 启动现在默认尝试把 `vda` 的 ext4
+  直接挂为 `/`，不再要求评测平台配合传入 `tx.profile=onsite`；显式 `tx.root=<设备>` 优先，`tx.root=sdcard`
+  兼容映射到 `vda`。`tx.profile=pretest`、`tx.profile=busybox` 和 initrd 启动仍保留 tmpfs 根，避免破坏旧初赛和
+  busybox 调试链路。`/tmp`、`/var/tmp` 等运行时目录改为在 ext4 根和 tmpfs 根上都初始化；现有 `/dev`、`/proc`、
+  `/sys`、`/dev/shm`、`/dev/block` 伪文件系统挂载拓扑不变。验证：根设备策略定向测试 1/1；tx-kernel 单测
+  83/83；`cargo xtask build --target rv64-qemu` 通过；全量 `cargo -q xtask unit` 在未改动的 tx-shims 测试目标
+  处有既有编译错误。Next：单独实现/验证 CAgent 用户态启动选择，并用 final-2026 生成的镜像做 QEMU 启动实测。
+  Blocker：当前尚无已生成的 CAgent 测试镜像用于端到端启动验证。
 - 2026-07-18 (merge main→final-test + 两大 post-merge 修复). main 76 提交并入:net 重构(#52,55 文件)全量取
   main;9 文本+3 语义冲突逐个核对解——rv boot_static 保 final-test 动态 MMIO 发现+补 main goldfish-rtc 静态区
   (GENERATED_MMIO_REGIONS +1→+2)、tx-hal uart_irq()+NET_IRQ 两侧都留、exec LTP 取 final-test 自洽版(main 版
