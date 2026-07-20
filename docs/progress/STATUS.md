@@ -1,3 +1,38 @@
+- 2026-07-20 (官方复提交恢复 CAgent-only). BuildStorm 的 ext4 目录扩容与 Cargo
+  子进程等待问题继续暂停排查；finals PID 1 默认脚本恢复为只执行 `run_cagent`，输出
+  `mode=cagent-only`，CAgent 完成后 `sync` 并按其状态直接退出。该版本用于尽快复提交确认
+  LA64 已通过的十项结果以及 RV64 4096-byte 信号帧载体修复，不运行 BuildStorm。
+- 2026-07-20 (RV64 finals CAgent 信号帧容量回归修复). 官方 `-m 8G -smp 8`
+  运行中，LA64 CAgent 十项全部成功并正常退出；RV64 在 Bash 安装/进入信号处理时 panic：
+  `signal frame layout (2464 bytes) exceeds SignalFrameBytes buffer (2048)`。根因是 LA64
+  LSX/LASX 支持把公共 `UserFpContext` 扩展为包含 32x256-bit 向量寄存器，RV64 私有信号帧同时
+  保存该 opaque context 和 Linux `ucontext_t`，总大小增至 2464 字节，而公共字节载体仍是旧的
+  2048 字节。现将 `SignalFrameBytes::CAPACITY` 扩为单页 4096 字节；128 KiB 内核栈可容纳，
+  且不改变两架构用户态帧布局。验证：`make oscomp-build-rv64` 与
+  `make oscomp-submit-rv64` 成功，生成的新 `target/oscomp/submit/kernel-rv` 已包含修复。
+- 2026-07-20 (BuildStorm ext4 子目录 readdir 挂载分派修复). 官方镜像 onsite 复现中，顺序
+  `mkdir/stat` 可在 `/work/tgoskits` ext4 上创建并看到四级目录，但 `find` 进入第一个子目录即报
+  `Bad file descriptor`。根因是 `sys_getdents64` 只用 descendant `RNode` 的
+  `containing_mount_weak()` 查 FsOps，而 walker 只在 mount root rnode 上携带该 weak；代码原 TODO
+  因而对所有挂载根以下目录返回 ENOSYS。现改用目录 `OpenFile` 已保存的 `opendir_dentry`，通过
+  `fs_ops_for_dentry()` 沿 parent hint 找到挂载和 FsOps。Next：重跑 BuildStorm，确认 Cargo 能创建并
+  遍历 `target/debug/.fingerprint`，再观察正式编译的下一阻塞。
+- 2026-07-20 (决赛 BuildStorm 新 mount API 安全回退). 暂停从 syscall dispatcher 暴露半成品
+  `open_tree/fsopen/fspick`，三个入口统一返回 `ENOSYS`；内部实现暂时保留，待 `fsconfig -> fsmount ->
+  move_mount` 和 mount-api FD 全生命周期闭合后再启用。此兼容策略使官方镜像的 util-linux 可以回退
+  legacy `mount(2)`，避免半成品 `MountApi` FD 进入普通 VFS `rnode()` 路径并 panic，同时不影响现有
+  legacy mount 和启动阶段已完成的 proc/sys/dev 挂载。验证：LA64 QEMU 9 + 官方 final 镜像已越过
+  三次重复 mount，`rustc 1.98.0-nightly`、`cargo 1.98.0-nightly` 正常，输出
+  `BUILDSTORM_TOOLCHAIN ok` 和 `BUILDSTORM_MINIBUILD ok`。下一阻塞已推进到 ext4 工作区：Cargo 创建
+  `/work/tgoskits/target/debug/.fingerprint/camino-*` 返回 ENOENT，预编译和正式编译均失败；同一流程在
+  tmpfs `/tmp/minibuild` 成功，初步将范围收敛到 ext4 多级目录创建/创建后路径可见性。另见
+  `cores=1`，用户态 CPU 枚举仍未反映 `-smp 8`。
+- 2026-07-20 (决赛一阶段临时 BuildStorm-only 调试版本). finals PID 1 默认入口由 CAgent-only
+  切换为只调用 `run_buildstorm`，保留 `run_cagent` 实现但当前不调用，便于隔离第二题工具链与复杂构建
+  问题。当前已知首个阻塞发生在官方脚本开头重复执行 `mount -t proc proc /proc`：Debian util-linux
+  进入未完成的新 mount API 路径并使 mount-api-backed `OpenFile` 被传给普通 `rnode()`，尚未到达
+  `rustc --version`。Next：用官方镜像复现并修复 mount API/重复挂载兼容，再逐段推进 toolchain、
+  minibuild 和 arceos-helloworld 全量构建。
 - 2026-07-20 (LA64 finals glibc LSX/LASX 上下文支持). QEMU 9 `-d int` 确认官方 LA 镜像的 glibc
   动态加载器在 `pc=0x3e0083e7d4` 首次执行 LSX 时触发 ECODE 16（SXD）；原内核只识别到
   FPD=15，先错误 SIGSEGV，初版处理又因通用 CSR helper 未实现 EUEN(0x02) 读写而在同一指令

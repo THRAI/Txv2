@@ -572,7 +572,7 @@ impl<I: BlockImage> Ext4Pager<I> {
             return Err(Ext4FormatError::OutOfBounds);
         }
         let new_min = (8usize + name.len() + 3) & !3;
-        let disk_inode = self.read_inode(dir_ino)?;
+        let mut disk_inode = self.read_inode(dir_ino)?;
         let page_count = div_ceil_u64(disk_inode.size, BLOCK_SIZE as u64);
 
         for page_index in 0..page_count {
@@ -623,7 +623,33 @@ impl<I: BlockImage> Ext4Pager<I> {
                 off += rec_len;
             }
         }
-        Err(Ext4FormatError::OutOfBounds)
+        // No existing directory block has enough slack. Grow the directory
+        // by one block and make the new entry consume that block's full
+        // record.  The previous implementation returned OutOfBounds here,
+        // which surfaced as ENOENT once Cargo filled the first 4 KiB
+        // `.fingerprint` directory block during BuildStorm.
+        let logical = logical_block(page_count)?;
+        let physical = self.allocate_block()?;
+        self.attach_data_block(&mut disk_inode, logical, physical)?;
+
+        let mut page = [0u8; BLOCK_SIZE];
+        encode_dir_entry(
+            new_ino.get(),
+            BLOCK_SIZE as u16,
+            file_type,
+            name,
+            &mut page,
+        )?;
+        self.image.write_block(physical, &page)?;
+
+        disk_inode.size = disk_inode
+            .size
+            .checked_add(BLOCK_SIZE as u64)
+            .ok_or(Ext4FormatError::OutOfBounds)?;
+        disk_inode.blocks_512 = disk_inode
+            .blocks_512
+            .saturating_add((BLOCK_SIZE / 512) as u64);
+        self.write_inode(dir_ino, &disk_inode)
     }
 
     /// Remove the directory entry named `name` from `dir_ino`.  Returns the

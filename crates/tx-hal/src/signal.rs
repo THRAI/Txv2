@@ -81,7 +81,11 @@ pub struct SignalFrameBytes {
 }
 
 impl SignalFrameBytes {
-    pub const CAPACITY: usize = 2048;
+    // LA64's full LASX register file extends UserFpContext to 1,312 bytes.
+    // RV64 keeps that opaque context in its private validation header in
+    // addition to the Linux-compatible ucontext, making Rv64SignalFrame 2,464
+    // bytes. Keep one page here so both board layouts fit without truncation.
+    pub const CAPACITY: usize = 4096;
 
     pub fn from_slice(bytes: &[u8]) -> Self {
         let len = bytes.len();

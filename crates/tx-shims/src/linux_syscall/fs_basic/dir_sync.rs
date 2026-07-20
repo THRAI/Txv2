@@ -28,24 +28,16 @@ pub(in crate::linux_syscall) async fn sys_getdents64<'a>(
         _ => return SyscallResult::Error(ENOTDIR_VALUE),
     };
 
-    // Resolve the FsOps for this directory's mount. The OpenFile's
-    // rnode is the same `Cap<RNode>` that the walker installed via
-    // step_open against a mount-published dentry — we can't pull the
-    // mount payload directly off the rnode (`materialise_child_rnode`
-    // doesn't carry the mount weak), so reuse the dentry-side
-    // `fs_ops_for_dentry` shape via a synthetic dentry. In practice
-    // every directory rnode this path sees is the mount root or a
-    // descendant materialised through step_open, and the rnode
-    // itself carries `containing_mount_weak()` only when it *is* the
-    // mount root. For descendants we fall through to `None` below
-    // and the call surfaces -ENOSYS defensively. tmpfs's directory
-    // tree uses a single rnode-per-inode with the mount weak set
-    // only at the root, so this is the practical limit today.
-    //
-    // TODO(phase-readdir-mount): teach `materialise_child_rnode` to
-    // forward the mount weak so descendants don't hit the fallback.
-    // Until then, every test fixture uses the mount-root directory.
-    let fs_ops = match fs_ops_for_rnode(file.rnode()) {
+    // Descendant rnodes intentionally do not carry the mount weak; the
+    // directory OpenFile does retain the resolved DEntry specifically for
+    // dirfd-relative operations.  Resolve FsOps through that dentry's parent
+    // chain so getdents64 works below a mount root (Cargo/find both walk deep
+    // ext4 directory trees).
+    let dir_dentry = match file.opendir_dentry() {
+        Some(dentry) => dentry,
+        None => return SyscallResult::Error(ENOTDIR_VALUE),
+    };
+    let fs_ops = match fs_ops_for_dentry(&dir_dentry) {
         Some(o) => o,
         None => return SyscallResult::Error(ENOSYS_VALUE),
     };

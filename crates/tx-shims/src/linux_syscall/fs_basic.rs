@@ -2569,14 +2569,28 @@ pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
                 }
             }
         } else {
-            if dirfd != AT_FDCWD {
+            // Match openat/mkdirat semantics for path-based metadata probes:
+            // absolute paths ignore dirfd, AT_FDCWD starts at cwd, and a real
+            // directory fd starts at the dentry retained by its OpenFile.
+            let rooted_at: Cap<DEntry> = if path.starts_with(b"/") || dirfd == AT_FDCWD {
+                cwd.clone()
+            } else if dirfd < 0 {
                 return SyscallResult::Error(EBADF_VALUE);
-            }
+            } else {
+                let open_file = match ctx.process.fd(dirfd as u32) {
+                    Some(file) => file,
+                    None => return SyscallResult::Error(EBADF_VALUE),
+                };
+                match open_file.opendir_dentry() {
+                    Some(dentry) => dentry,
+                    None => return SyscallResult::Error(ENOTDIR_VALUE),
+                }
+            };
             let walker_cred = ctx.walker_cred();
             let result = {
                 let mut script_ctx = build_subject_script_ctx(ctx);
                 let mut op = StatxOp {
-                    rooted_at: &cwd,
+                    rooted_at: &rooted_at,
                     path: &path,
                     cred: &walker_cred,
                     target: None,
@@ -2601,7 +2615,8 @@ pub(super) async fn sys_statx<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
 /// `__NR_newfstatat = 79`.
 ///
 /// Slice 6 surface:
-/// - `dirfd == AT_FDCWD` for path walks; non-cwd dirfds → `-EBADF`.
+/// - Path walks accept `AT_FDCWD` and real directory fds; absolute paths
+///   ignore `dirfd`, matching the other `*at` syscall arms.
 /// - `flags & AT_EMPTY_PATH` paired with empty path stats either the
 ///   cwd (`AT_FDCWD`) or the supplied fd. LA64 musl uses this fd form
 ///   to implement `fstat(fd)`.
@@ -2644,8 +2659,7 @@ pub(super) async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
 
     // AT_EMPTY_PATH + empty path: stat the cwd itself for AT_FDCWD,
     // or mirror fstat(fd) for a real fd. Otherwise use StatOp +
-    // drive_oneshot from cwd; directory-fd path walks remain out of
-    // scope for this slice.
+    // drive_oneshot from the same cwd/dirfd anchor as openat/mkdirat.
     let cwd = match ctx.process.cwd() {
         Some(d) => d,
         None => return SyscallResult::Error(ENOENT_VALUE),
@@ -2657,13 +2671,24 @@ pub(super) async fn sys_newfstatat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> 
             return sys_fstat([dirfd as u64, statbuf_uaddr, 0, 0, 0, 0], ctx);
         }
     } else {
-        if dirfd != AT_FDCWD {
+        let rooted_at: Cap<DEntry> = if path.starts_with(b"/") || dirfd == AT_FDCWD {
+            cwd.clone()
+        } else if dirfd < 0 {
             return SyscallResult::Error(EBADF_VALUE);
-        }
+        } else {
+            let open_file = match ctx.process.fd(dirfd as u32) {
+                Some(file) => file,
+                None => return SyscallResult::Error(EBADF_VALUE),
+            };
+            match open_file.opendir_dentry() {
+                Some(dentry) => dentry,
+                None => return SyscallResult::Error(ENOTDIR_VALUE),
+            }
+        };
         let result = {
             let mut script_ctx = build_subject_script_ctx(ctx);
             let mut op = StatOp {
-                rooted_at: &cwd,
+                rooted_at: &rooted_at,
                 path: &path,
                 cred: &walker_cred,
                 target: None,
