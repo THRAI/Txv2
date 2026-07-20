@@ -650,6 +650,8 @@ fn la64_signal_frame_restore_uses_saved_user_context() {
                 _reserved0: [0; 3],
                 flags: tx_hal::UserFpContext::FLAG_VALID | tx_hal::UserFpContext::FLAG_DIRTY,
                 _reserved1: 0,
+                _reserved2: [0; 2],
+                simd_regs: [0; 128],
             },
         },
     };

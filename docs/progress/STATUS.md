@@ -1,3 +1,16 @@
+- 2026-07-20 (LA64 finals glibc LSX/LASX 上下文支持). QEMU 9 `-d int` 确认官方 LA 镜像的 glibc
+  动态加载器在 `pc=0x3e0083e7d4` 首次执行 LSX 时触发 ECODE 16（SXD）；原内核只识别到
+  FPD=15，先错误 SIGSEGV，初版处理又因通用 CSR helper 未实现 EUEN(0x02) 读写而在同一指令
+  无限重试。现补齐 SXD=16/ASXD=17、EUEN.SXE/ASXE 懒启用、每线程 32x256-bit 向量区以及
+  标量/LSX/LASX 分级汇编保存恢复，并补齐 EUEN CSR 读写。验证：`make oscomp-build-la64`、
+  `make oscomp-submit-la64` 通过；QEMU 9.2.1 + `sdcard-la-pub.img` + `-smp 8 -m 8G` 成功进入
+  `TX_FINAL_INIT start mode=cagent-only`，CAgent 十项全部 pass，测试组 END，PID 1 以 0 退出。
+- 2026-07-20 (决赛一阶段临时 CAgent-only 评分版本). 为先确认 RV64/LA64 第一题实际得分，默认 finals PID 1
+  脚本暂时只调用 `run_cagent`：打印 `TX_FINAL_INIT start mode=cagent-only`，等待官方 CAgent 十题及 END，
+  `sync` 后以 CAgent 状态退出；`run_buildstorm` 函数仍保留但当前不调用，待第二题 mount-api panic 修复后恢复。
+  该临时版本会使 BuildStorm 无输出/零分，目的是隔离验证两架构 CAgent。验证：`bash -n` 与
+  `git diff --check` 通过。Next：提交官方平台查看 RV64/LA64 CAgent 分数；LA 若仍在 `TX_FINAL_INIT start`
+  前 user-segv，则用本地 `sdcard-la-pub.img` 修首次 Bash 用户态执行。Blocker：LA64 先前仍在 Bash 入口崩溃。
 - 2026-07-20 (决赛一阶段 CAgent 结束死锁修正). 官方 `cagent_testcode.sh` 在启动常驻
   `simple_llm_server` 和十个后台用例后执行裸 `wait`，因此清理阶段的 `kill $SERVER_PID` 不可达；原包装层
   45 秒后执行 `killall simple_llm_server`，但 Txv2 的 `execve` 尚未刷新 `/proc/<pid>/stat` 的 `comm`，

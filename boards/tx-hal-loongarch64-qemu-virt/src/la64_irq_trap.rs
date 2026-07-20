@@ -440,6 +440,21 @@ where
         return TrapAction::Resume;
     }
 
+    // LSX/LASX share their low lanes with the scalar FP register file.  The
+    // first vector instruction traps while SXE/ASXE is clear; enable the
+    // requested extension and retry it.  Subsequent trap-frame capture saves
+    // the complete vector file into UserFpContext before another thread can
+    // own the CPU.
+    if from_user && (ecode == LA64_ECODE_SXD || ecode == LA64_ECODE_ASXD) {
+        let mut euen = read_la64_csr(LA64_CSR_EUEN);
+        euen |= LA64_EUEN_FPE | LA64_EUEN_SXE;
+        if ecode == LA64_ECODE_ASXD {
+            euen |= LA64_EUEN_ASXE;
+        }
+        write_la64_csr(LA64_CSR_EUEN, euen);
+        return TrapAction::Resume;
+    }
+
     if ecode == LA64_ECODE_ALE {
         if from_user {
             match super::la64_unaligned::emulate_user_unaligned(frame) {
@@ -585,7 +600,11 @@ pub(crate) const fn classify_la64_trap(estat: usize) -> TrapClass {
         }
         LA64_ECODE_SYS => TrapClass::Syscall,
         LA64_ECODE_BRK => TrapClass::Breakpoint,
-        LA64_ECODE_INE | LA64_ECODE_IPE | LA64_ECODE_FPD => TrapClass::IllegalInstruction,
+        LA64_ECODE_INE
+        | LA64_ECODE_IPE
+        | LA64_ECODE_FPD
+        | LA64_ECODE_SXD
+        | LA64_ECODE_ASXD => TrapClass::IllegalInstruction,
         _ => TrapClass::UnknownSync,
     }
 }
@@ -697,6 +716,9 @@ pub(crate) fn write_la64_csr(csr: usize, value: usize) {
             LA64_CSR_CRMD => {
                 core::arch::asm!("csrwr {value}, 0x00", value = in(reg) value, options(nomem, nostack));
             }
+            LA64_CSR_EUEN => {
+                core::arch::asm!("csrwr {value}, 0x02", value = in(reg) value, options(nomem, nostack));
+            }
             LA64_CSR_EENTRY => {
                 core::arch::asm!("csrwr {value}, 0x0c", value = in(reg) value, options(nomem, nostack));
             }
@@ -751,6 +773,10 @@ pub(crate) fn read_la64_csr(csr: usize) -> usize {
         match csr {
             LA64_CSR_CRMD => {
                 core::arch::asm!("csrrd {value}, 0x00", value = out(reg) value, options(nomem, nostack));
+                value
+            }
+            LA64_CSR_EUEN => {
+                core::arch::asm!("csrrd {value}, 0x02", value = out(reg) value, options(nomem, nostack));
                 value
             }
             LA64_CSR_ECFG => {

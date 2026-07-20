@@ -103,21 +103,28 @@ impl TrapFrameView {
 /// The exact meaning of `regs` and `status` is platform-owned. Portable
 /// signal code treats this as an opaque saved context and passes it back to
 /// the selected platform through `SignalFrameIf::restore_signal_frame`.
-#[repr(C)]
+#[repr(C, align(32))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UserFpContext {
     pub regs: [u64; 32],
     pub fcsr: u32,
     pub fcc: u8,
     pub _reserved0: [u8; 3],
-    /// Bit 0: FP state valid. Bit 1: FP state dirty.
+    /// Bit 0: FP state valid. Bit 1: FP state dirty. Bit 2: LSX state
+    /// valid. Bit 3: LASX state valid.
     pub flags: u32,
     pub _reserved1: u32,
+    pub _reserved2: [u64; 2],
+    /// Architecture extension state. LA64 uses one 256-bit slot per
+    /// vector register; scalar-only platforms leave this area zeroed.
+    pub simd_regs: [u64; 128],
 }
 
 impl UserFpContext {
     pub const FLAG_VALID: u32 = 1 << 0;
     pub const FLAG_DIRTY: u32 = 1 << 1;
+    pub const FLAG_LSX_VALID: u32 = 1 << 2;
+    pub const FLAG_LASX_VALID: u32 = 1 << 3;
 
     pub const fn empty() -> Self {
         Self {
@@ -127,6 +134,8 @@ impl UserFpContext {
             _reserved0: [0; 3],
             flags: 0,
             _reserved1: 0,
+            _reserved2: [0; 2],
+            simd_regs: [0; 128],
         }
     }
 

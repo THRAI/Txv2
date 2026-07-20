@@ -439,8 +439,8 @@ tx_la64_resume_kernel_after_reschedule:
     .globl tx_la64_qemu_fp_save_context
     .type tx_la64_qemu_fp_save_context, @function
 tx_la64_qemu_fp_save_context:
-    csrrd   $t0, TX_LA64_CSR_EUEN
-    andi    $t0, $t0, 1
+    csrrd   $t3, TX_LA64_CSR_EUEN
+    andi    $t0, $t3, 1
     beqz    $t0, .Ltx_la64_fp_save_none
 
     fst.d   $f0,  $a0,   0
@@ -505,8 +505,32 @@ tx_la64_qemu_fp_save_context:
     or      $t0, $t0, $t1
     st.b    $t0, $a0, 260
 
-    li.w    $t0, 3
-    st.w    $t0, $a0, 264
+    li.w    $t2, 3
+    andi    $t1, $t3, 4
+    bnez    $t1, .Ltx_la64_fp_save_lasx
+    andi    $t1, $t3, 2
+    bnez    $t1, .Ltx_la64_fp_save_lsx
+    b       .Ltx_la64_fp_save_done
+
+.Ltx_la64_fp_save_lasx:
+    .set    tx_la64_simd_off, 288
+    .irp    n,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    xvst    $xr\n, $a0, tx_la64_simd_off
+    .set    tx_la64_simd_off, tx_la64_simd_off + 32
+    .endr
+    ori     $t2, $t2, 12
+    b       .Ltx_la64_fp_save_done
+
+.Ltx_la64_fp_save_lsx:
+    .set    tx_la64_simd_off, 288
+    .irp    n,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    vst     $vr\n, $a0, tx_la64_simd_off
+    .set    tx_la64_simd_off, tx_la64_simd_off + 32
+    .endr
+    ori     $t2, $t2, 4
+
+.Ltx_la64_fp_save_done:
+    st.w    $t2, $a0, 264
     li.w    $a0, 1
     jr      $ra
 
@@ -522,8 +546,13 @@ tx_la64_qemu_fp_restore_context:
     ld.w    $t0, $a0, 264
     andi    $t1, $t0, 1
     beqz    $t1, .Ltx_la64_fp_restore_disable
+    andi    $t1, $t0, 8
+    bnez    $t1, .Ltx_la64_fp_restore_lasx
+    andi    $t1, $t0, 4
+    bnez    $t1, .Ltx_la64_fp_restore_lsx
 
     csrrd   $t2, TX_LA64_CSR_EUEN
+    andi    $t2, $t2, 0xff8
     ori     $t2, $t2, 1
     csrwr   $t2, TX_LA64_CSR_EUEN
 
@@ -559,7 +588,32 @@ tx_la64_qemu_fp_restore_context:
     fld.d   $f29, $a0, 232
     fld.d   $f30, $a0, 240
     fld.d   $f31, $a0, 248
+    b       .Ltx_la64_fp_restore_control
 
+.Ltx_la64_fp_restore_lasx:
+    csrrd   $t2, TX_LA64_CSR_EUEN
+    andi    $t2, $t2, 0xff8
+    ori     $t2, $t2, 7
+    csrwr   $t2, TX_LA64_CSR_EUEN
+    .set    tx_la64_simd_off, 288
+    .irp    n,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    xvld    $xr\n, $a0, tx_la64_simd_off
+    .set    tx_la64_simd_off, tx_la64_simd_off + 32
+    .endr
+    b       .Ltx_la64_fp_restore_control
+
+.Ltx_la64_fp_restore_lsx:
+    csrrd   $t2, TX_LA64_CSR_EUEN
+    andi    $t2, $t2, 0xff8
+    ori     $t2, $t2, 3
+    csrwr   $t2, TX_LA64_CSR_EUEN
+    .set    tx_la64_simd_off, 288
+    .irp    n,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    vld     $vr\n, $a0, tx_la64_simd_off
+    .set    tx_la64_simd_off, tx_la64_simd_off + 32
+    .endr
+
+.Ltx_la64_fp_restore_control:
     ld.w    $t1, $a0, 256
     movgr2fcsr $fcsr0, $t1
 
@@ -583,7 +637,7 @@ tx_la64_qemu_fp_restore_context:
 
 .Ltx_la64_fp_restore_disable:
     csrrd   $t2, TX_LA64_CSR_EUEN
-    andi    $t2, $t2, 0xffe
+    andi    $t2, $t2, 0xff8
     csrwr   $t2, TX_LA64_CSR_EUEN
     jr      $ra
     .size tx_la64_qemu_fp_restore_context, . - tx_la64_qemu_fp_restore_context

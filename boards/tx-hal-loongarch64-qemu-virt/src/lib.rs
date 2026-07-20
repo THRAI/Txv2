@@ -301,7 +301,7 @@ fn la64_set_fpu_enabled(enabled: bool) {
     if enabled {
         euen |= LA64_EUEN_FPE;
     } else {
-        euen &= !LA64_EUEN_FPE;
+        euen &= !(LA64_EUEN_FPE | LA64_EUEN_SXE | LA64_EUEN_ASXE);
     }
     la64_irq_trap::write_la64_csr(LA64_CSR_EUEN, euen);
 }
