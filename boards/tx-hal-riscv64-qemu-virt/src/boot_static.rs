@@ -57,6 +57,24 @@ impl FirmwareDtb {
     pub(crate) const fn addr(self) -> usize {
         self.phys.0
     }
+
+    /// Address used while parsing the firmware-owned blob.
+    ///
+    /// The SBI register carries a physical address. Real RV64 execution has
+    /// already left the low-linked image by the time Rust parses it, so use
+    /// the board's named direct-map conversion. Host tests keep passing real
+    /// host pointers and therefore intentionally use the raw value.
+    pub(crate) const fn parse_addr(self) -> usize {
+        #[cfg(target_arch = "riscv64")]
+        {
+            DIRECT_MAP_BASE + self.phys.0
+        }
+
+        #[cfg(not(target_arch = "riscv64"))]
+        {
+            self.phys.0
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

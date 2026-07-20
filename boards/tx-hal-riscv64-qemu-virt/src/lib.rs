@@ -58,7 +58,7 @@ fn for_each_console_byte_for_sbi(bytes: &[u8], mut emit: impl FnMut(u8)) {
 
 const QEMU_VIRT_RAM_BASE: usize = 0x8000_0000;
 const QEMU_VIRT_FALLBACK_RAM_SIZE: usize = 256 * 1024 * 1024;
-const MAX_BOOT_CPUS: usize = 4;
+const MAX_BOOT_CPUS: usize = 8;
 pub(crate) const PLIC_PHYS_BASE: usize = 0x0c00_0000;
 /// QEMU virt machine's NS16550-compatible UART. PLIC IRQ 10
 /// ([`IrqIf::UART_IRQ`]) is wired to this UART, but the device
@@ -150,6 +150,10 @@ static RV64_PERCPU_AREAS: [Rv64PerCpuArea; MAX_BOOT_CPUS] = [
     Rv64PerCpuArea::new(1),
     Rv64PerCpuArea::new(2),
     Rv64PerCpuArea::new(3),
+    Rv64PerCpuArea::new(4),
+    Rv64PerCpuArea::new(5),
+    Rv64PerCpuArea::new(6),
+    Rv64PerCpuArea::new(7),
 ];
 
 /// Per-hart save area for the reschedule longjmp (slice 2 of the
@@ -223,6 +227,26 @@ static RV64_KERNEL_RESUME_CTX: [PerHartCell<KernelResumeCtx>; MAX_BOOT_CPUS] = [
         ra: 0,
         s: [0; 12],
     }),
+    PerHartCell::new(KernelResumeCtx {
+        sp: 0,
+        ra: 0,
+        s: [0; 12],
+    }),
+    PerHartCell::new(KernelResumeCtx {
+        sp: 0,
+        ra: 0,
+        s: [0; 12],
+    }),
+    PerHartCell::new(KernelResumeCtx {
+        sp: 0,
+        ra: 0,
+        s: [0; 12],
+    }),
+    PerHartCell::new(KernelResumeCtx {
+        sp: 0,
+        ra: 0,
+        s: [0; 12],
+    }),
 ];
 
 /// Per-CPU trap-handler stack. Sized 64 KiB; the trap vector
@@ -238,13 +262,17 @@ static RV64_KERNEL_RESUME_CTX: [PerHartCell<KernelResumeCtx>; MAX_BOOT_CPUS] = [
 /// `KERNEL_RO`); plain `static [u8; N]` lands in `.rodata` and
 /// the trap-vector's first store would fault.
 ///
-/// Total static cost is `MAX_BOOT_CPUS × 64 KiB = 256 KiB`.
+/// Total static cost is `MAX_BOOT_CPUS × 64 KiB = 512 KiB`.
 const RV64_TRAP_STACK_SIZE: usize = 64 * 1024;
 
 #[repr(C, align(16))]
 pub struct Rv64TrapStack(pub [u8; RV64_TRAP_STACK_SIZE]);
 
 static RV64_TRAP_STACKS: [PerHartCell<Rv64TrapStack>; MAX_BOOT_CPUS] = [
+    PerHartCell::new(Rv64TrapStack([0; RV64_TRAP_STACK_SIZE])),
+    PerHartCell::new(Rv64TrapStack([0; RV64_TRAP_STACK_SIZE])),
+    PerHartCell::new(Rv64TrapStack([0; RV64_TRAP_STACK_SIZE])),
+    PerHartCell::new(Rv64TrapStack([0; RV64_TRAP_STACK_SIZE])),
     PerHartCell::new(Rv64TrapStack([0; RV64_TRAP_STACK_SIZE])),
     PerHartCell::new(Rv64TrapStack([0; RV64_TRAP_STACK_SIZE])),
     PerHartCell::new(Rv64TrapStack([0; RV64_TRAP_STACK_SIZE])),
@@ -321,6 +349,14 @@ impl BootPlatformIf for Platform {
         let bag = BootStaticBag::<IdentityLive>::capture_once(firmware_arg);
         // 建立引导页表:Sv39 无硬件直映射窗口,内核要在高地址跑必须软件建表
         pmap::adopt_high_linked_bootstrap_pmap(bag);
+        // QEMU with 8 GiB RAM may place the firmware DTB near the top of RAM
+        // (the official lane passes 0x27fe00000), outside the trampoline's
+        // initial 1 GiB direct-map leaf. Preseed the leaf containing the DTB
+        // before the parser dereferences the firmware pointer through its
+        // high direct-map alias.
+        #[cfg(target_arch = "riscv64")]
+        pmap::cover_boot_firmware_dtb_from_bag(bag, PhysAddr(firmware_arg))
+            .expect("firmware DTB is outside the RV64 bootstrap direct map");
 
         // 把解析出的事实发布成全局 BootInfo/PlatformInfo(供上层 boot_info() 等读),
         // 并在拆除低地址恒等映射前完成收尾(IdentityLive -> IdentityDropped 类型状态机)
@@ -1770,7 +1806,7 @@ impl BootStaticBag<IdentityLive> {
     }
 
     unsafe fn publish_boot_info_from_fdt(&mut self) {
-        let dtb_addr = self.firmware_dtb().addr();
+        let dtb_addr = self.firmware_dtb().parse_addr();
         let memory_regions = unsafe { self.memory_regions_mut() };
         let cmdline = unsafe { self.cmdline_mut() };
         memory_regions.fill(reserved_region());

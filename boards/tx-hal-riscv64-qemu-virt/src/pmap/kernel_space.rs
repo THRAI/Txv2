@@ -45,8 +45,8 @@ use super::{
     ensure_l1_table_for_reservation, l0_table_mut, l1_table_mut, page_table_mut_from_phys,
     pte_is_branch, pte_is_leaf, pte_phys, rollback_intermediates_from_bag, rv64_1g_leaf_index,
     rv64_2m_leaf_index, rv64_4k_leaf_index, sfence_vma_all, validate_aligned_mapping,
-    validate_aligned_virt, validate_rv64_leaf_permissions, PAGE_SIZE, PTE_G, PTE_R, PTE_W,
-    QEMU_RAM_BASE, SUPERPAGE_1G_SIZE, SUPERPAGE_2M_SIZE,
+    validate_aligned_virt, validate_rv64_leaf_permissions, DIRECT_MAP_SIZE, PAGE_SIZE, PTE_G,
+    PTE_R, PTE_W, QEMU_RAM_BASE, SUPERPAGE_1G_SIZE, SUPERPAGE_2M_SIZE,
 };
 
 // 引导 pmap 事实与直接映射扩展放在一起：substrate 先消费这些事实，再请板卡
@@ -90,6 +90,39 @@ pub(super) fn reserve_direct_map_1g_from_bag<State>(
     )))
 }
 
+/// Preseed the direct-map root leaf that contains the firmware DTB.
+///
+/// The trampoline deliberately installs only the first 1 GiB RAM leaf. With
+/// large QEMU guests, firmware may place the DTB near the top of RAM, before
+/// its memory nodes have been parsed and before substrate can extend the full
+/// direct map. This one early leaf is therefore installed without advancing
+/// the published contiguous direct-map range; normal substrate extension will
+/// later encounter the identical leaf and treat it idempotently.
+pub(crate) fn cover_boot_firmware_dtb_from_bag<State>(
+    bag: &BootStaticBag<State>,
+    dtb_phys: PhysAddr,
+) -> Result<(), PmapError> {
+    if dtb_phys.0 == 0 {
+        return Ok(());
+    }
+    if dtb_phys.0 < QEMU_RAM_BASE || dtb_phys.0 >= DIRECT_MAP_SIZE {
+        return Err(PmapError::InvalidRequest);
+    }
+
+    let leaf_phys = dtb_phys.0 - (dtb_phys.0 % SUPERPAGE_1G_SIZE);
+    let virt = direct_map_virt(leaf_phys);
+    let expected = encode_leaf_pte(PhysAddr(leaf_phys), PTE_R | PTE_W | PTE_G);
+    let root = unsafe { bag.bootstrap_root_mut() };
+    let slot = &mut root.0[rv64_1g_leaf_index(virt)];
+    if *slot == 0 {
+        *slot = expected;
+    } else if *slot != expected {
+        return Err(PmapError::AlreadyMapped);
+    }
+    sfence_vma_all();
+    Ok(())
+}
+
 // 薄壳：提交直连区 1 GiB 叶子预约（取全局根后转交 `_from_bag`）。
 pub(crate) fn commit_kernel_direct_map_1g(reservation: PmapReservation) {
     commit_direct_map_1g_from_bag(BootStaticBag::<IdentityDropped>::global_ref(), reservation);
@@ -131,12 +164,21 @@ pub(super) fn extend_direct_map_from_bag<State>(
     let mut phys = align_up(current_end, SUPERPAGE_1G_SIZE).ok_or(PmapError::InvalidRequest)?;
     let target = align_up(phys_end.0, SUPERPAGE_1G_SIZE).ok_or(PmapError::InvalidRequest)?;
     while phys < target {
-        if let Some(reservation) = reserve_direct_map_1g_from_bag(bag, PhysAddr(phys))? {
-            commit_direct_map_1g_from_bag(bag, reservation);
-        }
-        phys = phys
+        let next_phys = phys
             .checked_add(SUPERPAGE_1G_SIZE)
             .ok_or(PmapError::InvalidRequest)?;
+        if let Some(reservation) = reserve_direct_map_1g_from_bag(bag, PhysAddr(phys))? {
+            commit_direct_map_1g_from_bag(bag, reservation);
+        } else {
+            // A bootstrap-only leaf (notably the high firmware-DTB leaf)
+            // becomes part of the contiguous direct map once this walk
+            // reaches it. The PTE needs no rewrite, but the published range
+            // must still advance across the already-identical leaf.
+            unsafe {
+                extend_bootstrap_direct_map_info(bag, next_phys);
+            }
+        }
+        phys = next_phys;
     }
 
     Ok(())

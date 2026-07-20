@@ -17,8 +17,13 @@
 
 use super::helpers::{bootstrap_block_on, exec_error_tag, parse_init_from_cmdline};
 use super::*;
-use crate::adapter::step_engine::{self as step_engine, StepOutcome, page_allocator};
+use crate::adapter::step_engine::{self as step_engine, page_allocator, StepOutcome};
 use core::fmt::Write;
+
+/// Finals first-stage PID 1 policy.  The script stays in userspace syntax and
+/// is handed to the official rootfs's Bash with `-c`; bootstrap therefore does
+/// not need to create or overwrite `/init` on the contest ext4 image.
+const FINAL_TESTCODE: &[u8] = include_bytes!("final_testcode.sh");
 
 fn oscomp_boot_suite(cmdline: Option<&str>) -> Option<&str> {
     let cmdline = cmdline?;
@@ -40,6 +45,27 @@ fn onsite_profile_enabled<P: tx_hal::TxPlatform>() -> bool {
     cmdline
         .split_ascii_whitespace()
         .any(|token| token == "tx.profile=onsite")
+}
+
+/// Select the finals autorun only for a block-backed root and only when the
+/// caller did not explicitly choose another init lane.  The official judge
+/// supplies neither a cmdline nor an initrd, so it lands here naturally.
+fn final_testcode_autorun_enabled<P: tx_hal::TxPlatform>() -> bool {
+    if !ROOTFS_FROM_BOOT_MEDIA.load(Ordering::Acquire) {
+        return false;
+    }
+
+    let Some(cmdline) = <P as tx_hal::BootInfoIf>::boot_info().cmdline else {
+        return true;
+    };
+    !cmdline.split_ascii_whitespace().any(|token| {
+        token.starts_with("init=")
+            || token.starts_with("tx.runsh=")
+            || matches!(
+                token,
+                "tx.profile=onsite" | "tx.profile=busybox" | "tx.profile=pretest"
+            )
+    })
 }
 
 fn oscomp_libctest_network_cmd(libc: &str) -> alloc::string::String {
@@ -548,6 +574,42 @@ impl<P: TxPlatform> CoreInit<P> {
                     }
                 }
                 return;
+            }
+        }
+
+        // Finals first-stage default: keep the official ext4 image mounted as
+        // `/`, replace PID 1 with that image's Bash, and let the embedded
+        // userspace script run CAgent followed by BuildStorm.  This is
+        // architecture-neutral (the image supplies the RV64/LA64 Bash and
+        // dynamic loader) and avoids requiring an `/init` file on the disk.
+        if final_testcode_autorun_enabled::<P>() {
+            let envp: &[&[u8]] = &[
+                b"PATH=/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                b"HOME=/root",
+                b"TMPDIR=/tmp",
+                b"TERM=linux",
+            ];
+            let argv: &[&[u8]] = &[b"bash", b"-c", FINAL_TESTCODE];
+            let outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
+                &init,
+                &thread,
+                b"/bin/bash",
+                argv,
+                envp,
+                &cred,
+            ));
+            Self::write_board_sentinel_prefix();
+            match outcome {
+                Ok(()) => {
+                    tx_hal::console_write_str::<P>(":bootstrap-exec:final:ok\n");
+                    return;
+                }
+                Err(e) => {
+                    tx_hal::console_write_str::<P>(":bootstrap-exec:final:fail:");
+                    tx_hal::console_write_str::<P>(exec_error_tag(&e));
+                    tx_hal::console_write_str::<P>("\n");
+                    panic!("bootstrap exec for finals /bin/bash failed: {e:?}");
+                }
             }
         }
 
@@ -2803,7 +2865,8 @@ fn oscomp_glibc_script_for_group(group: &str) -> Option<&'static str> {
     }
 }
 
-const LIBCTEST_STATIC_SAFE_CASES: &str = "argv basename clocale_mbfuncs clock_gettime dirname env fdopen fnmatch fscanf fwscanf \
+const LIBCTEST_STATIC_SAFE_CASES: &str =
+    "argv basename clocale_mbfuncs clock_gettime dirname env fdopen fnmatch fscanf fwscanf \
      iconv_open inet_pton mbc memstream pthread_cond pthread_tsd qsort random search_hsearch \
      search_insque search_lsearch search_tsearch setjmp snprintf socket sscanf sscanf_long stat \
      strftime string string_memcpy string_memmem string_memset string_strchr string_strcspn \
@@ -2821,7 +2884,8 @@ const LIBCTEST_STATIC_SAFE_CASES: &str = "argv basename clocale_mbfuncs clock_ge
      scanf_nullbyte_char setvbuf_unget sigprocmask_internal sscanf_eof statvfs strverscmp \
      syscall_sign_extend uselocale_0 wcsncpy_read_overflow wcsstr_false_negative";
 
-const LIBCTEST_DYNAMIC_SAFE_CASES: &str = "argv basename clocale_mbfuncs clock_gettime dirname dlopen env fdopen fnmatch fscanf fwscanf \
+const LIBCTEST_DYNAMIC_SAFE_CASES: &str =
+    "argv basename clocale_mbfuncs clock_gettime dirname dlopen env fdopen fnmatch fscanf fwscanf \
      iconv_open inet_pton mbc memstream pthread_cond pthread_tsd qsort random search_hsearch \
      search_insque search_lsearch search_tsearch sem_init setjmp snprintf socket sscanf \
      sscanf_long stat strftime string string_memcpy string_memmem string_memset string_strchr \

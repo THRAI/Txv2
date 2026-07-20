@@ -1,3 +1,23 @@
+- 2026-07-20 (决赛一阶段 PID 1 自动运行两题). 默认块设备根文件系统启动不再查找官方镜像中不存在的
+  `/init`：现有 PID 1 直接 exec 镜像的 `/bin/bash`，并以 `-c` 运行内嵌的用户态
+  `crates/tx-kernel/src/init/final_testcode.sh`；脚本在镜像根布局中定位官方脚本，先跑 CAgent、再跑
+  BuildStorm，保留两者原始判分输出。CAgent 官方脚本的裸 `wait`会等待常驻 `simple_llm_server`，包装层在全部
+  用例 35 秒上限之后的 45 秒结束该服务，使官方脚本输出 END 后继续第二题。显式 `init=`、`tx.runsh=`、
+  onsite/busybox/pretest 不进入该默认路径。验证：启动脚本通过 `bash -n`，`git diff --check` 通过，RV64 和
+  LA64 release 交叉构建均成功；本地没有决赛官方 8 GiB 镜像，无法端到端确认镜像内脚本路径和 Bash/动态链接
+  运行。Next：提交官方平台确认
+  `:bootstrap-exec:final:ok`、`TX_FINAL_INIT start` 和两组官方 START/END。Blocker：缺少官方镜像。
+- 2026-07-20 (决赛一阶段 RV64 高 DTB + 8-hart 启动容量修复). 官方命令为 `-m 8G -smp 8`，OpenSBI 1.5.1
+  把 DTB 放到 `0x27fe00000`，旧引导页表只直映首个 1 GiB RAM，故 `boot_handoff` 读取 DTB header 时触发
+  load page fault；现在接管引导页表后先预置 DTB 所在的 1 GiB direct-map 叶，解析统一走具名物理→direct-map
+  地址转换，且不把这个尚不连续的叶错误发布为完整直映范围，后续 substrate 扩展会幂等接管。官方 `-smp 8`
+  还允许 0..7 任一 hart 成为 boot hart；RV64 汇编上限、per-CPU 区、kernel-resume context、trap stack 和链接器
+  启动栈由 4 扩到 8（512 KiB→1 MiB）。无 cmdline 时仍只上线 boot hart，本轮只扩容量、不改变默认单核策略。
+  验证：`cargo -q xtask unit` 通过；RV64 HAL 串行单测 84/84（新增官方高 DTB 页表槽和 hart7 回归）；debug/release
+  RV64 交叉构建通过；release 链接符号确认 1 MiB boot stack、内核仍在 32 MiB bootstrap alias 内；本地
+  `-m 8G -smp 8` 连跑覆盖 boot hart 1/2/3/4/7，全部到 `boot:ok`。Next：回到 CAgent `/init` 启动选择和官方
+  sdcard 镜像端到端验证。Blocker：本地 QEMU 1.3 把 DTB 放在 `0xbfe00000`，官方高地址布局只能靠精确页表单测
+  与下一次平台提交复验。
 - 2026-07-20 (决赛一阶段默认根挂载策略). 无 cmdline、无 initrd 的 QEMU 启动现在默认尝试把 `vda` 的 ext4
   直接挂为 `/`，不再要求评测平台配合传入 `tx.profile=onsite`；显式 `tx.root=<设备>` 优先，`tx.root=sdcard`
   兼容映射到 `vda`。`tx.profile=pretest`、`tx.profile=busybox` 和 initrd 启动仍保留 tmpfs 根，避免破坏旧初赛和

@@ -31,7 +31,8 @@ use super::address_space::{
     reserve_mapping_from_root, unmap_mapping_from_root,
 };
 use super::kernel_space::{
-    commit_direct_map_1g_from_bag, commit_kernel_mapping_from_bag, protect_kernel_mapping_from_bag,
+    commit_direct_map_1g_from_bag, commit_kernel_mapping_from_bag,
+    cover_boot_firmware_dtb_from_bag, extend_direct_map_from_bag, protect_kernel_mapping_from_bag,
     reserve_direct_map_1g_from_bag, reserve_kernel_mapping_from_bag,
     rollback_kernel_mapping_from_bag, unmap_kernel_mapping_from_bag,
 };
@@ -452,6 +453,42 @@ fn direct_map_extension_is_idempotent_for_existing_leaf() {
         reserve_direct_map_1g_from_bag(&bag, PhysAddr(QEMU_RAM_BASE))
             .expect("existing direct map leaf"),
         None
+    );
+}
+
+#[test]
+fn high_firmware_dtb_preseeds_its_direct_map_leaf_without_publishing_a_gap() {
+    let _guard = pmap_test_guard();
+    let mut bag = test_bag();
+    publish_bootstrap_bag(&mut bag);
+
+    let official_dtb = PhysAddr(0x2_7fe0_0000);
+    cover_boot_firmware_dtb_from_bag(&bag, official_dtb).expect("cover official high DTB leaf");
+
+    let leaf_phys = PhysAddr(0x2_4000_0000);
+    let slot = rv64_1g_leaf_index(EXPECTED_DIRECT_MAP_BASE + leaf_phys.0);
+    assert_eq!(
+        bag.bootstrap_root_ref().0[slot],
+        encode_leaf_pte(leaf_phys, PTE_R | PTE_W | PTE_G)
+    );
+    assert_eq!(
+        bag.bootstrap_pmap_info_ref()
+            .expect("pmap info")
+            .direct_map
+            .size,
+        QEMU_BOOTSTRAP_MAP_SIZE,
+        "a non-contiguous bootstrap leaf must not inflate the published span"
+    );
+
+    extend_direct_map_from_bag(&bag, PhysAddr(0x2_8000_0000))
+        .expect("extend the contiguous direct map through the preseeded leaf");
+    assert_eq!(
+        bag.bootstrap_pmap_info_ref()
+            .expect("pmap info")
+            .direct_map
+            .size,
+        8 * QEMU_BOOTSTRAP_MAP_SIZE,
+        "the existing DTB leaf must join the published contiguous span"
     );
 }
 

@@ -8,7 +8,7 @@ use crate::{
     asid_residency_mask, clear_asid_residency, clear_current_asid_residency, dispatch_trap_frame,
     enter_irq_context, for_each_console_byte_for_sbi, mark_asid_resident_on_current_cpu,
     mark_ipi_ack, percpu_tls_for_cpu, remote_sfence_targets_for_asid_from,
-    remote_sfence_targets_from, trap::classify_rv64_trap, Platform, Rv64TrapFrame,
+    remote_sfence_targets_from, trap::classify_rv64_trap, Platform, Rv64TrapFrame, MAX_BOOT_CPUS,
     RV64_PERCPU_AREAS,
 };
 
@@ -164,12 +164,14 @@ fn percpu_install_sets_kernel_tls_pointer_and_current_cpu() {
     let _guard = RV64_HAL_TEST_LOCK.lock().expect("rv64 hal test lock");
     let saved_tls = <Platform as PercpuIf>::read_kernel_tls();
 
-    <Platform as PercpuIf>::install_early_percpu(CpuId(2));
+    <Platform as PercpuIf>::install_early_percpu(CpuId(7));
 
     let kernel_tls = <Platform as PercpuIf>::read_kernel_tls() as usize;
-    assert_eq!(Some(kernel_tls), percpu_tls_for_cpu(CpuId(2)));
-    assert_eq!(<Platform as PercpuIf>::current_cpu_id(), CpuId(2));
-    assert_eq!(<Platform as SmpIf>::current_cpu_id(), CpuId(2));
+    assert_eq!(MAX_BOOT_CPUS, 8);
+    assert_eq!(RV64_PERCPU_AREAS.len(), 8);
+    assert_eq!(Some(kernel_tls), percpu_tls_for_cpu(CpuId(7)));
+    assert_eq!(<Platform as PercpuIf>::current_cpu_id(), CpuId(7));
+    assert_eq!(<Platform as SmpIf>::current_cpu_id(), CpuId(7));
 
     <Platform as PercpuIf>::write_kernel_tls(saved_tls);
 }

@@ -25,7 +25,9 @@ core::arch::global_asm!(
     // before satp turns on; an under-mapped kernel page-faults into a trap-vector loop.
     .equ TX_RV64_KERNEL_ALIAS_L0_TABLES, 16
     .equ TX_RV64_PAGE_SIZE, 4096
-    .equ TX_RV64_MAX_BOOT_CPUS, 4
+    // Must equal `lib.rs::MAX_BOOT_CPUS`. The official final-phase lane uses
+    // `-smp 8`, and OpenSBI may choose any of harts 0..7 as the boot hart.
+    .equ TX_RV64_MAX_BOOT_CPUS, 8
     .equ TX_RV64_BOOT_STACK_STRIDE, 131072
     .equ TX_RV64_SATP_SV39, 0x8000000000000000
     .equ TX_RV64_PTE_V, 0x001
