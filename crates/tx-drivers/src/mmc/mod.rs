@@ -314,7 +314,8 @@ impl Vf2Mmc {
     fn read_one_block(&self, lba: u32, out: &mut [usize]) -> bool {
         self.set_size(SD_BLOCK_SIZE, SD_BLOCK_SIZE);
         let cmd = CMD::data_cmd(0, 17); // CMD17 single-block read
-        self.send_cmd(cmd, CMDARG::from(lba), Some(out), true).is_some()
+        self.send_cmd(cmd, CMDARG::from(lba), Some(out), true)
+            .is_some()
     }
 
     fn write_one_block(&self, lba: u32, data: &mut [usize]) -> bool {
@@ -329,7 +330,12 @@ impl Vf2Mmc {
 
 fn frame_words_mut(frame: Frame) -> Option<&'static mut [usize]> {
     let ptr = page_allocator::frame_kernel_addr(frame.ppn()).ok()?;
-    Some(unsafe { core::slice::from_raw_parts_mut(ptr as *mut usize, PAGE_SIZE / core::mem::size_of::<usize>()) })
+    Some(unsafe {
+        core::slice::from_raw_parts_mut(
+            ptr as *mut usize,
+            PAGE_SIZE / core::mem::size_of::<usize>(),
+        )
+    })
 }
 
 impl BlockDeviceOps for Vf2Mmc {
@@ -368,8 +374,7 @@ impl BlockDeviceOps for Vf2Mmc {
                 return StepOutcome::Err(Errno::EIO.into());
             };
             for blk in 0..BLOCKS_PER_PAGE {
-                let lba = block_id.as_u64()
-                    + (idx * BLOCKS_PER_PAGE + blk) as u64;
+                let lba = block_id.as_u64() + (idx * BLOCKS_PER_PAGE + blk) as u64;
                 let chunk = &mut words[blk * WORDS_PER_BLOCK..(blk + 1) * WORDS_PER_BLOCK];
                 if !self.read_one_block(lba as u32, chunk) {
                     return StepOutcome::Err(Errno::EIO.into());
@@ -392,8 +397,7 @@ impl BlockDeviceOps for Vf2Mmc {
                 return StepOutcome::Err(Errno::EIO.into());
             };
             for blk in 0..BLOCKS_PER_PAGE {
-                let lba = block_id.as_u64()
-                    + (idx * BLOCKS_PER_PAGE + blk) as u64;
+                let lba = block_id.as_u64() + (idx * BLOCKS_PER_PAGE + blk) as u64;
                 let chunk = &mut words[blk * WORDS_PER_BLOCK..(blk + 1) * WORDS_PER_BLOCK];
                 if !self.write_one_block(lba as u32, chunk) {
                     return StepOutcome::Err(Errno::EIO.into());

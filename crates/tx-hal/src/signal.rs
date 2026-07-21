@@ -114,7 +114,6 @@ pub struct SavedSignalFrame {
 unsafe impl Pod for SavedSignalFrame {}
 
 pub trait SignalFrameIf: TrapIf {
-
     fn signal_frame_size() -> usize {
         0
     }

@@ -2113,7 +2113,6 @@ pub const MEMBARRIER_SUPPORTED_MASK: u64 = MEMBARRIER_CMD_QUERY
 // syscall surface; SIOCGIF* live with the ioctl block above.
 // ---------------------------------------------------------------------------
 
-
 /// `IPPROTO_ICMPV6` — ICMPv6.
 pub const IPPROTO_ICMPV6: i32 = 58;
 
@@ -2151,8 +2150,6 @@ pub const IPV6_RECVTCLASS: i32 = 66;
 /// `IPV6_TCLASS` — ancillary/sticky traffic class.
 pub const IPV6_TCLASS: i32 = 67;
 
-
-
 // Socket-option *names* (the `optname` arg to set/getsockopt), grouped by level.
 // CRITICAL: these MUST be defined — the set/getsockopt dispatch matches on
 // `(level, OPTNAME)`; an undefined OPTNAME silently becomes an irrefutable
@@ -2174,7 +2171,6 @@ pub const IP_MULTICAST_LOOP: i32 = 34;
 pub const IP_ADD_MEMBERSHIP: i32 = 35;
 pub const IP_DROP_MEMBERSHIP: i32 = 36;
 pub const ICMP6_FILTER: i32 = 1;
-
 
 // IPPROTO_SCTP options.
 pub const SCTP_RTOINFO: i32 = 0;
@@ -2198,11 +2194,6 @@ pub const SCTP_GET_PEER_ADDRS: i32 = 108;
 pub const SCTP_GET_LOCAL_ADDRS: i32 = 109;
 pub const SCTP_SOCKOPT_CONNECTX: i32 = 110;
 pub const SCTP_SOCKOPT_CONNECTX3: i32 = 111;
-
-
-
-
-
 
 pub const IPV6_CHECKSUM: i32 = 7;
 pub const IPV6_UNICAST_HOPS: i32 = 16;

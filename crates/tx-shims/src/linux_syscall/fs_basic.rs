@@ -2323,7 +2323,12 @@ fn stat_rdev_for_open_file(file: &Cap<OpenFile>) -> u64 {
     linux_encode_dev_t(major, minor)
 }
 
-fn inode_meta_to_statx(meta: &InodeMeta, ino: u64, rdev_major: u32, rdev_minor: u32) -> StatxLayout {
+fn inode_meta_to_statx(
+    meta: &InodeMeta,
+    ino: u64,
+    rdev_major: u32,
+    rdev_minor: u32,
+) -> StatxLayout {
     let ts = |sec, nsec| StatxTimestamp {
         tv_sec: sec,
         tv_nsec: nsec as u32,

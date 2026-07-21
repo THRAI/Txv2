@@ -5,7 +5,7 @@ use core::{
 
 use crate::adapter::boot_runtime;
 use crate::adapter::step_engine::{
-    self as step_engine, ByteProgress, Cap, SpinMutex, StepOutcome, init, init_on_ap, spin_mutex,
+    self as step_engine, init, init_on_ap, spin_mutex, ByteProgress, Cap, SpinMutex, StepOutcome,
 };
 use crate::init::helpers::SmpRescheduleSignal;
 use tx_hal::{BootHandoff, CpuId, CpuMask, IpiKind, TxPlatform};
@@ -553,7 +553,7 @@ impl<P: TxPlatform> CoreInit<P> {
     /// whether the bytes at offset 1024+56 spell the ext4 magic (`0x53 0xef`).
     /// Boards without a block device (e.g. m1dock-mock) silently no-op.
     fn probe_ext4_superblock_smoke() {
-        use tx_fs::tx_ext4::{BLOCK_SIZE, BlockDeviceImage, BlockImage};
+        use tx_fs::tx_ext4::{BlockDeviceImage, BlockImage, BLOCK_SIZE};
         use tx_subsystems::device::block_device_by_name;
 
         let dev_name = Self::root_device_name().unwrap_or("vda");
@@ -652,7 +652,7 @@ impl<P: TxPlatform> CoreInit<P> {
             return false;
         };
 
-        use tx_fs::tx_ext4::{BlockDeviceImage, mount_ext4_read_write};
+        use tx_fs::tx_ext4::{mount_ext4_read_write, BlockDeviceImage};
         use tx_subsystems::device::block_device_by_name;
 
         let Some(reg) = block_device_by_name(dev_name.as_bytes()) else {
@@ -1552,7 +1552,7 @@ impl<P: TxPlatform> CoreInit<P> {
             return;
         }
 
-        use tx_fs::tx_ext4::{BlockDeviceImage, mount_ext4_read_write};
+        use tx_fs::tx_ext4::{mount_ext4_read_write, BlockDeviceImage};
         use tx_subsystems::device::block_device_by_name;
 
         let Some(reg) = block_device_by_name(b"vda") else {

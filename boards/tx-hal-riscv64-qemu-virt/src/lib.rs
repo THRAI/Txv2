@@ -328,6 +328,7 @@ impl PlatformConfig for Platform {
     const DIRECT_MAP_BASE: tx_hal::VirtAddr = tx_hal::VirtAddr(pmap_topology::DIRECT_MAP_BASE);
     const DIRECT_MAP_SIZE: usize = pmap_topology::DIRECT_MAP_SIZE;
     const KERNEL_VIRT_BASE: tx_hal::VirtAddr = tx_hal::VirtAddr(pmap_topology::KERNEL_VIRT_BASE);
+    const KERNEL_PAGE_TABLE_ACTIVE_AT_SUBSTRATE_INIT: bool = true;
     const USER_TOP: tx_hal::VirtAddr = tx_hal::VirtAddr(pmap_topology::SV39_USER_TOP);
     const USER_RESERVED_TOP_SIZE: usize = pmap_topology::USER_RESERVED_TOP_SIZE;
     const USER_ALLOC_TOP: tx_hal::VirtAddr = tx_hal::VirtAddr(pmap_topology::SV39_USER_ALLOC_TOP);
@@ -383,17 +384,17 @@ impl InitIf for Platform {
 // 解析设备树、发布这些脏活在 boot_handoff 里干完了,这边只管读。
 impl BootInfoIf for Platform {
     fn boot_info() -> &'static BootInfo {
-        BootStaticBag::<IdentityDropped>::global_ref().boot_info_ref()   // 取内核初始化信息
+        BootStaticBag::<IdentityDropped>::global_ref().boot_info_ref() // 取内核初始化信息
     }
 }
 
 impl PlatformInfoIf for Platform {
     fn platform_info() -> &'static PlatformInfo {
-        BootStaticBag::<IdentityDropped>::global_ref().platform_info_ref()   // 取硬件信息
+        BootStaticBag::<IdentityDropped>::global_ref().platform_info_ref() // 取硬件信息
     }
 
     fn devices() -> &'static [tx_hal::DeviceInfo] {
-        BootStaticBag::<IdentityDropped>::global_ref().platform_devices_ref()   // 取设备列表
+        BootStaticBag::<IdentityDropped>::global_ref().platform_devices_ref() // 取设备列表
     }
 }
 
@@ -470,6 +471,10 @@ impl PmapIf for Platform {
         pmap::commit_kernel_mapping(reservation, permissions);
     }
 
+    fn commit_new_kernel_mapping(reservation: PmapReservation, permissions: PmapPermissions) {
+        pmap::commit_new_kernel_mapping(reservation, permissions);
+    }
+
     fn unmap_kernel_mapping(
         virt: tx_hal::VirtAddr,
         kind: PmapReserveKind,
@@ -488,6 +493,26 @@ impl PmapIf for Platform {
     fn shootdown_kernel_mapping(invalidation: PmapInvalidation) {
         pmap::shootdown_kernel_mapping(invalidation);
         remote_sfence_vma(invalidation);
+    }
+
+    fn shootdown_kernel_mappings(invalidations: &[PmapInvalidation]) {
+        let Some(first) = invalidations.first().copied() else {
+            return;
+        };
+        let mut start = first.virt().0;
+        let mut end = start.saturating_add(first.size());
+        for invalidation in &invalidations[1..] {
+            start = start.min(invalidation.virt().0);
+            end = end.max(invalidation.virt().0.saturating_add(invalidation.size()));
+        }
+
+        // Kernel mappings are shared by every address space. The current RV64
+        // backend already upgrades a single invalidation to one local full
+        // sfence, so do that once for the whole batch and issue one remote SBI
+        // range request instead of one request per 4-KiB page.
+        let merged = PmapInvalidation::new(VirtAddr(start), end.saturating_sub(start));
+        pmap::shootdown_kernel_mapping(merged);
+        remote_sfence_vma(merged);
     }
 
     fn create_pmap_root() -> Result<PmapRoot, PmapError> {

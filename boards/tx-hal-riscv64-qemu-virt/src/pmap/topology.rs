@@ -37,12 +37,12 @@ pub(crate) const KERNEL_VIRT_BASE: usize = 0xffff_ffff_8020_0000; // 内核镜�
 pub(crate) const QEMU_RAM_BASE: usize = 0x8000_0000; // QEMU virt 平台 RAM 物理基址
 pub(crate) const QEMU_KERNEL_PHYS_BASE: usize = 0x8020_0000; // 内核加载的物理基址
 pub(crate) const QEMU_BOOTSTRAP_MAP_SIZE: usize = 1024 * 1024 * 1024; // 启动期恒等映射窗口大小(1 GiB)
-// 启动期内核别名窗口：启动跳板在开启分页前映射 [kernel_phys_base .. +SIZE)，
-// 因此整个内核镜像(text + data + bss + 启动栈)都必须放得下。从 16M 提到 32M，
-// 因为 debug 内核镜像超过了 16M(main 的 8M `TX_OBSERVE_RINGS` 加上迁入的网络子
-// 系统把 `__kernel_end` 推到约 16.7M)；比此窗口更大的内核会在 satp 打开的瞬间
-// 触发缺页并在陷入向量里死循环。要与
-// `boot_trampoline.rs::TX_RV64_KERNEL_ALIAS_L0_TABLES` 保持同步(= SIZE / 2M)。
+                                                                      // 启动期内核别名窗口：启动跳板在开启分页前映射 [kernel_phys_base .. +SIZE)，
+                                                                      // 因此整个内核镜像(text + data + bss + 启动栈)都必须放得下。从 16M 提到 32M，
+                                                                      // 因为 debug 内核镜像超过了 16M(main 的 8M `TX_OBSERVE_RINGS` 加上迁入的网络子
+                                                                      // 系统把 `__kernel_end` 推到约 16.7M)；比此窗口更大的内核会在 satp 打开的瞬间
+                                                                      // 触发缺页并在陷入向量里死循环。要与
+                                                                      // `boot_trampoline.rs::TX_RV64_KERNEL_ALIAS_L0_TABLES` 保持同步(= SIZE / 2M)。
 pub(crate) const KERNEL_BOOTSTRAP_ALIAS_SIZE: usize = 32 * 1024 * 1024; // 启动期内核别名窗口大小(32 MiB)
 pub(crate) const SUPERPAGE_1G_SIZE: usize = 1024 * 1024 * 1024; // 1 GiB 大页大小
 pub(crate) const SUPERPAGE_2M_SIZE: usize = 2 * 1024 * 1024; // 2 MiB 大页大小

@@ -11,12 +11,12 @@ use crate::net::protocol::{
     parse_raw_icmpv4_echo_payload_unchecked, Icmpv4Event, Icmpv6Event, RawIpv6Packet,
     UDP_IPV4_MAX_PAYLOAD_BYTES,
 };
+use crate::net::structure::table::SocketTable;
 use crate::net::structure::{
     AddressFamily, ConnectionKey, IpEndpoint, Ipv4Address, Ipv6Address, ProtocolNumber, RdsState,
     RecvWireSet, SendRecvFlags, SendWireSet, SocketIdentity, SocketKind, SocketPayload,
     SocketProtocol, TcpState, UnixDatagramState, UnixSocketPath, UnixStreamState,
 };
-use crate::net::structure::table::SocketTable;
 use crate::net::NetAdminAuthority;
 use tx_substrate::zone::PayloadCap;
 
@@ -636,7 +636,9 @@ fn send_raw_ipv6(
 
     if !destination.is_loopback() && !destination.is_unspecified() {
         if ipv6_addr_is_configured(dst_addr) {
-            return send_configured_icmpv6_echo(payload, protocol, src_addr, dst_addr, bytes, guard);
+            return send_configured_icmpv6_echo(
+                payload, protocol, src_addr, dst_addr, bytes, guard,
+            );
         }
         // Real external v6 destination: queue for the device-TX lane (mirror
         // of the v4 external echo flow). Replies come back through the wire

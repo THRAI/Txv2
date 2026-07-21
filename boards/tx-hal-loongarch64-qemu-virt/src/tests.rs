@@ -901,9 +901,7 @@ fn dmw_direct_map_reservation_is_precovered_for_ram() {
         Ok(())
     );
     assert_eq!(
-        Platform::extend_direct_map(PhysAddr(
-            QEMU_LA64_RAM_BASE + QEMU_LA64_DIRECT_MAP_SIZE
-        )),
+        Platform::extend_direct_map(PhysAddr(QEMU_LA64_RAM_BASE + QEMU_LA64_DIRECT_MAP_SIZE)),
         Ok(())
     );
     assert_eq!(

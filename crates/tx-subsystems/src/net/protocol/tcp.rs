@@ -420,7 +420,6 @@ impl RawTcpSocket {
             publish
         })
     }
-
 }
 
 /// Space = smoltcp tx ring headroom minus corked (not-yet-committed)

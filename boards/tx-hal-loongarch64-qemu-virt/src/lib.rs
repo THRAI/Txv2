@@ -11,10 +11,10 @@ use tx_hal::{
     PhysAddr, PhysRange, PlatformConfig, PlatformInfo, PlatformInfoIf, PmapError, PmapIf,
     PmapInvalidation, PmapPermissions, PmapReservation, PmapReservationIntermediates,
     PmapReserveKind, PmapRoot, PmapUnmapResult, Pod, PowerIf, PtNode, PtNodeAllocator,
-    SavedSignalFrame, SecondaryEntry, SignalFrameIf, SignalFrameWrite,
-    SignalHandlerRegs, SmpIf, TimeIf, TrapAction, TrapClass, TrapFrameMut, TrapFrameMutVtable,
-    TrapFrameSnapshot, TrapFrameView, TrapIf, TrapPreviousMode, UserFpContext, UserPtr,
-    UserSignalMaskAbi, UserTrapContext, VirtAddr, VirtRange,
+    SavedSignalFrame, SecondaryEntry, SignalFrameIf, SignalFrameWrite, SignalHandlerRegs, SmpIf,
+    TimeIf, TrapAction, TrapClass, TrapFrameMut, TrapFrameMutVtable, TrapFrameSnapshot,
+    TrapFrameView, TrapIf, TrapPreviousMode, UserFpContext, UserPtr, UserSignalMaskAbi,
+    UserTrapContext, VirtAddr, VirtRange,
 };
 
 pub use boot_args::capture_loongarch64_qemu_boot_args;
@@ -30,8 +30,8 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 pub(crate) use la64_consts::*;
-pub use la64_trap_frame::La64TrapFrame;
 pub(crate) use la64_signal_frame::La64SignalFrame;
+pub use la64_trap_frame::La64TrapFrame;
 
 #[cfg(target_arch = "loongarch64")]
 unsafe extern "C" {
@@ -503,7 +503,7 @@ impl BootPlatformIf for Platform {
         // la 比 riscv 少一步"建引导页表":龙芯有 DMW 硬件直映射窗口(见 boot_asm.rs),
         // 早期汇编已设好,内核靠硬件窗口即可访问物理内存,无需软件页表。
         boot_args::record_legacy_firmware_arg(firmware_arg); // 记下固件参数(la 固件约定,供后续取用)
-        ensure_static_boot_facts();                          // 采集并发布 BootInfo/PlatformInfo(等价 riscv 的发布步)
+        ensure_static_boot_facts(); // 采集并发布 BootInfo/PlatformInfo(等价 riscv 的发布步)
 
         // 套壳成交接单返回
         BootHandoff {
@@ -564,8 +564,8 @@ mod boot_facts;
 mod boot_firmware;
 mod boot_smp;
 mod dtb;
-mod la64_irq_trap;
 mod la64_consts;
+mod la64_irq_trap;
 mod la64_liointc;
 mod la64_percpu;
 mod la64_pmap;

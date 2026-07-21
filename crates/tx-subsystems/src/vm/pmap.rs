@@ -221,7 +221,9 @@ impl VmPmap {
     /// ASID/root CSR writes; this layer only supplies the root captured when the
     /// AddressSpace was created for that platform.
     pub fn activate(&self) -> Result<(), VmPmapError> {
-        (self.ops.activate_root)(self.root()).map_err(VmPmapError::Pmap)
+        (self.ops.activate_root)(self.root()).map_err(VmPmapError::Pmap)?;
+        tx_substrate::slab::enable_vmalloc_after_kernel_pmap_activation();
+        Ok(())
     }
 
     pub fn publish_page(

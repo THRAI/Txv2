@@ -16,11 +16,11 @@ use tx_subsystems::execution::{Errno, Guard};
 use tx_subsystems::mount::MountPayload;
 use tx_subsystems::page_backed::{Frame, FsPageBacking};
 use tx_subsystems::process::{self, Pid};
+use tx_subsystems::vfs::structure::StructPayload;
 use tx_subsystems::vfs::{
     render_dentry_path, Credential, DirCursor, DirEntry, FsObjectId, FsOps, InodeKind, InodeMeta,
     ProjectionKey, ProjectionSchemaId, RNode, RNodeBacking, S_IFDIR, S_IFLNK, S_IFREG,
 };
-use tx_subsystems::vfs::structure::StructPayload;
 
 // Fixed procfs node IDs live in the 0x7071_6Fxx block, deliberately BELOW
 // `PROCFS_PID_BASE` (0x7072_0000). They must never fall inside the per-pid dir
@@ -123,17 +123,14 @@ pub const PROCFS_NET_IPV6_ROUTE_ID: FsObjectId = FsObjectId::new(0x7071_6F1B);
 // IGMPv2-compatible regardless.
 pub const PROCFS_SYS_NET_IPV4_ID: FsObjectId = FsObjectId::new(0x7071_6F17);
 pub const PROCFS_SYS_NET_IPV4_CONF_ID: FsObjectId = FsObjectId::new(0x7071_6F18);
-pub const PROCFS_SYS_NET_IPV4_IGMP_MAX_MEMBERSHIPS_ID: FsObjectId =
-    FsObjectId::new(0x7071_6F19);
+pub const PROCFS_SYS_NET_IPV4_IGMP_MAX_MEMBERSHIPS_ID: FsObjectId = FsObjectId::new(0x7071_6F19);
 pub const PROCFS_SYS_NET_IPV4_IGMP_MAX_MSF_ID: FsObjectId = FsObjectId::new(0x7071_6F1A);
 
-static IGMP_MAX_MEMBERSHIPS: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(20);
+static IGMP_MAX_MEMBERSHIPS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(20);
 static IGMP_MAX_MSF: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(10);
 // One shared knob for `all` and every per-iface dir (mcast-lib only ever
 // writes 0 and restores the saved value).
-static FORCE_IGMP_VERSION: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
+static FORCE_IGMP_VERSION: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 // `conf/<name>/` entries live in their own high id region: dir = base + tag*4,
 // disable_ipv6 = dir+1, accept_dad = dir+2, where tag = FNV-1a(name) (30-bit).
@@ -346,7 +343,10 @@ fn write_userns_projection(
     } else if let Some(pid) = pid_from_gid_map_id(fs_object_id) {
         (pid, UsernsWriteTarget::GidMap)
     } else {
-        (pid_from_setgroups_id(fs_object_id)?, UsernsWriteTarget::Setgroups)
+        (
+            pid_from_setgroups_id(fs_object_id)?,
+            UsernsWriteTarget::Setgroups,
+        )
     };
 
     let Some(proc) = process::process_by_pid(pid) else {
@@ -795,10 +795,7 @@ impl FsOps for Procfs {
             PROCFS_SELF_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Symlink, PROCFS_SYMLINK_MODE))
             }
-            PROCFS_MOUNTS_ID
-            | PROCFS_CPUINFO_ID
-            | PROCFS_UPTIME_ID
-            | PROCFS_MEMINFO_ID
+            PROCFS_MOUNTS_ID | PROCFS_CPUINFO_ID | PROCFS_UPTIME_ID | PROCFS_MEMINFO_ID
             | PROCFS_CONFIG_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_FILE_MODE))
             }
@@ -847,8 +844,7 @@ impl FsOps for Procfs {
             PROCFS_SYS_NET_IPV4_ID | PROCFS_SYS_NET_IPV4_CONF_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Directory, PROCFS_DIR_MODE))
             }
-            PROCFS_SYS_NET_IPV4_IGMP_MAX_MEMBERSHIPS_ID
-            | PROCFS_SYS_NET_IPV4_IGMP_MAX_MSF_ID => {
+            PROCFS_SYS_NET_IPV4_IGMP_MAX_MEMBERSHIPS_ID | PROCFS_SYS_NET_IPV4_IGMP_MAX_MSF_ID => {
                 StepOutcome::done(InodeMeta::new(InodeKind::Regular, PROCFS_RW_FILE_MODE))
             }
             id if ipv4_conf_kind(id) == Some(0) => {
@@ -1056,7 +1052,11 @@ impl FsOps for Procfs {
                     return finish_dots(state_byte, idx, id);
                 }
                 let files: &[(&[u8], FsObjectId, InodeKind)] = &[
-                    (b"pipe-max-size", PROCFS_SYS_FS_PIPE_MAX_SIZE_ID, InodeKind::Regular),
+                    (
+                        b"pipe-max-size",
+                        PROCFS_SYS_FS_PIPE_MAX_SIZE_ID,
+                        InodeKind::Regular,
+                    ),
                     (
                         b"lease-break-time",
                         PROCFS_SYS_FS_LEASE_BREAK_TIME_ID,
@@ -1090,7 +1090,11 @@ impl FsOps for Procfs {
                 let files: &[(&[u8], FsObjectId, InodeKind)] = &[
                     (b"if_inet6", PROCFS_NET_IF_INET6_ID, InodeKind::Regular),
                     (b"tx_neigh", PROCFS_NET_TX_NEIGH_ID, InodeKind::Regular),
-                    (b"tx_neigh_ctl", PROCFS_NET_TX_NEIGH_CTL_ID, InodeKind::Regular),
+                    (
+                        b"tx_neigh_ctl",
+                        PROCFS_NET_TX_NEIGH_CTL_ID,
+                        InodeKind::Regular,
+                    ),
                     (b"arp", PROCFS_NET_ARP_ID, InodeKind::Regular),
                     (b"ipv6_route", PROCFS_NET_IPV6_ROUTE_ID, InodeKind::Regular),
                 ];

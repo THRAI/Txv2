@@ -23,7 +23,6 @@ pub(crate) struct La64SignalFrame {
 unsafe impl Pod for La64SignalFrame {}
 
 impl La64SignalFrame {
-
     pub(crate) fn new_from_context(context: &UserTrapContext, setup: &SignalFrameWrite) -> Self {
         Self {
             magic: LA64_SIGFRAME_MAGIC,

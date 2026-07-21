@@ -1227,6 +1227,26 @@ fn log_recipe<P: TxPlatform>(label: &str, entry: &VmEntry) {
         VmEntryBacking::Page { offset } => {
             tx_hal::console_write_str::<P>("page@0x");
             write_hex_u64::<P>(offset);
+            if let Some((pc, _)) = entry.page_backing() {
+                tx_hal::console_write_str::<P>(":pc-size=0x");
+                write_hex_u64::<P>(pc.size_bytes());
+                tx_hal::console_write_str::<P>(":pc-pages=0x");
+                write_hex_u64::<P>(pc.page_count());
+                match pc.kind() {
+                    tx_subsystems::page_backed::PageContainerKind::File {
+                        fs_object_id, ..
+                    } => {
+                        tx_hal::console_write_str::<P>(":file-id=0x");
+                        write_hex_u64::<P>(fs_object_id.as_u64());
+                    }
+                    tx_subsystems::page_backed::PageContainerKind::Anon { .. } => {
+                        tx_hal::console_write_str::<P>(":anon");
+                    }
+                    tx_subsystems::page_backed::PageContainerKind::Device { .. } => {
+                        tx_hal::console_write_str::<P>(":device");
+                    }
+                }
+            }
         }
     }
     tx_hal::console_write_str::<P>("\n");

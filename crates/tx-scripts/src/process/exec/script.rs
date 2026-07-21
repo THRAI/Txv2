@@ -623,11 +623,7 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
                 drop(guard);
                 match outcome {
                     V3::Done(()) => {
-                        let path = path_buf
-                            .split(|&b| b == 0)
-                            .next()
-                            .unwrap_or(&[])
-                            .to_vec();
+                        let path = path_buf.split(|&b| b == 0).next().unwrap_or(&[]).to_vec();
                         if !path.is_empty() {
                             parsed.interpreter_path = Some(path);
                         }
@@ -707,9 +703,8 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
                     .next()
                     .map(|b| b.to_vec())
                     .unwrap_or_else(|| interp_path.to_vec());
-                let mut glibc_path = alloc::vec::Vec::with_capacity(
-                    b"/musl/glibc/lib/".len() + basename.len(),
-                );
+                let mut glibc_path =
+                    alloc::vec::Vec::with_capacity(b"/musl/glibc/lib/".len() + basename.len());
                 glibc_path.extend_from_slice(b"/musl/glibc/lib/");
                 glibc_path.extend_from_slice(&basename);
                 let glibc_root = exec_root_for_path(&rooted_at, &glibc_path);

@@ -530,12 +530,18 @@ mod dsr_reply_tests {
 
     #[test]
     fn home_move_without_coords_is_row1_col1() {
-        assert_eq!(synthesize_dsr_cpr_reply(b"\x1b[H\x1b[6n").unwrap(), b"\x1b[1;1R");
+        assert_eq!(
+            synthesize_dsr_cpr_reply(b"\x1b[H\x1b[6n").unwrap(),
+            b"\x1b[1;1R"
+        );
     }
 
     #[test]
     fn query_without_preceding_move_defaults_to_origin_plus_glyphs() {
-        assert_eq!(synthesize_dsr_cpr_reply(b"XY\x1b[6n").unwrap(), b"\x1b[1;3R");
+        assert_eq!(
+            synthesize_dsr_cpr_reply(b"XY\x1b[6n").unwrap(),
+            b"\x1b[1;3R"
+        );
     }
 }
 

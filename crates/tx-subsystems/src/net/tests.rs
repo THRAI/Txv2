@@ -51,9 +51,8 @@ use crate::net::protocol::{
     build_icmpv4_echo_request_message, decide_ipv4_route, decide_ipv6_route, loopback_iface,
     ArpSnapshotState, EtherIface, EtherPacketSource, EtherPacketTxSink, Icmpv4EchoPacket,
     Icmpv4Event, IfaceCommon, Ipv4RouteDecision, Ipv6RouteDecision, LoopbackIface, PollContext,
-    RawTcpSocket, RawUdpSocket, SmoltcpAdapter,
-    SmoltcpAdapterConfig, SmoltcpPacketSource, SmoltcpPacketTxSink, UdpTxDatagram,
-    ARP_REQUEST_RETRY_LIMIT, TCP_CORK_AUTO_FLUSH_BYTES,
+    RawTcpSocket, RawUdpSocket, SmoltcpAdapter, SmoltcpAdapterConfig, SmoltcpPacketSource,
+    SmoltcpPacketTxSink, UdpTxDatagram, ARP_REQUEST_RETRY_LIMIT, TCP_CORK_AUTO_FLUSH_BYTES,
 };
 use crate::net::structure::table::SOCKET_TABLE;
 use crate::net::{
@@ -192,7 +191,7 @@ fn ethernet_ipv6_frame(protocol: u8, transport: &[u8]) -> std::vec::Vec<u8> {
     frame.extend_from_slice(&payload_len.to_be_bytes());
     frame.push(protocol); // next header
     frame.push(64); // hop limit
-    // 2001:db8::1 -> 2001:db8::2
+                    // 2001:db8::1 -> 2001:db8::2
     frame.extend_from_slice(&[
         0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
     ]);

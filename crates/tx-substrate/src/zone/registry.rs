@@ -236,8 +236,7 @@ impl ZoneRegistry {
         Self {
             lock: SpinLock::new(),
             entries: [const { UnsafeCell::new(None) }; MAX_REGISTERED_ZONES],
-            published: [const { core::sync::atomic::AtomicBool::new(false) };
-                MAX_REGISTERED_ZONES],
+            published: [const { core::sync::atomic::AtomicBool::new(false) }; MAX_REGISTERED_ZONES],
         }
     }
 

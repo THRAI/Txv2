@@ -11,13 +11,13 @@ use smoltcp::time::Instant;
 use tx_hal::TxPlatform;
 use tx_substrate::SpinMutex;
 use tx_subsystems::net::delegate::{
-    NetDelegateDriver, NetDelegateSupervisor, NetDelegateTaskConfig, NetDelegateTimerArm,
-    NetDelegateTimerWake, net_delegate_kick_tick, net_delegate_task_loop_owned_with_deadline_hook,
+    net_delegate_kick_tick, net_delegate_task_loop_owned_with_deadline_hook, NetDelegateDriver,
+    NetDelegateSupervisor, NetDelegateTaskConfig, NetDelegateTimerArm, NetDelegateTimerWake,
 };
 #[cfg(test)]
 use tx_subsystems::net::device::VIRTIO_NET0_DEVICE;
 use tx_subsystems::net::device::{
-    VIRTIO_NET0_REGISTRATION, net_device_by_name, net_device_snapshot,
+    net_device_by_name, net_device_snapshot, VIRTIO_NET0_REGISTRATION,
 };
 use tx_subsystems::net::execution::{DeviceTxBudget, LoopbackPollBudget};
 use tx_subsystems::net::packet::{
@@ -26,10 +26,10 @@ use tx_subsystems::net::packet::{
 use tx_subsystems::net::protocol::{EtherIface, IfaceCommon, LoopbackIface};
 use tx_subsystems::net::structure::Ipv4Address;
 use tx_subsystems::net::{
-    NetAdminAuthority, initial_loopback_iface, initial_net_namespace_payload,
+    initial_loopback_iface, initial_net_namespace_payload, NetAdminAuthority,
 };
 
-use super::{BOOT_REACTOR, CoreInit};
+use super::{CoreInit, BOOT_REACTOR};
 
 const DEADLINE_UPDATED: tx_reactor::wait::Mask = tx_reactor::wait::Mask::from_bits(0x1);
 const BOOT_ETH_IPV4: Ipv4Address = Ipv4Address::new([10, 0, 2, 15]);

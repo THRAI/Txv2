@@ -8,11 +8,16 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 use core::ptr::{self, NonNull};
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use tx_hal::{Ppn, TxPlatform};
+use tx_hal::{
+    PhysAddr, PmapError, PmapInvalidation, PmapPermissions, PmapReservation, PmapReserveKind,
+    PmapUnmapResult, Ppn, TxPlatform, VirtAddr,
+};
 
-use crate::page_allocator::{installed_bitmap_allocator, AllocError, PageAllocator, ZeroPolicy};
+use crate::page_allocator::{
+    self, installed_bitmap_allocator, AllocError, PageAllocator, ZeroPolicy,
+};
 
 const MIN_CLASS: usize = 8;
 const MAX_SLAB_CLASS: usize = 2048;
@@ -21,6 +26,27 @@ const CLASS_SIZES: [usize; CLASS_COUNT] = [8, 16, 32, 64, 128, 256, 512, 1024, 2
 const CLASS_REFILL_PAGES: [usize; CLASS_COUNT] = [1, 1, 1, 4, 8, 4, 2, 1, 1];
 const DEFAULT_PAGE_SIZE: usize = 4096;
 const RETAIN_EMPTY_SLAB_PAGES_PER_CLASS: usize = 1;
+
+// Large Rust allocations need contiguous virtual addresses, not contiguous
+// physical frames. Keep moderate allocations on the direct-map heap, while
+// routing genuinely large buffers through a separately mapped kernel window.
+// The window occupies one otherwise-unused Sv39 kernel root slot immediately
+// above RV64's 128-GiB direct-map range; LA64 accepts the same high-half range
+// through its global PGDH.
+const VMALLOC_THRESHOLD: usize = 64 * 1024;
+const VMALLOC_DIRECT_TRY_MAX: usize = 1024 * 1024;
+const VMALLOC_BASE: usize = 0xffff_ffe0_0000_0000;
+const VMALLOC_SIZE: usize = 1024 * 1024 * 1024;
+const VMALLOC_PAGE_COUNT: usize = VMALLOC_SIZE / DEFAULT_PAGE_SIZE;
+const VMALLOC_BITMAP_WORDS: usize = VMALLOC_PAGE_COUNT / u64::BITS as usize;
+const VMALLOC_GUARD_PAGE: usize = 0;
+
+type ReserveKernelMappingFn =
+    fn(VirtAddr, PhysAddr, PmapReserveKind) -> Result<Option<PmapReservation>, PmapError>;
+type CommitKernelMappingFn = fn(PmapReservation, PmapPermissions);
+type UnmapKernelMappingFn =
+    fn(VirtAddr, PmapReserveKind) -> Result<Option<PmapUnmapResult>, PmapError>;
+type ShootdownKernelMappingsFn = fn(&[PmapInvalidation]);
 
 /// Slab allocation failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -351,6 +377,349 @@ impl Drop for SpinGuard<'_> {
     }
 }
 
+static VMALLOC_VA_LOCK: SpinLock = SpinLock::new();
+static VMALLOC_MAP_LOCK: SpinLock = SpinLock::new();
+static VMALLOC_READY: AtomicBool = AtomicBool::new(false);
+static VMALLOC_INITIALIZED: AtomicBool = AtomicBool::new(false);
+static VMALLOC_HINT: AtomicUsize = AtomicUsize::new(1);
+static VMALLOC_BITMAP: [AtomicU64; VMALLOC_BITMAP_WORDS] =
+    [const { AtomicU64::new(0) }; VMALLOC_BITMAP_WORDS];
+static VMALLOC_RESERVE_MAPPING: AtomicUsize = AtomicUsize::new(0);
+static VMALLOC_COMMIT_NEW_MAPPING: AtomicUsize = AtomicUsize::new(0);
+static VMALLOC_UNMAP_MAPPING: AtomicUsize = AtomicUsize::new(0);
+static VMALLOC_SHOOTDOWN_MAPPINGS: AtomicUsize = AtomicUsize::new(0);
+
+fn init_vmalloc<P: TxPlatform>() {
+    VMALLOC_RESERVE_MAPPING.store(P::reserve_kernel_mapping as usize, Ordering::Release);
+    VMALLOC_COMMIT_NEW_MAPPING.store(P::commit_new_kernel_mapping as usize, Ordering::Release);
+    VMALLOC_UNMAP_MAPPING.store(P::unmap_kernel_mapping as usize, Ordering::Release);
+    VMALLOC_SHOOTDOWN_MAPPINGS.store(P::shootdown_kernel_mappings as usize, Ordering::Release);
+
+    // Keep one leaf permanently mapped. RV64 process roots copy the kernel-half
+    // root slots when they are created; retaining this leaf keeps the vmalloc
+    // root/L1 branch shared by every existing and future process root.
+    let _va_guard = VMALLOC_VA_LOCK.lock();
+    let _map_guard = VMALLOC_MAP_LOCK.lock();
+    set_vmalloc_page_used(VMALLOC_GUARD_PAGE);
+    let Ok(allocator) = installed_bitmap_allocator() else {
+        clear_vmalloc_page(VMALLOC_GUARD_PAGE);
+        return;
+    };
+    let Ok(frame) = allocator.reserve_frame(ZeroPolicy::UninitFullOverwrite) else {
+        clear_vmalloc_page(VMALLOC_GUARD_PAGE);
+        return;
+    };
+    let owned = frame.commit();
+    let ppn = owned.ppn();
+    let Some(phys) = ppn.0.checked_mul(DEFAULT_PAGE_SIZE) else {
+        clear_vmalloc_page(VMALLOC_GUARD_PAGE);
+        return;
+    };
+    let virt = VirtAddr(VMALLOC_BASE);
+    match P::reserve_kernel_mapping(virt, PhysAddr(phys), PmapReserveKind::Page4K) {
+        Ok(Some(reservation)) => {
+            P::commit_new_kernel_mapping(reservation, PmapPermissions::KERNEL_RW);
+            P::shootdown_kernel_mapping(PmapInvalidation::new(virt, DEFAULT_PAGE_SIZE));
+            core::mem::forget(owned);
+            VMALLOC_READY.store(true, Ordering::Release);
+            if P::KERNEL_PAGE_TABLE_ACTIVE_AT_SUBSTRATE_INIT {
+                VMALLOC_INITIALIZED.store(true, Ordering::Release);
+            }
+        }
+        _ => {
+            clear_vmalloc_page(VMALLOC_GUARD_PAGE);
+        }
+    }
+}
+
+/// Enable the page-table-backed large-object heap after the platform has made
+/// its global kernel page table active. RV64 enables it during substrate init;
+/// LA64 calls this after the first PGDH activation.
+pub fn enable_vmalloc_after_kernel_pmap_activation() {
+    if VMALLOC_READY.load(Ordering::Acquire) {
+        VMALLOC_INITIALIZED.store(true, Ordering::Release);
+    }
+}
+
+fn should_use_vmalloc(layout: Layout) -> bool {
+    layout.size() >= VMALLOC_THRESHOLD
+        && layout.align() <= VMALLOC_SIZE
+        && VMALLOC_INITIALIZED.load(Ordering::Acquire)
+}
+
+fn ptr_is_vmalloc(ptr: *mut u8) -> bool {
+    let addr = ptr as usize;
+    addr >= VMALLOC_BASE && addr < VMALLOC_BASE + VMALLOC_SIZE
+}
+
+fn try_vmalloc(layout: Layout) -> Option<NonNull<u8>> {
+    let page_count = div_ceil(layout.size(), DEFAULT_PAGE_SIZE)?;
+    let align_pages = if layout.align() <= DEFAULT_PAGE_SIZE {
+        1
+    } else {
+        layout.align() / DEFAULT_PAGE_SIZE
+    };
+    if page_count == 0 || page_count >= VMALLOC_PAGE_COUNT || align_pages == 0 {
+        return None;
+    }
+
+    let start_page = {
+        let _guard = VMALLOC_VA_LOCK.lock();
+        reserve_vmalloc_pages(page_count, align_pages)?
+    };
+    let allocator = installed_bitmap_allocator().ok()?;
+    let mut mapped = 0usize;
+
+    {
+        let _guard = VMALLOC_MAP_LOCK.lock();
+        while mapped < page_count {
+            let frame = match allocator.reserve_frame(ZeroPolicy::UninitFullOverwrite) {
+                Ok(frame) => frame,
+                Err(_) => break,
+            };
+            let owned = frame.commit();
+            let ppn = owned.ppn();
+            let Some(phys) = ppn.0.checked_mul(DEFAULT_PAGE_SIZE) else {
+                break;
+            };
+            let virt = VirtAddr(VMALLOC_BASE + (start_page + mapped) * DEFAULT_PAGE_SIZE);
+            let reservation =
+                match vmalloc_reserve_mapping(virt, PhysAddr(phys), PmapReserveKind::Page4K) {
+                    Ok(Some(reservation)) => reservation,
+                    _ => break,
+                };
+            vmalloc_commit_new_mapping(reservation, PmapPermissions::KERNEL_RW);
+            core::mem::forget(owned);
+            mapped += 1;
+        }
+
+        if mapped != page_count && !unmap_vmalloc_pages(start_page, mapped, allocator) {
+            return None;
+        }
+    }
+
+    if mapped != page_count {
+        let _guard = VMALLOC_VA_LOCK.lock();
+        clear_vmalloc_range(start_page, page_count);
+        return None;
+    }
+
+    // `commit_new_kernel_mapping` deliberately omits per-leaf synchronization.
+    // Publish the complete new range once before returning its pointer.
+    shootdown_vmalloc_range(
+        VMALLOC_BASE + start_page * DEFAULT_PAGE_SIZE,
+        VMALLOC_BASE + (start_page + page_count) * DEFAULT_PAGE_SIZE,
+    );
+
+    NonNull::new((VMALLOC_BASE + start_page * DEFAULT_PAGE_SIZE) as *mut u8)
+}
+
+unsafe fn dealloc_vmalloc(ptr: *mut u8, layout: Layout) {
+    let Some(offset) = (ptr as usize).checked_sub(VMALLOC_BASE) else {
+        return;
+    };
+    if offset % DEFAULT_PAGE_SIZE != 0 {
+        return;
+    }
+    let Some(page_count) = div_ceil(layout.size(), DEFAULT_PAGE_SIZE) else {
+        return;
+    };
+    let start_page = offset / DEFAULT_PAGE_SIZE;
+    if start_page == VMALLOC_GUARD_PAGE
+        || page_count == 0
+        || start_page.saturating_add(page_count) > VMALLOC_PAGE_COUNT
+    {
+        return;
+    }
+
+    let Ok(allocator) = installed_bitmap_allocator() else {
+        return;
+    };
+    let unmapped = {
+        let _guard = VMALLOC_MAP_LOCK.lock();
+        unmap_vmalloc_pages(start_page, page_count, allocator)
+    };
+    if unmapped {
+        let _guard = VMALLOC_VA_LOCK.lock();
+        clear_vmalloc_range(start_page, page_count);
+    }
+}
+
+fn unmap_vmalloc_pages(
+    start_page: usize,
+    page_count: usize,
+    allocator: &crate::page_allocator::BitmapPageAllocator<'static>,
+) -> bool {
+    let mut complete = true;
+    let mut deferred_head = None;
+    let mut invalidation_start = usize::MAX;
+    let mut invalidation_end = 0usize;
+
+    for page_offset in 0..page_count {
+        let page = start_page + page_offset;
+        let virt = VirtAddr(VMALLOC_BASE + page * DEFAULT_PAGE_SIZE);
+        let Ok(Some(result)) = vmalloc_unmap_mapping(virt, PmapReserveKind::Page4K) else {
+            complete = false;
+            continue;
+        };
+
+        let invalidation = result.invalidation();
+        invalidation_start = invalidation_start.min(invalidation.virt().0);
+        invalidation_end =
+            invalidation_end.max(invalidation.virt().0.saturating_add(invalidation.size()));
+
+        let ppn = result.base_ppn();
+        let Ok(page_ptr) = page_allocator::frame_kernel_addr(ppn) else {
+            // Direct-map lookup is a substrate invariant. If a platform breaks
+            // it, finish the pending shootdown before returning this one frame
+            // and continue without leaking or reusing a stale alias.
+            shootdown_vmalloc_range(invalidation_start, invalidation_end);
+            release_deferred_vmalloc_frames(deferred_head, allocator);
+            allocator.release_owned(ppn);
+            deferred_head = None;
+            invalidation_start = usize::MAX;
+            invalidation_end = 0;
+            complete = false;
+            continue;
+        };
+        unsafe {
+            // After deallocation starts the object contents are dead. Reuse
+            // the first word of each still-owned frame as an intrusive free
+            // chain so an arbitrarily large vfree needs no heap allocation.
+            (page_ptr as *mut usize).write(deferred_head.map_or(usize::MAX, |head: Ppn| head.0));
+        }
+        deferred_head = Some(ppn);
+    }
+
+    if deferred_head.is_some() {
+        shootdown_vmalloc_range(invalidation_start, invalidation_end);
+        release_deferred_vmalloc_frames(deferred_head, allocator);
+    }
+    complete
+}
+
+fn shootdown_vmalloc_range(start: usize, end: usize) {
+    if start < end {
+        let invalidation = PmapInvalidation::new(VirtAddr(start), end - start);
+        vmalloc_shootdown_mappings(core::slice::from_ref(&invalidation));
+    }
+}
+
+fn release_deferred_vmalloc_frames(
+    mut head: Option<Ppn>,
+    allocator: &crate::page_allocator::BitmapPageAllocator<'static>,
+) {
+    while let Some(ppn) = head {
+        let next = page_allocator::frame_kernel_addr(ppn)
+            .ok()
+            .map(|page_ptr| unsafe { (page_ptr as *const usize).read() })
+            .filter(|next| *next != usize::MAX)
+            .map(Ppn);
+        allocator.release_owned(ppn);
+        head = next;
+    }
+}
+
+fn reserve_vmalloc_pages(page_count: usize, align_pages: usize) -> Option<usize> {
+    let hint = VMALLOC_HINT
+        .load(Ordering::Relaxed)
+        .clamp(1, VMALLOC_PAGE_COUNT - 1);
+    for (start, end) in [(hint, VMALLOC_PAGE_COUNT), (1, hint)] {
+        let mut candidate = align_page_index(start, align_pages)?;
+        while candidate
+            .checked_add(page_count)
+            .is_some_and(|range_end| range_end <= end)
+        {
+            let mut blocker = None;
+            for page in candidate..candidate + page_count {
+                if vmalloc_page_used(page) {
+                    blocker = Some(page);
+                    break;
+                }
+            }
+            if let Some(blocker) = blocker {
+                candidate = align_page_index(blocker + 1, align_pages)?;
+                continue;
+            }
+            for page in candidate..candidate + page_count {
+                set_vmalloc_page_used(page);
+            }
+            VMALLOC_HINT.store(candidate + page_count, Ordering::Relaxed);
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn align_page_index(value: usize, align: usize) -> Option<usize> {
+    let remainder = value % align;
+    if remainder == 0 {
+        Some(value)
+    } else {
+        value.checked_add(align - remainder)
+    }
+}
+
+fn vmalloc_page_used(page: usize) -> bool {
+    let word = VMALLOC_BITMAP[page / u64::BITS as usize].load(Ordering::Relaxed);
+    word & (1u64 << (page % u64::BITS as usize)) != 0
+}
+
+fn set_vmalloc_page_used(page: usize) {
+    VMALLOC_BITMAP[page / u64::BITS as usize]
+        .fetch_or(1u64 << (page % u64::BITS as usize), Ordering::Relaxed);
+}
+
+fn clear_vmalloc_page(page: usize) {
+    VMALLOC_BITMAP[page / u64::BITS as usize]
+        .fetch_and(!(1u64 << (page % u64::BITS as usize)), Ordering::Relaxed);
+}
+
+fn clear_vmalloc_range(start_page: usize, page_count: usize) {
+    for page in start_page..start_page + page_count {
+        clear_vmalloc_page(page);
+    }
+}
+
+fn vmalloc_reserve_mapping(
+    virt: VirtAddr,
+    phys: PhysAddr,
+    kind: PmapReserveKind,
+) -> Result<Option<PmapReservation>, PmapError> {
+    let raw = VMALLOC_RESERVE_MAPPING.load(Ordering::Acquire);
+    if raw == 0 {
+        return Err(PmapError::Unsupported);
+    }
+    let callback: ReserveKernelMappingFn = unsafe { core::mem::transmute(raw) };
+    callback(virt, phys, kind)
+}
+
+fn vmalloc_commit_new_mapping(reservation: PmapReservation, permissions: PmapPermissions) {
+    let raw = VMALLOC_COMMIT_NEW_MAPPING.load(Ordering::Acquire);
+    debug_assert_ne!(raw, 0);
+    let callback: CommitKernelMappingFn = unsafe { core::mem::transmute(raw) };
+    callback(reservation, permissions);
+}
+
+fn vmalloc_unmap_mapping(
+    virt: VirtAddr,
+    kind: PmapReserveKind,
+) -> Result<Option<PmapUnmapResult>, PmapError> {
+    let raw = VMALLOC_UNMAP_MAPPING.load(Ordering::Acquire);
+    if raw == 0 {
+        return Err(PmapError::Unsupported);
+    }
+    let callback: UnmapKernelMappingFn = unsafe { core::mem::transmute(raw) };
+    callback(virt, kind)
+}
+
+fn vmalloc_shootdown_mappings(invalidations: &[PmapInvalidation]) {
+    let raw = VMALLOC_SHOOTDOWN_MAPPINGS.load(Ordering::Acquire);
+    debug_assert_ne!(raw, 0);
+    let callback: ShootdownKernelMappingsFn = unsafe { core::mem::transmute(raw) };
+    callback(invalidations);
+}
+
 #[repr(C)]
 struct SlabPageHeader {
     ppn: Ppn,
@@ -521,9 +890,23 @@ pub struct KernelGlobalAllocator;
 
 unsafe impl GlobalAlloc for KernelGlobalAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // Match the kvmalloc policy: keep medium allocations on the cheap
+        // direct-map path when contiguous memory is readily available, and
+        // use vmalloc as the fragmentation-safe fallback. Very large requests
+        // skip the bitmap allocator's expensive contiguous-run search.
+        if layout.size() > VMALLOC_DIRECT_TRY_MAX && should_use_vmalloc(layout) {
+            if let Some(ptr) = try_vmalloc(layout) {
+                return ptr.as_ptr();
+            }
+        }
         match GLOBAL_HEAP.try_alloc(layout) {
             Ok(ptr) => ptr.as_ptr(),
             Err(_) => {
+                if should_use_vmalloc(layout) {
+                    if let Some(ptr) = try_vmalloc(layout) {
+                        return ptr.as_ptr();
+                    }
+                }
                 record_global_alloc_failure(layout);
                 ptr::null_mut()
             }
@@ -531,6 +914,12 @@ unsafe impl GlobalAlloc for KernelGlobalAllocator {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        if ptr_is_vmalloc(ptr) {
+            unsafe {
+                dealloc_vmalloc(ptr, layout);
+            }
+            return;
+        }
         unsafe {
             GLOBAL_HEAP.dealloc(ptr, layout);
         }
@@ -589,7 +978,9 @@ pub fn init<P: TxPlatform>() -> Result<(), SlabError> {
 
     GLOBAL_DIRECT_MAP_BASE.store(P::DIRECT_MAP_BASE.0, Ordering::Release);
     GLOBAL_PAGE_SIZE.store(P::PAGE_SIZE, Ordering::Release);
-    GLOBAL_HEAP.init()
+    GLOBAL_HEAP.init()?;
+    init_vmalloc::<P>();
+    Ok(())
 }
 
 /// Run a no-alloc smoke test against the global heap.

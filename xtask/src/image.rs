@@ -13,7 +13,9 @@ use crate::Result;
 
 pub(crate) fn image(root: &Path, args: Vec<String>) -> Result<()> {
     let Some(kind) = args.first() else {
-        return Err("image command needs a kind: cpio, initramfs, ext4, vf2-uimage, or la-uimage".into());
+        return Err(
+            "image command needs a kind: cpio, initramfs, ext4, vf2-uimage, or la-uimage".into(),
+        );
     };
     if kind.as_str() == "vf2-uimage" {
         return image_vf2_uimage(root, &args[1..]);
@@ -155,7 +157,11 @@ fn image_vf2_uimage(root: &Path, args: &[String]) -> Result<()> {
     println!("vf2 uimage ready: {}", uimage.display());
     if have_initrd {
         println!("vf2 initrd ready: {}", initrd_uimage.display());
-        println!("next: cp {} {} /srv/tftp/", uimage.display(), initrd_uimage.display());
+        println!(
+            "next: cp {} {} /srv/tftp/",
+            uimage.display(),
+            initrd_uimage.display()
+        );
         println!("U-Boot> tftpboot {VF2_LOAD_ADDR} txv2-vf2.uimage");
         println!("U-Boot> tftpboot 0x88300000 txv2-vf2-initrd.uimage");
         println!("U-Boot> bootm {VF2_LOAD_ADDR} 0x88300000 ${{fdtcontroladdr}}");

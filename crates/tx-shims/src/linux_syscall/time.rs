@@ -14,7 +14,6 @@ use tx_hal::{UserSaFlagsAbi, UserSigInfoAbi, UserSignalMaskAbi, UserTrapContext}
 use tx_subsystems::signal::step_kill_process;
 use tx_subsystems::thread_runtime::ThreadIdentity;
 
-
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(super) struct TimespecLayout {
@@ -921,7 +920,6 @@ pub(super) async fn sys_clock_nanosleep<'a, P: TimeIf>(
     }
 }
 
-
 /// Fire `pid`'s ITIMER_REAL at expiry: re-arm the deadline and deliver SIGALRM
 /// to the process when it has a handler installed.
 ///
@@ -954,7 +952,8 @@ pub(super) fn fire_itimer_real<P: TimeIf>(pid: u32) {
     }
     let now_ns = P::read_ns();
     let key = (pid, ITIMER_REAL);
-    let interval_ns = with_interval_timers(|timers| timers.get(&key).map(|timer| timer.interval_ns));
+    let interval_ns =
+        with_interval_timers(|timers| timers.get(&key).map(|timer| timer.interval_ns));
     match interval_ns {
         Some(interval) if interval > 0 => with_interval_timers(|timers| {
             if let Some(timer) = timers.get_mut(&key) {

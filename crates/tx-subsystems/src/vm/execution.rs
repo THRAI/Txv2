@@ -154,8 +154,7 @@ impl AddressSpace {
                 // every gcc/rustc fork+exec take minutes.
                 if entry.prot.write {
                     for (page, snap) in parent.pmap.walk_range(range) {
-                        if let Ok(map_pin) =
-                            step_engine::page_allocator::acquire_map_pin(snap.ppn)
+                        if let Ok(map_pin) = step_engine::page_allocator::acquire_map_pin(snap.ppn)
                         {
                             let _ = child.pmap.publish_page(
                                 page,

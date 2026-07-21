@@ -600,11 +600,9 @@ pub(crate) const fn classify_la64_trap(estat: usize) -> TrapClass {
         }
         LA64_ECODE_SYS => TrapClass::Syscall,
         LA64_ECODE_BRK => TrapClass::Breakpoint,
-        LA64_ECODE_INE
-        | LA64_ECODE_IPE
-        | LA64_ECODE_FPD
-        | LA64_ECODE_SXD
-        | LA64_ECODE_ASXD => TrapClass::IllegalInstruction,
+        LA64_ECODE_INE | LA64_ECODE_IPE | LA64_ECODE_FPD | LA64_ECODE_SXD | LA64_ECODE_ASXD => {
+            TrapClass::IllegalInstruction
+        }
         _ => TrapClass::UnknownSync,
     }
 }

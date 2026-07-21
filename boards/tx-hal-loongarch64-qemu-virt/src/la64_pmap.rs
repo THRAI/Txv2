@@ -331,13 +331,27 @@ pub(crate) fn commit_la64_kernel_mapping(
     reservation: PmapReservation,
     permissions: PmapPermissions,
 ) {
+    let virt = reservation.virt();
+    publish_la64_kernel_mapping(reservation, permissions);
+    la64_invtlb_global(virt);
+}
+
+/// Publish a reservation for a previously empty leaf. New vmap mappings have
+/// no stale valid translation, so population does not require INVTLB.
+pub(crate) fn commit_new_la64_kernel_mapping(
+    reservation: PmapReservation,
+    permissions: PmapPermissions,
+) {
+    publish_la64_kernel_mapping(reservation, permissions);
+}
+
+fn publish_la64_kernel_mapping(reservation: PmapReservation, permissions: PmapPermissions) {
     let root = PhysAddr(LA64_KERNEL_PGDH_PHYS.load(Ordering::Acquire));
     assert_ne!(root.0, 0, "LA64 kernel PGDH root must exist");
     register_la64_committed_intermediates(reservation.intermediates());
     let leaf = encode_la64_leaf_pte(reservation.phys(), permissions);
     write_la64_leaf(root, reservation.virt(), reservation.kind(), leaf)
         .expect("reserved LA64 kernel leaf slot");
-    la64_invtlb_global(reservation.virt());
 }
 
 pub(crate) fn unmap_la64_kernel_mapping(

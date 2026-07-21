@@ -178,7 +178,6 @@ struct Rv64SignalFrame {
 unsafe impl Pod for Rv64SignalFrame {}
 
 impl Rv64SignalFrame {
-
     fn validate(&self, user_sp: UserPtr<u8>) -> Result<(), FaultInfo> {
         if self.magic == RV64_SIGFRAME_MAGIC
             && self.version == RV64_SIGFRAME_VERSION
@@ -217,7 +216,6 @@ impl Rv64SignalFrame {
 }
 
 impl SignalFrameIf for Platform {
-
     fn signal_frame_size() -> usize {
         size_of::<Rv64SignalFrame>()
     }

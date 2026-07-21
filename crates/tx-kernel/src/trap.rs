@@ -134,8 +134,7 @@ impl<P: TxPlatform> KernelTrapSink<P> for KernelTrapDispatcher {
         // corrupted on signal return) tears down the whole run instead of
         // just that one process.
         let hart = <P as PercpuIf>::current_cpu_id().0;
-        let outcome =
-            trap_handoff::hand_off_user_fatal(hart, &view, 0, fault.address.0 as u64);
+        let outcome = trap_handoff::hand_off_user_fatal(hart, &view, 0, fault.address.0 as u64);
         let action = trap_handoff::outcome_to_trap_action(&outcome);
         if matches!(action, TrapAction::Terminate) {
             log_page_fault_handoff_failure::<P>(hart, &outcome);
@@ -317,8 +316,8 @@ fn direct_syscall_preconditions(
     process: &tx_subsystems::process::ProcessIdentity,
 ) -> bool {
     use tx_shims::linux_syscall::numbers::{
-        NR_CLOCK_GETTIME, NR_GETEGID, NR_GETEUID, NR_GETGID, NR_GETPID, NR_GETTID,
-        NR_GETTIMEOFDAY, NR_GETUID,
+        NR_CLOCK_GETTIME, NR_GETEGID, NR_GETEUID, NR_GETGID, NR_GETPID, NR_GETTID, NR_GETTIMEOFDAY,
+        NR_GETUID,
     };
     match nr {
         NR_RT_SIGPROCMASK => {
@@ -463,7 +462,6 @@ fn log_page_fault_handoff_failure<P: TxPlatform>(
 fn write_usize<P: TxPlatform>(value: usize) {
     write_u64::<P>(value as u64);
 }
-
 
 fn write_u64<P: TxPlatform>(value: u64) {
     if value == 0 {

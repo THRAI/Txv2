@@ -421,7 +421,7 @@ Free
   -> Reserved             zone::reserve
   -> Live                 zone::sign, returns first Cap<T>
   -> Dead                 last identity retention wins SENTINEL_DEAD CAS
-  -> Retired              enqueue into bounded reclaim queue
+  -> Retired              enqueue into a growable sealed-bag queue
   -> Free + generation++  after epoch quiescence and destructor
 ```
 
@@ -435,9 +435,12 @@ Retire enqueue failure is fail-fast in the five-state design. After
 can safely remain discoverable for a later retry: it is non-upgradeable and not
 allocator-free, but it is also not yet owned by the EBR queue. Therefore the
 zone implementation may run one bounded `epoch::try_drain`/retry to relieve
-transient retired-node pool pressure. If the second enqueue still fails, this is
-a substrate capacity invariant violation and the kernel panics rather than
-silently leaking or reusing the slot.
+transient bag-page pressure. The executable implementation does not impose a
+fixed retired-object count: each CPU batches 64 callbacks locally, seals full
+bags into a growable global FIFO, and obtains additional bag pages directly
+from the page allocator. If that page allocation and the bounded retry both
+fail, this is genuine physical-memory exhaustion and the kernel panics rather
+than silently leaking or reusing the slot.
 
 ### 5.2 `PayloadSlot`
 <!-- txdoc:EBR-ZONE-ZONE-POLICIES-PAYLOADSLOT-1 -->
@@ -543,18 +546,24 @@ pub(crate) unsafe fn retire(
 pub fn try_drain(budget: DrainBudget);
 ```
 
-Implementation may still use:
+The executable implementation uses the Crossbeam collection shape:
 
 - a global monotonically increasing epoch;
-- per-CPU local epoch state;
-- per-CPU retired lists;
-- timer-triggered and pressure-triggered drains;
+- per-CPU local epoch state and an inline 64-callback local bag;
+- a global FIFO of page-backed bags sealed after a sequentially consistent
+  publication fence;
+- collection every 128 guard acquisitions plus explicit bounded drains;
+- at most eight expired bags per periodic collection pass;
+- a bounded cache of empty bag pages, with excess pages returned to the frame
+  allocator;
 - CPU pinning inside `Guard`;
 - a two-epoch safe margin.
 
 The public architecture should not require callers to know these mechanics.
-Callers hold `Guard`; zones call `retire`; `retire` records the current epoch
-internally; the timer/allocator invokes `try_drain`.
+Callers hold `Guard`; zones call `retire`; sealing records the current epoch
+internally; the timer/allocator invokes `try_drain`. Periodic collection does
+not flush a partially filled local bag, avoiding needless global publication
+on the read-side hot path.
 
 ---
 

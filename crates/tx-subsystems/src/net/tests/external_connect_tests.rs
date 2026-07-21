@@ -409,7 +409,11 @@ fn device_tx_single_pass_drains_multiple_segments() {
     let reserve = client_raw
         .enqueue_tx_bytes(&std::vec![0xa5u8; 4000])
         .expect("enqueue tx bytes");
-    assert!(reserve.bytes >= 2000, "send queue too small: {}", reserve.bytes);
+    assert!(
+        reserve.bytes >= 2000,
+        "send queue too small: {}",
+        reserve.bytes
+    );
 
     struct CountingSink {
         frames: core::sync::atomic::AtomicUsize,
@@ -510,10 +514,7 @@ fn external_udp_sendto_reaches_device_tx() {
     )
     .expect("udp socket");
     // Mirror maybe_autobind_udp_sendto: bind 0.0.0.0:ephemeral.
-    assert_eq!(
-        step_bind(&udp, inet(49_180), &guard),
-        StepOutcome::Done(())
-    );
+    assert_eq!(step_bind(&udp, inet(49_180), &guard), StepOutcome::Done(()));
 
     let dst = IpEndpoint::new(REMOTE_IP, 53);
     let outcome = step_send_to_kernel_bytes(
@@ -523,7 +524,11 @@ fn external_udp_sendto_reaches_device_tx() {
         SendRecvFlags::empty(),
         &guard,
     );
-    assert_eq!(outcome, StepOutcome::Done(15), "sendto must accept the datagram");
+    assert_eq!(
+        outcome,
+        StepOutcome::Done(15),
+        "sendto must accept the datagram"
+    );
     let _ = dst;
 
     struct CountingSink {

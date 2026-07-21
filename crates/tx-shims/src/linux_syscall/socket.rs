@@ -52,9 +52,8 @@ static NEXT_EPHEMERAL_PORT_OFFSET: core::sync::atomic::AtomicU16 =
 
 pub(super) fn ephemeral_port_candidates() -> impl Iterator<Item = u16> {
     const LEN: u16 = EPHEMERAL_PORT_END - EPHEMERAL_PORT_START;
-    let start = NEXT_EPHEMERAL_PORT_OFFSET
-        .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
-        % LEN;
+    let start =
+        NEXT_EPHEMERAL_PORT_OFFSET.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % LEN;
     (0..LEN).map(move |i| EPHEMERAL_PORT_START + (start + i) % LEN)
 }
 const IOVEC_BYTES: u64 = 16;
@@ -1586,11 +1585,9 @@ async fn sendmsg_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
         let info = sctp_info.unwrap_or_default();
         // SCTP_DISABLE_FRAGMENTS: a message larger than the association
         // fragmentation point is rejected with EMSGSIZE rather than split.
-        let (disable_frag, maxseg) = socket
-            .acquire_operational()
-            .map_or((false, 0u32), |p| {
-                p.with_options(|o| (o.sctp.disable_fragments, o.sctp.maxseg))
-            });
+        let (disable_frag, maxseg) = socket.acquire_operational().map_or((false, 0u32), |p| {
+            p.with_options(|o| (o.sctp.disable_fragments, o.sctp.maxseg))
+        });
         if disable_frag {
             let frag_point = if maxseg != 0 {
                 maxseg as usize
@@ -2613,8 +2610,10 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
                 return SyscallResult::Error(errno_to_i32(errno));
             }
             let assoc_id = u32::from_le_bytes([buf[28], buf[29], buf[30], buf[31]]);
-            let is_seqpacket = payload.with_options(|o| o.socket.sock_type == SocketType::SeqPacket);
-            if is_seqpacket && assoc_id != 0 && payload.sctp_peer_addr_by_assoc(assoc_id).is_none() {
+            let is_seqpacket =
+                payload.with_options(|o| o.socket.sock_type == SocketType::SeqPacket);
+            if is_seqpacket && assoc_id != 0 && payload.sctp_peer_addr_by_assoc(assoc_id).is_none()
+            {
                 return SyscallResult::Error(errno_to_i32(Errno::EINVAL));
             }
             payload.with_options_mut(|opts| opts.sctp.default_send_param = buf);
@@ -3811,8 +3810,11 @@ fn parse_arpreq_device(bytes: &[u8; ARPREQ_BYTES]) -> Result<Option<&str>, i32> 
 fn parse_arpreq_ethernet_addr(
     bytes: &[u8; ARPREQ_BYTES],
 ) -> Result<tx_subsystems::net::EthernetAddress, i32> {
-    let family =
-        u16::from_le_bytes(bytes[ARPREQ_HA_OFFSET..ARPREQ_HA_OFFSET + 2].try_into().unwrap());
+    let family = u16::from_le_bytes(
+        bytes[ARPREQ_HA_OFFSET..ARPREQ_HA_OFFSET + 2]
+            .try_into()
+            .unwrap(),
+    );
     if family != 0 && family != ARPHRD_ETHER {
         return Err(EINVAL_VALUE);
     }
@@ -4330,9 +4332,7 @@ pub(super) fn sys_socket_ioctl<'a>(request: u32, argp: u64, ctx: &SyscallCtx<'a>
             let value: [u8; 4] = match request {
                 SIOCGIFADDR => addr.octets(),
                 SIOCGIFNETMASK => mask.to_be_bytes(),
-                SIOCGIFBRDADDR => {
-                    (u32::from_be_bytes(addr.octets()) | !mask).to_be_bytes()
-                }
+                SIOCGIFBRDADDR => (u32::from_be_bytes(addr.octets()) | !mask).to_be_bytes(),
                 _ => unreachable!(),
             };
             // sockaddr_in image in ifr_addr: family, zero port, addr.
@@ -4402,8 +4402,7 @@ pub(super) fn sys_socket_ioctl<'a>(request: u32, argp: u64, ctx: &SyscallCtx<'a>
                         return SyscallResult::Error(EINVAL_VALUE);
                     };
                     if let Some(label) = alias_label {
-                        let Some((addr, _)) = netns.ipv4_extra_by_label(link.ifindex, label)
-                        else {
+                        let Some((addr, _)) = netns.ipv4_extra_by_label(link.ifindex, label) else {
                             return SyscallResult::Error(errno_to_i32(Errno::EADDRNOTAVAIL));
                         };
                         return match netns.add_device_ipv4_addr_by_ifindex(

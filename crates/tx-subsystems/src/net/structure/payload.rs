@@ -438,8 +438,7 @@ impl SocketPayload {
     }
 
     pub fn tcp_recv_closed_by_peer(&self) -> bool {
-        self.imp.tcp()
-            .is_some_and(RawTcpSocket::is_recv_closed)
+        self.imp.tcp().is_some_and(RawTcpSocket::is_recv_closed)
     }
 
     pub fn raw_udp_socket(&self) -> Option<&RawUdpSocket> {
@@ -505,7 +504,8 @@ impl SocketPayload {
     }
 
     pub(crate) fn sctp_peers(&self) -> Vec<SctpAssoc> {
-        self.imp.sctp()
+        self.imp
+            .sctp()
             .map_or_else(Vec::new, RawSctpSocket::peers_snapshot)
     }
 
@@ -536,7 +536,8 @@ impl SocketPayload {
 
     /// All local addresses this socket is bound to (primary bind + sctp_bindx).
     pub fn sctp_local_addrs(&self) -> Vec<IpEndpoint> {
-        self.imp.sctp()
+        self.imp
+            .sctp()
             .map_or_else(Vec::new, RawSctpSocket::local_addrs)
     }
 
@@ -569,8 +570,7 @@ impl SocketPayload {
 
     /// Number of 1-to-many (SEQPACKET) associations on this socket.
     pub fn sctp_assoc_count(&self) -> usize {
-        self.imp.sctp()
-            .map_or(0, |raw| raw.peers_snapshot().len())
+        self.imp.sctp().map_or(0, |raw| raw.peers_snapshot().len())
     }
 
     pub fn record_packet_frame(&self, source: SockAddrLl, payload: Vec<u8>) -> Option<bool> {
@@ -770,35 +770,32 @@ impl SocketPayload {
     }
 
     pub fn udp_corked_send_len(&self) -> usize {
-        self.imp.udp()
-            .map(RawUdpSocket::corked_tx_len)
-            .unwrap_or(0)
+        self.imp.udp().map(RawUdpSocket::corked_tx_len).unwrap_or(0)
     }
 
     pub(crate) fn reserve_send_space(&self, len: usize) -> Option<SocketSendReserve> {
-        let (bytes, became_full, needs_poll_kick) =
-            match &self.imp {
-                SocketImpl::Tcp(raw_tcp) => {
-                    let reserve = raw_tcp.enqueue_tx_len(len)?;
-                    (
-                        reserve.bytes,
-                        reserve.became_full,
-                        reserve.flushed_to_protocol,
-                    )
+        let (bytes, became_full, needs_poll_kick) = match &self.imp {
+            SocketImpl::Tcp(raw_tcp) => {
+                let reserve = raw_tcp.enqueue_tx_len(len)?;
+                (
+                    reserve.bytes,
+                    reserve.became_full,
+                    reserve.flushed_to_protocol,
+                )
+            }
+            SocketImpl::Udp(raw_udp) => match self.udp_connected_remote() {
+                Some(dst) => {
+                    raw_udp.set_tx_src_hint(self.udp_tx_src_hint(dst));
+                    let (bytes, became_full) = raw_udp.enqueue_tx_len_to(dst, len)?;
+                    (bytes, became_full, false)
                 }
-                SocketImpl::Udp(raw_udp) => match self.udp_connected_remote() {
-                    Some(dst) => {
-                        raw_udp.set_tx_src_hint(self.udp_tx_src_hint(dst));
-                        let (bytes, became_full) = raw_udp.enqueue_tx_len_to(dst, len)?;
-                        (bytes, became_full, false)
-                    }
-                    None => {
-                        let (bytes, became_full) = raw_udp.enqueue_tx_len(len)?;
-                        (bytes, became_full, false)
-                    }
-                },
-                _ => return None,
-            };
+                None => {
+                    let (bytes, became_full) = raw_udp.enqueue_tx_len(len)?;
+                    (bytes, became_full, false)
+                }
+            },
+            _ => return None,
+        };
         Some(SocketSendReserve {
             bytes,
             became_full,
@@ -812,37 +809,36 @@ impl SocketPayload {
         flags: super::types::SendRecvFlags,
     ) -> Result<Option<SocketSendReserve>, crate::execution::Errno> {
         let more = flags.contains(super::types::SendRecvFlags::MSG_MORE);
-        let (bytes, became_full, needs_poll_kick) =
-            match &self.imp {
-                SocketImpl::Tcp(raw_tcp) => match raw_tcp.enqueue_tx_bytes_with_more(bytes, more) {
-                    Some(reserve) => (
-                        reserve.bytes,
-                        reserve.became_full,
-                        reserve.flushed_to_protocol,
-                    ),
+        let (bytes, became_full, needs_poll_kick) = match &self.imp {
+            SocketImpl::Tcp(raw_tcp) => match raw_tcp.enqueue_tx_bytes_with_more(bytes, more) {
+                Some(reserve) => (
+                    reserve.bytes,
+                    reserve.became_full,
+                    reserve.flushed_to_protocol,
+                ),
+                None => return Ok(None),
+            },
+            SocketImpl::Udp(raw_udp) => {
+                // A plain send() with no msg_name still needs a destination:
+                // use the connected peer, or fail EDESTADDRREQ like Linux (and
+                // like the sendto path in reserve_send_bytes_to_with_flags).
+                // The pre-refactor VecDeque accepted an unaddressable datagram
+                // and silently dropped it at drain; the smoltcp tx ring cannot
+                // stage an unspecified dst, so reject up front rather than
+                // report success for bytes that never leave (and leave the
+                // send-buffer accounting inconsistent).
+                let dst = match self.udp_connected_remote() {
+                    Some(dst) => dst,
+                    None => return Err(crate::execution::Errno::EDESTADDRREQ),
+                };
+                raw_udp.set_tx_src_hint(self.udp_tx_src_hint(dst));
+                match raw_udp.enqueue_tx_bytes_to_with_more(dst, bytes, more) {
+                    Some((bytes, became_full)) => (bytes, became_full, false),
                     None => return Ok(None),
-                },
-                SocketImpl::Udp(raw_udp) => {
-                    // A plain send() with no msg_name still needs a destination:
-                    // use the connected peer, or fail EDESTADDRREQ like Linux (and
-                    // like the sendto path in reserve_send_bytes_to_with_flags).
-                    // The pre-refactor VecDeque accepted an unaddressable datagram
-                    // and silently dropped it at drain; the smoltcp tx ring cannot
-                    // stage an unspecified dst, so reject up front rather than
-                    // report success for bytes that never leave (and leave the
-                    // send-buffer accounting inconsistent).
-                    let dst = match self.udp_connected_remote() {
-                        Some(dst) => dst,
-                        None => return Err(crate::execution::Errno::EDESTADDRREQ),
-                    };
-                    raw_udp.set_tx_src_hint(self.udp_tx_src_hint(dst));
-                    match raw_udp.enqueue_tx_bytes_to_with_more(dst, bytes, more) {
-                        Some((bytes, became_full)) => (bytes, became_full, false),
-                        None => return Ok(None),
-                    }
                 }
-                _ => return Ok(None),
-            };
+            }
+            _ => return Ok(None),
+        };
         Ok(Some(SocketSendReserve {
             bytes,
             became_full,
@@ -857,61 +853,56 @@ impl SocketPayload {
         flags: super::types::SendRecvFlags,
     ) -> Result<Option<SocketSendReserve>, crate::execution::Errno> {
         let more = flags.contains(super::types::SendRecvFlags::MSG_MORE);
-        let (bytes, became_full, needs_poll_kick) =
-            match &self.imp {
-                SocketImpl::Tcp(raw_tcp) => {
-                    match raw_tcp.enqueue_tx_bytes_with_more(bytes, more) {
-                        Some(reserve) => (
-                            reserve.bytes,
-                            reserve.became_full,
-                            reserve.flushed_to_protocol,
-                        ),
-                        None => return Ok(None),
-                    }
+        let (bytes, became_full, needs_poll_kick) = match &self.imp {
+            SocketImpl::Tcp(raw_tcp) => match raw_tcp.enqueue_tx_bytes_with_more(bytes, more) {
+                Some(reserve) => (
+                    reserve.bytes,
+                    reserve.became_full,
+                    reserve.flushed_to_protocol,
+                ),
+                None => return Ok(None),
+            },
+            SocketImpl::Udp(raw_udp) => {
+                let dst = match dst.or_else(|| self.udp_connected_remote()) {
+                    Some(dst) => dst,
+                    None => return Err(crate::execution::Errno::EDESTADDRREQ),
+                };
+                raw_udp.set_tx_src_hint(self.udp_tx_src_hint(dst));
+                match raw_udp.enqueue_tx_bytes_to_with_more(dst, bytes, more) {
+                    Some((bytes, became_full)) => (bytes, became_full, false),
+                    None => return Ok(None),
                 }
-                SocketImpl::Udp(raw_udp) => {
-                    let dst = match dst.or_else(|| self.udp_connected_remote()) {
-                        Some(dst) => dst,
-                        None => return Err(crate::execution::Errno::EDESTADDRREQ),
-                    };
-                    raw_udp.set_tx_src_hint(self.udp_tx_src_hint(dst));
-                    match raw_udp.enqueue_tx_bytes_to_with_more(dst, bytes, more) {
-                        Some((bytes, became_full)) => (bytes, became_full, false),
-                        None => return Ok(None),
-                    }
+            }
+            SocketImpl::Icmp(raw_icmp) => {
+                let dst = match dst {
+                    Some(dst) => dst,
+                    None => return Err(crate::execution::Errno::EDESTADDRREQ),
+                };
+                if dst.family != AddressFamily::Inet {
+                    return Err(crate::execution::Errno::EAFNOSUPPORT);
                 }
-                SocketImpl::Icmp(raw_icmp) => {
-                    let dst = match dst {
-                        Some(dst) => dst,
-                        None => return Err(crate::execution::Errno::EDESTADDRREQ),
-                    };
-                    if dst.family != AddressFamily::Inet {
-                        return Err(crate::execution::Errno::EAFNOSUPPORT);
+                let local = self.raw_icmp_bound_local().unwrap_or(Ipv4Address::LOOPBACK);
+                let event = match parse_icmpv4_payload(local, dst.addr, bytes) {
+                    Icmpv4Event::Malformed if self.is_icmp_datagram_socket() => {
+                        parse_icmpv4_echo_payload_unchecked(local, dst.addr, bytes)
                     }
-                    let local = self.raw_icmp_bound_local().unwrap_or(Ipv4Address::LOOPBACK);
-                    let event = match parse_icmpv4_payload(local, dst.addr, bytes) {
-                        Icmpv4Event::Malformed if self.is_icmp_datagram_socket() => {
-                            parse_icmpv4_echo_payload_unchecked(local, dst.addr, bytes)
-                        }
-                        Icmpv4Event::Malformed if self.is_raw_icmp_socket() => {
-                            parse_raw_icmpv4_echo_payload_unchecked(local, dst.addr, bytes)
-                        }
-                        event => event,
-                    };
-                    let packet = match event {
-                        Icmpv4Event::EchoRequest(packet) | Icmpv4Event::EchoReply(packet) => packet,
-                        Icmpv4Event::Malformed => return Err(crate::execution::Errno::EINVAL),
-                        Icmpv4Event::Unsupported => {
-                            return Err(crate::execution::Errno::EOPNOTSUPP)
-                        }
-                    };
-                    match raw_icmp.enqueue_tx_echo(packet) {
-                        Some((bytes, became_full)) => (bytes, became_full, false),
-                        None => return Ok(None),
+                    Icmpv4Event::Malformed if self.is_raw_icmp_socket() => {
+                        parse_raw_icmpv4_echo_payload_unchecked(local, dst.addr, bytes)
                     }
+                    event => event,
+                };
+                let packet = match event {
+                    Icmpv4Event::EchoRequest(packet) | Icmpv4Event::EchoReply(packet) => packet,
+                    Icmpv4Event::Malformed => return Err(crate::execution::Errno::EINVAL),
+                    Icmpv4Event::Unsupported => return Err(crate::execution::Errno::EOPNOTSUPP),
+                };
+                match raw_icmp.enqueue_tx_echo(packet) {
+                    Some((bytes, became_full)) => (bytes, became_full, false),
+                    None => return Ok(None),
                 }
-                _ => return Ok(None),
-            };
+            }
+            _ => return Ok(None),
+        };
         Ok(Some(SocketSendReserve {
             bytes,
             became_full,
@@ -969,13 +960,17 @@ impl SocketPayload {
     }
 
     pub(crate) fn record_icmp_recv_echo_reply(&self, packet: Icmpv4EchoPacket) -> bool {
-        let became_readable = self.imp.icmp()
+        let became_readable = self
+            .imp
+            .icmp()
             .is_some_and(|raw_icmp| raw_icmp.ingest_rx_echo_reply(packet));
         became_readable
     }
 
     pub(crate) fn record_raw_ipv6_packet(&self, packet: RawIpv6Packet) -> bool {
-        let became_readable = self.imp.icmp()
+        let became_readable = self
+            .imp
+            .icmp()
             .is_some_and(|raw_icmp| raw_icmp.ingest_rx_ipv6_packet(packet));
         became_readable
     }
@@ -1131,27 +1126,13 @@ impl SocketPayload {
             SocketImpl::Tcp(raw_tcp) => raw_tcp
                 .recv_len(len, peek)
                 .or_else(|| raw_tcp.is_recv_closed().then_some((0, false))),
-            SocketImpl::Udp(raw_udp) => {
-                raw_udp.recv_len(len, peek)
-            }
-            SocketImpl::Icmp(raw_icmp) => {
-                raw_icmp.recv_len(len, peek)
-            }
-            SocketImpl::Unix(raw_unix) => {
-                raw_unix.recv_len(len, peek, unix_stream)
-            }
-            SocketImpl::Rds(raw_rds) => {
-                raw_rds.recv_len(len, peek)
-            }
-            SocketImpl::Sctp(raw_sctp) => {
-                raw_sctp.recv_len(len, peek)
-            }
-            SocketImpl::NetlinkRoute(raw_netlink) => {
-                raw_netlink.recv_len(len)
-            }
-            SocketImpl::NetlinkNetfilter(raw_netlink) => {
-                raw_netlink.recv_len(len)
-            }
+            SocketImpl::Udp(raw_udp) => raw_udp.recv_len(len, peek),
+            SocketImpl::Icmp(raw_icmp) => raw_icmp.recv_len(len, peek),
+            SocketImpl::Unix(raw_unix) => raw_unix.recv_len(len, peek, unix_stream),
+            SocketImpl::Rds(raw_rds) => raw_rds.recv_len(len, peek),
+            SocketImpl::Sctp(raw_sctp) => raw_sctp.recv_len(len, peek),
+            SocketImpl::NetlinkRoute(raw_netlink) => raw_netlink.recv_len(len),
+            SocketImpl::NetlinkNetfilter(raw_netlink) => raw_netlink.recv_len(len),
             _ => None,
         }
     }
@@ -1170,17 +1151,11 @@ impl SocketPayload {
             SocketImpl::Tcp(raw_tcp) => raw_tcp.recv_available(),
             SocketImpl::Udp(raw_udp) => raw_udp.recv_available(),
             SocketImpl::Icmp(raw_icmp) => raw_icmp.recv_available(),
-            SocketImpl::Unix(raw_unix) => {
-                raw_unix.recv_available(unix_stream)
-            }
+            SocketImpl::Unix(raw_unix) => raw_unix.recv_available(unix_stream),
             SocketImpl::Rds(raw_rds) => raw_rds.recv_available(),
             SocketImpl::Sctp(raw_sctp) => raw_sctp.recv_available(),
-            SocketImpl::NetlinkRoute(raw_netlink) => {
-                raw_netlink.recv_available()
-            }
-            SocketImpl::NetlinkNetfilter(raw_netlink) => {
-                raw_netlink.recv_available()
-            }
+            SocketImpl::NetlinkRoute(raw_netlink) => raw_netlink.recv_available(),
+            SocketImpl::NetlinkNetfilter(raw_netlink) => raw_netlink.recv_available(),
             _ => 0,
         }
     }
@@ -1196,12 +1171,8 @@ impl SocketPayload {
             SocketImpl::Unix(raw_unix) => raw_unix.send_available(),
             SocketImpl::Rds(raw_rds) => raw_rds.send_available(),
             SocketImpl::Sctp(raw_sctp) => raw_sctp.send_available(),
-            SocketImpl::NetlinkRoute(raw_netlink) => {
-                raw_netlink.send_available()
-            }
-            SocketImpl::NetlinkNetfilter(raw_netlink) => {
-                raw_netlink.send_available()
-            }
+            SocketImpl::NetlinkRoute(raw_netlink) => raw_netlink.send_available(),
+            SocketImpl::NetlinkNetfilter(raw_netlink) => raw_netlink.send_available(),
             _ => 0,
         }
     }
@@ -1273,7 +1244,6 @@ impl SocketPayload {
             super::IpAddress::V6(_) => None,
         }
     }
-
 }
 
 const fn default_family_for_kind(kind: SocketKind) -> AddressFamily {

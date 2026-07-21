@@ -178,25 +178,28 @@ pub const RISCV_HWCAP_IMAFDC: u64 = RISCV_HWCAP_ISA_I
 
 /// 平台编译期常量表：默认值是占位（多为 0），真值由每块板的 impl 覆盖。
 pub trait PlatformConfig {
-    const ARCH: Arch;                                 // 架构 Riscv64/LoongArch64，必填
-    const BOARD: &'static str;                        // 板名字符串，必填
-    const SUBSTRATE_BOOT_READY: bool = false;         // 启动是否已对接 substrate
-    const PAGE_SIZE: usize = 4096;                    // 一页字节数（分页最小单位）
-    const PAGE_SHIFT: usize = 12;                     // log2(页大小)，地址右移求页号
-    const PHYS_ADDR_BITS: u8 = 0;                     // 物理地址位数（riscv 56）
-    const VIRT_ADDR_BITS: u8 = 0;                     // 虚拟地址位数（riscv 39=Sv39）
-    const DIRECT_MAP_BASE: VirtAddr = VirtAddr(0);    // 直连区起点，虚拟=物理+此值
-    const DIRECT_MAP_SIZE: usize = 0;                 // 直连区大小（覆盖全物理内存，128GB）
-    const KERNEL_VIRT_BASE: VirtAddr = VirtAddr(0);   // 内核代码虚拟基址（住最高处）
-    const USER_TOP: VirtAddr = VirtAddr(0);           // 用户地址天花板（riscv 256GB）
-    const USER_RESERVED_TOP_SIZE: usize = 0;          // 顶部保留、不给用户的大小（4MB）
-    const USER_ALLOC_TOP: VirtAddr = Self::USER_TOP;  // 用户可分配上限=天花板-保留（派生）
-    const KERNEL_STACK_SIZE: usize = 0;               // 内核栈大小（riscv 128KB）
+    const ARCH: Arch; // 架构 Riscv64/LoongArch64，必填
+    const BOARD: &'static str; // 板名字符串，必填
+    const SUBSTRATE_BOOT_READY: bool = false; // 启动是否已对接 substrate
+    const PAGE_SIZE: usize = 4096; // 一页字节数（分页最小单位）
+    const PAGE_SHIFT: usize = 12; // log2(页大小)，地址右移求页号
+    const PHYS_ADDR_BITS: u8 = 0; // 物理地址位数（riscv 56）
+    const VIRT_ADDR_BITS: u8 = 0; // 虚拟地址位数（riscv 39=Sv39）
+    const DIRECT_MAP_BASE: VirtAddr = VirtAddr(0); // 直连区起点，虚拟=物理+此值
+    const DIRECT_MAP_SIZE: usize = 0; // 直连区大小（覆盖全物理内存，128GB）
+    const KERNEL_VIRT_BASE: VirtAddr = VirtAddr(0); // 内核代码虚拟基址（住最高处）
+    /// Whether page-table-backed kernel mappings are accessible while the
+    /// substrate initializes the heap. LA64 enables PGDH later.
+    const KERNEL_PAGE_TABLE_ACTIVE_AT_SUBSTRATE_INIT: bool = false;
+    const USER_TOP: VirtAddr = VirtAddr(0); // 用户地址天花板（riscv 256GB）
+    const USER_RESERVED_TOP_SIZE: usize = 0; // 顶部保留、不给用户的大小（4MB）
+    const USER_ALLOC_TOP: VirtAddr = Self::USER_TOP; // 用户可分配上限=天花板-保留（派生）
+    const KERNEL_STACK_SIZE: usize = 0; // 内核栈大小（riscv 128KB）
     const KERNEL_STACK_ALIGN: usize = Self::PAGE_SIZE; // 内核栈对齐（页对齐）
-    const PAGE_TABLE_LEVELS: u8 = 0;                  // 页表层数（riscv Sv39 = 3 级）
-    const ASID_BITS: u8 = 0;                          // ASID 位数，切进程免清整个 TLB（16）
-    const CACHE_LINE_SIZE: usize = 0;                 // 缓存行字节数，防多核伪共享（64）
-    const DMA_COHERENT: bool = false;                 // DMA 是否与缓存一致，false 需手动刷
+    const PAGE_TABLE_LEVELS: u8 = 0; // 页表层数（riscv Sv39 = 3 级）
+    const ASID_BITS: u8 = 0; // ASID 位数，切进程免清整个 TLB（16）
+    const CACHE_LINE_SIZE: usize = 0; // 缓存行字节数，防多核伪共享（64）
+    const DMA_COHERENT: bool = false; // DMA 是否与缓存一致，false 需手动刷
 }
 
 pub trait BootPlatformIf {
@@ -599,17 +602,20 @@ pub struct BootstrapPmapInfo {
 /// (返回 Unsupported 或空),mock/测试板不实现也能链接,真板覆盖。约分五组(见下)。
 pub trait PmapIf {
     // ===== 组1:页表节点分配(建页表要内存,来源是 boot_static 的 pt_node 池) =====
-    fn bootstrap_pmap_info() -> Option<&'static BootstrapPmapInfo> {  // 引导页表自述事实
+    fn bootstrap_pmap_info() -> Option<&'static BootstrapPmapInfo> {
+        // 引导页表自述事实
         None
     }
 
-    fn alloc_pt_node() -> Result<PtNode, AllocError> {   // 要一页当页表节点
+    fn alloc_pt_node() -> Result<PtNode, AllocError> {
+        // 要一页当页表节点
         Err(AllocError::Exhausted)
     }
 
-    fn free_pt_node(_node: PtNode) {}                    // 还回去
+    fn free_pt_node(_node: PtNode) {} // 还回去
 
-    fn install_pt_node_allocator(_allocator: PtNodeAllocator) -> Result<(), PmapError> {  // 装 substrate 的正式分配器
+    fn install_pt_node_allocator(_allocator: PtNodeAllocator) -> Result<(), PmapError> {
+        // 装 substrate 的正式分配器
         Err(PmapError::Unsupported)
     }
 
@@ -638,6 +644,17 @@ pub trait PmapIf {
 
     fn commit_kernel_mapping(_reservation: PmapReservation, _permissions: PmapPermissions) {}
 
+    /// Publish a mapping into a leaf slot that was previously unmapped.
+    ///
+    /// Unlike `commit_kernel_mapping`, implementations may omit the immediate
+    /// per-leaf TLB synchronization because the reservation proved that no old
+    /// valid mapping existed. The caller must issue one architecture-appropriate
+    /// publication fence/shootdown after completing the whole new range. The
+    /// default preserves the conservative legacy behaviour.
+    fn commit_new_kernel_mapping(reservation: PmapReservation, permissions: PmapPermissions) {
+        Self::commit_kernel_mapping(reservation, permissions);
+    }
+
     fn unmap_kernel_mapping(
         _virt: VirtAddr,
         _kind: PmapReserveKind,
@@ -662,11 +679,12 @@ pub trait PmapIf {
     }
 
     // ===== 组3:用户地址空间的创建/销毁/激活(fork/exec/切进程的核心) =====
-    fn create_pmap_root() -> Result<PmapRoot, PmapError> {   // 建一个新进程的页表根
+    fn create_pmap_root() -> Result<PmapRoot, PmapError> {
+        // 建一个新进程的页表根
         Err(PmapError::Unsupported)
     }
 
-    fn destroy_pmap_root(_root: PmapRoot) {}                 // 销毁
+    fn destroy_pmap_root(_root: PmapRoot) {} // 销毁
 
     /// 激活一个用户地址空间根(面向 VM 的别名,默认转调 activate_user_pmap)。
     ///
@@ -717,7 +735,8 @@ pub trait PmapIf {
     // ===== 组5:用户映射的 TLB shootdown(带 asid,只刷该地址空间的 TLB 项) =====
     fn shootdown_mapping(_asid: Asid, _invalidation: PmapInvalidation) {}
 
-    fn shootdown_mappings(asid: Asid, invalidations: &[PmapInvalidation]) {   // 批量版
+    fn shootdown_mappings(asid: Asid, invalidations: &[PmapInvalidation]) {
+        // 批量版
         for invalidation in invalidations {
             Self::shootdown_mapping(asid, *invalidation);
         }

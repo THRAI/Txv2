@@ -31,7 +31,8 @@ pub(crate) const QEMU_LA64_KERNEL_LOAD_BASE: usize = 0x9000_0000;
 // demonstrably executing there, and every supported machine (QEMU
 // virt with -m >= 768M, LS2K1000 DDR) backs at least this much at
 // 0x9000_0000. The board's exact static map replaces this in P4.2.
-pub(crate) const QEMU_LA64_FALLBACK_HIGH_USABLE_END: usize = QEMU_LA64_KERNEL_LOAD_BASE + 0x1000_0000;
+pub(crate) const QEMU_LA64_FALLBACK_HIGH_USABLE_END: usize =
+    QEMU_LA64_KERNEL_LOAD_BASE + 0x1000_0000;
 #[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
 pub(crate) const QEMU_LA64_PCH_PIC_BASE: usize = 0x1000_0000;
 #[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
@@ -162,9 +163,11 @@ pub(crate) const LA64_SIGFRAME_ALIGN: usize = 16;
 pub(crate) const LA64_SIGFRAME_MAGIC: u64 = 0x5458_5632_4c41_5331; // "TXV2LAS1"
 pub(crate) const LA64_SIGFRAME_VERSION: u32 = 1;
 pub(crate) const LA64_RT_SIGRETURN_SYSCALL: u32 = 139;
-pub(crate) const LA64_ADDI_D_R11_ZERO_RT_SIGRETURN: u32 = la64_addi_d(11, 0, LA64_RT_SIGRETURN_SYSCALL);
+pub(crate) const LA64_ADDI_D_R11_ZERO_RT_SIGRETURN: u32 =
+    la64_addi_d(11, 0, LA64_RT_SIGRETURN_SYSCALL);
 pub(crate) const LA64_SYSCALL_0: u32 = 0x002b_0000;
-pub(crate) const LA64_SIGRETURN_TRAMPOLINE: [u32; 2] = [LA64_ADDI_D_R11_ZERO_RT_SIGRETURN, LA64_SYSCALL_0];
+pub(crate) const LA64_SIGRETURN_TRAMPOLINE: [u32; 2] =
+    [LA64_ADDI_D_R11_ZERO_RT_SIGRETURN, LA64_SYSCALL_0];
 pub(crate) const LA64_EIOINTC_BASE: usize = 0x1400;
 pub(crate) const LA64_EIOINTC_ENABLE_START: usize = 0x200;
 pub(crate) const LA64_EIOINTC_COREISR_START: usize = 0x400;

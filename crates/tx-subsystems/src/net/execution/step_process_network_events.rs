@@ -366,7 +366,10 @@ fn process_tcp_event(
             remote: event.src,
         });
     });
-    child_payload.raw_tcp_socket()?.listen_endpoint(event.dst).ok()?;
+    child_payload
+        .raw_tcp_socket()?
+        .listen_endpoint(event.dst)
+        .ok()?;
     // Backlog full ⇒ enqueue fails ⇒ drop the SYN (Linux semantics: the
     // client retries; the just-created child is reclaimed with its Cap).
     listener_payload.enqueue_connecting_entry(TcpBacklogEntry {

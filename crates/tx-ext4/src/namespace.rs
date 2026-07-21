@@ -163,8 +163,7 @@ where
             return StepOutcome::err(e.into());
         }
         let mut updated = meta;
-        updated.mode =
-            (updated.mode & tx_subsystems::vfs::structure::S_IFMT) | (new_mode & 0o7777);
+        updated.mode = (updated.mode & tx_subsystems::vfs::structure::S_IFMT) | (new_mode & 0o7777);
         let write = self.with_pager(|pager| {
             pager
                 .write_inode_meta_journaled(inode, inode_meta_lite(&updated))

@@ -9,11 +9,11 @@ pub(crate) mod adapter;
 pub mod admin;
 pub mod checks;
 pub mod clock;
-pub mod file_ops;
 pub mod delegate;
 pub mod device;
 pub mod execution;
 pub mod facade;
+pub mod file_ops;
 pub mod namespace;
 pub mod netfilter;
 pub mod nfnetlink;
@@ -117,12 +117,12 @@ pub use packet::{
 };
 pub use project::{
     proc_net_arp_snapshot_text, proc_net_arp_snapshot_zero_text, proc_net_dev_snapshot_text,
-    proc_net_dev_snapshot_text_for_namespace, proc_net_neigh_snapshot_text,
-    proc_net_ipv6_route_snapshot_text, proc_net_neigh_snapshot_text_for_namespace,
-    proc_net_netfilter_rules_text,
-    proc_net_netfilter_rules_text_for_namespace, proc_net_nf_conntrack_text,
-    proc_net_nf_conntrack_text_for_namespace, proc_net_route_snapshot_text,
-    proc_net_tcp_listener_process_table_text, proc_net_tcp_socket_table_text,
+    proc_net_dev_snapshot_text_for_namespace, proc_net_ipv6_route_snapshot_text,
+    proc_net_neigh_snapshot_text, proc_net_neigh_snapshot_text_for_namespace,
+    proc_net_netfilter_rules_text, proc_net_netfilter_rules_text_for_namespace,
+    proc_net_nf_conntrack_text, proc_net_nf_conntrack_text_for_namespace,
+    proc_net_route_snapshot_text, proc_net_tcp_listener_process_table_text,
+    proc_net_tcp_socket_table_text,
 };
 pub use protocol::{
     ArpEntry, EtherIface, EtherPacketSource, EtherPacketTxSink, Icmpv4EchoPacket, Icmpv4Event,

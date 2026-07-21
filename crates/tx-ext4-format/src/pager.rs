@@ -262,12 +262,7 @@ impl<I: BlockImage> Ext4Pager<I> {
     /// depth-1 index node pointing at it. A 4 KiB extent block holds up to 340
     /// extents, which covers the file sizes the test workloads use; deeper
     /// trees / multiple child blocks remain `Unsupported`.
-    fn attach_data_block(
-        &mut self,
-        inode: &mut Inode,
-        logical: u32,
-        physical: u64,
-    ) -> Result<()> {
+    fn attach_data_block(&mut self, inode: &mut Inode, logical: u32, physical: u64) -> Result<()> {
         const INLINE_MAX_EXTENTS: usize = 4;
         let block_max_extents = (BLOCK_SIZE - 12) / 12;
         match ExtentNode::parse(inode.extent_root_bytes())? {
@@ -633,13 +628,7 @@ impl<I: BlockImage> Ext4Pager<I> {
         self.attach_data_block(&mut disk_inode, logical, physical)?;
 
         let mut page = [0u8; BLOCK_SIZE];
-        encode_dir_entry(
-            new_ino.get(),
-            BLOCK_SIZE as u16,
-            file_type,
-            name,
-            &mut page,
-        )?;
+        encode_dir_entry(new_ino.get(), BLOCK_SIZE as u16, file_type, name, &mut page)?;
         self.image.write_block(physical, &page)?;
 
         disk_inode.size = disk_inode

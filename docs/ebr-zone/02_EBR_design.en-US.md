@@ -18,6 +18,17 @@ policy-based zone substrate. Upper subsystems name role-shaped types
 identity slots, projection rows); they do not pass `Zone<T, EbrPolicy>` through
 operation code.
 
+**Executable implementation update (2026-07-21):** the `RetiredNode` /
+per-CPU linked-list pseudocode retained later in this historical detailed
+walkthrough is superseded by the active contract in
+`docs/design/01_substrate/EBR_ZONE_INTERFACE_v1.md`. The implementation now
+follows Crossbeam's collection shape: 64 callbacks per CPU-local bag, a SeqCst
+fence before sealing with the global epoch, a growable FIFO of page-backed
+sealed bags, collection every 128 pinnings, at most eight bags per periodic
+pass, and the same two-epoch safety margin. Empty bag caching is bounded; there
+is no fixed 1024-node retirement ceiling. The older list snippets below explain
+the safety argument but are not the current storage algorithm.
+
 ---
 
 ## 0. Background: Why EBR Is Needed

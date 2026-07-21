@@ -558,6 +558,33 @@ impl VmEntry {
         }
     }
 
+    /// Whether `other`, when placed immediately after `self`, continues the
+    /// same backing byte stream. Adjacent mappings of the same file are only
+    /// coalescible when the right-hand file offset follows the left range;
+    /// two independent mappings that both start at offset zero must remain
+    /// separate VMAs.
+    pub(in crate::vm) fn has_contiguous_backing_with(&self, other: &Self) -> bool {
+        match (self.backing, other.backing) {
+            (VmEntryBacking::None, VmEntryBacking::None)
+            | (VmEntryBacking::PrivateAnon, VmEntryBacking::PrivateAnon) => true,
+            (
+                VmEntryBacking::Page {
+                    offset: left_offset,
+                },
+                VmEntryBacking::Page {
+                    offset: right_offset,
+                },
+            ) => {
+                self.owners.page.as_ref() == other.owners.page.as_ref()
+                    && u64::try_from(self.range.len())
+                        .ok()
+                        .and_then(|len| left_offset.checked_add(len))
+                        == Some(right_offset)
+            }
+            _ => false,
+        }
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn debug_owner_strong_count(&self) -> usize {
         Arc::strong_count(&self.owners)

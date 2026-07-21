@@ -1,3 +1,26 @@
+- 2026-07-21 (EBR / vmalloc 成熟路径收敛). EBR 已由临时可增长节点池改为 Crossbeam
+  形状：每 CPU 64 项本地 bag、SeqCst 封口、全局页后备 FIFO、每 128 次 guard acquisition
+  冷路径收集、每轮最多八个 bag、两 epoch 安全间隔；固定 1024 上限已删除，回调不持队列锁，
+  空 bag 页缓存上限为 64，超出部分归还页分配器。vmalloc 改为 Txv2 版 `kvmalloc` 策略：
+  64 KiB..1 MiB 先尝试便宜的连续 direct-map，失败再 vmalloc；更大对象优先 vmalloc，避免
+  bitmap 连续区全表搜索。新映射逐页写 PTE 后只做一次范围发布；释放时先清整段 PTE，通过
+  dead page 内侵入链暂存 PPN，一次 shootdown 后再归还全部物理帧，删除原逐页 TLB flush 和
+  单一长持有 vmalloc 锁热点。设计依据和边界记录在
+  `docs/progress/research/2026-07-21-ebr-vmalloc-mature-shape.md`。验证：`tx-substrate` epoch
+  4/4、page allocator 22/22、pmap 5/5、shootdown 5/5、slab 5/5；RV64/LA64 release 交叉
+  编译通过，`target/oscomp/submit/kernel-rv` 与 `kernel-la` 已刷新。Next：用官方 RV 镜像
+  重跑完整 BuildStorm，比较 tg-xtask 编译时间并确认不再出现 6 MiB 连续分配失败或 EBR
+  容量 panic。Blocker：完整 BuildStorm 尚未在本轮代码上跑完。
+- 2026-07-21 (BuildStorm Pmap 连续内存分配修复). RV64 在 tg-xtask 构建到
+  `63/446` 时仍有约 4.4 GiB 空闲页，但最大连续空闲区仅 693 页；内核申请
+  6,291,456 字节后失败。该大小精确对应 resident pmap 的
+  `131072 * 48-byte` 单体 `Vec` 扩容，并非物理页耗尽或已确认的泄漏。生产默认改用
+  已有的 64 项分块 resident 后端，使单块表项存储约 3 KiB，避免大地址空间要求
+  数 MiB 连续物理内存；`Vec` 后端仅保留给对照测试。
+- 2026-07-20 (恢复 BuildStorm-only 现场诊断). finals PID 1 默认脚本由临时评分用的
+  CAgent-only 切回只执行 `run_buildstorm`，保留 CAgent 函数但不调用；用于重新构建本地
+  LA64 内核后复现 Cargo 在 rustc 子进程退出后的阻塞。当前单核是主动限制，不作为问题处理；
+  下一步只区分 Cargo 阻塞在 `wait4`、pipe/poll 或 futex，再修复对应唤醒链。
 - 2026-07-20 (官方复提交恢复 CAgent-only). BuildStorm 的 ext4 目录扩容与 Cargo
   子进程等待问题继续暂停排查；finals PID 1 默认脚本恢复为只执行 `run_cagent`，输出
   `mode=cagent-only`，CAgent 完成后 `sync` 并按其状态直接退出。该版本用于尽快复提交确认

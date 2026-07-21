@@ -794,7 +794,9 @@ fn tcp_cleanup_withdraws_from_owning_namespace_table() {
         .insert_tcp_connection(key, sock.clone())
         .expect("register connection in isolated ns");
     assert!(
-        ns.socket_table().lookup_tcp_connection(key, &guard).is_some(),
+        ns.socket_table()
+            .lookup_tcp_connection(key, &guard)
+            .is_some(),
         "precondition: connection registered in isolated ns"
     );
     // The global initial-ns table must NOT have it (that's the whole point).
@@ -815,7 +817,9 @@ fn tcp_cleanup_withdraws_from_owning_namespace_table() {
         "R2c: cleanup must withdraw from the owning ns table"
     );
     assert!(
-        ns.socket_table().lookup_tcp_connection(key, &guard).is_none(),
+        ns.socket_table()
+            .lookup_tcp_connection(key, &guard)
+            .is_none(),
         "R2c: isolated ns connection must be gone after cleanup"
     );
 }

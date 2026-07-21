@@ -1036,7 +1036,7 @@ fn try_merge_adjacent_entries(
     if left.range.end() != right.range.start()
         || left.prot != right.prot
         || left.flags != right.flags
-        || !left.same_backing(right)
+        || !left.has_contiguous_backing_with(right)
         || left.ufd_registration != right.ufd_registration
     {
         return Ok(None);

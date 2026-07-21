@@ -13,7 +13,7 @@
 // `populate_rootfs_shebang_shims` for the full design rationale.
 
 use super::*;
-use crate::adapter::step_engine::{self as step_engine, StepOutcome, page_allocator};
+use crate::adapter::step_engine::{self as step_engine, page_allocator, StepOutcome};
 use tx_subsystems::page_backed::{FsPageBacking, MaterializeAccess, PageIndex};
 
 impl<P: TxPlatform> CoreInit<P> {
@@ -1034,8 +1034,7 @@ exit 0
 "#;
         // The netfilter-state ping script is installed under the real
         // `ping`/`ping6` names on both arches.
-        let (ping_script_name, ping6_script_name): (&[u8], &[u8]) =
-            (b"ping", b"ping6");
+        let (ping_script_name, ping6_script_name): (&[u8], &[u8]) = (b"ping", b"ping6");
         if !create_file_with_data(
             &create_ctx,
             tx_ltp_bin_id,

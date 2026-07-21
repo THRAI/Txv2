@@ -7,9 +7,12 @@
 //! coherent "post-aspace-swap, pre-user-entry" group called only from
 //! the exec script.
 
-use crate::process::adapter::step_engine::Cap;
+use alloc::vec::Vec;
+
+use crate::process::adapter::step_engine::{self, Cap};
 
 use crate::process::structure::{ProcessIdentity, ProcessPayload};
+use crate::vfs::OpenFile;
 
 /// Close every fd marked `CLOEXEC` in `process.fd_table`, then clear
 /// the `cloexec` set.
@@ -17,7 +20,10 @@ use crate::process::structure::{ProcessIdentity, ProcessPayload};
 /// Per `txdoc:EXEC-12-2-CLOSE-CLOEXEC-FDS`. Called inside `exec_script`
 /// after the process passes EXEC-PONR and before the new userspace
 /// entry point runs. Infallible — closed slots release their
-/// `Cap<OpenFile>` per zone EBR.
+/// `Cap<OpenFile>` per zone EBR. If the removed descriptors hold the
+/// final references to an open file, run its synchronous last-close
+/// hook before dropping the caps. This is required for `SOCK_CLOEXEC`
+/// exec-error channels: the peer must observe EOF when exec succeeds.
 ///
 /// V1 ceiling: the cloexec set is internally a `u32` bitmap covering
 /// fds 0..32. PR-FD-V scaffolding (in `process/fd_table.rs`) will
@@ -37,15 +43,41 @@ pub fn step_close_cloexec_fds(process: &Cap<ProcessIdentity>) {
     if cloexec.is_empty() {
         return;
     }
+    let mut closed = Vec::<Cap<OpenFile>>::new();
     for fd in cloexec {
-        // Drop via the existing accessor; the previous `Cap` (if any)
-        // is returned for EBR-deferred drop. We discard it here — the
-        // slot is now empty, the fd is closed.
-        let _ = process.set_fd(fd, None);
+        if let Some(file) = process.set_fd(fd, None) {
+            closed.push(file);
+        }
     }
     // Clear the set wholesale: every previously-marked fd is now
     // closed; future fcntl(F_SETFD) calls start from a clean state.
     process.clear_fd_cloexec();
+
+    // Multiple CLOEXEC descriptors may alias one open-file description.
+    // Notify exactly once, and only when this batch removed every live
+    // descriptor reference. This mirrors the process-exit close path.
+    let mut seen_files = Vec::new();
+    for file in &closed {
+        let raw_file = file.raw();
+        if seen_files.contains(&raw_file) {
+            continue;
+        }
+        seen_files.push(raw_file);
+
+        let closed_refs = closed
+            .iter()
+            .filter(|candidate| candidate.raw() == raw_file)
+            .count() as u32;
+        if file.retain_count() > closed_refs {
+            continue;
+        }
+
+        let Some(ops) = file.file_ops() else {
+            continue;
+        };
+        let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
+        ops.on_last_close(&guard);
+    }
 }
 
 /// Reset every user-installed signal disposition on `process` to

@@ -211,6 +211,10 @@ impl PmapIf for Platform {
         commit_la64_kernel_mapping(reservation, permissions);
     }
 
+    fn commit_new_kernel_mapping(reservation: PmapReservation, permissions: PmapPermissions) {
+        commit_new_la64_kernel_mapping(reservation, permissions);
+    }
+
     fn unmap_kernel_mapping(
         virt: VirtAddr,
         kind: PmapReserveKind,
@@ -288,6 +292,14 @@ impl PmapIf for Platform {
         la64_invtlb_global(invalidation.virt());
     }
 
+    fn shootdown_kernel_mappings(invalidations: &[PmapInvalidation]) {
+        if !invalidations.is_empty() {
+            // One architecturally defined all-TLB invalidation is cheaper than
+            // issuing INVTLB op 0x6 once for every unmapped vmalloc page.
+            la64_invtlb_all();
+        }
+    }
+
     fn shootdown_mapping(asid: Asid, invalidation: PmapInvalidation) {
         la64_invtlb_asid(asid, invalidation.virt());
     }
@@ -347,7 +359,6 @@ impl TrapIf for Platform {
 }
 
 impl SignalFrameIf for Platform {
-
     fn signal_frame_size() -> usize {
         core::mem::size_of::<La64SignalFrame>()
     }
@@ -415,7 +426,6 @@ impl SignalFrameIf for Platform {
             tx_hal::SignalFrameBytes::from_slice(frame_bytes),
         ))
     }
-
 }
 
 fn decode_la64_signal_frame(

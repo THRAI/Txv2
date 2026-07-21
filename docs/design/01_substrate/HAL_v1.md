@@ -979,6 +979,7 @@ pub trait PmapIf {
     ) -> Result<Option<PmapReservation>, PmapError>;
     fn rollback_kernel_mapping(reservation: PmapReservation);
     fn commit_kernel_mapping(reservation: PmapReservation);
+    fn commit_new_kernel_mapping(reservation: PmapReservation);
     fn unmap_kernel_mapping(
         virt: VirtAddr,
         kind: PmapReserveKind,
@@ -989,6 +990,7 @@ pub trait PmapIf {
         permissions: PmapPermissions,
     ) -> Result<Option<PmapInvalidation>, PmapError>;
     fn shootdown_kernel_mapping(invalidation: PmapInvalidation);
+    fn shootdown_kernel_mappings(invalidations: &[PmapInvalidation]);
 }
 ```
 
@@ -1014,6 +1016,15 @@ The executable pmap mutation surface is still intentionally narrow:
 commits before the allocator is installed, while `reserve_kernel_mapping()` /
 `commit_kernel_mapping()` cover boot-time kernel mappings at 2 MiB or 4 KiB
 granularity for platform MMIO.
+`commit_new_kernel_mapping()` is the vmap-specific publication primitive. A
+`PmapReservation` proves that the leaf was empty, so RV64 and LA64 publish the
+new PTE without issuing a per-leaf synchronization. After filling the range,
+the caller performs one architecture-appropriate range publication/shootdown;
+this preserves page-walk visibility without invalidating after every 4 KiB
+write. The conservative `commit_kernel_mapping()` remains available to callers
+that require its legacy immediate post-publication fence.
+`shootdown_kernel_mappings()` lets a platform coalesce publication or teardown
+invalidations into one range operation (RV64) or one global INVTLB (LA64).
 Abandoned 2 MiB / 4 KiB reservations can be rolled back, releasing any
 `PT_NODE_POOL` intermediates allocated while reserving. Kernel 2 MiB / 4 KiB
 mappings can also be unmapped into a `PmapUnmapResult`, whose invalidation is
@@ -2202,7 +2213,12 @@ pub trait CacheIf {
 
 - **exec / ELF loader.** After loading executable pages, call `flush_icache_range` over the .text region before the first user-mode entry. Otherwise the i-cache may hold stale data from the previous use of those frames.
 - **DMA.** Drivers call `dcache_clean_range` before handing a buffer to a device (write to memory must be visible to the device) and `dcache_invalidate_range` after the device has written into memory and before the CPU reads it. The `DmaIf` (§17) wraps these in direction-aware helpers.
-- **PTE publication.** After installing PTEs, the hart that installed them issues `sfence.vma` / `invtlb` (this is `PmapIf::shootdown`, not `CacheIf`). But `CacheIf::fence_all` is what subsystems use when they need general memory ordering across HAL layers.
+- **PTE publication.** Replacing or changing an existing translation requires
+  `sfence.vma` / `invtlb` through `PmapIf::shootdown`; publishing into a leaf
+  proven empty by `PmapReservation` may use `commit_new_kernel_mapping()` to
+  defer synchronization until one range publication after all leaves are
+  installed. `CacheIf::fence_all` remains the general memory-ordering surface
+  across HAL layers.
 - **JIT / future module loading.** Out of scope for v1.
 
 ### 16.2 Why not `cfg`?

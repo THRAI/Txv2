@@ -212,8 +212,7 @@ static TIMEBASE_FREQUENCY_HZ: TimebaseFrequencyCell =
     TimebaseFrequencyCell(UnsafeCell::new(QEMU_VIRT_FALLBACK_TIMEBASE_HZ));
 static PLATFORM_DEVICES: PlatformDevicesCell =
     PlatformDevicesCell(UnsafeCell::new([EMPTY_DEVICE; MAX_PLATFORM_DEVICES]));
-static PLATFORM_DEVICE_COUNT: PlatformDeviceCountCell =
-    PlatformDeviceCountCell(UnsafeCell::new(0));
+static PLATFORM_DEVICE_COUNT: PlatformDeviceCountCell = PlatformDeviceCountCell(UnsafeCell::new(0));
 static PLIC_SCONTEXTS: PlicScontextsCell =
     PlicScontextsCell(UnsafeCell::new([None; crate::dtb::MAX_PLIC_HARTS]));
 static PLIC_PHYS_BASE_PUBLISHED: PlicPhysBaseCell =
@@ -495,30 +494,30 @@ enum StoredBootStaticBag {
 /// 泛型 State 是状态标记:IdentityLive=低地址恒等映射还在,IdentityDropped=已拆。
 pub(crate) struct BootStaticBag<State> {
     // —— 内核镜像各段的物理起止地址(启动时从链接器符号读出)——
-    kernel_start: BootLinkedAddr,          // 整个内核镜像
+    kernel_start: BootLinkedAddr, // 整个内核镜像
     kernel_end: BootLinkedAddr,
-    text_start: BootLinkedAddr,            // 代码段
+    text_start: BootLinkedAddr, // 代码段
     text_end: BootLinkedAddr,
-    rodata_start: BootLinkedAddr,          // 只读数据段
+    rodata_start: BootLinkedAddr, // 只读数据段
     rodata_end: BootLinkedAddr,
-    data_start: BootLinkedAddr,            // 可写数据段
+    data_start: BootLinkedAddr, // 可写数据段
     data_end: BootLinkedAddr,
-    bss_start: BootLinkedAddr,             // 未初始化数据段
+    bss_start: BootLinkedAddr, // 未初始化数据段
     bss_end: BootLinkedAddr,
     // —— 启动栈、入口点、关键寄存器初值 ——
-    boot_stack_bottom: BootLinkedAddr,     // 启动栈
+    boot_stack_bottom: BootLinkedAddr, // 启动栈
     boot_stack_top: BootLinkedAddr,
-    global_pointer: BootLinkedAddr,        // gp 寄存器初值
-    rust_entry: BootLinkedAddr,            // rust_entry 函数地址
-    trap_vector: BootLinkedAddr,           // 陷入向量地址
+    global_pointer: BootLinkedAddr, // gp 寄存器初值
+    rust_entry: BootLinkedAddr,     // rust_entry 函数地址
+    trap_vector: BootLinkedAddr,    // 陷入向量地址
     // —— 引导页表的各块存储地址(供 pmap 长期取用)——
-    bootstrap_root: BootLinkedAddr,        // 引导页表根
-    kernel_alias_l1: BootLinkedAddr,       // 高地址别名 L1 表
-    kernel_alias_l0_tables: BootLinkedAddr,// 高地址别名 L0 表
-    pt_node_pool: BootLinkedAddr,          // 页表节点池(fork 分配页表用)
+    bootstrap_root: BootLinkedAddr,         // 引导页表根
+    kernel_alias_l1: BootLinkedAddr,        // 高地址别名 L1 表
+    kernel_alias_l0_tables: BootLinkedAddr, // 高地址别名 L0 表
+    pt_node_pool: BootLinkedAddr,           // 页表节点池(fork 分配页表用)
     // —— 固件事实 + 状态标记 ——
-    dtb: FirmwareDtb,                      // 固件给的设备树物理地址
-    _state: PhantomData<State>,            // 零大小状态标记,不占内存
+    dtb: FirmwareDtb,           // 固件给的设备树物理地址
+    _state: PhantomData<State>, // 零大小状态标记,不占内存
 }
 
 // "桥还在(恒等映射未拆)"阶段的方法:造包、取包、读链接器符号构造
@@ -528,7 +527,8 @@ impl BootStaticBag<IdentityLive> {
         unsafe {
             let slot = &mut *STORED_BOOT_STATIC_BAG.0.get();
             match slot {
-                StoredBootStaticBag::Uninit => {            // 只有"还没造"才允许构造
+                StoredBootStaticBag::Uninit => {
+                    // 只有"还没造"才允许构造
                     *slot = StoredBootStaticBag::IdentityLive(Self::capture(dtb_addr));
                 }
                 StoredBootStaticBag::IdentityLive(_)
@@ -843,8 +843,7 @@ impl<State> BootStaticBag<State> {
     pub(crate) fn platform_devices_ref(&self) -> &'static [DeviceInfo] {
         unsafe {
             let count = (*PLATFORM_DEVICE_COUNT.0.get()).min(MAX_PLATFORM_DEVICES);
-            let devices: &'static [DeviceInfo; MAX_PLATFORM_DEVICES] =
-                &*PLATFORM_DEVICES.0.get();
+            let devices: &'static [DeviceInfo; MAX_PLATFORM_DEVICES] = &*PLATFORM_DEVICES.0.get();
             &devices[..count]
         }
     }

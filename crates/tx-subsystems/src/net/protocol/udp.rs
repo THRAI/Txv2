@@ -176,7 +176,7 @@ impl RawUdpSocket {
 
         with_context(|cx| {
             let inner = &mut *self.inner.lock();
-        let socket = &mut inner.socket;
+            let socket = &mut inner.socket;
             let was_empty = !socket.can_recv();
             let udp_repr = UdpRepr {
                 src_port: src.port,
@@ -375,7 +375,7 @@ impl RawUdpSocket {
     pub fn pop_tx_datagram(&self) -> Option<UdpTxDatagramDrain> {
         with_context(|cx| {
             let inner = &mut *self.inner.lock();
-        let socket = &mut inner.socket;
+            let socket = &mut inner.socket;
             let mut out = None;
             let result: Result<(), ()> =
                 socket.dispatch(cx, |_cx, _meta, (ip_repr, udp_repr, payload)| {
@@ -428,7 +428,7 @@ impl RawUdpSocket {
         // `close` cleared the VecDeques; smoltcp `close` only unbinds).
         with_context(|cx| {
             let inner = &mut *self.inner.lock();
-        let socket = &mut inner.socket;
+            let socket = &mut inner.socket;
             while socket.recv().is_ok() {}
             loop {
                 let mut popped = false;

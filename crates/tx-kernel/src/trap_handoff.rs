@@ -339,8 +339,10 @@ pub fn hand_off_user_fatal(
     payload.store_saved_user_context(Some(view.capture_user_context()));
 
     let slot: UserspaceRunSlot = payload.userspace_slot().clone();
-    match slot.complete_interesting_trap(active, UserspaceTrapInfo::Fatal(FatalTrapInfo::new(cause, value)))
-    {
+    match slot.complete_interesting_trap(
+        active,
+        UserspaceTrapInfo::Fatal(FatalTrapInfo::new(cause, value)),
+    ) {
         Ok(_status) => HandoffOutcome::Resolved,
         Err(err) => HandoffOutcome::SlotError(err),
     }

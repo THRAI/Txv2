@@ -47,9 +47,9 @@ pub(crate) use address_space::{
 pub(crate) use kernel_space::cover_boot_firmware_dtb_from_bag;
 pub(crate) use kernel_space::{
     bootstrap_pmap_info, commit_kernel_direct_map_1g, commit_kernel_mapping,
-    cover_direct_map_low_from_bag, extend_direct_map, protect_kernel_mapping,
-    reserve_kernel_direct_map_1g, reserve_kernel_mapping, rollback_kernel_mapping,
-    shootdown_kernel_mapping, unmap_kernel_mapping,
+    commit_new_kernel_mapping, cover_direct_map_low_from_bag, extend_direct_map,
+    protect_kernel_mapping, reserve_kernel_direct_map_1g, reserve_kernel_mapping,
+    rollback_kernel_mapping, shootdown_kernel_mapping, unmap_kernel_mapping,
 };
 pub(crate) use pt_node::{alloc_pt_node, free_pt_node, install_pt_node_allocator};
 use pt_node::{alloc_pt_node_from_bag, free_pt_node_from_bag};

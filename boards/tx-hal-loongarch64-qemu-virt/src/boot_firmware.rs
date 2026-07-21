@@ -414,7 +414,10 @@ pub(crate) fn parse_rd_start_request(text: &str) -> Option<(usize, usize)> {
 }
 
 fn parse_usize_maybe_hex(value: &str) -> Option<usize> {
-    if let Some(hex) = value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")) {
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
         usize::from_str_radix(hex, 16).ok()
     } else {
         value.parse::<usize>().ok()

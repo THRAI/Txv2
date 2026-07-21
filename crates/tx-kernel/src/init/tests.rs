@@ -30,9 +30,9 @@ use tx_hal::{
 /// surface.
 const TEST_PAGE_SIZE: usize = 4096;
 
-use crate::init::{CoreInit, console_tty, dev_mount, dev_shm_mount, root_mount};
+use crate::init::{console_tty, dev_mount, dev_shm_mount, root_mount, CoreInit};
 
-use crate::adapter::step_engine::{self as step_engine, StepOutcome, guard, page_allocator};
+use crate::adapter::step_engine::{self as step_engine, guard, page_allocator, StepOutcome};
 /// Serialise every test in this module against the rest of tx-kernel's
 /// test set: they all touch the global `INIT_PROCESS` / mount / TTY
 /// slots plus the per-CPU epoch domain (which forbids guard nesting
@@ -451,7 +451,7 @@ fn boot_smoke_mounts_root_and_dev_and_resolves_console() {
 /// RNode is a `StructBacked { Tty(...) }` for the boot console.
 #[test]
 fn boot_smoke_walker_resolves_dev_console_after_mount_registration() {
-    use tx_subsystems::vfs::{Credential, RNodeBacking, StructPayload, walker};
+    use tx_subsystems::vfs::{walker, Credential, RNodeBacking, StructPayload};
 
     let _serial = setup();
     drive_boot_wiring();
@@ -497,7 +497,7 @@ fn boot_smoke_walker_resolves_dev_console_after_mount_registration() {
 /// (`docs/design/05_filesystem/BDEV_FS.md` §7.1).
 #[test]
 fn boot_smoke_walker_resolves_dev_block_after_bdevfs_mount() {
-    use tx_subsystems::vfs::{Credential, RNodeBacking, walker};
+    use tx_subsystems::vfs::{walker, Credential, RNodeBacking};
 
     let _serial = setup();
     drive_boot_wiring();
@@ -536,7 +536,7 @@ fn boot_smoke_walker_resolves_dev_block_after_bdevfs_mount() {
 /// publish a tmpfs mount over devfs's synthetic `/dev/shm` directory.
 #[test]
 fn boot_smoke_walker_resolves_dev_shm_to_tmpfs_mount() {
-    use tx_subsystems::vfs::{Credential, RNodeBacking, walker};
+    use tx_subsystems::vfs::{walker, Credential, RNodeBacking};
 
     let _serial = setup();
     drive_boot_wiring();
@@ -577,7 +577,7 @@ fn boot_smoke_walker_resolves_dev_shm_to_tmpfs_mount() {
 
 #[test]
 fn boot_smoke_dev_shm_accepts_posix_shm_and_named_sem_files() {
-    use tx_subsystems::vfs::{Credential, RNodeBacking, walker};
+    use tx_subsystems::vfs::{walker, Credential, RNodeBacking};
 
     let _serial = setup();
     drive_boot_wiring();
@@ -647,8 +647,8 @@ fn boot_smoke_dev_shm_accepts_posix_shm_and_named_sem_files() {
 #[test]
 fn boot_wiring_mounts_writable_tmpfs_at_dev_shm_for_musl_shm_open() {
     use tx_shims::linux_syscall::{
-        AT_FDCWD, NR_OPENAT, O_CLOEXEC, O_CREAT, O_NONBLOCK, O_RDWR, SyscallCtx, SyscallResult,
-        dispatch,
+        dispatch, SyscallCtx, SyscallResult, AT_FDCWD, NR_OPENAT, O_CLOEXEC, O_CREAT, O_NONBLOCK,
+        O_RDWR,
     };
 
     let _serial = setup();

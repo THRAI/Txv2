@@ -300,8 +300,31 @@ pub(crate) fn commit_kernel_mapping(reservation: PmapReservation, permissions: P
     );
 }
 
+/// Publish a reservation for a leaf slot that was proven empty without an
+/// unnecessary `sfence.vma`. This is the vmap population path: there cannot be
+/// a stale valid translation for a previously unmapped address.
+pub(crate) fn commit_new_kernel_mapping(
+    reservation: PmapReservation,
+    permissions: PmapPermissions,
+) {
+    publish_kernel_mapping_from_bag(
+        BootStaticBag::<IdentityDropped>::global_ref(),
+        reservation,
+        permissions,
+    );
+}
+
 // 登记中间表所有权，按粒度写入叶子 PTE，最后本地刷 TLB。
 pub(super) fn commit_kernel_mapping_from_bag<State>(
+    bag: &BootStaticBag<State>,
+    reservation: PmapReservation,
+    permissions: PmapPermissions,
+) {
+    publish_kernel_mapping_from_bag(bag, reservation, permissions);
+    sfence_vma_all();
+}
+
+fn publish_kernel_mapping_from_bag<State>(
     bag: &BootStaticBag<State>,
     reservation: PmapReservation,
     permissions: PmapPermissions,
@@ -323,7 +346,6 @@ pub(super) fn commit_kernel_mapping_from_bag<State>(
             l0.0[rv64_4k_leaf_index(reservation.virt().0)] = pte;
         }
     }
-    sfence_vma_all();
 }
 
 // 内核 unmap/protect 只作用于已存在的同粒度叶子。空槽位是 no-op；拆分大页这类

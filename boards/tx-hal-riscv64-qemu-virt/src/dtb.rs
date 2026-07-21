@@ -325,10 +325,12 @@ pub(crate) unsafe fn parse_reserved_regions_from_fdt(
     // at off_mem_rsvmap, terminated by a zero pair.
     const MAX_MEMRESERVE_ENTRIES: usize = 16;
     let header = dtb_addr as *const u8;
-    let read_be32 =
-        |offset: usize| -> u32 { unsafe { (header.add(offset) as *const u32).read_unaligned() }.to_be() };
-    let read_be64 =
-        |offset: usize| -> u64 { unsafe { (header.add(offset) as *const u64).read_unaligned() }.to_be() };
+    let read_be32 = |offset: usize| -> u32 {
+        unsafe { (header.add(offset) as *const u32).read_unaligned() }.to_be()
+    };
+    let read_be64 = |offset: usize| -> u64 {
+        unsafe { (header.add(offset) as *const u64).read_unaligned() }.to_be()
+    };
     let totalsize = read_be32(4) as usize;
     let mut offset = read_be32(16) as usize; // off_mem_rsvmap
     for _ in 0..MAX_MEMRESERVE_ENTRIES {
@@ -793,7 +795,10 @@ mod tests {
     fn derives_plic_scontexts_from_real_qemu_virt_dtb() {
         let mut contexts = [None; super::MAX_PLIC_HARTS];
         let resolved = unsafe {
-            super::parse_plic_scontexts_from_fdt(QEMU_RV64_VIRT_DTB.as_ptr() as usize, &mut contexts)
+            super::parse_plic_scontexts_from_fdt(
+                QEMU_RV64_VIRT_DTB.as_ptr() as usize,
+                &mut contexts,
+            )
         };
 
         // QEMU virt: every hart has M then S context -> S = 2*hart+1.
@@ -918,8 +923,9 @@ mod tests {
         // Root slot 257 = (DIRECT_MAP_BASE + 0x4000_0000) >> 30 & 0x1ff:
         // expect a 1 GiB leaf PTE for phys 0x4000_0000 with
         // V|R|W|G|A|D = 0xe7 ((phys >> 12) << 10 = 0x1000_0000).
-        let root = crate::boot_static::BootStaticBag::<crate::boot_static::IdentityDropped>::global_ref()
-            .bootstrap_root_ref();
+        let root =
+            crate::boot_static::BootStaticBag::<crate::boot_static::IdentityDropped>::global_ref()
+                .bootstrap_root_ref();
         assert_eq!(root.0[257], 0x1000_0000 | 0xe7);
     }
 

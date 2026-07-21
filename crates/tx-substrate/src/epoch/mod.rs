@@ -16,11 +16,11 @@ pub use domain::{
     EpochError, EpochSummary,
 };
 pub use guard::Guard;
-pub use retired::RETIRED_NODE_POOL_CAPACITY;
+pub use retired::RETIRED_BAG_CAPACITY;
 
 #[doc(hidden)]
 pub mod testing {
-    pub use super::retired::RETIRED_NODE_POOL_CAPACITY;
+    pub use super::retired::RETIRED_BAG_CAPACITY;
 
     pub unsafe fn reset_for_test() {
         super::domain::reset_for_test();

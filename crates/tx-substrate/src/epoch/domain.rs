@@ -10,15 +10,13 @@ use core::sync::atomic::{fence, AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use super::guard::Guard;
 use super::local::CpuLocalEpochState;
-use super::retired::{append_index, PerCpuRetiredPool};
+use super::retired::{allocate_bag_page, BagQueue, RetiredEntry, SealedBag, RETIRED_BAG_CAPACITY};
 use tx_hal::{CpuId, CpuPinGuard, IrqIf, PercpuIf, SmpIf};
 
 const INITIAL_EPOCH: u64 = 1;
-const RETIRE_THRESHOLD: usize = 512;
-const DEFAULT_DRAIN_BATCH: usize = 128;
+const COLLECT_STEPS: usize = 8;
+const PERIODIC_COLLECT_BUDGET: usize = RETIRED_BAG_CAPACITY * COLLECT_STEPS;
 const MAX_EPOCH_CPUS: usize = 64;
-
-pub use super::retired::RETIRED_NODE_POOL_CAPACITY;
 
 static GLOBAL_DOMAIN: EpochDomain = EpochDomain::new();
 static RETIRE_TRACE_SAMPLE: AtomicU64 = AtomicU64::new(0);
@@ -29,7 +27,7 @@ static RECLAIM_TRACE_SAMPLE: AtomicU64 = AtomicU64::new(0);
 pub enum EpochError {
     AlreadyInitialized,
     NotInitialized,
-    RetiredNodePoolExhausted,
+    RetiredBagAllocationFailed,
     NullPointer,
     TooManyCpus,
     InvalidCpu,
@@ -82,11 +80,14 @@ pub(crate) struct EpochDomain {
     hooks: UnsafeCell<PlatformHooks>,
     /// Per-CPU guard state and retired-node list heads.
     cpu_states: [CpuLocalEpochState; MAX_EPOCH_CPUS],
-    /// Protects initialization and hook replacement; hot retire/drain paths use
-    /// CPU pinning and per-CPU node ranges instead of this lock.
+    /// Protects initialization and hook replacement.
     lock: SpinLock,
-    /// Backing storage for retired nodes. It is physically one array, but split
-    /// into fixed per-CPU slices so each CPU mutates only its own freelist.
+    /// Serializes short shared sealed-bag queue operations.
+    queue_lock: SpinLock,
+    /// Allows one collector to execute callbacks at a time without holding the
+    /// queue lock across arbitrary destructors.
+    collect_lock: SpinLock,
+    /// Shared sealed-bag queue and recycled page-backed bag cache.
     state: UnsafeCell<DomainState>,
 }
 
@@ -102,6 +103,8 @@ impl EpochDomain {
             hooks: UnsafeCell::new(PlatformHooks::default()),
             cpu_states: [const { CpuLocalEpochState::new() }; MAX_EPOCH_CPUS],
             lock: SpinLock::new(),
+            queue_lock: SpinLock::new(),
+            collect_lock: SpinLock::new(),
             state: UnsafeCell::new(DomainState::new()),
         }
     }
@@ -204,7 +207,15 @@ impl EpochDomain {
         // Publish the local epoch before any protected load can float above the
         // guard acquisition. This is the core EBR reader-side ordering rule.
         fence(Ordering::SeqCst);
-        Guard::new(self, local, cpu_id, current_epoch, cpu_pin)
+        let should_collect = local.note_pin_and_should_collect();
+        let guard = Guard::new(self, local, cpu_id, current_epoch, cpu_pin);
+        if should_collect {
+            // Match Crossbeam's cold pin path: collect already-sealed bags,
+            // but do not force a partially filled local bag into the shared
+            // queue every 128 pinnings.
+            let _ = self.try_drain_inner(PERIODIC_COLLECT_BUDGET, false);
+        }
+        guard
     }
 
     pub(crate) fn leave_guard(&'static self) {
@@ -260,88 +271,76 @@ impl EpochDomain {
         }
 
         let hooks = self.hooks();
-        let cpu_pin = (hooks.pin_current_cpu)();
-        let cpu_id = cpu_pin.cpu_id();
-        let local = self.cpu_state(cpu_id).ok_or(EpochError::InvalidCpu)?;
-        if !local.is_initialized() {
-            return Err(EpochError::CpuNotInitialized);
-        }
-
-        let retired_at_epoch = self.global_epoch.0.load(Ordering::Relaxed);
-        let mut state = unsafe { &mut *self.state.get() };
-        // The current CPU is pinned, so this allocation touches only the
-        // current CPU's independent retired pool.
-        let mut index = state.alloc_node(cpu_id);
-        drop(cpu_pin);
-
-        if index.is_none() {
-            if let Some(seq) = trace_seq {
-                emit_epoch_trace(b"debug.epoch.retire.alloc_miss", seq);
-            }
-            let _ = self.try_drain(DEFAULT_DRAIN_BATCH);
-
+        let mut retried_after_drain = false;
+        loop {
             let cpu_pin = (hooks.pin_current_cpu)();
             let cpu_id = cpu_pin.cpu_id();
             let local = self.cpu_state(cpu_id).ok_or(EpochError::InvalidCpu)?;
             if !local.is_initialized() {
                 return Err(EpochError::CpuNotInitialized);
             }
-            state = unsafe { &mut *self.state.get() };
-            index = state.alloc_node(cpu_id);
 
-            let index = index.ok_or(EpochError::RetiredNodePoolExhausted)?;
-            let pool = state
-                .pool_mut(cpu_id)
-                .expect("retire_raw CPU must have a retired pool");
-            pool.nodes[index].ptr = ptr;
-            pool.nodes[index].reclaim_fn = reclaim_fn;
-            pool.nodes[index].retired_at_epoch = retired_at_epoch;
+            let local_bag = unsafe { &mut *local.bag_ptr() };
+            if local_bag.is_full() {
+                let seal_result = self.seal_local_bag(cpu_id, local_bag);
+                if seal_result.is_err() && !retried_after_drain {
+                    drop(cpu_pin);
+                    if let Some(seq) = trace_seq {
+                        emit_epoch_trace(b"debug.epoch.retire.alloc_miss", seq);
+                    }
+                    let _ = self.try_drain_inner(PERIODIC_COLLECT_BUDGET, false);
+                    retried_after_drain = true;
+                    continue;
+                }
+                seal_result?;
+            }
 
-            let retired = unsafe { &mut *local.retired_ptr() };
-            retired.push(&mut pool.nodes, index);
-            let retired_count = retired.count;
+            local_bag.push(RetiredEntry { ptr, reclaim_fn });
+            local.note_retired();
+            let retired_count = local.retired_count();
             if let Some(seq) = trace_seq {
                 emit_epoch_trace(b"debug.epoch.retire.queued", seq);
                 emit_epoch_trace(b"debug.epoch.retire.local_count", retired_count as i64);
             }
-            let should_try_drain = retired_count > RETIRE_THRESHOLD;
-            drop(cpu_pin);
-            if should_try_drain {
-                if let Some(seq) = trace_seq {
-                    emit_epoch_trace(b"debug.epoch.retire.threshold", seq);
-                }
-                let _ = self.try_drain(DEFAULT_DRAIN_BATCH);
-            }
+            return Ok(());
+        }
+    }
+
+    fn seal_local_bag(
+        &'static self,
+        cpu_id: CpuId,
+        local_bag: &mut super::retired::LocalBag,
+    ) -> Result<(), EpochError> {
+        if local_bag.is_empty() {
             return Ok(());
         }
 
-        let index = index.expect("checked above");
-        let pool = state
-            .pool_mut(cpu_id)
-            .expect("retire_raw CPU must have a retired pool");
-        pool.nodes[index].ptr = ptr;
-        pool.nodes[index].reclaim_fn = reclaim_fn;
-        pool.nodes[index].retired_at_epoch = retired_at_epoch;
+        let cached = {
+            let _guard = self.queue_lock.lock();
+            unsafe { &mut *self.state.get() }.queue.take_cached()
+        };
+        let bag = match cached {
+            Some(bag) => bag,
+            None => allocate_bag_page().map_err(|_| EpochError::RetiredBagAllocationFailed)?,
+        };
 
-        let retired = unsafe { &mut *local.retired_ptr() };
-        retired.push(&mut pool.nodes, index);
-        let retired_count = retired.count;
-        if let Some(seq) = trace_seq {
-            emit_epoch_trace(b"debug.epoch.retire.queued", seq);
-            emit_epoch_trace(b"debug.epoch.retire.local_count", retired_count as i64);
+        // Crossbeam seals a local bag only after a SeqCst publication fence,
+        // then stamps it with the current global epoch.
+        fence(Ordering::SeqCst);
+        let epoch = self.global_epoch.0.load(Ordering::Relaxed);
+        unsafe {
+            SealedBag::fill_from_local(bag, local_bag, epoch, cpu_id.0);
         }
-        let should_try_drain = retired_count > RETIRE_THRESHOLD;
-
-        if should_try_drain {
-            if let Some(seq) = trace_seq {
-                emit_epoch_trace(b"debug.epoch.retire.threshold", seq);
-            }
-            let _ = self.try_drain(DEFAULT_DRAIN_BATCH);
-        }
+        let _guard = self.queue_lock.lock();
+        unsafe { &mut *self.state.get() }.queue.push_back(bag);
         Ok(())
     }
 
     fn try_drain(&'static self, budget: usize) -> DrainStats {
+        self.try_drain_inner(budget, true)
+    }
+
+    fn try_drain_inner(&'static self, budget: usize, flush_local: bool) -> DrainStats {
         let trace_seq = epoch_trace_sample(&DRAIN_TRACE_SAMPLE);
         if let Some(seq) = trace_seq {
             emit_epoch_trace(b"debug.epoch.drain.enter", seq);
@@ -356,24 +355,9 @@ impl EpochDomain {
             ..DrainStats::default()
         };
 
-        if self.try_advance_epoch() {
-            stats.advanced_epochs += 1;
-        }
-
-        // Nodes retired in epoch E are reclaimable only once the global epoch
-        // reaches at least E + 2.
-        let safe_epoch = self.global_epoch.0.load(Ordering::Acquire);
-        let mut reclaim_head = None;
-        let mut reclaim_tail = None;
-        let mut reclaim_count = 0usize;
-
         let hooks = self.hooks();
         let cpu_pin = (hooks.pin_current_cpu)();
         let cpu_id = cpu_pin.cpu_id();
-        if let Some(_seq) = trace_seq {
-            emit_epoch_trace(b"debug.epoch.drain.cpu", cpu_id.0 as i64);
-            emit_epoch_trace(b"debug.epoch.drain.safe_epoch", safe_epoch as i64);
-        }
         if cpu_id.0 >= self.possible_cpus.0.load(Ordering::Acquire)
             || !(hooks.is_cpu_online)(cpu_id)
             || !self.cpu_states[cpu_id.0].is_initialized()
@@ -381,40 +365,86 @@ impl EpochDomain {
             return stats;
         }
 
-        {
-            let state = unsafe { &mut *self.state.get() };
-            let pool = state
-                .pool_mut(cpu_id)
-                .expect("try_drain CPU must have a retired pool");
-            let retired = unsafe { &mut *self.cpu_states[cpu_id.0].retired_ptr() };
-            let mut remaining_head = None;
-            let mut remaining_tail = None;
-            let mut remaining_count = 0usize;
+        let local = &self.cpu_states[cpu_id.0];
+        let flush_failed = flush_local
+            && self
+                .seal_local_bag(cpu_id, unsafe { &mut *local.bag_ptr() })
+                .is_err();
 
-            // Drain only the current CPU's retired list. Other CPUs reclaim
-            // their own nodes when they hit their drain path.
-            while let Some(index) = retired.pop(&mut pool.nodes) {
-                let expired = safe_epoch >= pool.nodes[index].retired_at_epoch.saturating_add(2);
-                if reclaim_count < budget && expired {
-                    append_index(&mut pool.nodes, &mut reclaim_head, &mut reclaim_tail, index);
-                    reclaim_count += 1;
-                } else {
-                    append_index(
-                        &mut pool.nodes,
-                        &mut remaining_head,
-                        &mut remaining_tail,
-                        index,
-                    );
-                    remaining_count += 1;
+        if self.try_advance_epoch() {
+            stats.advanced_epochs += 1;
+        }
+
+        // Nodes retired in epoch E are reclaimable only once the global epoch
+        // reaches at least E + 2.
+        let safe_epoch = self.global_epoch.0.load(Ordering::Acquire);
+        if let Some(_seq) = trace_seq {
+            emit_epoch_trace(b"debug.epoch.drain.cpu", cpu_id.0 as i64);
+            emit_epoch_trace(b"debug.epoch.drain.safe_epoch", safe_epoch as i64);
+        }
+
+        let Some(_collector) = self.collect_lock.try_lock() else {
+            stats.remaining = self.total_retired_count();
+            return stats;
+        };
+
+        let mut collected_bags = 0usize;
+        while stats.reclaimed < budget && collected_bags < COLLECT_STEPS {
+            let bag = {
+                let _guard = self.queue_lock.lock();
+                unsafe { &mut *self.state.get() }
+                    .queue
+                    .pop_expired(safe_epoch)
+            };
+            let Some(mut bag) = bag else {
+                break;
+            };
+            collected_bags += 1;
+
+            while stats.reclaimed < budget {
+                let next = unsafe {
+                    let bag_ref = bag.as_mut();
+                    if bag_ref.cursor == bag_ref.len {
+                        None
+                    } else {
+                        let entry = bag_ref.entries[bag_ref.cursor];
+                        bag_ref.cursor += 1;
+                        Some((entry, bag_ref.owner_cpu, bag_ref.cursor == bag_ref.len))
+                    }
+                };
+                let Some((entry, owner_cpu, complete)) = next else {
+                    break;
+                };
+                let reclaim_seq = epoch_trace_sample(&RECLAIM_TRACE_SAMPLE);
+                if let Some(seq) = reclaim_seq {
+                    emit_epoch_trace(b"debug.epoch.reclaim.begin", seq);
+                    emit_epoch_trace(b"debug.epoch.reclaim.fn", entry.reclaim_fn as usize as i64);
+                }
+                unsafe { (entry.reclaim_fn)(entry.ptr) };
+                if let Some(seq) = reclaim_seq {
+                    emit_epoch_trace(b"debug.epoch.reclaim.end", seq);
+                }
+                self.cpu_states[owner_cpu].note_reclaimed(1);
+                stats.reclaimed += 1;
+                if complete {
+                    break;
                 }
             }
 
-            retired.head = remaining_head;
-            retired.count = remaining_count;
-            stats.remaining = remaining_count;
+            if unsafe { bag.as_ref().remaining() } == 0 {
+                let _guard = self.queue_lock.lock();
+                unsafe { &mut *self.state.get() }.queue.recycle(bag);
+            } else {
+                let _guard = self.queue_lock.lock();
+                unsafe { &mut *self.state.get() }.queue.push_front(bag);
+                break;
+            }
         }
 
-        stats.reclaimed = self.reclaim_list(cpu_id, reclaim_head);
+        if flush_failed {
+            let _ = self.seal_local_bag(cpu_id, unsafe { &mut *local.bag_ptr() });
+        }
+        stats.remaining = self.total_retired_count();
         if let Some(seq) = trace_seq {
             emit_epoch_trace(b"debug.epoch.drain.exit", seq);
             emit_epoch_trace(b"debug.epoch.drain.advanced", stats.advanced_epochs as i64);
@@ -431,6 +461,10 @@ impl EpochDomain {
     fn try_advance_epoch(&'static self) -> bool {
         let current = self.global_epoch.0.load(Ordering::Acquire);
         let hooks = self.hooks();
+
+        // Pairs with guard publication and bag sealing. This is the same
+        // synchronization point Crossbeam places before scanning participants.
+        fence(Ordering::SeqCst);
 
         // Epoch advance is allowed only if every online initialized CPU is
         // either outside a guard (`local == 0`) or already in the current epoch.
@@ -457,39 +491,10 @@ impl EpochDomain {
             .is_ok()
     }
 
-    fn reclaim_list(&'static self, cpu: CpuId, mut head: Option<usize>) -> usize {
-        let mut reclaimed = 0usize;
-        while let Some(index) = head {
-            let state = unsafe { &mut *self.state.get() };
-            let pool = state
-                .pool_mut(cpu)
-                .expect("reclaim_list CPU must have a retired pool");
-            debug_assert!(index < RETIRED_NODE_POOL_CAPACITY);
-            let node = &mut pool.nodes[index];
-            let ptr = node.ptr;
-            let reclaim_fn = node.reclaim_fn;
-            let next = node.next;
-            node.next = None;
-
-            // The callback owns object-specific destruction. The domain only
-            // decides when it is safe to call it.
-            let trace_seq = epoch_trace_sample(&RECLAIM_TRACE_SAMPLE);
-            if let Some(seq) = trace_seq {
-                emit_epoch_trace(b"debug.epoch.reclaim.begin", seq);
-                emit_epoch_trace(b"debug.epoch.reclaim.fn", reclaim_fn as usize as i64);
-            }
-            unsafe { reclaim_fn(ptr) };
-            if let Some(seq) = trace_seq {
-                emit_epoch_trace(b"debug.epoch.reclaim.end", seq);
-            }
-
-            let state = unsafe { &mut *self.state.get() };
-            state.free_node(cpu, index);
-
-            reclaimed += 1;
-            head = next;
-        }
-        reclaimed
+    fn total_retired_count(&self) -> usize {
+        (0..self.possible_cpus.0.load(Ordering::Acquire))
+            .map(|cpu| self.cpu_states[cpu].retired_count())
+            .sum()
     }
 
     fn cpu_state(&'static self, cpu: CpuId) -> Option<&'static CpuLocalEpochState> {
@@ -592,33 +597,18 @@ fn default_is_cpu_online(cpu: CpuId) -> bool {
 }
 
 struct DomainState {
-    /// One independent retired-node pool per CPU.
-    pools: [PerCpuRetiredPool; MAX_EPOCH_CPUS],
+    queue: BagQueue,
 }
 
 impl DomainState {
     const fn new() -> Self {
         Self {
-            pools: [const { PerCpuRetiredPool::new() }; MAX_EPOCH_CPUS],
+            queue: BagQueue::new(),
         }
     }
 
     fn reset(&mut self) {
-        for cpu in 0..MAX_EPOCH_CPUS {
-            self.pools[cpu].reset();
-        }
-    }
-
-    fn alloc_node(&mut self, cpu: CpuId) -> Option<usize> {
-        self.pools.get_mut(cpu.0)?.alloc_node()
-    }
-
-    fn free_node(&mut self, cpu: CpuId, index: usize) {
-        self.pools[cpu.0].free_node(index);
-    }
-
-    fn pool_mut(&mut self, cpu: CpuId) -> Option<&mut PerCpuRetiredPool> {
-        self.pools.get_mut(cpu.0)
+        self.queue.reset();
     }
 }
 
@@ -642,6 +632,13 @@ impl SpinLock {
             core::hint::spin_loop();
         }
         SpinGuard { lock: self }
+    }
+
+    fn try_lock(&self) -> Option<SpinGuard<'_>> {
+        self.held
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| SpinGuard { lock: self })
     }
 }
 

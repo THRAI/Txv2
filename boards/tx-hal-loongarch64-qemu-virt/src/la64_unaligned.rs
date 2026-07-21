@@ -121,8 +121,7 @@ pub(crate) fn emulate_kernel_unaligned(frame: &mut La64TrapFrame) -> UnalignedOu
         AccessKind::Load => {
             let mut raw: u64 = 0;
             for offset in 0..decoded.width {
-                let byte =
-                    unsafe { core::ptr::read_volatile((frame.badv + offset) as *const u8) };
+                let byte = unsafe { core::ptr::read_volatile((frame.badv + offset) as *const u8) };
                 raw |= (byte as u64) << (8 * offset);
             }
             let value = if decoded.signed {

@@ -1767,7 +1767,11 @@ impl core::future::Future for SubstrateReadyWait {
             this.subscriber = Some(id);
         }
         while let Some(event) = this.mailbox.poll() {
-            if this.active.as_ref().is_some_and(|wait| wait.matches(&event)) {
+            if this
+                .active
+                .as_ref()
+                .is_some_and(|wait| wait.matches(&event))
+            {
                 return core::task::Poll::Ready(());
             }
         }
@@ -1805,7 +1809,9 @@ fn socket_ready_wait(source_id: u64, interest_bits: u64) -> Option<SocketReadyWa
     if let Some(source) = crate::adapter::reactor_entry::lookup_source(
         crate::adapter::step_engine::WaitSourceId::new(source_id),
     ) {
-        return Some(SocketReadyWait::Substrate(SubstrateReadyWait::new(source, interests)));
+        return Some(SocketReadyWait::Substrate(SubstrateReadyWait::new(
+            source, interests,
+        )));
     }
     let token = tx_subsystems::execution::WaitToken::new(source_id, interest_bits);
     wait_source::wait_on_token(token).map(SocketReadyWait::Legacy)

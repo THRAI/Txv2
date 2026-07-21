@@ -85,13 +85,13 @@ run_buildstorm() {
     return "$buildstorm_rc"
 }
 
-echo "TX_FINAL_INIT start mode=cagent-only"
-run_cagent
-cagent_rc=$?
+echo "TX_FINAL_INIT start mode=buildstorm-only"
+run_buildstorm
+buildstorm_rc=$?
 sync
-echo "TX_FINAL_INIT done mode=cagent-only cagent_rc=$cagent_rc"
+echo "TX_FINAL_INIT done mode=buildstorm-only buildstorm_rc=$buildstorm_rc"
 
-if [ "$cagent_rc" -ne 0 ]; then
+if [ "$buildstorm_rc" -ne 0 ]; then
     exit 1
 fi
 exit 0

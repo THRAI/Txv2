@@ -174,7 +174,7 @@ impl<T: 'static> Cap<T> {
                     unsafe { epoch::retire_raw(slot.as_ptr() as *mut u8, reclaim_slot::<T>) }
                         .expect(
                             "zone slot retire enqueue failed after bounded drain; \
-                             five-state zone design fail-fasts on retired-node pool exhaustion",
+                             retired-bag page allocation failed",
                         );
                     return;
                 }

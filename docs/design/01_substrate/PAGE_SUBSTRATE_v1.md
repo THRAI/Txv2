@@ -853,6 +853,25 @@ Range unmap and protect helpers collect per-page `PmapUnmapResult` /
 with range locks, recipes, and the substrate ASID-scoped shootdown batch without
 making the board own VM policy.
 
+### 7.4 Kernel virtually contiguous allocation
+<!-- txdoc:PAGE-SUBSTRATE-KERNEL-VMALLOC-1 -->
+
+The global allocator follows a `kvmalloc`-style policy for large Rust objects.
+Moderate requests first try the direct-map contiguous allocator and fall back
+to vmalloc when fragmentation prevents a run. Requests above the allocator's
+bounded direct-try limit go directly to vmalloc because the current bitmap
+backend has no buddy allocator's constant-time order availability test.
+
+The vmalloc window supplies contiguous virtual addresses backed by independent
+4 KiB frames. Population reserves empty leaves and uses
+`PmapIf::commit_new_kernel_mapping()`, so it does not flush the TLB once per new
+page; one range publication follows the completed PTE batch. Teardown first
+clears every leaf, chains the still-owned frames through their now-dead object
+storage without allocating metadata, issues one batched kernel shootdown, and
+only then returns the frames. This preserves the required `unmap -> shootdown
+-> physical reuse` ordering while making cost linear in PTE updates rather than
+linear in global TLB flushes.
+
 ### 7.4 Pmap's own intermediate pages
 <!-- txdoc:PAGE-SUBSTRATE-PMAP-INTEGRATION-PMAPS-OWN-INTERMEDIATE-PAGES-1 -->
 
