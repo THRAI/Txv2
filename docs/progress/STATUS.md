@@ -17824,6 +17824,19 @@
   `identity.payload` is the highest-volume lock with rho `0.090099`,
   service p99 `97000ns`, response p99 `99000ns`, and response max
   `15209000ns`.
+- 2026-07-21 Crossbeam-style nested epoch guards: replaced the synthetic
+  no-op `borrow_current_guard()` guard with balanced per-CPU `pin_depth`.
+  Only the outermost `0 -> 1` guard publishes `local_epoch`, increments the
+  periodic 128-pinning counter, and may collect; only the final `1 -> 0` drop
+  clears `local_epoch` and decrements the active-participant summary. Existing
+  local/sealed bag and global queue reclamation remain unchanged. Updated the
+  active EBR invariant and interface/design notes accordingly. Verification:
+  `cargo fmt --check`, `cargo test -p tx-substrate --test epoch` (4 passed),
+  and `git diff --check` passed. `cargo check --workspace` reached the board
+  crates but remains blocked by pre-existing missing LoongArch
+  `LA64_CSR_EUEN`/`LA64_EUEN_*` constants. Next step: rerun the RV BuildStorm
+  workload and, if the stale-Cap panic remains, instrument its concrete Cap
+  type/key rather than changing the EBR collection cadence.
 - Real K210 boot, linker, and hardware path are not implemented yet.
 - OSComp FAT32 image/test runner integration is not yet a passing boot test.
 - LA64 target availability depends on local rustup support.

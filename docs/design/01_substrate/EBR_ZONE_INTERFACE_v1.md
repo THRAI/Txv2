@@ -557,6 +557,9 @@ The executable implementation uses the Crossbeam collection shape:
 - a bounded cache of empty bag pages, with excess pages returned to the frame
   allocator;
 - CPU pinning inside `Guard`;
+- Crossbeam-style per-CPU guard depth: only an outermost guard acquisition
+  publishes the local epoch and advances the 128-pinning counter, while only
+  the final nested guard drop makes the CPU quiescent;
 - a two-epoch safe margin.
 
 The public architecture should not require callers to know these mechanics.

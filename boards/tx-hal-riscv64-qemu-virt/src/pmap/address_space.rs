@@ -112,7 +112,7 @@ pub(super) fn destroy_pmap_root_from_bag<State>(bag: &BootStaticBag<State>, root
         }
         *slot = 0;
     }
-    let invalidated = invalidate_destroyed_root(); // 先刷 TLB，拿到失效见证
+    let invalidated = invalidate_destroyed_root(bag, root.phys()); // 先离开待销毁根并刷 TLB
     free_asid_after_invalidation(root.asid(), invalidated); // 清残留后再回收 ASID
     free_pt_node_from_bag(bag, root.into_node());
 }
@@ -502,8 +502,43 @@ fn free_asid(asid: Asid) {
     ALLOCATED_ASIDS[word_index].fetch_and(!(1u64 << bit_index), Ordering::AcqRel);
 }
 
-// 销毁根后先全刷 TLB，返回见证类型强制“先失效后回收 ASID”的顺序。
-fn invalidate_destroyed_root() -> RootInvalidated {
+/// 在回收根页表前使其翻译失效。
+///
+/// 如果当前 hart 的 `satp` 仍指向这个根，单独执行 `sfence.vma`
+/// 并不能解除引用：根页被帧分配器复用后，硬件会把新数据当成
+/// PTE 继续游走。因此必须先切换到永久存在的 bootstrap 内核根，
+/// 再刷新 TLB，然后才能释放进程根页表。
+///
+/// 当前保证本 hart（BuildStorm `-smp 1` 路径）；多核下还需要在释放前
+/// 确保其他 hart 也已经离开该根页表。
+fn invalidate_destroyed_root<State>(
+    bag: &BootStaticBag<State>,
+    root_phys: PhysAddr,
+) -> RootInvalidated {
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        const SATP_PPN_MASK: usize = (1usize << 44) - 1;
+        let current_satp: usize;
+        core::arch::asm!(
+            "csrr {satp}, satp",
+            satp = out(reg) current_satp,
+            options(nomem, nostack)
+        );
+        if (current_satp & SATP_PPN_MASK) == (root_phys.0 >> 12) {
+            const SATP_MODE_SV39: usize = 0x8 << 60;
+            let bootstrap_satp =
+                SATP_MODE_SV39 | (bag.bootstrap_root_phys().0 >> 12);
+            core::arch::asm!(
+                "csrw satp, {satp}",
+                "sfence.vma",
+                satp = in(reg) bootstrap_satp,
+                options(nostack)
+            );
+            return RootInvalidated;
+        }
+    }
+    #[cfg(not(target_arch = "riscv64"))]
+    let _ = (bag, root_phys);
     sfence_vma_all();
     RootInvalidated
 }

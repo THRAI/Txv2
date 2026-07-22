@@ -17,6 +17,9 @@ pub(crate) struct CpuLocalEpochState {
     initialized: AtomicBool,
     /// Zero means quiescent; non-zero means the CPU is inside a guard.
     local_epoch: AtomicU64,
+    /// Number of live guards on this CPU. Only the outermost guard publishes
+    /// `local_epoch`; only the last guard to leave clears it.
+    pin_depth: AtomicUsize,
     /// Current CPU's Crossbeam-style local deferred-callback bag.
     bag: UnsafeCell<LocalBag>,
     /// Number of callbacks owned by this CPU across its local and sealed bags.
@@ -32,6 +35,7 @@ impl CpuLocalEpochState {
         Self {
             initialized: AtomicBool::new(false),
             local_epoch: AtomicU64::new(0),
+            pin_depth: AtomicUsize::new(0),
             bag: UnsafeCell::new(LocalBag::new()),
             pending: AtomicUsize::new(0),
             pin_count: AtomicUsize::new(0),
@@ -40,6 +44,7 @@ impl CpuLocalEpochState {
 
     pub(crate) fn init(&self) {
         self.local_epoch.store(0, Ordering::Release);
+        self.pin_depth.store(0, Ordering::Release);
         unsafe {
             *self.bag.get() = LocalBag::new();
         }
@@ -51,6 +56,7 @@ impl CpuLocalEpochState {
     pub(crate) fn reset(&self) {
         self.initialized.store(false, Ordering::Release);
         self.local_epoch.store(0, Ordering::Release);
+        self.pin_depth.store(0, Ordering::Release);
         unsafe {
             *self.bag.get() = LocalBag::new();
         }
@@ -62,19 +68,55 @@ impl CpuLocalEpochState {
         self.initialized.load(Ordering::Acquire)
     }
 
-    pub(crate) fn enter(&self, epoch: u64) {
-        debug_assert_eq!(
-            self.local_epoch.load(Ordering::Relaxed),
-            0,
-            "epoch guards cannot be nested on the same CPU"
-        );
-        // SeqCst pairs with the domain's guard acquisition fence and keeps the
-        // published epoch visible before protected reads proceed.
-        self.local_epoch.store(epoch, Ordering::SeqCst);
+    /// Pin this CPU-local participant and return `(entered_epoch, outermost)`.
+    ///
+    /// Like Crossbeam's `guard_count`, nested guards only increase the depth.
+    /// The 0 -> 1 transition is the sole publication point for `local_epoch`.
+    pub(crate) fn pin(&self, epoch: u64) -> (u64, bool) {
+        let previous_depth = self
+            .pin_depth
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |depth| {
+                depth.checked_add(1)
+            })
+            .expect("epoch guard nesting depth overflowed");
+
+        if previous_depth == 0 {
+            debug_assert_eq!(self.local_epoch.load(Ordering::Relaxed), 0);
+            // SeqCst pairs with the domain's guard acquisition fence and keeps
+            // the published epoch visible before protected reads proceed.
+            self.local_epoch.store(epoch, Ordering::SeqCst);
+            (epoch, true)
+        } else {
+            let entered_epoch = self.local_epoch.load(Ordering::Acquire);
+            assert_ne!(
+                entered_epoch, 0,
+                "nested epoch guard found a quiescent CPU-local participant"
+            );
+            (entered_epoch, false)
+        }
     }
 
-    pub(crate) fn leave(&self) {
-        self.local_epoch.store(0, Ordering::Release);
+    /// Unpin one guard. Returns true only for the final 1 -> 0 transition.
+    pub(crate) fn unpin(&self) -> bool {
+        let previous_depth = self
+            .pin_depth
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |depth| {
+                depth.checked_sub(1)
+            })
+            .expect("epoch guard nesting depth underflowed");
+
+        if previous_depth == 1 {
+            // Release keeps every protected access before the participant is
+            // advertised as quiescent to a concurrent collector.
+            self.local_epoch.store(0, Ordering::Release);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn is_pinned(&self) -> bool {
+        self.pin_depth.load(Ordering::Relaxed) != 0
     }
 
     pub(crate) fn current(&self) -> u64 {

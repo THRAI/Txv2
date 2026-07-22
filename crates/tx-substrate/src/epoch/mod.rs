@@ -47,18 +47,19 @@ pub fn guard() -> Guard<'static> {
     domain::guard()
 }
 
-/// Borrow the current CPU's active epoch guard without modifying epoch counters.
+/// Enter a real nested guard when the current CPU is already epoch-pinned.
 ///
-/// Returns `Some(guard)` when the current CPU already holds a guard
-/// (`local_epoch != 0`).  The returned guard has a no-op Drop: it does not
-/// call `local.leave()` or decrement `active_guards`.
+/// Returns `Some(guard)` when the current CPU already holds a guard. The
+/// returned guard increments the CPU-local pin depth and decrements it on Drop.
+/// It reuses the outermost guard's published epoch and does not count as a new
+/// periodic-collection pinning.
 ///
 /// Returns `None` if no guard is currently held; the caller should fall back
 /// to `epoch::guard()`.
 ///
-/// Use this when code must satisfy an `&Guard` API but is called from within
-/// an existing epoch window and creating a nested guard would violate the
-/// EBR no-nesting invariant.
+/// This compatibility spelling remains for callers that want to distinguish
+/// "already guarded" from "create an outermost guard". New code may simply
+/// call `epoch::guard()`, which also supports balanced nesting.
 pub fn borrow_current_guard() -> Option<Guard<'static>> {
     domain::borrow_guard()
 }

@@ -174,8 +174,11 @@ fn try_direct_trap_syscall<P: TxPlatform>(
 
     let context_start = direct_sigprocmask_detail_now(req.nr);
     let thread_lookup_start = direct_sigprocmask_detail_now(req.nr);
-    let Some(thread) = tx_subsystems::thread_runtime::current_userspace_thread_identity(hart)
-    else {
+    // The trap runs inside `PerHartSlotted::poll`, which keeps the current
+    // thread identity installed until the userspace round-trip longjmps back
+    // and the wrapped poll returns.  Use that poll-scoped authority instead of
+    // maintaining a second userspace identity cache with a wider lifetime.
+    let Some(thread) = tx_subsystems::thread_runtime::current_thread_identity(hart) else {
         emit_direct_sigprocmask_detail_value(req.nr, b"debug.trap.direct_sigprocmask.no_thread", 1);
         return None;
     };

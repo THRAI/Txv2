@@ -7,6 +7,7 @@
 use core::hash::{Hash, Hasher};
 use core::marker::PhantomData;
 use core::ops::Deref;
+use core::panic::Location;
 use core::ptr::NonNull;
 use core::sync::atomic::Ordering;
 
@@ -116,6 +117,48 @@ pub struct Cap<T: 'static> {
 /// entities even though this slice uses the same underlying slot state.
 pub struct PayloadCap<T: 'static> {
     inner: Cap<T>,
+}
+
+#[cold]
+#[inline(never)]
+fn panic_stale_cap_clone<T: 'static>(
+    cap_addr: usize,
+    raw: u32,
+    caller: &'static Location<'static>,
+) -> ! {
+    let key = SlotKey::from_raw(raw);
+    match registry::lookup(key.zone_id()) {
+        Some(info) => panic!(
+            "zone stale Cap clone: expected_type={} cap_addr=0x{:016x} raw=0x{:08x} zone={} slab={} slot={} \
+             registry_type={} allocated={} slabs={} empty_slabs={} caller={}:{}:{}",
+            core::any::type_name::<T>(),
+            cap_addr,
+            raw,
+            key.zone_id().0,
+            key.slab_id(),
+            key.slot_index(),
+            info.type_name,
+            info.allocated_slots,
+            info.slab_count,
+            info.empty_slab_count,
+            caller.file(),
+            caller.line(),
+            caller.column(),
+        ),
+        None => panic!(
+            "zone stale Cap clone: expected_type={} cap_addr=0x{:016x} raw=0x{:08x} zone={} slab={} slot={} \
+             registry=missing caller={}:{}:{}",
+            core::any::type_name::<T>(),
+            cap_addr,
+            raw,
+            key.zone_id().0,
+            key.slab_id(),
+            key.slot_index(),
+            caller.file(),
+            caller.line(),
+            caller.column(),
+        ),
+    }
 }
 
 unsafe impl<T: Send + Sync> Send for Cap<T> {}
@@ -274,10 +317,11 @@ impl<T: 'static> Cap<T> {
 }
 
 impl<T: 'static> Clone for Cap<T> {
+    #[track_caller]
     fn clone(&self) -> Self {
-        let slot = self
-            .slot()
-            .expect("zone Cap key no longer resolves to a live slot");
+        let Some(slot) = self.slot() else {
+            panic_stale_cap_clone::<T>(self as *const Self as usize, self.raw, Location::caller());
+        };
         let meta = unsafe { slot.as_ref().meta() };
         loop {
             let cur = meta.load(Ordering::Acquire);
@@ -396,6 +440,7 @@ impl<T: 'static> PayloadCap<T> {
 }
 
 impl<T: 'static> Clone for PayloadCap<T> {
+    #[track_caller]
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),

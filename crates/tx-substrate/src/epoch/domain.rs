@@ -72,7 +72,7 @@ pub(crate) struct EpochDomain {
     initialized: AtomicBool,
     /// Monotonic epoch used to decide when retired nodes become reclaimable.
     global_epoch: CachePadded<AtomicU64>,
-    /// Debug/accounting counter for currently live guards.
+    /// Debug/accounting counter for currently pinned CPU participants.
     active_guards: CachePadded<AtomicUsize>,
     /// Number of CPUs the platform says may participate in EBR.
     possible_cpus: CachePadded<AtomicUsize>,
@@ -196,19 +196,17 @@ impl EpochDomain {
         );
 
         let current_epoch = self.global_epoch.0.load(Ordering::Acquire);
-        let active_epoch = local.current();
-        assert_eq!(
-            active_epoch, 0,
-            "epoch::guard nested on CPU {} with active epoch {}; use borrow_current_guard()",
-            cpu_id.0, active_epoch
-        );
-        local.enter(current_epoch);
-        self.active_guards.0.fetch_add(1, Ordering::AcqRel);
-        // Publish the local epoch before any protected load can float above the
-        // guard acquisition. This is the core EBR reader-side ordering rule.
-        fence(Ordering::SeqCst);
-        let should_collect = local.note_pin_and_should_collect();
-        let guard = Guard::new(self, local, cpu_id, current_epoch, cpu_pin);
+        let (entered_epoch, outermost) = local.pin(current_epoch);
+        let should_collect = if outermost {
+            self.active_guards.0.fetch_add(1, Ordering::AcqRel);
+            // Publish the local epoch before any protected load can float above
+            // the guard acquisition. Nested guards reuse this published window.
+            fence(Ordering::SeqCst);
+            local.note_pin_and_should_collect()
+        } else {
+            false
+        };
+        let guard = Guard::new(self, local, cpu_id, entered_epoch, cpu_pin);
         if should_collect {
             // Match Crossbeam's cold pin path: collect already-sealed bags,
             // but do not force a partially filled local bag into the shared
@@ -222,10 +220,10 @@ impl EpochDomain {
         self.active_guards.0.fetch_sub(1, Ordering::AcqRel);
     }
 
-    /// Return a borrow-mode guard for the current CPU if one is already active
-    /// (local_epoch != 0).  The returned guard does not call `local.enter()` or
-    /// increment `active_guards`; its Drop is a no-op.  Returns `None` when no
-    /// guard is held.
+    /// Return a real nested guard for the current CPU if one is already active.
+    /// The nested guard increments/decrements the CPU-local pin depth but does
+    /// not republish the epoch, increment `active_guards`, or trigger periodic
+    /// collection. Returns `None` when no guard is held.
     fn borrow_guard(&'static self) -> Option<Guard<'static>> {
         if !self.initialized.load(Ordering::Acquire) {
             return None;
@@ -234,17 +232,16 @@ impl EpochDomain {
         let cpu_pin = (hooks.pin_current_cpu)();
         let cpu_id = cpu_pin.cpu_id();
         let local = self.cpu_state(cpu_id)?;
-        let local_epoch = local.current();
-        if local_epoch == 0 {
+        if !local.is_pinned() {
             return None;
         }
-        Some(Guard::new_borrowed(
-            self,
-            local,
-            cpu_id,
-            local_epoch,
-            cpu_pin,
-        ))
+        let current_epoch = self.global_epoch.0.load(Ordering::Acquire);
+        let (entered_epoch, outermost) = local.pin(current_epoch);
+        assert!(
+            !outermost,
+            "active epoch participant became quiescent while CPU-pinned"
+        );
+        Some(Guard::new(self, local, cpu_id, entered_epoch, cpu_pin))
     }
 
     unsafe fn retire_raw(

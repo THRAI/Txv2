@@ -594,7 +594,6 @@ impl ThreadIdentitySlots {
 }
 
 static CURRENT_THREAD_IDENTITY: ThreadIdentitySlots = ThreadIdentitySlots::new();
-static CURRENT_USERSPACE_THREAD_IDENTITY: ThreadIdentitySlots = ThreadIdentitySlots::new();
 static LAST_USERSPACE_SET_HART: AtomicU64 = AtomicU64::new(u64::MAX);
 static LAST_USERSPACE_CLEAR_HART: AtomicU64 = AtomicU64::new(u64::MAX);
 static USERSPACE_SET_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -618,7 +617,11 @@ pub fn current_thread_identity(
     if hart >= MAX_THREAD_PAYLOAD_HARTS {
         return None;
     }
-    CURRENT_THREAD_IDENTITY.slots[hart].lock().clone()
+    let slot = CURRENT_THREAD_IDENTITY.slots[hart].lock();
+    match slot.as_ref() {
+        Some(thread) => Some(thread.clone()),
+        None => None,
+    }
 }
 
 /// Return the payload that most recently entered userspace on `hart`.
@@ -633,15 +636,6 @@ pub fn current_userspace_payload(hart: usize) -> Option<PayloadCap<ThreadPayload
         return None;
     }
     CURRENT_USERSPACE_PAYLOAD.slots[hart].lock().clone()
-}
-
-pub fn current_userspace_thread_identity(
-    hart: usize,
-) -> Option<crate::thread_runtime::adapter::step_engine::Cap<ThreadIdentity>> {
-    if hart >= MAX_THREAD_PAYLOAD_HARTS {
-        return None;
-    }
-    CURRENT_USERSPACE_THREAD_IDENTITY.slots[hart].lock().clone()
 }
 
 pub fn current_thread_payload_mask() -> u64 {
@@ -683,7 +677,10 @@ pub fn set_current_thread_identity(
         "hart {hart} exceeds MAX_THREAD_PAYLOAD_HARTS",
     );
     let mut slot = CURRENT_THREAD_IDENTITY.slots[hart].lock();
-    let prev = slot.clone();
+    let prev = match slot.as_ref() {
+        Some(thread) => Some(thread.clone()),
+        None => None,
+    };
     *slot = Some(thread);
     prev
 }
@@ -723,20 +720,6 @@ pub fn set_current_userspace_payload(
     prev
 }
 
-pub fn set_current_userspace_thread_identity(
-    hart: usize,
-    thread: crate::thread_runtime::adapter::step_engine::Cap<ThreadIdentity>,
-) -> Option<crate::thread_runtime::adapter::step_engine::Cap<ThreadIdentity>> {
-    assert!(
-        hart < MAX_THREAD_PAYLOAD_HARTS,
-        "hart {hart} exceeds MAX_THREAD_PAYLOAD_HARTS",
-    );
-    let mut slot = CURRENT_USERSPACE_THREAD_IDENTITY.slots[hart].lock();
-    let prev = slot.clone();
-    *slot = Some(thread);
-    prev
-}
-
 /// Clear the userspace-running payload on `hart`.
 pub fn clear_current_userspace_payload(hart: usize) -> Option<PayloadCap<ThreadPayload>> {
     if hart >= MAX_THREAD_PAYLOAD_HARTS {
@@ -746,15 +729,6 @@ pub fn clear_current_userspace_payload(hart: usize) -> Option<PayloadCap<ThreadP
     LAST_USERSPACE_CLEAR_HART.store(hart as u64, Ordering::Relaxed);
     USERSPACE_CLEAR_COUNT.fetch_add(1, Ordering::Relaxed);
     cleared
-}
-
-pub fn clear_current_userspace_thread_identity(
-    hart: usize,
-) -> Option<crate::thread_runtime::adapter::step_engine::Cap<ThreadIdentity>> {
-    if hart >= MAX_THREAD_PAYLOAD_HARTS {
-        return None;
-    }
-    CURRENT_USERSPACE_THREAD_IDENTITY.slots[hart].lock().take()
 }
 
 pub fn userspace_payload_trace_counters() -> (u64, u64, u64, u64) {

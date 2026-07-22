@@ -171,23 +171,45 @@ impl<P: SlabPageProvider> SlabHeap<P> {
         let _guard = class.lock.lock();
 
         unsafe {
-            if (*class.free_list.get()).is_null() {
+            if (*class.partial_pages.get()).is_null() && (*class.empty_pages.get()).is_null() {
                 self.populate_class(index, class)?;
             }
 
-            let object = *class.free_list.get();
+            let page = if !(*class.partial_pages.get()).is_null() {
+                *class.partial_pages.get()
+            } else {
+                *class.empty_pages.get()
+            };
+            if page.is_null() {
+                return Err(SlabError::PageAllocator(AllocError::Exhausted));
+            }
+
+            let object = (*page).free_list;
             if object.is_null() {
                 return Err(SlabError::PageAllocator(AllocError::Exhausted));
             }
 
-            *class.free_list.get() = (*object).next;
-            let header = page_header_for_object(object as *mut u8, self.provider.page_size());
-            if (*header).retained_empty {
-                debug_assert_eq!((*header).free_count, (*header).capacity);
-                (*header).retained_empty = false;
+            debug_assert_eq!((*page).magic, SLAB_PAGE_MAGIC);
+            debug_assert_eq!((*page).class_index, index);
+            debug_assert!((*page).free_count > 0);
+
+            (*page).free_list = (*object).next;
+            if (*page).retained_empty {
+                debug_assert_eq!((*page).state, SlabPageState::Empty);
+                debug_assert_eq!((*page).free_count, (*page).capacity);
+                (*page).retained_empty = false;
                 *class.retained_empty_pages.get() -= 1;
             }
-            (*header).free_count -= 1;
+            (*page).free_count -= 1;
+
+            let new_state = if (*page).free_count == 0 {
+                SlabPageState::Full
+            } else {
+                SlabPageState::Partial
+            };
+            if (*page).state != new_state {
+                move_page(class, page, new_state);
+            }
 
             Ok(NonNull::new_unchecked(object as *mut u8))
         }
@@ -200,25 +222,28 @@ impl<P: SlabPageProvider> SlabHeap<P> {
 
         unsafe {
             let header = page_header_for_object(ptr, self.provider.page_size());
+            debug_assert_eq!((*header).magic, SLAB_PAGE_MAGIC);
+            debug_assert_eq!((*header).class_index, index);
+            debug_assert_ne!((*header).state, SlabPageState::Detached);
+            debug_assert_ne!((*header).state, SlabPageState::Empty);
+            debug_assert!((*header).free_count < (*header).capacity);
+
             let object = ptr as *mut FreeObject;
-            (*object).next = *class.free_list.get();
-            *class.free_list.get() = object;
+            (*object).next = (*header).free_list;
+            (*header).free_list = object;
             (*header).free_count += 1;
 
             if (*header).free_count == (*header).capacity {
                 if *class.retained_empty_pages.get() < RETAIN_EMPTY_SLAB_PAGES_PER_CLASS {
                     (*header).retained_empty = true;
                     *class.retained_empty_pages.get() += 1;
+                    move_page(class, header, SlabPageState::Empty);
                 } else {
-                    let page_base = header as *mut u8;
-                    remove_page_objects_from_free_list(
-                        class.free_list.get(),
-                        page_base,
-                        self.provider.page_size(),
-                    );
-                    unlink_page(class.pages.get(), header);
+                    unlink_page(class, header);
                     page_to_release = header;
                 }
+            } else if (*header).state == SlabPageState::Full {
+                move_page(class, header, SlabPageState::Partial);
             }
         }
 
@@ -299,24 +324,25 @@ impl<P: SlabPageProvider> SlabHeap<P> {
 
                 let header = page as *mut SlabPageHeader;
                 header.write(SlabPageHeader {
+                    magic: SLAB_PAGE_MAGIC,
                     ppn: page_ppn,
+                    class_index: index,
                     capacity,
                     free_count: capacity,
+                    free_list: ptr::null_mut(),
+                    state: SlabPageState::Detached,
                     retained_empty: false,
-                    next: *class.pages.get(),
+                    next: ptr::null_mut(),
                     prev: ptr::null_mut(),
                 });
 
-                if !(*class.pages.get()).is_null() {
-                    (**class.pages.get()).prev = header;
-                }
-                *class.pages.get() = header;
-
                 for offset in 0..capacity {
                     let object = page.add(object_start + offset * size) as *mut FreeObject;
-                    (*object).next = *class.free_list.get();
-                    *class.free_list.get() = object;
+                    (*object).next = (*header).free_list;
+                    (*header).free_list = object;
                 }
+
+                link_page(class, header, SlabPageState::Empty);
             }
         }
 
@@ -326,8 +352,9 @@ impl<P: SlabPageProvider> SlabHeap<P> {
 
 struct SlabClass {
     lock: SpinLock,
-    free_list: UnsafeCell<*mut FreeObject>,
-    pages: UnsafeCell<*mut SlabPageHeader>,
+    empty_pages: UnsafeCell<*mut SlabPageHeader>,
+    partial_pages: UnsafeCell<*mut SlabPageHeader>,
+    full_pages: UnsafeCell<*mut SlabPageHeader>,
     retained_empty_pages: UnsafeCell<usize>,
 }
 
@@ -337,8 +364,9 @@ impl SlabClass {
     const fn new() -> Self {
         Self {
             lock: SpinLock::new(),
-            free_list: UnsafeCell::new(ptr::null_mut()),
-            pages: UnsafeCell::new(ptr::null_mut()),
+            empty_pages: UnsafeCell::new(ptr::null_mut()),
+            partial_pages: UnsafeCell::new(ptr::null_mut()),
+            full_pages: UnsafeCell::new(ptr::null_mut()),
             retained_empty_pages: UnsafeCell::new(0),
         }
     }
@@ -722,12 +750,27 @@ fn vmalloc_shootdown_mappings(invalidations: &[PmapInvalidation]) {
 
 #[repr(C)]
 struct SlabPageHeader {
+    magic: usize,
     ppn: Ppn,
+    class_index: usize,
     capacity: usize,
     free_count: usize,
+    free_list: *mut FreeObject,
+    state: SlabPageState,
     retained_empty: bool,
     next: *mut SlabPageHeader,
     prev: *mut SlabPageHeader,
+}
+
+const SLAB_PAGE_MAGIC: usize = 0x5458_534c_4142_5047;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum SlabPageState {
+    Detached,
+    Empty,
+    Partial,
+    Full,
 }
 
 struct FreeObject {
@@ -756,32 +799,34 @@ fn page_header_for_object(ptr: *mut u8, page_size: usize) -> *mut SlabPageHeader
     (ptr as usize & !(page_size - 1)) as *mut SlabPageHeader
 }
 
-unsafe fn remove_page_objects_from_free_list(
-    free_list: *mut *mut FreeObject,
-    page_base: *mut u8,
-    page_size: usize,
-) {
-    unsafe {
-        let mut current = *free_list;
-        let mut previous = ptr::null_mut::<FreeObject>();
-        while !current.is_null() {
-            let next = (*current).next;
-            if page_header_for_object(current as *mut u8, page_size) as *mut u8 == page_base {
-                if previous.is_null() {
-                    *free_list = next;
-                } else {
-                    (*previous).next = next;
-                }
-            } else {
-                previous = current;
-            }
-            current = next;
-        }
+unsafe fn page_list_head(class: &SlabClass, state: SlabPageState) -> *mut *mut SlabPageHeader {
+    match state {
+        SlabPageState::Empty => class.empty_pages.get(),
+        SlabPageState::Partial => class.partial_pages.get(),
+        SlabPageState::Full => class.full_pages.get(),
+        SlabPageState::Detached => unreachable!("detached slab pages have no list"),
     }
 }
 
-unsafe fn unlink_page(head: *mut *mut SlabPageHeader, page: *mut SlabPageHeader) {
+unsafe fn link_page(class: &SlabClass, page: *mut SlabPageHeader, state: SlabPageState) {
     unsafe {
+        debug_assert_eq!((*page).state, SlabPageState::Detached);
+        let head = page_list_head(class, state);
+        (*page).state = state;
+        (*page).prev = ptr::null_mut();
+        (*page).next = *head;
+        if !(*head).is_null() {
+            (**head).prev = page;
+        }
+        *head = page;
+    }
+}
+
+unsafe fn unlink_page(class: &SlabClass, page: *mut SlabPageHeader) {
+    unsafe {
+        let state = (*page).state;
+        debug_assert_ne!(state, SlabPageState::Detached);
+        let head = page_list_head(class, state);
         if !(*page).prev.is_null() {
             (*(*page).prev).next = (*page).next;
         } else {
@@ -791,6 +836,20 @@ unsafe fn unlink_page(head: *mut *mut SlabPageHeader, page: *mut SlabPageHeader)
         if !(*page).next.is_null() {
             (*(*page).next).prev = (*page).prev;
         }
+
+        (*page).next = ptr::null_mut();
+        (*page).prev = ptr::null_mut();
+        (*page).state = SlabPageState::Detached;
+    }
+}
+
+unsafe fn move_page(class: &SlabClass, page: *mut SlabPageHeader, state: SlabPageState) {
+    unsafe {
+        if (*page).state == state {
+            return;
+        }
+        unlink_page(class, page);
+        link_page(class, page, state);
     }
 }
 

@@ -99,9 +99,8 @@ use tx_subsystems::signal::{ast_dispatch, refresh_deliverable_signal_summary, As
 use tx_subsystems::thread_runtime::execution::prepare_userspace_entry_payload_into;
 use tx_subsystems::thread_runtime::{
     clear_current_thread_identity, clear_current_thread_payload, clear_current_userspace_payload,
-    clear_current_userspace_thread_identity, set_current_thread_identity,
-    set_current_thread_payload, set_current_userspace_payload,
-    set_current_userspace_thread_identity, ThreadIdentity, ThreadPayload,
+    set_current_thread_identity, set_current_thread_payload, set_current_userspace_payload,
+    ThreadIdentity, ThreadPayload,
 };
 use tx_subsystems::vm::{
     AccessMode, AddressSpace, Prot, UserAccessKind, UserRange, UserVirtAddr, VmEntry,
@@ -604,8 +603,6 @@ pub async fn run_thread<P: TxPlatform>(
                 }
                 payload.set_active_userspace_request(Some(entry_token));
                 let entry_hart = <P as tx_hal::SmpIf>::current_cpu_id().0;
-                let _prev_userspace_thread =
-                    set_current_userspace_thread_identity(entry_hart, thread.clone());
                 let _prev_userspace = set_current_userspace_payload(entry_hart, payload.clone());
                 ctx = tx_shims::linux_syscall::maybe_deliver_itimer_signal::<P>(
                     ctx, &process, &thread, &aspace,
@@ -636,7 +633,6 @@ pub async fn run_thread<P: TxPlatform>(
         let entry_hart = <P as tx_hal::SmpIf>::current_cpu_id().0;
         if !matches!(trap, UserspaceTrapInfo::TimerPreempt) {
             let _ = clear_current_userspace_payload(entry_hart);
-            let _ = clear_current_userspace_thread_identity(entry_hart);
         }
         payload.set_active_userspace_request(None);
         if let UserspaceTrapInfo::Syscall(req) = trap {
