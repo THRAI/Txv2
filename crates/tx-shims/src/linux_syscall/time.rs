@@ -406,7 +406,7 @@ pub(super) fn sys_settimeofday<'a, P: TimeIf>(
     }
 }
 
-const ITIMER_REAL: u32 = 0;
+pub const ITIMER_REAL: u32 = 0;
 const ITIMER_VIRTUAL: u32 = 1;
 const ITIMER_PROF: u32 = 2;
 const SIGALRM: u8 = 14;

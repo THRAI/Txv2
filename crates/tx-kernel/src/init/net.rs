@@ -27,6 +27,7 @@ use tx_subsystems::net::protocol::{EtherIface, IfaceCommon, LoopbackIface};
 use tx_subsystems::net::structure::Ipv4Address;
 use tx_subsystems::net::{
     initial_loopback_iface, initial_net_namespace_payload, NetAdminAuthority,
+    NetNamespaceRouteConfig,
 };
 
 use super::{CoreInit, BOOT_REACTOR};
@@ -154,9 +155,31 @@ fn publish_boot_net_device_to_namespace(
             Some(BOOT_ETH_IPV4),
             Some(24),
         );
-        return;
+    } else {
+        let _ = namespace.attach_device_for_test_or_bootstrap(registration, Some(BOOT_ETH_IPV4));
     }
-    let _ = namespace.attach_device_for_test_or_bootstrap(registration, Some(BOOT_ETH_IPV4));
+    // Boot default route (0.0.0.0/0 via the SLIRP gateway). On Linux this
+    // line is DHCP's job; the boot lane configures the iface statically, so
+    // the FIB must be seeded here too. Without it every off-link v4 dst is
+    // unroutable: TCP connect selects no source address, `step_send`
+    // hard-fails, and `gateway_for_device` leaves the per-link iface without
+    // a gateway so TX dies EADDRNOTAVAIL before ARP. The L2 next-hop is
+    // already covered by the static gateway ARP installed at runtime setup.
+    // EEXIST on re-publish is benign.
+    let _ = namespace.add_ipv4_route(
+        authority,
+        NetNamespaceRouteConfig {
+            dst: Ipv4Address::UNSPECIFIED,
+            prefix_len: 0,
+            gateway: Some(BOOT_ETH_GATEWAY),
+            oif_name: Some(registration.name),
+            preferred_src: Some(BOOT_ETH_IPV4),
+            table: 254,
+            protocol: 3,   // RTPROT_BOOT
+            scope: 0,      // RT_SCOPE_UNIVERSE
+            route_type: 1, // RTN_UNICAST
+        },
+    );
 }
 
 impl BootNetRuntime {
@@ -328,7 +351,25 @@ impl<P: TxPlatform> CoreInit<P> {
                         BootNetDelegateDriver::<P>::new(runtime),
                         config,
                         move |next_deadline| {
-                            let _ = runtime.refresh_delegate_deadline(next_deadline);
+                            // RX poll floor: no RX interrupt is wired, so a
+                            // quiet established stream (reader blocked in
+                            // read(), smoltcp with no pending timers) yields
+                            // `next_deadline = None`; the timer then disarms
+                            // and the delegate sleeps forever while frames
+                            // pile up unprocessed in the virtio queue —
+                            // external bulk transfers stall right after the
+                            // initial syscall-driven burst (git clone froze
+                            // at ~20 KiB). Clamp the deadline so the
+                            // delegate always re-polls the device soon.
+                            let micros = P::read_ns() / 1_000;
+                            let now =
+                                Instant::from_micros(micros.min(i64::MAX as u64) as i64);
+                            let floor = now + smoltcp::time::Duration::from_millis(10);
+                            let clamped = Some(match next_deadline {
+                                Some(deadline) if deadline < floor => deadline,
+                                _ => floor,
+                            });
+                            let _ = runtime.refresh_delegate_deadline(clamped);
                         },
                     )
                     .await;

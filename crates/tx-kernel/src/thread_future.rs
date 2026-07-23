@@ -952,21 +952,40 @@ pub async fn run_thread<P: TxPlatform>(
                         );
                         log_user_segv::<P>(&payload, info.addr.raw(), info.access, "pf", e);
                         log_nearby_recipes::<P>(&aspace, info.addr.raw() as usize);
+                        // Also dump the recipe containing the faulting PC, so
+                        // we get the library load base and can disassemble the
+                        // exact NULL-write instruction (proxy-push segv hunt).
+                        if let Some(c) = payload.saved_user_context() {
+                            log_nearby_recipes::<P>(&aspace, c.pc as usize);
+                        }
+                        dump_syscall_history::<P>();
                         deliver_synchronous_fault(&thread, Signum::SIGSEGV);
                         return;
                     }
                 }
             }
-            UserspaceTrapInfo::Fatal(_info) => {
+            UserspaceTrapInfo::Fatal(info) => {
                 // Phase B: route fatal trap through canonical
                 // synchronous-fault entry per SIGNAL_v1 §20.
+                // Report the REAL trap cause/tval — the previous
+                // placeholder (addr=0, no-recipe) made every fatal trap
+                // read like a NULL-pointer page fault and hid the actual
+                // scause (illegal-instruction vs misaligned vs ...).
+                tx_hal::console_write_str::<P>("txkernel:");
+                tx_hal::console_write_str::<P>(P::BOARD);
+                tx_hal::console_write_str::<P>(":user-fatal:cause=0x");
+                write_hex_u64::<P>(info.cause);
+                tx_hal::console_write_str::<P>(":tval=0x");
+                write_hex_u64::<P>(info.value);
+                tx_hal::console_write_str::<P>("\n");
                 log_user_segv::<P>(
                     &payload,
-                    0,
+                    info.value,
                     PageFaultAccess::Unknown,
                     "fatal",
                     tx_subsystems::vm::VmFaultError::NoRecipe,
                 );
+                dump_syscall_history::<P>();
                 deliver_synchronous_fault(&thread, Signum::SIGSEGV);
                 return;
             }
@@ -1149,6 +1168,24 @@ fn log_user_segv<P: TxPlatform>(
     write_hex_u64::<P>(sp);
     tx_hal::console_write_str::<P>(":a0=0x");
     write_hex_u64::<P>(a0);
+    tx_hal::console_write_str::<P>("\n");
+}
+
+/// PROBE(proxy-push segv hunt): dump the last syscalls (nr=ret, hex) recorded
+/// by the tx-shims dispatch ring, so the fatal-trap report shows what
+/// git-remote-https did right before it faulted. Newest entry printed last.
+fn dump_syscall_history<P: TxPlatform>() {
+    let (nrs, rets, pos) = tx_shims::linux_syscall::syscall_history_snapshot();
+    let len = tx_shims::linux_syscall::SYSCALL_HISTORY_LEN;
+    tx_hal::console_write_str::<P>("txkernel:syshist(nr=ret hex,newest-last):");
+    let show = if len < 28 { len } else { 28 };
+    for k in (0..show).rev() {
+        let idx = (pos + len - 1 - k) % len;
+        tx_hal::console_write_str::<P>(" ");
+        write_hex_u64::<P>(nrs[idx]);
+        tx_hal::console_write_str::<P>("=");
+        write_hex_u64::<P>(rets[idx] as u64);
+    }
     tx_hal::console_write_str::<P>("\n");
 }
 

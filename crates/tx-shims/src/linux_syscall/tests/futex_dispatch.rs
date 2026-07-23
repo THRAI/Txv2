@@ -196,7 +196,7 @@ fn direct_trap_futex_wake_uses_wake_handoff_hint() {
     );
 
     let wake_req = SyscallRequest::new(NR_FUTEX, [uaddr, FUTEX_WAKE as u64, 1, 0, 0, 0]);
-    let result = crate::linux_syscall::dispatch_direct_trap_oneshot(
+    let result = crate::linux_syscall::dispatch_direct_trap_oneshot::<ShimsTestPmap>(
         &wake_req,
         &proc_cap,
         &thread,

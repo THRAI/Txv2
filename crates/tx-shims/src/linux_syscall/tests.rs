@@ -1106,7 +1106,7 @@ fn dispatch_direct_trap_payload_oneshot_routes_sigprocmask_through_payload_lane(
     const SIGUSR1_BIT: u64 = 1u64 << 9;
 
     let set: u64 = SIGUSR1_BIT;
-    let set_result = dispatch_direct_trap_payload_oneshot(
+    let set_result = dispatch_direct_trap_payload_oneshot::<ShimsTestPmap>(
         &SyscallRequest::new(
             NR_RT_SIGPROCMASK,
             [SIG_SETMASK, &set as *const u64 as u64, 0, 8, 0, 0],
@@ -1119,7 +1119,7 @@ fn dispatch_direct_trap_payload_oneshot_routes_sigprocmask_through_payload_lane(
     assert_eq!(set_result, Some(SyscallResult::Return(0)));
 
     let mut oldset: u64 = 0;
-    let query_result = dispatch_direct_trap_payload_oneshot(
+    let query_result = dispatch_direct_trap_payload_oneshot::<ShimsTestPmap>(
         &SyscallRequest::new(
             NR_RT_SIGPROCMASK,
             [SIG_SETMASK, 0, &mut oldset as *mut u64 as u64, 8, 0, 0],

@@ -44,10 +44,15 @@ use tx_subsystems::vfs::FsOps;
 
 /// Static writable capacity for ext4 regular-file PageContainers.
 ///
-/// PageContainer currently has a fixed `page_count` capacity. Match tmpfs'
-/// day-1 growth window so newly-created ext4 files can grow through ordinary
-/// PageBacked writes instead of failing after one page.
-const EXT4_FILE_PAGE_CAP: u64 = 2048;
+/// PageContainer currently has a fixed `page_count` capacity. Newly-created
+/// ext4 files can grow through ordinary PageBacked writes up to this bound;
+/// writes past it fail EINVAL at `write_user_to_pc`'s capacity check. The
+/// original 2048-page (8 MiB) window made `git clone` of any repo whose pack
+/// exceeds 8 MiB die mid-transfer with "fatal: write error: Invalid argument"
+/// (xv6-riscv's ~7.8k-object pack crosses it). The page store is a sparse
+/// BTreeMap, so the cap is a bound, not an allocation — 65536 pages (256 MiB)
+/// costs nothing up front and comfortably covers competition-scale repos.
+const EXT4_FILE_PAGE_CAP: u64 = 65536;
 
 /// Factory for `MountOutput::fs_ops`.
 ///

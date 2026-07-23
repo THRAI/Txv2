@@ -109,6 +109,7 @@ mod cred;
 use cred::*;
 mod time;
 pub use time::poll_due_itimers;
+pub use time::ITIMER_REAL;
 use time::*;
 mod signal;
 use signal::*;
@@ -191,7 +192,8 @@ pub use numbers::{
     CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_MONOTONIC_COARSE, CLOCK_MONOTONIC_RAW,
     CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME, CLOCK_REALTIME_COARSE, CLOCK_THREAD_CPUTIME_ID,
     CLONE_CHILD_CLEARTID, CLONE_CHILD_SETTID, CLONE_DETACHED, CLONE_FILES, CLONE_FS,
-    CLONE_NEWCGROUP, CLONE_NEWNET, CLONE_NEWUSER, CLONE_NEWUTS, CLONE_PARENT, CLONE_PARENT_SETTID,
+    CLONE_NEWCGROUP, CLONE_NEWNET, CLONE_NEWNS, CLONE_NEWUSER, CLONE_NEWUTS, CLONE_PARENT,
+    CLONE_PARENT_SETTID,
     CLONE_SETTLS, CLONE_SIGHAND, CLONE_SYSVSEM, CLONE_THREAD, CLONE_VFORK, CLONE_VM,
     CLOSE_RANGE_CLOEXEC, CLOSE_RANGE_UNSHARE, DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_LNK, DT_REG,
     DT_SOCK, DT_UNKNOWN, FD_CLOEXEC, FUTEX_CLOCK_REALTIME, FUTEX_CMD_MASK, FUTEX_CMP_REQUEUE,
@@ -276,7 +278,8 @@ pub use numbers::{
     IPV6_UNICAST_HOPS, IPV6_V6ONLY, IP_ADD_MEMBERSHIP, IP_DROP_MEMBERSHIP, IP_HDRINCL,
     IP_MULTICAST_IF, IP_MULTICAST_LOOP, IP_MULTICAST_TTL, IP_RECVERR, IP_TOS, IP_TTL,
     MCAST_JOIN_GROUP,
-    MCAST_LEAVE_GROUP, NETLINK_EXT_ACK, NETLINK_NETFILTER, NETLINK_ROUTE, NR_CAPGET, NR_CAPSET,
+    MCAST_LEAVE_GROUP, NETLINK_EXT_ACK, NETLINK_NETFILTER, NETLINK_ROUTE, NETLINK_XFRM, NR_CAPGET,
+    NR_CAPSET,
     NR_FADVISE64, NR_FSOPEN, NR_FSPICK, NR_KCMP, NR_MINCORE, NR_MLOCK2, NR_MLOCKALL,
     NR_MUNLOCKALL, NR_OPEN_TREE, NR_PIDFD_GETFD, NR_REMAP_FILE_PAGES, NR_SETGROUPS,
     NR_SETHOSTNAME, NR_SIGNALFD, OPEN_TREE_CLOEXEC, OPEN_TREE_CLONE, PACKET_RESERVE,
@@ -496,6 +499,49 @@ pub(super) const SIGACTION_BYTES: usize = 32;
 /// stays so Phase 2b's additions (`read`, `brk`) can return
 /// `SyscallResult::Return` after one or more `.await` points without
 /// changing the surface.
+// PROBE(proxy-push segv hunt): syscall history ring. Records (nr, ret) of
+// every main-dispatch syscall; dumped by the fatal-trap post-mortem so we can
+// see which syscall returned a bad value right before git-remote-https wrote
+// to a NULL pointer during a proxied HTTPS upload. Remove once fixed.
+const SYSHIST_LEN: usize = 40;
+static SYSHIST_NR: [core::sync::atomic::AtomicU64; SYSHIST_LEN] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; SYSHIST_LEN];
+static SYSHIST_RET: [core::sync::atomic::AtomicI64; SYSHIST_LEN] =
+    [const { core::sync::atomic::AtomicI64::new(0) }; SYSHIST_LEN];
+static SYSHIST_POS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+fn syshist_record(nr: u64, ret: i64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let i = SYSHIST_POS.fetch_add(1, Relaxed) % SYSHIST_LEN;
+    SYSHIST_NR[i].store(nr, Relaxed);
+    SYSHIST_RET[i].store(ret, Relaxed);
+}
+
+fn syshist_ret_of(r: &SyscallResult) -> i64 {
+    match r {
+        SyscallResult::Return(v) => *v,
+        SyscallResult::CloneReturn { value, .. } => *value,
+        SyscallResult::Error(e) => -(*e as i64),
+        _ => i64::MIN,
+    }
+}
+
+/// Length of the syscall-history ring (probe).
+pub const SYSCALL_HISTORY_LEN: usize = SYSHIST_LEN;
+
+/// Snapshot the syscall-history ring for the fatal-trap post-mortem.
+/// Newest entry is at `(pos - 1) % LEN`.
+pub fn syscall_history_snapshot() -> ([u64; SYSHIST_LEN], [i64; SYSHIST_LEN], usize) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let mut nrs = [0u64; SYSHIST_LEN];
+    let mut rets = [0i64; SYSHIST_LEN];
+    for i in 0..SYSHIST_LEN {
+        nrs[i] = SYSHIST_NR[i].load(Relaxed);
+        rets[i] = SYSHIST_RET[i].load(Relaxed);
+    }
+    (nrs, rets, SYSHIST_POS.load(Relaxed))
+}
+
 pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + tx_hal::ConsoleIf>(
     req: SyscallRequest,
     ctx: &SyscallCtx<'a>,
@@ -523,6 +569,7 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + tx_h
     // (netperf UDP_STREAM/TCP_STREAM `send` bursts) never see SIGALRM and hang.
     time::poll_itimer_real_on_syscall_boundary::<P>(ctx);
     let result = dispatch_inner::<P>(req, ctx).await;
+    syshist_record(req.nr, syshist_ret_of(&result));
     tx_observe::set_current_parent_span(prev);
     emit_syscall_exit(l0_span, &result);
     result

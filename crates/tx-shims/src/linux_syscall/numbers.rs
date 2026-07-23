@@ -80,6 +80,7 @@ pub const AF_INET6: u16 = 10;
 pub const AF_NETLINK: u16 = 16;
 pub const AF_PACKET: u16 = 17;
 pub const NETLINK_ROUTE: i32 = 0;
+pub const NETLINK_XFRM: i32 = 6;
 pub const NETLINK_NETFILTER: i32 = 12;
 pub const SOL_NETLINK: i32 = 270;
 pub const SOL_PACKET: i32 = 263;

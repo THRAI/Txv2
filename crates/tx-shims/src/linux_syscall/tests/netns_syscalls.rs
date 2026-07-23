@@ -77,7 +77,10 @@ fn path_display(path: &[u8]) -> alloc::string::String {
     alloc::string::String::from_utf8_lossy(without_nul).into_owned()
 }
 
-fn build_procfs_root(dev_id: u32, mount_id: u64) -> Cap<DEntry> {
+fn build_procfs_root_with_mount(
+    dev_id: u32,
+    mount_id: u64,
+) -> (Cap<DEntry>, Cap<MountIdentity>) {
     let procfs = tx_fs::procfs::Procfs::new();
     let fs_ops = tx_fs::procfs::Procfs::fs_ops_arc();
     let backing: Arc<dyn tx_subsystems::page_backed::FsPageBacking> =
@@ -102,7 +105,7 @@ fn build_procfs_root(dev_id: u32, mount_id: u64) -> Cap<DEntry> {
             StepOutcome::Done(rnode) => rnode,
             other => panic!("materialise procfs root failed: {other:?}"),
         };
-    let _mount = MountIdentity::new_cap(
+    let mount = MountIdentity::new_cap(
         MountId::new(mount_id),
         None,
         root_rnode.clone(),
@@ -112,7 +115,17 @@ fn build_procfs_root(dev_id: u32, mount_id: u64) -> Cap<DEntry> {
     )
     .expect("procfs mount identity");
 
-    DEntry::new_cap(InlineName::ROOT, root_rnode).expect("procfs root dentry")
+    let dentry = DEntry::new_cap(InlineName::ROOT, root_rnode).expect("procfs root dentry");
+    (dentry, mount)
+}
+
+fn build_procfs_root(dev_id: u32, mount_id: u64) -> Cap<DEntry> {
+    build_procfs_root_with_mount(dev_id, mount_id).0
+}
+
+// Ids 90/90 stay clear of the 73/74 roots other tests in this file build.
+fn build_mount_api_test_root() -> (Cap<DEntry>, Cap<MountIdentity>) {
+    build_procfs_root_with_mount(90, 90)
 }
 
 #[test]
