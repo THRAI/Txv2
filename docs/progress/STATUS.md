@@ -1,3 +1,17 @@
+- 2026-07-24 (修复 `git remote add` 丢 url — VFS walk 解析权归 FS 层). 病象:guest 里 `git remote add me
+  <url>` 后 `git remote -v` 只有名字没网址;`.git/config` 缺 url 行(fetch 行在)。**探针链定根因**(txdiag
+  计数器 → 事件环 → 实例指针三轮迭代):`git remote add` 单进程连做两次 config 改写(写 config.lock →
+  rename 盖 config × 2),第二次改写打开 config 时 dentry 子缓存命中**陈旧实例**读到改写一前的内容,url 于是
+  被第二次改写覆盖丢失。深层结构病:**同一目录可并存多个活 DEntry 实例**(children 弱引用死亡后各 walk 独立
+  重建链条;实证 `.git` 被填进 15+ 个一次性父实例),rename/unlink 的 `remove_cached_child` 打在自己 walk 出
+  的一次性实例上,open 路径命中的 canonical 实例从未被清,直到弱引用自然死亡"自愈"(瞬态、时机依赖;ext4
+  三层缓存 lookup_cache/dir_cache/inode_meta_cache 的按父失效反而全程正确)。**修复**(resolution/step.rs
+  kernel_step 单函数):解析权反转——每组件先走 `FsOps::lookup`(其按父失效全局键控、已证一致),dentry 子缓
+  存降级为"FS 同意 ino 时保留既有 DEntry/RNode(含 PageContainer)身份",ino 不合即丢弃缓存实例重物化。顺带
+  治好同族 unlink-后-open-命中已删 dentry 类。**验证**:remote-add 复现全绿(url/fetch/remote -v/geturl 全
+  正确,ino 链 7183→7192→7194)+ 昨日 stale-stat 复现回归绿 + verify-git-net.sh 8/8。代价:每组件多一次
+  FS-lookup(ext4 侧 BTreeMap 命中,LTP exec 风暴依赖的 ext4 负缓存不变)。**Next**:la64 重建验证;残留结构
+  债(dentry 多实例/rnode+pc 重复物化、NeedIO-resume 路径不保身份)记入 P5。Blocker:无。
 - 2026-07-23 (修复 ext4 覆写已 tracked 文件 git 看不见 — O_TRUNC/stat/mtime 三层根因). 病象:guest 里
   `git clone` 后 `echo "hello" > README`,cat 见新内容但 `git add .`+`git status` 报 clean(git 只比 lstat
   size/mtime/ctime,匹配就不读内容)。**内核探针(txdiag,sys_sync 触发 dump)实证根因链**,推翻"stat 读到

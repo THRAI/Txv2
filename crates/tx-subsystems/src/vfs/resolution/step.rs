@@ -140,15 +140,21 @@ pub fn kernel_step(
     };
 
     // --- lookup / materialise, with parent-local dentry cache ---
+    //
+    // Resolution authority is the `FsOps::lookup` tier: its per-parent
+    // caches are invalidated on rename/unlink/create keyed by the parent's
+    // fs_object_id, globally. The parent-local dentry child cache is NOT
+    // reliable for (name → ino) resolution — the same directory can have
+    // several live `DEntry` instances (weak child links die and chains get
+    // rebuilt per walk), so a mutation's `remove_cached_child` may purge a
+    // different instance than the one a later walk hits. Trusting a cached
+    // child blindly served pre-rename files: git's second config rewrite
+    // read the pre-first-rewrite content and `remote add` lost the url.
+    // The cached child is used only to PRESERVE the existing DEntry/RNode
+    // (and its PageContainer) identity when the FS agrees on the ino.
     let parent_fs_object_id = current.rnode().fs_object_id();
-    let (child_dentry, child_rnode_cap, child_fs_object_id, child_meta) = if let Some(cached) =
-        current.cached_child(child_inline)
-    {
-        let rnode = cached.rnode().clone();
-        let fs_object_id = rnode.fs_object_id();
-        let meta = rnode.meta();
-        (cached, rnode, fs_object_id, meta)
-    } else {
+    let cached_child = current.cached_child(child_inline);
+    let (child_dentry, child_rnode_cap, child_fs_object_id, child_meta) = {
         let child_fs_object_id = match fs_ops.lookup(parent_fs_object_id, &component, guard) {
             StepOutcome::Done(id) => id,
             StepOutcome::Yield { .. } => {
@@ -189,83 +195,95 @@ pub fn kernel_step(
             }
         };
 
-        let child_meta = match fs_ops.load_inode_meta(child_fs_object_id, guard) {
-            StepOutcome::Done(m) => m,
-            StepOutcome::Yield { .. } => {
-                let retry_remaining = remaining_with_component(&component, &remaining);
-                let request = IORequest::LoadInodeMeta {
-                    fs_object_id: child_fs_object_id,
-                };
-                let token = ResumeToken {
-                    walking: WalkingState {
+        if let Some(cached) =
+            cached_child.filter(|c| c.rnode().fs_object_id() == child_fs_object_id)
+        {
+            let rnode = cached.rnode().clone();
+            let meta = rnode.meta();
+            (cached, rnode, child_fs_object_id, meta)
+        } else {
+            // Stale or absent cached instance: drop it and materialise fresh.
+            current.remove_cached_child(child_inline);
+            let child_meta = match fs_ops.load_inode_meta(child_fs_object_id, guard) {
+                StepOutcome::Done(m) => m,
+                StepOutcome::Yield { .. } => {
+                    let retry_remaining = remaining_with_component(&component, &remaining);
+                    let request = IORequest::LoadInodeMeta {
+                        fs_object_id: child_fs_object_id,
+                    };
+                    let token = ResumeToken {
+                        walking: WalkingState {
+                            current,
+                            remaining: retry_remaining,
+                            hop_count,
+                            mount_root,
+                            must_be_directory,
+                        },
+                        request: request.clone(),
+                        mount_namespace: None,
+                        hop_count,
+                    };
+                    return KernelStep::NeedIO(request, token);
+                }
+                StepOutcome::Err(e) => {
+                    return KernelStep::Error(WalkCause::FsOpsRejected(
+                        crate::execution::Errno::from(e),
+                    ));
+                }
+                StepOutcome::Continue { .. } => {
+                    let retry_remaining = remaining_with_component(&component, &remaining);
+                    return KernelStep::Continue(WalkState::Walking(WalkingState {
                         current,
                         remaining: retry_remaining,
                         hop_count,
                         mount_root,
                         must_be_directory,
-                    },
-                    request: request.clone(),
-                    mount_namespace: None,
+                    }));
+                }
+            };
+
+            let child_rnode_cap = match materialise_child(
+                &fs_ops,
+                child_fs_object_id,
+                &child_meta,
+                mount_payload.as_ref(),
+                &WalkingState {
+                    current: current.clone(),
+                    remaining: remaining_with_component(&component, &remaining),
                     hop_count,
-                };
-                return KernelStep::NeedIO(request, token);
-            }
-            StepOutcome::Err(e) => {
-                return KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::from(
-                    e,
-                )));
-            }
-            StepOutcome::Continue { .. } => {
-                let retry_remaining = remaining_with_component(&component, &remaining);
-                return KernelStep::Continue(WalkState::Walking(WalkingState {
-                    current,
-                    remaining: retry_remaining,
-                    hop_count,
-                    mount_root,
+                    mount_root: mount_root.clone(),
                     must_be_directory,
-                }));
-            }
-        };
+                },
+                guard,
+            ) {
+                Ok(rnode) => rnode,
+                Err(KernelStep::NeedIO(req, token)) => return KernelStep::NeedIO(req, token),
+                Err(KernelStep::Error(cause)) => return KernelStep::Error(cause),
+                Err(_) => {
+                    return KernelStep::Error(WalkCause::FsOpsRejected(
+                        crate::execution::Errno::EIO,
+                    ));
+                }
+            };
 
-        let child_rnode_cap = match materialise_child(
-            &fs_ops,
-            child_fs_object_id,
-            &child_meta,
-            mount_payload.as_ref(),
-            &WalkingState {
-                current: current.clone(),
-                remaining: remaining_with_component(&component, &remaining),
-                hop_count,
-                mount_root: mount_root.clone(),
-                must_be_directory,
-            },
-            guard,
-        ) {
-            Ok(rnode) => rnode,
-            Err(KernelStep::NeedIO(req, token)) => return KernelStep::NeedIO(req, token),
-            Err(KernelStep::Error(cause)) => return KernelStep::Error(cause),
-            Err(_) => {
-                return KernelStep::Error(WalkCause::FsOpsRejected(crate::execution::Errno::EIO));
-            }
-        };
-
-        let mut child_dentry_raw = DEntry::new(child_inline, child_rnode_cap.clone());
-        child_dentry_raw.set_parent_hint(&current);
-        let child_dentry = match step_engine::sign(child_dentry_raw) {
-            Ok(cap) => cap,
-            Err(_) => {
-                return KernelStep::Error(WalkCause::FsOpsRejected(
-                    crate::execution::Errno::ENOMEM,
-                ));
-            }
-        };
-        current.cache_child(child_dentry.clone());
-        (
-            child_dentry,
-            child_rnode_cap,
-            child_fs_object_id,
-            child_meta,
-        )
+            let mut child_dentry_raw = DEntry::new(child_inline, child_rnode_cap.clone());
+            child_dentry_raw.set_parent_hint(&current);
+            let child_dentry = match step_engine::sign(child_dentry_raw) {
+                Ok(cap) => cap,
+                Err(_) => {
+                    return KernelStep::Error(WalkCause::FsOpsRejected(
+                        crate::execution::Errno::ENOMEM,
+                    ));
+                }
+            };
+            current.cache_child(child_dentry.clone());
+            (
+                child_dentry,
+                child_rnode_cap,
+                child_fs_object_id,
+                child_meta,
+            )
+        }
     };
 
     // --- mid-path non-directory check ---
