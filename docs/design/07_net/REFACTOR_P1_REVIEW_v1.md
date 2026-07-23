@@ -52,6 +52,7 @@ SYN-ACK 手工缓存重传 ──✂ S3                             重传/背�
 **为什么安全.** loopback 正常连接走真握手（`has_connected=true`）本就在段级路径；落在直拷路的只有外部 demux 手工造的 Connected 连接——外部 TCP 在本分支结构性不可用（审计①），行为从"假成功"变"诚实失败"。
 
 **审查要点.**
+
 - [ ] `grep -rn "tcp_uses_direct_stream\|send_tcp_stream_bytes\|ingest_rx_bytes_unbounded\|record_tcp_stream_bytes"` 全仓为零。
 - [ ] `lookup_tcp_connected_peer` 保留（`tcp_connected_peer_error` 还在用）——确认没误删。
 - [ ] 语义变化点：手工 Connected 的 socket 现在 send 走 `reserve_send` → smoltcp 未握手 → 拿不到空间 → yield 等待（不再假成功）。接受与否请签字。
@@ -81,6 +82,7 @@ pub fn recv_len(&self, len, peek) -> Option<(usize, bool)> {
 - **通路 C 收敛**：`TcpPacketEvent` 新增 `segment: Option<SmoltcpTcpSegment>` 字段（`with_segment` 构造，`new()` 缺省 None 保测试兼容）；demux 用 `SmoltcpTcpSegment::parse_ipv4_packet` 产完整段（**校验和验证**，附带修了 R3a 的这条入口）；`process_tcp_event` 已建立连接分支改喂 `process_segment`，**删掉 `ack_bytes = max(1, payload_len)` 的猜测性假 ACK 记账**（events.rs 原 :287）。
 
 **审查要点.**
+
 - [ ] `recv_len` 丢弃循环的终止性：`recv()` 返回 0 即 break；`taken_total` 不会超 `len`。
 - [ ] `became_empty` 语义保真：非 peek 且 ring 空 → true → `step_recv` 清 HAS_DATA 位（step_recv.rs:105-107 未改）。
 - [ ] **行为差异（需签字）**：MSG_PEEK 在 ring 回绕处只返回第一段连续字节（`peek_slice` 语义），旧 VecDeque 可整段 peek。POSIX 允许短读，但请知悉。
@@ -109,6 +111,7 @@ if socket.may_send() { send_capacity - send_queue() - corked } else { 0 }
 ```
 
 **审查要点.**
+
 - [ ] `send_available` 等价性论证：未连接时 `may_send()=false → 0`，与旧 `min(…, protocol_available=0)` 一致；已连接时旧影子与 ring 同步增长，`min` 退化为 ring 项。
 - [ ] `flush_tcp_tx_before_close`（step_socket_close.rs:185）用 `send_queued`——新语义（ring 未发字节）对 close 冲刷循环仍正确。
 - [ ] 手工流控删除后的背压：对端 ring 满 → 窗口收缩 → `dispatch` 自然停——`TCP_LOOPBACK_TRANSFER_PACKET_PASSES=64` 上限仍在，无死循环。
@@ -132,6 +135,7 @@ let Some(segment) = raw_tcp.dispatch_segment() else { return true; };
 ```
 
 **审查要点.**
+
 - [ ] 上述 true/false 语义修正是否认可：`attempts` 现在计的是"轮询轮数"而非"实际重发次数"（上限 `TCP_BACKLOG_RETRANSMIT_LIMIT_STAGING` 仍封顶生命周期）；smoltcp 放弃的 child 走 `Closed` 态由 `connecting_entry_failed` 收割。
 - [ ] 双层定时器叠加：backlog 1s 回退 × smoltcp RTO 递增——重发时刻 = 两者较晚者，比旧手工节奏慢半拍但正确；请确认接受。
 - [ ] `connected` 边沿检测一次性论证：`!before.is_active && after.is_active`；TCP 不经 reset 不会重入活跃集（active = Established/CloseWait/FinWait1/2）。
@@ -139,55 +143,16 @@ let Some(segment) = raw_tcp.dispatch_segment() else { return true; };
 
 ---
 
-## 5. S4 `123faf5d` — UDP 单通路 + SMP 竞态修复（审查密度最高的一步）
+## 5.
 
-**5a. UDP 直拷之死.** 删 `poll_udp_loopback_direct_one`（poll_context 整函数）与 send 内联的查表直塞段；loopback UDP 一律 `poll_udp_egress_one`（取报→编包→入 lo 队列）→ `poll_udp_ingress`（出队→解析→投递对端队列）。发送路径同步驱动一轮（拍板 4-A，时延特性不变）。
+    ### 测试更新对照表（S 步散布，集中列此——每条都要你认可）
 
-**5b. UDP v6 臂.**（不补就是回归：直拷曾家族无关，iface 转运原仅 v4，v6 回环 UDP 会静默丢包——ipv6_lib/getaddrinfo 类测试依赖它。）`UdpTxDatagram::emit_ipv4_packet` 按 dst 家族分派 `emit_v6`；`UdpRxDatagram::parse_ipv4_packet` 加 v6 落空臂——**镜像 TCP 现成的 v6 处理**（函数名沿革同 TCP：名为 ipv4 实通两族）。
-
-**5c. SMP 竞态修复.** 现象：smp4 下 UDP smoke ~1/3 概率 panic（`cap.rs:349`），S3 基线 6/6 绿——S4 引入的暴露。机理与修复：
-
-```
-机理: 队列转运使 poll 路径高频触碰"可能已被并发 close 退休"的外来 socket Cap;
-      Cap::deref(cap.rs:349) 与 Cap::clone(cap.rs:280) 对已退休槽 = panic(expect)。
-      而 target.acquire_operational() 的自动解引用发生在方法调用之前!
-
-修复: 无 deref 访问模式 ——
-  let target_ident = target.downgrade().observe(guard)?;   // 检活 + guard 钉内存
-  let target_payload = target_ident.acquire_operational()?; // IdentRef 上调用,无 Cap deref
-应用于 poll_udp_egress_one / poll_udp_ingress / NetworkPublishTarget::publish。
-
-第二个坑: publish() 内取 guard 用 epoch::guard() ⇒ 6/6 必炸 ——
-      EBR 禁止嵌套 guard(epoch/mod.rs:59-61 自述);
-      正确姿势 = borrow_current_guard().unwrap_or_else(guard)。
-```
-
-**审查要点.**
-- [ ] 5a：`budget=1` 的内联 ingress 可能处理到**别的流**的队头包（自己的包由 delegate 兜底）——"至少一次投递、协作式清队"语义是否接受。
-- [ ] 5a：EMSGSIZE/EINVAL/MSG_MORE 早退分支全部保留（对照 diff 确认无误删）。
-- [ ] 5b：`emit_v6` 与 TCP 的 v6 parse 镜像逐字段核对（`Ipv6Repr{src,dst,next_header,payload_len,hop_limit:64}`）。
-- [ ] 5c：`observe` 之后仍有微小 TOCTOU？——没有 panic 风险：`IdentRef` 内存由 guard 钉住，最坏读到正在关闭的 payload（`live_payload()` 返回 None，各调用点已处理）。
-- [ ] 5c：`borrow_current_guard` 的 fallback `guard()`：publish 的所有调用链是否必然已持 guard？（若是，fallback 永不触发；若不是，新开 guard 合法。）两种情况都安全。
-- [ ] **残留暴露（签字项）**：TCP 侧 `poll_egress_one`/`poll_ingress`/`process_tcp_event` 等仍是 `Cap` 裸 deref 形态（S3 前就存在，冒烟未见炸），系统性加固归 P3——是否接受这个边界。
-
-**证据.** 修复前 smp4 3 跑 1 炸（S3 基线 6/6 绿可对照）；嵌套 guard 版 6/6 必炸；最终版 smp4 UDP 8/8 + TCP 3/3 绿；UDP 测试族单跑 10/10。
-
----
-
-## 6. S5 `402a441d` — 时间戳解冻 + 扫尾
-
-- 内联路径 5 处 `PollContext::new_with_table(Instant::ZERO, …)` → `net_now_instant()`（step_tcp_loopback ×2 / step_udp_loopback ×2 / step_icmp_loopback ×1）——backlog `created_at` 等 timestamp 消费者在内联路径不再看到冻结时间。
-- **保留的 ZERO**（非本步范围，勿误报）：`step_loopback_pending.rs:255`、`step_device_tx.rs:92`、`step_process_network_events.rs:56` 是无时间参数的便捷包装（测试入口），production delegate 走 `_at` 变体传 `driver.now()`。
-- **⚠ fmt 混入（签字项）**：`cargo fmt -p tx-subsystems` 把 `namespace.rs`/`rtnetlink.rs`/`execution/mod.rs`/`step_send.rs` 的既有非 fmt-clean 代码一并重排（注释缩进/导入排序/调用折行），**纯格式无语义**——已逐 hunk 核对。嫌脏可要求我拆出去。
-
-### 测试更新对照表（S 步散布，集中列此——每条都要你认可）
-
-| 原测试 | 处置 | 理由 |
-| ------ | ---- | ---- |
-| `raw_tcp_socket_ingests_and_drains_rx_bytes` / `raw_tcp_socket_peek_does_not_drain_rx_bytes` | 删除，代之以 `raw_tcp_socket_recv_reports_empty_smoltcp_ring` | 断言的是已删除的 staging 缓冲的有界摄入契约；端到端 recv 覆盖在 loopback_tests |
-| `tcp_packet_event_payload_bytes_are_consumed_by_step_recv` | 改写为 `tcp_packet_event_without_segment_is_dropped` | 原断言 = 裸字节旁路投递（病灶本身）；新断言 = 旁路已死。**其前身本就在 305 基线失败集合**（毒化级联族），同槽换名 |
-| `tcp_loopback_handshake_connects_bound_client_to_listener` 的 `has_connected` 断言 | 改断 smoltcp `State::Established` | 闩锁已删，"已连接"的单一真相是状态机 |
-| 新增 `tcp_loopback_lost_data_segment_is_retransmitted_after_rto` | P1 灵魂测试 | 单跑绿；全量挂于既有毒化级联（同族 17 兄弟基线即挂） |
+| 原测试                                                                                           | 处置                                                           | 理由                                                                                                                    |
+| ------------------------------------------------------------------------------------------------ | -------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `raw_tcp_socket_ingests_and_drains_rx_bytes` / `raw_tcp_socket_peek_does_not_drain_rx_bytes` | 删除，代之以`raw_tcp_socket_recv_reports_empty_smoltcp_ring` | 断言的是已删除的 staging 缓冲的有界摄入契约；端到端 recv 覆盖在 loopback_tests                                          |
+| `tcp_packet_event_payload_bytes_are_consumed_by_step_recv`                                     | 改写为`tcp_packet_event_without_segment_is_dropped`          | 原断言 = 裸字节旁路投递（病灶本身）；新断言 = 旁路已死。**其前身本就在 305 基线失败集合**（毒化级联族），同槽换名 |
+| `tcp_loopback_handshake_connects_bound_client_to_listener` 的 `has_connected` 断言           | 改断 smoltcp`State::Established`                             | 闩锁已删，"已连接"的单一真相是状态机                                                                                    |
+| 新增`tcp_loopback_lost_data_segment_is_retransmitted_after_rto`                                | P1 灵魂测试                                                    | 单跑绿；全量挂于既有毒化级联（同族 17 兄弟基线即挂）                                                                    |
 
 ---
 
