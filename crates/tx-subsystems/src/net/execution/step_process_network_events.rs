@@ -15,7 +15,7 @@ use crate::net::protocol::{
 use crate::net::structure::registry;
 use crate::net::structure::table::SocketTable;
 use crate::net::structure::{
-    ConnectionKey, Ipv4Address, RecvWireSet, SocketIdentity, SocketKind, SocketProtocol,
+    ConnectionKey, Ipv4Address, SocketIdentity, SocketKind, SocketProtocol,
     TcpBacklogEntry, TcpBacklogRetransmitOutcome, TcpState, TCP_BACKLOG_TIMEOUT_STAGING_MILLIS,
 };
 use tx_substrate::zone::Cap;
@@ -420,15 +420,22 @@ fn feed_tcp_segment(
         }
     }
 
-    // P2-S7 hardening: readiness is a field on the identity — read it via
-    // an observed IdentRef, not a bare Cap deref (panics on retired slots).
-    let Some(ident) = socket.downgrade().observe(guard) else {
+    // P2-S7 hardening: observe(guard) before publishing — the socket may be
+    // concurrently close-retired (bare Cap deref panics on retired slots).
+    if socket.downgrade().observe(guard).is_none() {
         return publishes;
     };
     let publish = NetworkPublish {
-        recv_has_data: bits.recv_readable
-            || ident.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() == 0
-                && raw.recv_available() > 0,
+        // No wire-already-set suppression here: gating the publish on
+        // `recv_wq.peek() & HAS_DATA == 0` loses the wakeup when the feed
+        // interleaves with a reader that has just observed an empty buffer
+        // and is about to clear the wire and sleep — the data lands, the
+        // suppressed publish never fires, no further segment arrives, and
+        // the reader sleeps forever (observed: git push hung on the final
+        // report-status response that was TCP-ACKed into the rx buffer).
+        // Re-firing an already-set wire is idempotent and a spurious wake
+        // just re-checks the buffer.
+        recv_has_data: bits.recv_readable || raw.recv_available() > 0,
         send_has_space: bits.connected || bits.send_writable,
         recv_broken: bits.broken || bits.recv_closed,
         send_broken: bits.broken || bits.send_closed,

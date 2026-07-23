@@ -11,7 +11,8 @@ use smoltcp::time::Instant;
 use tx_hal::TxPlatform;
 use tx_substrate::SpinMutex;
 use tx_subsystems::net::delegate::{
-    net_delegate_kick_tick, net_delegate_task_loop_owned_with_deadline_hook, NetDelegateDriver,
+    net_delegate_kick_poll, net_delegate_kick_tick,
+    net_delegate_task_loop_owned_with_deadline_hook, NetDelegateDriver,
     NetDelegateSupervisor, NetDelegateTaskConfig, NetDelegateTimerArm, NetDelegateTimerWake,
 };
 #[cfg(test)]
@@ -469,6 +470,18 @@ async fn boot_net_deadline_task(runtime: &'static BootNetRuntime) {
                 };
                 if runtime.consume_timer_wake(wake) {
                     net_delegate_kick_tick();
+                    // Also raise POLL: the whole established-connection
+                    // pipeline (device RX read, smoltcp dispatch — and with
+                    // it RTO/fast retransmits — device-TX drain) lives in
+                    // the delegate's poll_seen branch; the tick branch only
+                    // walks the half-open handshake backlog. Without this a
+                    // fully quiet wire is fatal to a connection with a lost
+                    // segment: no RX ⇒ no POLL ⇒ dispatch never runs ⇒ the
+                    // RTO retransmit is never emitted and both ends wait
+                    // forever (observed: 17MB git push over slirp wedged
+                    // mid-upload; peer stuck at dup-ACK 18121 while we sat
+                    // on unacked data at the window edge, silent for 400s+).
+                    net_delegate_kick_poll();
                 }
             }
             tx_reactor::wait::WaitOutcome::Ready

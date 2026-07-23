@@ -381,6 +381,46 @@ impl RawTcpSocket {
         })
     }
 
+    /// Like [`Self::dispatch_segment`], but the segment is committed only
+    /// if `transmit` accepts it. Returning `false` from `transmit`
+    /// propagates an error out of smoltcp's `dispatch`, which leaves the
+    /// socket state (`remote_last_seq`, timers) untouched — the segment
+    /// stays queued and is re-dispatched on the next pass.
+    ///
+    /// This is the loss-free shape for a backpressuring sink. The
+    /// pop-then-drop shape (`dispatch_segment` + discarding when the sink
+    /// is busy) manufactured a real packet hole on every send burst that
+    /// outran the virtio TX queue: smoltcp believed the segment was on the
+    /// wire, the peer dup-ACKed the gap, and the retransmit rewind
+    /// re-blasted a full window — overrunning the queue again and minting
+    /// the next hole (observed as a self-sustaining ~4KB/s loss loop on
+    /// bulk TLS uploads).
+    ///
+    /// Returns `Some(true)` if a segment was emitted and accepted,
+    /// `Some(false)` if the sink refused it (still queued), and `None`
+    /// if smoltcp had nothing to send.
+    pub fn dispatch_segment_via(
+        &self,
+        transmit: impl FnOnce(&SmoltcpTcpSegment) -> bool,
+    ) -> Option<bool> {
+        with_context(|cx| {
+            let inner = &mut *self.inner.lock();
+            let socket = &mut inner.socket;
+            let mut attempted = None;
+            let _ = socket.dispatch(cx, |_, (ip_repr, tcp_repr)| {
+                let segment = SmoltcpTcpSegment::from_reprs(ip_repr, tcp_repr);
+                let sent = transmit(&segment);
+                attempted = Some(sent);
+                if sent {
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            });
+            attempted
+        })
+    }
+
     pub fn process_segment(&self, segment: &SmoltcpTcpSegment) -> SmoltcpTcpProcessPublish {
         with_context(|cx| {
             let inner = &mut *self.inner.lock();

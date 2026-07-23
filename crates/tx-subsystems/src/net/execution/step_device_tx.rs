@@ -239,43 +239,71 @@ fn process_tcp_tx_socket(
         return;
     };
     // P2-S4 drain loop: keep dispatching until smoltcp has nothing to send,
-    // the sink backpressures, or the per-socket budget is spent. A segment
-    // popped by `dispatch_segment` that the sink then refuses is recovered
-    // by smoltcp's RTO (same exposure as the previous single-shot shape);
-    // the readiness probe before each dispatch keeps that window small.
+    // the sink backpressures, or the per-socket budget is spent. The sink
+    // transmit runs INSIDE the dispatch closure (`dispatch_segment_via`):
+    // when the sink refuses, the closure errors out of smoltcp's dispatch
+    // and the segment stays queued for the next pass. The previous
+    // pop-then-drop shape lost the segment on every Busy — smoltcp
+    // believed it was on the wire, so each burst that outran the virtio
+    // TX queue minted a real hole, and the retransmit rewind re-blasted a
+    // full window that overran the queue again (self-sustaining loss
+    // thrash on bulk uploads).
     let mut sent = false;
     for _ in 0..TCP_TX_SOCKET_DRAIN_BUDGET {
         if sink.readiness_at(now, guard) == PacketTxReadiness::Busy {
             outcome.tcp_busy += 1;
             break;
         }
-        let Some(packet) = raw_tcp
-            .dispatch_segment()
-            .and_then(|segment| segment.emit_ipv4_packet())
-        else {
+        let mut accepted_bytes = None;
+        let mut busy = false;
+        let mut pending = false;
+        let mut failed = false;
+        let dispatched = raw_tcp.dispatch_segment_via(|segment| {
+            let Some(packet) = segment.emit_ipv4_packet() else {
+                // Unbuildable (e.g. no route yet): refuse so it stays
+                // queued — dropping it here would mint a wire hole.
+                failed = true;
+                return false;
+            };
+            match sink.transmit_at(packet.as_bytes(), now, guard) {
+                PacketTxResult::Accepted { frame_len } => {
+                    accepted_bytes = Some(frame_len);
+                    true
+                }
+                PacketTxResult::Busy => {
+                    busy = true;
+                    false
+                }
+                PacketTxResult::PendingResolution { .. } => {
+                    pending = true;
+                    false
+                }
+                PacketTxResult::Failed { .. } => {
+                    failed = true;
+                    false
+                }
+            }
+        });
+        let Some(emitted) = dispatched else {
             break;
         };
-
         outcome.tcp_attempted += 1;
-        match sink.transmit_at(packet.as_bytes(), now, guard) {
-            PacketTxResult::Accepted { frame_len } => {
+        if emitted {
+            if let Some(frame_len) = accepted_bytes {
                 outcome.tcp_packets += 1;
                 outcome.tx_bytes += frame_len;
                 sent = true;
             }
-            PacketTxResult::Busy => {
-                outcome.tcp_busy += 1;
-                break;
-            }
-            PacketTxResult::PendingResolution { .. } => {
-                outcome.tcp_resolution_pending += 1;
-                break;
-            }
-            PacketTxResult::Failed { .. } => {
-                outcome.tcp_failed += 1;
-                break;
-            }
+            continue;
         }
+        if busy {
+            outcome.tcp_busy += 1;
+        } else if pending {
+            outcome.tcp_resolution_pending += 1;
+        } else if failed {
+            outcome.tcp_failed += 1;
+        }
+        break;
     }
     if sent {
         outcome.sockets_touched += 1;

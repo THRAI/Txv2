@@ -1,3 +1,23 @@
+- 2026-07-24 (修复大包上传 wedge/断线 — 外部 TCP 可靠性四连修,git push 真凶). 病象:guest 向 github push
+  17MB pack 报 `curl 16 HTTP2 framing layer`+断线;本地 HTTP/1.1 同样复现(~50% wedge,宿主直推同服务端秒
+  过)。**pcap+代码四层因果链**:① 真凶=TX 弹出即丢——device-TX lane `dispatch_segment` 把段从 smoltcp 弹
+  出(remote_last_seq 已推进、视为在网),`sink.transmit_at` Busy 时段被丢弃 → 每次整窗爆发超出 virtio 队列
+  必自产真洞(pcap 实锤:被 1138 个 dup-ack 讨要的 seq 首次上线是风暴后的重传,首发从未出现);② fork
+  dispatch 重传饥饿门——`!seq_to_transmit` 挡住 should_retransmit,窗口有余量就永不服务 FastRetransmit/RTO,
+  发完新数据还把 FastRetransmit 覆写成新 RTO → 洞长期不补,cwnd 崩塌爬行(~4.4KB/s),rewind 整窗再爆发再
+  丢=自续损耗环;③ 静默泵缺失——deadline 到期只 kick TICK,而 RX 读+dispatch+device-TX 全在 poll_seen 分
+  支,tick 分支只走半开握手 backlog → 全静默(洞+窗口顶死)后 RTO 永无发射机会,双端死等(pcap:对端 ack
+  18121 停格、guest 顶到 18121+65535 窗口边缘后 400s+ 无包);④ 尾期丢唤醒——feed 的 recv 发布被
+  `recv_wq.peek()&HAS_DATA==0` 抑制,读者"见空→[响应入缓冲,发布被抑制]→清线→睡"竞态后永睡(实锤:
+  report-status 响应已 TCP-ACK 入缓冲,git 挂死至 timeout)。**修复**:step_device_tx 改
+  `dispatch_segment_via`(sink 发射进 dispatch 闭包,拒收→闭包 Err→smoltcp 状态回滚段留队,fork 的
+  emit(...)? 语义本就支持);fork tcp.rs 撤 `!seq_to_transmit` 门(真 TCP 洞优先);boot_net_deadline_task
+  超时 TICK+POLL 双拉;feed 撤发布抑制门(重复 fire 幂等)。**验证**:15MB push 本地 HTTP 5/5、HTTPS/TLS
+  (node h2 服务端)rc=0 且 **2m17s 零重传**(修前:永不完成/4.4KB/s 爬行);tx-subsystems net:: 集合差 vs
+  HEAD 字节级一致(199 已知级联失败同款);verify-git-net.sh 8/8。诊断法:QEMU `-object filter-dump` pcap +
+  逐层判别(宿主直推排除服务端→本地 h1 排除 h2/代理→dup-ack 停格定重传缺席→首发缺失定 TX 丢段)。
+  **Next**:la64 重建验证(欠两轮);镜像仅 ~25MB 空闲+ENOSPC 在 close-flush 被静默吞(write 假成功)待
+  修;smoltcp fork 自带测试套 pre-existing 编不过(rstest 缺件)。Blocker:无。
 - 2026-07-24 (修复 `git remote add` 丢 url — VFS walk 解析权归 FS 层). 病象:guest 里 `git remote add me
   <url>` 后 `git remote -v` 只有名字没网址;`.git/config` 缺 url 行(fetch 行在)。**探针链定根因**(txdiag
   计数器 → 事件环 → 实例指针三轮迭代):`git remote add` 单进程连做两次 config 改写(写 config.lock →

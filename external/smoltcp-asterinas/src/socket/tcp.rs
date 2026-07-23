@@ -2275,30 +2275,37 @@ impl<'a> Socket<'a> {
             // If a timeout expires, we should abort the connection.
             net_debug!("timeout exceeded");
             self.set_state(State::Closed);
-        } else if !self.seq_to_transmit(cx) {
-            if let Some(retransmit_delta) = self.timer.should_retransmit(cx.now()) {
-                // If a retransmit timer expired, we should resend data starting at the last ACK.
-                net_debug!("retransmitting at t+{}", retransmit_delta);
+        } else if let Some(retransmit_delta) = self.timer.should_retransmit(cx.now()) {
+            // If a retransmit timer expired, we should resend data starting at the last ACK.
+            //
+            // Serviced REGARDLESS of whether fresh data is transmittable: the
+            // previous `!self.seq_to_transmit(cx)` gate starved this branch for
+            // as long as the peer's window had room for new bytes, so a fast
+            // retransmit armed by 3 duplicate ACKs (and any expired RTO) was
+            // ignored while dispatch kept streaming new data past the hole —
+            // the peer dup-ACKed every one of them (observed: 1138 dup-ACKs,
+            // zero retransmissions, 17MB git push wedged). Real TCP repairs
+            // the hole first; the rewind below does exactly that.
+            net_debug!("retransmitting at t+{}", retransmit_delta);
 
-                // Rewind "last sequence number sent", as if we never
-                // had sent them. This will cause all data in the queue
-                // to be sent again.
-                self.remote_last_seq = self.local_seq_no;
+            // Rewind "last sequence number sent", as if we never
+            // had sent them. This will cause all data in the queue
+            // to be sent again.
+            self.remote_last_seq = self.local_seq_no;
 
-                // Clear the `should_retransmit` state. If we can't retransmit right
-                // now for whatever reason (like zero window), this avoids an
-                // infinite polling loop where `poll_at` returns `Now` but `dispatch`
-                // can't actually do anything.
-                self.timer.set_for_idle(cx.now(), self.keep_alive);
+            // Clear the `should_retransmit` state. If we can't retransmit right
+            // now for whatever reason (like zero window), this avoids an
+            // infinite polling loop where `poll_at` returns `Now` but `dispatch`
+            // can't actually do anything.
+            self.timer.set_for_idle(cx.now(), self.keep_alive);
 
-                // Inform RTTE, so that it can avoid bogus measurements.
-                self.rtte.on_retransmit();
+            // Inform RTTE, so that it can avoid bogus measurements.
+            self.rtte.on_retransmit();
 
-                // Inform the congestion controller that we're retransmitting.
-                self.congestion_controller
-                    .inner_mut()
-                    .on_retransmit(cx.now());
-            }
+            // Inform the congestion controller that we're retransmitting.
+            self.congestion_controller
+                .inner_mut()
+                .on_retransmit(cx.now());
         }
 
         // Decide whether we're sending a packet.
