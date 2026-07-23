@@ -724,7 +724,7 @@ fn live_meta_for_dentry(target: &Cap<DEntry>, guard: &crate::execution::Guard<'_
     // surface through all stat-family calls. The cached RNode meta is the
     // snapshot from materialisation time.
     let ino = target.rnode().fs_object_id();
-    match target.rnode().containing_mount_weak() {
+    let mut meta = match target.rnode().containing_mount_weak() {
         Some(weak) => match weak.upgrade(guard) {
             Some(payload) => match payload.fs_ops().load_inode_meta(ino, guard) {
                 StepOutcome::Done(m) => m,
@@ -733,7 +733,16 @@ fn live_meta_for_dentry(target: &Cap<DEntry>, guard: &crate::execution::Guard<'_
             None => target.rnode().meta(),
         },
         None => target.rnode().meta(),
+    };
+    // Live-size overlay: while a page-backed file has unflushed writes,
+    // the in-memory `PageContainer.size_bytes` is the authoritative
+    // logical size (grown on every write); the FS inode only catches up
+    // at the close-time `step_fsync`. Mirrors the fd-based
+    // `stat_meta_for_open_file` overlay so path stat agrees with fstat.
+    if let super::structure::RNodeBacking::PageBacked { pc } = target.rnode().backing() {
+        meta.size = pc.size_bytes();
     }
+    meta
 }
 
 // ============================================================================

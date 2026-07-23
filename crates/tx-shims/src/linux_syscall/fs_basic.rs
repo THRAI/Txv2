@@ -1098,19 +1098,61 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
             return SyscallResult::Error(EISDIR_VALUE);
         }
         use StepOutcome as V3Trunc;
-        let fs_page_backing = match fs_page_backing_for_dentry(&dentry) {
-            Some(b) => b,
-            None => return SyscallResult::Error(ENOSYS_VALUE),
-        };
         let fs_object_id = dentry.rnode().fs_object_id();
-        let guard = step_engine::guard();
-        match fs_page_backing.truncate(fs_object_id, 0, &guard) {
-            V3Trunc::Done(()) => {}
-            V3Trunc::Continue { .. } | V3Trunc::Yield { .. } => {
-                return SyscallResult::Error(EIO_VALUE);
+        // Page-backed rnodes must truncate the LIVE PageContainer together
+        // with the FS inode (`step_truncate`, the same both-sides path
+        // ftruncate takes). Truncating only the FS side leaves a cached
+        // `pc` at its stale pre-open size: the write lands at offset 0
+        // without shrinking `pc.size_bytes()`, and the close-time
+        // `step_fsync` then persists that stale size straight back over
+        // the truncate — `echo new > tracked-file` kept the old st_size,
+        // so stat-cache-based change detection (git) never saw shell-
+        // redirect edits, while readers got the old length padded from
+        // the fresh zero page.
+        //
+        // Guard ordering: `fs_page_backing_for_dentry` opens its own
+        // epoch guard, so it must run before this scope's guard opens
+        // (EBR guards do not nest).
+        //
+        // Only File-kind containers route through `step_truncate`: an
+        // Anon-kind pc (tmpfs) gets no `FsPageBacking::truncate`
+        // callback from it, which would skip tmpfs's own payload-size
+        // update — tmpfs's `truncate` impl already does the pc-level
+        // shrink itself, so it stays on the `fs_page_backing` arm.
+        match dentry.rnode().backing() {
+            tx_subsystems::vfs::structure::RNodeBacking::PageBacked { pc }
+                if matches!(
+                    pc.kind(),
+                    tx_subsystems::page_backed::PageContainerKind::File { .. }
+                ) =>
+            {
+                let pc = pc.clone();
+                let guard = step_engine::guard();
+                match tx_subsystems::page_backed::step_truncate(&pc, 0, &guard) {
+                    V3Trunc::Done(()) => {}
+                    V3Trunc::Continue { .. } | V3Trunc::Yield { .. } => {
+                        return SyscallResult::Error(EIO_VALUE);
+                    }
+                    V3Trunc::Err(errno) => {
+                        return SyscallResult::error_from(Errno::from(errno));
+                    }
+                }
             }
-            V3Trunc::Err(errno) => {
-                return SyscallResult::error_from(Errno::from(errno));
+            _ => {
+                let fs_page_backing = match fs_page_backing_for_dentry(&dentry) {
+                    Some(b) => b,
+                    None => return SyscallResult::Error(ENOSYS_VALUE),
+                };
+                let guard = step_engine::guard();
+                match fs_page_backing.truncate(fs_object_id, 0, &guard) {
+                    V3Trunc::Done(()) => {}
+                    V3Trunc::Continue { .. } | V3Trunc::Yield { .. } => {
+                        return SyscallResult::Error(EIO_VALUE);
+                    }
+                    V3Trunc::Err(errno) => {
+                        return SyscallResult::error_from(Errno::from(errno));
+                    }
+                }
             }
         }
     }

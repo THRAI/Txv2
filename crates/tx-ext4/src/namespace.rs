@@ -128,11 +128,12 @@ where
             Ok(inode) => inode,
             Err(err) => return StepOutcome::err(err.into()),
         };
-        match self.with_pager(|pager| {
-            pager
-                .write_inode_meta_journaled(inode, inode_meta_lite(meta))
-                .map(|_| ())
-        }) {
+        // In-place write, not `write_inode_meta_journaled`: the journaled
+        // variant only records a jbd2 transaction (no home-block
+        // checkpoint), so chmod/chown/utimensat and write-time mtime
+        // stamps were invisible to every subsequent `read_inode` until a
+        // replay that never runs in-kernel.
+        match self.with_pager(|pager| pager.write_inode_meta(inode, inode_meta_lite(meta))) {
             Ok(()) => StepOutcome::done(()),
             Err(err) => StepOutcome::err(err.into()),
         }

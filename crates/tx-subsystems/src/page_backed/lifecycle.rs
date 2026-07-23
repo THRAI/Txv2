@@ -157,7 +157,9 @@ pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<(), Page
             .fs_page_backing
             .truncate(*fs_object_id, size, guard)
         {
-            V3::Done(()) => {}
+            V3::Done(()) => {
+                stamp_write_times(mount, *fs_object_id, guard);
+            }
             V3::Continue { progress: _ } => return V3::continue_with(PageProgress::EMPTY),
             V3::Yield { progress: _, shape } => {
                 let Some((carrier, interests)) =
@@ -204,6 +206,39 @@ pub fn step_fsync(pc: &PageContainer, guard: &Guard<'_>) -> StepOutcome<(), Page
         }
         V3::Err(v3_errno) => V3::err(v3_errno),
     }
+}
+
+/// Stamp mtime/ctime on the FS inode after a successful writeback so
+/// metadata-based change detection (git's stat cache trusts size+mtime)
+/// observes shell-redirect and applet writes. Close/fd-release is the
+/// only flush point (no background writeback daemon), so stamping here
+/// covers every writer. Best-effort: hosts without an installed
+/// wall-clock source (unit tests) and filesystems without
+/// `serialize_inode_meta` skip silently — the data flush above already
+/// succeeded.
+fn stamp_write_times(
+    mount: &crate::mount::MountPayloadPin,
+    fs_object_id: FsObjectId,
+    guard: &Guard<'_>,
+) {
+    use crate::page_backed::adapter::step_engine::StepOutcome as V3;
+    let Some(now_ns) = crate::wall_clock::realtime_now_ns_hooked() else {
+        return;
+    };
+    let ts = crate::vfs::structure::Timespec::new(
+        (now_ns / 1_000_000_000) as i64,
+        (now_ns % 1_000_000_000) as i32,
+    );
+    let mut meta = match mount.payload().fs_ops.load_inode_meta(fs_object_id, guard) {
+        V3::Done(meta) => meta,
+        _ => return,
+    };
+    meta.mtime = ts;
+    meta.ctime = ts;
+    let _ = mount
+        .payload()
+        .fs_ops
+        .serialize_inode_meta(fs_object_id, &meta, guard);
 }
 
 /// `step_truncate` — v3 outcome shape over `PageProgress`.

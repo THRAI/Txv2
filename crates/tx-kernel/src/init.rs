@@ -538,6 +538,9 @@ impl<P: TxPlatform> CoreInit<P> {
             });
             tx_hal::console_write_str::<P>("\n");
         }
+        // Route CLOCK_REALTIME to code below the platform generic
+        // (page-backed writeback stamps file mtimes on flush).
+        tx_subsystems::wall_clock::install_monotonic_ns_source(P::read_ns);
         // Seed CLOCK_REALTIME from the platform hardware RTC (if any) so wall
         // time — `date`, `git` commit timestamps, file mtimes — reflects real
         // time instead of the fixed epoch base. Runs after vDSO init so the

@@ -1,3 +1,22 @@
+- 2026-07-23 (修复 ext4 覆写已 tracked 文件 git 看不见 — O_TRUNC/stat/mtime 三层根因). 病象:guest 里
+  `git clone` 后 `echo "hello" > README`,cat 见新内容但 `git add .`+`git status` 报 clean(git 只比 lstat
+  size/mtime/ctime,匹配就不读内容)。**内核探针(txdiag,sys_sync 触发 dump)实证根因链**,推翻"stat 读到
+  缓存快照"假设——stat 一直读磁盘真值,是磁盘被写坏:① sys_openat O_TRUNC 只截磁盘 inode、不截活
+  PageContainer → pc.size 停旧值,write 后 restore-dup2 的 step_fsync 把陈旧 size truncate 回磁盘,抹掉
+  O_TRUNC(磁盘=hello\n+整页零+旧 size,pc 死后重开读 hello+2884×\0,hash-object 实证;cat 显示 hello 是
+  shell 吞 NUL 的假象);② mtime 恒 0:写路径无人维护,且 serialize_inode_meta→write_inode_meta_journaled
+  只写 journal 区、从不 checkpoint home block(chmod/chown/utimensat 同坑,utimensat 的 STAT_META_OVERRIDES
+  表即补丁痕迹),mtime≡0 还关掉 git racy-clean 保护。**修复(7 文件)**:fs_basic.rs O_TRUNC 臂对
+  File-kind pc 走 step_truncate 双截(tmpfs Anon-kind 保持旧路,其 truncate 自带双更新;⚠️ EBR guard 不可
+  嵌套,fs_page_backing_for_dentry 须在本地 guard 前调);lifecycle.rs step_fsync size 持久化后 stamp
+  mtime/ctime(同尺寸覆写也能检出);composite.rs live_meta_for_dentry 活 pc size 覆盖(path-stat 与 fstat
+  一致);wall_clock.rs 加 install_monotonic_ns_source/realtime_now_ns_hooked 非泛型时钟 hook + init.rs 启动
+  安装;pager.rs 加 in-place write_inode_meta + namespace.rs serialize 改走它(journal 变体保留给 jbd2 仿真
+  测试)。**验证**:QEMU 最小复现全绿(stat size=6 + 真实 RTC mtime 随写推进、git status="M f"、index/
+  hash-object==blob("hello\n")、applet cat> 路径同绿)+ verify-git-net.sh 8/8(含 git init chmod 走新
+  serialize 路)。xtask unit 未跑(本谱系已知挂,既定裁定用 QEMU 验)。**Next**:la64 重建+
+  verify-git-net-la64.sh(push 前必补);全量 LTP 对账;考虑退役 STAT_META_OVERRIDES。Blocker:无。改动与
+  未提交的 git-clone 猎杀 5 连修同文件纠缠,提交时机由用户定。
 - 2026-07-16 (修复 busybox writev→ext4 跨进程写丢失 — 决赛 git 题隐患). 病象:shell 重定向写
   ext4 文件(`echo>f`/`cat>f`/`printf>f`,builtin 与 applet 都算),**另一个进程读到空**(git 提交进去的
   README 是空的);`write()`/`cp`/`dd`/git 自己写正常,`sync` 无效,同进程读正常。**逐步实验定根因**(非

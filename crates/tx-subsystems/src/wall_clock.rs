@@ -5,7 +5,7 @@
 //! offset and bump a generation counter that timer consumers can
 //! observe.
 
-use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
 use tx_hal::TimeIf;
 
@@ -124,6 +124,33 @@ impl WallClock {
 }
 
 static WALL_CLOCK: WallClock = WallClock::new(DEFAULT_REALTIME_EPOCH_BASE_NS as i64);
+
+/// Platform monotonic-ns reader for callers without a `P: TimeIf` bound
+/// (page-backed writeback stamping file mtimes lives below the platform
+/// generic). Installed once by the boot path; zero until then.
+static MONOTONIC_NS_SOURCE: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the platform's monotonic clock reader (`P::read_ns`) so
+/// non-generic code can read CLOCK_REALTIME via
+/// [`realtime_now_ns_hooked`].
+pub fn install_monotonic_ns_source(source: fn() -> u64) {
+    MONOTONIC_NS_SOURCE.store(source as usize, Ordering::Release);
+}
+
+/// CLOCK_REALTIME for callers without a `P: TimeIf` bound. `None` until
+/// the boot path installs the monotonic source (host unit tests never
+/// install it, so test filesystem state keeps epoch timestamps).
+pub fn realtime_now_ns_hooked() -> Option<u64> {
+    let raw = MONOTONIC_NS_SOURCE.load(Ordering::Acquire);
+    if raw == 0 {
+        return None;
+    }
+    // SAFETY: the only store is `install_monotonic_ns_source`, which
+    // writes a valid `fn() -> u64`; fn pointers are non-null and never
+    // deallocated.
+    let source: fn() -> u64 = unsafe { core::mem::transmute(raw) };
+    Some(add_signed_ns(source(), WALL_CLOCK.realtime_offset_ns()))
+}
 
 pub fn monotonic_now_ns<P: TimeIf>() -> u64 {
     WALL_CLOCK.monotonic_now_ns::<P>()
