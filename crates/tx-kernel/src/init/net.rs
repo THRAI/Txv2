@@ -25,7 +25,7 @@ use tx_subsystems::net::packet::{
     PacketDispatch, PacketSource, PacketTxReadiness, PacketTxResult, PacketTxSink,
 };
 use tx_subsystems::net::protocol::{EtherIface, IfaceCommon, LoopbackIface};
-use tx_subsystems::net::structure::Ipv4Address;
+use tx_subsystems::net::structure::{Ipv4Address, Ipv6Address};
 use tx_subsystems::net::{
     initial_loopback_iface, initial_net_namespace_payload, NetAdminAuthority,
     NetNamespaceRouteConfig,
@@ -37,6 +37,12 @@ const DEADLINE_UPDATED: tx_reactor::wait::Mask = tx_reactor::wait::Mask::from_bi
 const BOOT_ETH_IPV4: Ipv4Address = Ipv4Address::new([10, 0, 2, 15]);
 const BOOT_ETH_NETMASK: Ipv4Address = Ipv4Address::new([255, 255, 255, 0]);
 const BOOT_ETH_GATEWAY: Ipv4Address = Ipv4Address::new([10, 0, 2, 2]);
+/// V5-2: static v6 address for the boot NIC, mirroring `BOOT_ETH_IPV4` under
+/// the same SLIRP convention (`fec0::/64`, host side `fec0::2`, DNS `fec0::3`).
+const BOOT_ETH_IPV6: Ipv6Address = Ipv6Address::new([
+    0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x15,
+]);
+const BOOT_ETH_IPV6_PREFIX_LEN: u8 = 64;
 const BOOT_ETH_NAME: &str = "eth0";
 
 static BOOT_NET_RUNTIME: SpinMutex<Option<&'static BootNetRuntime>> = SpinMutex::new(None);
@@ -158,6 +164,35 @@ fn publish_boot_net_device_to_namespace(
         );
     } else {
         let _ = namespace.attach_device_for_test_or_bootstrap(registration, Some(BOOT_ETH_IPV4));
+    }
+    // V5-2: same treatment for IPv6. This kernel has no RA/SLAAC/DHCPv6 and
+    // generates no link-local address, so without this seed `eth0` comes up
+    // with NO v6 address at all: `/proc/net/if_inet6` lists only `lo`,
+    // `decide_ipv6_route` answers `Unreachable` for every destination, and the
+    // whole (working) external v6 datapath is unreachable until a human types
+    // `ip -6 addr add`. Address chosen to mirror BOOT_ETH_IPV4 under the same
+    // SLIRP convention (host side `fec0::2`, DNS `fec0::3`).
+    //
+    // Deliberately NO `::/0` default route, unlike the v4 seed below. v4's
+    // default route is real — 10.0.2.2 genuinely NATs to the v4 internet — but
+    // SLIRP does not route IPv6 off `fec0::/64`, and advertising a default
+    // router that cannot forward turns a fast `EADDRNOTAVAIL` into a connect
+    // that hangs until TCP gives up. On-link (`fec0::2`/`fec0::3`) needs no
+    // route entry: the connected prefix covers it. A host with real v6
+    // upstream can still `ip -6 route add default via ...` (the V3b gateway
+    // path is verified on hardware), and a future RA/SLAAC stage would install
+    // it from the advertisement instead of guessing here.
+    if let Some(link) = namespace
+        .link_snapshot()
+        .into_iter()
+        .find(|link| link.name == registration.name)
+    {
+        let _ = namespace.set_device_ipv6_addr_by_ifindex(
+            authority,
+            link.ifindex,
+            Some(BOOT_ETH_IPV6),
+            Some(BOOT_ETH_IPV6_PREFIX_LEN),
+        );
     }
     // Boot default route (0.0.0.0/0 via the SLIRP gateway). On Linux this
     // line is DHCP's job; the boot lane configures the iface statically, so

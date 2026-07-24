@@ -810,10 +810,21 @@ fn icmp6_filter_accepts(filter: [u32; 8], packet_type: Option<u8>) -> bool {
         .is_none_or(|word| (word & (1u32 << shift)) == 0)
 }
 
+/// Source address for an outgoing raw ICMPv6 packet.
+///
+/// V5-3: consult the FIB first (same answer the TCP/UDP paths now get), but
+/// unlike them keep the old on-link/first-address heuristic as a fallback.
+/// `ping6` to a destination with no route should still put a packet on the
+/// wire from a real local address — returning None here would make
+/// `send_raw_ipv6` fall back to `::1`, which is strictly worse than a
+/// best-guess source.
 fn preferred_ipv6_source_for(
     net_namespace: &PayloadCap<NetNamespacePayload>,
     dst: Ipv6Address,
 ) -> Option<Ipv6Address> {
+    if let Some(routed) = net_namespace.preferred_ipv6_source(dst) {
+        return Some(routed);
+    }
     let mut fallback = None;
     for link in net_namespace.link_snapshot() {
         if !link.is_up {

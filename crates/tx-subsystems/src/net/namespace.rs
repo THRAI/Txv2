@@ -1289,6 +1289,35 @@ impl NetNamespacePayload {
             .max_by_key(|decision| decision.prefix_len)
     }
 
+    /// V5-3: FIB-driven IPv6 source-address selection — the single place that
+    /// answers "which of my addresses do I send to `dst` from?".
+    ///
+    /// Before this, three call sites (connect autobind in tx-shims,
+    /// `select_routed_local`, and the raw-ICMPv6 helper) each carried their own
+    /// copy of "take the first up non-loopback link that has any v6 address",
+    /// which ignores `preferred_src`, prefix length and the outgoing interface
+    /// — wrong the moment a host has more than one v6 prefix.
+    ///
+    /// **Returning `None` when no route covers `dst` is load-bearing**, not an
+    /// oversight: connect() relies on it to fail fast with EADDRNOTAVAIL
+    /// instead of queueing a SYN that `decide_ipv6_route` will refuse forever.
+    /// Callers that would rather send from *something* than not send at all
+    /// (raw ICMPv6) layer their own fallback on top.
+    pub fn preferred_ipv6_source(&self, dst: Ipv6Address) -> Option<Ipv6Address> {
+        let route = self.best_ipv6_route(dst)?;
+        route.preferred_src.or_else(|| {
+            self.link_snapshot()
+                .into_iter()
+                .find(|link| {
+                    link.name == route.oif_name
+                        && link.is_up
+                        && !link.is_loopback
+                        && link.ipv6_addr.is_some()
+                })
+                .and_then(|link| link.ipv6_addr)
+        })
+    }
+
     fn route6_decision_for_info(
         &self,
         route: NetNamespaceRoute6Info,

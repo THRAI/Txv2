@@ -97,12 +97,13 @@ fn connect_autobind_local_base(
                 || IpEndpoint::unspecified_for_family(remote_endpoint.family, 0),
                 |src| IpEndpoint::new(src, 0),
             ),
-        tx_subsystems::net::structure::IpAddress::V6(_) => payload
+        // V5-3: routed like the V4 arm above (was "first up non-loopback link
+        // with any v6 address", FIB-blind). No route to `dst` => unspecified
+        // local => `step_connect` returns EADDRNOTAVAIL immediately, which is
+        // what keeps an unreachable global v6 destination from hanging.
+        tx_subsystems::net::structure::IpAddress::V6(dst) => payload
             .net_namespace()
-            .link_snapshot()
-            .into_iter()
-            .find(|link| link.is_up && !link.is_loopback && link.ipv6_addr.is_some())
-            .and_then(|link| link.ipv6_addr)
+            .preferred_ipv6_source(dst)
             .map_or_else(
                 || IpEndpoint::unspecified_for_family(remote_endpoint.family, 0),
                 |src| IpEndpoint::new_v6(src, 0),

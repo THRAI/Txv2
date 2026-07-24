@@ -785,12 +785,14 @@ fn select_routed_local(
             .best_ipv4_route(dst)
             .and_then(|route| route.preferred_src)
             .map(|src| IpEndpoint::new(src, local.port)),
-        crate::net::structure::IpAddress::V6(_) => payload
+        // V5-3: was "first up non-loopback link that has any v6 address",
+        // which ignored the FIB entirely. Now routed like the V4 arm above —
+        // and a destination with NO route yields None, so the caller keeps an
+        // unspecified local and connect() fails fast instead of parking on a
+        // SYN that `decide_ipv6_route` will refuse forever.
+        crate::net::structure::IpAddress::V6(dst) => payload
             .net_namespace()
-            .link_snapshot()
-            .into_iter()
-            .find(|link| link.is_up && !link.is_loopback && link.ipv6_addr.is_some())
-            .and_then(|link| link.ipv6_addr)
+            .preferred_ipv6_source(dst)
             .map(|src| IpEndpoint::new_v6(src, local.port)),
     }
 }

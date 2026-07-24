@@ -1293,21 +1293,7 @@ impl SocketPayload {
             // was fully implemented but had zero non-test callers.
             super::IpAddress::V6(addr) => self
                 .net_namespace()
-                .best_ipv6_route(addr)
-                .and_then(|route| {
-                    route.preferred_src.or_else(|| {
-                        self.net_namespace()
-                            .link_snapshot()
-                            .into_iter()
-                            .find(|link| {
-                                link.name == route.oif_name
-                                    && link.is_up
-                                    && !link.is_loopback
-                                    && link.ipv6_addr.is_some()
-                            })
-                            .and_then(|link| link.ipv6_addr)
-                    })
-                })
+                .preferred_ipv6_source(addr)
                 .map(|src| IpEndpoint::new_v6(src, 0)),
         }
     }

@@ -371,11 +371,30 @@ pcap 必须看到 **src = `fec0::15`(不是 `::1`)** 的 v6 UDP 包及其应答�
 **推荐方案:镜像 v4 的 boot seed,不做 RA/SLAAC。** 文件 `crates/tx-kernel/src/init/net.rs`。
 
 在 `publish_boot_net_device_to_namespace`(`init/net.rs:143`)里,紧挨着现有的
-`set_device_ipv4_addr_by_ifindex`(`:153-158`)和 `add_ipv4_route`(`:170-186`)加两段对位:
+`set_device_ipv4_addr_by_ifindex`(`:153-158`)加对位的
+`set_device_ipv6_addr_by_ifindex(auth, ifindex, Some(BOOT_ETH_IPV6), Some(64))`,
+`BOOT_ETH_IPV6 = fec0::15`(与 `BOOT_ETH_IPV4 = 10.0.2.15` 同款 slirp 约定)。
 
-- `set_device_ipv6_addr_by_ifindex(auth, ifindex, Some(BOOT_ETH_IPV6), Some(64))`,
-  `BOOT_ETH_IPV6 = fec0::15`(与 `BOOT_ETH_IPV4 = 10.0.2.15` 同款 slirp 约定);
-- `add_ipv6_route(::/0 via fec0::2, oif=eth0, preferred_src=fec0::15, RTPROT_BOOT)`。
+> **⚠️ 落地时相对本节原方案做了两处偏离,理由如下(实测驱动)。**
+>
+> **偏离 1:不加 `::/0` 默认路由。** 原方案说"镜像 v4 再加一条 `::/0 via fec0::2`"。
+> 但 v4 的默认路由是**真的**——`10.0.2.2` 确实 NAT 到 v4 公网;而 slirp **不会**把 IPv6 路由出
+> `fec0::/64`,宣告一个转发不了的默认路由等于**伪造可达性**,只会把一次快速的
+> `EADDRNOTAVAIL` 变成挂到 TCP 超时。on-link 的 `fec0::2`/`fec0::3` 本来就被连接路由覆盖,
+> 不需要这条。真有 v6 上游的宿主仍可 `ip -6 route add default via ...`(V3b 网关路径已真机验过,§1.5),
+> 将来的 RA/SLAAC 阶段则应当**从通告里学**而不是在这里猜。
+>
+> **偏离 2:V5-3 从"建议做"升级为 V5-2 的必要配套,两者必须一起落。**
+> 只加 V5-2 会**引入一个新回归**:eth0 一旦有了 v6 地址,connect 的 autobind
+> (`helpers.rs:100`)那份 FIB-blind 启发式就会为**任何** v6 目的地(包括没有路由的全局地址)
+> 选出 `fec0::15` 作为源 → SYN 入队 → `decide_ipv6_route` 判 `Unreachable` → 段被
+> 拒收即留队 → **connect 挂死到超时**。实测对照:
+>
+> | | V5-2 单独 | V5-2 + V5-3 |
+> |---|---|---|
+> | `wget http://[2606:4700:4700::1111]:80/` | 55s 内未返回 | `Address not available`,**elapsed=0s** |
+>
+> 这恰好也是任务书 §九 那个 wget 现象的场景——**不能**让它从"快速失败"退化成"挂住"。
 
 *为什么不做 RA/SLAAC(至少这一轮不做)*:
 
@@ -395,12 +414,19 @@ pcap 必须看到 **src = `fec0::15`(不是 `::1`)** 的 v6 UDP 包及其应答�
 **验收**:不打任何 `ip -6` 命令,开机直接
 `cat /proc/net/if_inet6` 有 eth0 行、`ping6 fec0::2` 3/3、`wget http://[fec0::2]:PORT/` 200、`nc -u fec0::2` echo 通。
 
-### V5-3 — v6 源地址选择收敛到 FIB(治 G4,建议做)
+### V5-3 — v6 源地址选择收敛到 FIB(治 G4,**必做,与 V5-2 同批**)
 
-把 §2.6 三处启发式收敛成一个走 `best_ipv6_route` 的公共函数(镜像 v4 的写法),
-改 `helpers.rs:100-108`、`step_connect.rs:788-794`、`step_send.rs:813-835`。
-**验收**:新增单测——两条 v6 前缀 + 显式 `preferred_src` 的 route 时,connect/sendto 选中的源地址跟着 FIB 走;
-真机 `ip -6 addr add` 两个前缀后 `wget` 打各自网段,pcap 源地址正确。
+把 §2.6 三处启发式收敛到 `NetNamespacePayload::preferred_ipv6_source(dst)`(内部走 `best_ipv6_route`,
+镜像 v4 的写法),改 `helpers.rs`(connect autobind)、`step_connect.rs`(`select_routed_local`)、
+`step_send.rs`(`preferred_ipv6_source_for`)、`payload.rs`(`udp_tx_src_hint`,V5-1 已先接上)。
+
+**语义要点**:`preferred_ipv6_source` 在**没有路由覆盖 dst 时返回 `None`,这是承重的**——
+connect 靠它快速失败(见 V5-2 的偏离 2)。唯一例外是 **raw ICMPv6**:它在 FIB 未命中时保留
+原来的"on-link 前缀匹配 / 第一个非 `::1` 地址"启发式兜底,因为 `ping6` 打无路由地址时,
+用一个尽力而为的真实本地源发包,好过 `send_raw_ipv6` 回退到 `::1`。
+
+**验收**:见 V5-2 的对照表(无路由全局 v6 从"挂住"变回 `elapsed=0s` 快速失败);
+单测集合差与基线**完全一致**。
 
 ### V5-4 — 回归覆盖补齐(治 G7,建议随 V5-1 一起提交)
 
@@ -518,8 +544,15 @@ musl/glibc 的 `getaddrinfo` 在做 RFC 6724 目的地址排序时,会对每个�
 
 | 阶段 | 状态 |
 |---|---|
-| Phase 0 调研 | ✅ 本文;基线四门已跑(§1.8);**等待审阅** |
-| V5-1 外部 v6 UDP | ⏸ 未开始(待审阅通过) |
-| V5-2 v6 开机自动配置 | ⏸ 未开始(待决策) |
-| V5-3 v6 源选择接 FIB | ⏸ 未开始 |
-| V5-4 回归覆盖 | ⏸ 未开始 |
+| Phase 0 调研 | ✅ 本文;方案已审阅通过(2026-07-25) |
+| V5-1 外部 v6 UDP | ✅ 落地 `1ab2b8c8`(含 V5-4 的回归测试) |
+| V5-2 v6 开机自动配置 | ✅ 落地(不含 `::/0`,见偏离 1) |
+| V5-3 v6 源选择接 FIB | ✅ 落地(与 V5-2 同批,见偏离 2) |
+| V5-4 回归覆盖 | ✅ 已随 V5-1 提交 |
+
+**现在开箱即用的 IPv6 能力**(guest 零手工配置):`/proc/net/if_inet6` 有 eth0、
+`ping6 fec0::2` 3/3、外部 v6 TCP(HTTP 200)、外部 v6 UDP(echo 往返,源地址正确)、
+off-link v6 经 `ip -6 route add default via ...`(V3b)。
+
+**仍然没有的**(有意留下,见 §3 末尾):RA/SLAAC/link-local/DHCPv6、v6-only 网卡、
+v6 分片/转发、`ip -6 neigh` 投影、`/proc/net/{tcp,udp,tcp6,udp6}`、双 iface 合并。

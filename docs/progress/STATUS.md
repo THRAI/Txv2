@@ -1,3 +1,25 @@
+- 2026-07-25 (**V5-2 + V5-3:IPv6 开机即用 + v6 源选择接 FIB**). V5-2:此内核无 RA/SLAAC/DHCPv6、也不
+  生成 link-local,`eth0` 开机**没有任何 v6 地址**,整条(已经能用的)外部 v6 数据面要人手打
+  `ip -6 addr add` 才活。修复=`init/net.rs` 的 `publish_boot_net_device_to_namespace` 里,紧挨 v4 的
+  `set_device_ipv4_addr_by_ifindex` 加对位 `set_device_ipv6_addr_by_ifindex(BOOT_ETH_IPV6=fec0::15/64)`
+  (同款 slirp 约定)。**相对审阅稿两处偏离,都是实测驱动**:① **不加 `::/0` 默认路由**——v4 那条是真的
+  (10.0.2.2 确实 NAT 到公网),而 slirp 不把 IPv6 路由出 `fec0::/64`,宣告转发不了的默认路由=伪造可达性,
+  只会把快速 `EADDRNOTAVAIL` 变成挂到 TCP 超时;on-link 的 fec0::2/fec0::3 本就被连接路由覆盖。② **V5-3
+  从"建议做"升级为必要配套**:只落 V5-2 会**引入新回归**——eth0 一有 v6 地址,connect autobind
+  (`helpers.rs:100`)那份 FIB-blind 启发式就会给**任何** v6 目的地(含无路由的全局地址)选出 fec0::15 当源
+  → SYN 入队 → `decide_ipv6_route` 判 Unreachable → 段拒收即留队 → **connect 挂死**。真机对照:
+  `wget http://[2606:4700:4700::1111]:80/` 在 V5-2 单独时 **55s 内未返回**,补上 V5-3 后
+  **`Address not available` / elapsed=0s**。V5-3 本体=新增 `NetNamespacePayload::preferred_ipv6_source(dst)`
+  (走 `best_ipv6_route`),收敛 §2.6 的三份"扫第一个有 v6 地址的 up 非 loopback link"启发式:
+  `helpers.rs` autobind / `step_connect.rs` `select_routed_local` / `payload.rs` `udp_tx_src_hint` 三处
+  **纯 FIB 无兜底**(返 None 是承重的,快速失败靠它),唯 raw ICMPv6 的 `preferred_ipv6_source_for` 保留
+  既有启发式兜底(ping6 打无路由地址时用尽力而为的真实源,好过 `send_raw_ipv6` 回退 `::1`)。**验证**:
+  guest **零手工配置**下 `/proc/net/if_inet6` 有 eth0 行、`ip -6 addr` 显示 fec0::15/64、ping6 3/3、
+  外部 v6 TCP(HTTP 200)、外部 v6 UDP(echo 往返)全绿;v4 对照(TCP/UDP/DNS)全绿。回归门:rv64/la64
+  build 零新增 warning;`tx-subsystems --lib` 集合差 **IDENTICAL(324==324)零回归**;`verify-git-net.sh`
+  **8/8**。**Next**:LTP net 抽样对账(尤其 net.ipv6 —— `/proc/net/if_inet6` 现在多一行 eth0,需确认没有
+  靶子在数行数);任务书 §7 的 RFC 6724 目的地址排序仍**未验证**(注意:musl getaddrinfo 用 **UDP** connect
+  探测,而 UDP autobind 不走 V6 臂,所以 V5-3 的快速失败杠杆目前**只对 TCP 生效**)。**Blocker**:无。
 - 2026-07-25 (**V5-1 外部 IPv6 UDP 打通** — 破坏性弹出 + v6 源地址空洞两连修). 病象:guest 里任何发往
   外部 v6 单播地址的 UDP(含 DNS)**一个包都到不了网线**,而同时刻 v4 UDP 与 v6 TCP 全通。**双根因**:
   ① `step_device_tx.rs:342` UDP 车道 `take_udp_tx_datagram()` 是**破坏性弹出**,sink 一旦返回
