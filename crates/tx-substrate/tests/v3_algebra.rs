@@ -84,71 +84,106 @@ fn errno_mirrors_v4_catalog() {
     let cases = [
         Errno::E2BIG,
         Errno::EACCES,
+        Errno::EADDRINUSE,
+        Errno::EADDRNOTAVAIL,
+        Errno::EAFNOSUPPORT,
         Errno::EAGAIN,
+        Errno::EALREADY,
         Errno::EBADF,
         Errno::EBUSY,
         Errno::ECANCELED,
+        Errno::ECONNREFUSED,
+        Errno::EDESTADDRREQ,
         Errno::EDQUOT,
         Errno::EEXIST,
+        Errno::EFBIG,
+        Errno::EIDRM,
         Errno::EFAULT,
         Errno::EINVAL,
+        Errno::EINPROGRESS,
+        Errno::EINTR,
         Errno::EIO,
+        Errno::EISCONN,
         Errno::EISDIR,
         Errno::ELOOP,
         Errno::ENAMETOOLONG,
         Errno::ENODEV,
         Errno::ENOEXEC,
+        Errno::EMSGSIZE,
         Errno::ENOMEM,
         Errno::ENOENT,
+        Errno::ENOPROTOOPT,
         Errno::ENOSYS,
+        Errno::ENOTCONN,
         Errno::ENOTDIR,
         Errno::ENOTEMPTY,
         Errno::ENOTTY,
+        Errno::ENOTSOCK,
+        Errno::EOPNOTSUPP,
         Errno::EPERM,
         Errno::EPIPE,
+        Errno::EPROTONOSUPPORT,
         Errno::ERANGE,
         Errno::EROFS,
         Errno::ESPIPE,
         Errno::ESRCH,
         Errno::ESTALE,
         Errno::ETIMEDOUT,
+        Errno::EMLINK,
+        Errno::ESOCKTNOSUPPORT,
     ];
-    assert_eq!(cases.len(), 30);
+    assert_eq!(cases.len(), 49);
     for errno in cases {
         match errno {
             Errno::E2BIG
             | Errno::EACCES
+            | Errno::EADDRINUSE
+            | Errno::EADDRNOTAVAIL
+            | Errno::EAFNOSUPPORT
             | Errno::EAGAIN
+            | Errno::EALREADY
             | Errno::EBADF
             | Errno::EBUSY
             | Errno::ECANCELED
+            | Errno::ECONNREFUSED
+            | Errno::EDESTADDRREQ
             | Errno::EDQUOT
             | Errno::EEXIST
             | Errno::EFBIG
             | Errno::EIDRM
             | Errno::EFAULT
             | Errno::EINVAL
+            | Errno::EINPROGRESS
+            | Errno::EINTR
             | Errno::EIO
+            | Errno::EISCONN
             | Errno::EISDIR
             | Errno::ELOOP
             | Errno::ENAMETOOLONG
             | Errno::ENODEV
             | Errno::ENOEXEC
+            | Errno::EMSGSIZE
             | Errno::ENOMEM
             | Errno::ENOENT
+            | Errno::ENOPROTOOPT
             | Errno::ENOSYS
+            | Errno::ENOTCONN
             | Errno::ENOTDIR
             | Errno::ENOTEMPTY
             | Errno::ENOTTY
+            | Errno::ENOTSOCK
+            | Errno::EOPNOTSUPP
             | Errno::EPERM
             | Errno::EPIPE
+            | Errno::EPROTONOSUPPORT
             | Errno::ERANGE
             | Errno::EROFS
             | Errno::ESPIPE
             | Errno::ESRCH
             | Errno::ESTALE
             | Errno::ETIMEDOUT
-            | Errno::EINTR => {}
+            | Errno::EMLINK
+            | Errno::ESOCKTNOSUPPORT => {}
         }
     }
 }

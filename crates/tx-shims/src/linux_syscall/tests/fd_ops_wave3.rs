@@ -9,7 +9,11 @@ use crate::linux_syscall::{
     O_WRONLY, TTY_WRITE_MAX_INLINE,
 };
 use std::sync::Arc;
-use tx_substrate::wake::TaskMailbox;
+use tx_services::time::{
+    DeadlineDomain, DeadlineNs, DeadlineRegistrarHandle, TimeError, TimerRole, TimerTarget,
+    TimerToken,
+};
+use tx_substrate::wake::{MailboxEvent, TaskMailbox};
 
 const E_INVAL: i32 = 22;
 const E_NOSYS: i32 = 38;
@@ -19,6 +23,51 @@ const E_AGAIN: i32 = 11;
 const AF_UNIX: u64 = 1;
 const SOCK_STREAM: u64 = 1;
 const POLLIN: i16 = 0x0001;
+
+#[derive(Default)]
+struct FdDeadlineDomain {
+    registration: std::sync::Mutex<Option<FdDeadlineRegistration>>,
+}
+
+struct FdDeadlineRegistration {
+    role: TimerRole,
+    mailbox: std::sync::Weak<TaskMailbox>,
+    token: TimerToken,
+}
+
+impl FdDeadlineDomain {
+    fn take_registration(&self) -> FdDeadlineRegistration {
+        self.registration
+            .lock()
+            .unwrap()
+            .take()
+            .expect("finite fd wait timeout should register a deadline")
+    }
+}
+
+impl DeadlineDomain for FdDeadlineDomain {
+    fn register_deadline(
+        &self,
+        _deadline_ns: DeadlineNs,
+        role: TimerRole,
+        target: TimerTarget,
+    ) -> Result<TimerToken, TimeError> {
+        let TimerTarget::TaskMailbox(mailbox) = target else {
+            panic!("fd wait timeout must use a task-mailbox deadline");
+        };
+        let token = TimerToken::new(0xFD01);
+        *self.registration.lock().unwrap() = Some(FdDeadlineRegistration {
+            role,
+            mailbox,
+            token,
+        });
+        Ok(token)
+    }
+
+    fn cancel_deadline(&self, _token: TimerToken) -> bool {
+        true
+    }
+}
 
 fn pipe2_setup() -> TestSetup {
     setup()
@@ -222,6 +271,68 @@ fn dispatch_ppoll_zero_timeout_clears_unready_socketpair_reader() {
 }
 
 #[test]
+fn dispatch_ppoll_positive_timeout_uses_unified_timer_registry() {
+    let _setup = pipe2_setup();
+    let (proc_cap, thread) = fresh_proc_thread();
+    let mailbox = Arc::new(TaskMailbox::new());
+    let domain = Arc::new(FdDeadlineDomain::default());
+    let ctx = make_ctx(proc_cap.clone(), thread)
+        .with_mailbox(Arc::clone(&mailbox))
+        .with_timer_registrar(DeadlineRegistrarHandle::from_domain(domain.clone()));
+    let sv = dispatch_socketpair(&ctx);
+
+    let mut pollfd = [0u8; 8];
+    pollfd[0..4].copy_from_slice(&(sv[0] as i32).to_le_bytes());
+    pollfd[4..6].copy_from_slice(&POLLIN.to_le_bytes());
+    let timeout = [0u64, 1_000_000u64];
+    let req = SyscallRequest::new(
+        NR_PPOLL,
+        [
+            pollfd.as_mut_ptr() as u64,
+            1,
+            timeout.as_ptr() as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    let waker = Waker::noop().clone();
+    let mut cx = Context::from_waker(&waker);
+    let fut = dispatch::<ShimsTestPmap>(req, &ctx);
+    let mut pinned = Box::pin(fut);
+
+    for _ in 0..4 {
+        let poll = pinned.as_mut().poll(&mut cx);
+        assert!(
+            matches!(poll, Poll::Pending),
+            "ppoll with unreadable fd and finite timeout should park before expiry; got {poll:?}"
+        );
+    }
+    let registration = domain.take_registration();
+    assert_eq!(registration.role, TimerRole::DeadlineAbort);
+    let target_mailbox = registration
+        .mailbox
+        .upgrade()
+        .expect("deadline timer should retain the syscall task mailbox");
+    assert!(target_mailbox.post(MailboxEvent::TimerFired {
+        token: registration.token,
+    }));
+
+    for _ in 0..16 {
+        if let Poll::Ready(result) = pinned.as_mut().poll(&mut cx) {
+            assert_eq!(result, SyscallResult::Return(0));
+            assert_eq!(
+                i16::from_le_bytes(pollfd[6..8].try_into().unwrap()),
+                0,
+                "timeout should leave the unreadable fd without revents"
+            );
+            return;
+        }
+    }
+    panic!("ppoll did not resolve after unified timer expiry");
+}
+
+#[test]
 fn dispatch_socketpair_empty_blocking_read_returns_eagain_without_rnode_panic() {
     let _setup = pipe2_setup();
     let (proc_cap, thread) = fresh_proc_thread();
@@ -412,6 +523,70 @@ fn dispatch_pselect6_zero_timeout_clears_unready_pipe_reader() {
         !fdset_has(&readfds, pipefd[0]),
         "unready reader bit cleared"
     );
+}
+
+#[test]
+fn dispatch_pselect6_positive_timeout_uses_unified_timer_registry() {
+    let _setup = pipe2_setup();
+    let (proc_cap, thread) = fresh_proc_thread();
+    let mailbox = Arc::new(TaskMailbox::new());
+    let domain = Arc::new(FdDeadlineDomain::default());
+    let ctx = make_ctx(proc_cap.clone(), thread)
+        .with_mailbox(Arc::clone(&mailbox))
+        .with_timer_registrar(DeadlineRegistrarHandle::from_domain(domain.clone()));
+    let mut pipefd: [u32; 2] = [u32::MAX, u32::MAX];
+    let req = SyscallRequest::new(NR_PIPE2, [pipefd.as_mut_ptr() as u64, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(req, &ctx)),
+        SyscallResult::Return(0)
+    );
+
+    let mut readfds = fdset_with(pipefd[0]);
+    let timeout = [0u64, 1_000_000u64];
+    let req = SyscallRequest::new(
+        NR_PSELECT6,
+        [
+            pipefd[0] as u64 + 1,
+            readfds.as_mut_ptr() as u64,
+            0,
+            0,
+            timeout.as_ptr() as u64,
+            0,
+        ],
+    );
+    let waker = Waker::noop().clone();
+    let mut cx = Context::from_waker(&waker);
+    let fut = dispatch::<ShimsTestPmap>(req, &ctx);
+    let mut pinned = Box::pin(fut);
+
+    for _ in 0..4 {
+        let poll = pinned.as_mut().poll(&mut cx);
+        assert!(
+            matches!(poll, Poll::Pending),
+            "pselect6 with unreadable fd and finite timeout should park before expiry; got {poll:?}"
+        );
+    }
+    let registration = domain.take_registration();
+    assert_eq!(registration.role, TimerRole::DeadlineAbort);
+    let target_mailbox = registration
+        .mailbox
+        .upgrade()
+        .expect("deadline timer should retain the syscall task mailbox");
+    assert!(target_mailbox.post(MailboxEvent::TimerFired {
+        token: registration.token,
+    }));
+
+    for _ in 0..16 {
+        if let Poll::Ready(result) = pinned.as_mut().poll(&mut cx) {
+            assert_eq!(result, SyscallResult::Return(0));
+            assert!(
+                !fdset_has(&readfds, pipefd[0]),
+                "timeout should clear the unready reader bit"
+            );
+            return;
+        }
+    }
+    panic!("pselect6 did not resolve after unified timer expiry");
 }
 
 #[test]

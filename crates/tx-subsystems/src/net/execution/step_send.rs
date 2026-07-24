@@ -3,7 +3,7 @@ use tx_substrate::zone::Cap;
 
 use crate::execution::{Errno, Guard};
 use crate::net::checks::require::require_socket_write_target;
-use crate::net::delegate::net_delegate_kick_poll;
+use crate::net::delegate::net_delegate_kick_poll_with_post;
 use crate::net::execution::{socket_send_wait_token, yield_bytes_on_token, ByteStepOutcome};
 use crate::net::namespace::{net_namespace_payloads_snapshot, NetNamespacePayload};
 use crate::net::protocol::{
@@ -16,7 +16,6 @@ use crate::net::structure::{
     RecvWireSet, SendRecvFlags, SendWireSet, SocketIdentity, SocketKind, SocketPayload,
     SocketProtocol, TcpState, UnixDatagramState, UnixSocketPath, UnixStreamState,
 };
-use crate::net::structure::table::SocketTable;
 use crate::net::NetAdminAuthority;
 use tx_substrate::zone::PayloadCap;
 
@@ -64,7 +63,7 @@ pub fn step_send(
 
     if reserve.bytes == 0 {
         if reserve.needs_poll_kick {
-            net_delegate_kick_poll();
+            net_delegate_kick_poll_with_post(|mailbox, event| mailbox.post(event));
         }
         socket.readiness.clear_send(SendWireSet::SPACE);
         return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
@@ -75,7 +74,7 @@ pub fn step_send(
     }
 
     if !flags.contains(SendRecvFlags::MSG_MORE) || reserve.needs_poll_kick {
-        net_delegate_kick_poll();
+        net_delegate_kick_poll_with_post(|mailbox, event| mailbox.post(event));
     }
     StepOutcome::Done(reserve.bytes)
 }
@@ -121,6 +120,9 @@ pub fn step_send_kernel_bytes(
     if socket.kind == SocketKind::UnixStream {
         return send_unix_stream_bytes(socket, &payload, bytes, guard);
     }
+    if socket.kind == SocketKind::Tcp && tcp_uses_direct_stream(&payload) {
+        return send_tcp_stream_bytes(socket, &payload, bytes, guard);
+    }
     if socket.kind == SocketKind::Sctp {
         return send_sctp_stream_bytes(socket, &payload, bytes, 0, 0, guard);
     }
@@ -128,18 +130,14 @@ pub fn step_send_kernel_bytes(
         return send_unix_datagram_connected(socket, &payload, bytes, guard);
     }
 
-    let reserve = match payload.reserve_send_bytes_with_flags(bytes, flags) {
-        Ok(Some(reserve)) => reserve,
-        Ok(None) => {
-            socket.readiness.clear_send(SendWireSet::SPACE);
-            return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
-        }
-        Err(errno) => return StepOutcome::Err(errno),
+    let Some(reserve) = payload.reserve_send_bytes_with_flags(bytes, flags) else {
+        socket.readiness.clear_send(SendWireSet::SPACE);
+        return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
     };
 
     if reserve.bytes == 0 {
         if reserve.needs_poll_kick {
-            net_delegate_kick_poll();
+            net_delegate_kick_poll_with_post(|mailbox, event| mailbox.post(event));
         }
         socket.readiness.clear_send(SendWireSet::SPACE);
         return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
@@ -150,7 +148,7 @@ pub fn step_send_kernel_bytes(
     }
 
     if !flags.contains(SendRecvFlags::MSG_MORE) || reserve.needs_poll_kick {
-        net_delegate_kick_poll();
+        net_delegate_kick_poll_with_post(|mailbox, event| mailbox.post(event));
     }
     StepOutcome::Done(reserve.bytes)
 }
@@ -254,17 +252,12 @@ pub fn step_send_to_kernel_bytes_with_poll_kick(
             if destination.family != AddressFamily::Inet {
                 return StepOutcome::Err(Errno::EAFNOSUPPORT);
             }
-            if !destination.is_loopback() && !destination.is_unspecified() {
-                // Configured/local-multicast peers keep the synthesized
-                // loopback-style reply (netns/LTP flows). A real external
-                // destination falls through to the generic reserve below —
-                // icmp tx queue → device-TX lane → wire (replies come back
-                // through the demux → process_icmp_event → raw socket).
-                if ipv4_multicast_group_is_joined_locally(destination.addr)
-                    || ipv4_addr_is_configured(destination.addr)
-                {
-                    return send_configured_icmpv4_echo(&payload, destination.addr, bytes, guard);
-                }
+            if !destination.is_loopback()
+                && !destination.is_unspecified()
+                && !raw_icmpv4_route_uses_gateway(&payload, destination.addr)
+                && !raw_icmpv4_route_uses_device(&payload, destination.addr)
+            {
+                return send_configured_icmpv4_echo(&payload, destination.addr, bytes, guard);
             }
         }
     }
@@ -273,6 +266,9 @@ pub fn step_send_to_kernel_bytes_with_poll_kick(
     }
     if socket.kind == SocketKind::UnixStream {
         return send_unix_stream_bytes(socket, &payload, bytes, guard);
+    }
+    if socket.kind == SocketKind::Tcp && tcp_uses_direct_stream(&payload) {
+        return send_tcp_stream_bytes(socket, &payload, bytes, guard);
     }
     if socket.kind == SocketKind::Sctp {
         return send_sctp_stream_bytes(socket, &payload, bytes, 0, 0, guard);
@@ -295,7 +291,7 @@ pub fn step_send_to_kernel_bytes_with_poll_kick(
 
     if reserve.bytes == 0 {
         if kick_poll && reserve.needs_poll_kick {
-            net_delegate_kick_poll();
+            net_delegate_kick_poll_with_post(|mailbox, event| mailbox.post(event));
         }
         socket.readiness.clear_send(SendWireSet::SPACE);
         return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
@@ -306,7 +302,7 @@ pub fn step_send_to_kernel_bytes_with_poll_kick(
     }
 
     if kick_poll && (!flags.contains(SendRecvFlags::MSG_MORE) || reserve.needs_poll_kick) {
-        net_delegate_kick_poll();
+        net_delegate_kick_poll_with_post(|mailbox, event| mailbox.post(event));
     }
     StepOutcome::Done(reserve.bytes)
 }
@@ -354,14 +350,7 @@ fn tcp_connected_peer_error(payload: &SocketPayload, guard: &Guard<'_>) -> Optio
         return None;
     };
     let Some(peer) = lookup_tcp_connected_peer(payload, local, remote, guard) else {
-        // No in-kernel peer: this is an external (real-device) TCP connection
-        // whose peer lives on the wire, not a loopback/intra-kernel pair. The
-        // connection is writable as long as its smoltcp socket can still
-        // send; only a socket that can no longer send is a genuine EPIPE.
-        return match payload.raw_tcp_socket() {
-            Some(raw) if raw.may_send() => None,
-            _ => Some(Errno::EPIPE),
-        };
+        return Some(Errno::EPIPE);
     };
     let Some(peer_payload) = peer.acquire_operational() else {
         return Some(Errno::EPIPE);
@@ -373,6 +362,15 @@ fn tcp_connected_peer_error(payload: &SocketPayload, guard: &Guard<'_>) -> Optio
         }) if peer_local == remote && peer_remote == local => None,
         _ => Some(Errno::EPIPE),
     }
+}
+
+fn tcp_uses_direct_stream(payload: &SocketPayload) -> bool {
+    matches!(
+        payload.protocol_snapshot(),
+        SocketProtocol::Tcp(TcpState::Connected { .. })
+    ) && payload
+        .raw_tcp_socket()
+        .is_some_and(|raw| !raw.protocol_runtime_state().has_connected)
 }
 
 fn lookup_tcp_connected_peer(
@@ -390,6 +388,46 @@ fn lookup_tcp_connected_peer(
                 .into_iter()
                 .find_map(|namespace| namespace.socket_table().lookup_tcp_connection(key, guard))
         })
+}
+
+fn send_tcp_stream_bytes(
+    _socket: &Cap<SocketIdentity>,
+    payload: &SocketPayload,
+    bytes: &[u8],
+    guard: &Guard<'_>,
+) -> ByteStepOutcome<usize> {
+    let (local, remote) = match payload.protocol_snapshot() {
+        SocketProtocol::Tcp(TcpState::Connected { local, remote }) => (local, remote),
+        SocketProtocol::Tcp(TcpState::Closed) => return StepOutcome::Err(Errno::ENOTCONN),
+        SocketProtocol::Tcp(_) => return StepOutcome::Err(Errno::EPIPE),
+        _ => return StepOutcome::Err(Errno::EINVAL),
+    };
+    let Some(peer) = lookup_tcp_connected_peer(payload, local, remote, guard) else {
+        return StepOutcome::Err(Errno::EPIPE);
+    };
+    let Some(peer_payload) = peer.acquire_operational() else {
+        return StepOutcome::Err(Errno::EPIPE);
+    };
+    if !matches!(
+        peer_payload.protocol_snapshot(),
+        SocketProtocol::Tcp(TcpState::Connected {
+            local: peer_local,
+            remote: peer_remote,
+        }) if peer_local == remote && peer_remote == local
+    ) {
+        return StepOutcome::Err(Errno::EPIPE);
+    }
+    if peer_payload.shutdown_rd() {
+        return StepOutcome::Err(Errno::EPIPE);
+    }
+    let Some(became_readable) = peer_payload.record_tcp_stream_bytes(bytes) else {
+        return StepOutcome::Err(Errno::EPIPE);
+    };
+    if became_readable {
+        peer.readiness
+            .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| mailbox.post(event));
+    }
+    StepOutcome::Done(bytes.len())
 }
 
 fn send_unix_datagram_connected(
@@ -430,7 +468,9 @@ fn send_unix_datagram_to_peer_raw(
         return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
     };
     if became_readable {
-        target.readiness.fire_recv(RecvWireSet::HAS_DATA);
+        target
+            .readiness
+            .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| mailbox.post(event));
     }
     StepOutcome::Done(bytes.len())
 }
@@ -463,7 +503,9 @@ fn send_unix_datagram_to_path(
         return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
     };
     if became_readable {
-        target.readiness.fire_recv(RecvWireSet::HAS_DATA);
+        target
+            .readiness
+            .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| mailbox.post(event));
     }
     StepOutcome::Done(bytes.len())
 }
@@ -507,7 +549,9 @@ fn send_rds_packet(
         return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
     };
     if became_readable {
-        target.readiness.fire_recv(RecvWireSet::HAS_DATA);
+        target
+            .readiness
+            .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| mailbox.post(event));
     }
     StepOutcome::Done(bytes.len())
 }
@@ -595,13 +639,15 @@ fn deliver_icmpv4_reply_to_table(
             continue;
         }
         if target_payload.record_icmp_recv_echo_reply(reply.clone()) {
-            target.readiness.fire_recv(RecvWireSet::HAS_DATA);
+            target
+                .readiness
+                .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| mailbox.post(event));
         }
     }
 }
 
 fn send_raw_ipv6(
-    socket: &Cap<SocketIdentity>,
+    _socket: &Cap<SocketIdentity>,
     payload: &SocketPayload,
     dst: Option<IpEndpoint>,
     bytes: &[u8],
@@ -635,13 +681,7 @@ fn send_raw_ipv6(
         .unwrap_or(Ipv6Address::LOOPBACK);
 
     if !destination.is_loopback() && !destination.is_unspecified() {
-        if ipv6_addr_is_configured(dst_addr) {
-            return send_configured_icmpv6_echo(payload, protocol, src_addr, dst_addr, bytes, guard);
-        }
-        // Real external v6 destination: queue for the device-TX lane (mirror
-        // of the v4 external echo flow). Replies come back through the wire
-        // demux (PacketDispatch::Icmp6) into this raw socket.
-        return send_external_icmpv6_echo(socket, payload, protocol, src_addr, dst_addr, bytes);
+        return send_configured_icmpv6_echo(payload, protocol, src_addr, dst_addr, bytes, guard);
     }
 
     let packet = RawIpv6Packet {
@@ -652,41 +692,13 @@ fn send_raw_ipv6(
     };
 
     deliver_raw_ipv6_packet_to_table(
-        payload.socket_table(),
+        payload,
         protocol,
         dst_addr,
         bytes.first().copied(),
         packet,
         guard,
     );
-    StepOutcome::Done(bytes.len())
-}
-
-/// External (non-configured) v6 echo: parse the request and queue it for the
-/// device-TX lane, mirroring the v4 external flow through the generic reserve.
-fn send_external_icmpv6_echo(
-    socket: &Cap<SocketIdentity>,
-    payload: &SocketPayload,
-    protocol: ProtocolNumber,
-    src_addr: Ipv6Address,
-    dst_addr: Ipv6Address,
-    bytes: &[u8],
-) -> ByteStepOutcome<usize> {
-    if protocol != ProtocolNumber(58) {
-        return StepOutcome::Err(Errno::EOPNOTSUPP);
-    }
-    let request = match parse_icmpv6_payload_unchecked(src_addr, dst_addr, bytes) {
-        Icmpv6Event::EchoRequest(request) => request,
-        Icmpv6Event::Malformed => return StepOutcome::Err(Errno::EINVAL),
-        Icmpv6Event::EchoReply(_) | Icmpv6Event::Unsupported => {
-            return StepOutcome::Err(Errno::EOPNOTSUPP)
-        }
-    };
-    if payload.enqueue_icmp6_tx_echo(request).is_none() {
-        socket.readiness.clear_send(SendWireSet::SPACE);
-        return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
-    }
-    net_delegate_kick_poll();
     StepOutcome::Done(bytes.len())
 }
 
@@ -708,7 +720,7 @@ fn send_configured_icmpv6_echo(
         Icmpv6Event::EchoRequest(request) => request,
         Icmpv6Event::Malformed => return StepOutcome::Err(Errno::EINVAL),
         Icmpv6Event::EchoReply(_) | Icmpv6Event::Unsupported => {
-            return StepOutcome::Err(Errno::EOPNOTSUPP)
+            return StepOutcome::Err(Errno::EOPNOTSUPP);
         }
     };
     learn_configured_icmpv6_neighbor(payload, src_addr, dst_addr);
@@ -722,7 +734,7 @@ fn send_configured_icmpv6_echo(
     };
     let packet_type = reply_packet.payload.first().copied();
     deliver_raw_ipv6_packet_to_table(
-        payload.socket_table(),
+        payload,
         protocol,
         reply.dst,
         packet_type,
@@ -757,15 +769,15 @@ fn learn_configured_icmpv6_neighbor(
     );
 }
 
-pub(crate) fn deliver_raw_ipv6_packet_to_table(
-    table: &SocketTable,
+fn deliver_raw_ipv6_packet_to_table(
+    payload: &SocketPayload,
     protocol: ProtocolNumber,
     dst_addr: Ipv6Address,
     packet_type: Option<u8>,
     packet: RawIpv6Packet,
     guard: &Guard<'_>,
 ) {
-    for target in table.snapshot_raw_icmp(guard) {
+    for target in payload.socket_table().snapshot_raw_icmp(guard) {
         if target.kind != SocketKind::RawIcmp {
             continue;
         }
@@ -793,7 +805,9 @@ pub(crate) fn deliver_raw_ipv6_packet_to_table(
             continue;
         }
         if target_payload.record_raw_ipv6_packet(packet.clone()) {
-            target.readiness.fire_recv(RecvWireSet::HAS_DATA);
+            target
+                .readiness
+                .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| mailbox.post(event));
         }
     }
 }
@@ -884,6 +898,20 @@ fn preferred_ipv4_source_for(
             })
             .and_then(|link| link.ipv4_addr)
     })
+}
+
+fn raw_icmpv4_route_uses_gateway(payload: &SocketPayload, dst: Ipv4Address) -> bool {
+    payload
+        .net_namespace()
+        .best_ipv4_route(dst)
+        .is_some_and(|route| route.next_hop != dst)
+}
+
+fn raw_icmpv4_route_uses_device(payload: &SocketPayload, dst: Ipv4Address) -> bool {
+    payload
+        .net_namespace()
+        .best_ipv4_route(dst)
+        .is_some_and(|route| route.kind == crate::net::NetNamespaceRouteKind::Connected)
 }
 
 /// Auto-create an ARP/neighbor entry for the pinged IPv4 dst (mirrors
@@ -977,7 +1005,8 @@ fn send_unix_stream_bytes(
         return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
     };
     if became_readable {
-        peer.readiness.fire_recv(RecvWireSet::HAS_DATA);
+        peer.readiness
+            .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| mailbox.post(event));
     }
     StepOutcome::Done(bytes.len())
 }
@@ -1014,7 +1043,10 @@ fn send_sctp_stream_bytes(
                     Some(local),
                 ) {
                     if became_readable {
-                        peer.readiness.fire_recv(RecvWireSet::HAS_DATA);
+                        peer.readiness
+                            .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| {
+                                mailbox.post(event)
+                            });
                     }
                     return StepOutcome::Done(bytes.len());
                 }
@@ -1046,7 +1078,8 @@ fn send_sctp_stream_bytes(
         return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
     };
     if became_readable {
-        peer.readiness.fire_recv(RecvWireSet::HAS_DATA);
+        peer.readiness
+            .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| mailbox.post(event));
     }
     StepOutcome::Done(bytes.len())
 }
@@ -1174,7 +1207,11 @@ pub fn step_send_sctp_seqpacket(
                 offset = end;
             }
             if fired {
-                socket.readiness.fire_recv(RecvWireSet::HAS_DATA);
+                socket
+                    .readiness
+                    .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| {
+                        mailbox.post(event)
+                    });
             }
         }
         return StepOutcome::Done(bytes.len());
@@ -1208,7 +1245,11 @@ pub fn step_send_sctp_seqpacket(
                 return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
             };
             if became_readable {
-                peeled.readiness.fire_recv(RecvWireSet::HAS_DATA);
+                peeled
+                    .readiness
+                    .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| {
+                        mailbox.post(event)
+                    });
             }
             return StepOutcome::Done(bytes.len());
         }
@@ -1241,7 +1282,8 @@ pub fn step_send_sctp_seqpacket(
         return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
     };
     if became_readable {
-        peer.readiness.fire_recv(RecvWireSet::HAS_DATA);
+        peer.readiness
+            .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| mailbox.post(event));
     }
 
     // SCTP_AUTOCLOSE: a 1-to-many association closes after `autoclose` idle
@@ -1256,7 +1298,11 @@ pub fn step_send_sctp_seqpacket(
                 .record_sctp_message(bytes, true, 0, 0, Some(dst))
                 .is_some()
             {
-                socket.readiness.fire_recv(RecvWireSet::HAS_DATA);
+                socket
+                    .readiness
+                    .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| {
+                        mailbox.post(event)
+                    });
             }
         }
         let peer_assoc_id = peer_payload.sctp_assoc_id_for_peer(source).unwrap_or(0);
@@ -1267,7 +1313,10 @@ pub fn step_send_sctp_seqpacket(
                 .record_sctp_message(bytes, true, 0, 0, Some(source))
                 .is_some()
             {
-                peer.readiness.fire_recv(RecvWireSet::HAS_DATA);
+                peer.readiness
+                    .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| {
+                        mailbox.post(event)
+                    });
             }
         }
         payload.sctp_remove_assoc(my_assoc_id);

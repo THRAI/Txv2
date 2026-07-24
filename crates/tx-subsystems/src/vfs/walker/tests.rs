@@ -13,17 +13,21 @@ use crate::mount::{
 };
 use crate::tty::execution::{register_console_alias, register_hardware};
 use crate::tty::structure::TtyIdentity;
+use crate::vfs::FsOps;
 use crate::vfs::adapter::step_engine::{
-    guard, reserve_for, sign_for, ByteProgress, Cap, Errno as V3Errno, SpinMutex,
-    StepOutcome as V3, StepOutcome,
+    ByteProgress, Cap, Errno as V3Errno, SpinMutex, StepOutcome as V3, StepOutcome, guard,
+    reserve_for, sign, sign_for,
 };
 use crate::vfs::structure::{
     Credential, DEntry, FsObjectId, InlineName, InodeKind, InodeMeta, OpenFileFlags, RNode,
     RNodeBacking, S_IFDIR,
 };
-use crate::vfs::FsOps;
 
-use super::{step_open, step_walk, step_walk_in_mount_namespace, SYMLOOP_MAX};
+use super::{
+    SYMLOOP_MAX, step_open, step_open_in_mount_namespace, step_open_in_mount_namespace_with_mount,
+    step_open_in_mount_namespace_with_origin_mount, step_walk, step_walk_in_mount_namespace,
+    step_walk_in_mount_namespace_with_origin_mount,
+};
 
 // === capturing char-device binding for the console TTY ================
 
@@ -341,8 +345,11 @@ struct Topology {
 /// whose RNode has `with_containing_mount` wired so the walker can
 /// resolve the in-scope FsOps.
 fn build_rootfs() -> Topology {
-    let rootfs = TestFs::new(FsObjectId::new(2));
-    let root_id = FsObjectId::new(2);
+    build_rootfs_with_root_id(FsObjectId::new(2))
+}
+
+fn build_rootfs_with_root_id(root_id: FsObjectId) -> Topology {
+    let rootfs = TestFs::new(root_id);
 
     let payload = MountPayload::new_cap(
         rootfs.clone() as Arc<dyn crate::vfs::FsOps>,
@@ -369,14 +376,14 @@ fn build_rootfs() -> Topology {
     let root_mount = MountIdentity::new_cap(
         MountId::new(1),
         None,
-        root_rnode.clone(),
+        root_rnode,
         None,
         payload,
         MountFlags::empty(),
     )
     .expect("rootfs mount identity reservation");
 
-    let root_dentry = DEntry::new_cap(InlineName::ROOT, root_rnode).expect("rootfs root dentry");
+    let root_dentry = root_mount.root_dentry().clone();
 
     Topology {
         root_dentry,
@@ -402,7 +409,7 @@ fn install_console_tty() -> Cap<TtyIdentity> {
 /// returned `Cap<DEntry>` is the `/dev` mount-point dentry on rootfs
 /// (its `mounted_hint` is set to the devfs mount). The `console` TTY
 /// has been pre-registered so devfs's lookup can find it.
-fn mount_devfs_at_dev(topo: &Topology) -> (Cap<MountIdentity>, Cap<TtyIdentity>) {
+fn mount_devfs_at_dev(topo: &Topology) -> (Cap<MountIdentity>, Cap<TtyIdentity>, Arc<TestFs>) {
     // Build a "devfs"-shaped TestFs whose only child of root is
     // `console` (a CharDevice — but the walker's
     // `materialise_child_rnode` only handles `Directory` and
@@ -459,24 +466,26 @@ fn mount_devfs_at_dev(topo: &Topology) -> (Cap<MountIdentity>, Cap<TtyIdentity>)
         let res = reserve_for::<RNode>().expect("dev mount-point rnode");
         sign_for(res, raw)
     };
-    let dev_mount_point_dentry = DEntry::new_cap(
+    let mut dev_mount_point_raw = DEntry::new(
         InlineName::new(b"dev").expect("dev inline name"),
         dev_mount_point_rnode,
-    )
-    .expect("dev mount-point dentry");
+    );
+    dev_mount_point_raw.set_parent_hint(&topo.root_dentry);
+    let dev_mount_point_dentry = sign(dev_mount_point_raw).expect("dev mount-point dentry");
+    topo.root_dentry.cache_child(dev_mount_point_dentry.clone());
 
     let dev_mount = MountIdentity::new_cap(
         MountId::new(2),
         Some(dev_mount_point_dentry.clone()),
         devfs_root_rnode,
-        None,
+        Some(topo.root_mount.clone()),
         dev_payload,
         MountFlags::empty(),
     )
     .expect("devfs mount identity");
 
     let tty = install_console_tty();
-    (dev_mount, tty)
+    (dev_mount, tty, devfs)
 }
 
 // === tests ============================================================
@@ -690,7 +699,7 @@ fn step_walk_crosses_mount_point_at_dev() {
     init_zones();
     crate::mount::reset_mount_table_for_test();
     let topo = build_rootfs();
-    let (dev_mount, _tty) = mount_devfs_at_dev(&topo);
+    let (dev_mount, _tty, _devfs) = mount_devfs_at_dev(&topo);
 
     // Find the rootfs's MountPayload Cap and the FsObjectId of /dev
     // on rootfs. These form the (parent_payload, child_fs_object_id)
@@ -733,32 +742,23 @@ fn step_walk_crosses_mount_point_at_dev() {
 }
 
 #[test]
-fn step_walk_uses_mount_namespace_table_before_global_fallback() {
+fn step_walk_uses_mount_namespace_table_without_global_fallback() {
     let _serial = crate::test_support::EPOCH_TEST_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     init_zones();
     crate::mount::reset_mount_table_for_test();
     let topo = build_rootfs();
-    let (dev_mount, _tty) = mount_devfs_at_dev(&topo);
+    let (dev_mount, _tty, _devfs) = mount_devfs_at_dev(&topo);
 
-    let root_dev_id =
-        match <TestFs as FsOps>::lookup(&*topo.rootfs, FsObjectId::new(2), b"dev", &guard()) {
-            V3::Done(id) => id,
-            other => panic!("rootfs lookup(dev) failed: {other:?}"),
-        };
-    let rootfs_payload = topo
-        .root_dentry
-        .rnode()
-        .containing_mount_weak()
-        .expect("root rnode has containing_mount")
-        .upgrade(&guard())
-        .expect("rootfs payload upgrade");
     let ns_with_mount =
         crate::mount::MountNamespace::new_cap(topo.root_mount.clone()).expect("ns cap");
     let ns_without_mount =
         crate::mount::MountNamespace::new_cap(topo.root_mount.clone()).expect("ns cap");
-    ns_with_mount.register_mount(&rootfs_payload, root_dev_id, dev_mount);
+    ns_with_mount.register_mount(
+        &dev_mount.mountpoint().expect("dev mountpoint"),
+        dev_mount.clone(),
+    );
 
     let cred = Credential::root();
     let guard = guard();
@@ -786,17 +786,438 @@ fn step_walk_uses_mount_namespace_table_before_global_fallback() {
         V3::Err(V3Errno::ENOENT) => {}
         other => panic!("expected namespace without mount to hide /dev contents, got {other:?}"),
     }
+
+    let flags = OpenFileFlags {
+        read: true,
+        write: false,
+        append: false,
+        cloexec: false,
+        nonblocking: false,
+        packet: false,
+    };
+    let guard = crate::vfs::adapter::step_engine::guard();
+    let opened = match step_open_in_mount_namespace_with_mount(
+        topo.root_dentry.clone(),
+        b"/dev/consoledir",
+        flags,
+        0,
+        &cred,
+        &ns_with_mount,
+        &guard,
+    ) {
+        V3::Done(opened) => opened,
+        other => panic!("namespace-local open with mount failed: {other:?}"),
+    };
+    assert_eq!(opened.mount.key(), dev_mount.key());
 }
 
 #[test]
-fn run_walker_resume_preserves_mount_namespace() {
+fn namespace_aware_open_uses_each_namespaces_root_for_absolute_paths() {
+    let _serial = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_zones();
+    crate::mount::reset_mount_table_for_test();
+
+    let topo_a = build_rootfs();
+    let a_id = topo_a.rootfs.add_dir(FsObjectId::new(2), b"shared");
+    let ns_a =
+        crate::mount::MountNamespace::new_cap(topo_a.root_mount.clone()).expect("namespace A");
+
+    let topo_b = build_rootfs();
+    topo_b.rootfs.add_dir(FsObjectId::new(2), b"padding");
+    let b_id = topo_b.rootfs.add_dir(FsObjectId::new(2), b"shared");
+    let ns_b =
+        crate::mount::MountNamespace::new_cap(topo_b.root_mount.clone()).expect("namespace B");
+    assert_ne!(a_id, b_id, "fixture must distinguish namespace roots");
+
+    let flags = OpenFileFlags {
+        read: true,
+        write: false,
+        append: false,
+        cloexec: false,
+        nonblocking: false,
+        packet: false,
+    };
+    let cred = Credential::root();
+    let guard = guard();
+
+    // Deliberately pass the other namespace's root as the cwd anchor. An
+    // absolute path must ignore it and start from the supplied namespace root.
+    let file_a = match step_open_in_mount_namespace_with_mount(
+        topo_b.root_dentry.clone(),
+        b"/shared",
+        flags,
+        0,
+        &cred,
+        &ns_a,
+        &guard,
+    ) {
+        V3::Done(file) => file,
+        other => panic!("namespace A absolute open failed: {other:?}"),
+    };
+    let file_b = match step_open_in_mount_namespace_with_mount(
+        topo_a.root_dentry.clone(),
+        b"/shared",
+        flags,
+        0,
+        &cred,
+        &ns_b,
+        &guard,
+    ) {
+        V3::Done(file) => file,
+        other => panic!("namespace B absolute open failed: {other:?}"),
+    };
+
+    assert_eq!(file_a.open_file.rnode().fs_object_id(), a_id);
+    assert_eq!(file_b.open_file.rnode().fs_object_id(), b_id);
+    assert_eq!(file_a.mount.key(), topo_a.root_mount.key());
+    assert_eq!(file_b.mount.key(), topo_b.root_mount.key());
+}
+
+#[test]
+fn namespace_aware_open_absolute_symlink_uses_supplied_namespace_root() {
+    let _serial = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_zones();
+    crate::mount::reset_mount_table_for_test();
+
+    let topo_a = build_rootfs();
+    let a_target = topo_a.rootfs.add_dir(FsObjectId::new(2), b"target");
+    topo_a
+        .rootfs
+        .add_symlink(FsObjectId::new(2), b"jump", b"/target");
+    let ns_a =
+        crate::mount::MountNamespace::new_cap(topo_a.root_mount.clone()).expect("namespace A");
+
+    let topo_b = build_rootfs();
+    topo_b.rootfs.add_dir(FsObjectId::new(2), b"padding");
+    let b_target = topo_b.rootfs.add_dir(FsObjectId::new(2), b"target");
+    topo_b
+        .rootfs
+        .add_symlink(FsObjectId::new(2), b"jump", b"/target");
+    let ns_b =
+        crate::mount::MountNamespace::new_cap(topo_b.root_mount.clone()).expect("namespace B");
+    assert_ne!(a_target, b_target, "fixture must distinguish targets");
+
+    let flags = OpenFileFlags {
+        read: true,
+        write: false,
+        append: false,
+        cloexec: false,
+        nonblocking: false,
+        packet: false,
+    };
+    let cred = Credential::root();
+    let guard = guard();
+    let file_a = match step_open_in_mount_namespace_with_mount(
+        topo_b.root_dentry.clone(),
+        b"/jump",
+        flags,
+        0,
+        &cred,
+        &ns_a,
+        &guard,
+    ) {
+        V3::Done(file) => file,
+        other => panic!("namespace A absolute symlink open failed: {other:?}"),
+    };
+    let file_b = match step_open_in_mount_namespace_with_mount(
+        topo_a.root_dentry.clone(),
+        b"/jump",
+        flags,
+        0,
+        &cred,
+        &ns_b,
+        &guard,
+    ) {
+        V3::Done(file) => file,
+        other => panic!("namespace B absolute symlink open failed: {other:?}"),
+    };
+
+    assert_eq!(file_a.open_file.rnode().fs_object_id(), a_target);
+    assert_eq!(file_b.open_file.rnode().fs_object_id(), b_target);
+    assert_eq!(file_a.mount.key(), topo_a.root_mount.key());
+    assert_eq!(file_b.mount.key(), topo_b.root_mount.key());
+}
+
+#[test]
+fn namespace_walk_dotdot_crosses_child_mount_when_root_inode_ids_match() {
+    let _serial = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_zones();
+    crate::mount::reset_mount_table_for_test();
+    let topo = build_rootfs_with_root_id(FsObjectId::ROOT);
+    topo.rootfs.add_dir(FsObjectId::ROOT, b"mnt");
+
+    let cred = Credential::root();
+    let guard = guard();
+    let mountpoint = match step_walk(topo.root_dentry.clone(), b"/mnt", &cred, &guard) {
+        V3::Done(dentry) => dentry,
+        other => panic!("resolve mountpoint failed: {other:?}"),
+    };
+
+    let child_fs = TestFs::new(FsObjectId::ROOT);
+    let child_payload = MountPayload::new_cap(
+        child_fs.clone() as Arc<dyn crate::vfs::FsOps>,
+        child_fs as Arc<dyn crate::page_backed::FsPageBacking>,
+        None,
+        DevId::new(77),
+        MountOptions::default(),
+        "testfs-child",
+        SourceLabel::Static("child"),
+    )
+    .expect("child payload");
+    let child_root = {
+        let raw = RNode::new(
+            FsObjectId::ROOT,
+            InodeMeta::new(InodeKind::Directory, S_IFDIR | 0o755),
+            RNodeBacking::Directory,
+        )
+        .with_containing_mount(&child_payload);
+        let res = reserve_for::<RNode>().expect("child root reservation");
+        sign_for(res, raw)
+    };
+    let child_mount = MountIdentity::new_cap(
+        MountId::new(77),
+        Some(mountpoint.clone()),
+        child_root,
+        Some(topo.root_mount.clone()),
+        child_payload,
+        MountFlags::empty(),
+    )
+    .expect("child mount");
+    let namespace =
+        crate::mount::MountNamespace::new_cap(topo.root_mount.clone()).expect("namespace");
+    namespace.register_mount(&mountpoint, child_mount.clone());
+
+    let resolved = step_walk_in_mount_namespace(
+        topo.root_dentry.clone(),
+        b"/mnt/..",
+        &cred,
+        &namespace,
+        &guard,
+    );
+    match resolved {
+        V3::Done(dentry) => assert_eq!(dentry.key(), topo.root_dentry.key()),
+        other => panic!("dotdot crossing failed: {other:?}"),
+    }
+    let flags = OpenFileFlags {
+        read: true,
+        write: false,
+        append: false,
+        cloexec: false,
+        nonblocking: false,
+        packet: false,
+    };
+    let opened = match step_open_in_mount_namespace_with_mount(
+        topo.root_dentry.clone(),
+        b"/mnt/..",
+        flags,
+        0,
+        &cred,
+        &namespace,
+        &guard,
+    ) {
+        V3::Done(opened) => opened,
+        other => panic!("dotdot open with mount failed: {other:?}"),
+    };
+    assert_eq!(opened.mount.key(), topo.root_mount.key());
+}
+
+#[test]
+fn namespace_open_symlinks_preserve_relative_and_reset_absolute_mount_witness() {
     let _serial = crate::test_support::EPOCH_TEST_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     init_zones();
     crate::mount::reset_mount_table_for_test();
     let topo = build_rootfs();
-    let (dev_mount, _tty) = mount_devfs_at_dev(&topo);
+    let root_target = topo.rootfs.add_dir(FsObjectId::new(2), b"root-target");
+    let (dev_mount, _tty, devfs) = mount_devfs_at_dev(&topo);
+    devfs.add_symlink(FsObjectId::new(0x6465_7600), b"jump", b"consoledir");
+    devfs.add_symlink(FsObjectId::new(0x6465_7600), b"abs-jump", b"/root-target");
+    let namespace =
+        crate::mount::MountNamespace::new_cap(topo.root_mount.clone()).expect("namespace");
+    namespace.register_mount(
+        &dev_mount.mountpoint().expect("dev mountpoint"),
+        dev_mount.clone(),
+    );
+    let flags = OpenFileFlags {
+        read: true,
+        write: false,
+        append: false,
+        cloexec: false,
+        nonblocking: false,
+        packet: false,
+    };
+    let cred = Credential::root();
+    let guard = guard();
+    let opened = match step_open_in_mount_namespace_with_mount(
+        topo.root_dentry.clone(),
+        b"/dev/jump",
+        flags,
+        0,
+        &cred,
+        &namespace,
+        &guard,
+    ) {
+        V3::Done(opened) => opened,
+        other => panic!("relative symlink open failed: {other:?}"),
+    };
+    assert_eq!(
+        opened.open_file.rnode().fs_object_id().as_u64(),
+        0x6465_7601
+    );
+    assert_eq!(opened.mount.key(), dev_mount.key());
+
+    let absolute = match step_open_in_mount_namespace_with_mount(
+        topo.root_dentry.clone(),
+        b"/dev/abs-jump",
+        flags,
+        0,
+        &cred,
+        &namespace,
+        &guard,
+    ) {
+        V3::Done(opened) => opened,
+        other => panic!("absolute symlink open failed: {other:?}"),
+    };
+    assert_eq!(absolute.open_file.rnode().fs_object_id(), root_target);
+    assert_eq!(absolute.mount.key(), topo.root_mount.key());
+
+    let relative_from_child = match step_open_in_mount_namespace_with_origin_mount(
+        dev_mount.root_dentry().clone(),
+        &dev_mount,
+        b"consoledir",
+        flags,
+        0,
+        &cred,
+        &namespace,
+        &guard,
+    ) {
+        V3::Done(opened) => opened,
+        other => panic!("relative child-cwd open failed: {other:?}"),
+    };
+    assert_eq!(relative_from_child.mount.key(), dev_mount.key());
+
+    let walked_dotdot = match step_walk_in_mount_namespace_with_origin_mount(
+        dev_mount.root_dentry().clone(),
+        &dev_mount,
+        b"..",
+        &cred,
+        &namespace,
+        &guard,
+    ) {
+        V3::Done(resolved) => resolved,
+        other => panic!(
+            "relative child-cwd dotdot walk failed: {other:?}; diag={:?}",
+            crate::vfs::resolution::diagnostic::last_ctx()
+        ),
+    };
+    assert_eq!(walked_dotdot.dentry.key(), topo.root_dentry.key());
+    assert_eq!(walked_dotdot.mount.key(), topo.root_mount.key());
+
+    let detached_namespace =
+        crate::mount::MountNamespace::new_cap(topo.root_mount.clone()).expect("setns namespace");
+    let origin_held = match step_open_in_mount_namespace_with_origin_mount(
+        dev_mount.root_dentry().clone(),
+        &dev_mount,
+        b"jump",
+        flags,
+        0,
+        &cred,
+        &detached_namespace,
+        &guard,
+    ) {
+        V3::Done(opened) => opened,
+        other => panic!("origin-held detached cwd open failed: {other:?}"),
+    };
+    assert_eq!(origin_held.mount.key(), dev_mount.key());
+}
+
+#[test]
+fn namespace_walk_dotdot_does_not_use_global_only_mount_root() {
+    let _serial = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_zones();
+    crate::mount::reset_mount_table_for_test();
+    let topo = build_rootfs();
+    topo.rootfs.add_dir(FsObjectId::new(2), b"global");
+
+    let cred = Credential::root();
+    let guard = guard();
+    let mountpoint = match step_walk(topo.root_dentry.clone(), b"/global", &cred, &guard) {
+        V3::Done(dentry) => dentry,
+        other => panic!("resolve global mountpoint failed: {other:?}"),
+    };
+    let child_fs = TestFs::new(FsObjectId::ROOT);
+    let child_payload = MountPayload::new_cap(
+        child_fs.clone() as Arc<dyn crate::vfs::FsOps>,
+        child_fs as Arc<dyn crate::page_backed::FsPageBacking>,
+        None,
+        DevId::new(78),
+        MountOptions::default(),
+        "global-only-child",
+        SourceLabel::Static("global-only"),
+    )
+    .expect("child payload");
+    let child_root = {
+        let raw = RNode::new(
+            FsObjectId::ROOT,
+            InodeMeta::new(InodeKind::Directory, S_IFDIR | 0o755),
+            RNodeBacking::Directory,
+        )
+        .with_containing_mount(&child_payload);
+        let res = reserve_for::<RNode>().expect("child root reservation");
+        sign_for(res, raw)
+    };
+    let child_mount = MountIdentity::new_cap(
+        MountId::new(78),
+        Some(mountpoint.clone()),
+        child_root,
+        Some(topo.root_mount.clone()),
+        child_payload,
+        MountFlags::empty(),
+    )
+    .expect("global-only child mount");
+    crate::mount::register_mount(
+        &topo
+            .root_mount
+            .payload_cap()
+            .expect("root payload")
+            .into_cap(),
+        mountpoint.rnode().fs_object_id(),
+        child_mount.clone(),
+    );
+    let namespace =
+        crate::mount::MountNamespace::new_cap(topo.root_mount.clone()).expect("namespace");
+
+    let resolved = step_walk_in_mount_namespace(
+        child_mount.root_dentry().clone(),
+        b"..",
+        &cred,
+        &namespace,
+        &guard,
+    );
+    match resolved {
+        V3::Done(dentry) => assert_eq!(dentry.key(), child_mount.root_dentry().key()),
+        other => panic!("namespace-aware dotdot failed: {other:?}"),
+    }
+}
+
+#[test]
+fn namespace_aware_open_does_not_fall_back_to_global_mount_table() {
+    let _serial = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_zones();
+    crate::mount::reset_mount_table_for_test();
+    let topo = build_rootfs();
+    let (dev_mount, _tty, _devfs) = mount_devfs_at_dev(&topo);
 
     let root_dev_id =
         match <TestFs as FsOps>::lookup(&*topo.rootfs, FsObjectId::new(2), b"dev", &guard()) {
@@ -810,12 +1231,54 @@ fn run_walker_resume_preserves_mount_namespace() {
         .expect("root rnode has containing_mount")
         .upgrade(&guard())
         .expect("rootfs payload upgrade");
+    crate::mount::register_mount(&rootfs_payload, root_dev_id, dev_mount);
+
+    let namespace =
+        crate::mount::MountNamespace::new_cap(topo.root_mount.clone()).expect("isolated namespace");
+    let flags = OpenFileFlags {
+        read: true,
+        write: false,
+        append: false,
+        cloexec: false,
+        nonblocking: false,
+        packet: false,
+    };
+    let cred = Credential::root();
+    let guard = guard();
+    let outcome = step_open_in_mount_namespace(
+        topo.root_dentry.clone(),
+        b"/dev/consoledir",
+        flags,
+        0,
+        &cred,
+        &namespace,
+        &guard,
+    );
+
+    match outcome {
+        V3::Err(V3Errno::ENOENT) => {}
+        other => panic!("namespace-aware open leaked the global mount: {other:?}"),
+    }
+}
+
+#[test]
+fn run_walker_resume_preserves_mount_namespace() {
+    let _serial = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_zones();
+    crate::mount::reset_mount_table_for_test();
+    let topo = build_rootfs();
+    let (dev_mount, _tty, devfs) = mount_devfs_at_dev(&topo);
+
     let ns_with_mount =
         crate::mount::MountNamespace::new_cap(topo.root_mount.clone()).expect("ns cap");
-    ns_with_mount.register_mount(&rootfs_payload, root_dev_id, dev_mount);
+    ns_with_mount.register_mount(
+        &dev_mount.mountpoint().expect("dev mountpoint"),
+        dev_mount.clone(),
+    );
 
-    topo.rootfs
-        .yield_next_lookup(FsObjectId::new(2), b"dev", 0x61, 0x01);
+    devfs.yield_next_lookup(FsObjectId::new(0x6465_7600), b"consoledir", 0x61, 0x01);
 
     let cred = Credential::root();
     let first_guard = guard();
@@ -851,6 +1314,10 @@ fn run_walker_resume_preserves_mount_namespace() {
         resolved.rnode.fs_object_id().as_u64() > 0x6465_7600,
         "expected devfs namespace object after resume, got {:?}",
         resolved.rnode.fs_object_id()
+    );
+    assert_eq!(
+        resolved.mount.expect("resumed mount witness").key(),
+        dev_mount.key()
     );
 }
 

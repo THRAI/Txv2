@@ -140,6 +140,36 @@ fn submitted_task_reports_queue_and_turn_at_publish_point() {
 }
 
 #[test]
+fn signal_delivery_hint_prioritizes_already_queued_userspace_task() {
+    let mut scheduler = Phase1Scheduler::new();
+    let aux = TaskId(74);
+    let worker = TaskId(75);
+
+    scheduler.task_submitted(
+        aux,
+        TaskHandle::new(aux),
+        InitialSchedMeta::fair()
+            .userspace_thread()
+            .preempted_on_submit(),
+    );
+    scheduler.task_submitted(
+        worker,
+        TaskHandle::new(worker),
+        InitialSchedMeta::fair()
+            .userspace_thread()
+            .preempted_on_submit(),
+    );
+
+    scheduler.task_runnable(worker, WakeHint::SignalDelivery);
+
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|(task, _)| task),
+        Some(worker),
+        "thread-directed signal delivery should let an already queued worker run before older preempted peers"
+    );
+}
+
+#[test]
 fn submitted_movable_fair_tasks_spread_across_allowed_harts() {
     let mut scheduler = Phase1Scheduler::new();
     let first = TaskId(23);
@@ -1107,6 +1137,54 @@ fn idle_hart_steals_preempted_task_when_affinity_allows() {
     assert_eq!(
         pick_id_and_slice(&mut scheduler, HartId(1)).map(|x| x.0),
         Some(task)
+    );
+}
+
+#[test]
+fn timer_style_wake_after_steal_targets_last_owner_hart() {
+    let mut scheduler = Phase1Scheduler::new();
+    let task = submit_fair_affinity(&mut scheduler, 41, 0b0011);
+
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(0)).map(|x| x.0),
+        Some(task)
+    );
+    scheduler.task_stopped(
+        task,
+        StopReason::SliceExpired,
+        Phase1Scheduler::NEW_QUEUE_SLICE_NS,
+        HartId(0),
+    );
+    assert_eq!(
+        scheduler.try_steal(HartId(1), HartId(0)).map(|h| h.id()),
+        Some(task)
+    );
+    assert_eq!(
+        pick_id_and_slice(&mut scheduler, HartId(1)).map(|x| x.0),
+        Some(task)
+    );
+
+    scheduler.task_stopped(task, StopReason::Blocked, 0, HartId(1));
+    assert_eq!(scheduler.task_owner(task), Some(TaskRunOwner::Parked));
+
+    let placement = scheduler
+        .task_runnable_from(task, WakeHint::Normal, HartId(0))
+        .expect("timer-style wake should make the parked task runnable");
+    assert_eq!(
+        placement.target_hart,
+        HartId(1),
+        "wake must route to the post-steal owner hart, not the firing hart",
+    );
+    assert!(
+        placement.wake_remote,
+        "a timer firing on hart0 should send a remote reschedule to hart1",
+    );
+    assert_eq!(
+        scheduler.task_owner(task),
+        Some(TaskRunOwner::Queued {
+            hart: HartId(1),
+            queue: Phase1QueueKind::Preempted,
+        })
     );
 }
 

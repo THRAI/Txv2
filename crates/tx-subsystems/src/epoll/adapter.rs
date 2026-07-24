@@ -16,12 +16,7 @@ pub mod step_engine {
         YieldShape,
     };
     pub use tx_substrate::wake::WaitSource;
-    pub use tx_substrate::zone::{
-        reserve_for, sign, sign_for, Cap, CapProducingPolicy, CoLocatedEntity, Dead, Entity,
-        IdentRef, IdentitySlot, IsPayloadPolicy, ObserverNodePolicy, OperationalCapExt,
-        OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy, RetainedEntityPolicy, Weak,
-        Zone, ZoneAllocated, ZoneError, ZonePolicy,
-    };
+    pub use tx_substrate::zone::{Cap, Zone, ZoneAllocated, ZoneError};
 
     pub fn register_zone_for<T: ZoneAllocated>() -> Result<(), ZoneError> {
         zone::register_zone_for::<T>().map(|_| ())
@@ -31,8 +26,6 @@ pub mod step_engine {
 #[platform_adapter(
     platform = "reactor",
     domain = "wait_routing",
-    reason = "wrap reactor Channel/Mask as epoll legacy wake verbs"
+    reason = "reserved epoll reactor wait-routing adapter boundary; no current public re-exports"
 )]
-pub mod wait_routing {
-    pub use tx_reactor::wait::{Channel, Mask};
-}
+pub mod wait_routing {}

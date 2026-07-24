@@ -18,6 +18,7 @@ pub mod adapter;
 pub mod agent_reply;
 pub mod ast;
 pub mod completion;
+mod deadline_registry;
 pub mod dispatch;
 pub mod hart_loop;
 pub mod interrupt;
@@ -28,7 +29,6 @@ pub mod scheduler;
 pub(crate) mod spin_lock;
 pub mod sync_coord;
 pub mod task;
-pub mod timer;
 pub mod userspace;
 pub mod wait;
 pub mod wait_source;
@@ -53,9 +53,8 @@ pub use scheduler::{
     WakeHint,
 };
 pub use task::{
-    current_delegate_registry, current_task_mailbox, current_timer_wheel, TaskDrainRecord, TaskId,
-    TaskKey, TaskLifecycleError, TaskStatus,
+    current_deadline_registrar, current_delegate_registry, current_task_mailbox, TaskDrainRecord,
+    TaskId, TaskKey, TaskLifecycleError, TaskStatus,
 };
-pub use timer::{DeadlineFuture, TimerGuard, TimerGuardRole, TimerToken, TimerWheel};
 pub use wait_source::{PreparedWaitRegistration, SubscriberId, WaitRegistrationGuard, WaitSource};
 pub use yield_now::{yield_now, YieldNow};

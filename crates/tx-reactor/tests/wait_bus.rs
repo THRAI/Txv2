@@ -277,7 +277,7 @@ fn declared_channel_empty_interest_matches_raw_wait_behavior() {
 }
 
 #[test]
-fn reactor_declared_channel_uses_timer_queue_for_timeouts() {
+fn reactor_declared_channel_uses_timer_registry_for_timeouts() {
     let reactor = Reactor::new();
     let channel = reactor
         .declared_channel(WireDeclaration::<DeclaredWaitEvent>::port(
@@ -430,7 +430,7 @@ fn declared_readiness_channel_empty_interest_matches_raw_wait_behavior() {
 }
 
 #[test]
-fn reactor_declared_readiness_channel_uses_timer_queue_for_timeouts() {
+fn reactor_declared_readiness_channel_uses_timer_registry_for_timeouts() {
     let reactor = Reactor::new();
     let channel = reactor
         .declared_readiness_channel(WireDeclaration::<DeclaredReadiness>::queue(

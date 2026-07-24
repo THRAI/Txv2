@@ -3,7 +3,6 @@
 extern crate alloc;
 
 pub mod adapter;
-pub mod mmc;
 mod sync;
 pub mod virtio;
 

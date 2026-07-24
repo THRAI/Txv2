@@ -84,6 +84,46 @@ impl CpuPinGuard {
     }
 }
 
+/// RAII token that masks ordinary interrupt-driven execution on the current CPU.
+///
+/// This guard covers maskable local IRQ admission only. It does not mask NMI-like
+/// events, pin the CPU, or make yielding/migration safe. CPU affinity remains
+/// the responsibility of [`CpuPinGuard`].
+#[derive(Debug)]
+#[must_use]
+pub struct LocalExecutionGuard {
+    restore: unsafe fn(usize),
+    saved_state: usize,
+    _not_send_sync: PhantomData<*mut ()>,
+}
+
+impl LocalExecutionGuard {
+    /// Construct a guard from an already-saved and already-disabled platform
+    /// state.
+    ///
+    /// # Safety
+    ///
+    /// `restore(saved_state)` must restore exactly the maskable local interrupt
+    /// state captured by the matching exclusion operation. The callback runs
+    /// once on the CPU that drops this non-transferable guard. The caller must
+    /// ensure the guard cannot cross a yield or CPU migration point.
+    pub const unsafe fn new(saved_state: usize, restore: unsafe fn(usize)) -> Self {
+        Self {
+            restore,
+            saved_state,
+            _not_send_sync: PhantomData,
+        }
+    }
+}
+
+impl Drop for LocalExecutionGuard {
+    fn drop(&mut self) {
+        unsafe {
+            (self.restore)(self.saved_state);
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BootArg(pub usize);
 
@@ -145,6 +185,104 @@ impl PhysRange {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BootProtocol {
+    RiscvSbi,
+    RiscvDirect,
+    LoongArchFirmware,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BootHandoff {
+    pub cpu_id: CpuId,
+    pub firmware_arg: BootArg,
+    pub protocol: BootProtocol,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BootInfo {
+    pub memory_regions: &'static [MemoryRegion],
+    pub kernel_image: PhysRange,
+    pub initrd: Option<PhysRange>,
+    pub cmdline: Option<&'static str>,
+}
+
+impl BootInfo {
+    pub const fn empty() -> Self {
+        Self {
+            memory_regions: &[],
+            kernel_image: PhysRange::empty(),
+            initrd: None,
+            cmdline: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MemoryRegion {
+    pub base: PhysAddr,
+    pub size: usize,
+    pub kind: MemoryRegionKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MemoryRegionKind {
+    Usable,
+    Reserved,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpiSdInfo {
+    pub controller: &'static str,
+    pub chip_select: u8,
+    pub mode: u8,
+    pub max_hz: u32,
+    pub qemu_backing: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MmioFlags(pub u32);
+
+impl MmioFlags {
+    pub const DEVICE_NGNRNE: Self = Self(1 << 0);
+    pub const DEVICE_NGNRE: Self = Self(1 << 1);
+    pub const READ: Self = Self(1 << 2);
+    pub const WRITE: Self = Self(1 << 3);
+
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MmioRegion {
+    pub name: &'static str,
+    pub phys: PhysRange,
+    pub virt: VirtRange,
+    pub flags: MmioFlags,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PlatformInfo {
+    pub board: &'static str,
+    pub spi_sd: Option<SpiSdInfo>,
+    pub mmio_regions: &'static [MmioRegion],
+    pub timebase_frequency_hz: u64,
+    pub possible_cpu_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArchAuxvFacts {
     pub page_size: usize,
     pub hwcap: u64,
@@ -176,27 +314,26 @@ pub const RISCV_HWCAP_IMAFDC: u64 = RISCV_HWCAP_ISA_I
     | RISCV_HWCAP_ISA_D
     | RISCV_HWCAP_ISA_C;
 
-/// 平台编译期常量表：默认值是占位（多为 0），真值由每块板的 impl 覆盖。
 pub trait PlatformConfig {
-    const ARCH: Arch;                                 // 架构 Riscv64/LoongArch64，必填
-    const BOARD: &'static str;                        // 板名字符串，必填
-    const SUBSTRATE_BOOT_READY: bool = false;         // 启动是否已对接 substrate
-    const PAGE_SIZE: usize = 4096;                    // 一页字节数（分页最小单位）
-    const PAGE_SHIFT: usize = 12;                     // log2(页大小)，地址右移求页号
-    const PHYS_ADDR_BITS: u8 = 0;                     // 物理地址位数（riscv 56）
-    const VIRT_ADDR_BITS: u8 = 0;                     // 虚拟地址位数（riscv 39=Sv39）
-    const DIRECT_MAP_BASE: VirtAddr = VirtAddr(0);    // 直连区起点，虚拟=物理+此值
-    const DIRECT_MAP_SIZE: usize = 0;                 // 直连区大小（覆盖全物理内存，128GB）
-    const KERNEL_VIRT_BASE: VirtAddr = VirtAddr(0);   // 内核代码虚拟基址（住最高处）
-    const USER_TOP: VirtAddr = VirtAddr(0);           // 用户地址天花板（riscv 256GB）
-    const USER_RESERVED_TOP_SIZE: usize = 0;          // 顶部保留、不给用户的大小（4MB）
-    const USER_ALLOC_TOP: VirtAddr = Self::USER_TOP;  // 用户可分配上限=天花板-保留（派生）
-    const KERNEL_STACK_SIZE: usize = 0;               // 内核栈大小（riscv 128KB）
-    const KERNEL_STACK_ALIGN: usize = Self::PAGE_SIZE; // 内核栈对齐（页对齐）
-    const PAGE_TABLE_LEVELS: u8 = 0;                  // 页表层数（riscv Sv39 = 3 级）
-    const ASID_BITS: u8 = 0;                          // ASID 位数，切进程免清整个 TLB（16）
-    const CACHE_LINE_SIZE: usize = 0;                 // 缓存行字节数，防多核伪共享（64）
-    const DMA_COHERENT: bool = false;                 // DMA 是否与缓存一致，false 需手动刷
+    const ARCH: Arch;
+    const BOARD: &'static str;
+    const SUBSTRATE_BOOT_READY: bool = false;
+    const PAGE_SIZE: usize = 4096;
+    const PAGE_SHIFT: usize = 12;
+    const PHYS_ADDR_BITS: u8 = 0;
+    const VIRT_ADDR_BITS: u8 = 0;
+    const DIRECT_MAP_BASE: VirtAddr = VirtAddr(0);
+    const DIRECT_MAP_SIZE: usize = 0;
+    const KERNEL_VIRT_BASE: VirtAddr = VirtAddr(0);
+    const USER_TOP: VirtAddr = VirtAddr(0);
+    const USER_RESERVED_TOP_SIZE: usize = 0;
+    const USER_ALLOC_TOP: VirtAddr = Self::USER_TOP;
+    const KERNEL_STACK_SIZE: usize = 0;
+    const KERNEL_STACK_ALIGN: usize = Self::PAGE_SIZE;
+    const PAGE_TABLE_LEVELS: u8 = 0;
+    const ASID_BITS: u8 = 0;
+    const CACHE_LINE_SIZE: usize = 0;
+    const DMA_COHERENT: bool = false;
 }
 
 pub trait BootPlatformIf {
@@ -220,21 +357,12 @@ pub trait InitIf {
     fn init_later_secondary(_cpu_id: CpuId) {}
 }
 
-/// 读取端:取"内核初始化信息"(内存地图/命令行/initrd/内核镜像)。
-/// 数据由 boot_handoff 开机时发布,这里只负责取出,启动后随时可读。
 pub trait BootInfoIf {
     fn boot_info() -> &'static BootInfo;
 }
 
-/// 读取端:取"平台硬件信息"(设备寄存器窗口/时钟频率/CPU数/设备列表)。
 pub trait PlatformInfoIf {
     fn platform_info() -> &'static PlatformInfo;
-
-    /// 开机发现的设备列表(通常来自固件设备树)。默认空,mock/测试板免接线;
-    /// 有设备发现的真板覆盖它返回真实列表。
-    fn devices() -> &'static [DeviceInfo] {
-        &[]
-    }
 }
 
 pub trait AuxvIf: PlatformConfig {
@@ -718,12 +846,6 @@ pub trait PmapIf {
     }
 }
 
-mod platform_info;
-pub use platform_info::*;
-
-mod signal;
-pub use signal::*;
-
 pub mod observer;
 pub use observer::{ObserverIf, RingDescriptor};
 pub mod pmap;
@@ -814,6 +936,184 @@ impl<T> Eq for UserPtr<T> {}
 unsafe impl<T: Send> Send for UserPtr<T> {}
 unsafe impl<T: Sync> Sync for UserPtr<T> {}
 
+// ---------------------------------------------------------------------------
+// SignalFrameIf
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserSigInfoAbi {
+    pub bytes: [u8; 128],
+}
+
+impl UserSigInfoAbi {
+    pub const ZERO: Self = Self { bytes: [0; 128] };
+}
+
+unsafe impl Pod for UserSigInfoAbi {}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserSignalMaskAbi {
+    pub bits: u64,
+}
+
+impl UserSignalMaskAbi {
+    pub const EMPTY: Self = Self { bits: 0 };
+}
+
+unsafe impl Pod for UserSignalMaskAbi {}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserSaFlagsAbi {
+    pub bits: u64,
+}
+
+impl UserSaFlagsAbi {
+    pub const EMPTY: Self = Self { bits: 0 };
+}
+
+unsafe impl Pod for UserSaFlagsAbi {}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SignalFrameWrite {
+    pub stack_top: UserPtr<u8>,
+    pub sig_no: u32,
+    pub siginfo: UserSigInfoAbi,
+    pub old_mask: UserSignalMaskAbi,
+    pub flags: UserSaFlagsAbi,
+    pub handler_pc: UserPtr<()>,
+    pub restorer_pc: UserPtr<()>,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SignalFramePlacement {
+    pub frame_addr: UserPtr<()>,
+    pub trampoline_pc: UserPtr<()>,
+}
+
+/// Raw bytes of a signal frame (platform-specific layout).
+/// Carried from `prepare_signal_frame` to the caller, who writes
+/// them to the user stack via `AddressSpace::copy_to_user`.
+///
+/// The buffer must be at least as large as the platform-specific
+/// `*SignalFrame` struct (RV64 ~720 bytes including UserTrapContext +
+/// FpContext + trampoline). The previous 512-byte buffer silently
+/// truncated `from_slice`, dropping the trailing fields — most
+/// catastrophically the on-stack `rt_sigreturn` trampoline at
+/// `offset_of!(SignalFrame, trampoline) = 712` — so the handler
+/// returned through `ra = frame_addr + 712` and the CPU fetched
+/// uninitialised stack bytes instead of the trampoline. Musl-compatible
+/// RV64 `ucontext_t` now includes the full floating-point union, so
+/// keep the carrier above the board frame sizes rather than trimming
+/// the userspace ABI shape.
+pub struct SignalFrameBytes {
+    pub data: [u8; Self::CAPACITY],
+    pub len: usize,
+}
+
+impl SignalFrameBytes {
+    pub const CAPACITY: usize = 2048;
+
+    pub fn from_slice(bytes: &[u8]) -> Self {
+        let len = bytes.len();
+        assert!(
+            len <= Self::CAPACITY,
+            "signal frame layout ({len} bytes) exceeds SignalFrameBytes buffer ({})",
+            Self::CAPACITY,
+        );
+        let mut data = [0u8; Self::CAPACITY];
+        data[..len].copy_from_slice(bytes);
+        Self { data, len }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.data[..self.len]
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SavedSignalFrame {
+    pub saved_mask: UserSignalMaskAbi,
+    pub user_context: UserTrapContext,
+}
+
+unsafe impl Pod for SavedSignalFrame {}
+
+pub trait SignalFrameIf: TrapIf {
+    fn write_signal_frame(
+        tf: TrapFrameMut<'_>,
+        setup: SignalFrameWrite,
+    ) -> Result<SignalFramePlacement, FaultInfo> {
+        let _ = tf;
+        Err(FaultInfo {
+            address: VirtAddr(setup.stack_top.addr()),
+            write: true,
+            instruction: false,
+            from_user: false,
+        })
+    }
+
+    fn read_signal_frame(user_sp: UserPtr<u8>) -> Result<SavedSignalFrame, FaultInfo> {
+        Err(FaultInfo {
+            address: VirtAddr(user_sp.addr()),
+            write: false,
+            instruction: false,
+            from_user: false,
+        })
+    }
+
+    fn signal_frame_size() -> usize {
+        0
+    }
+
+    fn decode_signal_frame_bytes(
+        user_sp: UserPtr<u8>,
+        _bytes: &[u8],
+    ) -> Result<SavedSignalFrame, FaultInfo> {
+        Err(FaultInfo {
+            address: VirtAddr(user_sp.addr()),
+            write: false,
+            instruction: false,
+            from_user: false,
+        })
+    }
+
+    fn restore_signal_frame(_tf: TrapFrameMut<'_>, _frame: &SavedSignalFrame) {}
+
+    fn rewind_syscall_pc(mut tf: TrapFrameMut<'_>) {
+        tf.rewind_pc(4);
+    }
+
+    /// Build a signal-handler entry context and frame bytes
+    /// WITHOUT accessing a live TrapFrameMut. Returns the modified
+    /// `UserTrapContext` (sepc=handler, sp=frame_addr, ra=trampoline)
+    /// and the raw signal frame bytes to write to the user stack.
+    ///
+    /// Used by the thread-future AST checkpoint, which runs before
+    /// `enter_userspace_with_context` (where TrapFrameMut is
+    /// available). The caller writes `frame_bytes` to user memory
+    /// via `AddressSpace::copy_to_user`, then stores the modified
+    /// context as `saved_user_context`.
+    ///
+    /// Default: returns `ENOSYS`-shaped fallback.
+    fn prepare_signal_frame(
+        _ctx: &UserTrapContext,
+        _setup: &SignalFrameWrite,
+    ) -> Result<(UserTrapContext, SignalFrameBytes), FaultInfo> {
+        Err(FaultInfo {
+            address: VirtAddr(0),
+            write: true,
+            instruction: false,
+            from_user: false,
+        })
+    }
+}
+
 pub trait FpSimdIf {
     const SUPPORTED: bool;
 
@@ -885,19 +1185,13 @@ pub trait IrqIf {
     /// §"Open questions #6".
     const UART_IRQ: u32 = 0;
 
-    /// Runtime UART IRQ number. Defaults to the static constant;
-    /// boards with device-tree discovery override this to serve the
-    /// probed value (QEMU virt wires the UART at 10, VisionFive 2 at
-    /// 32 — same kernel, different trees).
-    fn uart_irq() -> u32 {
-        Self::UART_IRQ
-    }
-
-    /// Platform-specific IRQ number for the boot virtio-net device
-    /// (`0` sentinel = no net IRQ wired; the net delegate then relies on
-    /// poll kicks alone). On QEMU rv64 virt, virtio-mmio slot N maps to
-    /// PLIC IRQ `1 + N`, so the `virtio1` net slot (0x1000_2000) is IRQ 2.
-    const NET_IRQ: u32 = 0;
+    /// Platform-specific IRQ number for a wake-capable persistent-clock RTC.
+    ///
+    /// Boards without a hardware RTC alarm interrupt keep the `0` sentinel
+    /// default. The generic kernel may use this to register an IRQ handler that
+    /// publishes an RTC device event; HAL itself must not know devfs or RTC
+    /// userspace state.
+    const RTC_IRQ: u32 = 0;
 
     fn in_irq_context() -> bool {
         false
@@ -906,6 +1200,10 @@ pub trait IrqIf {
     fn interrupts_enabled() -> bool {
         true
     }
+
+    /// Save maskable local interrupt admission and disable it until the returned
+    /// guard is dropped. This does not provide CPU affinity or NMI exclusion.
+    fn exclude_local_execution() -> LocalExecutionGuard;
 
     fn claim() -> u32 {
         0
@@ -957,19 +1255,64 @@ impl Default for IrqDispatchTable {
     }
 }
 
-pub trait TimeIf {
+/// The instruction or architectural source a vDSO may read without entering
+/// the kernel. `None` keeps the vDSO on its syscall fallback path.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VdsoCounterMode {
+    None = 0,
+    RiscvTime = 1,
+}
+
+/// Static platform facts for a raw counter that can back vDSO time reads.
+///
+/// This is intentionally a value returned by the selected board type rather
+/// than a runtime HAL service. The timekeeper validates eligibility before it
+/// reads the raw counter or publishes a fast-path calibration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VdsoCounterInfo {
+    pub frequency_hz: u64,
+    pub mask: u64,
+    pub stable: bool,
+    pub user_readable: bool,
+    pub mode: VdsoCounterMode,
+}
+
+pub trait MonotonicCounterIf {
     /// Read monotonic nanoseconds since the platform's boot-time epoch.
     ///
     /// Values must be non-decreasing on the current hart and cheap enough for
     /// scheduler/reactor hot paths.
     fn read_ns() -> u64;
 
+    /// Return the hardware timer frequency used for ns/tick conversion.
+    fn frequency_hz() -> u64;
+
+    /// Describe the raw counter for the optional vDSO fast path.
+    ///
+    /// Platforms that do not expose a stable user-readable counter retain the
+    /// default and the vDSO uses its syscall fallback.
+    fn vdso_counter_info() -> Option<VdsoCounterInfo> {
+        None
+    }
+
+    /// Read the same raw counter described by [`Self::vdso_counter_info`].
+    ///
+    /// Callers must only use this after accepting the descriptor. The default
+    /// avoids imposing an architecture-specific counter read on other boards.
+    fn read_vdso_counter() -> u64 {
+        0
+    }
+}
+
+pub trait DeadlineTimerIf {
     /// Program the current hart's timer for an absolute monotonic deadline.
     ///
-    /// `deadline` uses the same nanosecond epoch as `read_ns()`. Platforms
-    /// must not intentionally arm an earlier hardware deadline than requested;
-    /// interrupts may arrive late due to firmware, hardware, or emulator
-    /// latency. A past deadline should fire as soon as the platform can arrange.
+    /// `deadline` uses the same nanosecond epoch as
+    /// `MonotonicCounterIf::read_ns()`. Platforms must not intentionally arm an
+    /// earlier hardware deadline than requested; interrupts may arrive late due
+    /// to firmware, hardware, or emulator latency. A past deadline should fire
+    /// as soon as the platform can arrange.
     fn set_deadline_ns(deadline: u64);
 
     /// Cancel the current hart's pending timer deadline when the platform has
@@ -979,19 +1322,51 @@ pub trait TimeIf {
     /// Prepare the current hart so a programmed timer deadline can wake or
     /// trap out of the platform idle path.
     fn enable_timer_wakeups() {}
+}
 
-    /// Return the hardware timer frequency used for ns/tick conversion.
-    fn frequency_hz() -> u64;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PersistentClockError {
+    Unsupported,
+    Invalid,
+    Range,
+    Hardware,
+}
 
-    /// Read the platform's hardware real-time clock as nanoseconds since the
-    /// Unix epoch, if the platform exposes a readable RTC. Returns `None` when
-    /// there is none, in which case the kernel wall clock keeps its default
-    /// epoch base. Called once at boot to seed `CLOCK_REALTIME`; never on a
-    /// hot path.
-    fn read_rtc_epoch_ns() -> Option<u64> {
-        None
+pub trait PersistentClockIf {
+    /// Read persistent realtime in nanoseconds since the Unix epoch.
+    ///
+    /// This is RTC/firmware wall-clock capability, not the hot
+    /// `CLOCK_REALTIME` path. Platforms without persistent wall-clock hardware
+    /// should return [`PersistentClockError::Unsupported`].
+    fn read_realtime_ns() -> Result<u64, PersistentClockError> {
+        Err(PersistentClockError::Unsupported)
+    }
+
+    /// Set persistent realtime in nanoseconds since the Unix epoch.
+    fn set_realtime_ns(_ns: u64) -> Result<(), PersistentClockError> {
+        Err(PersistentClockError::Unsupported)
+    }
+
+    /// Program a persistent-clock wake alarm when the platform supports one.
+    fn set_wake_alarm_ns(_ns: u64) -> Result<(), PersistentClockError> {
+        Err(PersistentClockError::Unsupported)
+    }
+
+    /// Clear a persistent-clock wake alarm when the platform supports one.
+    fn clear_wake_alarm() -> Result<(), PersistentClockError> {
+        Err(PersistentClockError::Unsupported)
+    }
+
+    /// Acknowledge a persistent-clock wake-alarm interrupt after the platform
+    /// IRQ dispatcher has identified the RTC source.
+    ///
+    /// This is a hardware acknowledgement hook. It must not publish devfs
+    /// events, inspect userspace RTC state, or route scheduler wakes.
+    fn acknowledge_wake_alarm_irq() -> Result<(), PersistentClockError> {
+        Ok(())
     }
 }
+
 pub trait PercpuIf {
     fn current_cpu_id() -> CpuId {
         CpuId(0)
@@ -1063,6 +1438,8 @@ pub enum IpiKind {
     /// hart through a `fence` sequence so that all prior memory
     /// operations are globally visible.
     Membarrier,
+    /// Run deferred cross-CPU maintenance work such as RCU/EBR quiescence.
+    Maintenance,
     Stop,
 }
 
@@ -1079,18 +1456,8 @@ pub trait SmpIf {
         CpuMask::single(CpuId(0))
     }
 
-    /// Size of the possible-CPU **id space**: highest possible cpu id
-    /// plus one — deliberately NOT the population count. Dense-index
-    /// consumers (epoch/zone per-cpu domains) allocate and range-check
-    /// per-cpu slots by raw `CpuId`, and real boards boot on a
-    /// non-zero hart (VisionFive 2's BSP is hart 1), so a sparse mask
-    /// like {1} must report 2, and {1,2,3} must report 4. For
-    /// contiguous masks starting at 0 (QEMU, host tests) this equals
-    /// the count, so existing platforms see no change. Popcount
-    /// consumers should use `possible_cpus().count()` directly.
     fn possible_cpu_count() -> usize {
-        let bits = Self::possible_cpus().bits();
-        (u64::BITS - bits.leading_zeros()) as usize
+        Self::possible_cpus().count()
     }
 
     fn online_cpu_count() -> usize {
@@ -1168,7 +1535,9 @@ pub trait TxPlatform:
     + TrapIf
     + SignalFrameIf
     + IrqIf
-    + TimeIf
+    + MonotonicCounterIf
+    + DeadlineTimerIf
+    + PersistentClockIf
     + PercpuIf
     + CacheIf
     + DmaIf
@@ -1192,7 +1561,9 @@ impl<T> TxPlatform for T where
         + TrapIf
         + SignalFrameIf
         + IrqIf
-        + TimeIf
+        + MonotonicCounterIf
+        + DeadlineTimerIf
+        + PersistentClockIf
         + PercpuIf
         + CacheIf
         + DmaIf
@@ -1202,6 +1573,10 @@ impl<T> TxPlatform for T where
         + ObserverIf
         + 'static
 {
+}
+
+pub trait KernelMain<P: TxPlatform> {
+    fn kernel_main(handoff: BootHandoff) -> !;
 }
 
 pub fn console_write_bytes<P: ConsoleIf>(bytes: &[u8]) {
@@ -1214,4 +1589,16 @@ pub fn console_read_bytes<P: ConsoleIf>(buf: &mut [u8]) -> usize {
 
 pub fn console_write_str<P: ConsoleIf>(message: &str) {
     P::write_bytes(message.as_bytes());
+}
+
+pub fn entry<P, K>(cpu_id: usize, firmware_arg: usize) -> !
+where
+    P: TxPlatform,
+    K: KernelMain<P>,
+{
+    P::install_minimal_trap_vector();
+    let handoff = P::boot_handoff(cpu_id, firmware_arg);
+    P::install_early_percpu(handoff.cpu_id);
+    P::mark_cpu_online(handoff.cpu_id);
+    K::kernel_main(handoff)
 }

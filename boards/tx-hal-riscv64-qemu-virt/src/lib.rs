@@ -5,7 +5,7 @@ extern crate alloc;
 extern crate std;
 
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 mod boot_static;
 mod boot_trampoline;
@@ -33,16 +33,18 @@ use dtb::parse_boot_info_from_fdt;
 use pmap::topology as pmap_topology;
 use tx_hal::{
     AllocError, Arch, ArchAuxvFacts, Asid, AuxvIf, BootArg, BootHandoff, BootInfo, BootInfoIf,
-    BootPlatformIf, BootProtocol, BootstrapPmapInfo, CacheIf, ConsoleIf, CpuId, CpuMask, DmaAddr,
-    DmaDirection, DmaIf, EntropyIf, InitIf, IpiKind, IrqDispatchTable, IrqHandled, IrqIf,
-    MemoryRegion, MemoryRegionKind, ObserverIf, PercpuIf, PhysAddr, PlatformConfig, PlatformInfo,
-    PlatformInfoIf, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
-    PmapReserveKind, PmapRoot, PmapUnmapResult, PowerIf, PtNode, PtNodeAllocator, SecondaryEntry,
-    SmpIf, TimeIf, VirtAddr,
+    BootPlatformIf, BootProtocol, BootstrapPmapInfo, CacheIf, ConsoleIf, CpuId, CpuMask,
+    DeadlineTimerIf, DmaAddr, DmaDirection, DmaIf, EntropyIf, InitIf, IpiKind, IrqDispatchTable,
+    IrqHandled, IrqIf, LocalExecutionGuard, MemoryRegion, MemoryRegionKind, MonotonicCounterIf,
+    ObserverIf, PercpuIf, PersistentClockError, PersistentClockIf, PhysAddr, PlatformConfig,
+    PlatformInfo, PlatformInfoIf, PmapError, PmapIf, PmapInvalidation, PmapPermissions,
+    PmapReservation, PmapReserveKind, PmapRoot, PmapUnmapResult, PowerIf, PtNode, PtNodeAllocator,
+    SecondaryEntry, SmpIf, VdsoCounterInfo, VirtAddr,
 };
 
 pub struct Platform;
 
+#[cfg(any(target_arch = "riscv64", test))]
 fn for_each_console_byte_for_sbi(bytes: &[u8], mut emit: impl FnMut(u8)) {
     let mut idx = 0;
     while idx < bytes.len() {
@@ -59,7 +61,10 @@ fn for_each_console_byte_for_sbi(bytes: &[u8], mut emit: impl FnMut(u8)) {
 const QEMU_VIRT_RAM_BASE: usize = 0x8000_0000;
 const QEMU_VIRT_FALLBACK_RAM_SIZE: usize = 256 * 1024 * 1024;
 const MAX_BOOT_CPUS: usize = 4;
-pub(crate) const PLIC_PHYS_BASE: usize = 0x0c00_0000;
+#[cfg(target_arch = "riscv64")]
+const PLIC_PHYS_BASE: usize = 0x0c00_0000;
+#[cfg(target_arch = "riscv64")]
+const PLIC_BASE: usize = pmap_topology::DIRECT_MAP_BASE + PLIC_PHYS_BASE;
 /// QEMU virt machine's NS16550-compatible UART. PLIC IRQ 10
 /// ([`IrqIf::UART_IRQ`]) is wired to this UART, but the device
 /// itself only raises RX-data-available IRQs when its IER (offset
@@ -70,35 +75,7 @@ pub(crate) const PLIC_PHYS_BASE: usize = 0x0c00_0000;
 const UART_PHYS_BASE: usize = 0x1000_0000;
 #[cfg(target_arch = "riscv64")]
 const UART_BASE: usize = pmap_topology::DIRECT_MAP_BASE + UART_PHYS_BASE;
-/// QEMU virt goldfish-rtc (`google,goldfish-rtc`, DTB node `rtc@101000`).
-/// Register `TIME_LOW` (0x00) latches the high half into `TIME_HIGH` (0x04);
-/// the 64-bit pair is nanoseconds since the Unix epoch — real host time under
-/// QEMU's default (`-rtc base=utc`). Reachable through the low-address direct
-/// map like PLIC/UART above.
-#[cfg(target_arch = "riscv64")]
-const RTC_PHYS_BASE: usize = 0x0010_1000;
-#[cfg(target_arch = "riscv64")]
-const RTC_BASE: usize = pmap_topology::DIRECT_MAP_BASE + RTC_PHYS_BASE;
 const PLIC_MAX_IRQ: u32 = tx_hal::IRQ_DISPATCH_TABLE_SIZE as u32;
-
-/// Read the goldfish-rtc as Unix-epoch nanoseconds. `None` if the device reads
-/// back zero (absent / not wired).
-#[cfg(target_arch = "riscv64")]
-fn read_goldfish_rtc_epoch_ns() -> Option<u64> {
-    // SAFETY: `RTC_BASE` is the boot-time direct map of the QEMU virt
-    // goldfish-rtc MMIO block (same low-address window as PLIC/UART). Reading
-    // TIME_LOW first is required — it atomically latches TIME_HIGH.
-    unsafe {
-        let low = (RTC_BASE as *const u32).read_volatile() as u64;
-        let high = ((RTC_BASE + 4) as *const u32).read_volatile() as u64;
-        let ns = (high << 32) | low;
-        (ns != 0).then_some(ns)
-    }
-}
-#[cfg(not(target_arch = "riscv64"))]
-fn read_goldfish_rtc_epoch_ns() -> Option<u64> {
-    None
-}
 #[cfg(all(not(target_arch = "riscv64"), test))]
 const PLIC_IRQ_SOURCES: usize = tx_hal::IRQ_DISPATCH_TABLE_SIZE;
 #[cfg(all(not(target_arch = "riscv64"), test))]
@@ -109,8 +86,31 @@ const PLIC_ENABLE_CONTEXT_STRIDE: usize = 0x80;
 const PLIC_CONTEXT_BASE: usize = 0x20_0000;
 const PLIC_CONTEXT_STRIDE: usize = 0x1000;
 const PLIC_CLAIM_COMPLETE: usize = 0x4;
+#[cfg(any(target_arch = "riscv64", test))]
+const GOLDFISH_RTC_PHYS_BASE: usize = 0x0010_1000;
+#[cfg(target_arch = "riscv64")]
+const GOLDFISH_RTC_BASE: usize = pmap_topology::DIRECT_MAP_BASE + GOLDFISH_RTC_PHYS_BASE;
+const GOLDFISH_RTC_IRQ: u32 = 11;
+const GOLDFISH_RTC_TIME_LOW: usize = 0x00;
+const GOLDFISH_RTC_TIME_HIGH: usize = 0x04;
+const GOLDFISH_RTC_ALARM_LOW: usize = 0x08;
+const GOLDFISH_RTC_ALARM_HIGH: usize = 0x0c;
+const GOLDFISH_RTC_IRQ_ENABLED: usize = 0x10;
+const GOLDFISH_RTC_CLEAR_ALARM: usize = 0x14;
+const GOLDFISH_RTC_ALARM_STATUS: usize = 0x18;
+const GOLDFISH_RTC_CLEAR_INTERRUPT: usize = 0x1c;
 static ONLINE_CPUS: AtomicU64 = AtomicU64::new(0);
-static IPI_ACKED_CPUS: AtomicU64 = AtomicU64::new(0);
+const IPI_KIND_COUNT: usize = 5;
+const IPI_CPU_SLOTS: usize = u64::BITS as usize;
+static IPI_STATE_LOCKS: [AtomicBool; IPI_CPU_SLOTS] =
+    [const { AtomicBool::new(false) }; IPI_CPU_SLOTS];
+static IPI_PENDING_CPUS: [AtomicU64; IPI_KIND_COUNT] =
+    [const { AtomicU64::new(0) }; IPI_KIND_COUNT];
+static IPI_ACKED_CPUS: [AtomicU64; IPI_KIND_COUNT] = [const { AtomicU64::new(0) }; IPI_KIND_COUNT];
+#[cfg(test)]
+static TEST_IPI_TRANSPORT_MASK: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static TEST_LOCAL_MEMBARRIER_ACTIONS: AtomicUsize = AtomicUsize::new(0);
 static ASID_RESIDENCY: [AtomicU64; pmap::ASID_CAPACITY] =
     [const { AtomicU64::new(0) }; pmap::ASID_CAPACITY];
 static FALLBACK_IRQ_DEPTH: AtomicUsize = AtomicUsize::new(0);
@@ -176,13 +176,13 @@ pub struct KernelResumeCtx {
 // asm (`TX_RV64_RCTX_SP`, `TX_RV64_RCTX_RA`, `TX_RV64_RCTX_S0`). The
 // Rust constants below pin the layout from the Rust side so a struct
 // reorder triggers a compile-time mismatch with the static_assert.
-const KERNEL_RESUME_CTX_SP_OFFSET: usize = 0;
-const KERNEL_RESUME_CTX_RA_OFFSET: usize = 8;
-const KERNEL_RESUME_CTX_S0_OFFSET: usize = 16;
+const _KERNEL_RESUME_CTX_SP_OFFSET: usize = 0;
+const _KERNEL_RESUME_CTX_RA_OFFSET: usize = 8;
+const _KERNEL_RESUME_CTX_S0_OFFSET: usize = 16;
 const _: () = assert!(core::mem::size_of::<KernelResumeCtx>() == 14 * 8);
-const _: () = assert!(core::mem::offset_of!(KernelResumeCtx, sp) == KERNEL_RESUME_CTX_SP_OFFSET);
-const _: () = assert!(core::mem::offset_of!(KernelResumeCtx, ra) == KERNEL_RESUME_CTX_RA_OFFSET);
-const _: () = assert!(core::mem::offset_of!(KernelResumeCtx, s) == KERNEL_RESUME_CTX_S0_OFFSET);
+const _: () = assert!(core::mem::offset_of!(KernelResumeCtx, sp) == _KERNEL_RESUME_CTX_SP_OFFSET);
+const _: () = assert!(core::mem::offset_of!(KernelResumeCtx, ra) == _KERNEL_RESUME_CTX_RA_OFFSET);
+const _: () = assert!(core::mem::offset_of!(KernelResumeCtx, s) == _KERNEL_RESUME_CTX_S0_OFFSET);
 
 /// Per-hart cell with `Sync` because the only writer/reader is the
 /// local hart's trap-vector / userspace-entry shim. Cross-hart
@@ -315,21 +315,14 @@ impl BootPlatformIf for Platform {
     const BOOT_PROTOCOL: BootProtocol = BootProtocol::RiscvSbi;
 
     fn boot_handoff(cpu_id: usize, firmware_arg: usize) -> BootHandoff {
-        // firmware_arg 是 SBI 交来的 DTB(设备树)物理地址——只是个指针,
-        // 真正的内存/设备信息还锁在它指向的 blob 里,必须现在就地解析。
-        // 解析 DTB,把内存布局/设备等榨进静态包(capture_once 保证全局只解析一次)
         let bag = BootStaticBag::<IdentityLive>::capture_once(firmware_arg);
-        // 建立引导页表:Sv39 无硬件直映射窗口,内核要在高地址跑必须软件建表
         pmap::adopt_high_linked_bootstrap_pmap(bag);
 
-        // 把解析出的事实发布成全局 BootInfo/PlatformInfo(供上层 boot_info() 等读),
-        // 并在拆除低地址恒等映射前完成收尾(IdentityLive -> IdentityDropped 类型状态机)
         BootStaticBag::<IdentityLive>::take_global()
             .publish_boot_info_before_identity_drop(firmware_arg)
             .complete_post_entry_pipeline()
             .install_global();
 
-        // 最后才做契约默认版做的那件事:把裸值套壳成交接单返回
         BootHandoff {
             cpu_id: CpuId(cpu_id),
             firmware_arg: BootArg(firmware_arg),
@@ -343,21 +336,15 @@ impl InitIf for Platform {
     fn init_later(_handoff: BootHandoff) {}
 }
 
-// 三个方法都一样:从那张已定案的启动登记表(BootStaticBag)里把对应字段取出来。
-// 解析设备树、发布这些脏活在 boot_handoff 里干完了,这边只管读。
 impl BootInfoIf for Platform {
     fn boot_info() -> &'static BootInfo {
-        BootStaticBag::<IdentityDropped>::global_ref().boot_info_ref()   // 取内核初始化信息
+        BootStaticBag::<IdentityDropped>::global_ref().boot_info_ref()
     }
 }
 
 impl PlatformInfoIf for Platform {
     fn platform_info() -> &'static PlatformInfo {
-        BootStaticBag::<IdentityDropped>::global_ref().platform_info_ref()   // 取硬件信息
-    }
-
-    fn devices() -> &'static [tx_hal::DeviceInfo] {
-        BootStaticBag::<IdentityDropped>::global_ref().platform_devices_ref()   // 取设备列表
+        BootStaticBag::<IdentityDropped>::global_ref().platform_info_ref()
     }
 }
 
@@ -512,35 +499,23 @@ impl PmapIf for Platform {
     /// user mappings), and every user-mode instruction fetch would
     /// fault forever.
     fn activate_user_pmap(root: &PmapRoot) {
-        let asid_usable = hw_asid_tagging_usable();
         mark_asid_resident_on_current_cpu(root.asid());
         #[cfg(target_arch = "riscv64")]
         unsafe {
             const SATP_MODE_SV39: usize = 0x8 << 60;
             let ppn = root.phys().0 >> 12;
-            // Zero-/narrow-ASID hardware (VF2 U74 implements 0 bits):
-            // hardware would truncate the tag anyway; write 0 so the
-            // fast-path compare below stays meaningful (a readback of
-            // a truncated field would otherwise never equal our
-            // computed satp and force the slow path every entry).
-            let asid = if asid_usable {
-                root.asid().0 as usize
-            } else {
-                0
-            };
+            let asid = root.asid().0 as usize;
             let satp = SATP_MODE_SV39 | (asid << 44) | ppn;
             // Fast path: returning to the same address space (the common
             // syscall return). No CSR write, no fence — TLB entries for
-            // this root are still valid (per-ASID on tagged hardware; on
-            // degraded hardware the flush-on-switch below guarantees the
-            // TLB only ever holds the current space's entries).
+            // this ASID are still valid.
             let current: usize;
             core::arch::asm!("csrr {satp}, satp", satp = out(reg) current, options(nomem, nostack));
             if current == satp {
                 return;
             }
-            // Different root: write satp. On ASID-tagged hardware (QEMU:
-            // 16 bits) no fence is needed per the privileged spec:
+            // Different root/ASID: write satp WITHOUT a global sfence.vma.
+            // Correctness per the RISC-V privileged spec:
             //  - TLB entries are ASID-tagged; switching ASIDs needs no fence.
             //  - Invalid (V=0) PTEs are never cached, so invalid→valid map
             //    commits are picked up by the next hardware walk unfenced
@@ -557,41 +532,30 @@ impl PmapIf for Platform {
                 satp = in(reg) satp,
                 options(nostack)
             );
-            // Degraded (zero-ASID) hardware: every space shares tag 0,
-            // so the previous space's entries are live for this one —
-            // flush on switch (board `ls` fork/COW loop root cause,
-            // 2026-07-03). QEMU never takes this branch.
-            if !asid_usable {
-                core::arch::asm!("sfence.vma", options(nostack));
-            }
         }
         #[cfg(not(target_arch = "riscv64"))]
-        let _ = (root, asid_usable);
+        let _ = root;
     }
 }
 impl IrqIf for Platform {
     const MAX_IRQ: u32 = PLIC_MAX_IRQ;
 
     /// QEMU `virt` machine's 16550 UART is wired at PLIC IRQ 10.
-    /// Source: `qemu/hw/riscv/virt.c::UART0_IRQ`. Fallback only —
-    /// `uart_irq()` serves the device-tree value when one was probed.
+    /// Source: `qemu/hw/riscv/virt.c::UART0_IRQ`.
     const UART_IRQ: u32 = 10;
-
-    /// Device-tree probed UART IRQ (VisionFive 2 wires uart0 at 32,
-    /// QEMU virt at 10); constant fallback when no table was parsed.
-    fn uart_irq() -> u32 {
-        uart_device_info()
-            .and_then(|uart| uart.irq)
-            .unwrap_or(Self::UART_IRQ)
-    }
-
-    /// virtio-mmio slot N sits at PLIC IRQ `1 + N`
-    /// (`qemu/hw/riscv/virt.c::VIRTIO_IRQ`); the net device binds the
-    /// `virtio1` slot (0x1000_2000), i.e. IRQ 2.
-    const NET_IRQ: u32 = 2;
+    /// QEMU `virt` machine's goldfish RTC is wired at PLIC IRQ 11.
+    const RTC_IRQ: u32 = GOLDFISH_RTC_IRQ;
 
     fn in_irq_context() -> bool {
         irq_context_depth() != 0
+    }
+
+    fn interrupts_enabled() -> bool {
+        supervisor_interrupts_enabled()
+    }
+
+    fn exclude_local_execution() -> LocalExecutionGuard {
+        exclude_supervisor_interrupts()
     }
 
     fn claim() -> u32 {
@@ -651,11 +615,25 @@ impl IrqIf for Platform {
         IrqHandled::Done
     }
 }
-impl TimeIf for Platform {
+impl MonotonicCounterIf for Platform {
     fn read_ns() -> u64 {
         time::read_ns(Self::frequency_hz())
     }
 
+    fn frequency_hz() -> u64 {
+        Self::platform_info().timebase_frequency_hz
+    }
+
+    fn vdso_counter_info() -> Option<VdsoCounterInfo> {
+        Some(time::vdso_counter_info(Self::frequency_hz()))
+    }
+
+    fn read_vdso_counter() -> u64 {
+        time::read_time_ticks()
+    }
+}
+
+impl DeadlineTimerIf for Platform {
     fn set_deadline_ns(deadline: u64) {
         time::set_deadline_ns(deadline, Self::frequency_hz());
     }
@@ -667,15 +645,37 @@ impl TimeIf for Platform {
     fn enable_timer_wakeups() {
         time::enable_timer_wakeups();
     }
+}
 
-    fn frequency_hz() -> u64 {
-        Self::platform_info().timebase_frequency_hz
+impl PersistentClockIf for Platform {
+    fn read_realtime_ns() -> Result<u64, PersistentClockError> {
+        Ok(goldfish_rtc_read_time_ns())
     }
 
-    fn read_rtc_epoch_ns() -> Option<u64> {
-        read_goldfish_rtc_epoch_ns()
+    fn set_realtime_ns(ns: u64) -> Result<(), PersistentClockError> {
+        goldfish_rtc_write_time_ns(ns);
+        Ok(())
+    }
+
+    fn set_wake_alarm_ns(ns: u64) -> Result<(), PersistentClockError> {
+        goldfish_rtc_program_alarm_ns(ns);
+        Self::set_priority(GOLDFISH_RTC_IRQ, 1);
+        Self::unmask(GOLDFISH_RTC_IRQ);
+        Ok(())
+    }
+
+    fn clear_wake_alarm() -> Result<(), PersistentClockError> {
+        goldfish_rtc_disable_alarm();
+        Self::mask(GOLDFISH_RTC_IRQ);
+        Ok(())
+    }
+
+    fn acknowledge_wake_alarm_irq() -> Result<(), PersistentClockError> {
+        goldfish_rtc_ack_alarm_irq();
+        Ok(())
     }
 }
+
 impl PercpuIf for Platform {
     fn current_cpu_id() -> CpuId {
         current_cpu_id()
@@ -742,29 +742,7 @@ impl SmpIf for Platform {
     }
 
     fn possible_cpus() -> CpuMask {
-        // SINGLE-CORE BY DEFAULT: the userspace scheduling contract
-        // is single-hart until cross-hart handoff lands, and the
-        // judge lane has always run -smp 1. More cores are an
-        // explicit opt-in via `tx.maxcpus=N` on the boot cmdline
-        // (xtask qemu injects it to match --smp; boards simply omit
-        // it). This also sidesteps firmware trees that misdescribe
-        // cpu topology — the VF2 U-Boot FDT claims hart0 (physically
-        // an MMU-less S7) is an S-mode-capable u74.
-        let requested = max_cpus_from_cmdline().unwrap_or(1);
-        if requested <= 1 {
-            return CpuMask::single(current_cpu_id());
-        }
-        // Opt-in multi-core: DTB-derived S-mode-capable harts
-        // (Linux's mmu-type + status rule), falling back to the
-        // count-prefix mask, capped by the request and the boot-asm
-        // stack budget. The boot hart always stays in the set.
-        let dtb_mask = boot_static::startable_harts();
-        let base = if dtb_mask != 0 {
-            CpuMask::from_bits(dtb_mask & CpuMask::first(MAX_BOOT_CPUS).bits())
-        } else {
-            CpuMask::first(Self::platform_info().possible_cpu_count.min(MAX_BOOT_CPUS))
-        };
-        limit_cpus(base, requested, current_cpu_id())
+        CpuMask::first(Self::platform_info().possible_cpu_count.min(MAX_BOOT_CPUS))
     }
 
     fn online_cpus() -> CpuMask {
@@ -782,7 +760,7 @@ impl SmpIf for Platform {
         let current = current_cpu_id();
         let mut started_mask = CpuMask::EMPTY;
 
-        IPI_ACKED_CPUS.store(0, Ordering::Release);
+        reset_ipi_software_state();
         pmap::install_secondary_identity_bridge();
         for cpu in 0..MAX_BOOT_CPUS {
             let cpu = CpuId(cpu);
@@ -814,8 +792,8 @@ impl SmpIf for Platform {
         core::hint::spin_loop();
     }
 
-    fn pending_ipi(_kind: IpiKind) -> bool {
-        supervisor_software_interrupt_pending()
+    fn pending_ipi(kind: IpiKind) -> bool {
+        ipi_pending_on_cpu(current_cpu_id(), kind)
     }
 
     fn park_this_cpu() -> ! {
@@ -825,28 +803,38 @@ impl SmpIf for Platform {
         }
     }
 
-    fn send_ipi(target: CpuId, _kind: IpiKind) {
+    fn send_ipi(target: CpuId, kind: IpiKind) {
         if target == current_cpu_id() {
             return;
         }
-        send_sbi_ipi(CpuMask::single(target));
+        send_software_ipi(CpuMask::single(target), kind);
     }
 
-    fn broadcast_ipi(mask: CpuMask, _kind: IpiKind) {
-        send_sbi_ipi(mask);
+    fn broadcast_ipi(mask: CpuMask, kind: IpiKind) {
+        let current = current_cpu_id();
+        let current_mask = CpuMask::single(current);
+        let remote_mask = CpuMask::from_bits(mask.bits() & !current_mask.bits());
+        send_software_ipi(remote_mask, kind);
+        if mask.contains(current) {
+            process_local_ipi(current, kind);
+        }
     }
 
-    fn ack_ipi(_kind: IpiKind) {
-        mark_ipi_ack(current_cpu_id());
-        clear_supervisor_software_interrupt();
+    fn ack_ipi(kind: IpiKind) {
+        let cpu = current_cpu_id();
+        let locked = lock_ipi_targets(CpuMask::single(cpu));
+        if acknowledge_ipi_on_cpu(cpu, kind) {
+            clear_supervisor_software_interrupt();
+        }
+        unlock_ipi_targets(locked);
     }
 
-    fn clear_ipi_ack_cpus(_kind: IpiKind, mask: CpuMask) {
-        IPI_ACKED_CPUS.fetch_and(!mask.bits(), Ordering::AcqRel);
+    fn clear_ipi_ack_cpus(kind: IpiKind, mask: CpuMask) {
+        IPI_ACKED_CPUS[ipi_kind_index(kind)].fetch_and(!mask.bits(), Ordering::AcqRel);
     }
 
-    fn ipi_ack_cpus(_kind: IpiKind) -> CpuMask {
-        CpuMask::from_bits(IPI_ACKED_CPUS.load(Ordering::Acquire))
+    fn ipi_ack_cpus(kind: IpiKind) -> CpuMask {
+        CpuMask::from_bits(IPI_ACKED_CPUS[ipi_kind_index(kind)].load(Ordering::Acquire))
     }
 }
 
@@ -880,7 +868,7 @@ impl EntropyIf for Platform {
         use core::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0xA5A5_5A5A_DEAD_BEEF);
 
-        let ticks: u64 = time::read_time_ticks();
+        let ticks: u64 = read_rdtime_ticks();
         let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut s = ticks ^ counter.rotate_left(13);
         // Avoid the all-zero xorshift fixed point.
@@ -922,7 +910,7 @@ const OBS_RING_HARTS: usize = 4;
 struct ObsRingBuf([u8; OBS_RING_BYTES]);
 
 #[no_mangle]
-#[link_section = ".bss.observe_rings"]
+#[cfg_attr(target_arch = "riscv64", link_section = ".bss.observe_rings")]
 static mut TX_OBSERVE_RINGS: [ObsRingBuf; OBS_RING_HARTS] =
     [const { ObsRingBuf([0u8; OBS_RING_BYTES]) }; OBS_RING_HARTS];
 
@@ -973,6 +961,28 @@ pub fn obs_ring_bytes(hart: CpuId) -> Option<&'static [u8]> {
     unsafe { Some(&TX_OBSERVE_RINGS[idx].0[..]) }
 }
 
+#[cfg(target_arch = "riscv64")]
+fn read_rdtime_ticks() -> u64 {
+    let ticks: u64;
+    unsafe {
+        core::arch::asm!(
+            "rdtime {ticks}",
+            ticks = out(reg) ticks,
+            options(nomem, nostack)
+        );
+    }
+    ticks
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+fn read_rdtime_ticks() -> u64 {
+    // Host-test fallback: return 0 so the trait default counter
+    // alone provides variance. The host test
+    // `entropy_fill_random_distinct_calls_diverge` exercises this
+    // path.
+    0
+}
+
 fn current_cpu_id() -> CpuId {
     let kernel_tls = read_kernel_tls();
     cpu_id_from_kernel_tls(kernel_tls).unwrap_or({
@@ -992,7 +1002,7 @@ fn install_early_percpu(cpu_id: CpuId) {
     // trap-vector prologue does `csrrw sp, sscratch, sp` to swap
     // onto the per-CPU trap-handler stack; sscratch must therefore
     // be primed before any trap can fire on this hart. We are
-    // called from `tx_kernel::kernel_main()` on every hart's boot path,
+    // called from `tx_hal::entry()` on every hart's boot path,
     // immediately after the trap vector is installed, which is
     // the earliest moment we have a valid `cpu_id` and a populated
     // trap-stack array. Subsequent traps re-prime sscratch through
@@ -1111,143 +1121,11 @@ fn valid_plic_irq(irq: u32) -> bool {
     irq != 0 && irq < PLIC_MAX_IRQ
 }
 
-/// Parse `tx.maxcpus=N` from the boot cmdline. Boards without a
-/// cmdline (host tests, missing chosen node) get `None` = no cap.
-///
-/// Rationale: the VF2 U-Boot control FDT MISDESCRIBES hart0 (claims
-/// u74-mc + mmu-type sv39 + status okay for what is physically an
-/// MMU-less S7 monitor core — verified with `fdt print /cpus/cpu@0`
-/// on the board, 2026-07-02), so device-tree cpu filtering cannot be
-/// trusted there. The cmdline knob sidesteps firmware-tree lies and
-/// also enforces the single-core requirement while userspace
-/// cross-hart handoff remains unfinished.
-fn max_cpus_from_cmdline() -> Option<usize> {
-    let cmdline = BootStaticBag::<IdentityDropped>::global_ref()
-        .boot_info_ref()
-        .cmdline?;
-    for token in cmdline.split_whitespace() {
-        if let Some(value) = token.strip_prefix("tx.maxcpus=") {
-            return value.parse().ok();
-        }
-    }
-    None
-}
-
-/// Keep at most `limit` cpus from `base`, always retaining `keep`
-/// (the boot hart), then lowest hart ids first.
-fn limit_cpus(base: CpuMask, limit: usize, keep: CpuId) -> CpuMask {
-    let mut bits = 0u64;
-    let mut taken = 0usize;
-    if base.contains(keep) {
-        bits |= CpuMask::single(keep).bits();
-        taken = 1;
-    }
-    for cpu in 0..u64::BITS as usize {
-        if taken >= limit {
-            break;
-        }
-        let cpu = CpuId(cpu);
-        if cpu == keep || !base.contains(cpu) {
-            continue;
-        }
-        bits |= CpuMask::single(cpu).bits();
-        taken += 1;
-    }
-    CpuMask::from_bits(bits)
-}
-
-/// Hardware-implemented `satp.ASID` width in bits, probed once via
-/// Linux's boot trick: write all-ones into the WARL ASID field, read
-/// back, count surviving bits (`usize::MAX` = not probed yet).
-///
-/// Board reality (2026-07-03, `ls`-loop root cause): the VF2's
-/// JH7110 U74 implements **zero** ASID bits — hardware truncates
-/// every satp ASID write, so ALL address spaces share hardware tag 0
-/// and the "ASID-tagged TLB entries need no fence on address-space
-/// switch" fast path is physically void there: a parent shell's
-/// stale read-only TLB entry stays live for the forked child at the
-/// same VA, and the child's COW store faults forever (asid-qualified
-/// sfences can't name the truncated tag either). QEMU implements the
-/// full 16 bits, which hid all of this. When the implemented width
-/// cannot represent `pmap::ASID_CAPACITY`, we degrade: satp always
-/// carries ASID 0, every address-space switch issues a full local
-/// `sfence.vma`, and per-VA shootdowns flush across all ASIDs — the
-/// scheme Chronix/Del0n1x use unconditionally on this board.
-static HW_ASID_BITS: AtomicUsize = AtomicUsize::new(usize::MAX);
-
-fn hw_asid_bits() -> usize {
-    let cached = HW_ASID_BITS.load(Ordering::Relaxed);
-    if cached != usize::MAX {
-        return cached;
-    }
-    let mut probed = probe_hw_asid_bits();
-    // Debug knob: `tx.pmap.asid-bits=N` caps the detected width so the
-    // zero-ASID degrade path (VF2 U74 reality) can be exercised and
-    // debugged under QEMU, which implements the full 16 bits.
-    if let Some(forced) = asid_bits_cap_from_cmdline() {
-        probed = probed.min(forced);
-    }
-    HW_ASID_BITS.store(probed, Ordering::Relaxed);
-    #[cfg(target_arch = "riscv64")]
-    {
-        trap::console_write_literal(b"txkernel:pmap:asid-bits=0x");
-        trap::console_write_hex(probed);
-        trap::console_write_literal(b"\n");
-    }
-    probed
-}
-
-#[cfg(target_arch = "riscv64")]
-fn probe_hw_asid_bits() -> usize {
-    unsafe {
-        let orig: usize;
-        core::arch::asm!("csrr {0}, satp", out(reg) orig, options(nomem, nostack));
-        let probe = orig | (0xFFFFusize << 44);
-        let read: usize;
-        core::arch::asm!("csrw satp, {0}", in(reg) probe, options(nostack));
-        core::arch::asm!("csrr {0}, satp", out(reg) read, options(nomem, nostack));
-        core::arch::asm!("csrw satp, {0}", in(reg) orig, options(nostack));
-        core::arch::asm!("sfence.vma", options(nostack));
-        ((read >> 44) & 0xFFFF).count_ones() as usize
-    }
-}
-
-#[cfg(not(target_arch = "riscv64"))]
-fn probe_hw_asid_bits() -> usize {
-    // Host builds have no satp; report the full RISC-V field width so
-    // host tests exercise the (QEMU-equivalent) tagged fast path.
-    16
-}
-
-/// True when the hardware ASID width can uniquely tag our whole
-/// software ASID space; false = degrade to flush-on-switch.
-pub(crate) fn hw_asid_tagging_usable() -> bool {
-    hw_asid_bits() >= pmap::ASID_CAPACITY.trailing_zeros() as usize
-}
-
-fn asid_bits_cap_from_cmdline() -> Option<usize> {
-    let cmdline = BootStaticBag::<IdentityDropped>::global_ref()
-        .boot_info_ref()
-        .cmdline?;
-    for token in cmdline.split_whitespace() {
-        if let Some(value) = token.strip_prefix("tx.pmap.asid-bits=") {
-            return value.parse().ok();
-        }
-    }
-    None
-}
-
 fn current_plic_context() -> usize {
     plic_context_for_cpu(current_cpu_id())
 }
 
 fn plic_context_for_cpu(cpu: CpuId) -> usize {
-    // Device-tree derived S-mode context when boot resolved one (on
-    // VF2 hart0 has no S context and the formula below is wrong for
-    // every hart); QEMU virt formula as fallback.
-    if let Some(context) = boot_static::plic_scontext_for_hart(cpu.0) {
-        return context as usize;
-    }
     cpu.0.saturating_mul(2).saturating_add(1)
 }
 
@@ -1289,19 +1167,53 @@ fn plic_set_enabled(context: usize, irq: u32, enabled: bool) {
     plic_write_u32(offset, next);
 }
 
-#[cfg(target_arch = "riscv64")]
-fn plic_virt_base() -> usize {
-    pmap_topology::DIRECT_MAP_BASE + boot_static::plic_phys_base()
+fn split_u64(value: u64) -> (u32, u32) {
+    (value as u32, (value >> 32) as u32)
+}
+
+fn join_u64(low: u32, high: u32) -> u64 {
+    u64::from(low) | (u64::from(high) << 32)
+}
+
+fn goldfish_rtc_read_time_ns() -> u64 {
+    let low = goldfish_rtc_read_u32(GOLDFISH_RTC_TIME_LOW);
+    let high = goldfish_rtc_read_u32(GOLDFISH_RTC_TIME_HIGH);
+    join_u64(low, high)
+}
+
+fn goldfish_rtc_write_time_ns(ns: u64) {
+    let (low, high) = split_u64(ns);
+    goldfish_rtc_write_u32(GOLDFISH_RTC_TIME_HIGH, high);
+    goldfish_rtc_write_u32(GOLDFISH_RTC_TIME_LOW, low);
+}
+
+fn goldfish_rtc_program_alarm_ns(ns: u64) {
+    let (low, high) = split_u64(ns);
+    goldfish_rtc_write_u32(GOLDFISH_RTC_ALARM_HIGH, high);
+    goldfish_rtc_write_u32(GOLDFISH_RTC_ALARM_LOW, low);
+    goldfish_rtc_write_u32(GOLDFISH_RTC_IRQ_ENABLED, 1);
+}
+
+fn goldfish_rtc_disable_alarm() {
+    goldfish_rtc_write_u32(GOLDFISH_RTC_IRQ_ENABLED, 0);
+    if goldfish_rtc_read_u32(GOLDFISH_RTC_ALARM_STATUS) != 0 {
+        goldfish_rtc_write_u32(GOLDFISH_RTC_CLEAR_ALARM, 1);
+    }
+    goldfish_rtc_write_u32(GOLDFISH_RTC_CLEAR_INTERRUPT, 1);
+}
+
+fn goldfish_rtc_ack_alarm_irq() {
+    goldfish_rtc_write_u32(GOLDFISH_RTC_CLEAR_INTERRUPT, 1);
 }
 
 #[cfg(target_arch = "riscv64")]
 fn plic_read_u32(offset: usize) -> u32 {
-    unsafe { ((plic_virt_base() + offset) as *const u32).read_volatile() }
+    unsafe { ((PLIC_BASE + offset) as *const u32).read_volatile() }
 }
 
 #[cfg(target_arch = "riscv64")]
 fn plic_write_u32(offset: usize, value: u32) {
-    unsafe { ((plic_virt_base() + offset) as *mut u32).write_volatile(value) };
+    unsafe { ((PLIC_BASE + offset) as *mut u32).write_volatile(value) };
 }
 
 /// Enable the 16550 UART's "received-data-available" interrupt
@@ -1319,40 +1231,15 @@ fn plic_write_u32(offset: usize, value: u32) {
 ///
 /// Idempotent: writing IER and `csrs` instructions just set the
 /// same bits.
-/// First probed UART from the published device table (None on boards
-/// without a table, e.g. before FDT parse or in host tests).
-fn uart_device_info() -> Option<tx_hal::DeviceInfo> {
-    BootStaticBag::<IdentityDropped>::global_ref()
-        .platform_devices_ref()
-        .iter()
-        .copied()
-        .find(|device| device.kind == tx_hal::DeviceKind::Uart)
-}
-
 #[cfg(target_arch = "riscv64")]
 fn enable_uart_rx_irq() {
-    // 16550 IER register index = 1; bit 0 = ERBFI (Enable Received
-    // Data Available Interrupt). Real 16550 derivatives place it at
-    // index << reg-shift with reg-io-width-sized registers: QEMU's
-    // ns16550a is byte-adjacent (shift 0, width 1), VF2's dw-apb-uart
-    // uses 32-bit registers at stride 4 (shift 2, width 4).
-    const UART_IER_INDEX: usize = 1;
+    // 16550 IER offset = 1; bit 0 = ERBFI (Enable Received Data
+    // Available Interrupt).
+    const UART_IER_OFFSET: usize = 1;
     const UART_IER_ERBFI: u8 = 0x01;
-    let (uart_base, reg_shift, reg_io_width) = match uart_device_info() {
-        Some(uart) => (
-            pmap_topology::DIRECT_MAP_BASE + uart.mmio.start.0,
-            uart.reg_shift as usize,
-            uart.reg_io_width,
-        ),
-        None => (UART_BASE, 0, 1),
-    };
     unsafe {
-        let ier_addr = uart_base + (UART_IER_INDEX << reg_shift);
-        if reg_io_width == 4 {
-            (ier_addr as *mut u32).write_volatile(u32::from(UART_IER_ERBFI));
-        } else {
-            (ier_addr as *mut u8).write_volatile(UART_IER_ERBFI);
-        }
+        let ier = (UART_BASE + UART_IER_OFFSET) as *mut u8;
+        ier.write_volatile(UART_IER_ERBFI);
 
         // sie |= SEIE (bit 9) and sstatus |= SIE (bit 1).
         let seie = 1usize << 9;
@@ -1402,6 +1289,40 @@ fn plic_write_u32(offset: usize, value: u32) {
     HOST_PLIC_STATE
         .lock()
         .expect("host plic state")
+        .write_u32(offset, value);
+}
+
+#[cfg(target_arch = "riscv64")]
+fn goldfish_rtc_read_u32(offset: usize) -> u32 {
+    unsafe { ((GOLDFISH_RTC_BASE + offset) as *const u32).read_volatile() }
+}
+
+#[cfg(target_arch = "riscv64")]
+fn goldfish_rtc_write_u32(offset: usize, value: u32) {
+    unsafe { ((GOLDFISH_RTC_BASE + offset) as *mut u32).write_volatile(value) };
+}
+
+#[cfg(all(not(target_arch = "riscv64"), not(test)))]
+fn goldfish_rtc_read_u32(_offset: usize) -> u32 {
+    0
+}
+
+#[cfg(all(not(target_arch = "riscv64"), not(test)))]
+fn goldfish_rtc_write_u32(_offset: usize, _value: u32) {}
+
+#[cfg(all(not(target_arch = "riscv64"), test))]
+fn goldfish_rtc_read_u32(offset: usize) -> u32 {
+    HOST_GOLDFISH_RTC_STATE
+        .lock()
+        .expect("host goldfish rtc state")
+        .read_u32(offset)
+}
+
+#[cfg(all(not(target_arch = "riscv64"), test))]
+fn goldfish_rtc_write_u32(offset: usize, value: u32) {
+    HOST_GOLDFISH_RTC_STATE
+        .lock()
+        .expect("host goldfish rtc state")
         .write_u32(offset, value);
 }
 
@@ -1496,6 +1417,92 @@ impl HostPlicState {
 static HOST_PLIC_STATE: std::sync::Mutex<HostPlicState> =
     std::sync::Mutex::new(HostPlicState::new());
 
+#[cfg(all(not(target_arch = "riscv64"), test))]
+struct HostGoldfishRtcState {
+    registers: [u32; 8],
+    read_offsets: [usize; 16],
+    read_len: usize,
+    write_offsets: [usize; 16],
+    write_values: [u32; 16],
+    write_len: usize,
+}
+
+#[cfg(all(not(target_arch = "riscv64"), test))]
+impl HostGoldfishRtcState {
+    const fn new() -> Self {
+        Self {
+            registers: [0; 8],
+            read_offsets: [0; 16],
+            read_len: 0,
+            write_offsets: [0; 16],
+            write_values: [0; 16],
+            write_len: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    fn set_time_ns(&mut self, ns: u64) {
+        let (low, high) = split_u64(ns);
+        self.registers[GOLDFISH_RTC_TIME_LOW / core::mem::size_of::<u32>()] = low;
+        self.registers[GOLDFISH_RTC_TIME_HIGH / core::mem::size_of::<u32>()] = high;
+    }
+
+    fn set_alarm_status(&mut self, status: bool) {
+        self.registers[GOLDFISH_RTC_ALARM_STATUS / core::mem::size_of::<u32>()] = u32::from(status);
+    }
+
+    fn read_u32(&mut self, offset: usize) -> u32 {
+        self.record_read(offset);
+        self.registers
+            .get(offset / core::mem::size_of::<u32>())
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn write_u32(&mut self, offset: usize, value: u32) {
+        self.record_write(offset, value);
+        if let Some(register) = self.registers.get_mut(offset / core::mem::size_of::<u32>()) {
+            *register = value;
+        }
+    }
+
+    fn record_read(&mut self, offset: usize) {
+        if let Some(slot) = self.read_offsets.get_mut(self.read_len) {
+            *slot = offset;
+            self.read_len += 1;
+        }
+    }
+
+    fn record_write(&mut self, offset: usize, value: u32) {
+        if let Some(slot) = self.write_offsets.get_mut(self.write_len) {
+            *slot = offset;
+        }
+        if let Some(slot) = self.write_values.get_mut(self.write_len) {
+            *slot = value;
+            self.write_len += 1;
+        }
+    }
+
+    fn read_log(&self) -> &[usize] {
+        &self.read_offsets[..self.read_len]
+    }
+
+    fn write_log(&self) -> &[usize] {
+        &self.write_offsets[..self.write_len]
+    }
+
+    fn write_values(&self) -> &[u32] {
+        &self.write_values[..self.write_len]
+    }
+}
+
+#[cfg(all(not(target_arch = "riscv64"), test))]
+static HOST_GOLDFISH_RTC_STATE: std::sync::Mutex<HostGoldfishRtcState> =
+    std::sync::Mutex::new(HostGoldfishRtcState::new());
+
 pub(crate) struct IrqContextGuard {
     depth: &'static AtomicUsize,
 }
@@ -1533,6 +1540,57 @@ fn current_percpu_area() -> Option<&'static Rv64PerCpuArea> {
     RV64_PERCPU_AREAS.get(cpu.0)
 }
 
+fn supervisor_interrupts_enabled() -> bool {
+    #[cfg(target_arch = "riscv64")]
+    {
+        const RV64_SSTATUS_SIE: usize = 1 << 1;
+        let sstatus: usize;
+        unsafe {
+            core::arch::asm!("csrr {sstatus}, sstatus", sstatus = out(reg) sstatus, options(nomem, nostack));
+        }
+        sstatus & RV64_SSTATUS_SIE != 0
+    }
+
+    #[cfg(not(target_arch = "riscv64"))]
+    {
+        true
+    }
+}
+
+fn exclude_supervisor_interrupts() -> LocalExecutionGuard {
+    #[cfg(target_arch = "riscv64")]
+    {
+        let saved: usize;
+        unsafe {
+            core::arch::asm!(
+                "csrrci {saved}, sstatus, 2",
+                saved = out(reg) saved,
+                options(nostack)
+            );
+            LocalExecutionGuard::new(saved & (1 << 1), restore_supervisor_interrupts)
+        }
+    }
+
+    #[cfg(not(target_arch = "riscv64"))]
+    unsafe {
+        LocalExecutionGuard::new(0, restore_supervisor_interrupts)
+    }
+}
+
+unsafe fn restore_supervisor_interrupts(saved: usize) {
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        if saved & (1 << 1) != 0 {
+            core::arch::asm!("csrsi sstatus, 2", options(nostack));
+        } else {
+            core::arch::asm!("csrci sstatus, 2", options(nostack));
+        }
+    }
+
+    #[cfg(not(target_arch = "riscv64"))]
+    let _ = saved;
+}
+
 fn enable_supervisor_software_interrupts() {
     #[cfg(target_arch = "riscv64")]
     unsafe {
@@ -1547,25 +1605,101 @@ fn enable_supervisor_software_wakeups() {
     }
 }
 
-fn supervisor_software_interrupt_pending() -> bool {
-    #[cfg(target_arch = "riscv64")]
-    {
-        let sip: usize;
-        unsafe {
-            core::arch::asm!("csrr {sip}, sip", sip = out(reg) sip, options(nomem, nostack));
-        }
-        sip & 0x2 != 0
-    }
-
-    #[cfg(not(target_arch = "riscv64"))]
-    {
-        false
+const fn ipi_kind_index(kind: IpiKind) -> usize {
+    match kind {
+        IpiKind::Reschedule => 0,
+        IpiKind::TlbShootdown => 1,
+        IpiKind::Membarrier => 2,
+        IpiKind::Maintenance => 3,
+        IpiKind::Stop => 4,
     }
 }
 
-fn mark_ipi_ack(cpu_id: CpuId) {
+fn lock_ipi_targets(mask: CpuMask) -> u64 {
+    let mut bits = mask.bits();
+    let mut locked = 0;
+    while bits != 0 {
+        let cpu = bits.trailing_zeros() as usize;
+        while IPI_STATE_LOCKS[cpu]
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        let bit = 1u64 << cpu;
+        locked |= bit;
+        bits &= bits - 1;
+    }
+    locked
+}
+
+fn unlock_ipi_targets(mut bits: u64) {
+    while bits != 0 {
+        let cpu = bits.trailing_zeros() as usize;
+        IPI_STATE_LOCKS[cpu].store(false, Ordering::Release);
+        bits &= bits - 1;
+    }
+}
+
+fn send_software_ipi(mask: CpuMask, kind: IpiKind) {
+    let locked = lock_ipi_targets(mask);
+    IPI_PENDING_CPUS[ipi_kind_index(kind)].fetch_or(mask.bits(), Ordering::Release);
+    send_sbi_ipi(mask);
+    unlock_ipi_targets(locked);
+}
+
+fn process_local_ipi(cpu: CpuId, kind: IpiKind) {
+    let _irq_guard = <Platform as IrqIf>::exclude_local_execution();
+    let cpu_mask = CpuMask::single(cpu);
+    let locked = lock_ipi_targets(cpu_mask);
+    IPI_PENDING_CPUS[ipi_kind_index(kind)].fetch_or(cpu_mask.bits(), Ordering::Release);
+    execute_local_ipi_action(kind);
+    if acknowledge_ipi_on_cpu(cpu, kind) {
+        clear_supervisor_software_interrupt();
+    }
+    unlock_ipi_targets(locked);
+}
+
+fn execute_local_ipi_action(kind: IpiKind) {
+    if kind == IpiKind::Membarrier {
+        core::sync::atomic::fence(Ordering::SeqCst);
+        #[cfg(test)]
+        TEST_LOCAL_MEMBARRIER_ACTIONS.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+fn ipi_pending_on_cpu(cpu: CpuId, kind: IpiKind) -> bool {
+    let bit = CpuMask::single(cpu).bits();
+    bit != 0 && IPI_PENDING_CPUS[ipi_kind_index(kind)].load(Ordering::Acquire) & bit != 0
+}
+
+fn any_ipi_pending_on_cpu(cpu: CpuId) -> bool {
+    let bit = CpuMask::single(cpu).bits();
+    bit != 0
+        && IPI_PENDING_CPUS
+            .iter()
+            .any(|pending| pending.load(Ordering::Acquire) & bit != 0)
+}
+
+fn acknowledge_ipi_on_cpu(cpu: CpuId, kind: IpiKind) -> bool {
+    IPI_PENDING_CPUS[ipi_kind_index(kind)]
+        .fetch_and(!CpuMask::single(cpu).bits(), Ordering::AcqRel);
+    mark_ipi_ack(cpu, kind);
+    !any_ipi_pending_on_cpu(cpu)
+}
+
+fn reset_ipi_software_state() {
+    for pending in &IPI_PENDING_CPUS {
+        pending.store(0, Ordering::Release);
+    }
+    for acked in &IPI_ACKED_CPUS {
+        acked.store(0, Ordering::Release);
+    }
+}
+
+fn mark_ipi_ack(cpu_id: CpuId, kind: IpiKind) {
     if cpu_id.0 < u64::BITS as usize {
-        IPI_ACKED_CPUS.fetch_or(1u64 << cpu_id.0, Ordering::AcqRel);
+        IPI_ACKED_CPUS[ipi_kind_index(kind)].fetch_or(1u64 << cpu_id.0, Ordering::AcqRel);
     }
 }
 
@@ -1632,27 +1766,15 @@ pub(crate) fn remote_sfence_vma_asid_batch(asid: Asid, invalidations: &[PmapInva
 
     #[cfg(target_arch = "riscv64")]
     {
-        let asid_usable = hw_asid_tagging_usable();
         for invalidation in invalidations {
-            let error = if asid_usable {
-                sbi_remote_sfence_vma_asid(
-                    targets.bits(),
-                    0,
-                    invalidation.virt().0,
-                    invalidation.size(),
-                    asid.0 as usize,
-                )
-            } else {
-                // Zero-ASID hardware: remote harts can't match the
-                // truncated tag either; use the unqualified form.
-                sbi_remote_sfence_vma(
-                    targets.bits(),
-                    0,
-                    invalidation.virt().0,
-                    invalidation.size(),
-                )
-            };
-            assert_eq!(error, 0, "SBI remote sfence.vma failed");
+            let error = sbi_remote_sfence_vma_asid(
+                targets.bits(),
+                0,
+                invalidation.virt().0,
+                invalidation.size(),
+                asid.0 as usize,
+            );
+            assert_eq!(error, 0, "SBI remote sfence.vma.asid failed");
         }
     }
 
@@ -1685,6 +1807,7 @@ fn mark_asid_resident_on_current_cpu(asid: Asid) {
     ASID_RESIDENCY[asid.0 as usize].fetch_or(1u64 << cpu.0, Ordering::AcqRel);
 }
 
+#[cfg(any(target_arch = "riscv64", test))]
 pub(crate) fn clear_current_asid_residency() {
     let asid = current_satp_asid();
     if asid.0 == 0 || (asid.0 as usize) >= ASID_RESIDENCY.len() {
@@ -1710,6 +1833,7 @@ pub(crate) fn clear_asid_residency(asid: Asid) {
     }
 }
 
+#[cfg(any(target_arch = "riscv64", test))]
 fn current_satp_asid() -> Asid {
     #[cfg(target_arch = "riscv64")]
     unsafe {
@@ -1729,6 +1853,9 @@ fn send_sbi_ipi(mask: CpuMask) {
     if mask == 0 {
         return;
     }
+
+    #[cfg(test)]
+    TEST_IPI_TRANSPORT_MASK.fetch_or(mask, Ordering::AcqRel);
 
     #[cfg(target_arch = "riscv64")]
     {
@@ -1790,20 +1917,6 @@ impl BootStaticBag<IdentityLive> {
         cmdline.fill(0);
 
         let parsed = parse_boot_info_from_fdt(dtb_addr, memory_regions, cmdline);
-
-        let devices = unsafe { self.platform_devices_mut() };
-        let device_count = unsafe { dtb::parse_devices_from_fdt(dtb_addr, &mut devices[..]) };
-        self.publish_platform_device_count(device_count);
-
-        if let Some(plic) = devices[..device_count]
-            .iter()
-            .find(|device| device.kind == tx_hal::DeviceKind::IntController)
-        {
-            self.publish_plic_phys_base(plic.mmio.start.0);
-        }
-        let scontexts = unsafe { self.plic_scontexts_mut() };
-        unsafe { dtb::parse_plic_scontexts_from_fdt(dtb_addr, scontexts) };
-
         let (memory_region_count, initrd, cmdline_len, timebase_frequency_hz, possible_cpu_count) =
             if let Some(parsed) = parsed {
                 (
@@ -1825,34 +1938,6 @@ impl BootStaticBag<IdentityLive> {
             };
         self.publish_timebase_frequency_hz(timebase_frequency_hz);
         self.publish_possible_cpu_count(possible_cpu_count);
-        if let Some(parsed) = parsed {
-            self.publish_startable_harts(parsed.startable_harts);
-        }
-
-        // Firmware-reserved RAM (OpenSBI's PMP-protected home, exposed
-        // via /reserved-memory + the header memreserve block) must be
-        // excluded before the allocator plans metadata placement. On
-        // VF2 the firmware sits at the very bottom of DDR.
-        let reserved_count = unsafe {
-            dtb::parse_reserved_regions_from_fdt(
-                dtb_addr,
-                &mut memory_regions[memory_region_count..],
-            )
-        };
-        let memory_region_count = memory_region_count + reserved_count;
-
-        // Boards like the VisionFive 2 report DDR from 0x4000_0000; the
-        // asm boot tables only cover the QEMU gigabyte at 0x8000_0000.
-        // Add the missing low direct-map leaves before anyone allocates
-        // from those regions. No-op on QEMU.
-        if let Some(lowest) = memory_regions[..memory_region_count]
-            .iter()
-            .map(|region| region.base.0)
-            .min()
-        {
-            let _ = pmap::cover_direct_map_low_from_bag(self, PhysAddr(lowest));
-        }
-
         let memory_region_count =
             reserve_firmware_loader_region(memory_regions, memory_region_count);
 

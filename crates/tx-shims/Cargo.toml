@@ -19,6 +19,7 @@ doctest = false
 tx-reactor = { path = "../tx-reactor" }
 tx-platform-adapter = { path = "../tx-platform-adapter" }
 tx-substrate = { path = "../tx-substrate" }
+tx-time = { path = "../tx-time" }
 tx-test-support = { path = "../tx-test-support" }
 tx-subsystems = { path = "../tx-subsystems" }
 # Pre-ELF Phase 6 (NR_EXECVE syscall arm): `sys_execve` calls

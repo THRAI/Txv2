@@ -26,22 +26,22 @@
 //! }
 //! ```
 //!
-//! Tests that use this module serialize on a crate-global `Mutex` so
+//! Tests that use this module serialize on a crate-global spin lock so
 //! concurrent test runs do not race on the observation statics.
 
-extern crate std;
+extern crate alloc;
 
-use std::sync::{Mutex, MutexGuard};
-use std::vec::Vec;
+use alloc::vec;
+use alloc::vec::Vec;
 
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use tx_hal::{
     Arch, AuxvIf, BootInfo, BootInfoIf, BootPlatformIf, BootProtocol, CacheIf, ConsoleIf, CpuId,
-    CpuMask, DmaIf, EntropyIf, InitIf, IrqIf, MemoryRegion, ObserverIf, PercpuIf, PhysRange,
-    PlatformConfig, PlatformInfo, PlatformInfoIf, PmapIf, PowerIf, RingDescriptor, SignalFrameIf,
-    SmpIf, TimeIf, TrapIf, VirtAddr,
+    CpuMask, DmaIf, EntropyIf, InitIf, IrqIf, MemoryRegion, MonotonicCounterIf, ObserverIf,
+    PercpuIf, PhysRange, PlatformConfig, PlatformInfo, PlatformInfoIf, PmapIf, PowerIf,
+    RingDescriptor, SignalFrameIf, SmpIf, TrapIf, VirtAddr,
 };
 use tx_observe_types::{TxTraceHartRing, TxTraceKind, TxTraceRecord};
 
@@ -51,8 +51,28 @@ use crate::HartEmitter;
 
 /// Observation tests must not run concurrently because they share `HART_SLOTS`,
 /// `EMITTERS`, `TS_FN`, and `CPU_ID_FN` statics.  All tests that call
-/// `TestPlatform::init()` automatically serialize on this mutex.
-static TEST_LOCK: Mutex<()> = Mutex::new(());
+/// `TestPlatform::init()` automatically serialize on this lock.
+static TEST_LOCK: AtomicBool = AtomicBool::new(false);
+
+struct TestLockGuard;
+
+impl TestLockGuard {
+    fn acquire() -> Self {
+        while TEST_LOCK
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        Self
+    }
+}
+
+impl Drop for TestLockGuard {
+    fn drop(&mut self) {
+        TEST_LOCK.store(false, Ordering::Release);
+    }
+}
 
 // ── Ring storage ───────────────────────────────────────────────────────────────
 
@@ -106,11 +126,11 @@ impl TestPlatform {
     /// returns a [`TestObservation`].  The lock is held until `TestObservation`
     /// is dropped.
     pub fn init(self) -> TestObservation {
-        let guard = TEST_LOCK.lock().expect("test lock poisoned");
+        let guard = TestLockGuard::acquire();
 
         // Allocate ring storage on the heap.
         let ring_bytes = DEFAULT_RING_BYTES;
-        let mut storage: Vec<u8> = std::vec![0u8; ring_bytes];
+        let mut storage: Vec<u8> = vec![0u8; ring_bytes];
 
         // Record what we need before moving `self`.
         let cpu_id = self.cpu_id;
@@ -158,7 +178,7 @@ impl Default for TestPlatform {
 /// the next test starts with a clean slate.  The `TEST_LOCK` is held for the
 /// lifetime of this value.
 pub struct TestObservation {
-    _guard: MutexGuard<'static, ()>,
+    _guard: TestLockGuard,
     _storage: Vec<u8>,
     cpu_id: usize,
 }
@@ -297,7 +317,13 @@ impl ConsoleIf for SyntheticPlatform {
 impl PmapIf for SyntheticPlatform {}
 impl TrapIf for SyntheticPlatform {}
 impl SignalFrameIf for SyntheticPlatform {}
-impl IrqIf for SyntheticPlatform {}
+unsafe fn restore_synthetic_local_execution(_saved_state: usize) {}
+
+impl IrqIf for SyntheticPlatform {
+    fn exclude_local_execution() -> tx_hal::LocalExecutionGuard {
+        unsafe { tx_hal::LocalExecutionGuard::new(0, restore_synthetic_local_execution) }
+    }
+}
 impl EntropyIf for SyntheticPlatform {}
 impl CacheIf for SyntheticPlatform {}
 impl DmaIf for SyntheticPlatform {}
@@ -319,12 +345,11 @@ impl PowerIf for SyntheticPlatform {
     }
 }
 
-impl TimeIf for SyntheticPlatform {
+impl MonotonicCounterIf for SyntheticPlatform {
     fn read_ns() -> u64 {
         TS_COUNTER_HELPER.fetch_add(1, Ordering::Relaxed) as u64 + 1
     }
-    fn set_deadline_ns(_: u64) {}
-    fn cancel_deadline() {}
+
     fn frequency_hz() -> u64 {
         1_000_000_000
     }

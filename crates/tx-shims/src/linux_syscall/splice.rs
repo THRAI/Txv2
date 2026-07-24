@@ -8,6 +8,7 @@
 
 use super::*;
 use crate::adapter::step_engine::StepOutcome;
+use tx_services::time::{ClockRead, TimekeeperClock};
 use tx_subsystems::vfs::structure::{InodeKind, OpenFileBacking, RNodeBacking, StructPayload};
 
 const SPLICE_F_MOVE: u32 = 0x01;
@@ -279,10 +280,10 @@ pub(super) fn sys_tee<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
     splice_outcome_to_result(outcome)
 }
 
-pub(super) async fn sys_splice<'a, P: tx_hal::TimeIf>(
-    args: [u64; 6],
-    ctx: &SyscallCtx<'a>,
-) -> SyscallResult {
+pub(super) async fn sys_splice<'a, P>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
+where
+    TimekeeperClock<P>: ClockRead,
+{
     let fd_in = args[0] as i32;
     let off_in_ptr = args[1];
     let fd_out = args[2] as i32;
@@ -343,7 +344,7 @@ pub(super) async fn sys_splice<'a, P: tx_hal::TimeIf>(
             if input.side != tx_subsystems::pipe::PipeSide::Reader {
                 return SyscallResult::Error(EBADF_VALUE);
             }
-            splice_pipe_to_file::<P>(fd_in, fd_out, off_out_ptr, len, ctx).await
+            splice_pipe_to_file(fd_in, fd_out, off_out_ptr, len, ctx).await
         }
         (None, Some(output)) => {
             if output.side != tx_subsystems::pipe::PipeSide::Writer {
@@ -355,7 +356,7 @@ pub(super) async fn sys_splice<'a, P: tx_hal::TimeIf>(
     }
 }
 
-async fn splice_pipe_to_file<'a, P: tx_hal::TimeIf>(
+async fn splice_pipe_to_file<'a>(
     fd_in: i32,
     fd_out: i32,
     off_out_ptr: u64,
@@ -428,11 +429,16 @@ async fn splice_pipe_to_file<'a, P: tx_hal::TimeIf>(
             if let Some(n) = written_len {
                 let mut discard = alloc::vec::Vec::new();
                 discard.resize(n, 0);
-                let _ = sys_read::<P>(
-                    [fd_in as u64, discard.as_mut_ptr() as u64, n as u64, 0, 0, 0],
-                    ctx,
-                )
-                .await;
+                let _ = {
+                    let guard = step_engine::guard();
+                    tx_subsystems::pipe::step_read_with_post(
+                        &in_pipe.payload,
+                        &mut discard,
+                        &guard,
+                        in_pipe.nonblocking,
+                        |mailbox, event| ctx.post_mailbox_ref_event(mailbox, event),
+                    )
+                };
             }
             result
         }
@@ -563,13 +569,16 @@ fn try_splice_pipe_lease_to_file<'a>(
     }
 }
 
-async fn splice_file_to_pipe<'a, P: tx_hal::TimeIf>(
+async fn splice_file_to_pipe<'a, P>(
     fd_in: i32,
     off_in_ptr: u64,
     fd_out: i32,
     len: usize,
     ctx: &SyscallCtx<'a>,
-) -> SyscallResult {
+) -> SyscallResult
+where
+    TimekeeperClock<P>: ClockRead,
+{
     if let Some(result) = try_splice_file_lease_to_pipe(fd_in, off_in_ptr, fd_out, len, ctx) {
         return result;
     }
@@ -709,11 +718,10 @@ fn try_splice_file_lease_to_pipe<'a>(
     }
 }
 
-async fn read_file_to_kernel<'a, P: tx_hal::TimeIf>(
-    fd: i32,
-    buf: &mut [u8],
-    ctx: &SyscallCtx<'a>,
-) -> SyscallResult {
+async fn read_file_to_kernel<'a, P>(fd: i32, buf: &mut [u8], ctx: &SyscallCtx<'a>) -> SyscallResult
+where
+    TimekeeperClock<P>: ClockRead,
+{
     let file = match resolve_fd(&ctx.process, fd as u32) {
         Some(file) => file,
         None => return SyscallResult::Error(EBADF_VALUE),
@@ -731,7 +739,7 @@ async fn read_file_to_kernel<'a, P: tx_hal::TimeIf>(
         };
         return splice_outcome_to_result(outcome);
     }
-    sys_read::<P>(
+    super::io::sys_read_non_socket::<P>(
         [
             fd as u64,
             buf.as_mut_ptr() as u64,
@@ -741,6 +749,7 @@ async fn read_file_to_kernel<'a, P: tx_hal::TimeIf>(
             0,
         ],
         ctx,
+        file,
     )
     .await
 }

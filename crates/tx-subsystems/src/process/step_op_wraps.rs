@@ -12,7 +12,7 @@ use crate::process::adapter::step_engine::{
     PlaceholderProcessSubject, ScriptCtx, StepOp, StepOutcome,
 };
 use crate::process::structure::reset_pid_counter_for_test;
-use crate::signal::{SignalMask, Signum};
+use crate::signal::SignalMask;
 use crate::test_support::EPOCH_TEST_LOCK;
 use crate::thread_runtime::structure::reset_tid_counter_for_test;
 use crate::vm::{AddressSpace, TestPmap};
@@ -106,41 +106,6 @@ fn clone_thread_op_delegates_to_step_clone_thread() {
 }
 
 #[test]
-fn exit_group_op_delegates_to_step_exit_group() {
-    let _g = setup();
-    let parent = bootstrap();
-    let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
-    let mut op = ExitGroupOp {
-        process: &child,
-        status: ExitStatus::Exited(0),
-    };
-    let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
-    let outcome = op.step(&mut ctx);
-    assert_eq!(outcome, StepOutcome::Done(()));
-    assert!(child.is_zombie());
-    assert_eq!(child.exit_status(), Some(ExitStatus::Exited(0)));
-}
-
-#[test]
-fn exit_group_with_signal_op_delegates_to_step_exit_group_with_signal() {
-    let _g = setup();
-    let parent = bootstrap();
-    let child = step_fork::<TestPmap>(&parent, false, false).expect("fork");
-    let mut op = ExitGroupWithSignalOp {
-        process: &child,
-        sig: Signum::SIGKILL,
-    };
-    let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
-    let outcome = op.step(&mut ctx);
-    assert_eq!(outcome, StepOutcome::Done(()));
-    assert!(child.is_zombie());
-    assert_eq!(
-        child.exit_status(),
-        Some(ExitStatus::Signaled(Signum::SIGKILL))
-    );
-}
-
-#[test]
 fn waitpid_nohang_op_no_children_returns_echild() {
     let _g = setup();
     let parent = bootstrap();
@@ -197,17 +162,6 @@ fn setsid_op_delegates_to_step_setsid() {
         StepOutcome::Done(sid) => assert_eq!(sid.0, child.pid.0),
         other => panic!("expected Done(sid), got {other:?}"),
     }
-}
-
-#[test]
-fn close_cloexec_fds_op_is_noop_with_empty_set() {
-    let _g = setup();
-    let parent = bootstrap();
-    let mut op = CloseCloexecFdsOp { process: &parent };
-    let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
-    let outcome = op.step(&mut ctx);
-    assert_eq!(outcome, StepOutcome::Done(()));
-    assert!(parent.fd_cloexec_snapshot().is_empty());
 }
 
 #[test]

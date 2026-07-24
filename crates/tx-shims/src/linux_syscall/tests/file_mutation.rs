@@ -10,11 +10,12 @@ use crate::adapter::step_engine::{
 use tx_fs::tmpfs::{Tmpfs, TMPFS_ROOT_OBJECT_ID};
 use tx_subsystems::cred::CapabilitySet;
 use tx_subsystems::mount::{
-    DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, SourceLabel,
+    DevId, MountFlags, MountId, MountIdentity, MountNamespace, MountOptions, MountPayload,
+    Propagation, SourceLabel,
 };
 use tx_subsystems::page_backed::FsPageBacking;
 use tx_subsystems::pipe::{step_pipe2, PipeFlags};
-use tx_subsystems::process::step_chdir;
+use tx_subsystems::process::{step_chdir, step_set_mount_namespace};
 use tx_subsystems::vfs::structure::{
     Credential, DEntry, DirCursor, FsObjectId, InlineName, InodeKind, InodeMeta, RNode,
     RNodeBacking, S_IFDIR,
@@ -22,9 +23,9 @@ use tx_subsystems::vfs::structure::{
 use tx_subsystems::vfs::FsOps;
 
 use crate::linux_syscall::{
-    AT_FDCWD, AT_REMOVEDIR, NR_FSTAT, NR_FTRUNCATE, NR_LINKAT, NR_LSEEK, NR_MKDIRAT, NR_OPENAT,
-    NR_READLINKAT, NR_RENAMEAT2, NR_SYMLINKAT, NR_TRUNCATE, NR_UNLINKAT, NR_UTIMENSAT, O_RDWR,
-    O_TMPFILE, RENAME_EXCHANGE, RENAME_NOREPLACE, SEEK_SET, UTIME_NOW,
+    AT_FDCWD, AT_REMOVEDIR, NR_FSTAT, NR_FTRUNCATE, NR_LINKAT, NR_LSEEK, NR_MKDIRAT, NR_MOUNT,
+    NR_OPENAT, NR_READLINKAT, NR_RENAMEAT2, NR_SYMLINKAT, NR_TRUNCATE, NR_UNLINKAT, NR_UTIMENSAT,
+    O_RDWR, O_TMPFILE, RENAME_EXCHANGE, RENAME_NOREPLACE, SEEK_SET, UTIME_NOW,
 };
 
 /// errno magnitudes (positive Linux RV64 generic ABI values).
@@ -188,6 +189,188 @@ fn lookup_exists_in(tmpfs: &Arc<Tmpfs>, parent: FsObjectId, name: &[u8]) -> bool
     matches!(tmpfs.lookup(parent, name, &guard), StepOutcome::Done(_))
 }
 
+fn install_test_mount_namespace(
+    process: &Cap<ProcessIdentity>,
+    root: &Cap<DEntry>,
+) -> (Cap<MountIdentity>, Cap<MountNamespace>) {
+    let payload = root
+        .rnode()
+        .containing_mount_weak()
+        .and_then(|weak| weak.upgrade(&guard()))
+        .expect("root mount payload");
+    let root_mount = MountIdentity::new_cap_with_root_dentry(
+        MountId::new(42_000),
+        None,
+        root.clone(),
+        None,
+        payload,
+        MountFlags::empty(),
+    )
+    .expect("root mount identity");
+    let namespace = MountNamespace::new_cap(root_mount.clone()).expect("mount namespace");
+    step_set_mount_namespace(process, namespace.clone()).expect("install mount namespace");
+    (root_mount, namespace)
+}
+
+fn walk_in_namespace(
+    root: &Cap<DEntry>,
+    path: &[u8],
+    namespace: &Cap<MountNamespace>,
+) -> Cap<DEntry> {
+    let guard = guard();
+    match tx_subsystems::vfs::walker::step_walk_in_mount_namespace(
+        root.clone(),
+        path,
+        &root_cred(),
+        namespace,
+        &guard,
+    ) {
+        StepOutcome::Done(dentry) => dentry,
+        other => panic!("namespace walk {path:?}: {other:?}"),
+    }
+}
+
+// -----------------------------------------------------------------
+// mount namespace bind/move
+// -----------------------------------------------------------------
+
+#[test]
+fn dispatch_mount_bind_is_immediately_visible_in_calling_mount_namespace() {
+    const MS_BIND: u64 = 4096;
+
+    let _setup = fm_setup();
+    let (root, tmpfs) = build_tmpfs_root();
+    make_dir(&tmpfs, b"source");
+    make_dir(&tmpfs, b"target");
+    let (process, thread) = bootstrap_with_cwd(root.clone());
+    let (_root_mount, namespace) = install_test_mount_namespace(&process, &root);
+    let ctx = make_ctx(process, thread);
+
+    let target_before = walk_in_namespace(&root, b"/target", &namespace);
+    let source = nul_terminate(b"/source");
+    let target = nul_terminate(b"/target");
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_MOUNT,
+            [
+                source.as_ptr() as u64,
+                target.as_ptr() as u64,
+                0,
+                MS_BIND,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Return(0));
+
+    let mounted = namespace
+        .mount_for(&target_before)
+        .expect("bind must publish into the calling mount namespace");
+    let resolved = walk_in_namespace(&root, b"/target", &namespace);
+    assert_eq!(resolved.key(), mounted.root_dentry().key());
+}
+
+#[test]
+fn dispatch_mount_move_preserves_identity_and_rekeys_global_and_namespace_indexes() {
+    const MS_BIND: u64 = 4096;
+    const MS_MOVE: u64 = 8192;
+
+    let _setup = fm_setup();
+    let (root, tmpfs) = build_tmpfs_root();
+    make_dir(&tmpfs, b"source");
+    let old_id = make_dir(&tmpfs, b"old");
+    let new_id = make_dir(&tmpfs, b"new");
+    let (process, thread) = bootstrap_with_cwd(root.clone());
+    let (_root_mount, namespace) = install_test_mount_namespace(&process, &root);
+    let ctx = make_ctx(process, thread);
+
+    let old_mountpoint = walk_in_namespace(&root, b"/old", &namespace);
+    let new_mountpoint = walk_in_namespace(&root, b"/new", &namespace);
+    let source = nul_terminate(b"/source");
+    let old = nul_terminate(b"/old");
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_MOUNT,
+                [
+                    source.as_ptr() as u64,
+                    old.as_ptr() as u64,
+                    0,
+                    MS_BIND,
+                    0,
+                    0,
+                ],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Return(0)
+    );
+    let original = namespace.mount_for(&old_mountpoint).expect("bound mount");
+    let parent_payload = root
+        .rnode()
+        .containing_mount_weak()
+        .and_then(|weak| weak.upgrade(&guard()))
+        .expect("root mount payload");
+    assert_eq!(
+        tx_subsystems::mount::mount_for(&parent_payload, old_id)
+            .expect("global bound mount")
+            .key(),
+        original.key()
+    );
+    original.set_flags(MountFlags::NOEXEC);
+    original.set_propagation(Propagation::Shared);
+    original.set_peer_group(77);
+    let identity_key = original.key();
+    let mount_id = original.id();
+    let root_key = original.root_dentry().key();
+    let parent_key = original.parent().map(Cap::key);
+
+    let new = nul_terminate(b"/new");
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_MOUNT,
+                [old.as_ptr() as u64, new.as_ptr() as u64, 0, MS_MOVE, 0, 0],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Return(0)
+    );
+
+    assert!(namespace.mount_for(&old_mountpoint).is_none());
+    assert!(tx_subsystems::mount::mount_for(&parent_payload, old_id).is_none());
+    let moved = namespace
+        .mount_for(&new_mountpoint)
+        .expect("moved mount at new namespace index");
+    assert_eq!(
+        tx_subsystems::mount::mount_for(&parent_payload, new_id)
+            .expect("moved mount at new global index")
+            .key(),
+        identity_key
+    );
+    assert_eq!(moved.key(), identity_key);
+    assert_eq!(moved.id(), mount_id);
+    assert_eq!(moved.root_dentry().key(), root_key);
+    assert_eq!(moved.flags(), MountFlags::NOEXEC);
+    assert_eq!(moved.propagation(), Propagation::Shared);
+    assert_eq!(moved.peer_group(), 77);
+    assert_eq!(moved.parent().map(Cap::key), parent_key);
+    assert_eq!(
+        moved.mountpoint().expect("moved mountpoint").key(),
+        new_mountpoint.key()
+    );
+    assert_eq!(
+        walk_in_namespace(&root, b"/new", &namespace).key(),
+        root_key
+    );
+    assert_ne!(
+        walk_in_namespace(&root, b"/old", &namespace).key(),
+        root_key
+    );
+}
+
 // -----------------------------------------------------------------
 // mkdirat
 // -----------------------------------------------------------------
@@ -231,9 +414,9 @@ fn dispatch_mkdirat_existing_returns_neg_eexist() {
     drop(path);
 }
 
-/// `mkdirat` with a non-cwd dirfd surfaces as `-EBADF`.
+/// `mkdirat` with an absolute path ignores a non-cwd dirfd.
 #[test]
-fn dispatch_mkdirat_non_cwd_dirfd_returns_neg_ebadf() {
+fn dispatch_mkdirat_absolute_path_ignores_non_cwd_dirfd() {
     let _setup = fm_setup();
     let (root_dentry, _tmpfs) = build_tmpfs_root();
     let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
@@ -242,7 +425,7 @@ fn dispatch_mkdirat_non_cwd_dirfd_returns_neg_ebadf() {
     let path = nul_terminate(b"/d");
     let req = SyscallRequest::new(NR_MKDIRAT, [3, path.as_ptr() as u64, 0o755, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
-    assert_eq!(result, SyscallResult::Error(E_BADF));
+    assert_eq!(result, SyscallResult::Return(0));
     drop(path);
 }
 
@@ -602,6 +785,26 @@ fn dispatch_truncate_pagebacked_returns_zero() {
     let req = SyscallRequest::new(NR_TRUNCATE, [path.as_ptr() as u64, 0, 0, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Return(0));
+    drop(path);
+}
+
+#[test]
+fn dispatch_truncate_without_file_write_returns_neg_eacces() {
+    use tx_subsystems::cross_crate_test_support::{clear_caps_for_test, set_cred_ids_for_test};
+
+    let _setup = fm_setup();
+    let (root_dentry, tmpfs) = build_tmpfs_root();
+    create_regular(&tmpfs, b"f");
+
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    set_cred_ids_for_test(&proc_cap, 2000, 2000, 2000, 2000, 2000, 2000);
+    clear_caps_for_test(&proc_cap);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let path = nul_terminate(b"/f");
+    let req = SyscallRequest::new(NR_TRUNCATE, [path.as_ptr() as u64, 0, 0, 0, 0, 0]);
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Error(E_ACCES));
     drop(path);
 }
 

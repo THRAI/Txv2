@@ -128,8 +128,7 @@ pub(crate) fn lint_invariants_witness_scope(root: &Path) -> Result<()> {
         "ok"
     };
     println!(
-        "IdentRef in struct fields: {:>4}  (ceiling {})  {}",
-        struct_count, MAX_IDENTREF_IN_STRUCTS, struct_status
+        "IdentRef in struct fields: {struct_count:>4}  (ceiling {MAX_IDENTREF_IN_STRUCTS})  {struct_status}"
     );
 
     let outcome_status = if outcome_count > MAX_IDENTREF_IN_STEP_OUTCOME {
@@ -138,8 +137,7 @@ pub(crate) fn lint_invariants_witness_scope(root: &Path) -> Result<()> {
         "ok"
     };
     println!(
-        "IdentRef in StepOutcome:   {:>4}  (ceiling {})  {}",
-        outcome_count, MAX_IDENTREF_IN_STEP_OUTCOME, outcome_status
+        "IdentRef in StepOutcome:   {outcome_count:>4}  (ceiling {MAX_IDENTREF_IN_STEP_OUTCOME})  {outcome_status}"
     );
 
     for v in &struct_violations {

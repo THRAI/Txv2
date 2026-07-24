@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import contextlib
+import gzip
 import io
 import shutil
 import subprocess
@@ -12,11 +13,14 @@ from pathlib import Path
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "tx-observe-analyze.py"
+HOST_PACKAGE = SCRIPT.with_name("tx_observe_host")
 SPEC = importlib.util.spec_from_file_location("tx_observe_analyze", SCRIPT)
 assert SPEC is not None
 analyzer = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(analyzer)
+
+import tx_observe_host.l6_views as host_l6_views
 
 
 def make_record(
@@ -60,6 +64,108 @@ def make_record(
 
 
 class TxObserveAnalyzeTests(unittest.TestCase):
+    def test_python_host_layers_are_package_directories(self) -> None:
+        for layer in ["l4_readers", "l5_canonical", "l6_views"]:
+            with self.subTest(layer=layer):
+                self.assertTrue((HOST_PACKAGE / layer).is_dir())
+                self.assertTrue((HOST_PACKAGE / layer / "__init__.py").is_file())
+                self.assertFalse((HOST_PACKAGE / f"{layer}.py").exists())
+
+    def test_analyzer_exposes_host_boundary_types(self) -> None:
+        records = [
+            {"kind": "Counter", "hart": 0, "ts": "1", "payload": {"counter_id": 1, "value": 2}},
+        ]
+        integrity = analyzer.TraceIntegrity.from_records("ndjson", records)
+        stream = analyzer.TraceEventStream(records, integrity)
+        projection = analyzer.ProjectionInput(stream, {1: "debug.test.counter"})
+
+        self.assertEqual(projection.stream.integrity.input_kind, "ndjson")
+        self.assertEqual(projection.stream.integrity.retained_records, 1)
+        self.assertEqual(projection.stream.records, records)
+        self.assertEqual(projection.stream.markers, [])
+        self.assertEqual(analyzer.TraceStreamMarker.capture_loss(projection.stream.integrity).kind, "capture_loss")
+        self.assertIn("debug.test.counter", analyzer.analyze_projection(projection, top=1))
+
+    def test_analyzer_host_boundary_types_live_in_layer_modules(self) -> None:
+        self.assertEqual(analyzer.TraceIntegrity.__module__, "tx_observe_host.l4_readers")
+        self.assertEqual(analyzer.TraceLoadResult.__module__, "tx_observe_host.l4_readers")
+        self.assertEqual(analyzer.TraceEventStream.__module__, "tx_observe_host.l5_canonical")
+        self.assertEqual(analyzer.TraceStreamMarker.__module__, "tx_observe_host.l5_canonical")
+        self.assertEqual(analyzer.ProjectionInput.__module__, "tx_observe_host.l6_views")
+        self.assertEqual(analyzer.load_txtrace_stream.__module__, "tx_observe_host.l4_readers")
+        self.assertEqual(analyzer.load_rawrecords_stream.__module__, "tx_observe_host.l4_readers")
+        self.assertEqual(analyzer.load_records_stream.__module__, "tx_observe_host.l4_readers")
+        self.assertEqual(analyzer.decode_record_bytes.__module__, "tx_observe_host.l5_canonical")
+        self.assertEqual(analyzer.decode_payload_bytes.__module__, "tx_observe_host.l5_canonical")
+        self.assertEqual(analyzer.validate_host_catalog.__module__, "tx_observe_host.l6_views")
+        self.assertEqual(analyzer.projection_schema_catalog.__module__, "tx_observe_host.l6_views")
+        self.assertEqual(analyzer.parquet_select_sql.__module__, "tx_observe_host.l6_views")
+        self.assertEqual(analyzer.DerivedTables.__module__, "tx_observe_host.l6_views.tables")
+        self.assertEqual(analyzer.DerivedCacheResult.__module__, "tx_observe_host.l6_views.tables")
+        self.assertEqual(analyzer.build_derived_tables.__module__, "tx_observe_host.l6_views.tables")
+        self.assertEqual(analyzer.load_or_build_derived_tables.__module__, "tx_observe_host.l6_views.tables")
+        self.assertEqual(analyzer.export_derived_tables_parquet.__module__, "tx_observe_host.l6_views.tables")
+        self.assertEqual(analyzer.run_sql_query.__module__, "tx_observe_host.l6_views.tables")
+        self.assertEqual(analyzer.run_python_projection.__module__, "tx_observe_host.l6_views.tables")
+        self.assertEqual(analyzer.analyze_projection.__module__, "tx_observe_host.l6_views.reports")
+        self.assertEqual(analyzer.analyze_allocation_tracks.__module__, "tx_observe_host.l6_views.reports")
+        self.assertEqual(analyzer.analyze_lock_metrics.__module__, "tx_observe_host.l6_views.reports")
+        self.assertEqual(analyzer.analyze_futex_ops.__module__, "tx_observe_host.l6_views.reports")
+        self.assertEqual(analyzer.allocation_rows.__module__, "tx_observe_host.l6_views.reports")
+
+    def test_analyzer_validates_generated_host_catalog(self) -> None:
+        catalog = SCRIPT.with_name("tx-observe-host-catalog.json")
+
+        checked = analyzer.validate_host_catalog(catalog)
+
+        self.assertIn("records", checked)
+        self.assertIn("spans.parquet", checked)
+        self.assertEqual(
+            checked["records"],
+            [
+                ("ts", "UBIGINT"),
+                ("hart", "UINTEGER"),
+                ("seq", "UBIGINT"),
+                ("kind", "VARCHAR"),
+                ("level", "VARCHAR"),
+                ("span", "VARCHAR"),
+                ("parent", "VARCHAR"),
+                ("name_id", "UINTEGER"),
+                ("payload_tag", "UINTEGER"),
+            ],
+        )
+        self.assertIn(("dur", "UBIGINT"), checked["spans.parquet"])
+        self.assertFalse(hasattr(analyzer, "RECORD_SQL_SCHEMA"))
+        self.assertFalse(hasattr(analyzer, "PARQUET_SCHEMAS"))
+
+    def test_analyzer_validates_generated_host_catalog_topology(self) -> None:
+        catalog = analyzer.load_host_catalog(SCRIPT.with_name("tx-observe-host-catalog.json"))
+
+        checked = analyzer.validate_host_catalog_topology(catalog)
+
+        self.assertIn("lock_metrics", checked["control_groups"])
+        self.assertIn("lock", checked["event_families"])
+        self.assertIn("lock_rows", checked["event_families"]["lock"]["projection"])
+
+    def test_analyzer_rejects_bad_host_catalog_event_family_projection(self) -> None:
+        catalog = {
+            "schema": "tx-observe-host-catalog-v0",
+            "control_groups": [{"id": "lock_metrics"}],
+            "projections": [{"id": "records", "kind": "sql_view", "columns": []}],
+            "event_families": [
+                {
+                    "id": "lock",
+                    "levels": ["boundary"],
+                    "payloads": ["counter_value"],
+                    "control_group": "lock_metrics",
+                    "projection": ["missing_projection"],
+                }
+            ],
+        }
+
+        with self.assertRaisesRegex(ValueError, "missing_projection"):
+            analyzer.validate_host_catalog_topology(catalog)
+
     def test_analyze_accepts_string_timestamps_and_reports_hart_local_gaps(self) -> None:
         records = [
             {"kind": "Counter", "hart": 0, "ts": "0", "payload": {"counter_id": 1, "value": "9007199254740993"}},
@@ -789,7 +895,7 @@ class TxObserveAnalyzeTests(unittest.TestCase):
             payload = struct.pack("<IIQ", counter_id, 0, value)
             return make_record(hart=hart, seq=seq, ts=ts, payload_tag=analyzer.PAYLOAD_COUNTER_VALUE, payload=payload)
 
-        def make_trace(records_by_hart: list[list[bytes]]) -> Path:
+        def make_trace(records_by_hart: list[list[bytes]], lost_by_hart: list[int] | None = None) -> Path:
             ring_order = 2
             slot_count = 1 << ring_order
             ring_data_size = analyzer.RING_HEADER_SIZE + slot_count * analyzer.SUPPORTED_RECORD_SIZE
@@ -809,6 +915,8 @@ class TxObserveAnalyzeTests(unittest.TestCase):
                 ring_base = 72 + hart * ring_data_size
                 struct.pack_into("<H", buf, ring_base, hart)
                 struct.pack_into("<Q", buf, ring_base + analyzer.RING_PRODUCER_OFF, len(records))
+                if lost_by_hart is not None:
+                    struct.pack_into("<Q", buf, ring_base + analyzer.RING_LOST_OFF, lost_by_hart[hart])
                 slots_base = ring_base + analyzer.RING_HEADER_SIZE
                 for idx, record in enumerate(records):
                     off = slots_base + idx * analyzer.SUPPORTED_RECORD_SIZE
@@ -827,13 +935,30 @@ class TxObserveAnalyzeTests(unittest.TestCase):
             ]
         )
         try:
+            stream = analyzer.load_txtrace_stream(trace_path)
             records = analyzer.load_txtrace_records(trace_path)
         finally:
             trace_path.unlink(missing_ok=True)
 
+        self.assertEqual(stream.integrity.input_kind, "txtrace")
+        self.assertTrue(stream.integrity.complete)
+        self.assertEqual(stream.integrity.drained_records, 3)
+        self.assertEqual(stream.integrity.retained_records, 3)
+        self.assertEqual(stream.records, records)
         self.assertEqual([record["hart"] for record in records], [1, 0, 1])
         self.assertEqual([record["ts"] for record in records], [100, 200, 300])
         self.assertEqual(records[0]["payload"]["value"], 1)
+
+        loss_trace = make_trace([[make_counter_record(0, 1, 100, 1, 2)]], lost_by_hart=[5])
+        try:
+            loss_stream = analyzer.load_txtrace_stream(loss_trace)
+        finally:
+            loss_trace.unlink(missing_ok=True)
+
+        self.assertFalse(loss_stream.integrity.complete)
+        self.assertEqual(loss_stream.integrity.lost_records, 5)
+        self.assertEqual(loss_stream.markers[-1].kind, "capture_loss")
+        self.assertEqual(loss_stream.markers[-1].lost_records, 5)
 
     def test_load_txtrace_records_emits_repairs_for_malformed_slots(self) -> None:
         def make_trace(records_by_hart: list[list[bytes]]) -> Path:
@@ -904,10 +1029,17 @@ class TxObserveAnalyzeTests(unittest.TestCase):
             ]
         )
         try:
+            stream = analyzer.load_txtrace_stream(trace_path)
             records = analyzer.load_txtrace_records(trace_path)
         finally:
             trace_path.unlink(missing_ok=True)
 
+        self.assertFalse(stream.integrity.complete)
+        self.assertEqual(stream.integrity.repair_count, 3)
+        self.assertEqual(stream.integrity.retained_records, 4)
+        self.assertEqual(stream.records, records)
+        self.assertEqual([marker.kind for marker in stream.markers], ["repair", "repair", "repair"])
+        self.assertEqual(stream.markers[0].category, "txtrace.repair.bad_magic")
         self.assertEqual(records[-3]["kind"], "Repair")
         self.assertEqual(records[-3]["category"], "txtrace.repair.bad_magic")
         self.assertEqual(records[-2]["category"], "txtrace.repair.version_mismatch")
@@ -936,16 +1068,66 @@ class TxObserveAnalyzeTests(unittest.TestCase):
             tmp.write(raw)
             raw_path = Path(tmp.name)
         try:
+            stream = analyzer.load_rawrecords_stream(raw_path)
             records = analyzer.load_rawrecords(raw_path)
         finally:
             raw_path.unlink(missing_ok=True)
 
+        self.assertEqual(stream.integrity.input_kind, "rawrecords")
+        self.assertFalse(stream.integrity.complete)
+        self.assertEqual(stream.integrity.drained_records, 3)
+        self.assertEqual(stream.integrity.retained_records, 3)
+        self.assertEqual(stream.integrity.repair_count, 1)
+        self.assertEqual(stream.records, records)
+        self.assertEqual([marker.kind for marker in stream.markers], ["repair"])
+        self.assertEqual(stream.markers[0].category, "txtrace.repair.bad_magic")
         self.assertEqual(records[0]["hart"], 1)
         self.assertEqual(records[0]["ts"], 200)
         self.assertEqual(records[1]["hart"], 0)
         self.assertEqual(records[1]["ts"], 300)
         self.assertEqual(records[2]["kind"], "Repair")
         self.assertEqual(records[2]["category"], "txtrace.repair.bad_magic")
+
+    def test_load_gzip_rawrecords_preserves_canonical_records(self) -> None:
+        raw = struct.pack("<H6x", 2) + make_record(hart=2, seq=7, ts=99)
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "trace.rawrecords.gz"
+            with gzip.open(path, "wb") as file:
+                file.write(raw)
+
+            stream = analyzer.load_rawrecords_stream(path)
+
+        self.assertEqual(stream.integrity.input_kind, "rawrecords-gzip")
+        self.assertTrue(stream.integrity.complete)
+        self.assertEqual(stream.integrity.drained_records, 1)
+        self.assertEqual(stream.records[0]["hart"], 2)
+        self.assertEqual(stream.records[0]["seq"], 7)
+
+    def test_default_cli_materializes_sibling_parquet_directory(self) -> None:
+        duckdb = shutil.which("duckdb")
+        if duckdb is None:
+            self.skipTest("duckdb CLI is required to verify default Parquet export")
+        with TemporaryDirectory() as tmpdir:
+            rawrecords = Path(tmpdir) / "trace.rawrecords.gz"
+            with gzip.open(rawrecords, "wb") as file:
+                file.write(struct.pack("<H6x", 0) + make_record(hart=0, seq=1, ts=1))
+
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--rawrecords",
+                    str(rawrecords),
+                    "--source-root",
+                    "/dev/null",
+                ],
+                capture_output=True,
+                text=True,
+            )
+
+            parquet_dir = rawrecords.with_name(rawrecords.name + ".parquet")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertTrue((parquet_dir / "counters.parquet").exists())
 
     def test_sql_mode_queries_derived_and_record_views(self) -> None:
         duckdb = shutil.which("duckdb")
@@ -967,6 +1149,54 @@ class TxObserveAnalyzeTests(unittest.TestCase):
         ).strip()
 
         self.assertEqual(output, "records,p50\n3,200")
+
+    def test_sql_mode_accepts_projection_input(self) -> None:
+        duckdb = shutil.which("duckdb")
+        if duckdb is None:
+            self.skipTest("duckdb CLI is required to verify SQL mode")
+        records = [
+            {"kind": "Counter", "hart": 0, "seq": 1, "ts": "100", "payload": {"counter_id": 3, "value": 9}},
+        ]
+        tables = analyzer.build_derived_tables(records)
+        projection = analyzer.ProjectionInput(
+            analyzer.TraceEventStream(records, analyzer.TraceIntegrity.from_records("ndjson", records)),
+            {3: "debug.counter"},
+            tables,
+        )
+
+        output = analyzer.run_sql_projection(
+            projection,
+            "select count(*) as records, (select count(*) from counters) as counters from records",
+            "csv",
+        ).strip()
+
+        self.assertEqual(output, "records,counters\n1,1")
+
+    def test_sql_mode_uses_generated_host_catalog_schemas(self) -> None:
+        duckdb = shutil.which("duckdb")
+        if duckdb is None:
+            self.skipTest("duckdb CLI is required to verify SQL mode")
+        old_cache = host_l6_views._PROJECTION_SCHEMA_CATALOG
+        try:
+            host_l6_views._PROJECTION_SCHEMA_CATALOG = {
+                **analyzer.projection_schema_catalog(),
+                "records": [("wrong_column", "VARCHAR")],
+            }
+            records = [
+                {"kind": "Counter", "hart": 0, "seq": 1, "ts": "100", "payload": {"counter_id": 3, "value": 9}},
+            ]
+            tables = analyzer.build_derived_tables(records)
+
+            with self.assertRaisesRegex(RuntimeError, "ts"):
+                analyzer.run_sql_query(
+                    records,
+                    tables,
+                    {3: "debug.counter"},
+                    "select count(ts) as records from records",
+                    "csv",
+                )
+        finally:
+            host_l6_views._PROJECTION_SCHEMA_CATALOG = old_cache
 
     def test_python_file_receives_parquet_environment(self) -> None:
         duckdb = shutil.which("duckdb")

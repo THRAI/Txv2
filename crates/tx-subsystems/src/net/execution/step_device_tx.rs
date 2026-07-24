@@ -5,10 +5,11 @@ use tx_substrate::zone::{Cap, PayloadCap};
 use crate::execution::{Guard, StepOutcome};
 use crate::net::namespace::{initial_net_namespace_payload, NetNamespacePayload};
 use crate::net::packet::{PacketTxReadiness, PacketTxResult, PacketTxSink};
-use crate::net::protocol::{build_icmpv4_echo_request, build_icmpv6_echo_request_packet};
+use crate::net::protocol::build_icmpv4_echo_request;
 use crate::net::structure::{
     IpEndpoint, Ipv4Address, SendWireSet, SocketIdentity, SocketProtocol, TcpState, UdpInner,
 };
+use tx_substrate::wake::mailbox::{MailboxEvent, TaskMailbox};
 
 pub const DEVICE_TX_BUDGET_DEFAULT: DeviceTxBudget = DeviceTxBudget {
     tcp_connecting: 16,
@@ -76,52 +77,66 @@ impl DeviceTxOutcome {
     }
 }
 
-pub fn step_process_device_tx_pending(
+pub fn step_process_device_tx_pending_with_post<F>(
     sink: &dyn PacketTxSink,
     budget: DeviceTxBudget,
     guard: &Guard<'_>,
-) -> StepOutcome<DeviceTxOutcome> {
+    post: F,
+) -> StepOutcome<DeviceTxOutcome>
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     // observe
     // upgrade
     // reserve
     // commit
     // publish
-    step_process_device_tx_pending_in_namespace_at(
+    step_process_device_tx_pending_in_namespace_at_with_post::<F>(
         sink,
         initial_net_namespace_payload(),
         Instant::ZERO,
         budget,
         guard,
+        post,
     )
 }
 
-pub fn step_process_device_tx_pending_at(
+pub fn step_process_device_tx_pending_at_with_post<F>(
     sink: &dyn PacketTxSink,
     now: Instant,
     budget: DeviceTxBudget,
     guard: &Guard<'_>,
-) -> StepOutcome<DeviceTxOutcome> {
+    post: F,
+) -> StepOutcome<DeviceTxOutcome>
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     // observe
     // upgrade
     // reserve
     // commit
     // publish
-    step_process_device_tx_pending_in_namespace_at(
+    step_process_device_tx_pending_in_namespace_at_with_post::<F>(
         sink,
         initial_net_namespace_payload(),
         now,
         budget,
         guard,
+        post,
     )
 }
 
-pub fn step_process_device_tx_pending_in_namespace_at(
+pub fn step_process_device_tx_pending_in_namespace_at_with_post<F>(
     sink: &dyn PacketTxSink,
     net_namespace: PayloadCap<NetNamespacePayload>,
     now: Instant,
     budget: DeviceTxBudget,
     guard: &Guard<'_>,
-) -> StepOutcome<DeviceTxOutcome> {
+    mut post: F,
+) -> StepOutcome<DeviceTxOutcome>
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     // observe
     // upgrade
     // reserve
@@ -133,43 +148,17 @@ pub fn step_process_device_tx_pending_in_namespace_at(
     for socket in table
         .snapshot_tcp_bound(guard)
         .into_iter()
-        .filter(|socket| is_tcp_connecting(socket, guard))
+        .filter(is_tcp_connecting)
         .take(budget.tcp_connecting)
     {
         process_tcp_tx_socket(&socket, sink, now, guard, &mut outcome);
-    }
-
-    // Half-open inbound children (P2-S3): their SYN-ACK (initial send and
-    // RTO retransmits) is queued inside smoltcp by the SYN feed, but they
-    // are not in the connections table until the final ACK promotes them,
-    // so the lanes above cannot see them. Walk the listeners' connecting
-    // backlogs; `dispatch_segment` inside `process_tcp_tx_socket` is the
-    // only gate needed (it emits nothing unless smoltcp wants to send).
-    let mut half_open_seen = Vec::new();
-    for listener in table
-        .snapshot_tcp_listeners(guard)
-        .into_iter()
-        .take(budget.tcp_connecting)
-    {
-        let Some(listener_ident) = listener.downgrade().observe(guard) else {
-            continue;
-        };
-        let Some(listener_payload) = listener_ident.acquire_operational() else {
-            continue;
-        };
-        for child in listener_payload.connecting_children() {
-            if !remember_socket(&mut half_open_seen, &child) {
-                continue;
-            }
-            process_tcp_tx_socket(&child, sink, now, guard, &mut outcome);
-        }
     }
 
     let mut tcp_connections_seen = Vec::new();
     for socket in table
         .snapshot_tcp_connections(guard)
         .into_iter()
-        .filter(|socket| is_tcp_connected(socket, guard))
+        .filter(is_tcp_connected)
     {
         if !remember_socket(&mut tcp_connections_seen, &socket) {
             continue;
@@ -185,7 +174,7 @@ pub fn step_process_device_tx_pending_in_namespace_at(
         .snapshot_udp_bound(guard)
         .into_iter()
         .chain(table.snapshot_udp_connections(guard))
-        .filter(|socket| is_udp_bound_or_connected(socket, guard))
+        .filter(is_udp_bound_or_connected)
     {
         if !remember_socket(&mut udp_bound_seen, &socket) {
             continue;
@@ -193,7 +182,7 @@ pub fn step_process_device_tx_pending_in_namespace_at(
         if outcome.udp_attempted >= budget.udp_bound {
             break;
         }
-        process_udp_tx_socket(&socket, sink, now, guard, &mut outcome);
+        process_udp_tx_socket(&socket, sink, now, guard, &mut outcome, &mut post);
     }
 
     let mut raw_icmp_seen = Vec::new();
@@ -208,16 +197,11 @@ pub fn step_process_device_tx_pending_in_namespace_at(
         if outcome.raw_icmp_attempted >= budget.raw_icmp {
             break;
         }
-        process_raw_icmp_tx_socket(&socket, sink, now, guard, &mut outcome);
+        process_raw_icmp_tx_socket(&socket, sink, now, guard, &mut outcome, &mut post);
     }
 
     StepOutcome::Done(outcome)
 }
-
-/// Per-socket drain bound for one device-TX pass (P2-S4). Keeps a single
-/// bulk sender from monopolising the delegate round while still letting a
-/// multi-MSS send queue empty in one pass instead of one-segment-per-wake.
-const TCP_TX_SOCKET_DRAIN_BUDGET: usize = 16;
 
 fn process_tcp_tx_socket(
     socket: &Cap<SocketIdentity>,
@@ -226,111 +210,83 @@ fn process_tcp_tx_socket(
     guard: &Guard<'_>,
     outcome: &mut DeviceTxOutcome,
 ) {
-    // P2-S7 hardening (P1-S4 race family): the socket may be concurrently
-    // close-retired; observe(guard) instead of bare Cap deref (which
-    // panics on a retired slot).
-    let Some(ident) = socket.downgrade().observe(guard) else {
-        return;
-    };
-    let Some(payload) = ident.acquire_operational() else {
+    let Some(payload) = socket.acquire_operational() else {
         return;
     };
     let Some(raw_tcp) = payload.raw_tcp_socket() else {
         return;
     };
-    // P2-S4 drain loop: keep dispatching until smoltcp has nothing to send,
-    // the sink backpressures, or the per-socket budget is spent. A segment
-    // popped by `dispatch_segment` that the sink then refuses is recovered
-    // by smoltcp's RTO (same exposure as the previous single-shot shape);
-    // the readiness probe before each dispatch keeps that window small.
-    let mut sent = false;
-    for _ in 0..TCP_TX_SOCKET_DRAIN_BUDGET {
-        if sink.readiness_at(now, guard) == PacketTxReadiness::Busy {
-            outcome.tcp_busy += 1;
-            break;
-        }
-        let Some(packet) = raw_tcp
-            .dispatch_segment()
-            .and_then(|segment| segment.emit_ipv4_packet())
-        else {
-            break;
-        };
-
-        outcome.tcp_attempted += 1;
-        match sink.transmit_at(packet.as_bytes(), now, guard) {
-            PacketTxResult::Accepted { frame_len } => {
-                outcome.tcp_packets += 1;
-                outcome.tx_bytes += frame_len;
-                sent = true;
-            }
-            PacketTxResult::Busy => {
-                outcome.tcp_busy += 1;
-                break;
-            }
-            PacketTxResult::PendingResolution { .. } => {
-                outcome.tcp_resolution_pending += 1;
-                break;
-            }
-            PacketTxResult::Failed { .. } => {
-                outcome.tcp_failed += 1;
-                break;
-            }
-        }
+    if sink.readiness_at(now, guard) == PacketTxReadiness::Busy {
+        outcome.tcp_busy += 1;
+        return;
     }
-    if sent {
-        outcome.sockets_touched += 1;
+    let Some(packet) = raw_tcp
+        .dispatch_segment()
+        .and_then(|segment| segment.emit_ipv4_packet())
+    else {
+        return;
+    };
+
+    outcome.tcp_attempted += 1;
+    match sink.transmit_at(packet.as_bytes(), now, guard) {
+        PacketTxResult::Accepted { frame_len } => {
+            outcome.tcp_packets += 1;
+            outcome.tx_bytes += frame_len;
+            outcome.sockets_touched += 1;
+        }
+        PacketTxResult::Busy => {
+            outcome.tcp_busy += 1;
+        }
+        PacketTxResult::PendingResolution { .. } => {
+            outcome.tcp_resolution_pending += 1;
+        }
+        PacketTxResult::Failed { .. } => {
+            outcome.tcp_failed += 1;
+        }
     }
 }
 
-fn process_udp_tx_socket(
+fn process_udp_tx_socket<F>(
     socket: &Cap<SocketIdentity>,
     sink: &dyn PacketTxSink,
     now: Instant,
     guard: &Guard<'_>,
     outcome: &mut DeviceTxOutcome,
-) {
-    // P2-S7 hardening (P1-S4 race family): observe(guard), no bare deref.
-    let Some(ident) = socket.downgrade().observe(guard) else {
-        return;
-    };
-    let Some(payload) = ident.acquire_operational() else {
+    post: &mut F,
+) where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
+    let Some(payload) = socket.acquire_operational() else {
         return;
     };
     let Some(local) = udp_local_endpoint(&payload.protocol_snapshot()) else {
         return;
     };
-    if payload.peek_udp_tx_datagram().is_none() {
+    let Some(datagram) = payload.peek_udp_tx_datagram() else {
         return;
-    }
+    };
     if sink.readiness_at(now, guard) == PacketTxReadiness::Busy {
         outcome.udp_busy += 1;
         return;
     }
-    // P2-S6: pop through smoltcp dispatch so the wire source is the
-    // dispatch-resolved endpoint (bound address or enqueue-time hint) —
-    // sockets autobound to 0.0.0.0 must not emit src-unspecified packets.
-    // The pop is destructive; a sink refusal drops the datagram (UDP is
-    // best-effort and the readiness probe above keeps that window small).
-    let Some(drain) = payload.take_udp_tx_datagram() else {
-        return;
-    };
-    let packet_src = if !drain.src.is_unspecified() && drain.src.port != 0 {
-        drain.src
-    } else {
-        local
-    };
-    let Some(packet) = drain.datagram.emit_ipv4_packet(packet_src) else {
+    let Some(packet) = datagram.emit_ipv4_packet(local) else {
         return;
     };
 
     outcome.udp_attempted += 1;
     match sink.transmit_at(packet.as_bytes(), now, guard) {
         PacketTxResult::Accepted { frame_len } => {
+            let Some(drain) = payload.commit_udp_tx_datagram_sent() else {
+                outcome.udp_failed += 1;
+                return;
+            };
             outcome.udp_packets += 1;
             outcome.tx_bytes += frame_len;
             outcome.sockets_touched += 1;
             if drain.became_available {
-                outcome.wakes_fired += ident.readiness.fire_send(SendWireSet::SPACE);
+                outcome.wakes_fired += socket
+                    .readiness
+                    .fire_send_with_post(SendWireSet::SPACE, post);
             }
         }
         PacketTxResult::Busy => {
@@ -345,58 +301,20 @@ fn process_udp_tx_socket(
     }
 }
 
-fn process_raw_icmp_tx_socket(
+fn process_raw_icmp_tx_socket<F>(
     socket: &Cap<SocketIdentity>,
     sink: &dyn PacketTxSink,
     now: Instant,
     guard: &Guard<'_>,
     outcome: &mut DeviceTxOutcome,
-) {
-    // P2-S7 hardening (P1-S4 race family): observe(guard), no bare deref.
-    let Some(ident) = socket.downgrade().observe(guard) else {
-        return;
-    };
-    let Some(payload) = ident.acquire_operational() else {
+    post: &mut F,
+) where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
+    let Some(payload) = socket.acquire_operational() else {
         return;
     };
     let Some(mut echo) = payload.peek_icmp_tx_echo() else {
-        // External v6 echo lane (mirror of the v4 flow below): queued by
-        // step_send for a non-configured (real external) v6 destination.
-        // dispatch_ip_at's version nibble routes the packet into
-        // dispatch_ipv6_at (route → NDP → wire); PendingResolution keeps it
-        // queued so the retry after neighbour resolution actually sends it.
-        let Some(echo6) = payload.peek_icmp6_tx_echo() else {
-            return;
-        };
-        if sink.readiness_at(now, guard) == PacketTxReadiness::Busy {
-            outcome.raw_icmp_busy += 1;
-            return;
-        }
-        let packet = build_icmpv6_echo_request_packet(&echo6);
-        outcome.raw_icmp_attempted += 1;
-        match sink.transmit_at(packet.as_bytes(), now, guard) {
-            PacketTxResult::Accepted { frame_len } => {
-                let Some(became_available) = payload.commit_icmp6_tx_echo_sent() else {
-                    outcome.raw_icmp_failed += 1;
-                    return;
-                };
-                outcome.raw_icmp_packets += 1;
-                outcome.tx_bytes += frame_len;
-                outcome.sockets_touched += 1;
-                if became_available {
-                    outcome.wakes_fired += ident.readiness.fire_send(SendWireSet::SPACE);
-                }
-            }
-            PacketTxResult::Busy => {
-                outcome.raw_icmp_busy += 1;
-            }
-            PacketTxResult::PendingResolution { .. } => {
-                outcome.raw_icmp_resolution_pending += 1;
-            }
-            PacketTxResult::Failed { .. } => {
-                outcome.raw_icmp_failed += 1;
-            }
-        }
         return;
     };
     if sink.readiness_at(now, guard) == PacketTxReadiness::Busy {
@@ -423,7 +341,9 @@ fn process_raw_icmp_tx_socket(
             outcome.tx_bytes += frame_len;
             outcome.sockets_touched += 1;
             if drain.became_available {
-                outcome.wakes_fired += ident.readiness.fire_send(SendWireSet::SPACE);
+                outcome.wakes_fired += socket
+                    .readiness
+                    .fire_send_with_post(SendWireSet::SPACE, post);
             }
         }
         PacketTxResult::Busy => {
@@ -442,43 +362,31 @@ fn is_external_ipv4(addr: Ipv4Address) -> bool {
     addr != Ipv4Address::LOOPBACK && addr != Ipv4Address::BROADCAST
 }
 
-fn is_tcp_connecting(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> bool {
-    socket
-        .downgrade()
-        .observe(guard)
-        .and_then(|ident| ident.acquire_operational())
-        .is_some_and(|payload| {
-            matches!(
-                payload.protocol_snapshot(),
-                SocketProtocol::Tcp(TcpState::Connecting { .. })
-            )
-        })
+fn is_tcp_connecting(socket: &Cap<SocketIdentity>) -> bool {
+    socket.acquire_operational().is_some_and(|payload| {
+        matches!(
+            payload.protocol_snapshot(),
+            SocketProtocol::Tcp(TcpState::Connecting { .. })
+        )
+    })
 }
 
-fn is_tcp_connected(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> bool {
-    socket
-        .downgrade()
-        .observe(guard)
-        .and_then(|ident| ident.acquire_operational())
-        .is_some_and(|payload| {
-            matches!(
-                payload.protocol_snapshot(),
-                SocketProtocol::Tcp(TcpState::Connected { .. })
-            )
-        })
+fn is_tcp_connected(socket: &Cap<SocketIdentity>) -> bool {
+    socket.acquire_operational().is_some_and(|payload| {
+        matches!(
+            payload.protocol_snapshot(),
+            SocketProtocol::Tcp(TcpState::Connected { .. })
+        )
+    })
 }
 
-fn is_udp_bound_or_connected(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) -> bool {
-    socket
-        .downgrade()
-        .observe(guard)
-        .and_then(|ident| ident.acquire_operational())
-        .is_some_and(|payload| {
-            matches!(
-                payload.protocol_snapshot(),
-                SocketProtocol::Udp(UdpInner::Bound { .. } | UdpInner::Connected { .. })
-            )
-        })
+fn is_udp_bound_or_connected(socket: &Cap<SocketIdentity>) -> bool {
+    socket.acquire_operational().is_some_and(|payload| {
+        matches!(
+            payload.protocol_snapshot(),
+            SocketProtocol::Udp(UdpInner::Bound { .. } | UdpInner::Connected { .. })
+        )
+    })
 }
 
 fn udp_local_endpoint(protocol: &SocketProtocol) -> Option<IpEndpoint> {

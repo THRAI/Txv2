@@ -17,9 +17,9 @@
 //!    `Cap<ProcessIdentity>` slot key. `register_subscription` /
 //!    `unregister_subscription` are driven by the syscall arm at
 //!    open / close (`Drop for SignalFd`) time;
-//!    [`notify_process_signal`] is driven by
-//!    [`crate::signal::step_kill_process`] *after* the existing
-//!    thread-eligibility post completes.
+//!    [`notify_process_signal_with_post`] is driven by the signal
+//!    process-directed kill path *after* the existing thread-eligibility post
+//!    completes.
 //! 4. A per-fd pending-signum queue with a paired
 //!    [`Arc<WaitSource>`] for read-readiness. The queue is a
 //!    `VecDeque<u8>` (raw signum bytes) — phase D9-D treats signals
@@ -72,7 +72,7 @@ use adapter::step_engine::{
     borrow_current_guard, guard, sign, ByteProgress, Cap, OperationalCapExt, SpinMutex,
     StepOutcome, V3Errno, WaitSource, Weak, Zone, ZoneAllocated, ZoneError,
 };
-use adapter::wait_routing::Channel;
+use adapter::wait_routing::{MailboxEvent, TaskMailbox};
 
 use crate::process::structure::ProcessIdentity;
 use crate::signal::Signum;
@@ -109,7 +109,7 @@ pub struct SignalFd {
     sfd_id: u64,
     /// Owning process's slot-key raw value. The signalfd is bound to
     /// the process at construction; the bind-key is what the
-    /// per-process registry indexes on. `step_kill_process` resolves
+    /// per-process registry indexes on. Process-directed kill resolves
     /// "which signalfds does this process own?" via the registry.
     owner_proc_key: u32,
     /// Weak reference to the owning process.  Used by
@@ -141,16 +141,11 @@ pub struct SignalFd {
     /// per-occurrence payload; the current shape matches Linux's
     /// rt-signal queueing without needing extra state.
     pending: SpinMutex<VecDeque<u8>>,
-    /// Per-fd `WaitSource`. Fired whenever a matching signal is
-    /// delivered to the owning process. Pattern mirrors pipe /
-    /// userfaultfd: an `Arc<WaitSource>` whose id is paired with a
-    /// legacy `Channel` for D2/D4 coexistence.
+    /// Per-fd `WaitSource`. Fired whenever a matching signal is delivered to
+    /// the owning process.
     wait_source: Arc<WaitSource>,
-    /// Legacy `Channel` companion to [`Self::wait_source`].
-    wait_channel: Channel,
-    /// Carrier id paired with [`Self::wait_channel`] and
-    /// [`Self::wait_source`]. Stable for the lifetime of the
-    /// `Cap<SignalFd>`.
+    /// Carrier id paired with [`Self::wait_source`]. Stable for the lifetime
+    /// of the `Cap<SignalFd>`.
     wait_source_id: u64,
 }
 
@@ -172,15 +167,17 @@ impl SignalFd {
     /// and registers in one step.
     pub fn new(owner_proc_key: u32, owner_proc: Option<Weak<ProcessIdentity>>, mask: u64) -> Self {
         let wait_point = notification::new_wait_point();
+        let wait_source_id =
+            tx_substrate::wake::WaitEndpoint::source_id(wait_point.endpoint()).raw();
+        let (_, wait_source) = wait_point.into_parts();
         Self {
             sfd_id: allocate_sfd_id(),
             owner_proc_key,
             owner_proc,
             mask: AtomicU64::new(mask),
             pending: SpinMutex::new(VecDeque::new()),
-            wait_source: wait_point.source,
-            wait_channel: wait_point.channel,
-            wait_source_id: wait_point.source_id,
+            wait_source,
+            wait_source_id,
         }
     }
 
@@ -232,8 +229,13 @@ impl SignalFd {
 
     /// Borrow the per-fd wait source. The agent's `read(2)` arm parks
     /// on this carrier when the queue is empty (blocking mode).
-    pub fn wait_source(&self) -> &Arc<WaitSource> {
+    fn wait_source(&self) -> &Arc<WaitSource> {
         &self.wait_source
+    }
+
+    /// Readable endpoint exposed to wait drivers.
+    pub fn read_endpoint(&self) -> &Arc<WaitSource> {
+        self.wait_source()
     }
 
     /// Carrier id paired with [`Self::wait_source`].
@@ -241,15 +243,19 @@ impl SignalFd {
         self.wait_source_id
     }
 
-    /// Notify this subscription of a delivered signal. Filters against
-    /// the current mask: posts only if `signum` is covered. Fires
-    /// both wake paths (D2/D4 coexistence) on success.
-    pub fn notify(&self, signum: Signum) -> bool {
+    /// Notify this subscription using a caller-provided mailbox-ref post
+    /// operation for the wait-source side. The pending queue remains signalfd
+    /// state; the caller decides whether delivered wait-source events should
+    /// route through owner-aware scheduler placement.
+    pub fn notify_with_post<F>(&self, signum: Signum, post: F) -> bool
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+    {
         if !self.covers(signum) {
             return false;
         }
         self.pending.lock().push_back(signum.raw());
-        notification::notify_readable(&self.wait_channel, &self.wait_source);
+        notification::notify_readable_with_post(&self.wait_source, post);
         true
     }
 
@@ -263,8 +269,8 @@ impl SignalFd {
 impl Drop for SignalFd {
     fn drop(&mut self) {
         // Release the registry slot so a dropped signalfd no longer
-        // receives posts from `step_kill_process`. Also release the
-        // legacy carrier id so the wait_source registry does not leak.
+        // receives posts from process-directed kill. Also release the
+        // wait-source carrier id so the wait_source registry does not leak.
         unregister_subscription(self.owner_proc_key, self.sfd_id);
         notification::release_wait_point(self.wait_source_id);
     }
@@ -276,15 +282,14 @@ impl Drop for SignalFd {
 //
 // Keyed by `ProcessIdentity::key().raw()`.  signalfd registers here at
 // construction and unregisters on Drop.  When `signal_port.fire()`
-// fires (from `step_kill_process`), this table is walked to wake each
+// fires from process-directed kill, this table is walked to wake each
 // registered signalfd's wait_source.  The signalfd reader then drains
 // pending signals from the owning process's pending queues on its own.
 //
-// This bridge exists because signalfd uses Channel-based wait_sources
-// (yield_on_wait_source) while the bus uses TaskMailbox-based
-// subscriptions (RawPort.subscribe).  Once the reactor supports
-// polling TaskMailbox for StepOp yields, this table can be replaced
-// with direct `signal_port.subscribe()` calls.
+// This bridge exists because signalfd uses object-local wait sources
+// (`YieldShape::OnWaitSource`) while the bus uses RawPort subscriptions. Once
+// signal delivery owns a direct endpoint fanout, this table can be replaced
+// with direct signal-port subscription.
 
 type SignalFdList = Vec<Weak<SignalFd>>;
 
@@ -314,15 +319,13 @@ fn unregister_subscription(proc_key: u32, sfd_id: u64) {
     }
 }
 
-/// Notify every signalfd subscription registered against `proc_key`
-/// of a delivered signal. Each subscription checks its mask; the
-/// match-and-post is per-subscription. Returns the number of
-/// subscriptions that accepted the signal.
-///
-/// Called by [`crate::signal::step_kill_process`] *after* the
-/// thread-eligibility post completes — the wake paths are additive
-/// (per D9 §6 / W-II prompt constraint 1).
-pub fn notify_process_signal(proc_key: u32, signum: Signum) -> usize {
+/// Notify every signalfd subscription registered against `proc_key`, routing
+/// wait-source publication through a caller-provided mailbox-ref post
+/// operation when a scheduler-aware caller has one.
+pub fn notify_process_signal_with_post<F>(proc_key: u32, signum: Signum, mut post: F) -> usize
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     // Snapshot the subscription list under the lock so we don't hold
     // the registry spinlock across the per-subscription `notify`
     // calls (which take their own per-fd locks).
@@ -339,7 +342,7 @@ pub fn notify_process_signal(proc_key: u32, signum: Signum) -> usize {
         let Some(cap) = weak.upgrade(&guard) else {
             continue;
         };
-        if cap.notify(signum) {
+        if cap.notify_with_post(signum, &mut post) {
             delivered += 1;
         }
     }
@@ -392,7 +395,7 @@ fn drain_pending_signals(sfd: &SignalFd) {
         }
         if let Some(signum) = Signum::new(signum_raw) {
             if (mask & signum.bit()) != 0 {
-                sfd.notify(signum);
+                sfd.notify_with_post(signum, |mailbox, event| mailbox.post(event));
             }
         }
     }
@@ -413,9 +416,9 @@ fn drain_pending_signals(sfd: &SignalFd) {
 ///   serializing one zero-filled record with the popped `ssi_signo`.
 /// - queue empty + `nonblocking` → `Err(EAGAIN)`.
 /// - queue empty + blocking → `Yield { OnWaitSource }` on the per-fd
-///   wait source; the dispatcher parks on
-///   `wait_source::wait_on_token` and re-polls when
-///   [`SignalFd::notify`] fires.
+///   wait source; the dispatcher parks through the registered wait-source
+///   resolver and re-polls when
+///   [`SignalFd::notify_with_post`] fires.
 pub fn signalfd_read(
     sfd: &SignalFd,
     out: &mut [u8],
@@ -441,7 +444,7 @@ pub fn signalfd_read(
     if nonblocking {
         return StepOutcome::err(V3Errno::EAGAIN);
     }
-    notification::wait_until_readable(sfd.wait_source_id())
+    notification::wait_until_readable(sfd.read_endpoint())
 }
 
 /// Serialize a single `Signum` into a 128-byte
@@ -497,6 +500,10 @@ mod tests {
         guard
     }
 
+    fn notify_direct_for_test(sfd: &SignalFd, signum: Signum) -> bool {
+        sfd.notify_with_post(signum, |mailbox, event| mailbox.post(event))
+    }
+
     #[test]
     fn distinct_signalfds_have_distinct_ids() {
         let _g = setup();
@@ -521,11 +528,11 @@ mod tests {
         let cap = { sign(SignalFd::new(0, None, sigusr1.bit())).expect("reserve") };
 
         // SIGUSR2 is not in the mask — drop on the floor.
-        assert!(!cap.notify(sigusr2));
+        assert!(!notify_direct_for_test(&cap, sigusr2));
         assert_eq!(cap.pending_count(), 0);
 
         // SIGUSR1 is — pushes onto the queue.
-        assert!(cap.notify(sigusr1));
+        assert!(notify_direct_for_test(&cap, sigusr1));
         assert_eq!(cap.pending_count(), 1);
 
         // Pop returns the signum.
@@ -538,6 +545,10 @@ mod tests {
     fn signalfd_read_returns_eagain_when_empty_and_nonblocking() {
         let _g = setup();
         let cap = { sign(SignalFd::new(0, None, !0u64)).expect("reserve") };
+        assert_eq!(
+            tx_substrate::wake::WaitEndpoint::source_id(cap.read_endpoint()).raw(),
+            cap.wait_source_id(),
+        );
         let mut buf = [0u8; SIGNALFD_SIGINFO_SIZE];
         let outcome = signalfd_read(&cap, &mut buf, /* nonblocking = */ true);
         match outcome {
@@ -551,7 +562,7 @@ mod tests {
         let _g = setup();
         let sigusr1 = Signum::new(10).expect("SIGUSR1");
         let cap = { sign(SignalFd::new(0, None, sigusr1.bit())).expect("reserve") };
-        assert!(cap.notify(sigusr1));
+        assert!(notify_direct_for_test(&cap, sigusr1));
         let mut buf = [0xFFu8; SIGNALFD_SIGINFO_SIZE];
         let outcome = signalfd_read(&cap, &mut buf, false);
         match outcome {

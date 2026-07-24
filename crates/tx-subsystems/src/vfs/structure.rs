@@ -15,7 +15,9 @@ use core::sync::atomic::{AtomicI8, AtomicU64, Ordering};
 use crate::vfs::adapter::step_engine::{
     self, Cap, PayloadCap, SpinMutex, Weak, Zone, ZoneAllocated, ZoneError,
 };
-use crate::vfs::adapter::wait_routing::{Channel, WaitSource};
+use crate::vfs::adapter::wait_routing::{
+    MailboxEvent, MailboxSchedulerHint, TaskMailbox, WaitSource,
+};
 
 use crate::aio::AioContext;
 use crate::cred::{CapabilitySet, Cred, CredSnapshot};
@@ -42,15 +44,9 @@ pub const VFS_NAME_MAX: usize = 255;
 
 /// Per-RNode wait-source interest mask: bytes are available to read.
 ///
-/// PR-3D-5: VFS lands the per-inode read/write wait-source primitive
-/// in the same shape pipe/tty/exit_source use: one `Arc<WaitSource>`
-/// per direction per inode, sharing the legacy `wait_source` registry
-/// `u64` namespace with a paired reactor `Channel`. The bit lives on
-/// VFS rather than on a backing because the wake-publication shape is
-/// VFS-uniform (every inode has read/write semantics with the same
-/// blocking-IO contract); per-backing helpers (`pipe`, `tty`, future
-/// `socket`) layer their own bit allocations on top of this shape if
-/// they need them.
+/// VFS owns per-inode read/write wait-source bits. The bit lives on VFS rather
+/// than on a backing because the wake-publication shape is VFS-uniform: every
+/// inode has read/write semantics with the same blocking-IO contract.
 // === zone statics =====================================================
 
 static DENTRY_ZONE: Zone<DEntry> = Zone::const_new();
@@ -200,7 +196,7 @@ pub const S_IFSOCK: u16 = 0o140000;
 
 // POSIX special-mode bits: setuid, setgid, sticky. Live above the
 // standard `rwxrwxrwx` triplets but below `S_IFMT`. Used by the DAC +
-// setuid slice's chmod/chown bookkeeping (e.g. `step_chown` silently
+// setuid slice's chmod/chown bookkeeping (e.g. `chown_inode` silently
 // clears `S_ISUID`/`S_ISGID` for non-privileged callers).
 pub const S_ISUID: u16 = 0o4000;
 pub const S_ISGID: u16 = 0o2000;
@@ -732,52 +728,33 @@ impl RNode {
         f(wait_points.as_ref().expect("wait points were initialized"))
     }
 
-    fn read_wait_snapshot(&self) -> Option<(Channel, Arc<WaitSource>)> {
+    fn read_wait_snapshot(&self) -> Option<Arc<WaitSource>> {
         let wait_points = self.wait_points.lock();
         wait_points
             .as_ref()
-            .map(|points| (points.read_channel.clone(), points.read_source.clone()))
+            .map(|points| points.read_source.clone())
     }
 
-    fn write_wait_snapshot(&self) -> Option<(Channel, Arc<WaitSource>)> {
+    fn write_wait_snapshot(&self) -> Option<Arc<WaitSource>> {
         let wait_points = self.wait_points.lock();
         wait_points
             .as_ref()
-            .map(|points| (points.write_channel.clone(), points.write_source.clone()))
+            .map(|points| points.write_source.clone())
     }
 
-    /// Legacy reactor `Channel` paired with [`Self::read_wait_source`].
-    /// Production callers fire this and the new `WaitSource` in tandem
-    /// from the per-inode "newly readable" transition site (see module
-    /// docs); v3 callers awaiting via
-    /// [`crate::wait_source::wait_on_token`] resolve the carrier id from
-    /// [`Self::read_wait_source_id`].
-    pub fn read_wait_channel(&self) -> Channel {
-        self.with_wait_points(|points| points.read_channel.clone())
-    }
-
-    /// Legacy registry carrier id for [`Self::read_wait_channel`].
-    /// Shares the same `u64` with [`Self::read_wait_source`]'s
-    /// `WaitSourceId` so a v3 caller's `YieldShape::OnWaitSource
-    /// { source: WaitSourceId(id), .. }` resolves to this same slot.
+    /// Registry carrier id for [`Self::read_wait_source`].
     pub fn read_wait_source_id(&self) -> u64 {
         self.with_wait_points(|points| points.read_source_id)
     }
 
-    /// PR-3D-5: per-inode `WaitSource` for the new mailbox-based wake
-    /// path. Returned as `&Arc<WaitSource>` so callers can clone the
-    /// strong ref and hold the source alive across the wait window via
-    /// `WaitSource::prepare(..).install_if(..)` independent of the
-    /// inode's EBR retirement. `WaitSource::id()` matches
-    /// [`Self::read_wait_source_id`].
-    pub fn read_wait_source(&self) -> Arc<WaitSource> {
+    /// Per-inode `WaitSource` for the mailbox-based wake path.
+    fn read_wait_source(&self) -> Arc<WaitSource> {
         self.with_wait_points(|points| points.read_source.clone())
     }
 
-    /// Companion to [`Self::read_wait_channel`] for the writable
-    /// direction.
-    pub fn write_wait_channel(&self) -> Channel {
-        self.with_wait_points(|points| points.write_channel.clone())
+    /// Read endpoint exposed to wait drivers.
+    pub fn read_endpoint(&self) -> Arc<WaitSource> {
+        self.read_wait_source()
     }
 
     /// Companion to [`Self::read_wait_source_id`] for the writable
@@ -788,36 +765,40 @@ impl RNode {
 
     /// Companion to [`Self::read_wait_source`] for the writable
     /// direction.
-    pub fn write_wait_source(&self) -> Arc<WaitSource> {
+    fn write_wait_source(&self) -> Arc<WaitSource> {
         self.with_wait_points(|points| points.write_source.clone())
     }
 
-    /// Fire the per-inode read wake path on both the legacy `Channel`
-    /// and the new `WaitSource` (PR-3D-5 D2/D4 coexistence). Pass the
-    /// interest bits the transition signals — today that is
-    /// [`VFS_READABLE`] for the single-bit "bytes available" semantic;
-    /// future per-backing wires (e.g. socket urgent-data, future
-    /// `inotify`) may carry additional bits on the same source.
-    ///
-    /// Returns the number of legacy `Channel` awaiters released by
-    /// [`Channel::fire`]. The `WaitSource::notify` count is intentionally
-    /// not surfaced — production callers don't branch on it, and the
-    /// dual-fire happens unconditionally under the same call (so
-    /// either both paths fire or neither does, matching the
-    /// exit_source / tty templates).
-    pub fn fire_read_wait(&self, mask: u64) -> usize {
-        let Some((channel, source)) = self.read_wait_snapshot() else {
-            return 0;
-        };
-        notification::notify_readable(&channel, &source, mask)
+    /// Write endpoint exposed to wait drivers.
+    pub fn write_endpoint(&self) -> Arc<WaitSource> {
+        self.write_wait_source()
     }
 
-    /// Companion to [`Self::fire_read_wait`] for the writable direction.
-    pub fn fire_write_wait(&self, mask: u64) -> usize {
-        let Some((channel, source)) = self.write_wait_snapshot() else {
-            return 0;
+    /// Fire the per-inode read wake path through a caller-provided mailbox
+    /// post route.
+    ///
+    /// Fire the per-inode read wait source through a caller-provided mailbox
+    /// post route.
+    pub fn fire_read_wait_with_post<F>(&self, mask: u64, post: F)
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent, MailboxSchedulerHint) -> bool,
+    {
+        let Some(source) = self.read_wait_snapshot() else {
+            return;
         };
-        notification::notify_writable(&channel, &source, mask)
+        notification::notify_readable_with_post(&source, mask, post)
+    }
+
+    /// Companion to [`Self::fire_read_wait_with_post`] for the writable
+    /// direction.
+    pub fn fire_write_wait_with_post<F>(&self, mask: u64, post: F)
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent, MailboxSchedulerHint) -> bool,
+    {
+        let Some(source) = self.write_wait_snapshot() else {
+            return;
+        };
+        notification::notify_writable_with_post(&source, mask, post)
     }
 }
 
@@ -843,11 +824,11 @@ impl Drop for RNode {
     }
 }
 
-// PR-3D-5: `Channel` and `WaitSource` are not `Debug`, so the previous
-// `#[derive(Debug)]` on `RNode` cannot survive after the wait-source
-// fields land. The manual impl below preserves the previously-derived
-// shape (one entry per kept field) and elides the wake-publication
-// internals (which would be noisy and carry no value for debug
+// PR-3D-5: `WaitSource` is not `Debug`, so the previous `#[derive(Debug)]`
+// on `RNode` cannot survive after the wait-source fields land. The manual
+// impl below preserves the previously-derived shape (one entry per kept
+// field) and elides the wake-publication internals (which would be noisy and
+// carry no value for debug
 // output — observers care about the inode identity / metadata, not
 // the registered subscriber list).
 impl core::fmt::Debug for RNode {
@@ -933,8 +914,16 @@ impl DEntry {
         }
     }
 
-    pub fn cache_child(&self, child: Cap<DEntry>) {
-        self.children.lock().insert(child.name(), child.downgrade());
+    pub fn cache_child(&self, child: Cap<DEntry>) -> Cap<DEntry> {
+        let mut children = self.children.lock();
+        if let Some(existing) = children.get(&child.name()).copied() {
+            let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
+            if let Some(canonical) = existing.upgrade(&guard) {
+                return canonical;
+            }
+        }
+        children.insert(child.name(), child.downgrade());
+        child
     }
 
     pub fn remove_cached_child(&self, name: InlineName) {
@@ -1026,7 +1015,7 @@ pub enum OpenFileBacking {
     /// Drop semantics: when the last `Cap<OpenFile>` for a ufd is
     /// released and EBR retires this slot, the inner `Cap<UserfaultFd>`
     /// drops too and (in later phases) `Drop for UserfaultFd` will
-    /// drive `DelegateRegistry::mark_endpoint_died`.
+    /// drive the `DelegateRegistry` delegate endpoint-death transition.
     Ufd { ufd: Cap<UserfaultFd> },
     /// `io_setup(2)` open file (PR-11 phase 1). The cap is the
     /// substrate-side `AioContext` identity later phases use to route
@@ -1050,7 +1039,7 @@ pub enum OpenFileBacking {
     /// released and EBR retires this slot, the inner `Cap<SignalFd>`
     /// drops too — `Drop for SignalFd` removes the subscription entry
     /// from the per-process registry so future
-    /// `step_kill_process` calls no longer route to it.
+    /// process-directed kill calls no longer route to it.
     SignalFd { sfd: Cap<SignalFd> },
     /// `io_uring_setup(2)` open file (future PR-12 phase 0 — second
     /// `OnBehalfOf<P>` canary). The cap is the substrate-side
@@ -1528,6 +1517,38 @@ impl OpenFile {
         }
     }
 
+    /// Adjust the fd-table-visible endpoint count without cloning any `Cap`.
+    /// Exec's post-PoNR CLOEXEC commit uses the decrement form, so this method
+    /// must remain allocation-free and infallible.
+    pub(crate) fn adjust_process_fd_reference(&self, increment: bool) {
+        match &self.backing {
+            OpenFileBacking::Rnode { rnode } => {
+                let RNodeBacking::StructBacked {
+                    payload: StructPayload::Pipe { payload, side },
+                } = rnode.backing()
+                else {
+                    return;
+                };
+                match (*side, increment) {
+                    (crate::pipe::PipeSide::Reader, true) => payload.incr_reader(),
+                    (crate::pipe::PipeSide::Writer, true) => payload.incr_writer(),
+                    (crate::pipe::PipeSide::Reader, false) => payload.decr_reader(),
+                    (crate::pipe::PipeSide::Writer, false) => payload.decr_writer(),
+                }
+            }
+            OpenFileBacking::SocketPair { rx, tx } => {
+                if increment {
+                    rx.incr_reader();
+                    tx.incr_writer();
+                } else {
+                    rx.decr_reader();
+                    tx.decr_writer();
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Socket identity backing this open file, if it is a network socket.
     /// Restored alongside the net subsystem re-home; used by
     /// `/proc/net/{tcp,udp,...}` enumeration to walk a process's open sockets.
@@ -1541,14 +1562,6 @@ impl OpenFile {
             },
             _ => None,
         }
-    }
-
-    /// P3-S4 (D13): the file's `FileOps` implementation, when its backing
-    /// kind provides one. Sockets today; other rich fd kinds join by
-    /// implementing the trait — call sites then stop naming kinds.
-    pub fn file_ops(&self) -> Option<&dyn crate::device::FileOps> {
-        self.socket_identity()
-            .map(|identity| identity as &dyn crate::device::FileOps)
     }
 
     /// VFS-shaped accessor — returns the inner `Cap<RNode>` for an

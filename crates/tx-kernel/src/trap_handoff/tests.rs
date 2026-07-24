@@ -70,18 +70,31 @@ impl tx_hal::TrapIf for TestPlatform {}
 
 impl tx_hal::SignalFrameIf for TestPlatform {}
 
-impl tx_hal::IrqIf for TestPlatform {}
+unsafe fn restore_test_local_execution(_saved_state: usize) {}
 
-impl tx_hal::TimeIf for TestPlatform {
+impl tx_hal::IrqIf for TestPlatform {
+    fn exclude_local_execution() -> tx_hal::LocalExecutionGuard {
+        unsafe { tx_hal::LocalExecutionGuard::new(0, restore_test_local_execution) }
+    }
+}
+
+impl tx_hal::MonotonicCounterIf for TestPlatform {
     fn read_ns() -> u64 {
         0
     }
-    fn set_deadline_ns(_deadline: u64) {}
-    fn cancel_deadline() {}
+
     fn frequency_hz() -> u64 {
         1_000_000_000
     }
 }
+
+impl tx_hal::DeadlineTimerIf for TestPlatform {
+    fn set_deadline_ns(_deadline: u64) {}
+
+    fn cancel_deadline() {}
+}
+
+impl tx_hal::PersistentClockIf for TestPlatform {}
 
 impl tx_hal::PercpuIf for TestPlatform {}
 

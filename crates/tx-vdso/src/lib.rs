@@ -20,6 +20,15 @@
 
 #![no_std]
 
+#[cfg(test)]
+extern crate std;
+
+/// The VVAR page is one page immediately below the vDSO image base.
+///
+/// VM owns both runtime addresses; this image-relative ABI value is the only
+/// placement fact the vDSO needs.
+pub const VVAR_DELTA: isize = -4096;
+
 /// Whether a real vDSO image was produced at build time.
 #[cfg(not(vdso_stub))]
 pub const VDSO_AVAILABLE: bool = true;
@@ -43,3 +52,8 @@ pub const VDSO_IMAGE_SIZE: usize = VDSO_IMAGE.len();
 
 /// Number of 4 KiB pages the vDSO image occupies.
 pub const VDSO_NUM_PAGES: usize = VDSO_IMAGE_SIZE.div_ceil(4096);
+
+include!(concat!(env!("OUT_DIR"), "/symbol_offsets.rs"));
+
+#[cfg(test)]
+mod tests;

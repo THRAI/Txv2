@@ -9,7 +9,7 @@
 //! before phase 6 to abort exec without observable footprint.
 //!
 //! Sibling Phase 4 (`tx-scripts/src/process/exec/loader.rs`) populates
-//! the `ImagePlan` from a parsed `goblin::elf::Elf`. This module owns
+//! the `ImagePlan` from txKernel-owned ELF facts. This module owns
 //! the kernel-side translation: each `LoadSegment` lands as one or two
 //! `VmEntry` recipes (file-backed prefix + optional anonymous BSS
 //! tail), and `populate_detached_user_range` writes the loader-built
@@ -67,9 +67,8 @@ pub const USER_STACK_INITIAL_RESERVATION: u64 = 8 * 1024 * 1024;
 /// Phase 1A ships a placeholder shape large enough for V1 / V2 to be
 /// implemented and tested; sibling Phase 4 (`tx-scripts/.../loader.rs`)
 /// extends or refines this without touching the V1 / V2 internals.
-/// Per the plan's "Cross-doc supporting edits" the goblin dependency
-/// stays inside `tx-scripts`; `tx-subsystems::vm::scripts` only sees
-/// kernel-side shapes.
+/// The replaceable syntax parser stays inside `tx-scripts`;
+/// `tx-subsystems::vm::scripts` only sees kernel-side shapes.
 ///
 /// Cites: `txdoc:EXEC-8-1-LOADER-PUBLIC-TYPES`,
 ///        `txdoc:EXEC-9-2-CREATE-DETACHED-ADDRESS-SPACE`.
@@ -85,8 +84,9 @@ pub struct ImagePlan {
     /// exceeds its `file_size` and the tail extends past the
     /// page-rounded end of the file-backed prefix.
     pub bss_extension: Option<BssTail>,
-    /// Whether PT_GNU_STACK with PF_X was found in the ELF.
-    /// When true, the stack region gets `PROT_EXEC`.
+    /// Whether PT_GNU_STACK with PF_X was found in the ELF. The detached-AS
+    /// builder combines this request with vDSO-restorer availability to select
+    /// the final stack protection in one step.
     pub executable_stack: bool,
 }
 
@@ -94,7 +94,7 @@ pub struct ImagePlan {
 ///
 /// `vaddr`/`memsz`/`filesz`/`file_offset` map onto the program-header
 /// fields (`p_vaddr`, `p_memsz`, `p_filesz`, `p_offset`). `flags`
-/// captures `p_flags` after the loader's W^X validation per
+/// captures the loader-validated R/W/X bits per
 /// `txdoc:EXEC-8-5-PROGRAM-HEADER-VALIDATION`. `backing` is the
 /// kernel-side `Cap<PageContainer>` cloned from the open file's RNode
 /// (`RNodeBacking::PageBacked { pc }`).
@@ -117,12 +117,12 @@ pub struct BssTail {
     pub size: u64,
 }
 
-/// Parsed `p_flags` after the loader's W^X / non-zero-prot validation.
+/// Parsed `p_flags` after the loader's non-zero-protection validation.
 ///
-/// Slice scope per `txdoc:EXEC-8-5-PROGRAM-HEADER-VALIDATION`: a LOAD
-/// segment with both `write == true` and `execute == true` is rejected
-/// at parse time. The loader normalises `read = true` for any executable
-/// or writable segment.
+/// Slice scope per `txdoc:EXEC-8-5-PROGRAM-HEADER-VALIDATION`: W+X LOAD
+/// segments are accepted for Linux compatibility. A LOAD is rejected only
+/// when all R/W/X bits are clear, and the declared PF_R bit is preserved
+/// without being synthesized for writable or executable segments.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SegmentFlags {
     pub read: bool,
@@ -209,6 +209,14 @@ impl From<VmPmapError> for ScriptError {
 /// not hold a guard at the call site. Sibling Phase 5's `exec_script`
 /// already obeys this by acquiring fresh guards inside the script's
 /// step-call sites.
+fn initial_stack_prot(executable_requested: bool, vdso_restorer_available: bool) -> Prot {
+    if executable_requested || !vdso_restorer_available {
+        Prot::new(true, true, true)
+    } else {
+        Prot::READ_WRITE
+    }
+}
+
 pub fn build_aspace_from_image<P: PmapIf>(
     image_plan: &ImagePlan,
 ) -> Result<Cap<AddressSpace>, ScriptError> {
@@ -253,35 +261,16 @@ pub fn build_aspace_from_image<P: PmapIf>(
 
     // Stack: anonymous private, page-aligned, anchored to `stack_top`.
     //
-    // The stack is mapped **executable** unconditionally — not because
-    // the ELF's GNU_STACK said so, but because our signal-delivery
-    // path (`SignalFrameIf::prepare_signal_frame` on both RV64 and
-    // LA64) writes a 2-instruction `rt_sigreturn` trampoline at the
-    // top of the signal frame on the user stack, and sets the
-    // handler's `ra` to that trampoline address. When the handler
-    // returns via `ret`, the CPU fetches the trampoline insns from
-    // the stack — which requires PROT_EXEC on the stack page.
-    //
-    // Linux moved this trampoline into the vDSO years ago (modern
-    // user stacks are NX). txKernel's vDSO infrastructure exists
-    // (`crates/tx-vdso/`, `tx_subsystems::vdso::init_vdso`) but the
-    // user-side mapping isn't wired yet — see `vdso_base_opt: None`
-    // at `crates/tx-shims/src/linux_syscall/exec_op.rs:125`. Until
-    // that lands, the stack must be RWX or every signal-handler
-    // return SIGSEGVs (observed end-to-end as a busybox-sh crash on
-    // SIGCHLD delivery after first child exit — root cause traced
-    // 2026-05-18).
-    //
-    // TODO(vdso): once the vDSO is mapped into user aspaces, expose
-    // a `__vdso_rt_sigreturn` symbol, look up its user VA, point
-    // `handler_ctx.regs[ra]` at it, and restore W^X on the stack.
-    let _ = image_plan.executable_stack;
+    // PT_GNU_STACK PF_X always wins. Otherwise, a mapped vDSO restorer permits
+    // an NX stack; targets without one retain the executable signal-frame
+    // trampoline fallback.
+    let stack_prot = initial_stack_prot(image_plan.executable_stack, crate::vdso::vdso_available());
     let stack_start = image_plan.stack_top - USER_STACK_INITIAL_RESERVATION;
     let stack_range = align_range(stack_start, USER_STACK_INITIAL_RESERVATION)
         .ok_or(ScriptError::InvalidImage)?;
     let stack_entry = VmEntry::new(
         stack_range,
-        Prot::new(true, true, true),
+        stack_prot,
         VmEntryFlags::PRIVATE,
         VmBacking::PrivateAnon,
     );
@@ -570,7 +559,9 @@ const fn map_publish_error(error: VmFaultError) -> Errno {
         VmFaultError::ProtectionViolation => Errno::EINVAL,
         VmFaultError::PageBeyondSize | VmFaultError::BackingMismatch => Errno::EFAULT,
         VmFaultError::BackingOffsetOverflow | VmFaultError::Range(_) => Errno::EINVAL,
-        VmFaultError::PageCache(_) | VmFaultError::Pmap(_) => Errno::EIO,
+        VmFaultError::PageCache(_) | VmFaultError::Pmap(_) | VmFaultError::SpecialUnavailable => {
+            Errno::EIO
+        }
     }
 }
 
@@ -632,6 +623,17 @@ mod tests {
             Poll::Ready(out) => out,
             Poll::Pending => panic!("populate_detached_user_range yielded unexpectedly"),
         }
+    }
+
+    #[test]
+    fn initial_stack_protection_follows_gnu_stack_and_vdso_restorer_matrix() {
+        assert_eq!(initial_stack_prot(false, true), Prot::READ_WRITE);
+        assert_eq!(initial_stack_prot(true, true), Prot::new(true, true, true));
+        assert_eq!(
+            initial_stack_prot(false, false),
+            Prot::new(true, true, true)
+        );
+        assert_eq!(initial_stack_prot(true, false), Prot::new(true, true, true));
     }
 
     #[test]

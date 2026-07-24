@@ -12,13 +12,12 @@
 //!
 //! Two domains:
 //!
-//! * `step_engine` — substrate. Everything in the above paragraph
-//!   except the reactor `Channel`/`Mask`. Re-exports `zone::sign` plus
-//!   pass-through `reserve_for` / `sign_for`.
+//! * `step_engine` — substrate. Re-exports `zone::sign` plus pass-through
+//!   `reserve_for` / `sign_for`.
 //!
-//! * `wait_routing` — stacked substrate + reactor. `RangeLock`
-//!   exposes a wait source for fault-resolution range conflicts;
-//!   standard wakeup verbs.
+//! * `wait_routing` — substrate wait-source registration plus agent reply
+//!   await. `RangeLock` exposes a wait source for fault-resolution range
+//!   conflicts.
 
 use tx_platform_adapter::platform_adapter;
 
@@ -31,7 +30,7 @@ use tx_platform_adapter::platform_adapter;
 pub mod step_engine {
     #[cfg(not(tx_lock_metrics_vm))]
     pub(crate) use crate::sync::SpinMutex;
-    pub use tx_substrate::epoch::{self as epoch_mod, guard, Guard};
+    pub use tx_substrate::epoch::{borrow_current_guard, guard, Guard};
     pub use tx_substrate::page_allocator::{
         self, BitmapPageAllocator, CachePin, GiftPin, ZeroPolicy,
     };
@@ -39,16 +38,14 @@ pub mod step_engine {
     pub use tx_substrate::step::{
         AbortReason, AgentCancelPolicy, ByteProgress, DelegateRegistry, DelegateReply,
         DelegateRequest, DelegateState, DelegateTokenId, Errno, InterestMask, NoProgress,
-        PageProgress, ProcessIdentity as PlaceholderProcessSubject, ScriptCtx, StepOp, StepOutcome,
-        StepProgress, SubjectIdentity, TokenDropPolicy, TransitionOutcome, UfdAccessKind, UfdReply,
-        UfdRequest, WaitSourceId, YieldShape,
+        OneShotStepOp, PageProgress, ProcessIdentity as PlaceholderProcessSubject, ScriptCtx,
+        StepOp, StepOutcome, StepProgress, SubjectIdentity, TokenDropPolicy, TransitionOutcome,
+        UfdAccessKind, UfdReply, UfdRequest, WaitSourceId, YieldShape,
     };
     pub use tx_substrate::wake::{MailboxEvent, TaskMailbox};
     pub use tx_substrate::zone::{
-        register_zone_for, reserve_for, sign, sign_for, Cap, CapProducingPolicy, CoLocatedEntity,
-        Dead, Entity, IdentRef, IdentitySlot, IsPayloadPolicy, ObserverNodePolicy,
-        OperationalCapExt, OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy,
-        RetainedEntityPolicy, Weak, Zone, ZoneAllocated, ZoneError, ZonePolicy,
+        register_zone_for, reserve_for, sign, sign_for, Cap, Dead, Entity, IdentRef, PayloadCap,
+        Weak, Zone, ZoneAllocated, ZoneError,
     };
 }
 
@@ -58,16 +55,10 @@ pub mod step_engine {
     apis = ["step"],
     reason = "wrap WaitSourceId minting for vm range-lock wait sources (range_lock.rs)"
 )]
-#[platform_adapter(
-    platform = "reactor",
-    domain = "wait_routing",
-    reason = "wrap reactor Channel/Mask as vm range-lock legacy wakeup verbs"
-)]
 pub mod wait_routing {
     use alloc::sync::Arc;
 
     pub use tx_reactor::await_agent_reply;
-    pub use tx_reactor::wait::{Channel, Mask};
     pub use tx_substrate::wake::WaitSource;
 
     pub fn new_wait_source(source_id: u64) -> Arc<WaitSource> {

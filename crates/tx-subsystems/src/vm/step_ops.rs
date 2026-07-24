@@ -15,11 +15,11 @@
 //! reactors and shim layers that drive via `tx_scripts::drive`.
 
 use crate::vm::adapter::step_engine::{
-    self, Errno, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
+    self, Errno, NoProgress, OneShotStepOp, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
 };
 use crate::vm::{
-    AddressSpace, Prot, UserRange, UserVirtAddr, VmMapCommit, VmMapError, VmMapOutcome,
-    VmMapRequest, VmRemapOutcome, VmRemapRequest,
+    AddressSpace, Prot, UserAccessKind, UserRange, UserVirtAddr, VmMapCommit, VmMapError,
+    VmMapOutcome, VmMapRequest, VmRemapOutcome, VmRemapRequest,
 };
 
 /// Translate a [`VmMapError`] into a substrate [`Errno`] for
@@ -39,8 +39,39 @@ fn vmmap_error_to_errno(error: VmMapError) -> Errno {
 
 /// Build the canonical RangeLock wait-source Yield for WouldBlock.
 fn range_lock_blocked<O>(aspace: &AddressSpace) -> StepOutcome<O, NoProgress> {
-    crate::vm::notification::range_lock_blocked(aspace.range_lock().wait_source_id())
+    crate::vm::notification::range_lock_blocked(aspace.range_lock().release_endpoint())
 }
+
+// ---------------------------------------------------------------------------
+// ReserveUserRangeOp
+// ---------------------------------------------------------------------------
+
+/// One-shot wrapper for eager user-range materialization before direct I/O.
+///
+/// `reserve_user_range_for_access` resolves every page inline, so it is not a
+/// RangeLock wait operation. The [`OneShotStepOp`] marker makes an accidental
+/// `Continue` or `Yield` a driver-contract violation at the syscall boundary.
+pub struct ReserveUserRangeOp<'a> {
+    pub aspace: &'a AddressSpace,
+    pub range: UserRange,
+    pub kind: UserAccessKind,
+}
+
+impl<'a, I: SubjectIdentity> StepOp<I> for ReserveUserRangeOp<'a> {
+    type Output = ();
+    type Progress = NoProgress;
+
+    fn step(&mut self, ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        // Direct-I/O prefaulting has no independent authority input, but keeps
+        // the enclosing syscall subject explicit at the StepOp boundary.
+        let _ = ctx.subject();
+        self.aspace
+            .reserve_user_range_for_access(self.range, self.kind)
+    }
+}
+
+impl OneShotStepOp for ReserveUserRangeOp<'_> {}
+impl OneShotStepOp<crate::process::ProcessIdentity> for ReserveUserRangeOp<'_> {}
 
 // ---------------------------------------------------------------------------
 // VmMapOp

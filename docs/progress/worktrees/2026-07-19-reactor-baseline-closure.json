@@ -1,0 +1,31 @@
+{
+  "schema": "tx.progress.worktree.v1",
+  "id": "2026-07-19-reactor-baseline-closure",
+  "created": "2026-07-19",
+  "updated": "2026-07-21",
+  "status": "active",
+  "branch": "codex/reactor-baseline-closure",
+  "path": "/Users/3y/.config/superpowers/worktrees/Tx/reactor-refactor",
+  "base": "codex/reactor-refactor@df0e877e4288cb4b7eed49a47a42c96d4d881fb4",
+  "plan": "docs/progress/plans/2026-07-19-reactor-baseline-closure.json",
+  "owner": "codex/reactor-baseline-closure",
+  "write_scope": [
+    "crates/tx-reactor",
+    "crates/tx-kernel",
+    "crates/tx-services",
+    "xtask",
+    "docs/design",
+    "tools/images/vendor",
+    "docs/progress/plans/2026-07-19-reactor-baseline-closure.json",
+    "docs/progress/worktrees/2026-07-19-reactor-baseline-closure.json",
+    "docs/superpowers/specs/2026-07-19-reactor-baseline-closure-design.md",
+    "docs/superpowers/plans/2026-07-19-reactor-baseline-closure-phase-a.md"
+  ],
+  "verification": [
+    "cargo xtask ci",
+    "cargo xtask ci-slow",
+    "cargo xtask progress validate",
+    "git diff --check"
+  ],
+  "notes": "Stacked closure worktree. The original codex/reactor-refactor branch remains unchanged with exactly thirteen commits. cargo clean removed only this worktree's generated Cargo artifacts after ENOSPC, restoring about 26 GiB free space."
+}

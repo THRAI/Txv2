@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 
-use crate::net::protocol::{Icmpv4Event, RawIpv6Packet, SmoltcpTcpSegment};
+use crate::net::protocol::Icmpv4Event;
 use crate::net::structure::IpEndpoint;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -8,9 +8,6 @@ pub enum PacketDispatch {
     Tcp(TcpPacketEvent),
     Udp(UdpPacketEvent),
     Icmp(Icmpv4Event),
-    /// IPv6 V1b: a raw ICMPv6 packet lifted off the wire, routed to raw-icmp6
-    /// sockets (ping6 echo replies). NDISC processing is V2.
-    Icmp6(RawIpv6Packet),
     Unsupported,
     Malformed,
 }
@@ -22,11 +19,6 @@ pub struct TcpPacketEvent {
     pub flags: TcpPacketFlags,
     pub payload: Vec<u8>,
     pub urgent: bool,
-    /// Fully parsed segment (seq/ack/window) for feeding smoltcp
-    /// `process_segment`. `None` when the producer only had bare fields
-    /// (e.g. hand-built test events); such events cannot carry data into
-    /// an established connection.
-    pub segment: Option<SmoltcpTcpSegment>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -57,13 +49,7 @@ impl TcpPacketEvent {
             flags,
             payload,
             urgent,
-            segment: None,
         }
-    }
-
-    pub fn with_segment(mut self, segment: Option<SmoltcpTcpSegment>) -> Self {
-        self.segment = segment;
-        self
     }
 
     pub fn with_payload_len(

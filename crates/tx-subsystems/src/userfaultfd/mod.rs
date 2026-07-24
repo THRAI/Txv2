@@ -12,7 +12,7 @@
 //! 1. The zone-allocated `UserfaultFd` payload.
 //! 2. A stable `ufd_id` minted at construction — used in later phases
 //!    as the `endpoint_marker` for `DelegateRegistry::install_request`
-//!    and `mark_endpoint_died` (see D7 §3.3).
+//!    and `delegate endpoint-death transition` (see D7 §3.3).
 //! 3. The `register_zones()` hook called from
 //!    [`crate::zones::register_all`].
 //!
@@ -36,19 +36,21 @@ pub mod adapter;
 pub mod notification;
 
 use adapter::step_engine::{
-    sign, ByteProgress, Cap, DelegateRegistry, DelegateTokenId, SpinMutex, StepOutcome,
-    TaskMailbox, V3Errno, WaitSource, Zone, ZoneAllocated, ZoneError,
+    sign, ByteProgress, Cap, DelegateRegistry, DelegateTokenId, MailboxEvent, MailboxSchedulerHint,
+    ScriptCtx, SpinMutex, StepOp, StepOutcome, SubjectIdentity, TaskMailbox, V3Errno, WaitSource,
+    Zone, ZoneAllocated, ZoneError,
 };
-use adapter::wait_routing::Channel;
 
 // === ufd_id minting ===================================================
 
 /// Monotonic counter for `UserfaultFd::ufd_id`. The id is the
 /// `endpoint_marker` later phases pass to
-/// `DelegateRegistry::install_request` / `mark_endpoint_died`. Starts
+/// `DelegateRegistry::install_request` / `delegate endpoint-death transition`. Starts
 /// at 1 so 0 can serve as "no endpoint" if a future caller ever needs
 /// a sentinel.
 static NEXT_UFD_ID: AtomicU64 = AtomicU64::new(1);
+
+pub type MailboxRefPostWithHintFn = fn(&TaskMailbox, MailboxEvent, MailboxSchedulerHint) -> bool;
 
 fn allocate_ufd_id() -> u64 {
     NEXT_UFD_ID.fetch_add(1, Ordering::AcqRel)
@@ -63,7 +65,7 @@ fn allocate_ufd_id() -> u64 {
 /// substrate carries the few fields phase 5 actually serializes plus
 /// the per-fault `DelegateTokenId` that links the message back to the
 /// pending agent slot so an `UFFDIO_COPY` / `_ZEROPAGE` / `_CONTINUE`
-/// reply can `mark_replied` against the right token.
+/// reply can `delegate reply transition` against the right token.
 ///
 /// **Token tracking decision.** Linux's `struct uffd_msg` does not
 /// carry a token id natively — the agent infers "which fault is this
@@ -170,7 +172,7 @@ pub struct UserfaultFd {
     /// thread in the registering process to a handler thread bound to a
     /// specific ufd via the `read(uffd_fd, &mut uffd_msg)` arm; one
     /// registry per ufd matches that 1:1 grouping. The `ufd_id` doubles
-    /// as the `endpoint_marker` so [`DelegateRegistry::mark_endpoint_died`]
+    /// as the `endpoint_marker` so the `DelegateRegistry` delegate endpoint-death transition
     /// can walk all in-flight faults on this ufd when the cap is
     /// dropped (the close-the-fd-on-handler-exit path).
     ///
@@ -178,7 +180,7 @@ pub struct UserfaultFd {
     /// against this registry and `await_agent_reply` against the
     /// faulting thread's mailbox; phase 5 wires the `UFFDIO_COPY` /
     /// `UFFDIO_ZEROPAGE` ioctls to drive
-    /// [`DelegateRegistry::mark_replied`] against the same registry.
+    /// the `DelegateRegistry` delegate reply transition against the same registry.
     delegate_registry: DelegateRegistry,
     /// PR-10 phase 5: per-ufd pending-fault queue. Each successful
     /// `fault_script` interception pushes one [`UffdMsg`] here; the
@@ -191,24 +193,17 @@ pub struct UserfaultFd {
     /// pipe.rs::RingBuffer pattern and stays consistent with the
     /// hot-path-cold registration model.
     pending_faults: SpinMutex<VecDeque<UffdMsg>>,
-    /// PR-10 phase 5: per-ufd read-readiness wait source. Fired
-    /// whenever a fault is pushed onto [`Self::pending_faults`]. The
-    /// agent thread's `step_ufd_read` parks on this source when the
-    /// queue is empty (blocking case); pipe.rs's `Arc<WaitSource>`
-    /// pattern is the model (D2/D4 coexistence: the legacy `Channel`
-    /// and the new `WaitSource` fire on every transition).
+    /// PR-10 phase 5: per-ufd read-readiness wait source. Fired whenever a
+    /// fault is pushed onto [`Self::pending_faults`]. The agent thread's
+    /// `step_ufd_read` parks on this source when the queue is empty.
     ///
     /// `WaitSource::id()` matches [`Self::wait_source_id`] so a
     /// `YieldShape::OnWaitSource { source }` consumer's `source.raw()`
-    /// round-trips through the legacy `wait_source` resolver.
+    /// round-trips through the compatibility `wait_source` resolver.
     wait_source: Arc<WaitSource>,
-    /// Legacy `Channel` companion (D2 coexistence with pipe.rs). The
-    /// `wait_source` registry's id is the same `u64` carried on the
-    /// new path so a `WaitToken::source_id()` lookup lands here.
-    wait_channel: Channel,
-    /// Carrier id paired with [`Self::wait_channel`]. Stable for the
-    /// lifetime of the `Cap<UserfaultFd>` — minted at construction
-    /// and released in `Drop`.
+    /// Carrier id paired with [`Self::wait_source`]. Stable for the lifetime
+    /// of the `Cap<UserfaultFd>`; minted at construction and released in
+    /// `Drop`.
     wait_source_id: u64,
 }
 
@@ -239,6 +234,9 @@ impl UserfaultFd {
     /// here so future bits do not break the substrate API.
     pub fn with_flags(open_flags: u32) -> Self {
         let wait_point = notification::new_wait_point();
+        let wait_source_id =
+            tx_substrate::wake::WaitEndpoint::source_id(wait_point.endpoint()).raw();
+        let (_, wait_source) = wait_point.into_parts();
         Self {
             ufd_id: allocate_ufd_id(),
             open_flags,
@@ -246,9 +244,8 @@ impl UserfaultFd {
             registrations: SpinMutex::new(Vec::new()),
             delegate_registry: DelegateRegistry::new(),
             pending_faults: SpinMutex::new(VecDeque::new()),
-            wait_source: wait_point.source,
-            wait_channel: wait_point.channel,
-            wait_source_id: wait_point.source_id,
+            wait_source,
+            wait_source_id,
         }
     }
 
@@ -272,7 +269,7 @@ impl UserfaultFd {
     /// for identity assertions in tests; later phases wire it as the
     /// `endpoint_marker` argument to
     /// `DelegateRegistry::install_request` and
-    /// `mark_endpoint_died`.
+    /// `delegate endpoint-death transition`.
     pub const fn ufd_id(&self) -> u64 {
         self.ufd_id
     }
@@ -333,13 +330,13 @@ impl UserfaultFd {
 
     /// Per-ufd [`DelegateRegistry`] (PR-10 phase 4). The fault path
     /// installs requests against this registry; the agent's reply
-    /// ioctls (phase 5) drive `mark_replied` against it.
+    /// ioctls (phase 5) drive `delegate reply transition` against it.
     ///
     /// Each `Cap<UserfaultFd>` owns its own registry — Linux's ufd
     /// routes a fault to exactly one handler-bound ufd, so the
     /// per-ufd grouping matches the kernel model (D7 §3.3). The
     /// `ufd_id` is the `endpoint_marker` consumers pass to
-    /// `install_request` so a future `mark_endpoint_died` walk can
+    /// `install_request` so a future `delegate endpoint-death transition` walk can
     /// abort every in-flight fault when the ufd cap drops.
     pub fn delegate_registry(&self) -> &DelegateRegistry {
         &self.delegate_registry
@@ -350,25 +347,31 @@ impl UserfaultFd {
     /// `YieldShape::OnWaitSource` producer) can clone and hold the
     /// source across the wait window without keeping the ufd cap
     /// alive longer than necessary.
-    pub fn wait_source(&self) -> &Arc<WaitSource> {
+    fn wait_source(&self) -> &Arc<WaitSource> {
         &self.wait_source
     }
 
-    /// PR-10 phase 5: legacy-resolver-side carrier id. The same `u64`
-    /// is stamped on the new `WaitSource::id()` so a `WaitToken`
-    /// constructed from this id resolves via `wait_source::wait_on_token`
-    /// against the [`Self::wait_channel`].
+    /// Readable endpoint exposed to wait drivers.
+    pub fn read_endpoint(&self) -> &Arc<WaitSource> {
+        self.wait_source()
+    }
+
+    /// PR-10 phase 5: registered source id. The same `u64` is stamped on the
+    /// `WaitSource::id()` so waiters resolve this id against
+    /// [`Self::wait_source`].
     pub fn wait_source_id(&self) -> u64 {
         self.wait_source_id
     }
 
-    /// PR-10 phase 5: push a fault message onto the pending queue and
-    /// fire both wake paths (legacy `Channel` + new `WaitSource`).
-    /// Called by the phase-4 `fault_script` OnAgent branch immediately
-    /// after `install_request` returns the `DelegateTokenId`.
-    pub fn push_fault_msg(&self, msg: UffdMsg) {
+    /// Push a fault message and publish readability through a caller-provided
+    /// mailbox-ref post operation. Reactor contexts inject the owner-aware
+    /// path here; no-context callers pass an explicit direct post helper.
+    pub fn push_fault_msg_with_post<F>(&self, msg: UffdMsg, post: F)
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent, MailboxSchedulerHint) -> bool,
+    {
         self.pending_faults.lock().push_back(msg);
-        notification::notify_readable(&self.wait_channel, &self.wait_source);
+        notification::notify_readable_with_post(&self.wait_source, post);
     }
 
     /// PR-10 phase 5: snapshot the pending-fault queue depth. Tests
@@ -405,8 +408,8 @@ impl UserfaultFd {
 ///   buffer at least 32 bytes wide to receive a fault message).
 /// - queue empty + O_NONBLOCK → `Err(EAGAIN)`.
 /// - queue empty + blocking → `Yield { OnWaitSource }` on the per-ufd
-///   wait source; the dispatcher parks on `wait_source::wait_on_token`
-///   and re-polls when [`UserfaultFd::push_fault_msg`] fires.
+///   wait source; the dispatcher parks through the registered wait-source
+///   resolver and re-polls when [`UserfaultFd::push_fault_msg_with_post`] fires.
 ///
 /// **Wire format (32 bytes).** Linux's `struct uffd_msg` is 32 bytes
 /// on RV64. The serialized layout phase 5 emits is the minimum the
@@ -457,10 +460,25 @@ pub fn step_ufd_read(
     if nonblocking {
         return StepOutcome::err(V3Errno::EAGAIN);
     }
-    // Park on the per-ufd wait source. The caller (sys_read in the
-    // shim) drives `wait_source::wait_on_token` against the carrier
-    // id; `push_fault_msg` fires the channel on the next install.
-    notification::wait_until_readable(ufd.wait_source_id())
+    // Park on the per-ufd readable endpoint; the next fault push notifies the
+    // same source.
+    notification::wait_until_readable(ufd.read_endpoint())
+}
+
+pub struct UffdReadOp<'a> {
+    pub ufd: &'a UserfaultFd,
+    pub out: &'a mut [u8],
+    pub nonblocking: bool,
+}
+
+impl<I: SubjectIdentity> StepOp<I> for UffdReadOp<'_> {
+    type Output = usize;
+    type Progress = ByteProgress;
+
+    fn step(&mut self, ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let _ = ctx.subject();
+        step_ufd_read(self.ufd, self.out, self.nonblocking)
+    }
 }
 
 /// Wire-format size of a serialized `struct uffd_msg` record per
@@ -537,7 +555,7 @@ impl Drop for UserfaultFd {
 /// 2. On match: returns an [`crate::vm::UfdDispatchTarget`] pointing
 ///    at the cap's per-ufd `DelegateRegistry`, the faulting thread's
 ///    `Weak<TaskMailbox>`, and the cap itself as the `fault_pusher`
-///    so the OnAgent branch can `push_fault_msg`.
+///    so the OnAgent branch can `push_fault_msg_with_post`.
 /// 3. On miss (the cap was closed between `UFFDIO_REGISTER` and the
 ///    fault, or the registration tag is stale): returns `None`. The
 ///    fault-script falls through to the normal materialize path —
@@ -554,7 +572,7 @@ pub struct ProcessUfdDispatch<'a> {
     process: &'a Cap<crate::process::ProcessIdentity>,
     /// Faulting thread's mailbox (held `Weak` so the script frame's
     /// teardown does not pin a dead mailbox alive — see PR-7B
-    /// invariant on `mark_replied`'s `Weak::upgrade` semantics).
+    /// invariant on `delegate reply transition`'s `Weak::upgrade` semantics).
     mailbox: alloc::sync::Weak<TaskMailbox>,
     /// Cached cap clone produced by `resolve`. The cap is held inside
     /// the dispatcher across the `await_agent_reply` window so the
@@ -573,6 +591,9 @@ pub struct ProcessUfdDispatch<'a> {
     /// tied to the dispatcher's `&self` lifetime, which the fault
     /// future holds across the `await_agent_reply` await.
     resolved_cap: core::cell::UnsafeCell<Option<Cap<UserfaultFd>>>,
+    /// Owner-aware or explicitly direct mailbox-ref post operation for
+    /// pending-fault readable publication.
+    fault_post: MailboxRefPostWithHintFn,
 }
 
 // SAFETY: `ProcessUfdDispatch` may travel with the fault future
@@ -588,19 +609,18 @@ pub struct ProcessUfdDispatch<'a> {
 unsafe impl<'a> Sync for ProcessUfdDispatch<'a> {}
 
 impl<'a> ProcessUfdDispatch<'a> {
-    /// Construct a fresh dispatcher. Caller supplies the process cap
-    /// (typically `thread.upgrade_owner_proc()` from the trap
-    /// handler) and the faulting thread's mailbox (`Weak` to avoid
-    /// pinning a dead mailbox alive — `thread.task_mailbox_weak()`
-    /// or equivalent).
-    pub fn new(
+    /// Construct a dispatcher that publishes userfaultfd readable events
+    /// through the caller-provided mailbox-ref post route.
+    pub fn new_with_post(
         process: &'a Cap<crate::process::ProcessIdentity>,
         mailbox: alloc::sync::Weak<TaskMailbox>,
+        fault_post: MailboxRefPostWithHintFn,
     ) -> Self {
         Self {
             process,
             mailbox,
             resolved_cap: core::cell::UnsafeCell::new(None),
+            fault_post,
         }
     }
 }
@@ -666,6 +686,7 @@ impl<'a> crate::vm::UfdDispatch for ProcessUfdDispatch<'a> {
             registry: ufd_ref.delegate_registry(),
             mailbox: self.mailbox.clone(),
             fault_pusher: Some(ufd_ref),
+            fault_post: self.fault_post,
         })
     }
 }
@@ -715,6 +736,10 @@ mod tests {
         let ufd = UserfaultFd::new_cap().expect("ufd cap");
         // The cap must resolve to a live ufd payload with a non-zero id.
         assert!(ufd.ufd_id() > 0, "ufd_id must be a positive monotonic id");
+        assert_eq!(
+            tx_substrate::wake::WaitEndpoint::source_id(ufd.read_endpoint()).raw(),
+            ufd.wait_source_id(),
+        );
     }
 
     #[test]

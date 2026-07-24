@@ -10,7 +10,8 @@
 //!
 //! - Types: [`Signum`], [`SignalMask`], [`PendingSignalQueue`],
 //!   [`SigDisposition`], [`SigActionTable`].
-//! - Shims: [`step_kill_process`], [`step_kill_pgrp`], [`step_sigaction`].
+//! - Shims: [`step_kill_process_with_post`], [`step_kill_pgrp_with_post`],
+//!   [`step_sigaction`].
 //! - Per-thread mutators (mask + pending) live in
 //!   `thread_runtime::execution`.
 //!
@@ -28,18 +29,26 @@
 //!   yet; callers pass `Cap<ProcessIdentity>` directly. Numeric kill
 //!   lands when the registry does.
 
+use alloc::sync::Weak as ArcWeak;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 pub mod adapter;
 
 use adapter::step_engine::{
-    self, Cap, Guard, NoProgress, OneShotStepOp, OperationalCapExt, PayloadCap, ScriptCtx,
-    SignalRouting, SpinMutex, StepOp, StepOutcome, SubjectIdentity,
+    self, Cap, Guard, MailboxEvent, NoProgress, OneShotStepOp, OperationalCapExt, PayloadCap,
+    ScriptCtx, SignalRouting, SpinMutex, StepOp, StepOutcome, SubjectIdentity, TaskMailbox,
 };
 
 use crate::execution::Errno;
 use crate::process::structure::{ProcessGroup, ProcessIdentity, ProcessPayload, SIGNAL_GENERATED};
-use crate::thread_runtime::execution::{post_signal, post_signal_mailbox};
+use crate::thread_runtime::execution::{post_signal_mailbox_with_post, post_signal_with_post};
+
+fn direct_task_mailbox_post(weak: ArcWeak<TaskMailbox>, event: MailboxEvent) {
+    let Some(mailbox) = weak.upgrade() else {
+        return;
+    };
+    let _ = mailbox.post(event);
+}
 
 /// POSIX signal number, 1..=64.
 ///
@@ -65,6 +74,8 @@ impl Signum {
     pub const SIGTSTP: Self = Self(20);
     pub const SIGTTIN: Self = Self(21);
     pub const SIGTTOU: Self = Self(22);
+    pub const GLIBC_SIGCANCEL: Self = Self(32);
+    pub const MUSL_SIGCANCEL: Self = Self(33);
 
     pub const MIN: u8 = 1;
     pub const MAX: u8 = 64;
@@ -92,6 +103,13 @@ impl Signum {
     /// `step_sigprocmask` can refuse no-ops on these signals later.
     pub const fn is_uncatchable(self) -> bool {
         matches!(self.0, 9 | 19)
+    }
+
+    /// Linux libcs reserve internal realtime signals for pthread
+    /// cancellation. These handlers inspect the delivered ucontext more
+    /// tightly than ordinary application handlers.
+    pub const fn is_libc_sigcancel(self) -> bool {
+        matches!(self.0, 32 | 33)
     }
 }
 
@@ -427,7 +445,7 @@ impl SigActionTable {
 /// thread being terminated / is a stop pending". The authoritative
 /// state lives in `thread_pending`, `group_pending`, the current mask,
 /// and `step_thread_exit`'s commit; `signal_summary` is a denormalised
-/// view kept current by `post_signal`, `step_sigprocmask`, and the
+/// view kept current by catchable-signal posting, `step_sigprocmask`, and the
 /// SIGKILL routing path.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct InterruptSummary {
@@ -542,10 +560,7 @@ fn emit_signal_select_trace(name: &[u8], value: i64) {
         let _ = value;
         if let Some(observer) = tx_observe::current() {
             debug_assert!(SIGNAL_SELECT_TRACE_NAMES.contains(&name));
-            observer.counter(
-                tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-                value,
-            );
+            observer.debug_counter(name, value);
         }
     }
     #[cfg(not(tx_signal_select_metrics))]
@@ -682,15 +697,19 @@ pub fn thread_pending_signal_interrupts(
             // breaks LTP wait4/poll which rely on SA_RESTART, e.g. the tst
             // harness's parent waitpid taking SIGUSR1/SIGALRM cleanup signals).
             //
-            // The one exception is SIGINT: cyclictest's `kill -2 $hackbench`
-            // relies on hackbench's SIGINT handler running to reap its 400
-            // workers, and glibc's signal() installs that handler with
-            // SA_RESTART. SIGINT handlers are interactive-teardown handlers that
-            // siglongjmp/exit, so restart-vs-EINTR is moot, and no default-suite
-            // test relies on SIGINT restarting a syscall. Scope the override to
-            // SIGINT so other SA_RESTART signals keep correct (non-EINTR)
-            // behavior.
-            !entry.flags.contains(SaFlags::RESTART) || sig == Signum::SIGINT
+            // SIGINT is the interactive-teardown exception: cyclictest's
+            // `kill -2 $hackbench` relies on hackbench's SIGINT handler running
+            // to reap its workers even though glibc's signal() installs the
+            // handler with SA_RESTART.
+            //
+            // Libc cancellation signals are the other narrow exception.
+            // glibc/musl wrap cancelable syscalls such as futex waits in their
+            // own restart/cancel logic; the kernel must wake the blocked wait so
+            // the wrapper can observe pending cancellation instead of silently
+            // re-parking under SA_RESTART.
+            !entry.flags.contains(SaFlags::RESTART)
+                || sig == Signum::SIGINT
+                || sig.is_libc_sigcancel()
         }
     }
 }
@@ -727,7 +746,17 @@ fn sync_group_pending_summaries(
             if let Some(sig) = wake_sig {
                 if (group_pending & sig.bit()) != 0 && !thread_payload.signal_mask().is_blocked(sig)
                 {
-                    post_signal_mailbox(&thread_payload, sig, SignalRouting::ProcessDirected);
+                    let _ = post_signal_mailbox_with_post(
+                        &thread_payload,
+                        sig,
+                        SignalRouting::ProcessDirected,
+                        |weak, event| {
+                            let Some(mailbox) = weak.upgrade() else {
+                                return;
+                            };
+                            let _ = mailbox.post(event);
+                        },
+                    );
                 }
             }
             touched = true;
@@ -794,9 +823,13 @@ pub enum AstOutcome {
     InitiateTermination,
     /// Default action for `sig` is `Term`/`Core` — process group
     /// should exit with this signal. Future work hooks this into
-    /// `process::step_exit_group` with an exit-status that encodes
+    /// the process group-exit transition with an exit status that encodes
     /// "killed by sig".
     DefaultTerminate { sig: Signum },
+    /// Default termination was selected, but process lifecycle ownership
+    /// prevented the exit transition. The signal has been requeued and the
+    /// caller must yield before retrying the AST checkpoint.
+    DefaultTerminateDeferred { sig: Signum },
     /// Default action is `Stop` (SIGSTOP-family). Thread should park
     /// on the stop channel; `THREAD_RUNTIME_v1` §6 owns the state
     /// machine. Day-1 just recognises the intent.
@@ -889,7 +922,7 @@ pub fn ast_check(thread: &Cap<crate::thread_runtime::ThreadIdentity>) -> AstOutc
 /// side-effects we have wired:
 ///
 /// - `DefaultTerminate { sig }` invokes
-///   [`process::step_exit_group_with_signal`] on the thread's owner
+///   the fatal group-exit transition on the thread's owner
 ///   process. The process zombifies with `terminating_signal =
 ///   Some(sig)` and the day-1 status encoding.
 /// - All other variants are returned unchanged. `DefaultStop`,
@@ -909,7 +942,16 @@ pub fn ast_dispatch(thread: &Cap<crate::thread_runtime::ThreadIdentity>) -> AstO
         let guard = step_engine::guard();
         if let Some(proc) = thread.owner_proc.upgrade(&guard) {
             drop(guard);
-            crate::process::execution::step_exit_group_with_signal(&proc, sig);
+            let exit = crate::process::execution::step_exit_group_with_signal_with_posts(
+                &proc,
+                sig,
+                direct_task_mailbox_post,
+                |mailbox, event| mailbox.post(event),
+            );
+            if exit == crate::process::ProcessExitOutcome::Retry {
+                post_group_pending_signal(&proc, sig);
+                return AstOutcome::DefaultTerminateDeferred { sig };
+            }
         }
     }
     outcome
@@ -922,6 +964,14 @@ pub fn ast_dispatch(thread: &Cap<crate::thread_runtime::ThreadIdentity>) -> AstO
 pub enum KillOutcome {
     Delivered,
     NoLiveThread,
+    Retry,
+}
+
+fn kill_outcome_from_exit(outcome: crate::process::ProcessExitOutcome) -> KillOutcome {
+    match outcome {
+        crate::process::ProcessExitOutcome::Completed => KillOutcome::Delivered,
+        crate::process::ProcessExitOutcome::Retry => KillOutcome::Retry,
+    }
 }
 
 /// Deliver a synchronous fault signal (SIGSEGV, SIGILL, SIGBUS, etc.)
@@ -930,7 +980,7 @@ pub enum KillOutcome {
 /// Per `SIGNAL_v1` §20, synchronous faults are delivered on the
 /// trapping thread and **bypass the signal mask** — the fault
 /// occurs regardless of `sigprocmask` state.  The delivery path
-/// differs from `deliver_posix_signal` in two critical ways:
+/// differs from ordinary POSIX signal delivery in two critical ways:
 ///
 /// 1. **No Gewalt routing.** Synchronous faults are always
 ///    catchable Event signals — they consult `sig_actions` for
@@ -943,10 +993,10 @@ pub enum KillOutcome {
 /// If the disposition is `Default` (no handler installed), the
 ///    default action is taken immediately — for SIGSEGV/SIGILL/
 ///    SIGBUS/SIGFPE this is `Term` or `Core`, which maps to
-///    `step_exit_group_with_signal`.
+///    the fatal group-exit transition.
 ///
 /// Phase B (first pass): always takes the default-action path
-///    (calls `step_exit_group_with_signal`).  Handler routing
+///    (calls the fatal group-exit transition).  Handler routing
 ///    via `sig_actions` and signal-frame delivery land in
 ///    Phase D once `SignalFrameIf` integration is complete.
 ///
@@ -956,19 +1006,28 @@ pub enum KillOutcome {
 ///    SIGBUS, SIGFPE, SIGTRAP, SIGSYS); other signums panic.
 ///
 /// See: `txdoc:SIGNAL-V1-S20-SYNCHRONOUS-FAULT`.
-pub fn deliver_synchronous_fault(thread: &Cap<crate::thread_runtime::ThreadIdentity>, sig: Signum) {
+pub fn deliver_synchronous_fault(
+    thread: &Cap<crate::thread_runtime::ThreadIdentity>,
+    sig: Signum,
+) -> crate::process::ProcessExitOutcome {
     let guard = step_engine::guard();
     if let Some(process) = thread.owner_proc.upgrade(&guard) {
         drop(guard);
         // Phase B: always take default action.
-        crate::process::execution::step_exit_group_with_signal(&process, sig);
+        return crate::process::execution::step_exit_group_with_signal_with_posts(
+            &process,
+            sig,
+            direct_task_mailbox_post,
+            |mailbox, event| mailbox.post(event),
+        );
     }
+    crate::process::ProcessExitOutcome::Completed
 }
 
 /// Deliver a signal via the canonical POSIX entry point.
 ///
 /// This is the canonical POSIX signal delivery entry per `SIGNAL_v1`
-/// §12 (`deliver_posix_signal`). It accepts a `SignalTarget` and
+/// §12. It accepts a `SignalTarget` and
 /// routes the signal through three stages:
 ///
 /// 1. **Gewalt check** — `SIGKILL`/`SIGSTOP`/`SIGCONT` bypass the
@@ -989,7 +1048,14 @@ pub fn deliver_synchronous_fault(thread: &Cap<crate::thread_runtime::ThreadIdent
 /// `Thread` targets are TODO.
 ///
 /// See: `txdoc:SIGNAL-V1-S12-DELIVER-POSIX-SIGNAL`.
-pub fn deliver_posix_signal(target: SignalTarget, sig: Signum) -> KillOutcome {
+pub fn deliver_posix_signal_with_post<F>(
+    target: SignalTarget,
+    sig: Signum,
+    mut post: F,
+) -> KillOutcome
+where
+    F: FnMut(ArcWeak<TaskMailbox>, MailboxEvent),
+{
     let cap = match target {
         SignalTarget::Process(cap) => cap,
         SignalTarget::ProcessGroup(_group) => {
@@ -1008,7 +1074,7 @@ pub fn deliver_posix_signal(target: SignalTarget, sig: Signum) -> KillOutcome {
 
     // Gewalt signums bypass the routing table entirely.
     if is_gewalt(sig) {
-        return step_kill_process(&cap, sig, None);
+        return step_kill_process_with_post(&cap, sig, None, post);
     }
 
     // Event signums: consult sig_actions for disposition.
@@ -1023,23 +1089,27 @@ pub fn deliver_posix_signal(target: SignalTarget, sig: Signum) -> KillOutcome {
             // Materialise the default action immediately.
             match default_action(sig) {
                 DefaultAction::Ignore => KillOutcome::Delivered,
-                DefaultAction::Term | DefaultAction::Core => {
-                    crate::process::execution::step_exit_group_with_signal(&cap, sig);
-                    KillOutcome::Delivered
-                }
+                DefaultAction::Term | DefaultAction::Core => kill_outcome_from_exit(
+                    crate::process::execution::step_exit_group_with_signal_with_posts(
+                        &cap,
+                        sig,
+                        &mut post,
+                        |mailbox, event| mailbox.post(event),
+                    ),
+                ),
                 DefaultAction::Stop => {
-                    route_gewalt(&cap, Signum::SIGSTOP);
+                    route_gewalt_with_post(&cap, Signum::SIGSTOP, &mut post);
                     KillOutcome::Delivered
                 }
                 DefaultAction::Cont => {
-                    route_gewalt(&cap, Signum::SIGCONT);
+                    route_gewalt_with_post(&cap, Signum::SIGCONT, &mut post);
                     KillOutcome::Delivered
                 }
             }
         }
         SigDisposition::Handler(_handler) => {
             // Post to eligible thread's pending; AST delivers handler.
-            step_kill_process(&cap, sig, None)
+            step_kill_process_with_post(&cap, sig, None, post)
         }
     }
 }
@@ -1093,20 +1163,27 @@ pub fn pending_signal_interrupts_wait(
     }
 }
 
-pub fn deliver_signal_if_handler(process: &Cap<ProcessIdentity>, sig: Signum) -> bool {
+pub fn deliver_signal_if_handler_with_post<F>(
+    process: &Cap<ProcessIdentity>,
+    sig: Signum,
+    post: F,
+) -> bool
+where
+    F: FnMut(ArcWeak<TaskMailbox>, MailboxEvent),
+{
     let disposition = match process.upgrade_operational() {
         Ok(payload) => payload.sig_actions().get(sig),
         Err(_) => return false,
     };
     if matches!(disposition, SigDisposition::Handler(_)) {
-        step_kill_process(process, sig, None);
+        step_kill_process_with_post(process, sig, None, post);
         true
     } else {
         false
     }
 }
 
-/// Target for `deliver_posix_signal`.
+/// Target for POSIX signal delivery.
 ///
 /// Per `SIGNAL_v1` §12, a signal can be addressed to a process
 /// (`pid > 0`), a process group (`pid == 0` or `pid == -pgid`), or a
@@ -1123,10 +1200,10 @@ pub enum SignalTarget {
 /// dispatches by category:
 ///
 /// - **Gewalt** signums (SIGKILL, SIGSTOP, SIGCONT) bypass the
-///   pending queue entirely and route through [`route_gewalt`],
+///   pending queue entirely and route through [`route_gewalt_with_post`],
 ///   which updates each thread's `signal_summary` in place.
 /// - **Event** signums (catchable) route to a single eligible live
-///   thread's `thread_pending` via [`post_signal`].
+///   thread's `thread_pending` via `post_signal_with_post`.
 ///
 /// **D9-B eligibility scan.** Per POSIX, a process-directed signal
 /// must be delivered to a thread whose mask permits the signum if
@@ -1142,26 +1219,46 @@ pub enum SignalTarget {
 ///    (POSIX permits the signal to remain pending until the chosen
 ///    thread unblocks it), pick the first non-zombie thread anyway.
 ///    The bit is set in its `thread_pending`; `signal_summary.
-///    deliverable_signal` stays `false` because `post_signal`'s mask
+///    deliverable_signal` stays `false` because the catchable-signal post mask
 ///    check filters the summary update.
 ///
-/// The mailbox post happens via `post_signal` *after* the
-/// thread-list lock is dropped — `post_signal` does not reacquire
+/// The mailbox post happens via the catchable-signal post helper *after* the
+/// thread-list lock is dropped — it does not reacquire
 /// `payload.threads.inner.lock()`, so this order avoids any
 /// post-while-holding-list-lock hazard. Zombies are skipped.
-pub fn step_kill_process(
+pub fn step_kill_process_with_post<F>(
     target: &Cap<ProcessIdentity>,
     sig: Signum,
     info: Option<SigInfo>,
-) -> KillOutcome {
+    mut post: F,
+) -> KillOutcome
+where
+    F: FnMut(ArcWeak<TaskMailbox>, MailboxEvent),
+{
+    step_kill_process_with_posts(target, sig, info, &mut post, |mailbox, event| {
+        mailbox.post(event)
+    })
+}
+
+pub fn step_kill_process_with_posts<P, R>(
+    target: &Cap<ProcessIdentity>,
+    sig: Signum,
+    info: Option<SigInfo>,
+    mut post: P,
+    mut source_post: R,
+) -> KillOutcome
+where
+    P: FnMut(ArcWeak<TaskMailbox>, MailboxEvent),
+    R: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     // observe
     // upgrade
     // reserve
     // commit
     // publish
     if is_gewalt(sig) {
-        let outcome = route_gewalt(target, sig);
-        // D9-D: route_gewalt does not currently fan out to signalfd
+        let outcome = route_gewalt_with_post(target, sig, &mut post);
+        // D9-D: Gewalt routing does not currently fan out to signalfd
         // subscriptions — SIGKILL/SIGSTOP/SIGCONT bypass pending
         // queues per SIGNAL_v1 §2 Consequence 2, and the canonical
         // signalfd Linux behaviour for SIGSTOP/SIGCONT is to deliver
@@ -1185,7 +1282,11 @@ pub fn step_kill_process(
             if let Some(payload) = target.payload.lock().as_ref() {
                 payload.signal_port.fire(SIGNAL_GENERATED);
             }
-            crate::signalfd::notify_process_signal(target.key().raw(), sig);
+            crate::signalfd::notify_process_signal_with_post(
+                target.key().raw(),
+                sig,
+                &mut source_post,
+            );
         }
         return outcome;
     }
@@ -1199,7 +1300,7 @@ pub fn step_kill_process(
 
         // Pass 1: first non-zombie thread with `sig` NOT blocked.
         // The sigmask read goes through the payload's `signal_mask`
-        // atomic via `signal_mask()`, matching `post_signal` /
+        // atomic via `signal_mask()`, matching catchable-signal posting /
         // `step_sigprocmask`'s discipline.
         let mut eligible: Option<Cap<crate::thread_runtime::ThreadIdentity>> = None;
         let mut fallback: Option<Cap<crate::thread_runtime::ThreadIdentity>> = None;
@@ -1217,7 +1318,7 @@ pub fn step_kill_process(
             }
         }
         eligible.or(fallback)
-        // `threads` lock drops at end of scope before `post_signal`.
+        // `threads` lock drops at end of scope before catchable-signal posting.
     };
 
     let Some(chosen) = chosen else {
@@ -1229,7 +1330,13 @@ pub fn step_kill_process(
         target.siginfo_store(sig, *sinfo);
     }
 
-    post_signal(&chosen, sig, SignalRouting::ProcessDirected, info);
+    post_signal_with_post(
+        &chosen,
+        sig,
+        SignalRouting::ProcessDirected,
+        info,
+        &mut post,
+    );
 
     // D9-D: fan out to every per-process signalfd subscription whose
     // mask covers `sig`. Runs *after* the thread-eligibility post —
@@ -1253,14 +1360,14 @@ pub fn step_kill_process(
     }
 
     // bus subscriber reaction: push siginfo to signalfd queues
-    crate::signalfd::notify_process_signal(target.key().raw(), sig);
+    crate::signalfd::notify_process_signal_with_post(target.key().raw(), sig, &mut source_post);
 
     KillOutcome::Delivered
 }
 
 /// `true` for the three Gewalt signums per `SIGNAL_v1` §1: SIGKILL,
 /// SIGSTOP, SIGCONT. These bypass the catchable pending queues and
-/// are routed by [`route_gewalt`].
+/// are routed by [`route_gewalt_with_post`].
 pub const fn is_gewalt(sig: Signum) -> bool {
     matches!(
         sig.raw(),
@@ -1272,7 +1379,7 @@ pub const fn is_gewalt(sig: Signum) -> bool {
 /// signals do not enter pending queues — they directly invoke control
 /// ops (group exit, group stop, group continue):
 ///
-/// - **SIGKILL** → invokes [`process::step_exit_group_with_signal`]
+/// - **SIGKILL** -> invokes the fatal group-exit transition
 ///   immediately. The target becomes a zombie with
 ///   `terminating_signal = Some(SIGKILL)` and
 ///   `exit_status = Some(128 + SIGKILL)`. Per spec
@@ -1287,15 +1394,31 @@ pub const fn is_gewalt(sig: Signum) -> bool {
 ///
 /// Returns `Delivered` if the target was live and at least one
 /// transition was applied, `NoLiveThread` otherwise.
-pub fn route_gewalt(target: &Cap<ProcessIdentity>, sig: Signum) -> KillOutcome {
-    debug_assert!(is_gewalt(sig), "route_gewalt called with non-Gewalt signum");
+pub fn route_gewalt_with_post<F>(
+    target: &Cap<ProcessIdentity>,
+    sig: Signum,
+    mut post: F,
+) -> KillOutcome
+where
+    F: FnMut(ArcWeak<TaskMailbox>, MailboxEvent),
+{
+    debug_assert!(
+        is_gewalt(sig),
+        "route_gewalt_with_post called with non-Gewalt signum"
+    );
 
     if sig == Signum::SIGKILL {
         if target.is_zombie() {
             return KillOutcome::NoLiveThread;
         }
-        crate::process::execution::step_exit_group_with_signal(target, sig);
-        return KillOutcome::Delivered;
+        return kill_outcome_from_exit(
+            crate::process::execution::step_exit_group_with_signal_with_posts(
+                target,
+                sig,
+                &mut post,
+                |mailbox, event| mailbox.post(event),
+            ),
+        );
     }
 
     let Ok(payload) = target.upgrade_operational() else {
@@ -1332,7 +1455,12 @@ pub fn route_gewalt(target: &Cap<ProcessIdentity>, sig: Signum) -> KillOutcome {
         // control ops; per D9 §5 these "control ops, not
         // readiness transitions" still warrant a wake-hint because
         // the parked future has to notice the summary change.
-        post_signal_mailbox(&thread_payload, sig, SignalRouting::ProcessDirected);
+        let _ = post_signal_mailbox_with_post(
+            &thread_payload,
+            sig,
+            SignalRouting::ProcessDirected,
+            &mut post,
+        );
         touched = true;
     }
 
@@ -1348,11 +1476,37 @@ pub fn route_gewalt(target: &Cap<ProcessIdentity>, sig: Signum) -> KillOutcome {
 /// queue so the (future) delivery step can distinguish thread-
 /// targeted from group-targeted posts. Gewalt signals bypass the
 /// pending queues entirely per `SIGNAL_v1` §2 Consequence 2 — they
-/// route through [`route_gewalt`] which directly updates each
+/// route through [`route_gewalt_with_post`] which directly updates each
 /// thread's `signal_summary`.
 ///
 /// Returns the count of processes that received the post.
-pub fn step_kill_pgrp(pgrp: &Cap<ProcessGroup>, sig: Signum) -> usize {
+pub fn step_kill_pgrp_with_post<F>(pgrp: &Cap<ProcessGroup>, sig: Signum, mut post: F) -> usize
+where
+    F: FnMut(ArcWeak<TaskMailbox>, MailboxEvent),
+{
+    let mut source_post = |mailbox: &TaskMailbox, event| mailbox.post(event);
+    step_kill_pgrp_with_posts_dyn(pgrp, sig, &mut post, &mut source_post)
+}
+
+pub fn step_kill_pgrp_with_posts<P, R>(
+    pgrp: &Cap<ProcessGroup>,
+    sig: Signum,
+    mut post: P,
+    mut source_post: R,
+) -> usize
+where
+    P: FnMut(ArcWeak<TaskMailbox>, MailboxEvent),
+    R: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
+    step_kill_pgrp_with_posts_dyn(pgrp, sig, &mut post, &mut source_post)
+}
+
+fn step_kill_pgrp_with_posts_dyn(
+    pgrp: &Cap<ProcessGroup>,
+    sig: Signum,
+    post: &mut dyn FnMut(ArcWeak<TaskMailbox>, MailboxEvent),
+    source_post: &mut dyn FnMut(&TaskMailbox, MailboxEvent) -> bool,
+) -> usize {
     // observe
     // upgrade
     // reserve
@@ -1363,7 +1517,9 @@ pub fn step_kill_pgrp(pgrp: &Cap<ProcessGroup>, sig: Signum) -> usize {
     let catchable = !is_gewalt(sig);
     let members = pgrp.members.snapshot_live(&guard);
     for member in &members {
-        if step_kill_process(member, sig, None) == KillOutcome::Delivered {
+        if step_kill_process_with_posts(member, sig, None, &mut *post, &mut *source_post)
+            == KillOutcome::Delivered
+        {
             // Catchable only: mirror onto group_pending so the
             // delivery step can recognise group-targeted posts.
             // Gewalt bypasses pending queues entirely.
@@ -1435,6 +1591,7 @@ pub enum SigDispositionChange {
 pub enum KillScriptOutcome {
     Delivered,
     NoLiveThread,
+    Retry,
     /// Posted permission was OK (e.g. signal 0 probe), no actual
     /// delivery happened.
     Probed,
@@ -1442,7 +1599,7 @@ pub enum KillScriptOutcome {
 
 /// POSIX-shaped `kill(target_pid, sig)` modulo pid lookup. Composes
 /// the `cred::require_signal_send` permission check with
-/// [`step_kill_process`] per `SIGNAL_v1` §32's `script_kill`. The
+/// [`step_kill_process_with_posts`] per `SIGNAL_v1` §32's `script_kill`. The
 /// guard-bound witness is consumed in the same step; the underlying
 /// post is the existing producer-internal mechanism.
 ///
@@ -1461,19 +1618,44 @@ pub fn script_kill_process(
     sig: Signum,
     info: Option<SigInfo>,
 ) -> Result<KillScriptOutcome, Errno> {
+    script_kill_process_with_posts(
+        source,
+        target,
+        sig,
+        info,
+        direct_task_mailbox_post,
+        |mailbox, event| mailbox.post(event),
+    )
+}
+
+pub fn script_kill_process_with_posts<P, R>(
+    source: &Cap<ProcessIdentity>,
+    target: &Cap<ProcessIdentity>,
+    sig: Signum,
+    info: Option<SigInfo>,
+    mut post: P,
+    source_post: R,
+) -> Result<KillScriptOutcome, Errno>
+where
+    P: FnMut(ArcWeak<TaskMailbox>, MailboxEvent),
+    R: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     use crate::cred::checks::{authorize_signal_send, AuthOutcome};
 
     match authorize_signal_send(source, target, sig)? {
         AuthOutcome::NoLiveTarget => return Ok(KillScriptOutcome::NoLiveThread),
         AuthOutcome::Authorized => {}
     }
-    // Commit. `step_kill_process` is the primitive (no cred check);
+    // Commit. `step_kill_process_with_posts` is the primitive (no cred check);
     // authorize_signal_send dropped its guard before returning, so
-    // post_signal's inner guard for SigInfo storage doesn't nest.
-    Ok(match step_kill_process(target, sig, info) {
-        KillOutcome::Delivered => KillScriptOutcome::Delivered,
-        KillOutcome::NoLiveThread => KillScriptOutcome::NoLiveThread,
-    })
+    // The catchable-signal post helper's inner guard for SigInfo storage doesn't nest.
+    Ok(
+        match step_kill_process_with_posts(target, sig, info, &mut post, source_post) {
+            KillOutcome::Delivered => KillScriptOutcome::Delivered,
+            KillOutcome::NoLiveThread => KillScriptOutcome::NoLiveThread,
+            KillOutcome::Retry => KillScriptOutcome::Retry,
+        },
+    )
 }
 
 /// Permission probe equivalent to POSIX `kill(pid, 0)`. Runs the cred
@@ -1496,10 +1678,42 @@ pub fn script_kill_probe(
     }
 }
 
+/// Permission-only counterpart to [`script_kill_pgrp`]. Returns the
+/// number of live group members the source may signal without posting
+/// anything to pending queues or mailboxes.
+pub fn script_kill_pgrp_probe(
+    source: &Cap<ProcessIdentity>,
+    pgrp: &Cap<ProcessGroup>,
+) -> Result<u32, Errno> {
+    use crate::cred::checks::{authorize_signal_send_under_guard, AuthOutcome};
+
+    let guard = step_engine::guard();
+    let source_snapshot = source.cred_snapshot().ok_or(Errno::ESRCH)?;
+    let members: alloc::vec::Vec<Cap<ProcessIdentity>> = pgrp.members.snapshot_live(&guard);
+    let mut permitted = 0u32;
+
+    for member in &members {
+        if matches!(
+            authorize_signal_send_under_guard(
+                &source_snapshot,
+                source,
+                member,
+                Signum::SIGTERM,
+                &guard,
+            ),
+            Ok(AuthOutcome::Authorized)
+        ) {
+            permitted += 1;
+        }
+    }
+
+    Ok(permitted)
+}
+
 /// Permission-checked process-group fanout per `SIGNAL_v1` §12.2.
 /// Iterates `pgrp.members`, builds a `TargetProcCred` per live member,
 /// runs the cred check, and posts on permitted members via
-/// [`step_kill_process`]. Returns the count of members the call
+/// [`step_kill_process_with_post`]. Returns the count of members the call
 /// successfully delivered to. Per-member denials and zombies are
 /// independent — they don't fail the whole call.
 ///
@@ -1512,8 +1726,35 @@ pub fn script_kill_pgrp(
     pgrp: &Cap<ProcessGroup>,
     sig: Signum,
 ) -> Result<u32, Errno> {
+    script_kill_pgrp_with_posts(
+        source,
+        pgrp,
+        sig,
+        direct_task_mailbox_post,
+        |mailbox, event| mailbox.post(event),
+    )
+}
+
+pub fn script_kill_pgrp_with_posts<P, R>(
+    source: &Cap<ProcessIdentity>,
+    pgrp: &Cap<ProcessGroup>,
+    sig: Signum,
+    mut post: P,
+    mut source_post: R,
+) -> Result<u32, Errno>
+where
+    P: FnMut(ArcWeak<TaskMailbox>, MailboxEvent),
+    R: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     let guard = step_engine::guard();
-    script_kill_pgrp_with_guard(source, pgrp, sig, &guard)
+    script_kill_pgrp_with_guard_and_posts_dyn(
+        source,
+        pgrp,
+        sig,
+        &guard,
+        &mut post,
+        &mut source_post,
+    )
 }
 
 pub(crate) fn script_kill_pgrp_with_guard(
@@ -1522,11 +1763,45 @@ pub(crate) fn script_kill_pgrp_with_guard(
     sig: Signum,
     guard: &Guard<'_>,
 ) -> Result<u32, Errno> {
+    script_kill_pgrp_with_guard_and_posts(
+        source,
+        pgrp,
+        sig,
+        guard,
+        direct_task_mailbox_post,
+        |mailbox, event| mailbox.post(event),
+    )
+}
+
+pub(crate) fn script_kill_pgrp_with_guard_and_posts<P, R>(
+    source: &Cap<ProcessIdentity>,
+    pgrp: &Cap<ProcessGroup>,
+    sig: Signum,
+    guard: &Guard<'_>,
+    mut post: P,
+    mut source_post: R,
+) -> Result<u32, Errno>
+where
+    P: FnMut(ArcWeak<TaskMailbox>, MailboxEvent),
+    R: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
+    script_kill_pgrp_with_guard_and_posts_dyn(source, pgrp, sig, guard, &mut post, &mut source_post)
+}
+
+fn script_kill_pgrp_with_guard_and_posts_dyn(
+    source: &Cap<ProcessIdentity>,
+    pgrp: &Cap<ProcessGroup>,
+    sig: Signum,
+    guard: &Guard<'_>,
+    post: &mut dyn FnMut(ArcWeak<TaskMailbox>, MailboxEvent),
+    source_post: &mut dyn FnMut(&TaskMailbox, MailboxEvent) -> bool,
+) -> Result<u32, Errno> {
     use crate::cred::checks::{authorize_signal_send_under_guard, AuthOutcome};
 
     let source_snapshot = source.cred_snapshot().ok_or(Errno::ESRCH)?;
 
     let mut delivered = 0u32;
+    let mut retry = false;
     let members: alloc::vec::Vec<Cap<ProcessIdentity>> = pgrp.members.snapshot_live(guard);
 
     for member in &members {
@@ -1537,21 +1812,81 @@ pub(crate) fn script_kill_pgrp_with_guard(
             Ok(AuthOutcome::Authorized) => {}
             Ok(AuthOutcome::NoLiveTarget) | Err(_) => continue,
         }
-        if step_kill_process(member, sig, None) == KillOutcome::Delivered {
-            // Catchable only: mirror onto group_pending. Gewalt
-            // signals (SIGKILL/SIGSTOP/SIGCONT) bypass pending
-            // queues entirely per SIGNAL_v1 §2 Consequence 2.
-            if !is_gewalt(sig) {
-                post_group_pending_signal(member, sig);
+        match step_kill_process_with_posts(member, sig, None, &mut *post, &mut *source_post) {
+            KillOutcome::Delivered => {
+                // Catchable only: mirror onto group_pending. Gewalt
+                // signals (SIGKILL/SIGSTOP/SIGCONT) bypass pending
+                // queues entirely per SIGNAL_v1 §2 Consequence 2.
+                if !is_gewalt(sig) {
+                    post_group_pending_signal(member, sig);
+                }
+                delivered += 1;
             }
-            delivered += 1;
+            KillOutcome::Retry => retry = true,
+            KillOutcome::NoLiveThread => {}
         }
     }
 
-    Ok(delivered)
+    if delivered == 0 && retry {
+        Err(Errno::EAGAIN)
+    } else {
+        Ok(delivered)
+    }
 }
 
-/// Cred-checked counterpart to [`deliver_posix_signal`].
+/// Resolve a signal target to its owning process and run send authorization.
+fn authorize_signal_target(
+    source: &Cap<ProcessIdentity>,
+    target: &SignalTarget,
+    sig: Signum,
+) -> Result<Option<Cap<ProcessIdentity>>, Errno> {
+    let target_proc = match target {
+        SignalTarget::Process(cap) => cap.clone(),
+        SignalTarget::Thread(thread) => match thread.upgrade_owner_proc() {
+            Some(process) => process,
+            None => return Ok(None),
+        },
+        SignalTarget::ProcessGroup(_) => return Ok(None),
+    };
+
+    use crate::cred::checks::{authorize_signal_send, AuthOutcome};
+    match authorize_signal_send(source, &target_proc, sig)? {
+        AuthOutcome::NoLiveTarget => Ok(None),
+        AuthOutcome::Authorized => Ok(Some(target_proc)),
+    }
+}
+
+/// Authorize a thread-targeted signal using the normal POSIX send rule, then
+/// terminate the owning process with that signal. This is the LA64 SIGCANCEL
+/// fail-fast script; keeping it architecture-neutral makes its auth and
+/// lifecycle outcomes host-testable.
+pub fn script_authorized_thread_exit_with_posts<P, R>(
+    source: &Cap<ProcessIdentity>,
+    thread: &Cap<crate::thread_runtime::ThreadIdentity>,
+    sig: Signum,
+    post: P,
+    source_post: R,
+) -> Result<KillOutcome, Errno>
+where
+    P: FnMut(ArcWeak<TaskMailbox>, MailboxEvent),
+    R: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
+    let target = SignalTarget::Thread(thread.clone());
+    let Some(target_proc) = authorize_signal_target(source, &target, sig)? else {
+        return Ok(KillOutcome::NoLiveThread);
+    };
+
+    Ok(kill_outcome_from_exit(
+        crate::process::execution::step_exit_group_with_signal_with_posts(
+            &target_proc,
+            sig,
+            post,
+            source_post,
+        ),
+    ))
+}
+
+/// Cred-checked counterpart to disposition-aware POSIX signal delivery.
 ///
 /// Runs `cred::require_signal_send` against `source`'s syscall-entry
 /// snapshot before invoking the disposition-aware delivery primitive.
@@ -1562,44 +1897,44 @@ pub(crate) fn script_kill_pgrp_with_guard(
 ///
 /// `target` may be [`SignalTarget::Process`] or
 /// [`SignalTarget::Thread`]. The `ProcessGroup` variant is rejected
-/// with `Ok(NoLiveThread)` — pgrp fanout flows through
+/// with `Ok(NoLiveThread)` - pgrp fanout flows through
 /// [`script_kill_pgrp`] instead.
 ///
 /// Returns:
-/// - `Ok(Delivered)` / `Ok(NoLiveThread)` — outcome of the delivery
+/// - `Ok(Delivered)` / `Ok(NoLiveThread)` - outcome of the delivery
 ///   primitive after a successful cred check.
-/// - `Err(Errno::ESRCH)` — `source` is a zombie.
-/// - `Err(Errno::EPERM)` — cred check denied the post.
-pub fn script_deliver_signal(
+/// - `Err(Errno::ESRCH)` - `source` is a zombie.
+/// - `Err(Errno::EPERM)` - cred check denied the post.
+pub fn script_deliver_signal_with_post<F>(
     source: &Cap<ProcessIdentity>,
     target: SignalTarget,
     sig: Signum,
     info: Option<SigInfo>,
-) -> Result<KillOutcome, Errno> {
-    // Resolve the target's owning process *before* taking the
-    // auth-phase guard — `upgrade_owner_proc()` takes its own guard
-    // internally, and nesting would trip the no-nested-guard
-    // invariant.
-    let target_proc = match &target {
-        SignalTarget::Process(cap) => cap.clone(),
-        SignalTarget::Thread(t) => match t.upgrade_owner_proc() {
-            Some(p) => p,
-            None => return Ok(KillOutcome::NoLiveThread),
-        },
-        // Pgrp fanout has its own cred-checked script
-        // (`script_kill_pgrp`). Reject here defensively rather than
-        // delivering unchecked.
-        SignalTarget::ProcessGroup(_) => return Ok(KillOutcome::NoLiveThread),
-    };
+    mut post: F,
+) -> Result<KillOutcome, Errno>
+where
+    F: FnMut(ArcWeak<TaskMailbox>, MailboxEvent),
+{
+    script_deliver_signal_with_posts(source, target, sig, info, &mut post, |mailbox, event| {
+        mailbox.post(event)
+    })
+}
 
-    // Phase 1 — authorise. authorize_signal_send takes + drops its
-    // own guard, so the commit phase can take its own guard for
-    // SigInfo storage / weak upgrades without nesting.
-    use crate::cred::checks::{authorize_signal_send, AuthOutcome};
-    match authorize_signal_send(source, &target_proc, sig)? {
-        AuthOutcome::NoLiveTarget => return Ok(KillOutcome::NoLiveThread),
-        AuthOutcome::Authorized => {}
-    }
+pub fn script_deliver_signal_with_posts<P, R>(
+    source: &Cap<ProcessIdentity>,
+    target: SignalTarget,
+    sig: Signum,
+    info: Option<SigInfo>,
+    mut post: P,
+    mut source_post: R,
+) -> Result<KillOutcome, Errno>
+where
+    P: FnMut(ArcWeak<TaskMailbox>, MailboxEvent),
+    R: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
+    let Some(target_proc) = authorize_signal_target(source, &target, sig)? else {
+        return Ok(KillOutcome::NoLiveThread);
+    };
 
     // Phase 2 — commit. Process-targeted sends keep the
     // disposition-aware process selection path; thread-targeted
@@ -1608,10 +1943,18 @@ pub fn script_deliver_signal(
     // process-directed routing can strand SIGCANCEL on a different
     // unblocked sibling.
     Ok(match target {
-        SignalTarget::Process(_) => step_kill_process(&target_proc, sig, info),
+        SignalTarget::Process(_) => {
+            step_kill_process_with_posts(&target_proc, sig, info, post, source_post)
+        }
         SignalTarget::Thread(thread) => {
             if is_gewalt(sig) {
-                return Ok(step_kill_process(&target_proc, sig, info));
+                return Ok(step_kill_process_with_posts(
+                    &target_proc,
+                    sig,
+                    info,
+                    post,
+                    source_post,
+                ));
             }
             let disposition = match target_proc.upgrade_operational() {
                 Ok(payload) => payload.sig_actions().get(sig),
@@ -1622,15 +1965,21 @@ pub fn script_deliver_signal(
                 SigDisposition::Default => match default_action(sig) {
                     DefaultAction::Ignore => return Ok(KillOutcome::Delivered),
                     DefaultAction::Term | DefaultAction::Core => {
-                        crate::process::execution::step_exit_group_with_signal(&target_proc, sig);
-                        return Ok(KillOutcome::Delivered);
+                        return Ok(kill_outcome_from_exit(
+                            crate::process::execution::step_exit_group_with_signal_with_posts(
+                                &target_proc,
+                                sig,
+                                &mut post,
+                                &mut source_post,
+                            ),
+                        ));
                     }
                     DefaultAction::Stop => {
-                        route_gewalt(&target_proc, Signum::SIGSTOP);
+                        route_gewalt_with_post(&target_proc, Signum::SIGSTOP, &mut post);
                         return Ok(KillOutcome::Delivered);
                     }
                     DefaultAction::Cont => {
-                        route_gewalt(&target_proc, Signum::SIGCONT);
+                        route_gewalt_with_post(&target_proc, Signum::SIGCONT, &mut post);
                         return Ok(KillOutcome::Delivered);
                     }
                 },
@@ -1639,13 +1988,14 @@ pub fn script_deliver_signal(
             if let Some(info) = info {
                 target_proc.siginfo_store(sig, info);
             }
-            post_signal(
+            post_signal_with_post(
                 &thread,
                 sig,
                 SignalRouting::ThreadDirected {
                     tid: thread.tid.0 as u64,
                 },
                 info,
+                post,
             );
             KillOutcome::Delivered
         }
@@ -1736,54 +2086,99 @@ pub fn deliver_tty_dispatch_with_guard(
 // wraps need no lifetime parameter. Each `step()` body delegates to
 // the free fn unchanged and lifts the return into `StepOutcome::Done`.
 
-/// `StepOp` wrap for [`step_kill_process`]. PR-2 wave 2.
-pub struct KillProcessOp {
+/// `StepOp` wrap for process-directed signal delivery with caller-injected
+/// mailbox publication.
+pub struct KillProcessWithPostOp<F> {
     pub target: Cap<ProcessIdentity>,
     pub sig: Signum,
     pub info: Option<SigInfo>,
+    pub post: F,
 }
 
-impl<I: SubjectIdentity> StepOp<I> for KillProcessOp {
+impl<I, F> StepOp<I> for KillProcessWithPostOp<F>
+where
+    I: SubjectIdentity,
+    F: FnMut(ArcWeak<TaskMailbox>, MailboxEvent),
+{
     type Output = KillOutcome;
     type Progress = NoProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        StepOutcome::Done(step_kill_process(&self.target, self.sig, self.info))
+        StepOutcome::Done(step_kill_process_with_post(
+            &self.target,
+            self.sig,
+            self.info,
+            &mut self.post,
+        ))
     }
 }
 
-impl<I: SubjectIdentity> OneShotStepOp<I> for KillProcessOp {}
-
-/// `StepOp` wrap for [`step_kill_pgrp`]. PR-2 wave 2.
-pub struct KillPgrpOp {
-    pub pgrp: Cap<ProcessGroup>,
-    pub sig: Signum,
+impl<I, F> OneShotStepOp<I> for KillProcessWithPostOp<F>
+where
+    I: SubjectIdentity,
+    F: FnMut(ArcWeak<TaskMailbox>, MailboxEvent),
+{
 }
 
-impl<I: SubjectIdentity> StepOp<I> for KillPgrpOp {
+/// `StepOp` wrap for process-group-directed signal delivery with caller-
+/// injected mailbox publication.
+pub struct KillPgrpWithPostOp<F> {
+    pub pgrp: Cap<ProcessGroup>,
+    pub sig: Signum,
+    pub post: F,
+}
+
+impl<I, F> StepOp<I> for KillPgrpWithPostOp<F>
+where
+    I: SubjectIdentity,
+    F: FnMut(ArcWeak<TaskMailbox>, MailboxEvent),
+{
     type Output = usize;
     type Progress = NoProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        StepOutcome::Done(step_kill_pgrp(&self.pgrp, self.sig))
+        StepOutcome::Done(step_kill_pgrp_with_post(
+            &self.pgrp,
+            self.sig,
+            &mut self.post,
+        ))
     }
 }
 
-impl OneShotStepOp<crate::process::ProcessIdentity> for KillPgrpOp {}
-
-/// `StepOp` wrap for [`deliver_posix_signal`].
-pub struct DeliverSignalOp {
-    pub target: SignalTarget,
-    pub sig: Signum,
+impl<I, F> OneShotStepOp<I> for KillPgrpWithPostOp<F>
+where
+    I: SubjectIdentity,
+    F: FnMut(ArcWeak<TaskMailbox>, MailboxEvent),
+{
 }
 
-impl<I: SubjectIdentity> StepOp<I> for DeliverSignalOp {
+/// `StepOp` wrap for disposition-aware POSIX signal delivery.
+pub struct DeliverSignalWithPostOp<F> {
+    pub target: SignalTarget,
+    pub sig: Signum,
+    pub post: F,
+}
+
+impl<I, F> StepOp<I> for DeliverSignalWithPostOp<F>
+where
+    I: SubjectIdentity,
+    F: FnMut(ArcWeak<TaskMailbox>, MailboxEvent),
+{
     type Output = KillOutcome;
     type Progress = NoProgress;
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        StepOutcome::Done(deliver_posix_signal(self.target.clone(), self.sig))
+        StepOutcome::Done(deliver_posix_signal_with_post(
+            self.target.clone(),
+            self.sig,
+            &mut self.post,
+        ))
     }
 }
 
-impl<I: SubjectIdentity> OneShotStepOp<I> for DeliverSignalOp {}
+impl<I, F> OneShotStepOp<I> for DeliverSignalWithPostOp<F>
+where
+    I: SubjectIdentity,
+    F: FnMut(ArcWeak<TaskMailbox>, MailboxEvent),
+{
+}
 
 /// `StepOp` wrap for [`step_sigaction`]. PR-2 wave 2.
 pub struct SigactionOp {
@@ -1810,6 +2205,8 @@ mod step_op_wraps {
     //! the result into `StepOutcome::Done`. Permission-rule and
     //! routing semantics are covered by the existing free-fn tests
     //! in `signal::tests`.
+    use alloc::sync::Arc;
+
     use super::*;
     use crate::process::bootstrap_init_process;
     use crate::process::structure::reset_pid_counter_for_test;
@@ -1836,32 +2233,70 @@ mod step_op_wraps {
     }
 
     #[test]
-    fn kill_process_op_delegates_to_step_kill_process() {
+    fn kill_process_with_post_op_uses_injected_post() {
         let _g = setup();
         let proc_cap = bootstrap_init_process(fresh_aspace()).expect("bootstrap");
-        let mut op = KillProcessOp {
+        let leader = proc_cap.nth_thread(0).expect("leader thread");
+        let mailbox = Arc::new(TaskMailbox::new());
+        let leader_payload = leader.payload_cap().expect("live leader");
+        leader_payload.bind_mailbox(Arc::downgrade(&mailbox));
+        let mut posted = 0usize;
+        let mut op = KillProcessWithPostOp {
             target: proc_cap.clone(),
             sig: Signum::SIGTERM,
             info: None,
+            post: |weak: ArcWeak<TaskMailbox>, event: MailboxEvent| {
+                if !matches!(event, MailboxEvent::SignalDelivered { .. }) {
+                    return;
+                }
+                if let Some(mailbox) = weak.upgrade() {
+                    let _ = mailbox.post(event);
+                    posted += 1;
+                }
+            },
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         assert_eq!(outcome, StepOutcome::Done(KillOutcome::Delivered));
+        assert_eq!(posted, 1);
+        assert!(matches!(
+            mailbox.poll(),
+            Some(MailboxEvent::SignalDelivered { .. })
+        ));
     }
 
     #[test]
-    fn kill_pgrp_op_delegates_to_step_kill_pgrp() {
+    fn kill_pgrp_with_post_op_uses_injected_post() {
         let _g = setup();
         let proc_cap = bootstrap_init_process(fresh_aspace()).expect("bootstrap");
+        let leader = proc_cap.nth_thread(0).expect("leader thread");
+        let mailbox = Arc::new(TaskMailbox::new());
+        let leader_payload = leader.payload_cap().expect("live leader");
+        leader_payload.bind_mailbox(Arc::downgrade(&mailbox));
         let pgrp = proc_cap.pgrp_cap();
-        let mut op = KillPgrpOp {
+        let mut posted = 0usize;
+        let mut op = KillPgrpWithPostOp {
             pgrp,
             sig: Signum::SIGINT,
+            post: |weak: ArcWeak<TaskMailbox>, event: MailboxEvent| {
+                if !matches!(event, MailboxEvent::SignalDelivered { .. }) {
+                    return;
+                }
+                if let Some(mailbox) = weak.upgrade() {
+                    let _ = mailbox.post(event);
+                    posted += 1;
+                }
+            },
         };
         let mut ctx = ScriptCtx::<PlaceholderProcessSubject>::new();
         let outcome = op.step(&mut ctx);
         // bootstrap_init_process gives a single-member pgrp.
         assert_eq!(outcome, StepOutcome::Done(1usize));
+        assert_eq!(posted, 1);
+        assert!(matches!(
+            mailbox.poll(),
+            Some(MailboxEvent::SignalDelivered { .. })
+        ));
     }
 
     #[test]

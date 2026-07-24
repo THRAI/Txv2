@@ -279,19 +279,9 @@ pub(super) fn commit_mapping_from_root(
             l0.0[rv64_4k_leaf_index(reservation.virt().0)] = pte;
         }
     }
-    // ASID-tagged hardware (QEMU): no fence here. Commits are
-    // invalid->valid (reserve rejects AlreadyMapped) and invalid PTEs
-    // are never cached, so the next hardware walk picks them up;
-    // unmap/protect still fence at invalidation.
-    //
-    // Zero-ASID hardware (VF2 U74): re-entry to the SAME address
-    // space takes `activate_user_pmap`'s fast path (no satp write, no
-    // fence), so the fence must happen here. Per SiFive erratum
-    // CIP-1200 the address-qualified form is unreliable on this
-    // silicon — use the FULL sfence.vma (Linux's workaround).
-    if !crate::hw_asid_tagging_usable() {
-        sfence_vma_all();
-    }
+    // User pmap commits are consumed at the next userspace entry, where
+    // `activate_user_pmap` writes `satp` and issues `sfence.vma`. Avoid a
+    // second per-PTE fence here; unmap/protect still fence at invalidation.
 }
 
 pub(crate) fn unmap_mapping(
@@ -421,30 +411,16 @@ pub(crate) fn shootdown_mappings(asid: Asid, invalidations: &[PmapInvalidation])
     }
 
     let coalesced = coalesce_invalidation_ranges(invalidations);
-    let asid_usable = crate::hw_asid_tagging_usable();
-    if asid_usable {
-        for invalidation in &coalesced {
-            sfence_vma_range_asid(invalidation.virt(), invalidation.size(), asid);
-        }
-    } else {
-        // SiFive U74 erratum CIP-1200 (JH7110/VF2): address-qualified
-        // `sfence.vma` fails to invalidate all translation-cache
-        // entries — Linux's workaround upgrades every such fence to a
-        // FULL `sfence.vma` on this silicon, and so do we. Proven on
-        // board 2026-07-03: a store looped forever at a VA whose
-        // in-memory walk (root->l2e->l1e->l0e read back in hardware
-        // order) was a perfect V|R|W|X|U|A|D chain while per-VA
-        // fences fired every iteration. We key off the zero-ASID
-        // probe, which uniquely identifies this core today.
-        sfence_vma_all();
+    for invalidation in &coalesced {
+        sfence_vma_range_asid(invalidation.virt(), invalidation.size(), asid);
     }
     crate::remote_sfence_vma_asid_batch(asid, &coalesced);
 }
 
 fn alloc_asid() -> Result<Asid, PmapError> {
-    for word_index in 0..ASID_BITMAP_WORDS {
+    for (word_index, word) in ALLOCATED_ASIDS.iter().enumerate().take(ASID_BITMAP_WORDS) {
         loop {
-            let allocated = ALLOCATED_ASIDS[word_index].load(Ordering::Acquire);
+            let allocated = word.load(Ordering::Acquire);
             let reserved = if word_index == 0 { 1 } else { 0 };
             if allocated | reserved == u64::MAX {
                 break;
@@ -458,7 +434,7 @@ fn alloc_asid() -> Result<Asid, PmapError> {
                 if allocated & bit != 0 {
                     continue;
                 }
-                if ALLOCATED_ASIDS[word_index]
+                if word
                     .compare_exchange(
                         allocated,
                         allocated | bit,

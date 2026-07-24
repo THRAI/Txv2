@@ -12,6 +12,10 @@ expect "tcp" within 10000
 expect "udp" within 10000
 expect "snmp" within 10000
 expect "netlink" within 10000
+expect "dev" within 10000
+expect "route" within 10000
+expect "nf_conntrack" within 10000
+expect "tx_nf_rules" within 10000
 expect "/ # " within 10000
 
 sleep 500
@@ -24,6 +28,36 @@ send "cat /proc/net/snmp\n"
 expect "Ip:" within 10000
 expect "Tcp:" within 10000
 expect "Udp:" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "cat /proc/net/dev\n"
+expect "lo:" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "cat /proc/net/route\n"
+expect "Iface" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "cat /proc/net/nf_conntrack; echo NF_CONNTRACK_READ_OK\n"
+expect "NF_CONNTRACK_READ_OK" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "cat /proc/net/tx_nf_rules\n"
+expect "idx" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "cat /proc/sys/net/ipv4/ip_forward\n"
+expect "0" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "echo 1 > /proc/sys/net/ipv4/ip_forward; printf IP_FORWARD_NOW_; cat /proc/sys/net/ipv4/ip_forward\n"
+expect "IP_FORWARD_NOW_1" within 10000
 expect "/ # " within 10000
 
 sleep 500

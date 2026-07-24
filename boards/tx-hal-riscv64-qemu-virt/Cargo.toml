@@ -22,3 +22,6 @@ tx-hal = { path = "../../crates/tx-hal" }
 [lib]
 path = "src/lib.rs"
 doctest = false
+
+[lints]
+workspace = true

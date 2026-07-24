@@ -3,7 +3,7 @@
 <!-- txdoc:TXV3-INVARIANTS-V5 -->
 
 **Status.** v5 (Txv3 refresh, 2026-05).
-**Supersedes.** `00_meta-framework/INVARIANTS_v4.md`. v5 carries forward all v4 invariant families unchanged unless explicitly modified, and introduces four new families: SUBJ-*, YIELD-*, DELEGATE-*, SCOPE-*.
+**Supersedes.** `00_meta-framework/INVARIANTS_v4.md`. v5 carries forward all v4 invariant families unchanged unless explicitly modified, and introduces five new families: SUBJ-*, YIELD-*, DELEGATE-*, SCOPE-*, LANE-*.
 **Audience.** Subsystem authors, reviewers, lint-infrastructure authors. Each invariant has a stable identifier; lints cite invariants by identifier.
 
 ---
@@ -33,6 +33,7 @@ Catalog of families:
 | **YIELD-*** | **YieldShape discipline** | **v5, new** |
 | **DELEGATE-*** | **OnAgent yield** | **v5, new** |
 | **SCOPE-*** | **ExecutionScope** | **v5, new** |
+| **LANE-*** | **semantic owner API lanes** | **v5, new** |
 | PID-*, NSVIEW-*, MAP-*, FS-*, etc. | subsystem-specific | v4, preserved |
 
 ---
@@ -189,6 +190,52 @@ WIT-6. **Reservation guards are not witnesses but are subject to the same yield-
 
 ---
 
+## LANE — semantic owner API lanes (new in v5)
+
+<!-- txdoc:INV-V5-LANE -->
+
+LANE-1. **A semantic owner/root exposes only the lanes it supports.** The shared
+catalog is `BindingLane`, `ProjectionLane`, and `ReadinessLane`; there is no
+universal domain-object or generic CRUD trait.
+
+LANE-2. **Lane results are domain-shaped and backend-opaque.** Public results
+must not expose raw container nodes, lock guards, atomics, zone policies,
+substrate reservations, RCU roots, source IDs, or mailbox registries.
+
+LANE-3. **Binding and projection callers own the epoch guard.** A lane receives
+the caller's guard and must not create a hidden nested guard. Guard-scoped
+results obey WIT-* and YIELD-*.
+
+LANE-4. **Binding observation does not silently acquire retention.** Crossing a
+step or yield boundary requires explicit upgrade to `Cap<T>` or
+`T::OperationalEvidence`, or an owned copy whose semantics permit replay.
+
+LANE-5. **A successful outer reservation makes commit infallible and bounded.**
+The reservation owns every fallible substrate resource, rolls back on Drop,
+and never crosses a step or yield boundary.
+
+LANE-6. **Projection is descriptive, not authoritative.** Projection rows do
+not authorize operations, substitute for binding witnesses, mutate owner
+state, or install waits.
+
+LANE-7. **Readiness reports expose level state and opaque endpoints, not wake
+truth.** A wake requires a fresh readiness/binding observation and carries no
+guard-scoped evidence.
+
+LANE-8. **Visibility precedes notification.** An owner publishes a new binding
+or snapshot before firing any endpoint, bus attachment, completion, or signal
+derived from that transition.
+
+LANE-9. **Zone identity and publication storage are orthogonal.** Semantic
+entities use role-shaped zone evidence; binding values are container-owned;
+observer nodes and published roots have no public `Cap` or `Weak` identity.
+
+LANE-10. **RCU is confined to publication implementation.** Raw atomic roots
+and retirement calls are allowed only in reviewed epoch, zone, and publication
+internals; owner facades remain unchanged when their backend migrates.
+
+---
+
 ## ASYNC — preserved from v4
 
 <!-- txdoc:INV-V5-ASYNC -->
@@ -236,6 +283,7 @@ All v4 invariants in these families hold unchanged in v5. Cross-references in th
 | YIELD | new family, 9 invariants |
 | DELEGATE | new family, 9 invariants |
 | SCOPE | new family, 7 invariants |
+| LANE | new family, 10 invariants |
 | STEP-1 | rephrased over four-variant outcome |
 | STEP-3 | rephrased over `StepProgress` monoid |
 | SCRIPT-V5-1..3 | new sub-rules for upper/lower split |

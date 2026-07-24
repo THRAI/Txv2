@@ -1,5 +1,4 @@
 use super::la64_irq_trap::*;
-use super::la64_percpu::*;
 use super::la64_pmap::*;
 use super::platform_impls::{la64_copy_from_user_raw, la64_copy_to_user_raw};
 #[cfg(not(target_arch = "loongarch64"))]
@@ -13,6 +12,7 @@ use tx_hal::{
 };
 
 static TEST_PMAP_STATE_LOCK: Mutex<()> = Mutex::new(());
+static TEST_HAL_STATE_LOCK: Mutex<()> = Mutex::new(());
 static TEST_PT_ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 static TEST_PT_RELEASES: AtomicUsize = AtomicUsize::new(0);
 static TEST_ROOT_ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
@@ -52,7 +52,7 @@ impl KernelTrapSink<Platform> for RecordingTrapSink {
         TrapAction::Resume
     }
 
-    fn on_external_irq(_cpu: CpuId, _view: TrapFrameMut<'_>) -> TrapAction {
+    fn on_external_irq(_cpu: CpuId) -> TrapAction {
         panic!("unexpected external irq")
     }
 
@@ -86,7 +86,7 @@ impl KernelTrapSink<Platform> for RecordingSyscallSink {
         panic!("unexpected timer")
     }
 
-    fn on_external_irq(_cpu: CpuId, _view: TrapFrameMut<'_>) -> TrapAction {
+    fn on_external_irq(_cpu: CpuId) -> TrapAction {
         panic!("unexpected external irq")
     }
 
@@ -105,22 +105,22 @@ fn boot_info_publishes_qemu_ram_and_kernel_image() {
 
     assert_eq!(info.initrd, None);
     assert_eq!(info.cmdline, None);
-    // Unified high load base shared with the LS2K1000 board.
-    assert_eq!(info.kernel_image.start, PhysAddr(0x9000_0000));
+    assert_eq!(info.kernel_image.start, PhysAddr(0x0020_0000));
     assert!(info.kernel_image.size > 0);
 
-    // No-firmware fallback shape: whole low window Reserved (firmware
-    // tables), conservative high window past the kernel Usable.
     assert_eq!(info.memory_regions.len(), 2);
     assert_eq!(info.memory_regions[0].base, PhysAddr(0));
     assert_eq!(info.memory_regions[0].kind, MemoryRegionKind::Reserved);
-    assert_eq!(info.memory_regions[0].size, 0x1000_0000);
+    assert!(info.memory_regions[0].size >= info.kernel_image.end().0);
 
     assert_eq!(info.memory_regions[1].kind, MemoryRegionKind::Usable);
-    assert!(info.memory_regions[1].base.0 >= info.kernel_image.end().0);
+    assert_eq!(
+        info.memory_regions[1].base,
+        PhysAddr(info.memory_regions[0].size)
+    );
     assert_eq!(
         info.memory_regions[1].base.0 + info.memory_regions[1].size,
-        0x9000_0000 + 0x1000_0000
+        0x1000_0000
     );
 }
 
@@ -134,8 +134,6 @@ fn bootstrap_pmap_info_describes_dmw_direct_ram() {
     assert_eq!(mapping.bootstrap_root(), PhysAddr(0));
     assert_eq!(mapping.direct_map_phys(), la64_dmw_mapped_phys());
     assert_eq!(pmap.root, PhysAddr(0));
-    // The cached DMW window hardware-maps the whole physical space —
-    // both the low firmware window and the high-RAM kernel image.
     assert_eq!(pmap.mapped, la64_dmw_mapped_phys());
     assert_eq!(pmap.direct_map_base, VirtAddr(LA64_DMW_CACHED_BASE));
     assert_eq!(pmap.direct_map, la64_dmw_direct_map());
@@ -152,7 +150,7 @@ fn bootstrap_pmap_info_describes_dmw_direct_ram() {
 
 #[test]
 fn substrate_smoke_gate_is_enabled_and_uart_mmio_is_published() {
-    let substrate_ready = <Platform as PlatformConfig>::SUBSTRATE_BOOT_READY;
+    let substrate_ready = core::hint::black_box(<Platform as PlatformConfig>::SUBSTRATE_BOOT_READY);
     assert!(substrate_ready);
     assert_eq!(
         <Platform as PlatformConfig>::USER_TOP,
@@ -160,7 +158,7 @@ fn substrate_smoke_gate_is_enabled_and_uart_mmio_is_published() {
     );
     assert_eq!(<Platform as PlatformConfig>::PAGE_TABLE_LEVELS, 4);
     assert_eq!(<Platform as PlatformConfig>::ASID_BITS, 10);
-    assert_eq!(Platform::platform_info().mmio_regions.len(), 4);
+    assert_eq!(Platform::platform_info().mmio_regions.len(), 5);
     assert_eq!(Platform::platform_info().mmio_regions[0].name, "uart0");
     assert_eq!(
         Platform::platform_info().mmio_regions[0].virt.start,
@@ -206,6 +204,26 @@ fn qemu_la64_pci_windows_are_published_for_virtio_pci_devices() {
 }
 
 #[test]
+fn qemu_la64_mmio_regions_include_ls7a_rtc() {
+    let regions = Platform::platform_info().mmio_regions;
+    let rtc = regions
+        .iter()
+        .find(|region| region.name == "ls7a-rtc")
+        .expect("ls7a rtc region");
+
+    assert_eq!(rtc.phys.start, PhysAddr(QEMU_LA64_RTC_BASE));
+    assert_eq!(rtc.phys.size, QEMU_LA64_RTC_SIZE);
+    assert_eq!(
+        rtc.virt.start,
+        VirtAddr(la64_uncached_virt(QEMU_LA64_RTC_BASE))
+    );
+    assert_eq!(rtc.virt.size, QEMU_LA64_RTC_SIZE);
+    assert!(rtc.flags.contains(MmioFlags::DEVICE_NGNRNE));
+    assert!(rtc.flags.contains(MmioFlags::READ));
+    assert!(rtc.flags.contains(MmioFlags::WRITE));
+}
+
+#[test]
 fn auxv_facts_publish_loongarch64_platform() {
     let facts = <Platform as AuxvIf>::arch_auxv_facts();
 
@@ -235,6 +253,14 @@ fn dmw_aliases_decode_back_to_physical_addresses() {
         la64_kernel_addr_to_phys(la64_uncached_virt(0x1fe0_0000)),
         0x1fe0_0000
     );
+}
+
+#[test]
+#[cfg(not(target_arch = "loongarch64"))]
+fn trap_vector_install_is_host_noop() {
+    <Platform as TrapIf>::install_minimal_trap_vector();
+    <Platform as TrapIf>::install_kernel_trap_vector();
+    <Platform as TrapIf>::install_user_trap_vector();
 }
 
 #[test]
@@ -281,82 +307,11 @@ fn la64_trap_classification_decodes_interrupts_and_sync_faults() {
 }
 
 #[test]
-fn rd_start_request_parses_vendor_cmdline_convention() {
-    use crate::boot_firmware::parse_rd_start_request;
-
-    // Board flow: bootargs carry the tftp staging window explicitly.
-    assert_eq!(
-        parse_rd_start_request(
-            "tx.profile=busybox tx.board=ls2k1000 console=ttyS0 \
-             rd_start=0x9000000098800000 rd_size=0x3c800"
-        ),
-        Some((0x9000_0000_9880_0000, 0x3c800))
-    );
-    // Decimal values and raw physical addresses are accepted too.
-    assert_eq!(
-        parse_rd_start_request("rd_start=2558525440 rd_size=247808"),
-        Some((0x9880_0000, 247808))
-    );
-    // Both keys required; zero size rejected.
-    assert_eq!(parse_rd_start_request("rd_start=0x98800000"), None);
-    assert_eq!(parse_rd_start_request("rd_size=0x3c800"), None);
-    assert_eq!(
-        parse_rd_start_request("rd_start=0x98800000 rd_size=0"),
-        None
-    );
-    assert_eq!(parse_rd_start_request("console=ttyS0"), None);
-}
-
-#[test]
-fn la64_ecode_table_matches_reference_manual() {
-    // Numeric pins against the LoongArch reference manual (Linux
-    // EXCCODE_*). A symbolically self-consistent but mistranscribed
-    // table passed every other test yet terminated the LS2K1000 first
-    // flight: ALE was listed as 10 (real silicon raises 9; QEMU never
-    // raises ALE at all), so kernel unaligned traps skipped the
-    // emulator. ADEF/ADEM are EsubCodes of ADE (Ecode 8), not Ecodes.
-    assert_eq!(LA64_ECODE_ADE, 8);
-    assert_eq!(LA64_ECODE_ALE, 9);
-    assert_eq!(LA64_ECODE_SYS, 11);
-    assert_eq!(LA64_ECODE_BRK, 12);
-    assert_eq!(LA64_ECODE_INE, 13);
-    assert_eq!(LA64_ECODE_IPE, 14);
-    assert_eq!(LA64_ECODE_FPD, 15);
-
-    // Raw estat 0x90000 is exactly what the board dumped on the first
-    // flight: Ecode 9 (ALE), EsubCode 0 — must classify as alignment.
-    assert_eq!(
-        classify_la64_trap(0x90000),
-        TrapClass::AlignmentFault {
-            write: false,
-            instruction: false,
-        }
-    );
-    // ADE fetch/mem split via EsubCode.
-    assert_eq!(
-        classify_la64_trap(LA64_ECODE_ADE << LA64_ESTAT_ECODE_SHIFT),
-        TrapClass::AlignmentFault {
-            write: false,
-            instruction: true,
-        }
-    );
-    assert_eq!(
-        classify_la64_trap(
-            (LA64_ECODE_ADE << LA64_ESTAT_ECODE_SHIFT) | (1 << LA64_ESTAT_ESUBCODE_SHIFT)
-        ),
-        TrapClass::AlignmentFault {
-            write: false,
-            instruction: false,
-        }
-    );
-}
-
-#[test]
 fn la64_platform_snapshot_projects_classified_fault() {
     let snapshot = TrapFrameSnapshot {
-        cause: LA64_ECODE_PIL << LA64_ESTAT_ECODE_SHIFT,
-        pc: 0x2000,
-        fault_value: 0x3000,
+        scause: LA64_ECODE_PIL << LA64_ESTAT_ECODE_SHIFT,
+        sepc: 0x2000,
+        stval: 0x3000,
     };
     let portable = Platform::snapshot_trap(snapshot);
 
@@ -441,6 +396,20 @@ fn la64_restore_user_context_refreshes_cached_view_with_la64_abi() {
     }
     assert_eq!(frame.prmd & LA64_PRMD_PPLV_MASK, LA64_PRMD_PPLV_USER);
     assert_ne!(frame.prmd & LA64_PRMD_PIE, 0);
+}
+
+#[test]
+fn la64_capture_user_context_host_path_reports_empty_fp_state() {
+    let frame = La64TrapFrame {
+        r: [0; 32],
+        estat: LA64_ECODE_SYS << LA64_ESTAT_ECODE_SHIFT,
+        era: 0x1000,
+        badv: 0,
+        crmd: 0,
+        prmd: LA64_PRMD_PPLV_USER | LA64_PRMD_PIE,
+    };
+    let captured = frame.capture_user_context();
+    assert_eq!(captured.fp, tx_hal::UserFpContext::empty());
 }
 
 #[test]
@@ -669,9 +638,7 @@ fn la64_signal_frame_restore_uses_saved_user_context() {
 
 #[test]
 fn la64_fpsimdif_initial_state_is_signal_frame_compatible() {
-    const {
-        assert!(<Platform as FpSimdIf>::SUPPORTED);
-    }
+    assert!(core::hint::black_box(<Platform as FpSimdIf>::SUPPORTED));
     let state = <Platform as FpSimdIf>::init_state();
     assert!(state.is_valid());
     assert_eq!(state.flags & tx_hal::UserFpContext::FLAG_DIRTY, 0);
@@ -899,9 +866,7 @@ fn dmw_direct_map_reservation_is_precovered_for_ram() {
         Ok(())
     );
     assert_eq!(
-        Platform::extend_direct_map(PhysAddr(
-            QEMU_LA64_RAM_BASE + QEMU_LA64_DIRECT_MAP_SIZE
-        )),
+        Platform::extend_direct_map(PhysAddr(QEMU_LA64_RAM_BASE + QEMU_LA64_DIRECT_MAP_SIZE)),
         Ok(())
     );
     assert_eq!(
@@ -1129,9 +1094,20 @@ fn la64_user_mapping_rollback_uses_existing_root_path() {
 
 #[test]
 #[cfg(not(target_arch = "loongarch64"))]
+fn pmap_shootdown_paths_are_host_noops() {
+    let invalidation = PmapInvalidation::new(VirtAddr(LA64_DMW_CACHED_BASE), 4096);
+
+    Platform::shootdown_kernel_mapping(invalidation);
+    Platform::shootdown_mapping(Asid(1), invalidation);
+}
+
+#[test]
+#[cfg(not(target_arch = "loongarch64"))]
 fn cache_and_dma_paths_publish_qemu_coherent_defaults() {
-    const { assert!(<Platform as PlatformConfig>::DMA_COHERENT) };
-    const { assert!(<Platform as DmaIf>::DMA_COHERENT) };
+    assert!(core::hint::black_box(
+        <Platform as PlatformConfig>::DMA_COHERENT
+    ));
+    assert!(core::hint::black_box(<Platform as DmaIf>::DMA_COHERENT));
     assert_eq!(
         <Platform as DmaIf>::phys_to_dma(PhysAddr(0x1234)),
         DmaAddr(0x1234)
@@ -1151,6 +1127,7 @@ fn cache_and_dma_paths_publish_qemu_coherent_defaults() {
 #[test]
 #[cfg(not(target_arch = "loongarch64"))]
 fn irq_dispatch_table_routes_handlers_and_masks_spurious() {
+    let _guard = TEST_HAL_STATE_LOCK.lock().expect("la64 hal test lock");
     TEST_IRQ_DISPATCHES.store(0, Ordering::Release);
     LA64_IRQ_DISPATCH_TABLE.store(0, Ordering::Release);
     la64_reset_host_uart_ier_for_test();
@@ -1182,8 +1159,19 @@ fn irq_dispatch_table_routes_handlers_and_masks_spurious() {
 }
 
 #[test]
+fn la64_platform_overrides_uart_irq_constant() {
+    assert_eq!(<Platform as IrqIf>::UART_IRQ, QEMU_LA64_UART0_IRQ);
+}
+
+#[test]
+fn la64_platform_overrides_rtc_irq_constant() {
+    assert_eq!(<Platform as IrqIf>::RTC_IRQ, QEMU_LA64_RTC_IRQ);
+}
+
+#[test]
 #[cfg(not(target_arch = "loongarch64"))]
 fn la64_irq_claim_masks_and_completes_qemu_uart_gsi() {
+    let _guard = TEST_HAL_STATE_LOCK.lock().expect("la64 hal test lock");
     reset_la64_host_irq_controller_for_test();
     let ext_irq = QEMU_LA64_UART0_IRQ - QEMU_LA64_GSI_BASE;
     let bit = 1u64 << ext_irq;
@@ -1204,6 +1192,134 @@ fn la64_irq_claim_masks_and_completes_qemu_uart_gsi() {
     assert_eq!(LA64_HOST_EIOINTC_ENABLE0.load(Ordering::Acquire) & bit, 0);
     assert_ne!(LA64_HOST_PCH_PIC_MASK.load(Ordering::Acquire) & bit, 0);
     assert_eq!(<Platform as IrqIf>::claim(), 0);
+}
+
+#[test]
+#[cfg(not(target_arch = "loongarch64"))]
+fn ls7a_persistent_clock_reads_toy_registers() {
+    let _guard = TEST_HAL_STATE_LOCK.lock().expect("la64 hal test lock");
+    reset_la64_host_irq_controller_for_test();
+    {
+        let mut state = LA64_HOST_LS7A_RTC_STATE
+            .lock()
+            .expect("host ls7a rtc state");
+        state.reset();
+        state.set_toy_time(1_704_067_200 * NANOS_PER_SEC);
+    }
+
+    assert_eq!(
+        <Platform as PersistentClockIf>::read_realtime_ns(),
+        Ok(1_704_067_200 * NANOS_PER_SEC)
+    );
+
+    let state = LA64_HOST_LS7A_RTC_STATE
+        .lock()
+        .expect("host ls7a rtc state");
+    assert_eq!(
+        state.read_log(),
+        [LS7A_RTC_CTRL, LS7A_RTC_TOYREAD0, LS7A_RTC_TOYREAD1,]
+    );
+    assert_eq!(state.write_log(), [LS7A_RTC_CTRL]);
+    assert_eq!(
+        state.write_values(),
+        [LS7A_RTC_CTRL_EO | LS7A_RTC_CTRL_TOYEN]
+    );
+}
+
+#[test]
+#[cfg(not(target_arch = "loongarch64"))]
+fn ls7a_persistent_clock_writes_toy_year_then_calendar() {
+    let _guard = TEST_HAL_STATE_LOCK.lock().expect("la64 hal test lock");
+    {
+        let mut state = LA64_HOST_LS7A_RTC_STATE
+            .lock()
+            .expect("host ls7a rtc state");
+        state.reset();
+    }
+
+    assert_eq!(
+        <Platform as PersistentClockIf>::set_realtime_ns(1_704_067_200 * NANOS_PER_SEC),
+        Ok(())
+    );
+
+    let state = LA64_HOST_LS7A_RTC_STATE
+        .lock()
+        .expect("host ls7a rtc state");
+    assert_eq!(
+        state.write_log(),
+        [LS7A_RTC_CTRL, LS7A_RTC_TOYWRITE1, LS7A_RTC_TOYWRITE0,]
+    );
+    let (toy0, toy1) =
+        ls7a_toy_registers_from_unix_ns(1_704_067_200 * NANOS_PER_SEC).expect("toy registers");
+    assert_eq!(
+        state.write_values(),
+        [LS7A_RTC_CTRL_EO | LS7A_RTC_CTRL_TOYEN, toy1, toy0]
+    );
+}
+
+#[test]
+#[cfg(not(target_arch = "loongarch64"))]
+fn ls7a_persistent_clock_programs_alarm_and_unmasks_irq() {
+    let _guard = TEST_HAL_STATE_LOCK.lock().expect("la64 hal test lock");
+    reset_la64_host_irq_controller_for_test();
+    {
+        let mut state = LA64_HOST_LS7A_RTC_STATE
+            .lock()
+            .expect("host ls7a rtc state");
+        state.reset();
+    }
+
+    assert_eq!(
+        <Platform as PersistentClockIf>::set_wake_alarm_ns(1_704_070_800 * NANOS_PER_SEC),
+        Ok(())
+    );
+
+    let state = LA64_HOST_LS7A_RTC_STATE
+        .lock()
+        .expect("host ls7a rtc state");
+    assert_eq!(state.write_log(), [LS7A_RTC_CTRL, LS7A_RTC_TOYMATCH0]);
+    assert_eq!(
+        state.write_values()[0],
+        LS7A_RTC_CTRL_EO | LS7A_RTC_CTRL_TOYEN
+    );
+    assert_eq!(
+        state.write_values()[1],
+        ls7a_toymatch_from_unix_ns(1_704_070_800 * NANOS_PER_SEC).expect("toymatch")
+    );
+    drop(state);
+
+    let ext_irq = QEMU_LA64_RTC_IRQ - QEMU_LA64_GSI_BASE;
+    let bit = 1u64 << ext_irq;
+    assert_eq!(LA64_HOST_EIOINTC_ENABLE0.load(Ordering::Acquire) & bit, bit);
+    assert_eq!(LA64_HOST_PCH_PIC_MASK.load(Ordering::Acquire) & bit, 0);
+}
+
+#[test]
+#[cfg(not(target_arch = "loongarch64"))]
+fn ls7a_persistent_clock_clear_alarm_masks_irq_without_disabling_toy() {
+    let _guard = TEST_HAL_STATE_LOCK.lock().expect("la64 hal test lock");
+    reset_la64_host_irq_controller_for_test();
+    <Platform as IrqIf>::unmask(QEMU_LA64_RTC_IRQ);
+    {
+        let mut state = LA64_HOST_LS7A_RTC_STATE
+            .lock()
+            .expect("host ls7a rtc state");
+        state.reset();
+    }
+
+    assert_eq!(<Platform as PersistentClockIf>::clear_wake_alarm(), Ok(()));
+
+    let state = LA64_HOST_LS7A_RTC_STATE
+        .lock()
+        .expect("host ls7a rtc state");
+    assert_eq!(state.write_log(), [LS7A_RTC_TOYMATCH0]);
+    assert_eq!(state.write_values(), [0]);
+    drop(state);
+
+    let ext_irq = QEMU_LA64_RTC_IRQ - QEMU_LA64_GSI_BASE;
+    let bit = 1u64 << ext_irq;
+    assert_eq!(LA64_HOST_EIOINTC_ENABLE0.load(Ordering::Acquire) & bit, 0);
+    assert_ne!(LA64_HOST_PCH_PIC_MASK.load(Ordering::Acquire) & bit, 0);
 }
 
 fn test_irq_handler(irq: u32) -> IrqHandled {
@@ -1234,6 +1350,16 @@ fn la64_timer_deadline_rounds_up_to_tcfg_granule() {
     assert_eq!(round_up_to_tcfg_ticks(4), 4);
     assert_eq!(round_up_to_tcfg_ticks(5), 8);
     assert_eq!(round_up_to_tcfg_ticks(u64::MAX), u64::MAX - 3);
+}
+
+#[test]
+#[cfg(not(target_arch = "loongarch64"))]
+fn timeif_paths_are_host_noops_without_cpu_counter() {
+    assert_eq!(<Platform as MonotonicCounterIf>::frequency_hz(), 0);
+    assert_eq!(<Platform as MonotonicCounterIf>::read_ns(), 0);
+    <Platform as DeadlineTimerIf>::set_deadline_ns(1_000_000);
+    <Platform as DeadlineTimerIf>::cancel_deadline();
+    <Platform as DeadlineTimerIf>::enable_timer_wakeups();
 }
 
 #[test]

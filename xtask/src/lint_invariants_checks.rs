@@ -88,8 +88,7 @@ pub(crate) fn lint_invariants_checks_purity(root: &Path) -> Result<()> {
         "ok"
     };
     println!(
-        "mutation calls in checks/ files: {:>4}  (ceiling {})  {}",
-        count, MAX_MUTATIONS_IN_CHECKS, status
+        "mutation calls in checks/ files: {count:>4}  (ceiling {MAX_MUTATIONS_IN_CHECKS})  {status}"
     );
 
     for v in &violations {

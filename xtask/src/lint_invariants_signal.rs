@@ -139,8 +139,7 @@ pub(crate) fn lint_invariants_signal_publish(root: &Path) -> Result<()> {
         "ok"
     };
     println!(
-        "violations (publish-before-commit): {:>4}  (ceiling {})  {}",
-        violation_count, MAX_SIGNAL_BEFORE_COMMIT, status
+        "violations (publish-before-commit): {violation_count:>4}  (ceiling {MAX_SIGNAL_BEFORE_COMMIT})  {status}"
     );
 
     for v in &violations {

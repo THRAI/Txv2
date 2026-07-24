@@ -23,6 +23,8 @@ use tx_subsystems::vm::USER_PAGE_SIZE;
 
 use super::{ExecTestFs, ExecTestInode};
 
+const S_IFLNK: u16 = 0o120000;
+
 impl tx_subsystems::vfs::FsOps for ExecTestFs {
     fn lookup(
         &self,
@@ -51,6 +53,17 @@ impl tx_subsystems::vfs::FsOps for ExecTestFs {
         };
         let meta = match inode {
             ExecTestInode::Directory => InodeMeta::new(InodeKind::Directory, S_IFDIR | 0o755),
+            ExecTestInode::Symlink { .. } => InodeMeta::new(InodeKind::Symlink, S_IFLNK | 0o777),
+            ExecTestInode::RegularNonPageBacked {
+                mode_bits,
+                uid,
+                gid,
+            } => {
+                let mut meta = InodeMeta::new(InodeKind::Regular, S_IFREG | *mode_bits);
+                meta.uid = *uid;
+                meta.gid = *gid;
+                meta
+            }
             ExecTestInode::Regular {
                 size,
                 mode_bits,
@@ -170,10 +183,17 @@ impl tx_subsystems::vfs::FsOps for ExecTestFs {
 
     fn read_link(
         &self,
-        _fs_object_id: FsObjectId,
+        fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
     ) -> V3Outcome<Box<[u8]>, NoProgress> {
-        V3Outcome::err(Errno::EINVAL.into())
+        let inner = self.inner.lock();
+        match inner.inodes.get(&fs_object_id) {
+            Some(ExecTestInode::Symlink { target }) => {
+                V3Outcome::done(target.clone().into_boxed_slice())
+            }
+            Some(_) => V3Outcome::err(Errno::EINVAL.into()),
+            None => V3Outcome::err(Errno::ENOENT.into()),
+        }
     }
 
     fn materialise_rnode(
@@ -201,7 +221,26 @@ impl tx_subsystems::vfs::FsOps for ExecTestFs {
                     Err(_) => V3Outcome::err(Errno::ENOMEM.into()),
                 }
             }
+            ExecTestInode::RegularNonPageBacked { .. } => {
+                match RNode::new_cap_in_mount(fs_object_id, meta, RNodeBacking::Directory, mount) {
+                    Ok(rnode) => V3Outcome::done(rnode),
+                    Err(_) => V3Outcome::err(Errno::ENOMEM.into()),
+                }
+            }
             ExecTestInode::Directory => V3Outcome::err(Errno::EISDIR.into()),
+            ExecTestInode::Symlink { target } => {
+                match RNode::new_cap_in_mount(
+                    fs_object_id,
+                    meta,
+                    RNodeBacking::Symlink {
+                        target: target.clone().into_boxed_slice(),
+                    },
+                    mount,
+                ) {
+                    Ok(rnode) => V3Outcome::done(rnode),
+                    Err(_) => V3Outcome::err(Errno::ENOMEM.into()),
+                }
+            }
         }
     }
 }
@@ -216,7 +255,11 @@ impl tx_subsystems::page_backed::FsPageBacking for ExecTestFs {
         let inner = self.inner.lock();
         let container = match inner.inodes.get(&fs_object_id) {
             Some(ExecTestInode::Regular { container, .. }) => container.clone(),
+            Some(ExecTestInode::RegularNonPageBacked { .. }) => {
+                return V3Outcome::err(Errno::ENODEV.into())
+            }
             Some(ExecTestInode::Directory) => return V3Outcome::err(Errno::EISDIR.into()),
+            Some(ExecTestInode::Symlink { .. }) => return V3Outcome::err(Errno::EINVAL.into()),
             None => return V3Outcome::err(Errno::ENOENT.into()),
         };
         drop(inner);

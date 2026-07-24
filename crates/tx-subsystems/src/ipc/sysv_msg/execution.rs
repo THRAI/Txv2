@@ -16,6 +16,7 @@ use crate::ipc::sysv_msg::structure::Msg;
 use crate::ipc::sysv_shm::execution::{IPC_CREAT, IPC_EXCL, IPC_NOWAIT, IPC_PRIVATE};
 use crate::ipc::sysv_shm::structure::IpcPerm;
 use crate::process::adapter::step_engine::{Cap, NoProgress, StepOutcome};
+use crate::process::adapter::wait_routing::{MailboxEvent, TaskMailbox};
 use crate::process::nsproxy::SysvKey;
 
 // msgctl commands (same numbering as shmctl)
@@ -109,21 +110,25 @@ pub fn step_msgget(
 }
 
 // ---------------------------------------------------------------------------
-// step_msgsnd
+// msgsnd
 // ---------------------------------------------------------------------------
 
 /// `msgsnd(msqid, msgp, msgsz, msgflg)` — send a message.
-pub fn step_msgsnd(
+pub fn step_msgsnd_with_post<F>(
     msqid: u32,
     mtype: i64,
     mtext: Vec<u8>,
     msgflg: i32,
     cred: &Cap<Cred>,
-) -> Result<usize, Errno> {
+    post: F,
+) -> Result<usize, Errno>
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     // observe/upgrade/reserve/commit/publish are delegated to the v3 op.
     // This legacy wrapper cannot drive waits, so it preserves the old
     // non-blocking Result shape by surfacing a yielded wait as EAGAIN.
-    match step_msgsnd_v3(msqid, mtype, mtext, msgflg, cred) {
+    match step_msgsnd_v3_with_post(msqid, mtype, mtext, msgflg, cred, post) {
         StepOutcome::Done(sent) => Ok(sent),
         StepOutcome::Err(errno) => Err(errno.into()),
         StepOutcome::Yield { .. } => Err(Errno::EAGAIN),
@@ -131,13 +136,17 @@ pub fn step_msgsnd(
     }
 }
 
-pub fn step_msgsnd_v3(
+pub fn step_msgsnd_v3_with_post<F>(
     msqid: u32,
     mtype: i64,
     mtext: Vec<u8>,
     msgflg: i32,
     cred: &Cap<Cred>,
-) -> MsgsndOutcome {
+    post: F,
+) -> MsgsndOutcome
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     // observe: inspect current subsystem state and validate inputs.
     // upgrade: acquire capabilities/guards needed for mutation.
     // reserve: reserve namespace, memory, or wait-source effects.
@@ -176,7 +185,7 @@ pub fn step_msgsnd_v3(
             if (msgflg & IPC_NOWAIT) != 0 {
                 return StepOutcome::err(Errno::EAGAIN.into());
             }
-            return notification::wait_for_send_space(payload.send_source_id);
+            return notification::wait_for_send_space(payload.send_endpoint());
         }
 
         let mut messages = payload.messages.lock();
@@ -187,27 +196,31 @@ pub fn step_msgsnd_v3(
             .fetch_add(msg_len as u64, Ordering::Release);
         payload.msg_count.fetch_add(1, Ordering::Release);
         payload.queue_seq.fetch_add(1, Ordering::Release);
-        notification::notify_message_available(&payload.recv_channel, &payload.recv_source);
+        notification::notify_message_available_with_post(&payload.recv_source, post);
         StepOutcome::done(msg_len)
     }
 }
 
 // ---------------------------------------------------------------------------
-// step_msgrcv
+// msgrcv
 // ---------------------------------------------------------------------------
 
 /// `msgrcv(msqid, msgp, msgsz, msgtyp, msgflg)` — receive a message.
-pub fn step_msgrcv(
+pub fn step_msgrcv_with_post<F>(
     msqid: u32,
     msgsz: usize,
     msgtyp: i64,
     msgflg: i32,
     cred: &Cap<Cred>,
-) -> Result<(i64, Vec<u8>), Errno> {
+    post: F,
+) -> Result<(i64, Vec<u8>), Errno>
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     // observe/upgrade/reserve/commit/publish are delegated to the v3 op.
     // This legacy wrapper cannot drive waits, so it preserves the old
     // non-blocking Result shape by surfacing a yielded wait as EAGAIN.
-    match step_msgrcv_v3(msqid, msgsz, msgtyp, msgflg, cred) {
+    match step_msgrcv_v3_with_post(msqid, msgsz, msgtyp, msgflg, cred, post) {
         StepOutcome::Done(message) => Ok(message),
         StepOutcome::Err(errno) => Err(errno.into()),
         StepOutcome::Yield { .. } => Err(Errno::EAGAIN),
@@ -215,13 +228,17 @@ pub fn step_msgrcv(
     }
 }
 
-pub fn step_msgrcv_v3(
+pub fn step_msgrcv_v3_with_post<F>(
     msqid: u32,
     msgsz: usize,
     msgtyp: i64,
     msgflg: i32,
     cred: &Cap<Cred>,
-) -> MsgrcvOutcome {
+    post: F,
+) -> MsgrcvOutcome
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     // observe: inspect current subsystem state and validate inputs.
     // upgrade: acquire capabilities/guards needed for mutation.
     // reserve: reserve namespace, memory, or wait-source effects.
@@ -252,7 +269,7 @@ pub fn step_msgrcv_v3(
             if queue.destroyed.load(Ordering::Acquire) {
                 return StepOutcome::err(Errno::EIDRM.into());
             }
-            return notification::wait_for_message(payload.recv_source_id);
+            return notification::wait_for_message(payload.recv_endpoint());
         }
 
         let mut messages = payload.messages.lock();
@@ -260,7 +277,7 @@ pub fn step_msgrcv_v3(
             Some(pos) => pos,
             None if (msgflg & IPC_NOWAIT) != 0 => return StepOutcome::err(Errno::EAGAIN.into()),
             None => {
-                return notification::wait_for_message(payload.recv_source_id);
+                return notification::wait_for_message(payload.recv_endpoint());
             }
         };
         if messages[pos].mtext.len() > msgsz && (msgflg & MSG_NOERROR) == 0 {
@@ -277,7 +294,7 @@ pub fn step_msgrcv_v3(
             .current_bytes
             .fetch_sub(mlen as u64, Ordering::Release);
         payload.msg_count.fetch_sub(1, Ordering::Release);
-        notification::notify_space_available(&payload.send_channel, &payload.send_source);
+        notification::notify_space_available_with_post(&payload.send_source, post);
 
         StepOutcome::done((msg.mtype, mtext))
     }
@@ -300,16 +317,20 @@ fn find_msg(messages: &[Msg], msgtyp: i64) -> Option<usize> {
 }
 
 // ---------------------------------------------------------------------------
-// step_msgctl
+// msgctl execution
 // ---------------------------------------------------------------------------
 
 /// `msgctl(msqid, cmd, buf)` — control a message queue.
-pub fn step_msgctl(
+pub fn step_msgctl_with_post<F>(
     msqid: u32,
     cmd: i32,
     set_fields: Option<(u16, u32, u32)>,
     cred: &Cap<Cred>,
-) -> Result<MsgCtlResult, Errno> {
+    post: F,
+) -> Result<MsgCtlResult, Errno>
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     // observe: inspect current subsystem state and validate inputs.
     // upgrade: acquire capabilities/guards needed for mutation.
     // reserve: reserve namespace, memory, or wait-source effects.
@@ -324,11 +345,10 @@ pub fn step_msgctl(
                 q.destroyed.store(true, Ordering::Release);
                 if let Some(payload) = q.payload.lock().as_ref().cloned() {
                     payload.queue_seq.fetch_add(1, Ordering::Release);
-                    notification::abort_removed(
-                        &payload.send_channel,
+                    notification::abort_removed_with_post(
                         &payload.send_source,
-                        &payload.recv_channel,
                         &payload.recv_source,
+                        post,
                     );
                 }
             }
@@ -400,15 +420,17 @@ pub fn step_msgctl(
     }
 }
 
-/// Namespace-aware `msgctl` wrapper for syscall paths that can withdraw
-/// keyed namespace bindings on `IPC_RMID`.
-pub fn step_msgctl_in_ns(
+pub fn step_msgctl_in_ns_with_post<F>(
     msqid: u32,
     cmd: i32,
     set_fields: Option<(u16, u32, u32)>,
     cred: &Cap<Cred>,
     nsproxy: &Cap<crate::process::nsproxy::NsProxy>,
-) -> Result<MsgCtlResult, Errno> {
+    post: F,
+) -> Result<MsgCtlResult, Errno>
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     // observe: inspect current subsystem state and validate inputs.
     // upgrade: acquire capabilities/guards needed for mutation.
     // reserve: reserve namespace, memory, or wait-source effects.
@@ -419,7 +441,7 @@ pub fn step_msgctl_in_ns(
     } else {
         None
     };
-    let result = step_msgctl(msqid, cmd, set_fields, cred)?;
+    let result = step_msgctl_with_post(msqid, cmd, set_fields, cred, post)?;
     if let Some(Some(key)) = key {
         let mut table = nsproxy.ipc_ns.sysv_msg.lock();
         if table.get(&key).map(|queue| queue.msqid) == Some(msqid) {

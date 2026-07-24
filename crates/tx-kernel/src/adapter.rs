@@ -11,7 +11,7 @@
 //! * `boot_runtime` — stacked substrate + reactor. The boot-side
 //!   primitives kernel init pulls from reactor (HartId, hart_loop,
 //!   userspace, wait, SharedReactor, InitialSchedMeta,
-//!   RescheduleSignal, etc.).
+//!   RescheduleSignal, mailbox wake event types, etc.).
 
 use tx_platform_adapter::platform_adapter;
 
@@ -24,7 +24,8 @@ use tx_platform_adapter::platform_adapter;
 pub mod step_engine {
     pub(crate) use crate::sync::{spin_mutex, SpinMutex};
     pub use tx_substrate::epoch::{
-        self as epoch, borrow_current_guard, cpu_summary, drain_with_budget, guard, summary, Guard,
+        borrow_current_guard, cpu_summary, drain_with_budget, guard, service_local_drain_request,
+        summary, Guard,
     };
     pub use tx_substrate::step::{
         ByteProgress, Errno, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
@@ -41,12 +42,20 @@ pub mod step_engine {
 #[platform_adapter(
     platform = "reactor",
     domain = "boot_runtime",
-    reason = "wrap reactor boot primitives (HartId, hart_loop, userspace, wait, SharedReactor, InitialSchedMeta, RescheduleSignal, ast) used by tx-kernel init and trap_handoff"
+    reason = "wrap reactor boot primitives (HartId, hart_loop, userspace, wait, SharedReactor, InitialSchedMeta, RescheduleSignal, ast) and substrate mailbox wake event types used by tx-kernel init and trap_handoff"
 )]
 pub mod boot_runtime {
+    pub use tx_reactor::dispatch::WakeDispatchReport;
     pub use tx_reactor::{
-        ast, current_delegate_registry, current_task_mailbox, current_timer_wheel, hart_loop,
-        userspace, wait, yield_now, HartId, InitialSchedMeta, Phase1QueueKind, Reactor,
-        RescheduleSignal, SharedReactor, SliceClock, TaskKey,
+        ast, current_deadline_registrar, current_delegate_registry, current_task_mailbox,
+        hart_loop, userspace, wait, yield_now, HartId, InitialSchedMeta, Phase1QueueKind, Reactor,
+        RescheduleSignal, SharedReactor, SliceClock, SubscriberId, TaskKey, WaitSource,
     };
+    pub use tx_services::time::TimerGuard;
+    pub use tx_substrate::step::{
+        AgentCancelPolicy, Deadline, DelegateRegistry, DelegateReply, DelegateRequest,
+        DelegateTokenId, InterestMask, TokenDropPolicy, TransitionOutcome, WaitSourceId,
+    };
+    pub use tx_substrate::wake::mailbox::MailboxPollAction;
+    pub use tx_substrate::wake::{MailboxEvent, TaskMailbox};
 }

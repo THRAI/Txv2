@@ -17,7 +17,7 @@ use crate::tty::adapter::step_engine::{
     NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
 };
 use crate::tty::checks::require_live_tty;
-use crate::tty::execution::{step_ingest, IngestOutcome};
+use crate::tty::execution::{step_ingest_with_post, IngestOutcome};
 use crate::tty::structure::{TtyIdentity, TtyTransport};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -27,7 +27,7 @@ pub struct HardwarePollOutcome {
 }
 
 /// Read up to `max_bytes` from a hardware-backed tty transport and feed the
-/// result into `step_ingest`.
+/// result into the TTY ingest step.
 ///
 /// v3-shape: a one-shot `NoProgress` outcome. The pre-v3 flavour
 /// surfaced `AdvancedThenBlocked(outcome, wait)` when the driver's
@@ -67,7 +67,9 @@ pub fn step_poll_hardware_input(
                         read: usize,
                         guard: &Guard<'_>|
      -> StepOutcome<HardwarePollOutcome, NoProgress> {
-        match step_ingest(tty, bytes, guard) {
+        match step_ingest_with_post(tty, bytes, guard, |mailbox, event, hint| {
+            mailbox.post_with_scheduler_hint(event, hint)
+        }) {
             V3::Done(ingest) => V3::Done(HardwarePollOutcome {
                 bytes_read: read,
                 ingest,

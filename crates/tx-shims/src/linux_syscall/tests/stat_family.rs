@@ -10,14 +10,15 @@ use alloc::vec;
 use tx_fs::tmpfs::{Tmpfs, TMPFS_ROOT_OBJECT_ID};
 use tx_subsystems::cred::CapabilitySet;
 use tx_subsystems::mount::{
-    DevId, MountFlags, MountId, MountIdentity, MountOptions, MountPayload, SourceLabel,
+    DevId, MountFlags, MountId, MountIdentity, MountNamespace, MountOptions, MountPayload,
+    SourceLabel,
 };
 use tx_subsystems::page_backed::FsPageBacking;
 use tx_subsystems::pipe::{step_pipe2, PipeFlags};
-use tx_subsystems::process::step_chdir;
+use tx_subsystems::process::{step_chdir_with_mount, step_set_mount_namespace};
 use tx_subsystems::vfs::structure::{
     Credential, DEntry, InlineName, InodeKind, InodeMeta, OpenFileFlags, RNode, RNodeBacking,
-    S_IFDIR,
+    S_IFDIR, S_IFLNK,
 };
 use tx_subsystems::vfs::{FsOps, OpenFile};
 
@@ -84,7 +85,7 @@ fn stat_setup() -> TestSetup {
 /// the dentry, the FsOps `Arc` (so callers can mint files
 /// directly), and the root `Cap<RNode>` (so callers can build a
 /// directory OpenFile for getdents64 tests).
-fn build_tmpfs_root() -> (Cap<DEntry>, Arc<Tmpfs>, Cap<RNode>) {
+fn build_tmpfs_root() -> (Cap<DEntry>, Arc<Tmpfs>, Cap<RNode>, Cap<MountIdentity>) {
     let tmpfs = Arc::new(Tmpfs::new());
     let payload = MountPayload::new_cap(
         tmpfs.clone() as Arc<dyn tx_subsystems::vfs::FsOps>,
@@ -108,27 +109,31 @@ fn build_tmpfs_root() -> (Cap<DEntry>, Arc<Tmpfs>, Cap<RNode>) {
         sign_for(res, raw)
     };
 
-    let _mount = MountIdentity::new_cap(
+    let root_dentry = DEntry::new_cap(InlineName::ROOT, root_rnode.clone()).expect("root dentry");
+    let root_mount = MountIdentity::new_cap_with_root_dentry(
         MountId::new(31),
         None,
-        root_rnode.clone(),
+        root_dentry.clone(),
         None,
         payload,
         MountFlags::empty(),
     )
     .expect("mount identity");
-
-    let root_dentry = DEntry::new_cap(InlineName::ROOT, root_rnode.clone()).expect("root dentry");
-    (root_dentry, tmpfs, root_rnode)
+    (root_dentry, tmpfs, root_rnode, root_mount)
 }
 
 /// Bootstrap an init process whose cwd is `root_dentry`. Returns
 /// the `(process, leader-thread)` pair.
-fn bootstrap_with_cwd(root_dentry: Cap<DEntry>) -> (Cap<ProcessIdentity>, Cap<ThreadIdentity>) {
+fn bootstrap_with_cwd(
+    root_dentry: Cap<DEntry>,
+    root_mount: Cap<MountIdentity>,
+) -> (Cap<ProcessIdentity>, Cap<ThreadIdentity>) {
     let aspace = fresh_aspace();
     let process = bootstrap_init_process(aspace).expect("bootstrap init");
     let thread = process.nth_thread(0).expect("leader thread");
-    match step_chdir(&process, root_dentry) {
+    let namespace = MountNamespace::new_cap(root_mount.clone()).expect("mount namespace");
+    step_set_mount_namespace(&process, namespace).expect("install mount namespace");
+    match step_chdir_with_mount(&process, root_dentry, root_mount) {
         tx_subsystems::process::ChdirOutcome::Replaced { .. } => {}
         tx_subsystems::process::ChdirOutcome::ZombieIgnored => {
             panic!("init bootstrap zombified")
@@ -195,7 +200,7 @@ fn read_u16_at(buf: &[u8], off: usize) -> u16 {
 #[test]
 fn dispatch_fstat_on_pagebacked_fd_writes_stat_struct() {
     let _setup = stat_setup();
-    let (root_dentry, tmpfs, _root_rnode) = build_tmpfs_root();
+    let (root_dentry, tmpfs, _root_rnode, _root_mount) = build_tmpfs_root();
     let owner_cred = Credential {
         uid: 0,
         gid: 0,
@@ -208,7 +213,7 @@ fn dispatch_fstat_on_pagebacked_fd_writes_stat_struct() {
             other => panic!("create_inode: {other:?}"),
         }
     };
-    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry, _root_mount);
 
     // Open the file via the openat path so the resulting OpenFile
     // is a real PageBacked rnode whose meta carries the 0o100644
@@ -311,7 +316,7 @@ fn dispatch_fstat_null_buffer_returns_neg_efault() {
 #[test]
 fn dispatch_newfstatat_with_valid_path_returns_zero() {
     let _setup = stat_setup();
-    let (root_dentry, tmpfs, _root_rnode) = build_tmpfs_root();
+    let (root_dentry, tmpfs, _root_rnode, _root_mount) = build_tmpfs_root();
     let owner_cred = Credential {
         uid: 0,
         gid: 0,
@@ -321,7 +326,7 @@ fn dispatch_newfstatat_with_valid_path_returns_zero() {
         let guard = guard();
         let _ = tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100640, &owner_cred, &guard);
     }
-    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry, _root_mount);
     let ctx = make_ctx(proc_cap, thread);
 
     let path = nul_terminate(b"/f");
@@ -343,13 +348,78 @@ fn dispatch_newfstatat_with_valid_path_returns_zero() {
     drop(path);
 }
 
+/// `newfstatat(..., AT_SYMLINK_NOFOLLOW)` stats the final symlink
+/// itself rather than the regular-file target.
+#[test]
+fn dispatch_newfstatat_at_symlink_nofollow_stats_link() {
+    let _setup = stat_setup();
+    let (root_dentry, tmpfs, _root_rnode, _root_mount) = build_tmpfs_root();
+    let owner_cred = Credential {
+        uid: 0,
+        gid: 0,
+        effective_caps: CapabilitySet::FULL,
+    };
+    {
+        let guard = guard();
+        match tmpfs.create_inode(
+            TMPFS_ROOT_OBJECT_ID,
+            b"target",
+            0o100640,
+            &owner_cred,
+            &guard,
+        ) {
+            StepOutcome::Done(_) => {}
+            other => panic!("create_inode target: {other:?}"),
+        }
+    }
+    let link_id = {
+        let guard = guard();
+        match tmpfs.symlink(
+            TMPFS_ROOT_OBJECT_ID,
+            b"link",
+            b"target",
+            &owner_cred,
+            &guard,
+        ) {
+            StepOutcome::Done((id, _meta)) => id,
+            other => panic!("symlink link -> target: {other:?}"),
+        }
+    };
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry, _root_mount);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let path = nul_terminate(b"/link");
+    let mut statbuf = vec![0u8; STAT_BYTES];
+    let req = SyscallRequest::new(
+        NR_NEWFSTATAT,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            statbuf.as_mut_ptr() as u64,
+            crate::linux_syscall::AT_SYMLINK_NOFOLLOW as u64,
+            0,
+            0,
+        ],
+    );
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Return(0));
+    let mode = read_u32_at(&statbuf, STAT_MODE_OFF);
+    assert_eq!(
+        mode as u16 & 0o170000,
+        S_IFLNK,
+        "expected S_IFLNK; got {mode:#o}"
+    );
+    assert_eq!(read_u64_at(&statbuf, STAT_INO_OFF), link_id.as_u64());
+    drop(path);
+}
+
 /// `newfstatat(AT_FDCWD, "/missing", &statbuf, 0)` surfaces the
 /// walker's `Errno::ENOENT` as `-ENOENT`.
 #[test]
 fn dispatch_newfstatat_with_nonexistent_path_returns_neg_enoent() {
     let _setup = stat_setup();
-    let (root_dentry, _tmpfs, _root_rnode) = build_tmpfs_root();
-    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let (root_dentry, _tmpfs, _root_rnode, _root_mount) = build_tmpfs_root();
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry, _root_mount);
     let ctx = make_ctx(proc_cap, thread);
 
     let path = nul_terminate(b"/missing");
@@ -376,8 +446,8 @@ fn dispatch_newfstatat_with_nonexistent_path_returns_neg_enoent() {
 #[test]
 fn dispatch_newfstatat_at_empty_path_stats_cwd() {
     let _setup = stat_setup();
-    let (root_dentry, _tmpfs, _root_rnode) = build_tmpfs_root();
-    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let (root_dentry, _tmpfs, _root_rnode, _root_mount) = build_tmpfs_root();
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry, _root_mount);
     let ctx = make_ctx(proc_cap, thread);
 
     let path = nul_terminate(b"");
@@ -406,7 +476,7 @@ fn dispatch_newfstatat_at_empty_path_stats_cwd() {
 #[test]
 fn dispatch_newfstatat_at_empty_path_stats_fd() {
     let _setup = stat_setup();
-    let (root_dentry, tmpfs, _root_rnode) = build_tmpfs_root();
+    let (root_dentry, tmpfs, _root_rnode, _root_mount) = build_tmpfs_root();
     let owner_cred = Credential {
         uid: 0,
         gid: 0,
@@ -419,7 +489,7 @@ fn dispatch_newfstatat_at_empty_path_stats_fd() {
             other => panic!("create_inode: {other:?}"),
         }
     };
-    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry, _root_mount);
 
     let path = nul_terminate(b"/f");
     let ctx = make_ctx(proc_cap.clone(), thread);
@@ -466,8 +536,8 @@ fn dispatch_newfstatat_at_empty_path_stats_fd() {
 #[test]
 fn dispatch_statx_on_root_writes_statx_struct() {
     let _setup = stat_setup();
-    let (root_dentry, _tmpfs, root_rnode) = build_tmpfs_root();
-    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let (root_dentry, _tmpfs, root_rnode, _root_mount) = build_tmpfs_root();
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry, _root_mount);
     let ctx = make_ctx(proc_cap, thread);
 
     let path = nul_terminate(b"/");
@@ -507,7 +577,7 @@ fn dispatch_statx_on_root_writes_statx_struct() {
 #[test]
 fn dispatch_statx_at_empty_path_stats_fd() {
     let _setup = stat_setup();
-    let (root_dentry, tmpfs, _root_rnode) = build_tmpfs_root();
+    let (root_dentry, tmpfs, _root_rnode, _root_mount) = build_tmpfs_root();
     let owner_cred = Credential {
         uid: 0,
         gid: 0,
@@ -520,7 +590,7 @@ fn dispatch_statx_at_empty_path_stats_fd() {
             other => panic!("create_inode: {other:?}"),
         }
     };
-    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry, _root_mount);
 
     let path = nul_terminate(b"/f");
     let ctx = make_ctx(proc_cap.clone(), thread);
@@ -561,10 +631,71 @@ fn dispatch_statx_at_empty_path_stats_fd() {
     drop(empty);
 }
 
+/// `statx(..., AT_SYMLINK_NOFOLLOW, ...)` reports the terminal
+/// symlink's metadata rather than the target's metadata.
+#[test]
+fn dispatch_statx_at_symlink_nofollow_stats_link() {
+    let _setup = stat_setup();
+    let (root_dentry, tmpfs, _root_rnode, _root_mount) = build_tmpfs_root();
+    let owner_cred = Credential {
+        uid: 0,
+        gid: 0,
+        effective_caps: CapabilitySet::FULL,
+    };
+    {
+        let guard = guard();
+        match tmpfs.create_inode(
+            TMPFS_ROOT_OBJECT_ID,
+            b"target",
+            0o100600,
+            &owner_cred,
+            &guard,
+        ) {
+            StepOutcome::Done(_) => {}
+            other => panic!("create_inode target: {other:?}"),
+        }
+    }
+    let link_id = {
+        let guard = guard();
+        match tmpfs.symlink(
+            TMPFS_ROOT_OBJECT_ID,
+            b"link",
+            b"target",
+            &owner_cred,
+            &guard,
+        ) {
+            StepOutcome::Done((id, _meta)) => id,
+            other => panic!("symlink link -> target: {other:?}"),
+        }
+    };
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry, _root_mount);
+    let ctx = make_ctx(proc_cap, thread);
+
+    let path = nul_terminate(b"/link");
+    let mut statxbuf = vec![0u8; STATX_BYTES];
+    let req = SyscallRequest::new(
+        NR_STATX,
+        [
+            AT_FDCWD as i64 as u64,
+            path.as_ptr() as u64,
+            crate::linux_syscall::AT_SYMLINK_NOFOLLOW as u64,
+            crate::linux_syscall::numbers::STATX_BASIC_STATS as u64,
+            statxbuf.as_mut_ptr() as u64,
+            0,
+        ],
+    );
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Return(0));
+    let mode = read_u16_at(&statxbuf, STATX_MODE_OFF);
+    assert_eq!(mode & 0o170000, S_IFLNK, "expected S_IFLNK; got {mode:#o}");
+    assert_eq!(read_u64_at(&statxbuf, STATX_INO_OFF), link_id.as_u64());
+    drop(path);
+}
+
 #[test]
 fn dispatch_statx_after_fchmodat_observes_live_mode() {
     let _setup = stat_setup();
-    let (root_dentry, tmpfs, _root_rnode) = build_tmpfs_root();
+    let (root_dentry, tmpfs, _root_rnode, _root_mount) = build_tmpfs_root();
     let owner_cred = Credential {
         uid: 0,
         gid: 0,
@@ -578,7 +709,7 @@ fn dispatch_statx_after_fchmodat_observes_live_mode() {
         }
     }
 
-    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry, _root_mount);
     let ctx = make_ctx(proc_cap.clone(), thread);
     let path = nul_terminate(b"/f");
 
@@ -611,6 +742,34 @@ fn dispatch_statx_after_fchmodat_observes_live_mode() {
     drop(path);
 }
 
+#[test]
+fn dispatch_fchmodat_absolute_path_ignores_non_cwd_dirfd() {
+    let _setup = stat_setup();
+    let (root_dentry, tmpfs, _root_rnode, _root_mount) = build_tmpfs_root();
+    let owner_cred = Credential {
+        uid: 0,
+        gid: 0,
+        effective_caps: CapabilitySet::FULL,
+    };
+    {
+        let guard = guard();
+        match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner_cred, &guard) {
+            StepOutcome::Done(_) => {}
+            other => panic!("create_inode: {other:?}"),
+        }
+    }
+
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry, _root_mount);
+    let ctx = make_ctx(proc_cap, thread);
+    let path = nul_terminate(b"/f");
+    let chmod_req = SyscallRequest::new(NR_FCHMODAT, [3, path.as_ptr() as u64, 0o600, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(chmod_req, &ctx)),
+        SyscallResult::Return(0)
+    );
+    drop(path);
+}
+
 // -----------------------------------------------------------------
 // chdir / fchdir
 // -----------------------------------------------------------------
@@ -620,8 +779,8 @@ fn dispatch_statx_after_fchmodat_observes_live_mode() {
 #[test]
 fn dispatch_chdir_to_existing_dir_succeeds() {
     let _setup = stat_setup();
-    let (root_dentry, _tmpfs, _root_rnode) = build_tmpfs_root();
-    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let (root_dentry, _tmpfs, _root_rnode, _root_mount) = build_tmpfs_root();
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry, _root_mount);
     let ctx = make_ctx(proc_cap.clone(), thread);
 
     let path = nul_terminate(b"/");
@@ -636,8 +795,8 @@ fn dispatch_chdir_to_existing_dir_succeeds() {
 #[test]
 fn dispatch_chdir_to_nonexistent_path_returns_neg_enoent() {
     let _setup = stat_setup();
-    let (root_dentry, _tmpfs, _root_rnode) = build_tmpfs_root();
-    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let (root_dentry, _tmpfs, _root_rnode, _root_mount) = build_tmpfs_root();
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry, _root_mount);
     let ctx = make_ctx(proc_cap, thread);
 
     let path = nul_terminate(b"/missing");
@@ -652,7 +811,7 @@ fn dispatch_chdir_to_nonexistent_path_returns_neg_enoent() {
 #[test]
 fn dispatch_chdir_to_regular_file_returns_neg_enotdir() {
     let _setup = stat_setup();
-    let (root_dentry, tmpfs, _root_rnode) = build_tmpfs_root();
+    let (root_dentry, tmpfs, _root_rnode, _root_mount) = build_tmpfs_root();
     let owner_cred = Credential {
         uid: 0,
         gid: 0,
@@ -662,7 +821,7 @@ fn dispatch_chdir_to_regular_file_returns_neg_enotdir() {
         let guard = guard();
         let _ = tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner_cred, &guard);
     }
-    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry, _root_mount);
     let ctx = make_ctx(proc_cap, thread);
 
     let path = nul_terminate(b"/f");
@@ -672,12 +831,69 @@ fn dispatch_chdir_to_regular_file_returns_neg_enotdir() {
     drop(path);
 }
 
-// Removed: `dispatch_fchdir_returns_neg_enosys`. The Slice 6 carryover
-// ENOSYS path was lifted when `OpenFile::opendir_dentry` and
-// `step_chdir` learned to round-trip the DEntry hint; the dispatch arm
-// now reports `-EBADF` for fd 0 (no open dir) rather than `-ENOSYS`.
-// The success path is exercised by integration tests once a directory
-// fd exists in the fd table.
+#[test]
+fn dispatch_fchdir_to_mounted_directory_fd_installs_complete_cwd_binding() {
+    let _setup = stat_setup();
+    let (root_dentry, tmpfs, _root_rnode, root_mount) = build_tmpfs_root();
+    let owner_cred = Credential {
+        uid: 0,
+        gid: 0,
+        effective_caps: CapabilitySet::FULL,
+    };
+    {
+        let guard = guard();
+        match tmpfs.mkdir(
+            TMPFS_ROOT_OBJECT_ID,
+            b"dir",
+            S_IFDIR | 0o755,
+            &owner_cred,
+            &guard,
+        ) {
+            StepOutcome::Done(_) => {}
+            other => panic!("mkdir dir: {other:?}"),
+        }
+    }
+
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry.clone(), root_mount.clone());
+    let namespace = proc_cap
+        .mount_namespace_cap()
+        .expect("process mount namespace");
+    let resolved = match tx_subsystems::vfs::walker::step_walk_in_mount_namespace_with_origin_mount(
+        root_dentry,
+        &root_mount,
+        b"dir",
+        &owner_cred,
+        &namespace,
+        &guard(),
+    ) {
+        StepOutcome::Done(resolved) => resolved,
+        other => panic!("resolve mounted directory: {other:?}"),
+    };
+    let directory = OpenFile::new_cap_with_dentry(
+        resolved.dentry.rnode().clone(),
+        OpenFileFlags {
+            read: true,
+            write: false,
+            append: false,
+            cloexec: false,
+            nonblocking: false,
+            packet: false,
+        },
+        resolved.dentry.clone(),
+    )
+    .expect("directory open file");
+    assert!(proc_cap.install_fd(3, directory).is_none());
+
+    let ctx = make_ctx(proc_cap.clone(), thread);
+    let req = SyscallRequest::new(NR_FCHDIR, [3, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(req, &ctx)),
+        SyscallResult::Return(0)
+    );
+    let cwd = proc_cap.cwd_binding().expect("mounted cwd binding");
+    assert_eq!(cwd.dentry.key(), resolved.dentry.key());
+    assert_eq!(cwd.mount.key(), resolved.mount.key());
+}
 
 // -----------------------------------------------------------------
 // statfs / fstatfs
@@ -712,7 +928,7 @@ fn dispatch_statfs_writes_musl_lp64_statfs_layout() {
 #[test]
 fn dispatch_fstatfs_writes_musl_lp64_statfs_layout() {
     let _setup = stat_setup();
-    let (_root_dentry, _tmpfs, root_rnode) = build_tmpfs_root();
+    let (_root_dentry, _tmpfs, root_rnode, _root_mount) = build_tmpfs_root();
     let proc_cap = bootstrap();
     let thread = first_thread(&proc_cap);
     proc_cap.set_fd(8, Some(directory_open_file(root_rnode)));
@@ -735,8 +951,8 @@ fn dispatch_fstatfs_writes_musl_lp64_statfs_layout() {
 #[test]
 fn dispatch_getcwd_after_chdir_returns_path() {
     let _setup = stat_setup();
-    let (root_dentry, _tmpfs, _root_rnode) = build_tmpfs_root();
-    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let (root_dentry, _tmpfs, _root_rnode, _root_mount) = build_tmpfs_root();
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry, _root_mount);
     let ctx = make_ctx(proc_cap, thread);
 
     let mut buf = [0u8; 64];
@@ -753,8 +969,8 @@ fn dispatch_getcwd_after_chdir_returns_path() {
 #[test]
 fn dispatch_getcwd_zero_size_returns_neg_einval() {
     let _setup = stat_setup();
-    let (root_dentry, _tmpfs, _root_rnode) = build_tmpfs_root();
-    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let (root_dentry, _tmpfs, _root_rnode, _root_mount) = build_tmpfs_root();
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry, _root_mount);
     let ctx = make_ctx(proc_cap, thread);
 
     let mut buf = [0u8; 8];
@@ -768,8 +984,8 @@ fn dispatch_getcwd_zero_size_returns_neg_einval() {
 #[test]
 fn dispatch_getcwd_too_small_buffer_returns_neg_erange() {
     let _setup = stat_setup();
-    let (root_dentry, _tmpfs, _root_rnode) = build_tmpfs_root();
-    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let (root_dentry, _tmpfs, _root_rnode, _root_mount) = build_tmpfs_root();
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry, _root_mount);
     let ctx = make_ctx(proc_cap, thread);
 
     let mut buf = [0u8; 1];
@@ -789,7 +1005,7 @@ fn dispatch_getcwd_too_small_buffer_returns_neg_erange() {
 #[test]
 fn dispatch_getdents64_on_directory_fd_writes_entries() {
     let _setup = stat_setup();
-    let (_root_dentry, tmpfs, root_rnode) = build_tmpfs_root();
+    let (_root_dentry, tmpfs, root_rnode, _root_mount) = build_tmpfs_root();
     let owner_cred = Credential {
         uid: 0,
         gid: 0,
@@ -864,7 +1080,7 @@ fn dispatch_getdents64_on_directory_fd_writes_entries() {
 #[test]
 fn dispatch_lseek_directory_fd_resets_getdents64_cursor() {
     let _setup = stat_setup();
-    let (_root_dentry, tmpfs, root_rnode) = build_tmpfs_root();
+    let (_root_dentry, tmpfs, root_rnode, _root_mount) = build_tmpfs_root();
     let owner_cred = Credential {
         uid: 0,
         gid: 0,
@@ -956,7 +1172,7 @@ fn dispatch_getdents64_on_pipe_fd_returns_neg_enotdir() {
 #[test]
 fn dispatch_getdents64_after_full_read_returns_zero() {
     let _setup = stat_setup();
-    let (_root_dentry, _tmpfs, root_rnode) = build_tmpfs_root();
+    let (_root_dentry, _tmpfs, root_rnode, _root_mount) = build_tmpfs_root();
     let proc_cap = bootstrap();
     let thread = first_thread(&proc_cap);
     proc_cap.set_fd(8, Some(directory_open_file(root_rnode)));

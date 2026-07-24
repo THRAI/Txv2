@@ -13,46 +13,42 @@ pub(crate) use range_lock::{
 #[notification_adapter(
     subsystem = "vm",
     domain = "range_lock",
-    reason = "vm notification.rs owns RangeLock release masks, channel registration, and wait-source yields"
+    reason = "vm notification.rs owns RangeLock release masks, wait-source registration, and wait-source yields"
 )]
 mod range_lock {
     use crate::execution::WaitToken;
     use crate::vm::adapter::step_engine::{NoProgress, StepOutcome, StepProgress, YieldShape};
-    use crate::vm::adapter::wait_routing::{self, Channel, Mask, WaitSource};
+    use crate::vm::adapter::wait_routing::{self, WaitSource};
     use crate::vm::RANGE_LOCK_RELEASE_MASK;
     use alloc::sync::Arc;
 
     pub(crate) struct RangeLockWaitPoint {
-        pub(crate) channel: Channel,
         pub(crate) source_id: u64,
         pub(crate) source: Arc<WaitSource>,
     }
 
     pub(crate) fn new_range_lock_wait_point() -> RangeLockWaitPoint {
-        let channel = Channel::new();
         let source_id = crate::allocate_notification_source_id();
-        crate::wait_source::register_wait_channel_with_id(source_id, channel.clone());
         let source = wait_routing::new_wait_source(source_id);
-        RangeLockWaitPoint {
-            channel,
-            source_id,
-            source,
-        }
+        crate::wait_source::register_wait_source_with_id(source_id, source.clone());
+        RangeLockWaitPoint { source_id, source }
     }
 
     pub(crate) fn release_range_lock_wait_point(source_id: u64) {
-        crate::wait_source::release_wait_channel(source_id);
+        crate::wait_source::release_wait_source(source_id);
         wait_routing::unregister_source(source_id);
     }
 
-    pub(crate) fn notify_range_lock_released(channel: &Channel, source: &Arc<WaitSource>) {
-        channel.fire(Mask::from_bits(RANGE_LOCK_RELEASE_MASK));
+    pub(crate) fn notify_range_lock_released(source: &Arc<WaitSource>) {
         source.notify_emit(crate::vm::adapter::step_engine::InterestMask::new(
             RANGE_LOCK_RELEASE_MASK,
         ));
     }
 
-    pub(crate) fn range_lock_blocked<O>(source_id: u64) -> StepOutcome<O, NoProgress> {
+    pub(crate) fn range_lock_blocked<O>(
+        endpoint: &(impl tx_substrate::wake::WaitEndpoint + ?Sized),
+    ) -> StepOutcome<O, NoProgress> {
+        let source_id = tx_substrate::wake::WaitEndpoint::source_id(endpoint).raw();
         StepOutcome::yield_on_wait_source(NoProgress, source_id, RANGE_LOCK_RELEASE_MASK)
     }
 

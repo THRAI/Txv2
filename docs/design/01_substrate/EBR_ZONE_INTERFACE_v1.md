@@ -685,6 +685,28 @@ Reject:
 - immediate `T::drop` before guarded readers have quiesced;
 - out-of-band `reclaim_permitted` flags.
 
+### 10.1 Relationship To Owner Lanes And RCU Publication
+
+<!-- txdoc:EBR-ZONE-OWNER-LANES-RCU-1 -->
+
+[`OBJECT_API_LANES_v1.md`](../00_meta-framework/OBJECT_API_LANES_v1.md)
+defines the semantic owner/root boundary above this interface. Zone and RCU
+publication remain orthogonal beneath that boundary:
+
+- zone gives semantic entities stable identity and role-shaped evidence;
+- authoritative containers store `BindingValue` entries by value, including
+  obligation-derived `Weak`, `Cap`, or operational evidence;
+- `Published<T>` may replace immutable container roots and retire old roots
+  through EBR without giving those roots semantic identity;
+- tree/index nodes are private `ObserverNode` storage and never produce public
+  `Cap<Node>` or `Weak<Node>`;
+- old published snapshots may delay evidence Drop through the grace period,
+  but fresh readers resolve only through the newly published root.
+
+Moving a container to RCU does not require moving its nodes into zone storage.
+Observer-node zones are an optional private allocation/reclamation strategy,
+not an upper API or an RCU prerequisite.
+
 ---
 
 ## 11. Review Checklist

@@ -742,7 +742,7 @@ These payloads are L6 (`Mutation`).  Landed in OBS-8; emit is gated by
 `tx_substrate::zone::MUTATION_EMIT_ENABLED` (zone sign) and
 `tx_substrate::index::INDEX_MUTATION_EMIT_ENABLED` (index commit), both
 default-off.  The daemon decodes both tags via `read_as!` in
-`tools/tx-trace-daemon/src/decode.rs`.
+`tools/tx-trace-daemon/src/l5_canonical/decode.rs`.
 
 ### 8.9 Phase transition payload (OBS-8)
 
@@ -783,7 +783,7 @@ L5 Phase spans fire at substrate `init` (BSP, `hart_id = 0`) and
 `init_on_ap` (AP, `hart_id = cpu.0`).  No runtime gate — L5 is
 low-frequency (a handful per boot) and always on when observation is
 wired.  Daemon decodes via `read_as!(PayloadPhaseTransition)` added in
-`tools/tx-trace-daemon/src/decode.rs`.
+`tools/tx-trace-daemon/src/l5_canonical/decode.rs`.
 
 ### 8.8 Panic payload
 

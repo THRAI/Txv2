@@ -49,6 +49,7 @@ This document does *not* cover:
 - [`03_STEP_MODEL_v2.md`](../../Txv3/03_STEP_MODEL_v2.md) — step outcome algebra, five-phase discipline.
 - [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) — STEP-4, OBL-*, BIF-*.
 - [`MODULE_MAP_v1.md`](../00_meta-framework/MODULE_MAP_v1.md) §5.1 (vm subsystem), §7 (FS instances).
+- [`IO_MANAGER_v1.md`](../05_filesystem/IO_MANAGER_v1.md) — target I/O control plane that keeps `PageContainer` as the only long-lived ordinary file-data cache while moving miss/writeback submission, readahead, completion, and block scheduling into service futures.
 
 ### Zone-derived type policy
 <!-- txdoc:PAGE-BACKED-ZONE-DERIVED-TYPE-POLICY -->

@@ -1,0 +1,275 @@
+{
+  "schema": "tx.progress.plan.v1",
+  "id": "2026-07-14-reactor-refactor",
+  "title": "Reactor correctness-first ownership refactor",
+  "status": "complete",
+  "created": "2026-07-14",
+  "updated": "2026-07-21",
+  "owner": "codex/reactor-refactor",
+  "summary": "Complete the 13-task Reactor refactor with one TaskControl and PollLease path, generation/epoch-bearing physical queues, transition-sensitive wake ingress, thread-owned userspace rendezvous, retired compatibility paths, and passive transition counters. Task 13 adds deterministic typed diagnostics and executes every final gate without weakening inherited baselines. Non-goals are txtrace wire/schema/host decoder changes, unrelated baseline cleanup, vendor-image policy changes, and unmeasured wake-ingress sharding or task-table optimization.",
+  "scope": {
+    "in": [
+      "crates/tx-reactor/src/observability.rs",
+      "crates/tx-reactor/src/core",
+      "crates/tx-reactor/src/hart",
+      "crates/tx-reactor/src/runtime",
+      "crates/tx-reactor/src/userspace",
+      "crates/tx-reactor/src/wake",
+      "crates/tx-reactor/tests/module_layout.rs",
+      "docs/progress/STATUS.md",
+      "docs/progress/plans/2026-07-14-reactor-refactor.json"
+    ],
+    "out": [],
+    "write_sets": [
+      {
+        "owner": "task-13-implementer",
+        "paths": [
+          "crates/tx-reactor",
+          "docs/progress/STATUS.md",
+          "docs/progress/plans/2026-07-14-reactor-refactor.json"
+        ],
+        "notes": "Isolated codex/reactor-refactor worktree; Task 13 transition diagnostics, focused tests, structural ratchets, and completion records only."
+      }
+    ]
+  },
+  "context": {
+    "design_docs": [
+      "docs/design/INDEX.md",
+      "docs/Txv3/08_OBSERVATION_v1.md"
+    ],
+    "progress_refs": [],
+    "external_refs": []
+  },
+  "steps": [
+    {
+      "id": "task-13-counters",
+      "title": "Add typed passive transition counters after authoritative transitions",
+      "status": "complete",
+      "depends_on": [],
+      "paths": [
+        "crates/tx-reactor/src/observability.rs",
+        "crates/tx-reactor/src/core/arena.rs",
+        "crates/tx-reactor/src/core/poll.rs",
+        "crates/tx-reactor/src/core/task.rs",
+        "crates/tx-reactor/src/core/transition.rs",
+        "crates/tx-reactor/src/hart/drive.rs",
+        "crates/tx-reactor/src/runtime/diagnostics.rs",
+        "crates/tx-reactor/src/runtime/hart_runtime.rs",
+        "crates/tx-reactor/src/runtime/task_lifecycle.rs",
+        "crates/tx-reactor/src/userspace/rendezvous.rs",
+        "crates/tx-reactor/src/wake/state.rs",
+        "crates/tx-subsystems/src/thread_runtime/adapter.rs",
+        "crates/tx-subsystems/src/thread_runtime/structure.rs",
+        "crates/tx-subsystems/src/thread_runtime/tests.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-reactor observability --lib -- --nocapture"
+      ],
+      "notes": "Per-instance Arc ownership allocates only at observer construction. TransitionRecorder is write-only and exposes only unit-returning record methods; the bank and snapshot implementation remain owned by observability.rs, while the crate-private snapshot helper is referenced only by the exact public facade in runtime/diagnostics.rs. Hot recording is an immutable enabled-bit check plus allocation-free lock-free Relaxed fetch_update with saturating_add, so all eleven fields stop at u64::MAX. Reactor and read-only per-thread userspace diagnostics perform independent Relaxed loads and are explicitly non-transactional. ThreadRuntime early owner-token rejection and slot generation mismatch share one per-thread bank and record each StaleRequest outcome exactly once; disabled mode remains zero and ThreadPayload exposes only typed TransitionCounters, never the raw slot. CancelTransition carries lock-protected newly_deferred evidence and only the first cancel_requested false-to-true transition records. Poll acquire validation returns precise stale epoch, hart, and queue-kind reasons under the TaskControl lock; only epoch mismatch records run_token_stale_epoch. No txtrace wire or host surface changed."
+    },
+    {
+      "id": "task-13-equivalence",
+      "title": "Prove enabled and disabled modes preserve task behavior",
+      "status": "complete",
+      "depends_on": [
+        "task-13-counters"
+      ],
+      "paths": [
+        "crates/tx-reactor/src/runtime/tests/observability.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-reactor observability --lib -- --nocapture"
+      ],
+      "notes": "The same self-wake, park, duplicate wake, completion, and terminal-drain script produces identical final TaskStatus, three Future polls, queue depths, completed records, and cancelled records in enabled and disabled modes. Disabled counters remain zero."
+    },
+    {
+      "id": "task-13-structural",
+      "title": "Pin passive reads and full-tree Reactor structure",
+      "status": "complete",
+      "depends_on": [
+        "task-13-counters"
+      ],
+      "paths": [
+        "crates/tx-reactor/src/runtime/tests",
+        "crates/tx-reactor/src/runtime/diagnostics.rs",
+        "crates/tx-reactor/src/scheduler/test_support.rs",
+        "crates/tx-reactor/src/scheduler/tests/pick.rs",
+        "crates/tx-reactor/tests/module_layout.rs",
+        "crates/tx-reactor/tests/module_layout/transition_observability.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-reactor --lib runtime::tests::",
+        "cargo test -p tx-reactor --test module_layout",
+        "wc -l crates/tx-reactor/src/**/*.rs crates/tx-reactor/src/*.rs",
+        "rg -n \"compat_locals|request_userspace_run|record_userspace_timer_preemption\" crates/tx-reactor/src crates/tx-reactor/tests",
+        "rg -n \"VecDeque<TaskId>|TaskHandle::new\\(TaskId\" crates/tx-reactor/src"
+      ],
+      "notes": "The scanner recursively checks every authored crates/tx-reactor/src/**/*.rs and rejects a synthetic 1501-line fixture. The 5364-line runtime/tests.rs moved to runtime/tests/mod.rs and split into eight responsibility modules: affinity_publication 789, queue_publication 1148, wake_and_structure 414, concurrency_unwind 359, lifecycle_terminal 706, generation_tokens 737, acquire_reconciliation 405, and queue_pruning 548 lines; all 93 moved tests remain present. The scheduler fixture now constructs an explicit generation-bearing TaskKey before TaskHandle, and the exact raw-pattern scan is empty. Retired compatibility strings occur only in negative fixtures. Every Reactor source file is at most 1500 lines; scheduler/placement.rs is largest at 1411. The capability ratchet tokenizes comments/literals, preserves raw strings, normalizes ASCII Rust raw identifiers r#ident to logical ident tokens, and scans every production source without recorder gating. It pins all ReactorObservability, TransitionCounters, and snapshot helper references; rejects direct, aliased, wrapper, inline-module, UFCS, raw-identifier, and captured method-item/callback observability routes outside runtime/diagnostics.rs; rejects other transitions/snapshot/counters read calls outside the diagnostic owners; and token-pins the dedicated owner's complete one-method body so an added decision method fails. Raw module paths such as crate::r#observability::TransitionRecorder continue through another :: and remain valid. The module-layout count is 21 and arch lint stays at the inherited 82 findings."
+    },
+    {
+      "id": "task-13-gates",
+      "title": "Execute host, lint, target, full-build, and smoke gates",
+      "status": "complete",
+      "depends_on": [
+        "task-13-equivalence",
+        "task-13-structural"
+      ],
+      "paths": [],
+      "verification": [
+        "cargo fmt --check",
+        "cargo test -p tx-reactor --lib",
+        "cargo test -p tx-reactor",
+        "cargo test -p tx-kernel thread_future -- --nocapture",
+        "cargo test -p tx-kernel trap_handoff -- --nocapture",
+        "cargo test -p tx-subsystems thread_runtime -- --nocapture",
+        "cargo test -p tx-subsystems --lib thread_runtime -- --nocapture",
+        "cargo xtask lint arch",
+        "cargo xtask lint boundary",
+        "cargo xtask lint unused",
+        "cargo xtask lint docs",
+        "git diff --check",
+        "cargo check -p tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf",
+        "cargo xtask full-build --target rv64-qemu",
+        "cargo xtask test smoke --target rv64-qemu"
+      ],
+      "notes": "All commands were run exactly. Focused/package gates pass except inherited broad tx-subsystems integration visibility/import failures. Existing fmt, arch, unused, docs, progress-reference, and missing vendor-image blockers are recorded below without suppression or ratchet changes. Full-build doctor passes and detects QEMU 10.2.2 plus the RV64 target, but kernel build stops before image/QEMU."
+    },
+    {
+      "id": "task-13-catchup",
+      "title": "Record completion, verification, next measurement, and blockers",
+      "status": "complete",
+      "depends_on": [
+        "task-13-gates"
+      ],
+      "paths": [
+        "docs/progress/STATUS.md",
+        "docs/progress/plans/2026-07-14-reactor-refactor.json"
+      ],
+      "verification": [
+        "cargo xtask progress validate"
+      ],
+      "notes": "Next performance action: measure wake_ingress_coalesced / (wake_ingress_enqueued + wake_ingress_coalesced) and stale generation/epoch token drop rates under SMP workload before deciding whether wake-ingress sharding or task-table storage optimization is justified."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test -p tx-reactor observability --lib -- --nocapture",
+      "status": "passed",
+      "notes": "8 passed: exact isolated deltas and u64::MAX saturation for all 11 typed counters, disabled-zero behavior, scripted enabled/disabled equivalence, precise stale generation/epoch/hart/queue rejection, first-transition-only deferred cancel, reentry, and stale userspace request. Initial RED exited 101 on absent typed fields/constructors; review RED showed wrap-to-zero, deferred count 2, wrong-hart epoch count 1, and no write-only recorder type."
+    },
+    {
+      "command": "cargo test -p tx-reactor --test module_layout",
+      "status": "passed",
+      "notes": "21 passed, including recursive all-source line limits with a synthetic 1501-line rejection fixture, exact raw TaskId queue/handle rejection, source-tree-wide transitive alias/reexport resolution for generation-sensitive TaskKey queries and the public TaskId allowlist, unconditional production diagnostic-read scanning, an exact dedicated diagnostic-owner body, and exact module/DAG inventories. Structural RED found runtime/tests.rs at 5364 lines and scheduler/tests/pick.rs raw TaskId construction; quality re-review REDs additionally proved self.observability().transitions() escaped the recorder-gated scanner, a captured Reactor::observability method item escaped the call-only scanner, and reactor.r#observability() escaped before raw-identifier normalization. GREEN rejects direct, aliased, wrapper, inline-module, UFCS, raw-identifier dot/path/callback, method-item callback, and added-owner-decision fixtures while accepting raw observability module paths and unrelated raw identifiers."
+    },
+    {
+      "command": "cargo test -p tx-reactor --lib runtime::tests::",
+      "status": "passed",
+      "notes": "139 passed. The eight mechanically moved responsibility clusters contain exactly 93 #[test] functions, including the Task 12 stale-generation query witness; focused review tests cover stale query rejection, deferred-cancel exact-once, and precise stale mismatch counting."
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "failed",
+      "notes": "Inherited only: xtask/src/test.rs:184 needs rustfmt expansion of the missing vDSO witness start-stub format call. Task 13 Rust files were formatted directly and left this unrelated file untouched."
+    },
+    {
+      "command": "cargo test -p tx-reactor --lib",
+      "status": "passed",
+      "notes": "227 library tests passed. The crate manifest disables implicit library tests, so this explicit --lib command is required."
+    },
+    {
+      "command": "cargo test -p tx-reactor",
+      "status": "passed",
+      "notes": "206 integration tests passed. Combined with the explicit --lib command, Reactor verification covers 433 tests."
+    },
+    {
+      "command": "cargo check -p tx-reactor --lib --no-default-features",
+      "status": "passed",
+      "notes": "Reactor no-default library check passed."
+    },
+    {
+      "command": "cargo check -p tx-kernel --lib --no-default-features",
+      "status": "passed",
+      "notes": "Kernel no-default library check passed with inherited warnings outside the Task 13 scope."
+    },
+    {
+      "command": "cargo test -p tx-kernel thread_future -- --nocapture",
+      "status": "passed",
+      "notes": "27 passed, 82 filtered out."
+    },
+    {
+      "command": "cargo test -p tx-kernel trap_handoff -- --nocapture",
+      "status": "passed",
+      "notes": "7 passed, 102 filtered out."
+    },
+    {
+      "command": "cargo test -p tx-subsystems thread_runtime -- --nocapture",
+      "status": "failed",
+      "notes": "Inherited broad-command compile failure in unrelated integration targets with private wait-source visibility and signal import errors. The exact compiler inventory and count vary with parallel scheduling; scoped --lib ThreadRuntime is the authoritative Task 13 regression command."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib thread_runtime -- --nocapture",
+      "status": "passed",
+      "notes": "Authoritative scoped result: 28 passed, 1287 filtered out. Review RED failed to compile because ThreadPayload had no typed userspace counter accessor or disabled constructor; GREEN covers early owner rejection, slot-generation mismatch, and disabled zero behavior."
+    },
+    {
+      "command": "cargo xtask lint arch",
+      "status": "failed",
+      "notes": "Exactly 82 inherited issues after the Reactor oversized-source finding was removed by the mechanical split; no ceiling changed."
+    },
+    {
+      "command": "cargo xtask lint boundary",
+      "status": "failed",
+      "notes": "Inherited boundary baseline reproduced exactly: substrate 682 outside-adapter lines and reactor 51; no ceiling changed."
+    },
+    {
+      "command": "cargo xtask lint unused",
+      "status": "failed",
+      "notes": "Exactly 2 inherited tx-kernel issues: unused hart at init.rs:2362 and dead unregister_thread_reactor_task at init/reactor_submit.rs:98."
+    },
+    {
+      "command": "cargo xtask lint docs",
+      "status": "failed",
+      "notes": "Inherited 27 broken Markdown links plus 6 stale-vocabulary warnings."
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed",
+      "notes": "No whitespace errors."
+    },
+    {
+      "command": "cargo check -p tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf",
+      "status": "failed",
+      "notes": "tx-reactor compiles; tx-kernel rootfs_shims.rs:500 include_bytes fails because tools/images/vendor/tx-netfast-riscv64 is absent."
+    },
+    {
+      "command": "cargo xtask full-build --target rv64-qemu",
+      "status": "failed",
+      "notes": "Doctor passes, including QEMU 10.2.2 and RV64 target. Kernel build then stops on missing tools/images/vendor/tx-netfast-riscv64 before image creation or QEMU."
+    },
+    {
+      "command": "cargo xtask test smoke --target rv64-qemu",
+      "status": "failed",
+      "notes": "Stops in the initial kernel build on missing tools/images/vendor/tx-netfast-riscv64; QEMU does not launch, so no boot or SMP owner-wake sentinel is claimed."
+    },
+    {
+      "command": "cargo xtask progress validate",
+      "status": "failed",
+      "notes": "Expected inherited repository reference blocker: docs/design/05_filesystem/IO_MANAGER_v1.md is absent. No unrelated JSON was modified."
+    }
+  ],
+  "risks": [
+    "Relaxed diagnostic snapshots are independent per-field loads rather than a transactional cross-counter instant; counters are not semantic state, each increment remains atomic, and every field saturates at u64::MAX.",
+    "Wake-ingress and stale-token rates need workload measurement before they justify queue sharding or storage redesign."
+  ],
+  "blockers": [
+    "RV64 image and QEMU smoke are externally blocked before QEMU by missing tools/images/vendor/tx-netfast-riscv64.",
+    "Repository progress validation is blocked by the inherited missing docs/design/05_filesystem/IO_MANAGER_v1.md reference.",
+    "Inherited broad tx-subsystems integration targets do not compile because of unrelated private wait-source visibility and signal import errors; the exact parallel compiler inventory is intentionally not treated as stable evidence.",
+    "Inherited full fmt, arch 82, boundary substrate 682 / reactor 51, unused 2, and docs 27 broken-link baselines remain."
+  ],
+  "handoff": {
+    "needed": false,
+    "path": null
+  }
+}

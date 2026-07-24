@@ -104,8 +104,8 @@ fn step_reset_for_exec_preserves_pending_signals() {
     let proc_cap = fresh_init();
 
     // Pre-seed group_pending with SIGTERM via the Gewalt-free
-    // `step_kill_process` path (catchable signals route through
-    // post_signal onto the leader thread's pending; group_pending
+    // process-directed kill path (catchable signals route through
+    // catchable-signal posting onto the leader thread's pending; group_pending
     // we set directly via the per-payload accessor for clarity).
     {
         let payload = proc_cap.payload.lock();

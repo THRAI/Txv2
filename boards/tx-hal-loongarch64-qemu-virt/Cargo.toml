@@ -12,8 +12,10 @@ tx-hal = { path = "../../crates/tx-hal" }
 [features]
 default = []
 la64-boot-trace = []
-la-board-ls2k1000 = []
 
 [lib]
 path = "src/lib.rs"
 doctest = false
+
+[lints]
+workspace = true

@@ -154,19 +154,23 @@ find_pkg_for_token() {
   return 1
 }
 
-declare -A SEEN=()
 declare -a QUEUE=()
 declare -a ORDER=()
+SEEN_KEYS="
+"
 
 enqueue_pkg() {
   local repo_pkg="$1"
   local repo="${repo_pkg%%:*}"
   local pkg="${repo_pkg#*:}"
   local key="$repo:$pkg"
-  if [ -n "${SEEN[$key]:-}" ]; then
-    return 0
-  fi
-  SEEN["$key"]=1
+  case "$SEEN_KEYS" in
+    *"
+$key
+"*) return 0 ;;
+  esac
+  SEEN_KEYS="$SEEN_KEYS$key
+"
   QUEUE+=("$key")
   ORDER+=("$key")
 }

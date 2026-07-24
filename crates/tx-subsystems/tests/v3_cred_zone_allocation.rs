@@ -44,7 +44,9 @@ use tx_hal::{
 use tx_subsystems::cred::adapter::step_engine::Cap;
 
 use tx_subsystems::cred::{step_setuid, CredChange, Uid};
-use tx_subsystems::process::{bootstrap_init_process, step_exit_group, step_fork, ExitStatus};
+use tx_subsystems::process::{
+    bootstrap_init_process, step_exit_group_with_posts, step_fork, ExitStatus,
+};
 use tx_subsystems::vm::AddressSpace;
 use tx_subsystems::zones;
 
@@ -111,6 +113,23 @@ fn fresh_aspace() -> Cap<AddressSpace> {
     AddressSpace::new_cap_for_platform::<StubPmap>().expect("fresh aspace")
 }
 
+fn finish_process_group_for_test(
+    process: &Cap<tx_subsystems::process::ProcessIdentity>,
+    status: ExitStatus,
+) {
+    step_exit_group_with_posts(
+        process,
+        status,
+        |weak, event| {
+            let Some(mailbox) = weak.upgrade() else {
+                return;
+            };
+            let _ = mailbox.post(event);
+        },
+        |mailbox, event| mailbox.post(event),
+    );
+}
+
 /// Single integration test that bootstraps init once and exercises
 /// every cred-cap invariant from there.
 #[test]
@@ -162,11 +181,11 @@ fn cred_zone_allocation_invariants_round_trip() {
     assert!(still_pre.uid.is_root());
 
     // (5) `cred_cap()` returns `None` for zombies. Zombify the child
-    // via `step_exit_group`; the identity stays observable (parent
+    // via group exit; the identity stays observable (parent
     // retains it for `waitpid`) but the payload — and therefore the
     // cred-slot — is dropped.
-    step_exit_group(&child, ExitStatus::Exited(0));
-    assert!(child.is_zombie(), "step_exit_group zombifies the child");
+    finish_process_group_for_test(&child, ExitStatus::Exited(0));
+    assert!(child.is_zombie(), "group exit zombifies the child");
     assert!(
         child.cred_cap().is_none(),
         "zombies have no cred cap (payload dropped)"

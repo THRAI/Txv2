@@ -1,4 +1,5 @@
 use alloc::boxed::Box;
+use alloc::collections::VecDeque;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -11,7 +12,6 @@ use smoltcp::wire::{
     Ipv4Repr, Ipv6Packet, Ipv6Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber, TcpTimestampRepr,
 };
 
-use crate::net::clock::net_now_instant;
 use crate::net::packet::LoopbackIpPacket;
 use crate::net::structure::{
     AddressFamily, IpEndpoint, Ipv4Address, Ipv6Address as TxIpv6Address, SocketOptionSet,
@@ -20,47 +20,21 @@ use crate::sync::SpinMutex;
 
 pub const TCP_CORK_AUTO_FLUSH_BYTES: usize = 1460;
 
-/// P3-C S4 (R2d): cap the smoltcp TCP ring backing per direction. The
-/// default SO_RCVBUF=256KB + SO_SNDBUF=64KB means every TCP socket eagerly
-/// allocated 320KB (loopback included) with no accounting → mass sockets
-/// OOM-panic the heap. Clamp the actual `vec!` backing here (mirrors UDP's
-/// `UDP_SMOLTCP_BACKING_MAX_BYTES`); the reported SO_RCVBUF/SNDBUF stays at
-/// the option value (getsockopt reads `options.socket.*_buf_size`, not the
-/// buffer), so this is invisible to sockopt callers. 64KB/dir is ample for
-/// the TCG/loopback throughput regime (bulk sends 32KB); real-link tuning
-/// is a later concern.
-const TCP_SMOLTCP_BACKING_MAX_BYTES: usize = 65_536;
-
-fn tcp_backing_bytes(bytes: usize) -> usize {
-    bytes.clamp(1, TCP_SMOLTCP_BACKING_MAX_BYTES)
-}
-
-/// P3-B S2 (D4, R1d): the smoltcp socket, the protocol sticky bits and
-/// the MSG_MORE corking buffer live under ONE lock. The former
-/// three-lock split let a single send make 6–9 independent
-/// acquire/release round-trips — `send_available` was read and released
-/// before `send_slice` used the stale value, and the corked
-/// read→clear window could wipe bytes a concurrent MSG_MORE append had
-/// just staged. With one lock the whole
-/// available→combine→send_slice→clear composite is atomic by
-/// construction. Lock order vs the global context is unchanged:
-/// CONTEXT_IFACE outer, `inner` inner (taken inside `with_context`
-/// closures only).
-struct TcpInner {
-    socket: Box<tcp::Socket<'static>>,
-    protocol_state: RawTcpProtocolState,
-    corked_tx: Vec<u8>,
-}
-
 /// Doc-named owner for the smoltcp TCP socket and its backing buffers.
 pub struct RawTcpSocket {
-    inner: SpinMutex<TcpInner>,
+    socket: SpinMutex<Box<tcp::Socket<'static>>>,
+    protocol_state: SpinMutex<RawTcpProtocolState>,
+    last_syn_ack: SpinMutex<Option<SmoltcpTcpSegment>>,
+    rx_buffer: SpinMutex<VecDeque<u8>>,
+    tx_buffer: SpinMutex<VecDeque<u8>>,
+    corked_tx: SpinMutex<Vec<u8>>,
     recv_capacity: usize,
     send_capacity: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RawTcpProtocolState {
+    pub has_connected: bool,
     pub is_recv_shut: bool,
     pub is_rst_closed: bool,
 }
@@ -117,11 +91,12 @@ impl RawTcpSocket {
         let socket = new_smoltcp_tcp_socket(recv_capacity, send_capacity, options);
 
         Self {
-            inner: SpinMutex::new(TcpInner {
-                socket: Box::new(socket),
-                protocol_state: RawTcpProtocolState::default(),
-                corked_tx: Vec::new(),
-            }),
+            socket: SpinMutex::new(Box::new(socket)),
+            protocol_state: SpinMutex::new(RawTcpProtocolState::default()),
+            last_syn_ack: SpinMutex::new(None),
+            rx_buffer: SpinMutex::new(VecDeque::new()),
+            tx_buffer: SpinMutex::new(VecDeque::new()),
+            corked_tx: SpinMutex::new(Vec::new()),
             recv_capacity,
             send_capacity,
         }
@@ -135,8 +110,32 @@ impl RawTcpSocket {
         self.send_capacity
     }
 
+    pub fn ingest_rx_bytes(&self, bytes: &[u8]) -> bool {
+        if bytes.is_empty() {
+            return false;
+        }
+
+        let mut rx = self.rx_buffer.lock();
+        let was_empty = rx.is_empty();
+        let available = self.recv_capacity.saturating_sub(rx.len());
+        let accepted = core::cmp::min(available, bytes.len());
+        rx.extend(bytes.iter().copied().take(accepted));
+        was_empty && accepted > 0
+    }
+
+    pub fn ingest_rx_bytes_unbounded(&self, bytes: &[u8]) -> bool {
+        if bytes.is_empty() {
+            return false;
+        }
+
+        let mut rx = self.rx_buffer.lock();
+        let was_empty = rx.is_empty();
+        rx.extend(bytes.iter().copied());
+        was_empty
+    }
+
     pub fn recv_available(&self) -> usize {
-        self.inner.lock().socket.recv_queue()
+        self.rx_buffer.lock().len()
     }
 
     pub fn recv_len(&self, len: usize, peek: bool) -> Option<(usize, bool)> {
@@ -144,34 +143,18 @@ impl RawTcpSocket {
             return Some((0, false));
         }
 
-        let inner = &mut *self.inner.lock();
-        let socket = &mut inner.socket;
-        if socket.recv_queue() == 0 {
+        let mut rx = self.rx_buffer.lock();
+        if rx.is_empty() {
             return None;
         }
 
-        if peek {
-            let bytes = core::cmp::min(socket.recv_queue(), len);
-            return Some((bytes, false));
-        }
-
-        // Consume-and-discard: the smoltcp ring may wrap, so `recv` can hand
-        // out less than the queued total per call — loop until done.
-        let mut taken_total = 0;
-        while taken_total < len {
-            let want = len - taken_total;
-            let taken = socket
-                .recv(|buf| {
-                    let take = core::cmp::min(buf.len(), want);
-                    (take, take)
-                })
-                .unwrap_or(0);
-            if taken == 0 {
-                break;
+        let bytes = core::cmp::min(rx.len(), len);
+        if !peek {
+            for _ in 0..bytes {
+                let _ = rx.pop_front();
             }
-            taken_total += taken;
         }
-        Some((taken_total, socket.recv_queue() == 0))
+        Some((bytes, !peek && rx.is_empty()))
     }
 
     pub fn recv_bytes(&self, out: &mut [u8], peek: bool) -> Option<(usize, bool)> {
@@ -179,29 +162,45 @@ impl RawTcpSocket {
             return Some((0, false));
         }
 
-        let inner = &mut *self.inner.lock();
-        let socket = &mut inner.socket;
-        if socket.recv_queue() == 0 {
+        let mut rx = self.rx_buffer.lock();
+        if rx.is_empty() {
             return None;
         }
 
-        let bytes = if peek {
-            socket.peek_slice(out).unwrap_or(0)
+        let bytes = core::cmp::min(rx.len(), out.len());
+        if peek {
+            for (dst, src) in out.iter_mut().take(bytes).zip(rx.iter()) {
+                *dst = *src;
+            }
         } else {
-            socket.recv_slice(out).unwrap_or(0)
-        };
-        if bytes == 0 {
-            return None;
+            for dst in out.iter_mut().take(bytes) {
+                if let Some(byte) = rx.pop_front() {
+                    *dst = byte;
+                }
+            }
         }
-        Some((bytes, !peek && socket.recv_queue() == 0))
+        Some((bytes, !peek && rx.is_empty()))
     }
 
     pub fn send_available(&self) -> usize {
-        send_available_inner(&self.inner.lock())
+        let queued = self.tx_buffer.lock().len();
+        let corked = self.corked_tx.lock().len();
+        let staged_available = self
+            .send_capacity
+            .saturating_sub(queued.saturating_add(corked));
+        let protocol_available = {
+            let socket = self.socket.lock();
+            if socket.may_send() {
+                socket.send_capacity().saturating_sub(socket.send_queue())
+            } else {
+                0
+            }
+        };
+        core::cmp::min(staged_available, protocol_available)
     }
 
     pub fn send_queued(&self) -> usize {
-        self.inner.lock().socket.send_queue()
+        self.tx_buffer.lock().len()
     }
 
     pub fn enqueue_tx_len(&self, len: usize) -> Option<RawTcpSendReserve> {
@@ -225,114 +224,175 @@ impl RawTcpSocket {
             });
         }
 
-        // R1d fix: the whole available→combine→send_slice→clear composite
-        // runs under one lock acquisition — no stale-available window, no
-        // corked read→clear overwrite window.
-        let inner = &mut *self.inner.lock();
-        let available = send_available_inner(inner);
+        let available = self.send_available();
         if available == 0 {
             return None;
         }
 
         let requested = core::cmp::min(available, bytes.len());
         if more {
-            inner
-                .corked_tx
+            self.corked_tx
+                .lock()
                 .extend(bytes.iter().copied().take(requested));
-            let flushed_to_protocol = if inner.corked_tx.len() >= TCP_CORK_AUTO_FLUSH_BYTES {
-                flush_corked_inner(inner) > 0
+            let flushed_to_protocol = if self.corked_tx.lock().len() >= TCP_CORK_AUTO_FLUSH_BYTES {
+                self.flush_corked_tx() > 0
             } else {
                 false
             };
             return Some(RawTcpSendReserve {
                 bytes: requested,
-                became_full: send_available_inner(inner) == 0,
+                became_full: self.send_available() == 0,
                 flushed_to_protocol,
             });
         }
 
-        let corked_len = inner.corked_tx.len();
+        let corked_len = self.corked_tx.lock().len();
         let mut combined = Vec::with_capacity(corked_len + requested);
         if corked_len != 0 {
-            combined.extend(inner.corked_tx.iter().copied());
+            combined.extend(self.corked_tx.lock().iter().copied());
         }
         combined.extend_from_slice(&bytes[..requested]);
 
-        let accepted = inner.socket.send_slice(&combined).ok()?;
+        let accepted = self.enqueue_protocol_tx_bytes(&combined).ok()?;
         if accepted == 0 {
             return None;
         }
         if corked_len != 0 {
-            inner.corked_tx.clear();
+            self.corked_tx.lock().clear();
         }
+        self.tx_buffer
+            .lock()
+            .extend(combined.iter().copied().take(accepted));
         let accepted_new = accepted.saturating_sub(corked_len).min(requested);
         Some(RawTcpSendReserve {
             bytes: accepted_new,
-            became_full: send_available_inner(inner) == 0,
+            became_full: self.send_available() == 0,
             flushed_to_protocol: accepted > 0,
         })
     }
 
     pub fn flush_corked_tx(&self) -> usize {
-        flush_corked_inner(&mut self.inner.lock())
+        let bytes = {
+            let mut corked = self.corked_tx.lock();
+            if corked.is_empty() {
+                return 0;
+            }
+            core::mem::take(&mut *corked)
+        };
+
+        let accepted = match self.enqueue_protocol_tx_bytes(&bytes) {
+            Ok(accepted) => accepted,
+            Err(_) => {
+                self.prepend_corked_tx(&bytes);
+                return 0;
+            }
+        };
+        if accepted == 0 {
+            self.prepend_corked_tx(&bytes);
+            return 0;
+        }
+
+        self.tx_buffer
+            .lock()
+            .extend(bytes.iter().copied().take(accepted));
+        if accepted < bytes.len() {
+            self.prepend_corked_tx(&bytes[accepted..]);
+        }
+        accepted
+    }
+
+    pub fn ack_tx_bytes(&self, bytes: usize) -> bool {
+        if bytes == 0 {
+            return false;
+        }
+
+        let had_no_space = self.send_available() == 0;
+        let mut tx = self.tx_buffer.lock();
+        let released = core::cmp::min(bytes, tx.len());
+        for _ in 0..released {
+            let _ = tx.pop_front();
+        }
+        drop(tx);
+        had_no_space && released > 0 && self.send_available() > 0
+    }
+
+    pub fn dequeue_tx_bytes(&self, max_len: usize) -> Option<(Vec<u8>, bool)> {
+        if max_len == 0 {
+            return None;
+        }
+
+        let had_no_space = self.send_available() == 0;
+        let mut tx = self.tx_buffer.lock();
+        if tx.is_empty() {
+            return None;
+        }
+
+        let bytes = core::cmp::min(tx.len(), max_len);
+        let mut drained = Vec::with_capacity(bytes);
+        for _ in 0..bytes {
+            if let Some(byte) = tx.pop_front() {
+                drained.push(byte);
+            }
+        }
+
+        Some((drained, had_no_space))
     }
 
     pub fn can_recv(&self) -> bool {
-        self.inner.lock().socket.can_recv()
+        self.socket.lock().can_recv()
     }
 
     pub fn can_send(&self) -> bool {
-        self.inner.lock().socket.can_send()
+        self.socket.lock().can_send()
     }
 
     pub fn may_recv(&self) -> bool {
-        self.inner.lock().socket.may_recv()
+        self.socket.lock().may_recv()
     }
 
     pub fn may_send(&self) -> bool {
-        self.inner.lock().socket.may_send()
+        self.socket.lock().may_send()
     }
 
     pub fn is_recv_closed(&self) -> bool {
-        self.inner.lock().protocol_state.is_recv_shut
+        self.protocol_state.lock().is_recv_shut
     }
 
     pub fn is_send_closed(&self) -> bool {
-        !self.inner.lock().socket.may_send()
+        !self.socket.lock().may_send()
     }
 
     pub fn close(&self) {
-        let inner = &mut *self.inner.lock();
-        let _ = flush_corked_inner(inner);
-        inner.socket.close();
+        let _ = self.flush_corked_tx();
+        self.socket.lock().close();
     }
 
     pub fn abort(&self) {
-        let inner = &mut *self.inner.lock();
-        inner.corked_tx.clear();
-        inner.socket.abort();
+        self.corked_tx.lock().clear();
+        self.socket.lock().abort();
     }
 
     pub fn reset(&self, options: &SocketOptionSet) {
-        let inner = &mut *self.inner.lock();
-        inner.socket = Box::new(new_smoltcp_tcp_socket(
+        *self.socket.lock() = Box::new(new_smoltcp_tcp_socket(
             self.recv_capacity,
             self.send_capacity,
             options,
         ));
-        inner.protocol_state = RawTcpProtocolState::default();
-        inner.corked_tx.clear();
+        *self.protocol_state.lock() = RawTcpProtocolState::default();
+        *self.last_syn_ack.lock() = None;
+        self.rx_buffer.lock().clear();
+        self.tx_buffer.lock().clear();
+        self.corked_tx.lock().clear();
     }
 
     pub fn mark_recv_closed_by_peer(&self) {
-        self.inner.lock().protocol_state.is_recv_shut = true;
+        self.protocol_state.lock().is_recv_shut = true;
     }
 
     pub fn listen_endpoint(&self, local: IpEndpoint) -> Result<(), RawTcpSocketError> {
         let endpoint = to_smoltcp_endpoint(local);
-        self.inner
+        self.socket
             .lock()
-            .socket
             .listen(endpoint)
             .map_err(|error| match error {
                 tcp::ListenError::InvalidState => RawTcpSocketError::InvalidState,
@@ -346,9 +406,8 @@ impl RawTcpSocket {
         remote: IpEndpoint,
     ) -> Result<(), RawTcpSocketError> {
         with_context(|cx| {
-            self.inner
+            self.socket
                 .lock()
-                .socket
                 .connect(cx, to_smoltcp_endpoint(remote), to_smoltcp_endpoint(local))
                 .map_err(|error| match error {
                     tcp::ConnectError::InvalidState => RawTcpSocketError::InvalidState,
@@ -358,17 +417,16 @@ impl RawTcpSocket {
     }
 
     pub fn protocol_state(&self) -> tcp::State {
-        self.inner.lock().socket.state()
+        self.socket.lock().state()
     }
 
     pub fn protocol_runtime_state(&self) -> RawTcpProtocolState {
-        self.inner.lock().protocol_state
+        *self.protocol_state.lock()
     }
 
     pub fn dispatch_segment(&self) -> Option<SmoltcpTcpSegment> {
         with_context(|cx| {
-            let inner = &mut *self.inner.lock();
-            let socket = &mut inner.socket;
+            let mut socket = self.socket.lock();
             let mut segment = None;
             let result = socket.dispatch(cx, |_, (ip_repr, tcp_repr)| {
                 segment = Some(SmoltcpTcpSegment::from_reprs(ip_repr, tcp_repr));
@@ -377,27 +435,33 @@ impl RawTcpSocket {
             if result.is_err() {
                 return None;
             }
-            segment
+            let segment = segment?;
+            self.remember_syn_ack(&segment);
+            Some(segment)
         })
+    }
+
+    pub fn retransmit_syn_ack_segment(&self) -> Option<SmoltcpTcpSegment> {
+        self.last_syn_ack.lock().clone()
     }
 
     pub fn process_segment(&self, segment: &SmoltcpTcpSegment) -> SmoltcpTcpProcessPublish {
         with_context(|cx| {
-            let inner = &mut *self.inner.lock();
-            let before = observe_socket(&inner.socket);
+            let mut socket = self.socket.lock();
+            let before = observe_socket(&socket);
             let tcp_repr = segment.tcp.as_repr(&segment.payload);
-            let _reply = if inner.socket.accepts(cx, &segment.ip_repr, &tcp_repr) {
-                inner.socket.process(cx, &segment.ip_repr, &tcp_repr)
+            let _reply = if socket.accepts(cx, &segment.ip_repr, &tcp_repr) {
+                socket.process(cx, &segment.ip_repr, &tcp_repr)
             } else {
                 None
             };
-            let after = observe_socket(&inner.socket);
-            let protocol_state = &mut inner.protocol_state;
+            let after = observe_socket(&socket);
+            drop(socket);
+
+            let mut protocol_state = self.protocol_state.lock();
             let mut publish = SmoltcpTcpProcessPublish::default();
-            // Edge-detect "just became connected" from the smoltcp state
-            // itself: TCP never re-enters the active set without a reset,
-            // so this fires exactly once per connection.
-            if !before.is_active && after.is_active {
+            if !protocol_state.has_connected && after.is_active {
+                protocol_state.has_connected = true;
                 publish.connected = true;
             }
             if before.can_send != after.can_send && after.can_send {
@@ -421,59 +485,53 @@ impl RawTcpSocket {
         })
     }
 
-}
+    pub fn drain_protocol_recv_to_staging(&self) -> bool {
+        let mut became_readable = false;
+        let mut scratch = [0u8; 1024];
 
-/// Space = smoltcp tx ring headroom minus corked (not-yet-committed)
-/// bytes, which will need ring space when flushed.
-fn send_available_inner(inner: &TcpInner) -> usize {
-    if inner.socket.may_send() {
-        inner
-            .socket
-            .send_capacity()
-            .saturating_sub(inner.socket.send_queue())
-            .saturating_sub(inner.corked_tx.len())
-    } else {
-        0
-    }
-}
-
-fn flush_corked_inner(inner: &mut TcpInner) -> usize {
-    if inner.corked_tx.is_empty() {
-        return 0;
-    }
-    let bytes = core::mem::take(&mut inner.corked_tx);
-
-    let accepted = match inner.socket.send_slice(&bytes) {
-        Ok(accepted) => accepted,
-        Err(_) => {
-            prepend_corked_inner(inner, &bytes);
-            return 0;
+        loop {
+            let read = {
+                let mut socket = self.socket.lock();
+                if !socket.can_recv() {
+                    0
+                } else {
+                    socket.recv_slice(&mut scratch).unwrap_or_default()
+                }
+            };
+            if read == 0 {
+                break;
+            }
+            became_readable |= self.ingest_rx_bytes(&scratch[..read]);
         }
-    };
-    if accepted == 0 {
-        prepend_corked_inner(inner, &bytes);
-        return 0;
+
+        became_readable
     }
 
-    if accepted < bytes.len() {
-        prepend_corked_inner(inner, &bytes[accepted..]);
-    }
-    accepted
-}
-
-fn prepend_corked_inner(inner: &mut TcpInner, bytes: &[u8]) {
-    if bytes.is_empty() {
-        return;
-    }
-    if inner.corked_tx.is_empty() {
-        inner.corked_tx.extend_from_slice(bytes);
-        return;
+    fn enqueue_protocol_tx_bytes(&self, bytes: &[u8]) -> Result<usize, tcp::SendError> {
+        self.socket.lock().send_slice(bytes)
     }
 
-    let mut combined = Vec::with_capacity(bytes.len() + inner.corked_tx.len());
-    combined.extend_from_slice(bytes);
-    combined.extend(inner.corked_tx.iter().copied());
-    inner.corked_tx = combined;
+    fn prepend_corked_tx(&self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let mut corked = self.corked_tx.lock();
+        if corked.is_empty() {
+            corked.extend_from_slice(bytes);
+            return;
+        }
+
+        let mut combined = Vec::with_capacity(bytes.len() + corked.len());
+        combined.extend_from_slice(bytes);
+        combined.extend(corked.iter().copied());
+        *corked = combined;
+    }
+
+    fn remember_syn_ack(&self, segment: &SmoltcpTcpSegment) {
+        if segment.tcp.control == TcpControl::Syn && segment.tcp.ack_number.is_some() {
+            *self.last_syn_ack.lock() = Some(segment.clone());
+        }
+    }
 }
 
 fn new_smoltcp_tcp_socket(
@@ -481,9 +539,8 @@ fn new_smoltcp_tcp_socket(
     send_capacity: usize,
     options: &SocketOptionSet,
 ) -> tcp::Socket<'static> {
-    // R2d: clamp the actual ring backing (reported capacity is unchanged).
-    let rx_buf = tcp::SocketBuffer::new(vec![0u8; tcp_backing_bytes(recv_capacity)]);
-    let tx_buf = tcp::SocketBuffer::new(vec![0u8; tcp_backing_bytes(send_capacity)]);
+    let rx_buf = tcp::SocketBuffer::new(vec![0u8; recv_capacity]);
+    let tx_buf = tcp::SocketBuffer::new(vec![0u8; send_capacity]);
     let mut socket = tcp::Socket::new(rx_buf, tx_buf);
 
     socket.set_nagle_enabled(!options.tcp.nodelay);
@@ -652,25 +709,14 @@ fn observe_socket(socket: &tcp::Socket<'_>) -> SocketProtocolObservation {
     }
 }
 
-// Single-netns skeleton: one persistent Interface acting only as the
-// `Context` provider (checksum caps + `now`). Lock order is CONTEXT_IFACE
-// outer, `self.socket` inner at every call site. Per-netns Interfaces are a
-// later phase (REFACTOR_PLAN_A_v2 P5).
-static CONTEXT_IFACE: SpinMutex<Option<Interface>> = SpinMutex::new(None);
-
-pub(crate) fn with_context<R>(f: impl FnOnce(&mut smoltcp::iface::Context) -> R) -> R {
-    let mut slot = CONTEXT_IFACE.lock();
-    let iface = slot.get_or_insert_with(|| {
-        let mut device = Loopback::new(Medium::Ip);
-        Interface::new(
-            Config::new(HardwareAddress::Ip),
-            &mut device,
-            smoltcp::time::Instant::ZERO,
-        )
-    });
-    let cx = iface.context();
-    cx.now = net_now_instant();
-    f(cx)
+fn with_context<R>(f: impl FnOnce(&mut smoltcp::iface::Context) -> R) -> R {
+    let mut device = Loopback::new(Medium::Ip);
+    let mut iface = Interface::new(
+        Config::new(HardwareAddress::Ip),
+        &mut device,
+        smoltcp::time::Instant::ZERO,
+    );
+    f(iface.context())
 }
 
 fn to_smoltcp_endpoint(endpoint: IpEndpoint) -> SmoltcpIpEndpoint {

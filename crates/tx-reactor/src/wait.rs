@@ -7,14 +7,16 @@ use core::{
 };
 
 use crate::adapter::bus_wire::{
-    DeclaredPort, DeclaredPortSubscription, DeclaredQueue, DeclaredQueueSubscription,
-    DeclaredWireError, RawPort, RawPortSubscription, WireDeclaration, WireDeclarationError,
-    WireEventSet,
+    ActiveWait, DeclaredPort, DeclaredPortSubscription, DeclaredQueue, DeclaredQueueSubscription,
+    DeclaredWireError, InterestMask, MailboxEvent, MailboxPollAction, RawPort, RawPortSubscription,
+    TaskMailbox, WaitSourceId, WireDeclaration, WireDeclarationError, WireEventSet,
 };
 use crate::interrupt::{InterruptSource, NoInterrupts};
-use crate::timer::{DeadlineFuture, TimerQueue};
 use alloc::sync::Arc;
-use tx_substrate::wake::mailbox::TaskMailbox;
+use tx_services::time::{
+    DeadlineNs, DeadlineRegistrar, DeadlineRegistrarHandle, TimerGuard, TimerRole, TimerTarget,
+    TimerToken,
+};
 
 /// Bit mask naming the wait events a task cares about on a channel.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -106,19 +108,19 @@ pub enum WaitOutcome {
 #[derive(Clone)]
 pub struct Channel {
     port: RawPort,
-    timers: Option<TimerQueue>,
+    timer_registrar: Option<DeadlineRegistrarHandle>,
 }
 
 /// Reactor wait channel backed by a typed declared bus port.
 pub struct DeclaredChannel<E> {
     port: DeclaredPort<E>,
-    timers: Option<TimerQueue>,
+    timer_registrar: Option<DeadlineRegistrarHandle>,
 }
 
 /// Reactor wait channel backed by a typed declared bus readiness queue.
 pub struct DeclaredReadinessChannel<E> {
     queue: DeclaredQueue<E>,
-    timers: Option<TimerQueue>,
+    timer_registrar: Option<DeadlineRegistrarHandle>,
 }
 
 /// Future returned by `Channel::wait`.
@@ -126,7 +128,8 @@ pub struct WaitFuture {
     channel: Channel,
     mask: Mask,
     subscription: Option<RawPortSubscription>,
-    mailbox: Arc<TaskMailbox>,
+    mailbox: Option<Arc<TaskMailbox>>,
+    active: Option<ActiveWait>,
 }
 
 /// Future returned by `DeclaredChannel::wait`.
@@ -134,7 +137,8 @@ pub struct DeclaredWaitFuture<E> {
     channel: DeclaredChannel<E>,
     interest: E,
     subscription: Option<DeclaredPortSubscription<E>>,
-    mailbox: Arc<TaskMailbox>,
+    mailbox: Option<Arc<TaskMailbox>>,
+    active: Option<ActiveWait>,
 }
 
 /// Future returned by `DeclaredReadinessChannel::wait`.
@@ -142,7 +146,8 @@ pub struct DeclaredReadinessWaitFuture<E> {
     channel: DeclaredReadinessChannel<E>,
     interest: E,
     subscription: Option<DeclaredQueueSubscription<E>>,
-    mailbox: Arc<TaskMailbox>,
+    mailbox: Option<Arc<TaskMailbox>>,
+    active: Option<ActiveWait>,
 }
 
 /// Future returned by `Channel::wait_event`.
@@ -153,7 +158,7 @@ pub struct WaitEventFuture<C, I = NoInterrupts> {
     interrupts: I,
     condition: C,
     wait: Option<WaitFuture>,
-    timer: Option<DeadlineFuture>,
+    timer: Option<ProtocolTimer>,
 }
 
 /// Future returned by `DeclaredChannel::wait_event`.
@@ -164,7 +169,7 @@ pub struct DeclaredWaitEventFuture<E, C, I = NoInterrupts> {
     interrupts: I,
     condition: C,
     wait: Option<DeclaredWaitFuture<E>>,
-    timer: Option<DeadlineFuture>,
+    timer: Option<ProtocolTimer>,
 }
 
 /// Future returned by `DeclaredReadinessChannel::wait_event`.
@@ -175,26 +180,111 @@ pub struct DeclaredReadinessWaitEventFuture<E, C, I = NoInterrupts> {
     interrupts: I,
     condition: C,
     wait: Option<DeclaredReadinessWaitFuture<E>>,
-    timer: Option<DeadlineFuture>,
+    timer: Option<ProtocolTimer>,
+}
+
+struct ProtocolTimer {
+    registrar: DeadlineRegistrarHandle,
+    deadline_ns: u64,
+    mailbox: Option<Arc<TaskMailbox>>,
+    guard: Option<TimerGuard>,
+    token: Option<TimerToken>,
+}
+
+impl ProtocolTimer {
+    fn new(registrar: DeadlineRegistrarHandle, deadline_ns: u64) -> Self {
+        Self {
+            registrar,
+            deadline_ns,
+            mailbox: None,
+            guard: None,
+            token: None,
+        }
+    }
+
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<WaitOutcome> {
+        let mailbox = ensure_wait_mailbox(&mut self.mailbox, cx);
+        if self.guard.is_none() {
+            let guard = self
+                .registrar
+                .register_deadline(
+                    DeadlineNs::new(self.deadline_ns),
+                    TimerRole::DeadlineAbort,
+                    TimerTarget::TaskMailbox(Arc::downgrade(&mailbox)),
+                )
+                .expect("reactor wait deadline registration failed");
+            self.token = Some(guard.token());
+            self.guard = Some(guard);
+        }
+
+        if mailbox
+            .poll_select(|event| match event {
+                MailboxEvent::TimerFired { token } if Some(*token) == self.token => {
+                    MailboxPollAction::Take
+                }
+                _ => MailboxPollAction::Keep,
+            })
+            .is_some()
+        {
+            self.guard = None;
+            self.token = None;
+            return Poll::Ready(WaitOutcome::TimedOut);
+        }
+
+        Poll::Pending
+    }
+}
+
+fn ensure_wait_mailbox(
+    mailbox: &mut Option<Arc<TaskMailbox>>,
+    cx: &mut Context<'_>,
+) -> Arc<TaskMailbox> {
+    let mailbox = mailbox
+        .get_or_insert_with(|| {
+            crate::task::current_poll_task_mailbox().unwrap_or_else(|| Arc::new(TaskMailbox::new()))
+        })
+        .clone();
+    mailbox.register_waker(cx.waker().clone());
+    mailbox
+}
+
+fn active_wait_for(
+    source: WaitSourceId,
+    generation: crate::WaitGeneration,
+    interests: u64,
+) -> ActiveWait {
+    ActiveWait::new(generation, source, InterestMask::new(interests))
+}
+
+fn source_wait_poll_action(active: ActiveWait, event: &MailboxEvent) -> MailboxPollAction {
+    match event {
+        MailboxEvent::SourceFired {
+            source, generation, ..
+        } if *source == active.source && *generation != active.generation => {
+            MailboxPollAction::Drop
+        }
+        event if active.matches(event) => MailboxPollAction::Take,
+        _ => MailboxPollAction::Keep,
+    }
 }
 
 impl Channel {
     /// Creates an event-only wait channel.
     ///
     /// Timeout-capable wait channels are produced by `Reactor::channel()`
-    /// so they share the reactor's deadline queue and clock source.
+    /// so they share the reactor's timer registry.
     pub fn new() -> Self {
         Self {
             port: RawPort::new(),
-            timers: None,
+            timer_registrar: None,
         }
     }
 
-    /// Creates a channel wired to a reactor-owned timer queue.
-    pub(crate) fn with_timer_queue(timers: TimerQueue) -> Self {
+    /// Creates a channel wired to a reactor-owned timer registry.
+    pub(crate) fn with_deadline_registrar(timer_registrar: DeadlineRegistrarHandle) -> Self {
         Self {
             port: RawPort::new(),
-            timers: Some(timers),
+            timer_registrar: Some(timer_registrar),
         }
     }
 
@@ -203,7 +293,8 @@ impl Channel {
             channel: self.clone(),
             mask,
             subscription: None,
-            mailbox: Arc::new(TaskMailbox::new()),
+            mailbox: None,
+            active: None,
         }
     }
 
@@ -247,6 +338,25 @@ impl Channel {
         }
         self.port.fire(mask.bits())
     }
+
+    pub fn try_fire_with_post<F>(&self, mask: Mask, post: F) -> Result<usize, DeclaredWireError>
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+    {
+        if mask.is_empty() {
+            return Ok(0);
+        }
+        self.port
+            .try_fire_with_post(mask.bits(), post)
+            .map_err(DeclaredWireError::from)
+    }
+
+    pub fn fire_with_post<F>(&self, mask: Mask, post: F) -> usize
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+    {
+        self.try_fire_with_post(mask, post).unwrap_or(0)
+    }
 }
 
 /// Fire a legacy wait `Channel` with a raw mask value, returning the
@@ -273,23 +383,29 @@ where
 
     /// Creates an event-only wait channel over an existing declared bus port.
     pub fn from_port(port: DeclaredPort<E>) -> Self {
-        Self { port, timers: None }
+        Self {
+            port,
+            timer_registrar: None,
+        }
     }
 
-    pub(crate) fn with_timer_queue(
+    pub(crate) fn with_deadline_registrar(
         declaration: WireDeclaration<E>,
-        timers: TimerQueue,
+        timer_registrar: DeadlineRegistrarHandle,
     ) -> Result<Self, WireDeclarationError> {
-        Ok(Self::from_port_with_timer_queue(
+        Ok(Self::from_port_with_deadline_registrar(
             DeclaredPort::new(declaration)?,
-            timers,
+            timer_registrar,
         ))
     }
 
-    pub(crate) fn from_port_with_timer_queue(port: DeclaredPort<E>, timers: TimerQueue) -> Self {
+    pub(crate) fn from_port_with_deadline_registrar(
+        port: DeclaredPort<E>,
+        timer_registrar: DeadlineRegistrarHandle,
+    ) -> Self {
         Self {
             port,
-            timers: Some(timers),
+            timer_registrar: Some(timer_registrar),
         }
     }
 
@@ -307,7 +423,8 @@ where
             channel: self.clone(),
             interest,
             subscription: None,
-            mailbox: Arc::new(TaskMailbox::new()),
+            mailbox: None,
+            active: None,
         })
     }
 
@@ -383,6 +500,20 @@ where
         self.port.try_fire(event)
     }
 
+    pub fn try_fire_with_post<F>(&self, event: E, post: F) -> Result<usize, DeclaredWireError>
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+    {
+        self.port.try_fire_with_post(event, post)
+    }
+
+    pub fn fire_with_post<F>(&self, event: E, post: F) -> usize
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+    {
+        self.try_fire_with_post(event, post).unwrap_or(0)
+    }
+
     pub fn fire(&self, event: E) -> usize {
         self.port.fire(event)
     }
@@ -392,7 +523,7 @@ impl<E> Clone for DeclaredChannel<E> {
     fn clone(&self) -> Self {
         Self {
             port: self.port.clone(),
-            timers: self.timers.clone(),
+            timer_registrar: self.timer_registrar.clone(),
         }
     }
 }
@@ -414,24 +545,27 @@ where
     pub fn from_queue(queue: DeclaredQueue<E>) -> Self {
         Self {
             queue,
-            timers: None,
+            timer_registrar: None,
         }
     }
 
-    pub(crate) fn with_timer_queue(
+    pub(crate) fn with_deadline_registrar(
         declaration: WireDeclaration<E>,
-        timers: TimerQueue,
+        timer_registrar: DeadlineRegistrarHandle,
     ) -> Result<Self, WireDeclarationError> {
-        Ok(Self::from_queue_with_timer_queue(
+        Ok(Self::from_queue_with_deadline_registrar(
             DeclaredQueue::new(declaration)?,
-            timers,
+            timer_registrar,
         ))
     }
 
-    pub(crate) fn from_queue_with_timer_queue(queue: DeclaredQueue<E>, timers: TimerQueue) -> Self {
+    pub(crate) fn from_queue_with_deadline_registrar(
+        queue: DeclaredQueue<E>,
+        timer_registrar: DeadlineRegistrarHandle,
+    ) -> Self {
         Self {
             queue,
-            timers: Some(timers),
+            timer_registrar: Some(timer_registrar),
         }
     }
 
@@ -452,7 +586,8 @@ where
             channel: self.clone(),
             interest,
             subscription: None,
-            mailbox: Arc::new(TaskMailbox::new()),
+            mailbox: None,
+            active: None,
         })
     }
 
@@ -528,6 +663,20 @@ where
         self.queue.try_fire(event)
     }
 
+    pub fn try_fire_with_post<F>(&self, event: E, post: F) -> Result<usize, DeclaredWireError>
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+    {
+        self.queue.try_fire_with_post(event, post)
+    }
+
+    pub fn fire_with_post<F>(&self, event: E, post: F) -> usize
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+    {
+        self.try_fire_with_post(event, post).unwrap_or(0)
+    }
+
     pub fn fire(&self, event: E) -> usize {
         self.queue.fire(event)
     }
@@ -549,7 +698,7 @@ impl<E> Clone for DeclaredReadinessChannel<E> {
     fn clone(&self) -> Self {
         Self {
             queue: self.queue.clone(),
-            timers: self.timers.clone(),
+            timer_registrar: self.timer_registrar.clone(),
         }
     }
 }
@@ -568,30 +717,41 @@ impl Future for WaitFuture {
         if this.mask.is_empty() {
             return Poll::Ready(WaitOutcome::Ready);
         }
+        let mailbox = ensure_wait_mailbox(&mut this.mailbox, cx);
 
         let ready = if let Some(subscription) = this.subscription.as_mut() {
-            if this.mailbox.poll().is_some() {
+            if this
+                .active
+                .and_then(|active| {
+                    mailbox.poll_select(|event| source_wait_poll_action(active, event))
+                })
+                .is_some()
+            {
                 true
             } else {
-                subscription.update(
-                    this.mask.bits(),
-                    Arc::downgrade(&this.mailbox),
-                    this.mailbox.next_generation(),
-                );
+                let generation = mailbox.next_generation();
+                let active =
+                    active_wait_for(this.channel.port.source_id(), generation, this.mask.bits());
+                subscription.update(this.mask.bits(), Arc::downgrade(&mailbox), generation);
+                this.active = Some(active);
                 false
             }
         } else {
-            this.mailbox.register_waker(cx.waker().clone());
+            let generation = mailbox.next_generation();
+            let active =
+                active_wait_for(this.channel.port.source_id(), generation, this.mask.bits());
             this.subscription = Some(this.channel.port.subscribe(
                 this.mask.bits(),
-                Arc::downgrade(&this.mailbox),
-                this.mailbox.next_generation(),
+                Arc::downgrade(&mailbox),
+                generation,
             ));
+            this.active = Some(active);
             false
         };
 
         if ready {
             this.subscription = None;
+            this.active = None;
             return Poll::Ready(WaitOutcome::Ready);
         }
 
@@ -602,6 +762,7 @@ impl Future for WaitFuture {
 impl Drop for WaitFuture {
     fn drop(&mut self) {
         self.subscription = None;
+        self.active = None;
     }
 }
 
@@ -618,30 +779,47 @@ where
         if this.interest.bits() == 0 {
             return Poll::Ready(WaitOutcome::Ready);
         }
+        let mailbox = ensure_wait_mailbox(&mut this.mailbox, cx);
 
         let ready = if let Some(subscription) = this.subscription.as_mut() {
-            if this.mailbox.poll().is_some() {
+            if this
+                .active
+                .and_then(|active| {
+                    mailbox.poll_select(|event| source_wait_poll_action(active, event))
+                })
+                .is_some()
+            {
                 true
             } else {
-                subscription.update(
-                    this.interest,
-                    Arc::downgrade(&this.mailbox),
-                    this.mailbox.next_generation(),
+                let generation = mailbox.next_generation();
+                let active = active_wait_for(
+                    this.channel.port.raw().source_id(),
+                    generation,
+                    this.interest.bits(),
                 );
+                subscription.update(this.interest, Arc::downgrade(&mailbox), generation);
+                this.active = Some(active);
                 false
             }
         } else {
-            this.mailbox.register_waker(cx.waker().clone());
+            let generation = mailbox.next_generation();
+            let active = active_wait_for(
+                this.channel.port.raw().source_id(),
+                generation,
+                this.interest.bits(),
+            );
             this.subscription = Some(this.channel.port.subscribe(
                 this.interest,
-                Arc::downgrade(&this.mailbox),
-                this.mailbox.next_generation(),
+                Arc::downgrade(&mailbox),
+                generation,
             ));
+            this.active = Some(active);
             false
         };
 
         if ready {
             this.subscription = None;
+            this.active = None;
             return Poll::Ready(WaitOutcome::Ready);
         }
 
@@ -652,6 +830,7 @@ where
 impl<E> Drop for DeclaredWaitFuture<E> {
     fn drop(&mut self) {
         self.subscription = None;
+        self.active = None;
     }
 }
 
@@ -668,30 +847,47 @@ where
         if this.interest.bits() == 0 {
             return Poll::Ready(WaitOutcome::Ready);
         }
+        let mailbox = ensure_wait_mailbox(&mut this.mailbox, cx);
 
         let ready = if let Some(subscription) = this.subscription.as_mut() {
-            if this.mailbox.poll().is_some() {
+            if this
+                .active
+                .and_then(|active| {
+                    mailbox.poll_select(|event| source_wait_poll_action(active, event))
+                })
+                .is_some()
+            {
                 true
             } else {
-                subscription.update(
-                    this.interest,
-                    Arc::downgrade(&this.mailbox),
-                    this.mailbox.next_generation(),
+                let generation = mailbox.next_generation();
+                let active = active_wait_for(
+                    this.channel.queue.raw().source_id(),
+                    generation,
+                    this.interest.bits(),
                 );
+                subscription.update(this.interest, Arc::downgrade(&mailbox), generation);
+                this.active = Some(active);
                 false
             }
         } else {
-            this.mailbox.register_waker(cx.waker().clone());
+            let generation = mailbox.next_generation();
+            let active = active_wait_for(
+                this.channel.queue.raw().source_id(),
+                generation,
+                this.interest.bits(),
+            );
             this.subscription = Some(this.channel.queue.subscribe(
                 this.interest,
-                Arc::downgrade(&this.mailbox),
-                this.mailbox.next_generation(),
+                Arc::downgrade(&mailbox),
+                generation,
             ));
+            this.active = Some(active);
             false
         };
 
         if ready {
             this.subscription = None;
+            this.active = None;
             return Poll::Ready(WaitOutcome::Ready);
         }
 
@@ -702,6 +898,7 @@ where
 impl<E> Drop for DeclaredReadinessWaitFuture<E> {
     fn drop(&mut self) {
         self.subscription = None;
+        self.active = None;
     }
 }
 
@@ -733,11 +930,11 @@ where
             }
 
             if let Some(deadline_ns) = deadline_ns {
-                if let Some(timers) = this.channel.timers.as_ref() {
-                    let timer = this
-                        .timer
-                        .get_or_insert_with(|| timers.wait_until(deadline_ns));
-                    if Pin::new(timer).poll(cx).is_ready() {
+                if let Some(timer_registrar) = this.channel.timer_registrar.as_ref() {
+                    let timer = this.timer.get_or_insert_with(|| {
+                        ProtocolTimer::new(timer_registrar.clone(), deadline_ns)
+                    });
+                    if timer.poll(cx).is_ready() {
                         this.wait = None;
                         this.timer = None;
                         return Poll::Ready(WaitOutcome::TimedOut);
@@ -820,11 +1017,11 @@ where
             }
 
             if let Some(deadline_ns) = deadline_ns {
-                if let Some(timers) = this.channel.timers.as_ref() {
-                    let timer = this
-                        .timer
-                        .get_or_insert_with(|| timers.wait_until(deadline_ns));
-                    if Pin::new(timer).poll(cx).is_ready() {
+                if let Some(timer_registrar) = this.channel.timer_registrar.as_ref() {
+                    let timer = this.timer.get_or_insert_with(|| {
+                        ProtocolTimer::new(timer_registrar.clone(), deadline_ns)
+                    });
+                    if timer.poll(cx).is_ready() {
                         this.wait = None;
                         this.timer = None;
                         return Poll::Ready(WaitOutcome::TimedOut);
@@ -907,11 +1104,11 @@ where
             }
 
             if let Some(deadline_ns) = deadline_ns {
-                if let Some(timers) = this.channel.timers.as_ref() {
-                    let timer = this
-                        .timer
-                        .get_or_insert_with(|| timers.wait_until(deadline_ns));
-                    if Pin::new(timer).poll(cx).is_ready() {
+                if let Some(timer_registrar) = this.channel.timer_registrar.as_ref() {
+                    let timer = this.timer.get_or_insert_with(|| {
+                        ProtocolTimer::new(timer_registrar.clone(), deadline_ns)
+                    });
+                    if timer.poll(cx).is_ready() {
                         this.wait = None;
                         this.timer = None;
                         return Poll::Ready(WaitOutcome::TimedOut);

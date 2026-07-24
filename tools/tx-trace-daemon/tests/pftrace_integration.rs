@@ -119,7 +119,7 @@ fn make_trace_file(records: &[Vec<u8>]) -> Vec<u8> {
     buf
 }
 
-// ── Minimal Perfetto proto decode types (mirroring src/perfetto/proto.rs) ────
+// ── Minimal Perfetto proto decode types (mirroring src/l6_views/perfetto/proto.rs) ────
 
 #[derive(Clone, PartialEq, prost::Message)]
 struct Trace {

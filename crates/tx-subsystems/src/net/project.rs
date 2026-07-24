@@ -174,51 +174,6 @@ pub fn proc_net_route_snapshot_text(netns: &NetNamespacePayload) -> String {
     out
 }
 
-/// `/proc/net/ipv6_route` — the kernel IPv6 FIB in its native format, one line
-/// per route, no header, space-separated lowercase hex without `0x`:
-/// `<dst 32hex> <dstplen 2hex> <src 32hex> <srcplen 2hex> <nexthop 32hex>
-///  <metric 8hex> <refcnt 8hex> <use 8hex> <flags 8hex> <devname>`.
-/// `ip -6 route` parses this; the address fields are the 16 bytes rendered as
-/// 32 hex chars. Only RTF_UP (0x1) and RTF_GATEWAY (0x2) flags are modeled.
-pub fn proc_net_ipv6_route_snapshot_text(netns: &NetNamespacePayload) -> String {
-    let mut out = String::new();
-    for route in netns.route6_snapshot() {
-        let devname = route.oif_name.unwrap_or("*");
-        let mut flags: u32 = 0x0000_0001;
-        let nexthop = if let Some(gateway) = route.gateway {
-            flags |= 0x0000_0002;
-            gateway
-        } else {
-            Ipv6Address::UNSPECIFIED
-        };
-        let _ = writeln!(
-            out,
-            "{} {:02x} {} {:02x} {} {:08x} {:08x} {:08x} {:08x} {}",
-            proc_ipv6_route_hex(route.dst),
-            route.prefix_len,
-            proc_ipv6_route_hex(Ipv6Address::UNSPECIFIED),
-            0u8,
-            proc_ipv6_route_hex(nexthop),
-            0u32,
-            0u32,
-            0u32,
-            flags,
-            devname,
-        );
-    }
-    out
-}
-
-/// Render an IPv6 address as 32 lowercase hex chars (the 16 octets concatenated,
-/// no separators), matching the `/proc/net/ipv6_route` address column format.
-fn proc_ipv6_route_hex(addr: Ipv6Address) -> String {
-    let mut out = String::new();
-    for byte in addr.octets() {
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
-}
-
 pub fn proc_net_netfilter_rules_text() -> String {
     let netns = crate::net::namespace::initial_net_namespace_payload();
     proc_net_netfilter_rules_text_for_namespace(&netns)

@@ -34,16 +34,17 @@
 //! 5. **Framework reusability.** The SQPOLL kthread is constructed
 //!    from substrate's `step_v3::with_on_behalf_of` **as-is** — no
 //!    new framework primitive is added. The scaffold's
-//!    [`tx_subsystems::io_uring::spawn_sqpoll_worker`] is a
-//!    row-for-row clone of
-//!    [`tx_subsystems::aio::spawn_worker_for_context`] with the
-//!    `AioContext` cap swapped for an `IoUring` cap and the dispatcher
-//!    parameter removed (phase 0 has no dispatcher). The fact that
-//!    these tests pass with that minimal delta is the evidence W-W's
+//!    [`tx_subsystems::io_uring::spawn_sqpoll_worker_with_completion_post`]
+//!    is a row-for-row clone of
+//!    [`tx_subsystems::aio::spawn_worker_for_context_with_completion_post`]
+//!    with the `AioContext` cap swapped for an `IoUring` cap and the
+//!    dispatcher parameter removed (phase 0 has no dispatcher). The fact
+//!    that these tests pass with that minimal delta is the evidence W-W's
 //!    "zero additional framework work" prediction holds.
 
 extern crate alloc;
 
+use alloc::sync::Arc;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
@@ -51,14 +52,18 @@ use core::task::{Context, Poll, Waker};
 use std::sync::{LazyLock, Mutex};
 
 use tx_hal::{
-    Arch, Asid, EntropyIf, PhysAddr, PlatformConfig, PmapError, PmapIf, PmapPermissions,
-    PmapReservation, PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, TimeIf, VirtAddr,
+    Arch, Asid, DeadlineTimerIf, EntropyIf, MonotonicCounterIf, PhysAddr, PlatformConfig,
+    PmapError, PmapIf, PmapPermissions, PmapReservation, PmapReserveKind, PmapRoot,
+    PmapUnmapResult, PtNode, VirtAddr,
 };
 use tx_shims::adapter::reactor_entry::SyscallRequest;
 use tx_shims::adapter::step_engine::{CancelReason, Cap, OnBehalfOfAbort};
+use tx_substrate::step::InterestMask;
+use tx_substrate::wake::{MailboxEvent, TaskMailbox};
 use tx_subsystems::cross_crate_test_support::{
     reset_init_process, reset_pid_counter, reset_tid_counter,
 };
+use tx_subsystems::io_uring::notification::CQE_AVAILABLE;
 use tx_subsystems::io_uring::{reset_ring_id_counter_for_test, SqeStub, SqpollWorkerFuture};
 use tx_subsystems::process::{bootstrap_init_process, ProcessIdentity};
 use tx_subsystems::thread_runtime::ThreadIdentity;
@@ -132,20 +137,34 @@ impl tx_hal::ConsoleIf for StubPmap {
 }
 impl tx_hal::SmpIf for StubPmap {}
 
-impl TimeIf for StubPmap {
+impl MonotonicCounterIf for StubPmap {
     fn read_ns() -> u64 {
         0
     }
-    fn set_deadline_ns(_deadline: u64) {}
-    fn cancel_deadline() {}
+
     fn frequency_hz() -> u64 {
         1_000_000_000
     }
 }
 
+impl DeadlineTimerIf for StubPmap {
+    fn set_deadline_ns(_deadline: u64) {}
+
+    fn cancel_deadline() {}
+}
+
+impl tx_hal::PersistentClockIf for StubPmap {}
+
 // -------- Setup -----------------------------------------------------
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
+static SQPOLL_REF_POST_COUNT: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+fn counting_sqpoll_ref_post(mailbox: &TaskMailbox, event: MailboxEvent) -> bool {
+    SQPOLL_REF_POST_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    mailbox.post(event)
+}
 
 fn setup() -> std::sync::MutexGuard<'static, ()> {
     let guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -338,9 +357,10 @@ fn io_uring_setup_spawns_one_sqpoll_worker_per_ring() {
 #[test]
 fn sqpoll_kthread_observes_pushed_sqe_within_bounded_ticks() {
     let _g = setup();
+    SQPOLL_REF_POST_COUNT.store(0, core::sync::atomic::Ordering::Release);
     let proc_cap = bootstrap_init_process(fresh_aspace()).expect("bootstrap");
     let thread = first_thread(&proc_cap);
-    let ctx = make_ctx(proc_cap.clone(), thread);
+    let ctx = make_ctx(proc_cap.clone(), thread).with_mailbox_ref_post(counting_sqpoll_ref_post);
 
     let fd = match dispatch_io_uring_setup(&ctx, 4) {
         SyscallResult::Return(n) => n as u32,
@@ -354,6 +374,17 @@ fn sqpoll_kthread_observes_pushed_sqe_within_bounded_ticks() {
         .clone();
     let worker = take_io_uring_worker_for_test(ring.ring_id())
         .expect("SQPOLL kthread future stashed by io_uring_setup");
+    let mailbox = Arc::new(TaskMailbox::new());
+    let generation = mailbox.next_generation();
+    let _sub = ring
+        .cqe_available_source()
+        .prepare(
+            Arc::downgrade(&mailbox),
+            generation,
+            InterestMask::new(CQE_AVAILABLE),
+        )
+        .install();
+    let cqe_source = ring.cqe_available_id();
 
     // Push a single SQE through the scaffold's test helper. Production
     // phase 1 will dequeue from the user-mmapped SQ ring instead.
@@ -367,6 +398,26 @@ fn sqpoll_kthread_observes_pushed_sqe_within_bounded_ticks() {
     pump_worker_until(worker, |_| ring.dispatched() >= 1, 64);
     assert_eq!(ring.dispatched(), 1, "kthread body observed one SQE");
     assert_eq!(ring.sq_len(), 0, "kthread drained the SQ ring");
+    assert_eq!(ring.cq_len(), 1, "kthread published one scaffold CQE");
+    assert_eq!(
+        SQPOLL_REF_POST_COUNT.load(core::sync::atomic::Ordering::Acquire),
+        1,
+        "SQPOLL completion publication should use the injected post"
+    );
+    let cqe = ring.pop_cqe().expect("worker produced cqe");
+    assert_eq!(cqe.user_data, 0xCAFE_BABE);
+    match mailbox.poll().expect("cqe source fired") {
+        MailboxEvent::SourceFired {
+            generation: seen_generation,
+            source,
+            interests,
+        } => {
+            assert_eq!(seen_generation, generation);
+            assert_eq!(source.raw(), cqe_source);
+            assert_eq!(interests.raw(), CQE_AVAILABLE);
+        }
+        other => panic!("expected cqe SourceFired, got {other:?}"),
+    }
 }
 
 /// Pin invariant 3 (multi-SQE) — pushing two SQEs in sequence both

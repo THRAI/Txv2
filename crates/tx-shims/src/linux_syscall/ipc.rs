@@ -2,17 +2,17 @@
 
 use super::{
     bootstrap_copy_from_user, bootstrap_copy_to_user, bootstrap_read_user, bootstrap_write_user,
-    errno_to_i32, read_user_cstr, ReadCStrError, SyscallCtx, SyscallResult, E2BIG_VALUE,
-    EBADF_VALUE, EFAULT_VALUE, EINVAL_VALUE, ENAMETOOLONG_VALUE, ENOENT_VALUE, ENOMEM_VALUE,
-    ENOSYS_VALUE, O_ACCMODE, O_CLOEXEC, O_CREAT, O_EXCL, O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY,
+    errno_to_i32, read_user_cstr, MailboxRefPostFn, MailboxRefPostWithHintFn, ReadCStrError,
+    SyscallCtx, SyscallResult, E2BIG_VALUE, EBADF_VALUE, EFAULT_VALUE, EINVAL_VALUE,
+    ENAMETOOLONG_VALUE, ENOENT_VALUE, ENOMEM_VALUE, ENOSYS_VALUE, O_ACCMODE, O_CLOEXEC, O_CREAT,
+    O_EXCL, O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY,
 };
-use crate::adapter::step_engine::{
-    Cap, InterestMask, NoProgress, ScriptCtx, StepOp, StepOutcome, WaitSourceId,
-};
+use crate::adapter::step_engine::{Cap, InterestMask, NoProgress, ScriptCtx, StepOp, StepOutcome};
 use alloc::vec::Vec;
-use tx_hal::TimeIf;
 use tx_scripts::drive;
+use tx_services::time::{timekeeper_clock, ClockRead, TimekeeperClock};
 use tx_substrate::step::{Deadline, DriveMode};
+use tx_substrate::wake::mailbox::MailboxSchedulerHint;
 use tx_subsystems::cred::Cred;
 use tx_subsystems::execution::Errno;
 use tx_subsystems::ipc;
@@ -200,6 +200,7 @@ fn read_mq_name(ctx: &SyscallCtx<'_>, name_ptr: u64) -> Result<Vec<u8>, SyscallR
     let name = match read_user_cstr(&ctx.aspace, name_ptr, MQ_NAME_MAX + 1) {
         Ok(name) => name,
         Err(ReadCStrError::TooLong) => return Err(SyscallResult::Error(ENAMETOOLONG_VALUE)),
+        Err(ReadCStrError::OutOfMemory) => return Err(SyscallResult::Error(ENOMEM_VALUE)),
         Err(ReadCStrError::Fault(errno)) => return Err(SyscallResult::error_from(errno)),
     };
     if name.is_empty() || name.contains(&b'/') {
@@ -261,12 +262,12 @@ async fn wait_for_mq_readiness(
     let Ok(info) = ipc::posix_mq::execution::step_mq_poll_info(mq) else {
         return;
     };
-    let source_id = if write {
-        info.write_source_id
+    let endpoint = if write {
+        &info.write_endpoint
     } else {
-        info.read_source_id
+        &info.read_endpoint
     };
-    super::await_wait_source(ctx, WaitSourceId::new(source_id), InterestMask::new(1)).await;
+    super::await_wait_endpoint(ctx, endpoint, InterestMask::new(1)).await;
 }
 
 fn validate_sem_timeout(ctx: &SyscallCtx<'_>, timeout_ptr: u64) -> Result<(), SyscallResult> {
@@ -340,6 +341,8 @@ struct SysvSemopWaitOp<'a> {
     sops: &'a [SemBuf],
     cred: &'a Cap<Cred>,
     process: &'a Cap<ProcessIdentity>,
+    post: Option<MailboxRefPostFn>,
+    post_with_hint: Option<MailboxRefPostWithHintFn>,
 }
 
 impl StepOp<ProcessIdentity> for SysvSemopWaitOp<'_> {
@@ -350,7 +353,21 @@ impl StepOp<ProcessIdentity> for SysvSemopWaitOp<'_> {
         &mut self,
         _ctx: &mut ScriptCtx<ProcessIdentity>,
     ) -> StepOutcome<Self::Output, Self::Progress> {
-        ipc::sysv_sem::execution::step_semop_v3(self.semid, self.sops, self.cred, self.process)
+        ipc::sysv_sem::execution::step_semop_v3_with_post(
+            self.semid,
+            self.sops,
+            self.cred,
+            self.process,
+            |mailbox, event| {
+                if let Some(post) = self.post_with_hint {
+                    return post(mailbox, event, MailboxSchedulerHint::Normal);
+                }
+                if let Some(post) = self.post {
+                    return post(mailbox, event);
+                }
+                mailbox.post(event)
+            },
+        )
     }
 }
 
@@ -370,13 +387,19 @@ async fn drive_semop(
         script_ctx = script_ctx.with_deadline(Deadline::from_raw(deadline_ns));
     }
     let mailbox_arc = script_ctx.mailbox().cloned();
-    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let timer_registrar_handle = script_ctx.timer_registrar().cloned();
     let delegate_registry_arc = script_ctx.delegate_registry().cloned();
 
     let can_drive_wait =
-        mailbox_arc.is_some() && (deadline_ns.is_none() || timer_wheel_arc.is_some());
+        mailbox_arc.is_some() && (deadline_ns.is_none() || timer_registrar_handle.is_some());
     if !can_drive_wait {
-        return match ipc::sysv_sem::execution::step_semop_v3(semid, sops, &cred, &ctx.process) {
+        return match ipc::sysv_sem::execution::step_semop_v3_with_post(
+            semid,
+            sops,
+            &cred,
+            &ctx.process,
+            |mailbox, event| ctx.post_mailbox_ref_event(mailbox, event),
+        ) {
             StepOutcome::Done(applied) => SyscallResult::Return(applied as i64),
             StepOutcome::Err(errno) => {
                 let errno: Errno = errno.into();
@@ -392,6 +415,8 @@ async fn drive_semop(
         sops,
         cred: &cred,
         process: &ctx.process,
+        post: ctx.mailbox_ref_post,
+        post_with_hint: ctx.mailbox_ref_post_with_hint,
     };
     match drive(
         op,
@@ -399,7 +424,7 @@ async fn drive_semop(
         DriveMode::Waiting,
         mailbox_arc.as_ref(),
         delegate_registry_arc.as_deref(),
-        timer_wheel_arc.as_ref(),
+        timer_registrar_handle.as_ref(),
     )
     .await
     {
@@ -590,7 +615,14 @@ pub(super) fn sys_msgctl(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult 
         None
     };
 
-    match ipc::sysv_msg::execution::step_msgctl_in_ns(msqid, cmd, set_fields, &cred, &ns) {
+    match ipc::sysv_msg::execution::step_msgctl_in_ns_with_post(
+        msqid,
+        cmd,
+        set_fields,
+        &cred,
+        &ns,
+        |mailbox, event| ctx.post_mailbox_ref_event(mailbox, event),
+    ) {
         Ok(result) => match result {
             ipc::sysv_msg::execution::MsgCtlResult::Success => SyscallResult::Return(0i64),
             ipc::sysv_msg::execution::MsgCtlResult::Stat(info) => {
@@ -672,10 +704,10 @@ pub(super) async fn sys_semop(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRe
     drive_semop(semid, &sops, ctx, None).await
 }
 
-pub(super) async fn sys_semtimedop<P: TimeIf>(
-    args: [u64; 6],
-    ctx: &SyscallCtx<'_>,
-) -> SyscallResult {
+pub(super) async fn sys_semtimedop<P>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult
+where
+    TimekeeperClock<P>: ClockRead,
+{
     let (semid, sops) = match read_semops(args, ctx) {
         Ok(v) => v,
         Err(result) => return result,
@@ -684,7 +716,11 @@ pub(super) async fn sys_semtimedop<P: TimeIf>(
         Ok(v) => v,
         Err(result) => return result,
     };
-    let deadline_ns = timeout_ns.map(|ns| P::read_ns().saturating_add(ns));
+    let deadline_ns = timeout_ns.map(|ns| {
+        timekeeper_clock::<P>()
+            .monotonic_now_ns()
+            .saturating_add(ns)
+    });
     drive_semop(semid, &sops, ctx, deadline_ns).await
 }
 
@@ -713,7 +749,7 @@ pub(super) fn sys_semctl(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult 
             ipc::sysv_sem::execution::SemCtlArg::Val(arg_raw as i32)
         }
         ipc::sysv_sem::execution::SETALL => {
-            let nsems = match ipc::sysv_sem::execution::step_semctl_in_ns(
+            let nsems = match ipc::sysv_sem::execution::step_semctl_in_ns_with_post(
                 semid,
                 semnum,
                 ipc::sysv_sem::execution::IPC_STAT,
@@ -721,6 +757,7 @@ pub(super) fn sys_semctl(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult 
                 &cred,
                 &ns,
                 Some(&ctx.process),
+                |mailbox, event| ctx.post_mailbox_ref_event(mailbox, event),
             ) {
                 Ok(ipc::sysv_sem::execution::SemCtlResult::Stat(info)) => info.nsems,
                 Ok(_) => return SyscallResult::Error(EINVAL_VALUE),
@@ -740,7 +777,7 @@ pub(super) fn sys_semctl(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult 
         _ => ipc::sysv_sem::execution::SemCtlArg::None,
     };
 
-    match ipc::sysv_sem::execution::step_semctl_in_ns(
+    match ipc::sysv_sem::execution::step_semctl_in_ns_with_post(
         semid,
         semnum,
         cmd,
@@ -748,6 +785,7 @@ pub(super) fn sys_semctl(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult 
         &cred,
         &ns,
         Some(&ctx.process),
+        |mailbox, event| ctx.post_mailbox_ref_event(mailbox, event),
     ) {
         Ok(result) => match result {
             ipc::sysv_sem::execution::SemCtlResult::Success => SyscallResult::Return(0i64),
@@ -840,7 +878,14 @@ pub(super) fn sys_msgsnd(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult 
             return SyscallResult::Error(errno_to_i32(errno));
         }
     }
-    match ipc::sysv_msg::execution::step_msgsnd(msqid, mtype, mtext, msgflg, &cred) {
+    match ipc::sysv_msg::execution::step_msgsnd_with_post(
+        msqid,
+        mtype,
+        mtext,
+        msgflg,
+        &cred,
+        |mailbox, event| ctx.post_mailbox_ref_event(mailbox, event),
+    ) {
         Ok(_) => SyscallResult::Return(0),
         Err(e) => SyscallResult::Error(errno_to_i32(e)),
     }
@@ -859,7 +904,14 @@ pub(super) fn sys_msgrcv(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult 
     if msgp == 0 {
         return SyscallResult::Error(EFAULT_VALUE);
     }
-    match ipc::sysv_msg::execution::step_msgrcv(msqid, msgsz, msgtyp, msgflg, &cred) {
+    match ipc::sysv_msg::execution::step_msgrcv_with_post(
+        msqid,
+        msgsz,
+        msgtyp,
+        msgflg,
+        &cred,
+        |mailbox, event| ctx.post_mailbox_ref_event(mailbox, event),
+    ) {
         Ok((mtype, mtext)) => {
             if let Err(errno) = bootstrap_write_user(&ctx.aspace, msgp, mtype) {
                 return SyscallResult::Error(errno_to_i32(errno));
@@ -970,7 +1022,14 @@ pub(super) async fn sys_mq_timedsend(args: [u64; 6], ctx: &SyscallCtx<'_>) -> Sy
     }
     let cred = ctx.cred_cap();
     loop {
-        match ipc::posix_mq::execution::step_mq_send(mq, &msg, args[3] as u32, &cred) {
+        match ipc::posix_mq::execution::step_mq_send_with_posts(
+            mq,
+            &msg,
+            args[3] as u32,
+            &cred,
+            |mailbox, event| ctx.post_mailbox_ref_event(mailbox, event),
+            |mailbox, event| ctx.post_mailbox_event(mailbox, event),
+        ) {
             Ok(()) => return SyscallResult::Return(0),
             Err(Errno::EAGAIN) if args[4] == 0 && !file.flags().nonblocking => {
                 wait_for_mq_readiness(ctx, mq, true).await;
@@ -1006,7 +1065,12 @@ pub(super) async fn sys_mq_timedreceive(args: [u64; 6], ctx: &SyscallCtx<'_>) ->
     }
     let cred = ctx.cred_cap();
     loop {
-        match ipc::posix_mq::execution::step_mq_receive(mq, msg_len, &cred) {
+        match ipc::posix_mq::execution::step_mq_receive_with_post(
+            mq,
+            msg_len,
+            &cred,
+            |mailbox, event| ctx.post_mailbox_ref_event(mailbox, event),
+        ) {
             Ok((msg, prio)) => {
                 if !msg.is_empty() {
                     if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, msg_ptr, &msg) {

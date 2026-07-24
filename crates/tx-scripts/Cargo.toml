@@ -11,17 +11,7 @@ test = true
 doctest = false
 
 [dependencies]
-# Open Q #5 DECIDED 2026-05-06 prefers ["alloc", "endian_fd", "elf64"]
-# (RV64-only slice). However, goblin 0.10.5 has a compile-time bug:
-# `elf::dynamic::dyn32` and `elf::header::Header::new` reference
-# `crate::elf32` unconditionally without a `cfg(feature = "elf32")`
-# gate, so the crate fails to build with `elf64` alone. We add
-# `elf32` purely as a build dependency; the parser (`loader.rs`)
-# never invokes any 32-bit code path.
-# TODO(elf-loader): drop `elf32` once goblin upstream fixes the
-# dyn32 / Header::new gating (track via a goblin issue / version
-# bump in a follow-up).
-goblin = { version = "0.10", default-features = false, features = ["alloc", "endian_fd", "elf64", "elf32"] }
+elf = { version = "0.8.0", default-features = false }
 # Phase 5 (exec script) integrates the loader with the kernel-side
 # subsystems: VFS walker, page-backed targeted reads, vm scripts,
 # process / thread runtime, and signal table reset. The substrate
@@ -33,6 +23,7 @@ tx-observe = { path = "../tx-observe" }
 tx-observe-types = { path = "../tx-observe-types" }
 tx-platform-adapter = { path = "../tx-platform-adapter" }
 tx-substrate = { path = "../tx-substrate" }
+tx-time = { path = "../tx-time" }
 tx-test-support = { path = "../tx-test-support" }
 tx-subsystems = { path = "../tx-subsystems" }
 tx-services = { path = "../tx-services" }

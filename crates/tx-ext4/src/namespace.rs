@@ -45,11 +45,9 @@ use tx_subsystems::vfs::FsOps;
 /// Static writable capacity for ext4 regular-file PageContainers.
 ///
 /// PageContainer currently has a fixed `page_count` capacity. Match tmpfs'
-/// growth window (256 MiB — see `TMPFS_FILE_PAGE_CAP`) so newly-created
-/// ext4 files can grow through ordinary PageBacked writes instead of
-/// failing after one page. The original 8 MiB day-1 cap EINVAL'd git
-/// clone's pack write at ~8 MiB (finals git Task2).
-const EXT4_FILE_PAGE_CAP: u64 = 65536;
+/// day-1 growth window so newly-created ext4 files can grow through ordinary
+/// PageBacked writes instead of failing after one page.
+const EXT4_FILE_PAGE_CAP: u64 = 2048;
 
 /// Factory for `MountOutput::fs_ops`.
 ///
@@ -79,7 +77,7 @@ where
             Ok(parent) => parent,
             Err(err) => {
                 tx_subsystems::vfs::resolution::diagnostic::record_diag(21);
-                return StepOutcome::err(err.into());
+                return StepOutcome::err(err);
             }
         };
 
@@ -87,11 +85,11 @@ where
             Ok(Some(inode)) => StepOutcome::done(inode_fs_object_id(inode)),
             Ok(None) => {
                 tx_subsystems::vfs::resolution::diagnostic::record_diag(22); // ENOENT
-                StepOutcome::err(Errno::ENOENT.into())
+                StepOutcome::err(Errno::ENOENT)
             }
             Err(err) => {
                 tx_subsystems::vfs::resolution::diagnostic::record_diag(23); // format err
-                StepOutcome::err(err.into())
+                StepOutcome::err(err)
             }
         }
     }
@@ -103,12 +101,12 @@ where
     ) -> StepOutcome<InodeMeta, NoProgress> {
         let inode = match inode_no(fs_object_id) {
             Ok(inode) => inode,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
 
         match self.inode_meta_cached(inode) {
             Ok(meta) => StepOutcome::done(map_inode_meta(meta)),
-            Err(err) => StepOutcome::err(err.into()),
+            Err(err) => StepOutcome::err(err),
         }
     }
 
@@ -119,11 +117,11 @@ where
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
         if self.is_read_only() {
-            return StepOutcome::err(Errno::EROFS.into());
+            return StepOutcome::err(Errno::EROFS);
         }
         let inode = match inode_no(fs_object_id) {
             Ok(inode) => inode,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         match self.with_pager(|pager| {
             pager
@@ -131,51 +129,7 @@ where
                 .map(|_| ())
         }) {
             Ok(()) => StepOutcome::done(()),
-            Err(err) => StepOutcome::err(err.into()),
-        }
-    }
-
-    fn step_chmod(
-        &self,
-        fs_object_id: FsObjectId,
-        new_mode: u16,
-        cred: &Credential,
-        _guard: &Guard<'_>,
-    ) -> StepOutcome<(), NoProgress> {
-        // ext4 previously inherited the trait's ENOSYS default; with
-        // the onsite alpine image mounted as an ext4 root, git init's
-        // core.filemode probe (chmod on .git/config.lock) hit it and
-        // aborted. Semantics mirror the tmpfs implementation: keep
-        // IFMT, replace the low 12 permission bits, persist through
-        // the journaled inode-meta write.
-        if self.is_read_only() {
-            return StepOutcome::err(Errno::EROFS.into());
-        }
-        let inode = match inode_no(fs_object_id) {
-            Ok(inode) => inode,
-            Err(err) => return StepOutcome::err(err.into()),
-        };
-        let meta = match self.inode_meta_cached(inode) {
-            Ok(meta) => map_inode_meta(meta),
-            Err(err) => return StepOutcome::err(err.into()),
-        };
-        if let Err(e) = tx_subsystems::vfs::predicates::check_chmod_perm(&meta, cred) {
-            return StepOutcome::err(e.into());
-        }
-        let mut updated = meta;
-        updated.mode =
-            (updated.mode & tx_subsystems::vfs::structure::S_IFMT) | (new_mode & 0o7777);
-        let write = self.with_pager(|pager| {
-            pager
-                .write_inode_meta_journaled(inode, inode_meta_lite(&updated))
-                .map(|_| ())
-        });
-        match write {
-            Ok(()) => {
-                self.invalidate_inode_meta(inode);
-                StepOutcome::done(())
-            }
-            Err(err) => StepOutcome::err(err.into()),
+            Err(err) => StepOutcome::err(err),
         }
     }
 
@@ -188,11 +142,11 @@ where
         _guard: &Guard<'_>,
     ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
         if self.is_read_only() {
-            return StepOutcome::err(Errno::EROFS.into());
+            return StepOutcome::err(Errno::EROFS);
         }
         let parent_ino = match inode_no(parent) {
             Ok(v) => v,
-            Err(e) => return StepOutcome::err(e.into()),
+            Err(e) => return StepOutcome::err(e),
         };
         match self.with_pager(|pager| {
             pager.create_regular_file(parent_ino, name, mode, cred.uid, cred.gid, 0)
@@ -201,11 +155,11 @@ where
                 self.invalidate_lookup_cache_for(parent_ino);
                 let meta = match self.with_pager(|pager| pager.inode_meta(new_ino)) {
                     Ok(m) => m,
-                    Err(e) => return StepOutcome::err(e.into()),
+                    Err(e) => return StepOutcome::err(e),
                 };
                 StepOutcome::done((inode_fs_object_id(new_ino), map_inode_meta(meta)))
             }
-            Err(e) => StepOutcome::err(e.into()),
+            Err(e) => StepOutcome::err(e),
         }
     }
 
@@ -217,18 +171,18 @@ where
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
         if self.is_read_only() {
-            return StepOutcome::err(Errno::EROFS.into());
+            return StepOutcome::err(Errno::EROFS);
         }
         let parent_ino = match inode_no(parent) {
             Ok(v) => v,
-            Err(e) => return StepOutcome::err(e.into()),
+            Err(e) => return StepOutcome::err(e),
         };
         match self.with_pager(|pager| pager.remove_dir_entry(parent_ino, name)) {
             Ok(_removed_ino) => {
                 self.invalidate_lookup_cache_for(parent_ino);
                 StepOutcome::done(())
             }
-            Err(e) => StepOutcome::err(e.into()),
+            Err(e) => StepOutcome::err(e),
         }
     }
 
@@ -241,22 +195,22 @@ where
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
         if self.is_read_only() {
-            return StepOutcome::err(Errno::EROFS.into());
+            return StepOutcome::err(Errno::EROFS);
         }
         let old_parent_ino = match inode_no(old_parent) {
             Ok(v) => v,
-            Err(e) => return StepOutcome::err(e.into()),
+            Err(e) => return StepOutcome::err(e),
         };
         let new_parent_ino = match inode_no(new_parent) {
             Ok(v) => v,
-            Err(e) => return StepOutcome::err(e.into()),
+            Err(e) => return StepOutcome::err(e),
         };
 
         // Resolve old inode number and its ext4 file_type.
         let old_ino = match self.with_pager(|pager| pager.lookup(old_parent_ino, old_name)) {
             Ok(Some(ino)) => ino,
-            Ok(None) => return StepOutcome::err(Errno::ENOENT.into()),
-            Err(e) => return StepOutcome::err(e.into()),
+            Ok(None) => return StepOutcome::err(Errno::ENOENT),
+            Err(e) => return StepOutcome::err(e),
         };
         // Derive ext4 dir-entry file_type from the inode mode.
         // EXT4_FT_REG_FILE=1, EXT4_FT_DIR=2.
@@ -268,7 +222,7 @@ where
                     1u8
                 }
             }
-            Err(e) => return StepOutcome::err(e.into()),
+            Err(e) => return StepOutcome::err(e),
         };
 
         // Remove destination entry if it already exists (best-effort;
@@ -280,7 +234,7 @@ where
         if let Err(e) = self.with_pager(|pager| {
             pager.append_dir_entry(new_parent_ino, new_name, old_ino, file_type)
         }) {
-            return StepOutcome::err(e.into());
+            return StepOutcome::err(e);
         }
         self.invalidate_lookup_cache_for(new_parent_ino);
 
@@ -290,7 +244,7 @@ where
                 self.invalidate_lookup_cache_for(old_parent_ino);
                 StepOutcome::done(())
             }
-            Err(e) => StepOutcome::err(e.into()),
+            Err(e) => StepOutcome::err(e),
         }
     }
 
@@ -301,7 +255,7 @@ where
         _target: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::ENOSYS.into())
+        StepOutcome::err(Errno::ENOSYS)
     }
 
     fn mkdir(
@@ -313,16 +267,16 @@ where
         _guard: &Guard<'_>,
     ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
         if self.is_read_only() {
-            return StepOutcome::err(Errno::EROFS.into());
+            return StepOutcome::err(Errno::EROFS);
         }
         let parent_ino = match inode_no(parent) {
             Ok(v) => v,
-            Err(e) => return StepOutcome::err(e.into()),
+            Err(e) => return StepOutcome::err(e),
         };
         match self.with_pager(|pager| pager.lookup(parent_ino, name)) {
-            Ok(Some(_)) => return StepOutcome::err(Errno::EEXIST.into()),
+            Ok(Some(_)) => return StepOutcome::err(Errno::EEXIST),
             Ok(None) => {}
-            Err(e) => return StepOutcome::err(e.into()),
+            Err(e) => return StepOutcome::err(e),
         }
         match self.with_pager(|pager| {
             pager.create_directory(parent_ino, name, mode, cred.uid, cred.gid, 0)
@@ -331,11 +285,11 @@ where
                 self.invalidate_lookup_cache_for(parent_ino);
                 let meta = match self.with_pager(|pager| pager.inode_meta(new_ino)) {
                     Ok(m) => m,
-                    Err(e) => return StepOutcome::err(e.into()),
+                    Err(e) => return StepOutcome::err(e),
                 };
                 StepOutcome::done((inode_fs_object_id(new_ino), map_inode_meta(meta)))
             }
-            Err(e) => StepOutcome::err(e.into()),
+            Err(e) => StepOutcome::err(e),
         }
     }
 
@@ -347,11 +301,11 @@ where
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
         if self.is_read_only() {
-            return StepOutcome::err(Errno::EROFS.into());
+            return StepOutcome::err(Errno::EROFS);
         }
         let parent_ino = match inode_no(parent) {
             Ok(v) => v,
-            Err(e) => return StepOutcome::err(e.into()),
+            Err(e) => return StepOutcome::err(e),
         };
         // Remove the directory entry from the parent.  The directory
         // itself is assumed empty (the VFS layer should have checked);
@@ -362,7 +316,7 @@ where
                 self.invalidate_lookup_cache_for(parent_ino);
                 StepOutcome::done(())
             }
-            Err(e) => StepOutcome::err(e.into()),
+            Err(e) => StepOutcome::err(e),
         }
     }
 
@@ -374,7 +328,7 @@ where
         _cred: &Credential,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(FsObjectId, InodeMeta), NoProgress> {
-        StepOutcome::err(Errno::ENOSYS.into())
+        StepOutcome::err(Errno::ENOSYS)
     }
 
     fn readdir(
@@ -385,18 +339,18 @@ where
     ) -> StepOutcome<Option<(DirEntry, DirCursor)>, NoProgress> {
         let inode = match inode_no(fs_object_id) {
             Ok(inode) => inode,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         let offset = match cursor_offset(cursor) {
             Ok(offset) => offset,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         let mut entries = [DirEntryLite::empty(); READDIR_WINDOW_ENTRIES];
         let mut next_offsets = [0u64; READDIR_WINDOW_ENTRIES];
         let count =
             match self.read_dir_entries_cached(inode, offset, &mut entries, &mut next_offsets) {
                 Ok(count) => count,
-                Err(err) => return StepOutcome::err(err.into()),
+                Err(err) => return StepOutcome::err(err),
             };
         if count == 0 {
             return StepOutcome::done(None);
@@ -405,7 +359,7 @@ where
         let entry = entries[0];
         let name = match InlineName::new(entry.name()) {
             Ok(name) => name,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         StepOutcome::done(Some((
             DirEntry {
@@ -422,7 +376,7 @@ where
         _fs_object_id: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::ENOSYS.into())
+        StepOutcome::err(Errno::ENOSYS)
     }
 
     fn materialise_rnode(
@@ -434,7 +388,7 @@ where
     ) -> StepOutcome<Cap<RNode>, NoProgress> {
         let pin = match self.mount_pin.lock().clone() {
             Some(p) => p,
-            None => return StepOutcome::err(Errno::ENOSYS.into()),
+            None => return StepOutcome::err(Errno::ENOSYS),
         };
 
         const PAGE_SIZE: u64 = 4096;
@@ -453,13 +407,14 @@ where
             page_count,
         ) {
             Ok(pc) => pc,
-            Err(_) => return StepOutcome::err(Errno::ENOMEM.into()),
+            Err(_) => return StepOutcome::err(Errno::ENOMEM),
         };
         pc.set_size_bytes(meta.size);
+        self.bind_file_page_container(pc.clone());
 
         match RNode::new_cap_in_mount(fs_object_id, meta, RNodeBacking::PageBacked { pc }, mount) {
             Ok(rnode) => StepOutcome::done(rnode),
-            Err(_) => StepOutcome::err(Errno::ENOMEM.into()),
+            Err(_) => StepOutcome::err(Errno::ENOMEM),
         }
     }
 
@@ -470,15 +425,15 @@ where
     ) -> StepOutcome<alloc::boxed::Box<[u8]>, NoProgress> {
         let inode = match inode_no(fs_object_id) {
             Ok(inode) => inode,
-            Err(err) => return StepOutcome::err(err.into()),
+            Err(err) => return StepOutcome::err(err),
         };
         match self.with_pager(|pager| pager.read_symlink(inode)) {
             Ok(bytes) => StepOutcome::done(bytes.into_boxed_slice()),
-            Err(err) => StepOutcome::err(err.into()),
+            Err(err) => StepOutcome::err(err),
         }
     }
 
-    // `step_chown` would commit the same way if a workload needs it.
+    // `chmod_inode`, `chown_inode` commit through `serialize_inode_meta`.
 }
 
 fn inode_meta_lite(meta: &InodeMeta) -> InodeMetaLite {

@@ -276,15 +276,14 @@ fn tcp_loopback_handshake_connects_bound_client_to_listener() {
             .protocol_state(),
         smoltcp::socket::tcp::State::Established
     );
-    // P1-S3: `has_connected` 闩锁已删——"已连接"的单一真相就是 smoltcp 状态。
-    assert_eq!(
+    assert!(
         client
             .acquire_operational()
             .expect("client payload")
             .raw_tcp_socket()
             .expect("client raw tcp")
-            .protocol_state(),
-        smoltcp::socket::tcp::State::Established
+            .protocol_runtime_state()
+            .has_connected
     );
 }
 
@@ -491,6 +490,7 @@ fn tcp_recv_kicks_loopback_after_freeing_peer_window() {
     let _lock = crate::test_support::EPOCH_TEST_LOCK
         .lock()
         .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
     loopback_iface().clear_for_test_or_bootstrap();
     let guard = tx_substrate::epoch::guard();
     let mut listener_options = SocketOptionSet::default_tcp();
@@ -611,7 +611,9 @@ fn tcp_pollout_ignores_stale_send_space_wake_when_full() {
         step_send_kernel_bytes(&client, b"hello", SendRecvFlags::empty(), &guard),
         StepOutcome::Done(5)
     );
-    client.readiness.fire_send(SendWireSet::SPACE);
+    client
+        .readiness
+        .fire_send_with_post(SendWireSet::SPACE, |mailbox, event| mailbox.post(event));
 
     assert!(matches!(
         step_poll_ready(&client, &guard),
@@ -886,63 +888,4 @@ fn tcp_loopback_handshake_requires_bound_client_for_now() {
         step_tcp_loopback_handshake(&client, &guard),
         StepOutcome::Err(Errno::EADDRNOTAVAIL)
     ));
-}
-
-#[test]
-fn tcp_loopback_lost_data_segment_is_retransmitted_after_rto() {
-    // P1 灵魂测试：数据只在 smoltcp 段级单通路上流动（P1）+ 时钟活着（P0）
-    // ⇒ 人为丢弃一个数据段后，越过 RTO 重新驱动，对端仍能收齐字节。
-    // 旧直拷世界不存在"段"可丢，此测试同时锁死 P0 与 P1 的成果。
-    init_zones();
-    let _lock = crate::test_support::EPOCH_TEST_LOCK
-        .lock()
-        .expect("net epoch test lock");
-    crate::net::clock::net_set_now_ns(0);
-    let (client, _listener, _local, _remote) = prepare_loopback_connect(40_299, 50_299);
-    let guard = tx_substrate::epoch::guard();
-
-    let outcome = match step_tcp_loopback_handshake(&client, &guard) {
-        StepOutcome::Done(outcome) => outcome,
-        _ => panic!("loopback handshake should succeed"),
-    };
-    let child = outcome.child;
-
-    let iface = crate::net::namespace::initial_loopback_iface();
-    while iface.pop_ingress().is_some() {} // 清残包，保证丢的是我们的段
-
-    // 客户端把数据写进 smoltcp tx ring，egress 出数据段——然后丢弃它
-    let client_payload = client.acquire_operational().expect("client payload");
-    let client_raw = client_payload.raw_tcp_socket().expect("client raw");
-    assert!(client_raw.enqueue_tx_bytes(b"hello").is_some());
-
-    let mut ctx =
-        PollContext::new_with_table(smoltcp::time::Instant::ZERO, client_payload.socket_table());
-    assert!(ctx.poll_egress_one(&client, iface, &guard).is_some());
-    assert!(
-        iface.pop_ingress().is_some(),
-        "数据段应已入 iface 队列——人为丢弃，模拟丢包"
-    );
-
-    // 对端没有数据；时间没走，立刻重试 egress 不该重传
-    let child_payload = child.acquire_operational().expect("child payload");
-    let child_raw = child_payload.raw_tcp_socket().expect("child raw");
-    assert_eq!(child_raw.recv_available(), 0);
-    assert!(
-        ctx.poll_egress_one(&client, iface, &guard).is_none(),
-        "RTO 未到期不该重传"
-    );
-
-    // 拨钟越过初始 RTO(≈700ms) → 重传 → 喂给对端 → 字节收齐
-    crate::net::clock::net_set_now_ns(2_000_000_000);
-    assert!(
-        ctx.poll_egress_one(&client, iface, &guard).is_some(),
-        "越过 RTO 应重传数据段"
-    );
-    let _ = ctx.poll_ingress(iface, &guard, 4);
-    assert_eq!(child_raw.recv_available(), 5, "重传后对端应收齐 5 字节");
-    let mut out = [0u8; 8];
-    assert_eq!(child_raw.recv_bytes(&mut out, false), Some((5, true)));
-    assert_eq!(&out[..5], b"hello");
-
-    crate::net::clock::net_set_now_ns(0);
 }

@@ -265,25 +265,13 @@ impl<K, V, const N: usize> IndexReservation<'_, K, V, N> {
         // inside a `StepOp::step` body (OBS-A-1).
         if INDEX_MUTATION_EMIT_ENABLED.load(Ordering::Relaxed) {
             if let Some(em) = tx_observe::current() {
-                use tx_observe::encode::{encode_mutation_index_commit, mutation_index_commit_tag};
-                use tx_observe::{EventNameId, TxTraceLevel};
-                use tx_observe_types::PayloadMutationIndexCommit;
-
                 // `index_id` is the lower 32 bits of the index pointer —
                 // a stable per-instance discriminant within a single boot.
                 let index_id = self.index as *const _ as usize as u32;
-                let p = PayloadMutationIndexCommit {
+                em.mutation_index_commit(
                     index_id,
-                    key_low: self.slot_index as u32,
-                    value_object_id: 0, // generic V; no Cap available here
-                };
-                let (payload_bytes, _) = encode_mutation_index_commit(&p);
-                em.instant(
-                    TxTraceLevel::Mutation,
-                    EventNameId::from_raw(0x4d494358u32), // "MICX" — mutation.index_commit
-                    tx_observe::SpanId::NONE,
-                    mutation_index_commit_tag(),
-                    &payload_bytes,
+                    self.slot_index as u32,
+                    0, // generic V; no Cap available here
                 );
             }
         }

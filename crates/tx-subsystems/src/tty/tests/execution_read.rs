@@ -1,11 +1,24 @@
 //! TTY execution read step tests.
 
 use crate::tty::adapter::step_engine::{guard, StepOutcome};
-use crate::tty::execution::{step_ingest, step_ioctl_tcgets, step_ioctl_tcsets, step_read};
+use crate::tty::execution::{
+    step_ingest_with_post, step_ioctl_tcgets, step_ioctl_tcsets, step_read, tty_read_would_complete,
+};
 use crate::tty::structure::termios::ICANON;
 use crate::tty::structure::{TtyKind, TtyPayload};
 
 use super::support::{alloc_tty, init_zones, NOOP_BINDING, TTY_ZONE_TEST_LOCK};
+
+fn ingest_direct(
+    tty: &crate::tty::adapter::step_engine::Cap<crate::tty::structure::TtyIdentity>,
+    bytes: &[u8],
+    guard: &crate::execution::Guard<'_>,
+) -> StepOutcome<crate::tty::execution::IngestOutcome, crate::tty::adapter::step_engine::NoProgress>
+{
+    step_ingest_with_post(tty, bytes, guard, |mailbox, event, hint| {
+        mailbox.post_with_scheduler_hint(event, hint)
+    })
+}
 
 #[test]
 fn noncanonical_vmin_blocks_until_threshold_is_met() {
@@ -33,7 +46,7 @@ fn noncanonical_vmin_blocks_until_threshold_is_met() {
     );
 
     assert_eq!(
-        step_ingest(&tty, b"xy", &guard),
+        ingest_direct(&tty, b"xy", &guard),
         StepOutcome::Done(crate::tty::execution::IngestOutcome {
             consumed: 2,
             readable_fired: true,
@@ -47,7 +60,7 @@ fn noncanonical_vmin_blocks_until_threshold_is_met() {
     ));
 
     assert_eq!(
-        step_ingest(&tty, b"z", &guard),
+        ingest_direct(&tty, b"z", &guard),
         StepOutcome::Done(crate::tty::execution::IngestOutcome {
             consumed: 1,
             readable_fired: true,
@@ -55,6 +68,63 @@ fn noncanonical_vmin_blocks_until_threshold_is_met() {
             ..Default::default()
         })
     );
+    assert_eq!(step_read(&tty, &mut out, &guard), StepOutcome::Done(3));
+    assert_eq!(&out[..3], b"xyz");
+}
+
+#[test]
+fn noncanonical_vmin_with_vtime_blocks_until_threshold_is_met() {
+    let _serial = TTY_ZONE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    init_zones();
+    let guard = guard();
+    let tty = alloc_tty(
+        TtyKind::SerialHardware,
+        14,
+        "ttyS14",
+        TtyPayload::new_hardware(&NOOP_BINDING),
+    );
+    let mut out = [0u8; 8];
+
+    let mut raw_mode = match step_ioctl_tcgets(&tty, &guard) {
+        StepOutcome::Done(termios) => termios,
+        other => panic!("tcgets failed: {other:?}"),
+    };
+    raw_mode.c_lflag &= !ICANON;
+    raw_mode.c_cc[crate::tty::structure::termios::VMIN] = 3;
+    raw_mode.c_cc[crate::tty::structure::termios::VTIME] = 1;
+    assert_eq!(
+        step_ioctl_tcsets(&tty, raw_mode, &guard),
+        StepOutcome::Done(crate::tty::execution::IoctlSideEffect::default())
+    );
+
+    assert_eq!(
+        ingest_direct(&tty, b"xy", &guard),
+        StepOutcome::Done(crate::tty::execution::IngestOutcome {
+            consumed: 2,
+            readable_fired: true,
+            writable_fired: true,
+            ..Default::default()
+        })
+    );
+    assert!(
+        !tty_read_would_complete(&tty, &guard),
+        "poll/select must not report readable before the VMIN threshold"
+    );
+    assert!(matches!(
+        step_read(&tty, &mut out, &guard),
+        StepOutcome::Yield { .. }
+    ));
+
+    assert_eq!(
+        ingest_direct(&tty, b"z", &guard),
+        StepOutcome::Done(crate::tty::execution::IngestOutcome {
+            consumed: 1,
+            readable_fired: true,
+            writable_fired: true,
+            ..Default::default()
+        })
+    );
+    assert!(tty_read_would_complete(&tty, &guard));
     assert_eq!(step_read(&tty, &mut out, &guard), StepOutcome::Done(3));
     assert_eq!(&out[..3], b"xyz");
 }

@@ -74,6 +74,21 @@ pub(crate) fn create_socket_in_namespace_with_family(
     Ok(identity)
 }
 
+pub(crate) fn create_connected_stream_for_accept_in_namespace(
+    local: IpEndpoint,
+    peer: IpEndpoint,
+    options: SocketOptionSet,
+    net_namespace: PayloadCap<NetNamespacePayload>,
+) -> Result<Cap<SocketIdentity>, ZoneError> {
+    create_connected_stream_for_accept_in_namespace_with_family(
+        local,
+        peer,
+        default_family_for_kind(SocketKind::Tcp),
+        options,
+        net_namespace,
+    )
+}
+
 pub(crate) fn create_connected_stream_for_accept_in_namespace_with_family(
     local: IpEndpoint,
     peer: IpEndpoint,
