@@ -23,7 +23,7 @@ use crate::vm::checks::{
     require_fault_publication, require_fault_recipe, require_map_admission, require_remap_shape,
 };
 use crate::vm::pmap::PmapBatchPage;
-use crate::vm::structure::{PrivatePageError, PrivatePageSet};
+use crate::vm::structure::{PrivatePageError, PrivatePageSet, VmPageOff};
 use crate::vm::{
     AccessMode, AddressSpace, LockMode, MapPlacement, PmapPublishOutcome, Prot, RangeGuard,
     UserRange, UserVirtAddr, VmBacking, VmEntry, VmEntryBacking, VmFault, VmFaultError,
@@ -1300,6 +1300,29 @@ impl AddressSpace {
             MadviseAdvice::DontNeed | MadviseAdvice::Free => {
                 let _guard = self.acquire_writer(range)?;
                 self.pmap.teardown_range(range)?;
+
+                // Dropping the PTEs only releases their MapPins.  Private
+                // anonymous/COW pages are also retained by CachePins in the
+                // per-VMA PrivatePageSet, so leaving that set untouched makes
+                // MADV_DONTNEED refault the old contents and keeps the frames
+                // permanently charged to the process.  Tear down the PTEs
+                // first (including shootdown), then withdraw the overlapping
+                // private frames so their final pins can return the pages.
+                for entry in self.recipes_overlapping(range) {
+                    let Some(private) = entry.private() else {
+                        continue;
+                    };
+                    let overlap_start = entry.range.start().0.max(range.start().0);
+                    let overlap_end = entry.range.end().0.min(range.end().0);
+                    if overlap_start >= overlap_end {
+                        continue;
+                    }
+                    let entry_start = entry.range.start().0;
+                    let start_off = (overlap_start - entry_start) / USER_PAGE_SIZE;
+                    let end_off = (overlap_end - entry_start) / USER_PAGE_SIZE;
+                    private.drain_range(VmPageOff(start_off as u64), VmPageOff(end_off as u64));
+                }
+
                 let guard = step_engine::guard();
                 self.stats.store(self.recipes.stats(&guard));
                 Ok(())

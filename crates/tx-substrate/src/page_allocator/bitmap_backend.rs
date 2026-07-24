@@ -3,7 +3,8 @@ use tx_hal::Ppn;
 
 use super::{
     AllocError, AllocatorBackendKind, AllocatorDiagnostics, FrameMeta, FrameReservation,
-    FrameRunReservation, FrameZeroer, PageAllocator, PermanentFrame, ZeroPolicy,
+    FrameRoleDiagnostics, FrameRunReservation, FrameZeroer, PageAllocator, PermanentFrame,
+    ZeroPolicy,
 };
 
 /// v1 global atomic-bitmap page allocator.
@@ -489,6 +490,64 @@ impl<'a> BitmapPageAllocator<'a> {
             }
         }
         best
+    }
+
+    pub(crate) fn frame_role_diagnostics(&self) -> FrameRoleDiagnostics {
+        let mut diag = FrameRoleDiagnostics::default();
+
+        for index in 0..self.total {
+            let ppn = self.ppn_from_dense_index(index);
+            let meta = self.meta(ppn);
+            let free = self.bit_is_set(ppn);
+            let reserved = meta.is_reserved();
+            let state = meta.state();
+
+            if free {
+                diag.free_pages += 1;
+            }
+            if reserved {
+                diag.reserved_pages += 1;
+                if state != 0 {
+                    diag.reserved_live_pages += 1;
+                }
+            }
+            if !free && !reserved && state == 0 {
+                diag.unowned_unavailable_pages += 1;
+            }
+
+            let owner_refs = meta.refcount() as usize;
+            let map_refs = meta.map_count() as usize;
+            let cache_refs = meta.cache_ref() as usize;
+            let pin_refs = meta.pin_count() as usize;
+
+            diag.owner_refs = diag.owner_refs.saturating_add(owner_refs);
+            diag.map_refs = diag.map_refs.saturating_add(map_refs);
+            diag.cache_refs = diag.cache_refs.saturating_add(cache_refs);
+            diag.pin_refs = diag.pin_refs.saturating_add(pin_refs);
+
+            let mut role_count = 0usize;
+            if owner_refs != 0 {
+                diag.owned_pages += 1;
+                role_count += 1;
+            }
+            if map_refs != 0 {
+                diag.mapped_pages += 1;
+                role_count += 1;
+            }
+            if cache_refs != 0 {
+                diag.cached_pages += 1;
+                role_count += 1;
+            }
+            if pin_refs != 0 {
+                diag.pinned_pages += 1;
+                role_count += 1;
+            }
+            if role_count > 1 {
+                diag.mixed_role_pages += 1;
+            }
+        }
+
+        diag
     }
 }
 

@@ -474,6 +474,10 @@ impl IrqIf for Platform {
         la64_irq_context_depth() != 0
     }
 
+    fn in_trap_context() -> bool {
+        la64_current_stack_is_trap_stack()
+    }
+
     fn interrupts_enabled() -> bool {
         read_la64_csr(LA64_CSR_CRMD) & LA64_CRMD_IE != 0
     }

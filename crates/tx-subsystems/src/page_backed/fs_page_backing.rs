@@ -20,11 +20,27 @@
 //! `supports_reflink` is a boolean predicate (not `StepOutcome`-
 //! returning).
 
-use crate::execution::Guard;
+use crate::execution::{Errno, Guard};
 use crate::vfs::FsObjectId;
 
 use super::{Frame, PageContainer};
 use crate::page_backed::adapter::step_engine::{NoProgress, StepOutcome};
+
+/// Filesystem capacity reported by `statfs(2)` / `fstatfs(2)`.
+///
+/// Counts are expressed in units of `block_size`; inode counts are filesystem
+/// objects rather than bytes. Backends should return a fresh snapshot rather
+/// than cached superblock counters when their on-disk accounting can lag.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FilesystemStats {
+    pub block_size: u64,
+    pub total_blocks: u64,
+    pub free_blocks: u64,
+    pub available_blocks: u64,
+    pub total_inodes: u64,
+    pub free_inodes: u64,
+    pub max_name_len: u64,
+}
 
 /// `FsPageBacking` trait emitting `step_v3` outcomes.
 ///
@@ -32,6 +48,14 @@ use crate::page_backed::adapter::step_engine::{NoProgress, StepOutcome};
 /// `StepOutcome<T, NoProgress>`. `fallocate`
 /// defaults to `Done(())` and `supports_reflink` defaults to `false`.
 pub trait FsPageBacking: Send + Sync + 'static {
+    /// Return a current filesystem-capacity snapshot.
+    ///
+    /// Backends that do not expose capacity accounting explicitly reject the
+    /// operation instead of manufacturing the old fixed-size result.
+    fn filesystem_stats(&self, _guard: &Guard<'_>) -> StepOutcome<FilesystemStats, NoProgress> {
+        StepOutcome::err(Errno::ENOSYS.into())
+    }
+
     fn fetch_page(
         &self,
         fs_object_id: FsObjectId,

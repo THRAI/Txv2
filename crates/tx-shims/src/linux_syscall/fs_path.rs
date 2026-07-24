@@ -91,7 +91,7 @@ fn resolve_cwd(dirfd: i32, ctx: &SyscallCtx) -> Result<Cap<DEntry>, i32> {
     open_file.opendir_dentry().ok_or(ENOTDIR_VALUE)
 }
 
-fn resolve_path_at<P: PmapIf>(
+pub(super) fn resolve_path_at<P: PmapIf>(
     dirfd: i32,
     path: &[u8],
     cred: &Credential,
@@ -736,9 +736,10 @@ pub(super) fn mount_payload_for_dentry(dentry: &Cap<DEntry>) -> Option<Cap<Mount
     let guard = step_engine::guard();
     let mut cursor = dentry.clone();
     loop {
-        let weak = cursor.rnode().containing_mount_weak()?;
-        if let Some(payload) = weak.upgrade(&guard) {
-            return Some(payload);
+        if let Some(weak) = cursor.rnode().containing_mount_weak() {
+            if let Some(payload) = weak.upgrade(&guard) {
+                return Some(payload);
+            }
         }
         cursor = cursor.parent_hint()?;
     }
@@ -785,4 +786,46 @@ pub(super) fn walk_from_process(
         V3::Continue { .. } | V3::Yield { .. } => Err(EIO_VALUE),
         V3::Err(errno) => Err(errno_to_i32(Errno::from(errno))),
     }
+}
+
+/// Resolve `path` without following its final symlink while honoring the
+/// caller's mount namespace. Namespace-removal operations need the terminal
+/// dentry itself both for POSIX no-follow semantics and to keep the victim's
+/// RNode/PageContainer alive until the namespace mutation has committed.
+pub(super) fn walk_from_nofollow_process(
+    cwd: Cap<DEntry>,
+    path: &[u8],
+    cred: &Credential,
+    process: &Cap<ProcessIdentity>,
+) -> Result<Cap<DEntry>, i32> {
+    use tx_subsystems::vfs::resolution::driver::{
+        walk_to_completion, walk_to_completion_with_mount_namespace,
+    };
+    use tx_subsystems::vfs::resolution::state::{FinalSymlinkPolicy, WalkMode};
+
+    let guard = step_engine::guard();
+    let resolved = if let Some(mnt_ns) = process.mount_namespace_cap() {
+        walk_to_completion_with_mount_namespace(
+            cwd,
+            path,
+            WalkMode::EntityUnfollowed,
+            FinalSymlinkPolicy::NoFollow,
+            cred,
+            Some(&mnt_ns),
+            &guard,
+        )
+    } else {
+        walk_to_completion(
+            cwd,
+            path,
+            WalkMode::EntityUnfollowed,
+            FinalSymlinkPolicy::NoFollow,
+            cred,
+            &guard,
+        )
+    };
+    drop(guard);
+    resolved
+        .map(|resolved| resolved.dentry)
+        .map_err(|errno| errno_to_i32(Errno::from(errno)))
 }

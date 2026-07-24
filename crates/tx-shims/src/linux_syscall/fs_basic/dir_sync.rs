@@ -166,21 +166,26 @@ pub(in crate::linux_syscall) async fn sys_statfs<P: PmapIf>(
     args: [u64; 6],
     ctx: &SyscallCtx<'_>,
 ) -> SyscallResult {
-    let _ = core::marker::PhantomData::<P>;
+    let path = match read_user_cstr(&ctx.aspace, args[0], EXECVE_PATH_MAX) {
+        Ok(path) => path,
+        Err(ReadCStrError::TooLong) => return SyscallResult::Error(ENAMETOOLONG_VALUE),
+        Err(ReadCStrError::Fault(errno)) => return SyscallResult::error_from(errno),
+    };
+    if path.is_empty() {
+        return SyscallResult::Error(ENOENT_VALUE);
+    }
+    let dentry = match resolve_path_at::<P>(AT_FDCWD, &path, &ctx.walker_cred(), ctx) {
+        Ok(dentry) => dentry,
+        Err(errno) => return SyscallResult::Error(errno),
+    };
+    let payload = match mount_payload_for_dentry(&dentry) {
+        Some(payload) => payload,
+        None => return SyscallResult::Error(ENODEV_VALUE),
+    };
     let buf_uaddr = args[1];
-    let statfs = StatfsLayout {
-        f_type: 0x0102_1994,
-        f_bsize: 4096,
-        f_blocks: 1024,
-        f_bfree: 768,
-        f_bavail: 768,
-        f_files: 4096,
-        f_ffree: 2048,
-        f_fsid: [0, 0],
-        f_namelen: 255,
-        f_frsize: 4096,
-        f_flags: 0,
-        f_spare: [0; 4],
+    let statfs = match statfs_for_mount(&payload) {
+        Ok(statfs) => statfs,
+        Err(result) => return result,
     };
     if let Err(e) = bootstrap_write_user::<StatfsLayout>(&ctx.aspace, buf_uaddr, statfs) {
         return SyscallResult::error_from(e);
@@ -195,10 +200,68 @@ pub(in crate::linux_syscall) async fn sys_fstatfs<P: PmapIf>(
 ) -> SyscallResult {
     let _ = core::marker::PhantomData::<P>;
     let fd = args[0] as u32;
-    if ctx.process.fd(fd).is_none() {
-        return SyscallResult::Error(EBADF_VALUE);
+    let open_file = match ctx.process.fd(fd) {
+        Some(open_file) => open_file,
+        None => return SyscallResult::Error(EBADF_VALUE),
+    };
+    let guard = step_engine::guard();
+    let payload = match open_file
+        .rnode()
+        .containing_mount_weak()
+        .and_then(|weak| weak.upgrade(&guard))
+    {
+        Some(payload) => payload,
+        None => return SyscallResult::Error(ENODEV_VALUE),
+    };
+    drop(guard);
+    let statfs = match statfs_for_mount(&payload) {
+        Ok(statfs) => statfs,
+        Err(result) => return result,
+    };
+    if let Err(e) = bootstrap_write_user::<StatfsLayout>(&ctx.aspace, args[1], statfs) {
+        return SyscallResult::error_from(e);
     }
-    sys_statfs::<P>(args, ctx).await
+    SyscallResult::Return(0)
+}
+
+fn statfs_for_mount(
+    payload: &Cap<tx_subsystems::mount::MountPayload>,
+) -> Result<StatfsLayout, SyscallResult> {
+    let guard = step_engine::guard();
+    let stats = match payload.fs_page_backing().filesystem_stats(&guard) {
+        StepOutcome::Done(stats) => stats,
+        StepOutcome::Err(errno) => {
+            return Err(SyscallResult::error_from(Errno::from(errno)));
+        }
+        StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
+            return Err(SyscallResult::Error(EIO_VALUE));
+        }
+    };
+    Ok(StatfsLayout {
+        f_type: filesystem_magic(payload.fstype),
+        f_bsize: stats.block_size,
+        f_blocks: stats.total_blocks,
+        f_bfree: stats.free_blocks,
+        f_bavail: stats.available_blocks,
+        f_files: stats.total_inodes,
+        f_ffree: stats.free_inodes,
+        f_fsid: [payload.dev_id.as_u32() as i32, 0],
+        f_namelen: stats.max_name_len,
+        f_frsize: stats.block_size,
+        f_flags: payload.options.flags.bits(),
+        f_spare: [0; 4],
+    })
+}
+
+fn filesystem_magic(fstype: &str) -> u64 {
+    match fstype {
+        "ext4" => 0x0000_EF53,
+        "tmpfs" => 0x0102_1994,
+        "proc" => 0x0000_9FA0,
+        "sysfs" => 0x6265_6572,
+        "devfs" => 0x0000_1373,
+        _ => 0,
+    }
 }
 
 /// `sync()`. Linux RV64 ABI `__NR_sync = 81`.
@@ -252,6 +315,28 @@ pub(in crate::linux_syscall) async fn sys_fsync<P: PmapIf>(
         Some(f) => f,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
+    if let Some(pc) = crate::linux_syscall::vm::extract_page_container(&open_file) {
+        use step_engine::DriveMode;
+        use tx_scripts::drive;
+        let mut script_ctx = build_subject_script_ctx(ctx);
+        let mailbox_arc = script_ctx.mailbox().cloned();
+        let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+        let op = tx_subsystems::page_backed::FsyncOp { pc: &pc };
+        return match drive(
+            op,
+            &mut script_ctx,
+            DriveMode::Waiting,
+            mailbox_arc.as_ref(),
+            None,
+            timer_wheel_arc.as_ref(),
+        )
+        .await
+        {
+            Ok(()) => SyscallResult::Return(0),
+            Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
+        };
+    }
+
     let rnode = open_file.rnode();
     let fs_object_id = rnode.fs_object_id();
     // The mount-weak upgrade and the page-backing clone are done inside

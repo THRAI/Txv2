@@ -1,7 +1,9 @@
 use step_engine::Guard;
 use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
 use tx_subsystems::execution::Errno;
-use tx_subsystems::page_backed::{reserve_frame_with_reclaim, Frame, FsPageBacking};
+use tx_subsystems::page_backed::{
+    reserve_frame_with_reclaim, FilesystemStats, Frame, FsPageBacking,
+};
 use tx_subsystems::vfs::structure::FsObjectId;
 
 use crate::adapter::step_engine::{self as step_engine, page_allocator, NoProgress, StepOutcome};
@@ -100,6 +102,24 @@ impl<I> FsPageBacking for Ext4FsInstance<I>
 where
     I: BlockImage + Send + 'static,
 {
+    fn filesystem_stats(&self, _guard: &Guard<'_>) -> StepOutcome<FilesystemStats, NoProgress> {
+        match self.with_pager(|pager| pager.filesystem_stats()) {
+            Ok(stats) => {
+                crate::report_filesystem_stats(stats);
+                StepOutcome::done(FilesystemStats {
+                    block_size: stats.block_size,
+                    total_blocks: stats.total_blocks,
+                    free_blocks: stats.free_blocks,
+                    available_blocks: stats.available_blocks,
+                    total_inodes: stats.total_inodes,
+                    free_inodes: stats.free_inodes,
+                    max_name_len: stats.max_name_len,
+                })
+            }
+            Err(err) => StepOutcome::err(err.into()),
+        }
+    }
+
     fn fetch_page(
         &self,
         fs_object_id: FsObjectId,
@@ -144,9 +164,13 @@ where
         if let Err(err) = read_frame_bytes(frame, &mut page) {
             return StepOutcome::err(err.into());
         }
-        match self.with_pager(|pager| pager.write_page(inode, file_page_index, &page)) {
+        match self.with_pager_raw(|pager| pager.write_page(inode, file_page_index, &page)) {
             Ok(()) => StepOutcome::done(()),
-            Err(err) => StepOutcome::err(err.into()),
+            Err(err) => {
+                let stats = self.with_pager_raw(|pager| pager.filesystem_stats()).ok();
+                crate::report_writeback_stats(inode.get(), file_page_index, err, stats);
+                StepOutcome::err(crate::read_backend::map_format_error(err).into())
+            }
         }
     }
 
@@ -161,7 +185,10 @@ where
             Err(err) => return StepOutcome::err(err.into()),
         };
         match self.with_pager(|pager| pager.set_inode_size(inode, new_size)) {
-            Ok(()) => StepOutcome::done(()),
+            Ok(()) => {
+                self.invalidate_inode_meta(inode);
+                StepOutcome::done(())
+            }
             Err(err) => StepOutcome::err(err.into()),
         }
     }

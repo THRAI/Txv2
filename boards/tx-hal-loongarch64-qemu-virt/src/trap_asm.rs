@@ -284,6 +284,15 @@ tx_la64_qemu_trap_low_end:
     .globl tx_la64_qemu_return_to_userspace
     .type tx_la64_qemu_return_to_userspace, @function
 tx_la64_qemu_return_to_userspace:
+    // `idle 0` deliberately leaves CRMD.IE enabled after wakeup.  Mask
+    // interrupts before changing ERA/PRMD and restoring user registers so an
+    // interrupt cannot observe a half-installed user-return context.  `ertn`
+    // restores the requested user interrupt state from PRMD.PIE.
+    csrrd   $r12, TX_LA64_CSR_CRMD_TRAP
+    li.w    $r13, -5
+    and     $r12, $r12, $r13
+    csrwr   $r12, TX_LA64_CSR_CRMD_TRAP
+
     move    $r31, $a0
     ld.d    $r12, $r31, TX_LA64_TF_ERA
     csrwr   $r12, TX_LA64_CSR_ERA_TRAP
@@ -338,6 +347,15 @@ tx_la64_qemu_activate_enter_userspace:
     // a6 = switch_required
     // All Rust stack-dependent work must be complete before this
     // function. After CRMD.PG is written, do not return to Rust.
+    // The reactor may arrive here with CRMD.IE still enabled after `idle 0`.
+    // Close the complete resume-context / KSAVE / pmap / user-register
+    // transition against timer and device interrupts.  `ertn` later restores
+    // user interrupt state from PRMD.PIE.
+    csrrd   $r12, TX_LA64_CSR_CRMD_TRAP
+    li.w    $r13, -5
+    and     $r12, $r12, $r13
+    csrwr   $r12, TX_LA64_CSR_CRMD_TRAP
+
     st.d    $sp, $a0, TX_LA64_RCTX_SP
     st.d    $r1, $a0, TX_LA64_RCTX_RA
     st.d    $r21, $a0, TX_LA64_RCTX_R21

@@ -229,6 +229,27 @@ pub(crate) fn la64_trap_stack_top_for_cpu(cpu: CpuId) -> usize {
     }
 }
 
+#[inline]
+pub(crate) fn la64_current_stack_is_trap_stack() -> bool {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let sp: usize;
+        unsafe {
+            core::arch::asm!(
+                "move {sp}, $sp",
+                sp = out(reg) sp,
+                options(nomem, nostack)
+            );
+        }
+        let cpu = <Platform as SmpIf>::current_cpu_id();
+        let top = la64_trap_stack_top_for_cpu(cpu);
+        return (top.saturating_sub(LA64_TRAP_STACK_SIZE)..top).contains(&sp);
+    }
+
+    #[cfg(not(target_arch = "loongarch64"))]
+    false
+}
+
 #[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
 pub(crate) fn la64_kernel_resume_ctx_ptr_for_cpu(cpu: CpuId) -> *mut KernelResumeCtx {
     let ptr = LA64_KERNEL_RESUME_CTX[cpu.0].as_ptr();

@@ -36,7 +36,7 @@ use tx_hal::{
 
 use crate::boot_static::{BootStaticBag, IdentityDropped, PageTable};
 
-use super::kernel_space::{page_table_is_empty, protect_leaf_slot, unmap_leaf_slot};
+use super::kernel_space::{protect_leaf_slot, unmap_leaf_slot};
 use super::pt_node::{
     alloc_pt_node_from_bag, free_pt_node_from_bag, register_committed_intermediates,
     release_committed_pt_node_from_bag,
@@ -104,7 +104,14 @@ pub(crate) fn destroy_pmap_root(root: PmapRoot) {
 }
 
 pub(super) fn destroy_pmap_root_from_bag<State>(bag: &BootStaticBag<State>, root: PmapRoot) {
-    let table = unsafe { page_table_mut_from_phys(root.phys()) };
+    let root_phys = root.phys();
+    // `satp` may still reference this root.  Leave it and invalidate all
+    // translations before returning any child PT-node to the frame allocator;
+    // otherwise a hardware page walk can continue through a page-table page
+    // that has already been reused for unrelated kernel data.
+    let invalidated = invalidate_destroyed_root(bag, root_phys);
+
+    let table = unsafe { page_table_mut_from_phys(root_phys) };
     for slot in &mut table.0[..256] {
         // 只处理用户半区（低 256 项），内核半区保持不动
         if pte_is_branch(*slot) {
@@ -112,7 +119,6 @@ pub(super) fn destroy_pmap_root_from_bag<State>(bag: &BootStaticBag<State>, root
         }
         *slot = 0;
     }
-    let invalidated = invalidate_destroyed_root(bag, root.phys()); // 先离开待销毁根并刷 TLB
     free_asid_after_invalidation(root.asid(), invalidated); // 清残留后再回收 ASID
     free_pt_node_from_bag(bag, root.into_node());
 }
@@ -304,7 +310,11 @@ pub(super) fn commit_mapping_from_root(
     }
 }
 
-// 解除用户映射：清空对应叶子项，修剪变空的中间表，返回失效凭证供 shootdown。
+// 解除用户映射：只清空对应叶子项并返回失效凭证供 shootdown。
+//
+// 已提交的空 L0/L1 继续由该进程根持有，直到 destroy_pmap_root 在离开当前
+// satp 并完成 TLB 失效后统一回收。普通 unmap 不能在 shootdown 之前归还
+// 中间页表页，否则硬件页表遍历可能继续访问已经复用的物理页。
 pub(crate) fn unmap_mapping(
     root: &PmapRoot,
     virt: VirtAddr,
@@ -319,7 +329,7 @@ pub(crate) fn unmap_mapping(
 }
 
 pub(super) fn unmap_mapping_from_root<State>(
-    bag: &BootStaticBag<State>,
+    _bag: &BootStaticBag<State>,
     root: PhysAddr,
     virt: VirtAddr,
     kind: PmapReserveKind,
@@ -336,14 +346,10 @@ pub(super) fn unmap_mapping_from_root<State>(
             let Some(l1) = l1_table_mut_from_root(root, virt) else {
                 return Ok(None);
             };
-            let result = {
+            {
                 let slot = &mut l1.0[rv64_2m_leaf_index(virt.0)];
-                unmap_leaf_slot(slot, virt, kind)?
-            };
-            if result.is_some() {
-                prune_empty_l1_table_in_root(bag, root, virt); // 若 L1 变空则回收
+                unmap_leaf_slot(slot, virt, kind)
             }
-            Ok(result)
         }
         PmapReserveKind::Page4K => {
             let Some(l1) = l1_table_mut_from_root(root, virt) else {
@@ -357,16 +363,10 @@ pub(super) fn unmap_mapping_from_root<State>(
                 return Err(PmapError::InvalidRequest); // 该处是大页叶子而非分支，请求非法
             }
             let l0 = unsafe { page_table_mut_from_phys(pte_phys(l1_slot)) };
-            let result = {
+            {
                 let slot = &mut l0.0[rv64_4k_leaf_index(virt.0)];
-                unmap_leaf_slot(slot, virt, kind)?
-            };
-            if result.is_some() {
-                // 自底向上修剪：先 L0 后 L1
-                prune_empty_l0_table_in_root(bag, root, virt);
-                prune_empty_l1_table_in_root(bag, root, virt);
+                unmap_leaf_slot(slot, virt, kind)
             }
-            Ok(result)
         }
     }
 }
@@ -526,8 +526,7 @@ fn invalidate_destroyed_root<State>(
         );
         if (current_satp & SATP_PPN_MASK) == (root_phys.0 >> 12) {
             const SATP_MODE_SV39: usize = 0x8 << 60;
-            let bootstrap_satp =
-                SATP_MODE_SV39 | (bag.bootstrap_root_phys().0 >> 12);
+            let bootstrap_satp = SATP_MODE_SV39 | (bag.bootstrap_root_phys().0 >> 12);
             core::arch::asm!(
                 "csrw satp, {satp}",
                 "sfence.vma",
@@ -636,51 +635,6 @@ pub(super) fn l1_table_mut_from_root(
         return None;
     }
     Some(unsafe { page_table_mut_from_phys(pte_phys(pte)) })
-}
-
-// 若 virt 对应的 L0 表已空，则从 L1 摘除并归还该 PT-node。
-fn prune_empty_l0_table_in_root<State>(
-    bag: &BootStaticBag<State>,
-    root: &mut PageTable,
-    virt: VirtAddr,
-) {
-    let Some(l1) = l1_table_mut_from_root(root, virt) else {
-        return;
-    };
-    let slot = &mut l1.0[rv64_2m_leaf_index(virt.0)];
-    if !pte_is_branch(*slot) {
-        return;
-    }
-
-    let phys = pte_phys(*slot);
-    let l0 = unsafe { page_table_mut_from_phys(phys) };
-    if !page_table_is_empty(l0) {
-        return; // 表非空，保留
-    }
-
-    *slot = 0; // 清 L1 中指向该 L0 的槽
-    release_committed_pt_node_from_bag(bag, phys);
-}
-
-// 若 virt 对应的 L1 表已空，则从根表摘除并归还该 PT-node。
-fn prune_empty_l1_table_in_root<State>(
-    bag: &BootStaticBag<State>,
-    root: &mut PageTable,
-    virt: VirtAddr,
-) {
-    let slot = &mut root.0[rv64_1g_leaf_index(virt.0)];
-    if !pte_is_branch(*slot) {
-        return;
-    }
-
-    let phys = pte_phys(*slot);
-    let l1 = unsafe { page_table_mut_from_phys(phys) };
-    if !page_table_is_empty(l1) {
-        return; // 表非空，保留
-    }
-
-    *slot = 0; // 清根表中指向该 L1 的槽
-    release_committed_pt_node_from_bag(bag, phys);
 }
 
 // 递归释放整棵页表子树：深度优先清空各级分支并归还每个 PT-node。

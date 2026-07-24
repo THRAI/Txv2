@@ -1174,12 +1174,19 @@ pub(super) fn sys_close<'a>(fd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
     // Write back dirty data + logical size before dropping the fd. There
     // is no background writeback daemon, so close is the flush point for
     // page-backed files; without it a fresh reopen reads the stale
-    // (create-time, zero) inode size and empty data. Best-effort — the
-    // ext4 flush path is synchronous (Done).
+    // (create-time, zero) inode size and empty data. The descriptor is
+    // removed even if writeback fails, but close returns that writeback
+    // error so userspace cannot mistake lost data for a successful close.
+    let mut flush_error = None;
     if let Some(file) = &file_to_close {
         if let Some(pc) = crate::linux_syscall::vm::extract_page_container(file) {
             let guard = step_engine::guard();
-            let _ = tx_subsystems::page_backed::step_fsync(&pc, &guard);
+            flush_error = match tx_subsystems::page_backed::step_fsync(&pc, &guard) {
+                tx_substrate::step::StepOutcome::Done(()) => None,
+                tx_substrate::step::StepOutcome::Err(errno) => Some(Errno::from(errno)),
+                tx_substrate::step::StepOutcome::Continue { .. }
+                | tx_substrate::step::StepOutcome::Yield { .. } => Some(Errno::EIO),
+            };
         }
     }
     let mut script_ctx = build_subject_script_ctx(ctx);
@@ -1194,7 +1201,10 @@ pub(super) fn sys_close<'a>(fd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
                 fcntl_release_process_locks_for_file(ctx.process.pid.0, &file);
                 maybe_close_socket_file_after_fd_remove(&file);
             }
-            SyscallResult::Return(0)
+            match flush_error {
+                Some(errno) => SyscallResult::error_from(errno),
+                None => SyscallResult::Return(0),
+            }
         }
         Err(v3errno) => SyscallResult::error_from(Errno::from(v3errno)),
     }

@@ -3,24 +3,41 @@ use core::convert::TryFrom;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::adapter::step_engine::{Cap, PayloadCap, SpinMutex};
+use crate::adapter::step_engine::{Cap, Guard, PayloadCap, SpinMutex, Weak};
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use tx_ext4_format::pager::{BlockImage, DirEntryLite, Ext4Pager, InodeMetaLite, InodeNo};
 use tx_ext4_format::Ext4FormatError;
 use tx_subsystems::execution::Errno;
 use tx_subsystems::mount::{MountPayload, MountPayloadPin};
+use tx_subsystems::page_backed::{PageContainer, PageContainerKind};
 use tx_subsystems::vfs::structure::DirCursor;
 use tx_subsystems::vfs::structure::{FsObjectId, InodeMeta, Timespec};
 
 pub(crate) const EXT4_ROOT_INODE: u32 = 2;
 pub(crate) const READDIR_WINDOW_ENTRIES: usize = 64;
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum OrphanState {
+    Pending,
+    Reclaiming,
+}
+
 pub(crate) struct Ext4FsInstance<I> {
     pager: Ext4PagerCell<I>,
     lookup_cache: SpinMutex<LookupCache>,
     dir_cache: SpinMutex<DirCache>,
     inode_meta_cache: SpinMutex<InodeMetaCache>,
+    /// Per-inode page-cache coherence index. Every hard-link alias of a
+    /// regular inode must materialise the same PageContainer while it is
+    /// alive; separate containers would permit stale reads and writeback
+    /// through one name to overwrite data written through another.
+    page_containers: SpinMutex<BTreeMap<u32, Weak<PageContainer>>>,
+    /// Inodes whose namespace link count reached zero. Entries remain here
+    /// while an RNode/OpenFile/mmap/PageContainer can still reach the payload;
+    /// the last-payload callback retries `destroy_inode`.
+    orphaned_inodes: SpinMutex<BTreeMap<u32, OrphanState>>,
     pub(crate) mount_pin: SpinMutex<Option<MountPayloadPin>>,
     /// Per-mount read-only flag. When `true`, every mutating
     /// `FsOps` method (`create_inode`, `mkdir`, `unlink`, …) and
@@ -38,6 +55,8 @@ impl<I: BlockImage> Ext4FsInstance<I> {
             lookup_cache: SpinMutex::new(LookupCache::empty()),
             dir_cache: SpinMutex::new(DirCache::empty()),
             inode_meta_cache: SpinMutex::new(InodeMetaCache::empty()),
+            page_containers: SpinMutex::new(BTreeMap::new()),
+            orphaned_inodes: SpinMutex::new(BTreeMap::new()),
             mount_pin: SpinMutex::new(None),
             read_only: AtomicBool::new(read_only),
         }))
@@ -59,8 +78,15 @@ impl<I: BlockImage> Ext4FsInstance<I> {
         &self,
         f: impl FnOnce(&mut Ext4Pager<I>) -> tx_ext4_format::Result<T>,
     ) -> Result<T, Errno> {
+        self.with_pager_raw(f).map_err(map_format_error)
+    }
+
+    pub(crate) fn with_pager_raw<T>(
+        &self,
+        f: impl FnOnce(&mut Ext4Pager<I>) -> tx_ext4_format::Result<T>,
+    ) -> tx_ext4_format::Result<T> {
         let mut pager = self.pager.lock();
-        f(&mut pager).map_err(map_format_error)
+        f(&mut pager)
     }
 
     pub(crate) fn lookup_cached(
@@ -148,6 +174,137 @@ impl<I: BlockImage> Ext4FsInstance<I> {
         self.lookup_cache.lock().invalidate_parent(parent);
         self.dir_cache.lock().invalidate(parent);
         self.inode_meta_cache.lock().invalidate(parent);
+    }
+
+    /// Resolve or create the one coherent page cache for `inode`.
+    ///
+    /// The coherence lock is held while the on-disk inode is revalidated and
+    /// the new container is published. `destroy_orphaned_inode` takes the
+    /// same lock before freeing/reusing the inode number, closing the race
+    /// between lookup metadata and materialisation on another CPU.
+    pub(crate) fn get_or_create_page_container(
+        &self,
+        inode: InodeNo,
+        fs_object_id: FsObjectId,
+        mount: MountPayloadPin,
+        minimum_page_count: u64,
+        guard: &Guard<'_>,
+    ) -> Result<(Cap<PageContainer>, InodeMetaLite), Errno> {
+        {
+            let mut index = self.page_containers.lock();
+            if let Some(weak) = index.get(&inode.get()).copied() {
+                if let Some(container) = weak.upgrade(guard) {
+                    drop(index);
+                    let meta = self.with_pager(|pager| pager.inode_meta(inode))?;
+                    return Ok((container, meta));
+                }
+                index.remove(&inode.get());
+            }
+        }
+
+        let meta = self.with_pager(|pager| pager.inode_meta(inode))?;
+        if meta.mode == 0 || meta.nlinks == 0 {
+            return Err(Errno::ENOENT);
+        }
+        let page_count = meta
+            .size
+            .div_ceil(tx_subsystems::vm::USER_PAGE_SIZE as u64)
+            .max(minimum_page_count);
+        let container = PageContainer::new_cap(
+            PageContainerKind::File {
+                mount,
+                fs_object_id,
+            },
+            page_count,
+        )
+        .map_err(|_| Errno::ENOMEM)?;
+        container.set_size_bytes(meta.size);
+
+        // Publish under the coherence lock, but allocate the candidate before
+        // taking it: zone allocation can drain EBR and run a PageContainer
+        // finalizer, which may re-enter this instance.
+        let orphaned = self.orphaned_inodes.lock();
+        if orphaned.contains_key(&inode.get()) {
+            drop(orphaned);
+            drop(container);
+            return Err(Errno::ENOENT);
+        }
+        let mut index = self.page_containers.lock();
+        if let Some(weak) = index.get(&inode.get()).copied() {
+            if let Some(existing) = weak.upgrade(guard) {
+                drop(index);
+                drop(orphaned);
+                drop(container);
+                let latest = self.with_pager(|pager| pager.inode_meta(inode))?;
+                return Ok((existing, latest));
+            }
+            index.remove(&inode.get());
+        }
+        let latest = self.with_pager(|pager| pager.inode_meta(inode))?;
+        if latest.mode == 0 || latest.nlinks == 0 {
+            drop(index);
+            drop(orphaned);
+            drop(container);
+            return Err(Errno::ENOENT);
+        }
+        container.set_size_bytes(latest.size);
+        index.insert(inode.get(), container.downgrade());
+        drop(index);
+        drop(orphaned);
+        Ok((container, latest))
+    }
+
+    pub(crate) fn mark_inode_orphaned(&self, inode: InodeNo) {
+        self.orphaned_inodes
+            .lock()
+            .insert(inode.get(), OrphanState::Pending);
+    }
+
+    /// Reclaim a zero-link inode only after its coherent PageContainer no
+    /// longer has a strong reference. ext4 materialises every inode kind
+    /// through this indexed file container, so directories and symlinks use
+    /// the same final-payload gate as regular files.
+    pub(crate) fn destroy_orphaned_inode(
+        &self,
+        inode: InodeNo,
+        guard: &Guard<'_>,
+    ) -> Result<(), Errno> {
+        {
+            let mut orphaned = self.orphaned_inodes.lock();
+            if orphaned.get(&inode.get()) != Some(&OrphanState::Pending) {
+                return Ok(());
+            }
+            orphaned.insert(inode.get(), OrphanState::Reclaiming);
+        }
+
+        let mut containers = self.page_containers.lock();
+        if let Some(weak) = containers.get(&inode.get()).copied() {
+            if let Some(live) = weak.upgrade(guard) {
+                drop(containers);
+                self.orphaned_inodes
+                    .lock()
+                    .insert(inode.get(), OrphanState::Pending);
+                // Dropping this temporary reference outside every lock may
+                // itself be the last release and re-enter the callback.
+                drop(live);
+                return Ok(());
+            }
+            containers.remove(&inode.get());
+        }
+        drop(containers);
+
+        // Extent collection allocates and block I/O can trigger unrelated
+        // completion/finalizer work. Never hold orphan/coherence locks here.
+        let result = self.with_pager(|pager| pager.destroy_inode(inode));
+        let mut orphaned = self.orphaned_inodes.lock();
+        if result.is_ok() {
+            orphaned.remove(&inode.get());
+            drop(orphaned);
+            self.inode_meta_cache.lock().invalidate(inode);
+        } else {
+            orphaned.insert(inode.get(), OrphanState::Pending);
+        }
+        result
     }
 }
 
@@ -610,7 +767,12 @@ pub(crate) fn map_format_error(err: Ext4FormatError) -> Errno {
         }
         Ext4FormatError::OutOfBounds => Errno::ENOENT,
         Ext4FormatError::Unsupported => Errno::ENOSYS,
+        Ext4FormatError::ExtentTreeFull { .. } => Errno::EFBIG,
         Ext4FormatError::WouldBlock => Errno::EAGAIN,
+        Ext4FormatError::NotEmpty => Errno::ENOTEMPTY,
+        Ext4FormatError::IsDirectory => Errno::EISDIR,
+        Ext4FormatError::NotDirectory => Errno::ENOTDIR,
+        Ext4FormatError::InvalidInput => Errno::EINVAL,
     }
 }
 

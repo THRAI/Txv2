@@ -261,7 +261,7 @@ pub(super) async fn sys_mkdirat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sys
     let parent_dentry = if parent_path.is_empty() {
         rooted_at
     } else {
-        match walk_from(rooted_at, parent_path, &cred) {
+        match walk_from_process(rooted_at, parent_path, &cred, &ctx.process) {
             Ok(d) => d,
             Err(e) => return SyscallResult::Error(e),
         }
@@ -336,7 +336,7 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     let parent_dentry = if parent_path.is_empty() {
         rooted_at
     } else {
-        match walk_from(rooted_at, parent_path, &cred) {
+        match walk_from_process(rooted_at, parent_path, &cred, &ctx.process) {
             Ok(d) => d,
             Err(e) => return SyscallResult::Error(e),
         }
@@ -350,19 +350,19 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
         Some(o) => o,
         None => return SyscallResult::Error(EROFS_VALUE),
     };
-    let target_id = {
-        let guard = step_engine::guard();
-        match fs_ops.lookup(parent_id, basename, &guard) {
-            V3::Done(id) => id,
-            V3::Continue { .. } | V3::Yield { .. } => return SyscallResult::Error(EIO_VALUE),
-            V3::Err(errno)
-                if errno == Errno::ENOENT && try_unlink_unix_socket_path(ctx, &path, &guard) =>
-            {
-                return SyscallResult::Return(0);
+    let target_dentry =
+        match walk_from_nofollow_process(parent_dentry.clone(), basename, &cred, &ctx.process) {
+            Ok(dentry) => dentry,
+            Err(errno) if errno == ENOENT_VALUE => {
+                let guard = step_engine::guard();
+                if try_unlink_unix_socket_path(ctx, &path, &guard) {
+                    return SyscallResult::Return(0);
+                }
+                return SyscallResult::Error(errno);
             }
-            V3::Err(errno) => return SyscallResult::error_from(Errno::from(errno)),
-        }
-    };
+            Err(errno) => return SyscallResult::Error(errno),
+        };
+    let target_id = target_dentry.rnode().fs_object_id();
     let child_meta = {
         let guard = step_engine::guard();
         match fs_ops.load_inode_meta(target_id, &guard) {
@@ -398,10 +398,14 @@ pub(super) async fn sys_unlinkat<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sy
     match outcome {
         V3::Done(()) => {
             parent_dentry.remove_cached_child_by_name(basename);
-            if want_rmdir || child_meta.nlinks <= 1 {
-                let guard = step_engine::guard();
-                let _ = fs_ops.destroy_inode(target_id, &guard);
-            }
+            // Offer an immediate destruction opportunity for backends whose
+            // payload is independently retained (tmpfs). ext4 observes the
+            // live coherent PageContainer and deliberately defers; its final
+            // container drop retries after every OpenFile/mmap is gone.
+            let guard = step_engine::guard();
+            let _ = fs_ops.destroy_inode(target_id, &guard);
+            drop(guard);
+            drop(target_dentry);
             SyscallResult::Return(0)
         }
         V3::Continue { .. } | V3::Yield { .. } => SyscallResult::Error(EIO_VALUE),
@@ -1809,27 +1813,40 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     let old_parent_dentry = if old_parent_path.is_empty() {
         old_root.clone()
     } else {
-        match walk_from(old_root.clone(), old_parent_path, &cred) {
+        match walk_from_process(old_root.clone(), old_parent_path, &cred, &ctx.process) {
             Ok(d) => d,
             Err(e) => return SyscallResult::Error(e),
         }
     };
-    let old_child_dentry = match walk_from(old_root.clone(), &oldpath, &cred) {
+    let old_child_dentry = match walk_from_nofollow_process(
+        old_parent_dentry.clone(),
+        old_basename,
+        &cred,
+        &ctx.process,
+    ) {
         Ok(d) => d,
         Err(e) => return SyscallResult::Error(e),
     };
     let new_parent_dentry = if new_parent_path.is_empty() {
         new_root.clone()
     } else {
-        match walk_from(new_root.clone(), new_parent_path, &cred) {
+        match walk_from_process(new_root.clone(), new_parent_path, &cred, &ctx.process) {
             Ok(d) => d,
             Err(e) => return SyscallResult::Error(e),
         }
     };
-    // Displaced inode is optional — walk_from returns Err(ENOENT)
-    // when the new path doesn't exist, which is the normal case
-    // for a rename that creates rather than overwrites.
-    let displaced_dentry = walk_from(new_root.clone(), &newpath, &cred).ok();
+    // The displaced inode is optional only for ENOENT. Other walker errors
+    // must not be mistaken for an absent destination.
+    let displaced_dentry = match walk_from_nofollow_process(
+        new_parent_dentry.clone(),
+        new_basename,
+        &cred,
+        &ctx.process,
+    ) {
+        Ok(dentry) => Some(dentry),
+        Err(errno) if errno == ENOENT_VALUE => None,
+        Err(errno) => return SyscallResult::Error(errno),
+    };
     if (flags & RENAME_NOREPLACE) != 0 && displaced_dentry.is_some() {
         return SyscallResult::Error(EEXIST_VALUE);
     }
@@ -1916,12 +1933,16 @@ pub(super) async fn sys_renameat2<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
             old_parent_dentry.remove_cached_child_by_name(b".tx_rename_exchange_tmp");
             old_parent_dentry.remove_cached_child_by_name(old_basename);
             new_parent_dentry.remove_cached_child_by_name(new_basename);
+            // `displaced_dentry` pins an overwritten target through commit.
+            // ext4 marks it orphaned and the live PageContainer gates this
+            // opportunity; final payload drop retries physical reclamation.
             if (flags & RENAME_EXCHANGE) == 0 {
                 if let Some(displaced) = displaced_dentry.as_ref() {
                     let guard = step_engine::guard();
                     let _ = fs_ops.destroy_inode(displaced.rnode().fs_object_id(), &guard);
                 }
             }
+            drop(displaced_dentry);
             SyscallResult::Return(0)
         }
         StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => SyscallResult::Error(EIO_VALUE),

@@ -12,8 +12,8 @@ mod local;
 mod retired;
 
 pub use domain::{
-    cpu_summary, init_on_ap, init_on_bsp, summary, try_drain, CpuEpochSummary, DrainStats,
-    EpochError, EpochSummary,
+    cpu_summary, drain_requested, init_on_ap, init_on_bsp, summary, try_drain, CpuEpochSummary,
+    DrainStats, EpochError, EpochSummary,
 };
 pub use guard::Guard;
 pub use retired::RETIRED_BAG_CAPACITY;
@@ -67,6 +67,14 @@ pub fn borrow_current_guard() -> Option<Guard<'static>> {
 /// Try to reclaim at most `budget` expired retired nodes.
 pub fn drain_with_budget(budget: usize) -> DrainStats {
     try_drain(budget)
+}
+
+/// Reclaim a pending periodic batch, if one was requested.
+///
+/// This is intended for normal-stack reactor maintenance points. Calls made
+/// from IRQ/trap context preserve the request and execute no callbacks.
+pub fn drain_requested_with_budget(budget: usize) -> DrainStats {
+    drain_requested(budget)
 }
 
 /// Schedule `ptr` for delayed reclamation through the EBR domain.

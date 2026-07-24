@@ -12,7 +12,7 @@
 //!   pmap pipeline methods used by the RV64 assembly path.
 //! - individual tests then exercise bootstrap aliasing, identity teardown,
 //!   direct-map/MMIO mapping, typed PT-node fallback, root lifecycle, and
-//!   protect/unmap pruning.
+//!   protect/unmap retention.
 //!
 //! These stay as a private unit-test module instead of crate-level integration
 //! tests because they intentionally inspect board-private PTEs, PT-node pool
@@ -639,6 +639,7 @@ fn unmap_kernel_mapping_clears_leaf_and_reports_invalidation() {
     let _guard = pmap_test_guard();
     reset_typed_pt_allocator_test_state();
     reset_pt_node_pool_for_test();
+    reset_committed_pt_nodes_for_test();
     let mut bag = test_bag();
     publish_bootstrap_bag(&mut bag);
 
@@ -664,9 +665,14 @@ fn unmap_kernel_mapping_clears_leaf_and_reports_invalidation() {
     assert_eq!(result.invalidation().virt(), virt);
     assert_eq!(result.invalidation().size(), 2 * 1024 * 1024);
 
-    assert_eq!(bag.bootstrap_root_ref().0[rv64_1g_leaf_index(virt.0)], 0);
+    assert!(pte_is_branch(
+        bag.bootstrap_root_ref().0[rv64_1g_leaf_index(virt.0)]
+    ));
+    let l1 = l1_table_for_test(&bag, virt).expect("retained kernel l1");
+    assert_eq!(l1.0[rv64_2m_leaf_index(virt.0)], 0);
 
     shootdown_kernel_mapping(result.invalidation());
+    reset_committed_pt_nodes_for_test();
 }
 
 #[test]
@@ -928,7 +934,7 @@ fn destroying_process_root_tears_down_committed_user_tables() {
 }
 
 #[test]
-fn process_root_maps_protects_unmaps_and_prunes_user_tables() {
+fn process_root_unmap_retains_user_tables_until_root_destroy() {
     let _guard = pmap_test_guard();
     reset_typed_pt_allocator_test_state();
     reset_pt_node_pool_for_test();
@@ -974,11 +980,14 @@ fn process_root_maps_protects_unmaps_and_prunes_user_tables() {
     assert_eq!(result.phys(), phys);
 
     let root_table = unsafe { page_table_mut_from_phys(root.phys()) };
-    assert_eq!(root_table.0[rv64_1g_leaf_index(virt.0)], 0);
+    assert!(pte_is_branch(root_table.0[rv64_1g_leaf_index(virt.0)]));
+    let l1 = l1_table_mut_from_root(root_table, virt).expect("retained user l1");
+    let l0 = l0_table_mut(l1, virt).expect("retained user l0");
+    assert_eq!(l0.0[rv64_4k_leaf_index(virt.0)], 0);
     assert_eq!(
         pt_node_allocated_for_test(),
-        1,
-        "only the process root should remain allocated"
+        3,
+        "process root and its empty L1/L0 must remain until root destroy"
     );
 
     destroy_pmap_root_from_bag(&bag, root);

@@ -940,6 +940,17 @@ pub trait IrqIf {
         false
     }
 
+    /// Return whether the current execution is using an architecture trap
+    /// stack.
+    ///
+    /// Synchronous exceptions such as syscalls are not IRQ context, but they
+    /// still run on a small per-hart trap stack on stackless platforms.
+    /// Substrates use this fact to defer destructor-heavy maintenance until
+    /// control has returned to a normal kernel/reactor stack.
+    fn in_trap_context() -> bool {
+        Self::in_irq_context()
+    }
+
     fn interrupts_enabled() -> bool {
         true
     }

@@ -847,11 +847,6 @@ pub(super) fn sys_writev_pagebacked_oneshot<'a>(
         drop(step_engine::guard());
     }
 
-    if total > 0 {
-        if let Err(errno) = flush_pagebacked_file(&file) {
-            return Some(SyscallResult::error_from(errno));
-        }
-    }
     Some(SyscallResult::Return(total))
 }
 
@@ -1790,11 +1785,6 @@ async fn sys_write_pagebacked<'a>(
     .await
     {
         Ok(total) => {
-            if total > 0 {
-                if let Err(errno) = flush_pagebacked_file(file) {
-                    return SyscallResult::error_from(errno);
-                }
-            }
             emit_debug_counter(b"debug.write.pagebacked.done", total as i64);
             emit_debug_counter(b"debug.write.pagebacked.phase", 4);
             SyscallResult::Return(total as i64)
@@ -1811,20 +1801,6 @@ async fn sys_write_pagebacked<'a>(
             }
             SyscallResult::error_from(errno)
         }
-    }
-}
-
-fn flush_pagebacked_file(file: &Cap<OpenFile>) -> Result<(), tx_subsystems::execution::Errno> {
-    use tx_substrate::step::StepOutcome as V3;
-
-    let Some(pc) = crate::linux_syscall::vm::extract_page_container(file) else {
-        return Ok(());
-    };
-    let guard = crate::adapter::step_engine::guard();
-    match tx_subsystems::page_backed::step_fsync(&pc, &guard) {
-        V3::Done(()) => Ok(()),
-        V3::Err(errno) => Err(errno.into()),
-        V3::Continue { .. } | V3::Yield { .. } => Err(tx_subsystems::execution::Errno::EIO),
     }
 }
 

@@ -762,6 +762,22 @@ fn reclaim_clean_file_pages_drops_clean_cache_entries() {
 }
 
 #[test]
+fn file_page_container_has_no_artificial_page_count_limit() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let fs = Arc::new(RecordingFs::new());
+    let pc = file_page_container(fs.clone(), fs, FsObjectId::new(57), 4);
+
+    assert_eq!(pc.page_count(), 4, "initial cache window remains unchanged");
+    assert_eq!(pc.byte_capacity(), Some(u64::MAX));
+    assert_eq!(
+        pc.check_bounds(PageIndex::new(65536)),
+        Ok(()),
+        "regular files must be able to grow beyond the former 256 MiB limit"
+    );
+}
+
+#[test]
 fn anon_page_container_materializes_once_and_tracks_dirty_writes() {
     setup_host_substrate();
     let pc = PageContainer::new(

@@ -33,8 +33,8 @@ mod reflink;
 mod targeted_read;
 mod user_buffer;
 pub use cross_variant::step_copy_file_range;
-pub use fs_page_backing::FsPageBacking;
-pub use lifecycle::{step_fallocate, step_fsync, step_truncate, FallocateOp, TruncateOp};
+pub use fs_page_backing::{FilesystemStats, FsPageBacking};
+pub use lifecycle::{step_fallocate, step_fsync, step_truncate, FallocateOp, FsyncOp, TruncateOp};
 pub use reflink::{cow_replace_into_private, install_shared_page};
 pub use targeted_read::read_exact_at;
 pub use user_buffer::{
@@ -49,8 +49,10 @@ static PAGE_CONTAINER_ZONE: Zone<PageContainer> = Zone::const_new();
 static PAGE_CONTAINER_RECLAIM_REGISTRY: SpinMutex<alloc::vec::Vec<Weak<PageContainer>>> =
     SpinMutex::new(alloc::vec::Vec::new());
 
-const PAGE_CACHE_RECLAIM_BATCH: usize = 256;
-const PAGE_CACHE_RECLAIM_LOW_WATERMARK: usize = 1024;
+const PAGE_CACHE_RECLAIM_MIN_BATCH: usize = 256;
+const PAGE_CACHE_RECLAIM_MAX_BATCH: usize = 4096;
+const PAGE_CACHE_RECLAIM_MIN_WATERMARK: usize = 1024;
+const PAGE_CACHE_RECLAIM_MAX_WATERMARK: usize = 128 * 1024;
 
 unsafe impl ZoneAllocated for PageContainer {
     fn zone() -> &'static Zone<Self> {
@@ -404,6 +406,28 @@ pub struct PageContainer {
 unsafe impl Send for PageContainer {}
 unsafe impl Sync for PageContainer {}
 
+impl Drop for PageContainer {
+    fn drop(&mut self) {
+        let PageContainerKind::File {
+            mount,
+            fs_object_id,
+        } = &self.kind
+        else {
+            return;
+        };
+
+        // A file mapping can outlive every RNode/OpenFile. Therefore the
+        // last file-backed PageContainer, rather than the last RNode, is the
+        // regular-file payload lifetime boundary. The backend still checks
+        // nlink/orphan state, so linked files take the cheap no-op path.
+        let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
+        let _ = mount
+            .payload()
+            .fs_ops()
+            .destroy_inode(*fs_object_id, &guard);
+    }
+}
+
 #[derive(Debug)]
 struct PageContainerState {
     pages: PageCacheIndex,
@@ -587,7 +611,14 @@ impl PageContainer {
         kind: PageContainerKind,
         page_count: u64,
     ) -> Result<Cap<PageContainer>, ZoneError> {
-        step_engine::sign(Self::new(kind, page_count))
+        let reclaimable_file = matches!(&kind, PageContainerKind::File { .. });
+        let container = step_engine::sign(Self::new(kind, page_count))?;
+        if reclaimable_file {
+            PAGE_CONTAINER_RECLAIM_REGISTRY
+                .lock()
+                .push(container.downgrade());
+        }
+        Ok(container)
     }
 
     pub fn new_file_cap(
@@ -609,9 +640,6 @@ impl PageContainer {
             page_count,
         )?;
         container.set_size_bytes(size_bytes);
-        PAGE_CONTAINER_RECLAIM_REGISTRY
-            .lock()
-            .push(container.downgrade());
         Ok(container)
     }
 
@@ -1205,6 +1233,13 @@ impl PageContainer {
     }
 
     fn check_bounds(&self, page: PageIndex) -> Result<(), PageCacheError> {
+        // A regular file is sparse and growable. Its EOF and maximum file
+        // size are enforced by the filesystem backend, not by the initial
+        // PageContainer cache window. Keeping the initial page_count as a
+        // hard bound made writes fail at an arbitrary 256 MiB boundary.
+        if matches!(self.kind, PageContainerKind::File { .. }) {
+            return Ok(());
+        }
         if page.as_u64() >= self.page_count {
             return Err(PageCacheError::OutOfBounds);
         }
@@ -1212,6 +1247,9 @@ impl PageContainer {
     }
 
     fn byte_capacity(&self) -> Option<u64> {
+        if matches!(self.kind, PageContainerKind::File { .. }) {
+            return Some(u64::MAX);
+        }
         self.page_count
             .checked_mul(crate::vm::USER_PAGE_SIZE as u64)
     }
@@ -1469,7 +1507,7 @@ pub fn reserve_frame_with_reclaim(
     match page_allocator::reserve_frame(policy) {
         Ok(frame) => Ok(frame),
         Err(AllocError::Exhausted) => {
-            reclaim_clean_file_pages(PAGE_CACHE_RECLAIM_BATCH);
+            reclaim_clean_file_pages(PAGE_CACHE_RECLAIM_MAX_BATCH);
             page_allocator::reserve_frame(policy)
         }
         Err(error) => Err(error),
@@ -1477,12 +1515,22 @@ pub fn reserve_frame_with_reclaim(
 }
 
 pub fn reclaim_clean_file_pages_if_low() -> usize {
-    match page_allocator::free_count() {
-        Ok(free) if free <= PAGE_CACHE_RECLAIM_LOW_WATERMARK => {
-            reclaim_clean_file_pages(PAGE_CACHE_RECLAIM_BATCH)
-        }
-        _ => 0,
+    let (Ok(free), Ok(total)) = (page_allocator::free_count(), page_allocator::total_count())
+    else {
+        return 0;
+    };
+    let watermark = (total / 8).clamp(
+        PAGE_CACHE_RECLAIM_MIN_WATERMARK,
+        PAGE_CACHE_RECLAIM_MAX_WATERMARK,
+    );
+    if free > watermark {
+        return 0;
     }
+
+    let deficit = watermark.saturating_sub(free).saturating_add(1);
+    reclaim_clean_file_pages(
+        deficit.clamp(PAGE_CACHE_RECLAIM_MIN_BATCH, PAGE_CACHE_RECLAIM_MAX_BATCH),
+    )
 }
 
 pub fn reclaim_clean_file_pages(budget: usize) -> usize {

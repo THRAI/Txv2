@@ -467,6 +467,11 @@ impl Inode {
                     if let Some(block) = extent.physical_for(logical_block) {
                         return Ok(BlockMapping::Data(block));
                     }
+                    if extent.contains(logical_block) {
+                        return Ok(BlockMapping::Unwritten(
+                            extent.physical_start + (logical_block - extent.logical_block) as u64,
+                        ));
+                    }
                 }
                 Ok(BlockMapping::Hole)
             }
@@ -514,6 +519,10 @@ impl Default for Inode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockMapping {
     Data(u64),
+    /// A physically allocated extent whose contents are not initialized yet.
+    /// Reads return zeroes; the first write converts the covered block to an
+    /// initialized extent without allocating another physical block.
+    Unwritten(u64),
     Hole,
     NeedNode(u64),
 }

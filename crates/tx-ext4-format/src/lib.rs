@@ -14,5 +14,18 @@ pub enum Ext4FormatError {
     OutOfBounds,
     Truncated,
     Unsupported,
+    /// The extent tree cannot grow any deeper while inserting a new
+    /// logical-to-physical mapping.  Keep the insertion context in the
+    /// error so callers and tests do not have to infer an opaque ENOSYS.
+    ExtentTreeFull {
+        inode: u32,
+        logical_block: u32,
+        depth: u16,
+        entries: u16,
+    },
     WouldBlock,
+    NotEmpty,
+    IsDirectory,
+    NotDirectory,
+    InvalidInput,
 }

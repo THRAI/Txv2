@@ -78,7 +78,7 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
-use alloc::{boxed::Box, sync::Arc};
+use alloc::{boxed::Box, format, sync::Arc};
 
 use crate::adapter::boot_runtime;
 use crate::adapter::step_engine::{Cap, PayloadCap};
@@ -89,8 +89,10 @@ use boot_runtime::userspace::{
 };
 use tx_hal::{PercpuIf, TrapIf, TxPlatform};
 use tx_shims::linux_syscall::numbers::{
-    FUTEX_CMD_MASK, FUTEX_WAKE, FUTEX_WAKE_BITSET, NR_CLONE, NR_FUTEX, NR_MMAP, NR_MPROTECT,
-    NR_MUNMAP, NR_READ, NR_READV, NR_RT_SIGPROCMASK, NR_WRITE, NR_WRITEV,
+    FUTEX_CMD_MASK, FUTEX_WAKE, FUTEX_WAKE_BITSET, NR_CLONE, NR_CLOSE, NR_FALLOCATE, NR_FDATASYNC,
+    NR_FSTATFS, NR_FSYNC, NR_FTRUNCATE, NR_FUTEX, NR_LSEEK, NR_MMAP, NR_MPROTECT, NR_MSYNC,
+    NR_MUNMAP, NR_PWRITE64, NR_PWRITEV, NR_PWRITEV2, NR_READ, NR_READV, NR_RENAMEAT2,
+    NR_RT_SIGPROCMASK, NR_STATFS, NR_SYNC_FILE_RANGE, NR_UNLINKAT, NR_WRITE, NR_WRITEV,
 };
 use tx_shims::linux_syscall::SyscallResult;
 use tx_subsystems::signal::deliver_synchronous_fault;
@@ -108,6 +110,118 @@ use tx_subsystems::vm::{
 };
 
 const HOT_SYSCALL_HANDOFF_BUDGET: u8 = 64;
+const POST_TRAP_EBR_BUDGET: usize = 512;
+
+/// Run deferred destructors after the architecture trap shell has longjmped
+/// back to the saved reactor stack.
+///
+/// `epoch::guard()` can be entered on the small per-hart trap stack, so its
+/// periodic cold path only publishes a collection request there. Waiting for
+/// the outer hart loop is too late for a continuously runnable compiler: one
+/// future poll can process many immediately-ready syscall/page-fault
+/// round-trips. This seam executes once per resolved userspace trap, on the
+/// ordinary kernel stack, and preserves Crossbeam's bounded 512-callback batch.
+fn drain_post_trap_epoch_maintenance() {
+    let _ = crate::adapter::step_engine::drain_requested_with_budget(POST_TRAP_EBR_BUDGET);
+    // RecipeTree's EBR callback intentionally transfers ownership to a second
+    // normal-stack queue. Drain it in the same round so old persistent roots do
+    // not retain millions of shared treap nodes until the reactor becomes idle.
+    let _ = tx_subsystems::vm::drain_deferred_recipe_reclaims(POST_TRAP_EBR_BUDGET);
+}
+
+fn is_link_diagnostic_process(process: &Cap<tx_subsystems::process::ProcessIdentity>) -> bool {
+    let comm = process.comm();
+    let len = comm
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(comm.len());
+    let comm = &comm[..len];
+    [
+        b"ld".as_slice(),
+        b"collect2".as_slice(),
+        b"cc".as_slice(),
+        b"rustc".as_slice(),
+        b"tg-xtask".as_slice(),
+    ]
+    .iter()
+    .any(|name| comm == *name)
+}
+
+fn is_link_file_syscall(nr: u64) -> bool {
+    matches!(
+        nr,
+        NR_STATFS
+            | NR_FSTATFS
+            | NR_WRITE
+            | NR_WRITEV
+            | NR_PWRITE64
+            | NR_PWRITEV
+            | NR_PWRITEV2
+            | NR_FTRUNCATE
+            | NR_FALLOCATE
+            | NR_FSYNC
+            | NR_FDATASYNC
+            | NR_SYNC_FILE_RANGE
+            | NR_CLOSE
+            | NR_LSEEK
+            | NR_MSYNC
+            | NR_RENAMEAT2
+            | NR_UNLINKAT
+    )
+}
+
+/// Emit only failures that can explain a final linker error. Successful writes
+/// stay silent: rustc/ld issue enough of them to make serial tracing alter the
+/// workload. ENOSYS is always interesting for linker-related processes because
+/// libc/BFD may translate an unavailable file operation into a later generic
+/// failure.
+fn report_link_syscall_failure<P: TxPlatform>(
+    process: &Cap<tx_subsystems::process::ProcessIdentity>,
+    req: &SyscallRequest,
+    result: &SyscallResult,
+) {
+    let SyscallResult::Error(errno) = *result else {
+        return;
+    };
+    if !is_link_diagnostic_process(process) || (!is_link_file_syscall(req.nr) && errno != 38) {
+        return;
+    }
+
+    let comm_raw = process.comm();
+    let comm_len = comm_raw
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(comm_raw.len());
+    let comm = core::str::from_utf8(&comm_raw[..comm_len]).unwrap_or("?");
+    let fd = req.args[0] as u32;
+    let file_details = process.fd(fd).and_then(|file| {
+        let tx_subsystems::vfs::structure::OpenFileBacking::Rnode { rnode } = file.backing() else {
+            return None;
+        };
+        let size = match rnode.backing() {
+            tx_subsystems::vfs::RNodeBacking::PageBacked { pc } => pc.size_bytes(),
+            _ => rnode.meta().size,
+        };
+        Some(format!(
+            ":inode={}:offset={}:size={}",
+            rnode.fs_object_id().as_u64(),
+            file.offset(),
+            size,
+        ))
+    });
+    let line = format!(
+        "txkernel:linkdiag:syscall-error:pid={}:comm={}:nr={}:errno={}:a0={:#x}:a1={:#x}:a2={:#x}{}\n",
+        process.pid.0,
+        comm,
+        req.nr,
+        errno,
+        req.args[0],
+        req.args[1],
+        req.args[2],
+        file_details.as_deref().unwrap_or(""),
+    );
+    tx_hal::console_write_str::<P>(&line);
+}
 
 /// Translate the reactor's `PageFaultAccess` into the VM subsystem's
 /// `AccessMode`, which is what `VmFault` consumes. The two enums do
@@ -611,6 +725,13 @@ pub async fn run_thread<P: TxPlatform>(
                     emit_syscall_roundtrip_marker(sysno, b"debug.thread.enter.before");
                 }
                 <P as TrapIf>::enter_userspace_with_context(&ctx, root);
+                // A real-platform return means the user pmap was activated and
+                // userspace trapped back to this reactor stack.  LA64 cannot
+                // enable vmalloc during substrate init because its global PGDH
+                // becomes active only at this hand-off; publish that fact now.
+                // RV64 already enables vmalloc during substrate init, so this
+                // idempotent notification is a no-op there.
+                tx_substrate::slab::enable_vmalloc_after_kernel_pmap_activation();
             } else {
                 return;
             }
@@ -635,6 +756,7 @@ pub async fn run_thread<P: TxPlatform>(
             let _ = clear_current_userspace_payload(entry_hart);
         }
         payload.set_active_userspace_request(None);
+        drain_post_trap_epoch_maintenance();
         if let UserspaceTrapInfo::Syscall(req) = trap {
             emit_syscall_roundtrip_marker(req.nr, b"debug.thread.trap.consumed");
         }
@@ -794,6 +916,7 @@ pub async fn run_thread<P: TxPlatform>(
                             Box::pin(tx_shims::linux_syscall::dispatch::<P>(req, &ctx)).await
                         };
                         emit_syscall_roundtrip_marker(req.nr, b"debug.thread.dispatch.after");
+                        report_link_syscall_failure::<P>(&process, &req, &result);
                         result
                     }
                 };

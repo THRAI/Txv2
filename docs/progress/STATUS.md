@@ -1,3 +1,39 @@
+- 2026-07-24 (LA64 BuildStorm vmalloc 激活链补齐). LA64 的 PGDH 实际已在
+  `TrapIf::enter_userspace_with_context` 中激活，但运行时绕过了原先唯一调用
+  `enable_vmalloc_after_kernel_pmap_activation` 的 `VmPmap::activate` 包装层，导致诊断长期为
+  `ready=1:initialized=0`，962880-byte 分配在碎片化后错误回退到236页连续物理内存并失败。
+  现在线程运行时从真实用户态陷回后发布 pmap 已激活事实；该通知幂等，RV64 不受影响。
+  验证：`cargo xtask build --target la64-qemu --release` 通过。Next：刷新 `kernel-la` 后复跑
+  4-GiB BuildStorm，确认诊断为 `initialized=1` 且原 OOM 不再出现。Blocker：完整 guest
+  复跑尚未完成。
+- 2026-07-23 (BuildStorm ext4 删除生命周期闭环). ext4 hard link 继续共享同一个
+  `inode -> Weak<PageContainer>` 活页缓存；unlink/rmdir/rename 覆盖只更新目录项和
+  `i_links_count`，零链接 inode 进入每挂载 orphan 集合。`unlinkat`、通用 `UnlinkOp`、
+  `O_TMPFILE` 和 rename 覆盖路径均在提交期间持有 nofollow 目标，并只提供一次后端销毁机会；
+  ext4 检测到活 PageContainer 时拒绝提前复用，最后一个 file PageContainer 经 EBR 析构后
+  再次调用 `destroy_inode`，此时才回收叶 extent、extent 索引块、数据块位图和 inode 位图。
+  truncate 缩小时同步裁剪 extent 树并释放 EOF 后数据块。rename 现处理同 inode no-op、
+  覆盖目标 nlink/orphan、目录类型校验、非空目录、跨目录 `..`/父 nlink 和祖先环检测；
+  mkdir/rmdir 父链接数也已配平。没有把重型回收塞进全局 RNode Drop，避免影响 tmpfs/FAT
+  等其他后端。验证：tx-ext4-format 19/19、tx-ext4 11/11、page_backed 91/91、tmpfs 53/53，
+  `tx-shims`/相关库 check 通过；RV64 release 与 `target/oscomp/submit/kernel-rv` 已重新构建。
+  Next：用干净官方镜像复跑 BuildStorm。
+  Blocker：ext4 metadata checksum、组/超级块空闲计数和 `INODE_UNINIT/BLOCK_UNINIT` 仍是
+  独立的磁盘一致性工作；本轮先闭合运行时 inode/块生命周期，不宣称写入式 fsck 已完全干净。
+- 2026-07-23 (BuildStorm vmalloc 失败链诊断与镜像污染隔离). 为大对象 direct-map
+  失败后的 vmalloc 回退补齐无分配诊断：记录 VA 位图使用量/最大连续区、分配阶段、物理帧
+  失败、pmap 映射错误、回滚/解除映射缺页以及被隔离的 VA 页数；OOM 汇总会输出
+  `txkernel:vmalloc:*`，用于区分 VA 耗尽、物理页申请失败、映射失败和不完整回滚。LA64
+  4 GiB 单核 BuildStorm 复跑没有触发原 962880-byte OOM，而在 `444/446: axbuild`
+  先出现对象复制 `ENOENT`，随后 Cargo 数据库 `disk I/O error`、`tee`/shell 写入失败。
+  宿主和镜像空间均充足；只读 `e2fsck -f -n` 以 rc=12 中止，确认大量 inode/目录
+  checksum 错误，并发现目录项引用 `INODE_UNINIT` 组中的已删除/未使用 inode。当前 LA
+  镜像已不适合作为内存分配器验证基线，不能用这轮结果修改 vmalloc。验证：
+  `cargo check -p tx-substrate -p tx-subsystems --lib`、`cargo test -p tx-substrate --test slab`
+  与 LA64 release/submit 构建此前均通过。Next：重新解压干净官方镜像（优先 `-snapshot`
+  复现），跑到原 OOM 并按 `txkernel:vmalloc:last_fail` 的唯一失败阶段修复。Blocker：本机
+  没有 `sdcards-final.tar.xz` 或其他干净 LA 镜像副本；当前镜像的修复会清除损坏缓存，
+  未擅自执行写入式 fsck。
 - 2026-07-21 (EBR / vmalloc 成熟路径收敛). EBR 已由临时可增长节点池改为 Crossbeam
   形状：每 CPU 64 项本地 bag、SeqCst 封口、全局页后备 FIFO、每 128 次 guard acquisition
   冷路径收集、每轮最多八个 bag、两 epoch 安全间隔；固定 1024 上限已删除，回调不持队列锁，
@@ -17837,6 +17873,82 @@
   `LA64_CSR_EUEN`/`LA64_EUEN_*` constants. Next step: rerun the RV BuildStorm
   workload and, if the stale-Cap panic remains, instrument its concrete Cap
   type/key rather than changing the EBR collection cadence.
+- 2026-07-22 BuildStorm anonymous-memory reclaim fix: `MADV_DONTNEED` and the
+  current eager `MADV_FREE` path now withdraw overlapping entries from each
+  VMA's `PrivatePageSet` after PTE teardown/shootdown, releasing the retained
+  `CachePin`s instead of refaulting old anonymous/COW contents indefinitely.
+  Verification: `cargo check -p tx-subsystems --lib` passed. Next step: rebuild
+  the LA/RV submission kernels and confirm that jemalloc no longer reports a
+  non-working `MADV_DONTNEED`; file-cache watermarks remain a separate tuning
+  item for the long BuildStorm workload.
+- 2026-07-22 BuildStorm file-cache/vmalloc pressure fix: all file-backed
+  `PageContainer`s, including the ext4 containers constructed through generic
+  `new_cap`, now enter the clean-page reclaim registry. Pressure reclaim uses
+  an allocator-sized watermark capped at 512 MiB and reclaims up to 16 MiB per
+  pass instead of waiting until only 4 MiB remains. Expanded the bounded
+  vmalloc arena from 1 GiB to 4 GiB and pre-populated one guard leaf in every
+  covered 1-GiB RV64 root slot so future process roots inherit every vmalloc
+  branch; LA64 uses the same guards under its global PGDH. Verification:
+  `cargo check -p tx-substrate --lib`, `cargo check -p tx-subsystems --lib`,
+  `cargo check -p tx-ext4 --lib`, and release `cargo xtask build` for both
+  `la64-qemu` and `rv64-qemu` passed; `git diff --check` passed. The aggregate
+  `cargo -q xtask unit` gate remains blocked by five pre-existing tx-shims
+  lib-test compilation errors. Next step: rerun the cached 4-GiB BuildStorm
+  image and confirm the tg-xtask link completes without the 962880-byte kernel
+  allocation panic.
+- 2026-07-23 BuildStorm pmap-teardown bounded-memory fix: decoded the repeated
+  962880-byte allocation exactly as `20060 * size_of::<(UserPage,
+  PmapMapping)>()` (`48` bytes in the built artifact). The production chunked
+  resident store still flattened the whole `MADV_DONTNEED` teardown range into
+  one `Vec`, then grew invalidation and pin vectors with the same resident-page
+  count. `VmPmap::teardown_range` now removes mappings directly from the
+  chunked index and completes shootdown/pin release in fixed 32-page batches,
+  so reclaim no longer allocates temporary memory proportional to the address
+  space being reclaimed. Verification: `cargo check -p tx-subsystems --lib`,
+  the nine `vm::pmap::resident::tests`, and `git diff --check` passed. Next
+  step: rebuild the LA submission kernel and rerun the cached BuildStorm image.
+- 2026-07-23 BuildStorm ext4 extent/writeback fix: replaced the single-leaf
+  write path with recursive extent-node splitting and root growth through
+  depth 5, added near-goal block allocation so sequential dirty-page flushes
+  coalesce into one extent, and made data/metadata allocation transactional:
+  failed node or inode commits restore old extent blocks and return every new
+  bitmap reservation. Unwritten extents now materialize their existing
+  physical block instead of allocating a duplicate. Ordinary `write`/`writev`
+  no longer performs a full-file fsync after every syscall; `fsync` now drives
+  PageContainer dirty-page writeback, while `close` remains the persistence
+  boundary and reports writeback errors. Production writeback errors emit
+  inode/logical-block/structured-format diagnostics to the board console.
+  Verification: `cargo test -p tx-ext4-format --test pager_mock` (22 passed,
+  including forced 340-entry leaf split, depth-2 root growth, rollback fault
+  injection, contiguous allocation, and unwritten conversion),
+  `cargo test -p tx-ext4 --lib` (11 passed),
+  `cargo check -p tx-ext4 --features host-async`, release
+  `cargo xtask build --target rv64-qemu --release`, focused rustfmt checks,
+  and `git diff --check` passed. The aggregate `cargo -q xtask unit` gate still
+  stops on the pre-existing tx-shims lib-test errors for missing
+  `ITIMER_REAL`/`NETLINK_XFRM`/`CLONE_NEWNS`, two uninferred test platform
+  parameters, and missing `build_mount_api_test_root`. The RV submission
+  artifact was generated at `target/oscomp/submit/kernel-rv`; next step is to
+  rerun the cached BuildStorm image. If writeback fails, the new
+  `txkernel:ext4:writeback:error` line identifies the exact inode, logical
+  block, and structured format error.
+- 2026-07-23 BuildStorm statfs accounting and remaining ENOSPC: added the
+  backend-neutral `FilesystemStats` snapshot to `FsPageBacking`; ext4 now
+  scans every live block-group block/inode bitmap instead of trusting stale
+  superblock counters, and tmpfs reports current page-allocator capacity.
+  `statfs(path)` resolves the path's containing mount and `fstatfs(fd)` uses
+  the fd RNode's containing mount; both now return backend values rather than
+  the old fixed 1024/768-block placeholder. Verification: production crates
+  built through `cargo -q xtask unit`, all 23 tx-ext4-format tests passed, and
+  the RV release/submission artifacts were rebuilt with matching hashes.
+  Cached-image BuildStorm still failed at the final link of `tg-xtask`:
+  `/usr/bin/ld: final link failed: No space left on device`. No
+  `txkernel:ext4:writeback:error` or kernel panic preceded it. This disproves
+  the fixed statfs result as the complete direct cause. Next investigation
+  must distinguish an ld/BFD capacity decision from an actual write/close
+  errno and instrument the statfs plus final file-write/close paths before
+  changing ext4 allocation again. Serial log:
+  `target/buildstorm-rv-statfs.log`.
 - Real K210 boot, linker, and hardware path are not implemented yet.
 - OSComp FAT32 image/test runner integration is not yet a passing boot test.
 - LA64 target availability depends on local rustup support.

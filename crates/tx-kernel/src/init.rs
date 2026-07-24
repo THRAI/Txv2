@@ -162,6 +162,10 @@ fn pid_tripwire_warning<P: TxPlatform>() {
     );
 }
 
+fn ext4_writeback_diagnostic<P: TxPlatform>(message: &str) {
+    tx_hal::console_write_str::<P>(message);
+}
+
 fn init_mount_namespace() -> Option<Cap<MountNamespace>> {
     tx_subsystems::process::init_process()?.mount_namespace_cap()
 }
@@ -652,6 +656,7 @@ impl<P: TxPlatform> CoreInit<P> {
             return false;
         };
 
+        tx_ext4::install_diagnostic_sink(ext4_writeback_diagnostic::<P>);
         use tx_fs::tx_ext4::{mount_ext4_read_write, BlockDeviceImage};
         use tx_subsystems::device::block_device_by_name;
 
@@ -1552,6 +1557,7 @@ impl<P: TxPlatform> CoreInit<P> {
             return;
         }
 
+        tx_ext4::install_diagnostic_sink(ext4_writeback_diagnostic::<P>);
         use tx_fs::tx_ext4::{mount_ext4_read_write, BlockDeviceImage};
         use tx_subsystems::device::block_device_by_name;
 

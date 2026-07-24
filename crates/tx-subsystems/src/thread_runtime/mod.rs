@@ -17,9 +17,8 @@ pub use execution::{
 };
 pub use structure::{
     allocate_tid, clear_current_thread_identity, clear_current_thread_payload,
-    clear_current_userspace_payload,
-    current_thread_identity, current_thread_payload, current_thread_payload_mask,
-    current_userspace_payload, current_userspace_payload_mask,
+    clear_current_userspace_payload, current_thread_identity, current_thread_payload,
+    current_thread_payload_mask, current_userspace_payload, current_userspace_payload_mask,
     drain_pending_syscall_return, prewarm_thread_payload_slots, set_current_thread_identity,
     set_current_thread_payload, set_current_userspace_payload, userspace_payload_trace_counters,
     ThreadIdentity, ThreadPayload, Tid, MAX_THREAD_PAYLOAD_HARTS,

@@ -642,6 +642,10 @@ impl IrqIf for Platform {
         irq_context_depth() != 0
     }
 
+    fn in_trap_context() -> bool {
+        current_stack_is_trap_stack()
+    }
+
     fn claim() -> u32 {
         plic_claim(current_plic_context())
     }
@@ -1568,6 +1572,23 @@ pub(crate) fn enter_irq_context() -> IrqContextGuard {
 
 fn irq_context_depth() -> usize {
     current_irq_depth_cell().load(Ordering::Acquire)
+}
+
+#[inline]
+fn current_stack_is_trap_stack() -> bool {
+    #[cfg(target_arch = "riscv64")]
+    {
+        let sp: usize;
+        unsafe {
+            core::arch::asm!("mv {sp}, sp", sp = out(reg) sp, options(nomem, nostack));
+        }
+        let cpu = <Platform as SmpIf>::current_cpu_id();
+        let top = trap_stack_top_for_cpu(cpu);
+        return (top.saturating_sub(RV64_TRAP_STACK_SIZE)..top).contains(&sp);
+    }
+
+    #[cfg(not(target_arch = "riscv64"))]
+    false
 }
 
 fn current_irq_depth_cell() -> &'static AtomicUsize {

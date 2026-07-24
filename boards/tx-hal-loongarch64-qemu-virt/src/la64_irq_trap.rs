@@ -723,6 +723,9 @@ pub(crate) fn write_la64_csr(csr: usize, value: usize) {
             LA64_CSR_ECFG => {
                 core::arch::asm!("csrwr {value}, 0x04", value = in(reg) value, options(nomem, nostack));
             }
+            LA64_CSR_KSAVE0 => {
+                core::arch::asm!("csrwr {value}, 0x30", value = in(reg) value, options(nomem, nostack));
+            }
             LA64_CSR_ASID => {
                 core::arch::asm!("csrwr {value}, 0x18", value = in(reg) value, options(nomem, nostack));
             }

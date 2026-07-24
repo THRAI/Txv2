@@ -1,14 +1,14 @@
 //! 内核半区（高地址）pmap 操作。
 //!
 //! 本模块负责：直接映射扩展、MMIO/内核映射的预约/提交、内核权限原地修改，
-//! 以及内核解除映射/剪空表的行为。这里是内核半区页表的所有写操作，对应
+//! 以及内核解除映射行为。这里是内核半区页表的所有写操作，对应
 //! `PmapIf` 的 `*_kernel_mapping` / `direct_map` 接口。
 //!
 //! 这里维护的核心数据结构/状态：
 //! - 存放于 `BootStaticBag<IdentityDropped>` 的全局引导根页表；
 //! - `BootstrapPmapInfo`，尤其是 substrate 要消费的直接映射范围；
 //! - 尚未发布的内核映射所用的 `PmapReservation` 中间表；
-//! - 已提交的分支表在 PT-node 登记表中的条目（后续剪空时用到）。
+//! - 已提交的分支表在 PT-node 登记表中的条目。
 //!
 //! 主要修改状态的函数：
 //! - `reserve_kernel_direct_map_1g()`、`commit_kernel_direct_map_1g()`、
@@ -22,7 +22,7 @@
 //! 辅助函数分组：
 //! - 预约辅助函数判定某个槽位是已映射、空闲、还是冲突；
 //! - 叶子辅助函数实现安全的同粒度解除映射/权限修改；
-//! - 剪空辅助函数通过 PT-node 所有权归还空的已提交 L0/L1 表。
+//! - 已提交的内核 L0/L1 表保持常驻，避免在 shootdown 前回收页表页。
 //!
 //! 模式约定：薄壳 + `_from_bag`——薄壳取全局根，`_from_bag` 真正干活，也便于
 //! 测试注入。这里仍是板卡专属的 Sv39 代码；可移植的范围 API 在
@@ -38,7 +38,7 @@ use tx_hal::{
 
 use crate::boot_static::{BootStaticBag, IdentityDropped, PageTable};
 
-use super::pt_node::{register_committed_intermediates, release_committed_pt_node_from_bag};
+use super::pt_node::register_committed_intermediates;
 use super::{
     align_up, direct_map_virt, encode_kernel_mapping_leaf, encode_leaf_pte,
     encode_leaf_pte_with_permissions, ensure_l0_table_for_reservation,
@@ -358,7 +358,8 @@ pub(crate) fn unmap_kernel_mapping(
     unmap_kernel_mapping_from_bag(BootStaticBag::<IdentityDropped>::global_ref(), virt, kind)
 }
 
-// 定位到叶子槽位并清零（只动同粒度已存在叶子），成功后剪掉可能变空的中间表。
+// 定位到叶子槽位并清零（只动同粒度已存在叶子）。已提交的内核中间表保持
+// 常驻；vmalloc 窗口有界，这避免了在上层 shootdown 之前回收页表页。
 pub(super) fn unmap_kernel_mapping_from_bag<State>(
     bag: &BootStaticBag<State>,
     virt: VirtAddr,
@@ -371,14 +372,10 @@ pub(super) fn unmap_kernel_mapping_from_bag<State>(
             let Some(l1) = l1_table_mut(bag, virt) else {
                 return Ok(None);
             };
-            let result = {
+            {
                 let slot = &mut l1.0[rv64_2m_leaf_index(virt.0)];
-                unmap_leaf_slot(slot, virt, kind)?
-            };
-            if result.is_some() {
-                prune_empty_l1_table_from_bag(bag, virt);
+                unmap_leaf_slot(slot, virt, kind)
             }
-            Ok(result)
         }
         PmapReserveKind::Page4K => {
             let Some(l1) = l1_table_mut(bag, virt) else {
@@ -392,15 +389,10 @@ pub(super) fn unmap_kernel_mapping_from_bag<State>(
                 return Err(PmapError::InvalidRequest);
             }
             let l0 = unsafe { page_table_mut_from_phys(pte_phys(l1_slot)) };
-            let result = {
+            {
                 let slot = &mut l0.0[rv64_4k_leaf_index(virt.0)];
-                unmap_leaf_slot(slot, virt, kind)?
-            };
-            if result.is_some() {
-                prune_empty_l0_table_from_bag(bag, virt);
-                prune_empty_l1_table_from_bag(bag, virt);
+                unmap_leaf_slot(slot, virt, kind)
             }
-            Ok(result)
         }
     }
 }
@@ -643,48 +635,4 @@ pub(super) fn protect_leaf_slot(
     }
     *slot = updated;
     Ok(Some(PmapInvalidation::new(virt, kind.size())))
-}
-
-// 剪空辅助函数在 unmap 之后归还变空的已提交分支表。PT-node 登记表是 pmap 专属
-// 的权威，负责把一个分支 PTE 的物理地址还原成可释放的带类型所有者。
-// 若 L0 表已空则清掉 L1 中指向它的分支槽位，并经登记表归还该 L0 表内存。
-fn prune_empty_l0_table_from_bag<State>(bag: &BootStaticBag<State>, virt: VirtAddr) {
-    let Some(l1) = l1_table_mut(bag, virt) else {
-        return;
-    };
-    let slot = &mut l1.0[rv64_2m_leaf_index(virt.0)];
-    if !pte_is_branch(*slot) {
-        return;
-    }
-
-    let phys = pte_phys(*slot);
-    let l0 = unsafe { page_table_mut_from_phys(phys) };
-    if !page_table_is_empty(l0) {
-        return;
-    }
-
-    *slot = 0;
-    release_committed_pt_node_from_bag(bag, phys);
-}
-
-// 若 L1 表已空则清掉根中指向它的分支槽位，并经登记表归还该 L1 表内存。
-fn prune_empty_l1_table_from_bag<State>(bag: &BootStaticBag<State>, virt: VirtAddr) {
-    let slot = unsafe { &mut bag.bootstrap_root_mut().0[rv64_1g_leaf_index(virt.0)] };
-    if !pte_is_branch(*slot) {
-        return;
-    }
-
-    let phys = pte_phys(*slot);
-    let l1 = unsafe { page_table_mut_from_phys(phys) };
-    if !page_table_is_empty(l1) {
-        return;
-    }
-
-    *slot = 0;
-    release_committed_pt_node_from_bag(bag, phys);
-}
-
-// 判断一张页表是否全零（所有条目为空）。
-pub(super) fn page_table_is_empty(table: &PageTable) -> bool {
-    table.0.iter().all(|entry| *entry == 0)
 }

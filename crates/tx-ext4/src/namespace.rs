@@ -3,7 +3,6 @@ use step_engine::Guard;
 use tx_ext4_format::pager::{BlockImage, DirEntryLite, InodeMetaLite};
 use tx_subsystems::execution::Errno;
 use tx_subsystems::mount::MountPayload;
-use tx_subsystems::page_backed::{PageContainer, PageContainerKind};
 use tx_subsystems::vfs::structure::{
     Credential, DirCursor, DirEntry, FsObjectId, InlineName, InodeKind, InodeMeta, RNode,
     RNodeBacking,
@@ -42,14 +41,12 @@ fn ext4_file_type_to_kind(file_type: u8) -> InodeKind {
 
 use tx_subsystems::vfs::FsOps;
 
-/// Static writable capacity for ext4 regular-file PageContainers.
+/// Initial sparse-cache window for ext4 regular-file PageContainers.
 ///
-/// PageContainer currently has a fixed `page_count` capacity. Match tmpfs'
-/// growth window (256 MiB — see `TMPFS_FILE_PAGE_CAP`) so newly-created
-/// ext4 files can grow through ordinary PageBacked writes instead of
-/// failing after one page. The original 8 MiB day-1 cap EINVAL'd git
-/// clone's pack write at ~8 MiB (finals git Task2).
-const EXT4_FILE_PAGE_CAP: u64 = 65536;
+/// This is not a file-size limit: file-backed PageContainers are sparse and
+/// may grow beyond this window. Keeping a moderate initial value preserves
+/// the existing cache geometry without rejecting large linker outputs.
+const EXT4_FILE_INITIAL_PAGE_WINDOW: u64 = 65536;
 
 /// Factory for `MountOutput::fs_ops`.
 ///
@@ -212,7 +209,7 @@ where
         &self,
         parent: FsObjectId,
         name: &[u8],
-        _target: FsObjectId,
+        target: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
         if self.is_read_only() {
@@ -222,9 +219,17 @@ where
             Ok(v) => v,
             Err(e) => return StepOutcome::err(e.into()),
         };
-        match self.with_pager(|pager| pager.remove_dir_entry(parent_ino, name)) {
-            Ok(_removed_ino) => {
+        let target_ino = match inode_no(target) {
+            Ok(v) => v,
+            Err(e) => return StepOutcome::err(e.into()),
+        };
+        match self.with_pager(|pager| pager.unlink_inode(parent_ino, name, target_ino)) {
+            Ok(remaining_links) => {
                 self.invalidate_lookup_cache_for(parent_ino);
+                self.invalidate_inode_meta(target_ino);
+                if remaining_links == 0 {
+                    self.mark_inode_orphaned(target_ino);
+                }
                 StepOutcome::done(())
             }
             Err(e) => StepOutcome::err(e.into()),
@@ -251,42 +256,18 @@ where
             Err(e) => return StepOutcome::err(e.into()),
         };
 
-        // Resolve old inode number and its ext4 file_type.
-        let old_ino = match self.with_pager(|pager| pager.lookup(old_parent_ino, old_name)) {
-            Ok(Some(ino)) => ino,
-            Ok(None) => return StepOutcome::err(Errno::ENOENT.into()),
-            Err(e) => return StepOutcome::err(e.into()),
-        };
-        // Derive ext4 dir-entry file_type from the inode mode.
-        // EXT4_FT_REG_FILE=1, EXT4_FT_DIR=2.
-        let file_type = match self.with_pager(|pager| pager.inode_meta(old_ino)) {
-            Ok(meta) => {
-                if meta.mode & 0xF000 == 0x4000 {
-                    2u8
-                } else {
-                    1u8
-                }
-            }
-            Err(e) => return StepOutcome::err(e.into()),
-        };
-
-        // Remove destination entry if it already exists (best-effort;
-        // the syscall layer already enforces RENAME_NOREPLACE before we
-        // get here, so this path is for overwrite-replace semantics).
-        let _ = self.with_pager(|pager| pager.remove_dir_entry(new_parent_ino, new_name));
-
-        // Install the new directory entry.
-        if let Err(e) = self.with_pager(|pager| {
-            pager.append_dir_entry(new_parent_ino, new_name, old_ino, file_type)
+        match self.with_pager(|pager| {
+            pager.rename_inode(old_parent_ino, old_name, new_parent_ino, new_name)
         }) {
-            return StepOutcome::err(e.into());
-        }
-        self.invalidate_lookup_cache_for(new_parent_ino);
-
-        // Remove the old directory entry.
-        match self.with_pager(|pager| pager.remove_dir_entry(old_parent_ino, old_name)) {
-            Ok(_) => {
+            Ok(outcome) => {
                 self.invalidate_lookup_cache_for(old_parent_ino);
+                self.invalidate_lookup_cache_for(new_parent_ino);
+                if let Some((displaced, remaining_links)) = outcome.displaced {
+                    self.invalidate_inode_meta(displaced);
+                    if remaining_links == 0 {
+                        self.mark_inode_orphaned(displaced);
+                    }
+                }
                 StepOutcome::done(())
             }
             Err(e) => StepOutcome::err(e.into()),
@@ -295,12 +276,42 @@ where
 
     fn link(
         &self,
-        _parent: FsObjectId,
-        _name: &[u8],
-        _target: FsObjectId,
+        parent: FsObjectId,
+        name: &[u8],
+        target: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::ENOSYS.into())
+        if self.is_read_only() {
+            return StepOutcome::err(Errno::EROFS.into());
+        }
+        let parent_ino = match inode_no(parent) {
+            Ok(v) => v,
+            Err(e) => return StepOutcome::err(e.into()),
+        };
+        let target_ino = match inode_no(target) {
+            Ok(v) => v,
+            Err(e) => return StepOutcome::err(e.into()),
+        };
+        match self.lookup_cached(parent_ino, name) {
+            Ok(Some(_)) => return StepOutcome::err(Errno::EEXIST.into()),
+            Ok(None) => {}
+            Err(e) => return StepOutcome::err(e.into()),
+        }
+        let meta = match self.inode_meta_cached(target_ino) {
+            Ok(meta) => meta,
+            Err(e) => return StepOutcome::err(e.into()),
+        };
+        if meta.mode & 0xF000 == 0x4000 {
+            return StepOutcome::err(Errno::EPERM.into());
+        }
+        match self.with_pager(|pager| pager.link_inode(parent_ino, name, target_ino)) {
+            Ok(()) => {
+                self.invalidate_lookup_cache_for(parent_ino);
+                self.invalidate_inode_meta(target_ino);
+                StepOutcome::done(())
+            }
+            Err(e) => StepOutcome::err(e.into()),
+        }
     }
 
     fn mkdir(
@@ -342,7 +353,7 @@ where
         &self,
         parent: FsObjectId,
         name: &[u8],
-        _target: FsObjectId,
+        target: FsObjectId,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
         if self.is_read_only() {
@@ -352,13 +363,15 @@ where
             Ok(v) => v,
             Err(e) => return StepOutcome::err(e.into()),
         };
-        // Remove the directory entry from the parent.  The directory
-        // itself is assumed empty (the VFS layer should have checked);
-        // we do not attempt to free the inode or its `.`/`..` entries —
-        // good enough for the busybox-musl `rmdir test` test case.
-        match self.with_pager(|pager| pager.remove_dir_entry(parent_ino, name)) {
-            Ok(_) => {
+        let target_ino = match inode_no(target) {
+            Ok(v) => v,
+            Err(e) => return StepOutcome::err(e.into()),
+        };
+        match self.with_pager(|pager| pager.unlink_directory(parent_ino, name, target_ino)) {
+            Ok(()) => {
                 self.invalidate_lookup_cache_for(parent_ino);
+                self.invalidate_inode_meta(target_ino);
+                self.mark_inode_orphaned(target_ino);
                 StepOutcome::done(())
             }
             Err(e) => StepOutcome::err(e.into()),
@@ -418,45 +431,63 @@ where
 
     fn destroy_inode(
         &self,
-        _fs_object_id: FsObjectId,
-        _guard: &Guard<'_>,
+        fs_object_id: FsObjectId,
+        guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        StepOutcome::err(Errno::ENOSYS.into())
+        if self.is_read_only() {
+            return StepOutcome::err(Errno::EROFS.into());
+        }
+        let inode = match inode_no(fs_object_id) {
+            Ok(inode) => inode,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
+        match self.destroy_orphaned_inode(inode, guard) {
+            Ok(()) => StepOutcome::done(()),
+            Err(err) => StepOutcome::err(err.into()),
+        }
     }
 
     fn materialise_rnode(
         &self,
         fs_object_id: FsObjectId,
-        meta: InodeMeta,
+        _meta: InodeMeta,
         mount: &Cap<MountPayload>,
-        _guard: &Guard<'_>,
+        guard: &Guard<'_>,
     ) -> StepOutcome<Cap<RNode>, NoProgress> {
+        let inode = match inode_no(fs_object_id) {
+            Ok(inode) => inode,
+            Err(err) => return StepOutcome::err(err.into()),
+        };
         let pin = match self.mount_pin.lock().clone() {
             Some(p) => p,
             None => return StepOutcome::err(Errno::ENOSYS.into()),
         };
 
-        const PAGE_SIZE: u64 = 4096;
         // Always allocate a writable growth window for regular files.
         // `PageContainer::new()` initialises `size_bytes` to `page_count *
         // PAGE_SIZE` (the physical capacity), not to the inode's logical size,
         // so we must call `set_size_bytes` afterwards.  Without this correction
         // O_APPEND writes compute `offset = size_bytes = PAGE_SIZE`, which
         // immediately exceeds `capacity = PAGE_SIZE`, yielding EINVAL.
-        let page_count = meta.size.div_ceil(PAGE_SIZE).max(EXT4_FILE_PAGE_CAP);
-        let pc = match PageContainer::new_cap(
-            PageContainerKind::File {
-                mount: pin,
-                fs_object_id,
-            },
-            page_count,
+        let (pc, disk_meta) = match self.get_or_create_page_container(
+            inode,
+            fs_object_id,
+            pin,
+            EXT4_FILE_INITIAL_PAGE_WINDOW,
+            guard,
         ) {
-            Ok(pc) => pc,
-            Err(_) => return StepOutcome::err(Errno::ENOMEM.into()),
+            Ok(result) => result,
+            Err(err) => return StepOutcome::err(err.into()),
         };
-        pc.set_size_bytes(meta.size);
+        let mut materialized_meta = map_inode_meta(disk_meta);
+        materialized_meta.size = pc.size_bytes();
 
-        match RNode::new_cap_in_mount(fs_object_id, meta, RNodeBacking::PageBacked { pc }, mount) {
+        match RNode::new_cap_in_mount(
+            fs_object_id,
+            materialized_meta,
+            RNodeBacking::PageBacked { pc },
+            mount,
+        ) {
             Ok(rnode) => StepOutcome::done(rnode),
             Err(_) => StepOutcome::err(Errno::ENOMEM.into()),
         }

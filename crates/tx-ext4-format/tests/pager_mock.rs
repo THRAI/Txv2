@@ -13,6 +13,7 @@ use tx_ext4_format::pager::{
 struct MemImage {
     blocks: Vec<[u8; BLOCK_SIZE]>,
     barriers: usize,
+    fail_write_block: Option<u64>,
 }
 
 impl MemImage {
@@ -20,6 +21,7 @@ impl MemImage {
         Self {
             blocks: vec![[0; BLOCK_SIZE]; blocks],
             barriers: 0,
+            fail_write_block: None,
         }
     }
 
@@ -47,6 +49,9 @@ impl BlockImage for MemImage {
     }
 
     fn write_block(&mut self, block: u64, data: &[u8; BLOCK_SIZE]) -> tx_ext4_format::Result<()> {
+        if self.fail_write_block == Some(block) {
+            return Err(Ext4FormatError::WouldBlock);
+        }
         let dst = self
             .blocks
             .get_mut(block as usize)
@@ -574,6 +579,192 @@ fn write_page_to_hole_and_tail_reads_back() {
     assert_eq!(got, filled_page(0x20), "logical 0 clobbered by writeback");
 }
 
+#[test]
+fn sequential_writeback_allocates_one_contiguous_extent() {
+    let mut image = mock_image();
+    mark_inode_bitmap_used(&mut image, 13);
+    mark_block_bitmap_used(&mut image, 48);
+    let mut pager = Ext4Pager::open(image).unwrap();
+    let inode = pager
+        .create_regular_file(InodeNo::new(2), b"sequential", 0o644, 0, 0, 0)
+        .unwrap();
+
+    for logical in 0..8u64 {
+        pager
+            .write_page(inode, logical, &filled_page(logical as u8))
+            .unwrap();
+    }
+    pager.set_inode_size(inode, 8 * BLOCK_SIZE as u64).unwrap();
+
+    let disk_inode = read_inode_from_image(pager.image(), 4, inode.get());
+    let header = ExtentHeader::parse(disk_inode.extent_root_bytes()).unwrap();
+    let extents = Extent::parse_all(disk_inode.extent_root_bytes()).unwrap();
+    assert_eq!(header.depth, 0);
+    assert_eq!(extents.len(), 1);
+    assert_eq!(extents[0].logical_block, 0);
+    assert_eq!(extents[0].actual_len(), 8);
+    assert_eq!(extents[0].physical_start, 48);
+}
+
+#[test]
+fn writeback_materializes_unwritten_extent_without_allocating_again() {
+    let mut image = mock_image();
+    mark_block_bitmap_used(&mut image, 32);
+    let mut inode = Inode::default();
+    inode.mode = Inode::S_IFREG | 0o644;
+    inode.size = BLOCK_SIZE as u64;
+    inode.blocks_512 = 8;
+    inode.links_count = 1;
+    inode.flags = Inode::EXTENTS_FL;
+    inode
+        .set_extent_root(&[Extent {
+            logical_block: 0,
+            len: Extent::UNINITIALIZED_MASK + 1,
+            physical_start: 31,
+        }])
+        .unwrap();
+    write_inode(&mut image, 14, &inode);
+
+    let mut pager = Ext4Pager::open(image).unwrap();
+    pager
+        .write_page(InodeNo::new(14), 0, &filled_page(0xA4))
+        .unwrap();
+
+    let disk_inode = read_inode_from_image(pager.image(), 4, 14);
+    let extents = Extent::parse_all(disk_inode.extent_root_bytes()).unwrap();
+    assert_eq!(extents.len(), 1);
+    assert!(extents[0].is_initialized());
+    assert_eq!(extents[0].physical_start, 31);
+    assert_eq!(disk_inode.blocks_512, 8);
+    assert!(!BitmapView::new(pager.image().block(2)).is_set(32));
+
+    let mut readback = [0u8; BLOCK_SIZE];
+    assert_eq!(
+        pager.read_page(InodeNo::new(14), 0, &mut readback).unwrap(),
+        PageRead::Data { block: 31 }
+    );
+    assert_eq!(readback, filled_page(0xA4));
+}
+
+#[test]
+fn full_extent_leaf_splits_and_grows_inode_root() {
+    const EXTENTS_PER_LEAF: usize = (BLOCK_SIZE - 12) / 12;
+    const LEAF_COUNT: usize = 4;
+    const LEAF_FIRST_BLOCK: u64 = 100;
+    const DATA_FIRST_BLOCK: u64 = 1_000;
+    const FIRST_FREE_BLOCK: usize = 3_800;
+
+    let mut image = MemImage::new(4_096);
+    let sb = Superblock {
+        inodes_count: 64,
+        blocks_count: 4_096,
+        log_block_size: 2,
+        blocks_per_group: 4_096,
+        inodes_per_group: 64,
+        inode_size: 256,
+        feature_incompat: Superblock::FEATURE_INCOMPAT_EXTENTS,
+        feature_ro_compat: Superblock::FEATURE_RO_COMPAT_HUGE_FILE,
+        journal_inode: 8,
+        ..Superblock::default()
+    };
+    sb.encode(&mut image.block_mut(0)[1024..2048]).unwrap();
+    GroupDesc {
+        block_bitmap: 2,
+        inode_bitmap: 3,
+        inode_table: 4,
+        ..GroupDesc::default()
+    }
+    .encode(&mut image.block_mut(1)[..64])
+    .unwrap();
+    mark_block_bitmap_used(&mut image, FIRST_FREE_BLOCK);
+
+    let mut root_indexes = Vec::new();
+    for leaf_index in 0..LEAF_COUNT {
+        let first_extent = leaf_index * EXTENTS_PER_LEAF;
+        let extents: Vec<_> = (0..EXTENTS_PER_LEAF)
+            .map(|offset| {
+                let extent_index = first_extent + offset;
+                Extent {
+                    logical_block: (extent_index * 2) as u32,
+                    len: 1,
+                    physical_start: DATA_FIRST_BLOCK + (extent_index * 2) as u64,
+                }
+            })
+            .collect();
+        let leaf_block = LEAF_FIRST_BLOCK + leaf_index as u64;
+        ExtentNode::encode_leaf(&extents, image.block_mut(leaf_block)).unwrap();
+        root_indexes.push(ExtentIdx {
+            logical_block: extents[0].logical_block,
+            child: leaf_block,
+        });
+    }
+
+    let mut inode = Inode::default();
+    inode.mode = Inode::S_IFREG | 0o644;
+    inode.size = (EXTENTS_PER_LEAF * LEAF_COUNT * 2 * BLOCK_SIZE) as u64;
+    inode.blocks_512 = ((EXTENTS_PER_LEAF * LEAF_COUNT + LEAF_COUNT) * 8) as u64;
+    inode.links_count = 1;
+    inode.flags = Inode::EXTENTS_FL;
+    inode.set_extent_index_root(&root_indexes, 1).unwrap();
+    write_inode(&mut image, 12, &inode);
+
+    // A failure while committing the split must restore the old tree and
+    // return every data/metadata reservation to the bitmap.
+    let mut failing_image = image.clone();
+    failing_image.fail_write_block = Some(LEAF_FIRST_BLOCK);
+    let mut failing_pager = Ext4Pager::open(failing_image).unwrap();
+    let inserted_logical = (EXTENTS_PER_LEAF * 2 - 1) as u64;
+    assert_eq!(
+        failing_pager
+            .write_page(InodeNo::new(12), inserted_logical, &filled_page(0xD7))
+            .unwrap_err(),
+        Ext4FormatError::WouldBlock
+    );
+    let failed_inode = read_inode_from_image(failing_pager.image(), 4, 12);
+    assert_eq!(
+        ExtentHeader::parse(failed_inode.extent_root_bytes())
+            .unwrap()
+            .depth,
+        1
+    );
+    let failed_bitmap = BitmapView::new(failing_pager.image().block(2));
+    assert!(!failed_bitmap.is_set(FIRST_FREE_BLOCK));
+    assert!(!failed_bitmap.is_set(FIRST_FREE_BLOCK + 1));
+    assert!(!failed_bitmap.is_set(FIRST_FREE_BLOCK + 2));
+
+    let mut pager = Ext4Pager::open(image).unwrap();
+    pager
+        .write_page(InodeNo::new(12), inserted_logical, &filled_page(0xD7))
+        .unwrap();
+
+    let disk_inode = read_inode_from_image(pager.image(), 4, 12);
+    let root_header = ExtentHeader::parse(disk_inode.extent_root_bytes()).unwrap();
+    let root = match ExtentNode::parse(disk_inode.extent_root_bytes()).unwrap() {
+        ExtentNode::Index(indexes) => indexes,
+        ExtentNode::Leaf(_) => panic!("overflowed root did not become an index"),
+    };
+    assert_eq!(root_header.depth, 2);
+    assert_eq!(root.len(), 1);
+
+    let internal = pager.image().block(root[0].child);
+    let internal_header = ExtentHeader::parse(internal).unwrap();
+    let internal_indexes = match ExtentNode::parse(internal).unwrap() {
+        ExtentNode::Index(indexes) => indexes,
+        ExtentNode::Leaf(_) => panic!("depth-2 root did not point to an index node"),
+    };
+    assert_eq!(internal_header.depth, 1);
+    assert_eq!(internal_indexes.len(), 5);
+
+    let mut readback = [0u8; BLOCK_SIZE];
+    assert!(matches!(
+        pager
+            .read_page(InodeNo::new(12), inserted_logical, &mut readback)
+            .unwrap(),
+        PageRead::Data { .. }
+    ));
+    assert_eq!(readback, filled_page(0xD7));
+}
+
 fn mark_block_bitmap_used(image: &mut MemImage, count: usize) {
     let mut bm = BitmapMut::new(image.block_mut(2));
     for bit in 0..count {
@@ -606,6 +797,245 @@ fn create_multiple_regular_files_all_findable() {
             core::str::from_utf8(name).unwrap()
         );
     }
+}
+
+#[test]
+fn hard_links_defer_then_reclaim_inode_and_blocks() {
+    let mut image = mock_image();
+    mark_inode_bitmap_used(&mut image, 13);
+    mark_block_bitmap_used(&mut image, 48);
+    let mut pager = Ext4Pager::open(image).unwrap();
+
+    let inode = pager
+        .create_regular_file(InodeNo::new(2), b"original", 0o644, 0, 0, 0)
+        .unwrap();
+    assert_eq!(inode, InodeNo::new(14));
+    pager.write_page(inode, 0, &filled_page(0xA5)).unwrap();
+    pager.set_inode_size(inode, BLOCK_SIZE as u64).unwrap();
+
+    pager.link_inode(InodeNo::new(2), b"alias", inode).unwrap();
+    assert_eq!(pager.inode_meta(inode).unwrap().nlinks, 2);
+    assert_eq!(
+        pager.unlink_inode(InodeNo::new(2), b"original", inode),
+        Ok(1)
+    );
+    assert_eq!(
+        pager.lookup(InodeNo::new(2), b"alias").unwrap(),
+        Some(inode)
+    );
+    assert_eq!(pager.unlink_inode(InodeNo::new(2), b"alias", inode), Ok(0));
+    assert_eq!(pager.inode_meta(inode).unwrap().nlinks, 0);
+
+    pager.destroy_inode(inode).unwrap();
+    assert!(!BitmapView::new(pager.image().block(3)).is_set(13));
+    assert!(!BitmapView::new(pager.image().block(2)).is_set(48));
+    assert_eq!(pager.allocate_inode().unwrap(), inode);
+    assert_eq!(pager.allocate_block().unwrap(), 48);
+}
+
+#[test]
+fn rename_replacement_orphans_then_reclaims_displaced_inode() {
+    let mut image = mock_image();
+    mark_inode_bitmap_used(&mut image, 13);
+    mark_block_bitmap_used(&mut image, 48);
+    let mut pager = Ext4Pager::open(image).unwrap();
+
+    let source = pager
+        .create_regular_file(InodeNo::new(2), b"source", 0o644, 0, 0, 0)
+        .unwrap();
+    let displaced = pager
+        .create_regular_file(InodeNo::new(2), b"destination", 0o644, 0, 0, 0)
+        .unwrap();
+    pager.write_page(displaced, 0, &filled_page(0xD5)).unwrap();
+    pager.set_inode_size(displaced, BLOCK_SIZE as u64).unwrap();
+
+    let outcome = pager
+        .rename_inode(InodeNo::new(2), b"source", InodeNo::new(2), b"destination")
+        .unwrap();
+    assert_eq!(outcome.displaced, Some((displaced, 0)));
+    assert_eq!(pager.lookup(InodeNo::new(2), b"source").unwrap(), None);
+    assert_eq!(
+        pager.lookup(InodeNo::new(2), b"destination").unwrap(),
+        Some(source)
+    );
+    assert_eq!(pager.inode_meta(source).unwrap().nlinks, 1);
+    assert_eq!(pager.inode_meta(displaced).unwrap().nlinks, 0);
+
+    pager.destroy_inode(displaced).unwrap();
+    assert!(!BitmapView::new(pager.image().block(3)).is_set(14));
+    assert!(!BitmapView::new(pager.image().block(2)).is_set(48));
+}
+
+#[test]
+fn rename_between_two_hard_links_is_a_noop() {
+    let image = mock_image();
+    let mut pager = Ext4Pager::open(image).unwrap();
+    let inode = InodeNo::new(12);
+    pager.link_inode(InodeNo::new(2), b"alias", inode).unwrap();
+
+    let outcome = pager
+        .rename_inode(InodeNo::new(2), b"hello", InodeNo::new(2), b"alias")
+        .unwrap();
+    assert_eq!(outcome.displaced, None);
+    assert_eq!(
+        pager.lookup(InodeNo::new(2), b"hello").unwrap(),
+        Some(inode)
+    );
+    assert_eq!(
+        pager.lookup(InodeNo::new(2), b"alias").unwrap(),
+        Some(inode)
+    );
+    assert_eq!(pager.inode_meta(inode).unwrap().nlinks, 2);
+}
+
+#[test]
+fn rename_preserves_destination_directory_growth() {
+    let mut image = mock_image();
+    mark_inode_bitmap_used(&mut image, 13);
+    mark_block_bitmap_used(&mut image, 48);
+    let mut pager = Ext4Pager::open(image).unwrap();
+    let root = InodeNo::new(2);
+
+    let source_dir = pager
+        .create_directory(root, b"rename-source-dir", 0o755, 0, 0, 0)
+        .unwrap();
+    let source = pager
+        .create_regular_file(source_dir, b"metadata.tmp", 0o644, 0, 0, 0)
+        .unwrap();
+
+    // Fill the root until append_dir_entry allocates a fresh directory block.
+    let initial_size = pager.inode_meta(root).unwrap().size;
+    let mut suffix = 0u8;
+    while pager.inode_meta(root).unwrap().size == initial_size {
+        let mut name = vec![b'x'; 255];
+        name[0] = b'A' + suffix;
+        pager.link_inode(root, &name, source).unwrap();
+        suffix += 1;
+    }
+    let grown_once = pager.inode_meta(root).unwrap().size;
+
+    // The first entry in a new block owns the whole record. Fourteen more
+    // maximal names leave less than one maximal record of slack, so rename
+    // below must grow the directory again.
+    for _ in 0..14 {
+        let mut name = vec![b'x'; 255];
+        name[0] = b'A' + suffix;
+        pager.link_inode(root, &name, source).unwrap();
+        suffix += 1;
+    }
+    assert_eq!(pager.inode_meta(root).unwrap().size, grown_once);
+
+    let destination = vec![b'z'; 255];
+    pager
+        .rename_inode(source_dir, b"metadata.tmp", root, &destination)
+        .unwrap();
+
+    assert_eq!(
+        pager.inode_meta(root).unwrap().size,
+        grown_once + BLOCK_SIZE as u64
+    );
+    assert_eq!(pager.lookup(root, &destination).unwrap(), Some(source));
+    assert_eq!(pager.lookup(source_dir, b"metadata.tmp").unwrap(), None);
+}
+
+#[test]
+fn mkdir_preserves_parent_directory_growth() {
+    let mut image = mock_image();
+    mark_inode_bitmap_used(&mut image, 13);
+    mark_block_bitmap_used(&mut image, 48);
+    let mut pager = Ext4Pager::open(image).unwrap();
+    let root = InodeNo::new(2);
+    let link_target = InodeNo::new(12);
+
+    // Grow the root once, then consume the new block until another maximal
+    // directory name can only be inserted by growing it again.
+    let initial_size = pager.inode_meta(root).unwrap().size;
+    let mut suffix = 0u8;
+    while pager.inode_meta(root).unwrap().size == initial_size {
+        let mut name = vec![b'x'; 255];
+        name[0] = b'A' + suffix;
+        pager.link_inode(root, &name, link_target).unwrap();
+        suffix += 1;
+    }
+    let grown_once = pager.inode_meta(root).unwrap().size;
+    for _ in 0..14 {
+        let mut name = vec![b'x'; 255];
+        name[0] = b'A' + suffix;
+        pager.link_inode(root, &name, link_target).unwrap();
+        suffix += 1;
+    }
+    assert_eq!(pager.inode_meta(root).unwrap().size, grown_once);
+
+    let root_links = pager.inode_meta(root).unwrap().nlinks;
+    let directory_name = vec![b'm'; 255];
+    let directory = pager
+        .create_directory(root, &directory_name, 0o755, 0, 0, 0)
+        .unwrap();
+
+    let grown_meta = pager.inode_meta(root).unwrap();
+    assert_eq!(grown_meta.size, grown_once + BLOCK_SIZE as u64);
+    assert_eq!(grown_meta.nlinks, root_links + 1);
+    assert_eq!(
+        pager.lookup(root, &directory_name).unwrap(),
+        Some(directory)
+    );
+    assert_eq!(pager.lookup(directory, b"..").unwrap(), Some(root));
+
+    pager
+        .unlink_directory(root, &directory_name, directory)
+        .unwrap();
+    assert_eq!(pager.inode_meta(root).unwrap().nlinks, root_links);
+    assert_eq!(
+        pager.inode_meta(root).unwrap().size,
+        grown_once + BLOCK_SIZE as u64
+    );
+}
+
+#[test]
+fn mkdir_rmdir_balances_parent_links_and_reclaims_directory_storage() {
+    let mut image = mock_image();
+    mark_inode_bitmap_used(&mut image, 13);
+    mark_block_bitmap_used(&mut image, 48);
+    let mut pager = Ext4Pager::open(image).unwrap();
+    let root = InodeNo::new(2);
+    let root_links = pager.inode_meta(root).unwrap().nlinks;
+
+    let directory = pager
+        .create_directory(root, b"temporary", 0o755, 0, 0, 0)
+        .unwrap();
+    assert_eq!(pager.inode_meta(root).unwrap().nlinks, root_links + 1);
+    assert_eq!(
+        pager.lookup(directory, b"..").unwrap(),
+        Some(InodeNo::new(2))
+    );
+
+    pager
+        .unlink_directory(root, b"temporary", directory)
+        .unwrap();
+    assert_eq!(pager.inode_meta(root).unwrap().nlinks, root_links);
+    assert_eq!(pager.inode_meta(directory).unwrap().nlinks, 0);
+    pager.destroy_inode(directory).unwrap();
+    assert!(!BitmapView::new(pager.image().block(3)).is_set(13));
+    assert!(!BitmapView::new(pager.image().block(2)).is_set(48));
+}
+
+#[test]
+fn truncate_shrink_returns_suffix_extent_blocks() {
+    let mut image = mock_image();
+    mark_block_bitmap_used(&mut image, 48);
+    let mut pager = Ext4Pager::open(image).unwrap();
+
+    pager
+        .set_inode_size(InodeNo::new(12), BLOCK_SIZE as u64)
+        .unwrap();
+    let meta = pager.inode_meta(InodeNo::new(12)).unwrap();
+    assert_eq!(meta.size, BLOCK_SIZE as u64);
+    assert_eq!(meta.blocks_512, 8);
+    let bitmap = BitmapView::new(pager.image().block(2));
+    assert!(bitmap.is_set(20));
+    assert!(!bitmap.is_set(21));
+    assert!(!bitmap.is_set(30));
+    assert_eq!(pager.allocate_block().unwrap(), 21);
 }
 
 fn mark_inode_bitmap_used(image: &mut MemImage, count: usize) {
@@ -780,6 +1210,14 @@ fn write_inode_at_table(image: &mut MemImage, inode_table_block: u64, ino: u32, 
     inode
         .encode(&mut image.block_mut(block as u64)[in_block..in_block + 256])
         .unwrap();
+}
+
+fn read_inode_from_image(image: &MemImage, inode_table_block: u64, ino: u32) -> Inode {
+    let index = (ino - 1) as usize;
+    let offset = index * 256;
+    let block = inode_table_block as usize + offset / BLOCK_SIZE;
+    let in_block = offset % BLOCK_SIZE;
+    Inode::parse(&image.block(block as u64)[in_block..in_block + 256]).unwrap()
 }
 
 fn filled_page(byte: u8) -> [u8; BLOCK_SIZE] {

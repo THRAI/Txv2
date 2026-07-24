@@ -158,8 +158,11 @@ pub fn dump_summary<P: TxPlatform>() {
     write_usize::<P>(summary.zone_count);
     console_write_str::<P>(":captured=");
     write_usize::<P>(summary.captured_zones);
+    console_write_str::<P>(":retired=");
+    write_usize::<P>(summary.epoch.retired_count);
+    console_write_str::<P>(":collect_requested=");
+    write_usize::<P>(summary.epoch.collection_requested as usize);
     console_write_str::<P>("\n");
-
     if let Ok(diag) = page_allocator::backend_diagnostics() {
         console_write_str::<P>("txkernel:pagealloc:free=");
         write_usize::<P>(diag.free_count);
@@ -167,6 +170,37 @@ pub fn dump_summary<P: TxPlatform>() {
         write_usize::<P>(diag.total_count);
         console_write_str::<P>(":max_run=");
         write_usize::<P>(diag.max_contiguous_free_run);
+        console_write_str::<P>("\n");
+    }
+    if let Ok(diag) = page_allocator::frame_role_diagnostics() {
+        console_write_str::<P>("txkernel:pagealloc:roles:free=");
+        write_usize::<P>(diag.free_pages);
+        console_write_str::<P>(":reserved=");
+        write_usize::<P>(diag.reserved_pages);
+        console_write_str::<P>(":reserved_live=");
+        write_usize::<P>(diag.reserved_live_pages);
+        console_write_str::<P>(":unowned_unavailable=");
+        write_usize::<P>(diag.unowned_unavailable_pages);
+        console_write_str::<P>(":owned=");
+        write_usize::<P>(diag.owned_pages);
+        console_write_str::<P>(":mapped=");
+        write_usize::<P>(diag.mapped_pages);
+        console_write_str::<P>(":cached=");
+        write_usize::<P>(diag.cached_pages);
+        console_write_str::<P>(":pinned=");
+        write_usize::<P>(diag.pinned_pages);
+        console_write_str::<P>(":mixed=");
+        write_usize::<P>(diag.mixed_role_pages);
+        console_write_str::<P>("\n");
+
+        console_write_str::<P>("txkernel:pagealloc:refs:owner=");
+        write_usize::<P>(diag.owner_refs);
+        console_write_str::<P>(":map=");
+        write_usize::<P>(diag.map_refs);
+        console_write_str::<P>(":cache=");
+        write_usize::<P>(diag.cache_refs);
+        console_write_str::<P>(":pin=");
+        write_usize::<P>(diag.pin_refs);
         console_write_str::<P>("\n");
     }
     if let Some(fail) = slab::last_allocation_failure() {
@@ -182,6 +216,139 @@ pub fn dump_summary<P: TxPlatform>() {
         write_usize::<P>(fail.total_count);
         console_write_str::<P>(":max_run=");
         write_usize::<P>(fail.max_contiguous_free_run);
+        console_write_str::<P>("\n");
+
+        let heap = slab::heap_diagnostics();
+        console_write_str::<P>("txkernel:heap:pages:small_live=");
+        write_usize::<P>(heap.small_live_pages);
+        console_write_str::<P>(":small_peak=");
+        write_usize::<P>(heap.small_peak_pages);
+        console_write_str::<P>(":large_live=");
+        write_usize::<P>(heap.large_live_pages);
+        console_write_str::<P>(":large_peak=");
+        write_usize::<P>(heap.large_peak_pages);
+        console_write_str::<P>(":large_allocations=");
+        write_usize::<P>(heap.large_live_allocations);
+        console_write_str::<P>(":alloc_calls=");
+        write_usize::<P>(heap.large_alloc_calls);
+        console_write_str::<P>(":free_calls=");
+        write_usize::<P>(heap.large_free_calls);
+        console_write_str::<P>("\n");
+
+        console_write_str::<P>("txkernel:heap:large_bins:allocs_1=");
+        write_usize::<P>(heap.large_live_allocations_by_bin[0]);
+        console_write_str::<P>(":allocs_2_15=");
+        write_usize::<P>(heap.large_live_allocations_by_bin[1]);
+        console_write_str::<P>(":allocs_16_255=");
+        write_usize::<P>(heap.large_live_allocations_by_bin[2]);
+        console_write_str::<P>(":allocs_256_plus=");
+        write_usize::<P>(heap.large_live_allocations_by_bin[3]);
+        console_write_str::<P>(":pages_1=");
+        write_usize::<P>(heap.large_live_pages_by_bin[0]);
+        console_write_str::<P>(":pages_2_15=");
+        write_usize::<P>(heap.large_live_pages_by_bin[1]);
+        console_write_str::<P>(":pages_16_255=");
+        write_usize::<P>(heap.large_live_pages_by_bin[2]);
+        console_write_str::<P>(":pages_256_plus=");
+        write_usize::<P>(heap.large_live_pages_by_bin[3]);
+        console_write_str::<P>("\n");
+
+        for index in 0..heap.small_class_sizes.len() {
+            if heap.small_class_pages[index] == 0 {
+                continue;
+            }
+            console_write_str::<P>("txkernel:heap:class:size=");
+            write_usize::<P>(heap.small_class_sizes[index]);
+            console_write_str::<P>(":pages=");
+            write_usize::<P>(heap.small_class_pages[index]);
+            console_write_str::<P>(":used=");
+            write_usize::<P>(heap.small_class_used_objects[index]);
+            console_write_str::<P>(":capacity=");
+            write_usize::<P>(heap.small_class_capacity_objects[index]);
+            console_write_str::<P>(":empty=");
+            write_usize::<P>(heap.small_class_empty_pages[index]);
+            console_write_str::<P>(":partial=");
+            write_usize::<P>(heap.small_class_partial_pages[index]);
+            console_write_str::<P>(":full=");
+            write_usize::<P>(heap.small_class_full_pages[index]);
+            console_write_str::<P>("\n");
+        }
+
+        let vmalloc = slab::vmalloc_diagnostics();
+        console_write_str::<P>("txkernel:vmalloc:ready=");
+        write_usize::<P>(vmalloc.ready as usize);
+        console_write_str::<P>(":initialized=");
+        write_usize::<P>(vmalloc.initialized as usize);
+        console_write_str::<P>(":window_pages=");
+        write_usize::<P>(vmalloc.window_pages);
+        console_write_str::<P>(":bitmap_used=");
+        write_usize::<P>(vmalloc.bitmap_used_pages);
+        console_write_str::<P>(":bitmap_free=");
+        write_usize::<P>(vmalloc.bitmap_free_pages);
+        console_write_str::<P>(":bitmap_max_run=");
+        write_usize::<P>(vmalloc.bitmap_max_free_run);
+        console_write_str::<P>(":hint=");
+        write_usize::<P>(vmalloc.hint);
+        console_write_str::<P>("\n");
+
+        console_write_str::<P>("txkernel:vmalloc:alloc:attempts=");
+        write_usize::<P>(vmalloc.alloc_attempts);
+        console_write_str::<P>(":successes=");
+        write_usize::<P>(vmalloc.alloc_successes);
+        console_write_str::<P>(":live_allocations=");
+        write_usize::<P>(vmalloc.live_allocations);
+        console_write_str::<P>(":live_pages=");
+        write_usize::<P>(vmalloc.live_pages);
+        console_write_str::<P>(":peak_live_pages=");
+        write_usize::<P>(vmalloc.peak_live_pages);
+        console_write_str::<P>(":unmap_attempts=");
+        write_usize::<P>(vmalloc.unmap_attempts);
+        console_write_str::<P>(":partial_unmaps=");
+        write_usize::<P>(vmalloc.partial_unmaps);
+        console_write_str::<P>(":bad_deallocs=");
+        write_usize::<P>(vmalloc.bad_deallocs);
+        console_write_str::<P>(":quarantined_ranges=");
+        write_usize::<P>(vmalloc.quarantined_ranges);
+        console_write_str::<P>(":quarantined_pages=");
+        write_usize::<P>(vmalloc.quarantined_pages);
+        console_write_str::<P>("\n");
+
+        console_write_str::<P>("txkernel:vmalloc:last_fail:stage=");
+        console_write_str::<P>(slab::vmalloc_failure_stage_name(vmalloc.last_failure_stage));
+        console_write_str::<P>(":stage_code=");
+        write_usize::<P>(vmalloc.last_failure_stage);
+        console_write_str::<P>(":cause=");
+        console_write_str::<P>(slab::vmalloc_failure_stage_name(
+            vmalloc.last_failure_cause_stage,
+        ));
+        console_write_str::<P>(":request_pages=");
+        write_usize::<P>(vmalloc.last_failure_request_pages);
+        console_write_str::<P>(":mapped_pages=");
+        write_usize::<P>(vmalloc.last_failure_mapped_pages);
+        console_write_str::<P>(":start_page=");
+        write_usize::<P>(vmalloc.last_failure_start_page);
+        console_write_str::<P>(":pmap_error=");
+        console_write_str::<P>(slab::vmalloc_pmap_error_name(
+            vmalloc.last_failure_pmap_error,
+        ));
+        console_write_str::<P>(":alloc_error=");
+        console_write_str::<P>(slab::vmalloc_alloc_error_name(
+            vmalloc.last_failure_alloc_error,
+        ));
+        console_write_str::<P>("\n");
+
+        console_write_str::<P>("txkernel:vmalloc:last_unmap:request_pages=");
+        write_usize::<P>(vmalloc.last_unmap_request_pages);
+        console_write_str::<P>(":removed_pages=");
+        write_usize::<P>(vmalloc.last_unmap_removed_pages);
+        console_write_str::<P>(":missing_pages=");
+        write_usize::<P>(vmalloc.last_unmap_missing_pages);
+        console_write_str::<P>(":frame_lookup_failures=");
+        write_usize::<P>(vmalloc.last_unmap_frame_lookup_failures);
+        console_write_str::<P>(":first_failed_page=");
+        write_usize::<P>(vmalloc.last_unmap_first_failed_page);
+        console_write_str::<P>(":pmap_error=");
+        console_write_str::<P>(slab::vmalloc_pmap_error_name(vmalloc.last_unmap_pmap_error));
         console_write_str::<P>("\n");
     }
 

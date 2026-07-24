@@ -88,7 +88,9 @@ core::arch::global_asm!(
     .equ TX_RV64_TF_F30, TX_RV64_TF_F_BASE + 30*8
     .equ TX_RV64_TF_F31, TX_RV64_TF_F_BASE + 31*8
     .equ TX_RV64_TF_FCSR, TX_RV64_TF_F_BASE + 256
-    .equ TX_RV64_TF_SIZE, 552
+    # Keep the frame 16-byte aligned at every Rust call boundary.  The
+    # register payload occupies 552 bytes; the final 8 bytes are ABI padding.
+    .equ TX_RV64_TF_SIZE, 560
     .equ TX_RV64_TF_TMP_T0, TX_RV64_TF_SIZE - 16
     .equ TX_RV64_TF_TMP_SSCRATCH, TX_RV64_TF_SIZE - 8
 
@@ -527,7 +529,7 @@ const X_A4: usize = 14;
 const X_A5: usize = 15;
 pub(crate) const X_A7: usize = 17;
 
-#[repr(C)]
+#[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Rv64TrapFrame {
     pub x: [usize; 32], // offsets   0..255
@@ -537,9 +539,13 @@ pub struct Rv64TrapFrame {
     pub sstatus: usize, // offset  280
     pub f: [u64; 32],   // offsets 288..543  (TX_RV64_TF_F_BASE)
     pub fcsr: u32,      // offset  544       (TX_RV64_TF_FCSR)
-    pub _pad_fp: u32,   // offset  548       (pad to 8-byte alignment)
-                        // total  = 552 bytes (TX_RV64_TF_SIZE)
+    pub _pad_fp: u32,   // offset  548       (pad FP payload to 8 bytes)
+                        // payload = 552 bytes; repr(align(16)) rounds the
+                        // complete frame to 560 bytes (TX_RV64_TF_SIZE)
 }
+
+const _: [(); 560] = [(); core::mem::size_of::<Rv64TrapFrame>()];
+const _: [(); 16] = [(); core::mem::align_of::<Rv64TrapFrame>()];
 
 impl Rv64TrapFrame {
     pub const fn snapshot(&self) -> TrapFrameSnapshot {

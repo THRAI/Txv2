@@ -56,6 +56,8 @@ pub struct EpochSummary {
     pub global_epoch: u64,
     pub active_guards: usize,
     pub possible_cpus: usize,
+    pub retired_count: usize,
+    pub collection_requested: bool,
 }
 
 #[repr(align(64))]
@@ -76,6 +78,10 @@ pub(crate) struct EpochDomain {
     active_guards: CachePadded<AtomicUsize>,
     /// Number of CPUs the platform says may participate in EBR.
     possible_cpus: CachePadded<AtomicUsize>,
+    /// Set by retirement/pin hot paths and consumed at a normal-stack drain
+    /// point. Trap/IRQ paths may request collection but never execute
+    /// destructor callbacks themselves.
+    collection_requested: AtomicBool,
     /// Platform callbacks are installed once at BSP init and then read lock-free.
     hooks: UnsafeCell<PlatformHooks>,
     /// Per-CPU guard state and retired-node list heads.
@@ -100,6 +106,7 @@ impl EpochDomain {
             global_epoch: CachePadded::new(AtomicU64::new(INITIAL_EPOCH)),
             active_guards: CachePadded::new(AtomicUsize::new(0)),
             possible_cpus: CachePadded::new(AtomicUsize::new(1)),
+            collection_requested: AtomicBool::new(false),
             hooks: UnsafeCell::new(PlatformHooks::default()),
             cpu_states: [const { CpuLocalEpochState::new() }; MAX_EPOCH_CPUS],
             lock: SpinLock::new(),
@@ -125,6 +132,7 @@ impl EpochDomain {
         self.global_epoch.0.store(INITIAL_EPOCH, Ordering::Release);
         self.active_guards.0.store(0, Ordering::Release);
         self.possible_cpus.0.store(possible_cpus, Ordering::Release);
+        self.collection_requested.store(false, Ordering::Release);
 
         let _guard = self.lock.lock();
         unsafe {
@@ -144,6 +152,7 @@ impl EpochDomain {
         self.global_epoch.0.store(INITIAL_EPOCH, Ordering::Release);
         self.active_guards.0.store(0, Ordering::Release);
         self.possible_cpus.0.store(1, Ordering::Release);
+        self.collection_requested.store(false, Ordering::Release);
 
         let _guard = self.lock.lock();
         unsafe {
@@ -208,10 +217,12 @@ impl EpochDomain {
         };
         let guard = Guard::new(self, local, cpu_id, entered_epoch, cpu_pin);
         if should_collect {
-            // Match Crossbeam's cold pin path: collect already-sealed bags,
-            // but do not force a partially filled local bag into the shared
-            // queue every 128 pinnings.
-            let _ = self.try_drain_inner(PERIODIC_COLLECT_BUDGET, false);
+            // Crossbeam performs this cold-path collection on an ordinary
+            // userspace thread stack. Txv2 can enter guard() from a syscall
+            // trap stack, so only publish a maintenance request here. The
+            // reactor consumes it after the trap longjmp returns to its normal
+            // kernel stack.
+            self.request_collection();
         }
         guard
     }
@@ -330,11 +341,24 @@ impl EpochDomain {
         }
         let _guard = self.queue_lock.lock();
         unsafe { &mut *self.state.get() }.queue.push_back(bag);
+        self.request_collection();
         Ok(())
     }
 
     fn try_drain(&'static self, budget: usize) -> DrainStats {
         self.try_drain_inner(budget, true)
+    }
+
+    fn drain_requested(&'static self, budget: usize) -> DrainStats {
+        if !self.collection_requested.swap(false, Ordering::AcqRel) {
+            return DrainStats::default();
+        }
+
+        let stats = self.try_drain_inner(budget, true);
+        if stats.remaining > 0 {
+            self.request_collection();
+        }
+        stats
     }
 
     fn try_drain_inner(&'static self, budget: usize, flush_local: bool) -> DrainStats {
@@ -353,6 +377,15 @@ impl EpochDomain {
         };
 
         let hooks = self.hooks();
+        if (hooks.in_irq_context)() || (hooks.in_trap_context)() {
+            // Never run arbitrary Rust destructors on a bounded IRQ/trap
+            // stack. Preserve the request for the reactor's normal-stack
+            // maintenance point.
+            self.request_collection();
+            stats.remaining = self.total_retired_count();
+            return stats;
+        }
+
         let cpu_pin = (hooks.pin_current_cpu)();
         let cpu_id = cpu_pin.cpu_id();
         if cpu_id.0 >= self.possible_cpus.0.load(Ordering::Acquire)
@@ -455,6 +488,11 @@ impl EpochDomain {
         stats
     }
 
+    #[inline]
+    fn request_collection(&self) {
+        self.collection_requested.store(true, Ordering::Release);
+    }
+
     fn try_advance_epoch(&'static self) -> bool {
         let current = self.global_epoch.0.load(Ordering::Acquire);
         let hooks = self.hooks();
@@ -511,6 +549,7 @@ impl EpochDomain {
         self.global_epoch.0.store(INITIAL_EPOCH, Ordering::Release);
         self.active_guards.0.store(0, Ordering::Release);
         self.possible_cpus.0.store(1, Ordering::Release);
+        self.collection_requested.store(false, Ordering::Release);
         let _guard = self.lock.lock();
         *self.hooks.get() = PlatformHooks::default();
         (*self.state.get()).reset();
@@ -525,6 +564,8 @@ impl EpochDomain {
             global_epoch: self.global_epoch.0.load(Ordering::Acquire),
             active_guards: self.active_guards.0.load(Ordering::Acquire),
             possible_cpus: self.possible_cpus.0.load(Ordering::Acquire),
+            retired_count: self.total_retired_count(),
+            collection_requested: self.collection_requested.load(Ordering::Acquire),
         }
     }
 
@@ -557,6 +598,7 @@ fn emit_epoch_trace(name: &[u8], value: i64) {
 struct PlatformHooks {
     pin_current_cpu: fn() -> CpuPinGuard,
     in_irq_context: fn() -> bool,
+    in_trap_context: fn() -> bool,
     is_cpu_online: fn(CpuId) -> bool,
 }
 
@@ -565,6 +607,7 @@ impl PlatformHooks {
         Self {
             pin_current_cpu: default_pin_current_cpu,
             in_irq_context: default_in_irq_context,
+            in_trap_context: default_in_trap_context,
             is_cpu_online: default_is_cpu_online,
         }
     }
@@ -576,6 +619,7 @@ impl PlatformHooks {
         Self {
             pin_current_cpu: P::pin_current_cpu,
             in_irq_context: P::in_irq_context,
+            in_trap_context: P::in_trap_context,
             is_cpu_online: P::is_cpu_online,
         }
     }
@@ -586,6 +630,10 @@ fn default_pin_current_cpu() -> CpuPinGuard {
 }
 
 fn default_in_irq_context() -> bool {
+    false
+}
+
+fn default_in_trap_context() -> bool {
     false
 }
 
@@ -678,6 +726,10 @@ pub(crate) unsafe fn retire_raw(
 
 pub fn try_drain(budget: usize) -> DrainStats {
     GLOBAL_DOMAIN.try_drain(budget)
+}
+
+pub fn drain_requested(budget: usize) -> DrainStats {
+    GLOBAL_DOMAIN.drain_requested(budget)
 }
 
 pub fn summary() -> EpochSummary {
