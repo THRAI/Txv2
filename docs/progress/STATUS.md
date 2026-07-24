@@ -1,3 +1,30 @@
+- 2026-07-25 (IPv6 外部数据面 Phase 0 调研 — **仅调研,零实现改动**;worktree `.claude/worktrees/ipv6-external`,
+  分支 `claude/ipv6-external-nic`,基线 `feature-network-refactor@2c5fe37b`). 产出正本
+  `docs/design/07_net/IPV6_EXTERNAL_DATAPLANE_v1.md`(txdoc:07-NET-IPV6-EXT-DATAPLANE-V1)。**任务前提被实测
+  推翻一半**:外部 IPv6 **TCP 早就端到端通了**(QEMU 真机 `wget http://[fec0::2]:P/` 完整 SYN/SYN-ACK/GET/200/
+  FIN,pcap 逐帧在文档 §1.4)——`step_device_tx.rs` grep 不到 `Ipv6` 不代表纯 v4,因为
+  `SmoltcpTcpSegment::emit_ipv4_packet`(protocol/tcp.rs:565)与 `UdpTxDatagram::emit_ipv4_packet`
+  (protocol/udp.rs:494)都是**名字误导的双族函数**,`dispatch_ip_at`(ether/mod.rs:346-350)按版本 nibble
+  分派。V3b 的 off-link 网关分支也在真机首验通过(帧送到网关 MAC,§1.5)。**真缺口只有两块**:① **外部 v6
+  UDP 一个包都到不了网线**,双因:G1a `step_device_tx.rs:342` UDP 车道 `take_udp_tx_datagram()` **破坏性弹
+  出**(TCP 用"拒收即留队"、raw-ICMPv6 用 peek/commit,唯独 UDP 丢数据)× G1b 初始 namespace 一轮里有**两个
+  TX sink**,先跑的 boot lane iface(init/net.rs:75-84)**没有 `.with_ipv6`**,对任何非组播 v6 目的地
+  `decide_ipv6_route → Unreachable → Failed{EADDRNOTAVAIL}`;G1c `payload.rs:1273` `udp_tx_src_hint` 的 V6 臂
+  硬编码 `None` → smoltcp 无地址 CONTEXT_IFACE 回退 `::1`,**上线的 v6 UDP 源地址是 `::1`(网线实证)**。
+  ② **guest 开机没有任何 v6 地址/路由**(无 RA/SLAAC/link-local/DHCPv6,`crates/` 下零命中;boot 只 seed 了 v4,
+  init/net.rs:143-186)。**关键证伪**(证据同等重要):NDP 未解析 ❌(热好 NDP + sleep 3s 再发仍零包)、
+  源地址选不出 ❌(bind 到 fec0::15 仍零包)、UDP 车道对 v6 不工作 ❌(**改打组播 ff02::1 同一车道就发出去了**
+  ——这条是分离"车道坏"与"路由判死"的决定性判别)。另证伪一条"v4 回归":**QEMU `-netdev user,ipv6=on` 单独
+  指定会关掉 IPv4**,必须写 `ipv4=on,ipv6=on`,否则伪造出 v4 全死。**方案**(待用户审阅):V5-1 修 UDP
+  (弹出可回退 + V6 src hint 接 `best_ipv6_route`,后者目前是零调用者的死代码)、V5-2 镜像 v4 的 boot seed 自
+  动配 v6(**不做** RA/SLAAC,LTP 价值近零;但已实证 libslirp 收到 RS 会立即回 RA,将来做的话环境现成)、
+  V5-3 v6 源选择收敛到 FIB、V5-4 补外部 v6 回归测试(现在 `external_connect_tests.rs` 里 v6 零命中)。
+  **基线四门已跑**:rv64/la64 build ✅;`cargo test -p tx-subsystems --lib` = 832 passed **322 failed**
+  (失败集合存 `.v6work/unit-baseline.failures`);`verify-git-net.sh` **8/8**。harness 在
+  `.v6work/probe-v6.sh` + `guest-v6.sh`(两个独立 v4/v6 主机 server + filter-dump pcap + guest 探针必须
+  detach 且 out/err/rc 三文件——本 FS 的 `>>` 从 offset 0 重写、wedge 的 `connect()` 不被 `timeout` 杀掉)。
+  **Next**:等审阅通过再进 V5-1。**Blocker**:方案未审;另 slirp `hostfwd` 只支持 IPv4 ⇒ "外部主动连入 guest
+  的 v6 监听"在本环境无法测,只能靠 host 单测覆盖(已写进文档验收计划)。
 - 2026-07-24 (修复 HTTPS 慢速 push SIGSEGV — VM mprotect 全范围快捷路径丢 PrivatePageSet). 病象:git push 到
   HTTPS 远端+慢速上传时 git-remote-https 必崩 signal 11(repro-push-noprog.sh 100% 复现;HTTP 慢速正常)。
   **破案链**:SEGV post-mortem 增强(thread_future.rs:全寄存器+a0/a5/s0/sp hexdump+全 recipe 表;syshist
