@@ -682,6 +682,55 @@ fn fault_script_yields_on_writer_conflict_and_completes_after_release() {
 }
 
 #[test]
+fn fault_publish_retries_when_recipe_changes_after_materialization() {
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let target = range(0x1c000, 1);
+
+    map_reserved(aspace.reserve_map(
+        VmEntry::new(
+            target,
+            Prot::READ_WRITE,
+            VmEntryFlags::SHARED,
+            page_backing(0),
+        ),
+        MapPlacement::RequireFree,
+    ))
+    .commit()
+    .expect("baseline map");
+
+    let outcome = aspace
+        .resolve_fault(VmFault::new(
+            crate::vm::UserVirtAddr(0x1c000),
+            AccessMode::Write,
+        ))
+        .expect("fault resolves");
+    let materialization = outcome
+        .materialize_pagebacked_anon()
+        .expect("materialization");
+
+    // Model the SMP race seen by rustc: a VM writer changes the VMA after
+    // resolve/materialize but before the faulting CPU publishes its PTE.
+    aspace
+        .try_mprotect(target, Prot::READ)
+        .expect("concurrent protection update");
+
+    assert!(matches!(
+        aspace
+            .try_fault_script_publish(&outcome, materialization)
+            .expect("stale publication is retryable"),
+        super::super::execution::FaultScriptPublish::Retry
+    ));
+    assert_eq!(
+        aspace
+            .pmap()
+            .lookup(crate::vm::UserVirtAddr(0x1c000).containing_page()),
+        None,
+        "a stale materialization must never reach the pmap"
+    );
+}
+
+#[test]
 fn fork_aspace_clones_parent_recipes_into_fresh_child() {
     setup_host_substrate();
     let parent = AddressSpace::new();

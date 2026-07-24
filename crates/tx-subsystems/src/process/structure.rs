@@ -168,7 +168,34 @@ pub struct ProcessIdentity {
     /// original parent exited. Direct children of init keep this false so
     /// the userspace runner can still reap them with wait4.
     pub(crate) adopted_by_init: AtomicBool,
+    /// Serializes clone publication against exit/exec lifecycle changes.
+    ///
+    /// Resource teardown never runs while holding this lock; it only protects
+    /// the short state transition and clone attach/publish transaction.
+    pub(crate) lifecycle: ProcessSpinMutex<ProcessLifecycle>,
     pub(crate) payload: ProcessSpinMutex<Option<PayloadCap<ProcessPayload>>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProcessLifecycle {
+    Alive,
+    Execing,
+    Exiting,
+    Zombie,
+}
+
+/// Keeps a process in the `Execing` lifecycle state from sibling collapse
+/// through the address-space visibility boundary and all post-commit resets.
+/// While this guard exists, clone publication is rejected and group exit
+/// cannot begin its teardown.
+pub struct ProcessExecGuard<'a> {
+    process: &'a ProcessIdentity,
+}
+
+impl Drop for ProcessExecGuard<'_> {
+    fn drop(&mut self) {
+        self.process.finish_exec();
+    }
 }
 
 /// `ProcessIdentity` is the production [`SubjectIdentity`]
@@ -227,6 +254,48 @@ impl step_engine::SubjectIdentity for ProcessIdentity {
 }
 
 impl ProcessIdentity {
+    pub(crate) fn begin_exit(&self) -> bool {
+        loop {
+            let mut lifecycle = self.lifecycle.lock();
+            match *lifecycle {
+                ProcessLifecycle::Alive => {
+                    *lifecycle = ProcessLifecycle::Exiting;
+                    return true;
+                }
+                ProcessLifecycle::Execing => {
+                    drop(lifecycle);
+                    core::hint::spin_loop();
+                }
+                ProcessLifecycle::Exiting | ProcessLifecycle::Zombie => return false,
+            }
+        }
+    }
+
+    pub(crate) fn finish_exit(&self) {
+        *self.lifecycle.lock() = ProcessLifecycle::Zombie;
+    }
+
+    pub(crate) fn begin_exec(&self) -> bool {
+        let mut lifecycle = self.lifecycle.lock();
+        if *lifecycle != ProcessLifecycle::Alive {
+            return false;
+        }
+        *lifecycle = ProcessLifecycle::Execing;
+        true
+    }
+
+    pub(crate) fn finish_exec(&self) {
+        let mut lifecycle = self.lifecycle.lock();
+        if *lifecycle == ProcessLifecycle::Execing {
+            *lifecycle = ProcessLifecycle::Alive;
+        }
+    }
+
+    pub fn begin_exec_transaction(&self) -> Option<ProcessExecGuard<'_>> {
+        self.begin_exec()
+            .then_some(ProcessExecGuard { process: self })
+    }
+
     /// Access the process payload slot.  Returns `None` when the
     /// process is a zombie (payload dropped).
     pub fn payload_slot(&self) -> &ProcessSpinMutex<Option<PayloadCap<ProcessPayload>>> {
@@ -344,9 +413,25 @@ impl ProcessIdentity {
     /// as the sole live thread. Returns the number of siblings
     /// removed, or `None` for zombies.
     pub fn collapse_threads_for_exec(&self, initiator: &Cap<ThreadIdentity>) -> Option<usize> {
+        let exec = self.begin_exec_transaction()?;
+        self.collapse_threads_for_exec_in(initiator, &exec)
+    }
+
+    pub fn collapse_threads_for_exec_in(
+        &self,
+        initiator: &Cap<ThreadIdentity>,
+        exec: &ProcessExecGuard<'_>,
+    ) -> Option<usize> {
+        if !core::ptr::eq(self, exec.process) || *self.lifecycle.lock() != ProcessLifecycle::Execing
+        {
+            return None;
+        }
         let payload = {
             let payload_guard = self.payload.lock();
-            payload_guard.as_ref().cloned()?
+            match payload_guard.as_ref().cloned() {
+                Some(payload) => payload,
+                None => return None,
+            }
         };
         payload.collapse_threads_for_exec(initiator)
     }
@@ -629,6 +714,37 @@ impl ProcessIdentity {
         file: Cap<crate::vfs::OpenFile>,
     ) -> Option<Cap<crate::vfs::OpenFile>> {
         self.set_fd(fd, Some(file))
+    }
+
+    /// Atomically choose the lowest free descriptor and publish both the file
+    /// and its close-on-exec bit.
+    pub fn install_new_fd_at_least(
+        &self,
+        min: u32,
+        file: Cap<crate::vfs::OpenFile>,
+        cloexec: bool,
+    ) -> Option<u32> {
+        self.payload
+            .lock()
+            .as_ref()
+            .and_then(|payload| payload.install_new_fd_at_least(min, file, cloexec))
+    }
+
+    pub fn install_new_fd(&self, file: Cap<crate::vfs::OpenFile>, cloexec: bool) -> Option<u32> {
+        self.install_new_fd_at_least(0, file, cloexec)
+    }
+
+    /// Atomically replace a specific descriptor and its CLOEXEC state.
+    pub fn install_fd_with_cloexec(
+        &self,
+        fd: u32,
+        file: Cap<crate::vfs::OpenFile>,
+        cloexec: bool,
+    ) -> Option<Cap<crate::vfs::OpenFile>> {
+        self.payload
+            .lock()
+            .as_ref()
+            .and_then(|payload| payload.install_fd_with_cloexec(fd, file, cloexec))
     }
 
     /// Read the close-on-exec bit for fd `fd` on this process's
@@ -1489,13 +1605,73 @@ impl ProcessPayload {
     /// same accessor to preopen fds 0/1/2.
     pub fn set_fd(&self, idx: u32, file: Option<Cap<OpenFile>>) -> Option<Cap<OpenFile>> {
         let mut slot = self.fds.lock();
+        let mut cloexec = self.fd_cloexec.lock();
         let previous = match file {
             Some(f) => slot.insert(idx, f),
-            None => slot.remove(&idx),
+            None => {
+                cloexec.remove(&idx);
+                slot.remove(&idx)
+            }
         };
+        drop(cloexec);
         drop(slot);
         if let Some(file) = &previous {
             decr_pipe_fd_ref(file);
+        }
+        previous
+    }
+
+    pub fn install_new_fd_at_least(
+        &self,
+        min: u32,
+        file: Cap<OpenFile>,
+        want_cloexec: bool,
+    ) -> Option<u32> {
+        let mut files = self.fds.lock();
+        let limit = self.rlimit_nofile_cur.load(Ordering::Acquire);
+        let mut fd = min;
+        for &existing in files.keys() {
+            if existing < fd {
+                continue;
+            }
+            if existing == fd {
+                fd = fd.checked_add(1)?;
+            } else {
+                break;
+            }
+        }
+        if fd >= limit {
+            return None;
+        }
+        let mut cloexec = self.fd_cloexec.lock();
+        debug_assert!(!files.contains_key(&fd));
+        files.insert(fd, file);
+        if want_cloexec {
+            cloexec.insert(fd);
+        } else {
+            cloexec.remove(&fd);
+        }
+        Some(fd)
+    }
+
+    pub fn install_fd_with_cloexec(
+        &self,
+        fd: u32,
+        file: Cap<OpenFile>,
+        want_cloexec: bool,
+    ) -> Option<Cap<OpenFile>> {
+        let mut files = self.fds.lock();
+        let mut cloexec = self.fd_cloexec.lock();
+        let previous = files.insert(fd, file);
+        if want_cloexec {
+            cloexec.insert(fd);
+        } else {
+            cloexec.remove(&fd);
+        }
+        drop(cloexec);
+        drop(files);
+        if let Some(previous) = &previous {
+            decr_pipe_fd_ref(previous);
         }
         previous
     }
@@ -1545,16 +1721,14 @@ impl ProcessPayload {
         self.fds.lock().clone()
     }
 
-    /// Clone the fd table for `fork`, accounting each inherited pipe
-    /// endpoint as a new fd reference. Unlike [`Self::snapshot_fds`],
-    /// this result is intended to be installed into another live
-    /// `ProcessPayload`.
-    pub(crate) fn clone_fds_for_fork(&self) -> BTreeMap<u32, Cap<OpenFile>> {
-        let cloned = self.fds.lock().clone();
+    pub(crate) fn clone_fd_state_for_fork(&self) -> (BTreeMap<u32, Cap<OpenFile>>, BTreeSet<u32>) {
+        let files = self.fds.lock();
+        let cloexec = self.fd_cloexec.lock();
+        let cloned = files.clone();
         for file in cloned.values() {
             incr_pipe_fd_ref(file);
         }
-        cloned
+        (cloned, cloexec.clone())
     }
 
     /// Public fd-table snapshot (for procfs `/proc/<pid>/fd/`).
@@ -1625,9 +1799,13 @@ impl ProcessPayload {
             });
         }
 
-        for sibling in siblings {
-            crate::thread_runtime::step_thread_exit(sibling, 0);
+        for sibling in &siblings {
+            crate::thread_runtime::step_thread_exit(sibling.clone(), 0);
         }
+        // Remote thread futures retain their PayloadCaps until their reactor
+        // polls finish. Never spin-wait for their per-hart poll slots while
+        // holding the exec transition: returning to the reactor is what lets
+        // those slots clear.
 
         *self.group_exit.lock() = None;
         Some(self.threads.count())
@@ -1927,7 +2105,7 @@ pub(crate) fn incr_pipe_fd_ref(file: &Cap<OpenFile>) {
     adjust_pipe_fd_ref(file, true);
 }
 
-fn decr_pipe_fd_ref(file: &Cap<OpenFile>) {
+pub(crate) fn decr_pipe_fd_ref(file: &Cap<OpenFile>) {
     adjust_pipe_fd_ref(file, false);
 }
 

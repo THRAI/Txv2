@@ -909,34 +909,19 @@ fn mount_api_resolve_cwd_for_path(
     resolve_cwd_for_path(dirfd, path, ctx)
 }
 
-fn allocate_mount_api_fd(ctx: &SyscallCtx<'_>) -> Result<u32, SyscallResult> {
-    let fd = ctx.process.allocate_fd();
-    let (soft_limit, _) = ctx.process.rlimit_nofile();
-    if fd >= soft_limit {
-        Err(SyscallResult::Error(EMFILE_VALUE))
-    } else {
-        Ok(fd)
-    }
-}
-
 fn install_mount_api_fd(
     ctx: &SyscallCtx<'_>,
     file: Cap<mount::MountApiFile>,
     flags: OpenFileFlags,
 ) -> SyscallResult {
-    let fd = match allocate_mount_api_fd(ctx) {
-        Ok(fd) => fd,
-        Err(err) => return err,
-    };
     let cloexec = flags.cloexec;
     let open_file = match OpenFile::new_mount_api_cap(file, flags) {
         Ok(open_file) => open_file,
         Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
     };
-    let _ = ctx.process.install_fd(fd, open_file);
-    if cloexec {
-        ctx.process.set_fd_cloexec(fd, true);
-    }
+    let Some(fd) = ctx.process.install_new_fd(open_file, cloexec) else {
+        return SyscallResult::Error(EMFILE_VALUE);
+    };
     SyscallResult::Return(fd as i64)
 }
 

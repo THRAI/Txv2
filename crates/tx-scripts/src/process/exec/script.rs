@@ -1170,7 +1170,10 @@ async fn exec_script_inner<P: PmapIf + EntropyIf + tx_hal::AuxvIf>(
     // the old thread group must be reduced to the calling thread after
     // all reversible preparation has succeeded and before the address
     // space replacement becomes visible.
-    let _collapsed = process.collapse_threads_for_exec(thread);
+    let exec_guard = process.begin_exec_transaction().ok_or(ExecError::Busy)?;
+    let _collapsed = process
+        .collapse_threads_for_exec_in(thread, &exec_guard)
+        .ok_or(ExecError::Busy)?;
 
     // ===== Phase 6 — address-space visibility boundary ===============
     //

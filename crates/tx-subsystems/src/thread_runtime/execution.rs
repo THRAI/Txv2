@@ -412,11 +412,13 @@ fn walk_robust_list(thread: &Cap<ThreadIdentity>, head: u64, _offset: u64) {
     let Some(proc) = thread.owner_proc.upgrade(&guard) else {
         return;
     };
-    let proc_guard = proc.payload.lock();
-    let Some(payload) = proc_guard.as_ref() else {
-        return;
+    let aspace = {
+        let proc_guard = proc.payload.lock();
+        let Some(payload) = proc_guard.as_ref() else {
+            return;
+        };
+        payload.aspace_cap()
     };
-    let aspace = payload.aspace_cap();
 
     let Some((first, futex_offset, pending)) =
         crate::process::execution::measure_process_lock_service(

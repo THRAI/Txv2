@@ -14,7 +14,8 @@ use crate::process::adapter::step_engine::{
     YieldShape, ZoneError,
 };
 use crate::process::structure::{
-    ExitStatus, Frame, Pgid, Pid, ProcessGroup, ProcessIdentity, ProcessPayload, Session, Sid,
+    ExitStatus, Frame, Pgid, Pid, ProcessGroup, ProcessIdentity, ProcessLifecycle, ProcessPayload,
+    Session, Sid,
 };
 use crate::process::topology::{
     ProcessChildren, ProcessGroupMembers, ProcessThreads, SessionMembers,
@@ -478,13 +479,14 @@ pub fn step_fork_with_options<P: PmapIf>(
     ) = {
         let payload_guard = parent.payload.lock();
         let payload = payload_guard.as_ref().ok_or(ForkError::ParentZombie)?;
+        let (parent_fds, parent_fd_cloexec) = payload.clone_fd_state_for_fork();
         (
             payload.aspace_cap(),
             payload.nsproxy_cap(),
             payload.cred(),
             payload.cwd(),
-            payload.clone_fds_for_fork(),
-            payload.fd_cloexec_snapshot(),
+            parent_fds,
+            parent_fd_cloexec,
             payload.rlimit_nofile(),
             payload.rlimit_memlock(),
             payload.net_namespace(),
@@ -786,13 +788,6 @@ pub fn step_clone_thread(
         sign_thread_start,
     );
     emit_clone_thread_marker(b"debug.clone_thread.sign_thread.after", tid.0 as i64);
-    let register_tid_start = clone_path_clock_now();
-    register_tid(child.tid, child.clone());
-    emit_clone_path_duration(
-        b"debug.clone_path.step_clone_thread.register_tid_ns",
-        register_tid_start,
-    );
-    emit_clone_thread_marker(b"debug.clone_thread.register_tid.after", tid.0 as i64);
     let seed_context_start = clone_path_clock_now();
     seed_child_leader_context(&child, parent_user_ctx, tls, stack);
     emit_clone_path_duration(
@@ -818,11 +813,29 @@ pub fn step_clone_thread(
     );
     emit_clone_thread_marker(b"debug.clone_thread.clear_ctid.after", tid.0 as i64);
     let attach_start = clone_path_clock_now();
-    if let Some(proc_payload) = process.payload.lock().as_ref() {
-        proc_payload.threads.attach(child.clone());
-        sync_thread_group_pending_summary(proc_payload, &child);
-        proc_payload.thread_count.fetch_add(1, Ordering::AcqRel);
+    // Commit and publish are serialized against Alive -> Exiting/Execing.
+    // TID publication is deliberately last: observers can never resolve a
+    // child that is absent from its owning process roster.
+    let lifecycle = process.lifecycle.lock();
+    if *lifecycle != ProcessLifecycle::Alive {
+        return Err(ZoneError::InvalidState);
     }
+    let payload_guard = process.payload.lock();
+    let Some(proc_payload) = payload_guard.as_ref() else {
+        return Err(ZoneError::InvalidState);
+    };
+    proc_payload.threads.attach(child.clone());
+    sync_thread_group_pending_summary(proc_payload, &child);
+    proc_payload.thread_count.fetch_add(1, Ordering::AcqRel);
+    let register_tid_start = clone_path_clock_now();
+    register_tid(child.tid, child.clone());
+    emit_clone_path_duration(
+        b"debug.clone_path.step_clone_thread.register_tid_ns",
+        register_tid_start,
+    );
+    emit_clone_thread_marker(b"debug.clone_thread.register_tid.after", tid.0 as i64);
+    drop(payload_guard);
+    drop(lifecycle);
     emit_clone_path_duration(
         b"debug.clone_path.step_clone_thread.attach_ns",
         attach_start,
@@ -891,8 +904,18 @@ fn emit_clone_path_count(name: &[u8], value: u64) {
 /// `128 + sig` encoding by Wave 1 of the fork/clone/wait4 slice;
 /// Open Q #3 DECIDED 2026-05-06.)
 pub fn step_exit_group(process: &Cap<ProcessIdentity>, status: ExitStatus) {
+    if !process.begin_exit() {
+        // Preserve the existing signal-vs-explicit-exit overwrite semantics
+        // for an already completed zombie, but never run teardown twice.
+        if *process.lifecycle.lock() == ProcessLifecycle::Zombie {
+            *process.exit_status.lock() = Some(status);
+        }
+        return;
+    }
+
+    let payload = process.payload.lock().as_ref().cloned();
     // observe
-    if let Some(payload) = process.payload.lock().as_ref() {
+    if let Some(payload) = payload.as_ref() {
         payload.notify_vfork_done();
     }
     // upgrade
@@ -903,23 +926,13 @@ pub fn step_exit_group(process: &Cap<ProcessIdentity>, status: ExitStatus) {
     sever_children(process);
     crate::ipc::sysv_sem::execution::step_sem_undo(process);
 
-    let mut payload_guard = process.payload.lock();
-    if let Some(payload) = payload_guard.as_ref() {
+    if let Some(payload) = payload.as_ref() {
         let aspace = payload.aspace_cap();
-        let _shm_detach = measure_process_lock_service(
-            b"debug.lock_service.process.payload.exit_group.shm_detach.duration_ns",
-            || crate::ipc::sysv_shm::execution::detach_all_for_aspace(&aspace),
-        );
-        let closed_fds = measure_process_lock_service(
-            b"debug.lock_service.process.payload.exit_group.drain_fds.duration_ns",
-            || payload.drain_fds(),
-        );
-        close_socket_files_for_process_exit(&closed_fds);
-        flush_page_backed_files_for_process_exit(&closed_fds);
         let drained: Vec<Cap<ThreadIdentity>> = measure_process_lock_service(
             b"debug.lock_service.process.payload.exit_group.threads_drain.duration_ns",
             || payload.threads.drain(),
         );
+        payload.thread_count.store(0, Ordering::Release);
         measure_process_lock_service(
             b"debug.lock_service.process.payload.exit_group.zombify_threads.duration_ns",
             || {
@@ -932,6 +945,25 @@ pub fn step_exit_group(process: &Cap<ProcessIdentity>, status: ExitStatus) {
                 }
             },
         );
+        // Do not synchronously wait for remote reactor polls here. A sibling
+        // may still have its poll-scoped identity installed on another hart,
+        // and that slot can only be cleared after this exit path yields back
+        // to the reactor. Spinning here therefore deadlocks the very progress
+        // needed to acknowledge the exit. The remote future owns a
+        // PayloadCap, so its in-flight state remains alive; after the payload
+        // is withdrawn it observes termination on its next poll/trap and
+        // finishes asynchronously.
+
+        let _shm_detach = measure_process_lock_service(
+            b"debug.lock_service.process.payload.exit_group.shm_detach.duration_ns",
+            || crate::ipc::sysv_shm::execution::detach_all_for_aspace(&aspace),
+        );
+        let closed_fds = measure_process_lock_service(
+            b"debug.lock_service.process.payload.exit_group.drain_fds.duration_ns",
+            || payload.drain_fds(),
+        );
+        close_socket_files_for_process_exit(&closed_fds);
+        flush_page_backed_files_for_process_exit(&closed_fds);
         measure_process_lock_service(
             b"debug.lock_service.process.payload.exit_group.drop_drained.duration_ns",
             || {
@@ -940,12 +972,14 @@ pub fn step_exit_group(process: &Cap<ProcessIdentity>, status: ExitStatus) {
             },
         );
     }
+    let mut payload_guard = process.payload.lock();
     measure_process_lock_service(
         b"debug.lock_service.process.payload.exit_group.payload_drop.duration_ns",
         || *payload_guard = None,
     );
     drop(payload_guard);
     *process.exit_status.lock() = Some(status);
+    process.finish_exit();
 
     if try_auto_reap_adopted_by_init(process) {
         return;
@@ -969,8 +1003,12 @@ pub fn step_exit_group(process: &Cap<ProcessIdentity>, status: ExitStatus) {
 /// fork/clone/wait4 slice (2026-05-06) added the `exit_source` fire
 /// alongside the SIGCHLD post for parent-side wake.
 pub(crate) fn step_process_exit(process: &Cap<ProcessIdentity>, status: ExitStatus) {
+    if !process.begin_exit() {
+        return;
+    }
+    let payload = process.payload.lock().as_ref().cloned();
     // observe
-    if let Some(payload) = process.payload.lock().as_ref() {
+    if let Some(payload) = payload.as_ref() {
         payload.notify_vfork_done();
     }
     // upgrade
@@ -981,8 +1019,7 @@ pub(crate) fn step_process_exit(process: &Cap<ProcessIdentity>, status: ExitStat
     sever_children(process);
     *process.exit_status.lock() = Some(status);
     crate::ipc::sysv_sem::execution::step_sem_undo(process);
-    let mut payload_guard = process.payload.lock();
-    if let Some(payload) = payload_guard.as_ref() {
+    if let Some(payload) = payload.as_ref() {
         let _shm_detach = measure_process_lock_service(
             b"debug.lock_service.process.payload.process_exit.shm_detach.duration_ns",
             || crate::ipc::sysv_shm::execution::detach_all_for_aspace(&payload.aspace_cap()),
@@ -998,10 +1035,13 @@ pub(crate) fn step_process_exit(process: &Cap<ProcessIdentity>, status: ExitStat
             || drop(closed_fds),
         );
     }
+    let mut payload_guard = process.payload.lock();
     measure_process_lock_service(
         b"debug.lock_service.process.payload.process_exit.payload_drop.duration_ns",
         || *payload_guard = None,
     );
+    drop(payload_guard);
+    process.finish_exit();
     if try_auto_reap_adopted_by_init(process) {
         return;
     }
@@ -1532,6 +1572,10 @@ fn sign_process_identity(
         pgrp: process_spin_mutex(pgrp, b"debug.lock.process.identity.pgrp"),
         exit_status: process_spin_mutex(None, b"debug.lock.process.identity.exit_status"),
         adopted_by_init: AtomicBool::new(false),
+        lifecycle: process_spin_mutex(
+            ProcessLifecycle::Alive,
+            b"debug.lock.process.identity.lifecycle",
+        ),
         payload: process_spin_mutex(None, b"debug.lock.process.identity.payload"),
     })
 }
@@ -2053,7 +2097,6 @@ impl StepOp<crate::process::ProcessIdentity> for CloseOp {
             return StepOutcome::Err(crate::process::adapter::step_engine::Errno::EBADF);
         }
         let _prev = self.process.set_fd(self.fd, None);
-        self.process.set_fd_cloexec(self.fd, false);
         StepOutcome::Done(())
     }
 }
@@ -2078,10 +2121,13 @@ impl StepOp<crate::process::ProcessIdentity> for DupOp {
             None => return StepOutcome::Err(crate::process::adapter::step_engine::Errno::EBADF),
         };
         super::structure::incr_pipe_fd_ref(&file);
-        let newfd = self.process.allocate_fd();
-        let _ = self.process.set_fd(newfd, Some(file));
-        self.process.set_fd_cloexec(newfd, false);
-        StepOutcome::Done(newfd)
+        match self.process.install_new_fd(file.clone(), false) {
+            Some(newfd) => StepOutcome::Done(newfd),
+            None => {
+                super::structure::decr_pipe_fd_ref(&file);
+                StepOutcome::Err(crate::process::adapter::step_engine::Errno::EAGAIN)
+            }
+        }
     }
 }
 
@@ -2114,9 +2160,10 @@ impl StepOp<crate::process::ProcessIdentity> for Dup3Op {
             None => return StepOutcome::Err(crate::process::adapter::step_engine::Errno::EBADF),
         };
         super::structure::incr_pipe_fd_ref(&file);
-        let _prev = self.process.install_fd(self.newfd, file);
         let want_cloexec = self.flags & O_CLOEXEC != 0;
-        self.process.set_fd_cloexec(self.newfd, want_cloexec);
+        let _prev = self
+            .process
+            .install_fd_with_cloexec(self.newfd, file, want_cloexec);
         StepOutcome::Done(self.newfd)
     }
 }
@@ -2172,12 +2219,18 @@ impl StepOp<crate::process::ProcessIdentity> for FcntlDupFdOp {
         if self.process.fd(self.fd).is_none() {
             return StepOutcome::Err(crate::process::adapter::step_engine::Errno::EBADF);
         }
-        let new_fd = self.process.allocate_fd_at_least(self.min);
         let file = self.process.fd(self.fd).unwrap();
         super::structure::incr_pipe_fd_ref(&file);
-        let _prev = self.process.install_fd(new_fd, file);
-        self.process.set_fd_cloexec(new_fd, self.cloexec);
-        StepOutcome::Done(new_fd)
+        match self
+            .process
+            .install_new_fd_at_least(self.min, file.clone(), self.cloexec)
+        {
+            Some(new_fd) => StepOutcome::Done(new_fd),
+            None => {
+                super::structure::decr_pipe_fd_ref(&file);
+                StepOutcome::Err(crate::process::adapter::step_engine::Errno::EAGAIN)
+            }
+        }
     }
 }
 

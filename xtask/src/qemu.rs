@@ -306,9 +306,10 @@ fn qemu_command(
         args.push("-no-shutdown".into());
     }
 
-    // The kernel is single-core by default (userspace contract);
-    // wanting the harts QEMU provides is expressed explicitly so
-    // `--smp N` lanes keep exercising SMP.
+    // QEMU's firmware topology is the default source of truth. Keep an
+    // explicit matching cap in xtask-generated command lines so `--smp N`
+    // remains deterministic even when a custom firmware tree exposes more
+    // harts than QEMU was asked to run.
     let maxcpus_suffix = format!(" tx.maxcpus={}", qemu_smp(target, options));
     if matches!(profile, Profile::Busybox | Profile::Alpine) {
         let initramfs_name = match profile {

@@ -16,9 +16,8 @@ use super::numbers::{
     TFD_CLOEXEC_FLAG, TFD_NONBLOCK_FLAG, TFD_TIMER_ABSTIME_FLAG, TFD_TIMER_CANCEL_ON_SET_FLAG,
 };
 use super::{
-    bootstrap_copy_to_user, bootstrap_read_user, bootstrap_write_user, errno_to_i32,
-    next_stdio_fd_below_nofile, SyscallCtx, SyscallResult, EAGAIN_VALUE, EBADF_VALUE, EINVAL_VALUE,
-    ENOMEM_VALUE,
+    bootstrap_copy_to_user, bootstrap_read_user, bootstrap_write_user, errno_to_i32, SyscallCtx,
+    SyscallResult, EAGAIN_VALUE, EBADF_VALUE, EINVAL_VALUE, ENOMEM_VALUE,
 };
 use crate::adapter::step_engine::{self as step_engine, InterestMask, WaitSourceId};
 
@@ -79,14 +78,9 @@ pub(super) fn sys_timerfd_create<'a>(
         Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
     };
 
-    let new_fd = match next_stdio_fd_below_nofile(&ctx.process) {
-        Ok(fd) => fd,
-        Err(result) => return result,
+    let Some(new_fd) = ctx.process.install_new_fd(open_cap, cloexec) else {
+        return SyscallResult::Error(super::EMFILE_VALUE);
     };
-    let _ = ctx.process.install_fd(new_fd, open_cap);
-    if cloexec {
-        ctx.process.set_fd_cloexec(new_fd, true);
-    }
     SyscallResult::Return(new_fd as i64)
 }
 

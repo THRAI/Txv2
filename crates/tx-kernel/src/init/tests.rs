@@ -364,7 +364,7 @@ fn root_device_policy_defaults_final_qemu_to_vda_and_preserves_compatibility_roo
 }
 
 #[test]
-fn initial_userspace_sched_meta_stays_on_cpu0_when_boot_hart_is_nonzero() {
+fn userspace_sched_meta_exposes_online_harts_without_initial_migration() {
     let _serial = setup();
     TEST_CURRENT_CPU.store(3, Ordering::Release);
     TEST_ONLINE_CPUS.store(0b1111, Ordering::Release);
@@ -372,12 +372,18 @@ fn initial_userspace_sched_meta_stays_on_cpu0_when_boot_hart_is_nonzero() {
     let meta = CoreInit::<TestPlatform>::userspace_thread_sched_meta();
 
     assert_eq!(
-        meta.affinity,
-        CpuMask::single(CpuId(0)).bits(),
-        "initial userspace remains on the BSP-safe CPU0 path; child threads own AP spread",
+        meta.affinity, 0b1111,
+        "initial userspace exposes every online hart to the Linux affinity ABI",
     );
     assert!(meta.userspace_thread);
     assert!(!meta.spread_on_submit);
+    assert_eq!(meta.migration, tx_reactor::MigrationPolicy::Pinned);
+
+    let child = CoreInit::<TestPlatform>::userspace_child_thread_sched_meta_for(CpuId(3));
+    assert_eq!(child.affinity, 0b1111);
+    assert!(child.userspace_thread);
+    assert!(child.spread_on_submit);
+    assert_eq!(child.migration, tx_reactor::MigrationPolicy::Pinned);
 }
 
 /// **Downgrade note (per trio plan §"Phase 3b tests"):** end-to-end

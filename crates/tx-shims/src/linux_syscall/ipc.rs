@@ -3,8 +3,9 @@
 use super::{
     bootstrap_copy_from_user, bootstrap_copy_to_user, bootstrap_read_user, bootstrap_write_user,
     errno_to_i32, read_user_cstr, ReadCStrError, SyscallCtx, SyscallResult, E2BIG_VALUE,
-    EBADF_VALUE, EFAULT_VALUE, EINVAL_VALUE, ENAMETOOLONG_VALUE, ENOENT_VALUE, ENOMEM_VALUE,
-    ENOSYS_VALUE, O_ACCMODE, O_CLOEXEC, O_CREAT, O_EXCL, O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY,
+    EBADF_VALUE, EFAULT_VALUE, EINVAL_VALUE, EMFILE_VALUE, ENAMETOOLONG_VALUE, ENOENT_VALUE,
+    ENOMEM_VALUE, ENOSYS_VALUE, O_ACCMODE, O_CLOEXEC, O_CREAT, O_EXCL, O_NONBLOCK, O_RDONLY,
+    O_RDWR, O_WRONLY,
 };
 use crate::adapter::step_engine::{
     Cap, InterestMask, NoProgress, ScriptCtx, StepOp, StepOutcome, WaitSourceId,
@@ -915,11 +916,9 @@ pub(super) fn sys_mq_open(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult
         Ok(cap) => cap,
         Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
     };
-    let fd = ctx.process.allocate_fd();
-    let _ = ctx.process.install_fd(fd, open_cap);
-    if open_flags.cloexec {
-        ctx.process.set_fd_cloexec(fd, true);
-    }
+    let Some(fd) = ctx.process.install_new_fd(open_cap, open_flags.cloexec) else {
+        return SyscallResult::Error(EMFILE_VALUE);
+    };
     SyscallResult::Return(fd as i64)
 }
 

@@ -54,16 +54,17 @@ pub(crate) const QEMU_LA64_PCH_MSI_SIZE: usize = 0x8;
 #[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
 pub(crate) const QEMU_LA64_FW_CFG_BASE: usize = 0x1e02_0000;
 pub(crate) const QEMU_LA64_FDT_BASE: usize = 0x0010_0000;
-pub(crate) const LA64_MAX_BOOT_CPUS: usize = 4;
-#[cfg(target_arch = "loongarch64")]
-pub(crate) const LA64_DEFAULT_POSSIBLE_CPUS: usize = LA64_MAX_BOOT_CPUS;
-#[cfg(not(target_arch = "loongarch64"))]
+/// Maximum number of harts covered by the statically allocated boot stacks,
+/// trap contexts, per-hart TLS state, and IRQ-depth counters.
+pub(crate) const LA64_MAX_BOOT_CPUS: usize = 8;
+/// Missing firmware topology must fail safe to one CPU. QEMU publishes the
+/// actual `-smp` topology through its FDT, so normal virtual-machine boots do
+/// not use this fallback.
 pub(crate) const LA64_DEFAULT_POSSIBLE_CPUS: usize = 1;
 pub(crate) const LA64_DMW_CACHED_BASE: usize = 0x9000_0000_0000_0000;
 pub(crate) const LA64_DMW_UNCACHED_BASE: usize = 0x8000_0000_0000_0000;
 pub(crate) const LA64_PHYS_ADDR_MASK: usize = (1usize << 48) - 1;
 pub(crate) const LA64_CSR_CRMD: usize = 0x00;
-#[cfg(target_arch = "loongarch64")]
 pub(crate) const LA64_CSR_EUEN: usize = 0x02;
 pub(crate) const LA64_CSR_ECFG: usize = 0x04;
 pub(crate) const LA64_CSR_EENTRY: usize = 0x0c;
@@ -84,11 +85,8 @@ pub(crate) const LA64_CRMD_IE: usize = 1 << 2;
 pub(crate) const LA64_CRMD_PG: usize = 1 << 4;
 pub(crate) const LA64_CRMD_DATF_CC: usize = 0b01 << 5;
 pub(crate) const LA64_CRMD_DATM_CC: usize = 0b01 << 7;
-#[cfg(target_arch = "loongarch64")]
 pub(crate) const LA64_EUEN_FPE: usize = 1 << 0;
-#[cfg(target_arch = "loongarch64")]
 pub(crate) const LA64_EUEN_SXE: usize = 1 << 1;
-#[cfg(target_arch = "loongarch64")]
 pub(crate) const LA64_EUEN_ASXE: usize = 1 << 2;
 pub(crate) const LA64_ASID_MASK: usize = 0x3ff;
 pub(crate) const LA64_TCFG_ENABLE: usize = 1 << 0;

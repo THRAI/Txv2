@@ -5,7 +5,7 @@ extern crate alloc;
 extern crate std;
 
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 mod boot_static;
 mod boot_trampoline;
@@ -33,12 +33,12 @@ use dtb::parse_boot_info_from_fdt;
 use pmap::topology as pmap_topology;
 use tx_hal::{
     AllocError, Arch, ArchAuxvFacts, Asid, AuxvIf, BootArg, BootHandoff, BootInfo, BootInfoIf,
-    BootPlatformIf, BootProtocol, BootstrapPmapInfo, CacheIf, ConsoleIf, CpuId, CpuMask, DmaAddr,
-    DmaDirection, DmaIf, EntropyIf, InitIf, IpiKind, IrqDispatchTable, IrqHandled, IrqIf,
-    MemoryRegion, MemoryRegionKind, ObserverIf, PercpuIf, PhysAddr, PlatformConfig, PlatformInfo,
-    PlatformInfoIf, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
-    PmapReserveKind, PmapRoot, PmapUnmapResult, PowerIf, PtNode, PtNodeAllocator, SecondaryEntry,
-    SmpIf, TimeIf, VirtAddr,
+    BootPlatformIf, BootProtocol, BootstrapPmapInfo, CacheIf, ConsoleIf, CpuId, CpuMask,
+    CpuPinGuard, DmaAddr, DmaDirection, DmaIf, EntropyIf, InitIf, IpiKind, IrqDispatchTable,
+    IrqHandled, IrqIf, MemoryRegion, MemoryRegionKind, ObserverIf, PercpuIf, PhysAddr,
+    PlatformConfig, PlatformInfo, PlatformInfoIf, PmapError, PmapIf, PmapInvalidation,
+    PmapPermissions, PmapReservation, PmapReserveKind, PmapRoot, PmapUnmapResult, PowerIf, PtNode,
+    PtNodeAllocator, SecondaryEntry, SmpIf, TimeIf, VirtAddr,
 };
 
 pub struct Platform;
@@ -110,7 +110,9 @@ const PLIC_CONTEXT_BASE: usize = 0x20_0000;
 const PLIC_CONTEXT_STRIDE: usize = 0x1000;
 const PLIC_CLAIM_COMPLETE: usize = 0x4;
 static ONLINE_CPUS: AtomicU64 = AtomicU64::new(0);
-static IPI_ACKED_CPUS: AtomicU64 = AtomicU64::new(0);
+const IPI_KIND_COUNT: usize = 4;
+static IPI_PENDING: [AtomicU8; MAX_BOOT_CPUS] = [const { AtomicU8::new(0) }; MAX_BOOT_CPUS];
+static IPI_ACKED_CPUS: [AtomicU64; IPI_KIND_COUNT] = [const { AtomicU64::new(0) }; IPI_KIND_COUNT];
 static ASID_RESIDENCY: [AtomicU64; pmap::ASID_CAPACITY] =
     [const { AtomicU64::new(0) }; pmap::ASID_CAPACITY];
 static FALLBACK_IRQ_DEPTH: AtomicUsize = AtomicUsize::new(0);
@@ -121,6 +123,17 @@ pub struct Rv64PerCpuArea {
     cpu_id: usize,
     kernel_stack_top: AtomicUsize,
     irq_depth: AtomicUsize,
+    /// Dedicated architecture trap-stack top. The RV64 trap-vector reads
+    /// this field directly through kernel `tp` for from-kernel traps, so
+    /// its offset is part of the assembly ABI.
+    trap_stack_top: AtomicUsize,
+    /// Software ASID whose user root is currently installed in `satp`.
+    ///
+    /// This cannot be reconstructed from `satp.ASID` on hardware that
+    /// implements zero ASID bits, so it must be tracked per hart.
+    active_user_asid: AtomicUsize,
+    /// Nesting depth of non-migratable kernel sections (EBR/zone guards).
+    cpu_pin_depth: AtomicUsize,
 }
 
 impl Rv64PerCpuArea {
@@ -129,6 +142,9 @@ impl Rv64PerCpuArea {
             cpu_id,
             kernel_stack_top: AtomicUsize::new(0),
             irq_depth: AtomicUsize::new(0),
+            trap_stack_top: AtomicUsize::new(0),
+            active_user_asid: AtomicUsize::new(0),
+            cpu_pin_depth: AtomicUsize::new(0),
         }
     }
 
@@ -144,6 +160,11 @@ impl Rv64PerCpuArea {
         self.irq_depth.load(Ordering::Acquire)
     }
 }
+
+const RV64_PERCPU_TRAP_STACK_TOP_OFFSET: usize = 24;
+const _: () = assert!(
+    core::mem::offset_of!(Rv64PerCpuArea, trap_stack_top) == RV64_PERCPU_TRAP_STACK_TOP_OFFSET
+);
 
 static RV64_PERCPU_AREAS: [Rv64PerCpuArea; MAX_BOOT_CPUS] = [
     Rv64PerCpuArea::new(0),
@@ -332,7 +353,7 @@ impl PlatformConfig for Platform {
     const USER_TOP: tx_hal::VirtAddr = tx_hal::VirtAddr(pmap_topology::SV39_USER_TOP);
     const USER_RESERVED_TOP_SIZE: usize = pmap_topology::USER_RESERVED_TOP_SIZE;
     const USER_ALLOC_TOP: tx_hal::VirtAddr = tx_hal::VirtAddr(pmap_topology::SV39_USER_ALLOC_TOP);
-    const KERNEL_STACK_SIZE: usize = 128 * 1024;
+    const KERNEL_STACK_SIZE: usize = 512 * 1024;
     const KERNEL_STACK_ALIGN: usize = Self::PAGE_SIZE;
     const PAGE_TABLE_LEVELS: u8 = 3;
     const ASID_BITS: u8 = 16;
@@ -745,9 +766,33 @@ impl PercpuIf for Platform {
         write_kernel_tls(value as usize);
     }
 
+    fn pin_current_cpu() -> CpuPinGuard {
+        let cpu = current_cpu_id();
+        current_percpu_area()
+            .expect("RV64 per-CPU area must exist before CPU pinning")
+            .cpu_pin_depth
+            .fetch_add(1, Ordering::Relaxed);
+        CpuPinGuard::with_unpin(cpu, rv64_unpin_cpu)
+    }
+
+    fn cpu_pin_depth() -> usize {
+        current_percpu_area()
+            .map(|area| area.cpu_pin_depth.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
     unsafe fn install_kernel_stack(top: VirtAddr) {
         unsafe { install_kernel_stack(top) };
     }
+}
+
+fn rv64_unpin_cpu(cpu: CpuId) {
+    debug_assert_eq!(cpu, current_cpu_id());
+    let previous = current_percpu_area()
+        .expect("RV64 per-CPU area must exist while dropping CPU pin")
+        .cpu_pin_depth
+        .fetch_sub(1, Ordering::Release);
+    assert!(previous != 0, "RV64 CPU pin nesting underflow");
 }
 impl CacheIf for Platform {
     fn fence_all() {
@@ -794,29 +839,22 @@ impl SmpIf for Platform {
     }
 
     fn possible_cpus() -> CpuMask {
-        // SINGLE-CORE BY DEFAULT: the userspace scheduling contract
-        // is single-hart until cross-hart handoff lands, and the
-        // judge lane has always run -smp 1. More cores are an
-        // explicit opt-in via `tx.maxcpus=N` on the boot cmdline
-        // (xtask qemu injects it to match --smp; boards simply omit
-        // it). This also sidesteps firmware trees that misdescribe
-        // cpu topology — the VF2 U-Boot FDT claims hart0 (physically
-        // an MMU-less S7) is an S-mode-capable u74.
-        let requested = max_cpus_from_cmdline().unwrap_or(1);
-        if requested <= 1 {
-            return CpuMask::single(current_cpu_id());
-        }
-        // Opt-in multi-core: DTB-derived S-mode-capable harts
-        // (Linux's mmu-type + status rule), falling back to the
-        // count-prefix mask, capped by the request and the boot-asm
-        // stack budget. The boot hart always stays in the set.
+        // Use every startable hart published by the firmware/QEMU topology by
+        // default. `tx.maxcpus=N` is an explicit upper bound, including
+        // `tx.maxcpus=1` for a diagnostic single-core boot. The boot hart is
+        // always retained even when firmware omits it from the startable mask.
         let dtb_mask = boot_static::startable_harts();
-        let base = if dtb_mask != 0 {
+        let discovered = if dtb_mask != 0 {
             CpuMask::from_bits(dtb_mask & CpuMask::first(MAX_BOOT_CPUS).bits())
         } else {
             CpuMask::first(Self::platform_info().possible_cpu_count.min(MAX_BOOT_CPUS))
         };
-        limit_cpus(base, requested, current_cpu_id())
+        let current = current_cpu_id();
+        let base = CpuMask::from_bits(discovered.bits() | CpuMask::single(current).bits());
+        let requested = max_cpus_from_cmdline()
+            .unwrap_or_else(|| base.count())
+            .clamp(1, MAX_BOOT_CPUS);
+        limit_cpus(base, requested, current)
     }
 
     fn online_cpus() -> CpuMask {
@@ -832,22 +870,26 @@ impl SmpIf for Platform {
     fn boot_secondary_cpus(entry: SecondaryEntry) -> usize {
         let possible = Self::possible_cpus();
         let current = current_cpu_id();
-        let mut started_mask = CpuMask::EMPTY;
+        let mut wait_mask = CpuMask::EMPTY;
 
-        IPI_ACKED_CPUS.store(0, Ordering::Release);
+        for acked in &IPI_ACKED_CPUS {
+            acked.store(0, Ordering::Release);
+        }
         pmap::install_secondary_identity_bridge();
         for cpu in 0..MAX_BOOT_CPUS {
             let cpu = CpuId(cpu);
             if cpu == current || !possible.contains(cpu) {
                 continue;
             }
-            if start_secondary_hart(cpu, entry) {
-                started_mask =
-                    CpuMask::from_bits(started_mask.bits() | CpuMask::single(cpu).bits());
+            let error = start_secondary_hart(cpu, entry);
+            if error == SBI_SUCCESS || error == SBI_ERR_ALREADY_AVAILABLE {
+                wait_mask = CpuMask::from_bits(wait_mask.bits() | CpuMask::single(cpu).bits());
             }
         }
-        let online = wait_for_online_secondaries(started_mask);
-        pmap::remove_secondary_identity_bridge();
+        let online = wait_for_online_secondaries(wait_mask);
+        if online == wait_mask.count() {
+            pmap::remove_secondary_identity_bridge();
+        }
 
         online
     }
@@ -866,8 +908,10 @@ impl SmpIf for Platform {
         core::hint::spin_loop();
     }
 
-    fn pending_ipi(_kind: IpiKind) -> bool {
-        supervisor_software_interrupt_pending()
+    fn pending_ipi(kind: IpiKind) -> bool {
+        let cpu = current_cpu_id();
+        cpu.0 < IPI_PENDING.len()
+            && IPI_PENDING[cpu.0].load(Ordering::Acquire) & ipi_kind_bit(kind) != 0
     }
 
     fn park_this_cpu() -> ! {
@@ -877,28 +921,69 @@ impl SmpIf for Platform {
         }
     }
 
-    fn send_ipi(target: CpuId, _kind: IpiKind) {
+    fn quiesce_this_cpu() -> ! {
+        time::cancel_deadline();
+        #[cfg(target_arch = "riscv64")]
+        unsafe {
+            // No handler may re-enter the reactor/zone runtime after the AP
+            // published its shutdown acknowledgement.
+            core::arch::asm!(
+                "csrci sstatus, 2",
+                "csrw sie, zero",
+                options(nomem, nostack)
+            );
+        }
+        loop {
+            #[cfg(target_arch = "riscv64")]
+            unsafe {
+                core::arch::asm!("wfi", options(nomem, nostack));
+            }
+            #[cfg(not(target_arch = "riscv64"))]
+            core::hint::spin_loop();
+        }
+    }
+
+    fn send_ipi(target: CpuId, kind: IpiKind) {
         if target == current_cpu_id() {
             return;
         }
+        if target.0 >= IPI_PENDING.len() {
+            return;
+        }
+        IPI_PENDING[target.0].fetch_or(ipi_kind_bit(kind), Ordering::AcqRel);
         send_sbi_ipi(CpuMask::single(target));
     }
 
-    fn broadcast_ipi(mask: CpuMask, _kind: IpiKind) {
+    fn broadcast_ipi(mask: CpuMask, kind: IpiKind) {
+        let mut bits = mask.bits();
+        while bits != 0 {
+            let cpu = bits.trailing_zeros() as usize;
+            if cpu < IPI_PENDING.len() && CpuId(cpu) != current_cpu_id() {
+                IPI_PENDING[cpu].fetch_or(ipi_kind_bit(kind), Ordering::AcqRel);
+            }
+            bits &= bits - 1;
+        }
         send_sbi_ipi(mask);
     }
 
-    fn ack_ipi(_kind: IpiKind) {
-        mark_ipi_ack(current_cpu_id());
-        clear_supervisor_software_interrupt();
+    fn ack_ipi(kind: IpiKind) {
+        let cpu = current_cpu_id();
+        if cpu.0 >= IPI_PENDING.len() {
+            return;
+        }
+        IPI_PENDING[cpu.0].fetch_and(!ipi_kind_bit(kind), Ordering::AcqRel);
+        mark_ipi_ack_for(kind, cpu);
+        if IPI_PENDING[cpu.0].load(Ordering::Acquire) == 0 {
+            clear_supervisor_software_interrupt();
+        }
     }
 
-    fn clear_ipi_ack_cpus(_kind: IpiKind, mask: CpuMask) {
-        IPI_ACKED_CPUS.fetch_and(!mask.bits(), Ordering::AcqRel);
+    fn clear_ipi_ack_cpus(kind: IpiKind, mask: CpuMask) {
+        IPI_ACKED_CPUS[ipi_kind_index(kind)].fetch_and(!mask.bits(), Ordering::AcqRel);
     }
 
-    fn ipi_ack_cpus(_kind: IpiKind) -> CpuMask {
-        CpuMask::from_bits(IPI_ACKED_CPUS.load(Ordering::Acquire))
+    fn ipi_ack_cpus(kind: IpiKind) -> CpuMask {
+        CpuMask::from_bits(IPI_ACKED_CPUS[ipi_kind_index(kind)].load(Ordering::Acquire))
     }
 }
 
@@ -1057,6 +1142,9 @@ fn install_early_percpu(cpu_id: CpuId) {
     #[cfg(target_arch = "riscv64")]
     unsafe {
         let trap_stack_top = trap_stack_top_for_cpu(cpu_id);
+        RV64_PERCPU_AREAS[cpu_id.0]
+            .trap_stack_top
+            .store(trap_stack_top, Ordering::Release);
         core::arch::asm!("csrw sscratch, {top}", top = in(reg) trap_stack_top);
     }
 
@@ -1163,16 +1251,16 @@ fn valid_plic_irq(irq: u32) -> bool {
     irq != 0 && irq < PLIC_MAX_IRQ
 }
 
-/// Parse `tx.maxcpus=N` from the boot cmdline. Boards without a
-/// cmdline (host tests, missing chosen node) get `None` = no cap.
+/// Parse `tx.maxcpus=N` from the boot cmdline. Boards without a cmdline
+/// (host tests, missing chosen node) get `None`, so the firmware topology is
+/// used without an additional cap.
 ///
-/// Rationale: the VF2 U-Boot control FDT MISDESCRIBES hart0 (claims
+/// The VF2 U-Boot control FDT MISDESCRIBES hart0 (claims
 /// u74-mc + mmu-type sv39 + status okay for what is physically an
 /// MMU-less S7 monitor core — verified with `fdt print /cpus/cpu@0`
-/// on the board, 2026-07-02), so device-tree cpu filtering cannot be
-/// trusted there. The cmdline knob sidesteps firmware-tree lies and
-/// also enforces the single-core requirement while userspace
-/// cross-hart handoff remains unfinished.
+/// on the board, 2026-07-02). Real-board boot commands should therefore keep
+/// passing an explicit `tx.maxcpus` policy; QEMU's generated FDT is the
+/// authoritative default for the final SMP lane.
 fn max_cpus_from_cmdline() -> Option<usize> {
     let cmdline = BootStaticBag::<IdentityDropped>::global_ref()
         .boot_info_ref()
@@ -1632,23 +1720,44 @@ fn supervisor_software_interrupt_pending() -> bool {
     }
 }
 
-fn mark_ipi_ack(cpu_id: CpuId) {
-    if cpu_id.0 < u64::BITS as usize {
-        IPI_ACKED_CPUS.fetch_or(1u64 << cpu_id.0, Ordering::AcqRel);
+const fn ipi_kind_index(kind: IpiKind) -> usize {
+    match kind {
+        IpiKind::Reschedule => 0,
+        IpiKind::TlbShootdown => 1,
+        IpiKind::Membarrier => 2,
+        IpiKind::Stop => 3,
     }
 }
 
-fn start_secondary_hart(cpu: CpuId, entry: SecondaryEntry) -> bool {
+const fn ipi_kind_bit(kind: IpiKind) -> u8 {
+    1u8 << ipi_kind_index(kind)
+}
+
+fn mark_ipi_ack(cpu_id: CpuId) {
+    mark_ipi_ack_for(IpiKind::Reschedule, cpu_id);
+}
+
+fn mark_ipi_ack_for(kind: IpiKind, cpu_id: CpuId) {
+    if cpu_id.0 < u64::BITS as usize {
+        IPI_ACKED_CPUS[ipi_kind_index(kind)].fetch_or(1u64 << cpu_id.0, Ordering::AcqRel);
+    }
+}
+
+const SBI_SUCCESS: isize = 0;
+const SBI_ERR_ALREADY_AVAILABLE: isize = -6;
+const RV64_SECONDARY_BOOT_TIMEOUT_NS: u64 = 2_000_000_000;
+
+fn start_secondary_hart(cpu: CpuId, entry: SecondaryEntry) -> isize {
     #[cfg(target_arch = "riscv64")]
     {
         let start_addr = boot_static::secondary_start_entry();
-        sbi_hart_start(cpu.0, start_addr, entry as usize) == 0
+        sbi_hart_start(cpu.0, start_addr, entry as usize)
     }
 
     #[cfg(not(target_arch = "riscv64"))]
     {
         let _ = (cpu, entry);
-        false
+        -2
     }
 }
 
@@ -1658,10 +1767,20 @@ fn wait_for_online_secondaries(target: CpuMask) -> usize {
         return 0;
     }
 
-    for _ in 0..100_000 {
+    // AP initialization installs per-hart substrate, observation and reactor
+    // state before publishing ONLINE_CPUS. A fixed spin count expires at
+    // different wall times on different QEMU hosts and used to let the BSP
+    // continue with only a subset of `-smp 8` online. Use the architectural
+    // monotonic timer so the wait is independent of emulation speed.
+    let start_ns = time::read_ns(<Platform as TimeIf>::frequency_hz());
+    let deadline_ns = start_ns.saturating_add(RV64_SECONDARY_BOOT_TIMEOUT_NS);
+    loop {
         let online = ONLINE_CPUS.load(Ordering::Acquire) & target;
         if online == target {
             return online.count_ones() as usize;
+        }
+        if time::read_ns(<Platform as TimeIf>::frequency_hz()) >= deadline_ns {
+            break;
         }
         core::hint::spin_loop();
     }
@@ -1751,19 +1870,52 @@ fn mark_asid_resident_on_current_cpu(asid: Asid) {
     if (asid.0 as usize) >= ASID_RESIDENCY.len() || cpu.0 >= u64::BITS as usize {
         return;
     }
+    let previous = RV64_PERCPU_AREAS[cpu.0]
+        .active_user_asid
+        .swap(asid.0 as usize, Ordering::AcqRel);
+    if previous != 0 && previous != asid.0 as usize && previous < ASID_RESIDENCY.len() {
+        ASID_RESIDENCY[previous].fetch_and(!(1u64 << cpu.0), Ordering::AcqRel);
+    }
     ASID_RESIDENCY[asid.0 as usize].fetch_or(1u64 << cpu.0, Ordering::AcqRel);
 }
 
-pub(crate) fn clear_current_asid_residency() {
-    let asid = current_satp_asid();
-    if asid.0 == 0 || (asid.0 as usize) >= ASID_RESIDENCY.len() {
-        return;
-    }
+/// Leave the current user root in the only safe order:
+///
+/// 1. install the permanent bootstrap kernel root,
+/// 2. invalidate local translations,
+/// 3. publish that this hart is no longer resident in the software ASID.
+///
+/// Clearing residency before changing `satp` lets a concurrent root destroy
+/// free page-table pages that this hart can still walk.
+pub(crate) fn deactivate_current_user_pmap() {
     let cpu = current_cpu_id();
-    if cpu.0 >= u64::BITS as usize {
+    if cpu.0 >= RV64_PERCPU_AREAS.len() || cpu.0 >= u64::BITS as usize {
         return;
     }
-    ASID_RESIDENCY[asid.0 as usize].fetch_and(!(1u64 << cpu.0), Ordering::AcqRel);
+    let asid = RV64_PERCPU_AREAS[cpu.0]
+        .active_user_asid
+        .load(Ordering::Acquire);
+    if asid == 0 || asid >= ASID_RESIDENCY.len() {
+        return;
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        const SATP_MODE_SV39: usize = 0x8 << 60;
+        let bootstrap_root = BootStaticBag::<IdentityDropped>::global_ref().bootstrap_root_phys();
+        let bootstrap_satp = SATP_MODE_SV39 | (bootstrap_root.0 >> 12);
+        core::arch::asm!(
+            "csrw satp, {satp}",
+            "sfence.vma",
+            satp = in(reg) bootstrap_satp,
+            options(nostack)
+        );
+    }
+
+    RV64_PERCPU_AREAS[cpu.0]
+        .active_user_asid
+        .store(0, Ordering::Release);
+    ASID_RESIDENCY[asid].fetch_and(!(1u64 << cpu.0), Ordering::AcqRel);
 }
 
 fn asid_residency_mask(asid: Asid) -> CpuMask {
@@ -1776,6 +1928,18 @@ fn asid_residency_mask(asid: Asid) -> CpuMask {
 pub(crate) fn clear_asid_residency(asid: Asid) {
     if (asid.0 as usize) < ASID_RESIDENCY.len() {
         ASID_RESIDENCY[asid.0 as usize].store(0, Ordering::Release);
+    }
+}
+
+/// Wait until no hart can page-walk through this address-space root.
+///
+/// Callers must first stop all threads that can re-enter the address space.
+/// The acquire loop pairs with `deactivate_current_user_pmap`'s release-side
+/// publication and deliberately has no unsafe timeout: freeing a still-live
+/// root is worse than exposing a lifecycle bug as a hang.
+pub(crate) fn wait_for_asid_quiescence(asid: Asid) {
+    while !asid_residency_mask(asid).is_empty() {
+        core::hint::spin_loop();
     }
 }
 

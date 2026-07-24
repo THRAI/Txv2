@@ -58,16 +58,6 @@ fn apply_stat_meta_override(fs_object_id: FsObjectId, meta: &mut InodeMeta) {
     *meta = stat_meta_override_or(fs_object_id, *meta);
 }
 
-fn allocate_fd_under_limit<'a>(ctx: &SyscallCtx<'a>) -> Result<u32, SyscallResult> {
-    let fd = ctx.process.allocate_fd();
-    let (soft_limit, _) = ctx.process.rlimit_nofile();
-    if fd >= soft_limit {
-        Err(SyscallResult::Error(EMFILE_VALUE))
-    } else {
-        Ok(fd)
-    }
-}
-
 fn ensure_fd_room_under_limit<'a>(ctx: &SyscallCtx<'a>) -> Result<(), SyscallResult> {
     let fd = ctx.process.next_fd_above(0);
     let (soft_limit, _) = ctx.process.rlimit_nofile();
@@ -144,19 +134,6 @@ fn procfs_projected_mount() -> Result<Cap<tx_subsystems::mount::MountPayload>, S
     .map_err(|_| SyscallResult::Error(ENOMEM_VALUE))?;
     *cached = Some(mount.clone());
     Ok(mount)
-}
-
-fn allocate_fd_at_least_under_limit<'a>(
-    ctx: &SyscallCtx<'a>,
-    min: u32,
-) -> Result<u32, SyscallResult> {
-    let fd = ctx.process.allocate_fd_at_least(min);
-    let (soft_limit, _) = ctx.process.rlimit_nofile();
-    if fd >= soft_limit {
-        Err(SyscallResult::Error(EMFILE_VALUE))
-    } else {
-        Ok(fd)
-    }
 }
 
 fn openat_tmpfile_name(seq: u64) -> Vec<u8> {
@@ -242,14 +219,12 @@ pub(super) fn sys_memfd_create<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
         Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
     };
 
-    let fd = match allocate_fd_under_limit(ctx) {
-        Ok(fd) => fd,
-        Err(err) => return err,
+    let Some(fd) = ctx
+        .process
+        .install_new_fd(open_file, flags & MFD_CLOEXEC != 0)
+    else {
+        return SyscallResult::Error(EMFILE_VALUE);
     };
-    let _ = ctx.process.install_fd(fd, open_file);
-    if flags & MFD_CLOEXEC != 0 {
-        ctx.process.set_fd_cloexec(fd, true);
-    }
 
     SyscallResult::Return(fd as i64)
 }
@@ -294,11 +269,9 @@ pub(super) fn sys_memfd_secret<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
         Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
     };
 
-    let fd = match allocate_fd_under_limit(ctx) {
-        Ok(fd) => fd,
-        Err(err) => return err,
+    let Some(fd) = ctx.process.install_new_fd(open_file, false) else {
+        return SyscallResult::Error(EMFILE_VALUE);
     };
-    let _ = ctx.process.install_fd(fd, open_file);
 
     SyscallResult::Return(fd as i64)
 }
@@ -362,9 +335,6 @@ pub(super) fn sys_fcntl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResu
             let (soft_limit, _) = ctx.process.rlimit_nofile();
             if min >= soft_limit {
                 return SyscallResult::Error(EINVAL_VALUE);
-            }
-            if let Err(err) = allocate_fd_at_least_under_limit(ctx, min) {
-                return err;
             }
             let mut script_ctx = build_subject_script_ctx(ctx);
             let mut op = FcntlDupFdOp {
@@ -654,9 +624,7 @@ pub(super) fn sys_close_range<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysca
     }
 
     for fd in open_keys.range(first..=last).copied() {
-        let file_to_close = ctx.process.fd(fd);
-        ctx.process.set_fd(fd, None);
-        ctx.process.set_fd_cloexec(fd, false);
+        let file_to_close = ctx.process.set_fd(fd, None);
         if let Some(file) = file_to_close {
             file.flock_release();
             fcntl_release_process_locks_for_file(ctx.process.pid.0, &file);
@@ -788,14 +756,9 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
             Ok(file) => file,
             Err(result) => return result,
         };
-        let fd = match allocate_fd_under_limit(ctx) {
-            Ok(fd) => fd,
-            Err(err) => return err,
+        let Some(fd) = ctx.process.install_new_fd(openfile, want_cloexec) else {
+            return SyscallResult::Error(EMFILE_VALUE);
         };
-        let _ = ctx.process.set_fd(fd, Some(openfile));
-        if want_cloexec {
-            ctx.process.set_fd_cloexec(fd, true);
-        }
         return SyscallResult::Return(fd as i64);
     }
 
@@ -813,14 +776,9 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
             Ok(file) => file,
             Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
         };
-        let fd = match allocate_fd_under_limit(ctx) {
-            Ok(fd) => fd,
-            Err(err) => return err,
+        let Some(fd) = ctx.process.install_new_fd(file, want_cloexec) else {
+            return SyscallResult::Error(EMFILE_VALUE);
         };
-        let _ = ctx.process.set_fd(fd, Some(file));
-        if want_cloexec {
-            ctx.process.set_fd_cloexec(fd, true);
-        }
         return SyscallResult::Return(fd as i64);
     }
 
@@ -843,14 +801,9 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
                     Ok(file) => file,
                     Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
                 };
-                let fd = match allocate_fd_under_limit(ctx) {
-                    Ok(fd) => fd,
-                    Err(err) => return err,
+                let Some(fd) = ctx.process.install_new_fd(file, want_cloexec) else {
+                    return SyscallResult::Error(EMFILE_VALUE);
                 };
-                let _ = ctx.process.set_fd(fd, Some(file));
-                if want_cloexec {
-                    ctx.process.set_fd_cloexec(fd, true);
-                }
                 return SyscallResult::Return(fd as i64);
             }
         }
@@ -971,14 +924,9 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
         let Some(openfile) = opened else {
             return SyscallResult::Error(EEXIST_VALUE);
         };
-        let fd = match allocate_fd_under_limit(ctx) {
-            Ok(fd) => fd,
-            Err(err) => return err,
+        let Some(fd) = ctx.process.install_new_fd(openfile, want_cloexec) else {
+            return SyscallResult::Error(EMFILE_VALUE);
         };
-        let _ = ctx.process.set_fd(fd, Some(openfile));
-        if want_cloexec {
-            ctx.process.set_fd_cloexec(fd, true);
-        }
         return SyscallResult::Return(fd as i64);
     }
 
@@ -986,10 +934,6 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     // goes through `OpenOp + drive()` — no manual step loop.
     if !want_create && !want_trunc {
         use step_engine::DriveMode;
-        let fd = match allocate_fd_under_limit(ctx) {
-            Ok(fd) => fd,
-            Err(err) => return err,
-        };
         use tx_scripts::drive;
         let mut script_ctx = build_subject_script_ctx(ctx);
         let op = OpenOp {
@@ -1023,10 +967,9 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
         if want_write && openfile.rnode().meta().kind() == InodeKind::Directory {
             return SyscallResult::Error(EISDIR_VALUE);
         }
-        let _ = ctx.process.set_fd(fd, Some(openfile));
-        if want_cloexec {
-            ctx.process.set_fd_cloexec(fd, true);
-        }
+        let Some(fd) = ctx.process.install_new_fd(openfile, want_cloexec) else {
+            return SyscallResult::Error(EMFILE_VALUE);
+        };
         return SyscallResult::Return(fd as i64);
     }
 
@@ -1140,14 +1083,9 @@ pub(super) async fn sys_openat<'a, P: PmapIf>(
     // Step 4: install at the lowest unused fd ≥ 0. Per fd-ops Wave 1
     // the fd table is a sparse `BTreeMap<u32, Cap<OpenFile>>`;
     // `allocate_fd()` scans for the lowest unused key.
-    let fd = match allocate_fd_under_limit(ctx) {
-        Ok(fd) => fd,
-        Err(err) => return err,
+    let Some(fd) = ctx.process.install_new_fd(openfile, want_cloexec) else {
+        return SyscallResult::Error(EMFILE_VALUE);
     };
-    let _ = ctx.process.set_fd(fd, Some(openfile));
-    if want_cloexec {
-        ctx.process.set_fd_cloexec(fd, true);
-    }
 
     SyscallResult::Return(fd as i64)
 }
@@ -1221,9 +1159,6 @@ pub(super) fn sys_close<'a>(fd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
 pub(super) fn sys_dup<'a>(oldfd: u32, ctx: &SyscallCtx<'a>) -> SyscallResult {
     if ctx.process.fd(oldfd).is_none() {
         return SyscallResult::Error(EBADF_VALUE);
-    }
-    if let Err(err) = allocate_fd_under_limit(ctx) {
-        return err;
     }
     let mut script_ctx = build_subject_script_ctx(ctx);
     let mut op = DupOp {
@@ -1343,24 +1278,16 @@ pub(super) fn sys_pipe2<'a>(pipefd_uaddr: u64, flags: u32, ctx: &SyscallCtx<'a>)
     // reader first so on a fresh process it lands at 0 and the
     // writer at 1, matching Linux's user-visible (3, 4) pattern
     // post-stdin/out/err.
-    let reader_fd = match allocate_fd_under_limit(ctx) {
-        Ok(fd) => fd,
-        Err(err) => return err,
+    let Some(reader_fd) = ctx.process.install_new_fd(reader_cap, pipe_flags.cloexec) else {
+        return SyscallResult::Error(EMFILE_VALUE);
     };
-    let _ = ctx.process.install_fd(reader_fd, reader_cap);
-    let writer_fd = match allocate_fd_under_limit(ctx) {
-        Ok(fd) => fd,
-        Err(err) => {
+    let writer_fd = match ctx.process.install_new_fd(writer_cap, pipe_flags.cloexec) {
+        Some(fd) => fd,
+        None => {
             let _ = ctx.process.set_fd(reader_fd, None);
-            return err;
+            return SyscallResult::Error(EMFILE_VALUE);
         }
     };
-    let _ = ctx.process.install_fd(writer_fd, writer_cap);
-
-    if pipe_flags.cloexec {
-        ctx.process.set_fd_cloexec(reader_fd, true);
-        ctx.process.set_fd_cloexec(writer_fd, true);
-    }
 
     // Write the (reader_fd, writer_fd) pair back to userspace as the
     // Linux ABI's two adjacent little-endian `int` slots. Keep this
@@ -1370,6 +1297,8 @@ pub(super) fn sys_pipe2<'a>(pipefd_uaddr: u64, flags: u32, ctx: &SyscallCtx<'a>)
     pipefd_bytes[0..4].copy_from_slice(&reader_fd.to_le_bytes());
     pipefd_bytes[4..8].copy_from_slice(&writer_fd.to_le_bytes());
     if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, pipefd_uaddr, &pipefd_bytes) {
+        let _ = ctx.process.set_fd(reader_fd, None);
+        let _ = ctx.process.set_fd(writer_fd, None);
         return SyscallResult::error_from(errno);
     }
 

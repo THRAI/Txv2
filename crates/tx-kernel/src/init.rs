@@ -45,6 +45,10 @@ static CONSOLE_WRITE_LOCK: SpinMutex<()> = spin_mutex((), b"debug.lock.kernel.co
 static AP_REACTOR_TASK_DONE_CPUS: AtomicU64 = AtomicU64::new(0);
 static BSP_REACTOR_TIMER_DONE_CPUS: AtomicU64 = AtomicU64::new(0);
 static BSP_REACTOR_TIMER_DEADLINE_NS: AtomicU64 = AtomicU64::new(0);
+/// Shutdown handshake for AP reactor loops. Zone teardown is only safe after
+/// every AP has returned from its current task poll and published itself here.
+static AP_REACTOR_STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+static AP_REACTOR_STOPPED_CPUS: AtomicU64 = AtomicU64::new(0);
 
 /// Global root-mount slot retained for the kernel lifetime after
 /// `mount_rootfs_from_boot_media` bootstraps the process subsystem.
@@ -303,6 +307,15 @@ impl<P: TxPlatform> CoreInit<P> {
         // zombifies init.
         if P::SUBSTRATE_BOOT_READY {
             Self::run_userspace_reactor_loop();
+            if !Self::quiesce_secondary_reactors() {
+                // Continuing into zone teardown while an AP still owns a
+                // reactor/zone reference is a use-after-free. The process has
+                // already exited, so a direct poweroff is the only safe
+                // timeout fallback.
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":smp:quiesce:WARN-timeout\n");
+                P::system_off();
+            }
         }
         // Drain registered zones, then power off. The
         // zones-aware shutdown lives on the BSP shutdown lane (the
@@ -1994,8 +2007,25 @@ impl<P: TxPlatform> CoreInit<P> {
     }
 
     fn boot_secondary_cpus() {
-        let started = P::boot_secondary_cpus(Self::secondary_cpu_entry);
-        if started > 0 {
+        let possible = P::possible_cpus();
+        let expected_secondaries = possible.count().saturating_sub(usize::from(
+            possible.contains(<P as tx_hal::SmpIf>::current_cpu_id()),
+        ));
+        let online_secondaries = P::boot_secondary_cpus(Self::secondary_cpu_entry);
+
+        Self::write_board_sentinel_prefix();
+        tx_hal::console_write_str::<P>(":smp:cpus:possible=");
+        Self::write_usize(possible.count());
+        tx_hal::console_write_str::<P>(":online-aps=");
+        Self::write_usize(online_secondaries);
+        tx_hal::console_write_str::<P>(":online=");
+        Self::write_usize(P::online_cpu_count());
+        if online_secondaries != expected_secondaries {
+            tx_hal::console_write_str::<P>(":WARN-partial");
+        }
+        tx_hal::console_write_str::<P>("\n");
+
+        if online_secondaries > 0 {
             Self::write_board_sentinel_prefix();
             tx_hal::console_write_str::<P>(":smp:aps:online\n");
         }
@@ -2143,6 +2173,15 @@ impl<P: TxPlatform> CoreInit<P> {
             // Re-read after every trap/longjmp round-trip; the boot argument is
             // not the authoritative hart identity once the reactor is running.
             let cpu_id = <P as tx_hal::SmpIf>::current_cpu_id();
+            if AP_REACTOR_STOP_REQUESTED.load(core::sync::atomic::Ordering::Acquire) {
+                P::cancel_deadline();
+                if P::pending_ipi(IpiKind::Stop) {
+                    P::ack_ipi(IpiKind::Stop);
+                }
+                AP_REACTOR_STOPPED_CPUS
+                    .fetch_or(Self::cpu_bit(cpu_id), core::sync::atomic::Ordering::Release);
+                P::quiesce_this_cpu();
+            }
             if Self::run_secondary_reactor_once(cpu_id) {
                 continue;
             }
@@ -2155,6 +2194,32 @@ impl<P: TxPlatform> CoreInit<P> {
             if P::pending_ipi(IpiKind::Reschedule) {
                 P::ack_ipi(IpiKind::Reschedule);
             }
+        }
+    }
+
+    fn quiesce_secondary_reactors() -> bool {
+        let current = <P as tx_hal::SmpIf>::current_cpu_id();
+        let targets =
+            CpuMask::from_bits(P::online_cpus().bits() & !CpuMask::single(current).bits());
+        if targets.is_empty() {
+            return true;
+        }
+
+        AP_REACTOR_STOPPED_CPUS.fetch_and(!targets.bits(), core::sync::atomic::Ordering::AcqRel);
+        AP_REACTOR_STOP_REQUESTED.store(true, core::sync::atomic::Ordering::Release);
+        P::broadcast_ipi(targets, IpiKind::Stop);
+
+        let deadline = P::read_ns().saturating_add(2_000_000_000);
+        loop {
+            let stopped = AP_REACTOR_STOPPED_CPUS.load(core::sync::atomic::Ordering::Acquire)
+                & targets.bits();
+            if stopped == targets.bits() {
+                return true;
+            }
+            if P::read_ns() >= deadline {
+                return false;
+            }
+            core::hint::spin_loop();
         }
     }
 
@@ -2287,26 +2352,28 @@ impl<P: TxPlatform> CoreInit<P> {
     }
 
     fn userspace_thread_sched_meta_for(cpu_id: CpuId) -> boot_runtime::InitialSchedMeta {
-        // Userspace trap/return state still has hart-local architectural
-        // coupling. Keep OSComp user threads on the submit hart until the
-        // userspace context handoff is fully migration-safe.
-        let affinity = Self::cpu_bit(cpu_id);
+        // Expose every online hart to userspace from the first task so
+        // sched_getaffinity/nproc observe the SMP machine. The initial task is
+        // still pinned and has no spread-on-submit flag, so it starts on the
+        // first online hart (normally CPU0) and never migrates while a
+        // userspace trap round-trip is active.
+        let fallback = Self::cpu_bit(cpu_id);
+        let online = P::online_cpus().bits();
+        let affinity = if online == 0 { fallback } else { online };
         boot_runtime::InitialSchedMeta::fair()
             .with_affinity(affinity)
             .pinned()
             .userspace_thread()
     }
 
-    #[cfg(not(any(tx_userspace_child_spread_smp1, tx_userspace_child_spread_smp4)))]
-    fn userspace_child_thread_sched_meta_for(cpu_id: CpuId) -> boot_runtime::InitialSchedMeta {
-        Self::userspace_thread_sched_meta_for(cpu_id)
-    }
-
-    #[cfg(any(tx_userspace_child_spread_smp1, tx_userspace_child_spread_smp4))]
     fn userspace_child_thread_sched_meta_for(cpu_id: CpuId) -> boot_runtime::InitialSchedMeta {
         let fallback = Self::cpu_bit(cpu_id);
         let online = P::online_cpus().bits();
         let affinity = if online == 0 { fallback } else { online };
+        // Distribute newly submitted children across the least-loaded online
+        // hart, then keep each child pinned there. This activates parallel
+        // Cargo/rustc processes without enabling post-trap userspace migration
+        // or userspace work stealing yet.
         boot_runtime::InitialSchedMeta::fair()
             .with_affinity(affinity)
             .pinned()

@@ -5,11 +5,11 @@ use tx_hal::{
 };
 
 use crate::{
-    asid_residency_mask, clear_asid_residency, clear_current_asid_residency, dispatch_trap_frame,
-    enter_irq_context, for_each_console_byte_for_sbi, mark_asid_resident_on_current_cpu,
-    mark_ipi_ack, percpu_tls_for_cpu, remote_sfence_targets_for_asid_from,
-    remote_sfence_targets_from, trap::classify_rv64_trap, Platform, Rv64TrapFrame, MAX_BOOT_CPUS,
-    RV64_PERCPU_AREAS,
+    asid_residency_mask, clear_asid_residency, deactivate_current_user_pmap, dispatch_trap_frame,
+    enter_irq_context, for_each_console_byte_for_sbi, limit_cpus,
+    mark_asid_resident_on_current_cpu, mark_ipi_ack, percpu_tls_for_cpu,
+    remote_sfence_targets_for_asid_from, remote_sfence_targets_from, trap::classify_rv64_trap,
+    Platform, Rv64TrapFrame, MAX_BOOT_CPUS, RV64_PERCPU_AREAS,
 };
 
 static RV64_HAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -174,6 +174,23 @@ fn percpu_install_sets_kernel_tls_pointer_and_current_cpu() {
     assert_eq!(<Platform as SmpIf>::current_cpu_id(), CpuId(7));
 
     <Platform as PercpuIf>::write_kernel_tls(saved_tls);
+}
+
+#[test]
+fn cpu_limit_keeps_boot_hart_and_caps_discovered_topology() {
+    let discovered = CpuMask::first(8);
+    assert_eq!(
+        limit_cpus(discovered, 1, CpuId(3)),
+        CpuMask::single(CpuId(3))
+    );
+    assert_eq!(limit_cpus(discovered, 4, CpuId(3)).count(), 4);
+    assert!(limit_cpus(discovered, 4, CpuId(3)).contains(CpuId(3)));
+
+    let sparse = CpuMask::from_bits((1 << 1) | (1 << 4) | (1 << 7));
+    assert_eq!(
+        limit_cpus(sparse, 2, CpuId(4)),
+        CpuMask::from_bits((1 << 1) | (1 << 4))
+    );
 }
 
 #[test]
@@ -634,7 +651,7 @@ fn remote_sfence_targets_are_limited_to_asid_residency() {
 
     assert_eq!(targets.bits(), 0b1000);
     assert_eq!(asid_residency_mask(asid).bits(), 0b1010);
-    clear_current_asid_residency();
+    deactivate_current_user_pmap();
     clear_asid_residency(asid);
 }
 

@@ -269,13 +269,9 @@ pub(super) fn sys_pidfd_getfd(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallRe
         Some(file) => file,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
-    let newfd = ctx.process.allocate_fd();
-    let (soft_limit, _) = ctx.process.rlimit_nofile();
-    if newfd >= soft_limit {
+    let Some(newfd) = ctx.process.install_new_fd(target_file, true) else {
         return SyscallResult::Error(EMFILE_VALUE);
-    }
-    let _ = ctx.process.install_fd(newfd, target_file);
-    ctx.process.set_fd_cloexec(newfd, true);
+    };
     SyscallResult::Return(newfd as i64)
 }
 

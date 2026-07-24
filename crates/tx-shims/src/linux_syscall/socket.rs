@@ -167,9 +167,9 @@ pub(super) fn sys_socket<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
         }
     };
 
-    let fd = ctx.process.allocate_fd();
-    let _ = ctx.process.set_fd(fd, Some(opened.file));
-    ctx.process.set_fd_cloexec(fd, opened.cloexec);
+    let Some(fd) = ctx.process.install_new_fd(opened.file, opened.cloexec) else {
+        return SyscallResult::Error(EMFILE_VALUE);
+    };
     SyscallResult::Return(fd as i64)
 }
 
@@ -245,15 +245,20 @@ pub(super) fn sys_socketpair<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
         }
     }
 
-    let first_fd = ctx.process.allocate_fd();
-    let _ = ctx.process.set_fd(first_fd, Some(first.file));
-    ctx.process.set_fd_cloexec(first_fd, first.cloexec);
-    let second_fd = ctx.process.allocate_fd();
-    let _ = ctx.process.set_fd(second_fd, Some(second.file));
-    ctx.process.set_fd_cloexec(second_fd, second.cloexec);
+    let Some(first_fd) = ctx.process.install_new_fd(first.file, first.cloexec) else {
+        return SyscallResult::Error(EMFILE_VALUE);
+    };
+    let Some(second_fd) = ctx.process.install_new_fd(second.file, second.cloexec) else {
+        ctx.process.set_fd(first_fd, None);
+        return SyscallResult::Error(EMFILE_VALUE);
+    };
     match bootstrap_write_user::<[i32; 2]>(&ctx.aspace, sv, [first_fd as i32, second_fd as i32]) {
         Ok(()) => SyscallResult::Return(0),
-        Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+        Err(errno) => {
+            ctx.process.set_fd(first_fd, None);
+            ctx.process.set_fd(second_fd, None);
+            SyscallResult::Error(errno_to_i32(errno))
+        }
     }
 }
 
@@ -394,9 +399,9 @@ async fn accept_impl<'a, P: TimeIf>(
                     return SyscallResult::Error(errno_to_i32(errno));
                 }
 
-                let new_fd = ctx.process.allocate_fd();
-                let _ = ctx.process.set_fd(new_fd, Some(opened.file));
-                ctx.process.set_fd_cloexec(new_fd, opened.cloexec);
+                let Some(new_fd) = ctx.process.install_new_fd(opened.file, opened.cloexec) else {
+                    return SyscallResult::Error(EMFILE_VALUE);
+                };
                 return SyscallResult::Return(new_fd as i64);
             }
             StepOutcome::Yield { shape, .. } => {
@@ -3352,8 +3357,11 @@ pub(super) fn sys_getsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
                             },
                         ) {
                             Ok(opened) => {
-                                let new_fd = ctx.process.allocate_fd();
-                                let _ = ctx.process.set_fd(new_fd, Some(opened.file));
+                                let Some(new_fd) =
+                                    ctx.process.install_new_fd(opened.file, opened.cloexec)
+                                else {
+                                    return SyscallResult::Error(EMFILE_VALUE);
+                                };
                                 buf[4..8].copy_from_slice(&(new_fd as i32).to_le_bytes());
                                 write_sockopt_bytes(ctx, optval, optlen_ptr, &buf)
                             }

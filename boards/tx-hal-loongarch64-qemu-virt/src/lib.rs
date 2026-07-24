@@ -5,16 +5,16 @@ extern crate std;
 
 use tx_hal::{
     AllocError, Arch, ArchAuxvFacts, Asid, AuxvIf, BootArg, BootHandoff, BootInfo, BootInfoIf,
-    BootPlatformIf, BootProtocol, BootstrapPmapInfo, CacheIf, ConsoleIf, CpuId, CpuMask, DmaIf,
-    EntropyIf, FaultInfo, FpSimdIf, InitIf, IpiKind, IrqDispatchTable, IrqHandled, IrqIf,
-    KernelTrapSink, MemoryRegion, MemoryRegionKind, MmioFlags, MmioRegion, ObserverIf, PercpuIf,
-    PhysAddr, PhysRange, PlatformConfig, PlatformInfo, PlatformInfoIf, PmapError, PmapIf,
-    PmapInvalidation, PmapPermissions, PmapReservation, PmapReservationIntermediates,
-    PmapReserveKind, PmapRoot, PmapUnmapResult, Pod, PowerIf, PtNode, PtNodeAllocator,
-    SavedSignalFrame, SecondaryEntry, SignalFrameIf, SignalFrameWrite, SignalHandlerRegs, SmpIf,
-    TimeIf, TrapAction, TrapClass, TrapFrameMut, TrapFrameMutVtable, TrapFrameSnapshot,
-    TrapFrameView, TrapIf, TrapPreviousMode, UserFpContext, UserPtr, UserSignalMaskAbi,
-    UserTrapContext, VirtAddr, VirtRange,
+    BootPlatformIf, BootProtocol, BootstrapPmapInfo, CacheIf, ConsoleIf, CpuId, CpuMask,
+    CpuPinGuard, DmaIf, EntropyIf, FaultInfo, FpSimdIf, InitIf, IpiKind, IrqDispatchTable,
+    IrqHandled, IrqIf, KernelTrapSink, MemoryRegion, MemoryRegionKind, MmioFlags, MmioRegion,
+    ObserverIf, PercpuIf, PhysAddr, PhysRange, PlatformConfig, PlatformInfo, PlatformInfoIf,
+    PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
+    PmapReservationIntermediates, PmapReserveKind, PmapRoot, PmapUnmapResult, Pod, PowerIf, PtNode,
+    PtNodeAllocator, SavedSignalFrame, SecondaryEntry, SignalFrameIf, SignalFrameWrite,
+    SignalHandlerRegs, SmpIf, TimeIf, TrapAction, TrapClass, TrapFrameMut, TrapFrameMutVtable,
+    TrapFrameSnapshot, TrapFrameView, TrapIf, TrapPreviousMode, UserFpContext, UserPtr,
+    UserSignalMaskAbi, UserTrapContext, VirtAddr, VirtRange,
 };
 
 pub use boot_args::capture_loongarch64_qemu_boot_args;
@@ -27,7 +27,7 @@ use la64_pmap::{la64_cached_virt, la64_uncached_virt, uart_put_byte, uart_try_ge
 
 use core::cell::UnsafeCell;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 pub(crate) use la64_consts::*;
 pub(crate) use la64_signal_frame::La64SignalFrame;
@@ -81,13 +81,10 @@ static INSTALLED_PT_NODE_ALLOCATOR: AtomicUsize = AtomicUsize::new(0);
 static LA64_TIMEBASE_HZ: AtomicU64 = AtomicU64::new(0);
 static LA64_POSSIBLE_CPU_COUNT: AtomicUsize = AtomicUsize::new(LA64_DEFAULT_POSSIBLE_CPUS);
 static LA64_ONLINE_CPUS: AtomicU64 = AtomicU64::new(1);
-static LA64_IPI_ACKED_CPUS: AtomicU64 = AtomicU64::new(0);
-static LA64_IRQ_CONTEXT_DEPTHS: [AtomicUsize; LA64_MAX_BOOT_CPUS] = [
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-];
+static LA64_IRQ_CONTEXT_DEPTHS: [AtomicUsize; LA64_MAX_BOOT_CPUS] =
+    [const { AtomicUsize::new(0) }; LA64_MAX_BOOT_CPUS];
+static LA64_CPU_PIN_DEPTHS: [AtomicUsize; LA64_MAX_BOOT_CPUS] =
+    [const { AtomicUsize::new(0) }; LA64_MAX_BOOT_CPUS];
 static LA64_IRQ_DISPATCH_TABLE: AtomicUsize = AtomicUsize::new(0);
 /// LA64 supports a 10-bit ASID space (`ASID_BITS = 10`, `LA64_ASID_MASK =
 /// 0x3ff`), i.e. 1024 ASIDs. The allocator must cover that whole space so that
@@ -101,21 +98,23 @@ static LA64_ALLOCATED_ASIDS: [AtomicU64; LA64_ASID_BITMAP_WORDS] =
     [const { AtomicU64::new(0) }; LA64_ASID_BITMAP_WORDS];
 static LA64_KERNEL_PGDH_PHYS: AtomicUsize = AtomicUsize::new(0);
 static LA64_KERNEL_PGDH_BOOTSTRAP_MAPPED: AtomicBool = AtomicBool::new(false);
-static LA64_ACTIVE_PGDL: AtomicUsize = AtomicUsize::new(0);
-static LA64_ACTIVE_PGDH: AtomicUsize = AtomicUsize::new(0);
-static LA64_ACTIVE_ASID: AtomicUsize = AtomicUsize::new(0);
+static LA64_ACTIVE_PGDL: [AtomicUsize; LA64_MAX_BOOT_CPUS] =
+    [const { AtomicUsize::new(0) }; LA64_MAX_BOOT_CPUS];
+static LA64_ACTIVE_PGDH: [AtomicUsize; LA64_MAX_BOOT_CPUS] =
+    [const { AtomicUsize::new(0) }; LA64_MAX_BOOT_CPUS];
+static LA64_ACTIVE_ASID: [AtomicUsize; LA64_MAX_BOOT_CPUS] =
+    [const { AtomicUsize::new(0) }; LA64_MAX_BOOT_CPUS];
+static LA64_ASID_RESIDENCY: [AtomicU64; LA64_ASID_CAPACITY] =
+    [const { AtomicU64::new(0) }; LA64_ASID_CAPACITY];
+static LA64_TLB_SHOOTDOWN_LOCK: AtomicBool = AtomicBool::new(false);
 static LA64_COMMITTED_PT_NODE_REGISTRY_LOCK: AtomicBool = AtomicBool::new(false);
 const LA64_COMMITTED_PT_NODE_REGISTRY_SLOTS: usize = 4096;
 static LA64_COMMITTED_PT_NODES: La64CommittedPtNodeRegistry = La64CommittedPtNodeRegistry(
     UnsafeCell::new([None; LA64_COMMITTED_PT_NODE_REGISTRY_SLOTS]),
 );
 #[cfg(target_arch = "loongarch64")]
-static LA64_KERNEL_TLS_VALID: [AtomicBool; LA64_MAX_BOOT_CPUS] = [
-    AtomicBool::new(false),
-    AtomicBool::new(false),
-    AtomicBool::new(false),
-    AtomicBool::new(false),
-];
+static LA64_KERNEL_TLS_VALID: [AtomicBool; LA64_MAX_BOOT_CPUS] =
+    [const { AtomicBool::new(false) }; LA64_MAX_BOOT_CPUS];
 #[cfg(not(target_arch = "loongarch64"))]
 static LA64_HOST_KERNEL_TLS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(not(target_arch = "loongarch64"))]
@@ -171,36 +170,16 @@ impl<T> PerHartCell<T> {
 }
 
 #[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
-static LA64_KERNEL_RESUME_CTX: [PerHartCell<KernelResumeCtx>; LA64_MAX_BOOT_CPUS] = [
+static LA64_KERNEL_RESUME_CTX: [PerHartCell<KernelResumeCtx>; LA64_MAX_BOOT_CPUS] = [const {
     PerHartCell::new(KernelResumeCtx {
         sp: 0,
         ra: 0,
         r21: 0,
         tp: 0,
         r22: [0; 10],
-    }),
-    PerHartCell::new(KernelResumeCtx {
-        sp: 0,
-        ra: 0,
-        r21: 0,
-        tp: 0,
-        r22: [0; 10],
-    }),
-    PerHartCell::new(KernelResumeCtx {
-        sp: 0,
-        ra: 0,
-        r21: 0,
-        tp: 0,
-        r22: [0; 10],
-    }),
-    PerHartCell::new(KernelResumeCtx {
-        sp: 0,
-        ra: 0,
-        r21: 0,
-        tp: 0,
-        r22: [0; 10],
-    }),
-];
+    })
+};
+    LA64_MAX_BOOT_CPUS];
 
 const LA64_TRAP_STACK_SIZE: usize = 16 * 1024;
 
@@ -208,12 +187,8 @@ const LA64_TRAP_STACK_SIZE: usize = 16 * 1024;
 pub struct La64TrapStack(pub [u8; LA64_TRAP_STACK_SIZE]);
 
 #[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
-static LA64_TRAP_STACKS: [PerHartCell<La64TrapStack>; LA64_MAX_BOOT_CPUS] = [
-    PerHartCell::new(La64TrapStack([0; LA64_TRAP_STACK_SIZE])),
-    PerHartCell::new(La64TrapStack([0; LA64_TRAP_STACK_SIZE])),
-    PerHartCell::new(La64TrapStack([0; LA64_TRAP_STACK_SIZE])),
-    PerHartCell::new(La64TrapStack([0; LA64_TRAP_STACK_SIZE])),
-];
+static LA64_TRAP_STACKS: [PerHartCell<La64TrapStack>; LA64_MAX_BOOT_CPUS] =
+    [const { PerHartCell::new(La64TrapStack([0; LA64_TRAP_STACK_SIZE])) }; LA64_MAX_BOOT_CPUS];
 
 #[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
 pub(crate) fn la64_trap_stack_top_for_cpu(cpu: CpuId) -> usize {
@@ -265,12 +240,8 @@ pub(crate) fn la64_kernel_resume_ctx_ptr_for_cpu(cpu: CpuId) -> *mut KernelResum
 }
 
 #[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
-static LA64_ENTRY_TRAP_FRAMES: [PerHartCell<La64TrapFrame>; LA64_MAX_BOOT_CPUS] = [
-    PerHartCell::new(La64TrapFrame::empty()),
-    PerHartCell::new(La64TrapFrame::empty()),
-    PerHartCell::new(La64TrapFrame::empty()),
-    PerHartCell::new(La64TrapFrame::empty()),
-];
+static LA64_ENTRY_TRAP_FRAMES: [PerHartCell<La64TrapFrame>; LA64_MAX_BOOT_CPUS] =
+    [const { PerHartCell::new(La64TrapFrame::empty()) }; LA64_MAX_BOOT_CPUS];
 
 #[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
 pub(crate) fn la64_entry_trap_frame_ptr_for_cpu(cpu: CpuId) -> *mut La64TrapFrame {
@@ -509,7 +480,7 @@ impl PlatformConfig for Platform {
     const DIRECT_MAP_SIZE: usize = QEMU_LA64_DIRECT_MAP_SIZE;
     const KERNEL_VIRT_BASE: VirtAddr = VirtAddr(la64_cached_virt(QEMU_LA64_KERNEL_LOAD_BASE));
     const USER_TOP: VirtAddr = VirtAddr(LA64_USER_TOP);
-    const KERNEL_STACK_SIZE: usize = 128 * 1024;
+    const KERNEL_STACK_SIZE: usize = 512 * 1024;
     const KERNEL_STACK_ALIGN: usize = Self::PAGE_SIZE;
     const PAGE_TABLE_LEVELS: u8 = 4;
     const ASID_BITS: u8 = 10;

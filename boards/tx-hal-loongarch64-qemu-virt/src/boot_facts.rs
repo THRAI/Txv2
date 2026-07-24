@@ -165,8 +165,8 @@ pub(crate) fn boot_cmdline_ptr() -> *mut u8 {
 }
 
 /// Parse `tx.maxcpus=N` from the published boot cmdline (None before
-/// boot facts are published or when the knob is absent — callers
-/// default to single-core). Mirrors the rv64 board's knob.
+/// boot facts are published or when the knob is absent — callers use the
+/// discovered firmware topology). Mirrors the rv64 board's knob.
 pub(crate) fn max_cpus_from_cmdline() -> Option<usize> {
     let info = unsafe { &*(boot_info_ptr() as *const BootInfo) };
     let cmdline = info.cmdline?;

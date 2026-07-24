@@ -329,6 +329,13 @@ impl TaskTable {
         let task = self.live_nonterminal_task_mut(handle)?;
         task.future = Some(future);
         if task.wake_state.take_wake() {
+            // A wake may race with the task's current poll.  In that case the
+            // waker has already queued this task before `poll()` returns
+            // `Pending`.  The queue entry is only useful if the task-table
+            // state is committed back to Runnable as well; leaving it in
+            // Polling makes the scheduler reject the queued entry and loses
+            // the wake permanently.
+            task.status = TaskStatus::Runnable;
             let mailbox_event = !task.mailbox.is_empty() || task.mailbox.overflow();
             Ok(PendingPollCommit::Woken {
                 hint: task.mailbox.take_scheduler_hint(),
@@ -398,15 +405,29 @@ impl TaskTable {
         id: TaskId,
     ) -> Option<(TaskKey, MailboxSchedulerHint)> {
         let task = self.slots.get_mut(id.index())?.task.as_mut()?;
-        if !task.wake_state.take_wake() {
-            return None;
-        }
-        if task.status == TaskStatus::Parked {
-            task.status = TaskStatus::Runnable;
-            let hint = task.mailbox.take_scheduler_hint();
-            Some((task.handle(), hint))
-        } else {
-            None
+        match task.status {
+            TaskStatus::Parked => {
+                if !task.wake_state.take_wake() {
+                    return None;
+                }
+                task.status = TaskStatus::Runnable;
+                let hint = task.mailbox.take_scheduler_hint();
+                Some((task.handle(), hint))
+            }
+            TaskStatus::Polling => {
+                // A different hart may drain the global wake queue while this
+                // task is still inside `Future::poll`.  Keep the wake bit set:
+                // `finish_polled_pending` owns the poll/park handshake and
+                // will turn the task straight back into Runnable.  Consuming
+                // it here loses the only wake when poll later returns Pending.
+                None
+            }
+            TaskStatus::Runnable | TaskStatus::Completed | TaskStatus::Cancelled => {
+                // Runnable tasks already have queue ownership; terminal tasks
+                // cannot be resumed.  Discard redundant/stale wake state.
+                let _ = task.wake_state.take_wake();
+                None
+            }
         }
     }
 
@@ -549,6 +570,33 @@ impl Default for TaskTable {
 
 const fn is_terminal(status: TaskStatus) -> bool {
     matches!(status, TaskStatus::Completed | TaskStatus::Cancelled)
+}
+
+#[cfg(test)]
+mod tests {
+    use core::future::pending;
+
+    use super::*;
+
+    #[test]
+    fn wake_during_poll_commits_task_back_to_runnable() {
+        let mut tasks = TaskTable::new();
+        let handle = tasks.submit(pending::<()>());
+        let (key, future, wake_state, _) = tasks
+            .take_runnable_future_by_id(handle.id())
+            .expect("take task for polling");
+
+        task_waker(wake_state).wake_by_ref();
+        let drained = tasks.drain_wake_ids();
+        assert_eq!(drained, [handle.id()]);
+        assert_eq!(tasks.take_wake_if_parked_by_id_with_hint(handle.id()), None);
+
+        assert!(matches!(
+            tasks.finish_polled_pending(key, future),
+            Ok(PendingPollCommit::Woken { .. })
+        ));
+        assert_eq!(tasks.status(handle), Some(TaskStatus::Runnable));
+    }
 }
 
 // ---------------------------------------------------------------------------

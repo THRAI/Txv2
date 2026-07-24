@@ -2,6 +2,7 @@ use super::boot_facts::linked_kernel_image;
 use super::la64_irq_trap::{align_up, write_la64_csr};
 #[cfg(feature = "la64-boot-trace")]
 use super::la64_irq_trap::{console_write_hex, console_write_literal};
+use super::la64_percpu::la64_current_cpu_id;
 use super::*;
 
 pub(crate) fn uart_put_byte(byte: u8) {
@@ -179,9 +180,13 @@ pub(crate) fn prepare_la64_pmap_switch(root: &PmapRoot) -> Result<La64PmapSwitch
     let pgdh = ensure_la64_kernel_pgdh_bootstrap_mapped()?;
     let asid = root.asid().0 as usize & LA64_ASID_MASK;
     let pgdl = root.phys().0;
-    let switch_required = LA64_ACTIVE_ASID.load(Ordering::Acquire) != asid
-        || LA64_ACTIVE_PGDL.load(Ordering::Acquire) != pgdl
-        || LA64_ACTIVE_PGDH.load(Ordering::Acquire) != pgdh.0;
+    let cpu = la64_current_cpu_id().0;
+    if cpu >= LA64_MAX_BOOT_CPUS {
+        return Err(PmapError::InvalidRequest);
+    }
+    let switch_required = LA64_ACTIVE_ASID[cpu].load(Ordering::Acquire) != asid
+        || LA64_ACTIVE_PGDL[cpu].load(Ordering::Acquire) != pgdl
+        || LA64_ACTIVE_PGDH[cpu].load(Ordering::Acquire) != pgdh.0;
 
     if switch_required {
         configure_la64_page_walk_csrs();
@@ -196,9 +201,105 @@ pub(crate) fn prepare_la64_pmap_switch(root: &PmapRoot) -> Result<La64PmapSwitch
 }
 
 pub(crate) fn record_la64_pmap_switch(switch: &La64PmapSwitch) {
-    LA64_ACTIVE_ASID.store(switch.asid, Ordering::Release);
-    LA64_ACTIVE_PGDL.store(switch.pgdl, Ordering::Release);
-    LA64_ACTIVE_PGDH.store(switch.pgdh, Ordering::Release);
+    let cpu = la64_current_cpu_id().0;
+    if cpu >= LA64_MAX_BOOT_CPUS || cpu >= u64::BITS as usize {
+        return;
+    }
+    let previous = LA64_ACTIVE_ASID[cpu].swap(switch.asid, Ordering::AcqRel);
+    LA64_ACTIVE_PGDL[cpu].store(switch.pgdl, Ordering::Release);
+    LA64_ACTIVE_PGDH[cpu].store(switch.pgdh, Ordering::Release);
+    if previous != 0 && previous != switch.asid && previous < LA64_ASID_RESIDENCY.len() {
+        LA64_ASID_RESIDENCY[previous].fetch_and(!(1u64 << cpu), Ordering::AcqRel);
+    }
+    if switch.asid != 0 && switch.asid < LA64_ASID_RESIDENCY.len() {
+        LA64_ASID_RESIDENCY[switch.asid].fetch_or(1u64 << cpu, Ordering::AcqRel);
+    }
+}
+
+/// Switch this hart from a user PGDL to the permanent kernel PGDH and only
+/// then publish departure from the user ASID.
+pub(crate) fn deactivate_la64_user_pmap() {
+    let cpu = la64_current_cpu_id().0;
+    if cpu >= LA64_MAX_BOOT_CPUS || cpu >= u64::BITS as usize {
+        return;
+    }
+    let asid = LA64_ACTIVE_ASID[cpu].load(Ordering::Acquire);
+    if asid == 0 {
+        return;
+    }
+    let pgdh = LA64_KERNEL_PGDH_PHYS.load(Ordering::Acquire);
+    assert_ne!(
+        pgdh, 0,
+        "LA64 kernel PGDH must exist before leaving userspace"
+    );
+
+    write_la64_csr(LA64_CSR_ASID, 0);
+    write_la64_csr(LA64_CSR_PGDL, 0);
+    write_la64_csr(LA64_CSR_PGDH, pgdh);
+    let crmd = LA64_CRMD_PG | LA64_CRMD_DATF_CC | LA64_CRMD_DATM_CC;
+    write_la64_csr(LA64_CSR_CRMD, crmd);
+    la64_invtlb_all();
+
+    LA64_ACTIVE_PGDL[cpu].store(0, Ordering::Release);
+    LA64_ACTIVE_PGDH[cpu].store(pgdh, Ordering::Release);
+    LA64_ACTIVE_ASID[cpu].store(0, Ordering::Release);
+    if asid < LA64_ASID_RESIDENCY.len() {
+        LA64_ASID_RESIDENCY[asid].fetch_and(!(1u64 << cpu), Ordering::AcqRel);
+    }
+}
+
+pub(crate) fn la64_asid_residency_mask(asid: Asid) -> CpuMask {
+    let index = asid.0 as usize;
+    if index >= LA64_ASID_RESIDENCY.len() {
+        return CpuMask::EMPTY;
+    }
+    CpuMask::from_bits(LA64_ASID_RESIDENCY[index].load(Ordering::Acquire))
+}
+
+pub(crate) fn wait_for_la64_asid_quiescence(asid: Asid) {
+    while !la64_asid_residency_mask(asid).is_empty() {
+        core::hint::spin_loop();
+    }
+}
+
+fn acquire_la64_tlb_shootdown_lock() {
+    while LA64_TLB_SHOOTDOWN_LOCK
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+}
+
+fn release_la64_tlb_shootdown_lock() {
+    LA64_TLB_SHOOTDOWN_LOCK.store(false, Ordering::Release);
+}
+
+/// Force remote harts through a full INVTLB and wait for acknowledgement.
+///
+/// LA64 currently has one hardware IPI vector, so requests are serialized.
+/// The receiver performs INVTLB in `boot_smp::ack_ipi(TlbShootdown)` before
+/// publishing its per-kind acknowledgement.
+pub(crate) fn la64_remote_tlb_shootdown(targets: CpuMask) {
+    let current = la64_current_cpu_id();
+    let targets = CpuMask::from_bits(
+        targets.bits()
+            & <Platform as SmpIf>::online_cpus().bits()
+            & !CpuMask::single(current).bits(),
+    );
+    if targets.is_empty() {
+        return;
+    }
+
+    acquire_la64_tlb_shootdown_lock();
+    <Platform as SmpIf>::clear_ipi_ack_cpus(IpiKind::TlbShootdown, targets);
+    <Platform as SmpIf>::broadcast_ipi(targets, IpiKind::TlbShootdown);
+    while (<Platform as SmpIf>::ipi_ack_cpus(IpiKind::TlbShootdown).bits() & targets.bits())
+        != targets.bits()
+    {
+        core::hint::spin_loop();
+    }
+    release_la64_tlb_shootdown_lock();
 }
 
 pub(crate) fn activate_la64_pmap(root: &PmapRoot) -> Result<(), PmapError> {

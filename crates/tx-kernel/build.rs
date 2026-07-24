@@ -31,8 +31,6 @@ fn main() {
     // Declare the custom cfg name so `#[cfg(busybox_baked)]` doesn't
     // trip `unexpected_cfgs`. Required by Rust 1.80+'s check-cfg lint.
     println!("cargo:rustc-check-cfg=cfg(busybox_baked)");
-    println!("cargo:rustc-check-cfg=cfg(tx_userspace_child_spread_smp1)");
-    println!("cargo:rustc-check-cfg=cfg(tx_userspace_child_spread_smp4)");
     println!("cargo:rerun-if-env-changed=TX_BUSYBOX");
     println!("cargo:rerun-if-env-changed=TX_OSCOMP_GROUPS");
 

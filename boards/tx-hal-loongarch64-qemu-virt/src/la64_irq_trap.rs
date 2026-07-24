@@ -1,6 +1,7 @@
 use super::la64_percpu::la64_current_cpu_id;
 use super::la64_pmap::{
-    dmw_covers_phys_range, la64_fixup_lookup, la64_kernel_addr_to_phys, la64_uncached_virt,
+    deactivate_la64_user_pmap, dmw_covers_phys_range, la64_fixup_lookup, la64_kernel_addr_to_phys,
+    la64_uncached_virt,
 };
 use super::*;
 
@@ -698,6 +699,7 @@ pub(crate) fn apply_la64_trap_action(frame: &La64TrapFrame, action: TrapAction) 
         TrapAction::Reschedule if from_user => unsafe {
             let cpu = <Platform as SmpIf>::current_cpu_id();
             let stack_top = la64_trap_stack_top_for_cpu(cpu);
+            deactivate_la64_user_pmap();
             write_la64_csr(LA64_CSR_KSAVE0, stack_top);
             let resume_ctx = la64_kernel_resume_ctx_ptr_for_cpu(cpu) as *const KernelResumeCtx;
             tx_la64_resume_kernel_after_reschedule(resume_ctx);

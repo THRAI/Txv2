@@ -964,11 +964,15 @@ fn activate_pmap_installs_pgdl_pgdh_and_asid() {
     assert_eq!(TEST_PMAP_ALLOCATIONS.load(Ordering::Acquire), 2);
 
     Platform::activate_user_pmap(&first);
-    let pgdh = LA64_ACTIVE_PGDH.load(Ordering::Acquire);
+    let cpu = la64_current_cpu_id().0;
+    let pgdh = LA64_ACTIVE_PGDH[cpu].load(Ordering::Acquire);
     assert_ne!(pgdh, 0);
-    assert_eq!(LA64_ACTIVE_PGDL.load(Ordering::Acquire), first.phys().0);
     assert_eq!(
-        LA64_ACTIVE_ASID.load(Ordering::Acquire),
+        LA64_ACTIVE_PGDL[cpu].load(Ordering::Acquire),
+        first.phys().0
+    );
+    assert_eq!(
+        LA64_ACTIVE_ASID[cpu].load(Ordering::Acquire),
         first.asid().0 as usize
     );
     assert_eq!(LA64_KERNEL_PGDH_PHYS.load(Ordering::Acquire), pgdh);
@@ -988,12 +992,15 @@ fn activate_pmap_installs_pgdl_pgdh_and_asid() {
     assert_eq!(TEST_PMAP_ALLOCATIONS.load(Ordering::Acquire), 6);
 
     Platform::activate_user_pmap(&second);
-    assert_eq!(LA64_ACTIVE_PGDL.load(Ordering::Acquire), second.phys().0);
     assert_eq!(
-        LA64_ACTIVE_ASID.load(Ordering::Acquire),
+        LA64_ACTIVE_PGDL[cpu].load(Ordering::Acquire),
+        second.phys().0
+    );
+    assert_eq!(
+        LA64_ACTIVE_ASID[cpu].load(Ordering::Acquire),
         second.asid().0 as usize
     );
-    assert_eq!(LA64_ACTIVE_PGDH.load(Ordering::Acquire), pgdh);
+    assert_eq!(LA64_ACTIVE_PGDH[cpu].load(Ordering::Acquire), pgdh);
     assert_eq!(TEST_PMAP_ALLOCATIONS.load(Ordering::Acquire), 6);
 
     Platform::destroy_pmap_root(first);
@@ -1237,6 +1244,15 @@ fn la64_timer_deadline_rounds_up_to_tcfg_granule() {
 }
 
 #[test]
+fn la64_smp_static_capacity_covers_final_eight_hart_lane() {
+    assert_eq!(LA64_MAX_BOOT_CPUS, 8);
+    assert_eq!(LA64_IRQ_CONTEXT_DEPTHS.len(), LA64_MAX_BOOT_CPUS);
+    assert_eq!(LA64_KERNEL_RESUME_CTX.len(), LA64_MAX_BOOT_CPUS);
+    assert_eq!(LA64_TRAP_STACKS.len(), LA64_MAX_BOOT_CPUS);
+    assert_eq!(LA64_ENTRY_TRAP_FRAMES.len(), LA64_MAX_BOOT_CPUS);
+}
+
+#[test]
 #[cfg(not(target_arch = "loongarch64"))]
 fn percpu_and_smp_publish_uniprocessor_state() {
     let saved_tls = <Platform as PercpuIf>::read_kernel_tls();
@@ -1370,9 +1386,18 @@ fn reset_pmap_test_state() {
     TEST_PMAP_RELEASES.store(0, Ordering::Release);
     LA64_KERNEL_PGDH_PHYS.store(0, Ordering::Release);
     LA64_KERNEL_PGDH_BOOTSTRAP_MAPPED.store(false, Ordering::Release);
-    LA64_ACTIVE_PGDL.store(0, Ordering::Release);
-    LA64_ACTIVE_PGDH.store(0, Ordering::Release);
-    LA64_ACTIVE_ASID.store(0, Ordering::Release);
+    for active in &LA64_ACTIVE_PGDL {
+        active.store(0, Ordering::Release);
+    }
+    for active in &LA64_ACTIVE_PGDH {
+        active.store(0, Ordering::Release);
+    }
+    for active in &LA64_ACTIVE_ASID {
+        active.store(0, Ordering::Release);
+    }
+    for resident in &LA64_ASID_RESIDENCY {
+        resident.store(0, Ordering::Release);
+    }
     unsafe {
         core::ptr::write_bytes(
             core::ptr::addr_of_mut!(TEST_PMAP_PAGES).cast::<u8>(),

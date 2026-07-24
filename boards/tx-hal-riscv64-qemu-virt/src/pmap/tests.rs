@@ -41,8 +41,8 @@ use super::pt_node::{
     pt_node_allocated_for_test, register_committed_pt_node, reset_committed_pt_nodes_for_test,
 };
 use super::pte::{
-    encode_leaf_pte, page_table_mut_from_phys, pte_phys, PTE_A, PTE_D, PTE_G, PTE_R, PTE_U, PTE_V,
-    PTE_W, PTE_X,
+    encode_leaf_pte, page_table_mut_from_phys, pte_is_branch, pte_phys, PTE_A, PTE_D, PTE_G, PTE_R,
+    PTE_U, PTE_V, PTE_W, PTE_X,
 };
 use super::topology::{
     bootstrap_satp_value, rv64_1g_leaf_index, rv64_2m_leaf_index, rv64_4k_leaf_index,
@@ -765,7 +765,7 @@ fn shootdown_batch_coalesces_contiguous_invalidations() {
 }
 
 #[test]
-fn committed_4k_unmap_releases_empty_intermediate_tables() {
+fn committed_kernel_4k_unmap_retains_intermediate_tables() {
     let _guard = pmap_test_guard();
     reset_typed_pt_allocator_test_state();
     reset_pt_node_pool_for_test();
@@ -793,11 +793,16 @@ fn committed_4k_unmap_releases_empty_intermediate_tables() {
         .expect("leaf should unmap");
 
     assert_eq!(result.phys(), phys);
-    assert_eq!(bag.bootstrap_root_ref().0[rv64_1g_leaf_index(virt.0)], 0);
+    assert!(pte_is_branch(
+        bag.bootstrap_root_ref().0[rv64_1g_leaf_index(virt.0)]
+    ));
+    l1_table_for_test(&bag, virt).expect("retained kernel L1");
+    let l0 = l0_table_for_test(&bag, virt).expect("retained kernel L0");
+    assert_eq!(l0.0[rv64_4k_leaf_index(virt.0)], 0);
     assert_eq!(
         TEST_TYPED_RELEASED.load(Ordering::Acquire),
-        2,
-        "empty L0 and L1 tables should release their typed frames"
+        0,
+        "kernel L0/L1 must remain until a globally quiescent teardown"
     );
 
     reset_typed_pt_allocator_test_state();
@@ -941,6 +946,7 @@ fn process_root_unmap_retains_user_tables_until_root_destroy() {
     let mut bag = test_bag();
     publish_bootstrap_bag(&mut bag);
 
+    let baseline_nodes = pt_node_allocated_for_test().count_ones();
     let root = create_pmap_root_from_bag(&bag).expect("process root");
     let virt = VirtAddr(0x4000);
     let phys = PhysAddr(0x8100_0000);
@@ -985,13 +991,13 @@ fn process_root_unmap_retains_user_tables_until_root_destroy() {
     let l0 = l0_table_mut(l1, virt).expect("retained user l0");
     assert_eq!(l0.0[rv64_4k_leaf_index(virt.0)], 0);
     assert_eq!(
-        pt_node_allocated_for_test(),
-        3,
+        pt_node_allocated_for_test().count_ones(),
+        baseline_nodes + 3,
         "process root and its empty L1/L0 must remain until root destroy"
     );
 
     destroy_pmap_root_from_bag(&bag, root);
-    assert_eq!(pt_node_allocated_for_test(), 0);
+    assert_eq!(pt_node_allocated_for_test().count_ones(), baseline_nodes);
 }
 
 #[test]

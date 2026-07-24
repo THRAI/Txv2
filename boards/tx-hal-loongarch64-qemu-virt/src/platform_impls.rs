@@ -245,6 +245,8 @@ impl PmapIf for Platform {
     }
 
     fn destroy_pmap_root(root: PmapRoot) {
+        deactivate_la64_user_pmap();
+        wait_for_la64_asid_quiescence(root.asid());
         release_la64_user_page_table_tree(root.phys(), 3);
         free_la64_asid(root.asid());
         Self::free_pt_node(root.into_node());
@@ -290,6 +292,11 @@ impl PmapIf for Platform {
 
     fn shootdown_kernel_mapping(invalidation: PmapInvalidation) {
         la64_invtlb_global(invalidation.virt());
+        let targets = CpuMask::from_bits(
+            <Platform as SmpIf>::online_cpus().bits()
+                & !CpuMask::single(la64_current_cpu_id()).bits(),
+        );
+        la64_remote_tlb_shootdown(targets);
     }
 
     fn shootdown_kernel_mappings(invalidations: &[PmapInvalidation]) {
@@ -297,11 +304,27 @@ impl PmapIf for Platform {
             // One architecturally defined all-TLB invalidation is cheaper than
             // issuing INVTLB op 0x6 once for every unmapped vmalloc page.
             la64_invtlb_all();
+            let targets = CpuMask::from_bits(
+                <Platform as SmpIf>::online_cpus().bits()
+                    & !CpuMask::single(la64_current_cpu_id()).bits(),
+            );
+            la64_remote_tlb_shootdown(targets);
         }
     }
 
     fn shootdown_mapping(asid: Asid, invalidation: PmapInvalidation) {
         la64_invtlb_asid(asid, invalidation.virt());
+        la64_remote_tlb_shootdown(la64_asid_residency_mask(asid));
+    }
+
+    fn shootdown_mappings(asid: Asid, invalidations: &[PmapInvalidation]) {
+        if invalidations.is_empty() {
+            return;
+        }
+        for invalidation in invalidations {
+            la64_invtlb_asid(asid, invalidation.virt());
+        }
+        la64_remote_tlb_shootdown(la64_asid_residency_mask(asid));
     }
 }
 impl TrapIf for Platform {
@@ -322,6 +345,11 @@ impl TrapIf for Platform {
     }
 
     fn enter_userspace_with_context(ctx: &UserTrapContext, root: &PmapRoot) {
+        assert_eq!(
+            <Platform as PercpuIf>::cpu_pin_depth(),
+            0,
+            "LA64 CPU pin escaped across a reactor/userspace boundary"
+        );
         #[cfg(target_arch = "loongarch64")]
         unsafe {
             let cpu = <Platform as SmpIf>::current_cpu_id();
@@ -643,9 +671,25 @@ impl PercpuIf for Platform {
         la64_write_kernel_tls(value as usize);
     }
 
+    fn pin_current_cpu() -> CpuPinGuard {
+        let cpu = la64_current_cpu_id();
+        LA64_CPU_PIN_DEPTHS[cpu.0].fetch_add(1, Ordering::Relaxed);
+        CpuPinGuard::with_unpin(cpu, la64_unpin_cpu)
+    }
+
+    fn cpu_pin_depth() -> usize {
+        LA64_CPU_PIN_DEPTHS[la64_current_cpu_id().0].load(Ordering::Relaxed)
+    }
+
     unsafe fn install_kernel_stack(top: VirtAddr) {
         unsafe { la64_install_kernel_stack(top) };
     }
+}
+
+fn la64_unpin_cpu(cpu: CpuId) {
+    debug_assert_eq!(cpu, la64_current_cpu_id());
+    let previous = LA64_CPU_PIN_DEPTHS[cpu.0].fetch_sub(1, Ordering::Release);
+    assert!(previous != 0, "LA64 CPU pin nesting underflow");
 }
 impl CacheIf for Platform {
     fn fence_all() {
@@ -674,20 +718,17 @@ impl SmpIf for Platform {
     }
 
     fn possible_cpus() -> CpuMask {
-        // SINGLE-CORE BY DEFAULT, mirroring the rv64 board: the
-        // userspace scheduling contract is single-hart until
-        // cross-hart handoff lands, and the judge runs -smp 1. More
-        // cores are an explicit opt-in via `tx.maxcpus=N` (xtask qemu
-        // injects it to match --smp; the LS2K1000 board omits it and
-        // stays on the boot core).
-        let requested = crate::boot_facts::max_cpus_from_cmdline().unwrap_or(1);
-        if requested <= 1 {
-            return CpuMask::single(la64_current_cpu_id());
-        }
-        let possible = LA64_POSSIBLE_CPU_COUNT
+        // QEMU publishes its `-smp` count through the firmware FDT. Use that
+        // topology by default and treat `tx.maxcpus=N` as an explicit upper
+        // bound. Missing firmware topology falls back to one CPU in
+        // `LA64_DEFAULT_POSSIBLE_CPUS`.
+        let discovered = LA64_POSSIBLE_CPU_COUNT
             .load(Ordering::Acquire)
             .clamp(1, LA64_MAX_BOOT_CPUS);
-        CpuMask::first(possible.min(requested))
+        let requested = crate::boot_facts::max_cpus_from_cmdline()
+            .unwrap_or(discovered)
+            .clamp(1, LA64_MAX_BOOT_CPUS);
+        CpuMask::first(discovered.min(requested))
     }
 
     fn online_cpus() -> CpuMask {
@@ -712,14 +753,32 @@ impl SmpIf for Platform {
         la64_wait_for_interrupt_once();
     }
 
-    fn pending_ipi(_kind: IpiKind) -> bool {
-        let _ = _kind;
-        boot_smp::pending_ipi()
+    fn pending_ipi(kind: IpiKind) -> bool {
+        boot_smp::pending_ipi(kind)
     }
 
-    fn send_ipi(target: CpuId, _kind: IpiKind) {
-        let _ = _kind;
-        boot_smp::send_ipi(target);
+    fn quiesce_this_cpu() -> ! {
+        Self::cancel_deadline();
+        #[cfg(target_arch = "loongarch64")]
+        {
+            // Disable every local interrupt source before publishing a
+            // permanently parked AP to the shutdown coordinator.
+            write_la64_csr(LA64_CSR_ECFG, 0);
+            let crmd = read_la64_csr(LA64_CSR_CRMD) & !LA64_CRMD_IE;
+            write_la64_csr(LA64_CSR_CRMD, crmd);
+        }
+        loop {
+            #[cfg(target_arch = "loongarch64")]
+            unsafe {
+                core::arch::asm!("idle 0", options(nomem, nostack));
+            }
+            #[cfg(not(target_arch = "loongarch64"))]
+            core::hint::spin_loop();
+        }
+    }
+
+    fn send_ipi(target: CpuId, kind: IpiKind) {
+        boot_smp::send_ipi(target, kind);
     }
 
     fn broadcast_ipi(mask: CpuMask, kind: IpiKind) {
@@ -732,19 +791,16 @@ impl SmpIf for Platform {
         }
     }
 
-    fn ack_ipi(_kind: IpiKind) {
-        let _ = _kind;
-        boot_smp::ack_ipi();
+    fn ack_ipi(kind: IpiKind) {
+        boot_smp::ack_ipi(kind);
     }
 
-    fn clear_ipi_ack_cpus(_kind: IpiKind, mask: CpuMask) {
-        let _ = _kind;
-        boot_smp::clear_ipi_ack_cpus(mask);
+    fn clear_ipi_ack_cpus(kind: IpiKind, mask: CpuMask) {
+        boot_smp::clear_ipi_ack_cpus(kind, mask);
     }
 
-    fn ipi_ack_cpus(_kind: IpiKind) -> CpuMask {
-        let _ = _kind;
-        boot_smp::ipi_ack_cpus()
+    fn ipi_ack_cpus(kind: IpiKind) -> CpuMask {
+        boot_smp::ipi_ack_cpus(kind)
     }
 }
 

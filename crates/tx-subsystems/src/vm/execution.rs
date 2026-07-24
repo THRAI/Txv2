@@ -333,6 +333,15 @@ impl AddressSpace {
                     await_range_lock(token).await;
                     continue;
                 }
+                FaultScriptPublish::Retry => {
+                    // The recipe or private-page state changed after the
+                    // resolve phase dropped its Materializer reservation.
+                    // This is an expected optimistic-concurrency conflict:
+                    // discard the temporary materialization and resolve the
+                    // fault against the current recipe.
+                    emit_vm_trace(b"debug.vm.fault.script.retry", 1);
+                    continue;
+                }
             }
         }
     }
@@ -373,7 +382,7 @@ impl AddressSpace {
         Ok(FaultScriptResolve::Done(outcome))
     }
 
-    fn try_fault_script_publish(
+    pub(in crate::vm) fn try_fault_script_publish(
         &self,
         outcome: &VmFaultOutcome,
         materialization: VmFaultMaterialization,
@@ -406,7 +415,18 @@ impl AddressSpace {
             b"debug.vm.fault.publish.private_len",
             outcome.entry.private().map(|set| set.len()).unwrap_or(0) as i64,
         );
-        let _entry = require_fault_publication(self, outcome, &materialization)?;
+        if let Err(error) = require_fault_publication(self, outcome, &materialization) {
+            if error == VmFaultError::StaleRecipe {
+                // A concurrent mmap/munmap/mprotect/private-page update won
+                // the race between resolve and publish. `materialization`
+                // owns all temporary pins, so dropping it before retrying
+                // leaves no partially published mapping behind.
+                emit_vm_trace(b"debug.vm.fault.publish.retry", 1);
+                drop(materialization);
+                return Ok(FaultScriptPublish::Retry);
+            }
+            return Err(error);
+        }
         emit_vm_trace(b"debug.vm.fault.publish.phase", 3);
         let published = self
             .pmap
@@ -451,6 +471,15 @@ impl AddressSpace {
                         return Ok(FaultScriptPublish::Wait(token));
                     }
                     VmFaultMaterializationStep::Err(error) => {
+                        if error == VmFaultError::WouldBlock {
+                            // Private-page install/replace uses optimistic
+                            // CAS. A loser must re-resolve the latest private
+                            // page state; surfacing this as a user fault would
+                            // incorrectly turn an ordinary SMP race into
+                            // SIGSEGV.
+                            emit_vm_trace(b"debug.vm.fault.materialize.retry", 1);
+                            return Ok(FaultScriptPublish::Retry);
+                        }
                         emit_vm_trace(b"debug.vm.fault.materialize.err", 1);
                         return Err(error);
                     }
@@ -694,15 +723,17 @@ impl AddressSpace {
                 VmMapTarget::Fixed { range, placement } => (range, placement),
             };
             let entry = VmEntry::new(range, request.prot, request.flags, request.backing.clone());
-
-            match self.reserve_map(entry, placement) {
+            let guard = self.acquire_writer_script(range).await;
+            match self.reserve_map_with_guard(entry, placement, guard) {
                 MapReserveResult::Reserved(reservation) => {
                     let commit = reservation.commit()?;
                     return Ok(VmMapOutcome { range, commit });
                 }
-                MapReserveResult::Blocked(token) => {
-                    await_range_lock(token).await;
-                    // continue loop to retry
+                MapReserveResult::Blocked(_) => unreachable_acquire_step(),
+                MapReserveResult::Err(VmMapError::AlreadyMapped)
+                    if matches!(request.target, VmMapTarget::Anywhere { .. }) =>
+                {
+                    continue;
                 }
                 MapReserveResult::Err(error) => return Err(error),
             }
@@ -714,26 +745,11 @@ impl AddressSpace {
     /// channel. Honors VM_v1_2 §3.6 by dropping the blocked guard before
     /// each `.await`.
     pub async fn munmap_script(&self, range: UserRange) -> Result<VmMapCommit, VmMapError> {
-        loop {
-            let _guard = match self
-                .range_lock
-                .acquire_step(range, LockMode::ExclusiveWriter)
-            {
-                V3StepOutcome::Done(guard) => guard,
-                V3StepOutcome::Yield { shape, .. } => {
-                    let Some(token) = crate::vm::notification::wait_token_from_shape(&shape) else {
-                        unreachable_acquire_step();
-                    };
-                    await_range_lock(token).await;
-                    continue;
-                }
-                _ => unreachable_acquire_step(),
-            };
-            let commit = self.recipes.unmap(range)?;
-            self.pmap.teardown_range(range)?;
-            self.stats.apply_delta(commit.stats_delta);
-            return Ok(commit);
-        }
+        let _guard = self.acquire_writer_script(range).await;
+        let commit = self.recipes.unmap(range)?;
+        self.pmap.teardown_range(range)?;
+        self.stats.apply_delta(commit.stats_delta);
+        Ok(commit)
     }
 
     /// Canonical async mprotect script per VM_v1_2 §5.4. Yields on `RangeLock`
@@ -743,26 +759,11 @@ impl AddressSpace {
         range: UserRange,
         prot: Prot,
     ) -> Result<VmMapCommit, VmMapError> {
-        loop {
-            let _guard = match self
-                .range_lock
-                .acquire_step(range, LockMode::ExclusiveWriter)
-            {
-                V3StepOutcome::Done(guard) => guard,
-                V3StepOutcome::Yield { shape, .. } => {
-                    let Some(token) = crate::vm::notification::wait_token_from_shape(&shape) else {
-                        unreachable_acquire_step();
-                    };
-                    await_range_lock(token).await;
-                    continue;
-                }
-                _ => unreachable_acquire_step(),
-            };
-            let commit = self.recipes.protect(range, prot)?;
-            self.pmap.teardown_range(range)?;
-            self.stats.apply_delta(commit.stats_delta);
-            return Ok(commit);
-        }
+        let _guard = self.acquire_writer_script(range).await;
+        let commit = self.recipes.protect(range, prot)?;
+        self.pmap.teardown_range(range)?;
+        self.stats.apply_delta(commit.stats_delta);
+        Ok(commit)
     }
 
     /// Canonical async mremap script per VM_v1_2 §5.5. Yields on `RangeLock`
@@ -773,66 +774,25 @@ impl AddressSpace {
         request: VmRemapRequest,
     ) -> Result<VmRemapOutcome, VmMapError> {
         require_remap_shape(request.old_range, request.new_range, request.placement)?;
-        loop {
-            let _guard_pair;
-            let _guard_single;
-            match request.placement {
-                VmRemapPlacement::Move => {
-                    _guard_pair = match self.range_lock.acquire_pair_step(
-                        (request.old_range, LockMode::ExclusiveWriter),
-                        (request.new_range, LockMode::ExclusiveWriter),
-                    ) {
-                        V3StepOutcome::Done(pair) => pair,
-                        V3StepOutcome::Yield { shape, .. } => {
-                            let Some(token) =
-                                crate::vm::notification::wait_token_from_shape(&shape)
-                            else {
-                                unreachable_acquire_step();
-                            };
-                            await_range_lock(token).await;
-                            continue;
-                        }
-                        _ => unreachable_acquire_step(),
-                    };
-                }
-                VmRemapPlacement::InPlace => {
-                    let lock_range = remap_union_range(request.old_range, request.new_range)?;
-                    _guard_single = match self
-                        .range_lock
-                        .acquire_step(lock_range, LockMode::ExclusiveWriter)
-                    {
-                        V3StepOutcome::Done(guard) => guard,
-                        V3StepOutcome::Yield { shape, .. } => {
-                            let Some(token) =
-                                crate::vm::notification::wait_token_from_shape(&shape)
-                            else {
-                                unreachable_acquire_step();
-                            };
-                            await_range_lock(token).await;
-                            continue;
-                        }
-                        _ => unreachable_acquire_step(),
-                    };
-                }
-            }
-            let commit = self.recipes.remap(
-                request.old_range,
-                request.new_range,
-                request.placement,
-                request.destination,
-            )?;
-            for teardown_range in
-                remap_teardown_ranges(request.old_range, request.new_range, request.placement)?
-            {
-                self.pmap.teardown_range(teardown_range)?;
-            }
-            self.stats.apply_delta(commit.stats_delta);
-            return Ok(VmRemapOutcome {
-                old_range: request.old_range,
-                new_range: request.new_range,
-                commit,
-            });
+        let lock_range = remap_union_range(request.old_range, request.new_range)?;
+        let _guard = self.acquire_writer_script(lock_range).await;
+        let commit = self.recipes.remap(
+            request.old_range,
+            request.new_range,
+            request.placement,
+            request.destination,
+        )?;
+        for teardown_range in
+            remap_teardown_ranges(request.old_range, request.new_range, request.placement)?
+        {
+            self.pmap.teardown_range(teardown_range)?;
         }
+        self.stats.apply_delta(commit.stats_delta);
+        Ok(VmRemapOutcome {
+            old_range: request.old_range,
+            new_range: request.new_range,
+            commit,
+        })
     }
 
     /// Async brk script: grow or shrink the program break of an Anon
@@ -907,19 +867,44 @@ impl AddressSpace {
         current_brk: crate::vm::UserVirtAddr,
         requested_brk: crate::vm::UserVirtAddr,
     ) -> Result<crate::vm::UserVirtAddr, VmMapError> {
-        loop {
-            match self.try_brk(brk_base, current_brk, requested_brk) {
-                Ok(new_brk) => return Ok(new_brk),
-                Err(VmMapError::WouldBlock) => {
-                    let token = WaitToken::new(
-                        self.range_lock.wait_source_id(),
-                        crate::vm::RANGE_LOCK_RELEASE_MASK,
-                    );
-                    await_range_lock(token).await;
-                }
-                Err(error) => return Err(error),
+        if requested_brk.0 < brk_base.0 {
+            return Err(VmMapError::InvalidRange);
+        }
+        if requested_brk.0 > current_brk.0 {
+            let old_committed =
+                checked_page_align_up(current_brk.0).ok_or(VmMapError::InvalidRange)?;
+            let new_committed =
+                checked_page_align_up(requested_brk.0).ok_or(VmMapError::InvalidRange)?;
+            if new_committed > old_committed {
+                let range = UserRange::new_aligned(
+                    UserVirtAddr(old_committed),
+                    new_committed - old_committed,
+                )
+                .map_err(|_| VmMapError::InvalidRange)?;
+                self.mmap_script(VmMapRequest::fixed(
+                    range,
+                    MapPlacement::RequireFree,
+                    Prot::READ_WRITE,
+                    crate::vm::VmEntryFlags::PRIVATE,
+                    VmBacking::PrivateAnon,
+                ))
+                .await?;
+            }
+        } else if requested_brk.0 < current_brk.0 {
+            let old_committed =
+                checked_page_align_up(current_brk.0).ok_or(VmMapError::InvalidRange)?;
+            let new_committed =
+                checked_page_align_up(requested_brk.0).ok_or(VmMapError::InvalidRange)?;
+            if new_committed < old_committed {
+                let range = UserRange::new_aligned(
+                    UserVirtAddr(new_committed),
+                    old_committed - new_committed,
+                )
+                .map_err(|_| VmMapError::InvalidRange)?;
+                self.munmap_script(range).await?;
             }
         }
+        Ok(requested_brk)
     }
 
     pub fn try_mremap(&self, request: VmRemapRequest) -> Result<VmRemapOutcome, VmMapError> {
@@ -984,6 +969,15 @@ impl AddressSpace {
             _ => unreachable_acquire_step(),
         };
 
+        self.reserve_map_with_guard(entry, placement, guard)
+    }
+
+    fn reserve_map_with_guard<'a>(
+        &'a self,
+        entry: VmEntry,
+        placement: MapPlacement,
+        guard: RangeGuard<'a>,
+    ) -> MapReserveResult<'a> {
         if let Err(error) = require_map_admission(self, &entry, placement) {
             return MapReserveResult::Err(error);
         }
@@ -1011,6 +1005,26 @@ impl AddressSpace {
             placement,
             _guard: guard,
         })
+    }
+
+    async fn acquire_writer_script(&self, range: UserRange) -> RangeGuard<'_> {
+        let mut pending: Option<crate::vm::PendingWriter<'_>> = None;
+        loop {
+            let result = match pending.take() {
+                Some(ticket) => ticket.try_acquire(),
+                None => self
+                    .range_lock
+                    .acquire_step_rich(range, LockMode::ExclusiveWriter),
+            };
+            match result {
+                crate::vm::AcquireResult::Acquired(guard) => return guard,
+                crate::vm::AcquireResult::WouldBlock(blocked) => {
+                    let token = blocked.wait_token();
+                    pending = blocked.pending_writer();
+                    await_range_lock(token).await;
+                }
+            }
+        }
     }
 
     pub fn try_munmap(&self, range: UserRange) -> Result<VmMapCommit, VmMapError> {
@@ -1224,9 +1238,10 @@ enum FaultScriptResolve {
     Wait(WaitToken),
 }
 
-enum FaultScriptPublish {
+pub(in crate::vm) enum FaultScriptPublish {
     Done(PmapPublishOutcome),
     Wait(WaitToken),
+    Retry,
 }
 
 fn private_anon_write_batch_shape(outcome: &VmFaultOutcome) -> bool {

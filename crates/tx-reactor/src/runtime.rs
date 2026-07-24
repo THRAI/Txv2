@@ -626,6 +626,19 @@ impl SharedReactor {
                                 let _ = view.dispatch_queued_task_from_hart(key.id(), hart, signal);
                             }
                         } else {
+                            // Publish the scheduler-side Parked owner before
+                            // finalising the task-table poll/park handshake.
+                            // A remote wake that races in while the task table
+                            // still says Polling leaves its wake bit pending;
+                            // `finish_polled_pending` observes it below and
+                            // immediately transitions both sides back to
+                            // runnable without a lost-wake window.
+                            view.task_stopped_local(
+                                key.id(),
+                                StopReason::Blocked,
+                                accounting.consumed_ns,
+                                hart,
+                            );
                             let pending_commit =
                                 { view.shared.tasks.lock().finish_polled_pending(key, future) };
                             match pending_commit {
@@ -645,14 +658,7 @@ impl SharedReactor {
                                     };
                                     view.mark_runnable_from_hart(key, hint, hart, signal);
                                 }
-                                Ok(PendingPollCommit::Parked) => {
-                                    view.task_stopped_local(
-                                        key.id(),
-                                        StopReason::Blocked,
-                                        accounting.consumed_ns,
-                                        hart,
-                                    );
-                                }
+                                Ok(PendingPollCommit::Parked) => {}
                                 Err(_) => {}
                             }
                         }
@@ -908,6 +914,15 @@ impl HartRuntimeView<'_> {
                             let _ = self.dispatch_queued_task_from_hart(key.id(), hart, signal);
                         }
                     } else {
+                        // Keep scheduler ownership and task-table state ordered
+                        // across a wake arriving from another hart.  See the
+                        // concurrent loop above for the full handshake.
+                        self.task_stopped_local(
+                            key.id(),
+                            StopReason::Blocked,
+                            accounting.consumed_ns,
+                            hart,
+                        );
                         let pending_commit =
                             { self.shared.tasks.lock().finish_polled_pending(key, future) };
                         match pending_commit {
@@ -927,14 +942,7 @@ impl HartRuntimeView<'_> {
                                 };
                                 self.mark_runnable_from_hart(key, hint, hart, signal);
                             }
-                            Ok(PendingPollCommit::Parked) => {
-                                self.task_stopped_local(
-                                    key.id(),
-                                    StopReason::Blocked,
-                                    accounting.consumed_ns,
-                                    hart,
-                                );
-                            }
+                            Ok(PendingPollCommit::Parked) => {}
                             Err(_) => {}
                         }
                     }

@@ -707,12 +707,6 @@ pub(super) fn sys_pidfd_open(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult 
         _ => return SyscallResult::Error(ESRCH_VALUE),
     };
 
-    let fd = ctx.process.allocate_fd();
-    let (soft_limit, _) = ctx.process.rlimit_nofile();
-    if fd >= soft_limit {
-        return SyscallResult::Error(EMFILE_VALUE);
-    }
-
     let open_flags = OpenFileFlags {
         read: true,
         write: false,
@@ -725,8 +719,9 @@ pub(super) fn sys_pidfd_open(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult 
         Ok(cap) => cap,
         Err(_) => return SyscallResult::Error(ENOMEM_VALUE),
     };
-    let _ = ctx.process.install_fd(fd, open_cap);
-    ctx.process.set_fd_cloexec(fd, true);
+    let Some(fd) = ctx.process.install_new_fd(open_cap, true) else {
+        return SyscallResult::Error(EMFILE_VALUE);
+    };
     SyscallResult::Return(fd as i64)
 }
 

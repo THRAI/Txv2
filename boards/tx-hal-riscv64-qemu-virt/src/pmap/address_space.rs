@@ -105,11 +105,16 @@ pub(crate) fn destroy_pmap_root(root: PmapRoot) {
 
 pub(super) fn destroy_pmap_root_from_bag<State>(bag: &BootStaticBag<State>, root: PmapRoot) {
     let root_phys = root.phys();
+    // Root destruction runs in kernel context. Ensure the local hart has
+    // published departure from whichever user root it last installed before
+    // waiting for the target ASID's residency mask.
+    crate::deactivate_current_user_pmap();
     // `satp` may still reference this root.  Leave it and invalidate all
     // translations before returning any child PT-node to the frame allocator;
     // otherwise a hardware page walk can continue through a page-table page
     // that has already been reused for unrelated kernel data.
     let invalidated = invalidate_destroyed_root(bag, root_phys);
+    crate::wait_for_asid_quiescence(root.asid());
 
     let table = unsafe { page_table_mut_from_phys(root_phys) };
     for slot in &mut table.0[..256] {
@@ -544,7 +549,6 @@ fn invalidate_destroyed_root<State>(
 
 // 在完成 TLB 失效后回收 ASID：先清除该 ASID 的驻留记录再释放位图。
 fn free_asid_after_invalidation(asid: Asid, _invalidated: RootInvalidated) {
-    crate::clear_asid_residency(asid);
     free_asid(asid);
 }
 

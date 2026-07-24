@@ -56,7 +56,9 @@ SECTIONS
 
     .bss.stack (NOLOAD) : AT(ADDR(.bss.stack) - KERNEL_LINK_OFFSET) ALIGN(4K) {
         __tx_boot_stack_bottom = .;
-        . += 512K;
+        /* 8 harts × 512 KiB; keep in sync with LA64_MAX_BOOT_CPUS and
+           LA64_BOOT_STACK_STRIDE. */
+        . += 4M;
         . = ALIGN(16);
         __tx_boot_stack_top = .;
     }

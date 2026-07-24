@@ -6,9 +6,9 @@ use crate::{current_kernel_resume_ctx_ptr, trap_stack_top_for_cpu, KernelResumeC
 #[cfg(target_arch = "riscv64")]
 use tx_hal::SmpIf;
 use tx_hal::{
-    FaultInfo, KernelTrapSink, PmapIf, PmapRoot, SignalHandlerRegs, TrapAction, TrapClass,
-    TrapFrameMut, TrapFrameMutVtable, TrapFrameSnapshot, TrapFrameView, TrapIf, TrapPreviousMode,
-    UserFpContext, UserTrapContext, VirtAddr,
+    FaultInfo, KernelTrapSink, PercpuIf, PmapIf, PmapRoot, SignalHandlerRegs, TrapAction,
+    TrapClass, TrapFrameMut, TrapFrameMutVtable, TrapFrameSnapshot, TrapFrameView, TrapIf,
+    TrapPreviousMode, UserFpContext, UserTrapContext, VirtAddr,
 };
 
 #[cfg(target_arch = "riscv64")]
@@ -100,47 +100,89 @@ core::arch::global_asm!(
     .equ TX_RV64_RCTX_RA, 8
     .equ TX_RV64_RCTX_S0, 16
     # s1..s11 follow at +8 each up to offset 104.
+    # Rv64PerCpuArea::trap_stack_top, addressed through kernel tp.
+    .equ TX_RV64_PERCPU_TRAP_STACK_TOP, 24
 
     .globl tx_rv64_qemu_minimal_trap_vector
 tx_rv64_qemu_minimal_trap_vector:
-    # Slice 2 trap-vector prologue: sscratch swap onto the per-CPU
-    # trap-handler stack. sscratch is boot-primed (and re-primed on
-    # every clean exit) to point at trap_stack_top for this hart.
+    # User traps cannot keep using their user stack, so switch them to
+    # the per-hart trap stack through sscratch. A normal kernel trap
+    # obtains the same dedicated stack top from the local per-CPU area
+    # through kernel tp; unlike sscratch, that value cannot be a stale
+    # interrupted sp. A trap already nested on the dedicated trap stack
+    # pushes directly below its current sp.
     #
-    # On entry: sp = trap-time sp (user sp for from-user, kernel sp
-    # for from-kernel); sscratch = trap_stack_top.
-    # After swap: sp = trap_stack_top; sscratch = trap-time sp.
+    # This distinction is load-bearing. The old code also swapped
+    # kernel-mode traps through sscratch. If sscratch temporarily held an
+    # interrupted kernel sp (for example during a nested trap), a later
+    # interrupt treated that stale address as a stack top and wrote a
+    # TrapFrame into the middle of the live reactor frame.
     #
-    # If the trap arrives while S-mode is already running in the trap
-    # epilogue, sscratch may still contain the interrupted user sp.
-    # Only use the current high-half stack directly in that narrow
-    # case. Normal kernel traps keep sscratch primed with the per-hart
-    # trap-stack top and should still swap onto that stack; otherwise an
-    # interrupt in a large kernel frame can trample the interrupted
-    # function's locals.
+    # Txv2's user VA is low-half and every kernel/trap stack is high-half,
+    # so the sign bit of the trap-time sp is the architecture-level
+    # from-user discriminator used before any GPR is available to save.
     bgez sp, 7f
-    addi sp, sp, -16
+
+    # From kernel. Preserve the temporaries used to identify the current
+    # stack plus the exact old sscratch value before clobbering them.
+    addi sp, sp, -32
     sd t0, 0(sp)
+    sd t1, 8(sp)
     csrr t0, sscratch
-    sd t0, 8(sp)
-    bgez t0, 6f
-    ld t0, 0(sp)
-    addi sp, sp, 16
-    j 7f
+    sd t0, 16(sp)
+
+    # If top-original_sp is in [0, 64 KiB], execution is already on
+    # this hart's trap stack and this is a nested trap.
+    ld t0, TX_RV64_PERCPU_TRAP_STACK_TOP(tp)
+    addi t1, sp, 32
+    sub t0, t0, t1
+    li t1, 65537
+    bltu t0, t1, 6f
+
+    # Ordinary from-kernel trap: switch to the dedicated trap stack
+    # obtained from tp. X0=2 uses the same swap-back exit shape as a
+    # user trap, with X2 holding the interrupted kernel sp.
+    addi t1, sp, 32
+    ld t0, TX_RV64_PERCPU_TRAP_STACK_TOP(tp)
+    mv sp, t0
+    addi sp, sp, -TX_RV64_TF_SIZE
+    ld t0, -32(t1)
+    sd t0, TX_RV64_TF_X5(sp)
+    ld t0, -24(t1)
+    sd t0, TX_RV64_TF_X6(sp)
+    ld t0, -16(t1)
+    sd t0, TX_RV64_TF_TMP_SSCRATCH(sp)
+    li t0, 2
+    sd t0, TX_RV64_TF_X0(sp)
+    sd ra, TX_RV64_TF_X1(sp)
+    sd t1, TX_RV64_TF_X2(sp)
+    sd gp, TX_RV64_TF_X3(sp)
+    sd tp, TX_RV64_TF_X4(sp)
+    j 9f
 
 6:
-    # Trap-time sp is already a trap stack pointer.
-    addi sp, sp, -(TX_RV64_TF_SIZE - 16)
-    ld t0, TX_RV64_TF_TMP_T0(sp)
+    # Nested trap: finish allocating below the active trap-handler
+    # stack. Copy the temporary saves before FP capture reuses their
+    # source offsets in the final frame.
+    addi sp, sp, -(TX_RV64_TF_SIZE - 32)
+    ld t0, (TX_RV64_TF_SIZE - 32)(sp)
     sd t0, TX_RV64_TF_X5(sp)
-    ld t0, TX_RV64_TF_TMP_SSCRATCH(sp)
+    ld t0, (TX_RV64_TF_SIZE - 24)(sp)
+    sd t0, TX_RV64_TF_X6(sp)
+    ld t0, (TX_RV64_TF_SIZE - 16)(sp)
+    sd t0, TX_RV64_TF_TMP_SSCRATCH(sp)
+    li t0, 1
     sd t0, TX_RV64_TF_X0(sp)
     sd ra, TX_RV64_TF_X1(sp)
     addi t0, sp, TX_RV64_TF_SIZE
     sd t0, TX_RV64_TF_X2(sp)
-    j 8f
+    sd gp, TX_RV64_TF_X3(sp)
+    sd tp, TX_RV64_TF_X4(sp)
+    j 9f
 
 7:
+    # From user. sscratch is boot-/exit-primed with this hart's
+    # trap-stack top. After the swap it retains the interrupted user sp.
     csrrw sp, sscratch, sp
 
     # Allocate the trap frame on the trap stack.
@@ -156,6 +198,7 @@ tx_rv64_qemu_minimal_trap_vector:
     sd gp, TX_RV64_TF_X3(sp)
     sd tp, TX_RV64_TF_X4(sp)
     sd t1, TX_RV64_TF_X6(sp)
+9:
     sd t2, TX_RV64_TF_X7(sp)
     sd s0, TX_RV64_TF_X8(sp)
     sd s1, TX_RV64_TF_X9(sp)
@@ -243,13 +286,20 @@ tx_rv64_qemu_minimal_trap_vector:
     la gp, __global_pointer$
     .option pop
 
-    # From-user traps arrive with tp restored from the user frame.
-    # Recover the kernel TLS pointer from the trap-stack top before
-    # entering Rust; all per-CPU state (current_cpu_id, irq depth,
-    # active userspace payload) depends on tp being the kernel value.
+    # From-user traps arrive with tp restored from the user frame, so
+    # recover kernel TLS from the per-hart trap-stack top. A direct
+    # from-kernel trap already saved the correct kernel tp in X4; its
+    # sp+frame-size is an ordinary kernel sp and must not be fed to the
+    # trap-stack lookup (doing so aliases every AP to CPU0).
+    ld t0, TX_RV64_TF_X0(sp)
+    bnez t0, .Ltx_rv64_restore_kernel_tp
     addi a0, sp, TX_RV64_TF_SIZE
     call tx_rv64_kernel_tls_from_trap_stack_top
     mv tp, a0
+    j .Ltx_rv64_kernel_tp_ready
+.Ltx_rv64_restore_kernel_tp:
+    ld tp, TX_RV64_TF_X4(sp)
+.Ltx_rv64_kernel_tp_ready:
 
     mv a0, sp
     call tx_rv64_qemu_kernel_trap_entry
@@ -262,12 +312,14 @@ tx_rv64_qemu_minimal_trap_vector:
     # DeliverSignal). Reschedule longjmps and never reaches here;
     # Terminate panics.
     #
-    # Discipline: stash the trap-time sp into sscratch FIRST (before
-    # restoring user temporaries), so we have it for the final
-    # swap. After all user regs are restored, deallocate the frame
-    # (sp moves up to trap_stack_top), then `csrrw sp, sscratch, sp`
-    # atomically: sp = trap-time sp, sscratch = trap_stack_top
-    # (re-primed for the next trap).
+    # X0 is an internal entry-path marker (real x0 is immutable):
+    #   0 = from user, swap back to the saved user sp;
+    #   1 = nested trap, remain on the direct trap stack;
+    #   2 = ordinary kernel trap, swap back to the saved kernel sp.
+    # The direct path also restores the exact pre-trap sscratch value
+    # saved in TX_RV64_TF_TMP_SSCRATCH. This makes nested traps
+    # compositional instead of leaking an inner interrupted sp into the
+    # next unrelated interrupt.
     ld t0, TX_RV64_TF_SEPC(sp)
     csrw sepc, t0
     ld t0, TX_RV64_TF_SSTATUS(sp)
@@ -315,16 +367,9 @@ tx_rv64_qemu_minimal_trap_vector:
     fld f31, TX_RV64_TF_F31(sp)
 2:
 
-    # Move trap-time sp into sscratch via t0. Safe to clobber t0
-    # because we'll restore the user's t0 from the frame below
-    # before we sret.
-    ld t0, TX_RV64_TF_X2(sp)
-    csrw sscratch, t0
-
     ld ra, TX_RV64_TF_X1(sp)
     ld gp, TX_RV64_TF_X3(sp)
     ld tp, TX_RV64_TF_X4(sp)
-    ld t0, TX_RV64_TF_X5(sp)
     ld t1, TX_RV64_TF_X6(sp)
     ld t2, TX_RV64_TF_X7(sp)
     ld s0, TX_RV64_TF_X8(sp)
@@ -352,10 +397,29 @@ tx_rv64_qemu_minimal_trap_vector:
     ld t5, TX_RV64_TF_X30(sp)
     ld t6, TX_RV64_TF_X31(sp)
 
-    # Deallocate the frame and atomically swap sp ↔ sscratch:
-    # sp = trap-time sp, sscratch = trap_stack_top.
+    # Keep t0 available until the path split; all other GPRs now carry
+    # their trap-time values.
+    ld t0, TX_RV64_TF_X0(sp)
+    addi t0, t0, -1
+    beqz t0, 4f
+
+    # From user or an ordinary kernel stack: stash the saved trap-time
+    # sp in sscratch, restore t0, then atomically return to that stack
+    # while re-priming sscratch with trap_stack_top.
+    ld t0, TX_RV64_TF_X2(sp)
+    csrw sscratch, t0
+    ld t0, TX_RV64_TF_X5(sp)
     addi sp, sp, TX_RV64_TF_SIZE
     csrrw sp, sscratch, sp
+    sret
+
+4:
+    # Nested trap: restore the pre-trap sscratch exactly and pop the
+    # direct-stack frame without a stack swap.
+    ld t0, TX_RV64_TF_TMP_SSCRATCH(sp)
+    csrw sscratch, t0
+    ld t0, TX_RV64_TF_X5(sp)
+    addi sp, sp, TX_RV64_TF_SIZE
     sret
 
     # ------------------------------------------------------------------
@@ -800,6 +864,11 @@ impl TrapIf for Platform {
     /// Returns when the trap shell chooses `TrapAction::Reschedule`
     /// and longjmps back via [`tx_rv64_resume_kernel_after_reschedule`].
     fn enter_userspace_with_context(ctx: &UserTrapContext, root: &PmapRoot) {
+        assert_eq!(
+            <Platform as PercpuIf>::cpu_pin_depth(),
+            0,
+            "RV64 CPU pin escaped across a reactor/userspace boundary"
+        );
         crate::debug_trace::record_entry(ctx);
 
         let mut frame = Rv64TrapFrame {
@@ -1044,7 +1113,7 @@ fn apply_trap_action(frame: &Rv64TrapFrame, action: TrapAction) {
             if from_user {
                 let cpu = <Platform as SmpIf>::current_cpu_id();
                 let stack_top = trap_stack_top_for_cpu(cpu);
-                crate::clear_current_asid_residency();
+                crate::deactivate_current_user_pmap();
                 unsafe {
                     core::arch::asm!("csrw sscratch, {top}", top = in(reg) stack_top);
                     let ctx = current_kernel_resume_ctx_ptr();

@@ -68,6 +68,7 @@ impl CpuMask {
 #[must_use]
 pub struct CpuPinGuard {
     cpu_id: CpuId,
+    unpin: Option<fn(CpuId)>,
     _not_send_sync: PhantomData<*mut ()>,
 }
 
@@ -75,12 +76,32 @@ impl CpuPinGuard {
     pub const fn new(cpu_id: CpuId) -> Self {
         Self {
             cpu_id,
+            unpin: None,
+            _not_send_sync: PhantomData,
+        }
+    }
+
+    /// Construct a platform-backed CPU pin. The platform must have already
+    /// entered its non-migratable section. `unpin` leaves that section when
+    /// the guard drops.
+    pub const fn with_unpin(cpu_id: CpuId, unpin: fn(CpuId)) -> Self {
+        Self {
+            cpu_id,
+            unpin: Some(unpin),
             _not_send_sync: PhantomData,
         }
     }
 
     pub const fn cpu_id(&self) -> CpuId {
         self.cpu_id
+    }
+}
+
+impl Drop for CpuPinGuard {
+    fn drop(&mut self) {
+        if let Some(unpin) = self.unpin {
+            unpin(self.cpu_id);
+        }
     }
 }
 
@@ -1064,6 +1085,15 @@ pub trait PercpuIf {
     fn pin_current_cpu() -> CpuPinGuard {
         CpuPinGuard::new(Self::current_cpu_id())
     }
+
+    /// Current nesting depth of platform CPU pins.
+    ///
+    /// A non-zero value means the current execution context must not migrate
+    /// to another hart. Platforms with a non-preemptive kernel may implement
+    /// this as a checked per-hart nesting counter instead of masking IRQs.
+    fn cpu_pin_depth() -> usize {
+        0
+    }
 }
 pub trait CacheIf {
     fn fence_all() {}
@@ -1169,6 +1199,17 @@ pub trait SmpIf {
         loop {
             Self::wait_for_interrupt_once();
         }
+    }
+
+    /// Permanently stop the current CPU after it has left all shared runtime
+    /// code.
+    ///
+    /// Unlike [`Self::park_this_cpu`], this is a shutdown primitive: platform
+    /// implementations must prevent timer/device/IPI handlers from re-entering
+    /// kernel services after this call.  The default is sufficient for
+    /// single-CPU/test platforms that never call the SMP shutdown path.
+    fn quiesce_this_cpu() -> ! {
+        Self::park_this_cpu()
     }
 
     fn send_ipi(target: CpuId, _kind: IpiKind) {
