@@ -3,11 +3,14 @@
 //! Spec: `man 2 timerfd_create`, `man 2 timerfd_settime`,
 //! `man 2 timerfd_gettime`.  v1: caller-driven time model — the
 //! subsystem stores deadline/interval; the syscall shim provides
-//! `now_ns` and handles blocking via `timer_sleep::sleep_until_ns`.
+//! `now_ns` and parks through the syscall context's timer registry.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
+use tx_services::time::{
+    timekeeper, DeadlineNs, DeadlineRegistrar, TimekeeperIf, TimerGuard, TimerRole, TimerTarget,
+};
 
 pub mod adapter;
 pub mod notification;
@@ -15,11 +18,11 @@ pub mod notification;
 use crate::wait_source;
 use adapter::step_engine::V3Errno;
 use adapter::step_engine::{
-    borrow_current_guard, eagain, guard, sign, ByteOutcome, Cap, NoProgress, OneShotStepOp,
-    ScriptCtx, SpinMutex, StepOp, StepOutcome, SubjectIdentity, WaitSource, Weak, Zone,
-    ZoneAllocated, ZoneError,
+    borrow_current_guard, eagain, guard, sign, ByteOutcome, Cap, InterestMask, NoProgress,
+    OneShotStepOp, ScriptCtx, SpinMutex, StepOp, StepOutcome, SubjectIdentity, WaitSource,
+    WaitSourceId, Weak, Zone, ZoneAllocated, ZoneError,
 };
-use adapter::wait_routing::{self, Channel};
+use adapter::wait_routing::{self, MailboxEvent, TaskMailbox};
 
 pub const TFD_CLOEXEC: u32 = 0o2000000;
 pub const TFD_NONBLOCK: u32 = 0o4000;
@@ -90,8 +93,8 @@ pub struct TimerFd {
     canceled_generation: AtomicU64,
     armed_wallclock_generation: AtomicU64,
     source_id: u64,
-    channel: Option<Channel>,
-    source: Option<Arc<WaitSource>>,
+    source: Arc<WaitSource>,
+    timer_guard: SpinMutex<Option<TimerGuard>>,
     flags: AtomicU64,
 }
 
@@ -102,6 +105,8 @@ impl TimerFd {
 
     pub fn new_with_clock(clockid: u32, flags: u32) -> Self {
         let wait_point = notification::new_wait_point();
+        let source_id = tx_substrate::wake::WaitEndpoint::source_id(wait_point.endpoint()).raw();
+        let (_, source) = wait_point.into_parts();
         TimerFd {
             timerfd_id: allocate_timerfd_id(),
             clockid: AtomicU64::new(clockid as u64),
@@ -113,9 +118,9 @@ impl TimerFd {
             cancel_on_set: AtomicU64::new(0),
             canceled_generation: AtomicU64::new(0),
             armed_wallclock_generation: AtomicU64::new(0),
-            source_id: wait_point.source_id,
-            channel: Some(wait_point.channel),
-            source: Some(wait_point.source),
+            source_id,
+            source,
+            timer_guard: SpinMutex::new(None),
             flags: AtomicU64::new(flags as u64),
         }
     }
@@ -141,6 +146,9 @@ impl TimerFd {
     pub fn source_id(&self) -> u64 {
         self.source_id
     }
+    pub fn read_endpoint(&self) -> &Arc<WaitSource> {
+        &self.source
+    }
     pub fn flags(&self) -> u32 {
         self.flags.load(Ordering::Acquire) as u32
     }
@@ -149,14 +157,16 @@ impl TimerFd {
         (self.flags() & TFD_NONBLOCK) != 0
     }
 
-    pub fn arm(&self, deadline_ns: u64, interval_ns: u64) {
+    pub fn arm(&self, deadline_ns: u64, interval_ns: u64, timer_guard: Option<TimerGuard>) {
         self.deadline_ns.store(deadline_ns, Ordering::Release);
         self.interval_ns.store(interval_ns, Ordering::Release);
         self.expiration_count.store(0, Ordering::Release);
         self.canceled_generation.store(0, Ordering::Release);
+        *self.timer_guard.lock() = timer_guard;
     }
 
     pub fn disarm(&self) {
+        *self.timer_guard.lock() = None;
         self.deadline_ns.store(0, Ordering::Release);
         self.interval_ns.store(0, Ordering::Release);
         self.target_realtime_ns.store(0, Ordering::Release);
@@ -179,7 +189,11 @@ impl TimerFd {
         }
     }
 
-    fn bump_expirations(&self, now_ns: u64) -> u64 {
+    fn bump_expirations(
+        &self,
+        now_ns: u64,
+        timer_registrar: Option<&dyn DeadlineRegistrar>,
+    ) -> u64 {
         let deadline = self.deadline_ns.load(Ordering::Acquire);
         if deadline == 0 {
             return 0;
@@ -189,6 +203,7 @@ impl TimerFd {
         }
         let interval = self.interval_ns.load(Ordering::Acquire);
         if interval == 0 {
+            *self.timer_guard.lock() = None;
             self.deadline_ns.store(0, Ordering::Release);
             let prev = self.expiration_count.fetch_add(1, Ordering::AcqRel);
             return prev + 1;
@@ -197,6 +212,7 @@ impl TimerFd {
         let count = elapsed / interval + 1;
         let new_deadline = deadline + count * interval;
         self.deadline_ns.store(new_deadline, Ordering::Release);
+        self.rearm_deadline_guard(new_deadline, timer_registrar);
         let prev = self.expiration_count.fetch_add(count, Ordering::AcqRel);
         prev + count
     }
@@ -205,7 +221,10 @@ impl TimerFd {
         self.expiration_count.swap(0, Ordering::AcqRel)
     }
 
-    fn mark_canceled_on_set(&self, generation: u64) -> bool {
+    fn mark_canceled_on_set_with_post<F>(&self, generation: u64, post: F) -> bool
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+    {
         if self.deadline_ns() == 0
             || self.clockid() != TIMERFD_CLOCK_REALTIME
             || self.armed_abstime.load(Ordering::Acquire) == 0
@@ -216,12 +235,20 @@ impl TimerFd {
         }
         self.canceled_generation
             .store(generation, Ordering::Release);
+        *self.timer_guard.lock() = None;
+        self.deadline_ns.store(0, Ordering::Release);
         self.expiration_count.fetch_add(1, Ordering::AcqRel);
-        self.fire_readable();
+        self.fire_readable_with_post(post);
         true
     }
 
-    fn revalidate_realtime_deadline_on_set(&self) {
+    fn revalidate_realtime_deadline_on_set_with_post<F>(
+        &self,
+        timer_registrar: Option<&dyn DeadlineRegistrar>,
+        post: F,
+    ) where
+        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+    {
         if self.deadline_ns() == 0
             || self.clockid() != TIMERFD_CLOCK_REALTIME
             || self.armed_abstime.load(Ordering::Acquire) == 0
@@ -233,19 +260,57 @@ impl TimerFd {
         if target == 0 {
             return;
         }
-        let deadline = crate::wall_clock::monotonic_deadline_from_realtime_ns(target);
+        let deadline = timekeeper().monotonic_deadline_from_realtime_ns(target);
         self.deadline_ns.store(deadline, Ordering::Release);
-        self.fire_readable();
+        self.rearm_deadline_guard(deadline, timer_registrar);
+        self.fire_readable_with_post(post);
     }
 
-    fn fire_readable(&self) {
-        notification::notify_readable(self.channel.as_ref(), self.source.as_ref());
+    fn fire_readable_with_post<F>(&self, post: F)
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+    {
+        notification::notify_readable_with_post(&self.source, post);
+    }
+
+    fn register_deadline_guard(
+        &self,
+        deadline_ns: u64,
+        registrar: Option<&dyn DeadlineRegistrar>,
+    ) -> Option<TimerGuard> {
+        let registrar = registrar?;
+        registrar
+            .register_deadline(
+                DeadlineNs::new(deadline_ns),
+                TimerRole::TimerFd,
+                TimerTarget::WaitSource {
+                    source: WaitSourceId::new(self.source_id),
+                    interests: InterestMask::new(notification::TIMERFD_READABLE),
+                },
+            )
+            .ok()
+    }
+
+    fn rearm_deadline_guard(&self, deadline_ns: u64, registrar: Option<&dyn DeadlineRegistrar>) {
+        let Some(registrar) = registrar else {
+            return;
+        };
+        let mut guard = self.timer_guard.lock();
+        let _ = registrar.rearm_deadline(
+            &mut guard,
+            DeadlineNs::new(deadline_ns),
+            TimerRole::TimerFd,
+            TimerTarget::WaitSource {
+                source: WaitSourceId::new(self.source_id),
+                interests: InterestMask::new(notification::TIMERFD_READABLE),
+            },
+        );
     }
 }
 
 impl Drop for TimerFd {
     fn drop(&mut self) {
-        wait_source::release_wait_channel(self.source_id);
+        wait_source::release_wait_source(self.source_id);
         wait_routing::unregister_source(self.source_id);
         unregister_wallclock_timerfd(self.timerfd_id);
     }
@@ -281,17 +346,7 @@ pub fn timerfd_set_clockid(tfd: &TimerFd, clockid: u32) {
     tfd.set_clockid(clockid);
 }
 
-pub fn timerfd_settime(
-    tfd: &TimerFd,
-    abstime: bool,
-    now_ns: u64,
-    new_value: ItimerSpec,
-    old_value: Option<&mut ItimerSpec>,
-) {
-    timerfd_settime_with_flags(tfd, abstime, now_ns, new_value, old_value, 0, 0)
-}
-
-pub fn timerfd_settime_with_flags(
+pub fn timerfd_settime_with_flags_and_post<F>(
     tfd: &TimerFd,
     abstime: bool,
     now_ns: u64,
@@ -299,7 +354,11 @@ pub fn timerfd_settime_with_flags(
     old_value: Option<&mut ItimerSpec>,
     flags: u32,
     wallclock_generation: u64,
-) {
+    timer_registrar: Option<&dyn DeadlineRegistrar>,
+    post: F,
+) where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     if let Some(old) = old_value {
         *old = ItimerSpec {
             it_interval_ns: tfd.interval_ns(),
@@ -314,7 +373,7 @@ pub fn timerfd_settime_with_flags(
     let is_realtime_abstime = tfd.clockid() == TIMERFD_CLOCK_REALTIME && abstime;
     let cancel_on_set = is_realtime_abstime && (flags & TFD_TIMER_CANCEL_ON_SET) != 0;
     let deadline = if is_realtime_abstime {
-        crate::wall_clock::monotonic_deadline_from_realtime_ns(it_value)
+        timekeeper().monotonic_deadline_from_realtime_ns(it_value)
     } else if abstime {
         it_value
     } else {
@@ -330,14 +389,40 @@ pub fn timerfd_settime_with_flags(
         .store(if cancel_on_set { 1 } else { 0 }, Ordering::Release);
     tfd.armed_wallclock_generation
         .store(wallclock_generation, Ordering::Release);
-    tfd.arm(deadline, new_value.it_interval_ns);
-    let count = tfd.bump_expirations(now_ns);
-    if count > 0 {
-        tfd.fire_readable();
-    }
+    let timer_guard = tfd.register_deadline_guard(deadline, timer_registrar);
+    tfd.arm(deadline, new_value.it_interval_ns, timer_guard);
+    let _ = timerfd_deadline_fired_with_post(tfd, now_ns, timer_registrar, post);
 }
 
-pub fn timerfd_clock_was_set(generation: u64) -> usize {
+/// Consume a deadline-delivery hint in the timerfd semantic owner.
+///
+/// Deadline domains only route the timerfd's wait source.  The timerfd state
+/// machine converts that hint into expiration accounting, periodic rearm, and
+/// readiness before a reader drains the accumulated count.
+pub fn timerfd_deadline_fired_with_post<F>(
+    tfd: &TimerFd,
+    now_ns: u64,
+    timer_registrar: Option<&dyn DeadlineRegistrar>,
+    post: F,
+) -> u64
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
+    let count = tfd.bump_expirations(now_ns, timer_registrar);
+    if count > 0 {
+        tfd.fire_readable_with_post(post);
+    }
+    count
+}
+
+pub fn timerfd_clock_was_set_with_post<F>(
+    generation: u64,
+    timer_registrar: Option<&dyn DeadlineRegistrar>,
+    mut post: F,
+) -> usize
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     let snapshot = {
         let list = WALLCLOCK_TIMERFDS.lock();
         list.clone()
@@ -351,21 +436,16 @@ pub fn timerfd_clock_was_set(generation: u64) -> usize {
         let Some(cap) = weak.upgrade(&guard) else {
             continue;
         };
-        if cap.mark_canceled_on_set(generation) {
+        if cap.mark_canceled_on_set_with_post(generation, &mut post) {
             canceled += 1;
         } else {
-            cap.revalidate_realtime_deadline_on_set();
+            cap.revalidate_realtime_deadline_on_set_with_post(timer_registrar, &mut post);
         }
     }
     canceled
 }
 
-pub fn step_timerfd_read(
-    tfd: &TimerFd,
-    now_ns: u64,
-    out: &mut [u8; 8],
-    nonblocking: bool,
-) -> ByteOutcome {
+pub fn step_timerfd_read(tfd: &TimerFd, out: &mut [u8; 8], nonblocking: bool) -> ByteOutcome {
     // observe: inspect current subsystem state and validate inputs.
     // upgrade: acquire capabilities/guards needed for mutation.
     // reserve: reserve namespace, memory, or wait-source effects.
@@ -376,19 +456,15 @@ pub fn step_timerfd_read(
         tfd.expiration_count.store(0, Ordering::Release);
         return StepOutcome::err(V3Errno::ECANCELED);
     }
-    let count = tfd.bump_expirations(now_ns);
-    if count > 0 {
+    if tfd.expiration_count() > 0 {
         let drained = tfd.drain_count();
-        if tfd.interval_ns() > 0 {
-            let _ = tfd.bump_expirations(now_ns);
-        }
         out.copy_from_slice(&drained.to_le_bytes());
         return ByteOutcome::done(8);
     }
     if nonblocking {
         return eagain();
     }
-    notification::wait_until_readable(tfd.source_id)
+    notification::wait_until_readable(tfd.read_endpoint())
 }
 
 pub struct TimerfdCreateOp {
@@ -440,8 +516,13 @@ mod tests {
     fn create_disarmed_read_returns_eagain() {
         let _g = setup();
         let cap = timerfd_create(TFD_NONBLOCK).expect("create");
+        let endpoint = cap.read_endpoint();
+        assert_eq!(
+            tx_substrate::wake::WaitEndpoint::source_id(endpoint).raw(),
+            cap.source_id(),
+        );
         let mut buf = [0u8; 8];
-        match step_timerfd_read(&cap, 0, &mut buf, true) {
+        match step_timerfd_read(&cap, &mut buf, true) {
             StepOutcome::Err(V3Errno::EAGAIN) => {}
             other => panic!("expected EAGAIN, got {other:?}"),
         }
@@ -452,7 +533,7 @@ mod tests {
         let _g = setup();
         let cap = timerfd_create(0).expect("create");
         let now = 1_000_000_000;
-        timerfd_settime(
+        timerfd_settime_with_flags_and_post(
             &cap,
             false,
             now,
@@ -461,16 +542,64 @@ mod tests {
                 it_value_ns: 100_000_000,
             },
             None,
+            0,
+            0,
+            None,
+            |mailbox, event| mailbox.post(event),
         );
         let mut buf = [0u8; 8];
-        match step_timerfd_read(&cap, now, &mut buf, false) {
+        match step_timerfd_read(&cap, &mut buf, false) {
             StepOutcome::Yield { .. } => {}
             other => panic!("expected Yield, got {other:?}"),
         }
         let now2 = now + 200_000_000;
-        match step_timerfd_read(&cap, now2, &mut buf, false) {
+        assert_eq!(
+            timerfd_deadline_fired_with_post(&cap, now2, None, |mailbox, event| {
+                mailbox.post(event)
+            }),
+            1
+        );
+        match step_timerfd_read(&cap, &mut buf, false) {
             StepOutcome::Done(8) => assert_eq!(u64::from_le_bytes(buf), 1),
             other => panic!("expected Done(8), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_drains_only_expirations_committed_from_deadline_delivery() {
+        let _g = setup();
+        let cap = timerfd_create(0).expect("create");
+        let now = 1_000_000_000;
+        timerfd_settime_with_flags_and_post(
+            &cap,
+            false,
+            now,
+            ItimerSpec {
+                it_interval_ns: 0,
+                it_value_ns: 100_000_000,
+            },
+            None,
+            0,
+            0,
+            None,
+            |mailbox, event| mailbox.post(event),
+        );
+
+        let mut buf = [0u8; 8];
+        match step_timerfd_read(&cap, &mut buf, false) {
+            StepOutcome::Yield { .. } => {}
+            other => panic!("read must wait for a deadline delivery, got {other:?}"),
+        }
+
+        assert_eq!(
+            timerfd_deadline_fired_with_post(&cap, now + 100_000_000, None, |mailbox, event| {
+                mailbox.post(event)
+            }),
+            1
+        );
+        match step_timerfd_read(&cap, &mut buf, false) {
+            StepOutcome::Done(8) => assert_eq!(u64::from_le_bytes(buf), 1),
+            other => panic!("expected the delivery-committed count, got {other:?}"),
         }
     }
 
@@ -479,7 +608,7 @@ mod tests {
         let _g = setup();
         let cap = timerfd_create(0).expect("create");
         let now = 1_000_000_000;
-        timerfd_settime(
+        timerfd_settime_with_flags_and_post(
             &cap,
             false,
             now,
@@ -488,9 +617,13 @@ mod tests {
                 it_value_ns: 100_000_000,
             },
             None,
+            0,
+            0,
+            None,
+            |mailbox, event| mailbox.post(event),
         );
         assert_eq!(cap.deadline_ns(), now + 100_000_000);
-        timerfd_settime(
+        timerfd_settime_with_flags_and_post(
             &cap,
             false,
             now,
@@ -499,6 +632,10 @@ mod tests {
                 it_value_ns: 0,
             },
             None,
+            0,
+            0,
+            None,
+            |mailbox, event| mailbox.post(event),
         );
         assert_eq!(cap.deadline_ns(), 0);
     }
@@ -520,7 +657,7 @@ mod tests {
         let _g = setup();
         let cap = timerfd_create(0).expect("create");
         timerfd_set_clockid(&cap, 0);
-        timerfd_settime_with_flags(
+        timerfd_settime_with_flags_and_post(
             &cap,
             true,
             1_000_000_000,
@@ -531,11 +668,16 @@ mod tests {
             None,
             TFD_TIMER_CANCEL_ON_SET,
             1,
+            None,
+            |mailbox, event| mailbox.post(event),
         );
 
-        assert_eq!(timerfd_clock_was_set(2), 1);
+        assert_eq!(
+            timerfd_clock_was_set_with_post(2, None, |mailbox, event| mailbox.post(event)),
+            1
+        );
         let mut buf = [0u8; 8];
-        match step_timerfd_read(&cap, 1_000_000_001, &mut buf, true) {
+        match step_timerfd_read(&cap, &mut buf, true) {
             StepOutcome::Err(V3Errno::ECANCELED) => {}
             other => panic!("expected ECANCELED after wallclock change, got {other:?}"),
         }

@@ -35,7 +35,7 @@
 //! `txdoc:MOUNT-STEP-MOUNT-COMMIT-ORDERING-1`, see
 //! `crate::mount::MountIdentity`), the walker upgrades the weak,
 //! switches the active filesystem to the mount's `payload().fs_ops`,
-//! and continues from a fresh DEntry over `mount.root()`. If the
+//! and continues from `mount.root_dentry()`. If the
 //! upgrade fails (mount torn down mid-walk), the walker reports
 //! `Errno::EIO` (`Errno::ENXIO` is not in the day-1 set; the
 //! mount-tear-down errno can sharpen in a follow-up).
@@ -84,8 +84,8 @@ use crate::vfs::adapter::step_engine::{self, Cap, NoProgress, StepOutcome, Weak}
 
 use crate::execution::{Errno, Guard};
 use crate::mount::{MountIdentity, MountNamespace, MountPayload};
-use crate::vfs::structure::{Credential, DEntry, InlineName, OpenFile, OpenFileFlags, RNode};
 use crate::vfs::FsOps;
+use crate::vfs::structure::{Credential, DEntry, InodeKind, OpenFile, OpenFileFlags, RNode};
 
 /// POSIX symlink-loop budget. Matches Linux's `MAXSYMLINKS = 40`.
 /// The 41st observed symlink (after 40 hops have already been
@@ -177,21 +177,60 @@ pub fn step_walk_in_mount_namespace<'g>(
     mount_namespace: &Cap<MountNamespace>,
     guard: &Guard<'g>,
 ) -> StepOutcome<Cap<DEntry>, NoProgress> {
+    use StepOutcome as V3;
+
+    let root_mount = mount_namespace.root().clone();
+    match step_walk_in_mount_namespace_with_origin_mount(
+        rooted_at,
+        &root_mount,
+        path,
+        cred,
+        mount_namespace,
+        guard,
+    ) {
+        V3::Done(resolved) => V3::done(resolved.dentry),
+        V3::Continue { progress } => V3::Continue { progress },
+        V3::Yield { progress, shape } => V3::Yield { progress, shape },
+        V3::Err(errno) => V3::err(errno),
+    }
+}
+
+#[derive(Debug)]
+pub struct ResolvedDEntryWithMount {
+    pub dentry: Cap<DEntry>,
+    pub mount: Cap<MountIdentity>,
+}
+
+pub fn step_walk_in_mount_namespace_with_origin_mount<'g>(
+    rooted_at: Cap<DEntry>,
+    origin_mount: &Cap<MountIdentity>,
+    path: &[u8],
+    cred: &Credential,
+    mount_namespace: &Cap<MountNamespace>,
+    guard: &Guard<'g>,
+) -> StepOutcome<ResolvedDEntryWithMount, NoProgress> {
     // observe: inspect current subsystem state and validate inputs.
     // upgrade: acquire capabilities/guards needed for mutation.
     // reserve: reserve namespace, memory, or wait-source effects.
     // commit: apply the state transition.
     // publish: emit readiness, signal, or observable outcome.
-    match crate::vfs::resolution::driver::walk_to_completion_with_mount_namespace(
+    match crate::vfs::resolution::driver::walk_to_completion_with_mount_namespace_and_origin(
         rooted_at,
         path,
         crate::vfs::resolution::state::WalkMode::Entity,
         crate::vfs::resolution::state::FinalSymlinkPolicy::Follow,
         cred,
         Some(mount_namespace),
+        Some(origin_mount),
         guard,
     ) {
-        Ok(resolved) => StepOutcome::done(resolved.dentry),
+        Ok(resolved) => match resolved.mount {
+            Some(mount) => StepOutcome::done(ResolvedDEntryWithMount {
+                dentry: resolved.dentry,
+                mount,
+            }),
+            None => StepOutcome::err(step_engine::Errno::ENODEV),
+        },
         Err(e) => StepOutcome::err(e.into()),
     }
 }
@@ -217,14 +256,125 @@ pub fn step_open<'g>(
     // reserve — OpenFile::new_cap reserves zone slot
     // commit — N/A: delegated to OpenFile::new_cap internals
     // publish — N/A: no signal attachments
-    use StepOutcome as V3;
-
     // `mode` is reserved for future create-on-open semantics; the
     // current surface only resolves existing entries.
     let _ = mode;
 
-    let dentry = match step_walk(rooted_at, path, cred, guard) {
-        V3::Done(d) => d,
+    open_after_walk(step_walk(rooted_at, path, cred, guard), flags, cred, guard)
+}
+
+/// Open a path using an explicit mount namespace.
+///
+/// Absolute paths and absolute symlink targets start at
+/// `mount_namespace.root_dentry()`. Relative paths still start at
+/// `rooted_at`, which is the caller's cwd/dirfd anchor in the current
+/// no-chroot process model. Mount crossing consults only the supplied
+/// namespace; it never falls back to the legacy global mount table.
+pub fn step_open_in_mount_namespace<'g>(
+    rooted_at: Cap<DEntry>,
+    path: &[u8],
+    flags: OpenFileFlags,
+    mode: u16,
+    cred: &Credential,
+    mount_namespace: &Cap<MountNamespace>,
+    guard: &Guard<'g>,
+) -> StepOutcome<Cap<OpenFile>, NoProgress> {
+    use StepOutcome as V3;
+
+    match step_open_in_mount_namespace_with_mount(
+        rooted_at,
+        path,
+        flags,
+        mode,
+        cred,
+        mount_namespace,
+        guard,
+    ) {
+        V3::Done(opened) => V3::done(opened.open_file),
+        V3::Continue { progress } => V3::Continue { progress },
+        V3::Yield { progress, shape } => V3::Yield { progress, shape },
+        V3::Err(errno) => V3::err(errno),
+    }
+}
+
+#[derive(Debug)]
+pub struct OpenFileWithMount {
+    pub open_file: Cap<OpenFile>,
+    pub mount: Cap<MountIdentity>,
+}
+
+/// Open a path and retain the final namespace mount selected by resolution.
+pub fn step_open_in_mount_namespace_with_mount<'g>(
+    rooted_at: Cap<DEntry>,
+    path: &[u8],
+    flags: OpenFileFlags,
+    mode: u16,
+    cred: &Credential,
+    mount_namespace: &Cap<MountNamespace>,
+    guard: &Guard<'g>,
+) -> StepOutcome<OpenFileWithMount, NoProgress> {
+    let root_mount = mount_namespace.root().clone();
+    step_open_in_mount_namespace_with_origin_mount(
+        rooted_at,
+        &root_mount,
+        path,
+        flags,
+        mode,
+        cred,
+        mount_namespace,
+        guard,
+    )
+}
+
+pub fn step_open_in_mount_namespace_with_origin_mount<'g>(
+    rooted_at: Cap<DEntry>,
+    origin_mount: &Cap<MountIdentity>,
+    path: &[u8],
+    flags: OpenFileFlags,
+    mode: u16,
+    cred: &Credential,
+    mount_namespace: &Cap<MountNamespace>,
+    guard: &Guard<'g>,
+) -> StepOutcome<OpenFileWithMount, NoProgress> {
+    use StepOutcome as V3;
+
+    let _ = mode;
+    let resolved =
+        match crate::vfs::resolution::driver::walk_to_completion_with_mount_namespace_and_origin(
+            rooted_at,
+            path,
+            crate::vfs::resolution::state::WalkMode::Entity,
+            crate::vfs::resolution::state::FinalSymlinkPolicy::Follow,
+            cred,
+            Some(mount_namespace),
+            Some(origin_mount),
+            guard,
+        ) {
+            Ok(resolved) => resolved,
+            Err(errno) => return V3::err(errno.into()),
+        };
+    let mount = match resolved.mount {
+        Some(mount) => mount,
+        None => return V3::err(step_engine::Errno::ENODEV),
+    };
+    match open_resolved_dentry(resolved.dentry, flags, cred, guard) {
+        V3::Done(open_file) => V3::done(OpenFileWithMount { open_file, mount }),
+        V3::Continue { progress } => V3::Continue { progress },
+        V3::Yield { progress, shape } => V3::Yield { progress, shape },
+        V3::Err(errno) => V3::err(errno),
+    }
+}
+
+fn open_after_walk<'g>(
+    walk: StepOutcome<Cap<DEntry>, NoProgress>,
+    flags: OpenFileFlags,
+    cred: &Credential,
+    guard: &Guard<'g>,
+) -> StepOutcome<Cap<OpenFile>, NoProgress> {
+    use StepOutcome as V3;
+
+    let dentry = match walk {
+        V3::Done(dentry) => dentry,
         V3::Continue { .. } => {
             // `walk_inner_v3` only returns `Done` / `Yield` / `Err` at
             // the top level — every `Continue` is consumed by the
@@ -236,6 +386,17 @@ pub fn step_open<'g>(
         V3::Yield { progress, shape } => return V3::Yield { progress, shape },
         V3::Err(err) => return V3::err(err),
     };
+
+    open_resolved_dentry(dentry, flags, cred, guard)
+}
+
+fn open_resolved_dentry<'g>(
+    dentry: Cap<DEntry>,
+    flags: OpenFileFlags,
+    cred: &Credential,
+    guard: &Guard<'g>,
+) -> StepOutcome<Cap<OpenFile>, NoProgress> {
+    use StepOutcome as V3;
 
     // Validate the requested open mode against the terminal inode's
     // R/W permission bits. Routes through the cred::checks witness
@@ -259,6 +420,84 @@ pub fn step_open<'g>(
     match OpenFile::new_cap_with_dentry(rnode, flags, dentry) {
         Ok(open) => V3::done(open),
         Err(_) => V3::err(step_engine::Errno::EIO),
+    }
+}
+
+/// Open a path without following a symlink in the final component.
+/// Non-final symlinks still follow through the ordinary walker
+/// machinery; a terminal symlink returns `ELOOP` for Linux
+/// `O_NOFOLLOW` compatibility.
+pub fn step_open_nofollow<'g>(
+    rooted_at: Cap<DEntry>,
+    path: &[u8],
+    flags: OpenFileFlags,
+    mode: u16,
+    cred: &Credential,
+    guard: &Guard<'g>,
+) -> StepOutcome<Cap<OpenFile>, NoProgress> {
+    use StepOutcome as V3;
+
+    let _ = mode;
+
+    let dentry = match crate::vfs::resolution::driver::walk_to_completion(
+        rooted_at,
+        path,
+        crate::vfs::resolution::state::WalkMode::EntityUnfollowed,
+        crate::vfs::resolution::state::FinalSymlinkPolicy::NoFollow,
+        cred,
+        guard,
+    ) {
+        Ok(resolved) => resolved.dentry,
+        Err(e) => return V3::err(e.into()),
+    };
+    if dentry.rnode().meta().kind() == InodeKind::Symlink {
+        return V3::err(step_engine::Errno::ELOOP);
+    }
+
+    open_resolved_dentry(dentry, flags, cred, guard)
+}
+
+/// Namespace-aware [`step_open_nofollow`] variant retaining the final mount.
+pub fn step_open_nofollow_in_mount_namespace_with_origin_mount<'g>(
+    rooted_at: Cap<DEntry>,
+    origin_mount: &Cap<MountIdentity>,
+    path: &[u8],
+    flags: OpenFileFlags,
+    mode: u16,
+    cred: &Credential,
+    mount_namespace: &Cap<MountNamespace>,
+    guard: &Guard<'g>,
+) -> StepOutcome<OpenFileWithMount, NoProgress> {
+    use StepOutcome as V3;
+
+    let _ = mode;
+    let resolved =
+        match crate::vfs::resolution::driver::walk_to_completion_with_mount_namespace_and_origin(
+            rooted_at,
+            path,
+            crate::vfs::resolution::state::WalkMode::EntityUnfollowed,
+            crate::vfs::resolution::state::FinalSymlinkPolicy::NoFollow,
+            cred,
+            Some(mount_namespace),
+            Some(origin_mount),
+            guard,
+        ) {
+            Ok(resolved) => resolved,
+            Err(errno) => return V3::err(errno.into()),
+        };
+    if resolved.dentry.rnode().meta().kind() == InodeKind::Symlink {
+        return V3::err(step_engine::Errno::ELOOP);
+    }
+    let mount = match resolved.mount {
+        Some(mount) => mount,
+        None => return V3::err(step_engine::Errno::ENODEV),
+    };
+
+    match open_resolved_dentry(resolved.dentry, flags, cred, guard) {
+        V3::Done(open_file) => V3::done(OpenFileWithMount { open_file, mount }),
+        V3::Continue { progress } => V3::Continue { progress },
+        V3::Yield { progress, shape } => V3::Yield { progress, shape },
+        V3::Err(errno) => V3::err(errno),
     }
 }
 
@@ -323,18 +562,14 @@ pub(crate) fn fs_ops_for_rnode<'g>(
 
 // === walker internals =================================================
 
-/// Build a `Cap<DEntry>` over a mount's root RNode. Used when the
-/// walker crosses a mount boundary or restarts from the namespace
-/// root for an absolute symlink target.
+/// Clone the mount-owned stable root DEntry. Used when the walker crosses a
+/// mount boundary or restarts from the namespace root for an absolute symlink
+/// target.
 pub(crate) fn dentry_for_mount_root(
     mount: &Cap<MountIdentity>,
-    mount_point: Option<&Cap<DEntry>>,
+    _mount_point: Option<&Cap<DEntry>>,
 ) -> Result<Cap<DEntry>, Errno> {
-    let mut raw = DEntry::new(InlineName::ROOT, mount.root().clone());
-    if let Some(parent) = mount_point {
-        raw.set_parent_hint(parent);
-    }
-    step_engine::sign(raw).map_err(|_| Errno::ENOMEM)
+    Ok(mount.root_dentry().clone())
 }
 
 /// Walk `from`'s parent-hint chain to find the namespace's root
@@ -358,13 +593,9 @@ pub(crate) fn mount_payload_for<'g>(
     weak.upgrade(guard)
 }
 
-/// Compare two dentries by name + RNode FsObjectId. Used by the
-/// `..` ascend-only-up-to-mount-root rule. The comparison is
-/// approximate (it does not check zone identity) but sufficient for
-/// the boot-time chroot-shaped namespace.
+/// Compare DEntry identities for the `..` mount-root boundary rule.
 pub(crate) fn is_same_dentry(a: &Cap<DEntry>, b: &Cap<DEntry>) -> bool {
-    a.rnode().fs_object_id() == b.rnode().fs_object_id()
-        && a.name().as_bytes() == b.name().as_bytes()
+    a.key() == b.key()
 }
 
 #[cfg(test)]

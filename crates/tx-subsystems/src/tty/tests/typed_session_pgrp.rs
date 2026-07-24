@@ -13,9 +13,10 @@ use crate::execution::Guard;
 use crate::process::execution::reset_init_process_for_test;
 use crate::process::structure::{reset_pid_counter_for_test, ExitStatus, Pgid};
 use crate::process::{
-    bootstrap_init_process, step_exit_group, step_fork, step_setpgid, step_setsid, ProcessIdentity,
+    bootstrap_init_process, step_exit_group_with_posts, step_fork, step_setpgid, step_setsid,
+    ProcessIdentity,
 };
-use crate::signal::{deliver_tty_dispatch, step_kill_pgrp, DispatchOutcome, Signum};
+use crate::signal::{deliver_tty_dispatch, step_kill_pgrp_with_post, DispatchOutcome, Signum};
 use crate::test_support::EPOCH_TEST_LOCK;
 use crate::thread_runtime::structure::reset_tid_counter_for_test;
 use crate::tty::execution::{
@@ -61,6 +62,20 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
 fn fresh_init() -> Cap<ProcessIdentity> {
     bootstrap_init_process(AddressSpace::new_cap_for_platform::<TestPmap>().expect("aspace"))
         .expect("init")
+}
+
+fn finish_process_group_for_test(process: &Cap<ProcessIdentity>, status: ExitStatus) {
+    step_exit_group_with_posts(
+        process,
+        status,
+        |weak, event| {
+            let Some(mailbox) = weak.upgrade() else {
+                return;
+            };
+            let _ = mailbox.post(event);
+        },
+        |mailbox, event| mailbox.post(event),
+    );
 }
 
 fn fresh_tty(name: &str) -> Cap<TtyIdentity> {
@@ -123,7 +138,7 @@ fn foreground_pgrp_cap_returns_none_for_legacy_raw_id_binding() {
 }
 
 #[test]
-fn typed_pgrp_can_drive_step_kill_pgrp_against_real_membership() {
+fn typed_pgrp_can_drive_process_group_signal_against_real_membership() {
     let _g = setup();
     let init = fresh_init();
     let pgrp = init.pgrp_cap();
@@ -132,9 +147,15 @@ fn typed_pgrp_can_drive_step_kill_pgrp_against_real_membership() {
     tty.bind_session_pgrp_typed(&session, &pgrp);
 
     // The whole point of typed rebinding: hand the foreground pgrp
-    // Cap to the signal shim. Ensure the round-trip works.
+    // Cap to the signal shim. Ensure the round-trip works through the
+    // caller-posting process-group signal route.
     let target_pgrp = tty.foreground_pgrp_cap().expect("foreground pgrp live");
-    let delivered = step_kill_pgrp(&target_pgrp, Signum::SIGTERM);
+    let delivered = step_kill_pgrp_with_post(&target_pgrp, Signum::SIGTERM, |weak, event| {
+        let Some(mailbox) = weak.upgrade() else {
+            return;
+        };
+        let _ = mailbox.post(event);
+    });
     assert_eq!(delivered, 1, "init is the only member of its pgrp");
 }
 
@@ -388,7 +409,7 @@ fn session_leader_exit_with_controlling_tty_fires_sighup_sigcont_and_clears_bind
     assert!(tty.foreground_pgrp_cap().is_some());
 
     // Session leader exits — fires the cascade.
-    step_exit_group(&init, ExitStatus::Exited(0));
+    finish_process_group_for_test(&init, ExitStatus::Exited(0));
 
     // Init zombified per usual.
     assert!(init.is_zombie());
@@ -396,7 +417,7 @@ fn session_leader_exit_with_controlling_tty_fires_sighup_sigcont_and_clears_bind
     // SIGHUP and SIGCONT now pending on every fg-pgrp member's
     // leader thread. init is the only member of its own pgrp (in
     // bootstrap), but it's now a zombie — the post happened before
-    // zombification (cascade runs first in step_exit_group).
+    // zombification (cascade runs first in group exit).
     //
     // Re-pull the zombie's stale leader: payload is dropped, so
     // `leader_pending` would panic. Instead, verify post effect via
@@ -434,7 +455,7 @@ fn session_leader_exit_with_live_fg_pgrp_member_delivers_sighup_and_sigcont() {
 
     // init exits (session leader) → cascade fires SIGHUP+SIGCONT to
     // the fg pgrp, which still contains child as a live member.
-    step_exit_group(&init, ExitStatus::Exited(0));
+    finish_process_group_for_test(&init, ExitStatus::Exited(0));
 
     assert!(
         leader_pending(&child, Signum::SIGHUP),
@@ -470,7 +491,7 @@ fn non_session_leader_exit_does_not_fire_cascade() {
 
     // grandchild (non-leader) exits. Cascade must NOT fire — the tty
     // binding stays put; the session's controlling_tty stays set.
-    step_exit_group(&grandchild, ExitStatus::Exited(0));
+    finish_process_group_for_test(&grandchild, ExitStatus::Exited(0));
 
     assert!(
         tty.session_pgrp().is_some(),
@@ -493,7 +514,7 @@ fn session_leader_exit_without_controlling_tty_is_noop() {
     assert!(!session.has_controlling_tty());
 
     // Just exercising the no-op branch — assertion is "didn't panic".
-    step_exit_group(&init, ExitStatus::Exited(0));
+    finish_process_group_for_test(&init, ExitStatus::Exited(0));
     assert!(init.is_zombie());
 }
 
@@ -514,7 +535,7 @@ fn session_leader_exit_with_tty_but_no_fg_pgrp_clears_binding_without_signal() {
     assert!(tty.session_pgrp().is_some());
     assert!(tty.foreground_pgrp_cap().is_none());
 
-    step_exit_group(&init, ExitStatus::Exited(0));
+    finish_process_group_for_test(&init, ExitStatus::Exited(0));
 
     // Per spec: "If `None` (no fg pgrp installed, or pgrp reclaimed),
     // skip the SIGHUP step but still proceed to step 3 (the tty's

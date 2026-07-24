@@ -51,15 +51,22 @@ pub fn step_tcp_close_staging(
     if let Some(raw_tcp) = payload.raw_tcp_socket() {
         raw_tcp.abort();
     }
+    payload.refresh_io_from_raw();
 
     let mark = payload.mark_shutdown(witness.how);
     let recv_woken = if mark.recv {
-        witness.identity.readiness.fire_recv(RecvWireSet::BROKEN)
+        witness
+            .identity
+            .readiness
+            .fire_recv_with_post(RecvWireSet::BROKEN, |mailbox, event| mailbox.post(event))
     } else {
         0
     };
     let send_woken = if mark.send {
-        witness.identity.readiness.fire_send(SendWireSet::BROKEN)
+        witness
+            .identity
+            .readiness
+            .fire_send_with_post(SendWireSet::BROKEN, |mailbox, event| mailbox.post(event))
     } else {
         0
     };

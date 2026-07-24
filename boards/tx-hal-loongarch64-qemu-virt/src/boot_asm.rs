@@ -7,12 +7,7 @@ core::arch::global_asm!(
     .equ TX_LA64_DMW_CACHED,   0x9000000000000011
     .equ TX_LA64_DMW_UNCACHED, 0x8000000000000001
     .equ TX_LA64_DMW_CACHED_BASE, 0x9000000000000000
-    // KERNEL_LINK_BASE + KERNEL_BOOT_PHYS_SIZE (linker script): first
-    // high-half instruction. Works from both entry modes: QEMU enters
-    // in DA mode where the address truncates to phys 0x90001000; the
-    // 2K1000 U-Boot enters through the cached DMW window where it is
-    // used as-is.
-    .equ TX_LA64_HIGH_START,   0x9000000090001000
+    .equ TX_LA64_HIGH_START,   0x9000000000201000
     .equ TX_LA64_PHYS_ADDR_MASK, 0x0000ffffffffffff
     .equ TX_LA64_CSR_DMW0, 0x180
     .equ TX_LA64_CSR_DMW1, 0x181

@@ -12,13 +12,8 @@
 //!   named pipe-side verbs (`done_bytes`, `eagain`, `epipe`,
 //!   `yield_until_readable`, `yield_until_writable`, `sign`).
 //!
-//! * **`wait_routing`** — wraps `tx_substrate::wake::WaitSource` (v3
-//!   path) and `tx_reactor::wait::{Channel, Mask}` (D2 legacy
-//!   coexistence path) as named pipe-side verbs (`new_wait_source`,
-//!   `fire_legacy_channel`, `notify_v3_source`). The two
-//!   `#[platform_adapter]` attributes stack on the one module because
-//!   pipe's wakeup routing is genuinely cross-platform and splitting
-//!   would fragment the semantic unit.
+//! * **`wait_routing`** — wraps `tx_substrate::wake::WaitSource` as named
+//!   pipe-side verbs (`new_wait_source`, `notify_source_with_post`).
 
 use tx_platform_adapter::platform_adapter;
 
@@ -38,10 +33,8 @@ pub mod step_engine {
         WaitSourceId, YieldShape,
     };
     pub use tx_substrate::zone::{
-        reserve_for, sign, sign_for, Cap, CapProducingPolicy, CoLocatedEntity, Dead, Entity,
-        IdentRef, IdentitySlot, IsPayloadPolicy, ObserverNodePolicy, OperationalCapExt,
-        OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy, RetainedEntityPolicy, Weak,
-        Zone, ZoneAllocated, ZoneError, ZonePolicy,
+        reserve_for, sign, sign_for, Cap, Dead, Entity, IdentRef, OperationalCapExt, PayloadCap,
+        Weak, Zone, ZoneAllocated, ZoneError,
     };
 
     pub type ByteOutcome = StepOutcome<usize, ByteProgress>;
@@ -95,24 +88,13 @@ pub mod step_engine {
     apis = ["wake", "step"],
     reason = "wrap WaitSource registration and v3 mailbox notify in pipe-side reader/writer wakeup verbs"
 )]
-#[platform_adapter(
-    platform = "reactor",
-    domain = "wait_routing",
-    reason = "wrap reactor Channel/Mask as pipe-side legacy wakeup verbs (PR-3D-1 D2 coexistence path)"
-)]
 pub mod wait_routing {
     use alloc::sync::Arc;
 
-    pub use tx_reactor::wait::{Channel, Mask};
-    pub use tx_substrate::wake::{
-        MailboxEvent, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource,
-    };
+    pub use tx_substrate::wake::{MailboxEvent, MailboxSchedulerHint, TaskMailbox, WaitSource};
 
-    /// Build a `WaitSource` for one side of a pipe, keyed by the
-    /// wait-source id minted from
-    /// `crate::wait_source::register_wait_channel` so the legacy
-    /// (`Channel`) and v3 (`WaitSource`) paths share an id namespace
-    /// (PR-3D-1 / D2 coexistence).
+    /// Build a `WaitSource` for one side of a pipe, keyed by the wait-source id
+    /// that pipe steps stamp into `YieldShape::OnWaitSource`.
     ///
     /// Delegates to `tx_substrate::wake::new_source`. Also registers
     /// the source in the global registry so the driver can look it up
@@ -122,14 +104,6 @@ pub mod wait_routing {
         let source = tx_substrate::wake::new_source(side_id);
         tx_substrate::wake::register_source(Arc::clone(&source));
         source
-    }
-
-    /// Fire the legacy `Channel` for one side of a pipe — the D2
-    /// coexistence path that the resolver still uses today.
-    ///
-    /// Delegates to `tx_reactor::wait::fire_legacy`.
-    pub fn fire_legacy_channel(channel: &Channel, mask_bits: u64) -> usize {
-        tx_reactor::wait::fire_legacy(channel, mask_bits)
     }
 
     /// Remove a source from the global registry. Companion of
@@ -142,11 +116,19 @@ pub mod wait_routing {
         tx_substrate::wake::unregister_source(WaitSourceId::new(id));
     }
 
-    /// Notify the v3 `WaitSource` for one side of a pipe — the
-    /// mailbox path that the new caller stack uses.
+    /// Notify the `WaitSource` through a caller-provided mailbox post.
     ///
-    /// Delegates to `tx_substrate::wake::notify`.
-    pub fn notify_v3_source(source: &Arc<WaitSource>, mask_bits: u64) {
-        tx_substrate::wake::notify(source, mask_bits)
+    /// This is the scheduler-context bridge used by syscall/reactor callers:
+    /// the pipe subsystem still owns readiness, while the caller decides how
+    /// an upgraded mailbox becomes runnable.
+    pub fn notify_source_with_post<F>(source: &Arc<WaitSource>, mask_bits: u64, mut post: F)
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+    {
+        source.notify_with_owner_post(
+            tx_substrate::step::InterestMask::new(mask_bits),
+            MailboxSchedulerHint::Normal,
+            |mailbox, event, _hint| post(mailbox, event),
+        );
     }
 }

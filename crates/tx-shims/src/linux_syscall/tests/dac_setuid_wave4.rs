@@ -200,7 +200,7 @@ fn nul_terminate(path: &[u8]) -> Vec<u8> {
 /// `fchmodat(AT_FDCWD, "/f", 0o600, 0)` against a tmpfs file owned
 /// by uid 1000 succeeds when the caller is uid 1000. Verifies the
 /// arm wires `walker_cred` (effective ids) into
-/// `FsOps::step_chmod` and that mode is masked to 0o7777.
+/// `FsOps::chmod_inode` and that mode is masked to 0o7777.
 #[test]
 fn dispatch_fchmodat_owner_succeeds() {
     let _setup = wave4_setup();
@@ -287,7 +287,7 @@ fn dispatch_fchmodat_devfs_returns_neg_erofs() {
     let ctx = make_ctx(proc_cap, thread);
 
     // The devfs root inode itself is targetable — chmod on it
-    // routes through `step_chmod` which devfs short-circuits to
+    // routes through `chmod_inode` which devfs short-circuits to
     // EROFS regardless of fs_object_id. Use the root path "/"
     // which always resolves.
     let path = nul_terminate(b"/");
@@ -300,9 +300,7 @@ fn dispatch_fchmodat_devfs_returns_neg_erofs() {
     drop(path);
 }
 
-/// Any non-`AT_FDCWD` dirfd value returns `-EBADF`. The slice's
-/// fd table doesn't carry directory-fd semantics yet
-/// (TODO(phase-dirfd)).
+/// A relative `fchmodat` path with an unknown dirfd returns `-EBADF`.
 #[test]
 fn dispatch_fchmodat_invalid_dirfd_returns_neg_ebadf() {
     let _setup = wave4_setup();
@@ -311,7 +309,7 @@ fn dispatch_fchmodat_invalid_dirfd_returns_neg_ebadf() {
     let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
     let ctx = make_ctx(proc_cap, thread);
 
-    let path = nul_terminate(b"/f");
+    let path = nul_terminate(b"f");
     // dirfd = 3 (a positive fd value); not AT_FDCWD = -100.
     let req = SyscallRequest::new(NR_FCHMODAT, [3u64, path.as_ptr() as u64, 0o600, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
@@ -512,6 +510,42 @@ fn dispatch_fchownat_unprivileged_to_self_succeeds() {
     drop(path);
 }
 
+#[test]
+fn dispatch_fchownat_absolute_path_ignores_non_cwd_dirfd() {
+    let _setup = wave4_setup();
+    let root = build_tmpfs_root();
+    let root_dentry = root.dentry.clone();
+    let tmpfs = root.tmpfs.clone();
+    let owner_cred = Credential {
+        uid: 0,
+        gid: 0,
+        effective_caps: CapabilitySet::FULL,
+    };
+    let guard = ebr_guard();
+    let (file_id, _) =
+        match tmpfs.create_inode(TMPFS_ROOT_OBJECT_ID, b"f", 0o100644, &owner_cred, &guard) {
+            StepOutcome::Done(out) => out,
+            other => panic!("create_inode: {other:?}"),
+        };
+    drop(guard);
+
+    let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
+    let ctx = make_ctx(proc_cap, thread);
+    let path = nul_terminate(b"/f");
+    let req = SyscallRequest::new(NR_FCHOWNAT, [3, path.as_ptr() as u64, 0, 0, 0, 0]);
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Return(0));
+
+    let guard = ebr_guard();
+    let meta = match tmpfs.load_inode_meta(file_id, &guard) {
+        StepOutcome::Done(m) => m,
+        other => panic!("load_inode_meta: {other:?}"),
+    };
+    assert_eq!(meta.uid, 0);
+    assert_eq!(meta.gid, 0);
+    drop(path);
+}
+
 /// Non-privileged caller chowning to a foreign uid returns
 /// `-EPERM`. Matches POSIX `chown(2)` ("only superuser may change
 /// the file's owner").
@@ -554,7 +588,7 @@ fn dispatch_fchownat_unprivileged_to_other_returns_neg_eperm() {
 
 /// `fchownat(.., -1, -1, ..)` (both ids = sentinel) is a "leave
 /// unchanged" no-op. Confirms `decode_uid_arg` / `decode_gid_arg`
-/// flow correctly into `step_chown`'s `(None, None)`.
+/// flow correctly into `chown_inode`'s `(None, None)`.
 #[test]
 fn dispatch_fchownat_minus_one_leaves_unchanged() {
     let _setup = wave4_setup();
@@ -574,7 +608,7 @@ fn dispatch_fchownat_minus_one_leaves_unchanged() {
         };
     drop(guard);
 
-    // Stay root + CAP_FOWNER so step_chown is permitted; this test
+    // Stay root + CAP_FOWNER so chown_inode is permitted; this test
     // is about the sentinel decoding, not the privilege check.
     let (proc_cap, thread) = bootstrap_with_cwd(root_dentry);
     let ctx = make_ctx(proc_cap, thread);

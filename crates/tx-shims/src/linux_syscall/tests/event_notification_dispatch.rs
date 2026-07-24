@@ -2,9 +2,10 @@ use super::*;
 
 use crate::linux_syscall::{
     NR_EPOLL_CREATE1, NR_EPOLL_CTL, NR_EPOLL_PWAIT2, NR_EVENTFD2, NR_FANOTIFY_INIT,
-    NR_FANOTIFY_MARK, NR_INOTIFY_ADD_WATCH, NR_INOTIFY_INIT1, NR_INOTIFY_RM_WATCH, NR_WRITE,
+    NR_FANOTIFY_MARK, NR_INOTIFY_ADD_WATCH, NR_INOTIFY_INIT1, NR_INOTIFY_RM_WATCH, NR_PIPE2,
+    NR_READ, NR_WRITE,
 };
-use tx_subsystems::signal::adapter::step_engine::TaskMailbox;
+use tx_substrate::wake::{MailboxEvent, MailboxSchedulerHint, TaskMailbox};
 
 const E_INVAL: i32 = 22;
 const E_NOSYS: i32 = 38;
@@ -14,6 +15,25 @@ const IN_CLOEXEC: u32 = 0o2000000;
 const IN_NONBLOCK: u32 = 0o4000;
 const FAN_CLOEXEC: u32 = 0x0000_0001;
 const FAN_NONBLOCK: u32 = 0x0000_0002;
+
+static EVENTFD_REF_POST_COUNT: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static PIPE_REF_POST_COUNT: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+fn counting_eventfd_ref_post(mailbox: &TaskMailbox, event: MailboxEvent) -> bool {
+    EVENTFD_REF_POST_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    mailbox.post(event)
+}
+
+fn counting_pipe_ref_post_with_hint(
+    mailbox: &TaskMailbox,
+    event: MailboxEvent,
+    _hint: MailboxSchedulerHint,
+) -> bool {
+    PIPE_REF_POST_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    mailbox.post(event)
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -54,6 +74,17 @@ fn create_eventfd(ctx: &SyscallCtx<'_>, init_val: u64) -> i64 {
     )) {
         SyscallResult::Return(fd) => fd,
         other => panic!("eventfd2: {other:?}"),
+    }
+}
+
+fn create_pipe(ctx: &SyscallCtx<'_>) -> [i32; 2] {
+    let mut pipefd = [-1i32; 2];
+    match block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_PIPE2, [pipefd.as_mut_ptr() as u64, 0, 0, 0, 0, 0]),
+        ctx,
+    )) {
+        SyscallResult::Return(0) => pipefd,
+        other => panic!("pipe2: {other:?}"),
     }
 }
 
@@ -126,6 +157,102 @@ fn dispatch_epoll_pwait2_null_timeout_reuses_epoll_ready_path() {
     assert_eq!(result, SyscallResult::Return(1));
     assert_eq!(out[0].events, EPOLLIN);
     assert_eq!(out[0].data, event.data);
+}
+
+#[test]
+fn dispatch_eventfd_write_uses_syscall_ctx_mailbox_ref_post_for_reader_wake() {
+    let (_setup, proc_cap, thread) = event_notify_setup();
+    EVENTFD_REF_POST_COUNT.store(0, core::sync::atomic::Ordering::Release);
+    let ctx = make_ctx(proc_cap, thread)
+        .with_mailbox(alloc::sync::Arc::new(TaskMailbox::new()))
+        .with_mailbox_ref_post(counting_eventfd_ref_post);
+    let eventfd = create_eventfd(&ctx, 0);
+    let mut out = 0u64;
+
+    let read_req = SyscallRequest::new(
+        NR_READ,
+        [
+            eventfd as u64,
+            &mut out as *mut u64 as u64,
+            core::mem::size_of::<u64>() as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    let waker = Waker::noop().clone();
+    let mut cx = Context::from_waker(&waker);
+    let mut read = Box::pin(dispatch::<ShimsTestPmap>(read_req, &ctx));
+    assert!(
+        matches!(read.as_mut().poll(&mut cx), Poll::Pending),
+        "read on an empty blocking eventfd should park"
+    );
+
+    let value = 7u64;
+    let write_result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_WRITE,
+            [
+                eventfd as u64,
+                &value as *const u64 as u64,
+                core::mem::size_of::<u64>() as u64,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+
+    assert_eq!(write_result, SyscallResult::Return(8));
+    assert_eq!(
+        EVENTFD_REF_POST_COUNT.load(core::sync::atomic::Ordering::Acquire),
+        1,
+        "eventfd write should wake the parked reader through SyscallCtx"
+    );
+    assert_eq!(block_on(read), SyscallResult::Return(8));
+    assert_eq!(out, value);
+}
+
+#[test]
+fn dispatch_pipe_write_uses_syscall_ctx_mailbox_ref_post_for_reader_wake() {
+    let (_setup, proc_cap, thread) = event_notify_setup();
+    PIPE_REF_POST_COUNT.store(0, core::sync::atomic::Ordering::Release);
+    let ctx = make_ctx(proc_cap, thread)
+        .with_mailbox(alloc::sync::Arc::new(TaskMailbox::new()))
+        .with_mailbox_ref_post_with_hint(counting_pipe_ref_post_with_hint);
+    let [reader_fd, writer_fd] = create_pipe(&ctx);
+    let mut out = [0u8; 1];
+
+    let read_req = SyscallRequest::new(
+        NR_READ,
+        [reader_fd as u64, out.as_mut_ptr() as u64, 1, 0, 0, 0],
+    );
+    let waker = Waker::noop().clone();
+    let mut cx = Context::from_waker(&waker);
+    let mut read = Box::pin(dispatch::<ShimsTestPmap>(read_req, &ctx));
+    assert!(
+        matches!(read.as_mut().poll(&mut cx), Poll::Pending),
+        "read on an empty blocking pipe should park"
+    );
+
+    let byte = [b'x'];
+    let write_result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_WRITE,
+            [writer_fd as u64, byte.as_ptr() as u64, 1, 0, 0, 0],
+        ),
+        &ctx,
+    ));
+
+    assert_eq!(write_result, SyscallResult::Return(1));
+    assert_eq!(
+        PIPE_REF_POST_COUNT.load(core::sync::atomic::Ordering::Acquire),
+        1,
+        "pipe write should wake the parked reader through SyscallCtx"
+    );
+    assert_eq!(block_on(read), SyscallResult::Return(1));
+    assert_eq!(out[0], byte[0]);
 }
 
 #[test]

@@ -366,11 +366,11 @@ pub fn require_rename<'g>(
 /// bits is not yet modelled.
 ///
 /// The `new_mode` argument is accepted for API symmetry with
-/// `step_chmod` and for future privilege-on-mode-bit rules; v1
+/// `chmod_inode` and for future privilege-on-mode-bit rules; v1
 /// does not consult it.
 ///
 /// Returns [`ChmodAuthorized`] on success — consumed at the
-/// `FsOps::step_chmod` commit site.
+/// `FsOps::chmod_inode` commit site.
 pub fn require_chmod<'g>(
     source: &CredSnapshot,
     target_meta: &InodeMeta,
@@ -392,7 +392,7 @@ pub fn require_chmod<'g>(
 /// own (`cred.uid`) and the gid only to their primary
 /// (`cred.gid`); `None` for either side means "leave unchanged".
 ///
-/// Matches the rule the per-FS `step_chown` impls enforce today
+/// Matches the rule the per-FS `chown_inode` impls enforce today
 /// (`tmpfs`, `devfs`, `bdevfs`, `procfs`); the cred-side seam is
 /// not stricter — it is the canonical place for the rule to live.
 ///
@@ -547,7 +547,7 @@ pub use super::{require_signal_send, signal_permitted, SignalAuthorized};
 //   • snapshot capture + ESRCH-on-zombie mapping
 //   • foreign-value-type resolution from a target Cap
 //   • the auth-phase epoch-guard scope (must drop before commit to
-//     avoid nesting with downstream guards in `post_signal`,
+//     avoid nesting with downstream catchable-signal post guards,
 //     `upgrade_owner_proc`, etc.)
 //
 // Two flavours per check: the bare form captures its own guard +
@@ -583,7 +583,7 @@ pub enum AuthOutcome {
 ///
 /// Captures a fresh epoch guard for the cred check and drops it
 /// before returning, so the caller's commit phase (which may take
-/// its own guards via `post_signal` / `upgrade_owner_proc` / etc.)
+/// its own guards via catchable-signal posting / `upgrade_owner_proc` / etc.)
 /// never nests under the auth guard.
 ///
 /// Folds the recurring snapshot + target-facts + `require_signal_send`

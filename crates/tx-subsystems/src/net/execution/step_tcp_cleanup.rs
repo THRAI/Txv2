@@ -2,7 +2,7 @@ use tx_substrate::mutation::MutationError;
 use tx_substrate::zone::Cap;
 
 use crate::execution::{Errno, Guard, StepOutcome};
-use crate::net::structure::table::SocketTable;
+use crate::net::structure::table::SOCKET_TABLE;
 use crate::net::structure::{ConnectionKey, SocketIdentity, SocketProtocol, TcpState};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -39,13 +39,8 @@ pub(crate) fn cleanup_tcp_connection(
         return Ok(TcpConnectionCleanupOutcome::default());
     };
 
-    // R2c: withdraw from the socket's OWN netns table, not the global
-    // initial-ns SOCKET_TABLE. The graceful-close path routed here for a
-    // non-initial-netns connection was hitting the wrong table, leaving
-    // the real ns entry (and its strong Cap → R2f) undeleted.
-    let table = payload.socket_table();
-    let local_withdrawn = withdraw_connection_key(table, ConnectionKey::new(local, remote));
-    let peer_withdrawn = withdraw_connection_key(table, ConnectionKey::new(remote, local));
+    let local_withdrawn = withdraw_connection_key(ConnectionKey::new(local, remote));
+    let peer_withdrawn = withdraw_connection_key(ConnectionKey::new(remote, local));
 
     payload.with_protocol_mut(|protocol| {
         if matches!(
@@ -61,6 +56,7 @@ pub(crate) fn cleanup_tcp_connection(
     if let Some(raw_tcp) = payload.raw_tcp_socket() {
         raw_tcp.abort();
     }
+    payload.refresh_io_from_raw();
 
     Ok(TcpConnectionCleanupOutcome {
         local_withdrawn,
@@ -69,8 +65,8 @@ pub(crate) fn cleanup_tcp_connection(
     })
 }
 
-fn withdraw_connection_key(table: &SocketTable, key: ConnectionKey) -> bool {
-    match table.withdraw_tcp_connection(key) {
+fn withdraw_connection_key(key: ConnectionKey) -> bool {
+    match SOCKET_TABLE.withdraw_tcp_connection(key) {
         Ok(_) => true,
         Err(
             MutationError::Missing

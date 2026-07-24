@@ -25,6 +25,15 @@ class OscompCustomRunTests(unittest.TestCase):
         self.assertIn("custom-run:status:$?", script)
         self.assertIn("#### OS COMP TEST GROUP END probe ####", script)
 
+    def test_pthread_cond_signal_probe_source_is_registered(self):
+        mod = load_module()
+
+        self.assertEqual(
+            mod.PTHREAD_COND_SIGNAL_PROBE,
+            ROOT / "tools/shell-tests/pthread_cond_signal_probe.c",
+        )
+        self.assertTrue(mod.PTHREAD_COND_SIGNAL_PROBE.exists())
+
     def test_libcbench_patch_inserts_observe_before_pthread_section(self):
         mod = load_module()
         source = """#include <unistd.h>
@@ -50,11 +59,11 @@ int main()
 
         self.assertEqual(
             mod.qemu_cmdline("libcbench-musl", None),
-            "tx.oscomp.observe=0 tx.oscomp.groups=libcbench-musl",
+            "tx.boot.mode=oscomp init=/tx-test-init tx.test_init=1 tx.oscomp.observe=0 tx.oscomp.groups=libcbench-musl",
         )
         self.assertEqual(
             mod.qemu_cmdline("libcbench-musl", 12000),
-            "tx.oscomp.observe_threshold=12000 tx.oscomp.groups=libcbench-musl",
+            "tx.boot.mode=oscomp init=/tx-test-init tx.test_init=1 tx.oscomp.observe_threshold=12000 tx.oscomp.groups=libcbench-musl",
         )
 
     def test_libcbench_patch_can_select_benchmark_without_observe_probe(self):

@@ -258,10 +258,7 @@ fn emit_syscall_roundtrip_marker(sysno: u64, name: &[u8]) {
         return;
     }
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            sysno as i64,
-        );
+        observer.debug_counter(name, sysno as i64);
         tx_observe::dump_registered_if_requested();
     }
 }
@@ -339,8 +336,10 @@ pub fn hand_off_user_fatal(
     payload.store_saved_user_context(Some(view.capture_user_context()));
 
     let slot: UserspaceRunSlot = payload.userspace_slot().clone();
-    match slot.complete_interesting_trap(active, UserspaceTrapInfo::Fatal(FatalTrapInfo::new(cause, value)))
-    {
+    match slot.complete_interesting_trap(
+        active,
+        UserspaceTrapInfo::Fatal(FatalTrapInfo::new(cause, value)),
+    ) {
         Ok(_status) => HandoffOutcome::Resolved,
         Err(err) => HandoffOutcome::SlotError(err),
     }

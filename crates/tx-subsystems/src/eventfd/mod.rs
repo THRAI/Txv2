@@ -19,7 +19,7 @@ use adapter::step_engine::{
     ScriptCtx, StepOp, StepOutcome, SubjectIdentity, V3Errno, WaitSource, Zone, ZoneAllocated,
     ZoneError,
 };
-use adapter::wait_routing::{self, Channel};
+use adapter::wait_routing::{self, MailboxEvent, TaskMailbox};
 
 pub const EFD_CLOEXEC: u32 = 0o2000000;
 pub const EFD_NONBLOCK: u32 = 0o4000;
@@ -32,41 +32,36 @@ pub struct EventFd {
     flags: AtomicU64,
     reader_source_id: u64,
     writer_source_id: u64,
-    reader_channel: Option<Channel>,
-    writer_channel: Option<Channel>,
-    reader_source: Option<Arc<WaitSource>>,
-    writer_source: Option<Arc<WaitSource>>,
+    reader_source: Arc<WaitSource>,
+    writer_source: Arc<WaitSource>,
 }
 
 impl EventFd {
     pub fn new(init_val: u64, flags: u32) -> Self {
         let wait_points = notification::new_wait_points();
+        let reader_source_id =
+            tx_substrate::wake::WaitEndpoint::source_id(wait_points.reader_endpoint()).raw();
+        let writer_source_id =
+            tx_substrate::wake::WaitEndpoint::source_id(wait_points.writer_endpoint()).raw();
 
         let readable = init_val != 0;
         let writable = init_val < EVENTFD_MAX;
 
         if readable {
-            notification::notify_readable(
-                Some(&wait_points.reader_channel),
-                Some(&wait_points.reader_source),
-            );
+            notification::notify_readable(wait_points.reader_endpoint());
         }
         if writable {
-            notification::notify_writable(
-                Some(&wait_points.writer_channel),
-                Some(&wait_points.writer_source),
-            );
+            notification::notify_writable(wait_points.writer_endpoint());
         }
 
+        let (_, reader_source, _, writer_source) = wait_points.into_parts();
         EventFd {
             counter: AtomicU64::new(init_val),
             flags: AtomicU64::new(flags as u64),
-            reader_source_id: wait_points.reader_source_id,
-            writer_source_id: wait_points.writer_source_id,
-            reader_channel: Some(wait_points.reader_channel),
-            writer_channel: Some(wait_points.writer_channel),
-            reader_source: Some(wait_points.reader_source),
-            writer_source: Some(wait_points.writer_source),
+            reader_source_id,
+            writer_source_id,
+            reader_source,
+            writer_source,
         }
     }
 
@@ -82,6 +77,12 @@ impl EventFd {
     pub fn writer_source_id(&self) -> u64 {
         self.writer_source_id
     }
+    pub fn reader_endpoint(&self) -> &Arc<WaitSource> {
+        &self.reader_source
+    }
+    pub fn writer_endpoint(&self) -> &Arc<WaitSource> {
+        &self.writer_source
+    }
     fn is_semaphore(&self) -> bool {
         (self.flags() & EFD_SEMAPHORE) != 0
     }
@@ -93,8 +94,8 @@ impl EventFd {
 
 impl Drop for EventFd {
     fn drop(&mut self) {
-        wait_source::release_wait_channel(self.reader_source_id);
-        wait_source::release_wait_channel(self.writer_source_id);
+        wait_source::release_wait_source(self.reader_source_id);
+        wait_source::release_wait_source(self.writer_source_id);
         wait_routing::unregister_source(self.reader_source_id);
         wait_routing::unregister_source(self.writer_source_id);
     }
@@ -118,7 +119,15 @@ pub fn eventfd_create(init_val: u64, flags: u32) -> Result<Cap<EventFd>, ZoneErr
     sign(efd)
 }
 
-pub fn step_eventfd_read(efd: &EventFd, out: &mut [u8; 8], nonblocking: bool) -> ByteOutcome {
+pub fn step_eventfd_read_with_post<F>(
+    efd: &EventFd,
+    out: &mut [u8; 8],
+    nonblocking: bool,
+    mut post: F,
+) -> ByteOutcome
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     // observe: inspect current subsystem state and validate inputs.
     // upgrade: acquire capabilities/guards needed for mutation.
     // reserve: reserve namespace, memory, or wait-source effects.
@@ -131,7 +140,7 @@ pub fn step_eventfd_read(efd: &EventFd, out: &mut [u8; 8], nonblocking: bool) ->
                 if nonblocking {
                     return eagain();
                 }
-                return notification::wait_until_readable(efd.reader_source_id);
+                return notification::wait_until_readable(efd.reader_endpoint());
             }
             if efd
                 .counter
@@ -140,7 +149,7 @@ pub fn step_eventfd_read(efd: &EventFd, out: &mut [u8; 8], nonblocking: bool) ->
             {
                 out.copy_from_slice(&1u64.to_le_bytes());
                 if current > EVENTFD_MAX {
-                    efd.fire_writable();
+                    efd.fire_writable_with_post(&mut post);
                 }
                 return ByteOutcome::done(8);
             }
@@ -151,18 +160,22 @@ pub fn step_eventfd_read(efd: &EventFd, out: &mut [u8; 8], nonblocking: bool) ->
         if nonblocking {
             return eagain();
         }
-        return notification::wait_until_readable(efd.reader_source_id);
+        return notification::wait_until_readable(efd.reader_endpoint());
     }
     out.copy_from_slice(&val.to_le_bytes());
-    efd.fire_writable();
+    efd.fire_writable_with_post(post);
     ByteOutcome::done(8)
 }
 
-pub fn step_eventfd_write(
+pub fn step_eventfd_write_with_post<F>(
     efd: &EventFd,
     val: u64,
     nonblocking: bool,
-) -> StepOutcome<(), NoProgress> {
+    post: F,
+) -> StepOutcome<(), NoProgress>
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     // observe: inspect current subsystem state and validate inputs.
     // upgrade: acquire capabilities/guards needed for mutation.
     // reserve: reserve namespace, memory, or wait-source effects.
@@ -178,7 +191,7 @@ pub fn step_eventfd_write(
             if nonblocking {
                 return eagain_no_progress();
             }
-            return notification::wait_until_writable(efd.writer_source_id);
+            return notification::wait_until_writable(efd.writer_endpoint());
         }
         let new_val = current + val;
         if efd
@@ -187,7 +200,7 @@ pub fn step_eventfd_write(
             .is_ok()
         {
             if current == 0 && new_val > 0 {
-                efd.fire_readable();
+                efd.fire_readable_with_post(post);
             }
             return StepOutcome::done(());
         }
@@ -195,11 +208,17 @@ pub fn step_eventfd_write(
 }
 
 impl EventFd {
-    fn fire_readable(&self) {
-        notification::notify_readable(self.reader_channel.as_ref(), self.reader_source.as_ref());
+    fn fire_readable_with_post<F>(&self, post: F)
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+    {
+        notification::notify_readable_with_post(&self.reader_source, post);
     }
-    fn fire_writable(&self) {
-        notification::notify_writable(self.writer_channel.as_ref(), self.writer_source.as_ref());
+    fn fire_writable_with_post<F>(&self, post: F)
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+    {
+        notification::notify_writable_with_post(&self.writer_source, post);
     }
 }
 
@@ -216,29 +235,45 @@ impl<I: SubjectIdentity> StepOp<I> for EventfdCreateOp {
 }
 impl<I: SubjectIdentity> OneShotStepOp<I> for EventfdCreateOp {}
 
-pub struct EventfdReadOp<'a> {
+pub struct EventfdReadOp<'a, F>
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     pub efd: &'a EventFd,
     pub out: &'a mut [u8; 8],
     pub nonblocking: bool,
+    pub post: F,
 }
-impl<I: SubjectIdentity> StepOp<I> for EventfdReadOp<'_> {
+impl<I: SubjectIdentity, F> StepOp<I> for EventfdReadOp<'_, F>
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     type Output = usize;
     type Progress = ByteProgress;
-    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        step_eventfd_read(self.efd, self.out, self.nonblocking)
+    fn step(&mut self, ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let _ = ctx.subject();
+        step_eventfd_read_with_post(self.efd, self.out, self.nonblocking, &mut self.post)
     }
 }
 
-pub struct EventfdWriteOp<'a> {
+pub struct EventfdWriteOp<'a, F>
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     pub efd: &'a EventFd,
     pub val: u64,
     pub nonblocking: bool,
+    pub post: F,
 }
-impl<I: SubjectIdentity> StepOp<I> for EventfdWriteOp<'_> {
+impl<I: SubjectIdentity, F> StepOp<I> for EventfdWriteOp<'_, F>
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     type Output = ();
     type Progress = NoProgress;
-    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
-        step_eventfd_write(self.efd, self.val, self.nonblocking)
+    fn step(&mut self, ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let _ = ctx.subject();
+        step_eventfd_write_with_post(self.efd, self.val, self.nonblocking, &mut self.post)
     }
 }
 
@@ -257,12 +292,36 @@ mod tests {
         guard
     }
 
+    fn direct_post(mailbox: &TaskMailbox, event: MailboxEvent) -> bool {
+        mailbox.post(event)
+    }
+
+    #[test]
+    fn endpoints_match_registered_reader_and_writer_sources() {
+        let _g = setup();
+        let cap = eventfd_create(0, 0).expect("create");
+
+        let reader = cap.reader_endpoint();
+        let writer = cap.writer_endpoint();
+
+        assert_eq!(
+            tx_substrate::wake::WaitEndpoint::source_id(reader).raw(),
+            cap.reader_source_id()
+        );
+        assert_eq!(
+            tx_substrate::wake::WaitEndpoint::source_id(writer).raw(),
+            cap.writer_source_id()
+        );
+        assert!(crate::wait_source::lookup_wait_source(cap.reader_source_id()).is_some());
+        assert!(crate::wait_source::lookup_wait_source(cap.writer_source_id()).is_some());
+    }
+
     #[test]
     fn create_with_zero_counter_reads_eagain_nonblocking() {
         let _g = setup();
         let cap = eventfd_create(0, EFD_NONBLOCK).expect("create");
         let mut buf = [0u8; 8];
-        match step_eventfd_read(&cap, &mut buf, true) {
+        match step_eventfd_read_with_post(&cap, &mut buf, true, direct_post) {
             StepOutcome::Err(V3Errno::EAGAIN) => {}
             other => panic!("expected EAGAIN, got {other:?}"),
         }
@@ -273,7 +332,7 @@ mod tests {
         let _g = setup();
         let cap = eventfd_create(42, 0).expect("create");
         let mut buf = [0xFFu8; 8];
-        match step_eventfd_read(&cap, &mut buf, false) {
+        match step_eventfd_read_with_post(&cap, &mut buf, false, direct_post) {
             StepOutcome::Done(n) => {
                 assert_eq!(n, 8);
                 assert_eq!(u64::from_le_bytes(buf), 42);
@@ -287,7 +346,10 @@ mod tests {
     fn write_adds_to_counter() {
         let _g = setup();
         let cap = eventfd_create(10, 0).expect("create");
-        assert_eq!(step_eventfd_write(&cap, 5, false), StepOutcome::done(()));
+        assert_eq!(
+            step_eventfd_write_with_post(&cap, 5, false, direct_post),
+            StepOutcome::done(())
+        );
         assert_eq!(cap.counter(), 15);
     }
 
@@ -295,9 +357,12 @@ mod tests {
     fn write_read_roundtrip() {
         let _g = setup();
         let cap = eventfd_create(0, 0).expect("create");
-        assert_eq!(step_eventfd_write(&cap, 7, false), StepOutcome::done(()));
+        assert_eq!(
+            step_eventfd_write_with_post(&cap, 7, false, direct_post),
+            StepOutcome::done(())
+        );
         let mut buf = [0u8; 8];
-        match step_eventfd_read(&cap, &mut buf, false) {
+        match step_eventfd_read_with_post(&cap, &mut buf, false, direct_post) {
             StepOutcome::Done(8) => assert_eq!(u64::from_le_bytes(buf), 7),
             other => panic!("expected Done(8), got {other:?}"),
         }
@@ -308,7 +373,7 @@ mod tests {
         let _g = setup();
         let cap = eventfd_create(5, EFD_SEMAPHORE).expect("create");
         let mut buf = [0u8; 8];
-        match step_eventfd_read(&cap, &mut buf, false) {
+        match step_eventfd_read_with_post(&cap, &mut buf, false, direct_post) {
             StepOutcome::Done(8) => assert_eq!(u64::from_le_bytes(buf), 1),
             other => panic!("expected Done(8), got {other:?}"),
         }
@@ -320,7 +385,7 @@ mod tests {
         let _g = setup();
         let cap = eventfd_create(0, 0).expect("create");
         assert_eq!(
-            step_eventfd_write(&cap, 0, false),
+            step_eventfd_write_with_post(&cap, 0, false, direct_post),
             StepOutcome::Err(V3Errno::EINVAL)
         );
     }

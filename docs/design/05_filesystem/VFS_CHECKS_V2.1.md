@@ -465,7 +465,7 @@ pub(crate) async fn walk_to_completion(
     path: &[u8],
     root_ctx: &RootCtx,
 ) -> Result<OwnedWitness, Errno> {
-    let outer_guard = epoch::pin();
+    let mut outer_guard = epoch::guard();
     let initial = WalkState::init(path, root_ctx, &outer_guard)?;
     let mut step = run_walker(mode, initial, &outer_guard);
     loop {
@@ -475,7 +475,7 @@ pub(crate) async fn walk_to_completion(
             DriverStep::NeedIO(req, tok) => {
                 drop(outer_guard);
                 let result = yield_for_io(req).await;
-                outer_guard = epoch::pin();
+                outer_guard = epoch::guard();
                 step = resume_walker(mode, tok, result, &outer_guard);
             }
         }

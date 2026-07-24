@@ -7,7 +7,7 @@
 //! restriction-stack handle is also zone-allocated).
 //!
 //! One adapter domain: `step_engine` — bundles the step-v3 types,
-//! the epoch guard primitive, and `zone::sign`.
+//! the epoch guard primitive, and role-shaped zone allocation.
 
 use tx_platform_adapter::platform_adapter;
 
@@ -25,9 +25,6 @@ pub mod step_engine {
         ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
     };
     pub use tx_substrate::zone::{
-        register_zone_for, reserve_for, sign, sign_for, Cap, CapProducingPolicy, CoLocatedEntity,
-        Dead, Entity, IdentRef, IdentitySlot, IsPayloadPolicy, ObserverNodePolicy,
-        OperationalCapExt, OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy,
-        RetainedEntityPolicy, Weak, Zone, ZoneAllocated, ZoneError, ZonePolicy,
+        sign, Cap, Dead, Entity, PayloadCap, Weak, Zone, ZoneAllocated, ZoneError,
     };
 }

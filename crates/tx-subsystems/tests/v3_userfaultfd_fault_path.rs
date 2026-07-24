@@ -12,10 +12,10 @@
 //!    matching the bound `TaskMailbox` against the freshly-minted
 //!    `DelegateTokenId`. Spurious mailbox events for other tokens
 //!    are re-posted (not consumed).
-//! 3. When the agent thread drives `mark_replied(token_id,
+//! 3. When the agent thread drives the delegate reply transition for `token_id`
 //!    DelegateReply::Ufd(...))`, the faulting future resumes and
 //!    completes the publish path.
-//! 4. When the agent fails to reply and `mark_endpoint_died(ufd_id)`
+//! 4. When the agent fails to reply and the delegate endpoint-death transition for `ufd_id`
 //!    fires (the ufd was closed), the faulting future surfaces the
 //!    abort as `VmFaultError::WouldBlock` (phase 4 stub mapping;
 //!    phase 6 may add a dedicated `AgentDied` variant).
@@ -48,8 +48,9 @@ use tx_hal::{
     Asid, PhysAddr, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
     PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
 };
+use tx_substrate::wake::MailboxSchedulerHint;
 use tx_subsystems::vm::adapter::step_engine::{
-    DelegateReply, DelegateState, TaskMailbox, TransitionOutcome, UfdReply,
+    DelegateReply, DelegateState, MailboxEvent, TaskMailbox, TransitionOutcome, UfdReply,
 };
 
 use tx_subsystems::userfaultfd::UserfaultFd;
@@ -61,6 +62,20 @@ use tx_subsystems::vm::{
 use tx_subsystems::zones;
 
 static EPOCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn direct_ufd_ref_post_with_hint(
+    mailbox: &TaskMailbox,
+    event: MailboxEvent,
+    hint: MailboxSchedulerHint,
+) -> bool {
+    mailbox.post_with_scheduler_hint(event, hint)
+}
+
+fn direct_delegate_mailbox_post(mailbox: std::sync::Weak<TaskMailbox>, event: MailboxEvent) {
+    if let Some(mailbox) = mailbox.upgrade() {
+        let _ = mailbox.post(event);
+    }
+}
 
 // -------- Stub PMAP -------------------------------------------------
 
@@ -150,6 +165,7 @@ impl<'a> UfdDispatch for SingleUfdDispatch<'a> {
             mailbox: self.mailbox.clone(),
             // Phase-4 tests don't exercise the read-queue arm.
             fault_pusher: None,
+            fault_post: direct_ufd_ref_post_with_hint,
         })
     }
 }
@@ -158,7 +174,7 @@ impl<'a> UfdDispatch for SingleUfdDispatch<'a> {
 //
 // Single-task `poll`-based executor that runs the fault future to
 // completion (or yields back to the test thread on `Pending`). Lets
-// the test drive `mark_replied` between polls — modelling the
+// the test drive `delegate reply transition` between polls — modelling the
 // agent-side handler running on a separate reactor task. Mirrors the
 // pattern used by `crates/tx-shims/tests/v3_userfaultfd_register.rs`.
 
@@ -179,7 +195,7 @@ fn noop_waker() -> Waker {
 
 /// Poll the future once and return `Some(out)` on `Ready`; `None` on
 /// `Pending`. Used to step the fault future across the agent's
-/// `mark_replied`.
+/// `delegate reply transition`.
 fn poll_once<F: Future>(future: Pin<&mut F>) -> Option<F::Output> {
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
@@ -216,7 +232,7 @@ fn fresh_aspace_with_ufd_tagged_vma(ufd: &UserfaultFd, range_start: u64) -> Arc<
 }
 
 // =========================================================================
-// 1. Reply path: agent's mark_replied wakes the parked fault future.
+// 1. Reply path: agent's delegate reply transition wakes the parked fault future.
 // =========================================================================
 
 #[test]
@@ -263,17 +279,22 @@ fn fault_script_yields_on_agent_and_resumes_on_mark_replied() {
     );
 
     // Drive the agent-side reply.
-    let outcome = registry.mark_replied(
+    let outcome = registry.mark_replied_with_post(
         token_id,
         DelegateReply::Ufd(UfdReply::ZeroPage {
             dst_uaddr: 0x4000_0000,
             len: USER_PAGE_SIZE as u64,
         }),
+        direct_delegate_mailbox_post,
     );
     assert_eq!(outcome, TransitionOutcome::Applied);
     assert_eq!(registry.state(token_id), Some(DelegateState::Replied));
     // The mailbox should now hold the AgentReplied wake hint.
-    assert_eq!(mailbox.len(), 1, "mark_replied posts exactly one event");
+    assert_eq!(
+        mailbox.len(),
+        1,
+        "delegate reply transition posts exactly one event"
+    );
 
     // Poll the future again: drains the mailbox, takes the reply,
     // runs the materialize-and-publish tail.
@@ -342,7 +363,7 @@ fn await_agent_reply_repost_spurious_events_for_other_tokens() {
 }
 
 // =========================================================================
-// 3. mark_endpoint_died aborts the fault with AgentDied.
+// 3. delegate endpoint-death transition aborts the fault with AgentDied.
 // =========================================================================
 
 #[test]
@@ -374,7 +395,7 @@ fn fault_script_resolves_to_would_block_on_agent_died() {
     // endpoint-death routing — the same call path the ufd-close arm
     // will drive in phase 5.
     assert_eq!(registry.tracked_count(), 1);
-    let transitioned = registry.mark_endpoint_died(ufd_id);
+    let transitioned = registry.mark_endpoint_died_with_post(ufd_id, direct_delegate_mailbox_post);
     assert_eq!(transitioned, 1, "the one in-flight token must abort");
     assert_eq!(
         registry.state(DelegateTokenId::new(1)),

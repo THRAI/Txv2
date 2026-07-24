@@ -6,9 +6,45 @@ use crate::execution::Errno;
 use crate::process::structure::{ProcessIdentity, TargetProcCred};
 use crate::signal::adapter::step_engine::Cap;
 use crate::signal::{
-    script_kill_pgrp, script_kill_probe, script_kill_process, step_sigaction, KillScriptOutcome,
-    SigDisposition,
+    script_authorized_thread_exit_with_posts, script_kill_pgrp, script_kill_pgrp_probe,
+    script_kill_probe, script_kill_process, step_sigaction, KillOutcome, KillScriptOutcome,
+    SigDisposition, SignalTarget,
 };
+use crate::thread_runtime::adapter::step_engine::{MailboxEvent, TaskMailbox};
+
+fn explicit_test_mailbox_post(weak: alloc::sync::Weak<TaskMailbox>, event: MailboxEvent) {
+    let Some(mailbox) = weak.upgrade() else {
+        return;
+    };
+    let _ = mailbox.post(event);
+}
+
+fn finish_process_group_for_test(
+    process: &Cap<ProcessIdentity>,
+    status: crate::process::ExitStatus,
+) {
+    crate::process::step_exit_group_with_posts(
+        process,
+        status,
+        explicit_test_mailbox_post,
+        |mailbox, event| mailbox.post(event),
+    );
+}
+
+fn deliver_signal_for_test(
+    source: &Cap<ProcessIdentity>,
+    target: SignalTarget,
+    sig: Signum,
+    info: Option<crate::signal::SigInfo>,
+) -> Result<crate::signal::KillOutcome, Errno> {
+    crate::signal::script_deliver_signal_with_post(
+        source,
+        target,
+        sig,
+        info,
+        explicit_test_mailbox_post,
+    )
+}
 
 fn set_cred(proc_cap: &Cap<ProcessIdentity>, cred: Cred) {
     // PR-9 phase 5 (D5 Path A): `cred` lives in `AtomicSlot<Cap<Cred>>`.
@@ -195,7 +231,7 @@ fn script_kill_process_zombie_target_returns_no_live_thread() {
     let parent = fresh_init();
     let child =
         crate::process::step_fork::<crate::vm::TestPmap>(&parent, false, false).expect("fork");
-    crate::process::step_exit_group(&child, ExitStatus::Exited(0));
+    finish_process_group_for_test(&child, ExitStatus::Exited(0));
 
     // Even without permission, target_proc_cred returns None for
     // a zombie, short-circuiting before the cred check.
@@ -209,7 +245,7 @@ fn script_kill_process_zombie_source_returns_esrch() {
     let parent = fresh_init();
     let child =
         crate::process::step_fork::<crate::vm::TestPmap>(&parent, false, false).expect("fork");
-    crate::process::step_exit_group(&parent, ExitStatus::Exited(0));
+    finish_process_group_for_test(&parent, ExitStatus::Exited(0));
 
     let outcome = script_kill_process(&parent, &child, Signum::SIGTERM, None);
     assert_eq!(outcome, Err(Errno::ESRCH));
@@ -256,6 +292,36 @@ fn script_kill_pgrp_partial_permission_returns_count_of_permitted() {
 }
 
 #[test]
+fn script_kill_pgrp_probe_partial_permission_counts_without_delivery() {
+    let _g = setup();
+    let parent = fresh_init();
+    let child_a =
+        crate::process::step_fork::<crate::vm::TestPmap>(&parent, false, false).expect("fork a");
+    let child_b =
+        crate::process::step_fork::<crate::vm::TestPmap>(&parent, false, false).expect("fork b");
+
+    set_cred(&parent, limited_cred(1000));
+    set_cred(&child_a, limited_cred(1000));
+    set_cred(&child_b, limited_cred(2000));
+
+    let pgrp = parent.pgrp_cap();
+    let permitted = script_kill_pgrp_probe(&parent, &pgrp).expect("source is live");
+    assert_eq!(permitted, 2);
+
+    let pending_on = |proc: &Cap<ProcessIdentity>| {
+        let payload = proc.payload.lock();
+        payload
+            .as_ref()
+            .and_then(|p| p.threads.nth(0))
+            .and_then(|thread| thread.payload_cap())
+            .is_some_and(|tp| tp.pending().is_pending(Signum::SIGTERM))
+    };
+    assert!(!pending_on(&parent), "source probe must not post");
+    assert!(!pending_on(&child_a), "permitted probe must not post");
+    assert!(!pending_on(&child_b), "denied probe must not post");
+}
+
+#[test]
 fn authorize_signal_send_yields_three_state_outcome() {
     // Pin the three-state contract of `cred::checks::authorize_signal_send`:
     //   • same uid                  → Ok(Authorized)
@@ -286,7 +352,7 @@ fn authorize_signal_send_yields_three_state_outcome() {
     );
 
     // Zombie target: re-bootstrap a fresh child, reap it, and check.
-    crate::process::step_exit_group(&child, crate::process::ExitStatus::Exited(0));
+    finish_process_group_for_test(&child, crate::process::ExitStatus::Exited(0));
     assert_eq!(
         authorize_signal_send(&parent, &child, Signum::SIGTERM),
         Ok(AuthOutcome::NoLiveTarget),
@@ -295,7 +361,7 @@ fn authorize_signal_send_yields_three_state_outcome() {
     // Zombie source.
     let live_target =
         crate::process::step_fork::<crate::vm::TestPmap>(&parent, false, false).expect("fork");
-    crate::process::step_exit_group(&parent, crate::process::ExitStatus::Exited(0));
+    finish_process_group_for_test(&parent, crate::process::ExitStatus::Exited(0));
     assert_eq!(
         authorize_signal_send(&parent, &live_target, Signum::SIGTERM),
         Err(Errno::ESRCH),
@@ -304,7 +370,7 @@ fn authorize_signal_send_yields_three_state_outcome() {
 
 #[test]
 fn script_deliver_signal_to_thread_denied_for_mismatched_uid() {
-    use crate::signal::{script_deliver_signal, KillOutcome, SignalTarget};
+    use crate::signal::{KillOutcome, SignalTarget};
 
     let _g = setup();
     let parent = fresh_init();
@@ -324,7 +390,7 @@ fn script_deliver_signal_to_thread_denied_for_mismatched_uid() {
     };
 
     let outcome =
-        script_deliver_signal(&parent, SignalTarget::Thread(leader), Signum::SIGTERM, None);
+        deliver_signal_for_test(&parent, SignalTarget::Thread(leader), Signum::SIGTERM, None);
     assert_eq!(outcome, Err(Errno::EPERM));
 
     // No post should have happened — verify the child's leader has
@@ -341,7 +407,7 @@ fn script_deliver_signal_to_thread_denied_for_mismatched_uid() {
 
 #[test]
 fn script_deliver_signal_to_thread_delivers_when_authorized() {
-    use crate::signal::{script_deliver_signal, KillOutcome, SignalTarget};
+    use crate::signal::{KillOutcome, SignalTarget};
 
     let _g = setup();
     let parent = fresh_init();
@@ -356,14 +422,112 @@ fn script_deliver_signal_to_thread_delivers_when_authorized() {
     };
 
     let outcome =
-        script_deliver_signal(&parent, SignalTarget::Thread(leader), Signum::SIGTERM, None);
+        deliver_signal_for_test(&parent, SignalTarget::Thread(leader), Signum::SIGTERM, None);
     assert_eq!(outcome, Ok(KillOutcome::Delivered));
+}
+
+#[test]
+fn authorized_thread_exit_denies_mismatched_uid_without_posts() {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    let _g = setup();
+    let parent = fresh_init();
+    let child =
+        crate::process::step_fork::<crate::vm::TestPmap>(&parent, false, false).expect("fork");
+    let leader = child.nth_thread(0).expect("child leader");
+    set_cred(&parent, limited_cred(1000));
+    set_cred(&child, limited_cred(2000));
+    let posts = AtomicUsize::new(0);
+
+    let outcome = script_authorized_thread_exit_with_posts(
+        &parent,
+        &leader,
+        Signum::new(33).expect("SIGCANCEL"),
+        |_, _| {
+            posts.fetch_add(1, Ordering::SeqCst);
+        },
+        |_, _| {
+            posts.fetch_add(1, Ordering::SeqCst);
+            true
+        },
+    );
+
+    assert_eq!(outcome, Err(Errno::EPERM));
+    assert_eq!(posts.load(Ordering::SeqCst), 0);
+    assert!(!child.is_zombie());
+    assert!(!leader.is_zombie());
+}
+
+#[test]
+fn authorized_thread_exit_completed_maps_to_delivered() {
+    let _g = setup();
+    let parent = fresh_init();
+    let child =
+        crate::process::step_fork::<crate::vm::TestPmap>(&parent, false, false).expect("fork");
+    let leader = child.nth_thread(0).expect("child leader");
+    let sigcancel = Signum::new(33).expect("SIGCANCEL");
+
+    let outcome = script_authorized_thread_exit_with_posts(
+        &parent,
+        &leader,
+        sigcancel,
+        explicit_test_mailbox_post,
+        |mailbox, event| mailbox.post(event),
+    );
+
+    assert_eq!(outcome, Ok(KillOutcome::Delivered));
+    assert!(child.is_zombie());
+    assert_eq!(child.terminating_signal(), Some(sigcancel));
+}
+
+#[test]
+fn authorized_thread_exit_exec_reservation_maps_to_retry() {
+    let _g = setup();
+    let parent = fresh_init();
+    let child =
+        crate::process::step_fork::<crate::vm::TestPmap>(&parent, false, false).expect("fork");
+    let leader = child.nth_thread(0).expect("child leader");
+    let exec_prep = crate::process::ProcessExecPrep::begin(&child, &leader)
+        .expect("reserve child exec lifecycle");
+
+    let outcome = script_authorized_thread_exit_with_posts(
+        &parent,
+        &leader,
+        Signum::new(33).expect("SIGCANCEL"),
+        explicit_test_mailbox_post,
+        |mailbox, event| mailbox.post(event),
+    );
+
+    assert_eq!(outcome, Ok(KillOutcome::Retry));
+    assert!(!child.is_zombie());
+    assert!(!leader.is_zombie());
+    drop(exec_prep);
+}
+
+#[test]
+fn authorized_thread_exit_dead_target_maps_to_no_live_thread() {
+    let _g = setup();
+    let parent = fresh_init();
+    let child =
+        crate::process::step_fork::<crate::vm::TestPmap>(&parent, false, false).expect("fork");
+    let leader = child.nth_thread(0).expect("child leader");
+    finish_process_group_for_test(&child, ExitStatus::Exited(0));
+
+    let outcome = script_authorized_thread_exit_with_posts(
+        &parent,
+        &leader,
+        Signum::new(33).expect("SIGCANCEL"),
+        explicit_test_mailbox_post,
+        |mailbox, event| mailbox.post(event),
+    );
+
+    assert_eq!(outcome, Ok(KillOutcome::NoLiveThread));
 }
 
 #[test]
 fn script_deliver_signal_to_thread_posts_to_requested_tid() {
     use crate::process::execution::spawn_sibling_thread_for_test;
-    use crate::signal::{script_deliver_signal, KillOutcome, SignalTarget};
+    use crate::signal::{KillOutcome, SignalTarget};
 
     let _g = setup();
     let proc = fresh_init();
@@ -375,7 +539,7 @@ fn script_deliver_signal_to_thread_posts_to_requested_tid() {
     let sibling = spawn_sibling_thread_for_test(&proc).expect("sibling thread");
     step_sigaction(&proc, Signum::SIGTERM, SigDisposition::Handler(0xCAFE_F00D));
 
-    let outcome = script_deliver_signal(
+    let outcome = deliver_signal_for_test(
         &proc,
         SignalTarget::Thread(sibling.clone()),
         Signum::SIGTERM,

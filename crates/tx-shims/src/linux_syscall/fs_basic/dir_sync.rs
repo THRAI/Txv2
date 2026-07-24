@@ -163,10 +163,7 @@ pub(in crate::linux_syscall) async fn sys_getdents64<'a>(
 pub(in crate::linux_syscall) fn fs_ops_for_rnode(
     rnode: &Cap<tx_subsystems::vfs::structure::RNode>,
 ) -> Option<Arc<dyn tx_subsystems::vfs::FsOps>> {
-    let guard = step_engine::guard();
-    let weak = rnode.containing_mount_weak()?;
-    let payload = weak.upgrade(&guard)?;
-    Some(payload.fs_ops.clone())
+    MountedNode::from_rnode_direct(rnode).map(|mounted| mounted.fs_ops())
 }
 
 /// `statfs(path, buf)`. Linux RV64 ABI `__NR_statfs = 43`.
@@ -230,15 +227,12 @@ pub(in crate::linux_syscall) async fn sys_syncfs<P: PmapIf>(
         Some(f) => f,
         None => return SyscallResult::Error(EBADF_VALUE),
     };
-    let guard = step_engine::guard();
     let rnode = open_file.rnode();
-    let page_backing = match rnode
-        .containing_mount_weak()
-        .and_then(|w| w.upgrade(&guard))
-    {
-        Some(mp) => mp.fs_page_backing().clone(),
+    let page_backing = match MountedNode::from_rnode_direct(rnode) {
+        Some(mounted) => mounted.fs_page_backing(),
         None => return SyscallResult::Error(ENODEV_VALUE),
     };
+    let guard = step_engine::guard();
     // syncfs: flush the entire filesystem. The default impl falls back
     // to `fsync_file(ROOT)`; journaling filesystems can override.
     match page_backing.sync_filesystem(&guard) {
@@ -262,16 +256,13 @@ pub(in crate::linux_syscall) async fn sys_fsync<P: PmapIf>(
     };
     let rnode = open_file.rnode();
     let fs_object_id = rnode.fs_object_id();
-    // The mount-weak upgrade and the page-backing clone are done inside
-    // a scoped guard so no guard crosses the subsequent
+    let page_container = crate::linux_syscall::vm::extract_page_container(&open_file);
+    // `MountedNode` scopes the mount-weak upgrade to the helper call and
+    // returns a cloned page-backing handle, so no guard crosses the subsequent
     // `drive(...).await` (INVARIANTS_v5 EBR-7).
     let page_backing = {
-        let guard = step_engine::guard();
-        match rnode
-            .containing_mount_weak()
-            .and_then(|w| w.upgrade(&guard))
-        {
-            Some(mp) => mp.fs_page_backing().clone(),
+        match MountedNode::from_rnode_direct(rnode) {
+            Some(mounted) => mounted.fs_page_backing(),
             None => return SyscallResult::Error(ENODEV_VALUE),
         }
     };
@@ -280,10 +271,12 @@ pub(in crate::linux_syscall) async fn sys_fsync<P: PmapIf>(
     use tx_scripts::drive;
     let mut script_ctx = build_subject_script_ctx(ctx);
     let mailbox_arc = script_ctx.mailbox().cloned();
-    let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+    let timer_registrar_handle = script_ctx.timer_registrar().cloned();
     let op = FileFsyncOp {
         page_backing,
         fs_object_id,
+        page_container,
+        state: tx_subsystems::page_backed::FileFsyncState::new(),
     };
     match drive(
         op,
@@ -291,7 +284,7 @@ pub(in crate::linux_syscall) async fn sys_fsync<P: PmapIf>(
         DriveMode::Waiting,
         mailbox_arc.as_ref(),
         None,
-        timer_wheel_arc.as_ref(),
+        timer_registrar_handle.as_ref(),
     )
     .await
     {

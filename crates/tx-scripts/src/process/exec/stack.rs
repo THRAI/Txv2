@@ -29,17 +29,16 @@
 //! `AT_NULL`. Later arch/runtime entries are emitted when present; absent
 //! optional pointer entries are omitted, not encoded with null values.
 
-use alloc::vec;
 use alloc::vec::Vec;
 
 // ---------------------------------------------------------------------------
 // Auxv `a_type` constants. Linux RV64 generic ABI; the values are stable
 // across architectures (defined in <elf.h> / <linux/auxvec.h>).
 //
-// TODO(phase-goblin-share): once Phase 4 lands the goblin dep, share these
-// with `goblin::elf::auxv` instead of hardcoding. The numeric values are
-// frozen by the Linux uABI, so the hardcoded constants here are
-// definitionally identical.
+// These tx-owned local keys define the Linux uABI serialization boundary:
+// `AuxvFacts` supplies values, and the stack builder emits key/value pairs.
+// The numeric values are frozen by the Linux uABI and remain independent of
+// the ELF syntax parser backend.
 // ---------------------------------------------------------------------------
 
 const AT_NULL: u64 = 0;
@@ -83,9 +82,9 @@ const STACK_ALIGN: usize = 16;
 /// `AT_UID`, `AT_EUID`, `AT_GID`, `AT_EGID`, and `AT_SECURE`. The
 /// drift-cleanup chore (2026-05-07) grew it from 11 to 13 by adding
 /// `AT_BASE` and `AT_ENTRY`; both pairs target musl's
-/// `__libc_start_main`, which reads `AT_ENTRY` to detect a non-canonical
-/// entry point and `AT_BASE` to recognise interpreter-loaded binaries
-/// (always `0` for v1's static-`ET_EXEC` contract). Each new pair is
+/// `__libc_start_main`, which reads `AT_ENTRY` as the main executable's
+/// entry and `AT_BASE` as the interpreter load bias (zero when no
+/// interpreter is present). Each new pair is
 /// 16 bytes, so the upper-table region grew by 7 × 16 = 112 bytes
 /// over the pre-Part-6 baseline; the existing alignment helper handles
 /// the size change automatically.
@@ -109,21 +108,34 @@ pub struct UserStackImage {
     pub bytes: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StackBuildError {
+    OutOfMemory,
+    InvalidString,
+    InvalidLayout,
+}
+
+fn try_zeroed_stack_bytes(len: usize) -> Result<Vec<u8>, StackBuildError> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(len)
+        .map_err(|_| StackBuildError::OutOfMemory)?;
+    bytes.resize(len, 0);
+    Ok(bytes)
+}
+
 /// Auxiliary-vector facts the loader knows after parsing the ELF.
 ///
 /// (`AT_PHDR`, `AT_PHENT`, `AT_PHNUM`) come from the ELF header and
 /// the `PT_PHDR` phdr (or the loader's fallback computation per
 /// `txdoc:EXEC-8-6-AT-PHDR-COMPUTATION`); `AT_PAGESZ` is the
 /// platform's user page size (4096 on RV64 today). The cred-derived
-/// fields (`at_uid`, `at_euid`, `at_gid`, `at_egid`, `at_secure`)
-/// land in Wave 3 Part 6 of the DAC + setuid slice; the `at_secure`
-/// flag is hardcoded to `0` until Wave 4's setuid recompute helper
-/// (`step_apply_suid_for_exec`) ships and toggles it on when the
-/// binary's `S_ISUID` / `S_ISGID` bit caused the effective uid or
-/// gid to change at exec time.
-pub struct AuxvFacts {
-    /// Virtual address of the program-header table (after load bias,
-    /// which is zero for static-`ET_EXEC` v1).
+/// fields (`at_uid`, `at_euid`, `at_gid`, `at_egid`, `at_secure`) reflect
+/// the post-`step_apply_suid_for_exec` credentials and whether setuid/setgid
+/// changed an effective id.
+pub struct AuxvFacts<'a> {
+    /// Virtual address of the program-header table after load bias. `ET_EXEC`
+    /// images retain their fixed addresses and therefore have zero bias.
     pub at_phdr: u64,
     /// Size of one program header. Always 56 on RV64 ELF64.
     pub at_phent: u64,
@@ -131,15 +143,13 @@ pub struct AuxvFacts {
     pub at_phnum: u64,
     /// Page size. 4096 on RV64.
     pub at_pagesz: u64,
-    /// Base address of the dynamic interpreter, or `0` for statically
-    /// linked `ET_EXEC` binaries (the v1 contract; see `EXEC_v1.md`'s
-    /// "static-only" note). musl's `__libc_start_main` reads this to
-    /// distinguish self-relocated dynamic loads from static-EXEC.
+    /// Dynamic interpreter load bias, or `0` when no interpreter is
+    /// present. musl's `__libc_start_main` reads this to distinguish
+    /// interpreter-loaded binaries from static execution.
     pub at_base: u64,
-    /// Entry point of the loaded program — exactly the value that
-    /// goes into the user trap frame's PC. Mirrors the ELF header's
-    /// `e_entry` for static-`ET_EXEC`; carries the interpreter's
-    /// entry point for the future dynamic-link path.
+    /// Main executable entry after load-bias rebasing. For dynamic exec,
+    /// `AT_ENTRY` remains the main entry while the initial user PC is the
+    /// interpreter entry; those two addresses are intentionally distinct.
     pub at_entry: u64,
     /// Real user id at exec time (caller's `cred.uid`). Read by musl's
     /// `__init_security` to populate `__libc.secure` alongside
@@ -158,9 +168,8 @@ pub struct AuxvFacts {
     /// (i.e. the effective uid or gid changed at exec); `0` otherwise.
     /// Used by libssp / musl to harden the runtime: clear
     /// `LD_PRELOAD`-equivalent env, force allocator hardening, etc.
-    /// Wave 3 ships this hardcoded to `0`; Wave 4's
-    /// `step_apply_suid_for_exec` is what sets it to `1` when the
-    /// recompute changed the effective ids.
+    /// `step_apply_suid_for_exec` sets it to `1` when credential recomputation
+    /// changes an effective id.
     pub at_secure: u64,
     /// 16 random bytes for the AT_RANDOM auxv slot. musl's
     /// `__init_ssp` reads exactly 16 bytes through this pointer to
@@ -172,13 +181,12 @@ pub struct AuxvFacts {
     pub at_random_bytes: [u8; 16],
     pub at_hwcap: u64,
     pub at_hwcap2: u64,
-    pub at_platform: Option<u64>,
-    pub platform_string: &'static [u8],
+    pub platform_string: &'a [u8],
     pub at_clktck: u64,
-    pub at_execfn: Option<u64>,
-    pub execfn_string: &'static [u8],
+    pub execfn_string: &'a [u8],
     pub at_flags: u64,
     pub at_sysinfo_ehdr: Option<u64>,
+    pub user_top: u64,
 }
 
 /// Build the initial userspace stack image for execve.
@@ -210,6 +218,8 @@ pub struct AuxvFacts {
 ///   ┌──────────────────────────────────┐  stack_top
 ///   │   string pool (envp strings)     │
 ///   │   string pool (argv strings)     │
+///   │   AT_EXECFN C string              │
+///   │   AT_PLATFORM C string            │
 ///   │   16-byte AT_RANDOM region       │
 ///   │   (16-byte alignment padding)    │
 ///   ├──────────────────────────────────┤
@@ -246,7 +256,32 @@ pub fn build_initial_user_stack(
     argv: &[&[u8]],
     envp: &[&[u8]],
     auxv_facts: &AuxvFacts,
-) -> UserStackImage {
+) -> Result<UserStackImage, StackBuildError> {
+    if stack_top == 0 || stack_top > auxv_facts.user_top {
+        return Err(StackBuildError::InvalidLayout);
+    }
+    if auxv_facts.platform_string.contains(&0)
+        || auxv_facts.execfn_string.contains(&0)
+        || argv.iter().any(|string| string.contains(&0))
+        || envp.iter().any(|string| string.contains(&0))
+    {
+        return Err(StackBuildError::InvalidString);
+    }
+
+    let checked_cstring_len = |bytes: &[u8]| {
+        bytes
+            .len()
+            .checked_add(1)
+            .ok_or(StackBuildError::InvalidLayout)
+    };
+    let checked_strings_len = |strings: &[&[u8]]| {
+        strings.iter().try_fold(0usize, |total, string| {
+            total
+                .checked_add(checked_cstring_len(string)?)
+                .ok_or(StackBuildError::InvalidLayout)
+        })
+    };
+
     // ---- 1. CVE-2021-4034 dummy argv[0] synthesis ------------------------
     //
     // The synthetic empty argv[0] keeps userspace away from the
@@ -262,15 +297,23 @@ pub fn build_initial_user_stack(
     //
     // Each string lands in the pool with a trailing NUL byte. We do
     // not deduplicate.
-    let mut argv_string_total: usize = 0;
-    for s in argv_view {
-        argv_string_total += s.len() + 1;
-    }
-    let mut envp_string_total: usize = 0;
-    for s in envp {
-        envp_string_total += s.len() + 1;
-    }
-    let string_pool_size = argv_string_total + envp_string_total;
+    let argv_string_total = checked_strings_len(argv_view)?;
+    let envp_string_total = checked_strings_len(envp)?;
+    let platform_string_total = if auxv_facts.platform_string.is_empty() {
+        0
+    } else {
+        checked_cstring_len(auxv_facts.platform_string)?
+    };
+    let execfn_string_total = if auxv_facts.execfn_string.is_empty() {
+        0
+    } else {
+        checked_cstring_len(auxv_facts.execfn_string)?
+    };
+    let string_pool_size = argv_string_total
+        .checked_add(envp_string_total)
+        .and_then(|total| total.checked_add(platform_string_total))
+        .and_then(|total| total.checked_add(execfn_string_total))
+        .ok_or(StackBuildError::InvalidLayout)?;
 
     // ---- 3. Compute the upper-table size --------------------------------
     //
@@ -278,15 +321,27 @@ pub fn build_initial_user_stack(
     //
     // The auxv reservation is fixed at `AUXV_PAIR_COUNT`; the actual
     // emitted list can be shorter when optional pointer facts are absent.
-    let upper_table_size = WORD_SIZE                   // argc
-        + (argc + 1) * WORD_SIZE                       // argv ptrs + NULL
-        + (envc + 1) * WORD_SIZE                       // envp ptrs + NULL
-        + AUXV_PAIR_COUNT * AUXV_PAIR_SIZE; // auxv
+    let argv_pointer_bytes = argc
+        .checked_add(1)
+        .and_then(|count| count.checked_mul(WORD_SIZE))
+        .ok_or(StackBuildError::InvalidLayout)?;
+    let envp_pointer_bytes = envc
+        .checked_add(1)
+        .and_then(|count| count.checked_mul(WORD_SIZE))
+        .ok_or(StackBuildError::InvalidLayout)?;
+    let auxv_bytes = AUXV_PAIR_COUNT
+        .checked_mul(AUXV_PAIR_SIZE)
+        .ok_or(StackBuildError::InvalidLayout)?;
+    let upper_table_size = WORD_SIZE
+        .checked_add(argv_pointer_bytes)
+        .and_then(|size| size.checked_add(envp_pointer_bytes))
+        .and_then(|size| size.checked_add(auxv_bytes))
+        .ok_or(StackBuildError::InvalidLayout)?;
 
     // ---- 4. Compute total bytes and 16-byte alignment padding ------------
     //
     // Layout (high → low):
-    //   string_pool    (envp strings then argv strings)
+    //   string_pool    (envp, argv, execfn, platform strings)
     //   AT_RANDOM      (16 bytes, also 16-byte aligned)
     //   pad            (so initial_sp = stack_top - total ends up 16-aligned)
     //   upper_table    (argc + ptrs + auxv)
@@ -296,23 +351,35 @@ pub fn build_initial_user_stack(
     // (and therefore 16-byte aligned) — but we do not lean on that
     // assumption: we compute padding from `stack_top` modulo 16
     // explicitly.
-    let unpadded = upper_table_size + AT_RANDOM_REGION_SIZE + string_pool_size;
-    let stack_top_mod = (stack_top as usize) & (STACK_ALIGN - 1);
+    let unpadded = upper_table_size
+        .checked_add(AT_RANDOM_REGION_SIZE)
+        .and_then(|size| size.checked_add(string_pool_size))
+        .ok_or(StackBuildError::InvalidLayout)?;
+    let stack_top_mod = usize::try_from(stack_top & (STACK_ALIGN as u64 - 1))
+        .map_err(|_| StackBuildError::InvalidLayout)?;
     // We need (stack_top - total) mod 16 == 0
     //   <=> total mod 16 == stack_top mod 16
     let need = stack_top_mod;
     let have = unpadded & (STACK_ALIGN - 1);
     let pad = (need + STACK_ALIGN - have) & (STACK_ALIGN - 1);
-    let total = unpadded + pad;
-
-    let initial_sp = stack_top - total as u64;
-    debug_assert!(initial_sp.is_multiple_of(STACK_ALIGN as u64));
+    let total = unpadded
+        .checked_add(pad)
+        .ok_or(StackBuildError::InvalidLayout)?;
+    let total_u64 = u64::try_from(total).map_err(|_| StackBuildError::InvalidLayout)?;
+    let initial_sp = stack_top
+        .checked_sub(total_u64)
+        .ok_or(StackBuildError::InvalidLayout)?;
+    if !initial_sp.is_multiple_of(STACK_ALIGN as u64)
+        || initial_sp >= auxv_facts.user_top
+        || initial_sp.checked_add(total_u64) != Some(stack_top)
+    {
+        return Err(StackBuildError::InvalidLayout);
+    }
 
     // ---- 5. Compute key user-VA addresses --------------------------------
     //
     // String-pool layout (low → high addresses):
-    //   [argv_pool_base, argv_pool_base + argv_string_total)
-    //   [envp_pool_base, envp_pool_base + envp_string_total)
+    //   platform, execfn, argv, envp.
     //
     // Sitting just below the AT_RANDOM region, which sits at
     //   [stack_top - AT_RANDOM_REGION_SIZE, stack_top).
@@ -323,6 +390,8 @@ pub fn build_initial_user_stack(
     //     stack_top
     //     [envp strings]
     //     [argv strings]
+    //     [AT_EXECFN]
+    //     [AT_PLATFORM]
     //     [AT_RANDOM 16B]
     //     [pad]
     //     [upper_table]
@@ -331,38 +400,77 @@ pub fn build_initial_user_stack(
     // in the pool is irrelevant as long as the auxv entry's a_val
     // points at 16 contiguous bytes. We pin the layout above for
     // determinism. The string pool occupies the topmost bytes; the
-    // AT_RANDOM region sits just below the argv strings (i.e. between
-    // pad and argv_pool_base).
+    // AT_RANDOM region sits below all four string groups.
     //
     // Concretely:
     //   envp_pool_top  = stack_top
     //   envp_pool_base = envp_pool_top - envp_string_total
     //   argv_pool_top  = envp_pool_base
     //   argv_pool_base = argv_pool_top - argv_string_total
-    //   at_random_top  = argv_pool_base
+    //   execfn_pool_top = argv_pool_base
+    //   execfn_pool_base = execfn_pool_top - execfn_string_total
+    //   platform_pool_top = execfn_pool_base
+    //   platform_pool_base = platform_pool_top - platform_string_total
+    //   at_random_top  = platform_pool_base
     //   at_random_base = at_random_top - AT_RANDOM_REGION_SIZE
     //
     // upper_table_top    = at_random_base - pad
     // upper_table_base   = upper_table_top - upper_table_size
     //                    = initial_sp
     let envp_pool_top = stack_top;
-    let envp_pool_base = envp_pool_top - envp_string_total as u64;
+    let envp_pool_base = envp_pool_top
+        .checked_sub(u64::try_from(envp_string_total).map_err(|_| StackBuildError::InvalidLayout)?)
+        .ok_or(StackBuildError::InvalidLayout)?;
     let argv_pool_top = envp_pool_base;
-    let argv_pool_base = argv_pool_top - argv_string_total as u64;
-    let at_random_top = argv_pool_base;
-    let at_random_base = at_random_top - AT_RANDOM_REGION_SIZE as u64;
+    let argv_pool_base = argv_pool_top
+        .checked_sub(u64::try_from(argv_string_total).map_err(|_| StackBuildError::InvalidLayout)?)
+        .ok_or(StackBuildError::InvalidLayout)?;
+    let execfn_pool_top = argv_pool_base;
+    let execfn_pool_base = execfn_pool_top
+        .checked_sub(
+            u64::try_from(execfn_string_total).map_err(|_| StackBuildError::InvalidLayout)?,
+        )
+        .ok_or(StackBuildError::InvalidLayout)?;
+    let platform_pool_top = execfn_pool_base;
+    let platform_pool_base = platform_pool_top
+        .checked_sub(
+            u64::try_from(platform_string_total).map_err(|_| StackBuildError::InvalidLayout)?,
+        )
+        .ok_or(StackBuildError::InvalidLayout)?;
+    let at_random_top = platform_pool_base;
+    let at_random_base = at_random_top
+        .checked_sub(AT_RANDOM_REGION_SIZE as u64)
+        .ok_or(StackBuildError::InvalidLayout)?;
+    let at_platform = (!auxv_facts.platform_string.is_empty()).then_some(platform_pool_base);
+    let at_execfn = (!auxv_facts.execfn_string.is_empty()).then_some(execfn_pool_base);
+    if at_random_base < initial_sp
+        || at_random_base >= auxv_facts.user_top
+        || [at_platform, at_execfn]
+            .into_iter()
+            .flatten()
+            .any(|address| address < initial_sp || address >= auxv_facts.user_top)
+    {
+        return Err(StackBuildError::InvalidLayout);
+    }
 
     // ---- 6. Allocate the kernel buffer ----------------------------------
     //
     // `bytes[0]` corresponds to `initial_sp` (the lowest byte we
     // emit). `bytes[total - 1]` corresponds to `stack_top - 1`.
-    let mut bytes: Vec<u8> = vec![0u8; total];
+    let mut bytes = try_zeroed_stack_bytes(total)?;
 
     // Helper: write a u64 (little-endian) at offset `off` in `bytes`.
     // RV64 is little-endian; psABI fixes `Elf64_addr`/`Elf64_xword`
     // as LE on RISC-V.
-    fn write_u64(bytes: &mut [u8], off: usize, v: u64) {
-        bytes[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    fn write_u64(bytes: &mut [u8], off: usize, v: u64) -> Result<(), StackBuildError> {
+        let end = off
+            .checked_add(WORD_SIZE)
+            .ok_or(StackBuildError::InvalidLayout)?;
+        bytes
+            .get_mut(off..end)
+            .ok_or(StackBuildError::InvalidLayout)?
+            .copy_from_slice(&v.to_le_bytes());
+        Ok(())
     }
 
     // ---- 7. Write the upper table (argc, argv ptrs, envp ptrs, auxv) ----
@@ -371,33 +479,61 @@ pub fn build_initial_user_stack(
     let mut off: usize = 0;
 
     // argc
-    write_u64(&mut bytes, off, argc as u64);
-    off += WORD_SIZE;
+    write_u64(
+        &mut bytes,
+        off,
+        u64::try_from(argc).map_err(|_| StackBuildError::InvalidLayout)?,
+    )?;
+    off = off
+        .checked_add(WORD_SIZE)
+        .ok_or(StackBuildError::InvalidLayout)?;
 
     // argv pointers — point into the string pool; layout the strings
     // densely starting at `argv_pool_base`.
     let mut argv_string_cursor = argv_pool_base;
     for s in argv_view {
-        write_u64(&mut bytes, off, argv_string_cursor);
-        off += WORD_SIZE;
-        argv_string_cursor += (s.len() + 1) as u64;
+        write_u64(&mut bytes, off, argv_string_cursor)?;
+        off = off
+            .checked_add(WORD_SIZE)
+            .ok_or(StackBuildError::InvalidLayout)?;
+        argv_string_cursor = argv_string_cursor
+            .checked_add(
+                u64::try_from(checked_cstring_len(s)?)
+                    .map_err(|_| StackBuildError::InvalidLayout)?,
+            )
+            .ok_or(StackBuildError::InvalidLayout)?;
     }
     // argv NULL terminator
-    write_u64(&mut bytes, off, 0);
-    off += WORD_SIZE;
-    debug_assert!(argv_string_cursor == argv_pool_top);
+    write_u64(&mut bytes, off, 0)?;
+    off = off
+        .checked_add(WORD_SIZE)
+        .ok_or(StackBuildError::InvalidLayout)?;
+    if argv_string_cursor != argv_pool_top {
+        return Err(StackBuildError::InvalidLayout);
+    }
 
     // envp pointers
     let mut envp_string_cursor = envp_pool_base;
     for s in envp {
-        write_u64(&mut bytes, off, envp_string_cursor);
-        off += WORD_SIZE;
-        envp_string_cursor += (s.len() + 1) as u64;
+        write_u64(&mut bytes, off, envp_string_cursor)?;
+        off = off
+            .checked_add(WORD_SIZE)
+            .ok_or(StackBuildError::InvalidLayout)?;
+        envp_string_cursor = envp_string_cursor
+            .checked_add(
+                u64::try_from(checked_cstring_len(s)?)
+                    .map_err(|_| StackBuildError::InvalidLayout)?,
+            )
+            .ok_or(StackBuildError::InvalidLayout)?;
     }
     // envp NULL terminator
-    write_u64(&mut bytes, off, 0);
-    off += WORD_SIZE;
-    debug_assert!(envp_string_cursor == envp_pool_top);
+    write_u64(&mut bytes, off, 0)?;
+    off = off
+        .checked_add(WORD_SIZE)
+        .ok_or(StackBuildError::InvalidLayout)?;
+    if envp_string_cursor != envp_pool_top {
+        return Err(StackBuildError::InvalidLayout);
+    }
 
     // auxv (fixed order matching Linux `fs/binfmt_elf.c::create_elf_tables`
     // for the slice's surface). Optional pointer-valued entries are
@@ -405,51 +541,56 @@ pub fn build_initial_user_stack(
     let mut auxv_entries: [(u64, u64); AUXV_PAIR_COUNT] = [(AT_NULL, 0); AUXV_PAIR_COUNT];
     let mut auxv_len = 0usize;
     {
-        let mut push_auxv = |a_type: u64, a_val: u64| {
-            debug_assert!(auxv_len < AUXV_PAIR_COUNT);
+        let mut push_auxv = |a_type: u64, a_val: u64| -> Result<(), StackBuildError> {
+            if auxv_len >= AUXV_PAIR_COUNT {
+                return Err(StackBuildError::InvalidLayout);
+            }
             auxv_entries[auxv_len] = (a_type, a_val);
             auxv_len += 1;
+            Ok(())
         };
-        push_auxv(AT_PHDR, auxv_facts.at_phdr);
-        push_auxv(AT_PHENT, auxv_facts.at_phent);
-        push_auxv(AT_PHNUM, auxv_facts.at_phnum);
-        push_auxv(AT_PAGESZ, auxv_facts.at_pagesz);
-        push_auxv(AT_BASE, auxv_facts.at_base);
-        push_auxv(AT_ENTRY, auxv_facts.at_entry);
-        push_auxv(AT_UID, auxv_facts.at_uid);
-        push_auxv(AT_EUID, auxv_facts.at_euid);
-        push_auxv(AT_GID, auxv_facts.at_gid);
-        push_auxv(AT_EGID, auxv_facts.at_egid);
-        push_auxv(AT_SECURE, auxv_facts.at_secure);
-        push_auxv(AT_RANDOM, at_random_base);
-        push_auxv(AT_HWCAP, auxv_facts.at_hwcap);
-        push_auxv(AT_HWCAP2, auxv_facts.at_hwcap2);
-        if let Some(at_platform) = auxv_facts.at_platform.filter(|v| *v != 0) {
-            push_auxv(AT_PLATFORM, at_platform);
+        push_auxv(AT_PHDR, auxv_facts.at_phdr)?;
+        push_auxv(AT_PHENT, auxv_facts.at_phent)?;
+        push_auxv(AT_PHNUM, auxv_facts.at_phnum)?;
+        push_auxv(AT_PAGESZ, auxv_facts.at_pagesz)?;
+        push_auxv(AT_BASE, auxv_facts.at_base)?;
+        push_auxv(AT_ENTRY, auxv_facts.at_entry)?;
+        push_auxv(AT_UID, auxv_facts.at_uid)?;
+        push_auxv(AT_EUID, auxv_facts.at_euid)?;
+        push_auxv(AT_GID, auxv_facts.at_gid)?;
+        push_auxv(AT_EGID, auxv_facts.at_egid)?;
+        push_auxv(AT_SECURE, auxv_facts.at_secure)?;
+        push_auxv(AT_RANDOM, at_random_base)?;
+        push_auxv(AT_HWCAP, auxv_facts.at_hwcap)?;
+        push_auxv(AT_HWCAP2, auxv_facts.at_hwcap2)?;
+        if let Some(at_platform) = at_platform {
+            push_auxv(AT_PLATFORM, at_platform)?;
         }
-        push_auxv(AT_CLKTCK, auxv_facts.at_clktck);
+        push_auxv(AT_CLKTCK, auxv_facts.at_clktck)?;
         if let Some(at_sysinfo_ehdr) = auxv_facts.at_sysinfo_ehdr.filter(|v| *v != 0) {
-            push_auxv(AT_SYSINFO_EHDR, at_sysinfo_ehdr);
+            push_auxv(AT_SYSINFO_EHDR, at_sysinfo_ehdr)?;
         }
-        if let Some(at_execfn) = auxv_facts.at_execfn.filter(|v| *v != 0) {
-            push_auxv(AT_EXECFN, at_execfn);
+        if let Some(at_execfn) = at_execfn {
+            push_auxv(AT_EXECFN, at_execfn)?;
         }
-        push_auxv(AT_FLAGS, auxv_facts.at_flags);
-        push_auxv(AT_NULL, 0);
+        push_auxv(AT_FLAGS, auxv_facts.at_flags)?;
+        push_auxv(AT_NULL, 0)?;
     }
     for &(a_type, a_val) in auxv_entries[..auxv_len].iter() {
-        write_u64(&mut bytes, off, a_type);
-        write_u64(&mut bytes, off + WORD_SIZE, a_val);
-        off += AUXV_PAIR_SIZE;
+        write_u64(&mut bytes, off, a_type)?;
+        let value_off = off
+            .checked_add(WORD_SIZE)
+            .ok_or(StackBuildError::InvalidLayout)?;
+        write_u64(&mut bytes, value_off, a_val)?;
+        off = off
+            .checked_add(AUXV_PAIR_SIZE)
+            .ok_or(StackBuildError::InvalidLayout)?;
     }
-    debug_assert!(off <= upper_table_size);
-    off = upper_table_size;
+    if off > upper_table_size {
+        return Err(StackBuildError::InvalidLayout);
+    }
 
-    // ---- 8. Padding region is already zeroed by `vec![0u8; total]` ------
-    //
-    // Skip past pad bytes.
-    off += pad;
-    debug_assert!(off == upper_table_size + pad);
+    // ---- 8. Padding region is already zeroed -----------------------------
 
     // ---- 9. AT_RANDOM region: 16 bytes from auxv_facts -----------------
     //
@@ -458,35 +599,87 @@ pub fn build_initial_user_stack(
     // other boards: deterministic counter default). Tests pass
     // explicit bytes (often `[0; 16]`) to keep layout-pin
     // assertions stable.
-    let at_random_off = upper_table_size + pad;
-    debug_assert!(at_random_off + AT_RANDOM_REGION_SIZE <= total);
-    bytes[at_random_off..at_random_off + AT_RANDOM_REGION_SIZE]
+    let at_random_off = upper_table_size
+        .checked_add(pad)
+        .ok_or(StackBuildError::InvalidLayout)?;
+    let at_random_end = at_random_off
+        .checked_add(AT_RANDOM_REGION_SIZE)
+        .ok_or(StackBuildError::InvalidLayout)?;
+    bytes
+        .get_mut(at_random_off..at_random_end)
+        .ok_or(StackBuildError::InvalidLayout)?
         .copy_from_slice(&auxv_facts.at_random_bytes);
+
+    fn write_cstring(
+        bytes: &mut [u8],
+        offset: usize,
+        string: &[u8],
+    ) -> Result<usize, StackBuildError> {
+        let string_end = offset
+            .checked_add(string.len())
+            .ok_or(StackBuildError::InvalidLayout)?;
+        bytes
+            .get_mut(offset..string_end)
+            .ok_or(StackBuildError::InvalidLayout)?
+            .copy_from_slice(string);
+        let nul = bytes
+            .get_mut(string_end)
+            .ok_or(StackBuildError::InvalidLayout)?;
+        *nul = 0;
+        string_end
+            .checked_add(1)
+            .ok_or(StackBuildError::InvalidLayout)
+    }
+
+    fn user_offset(address: u64, initial_sp: u64) -> Result<usize, StackBuildError> {
+        address
+            .checked_sub(initial_sp)
+            .ok_or(StackBuildError::InvalidLayout)
+            .and_then(|offset| usize::try_from(offset).map_err(|_| StackBuildError::InvalidLayout))
+    }
+
+    let platform_pool_off = user_offset(platform_pool_base, initial_sp)?;
+    let mut cursor = platform_pool_off;
+    if !auxv_facts.platform_string.is_empty() {
+        cursor = write_cstring(&mut bytes, cursor, auxv_facts.platform_string)?;
+    }
+    if cursor != user_offset(platform_pool_top, initial_sp)? {
+        return Err(StackBuildError::InvalidLayout);
+    }
+
+    let execfn_pool_off = user_offset(execfn_pool_base, initial_sp)?;
+    let mut cursor = execfn_pool_off;
+    if !auxv_facts.execfn_string.is_empty() {
+        cursor = write_cstring(&mut bytes, cursor, auxv_facts.execfn_string)?;
+    }
+    if cursor != user_offset(execfn_pool_top, initial_sp)? {
+        return Err(StackBuildError::InvalidLayout);
+    }
 
     // ---- 10. argv string pool ------------------------------------------
     //
     // Lives at user-VA `argv_pool_base`, which corresponds to byte
     // offset `argv_pool_base - initial_sp`.
-    let argv_pool_off = (argv_pool_base - initial_sp) as usize;
+    let argv_pool_off = user_offset(argv_pool_base, initial_sp)?;
     let mut cursor = argv_pool_off;
     for s in argv_view {
-        bytes[cursor..cursor + s.len()].copy_from_slice(s);
-        cursor += s.len();
-        bytes[cursor] = 0; // NUL terminator
-        cursor += 1;
+        cursor = write_cstring(&mut bytes, cursor, s)?;
+    }
+    if cursor != user_offset(argv_pool_top, initial_sp)? {
+        return Err(StackBuildError::InvalidLayout);
     }
 
     // ---- 11. envp string pool ------------------------------------------
-    let envp_pool_off = (envp_pool_base - initial_sp) as usize;
+    let envp_pool_off = user_offset(envp_pool_base, initial_sp)?;
     let mut cursor = envp_pool_off;
     for s in envp {
-        bytes[cursor..cursor + s.len()].copy_from_slice(s);
-        cursor += s.len();
-        bytes[cursor] = 0;
-        cursor += 1;
+        cursor = write_cstring(&mut bytes, cursor, s)?;
+    }
+    if cursor != total {
+        return Err(StackBuildError::InvalidLayout);
     }
 
-    UserStackImage { initial_sp, bytes }
+    Ok(UserStackImage { initial_sp, bytes })
 }
 
 // ---------------------------------------------------------------------------
@@ -497,12 +690,81 @@ pub fn build_initial_user_stack(
 mod tests {
     use super::*;
 
+    #[test]
+    fn stack_zeroed_buffer_reports_capacity_as_out_of_memory() {
+        assert_eq!(
+            try_zeroed_stack_bytes(usize::MAX),
+            Err(StackBuildError::OutOfMemory)
+        );
+    }
+
+    #[test]
+    fn stack_builder_rejects_user_top_and_aux_string_contract_violations() {
+        let stack_top = 0x4000_0000u64;
+        assert!(matches!(
+            build_initial_user_stack(
+                stack_top,
+                &[],
+                &[],
+                &AuxvFacts {
+                    user_top: stack_top - 1,
+                    ..facts()
+                },
+            ),
+            Err(StackBuildError::InvalidLayout)
+        ));
+        assert!(matches!(
+            build_initial_user_stack(
+                stack_top,
+                &[],
+                &[],
+                &AuxvFacts {
+                    execfn_string: b"/bin/app\0spoofed",
+                    ..facts()
+                },
+            ),
+            Err(StackBuildError::InvalidString)
+        ));
+        assert!(matches!(
+            build_initial_user_stack(stack_top, &[b"arg\0tail"], &[], &facts(),),
+            Err(StackBuildError::InvalidString)
+        ));
+        assert!(matches!(
+            build_initial_user_stack(stack_top, &[], &[b"KEY=value\0tail"], &facts(),),
+            Err(StackBuildError::InvalidString)
+        ));
+        assert!(matches!(
+            build_initial_user_stack(
+                stack_top,
+                &[],
+                &[],
+                &AuxvFacts {
+                    platform_string: b"riscv64\0spoofed",
+                    ..facts()
+                },
+            ),
+            Err(StackBuildError::InvalidString)
+        ));
+        assert!(matches!(
+            build_initial_user_stack(
+                8,
+                &[],
+                &[],
+                &AuxvFacts {
+                    user_top: 8,
+                    ..facts()
+                },
+            ),
+            Err(StackBuildError::InvalidLayout)
+        ));
+    }
+
     /// Compose a default `AuxvFacts` whose values are easy to spot in
     /// hex dumps when debugging a layout regression. The cred-derived
     /// fields default to the bootstrap-init shape (`uid = euid = 0`)
     /// with `at_secure = 0`; tests that need a setuid-binary
     /// signature override `at_secure` (and the eid fields) inline.
-    fn facts() -> AuxvFacts {
+    fn facts() -> AuxvFacts<'static> {
         AuxvFacts {
             at_phdr: 0x4000_0040,
             at_phent: 56,
@@ -518,13 +780,12 @@ mod tests {
             at_random_bytes: [0u8; 16],
             at_hwcap: 0,
             at_hwcap2: 0,
-            at_platform: None,
             platform_string: b"",
             at_clktck: CLKTCK_VALUE,
-            at_execfn: None,
             execfn_string: b"",
             at_flags: 0,
             at_sysinfo_ehdr: None,
+            user_top: 0x4000_0000,
         }
     }
 
@@ -564,7 +825,7 @@ mod tests {
     #[test]
     fn build_initial_user_stack_zero_argv_zero_envp_minimum_layout() {
         let stack_top = 0x4000_0000u64;
-        let image = build_initial_user_stack(stack_top, &[], &[], &facts());
+        let image = build_initial_user_stack(stack_top, &[], &[], &facts()).expect("stack image");
 
         // sp is 16-byte aligned per psABI.
         assert_eq!(image.initial_sp & 0xF, 0);
@@ -636,7 +897,8 @@ mod tests {
         let stack_top = 0x4000_0000u64;
         let argv: [&[u8]; 2] = [b"hello", b"world"];
         let envp: [&[u8]; 1] = [b"PATH=/bin"];
-        let image = build_initial_user_stack(stack_top, &argv, &envp, &facts());
+        let image =
+            build_initial_user_stack(stack_top, &argv, &envp, &facts()).expect("stack image");
 
         // argc == 2.
         let argc = read_u64(&image.bytes, 0);
@@ -685,7 +947,8 @@ mod tests {
         let stack_top = 0x4000_0000u64;
         let argv: [&[u8]; 3] = [b"abc", b"def", b"ghi"];
         let envp: [&[u8]; 2] = [b"X=1", b"YY=2"];
-        let image = build_initial_user_stack(stack_top, &argv, &envp, &facts());
+        let image =
+            build_initial_user_stack(stack_top, &argv, &envp, &facts()).expect("stack image");
         assert_eq!(
             image.initial_sp & (STACK_ALIGN as u64 - 1),
             0,
@@ -701,7 +964,8 @@ mod tests {
         let stack_top = 0x4000_0000u64;
         let argv: [&[u8]; 1] = [b"prog"];
         let envp: [&[u8]; 0] = [];
-        let image = build_initial_user_stack(stack_top, &argv, &envp, &facts());
+        let image =
+            build_initial_user_stack(stack_top, &argv, &envp, &facts()).expect("stack image");
 
         // Walk to the auxv table.
         let auxv_off = WORD_SIZE              // argc
@@ -724,7 +988,7 @@ mod tests {
     #[test]
     fn build_initial_user_stack_dummy_argv0_synthesised_when_empty() {
         let stack_top = 0x4000_0000u64;
-        let image = build_initial_user_stack(stack_top, &[], &[], &facts());
+        let image = build_initial_user_stack(stack_top, &[], &[], &facts()).expect("stack image");
 
         let argc = read_u64(&image.bytes, 0);
         assert_eq!(argc, 1, "empty argv must synthesise argc=1");
@@ -754,7 +1018,7 @@ mod tests {
     #[test]
     fn build_initial_user_stack_omits_absent_optional_auxv_entries() {
         let stack_top = 0x4000_0000u64;
-        let image = build_initial_user_stack(stack_top, &[], &[], &facts());
+        let image = build_initial_user_stack(stack_top, &[], &[], &facts()).expect("stack image");
 
         let auxv_off = WORD_SIZE                // argc
             + 2 * WORD_SIZE                     // argv[0] + NULL
@@ -796,12 +1060,13 @@ mod tests {
     fn build_initial_user_stack_emits_optional_auxv_entries_when_present() {
         let stack_top = 0x4000_0000u64;
         let auxv_facts = AuxvFacts {
-            at_platform: Some(0x4000_1000),
+            platform_string: b"riscv64",
             at_sysinfo_ehdr: Some(0x4000_2000),
-            at_execfn: Some(0x4000_3000),
+            execfn_string: b"/init",
             ..facts()
         };
-        let image = build_initial_user_stack(stack_top, &[], &[], &auxv_facts);
+        let image =
+            build_initial_user_stack(stack_top, &[], &[], &auxv_facts).expect("stack image");
 
         let auxv_off = WORD_SIZE                // argc
             + 2 * WORD_SIZE                     // argv[0] + NULL
@@ -814,12 +1079,47 @@ mod tests {
             )
         };
 
-        assert_eq!(pair(14), (AT_PLATFORM, 0x4000_1000));
+        assert_eq!(pair(14).0, AT_PLATFORM);
+        assert_eq!(read_cstring(&image, pair(14).1), b"riscv64");
         assert_eq!(pair(15), (AT_CLKTCK, CLKTCK_VALUE));
         assert_eq!(pair(16), (AT_SYSINFO_EHDR, 0x4000_2000));
-        assert_eq!(pair(17), (AT_EXECFN, 0x4000_3000));
+        assert_eq!(pair(17).0, AT_EXECFN);
+        assert_eq!(read_cstring(&image, pair(17).1), b"/init");
         assert_eq!(pair(18), (AT_FLAGS, 0));
         assert_eq!(pair(19), (AT_NULL, 0));
+    }
+
+    #[test]
+    fn build_initial_user_stack_places_platform_and_execfn_strings() {
+        let stack_top = 0x4000_0000u64;
+        let auxv_facts = AuxvFacts {
+            platform_string: b"riscv64",
+            execfn_string: b"/original/script",
+            ..facts()
+        };
+        let image =
+            build_initial_user_stack(stack_top, &[], &[], &auxv_facts).expect("stack image");
+
+        let auxv_off = WORD_SIZE + 2 * WORD_SIZE + WORD_SIZE;
+        let mut platform = None;
+        let mut execfn = None;
+        for index in 0..AUXV_PAIR_COUNT {
+            let base = auxv_off + index * AUXV_PAIR_SIZE;
+            match read_u64(&image.bytes, base) {
+                AT_PLATFORM => platform = Some(read_u64(&image.bytes, base + WORD_SIZE)),
+                AT_EXECFN => execfn = Some(read_u64(&image.bytes, base + WORD_SIZE)),
+                AT_NULL => break,
+                _ => {}
+            }
+        }
+
+        let platform = platform.expect("AT_PLATFORM");
+        let execfn = execfn.expect("AT_EXECFN");
+        assert_eq!(read_cstring(&image, platform), b"riscv64");
+        assert_eq!(read_cstring(&image, execfn), b"/original/script");
+        assert!(platform < stack_top);
+        assert!(execfn < stack_top);
+        assert_eq!(image.initial_sp & (STACK_ALIGN as u64 - 1), 0);
     }
 
     /// AT_UID lives at index 6 of the auxv table — the first cred-
@@ -840,7 +1140,8 @@ mod tests {
             at_secure: 1,
             ..facts()
         };
-        let image = build_initial_user_stack(stack_top, &[], &[], &auxv_facts);
+        let image =
+            build_initial_user_stack(stack_top, &[], &[], &auxv_facts).expect("stack image");
 
         let auxv_off = WORD_SIZE                // argc
             + 2 * WORD_SIZE                     // argv[0] + NULL
@@ -871,7 +1172,8 @@ mod tests {
             at_secure: 1,
             ..facts()
         };
-        let image = build_initial_user_stack(stack_top, &[], &[], &auxv_facts);
+        let image =
+            build_initial_user_stack(stack_top, &[], &[], &auxv_facts).expect("stack image");
 
         let auxv_off = WORD_SIZE                // argc
             + 2 * WORD_SIZE                     // argv[0] + NULL
@@ -886,7 +1188,7 @@ mod tests {
     #[test]
     fn build_initial_user_stack_emits_at_secure_zero_when_facts_set_to_0() {
         let stack_top = 0x4000_0000u64;
-        let image = build_initial_user_stack(stack_top, &[], &[], &facts());
+        let image = build_initial_user_stack(stack_top, &[], &[], &facts()).expect("stack image");
 
         let auxv_off = WORD_SIZE                // argc
             + 2 * WORD_SIZE                     // argv[0] + NULL
@@ -910,7 +1212,8 @@ mod tests {
             at_random_bytes: [0xab; 16],
             ..facts()
         };
-        let image = build_initial_user_stack(stack_top, &[], &[], &auxv_facts);
+        let image =
+            build_initial_user_stack(stack_top, &[], &[], &auxv_facts).expect("stack image");
 
         let auxv_off = WORD_SIZE                // argc
             + 2 * WORD_SIZE                     // argv[0] + NULL
@@ -946,7 +1249,8 @@ mod tests {
             at_entry: 0x1234_5678,
             ..facts()
         };
-        let image = build_initial_user_stack(stack_top, &[], &[], &auxv_facts);
+        let image =
+            build_initial_user_stack(stack_top, &[], &[], &auxv_facts).expect("stack image");
 
         let auxv_off = WORD_SIZE                // argc
             + 2 * WORD_SIZE                     // argv[0] + NULL
@@ -959,15 +1263,13 @@ mod tests {
         assert_eq!(read_u64(&image.bytes, entry_base + 8), 0x1234_5678);
     }
 
-    /// `AT_BASE` is hardcoded to `0` for the v1 static-`ET_EXEC`
-    /// contract (`EXEC_v1.md`'s "static-only" pin). musl's
-    /// `__libc_start_main` reads it as zero and treats the binary as
-    /// the canonical exec image (no PT_INTERP). This pin breaks if a
-    /// future dynamic-link slice forgets to flip the field.
+    /// A static executable has no interpreter, so its `AT_BASE` remains
+    /// zero. Dynamic exec tests cover the complementary nonzero interpreter
+    /// load bias.
     #[test]
     fn build_initial_user_stack_emits_at_base_zero_for_static_exec() {
         let stack_top = 0x4000_0000u64;
-        let image = build_initial_user_stack(stack_top, &[], &[], &facts());
+        let image = build_initial_user_stack(stack_top, &[], &[], &facts()).expect("stack image");
 
         let auxv_off = WORD_SIZE                // argc
             + 2 * WORD_SIZE                     // argv[0] + NULL

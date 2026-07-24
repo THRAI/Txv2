@@ -19,6 +19,7 @@ use tx_substrate::bus::{
     WireOwnerReclaimError, WireOwnerRetireFence,
 };
 use tx_substrate::epoch;
+use tx_substrate::wake::mailbox::{MailboxEvent, TaskMailbox};
 
 static EPOCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static OWNER_RECLAIM_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -283,6 +284,59 @@ fn declared_static_queue_and_port_validate_events_over_static_storage() {
     queue.clear(Readiness::HAS_DATA);
     drop(queue_subscription);
     drop(port_subscription);
+}
+
+#[test]
+fn raw_bus_fire_supports_injected_owner_post() {
+    let queue = RawQueue::new();
+    let port = RawPort::new();
+    let queue_mailbox = Arc::new(TaskMailbox::new());
+    let port_mailbox = Arc::new(TaskMailbox::new());
+
+    let _queue_sub = queue.subscribe(
+        0x3,
+        Arc::downgrade(&queue_mailbox),
+        queue_mailbox.next_generation(),
+    );
+    let _port_sub = port.subscribe(
+        0x4,
+        Arc::downgrade(&port_mailbox),
+        port_mailbox.next_generation(),
+    );
+
+    let queue_posts = AtomicUsize::new(0);
+    let port_posts = AtomicUsize::new(0);
+
+    assert_eq!(
+        queue.fire_with_post(0x1, |mailbox, event| {
+            queue_posts.fetch_add(1, Ordering::SeqCst);
+            mailbox.post(event)
+        }),
+        1
+    );
+    assert_eq!(
+        port.fire_with_post(0x4, |mailbox, event| {
+            port_posts.fetch_add(1, Ordering::SeqCst);
+            mailbox.post(event)
+        }),
+        1
+    );
+
+    assert_eq!(queue_posts.load(Ordering::SeqCst), 1);
+    assert_eq!(port_posts.load(Ordering::SeqCst), 1);
+
+    match queue_mailbox.poll().expect("queue event") {
+        MailboxEvent::SourceFired { interests, .. } => {
+            assert_eq!(interests.raw(), 0x1);
+        }
+        other => panic!("expected queue SourceFired, got {other:?}"),
+    }
+    match port_mailbox.poll().expect("port event") {
+        MailboxEvent::SourceFired { interests, .. } => {
+            assert_eq!(interests.raw(), 0x4);
+        }
+        other => panic!("expected port SourceFired, got {other:?}"),
+    }
 }
 
 #[test]

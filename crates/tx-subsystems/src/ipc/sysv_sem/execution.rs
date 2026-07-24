@@ -1,7 +1,7 @@
 //! SysV semaphore step operations.
 //!
 //! Phase IPC-3. Multi-op atomic semop, SEM_UNDO tracking, changed_seq
-//! sequencing, and `changed_channel` wake for blocked semop waiters.
+//! sequencing, and changed-source wake for blocked semop waiters.
 
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
@@ -14,6 +14,7 @@ use crate::ipc::sysv_sem::structure::{self, sem_flg, SemBuf};
 use crate::ipc::sysv_shm::execution::{IPC_CREAT, IPC_EXCL, IPC_PRIVATE};
 use crate::ipc::sysv_shm::structure::IpcPerm;
 use crate::process::adapter::step_engine::{Cap, NoProgress, StepOutcome};
+use crate::process::adapter::wait_routing::{MailboxEvent, TaskMailbox};
 use crate::process::nsproxy::SysvKey;
 use crate::process::structure::ProcessIdentity;
 
@@ -100,24 +101,22 @@ pub fn step_semget(
 }
 
 // ---------------------------------------------------------------------------
-// step_semop
+// step_semop_with_post
 // ---------------------------------------------------------------------------
 
-/// `semop(semid, sops, nsops)` — apply an array of operations atomically.
-///
-/// Returns the number of ops applied (always nsops on success).
-/// IPC_NOWAIT on any op makes the entire call non-blocking.
-/// SEM_UNDO on any op records the inverse adjustment.
-pub fn step_semop(
+pub fn step_semop_with_post<F>(
     semid: u32,
     sops: &[SemBuf],
     cred: &Cap<Cred>,
     process: &Cap<ProcessIdentity>,
-) -> Result<usize, Errno> {
+    post: F,
+) -> Result<usize, Errno>
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     // observe/upgrade/reserve/commit/publish are delegated to the v3 op.
-    // This legacy wrapper cannot drive waits, so it preserves the old
-    // non-blocking Result shape by surfacing a yielded wait as EAGAIN.
-    match step_semop_v3(semid, sops, cred, process) {
+    // This non-driving Result shape surfaces a yielded wait as EAGAIN.
+    match step_semop_v3_with_post(semid, sops, cred, process, post) {
         StepOutcome::Done(applied) => Ok(applied),
         StepOutcome::Err(errno) => Err(errno.into()),
         StepOutcome::Yield { .. } => Err(Errno::EAGAIN),
@@ -125,12 +124,16 @@ pub fn step_semop(
     }
 }
 
-pub fn step_semop_v3(
+pub fn step_semop_v3_with_post<F>(
     semid: u32,
     sops: &[SemBuf],
     cred: &Cap<Cred>,
     process: &Cap<ProcessIdentity>,
-) -> SemopOutcome {
+    post: F,
+) -> SemopOutcome
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     // observe: inspect current subsystem state and validate inputs.
     // upgrade: acquire capabilities/guards needed for mutation.
     // reserve: reserve namespace, memory, or wait-source effects.
@@ -187,7 +190,7 @@ pub fn step_semop_v3(
             if nowait {
                 return StepOutcome::err(Errno::EAGAIN.into());
             }
-            return notification::wait_for_change(payload.changed_source_id);
+            return notification::wait_for_change(payload.changed_endpoint());
         }
 
         // Apply all ops and track SEM_UNDO.
@@ -228,28 +231,33 @@ pub fn step_semop_v3(
 
         // Changed seq bump + wake.
         payload.changed_seq.fetch_add(1, Ordering::Release);
-        notification::notify_changed(&payload.changed_channel, &payload.changed_source);
+        notification::notify_changed_with_post(&payload.changed_source, post);
         StepOutcome::done(sops.len())
     }
 }
 
 // ---------------------------------------------------------------------------
-// step_semctl
+// step_semctl_with_post
 // ---------------------------------------------------------------------------
 
-pub fn step_semctl(
+pub fn step_semctl_with_post<F>(
     semid: u32,
     semnum: u16,
     cmd: i32,
     arg: SemCtlArg,
     cred: &Cap<Cred>,
     process: Option<&Cap<ProcessIdentity>>,
-) -> Result<SemCtlResult, Errno> {
+    post: F,
+) -> Result<SemCtlResult, Errno>
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     // observe: inspect current subsystem state and validate inputs.
     // upgrade: acquire capabilities/guards needed for mutation.
     // reserve: reserve namespace, memory, or wait-source effects.
     // commit: apply the state transition.
     // publish: emit readiness, signal, or observable outcome.
+    let mut post = post;
     match cmd {
         IPC_RMID => {
             let array = checks::require_sem_exists(semid)?;
@@ -258,7 +266,10 @@ pub fn step_semctl(
                 a.destroyed.store(true, Ordering::Release);
                 if let Some(payload) = a.payload.lock().as_ref().cloned() {
                     payload.changed_seq.fetch_add(1, Ordering::Release);
-                    notification::notify_changed(&payload.changed_channel, &payload.changed_source);
+                    notification::notify_changed_with_post(
+                        &payload.changed_source,
+                        |mailbox, event| post(mailbox, event),
+                    );
                 }
             }
             Ok(SemCtlResult::Success)
@@ -318,7 +329,10 @@ pub fn step_semctl(
                     values[semnum as usize].last_pid = process.pid.0;
                 }
                 payload.changed_seq.fetch_add(1, Ordering::Release);
-                notification::notify_changed(&payload.changed_channel, &payload.changed_source);
+                notification::notify_changed_with_post(
+                    &payload.changed_source,
+                    |mailbox, event| post(mailbox, event),
+                );
             });
             Ok(SemCtlResult::Success)
         }
@@ -352,7 +366,10 @@ pub fn step_semctl(
                     }
                 }
                 payload.changed_seq.fetch_add(1, Ordering::Release);
-                notification::notify_changed(&payload.changed_channel, &payload.changed_source);
+                notification::notify_changed_with_post(
+                    &payload.changed_source,
+                    |mailbox, event| post(mailbox, event),
+                );
             });
             Ok(SemCtlResult::Success)
         }
@@ -396,9 +413,7 @@ pub fn step_semctl(
     }
 }
 
-/// Namespace-aware `semctl` wrapper for syscall paths that can withdraw
-/// keyed namespace bindings on `IPC_RMID`.
-pub fn step_semctl_in_ns(
+pub fn step_semctl_in_ns_with_post<F>(
     semid: u32,
     semnum: u16,
     cmd: i32,
@@ -406,7 +421,11 @@ pub fn step_semctl_in_ns(
     cred: &Cap<Cred>,
     nsproxy: &Cap<crate::process::nsproxy::NsProxy>,
     process: Option<&Cap<ProcessIdentity>>,
-) -> Result<SemCtlResult, Errno> {
+    post: F,
+) -> Result<SemCtlResult, Errno>
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     // observe: inspect current subsystem state and validate inputs.
     // upgrade: acquire capabilities/guards needed for mutation.
     // reserve: reserve namespace, memory, or wait-source effects.
@@ -417,7 +436,7 @@ pub fn step_semctl_in_ns(
     } else {
         None
     };
-    let result = step_semctl(semid, semnum, cmd, arg, cred, process)?;
+    let result = step_semctl_with_post(semid, semnum, cmd, arg, cred, process, post)?;
     if let Some(Some(key)) = key {
         let mut table = nsproxy.ipc_ns.sysv_sem.lock();
         if table.get(&key).map(|array| array.semid) == Some(semid) {
@@ -428,17 +447,19 @@ pub fn step_semctl_in_ns(
 }
 
 // ---------------------------------------------------------------------------
-// step_sem_undo — called from process exit
+// step_sem_undo_with_post — called from process exit
 // ---------------------------------------------------------------------------
 
-/// Walk all SEM_UNDO entries for `process` and reverse the adjustments.
-/// Called from `step_process_exit` before the process payload is torn down.
-pub fn step_sem_undo(process: &Cap<ProcessIdentity>) {
+pub fn step_sem_undo_with_post<F>(process: &Cap<ProcessIdentity>, post: F)
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     // observe: inspect current subsystem state and validate inputs.
     // upgrade: acquire capabilities/guards needed for mutation.
     // reserve: reserve namespace, memory, or wait-source effects.
     // commit: apply the state transition.
     // publish: emit readiness, signal, or observable outcome.
+    let mut post = post;
     let Some(proc_payload) = process.payload_slot().lock().as_ref().cloned() else {
         return;
     };
@@ -456,10 +477,9 @@ pub fn step_sem_undo(process: &Cap<ProcessIdentity>) {
             }
         }
         payload_guard.changed_seq.fetch_add(1, Ordering::Release);
-        notification::notify_changed(
-            &payload_guard.changed_channel,
-            &payload_guard.changed_source,
-        );
+        notification::notify_changed_with_post(&payload_guard.changed_source, |mailbox, event| {
+            post(mailbox, event)
+        });
     }
 }
 

@@ -6,10 +6,13 @@
 use super::*;
 #[cfg(tx_sigprocmask_detail_metrics)]
 use core::sync::atomic::{AtomicU64, Ordering};
+use tx_services::time::{
+    timekeeper_clock, ClockRead, DeadlineRegistrar, DeadlineRegistrarHandle, TimekeeperClock,
+};
 use tx_substrate::verbs::OperationalCapExt;
 use tx_subsystems::process::numbers::{resolve_pid_number_as, PidName, PidNameKind};
-use tx_subsystems::signal::{step_kill_pgrp, SigInfo, SI_USER};
 use tx_subsystems::signal::{KillOutcome, SignalTarget};
+use tx_subsystems::signal::{SigInfo, SI_USER};
 
 #[cfg(target_arch = "loongarch64")]
 const MUSL_SIGCANCEL: u8 = 33;
@@ -106,10 +109,7 @@ fn sigprocmask_trace_sample() -> Option<i64> {
 #[cfg(tx_sigprocmask_detail_metrics)]
 fn emit_sigprocmask_debug(name: &[u8], value: i64) {
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            value,
-        );
+        observer.debug_counter(name, value);
         tx_observe::dump_registered_if_requested();
     }
 }
@@ -131,10 +131,7 @@ fn sigprocmask_detail_now() -> u64 {
 fn emit_sigprocmask_detail_duration(name: &[u8], start_ns: u64) {
     if let Some(observer) = tx_observe::current() {
         let dur = tx_observe::clock_now_ns().saturating_sub(start_ns);
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            dur.min(i64::MAX as u64) as i64,
-        );
+        observer.debug_counter(name, dur.min(i64::MAX as u64) as i64);
         tx_observe::dump_registered_if_requested();
     }
 }
@@ -410,10 +407,10 @@ fn set_thread_signal_mask(
     }
 }
 
-pub(super) async fn sys_rt_sigsuspend<P: tx_hal::TimeIf>(
-    args: [u64; 6],
-    ctx: &SyscallCtx<'_>,
-) -> SyscallResult {
+pub(super) async fn sys_rt_sigsuspend<P>(args: [u64; 6], ctx: &SyscallCtx<'_>) -> SyscallResult
+where
+    TimekeeperClock<P>: ClockRead,
+{
     let mask_ptr = args[0];
     let sigset_size = args[1];
     if mask_ptr == 0 {
@@ -445,14 +442,25 @@ pub(super) async fn sys_rt_sigsuspend<P: tx_hal::TimeIf>(
     // by gdb to a busy rt_sigsuspend loop). The pre-suspend mask is re-applied
     // by the delivered handler's `sigreturn` frame / the caller's own SETMASK
     // after its wait loop.
-    let restore_and_eintr =
-        |_ctx: &SyscallCtx<'_>, _old_mask: SignalMask| SyscallResult::Error(EINTR_VALUE);
+    let restore_and_eintr = |ctx: &SyscallCtx<'_>, old_mask: SignalMask| {
+        let _ = set_thread_signal_mask(ctx, old_mask);
+        SyscallResult::Error(EINTR_VALUE)
+    };
 
     const CHUNK_NS: u64 = 5_000_000;
     loop {
-        if let Some(deadline_ns) = poll_due_itimers::<P>(&ctx.process) {
-            P::set_deadline_ns(deadline_ns);
-        }
+        let timer_registrar = ctx.timer_registrar.as_ref().cloned();
+        let timer_mailbox = ctx.mailbox.as_ref().map(alloc::sync::Arc::downgrade);
+        let itimer_deadline_ns = poll_due_itimers_with_post::<P, _>(
+            &ctx.process,
+            timer_registrar
+                .as_ref()
+                .map(|registrar| registrar as &dyn DeadlineRegistrar),
+            timer_mailbox,
+            |mailbox, event| {
+                ctx.post_mailbox_event(mailbox, event);
+            },
+        );
         // Interrupt only on a signal that POSIX says should break a blocking
         // syscall — NOT on benign pending signals such as SIGCHLD (default
         // action Ignore), which the shell accrues while reaping the children
@@ -469,13 +477,17 @@ pub(super) async fn sys_rt_sigsuspend<P: tx_hal::TimeIf>(
 
         use crate::adapter::step_engine::DriveMode;
         use tx_scripts::drive;
-        let now_ns = <P as tx_hal::TimeIf>::read_ns();
+        let now_ns = timekeeper_clock::<P>().monotonic_now_ns();
+        let chunk_deadline_ns = now_ns.saturating_add(CHUNK_NS);
+        let park_deadline_ns = itimer_deadline_ns
+            .map(|deadline_ns| deadline_ns.min(chunk_deadline_ns))
+            .unwrap_or(chunk_deadline_ns);
         let mut script_ctx = build_subject_script_ctx(ctx);
-        let timer_wheel_arc = script_ctx.timer_wheel().cloned();
+        let timer_registrar_handle = script_ctx.timer_registrar().cloned();
         let mailbox = ctx.mailbox.clone();
         let op = NanosleepOp {
-            nanos: CHUNK_NS,
-            deadline_ns: now_ns.saturating_add(CHUNK_NS),
+            nanos: park_deadline_ns.saturating_sub(now_ns),
+            deadline_ns: park_deadline_ns,
             started: false,
         };
         match drive(
@@ -484,7 +496,7 @@ pub(super) async fn sys_rt_sigsuspend<P: tx_hal::TimeIf>(
             DriveMode::Waiting,
             mailbox.as_ref(),
             None,
-            timer_wheel_arc.as_ref(),
+            timer_registrar_handle.as_ref(),
         )
         .await
         {
@@ -594,28 +606,29 @@ fn write_sigtimedwait_siginfo(ctx: &SyscallCtx<'_>, info_ptr: u64, sig: Signum) 
     bootstrap_copy_to_user(&ctx.aspace, info_ptr, &image).map_err(errno_to_i32)
 }
 
-async fn park_sigtimedwait_tick<P: tx_hal::TimeIf>(
-    ctx: &SyscallCtx<'_>,
-    wait_bits: u64,
-    deadline_ns: Option<u64>,
-) {
+async fn park_sigtimedwait_tick<P>(ctx: &SyscallCtx<'_>, wait_bits: u64, deadline_ns: Option<u64>)
+where
+    TimekeeperClock<P>: ClockRead,
+{
     const SIGTIMEDWAIT_POLL_NS: u64 = 1_000_000;
 
     if wait_bits & Signum::SIGCHLD.bit() != 0 && deadline_ns.is_none() {
-        if let Some(token) = ctx.process.exit_source_wait_token() {
-            if let Some(future) = tx_subsystems::wait_source::wait_on_token(token) {
-                future.await;
-                return;
-            }
+        if let Some(endpoint) = ctx.process.exit_endpoint() {
+            tx_subsystems::wait_source::wait_on_endpoint(
+                &endpoint,
+                tx_subsystems::process::EXIT_SOURCE_CHILD_ZOMBIFIED,
+            )
+            .await;
+            return;
         }
     }
 
-    let now = <P as tx_hal::TimeIf>::read_ns();
+    let now = timekeeper_clock::<P>().monotonic_now_ns();
     let next = match deadline_ns {
         Some(deadline) => core::cmp::min(deadline, now.saturating_add(SIGTIMEDWAIT_POLL_NS)),
         None => now.saturating_add(SIGTIMEDWAIT_POLL_NS),
     };
-    if let Some(future) = tx_subsystems::timer_sleep::sleep_until_ns(next) {
+    if let Some(future) = super::deadline_timer(ctx, next) {
         future.await;
     } else {
         tx_reactor::yield_now().await;
@@ -630,10 +643,13 @@ async fn park_sigtimedwait_tick<P: tx_hal::TimeIf>(
 /// Signal-mask interaction is intentionally different from normal
 /// delivery: `sigtimedwait(2)` observes pending signals in `set` even
 /// when they are blocked, which is how runtest waits for child SIGCHLD.
-pub(super) async fn sys_rt_sigtimedwait<'a, P: tx_hal::TimeIf>(
+pub(super) async fn sys_rt_sigtimedwait<'a, P>(
     args: [u64; 6],
     ctx: &SyscallCtx<'a>,
-) -> SyscallResult {
+) -> SyscallResult
+where
+    TimekeeperClock<P>: ClockRead,
+{
     let set_ptr = args[0];
     let info_ptr = args[1];
     let timeout_ptr = args[2];
@@ -658,7 +674,11 @@ pub(super) async fn sys_rt_sigtimedwait<'a, P: tx_hal::TimeIf>(
             None => return SyscallResult::Error(EINVAL_VALUE),
         }
     };
-    let deadline_ns = timeout_ns.map(|ns| <P as tx_hal::TimeIf>::read_ns().saturating_add(ns));
+    let deadline_ns = timeout_ns.map(|ns| {
+        timekeeper_clock::<P>()
+            .monotonic_now_ns()
+            .saturating_add(ns)
+    });
 
     // `await_mailbox_event` (in `tx-scripts::drive::resolve_on_timer`)
     // re-posts any SignalDelivered event it consumes. sigtimedwait
@@ -678,7 +698,7 @@ pub(super) async fn sys_rt_sigtimedwait<'a, P: tx_hal::TimeIf>(
         }
 
         match deadline_ns {
-            Some(deadline) if <P as tx_hal::TimeIf>::read_ns() >= deadline => {
+            Some(deadline) if timekeeper_clock::<P>().monotonic_now_ns() >= deadline => {
                 return SyscallResult::Error(EAGAIN_VALUE);
             }
             Some(_) | None => {
@@ -789,15 +809,18 @@ pub(super) fn sys_pidfd_send_signal(args: [u64; 6], ctx: &SyscallCtx) -> Syscall
     });
 
     dispatch_errno(
-        tx_subsystems::signal::script_deliver_signal(
+        tx_subsystems::signal::script_deliver_signal_with_posts(
             &ctx.process,
             SignalTarget::Process(target),
             signum,
             siginfo,
+            |mailbox, event| ctx.post_mailbox_event(mailbox, event),
+            |mailbox, event| ctx.post_mailbox_ref_event(mailbox, event),
         ),
         |outcome| match outcome {
             KillOutcome::Delivered => SyscallResult::Return(0),
             KillOutcome::NoLiveThread => SyscallResult::Error(ESRCH_VALUE),
+            KillOutcome::Retry => SyscallResult::Error(EAGAIN_VALUE),
         },
     )
 }
@@ -912,17 +935,39 @@ pub(super) fn sys_rt_sigaction<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Sysc
     SyscallResult::Return(0)
 }
 
+fn signal_probe_result(
+    result: Result<tx_subsystems::signal::KillScriptOutcome, Errno>,
+) -> SyscallResult {
+    match result {
+        Ok(tx_subsystems::signal::KillScriptOutcome::Probed) => SyscallResult::Return(0),
+        Ok(tx_subsystems::signal::KillScriptOutcome::NoLiveThread) => {
+            SyscallResult::Error(ESRCH_VALUE)
+        }
+        Ok(tx_subsystems::signal::KillScriptOutcome::Retry) => SyscallResult::Error(EAGAIN_VALUE),
+        Ok(tx_subsystems::signal::KillScriptOutcome::Delivered) => SyscallResult::Return(0),
+        Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+    }
+}
+
+pub(super) fn signal_delivery_result(
+    result: Result<tx_subsystems::signal::KillOutcome, Errno>,
+) -> SyscallResult {
+    match result {
+        Ok(tx_subsystems::signal::KillOutcome::Delivered) => SyscallResult::Return(0),
+        Ok(tx_subsystems::signal::KillOutcome::NoLiveThread) => SyscallResult::Error(ESRCH_VALUE),
+        Ok(tx_subsystems::signal::KillOutcome::Retry) => SyscallResult::Error(EAGAIN_VALUE),
+        Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
+    }
+}
+
 /// `kill(pid, sig)` — Linux RV64 generic ABI `__NR_kill = 129`.
 ///
-/// Slice 7 v1 surface:
-/// - `pid > 0`: deliver `sig` to the matching process via
-///   `tx_subsystems::signal::step_kill_process`. Resolved through
-///   `process_by_pid`'s init-rooted tree walk.
-/// - `pid <= 0`: pgrp / all-processes targets — out of scope for v1
-///   (`-ENOSYS`; needs a global pid-to-pgrp lookup the slice does
-///   not yet wire).
-/// - `sig == 0`: existence probe — return `0` if the target exists
-///   (live or zombie), `-ESRCH` otherwise. Linux semantic.
+/// Supported target modes:
+/// - `pid > 0`: the matching process.
+/// - `pid == 0`: every permitted live member of the caller's process group.
+/// - `pid == -1`: every permitted live process except init and the caller.
+/// - `pid < -1`: every permitted live member of process group `|pid|`.
+/// - `sig == 0`: permission probe with the same target selection and no delivery.
 /// - Unknown signum (outside 1..=64): `-EINVAL`.
 /// - Target zombie / no live thread: `-ESRCH` (matches Linux's
 ///   "kill returns ESRCH if no signal could be delivered").
@@ -933,7 +978,17 @@ pub(super) fn sys_kill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
     // Phase F: pid == 0 routes to caller's process group.
     if pid == 0 {
         if sig == 0 {
-            return SyscallResult::Return(0); // existence probe
+            let pgrp = ctx.process.pgrp_cap();
+            return dispatch_errno(
+                tx_subsystems::signal::script_kill_pgrp_probe(&ctx.process, &pgrp),
+                |permitted| {
+                    if permitted > 0 {
+                        SyscallResult::Return(0)
+                    } else {
+                        SyscallResult::Error(EPERM_VALUE)
+                    }
+                },
+            );
         }
         let signum = match u8::try_from(sig).ok().and_then(Signum::new) {
             Some(s) => s,
@@ -941,13 +996,19 @@ pub(super) fn sys_kill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
         };
         let pgrp = ctx.process.pgrp_cap();
         // Route through script_kill_pgrp (cred-checked per-member fanout)
-        // rather than the primitive step_kill_pgrp, which would deliver
+        // rather than the primitive process-group delivery helper, which would deliver
         // without consulting cred::require_signal_send.
         // POSIX: kill(0, sig) returns -EPERM when no member was both
         // live AND permitted; script_kill_pgrp folds zombies and
         // permission denials into the same 0-count return.
         return dispatch_errno(
-            tx_subsystems::signal::script_kill_pgrp(&ctx.process, &pgrp, signum),
+            tx_subsystems::signal::script_kill_pgrp_with_posts(
+                &ctx.process,
+                &pgrp,
+                signum,
+                |mailbox, event| ctx.post_mailbox_event(mailbox, event),
+                |mailbox, event| ctx.post_mailbox_ref_event(mailbox, event),
+            ),
             |n| {
                 if n > 0 {
                     SyscallResult::Return(0)
@@ -982,7 +1043,9 @@ pub(super) fn sys_kill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
 
         let self_pid = ctx.process.pid.0;
         let mut matched = 0u32;
+        let mut probed = 0u32;
         let mut delivered = 0u32;
+        let mut retry = false;
         for (member_pid, _) in tx_subsystems::process::all_pids() {
             let proc = match tx_subsystems::process::process_by_pid(member_pid) {
                 Some(p) => p,
@@ -997,6 +1060,12 @@ pub(super) fn sys_kill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
             }
             matched += 1;
             let Some(signum) = signum_opt else {
+                if matches!(
+                    tx_subsystems::signal::script_kill_probe(&ctx.process, &proc),
+                    Ok(tx_subsystems::signal::KillScriptOutcome::Probed)
+                ) {
+                    probed += 1;
+                }
                 continue;
             };
             let siginfo = Some(SigInfo {
@@ -1005,11 +1074,21 @@ pub(super) fn sys_kill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
                 si_pid: self_pid,
                 si_uid: 0,
             });
-            if matches!(
-                tx_subsystems::signal::script_kill_process(&ctx.process, &proc, signum, siginfo),
-                Ok(tx_subsystems::signal::KillScriptOutcome::Delivered)
+            match tx_subsystems::signal::script_kill_process_with_posts(
+                &ctx.process,
+                &proc,
+                signum,
+                siginfo,
+                |mailbox, event| ctx.post_mailbox_event(mailbox, event),
+                |mailbox, event| ctx.post_mailbox_ref_event(mailbox, event),
             ) {
-                delivered += 1;
+                Ok(tx_subsystems::signal::KillScriptOutcome::Delivered) => delivered += 1,
+                Ok(tx_subsystems::signal::KillScriptOutcome::Retry) => retry = true,
+                Ok(
+                    tx_subsystems::signal::KillScriptOutcome::NoLiveThread
+                    | tx_subsystems::signal::KillScriptOutcome::Probed,
+                )
+                | Err(_) => {}
             }
         }
 
@@ -1017,12 +1096,16 @@ pub(super) fn sys_kill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
             return SyscallResult::Error(ESRCH_VALUE);
         }
         if sig == 0 {
-            // Existence probe (`kill(-pgid, 0)`): the group has at least
-            // one live member.
-            return SyscallResult::Return(0);
+            return if probed > 0 {
+                SyscallResult::Return(0)
+            } else {
+                SyscallResult::Error(EPERM_VALUE)
+            };
         }
         return if delivered > 0 {
             SyscallResult::Return(0)
+        } else if retry {
+            SyscallResult::Error(EAGAIN_VALUE)
         } else {
             // Members existed but none accepted the signal (cred denial
             // or raced exit) → EPERM, matching the `pid == 0` path.
@@ -1036,9 +1119,10 @@ pub(super) fn sys_kill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
     };
 
     if sig == 0 {
-        // Existence probe: 0 for live or zombie targets, -ESRCH for
-        // missing (handled above by the `process_by_pid` None branch).
-        return SyscallResult::Return(0);
+        return signal_probe_result(tx_subsystems::signal::script_kill_probe(
+            &ctx.process,
+            &target,
+        ));
     }
 
     // Bound check: Linux signums are 1..=64 (the realtime range
@@ -1059,16 +1143,23 @@ pub(super) fn sys_kill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
     // Route through the cred-checked script entry point. Drives
     // `cred::require_signal_send` against the caller's syscall-entry
     // snapshot (per cred_service_v_1 §"In flight" + §"Checks
-    // surface") and only then commits the post via `step_kill_process`.
-    // Going through `KillProcessOp::drive_oneshot` directly would
-    // bypass the cred check, since `KillProcessOp::step` calls the
-    // primitive `step_kill_process` without authorization.
+    // surface") and only then commits the post via the process-directed
+    // signal primitive. Going through a process-kill StepOp directly
+    // would bypass the cred check.
     use tx_subsystems::signal::KillScriptOutcome;
     dispatch_errno(
-        tx_subsystems::signal::script_kill_process(&ctx.process, &target, signum, siginfo),
+        tx_subsystems::signal::script_kill_process_with_posts(
+            &ctx.process,
+            &target,
+            signum,
+            siginfo,
+            |mailbox, event| ctx.post_mailbox_event(mailbox, event),
+            |mailbox, event| ctx.post_mailbox_ref_event(mailbox, event),
+        ),
         |outcome| match outcome {
             KillScriptOutcome::Delivered | KillScriptOutcome::Probed => SyscallResult::Return(0),
             KillScriptOutcome::NoLiveThread => SyscallResult::Error(ESRCH_VALUE),
+            KillScriptOutcome::Retry => SyscallResult::Error(EAGAIN_VALUE),
         },
     )
 }
@@ -1090,7 +1181,13 @@ pub(super) fn sys_tkill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
     // Resolve tid → ThreadIdentity via PidName namespace
     if let Some(PidName::Thread(thread_cap)) = resolve_pid_number_as(tid, PidNameKind::Thread) {
         if sig == 0 {
-            return SyscallResult::Return(0);
+            let Some(target_process) = thread_cap.upgrade_owner_proc() else {
+                return SyscallResult::Error(ESRCH_VALUE);
+            };
+            return signal_probe_result(tx_subsystems::signal::script_kill_probe(
+                &ctx.process,
+                &target_process,
+            ));
         }
         let signum = match u8::try_from(sig).ok().and_then(Signum::new) {
             Some(s) => s,
@@ -1099,16 +1196,18 @@ pub(super) fn sys_tkill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
 
         #[cfg(target_arch = "loongarch64")]
         if signum.raw() == MUSL_SIGCANCEL {
-            if let Some(proc_cap) = thread_cap.upgrade_owner_proc() {
-                // LA64 signal-frame delivery for musl's private
-                // SIGCANCEL path is not ABI-complete yet. Until the
-                // handler path is fixed, fail the current libctest
-                // child fast instead of leaving pthread_join blocked
-                // forever on the target thread's clear_child_tid futex.
-                tx_subsystems::process::execution::step_exit_group_with_signal(&proc_cap, signum);
-                return SyscallResult::Return(0);
-            }
-            return SyscallResult::Error(ESRCH_VALUE);
+            // LA64 signal-frame delivery for musl's private SIGCANCEL path is
+            // not ABI-complete yet. Authorize exactly like normal tkill before
+            // terminating the target's process as a bounded fail-fast.
+            return signal_delivery_result(
+                tx_subsystems::signal::script_authorized_thread_exit_with_posts(
+                    &ctx.process,
+                    &thread_cap,
+                    signum,
+                    |mailbox, event| ctx.post_mailbox_event(mailbox, event),
+                    |mailbox, event| ctx.post_mailbox_ref_event(mailbox, event),
+                ),
+            );
         }
 
         let siginfo = Some(SigInfo {
@@ -1117,18 +1216,14 @@ pub(super) fn sys_tkill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
             si_pid: ctx.process.pid.0,
             si_uid: 0,
         });
-        return match tx_subsystems::signal::script_deliver_signal(
+        return signal_delivery_result(tx_subsystems::signal::script_deliver_signal_with_posts(
             &ctx.process,
             SignalTarget::Thread(thread_cap),
             signum,
             siginfo,
-        ) {
-            Ok(tx_subsystems::signal::KillOutcome::Delivered) => SyscallResult::Return(0),
-            Ok(tx_subsystems::signal::KillOutcome::NoLiveThread) => {
-                SyscallResult::Error(ESRCH_VALUE)
-            }
-            Err(errno) => SyscallResult::Error(errno_to_i32(errno)),
-        };
+            |mailbox, event| ctx.post_mailbox_event(mailbox, event),
+            |mailbox, event| ctx.post_mailbox_ref_event(mailbox, event),
+        ));
     }
 
     SyscallResult::Error(ESRCH_VALUE)
@@ -1148,12 +1243,21 @@ pub(super) fn sys_tgkill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
     // (caller may only tgkill threads in its own thread group). This
     // is what makes the cred check below trivially self-permitted —
     // when cross-process tgkill lands the dispatch must route through
-    // `script_deliver_signal` (cred-checked) the way sys_tkill does.
+    // `script_deliver_signal_with_posts` (cred-checked) the way sys_tkill does.
     if tgid != ctx.process.pid.0 {
         return SyscallResult::Error(ESRCH_VALUE);
     }
     if sig == 0 {
-        return SyscallResult::Return(0);
+        let Some(thread) = ctx.process.thread_by_tid(tid) else {
+            return SyscallResult::Error(ESRCH_VALUE);
+        };
+        let Some(target_process) = thread.upgrade_owner_proc() else {
+            return SyscallResult::Error(ESRCH_VALUE);
+        };
+        return signal_probe_result(tx_subsystems::signal::script_kill_probe(
+            &ctx.process,
+            &target_process,
+        ));
     }
     let signum = match u8::try_from(sig).ok().and_then(Signum::new) {
         Some(s) => s,
@@ -1162,11 +1266,17 @@ pub(super) fn sys_tgkill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
     if let Some(thread) = ctx.process.thread_by_tid(tid) {
         #[cfg(target_arch = "loongarch64")]
         if signum.raw() == MUSL_SIGCANCEL {
-            // Same LA64 SIGCANCEL fail-fast as sys_tkill above. The
-            // tgid check already proved this targets the caller's
-            // thread group, so terminate that test child process.
-            tx_subsystems::process::execution::step_exit_group_with_signal(&ctx.process, signum);
-            return SyscallResult::Return(0);
+            // Keep the caller-tgid restriction above, then run the same target
+            // lifecycle and credential authorization as normal tgkill.
+            return signal_delivery_result(
+                tx_subsystems::signal::script_authorized_thread_exit_with_posts(
+                    &ctx.process,
+                    &thread,
+                    signum,
+                    |mailbox, event| ctx.post_mailbox_event(mailbox, event),
+                    |mailbox, event| ctx.post_mailbox_ref_event(mailbox, event),
+                ),
+            );
         }
 
         let siginfo = Some(SigInfo {
@@ -1175,16 +1285,14 @@ pub(super) fn sys_tgkill(args: [u64; 6], ctx: &SyscallCtx) -> SyscallResult {
             si_pid: ctx.process.pid.0,
             si_uid: 0,
         });
-        let mut script_ctx = build_subject_script_ctx(ctx);
-        let mut op = ThreadKillOp {
-            thread,
-            sig: signum,
-            info: siginfo,
-        };
-        match step_engine::drive_oneshot(&mut op, &mut script_ctx) {
-            Ok(()) => return SyscallResult::Return(0),
-            Err(v3errno) => return SyscallResult::error_from(Errno::from(v3errno)),
-        }
+        return signal_delivery_result(tx_subsystems::signal::script_deliver_signal_with_posts(
+            &ctx.process,
+            SignalTarget::Thread(thread),
+            signum,
+            siginfo,
+            |mailbox, event| ctx.post_mailbox_event(mailbox, event),
+            |mailbox, event| ctx.post_mailbox_ref_event(mailbox, event),
+        ));
     }
     SyscallResult::Error(ESRCH_VALUE)
 }

@@ -6,7 +6,7 @@ use std::{
 use tx_reactor::{
     completion::{Completion, CountdownCompletion},
     wait::{WaitOutcome, WaitProtocol},
-    Reactor, RunStats, TaskStatus,
+    HartId, InitialSchedMeta, Reactor, RescheduleSignal, RunStats, TaskStatus, WakeDispatchReport,
 };
 
 fn nz(count: u32) -> NonZeroU32 {
@@ -21,18 +21,30 @@ fn recorded(outcome: &Arc<Mutex<Option<WaitOutcome>>>) -> Option<WaitOutcome> {
     *outcome.lock().expect("outcome lock poisoned")
 }
 
+#[derive(Default)]
+struct RecordingRescheduleSignal {
+    sent: Vec<HartId>,
+}
+
+impl RescheduleSignal for RecordingRescheduleSignal {
+    fn send_reschedule_ipi(&mut self, target_hart: HartId) -> bool {
+        self.sent.push(target_hart);
+        true
+    }
+}
+
 #[test]
 fn counted_completion_consumes_available_credits_once() {
     let completion = Completion::new();
 
     assert!(!completion.try_consume());
 
-    completion.complete();
+    completion.complete_with_post(|mailbox, event| mailbox.post(event));
     assert!(completion.try_consume());
     assert!(!completion.try_consume());
 
-    completion.complete();
-    completion.complete();
+    completion.complete_with_post(|mailbox, event| mailbox.post(event));
+    completion.complete_with_post(|mailbox, event| mailbox.post(event));
     assert!(completion.try_consume());
     assert!(completion.try_consume());
     assert!(!completion.try_consume());
@@ -43,7 +55,7 @@ fn counted_wait_consumes_preexisting_credit() {
     let completion = Arc::new(Completion::new());
     let outcome = Arc::new(Mutex::new(None));
 
-    completion.complete();
+    completion.complete_with_post(|mailbox, event| mailbox.post(event));
 
     let reactor = Reactor::new();
     let task = {
@@ -107,7 +119,7 @@ fn counted_completion_wake_is_rechecked_and_consumed_by_one_waiter() {
     assert_eq!(reactor.task_status(first), Some(TaskStatus::Parked));
     assert_eq!(reactor.task_status(second), Some(TaskStatus::Parked));
 
-    completion.complete();
+    completion.complete_with_post(|mailbox, event| mailbox.post(event));
     assert_eq!(
         reactor.run_until_idle(),
         RunStats {
@@ -120,7 +132,7 @@ fn counted_completion_wake_is_rechecked_and_consumed_by_one_waiter() {
     assert_eq!(ready_count, 1);
     assert!(!completion.try_consume());
 
-    completion.complete();
+    completion.complete_with_post(|mailbox, event| mailbox.post(event));
     assert_eq!(
         reactor.run_until_idle(),
         RunStats {
@@ -132,6 +144,54 @@ fn counted_completion_wake_is_rechecked_and_consumed_by_one_waiter() {
     assert_eq!(recorded(&second_outcome), Some(WaitOutcome::Ready));
     assert_eq!(reactor.task_status(first), Some(TaskStatus::Completed));
     assert_eq!(reactor.task_status(second), Some(TaskStatus::Completed));
+}
+
+#[test]
+fn counted_completion_complete_with_post_routes_owner_aware() {
+    let reactor = Reactor::new();
+    let completion = Arc::new(Completion::new());
+    let outcome = Arc::new(Mutex::new(None));
+    let task = reactor.submit_task_with_meta(
+        {
+            let completion = Arc::clone(&completion);
+            let outcome = Arc::clone(&outcome);
+            async move {
+                record(&outcome, completion.wait(WaitProtocol::Interruptible).await);
+            }
+        },
+        InitialSchedMeta::kernel().with_affinity(0b0001),
+    );
+
+    assert_eq!(reactor.run_until_idle_on_hart(HartId(0)).polled, 1);
+    assert_eq!(reactor.task_key_status(task), Some(TaskStatus::Parked));
+
+    let mut signal = RecordingRescheduleSignal::default();
+    let mut report = WakeDispatchReport::empty();
+    let woken = completion.complete_with_post(|mailbox, event| {
+        let (posted, next) =
+            reactor.post_mailbox_ref_event_from_hart(mailbox, event, HartId(1), &mut signal);
+        report.merge(next);
+        posted
+    });
+
+    assert_eq!(woken, 1);
+    assert_eq!(
+        report,
+        WakeDispatchReport {
+            placements: 1,
+            local_reschedules: 0,
+            remote_ipis: 1,
+        }
+    );
+    assert_eq!(signal.sent, vec![HartId(0)]);
+    assert_eq!(
+        reactor.run_until_idle_on_hart(HartId(0)),
+        RunStats {
+            polled: 1,
+            completed: 1,
+        }
+    );
+    assert_eq!(recorded(&outcome), Some(WaitOutcome::Ready));
 }
 
 #[test]
@@ -178,6 +238,63 @@ fn counted_completion_wait_propagates_timeout() {
 }
 
 #[test]
+fn countdown_completion_arrive_with_post_routes_owner_aware_on_final_arrival() {
+    let reactor = Reactor::new();
+    let countdown = Arc::new(CountdownCompletion::new(nz(2)));
+    let outcome = Arc::new(Mutex::new(None));
+    let task = reactor.submit_task_with_meta(
+        {
+            let countdown = Arc::clone(&countdown);
+            let outcome = Arc::clone(&outcome);
+            async move {
+                record(&outcome, countdown.wait(WaitProtocol::Killable).await);
+            }
+        },
+        InitialSchedMeta::kernel().with_affinity(0b0001),
+    );
+
+    assert_eq!(reactor.run_until_idle_on_hart(HartId(0)).polled, 1);
+    assert_eq!(reactor.task_key_status(task), Some(TaskStatus::Parked));
+
+    let mut signal = RecordingRescheduleSignal::default();
+    let mut report = WakeDispatchReport::empty();
+    let first_woken = countdown.arrive_with_post(|mailbox, event| {
+        let (posted, next) =
+            reactor.post_mailbox_ref_event_from_hart(mailbox, event, HartId(1), &mut signal);
+        report.merge(next);
+        posted
+    });
+    assert_eq!(first_woken, 0);
+    assert_eq!(report, WakeDispatchReport::empty());
+    assert!(signal.sent.is_empty());
+
+    let second_woken = countdown.arrive_with_post(|mailbox, event| {
+        let (posted, next) =
+            reactor.post_mailbox_ref_event_from_hart(mailbox, event, HartId(1), &mut signal);
+        report.merge(next);
+        posted
+    });
+    assert_eq!(second_woken, 1);
+    assert_eq!(
+        report,
+        WakeDispatchReport {
+            placements: 1,
+            local_reschedules: 0,
+            remote_ipis: 1,
+        }
+    );
+    assert_eq!(signal.sent, vec![HartId(0)]);
+    assert_eq!(
+        reactor.run_until_idle_on_hart(HartId(0)),
+        RunStats {
+            polled: 1,
+            completed: 1,
+        }
+    );
+    assert_eq!(recorded(&outcome), Some(WaitOutcome::Ready));
+}
+
+#[test]
 fn countdown_completion_waits_until_final_arrival() {
     let countdown = Arc::new(CountdownCompletion::new(nz(2)));
     let outcome = Arc::new(Mutex::new(None));
@@ -201,7 +318,7 @@ fn countdown_completion_waits_until_final_arrival() {
     );
     assert_eq!(reactor.task_status(task), Some(TaskStatus::Parked));
 
-    countdown.arrive();
+    countdown.arrive_with_post(|mailbox, event| mailbox.post(event));
     assert!(!countdown.is_complete());
     assert_eq!(
         reactor.run_until_idle(),
@@ -212,7 +329,7 @@ fn countdown_completion_waits_until_final_arrival() {
     );
     assert_eq!(recorded(&outcome), None);
 
-    countdown.arrive();
+    countdown.arrive_with_post(|mailbox, event| mailbox.post(event));
     assert!(countdown.is_complete());
     assert_eq!(
         reactor.run_until_idle(),
@@ -230,6 +347,6 @@ fn countdown_completion_waits_until_final_arrival() {
 fn countdown_arrive_panics_on_underflow() {
     let countdown = CountdownCompletion::new(nz(1));
 
-    countdown.arrive();
-    countdown.arrive();
+    countdown.arrive_with_post(|mailbox, event| mailbox.post(event));
+    countdown.arrive_with_post(|mailbox, event| mailbox.post(event));
 }

@@ -3,7 +3,16 @@
 use super::*;
 
 use crate::linux_syscall::{NR_EVENTFD2, NR_IO_URING_ENTER, NR_IO_URING_SETUP};
+use tx_subsystems::io_uring::notification::CQE_AVAILABLE;
 use tx_subsystems::io_uring::SqeStub;
+
+static IO_URING_REF_POST_COUNT: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+fn counting_io_uring_ref_post(mailbox: &TaskMailbox, event: MailboxEvent) -> bool {
+    IO_URING_REF_POST_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    mailbox.post(event)
+}
 
 const E_BADF: i32 = 9;
 const E_INVAL: i32 = 22;
@@ -41,10 +50,22 @@ fn dispatch_io_uring_enter_zero_submit_returns_zero() {
 #[test]
 fn dispatch_io_uring_enter_drains_in_kernel_submission_ring() {
     let (_setup, proc_cap, thread) = io_uring_setup();
-    let ctx = make_ctx(proc_cap.clone(), thread);
+    IO_URING_REF_POST_COUNT.store(0, core::sync::atomic::Ordering::Release);
+    let ctx = make_ctx(proc_cap.clone(), thread).with_mailbox_ref_post(counting_io_uring_ref_post);
     let fd = create_io_uring(&ctx, 4);
     let ring_file = proc_cap.fd(fd as u32).expect("uring fd installed");
     let ring = ring_file.io_uring().expect("uring backing").clone();
+    let mailbox = Arc::new(TaskMailbox::new());
+    let generation = mailbox.next_generation();
+    let _sub = ring
+        .cqe_available_endpoint()
+        .prepare(
+            Arc::downgrade(&mailbox),
+            generation,
+            InterestMask::new(CQE_AVAILABLE),
+        )
+        .install();
+    let cqe_source = ring.cqe_available_id();
     ring.push_sqe_for_test(SqeStub::new(0, 0x1111))
         .expect("first sqe");
     ring.push_sqe_for_test(SqeStub::new(0, 0x2222))
@@ -60,6 +81,23 @@ fn dispatch_io_uring_enter_drains_in_kernel_submission_ring() {
     assert_eq!(cqe.user_data, 0x1111);
     assert_eq!(cqe.res, 0);
     assert_eq!(cqe.flags, 0);
+    assert_eq!(
+        IO_URING_REF_POST_COUNT.load(core::sync::atomic::Ordering::Acquire),
+        1,
+        "io_uring_enter CQE publication should use SyscallCtx mailbox-ref post"
+    );
+    match mailbox.poll().expect("cqe source fired") {
+        MailboxEvent::SourceFired {
+            generation: seen_generation,
+            source,
+            interests,
+        } => {
+            assert_eq!(seen_generation, generation);
+            assert_eq!(source.raw(), cqe_source);
+            assert_eq!(interests.raw(), CQE_AVAILABLE);
+        }
+        other => panic!("expected cqe SourceFired, got {other:?}"),
+    }
 }
 
 #[test]

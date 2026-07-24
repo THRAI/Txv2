@@ -19,9 +19,10 @@
 //!    in-kernel SQ scaffold into CQEs, and returns the submitted count.
 //! 3. Setup also spawns the SQPOLL kthread for the new ring by
 //!    constructing a [`SqpollWorkerFuture`] via
-//!    [`tx_subsystems::io_uring::spawn_sqpoll_worker`] and stashing it
-//!    in a per-ring registry [`take_io_uring_worker_for_test`]. This
-//!    mirrors W-CC's PR-11 phase 2 deferred-pump model verbatim.
+//!    [`tx_subsystems::io_uring::spawn_sqpoll_worker_with_completion_post`]
+//!    and stashing it in a per-ring registry
+//!    [`take_io_uring_worker_for_test`]. This mirrors W-CC's PR-11 phase 2
+//!    deferred-pump model verbatim.
 //!
 //! # Linux divergence
 //!
@@ -53,7 +54,10 @@ extern crate alloc;
 use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use tx_subsystems::io_uring::{spawn_sqpoll_worker, CqeStub, IoUring, SqpollWorkerFuture};
+use tx_subsystems::io_uring::{
+    spawn_sqpoll_worker_with_completion_post, CqeStub, IoUring, SqpollCompletionPost,
+    SqpollWorkerFuture,
+};
 use tx_subsystems::vfs::structure::OpenFileFlags;
 use tx_subsystems::vfs::OpenFile;
 
@@ -76,6 +80,24 @@ fn build_owner_subject(ctx: &SyscallCtx<'_>) -> crate::KernelSubjectContext {
     crate::KernelSubjectContext::from_thread(ctx.process.clone(), ctx.thread.clone(), authority)
 }
 
+fn build_sqpoll_completion_post(ctx: &SyscallCtx<'_>) -> SqpollCompletionPost {
+    let with_hint = ctx.mailbox_ref_post_with_hint;
+    let plain = ctx.mailbox_ref_post;
+    alloc::sync::Arc::new(move |mailbox, event| {
+        if let Some(post) = with_hint {
+            return post(
+                mailbox,
+                event,
+                tx_substrate::wake::MailboxSchedulerHint::Normal,
+            );
+        }
+        if let Some(post) = plain {
+            return post(mailbox, event);
+        }
+        mailbox.post(event)
+    })
+}
+
 /// `io_uring_setup(entries, params)` syscall arm — second
 /// `OnBehalfOf<P>` canary.
 ///
@@ -92,7 +114,7 @@ fn build_owner_subject(ctx: &SyscallCtx<'_>) -> crate::KernelSubjectContext {
 /// 1. Mint a fresh `Cap<IoUring>` via the W-LL phase 0 zone.
 /// 2. Build the owner's `SubjectContext` from the syscall ctx.
 /// 3. Construct the SQPOLL kthread future via
-///    [`spawn_sqpoll_worker`]. The kthread enters
+///    [`spawn_sqpoll_worker_with_completion_post`]. The kthread enters
 ///    `with_on_behalf_of(owner, body)` at startup; the borrow holds
 ///    for the entire ring lifetime (per D8 §13).
 /// 4. Stash the kthread future in the test registry keyed by
@@ -121,7 +143,13 @@ pub(super) fn sys_io_uring_setup(
     // function-pointer seam (a future PR-12 phase 2b follow-up).
     let ring_id = ring_cap.ring_id();
     let owner_subject = build_owner_subject(ctx);
-    let worker = spawn_sqpoll_worker(ring_cap.clone(), ctx.process.clone(), owner_subject);
+    let completion_post = build_sqpoll_completion_post(ctx);
+    let worker = spawn_sqpoll_worker_with_completion_post(
+        ring_cap.clone(),
+        ctx.process.clone(),
+        owner_subject,
+        completion_post,
+    );
     install_io_uring_worker_for_test(ring_id, worker);
 
     // 5. Wrap in an `OpenFile`. Phase 0 leaves every `OpenFileFlags`
@@ -185,7 +213,9 @@ pub(super) fn sys_io_uring_enter(args: [u64; 6], ctx: &SyscallCtx<'_>) -> Syscal
         let Some(sqe) = ring.pop_sqe() else {
             break;
         };
-        ring.push_cqe(CqeStub::new(sqe.user_data, 0, 0));
+        ring.push_cqe_with_post(CqeStub::new(sqe.user_data, 0, 0), |mailbox, event| {
+            ctx.post_mailbox_ref_event(mailbox, event)
+        });
         submitted += 1;
     }
 

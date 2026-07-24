@@ -2,8 +2,7 @@
 // jumbo split).
 //
 // Thin wrappers over the SBI ecall ABI used by the QEMU-virt board: legacy
-// set_timer (EID 0), legacy console putchar / getchar (EID 1, 2), legacy
-// shutdown (EID 8), HSM hart_start
+// console putchar / getchar (EID 1, 2), legacy shutdown (EID 8), HSM hart_start
 // (EID 0x48534D / fid 0), sPI send_ipi (EID 0x735049), and RFNC remote-fence
 // variants (EID 0x52464E43, fids 0/1/2). Each ecall site owns its own
 // `core::arch::asm!` so the constraint set stays local; non-rv64 builds expose
@@ -16,6 +15,7 @@ pub(super) fn sbi_console_putchar(byte: u8) {
             "ecall",
             inlateout("a0") byte as usize => _,
             in("a7") 1usize,
+            clobber_abi("C"),
             options(nostack)
         );
     }
@@ -41,6 +41,7 @@ pub(super) fn sbi_console_getchar() -> Option<u8> {
             "ecall",
             lateout("a0") value,
             in("a7") 2usize,
+            clobber_abi("C"),
             options(nostack)
         );
     }
@@ -69,6 +70,7 @@ pub(super) fn sbi_hart_start(hart_id: usize, start_addr: usize, opaque: usize) -
             in("a6") 0usize,
             in("a7") 0x48534dusize,
             lateout("a1") _,
+            clobber_abi("C"),
             options(nostack)
         );
     }
@@ -86,6 +88,7 @@ pub(super) fn sbi_send_ipi(hart_mask: u64, hart_mask_base: usize) -> isize {
             in("a6") 0usize,
             in("a7") 0x735049usize,
             lateout("a1") _,
+            clobber_abi("C"),
             options(nostack)
         );
     }
@@ -103,6 +106,7 @@ pub(super) fn sbi_remote_fence_i(hart_mask: u64, hart_mask_base: usize) -> isize
             in("a6") 0usize,
             in("a7") 0x52464e43usize,
             lateout("a1") _,
+            clobber_abi("C"),
             options(nostack)
         );
     }
@@ -127,6 +131,7 @@ pub(super) fn sbi_remote_sfence_vma(
             in("a6") 1usize,
             in("a7") 0x52464e43usize,
             lateout("a1") _,
+            clobber_abi("C"),
             options(nostack)
         );
     }
@@ -153,6 +158,7 @@ pub(super) fn sbi_remote_sfence_vma_asid(
             in("a6") 2usize,
             in("a7") 0x52464e43usize,
             lateout("a1") _,
+            clobber_abi("C"),
             options(nostack)
         );
     }
@@ -160,23 +166,8 @@ pub(super) fn sbi_remote_sfence_vma_asid(
 }
 
 #[cfg(target_arch = "riscv64")]
-pub(super) fn sbi_set_timer(deadline_ticks: u64) {
-    unsafe {
-        core::arch::asm!(
-            "ecall",
-            inlateout("a0") deadline_ticks as usize => _,
-            in("a7") 0usize,
-            options(nostack)
-        );
-    }
-}
-
-#[cfg(not(target_arch = "riscv64"))]
-pub(super) fn sbi_set_timer(_deadline_ticks: u64) {}
-
-#[cfg(target_arch = "riscv64")]
 pub(super) fn sbi_shutdown() {
     unsafe {
-        core::arch::asm!("ecall", in("a7") 8usize, options(nostack));
+        core::arch::asm!("ecall", in("a7") 8usize, clobber_abi("C"), options(nostack));
     }
 }

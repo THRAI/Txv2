@@ -208,7 +208,7 @@ pub fn check_chmod_perm(meta: &InodeMeta, cred: &Credential) -> Result<(), Errno
 ///
 /// POSIX / Linux nominally use `CAP_CHOWN` for the arbitrary-uid
 /// case. txKernel's v1 cred surface uses `CAP_FOWNER` as the
-/// privileged-chown gate (matches the choice in `tmpfs::step_chown`,
+/// privileged-chown gate (matches the choice in `tmpfs::chown_inode`,
 /// `devfs`, `bdevfs`, and `procfs` step bodies — slice-level
 /// simplification, not a final architectural decision).
 ///
@@ -225,7 +225,7 @@ pub fn check_chmod_perm(meta: &InodeMeta, cred: &Credential) -> Result<(), Errno
 /// change requested).
 ///
 /// Returns `Errno::EPERM` on denial. Matches the per-FS rule the
-/// existing step_chown implementations enforce; the cred-side
+/// existing chown_inode implementations enforce; the cred-side
 /// predicate is the canonical seam, not a stricter gate.
 pub fn check_chown_perm(
     meta: &InodeMeta,

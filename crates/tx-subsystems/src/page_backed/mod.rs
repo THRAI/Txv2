@@ -6,10 +6,13 @@
 //! `Frame` is intentionally not a zone entity: frame liveness is represented by
 //! typed page-substrate contributors.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 pub mod adapter;
+mod fsync_submission;
 pub mod notification;
 
 use adapter::step_engine::{
@@ -19,23 +22,62 @@ use adapter::step_engine::{
 };
 
 use crate::execution::{Errno, Guard};
-use crate::mount::MountPayloadPin;
+use crate::fs_iface::{BackendPlan, FsObjectKey, IoDataLeaseId, IoDataSource, IoDataTarget};
+use crate::io_manager::backend::{
+    dispatch_backend_plan, BlockPageCompletion, BlockPageRequestTracker, PageFrameRef,
+};
+use crate::io_manager::block::{
+    BlockCompletion, BlockCompletionSource, BlockDispatchExecutor, BlockQueue, BlockRequestId,
+    BlockServiceDriver, BlockServiceNext, BlockTagTable, QueueError, SubmitOutcome,
+};
+use crate::io_manager::page::{
+    service::{
+        PageCompletionRoute, PageService, PageServiceBackendContext, PageServiceBackendDriven,
+        PageServiceBackendOutcome, PageServiceBackendSubmitOutcome, PageServiceDrivenWork,
+        PageServiceNext, PageServiceTaggedBlockCompletionError, PageServiceTurn, PageServiceWork,
+        PageWaitInterest, PageWaiter,
+    },
+    PageContainerKey, PageGeneration, PageIoCompletionKind, PageIoFlags, PageIoOp, PageIoPriority,
+    PageIoRange, PageIoRequest, PageIoRequestId, PageIoResult,
+};
+use crate::io_manager::runtime::{
+    IoServiceKind, QueueDepth, ServiceBudget, ServiceKick, ServiceWakeSource,
+};
+use crate::mount::{MountPayloadBackendContext, MountPayloadPin};
 use crate::sync::SpinMutex;
 use crate::vfs::{FsObjectId, OpenFile};
 use tx_hal::{Ppn, UserPtr};
 use tx_substrate::page_allocator::OwnedFrame;
 
 mod cross_variant;
+mod direct_io;
 mod fs_page_backing;
 mod gift;
 mod lifecycle;
+mod range;
 mod reflink;
+mod slot;
+mod sparse_index;
 mod targeted_read;
 mod user_buffer;
 pub use cross_variant::step_copy_file_range;
+pub use direct_io::{
+    DirectIoBuffer, DirectIoBufferError, DirectIoCompletion, DirectIoOperation, DirectIoSubmission,
+    DirectIoWaitableSubmission,
+};
 pub use fs_page_backing::FsPageBacking;
-pub use lifecycle::{step_fallocate, step_fsync, step_truncate, FallocateOp, TruncateOp};
+pub use fsync_submission::FsyncSubmissionState;
+pub use lifecycle::{step_fallocate, step_fsync, step_truncate, FallocateOp, FsyncOp, TruncateOp};
+pub use range::{
+    PageRange, RangeReservation, RangeReservationError, RangeReservationId, RangeReservationKind,
+    RangeReservationTable,
+};
 pub use reflink::{cow_replace_into_private, install_shared_page};
+pub use slot::{
+    PageSlot, PageSlotCompletionError, PageSlotFetch, PageSlotFsyncStatus, PageSlotSnapshot,
+    PageSlotState,
+};
+use sparse_index::SparseIndex;
 pub use targeted_read::read_exact_at;
 pub use user_buffer::{
     step_read_to_kernel, step_read_to_user, step_write_from_kernel, step_write_from_user,
@@ -111,7 +153,15 @@ pub struct PageMarks {
     pub no_reclaim: bool,
 }
 
-struct PageCacheEntry {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PageCacheMark {
+    Dirty,
+    Writeback,
+    Referenced,
+    NoReclaim,
+}
+
+pub(crate) struct PageCacheEntry {
     ppn: Ppn,
     pin: PageCachePin,
     marks: PageMarks,
@@ -130,6 +180,26 @@ impl PageCacheEntry {
     }
 }
 
+impl PageCacheEntry {
+    fn get_mark(&self, mark: PageCacheMark) -> bool {
+        match mark {
+            PageCacheMark::Dirty => self.marks.dirty,
+            PageCacheMark::Writeback => self.marks.writeback,
+            PageCacheMark::Referenced => self.marks.referenced,
+            PageCacheMark::NoReclaim => self.marks.no_reclaim,
+        }
+    }
+
+    fn set_mark(&mut self, mark: PageCacheMark, value: bool) {
+        match mark {
+            PageCacheMark::Dirty => self.marks.dirty = value,
+            PageCacheMark::Writeback => self.marks.writeback = value,
+            PageCacheMark::Referenced => self.marks.referenced = value,
+            PageCacheMark::NoReclaim => self.marks.no_reclaim = value,
+        }
+    }
+}
+
 impl core::fmt::Debug for PageCacheEntry {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PageCacheEntry")
@@ -140,6 +210,7 @@ impl core::fmt::Debug for PageCacheEntry {
     }
 }
 
+#[derive(Debug)]
 struct CachedFrame {
     ppn: Ppn,
     pin: PageCachePin,
@@ -173,6 +244,53 @@ pub enum PageCacheError {
     Alloc(AllocError),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirectIoBusy {
+    Dirty,
+    Writeback,
+    Fetching,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirectIoAdmissionError {
+    UnsupportedKind,
+    OutOfBounds,
+    Range(RangeReservationError),
+    DuplicateLease(IoDataLeaseId),
+    Busy {
+        page: PageIndex,
+        state: DirectIoBusy,
+    },
+}
+
+impl From<RangeReservationError> for DirectIoAdmissionError {
+    fn from(error: RangeReservationError) -> Self {
+        Self::Range(error)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirectIoCompletionError {
+    UnknownLease(IoDataLeaseId),
+    UnknownReservation(RangeReservationId),
+    WrongReservationKind {
+        expected: RangeReservationKind,
+        actual: RangeReservationKind,
+    },
+    Backend(Errno),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirectIoSubmissionError {
+    UnknownLease(IoDataLeaseId),
+    OperationMismatch,
+    Busy(IoDataLeaseId),
+    MissingBackendPlanner,
+    Backend(Errno),
+    UnsupportedBackendPlan,
+    Queue(Errno),
+}
+
 #[derive(Debug, Default)]
 pub struct PageCacheIndex {
     pages: BTreeMap<PageIndex, PageCacheEntry>,
@@ -186,19 +304,25 @@ impl PageCacheIndex {
     }
 
     pub fn len(&self) -> usize {
-        self.pages.len()
+        <Self as SparseIndex>::len(self)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.pages.is_empty()
+        <Self as SparseIndex>::is_empty(self)
     }
 
     pub fn lookup(&self, page: PageIndex) -> Option<Ppn> {
-        self.pages.get(&page).map(|entry| entry.ppn)
+        self.load(page).map(|entry| entry.ppn)
     }
 
     pub fn marks(&self, page: PageIndex) -> Option<PageMarks> {
-        self.pages.get(&page).map(|entry| entry.marks)
+        self.load(page)?;
+        Some(PageMarks {
+            dirty: self.get_mark(page, PageCacheMark::Dirty),
+            writeback: self.get_mark(page, PageCacheMark::Writeback),
+            referenced: self.get_mark(page, PageCacheMark::Referenced),
+            no_reclaim: self.get_mark(page, PageCacheMark::NoReclaim),
+        })
     }
 
     fn install_if_absent(
@@ -206,12 +330,11 @@ impl PageCacheIndex {
         page: PageIndex,
         frame: CachedFrame,
     ) -> Result<(), PageCacheError> {
-        if let Some(entry) = self.pages.get(&page) {
+        if let Some(entry) = self.load(page) {
             return Err(PageCacheError::AlreadyPresent { current: entry.ppn });
         }
 
-        self.pages.insert(page, PageCacheEntry::new(frame));
-        Ok(())
+        self.insert(page, PageCacheEntry::new(frame))
     }
 
     fn install_if_match(
@@ -220,32 +343,21 @@ impl PageCacheIndex {
         expected: Ppn,
         replacement: Option<CachedFrame>,
     ) -> Result<Option<Ppn>, PageCacheError> {
-        let Some(entry) = self.pages.get_mut(&page) else {
-            return Err(PageCacheError::MissingPage);
-        };
-        if entry.ppn != expected {
-            return Err(PageCacheError::MismatchedFrame { current: entry.ppn });
+        let current = self
+            .load(page)
+            .map(|entry| entry.ppn)
+            .ok_or(PageCacheError::MissingPage)?;
+        if current != expected {
+            return Err(PageCacheError::MismatchedFrame { current });
         }
-
-        let previous = entry.ppn;
-        match replacement {
-            Some(frame) => {
-                *entry = PageCacheEntry::new(frame);
-            }
-            None => {
-                self.pages.remove(&page);
-            }
-        }
-        Ok(Some(previous))
+        let replacement = replacement.map(PageCacheEntry::new);
+        self.compare_replace(page, |entry| entry.ppn == expected, replacement)?;
+        Ok(Some(current))
     }
 
     fn mark_dirty(&mut self, page: PageIndex) -> Result<(), PageCacheError> {
-        let Some(entry) = self.pages.get_mut(&page) else {
-            return Err(PageCacheError::MissingPage);
-        };
-        entry.marks.dirty = true;
-        entry.marks.referenced = true;
-        Ok(())
+        self.set_mark(page, PageCacheMark::Dirty)?;
+        self.set_mark(page, PageCacheMark::Referenced)
     }
 
     fn reclaim_clean_pages(&mut self, budget: usize) -> usize {
@@ -258,14 +370,122 @@ impl PageCacheIndex {
             if reclaimed >= budget {
                 return true;
             }
-            let reclaimable =
-                !entry.marks.dirty && !entry.marks.writeback && !entry.marks.no_reclaim;
+            let reclaimable = !entry.get_mark(PageCacheMark::Dirty)
+                && !entry.get_mark(PageCacheMark::Writeback)
+                && !entry.get_mark(PageCacheMark::NoReclaim);
             if reclaimable {
                 reclaimed += 1;
             }
             !reclaimable
         });
         reclaimed
+    }
+
+    fn invalidate_clean_range(&mut self, range: PageRange) -> Vec<PageIndex> {
+        let invalidated = self
+            .pages
+            .iter()
+            .filter_map(|(page, entry)| {
+                (range.contains(*page)
+                    && !entry.get_mark(PageCacheMark::Dirty)
+                    && !entry.get_mark(PageCacheMark::Writeback))
+                .then_some(*page)
+            })
+            .collect::<Vec<_>>();
+        for page in &invalidated {
+            let _ = self.pages.remove(page);
+        }
+        invalidated
+    }
+}
+
+impl SparseIndex for PageCacheIndex {
+    type Key = PageIndex;
+    type Entry = PageCacheEntry;
+    type Error = PageCacheError;
+    type Mark = PageCacheMark;
+
+    fn len(&self) -> usize {
+        self.pages.len()
+    }
+
+    fn load(&self, key: Self::Key) -> Option<&Self::Entry> {
+        self.pages.get(&key)
+    }
+
+    fn load_mut(&mut self, key: Self::Key) -> Option<&mut Self::Entry> {
+        self.pages.get_mut(&key)
+    }
+
+    fn insert(&mut self, key: Self::Key, entry: Self::Entry) -> Result<(), Self::Error> {
+        if let Some(current) = self.pages.get(&key) {
+            return Err(PageCacheError::AlreadyPresent {
+                current: current.ppn,
+            });
+        }
+        self.pages.insert(key, entry);
+        Ok(())
+    }
+
+    fn compare_replace(
+        &mut self,
+        key: Self::Key,
+        matches: impl FnOnce(&Self::Entry) -> bool,
+        replacement: Option<Self::Entry>,
+    ) -> Result<Option<Self::Entry>, Self::Error> {
+        let Some(current) = self.pages.get(&key) else {
+            return Err(PageCacheError::MissingPage);
+        };
+        if !matches(current) {
+            return Err(PageCacheError::MismatchedFrame {
+                current: current.ppn,
+            });
+        }
+        Ok(match replacement {
+            Some(entry) => self.pages.insert(key, entry),
+            None => self.erase(key),
+        })
+    }
+
+    fn erase(&mut self, key: Self::Key) -> Option<Self::Entry> {
+        self.pages.remove(&key)
+    }
+
+    fn erase_from(&mut self, first: Self::Key) {
+        drop(self.pages.split_off(&first));
+    }
+
+    fn get_mark(&self, key: Self::Key, mark: Self::Mark) -> bool {
+        self.load(key)
+            .map(|entry| entry.get_mark(mark))
+            .unwrap_or(false)
+    }
+
+    fn set_mark(&mut self, key: Self::Key, mark: Self::Mark) -> Result<(), Self::Error> {
+        let Some(entry) = self.load_mut(key) else {
+            return Err(PageCacheError::MissingPage);
+        };
+        entry.set_mark(mark, true);
+        Ok(())
+    }
+
+    fn clear_mark(&mut self, key: Self::Key, mark: Self::Mark) -> Result<(), Self::Error> {
+        let Some(entry) = self.load_mut(key) else {
+            return Err(PageCacheError::MissingPage);
+        };
+        entry.set_mark(mark, false);
+        Ok(())
+    }
+
+    fn marked(&self, mark: Self::Mark) -> bool {
+        self.pages.values().any(|entry| entry.get_mark(mark))
+    }
+
+    fn collect_marked(&self, mark: Self::Mark) -> Vec<(Self::Key, &Self::Entry)> {
+        self.pages
+            .iter()
+            .filter_map(|(key, entry)| entry.get_mark(mark).then_some((*key, entry)))
+            .collect()
     }
 }
 
@@ -314,6 +534,85 @@ pub struct MaterializedPage {
 pub struct PageLease {
     ppn: Ppn,
     cache_pin: PageCachePin,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileFsyncFrontier(Vec<(PageIndex, PageGeneration)>);
+
+impl FileFsyncFrontier {
+    pub fn pages(&self) -> &[(PageIndex, PageGeneration)] {
+        &self.0
+    }
+}
+
+/// One fsync invocation's immutable view of file-page generations.
+///
+/// The session deliberately captures the frontier once. Re-entering after a
+/// yield therefore waits on the same writeback requests instead of treating
+/// later writes as part of the original fsync operation.
+pub struct FileFsyncSession<'a> {
+    pc: &'a PageContainer,
+    frontier: FileFsyncFrontier,
+}
+
+/// Owned fsync state that may cross reactor yields without retaining a guard
+/// or a borrow of the PageContainer.
+#[derive(Default)]
+pub struct FileFsyncState {
+    frontier: Option<FileFsyncFrontier>,
+    request: Option<PageIoRequestId>,
+}
+
+impl FileFsyncState {
+    pub const fn new() -> Self {
+        Self {
+            frontier: None,
+            request: None,
+        }
+    }
+
+    pub fn advance(&mut self, pc: &PageContainer) -> Result<Option<Result<(), Errno>>, Errno> {
+        let frontier = self.frontier.get_or_insert_with(|| {
+            pc.snapshot_file_fsync_frontier()
+                .expect("file PageContainer has an fsync frontier")
+        });
+        match pc.advance_file_fsync_frontier(frontier) {
+            FileFsyncFrontierAdvance::Submitted { .. } | FileFsyncFrontierAdvance::Waiting => {
+                return Ok(None);
+            }
+            FileFsyncFrontierAdvance::Error(errno) => return Err(errno),
+            FileFsyncFrontierAdvance::Complete => {}
+        }
+        let request = match self.request {
+            Some(request) => request,
+            None => {
+                let request = pc.submit_file_fsync().ok_or(Errno::EIO)?;
+                self.request = Some(request);
+                request
+            }
+        };
+        Ok(pc.take_file_fsync_submission(request))
+    }
+}
+
+impl FileFsyncSession<'_> {
+    pub fn frontier(&self) -> &FileFsyncFrontier {
+        &self.frontier
+    }
+
+    /// Submit or observe writeback for the generations captured at entry.
+    /// Callers may issue the filesystem durability fence only after `Complete`.
+    pub fn advance(&self) -> FileFsyncFrontierAdvance {
+        self.pc.advance_file_fsync_frontier(&self.frontier)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FileFsyncFrontierAdvance {
+    Complete,
+    Submitted { pages: u32 },
+    Waiting,
+    Error(Errno),
 }
 
 // PageLease carries page-cache role evidence for an already-live frame.
@@ -407,12 +706,95 @@ unsafe impl Sync for PageContainer {}
 #[derive(Debug)]
 struct PageContainerState {
     pages: PageCacheIndex,
+    file_page_slots: BTreeMap<PageIndex, PageSlot>,
     in_flight_file_pages: BTreeMap<PageIndex, FilePageFetch>,
+    file_io_service: PageService,
+    file_io_leases: BTreeMap<PageIoRequestId, PageLease>,
+    file_io_read_targets: BTreeMap<PageIoRequestId, CachedFrame>,
+    fsync_submissions: BTreeMap<PageIoRequestId, fsync_submission::FsyncSubmission>,
+    background_graphs: BTreeSet<PageIoRequestId>,
+    file_block_runtime: FileIoBlockRuntime,
+    file_io_wake: Option<Arc<ServiceWakeSource>>,
+    range_reservations: RangeReservationTable,
+    direct_io_in_flight: BTreeMap<IoDataLeaseId, direct_io::DirectIoInFlight>,
+    direct_io_completed: BTreeMap<IoDataLeaseId, direct_io::DirectIoCompleted>,
     // Page-scoped retry sources are retained so a task that already received
     // `Yield` can still register and consume a pending wake before it retries
     // and re-observes page state.
     file_page_waits: BTreeMap<PageIndex, notification::PageReadyWait>,
     next_file_fetch_id: u64,
+}
+
+#[derive(Debug)]
+struct FileIoBlockRuntime {
+    queue: BlockQueue,
+    tracker: BlockPageRequestTracker,
+    direct_tracker: DirectIoBlockTracker,
+    depth: QueueDepth,
+    tags: BlockTagTable,
+}
+
+impl FileIoBlockRuntime {
+    fn new(max_pending: usize, queue_depth: usize) -> Self {
+        Self {
+            queue: BlockQueue::new(max_pending),
+            tracker: BlockPageRequestTracker::new(),
+            direct_tracker: DirectIoBlockTracker::default(),
+            depth: QueueDepth::new(queue_depth),
+            tags: BlockTagTable::new(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct DirectIoBlockTracker {
+    pending: BTreeMap<BlockRequestId, Vec<IoDataLeaseId>>,
+}
+
+impl DirectIoBlockTracker {
+    fn record(&mut self, lease: IoDataLeaseId, outcome: SubmitOutcome) {
+        let id = match outcome {
+            SubmitOutcome::Queued(id) | SubmitOutcome::Merged(id) => id,
+        };
+        let leases = self.pending.entry(id).or_default();
+        if !leases.contains(&lease) {
+            leases.push(lease);
+        }
+    }
+
+    fn complete(
+        &mut self,
+        completion: &BlockCompletion,
+    ) -> Vec<(IoDataLeaseId, Result<(), Errno>)> {
+        self.pending
+            .remove(&completion.id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|lease| (lease, completion.result))
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.pending.len()
+    }
+}
+
+enum FileBlockSubmissionTarget<'a> {
+    External {
+        block_queue: &'a mut BlockQueue,
+        tracker: Option<&'a mut BlockPageRequestTracker>,
+    },
+    Owned,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileBlockServiceTurn {
+    pub dispatched: usize,
+    pub device_completions: usize,
+    pub page_completions: usize,
+    pub next: BlockServiceNext,
+    pub kicks: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -421,14 +803,38 @@ struct FilePageFetchId(u64);
 #[derive(Debug)]
 struct FilePageFetch {
     id: FilePageFetchId,
+    generation: PageGeneration,
+    request_id: Option<PageIoRequestId>,
     source_id: Option<u64>,
     joined: bool,
 }
 
 impl FilePageFetch {
+    #[cfg(test)]
     const fn new(id: FilePageFetchId) -> Self {
         Self {
             id,
+            generation: PageGeneration::new(id.0),
+            request_id: None,
+            source_id: None,
+            joined: false,
+        }
+    }
+
+    #[cfg(test)]
+    const fn with_l4_request(id: FilePageFetchId, request_id: Option<PageIoRequestId>) -> Self {
+        Self::with_l4_request_generation(id, PageGeneration::new(id.0), request_id)
+    }
+
+    const fn with_l4_request_generation(
+        id: FilePageFetchId,
+        generation: PageGeneration,
+        request_id: Option<PageIoRequestId>,
+    ) -> Self {
+        Self {
+            id,
+            generation,
+            request_id,
             source_id: None,
             joined: false,
         }
@@ -437,7 +843,7 @@ impl FilePageFetch {
 
 enum FilePageFetchStart {
     Cached(Result<MaterializedPage, PageCacheError>),
-    Joined(u64),
+    Joined(Arc<tx_substrate::wake::WaitSource>),
     Owner(FilePageFetchId),
 }
 
@@ -446,6 +852,19 @@ impl PageContainerState {
         let id = self.next_file_fetch_id;
         self.next_file_fetch_id = self.next_file_fetch_id.wrapping_add(1).max(1);
         FilePageFetchId(id)
+    }
+
+    fn register_file_io_waiter(&mut self, request_id: Option<PageIoRequestId>, source_id: u64) {
+        let Some(request_id) = request_id else {
+            return;
+        };
+        let _ = self.file_io_service.wait_on(
+            request_id,
+            PageWaiter {
+                source_id,
+                interests: PageWaitInterest::READY,
+            },
+        );
     }
 }
 
@@ -576,7 +995,18 @@ impl PageContainer {
             size_bytes: AtomicU64::new(capacity),
             state: PageContainerStateCell::new(PageContainerState {
                 pages: PageCacheIndex::new(),
+                file_page_slots: BTreeMap::new(),
                 in_flight_file_pages: BTreeMap::new(),
+                file_io_service: PageService::new(1024),
+                file_io_leases: BTreeMap::new(),
+                file_io_read_targets: BTreeMap::new(),
+                fsync_submissions: BTreeMap::new(),
+                background_graphs: BTreeSet::new(),
+                file_block_runtime: FileIoBlockRuntime::new(1024, 16),
+                file_io_wake: None,
+                range_reservations: RangeReservationTable::new(),
+                direct_io_in_flight: BTreeMap::new(),
+                direct_io_completed: BTreeMap::new(),
                 file_page_waits: BTreeMap::new(),
                 next_file_fetch_id: 1,
             }),
@@ -629,6 +1059,1455 @@ impl PageContainer {
 
     pub fn resident_pages(&self) -> usize {
         self.state.lock().pages.len()
+    }
+
+    fn io_manager_key(&self) -> PageContainerKey {
+        PageContainerKey::new(self as *const Self as usize as u64)
+    }
+
+    pub fn file_backend_context(&self) -> Option<MountPayloadBackendContext<'_>> {
+        let PageContainerKind::File {
+            mount,
+            fs_object_id,
+        } = &self.kind
+        else {
+            return None;
+        };
+        Some(MountPayloadBackendContext::new(
+            mount.payload(),
+            FsObjectKey::new(fs_object_id.as_u64()),
+        ))
+    }
+
+    /// Bind the page container to the service wake endpoint owned by its
+    /// registered L6 executor. The endpoint is a neutral I/O-manager runtime
+    /// handle, not a concrete device reference.
+    pub fn attach_file_io_wake_source(&self, wake_source: Arc<ServiceWakeSource>) -> bool {
+        let mut state = self.state.lock();
+        if state.file_io_wake.is_some() {
+            return false;
+        }
+        state.file_io_wake = Some(wake_source);
+        true
+    }
+
+    /// Reserve an idle range for a direct write. The owner keeps the returned
+    /// token until the corresponding direct-I/O completion releases it.
+    pub fn begin_file_direct_write(
+        &self,
+        range: PageRange,
+    ) -> Result<RangeReservation, DirectIoAdmissionError> {
+        self.begin_file_direct_io(range, RangeReservationKind::DirectWrite)
+    }
+
+    /// Reserve an idle range for a direct read. Direct reads preserve clean
+    /// cached data after completion but still exclude overlapping buffered I/O.
+    pub fn begin_file_direct_read(
+        &self,
+        range: PageRange,
+    ) -> Result<RangeReservation, DirectIoAdmissionError> {
+        self.begin_file_direct_io(range, RangeReservationKind::DirectRead)
+    }
+
+    /// Admit a direct read and retain the user-page DMA pins until its terminal
+    /// completion. Callers pass the returned neutral descriptor to the
+    /// filesystem planner only after this method has returned.
+    pub fn submit_file_direct_read(
+        &self,
+        range: PageRange,
+        buffer: DirectIoBuffer,
+    ) -> Result<DirectIoSubmission, DirectIoAdmissionError> {
+        self.submit_file_direct_io(range, buffer, DirectIoOperation::Read)
+    }
+
+    /// Admit a direct read with a terminal completion wait endpoint.
+    pub fn submit_file_direct_read_waitable(
+        &self,
+        range: PageRange,
+        buffer: DirectIoBuffer,
+    ) -> Result<DirectIoWaitableSubmission, DirectIoAdmissionError> {
+        self.submit_file_direct_io_waitable(range, buffer, DirectIoOperation::Read)
+    }
+
+    /// Admit a direct write and retain the user-page DMA pins until its
+    /// terminal completion.
+    pub fn submit_file_direct_write(
+        &self,
+        range: PageRange,
+        buffer: DirectIoBuffer,
+    ) -> Result<DirectIoSubmission, DirectIoAdmissionError> {
+        self.submit_file_direct_io(range, buffer, DirectIoOperation::Write)
+    }
+
+    /// Admit a direct write with a terminal completion wait endpoint.
+    pub fn submit_file_direct_write_waitable(
+        &self,
+        range: PageRange,
+        buffer: DirectIoBuffer,
+    ) -> Result<DirectIoWaitableSubmission, DirectIoAdmissionError> {
+        self.submit_file_direct_io_waitable(range, buffer, DirectIoOperation::Write)
+    }
+
+    /// Consume the terminal result associated with a waitable direct-I/O submission.
+    pub fn take_file_direct_submission_result(
+        &self,
+        submission: &DirectIoWaitableSubmission,
+    ) -> Option<Result<DirectIoCompletion, DirectIoCompletionError>> {
+        let mut state = self.state.lock();
+        let completed = state.direct_io_completed.remove(&submission.lease_id())?;
+        debug_assert_eq!(
+            notification::page_ready_source_id(&completed.wait),
+            submission.wait_source_id()
+        );
+        Some(completed.result)
+    }
+
+    /// Apply a terminal direct-I/O result and release the associated DMA lease.
+    ///
+    /// The in-flight entry is withdrawn before cache coherency work begins, so
+    /// no PageContainer state lock is held while invoking the completion path.
+    pub fn complete_file_direct_submission(
+        &self,
+        lease: IoDataLeaseId,
+        result: Result<(), Errno>,
+    ) -> Result<DirectIoCompletion, DirectIoCompletionError> {
+        let in_flight = {
+            let mut state = self.state.lock();
+            state
+                .direct_io_in_flight
+                .remove(&lease)
+                .ok_or(DirectIoCompletionError::UnknownLease(lease))?
+        };
+        let direct_io::DirectIoInFlight {
+            reservation,
+            buffer,
+            operation,
+            completion_wait,
+            ..
+        } = in_flight;
+        let completion = match operation {
+            DirectIoOperation::Read => self
+                .complete_file_direct_read(reservation, result)
+                .map(|()| DirectIoCompletion::Read),
+            DirectIoOperation::Write => self
+                .complete_file_direct_write(reservation, result)
+                .map(|invalidated| DirectIoCompletion::Write { invalidated }),
+        };
+        drop(buffer);
+        let notifier = completion_wait.map(|wait| {
+            let notifier = wait.notifier();
+            let replaced = self.state.lock().direct_io_completed.insert(
+                lease,
+                direct_io::DirectIoCompleted {
+                    result: completion,
+                    wait,
+                },
+            );
+            debug_assert!(replaced.is_none());
+            notifier
+        });
+        if let Some(notifier) = notifier {
+            notification::notify_page_ready_with_post(&notifier, |mailbox, event| {
+                mailbox.post(event)
+            });
+        }
+        completion
+    }
+
+    /// Plan a previously admitted direct-I/O lease and put its mapped data bio
+    /// on the owned L6 queue. The lease remains PageContainer-owned until the
+    /// matching tagged device completion reaches `complete_file_direct_submission`.
+    pub fn enqueue_file_direct_submission(
+        &self,
+        submission: &DirectIoSubmission,
+    ) -> Result<(), DirectIoSubmissionError> {
+        let lease = submission.lease_id();
+        {
+            let mut state = self.state.lock();
+            let Some(in_flight) = state.direct_io_in_flight.get_mut(&lease) else {
+                return Err(DirectIoSubmissionError::UnknownLease(lease));
+            };
+            if in_flight.operation != submission.operation() {
+                return Err(DirectIoSubmissionError::OperationMismatch);
+            }
+            if !matches!(in_flight.state, direct_io::DirectIoInFlightState::Admitted) {
+                return Err(DirectIoSubmissionError::Busy(lease));
+            }
+            in_flight.state = direct_io::DirectIoInFlightState::Planning;
+        }
+
+        let Some(context) = self.file_backend_context() else {
+            self.fail_file_direct_submission(lease, Errno::ENOSYS);
+            return Err(DirectIoSubmissionError::MissingBackendPlanner);
+        };
+        let (op, priority, flags) = match submission.operation() {
+            DirectIoOperation::Read => {
+                (PageIoOp::Read, PageIoPriority::Demand, PageIoFlags::DEMAND)
+            }
+            DirectIoOperation::Write => (
+                PageIoOp::Writeback,
+                PageIoPriority::ForegroundWrite,
+                PageIoFlags::WRITEBACK,
+            ),
+        };
+        let request = PageIoRequest::new(
+            PageIoRequestId::new(lease.raw()),
+            self.io_manager_key(),
+            PageIoRange::new(
+                submission.range().start().as_u64(),
+                submission.range().page_count(),
+            ),
+            op,
+            priority,
+            flags,
+            Some(PageGeneration::new(lease.raw())),
+        );
+        let Some(plan) = context
+            .payload()
+            .plan_backend_page_request_with_source_and_target(
+                context.object(),
+                request,
+                submission.source().cloned().unwrap_or(IoDataSource::None),
+                submission.target().cloned().unwrap_or(IoDataTarget::None),
+            )
+        else {
+            self.fail_file_direct_submission(lease, Errno::ENOSYS);
+            return Err(DirectIoSubmissionError::MissingBackendPlanner);
+        };
+        let bio = match plan {
+            BackendPlan::SubmitBios(bios) if bios.as_slice().len() == 1 => bios
+                .into_vec()
+                .into_iter()
+                .next()
+                .expect("checked one direct bio"),
+            BackendPlan::Err(errno) => {
+                self.fail_file_direct_submission(lease, errno);
+                return Err(DirectIoSubmissionError::Backend(errno));
+            }
+            _ => {
+                self.fail_file_direct_submission(lease, Errno::ENOSYS);
+                return Err(DirectIoSubmissionError::UnsupportedBackendPlan);
+            }
+        };
+
+        let queued = {
+            let mut state = self.state.lock();
+            let Some(in_flight) = state.direct_io_in_flight.get(&lease) else {
+                return Err(DirectIoSubmissionError::UnknownLease(lease));
+            };
+            if !matches!(in_flight.state, direct_io::DirectIoInFlightState::Planning) {
+                return Err(DirectIoSubmissionError::Busy(lease));
+            }
+            match state.file_block_runtime.queue.submit(bio) {
+                Ok(outcome) => {
+                    state
+                        .file_block_runtime
+                        .direct_tracker
+                        .record(lease, outcome);
+                    state
+                        .direct_io_in_flight
+                        .get_mut(&lease)
+                        .expect("direct lease stayed registered through planning")
+                        .state = direct_io::DirectIoInFlightState::Queued;
+                    Ok(())
+                }
+                Err(error) => {
+                    state
+                        .direct_io_in_flight
+                        .get_mut(&lease)
+                        .expect("direct lease stayed registered through planning")
+                        .state = direct_io::DirectIoInFlightState::Admitted;
+                    Err(error)
+                }
+            }
+        };
+        match queued {
+            Ok(()) => {
+                self.kick_file_io_service(IoServiceKind::Block);
+                Ok(())
+            }
+            Err(error) => {
+                let errno = direct_queue_errno(error);
+                self.fail_file_direct_submission(lease, errno);
+                Err(DirectIoSubmissionError::Queue(errno))
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn direct_io_in_flight_count_for_test(&self) -> usize {
+        self.state.lock().direct_io_in_flight.len()
+    }
+
+    #[cfg(test)]
+    pub fn direct_io_completed_count_for_test(&self) -> usize {
+        self.state.lock().direct_io_completed.len()
+    }
+
+    #[cfg(test)]
+    pub fn direct_io_block_tracker_len_for_test(&self) -> usize {
+        self.state.lock().file_block_runtime.direct_tracker.len()
+    }
+
+    /// Complete a direct write and conservatively invalidate overlapped clean
+    /// page-cache entries before releasing the direct-write reservation.
+    pub fn complete_file_direct_write(
+        &self,
+        reservation: RangeReservation,
+        result: Result<(), Errno>,
+    ) -> Result<usize, DirectIoCompletionError> {
+        if reservation.kind() != RangeReservationKind::DirectWrite {
+            return Err(DirectIoCompletionError::WrongReservationKind {
+                expected: RangeReservationKind::DirectWrite,
+                actual: reservation.kind(),
+            });
+        }
+        let mut state = self.state.lock();
+        if !state.range_reservations.release(reservation.id()) {
+            return Err(DirectIoCompletionError::UnknownReservation(
+                reservation.id(),
+            ));
+        }
+        if let Err(errno) = result {
+            return Err(DirectIoCompletionError::Backend(errno));
+        }
+        let invalidated = state.pages.invalidate_clean_range(reservation.range());
+        for page in &invalidated {
+            if let Some(slot) = state.file_page_slots.get(page) {
+                slot.invalidate();
+            }
+        }
+        Ok(invalidated.len())
+    }
+
+    /// Release a direct-read reservation after its device result. The default
+    /// coherency policy preserves clean resident cache pages for direct reads.
+    pub fn complete_file_direct_read(
+        &self,
+        reservation: RangeReservation,
+        result: Result<(), Errno>,
+    ) -> Result<(), DirectIoCompletionError> {
+        if reservation.kind() != RangeReservationKind::DirectRead {
+            return Err(DirectIoCompletionError::WrongReservationKind {
+                expected: RangeReservationKind::DirectRead,
+                actual: reservation.kind(),
+            });
+        }
+        let mut state = self.state.lock();
+        if !state.range_reservations.release(reservation.id()) {
+            return Err(DirectIoCompletionError::UnknownReservation(
+                reservation.id(),
+            ));
+        }
+        result.map_err(DirectIoCompletionError::Backend)
+    }
+
+    fn begin_file_direct_io(
+        &self,
+        range: PageRange,
+        kind: RangeReservationKind,
+    ) -> Result<RangeReservation, DirectIoAdmissionError> {
+        if !matches!(self.kind, PageContainerKind::File { .. }) {
+            return Err(DirectIoAdmissionError::UnsupportedKind);
+        }
+        let Some(end) = range.end() else {
+            return Err(DirectIoAdmissionError::Range(
+                RangeReservationError::Overflow,
+            ));
+        };
+        if end.as_u64() > self.page_count {
+            return Err(DirectIoAdmissionError::OutOfBounds);
+        }
+
+        let mut state = self.state.lock();
+        for (page, entry) in &state.pages.pages {
+            if !range.contains(*page) {
+                continue;
+            }
+            if entry.get_mark(PageCacheMark::Writeback) {
+                return Err(DirectIoAdmissionError::Busy {
+                    page: *page,
+                    state: DirectIoBusy::Writeback,
+                });
+            }
+            if entry.get_mark(PageCacheMark::Dirty) {
+                return Err(DirectIoAdmissionError::Busy {
+                    page: *page,
+                    state: DirectIoBusy::Dirty,
+                });
+            }
+        }
+        for (page, slot) in &state.file_page_slots {
+            if !range.contains(*page) {
+                continue;
+            }
+            let busy = match slot.snapshot().state {
+                PageSlotState::Dirty { .. } => Some(DirectIoBusy::Dirty),
+                PageSlotState::Writeback { .. } => Some(DirectIoBusy::Writeback),
+                PageSlotState::Fetching => Some(DirectIoBusy::Fetching),
+                PageSlotState::Empty
+                | PageSlotState::Resident { .. }
+                | PageSlotState::Error { .. } => None,
+            };
+            if let Some(state) = busy {
+                return Err(DirectIoAdmissionError::Busy { page: *page, state });
+            }
+        }
+        if let Some(page) = state
+            .in_flight_file_pages
+            .keys()
+            .copied()
+            .find(|page| range.contains(*page))
+        {
+            return Err(DirectIoAdmissionError::Busy {
+                page,
+                state: DirectIoBusy::Fetching,
+            });
+        }
+        state
+            .range_reservations
+            .try_reserve(range, kind)
+            .map_err(Into::into)
+    }
+
+    fn submit_file_direct_io(
+        &self,
+        range: PageRange,
+        buffer: DirectIoBuffer,
+        operation: DirectIoOperation,
+    ) -> Result<DirectIoSubmission, DirectIoAdmissionError> {
+        self.submit_file_direct_io_with_wait(range, buffer, operation, None)
+    }
+
+    fn submit_file_direct_io_waitable(
+        &self,
+        range: PageRange,
+        buffer: DirectIoBuffer,
+        operation: DirectIoOperation,
+    ) -> Result<DirectIoWaitableSubmission, DirectIoAdmissionError> {
+        let wait = notification::new_page_ready_wait();
+        let wait_source_id = notification::page_ready_source_id(&wait);
+        let wait_endpoint = Arc::clone(notification::page_ready_endpoint(&wait));
+        let submission =
+            self.submit_file_direct_io_with_wait(range, buffer, operation, Some(wait))?;
+        Ok(DirectIoWaitableSubmission::new(
+            submission,
+            wait_source_id,
+            wait_endpoint,
+        ))
+    }
+
+    fn submit_file_direct_io_with_wait(
+        &self,
+        range: PageRange,
+        buffer: DirectIoBuffer,
+        operation: DirectIoOperation,
+        completion_wait: Option<notification::PageReadyWait>,
+    ) -> Result<DirectIoSubmission, DirectIoAdmissionError> {
+        let reservation = match operation {
+            DirectIoOperation::Read => self.begin_file_direct_read(range)?,
+            DirectIoOperation::Write => self.begin_file_direct_write(range)?,
+        };
+        let submission = match operation {
+            DirectIoOperation::Read => DirectIoSubmission::read(range, &buffer),
+            DirectIoOperation::Write => DirectIoSubmission::write(range, &buffer),
+        };
+        let lease = buffer.lease_id();
+        let duplicate = {
+            let mut state = self.state.lock();
+            if state.direct_io_in_flight.contains_key(&lease) {
+                true
+            } else {
+                state.direct_io_in_flight.insert(
+                    lease,
+                    direct_io::DirectIoInFlight {
+                        reservation,
+                        buffer,
+                        operation,
+                        state: direct_io::DirectIoInFlightState::Admitted,
+                        completion_wait,
+                    },
+                );
+                false
+            }
+        };
+        if !duplicate {
+            return Ok(submission);
+        }
+
+        // Lease ids are globally allocated, but do not strand a range if an
+        // internal collision is ever introduced by a future buffer provider.
+        let release = match operation {
+            DirectIoOperation::Read => self.complete_file_direct_read(reservation, Ok(())),
+            DirectIoOperation::Write => self
+                .complete_file_direct_write(reservation, Ok(()))
+                .map(|_| ()),
+        };
+        debug_assert!(release.is_ok());
+        Err(DirectIoAdmissionError::DuplicateLease(lease))
+    }
+
+    fn fail_file_direct_submission(&self, lease: IoDataLeaseId, errno: Errno) {
+        let completion = self.complete_file_direct_submission(lease, Err(errno));
+        debug_assert!(
+            matches!(completion, Err(DirectIoCompletionError::Backend(found)) if found == errno)
+        );
+    }
+
+    fn kick_file_io_service(&self, service: IoServiceKind) {
+        let wake_source = self.state.lock().file_io_wake.clone();
+        if let Some(wake_source) = wake_source {
+            let _ = wake_source.kick_with_post(ServiceKick::new(service), |mailbox, event| {
+                mailbox.post(event)
+            });
+        }
+    }
+
+    /// Move one dirty file page into the L4 writeback queue.
+    ///
+    /// This is only admission: the backend planner and L6 executor own later
+    /// submission and completion. A failed admission restores the slot to
+    /// `Dirty`, so no request is left falsely in flight.
+    pub fn queue_file_page_writeback(&self, page: PageIndex) -> Option<PageIoRequestId> {
+        if !matches!(self.kind, PageContainerKind::File { .. }) {
+            return None;
+        }
+
+        let mut state = self.state.lock();
+        let writeback = state.file_page_slots.get(&page)?.begin_writeback().ok()?;
+        if state
+            .pages
+            .set_mark(page, PageCacheMark::Writeback)
+            .is_err()
+        {
+            if let Some(slot) = state.file_page_slots.get(&page) {
+                let _ = slot.abort_writeback(writeback.generation);
+            }
+            return None;
+        }
+        match state.file_io_service.submit(
+            self.io_manager_key(),
+            PageIoRange::new(page.as_u64(), 1),
+            PageIoOp::Writeback,
+            PageIoPriority::BackgroundWriteback,
+            PageIoFlags::WRITEBACK,
+            Some(writeback.generation),
+        ) {
+            Ok(id) => Some(id),
+            Err(_) => {
+                let _ = state.pages.clear_mark(page, PageCacheMark::Writeback);
+                if let Some(slot) = state.file_page_slots.get(&page) {
+                    let _ = slot.abort_writeback(writeback.generation);
+                }
+                None
+            }
+        }
+    }
+
+    /// Admit all currently dirty file pages to background L4 writeback.
+    ///
+    /// This is intentionally nonblocking: close may request background
+    /// visibility writeback, but only an explicit fsync owns a durability
+    /// frontier and waits for its journal commit.
+    pub fn queue_dirty_file_writeback(&self) -> usize {
+        let Some(frontier) = self.snapshot_file_fsync_frontier() else {
+            return 0;
+        };
+
+        let mut admitted = 0usize;
+        for &(page, _) in frontier.pages() {
+            if self.queue_file_page_writeback(page).is_some() {
+                admitted = admitted.saturating_add(1);
+            }
+        }
+        if admitted != 0 {
+            self.kick_file_io_service(IoServiceKind::Page);
+        }
+        admitted
+    }
+
+    pub fn snapshot_file_fsync_frontier(&self) -> Option<FileFsyncFrontier> {
+        if !matches!(self.kind, PageContainerKind::File { .. }) {
+            return None;
+        }
+        let state = self.state.lock();
+        let mut pages = Vec::new();
+        for (page, slot) in &state.file_page_slots {
+            let snapshot = slot.snapshot();
+            if matches!(
+                snapshot.state,
+                PageSlotState::Dirty { .. } | PageSlotState::Writeback { .. }
+            ) {
+                pages.push((*page, snapshot.generation));
+            }
+        }
+        Some(FileFsyncFrontier(pages))
+    }
+
+    /// Start an fsync session with a stable dirty/writeback generation frontier.
+    pub fn begin_file_fsync_session(&self) -> Option<FileFsyncSession<'_>> {
+        self.snapshot_file_fsync_frontier()
+            .map(|frontier| FileFsyncSession { pc: self, frontier })
+    }
+
+    /// Register one waitable fsync request with L4.
+    ///
+    /// The row remains owned by the PageContainer until terminal L4 completion
+    /// is consumed, so re-entry can retain the request identity rather than
+    /// submit a second journal commit graph.
+    pub fn submit_file_fsync(&self) -> Option<PageIoRequestId> {
+        if !matches!(self.kind, PageContainerKind::File { .. }) || self.page_count == 0 {
+            return None;
+        }
+
+        let mut state = self.state.lock();
+        let id = state
+            .file_io_service
+            .submit(
+                self.io_manager_key(),
+                PageIoRange::new(0, self.page_count),
+                PageIoOp::Fsync,
+                PageIoPriority::Fsync,
+                PageIoFlags::BARRIER,
+                None,
+            )
+            .ok()?;
+        let submission = fsync_submission::FsyncSubmission::new(id);
+        debug_assert_eq!(submission.id(), id);
+        let previous = state.fsync_submissions.insert(id, submission);
+        debug_assert!(previous.is_none(), "L4 request identifiers are unique");
+        Some(id)
+    }
+
+    /// Observe an fsync request without consuming its terminal result.
+    pub fn file_fsync_submission_state(&self, id: PageIoRequestId) -> Option<FsyncSubmissionState> {
+        self.state
+            .lock()
+            .fsync_submissions
+            .get(&id)
+            .map(|submission| submission.state())
+    }
+
+    /// Consume an fsync terminal result exactly once and retire its row.
+    pub fn take_file_fsync_submission(&self, id: PageIoRequestId) -> Option<Result<(), Errno>> {
+        let mut state = self.state.lock();
+        let result = state.fsync_submissions.get_mut(&id)?.take()?;
+        let retired = state.fsync_submissions.remove(&id);
+        debug_assert!(retired.is_some());
+        Some(result)
+    }
+
+    pub fn advance_file_fsync_frontier(
+        &self,
+        frontier: &FileFsyncFrontier,
+    ) -> FileFsyncFrontierAdvance {
+        let mut submitted = 0u32;
+        let mut waiting = false;
+        for &(page, generation) in frontier.pages() {
+            let status = self
+                .state
+                .lock()
+                .file_page_slots
+                .get(&page)
+                .map(|slot| slot.fsync_status(generation));
+            match status {
+                Some(PageSlotFsyncStatus::NeedsWriteback { .. }) => {
+                    if self.queue_file_page_writeback(page).is_some() {
+                        submitted = submitted.saturating_add(1);
+                    } else {
+                        waiting = true;
+                    }
+                }
+                Some(
+                    PageSlotFsyncStatus::WaitingForWriteback { .. }
+                    | PageSlotFsyncStatus::WaitingForEarlierWriteback { .. },
+                ) => waiting = true,
+                Some(PageSlotFsyncStatus::Error { errno }) => {
+                    return FileFsyncFrontierAdvance::Error(errno);
+                }
+                Some(PageSlotFsyncStatus::Clean) | None => {}
+            }
+        }
+        if submitted != 0 {
+            FileFsyncFrontierAdvance::Submitted { pages: submitted }
+        } else if waiting {
+            FileFsyncFrontierAdvance::Waiting
+        } else {
+            FileFsyncFrontierAdvance::Complete
+        }
+    }
+
+    pub fn drive_file_io_service_once<F>(
+        &self,
+        budget: ServiceBudget,
+        block_queue: &mut BlockQueue,
+        kick: F,
+    ) -> Option<PageServiceBackendDriven>
+    where
+        F: FnMut(ServiceKick) -> bool,
+    {
+        self.drive_file_io_service_once_inner(
+            budget,
+            FileBlockSubmissionTarget::External {
+                block_queue,
+                tracker: None,
+            },
+            kick,
+        )
+    }
+
+    pub fn drive_file_io_service_once_with_tracker<F>(
+        &self,
+        budget: ServiceBudget,
+        block_queue: &mut BlockQueue,
+        tracker: &mut BlockPageRequestTracker,
+        kick: F,
+    ) -> Option<PageServiceBackendDriven>
+    where
+        F: FnMut(ServiceKick) -> bool,
+    {
+        self.drive_file_io_service_once_inner(
+            budget,
+            FileBlockSubmissionTarget::External {
+                block_queue,
+                tracker: Some(tracker),
+            },
+            kick,
+        )
+    }
+
+    pub fn drive_file_io_service_once_owned<F>(
+        &self,
+        budget: ServiceBudget,
+        kick: F,
+    ) -> Option<PageServiceBackendDriven>
+    where
+        F: FnMut(ServiceKick) -> bool,
+    {
+        self.drive_file_io_service_once_inner(budget, FileBlockSubmissionTarget::Owned, kick)
+    }
+
+    fn drive_file_io_service_once_inner<F>(
+        &self,
+        budget: ServiceBudget,
+        mut block_target: FileBlockSubmissionTarget<'_>,
+        mut kick: F,
+    ) -> Option<PageServiceBackendDriven>
+    where
+        F: FnMut(ServiceKick) -> bool,
+    {
+        let context = self.file_backend_context()?;
+        let step = {
+            let mut state = self.state.lock();
+            state.file_io_service.drive_turn(budget)
+        };
+        let mut work = Vec::new();
+
+        if let PageServiceTurn::Work(items) = step.turn {
+            for item in items {
+                match item {
+                    PageServiceWork::Completion(route) => {
+                        let _ = self.apply_file_io_completion_route(&route);
+                        work.push(PageServiceDrivenWork::Completion(route));
+                    }
+                    PageServiceWork::Submission(request) => {
+                        let rollback_request = request.clone();
+                        let source = self.file_io_source_for_submission(&request);
+                        let target = self.file_io_target_for_submission(&request);
+                        let guard =
+                            step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
+                        let plan = match context.prepare_submission_with_source_and_target(
+                            &request, &source, &target, &guard,
+                        ) {
+                            Ok(()) => context.plan_submission_with_source_and_target(
+                                request.clone(),
+                                source,
+                                target,
+                            ),
+                            Err(errno) => Some(BackendPlan::Err(errno)),
+                        };
+                        let Some(plan) = plan else {
+                            self.abort_file_writeback_submission(&request);
+                            self.release_file_io_read_target(&request);
+                            work.push(PageServiceDrivenWork::UnplannedSubmission(request));
+                            continue;
+                        };
+                        let dispatch = dispatch_backend_plan(plan);
+                        let outcome = {
+                            let mut state = self.state.lock();
+                            state.file_io_service.consume_backend_dispatch(dispatch)
+                        };
+                        let queued = match &mut block_target {
+                            FileBlockSubmissionTarget::External {
+                                block_queue,
+                                tracker,
+                            } => {
+                                // The compatibility caller cannot route tagged completions into
+                                // this PageContainer's private graph registry.
+                                let queued = match outcome {
+                                    PageServiceBackendOutcome::BlockGraph(_) => {
+                                        Ok(PageServiceBackendSubmitOutcome::Err(Errno::ENOSYS))
+                                    }
+                                    outcome => {
+                                        self.state.lock().file_io_service.queue_backend_outcome(
+                                            outcome,
+                                            block_queue,
+                                            request.clone(),
+                                        )
+                                    }
+                                };
+                                if let (Ok(outcome), Some(tracker)) = (&queued, tracker.as_mut()) {
+                                    record_file_service_block_submissions(tracker, outcome);
+                                }
+                                queued
+                            }
+                            FileBlockSubmissionTarget::Owned => {
+                                let mut state = self.state.lock();
+                                let PageContainerState {
+                                    file_io_service,
+                                    file_block_runtime,
+                                    ..
+                                } = &mut *state;
+                                let queued = file_io_service.queue_backend_outcome(
+                                    outcome,
+                                    &mut file_block_runtime.queue,
+                                    request.clone(),
+                                );
+                                if let Ok(outcome) = &queued {
+                                    record_file_service_block_submissions(
+                                        &mut file_block_runtime.tracker,
+                                        outcome,
+                                    );
+                                }
+                                queued
+                            }
+                        };
+                        if let Ok(outcome) = &queued {
+                            self.register_file_service_metadata(&request, outcome);
+                        }
+                        match queued {
+                            Ok(outcome) => {
+                                work.push(PageServiceDrivenWork::BackendSubmission(outcome));
+                            }
+                            Err(error) => {
+                                self.abort_file_writeback_submission(&rollback_request);
+                                self.release_file_io_read_target(&rollback_request);
+                                work.push(PageServiceDrivenWork::BackendSubmitError(error));
+                            }
+                        }
+                    }
+                    PageServiceWork::BackendResume {
+                        page_request,
+                        resume,
+                    } => {
+                        let Some(plan) = context.resume_submission(resume) else {
+                            self.abort_file_writeback_submission(&page_request);
+                            self.release_file_io_read_target(&page_request);
+                            work.push(PageServiceDrivenWork::UnplannedSubmission(page_request));
+                            continue;
+                        };
+                        let dispatch = dispatch_backend_plan(plan);
+                        let outcome = {
+                            let mut state = self.state.lock();
+                            state.file_io_service.consume_backend_dispatch(dispatch)
+                        };
+                        let queued = match &mut block_target {
+                            FileBlockSubmissionTarget::External {
+                                block_queue,
+                                tracker,
+                            } => {
+                                // The compatibility caller cannot route tagged completions into
+                                // this PageContainer's private graph registry.
+                                let queued = match outcome {
+                                    PageServiceBackendOutcome::BlockGraph(_) => {
+                                        Ok(PageServiceBackendSubmitOutcome::Err(Errno::ENOSYS))
+                                    }
+                                    outcome => {
+                                        self.state.lock().file_io_service.queue_backend_outcome(
+                                            outcome,
+                                            block_queue,
+                                            page_request.clone(),
+                                        )
+                                    }
+                                };
+                                if let (Ok(outcome), Some(tracker)) = (&queued, tracker.as_mut()) {
+                                    record_file_service_block_submissions(tracker, outcome);
+                                }
+                                queued
+                            }
+                            FileBlockSubmissionTarget::Owned => {
+                                let mut state = self.state.lock();
+                                let PageContainerState {
+                                    file_io_service,
+                                    file_block_runtime,
+                                    ..
+                                } = &mut *state;
+                                let queued = file_io_service.queue_backend_outcome(
+                                    outcome,
+                                    &mut file_block_runtime.queue,
+                                    page_request.clone(),
+                                );
+                                if let Ok(outcome) = &queued {
+                                    record_file_service_block_submissions(
+                                        &mut file_block_runtime.tracker,
+                                        outcome,
+                                    );
+                                }
+                                queued
+                            }
+                        };
+                        if let Ok(outcome) = &queued {
+                            self.register_file_service_metadata(&page_request, outcome);
+                        }
+                        match queued {
+                            Ok(outcome) => {
+                                work.push(PageServiceDrivenWork::BackendSubmission(outcome))
+                            }
+                            Err(error) => {
+                                work.push(PageServiceDrivenWork::BackendSubmitError(error))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let next = {
+            let mut state = self.state.lock();
+            state.file_io_service.drive_turn(ServiceBudget::new(0)).next
+        };
+        let kicks = if next == PageServiceNext::Runnable {
+            usize::from(kick(ServiceKick::new(IoServiceKind::Page)))
+        } else {
+            0
+        };
+
+        Some(PageServiceBackendDriven { work, next, kicks })
+    }
+
+    pub fn drive_file_block_io_service_once<E, R, F>(
+        &self,
+        budget: ServiceBudget,
+        executor: &mut E,
+        mut frame_for: R,
+        mut kick: F,
+    ) -> Result<FileBlockServiceTurn, PageServiceTaggedBlockCompletionError>
+    where
+        E: BlockDispatchExecutor + BlockCompletionSource + ?Sized,
+        R: FnMut(&BlockPageCompletion) -> Option<PageFrameRef>,
+        F: FnMut(ServiceKick) -> bool,
+    {
+        let mut driver = BlockServiceDriver::new(budget);
+        let driven = {
+            let mut state = self.state.lock();
+            let runtime = &mut state.file_block_runtime;
+            driver.drive_once(
+                &mut runtime.queue,
+                &mut runtime.depth,
+                &mut runtime.tags,
+                &mut kick,
+            )
+        };
+
+        for dispatch in &driven.step.dispatches {
+            executor.submit(dispatch);
+        }
+
+        let mut device_completions = 0usize;
+        let mut page_completions = 0usize;
+        let mut kicks = driven.kicks;
+        let mut next = driven.step.next;
+        while let Some(completion) = executor.poll_completion() {
+            device_completions += 1;
+            let (outcome, direct_completions) = {
+                let mut state = self.state.lock();
+                let PageContainerState {
+                    file_io_service,
+                    file_block_runtime,
+                    ..
+                } = &mut *state;
+                let block_completion = file_block_runtime.tags.complete(
+                    &mut file_block_runtime.depth,
+                    completion.tag,
+                    completion.result,
+                )?;
+                let direct_completions = file_block_runtime
+                    .direct_tracker
+                    .complete(&block_completion);
+                let allow_external_completion = !direct_completions.is_empty();
+                let outcome = file_io_service.push_completed_block_completion_with_graphs(
+                    &mut file_block_runtime.tracker,
+                    &mut file_block_runtime.queue,
+                    block_completion,
+                    allow_external_completion,
+                    &mut frame_for,
+                )?;
+                (outcome, direct_completions)
+            };
+            for (lease, result) in direct_completions {
+                self.complete_file_direct_submission(lease, result)
+                    .map_err(|_| PageServiceTaggedBlockCompletionError::ExternalCompletion)?;
+            }
+            page_completions += outcome.queued;
+            if outcome.wake.is_some() {
+                kicks += usize::from(kick(ServiceKick::new(IoServiceKind::Page)));
+            }
+            if outcome.block_submitted != 0 {
+                next = BlockServiceNext::Runnable;
+                kicks += usize::from(kick(ServiceKick::new(IoServiceKind::Block)));
+            }
+        }
+
+        Ok(FileBlockServiceTurn {
+            dispatched: driven.step.dispatches.len(),
+            device_completions,
+            page_completions,
+            next,
+            kicks,
+        })
+    }
+
+    fn apply_file_io_completion_route(
+        &self,
+        route: &PageCompletionRoute,
+    ) -> Option<Result<PageSlotSnapshot, PageSlotCompletionError>> {
+        if route.completion.kind == PageIoCompletionKind::Noop {
+            if self
+                .state
+                .lock()
+                .background_graphs
+                .remove(&route.completion.id)
+            {
+                self.notify_file_background_completion(&route.completion);
+                return None;
+            }
+            if self.terminalize_file_fsync_submission(&route.completion) {
+                self.notify_file_backend_completion(&route.completion);
+            }
+            return None;
+        }
+        if route.completion.range.page_count() != 1 {
+            return None;
+        }
+        let page = PageIndex::new(route.completion.range.start_page());
+        if route.completion.kind == PageIoCompletionKind::WritebackFinished {
+            let mut state = self.state.lock();
+            let lease = state.file_io_leases.remove(&route.completion.id);
+            let slot = state.file_page_slots.get(&page)?;
+            let result = slot.complete_writeback(
+                route.completion.generation,
+                match route.completion.result {
+                    PageIoResult::Done => Ok(()),
+                    PageIoResult::Err(errno) => Err(errno),
+                },
+            );
+            if let Ok(snapshot) = result {
+                let _ = state.pages.clear_mark(page, PageCacheMark::Writeback);
+                if matches!(snapshot.state, PageSlotState::Resident { .. }) {
+                    let _ = state.pages.clear_mark(page, PageCacheMark::Dirty);
+                }
+            }
+            drop(lease);
+            return Some(result);
+        }
+        if route.completion.kind != PageIoCompletionKind::ReadInstalled {
+            return None;
+        }
+        let target = self
+            .state
+            .lock()
+            .file_io_read_targets
+            .remove(&route.completion.id);
+        let PageIoResult::Err(errno) = route.completion.result else {
+            return match (route.frame, target) {
+                (Some(frame), Some(target)) if target.ppn == frame.ppn() => {
+                    let result = self.apply_file_io_cached_read_completion(
+                        page,
+                        route.completion.generation,
+                        target,
+                    );
+                    if result.is_ok() {
+                        self.finish_file_page_fetch_after_service_completion(
+                            page,
+                            route.completion.generation,
+                            !route.waiters.is_empty(),
+                        );
+                    }
+                    Some(result)
+                }
+                (Some(frame), target) => {
+                    drop(target);
+                    let result = self.apply_file_io_read_frame_completion(
+                        page,
+                        route.completion.generation,
+                        frame,
+                    );
+                    if result.is_ok() {
+                        self.finish_file_page_fetch_after_service_completion(
+                            page,
+                            route.completion.generation,
+                            !route.waiters.is_empty(),
+                        );
+                    }
+                    Some(result)
+                }
+                (None, Some(target)) => {
+                    let result = self.apply_file_io_cached_read_completion(
+                        page,
+                        route.completion.generation,
+                        target,
+                    );
+                    if result.is_ok() {
+                        self.finish_file_page_fetch_after_service_completion(
+                            page,
+                            route.completion.generation,
+                            !route.waiters.is_empty(),
+                        );
+                    }
+                    Some(result)
+                }
+                (None, None) => None,
+            };
+        };
+        let result = {
+            let state = self.state.lock();
+            let slot = state.file_page_slots.get(&page)?;
+            slot.complete_fetch(route.completion.generation, Err(errno))
+        };
+        if result.is_ok() {
+            self.finish_file_page_fetch_after_service_completion(
+                page,
+                route.completion.generation,
+                !route.waiters.is_empty(),
+            );
+        }
+        Some(result)
+    }
+
+    fn terminalize_file_fsync_submission(
+        &self,
+        completion: &crate::io_manager::page::PageIoCompletion,
+    ) -> bool {
+        let result = match completion.result {
+            PageIoResult::Done => Ok(()),
+            PageIoResult::Err(errno) => Err(errno),
+        };
+        self.state
+            .lock()
+            .fsync_submissions
+            .get_mut(&completion.id)
+            .is_some_and(|submission| submission.complete(result))
+    }
+
+    fn notify_file_backend_completion(
+        &self,
+        completion: &crate::io_manager::page::PageIoCompletion,
+    ) {
+        let PageContainerKind::File {
+            mount,
+            fs_object_id,
+        } = &self.kind
+        else {
+            return;
+        };
+        let Some(planner) = mount.payload().backend_planner() else {
+            return;
+        };
+        planner.complete_page_io(crate::fs_iface::BackendPageCompletion::new(
+            FsObjectKey::new(fs_object_id.as_u64()),
+            completion.id,
+            PageIoOp::Fsync,
+            completion.result,
+        ));
+        if completion.result != PageIoResult::Done {
+            return;
+        }
+        let object = FsObjectKey::new(fs_object_id.as_u64());
+        match planner.take_background_graph(object) {
+            Ok(Some(graph)) => self.queue_file_background_graph(planner, object, graph),
+            Ok(None) => {}
+            Err(_) => {}
+        }
+    }
+
+    fn queue_file_background_graph(
+        &self,
+        planner: &dyn crate::fs_iface::BackendPlanner,
+        object: FsObjectKey,
+        graph: crate::fs_iface::BackendBioGraph,
+    ) {
+        let queued = {
+            let mut state = self.state.lock();
+            let PageContainerState {
+                file_io_service,
+                file_block_runtime,
+                background_graphs,
+                ..
+            } = &mut *state;
+            match file_io_service.reserve_background_request(
+                self.io_manager_key(),
+                PageIoRange::new(0, self.page_count),
+            ) {
+                Ok(request) => match file_io_service.queue_backend_outcome(
+                    PageServiceBackendOutcome::BlockGraph(graph),
+                    &mut file_block_runtime.queue,
+                    request.clone(),
+                ) {
+                    Ok(_) => {
+                        background_graphs.insert(request.id);
+                        Ok(())
+                    }
+                    Err(_) => Err(Errno::EIO),
+                },
+                Err(_) => Err(Errno::EBUSY),
+            }
+        };
+        if let Err(errno) = queued {
+            planner.complete_background_graph(object, Err(errno));
+        }
+    }
+
+    fn notify_file_background_completion(
+        &self,
+        completion: &crate::io_manager::page::PageIoCompletion,
+    ) {
+        let PageContainerKind::File {
+            mount,
+            fs_object_id,
+        } = &self.kind
+        else {
+            return;
+        };
+        let Some(planner) = mount.payload().backend_planner() else {
+            return;
+        };
+        let result = match completion.result {
+            PageIoResult::Done => Ok(()),
+            PageIoResult::Err(errno) => Err(errno),
+        };
+        planner.complete_background_graph(FsObjectKey::new(fs_object_id.as_u64()), result);
+    }
+
+    fn register_file_service_metadata(
+        &self,
+        page_request: &PageIoRequest,
+        outcome: &PageServiceBackendSubmitOutcome,
+    ) {
+        let PageServiceBackendSubmitOutcome::MetadataFirstQueued {
+            backend_request,
+            submitted,
+            resume,
+            ..
+        } = outcome
+        else {
+            return;
+        };
+        self.state
+            .lock()
+            .file_io_service
+            .register_metadata_submission(
+                page_request.clone(),
+                backend_request.clone(),
+                *resume,
+                submitted,
+            );
+    }
+
+    fn file_io_source_for_submission(&self, request: &PageIoRequest) -> IoDataSource {
+        if request.op != PageIoOp::Writeback || request.range.page_count() != 1 {
+            return IoDataSource::None;
+        }
+        let page = PageIndex::new(request.range.start_page());
+        let Some(ppn) = self.state.lock().pages.load(page).map(|entry| entry.ppn) else {
+            return IoDataSource::None;
+        };
+        let Ok(cache_pin) = page_allocator::acquire_cache_pin(ppn) else {
+            return IoDataSource::None;
+        };
+        let lease = PageLease {
+            ppn,
+            cache_pin: PageCachePin::Allocated(cache_pin),
+        };
+        self.state.lock().file_io_leases.insert(request.id, lease);
+        IoDataSource::page_cache(
+            IoDataLeaseId::new(request.id.raw()),
+            PageFrameRef::new(ppn),
+            0,
+            crate::vm::USER_PAGE_SIZE as u32,
+        )
+    }
+
+    fn file_io_target_for_submission(&self, request: &PageIoRequest) -> IoDataTarget {
+        if request.op != PageIoOp::Read || request.range.page_count() != 1 {
+            return IoDataTarget::None;
+        }
+        if !self
+            .state
+            .lock()
+            .in_flight_file_pages
+            .values()
+            .any(|fetch| fetch.request_id == Some(request.id))
+        {
+            return IoDataTarget::None;
+        }
+        let Ok(target) = allocate_cached_frame() else {
+            return IoDataTarget::None;
+        };
+        let frame = PageFrameRef::new(target.ppn);
+        let mut state = self.state.lock();
+        if !state
+            .in_flight_file_pages
+            .values()
+            .any(|fetch| fetch.request_id == Some(request.id))
+        {
+            return IoDataTarget::None;
+        }
+        state.file_io_read_targets.insert(request.id, target);
+        IoDataTarget::page_cache(
+            IoDataLeaseId::new(request.id.raw()),
+            frame,
+            0,
+            crate::vm::USER_PAGE_SIZE as u32,
+        )
+    }
+
+    fn release_file_io_read_target(&self, request: &PageIoRequest) {
+        let _ = self.state.lock().file_io_read_targets.remove(&request.id);
+    }
+
+    fn abort_file_writeback_submission(&self, request: &PageIoRequest) {
+        if request.op != PageIoOp::Writeback || request.range.page_count() != 1 {
+            return;
+        }
+        let page = PageIndex::new(request.range.start_page());
+        let mut state = self.state.lock();
+        let lease = state.file_io_leases.remove(&request.id);
+        let _ = state.pages.clear_mark(page, PageCacheMark::Writeback);
+        if let (Some(slot), Some(generation)) =
+            (state.file_page_slots.get(&page), request.generation_hint)
+        {
+            let _ = slot.abort_writeback(generation);
+        }
+        drop(lease);
+    }
+
+    fn apply_file_io_read_frame_completion(
+        &self,
+        page: PageIndex,
+        generation: PageGeneration,
+        frame: crate::fs_iface::PageFrameRef,
+    ) -> Result<PageSlotSnapshot, PageSlotCompletionError> {
+        let cached = match cached_frame_from_frame(Frame::new(frame.ppn())) {
+            Ok(frame) => frame,
+            Err(error) => {
+                let state = self.state.lock();
+                let Some(slot) = state.file_page_slots.get(&page) else {
+                    return Err(PageSlotCompletionError::NotFetching {
+                        state: PageSlotState::Empty,
+                        generation: PageGeneration::new(0),
+                    });
+                };
+                return slot.complete_fetch(generation, Err(page_cache_error_to_errno(error)));
+            }
+        };
+        self.apply_file_io_cached_read_completion(page, generation, cached)
+    }
+
+    fn apply_file_io_cached_read_completion(
+        &self,
+        page: PageIndex,
+        generation: PageGeneration,
+        cached: CachedFrame,
+    ) -> Result<PageSlotSnapshot, PageSlotCompletionError> {
+        let ppn = cached.ppn;
+        let mut state = self.state.lock();
+        let installed_ppn = match state.pages.lookup(page) {
+            Some(current) => current,
+            None => match state.pages.install_if_absent(page, cached) {
+                Ok(()) => ppn,
+                Err(PageCacheError::AlreadyPresent { current }) => current,
+                Err(error) => {
+                    let Some(slot) = state.file_page_slots.get(&page) else {
+                        return Err(PageSlotCompletionError::NotFetching {
+                            state: PageSlotState::Empty,
+                            generation: PageGeneration::new(0),
+                        });
+                    };
+                    return slot.complete_fetch(generation, Err(page_cache_error_to_errno(error)));
+                }
+            },
+        };
+        let Some(slot) = state.file_page_slots.get(&page) else {
+            return Err(PageSlotCompletionError::NotFetching {
+                state: PageSlotState::Empty,
+                generation: PageGeneration::new(0),
+            });
+        };
+        slot.complete_fetch(generation, Ok(installed_ppn))
+    }
+
+    #[cfg(test)]
+    fn file_io_request_count_for_test(&self) -> usize {
+        self.state.lock().file_io_service.submission_len()
+    }
+
+    #[cfg(test)]
+    fn file_io_lease_count_for_test(&self) -> usize {
+        self.state.lock().file_io_leases.len()
+    }
+
+    #[cfg(test)]
+    fn file_io_read_target_count_for_test(&self) -> usize {
+        self.state.lock().file_io_read_targets.len()
+    }
+
+    #[cfg(test)]
+    fn file_io_pending_request_for_test(&self, page: PageIndex) -> Option<PageIoRequest> {
+        let state = self.state.lock();
+        state
+            .file_io_service
+            .find_submission(
+                self.io_manager_key(),
+                PageIoRange::new(page.as_u64(), 1),
+                PageIoOp::Read,
+            )
+            .cloned()
+    }
+
+    #[cfg(test)]
+    fn file_io_waiter_count_for_test(&self, page: PageIndex) -> usize {
+        let state = self.state.lock();
+        let Some(fetch) = state.in_flight_file_pages.get(&page) else {
+            return 0;
+        };
+        fetch
+            .request_id
+            .map(|id| state.file_io_service.waiter_count(id))
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    fn file_io_block_queue_len_for_test(&self) -> usize {
+        self.state.lock().file_block_runtime.queue.len()
+    }
+
+    #[cfg(test)]
+    fn file_io_block_tracker_len_for_test(&self) -> usize {
+        self.state.lock().file_block_runtime.tracker.len()
+    }
+
+    #[cfg(test)]
+    fn file_page_fetch_in_flight_for_test(&self, page: PageIndex) -> bool {
+        self.state.lock().in_flight_file_pages.contains_key(&page)
+    }
+
+    #[cfg(test)]
+    fn file_page_slot_snapshot_for_test(&self, page: PageIndex) -> Option<PageSlotSnapshot> {
+        self.state
+            .lock()
+            .file_page_slots
+            .get(&page)
+            .map(PageSlot::snapshot)
     }
 
     pub fn lookup(&self, page: PageIndex) -> Option<Ppn> {
@@ -692,8 +2571,7 @@ impl PageContainer {
         page: PageIndex,
         access: MaterializeAccess,
     ) -> Result<MaterializedPage, PageCacheError> {
-        let guard =
-            adapter::step_engine::epoch::borrow_current_guard().unwrap_or_else(step_engine::guard);
+        let guard = adapter::step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
         self.materialize_page_now(page, access, &guard)
     }
 
@@ -859,6 +2737,9 @@ impl PageContainer {
         guard: &Guard<'_>,
     ) -> StepOutcome<MaterializedPage, NoProgress> {
         use adapter::step_engine::Errno as V3Errno;
+        if self.file_page_access_conflicts_with_reservation(page, access) {
+            return StepOutcome::Err(V3Errno::EBUSY);
+        }
         let fetch_id = match self.begin_file_page_fetch(page, access) {
             FilePageFetchStart::Cached(materialized) => {
                 return match materialized {
@@ -866,13 +2747,19 @@ impl PageContainer {
                     Err(error) => StepOutcome::Err(page_cache_error_to_errno(error).into()),
                 };
             }
-            FilePageFetchStart::Joined(source_id) => {
-                return notification::yield_on_page_ready_source(NoProgress, source_id);
+            FilePageFetchStart::Joined(endpoint) => {
+                return notification::yield_on_page_ready_source(NoProgress, &endpoint);
             }
             FilePageFetchStart::Owner(fetch_id) => fetch_id,
         };
 
         reclaim_clean_file_pages_if_low();
+
+        if let Some(planned) =
+            self.try_materialize_file_page_from_backend_plan(page, access, fetch_id)
+        {
+            return planned;
+        }
 
         let Some(offset) = page.as_u64().checked_mul(crate::vm::USER_PAGE_SIZE as u64) else {
             self.finish_file_page_fetch_without_install(page, fetch_id);
@@ -913,6 +2800,112 @@ impl PageContainer {
         }
     }
 
+    fn file_page_access_conflicts_with_reservation(
+        &self,
+        page: PageIndex,
+        access: MaterializeAccess,
+    ) -> bool {
+        let kind = match access {
+            MaterializeAccess::Read => RangeReservationKind::BufferedRead,
+            MaterializeAccess::Write => RangeReservationKind::BufferedWrite,
+        };
+        self.state
+            .lock()
+            .range_reservations
+            .conflicts(PageRange::new(page, 1), kind)
+    }
+
+    fn try_materialize_file_page_from_backend_plan(
+        &self,
+        page: PageIndex,
+        access: MaterializeAccess,
+        fetch_id: FilePageFetchId,
+    ) -> Option<StepOutcome<MaterializedPage, NoProgress>> {
+        let PageContainerKind::File { mount, .. } = &self.kind else {
+            return None;
+        };
+        if mount.payload().backend_planner().is_none() {
+            return None;
+        }
+
+        let first = self.drive_file_io_service_once_owned(ServiceBudget::new(1), |_| true)?;
+        let mut waits_for_async_completion =
+            file_service_work_waits_for_async_completion(first.work.as_slice());
+
+        if first.next == PageServiceNext::Runnable {
+            if let Some(second) =
+                self.drive_file_io_service_once_owned(ServiceBudget::new(1), |_| true)
+            {
+                waits_for_async_completion |=
+                    file_service_work_waits_for_async_completion(second.work.as_slice());
+            }
+        }
+
+        if self.lookup(page).is_some() {
+            self.finish_file_page_fetch_after_planned_install(page, fetch_id);
+            return Some(match self.materialize_existing_page(page, access, true) {
+                Ok(page) => StepOutcome::Done(page),
+                Err(error) => StepOutcome::Err(page_cache_error_to_errno(error).into()),
+            });
+        }
+
+        if waits_for_async_completion {
+            return self.yield_on_file_page_fetch(page, access, fetch_id);
+        }
+
+        None
+    }
+
+    fn yield_on_file_page_fetch(
+        &self,
+        page: PageIndex,
+        access: MaterializeAccess,
+        fetch_id: FilePageFetchId,
+    ) -> Option<StepOutcome<MaterializedPage, NoProgress>> {
+        let wait = notification::new_page_ready_wait();
+        let new_source_id = notification::page_ready_source_id(&wait);
+        let new_endpoint = Arc::clone(notification::page_ready_endpoint(&wait));
+
+        let endpoint = {
+            let mut state = self.state.lock();
+            if state.pages.lookup(page).is_some() {
+                return Some(match self.materialize_existing_page(page, access, false) {
+                    Ok(page) => StepOutcome::Done(page),
+                    Err(error) => StepOutcome::Err(page_cache_error_to_errno(error).into()),
+                });
+            }
+            let fetch = state.in_flight_file_pages.get(&page)?;
+            if fetch.id != fetch_id {
+                return None;
+            }
+
+            if let Some(existing) = state.file_page_waits.get(&page) {
+                let source_id = notification::page_ready_source_id(existing);
+                let endpoint = Arc::clone(notification::page_ready_endpoint(existing));
+                let request_id = fetch.request_id;
+                if let Some(fetch) = state.in_flight_file_pages.get_mut(&page) {
+                    fetch.source_id = Some(source_id);
+                    fetch.joined = true;
+                }
+                state.register_file_io_waiter(request_id, source_id);
+                endpoint
+            } else {
+                let request_id = fetch.request_id;
+                state.file_page_waits.insert(page, wait);
+                if let Some(fetch) = state.in_flight_file_pages.get_mut(&page) {
+                    fetch.source_id = Some(new_source_id);
+                    fetch.joined = true;
+                }
+                state.register_file_io_waiter(request_id, new_source_id);
+                new_endpoint
+            }
+        };
+
+        Some(notification::yield_on_page_ready_source(
+            NoProgress, &endpoint,
+        ))
+    }
+
     fn begin_file_page_fetch(
         &self,
         page: PageIndex,
@@ -935,18 +2928,25 @@ impl PageContainer {
                 .file_page_waits
                 .get(&page)
                 .map(notification::page_ready_source_id);
+            let existing_endpoint = state
+                .file_page_waits
+                .get(&page)
+                .map(|wait| Arc::clone(notification::page_ready_endpoint(wait)));
             if let Some(fetch) = state.in_flight_file_pages.get_mut(&page) {
                 if fetch.source_id.is_none() {
                     fetch.source_id = existing_source_id;
                 }
-                if let Some(source_id) = fetch.source_id {
+                if let (Some(source_id), Some(endpoint)) = (fetch.source_id, existing_endpoint) {
                     fetch.joined = true;
-                    return FilePageFetchStart::Joined(source_id);
+                    let request_id = fetch.request_id;
+                    state.register_file_io_waiter(request_id, source_id);
+                    return FilePageFetchStart::Joined(endpoint);
                 }
                 drop(state);
 
                 let wait = notification::new_page_ready_wait();
                 let source_id = notification::page_ready_source_id(&wait);
+                let endpoint = Arc::clone(notification::page_ready_endpoint(&wait));
                 let mut state = self.state.lock();
                 if state.pages.lookup(page).is_some() {
                     drop(state);
@@ -954,15 +2954,20 @@ impl PageContainer {
                         self.materialize_existing_page(page, access, false),
                     );
                 }
-                if let Some(existing_source_id) = state
-                    .file_page_waits
-                    .get(&page)
-                    .map(notification::page_ready_source_id)
+                if let Some((existing_source_id, existing_endpoint)) =
+                    state.file_page_waits.get(&page).map(|wait| {
+                        (
+                            notification::page_ready_source_id(wait),
+                            Arc::clone(notification::page_ready_endpoint(wait)),
+                        )
+                    })
                 {
                     if let Some(fetch) = state.in_flight_file_pages.get_mut(&page) {
                         fetch.source_id = Some(existing_source_id);
                         fetch.joined = true;
-                        return FilePageFetchStart::Joined(existing_source_id);
+                        let request_id = fetch.request_id;
+                        state.register_file_io_waiter(request_id, existing_source_id);
+                        return FilePageFetchStart::Joined(existing_endpoint);
                     }
                     continue;
                 }
@@ -974,15 +2979,42 @@ impl PageContainer {
                         .expect("file page fetch still present");
                     fetch.source_id = Some(source_id);
                     fetch.joined = true;
-                    return FilePageFetchStart::Joined(source_id);
+                    let request_id = fetch.request_id;
+                    state.register_file_io_waiter(request_id, source_id);
+                    return FilePageFetchStart::Joined(endpoint);
                 }
                 continue;
             }
 
             let fetch_id = state.allocate_file_fetch_id();
-            state
-                .in_flight_file_pages
-                .insert(page, FilePageFetch::new(fetch_id));
+            let generation = match state.file_page_slots.entry(page).or_default().begin_fetch() {
+                PageSlotFetch::Owner { generation }
+                | PageSlotFetch::Joined { generation }
+                | PageSlotFetch::Resident { generation, .. }
+                | PageSlotFetch::Blocked { generation, .. } => generation,
+            };
+            let request_id = state
+                .file_io_service
+                .submit(
+                    self.io_manager_key(),
+                    PageIoRange::new(page.as_u64(), 1),
+                    PageIoOp::Read,
+                    PageIoPriority::Demand,
+                    PageIoFlags::DEMAND,
+                    Some(generation),
+                )
+                .ok();
+            if request_id.is_none() {
+                if let Some(slot) = state.file_page_slots.get(&page) {
+                    if slot.generation() == generation {
+                        slot.invalidate();
+                    }
+                }
+            }
+            state.in_flight_file_pages.insert(
+                page,
+                FilePageFetch::with_l4_request_generation(fetch_id, generation, request_id),
+            );
             return FilePageFetchStart::Owner(fetch_id);
         }
     }
@@ -992,7 +3024,11 @@ impl PageContainer {
         page: PageIndex,
         fetch: FilePageFetch,
     ) -> Option<notification::PageReadyNotifier> {
-        (fetch.joined && fetch.source_id.is_some())
+        let routed_waiters = fetch
+            .request_id
+            .map(|request_id| state.file_io_service.retire_submission(request_id))
+            .unwrap_or_default();
+        (!routed_waiters.is_empty())
             .then(|| state.file_page_waits.get(&page).map(|wait| wait.notifier()))
             .flatten()
     }
@@ -1010,10 +3046,72 @@ impl PageContainer {
                 .in_flight_file_pages
                 .remove(&page)
                 .expect("matched file page fetch present");
+            if let Some(slot) = state.file_page_slots.get(&page) {
+                if slot.generation() == fetch.generation {
+                    slot.invalidate();
+                }
+            }
             Self::retire_file_page_fetch_wait(&mut state, page, fetch)
         };
         if let Some(notifier) = notify_ready {
-            notification::notify_page_ready(&notifier);
+            notification::notify_page_ready_with_post(&notifier, |mailbox, event| {
+                mailbox.post(event)
+            });
+        }
+    }
+
+    fn finish_file_page_fetch_after_planned_install(
+        &self,
+        page: PageIndex,
+        fetch_id: FilePageFetchId,
+    ) {
+        let notify_ready: Option<notification::PageReadyNotifier> = {
+            let mut state = self.state.lock();
+            let Some(fetch) = state.in_flight_file_pages.get(&page) else {
+                return;
+            };
+            if fetch.id != fetch_id {
+                return;
+            }
+            let fetch = state
+                .in_flight_file_pages
+                .remove(&page)
+                .expect("matched file page fetch present");
+            Self::retire_file_page_fetch_wait(&mut state, page, fetch)
+        };
+        if let Some(notifier) = notify_ready {
+            notification::notify_page_ready_with_post(&notifier, |mailbox, event| {
+                mailbox.post(event)
+            });
+        }
+    }
+
+    fn finish_file_page_fetch_after_service_completion(
+        &self,
+        page: PageIndex,
+        generation: PageGeneration,
+        notify_waiters: bool,
+    ) {
+        let notify_ready: Option<notification::PageReadyNotifier> = {
+            let mut state = self.state.lock();
+            let Some(fetch) = state.in_flight_file_pages.get(&page) else {
+                return;
+            };
+            if fetch.generation != generation {
+                return;
+            }
+            let _fetch = state
+                .in_flight_file_pages
+                .remove(&page)
+                .expect("matched file page fetch present");
+            notify_waiters
+                .then(|| state.file_page_waits.get(&page).map(|wait| wait.notifier()))
+                .flatten()
+        };
+        if let Some(notifier) = notify_ready {
+            notification::notify_page_ready_with_post(&notifier, |mailbox, event| {
+                mailbox.post(event)
+            });
         }
     }
 
@@ -1053,6 +3151,7 @@ impl PageContainer {
                 .in_flight_file_pages
                 .remove(&page)
                 .expect("matched file page fetch present");
+            let fetch_generation = fetch.generation;
             let notify_ready = Self::retire_file_page_fetch_wait(&mut state, page, fetch);
 
             let installed_dirty = (|| {
@@ -1072,11 +3171,24 @@ impl PageContainer {
                     .transpose()
                     .map(|marks| marks.map(|marks| marks.dirty))
             })();
+            if matches!(installed_dirty, Ok(Some(_))) {
+                if let Some(slot) = state.file_page_slots.get(&page) {
+                    if slot.generation() == fetch_generation {
+                        if slot.complete_fetch(fetch_generation, Ok(ppn)).is_ok()
+                            && access == MaterializeAccess::Write
+                        {
+                            let _ = slot.mark_dirty();
+                        }
+                    }
+                }
+            }
 
             (installed_dirty, notify_ready)
         };
         if let Some(notifier) = notify_ready {
-            notification::notify_page_ready(&notifier);
+            notification::notify_page_ready_with_post(&notifier, |mailbox, event| {
+                mailbox.post(event)
+            });
         }
         match installed_dirty {
             Ok(Some(dirty)) => StepOutcome::Done(MaterializedPage {
@@ -1113,6 +3225,9 @@ impl PageContainer {
                     && !matches!(self.kind, PageContainerKind::Device { .. })
                 {
                     state.pages.mark_dirty(page)?;
+                    if let Some(slot) = state.file_page_slots.get(&page) {
+                        let _ = slot.mark_dirty();
+                    }
                 }
                 materialized_snapshot_from_state(&state, page, newly_installed)?
             };
@@ -1128,7 +3243,7 @@ impl PageContainer {
             };
             let Some(dirty) = ({
                 let mut state = self.state.lock();
-                match state.pages.pages.get_mut(&page) {
+                match state.pages.load_mut(page) {
                     Some(entry) if entry.ppn == materialized.ppn => {
                         if access == MaterializeAccess::Write
                             && !matches!(self.kind, PageContainerKind::Device { .. })
@@ -1519,11 +3634,7 @@ fn materialized_snapshot_from_state(
     page: PageIndex,
     newly_installed: bool,
 ) -> Result<MaterializedPageSnapshot, PageCacheError> {
-    let entry = state
-        .pages
-        .pages
-        .get(&page)
-        .ok_or(PageCacheError::MissingPage)?;
+    let entry = state.pages.load(page).ok_or(PageCacheError::MissingPage)?;
     let pin = match &entry.pin {
         PageCachePin::Allocated(cache_pin) => {
             debug_assert_eq!(cache_pin.ppn(), entry.ppn);
@@ -1541,6 +3652,42 @@ fn materialized_snapshot_from_state(
     })
 }
 
+const fn direct_queue_errno(error: QueueError) -> Errno {
+    match error {
+        QueueError::Full | QueueError::DispatchDepthFull => Errno::EAGAIN,
+        QueueError::EmptyRange => Errno::EINVAL,
+    }
+}
+
+fn record_file_service_block_submissions(
+    tracker: &mut BlockPageRequestTracker,
+    outcome: &PageServiceBackendSubmitOutcome,
+) {
+    match outcome {
+        PageServiceBackendSubmitOutcome::BlockBiosQueued { request, submitted } => {
+            tracker.record_submit_outcomes(request.clone(), submitted)
+        }
+        PageServiceBackendSubmitOutcome::BlockGraphQueued { .. }
+        | PageServiceBackendSubmitOutcome::MetadataFirstQueued { .. } => {}
+        PageServiceBackendSubmitOutcome::QueuedPageCompletions { .. }
+        | PageServiceBackendSubmitOutcome::Yield(_)
+        | PageServiceBackendSubmitOutcome::Err(_) => {}
+    }
+}
+
+fn file_service_work_waits_for_async_completion(work: &[PageServiceDrivenWork]) -> bool {
+    work.iter().any(|item| {
+        matches!(
+            item,
+            PageServiceDrivenWork::BackendSubmission(
+                PageServiceBackendSubmitOutcome::BlockBiosQueued { .. }
+                    | PageServiceBackendSubmitOutcome::BlockGraphQueued { .. }
+                    | PageServiceBackendSubmitOutcome::MetadataFirstQueued { .. }
+            )
+        )
+    })
+}
+
 const fn page_cache_error_to_errno(error: PageCacheError) -> Errno {
     match error {
         PageCacheError::AlreadyPresent { .. }
@@ -1554,10 +3701,7 @@ const fn page_cache_error_to_errno(error: PageCacheError) -> Errno {
 
 fn emit_pagebacked_trace(name: &[u8], value: i64) {
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            value,
-        );
+        observer.debug_counter(name, value);
     }
 }
 
@@ -1574,11 +3718,17 @@ mod core_tests;
 #[cfg(test)]
 mod cross_variant_tests;
 #[cfg(test)]
+mod direct_io_tests;
+#[cfg(test)]
 mod lifecycle_tests;
+#[cfg(test)]
+mod range_tests;
 #[cfg(test)]
 mod reflink_tests;
 #[cfg(test)]
 mod size_tests;
+#[cfg(test)]
+mod slot_tests;
 #[cfg(test)]
 mod targeted_read_tests;
 #[cfg(test)]

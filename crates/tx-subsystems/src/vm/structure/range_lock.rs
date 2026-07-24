@@ -4,13 +4,12 @@
 //! declared overlap semantics and writer preference while leaving the final
 //! persistent/concurrent interval index for a later substrate fit.
 //!
-//! Each `RangeLock` owns a `wait_routing::Channel` registered with
-//! `wait_source`. On every release the channel fires the
-//! `RANGE_LOCK_RELEASE_MASK` bit so async script wrappers can convert a
-//! `WouldBlock` outcome into an awaitable wait via `WouldBlock::wait_token`.
+//! Each `RangeLock` owns a wait source. On every release the source fires the
+//! `RANGE_LOCK_RELEASE_MASK` bit so async wrappers can await the next release
+//! before retrying.
 
 use crate::vm::adapter::step_engine::{NoProgress, StepOutcome as V3StepOutcome};
-use crate::vm::adapter::wait_routing::{Channel, WaitSource};
+use crate::vm::adapter::wait_routing::WaitSource;
 use crate::vm::lock_metrics::{vm_spin_mutex, VmSpinMutex};
 use alloc::sync::Arc;
 
@@ -18,7 +17,7 @@ use crate::execution::WaitToken;
 
 use super::UserRange;
 
-/// Channel mask bit fired whenever a RangeLock acquirer releases its
+/// Wait-source bit fired whenever a RangeLock acquirer releases its
 /// reservation. Async waiters subscribe to this bit and re-acquire on wake.
 pub const RANGE_LOCK_RELEASE_MASK: u64 = 0x1;
 
@@ -53,9 +52,8 @@ impl<'a> WouldBlock<'a> {
     }
 
     /// `WaitToken` whose source resolves to the underlying `RangeLock`'s
-    /// release channel. Async wrappers feed this into
-    /// `wait_source::wait_on_token` to await the next release before
-    /// retrying their try-acquire.
+    /// release wait source. Async wrappers feed this into the registered
+    /// wait-source resolver to await the next release before retrying.
     pub fn wait_token(&self) -> WaitToken {
         WaitToken::new(self.lock.wait_source_id, RANGE_LOCK_RELEASE_MASK)
     }
@@ -98,6 +96,16 @@ impl<'a> PendingWriter<'a> {
     pub fn try_acquire(self) -> AcquireResult<'a> {
         self.lock.acquire_pending_writer(self)
     }
+
+    fn cancel_without_notify(mut self) {
+        if self.id != 0 {
+            self.lock
+                .state
+                .lock()
+                .release_pending_writer(self.id, self.range);
+            self.id = 0;
+        }
+    }
 }
 
 impl Drop for PendingWriter<'_> {
@@ -113,7 +121,6 @@ impl Drop for PendingWriter<'_> {
 /// but it is not the final optimized segment tree/concurrent interval index.
 pub struct RangeLock {
     state: VmSpinMutex<RangeLockState>,
-    wait_channel: Channel,
     wait_source: Arc<WaitSource>,
     wait_source_id: u64,
 }
@@ -123,17 +130,21 @@ impl RangeLock {
         let wait_point = crate::vm::notification::new_range_lock_wait_point();
         Self {
             state: vm_spin_mutex(RangeLockState::new(), b"debug.lock.vm.range_lock.state"),
-            wait_channel: wait_point.channel,
             wait_source: wait_point.source,
             wait_source_id: wait_point.source_id,
         }
     }
 
-    /// Carrier id under which this `RangeLock`'s release channel is
+    /// Carrier id under which this `RangeLock`'s release wait source is
     /// registered with the global wait-source resolver. Exposed for async
     /// wrappers that hand-build their own `WaitToken` values.
     pub fn wait_source_id(&self) -> u64 {
         self.wait_source_id
+    }
+
+    /// Release endpoint exposed to async wait drivers.
+    pub fn release_endpoint(&self) -> &Arc<WaitSource> {
+        &self.wait_source
     }
 
     /// Canonical step-shaped acquire per VM_v1_2 §3.1. `Done` = the
@@ -156,8 +167,14 @@ impl RangeLock {
     ) -> V3StepOutcome<RangeGuard<'_>, NoProgress> {
         match self.acquire_step_rich(range, mode) {
             AcquireResult::Acquired(guard) => V3StepOutcome::Done(guard),
-            AcquireResult::WouldBlock(blocked) => {
-                crate::vm::notification::range_lock_blocked(blocked.wait_token().source_id())
+            AcquireResult::WouldBlock(mut blocked) => {
+                if let Some(pending) = blocked.pending_writer.take() {
+                    // This one-shot surface cannot retain a pending-writer row
+                    // across the async wait. Remove the transient row without
+                    // publishing a release that would wake this same waiter.
+                    pending.cancel_without_notify();
+                }
+                crate::vm::notification::range_lock_blocked(self.release_endpoint())
             }
         }
     }
@@ -170,8 +187,8 @@ impl RangeLock {
     ) -> V3StepOutcome<RangeGuardPair<'_>, NoProgress> {
         match self.acquire_pair_step_rich(a, b) {
             AcquirePairResult::Acquired(pair) => V3StepOutcome::Done(pair),
-            AcquirePairResult::WouldBlock(blocked) => {
-                crate::vm::notification::range_lock_blocked(blocked.wait_token().source_id())
+            AcquirePairResult::WouldBlock(_blocked) => {
+                crate::vm::notification::range_lock_blocked(self.release_endpoint())
             }
         }
     }
@@ -266,16 +283,13 @@ impl RangeLock {
 
     fn release_active(&self, id: u64, range: UserRange) {
         self.state.lock().release_active(id, range);
-        crate::vm::notification::notify_range_lock_released(&self.wait_channel, &self.wait_source);
+        crate::vm::notification::notify_range_lock_released(&self.wait_source);
     }
 
     fn release_pending_writer(&self, id: u64, range: UserRange) {
         if id != 0 {
             self.state.lock().release_pending_writer(id, range);
-            crate::vm::notification::notify_range_lock_released(
-                &self.wait_channel,
-                &self.wait_source,
-            );
+            crate::vm::notification::notify_range_lock_released(&self.wait_source);
         }
     }
 }

@@ -1,9 +1,9 @@
-use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::image::ensure_test_initramfs;
 use crate::target::TxTarget;
 use crate::util::{
     command_exists, copy_dir_contents, option_value, optional_option_value, resolve_path,
@@ -268,6 +268,7 @@ fn oscomp_qemu(root: &Path, args: &[String]) -> Result<()> {
         .map(|path| resolve_path(root, path))
         .unwrap_or_else(|| root.join("target").join("oscomp").join("submit"));
     let dry_run = args.iter().any(|arg| arg == "--dry-run");
+    let test_initramfs = ensure_test_initramfs(root, target)?;
     let (kernel, sdcard, out, mut qemu_args) = match target {
         TxTarget::Rv64Qemu => (
             submit.join("kernel-rv"),
@@ -341,13 +342,19 @@ fn oscomp_qemu(root: &Path, args: &[String]) -> Result<()> {
             );
         }
     };
-    if let Some(suite) = boot_suite {
-        let cmdline = format!("tx.oscomp={suite} console=ttyS0");
+    if let Some(cmdline) = oscomp_qemu_boot_cmdline(boot_suite.as_deref()) {
+        qemu_args.push("-initrd".into());
+        qemu_args.push(test_initramfs.display().to_string());
         qemu_args.push("-append".into());
         qemu_args.push(cmdline.clone());
         if target == TxTarget::La64Qemu {
             qemu_args.push("-fw_cfg".into());
             qemu_args.push(format!("name=opt/tx.cmdline,string={cmdline}"));
+            qemu_args.push("-fw_cfg".into());
+            qemu_args.push(format!(
+                "name=opt/tx.initrd,file={}",
+                test_initramfs.display()
+            ));
         }
     }
     println!("{}", shell_join(&qemu_args));
@@ -378,6 +385,18 @@ fn oscomp_qemu(root: &Path, args: &[String]) -> Result<()> {
     } else {
         Err(format!("OSComp qemu exited with {status}"))
     }
+}
+
+fn oscomp_qemu_boot_cmdline(boot_suite: Option<&str>) -> Option<String> {
+    let suite = boot_suite.unwrap_or("").trim();
+    if suite.is_empty() {
+        return Some(
+            "tx.boot.mode=oscomp init=/tx-test-init tx.test_init=1 console=ttyS0".to_string(),
+        );
+    }
+    Some(format!(
+        "tx.boot.mode=oscomp init=/tx-test-init tx.test_init=1 tx.oscomp.observe_dump=0 tx.oscomp.groups={suite} console=ttyS0"
+    ))
 }
 
 /// Score an existing serial output file with the OSComp judge scripts.
@@ -694,4 +713,25 @@ fn copy_kernel_for_oscomp(root: &Path, target: TxTarget, dest: &Path, release: b
     fs::copy(&source, dest).map_err(|err| err.to_string())?;
     println!("copied {} -> {}", source.display(), dest.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oscomp_qemu_boot_suite_uses_explicit_boot_mode_and_groups() {
+        assert_eq!(
+            oscomp_qemu_boot_cmdline(Some("libctest-musl")),
+            Some("tx.boot.mode=oscomp init=/tx-test-init tx.test_init=1 tx.oscomp.observe_dump=0 tx.oscomp.groups=libctest-musl console=ttyS0".to_string())
+        );
+    }
+
+    #[test]
+    fn oscomp_qemu_without_suite_leaves_sdcard_default_but_marks_boot_mode() {
+        assert_eq!(
+            oscomp_qemu_boot_cmdline(None),
+            Some("tx.boot.mode=oscomp init=/tx-test-init tx.test_init=1 console=ttyS0".to_string())
+        );
+    }
 }

@@ -17,6 +17,14 @@
 
 use tx_substrate::step::EndpointKind;
 
+// Both helpers must remain const-callable, and these catalog truths must hold.
+const _: () = {
+    assert!(EndpointKind::Ufd.is_real());
+    assert!(!EndpointKind::Synthetic.is_real());
+    assert!(EndpointKind::Fuse.permits_fd_injection());
+    assert!(!EndpointKind::Ufd.permits_fd_injection());
+};
+
 // -- closed catalog smoke ----------------------------------------------------
 
 #[test]
@@ -62,7 +70,7 @@ fn endpoint_kind_is_real_table() {
         (EndpointKind::Synthetic, false),
     ];
     for (kind, expected) in table {
-        assert_eq!(kind.is_real(), expected, "is_real mismatch for {:?}", kind);
+        assert_eq!(kind.is_real(), expected, "is_real mismatch for {kind:?}");
     }
 }
 
@@ -85,26 +93,7 @@ fn endpoint_kind_permits_fd_injection_table() {
         assert_eq!(
             kind.permits_fd_injection(),
             expected,
-            "permits_fd_injection mismatch for {:?}",
-            kind
+            "permits_fd_injection mismatch for {kind:?}"
         );
     }
-}
-
-// -- helpers are const -------------------------------------------------------
-
-#[test]
-fn endpoint_kind_helpers_are_const() {
-    // Compile-time check: both helpers must be usable in `const`
-    // contexts so callers (e.g. `const fn` validators in PR-4) can
-    // gate on kind without runtime cost.
-    const UFD_REAL: bool = EndpointKind::Ufd.is_real();
-    const SYN_REAL: bool = EndpointKind::Synthetic.is_real();
-    const FUSE_FD: bool = EndpointKind::Fuse.permits_fd_injection();
-    const UFD_FD: bool = EndpointKind::Ufd.permits_fd_injection();
-
-    const { assert!(UFD_REAL) };
-    const { assert!(!SYN_REAL) };
-    const { assert!(FUSE_FD) };
-    const { assert!(!UFD_FD) };
 }

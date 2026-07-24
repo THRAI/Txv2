@@ -19,7 +19,7 @@
 //! - txdoc:STEP-V2-DRIVER-MODE-1 (DriveMode classify matrix)
 
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tx_hal::{
     Asid, PhysAddr, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
     PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, VirtAddr,
@@ -27,24 +27,101 @@ use tx_hal::{
 use tx_scripts::adapter::step_engine::{
     AgentCancelPolicy, Cap, Deadline, DelegateEndpoint, DelegateRequest, DelegateToken, DriveMode,
     Errno, InterestMask, NoProgress, ProcessIdentity, ScriptCtx, StepOp, StepOutcome,
-    SubjectAuthority, SubjectContext, SubjectIdentity, WaitSourceId, YieldShape,
+    SubjectAuthority, SubjectContext, SubjectIdentity, TimerId, WaitSourceId, YieldShape,
 };
 use tx_scripts::adapter::wake::{
-    register_source, unregister_source, MailboxEvent, SignalRouting, TaskMailbox, TimerWheel,
+    register_source, unregister_source, MailboxEvent, SignalRouting, TaskMailbox, TimerToken,
     WaitGeneration, WaitSource,
 };
+use tx_substrate::bus::RawQueue;
 use tx_subsystems::cred::placeholder_restrictions_cap;
 use tx_subsystems::cross_crate_test_support::{
     reset_init_process, reset_pid_counter, reset_tid_counter,
 };
 use tx_subsystems::process::{bootstrap_init_process, ProcessIdentity as RealProcessIdentity};
-use tx_subsystems::signal::{SignalMask, Signum};
-use tx_subsystems::thread_runtime::execution::{post_signal, step_sigprocmask, SigmaskHow};
+use tx_subsystems::signal::{
+    step_sigaction_entry, SaFlags, SigActionEntry, SigDisposition, SignalMask, Signum,
+};
+use tx_subsystems::thread_runtime::execution::{
+    post_signal_with_post, step_sigprocmask, SigmaskHow,
+};
 use tx_subsystems::thread_runtime::ThreadIdentity as RealThreadIdentity;
+use tx_subsystems::wait_source::{register_wait_queue, release_wait_source};
+use tx_time::{
+    DeadlineDomain, DeadlineNs, DeadlineRegistrarHandle, TimeError, TimerRole, TimerTarget,
+};
+
+struct RecordingDeadlineDomain {
+    next_token: std::sync::atomic::AtomicU64,
+    roles: Mutex<Vec<TimerRole>>,
+}
+
+impl RecordingDeadlineDomain {
+    fn new() -> Self {
+        Self {
+            next_token: std::sync::atomic::AtomicU64::new(1),
+            roles: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn roles(&self) -> Vec<TimerRole> {
+        self.roles.lock().unwrap().clone()
+    }
+}
+
+impl DeadlineDomain for RecordingDeadlineDomain {
+    fn register_deadline(
+        &self,
+        _deadline_ns: DeadlineNs,
+        role: TimerRole,
+        _target: TimerTarget,
+    ) -> Result<TimerToken, TimeError> {
+        self.roles.lock().unwrap().push(role);
+        Ok(TimerToken::new(
+            self.next_token
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ))
+    }
+
+    fn cancel_deadline(&self, _token: TimerToken) -> bool {
+        true
+    }
+}
+
+struct FailingDeadlineDomain;
+
+impl DeadlineDomain for FailingDeadlineDomain {
+    fn register_deadline(
+        &self,
+        _deadline_ns: DeadlineNs,
+        _role: TimerRole,
+        _target: TimerTarget,
+    ) -> Result<TimerToken, TimeError> {
+        Err(TimeError::Hardware)
+    }
+
+    fn cancel_deadline(&self, _token: TimerToken) -> bool {
+        false
+    }
+}
 use tx_subsystems::vm::AddressSpace;
 use tx_subsystems::zones;
 
 static DRIVE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn deliver_signal_with_direct_post_for_test(
+    thread: &Cap<RealThreadIdentity>,
+    sig: Signum,
+    routing: SignalRouting,
+    info: Option<tx_subsystems::signal::SigInfo>,
+) {
+    post_signal_with_post(thread, sig, routing, info, |weak, event| {
+        let Some(mailbox) = weak.upgrade() else {
+            return;
+        };
+        let _ = mailbox.post(event);
+    });
+}
 
 struct StubPmap;
 
@@ -475,6 +552,139 @@ fn drive_waiting_on_wait_source_wake_retries() {
     unregister_source(source_id);
 }
 
+#[test]
+fn drive_waiting_on_registered_raw_queue_wake_retries() {
+    let mailbox = Arc::new(TaskMailbox::new());
+    let queue = RawQueue::new();
+    let source_id = register_wait_queue(queue.clone());
+    let op = MockStepOp::new([
+        StepOutcome::Yield {
+            progress: NoProgress,
+            shape: on_wait_source_shape(source_id, 0b1),
+        },
+        StepOutcome::Done(42),
+    ]);
+    let mut ctx = ScriptCtx::new().with_mailbox(Arc::clone(&mailbox));
+    let future = tx_scripts::drive(op, &mut ctx, DriveMode::Waiting, Some(&mailbox), None, None);
+    let waker = std::task::Waker::noop().clone();
+    let mut task_ctx = std::task::Context::from_waker(&waker);
+    let mut future = Box::pin(future);
+
+    assert!(matches!(
+        future.as_mut().poll(&mut task_ctx),
+        std::task::Poll::Pending
+    ));
+    assert_eq!(queue.subscriber_count(), 1);
+    assert_eq!(queue.fire(0b1), 1);
+    assert_eq!(
+        future.as_mut().poll(&mut task_ctx),
+        std::task::Poll::Ready(Ok(42))
+    );
+
+    release_wait_source(source_id);
+}
+
+#[test]
+fn registered_raw_queue_wait_preserves_unrelated_mailbox_events() {
+    let mailbox = Arc::new(TaskMailbox::new());
+    let queue = RawQueue::new();
+    let source_id = register_wait_queue(queue.clone());
+    assert!(mailbox.post(MailboxEvent::SourceFired {
+        generation: WaitGeneration::new(99),
+        source: WaitSourceId::new(0xfeed),
+        interests: InterestMask::new(0b1),
+    }));
+    let op = MockStepOp::new([
+        StepOutcome::Yield {
+            progress: NoProgress,
+            shape: on_wait_source_shape(source_id, 0b1),
+        },
+        StepOutcome::Done(42),
+    ]);
+    let mut ctx = ScriptCtx::new().with_mailbox(Arc::clone(&mailbox));
+    let future = tx_scripts::drive(op, &mut ctx, DriveMode::Waiting, Some(&mailbox), None, None);
+    let waker = std::task::Waker::noop().clone();
+    let mut task_ctx = std::task::Context::from_waker(&waker);
+    let mut future = Box::pin(future);
+
+    assert!(matches!(
+        future.as_mut().poll(&mut task_ctx),
+        std::task::Poll::Pending
+    ));
+    assert_eq!(queue.fire(0b1), 1);
+    assert_eq!(
+        future.as_mut().poll(&mut task_ctx),
+        std::task::Poll::Ready(Ok(42))
+    );
+    assert!(matches!(
+        mailbox.poll(),
+        Some(MailboxEvent::SourceFired {
+            source,
+            generation,
+            ..
+        }) if source == WaitSourceId::new(0xfeed) && generation == WaitGeneration::new(99)
+    ));
+
+    release_wait_source(source_id);
+}
+
+#[test]
+fn drive_waiting_on_ready_registered_raw_queue_retries_without_parking() {
+    let mailbox = Arc::new(TaskMailbox::new());
+    let queue = RawQueue::new();
+    let source_id = register_wait_queue(queue.clone());
+    queue.fire(0b1);
+    let op = MockStepOp::new([
+        StepOutcome::Yield {
+            progress: NoProgress,
+            shape: on_wait_source_shape(source_id, 0b1),
+        },
+        StepOutcome::Done(42),
+    ]);
+    let mut ctx = ScriptCtx::new().with_mailbox(Arc::clone(&mailbox));
+
+    assert_eq!(
+        block_on(tx_scripts::drive(
+            op,
+            &mut ctx,
+            DriveMode::Waiting,
+            Some(&mailbox),
+            None,
+            None,
+        )),
+        Ok(42)
+    );
+    assert_eq!(queue.subscriber_count(), 0);
+
+    release_wait_source(source_id);
+}
+
+#[test]
+fn dropping_parked_registered_raw_queue_wait_unregisters_subscription() {
+    let mailbox = Arc::new(TaskMailbox::new());
+    let queue = RawQueue::new();
+    let source_id = register_wait_queue(queue.clone());
+    let op = MockStepOp::new([StepOutcome::Yield {
+        progress: NoProgress,
+        shape: on_wait_source_shape(source_id, 0b1),
+    }]);
+    let mut ctx = ScriptCtx::new().with_mailbox(Arc::clone(&mailbox));
+    let future = tx_scripts::drive(op, &mut ctx, DriveMode::Waiting, Some(&mailbox), None, None);
+    let waker = std::task::Waker::noop().clone();
+    let mut task_ctx = std::task::Context::from_waker(&waker);
+    let mut future = Box::pin(future);
+
+    assert!(matches!(
+        future.as_mut().poll(&mut task_ctx),
+        std::task::Poll::Pending
+    ));
+    assert_eq!(queue.subscriber_count(), 1);
+    drop(future);
+    assert_eq!(queue.subscriber_count(), 0);
+
+    release_wait_source(source_id);
+}
+
 // ---------------------------------------------------------------------------
 // drive-taskmb: basic TaskMailbox round-trip
 // ---------------------------------------------------------------------------
@@ -569,7 +779,7 @@ fn drive_yield_on_wait_source_with_mailbox_resolves_on_pre_posted_event() {
 #[test]
 fn drive_yield_on_wait_source_with_deadline_returns_etimedout() {
     let mailbox = Arc::new(TaskMailbox::new());
-    let wheel = TimerWheel::new();
+    let domain = Arc::new(RecordingDeadlineDomain::new());
     let source_id = WaitSourceId::new(45);
     let interests = InterestMask::new(0b1);
 
@@ -581,9 +791,9 @@ fn drive_yield_on_wait_source_with_deadline_returns_etimedout() {
         },
     }]);
 
+    let timer_registrar = DeadlineRegistrarHandle::from_domain(domain.clone());
     let mut ctx = ScriptCtx::new()
         .with_mailbox(Arc::clone(&mailbox))
-        .with_timer_wheel(wheel.clone())
         .with_deadline(Deadline::from_raw(10));
     let fut = tx_scripts::drive(
         op,
@@ -591,7 +801,7 @@ fn drive_yield_on_wait_source_with_deadline_returns_etimedout() {
         DriveMode::Waiting,
         Some(&mailbox),
         None,
-        Some(&wheel),
+        Some(&timer_registrar),
     );
     let waker = std::task::Waker::noop().clone();
     let mut task_ctx = std::task::Context::from_waker(&waker);
@@ -603,11 +813,101 @@ fn drive_yield_on_wait_source_with_deadline_returns_etimedout() {
         ),
         "first poll should park on the wait source"
     );
-    assert_eq!(wheel.fire_due(10), 1);
+    assert_eq!(domain.roles(), vec![TimerRole::DeadlineAbort]);
+    let _ = mailbox.post(MailboxEvent::TimerFired {
+        token: TimerToken::new(1),
+    });
     assert_eq!(
         pinned.as_mut().poll(&mut task_ctx),
         std::task::Poll::Ready(Err(Errno::ETIMEDOUT))
     );
+}
+
+#[test]
+fn drive_finite_wait_aborts_when_deadline_registration_fails() {
+    let mailbox = Arc::new(TaskMailbox::new());
+    let source_id = WaitSourceId::new(46);
+    let interests = InterestMask::new(0b1);
+    let registrar = DeadlineRegistrarHandle::from_domain(Arc::new(FailingDeadlineDomain));
+    let op = MockStepOp::new([StepOutcome::Yield {
+        progress: NoProgress,
+        shape: YieldShape::OnWaitSource {
+            source: source_id,
+            interests,
+        },
+    }]);
+    let mut ctx = ScriptCtx::new()
+        .with_mailbox(Arc::clone(&mailbox))
+        .with_deadline(Deadline::from_raw(10));
+    let mut future = Box::pin(tx_scripts::drive(
+        op,
+        &mut ctx,
+        DriveMode::Waiting,
+        Some(&mailbox),
+        None,
+        Some(&registrar),
+    ));
+    let waker = std::task::Waker::noop().clone();
+    let mut task_ctx = std::task::Context::from_waker(&waker);
+    assert!(matches!(
+        future.as_mut().poll(&mut task_ctx),
+        std::task::Poll::Ready(Err(Errno::ETIMEDOUT))
+    ));
+}
+
+#[test]
+fn drive_timer_aborts_when_deadline_registration_fails() {
+    let mailbox = Arc::new(TaskMailbox::new());
+    let registrar = DeadlineRegistrarHandle::from_domain(Arc::new(FailingDeadlineDomain));
+    let op = MockStepOp::new([StepOutcome::Yield {
+        progress: NoProgress,
+        shape: YieldShape::OnTimer {
+            token: TimerId::new(1),
+            deadline: Deadline::from_raw(10),
+        },
+    }]);
+    let mut ctx = ScriptCtx::new().with_mailbox(Arc::clone(&mailbox));
+    let mut future = Box::pin(tx_scripts::drive(
+        op,
+        &mut ctx,
+        DriveMode::Waiting,
+        Some(&mailbox),
+        None,
+        Some(&registrar),
+    ));
+    let waker = std::task::Waker::noop().clone();
+    let mut task_ctx = std::task::Context::from_waker(&waker);
+    assert!(matches!(
+        future.as_mut().poll(&mut task_ctx),
+        std::task::Poll::Ready(Err(Errno::ETIMEDOUT))
+    ));
+}
+
+#[test]
+fn dropping_parked_wait_unregisters_wait_source_subscription() {
+    let mailbox = Arc::new(TaskMailbox::new());
+    let source = Arc::new(WaitSource::new(WaitSourceId::new(47)));
+    register_source(Arc::clone(&source));
+    let op = MockStepOp::new([StepOutcome::Yield {
+        progress: NoProgress,
+        shape: YieldShape::OnWaitSource {
+            source: source.id(),
+            interests: InterestMask::new(0b1),
+        },
+    }]);
+    let mut ctx = ScriptCtx::new().with_mailbox(Arc::clone(&mailbox));
+    let future = tx_scripts::drive(op, &mut ctx, DriveMode::Waiting, Some(&mailbox), None, None);
+    let waker = std::task::Waker::noop().clone();
+    let mut task_ctx = std::task::Context::from_waker(&waker);
+    let mut future = Box::pin(future);
+    assert!(matches!(
+        future.as_mut().poll(&mut task_ctx),
+        std::task::Poll::Pending
+    ));
+    assert_eq!(source.subscriber_count(), 1);
+    drop(future);
+    assert_eq!(source.subscriber_count(), 0);
+    unregister_source(source.id());
 }
 
 #[test]
@@ -660,7 +960,7 @@ fn drive_masked_signal_hint_retries_instead_of_eintr() {
     let _ = step_sigprocmask(&thread, SigmaskHow::SetMask, block);
 
     let op = RetryThenDoneOp::new(source_id, interests);
-    post_signal(
+    deliver_signal_with_direct_post_for_test(
         &thread,
         Signum::SIGTERM,
         SignalRouting::ThreadDirected {
@@ -684,5 +984,91 @@ fn drive_masked_signal_hint_retries_instead_of_eintr() {
     assert!(
         mailbox.is_empty(),
         "masked SignalDelivered hints are consumed after forcing a re-poll"
+    );
+}
+
+#[test]
+fn drive_sa_restart_signal_hint_retries_instead_of_eintr() {
+    let _guard = DRIVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (proc, thread, mailbox, mut ctx) = bootstrap_subject();
+    let source_id = WaitSourceId::new(46);
+    let interests = InterestMask::new(0b1);
+
+    let action = SigActionEntry {
+        disposition: SigDisposition::Handler(0xCAFE),
+        flags: SaFlags::RESTART,
+        sa_mask: SignalMask::EMPTY,
+        restorer: 0,
+    };
+    let _ = step_sigaction_entry(&proc, Signum::SIGTERM, action);
+
+    let op = RetryThenDoneOp::new(source_id, interests);
+    deliver_signal_with_direct_post_for_test(
+        &thread,
+        Signum::SIGTERM,
+        SignalRouting::ThreadDirected {
+            tid: thread.tid.0 as u64,
+        },
+        None,
+    );
+    let result = block_on(tx_scripts::drive(
+        op,
+        &mut ctx,
+        DriveMode::Waiting,
+        Some(&mailbox),
+        None,
+        None,
+    ));
+    assert_eq!(
+        result,
+        Ok(77),
+        "SA_RESTART signal wake hints must re-poll instead of surfacing EINTR"
+    );
+    assert!(
+        mailbox.is_empty(),
+        "SA_RESTART SignalDelivered hint is consumed after forcing a re-poll"
+    );
+}
+
+#[test]
+fn drive_libc_sigcancel_hint_interrupts_even_with_sa_restart() {
+    let _guard = DRIVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (proc, thread, mailbox, mut ctx) = bootstrap_subject();
+    let source_id = WaitSourceId::new(47);
+    let interests = InterestMask::new(0b1);
+
+    let action = SigActionEntry {
+        disposition: SigDisposition::Handler(0xCA11CE1),
+        flags: SaFlags::RESTART,
+        sa_mask: SignalMask::EMPTY,
+        restorer: 0,
+    };
+    let _ = step_sigaction_entry(&proc, Signum::GLIBC_SIGCANCEL, action);
+
+    let op = RetryThenDoneOp::new(source_id, interests);
+    deliver_signal_with_direct_post_for_test(
+        &thread,
+        Signum::GLIBC_SIGCANCEL,
+        SignalRouting::ThreadDirected {
+            tid: thread.tid.0 as u64,
+        },
+        None,
+    );
+    let result = block_on(tx_scripts::drive(
+        op,
+        &mut ctx,
+        DriveMode::Waiting,
+        Some(&mailbox),
+        None,
+        None,
+    ));
+    assert_eq!(
+        result,
+        Err(Errno::EINTR),
+        "libc cancellation signals must interrupt cancelable waits despite SA_RESTART"
+    );
+    assert!(
+        mailbox.is_empty(),
+        "SIGCANCEL SignalDelivered hint is consumed after interrupting the wait"
     );
 }

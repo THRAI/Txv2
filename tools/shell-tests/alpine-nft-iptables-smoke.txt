@@ -18,9 +18,9 @@ expect "alpine-shell-ok" within 10000
 expect "/ # " within 10000
 
 sleep 500
-send "ls /sbin/nft /usr/sbin/nft /sbin/iptables /usr/sbin/iptables\n"
-expect "nft" within 10000
-expect "iptables" within 10000
+send "if test -x /usr/sbin/nft; then echo nft-ok; fi; if test -x /usr/sbin/iptables; then echo iptables-ok; fi\n"
+expect "nft-ok" within 10000
+expect "iptables-ok" within 10000
 expect "/ # " within 10000
 
 sleep 500

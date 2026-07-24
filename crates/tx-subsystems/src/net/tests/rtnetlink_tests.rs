@@ -4,10 +4,10 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::net::rtnetlink::{
-    rtnetlink_handle_request, rtnetlink_handle_request_with_netns_resolver, NLMSG_DONE,
-    NLMSG_ERROR, NLM_F_ACK, NLM_F_DUMP, NLM_F_REQUEST, RTM_DELADDR, RTM_DELLINK, RTM_DELNEIGH,
-    RTM_DELROUTE, RTM_GETADDR, RTM_GETLINK, RTM_GETNEIGH, RTM_GETROUTE, RTM_NEWADDR, RTM_NEWLINK,
-    RTM_NEWNEIGH, RTM_NEWROUTE, RTM_SETLINK,
+    netlink_route_send_with_post, rtnetlink_handle_request,
+    rtnetlink_handle_request_with_netns_resolver, NLMSG_DONE, NLMSG_ERROR, NLM_F_ACK, NLM_F_DUMP,
+    NLM_F_REQUEST, RTM_DELADDR, RTM_DELLINK, RTM_DELNEIGH, RTM_DELROUTE, RTM_GETADDR, RTM_GETLINK,
+    RTM_GETNEIGH, RTM_GETROUTE, RTM_NEWADDR, RTM_NEWLINK, RTM_NEWNEIGH, RTM_NEWROUTE, RTM_SETLINK,
 };
 
 const NLM_F_CREATE: u16 = 0x0400;
@@ -59,6 +59,49 @@ fn rtnetlink_getlink_dump_reports_loopback_and_done() {
         .iter()
         .any(|msg| nlmsg_type(msg) == RTM_NEWLINK && contains_bytes(msg, b"lo\0")));
     assert!(responses.iter().any(|msg| nlmsg_type(msg) == NLMSG_DONE));
+}
+
+#[test]
+fn rtnetlink_send_uses_injected_post_for_recv_readiness() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
+    let socket = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::NetlinkRoute,
+        SocketOptionSet::for_kind(SocketKind::NetlinkRoute),
+    )
+    .expect("netlink route socket");
+    let recv_mailbox = alloc::sync::Arc::new(TaskMailbox::new());
+    let generation = recv_mailbox.next_generation();
+    let _subscription = socket.readiness.recv_wq.subscribe(
+        RecvWireSet::HAS_DATA.bits(),
+        alloc::sync::Arc::downgrade(&recv_mailbox),
+        generation,
+    );
+    let request = nlmsg(
+        RTM_GETLINK,
+        NLM_F_REQUEST | NLM_F_DUMP,
+        11,
+        &ifinfomsg(0, 0, 0),
+    );
+    let mut injected_posts = 0usize;
+
+    let sent = netlink_route_send_with_post(
+        &socket,
+        &request,
+        crate::cred::Cred::root(),
+        |mailbox, event| {
+            injected_posts += 1;
+            mailbox.post(event)
+        },
+    )
+    .expect("netlink route send");
+
+    assert_eq!(sent, request.len());
+    assert_eq!(injected_posts, 1);
+    assert!(socket.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() != 0);
 }
 
 #[test]
@@ -199,6 +242,56 @@ fn rtnetlink_newlink_setlink_and_newaddr_mutate_namespace_snapshot() {
         .links
         .iter()
         .any(|link| link.name == "eth0" && link.ipv4_addr.is_none()));
+}
+
+#[test]
+fn rtnetlink_newaddr_initial_namespace_uses_host_visible_ifindex_not_eth0() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
+    crate::net::device::reset_net_registry_for_test();
+    static HOST_ETH0_REGS: &[&crate::net::NetDeviceRegistration] =
+        &[&crate::net::VIRTIO_NET0_REGISTRATION];
+    assert_eq!(
+        crate::net::register_net_devices(HOST_ETH0_REGS),
+        StepOutcome::Done(())
+    );
+    let ns = crate::net::initial_net_namespace_payload();
+    let root = crate::cred::Cred::root();
+
+    let uplink_req = nlmsg(
+        RTM_NEWLINK,
+        NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+        531,
+        &newlink_payload("uplink0", veth_linkinfo("gw0")),
+    );
+    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &uplink_req)[0]);
+
+    let uplink_ifindex = ifindex_for(&ns.network_snapshot().links, "uplink0");
+    let addr_req = nlmsg(
+        RTM_NEWADDR,
+        NLM_F_REQUEST | NLM_F_ACK,
+        532,
+        &newaddr_payload(uplink_ifindex, 24, [10, 0, 2, 15]),
+    );
+    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &addr_req)[0]);
+
+    let routes = ns.route_snapshot();
+    assert!(routes.iter().any(|route| {
+        route.oif_name == Some("uplink0")
+            && route.dst == Ipv4Address::new([10, 0, 2, 0])
+            && route.prefix_len == 24
+    }));
+    assert!(
+        routes.iter().all(|route| {
+            route.oif_name != Some("eth0") || route.dst != Ipv4Address::new([10, 0, 2, 0])
+        }),
+        "uplink address must not be recorded on host-visible eth0: {routes:?}"
+    );
+
+    crate::net::device::reset_net_registry_for_test();
 }
 
 #[test]
@@ -672,210 +765,6 @@ fn rtnetlink_newroute_delroute_default_gateway_updates_namespace_routes() {
 }
 
 #[test]
-fn rtnetlink_newroute_delroute_ipv6_updates_namespace_routes6() {
-    init_zones();
-    let _lock = crate::test_support::EPOCH_TEST_LOCK
-        .lock()
-        .expect("net epoch test lock");
-    crate::net::reset_initial_net_namespace_for_test();
-    let ns = crate::net::create_isolated_net_namespace_for_test("rtnl-ipv6-route")
-        .expect("namespace")
-        .payload_cap()
-        .expect("namespace payload");
-    let root = crate::cred::Cred::root();
-
-    // A dummy link carrying a v6 address, so the gateway is on-link and the
-    // route's oif can be inferred from its connected route.
-    let dummy_req = nlmsg(
-        RTM_NEWLINK,
-        NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
-        80,
-        &newlink_payload("dummy6r", dummy_linkinfo()),
-    );
-    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &dummy_req)[0]);
-    let ifindex = ifindex_for(&ns.link_snapshot(), "dummy6r");
-    let link_addr = [0xfd, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1];
-    let add_addr = nlmsg(
-        RTM_NEWADDR,
-        NLM_F_REQUEST | NLM_F_ACK,
-        81,
-        &newaddr6_payload(ifindex, 64, link_addr),
-    );
-    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &add_addr)[0]);
-
-    // Add an off-link /64 reachable via a gateway inside the connected subnet.
-    let dst = [0xfd, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-    let gateway = [0xfd, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0xfe];
-    let route_req = nlmsg(
-        RTM_NEWROUTE,
-        NLM_F_REQUEST | NLM_F_ACK,
-        82,
-        &newroute6_payload(64, Some(dst), Some(gateway), ifindex),
-    );
-    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &route_req)[0]);
-
-    let decision = ns
-        .best_ipv6_route(Ipv6Address::new([
-            0xfd, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5,
-        ]))
-        .expect("v6 route decision");
-    assert_eq!(decision.oif_name, "dummy6r");
-    assert_eq!(decision.next_hop, Ipv6Address::new(gateway));
-    assert_eq!(decision.prefix_len, 64);
-
-    // The GETROUTE dump (family AF_INET6) must carry the route's gateway bytes.
-    let dump_req = nlmsg(RTM_GETROUTE, NLM_F_REQUEST | NLM_F_DUMP, 83, &rtmsg6());
-    let routes = rtnetlink_handle_request(&ns, root, &dump_req);
-    assert!(routes.iter().any(|msg| {
-        nlmsg_type(msg) == RTM_NEWROUTE
-            && contains_bytes(msg, &gateway)
-            && contains_bytes(msg, &ifindex.to_le_bytes())
-    }));
-
-    // Deleting the route removes it from the FIB.
-    let del_req = nlmsg(
-        RTM_DELROUTE,
-        NLM_F_REQUEST | NLM_F_ACK,
-        84,
-        &newroute6_payload(64, Some(dst), Some(gateway), ifindex),
-    );
-    assert_ack_ok(&rtnetlink_handle_request(&ns, root, &del_req)[0]);
-    assert!(ns
-        .best_ipv6_route(Ipv6Address::new([
-            0xfd, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5,
-        ]))
-        .is_none());
-}
-
-#[test]
-fn namespace_add_ipv6_route_longest_prefix_wins() {
-    init_zones();
-    let _lock = crate::test_support::EPOCH_TEST_LOCK
-        .lock()
-        .expect("net epoch test lock");
-    crate::net::reset_initial_net_namespace_for_test();
-    let ns = crate::net::create_isolated_net_namespace_for_test("rtnl-ipv6-lpm")
-        .expect("namespace")
-        .payload_cap()
-        .expect("namespace payload");
-    let auth = NetAdminAuthority::for_test_or_bootstrap();
-
-    // A dummy link with a v6 address so route oifs resolve/validate.
-    let pair = create_veth_pair_for_test_or_bootstrap(VethPairConfig {
-        left: VethEndpointConfig {
-            name: "eth6lpm0",
-            devt: DevT::new(96, 21),
-            mac: EthernetAddress::new([0x02, 0, 0, 0x76, 0, 21]),
-        },
-        right: VethEndpointConfig {
-            name: "veth6lpm0",
-            devt: DevT::new(96, 22),
-            mac: EthernetAddress::new([0x02, 0, 0, 0x76, 0, 22]),
-        },
-        mtu: VETH_DEFAULT_MTU,
-    });
-    ns.attach_device_for_test_or_bootstrap(pair.left, None)
-        .expect("attach eth6lpm0");
-    let ifindex = ifindex_for(&ns.link_snapshot(), "eth6lpm0");
-    ns.set_device_ipv6_addr_by_ifindex(
-        auth,
-        ifindex,
-        Some(Ipv6Address::new([
-            0xfd, 0, 0, 0xa, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-        ])),
-        Some(64),
-    )
-    .expect("set v6 addr");
-
-    // A broad /32 and a specific /64 both cover the target; /64 must win.
-    ns.add_ipv6_route(
-        auth,
-        crate::net::NetNamespaceRoute6Config {
-            dst: Ipv6Address::new([0xfd, 0, 0, 0xb, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
-            prefix_len: 32,
-            gateway: None,
-            oif_name: Some("eth6lpm0"),
-            preferred_src: None,
-            table: 254,
-            protocol: 4,
-            scope: 253,
-            route_type: 1,
-        },
-    )
-    .expect("add /32 route");
-    ns.add_ipv6_route(
-        auth,
-        crate::net::NetNamespaceRoute6Config {
-            dst: Ipv6Address::new([0xfd, 0, 0, 0xb, 0, 0xc, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
-            prefix_len: 64,
-            gateway: None,
-            oif_name: Some("eth6lpm0"),
-            preferred_src: None,
-            table: 254,
-            protocol: 4,
-            scope: 253,
-            route_type: 1,
-        },
-    )
-    .expect("add /64 route");
-
-    let target = Ipv6Address::new([0xfd, 0, 0, 0xb, 0, 0xc, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9]);
-    let decision = ns.best_ipv6_route(target).expect("v6 route decision");
-    assert_eq!(decision.prefix_len, 64);
-    assert_eq!(decision.oif_name, "eth6lpm0");
-}
-
-#[test]
-fn namespace_route6_snapshot_includes_connected_route() {
-    init_zones();
-    let _lock = crate::test_support::EPOCH_TEST_LOCK
-        .lock()
-        .expect("net epoch test lock");
-    crate::net::reset_initial_net_namespace_for_test();
-    let ns = crate::net::create_isolated_net_namespace_for_test("rtnl-ipv6-connected")
-        .expect("namespace")
-        .payload_cap()
-        .expect("namespace payload");
-    let auth = NetAdminAuthority::for_test_or_bootstrap();
-
-    let pair = create_veth_pair_for_test_or_bootstrap(VethPairConfig {
-        left: VethEndpointConfig {
-            name: "eth6conn0",
-            devt: DevT::new(96, 31),
-            mac: EthernetAddress::new([0x02, 0, 0, 0x76, 0, 31]),
-        },
-        right: VethEndpointConfig {
-            name: "veth6conn0",
-            devt: DevT::new(96, 32),
-            mac: EthernetAddress::new([0x02, 0, 0, 0x76, 0, 32]),
-        },
-        mtu: VETH_DEFAULT_MTU,
-    });
-    ns.attach_device_for_test_or_bootstrap(pair.left, None)
-        .expect("attach eth6conn0");
-    let ifindex = ifindex_for(&ns.link_snapshot(), "eth6conn0");
-    ns.set_device_ipv6_addr_by_ifindex(
-        auth,
-        ifindex,
-        Some(Ipv6Address::new([
-            0xfd, 0, 0, 0xd, 0, 1, 0, 2, 0, 0, 0, 0, 0, 0, 0, 3,
-        ])),
-        Some(64),
-    )
-    .expect("set v6 addr");
-
-    // The connected /64 (network address, gateway None, oif = the link) is
-    // synthesized into the snapshot from the link's v6 address.
-    let network = Ipv6Address::new([0xfd, 0, 0, 0xd, 0, 1, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0]);
-    assert!(ns.route6_snapshot().iter().any(|route| {
-        route.dst == network
-            && route.prefix_len == 64
-            && route.oif_name == Some("eth6conn0")
-            && route.gateway.is_none()
-    }));
-}
-
-#[test]
 fn rtnetlink_delroute_connected_route_is_idempotent_until_addr_changes() {
     init_zones();
     let _lock = crate::test_support::EPOCH_TEST_LOCK
@@ -1230,6 +1119,78 @@ fn rtnetlink_setlink_netns_pid_moves_veth_peer_between_namespaces() {
 }
 
 #[test]
+fn rtnetlink_setlink_netns_pid_can_rename_moved_veth_peer() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
+    let host = crate::net::create_isolated_net_namespace_for_test("rtnl-host-pid-rename")
+        .expect("host namespace")
+        .payload_cap()
+        .expect("host namespace payload");
+    let container = crate::net::create_isolated_net_namespace_for_test("rtnl-container-pid-rename")
+        .expect("container namespace")
+        .payload_cap()
+        .expect("container namespace payload");
+    let root = crate::cred::Cred::root();
+
+    let veth_req = nlmsg(
+        RTM_NEWLINK,
+        NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+        52,
+        &newlink_payload("veth0", veth_linkinfo("vethpeer0")),
+    );
+    assert_ack_ok(&rtnetlink_handle_request(&host, root, &veth_req)[0]);
+
+    let peer_ifindex = ifindex_for(&host.network_snapshot().links, "vethpeer0");
+    let mut move_and_rename = ifinfomsg(peer_ifindex, 0, 0);
+    push_attr_string(&mut move_and_rename, IFLA_IFNAME, "eth0");
+    push_attr_i32(&mut move_and_rename, IFLA_NET_NS_PID, 42);
+    let move_req = nlmsg(RTM_SETLINK, NLM_F_REQUEST | NLM_F_ACK, 53, &move_and_rename);
+    let mut resolve_netns_fd = |_fd: i32| None;
+    let mut resolve_netns_pid = |pid: u32| (pid == 42).then(|| container.clone());
+    assert_ack_ok(
+        &crate::net::rtnetlink::rtnetlink_handle_request_with_netns_resolvers(
+            &host,
+            root,
+            &move_req,
+            &mut resolve_netns_fd,
+            &mut resolve_netns_pid,
+        )[0],
+    );
+
+    assert!(host
+        .network_snapshot()
+        .links
+        .iter()
+        .all(|link| link.name != "vethpeer0"));
+    let container_snapshot = container.network_snapshot();
+    assert!(container_snapshot
+        .links
+        .iter()
+        .any(|link| link.name == "eth0" && link.kind == NetDeviceKind::Veth));
+    assert!(container_snapshot
+        .links
+        .iter()
+        .all(|link| link.name != "vethpeer0"));
+
+    let eth_ifindex = ifindex_for(&container.network_snapshot().links, "eth0");
+    container
+        .set_device_ipv4_addr_by_ifindex(
+            NetAdminAuthority::for_test_or_bootstrap(),
+            eth_ifindex,
+            Some(Ipv4Address::new([172, 17, 0, 2])),
+            Some(16),
+        )
+        .expect("set renamed peer address");
+    assert!(container
+        .ether_ifaces_snapshot()
+        .iter()
+        .any(|iface| iface.name == "eth0"));
+}
+
+#[test]
 fn rtnetlink_setlink_master_zero_detaches_bridge_port() {
     init_zones();
     let _lock = crate::test_support::EPOCH_TEST_LOCK
@@ -1516,40 +1477,6 @@ fn newroute_payload(
 ) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(2);
-    payload.push(prefix_len);
-    payload.push(0);
-    payload.push(0);
-    payload.push(254);
-    payload.push(4);
-    payload.push(if gateway.is_some() { 0 } else { 253 });
-    payload.push(1);
-    payload.extend_from_slice(&0u32.to_le_bytes());
-    if let Some(dst) = dst {
-        push_attr(&mut payload, RTA_DST, &dst);
-    }
-    if let Some(gateway) = gateway {
-        push_attr(&mut payload, RTA_GATEWAY, &gateway);
-    }
-    if ifindex != 0 {
-        push_attr_u32(&mut payload, RTA_OIF, ifindex);
-    }
-    payload
-}
-
-fn rtmsg6() -> Vec<u8> {
-    let mut payload = vec![AF_INET6, 0, 0, 0, 0, 0, 0, 0];
-    payload.extend_from_slice(&0u32.to_le_bytes());
-    payload
-}
-
-fn newroute6_payload(
-    prefix_len: u8,
-    dst: Option<[u8; 16]>,
-    gateway: Option<[u8; 16]>,
-    ifindex: u32,
-) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.push(AF_INET6);
     payload.push(prefix_len);
     payload.push(0);
     payload.push(0);

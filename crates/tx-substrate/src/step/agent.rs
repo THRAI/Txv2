@@ -21,27 +21,11 @@
 //! [`DelegateRegistry`] for the state-machine docs and DTOK-1 / DTOK-2
 //! / DTOK-3 invariant references.
 //!
-//! ## Layering and the timer-wheel boundary
+//! ## Timer boundary
 //!
-//! Per [`docs/progress/decisions/2026-05-11-d6-timerwheel-layering.md`]
-//! the `TimerWheel` lives in [`crate::wake::timer`] (same crate). The
-//! `tx-reactor` crate re-exports the same types at its root for
-//! back-compat, but the canonical home is the substrate side. The
-//! integration contract is therefore **a same-crate call**:
-//!
-//! - The driver installs a `TimerGuard` with role
-//!   `TimerGuardRole::DelegateTimeout` against a token's deadline
-//!   via [`crate::wake::timer::TimerWheel::install_delegate_timeout`].
-//!   That helper tags the timer entry with the `DelegateTokenId`.
-//! - On timer-tick the reactor calls
-//!   [`crate::wake::timer::TimerWheel::fire_due_delegate_timeouts`]`(now, &registry)`
-//!   which walks expired `DelegateTimeout` entries and invokes
-//!   [`DelegateRegistry::mark_timed_out`] for each. The CAS races
-//!   whichever transition got there first (agent reply, cancel,
-//!   agent death). DTOK-3: first writer wins.
-//! - When the script-side waiter resumes (any terminal transition),
-//!   the driver drops the `TimerGuard`, retiring the timer-wheel
-//!   registration regardless of which side won the race.
+//! The script driver owns deadline registration and retirement. It calls the
+//! registry's timeout transition when its deadline fires; the registry owns
+//! only delegate state and the DTOK-3 first-writer-wins CAS.
 //!
 //! PR-7B layered the wake-side glue on top of this: a per-token
 //! `Weak<TaskMailbox>` is stored in the registry slot at
@@ -58,9 +42,9 @@
 //! dies when its owning process exits; a `Thread`-scoped endpoint
 //! dies when its owning thread exits. On endpoint death the runtime
 //! walks the in-flight tokens for that endpoint and calls
-//! [`DelegateRegistry::mark_agent_died`] on each one. The
+//! the `DelegateRegistry` delegate agent-death transition on each one. The
 //! per-endpoint walk routing is documented but not yet implemented
-//! here (placeholder helper [`DelegateRegistry::mark_endpoint_died`]
+//! here (placeholder helper the `DelegateRegistry` delegate endpoint-death transition
 //! exists; full `EndpointScope` discrimination lands when the
 //! endpoint cap-zone does, per `07_BLAST_RADIUS.md` §6 risk row
 //! "EndpointScope abandonment routing edge cases").
@@ -70,8 +54,13 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 use crate::sync::SpinMutex;
-use crate::wake::timer::{TimerGuard, TimerWheel};
 use crate::wake::{MailboxEvent, TaskMailbox};
+
+fn direct_delegate_mailbox_post(mailbox: Weak<TaskMailbox>, event: MailboxEvent) {
+    if let Some(mailbox) = mailbox.upgrade() {
+        let _ = mailbox.post(event);
+    }
+}
 
 /// Closed catalog of agent-side cancellation policies (per
 /// `docs/Txv3/05_DELEGATE_v1.md`). Names the protocol the agent
@@ -209,11 +198,10 @@ pub enum UfdReply {
 }
 
 /// Timer-id placeholder used by [`ResumeOutcome::TimerExpired`].
-/// PR-8 published the [`crate::wake::timer::TimerToken`] public
-/// surface (alongside [`crate::wake::timer::TimerWheel`] /
-/// [`crate::wake::timer::TimerGuard`]); D6 relocated those types
-/// from `tx-reactor::timer` to `tx-substrate::wake::timer`. PR-7
-/// will reconcile this `TimerId` with `TimerToken` when the
+/// [`crate::wake::deadline::TimerToken`] is the public timer identity
+/// vocabulary. Deadline registration and expiry routing are owned by the
+/// reactor deadline domain. PR-7 will reconcile this `TimerId` with
+/// `TimerToken` when the
 /// `OnAgent` runtime wires its `DelegateTimeout`-role guards into
 /// the resume path. Until then the two ids are the same raw `u64`
 /// shape and round-trip via `.raw()` / `::new(raw)`.
@@ -530,7 +518,7 @@ impl DelegateState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransitionOutcome {
     /// CAS succeeded; the token is now in the requested terminal
-    /// state and (for `mark_replied`) the reply is installed.
+    /// state and (for `delegate reply transition`) the reply is installed.
     Applied,
     /// Token was already terminal; this transition is a late no-op
     /// (DTOK-1 "late writer is dropped"). The current state is
@@ -556,7 +544,7 @@ pub enum TransitionOutcome {
 /// `EndpointScope` discriminator from `05_DELEGATE_v1.md` §3.1.
 /// PR-7 stores it as a raw `u64` because the real endpoint
 /// cap-zone has not landed yet; the registry's
-/// `mark_endpoint_died(marker)` walks all tokens with a matching
+/// the delegate endpoint-death transition for `marker` walks all tokens with a matching
 /// marker. PR-10+ replaces the marker with a real
 /// `Cap<DelegateEndpoint<K>>` once available.
 struct TokenSlot {
@@ -568,7 +556,7 @@ struct TokenSlot {
     /// to keep the slot allocation contiguous.
     reply: Option<DelegateReply>,
     /// Opaque per-endpoint identifier used by
-    /// [`DelegateRegistry::mark_endpoint_died`] to walk every
+    /// the `DelegateRegistry` delegate endpoint-death transition to walk every
     /// in-flight token belonging to a dying endpoint. PR-10+
     /// replaces this with a real `Cap<DelegateEndpoint<K>>` when
     /// the endpoint cap-zone lands.
@@ -621,7 +609,7 @@ pub struct DelegateRegistry {
 impl DelegateRegistry {
     /// Construct an empty registry. Token ids are issued starting
     /// at `1`; id `0` is reserved as a never-issued sentinel for
-    /// consistency with [`crate::wake::timer::TimerToken`] /
+    /// consistency with [`crate::wake::deadline::TimerToken`] /
     /// [`crate::wake::SubscriberId`].
     pub fn new() -> Self {
         Self {
@@ -642,7 +630,7 @@ impl DelegateRegistry {
     /// `drop_policy`.
     ///
     /// `endpoint_marker` is an opaque per-endpoint identifier used
-    /// by [`Self::mark_endpoint_died`]; PR-7 keeps it as a raw
+    /// by the endpoint-death walk; PR-7 keeps it as a raw
     /// `u64` because the real endpoint cap-zone has not landed yet.
     /// Callers that don't care about endpoint-death routing may
     /// pass `0`.
@@ -653,7 +641,7 @@ impl DelegateRegistry {
     /// before a transition fires, the eventual `mark_*` posts
     /// nothing (the `Weak::upgrade` returns `None`). Callers that
     /// don't need wake routing (state-machine unit tests, the
-    /// `mark_endpoint_died` walk path) may pass `Weak::new()`.
+    /// `delegate endpoint-death transition` walk path) may pass `Weak::new()`.
     ///
     /// The request envelope is reserved for the typed
     /// per-EndpointKind shapes that PR-10+ lands (UfdRequest,
@@ -667,26 +655,6 @@ impl DelegateRegistry {
     /// **State.** Token starts in [`DelegateState::Pending`].
     /// CAS-only transitions from here.
     ///
-    /// Per D6 §7, the `deadline` parameter pairs a
-    /// [`crate::wake::timer::TimerGuard`] with the
-    /// [`AgentTokenGuard`] in a single call. When
-    /// `deadline = Some((d, wheel))`, the registry installs a
-    /// `DelegateTimeout`-role timer on `wheel` against the freshly
-    /// minted [`DelegateTokenId`] and stores the resulting
-    /// [`TimerGuard`] inside the [`AgentTokenGuard`]; the timer
-    /// guard drops before the token-state CAS on
-    /// [`AgentTokenGuard::drop`], so any concurrent
-    /// [`crate::wake::timer::TimerWheel::fire_due_delegate_timeouts`]
-    /// walk is serialized through the registry CAS (DTOK-3 race
-    /// determinism carries through unchanged — see
-    /// [`AgentTokenGuard`] drop docs).
-    ///
-    /// When `deadline = None`, the guard carries no timer
-    /// registration (`timer: None`); callers that want a separately
-    /// managed timer (e.g. an external `TimerWheel` clock domain)
-    /// can still install one manually via
-    /// [`crate::wake::timer::TimerWheel::install_delegate_timeout`]
-    /// after `install_request` returns.
     pub fn install_request(
         &self,
         _request: DelegateRequest,
@@ -694,26 +662,17 @@ impl DelegateRegistry {
         cancel_policy: AgentCancelPolicy,
         drop_policy: TokenDropPolicy,
         mailbox: Weak<TaskMailbox>,
-        deadline: Option<(Deadline, &TimerWheel)>,
     ) -> AgentTokenGuard<'_> {
         let id = DelegateTokenId(self.next_id.fetch_add(1, Ordering::Relaxed));
         {
             let mut slots = self.slots.lock();
             slots.push((id, TokenSlot::new(endpoint_marker, mailbox)));
         }
-        // Install the paired timer (if requested) AFTER the slot is
-        // visible in the registry: a `fire_due_delegate_timeouts`
-        // walk that lands between the wheel install and the guard's
-        // return must find a `Pending` slot to CAS against. Order
-        // here mirrors the drop order in reverse (drop-after-acquire,
-        // acquire-before-publish).
-        let timer = deadline.map(|(deadline, wheel)| wheel.install_delegate_timeout(deadline, id));
         AgentTokenGuard {
             registry: Some(self),
             id,
             drop_policy,
             cancel_policy,
-            timer,
         }
     }
 
@@ -760,7 +719,20 @@ impl DelegateRegistry {
     /// terminal (DTOK-1). The mailbox post happens **only** on
     /// `Applied` — late writers drop the event (DTOK-2 wake-routing
     /// race resolution).
-    pub fn mark_replied(&self, id: DelegateTokenId, reply: DelegateReply) -> TransitionOutcome {
+    /// `Pending -> Replied`, with caller-supplied mailbox posting.
+    ///
+    /// This keeps the registry as the single token-state linearization point
+    /// while allowing reactor-context callers to route the resulting
+    /// `AgentReplied` event through owner-aware scheduler placement.
+    pub fn mark_replied_with_post<F>(
+        &self,
+        id: DelegateTokenId,
+        reply: DelegateReply,
+        mut post: F,
+    ) -> TransitionOutcome
+    where
+        F: FnMut(Weak<TaskMailbox>, MailboxEvent),
+    {
         let mailbox = {
             let mut slots = self.slots.lock();
             let entry = match slots.iter_mut().find(|(slot_id, _)| *slot_id == id) {
@@ -791,9 +763,7 @@ impl DelegateRegistry {
         };
         // Phase 4: post the wake event with the slot lock dropped
         // (mailbox.post takes its own lock; ordering-discipline).
-        if let Some(mb) = mailbox.upgrade() {
-            let _ = mb.post(MailboxEvent::AgentReplied { token_id: id });
-        }
+        post(mailbox, MailboxEvent::AgentReplied { token_id: id });
         TransitionOutcome::Applied
     }
 
@@ -801,11 +771,17 @@ impl DelegateRegistry {
     /// on first writer; [`TransitionOutcome::LateNoOp`] if any
     /// other terminal transition already won the race (DTOK-3).
     ///
-    /// Called by the reactor-side timer-wheel fire path (future
-    /// PR-7B). The substrate state machine does not own the timer
-    /// wheel — see the module-level "Layering" docs.
-    pub fn mark_timed_out(&self, id: DelegateTokenId) -> TransitionOutcome {
-        self.cas_terminal(id, DelegateState::TimedOut)
+    /// `Pending -> TimedOut`, with caller-supplied mailbox posting.
+    ///
+    /// This preserves the registry as the single token-state
+    /// linearization point while allowing reactor-context callers to route the
+    /// wake event through their owner-aware post primitive instead of the
+    /// registry directly invoking [`TaskMailbox::post`].
+    pub fn mark_timed_out_with_post<F>(&self, id: DelegateTokenId, mut post: F) -> TransitionOutcome
+    where
+        F: FnMut(Weak<TaskMailbox>, MailboxEvent),
+    {
+        self.cas_terminal_with_post(id, DelegateState::TimedOut, &mut post)
     }
 
     /// `Pending → Canceled`. Called from the
@@ -814,15 +790,27 @@ impl DelegateRegistry {
     /// Returns [`TransitionOutcome::Applied`] on first writer;
     /// [`TransitionOutcome::LateNoOp`] if any other terminal
     /// transition already won.
-    pub fn mark_canceled(&self, id: DelegateTokenId) -> TransitionOutcome {
-        self.cas_terminal(id, DelegateState::Canceled)
+    /// `Pending -> Canceled`, with caller-supplied mailbox posting.
+    pub fn mark_canceled_with_post<F>(&self, id: DelegateTokenId, mut post: F) -> TransitionOutcome
+    where
+        F: FnMut(Weak<TaskMailbox>, MailboxEvent),
+    {
+        self.cas_terminal_with_post(id, DelegateState::Canceled, &mut post)
     }
 
     /// `Pending → AgentDied`. Called by the runtime when the
     /// endpoint owning the in-flight delegation dies (fd close,
     /// process / thread exit per `EndpointScope`).
-    pub fn mark_agent_died(&self, id: DelegateTokenId) -> TransitionOutcome {
-        self.cas_terminal(id, DelegateState::AgentDied)
+    /// `Pending -> AgentDied`, with caller-supplied mailbox posting.
+    pub fn mark_agent_died_with_post<F>(
+        &self,
+        id: DelegateTokenId,
+        mut post: F,
+    ) -> TransitionOutcome
+    where
+        F: FnMut(Weak<TaskMailbox>, MailboxEvent),
+    {
+        self.cas_terminal_with_post(id, DelegateState::AgentDied, &mut post)
     }
 
     /// Walk all in-flight tokens whose endpoint marker matches
@@ -840,7 +828,12 @@ impl DelegateRegistry {
     /// per-process scoping, fd-close vs. exit ordering) lands
     /// when the real endpoint cap-zone does. PR-7 ships the walk
     /// API only.
-    pub fn mark_endpoint_died(&self, marker: u64) -> usize {
+    /// Mark every pending token for `marker` as `AgentDied`, with
+    /// caller-supplied mailbox posting for each applied transition.
+    pub fn mark_endpoint_died_with_post<F>(&self, marker: u64, mut post: F) -> usize
+    where
+        F: FnMut(Weak<TaskMailbox>, MailboxEvent),
+    {
         let slots = self.slots.lock();
         let ids: Vec<DelegateTokenId> = slots
             .iter()
@@ -855,14 +848,25 @@ impl DelegateRegistry {
         drop(slots);
         let mut transitioned = 0;
         for id in ids {
-            if matches!(self.mark_agent_died(id), TransitionOutcome::Applied) {
+            if matches!(
+                self.mark_agent_died_with_post(id, &mut post),
+                TransitionOutcome::Applied
+            ) {
                 transitioned += 1;
             }
         }
         transitioned
     }
 
-    fn cas_terminal(&self, id: DelegateTokenId, target: DelegateState) -> TransitionOutcome {
+    fn cas_terminal_with_post<F>(
+        &self,
+        id: DelegateTokenId,
+        target: DelegateState,
+        post: &mut F,
+    ) -> TransitionOutcome
+    where
+        F: FnMut(Weak<TaskMailbox>, MailboxEvent),
+    {
         debug_assert!(target.is_terminal());
         let (outcome, mailbox) = {
             let slots = self.slots.lock();
@@ -890,12 +894,13 @@ impl DelegateRegistry {
         // run with the slots lock dropped.
         if matches!(outcome, TransitionOutcome::Applied) {
             if let Some(reason) = abort_reason_for(target) {
-                if let Some(mb) = mailbox.upgrade() {
-                    let _ = mb.post(MailboxEvent::Abort {
+                post(
+                    mailbox,
+                    MailboxEvent::Abort {
                         token_id: id,
                         reason,
-                    });
-                }
+                    },
+                );
             }
         }
         outcome
@@ -929,18 +934,18 @@ impl Default for DelegateRegistry {
 ///
 /// | `TokenDropPolicy` | `AgentCancelPolicy` | Drop behaviour |
 /// |---|---|---|
-/// | `CancelOnDrop` | `BestEffort` | `mark_canceled(id)`; agent's late reply (if any) is dropped on arrival |
-/// | `CancelOnDrop` | `Synchronous` | `mark_canceled(id)`; *caller* is responsible for then waiting on the agent's cancel-ack (synchronous protocol is reactor-side) |
-/// | `CancelOnDrop` | `Detached` | `mark_canceled(id)`; agent's eventual reply is dropped on arrival |
+/// | `CancelOnDrop` | `BestEffort` | cancel the token through the caller-posting path; agent's late reply (if any) is dropped on arrival |
+/// | `CancelOnDrop` | `Synchronous` | cancel the token through the caller-posting path; *caller* is responsible for then waiting on the agent's cancel-ack (synchronous protocol is reactor-side) |
+/// | `CancelOnDrop` | `Detached` | cancel the token through the caller-posting path; agent's eventual reply is dropped on arrival |
 /// | `Abandon` | `BestEffort` | no transition; waiter is unbound but token remains `Pending` (or stays in whatever terminal state already won) — agent's reply will land on a dead waiter |
 /// | `Abandon` | `Synchronous` | as `Abandon`; the kernel does NOT initiate the sync-cancel protocol |
 /// | `Abandon` | `Detached` | as `Abandon` |
 ///
 /// The behaviours collapse: `CancelOnDrop` always calls
-/// `mark_canceled` regardless of `AgentCancelPolicy`; `Abandon` is
+/// the canceled transition regardless of `AgentCancelPolicy`; `Abandon` is
 /// always a pure unbind. `AgentCancelPolicy` shapes only the
 /// **agent-facing protocol** the caller drives **after** the
-/// `mark_canceled` CAS (see DELEGATE-6 in `02_INVARIANTS_v5.md`).
+/// cancel CAS (see DELEGATE-6 in `02_INVARIANTS_v5.md`).
 ///
 /// To deliberately retain the registration past the guard's
 /// lifetime (e.g. transfer of ownership to a state machine that
@@ -948,37 +953,6 @@ impl Default for DelegateRegistry {
 /// caller is then responsible for eventually driving the token to
 /// a terminal state.
 ///
-/// ## Pairing with a [`crate::wake::timer::TimerGuard`]
-///
-/// Per D6 §7, this guard **owns** an optional
-/// [`crate::wake::timer::TimerGuard`] internally. Callers pass a
-/// `deadline = Some((d, wheel))` to
-/// [`DelegateRegistry::install_request`] to mint a `DelegateTimeout`
-/// timer registration paired with the token; the resulting
-/// [`TimerGuard`] is stored in the `timer` field and dropped
-/// **before** the token-state CAS on [`Drop`]. Drop order:
-///
-/// 1. `Drop::drop` runs `self.timer.take()`, which drops the
-///    [`crate::wake::timer::TimerGuard`] and retires the wheel
-///    entry.
-/// 2. The `TokenDropPolicy::CancelOnDrop` branch runs
-///    [`DelegateRegistry::mark_canceled`], CAS-ing the slot.
-///
-/// A concurrent
-/// [`crate::wake::timer::TimerWheel::fire_due_delegate_timeouts`]
-/// walk is serialized through the registry CAS exactly as today:
-/// either it CASes first (drop's `mark_canceled` returns
-/// `LateNoOp(TimedOut)`) or our drop CASes first and the wheel
-/// entry has already been retired by step 1 so the fire walk
-/// observes no matching entry. DTOK-3 (reply-vs-timeout race
-/// determinism) carries through unchanged because the registry CAS
-/// remains the single linearization point; the timer-guard drop is
-/// pure cleanup of the wheel entry.
-///
-/// Call sites that want a manually-managed timer (separate clock
-/// domain, deferred install) can still pass `deadline = None` and
-/// install a [`TimerGuard`] explicitly via
-/// [`crate::wake::timer::TimerWheel::install_delegate_timeout`].
 #[must_use = "drop the guard to release the delegation; binding to _ may cancel immediately"]
 pub struct AgentTokenGuard<'a> {
     /// `None` after [`Self::forget`]; drop becomes a no-op.
@@ -986,13 +960,6 @@ pub struct AgentTokenGuard<'a> {
     id: DelegateTokenId,
     drop_policy: TokenDropPolicy,
     cancel_policy: AgentCancelPolicy,
-    /// `Some` iff [`DelegateRegistry::install_request`] was called
-    /// with a `deadline = Some((d, wheel))`. Dropped **before** the
-    /// `mark_canceled` CAS in [`Drop::drop`] so a concurrent
-    /// [`crate::wake::timer::TimerWheel::fire_due_delegate_timeouts`]
-    /// walk is serialized through the registry CAS — see the
-    /// type-level "Pairing with a `TimerGuard`" docs and D6 §7.
-    timer: Option<TimerGuard>,
 }
 
 impl<'a> AgentTokenGuard<'a> {
@@ -1028,9 +995,6 @@ impl<'a> AgentTokenGuard<'a> {
     /// eventually driving the token to a terminal state via one of
     /// the `mark_*` methods.
     ///
-    /// Mirrors [`crate::wake::timer::TimerGuard::forget`]: standard
-    /// pattern when ownership of a registration is transferred to a
-    /// longer-lived state machine.
     pub fn forget(mut self) -> DelegateTokenId {
         self.registry = None;
         self.id
@@ -1039,29 +1003,15 @@ impl<'a> AgentTokenGuard<'a> {
 
 impl<'a> Drop for AgentTokenGuard<'a> {
     fn drop(&mut self) {
-        // Step 1: retire the paired wheel entry FIRST (if any).
-        // Per D6 §7, dropping the TimerGuard cancels the wheel
-        // registration so any concurrent
-        // `fire_due_delegate_timeouts` walk either (a) already won
-        // the CAS — in which case the wheel entry was already
-        // retired by the fire path and step 2's `mark_canceled`
-        // returns `LateNoOp(TimedOut)` — or (b) lost the race to
-        // find the entry post-retire, leaving the registry CAS in
-        // step 2 as the unambiguous last writer. The registry CAS
-        // remains the linearization point (DTOK-3 race determinism
-        // unchanged). Drop the timer **inside** the `drop(...)`
-        // call so it runs synchronously here, not at end-of-scope
-        // (binding to `let _g = ...` would extend its lifetime past
-        // the CAS).
-        drop(self.timer.take());
-        // Step 2: token-state CAS per drop_policy.
+        // Token-state CAS per drop policy. Deadline ownership lives in the
+        // script driver, so this guard never retires timer state.
         if let Some(registry) = self.registry.take() {
             match self.drop_policy {
                 TokenDropPolicy::CancelOnDrop => {
                     // Idempotent: if a terminal transition already
                     // won (reply / timeout / agent-died), the CAS
                     // returns LateNoOp and we don't override it.
-                    let _ = registry.mark_canceled(self.id);
+                    let _ = registry.mark_canceled_with_post(self.id, direct_delegate_mailbox_post);
                 }
                 TokenDropPolicy::Abandon => {
                     // Pure unbind: leave token state alone. The

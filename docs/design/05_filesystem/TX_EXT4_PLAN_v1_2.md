@@ -17,6 +17,7 @@
 - [`VFS_CHECKS_V2.1.md`](VFS_CHECKS_V2.1.md) and [`MOUNT_v1.md`](MOUNT_v1.md) — VFS ownership boundary, `FsOps` and `FsPageBacking` consumer side.
 - [`PAGE_BACKED_v1.md`](../03_memory-vm/PAGE_BACKED_v1.md) — `FsPageBacking` trait, `PageContainer` model.
 - [`VM_v1_2.md`](../03_memory-vm/VM_v1_2.md) — fault handler and `FsPageBacking::fetch_page` integration.
+- [`IO_MANAGER_v1.md`](IO_MANAGER_v1.md) — target successor path for file-data I/O: ext4 remains the concrete mapping/journal backend and produces neutral page/block plans while the I/O manager owns batching, submission, completion, and block scheduling.
 - [`01_CONCEPTS_v5.md §3.5`](../../Txv3/01_CONCEPTS_v5.md) — factoring/topology axes used throughout this plan.
 - [`03_STEP_MODEL_v2.md`](../../Txv3/03_STEP_MODEL_v2.md) — `StepOutcome` contract; all async methods return step outcomes.
 

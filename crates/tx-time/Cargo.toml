@@ -1,0 +1,22 @@
+[package]
+name = "tx-time"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tx-hal = { path = "../tx-hal" }
+tx-substrate = { path = "../tx-substrate" }
+
+[features]
+default = []
+test-support = []
+
+[lib]
+path = "src/lib.rs"
+test = true
+doctest = false
+
+[lints]
+workspace = true

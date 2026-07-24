@@ -16,6 +16,32 @@ pub enum TrapClass {
     UnknownInterrupt,
 }
 
+impl TrapClass {
+    #[allow(non_upper_case_globals)]
+    pub const InstructionPageFault: Self = Self::PageFault {
+        write: false,
+        instruction: true,
+    };
+    #[allow(non_upper_case_globals)]
+    pub const LoadPageFault: Self = Self::PageFault {
+        write: false,
+        instruction: false,
+    };
+    #[allow(non_upper_case_globals)]
+    pub const StorePageFault: Self = Self::PageFault {
+        write: true,
+        instruction: false,
+    };
+    #[allow(non_upper_case_globals)]
+    pub const UserEnvCall: Self = Self::Syscall;
+    #[allow(non_upper_case_globals)]
+    pub const SupervisorTimer: Self = Self::TimerInterrupt;
+    #[allow(non_upper_case_globals)]
+    pub const SupervisorExternal: Self = Self::ExternalInterrupt;
+    #[allow(non_upper_case_globals)]
+    pub const Unknown: Self = Self::UnknownSync;
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TrapPreviousMode {
     User,
@@ -34,22 +60,19 @@ pub struct TrapSnapshot {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TrapFrameSnapshot {
-    /// Architecture trap cause (RV64 `scause`, LA64 `ESTAT`).
-    pub cause: usize,
-    /// Faulting/return program counter (RV64 `sepc`, LA64 `ERA`).
-    pub pc: usize,
-    /// Fault value (RV64 `stval`, LA64 `BADV`).
-    pub fault_value: usize,
+    pub scause: usize,
+    pub sepc: usize,
+    pub stval: usize,
 }
 
 impl TrapFrameSnapshot {
     pub const fn portable(self, class: TrapClass) -> TrapSnapshot {
         TrapSnapshot {
             class,
-            pc: VirtAddr(self.pc),
+            pc: VirtAddr(self.sepc),
             fault_address: match class {
                 TrapClass::PageFault { .. } | TrapClass::AlignmentFault { .. } => {
-                    Some(VirtAddr(self.fault_value))
+                    Some(VirtAddr(self.stval))
                 }
                 _ => None,
             },
@@ -292,13 +315,7 @@ pub trait KernelTrapSink<P: TxPlatform> {
 
     fn on_timer_interrupt(cpu: CpuId, view: TrapFrameMut<'_>) -> TrapAction;
 
-    /// External device IRQ. `view` is the interrupted context's trap
-    /// frame: implementations that return `Reschedule` for a trap that
-    /// interrupted a *user* slice must first hand the preemption off to
-    /// the userspace-run slot (same discipline as `on_timer_interrupt`),
-    /// because from-user `Reschedule` longjmps back into the thread
-    /// future, whose wait would otherwise never resolve.
-    fn on_external_irq(cpu: CpuId, view: TrapFrameMut<'_>) -> TrapAction;
+    fn on_external_irq(cpu: CpuId) -> TrapAction;
 
     fn on_ipi(cpu: CpuId) -> TrapAction;
 

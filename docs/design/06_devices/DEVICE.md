@@ -21,6 +21,7 @@
 - [`BUS_v1.md`](../01_substrate/BUS_v1.md) — wires hosted on `&'static` tier-2 structs need `const` constructors; see §12.3.
 - [`TTY.md`](./TTY.md) — the one subsystem that genuinely wants dynamic (`Cap`-based) identity, and explains why.
 - [`BDEV_FS.md`](../05_filesystem/BDEV_FS.md) — the filesystem that turns registered `BlockDevice`s into `/dev/vda`-style RNodes.
+- [`IO_MANAGER_v1.md`](../05_filesystem/IO_MANAGER_v1.md) — target boundary below PageBacked and concrete filesystems: block drivers execute hardware protocol, while L6 owns `Bio` scheduling, tags, queue depth, merge, and barriers.
 
 ### Zone-derived type policy
 
@@ -82,7 +83,11 @@ Every device in txKernel falls into exactly one of three tiers. The tier determi
 
 **Home.** `tx-hal-<arch>-<board>/*`. Same platform crate family as trap handling, pmap primitives, and the early console.
 
-**Interface.** Static HAL calls through the selected platform axis — for example `<P as TimeIf>::read_ns()`, `<P as IrqIf>::claim()`, `<P as ConsoleIf>::write_bytes(&[u8])`, normally written as `P::read_ns()`, `P::claim()`, and `P::write_bytes()` when the bound is in scope. No object-model involvement.
+**Interface.** Static HAL calls through the selected platform axis — for example
+`<P as MonotonicCounterIf>::read_ns()`, `<P as DeadlineTimerIf>::set_deadline_ns(deadline)`,
+`<P as IrqIf>::claim()`, and `<P as ConsoleIf>::write_bytes(&[u8])`, normally
+written as `P::read_ns()`, `P::set_deadline_ns(deadline)`, `P::claim()`, and
+`P::write_bytes()` when the bound is in scope. No object-model involvement.
 
 **Wrapping.** Some tier-1 devices have a tier-2 wrapping. The early UART used for `printk` is wrapped by a tier-2 `CharDeviceBinding` after substrate init, so `/dev/console` exists and userspace can open it. The tier-1 poke-MMIO path remains as a panic-time fallback; normal I/O goes through the tier-2 binding.
 

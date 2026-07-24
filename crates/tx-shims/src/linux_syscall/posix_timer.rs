@@ -8,6 +8,10 @@
 use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use tx_services::time::{
+    timekeeper_clock, ClockRead, DeadlineNs, DeadlineRegistrar, DeadlineRegistrarHandle,
+    TimekeeperClock, TimerGuard, TimerRole, TimerTarget,
+};
 use tx_subsystems::timerfd::{ItimerSpec, ITIMERSPEC_BYTES};
 
 use tx_subsystems::process::ProcessIdentity;
@@ -18,7 +22,6 @@ use super::numbers::{
     CLOCK_REALTIME, CLOCK_REALTIME_ALARM, CLOCK_TAI, CLOCK_THREAD_CPUTIME_ID, NR_TIMER_CREATE,
     NR_TIMER_DELETE, NR_TIMER_GETOVERRUN, NR_TIMER_GETTIME, NR_TIMER_SETTIME, TIMER_ABSTIME,
 };
-use super::time::realtime_ns;
 use super::{
     bootstrap_read_user, bootstrap_write_user, SyscallCtx, SyscallResult, EFAULT_VALUE,
     EINVAL_VALUE,
@@ -30,13 +33,14 @@ const SIGEV_NONE: i32 = 1;
 const SIGEV_THREAD_ID: i32 = 4;
 const SIGALRM: u8 = 14;
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Default)]
 struct PosixTimer {
     clockid: u32,
     deadline_ns: u64,
     interval_ns: u64,
     overrun: i32,
     signal: Option<tx_subsystems::signal::Signum>,
+    timer_guard: Option<TimerGuard>,
 }
 
 static NEXT_TIMER_ID: AtomicU32 = AtomicU32::new(1);
@@ -62,7 +66,7 @@ fn valid_clock(clockid: u32) -> bool {
     )
 }
 
-fn remaining_ns(timer: PosixTimer, now_ns: u64) -> u64 {
+fn remaining_ns(timer: &PosixTimer, now_ns: u64) -> u64 {
     if timer.deadline_ns == 0 {
         0
     } else {
@@ -70,15 +74,18 @@ fn remaining_ns(timer: PosixTimer, now_ns: u64) -> u64 {
     }
 }
 
-fn current_clock_ns<P: super::TimeIf>(clockid: u32, now_ns: u64) -> u64 {
+fn current_clock_ns<P>(clockid: u32, now_ns: u64) -> u64
+where
+    TimekeeperClock<P>: ClockRead,
+{
     if matches!(clockid, CLOCK_REALTIME | CLOCK_REALTIME_ALARM | CLOCK_TAI) {
-        realtime_ns::<P>()
+        timekeeper_clock::<P>().realtime_now_ns()
     } else {
         now_ns
     }
 }
 
-fn timer_to_spec(timer: PosixTimer, now_ns: u64) -> ItimerSpec {
+fn timer_to_spec(timer: &PosixTimer, now_ns: u64) -> ItimerSpec {
     ItimerSpec {
         it_interval_ns: timer.interval_ns,
         it_value_ns: remaining_ns(timer, now_ns),
@@ -89,9 +96,55 @@ fn timer_key(ctx: &SyscallCtx<'_>, timerid: u32) -> (u32, u32) {
     (ctx.process.pid.0, timerid)
 }
 
-pub fn poll_due_posix_timers<P: super::TimeIf>(process: &Cap<ProcessIdentity>) -> Option<u64> {
+fn register_syscall_timer_deadline(
+    ctx: &SyscallCtx<'_>,
+    deadline_ns: u64,
+    role: TimerRole,
+) -> Option<TimerGuard> {
+    let registrar = ctx.timer_registrar.as_ref()?;
+    let mailbox = ctx.mailbox.as_ref()?;
+    registrar
+        .register_deadline(
+            DeadlineNs::new(deadline_ns),
+            role,
+            TimerTarget::SignalTarget {
+                mailbox: alloc::sync::Arc::downgrade(mailbox),
+            },
+        )
+        .ok()
+}
+
+fn register_task_timer_deadline(
+    registrar: Option<&dyn DeadlineRegistrar>,
+    mailbox: Option<&alloc::sync::Weak<tx_substrate::wake::TaskMailbox>>,
+    deadline_ns: u64,
+    role: TimerRole,
+) -> Option<TimerGuard> {
+    let registrar = registrar?;
+    let mailbox = mailbox?;
+    registrar
+        .register_deadline(
+            DeadlineNs::new(deadline_ns),
+            role,
+            TimerTarget::SignalTarget {
+                mailbox: mailbox.clone(),
+            },
+        )
+        .ok()
+}
+
+pub fn poll_due_posix_timers_with_post<P, F>(
+    process: &Cap<ProcessIdentity>,
+    timer_registrar: Option<&dyn DeadlineRegistrar>,
+    timer_mailbox: Option<alloc::sync::Weak<tx_substrate::wake::TaskMailbox>>,
+    mut post: F,
+) -> Option<u64>
+where
+    TimekeeperClock<P>: ClockRead,
+    F: FnMut(alloc::sync::Weak<tx_substrate::wake::TaskMailbox>, tx_substrate::wake::MailboxEvent),
+{
     let pid = process.pid.0;
-    let now_ns = P::read_ns();
+    let now_ns = timekeeper_clock::<P>().monotonic_now_ns();
     let mut to_deliver = [None; 8];
     let mut deliver_len = 0usize;
     let next_deadline = with_timer_map(|timers| {
@@ -110,14 +163,22 @@ pub fn poll_due_posix_timers<P: super::TimeIf>(process: &Cap<ProcessIdentity>) -
                 }
 
                 if timer.interval_ns == 0 || timer.overrun == i32::MAX {
+                    timer.timer_guard = None;
                     timer.deadline_ns = 0;
                 } else {
                     let elapsed = now_ns.saturating_sub(timer.deadline_ns);
                     let periods = elapsed / timer.interval_ns + 1;
                     timer.overrun = periods.saturating_sub(1).min(i32::MAX as u64) as i32;
+                    timer.timer_guard = None;
                     timer.deadline_ns = timer
                         .deadline_ns
                         .saturating_add(periods.saturating_mul(timer.interval_ns));
+                    timer.timer_guard = register_task_timer_deadline(
+                        timer_registrar,
+                        timer_mailbox.as_ref(),
+                        timer.deadline_ns,
+                        TimerRole::PosixTimer,
+                    );
                 }
             }
 
@@ -132,9 +193,10 @@ pub fn poll_due_posix_timers<P: super::TimeIf>(process: &Cap<ProcessIdentity>) -
     });
 
     for signal in to_deliver.into_iter().flatten().take(deliver_len) {
-        let _ = tx_subsystems::signal::deliver_posix_signal(
+        let _ = tx_subsystems::signal::deliver_posix_signal_with_post(
             tx_subsystems::signal::SignalTarget::Process(process.clone()),
             signal,
+            &mut post,
         );
     }
 
@@ -227,19 +289,21 @@ pub(super) fn sys_timer_getoverrun(timerid: u32, ctx: &SyscallCtx<'_>) -> Syscal
     }
 }
 
-pub(super) fn sys_timer_gettime<P: super::TimeIf>(
+pub(super) fn sys_timer_gettime<P>(
     timerid: u32,
     curr_value_ptr: u64,
     ctx: &SyscallCtx<'_>,
-) -> SyscallResult {
+) -> SyscallResult
+where
+    TimekeeperClock<P>: ClockRead,
+{
     if curr_value_ptr == 0 {
         return SyscallResult::Error(EFAULT_VALUE);
     }
-    let now_ns = P::read_ns();
+    let now_ns = timekeeper_clock::<P>().monotonic_now_ns();
     let spec = with_timer_map(|timers| {
         timers
             .get(&timer_key(ctx, timerid))
-            .copied()
             .map(|timer| timer_to_spec(timer, now_ns))
     });
     let Some(spec) = spec else {
@@ -255,13 +319,16 @@ pub(super) fn sys_timer_gettime<P: super::TimeIf>(
     }
 }
 
-pub(super) fn sys_timer_settime<P: super::TimeIf>(
+pub(super) fn sys_timer_settime<P>(
     timerid: u32,
     flags: u32,
     new_value_ptr: u64,
     old_value_ptr: u64,
     ctx: &SyscallCtx<'_>,
-) -> SyscallResult {
+) -> SyscallResult
+where
+    TimekeeperClock<P>: ClockRead,
+{
     if flags & !TIMER_ABSTIME != 0 {
         return SyscallResult::Error(EINVAL_VALUE);
     }
@@ -278,11 +345,11 @@ pub(super) fn sys_timer_settime<P: super::TimeIf>(
         return SyscallResult::Error(EINVAL_VALUE);
     };
 
-    let now_ns = P::read_ns();
+    let now_ns = timekeeper_clock::<P>().monotonic_now_ns();
     let abstime = (flags & TIMER_ABSTIME) != 0;
     let update = with_timer_map(|timers| {
         let timer = timers.get_mut(&timer_key(ctx, timerid))?;
-        let old_spec = timer_to_spec(*timer, now_ns);
+        let old_spec = timer_to_spec(timer, now_ns);
         let clock_now_ns = current_clock_ns::<P>(timer.clockid, now_ns);
         timer.interval_ns = new_value.it_interval_ns;
         let expired_periodic_abstime = abstime
@@ -303,9 +370,14 @@ pub(super) fn sys_timer_settime<P: super::TimeIf>(
         } else {
             0
         };
-        Some((old_spec, *timer))
+        timer.timer_guard = if timer.deadline_ns == 0 {
+            None
+        } else {
+            register_syscall_timer_deadline(ctx, timer.deadline_ns, TimerRole::PosixTimer)
+        };
+        Some(old_spec)
     });
-    let Some((old_spec, timer_after)) = update else {
+    let Some(old_spec) = update else {
         return SyscallResult::Error(EINVAL_VALUE);
     };
 
@@ -318,9 +390,6 @@ pub(super) fn sys_timer_settime<P: super::TimeIf>(
             Ok(()) => {}
             Err(errno) => return SyscallResult::error_from(errno),
         }
-    }
-    if timer_after.deadline_ns != 0 {
-        P::set_deadline_ns(timer_after.deadline_ns);
     }
     SyscallResult::Return(0)
 }

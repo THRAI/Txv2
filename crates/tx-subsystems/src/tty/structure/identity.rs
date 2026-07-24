@@ -19,7 +19,7 @@ use alloc::sync::Arc;
 use crate::tty::adapter::step_engine::{
     AtomicSlot, Cap, Dead, Entity, PayloadCap, RawPort, RawQueue, SpinMutex, Weak,
 };
-use crate::tty::adapter::wait_routing::{Channel, WaitSource};
+use crate::tty::adapter::wait_routing::WaitSource;
 use crate::tty::notification;
 
 use super::payload::TtyPayload;
@@ -76,7 +76,8 @@ impl<const N: usize> FixedName<N> {
 ///
 /// Typed refs unlock pgrp-targeted signal delivery: callers can
 /// upgrade via [`SessionPgrp::upgrade_foreground_pgrp`] and pass the
-/// resulting `Cap<ProcessGroup>` to `signal::step_kill_pgrp`.
+/// resulting `Cap<ProcessGroup>` to the caller-posting process-group
+/// signal helper.
 #[derive(Clone, Copy, Debug)]
 pub struct SessionPgrp {
     pub session_id: u32,
@@ -216,36 +217,9 @@ pub struct TtyIdentity {
     /// identities first, then installs peer-linked payloads as commit points;
     /// hangup later clears this slot while identity wires remain observable.
     pub(crate) payload: SpinMutex<Option<PayloadCap<TtyPayload>>>,
-    /// Reactor wait channel that fires when `input_readable` transitions
-    /// non-empty. Used by `step_read`'s `Blocked(WaitToken)` carrier to
-    /// drive `wait_source::wait_on_token` from the syscall side; fired
-    /// from `step_ingest` after pushing bytes (alongside the existing
-    /// `RawQueue` readiness wire).
-    ///
-    /// Pre-ELF Phase 5 (item 9): bridges the existing `RawQueue` BIF-5
-    /// readiness wire to the wait-source registry that
-    /// `tx_subsystems::wait_source` uses, so blocking `read(2)` on a
-    /// console fd actually parks until UART RX bytes land.
-    wait_channel: Channel,
-    /// Carrier id that `wait_channel` is registered under in
-    /// `tx_subsystems::wait_source`. Embedded in any `WaitToken` this
-    /// TTY hands out so async script wrappers (`sys_read`'s
-    /// `wait_on_token` loop) can resolve the carrier without holding a
-    /// `Cap<TtyIdentity>`.
+    /// Carrier id under which this TTY's read wait source is registered.
     wait_source_id: u64,
-    /// PR-3D-4 (D2/D4 coexistence). Per-TTY `WaitSource` minted at
-    /// `TtyIdentity::new` time alongside the legacy `wait_channel`
-    /// `Channel`. Shares the same [`WaitSourceId`] (raw `u64` ==
-    /// `wait_source_id`) so a v3 caller's
-    /// `YieldShape::OnWaitSource { source: WaitSourceId(id), .. }`
-    /// resolves to this same source without going through the legacy
-    /// `wait_source` resolver.
-    ///
-    /// Fired in parallel with the legacy Channel by `step_ingest` (the
-    /// in-tree fire site for the read-readable transition). Mirrors
-    /// the `exit_wait_source` pattern from
-    /// `crates/tx-subsystems/src/process/structure.rs` (PR-3D-3): one
-    /// `Arc<WaitSource>` per object, one bit (`TTY_READABLE`).
+    /// Per-TTY `WaitSource` fired by `step_ingest` when input becomes readable.
     wait_source: Arc<WaitSource>,
 }
 
@@ -266,38 +240,24 @@ impl TtyIdentity {
             hangup_port: RawPort::new(),
             session_ctl_port: RawPort::new(),
             payload: SpinMutex::new(None),
-            wait_channel: wait_point.channel,
             wait_source_id: wait_point.source_id,
             wait_source: wait_point.source,
         }
     }
 
-    /// Carrier id under which `wait_channel` is registered with the
-    /// global `wait_source` resolver. Async script wrappers embed
-    /// this in their `WaitToken` values so `wait_on_token` can resolve
-    /// the channel without holding a `Cap<TtyIdentity>`.
+    /// Carrier id under which this TTY's read wait source is registered.
     pub fn wait_source_id(&self) -> u64 {
         self.wait_source_id
     }
 
-    /// Reactor wait channel paired with `input_readable`. Callers that
-    /// hold a `Cap<TtyIdentity>` may fire it directly when bytes
-    /// arrive; `step_ingest` is the in-tree fire site.
-    pub fn wait_channel(&self) -> &Channel {
-        &self.wait_channel
+    /// Per-TTY `WaitSource` for the mailbox-based wake path.
+    fn wait_source(&self) -> &Arc<WaitSource> {
+        &self.wait_source
     }
 
-    /// PR-3D-4: per-TTY `WaitSource` for the new mailbox-based wake
-    /// path. Returned as `&Arc<WaitSource>` so callers can clone and
-    /// hold the source across the wait window via
-    /// `WaitSource::prepare(..).install_if(..)` without going through
-    /// the legacy `wait_source` resolver.
-    ///
-    /// `WaitSource::id()` matches [`Self::wait_source_id`]: a v3
-    /// caller's `YieldShape::OnWaitSource { source: WaitSourceId(id),
-    /// .. }` resolves to this same source.
-    pub fn wait_source(&self) -> &Arc<WaitSource> {
-        &self.wait_source
+    /// Readable endpoint exposed to wait drivers.
+    pub fn read_endpoint(&self) -> &Arc<WaitSource> {
+        self.wait_source()
     }
 
     /// Install or replace the live payload slot.
@@ -344,8 +304,7 @@ impl TtyIdentity {
     /// raw-id bindings, when no binding is installed, or when the
     /// pgrp has been dropped.
     ///
-    /// Used by signal-fanout paths that want to call
-    /// `signal::step_kill_pgrp` against the foreground pgrp.
+    /// Used by signal-fanout paths that need the foreground pgrp cap.
     pub fn foreground_pgrp_cap(&self) -> Option<Cap<crate::process::structure::ProcessGroup>> {
         self.session_pgrp.snapshot()?.upgrade_foreground_pgrp()
     }

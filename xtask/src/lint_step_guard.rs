@@ -82,8 +82,7 @@ pub(crate) fn lint_invariants_step_guard(root: &Path) -> Result<()> {
         "ok"
     };
     println!(
-        "`pub guard: &Guard` fields in StepOp wraps: {:>4}  (ceiling {})  {}",
-        count, MAX_GUARD_FIELDS, status
+        "`pub guard: &Guard` fields in StepOp wraps: {count:>4}  (ceiling {MAX_GUARD_FIELDS})  {status}"
     );
     for v in &violations {
         println!("  {v}");

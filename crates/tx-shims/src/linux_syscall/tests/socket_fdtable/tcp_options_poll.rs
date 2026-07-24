@@ -1652,41 +1652,41 @@ fn dispatch_fcntl_setfl_nonblock_affects_socket_recvfrom() {
 }
 
 #[test]
-fn pselect_socket_read_ready_includes_hup_and_errors() {
-    assert!(crate::linux_syscall::io::pselect_socket_read_ready(
+fn select_fd_read_ready_includes_hup_and_errors() {
+    assert!(crate::linux_syscall::io::select_fd_read_ready(
         true,
-        PollMask::HUP
+        FdReadyMask::HUP
     ));
-    assert!(crate::linux_syscall::io::pselect_socket_read_ready(
+    assert!(crate::linux_syscall::io::select_fd_read_ready(
         true,
-        PollMask::RDHUP
+        FdReadyMask::RDHUP
     ));
-    assert!(crate::linux_syscall::io::pselect_socket_read_ready(
+    assert!(crate::linux_syscall::io::select_fd_read_ready(
         true,
-        PollMask::ERR
+        FdReadyMask::ERR
     ));
-    assert!(!crate::linux_syscall::io::pselect_socket_read_ready(
+    assert!(!crate::linux_syscall::io::select_fd_read_ready(
         false,
-        PollMask::IN
+        FdReadyMask::READ
     ));
 }
 
 #[test]
-fn pselect_socket_blocked_interests_keeps_read_and_write_distinct() {
+fn select_fd_blocked_directions_keeps_read_and_write_distinct() {
     assert_eq!(
-        crate::linux_syscall::io::pselect_socket_blocked_interests(true, true, PollMask::empty()),
+        crate::linux_syscall::io::select_fd_blocked_directions(true, true, FdReadyMask::empty()),
         (true, true)
     );
     assert_eq!(
-        crate::linux_syscall::io::pselect_socket_blocked_interests(true, true, PollMask::OUT),
+        crate::linux_syscall::io::select_fd_blocked_directions(true, true, FdReadyMask::WRITE),
         (true, false)
     );
     assert_eq!(
-        crate::linux_syscall::io::pselect_socket_blocked_interests(true, true, PollMask::ERR),
+        crate::linux_syscall::io::select_fd_blocked_directions(true, true, FdReadyMask::ERR),
         (false, false)
     );
     assert_eq!(
-        crate::linux_syscall::io::pselect_socket_blocked_interests(true, true, PollMask::HUP),
+        crate::linux_syscall::io::select_fd_blocked_directions(true, true, FdReadyMask::HUP),
         (false, true)
     );
 }

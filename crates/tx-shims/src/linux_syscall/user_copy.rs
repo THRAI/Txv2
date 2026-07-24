@@ -30,6 +30,8 @@ use tx_subsystems::vm::{
 pub(super) enum ReadCStrError {
     /// No NUL within `max_len` — surface as `-ENAMETOOLONG`.
     TooLong,
+    /// Kernel buffer growth failed while copying the string.
+    OutOfMemory,
     /// Canonical user copy fault (for example, `NULL`/bad pathname).
     Fault(Errno),
 }
@@ -39,6 +41,54 @@ pub(super) enum ReadCStrError {
 /// as `-E2BIG` per the Phase 6 plan.
 pub(super) enum ReadVecError {
     TooBig,
+    OutOfMemory,
+    Fault(Errno),
+}
+
+#[cfg(test)]
+static USER_COPY_ALLOCATION_FAIL_AFTER: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(usize::MAX);
+
+#[cfg(test)]
+pub(super) struct UserCopyAllocationFailureGuard;
+
+#[cfg(test)]
+impl Drop for UserCopyAllocationFailureGuard {
+    fn drop(&mut self) {
+        USER_COPY_ALLOCATION_FAIL_AFTER.store(usize::MAX, core::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+pub(super) fn fail_user_copy_allocation_after_for_test(
+    successful_reservations: usize,
+) -> UserCopyAllocationFailureGuard {
+    USER_COPY_ALLOCATION_FAIL_AFTER.store(
+        successful_reservations,
+        core::sync::atomic::Ordering::Release,
+    );
+    UserCopyAllocationFailureGuard
+}
+
+pub(super) fn try_reserve_user_copy_items<T>(
+    items: &mut Vec<T>,
+    additional: usize,
+) -> Result<(), ()> {
+    if additional == 0 {
+        return Ok(());
+    }
+    #[cfg(test)]
+    {
+        use core::sync::atomic::Ordering;
+        let remaining = USER_COPY_ALLOCATION_FAIL_AFTER.load(Ordering::Acquire);
+        if remaining != usize::MAX {
+            if remaining == 0 {
+                return Err(());
+            }
+            USER_COPY_ALLOCATION_FAIL_AFTER.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+    items.try_reserve_exact(additional).map_err(|_| ())
 }
 
 fn user_access_guard() -> step_engine::Guard<'static> {
@@ -50,8 +100,8 @@ fn user_access_guard() -> step_engine::Guard<'static> {
 ///
 /// Normal pathname-bearing syscalls expect Linux semantics here:
 /// `uaddr == 0` is `-EFAULT`, a missing NUL within `max_len` is
-/// `-ENAMETOOLONG`, and other canonical user-copy failures preserve
-/// their original errno.
+/// `-ENAMETOOLONG`, allocation failure is `-ENOMEM`, and other
+/// canonical user-copy failures preserve their original errno.
 pub(super) fn read_user_cstr(
     aspace: &AddressSpace,
     uaddr: u64,
@@ -66,6 +116,7 @@ pub(super) fn read_user_cstr(
     match bootstrap_read_user_cstr(aspace, uaddr, max_len) {
         Ok(v) => Ok(v),
         Err(Errno::ENAMETOOLONG) => Err(ReadCStrError::TooLong),
+        Err(Errno::ENOMEM) => Err(ReadCStrError::OutOfMemory),
         Err(errno) => Err(ReadCStrError::Fault(errno)),
     }
 }
@@ -92,12 +143,21 @@ pub(super) fn read_user_cstr_vec(
     if uaddr == 0 {
         return Ok(Vec::new());
     }
+    if max_slots > (u64::MAX as usize) / core::mem::size_of::<u64>() {
+        return Err(ReadVecError::TooBig);
+    }
     let mut out: Vec<Vec<u8>> = Vec::new();
     for slot in 0..max_slots {
-        let slot_addr = uaddr.wrapping_add((slot * core::mem::size_of::<u64>()) as u64);
+        let slot_offset = slot
+            .checked_mul(core::mem::size_of::<u64>())
+            .and_then(|offset| u64::try_from(offset).ok())
+            .ok_or(ReadVecError::TooBig)?;
+        let slot_addr = uaddr
+            .checked_add(slot_offset)
+            .ok_or(ReadVecError::Fault(Errno::EFAULT))?;
         let ptr = match bootstrap_read_user::<u64>(aspace, slot_addr) {
             Ok(p) => p,
-            Err(_) => return Err(ReadVecError::TooBig),
+            Err(errno) => return Err(ReadVecError::Fault(errno)),
         };
         if ptr == 0 {
             return Ok(out);
@@ -106,12 +166,7 @@ pub(super) fn read_user_cstr_vec(
         // budget. We need at least one byte for the NUL terminator;
         // when `*byte_budget == 0` any non-empty string is `TooBig`.
         let cap = *byte_budget;
-        let s = match read_user_cstr(aspace, ptr, cap) {
-            Ok(s) => s,
-            Err(ReadCStrError::TooLong | ReadCStrError::Fault(_)) => {
-                return Err(ReadVecError::TooBig);
-            }
-        };
+        let s = read_user_exec_cstr(aspace, ptr, cap)?;
         // Account `s.len() + 1` for the implicit NUL byte we read but
         // did not store, matching Linux's `ARG_MAX` accounting.
         let charged = s.len().saturating_add(1);
@@ -119,10 +174,47 @@ pub(super) fn read_user_cstr_vec(
             return Err(ReadVecError::TooBig);
         }
         *byte_budget -= charged;
+        try_reserve_user_copy_items(&mut out, 1).map_err(|_| ReadVecError::OutOfMemory)?;
         out.push(s);
     }
     // Hit the slot cap without observing a NULL terminator — treat
     // as oversized argv per the plan.
+    Err(ReadVecError::TooBig)
+}
+
+fn read_user_exec_cstr(
+    aspace: &AddressSpace,
+    uaddr: u64,
+    max_len: usize,
+) -> Result<Vec<u8>, ReadVecError> {
+    if uaddr == 0 {
+        return Err(ReadVecError::Fault(Errno::EFAULT));
+    }
+    if max_len == 0 {
+        return Err(ReadVecError::TooBig);
+    }
+
+    let mut out = Vec::new();
+    for offset in 0..max_len {
+        let offset = u64::try_from(offset).map_err(|_| ReadVecError::TooBig)?;
+        let byte_addr = uaddr
+            .checked_add(offset)
+            .ok_or(ReadVecError::Fault(Errno::EFAULT))?;
+        let byte = bootstrap_read_user::<u8>(aspace, byte_addr).map_err(ReadVecError::Fault)?;
+        if byte == 0 {
+            return Ok(out);
+        }
+        if out.len() == out.capacity() {
+            let additional = if out.capacity() == 0 {
+                core::cmp::min(max_len, 256)
+            } else {
+                core::cmp::min(out.capacity(), max_len - out.len())
+            };
+            try_reserve_user_copy_items(&mut out, additional)
+                .map_err(|_| ReadVecError::OutOfMemory)?;
+        }
+        out.push(byte);
+    }
     Err(ReadVecError::TooBig)
 }
 
@@ -462,13 +554,23 @@ pub(super) fn bootstrap_read_user_cstr(
                 }
                 // Fallback bootstrap scan — matches the previous inline
                 // helper.
-                let mut out: Vec<u8> = Vec::with_capacity(core::cmp::min(max_len, 256));
+                let mut out: Vec<u8> = Vec::new();
+                try_reserve_user_copy_items(&mut out, core::cmp::min(max_len, 256))
+                    .map_err(|_| Errno::ENOMEM)?;
                 for offset in 0..max_len {
                     // SAFETY: see `bootstrap_read_user`.
                     let byte =
                         unsafe { core::ptr::read_volatile((uaddr as usize + offset) as *const u8) };
                     if byte == 0 {
                         return Ok(out);
+                    }
+                    if out.len() == out.capacity() {
+                        let additional = core::cmp::min(
+                            out.capacity().max(1),
+                            max_len.saturating_sub(out.len()),
+                        );
+                        try_reserve_user_copy_items(&mut out, additional)
+                            .map_err(|_| Errno::ENOMEM)?;
                     }
                     out.push(byte);
                 }

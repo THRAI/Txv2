@@ -59,7 +59,7 @@ expect "N73D_BRIDGE_UP" within 15000
 expect "/ # " within 10000
 
 sleep 500
-send "if $IP link add veth0 type veth peer name eth0; then echo ${m}_VETH_A_CREATED; else echo ${m}_FAIL_VETH_A_CREATE; fi\n"
+send "if $IP link add veth0 type veth peer name vethpeer0; then echo ${m}_VETH_A_CREATED; else echo ${m}_FAIL_VETH_A_CREATE; fi\n"
 expect "N73D_VETH_A_CREATED" within 15000
 expect "/ # " within 10000
 
@@ -74,7 +74,7 @@ expect "N73D_VETH_A_UP" within 15000
 expect "/ # " within 10000
 
 sleep 500
-send "if $IP link set eth0 netns $target_a || /bin/netns-helper netns eth0 $target_a; then echo ${m}_ETH_A_MOVED; else echo ${m}_FAIL_ETH_A_MOVE; fi\n"
+send "if $IP link set vethpeer0 netns $target_a name eth0 || (/bin/netns-helper netns vethpeer0 $target_a && /bin/netns-helper exec $target_a $IP link set vethpeer0 name eth0); then echo ${m}_ETH_A_MOVED; else echo ${m}_FAIL_ETH_A_MOVE; fi\n"
 expect "N73D_ETH_A_MOVED" within 15000
 expect "/ # " within 10000
 
@@ -94,7 +94,7 @@ expect "N73D_ETH_A_DEFAULT_ROUTE" within 15000
 expect "/ # " within 10000
 
 sleep 500
-send "if $IP link add veth1 type veth peer name eth0; then echo ${m}_VETH_B_CREATED; else echo ${m}_FAIL_VETH_B_CREATE; fi\n"
+send "if $IP link add veth1 type veth peer name vethpeer1; then echo ${m}_VETH_B_CREATED; else echo ${m}_FAIL_VETH_B_CREATE; fi\n"
 expect "N73D_VETH_B_CREATED" within 15000
 expect "/ # " within 10000
 
@@ -109,7 +109,7 @@ expect "N73D_VETH_B_UP" within 15000
 expect "/ # " within 10000
 
 sleep 500
-send "if $IP link set eth0 netns $target_b || /bin/netns-helper netns eth0 $target_b; then echo ${m}_ETH_B_MOVED; else echo ${m}_FAIL_ETH_B_MOVE; fi\n"
+send "if $IP link set vethpeer1 netns $target_b name eth0 || (/bin/netns-helper netns vethpeer1 $target_b && /bin/netns-helper exec $target_b $IP link set vethpeer1 name eth0); then echo ${m}_ETH_B_MOVED; else echo ${m}_FAIL_ETH_B_MOVE; fi\n"
 expect "N73D_ETH_B_MOVED" within 15000
 expect "/ # " within 10000
 

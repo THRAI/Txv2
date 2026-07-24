@@ -85,3 +85,49 @@ fn vm_copy_to_user_rejects_read_only_recipe() {
 
     assert_eq!(copied, StepOutcome::Err(Errno::EFAULT.into()));
 }
+
+#[test]
+fn vm_read_user_cstr_grows_past_initial_capacity() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("vm user-access test lock");
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let user_addr = 0x20_000;
+    let expected = vec![b'x'; 300];
+    let mut input = expected.clone();
+    input.push(0);
+    map_private(&aspace, user_addr, input.len(), Prot::READ_WRITE);
+    let guard = crate::vm::adapter::step_engine::guard();
+    assert_eq!(
+        aspace.copy_to_user(UserPtr::new(user_addr), &input, &guard),
+        StepOutcome::Done(input.len())
+    );
+
+    assert_eq!(
+        aspace.read_user_cstr(UserPtr::new(user_addr), input.len(), &guard),
+        StepOutcome::Done(expected)
+    );
+}
+
+#[test]
+fn vm_read_user_cstr_preserves_fault_and_too_long_errors() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("vm user-access test lock");
+    setup_host_substrate();
+    let aspace = AddressSpace::new();
+    let user_addr = 0x30_000;
+    let input = [b'x'; 8];
+    map_private(&aspace, user_addr, input.len(), Prot::READ_WRITE);
+    let guard = crate::vm::adapter::step_engine::guard();
+    assert_eq!(
+        aspace.copy_to_user(UserPtr::new(user_addr), &input, &guard),
+        StepOutcome::Done(input.len())
+    );
+
+    assert_eq!(
+        aspace.read_user_cstr(UserPtr::new(0x40_000), input.len(), &guard),
+        StepOutcome::Err(Errno::EFAULT.into())
+    );
+    assert_eq!(
+        aspace.read_user_cstr(UserPtr::new(user_addr), input.len(), &guard),
+        StepOutcome::Err(Errno::ENAMETOOLONG.into())
+    );
+}

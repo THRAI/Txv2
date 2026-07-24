@@ -9,6 +9,7 @@ use core::ptr::{self, NonNull};
 
 use tx_hal::{PhysAddr, Ppn};
 
+use crate::epoch::RcuHead;
 use crate::page_allocator::{self, ZeroPolicy};
 
 use super::registry::SlotKey;
@@ -33,7 +34,10 @@ pub(crate) enum SlabList {
 ///
 /// The descriptor and typed slots live inside a backing page obtained directly
 /// from the frame allocator. It does not allocate through the kernel heap.
+#[repr(C)]
 pub struct ZoneSlab<T: 'static> {
+    /// One-shot intrusive retirement header. Kept separate from Keg linkage.
+    retire_head: RcuHead,
     /// Per-zone slab ID used in `SlotKey`.
     id: usize,
     /// Owning zone. Stored once per slab instead of once per slot.
@@ -72,11 +76,11 @@ impl<T: 'static> ZoneSlab<T> {
             return Err(ZoneError::AllocationFailed);
         }
 
-        // Commit the frame and intentionally keep the raw PPN. The slab header
-        // becomes the lifetime owner until `reclaim_slab` releases the frame.
+        // Keep the owned run live across all fallible address calculations so
+        // an early error returns the frame automatically. The slab header takes
+        // ownership only after it and every slot are fully initialized.
         let run = page_allocator::reserve_run(1, 1, ZeroPolicy::UninitFullOverwrite)?.commit();
         let backing_ppn = run.base();
-        core::mem::forget(run);
 
         let phys = PhysAddr(
             backing_ppn
@@ -96,6 +100,7 @@ impl<T: 'static> ZoneSlab<T> {
 
         unsafe {
             slab_ptr.write(Self {
+                retire_head: RcuHead::new(reclaim_slab_head::<T>),
                 id,
                 zone,
                 backing_ppn,
@@ -113,11 +118,17 @@ impl<T: 'static> ZoneSlab<T> {
             }
         }
 
+        core::mem::forget(run);
+
         Ok(slab)
     }
 
     pub(crate) fn id(&self) -> usize {
         self.id
+    }
+
+    pub(crate) fn retire_head(&mut self) -> NonNull<RcuHead> {
+        NonNull::from(&mut self.retire_head)
     }
 
     pub fn backing_ppn(&self) -> Ppn {
@@ -242,6 +253,13 @@ pub(crate) unsafe fn reclaim_slab<T: 'static>(ptr: *mut u8) {
             let _ = page_allocator::release_owned_frame(Ppn(backing_ppn.0 + offset));
         }
     }
+}
+
+unsafe fn reclaim_slab_head<T: 'static>(
+    head: *mut RcuHead,
+    _guard: &mut crate::epoch::LocalRetireGuard,
+) {
+    unsafe { reclaim_slab::<T>(head.cast::<u8>()) }
 }
 
 fn align_up(value: usize, align: usize) -> Option<usize> {

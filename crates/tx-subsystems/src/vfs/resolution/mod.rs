@@ -28,4 +28,4 @@ pub mod terminal;
 pub use state::PathResolution;
 
 /// Re-export the diagnostic probe for kernel-side consumption.
-pub use diagnostic::{last_ctx, last_diag, record_ctx, record_diag, render_ctx, DiagCtx};
+pub use diagnostic::{DiagCtx, last_ctx, last_diag, record_ctx, record_diag, render_ctx};

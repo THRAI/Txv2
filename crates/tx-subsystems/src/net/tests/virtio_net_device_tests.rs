@@ -176,7 +176,7 @@ fn virtio_rx_delegate_delivers_udp_payload_to_socket() {
     let driver = VirtioEtherDelegateDriver {
         source: EtherPacketSource { iface: &iface },
     };
-    crate::net::delegate::net_delegate_kick_poll();
+    crate::net::delegate::net_delegate_kick_poll_with_post(|mailbox, event| mailbox.post(event));
     let guard = tx_substrate::epoch::guard();
     let outcome = net_delegate_step_once(&driver, &guard);
 
@@ -205,10 +205,15 @@ fn virtio_irq_rx_available_only_fires_delegate_poll() {
     assert_eq!(device.rx_len(), 1);
     assert_eq!(delegate_ready_bits(), 0);
 
-    let irq = device.handle_irq(VirtioNetIrqEvent::RxAvailable);
+    let mut injected_posts = 0usize;
+    let irq = device.handle_irq_with_post(VirtioNetIrqEvent::RxAvailable, |mailbox, event| {
+        injected_posts += 1;
+        mailbox.post(event)
+    });
 
     assert!(irq.rx_ready);
     assert_eq!(irq.tx_completed, 0);
+    assert_eq!(injected_posts, irq.poll_wakes);
     assert_eq!(device.rx_len(), 1);
     assert!(delegate_ready_bits() & crate::net::delegate::DelegateWireSet::POLL.bits() != 0);
 }
@@ -233,10 +238,18 @@ fn virtio_irq_tx_complete_releases_capacity_and_fires_delegate_poll() {
     ));
     clear_delegate_queue();
 
-    let irq = device.handle_irq(VirtioNetIrqEvent::TxComplete { budget: 1 });
+    let mut injected_posts = 0usize;
+    let irq = device.handle_irq_with_post(
+        VirtioNetIrqEvent::TxComplete { budget: 1 },
+        |mailbox, event| {
+            injected_posts += 1;
+            mailbox.post(event)
+        },
+    );
 
     assert_eq!(irq.tx_completed, 1);
     assert_eq!(irq.tx_completed_bytes, 4);
+    assert_eq!(injected_posts, irq.poll_wakes);
     assert_eq!(device.tx_inflight_len(), 0);
     assert_eq!(device.tx_completed_len(), 1);
     assert!(delegate_ready_bits() & crate::net::delegate::DelegateWireSet::POLL.bits() != 0);

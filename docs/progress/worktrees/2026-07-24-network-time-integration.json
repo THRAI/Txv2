@@ -1,0 +1,29 @@
+{
+  "schema": "tx.progress.worktree.v1",
+  "id": "2026-07-24-network-time-integration",
+  "created": "2026-07-24",
+  "updated": "2026-07-24",
+  "status": "active",
+  "branch": "codex/network-time-integration",
+  "path": "/Users/3y/.config/superpowers/worktrees/Tx/network-time-integration",
+  "base": "origin/main",
+  "plan": "docs/progress/plans/2026-07-24-network-time-integration.json",
+  "owner": "codex",
+  "write_scope": [
+    "Cargo.toml",
+    "Cargo.lock",
+    "crates/tx-time",
+    "crates/tx-services",
+    "crates/tx-substrate",
+    "crates/tx-reactor",
+    "crates/tx-kernel",
+    "crates/tx-subsystems",
+    "docs/progress"
+  ],
+  "verification": [
+    "cargo test -p tx-subsystems --lib net:: --no-default-features",
+    "cargo -q xtask unit",
+    "cargo xtask progress validate"
+  ],
+  "notes": "Complete source baseline is integrated and passes cargo check --workspace -j 1. Final host tests and publication remain. Original dirty source worktree remains preserved."
+}

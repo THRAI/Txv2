@@ -14,10 +14,9 @@
 //!   `MailboxEvent`, `WaitGeneration`, `ActiveWait`).
 //! - [`wait_source`] — object-owned wait publication (`WaitSource`,
 //!   `PreparedWaitRegistration`, `WaitRegistrationGuard`, `SubscriberId`).
-//! - [`timer`] — role-tagged deadline registry (`TimerWheel`,
-//!   `TimerGuard`, `TimerToken`, `TimerGuardRole`). Relocated from
-//!   `tx-reactor::timer` per
-//!   [`docs/progress/decisions/2026-05-11-d6-timerwheel-layering.md`].
+//! - [`deadline`] — shared timer identity and role vocabulary
+//!   (`TimerToken`, `TimerGuardRole`). Deadline registration and expiry
+//!   routing belong to the reactor's deadline domain.
 //!
 //! `tx-reactor` re-exports these at its crate root for back-compat;
 //! existing reactor `TaskMailbox` paths continue to resolve.
@@ -26,25 +25,25 @@
 //!
 //! [`new_source`] and [`notify`] are the promoted canonical verbs that
 //! replace the per-subsystem `wait_routing::new_wait_source` and
-//! `wait_routing::notify_v3_source` wrappers. Subsystem adapters
+//! `wait_routing::*_with_post` wrappers. Subsystem adapters
 //! delegate to these; observation hooks attach here in one place.
 
 extern crate alloc;
 
 use alloc::sync::Arc;
 
+pub mod deadline;
 pub mod mailbox;
-pub mod timer;
 pub mod wait_source;
 
+pub use deadline::{TimerGuardRole, TimerToken};
 pub use mailbox::{
     agent_event_matches, ActiveWait, MailboxEvent, MailboxSchedulerHint, SignalRouting,
     TaskMailbox, WaitGeneration, MAILBOX_QUEUE_BOUND,
 };
-pub use timer::{TimerGuard, TimerGuardRole, TimerToken, TimerWheel};
 pub use wait_source::{
     lookup_source, register_source, registry_summary, unregister_source, PreparedWaitRegistration,
-    RegistrySummary, SubscriberId, WaitRegistrationGuard, WaitSource,
+    RegistrySummary, SubscriberId, WaitEndpoint, WaitRegistrationGuard, WaitSource,
 };
 
 /// Construct a new `WaitSource` wrapped in an `Arc`, keyed by `id`.
@@ -62,7 +61,7 @@ pub fn new_source(id: u64) -> Arc<WaitSource> {
 /// Replaces the per-subsystem adapter pattern
 /// `source.notify(InterestMask::new(mask_bits))`.
 /// Future observation hooks attach here in one place.
-pub fn notify(source: &WaitSource, mask_bits: u64) {
+pub fn notify(source: &WaitSource, mask_bits: u64) -> usize {
     use crate::step::InterestMask;
-    source.notify(InterestMask::new(mask_bits));
+    source.notify(InterestMask::new(mask_bits))
 }

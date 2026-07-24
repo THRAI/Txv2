@@ -32,8 +32,9 @@ class OscompObserveLiveTests(unittest.TestCase):
             self.assertEqual(layout.data, layout.base / "data")
             self.assertEqual(layout.submit, layout.base / "submit")
             self.assertEqual(layout.names, layout.base / "names.json")
+            self.assertEqual(layout.rawrecords, layout.host_dir / "trace.rawrecords.gz")
             self.assertEqual(layout.parquet_dir, layout.base / "analysis/parquet")
-            self.assertEqual(layout.cache_dir, layout.base / "analysis/cache")
+            self.assertEqual(layout.cache_dir, root / "target/tx-observe/cache")
             self.assertEqual(layout.report, layout.base / "report.json")
 
     def test_plan_uses_raw_only_live_drain_and_parquet_analysis(self):
@@ -64,20 +65,75 @@ class OscompObserveLiveTests(unittest.TestCase):
             self.assertIn("--observe-bracket", commands[0])
             self.assertEqual(plan.commands[0].argv[0], sys.executable)
             self.assertIn("--libcbench-only pthread", commands[0])
-            self.assertIn("memory-backend-file,id=txram,size=1G", commands[3])
-            self.assertIn("mem-path=" + str(layout.guest_mem), commands[3])
-            self.assertIn("tx.oscomp.observe=0", commands[3])
-            self.assertIn("tx.oscomp.observe_live_drain=1", commands[3])
-            self.assertIn("tx.oscomp.groups=libcbench-musl", commands[3])
-            self.assertIn("live-guest-mem", commands[4])
-            self.assertIn("--guest-mem " + str(layout.guest_mem), commands[4])
-            self.assertIn("--output-dir " + str(layout.host_dir), commands[4])
-            self.assertNotIn("--finalize", commands[4])
-            self.assertEqual(plan.commands[5].argv[0], sys.executable)
-            self.assertIn("tools/tx-observe-analyze.py", commands[5])
-            self.assertIn("--rawrecords " + str(layout.rawrecords), commands[5])
-            self.assertIn("--parquet-dir " + str(layout.parquet_dir), commands[5])
-            self.assertIn("--python-file analysis.py", commands[5])
+            self.assertIn("cargo xtask image test-init", commands[3])
+            self.assertIn("memory-backend-file,id=txram,size=1G", commands[4])
+            self.assertIn("mem-path=" + str(layout.guest_mem), commands[4])
+            self.assertIn("-initrd " + str(layout.test_initrd), commands[4])
+            self.assertIn("tx.oscomp.observe=0", commands[4])
+            self.assertIn("tx.oscomp.observe_live_drain=1", commands[4])
+            self.assertIn("tx.boot.mode=oscomp", commands[4])
+            self.assertIn("init=/tx-test-init", commands[4])
+            self.assertIn("tx.test_init=1", commands[4])
+            self.assertIn("tx.oscomp.groups=libcbench-musl", commands[4])
+            self.assertIn("live-guest-mem", commands[5])
+            self.assertIn("--guest-mem " + str(layout.guest_mem), commands[5])
+            self.assertIn("--output-dir " + str(layout.host_dir), commands[5])
+            self.assertNotIn("--finalize", commands[5])
+            self.assertEqual(plan.commands[6].argv[0], sys.executable)
+            self.assertIn("tools/tx-observe-analyze.py", commands[6])
+            self.assertIn("--rawrecords " + str(layout.rawrecords), commands[6])
+            self.assertIn("--parquet-dir " + str(layout.parquet_dir), commands[6])
+            self.assertIn("--python-file analysis.py", commands[6])
+
+    def test_seal_capture_prunes_copied_inputs_after_recording_provenance(self):
+        mod = load_module()
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            layout = mod.build_layout(root, "pthread")
+            layout.host_dir.mkdir(parents=True)
+            layout.rawrecords.write_bytes(b"gzip capture")
+            layout.names.write_text('{"name_table": {}}\n')
+            for directory, filename in [
+                (layout.data, "sdcard-rv.img"),
+                (layout.submit, "kernel-rv"),
+                (layout.build_dir, "libc-bench"),
+            ]:
+                directory.mkdir(parents=True)
+                (directory / filename).write_bytes(b"copied input")
+
+            capture = mod.seal_capture(root, layout)
+
+            self.assertEqual(capture["rawrecords"], "host/trace.rawrecords.gz")
+            self.assertEqual(capture["names"], "names.json")
+            self.assertEqual(len(capture["inputs"]), 3)
+            self.assertTrue((layout.base / "capture.json").exists())
+            self.assertFalse(layout.data.exists())
+            self.assertFalse(layout.submit.exists())
+            self.assertFalse(layout.build_dir.exists())
+
+    def test_storage_summary_reports_current_run_and_all_observe_artifacts(self):
+        mod = load_module()
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            layout = mod.build_layout(root, "pthread")
+            layout.host_dir.mkdir(parents=True)
+            layout.rawrecords.write_bytes(b"gzip capture")
+            (layout.host_dir / "runtime.json").write_text("{}\n")
+            layout.parquet_dir.mkdir(parents=True)
+            (layout.parquet_dir / "spans.parquet").write_bytes(b"PAR1")
+            layout.cache_dir.mkdir(parents=True)
+            (layout.cache_dir / "derived.json").write_bytes(b"cache")
+
+            summary = mod.observe_storage_summary(root, layout)
+
+            self.assertGreater(summary.run_bytes, 0)
+            self.assertGreaterEqual(summary.capture_bytes, summary.run_bytes)
+            self.assertGreater(summary.cache_bytes, 0)
+            self.assertEqual(summary.total_bytes, summary.capture_bytes + summary.cache_bytes)
+            self.assertRegex(
+                mod.format_storage_summary(summary),
+                r"^observe storage: run=.+ total=.+ captures=.+ cache=.+$",
+            )
 
     def test_public_test_selector_maps_to_libcbench_selection(self):
         mod = load_module()

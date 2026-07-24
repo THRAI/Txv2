@@ -164,20 +164,6 @@ pub(crate) fn boot_cmdline_ptr() -> *mut u8 {
     core::ptr::addr_of_mut!(BOOT_CMDLINE) as *mut u8
 }
 
-/// Parse `tx.maxcpus=N` from the published boot cmdline (None before
-/// boot facts are published or when the knob is absent — callers
-/// default to single-core). Mirrors the rv64 board's knob.
-pub(crate) fn max_cpus_from_cmdline() -> Option<usize> {
-    let info = unsafe { &*(boot_info_ptr() as *const BootInfo) };
-    let cmdline = info.cmdline?;
-    for token in cmdline.split_whitespace() {
-        if let Some(value) = token.strip_prefix("tx.maxcpus=") {
-            return value.parse().ok();
-        }
-    }
-    None
-}
-
 pub(crate) fn boot_info_ptr() -> *mut BootInfo {
     core::ptr::addr_of_mut!(BOOT_INFO)
 }
@@ -210,60 +196,24 @@ pub(crate) fn ensure_static_boot_facts() {
 }
 
 pub(crate) fn publish_static_boot_facts() {
-    // TEMP DIAG (la high-link bring-up): scan low RAM page starts for
-    // the FDT magic so we learn where QEMU actually parked the tree
-    // after the load-base move. Remove after FDT discovery is fixed.
-    #[cfg(all(target_arch = "loongarch64", feature = "la64-boot-trace"))]
-    {
-        let mut hits = 0usize;
-        let mut addr = 0usize;
-        while addr < 0x1000_0000 && hits < 4 {
-            let word = unsafe { (la64_cached_virt(addr) as *const u32).read_volatile() };
-            if u32::from_be(word) == 0xd00d_feed {
-                let total = unsafe { (la64_cached_virt(addr + 4) as *const u32).read_volatile() };
-                console_write_literal(b"txkernel:qemu-loongarch64-virt:fdt-scan:hit=0x");
-                console_write_hex(addr);
-                console_write_literal(b":totalsize=0x");
-                console_write_hex(u32::from_be(total) as usize);
-                console_write_literal(b"\n");
-                hits += 1;
-            }
-            addr += 0x1000;
-        }
-        if hits == 0 {
-            console_write_literal(b"txkernel:qemu-loongarch64-virt:fdt-scan:none-in-low-ram\n");
-        }
-    }
     let kernel_image = linked_kernel_image();
-    // Everything below the kernel image's end is reserved. With the
-    // unified high load base (0x9000_0000, shared with the LS2K1000
-    // board) the kernel sits at the START of the high-RAM region, so
-    // this bound simultaneously shields the kernel image and — via
-    // the fixed low-RAM barrier written by the populate helpers —
-    // the firmware tables (FDT/EFI) parked in low RAM. The previous
-    // `.min(QEMU_LA64_RAM_END)` assumed a low-RAM kernel and, after
-    // the base move, silently left the kernel image registered as
-    // Usable (allocator metadata then memset over live kernel state).
     let reserved_end = align_up(
         kernel_image.end().0,
         <Platform as PlatformConfig>::PAGE_SIZE,
-    );
+    )
+    .min(QEMU_LA64_RAM_END);
     trace_boot_args();
     let parsed_from_firmware = parse_firmware_boot_info(reserved_end);
     let (memory_region_count, initrd, cmdline_len, timebase_frequency_hz, possible_cpu_count) =
         parsed_from_firmware.unwrap_or_else(|| {
-            // No firmware description at all: reserve the whole low
-            // window (firmware tables live there) and admit only the
-            // conservative high window past the kernel image (see
-            // QEMU_LA64_FALLBACK_HIGH_USABLE_END).
-            let usable_size = QEMU_LA64_FALLBACK_HIGH_USABLE_END.saturating_sub(reserved_end);
+            let usable_size = QEMU_LA64_RAM_END.saturating_sub(reserved_end);
             unsafe {
                 let regions = boot_memory_regions_ptr();
                 core::ptr::write(
                     regions,
                     MemoryRegion {
                         base: PhysAddr(QEMU_LA64_RAM_BASE),
-                        size: QEMU_LA64_RAM_END - QEMU_LA64_RAM_BASE,
+                        size: reserved_end - QEMU_LA64_RAM_BASE,
                         kind: MemoryRegionKind::Reserved,
                     },
                 );
@@ -300,18 +250,6 @@ pub(crate) fn publish_static_boot_facts() {
     } else {
         None
     };
-
-    // Board profile switch. Must happen before the first boot
-    // sentinel prints so regular console output already targets the
-    // right UART (LS2K1000: 0x1fe2_0000 via the uncached window).
-    if let Some(cmdline) = cmdline {
-        if cmdline
-            .split_whitespace()
-            .any(|token| token == "tx.board=ls2k1000")
-        {
-            la64_select_board_ls2k1000();
-        }
-    }
 
     unsafe {
         let regions = boot_memory_regions_ptr() as *const MemoryRegion;
@@ -405,26 +343,6 @@ fn write_boot_facts_summary(
         console_write_literal(b":cmdline=none");
     }
     console_write_literal(b"\n");
-
-    // Per-region dump: the boot-memory table exactly as handed to the
-    // substrate allocator. Invaluable when a mis-parsed firmware map
-    // sends the metadata carve into nonexistent RAM.
-    unsafe {
-        let regions = boot_memory_regions_ptr();
-        for index in 0..memory_region_count.min(LA64_BOOT_MEMORY_REGION_CAPACITY) {
-            let region = core::ptr::read(regions.add(index));
-            console_write_literal(b"txkernel:qemu-loongarch64-virt:bootinfo:region=");
-            console_write_decimal(index);
-            console_write_literal(b":base=0x");
-            console_write_hex(region.base.0);
-            console_write_literal(b":size=0x");
-            console_write_hex(region.size);
-            console_write_literal(match region.kind {
-                MemoryRegionKind::Usable => b":usable\n",
-                _ => b":reserved\n",
-            });
-        }
-    }
 }
 
 #[cfg(not(all(target_arch = "loongarch64", feature = "la64-boot-trace")))]

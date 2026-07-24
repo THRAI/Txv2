@@ -1,4 +1,4 @@
-//! D9-B: `step_kill_process` thread-eligibility scan pins.
+//! D9-B: process-directed kill thread-eligibility scan pins.
 //!
 //! Per D9 §"Phase D9-B" the process-directed kill path must filter
 //! the thread selection by `!signal_mask.is_blocked(sig)`. Previously
@@ -23,7 +23,7 @@
 //! 4. **Single-thread sanity.** A one-thread process behaves as
 //!    before: the thread is non-zombie and the signal is unblocked
 //!    by default, so the post lands on the leader.
-//! 5. **Coalescence on double-post.** Two `step_kill_process` calls
+//! 5. **Coalescence on double-post.** Two process-directed kill calls
 //!    with the same signum on the same target both pick the same
 //!    eligible thread and set the bit once (bitset coalescence;
 //!    POSIX standard-signal contract). Each call still posts to
@@ -46,7 +46,7 @@ use tx_subsystems::signal::adapter::step_engine::{Cap, MailboxEvent, SignalRouti
 use tx_subsystems::process::bootstrap_init_process;
 use tx_subsystems::process::execution::spawn_sibling_thread_for_test;
 use tx_subsystems::process::structure::ProcessIdentity;
-use tx_subsystems::signal::{step_kill_process, KillOutcome, SignalMask, Signum};
+use tx_subsystems::signal::{step_kill_process_with_post, KillOutcome, SignalMask, Signum};
 use tx_subsystems::thread_runtime::execution::{
     mark_thread_zombie_for_test, step_sigprocmask, SigmaskHow,
 };
@@ -106,6 +106,15 @@ fn fresh_aspace() -> Cap<AddressSpace> {
     AddressSpace::new_cap_for_platform::<StubPmap>().expect("fresh aspace")
 }
 
+fn kill_process_direct_for_test(target: &Cap<ProcessIdentity>, sig: Signum) -> KillOutcome {
+    step_kill_process_with_post(target, sig, None, |weak, event| {
+        let Some(mailbox) = weak.upgrade() else {
+            return;
+        };
+        let _ = mailbox.post(event);
+    })
+}
+
 fn bind_mailbox(thread: &Cap<ThreadIdentity>, mailbox: &Arc<TaskMailbox>) {
     let payload = thread.payload_cap().expect("live thread");
     payload.bind_mailbox(Arc::downgrade(mailbox));
@@ -152,7 +161,7 @@ fn signal_eligibility_pins() {
     let leader_mb = Arc::new(TaskMailbox::new());
     bind_mailbox(&leader, &leader_mb);
     assert_eq!(
-        step_kill_process(&proc_cap, Signum::SIGTERM, None),
+        kill_process_direct_for_test(&proc_cap, Signum::SIGTERM),
         KillOutcome::Delivered
     );
     assert!(
@@ -196,7 +205,7 @@ fn signal_eligibility_pins() {
     // T2 keeps the empty mask.
 
     assert_eq!(
-        step_kill_process(&proc_cap, Signum::SIGTERM, None),
+        kill_process_direct_for_test(&proc_cap, Signum::SIGTERM),
         KillOutcome::Delivered
     );
     assert_eq!(
@@ -242,7 +251,7 @@ fn signal_eligibility_pins() {
     step_sigprocmask(&t2, SigmaskHow::SetMask, block_term);
 
     assert_eq!(
-        step_kill_process(&proc_cap, Signum::SIGTERM, None),
+        kill_process_direct_for_test(&proc_cap, Signum::SIGTERM),
         KillOutcome::Delivered
     );
     assert!(
@@ -296,11 +305,11 @@ fn signal_eligibility_pins() {
     while t3_mb.poll().is_some() {}
 
     assert_eq!(
-        step_kill_process(&proc_cap, Signum::SIGTERM, None),
+        kill_process_direct_for_test(&proc_cap, Signum::SIGTERM),
         KillOutcome::Delivered
     );
     assert_eq!(
-        step_kill_process(&proc_cap, Signum::SIGTERM, None),
+        kill_process_direct_for_test(&proc_cap, Signum::SIGTERM),
         KillOutcome::Delivered
     );
     assert!(
@@ -342,7 +351,7 @@ fn signal_eligibility_pins() {
         .pending()
         .clear(Signum::SIGTERM);
     assert_eq!(
-        step_kill_process(&proc_cap, Signum::SIGTERM, None),
+        kill_process_direct_for_test(&proc_cap, Signum::SIGTERM),
         KillOutcome::Delivered
     );
     assert!(
@@ -378,7 +387,7 @@ fn signal_eligibility_pins() {
     assert!(t3.is_zombie());
 
     assert_eq!(
-        step_kill_process(&proc_cap, Signum::SIGINT, None),
+        kill_process_direct_for_test(&proc_cap, Signum::SIGINT),
         KillOutcome::NoLiveThread,
         "all-zombie process returns NoLiveThread, not panic"
     );

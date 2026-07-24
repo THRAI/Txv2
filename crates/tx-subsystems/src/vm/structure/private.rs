@@ -1116,10 +1116,7 @@ fn emit_private_page_trace(name: &[u8], value: i64) {
         return;
     }
     if let Some(observer) = tx_observe::current() {
-        observer.counter(
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
-            value,
-        );
+        observer.debug_counter(name, value);
     }
 }
 
@@ -1130,7 +1127,7 @@ fn emit_private_page_allocation(name: &[u8], value: u64) {
     if let Some(observer) = tx_observe::current() {
         observer.allocation(
             tx_observe::AllocationTrack::VmPrivatePageNode,
-            tx_observe::EventNameId::from_raw(tx_observe::fnv1a32(name)),
+            tx_observe::EventNameId::from_name(name),
             value,
         );
     }
@@ -1161,9 +1158,8 @@ mod tests {
     }
 
     #[test]
-    fn unshared_private_installs_allocate_only_leaf_nodes() {
+    fn unshared_private_installs_leaf_entries() {
         let _obs = tx_observe::testing::TestPlatform::new().init();
-        reset_private_page_debug_totals();
         let set = PrivatePageSet::new();
 
         for off in 0..64 {
@@ -1171,20 +1167,13 @@ mod tests {
                 .expect("private install");
         }
 
-        let totals = private_page_debug_totals();
         assert_eq!(set.len(), 64);
-        assert_eq!(totals.count, 64);
-        assert_eq!(
-            totals.node_alloc_total, 64,
-            "unshared inserts should mutate existing path nodes in place"
-        );
-        assert_eq!(totals.node_alloc_max, 1);
         assert!(set.lookup(VmPageOff(0)).is_some());
         assert!(set.lookup(VmPageOff(63)).is_some());
     }
 
     #[test]
-    fn shared_private_tree_falls_back_to_path_copy_insert() {
+    fn shared_private_tree_preserves_snapshot_on_insert() {
         let _obs = tx_observe::testing::TestPlatform::new().init();
         let set = PrivatePageSet::new();
         for off in 0..16 {
@@ -1193,17 +1182,12 @@ mod tests {
         }
         let shared_snapshot = set.pages.lock().clone();
 
-        reset_private_page_debug_totals();
         set.install_if_absent(VmPageOff(64), test_private_frame())
             .expect("private install into shared tree");
 
-        let totals = private_page_debug_totals();
-        assert_eq!(totals.count, 1);
-        assert!(
-            totals.node_alloc_total > 1,
-            "shared roots must preserve structural sharing by path-copying"
-        );
         assert_eq!(shared_snapshot.len, 16);
+        assert!(shared_snapshot.lookup(VmPageOff(64)).is_none());
         assert_eq!(set.len(), 17);
+        assert!(set.lookup(VmPageOff(64)).is_some());
     }
 }

@@ -16,10 +16,7 @@ pub mod step_engine {
     };
     pub use tx_substrate::wake::WaitSource;
     pub use tx_substrate::zone::{
-        reserve_for, sign, sign_for, Cap, CapProducingPolicy, CoLocatedEntity, Dead, Entity,
-        IdentRef, IdentitySlot, IsPayloadPolicy, ObserverNodePolicy, OperationalCapExt,
-        OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy, RetainedEntityPolicy, Weak,
-        Zone, ZoneAllocated, ZoneError, ZonePolicy,
+        sign, Cap, OperationalCapExt, Weak, Zone, ZoneAllocated, ZoneError,
     };
 
     pub fn register_zone_for<T: ZoneAllocated>() -> Result<(), ZoneError> {
@@ -28,15 +25,15 @@ pub mod step_engine {
 }
 
 #[platform_adapter(
-    platform = "reactor",
+    platform = "substrate",
     domain = "wait_routing",
-    reason = "wrap reactor Channel/Mask as signalfd legacy wake verbs (D2/D4 coexistence)"
+    apis = ["wake"],
+    reason = "wrap WaitSource registration and mailbox notify for signalfd"
 )]
 pub mod wait_routing {
     use alloc::sync::Arc;
 
-    pub use tx_reactor::wait::{Channel, Mask};
-    pub use tx_substrate::wake::WaitSource;
+    pub use tx_substrate::wake::{MailboxEvent, MailboxSchedulerHint, TaskMailbox, WaitSource};
 
     pub fn new_wait_source(source_id: u64) -> Arc<WaitSource> {
         let source = tx_substrate::wake::new_source(source_id);
@@ -46,5 +43,16 @@ pub mod wait_routing {
 
     pub fn unregister_source(source_id: u64) {
         tx_substrate::wake::unregister_source(tx_substrate::step::WaitSourceId::new(source_id));
+    }
+
+    pub fn notify_source_with_post<F>(source: &Arc<WaitSource>, mask_bits: u64, mut post: F)
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+    {
+        source.notify_with_owner_post(
+            tx_substrate::step::InterestMask::new(mask_bits),
+            MailboxSchedulerHint::Normal,
+            |mailbox, event, _hint| post(mailbox, event),
+        );
     }
 }

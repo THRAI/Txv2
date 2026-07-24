@@ -1,23 +1,10 @@
-use super::la64_percpu::la64_current_cpu_id;
 use super::la64_pmap::{
-    dmw_covers_phys_range, la64_fixup_lookup, la64_kernel_addr_to_phys, la64_uncached_virt,
+    dmw_covers_phys_range, la64_current_cpu_id, la64_fixup_lookup, la64_kernel_addr_to_phys,
+    la64_uncached_virt,
 };
 use super::*;
 
 pub(crate) fn la64_extioi_claim() -> u32 {
-    // LS2K1000: the QEMU-virt eiointc IOCSR block is not present —
-    // this board's external interrupts come from its own liointc
-    // ("loongson,2k1000-icu" at 0x1fe01400). Claim from that driver
-    // and translate its source number to the public irq numbering the
-    // kernel registered handlers under (UART0: source 0 → the same
-    // public UART irq as the QEMU profile). Never fall through to the
-    // eiointc IOCSR reads — those addresses do not exist here.
-    if la64_board_is_ls2k1000() {
-        return match super::la64_liointc::ls2k1000_liointc_claim() {
-            Some(super::la64_liointc::LS2K1000_UART0_SOURCE) => QEMU_LA64_UART0_IRQ,
-            _ => 0,
-        };
-    }
     for word in 0..(LA64_EIOINTC_IRQS / u64::BITS) {
         let offset = word as usize * core::mem::size_of::<u64>();
         let pending = la64_eiointc_read_u64(LA64_EIOINTC_COREISR_START + offset)
@@ -34,11 +21,6 @@ pub(crate) fn la64_extioi_claim() -> u32 {
 }
 
 pub(crate) fn la64_complete_external_irq(irq: u32) {
-    if la64_board_is_ls2k1000() {
-        // liointc UART line is level-triggered: draining the RX FIFO
-        // deasserts it; there is no EOI register to write.
-        return;
-    }
     let Some(ext_irq) = la64_extioi_irq_from_public_irq(irq) else {
         return;
     };
@@ -49,14 +31,6 @@ pub(crate) fn la64_complete_external_irq(irq: u32) {
 }
 
 pub(crate) fn la64_mask_external_irq(irq: u32) {
-    if la64_board_is_ls2k1000() {
-        if irq == QEMU_LA64_UART0_IRQ {
-            super::la64_liointc::ls2k1000_liointc_disable(
-                super::la64_liointc::LS2K1000_UART0_SOURCE,
-            );
-        }
-        return;
-    }
     let Some(ext_irq) = la64_extioi_irq_from_public_irq(irq) else {
         return;
     };
@@ -67,14 +41,6 @@ pub(crate) fn la64_mask_external_irq(irq: u32) {
 }
 
 pub(crate) fn la64_unmask_external_irq(irq: u32) {
-    if la64_board_is_ls2k1000() {
-        if irq == QEMU_LA64_UART0_IRQ {
-            super::la64_liointc::ls2k1000_liointc_enable(
-                super::la64_liointc::LS2K1000_UART0_SOURCE,
-            );
-        }
-        return;
-    }
     let Some(ext_irq) = la64_extioi_irq_from_public_irq(irq) else {
         return;
     };
@@ -440,24 +406,12 @@ where
         return TrapAction::Resume;
     }
 
-    if ecode == LA64_ECODE_ALE {
-        if from_user {
-            match super::la64_unaligned::emulate_user_unaligned(frame) {
-                super::la64_unaligned::UnalignedOutcome::Emulated => return TrapAction::Resume,
-                super::la64_unaligned::UnalignedOutcome::Unsupported => {}
-                super::la64_unaligned::UnalignedOutcome::Fault(fault) => {
-                    return K::on_page_fault(frame.view_mut(), fault);
-                }
-            }
-        } else {
-            // Kernel-mode ALE: real LA264 silicon has no hardware
-            // unaligned access (QEMU emulates it silently). Emulate
-            // and resume; unsupported encodings fall through to the
-            // terminate dump so they still die loudly.
-            match super::la64_unaligned::emulate_kernel_unaligned(frame) {
-                super::la64_unaligned::UnalignedOutcome::Emulated => return TrapAction::Resume,
-                super::la64_unaligned::UnalignedOutcome::Unsupported
-                | super::la64_unaligned::UnalignedOutcome::Fault(_) => {}
+    if from_user && ecode == LA64_ECODE_ALE {
+        match super::la64_unaligned::emulate_user_unaligned(frame) {
+            super::la64_unaligned::UnalignedOutcome::Emulated => return TrapAction::Resume,
+            super::la64_unaligned::UnalignedOutcome::Unsupported => {}
+            super::la64_unaligned::UnalignedOutcome::Fault(fault) => {
+                return K::on_page_fault(frame.view_mut(), fault);
             }
         }
     }
@@ -488,7 +442,7 @@ where
         }
         TrapClass::ExternalInterrupt => {
             let _irq_context = enter_la64_irq_context();
-            K::on_external_irq(<Platform as SmpIf>::current_cpu_id(), frame.view_mut())
+            K::on_external_irq(<Platform as SmpIf>::current_cpu_id())
         }
         TrapClass::InterprocessorInterrupt => {
             let _irq_context = enter_la64_irq_context();
@@ -572,17 +526,14 @@ pub(crate) const fn classify_la64_trap(estat: usize) -> TrapClass {
             write: false,
             instruction: false,
         },
-        // ADE (address error): ADEF/ADEM are EsubCodes of Ecode 8,
-        // not Ecodes of their own. Routed like an alignment fault so
-        // it reaches on_illegal_or_sync_fault (fatal in kernel mode,
-        // signal in user mode).
-        LA64_ECODE_ADE => {
-            let esubcode = (estat >> LA64_ESTAT_ESUBCODE_SHIFT) & LA64_ESTAT_ESUBCODE_MASK;
-            TrapClass::AlignmentFault {
-                write: false,
-                instruction: esubcode == LA64_ESUBCODE_ADEF,
-            }
-        }
+        LA64_ECODE_ADEF => TrapClass::AlignmentFault {
+            write: false,
+            instruction: true,
+        },
+        LA64_ECODE_ADEM => TrapClass::AlignmentFault {
+            write: false,
+            instruction: false,
+        },
         LA64_ECODE_SYS => TrapClass::Syscall,
         LA64_ECODE_BRK => TrapClass::Breakpoint,
         LA64_ECODE_INE | LA64_ECODE_IPE | LA64_ECODE_FPD => TrapClass::IllegalInstruction,
@@ -909,6 +860,18 @@ pub(crate) fn console_write_decimal(mut value: usize) {
         }
     }
     Platform::write_bytes(&buf[cursor..]);
+}
+
+#[no_mangle]
+#[cfg(target_arch = "loongarch64")]
+extern "C" fn tx_la64_qemu_unhandled_exception() -> ! {
+    Platform::write_bytes(b"txkernel:qemu-loongarch64-virt:trap\n");
+    loop {
+        unsafe {
+            core::arch::asm!("idle 0", options(nomem, nostack));
+        }
+        core::hint::spin_loop();
+    }
 }
 
 pub(crate) fn align_up(value: usize, align: usize) -> usize {

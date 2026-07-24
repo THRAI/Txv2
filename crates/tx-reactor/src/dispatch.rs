@@ -42,6 +42,12 @@ impl WakeDispatchReport {
             self.local_reschedules += 1;
         }
     }
+
+    pub fn merge(&mut self, other: Self) {
+        self.placements += other.placements;
+        self.local_reschedules += other.local_reschedules;
+        self.remote_ipis += other.remote_ipis;
+    }
 }
 
 pub trait RescheduleSignal {

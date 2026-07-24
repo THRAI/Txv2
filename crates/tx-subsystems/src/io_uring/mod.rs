@@ -36,11 +36,12 @@
 //!    future PR-12 will replace these with the real `struct io_uring_sqe`
 //!    / `struct io_uring_cqe` shapes parsed from the user-mmapped ring;
 //!    for now the wire-layout parsing is intentionally deferred.
-//! 3. The [`spawn_sqpoll_worker`] helper — constructs the SQPOLL
-//!    kthread future as `with_on_behalf_of(owner, body)`. The body is a
-//!    single long-lived borrow that loops dequeuing SQEs from the ring
-//!    and dispatching them; this scaffold's "dispatch" is a counter
-//!    increment, matching W-CC's PR-11 phase 2 stub pattern.
+//! 3. The [`spawn_sqpoll_worker_with_completion_post`] helper —
+//!    constructs the SQPOLL kthread future as
+//!    `with_on_behalf_of(owner, body)`. The body is a single
+//!    long-lived borrow that loops dequeuing SQEs from the ring,
+//!    publishing CQEs through an explicit completion-post seam, and
+//!    incrementing the dispatch counter.
 //!
 //! # Non-goals (deferred to future PR-12 phases)
 //!
@@ -85,6 +86,10 @@ use adapter::step_engine::{
     sign, with_on_behalf_of, AbortSignal, CancelReason, Cap, OnBehalfOfAbort, ScriptCtx, SpinMutex,
     SubjectContext, SubjectIdentity, WaitSource, Zone, ZoneAllocated, ZoneError,
 };
+use adapter::wait_routing::{MailboxEvent, TaskMailbox};
+
+pub type SqpollCompletionPost =
+    Arc<dyn Fn(&TaskMailbox, MailboxEvent) -> bool + Send + Sync + 'static>;
 
 // === SQE / CQE stubs =================================================
 //
@@ -243,16 +248,21 @@ impl IoUring {
     /// depths. Mirrors `AioContext::with_nr_events`.
     pub fn with_entries(sq_entries: u32, cq_entries: u32) -> Self {
         let wait_points = notification::new_wait_points();
+        let sqe_arrived_id =
+            tx_substrate::wake::WaitEndpoint::source_id(wait_points.sqe_arrived_endpoint()).raw();
+        let cqe_available_id =
+            tx_substrate::wake::WaitEndpoint::source_id(wait_points.cqe_available_endpoint()).raw();
+        let (_, sqe_arrived, _, cqe_available) = wait_points.into_parts();
         Self {
             ring_id: allocate_ring_id(),
             sq_entries,
             cq_entries,
             sq_ring: SpinMutex::new(VecDeque::new()),
             cq_ring: SpinMutex::new(VecDeque::new()),
-            sqe_arrived: wait_points.sqe_arrived,
-            sqe_arrived_id: wait_points.sqe_arrived_id,
-            cqe_available: wait_points.cqe_available,
-            cqe_available_id: wait_points.cqe_available_id,
+            sqe_arrived,
+            sqe_arrived_id,
+            cqe_available,
+            cqe_available_id,
             worker_abort: Arc::new(AbortSignal::new()),
             dispatched: AtomicU64::new(0),
         }
@@ -304,8 +314,13 @@ impl IoUring {
     }
 
     /// Borrow the SQE-arrival wait source.
-    pub fn sqe_arrived_source(&self) -> &Arc<WaitSource> {
+    fn sqe_arrived_source(&self) -> &Arc<WaitSource> {
         &self.sqe_arrived
+    }
+
+    /// SQE-arrival endpoint exposed to wait drivers.
+    pub fn sqe_arrived_endpoint(&self) -> &Arc<WaitSource> {
+        self.sqe_arrived_source()
     }
 
     /// Wait-source id paired with [`Self::cqe_available`].
@@ -314,8 +329,13 @@ impl IoUring {
     }
 
     /// Borrow the CQE-availability wait source.
-    pub fn cqe_available_source(&self) -> &Arc<WaitSource> {
+    fn cqe_available_source(&self) -> &Arc<WaitSource> {
         &self.cqe_available
+    }
+
+    /// CQE-availability endpoint exposed to wait drivers.
+    pub fn cqe_available_endpoint(&self) -> &Arc<WaitSource> {
+        self.cqe_available_source()
     }
 
     /// Number of SQEs the kthread body has dequeued + "dispatched"
@@ -351,11 +371,13 @@ impl IoUring {
 
     /// Push a CQE onto the CQ ring and notify any waiters parked on
     /// `cqe_available`. Called by the kthread body after each SQE
-    /// dispatch (phase 1+; phase 0's body increments the dispatch
-    /// counter only).
-    pub fn push_cqe(&self, cqe: CqeStub) {
+    /// dispatch.
+    pub fn push_cqe_with_post<F>(&self, cqe: CqeStub, post: F)
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+    {
         self.cq_ring.lock().push_back(cqe);
-        notification::notify_cqe_available(&self.cqe_available);
+        notification::notify_cqe_available_with_post(&self.cqe_available, post);
     }
 
     /// Pop one CQE off the ring, if any. Future `io_uring_enter(2)`
@@ -436,20 +458,22 @@ pub(crate) fn register_zones() -> Result<(), ZoneError> {
 ///    - Check `ring.worker_abort` — if tripped, return `Err`.
 ///    - Try `ring.pop_sqe()` — if `Some(sqe)`, increment
 ///      `dispatched`, continue. Phase 1 invokes a real dispatcher
-///      mirroring `AioContext::push_completion` + `IocbDispatcher`.
+///      mirroring `AioContext::push_completion_with_post` +
+///      `IocbDispatcher`.
 ///    - If `None`, yield `Pending`. Re-poll observes either a wake
 ///      from `sqe_arrived` or the abort signal.
 ///
 /// **Framework reusability.** This function is a row-for-row clone of
-/// [`crate::aio::spawn_worker_for_context`] with `AioContext` →
-/// `IoUring`, `pop_iocb` → `pop_sqe`, and the dispatcher arg removed
-/// (phase 0 has no dispatcher closure; phase 1 will accept one with
-/// the same shape as `IocbDispatcher`). No new framework primitive is
-/// introduced — `with_on_behalf_of` is consumed verbatim.
-pub fn spawn_sqpoll_worker<I>(
+/// [`crate::aio::spawn_worker_for_context_with_completion_post`] with
+/// `AioContext` → `IoUring`, `pop_iocb` → `pop_sqe`, and the dispatcher
+/// arg removed (phase 0 has no dispatcher closure; phase 1 will accept
+/// one with the same shape as `IocbDispatcher`). No new framework
+/// primitive is introduced — `with_on_behalf_of` is consumed verbatim.
+pub fn spawn_sqpoll_worker_with_completion_post<I>(
     ring_cap: Cap<IoUring>,
     owner_principal: Cap<I>,
     owner_subject: SubjectContext<I>,
+    completion_post: SqpollCompletionPost,
 ) -> SqpollWorkerFuture
 where
     I: SubjectIdentity + Send + Sync,
@@ -461,6 +485,7 @@ where
     let ring_cap_for_body = ring_cap.clone();
     let helper = async move {
         let ring_inner = ring_cap_for_body;
+        let completion_post_inner = completion_post;
         let helper_result = with_on_behalf_of(
             owner_principal,
             &owner_subject,
@@ -468,10 +493,15 @@ where
                 // Borrow body — per D8 §13 the body loops draining
                 // SQEs under the long-lived `OnBehalfOf<P>` borrow.
                 // Phase 0: increment the dispatch counter on each
-                // SQE. Phase 1 will invoke a real per-SQE dispatcher
-                // mirroring the AIO `IocbDispatcher` shape.
+                // SQE and publish a scaffold CQE. Phase 1 will invoke
+                // a real per-SQE dispatcher mirroring the AIO
+                // `IocbDispatcher` shape.
                 loop {
-                    if let Some(_sqe) = ring_inner.pop_sqe() {
+                    if let Some(sqe) = ring_inner.pop_sqe() {
+                        ring_inner.push_cqe_with_post(
+                            CqeStub::new(sqe.user_data, 0, 0),
+                            |mailbox, event| completion_post_inner(mailbox, event),
+                        );
                         ring_inner.dispatched.fetch_add(1, Ordering::AcqRel);
                         continue;
                     }
@@ -499,9 +529,10 @@ where
     }
 }
 
-/// Erased SQPOLL kthread future returned by [`spawn_sqpoll_worker`].
-/// Mirrors [`crate::aio::AioWorkerFuture`]; the only structural
-/// difference is the cap type it retains.
+/// Erased SQPOLL kthread future returned by
+/// [`spawn_sqpoll_worker_with_completion_post`]. Mirrors
+/// [`crate::aio::AioWorkerFuture`]; the only structural difference is the cap
+/// type it retains.
 pub struct SqpollWorkerFuture {
     inner: SqpollWorkerState,
     /// The io_uring cap the kthread drains; held across the future's
@@ -687,14 +718,76 @@ mod tests {
     fn push_cqe_then_pop_returns_fifo() {
         let _g = setup();
         let ring = IoUring::new_cap().expect("ring cap");
-        ring.push_cqe(CqeStub::new(0xAAA, 0, 0));
-        ring.push_cqe(CqeStub::new(0xBBB, 0, 0));
+        ring.push_cqe_with_post(CqeStub::new(0xAAA, 0, 0), |mailbox, event| {
+            mailbox.post(event)
+        });
+        ring.push_cqe_with_post(CqeStub::new(0xBBB, 0, 0), |mailbox, event| {
+            mailbox.post(event)
+        });
         assert_eq!(ring.cq_len(), 2);
         let a = ring.pop_cqe().expect("first");
         let b = ring.pop_cqe().expect("second");
         assert_eq!(a.user_data, 0xAAA);
         assert_eq!(b.user_data, 0xBBB);
         assert!(ring.pop_cqe().is_none());
+    }
+
+    #[test]
+    fn push_cqe_with_post_uses_injected_mailbox_ref_post() {
+        let _g = setup();
+        let ring = IoUring::new_cap().expect("ring cap");
+        let mailbox = Arc::new(TaskMailbox::new());
+        let generation = mailbox.next_generation();
+        let _sub = ring
+            .cqe_available_endpoint()
+            .prepare(
+                Arc::downgrade(&mailbox),
+                generation,
+                crate::io_uring::adapter::step_engine::InterestMask::new(
+                    crate::io_uring::notification::CQE_AVAILABLE,
+                ),
+            )
+            .install();
+        let source = ring.cqe_available_id();
+        let mut injected_posts = 0usize;
+
+        ring.push_cqe_with_post(CqeStub::new(0xCAFE, 0, 0), |mailbox, event| {
+            injected_posts += 1;
+            mailbox.post(event)
+        });
+
+        assert_eq!(ring.cq_len(), 1);
+        assert_eq!(injected_posts, 1);
+        match mailbox.poll().expect("cqe source fired") {
+            MailboxEvent::SourceFired {
+                generation: seen_generation,
+                source: seen_source,
+                interests,
+            } => {
+                assert_eq!(seen_generation, generation);
+                assert_eq!(seen_source.raw(), source);
+                assert_eq!(
+                    interests.raw(),
+                    crate::io_uring::notification::CQE_AVAILABLE
+                );
+            }
+            other => panic!("expected cqe SourceFired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wait_endpoints_match_ring_wait_source_ids() {
+        let _g = setup();
+        let ring = IoUring::new_cap().expect("ring cap");
+
+        assert_eq!(
+            tx_substrate::wake::WaitEndpoint::source_id(ring.sqe_arrived_endpoint()).raw(),
+            ring.sqe_arrived_id()
+        );
+        assert_eq!(
+            tx_substrate::wake::WaitEndpoint::source_id(ring.cqe_available_endpoint()).raw(),
+            ring.cqe_available_id()
+        );
     }
 
     #[test]

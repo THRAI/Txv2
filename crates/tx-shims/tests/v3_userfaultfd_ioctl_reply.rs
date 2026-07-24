@@ -10,7 +10,7 @@
 //!      to `-EINVAL`.
 //!    - "No pending fault" (queue empty) rejects with `-EINVAL`.
 //!    - Successful reply: a pending fault pushed onto the ufd's queue
-//!      gets drained, the `DelegateRegistry::mark_replied` transitions
+//!      gets drained, the the `DelegateRegistry` delegate reply transition transitions
 //!      `Pending → Replied`, the queue depth returns to 0, and the
 //!      arg struct's `copy` / `zeropage` / `mapped` field is written
 //!      back with `len`.
@@ -35,11 +35,13 @@ use core::task::{Context, Poll, Waker};
 use std::sync::{LazyLock, Mutex};
 
 use tx_hal::{
-    Arch, Asid, EntropyIf, PhysAddr, PlatformConfig, PmapError, PmapIf, PmapPermissions,
-    PmapReservation, PmapReserveKind, PmapRoot, PmapUnmapResult, PtNode, TimeIf, UserPtr, VirtAddr,
+    Arch, Asid, DeadlineTimerIf, EntropyIf, MonotonicCounterIf, PhysAddr, PlatformConfig,
+    PmapError, PmapIf, PmapPermissions, PmapReservation, PmapReserveKind, PmapRoot,
+    PmapUnmapResult, PtNode, UserPtr, VirtAddr,
 };
 use tx_shims::adapter::reactor_entry::SyscallRequest;
 use tx_shims::adapter::step_engine::{self as zone, Cap};
+use tx_substrate::wake::{MailboxEvent, MailboxSchedulerHint, TaskMailbox};
 use tx_subsystems::cross_crate_test_support::{
     reset_init_process, reset_pid_counter, reset_tid_counter,
 };
@@ -59,6 +61,14 @@ use tx_shims::linux_syscall::numbers::{
 use tx_shims::linux_syscall::{dispatch, SyscallCtx, SyscallResult};
 
 // -------- Stub PMAP -------------------------------------------------
+
+fn direct_ufd_ref_post_with_hint(
+    mailbox: &TaskMailbox,
+    event: MailboxEvent,
+    hint: MailboxSchedulerHint,
+) -> bool {
+    mailbox.post_with_scheduler_hint(event, hint)
+}
 
 struct StubPmap;
 
@@ -117,16 +127,23 @@ impl tx_hal::ConsoleIf for StubPmap {
 }
 impl tx_hal::SmpIf for StubPmap {}
 
-impl TimeIf for StubPmap {
+impl MonotonicCounterIf for StubPmap {
     fn read_ns() -> u64 {
         0
     }
-    fn set_deadline_ns(_deadline: u64) {}
-    fn cancel_deadline() {}
+
     fn frequency_hz() -> u64 {
         1_000_000_000
     }
 }
+
+impl DeadlineTimerIf for StubPmap {
+    fn set_deadline_ns(_deadline: u64) {}
+
+    fn cancel_deadline() {}
+}
+
+impl tx_hal::PersistentClockIf for StubPmap {}
 
 // -------- Setup -----------------------------------------------------
 
@@ -388,12 +405,15 @@ fn push_fault(ctx: &SyscallCtx<'_>, fd: u32, fault_addr: u64) {
     // Detach the guard so it doesn't fire CancelOnDrop on the slot.
     core::mem::forget(guard);
 
-    ufd.push_fault_msg(UffdMsg {
-        event: UFFD_EVENT_PAGEFAULT,
-        fault_addr,
-        ufd_thread_id: 0,
-        token_id,
-    });
+    ufd.push_fault_msg_with_post(
+        UffdMsg {
+            event: UFFD_EVENT_PAGEFAULT,
+            fault_addr,
+            ufd_thread_id: 0,
+            token_id,
+        },
+        direct_ufd_ref_post_with_hint,
+    );
 }
 
 // -------- Tests -----------------------------------------------------
@@ -494,7 +514,7 @@ fn uffdio_copy_no_pending_fault_returns_einval() {
     );
 }
 
-/// `UFFDIO_COPY` with a matching pending fault drives `mark_replied`,
+/// `UFFDIO_COPY` with a matching pending fault drives `delegate reply transition`,
 /// pops the fault from the queue, and writes back `copy = len`.
 #[test]
 fn uffdio_copy_with_pending_fault_succeeds_and_drains_queue() {
@@ -530,7 +550,7 @@ fn uffdio_copy_with_pending_fault_succeeds_and_drains_queue() {
     assert_eq!(req_after.copy, USER_PAGE_SIZE as u64);
 }
 
-/// `UFFDIO_ZEROPAGE` with a matching pending fault drives `mark_replied`,
+/// `UFFDIO_ZEROPAGE` with a matching pending fault drives `delegate reply transition`,
 /// pops the fault, and writes back `zeropage = len`.
 #[test]
 fn uffdio_zeropage_with_pending_fault_succeeds_and_drains_queue() {
@@ -564,7 +584,7 @@ fn uffdio_zeropage_with_pending_fault_succeeds_and_drains_queue() {
 }
 
 /// `UFFDIO_CONTINUE` with a matching pending fault drives
-/// `mark_replied`, pops the fault, and writes back `mapped = len`.
+/// `delegate reply transition`, pops the fault, and writes back `mapped = len`.
 #[test]
 fn uffdio_continue_with_pending_fault_succeeds_and_drains_queue() {
     let _g = setup();

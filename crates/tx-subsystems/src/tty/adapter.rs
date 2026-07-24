@@ -14,7 +14,7 @@
 //!
 //! * `wait_routing` — stacked substrate + reactor. Same shape as
 //!   pipe / process / vfs (TtyIdentity exposes wait sources for
-//!   readers / writers, plus step_ingest uses reactor::wait::Mask).
+//!   readers / writers, and step_ingest posts v3 mailbox wakeups).
 
 use tx_platform_adapter::platform_adapter;
 
@@ -34,10 +34,8 @@ pub mod step_engine {
         StepOp, StepOutcome, StepProgress, SubjectIdentity, WaitSourceId, YieldShape,
     };
     pub use tx_substrate::zone::{
-        register_zone_for, reserve_for, sign, sign_for, Cap, CapProducingPolicy, CoLocatedEntity,
-        Dead, Entity, IdentRef, IdentitySlot, IsPayloadPolicy, ObserverNodePolicy,
-        OperationalCapExt, OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy,
-        RetainedEntityPolicy, Weak, Zone, ZoneAllocated, ZoneError, ZonePolicy,
+        register_zone_for, reserve_for, sign, sign_for, Cap, Dead, Entity, IdentRef,
+        OperationalCapExt, PayloadCap, PayloadPolicy, Weak, Zone, ZoneAllocated, ZoneError,
     };
     pub use tx_substrate::AtomicSlot;
 }
@@ -48,18 +46,10 @@ pub mod step_engine {
     apis = ["wake"],
     reason = "wrap WaitSource registration for tty reader/writer wakeup paths"
 )]
-#[platform_adapter(
-    platform = "reactor",
-    domain = "wait_routing",
-    reason = "wrap reactor Channel/Mask as tty legacy wakeup primitives (D2 coexistence)"
-)]
 pub mod wait_routing {
     use alloc::sync::Arc;
 
-    pub use tx_reactor::wait::{Channel, Mask};
-    pub use tx_substrate::wake::{
-        MailboxEvent, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource,
-    };
+    pub use tx_substrate::wake::{MailboxEvent, MailboxSchedulerHint, TaskMailbox, WaitSource};
 
     /// Delegates to `tx_substrate::wake::new_source`.
     pub fn new_wait_source(source_id: u64) -> Arc<WaitSource> {
@@ -73,13 +63,18 @@ pub mod wait_routing {
         tx_substrate::wake::unregister_source(tx_substrate::step::WaitSourceId::new(source_id));
     }
 
-    /// Delegates to `tx_reactor::wait::fire_legacy`.
-    pub fn fire_legacy_channel(channel: &Channel, mask_bits: u64) -> usize {
-        tx_reactor::wait::fire_legacy(channel, mask_bits)
-    }
-
-    /// Delegates to `tx_substrate::wake::notify`.
-    pub fn notify_v3_source(source: &Arc<WaitSource>, mask_bits: u64) {
-        tx_substrate::wake::notify(source, mask_bits)
+    /// Notify the v3 `WaitSource` using a caller-provided mailbox post route.
+    ///
+    /// Scheduler-context callers inject the owner-aware reactor route here;
+    /// no-context callers pass direct mailbox posting through the same helper.
+    pub fn notify_v3_source_with_post<F>(source: &Arc<WaitSource>, mask_bits: u64, mut post: F)
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent, MailboxSchedulerHint) -> bool,
+    {
+        source.notify_with_owner_post(
+            tx_substrate::step::InterestMask::new(mask_bits),
+            MailboxSchedulerHint::Normal,
+            |mailbox, event, hint| post(mailbox, event, hint),
+        );
     }
 }

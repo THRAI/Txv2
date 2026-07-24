@@ -5,14 +5,14 @@ use crate::device::{CharDeviceBinding, CharDeviceOps, DevT};
 use crate::execution::{Errno as V4Errno, Guard};
 use crate::page_backed::{AnonSwapPolicy, PageContainer, PageContainerKind};
 use crate::process::execution::reset_init_process_for_test;
-use crate::process::structure::{reset_pid_counter_for_test, Pgid};
-use crate::process::{bootstrap_init_process, step_fork, step_setpgid, ProcessIdentity};
+use crate::process::structure::{Pgid, reset_pid_counter_for_test};
+use crate::process::{ProcessIdentity, bootstrap_init_process, step_fork, step_setpgid};
 use crate::test_support::EPOCH_TEST_LOCK;
 use crate::thread_runtime::structure::reset_tid_counter_for_test;
 use crate::tty::execution::IoctlSideEffect;
 use crate::tty::structure::{Termios, TtyIdentity, TtyKind, TtyPayload, Winsize};
 use crate::vfs::adapter::step_engine::{
-    guard, reserve_for, sign_for, ByteProgress, Cap, Errno, PayloadCap, StepOutcome,
+    ByteProgress, Cap, Errno, PayloadCap, StepOutcome, guard, reserve_for, sign_for,
 };
 use crate::vm::{AddressSpace, TestPmap};
 use crate::zones;
@@ -156,6 +156,63 @@ fn cached_removed_directory_subtree_does_not_retain_parent_cycle() {
 }
 
 #[test]
+fn duplicate_child_publication_returns_existing_canonical_identity() {
+    let _g = setup_process_world();
+
+    let root_rnode = RNode::new_cap(
+        FsObjectId::new(200),
+        InodeMeta::new(InodeKind::Directory, 0o040755),
+        RNodeBacking::Directory,
+    )
+    .expect("root rnode");
+    let root = DEntry::new_cap(InlineName::ROOT, root_rnode).expect("root dentry");
+    let name = InlineName::new(b"same").expect("child name");
+
+    let first_rnode = RNode::new_cap(
+        FsObjectId::new(201),
+        InodeMeta::new(InodeKind::Regular, 0o100644),
+        RNodeBacking::Directory,
+    )
+    .expect("first rnode");
+    let mut first_raw = DEntry::new(name, first_rnode);
+    first_raw.set_parent_hint(&root);
+    let first = sign_for(
+        reserve_for::<DEntry>().expect("first dentry reservation"),
+        first_raw,
+    );
+
+    let second_rnode = RNode::new_cap(
+        FsObjectId::new(202),
+        InodeMeta::new(InodeKind::Regular, 0o100644),
+        RNodeBacking::Directory,
+    )
+    .expect("second rnode");
+    let mut second_raw = DEntry::new(name, second_rnode);
+    second_raw.set_parent_hint(&root);
+    let second = sign_for(
+        reserve_for::<DEntry>().expect("second dentry reservation"),
+        second_raw,
+    );
+
+    let first_published = root.cache_child(first.clone());
+    let second_published = root.cache_child(second.clone());
+
+    assert_eq!(first_published.key(), first.key());
+    assert_eq!(second_published.key(), first.key());
+    assert_ne!(second_published.key(), second.key());
+    assert_eq!(
+        root.cached_child(name)
+            .expect("cached canonical child")
+            .key(),
+        first.key()
+    );
+    assert_eq!(
+        second_published.rnode().fs_object_id(),
+        FsObjectId::new(201)
+    );
+}
+
+#[test]
 fn rnode_backing_carries_tty_identity_payload() {
     let _g = setup_process_world();
     init_tty_zones();
@@ -219,7 +276,12 @@ fn open_file_dispatches_struct_payload_read_write() {
     ));
     {
         assert_eq!(
-            crate::tty::execution::step_ingest(&tty, b"ok\n", &guard),
+            crate::tty::execution::step_ingest_with_post(
+                &tty,
+                b"ok\n",
+                &guard,
+                |mailbox, event, hint| mailbox.post_with_scheduler_hint(event, hint),
+            ),
             StepOutcome::Done(crate::tty::execution::IngestOutcome {
                 consumed: 3,
                 readable_fired: true,
@@ -259,6 +321,85 @@ fn open_file_dispatches_struct_payload_read_write() {
     );
     assert_eq!(char_out, [b'R']);
     assert_eq!(char_file.step_write(b"abc", &guard), StepOutcome::Done(3));
+}
+
+#[test]
+fn fd_ready_facade_reports_eventfd_readiness_and_waits() {
+    let _g = setup_process_world();
+    let efd = crate::eventfd::eventfd_create(7, 0).expect("eventfd");
+    let file = OpenFile::new_eventfd_cap(
+        efd.clone(),
+        OpenFileFlags {
+            read: true,
+            write: true,
+            append: false,
+            cloexec: false,
+            nonblocking: false,
+            packet: false,
+        },
+    )
+    .expect("eventfd file");
+
+    let guard = guard();
+    let report = crate::vfs::fd_ready::query_fd_ready(
+        crate::vfs::fd_ready::FdReadyQuery {
+            file: &file,
+            interest: crate::vfs::fd_ready::FdReadyMask::READ
+                | crate::vfs::fd_ready::FdReadyMask::WRITE,
+            now_monotonic_ns: None,
+        },
+        &guard,
+    );
+
+    assert!(
+        report
+            .ready
+            .contains(crate::vfs::fd_ready::FdReadyMask::READ)
+    );
+    assert!(
+        report
+            .ready
+            .contains(crate::vfs::fd_ready::FdReadyMask::WRITE)
+    );
+    assert!(report.epoll_watchable);
+    assert!(
+        report
+            .waits
+            .iter()
+            .any(|wait| wait.source.raw() == efd.reader_source_id())
+    );
+    assert!(
+        report
+            .waits
+            .iter()
+            .any(|wait| wait.source.raw() == efd.writer_source_id())
+    );
+    let reader_wait = report
+        .waits
+        .iter()
+        .find(|wait| wait.source.raw() == efd.reader_source_id())
+        .expect("reader wait");
+    assert_eq!(
+        reader_wait
+            .endpoint()
+            .map(tx_substrate::wake::WaitEndpoint::source_id),
+        Some(tx_substrate::step::WaitSourceId::new(
+            efd.reader_source_id()
+        ))
+    );
+    let writer_wait = report
+        .waits
+        .iter()
+        .find(|wait| wait.source.raw() == efd.writer_source_id())
+        .expect("writer wait");
+    assert_eq!(
+        writer_wait
+            .endpoint()
+            .map(tx_substrate::wake::WaitEndpoint::source_id),
+        Some(tx_substrate::step::WaitSourceId::new(
+            efd.writer_source_id()
+        ))
+    );
 }
 
 // ============================================================
