@@ -1,3 +1,21 @@
+- 2026-07-24 (修复 HTTPS 慢速 push SIGSEGV — VM mprotect 全范围快捷路径丢 PrivatePageSet). 病象:git push 到
+  HTTPS 远端+慢速上传时 git-remote-https 必崩 signal 11(repro-push-noprog.sh 100% 复现;HTTP 慢速正常)。
+  **破案链**:SEGV post-mortem 增强(thread_future.rs:全寄存器+a0/a5/s0/sp hexdump+全 recipe 表;syshist
+  环扩 pid.nr(fd,cnt)=ret 并滤 rt_sigaction 洪水)→ 崩溃 pc 实际在 ld-musl(r-x 段 0x94000 对 musl text 尺
+  寸,上轮"libcurl"是错误归属)→ 指令 `sb zero,0(zero)`+ebreak = **musl mallocng 断言自杀陷阱**,寄存器指纹
+  逐条对回 get_meta 源码 = `assert(meta->mem==base)` 失败,meta 页(恒 0xafb000)256B 全零而 group 页完好 →
+  **vmwatch VA 探针**(新 tx-subsystems/vm/probe.rs + execution.rs/types.rs 布点)打出页生命史:try_mprot →
+  zmiss(合法首次零填)→ musl 写入 meta → fork(spawn send-pack)时 forkwatch 查无此页(set 缺失实锤)→
+  fork 降权后父进程写 fault 二次 zmiss **零帧 replace 顶掉有内容帧** → 页归零。**根因**:`VmEntry::
+  split_rewrite`(vm/structure/types.rs)全范围快捷路径(`range==target`)clone 换 prot 时 owners 原样保留,
+  PROT_NONE→RW 的整 entry mprotect 产出**无 PrivatePageSet 的可写私有 entry**(违反 reserve_map/sub_entry 都
+  维护的"可写私有必带 set"不变量);内容只活在 PTE,任何 re-materialize(fork 降权后的写 fault)都零填重来。
+  musl mallocng meta_area 恰以 mmap(PROT_NONE)+逐页 mprotect(RW) 生长,邻页先 RW 留单页 NONE 洞时正好全范围命
+  中。慢速 HTTPS 只是让 TLS 堆压力长出新 meta 页,非网络 bug。**修复**:快捷路径在 `prot.write && !shared &&
+  private.is_none()` 时挂 fresh set;回归单测 vm_entry_full_range_protect_to_writable_attaches_private_set。
+  **验证**:repro HTTPS+HTTP rc=0 两轮(原 100% 崩);tx-subsystems --lib 集合差 vs 无修复基线 **322==322
+  IDENTICAL**;verify-git-net.sh **8/8**;la64 编译通过。探针留树默认静音(init.rs 注释一行可再武装;
+  vmwatch WATCH_LO/HI 在 vm/probe.rs)。**Next**:无必须项;可选=真外网慢速 push 复验。Blocker:无。
 - 2026-07-24 (修复大包上传 wedge/断线 — 外部 TCP 可靠性四连修,git push 真凶). 病象:guest 向 github push
   17MB pack 报 `curl 16 HTTP2 framing layer`+断线;本地 HTTP/1.1 同样复现(~50% wedge,宿主直推同服务端秒
   过)。**pcap+代码四层因果链**:① 真凶=TX 弹出即丢——device-TX lane `dispatch_segment` 把段从 smoltcp 弹

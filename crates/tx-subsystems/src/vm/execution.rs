@@ -120,10 +120,32 @@ impl AddressSpace {
         let parent_recipes = parent.recipes_snapshot();
         let child_recipes = parent.recipes.clone_shared(&guard);
         let child = AddressSpace::new_with_recipes_for_platform::<P>(child_recipes)?;
+        crate::vm::probe::probe_emit("fork", &[parent as *const AddressSpace as u64]);
 
         for entry in parent_recipes {
             let private = !entry.flags.shared;
             let range = entry.range;
+            if private
+                && range.start().as_usize() <= crate::vm::probe::WATCH_LO
+                && crate::vm::probe::WATCH_LO < range.end().as_usize()
+            {
+                let off = crate::vm::structure::VmPageOff(
+                    ((crate::vm::probe::WATCH_LO - range.start().as_usize()) / USER_PAGE_SIZE)
+                        as u64,
+                );
+                let (ppn, state, fp) = match entry.private().and_then(|set| set.lookup(off)) {
+                    Some(snap) => (
+                        snap.ppn.0 as u64,
+                        snap.state as u64,
+                        crate::vm::probe::frame_fingerprint(snap.ppn),
+                    ),
+                    None => (u64::MAX, u64::MAX, 0),
+                };
+                crate::vm::probe::probe_emit(
+                    "forkwatch",
+                    &[range.start().as_usize() as u64, ppn, state, fp],
+                );
+            }
             if let (true, Some(parent_set)) = (private, entry.private()) {
                 let child_set = parent_set.fork_share().map_err(VmMapError::Private)?;
                 let child_entry = entry.clone().with_private(Some(child_set));
@@ -182,6 +204,7 @@ impl AddressSpace {
     ///
     /// Returns the count of pages torn down for observability.
     pub fn exec_aspace(old_aspace: &AddressSpace) -> usize {
+        crate::vm::probe::probe_emit("exec", &[old_aspace as *const AddressSpace as u64]);
         old_aspace.teardown_all_pmap()
     }
 
@@ -399,6 +422,9 @@ impl AddressSpace {
         );
         let _entry = require_fault_publication(self, outcome, &materialization)?;
         emit_vm_trace(b"debug.vm.fault.publish.phase", 3);
+        let probe_va = outcome.page_range.start().as_usize();
+        let probe_ppn = materialization.page.ppn;
+        let probe_replace = materialization.replace_existing;
         let published = self
             .pmap
             .publish_page_with_replacement(
@@ -409,6 +435,19 @@ impl AddressSpace {
                 materialization.replace_existing,
             )
             .map_err(VmFaultError::Pmap)?;
+        if crate::vm::probe::watch_overlap(probe_va, probe_va + USER_PAGE_SIZE) {
+            crate::vm::probe::probe_emit(
+                "pub",
+                &[
+                    self as *const AddressSpace as u64,
+                    probe_va as u64,
+                    probe_ppn.0 as u64,
+                    matches!(outcome.access, AccessMode::Write) as u64,
+                    probe_replace as u64,
+                    crate::vm::probe::frame_fingerprint(probe_ppn),
+                ],
+            );
+        }
         emit_vm_trace(b"debug.vm.fault.publish.phase", 4);
         Ok(FaultScriptPublish::Done(published))
     }
@@ -544,6 +583,12 @@ impl AddressSpace {
             };
             drop(guard);
             emit_vm_trace(b"debug.vm.fault.prefault.phase", 4);
+            if crate::vm::probe::watch_overlap(addr, addr + USER_PAGE_SIZE) {
+                crate::vm::probe::probe_emit(
+                    "pre",
+                    &[addr as u64, materialization.page.ppn.0 as u64],
+                );
+            }
             batch_pages.push(PmapBatchPage {
                 page: outcome.page_range.start().containing_page(),
                 ppn: materialization.page.ppn,
@@ -720,6 +765,12 @@ impl AddressSpace {
                 }
                 _ => unreachable_acquire_step(),
             };
+            if crate::vm::probe::watch_overlap(range.start().as_usize(), range.end().as_usize()) {
+                crate::vm::probe::probe_emit(
+                    "munmap",
+                    &[range.start().as_usize() as u64, range.len() as u64],
+                );
+            }
             let commit = self.recipes.unmap(range)?;
             self.pmap.teardown_range(range)?;
             self.stats.apply_delta(commit.stats_delta);
@@ -749,6 +800,12 @@ impl AddressSpace {
                 }
                 _ => unreachable_acquire_step(),
             };
+            if crate::vm::probe::watch_overlap(range.start().as_usize(), range.end().as_usize()) {
+                crate::vm::probe::probe_emit(
+                    "mprot",
+                    &[range.start().as_usize() as u64, range.len() as u64],
+                );
+            }
             let commit = self.recipes.protect(range, prot)?;
             self.pmap.teardown_range(range)?;
             self.stats.apply_delta(commit.stats_delta);
@@ -1011,6 +1068,12 @@ impl AddressSpace {
         let _guard = self.acquire_writer(range)?;
         emit_vm_map_path_duration(b"debug.vm.map_path.munmap.acquire_ns", acquire_start);
         emit_vm_trace(b"debug.vm.unmap.phase", 1);
+        if crate::vm::probe::watch_overlap(range.start().as_usize(), range.end().as_usize()) {
+            crate::vm::probe::probe_emit(
+                "try_munmap",
+                &[range.start().as_usize() as u64, range.len() as u64],
+            );
+        }
         let recipe_start = vm_map_path_clock_now();
         let commit = self.recipes.unmap(range)?;
         emit_vm_map_path_duration(b"debug.vm.map_path.munmap.recipe_ns", recipe_start);
@@ -1039,6 +1102,12 @@ impl AddressSpace {
 
     pub fn try_mprotect(&self, range: UserRange, prot: Prot) -> Result<VmMapCommit, VmMapError> {
         emit_vm_trace(b"debug.vm.protect.phase", 0);
+        if crate::vm::probe::watch_overlap(range.start().as_usize(), range.end().as_usize()) {
+            crate::vm::probe::probe_emit(
+                "try_mprot",
+                &[range.start().as_usize() as u64, range.len() as u64],
+            );
+        }
         let _guard = self.acquire_writer(range)?;
         emit_vm_trace(b"debug.vm.protect.phase", 1);
         let commit = self.recipes.protect(range, prot)?;
@@ -1094,6 +1163,12 @@ impl AddressSpace {
         );
         if placement == MapPlacement::FixedReplace {
             emit_vm_trace(b"debug.vm.mmap.commit.fixed_teardown", 1);
+            if crate::vm::probe::watch_overlap(range.start().as_usize(), range.end().as_usize()) {
+                crate::vm::probe::probe_emit(
+                    "fixmap",
+                    &[range.start().as_usize() as u64, range.len() as u64],
+                );
+            }
             let teardown_start = vm_map_path_clock_now();
             self.pmap.teardown_range(range)?;
             emit_vm_map_path_duration(
@@ -1290,6 +1365,13 @@ impl AddressSpace {
         match advice {
             MadviseAdvice::DontNeed | MadviseAdvice::Free => {
                 let _guard = self.acquire_writer(range)?;
+                if crate::vm::probe::watch_overlap(range.start().as_usize(), range.end().as_usize())
+                {
+                    crate::vm::probe::probe_emit(
+                        "madv",
+                        &[range.start().as_usize() as u64, range.len() as u64],
+                    );
+                }
                 self.pmap.teardown_range(range)?;
                 let guard = step_engine::guard();
                 self.stats.store(self.recipes.stats(&guard));

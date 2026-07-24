@@ -508,13 +508,24 @@ static SYSHIST_NR: [core::sync::atomic::AtomicU64; SYSHIST_LEN] =
     [const { core::sync::atomic::AtomicU64::new(0) }; SYSHIST_LEN];
 static SYSHIST_RET: [core::sync::atomic::AtomicI64; SYSHIST_LEN] =
     [const { core::sync::atomic::AtomicI64::new(0) }; SYSHIST_LEN];
+// meta word: pid<<48 | (arg0 & 0xffff)<<32 | (arg2 & 0xffffffff) — for fd-shaped
+// syscalls this reads as pid/fd/count.
+static SYSHIST_META: [core::sync::atomic::AtomicU64; SYSHIST_LEN] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; SYSHIST_LEN];
 static SYSHIST_POS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
-fn syshist_record(nr: u64, ret: i64) {
+fn syshist_record(nr: u64, ret: i64, pid: u64, arg0: u64, arg2: u64) {
     use core::sync::atomic::Ordering::Relaxed;
+    // Skip rt_sigaction: spawn children reset all 64 signals in a loop, which
+    // floods the whole ring and evicts the pre-fork VM syscalls we care about.
+    if nr == 134 {
+        return;
+    }
     let i = SYSHIST_POS.fetch_add(1, Relaxed) % SYSHIST_LEN;
     SYSHIST_NR[i].store(nr, Relaxed);
     SYSHIST_RET[i].store(ret, Relaxed);
+    let meta = (pid << 48) | ((arg0 & 0xffff) << 32) | (arg2 & 0xffff_ffff);
+    SYSHIST_META[i].store(meta, Relaxed);
 }
 
 fn syshist_ret_of(r: &SyscallResult) -> i64 {
@@ -530,16 +541,34 @@ fn syshist_ret_of(r: &SyscallResult) -> i64 {
 pub const SYSCALL_HISTORY_LEN: usize = SYSHIST_LEN;
 
 /// Snapshot the syscall-history ring for the fatal-trap post-mortem.
-/// Newest entry is at `(pos - 1) % LEN`.
-pub fn syscall_history_snapshot() -> ([u64; SYSHIST_LEN], [i64; SYSHIST_LEN], usize) {
+/// Newest entry is at `(pos - 1) % LEN`. The third array is the meta word
+/// (`pid<<48 | fd<<32 | count`) recorded per entry.
+pub fn syscall_history_snapshot() -> (
+    [u64; SYSHIST_LEN],
+    [i64; SYSHIST_LEN],
+    [u64; SYSHIST_LEN],
+    usize,
+) {
     use core::sync::atomic::Ordering::Relaxed;
     let mut nrs = [0u64; SYSHIST_LEN];
     let mut rets = [0i64; SYSHIST_LEN];
+    let mut metas = [0u64; SYSHIST_LEN];
     for i in 0..SYSHIST_LEN {
         nrs[i] = SYSHIST_NR[i].load(Relaxed);
         rets[i] = SYSHIST_RET[i].load(Relaxed);
+        metas[i] = SYSHIST_META[i].load(Relaxed);
     }
-    (nrs, rets, SYSHIST_POS.load(Relaxed))
+    (nrs, rets, metas, SYSHIST_POS.load(Relaxed))
+}
+
+/// PROBE(proxy-push segv hunt): read user memory for the fatal-trap
+/// post-mortem hexdump. Returns false when the range is unmapped/unreadable.
+pub fn probe_copy_from_user(
+    aspace: &tx_subsystems::vm::AddressSpace,
+    uaddr: u64,
+    dst: &mut [u8],
+) -> bool {
+    user_copy::bootstrap_copy_from_user(aspace, dst, uaddr).is_ok()
 }
 
 pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + tx_hal::ConsoleIf>(
@@ -569,7 +598,13 @@ pub async fn dispatch<'a, P: PmapIf + EntropyIf + TimeIf + AuxvIf + SmpIf + tx_h
     // (netperf UDP_STREAM/TCP_STREAM `send` bursts) never see SIGALRM and hang.
     time::poll_itimer_real_on_syscall_boundary::<P>(ctx);
     let result = dispatch_inner::<P>(req, ctx).await;
-    syshist_record(req.nr, syshist_ret_of(&result));
+    syshist_record(
+        req.nr,
+        syshist_ret_of(&result),
+        ctx.process.pid.0 as u64,
+        req.args[0],
+        req.args[2],
+    );
     tx_observe::set_current_parent_span(prev);
     emit_syscall_exit(l0_span, &result);
     result

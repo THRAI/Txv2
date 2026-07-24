@@ -258,6 +258,11 @@ impl<P: TxPlatform> CoreInit<P> {
 
     fn init_substrate_if_ready(handoff: BootHandoff) {
         if P::SUBSTRATE_BOOT_READY {
+            // PROBE(proxy-push segv hunt): the vmwatch page-lifecycle probes
+            // in tx-subsystems::vm are compiled in but quiet by default.
+            // Uncomment to re-arm them (events on the WATCH_LO..WATCH_HI user
+            // VA range print to the console as `txkernel:vmwatch:*`):
+            // tx_subsystems::vm::probe::install_probe_sink(vm_probe_sink::<P>);
             init::<P>();
             crate::zones::register_all().expect("tx_kernel zone registration failed");
             Self::init_later(handoff);
@@ -2245,6 +2250,17 @@ mod init_setuid_fixture;
 #[cfg(test)]
 mod init_lseek_fixture;
 mod rootfs_shims;
+
+/// PROBE(proxy-push segv hunt): monomorphized raw console sink handed to the
+/// tx-subsystems vmwatch probes. ASCII-only lines from the probe emitter.
+/// Quiet by default — see the commented `install_probe_sink` call in
+/// `init_substrate_if_ready` to re-arm.
+#[allow(dead_code)]
+fn vm_probe_sink<P: TxPlatform>(bytes: &[u8]) {
+    if let Ok(s) = core::str::from_utf8(bytes) {
+        tx_hal::console_write_str::<P>(s);
+    }
+}
 
 #[cfg(test)]
 mod tests;

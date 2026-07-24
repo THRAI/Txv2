@@ -959,6 +959,9 @@ pub async fn run_thread<P: TxPlatform>(
                             log_nearby_recipes::<P>(&aspace, c.pc as usize);
                         }
                         dump_syscall_history::<P>();
+                        dump_user_regs::<P>(&payload);
+                        dump_user_mem_windows::<P>(&aspace, &payload);
+                        dump_all_recipes::<P>(&aspace);
                         deliver_synchronous_fault(&thread, Signum::SIGSEGV);
                         return;
                     }
@@ -1175,18 +1178,105 @@ fn log_user_segv<P: TxPlatform>(
 /// by the tx-shims dispatch ring, so the fatal-trap report shows what
 /// git-remote-https did right before it faulted. Newest entry printed last.
 fn dump_syscall_history<P: TxPlatform>() {
-    let (nrs, rets, pos) = tx_shims::linux_syscall::syscall_history_snapshot();
+    let (nrs, rets, metas, pos) = tx_shims::linux_syscall::syscall_history_snapshot();
     let len = tx_shims::linux_syscall::SYSCALL_HISTORY_LEN;
-    tx_hal::console_write_str::<P>("txkernel:syshist(nr=ret hex,newest-last):");
-    let show = if len < 28 { len } else { 28 };
+    tx_hal::console_write_str::<P>("txkernel:syshist(pid.nr(fd,cnt)=ret hex,newest-last):");
+    let show = if len < 36 { len } else { 36 };
     for k in (0..show).rev() {
         let idx = (pos + len - 1 - k) % len;
         tx_hal::console_write_str::<P>(" ");
+        write_hex_u64::<P>(metas[idx] >> 48);
+        tx_hal::console_write_str::<P>(".");
         write_hex_u64::<P>(nrs[idx]);
-        tx_hal::console_write_str::<P>("=");
+        tx_hal::console_write_str::<P>("(");
+        write_hex_u64::<P>((metas[idx] >> 32) & 0xffff);
+        tx_hal::console_write_str::<P>(",");
+        write_hex_u64::<P>(metas[idx] & 0xffff_ffff);
+        tx_hal::console_write_str::<P>(")=");
         write_hex_u64::<P>(rets[idx] as u64);
     }
     tx_hal::console_write_str::<P>("\n");
+}
+
+/// PROBE(proxy-push segv hunt): dump the full user register file so the
+/// mallocng-assert crash site can be reconstructed (which assert fired, what
+/// the header/meta values were).
+fn dump_user_regs<P: TxPlatform>(payload: &ThreadPayload) {
+    let Some(ctx) = payload.saved_user_context() else {
+        return;
+    };
+    tx_hal::console_write_str::<P>("txkernel:user-segv:regs");
+    for (i, r) in ctx.regs.iter().enumerate().skip(1) {
+        tx_hal::console_write_str::<P>(" x");
+        write_hex_u64::<P>(i as u64);
+        tx_hal::console_write_str::<P>("=");
+        write_hex_u64::<P>(*r as u64);
+    }
+    tx_hal::console_write_str::<P>("\n");
+}
+
+/// PROBE(proxy-push segv hunt): hexdump user memory windows around the
+/// registers involved in musl mallocng's get_meta asserts (a0/a5/s0 and the
+/// stack), so the corrupted heap bytes are visible in the post-mortem.
+fn dump_user_mem_windows<P: TxPlatform>(aspace: &AddressSpace, payload: &ThreadPayload) {
+    let Some(ctx) = payload.saved_user_context() else {
+        return;
+    };
+    let a0 = ctx.regs[10] as u64;
+    let a5 = ctx.regs[15] as u64;
+    let s0 = ctx.regs[8] as u64;
+    let sp = ctx.regs[2] as u64;
+    let centers: [(u64, u64, &str); 4] = [
+        (a0.saturating_sub(0x80), 0x100, "a0"),
+        (a5.saturating_sub(0x80), 0x100, "a5"),
+        (s0.saturating_sub(0x40), 0x80, "s0"),
+        (sp, 0x200, "sp"),
+    ];
+    let mut done: [u64; 4] = [u64::MAX; 4];
+    for (slot, (start, len, tag)) in centers.iter().enumerate() {
+        let start = *start & !0xf;
+        if done[..slot].contains(&start) {
+            continue;
+        }
+        done[slot] = start;
+        dump_user_hex::<P>(aspace, start, *len as usize, tag);
+    }
+}
+
+fn dump_user_hex<P: TxPlatform>(aspace: &AddressSpace, start: u64, len: usize, tag: &str) {
+    let mut off = 0usize;
+    while off < len {
+        let line_addr = start + off as u64;
+        let mut buf = [0u8; 16];
+        let ok = tx_shims::linux_syscall::probe_copy_from_user(aspace, line_addr, &mut buf);
+        tx_hal::console_write_str::<P>("txkernel:mem:");
+        tx_hal::console_write_str::<P>(tag);
+        tx_hal::console_write_str::<P>(":0x");
+        write_hex_u64::<P>(line_addr);
+        tx_hal::console_write_str::<P>(":");
+        if ok {
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            let mut text = [0u8; 32];
+            for (i, b) in buf.iter().enumerate() {
+                text[i * 2] = HEX[(b >> 4) as usize];
+                text[i * 2 + 1] = HEX[(b & 0xf) as usize];
+            }
+            tx_hal::console_write_str::<P>(core::str::from_utf8(&text).unwrap_or("?"));
+        } else {
+            tx_hal::console_write_str::<P>("<unmapped>");
+        }
+        tx_hal::console_write_str::<P>("\n");
+        off += 16;
+    }
+}
+
+/// PROBE(proxy-push segv hunt): dump the entire recipe table (user mmap map)
+/// so stack code pointers can be attributed to their libraries offline.
+fn dump_all_recipes<P: TxPlatform>(aspace: &AddressSpace) {
+    let recipes = aspace.recipes_snapshot();
+    for entry in recipes.iter() {
+        log_recipe::<P>("map", entry);
+    }
 }
 
 fn log_nearby_recipes<P: TxPlatform>(aspace: &AddressSpace, fault_addr: usize) {
