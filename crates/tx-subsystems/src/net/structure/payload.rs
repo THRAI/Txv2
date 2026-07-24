@@ -929,6 +929,17 @@ impl SocketPayload {
         })
     }
 
+    /// V5-1: undo a [`Self::take_udp_tx_datagram`] when the device sink
+    /// refused the packet, so the next sink (or the next pass) can retry it.
+    /// Returns false when the tx ring filled up behind us — only then is the
+    /// datagram genuinely dropped.
+    pub(crate) fn restore_udp_tx_datagram(&self, drain: SocketUdpTxDrain) -> bool {
+        let Some(raw_udp) = self.imp.udp() else {
+            return false;
+        };
+        raw_udp.requeue_tx_datagram(drain.datagram, drain.src)
+    }
+
     pub(crate) fn take_icmp_tx_echo(&self) -> Option<SocketIcmpTxDrain> {
         let raw_icmp = self.imp.icmp()?;
         let drain = raw_icmp.pop_tx_echo()?;
@@ -1270,7 +1281,34 @@ impl SocketPayload {
                     })
                 })
                 .map(|src| IpEndpoint::new(src, 0)),
-            super::IpAddress::V6(_) => None,
+            // V5-1: mirror of the V4 arm above. This used to be a hard `None`,
+            // which handed source selection to smoltcp — and the context iface
+            // carries no addresses, so `get_source_address_ipv6` fell back to
+            // `Ipv6Address::LOCALHOST`. Every external v6 UDP datagram that did
+            // reach the wire carried src=`::1` and could never be answered.
+            // (The v4 arm has no such symptom only because the v4 fallback
+            // returns None and smoltcp then drops the packet silently.)
+            //
+            // This is also the first real consumer of `best_ipv6_route`, which
+            // was fully implemented but had zero non-test callers.
+            super::IpAddress::V6(addr) => self
+                .net_namespace()
+                .best_ipv6_route(addr)
+                .and_then(|route| {
+                    route.preferred_src.or_else(|| {
+                        self.net_namespace()
+                            .link_snapshot()
+                            .into_iter()
+                            .find(|link| {
+                                link.name == route.oif_name
+                                    && link.is_up
+                                    && !link.is_loopback
+                                    && link.ipv6_addr.is_some()
+                            })
+                            .and_then(|link| link.ipv6_addr)
+                    })
+                })
+                .map(|src| IpEndpoint::new_v6(src, 0)),
         }
     }
 

@@ -1,3 +1,28 @@
+- 2026-07-25 (**V5-1 外部 IPv6 UDP 打通** — 破坏性弹出 + v6 源地址空洞两连修). 病象:guest 里任何发往
+  外部 v6 单播地址的 UDP(含 DNS)**一个包都到不了网线**,而同时刻 v4 UDP 与 v6 TCP 全通。**双根因**:
+  ① `step_device_tx.rs:342` UDP 车道 `take_udp_tx_datagram()` 是**破坏性弹出**,sink 一旦返回
+  Busy/PendingResolution/Failed 数据报即销毁——TCP 车道用"拒收即留队"(`dispatch_segment_via`,01aea500
+  修大包 wedge 时确立)、raw ICMPv6 用 peek→transmit→commit,**唯独 UDP 会丢数据**;叠加 ② 初始 namespace
+  一轮 delegate 里有**两个 TX sink**(`delegate/runtime.rs:247` boot lane 先跑,`:280` namespace lane 后跑),
+  boot lane 的 iface(`tx-kernel/src/init/net.rs:75-84`)建时**没有 `.with_ipv6`**,对任何非组播 v6 目的地
+  `decide_ipv6_route→Unreachable→Failed{EADDRNOTAVAIL}` ⇒ 数据报在能路由它的 iface 见到 socket 之前就被
+  销毁,**必丢**;③ `payload.rs:1273` `udp_tx_src_hint` 的 V6 臂硬编 `None` → 交给 smoltcp 决议,而
+  CONTEXT_IFACE 是无地址裸 loopback iface,`get_source_address_ipv6` 回退 `LOCALHOST` ⇒ 少数漏网的 v6 UDP
+  **源地址是 `::1`**(网线实证),对端无法应答。**修复**:(a) `udp.rs` 加 `requeue_tx_datagram(datagram, src)`
+  (`push_datagram_inner` 拆出 `push_datagram_with_source`,`local_address` 用**已决议的 src** 保证重试逐字节
+  一致)+ `payload.rs` `restore_udp_tx_datagram`;`process_udp_tx_socket` 三个非 Accepted 臂改为先 restore
+  再计数,ring 满才真丢。**顺带修掉 v4 UDP 在队列满时的静默丢包**。(b) `udp_tx_src_hint` 的 V6 臂镜像 V4 臂
+  走 `best_ipv6_route→preferred_src`(+按 oif_name 扫 link 兜底)——这也是 `best_ipv6_route` 头一次有真实
+  消费者(此前零非测试调用者)。**验证**:真机 `nc -u fec0::2` 收到 `UDPOK-V6`,pcap
+  `fec0::15.49154 > fec0::2:UDP` **源是 fec0::15 不是 ::1**;v6 DNS 查询也以正确源上线(NS/NA→A+AAAA 都发出),
+  **但 slirp 回 ICMPv6 `unreachable route fec0::3`** ⇒ 宿主 `/etc/resolv.conf` 只有 v4 nameserver,libslirp
+  无 v6 DNS 可转发,**环境限制非内核缺陷**(文档 §5 那条"nslookup fec0::3 成功"的验收标准据此修正)。回归门:
+  rv64/la64 build ✅ 零新增 warning;`tx-subsystems --lib` 集合差 = **+2 恰为新增的两个测试、0 既有翻转**
+  (隔离复跑 2/2 绿;全量里整个 external_connect_tests 模块本就级联失败);`verify-git-net.sh` **8/8**;
+  v4 对照(UDP/TCP/DNS)真机全绿。新测试 `refused_udp_datagram_is_requeued_for_the_next_pass`(用 v4 钉死
+  车道语义,与 v6 无关)+ `external_udp6_sendto_uses_the_interface_source_address`,**做过对照实验**:
+  `git stash` 掉三个源文件后两测试都 FAIL。**Next**:V5-2(boot 自动 seed v6 地址+默认路由)。
+  **Blocker**:无。
 - 2026-07-25 (IPv6 外部数据面 Phase 0 调研 — **仅调研,零实现改动**;worktree `.claude/worktrees/ipv6-external`,
   分支 `claude/ipv6-external-nic`,基线 `feature-network-refactor@2c5fe37b`). 产出正本
   `docs/design/07_net/IPV6_EXTERNAL_DATAPLANE_v1.md`(txdoc:07-NET-IPV6-EXT-DATAPLANE-V1)。**任务前提被实测

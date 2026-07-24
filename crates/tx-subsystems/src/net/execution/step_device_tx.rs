@@ -337,8 +337,8 @@ fn process_udp_tx_socket(
     // P2-S6: pop through smoltcp dispatch so the wire source is the
     // dispatch-resolved endpoint (bound address or enqueue-time hint) —
     // sockets autobound to 0.0.0.0 must not emit src-unspecified packets.
-    // The pop is destructive; a sink refusal drops the datagram (UDP is
-    // best-effort and the readiness probe above keeps that window small).
+    // V5-1: the pop is destructive, so every non-`Accepted` sink answer must
+    // undo it via `restore_udp_tx_datagram` below.
     let Some(drain) = payload.take_udp_tx_datagram() else {
         return;
     };
@@ -361,14 +361,34 @@ fn process_udp_tx_socket(
                 outcome.wakes_fired += ident.readiness.fire_send(SendWireSet::SPACE);
             }
         }
-        PacketTxResult::Busy => {
-            outcome.udp_busy += 1;
-        }
-        PacketTxResult::PendingResolution { .. } => {
-            outcome.udp_resolution_pending += 1;
-        }
-        PacketTxResult::Failed { .. } => {
-            outcome.udp_failed += 1;
+        // V5-1: a refused datagram goes BACK on the queue instead of into the
+        // void. The other two lanes never had this hole — TCP refuses from
+        // inside the dispatch closure so the segment never leaves smoltcp
+        // (01aea500, the bulk-upload wedge fix), and raw ICMPv6 is
+        // peek → transmit → commit. UDP was the last lane still losing data.
+        //
+        // The concrete failure this closes: the initial namespace is scanned
+        // by TWO device-TX sinks per delegate round — the boot lane's iface
+        // (init/net.rs, built with `IfaceCommon::with_gateway` and NO
+        // `.with_ipv6`) runs first, then the per-link namespace iface. The
+        // boot iface therefore answers `Unreachable` -> `Failed{EADDRNOTAVAIL}`
+        // for every unicast IPv6 destination, and the datagram was destroyed
+        // before the iface that could actually route it ever saw the socket.
+        // Net effect: external IPv6 UDP never reached the wire at all.
+        refused => {
+            if payload.restore_udp_tx_datagram(drain) {
+                match refused {
+                    PacketTxResult::Busy => outcome.udp_busy += 1,
+                    PacketTxResult::PendingResolution { .. } => {
+                        outcome.udp_resolution_pending += 1;
+                    }
+                    _ => outcome.udp_failed += 1,
+                }
+            } else {
+                // The tx ring filled up behind us: now it really is a
+                // best-effort drop.
+                outcome.udp_failed += 1;
+            }
         }
     }
 }

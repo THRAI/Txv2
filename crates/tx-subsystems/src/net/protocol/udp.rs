@@ -372,6 +372,27 @@ impl RawUdpSocket {
         self.enqueue_tx_datagram_with_more(dst, bytes.to_vec(), more)
     }
 
+    /// V5-1: put a dispatch-popped datagram BACK into the tx ring after the
+    /// device sink refused it. `src` is the source smoltcp already resolved
+    /// for it, so the retry emits a byte-identical packet instead of
+    /// re-running source selection against a different iface.
+    ///
+    /// Returns false only when the ring has filled up behind us — then the
+    /// datagram really is dropped (UDP is best-effort).
+    ///
+    /// Ordering note: the datagram goes back at the TAIL, so a requeue can
+    /// reorder it against datagrams enqueued in between. UDP has no ordering
+    /// guarantee, and losing the packet outright is strictly worse.
+    pub fn requeue_tx_datagram(&self, datagram: UdpTxDatagram, src: IpEndpoint) -> bool {
+        let inner = &mut *self.inner.lock();
+        let local_address = if src.is_unspecified() {
+            None
+        } else {
+            Some(to_smol_ip(&src))
+        };
+        push_datagram_with_source(inner, datagram, local_address).is_some()
+    }
+
     pub fn pop_tx_datagram(&self) -> Option<UdpTxDatagramDrain> {
         with_context(|cx| {
             let inner = &mut *self.inner.lock();
@@ -630,12 +651,21 @@ fn udp_send_available_inner(inner: &UdpInnerState, send_capacity: usize) -> usiz
 /// an unaddressable destination is accepted and dropped (legacy queue
 /// behaviour: it would sit until the drain failed to emit it).
 fn push_datagram_inner(inner: &mut UdpInnerState, datagram: UdpTxDatagram) -> Option<()> {
+    let local_address = inner.tx_src_hint;
+    push_datagram_with_source(inner, datagram, local_address)
+}
+
+fn push_datagram_with_source(
+    inner: &mut UdpInnerState,
+    datagram: UdpTxDatagram,
+    local_address: Option<IpAddress>,
+) -> Option<()> {
     if datagram.dst.port == 0 || datagram.dst.is_unspecified() {
         return Some(());
     }
     let meta = udp::UdpMetadata {
         endpoint: to_smol_endpoint(&datagram.dst),
-        local_address: inner.tx_src_hint,
+        local_address,
         meta: PacketMeta::default(),
     };
     inner

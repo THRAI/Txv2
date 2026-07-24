@@ -559,3 +559,225 @@ fn external_udp_sendto_reaches_device_tx() {
         tx.udp_resolution_pending
     );
 }
+
+const LOCAL_IP6: Ipv6Address = Ipv6Address::new([
+    0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x15,
+]);
+const REMOTE_IP6: Ipv6Address = Ipv6Address::new([
+    0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02,
+]);
+
+fn inet6_at(addr: Ipv6Address, port: u16) -> KernelSockAddr {
+    KernelSockAddr::V6(SockAddrIn6::new(port, addr))
+}
+
+/// Attach the virtio test device with both a v4 and a v6 address (the v4 one
+/// is what `ensure_ether_iface_for_link` keys off; the v6 one is what the
+/// route/source-selection code needs).
+fn attach_dual_stack_device(minor: u32) -> &'static NetDeviceRegistration {
+    let device = leak_virtio_device(2, 2);
+    let registration = leak_virtio_registration(device, minor);
+    let namespace = crate::net::initial_net_namespace_payload();
+    namespace
+        .attach_device_for_test_or_bootstrap(registration, Some(LOCAL_IP))
+        .expect("attach virtio test device to initial net namespace");
+    let ifindex = namespace
+        .link_snapshot()
+        .iter()
+        .find(|link| link.name == registration.name)
+        .expect("virtio test link")
+        .ifindex;
+    namespace
+        .set_device_ipv6_addr_by_ifindex(
+            NetAdminAuthority::for_test_or_bootstrap(),
+            ifindex,
+            Some(LOCAL_IP6),
+            Some(64),
+        )
+        .expect("set virtio test device ipv6 address");
+    registration
+}
+
+/// Capture what the device-TX lane actually hands the wire, and let the test
+/// decide how many passes must fail before the sink accepts.
+struct ScriptedSink {
+    refusals_left: core::sync::atomic::AtomicUsize,
+    frames: std::sync::Mutex<std::vec::Vec<std::vec::Vec<u8>>>,
+}
+
+impl ScriptedSink {
+    fn new(refusals: usize) -> Self {
+        Self {
+            refusals_left: core::sync::atomic::AtomicUsize::new(refusals),
+            frames: std::sync::Mutex::new(std::vec::Vec::new()),
+        }
+    }
+
+    fn accepted(&self) -> std::vec::Vec<std::vec::Vec<u8>> {
+        self.frames.lock().expect("scripted sink frames").clone()
+    }
+}
+
+impl PacketTxSink for ScriptedSink {
+    fn transmit(&self, frame: &[u8], _guard: &Guard<'_>) -> PacketTxResult {
+        let left = self.refusals_left.load(core::sync::atomic::Ordering::Acquire);
+        if left > 0 {
+            self.refusals_left
+                .store(left - 1, core::sync::atomic::Ordering::Release);
+            // Exactly what the boot lane's v4-only iface answers for a unicast
+            // IPv6 destination: `decide_ipv6_route` -> Unreachable.
+            return PacketTxResult::Failed {
+                errno: Errno::EADDRNOTAVAIL,
+            };
+        }
+        self.frames
+            .lock()
+            .expect("scripted sink frames")
+            .push(frame.to_vec());
+        PacketTxResult::Accepted {
+            frame_len: frame.len(),
+        }
+    }
+}
+
+/// V5-1 regression (G1a): the UDP device-TX pop is destructive, so a sink that
+/// refuses the packet must NOT destroy it. Before the fix the first refusal
+/// dropped the datagram permanently — and because the initial namespace is
+/// scanned by TWO sinks per delegate round (the boot lane's v4-only iface
+/// first), every external IPv6 UDP datagram died before the iface that could
+/// route it ever ran.
+///
+/// Deliberately uses IPv4 so this pins the LANE, not anything v6-specific.
+#[test]
+fn refused_udp_datagram_is_requeued_for_the_next_pass() {
+    let _lock = setup();
+
+    let device = leak_virtio_device(2, 2);
+    let registration = leak_virtio_registration(device, 76);
+    crate::net::initial_net_namespace_payload()
+        .attach_device_for_test_or_bootstrap(registration, Some(LOCAL_IP))
+        .expect("attach virtio test device to initial net namespace");
+
+    let guard = tx_substrate::epoch::guard();
+    let udp = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Udp,
+        SocketOptionSet::default_udp(),
+    )
+    .expect("udp socket");
+    assert_eq!(
+        step_bind(&udp, inet_addr(49_182, LOCAL_IP), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        step_send_to_kernel_bytes(
+            &udp,
+            Some(IpEndpoint::new(REMOTE_IP, 53)),
+            b"requeue-me",
+            SendRecvFlags::empty(),
+            &guard,
+        ),
+        StepOutcome::Done(10)
+    );
+
+    let sink = ScriptedSink::new(1);
+    let pass = |now_ms: i32| {
+        let StepOutcome::Done(tx) = step_process_device_tx_pending_in_namespace_at(
+            &sink,
+            crate::net::initial_net_namespace_payload(),
+            smoltcp::time::Instant::from_millis(now_ms as i64),
+            DeviceTxBudget::default(),
+            &guard,
+        ) else {
+            panic!("device tx pass should complete");
+        };
+        tx
+    };
+
+    let first = pass(5);
+    assert_eq!(first.udp_packets, 0, "first pass must be refused");
+    assert_eq!(
+        first.udp_failed, 1,
+        "a sink error is still counted as a failure"
+    );
+
+    let second = pass(10);
+    assert_eq!(
+        second.udp_packets, 1,
+        "the refused datagram must survive into the next pass \
+         (attempted={}, busy={}, pending={}, failed={})",
+        second.udp_attempted,
+        second.udp_busy,
+        second.udp_resolution_pending,
+        second.udp_failed
+    );
+    let frames = sink.accepted();
+    assert_eq!(frames.len(), 1, "exactly one packet reaches the wire");
+    assert!(
+        frames[0].ends_with(b"requeue-me"),
+        "the requeued datagram must carry the original payload"
+    );
+}
+
+/// V5-1 regression (G1c): an external IPv6 UDP datagram must leave with the
+/// interface's v6 address as source. Before the fix `udp_tx_src_hint`'s V6 arm
+/// was a hard `None`, smoltcp's address-less context iface fell back to
+/// `Ipv6Address::LOCALHOST`, and the wire packet carried src=`::1` — which no
+/// peer can answer.
+#[test]
+fn external_udp6_sendto_uses_the_interface_source_address() {
+    let _lock = setup();
+
+    let _registration = attach_dual_stack_device(77);
+    let guard = tx_substrate::epoch::guard();
+
+    let udp = registry::create_socket_in_namespace_with_family(
+        SocketKind::Udp,
+        AddressFamily::Inet6,
+        SocketOptionSet::default_udp(),
+        crate::net::initial_net_namespace_payload(),
+    )
+    .expect("udp6 socket");
+    // Mirror maybe_autobind_udp_sendto for AF_INET6: bind [::]:ephemeral, i.e.
+    // the socket does NOT know its own source address.
+    assert_eq!(
+        step_bind(&udp, inet6_at(Ipv6Address::UNSPECIFIED, 49_181), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        step_send_to_kernel_bytes(
+            &udp,
+            Some(IpEndpoint::new_v6(REMOTE_IP6, 53)),
+            b"dns6-query",
+            SendRecvFlags::empty(),
+            &guard,
+        ),
+        StepOutcome::Done(10)
+    );
+
+    let sink = ScriptedSink::new(0);
+    let StepOutcome::Done(tx) = step_process_device_tx_pending_in_namespace_at(
+        &sink,
+        crate::net::initial_net_namespace_payload(),
+        smoltcp::time::Instant::from_millis(5),
+        DeviceTxBudget::default(),
+        &guard,
+    ) else {
+        panic!("device tx pass should complete");
+    };
+    assert_eq!(
+        tx.udp_packets, 1,
+        "the v6 datagram must reach the sink (attempted={}, busy={}, pending={}, failed={})",
+        tx.udp_attempted, tx.udp_busy, tx.udp_resolution_pending, tx.udp_failed
+    );
+
+    let frames = sink.accepted();
+    assert_eq!(frames.len(), 1);
+    let packet = &frames[0];
+    assert_eq!(packet[0] >> 4, 6, "must be an IPv6 packet");
+    assert_eq!(
+        &packet[8..24],
+        &LOCAL_IP6.octets(),
+        "source must be the interface address, not ::1"
+    );
+    assert_eq!(&packet[24..40], &REMOTE_IP6.octets(), "destination");
+}

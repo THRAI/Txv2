@@ -447,10 +447,16 @@ pcap 必须看到 **src = `fec0::15`(不是 `::1`)** 的 v6 UDP 包及其应答�
 
 | 阶段 | 验收命令 | 期望 |
 |---|---|---|
-| V5-1 | `.v6work/probe-v6.sh`(guest 先 `ip -6 addr add fec0::15/64 dev eth0`) | `V6:udp6:[out=UDPOK-V6:...]`;pcap 有 `fec0::15.<port> > fec0::2.<port>: UDP` **且源不是 `::1`**;`nslookup example.com fec0::3` 解析成功 |
+| V5-1 | `.v6work/probe-v6.sh`(guest 先 `ip -6 addr add fec0::15/64 dev eth0`) | `V6:udp6:[out=UDPOK-V6:...]`;pcap 有 `fec0::15.<port> > fec0::2.<port>: UDP` **且源不是 `::1`**;v6 DNS 查询以正确源上线(见下方修正) |
 | V5-2 | 同上但**删掉** guest 脚本里所有 `ip -6` 命令 | `/proc/net/if_inet6` 含 eth0 行;`ping6 fec0::2` 3/3;`wget http://[fec0::2]:P/` 得 200;`nc -u fec0::2` echo 通 |
 | V5-3 | 新增 host 单测 + 双前缀真机 | 源地址跟随 FIB `preferred_src` |
 | V5-4 | `cargo test -p tx-subsystems --lib` | 新测试全绿;把新增测试名加进基线文件 |
+
+> **验收标准修正(V5-1 落地时实测)**:上表 V5-1 原写的"`nslookup example.com fec0::3` 解析成功"
+> **在本环境不可达**,已改判。内核侧完全正确——pcap 显示 NS/NA 解析 `fec0::3` 后,A 与 AAAA 查询
+> 都以 `src=fec0::15` 正常上线;但 **slirp 回的是 ICMPv6 `destination unreachable, unreachable route fec0::3`**
+> (来自 `fe80::2`)。原因是宿主 `/etc/resolv.conf` 只有 v4 nameserver(`127.0.0.53`),libslirp 没有
+> v6 上游可转发。**所以 v6 DNS 的验收标准 = "查询以正确源地址上线并被 slirp 应答"**,而不是"解析成功"。
 
 ### 环境注意(全部踩过)
 
