@@ -57,6 +57,7 @@
     net::tests::external_connect_tests::process_tcp_event_active_client_segment_promotes_to_connected
     net::tests::external_connect_tests::refused_udp_datagram_is_requeued_for_the_next_pass
     net::tests::external_connect_tests::sequential_connects_use_distinct_isns
+    net::tests::external_connect_tests::user_added_ipv6_address_displaces_the_boot_seeded_primary
     net::tests::icmp_tests::loopback_iface_echo_request_becomes_echo_reply
     net::tests::icmp_tests::raw_icmp_send_accepts_busybox_pattern_echo_code
     net::tests::icmp_tests::raw_icmpv4_echo_still_replies_after_local_addr_change_churn
@@ -171,6 +172,7 @@
     net::tests::rtnetlink_tests::rtnetlink_getlink_dump_reports_loopback_and_done
     net::tests::rtnetlink_tests::rtnetlink_getlink_single_by_name_reports_requested_link
     net::tests::rtnetlink_tests::rtnetlink_getroute_and_getneigh_dump_configured_namespace_iface
+    net::tests::rtnetlink_tests::rtnetlink_ipv6_addr_add_demotes_then_del_promotes_back
     net::tests::rtnetlink_tests::rtnetlink_ipv6_newaddr_getaddr_and_deladdr_mutate_namespace_snapshot
     net::tests::rtnetlink_tests::rtnetlink_newaddr_and_deladdr_support_loopback_alias
     net::tests::rtnetlink_tests::rtnetlink_newlink_dummy_and_setlink_mtu

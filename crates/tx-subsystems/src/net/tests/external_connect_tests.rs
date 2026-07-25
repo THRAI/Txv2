@@ -781,3 +781,94 @@ fn external_udp6_sendto_uses_the_interface_source_address() {
     );
     assert_eq!(&packet[24..40], &REMOTE_IP6.octets(), "destination");
 }
+
+/// V5-2 follow-up regression: the boot seed occupies the primary v6 slot, so an
+/// explicitly configured address must DISPLACE it rather than land in the
+/// unroutable secondary list. Before the newest-wins change this asserted
+/// `None` in practice — `route6_snapshot` only emits connected routes for the
+/// primary, so a secondary could be bound but never sourced or routed.
+#[test]
+fn user_added_ipv6_address_displaces_the_boot_seeded_primary() {
+    let _lock = setup();
+    let _registration = attach_dual_stack_device(90);
+    let namespace = crate::net::initial_net_namespace_payload();
+    let ifindex = namespace
+        .link_snapshot()
+        .iter()
+        .find(|link| link.name == "virtio-net-test")
+        .expect("virtio test link")
+        .ifindex;
+
+    // LOCAL_IP6 (fec0::15/64) stands in for the boot seed here.
+    let configured = Ipv6Address::new([
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x15,
+    ]);
+    let peer = Ipv6Address::new([
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+    ]);
+    assert_eq!(
+        namespace.preferred_ipv6_source(peer),
+        None,
+        "sanity: nothing routes to the new prefix before it is configured"
+    );
+
+    namespace
+        .add_device_ipv6_addr_by_ifindex(
+            NetAdminAuthority::for_test_or_bootstrap(),
+            ifindex,
+            configured,
+            64,
+        )
+        .expect("ip -6 addr add");
+
+    assert_eq!(
+        namespace.preferred_ipv6_source(peer),
+        Some(configured),
+        "the configured address must be routable, not a stored-but-unusable secondary"
+    );
+    assert_eq!(
+        namespace
+            .link_snapshot()
+            .iter()
+            .find(|link| link.name == "virtio-net-test")
+            .and_then(|link| link.ipv6_addr),
+        Some(configured),
+        "the configured address must hold the primary slot"
+    );
+    // The displaced address is demoted, not dropped: still owned (bindable),
+    // just no longer the routable one.
+    assert!(
+        namespace.owns_ipv6_addr(LOCAL_IP6),
+        "the displaced boot address must survive as a secondary"
+    );
+    assert_eq!(
+        namespace.preferred_ipv6_source(LOCAL_IP6),
+        None,
+        "documented limitation: a secondary has no connected route (P5 debt)"
+    );
+
+    // Symmetric half: deleting the primary must hand the slot back to a
+    // secondary, not leave the link with no usable v6 address at all.
+    assert_eq!(
+        namespace.del_device_ipv6_addr_by_ifindex(
+            NetAdminAuthority::for_test_or_bootstrap(),
+            ifindex,
+            configured,
+        ),
+        Ok(true)
+    );
+    assert_eq!(
+        namespace
+            .link_snapshot()
+            .iter()
+            .find(|link| link.name == "virtio-net-test")
+            .and_then(|link| link.ipv6_addr),
+        Some(LOCAL_IP6),
+        "the demoted address must be promoted back when the primary goes away"
+    );
+    assert_eq!(
+        namespace.preferred_ipv6_source(LOCAL_IP6),
+        Some(LOCAL_IP6),
+        "and it must be routable again"
+    );
+}

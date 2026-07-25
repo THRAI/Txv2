@@ -1663,8 +1663,24 @@ impl NetNamespacePayload {
         out
     }
 
-    /// Add an IPv6 address to a link; the first becomes the primary, further
-    /// distinct addresses become secondaries.
+    /// Add an IPv6 address to a link. The NEWEST address takes the primary
+    /// slot; any address it displaces is demoted to a secondary.
+    ///
+    /// **Why newest-wins and not first-wins.** Only the primary is routable:
+    /// `route6_snapshot` synthesises connected routes from `link.ipv6_addr`
+    /// alone, and `IfaceCommon` carries exactly one v6 address for
+    /// `decide_ipv6_route`'s on-link test. A secondary is therefore *stored but
+    /// unusable* — a silent black hole. That was tolerable while nothing
+    /// occupied the primary slot at boot (the user's first `ip -6 addr add`
+    /// became primary and worked), but the V5-2 boot seed now holds it, so
+    /// first-wins would make **every** explicitly configured address unroutable.
+    ///
+    /// Newest-wins dominates the old behaviour in every case: one address
+    /// behaves identically, and with several the most recently configured one
+    /// works where previously only the first did. It is still a deviation from
+    /// Linux, which routes all of them — carrying every on-link prefix into
+    /// `IfaceCommon` (and emitting connected routes for secondaries) is the
+    /// real fix and is recorded as P5 debt.
     pub fn add_device_ipv6_addr_by_ifindex(
         &self,
         authority: NetAdminAuthority,
@@ -1690,19 +1706,35 @@ impl NetNamespacePayload {
                 Some(prefix_len),
             );
         }
+        // Demote the address currently holding the primary slot, then install
+        // the new one there (see the newest-wins rationale above). Read the
+        // displaced prefix length BEFORE the overwrite, and do the fallible
+        // primary update BEFORE touching `extras`, so a failure cannot leave the
+        // link with the old primary demoted and nothing promoted.
+        let displaced = primary.map(|addr| {
+            (
+                addr,
+                self.ipv6_prefix_len_for_device(registration).unwrap_or(64),
+            )
+        });
+        self.set_device_ipv6_addr_by_ifindex(authority, ifindex, Some(addr), Some(prefix_len))?;
         {
             let mut extras = self.ipv6_extra_addrs.lock();
-            if let Some(extra) = extras
-                .iter_mut()
-                .find(|extra| extra.devt == registration.devt && extra.addr == addr)
-            {
-                extra.prefix_len = prefix_len;
-            } else {
-                extras.push(ExtraIpv6Addr {
-                    devt: registration.devt,
-                    addr,
-                    prefix_len,
-                });
+            // Whatever we are promoting must not linger as a secondary too.
+            extras.retain(|extra| !(extra.devt == registration.devt && extra.addr == addr));
+            if let Some((old_addr, old_prefix_len)) = displaced {
+                if let Some(extra) = extras
+                    .iter_mut()
+                    .find(|extra| extra.devt == registration.devt && extra.addr == old_addr)
+                {
+                    extra.prefix_len = old_prefix_len;
+                } else {
+                    extras.push(ExtraIpv6Addr {
+                        devt: registration.devt,
+                        addr: old_addr,
+                        prefix_len: old_prefix_len,
+                    });
+                }
             }
         }
         self.invalidate_link_snapshot_cache();
@@ -1741,7 +1773,31 @@ impl NetNamespacePayload {
             }
         }
         if self.ipv6_for_device(registration) == Some(addr) {
-            self.set_device_ipv6_addr_by_ifindex(authority, ifindex, None, None)?;
+            // Symmetric counterpart of the newest-wins promotion in
+            // `add_device_ipv6_addr_by_ifindex`: hand the routable primary slot
+            // to the most recently demoted secondary instead of leaving the
+            // link with no usable v6 address at all. Without this, deleting one
+            // of two configured addresses kills v6 on the link entirely even
+            // though another address is still configured.
+            let promoted = {
+                let mut extras = self.ipv6_extra_addrs.lock();
+                extras
+                    .iter()
+                    .rposition(|extra| extra.devt == registration.devt)
+                    .map(|index| {
+                        let extra = extras.remove(index);
+                        (extra.addr, extra.prefix_len)
+                    })
+            };
+            match promoted {
+                Some((next_addr, next_prefix_len)) => self.set_device_ipv6_addr_by_ifindex(
+                    authority,
+                    ifindex,
+                    Some(next_addr),
+                    Some(next_prefix_len),
+                )?,
+                None => self.set_device_ipv6_addr_by_ifindex(authority, ifindex, None, None)?,
+            }
             return Ok(true);
         }
         Ok(false)

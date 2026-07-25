@@ -1,3 +1,47 @@
+- 2026-07-25 (**net 抽样对账 + V5-2 回归修复:v6 地址槽位 newest-wins**). ① **netperf/iperf 全绿**:rv64 四条
+  lane(netperf-musl 5.0/5、netperf-glibc 5.0/5、iperf-musl 6.0/6、iperf-glibc 6.0/6 = **22/22**,已是天花板
+  故未跑基线对照)。**两个 harness 坑**(已入 memory):**`tx.oscomp=<suite>` 不是选择器**——只有
+  `tx.oscomp.groups=<suite>` 是,写错会静默启动整个默认组列表而 judge **照样打印一个像样的分数**(实测先
+  14/102 再 414/449,netperf 一次没跑);且 `cargo xtask oscomp test` 无法注入 `tx.oscomp.observe=0`,两坑
+  同时中。自研驱动 `.v6work/suite-run.sh` 两个都规避 + **始终 boot 镜像副本**。⚠️ **副作用需用户裁决**:第一次
+  用 `oscomp test` 时它把 QEMU 直接挂到共享的 `target/oscomp/testdata/sdcard-rv.img`(可写),observe-dump 的
+  mid-suite `system_off` 把该 4GB 镜像的 ext4 **block bitmap checksum 弄不一致**(`debugfs` 拒绝打开;对照
+  从未被启动的 `sdcard-la.img` 干净)。功能上仍可用(所有跑分都从副本启动、全满分),`e2fsck -fy` 可修,
+  **但那是用户的派生件,未擅自改**。② **LTP net 抽样对账**(rv.musl,HEAD `0fbe0733` vs 基线 `2c5fe37b`,
+  同一 harness `tools/ltp-runtest-witness.sh` + `KERNEL_DIR` 换核,判据=verdict **集合差**而非 judge 分——
+  官方 shell 形态会把整个模块塌成单个 0/1 项):`net.ipv6_lib` **35 verdict 逐字一致**(judge 42/42==42/42:
+  in6_01 5/5、in6_02 3/3、getaddrinfo_01 22/22、asapi_02 12/12);`net.ipv6` 计数三项全等(40/37/2)但
+  **`ipneigh6_ip` 失败形态退化**——基线"条目在表里、删除失败"→ HEAD"条目根本没进表"。③ **这条退化独立印证了
+  V5-2 的一个真回归**:V5-2 的 boot seed 占住**唯一可路由的 primary v6 槽**,用户/LTP 的
+  `ip -6 addr add fd00:1:1:1::2/64` 落成 secondary,而 `route6_snapshot`(只从 primary 合成连接路由)与
+  `IfaceCommon`(只带一个 v6 地址给 `same_ipv6_prefix`)都不看 secondary ⇒ **存得下但发不出的黑洞** ⇒
+  `decide_ipv6_route` 判 Unreachable ⇒ **NS 压根不发** ⇒ NDISC 学不到邻居。主机探针实证(修复前):
+  `preferred_ipv6_source(peer)=None`、`route6_snapshot_len=1`。V5-2 之前 eth0 无 v6 地址,用户的**第一个**
+  add 会成 primary → 能用,所以这是 V5-2 引入的。**修法**:`add_device_ipv6_addr_by_ifindex` 改 **newest-wins**
+  (新地址占 primary、被顶掉的降 secondary)+ `del_device_ipv6_addr_by_ifindex` 对称地在删 primary 时**提升
+  最近降级的 secondary**(否则"两个地址删一个"会让整条链路 v6 全死)。选 newest-wins 的理由:它在**每种情况下
+  都不比 V5-2 之前差**(单地址完全相同,多地址时"最近配置的能用"严格好过"只有第一个能用");仍偏离 Linux
+  (Linux 路由全部地址),真修法(`route6_snapshot` 覆盖 extras + `IfaceCommon` 带全部 on-link 前缀)记 P5。
+  ④ **v4 侧是同构先天缺口,有意不动**:`add_device_ipv4_addr_by_ifindex` 同样 first-wins、`route_snapshot`
+  同样不看 `ipv4_extra_addrs` ⇒ 这解释了 `net.tcp_cmds` 的 `ipneigh01: ARP entry '10.0.0.1' not listed`
+  (基线同样失败)。**不顺手改 v4**:boot seed 是 `10.0.2.15/24` 而 LTP 会 add `10.0.0.2/24`,v4 若也
+  newest-wins,guest 会在 LTP net 跑的过程中丢掉 10.0.2.15 身份 ⇒ 网关 10.0.2.2 变 off-prefix ⇒ 外部 v4
+  (含 DNS)当场断;v4 是承重路径,不为对称性动它。**验证**:rv64/la64 build 零新增 warning;
+  `tx-subsystems --lib` 集合差 = **+4 恰为本轮新增的 4 个回归测试**(V5-1 的两个 + 本次
+  `user_added_ipv6_address_displaces_the_boot_seeded_primary` 与
+  `rtnetlink_ipv6_addr_add_demotes_then_del_promotes_back`)、**0 既有翻转**;两个受影响模块隔离全绿
+  (rtnetlink 25/25、external_connect 8/8)。**修复后内核复验(全绿)**:① LTP `net.ipv6` verdict 集合与基线
+  **逐字一致(IDENTICAL,TPASS 39)**——退化的 `ipneigh6_ip` 已回到基线形态;② 真机三阶段
+  A 零配置 `fec0::15` + 外部 v6 TCP/UDP 通 → B `ip -6 addr add 2001:db8:1::15/64` 顶替为 primary(此时 fec0::2
+  off-link 不可达=**正确行为**,无默认路由)→ C `del` 后 **`fec0::15` 提升回来、外部 v6 TCP/UDP 双双恢复**;
+  ③ `verify-git-net.sh` **8/8**。文档 `IPV6_EXTERNAL_DATAPLANE_v1.md` §10 记录全部(含 §10.5 验收表)。
+  **⚠️ 两个自己踩的方法学坑(已记 §10.6 + memory)**:(a) **`cargo test` 不重建内核 ELF** ——
+  改完源码只跑单测就去 QEMU 验 = 验的是旧内核(ELF 13:42 建 / 源码 13:47 改),白跑两轮 QEMU,还一度把它误判成
+  "修复无效"甚至"LTP net.ipv6 挂死"(重建后 **不复现**,0 行 cut-spam);**QEMU 验证前必须 `stat` 比 ELF 与源码
+  mtime**。(b) **单测要打真实入口** —— 第一版只调 `add_device_ipv6_addr_by_ifindex`,而 guest 走 rtnetlink
+  消息层,补了经 `rtnetlink_handle_request` 的版本才算真覆盖。**Next**:无必须项;可选=la64 lane 的 net 抽样、
+  net.features/net.multicast 扩样、P5 的多地址可路由化。**Blocker**:`target/oscomp/testdata/sdcard-rv.img`
+  的 ext4 bitmap 需用户裁决是否 `e2fsck -fy`(功能仍可用,所有跑分都从副本启动)。
 - 2026-07-25 (**V5-2 + V5-3:IPv6 开机即用 + v6 源选择接 FIB**). V5-2:此内核无 RA/SLAAC/DHCPv6、也不
   生成 link-local,`eth0` 开机**没有任何 v6 地址**,整条(已经能用的)外部 v6 数据面要人手打
   `ip -6 addr add` 才活。修复=`init/net.rs` 的 `publish_boot_net_device_to_namespace` 里,紧挨 v4 的

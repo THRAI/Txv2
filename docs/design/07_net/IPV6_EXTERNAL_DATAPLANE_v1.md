@@ -546,9 +546,10 @@ musl/glibc 的 `getaddrinfo` 在做 RFC 6724 目的地址排序时,会对每个�
 |---|---|
 | Phase 0 调研 | ✅ 本文;方案已审阅通过(2026-07-25) |
 | V5-1 外部 v6 UDP | ✅ 落地 `1ab2b8c8`(含 V5-4 的回归测试) |
-| V5-2 v6 开机自动配置 | ✅ 落地(不含 `::/0`,见偏离 1) |
+| V5-2 v6 开机自动配置 | ✅ 落地(不含 `::/0`,见偏离 1);**后续修复见 §10** |
 | V5-3 v6 源选择接 FIB | ✅ 落地(与 V5-2 同批,见偏离 2) |
 | V5-4 回归覆盖 | ✅ 已随 V5-1 提交 |
+| V5-2 后续:v6 地址槽位 newest-wins | ✅ 落地(§10) |
 
 **现在开箱即用的 IPv6 能力**(guest 零手工配置):`/proc/net/if_inet6` 有 eth0、
 `ping6 fec0::2` 3/3、外部 v6 TCP(HTTP 200)、外部 v6 UDP(echo 往返,源地址正确)、
@@ -556,3 +557,83 @@ off-link v6 经 `ip -6 route add default via ...`(V3b)。
 
 **仍然没有的**(有意留下,见 §3 末尾):RA/SLAAC/link-local/DHCPv6、v6-only 网卡、
 v6 分片/转发、`ip -6 neigh` 投影、`/proc/net/{tcp,udp,tcp6,udp6}`、双 iface 合并。
+
+---
+
+## 10. V5-2 后续修复:v6 地址槽位 newest-wins(2026-07-25)
+
+### 10.1 V5-2 引入的回归(已修)
+
+**病症**:V5-2 的 boot seed 占住了**唯一可路由的 primary v6 槽**,于是用户/测试脚本
+`ip -6 addr add <另一个地址>` 落进 `ipv6_extra_addrs`(secondary)——而 secondary 是个
+**存得下但发不出的黑洞**:
+
+- `route6_snapshot`(`namespace.rs:1138`)只从 `link.ipv6_addr`(primary)合成连接路由;
+- `IfaceCommon` 只带**一个** v6 地址给 `decide_ipv6_route` 的 on-link 判断(`same_ipv6_prefix`)。
+
+主机探针(V5-2 后、修复前):
+
+```
+primary             = fec0::15      ← boot seed 占着
+best_route(peer)    = None
+preferred_src(peer) = None          ← 用户配的地址完全不可用
+route6_snapshot_len = 1
+```
+
+V5-2 之前 eth0 没有 v6 地址,用户的**第一个** `ip -6 addr add` 会成为 primary → 能用。
+V5-2 把这条路堵了 ⇒ 真回归。
+
+**LTP 独立印证**(§10.3 的对账):`net.ipv6` 的 `ipneigh6_ip` 用例失败形态从
+"条目在表里、删除失败"退化成"条目根本没进表"——因为 LTP 的 `fd00:1:1:1::2/64` 变成
+secondary 后 `decide_ipv6_route` 判 Unreachable,**NS 压根不发**,NDISC 学不到邻居。
+
+### 10.2 修法:newest-wins + 删除时提升
+
+- `add_device_ipv6_addr_by_ifindex`:**新地址占 primary,被顶掉的降为 secondary**。
+- `del_device_ipv6_addr_by_ifindex`:对称地在删掉 primary 时**把最近降级的 secondary 提回来**,
+  否则"两个地址删掉一个"会让整条链路的 v6 直接死掉。
+
+**为什么是 newest-wins**:它在**每种情况下都不比 V5-2 之前差**——单地址行为完全相同;
+多地址时"最近配置的能用"严格好过"只有第一个能用"。这仍**偏离 Linux**(Linux 路由全部地址),
+真修法见 §10.4 的债。
+
+### 10.3 v4 侧是同构的先天缺口(不在本次范围)
+
+`add_device_ipv4_addr_by_ifindex` 是**同样的 first-wins**,`route_snapshot` 也**不看**
+`ipv4_extra_addrs` ⇒ v4 secondary 同样不可路由。这解释了 `net.tcp_cmds` 里
+`ipneigh01: ARP entry '10.0.0.1' not listed`(LTP 的 `10.0.0.2/24` 落成 v4 secondary),
+且**基线同样失败**、与本次改动无关。
+
+**没有顺手把 v4 也改成 newest-wins**,而且是有意的:boot seed 是 `10.0.2.15/24`,LTP 会
+`ip addr add 10.0.0.2/24`;若 v4 也 newest-wins,guest 会在 LTP net 跑的过程中丢掉
+`10.0.2.15` 身份 ⇒ slirp 网关 `10.0.2.2` 变成 off-prefix ⇒ **外部 v4(含 DNS)当场断**。
+v4 是承重路径(git/netperf/绝大多数 LTP),不为对称性去动它。
+
+### 10.4 记入 P5 的真修法
+
+让 secondary 也可路由,需要两件一起做:
+1. `route6_snapshot` 为 `ipv6_extra_addrs` 也合成连接路由;
+2. `IfaceCommon` 携带**全部** on-link v6 前缀(小定长数组),`same_ipv6_prefix` 逐个比,
+   并把它纳入 `ensure_ether_iface_for_link` 的缓存键。
+
+做完 v4 应当同样处理(§10.3),那时 `ipneigh01_arp` / `ipneigh6_ip` 有望一起转绿。
+
+### 10.5 验收(真机三阶段)
+
+| 阶段 | `/proc/net/if_inet6` 的 eth0 | 外部 v6 TCP | 外部 v6 UDP |
+|---|---|---|---|
+| A 零配置(仅 V5-2 boot seed) | `fec0::15` | ✅ `HTTPOK-V6-/A` | ✅ `UDPOK-V6:P6A` |
+| B `ip -6 addr add 2001:db8:1::15/64` | `2001:db8:1::15`(顶替,`ip -6 route` 随之切到新前缀) | 预期不可达 | 预期不可达 |
+| C `ip -6 addr del ...` | **`fec0::15` 提升回来** | ✅ `HTTPOK-V6-/C` | ✅ `UDPOK-V6:P6C` |
+
+B 阶段"不可达"是**正确行为**而非缺陷:`fec0::2` 相对新前缀是 off-link 且没有默认路由(§3 V5-2 偏离 1)。
+v4 对照全程 `HTTPOK-V4-/v4`。
+
+### 10.6 两个自己踩的方法学坑(记下来免得再犯)
+
+1. **`cargo test` 不重建内核 ELF。** 改完源码只跑单测就去 QEMU 验证 = **验的是旧内核**;
+   第一轮 C 阶段"提升没生效"正是如此(ELF 建于 13:42、源码改于 13:47),白跑两轮 QEMU。
+   **每次 QEMU 验证前 `stat` 比一下 ELF 与源文件的 mtime**;`cp` 出去的提交件同理会固化旧 ELF。
+2. **单测要打真实入口。** 第一版回归测试直接调 `add_device_ipv6_addr_by_ifindex`,而 guest 走的是
+   rtnetlink 消息层;补了 `rtnetlink_tests.rs` 里经 `rtnetlink_handle_request` 的版本后才算真覆盖
+   (两个入口都测)。
