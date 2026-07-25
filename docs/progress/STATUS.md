@@ -1,3 +1,605 @@
+- 2026-07-25 (dirty workspace staged commit cleanup).
+  Summarized and landed the large shared-worktree dirty state as reviewable
+  staged commits on `codex/test-remote-network`: agent/test workspace
+  constraints, HAL/time/vDSO foundations, substrate publication/deadline wake,
+  boot exec plus VFS/IO paths, async device/network syscall surfaces, and
+  xtask/guest-test tooling. Verification during cleanup: `git diff --check`
+  passed before committing and `git diff --cached --check` passed for each
+  staged commit after fixing Markdown whitespace in two research notes. Next:
+  run the feasible aggregate checks from the new clean staged boundary, then
+  decide whether local-only config/index artifacts should be ignored or kept
+  outside Git. Blockers: no broad build/unit proof has been run yet after the
+  commits; the branch is still far ahead of and behind `origin/main`, so these
+  commits are cleanup checkpoints rather than integration-ready history.
+
+- 2026-07-25 (identity RCU detailed staged landing contract).
+  Expanded the approved identity RCU migration into phases P0-P12 with one
+  valid intermediate repository state per phase. The contract now separates
+  baseline capture, active ratchets, unused substrate primitive, primitive race
+  closure, `ThreadIdentity.payload`, per-hart userspace owner/ticket,
+  `ProcessIdentity.payload`, `Frame.vm`, one-Guard resolution, borrowed direct
+  dispatch, compatibility-path removal, SMP/performance proof, and optional
+  measured follow-ups. Thread payload and per-hart ownership are separate
+  review/rollback units even though they share Task 3 files. Every phase names
+  its input state, sole authoritative storage, dynamic reader-lock budget,
+  retained writer/lifecycle owner, hard exit gate, and rollback boundary. The
+  machine plan now mirrors that split and adds P0 baseline artifacts before
+  contracts or code. Lock targets remain owner `1 -> 0`, thread payload
+  `8 -> 0`, process payload `47 -> 0`, VM expressions `21 -> 0`, and composed
+  resolver `5 -> 0`; the four per-hart tables still retain `256 -> 256`
+  physical writer mutexes in the first landing. No Rust source changed and no
+  implementation/runtime test was run. Verification: `cargo xtask lint docs`
+  passed with the 7 existing retired-vocabulary discussion warnings; `cargo
+  xtask progress validate` passed for 37 records; JSON parse, unique-step and
+  dependency-closure checks passed; Markdown fence, placeholder, and scoped
+  whitespace checks passed. Next: execute P0 and capture the fresh callsite,
+  layout, counter, and guest-rustc-readiness baseline; then P1 lands active
+  contracts and failing production ratchets. Blockers: Rust implementation has
+  not started, guest rustc fixture readiness remains a P11 macro-measurement
+  gate, and staging/commit remain unauthorized in the dirty shared checkout.
+  See `docs/superpowers/plans/2026-07-25-identity-rcu-slot-migration.md` and
+  `docs/progress/plans/2026-07-25-identity-rcu-slot-migration.json`.
+
+- 2026-07-25 (identity RCU callsite budget and phase-gate refinement).
+  Fixed the first landing as owner-private
+  `PublishedBinding<T, Cap<T>/PayloadCap<T>>` over the existing Zone physical
+  slot: a guarded reader performs an Acquire root load plus Live metadata
+  validation, while a short writer lock owns evidence and publishes replace or
+  withdrawal with an AcqRel pointer swap. The specification freezes the
+  root-first 24-byte 64-bit layout, no-allocation/no-`RcuHead` rule, exact
+  reader/writer algorithms, and type layering. The refined identity shape
+  publishes one current userspace `ThreadIdentity` per hart, reaches
+  `ThreadPayload`, `ProcessPayload`, and `AddressSpace` through identity-owned
+  bindings under one Guard, and rejects a separately published thread/payload
+  pair. The old identity table becomes the single `CURRENT_USERSPACE_OWNER`
+  root. Timer IRQ retains its strong payload anchor because IRQ context cannot
+  create a Guard; poll-scoped current tables remain outside the first RCU
+  patch. `ThreadPayload` uses an atomic active-hart marker for lock-free direct
+  validation and keeps the exact request token behind a writer/IRQ lock; the
+  combined cell is explicitly ratcheted to 32 bytes on current 64-bit targets.
+  A userspace owner ticket records entry hart, request revision, and keys so
+  same-thread stale cleanup and different-thread hart takeover are both
+  rejected. Timer-preempt re-entry closes the old ticket before publishing a
+  new request even when it returns to the same hart. The broader lock audit
+  ranks PageContainer resident, cwd, fd, and dentry read
+  roots after identity, while retaining RangeLock, PTE/shootdown, PageSlot,
+  I/O completion, futex, pipe, and protocol state locks. No Rust source changed
+  and no runtime benchmark was run. The implementation plan now freezes the
+  audited production baselines and phase gates: current-owner 1 reader,
+  `ThreadIdentity.payload` 8 readers + 1 writer,
+  `ProcessIdentity.payload` 47 readers + 41 writer/lifecycle/topology points =
+  88, external `payload_slot()` 9 sites, and VM 20 reader locations / 21 reader
+  expressions + 1 construction + 2 production swaps. Success means dynamic
+  reader-lock removal, not physical mutex deletion: owner `1 -> 0`, thread
+  payload `8 -> 0`, process payload `47 -> 0`, VM expressions `21 -> 0`, and
+  the composed process/VM facade `2 -> 0`; binding writer mutexes and named
+  lifecycle/exec/topology coordination remain. Every phase now names its
+  replacement primitive, retained writer owner, and hard blocker, and any
+  fresh inventory mismatch stops mechanical migration. Verification: `jq
+  empty` passed; the scoped placeholder scan found no matches; scoped `git
+  diff --check` passed; `cargo xtask lint docs` passed with the 7 existing
+  stale-vocabulary discussion warnings; `cargo xtask progress validate` passed
+  for 37 records. Next: Task 0 lands active `txdoc:` contracts and exact failing
+  count ratchets, then Task 1 implements `PublishedBinding` and Task 3 pilots
+  `ThreadIdentity.payload` plus `CURRENT_USERSPACE_OWNER`. Blockers: no design
+  blocker for Task 0/1; guest rustc workload readiness remains a later Task 9
+  measurement blocker, and staging/commit remain unauthorized in the dirty
+  shared checkout. See
+  `docs/superpowers/specs/2026-07-25-identity-rcu-slot-design.md`,
+  `docs/superpowers/plans/2026-07-25-identity-rcu-slot-migration.md`, and
+  `docs/progress/plans/2026-07-25-identity-rcu-slot-migration.json`; lock
+  classification evidence is in
+  `docs/progress/research/2026-07-25-kernel-lock-rcu-candidate-audit.md`.
+
+- 2026-07-25 (Zone/Cap backend simplification audit).
+  The current dirty worktree already has lock-free fixed-depth SlotKey
+  resolution, so identity RCU should remove reader operations rather than add
+  another key cache. The chosen pilot shape is owner-private pointer-published
+  single bindings and one caller-owned Guard across the full identity chain;
+  pure synchronous direct arms retain nothing, while a real
+  yield/storage/fanout boundary performs the terminal retain. Remaining
+  backend candidates are a fused
+  one-load `Weak::upgrade`, removal of duplicate typed resolver checks, and a
+  measured pointer-backed `Cap` experiment after the pilot; raw key zero,
+  exact retain accounting, Weak generation, and upper Cap semantics remain
+  unchanged. Verification: Zone integration tests pass 17/17 and scoped diff
+  checking is clean. No runtime source changed and no fresh benchmark was run.
+  Next: specify and implement `PublishedBinding<T>`, then migrate the direct
+  trap thread -> process -> payload -> address-space chain. See
+  `docs/progress/research/2026-07-25-zone-cap-backend-simplification-audit.md`.
+
+- 2026-07-25 (ext4 Linux compatibility profiles and canonical plan refresh).
+  Kept ext4 as a Tx-native mounted kernel filesystem and rejected a userspace
+  daemon/private ext4 service as the primary path. The active plan now uses
+  Linux ext4, e2fsprogs and xfstests as authorities, with a pinned Tier 1
+  production profile followed by Tier 2 mainstream-Linux closure; rsext4 is an
+  algorithm reference only. Updated `TX_EXT4_PLAN_v1_2.md`, the existing
+  implementation/JSON plans and the rsext4 inventory, and recorded the durable
+  decision in
+  `docs/progress/decisions/2026-07-25-ext4-linux-compatibility-profiles.md`.
+  Verification passed: `cargo xtask lint docs` (with the seven existing
+  stale-vocabulary warnings), `cargo xtask progress validate` (36 records) and
+  `git diff --check`. Next: implement the single Tier 1 feature-mask/fixture
+  manifest, then close publication-after-commit for the
+  SetAttr vertical slice. Blockers: direct pager and planner/runtime writes are
+  both reachable; Tier 1 feature admission and Tier 2 xfstests manifests are not
+  yet executable.
+
+- 2026-07-23 (full rsext4-to-Tx migration, SetAttr admission slice).
+  Rebased the migration branch onto the current ext4 JBD2/revoke baseline,
+  preserving its truncate, unlink, destroy-inode, replay and power-cut work.
+  P0 capability fixtures are in `ff5413f5`; the immutable contract is in
+  `6513e243`; `a46018c4` adds an explicit read-set field/CRC validator,
+  metadata-only SetAttr JBD2 admission, production mount wiring and a chmod
+  regression. Verification in the rebased worktree: `cargo test
+  -p tx-ext4-format` (30 tests), `cargo test -p tx-ext4 --no-default-features`
+  (39 unit + 17 integration tests), formatting and diff-check pass. Remaining
+  blockers are substantive: projection is published before commit completion,
+  so commit-error rollback is still missing; no guest
+  `/musl/libc.so chmod +x -> remount -> exec` witness exists. The TOCTOU window
+  was narrowed by `da96efef` (validation now runs after journal reservation),
+  and `b46c1a6f` makes exec reload live mount metadata instead of trusting a
+  stale RNode snapshot. Next: make SetAttr publication stateful through commit
+  completion, add the guest witness, and remove the tmpfs 8 MiB regular-file
+  backing ceiling that can independently block copying a loader. See
+  `docs/progress/research/2026-07-23-rsext4-capability-ledger.md`,
+  `docs/superpowers/plans/2026-07-23-rsext4-full-migration.md` and
+  `docs/progress/plans/2026-07-23-rsext4-full-migration.json`.
+
+- 2026-07-23 (OSComp libctest-musl test-init payload unblock).
+  Fixed the test-init wrapper's long payload execution path by writing the
+  kernel-provided OSComp command string to `/tmp/tx-test-payload.sh` before
+  invoking `/bin/sh`, avoiding the guest `/bin/sh -c <huge full libctest
+  command>` `Argument list too long` failure. The namespace-aware open/unlink
+  fix remains validated by the full run: static `pthread_cancel_points`,
+  `pthread_cancel`, `pthread_cancel_sem_wait`, and `pthread_exit_cancel` all
+  pass. Verification: `sh -n tools/test-init/tx-test-init.sh`; marker-only
+  `cargo xtask oscomp qemu --target rv64-qemu --data
+  target/oscomp/libctest-pthread-cancel-focus --submit target/oscomp/submit
+  --boot-suite libctest-musl --expect-marker '#### OS COMP TEST GROUP START
+  libctest-musl ####' --timeout-ms 60000`; bounded full `libctest-musl` QEMU
+  reached `#### OS COMP TEST GROUP END libctest-musl ####`; `cargo xtask
+  oscomp score --target rv64-qemu --input target/oscomp/os_serial_out_rv.txt
+  --data target/oscomp/libctest-pthread-cancel-focus --suite libctest-musl`
+  reports `109/220`; `cargo xtask fault-decode --target rv64-qemu --serial
+  target/oscomp/os_serial_out_rv.txt --all --brief` reports no trap lines
+  (exit 1 for no trap). Saved serial:
+  `target/oscomp/libctest-pthread-cancel-focus/libctest-musl-full-after-test-init-payload-file.txt`.
+  Remaining blockers: dynamic `entry-dynamic.exe` fails in this slim image with
+  missing loader/deps, and static `stat` still fails. No files were staged or
+  committed.
+
+- 2026-07-21 (reactor full-driver migration follow-up, excluding step-discipline).
+  Completed the registered RawQueue/RawPort task-mailbox bridge (including
+  shared producer source IDs and selective mailbox polling) and moved the RTC,
+  eventfd, userfaultfd, signalfd, and timerfd blocking read/write paths onto
+  central `drive()`. Timerfd keeps deadline reconciliation inside its local
+  `TimerfdReadOp`, before every re-poll, and retains the syscall's owner-aware
+  mailbox post. The new wrappers explicitly retain their ScriptCtx subject, so
+  the subject-context ratchet is 119/120 rather than regressing. Verification:
+  targeted driver regressions; userfaultfd/signalfd subsystem tests; timerfd
+  periodic re-arm and owner-post tests; `cargo check -p tx-shims`; docs lint;
+  formatting; and diff-check all pass. `syscall-adhoc-loop` is now 2 files / 28
+  sites and `no-adhoc-drive` is 3/4; the remaining AIO worker and user-copy
+  bridges are intentionally synchronous, while a stateful `io_getevents`
+  driver remains the next async candidate. Aggregate invariants fail only on
+  the explicitly excluded `step-discipline` (50/5). A follow-up made
+  `TimerfdReadOp` Send-safe by owning `DeadlineRegistrarHandle` across the
+  drive future and using a non-owning `P` phantom; `cargo -q xtask unit` now
+  passes (shims 638, kernel 114, ext4 31, scripts 166). No files were staged
+  or committed.
+
+- 2026-07-22 (reactor migration VFS open follow-up, excluding step-discipline).
+  Moved `openat(O_CREAT)`'s create-and-rewalk path into the stateful
+  `CreateThenWalkOp + drive()` script and migrated the `O_TMPFILE` branch's
+  directory walk, create, and open phases to full VFS drivers; only its final
+  namespace removal remains a terminal `UnlinkFromParentOp + drive_oneshot`.
+  The new `CreateInParentOp` intentionally has no one-shot marker because an
+  FsOps backend may yield while publishing an inode. Both paths retain the
+  original parent-cache invalidation and re-walk behavior. Verification:
+  targeted static regressions, `cargo check -p tx-subsystems -p tx-shims`, and
+  29 `dispatch_openat_` tests all pass; `syscall-adhoc-loop` is now 7 files /
+  49 sites (from 8 / 63 before this batch), while `syscall-no-await` remains
+  56 and `no-adhoc-drive` remains 3 sites. Next: model the remaining
+  `fs_basic` create/truncate policy as a stateful driver, then implement the
+  RawQueue-to-task-mailbox bridge before migrating RTC; eventfd/timerfd/
+  signalfd/userfaultfd require owner-aware full drivers. `step-discipline`
+  remains explicitly out of scope. No files were staged or committed.
+
+- 2026-07-21 (reactor migration one-shot VFS follow-up, excluding step-discipline).
+  Replaced `sys_chdir`'s manual namespace-walker `StepOutcome` match with
+  `WalkInMountNamespaceWithOriginOp + drive_oneshot`; the new VFS adapter
+  carries the origin mount and namespace by value, opens its fresh guard on
+  each step, and retains the enclosing ScriptCtx subject. `mkdirat` and
+  `symlinkat` now likewise use VFS-owned `MkdirOp` / `SymlinkOp` one-shot
+  adapters, while their syscall-owned DAC checks and cache invalidation stay
+  unchanged. New static invariant tests lock all three migrations. Verification:
+  targeted xtask regressions, chdir 3/3, mkdirat 3/3, symlinkat 2/2,
+  `cargo check -p tx-subsystems -p tx-shims`, and the alias-loop lint pass.
+  `syscall-adhoc-loop` is now 8 files / 79 sites (from 8 / 83 before this
+  sub-batch); `no-adhoc-drive` remains 3/4. Next: migrate the remaining
+  stateful fs_mut paths separately, then introduce the RawQueue-to-driver
+  mailbox bridge required by RTC and the owner-aware full drivers required by
+  eventfd/timerfd/signalfd/userfaultfd. `step-discipline` remains out of
+  scope. No files were staged or committed.
+
+- 2026-07-21 (reactor migration non-STEP follow-up).
+  Added VM-owned `ReserveUserRangeOp` and moved direct I/O, buffered
+  PageBacked read/write, and the synchronous PageBacked `writev` prefault
+  paths onto `drive_oneshot`; each preserves its existing `EFAULT` mapping
+  while making `Continue`/`Yield` a one-shot contract violation. The VM
+  adapter now exports the same one-shot vocabulary as the other subsystem
+  adapters, and the op explicitly retains the enclosing `ScriptCtx` subject.
+  Also restored `truncate(path)` write authorization through
+  `cred_checks::authorize_open`, with a non-privileged root-owned-0644
+  regression. Verification: three new `xtask` architecture regressions,
+  five VM prefault tests, targeted truncate tests, `cargo check -p tx-shims`,
+  `cargo -q xtask unit`, `cred-check`, docs lint, and progress validation all
+  pass; `syscall-adhoc-loop` is now 85 (from 91 at this batch's start).
+  Next: RTC read needs a driver bridge that can subscribe a task mailbox to
+  devfs's registered `RawQueue`; the current `drive()` mailbox path only
+  subscribes `WaitSource`, so a mechanical RTC StepOp conversion can lose its
+  wake. `step-discipline` remains explicitly out of scope. No files were
+  staged or committed.
+
+- 2026-07-21 (reactor invariant closeout, excluding step-discipline).
+  Finished the remaining non-STEP migration gates after the virtual-hart
+  setup and signal-delivery queue-promotion repair. Four new lower-half
+  StepOps now retain their enclosing ScriptCtx subject while their explicit
+  credentials or caller routes remain the authority inputs. The syscall await
+  ratchet now recognizes multiline `drive(...)`, named drive/script wrappers,
+  and explicit syscall forwarding as dispatch-to-script boundaries; it still
+  reports raw endpoint, POSIX MQ, wait4, and poll/select waits. The
+  `no-adhoc-drive` ratchet also now recognizes direct `return StepOutcome::*`
+  producer construction, while preserving its existing match-arm compatibility
+  rule; it is 3/4. Verification:
+  `cargo test -p tx-reactor`, `cargo -q xtask unit`,
+  `cargo check -p tx-subsystems -p tx-shims`, all targeted non-STEP invariant
+  gates, and `cargo xtask lint invariants all` (only `step-discipline` is
+  over: 50/5). `cargo xtask lint invariants subject-context` is 120/120 and
+  `syscall-no-await` is 57/60. Next: migrate the remaining raw await loops
+  and separately address the explicitly excluded STEP stage-comment debt. No
+  files were staged or committed.
+
+- 2026-07-21 (reactor host virtual-hart test setup).
+  Direct host `cargo test` now inherits `RUST_TEST_THREADS=1` from
+  `.cargo/config.toml`, matching the existing `xtask unit` and CI setup. This
+  prevents independent host `Reactor` simulations from concurrently claiming
+  the same virtual `HartId` while using the kernel's per-hart ambient polling
+  context. Verification: `cargo test -p tx-reactor --test reactor_smoke` passes
+  54/54 and `.cargo/config.toml` passes `git diff --check`. The complete raw
+  reactor test command remains blocked by the pre-existing dirty
+  `signal_delivery_hint_prioritizes_already_queued_userspace_task` scheduler
+  test: it requires an unimplemented queued-task priority promotion and is
+  outside this virtual-setup-only change. Next: decide that scheduler policy
+  separately; no reactor runtime semantics were changed.
+
+- 2026-07-20 (RCU path migration Tasks 8-9 complete; implementation plan closed).
+  `RecipeIndex` now privately publishes immutable roots through
+  `Published<RecipeTree>` without changing AddressSpace, fork, or VM error
+  language. The unused bus owner-storage callback surface and fixed-descriptor
+  `retire_raw` compatibility lane are removed; epoch summaries expose only bag
+  and publication counts. The raw-retire/API-language ratchet scans all 20
+  production roots, reports zero RCU violations, and has 53/53 tests. A new
+  RV64 `--smp 4` boot witness pins an AP task inside one real Guard while the BSP
+  rewrites a Recipe root, proves zero reclaim/drop before quiescence, receives a
+  real Maintenance IPI ACK, then completes both callback and destructor work
+  with budget-one drains. Required markers are now part of the smoke harness.
+  Verification passes: epoch 21/21, zone 17/17, publication 15/15, bus 24/24,
+  VM 176/176, `cargo -q xtask unit` (948 tests), docs lint, progress validate,
+  RV64 full-build, 30-second RV64 SMP smoke, rustfmt check, and diff-check.
+  Aggregate `cargo xtask lint invariants` remains red only on unrelated shared
+  dirty-tree ratchets: STEP comments, SUBJ ignored contexts, `sys_openat` cred
+  gating, the VFS `fd_ready` Guard field, notification-boundary, and
+  syscall-no-await; the RCU/API-language sub-gate passes. Next: PageContainer
+  resident-root migration may start under a new bounded plan. No files were
+  staged or committed.
+
+- 2026-07-20 (RCU path migration Task 7 complete).
+  Added backend-only `Published<T>`, `PublishReservation<'_, T>`, and
+  `PublishError`; no node, `RcuHead`, or bag type is exported. Nodes use checked
+  raw allocation with a first-field 16-byte RCU header, and `T: Send + 'static`
+  closes deferred lifetime and cross-CPU Drop safety. Reservation rollback is
+  allocation- and claim-safe. Commit holds one `LocalRetireGuard`, preflights
+  the current and one possible in-flight next epoch before the AcqRel root
+  swap, then performs only post-swap sampling and infallible linking. Grace
+  callbacks are O(1) and reuse the outer callback guard to enter an unbounded
+  per-CPU publication drop list. Maintenance detaches one node at a time and
+  drops outside local exclusion while preserving CPU pinning, nested retirement,
+  offline transfer, and destructor-unwind tail safety. Witnesses include two
+  allocation failures, writer serialization, Acquire visibility, reader/writer
+  overlap, exclusive Drop, 1088 deferred nodes, CPU offline transfer, and panic
+  recovery. Verification passes: publication 15/15, epoch 23/23, Zone 18/18,
+  doc compile-fail 2/2, substrate check, formatting/diff-check, and API-language
+  `404` with Recipe still the sole raw-RCU pilot. No files were staged or
+  committed. Next: Task 8, migrate `RecipeIndex` behind unchanged owner APIs.
+
+- 2026-07-20 (RCU path migration Task 6 complete).
+  Closed SMP membership, remote maintenance, and CPU-offline ownership. BSP/AP
+  admission and offline transitions share the epoch membership lock; membership
+  plus EBR pin count use one CAS-updated atomic word, and advance performs its
+  final version check plus epoch CAS under the short membership critical
+  section after a lock-free CPU scan. Ring reuse publishes one owner-local drain
+  request and sends `IpiKind::Maintenance`; RV64 and LA64 now demultiplex
+  per-CPU/per-kind pending and ACK state, including safe self-broadcast handling.
+  The trap path only ACKs and returns `Reschedule`; BSP/AP reactor loops consume
+  requests in normal context before polling. Offline waits outside the lock for
+  reader, retire, and pin quiescence, then failure-atomically transfers compat,
+  Zone, and generic intrusive bags. Witnesses cover BSP/AP races, version
+  restart, duplicate admission, request de-duplication, three generic and three
+  real Zone bag heads, compatibility transfer, and transfer rollback. Scoped
+  verification passes: epoch 23/23, AP init 4/4, Zone 18/18, RV64 board 93/93,
+  LA64 board 53/53, M1Dock 14/14, substrate check, formatting, and diff-check.
+  Two review rounds report no remaining P1/P2. RV64 full-build still stops in
+  the unrelated dirty `tx-reactor` tree at the known nine timer/task API errors.
+  No files were staged or committed. Next: Task 7, backend-only `Published<T>`.
+
+- 2026-07-19 (RCU path migration Task 5 complete).
+  Contracted Zone slots to `Free`, `Reserved`, `Live`, and `Retiring`. The
+  packed payload is retain count while Live and intrusive raw `SlotKey` while
+  Retiring; `has_next` preserves raw key zero and `generation_exhausted`
+  prevents ABA reuse. Final `Cap` Drop uses one `LocalRetireGuard` for the
+  compound CAS, post-barrier epoch sample, link, and infallible publication.
+  Epoch detaches Zone keys under local exclusion and invokes registry-owned
+  typed reclaim callbacks outside exclusion. Reclaim destroys `T`, publishes
+  Free with Release ordering, returns reusable slots, and quarantines max
+  generation slots. Whole slabs now embed a first-field private `RcuHead`; Keg
+  unpublishes and unlinks under the same retire guard before enqueue, while
+  frame release waits for the two-epoch grace callback. Zone production
+  `retire_raw` callsites are zero; bus compatibility and the Recipe pilot remain.
+  Added witnesses for four-state grace, guarded Weak observation, mixed-zone
+  dispatch, raw key zero, compatibility-pool saturation, generation quarantine,
+  and delayed slab-frame release. Two review passes found no P1/P2. Scoped
+  tests pass: Zone 18/18, epoch 19/19, bus 28/28, AP init 2/2. True SMP
+  clone/upgrade and stale-directory-reader races move to Task 6. No files were
+  staged or committed. Next: Task 6, remote maintenance, membership version,
+  and CPU-offline bag transfer.
+
+- 2026-07-19 (RCU path migration Task 4 complete).
+  Replaced the domain-wide retirement state with three tagged bags per CPU and
+  retained the fixed raw-node pool only as an explicit per-CPU compatibility
+  lane. Generic `RcuHead` enqueue is O(1), allocation-free, and now uses a
+  crate-private same-guard boundary: backends acquire one `LocalRetireGuard`,
+  establish their no-new-reader barrier, sample the epoch with an AcqRel RMW,
+  and enqueue without reacquiring the guard. Task 5 will wire the reserved Zone
+  head after slot metadata gains `Retiring(next)`. Bounded drain checks exactly
+  three bag heads plus at most its node budget, preserves every remainder, and
+  reopens local IRQ admission/clears `retire_active` around synchronous reclaim
+  callbacks while retaining the no-yield CPU-affinity witness. Detached heads
+  remain self-marked through callback execution, blocking duplicate recursive
+  enqueue. Remote advance and summary paths no longer dereference another CPU's
+  `UnsafeCell`; owner CPUs publish atomic occupied-epoch and compatibility /
+  intrusive count summaries before clearing `retire_active`. Drain stats now
+  separate both lanes and resample remaining counts after reentrant callbacks.
+  Review found and closed compatibility-pool failure leakage, singleton and
+  detached-head double enqueue, remote bag aliasing, stale remaining stats, and
+  the missing same-guard backend boundary; final focused review reported no
+  P1/P2. Verification passed: epoch 19/19, the bag failure-atomicity unit test,
+  Zone 12/12, AP init 2/2, `cargo check -p tx-substrate --lib`, and
+  `cargo check -p tx-hal`; final docs/API/progress gates are recorded below.
+  Broad workspace unit remains subject to the existing unrelated Reactor and
+  step-agent dirty-tree blockers. No files were staged or committed. Next:
+  Task 5, move Zone slots and whole slabs from `retire_raw` to the intrusive
+  heads and lower the raw-retire ratchet.
+
+- 2026-07-19 (RCU path migration Task 3 complete).
+  Added the single HAL-owned `LocalExecutionGuard` vocabulary and made
+  `IrqIf::exclude_local_execution` a required method, so platforms cannot
+  silently inherit a no-op safety contract. RV64 QEMU and M1Dock atomically
+  save/clear SIE with `csrrci` and restore the exact prior bit; LA64 QEMU uses
+  masked `csrxchg` on CRMD.IE. All host/test `IrqIf` implementations now state
+  their explicit no-op model. The guard contract is intentionally narrow:
+  maskable local IRQ admission only, excluding NMI, CPU affinity, yield, and
+  migration guarantees. Epoch now has a crate-private `LocalRetireGuard` that
+  combines `CpuPinGuard` with local IRQ exclusion, validates online/initialized
+  admission, publishes per-CPU `retire_active`, samples the retire epoch with an
+  AcqRel RMW, and clears active before restoring IRQ admission. Advance scans
+  `retire_active`; local enqueue/detach/free-list mutation runs under the guard.
+  Reclaim callbacks temporarily reopen IRQ admission while retaining the CPU
+  pin, then re-enter exclusion before returning compatibility-pool nodes.
+  Tests cover nested save/restore, pre-disabled state, exact Drop ordering,
+  `!Send/!Sync`, same-CPU simulated IRQ exclusion, nested drain blocking,
+  recursive callback retire/drain, and a real two-thread/two-CPU remote-active
+  advance witness. Verification passed: epoch 12/12, Zone 12/12, AP init 2/2,
+  `cargo check -p tx-substrate --lib`, `cargo check -p tx-hal`, and RV64 QEMU,
+  RV64 M1Dock, and LA64 QEMU cross-target HAL checks. API-language remains at
+  404 (20 adapter, 383 wait, one VM Recipe raw-retire baseline); docs lint and
+  progress validation pass. Broader substrate test compilation is blocked by
+  unrelated dirty `step::agent::install_request` callsites still passing six
+  arguments to a five-argument API. `cargo -q xtask unit` remains blocked by
+  the previously recorded nine Reactor timer/deadline/mailbox/task API errors.
+  The whole-`DomainState` `UnsafeCell`, fixed pool, and O(n) compatibility drain
+  remain explicit Task 4 work. No files were staged or committed. Next: Task 4,
+  three intrusive per-CPU epoch bags and bounded detach.
+
+- 2026-07-19 (RCU path migration Task 2 complete).
+  Replaced the Keg's 64-entry direct-mapped slab cache and collision/list-walk
+  fallback with a fixed two-level 9+9 slab directory. A read now performs root,
+  leaf, and slab Acquire loads, validates the slab id, and computes the slot
+  directly; it does not acquire the Keg lock or inspect the Empty/Partial/Full
+  lists. Slab creation publishes the directory entry before a key can escape;
+  empty-slab retirement clears it before unlink and EBR enqueue, and enqueue
+  failure republishes before relinking. Directory root/leaf pages are lazily
+  allocated from the frame allocator and retained for the static Zone lifetime.
+  Added a 65-distinct-slab collision regression covering Weak observe, Cap
+  deref, clone, and non-final Drop with zero Keg-lock acquisitions. Review also
+  found and closed a pre-existing slab-allocation rollback leak: the committed
+  frame token now remains live across fallible direct-map resolution, with a
+  free-frame-count RED/GREEN regression. Test cleanup explicitly drains slot
+  and slab retirements and asserts the one-slab low-water state. Verification:
+  `cargo test -p tx-substrate --test zone` 12/12,
+  `cargo test -p tx-substrate --test ap_init` 2/2,
+  `cargo check -p tx-substrate --lib`, API-language ratchet (404 total: 20
+  adapter, 383 wait, one VM Recipe raw-retire baseline), docs lint, progress
+  validation, and scoped diff checking all passed. A strict clippy run was
+  blocked in unrelated `tx-observe` by its existing eight-argument `step_end`;
+  `cargo -q xtask unit` remains blocked in unrelated dirty `tx-reactor` by nine
+  timer/deadline/mailbox/task-generation/runnable API errors. No files were
+  staged or committed. Next: Task 3, real CPU-local exclusion for retire paths.
+
+- 2026-07-19 (RCU path migration Task 1 complete).
+  Froze the fixed-depth Zone lookup and path-complexity contracts and replaced
+  the API-language RCU ratchet's brace/token scanner with a `syn` AST pass. The
+  gate resolves current-file module/type aliases and local macro wrappers,
+  checks public signatures and associated items, and counts raw calls,
+  function values, methods, and definitions without matching comments or
+  strings. Four broad public `epoch` module forwards were retired from kernel
+  and subsystem adapters in favor of precise item exports. The real gate now
+  reports 404 report-only/ratcheted findings: 20 adapter terms, 383 wait terms,
+  and the single allowed direct raw-retire pilot at
+  `vm/structure/recipe.rs:405`; publication and epoch-module leakage are zero.
+  Verification passed: RCU ratchet tests 49/49, Zone linter tests 4/4,
+  `cargo xtask lint invariants api-language`, `cargo xtask lint docs` (seven
+  existing retired-vocabulary warnings), and `cargo xtask progress validate`.
+  `cargo check -p tx-subsystems --lib` remains blocked by unrelated dirty
+  Reactor drift: deleted `wake::timer`, missing deadline-registrar/current-poll
+  mailbox functions, `TaskGeneration::from_raw`, and parked-owner runnable
+  support. Cross-file parent `macro_rules!` expansion is intentionally outside
+  this source-AST gate; a future rustc-expanded/public-API check must cover it.
+  No files were staged or committed. Next: Task 2, the fixed-depth lock-free
+  `SlotKey -> Slot<T>` slab directory.
+
+- 2026-07-19 (RCU path migration plan).
+  Added the staged implementation plan that first removes the Keg lock and
+  slab-list scan from `SlotKey` observation, then supplies real HAL local
+  execution exclusion, three intrusive per-CPU epoch bags, four-state Zone
+  retirement, SMP maintenance/offline ownership, backend-only `Published<T>`,
+  and the VM RecipeIndex pilot. The plan preserves `AddressSpace` and owner
+  facade language, keeps Recipe nodes private and outside Zone identity, and
+  delays all expansion candidates until the fixed-pool/raw-retire path is gone
+  and an SMP witness passes. Planning artifacts only; no runtime Rust code was
+  changed. Next: review/accept the path gates, then execute the complexity
+  ratchet and lock-free slab-directory slices. Plan:
+  `docs/progress/plans/2026-07-19-rcu-path-migration.json`; detailed tasks:
+  `docs/superpowers/plans/2026-07-19-rcu-path-migration.md`. Verification:
+  `cargo xtask progress validate` passed all 35 records and
+  `cargo xtask lint docs` passed with the existing seven retired-vocabulary
+  warnings; scoped whitespace and diff checks were clean. Execution blocker:
+  the shared checkout is heavily dirty, so implementation must use an isolated
+  worktree or explicitly disjoint phase write sets.
+
+- 2026-07-18 (RCU state-machine contraction and intrusive reclaim decision).
+  Contracted the target design to the existing four-state Zone lifecycle plus
+  one epoch engine. `Published<T>` is now a linear reservation/commit protocol,
+  while reader and bag phases are derived from `local_epoch`, bag heads, and
+  epoch tags rather than represented by additional enums. The target replaces
+  the fixed retired-node pool with three per-CPU bags containing separate
+  intrusive Zone-slot and generic `RcuHead` lists. Zone slots reuse retain bits
+  as the next `SlotKey` only in `Retiring`; generic published nodes carry a
+  private 16-byte header. This removes stable `Dead`, public `RetireTicket`, and
+  post-publication capacity failure from the target API. No Rust implementation
+  changed; the live five-state/fixed-pool implementation remains the next
+  substrate slice. Verification passed docs lint, progress validation, scoped
+  stale-vocabulary/placeholder scans, and scoped diff checking; Cargo emitted
+  unrelated stale incremental-object cleanup warnings. Next: write and review
+  the focused implementation plan, then migrate epoch/Zone tests before the VM
+  RecipeTree pilot. Decision:
+  `docs/progress/decisions/2026-07-14-object-api-lanes-rcu-publication.md`.
+  Follow-up contract review closed the remaining blockers: fallible
+  pre-publication node allocation is represented by `PublishError::Allocation`
+  while commit stays infallible; retire epoch sampling now follows the
+  no-new-reader barrier through a coherent AcqRel RMW; Guard/advance ordering,
+  local-retire exclusion, callback-safe bounded drain, CPU maintenance/offline
+  transfer, SlotKey limits, and generation-wrap quarantine are explicit.
+  `RetireTicket` remains retired. This follow-up also changes documentation
+  only; no implementation witness is claimed. Docs lint, progress validation,
+  scoped canonical-doc retired-vocabulary/placeholder scans,
+  trailing-whitespace scans, and scoped diff checking passed; Cargo emitted
+  only unrelated stale incremental-object cleanup warnings.
+
+- 2026-07-18 (vDSO post-ELF-migration follow-up).
+  The RV64 coarse vDSO clock branches now apply the same `RiscvTime` VVAR
+  clock-mode gate as high-resolution reads, returning `-ENOSYS` for an
+  ineligible counter so libc uses the established syscall fallback. The
+  generated ET_DYN contract suite passed 9/9 with the local RV64 assembler.
+  `VdsoLayout` now owns the checked VM reservation and is shared by exec image/
+  stack placement and special-page mapping, removing the divergent fixed-top
+  mapper window. The focused VM test and `cargo check -p tx-scripts --lib` are
+  currently blocked before these crates compile by unrelated `tx-reactor`
+  references to deleted `wake::timer` and deadline-registrar APIs. Next scoped
+  work is a dynamic exec auxv/layout witness, followed by dynamic-table range
+  validation. See
+  `docs/progress/research/2026-07-18-vdso-elf-followup.md`.
+
+- 2026-07-17 (ELF final-review EAGAIN and EXEC-PONR corrections).
+  PageBacked `EAGAIN` now remains a typed retry through the Phase-2 probe,
+  staged ELF reader, and main/interpreter BSS-tail reads; `EIO` remains EIO.
+  Real file-backed `PageContainer` regressions cover the initial probe and a
+  later BSS-tail page fault. CLOEXEC closure now fallibly prepares the complete
+  exact `(fd, retained OpenFile identity)` plan and retains the caller thread
+  payload before sibling collapse. The checked commit holds the authoritative
+  payload plus `fds -> fd_cloexec` locks and rejects drift before the AS store.
+  OOM, reused-fd rollback, successful close, and post-prepare fault tests are
+  present. Full EXEC-PONR closure is still blocked: a last pipe/socketpair
+  endpoint close or vfork/exit-source publication can reach allocation-backed
+  WaitSource/mailbox delivery after the AS store. The plan now requires a
+  prepared bounded notification path in substrate/reactor and keeps the PoNR
+  step pending. Fresh Cargo tests, `xtask unit`, and crate checks are also
+  blocked before the target crates by the unrelated shared-tree `tx-reactor`
+  timer/deadline split. Next: finish the non-expanding notification lane, clear
+  the reactor compile split, then rerun focused exec/process fd gates and the
+  host unit gate. Plan: `2026-07-14-elf-exec-loader.json`.
+
+- 2026-07-17 (ELF exec final ABI review closure).
+  Initial-stack construction now materializes checked NUL-terminated
+  `AT_PLATFORM` and original-path `AT_EXECFN` strings and publishes real auxv
+  pointers for RV64, LA64, and shebang exec. Plain non-ELF input returns
+  `ENOEXEC` with no kernel `/bin/sh` fallback; the fifth shebang redirect returns
+  `ELOOP`. The final Linux-compatibility pass uses a 256-byte shebang probe,
+  preserves the entire optional argument, rejects only a truncated interpreter,
+  and rejects embedded NUL in kernel-side argv/envp and stack strings. Empty
+  syscall pathname returns `ENOENT`; syscall argv/envp and proc reference-vector
+  growth, including string bytes, is fallible and maps allocation failure to
+  `ENOMEM`, while invalid pointer arrays/elements return `EFAULT`. `AT_PHDR` is now
+  derived from the first `PT_LOAD` covering `e_phoff`; whole-table coverage and
+  `PT_PHDR` consistency are not extra rejection rules. Focused TDD plus all 163
+  `tx-scripts` exec tests, 73 loader tests, and 23 shim execve tests passed;
+  `cargo -q xtask unit`, docs lint, progress validation, scoped rustfmt, and
+  scoped diff checks also passed. Full `cargo xtask check` is blocked at its
+  first `cargo fmt --check` step by unrelated dirty ext4/I/O/vDSO/xtask files.
+  No new guest witness is claimed. Next: PageBacked/VFS executable lease
+  (`ETXTBSY`) and the blocked LA64/LTP/glibc guest witnesses. Plan:
+  `2026-07-14-elf-exec-loader.json`.
+
+- 2026-07-16 (ELF exec lifecycle transaction closure).
+  Exec preparation now holds a `ProcessExecPrep` bound to the authoritative
+  `ProcessIdentity`, payload key, and lifecycle generation through credential
+  commit. Exec, exit, ordinary/last-thread exit, fatal signal teardown, and
+  `CLONE_THREAD` share the single `ProcessPayload.group_exit` lane; per-TID
+  linear exit permits and `ExecAborting` handoff prevent duplicate detach/count
+  updates while allowing an in-flight sibling exit to clear the lane. Checked
+  Phase 6 AS replacement and Phase 7 credential commit reject stale bindings
+  before mutation. Lifecycle contention maps to `EAGAIN`; fatal AST/page-fault
+  retries cooperatively yield instead of exiting or spinning. Deterministic,
+  timeout-bounded race tests cover exec/exit ordering, clone admission, stale
+  credentials, duplicate sibling exit, and abort handoff. Verification: focused
+  lifecycle/cred/signal/exec/shim/kernel suites passed; host four-crate check and
+  LA64 `tx-shims --lib` check passed; `cargo -q xtask unit` passed with
+  tx-shims 627, tx-kernel 113, tx-ext4 31, and tx-scripts 150 tests. Next:
+  executable lease/ETXTBSY and the remaining LA64/LTP/glibc guest witnesses;
+  LA64 guest build still needs the vendored BusyBox artifact. Plan:
+  `2026-07-14-elf-exec-loader.json`.
+
+- 2026-07-16 (ELF exec yielding and GNU-stack closure).
+  `ExecScriptOp` now preserves PageBacked/VFS wait shapes and runs through the
+  central waiting driver instead of returning `EBUSY`; every retry remains
+  before EXEC-PONR with RAII rollback. VM stack creation now applies the final
+  GNU-stack/vDSO matrix once: explicit `PF_X` stays RWX, vDSO-backed default is
+  RW, and no-vDSO signal-trampoline fallback stays RWX. Focused red/green tests,
+  all 150 `tx-scripts` exec tests, 12 shim execve tests, and scoped checks pass.
+  Next: PageBacked/VFS executable lease (`ETXTBSY`) and the blocked LA64/LTP/
+  glibc guest witnesses. Plan: `2026-07-14-elf-exec-loader.json`.
+
+- 2026-07-16 (ext4 6G reactor-owned file-I/O runtime submission).
+  `CoreInit` now installs the sole file-I/O runtime spawner after the boot
+  reactor exists. Both boot-time registrations and later registrations use the
+  device registry's exactly-once claim before the kernel creates the owned,
+  current-hart-affine page-service future. The old production snapshot loop is
+  removed; a focused test verifies the single-runtime submission helper, and
+  the prior boot registry test remains the regression oracle. Next: route
+  regular RW ext4 `mount(2)` through discovered journal recovery, pool setup,
+  and the ext4 file-I/O binder.
+
 - 2026-07-16 (ext4 6G file-I/O runtime spawner registry).
   Added the inversion-of-control boundary required before dynamic ext4 mounts
   can use the discovered-journal planner: `tx-subsystems::device` now records
@@ -26,6 +628,69 @@
   planner. Known unrelated blocker: `v3_pipe_waitsource` has ten E0624 errors
   after parallel work made its pipe wait-source accessors private.
 
+- 2026-07-15 (build-toolchain process audit).
+  Read-only fanout found four material process risks: `CARGO_TARGET_DIR` can
+  diverge from QEMU's hard-coded artifact lookup; RV64 preparation currently
+  requires unrelated LA64 prerequisites and CI repeats an RV64 build; the
+  required slow CI job can skip its BusyBox boot witness in a fresh checkout;
+  and fixed image/serial names permit concurrent runs to overwrite evidence.
+  The recommended P0 is an explicit artifact-path contract, target-scoped
+  doctor, and a verified required BusyBox input. P1 adds image-input manifests,
+  lane-aware prepare/verified reuse, and run-scoped artifacts; P2 unifies gate
+  reporting and external-input reproducibility. No build behavior changed.
+  Detailed evidence, sequencing, verification, and the dirty-checkout blocker:
+  `docs/progress/research/2026-07-15-build-toolchain-process-audit.md`.
+
+- 2026-07-15 (domain object lane/facade catalog).
+  Refined `OBJECT_API_LANES_v1.md` with the accepted upper interaction rule:
+  owners implement binding/projection/readiness lanes internally, while checks,
+  execution, scripts, shims, and other subsystems consume narrowed domain
+  facades. Added exact interface families for VM/PageContainer, PID/process
+  topology/fd tables, VFS/OpenFile/mount/epoll, net/socket, IPC, TTY/device,
+  service carve-outs, and initial RCU candidates. `PidNamespace` and `FdTable`
+  are first-class owners; VFS remains facade-only; readiness takes a caller
+  guard and returns an owned opaque report. Docs lint and scoped structural
+  checks passed; full progress validation is blocked by the unrelated ELF
+  loader plan's invalid `in_progress` step status. No Rust implementation
+  changed. Next: write the staged implementation plan beginning with facade
+  ratchets, `Published<T>`, and the VM recipe pilot. See
+  `docs/progress/decisions/2026-07-14-object-api-lanes-rcu-publication.md`.
+
+- 2026-07-15 (vDSO time ABI completion crosswalk).
+  Expanded the active `VDSO_TIME_ABI_v1.md` contract with the complete
+  VVAR/vDSO address mapping transaction, R/RX protection matrix, boot and exec
+  ordering, auxv hand-off, `tx-vdso` versus `tx-time::vdso` boundary, syscall
+  fallback, signal-restorer selection, file-level hand-offs, and libc-owned
+  fallback matrix. The RV64 time fast-path and signal-restorer witnesses are
+  complete; the four-hart guest-SMP VVAR witness is also complete: CPU1 makes
+  1024 realtime updates while CPU0 makes 500000 resolved direct-vDSO reads,
+  with disjoint masks, both completions, and zero reader errors. Dynamic
+  glibc resolver proof is now complete: `entry-dynamic.exe` uses the real
+  `/glibc` loader route, reaches the `clock_gettime` completion marker, and
+  performs neither realtime nor monotonic syscall 113 in its case window.
+  The boot hook is installed before vDSO frame initialization and the final
+  init publication creates the first eligible snapshot. Verification:
+  `cargo xtask test vdso-witness --target rv64-qemu --timeout-ms 60000`,
+  `cargo xtask test vdso-vvar-smp-witness --target rv64-qemu --timeout-ms
+  60000`, the focused host VVAR seqlock stress, scoped diff check, and docs
+  lint; the
+  migration record is updated in
+  `docs/progress/plans/2026-07-14-vdso-migration.json`, now complete. See
+  `docs/progress/research/2026-07-15-vdso-time-abi-crosswalk.md`.
+
+- 2026-07-14 (object API lanes and RCU publication boundary).
+  Added the canonical `OBJECT_API_LANES_v1.md` contract. Semantic owner/root
+  objects compose binding, projection, and readiness lanes; role-shaped
+  evidence remains the identity/lifetime language, while reservation is a
+  transition phase and RCU publication stays private. The design separates
+  entity zone storage, container-owned binding values, private observer nodes,
+  and `Published<T>` snapshot retirement. Docs lint and scoped diff checks
+  passed; progress validation is blocked by the unrelated untracked vDSO plan's
+  invalid `in_progress` plan status. Next: review exact upper interaction
+  signatures, then plan the publication primitive, ratchets, and VM
+  `RecipeIndex` pilot. No Rust implementation changed. See
+  `docs/progress/decisions/2026-07-14-object-api-lanes-rcu-publication.md`.
+
 - 2026-07-14 (ext4 I/O-manager 6F direct-I/O completion wait/result).
   Waitable direct read/write submissions now carry a terminal PageReady wait
   endpoint while PageContainer keeps the result row until one take operation.
@@ -35,12 +700,12 @@
   msync/syncfs coherence, JBD2 durability, and 6G remain open. See
   `docs/progress/research/2026-07-14-direct-io-completion-wait.md`.
 
-- 2026-07-14 (ext4 I/O-manager 6F direct-I/O service wake attachment).
-  PageContainer now owns an optional neutral ServiceWakeSource. After a direct
-  bio enters owned L6, PageBacked releases state and posts a Block service
-  kick, without retaining a concrete device or driver. PageBacked 135/135 and
-  the focused `tx-subsystems` library check passed. The device runtime must
-  install the attachment during its own registration; completion wait/result,
+- 2026-07-14 (ext4 I/O-manager 6F direct-I/O service wake binding).
+  Registered PageContainer file-I/O runtimes now install their neutral
+  ServiceWakeSource on the PC. A successful direct bio enqueue posts a Block
+  service kick after releasing PC state, so owned L6 work is runnable without
+  PageBacked learning a concrete device handle. PageBacked 135/135 and the
+  bdevfs runtime-registration regression passed. Completion wait/result,
   ext4 runtime registration, O_DIRECT syscall, msync/syncfs, and 6G remain
   open. See `docs/progress/research/2026-07-14-direct-io-service-wake.md`.
 
@@ -58,6 +723,31 @@
   check` plus codegen check. The kernel-side 80-byte `txtrace-v0` ABI is
   unchanged. Next: measure the new default workflow on a full long OSComp
   capture before considering any event-volume sampling.
+
+- 2026-07-14 (ext4 I/O-manager 6F direct-I/O L4-to-L6 bridge).
+  PageContainer direct leases can now submit a one-bio mapped neutral plan to
+  the owned L6 queue and retain range reservation plus DMA pins through tagged
+  device completion. The direct tracker maps merged L6 request ids back to
+  leases; only a matching direct consumer may bypass the PageService page
+  tracker, and terminal coherency runs after releasing the state lock.
+  Verification passed: PageBacked 135/135, I/O-manager page 47/47, and
+  `cargo check -p tx-subsystems --lib --no-default-features`. This is not yet
+  an O_DIRECT syscall, a hole adapter, msync/syncfs coherence, or 6G cutover.
+  See `docs/progress/research/2026-07-14-direct-io-l6-bridge.md`.
+
+- 2026-07-14 (ext4 I/O-manager 6F direct-I/O completion registry).
+  `PageContainer` now retains each `DirectIoBuffer` and its range reservation
+  in a lease-keyed in-flight registry, returning only an immutable neutral
+  source/target descriptor to later planning. Terminal completion removes the
+  row under the short state lock, then applies the existing direct-read or
+  direct-write coherency path outside that lock before dropping the DMA pins.
+  Successful direct writes still invalidate clean cache entries; duplicate or
+  late completions return `UnknownLease`. Verification passed: PageBacked
+  134/134, `cargo check -p tx-subsystems --lib --no-default-features`, and
+  `cargo xtask progress validate`. The registry does not yet submit through
+  ext4/L6 or expose an O_DIRECT syscall; hole handling, msync/syncfs, and 6G
+  compatibility-path removal remain open. See
+  `docs/progress/research/2026-07-14-direct-io-completion-registry.md`.
 
 - 2026-07-14 (ext4 I/O-manager 6F user-page DMA lease foundation).
   Added the PageBacked-owned `DirectIoBuffer` lease. After the caller has
@@ -126,6 +816,2168 @@
   durability claim or fetch/flush hot-path removal is made here. See
   `docs/progress/plans/2026-07-13-ext4-io-manager-write-path.json`.
 
+- 2026-07-13 (ext4 I/O-manager 6C metadata continuation sub-slice).
+  `MetadataFirst` now retains its original backend page request through L6,
+  so L4 can wait for all metadata bios, preserve generation on terminal error,
+  deduplicate merged block IDs, and re-enter the same backend planner on
+  completion. `Ext4MappingTable` now caches inline extent roots and child
+  nodes: an uncached child extent emits an L6 bio into the existing L4 target
+  frame; resume validates/parses that frame and replans the data bio without a
+  synchronous pager read. The owned block runtime now forwards the L4 wake
+  generated by page and metadata completion. Verification passed: ext4 planner
+  5/5, PageBacked 127/127, page service 34/34, backend-plan 12/12, focused
+  no-default-feature checks, and scoped diff check. `cargo fmt --check` is
+  still workspace-noisy from unrelated dirty files; touched Rust files were
+  formatted directly. 6C remains open: ext4 inode lookup/mount must seed
+  extent roots and inject the concrete planner before production hot-path
+  cutover. See
+  `docs/progress/plans/2026-07-13-ext4-io-manager-write-path.json`.
+
+- 2026-07-13 (VFS path-oriented reorganization plan).
+  Fanout inspection of the live VFS facade, walker/request paths, shim boundary,
+  tests, and sibling module conventions produced a six-stage reorganization plan:
+  stable `model`/`checks`, `path`, `backend`, request-oriented `flow`, `wait`,
+  then shim convergence and compatibility retirement. The plan preserves the
+  root VFS facade, Mount topology ownership, PageBacked data ownership, and the
+  current RCU/EBR protocol. It explicitly keeps shim-local `ResolvedPath` /
+  `MountedDentry` out of VFS core. No Rust source changed. Details and scoped
+  verification are in
+  `docs/progress/research/2026-07-13-vfs-path-oriented-reorganization-plan.md`.
+  `cargo xtask progress validate` passed for 32 records; `cargo xtask lint docs`
+  passed with 7 existing stale-vocabulary warnings; scoped `git diff --check`
+  passed.
+  Next step is phase 1's behavior-preserving model/checks split; blockers are
+  the dirty checkout and deferred RCU/mount-publication work.
+
+- 2026-07-13 (reactor architecture/fanout survey).
+  Dispatched bounded read-only explorers across the reactor poll loop,
+  mailbox/WaitSource fanout, syscall drive bridge, and SMP/timer routing.
+  The current model is a stackless Future executor with generation-checked
+  TaskTable state, per-hart scheduler queues, mailbox wake hints, and
+  owner-aware placement. The survey found split wait bridges (`drive` versus
+  legacy epoll/wait helpers), linear subscriber fanout, duplicate wake-queue
+  insertion, a 64-hart versus 8-hart task-local capacity mismatch, duplicated
+  poll/commit paths, and a partially migrated timer boundary. Evidence is in
+  `docs/progress/research/2026-07-13-reactor-architecture-survey.md` and the
+  existing `docs/progress/research/2026-07-13-reactor-fanout-readers-audit.md`.
+  Verification was read-only line-numbered source inspection; no Rust source
+  changed. Next step is to converge the wait bridge and typed wake-post result
+  before queue/storage optimization. Blockers are the dirty checkout and
+  incomplete real-SMP/steal evidence.
+
+- 2026-07-13 (tx-time module migration plan).
+  Added the executable, eight-phase migration plan in
+  `docs/superpowers/plans/2026-07-13-tx-time-module-migration.md` and its
+  machine-readable proposed record in
+  `docs/progress/plans/2026-07-13-tx-time-module-migration.json`. The plan
+  implements the approved split: `tx-time` owns timekeeper, VVAR payload and
+  publication, typed RTC/HAL adapters, and an opaque-key indexed min heap;
+  each reactor retains the concrete `ReactorTimerDomain`, route table,
+  single-driver claim, current-hart arm, and owner-aware delivery. It stages
+  compatibility extraction, semantic consumer migration, old `TimerWheel`
+  retirement, zero-finding import lints, and focused host/QEMU closure gates.
+  It explicitly excludes network timer semantics, board RTC backends, CPU/TAI
+  completion, hierarchical wheels, and vDSO/VM mapping moves. No Rust source
+  migration has started. Next step: claim Phase 1 in an isolated worktree and
+  add the compatibility crate/facade tests.
+
+- 2026-07-13 (Tx debug dependency cache cleanup).
+  After confirming that no `cargo`, `rustc`, or `rustdoc` process was active,
+  cleared all entries from `target/debug/deps` (`69 GiB` to `0`). The follow-up
+  docs/progress verification rebuilt only `225 MiB` of required host artifacts
+  (520 entries); Data-volume free space remains about `68 GiB`. The `15 GiB`
+  `target/debug/incremental` cache was retained for local edit-loop reuse.
+  The durable storage audit is in
+  `docs/progress/research/2026-07-13-dev-storage-audit.md`. Future policy:
+  keep default `target/` for QEMU, use existing `target/host-cargo` for host
+  OSComp lanes, and use `CARGO_INCREMENTAL=0` plus disposable target dirs for
+  CI/one-shot sweeps. Verification: `deps_entries=0`, targeted `gdu`, and
+  `df -h`; next step is bounded incremental-cache pruning when no compiler is
+  active. No source files were changed and no incremental cache was deleted.
+
+- 2026-07-13 (development environment storage audit).
+  Read-only measurement found the Data volume at 99% (`420 GiB` used, about
+  `4.3 GiB` available). The Tx checkout is about `114 GiB`, dominated by
+  regenerable `target/debug/deps` (`69 GiB`) and `target/debug/incremental`
+  (`15 GiB`); other major development artifacts are Android userdata, Docker/
+  Colima allocated disk blocks, a cached MacTeX installer, Whisper models, and
+  application caches. Detailed evidence and bounded cleanup order are recorded
+  in `docs/progress/research/2026-07-13-dev-storage-audit.md`. Verification used
+  `df -h`, targeted `gdu`/`du`/`stat`, `git count-objects`, APFS snapshot checks,
+  and `lsof +L1`; no cleanup was run. Next step is a reviewed, bounded cleanup
+  after active builds stop. Blockers are the heavily dirty checkout and macOS
+  privacy restrictions on parts of `~/Library`.
+
+- 2026-07-13 (approved tx-time module architecture).
+  Accepted the physical `tx-time` crate design in
+  `docs/superpowers/specs/2026-07-13-tx-time-module-design.md`. It centralizes
+  timekeeper, queue algorithms, VVAR contents/publication, typed RTC adapters,
+  and capability APIs while retaining reactor ownership of each concrete
+  `ReactorTimerDomain` instance, due driver, current-hart arm, and owner-aware
+  task routing. The first queue implementation is a .NET-style indexed min
+  heap; a Linux-style hierarchical wheel is deferred until contention evidence
+  exists. VVAR content moves under time, while vDSO assembly and VM/exec mapping
+  remain in their existing ownership homes. The accepted design now also names
+  the lower HAL capability contract and keeps routing in the reactor-private
+  `TimerRouteTable`: time queue entries return opaque keys, while existing task,
+  signal, wait-source, delegate, and device routes execute after queue-lock
+  release. No source migration or webview artifact was committed. Next step:
+  review the design, then write the staged migration plan and begin with
+  compatibility API extraction.
+
+- 2026-07-13 (layered time-subsystem alignment audit).
+  Dispatched six read-only workers across the design baseline, HAL/hardware,
+  core time semantics, timer/reactor/SMP routing, upper consumers/lints, and
+  progress evidence. The resulting audit is recorded in
+  `docs/progress/research/2026-07-13-time-subsystem-layered-alignment-audit.md`.
+  It confirms the HAL split, unified deadline registry, typed RTC route, and
+  focused owner-aware wake witnesses, but finds remaining semantic/topology
+  gaps: direct `HalDeadlineTimer` programming from `thread_future`, non-atomic
+  realtime/VVAR publication, CPU/Tai and interval-timer ABI downgrades,
+  unchecked arithmetic, incomplete ActiveWait/steal contracts, and linter
+  patterns that miss RTC `fire_with_post` forms. The focused gates still pass
+  (`time_layering` 24/24 and 0 findings; `time-wake-retired` 0; `git diff
+  --check`), so the status is facade/topology partially closed rather than
+  full time-subsystem alignment. Next step is the P0 semantic fixes; real-board
+  RTC and network timer semantics remain separate lanes.
+
+- 2026-07-13 (ext4 I/O-manager 6A neutral write IR).
+  Completed the source/graph/resume contract in
+  `crates/tx-subsystems/src/fs_iface/plan.rs`: DMA-visible sources now carry
+  opaque leases, `BackendBioGraph` validates dependency DAGs, planners have an
+  explicit default resume rejection, and `BackendDispatch::BlockGraph` reaches
+  L4 only to be rejected with `ENOSYS` until dependency scheduling lands.
+  Verification passed: `cargo test -p tx-subsystems --lib io_manager --
+  --nocapture` (64 tests), `cargo test -p tx-subsystems --lib
+  fs_iface::plan::tests -- --nocapture` (4 tests), `cargo check -p
+  tx-subsystems`, scoped rustfmt, neutral-boundary scan, and diff check. Next
+  6B has since landed its first state-machine sub-slice: a page redirtied while
+  writeback is in flight retains the new dirty generation after the old
+  completion. PageSlot verification passed in the 116-test PageBacked suite.
+  Fsync generation frontiers, source-lease installation, and 6C ext4 read
+  planning remain pending; durable fsync remains blocked on ordered JBD2,
+  commit fencing, and replay.
+
+- 2026-07-12 (real-board RTC interface reservation).
+  Reserved the real-board RTC backend interface in the active time/HAL docs.
+  `HAL_v1.md` now names the board-local `PersistentClockIf` +
+  optional `IrqIf::RTC_IRQ` contract, including the hardware-only
+  `acknowledge_wake_alarm_irq` boundary and board-level witness expectations.
+  `TIME_WAKE_v1.md` now shows the real-board Rust shape for RTC backends and
+  states that generic code enters only through `HalRtcDevice<P> -> RtcDeviceOps`.
+  The Chinese timer subsystem design doc mirrors the same rule for SiFive and
+  2K2000 boards: board crates own register/firmware details, while devfs,
+  timekeeper, and syscall code must not import board RTC details directly.
+
+- 2026-07-12 (timer topology full audit closeout).
+  Completed the fresh requirement-by-requirement audit for the current
+  time/timer topology closure in
+  `docs/progress/research/2026-07-12-time-timer-topology-audit.md`. The audit
+  now maps `TIME_WAKE_v1.md` and
+  `TX_TIMER_SUBSYSTEM_DESIGN_CN.md` requirements to current evidence across
+  HAL split, timekeeper, persistent writeback, unified timer registry, reactor
+  driver boundary, owner-aware wake routing, SMP/post-steal behavior, RTC typed
+  route, retired-interface gates, and module/file boundaries. Scope is explicit:
+  non-network topology/import/API cleanup is closed by focused lints and
+  witnesses; broad dirty-tree `--tests`, network timer/readiness semantics, and
+  real-board/firmware RTC backend validation remain separate follow-up lanes.
+
+- 2026-07-12 (rv64 qemu owner-wake marker refresh).
+  Refreshed the runtime evidence for the time/timer topology audit on the
+  current checkout. Both `cargo xtask test smoke --target rv64-qemu
+  --timeout-ms 60000` and `cargo xtask test busybox-boot --target rv64-qemu
+  --timeout-ms 60000` rebuilt the RV64 QEMU lane, launched QEMU with `-smp 4`,
+  and the sentinel watcher observed `txkernel:qemu-riscv64-virt:boot:ok` plus
+  `txkernel:qemu-riscv64-virt:reactor:owner-wake:smp:ok`. Updated
+  `docs/progress/research/2026-07-12-time-timer-topology-audit.md` so the QEMU
+  owner-wake marker is current evidence rather than a remaining gap. Follow-up
+  validation: `rustfmt --edition 2024 --check` on the touched Rust test/lint
+  files passed; `cargo xtask progress validate` passed; `cargo xtask lint docs`
+  passed with the existing 7 stale-vocabulary warnings; `cargo xtask lint
+  invariants time-layering` reported 0 findings; `cargo xtask lint invariants
+  time-wake-retired` reported 0 retired sites; `git diff --check` passed.
+  Remaining before a full completion claim: broader dirty-tree `--tests`
+  coverage and real-board/firmware RTC evidence beyond QEMU/no-RTC typed paths.
+
+- 2026-07-12 (timer topology audit evidence refresh).
+  Reconciled `docs/progress/research/2026-07-12-time-timer-topology-audit.md`
+  with the current `TIME_WAKE_v1.md`: the host mixed-producer and broad
+  owner-aware producer stress witnesses are present and pass in this checkout,
+  so they are no longer recorded as future evidence. Added host coverage that
+  `cargo xtask test` smoke/busybox QEMU args require the
+  `reactor:owner-wake:smp:ok` marker, and corrected the stale busybox-boot
+  comment in `xtask/src/test.rs`. Verification:
+  `CARGO_TARGET_DIR=target/codex-time-topology cargo test -p tx-reactor --test
+  reactor_smoke mixed_producer_wakes_repeatedly_route_current_owner --
+  --nocapture` passed 1/1; `cargo test -p tx-reactor --test reactor_smoke
+  broad_owner_aware_producer_stress_routes_remote_wakes -- --nocapture` passed
+  1/1; `cargo test -p xtask qemu_args_require_owner_wake_marker --
+  --nocapture` passed 2/2. Remaining before a full completion claim: broader
+  dirty-tree `--tests` coverage, fresh QEMU marker runs for this checkout, and
+  real-board/firmware RTC evidence tracked separately from topology import/API
+  cleanup.
+
+- 2026-07-12 (reactor timer expiry remote-owner witness).
+  Added a focused `tx-reactor` smoke witness for the timer topology audit:
+  a task parked on a timer owned by hart 6 is expired by hart 1, routed through
+  the reactor owner-aware wake path, requeued on the owner hart, and requests
+  exactly one remote reschedule IPI. The adjacent same-hart timer expiry test
+  and the new remote-owner test now pass under the default parallel Rust test
+  harness by avoiding a shared process-wide per-hart current-context slot.
+  Verification: `CARGO_TARGET_DIR=target/codex-time-topology cargo test -p
+  tx-reactor --test reactor_smoke timer_wheel_expiry -- --nocapture` passed
+  2/2; scoped `rustfmt --edition 2024 --check` on
+  `crates/tx-reactor/tests/reactor_smoke.rs` and
+  `xtask/src/lint_invariants_time_layering.rs` passed. Updated
+  `docs/progress/research/2026-07-12-time-timer-topology-audit.md`; next step
+  remains broader requirement audit and mixed-producer SMP evidence before
+  claiming full topology completion.
+
+- 2026-07-12 (direct substrate timer import gate).
+  Turned the manual topology scan into a mechanical `time-layering` rule:
+  production `tx_substrate::wake::timer` imports are now confined to
+  `tx-substrate`, the lower `tx-scripts` timer-yield bridge, reactor private
+  driver/runtime homes, and the `tx-services::time` deadline/driver adapters.
+  Upper producers must import timer capabilities from `tx_services::time`.
+  Added a negative fixture under a fake `tx-subsystems` file and adjusted older
+  overlapping negative fixtures so they assert lint failure without assuming a
+  single finding. Updated `TIME_WAKE_v1.md` and the Chinese timer subsystem
+  design doc to state the direct-import allowlist. Verification:
+  `CARGO_TARGET_DIR=target/codex-time-topology cargo test -p xtask
+  time_layering -- --nocapture` passed 24/24 and `cargo xtask lint invariants
+  time-layering` reported 0 findings; `cargo xtask lint invariants
+  time-wake-retired` reported 0 retired sites; `cargo xtask lint docs` passed
+  with the existing 7 stale-vocabulary warnings; `cargo xtask progress
+  validate` passed; `rustfmt --edition 2024 --check` on the touched xtask file
+  passed; `git diff --check` passed. Next step: continue
+  requirement-by-requirement audit before claiming the timer topology complete.
+
+- 2026-07-12 (time/timer topology audit checkpoint).
+  Added `docs/progress/research/2026-07-12-time-timer-topology-audit.md` as the
+  current requirement-by-requirement audit against `TIME_WAKE_v1.md` and the
+  Chinese timer subsystem design doc. The audit records which topology
+  requirements are currently proven by `time-layering` / `time-wake-retired`
+  / focused tests, and separates accepted current boundaries (`TimerToken` as a
+  shared event token) from remaining evidence gaps (broader dirty-tree `--tests`
+  and future mixed-producer SMP stress). Next step: keep closing the remaining
+  evidence gaps rather than marking the whole goal complete from partial gates.
+
+- 2026-07-12 (timer token and reactor driver surface audit).
+  Audited the two remaining timer facade questions after the guard wrapper.
+  `TimerToken` currently remains a shared substrate event token because
+  `MailboxEvent::TimerFired` / `SignalTimerFired` and `TimerWakeRouter` carry
+  that exact identity for stale-wake filtering; wrapping it now would require a
+  separate mailbox conversion seam and is not the same class of public
+  implementation leak as `TimerGuard`. `ReactorTimeDriver::fire_due` still names
+  `TimerWakeRouter`, but the callsites are reactor-private driver boundaries
+  (`deadline_registry.rs`, `runtime.rs`, hart-loop tests) and match the current
+  design's `ReactorTimeDriver + TimerWakeRouter` pairing rather than upper
+  producer API. Verification/evidence: production scans show `TimerToken` use
+  outside substrate only in reactor runtime/wait, shims wait, and the net
+  delegate timer future for stale-wake filtering; `TimerWakeRouter` production
+  imports are confined to `tx-services/src/time/driver.rs` and `tx-reactor`
+  driver/runtime homes, with broader uses only in tests. Next step: full
+  requirement-by-requirement audit against `TIME_WAKE_v1.md` before declaring
+  the timer topology fully aligned.
+
+- 2026-07-12 (time service timer guard wrapper).
+  Removed another substrate timer implementation leak from the service facade:
+  `tx_services::time::TimerGuard` is now a service-owned wrapper instead of a
+  direct `pub use` of `tx_substrate::wake::timer::TimerGuard`. The wrapper keeps
+  the intended upper capabilities (`token()` for stale-wake filtering and
+  `forget()` for explicit startup-side token transfer) but no longer exposes
+  substrate `role()` / `deadline()` inspection to semantic producers. Extended
+  `time-layering` with a `service facade substrate timer guard re-export`
+  rule, a negative fixture, and a real-file witness that the service guard
+  exposes only token lifecycle operations. Updated `TIME_WAKE_v1.md` and
+  `TX_TIMER_SUBSYSTEM_DESIGN_CN.md` to call the guard service-owned. Verification:
+  scoped `rustfmt --edition 2024 --check` passed; `CARGO_TARGET_DIR=target/codex-time-topology
+  cargo check -p tx-services -p tx-fs -p tx-reactor -p tx-shims -p
+  tx-subsystems -p tx-kernel --lib` passed with existing warnings;
+  `cargo test -p tx-shims --lib time_syscalls -- --nocapture` passed 27/27;
+  `cargo test -p tx-shims --lib timerfd_dispatch -- --nocapture` passed 10/10;
+  `cargo test -p tx-shims --lib posix_timer_dispatch -- --nocapture` passed
+  4/4; `cargo test -p tx-kernel --lib
+  entry_timer_poll_rearms_periodic_itimer_with_current_timer_context --
+  --nocapture` passed 1/1; `cargo test -p tx-fs --lib
+  devfs_rtc_ops_route_through_persistent_clock_backend -- --nocapture` passed
+  1/1; `cargo test -p xtask time_layering -- --nocapture` passed 23/23;
+  `cargo xtask lint invariants time-layering` reported 0 findings; `cargo xtask
+  lint invariants time-wake-retired` reported 0 retired sites. Broad
+  `--tests` checks are still blocked by unrelated dirty-tree integration test
+  issues in tx-subsystems pipe/signal and tx-shims AIO/io_uring wait-source
+  visibility. Next step: decide whether `TimerToken` should stay a shared
+  substrate event token or gain a service wrapper plus mailbox conversion seam.
+
+- 2026-07-12 (deadline registrar substrate lowering boundary).
+  Made the only intended `DeadlineRegistrarHandle` -> substrate registrar escape
+  hatch explicit by replacing the generic `into_inner()` with
+  `into_substrate_registrar_for_script_bridge()`. `build_subject_script_ctx()`
+  is now the sole production caller that lowers the syscall-facing time-service
+  facade into the lower `ScriptCtx` timer registrar bridge; upper syscall
+  producers still register through `DeadlineRegistrar`. Extended
+  `time-layering` with a hard rule and negative fixture for calls outside the
+  bridge, plus a real-file witness that `ctx.rs` contains exactly one lowering
+  call and it lives under `build_subject_script_ctx()`. Updated
+  `TIME_WAKE_v1.md` and the Chinese timer subsystem design doc to name this
+  explicit bridge. Verification: scoped `rustfmt --edition 2024 --check`
+  passed; `CARGO_TARGET_DIR=target/codex-time-topology cargo check -p
+  tx-services -p tx-shims --lib` passed with existing warnings;
+  `CARGO_TARGET_DIR=target/codex-time-topology cargo check -p tx-kernel -p
+  tx-services -p tx-shims --lib` passed with existing warnings;
+  `CARGO_TARGET_DIR=target/codex-time-topology cargo test -p xtask
+  time_layering -- --nocapture` passed 21/21; `cargo xtask lint invariants
+  time-layering` reported 0 findings; `cargo xtask lint invariants
+  time-wake-retired` reported 0 retired sites. Next step: audit
+  `TimerGuard`/`TimerToken` service exports and the reactor driver trait
+  surface against the design before declaring full timer topology alignment.
+
+- 2026-07-12 (time service device callback wrapper).
+  Closed another facade leak in `tx_services::time`: the service no longer
+  directly re-exports substrate `DeviceTimerCallback`. It now owns a
+  `DeviceTimerCallback` wrapper that preserves the existing
+  `new`/`with_wait_source_wake`/`with_raw_queue_wake` producer shape while
+  lowering to the substrate callback only inside `DeadlineRegistrarHandle`.
+  Updated the reactor smoke test to import the callback through
+  `tx_services::time`, extended `time-layering` with a
+  `service facade substrate timer callback re-export` rule, and added a
+  negative fixture for restoring the substrate callback re-export. Verification:
+  `rustfmt --edition 2024 --check` on the touched Rust files passed;
+  `CARGO_TARGET_DIR=target/codex-time-topology cargo check -p
+  tx-services -p tx-fs -p tx-reactor --lib --tests` passed with existing
+  warnings, and `CARGO_TARGET_DIR=target/codex-time-topology cargo test -p
+  xtask time_layering -- --nocapture` passed 19/19; `cargo xtask lint
+  invariants time-layering` reported 0 findings; `cargo xtask lint invariants
+  time-wake-retired` reported 0 retired sites. The direct substrate
+  `DeviceTimerCallback` scan now matches only service-internal lowering and lint
+  fixtures, not upper producers. Next step: keep auditing remaining service
+  re-exports such as tokens/guards against the design boundary before declaring
+  the full timer topology complete.
+
+- 2026-07-12 (tx-kernel timer adapter export narrowed).
+  Continued the time/timer topology alignment by removing
+  `tx-kernel::adapter::boot_runtime`'s substrate
+  `TimerGuard`/`TimerGuardRole` re-export. The only kernel production consumer
+  needed to retain an armed registration token, so the adapter now exposes
+  `tx_services::time::TimerGuard` and no longer leaks substrate timer role
+  catalog names. Extended `time-layering` to cover `tx-kernel/src/adapter.rs`
+  and added a negative fixture for restoring a substrate `TimerGuardRole`
+  re-export. Also corrected zone shutdown diagnostics so
+  `txkernel:wait_source:*` reads the subsystem wait-source registry summary,
+  while `txkernel:wake_source:*` remains the narrow substrate wake diagnostic
+  through `wake_registry_summary`. Verification:
+  `rustfmt --edition 2024 --check` on the touched Rust files passed;
+  `CARGO_TARGET_DIR=target/codex-time-topology cargo check -p tx-kernel -p
+  tx-subsystems --lib` passed with existing warnings, and
+  `CARGO_TARGET_DIR=target/codex-time-topology cargo test -p xtask
+  time_layering -- --nocapture` passed 18/18; `cargo xtask lint invariants
+  time-layering` reported 0 findings; `cargo xtask lint invariants
+  time-wake-retired` reported 0 retired sites; `cargo xtask progress validate`
+  passed; `cargo xtask lint docs` passed with the existing 7 stale-vocabulary
+  warnings. Next step: continue reducing non-service timer names from public
+  adapters only where they are not part of the lower `tx-scripts`/substrate
+  yield bridge.
+
+- 2026-07-12 (tx-subsystems adapter wake export narrowed).
+  Continued the time/timer topology cleanup by removing the crate-root
+  `tx-subsystems::adapter::step_engine` broad `pub use tx_substrate::wake`
+  export. The only production use was zone boot diagnostics, now routed through
+  the narrow `wake_registry_summary` alias, so the adapter no longer indirectly
+  exposes `wake::timer` to semantic subsystem code. Extended `time-layering`
+  with a `broad subsystem wake adapter export` rule and a negative fixture that
+  rejects restoring `pub use tx_substrate::wake;`. Updated `TIME_WAKE_v1.md` and
+  `TX_TIMER_SUBSYSTEM_DESIGN_CN.md` to record the crate-root adapter boundary:
+  concrete timer capability remains behind `tx_services::time` or
+  reactor-private driver homes, while shared subsystem diagnostics may only use
+  specific named exports. Verification:
+  `rustfmt --edition 2024 --check` on the three touched Rust files passed;
+  `CARGO_TARGET_DIR=target/codex-time-topology cargo check -p tx-subsystems --lib`
+  passed with the existing net `guard` warning, and
+  `CARGO_TARGET_DIR=target/codex-time-topology cargo test -p xtask
+  time_layering -- --nocapture` passed 17/17; `cargo xtask lint invariants
+  time-layering` reported 0 findings; `cargo xtask lint invariants
+  time-wake-retired` reported 0 retired sites; `cargo xtask progress validate`
+  passed; `cargo xtask lint docs` passed with the existing 7 stale-vocabulary
+  warnings; `git diff --check` passed. `cargo fmt -p tx-subsystems -p xtask
+  --check` remains polluted by unrelated dirty-tree formatting in
+  `device.rs`, subsystem tests, and other xtask lint files, so the scoped
+  rustfmt check above is the formatting proof for this slice. Next step:
+  continue narrowing any remaining broad subsystem adapters without changing
+  network-stack timer semantics.
+
+- 2026-07-12 (tx-shims adapter stops exporting substrate timer surface).
+  Audited the remaining lower `ScriptCtx.timer_registrar` bridge and kept it in
+  `tx-substrate`/`tx-scripts` as part of generic `OnTimer` yield resolution:
+  moving that bridge to `tx_services` would invert the substrate/service
+  dependency. The actionable upper-layer leak was instead
+  `tx-shims/src/adapter.rs`, whose `reactor_entry` adapter still re-exported
+  substrate timer handle/role/trait names even though no shims caller used
+  them. Removed that re-export surface and extended `time-layering` from a
+  reactor-public-only check to a public timer implementation export rule that
+  also covers `tx-shims/src/adapter.rs`; added a negative fixture proving
+  `pub use tx_substrate::wake::timer::TimerRegistrarHandle` in that adapter is
+  rejected. Updated `TIME_WAKE_v1.md` and
+  `TX_TIMER_SUBSYSTEM_DESIGN_CN.md` to state that `ScriptCtx` is the confined
+  lower bridge while shims public adapters must not expose substrate timer
+  implementation surfaces. Verification: `cargo check -p tx-shims --lib`
+  passed with existing warnings; `cargo test -p xtask time_layering --
+  --nocapture` passed 16/16; `cargo xtask lint invariants time-layering`
+  reported 0 findings; `cargo xtask lint invariants time-wake-retired`
+  reported 0 retired sites; `cargo check -p tx-shims -p xtask --lib` passed
+  with existing warnings. Boundary scans now show `TimerRegistrarHandle` in the
+  allowed lower homes (`tx-substrate`, `tx-scripts`) plus the service adapter,
+  and not in `tx-shims` adapter or reactor public exports. Next step: continue
+  scanning upper subsystem adapters for broad wake/timer re-export leaks without
+  collapsing the substrate step driver into the service layer.
+
+- 2026-07-12 (syscall timer registrar context facade convergence).
+  Moved `SyscallCtx.timer_registrar` off
+  `tx_substrate::wake::timer::TimerRegistrarHandle` and onto
+  `tx_services::time::DeadlineRegistrarHandle`, so Linux syscall timer
+  producers receive the same time-service facade that the timer design document
+  requires. `thread_future` now injects the reactor-provided facade handle
+  directly, syscall timerfd/POSIX timer/ITIMER/RTC alarm paths borrow that
+  facade without re-wrapping substrate handles, and the only remaining lowering
+  point is `build_subject_script_ctx`, where the lower `ScriptCtx` yield
+  resolver still expects the substrate registrar bridge. `time-layering` now
+  has an explicit `syscall context substrate timer handle` rule plus a negative
+  fixture, so `linux_syscall/ctx.rs` cannot reintroduce a substrate
+  `TimerRegistrarHandle` field/import. Updated `TIME_WAKE_v1.md` and
+  `TX_TIMER_SUBSYSTEM_DESIGN_CN.md` to describe this split between syscall
+  facade context and lower step-yield bridge. Verification:
+  `cargo test -p xtask time_layering -- --nocapture` passed 15/15;
+  `cargo xtask lint invariants time-layering` reported 0 findings;
+  `cargo xtask lint invariants time-wake-retired` reported 0 retired sites;
+  `cargo check -p tx-shims -p tx-kernel -p tx-services -p tx-subsystems --lib`
+  passed with existing warnings; `cargo test -p tx-kernel --lib
+  entry_timer_poll_rearms_periodic_itimer_with_current_timer_context --
+  --nocapture` passed 1/1; `cargo test -p tx-shims --lib time_syscalls --
+  --nocapture` passed 27/27; `cargo test -p tx-shims --lib timerfd_dispatch --
+  --nocapture` passed 10/10; `cargo test -p tx-shims --lib
+  posix_timer_dispatch -- --nocapture` passed 4/4. Next step: decide whether
+  the lower `ScriptCtx.timer_registrar` bridge should also gain a service-facing
+  facade or remain substrate-owned as part of the generic step driver.
+
+- 2026-07-12 (I/O manager Phase 5 registry and boot submission closeout).
+  Closed the remaining PageContainer file-I/O service scheduling gap:
+  `device.rs` now owns a registry of `PageContainerFileIoServiceRuntime`
+  values, bdevfs registers exactly one runtime when it creates a new coherent
+  block-device `PageContainer`, and kernel init submits registered owned
+  file-I/O service loops into `BOOT_REACTOR` after net runtime submission. The
+  concrete bridge stays outside `io_manager`/`fs_iface`; `io_manager` still only
+  sees neutral requests, plans, queues, service wake values, and the adapter
+  module. Fresh verification: focused registry, bdevfs registration, and kernel
+  init submission tests passed; the init submission test now uses the same
+  runtime-iteration helper with a counting submit closure so it does not
+  initialise the global boot reactor or perturb the existing fallback-seam
+  tests. `page_backed` passed 115/115, `io_manager`
+  passed 62/62, `block_device_` passed 5/5, `tx-fs --lib bdevfs` passed 3/3,
+  `cargo check -p tx-subsystems -p tx-fs -p tx-kernel --lib` passed,
+  `rustfmt --edition 2024 --check --config skip_children=true` on touched files
+  passed, `git diff --check` on the scoped slice passed, and step-v4/no-await
+  lints both reported 0 findings. Broad `cargo -q xtask unit` passed after the
+  isolation fix: tx-shims 592/592, tx-kernel 105/105, tx-ext4 9/9, and
+  tx-scripts 56/56. Boundary scans still only match compatibility prose in
+  `io_manager/mod.rs` and raw substrate calls in `io_manager/adapter.rs`. Next
+  step: Phase 6 ext4 planning remains separate; do not delete the old direct
+  `FsPageBacking` executor until bdevfs and ext4 planned paths cover the same
+  behavior.
+
+- 2026-07-12 (time hooks replace retired subsystem wall-clock shim).
+  Deleted the old `crates/tx-subsystems/src/wall_clock.rs` compatibility shim
+  and moved the only subsystem-side wiring that still belongs above the service
+  owner into `tx_subsystems::time_hooks`. The service truth now stays under
+  `tx_services::time::wall_clock`; production and test consumers import
+  `timekeeper`, `timekeeper_clock`, `TimekeeperClock`, `TimekeeperIf`,
+  `DEFAULT_REALTIME_EPOCH_BASE_NS`, and `reset_for_test` through
+  `tx_services::time`, while `time_hooks::ensure_hooks_installed()` only
+  installs the timerfd realtime-change notifier and VVAR publish bridge.
+  `CoreInit::init_substrate_if_ready()` and the shared tx-shims test setup call
+  this hook installer explicitly after service reset/boot init. The
+  time-layering lint now rejects old `tx_subsystems::wall_clock` /
+  `crate::wall_clock` imports, asserts that `tx-subsystems` no longer exports or
+  carries `wall_clock.rs`, and requires the `time_hooks` module to remain the
+  narrow subsystem hook surface. Verification: `cargo check -p tx-services -p
+  tx-subsystems -p tx-shims -p tx-kernel -p tx-fs --lib` passed with existing
+  warnings; `cargo test -p xtask time_layering -- --nocapture` passed 14/14;
+  `cargo xtask lint invariants time-layering` and `cargo xtask lint invariants
+  time-wake-retired` both reported 0 findings; `cargo test -p tx-services --
+  --nocapture` passed 8/8; `cargo test -p tx-shims --lib timerfd_dispatch --
+  --nocapture` passed 10/10; `cargo test -p tx-shims --lib time_syscalls --
+  --nocapture` passed 27/27; `cargo test -p tx-shims --lib ioctl_dispatch --
+  --nocapture` passed 19/19; `cargo test -p tx-kernel --lib vdso --
+  --nocapture` passed 1/1; `cargo test -p tx-fs --lib
+  devfs_rtc_ops_route_through_persistent_clock_backend -- --nocapture` passed
+  1/1. Next step: keep migrating timer consumers onto the service-facing timer
+  APIs; do not restore a subsystem-owned wall-clock facade.
+
+- 2026-07-12 (time service test-support surface convergence).
+  Moved the remaining wall-clock test constants/reset users off
+  `tx_subsystems::wall_clock`: `tx_services::time` now re-exports
+  `reset_for_test` under test-support, tx-kernel vDSO tests call the service
+  reset directly, tx-shims shared syscall setup resets service state and then
+  explicitly installs subsystem hooks, and tx-shims/tx-fs RTC/timerfd tests read
+  `DEFAULT_REALTIME_EPOCH_BASE_NS` from the service facade. The compatibility
+  shim's `ensure_hooks_installed()` now idempotently rewrites the service hook
+  slots every call instead of relying on a cached bool, which keeps parallel
+  timerfd tests stable after reset moved to the service facade. Boundary scans
+  now show `tx_subsystems::wall_clock` only in production boot hook install,
+  tx-shims test hook install, the shim itself, and xtask lint fixtures. Updated
+  the time design docs and `time-layering` lint replacement text to reflect
+  this narrower role. Verification: `cargo test -p tx-services -- --nocapture`
+  passed 8/8; `cargo test -p tx-shims --lib timerfd_dispatch -- --nocapture`
+  passed 10/10 under the parallel harness; `cargo test -p tx-shims --lib
+  time_syscalls -- --nocapture` passed 27/27; `cargo test -p tx-shims --lib
+  ioctl_dispatch -- --nocapture` passed 19/19; `cargo test -p tx-kernel --lib
+  vdso -- --nocapture` passed; `cargo test -p tx-fs --lib
+  devfs_rtc_ops_route_through_persistent_clock_backend -- --nocapture` passed;
+  `cargo check -p tx-services -p tx-subsystems -p tx-shims -p tx-kernel -p
+  tx-fs --lib` passed with existing warnings; `cargo xtask lint invariants
+  time-layering` stayed at 0 findings. Next step: decide whether the old-path
+  re-export itself can be retired after downstream code stops naming
+  `tx_subsystems::wall_clock` outside hook installation.
+
+- 2026-07-12 (PageContainer file I/O owned service runtime seam).
+  Added `device::PageContainerFileIoServiceRuntime` and
+  `page_container_file_io_service_task_loop_owned` so a file-I/O service future
+  can own `Cap<PageContainer>`, `BlockDeviceHandle`, and `Arc<ServiceWakeSource>`
+  instead of borrowing local references. This closes the immediate type-shape
+  gap for `tx_reactor::submit_task`: the new regression asserts the produced
+  future is `Send + 'static` and then drives a real Bio-only planned miss through
+  L4 -> L6 -> `BlockDeviceHandle` -> L4 completion. The bridge still lives in
+  `device.rs`; `io_manager` and `fs_iface` remain neutral. Fresh verification:
+  `timeout 240s cargo test -p tx-subsystems --lib
+  file_page_io_service_owned_task_loop_holds_runtime_for_static_submission --
+  --test-threads=1` passed, `timeout 480s cargo test -p tx-subsystems --lib
+  page_backed -- --nocapture --test-threads=1` passed 115/115,
+  `timeout 480s cargo test -p tx-subsystems --lib io_manager -- --nocapture
+  --test-threads=1` passed 62/62, `timeout 240s cargo test -p tx-subsystems
+  --lib block_device_ -- --test-threads=1` passed 5/5, and
+  `timeout 480s cargo check -p tx-subsystems` passed. Step-v4-vocabulary and
+  step-no-await lints both reported 0 findings. Broad host regression
+  `timeout 900s cargo -q xtask unit` passed tx-shims 592/592, tx-kernel 104/104,
+  tx-ext4 9/9, and tx-scripts 56/56. Boundary scans still only match
+  compatibility prose in `io_manager/mod.rs` and raw substrate calls in
+  `io_manager/adapter.rs`. Remaining Phase 5 gap: a registry/discovery owner
+  still needs to create these runtimes for concrete bdevfs/ext4-backed file
+  containers and submit the owned loop from kernel init.
+
+- 2026-07-12 (PageContainer file I/O service borrowed task loop).
+  Added and verified the borrowed
+  `device::page_container_file_io_service_task_loop` shape for the aggregate
+  PageContainer file-I/O service: it waits on the io-manager service wake
+  endpoint for page/block/driver kicks, takes a fresh guard per ready turn,
+  drives `drive_page_container_file_io_service_once`, reposts self-kicks through
+  the same `ServiceWakeSource`, and reports wait/dispatch/completion counters
+  for scheduler wiring. This keeps concrete `BlockDeviceHandle` execution in
+  `device.rs`; `io_manager` and `fs_iface` remain neutral. Fresh verification:
+  `timeout 240s cargo test -p tx-subsystems --lib
+  file_page_io_service_task_loop_waits_for_service_kick_and_drives_turn --
+  --test-threads=1` passed, `timeout 480s cargo test -p tx-subsystems --lib
+  page_backed -- --nocapture --test-threads=1` passed 114/114,
+  `timeout 480s cargo test -p tx-subsystems --lib io_manager -- --nocapture
+  --test-threads=1` passed 62/62, `timeout 240s cargo test -p tx-subsystems
+  --lib block_device_ -- --test-threads=1` passed 5/5,
+  `timeout 480s cargo check -p tx-subsystems` passed, and
+  `cargo xtask lint invariants step-v4-vocabulary` plus
+  `cargo xtask lint invariants step-no-await` both reported 0 findings. Broad
+  host regression `timeout 900s cargo -q xtask unit` passed tx-shims 592/592,
+  tx-kernel 104/104, tx-ext4 9/9, and tx-scripts 56/56. Boundary scans still
+  show only compatibility prose for concrete backends and raw substrate
+  references confined to `io_manager/adapter.rs`. Remaining Phase 5 gap: global
+  service registration needs a stable owner/discovery policy for file
+  `PageContainer` plus block-handle pairs.
+
+- 2026-07-12 (PageContainer file I/O service StepOp seam).
+  Added a scheduler-facing `device::PageContainerFileIoServiceOp` wrapper for
+  one bounded aggregate PageContainer file-I/O service turn. The op keeps
+  `BlockDeviceHandle` and the concrete device executor bridge in `device.rs`,
+  takes a fresh step guard inside `StepOp::step`, returns
+  `Done(PageContainerFileIoServiceTurn)` on a successful turn, and maps internal
+  L6-to-L4 completion routing errors to `EIO`. The RED test first failed on the
+  missing wrapper, then passed after adding the op and the crate-root
+  `StepOp`/`ScriptCtx` adapter re-export. Fresh verification:
+  `timeout 240s cargo test -p tx-subsystems --lib
+  file_page_io_service_op_drives_aggregate_turn_as_step_op --
+  --test-threads=1` passed, `timeout 480s cargo test -p tx-subsystems --lib
+  page_backed -- --nocapture --test-threads=1` passed 113/113,
+  `timeout 480s cargo test -p tx-subsystems --lib io_manager -- --nocapture
+  --test-threads=1` passed 62/62, `timeout 240s cargo test -p tx-subsystems
+  --lib block_device_ -- --test-threads=1` passed 5/5,
+  `timeout 480s cargo check -p tx-subsystems` passed, `cargo -q xtask unit`
+  passed tx-shims 592/592, tx-kernel 104/104, tx-ext4 9/9, and tx-scripts
+  56/56, and `cargo xtask lint invariants step-v4-vocabulary` plus
+  `cargo xtask lint invariants step-no-await` both reported 0 findings.
+  Boundary scans still show no concrete filesystem/device executor imports
+  under `io_manager` or `fs_iface`; raw substrate references remain confined to
+  `io_manager/adapter.rs`. Remaining Phase 5 closeout is global service
+  scheduling/registration policy, not the typed op seam itself.
+
+- 2026-07-12 (I/O manager fresh closeout verification).
+  Re-ran the I/O manager landing gates in the current dirty checkout and kept
+  Phase 5 open at the scheduler-facing seam. Fresh verification:
+  `timeout 480s cargo test -p tx-subsystems --lib io_manager -- --nocapture
+  --test-threads=1` passed 62/62, `timeout 480s cargo test -p tx-subsystems
+  --lib page_backed -- --nocapture --test-threads=1` passed 112/112,
+  `timeout 240s cargo test -p tx-subsystems --lib block_device_ --
+  --test-threads=1` passed 5/5, and `timeout 480s cargo check -p
+  tx-subsystems` passed. Boundary scans still show no concrete
+  filesystem/device executor imports under `io_manager` or `fs_iface`; raw
+  substrate references remain confined to `io_manager/adapter.rs`. The only
+  warning observed is the existing unrelated
+  `crates/tx-subsystems/src/net/execution/step_connect.rs` unused `guard`.
+  Next step: either wire the aggregate file-I/O service turn into the global
+  service scheduler or record the explicit service-turn API as the temporary
+  scheduler-facing seam before closing Phase 5.
+
+- 2026-07-12 (PageContainer file I/O service turn next-state).
+  Added an explicit `PageContainerFileIoServiceNext` summary to the
+  device-layer aggregate file-I/O service turn, so future scheduler glue can
+  decide `Runnable`, `WaitingForCompletion`, or `Sleeping` without peeking into
+  the L4/L6 internals. The existing Bio-only service-turn regression now also
+  asserts that a fully drained L4 -> L6/device -> L4 completion turn reports
+  `Sleeping`, while preserving the boundary that `io_manager` remains neutral
+  and `BlockDeviceHandle` stays in `device.rs`. Verification: RED first failed
+  on missing `PageContainerFileIoServiceNext` and `turn.next`; after adding the
+  summary field, `timeout 240s cargo test -p tx-subsystems --lib
+  file_page_io_service_turn_plans_dispatches_and_applies_device_completion --
+  --test-threads=1` passed, `timeout 480s cargo test -p tx-subsystems --lib
+  page_backed -- --nocapture --test-threads=1` passed 112/112,
+  `timeout 480s cargo test -p tx-subsystems --lib io_manager -- --nocapture
+  --test-threads=1` passed 62/62, `timeout 240s cargo test -p tx-subsystems
+  --lib block_device_ -- --test-threads=1` passed 5/5, and `timeout 480s
+  cargo check -p tx-subsystems` passed with the existing
+  `net/execution/step_connect.rs` unused-`guard` warning. Boundary scans still
+  show no concrete filesystem/device executor imports under `io_manager` or
+  `fs_iface`; raw substrate references remain confined to `io_manager/adapter.rs`.
+  Remaining Phase 5 closeout is still the real global service registration hook
+  or a deliberate decision to keep the current explicit service-turn API as the
+  scheduler-facing seam for now.
+
+- 2026-07-12 (PageContainer file I/O service turn aggregation).
+  Added a device-layer `drive_page_container_file_io_service_once` turn that
+  composes the staged PageContainer L4 service, the owned L6 block runtime, the
+  `BlockDeviceHandle` compatibility executor, and a follow-up L4 completion
+  drain in one bounded service turn. This keeps `BlockDeviceHandle` knowledge in
+  `device.rs`, while callers no longer need to hand-sequence
+  `drive_file_io_service_once_owned`, `drive_page_container_file_block_device_service_once`,
+  and a second L4 completion pass for the Bio-only miss path. Added a regression
+  test proving one service turn plans a Bio, dispatches it through a real block
+  handle, observes LBA 64, applies the generation-checked PageSlot completion,
+  and lets the retry read the resident page. Verification: RED first failed on
+  missing `drive_page_container_file_io_service_once`; after the minimal helper
+  landed, `timeout 240s cargo test -p tx-subsystems --lib
+  file_page_io_service_turn_plans_dispatches_and_applies_device_completion --
+  --test-threads=1` passed, `timeout 480s cargo test -p tx-subsystems --lib
+  page_backed -- --nocapture --test-threads=1` passed 112/112,
+  `timeout 480s cargo test -p tx-subsystems --lib io_manager -- --nocapture
+  --test-threads=1` passed 62/62, `timeout 240s cargo test -p tx-subsystems
+  --lib block_device_ -- --test-threads=1` passed 5/5, and `timeout 480s
+  cargo check -p tx-subsystems` passed with the existing
+  `net/execution/step_connect.rs` unused-`guard` warning. Boundary scans still
+  show no concrete filesystem/device executor imports under `io_manager` or
+  `fs_iface`; raw substrate references remain confined to `io_manager/adapter.rs`.
+  Next step: decide whether the remaining Phase 5 closeout is a global service
+  registration hook or narrowing the direct compatibility fallback.
+
+- 2026-07-12 (PageContainer L6 service reaches real BlockDeviceHandle).
+  Connected the PageContainer-owned file-block runtime to the device-owned
+  `BlockDeviceHandle` compatibility executor without moving device knowledge
+  into `io_manager`: `device::drive_page_container_file_block_device_service_once`
+  now wraps `BlockDeviceDispatchAdapter` and calls the existing
+  `PageContainer::drive_file_block_io_service_once` seam, so the PageContainer
+  lock is released before actual block I/O. Added a regression test where a
+  Bio-only planned file miss yields, the owned L6 queue dispatches through a
+  real `BlockDeviceHandle`, the device read observes LBA 64, L6 completion
+  routes into PageService, and the retry observes the generation-checked
+  resident page. Verification: RED first failed on missing helper, then failed
+  because the old placeholder `BioVec` buffer key was not a valid allocator
+  PPN for the real device adapter; after switching this test to a valid PPN,
+  `timeout 240s cargo test -p tx-subsystems --lib
+  file_page_bio_only_plan_drives_owned_l6_through_block_device_handle --
+  --test-threads=1`, `timeout 480s cargo test -p tx-subsystems --lib
+  page_backed -- --nocapture --test-threads=1` passed 111/111,
+  `timeout 480s cargo test -p tx-subsystems --lib io_manager -- --nocapture
+  --test-threads=1` passed 62/62, `timeout 240s cargo test -p tx-subsystems
+  --lib block_device_ -- --test-threads=1` passed 5/5, and `timeout 480s
+  cargo check -p tx-subsystems` passed with the existing
+  `net/execution/step_connect.rs` unused-`guard` warning. Boundary scans still
+  show no concrete filesystem/device executor imports under `io_manager` or
+  `fs_iface`; raw substrate references remain confined to `io_manager/adapter.rs`.
+  Next step: decide whether Phase 5 should close after a service-loop scheduler
+  hook, or stay open until direct compatibility miss fallback is narrowed.
+
+- 2026-07-12 (time service wall-clock callsite convergence).
+  Moved production wall-clock consumers off the `tx_subsystems::wall_clock`
+  compatibility facade after making boot/init own hook installation explicitly:
+  `CoreInit::init_substrate_if_ready` now calls
+  `tx_subsystems::wall_clock::ensure_hooks_installed()` before trap/vDSO/device
+  paths, while kernel vDSO/net init, tx-subsystems timerfd/VVAR, and tx-shims
+  time/timerfd/epoll/io/ipc/signal/vm/socket call sites import
+  `tx_services::time::{timekeeper, timekeeper_clock, TimekeeperClock,
+  TimekeeperIf}` directly. The compatibility shim's test reset now resets the
+  service state and then force-reinstalls hooks, fixing timerfd cancel-on-set
+  tests under parallel harness execution. `time-layering` gained a hard rule
+  rejecting production imports from `tx_subsystems::wall_clock` /
+  `crate::wall_clock` for ordinary timekeeper facade access; the old module is
+  now limited to hook installation, old-path re-export, and test-support reset.
+  Updated `docs/design/02_execution/TIME_WAKE_v1.md` and
+  `docs/stage2-documents/time_infra/TX_TIMER_SUBSYSTEM_DESIGN_CN.md` to match
+  the topology. Verification: scoped rustfmt; boundary scans show only hook
+  install plus test/shim references to the old path; `cargo check -p
+  tx-services -p tx-subsystems -p tx-shims -p tx-kernel --lib` passed with
+  existing warnings; `cargo test -p tx-services -- --nocapture` passed 8/8;
+  focused `tx-subsystems` timerfd/vDSO tests passed; `cargo test -p tx-shims
+  --lib time_syscalls -- --nocapture` passed 27/27; `cargo test -p tx-shims
+  --lib timerfd_dispatch -- --nocapture` passed 10/10; `cargo xtask lint
+  invariants time-layering`, `cargo test -p xtask time_layering --
+  --nocapture`, and `cargo xtask lint invariants time-wake-retired` passed at
+  0 findings. Next step: decide when to retire the old-path re-export and move
+  remaining test constants/reset users onto an explicit `tx-services` test
+  support surface.
+
+- 2026-07-12 (endpoint language follow-up).
+  Tightened the object-owned wait endpoint language after the initial
+  convergence pass: `ProcessPayload` now exposes `exit_endpoint()`, and
+  `ProcessIdentity::exit_endpoint()` resolves through the payload endpoint
+  rather than the older `exit_wait_source()` spelling. The remaining direct
+  `wait_on_source_id()` helper is now test-only, so production wait code must
+  use object endpoints or the explicit registered raw bridge. Updated TTY
+  ingest publication and AIO/io_uring parent tests to use endpoint accessor
+  names when subscribing to the same mailbox-backed `WaitSource`, then
+  narrowed the old public source-handle accessors for AIO, io_uring,
+  signalfd, userfaultfd, TTY, pipe, and RNode so the exported object language
+  is the endpoint accessor set. Also restored the service time facade
+  `timekeeper` / `timekeeper_clock` re-exports so the broad endpoint check does
+  not conflict with time-layering. Verification: scoped `rustfmt --edition
+  2024`, scoped `git diff --check`, endpoint/raw wait scans, `cargo check -p
+  tx-subsystems -p tx-shims`, focused wait-source endpoint/source-id tests,
+  focused tx-shims parent-exit endpoint publication test, `cargo xtask lint
+  invariants legacy-wait-channel`, `cargo xtask lint invariants
+  time-layering`, and `cargo xtask progress validate` passed. Remaining
+  registered-source waits are classified as socket/net RawQueue/RawPort, fd
+  raw fallback, RTC/devfs raw, or registry tests.
+
+- 2026-07-12 (PageContainer Bio-only miss stays async).
+  Advanced the real file-miss path past the previous compatibility fallback:
+  when a mounted backend planner returns only `BioPlan` work, `PageContainer`
+  now drives the owned L4/L6 runtime, yields on a PageBacked PageReady source,
+  and leaves the request in the persistent block queue/tracker instead of
+  calling `FsPageBacking::fetch_page`. L6 tagged completion now flows back
+  through PageService, applies the generation-checked PageSlot completion,
+  retires the matching `in_flight_file_pages` owner fetch, and lets the retry
+  observe the installed page. Added/updated the materialize test to cover
+  yield-without-compat-fetch, owned L6 completion, in-flight retirement, and
+  retry-to-resident behavior. Also restored `tx_services::time` facade exports
+  for `timekeeper` / `timekeeper_clock`, which current dirty-tree timerfd/vDSO
+  callers still import. Verification: RED first failed with synchronous
+  `Done(...)` from compat fetch, then failed on missing in-flight retirement,
+  then `timeout 240s cargo test -p tx-subsystems --lib
+  file_page_materialize_bio_only_plan_yields_without_compat_fetch --
+  --test-threads=1` passed; `timeout 480s cargo test -p tx-subsystems --lib
+  page_backed -- --nocapture --test-threads=1` passed 110/110; `timeout 480s
+  cargo test -p tx-subsystems --lib io_manager -- --nocapture
+  --test-threads=1` passed 62/62; `timeout 240s cargo test -p tx-subsystems
+  --lib block_device_ -- --test-threads=1` passed 4/4; `timeout 480s cargo
+  check -p tx-subsystems` passed with the existing
+  `net/execution/step_connect.rs` unused-`guard` warning; scoped rustfmt,
+  boundary scans, and whitespace checks passed. Next step: connect the
+  device-owned `BlockDeviceHandle` service turn into this owned runtime from
+  the actual service scheduling path rather than only test executors.
+
+- 2026-07-12 (PageContainer-owned L6 runtime).
+  Advanced I/O manager Phase 5 from test-owned L6 bookkeeping to a
+  PageContainer-owned runtime: `PageContainerState` now retains the file BIO
+  `BlockQueue`, `BlockPageRequestTracker`, `BlockTagTable`, and `QueueDepth`;
+  `drive_file_io_service_once_owned` queues backend BioPlans into that
+  persistent runtime, and `drive_file_block_io_service_once` dispatches one
+  neutral block-service turn through caller-supplied executor/completion-source
+  traits, polling completions outside the PageContainer lock before routing
+  tagged block completions back into PageService for generation-checked
+  PageSlot install. A RED/GREEN test now proves Bio-only plans can persist
+  through L6 dispatch/completion and install a resident file slot without an
+  external test-owned tracker. Also fixed the `tx-subsystems` lib-test feature
+  chain by enabling `tx-services/test-support` as a dev-dependency, so
+  `tx_services::time::wall_clock::reset_for_test` is visible when
+  `tx-subsystems` compiles its own `cfg(test)` wrapper. Verification:
+  focused RED then GREEN for
+  `file_page_owned_l6_runtime_routes_bio_completion_into_page_slot`;
+  `timeout 480s cargo test -p tx-subsystems --lib page_backed --
+  --nocapture --test-threads=1` passed 110/110; `timeout 480s cargo test -p
+  tx-subsystems --lib io_manager -- --nocapture --test-threads=1` passed
+  62/62; `timeout 240s cargo test -p tx-subsystems --lib block_device_ --
+  --test-threads=1` passed 4/4; `timeout 480s cargo check -p tx-subsystems`
+  passed with the existing `net/execution/step_connect.rs` unused-`guard`
+  warning; scoped rustfmt, boundary scans, and whitespace checks passed. Next
+  step: make the real file miss/service loop choose the persistent async path
+  without duplicate compatibility fetches, then connect the device-owned
+  `BlockDeviceHandle` bridge through the same owned runtime.
+
+- 2026-07-12 (observe Python host boundary package).
+  Started moving the Python analyzer out of a single mixed L4/L5/L6 script by
+  adding `tools/tx_observe_host/` as a host-side package:
+  `l4_readers/` owns `TraceIntegrity`, `TraceLoadResult`, `.txtrace`,
+  `.rawrecords`, and NDJSON stream readers,
+  `l5_canonical/` owns `TraceEventStream`, `TraceStreamMarker`, and marker
+  derivation plus payload/record decode and ordering helpers, and
+  `l6_views/` owns `ProjectionInput`, generated host catalog validation,
+  projection schema lookup/cache, typed JSON/DuckDB select helpers, and
+  `l6_views/tables.py` derived table/cache/export execution plus
+  `l6_views/reports.py` text report projections. The historical
+  `tools/tx-observe-analyze.py` CLI remains the compatibility facade and
+  re-exports the same names, so existing tests and `cargo xtask observe
+  analyze` call shapes do not change. Tightened `xtask observe-schema` analyzer
+  boundary checking so boundary types must either be local test fixtures or
+  imported through `tx_observe_host`; analyzer-local SQL/Parquet schema
+  constants remain rejected, and local raw-reader/decode ownership
+  (`mmap`/`struct`, `RECORD_STRUCT`, `decode_*`, and stream-reader definitions)
+  is now rejected from the compatibility script. Analyzer-local projection
+  schema helpers (`_PROJECTION_SCHEMA_CATALOG`, `validate_host_catalog`,
+  `projection_schema_catalog`, `parquet_select_sql`, and `typed_select_sql`)
+  are also rejected so generated host-catalog interpretation remains in L6.
+  Continued the L6 split by moving `DerivedTables`, `DerivedCacheResult`,
+  derived-table construction/cache keys, SQL view materialization, Parquet
+  export/cache manifest handling, Parquet text summary, and Python-hook
+  table-dir execution from `tools/tx-observe-analyze.py` into
+  `tools/tx_observe_host/l6_views/tables.py`; the analyzer now imports and
+  re-exports those APIs while keeping text report assembly and CLI dispatch as
+  the compatibility frontend. `xtask observe-schema check` now also rejects
+  analyzer-local L6 table/projection execution definitions such as
+  `build_derived_tables`, `run_sql_query`, `export_derived_tables_parquet`,
+  and `run_python_projection`.
+  Finished the text-report slice by moving `analyze`, `analyze_projection`,
+  `analyze_allocation_tracks`, `analyze_lock_metrics`, futex/scheduler/VM
+  report helpers, phase-sequence helpers, and report formatting helpers into
+  `tools/tx_observe_host/l6_views/reports.py`; the analyzer now keeps input
+  selection, name loading, argument parsing, and process exit locally. The
+  schema gate rejects analyzer-local text-report projection definitions too.
+  Added analyzer tests proving the facade-exported boundary types, raw
+  reader/decode functions, and catalog/schema helpers come from the L4/L5/L6
+  package modules. The Python host layers are now package directories rather
+  than flat files, and `xtask observe-schema check` rejects the old
+  `l4_readers.py`, `l5_canonical.py`, and `l6_views.py` layer files. Updated
+  the L0-L6 refactor doc host folder map and gap table. Verification: `rustfmt
+  --edition 2021 --check xtask/src/observe_schema.rs`, scoped `git diff
+  --check`, `python3 -m py_compile tools/tx-observe-analyze.py
+  tools/tx_observe_host/__init__.py
+  tools/tx_observe_host/l4_readers/__init__.py
+  tools/tx_observe_host/l5_canonical/__init__.py
+  tools/tx_observe_host/l6_views/__init__.py
+  tools/tx_observe_host/l6_views/tables.py
+  tools/tx_observe_host/l6_views/reports.py tools/tests/test_tx_observe_analyze.py`,
+  `python3 -m unittest tools.tests.test_tx_observe_analyze`, and
+  `CARGO_TARGET_DIR=target/codex-observe-host cargo test -p xtask --lib
+  observe_schema -- --nocapture` (15/15),
+  `CARGO_TARGET_DIR=target/codex-observe-host cargo test -p tx-observe --test
+  layout -- --nocapture` (2/2), `CARGO_TARGET_DIR=target/codex-observe-host
+  cargo test --manifest-path tools/tx-trace-daemon/Cargo.toml --test layout
+  -- --nocapture` (5/5), `cargo xtask
+  observe-schema check`, `cargo xtask observe-schema codegen --check`, `cargo
+  xtask progress validate`, and `cargo xtask lint docs` passed. Docs lint still
+  reports the known non-fatal stale-vocabulary warnings. Next step: reduce
+  duplicate Python/Rust host decode/report logic only if a shared host library
+  boundary becomes worth the extra build-system cost.
+
+- 2026-07-12 (time service wall-clock physical consolidation).  Moved the
+  wall-clock/timekeeper implementation from `tx-subsystems/src/wall_clock.rs`
+  into `tx-services/src/time/wall_clock.rs`, so `Timekeeper`,
+  `TimekeeperClock<P>`, `TimekeeperIf`, `VvarSnapshot`, realtime offset,
+  generation, persistent seed/writeback, and VVAR snapshot generation now live
+  under the time service folder. `tx-subsystems::wall_clock` is now a
+  compatibility shim that re-exports the old path and installs two
+  subsystem-local hooks: timerfd clock-set cancel/revalidation notification and
+  VVAR snapshot publication. `tx-services` now runs its lib tests so the moved
+  wall-clock unit tests remain covered. `time-layering` allowlist moved the raw
+  HAL timekeeper home from `tx-subsystems/src/wall_clock.rs` to
+  `tx-services/src/time/wall_clock.rs`; the old subsystem path is no longer a
+  raw-HAL allowlist entry. Also fixed a timer-boundary compile fallout in
+  `tx-kernel/src/adapter.rs` by importing `TimerGuard` / `TimerGuardRole` from
+  the substrate timer surface inside the adapter instead of from the reactor
+  crate root. Verification: `cargo test -p tx-services -- --nocapture` passed
+  8/8; focused `tx-subsystems` tests passed for
+  `cancel_on_set_marks_realtime_absolute_timer_canceled` and `vdso`; `cargo
+  test -p tx-shims --lib timerfd_dispatch -- --nocapture` passed 10/10;
+  `cargo test -p tx-shims --lib time_syscalls -- --nocapture` passed 27/27;
+  `cargo check -p tx-services -p tx-subsystems -p tx-shims -p tx-kernel --lib`
+  passed with existing warnings; `cargo xtask lint invariants time-layering`
+  reported 0 findings; `cargo test -p xtask time_layering -- --nocapture`
+  passed 12/12; `cargo xtask lint invariants time-wake-retired` stayed at 0.
+  The wider `cargo check -p tx-services -p tx-subsystems -p tx-shims -p
+  tx-kernel --tests` remains blocked by unrelated dirty-tree imports in
+  `tx-subsystems/tests/v3_signal_interrupt_wake.rs`. Next step: move call
+  sites from `tx_subsystems::wall_clock` to `tx_services::time` after boot/init
+  owns hook installation centrally, then retire the compatibility shim.
+
+- 2026-07-12 (observe L4 live-drain folder split).
+  Split `tools/tx-trace-daemon/src/l4_readers/replay.rs` so file-backed
+  txtrace replay/bundle/stat helpers remain in `replay.rs`, while live
+  guest-memory drain, raw-record finalization, and ELF symbol-to-guest-RAM
+  offset resolution now live in `tools/tx-trace-daemon/src/l4_readers/live.rs`.
+  The public compatibility entry points stay available through
+  `l4_readers::replay::{run_live_guest_mem, LiveDrainConfig}` for existing CLI
+  code. Added a daemon layout test that fixes this L4 sub-boundary and
+  prevents guest-memory mmap ownership from drifting back into replay. Updated
+  the L0-L6 refactor doc host folder map to name the L4 child files
+  explicitly. Verification: `rustfmt --edition 2021 --check` on touched
+  daemon Rust files, scoped `git diff --check`, `cargo test --manifest-path
+  tools/tx-trace-daemon/Cargo.toml --test layout -- --nocapture`, `cargo test
+  --manifest-path tools/tx-trace-daemon/Cargo.toml -- --nocapture`, `cargo
+  test -p tx-observe --test layout -- --nocapture`, `cargo test -p
+  tx-observe --test smoke -- --nocapture`, `cargo test -p xtask
+  observe_schema -- --nocapture`, `cargo xtask observe-schema check`, `cargo
+  xtask observe-schema codegen --check`, `cargo xtask progress validate`, and
+  `cargo xtask lint docs` passed. The daemon tests still emit only the
+  pre-existing Perfetto dead-code warnings; docs lint still reports the known
+  stale-vocabulary warnings as non-fatal. Next step: continue reducing the
+  analyzer/daemon duplicate decode path under the L4/L5 boundary.
+
+- 2026-07-12 (epoll fd-endpoint wait convergence).
+  Carried fd facade endpoints through epoll registration instead of dropping
+  them to raw `WaitSourceId`: `FdReadyReport` now exposes a
+  `primary_endpoint()` clone, `EpollEntry` stores an optional object endpoint
+  alongside the legacy source id, and syscall `epoll_wait` registers endpoint
+  handles directly when present. The syscall single-source-id wait helper was
+  removed; `await_any_wait_source` remains only as the mixed endpoint/raw
+  multi-wait bridge and uses endpoint handles before falling back to registry
+  lookup. Verification: `cargo test -p tx-shims --lib epoll_dispatch --
+  --nocapture --test-threads=1` passed 10/10; `cargo check -p tx-shims`
+  passed with existing warnings; scoped endpoint/source scans show epoll no
+  longer has direct `wait_on_registered_source_id` waits; `cargo xtask lint
+  invariants legacy-wait-channel` passed with production legacy sites at 0 and
+  report-only inventory at 8. Remaining registered-source use is confined to
+  socket direct wait, fd fallback/RTC raw device wait, net raw-queue bridges,
+  and wait-source registry tests.
+
+- 2026-07-12 (eventfd/timerfd mandatory endpoint convergence).
+  Tightened the remaining object-owned eventfd/timerfd wait sources from
+  optional compatibility handles into mandatory endpoints: `EventFd`
+  reader/writer sources and `TimerFd` readable source are now stored as
+  `Arc<WaitSource>` and expose non-optional `*_endpoint()` accessors; their
+  notification adapters now take endpoint references directly. VFS fd readiness
+  now pushes those endpoints without `Option` branches, and syscall eventfd,
+  timerfd, and wait4 waits no longer fall back to source-id awaits when an
+  object endpoint is in scope. Verification: the endpoint-option/fallback scan
+  over eventfd/timerfd/VFS/syscall paths returned no matches; `cargo check -p
+  tx-subsystems -p tx-shims` and `cargo check -p tx-shims` passed with only the
+  existing `net/execution/step_connect.rs` unused-`guard` and
+  `tx_ext4_bridge.rs` unused-`Vec` warnings; focused tx-shims tests passed for
+  eventfd reader wake, timerfd periodic read rearm, and wait4 blocking
+  child-zombie wake; `cargo xtask lint invariants legacy-wait-channel` passed
+  with production legacy sites still at 0 and report-only inventory still at 8.
+  `cargo test -p tx-subsystems --lib eventfd` is currently blocked before
+  eventfd by an unrelated dirty-tree `page_backed/core_tests.rs` reference to
+  missing `drive_file_io_service_once_with_tracker`. Next step: continue the
+  remaining registered-source audit at fd/socket/net bridges.
+
+- 2026-07-12 (syscall endpoint wait convergence).
+  Added the syscall-side `await_wait_endpoint(ctx, endpoint, interests)` helper
+  so blocking syscall arms can subscribe through object-owned endpoints while
+  preserving the existing `ctx.mailbox` signal-wake behavior. Converted AIO
+  `io_getevents`, POSIX mq blocking readiness, wait4 parent-exit wait, and the
+  eventfd/signalfd/timerfd/userfaultfd read/write wait branches to use endpoint
+  handles where the object cap is already in scope; only endpoint-missing
+  fallbacks and raw fd/socket/net bridges still route through registered source
+  ids. Verification: `cargo check -p tx-shims` passed with only the existing
+  `net/execution/step_connect.rs` unused-`guard` and `tx_ext4_bridge.rs`
+  unused-`Vec` warnings; focused tests passed for eventfd reader wake, mq
+  blocking receive/send, AIO `v3_aio_io_getevents`, timerfd periodic read
+  rearm, and wait4 blocking child-zombie wake; `cargo xtask lint invariants
+  legacy-wait-channel` passed with production legacy sites still at 0 and
+  report-only inventory still at 8. Next step: audit whether eventfd/timerfd
+  endpoint fields can become non-optional and continue classifying remaining
+  fd/socket/net registered-source fallbacks.
+
+- 2026-07-12 (PageContainer records L6 submit outcomes).
+  Closed the next Phase-5 retention gap between PageContainer's file service
+  and the L6/device completion bridge. `PageContainer` now exposes
+  `drive_file_io_service_once_with_tracker`, a compatibility-preserving variant
+  of `drive_file_io_service_once` that records `BlockBiosQueued` and
+  `MetadataFirstQueued` `SubmitOutcome`s into `BlockPageRequestTracker` while
+  keeping the old service drive API intact. This means a Bio-only backend plan
+  submitted by the PageContainer-owned L4 service can later be resolved back to
+  the original `PageIoRequest` and generation when L6/device completion
+  arrives. Verification: RED first failed on missing
+  `drive_file_io_service_once_with_tracker`; `timeout 240s cargo test -p
+  tx-subsystems --lib
+  file_page_service_records_l6_submit_outcomes_for_later_completion --
+  --test-threads=1` then passed 1/1; `timeout 480s cargo test -p
+  tx-subsystems --lib page_backed -- --nocapture --test-threads=1` passed
+  109/109; `timeout 480s cargo test -p tx-subsystems --lib io_manager --
+  --nocapture --test-threads=1` passed 62/62; `timeout 240s cargo test -p
+  tx-subsystems --lib block_device_ -- --test-threads=1` passed 4/4; `timeout
+  480s cargo check -p tx-subsystems` passed with the existing
+  `net/execution/step_connect.rs` unused-`guard` warning; scoped rustfmt and
+  boundary scans passed. Remaining Phase-5 work: wire a persistent runtime
+  owner for the block queue/tracker/tag/depth state and invoke the device turn
+  from the real service loop instead of only tests/compat callers.
+
+- 2026-07-12 (I/O manager block-device service turn bridge).
+  Added the first device-owned block-service turn that composes the existing
+  L6 and L7 seams without moving device execution into `io_manager::block`.
+  `drive_block_device_service_once` lives in
+  `crates/tx-subsystems/src/device.rs`: it drives one `BlockServiceDriver`
+  turn, submits resulting `BlockDispatch` values through
+  `BlockDeviceDispatchAdapter`, polls `BlockDeviceCompletion`, and routes
+  tagged completions through `PageService::push_tagged_block_completion` using
+  the retained `BlockPageRequestTracker`. The current frame resolver is still a
+  staging resolver from `BioVec::buffer_key` to `PageFrameRef`, matching the
+  adapter's placeholder `Frame` mapping; real frame ownership is the next
+  integration step. Verification: RED first failed on missing
+  `drive_block_device_service_once`; `timeout 240s cargo test -p
+  tx-subsystems --lib
+  block_device_service_turn_routes_read_completion_into_page_service --
+  --test-threads=1` then passed 1/1; `timeout 240s cargo test -p
+  tx-subsystems --lib block_device_ -- --test-threads=1` passed 4/4;
+  `timeout 240s cargo test -p tx-subsystems --lib io_manager::block --
+  --test-threads=1` passed 10/10; `timeout 480s cargo test -p tx-subsystems
+  --lib io_manager -- --nocapture --test-threads=1` passed 62/62; `timeout
+  480s cargo check -p tx-subsystems` passed with the existing
+  `net/execution/step_connect.rs` unused-`guard` warning; scoped rustfmt and
+  boundary scans passed. Phase 5 remains in progress: the helper is not yet
+  called from the real PageContainer/file-I/O service path.
+
+- 2026-07-12 (I/O manager device-side dispatch adapter).
+  Added the device-layer compatibility executor for the staged L6/L7 seam:
+  `BlockDeviceDispatchAdapter` lives in `crates/tx-subsystems/src/device.rs`,
+  maps neutral `BlockDispatch` values onto the existing `BlockDeviceHandle`
+  read/write/barrier executor, and reports `BlockDeviceCompletion` values
+  through a local polled completion queue. This keeps `io_manager::block`
+  neutral: it still owns tags, queue depth, and barrier ordering, but does not
+  import `BlockDeviceHandle`, concrete drivers, `tx-fs`, or `tx-ext4`.
+  Verification: `timeout 240s cargo test -p tx-subsystems --lib
+  block_device_dispatch_adapter_ -- --test-threads=1` passed 2/2; `timeout
+  240s cargo test -p tx-subsystems --lib io_manager::block --
+  --test-threads=1` passed 10/10; `timeout 480s cargo test -p tx-subsystems
+  --lib io_manager -- --nocapture --test-threads=1` passed 62/62; `timeout
+  480s cargo check -p tx-subsystems` passed with the existing
+  `net/execution/step_connect.rs` unused-`guard` warning; scoped rustfmt and
+  boundary scans passed. Next step: wire this adapter into an actual block
+  service loop and feed `PageService::push_tagged_block_completion` with a real
+  frame resolver; Phase 5 remains in progress.
+
+- 2026-07-12 (observe host L6 schema truth closure).
+  Continued the host-side observe refactor by removing analyzer-local
+  projection schema constants (`PARQUET_SCHEMAS`, `RECORD_SQL_SCHEMA`,
+  `REPAIR_SQL_SCHEMA`, `NAME_SQL_SCHEMA`) from
+  `tools/tx-observe-analyze.py`. SQL and Parquet paths now rely on
+  `projection_schema_catalog()` backed by the generated
+  `tools/tx-observe-host-catalog.json`; `xtask observe-schema check` no
+  longer reverse-parses analyzer constants and instead keeps analyzer boundary
+  symbols plus TOML/catalog codegen as the enforcement split. The same gate now
+  rejects reintroduced analyzer-local projection schema constants. Updated
+  `schema/txobserve.toml`, regenerated the host catalog, and aligned
+  `docs/Txv3/08_OBSERVATION_L0_L6_REFACTOR_v0.md` to describe the generated
+  catalog as the host projection source of truth. Verification:
+  `python3 -m py_compile tools/tx-observe-analyze.py
+  tools/tests/test_tx_observe_analyze.py`, `python3 -m unittest
+  tools.tests.test_tx_observe_analyze`, `cargo test -p xtask observe_schema
+  -- --nocapture` (12/12, including the local-schema-constant rejection),
+  `cargo xtask observe-schema check`, `cargo xtask
+  observe-schema codegen --check`, and `cargo test --manifest-path
+  tools/tx-trace-daemon/Cargo.toml --test layout -- --nocapture` passed.
+  Next step: continue reducing the duplicate analyzer/daemon decode path under
+  an explicit shared host library boundary.
+
+- 2026-07-12 (observe L0-L6 explicit folder alignment).
+  Tightened the observe module layout to match
+  `docs/Txv3/08_OBSERVATION_L0_L6_REFACTOR_v0.md`: the crate root is now a
+  thin compatibility facade, while `HartEmitter` and the bounded producer
+  runtime live under `crates/tx-observe/src/l2_producer/runtime.rs`; L2
+  diagnostic dump/reset/serial extraction helpers live under
+  `crates/tx-observe/src/l2_producer/dump.rs`.
+  `schema/txobserve.toml`, `xtask observe-schema check`, and the L0-L6
+  refactor doc now point at the L2 runtime source for the public
+  `HartEmitter` method catalog. Existing L0/L1/L3 and host L4/L5/L6
+  directories remain enforced by layout tests. Verification:
+  `rustfmt --edition 2021 --check` on touched Rust files,
+  `cargo test -p tx-observe --test layout -- --nocapture`, `cargo test -p
+  tx-observe --test smoke -- --nocapture`, `cargo test --manifest-path
+  tools/tx-trace-daemon/Cargo.toml --test layout -- --nocapture`, `cargo test
+  -p xtask observe_schema -- --nocapture`, `cargo xtask observe-schema
+  check`, `cargo xtask observe-schema codegen --check`, and scoped
+  `git diff --check` passed. Next step: continue tightening L1 typed event
+  wrappers and L2 publish-status capabilities without changing txtrace-v0.
+
+- 2026-07-12 (I/O manager L6/L7 executor seam).
+  Added the neutral L6-to-L7 dispatch/completion seam in
+  `io_manager::block`. `BlockDispatchExecutor` lets a future device executor
+  consume `BlockDispatch` values without `io_manager::block` importing
+  `BlockDeviceHandle` or concrete drivers. `BlockDeviceCompletion` plus
+  `BlockCompletionSource` let L7 report `(tag, result)` back to
+  `BlockTagTable`, which then performs the existing request lookup and
+  `QueueDepth` completion accounting. `BlockServiceDriver` now has
+  `drive_once_with_executor` as the service-loop handoff shape. This keeps L6
+  keyed by block requests/tags and leaves page request tracking in
+  `io_manager::backend`. During verification, restored the narrow
+  `tx-observe::l2_producer::runtime` module re-export in
+  `crates/tx-observe/src/l2_producer/mod.rs`; the current dirty tree had split
+  the file but not re-exported the existing runtime symbols, blocking every
+  `tx-subsystems` cargo check. Verification: RED first failed on missing
+  `BlockDispatchExecutor`, `BlockDeviceCompletion`, and
+  `BlockCompletionSource`; focused tests then passed for
+  `block_service_submits_dispatches_to_executor_port` and
+  `block_tag_table_completes_polled_device_completion`; `timeout 480s cargo
+  test -p tx-subsystems --lib io_manager::block -- --test-threads=1` passed
+  10/10; `timeout 480s cargo test -p tx-subsystems --lib io_manager --
+  --nocapture --test-threads=1` passed 62/62; `timeout 480s cargo check -p
+  tx-subsystems` passed with the existing `net/execution/step_connect.rs`
+  unused-`guard` warning; progress validation, docs lint, boundary scans, and
+  scoped rustfmt passed. Remaining Phase 5 work: add the actual
+  device-side compatibility adapter that maps `BlockDispatch` into the current
+  `BlockDeviceHandle` executor and returns `BlockDeviceCompletion`.
+
+- 2026-07-12 (I/O manager phase-5 L6 block service turn).
+  Added a neutral L6 `BlockServiceDriver` in `io_manager::block`. It drains
+  `BlockQueue` under `ServiceBudget`, allocates tags through `BlockTagTable`,
+  updates `QueueDepth`, returns `BlockDispatch` values for the eventual driver
+  executor, and posts a block-service kick only when the remaining queue is
+  still immediately dispatchable. The L6 service shape does not mention
+  `PageIoRequest`, `PageService`, Mount, concrete filesystems, or drivers, so
+  file-page request retention remains in `io_manager::backend` and completion
+  routing remains in L4. Verification: RED first failed on missing
+  `BlockServiceDriver` / `BlockServiceStep` / `BlockServiceNext`, then
+  `timeout 240s cargo test -p tx-subsystems --lib block_service_ --
+  --test-threads=1` passed 2/2; `timeout 240s cargo test -p tx-subsystems
+  --lib io_manager::block -- --test-threads=1` passed 8/8; `timeout 480s
+  cargo test -p tx-subsystems --lib io_manager -- --nocapture
+  --test-threads=1` passed 60/60; `timeout 480s cargo check -p
+  tx-subsystems` passed with the existing `net/execution/step_connect.rs`
+  unused-`guard` warning; scoped rustfmt and boundary scans passed. Remaining
+  Phase 5 work: connect a concrete block-device executor/completion source to
+  consume `BlockDispatch` and feed `PageService::push_tagged_block_completion`
+  with a real frame resolver.
+
+- 2026-07-12 (I/O manager phase-5 tagged L6 completion ingress).
+  Added the neutral PageService helper that closes the current L6-to-L4
+  completion bridge slice without touching real drivers. The new
+  `PageService::push_tagged_block_completion` takes a `BlockTagTable` tag
+  completion, updates `QueueDepth`, fans the resulting `BlockCompletion`
+  through `BlockPageRequestTracker`, attaches read frames through a caller
+  resolver, and queues generation-bearing page completions back into the L4
+  PageService completion queue. This keeps page request tracking in
+  `io_manager::backend` / `page::service`; `io_manager::block` still does not
+  know file-page semantics. Verification: RED first failed on missing
+  `push_tagged_block_completion`, then `timeout 240s cargo test -p
+  tx-subsystems --lib page_service_routes_tagged_l6_completion_into_l4_queue
+  -- --test-threads=1` passed 1/1; `timeout 480s cargo test -p
+  tx-subsystems --lib page_service_ -- --test-threads=1` passed 34/34;
+  `timeout 480s cargo test -p tx-subsystems --lib io_manager -- --nocapture
+  --test-threads=1` passed 58/58; `timeout 480s cargo check -p
+  tx-subsystems` passed with the existing `net/execution/step_connect.rs`
+  unused-`guard` warning; scoped rustfmt and boundary scans passed. Remaining
+  Phase 5 work: wire a real block-service/driver completion source to call
+  this helper and provide the frame resolver.
+
+- 2026-07-12 (PageBacked page-ready endpoint wait convergence).
+  Converted the PageBacked joined file-page fetch wait from raw source-id yield
+  language to endpoint language. `FilePageFetchStart::Joined` now carries the
+  cloned page-ready `WaitSource` endpoint, and `materialize_file_page` calls
+  `yield_on_page_ready_source(NoProgress, endpoint)`; `FilePageFetch::source_id`
+  remains as the L4 route-registration key for in-flight fetch waiter
+  bookkeeping. `page_ready_endpoint` is re-exported through the PageBacked
+  notification facade so owner state can clone the endpoint without reaching
+  into the adapter module. Verification: `cargo check -p tx-subsystems` passed
+  with the existing `net/execution/step_connect.rs` unused-`guard` warning;
+  `cargo test -p tx-subsystems --lib page_backed::notification -- --nocapture
+  --test-threads=1` passed 1/1; `cargo test -p tx-subsystems --lib
+  page_backed::core_tests::file_page_retire_notifies_only_when_l4_route_has_waiter
+  -- --nocapture --test-threads=1` passed 1/1; `cargo test -p tx-subsystems
+  --lib page_backed::core_tests::file_page_stale_owner_after_truncate_cannot_publish_page
+  -- --nocapture --test-threads=1` passed 1/1; `cargo xtask lint invariants
+  legacy-wait-channel` passed with production legacy sites at 0 and
+  report-only inventory at 8; scoped `rustfmt`, endpoint/source-id scans, and
+  `git diff --check` passed. Remaining direct registered-id await bridges are
+  still socket/net RawQueue/RawPort, fd fallback, RTC/devfs RawQueue, plus
+  compatibility getters/tests and notification/adapter internals that lower
+  endpoint/id carriers into `YieldShape::OnWaitSource`.
+
+- 2026-07-12 (IPC/AIO endpoint wait convergence).
+  Continued the object-owned `WaitSource` endpoint migration across IPC and
+  async-I/O surfaces. SysV msg/sem wait helpers now take `WaitEndpoint` values
+  and derive the yielded carrier id internally; `msgsnd`/`msgrcv` blocking
+  waits pass `send_endpoint()` / `recv_endpoint()`, and `semop` blocking waits
+  pass `changed_endpoint()`. POSIX mq poll info now carries read/write endpoint
+  handles inherited from the SysV queue payload, so fd readiness pushes
+  endpoints and `mq_timedsend` / `mq_timedreceive` wait through an endpoint
+  derived carrier instead of reconstructing `WaitSourceId` from raw ids. AIO
+  `io_getevents` now derives the wait source from
+  `events_available_endpoint()`. AIO and io_uring wait-point construction was
+  tightened to private fields plus endpoint accessors/`into_parts()`, with
+  stored ids derived from `WaitEndpoint::source_id(...)` before the object
+  stores the sources. Verification: `cargo test -p tx-subsystems --lib
+  ipc::sysv_msg -- --nocapture --test-threads=1` passed 7/7; `cargo test -p
+  tx-subsystems --lib ipc::sysv_sem -- --nocapture --test-threads=1` passed
+  6/6; `cargo test -p tx-subsystems --lib ipc::posix_mq -- --nocapture
+  --test-threads=1` passed 3/3; `cargo test -p tx-subsystems --lib aio:: --
+  --nocapture --test-threads=1` passed 12/12; `cargo test -p tx-subsystems
+  --lib io_uring:: -- --nocapture --test-threads=1` passed 10/10; `cargo
+  check -p tx-subsystems -p tx-shims` passed with the existing
+  `net/execution/step_connect.rs` unused-`guard` warning and existing
+  `tx-fs/src/tx_ext4_bridge.rs` unused-`Vec` warning; `cargo xtask lint
+  invariants legacy-wait-channel` passed with production legacy sites at 0 and
+  report-only inventory at 8; scoped `rustfmt`, endpoint/source-id scans, and
+  `git diff --check` passed. Remaining direct registered-id await bridges are
+  socket/net RawQueue/RawPort, fd fallback, RTC/devfs RawQueue, plus
+  compatibility getters/tests and notification/adapter internals that lower
+  endpoints into `YieldShape::OnWaitSource`.
+
+- 2026-07-12 (pipe/TTY/VM endpoint wait convergence).
+  Continued the object-owned `WaitSource` endpoint migration. Pipe readiness
+  wait helpers now take `WaitEndpoint` values and derive the yielded carrier id
+  internally; `PipePayload::new()` derives stored ids from
+  `reader_endpoint()` / `writer_endpoint()`, and pipe byte, splice/tee, page
+  lease, and user-page gift wait sites pass `reader_endpoint()` /
+  `writer_endpoint()` instead of `*_wait_source_id`. TTY read blocking now
+  yields through `tty.read_endpoint()` instead of `tty.wait_source_id()`.
+  VM `RangeLock` `range_lock_blocked` now takes `release_endpoint()`, and
+  RangeLock step wrappers/gift acquire waits no longer hand-roll the release
+  source id. Process `waitpid` nohang blocking, vfork parent blocking, and
+  epoll empty/not-ready step yields now derive their carrier id from
+  `exit_endpoint()` / `ready_endpoint()` rather than calling the source-id
+  getter at the yield site. Verification: `cargo test -p tx-subsystems --test
+  v3_tty_waitsource -- --nocapture --test-threads=1` passed 2/2; `cargo test
+  -p tx-subsystems --test v3_pipe_waitsource -- --nocapture --test-threads=1`
+  passed 8/8; `cargo check -p tx-subsystems -p tx-shims` passed with the
+  existing `net/execution/step_connect.rs` unused-`guard` warning and existing
+  `tx-fs/src/tx_ext4_bridge.rs` unused-`Vec` warning; `cargo xtask lint
+  invariants legacy-wait-channel` passed with production legacy sites at 0 and
+  report-only inventory at 8; scoped `rustfmt` and `git diff --check` passed.
+  VM focused lib tests were attempted before the I/O manager tagged-completion
+  ingress landed, so the then-dirty `io_manager/page/service.rs` test blocked
+  `tx-subsystems` lib-test compilation before VM tests could run. Remaining
+  direct registered-id await bridges are socket/net RawQueue/RawPort, fd
+  fallback, RTC/devfs RawQueue, plus compatibility tests and
+  notification/adapter internals that deliberately lower endpoints into
+  `YieldShape::OnWaitSource`.
+
+- 2026-07-12 (signalfd/userfaultfd readable endpoint wait).
+  Converted signalfd and userfaultfd readable wait helpers from source-id
+  parameters to endpoint parameters. `notification::wait_until_readable(...)`
+  now takes a `WaitEndpoint` and derives the yielded source id internally;
+  `signalfd_read` and `step_ufd_read` pass `read_endpoint()` instead of
+  `wait_source_id()`. Their wait-point structs now keep source fields private,
+  expose `endpoint()`, and split via `into_parts()` only after construction has
+  derived the stable id from the endpoint. RTC/devfs was audited but left alone:
+  it is a RawQueue-backed event source, not an existing object-owned
+  `WaitSource`, so converting it needs a separate devfs/RTC carrier design.
+  Verification: `cargo test -p tx-subsystems --lib
+  signalfd_read_returns_eagain_when_empty_and_nonblocking -- --nocapture
+  --test-threads=1` passed 1/1; `cargo test -p tx-subsystems --lib
+  new_cap_returns_zone_allocated_userfaultfd -- --nocapture --test-threads=1`
+  passed 1/1; `cargo check -p tx-subsystems` passed with the existing
+  `net/execution/step_connect.rs` unused-`guard` warning; `cargo xtask lint
+  invariants legacy-wait-channel` passed with production legacy sites at 0 and
+  report-only inventory at 8; scoped `rustfmt` and `git diff --check` passed.
+  Remaining direct source-id await bridges are socket/net RawQueue/RawPort,
+  fd fallback, and RTC/devfs RawQueue.
+
+- 2026-07-12 (I/O manager phase-5 block request tracker).
+  Added the neutral request-retention table needed between L6 tagged
+  completion and L4 page completion. `BlockPageRequestTracker` records
+  `PageIoRequest`s against queued or merged `BlockRequestId`s and, when a
+  `BlockCompletion` arrives, removes the matching request set and returns
+  `BlockPageCompletion` bridge values. Merged adjacent block requests preserve
+  multiple page requests in order, so one block completion can fan back into
+  multiple generation-bearing page completions. The tracker lives in
+  `io_manager::backend`, not `io_manager::block`, so the block queue still does
+  not know file-page semantics. Verification: RED first failed on missing
+  `BlockPageRequestTracker`, then `timeout 240s cargo test -p tx-subsystems
+  --lib block_page_request_tracker_ -- --test-threads=1` passed 2/2; facade
+  re-export RED failed then passed; `timeout 480s cargo test -p tx-subsystems
+  --lib io_manager -- --nocapture --test-threads=1` passed 55/55; and
+  `timeout 480s cargo check -p tx-subsystems` passed with the existing
+  `net/execution/step_connect.rs` unused-`guard` warning. Scoped rustfmt,
+  `git diff --check`, concrete-backend scan, and raw-substrate scan passed.
+  Remaining Phase 5 work: add the L6 service turn that takes
+  `BlockTagTable::complete` output, asks the tracker for bridge completions,
+  attaches any read frames, and calls `PageService::push_block_page_completion`.
+
+- 2026-07-12 (futex wait endpoint language convergence).
+  Added futex endpoint spelling for bucket-owned wait sources:
+  `bucket_endpoint()` and `bucket_endpoint_for_source_id()`.  The exact
+  `FutexWaitPoint` now keeps its wait-source fields private, exposes an
+  `endpoint()` accessor, and derives the waiter/bucket source id from
+  `WaitEndpoint::source_id(endpoint)` before splitting into the stored
+  `(source_id, Arc<WaitSource>)` pair.  The futex wait-source integration test
+  now uses endpoint names in the endpoint/round-trip cases while the older
+  `bucket_wait_source*` helpers remain as compatibility spellings for existing
+  tests.  Verification: `cargo test -p tx-subsystems --lib
+  futex_bucket_endpoint_matches_wait_source_id -- --nocapture --test-threads=1`
+  passed 1/1; `cargo test -p tx-subsystems --test v3_futex_waitsource --no-run`
+  passed; full `v3_futex_waitsource` runtime execution compiled but produced
+  no test output before the 240s timeout, so it was not counted as a passing
+  runtime gate; `cargo check -p tx-subsystems` passed with the existing
+  `net/execution/step_connect.rs` unused-`guard` warning; `cargo xtask lint
+  invariants legacy-wait-channel` passed with production legacy sites at 0 and
+  report-only inventory at 8; scoped `rustfmt` and `git diff --check` passed.
+  Remaining direct source-id await bridges are still socket/net RawQueue/RawPort,
+  fd fallback, and RTC/devfs.
+
+- 2026-07-12 (I/O manager phase-5 PageService block-completion ingress).
+  Connected the new neutral block-to-page completion bridge to the L4 service
+  queue without touching real drivers. `PageService::push_block_page_completion`
+  now converts a `BlockPageCompletion` into a `PageIoCompletionEntry`, preserves
+  the frame side-car, and queues it through the same completion-first service
+  path used by backend-planned page completions. Invalid bridge conversions
+  return `BlockPageCompletionError` before making the service runnable, so a
+  block completion still cannot publish a page without generation metadata or a
+  read frame. Verification: RED first failed on missing
+  `push_block_page_completion`, then `timeout 240s cargo test -p
+  tx-subsystems --lib page_service_queues_block_page_completion_bridge_output
+  -- --test-threads=1` passed 1/1; `timeout 480s cargo test -p tx-subsystems
+  --lib page_service_ -- --test-threads=1` passed 31/31;
+  `timeout 480s cargo test -p tx-subsystems --lib io_manager -- --nocapture
+  --test-threads=1` passed 53/53; and `timeout 480s cargo check -p
+  tx-subsystems` passed with the existing `net/execution/step_connect.rs`
+  unused-`guard` warning. Remaining Phase 5 work: connect real
+  `BlockTagTable::complete` output plus retained request metadata to this
+  ingress from the L6 service loop.
+
+- 2026-07-12 (I/O manager phase-5 block-to-page completion bridge).
+  Added the neutral L6-to-L4 completion bridge shape needed after queued Bios
+  complete. `io_manager::backend::BlockPageCompletion` now pairs a retained
+  `PageIoRequest` with a `BlockCompletion` and optional `PageFrameRef`, then
+  converts successful read/readahead completions with a frame into a
+  `ReadInstalled` `PageIoCompletionEntry` carrying the original request id,
+  range, and PageSlot generation. Read success without a frame is rejected so
+  L6 completion cannot masquerade as page-cache installation; block errors map
+  through the same generation-bearing page completion path. The type is
+  re-exported from the backend facade and does not import Mount, tx-fs, tx-ext4,
+  PageBacked, or drivers. Verification: RED first failed on missing
+  `BlockPageCompletion` / `BlockPageCompletionError`, then
+  `timeout 240s cargo test -p tx-subsystems --lib block_completion_bridge_ --
+  --test-threads=1` passed 2/2; a facade re-export RED failed then passed;
+  `timeout 480s cargo test -p tx-subsystems --lib io_manager -- --nocapture
+  --test-threads=1` passed 52/52; `timeout 480s cargo check -p
+  tx-subsystems` passed with the existing
+  `net/execution/step_connect.rs` unused-`guard` warning. Scoped rustfmt and
+  concrete-backend/raw-substrate scans passed. Remaining Phase 5 work: wire
+  real tagged L6 completions into this bridge and feed the resulting page
+  completions back through PageService/PageBacked.
+
+- 2026-07-12 (I/O manager phase-5 L6 queued outcome request retention).
+  Preserved the original L4 `PageIoRequest` metadata when backend planning
+  queues L6 Bios. `PageServiceBackendSubmitOutcome::BlockBiosQueued` and
+  `MetadataFirstQueued` now carry the request id, page range, and generation
+  hint alongside the L6 `SubmitOutcome`s, and the PageBacked local queue helper
+  mirrors that shape. This keeps queued block work tied to the PageSlot
+  generation that will later accept or reject the frame-backed page completion.
+  Verification: `timeout 480s cargo test -p tx-subsystems --lib
+  page_service_submission_feeds_backend_bios_into_l6_block_queue --
+  --test-threads=1` passed 1/1, `page_service_` passed 30/30,
+  `io_manager` passed 49/49, and `cargo check -p tx-subsystems` passed with
+  the existing `net/execution/step_connect.rs` unused-`guard` warning. Scoped
+  rustfmt, `git diff --check`, concrete-backend scan, and raw-substrate scan
+  passed. Remaining Phase 5 work: add real L6/device completion plumbing that
+  turns retained request metadata plus block completion into generation-checked
+  frame-backed page completion.
+
+- 2026-07-12 (timer topology boundary fix).  Closed the fanout gaps from the
+  previous timer topology audit. `tx_reactor::adapter::bus_wire` no longer
+  re-exports substrate timer implementation/facade names; reactor internals and
+  tests import substrate timer router/token/role types only where they own the
+  timer-driver boundary. `linux_syscall/wait.rs` now wraps the entry-context
+  registrar in `tx_services::time::DeadlineRegistrarHandle` and registers
+  `DeadlineAbort` deadlines through `TimerTarget::TaskMailbox`. RTC alarm
+  emulation now passes `&dyn DeadlineRegistrar` through
+  `RtcAlarmEmulation`, and devfs installs the emulated alarm through
+  `TimerRole::RtcAlarm + TimerTarget::DeviceCallback` instead of calling
+  substrate registrar methods directly. `time-layering` now checks
+  `tx-reactor/src/adapter.rs` public exports and substrate
+  `TimerRegistrarHandle` residue in the relevant semantic/operation files.
+  Verification: `cargo check -p tx-services -p tx-fs -p tx-shims -p
+  tx-reactor --tests` passed with only existing `tx-vdso` assembler-stub,
+  `step_connect.rs` unused-`guard`, and `tx_ext4_bridge.rs` unused-`Vec`
+  warnings; focused tests passed for `tx-shims wait --lib` (52/52),
+  `tx-fs devfs_rtc_emulated_alarm_uses_timer_router_raw_queue_wake`,
+  `tx-reactor --test hart_loop` (5/5), and the reactor smoke timer wake
+  witness; `cargo xtask lint invariants time-layering`,
+  `cargo test -p xtask time_layering -- --nocapture` (12/12), and
+  `cargo xtask lint invariants time-wake-retired` all passed under
+  `CARGO_TARGET_DIR=target/codex-time-topology`. A broader
+  `cargo check -p tx-services -p tx-subsystems -p tx-fs -p tx-shims -p
+  tx-reactor --tests` remains blocked by unrelated dirty-tree fallout:
+  `tx-subsystems/tests/v3_signal_interrupt_wake.rs` imports retired
+  `signal::adapter::wait_routing` names, and
+  `tx-subsystems/src/io_manager/backend/plan.rs` tests reference missing
+  `BlockPageCompletion*` names. Next step: keep the transitional
+  `SyscallCtx`/`ScriptCtx` registrar bridge narrow and migrate new producer
+  paths only through `tx_services::time` facade APIs.
+
+- 2026-07-12 (wait endpoint language convergence continuation).
+  Added endpoint accessors for the remaining object-owned wait-source surfaces
+  found in this pass: AIO `iocb_arrived_endpoint()` /
+  `events_available_endpoint()`, io_uring `sqe_arrived_endpoint()` /
+  `cqe_available_endpoint()`, SysV message queue `send_endpoint()` /
+  `recv_endpoint()`, SysV semaphore `changed_endpoint()`,
+  `ServiceWakeSource::wake_endpoint()`, and PageBacked
+  `PageReadyWait::ready_endpoint()` via `page_ready_endpoint()`.  The fd
+  readiness facade now carries an optional `Arc<WaitSource>` endpoint in
+  `FdWait`; select/pselect waits prefer `wait_on_registered_endpoint()` for
+  object-owned waits and fall back to `wait_on_registered_source_id()` only for
+  non-endpoint/raw sources.  Verification: `cargo check -p tx-shims --lib`
+  passed with existing `net/execution/step_connect.rs` unused-`guard` and
+  `tx-fs/src/tx_ext4_bridge.rs` unused-`Vec` warnings; focused
+  `tx-subsystems` lib tests passed for `endpoint_matches_source_id`,
+  `wait_endpoints_match_`, `payload_endpoint`, and
+  `fd_ready_facade_reports_eventfd_readiness_and_waits`; `cargo xtask lint
+  invariants legacy-wait-channel` passed with production legacy sites at 0 and
+  report-only inventory at 8; scoped `rustfmt` and `git diff --check` passed.
+  Remaining bridge sites are socket/net delegate RawQueue/RawPort waits,
+  fd-facade fallback waits, and RTC/devfs source-id waits; those need the
+  socket/fd/devfs facade design rather than object endpoint accessor plumbing.
+
+- 2026-07-12 (I/O manager phase-5 Bio-only planner fallback guard).
+  Tightened the live materialize fast path so a backend planner only bypasses
+  the compatibility `FsPageBacking::fetch_page` executor when it actually
+  installs the requested page through a frame-backed completion. `SubmitBios`,
+  metadata-first, yield, error, or any other non-installing planner result now
+  leaves the owner fetch live and falls through to the old compatibility
+  executor. This preserves the L5/L6 boundary: staging a Bio in `BlockQueue` is
+  not equivalent to page-cache completion until the future device-completion
+  path can return a generation-checked frame. Verification: RED first failed
+  because a Bio-only planner returned `Err(EAGAIN)` instead of falling back;
+  after the fix, `timeout 480s cargo test -p tx-subsystems --lib
+  file_page_materialize_falls_back_to_compat_fetch_for_bio_only_plan --
+  --test-threads=1` passed 1/1, the frame-backed fast-path test still passed
+  1/1, `file_page_service_completion_` passed 3/3, `page_service_` passed
+  30/30, `io_manager` passed 48/48, and `cargo check -p tx-subsystems` passed
+  with the existing `net/execution/step_connect.rs` unused-`guard` warning.
+  Scoped rustfmt, `git diff --check`, concrete-backend scan, and raw-substrate
+  scan passed. Remaining Phase 5 work: add the real L6/device completion
+  plumbing that can turn queued Bios back into frame-backed page completions.
+
+- 2026-07-12 (timer topology fanout audit).  Ran a read-only fanout audit of
+  the timer code boundary after the reactor topology cleanup. Confirmed the
+  strong parts: crate-root `tx-reactor` no longer exports the old timer module
+  or current-wheel surface, concrete `TimerWheel` is confined to
+  `crates/tx-reactor/src/deadline_registry.rs` in reactor production code, and
+  runtime/task poll context carries `DeadlineRegistrarHandle` rather than a
+  wheel. The audit also found boundary gaps that the current hard gate does not
+  fully prove: public `tx_reactor::adapter::bus_wire` still re-exports
+  substrate timer facade/wire types; `linux_syscall/wait.rs` still directly
+  uses substrate `TimerRegistrarHandle`/`TimerRegistrar::install_for_task`;
+  RTC alarm emulation passes substrate `TimerRegistrarHandle` through
+  `tx-subsystems::device` into devfs; and the linter misses substrate
+  `TimerRegistrarHandle` struct fields plus adapter public re-export scope.
+  Verification: CodeGraph/read-only scans, four fanout readers, `cargo xtask
+  lint invariants time-layering` (0 findings), `cargo xtask lint invariants
+  time-wake-retired` (0 findings), and `cargo test -p xtask time_layering --
+  --nocapture` (11/11) passed using `CARGO_TARGET_DIR=target/codex-time-topology`.
+  Next step: decide whether to make `adapter::bus_wire` internal or explicitly
+  document it as an allowed public adapter surface, then migrate wait timeout
+  and RTC alarm emulation to `tx_services::time` facade and extend
+  `time-layering` to catch those shapes.
+
+- 2026-07-12 (I/O manager phase-5 planner-backed materialize fast path).
+  Connected the live file-page miss path to the mount-hosted backend planner
+  before the compatibility `FsPageBacking::fetch_page` executor. After a file
+  miss stages a L4 `PageIoRequest` and `PageSlot` generation,
+  `PageContainer::materialize_file_page` now attempts one bounded file service
+  turn; an immediate frame-backed `BackendPlan::Complete` queues the completion,
+  applies it through the PageBacked completion route, installs the frame, and
+  retires the legacy in-flight fetch without calling the compatibility fetch.
+  `UnplannedSubmission` still falls back to the old executor. Verification:
+  `timeout 240s cargo test -p tx-subsystems --lib
+  file_page_materialize_uses_frame_planner_before_compat_fetch --
+  --test-threads=1` passed 1/1; `file_page_service_completion_` passed 3/3;
+  `page_service_` passed 30/30; `backend_planner` passed 5/5; `cargo check -p
+  tx-subsystems` passed with the existing `net/execution/step_connect.rs`
+  unused-`guard` warning; `cargo test -p tx-subsystems --lib io_manager --
+  --nocapture --test-threads=1` passed 48/48; scoped rustfmt,
+  `git diff --check`, concrete-backend scan, and raw-substrate scan passed.
+  Remaining Phase 5 work: extend beyond immediate frame-backed completions to
+  real backend Bio/device completion plumbing and continue retiring the legacy
+  in-flight fetch table incrementally.
+
+- 2026-07-12 (wait endpoint language convergence slice).  Extended the
+  object-owned wait-source endpoint surface and removed another direct
+  source-id await detour. `RNode` now exposes `read_endpoint()` /
+  `write_endpoint()`; VM `brk_script` waits on `RangeLock::release_endpoint()`
+  with the release mask directly instead of constructing a source-id token for
+  the await path; the existing RangeLock, signalfd, userfaultfd, timerfd, and
+  epoll endpoint accessors/tests remain in this slice. Wait-source integration
+  tests for VFS, exit-source, futex, pipe, and TTY no longer mention or call
+  retired channel APIs; VFS/exit/futex now pin endpoint future
+  Pending-to-Ready behavior where applicable. Verification: scoped `rustfmt
+  --edition 2021` passed; `cargo test -p tx-subsystems --test
+  v3_vfs_waitsource --no-run` passed; `cargo test -p tx-subsystems --test
+  v3_exit_wait_source --test v3_futex_waitsource --test v3_tty_waitsource
+  --test v3_pipe_waitsource --no-run` passed; `cargo check -p tx-shims --lib`
+  passed with existing warnings; `cargo xtask lint invariants
+  legacy-wait-channel` passed with production sites at 0 and report-only
+  inventory still at 8 (`RegisteredWaitFuture` in fd/socket/net facade plus
+  residual `Mask` adapter names); scoped `git diff --check` passed. Runtime
+  execution of `cargo test -p tx-subsystems --test v3_vfs_waitsource --
+  --nocapture` compiled but was interrupted after more than 60s with no output,
+  so that run is not claimed. Next step: design the fd/OpenFile readiness
+  facade so remaining `wait_on_registered_source_id` bridge sites can collapse
+  without forcing RawQueue/RawPort users into object endpoints.
+
+- 2026-07-12 (I/O manager phase-5 frame side-car completion).
+  Added the neutral frame-reference handoff needed for successful planned-read
+  completions without changing the fixed `PageIoCompletion` value shape.
+  `fs_iface::PageCompletion` now carries optional `PageFrameRef { ppn }`;
+  `io_manager::backend` converts backend completions into
+  `PageIoCompletionEntry { completion, frame }`; `PageService` stores the
+  side-car in `PageCompletionRoute`; and PageBacked consumes the side-car to
+  install the frame into `PageContainer` and complete the matching `PageSlot`
+  generation as `Resident`. This keeps `io_manager` as a control plane: it
+  transports the temporary handoff but never owns the page-cache data. Existing
+  callers using `PageCompletion::new` still get no frame side-car, and
+  `PageIoCompletion` itself still contains only request id, range, result,
+  generation, and kind. Verification: RED first failed on missing
+  `PageFrameRef`, `with_frame_ref`, `PageIoCompletionList::from_page_completions`,
+  `PageCompletionRoute.frame`, and `PageService::push_page_completion`; then
+  `timeout 240s cargo test -p tx-subsystems --lib
+  page_service_routes_backend_frame_ref_with_completion -- --test-threads=1`
+  passed 1/1, `timeout 240s cargo test -p tx-subsystems --lib
+  file_page_service_completion_installs_planned_read_frame -- --test-threads=1`
+  passed 1/1, `timeout 240s cargo test -p tx-subsystems --lib
+  file_page_service_completion_ -- --test-threads=1` passed 3/3, `timeout 240s
+  cargo test -p tx-subsystems --lib page_service_ -- --test-threads=1` passed
+  30/30, backend plan/dispatch and backend planner filters passed, and
+  `timeout 300s cargo check -p tx-subsystems` passed with the existing
+  `net/execution/step_connect.rs` unused-`guard` warning. Scoped rustfmt,
+  `git diff --check`, concrete-backend scan, and raw-substrate scan passed.
+  Remaining Phase 5 work: use the normal backend planner path to produce real
+  frame-backed completions for bdev-fs/tmpfs-style reads, then retire more of
+  the direct compatibility fetch path page by page.
+
+- 2026-07-12 (I/O manager phase-5 PageSlot completion application).
+  Added the first PageBacked-owned completion application path from the staged
+  file PageService back into `PageSlot`. `PageContainerState` now carries a
+  `file_page_slots` table, file misses stage the slot into `Fetching` with the
+  same generation placed on the L4 `PageIoRequest`, the compatibility
+  `FsPageBacking` executor mirrors successful installs back to `Resident`, and
+  service-routed read error completions update the slot to `Error` only when
+  the completion generation still matches. Stale generation completions are
+  rejected by the slot and leave the current state unchanged. Successful
+  `ReadInstalled` service completions still do not install frames because the
+  current neutral completion IR carries no frame/PPN reference. Verification:
+  RED first failed on missing `file_page_slots` and
+  `file_page_slot_snapshot_for_test`; then `timeout 360s cargo test -p
+  tx-subsystems --lib file_page_service_completion_ -- --test-threads=1`
+  passed 2/2, `timeout 240s cargo test -p tx-subsystems --lib page_service_
+  -- --test-threads=1` passed 28/28, `timeout 180s cargo test -p
+  tx-subsystems --lib page_slot_ -- --test-threads=1` passed 3/3, the
+  PageContainer service-helper and shadow-queue focused tests passed, and
+  `timeout 300s cargo check -p tx-subsystems` passed with the existing
+  `net/execution/step_connect.rs` unused-`guard` warning. Scoped rustfmt,
+  `git diff --check`, concrete-backend scan, and raw-substrate scan passed.
+  Remaining Phase 5 work: extend the neutral completion IR or backend plan
+  shape with a real frame reference before successful planned reads can install
+  into `PageContainer` without the compatibility executor.
+
+- 2026-07-12 (I/O manager phase-5 PageContainer service turn helper).
+  Added the PageBacked-owned helper that drives one staged file PageService
+  turn through the real mount-hosted backend planner without holding the
+  PageContainer state lock across backend planning or L6 BlockQueue admission.
+  `PageContainer::drive_file_io_service_once` drains existing L4 service work
+  under a small `ServiceBudget`, releases the state lock before calling the
+  `MountPayloadBackendContext`, queues page completions back into the L4
+  service, feeds BioPlans to the L6 queue without driver submission, and
+  returns `UnplannedSubmission` for the compatibility path. This still does not
+  modify `materialize_file_page` or the direct `FsPageBacking` executor.
+  Verification: RED first failed on missing `drive_file_io_service_once`; then
+  `timeout 360s cargo test -p tx-subsystems --lib
+  file_page_container_drives_service_submission_through_mount_planner_without_state_lock
+  -- --test-threads=1` passed 1/1, `timeout 120s cargo test -p tx-subsystems
+  --lib page_service_ -- --test-threads=1` passed 26/26, `timeout 240s cargo
+  check -p tx-subsystems` passed with the existing
+  `net/execution/step_connect.rs` unused-`guard` warning, scoped rustfmt and
+  `git diff --check` passed, concrete-backend scans only matched the
+  compatibility comment in `io_manager/mod.rs`, and raw substrate refs remained
+  confined to `io_manager/adapter.rs` plus existing page_backed substrate state.
+  Remaining Phase 5 work: apply queued completions to PageSlot/PageContainer
+  state and replace the legacy `in_flight_file_pages` table incrementally.
+
+- 2026-07-12 (timer topology/export linter alignment).  Aligned reactor timer
+  ownership with `docs/stage2-documents/time_infra/TX_TIMER_SUBSYSTEM_DESIGN_CN.md`:
+  concrete `TimerWheel` ownership is confined to
+  `crates/tx-reactor/src/deadline_registry.rs`, runtime/task poll context now
+  carries `DeadlineRegistrarHandle`, and `tx-reactor` no longer exposes the old
+  public `timer` module/current-wheel surface. `time-layering` now rejects
+  top-level reactor re-exports of substrate timer implementation/facade types
+  and keeps `runtime.rs`/`task.rs` free of concrete wheel/current-wheel names.
+  Verification used isolated `CARGO_TARGET_DIR=target/codex-time-topology` to
+  avoid unrelated Cargo target locks: `cargo check -p tx-reactor --tests`,
+  `cargo xtask lint invariants time-layering`, `cargo test -p xtask
+  time_layering -- --nocapture`, `cargo xtask lint invariants
+  time-wake-retired`, focused reactor smoke tests for per-hart context and
+  timer expiry routing, `cargo test -p tx-reactor --test scheduler
+  timer_style_wake_after_steal_targets_last_owner_hart -- --nocapture`,
+  `cargo test -p tx-reactor --test hart_loop -- --nocapture`, `cargo xtask
+  lint docs`, and scoped `git diff --check` all passed. Docs lint still reports
+  the existing 7 stale-vocabulary mentions as warnings because active docs
+  discuss retired terms. Next step: decide separately whether
+  `tx-reactor::adapter::bus_wire` should remain a public substrate-adapter test
+  surface or be split into an internal-only timer wire adapter.
+
+- 2026-07-12 (I/O manager phase-5 PageContainer backend context seam).
+  Added the PageBacked-side bridge needed for the live service loop to construct
+  the mount-backed planner context. `PageContainer::file_backend_context` now
+  returns a `MountPayloadBackendContext` for file-backed containers by reading
+  the existing `MountPayloadPin` and mapping `FsObjectId` to `FsObjectKey`;
+  anon/device containers return `None`. This does not change
+  `materialize_file_page`, does not call `FsPageBacking`, and does not submit to
+  block drivers. Verification: RED first failed on missing
+  `file_backend_context`; after implementation, `timeout 120s cargo test -p
+  tx-subsystems --lib file_page_container_builds_mount_payload_backend_context
+  -- --test-threads=1` passed 1/1. Scoped rustfmt and `git diff --check`
+  passed for `page_backed`/`mount`/`io_manager` files. Boundary scans still only
+  show concrete backend terms in compatibility comments, and raw substrate refs
+  remain in the existing adapter/page-backed substrate areas. Caveat:
+  `non_file_page_container_has_no_backend_context` and `cargo check -p
+  tx-subsystems` timed out in this dirty checkout during rebuild/harness startup,
+  so they are not counted as passing evidence for this slice.
+
+- 2026-07-12 (I/O manager phase-5 MountPayload backend context).
+  Connected the neutral `PageServiceBackendContext` to the real mount-hosted
+  planner seam without reversing the dependency from `io_manager` into Mount.
+  `MountPayloadBackendContext` now holds `&MountPayload` plus `FsObjectKey` and
+  implements `PageServiceBackendContext` by delegating to
+  `MountPayload::plan_backend_page_request`; planned submissions can therefore
+  flow through `PageServiceDriver::drive_once_with_backend`, while mounts
+  without a planner still return `UnplannedSubmission` for the compatibility
+  `FsPageBacking` path. Verification: RED first failed on missing
+  `MountPayloadBackendContext`; then `timeout 60s cargo test -p tx-subsystems
+  --lib mount_payload_backend_context_drives_page_service_submission --
+  --test-threads=1` passed 1/1, `timeout 60s cargo test -p tx-subsystems
+  --lib mount_payload_backend_context_returns_none_without_planner --
+  --test-threads=1` passed 1/1, `timeout 90s cargo test -p tx-subsystems
+  --lib mount_payload_ -- --test-threads=1` passed 8/8, `timeout 60s cargo
+  test -p tx-subsystems --lib page_service_ -- --test-threads=1` passed
+  26/26, `timeout 60s cargo test -p tx-subsystems --lib backend_planner --
+  --test-threads=1` passed 5/5, scoped rustfmt passed, and `cargo check -p
+  tx-subsystems` passed with the existing `net/execution/step_connect.rs`
+  unused-`guard` warning. Boundary scans still keep concrete FS/driver deps out
+  of `io_manager`/`fs_iface`; raw substrate refs remain in
+  `io_manager/adapter.rs` plus an existing mount comment. Caveat: rerunning
+  `backend_plan_dispatch` in this dirty checkout timed out after harness start,
+  so this slice relies on the unchanged backend dispatch code plus the mount and
+  page-service focused tests.
+
+- 2026-07-12 (I/O manager phase-5 service-driver backend context).
+  Advanced `PageServiceDriver` from a pure drain/kick wrapper to a neutral
+  one-turn backend orchestrator. `PageServiceBackendContext` now lets the
+  caller resolve mounted object identity and produce a `BackendPlan` without
+  importing MountPayload or concrete filesystem crates into `io_manager`; the
+  driver turns `PageServiceWork::Submission` into backend submission outcomes,
+  queues planned completions for the next L4 turn, admits planned bios into
+  `BlockQueue`, and returns `UnplannedSubmission` so the compatibility
+  `FsPageBacking` path can still own requests that do not have a planner yet.
+  Verification: RED first failed on missing `PageServiceBackendContext`,
+  `PageServiceDrivenWork`, and `drive_once_with_backend`; then `timeout 30s
+  cargo test -p tx-subsystems --lib
+  page_service_driver_plans_submission_and_rekicks_for_queued_completion --
+  --test-threads=1` passed 1/1, `timeout 30s cargo test -p tx-subsystems
+  --lib page_service_driver_returns_unplanned_submission_for_compatibility_path
+  -- --test-threads=1` passed 1/1, `timeout 60s cargo test -p tx-subsystems
+  --lib page_service_ -- --test-threads=1` passed 25/25, backend planner and
+  dispatch filters passed, scoped rustfmt passed, `cargo check -p
+  tx-subsystems` passed with the existing `net/execution/step_connect.rs`
+  unused-`guard` warning, and boundary scans kept concrete FS/driver deps out
+  of `io_manager`/`fs_iface` with raw substrate refs confined to
+  `io_manager/adapter.rs`. Remaining Phase 5 work: replace the legacy
+  PageContainer in-flight fetch table with PageSlot-backed state and connect
+  the driver context to the real MountPayload/object lookup path.
+
+- 2026-07-12 (I/O manager phase-5 planner-to-L6 service helper).
+  Added the next typed PageService bridge from preserved L4 submissions into
+  neutral backend planning and L6 queue admission.
+  `PageService::consume_backend_submission` now converts a `PageIoRequest` plus
+  `FsObjectKey` into `BackendPageRequest`, invokes a neutral `BackendPlanner`,
+  dispatches the returned `BackendPlan`, queues page completions back into the
+  L4 completion queue, and feeds `SubmitBios` / metadata-first `BioPlan`s into
+  `BlockQueue` without calling drivers. Verification: RED first failed on
+  missing `consume_backend_submission` and `PageServiceBackendSubmitOutcome`;
+  after implementation and correcting the in-turn wake expectation to
+  `AlreadyRunnable`, `timeout 20s cargo test -p tx-subsystems --lib
+  page_service_submission_plans_dispatches_and_queues_page_completion --
+  --nocapture --test-threads=1` passed 1/1, `timeout 20s cargo test -p
+  tx-subsystems --lib page_service_submission_feeds_backend_bios_into_l6_block_queue
+  -- --nocapture --test-threads=1` passed 1/1, `timeout 60s cargo test -p
+  tx-subsystems --lib page_service_ -- --nocapture --test-threads=1` passed
+  23/23, backend planner/dispatch tests passed, scoped rustfmt passed, and
+  `cargo check -p tx-subsystems` passed with the existing
+  `net/execution/step_connect.rs` unused-`guard` warning. Remaining Phase 5
+  work: wrap this helper in the real service-driver/mount-object selection loop
+  and replace the legacy file-fetch table with PageSlot-backed state. Caveat:
+  `timeout 120s cargo test -p tx-subsystems --lib io_manager -- --nocapture
+  --test-threads=1` timed out after starting the test harness, and
+  `cargo -q xtask unit` was interrupted after more than four minutes of no
+  output; the focused tests above are the current evidence for this slice.
+
+- 2026-07-12 (I/O manager phase-5 backend dispatch consumption).
+  Added the first service-side consumer for neutral backend dispatch results.
+  `PageService::consume_backend_dispatch` now accepts `BackendDispatch`: page
+  completions are queued back into the L4 completion queue with a wake decision,
+  block bios are returned as L6 work, and metadata-first/yield/error outcomes
+  are preserved as typed values. This keeps `io_manager` isolated from concrete
+  filesystems and drivers while making the previously returned `BackendPlan`
+  usable by the service loop. Verification: RED first failed on missing
+  `consume_backend_dispatch`, `PageServiceBackendOutcome`, and missing backend
+  facade re-exports for `BackendDispatch` / `PageIoCompletionList`; then
+  `cargo test -p tx-subsystems --lib
+  page_service_consumes_backend_page_completions_into_l4_queue -- --nocapture
+  --test-threads=1` passed 1/1, `cargo test -p tx-subsystems --lib
+  page_service_ -- --nocapture --test-threads=1` passed 21/21, `cargo test -p
+  tx-subsystems --lib backend_plan_dispatch -- --nocapture --test-threads=1`
+  passed 3/3, `cargo test -p tx-subsystems --lib backend_planner --
+  --nocapture --test-threads=1` passed 5/5, scoped rustfmt passed for
+  `io_manager/page/service.rs` and `io_manager/backend/mod.rs`, and `cargo
+  check -p tx-subsystems` passed with the existing
+  `net/execution/step_connect.rs` unused-`guard` warning. Remaining Phase 5
+  work: wire the driver loop to call planner + dispatch + consumption in one
+  service turn, feed returned BioPlan lists into the L6 BlockQueue, and replace
+  the legacy file-fetch table with PageSlot-backed state.
+
+- 2026-07-12 (I/O manager phase-5 MountPayload planner invocation seam).
+  Connected the preserved PageService submission request to the mount-hosted
+  neutral planner without changing the live compatibility executor. Added
+  `BackendPageRequest::from_page_io_request`, which maps a full `PageIoRequest`
+  plus `FsObjectKey` into L5 request IR, and added
+  `MountPayload::plan_backend_page_request`, which invokes the optional
+  `BackendPlanner` and returns a neutral `BackendPlan`. A new witness drains a
+  `PageServiceWork::Submission(PageIoRequest)` and plans it through
+  `MountPayload`, proving the service-turn request shape now reaches the
+  mounted planner boundary. Verification: RED first failed on missing
+  `plan_backend_page_request`; then `cargo test -p tx-subsystems --lib
+  mount_payload_plans_page_service_submission_through_backend_planner --
+  --nocapture --test-threads=1` passed 1/1, `cargo test -p tx-subsystems
+  --lib mount_payload_ -- --nocapture --test-threads=1` passed 6/6, `cargo
+  test -p tx-subsystems --lib backend_planner -- --nocapture --test-threads=1`
+  passed 5/5, `cargo test -p tx-subsystems --lib page_service_ --
+  --nocapture --test-threads=1` passed 18/18, scoped rustfmt passed, and
+  `cargo check -p tx-subsystems` passed with the existing
+  `net/execution/step_connect.rs` unused-`guard` warning. Remaining Phase 5
+  work: consume the returned `BackendPlan` in the PageService/service-driver
+  loop and replace the legacy file-fetch table with PageSlot-backed state.
+
+- 2026-07-12 (I/O manager phase-5 PageService request-preserving work).
+  Tightened the L4 service-turn work shape so later backend-planner invocation
+  has the full request facts it needs. `PageServiceWork::Submission` now carries
+  the complete `PageIoRequest` instead of only `(PageContainerKey, PageIoRange,
+  PageIoOp)`, preserving request id, priority, flags, and generation hint for
+  conversion into `BackendPageRequest`. This does not submit to any concrete
+  filesystem or block driver; it only removes a type-shape blocker in the
+  service loop. Verification: RED first failed because the old
+  `Submission(pc, range, op)` variant could not accept a `PageIoRequest`; then
+  `cargo test -p tx-subsystems --lib
+  page_service_submission_work_preserves_full_request_metadata -- --nocapture
+  --test-threads=1` passed 1/1, `cargo test -p tx-subsystems --lib
+  page_service_ -- --nocapture --test-threads=1` passed 17/17, `cargo test -p
+  tx-subsystems --lib backend_planner -- --nocapture --test-threads=1` passed
+  4/4, scoped rustfmt passed for `io_manager/page/service.rs`, and `cargo
+  check -p tx-subsystems` passed with the existing
+  `net/execution/step_connect.rs` unused-`guard` warning. Remaining Phase 5
+  work: translate this preserved `PageIoRequest` plus mounted object identity
+  into `BackendPageRequest`, invoke `MountPayload::backend_planner()` in the
+  service turn, and replace the legacy file-fetch table with PageSlot-backed
+  state.
+
+- 2026-07-12 (I/O manager phase-5 MountPayload planner host).
+  Added the first real mount-hosted slot for the neutral backend-planning
+  interface without changing live file I/O execution. `MountPayload` now keeps
+  an optional `Arc<dyn BackendPlanner>` alongside the existing
+  `FsOps`/`FsPageBacking` pair; old `new`/`new_cap` constructors still default
+  the planner to `None`, and `new_with_backend_planner` /
+  `new_cap_with_backend_planner` are available for future bdev-fs/ext4
+  planning paths. `BackendPlanner` is now `Send + Sync + 'static`, matching
+  the requirement imposed by MountPayload's participation in zone/cap graphs.
+  Verification: RED first failed on missing `new_cap_with_backend_planner` and
+  `backend_planner`, then a second compile pass exposed the missing
+  Send/Sync/'static trait-object bound. After the fix, `cargo test -p
+  tx-subsystems --lib mount_payload_hosts_optional_backend_planner --
+  --nocapture --test-threads=1` passed 1/1, `cargo test -p tx-subsystems
+  --lib mount_payload_default_constructor_keeps_backend_planner_absent --
+  --nocapture --test-threads=1` passed 1/1, `cargo test -p tx-subsystems
+  --lib mount_payload_ -- --nocapture --test-threads=1` passed 5/5,
+  `cargo test -p tx-subsystems --lib backend_planner -- --nocapture
+  --test-threads=1` passed 4/4, `rustfmt --edition 2024 --check --config
+  skip_children=true` passed for `mount/mod.rs` and `fs_iface/plan.rs`, and
+  `cargo check -p tx-subsystems` passed with the existing
+  `net/execution/step_connect.rs` unused-`guard` warning. Remaining Phase 5
+  work: route a PageService submission through `MountPayload::backend_planner`
+  in the actual service turn, and replace the legacy file-fetch table with
+  PageSlot-backed state.
+
+- 2026-07-12 (I/O manager phase-5 neutral BackendPlanner seam).
+  Added the mount-hosted planner-facing neutral seam without wiring concrete
+  filesystems. `fs_iface::plan` now defines `FsObjectKey`,
+  `BackendPageRequest`, and `BackendPlanner`; `io_manager::backend` exposes
+  `plan_backend_request` so the future service loop can invoke a mounted
+  backend through neutral values and then dispatch `BackendPlan` into L4
+  completions or L6 BioPlan work. Verification: RED first failed on missing
+  `BackendPlanner`, `BackendPageRequest`, `FsObjectKey`, and
+  `plan_backend_request`; then `cargo test -p tx-subsystems --lib
+  backend_planner -- --nocapture --test-threads=1` passed 2/2, `cargo test -p
+  tx-subsystems --lib io_manager -- --nocapture --test-threads=1` passed
+  39/39, `rustfmt --edition 2024 --check --config skip_children=true` passed
+  for the touched backend/fs_iface files, and `cargo check -p tx-subsystems`
+  passed with the existing `net/execution/step_connect.rs` unused-`guard`
+  warning. Boundary scans still keep concrete FS/device executor dependencies
+  out of `io_manager`/`fs_iface` and raw substrate refs confined to
+  `io_manager/adapter.rs`. Remaining Phase 5 work: store/invoke this planner
+  through the real MountPayload path and replace the legacy file-fetch table
+  with PageSlot-backed state.
+
+- 2026-07-12 (I/O manager phase-5 PageService driver skeleton).
+  Added the first one-turn `kpageiod`-style driver shape over the staged L4
+  queue. `PageServiceDriver` calls `PageService::drive_turn` with a
+  `ServiceBudget`, returns the drained `PageServiceStep`, and emits a page
+  `ServiceKick` only when the turn leaves backlog runnable. This models the
+  long-lived service future's reschedule decision without invoking backend
+  planners, concrete filesystems, block devices, or reactor APIs. Verification:
+  RED first failed on missing `PageServiceDriver`; then `cargo test -p
+  tx-subsystems --lib page_service_driver_ -- --nocapture` passed 2/2, `cargo
+  test -p tx-subsystems --lib page_service_ -- --nocapture` passed 16/16,
+  `cargo test -p tx-subsystems --lib io_manager -- --nocapture` passed 37/37,
+  and `cargo check -p tx-subsystems` passed with the existing
+  `net/execution/step_connect.rs` unused-`guard` warning. Boundary scans still
+  keep raw substrate refs in `io_manager/adapter.rs` only and concrete
+  filesystem/device deps out of `io_manager`/`fs_iface`. Remaining Phase 5 work:
+  invoke real backend planners through the mount-hosted interface and replace
+  the legacy file-fetch table with PageSlot-backed state.
+
+- 2026-07-12 (I/O manager phase-5 mailbox-backed service wake source).
+  Bound the neutral service kick seam to the mailbox wait-source substrate
+  without pulling raw wake APIs into page/backend/block code. Added
+  `io_manager::adapter::service_wake` as the local platform adapter, plus
+  `runtime::ServiceWakeSource`, which registers mailbox subscribers by
+  `IoServiceKind` mask and delivers `ServiceKick` as `SourceFired` events.
+  Verification: RED first failed on missing `io_manager::adapter`,
+  `ServiceWakeSource`, and `IoServiceKind::mask_bits`; then `cargo test -p
+  tx-subsystems --lib service_wake_source -- --nocapture` passed 2/2, `cargo
+  test -p tx-subsystems --lib io_manager -- --nocapture` passed 35/35, and
+  `cargo check -p tx-subsystems` passed with the existing
+  `net/execution/step_connect.rs` unused-`guard` warning. Raw substrate refs are
+  confined to `crates/tx-subsystems/src/io_manager/adapter.rs`; concrete
+  filesystem/device boundary scan still only hits compatibility prose. Remaining
+  Phase 5 work: shape the actual long-lived service future loop over
+  `PageService::drive_turn`, and invoke real backend planners through the
+  mount-hosted interface.
+
+- 2026-07-12 (I/O manager phase-5 neutral backend dispatch).
+  Advanced the L5 planning boundary without invoking concrete filesystem code.
+  `io_manager::backend::plan` now exposes `BackendDispatch` plus
+  `dispatch_backend_plan`, converting neutral `BackendPlan::Complete` into L4
+  `PageIoCompletion` work, preserving `BioPlan` lists for L6 block submission,
+  and carrying metadata-first resume, yield, and error outcomes as values. This
+  keeps ext4/bdev-fs/tmpfs out of `io_manager` while giving the future service
+  loop a typed split between page-completion work and block-bio work.
+  Verification: RED first failed on missing `dispatch_backend_plan` and
+  `BackendDispatch`; then `cargo test -p tx-subsystems --lib
+  backend_plan_dispatch -- --nocapture` passed 3/3, `cargo test -p
+  tx-subsystems --lib io_manager -- --nocapture` passed 33/33, and `cargo
+  check -p tx-subsystems` passed with the existing
+  `net/execution/step_connect.rs` unused-`guard` warning. Boundary scan still
+  finds no concrete filesystem or block-device executor dependencies under
+  `io_manager`/`fs_iface`. Remaining Phase 5 work: bind the service kick seam
+  to an actual mailbox/service future and invoke real backend planners through
+  the mount-hosted interface.
+
+- 2026-07-11 (I/O manager phase-5 PageService runtime kick seam).
+  Advanced the staged L4 service wake boundary from a local wake decision to an
+  injected runtime kick seam. `io_manager::runtime` now defines neutral
+  `IoServiceKind` and `ServiceKick`; `PageService::submit_with_kick` and
+  `push_completion_with_kick` post `ServiceKick::new(IoServiceKind::Page)` only
+  when new work arrives after the service has slept, and skip duplicate kicks
+  when the service is already runnable. This follows the existing subsystem
+  `*_with_post` pattern without importing concrete filesystem crates, block
+  drivers, or reactor mailbox types into `io_manager`. Verification: RED first
+  failed on missing `IoServiceKind`, `ServiceKick`, `submit_with_kick`, and
+  `push_completion_with_kick`; then `cargo test -p tx-subsystems --lib
+  page_service_ -- --nocapture` passed 14/14, `cargo test -p tx-subsystems
+  --lib io_manager -- --nocapture` passed 30/30, and `cargo check -p
+  tx-subsystems` passed with the existing `net/execution/step_connect.rs`
+  unused-`guard` warning. Remaining Phase 5 work: bind the injected kick seam to
+  an actual mailbox/service future and add backend planning dispatch.
+
+- 2026-07-11 (VFS ResolvedPath named helper and file-mode dirfd fix).
+  Promoted the shim-local path helper from loose functions into a named
+  `linux_syscall::fs_resolve::ResolvedPath` wrapper for completed syscall-side
+  walks. `ResolvedPath::at` now owns path-aware `dirfd` anchoring plus mount
+  namespace-aware `step_walk`; `walk_from`, `walk_from_process`, and
+  `resolve_path_at` delegate through it. The older strict dirfd helper was
+  removed after its last callers disappeared. This exposed stale file-mode
+  expectations: `fchmodat` and `fchownat` with an absolute path must ignore an
+  otherwise-invalid dirfd, while the invalid-dirfd `fchmodat` test must use a
+  relative path to assert `EBADF`. Added absolute-path coverage for both
+  syscalls and kept `MountedDentry`/direct-only `MountedNode` unchanged.
+  Verification: RED was observed for
+  `dispatch_fchmodat_absolute_path_ignores_non_cwd_dirfd` (`EBADF` before the
+  fix), then it passed; `dispatch_fchownat_absolute_path_ignores_non_cwd_dirfd`
+  passed; `cargo test -p tx-shims --lib stat_family -- --nocapture
+  --test-threads=1` passed 27/27; `cargo test -p tx-shims --lib
+  dac_setuid_wave4 -- --nocapture --test-threads=1` passed 20/20 after
+  correcting the stale invalid-dirfd fixture; `cargo test -p tx-shims --lib
+  file_mutation -- --nocapture --test-threads=1` passed 34/34; `cargo test -p
+  tx-shims --lib fd_ops_wave2 -- --nocapture --test-threads=1` passed 41/41.
+  Existing warnings remain outside this VFS slice (`net/execution/step_connect.rs`
+  unused `guard`, `tx-fs/src/tx_ext4_bridge.rs` unused `Vec`).
+
+- 2026-07-11 (I/O manager phase-5 PageService wake decision).
+  Advanced the staged L4 service future boundary without importing reactor or
+  concrete filesystem code. `PageService` now tracks whether its last service
+  turn left it `Runnable` or `Sleeping`; wake-aware submit/completion admission
+  returns `Wake` when new work arrives after sleep and `AlreadyRunnable` when a
+  backlog is already scheduled. Verification: RED first failed on missing
+  `submit_with_wake`, `push_completion_with_wake`, and `PageServiceWake`; then
+  `cargo test -p tx-subsystems --lib page_service_ -- --nocapture` passed
+  11/11, `cargo test -p tx-subsystems --lib io_manager -- --nocapture` passed
+  27/27, and `cargo check -p tx-subsystems` passed with the existing
+  `net/execution/step_connect.rs` unused-`guard` warning. Boundary scan still
+  finds no concrete filesystem or block-device executor dependencies under
+  `io_manager`/`fs_iface`. Remaining Phase 5 work: bind this wake decision to
+  an actual reactor mailbox/service future, then add backend planning dispatch.
+
+- 2026-07-12 (tx-observe kernel-side L0-L3 folder split).
+  Reorganized the kernel-side `tx-observe` crate so the documented L0-L3
+  boundaries now have explicit source directories: `l0_schema/` owns the
+  generated schema catalog, `l1_probe_api/` owns callsite-facing macro/API
+  surface, `l2_producer/` owns producer-local per-hart support, and `l3_wire/`
+  owns txtrace payload encoding helpers. The crate root remains a compatibility
+  facade for the current `HartEmitter` implementation and re-exports the old
+  `encode`/`generated` module paths while callers migrate. L4-L6 remain
+  host-side layers and are intentionally not created under the kernel crate.
+  Verification: RED first failed on missing `l0_schema`; after the split,
+  `cargo test -p tx-observe --test layout -- --nocapture` passed 1/1,
+  `cargo test -p tx-observe --test smoke -- --nocapture` passed 14/14,
+  `cargo xtask observe-schema check`, `cargo xtask observe-schema codegen
+  --check`, and `cargo xtask lint invariants observe-producer-boundary` passed.
+  Remaining work: migrate `HartEmitter` implementation internals fully under
+  L2 and replace compatibility aliases once downstream callsites move.
+
+- 2026-07-12 (tx-observe host-side L4-L6 folder split).
+  Reorganized `tools/tx-trace-daemon` so the documented host layers now have
+  explicit source directories: `l4_readers/` owns txtrace replay, raw-record
+  finalization, live guest-memory drain, and existing integrity stats;
+  `l5_canonical/` owns the daemon `DecodedEvent` decode stream; and
+  `l6_views/` owns NDJSON emission plus Perfetto projection modules. `main.rs`
+  keeps compatibility module facades for the current CLI while callers migrate.
+  Added the first daemon-local type boundary pass as well: L4 now exposes
+  `TraceInputKind`, `TraceInput`, `TraceIntegrity`, `RawRecordFrame`, and the
+  staged `TraceReader` trait; L5 exposes `DecodeBatch`, `TraceEventStream`,
+  `TraceDecoder`, and decodes `RawRecordFrame` through `decode_frame`; L6
+  exposes `ProjectionInput` and `TraceTranscoder`, with JSON replay using the
+  stream projection path when unfiltered. The host layout test also guards that
+  `bytes_for_decode()` remains confined to L4/L5, so L6 cannot reopen raw
+  record bytes by accident. `schema/txobserve.toml` and the L0-L6 design doc
+  now point at the new host layer paths. Verification: RED layout first failed
+  on missing `l4_readers`, then the typed-boundary layout check failed on
+  missing `TraceInputKind`; after implementation, `cargo test --manifest-path
+  tools/tx-trace-daemon/Cargo.toml -- --nocapture` passed 28 unit tests, 3
+  layout tests, and 4 pftrace integration tests with the existing Perfetto
+  dead-code warnings. Remaining work: migrate the Python analyzer and
+  `xtask observe` surfaces onto the same `TraceIntegrity`/`TraceEventStream`/
+  `ProjectionInput` concepts and add topology lints for wrong-layer raw byte
+  access.
+
+- 2026-07-12 (tx-observe analyzer L4-L6 boundary vocabulary).
+  Added the first Python analyzer-side host boundary types so the text report
+  path no longer stays completely outside the L4-L6 vocabulary. The analyzer
+  now exposes `TraceIntegrity`, `TraceEventStream`, `ProjectionInput`, and
+  `analyze_projection`; the legacy `analyze(records, names, top, derived)` API
+  remains compatible but internally wraps records into a stream/projection
+  input before report generation. `observe-schema check` now enforces that a
+  real analyzer declaring `ANALYZER_DECODER_VERSION` also declares those host
+  boundary names, in addition to the existing SQL/Parquet projection column
+  checks. Verification so far: RED unittest first failed with missing
+  `TraceIntegrity`; after the slice, `python3 -m unittest
+  tools.tests.test_tx_observe_analyze` passed 25/25, `python3 -m py_compile
+  tools/tx-observe-analyze.py tools/tests/test_tx_observe_analyze.py` passed,
+  and `cargo test -p xtask observe_schema -- --nocapture` passed the 10
+  observe_schema-focused tests. Remaining work: use the same projection wrapper
+  for SQL/Parquet/Python-hook paths and make projection coverage generated from
+  `schema/txobserve.toml` rather than analyzer-local tables.
+
+- 2026-07-12 (tx-observe analyzer projection wrappers).
+  Routed the analyzer's remaining L6 programmable/export views through
+  `ProjectionInput` wrappers without changing the legacy helper signatures.
+  Added `run_sql_projection`, `export_projection_parquet`, and
+  `run_python_projection`; the CLI SQL, Parquet export, and Python-hook
+  branches now build one `ProjectionInput` after cache/load and pass that into
+  the relevant wrapper. `observe-schema check` now requires those wrappers
+  alongside `TraceIntegrity`, `TraceEventStream`, `ProjectionInput`, and
+  `analyze_projection` whenever the analyzer declares
+  `ANALYZER_DECODER_VERSION`. Verification so far: RED unittest first failed on
+  missing `run_sql_projection`; after implementation, the focused SQL
+  projection test passed, `python3 -m unittest tools.tests.test_tx_observe_analyze`
+  passed 26/26, and `python3 -m py_compile tools/tx-observe-analyze.py
+  tools/tests/test_tx_observe_analyze.py` passed. Remaining work: generate the
+  analyzer projection schema/coverage matrix from `schema/txobserve.toml`
+  rather than keeping `PARQUET_SCHEMAS` and SQL schemas handwritten.
+
+- 2026-07-12 (tx-observe generated host projection catalog).
+  Added host-side codegen from `schema/txobserve.toml` so L6 analyzer table
+  schemas are no longer checked only by comparing TOML to handwritten Python
+  constants. `cargo xtask observe-schema codegen` now writes both the kernel
+  Rust catalog and `tools/tx-observe-host-catalog.json`; `codegen --check`
+  validates both artifacts. The generated host catalog contains host inputs and
+  every projection id/kind/file/coverage/default column list. The analyzer now
+  exposes `load_host_catalog`, `projection_schemas_from_host_catalog`, and
+  `validate_host_catalog`; its CLI validates the generated catalog at startup
+  when the file exists, and tests assert that catalog schemas match
+  `PARQUET_SCHEMAS`, `RECORD_SQL_SCHEMA`, `REPAIR_SQL_SCHEMA`, and
+  `NAME_SQL_SCHEMA`. Verification so far: RED xtask test first failed because
+  `render_host_catalog` did not exist; after implementation, the focused
+  `render_host_catalog_lists_projection_schemas` test passed, `cargo xtask
+  observe-schema check` passed, `cargo xtask observe-schema codegen --check`
+  passed for both generated artifacts, and `python3 -m unittest
+  tools.tests.test_tx_observe_analyze` passed 27/27 with `py_compile` clean.
+  Remaining work: generated menu/profile views and explicit event-family
+  coverage tests, plus deciding whether to retire analyzer-local schema
+  constants in favor of loading the generated catalog directly.
+
+- 2026-07-12 (tx-observe L0-L6 folder topology enforcement).
+  Tightened the already-landed observe folder split so the documented topology
+  is mechanically enforced in both crates. The kernel layout test now requires
+  `crates/tx-observe/src/l0_schema`, `l1_probe_api`, `l2_producer`, and
+  `l3_wire`, rejects host-layer directories under the kernel crate, and also
+  rejects the old top-level `encode.rs`, `generated/`, `hart_local.rs`, and
+  `macros.rs` paths. The daemon layout test now requires
+  `tools/tx-trace-daemon/src/l4_readers`, `l5_canonical`, and `l6_views`,
+  rejects the old top-level `decode.rs`, `emit_json.rs`, `perfetto/`, and
+  `replay.rs` paths, and continues to enforce that raw record bytes only flow
+  through L4/L5. Updated the serialization doc and pftrace integration-test
+  comment to point at the new L5/L6 paths. Verification:
+  `cargo test -p tx-observe --test layout -- --nocapture` passed 2/2;
+  `cargo test --manifest-path tools/tx-trace-daemon/Cargo.toml --test layout
+  -- --nocapture` passed 4/4; `cargo xtask observe-schema check` passed;
+  `cargo xtask observe-schema codegen --check` passed; scoped
+  `cargo fmt --manifest-path tools/tx-trace-daemon/Cargo.toml --check`,
+  scoped `rustfmt --check`, and scoped `git diff --check` passed. Workspace
+  `cargo fmt --check` remains blocked by unrelated dirty-tree formatting
+  diffs outside observe.
+
+- 2026-07-12 (tx-observe generated host menu and coverage topology).
+  Extended the generated host catalog from projection-table schemas to the
+  fuller host-side topology needed by menuconfig-style tooling and L6 coverage
+  checks. `tools/tx-observe-host-catalog.json` now includes all schema cfgs,
+  control groups (`lock_metrics`, `ds_metrics`, VM/process/scheduler/signal
+  groups, capability/pmap debug, and demo boot), host inputs, projections, and
+  every event family with its level, payload, control-group, and projection
+  coverage. The analyzer now validates that generated event-family projection
+  references resolve against catalog projections and that control groups either
+  resolve to generated groups or the documented always-on builtins.
+  Verification so far: RED xtask renderer test failed on missing `cfgs`; RED
+  analyzer topology tests failed on missing `validate_host_catalog_topology`;
+  after implementation, the focused renderer test passed, the focused analyzer
+  topology tests passed, `cargo xtask observe-schema codegen` refreshed the
+  kernel and host generated artifacts, and both `cargo xtask observe-schema
+  check` and `cargo xtask observe-schema codegen --check` passed. Remaining
+  work: retire analyzer-local schema constants in favor of loading the
+  generated catalog directly.
+
+- 2026-07-12 (tx-observe analyzer generated-schema runtime lookup).
+  Moved the analyzer's SQL and Parquet runtime schema lookup onto the generated
+  host catalog. `projection_schema_catalog()` now loads
+  `tools/tx-observe-host-catalog.json`, validates its host topology, and feeds
+  `run_sql_query`, Parquet export, and Parquet manifest checks. The older
+  analyzer-local schema constants remain only as static inventory for
+  `observe-schema check` drift detection while the generated catalog becomes
+  the runtime source for typed SQL/Parquet views. Added a regression test that
+  temporarily corrupts `RECORD_SQL_SCHEMA` and still expects SQL mode to pass,
+  proving the query path no longer reads that local constant. Verification so
+  far: focused SQL/generated-catalog tests passed and `py_compile` passed.
+  Remaining work: move the xtask drift checker off parsing analyzer-local
+  schema constants so those constants can be deleted.
+
+- 2026-07-12 (tx-observe analyzer L4 input integrity stream).
+  Promoted analyzer input loading from bare record lists to L4-style streams.
+  Added `TraceLoadResult` and `load_*_stream()` entry points for `.txtrace`,
+  `.rawrecords`, and NDJSON inputs; each returns a `TraceEventStream` carrying
+  `TraceIntegrity` with input kind, retained/drained counts, repair count, and
+  txtrace lost/overwritten counters where available. The legacy
+  `load_txtrace_records`, `load_rawrecords`, `load_records`, and
+  `load_input_records` APIs remain wrappers for compatibility, while CLI
+  `ProjectionInput` construction now uses `load_input_stream()` so SQL,
+  Parquet, Python-hook, and text-report paths share the loaded integrity.
+  Verification so far: focused txtrace/rawrecords loader tests passed with
+  stream integrity assertions, and `py_compile` passed. Remaining work: align
+  daemon bundle/runtime summaries and analyzer repair/loss markers into a
+  shared L5 stream model.
+
+- 2026-07-12 (tx-observe L5 canonical repair/loss markers).
+  Added explicit L5 stream metadata for repair and capture-loss evidence.
+  Daemon `TraceEventStream` now derives `TraceStreamMarker::Repair` from
+  decoded `DecodedEvent::Repair` records and `TraceStreamMarker::CaptureLoss`
+  from L4 `TraceIntegrity` lost/overwritten counters; L6 JSON projection reads
+  the marker slice so the metadata is part of the projection-facing stream
+  contract while NDJSON output remains compatible. The analyzer now exposes a
+  matching `TraceStreamMarker` type and derives repair/capture-loss markers
+  for `.txtrace`, `.rawrecords`, and NDJSON streams. `observe-schema check`
+  also requires `class TraceStreamMarker:` in the analyzer host boundary.
+  Verification so far: daemon marker unit test passed, daemon host layout test
+  passed, focused analyzer repair/loss marker tests passed, and `py_compile`
+  passed. Remaining work: decide whether to extract the duplicate daemon/Python
+  decode paths into a shared host library or keep Python as a compatibility
+  analyzer with schema-gated drift checks.
+
+- 2026-07-12 (tx-observe bundle runtime uses canonical integrity).
+  Routed daemon bundle runtime metadata through the L5 stream contract.
+  `write_bundle` still returns the legacy `TraceStats` for CLI compatibility,
+  but `runtime.json` now includes the L4/L5 `integrity` object and canonical
+  `markers` from `TraceEventStream` alongside the existing `stats` payload.
+  This gives bundle consumers the same completeness/loss interpretation as
+  replay/analyzer streams without changing existing `stats` readers. Added a
+  regression test that writes a trace with a nonzero ring lost counter and
+  checks `runtime.json` for both `integrity.lost_records` and a
+  `CaptureLoss` marker. Verification so far: bundle runtime metadata test,
+  daemon marker unit test, and daemon host layout test passed.
+
+- 2026-07-12 (tx-observe live runtime canonical integrity metadata).
+  Closed the raw-only live-drain summary gap by synthesizing an empty L5 stream
+  from live `TraceStats` when decoded events are not available.
+  `run_live_guest_mem` now writes `integrity` and canonical `markers` into
+  live `runtime.json` alongside the existing raw `drained` and `stats`
+  sections, so lost or overwritten records have the same `CaptureLoss` marker
+  shape as bundle replay streams. Verification so far: the lost-counter
+  trace-stats unit test now also checks the synthesized live stream integrity
+  and `CaptureLoss` marker; the bundle runtime metadata test still passes.
+  Remaining work: decide whether daemon and analyzer decode should remain
+  duplicated with schema-gated drift checks or move into a shared host library.
+
+- 2026-07-11 (I/O manager phase-5 PageService scheduling shape).
+  Added the first service-loop scheduling contract for the staged L4
+  PageService. `drive_turn` now returns both the drained work and whether the
+  service should stay runnable or sleep, with completions still preferred over
+  submissions under `ServiceBudget`. Verification:
+  `cargo test -p tx-subsystems --lib page_service_drive_ -- --nocapture`
+  passed 3/3. The plan record
+  `docs/progress/plans/2026-07-11-io-manager-phase0-landing.json` is now
+  `active`: Phase 1-4 are complete, Phase 5 remains pending for actual
+  reactor service-future wake integration, backend planning dispatch, and
+  replacing the legacy file-fetch table with PageSlot-backed state.
+
+- 2026-07-11 (timer subsystem focused witness sweep).
+  Refreshed the full non-network timer subsystem acceptance set under
+  `docs/stage2-documents/time_infra/TX_TIMER_SUBSYSTEM_DESIGN_CN.md`. Producer
+  witnesses now have fresh host evidence: `timerfd_dispatch` passed 10/10;
+  `time_syscalls` passed 27/27 including nanosleep registry and `ITIMER_REAL`
+  signal-timer hint/rearm; `posix_timer_dispatch` passed 4/4; the futex
+  positive-timeout registry witness passed; `fd_ops_wave3` passed 20/20
+  including ppoll/pselect registry witnesses; `epoll_dispatch` passed 10/10;
+  `ioctl_dispatch` passed 19/19 including RTC typed ops, alarm fallback, and
+  pending-event readiness; `rtc_irq_handler_publishes_alarm_event_to_devfs_rtc_state`
+  passed; and `timer_style_wake_after_steal_targets_last_owner_hart` passed. Structural
+  gates also passed: `cargo check -p tx-services -p tx-subsystems -p tx-shims
+  -p tx-reactor`, `cargo xtask lint invariants time-layering` with 0/0
+  findings, and `cargo xtask lint invariants time-wake-retired` with 0/0
+  retired sites. The broad host unit gate also passed: `cargo -q xtask unit`
+  built `tx-shims`, `tx-kernel`, `tx-ext4`, and `tx-scripts`, then passed
+  `tx-shims` 590/590, `tx-kernel` 104/104, `tx-ext4` 9/9, and `tx-scripts`
+  56/56. Existing warnings remain outside this timer slice
+  (`tx-vdso` assembler stub, net `step_connect.rs` unused `guard`,
+  `tx_ext4_bridge.rs` unused `Vec`, plus tx-kernel test-only dead code in the
+  RTC witness). Updated the timer design document's current verification
+  snapshot to `time_syscalls` 27/27. Next step: run docs/progress whitespace
+  gates after this status update, then treat further work as new producer
+  additions or maintenance of the hard lints rather than an open timer
+  migration row.
+
 - 2026-07-11 (tx-observe schema codegen automation).
   Continued the observe L0 schema consolidation by making kernel-side automation
   concrete. `schema/txobserve.toml` now owns the `HartEmitter` public helper
@@ -133,7 +2985,7 @@
   producer-boundary lint rules. `cargo xtask observe-schema check` now compares
   that catalog against `crates/tx-observe/src/lib.rs`, and `cargo xtask
   observe-schema codegen --check` protects the generated kernel catalog at
-  `crates/tx-observe/src/generated/schema_catalog.rs`. The
+  `crates/tx-observe/src/l0_schema/schema_catalog.rs`. The
   `observe-producer-boundary` invariant now reads forbidden raw producer API
   needles from the TOML schema instead of a hardcoded xtask table. Verification:
   `cargo test -p xtask --lib observe_schema::tests -- --nocapture` passed 9/9;
@@ -146,6 +2998,408 @@
   automation work: generated host catalog/projection matrix, menuconfig-style
   TUI output, docs table generation, and eventually generated typed
   `EventToken`/macro wrappers for producer callsites.
+
+- 2026-07-12 (waitEndpoint object-accessor and TTY await migration).
+  Continued the waitEndpoint language landing beyond process exit. Added
+  endpoint-facing accessors for object-owned mailbox wait sources:
+  `EventFd::reader_endpoint` / `writer_endpoint`,
+  `PipePayload::reader_endpoint` / `writer_endpoint`, and
+  `TtyIdentity::read_endpoint`. The TTY readable wait path in tx-shims now
+  parks on `wait_source::wait_on_endpoint(tty.read_endpoint(), TTY_READABLE)`
+  instead of resolving `tty.wait_source_id()` through the registered-source
+  bridge. The pselect/ppoll wait helpers were generalized over `Future + Unpin`
+  so fd facade waits can continue using `RegisteredWaitFuture` while direct
+  object endpoints use `WaitSourceWaitFuture`. The stale TTY waitsource
+  integration test no longer imports legacy channel vocabulary and now proves
+  endpoint future `Pending -> Ready` across `step_ingest_with_post`.
+  Verification: RED was observed for missing eventfd/pipe/TTY endpoint methods
+  and for stale legacy-channel imports in `v3_tty_waitsource`; focused tests
+  passed:
+  `cargo test -p tx-subsystems --lib
+  eventfd::tests::endpoints_match_registered_reader_and_writer_sources --
+  --nocapture`, `cargo test -p tx-subsystems --lib
+  pipe::tests::pipe_step_pipe2_returns_distinct_reader_and_writer_caps --
+  --nocapture`, and `cargo test -p tx-subsystems --test v3_tty_waitsource
+  tty_wait_source_invariants_round_trip -- --nocapture`. `cargo check -p
+  tx-shims --lib` passed. `cargo xtask lint invariants legacy-wait-channel`
+  passed with production sites still 0; report-only inventory dropped from 10
+  to 8 (`RegisteredWaitFuture` 5 -> 3). Next step: continue endpoint accessors
+  for signalfd/userfaultfd/timerfd/epoll/range-lock/RNode where appropriate,
+  then decide separately whether fd `FdWait` should stay id-bearing or grow an
+  endpoint-backed variant.
+
+- 2026-07-11 (waitEndpoint language first landing).
+  Added the first tx-subsystems wait driver entry point that consumes a
+  substrate `WaitEndpoint` directly: `wait_source::wait_on_endpoint` builds the
+  mailbox wait future from an object-owned endpoint without routing through the
+  global source-id registry. Process exit is the first object-level landing:
+  `ProcessIdentity::exit_endpoint()` exposes the existing `Arc<WaitSource>` as
+  endpoint language, the process exit-source tests now subscribe through that
+  endpoint, and the SIGCHLD `sigtimedwait` park path in tx-shims uses
+  `exit_endpoint()` plus `wait_on_endpoint()` instead of exporting
+  `exit_source_id` into the await site. This keeps old token/id APIs available
+  for remaining yield-shape and compatibility paths while establishing the
+  narrower object-endpoint vocabulary. Verification: RED was observed for the
+  missing `wait_on_endpoint` helper and missing `exit_endpoint` object method;
+  `cargo test -p tx-subsystems --lib
+  wait_source::tests::wait_on_endpoint_subscribes_to_object_owned_source --
+  --nocapture` passed; `cargo test -p tx-subsystems --lib
+  process::tests::exit_source -- --nocapture` passed 4/4; `cargo check -p
+  tx-shims --lib` passed; `cargo xtask lint invariants legacy-wait-channel`
+  passed with production sites still 0 and the report-only inventory still at
+  10. Next step: migrate additional object-owned mailbox waits to endpoint
+  accessors, then decide whether fd `FdWait` should carry endpoints or stay as
+  the fd facade's id-bearing subscription value.
+
+- 2026-07-11 (I/O manager phase-5 route-gated PageBacked notify).
+  Tightened the PageBacked compatibility bridge so PageReady notification is
+  gated by the staged L4 service route. `retire_file_page_fetch_wait` now
+  retires the `PageService` submission, consumes the request's routed
+  `PageWaiter`s, and returns a PageReady notifier only when the service route
+  carried waiters; legacy `FilePageFetch::joined/source_id` state alone no
+  longer bypasses the L4 routing model. The live executor still falls back to
+  direct `FsPageBacking::fetch_page`; this slice only makes the completion-side
+  wake decision respect the service-owned waiter table. Verification: RED was
+  observed in `file_page_retire_notifies_only_when_l4_route_has_waiter`, then
+  it passed; `cargo test -p tx-subsystems --lib page_service_ -- --nocapture`
+  passed 5/5; focused
+  `file_page_miss_enters_l4_shadow_queue_before_compat_fetch` passed; `cargo
+  test -p tx-subsystems --lib io_manager -- --nocapture` passed 21/21; `cargo
+  test -p tx-subsystems --lib page_backed -- --nocapture --test-threads=1`
+  passed 99/99; `cargo check -p tx-subsystems` passed with the existing
+  `net/execution/step_connect.rs` unused-`guard` warning; boundary scan still
+  finds no concrete filesystem imports or device submission calls from
+  `io_manager`/`fs_iface`; scoped rustfmt, scoped `git diff --check`, `cargo
+  xtask progress validate`, and `cargo xtask lint docs` passed. Remaining
+  Phase 5 work: actual long-lived service-future scheduling, backend planning
+  dispatch, and replacing the legacy in-flight table with PageSlot-backed
+  state.
+
+- 2026-07-11 (I/O manager phase-5 PageBacked waiter bridge).
+  Moved the PageContainer staged miss shadow from a bare `PageRequestQueue` to
+  `io_manager::page::service::PageService`. File-page owner misses still use
+  the compatibility `FsPageBacking::fetch_page` executor, but the staged L4
+  request is now owned by `PageService`, and reentrant same-page misses
+  register their PageReady wait-source id as a neutral `PageWaiter` on that
+  service request. The direct compatibility completion retires the service
+  submission and clears service-owned waiters while the actual mailbox wake is
+  still posted by the existing PageBacked notifier. Verification: RED was
+  observed for missing `file_io_waiter_count_for_test`; focused
+  `file_page_miss_enters_l4_shadow_queue_before_compat_fetch` passed;
+  `cargo test -p tx-subsystems --lib page_service_ -- --nocapture` passed
+  5/5; `cargo test -p tx-subsystems --lib io_manager -- --nocapture` passed
+  21/21; `cargo test -p tx-subsystems --lib page_backed -- --nocapture
+  --test-threads=1` passed 98/98; `cargo check -p tx-subsystems` passed with the existing
+  `net/execution/step_connect.rs` unused-`guard` warning; boundary scan still
+  finds no concrete filesystem imports or device submission calls from
+  `io_manager`/`fs_iface`; scoped rustfmt and `git diff --check` passed.
+  Remaining Phase 5 work: use service completion routes for the actual
+  PageBacked mailbox notification, add actual long-lived service-future
+  scheduling, backend planning dispatch, and replace the legacy in-flight
+  table with PageSlot-backed state.
+
+- 2026-07-11 (VFS shim-local resolve/mounted helpers landed).
+  Completed the first non-RCU VFS cleanup implementation slice in the syscall
+  shim. `linux_syscall::fs_resolve` now owns path-aware `dirfd` anchoring and
+  parent/name splitting; absolute paths now ignore a non-`AT_FDCWD` `dirfd` as
+  Linux expects, pinned by
+  `dispatch_mkdirat_absolute_path_ignores_non_cwd_dirfd`. Added
+  `linux_syscall::fs_mounted` with `MountedDentry` for ascending
+  `DEntry -> MountPayload/FsOps/FsPageBacking` lookup and a direct-only
+  `MountedNode` helper for existing fd/RNode call sites. This intentionally
+  does not fix fd-only descendant RNodes that lack `containing_mount_weak`;
+  that remains a VFS stamping/composite follow-up, not an RCU or mount
+  publication change. Verification: `rustfmt --edition 2021` on the touched
+  syscall files passed; scoped `git diff --check` passed; `cargo test -p
+  tx-shims --lib file_mutation -- --nocapture --test-threads=1` passed 34/34;
+  `cargo test -p tx-shims --lib stat_family -- --nocapture --test-threads=1`
+  passed 26/26; `cargo test -p tx-shims --lib fd_ops_wave2 -- --nocapture
+  --test-threads=1` passed 41/41. Existing build warnings remain outside this
+  slice (`net/execution/step_connect.rs` unused `guard`,
+  `tx-fs/src/tx_ext4_bridge.rs` unused `Vec`). Remaining coverage gap:
+  syscall-level `fsync/syncfs` witnesses for the `MountedNode` page-backing
+  route.
+
+- 2026-07-11 (I/O manager phase-5 L4 waiter routing model).
+  Extended `io_manager::page::service` with neutral waiter-routing types:
+  `PageWaiter`, `PageWaitInterest`, `PageCompletionRoute`, and a request-id
+  keyed waiter table. Completion drain now attaches registered waiters to the
+  completion work before any submission work and removes those waiters exactly
+  once. This models L4 ownership of waiter routing without importing
+  PageBacked notification internals, concrete filesystem crates, reactor
+  mailbox posting, or block/device submission. Verification: RED was observed
+  for missing waiter routing types/API, then `cargo test -p tx-subsystems
+  --lib page_service_ -- --nocapture` passed 5/5; `cargo test -p
+  tx-subsystems --lib io_manager -- --nocapture` passed 21/21; `cargo test -p
+  tx-subsystems --lib page_backed -- --nocapture` passed 98/98; `cargo check
+  -p tx-subsystems` passed with the existing `net/execution/step_connect.rs`
+  unused-`guard` warning; boundary scan still finds no concrete filesystem
+  imports or device submission calls from `io_manager`/`fs_iface`; scoped
+  rustfmt, scoped `git diff --check`, `cargo xtask progress validate`, and
+  `cargo xtask lint docs` passed. Remaining Phase 5 work: wire PageBacked
+  wait-source notification through the service model, add actual long-lived
+  service-future scheduling, backend planning dispatch, and replace the legacy
+  in-flight table with PageSlot-backed state.
+
+- 2026-07-11 (timer RTC and SMP witness closeout). Re-ran the remaining
+  focused non-network timer witnesses under the timer subsystem contract. RTC
+  alarm emulation now has fresh proof that unsupported hardware alarms fall
+  back to the unified timer registry and publish pending `ALARM` bits only on
+  expiry: `cargo test -p tx-shims --lib
+  dispatch_ioctl_rtc_alarm_set_emulates_event_when_hardware_alarm_is_unsupported
+  -- --nocapture` passed. RTC typed readiness is covered by `cargo test -p
+  tx-shims --lib dispatch_ppoll_rtc_uses_typed_pending_event_readiness --
+  --nocapture`, and the typed IRQ ack/publication route is covered by `cargo
+  test -p tx-kernel rtc_irq_handler_publishes_alarm_event_to_devfs_rtc_state --
+  --nocapture`; both passed. The SMP post-steal wake witness
+  `timer_style_wake_after_steal_targets_last_owner_hart` now runs and passes
+  under `cargo test -p tx-reactor --test scheduler ... -- --nocapture`, proving
+  a timer-style wake from hart0 routes to the task's post-steal owner hart1
+  with remote reschedule while preserving the preempted-queue budget semantics.
+  Remaining timer scope: keep `time-layering`/`time-wake-retired` at zero,
+  rerun the full focused witness set after further timer-facing edits, and keep
+  network timer/readiness as a separate lane.
+
+- 2026-07-11 (time-layering gate repair after net/io-manager overlap). Repaired
+  two hard-gate regressions exposed by the final timer witness pass. The net
+  delegate timer adapter now accepts a borrowed `DeadlineRegistrar` trait and
+  registers its deadline at future construction time; the future stores only
+  mailbox, `TimerGuard`, and `TimerToken`, so it no longer keeps a concrete
+  `DeadlineRegistrarHandle` in net subsystem state. This preserves the
+  delegate timer behavior while satisfying the timer subsystem handle boundary.
+  Also narrowed `time-wake-retired` so the AIO/io_uring retired
+  `push_completion` name is checked only by the existing AIO/io_uring group,
+  avoiding a false positive on the unrelated I/O manager page-service
+  completion queue. Verification: `cargo xtask lint invariants time-layering`
+  passed with 0 findings; `cargo xtask lint invariants time-wake-retired`
+  passed with 0 sites; `cargo test -p xtask time_wake -- --nocapture` passed
+  5/5 in the xtask lib target; `cargo check -p tx-subsystems --lib` passed
+  with the existing `net/execution/step_connect.rs` unused-`guard` warning;
+  focused net delegate timer tests passed:
+  `net_delegate_supervisor_timer_wake_fires_tick_for_current_generation` and
+  `net_delegate_reactor_timer_adapter_fires_tick_and_drives_retransmit`.
+
+- 2026-07-11 (net delegate channel retirement). Removed the final net-owned
+  reactor `Channel` use from the delegate timer path. `net_delegate_wait_tick_deadline`
+  and `net_delegate_wait_supervised_deadline` now take the reactor deadline
+  registrar facade directly and park on a task-mailbox deadline future; the
+  timer expiry still publishes the delegate `TICK` bit and preserves
+  `WaitOutcome::TimedOut` for existing supervisor/report code. The reactor now
+  exposes `Reactor::deadline_registrar_handle()` so timer-only consumers do not
+  manufacture channels just to reach the timer wheel. Verification:
+  `cargo test -p tx-subsystems --lib
+  net_delegate_supervisor_timer_wake_fires_tick_for_current_generation --
+  --nocapture`, `cargo test -p tx-subsystems --lib
+  net_delegate_reactor_timer_adapter_fires_tick_and_drives_retransmit --
+  --nocapture`, `cargo test -p tx-subsystems --lib delegate_supervisor --
+  --nocapture`, and `cargo test -p tx-subsystems --lib delegate_tick --
+  --nocapture` passed; `cargo check -p tx-reactor --lib`, `cargo check -p
+  tx-subsystems --lib`, and `cargo xtask lint invariants legacy-wait-channel`
+  passed. Static scan over `crates/tx-subsystems/src/net` and socket shims now
+  finds no `Channel`, `timer_channel`, or `reactor.channel()` references.
+  Remaining report-only language is not channel ownership: `RegisteredWaitFuture`
+  in the registered-source resolver and `WaitProtocol` in the net facade.
+
+- 2026-07-11 (I/O manager phase-5 L4 service turn model).
+  Added `io_manager::page::service` as the staged L4 queue-owner model for
+  `kpageiod`-style turns. The service owns separate page submission and
+  completion queues, drains completions before submissions under
+  `ServiceBudget`, preserves submission backlog when completion handling
+  exhausts the budget, and sleeps only when both queues are empty. This fixes
+  the service-future type shape from `IO_MANAGER_v1.md` without importing
+  concrete filesystem crates or dispatching to block/device drivers.
+  Verification: RED was observed for missing `PageService`/turn types, then
+  `cargo test -p tx-subsystems --lib page_service_ -- --nocapture` passed
+  3/3; `cargo test -p tx-subsystems --lib io_manager -- --nocapture` passed
+  19/19; `cargo test -p tx-subsystems --lib page_backed -- --nocapture` passed
+  98/98; `cargo check -p tx-subsystems` passed with the existing
+  `net/execution/step_connect.rs` unused-`guard` warning; boundary scan still
+  finds no concrete filesystem imports or device submission calls from
+  `io_manager`/`fs_iface`; scoped rustfmt and `git diff --check` passed.
+  Remaining Phase 5 work: wait routing into the service, actual long-lived
+  service-future scheduling, backend planning dispatch, and replacing the
+  legacy in-flight table with PageSlot-backed state.
+
+- 2026-07-11 (I/O manager phase-5 PageContainer shadow admission).
+  Connected the current file-page miss owner path to a staged L4 shadow
+  request without replacing the live compatibility executor. `PageContainer`
+  now creates a `PageIoRequest` with a generation hint before calling the
+  existing `FsPageBacking::fetch_page`; reentrant same-page misses still join
+  the legacy in-flight fetch and do not enqueue a duplicate request; the shadow
+  request is retired when the direct compatibility fetch completes or fails.
+  Verification: the new
+  `file_page_miss_enters_l4_shadow_queue_before_compat_fetch` witness passed;
+  `cargo test -p tx-subsystems --lib io_manager -- --nocapture` passed 16/16;
+  `cargo test -p tx-subsystems --lib file_page_miss_ -- --nocapture` passed
+  3/3; `cargo test -p tx-subsystems --lib page_slot_ -- --nocapture` passed
+  3/3; `cargo test -p tx-subsystems --lib page_backed -- --nocapture` passed
+  98/98; `cargo check -p tx-subsystems` passed with the existing
+  `net/execution/step_connect.rs` unused-`guard` warning; boundary scan still
+  finds no concrete filesystem imports or device submission calls from
+  `io_manager`/`fs_iface`; `cargo xtask progress validate` passed. Remaining
+  Phase 5 work: real wait routing, service-future ownership/driving, and
+  replacing the legacy in-flight table with PageSlot-backed state.
+
+- 2026-07-11 (wait-source channel compatibility retirement). Removed the
+  non-network dual-hung `Channel + WaitSource` wake objects and the
+  `wait_source::wait_on_token` compatibility resolver. VFS RNode, TTY, futex,
+  VM RangeLock, and Process exit source now register and notify only
+  mailbox-backed `WaitSource` values; fd/readiness shims and net/socket
+  wait-shape drivers resolve source id plus interest through
+  `wait_on_registered_source_id`/`wait_on_source_id`. The global
+  `wait_source` registry now carries only `WaitSource`, `RawQueue`, and
+  `RawPort`; `register_wait_channel*`, `lookup_wait_channel`, and
+  `wait_on_token` are gone from production code and tests. Verification:
+  `cargo xtask lint invariants legacy-wait-channel` passed with
+  `legacy wait-channel sites: 0`; `cargo check -p tx-subsystems --lib` and
+  `cargo check -p tx-shims --lib` passed with existing warnings; focused tests
+  passed: `cargo test -p tx-subsystems --lib wait_source -- --nocapture`,
+  `cargo test -p tx-subsystems --lib process::tests::exit_source --
+  --nocapture`, `cargo test -p tx-subsystems --lib range_lock --
+  --nocapture`, `cargo test -p tx-shims --lib select_fd_ -- --nocapture`,
+  `cargo test -p tx-shims --lib fd_ops_wave3 -- --nocapture`, `cargo test -p
+  tx-shims --lib dispatch_ppoll_rtc_uses_typed_pending_event_readiness --
+  --nocapture`, and `cargo test -p tx-shims --lib event_notification_dispatch
+  -- --nocapture`; scoped `git diff --check` also passed. Remaining report-only
+  language: net delegate timer/supervisor still owns an internal reactor
+  `Channel`/`Mask`, and the wait-source future type still exposes
+  `RegisteredWaitFuture` while socket/io callers share the registered-source
+  facade. Next step: retire the net delegate timer `Channel` as a separate
+  network slice, then decide whether `RegisteredWaitFuture` should be renamed
+  or hidden behind a smaller facade.
+
+- 2026-07-11 (I/O manager phase-5 partial L4 admission gate).
+  Added the staged request-admission half of the L4 miss boundary without
+  wiring it into the live `PageContainer` miss path. `io_manager::page` now has
+  an `admission` submodule with `admit_demand_read`, which observes a
+  `PageSlot`, joins existing fetches, returns resident pages without queueing,
+  and turns an Empty/Error slot into a queued `PageIoRequest` carrying the
+  slot generation hint. Queue-full admission is rejected before claiming an
+  empty slot, preserving the slot state. Verification:
+  `cargo test -p tx-subsystems --lib page_admission_ -- --nocapture` passed
+  4/4; `cargo test -p tx-subsystems --lib io_manager -- --nocapture` passed
+  15/15; `cargo test -p tx-subsystems --lib page_slot_ -- --nocapture` passed
+  3/3; `cargo check -p tx-subsystems` passed with the existing
+  `net/execution/step_connect.rs` unused-`guard` warning. Boundary scan still
+  finds no concrete filesystem imports or device submission calls from
+  `io_manager`/`fs_iface`. Remaining Phase 5 work: connect this admission seam
+  to `PageContainer` miss/writeback paths and add wait routing/service-future
+  ownership.
+
+- 2026-07-11 (I/O manager phase-5 partial L4 completion gate).
+  Added the first L4 page-completion compatibility helper without connecting
+  `PageContainer` miss handling to the service path. `io_manager::page` now has
+  a `completion` submodule with `apply_read_completion`, which accepts a
+  `PageIoCompletion`, checks the staged read-completion shape, and delegates
+  generation-checked installation/error publication to `PageSlot::complete_fetch`.
+  This proves the requested completion boundary in isolation while leaving the
+  old `PageContainer -> FsPageBacking` miss path untouched. Verification:
+  `cargo test -p tx-subsystems --lib page_completion_ -- --nocapture` passed
+  2/2; `cargo test -p tx-subsystems --lib io_manager -- --nocapture` passed
+  11/11; `cargo test -p tx-subsystems --lib page_slot_ -- --nocapture` passed
+  3/3; `cargo check -p tx-subsystems` passed with the existing
+  `net/execution/step_connect.rs` unused-`guard` warning. Boundary scan still
+  finds no concrete filesystem imports or device submission calls from
+  `io_manager`/`fs_iface`. Remaining Phase 5 work: request ownership transfer
+  from PageContainer miss/writeback paths, wait routing, and service-future
+  queue ownership.
+
+- 2026-07-11 (timer producer registry witnesses and wait-source compile repair).
+  Added focused timer-registry witnesses for remaining non-RTC producers:
+  `dispatch_nanosleep_positive_duration_uses_unified_timer_registry`,
+  `dispatch_futex_wait_positive_timeout_uses_unified_timer_registry`,
+  `dispatch_ppoll_positive_timeout_uses_unified_timer_registry`, and
+  `dispatch_pselect6_positive_timeout_uses_unified_timer_registry`; the existing
+  epoll witness is `dispatch_epoll_pwait_positive_timeout_uses_unified_timer_registry`.
+  While verifying futex, fixed the dirty-tree wait-source rename fallout that
+  left futex/process/TTY/VM notification paths calling retired wait-channel
+  registration APIs or stale `wait_channel()` helpers. Production callsites now
+  register `WaitSource` values through `register_wait_source_with_id`, and
+  `cargo check -p tx-shims --lib` passes with only existing warnings
+  (`tx-vdso` assembler stub, `net/execution/step_connect.rs` unused `guard`,
+  `tx_ext4_bridge.rs` unused `Vec`). Verification passed before the later
+  dirty-tree test-cfg blocker: `cargo test -p tx-shims --lib
+  dispatch_nanosleep_positive_duration_uses_unified_timer_registry --
+  --nocapture`, `cargo test -p tx-shims --lib
+  dispatch_futex_wait_positive_timeout_uses_unified_timer_registry --
+  --nocapture`, `cargo test -p tx-shims --lib
+  dispatch_ppoll_positive_timeout_uses_unified_timer_registry -- --nocapture`,
+  and `cargo test -p tx-shims --lib fd_ops_wave3 -- --nocapture` passed.
+  Fresh recheck after the wait-source compile repair also passed the focused
+  producer witnesses: nanosleep positive timeout, futex positive timeout,
+  `fd_ops_wave3` including ppoll/pselect, and epoll positive timeout all ran
+  through `cargo test -p tx-shims --lib ... -- --nocapture`. Remaining timer
+  scope: RTC alarm final witness, SMP post-steal wake witness, and the final
+  time-layering/time-wake/doc/progress gates.
+
+- 2026-07-11 (SMP post-steal timer wake witness staged). Added the focused
+  scheduler witness
+  `timer_style_wake_after_steal_targets_last_owner_hart`, covering the race
+  where a fair task is preempted on hart0, stolen by hart1, later blocks on
+  hart1, and then receives a timer-style wake from hart0. The expected routing
+  is hart1 with `wake_remote=true`, proving wake target selection follows the
+  post-steal last owner rather than the firing hart. Verification:
+  `cargo check -p tx-reactor --tests` passed. Execution remains blocked by the
+  current `tx-reactor` test binary startup issue: both `cargo test -p
+  tx-reactor --test scheduler
+  timer_style_wake_after_steal_targets_last_owner_hart -- --nocapture` and the
+  matching `-- --list` run timed out before printing test enumeration.
+  Remaining timer scope: RTC alarm final witness, runnable `tx-reactor`
+  post-steal witness execution, and the final time-layering/time-wake/doc
+  gates.
+
+- 2026-07-11 (I/O manager phase-4 bdev-fs BioPlan adapter).
+  Landed the first concrete planning adapter without changing the live
+  `FsPageBacking` execution path. `crates/tx-fs/src/bdevfs/mod.rs` now exposes
+  `plan_page_bio` for page-offset-to-LBA read/write planning and
+  `plan_barrier_bio` for neutral barrier planning, both returning
+  `io_manager::block::BioPlan` values and neither submitting to
+  `BlockDeviceHandle`. Existing bdev-fs `fetch_page`, `flush_page`, and
+  `fsync_file` remain the compatibility executor. Verification:
+  `cargo test -p tx-fs --lib bdevfs -- --nocapture` passed 2/2;
+  `cargo test -p tx-subsystems --lib io_manager -- --nocapture` passed 9/9;
+  `cargo check -p tx-fs` and `cargo check -p tx-subsystems` passed with
+  existing warnings; scoped rustfmt, scoped `git diff --check`, and
+  `cargo xtask progress validate` passed. Boundary scan found no concrete
+  filesystem imports from `io_manager` or `fs_iface`. Next step: Phase 5 L4
+  page submission compatibility seam after the PageContainer miss-path tests
+  are defined.
+
+- 2026-07-11 (I/O manager phase-3 L6 block queue scaffolding).
+  Landed the staged L6 block-submission slice without changing
+  `BlockDeviceHandle`, `BlockDeviceOps`, bdev-fs, ext4, or live driver
+  execution. Extended `io_manager::block` with front/back adjacent LBA merge,
+  request-tag allocation, tag-to-request completion lookup, QueueDepth
+  completion accounting, and a tagged dispatch path that prevents ordinary I/O
+  from crossing an in-flight barrier/fence. Verification:
+  `cargo test -p tx-subsystems --lib io_manager::block -- --nocapture` passed
+  6/6; `cargo test -p tx-subsystems --lib io_manager -- --nocapture` passed
+  9/9; `cargo check -p tx-subsystems` passed with the existing
+  `net/execution/step_connect.rs` unused-`guard` warning; scoped rustfmt,
+  scoped `git diff --check`, `cargo xtask progress validate`, `cargo xtask
+  lint docs`, and `cargo -q xtask unit` passed. Static boundary scan found
+  only the compatibility prose in `io_manager/mod.rs`, with no concrete
+  filesystem imports and no `BlockDeviceHandle`/`BlockDeviceOps` call from the
+  new control-plane code. Next step: Phase 4 bdev-fs BioPlan adapter once the
+  broad `crates/tx-fs/src/` write-scope conflict is cleared.
+
+- 2026-07-11 (I/O manager phase-2 PageSlot/RangeReservation scaffolding).
+  Landed the second staging slice without changing the live
+  `PageContainer -> FsPageBacking -> BlockDeviceOps` path. Added
+  `page_backed::slot` with a per-slot locked FSM for Empty, Resident,
+  Fetching, Dirty, Writeback, Error, plus generation-checked fetch/writeback
+  completion. Added `page_backed::range` with an owner-locked interval table
+  for truncate/fallocate/fsync/O_DIRECT-style semantic exclusion. Verification:
+  `cargo test -p tx-subsystems --lib page_slot_ -- --nocapture` passed 3/3;
+  `cargo test -p tx-subsystems --lib range_reservation_ -- --nocapture`
+  passed 3/3; `cargo test -p tx-subsystems --lib page_backed -- --nocapture`
+  passed 97/97; `cargo test -p tx-subsystems --lib io_manager --
+  --nocapture` passed 6/6; `cargo check -p tx-subsystems` passed with the
+  existing `net/execution/step_connect.rs` unused-`guard` warning; `cargo
+  xtask progress validate`, `cargo xtask lint docs`, scoped `git diff --check`,
+  and `cargo -q xtask unit` passed. Next step: Phase 3 L6 block
+  queue/tag/fence semantics over the current `BlockDeviceHandle` model, still
+  without touching concrete drivers.
 
 - 2026-07-11 (tx-observe kernel-side structured/helper migration).
   Continued the kernel-side L0-L6 observe migration beyond the initial
@@ -182,6 +3436,5714 @@
   Remaining follow-up is schema/codegen ownership of helper names, not
   unchecked kernel producer migration.
 
+- 2026-07-11 (fd readiness facade ppoll/pselect cleanup).
+  Migrated the `sys_ppoll` and `sys_pselect6` readiness loops in
+  `crates/tx-shims/src/linux_syscall/io.rs` to translate Linux ABI interests
+  into `FdReadyMask` and consume `query_fd_ready` instead of hand-matching
+  eventfd/pipe/socketpair/timerfd/signalfd/userfaultfd/POSIX-mq/socket
+  readiness. Added shared select helper predicates over `FdReadyMask`, updated
+  the socket fdtable helper tests to the fd facade language, and kept RTC as the
+  shim-side fallback because the RTC wait source still lives in `tx-fs::devfs`.
+  The fd-readiness old-term inventory in `io.rs` is now down to the remaining
+  `sys_read` socket fast path (`socket_poll_mask_from_file`); ppoll/pselect no
+  longer carry the socket-specific poll helper names. Verification:
+  `cargo check -p tx-shims --lib` passed with existing warnings only;
+  `cargo test -p tx-shims --lib
+  dispatch_ppoll_rtc_uses_typed_pending_event_readiness -- --nocapture` passed;
+  `cargo test -p tx-shims --lib select_fd_ -- --nocapture` passed 2/2;
+  `cargo test -p tx-shims --lib fd_ops_wave3 -- --nocapture` passed 18/18;
+  `cargo test -p tx-subsystems --lib
+  fd_ready_facade_reports_eventfd_readiness_and_waits -- --nocapture` passed;
+  `cargo test -p xtask --lib
+  fd_ready_facade_inventory_flags_io_poll_readiness_terms -- --nocapture`
+  passed. `cargo xtask lint invariants legacy-wait-channel` still fails as
+  expected at 17 production legacy wait-channel sites, and the report-only
+  Channel-retirement inventory is 111 findings. Next step: replace the remaining
+  ppoll/pselect `WaitToken -> wait_on_token` await path with a wait-source list
+  await helper, then design the device endpoint seam that can retire the RTC
+  fallback.
+
+- 2026-07-11 (I/O manager phase-1 value scaffolding).
+  Landed the first I/O manager migration slice without changing the live
+  `PageContainer -> FsPageBacking -> BlockDeviceOps` path. Added
+  `crates/tx-subsystems/src/io_manager/` with page request/completion values,
+  page request queue priority admission, block `BioPlan`/`BioVec` values, FIFO
+  block queue admission, adjacent LBA merge, queue-depth checks, barrier fence
+  dispatch rules, and shared runtime queue-depth/budget helpers. Added
+  `crates/tx-subsystems/src/fs_iface/plan.rs` as the neutral backend-plan IR
+  and exported both new modules from `tx-subsystems`. No bdev-fs, ext4,
+  `FsPageBacking`, `BlockDeviceOps`, or `PageContainer::materialize_file_page`
+  code was changed. Verification: `cargo test -p tx-subsystems --lib
+  io_manager -- --nocapture` passed 6/6; `cargo check -p tx-subsystems` passed
+  with the existing `net/execution/step_connect.rs` unused-`guard` warning;
+  scoped `git diff --check` passed for the new module paths; concrete-backend
+  import scan found only compatibility prose; scoped rustfmt check passed for
+  the new files; `cargo xtask progress validate` passed with 30 progress files;
+  `cargo xtask lint docs` passed with the existing 7 stale-vocabulary warnings.
+  Full `lib.rs` rustfmt check remains blocked by unrelated dirty futex tests
+  that use the edition-2024 reserved word `gen`. Next step: start
+  `phase2-page-slot-range`.
+
+- 2026-07-11 (RTC IRQ ack typed time boundary).
+  Closed the remaining raw RTC IRQ acknowledgement edge under the timer
+  subsystem contract. Extended `time-layering` to catch raw
+  `P::acknowledge_wake_alarm_irq()` / `PersistentClockIf::acknowledge_wake_alarm_irq()`
+  callsites outside the platform adapter; the RED run reported
+  `crates/tx-kernel/src/irq.rs:185` as the single production finding. Migrated
+  `rtc_alarm_irq_handler` to acknowledge through
+  `tx_services::time::platform::HalRtcDevice<P>::acknowledge_alarm_irq()` and
+  kept RTC readiness publication on `publish_rtc_event_with_post` so the device
+  wake still routes through the injected owner-aware mailbox-ref post. Also
+  repaired the kernel entry-timer witness after public wheel retirement by
+  driving due timers through `Reactor::advance_time_to` /
+  `Reactor::next_deadline_ns` instead of a concrete `TimerWheel`. Updated the
+  timer subsystem design doc to mark RTC IRQ ack as typed. Verification:
+  `cargo xtask lint invariants time-layering` first failed with 1 finding, then
+  passed with 0; `cargo test -p tx-kernel
+  rtc_irq_handler_publishes_alarm_event_to_devfs_rtc_state -- --nocapture`
+  passed; `cargo test -p tx-kernel
+  entry_timer_poll_rearms_periodic_itimer_with_current_timer_context --
+  --nocapture` passed. Remaining timer scope is producer-level witnesses for
+  sleep/futex/poll/select/epoll/RTC/SMP plus continued lint allowlist
+  maintenance.
+
+- 2026-07-11 (POSIX/itimer signal timer hint witnesses).
+  Closed the remaining semantic witness slice for signal-producing timers under
+  the timer subsystem contract. Added focused tx-shims witnesses proving that a
+  unified registry expiry for `ITIMER_REAL` and POSIX timers only enqueues a
+  `SignalTimerFired` hint and does not itself deliver SIGALRM/POSIX timer
+  signals; the normal due-scan path remains responsible for signal delivery,
+  overrun/rearm handling, and mailbox posting. Updated
+  `docs/stage2-documents/time_infra/TX_TIMER_SUBSYSTEM_DESIGN_CN.md` to mark
+  the POSIX/itimer hint-vs-delivery boundary as covered, leaving RTC IRQ/device
+  route cleanup plus remaining sleep/futex/poll/select/epoll/RTC/SMP producer
+  witnesses as the active timer scope. Verification: `cargo test -p tx-shims
+  --lib dispatch_itimer_real_signal_timer_hint_waits_for_due_scan --
+  --nocapture` passed, `cargo test -p tx-shims --lib
+  dispatch_posix_timer_signal_timer_hint_waits_for_due_scan -- --nocapture`
+  passed, `cargo test -p tx-shims --lib time_syscalls -- --nocapture` passed
+  26/26, and `cargo test -p tx-shims --lib posix_timer_dispatch --
+  --nocapture` passed 4/4.
+
+- 2026-07-11 (Slice/preempt deadline naming convergence).
+  Finished the remaining reactor-side hardware-deadline naming cleanup under
+  the timer subsystem contract. `SliceClock` now extends
+  `tx_services::time::CurrentHartDeadlineTimer` and exposes only `now_ns()`;
+  preemptive slice accounting arms/cancels through
+  `set_current_hart_deadline_ns` / `cancel_current_hart_deadline`. The host
+  `ScriptedSliceClock`, kernel `KernelSliceClock`, and private reactor
+  `ClockSource` bridge now use the same current-hart deadline capability,
+  and the userspace idle periodic re-arm calls the typed method instead of the
+  old `HalDeadlineTimer::set_deadline_ns` helper. Updated the timer subsystem
+  design doc to mark reactor due/next, boot arm/cancel, and slice/preempt
+  hardware-deadline naming as landed; the remaining timer work is now semantic
+  producer evidence (`SignalTimerFired` POSIX/itimer witnesses) plus RTC
+  IRQ/device route cleanup. Verification: `cargo check -p tx-services -p
+  tx-reactor`, `cargo check -p tx-kernel` passed with existing warnings only,
+  `cargo test -p tx-reactor --test reactor_smoke
+  slice_clock_accounts_consumed_time_and_requeues_expired_slice -- --nocapture`
+  passed, `cargo test -p tx-reactor --test hart_loop -- --nocapture` passed
+  5/5, `cargo test -p tx-reactor --test reactor_smoke
+  timer_wheel_expiry_routes_parked_task_through_scheduler_without_mailbox_waker
+  -- --nocapture` passed, `cargo xtask lint invariants time-layering` stayed
+  at 0, and `cargo xtask lint invariants time-wake-retired` stayed at 0.
+
+- 2026-07-11 (ReactorTimeDriver hardware deadline programming seam).
+  Continued the timer subsystem interface migration by making hardware
+  deadline programming an explicit time-service edge. Added
+  `tx_services::time::CurrentHartDeadlineTimer`, gave `ReactorTimeDriver` a
+  default `program_current_hart_deadline(&mut timer)` method that arms or
+  cancels from `next_deadline_ns()`, and implemented the new timer capability
+  for `time::platform::HalDeadlineTimer<P>`. Reactor host clock programming
+  now uses the same `ReactorTimeDriver` default method, and kernel boot reactor
+  loops now call `runtime.program_current_hart_deadline(&mut HalDeadlineTimer)`
+  instead of matching `HartLoopDeadlineAction` to call set/cancel directly.
+  Updated the timer design doc to record `CurrentHartDeadlineTimer` and narrow
+  the remaining reactor-time work to residual slice/preempt deadline naming.
+  Verification: `cargo check -p tx-services -p tx-reactor`, `cargo check -p
+  tx-kernel` passed with existing warnings only, `cargo test -p tx-reactor
+  --test hart_loop -- --nocapture` passed 5/5, `cargo test -p tx-reactor
+  --test reactor_smoke slice_clock_accounts_consumed_time_and_requeues_expired_slice
+  -- --nocapture`, `cargo test -p tx-reactor --test reactor_smoke
+  next_deadline_ns_reports_earliest_and_clears_after_resolution -- --nocapture`,
+  and `cargo test -p tx-reactor --test reactor_smoke
+  timer_wheel_expiry_routes_parked_task_through_scheduler_without_mailbox_waker
+  -- --nocapture` passed; `cargo xtask lint invariants time-layering` stayed
+  at 0, `cargo xtask lint invariants time-wake-retired` stayed at 0, and
+  `cargo xtask lint docs` passed with the existing 7 stale-vocabulary warnings.
+  Next step: either clean up the remaining slice/preempt deadline naming or
+  add POSIX/itimer `SignalTimerFired` semantic witnesses.
+
+- 2026-07-11 (ReactorTimeDriver hart-loop call-shape).
+  Advanced the remaining timer subsystem migration by making
+  `tx_reactor::hart_loop::HartLoopRuntime` inherit
+  `tx_services::time::ReactorTimeDriver` and removing the duplicate
+  `hart_loop_next_deadline_ns` method. `Reactor` and `HartRuntimeView` now
+  implement `ReactorTimeDriver`; runtime due firing in
+  `advance_time_to_with_reschedule` /
+  `advance_time_to_from_hart_with_reschedule` calls
+  `ReactorTimeDriver::fire_due`, so the concrete timer registry is touched
+  inside the driver impl rather than at each hart-loop call shape. Updated the
+  timer subsystem design doc to record that due/next are facade-backed while
+  hardware arm/cancel still use the existing outer platform programmer seam.
+  Verification: `cargo check -p tx-reactor`; `cargo test -p tx-reactor --test
+  hart_loop -- --nocapture` passed 5/5; `cargo test -p tx-reactor --test
+  v3_pr7b_timer_routing -- --nocapture` passed 9/9; `cargo check -p
+  tx-kernel` passed with existing warnings only; `cargo test -p tx-reactor
+  --test reactor_smoke
+  timer_wheel_expiry_routes_parked_task_through_scheduler_without_mailbox_waker
+  -- --nocapture` passed; `cargo xtask lint invariants time-layering` stayed
+  at 0 and `cargo xtask lint invariants time-wake-retired` stayed at 0. Next
+  step: continue the remaining hardware-arm naming cleanup or add POSIX/itimer
+  signal-hint semantic witnesses.
+
+- 2026-07-11 (timer subsystem hard-boundary contract).
+  Closed the timer/time migration contract into
+  `docs/stage2-documents/time_infra/TX_TIMER_SUBSYSTEM_DESIGN_CN.md`: the
+  document now summarizes the migration lanes, module/file boundaries, five
+  consumer-facing interfaces (`ClockRead`, `RealtimeControl`/`VvarPublisher`,
+  `DeadlineRegistrar`, `ReactorTimeDriver`, `RtcDeviceOps`), semantic-loop vs
+  wake-loop split, producer ownership rules, SMP wake placement, linter
+  controls, review checklist, and remaining non-network timer scope. Hardened
+  `cargo xtask lint invariants time-layering` from report-only to a hard
+  ceiling-0 gate after the public `TimerWheel`/raw HAL findings reached zero.
+  Added an `xtask` negative unit witness proving raw production `P::read_ns()`
+  now fails the lint. Verification: `cargo test -p xtask
+  time_layering_lint_fails_on_raw_hal_time_in_production -- --nocapture`
+  passed, `cargo xtask lint invariants time-layering` passed with `time
+  layering findings: 0 (ceiling 0)`, `cargo xtask lint invariants
+  time-wake-retired` passed with 0 retired sites, `cargo xtask lint docs`
+  passed with the existing 7 stale-vocabulary warnings, and `cargo xtask
+  progress validate` passed with 30 progress files. Remaining work is
+  `ReactorTimeDriver` call-shape hardening, POSIX/itimer signal-hint semantic
+  witnesses, RTC IRQ/device route cleanup, and keeping the network timer lane
+  separate except for interface/compile fixes.
+
+- 2026-07-11 (fd readiness facade phase-1).
+  Landed the first fd facade slice for the wait/API-language convergence pass.
+  Added `crates/tx-subsystems/src/vfs/fd_ready.rs` as the OpenFile-level
+  readiness language (`FdReadyMask`, `FdReadyQuery`, `FdReadyReport`,
+  `FdWait`, `query_fd_ready`) over object-owned wait sources, exported it from
+  `vfs`, and pinned eventfd readiness/source behavior with a focused VFS unit
+  test. Migrated `crates/tx-shims/src/linux_syscall/epoll.rs` away from
+  hand-written pipe/eventfd/timerfd/signalfd/userfaultfd/POSIX-mq/socket
+  readiness/source matching; epoll now translates Linux bits to `FdReadyMask`
+  and consumes the shared facade. RTC char-device readiness remains a shim-side
+  fallback because its source id lives in `tx-fs::devfs`, so the next design
+  seam is a device-owned endpoint hook rather than a tx-subsystems -> tx-fs
+  dependency. Verification: RED facade test first failed on missing
+  `vfs::fd_ready`; after implementation, `cargo check -p tx-shims --lib`,
+  `cargo test -p tx-subsystems --lib
+  fd_ready_facade_reports_eventfd_readiness_and_waits -- --nocapture`, and
+  `cargo test -p tx-shims --lib epoll_dispatch -- --nocapture` passed with
+  existing warnings only. Next step: migrate ppoll/pselect to the same facade
+  and then retire the remaining fd-related `WaitToken`/Channel path.
+
+- 2026-07-11 (I/O manager phase-0 landing preparation).
+  Prepared the implementation lane for `docs/design/05_filesystem/IO_MANAGER_v1.md`
+  by adding `docs/progress/research/2026-07-11-io-manager-implementation-readiness.md`
+  and the proposed plan
+  `docs/progress/plans/2026-07-11-io-manager-phase0-landing.json`. Readiness is
+  "mostly ready": phase 0/1 can land as compatibility scaffolding around
+  request/plan/queue values, `PageSlot`, and `RangeReservation` while existing
+  `FsPageBacking` and `BlockDeviceOps` behavior stays valid. The plan keeps
+  generic file-data readahead in PageBacked/L4, keeps ext4 as mapper/metadata
+  owner, defers TxArray/RCU until slot generation semantics are stable, and
+  splits follow-up work by PageBacked, io_manager, block/bdev-fs, ext4, and
+  coordinator write sets. The plan is kept `proposed` and avoids claiming
+  `crates/tx-fs/src/bdevfs/` or `docs/progress/STATUS.md` because the active
+  network blocker plan still owns broad `crates/tx-fs/src/` and STATUS scopes.
+  Verification: `cargo xtask progress validate` passed with 30 progress files
+  after the scope adjustment; `cargo xtask lint docs` passed with the existing
+  7 stale-vocabulary warnings; scoped `git diff --check` passed. Next step:
+  claim a narrow worktree for `phase1-value-types` or
+  `phase2-page-slot-range`.
+
+- 2026-07-11 (public TimerWheel bridge retirement).
+  Cleared the remaining `time-layering` findings by retiring the public
+  concrete timer-wheel bridge. Removed `TimerWheel` from
+  `tx_substrate::wake` and `tx_reactor` top-level/adapter re-exports, made
+  `current_timer_wheel` reactor-internal, changed reactor smoke tests to use
+  `current_deadline_registrar` plus the `DeadlineRegistrar` facade, changed
+  the kernel thread-future test to consume the deadline registrar facade, and
+  moved direct TimerWheel surface tests to explicit
+  `tx_substrate::wake::timer::TimerWheel` imports. Verification:
+  `cargo check -p tx-reactor`, `cargo check -p tx-kernel`,
+  `cargo test -p tx-reactor --test reactor_smoke
+  per_hart_runtime_context_is_visible_only_on_polling_hart -- --nocapture`,
+  `cargo test -p tx-reactor --test reactor_smoke
+  timer_wheel_expiry_routes_parked_task_through_scheduler_without_mailbox_waker
+  -- --nocapture`, `cargo test -p tx-reactor --test v3_pr7b_timer_routing --
+  --nocapture` passed 9/9, `cargo test -p tx-reactor --test v3_timer_surface
+  timer_token_roundtrips_through_new_and_raw -- --nocapture`, `cargo test -p
+  tx-shims --lib futex_dispatch -- --nocapture` passed 15/15, `cargo test -p
+  tx-fs devfs_rtc -- --nocapture` passed 5/5, `cargo test -p tx-scripts drive
+  -- --nocapture` passed the matching drive suites, `cargo xtask lint
+  invariants time-layering` reported 0 findings, and `cargo xtask lint
+  invariants time-wake-retired` stayed at 0. Updated
+  `docs/stage2-documents/time_infra/TX_TIMER_SUBSYSTEM_DESIGN_CN.md` with the
+  zero-finding snapshot. Note: full `v3_timer_surface` without a filter was
+  interrupted after entering the test binary with no output; the filtered
+  surface test was used as the direct-import witness.
+
+- 2026-07-11 (network boot ClockRead facade cleanup).
+  Continued the timer subsystem migration by clearing the last raw HAL time
+  reads from production code. The RED evidence was `cargo xtask lint
+  invariants time-layering`: `crates/tx-kernel/src/init/net.rs` still used
+  `P::read_ns()` to build the boot network delegate's smoltcp `Instant` and
+  runtime base timestamp. Replaced both reads with
+  `timekeeper_clock::<P>().monotonic_now_ns()` through the `ClockRead` facade,
+  preserving the existing smoltcp timestamp conversion and network delegate
+  behavior. Verification: `cargo check -p tx-kernel` passed with existing
+  warnings; `cargo xtask lint invariants time-wake-retired` stayed at 0;
+  `cargo xtask lint invariants time-layering` dropped from 6 to 4 report-only
+  findings (raw HAL 2 -> 0, raw `TimerWheel`/current-wheel bridge stayed 4).
+  Updated `docs/stage2-documents/time_infra/TX_TIMER_SUBSYSTEM_DESIGN_CN.md`
+  with the new count. Next step: retire or explicitly allowlist the remaining
+  public/test `TimerWheel` bridge findings.
+
+- 2026-07-11 (socket/read dispatch ClockRead facade cleanup).
+  Continued the non-network time-layering migration under the timer subsystem
+  contract. The RED evidence was `cargo xtask lint invariants time-layering`:
+  socket accept/recv wrappers, `wait_on_socket_or_itimer`, read/readv/preadv2
+  wrappers, and generic/direct syscall dispatch still carried raw
+  `MonotonicCounterIf` / `DeadlineTimerIf` / `PersistentClockIf` bounds even
+  though the bodies now read time through `TimekeeperClock<P>: ClockRead` or
+  mutate realtime through `RealtimeControl`. Replaced the socket/itimer
+  deadline check with `timekeeper_clock::<P>().monotonic_now_ns()`, changed
+  socket receive/accept and read/readv/preadv2 wrappers to facade bounds, and
+  changed the dispatch entry bounds/imports to `TimekeeperClock<P>: ClockRead +
+  RealtimeControl`. Verification: `cargo check -p tx-shims` passed with
+  existing warnings; `cargo test -p tx-shims --lib fd_ops_wave3 -- --nocapture`
+  passed 18/18; `cargo test -p tx-shims --lib socket_fdtable::message_batch --
+  --nocapture` passed 8/8; `cargo xtask lint invariants time-wake-retired`
+  stayed at 0; `cargo xtask lint invariants time-layering` dropped from 31 to
+  6 report-only findings (raw HAL 27 -> 2, raw `TimerWheel`/current-wheel
+  bridge stayed 4). Updated
+  `docs/stage2-documents/time_infra/TX_TIMER_SUBSYSTEM_DESIGN_CN.md` with the
+  new count. Next step: decide whether to migrate or explicitly isolate the 2
+  raw network boot `P::read_ns()` sites, and retire/allowlist the 4 public
+  `TimerWheel` bridge findings.
+
+- 2026-07-11 (timer subsystem design contract completion).
+  Completed the timer subsystem design document pass requested after the
+  non-network time-layering migration slices. Expanded
+  `docs/stage2-documents/time_infra/TX_TIMER_SUBSYSTEM_DESIGN_CN.md` with an
+  explicit topology-to-interface mapping, the semantic-loop versus wake-loop
+  split, the rationale for consumer-shaped facade traits instead of a unified
+  `TimeIf`, and the implementation-home rules for each facade trait. This is a
+  documentation/architecture-contract slice only; it does not lower
+  `time-layering`. Verification: `cargo xtask lint docs` passed with the
+  existing 7 stale-vocabulary warnings; `cargo xtask lint invariants
+  time-wake-retired` stayed at 0; `cargo xtask lint invariants time-layering`
+  stayed at 31 report-only findings (27 raw HAL time, 4 raw
+  `TimerWheel`/current-wheel bridge). Next step: continue code migration at the
+  socket helper/raw-bound lane or decide the public `TimerWheel` bridge
+  retirement/allowlist.
+
+- 2026-07-11 (non-socket read/splice ClockRead facade cleanup).
+  Continued the non-network raw HAL bound cleanup under the timer subsystem
+  contract. The RED evidence was `cargo xtask lint invariants time-layering`:
+  `splice.rs` still carried four raw HAL bounds because its fallback read path
+  called socket-aware `sys_read::<P>`, and positioned read helpers in `io.rs`
+  still inherited the same raw bound even though positioned reads are
+  non-socket. Split `sys_read_non_socket::<P>` out of `sys_read` with only the
+  `TimekeeperClock<P>: ClockRead` facade bound; kept `sys_read` as the
+  socket-aware raw wrapper. Moved `pread64` and `preadv` to the non-socket
+  helper, kept `preadv2` raw because its `offset == -1` branch is readv-like
+  and may still target sockets, and changed `splice` to use the non-socket
+  helper while consuming already-peeked pipe bytes directly through
+  `pipe::step_read_with_post`. Verification: `cargo check -p tx-shims` passed
+  with existing warnings; `cargo test -p tx-shims --lib splice_dispatch --
+  --nocapture` passed 17/17; `cargo test -p tx-shims --lib fd_ops_wave3 --
+  --nocapture` passed 18/18; `cargo xtask lint invariants time-wake-retired`
+  stayed at 0; `cargo xtask lint invariants time-layering` dropped from 37 to
+  31 report-only findings (raw HAL 33 -> 27, raw `TimerWheel`/current-wheel
+  bridge stayed 4). Updated
+  `docs/stage2-documents/time_infra/TX_TIMER_SUBSYSTEM_DESIGN_CN.md` with the
+  new count and current remaining scope. Next step: handle the remaining raw
+  bounds in dispatch and socket-aware read wrappers only after deciding the
+  socket/network lane boundary, or retire/allowlist the remaining public
+  `TimerWheel` compatibility re-exports.
+
+- 2026-07-11 (kernel current deadline registrar facade cleanup).
+  Continued the current-wheel bridge retirement after the reactor wait facade
+  slice. The RED evidence was `cargo xtask lint invariants time-layering`:
+  kernel boot/runtime code still fetched `current_timer_wheel(hart)` and then
+  called `registrar_handle()` to manufacture a `DeadlineRegistrarHandle`, while
+  the owner-wake SMP probe registered through `TimerRegistrar::install_for_task`.
+  Added `tx_reactor::current_deadline_registrar(hart)` as the facade getter,
+  re-exported that through the kernel boot adapter, changed
+  `thread_future` entry-timer context to consume it directly, and changed the
+  owner-wake SMP probe to call `DeadlineRegistrar::register_deadline` with
+  `TimerRole::DeadlineAbort` / `TimerTarget::TaskMailbox`. Verification:
+  `cargo check -p tx-reactor` passed; `cargo check -p tx-kernel` passed with
+  existing warnings; `cargo test -p tx-reactor --test wait_bus -- --nocapture`
+  passed 14/14; `cargo xtask lint invariants time-wake-retired` stayed at 0;
+  `cargo xtask lint invariants time-layering` dropped from 41 to 37
+  report-only findings (raw HAL stayed 33, raw `TimerWheel`/current-wheel
+  bridge 8 -> 4). Updated
+  `docs/stage2-documents/time_infra/TX_TIMER_SUBSYSTEM_DESIGN_CN.md` to record
+  the new count and mark kernel poll-context as facade-backed. Next step:
+  decide whether to retire or allowlist the remaining public/test
+  `TimerWheel` re-export surfaces in `tx-substrate` and `tx-reactor`, then
+  continue non-network syscall raw-bound cleanup.
+
+- 2026-07-11 (reactor wait deadline registrar facade cleanup).
+  Continued the current-wheel bridge retirement lane from the timer subsystem
+  contract. The RED evidence was `cargo xtask lint invariants time-layering`:
+  `crates/tx-reactor/src/wait.rs` still stored `TimerWheel` in wait channels
+  and installed timeout guards through `TimerRegistrar::install_for_task`,
+  causing 11 raw wheel/current-wheel findings. Added `tx-services` as a
+  `tx-reactor` dependency, changed raw/declared/readiness wait channels to
+  store `DeadlineRegistrarHandle`, and changed `ProtocolTimer` to register
+  `TimerRole::DeadlineAbort` with `TimerTarget::TaskMailbox`. Reactor runtime
+  remains the owner of the concrete wheel; it now passes only a facade handle
+  to wait channels. Verification: `cargo test -p tx-reactor --test wait_bus
+  -- --nocapture` passed 14/14; `cargo check -p tx-reactor` passed;
+  `cargo xtask lint invariants time-wake-retired` stayed at 0; `cargo xtask
+  lint invariants time-layering` dropped from 52 to 41 report-only findings
+  (raw HAL stayed 33, raw `TimerWheel`/current-wheel bridge 19 -> 8). Updated
+  `docs/stage2-documents/time_infra/TX_TIMER_SUBSYSTEM_DESIGN_CN.md` to record
+  the new count and mark reactor wait timeout as facade-backed. Next step:
+  continue bridge retirement at the public re-export/current-task boundary
+  (`current_timer_wheel`, `registrar_handle()` in kernel poll context), while
+  keeping network timer/readiness out of this lane except compile fixes.
+
+- 2026-07-11 (devfs RTC typed backend cleanup).
+  Continued the non-network timer/time-layering migration by removing the
+  production devfs dependency on raw persistent-clock HAL traits. The RED
+  evidence was `cargo xtask lint invariants time-layering`: devfs still had
+  five raw HAL findings around `PersistentClockIf` import, backend install,
+  read, set-time, and alarm paths. Changed devfs to expose
+  `install_rtc_backend` over typed ns-level function pointers returning
+  `tx_services::time::TimeError`, translated those into device `RtcError`,
+  and installed the statically selected platform backend from kernel init via
+  `tx_services::time::platform::HalRtcDevice<P>`. Tests now install the same
+  typed backend shape instead of calling a devfs raw-HAL generic installer.
+  Verification: `cargo check -p tx-fs` passed; `cargo test -p tx-fs --lib
+  devfs_rtc -- --nocapture` passed 5/5; `cargo test -p tx-shims --lib
+  ioctl_dispatch -- --nocapture` passed 19/19; `cargo check -p tx-kernel`
+  passed with existing warnings; `cargo xtask lint invariants
+  time-wake-retired` stayed at 0; `cargo xtask lint invariants time-layering`
+  dropped from 57 to 52 report-only findings (raw HAL 38 -> 33, raw
+  `TimerWheel`/current-wheel bridge still 19). Updated
+  `docs/stage2-documents/time_infra/TX_TIMER_SUBSYSTEM_DESIGN_CN.md` to record
+  the new count and mark devfs RTC typed backend as landed. Next step: start
+  `current_timer_wheel` / `registrar_handle()` bridge retirement, or continue
+  non-network syscall raw-bound cleanup; network timer/readiness remains out of
+  scope except compile fixes.
+
+- 2026-07-11 (I/O manager architecture contract).
+  Added `docs/design/05_filesystem/IO_MANAGER_v1.md` and wired it into the
+  active design index plus PageBacked, bdev-fs, tx-ext4, and Device companion
+  links. The new contract captures the current I/O-performance design:
+  `PageContainer` remains the only long-lived ordinary file-data cache;
+  `io_manager` is a control plane split into L4 page submission, L5 neutral
+  backend planning, L6 block submission, and L7 driver execution; concrete
+  filesystems stay isolated behind `FsOps` plus a future `PagePager` or
+  `FsPageBacking` successor; `O_DIRECT` uses `RangeReservation` and
+  `PageSlot` coherency rather than encoding semantic exclusion in
+  `SparseIndex`; and service futures own plugging, readahead, writeback,
+  completion, queue-depth, merge, and barrier policy. Verification:
+  `cargo xtask lint docs` passed with the existing 7 stale-vocabulary warnings;
+  `cargo xtask progress validate` passed with 29 progress files; scoped
+  `git diff --check` passed for the touched design/progress docs. Next step:
+  either run an implementation-readiness plan for `PageSlot` /
+  `RangeReservation` / request types or align the older `FsPageBacking` prose
+  once the first neutral plan types are chosen.
+
+- 2026-07-11 (vDSO realtime seed facade cleanup).
+  Continued the non-network time-layering migration by moving
+  `crates/tx-kernel/src/vdso/mod.rs` off direct HAL time trait bounds. The RED
+  evidence was `cargo xtask lint invariants time-layering`: the vDSO bootstrap
+  path still imported `MonotonicCounterIf`/`PersistentClockIf`, bounded
+  `seed_realtime_from_persistent` on raw HAL traits, and kept test fake
+  platform impls in the production module file. Changed vDSO init to seed
+  realtime through `timekeeper_clock::<P>()` and
+  `RealtimeControl::seed_realtime_from_persistent`, publish VVAR through
+  `VvarPublisher`, and moved the fake platform test into
+  `crates/tx-kernel/src/vdso/tests.rs` so the production file no longer
+  carries raw HAL time strings. Verification: `cargo test -p tx-kernel --lib
+  boot_seed_helper_uses_persistent_clock_before_publish_path -- --nocapture`
+  passed 1/1; `cargo check -p tx-kernel` passed with existing warnings; `cargo
+  xtask lint invariants time-wake-retired` stayed at 0; `cargo xtask lint
+  invariants time-layering` dropped from 61 to 57 report-only findings (raw HAL
+  42 -> 38, raw `TimerWheel`/current-wheel bridge still 19); rustfmt check
+  passed for the vDSO files; `cargo xtask lint docs` passed with the existing 7
+  stale-vocabulary warnings; `cargo xtask progress validate` passed with 29
+  progress files; scoped `git diff --check` passed, including no-index checks
+  for the untracked timer design doc and new vDSO test module. Next step:
+  continue non-network raw bound cleanup in dispatch/splice/io or start
+  current-wheel bridge retirement.
+
+- 2026-07-11 (tx-observe kernel-side L1 helper first slice).
+  Started the kernel-side observe refactor with the smallest structured event
+  slice from the scout: `WaitSourceNotify`. Added
+  `HartEmitter::wait_source_notify(source_id_low, mask_bits, task_id_low,
+  wait_generation_low)` in `crates/tx-observe/src/lib.rs` as a typed L1-ish
+  helper for the `wake.notify` Yield instant. Added a focused
+  `tx-observe` smoke test proving record kind, level, stable name, payload tag,
+  payload length, and field layout. Migrated the three producer-side emit
+  blocks in `crates/tx-substrate/src/wake/wait_source.rs` to call the helper
+  instead of locally constructing `PayloadWaitSourceNotify`, tag helpers, and
+  raw `EventNameId`. Verification: first ran the new focused test RED and saw
+  the expected missing-method compile failure; after implementation,
+  `cargo test -p tx-observe wait_source_notify_helper_emits_typed_yield_instant
+  -- --nocapture` passed; `cargo test -p tx-substrate --test
+  obs4_wait_source_notify_emit -- --nocapture` passed 5/5;
+  `cargo test -p tx-substrate --test obs4_convergence_point_emit --
+  --nocapture` passed; `cargo xtask observe-schema check` passed. Next step:
+  extend L0 schema with concrete `names.stable` / `events` entries for
+  `wake.notify`, then use that shape for `resume`, `step`, and
+  `yield.On*`.
+
+- 2026-07-11 (tx-observe kernel-side schema scout).
+  Completed a read-only kernel-side scout for how current observe producers
+  can consume the new L0 schema. Recorded
+  `docs/progress/research/2026-07-11-tx-observe-kernel-side-scout.md`.
+  Conclusion: schema is scout-ready but not codegen-ready. ABI/payload/cfg/
+  projection/track truth is mechanically checked, while the remaining blocker
+  is concrete event/name identity: static names, syscall-number names,
+  type-derived drive names, raw literal mutation names, synthetic process ids,
+  and hundreds of wildcard `debug.*` counters. The best first implementation
+  slice is `WaitSourceNotify`, because it has one payload, one stable name,
+  one level, duplicated construction blocks, and no span lifecycle dependency.
+  Verification: `cargo xtask observe-schema check` passed with levels=8,
+  record_kinds=11, payloads=23, payload_structs=20, cfgs=34, projections=9,
+  tracks=16; source scan found 641 distinct kernel-side `debug.*` strings.
+  Next step: add schema support for `names.stable` / `names.synthetic` /
+  `names.derived` / `names.dynamic_family`, then migrate `wake.notify` through
+  a typed L1 helper.
+
+- 2026-07-11 (observe L0-L6 architecture document landing).
+  Landed the observation architecture contract in
+  `docs/Txv3/08_OBSERVATION_L0_L6_REFACTOR_v0.md` around the newly centralized
+  `schema/txobserve.toml` truth source. The document now distinguishes the
+  landed L0 inventory/check gate from planned L1-L6 migrations, adds current
+  and target Mermaid topologies, documents the real TOML section layout,
+  records the `cargo xtask observe-schema check` enforcement surface, and adds
+  a layer-by-layer gap map plus staged migration plan for kernel typed events,
+  producer status, wire encoding, host integrity, canonical decode, and L6
+  projections/TUI. Verification: `cargo xtask observe-schema check` passed
+  with levels=8, record_kinds=11, payloads=23, payload_structs=20, cfgs=34,
+  projections=9, tracks=16; `cargo xtask lint docs` passed with the existing
+  7 stale-vocabulary warnings. Next step: close the stable name/event catalog
+  so `observe-schema codegen --check` can generate kernel and host catalogs.
+
+- 2026-07-11 (realtime mutation facade seam cleanup).
+  Continued the timer subsystem migration by moving the syscall-style realtime
+  mutation path behind the time facade. The RED evidence was `cargo xtask lint
+  invariants time-layering`: `crates/tx-shims/src/linux_syscall/time.rs` still
+  carried three raw HAL findings for `set_realtime_from_syscall`,
+  `sys_clock_settime`, and `sys_settimeofday`. Extended
+  `tx_services::time::RealtimeControl` with
+  `set_realtime_ns_with_timerfd_post`, implemented it for
+  `TimekeeperClock<P>`, and changed `clock_settime`/`settimeofday` to call
+  `timekeeper_clock::<P>()` through `RealtimeControl` while preserving the
+  timerfd registrar and mailbox post seam. Added a wall-clock facade test for
+  the new method. Also restored minimal TCP loopback compatibility wrappers so
+  the `tx-subsystems` test harness compiles; this is a network compile fix
+  only, not a network semantic migration. Fixed an unrelated untracked xtask
+  `observe_schema.rs` indexing compile error that blocked all `cargo xtask`
+  commands. Verification: the new wall-clock focused test passed 1/1; `cargo
+  test -p tx-shims --lib time_syscalls -- --nocapture` passed 25/25; `cargo
+  check -p tx-shims` passed with existing warnings; `cargo xtask lint
+  invariants time-wake-retired` stayed at 0; `cargo xtask lint invariants
+  time-layering` dropped from 64 to 61 report-only findings (raw HAL 45 -> 42,
+  raw `TimerWheel`/current-wheel bridge still 19); scoped rustfmt check
+  passed; `cargo xtask lint docs` passed with the existing 7 stale-vocabulary
+  warnings; `cargo xtask progress validate` passed with 29 progress files;
+  scoped `git diff --check` passed, including a no-index check for the
+  untracked timer design doc. Next step: start `current_timer_wheel` bridge
+  retirement or continue dispatch/socket/splice bound cleanup, keeping network
+  semantics out of this lane.
+
+- 2026-07-11 (VFS ResolvedTarget slice-1 shim helper).
+  Implemented the first non-RCU VFS cleanup slice by adding the shim-local
+  `linux_syscall::fs_resolve` helper module. The new helper centralizes
+  path-aware `dirfd` anchoring, the old strict anchor helper for any future
+  legacy-only call sites, and parent/name splitting through a small `ParentName`
+  shape. Migrated `fs_basic`, `fs_path`, `fs_mut`, and `fs_handle` call sites
+  that previously carried local copies of the same logic. Corrected the
+  `file_mutation` expectation for `mkdirat(non-AT_FDCWD, "/absolute", ...)`:
+  absolute paths ignore `dirfd` and now create the target instead of returning
+  `EBADF`. Kept VFS core, mount publication, and fd-only descendant-RNode
+  behavior untouched. Verification:
+  `rustfmt --edition 2021` on touched syscall files passed; scoped
+  `git diff --check` passed; `cargo test -p tx-shims --lib fd_ops_wave2 --
+  --nocapture --test-threads=1` passed 41/41; `cargo test -p tx-shims --lib
+  stat_family -- --nocapture --test-threads=1` passed 26/26 after an initial
+  transient compile failure while untracked page_backed files were absent;
+  `cargo test -p tx-shims --lib file_mutation -- --nocapture --test-threads=1`
+  passed 34/34 after the test correction. Next step: add `MountedDentry` shim
+  helper for `DEntry -> MountPayload/FsOps/FsPageBacking` lookup without
+  changing descendant RNode mount-stamping semantics.
+
+- 2026-07-11 (VFS ResolvedTarget/MountedDentry scope fanout).
+  Ran read-only fanout on the first two non-RCU VFS cleanup abstractions. The
+  recommended first slice is shim-local `ResolvedTarget` for `dirfd` anchoring,
+  entity resolution, parent/name resolution, no-follow targets, and
+  empty-path fd targets. `MountedDentry` can start as a shim-local helper for
+  syscall `DEntry -> MountPayload/FsOps/FsPageBacking` lookup, but the boundary
+  is VFS-owned and should be promoted when `vfs::composite` panic sites and
+  direct-only walker helpers are cleaned. Recorded the scope and hazards in
+  `docs/progress/research/2026-07-11-vfs-resolved-target-mounted-dentry-scope.md`.
+  Verification: documentation-only scope record; `cargo xtask progress validate`
+  passed; scoped `git diff --check` passed. Next step: implement the
+  shim-local `ResolvedTarget` helper first, then prove `MountedDentry` on
+  dentry-based syscall call sites before touching fd-only descendant-RNode
+  behavior.
+
+- 2026-07-11 (timer subsystem design document consolidation).
+  Reworked `docs/stage2-documents/time_infra/TX_TIMER_SUBSYSTEM_DESIGN_CN.md`
+  from the previous multi-append draft into a single implementation contract.
+  The new document summarizes the current migration process, records the
+  64-report-only `time-layering` snapshot (45 raw HAL time findings and 19 raw
+  `TimerWheel`/`current_timer_wheel` bridge findings), defines the crate/file
+  module boundaries, pins the five public facade interfaces (`ClockRead`,
+  `RealtimeControl`/`VvarPublisher`, `DeadlineRegistrar`,
+  `ReactorTimeDriver`, and `RtcDeviceOps`), and separates design-complete from
+  implementation-complete criteria. It also records the remaining non-network
+  work: realtime mutation facade extension for timerfd post/revalidation,
+  `current_timer_wheel` bridge retirement, RTC/devfs typed ops convergence, and
+  `time-layering` ratchet-to-deny. Verification: scoped `git diff --check` for
+  `docs/progress/STATUS.md` passed; no-index `git diff --check` for the
+  untracked timer design doc passed; `cargo xtask lint docs` passed with the
+  existing 7 stale-vocabulary warnings; `cargo xtask progress validate` passed
+  with 29 progress files. Next step: implement the realtime mutation facade
+  seam or start current-wheel bridge retirement, then rerun focused producer
+  witnesses and update the count again.
+
+- 2026-07-11 (wait endpoint / Channel retirement phase-2 checkpoint).
+  Started the mailbox-only wait-language convergence pass after the
+  RCU/API-language audit. Added the narrow substrate `WaitEndpoint` trait over
+  `Arc<WaitSource>`, taught the compatibility `wait_source::wait_on_token`
+  resolver to park on mailbox-backed `WaitSource`s, and added a report-only
+  Channel-retirement inventory to `cargo xtask lint invariants
+  legacy-wait-channel`. Retired reactor `Channel` storage/fire paths from the
+  first low-heterogeneity object set: pipe, eventfd, signalfd, userfaultfd,
+  timerfd, SysV semaphore, SysV message queue, and POSIX-mq notification over
+  SysV queues. These objects now register their existing source ids to the
+  resolver as `WaitSource`s, so old `WaitToken` consumers keep their interface
+  while object publication speaks mailbox `WaitSource`. Verification:
+  `rustfmt --edition 2021` passed on touched wait/object files;
+  `cargo test -p xtask lint_invariants_wait -- --nocapture` passed 2/2;
+  `cargo check -p tx-subsystems --lib` passed with the existing
+  `net/execution/step_connect.rs` unused-`guard` warning; `cargo check -p
+  tx-shims --lib` passed with existing warnings; scoped `git diff --check`
+  passed. The `legacy-wait-channel` lint remains red by design but improved
+  from 25 to 17 production legacy API sites and from 209 to 110 report-only
+  Channel-retirement findings. Next step: design the fd readiness facade before
+  removing the 11 syscall-side `wait_on_token` consumers; remaining object
+  retirements are futex, VFS/RNode, TTY, VM RangeLock, process exit-source, and
+  net delegate/timer internals.
+
+- 2026-07-11 (io TTY/pagebacked ClockRead facade-bound cleanup).
+  Continued Package B/F time-layering cleanup for non-network `io.rs` read
+  helpers. The RED evidence was `cargo xtask lint invariants time-layering`:
+  TTY VTIME wait helpers and the pagebacked direct read helper still carried raw
+  `MonotonicCounterIf + DeadlineTimerIf` bounds even though their time reads
+  already use `timekeeper_clock::<P>()` and the syscall-context registrar-backed
+  deadline helpers. Changed `wait_for_tty_read_event_or_deadline`,
+  `sys_tty_read_buffered`, and `sys_read_pagebacked` to require
+  `TimekeeperClock<P>: ClockRead`. Kept the public `sys_read`/`readv`/`pread*`
+  wrappers on their raw bounds for now because `sys_read` still dispatches
+  socket fds to `socket::sys_recvfrom::<P>`, and the network lane remains out
+  of scope for this timer migration slice. Verification: `rustfmt --edition
+  2021 --check crates/tx-shims/src/linux_syscall/io.rs` passed; `cargo test -p
+  tx-shims --lib fd_ops_wave3 -- --nocapture` passed 18/18; `cargo check -p
+  tx-shims` passed with existing warnings; `cargo xtask lint invariants
+  time-wake-retired` stayed at 0 retired sites; `cargo xtask lint invariants
+  time-layering` dropped from 67 to 64 report-only findings (raw HAL 48 -> 45,
+  raw TimerWheel/current-wheel bridge still 19). Next step: split the
+  socket-dependent public read wrappers from VFS reads, continue `splice.rs`
+  after that split, or start `current_timer_wheel` bridge retirement.
+
+- 2026-07-11 (ioctl RTC alarm ClockRead facade-bound cleanup).
+  Continued Package B/F time-layering cleanup for the non-network RTC ioctl
+  path. The RED evidence was `cargo xtask lint invariants time-layering`:
+  `crates/tx-shims/src/linux_syscall/fs_basic.rs` still imported
+  `MonotonicCounterIf` solely for `sys_ioctl`, and `sys_ioctl` carried a raw
+  `P: MonotonicCounterIf` bound even though the only time-dependent branch is
+  RTC alarm emulation's realtime-to-monotonic conversion through the
+  timekeeper. Changed the ioctl syscall arm to require `TimekeeperClock<P>:
+  ClockRead`, removed the raw HAL import, and kept the existing timekeeper
+  semantic conversion for alarm emulation. Verification: `rustfmt --edition
+  2021 --check crates/tx-shims/src/linux_syscall/fs_basic.rs` passed; `cargo
+  test -p tx-shims --lib ioctl_dispatch -- --nocapture` passed 19/19; `cargo
+  check -p tx-shims` passed with existing warnings; `cargo xtask lint
+  invariants time-wake-retired` stayed at 0 retired sites; `cargo xtask lint
+  invariants time-layering` dropped from 69 to 67 report-only findings (raw HAL
+  50 -> 48, raw TimerWheel/current-wheel bridge still 19). Next step: continue
+  with `io.rs` TTY/read/pagebacked/pread, `splice.rs`, or start
+  `current_timer_wheel` bridge retirement.
+
+- 2026-07-11 (utimensat ClockRead facade-bound cleanup).
+  Continued Package B/F time-layering cleanup for the VFS timestamp syscall
+  path. The RED evidence was `cargo xtask lint invariants time-layering`:
+  `crates/tx-shims/src/linux_syscall/fs_mut.rs::sys_utimensat` still carried a
+  raw `MonotonicCounterIf + DeadlineTimerIf` bound even though its
+  `UTIME_NOW`/default timestamp path already reads realtime through
+  `time::realtime_ns::<P>()`, whose facade contract is
+  `TimekeeperClock<P>: ClockRead`. Changed the syscall arm to use that facade
+  bound and imported `ClockRead` / `TimekeeperClock` locally. Verification:
+  `rustfmt --edition 2021` passed after formatting; `cargo test -p tx-shims
+  --lib utimens -- --nocapture` passed 4/4; `cargo check -p tx-shims` passed
+  with existing warnings; `cargo xtask lint invariants time-wake-retired`
+  stayed at 0 retired sites; `cargo xtask lint invariants time-layering`
+  dropped from 70 to 69 report-only findings (raw HAL 51 -> 50, raw
+  TimerWheel/current-wheel bridge still 19). A broader
+  `cargo test -p tx-shims --lib file_mutation -- --nocapture` run had one
+  order-sensitive failure in `dispatch_futimens_fd_path_honours_now_and_omit`;
+  rerunning the `utimens` focused set passed, so the migration witness is the
+  focused `utimens` suite plus the structural lint drop. Next step: continue
+  with `fs_basic.rs::sys_ioctl`, `io.rs` TTY/read/pagebacked/pread bounds, or
+  start `current_timer_wheel` bridge retirement.
+
+- 2026-07-11 (tx-observe schema-layer gate completion).
+  Completed the schema-layer consolidation slice for `schema/txobserve.toml`
+  with fanout reader audits for host projection truth, explicit diagnostic
+  tracks/names, and payload field inventories. Extended `cargo xtask
+  observe-schema check` from ABI discriminants/cfgs to the full currently
+  mechanical L0 surface: payload struct field order/types and `size_of`
+  assertions, analyzer SQL/Parquet projection schemas, event-family references
+  to levels/payloads/control groups/projections, explicit track ids/names
+  against `ALLOC_TRACK_*` constants and Perfetto writer names, and name-family
+  coverage for explicit track names. Added `text_report` as a non-table host
+  projection so event-family references close inside the schema. Updated
+  `migration.checks` in the TOML to mark the enforced gates; concrete
+  `KERNEL_FNV1A_STABLE_NAMES` enumeration remains planned because the schema
+  currently owns stable-name families rather than every individual debug name.
+  Verification: `cargo test -p xtask observe_schema::tests:: -- --nocapture`
+  passed 7/7, and `cargo xtask observe-schema check` passed with `levels=8`,
+  `record_kinds=11`, `payloads=23`, `payload_structs=20`, `cfgs=34`,
+  `projections=9`, and `tracks=16`. Next step: decide whether to add concrete
+  `names.stable` entries and generate/check `names.json` families, or move
+  down-stack to L2/L3 producer/wire boundary tightening.
+
+- 2026-07-11 (tx-observe schema check gate).
+  Added the first executable L0 schema gate as `cargo xtask observe-schema
+  check [--schema schema/txobserve.toml]`. The command parses the handwritten
+  TOML with a typed `xtask` schema model and mechanically compares the
+  currently enforceable truth against source: `TxTraceLevel` and
+  `TxTraceKind` in `crates/tx-observe-types/src/record.rs`, `TxPayloadTag` in
+  `crates/tx-observe-types/src/payload.rs`, and the workspace
+  `unexpected_cfgs` allow-list in `Cargo.toml`. It intentionally does not
+  generate code yet and does not claim projection/table parity beyond the
+  inventory already recorded in TOML. Added focused red/green unit coverage
+  for matching inventory and mismatched payload-tag detection. Verification:
+  `cargo test -p xtask observe_schema::tests:: -- --nocapture` passed, and
+  `cargo xtask observe-schema check` passed with `levels=8`,
+  `record_kinds=11`, `payloads=23`, and `cfgs=34`. Next step: extend the
+  gate to check host projection schemas against `tools/tx-observe-analyze.py`
+  and then add CI/docs integration.
+
+- 2026-07-11 (tx-observe L0 schema inventory).
+  Started the L0 truth-consolidation slice for the observation L0-L6 refactor
+  by adding `schema/txobserve.toml` as the first handwritten core-schema
+  inventory. The TOML now mirrors the current `txtrace-v0` facts without
+  changing kernel hot paths or host decode: 8 `TxTraceLevel` values, 11
+  `TxTraceKind` values, 23 `TxPayloadTag` payload schemas with field lists, 34
+  workspace cfg/control gates, explicit diagnostic tracks, host input readers,
+  and the current NDJSON/Perfetto/SQL/Parquet projection views. The file marks
+  this as inventory/check material rather than generated-code authority; the
+  next slice is `xtask observe-schema check` to compare the TOML against the
+  existing Rust ABI, `Cargo.toml` cfg list, daemon decode, and analyzer
+  projection tables. Verification: Python `tomllib` parsed
+  `schema/txobserve.toml`; a focused comparison script found no missing,
+  extra, or mismatched `TxTraceLevel`, `TxTraceKind`, `TxPayloadTag`, or cfg
+  entries; scoped `git diff --check -- schema/txobserve.toml` passed.
+
+- 2026-07-11 (VFS redundancy and bad-smell fanout).
+  Completed a read-only fanout audit of the current VFS, Mount/backend, and
+  syscall-facing filesystem surfaces. Recorded
+  `docs/progress/research/2026-07-11-vfs-redundancy-bad-smell-fanout.md`.
+  Main findings: the typed `require_*` witness facade is not the dominant
+  syscall path; live walker state is `Cap`/`parent_hint` based while the active
+  design still describes `IdentRef` + `WalkTrail`; namespace-aware walks still
+  fall back to the global mount table; MountNamespace and the global
+  `MOUNT_TABLE` duplicate topology with different semantics; shim code
+  duplicates dirfd resolution, FsOps/MountPayload discovery, fd installation,
+  and fd-kind dispatch; and `OpenFileBacking` has become a broad fd bus with
+  panic-based legacy `rnode()` access. No code changes or functional tests were
+  run. Next step: start with a small helper cleanup around fd
+  installation/dirfd resolution, a mount-publication convergence pass, or a
+  focused mount-stamp/getdents64 consistency pass.
+
+- 2026-07-11 (timer subsystem design contract).
+  Completed the timer subsystem design document closeout for
+  `docs/stage2-documents/time_infra/TX_TIMER_SUBSYSTEM_DESIGN_CN.md`.
+  Added the final landing contract that summarizes the current migration
+  process, module boundaries, five facade interfaces, end-to-end control
+  flows, producer contracts, linter/file-level controls, and the distinction
+  between design-complete and implementation-complete. The contract records the
+  current `time-layering` snapshot as 70 report-only findings (51 raw HAL time
+  findings and 19 raw TimerWheel/current-wheel bridge findings), keeps network
+  timer/readiness as a separate lane, and names `current_timer_wheel` bridge
+  retirement, context/bound cleanup, RTC typed ops alignment, and lint ratchet
+  as the remaining implementation work. Verification: `cargo xtask lint docs`
+  passed with the existing 7 stale-vocabulary warnings; `cargo xtask progress
+  validate` passed; scoped `git diff --check` passed for the timer design doc
+  and `docs/progress/STATUS.md`.
+
+- 2026-07-11 (futex ClockRead facade-bound cleanup).
+  Continued Package B/F time-layering cleanup for `vm.rs::sys_futex`.
+  The RED evidence was the existing `cargo xtask lint invariants
+  time-layering` report: `sys_futex` still carried
+  `MonotonicCounterIf + DeadlineTimerIf` even though its timeout calculation
+  is a time-facade consumer and already parks through the syscall
+  registrar-backed script context. Changed the futex syscall bound to
+  `TimekeeperClock<P>: ClockRead`, read monotonic time through
+  `timekeeper_clock::<P>().monotonic_now_ns()`, and preserved the existing
+  timekeeper semantic conversion for `FUTEX_WAIT_BITSET |
+  FUTEX_CLOCK_REALTIME` absolute realtime deadlines. Verification:
+  `rustfmt --edition 2021` passed for `vm.rs`; `cargo check -p tx-shims`
+  passed with existing warnings; `cargo test -p tx-shims --lib
+  futex_dispatch -- --nocapture` passed 15/15; `cargo xtask lint invariants
+  time-wake-retired` stayed at 0 retired sites; `cargo xtask lint invariants
+  time-layering` dropped from 71 to 70 report-only findings (raw HAL 52 -> 51,
+  raw TimerWheel/current-wheel bridge still 19). Updated
+  `docs/stage2-documents/time_infra/TX_TIMER_SUBSYSTEM_DESIGN_CN.md` to record
+  the 70/51/19 snapshot and futex facade-bound cleanup. Next step: continue
+  with `io.rs` TTY/read/pagebacked/pread, fs timestamp/ioctl paths, or start
+  `current_timer_wheel` bridge retirement.
+
+- 2026-07-11 (time syscall ClockRead facade-bound cleanup).
+  Continued Package B/F time-layering cleanup for `time.rs` clock,
+  gettimeofday, itimer, nanosleep, and syscall-boundary ITIMER_REAL helpers.
+  The RED evidence was the existing `cargo xtask lint invariants
+  time-layering` report: these functions already read time through
+  `timekeeper_clock::<P>()`, but their signatures still carried raw
+  `MonotonicCounterIf` / `DeadlineTimerIf` bounds. Changed `realtime_ns`,
+  `sys_clock_gettime`, `sys_gettimeofday`, `sys_getitimer`, `sys_setitimer`,
+  `sys_times`, `sys_nanosleep`, `sys_clock_nanosleep`,
+  `take_due_itimer_real`, `maybe_deliver_itimer_signal_with_post`,
+  `fire_itimer_real_with_post`, and `poll_itimer_real_on_syscall_boundary` to
+  depend on `TimekeeperClock<P>: ClockRead`. Left `clock_settime` /
+  `settimeofday` persistent RTC writeback paths on their existing
+  `PersistentClockIf` bounds. Verification: `rustfmt --edition 2021 --check
+  crates/tx-shims/src/linux_syscall/time.rs` passed; `cargo check -p
+  tx-shims` passed with existing warnings; `cargo test -p tx-shims --lib
+  time_syscalls -- --nocapture` passed 25/25; `cargo xtask lint invariants
+  time-wake-retired` stayed at 0 retired sites; `cargo xtask lint invariants
+  time-layering` dropped from 84 to 71 report-only findings (raw HAL 65 -> 52,
+  raw TimerWheel/current-wheel bridge still 19); `cargo xtask lint docs`
+  passed with the existing 7 stale-vocabulary warnings; `cargo xtask progress
+  validate` passed; scoped `git diff --check` passed; and
+  `cargo -q xtask unit` passed build plus `tx-shims` 583/583, `tx-kernel`
+  104/104, `tx-ext4` 9/9, and `tx-scripts` 56/56 host tests. Updated
+  `docs/stage2-documents/time_infra/TX_TIMER_SUBSYSTEM_DESIGN_CN.md` to record
+  the 71/52/19 snapshot and time-syscall facade-bound cleanup. Next step:
+  continue with `io.rs` TTY/read/pagebacked/pread, `vm.rs` futex, or start
+  `current_timer_wheel` bridge retirement.
+
+- 2026-07-11 (ppoll/pselect ClockRead facade-bound cleanup).
+  Continued Package B/F time-layering cleanup for `io.rs` ppoll/pselect
+  timeout helpers and `time.rs::sleep_until_deadline`. The RED evidence was
+  the existing `cargo xtask lint invariants time-layering` report:
+  `timerfd_readable_level`, `sleep_timeout_ns`,
+  `wait_on_any_token_or_pselect_deadline`, `wait_until_pselect_deadline`,
+  `sys_ppoll`, `sys_pselect6`, and `sleep_until_deadline` still carried raw
+  HAL time findings even though the bodies should use the time facade. Changed
+  those helpers/syscalls to depend on `TimekeeperClock<P>: ClockRead`, kept
+  monotonic reads through `timekeeper_clock::<P>().monotonic_now_ns()`, and
+  routed pselect deadline waits through the syscall-context deadline helper
+  instead of the standalone timer-sleep path. Verification:
+  `rustfmt --edition 2021` passed for `io.rs` and `time.rs`;
+  `cargo test -p tx-shims --lib fd_ops_wave3 -- --nocapture` passed 18/18;
+  `cargo test -p tx-shims --lib timerfd_dispatch -- --nocapture` passed 10/10;
+  `cargo check -p tx-shims` passed with existing warnings;
+  `cargo xtask lint invariants time-wake-retired` stayed at 0 retired sites;
+  `cargo xtask lint invariants time-layering` dropped from 91 to 84
+  report-only findings (raw HAL 72 -> 65, raw TimerWheel/current-wheel bridge
+  still 19); `cargo xtask lint docs` passed with the existing 7
+  stale-vocabulary warnings; `cargo xtask progress validate` passed; scoped
+  `git diff --check` passed; and `cargo -q xtask unit` passed build plus
+  `tx-shims` 583/583, `tx-kernel` 104/104, `tx-ext4` 9/9, and `tx-scripts`
+  56/56 host tests. Updated
+  `docs/stage2-documents/time_infra/TX_TIMER_SUBSYSTEM_DESIGN_CN.md` to record
+  the 84/65/19 snapshot and ppoll/pselect facade-bound cleanup. Next step:
+  continue remaining `io.rs` TTY/read/pagebacked/pread raw bounds or start the
+  larger `current_timer_wheel` bridge retirement.
+
+- 2026-07-11 (timer subsystem design contract expansion).
+  Expanded `docs/stage2-documents/time_infra/TX_TIMER_SUBSYSTEM_DESIGN_CN.md`
+  as the current timer-subsystem design contract. The document now separates
+  the migration process into clock-read facade, deadline registration,
+  reactor driver/context, RTC/device, and lint/control lanes; maps the live
+  `tx-services::time` Rust surface to its target role; explains how
+  `time-layering` rules enforce file/module boundaries; and adds a final
+  implementation specification covering topology, interfaces, control flows,
+  Package A-H exit conditions, remaining migration scope, patch template, and
+  final completion criteria. No code migration was completed in this slice;
+  the existing unfinished `io.rs`/`time.rs` ppoll/pselect cleanup remains a
+  separate work item. Verification: scoped Markdown whitespace check passed
+  for the timer subsystem document. Next step: either resume the ppoll/pselect
+  facade-bound code slice or start the `current_timer_wheel` bridge retirement
+  from the documented Package F boundary.
+
+- 2026-07-11 (timerfd producer witness refresh).
+  Refreshed the timer subsystem acceptance status after the timerfd guard and
+  realtime-revalidation migration. The focused regression
+  `dispatch_clock_settime_cancel_on_set_cancels_timerfd_registry_guard` now
+  passes in this checkout, proving that `CLOCK_REALTIME` cancel-on-set drops
+  the object-owned `TimerGuard` and removes the stale registry deadline.
+  The full `timerfd_dispatch` group passed 10/10 and covers initial object
+  guard registration, periodic rearm, cancel-on-set `ECANCELED`, cancel-on-set
+  guard removal, realtime absolute deadline rebase, and mailbox-ref post
+  routing. Updated
+  `docs/stage2-documents/time_infra/TX_TIMER_SUBSYSTEM_DESIGN_CN.md` so the
+  verification plan and remaining-risk section no longer list timerfd as an
+  open producer row. Verification: `timeout 360s cargo test -p tx-shims
+  --lib dispatch_clock_settime_cancel_on_set_cancels_timerfd_registry_guard
+  -- --nocapture` passed 1/1; `timeout 360s cargo test -p tx-shims --lib
+  timerfd_dispatch -- --nocapture` passed 10/10 with only existing warnings.
+  Next step: run the non-timerfd producer groups and final time-layering/docs
+  gates before declaring the whole timer migration complete.
+
+- 2026-07-11 (signal wait ClockRead facade-bound cleanup).
+  Continued Package B/F time-layering cleanup for signal wait and itimer poll
+  helpers. The RED evidence was the existing `cargo xtask lint invariants
+  time-layering` report: `crates/tx-shims/src/linux_syscall/signal.rs` still
+  had raw HAL time findings on `sys_rt_sigsuspend`,
+  `park_sigtimedwait_tick`, and `sys_rt_sigtimedwait`, and the sigsuspend path
+  was also constrained by `crates/tx-shims/src/linux_syscall/time.rs`
+  `poll_due_itimers_with_post` requiring `MonotonicCounterIf +
+  DeadlineTimerIf`. Changed those helpers to depend on the facade capability
+  bound `TimekeeperClock<P>: ClockRead` while preserving the existing
+  `timekeeper_clock::<P>().monotonic_now_ns()` read path and registrar-backed
+  itimer wait route. Verification: `rustfmt --edition 2021 --check` passed
+  for `signal.rs` and `time.rs`; `cargo test -p tx-shims --lib
+  sigtimedwait_dispatch -- --nocapture` passed 7/7; `cargo check -p
+  tx-shims` passed with existing warnings; `cargo xtask lint invariants
+  time-wake-retired` stayed at 0 retired sites; `cargo xtask lint invariants
+  time-layering` dropped from 95 to 91 report-only findings (raw HAL 76 -> 72,
+  raw TimerWheel/current-wheel bridge still 19); `cargo xtask lint docs`
+  passed with the existing 7 stale-vocabulary warnings; `cargo xtask progress
+  validate` passed; scoped `git diff --check` passed; and
+  `cargo -q xtask unit` passed build plus `tx-shims` 583/583, `tx-kernel`
+  104/104, `tx-ext4` 9/9, and `tx-scripts` 56/56 host tests. Updated
+  `TX_TIMER_SUBSYSTEM_DESIGN_CN.md` to record the new 91/72/19 snapshot and
+  signal wait facade-bound cleanup. Next step: continue the same facade-bound
+  pattern in `io.rs`, `time.rs`, or start the larger current-wheel bridge
+  retirement.
+
+- 2026-07-10 (IPC semtimedop ClockRead facade-bound cleanup).
+  Continued Package B/F time-layering cleanup for SysV IPC timeout helpers.
+  The RED evidence was the existing `cargo xtask lint invariants
+  time-layering` report: `crates/tx-shims/src/linux_syscall/ipc.rs` still had
+  two raw HAL time findings from its `MonotonicCounterIf + DeadlineTimerIf`
+  import and `sys_semtimedop` signature even though the deadline body already
+  read time through `timekeeper_clock::<P>().monotonic_now_ns()`. Changed
+  `sys_semtimedop` to depend on `TimekeeperClock<P>: ClockRead` and removed
+  the raw HAL time import from `ipc.rs`. Verification:
+  `rustfmt --edition 2021 --check crates/tx-shims/src/linux_syscall/ipc.rs`
+  passed; `cargo test -p tx-shims --lib ipc_dispatch -- --nocapture` passed
+  16/16; `cargo check -p tx-shims` passed with existing warnings;
+  `cargo xtask lint invariants time-wake-retired` stayed at 0 retired sites;
+  `cargo xtask lint invariants time-layering` dropped from 97 to 95
+  report-only findings (raw HAL 78 -> 76, raw TimerWheel/current-wheel bridge
+  still 19); `cargo xtask lint docs` passed with the existing 7
+  stale-vocabulary warnings; `cargo xtask progress validate` passed; scoped
+  `git diff --check` passed; and `cargo -q xtask unit` passed build plus
+  `tx-shims` 583/583, `tx-kernel` 104/104, `tx-ext4` 9/9, and `tx-scripts`
+  56/56 host tests. Updated `TX_TIMER_SUBSYSTEM_DESIGN_CN.md` to record the
+  new 95/76/19 snapshot and IPC/semtimedop facade-bound cleanup. Next step:
+  continue the same facade-bound pattern in `signal.rs` or `io.rs`, or start
+  the larger current-wheel bridge retirement.
+
+- 2026-07-10 (epoll ClockRead facade-bound cleanup).
+  Continued Package B/F time-layering cleanup for epoll syscall helpers. The
+  RED evidence was the existing `cargo xtask lint invariants time-layering`
+  report: `crates/tx-shims/src/linux_syscall/epoll.rs` still had eight raw
+  HAL time findings from its `MonotonicCounterIf + DeadlineTimerIf` import and
+  helper/syscall signatures even though the function bodies already read time
+  through `timekeeper_clock::<P>().monotonic_now_ns()`. Changed
+  `ready_mask_for_entry`, `collect_ready_events`, the timeout deadline helpers,
+  `sys_epoll_wait`, `sys_epoll_pwait2`, and `sys_epoll_wait_until` to use the
+  facade capability bound `TimekeeperClock<P>: ClockRead`, and removed the raw
+  HAL time import from `epoll.rs`. Verification:
+  `rustfmt --edition 2021 --check crates/tx-shims/src/linux_syscall/epoll.rs`
+  passed; `cargo test -p tx-shims --lib epoll_dispatch -- --nocapture` passed
+  9/9; `cargo check -p tx-shims` passed with existing warnings;
+  `cargo xtask lint invariants time-wake-retired` stayed at 0 retired sites;
+  `cargo xtask lint invariants time-layering` dropped from 105 to 97
+  report-only findings (raw HAL 86 -> 78, raw TimerWheel/current-wheel bridge
+  still 19); `cargo xtask lint docs` passed with the existing 7
+  stale-vocabulary warnings; `cargo xtask progress validate` passed; scoped
+  `git diff --check` passed; and `cargo -q xtask unit` passed build plus
+  `tx-shims` 583/583, `tx-kernel` 104/104, `tx-ext4` 9/9, and `tx-scripts`
+  56/56 host tests. Updated `TX_TIMER_SUBSYSTEM_DESIGN_CN.md` to record the
+  new 97/78/19 snapshot and epoll facade-bound cleanup. Next step: continue
+  the same facade-bound pattern in `ipc.rs`, `signal.rs`, `io.rs`, or start
+  the larger current-wheel bridge retirement.
+
+- 2026-07-10 (timer subsystem design contract and POSIX timer facade-bound snapshot).
+  Finished the timer subsystem design document as the current implementation
+  contract for migration process, module boundaries, consumer-facing APIs,
+  linter control, producer ownership, and next-slice review discipline. Updated
+  `docs/stage2-documents/time_infra/TX_TIMER_SUBSYSTEM_DESIGN_CN.md` from the
+  previous 109/90/19 `time-layering` snapshot to the POSIX timer
+  facade-bound state: 105 report-only findings total, with raw HAL time
+  findings down to 86 and raw TimerWheel/current-wheel bridge findings still
+  19. The doc now records that `posix_timer.rs` helper signatures
+  (`current_clock_ns`, `poll_due_posix_timers_with_post`,
+  `sys_timer_gettime`, `sys_timer_settime`) use the facade bound
+  `TimekeeperClock<P>: ClockRead`, and adds a closing implementation contract
+  for how future timer patches must move from RED evidence to focused witness,
+  lint count, and progress catch-up. Verification:
+  `cargo test -p tx-shims --lib posix_timer_dispatch -- --nocapture` passed
+  3/3; `cargo check -p tx-shims` passed with existing warnings;
+  `cargo xtask lint invariants time-wake-retired` stayed at 0 retired sites;
+  `cargo xtask lint invariants time-layering` reported 105 findings
+  (raw HAL 86, raw TimerWheel/current-wheel bridge 19); `cargo xtask lint
+  docs` passed with the existing 7 stale-vocabulary warnings; `cargo xtask
+  progress validate` passed; scoped `git diff --check` passed; and
+  `cargo -q xtask unit` passed build plus `tx-shims` 583/583, `tx-kernel`
+  104/104, `tx-ext4` 9/9, and `tx-scripts` 56/56 host tests. Next step:
+  continue Package B/F by
+  cleaning another syscall cluster's raw platform bounds or retiring the
+  `current_timer_wheel` bridge.
+
+- 2026-07-10 (timerfd ClockRead facade-bound cleanup).
+  Continued Package B/F time-layering cleanup for timerfd syscall helpers.
+  The existing `cargo xtask lint invariants time-layering` report served as
+  the RED evidence: `crates/tx-shims/src/linux_syscall/timerfd.rs` still had
+  three raw HAL time findings on `sys_timerfd_settime`, `sys_timerfd_gettime`,
+  and `sys_timerfd_read` because their signatures required
+  `MonotonicCounterIf + DeadlineTimerIf`. Changed those helpers to depend on
+  the facade capability bound `TimekeeperClock<P>: ClockRead` while preserving
+  the existing `timekeeper_clock::<P>().monotonic_now_ns()` clock-read path and
+  syscall ctx timer registrar route. Focused timerfd tests exposed one
+  order-dependent test assumption in the previous cancel-on-set witness; fixed
+  it to use a future target relative to
+  `DEFAULT_REALTIME_EPOCH_BASE_NS`, matching the existing realtime
+  revalidation test. Verification: `rustfmt --edition 2021 --check` passed
+  for `timerfd.rs` and `timerfd_dispatch.rs`; `cargo test -p tx-shims --lib
+  timerfd_dispatch -- --nocapture` passed 10/10; `cargo check -p tx-shims`
+  passed with existing warnings; `cargo -q xtask unit` passed build plus
+  `tx-shims` 583/583, `tx-kernel` 104/104, `tx-ext4` 9/9, and `tx-scripts`
+  56/56 host tests; `cargo xtask lint invariants
+  time-wake-retired` stayed at 0 retired sites; `cargo xtask lint invariants
+  time-layering` dropped from 112 to 109 report-only findings (raw HAL 93 ->
+  90, raw TimerWheel/current-wheel bridge still 19). Updated
+  `TX_TIMER_SUBSYSTEM_DESIGN_CN.md` to record the new 109/90/19 snapshot and
+  the timerfd facade-bound cleanup. Next step: apply the same facade-bound
+  pattern to another syscall cluster or retire the current-wheel bridge.
+
+- 2026-07-10 (timerfd cancel-on-set guard cleanup).
+  Closed the Package D timerfd guard-cleanup gap. Added a focused RED syscall
+  regression proving that a `CLOCK_REALTIME` absolute timerfd armed with
+  `TFD_TIMER_CANCEL_ON_SET` left its old unified `TimerWheel` deadline behind
+  after `clock_settime`; the test failed with `wheel.next_deadline_ns()` still
+  `Some(...)`. Updated `TimerFd::mark_canceled_on_set_with_post` so the
+  cancel-on-set linearization point records the canceled generation, drops the
+  object-owned `TimerGuard`, clears the stale deadline, increments the
+  expiration counter, and publishes readable wake. The existing read path still
+  returns `ECANCELED` from `canceled_generation`; the change only removes the
+  stale registry wake. Updated
+  `docs/stage2-documents/time_infra/TX_TIMER_SUBSYSTEM_DESIGN_CN.md` so
+  cancel-on-set guard cleanup is recorded as landed, leaving current-wheel
+  bridge retirement and `time-layering` ratchet as the next timer migration
+  work. Verification: new focused test failed RED before the fix and passed
+  after; `cargo test -p tx-shims --lib timerfd_dispatch -- --nocapture` passed
+  10/10; `cargo check -p tx-subsystems -p tx-shims` passed with existing
+  warnings; scoped `rustfmt --edition 2021 --check` passed; `cargo xtask lint
+  invariants time-wake-retired` stayed at 0 retired sites; `cargo xtask lint
+  invariants time-layering` stayed report-only at 112 findings (raw HAL 93,
+  raw TimerWheel/current-wheel bridge 19); `cargo xtask lint docs` passed with
+  the existing 7 stale-vocabulary warnings; `cargo -q xtask unit` passed build
+  plus `tx-shims` 583/583, `tx-kernel` 104/104, `tx-ext4` 9/9, and
+  `tx-scripts` 56/56 host tests. `cargo test -p tx-subsystems --lib timerfd
+  -- --nocapture` is not a usable scoped gate in the current dirty tree:
+  the lib-test harness fails before timerfd tests on existing net/ipc test
+  import drift unrelated to this slice. Next step: retire the current-wheel
+  bridge via explicit `ReactorTimeDriver`/registrar context.
+
+- 2026-07-10 (API language phase-2 initial adapter convergence).
+  Continued the limited-language convergence with a mechanical pass only, then
+  stopped before designing new fd/readiness interfaces. The pass added the
+  crate-root `tx-subsystems/src/adapter.rs` to the report-only
+  `api-language` lint, added `CoLocatedEntity` to the adapter mechanism
+  inventory, and narrowed the remaining easy adapter exports in
+  `tx-subsystems::{adapter,pipe,cred,mount}` plus `tx-shims::adapter`.
+  `pipe`, `cred`, root `tx-subsystems`, and `tx-shims` no longer re-export the
+  unused zone policy/binding/identity-slot helpers from this pass. `mount`
+  still keeps `IdentitySlot`, `PayloadBinding`, and `PayloadPolicy` because
+  its current split identity/payload structures still use them internally;
+  those are now explicit design-stage leftovers rather than accidental broad
+  exports. Verification: `rustfmt --edition 2021 --check` and scoped
+  `git diff --check` passed for touched Phase 2 files;
+  `cargo test -p xtask api_language -- --nocapture` passed 3/3;
+  `cargo xtask lint invariants api-language` exited 0 with 430 report-only
+  findings (55 adapter mechanism language, 375 wait readiness raw language);
+  `cargo check -p tx-subsystems -p tx-shims --lib` passed with existing
+  warnings in `tx-subsystems` net connect and `tx-fs` ext4 bridge. Next step:
+  pause mechanical edits and design the fd/readiness facade plus mount/TTY
+  mechanism-boundary policy before reducing the remaining wait/raw vocabulary.
+
+- 2026-07-10 (timer subsystem design consolidation).
+  Consolidated `docs/stage2-documents/time_infra/TX_TIMER_SUBSYSTEM_DESIGN_CN.md`
+  into the current timer subsystem reference for migration process, module
+  boundaries, consumer-facing interfaces, linter control, and producer
+  contracts. Updated the doc from the old `SignalTarget`-carrier-only state to
+  the current registry-fire route: `TimerTarget::SignalTarget` maps to
+  `install_signal_timer`, `TimerWheel` dispatches through
+  `TimerWakeRouter::post_signal_timer_fired`, the reactor posts
+  `MailboxEvent::SignalTimerFired` with a signal-delivery scheduler hint, and
+  kernel entry drains the hint before re-scanning POSIX/itimer due tables.
+  Clarified the remaining boundary: `SignalTimerFired` is only a wake hint, not
+  signal delivery; POSIX signal semantics still live in entry/syscall table
+  scan, and current-wheel bridge retirement plus hard `time-layering` ratchet
+  remain open. Also fixed the `TimerTarget::SignalTarget` rustdoc in
+  `crates/tx-services/src/time/deadline.rs` to match the implemented route.
+  Verification: residual old-state grep returned no matches; scoped
+  `git diff --check` passed; `cargo xtask lint docs` passed with the existing
+  7 stale-vocabulary warnings; `cargo xtask lint invariants
+  time-wake-retired` passed at 0 retired sites; `cargo xtask lint invariants
+  time-layering` stayed report-only at 112 findings (raw HAL 93, raw
+  TimerWheel/current-wheel bridge 19). Next step: continue bridge retirement
+  via explicit `ReactorTimeDriver`/registrar context and decide timerfd
+  cancel-on-set guard cleanup hardening.
+
+- 2026-07-10 (API language phase-1 adapter convergence).
+  Completed a bounded fanout pass to shrink subsystem adapter mechanism
+  exports without moving domain vocabulary into substrate. Added the
+  report-only `cargo xtask lint invariants api-language` inventory, which
+  scans adapter mechanism terms and raw wait/readiness vocabulary while the
+  tree converges. Narrowed unused zone-policy/binding/identity-slot exports in
+  the fd-like adapters, process/thread/signal adapters, and
+  VFS/VM/PageBacked/TTY adapters; retained only the remaining local users such
+  as legacy `Channel` wait paths, VM `Mask`, TTY bus primitives, and the
+  payload-policy hooks still required by current structures. Verification:
+  `cargo test -p xtask api_language -- --nocapture` passed 3/3;
+  `rustfmt --edition 2021 --check` passed for the new lint and touched
+  adapters; scoped `git diff --check` passed; `cargo xtask lint invariants
+  api-language` exited 0 with 474 report-only findings (99 adapter mechanism
+  language, 375 wait readiness raw language); `cargo check -p tx-subsystems
+  --lib` passed with the existing `net/execution/step_connect.rs` unused
+  `guard` warning. Next step: use the new report to drive a second pass on
+  root/pipe/cred adapters and then isolate fd-like readiness registration so
+  epoll stops assembling raw wait-source details.
+
+- 2026-07-10 (tx-observe L0-L6 refactor design).
+  Added `docs/Txv3/08_OBSERVATION_L0_L6_REFACTOR_v0.md` as the observation
+  subsystem tightening proposal, then revised the topology around a single
+  handwritten `schema/txobserve.toml` source of truth. The document now splits
+  the generated/use path into kernel-side L1-L3 (semantic probe API, producer
+  contract, wire writer) and host-side L4-L6 (readers/integrity, canonical
+  representation, transcoders/views including TUI/menuconfig). The host-side
+  boundary is now type-shaped: L4 emits `RawRecordFrame`/`TraceIntegrity`, L5
+  consumes `DecodeBatch<TraceReader>` and emits `TraceEventStream`, and L6
+  only receives `ProjectionInput<'_>` so exporters cannot legally decode
+  `TxTraceRecord` bytes. The kernel-side boundary is likewise type-shaped:
+  generated `EventToken<E>` plus sealed `EventShape` build `PendingEvent<E>`,
+  `HartEmitter` returns `PublishedSpan` only after a begin publish succeeds,
+  and `WireEncoder` owns private `EncodedRecord` construction before the ring
+  publisher consumes it. Updated `docs/Txv3/INDEX.md` to point at the
+  proposal. Verification: scoped `git diff --check` passed; `cargo xtask lint
+  docs` passed with the existing 7 stale-vocabulary warnings.
+
+- 2026-07-10 (signal timer target carrier migration).
+  Continued Package E timer migration by adding a facade-level
+  `TimerTarget::SignalTarget` carrier in `tx-services::time::deadline` and
+  switching POSIX timer plus `ITIMER_REAL` registration helpers in
+  `crates/tx-shims/src/linux_syscall/{posix_timer.rs,time.rs}` from generic
+  `TaskMailbox` targets to this signal-timer target. The substrate adapter
+  still maps the carrier to the existing task-mailbox timer wake, so this is
+  not the final signal-delivery callback route; it does make producer intent
+  explicit and gives the next slice a typed target to hang the real signal
+  route from. Added an `xtask` mechanical regression,
+  `signal_timer_producers_register_signal_targets`, which failed RED while the
+  producer files lacked `TimerTarget::SignalTarget` and passed after the
+  migration. Focused verification passed:
+  `cargo test -p xtask signal_timer_producers_register_signal_targets --
+  --nocapture`; `cargo test -p tx-shims --lib posix_timer_dispatch --
+  --nocapture` passed 3/3; `cargo test -p tx-shims --lib time_syscalls --
+  --nocapture` passed 25/25; `cargo check -p tx-services -p tx-shims -p
+  tx-kernel` passed with existing warnings; scoped rustfmt passed; `cargo
+  xtask lint invariants time-layering` stayed report-only at 112 findings
+  (raw HAL time trait/callsite 93, raw `TimerWheel` bridge 19); `cargo xtask
+  lint invariants time-wake-retired` stayed at zero retired sites; and
+  `cargo xtask lint docs` passed with the existing 7 stale-vocabulary
+  warnings. `cargo -q xtask unit` initially hit an unrelated compile blocker
+  from `thread_runtime::structure` importing `InterruptSource` through the old
+  signal adapter path; fixed that one-line import to
+  `tx_reactor::interrupt::InterruptSource`, then reran `cargo -q xtask unit`
+  successfully: `tx-shims` 582/582, `tx-kernel` 104/104, `tx-ext4` 9/9, and
+  `tx-scripts` 56/56. Updated
+  `docs/stage2-documents/time_infra/TX_TIMER_SUBSYSTEM_DESIGN_CN.md` to record
+  the precise new state: `SignalTarget` carrier exists, while the real
+  registry-fire signal delivery route, current-wheel bridge retirement,
+  timerfd cancel-on-set guard cleanup decision, and hard `time-layering`
+  ratchet remain open.
+
+- 2026-07-10 (entry-side timer poll registrar context injection).
+  Continued Package B/E/F timer migration by centralizing entry-side timer
+  context collection in `crates/tx-kernel/src/thread_future.rs`.
+  `EntryTimerPollContext` now captures the current hart, task mailbox, and
+  timer registrar; `poll_entry_timers_and_liveness` passes the registrar and
+  mailbox into POSIX timer and `ITIMER_REAL` `poll_due`, and
+  `build_syscall_ctx` reuses the same helper for syscall context setup. This
+  is the explicit-context injection slice, not full bridge retirement:
+  the registrar is still derived from the existing per-hart
+  `current_timer_wheel(...).registrar_handle()` bridge, so `time-layering`
+  remains report-only at 112 findings. Added a focused kernel RED/GREEN test
+  proving entry-side `ITIMER_REAL` periodic `poll_due` rearm registers the
+  next deadline back into the unified timer registry through current timer
+  context. Verification already run for this slice:
+  `cargo test -p tx-kernel --lib
+  entry_timer_poll_rearms_periodic_itimer_with_current_timer_context --
+  --nocapture` failed before the production change and passed after;
+  `cargo test -p tx-kernel --lib
+  per_hart_slotted_binds_current_task_mailbox -- --nocapture` passed;
+  `cargo check -p tx-kernel` passed with existing warnings; scoped rustfmt
+  check passed for `thread_future.rs` and its tests; `cargo xtask lint
+  invariants time-layering` stayed report-only at 112 findings (raw HAL time
+  trait/callsite 93, raw `TimerWheel` bridge 19); `cargo xtask lint
+  invariants time-wake-retired` stayed at zero retired sites; `cargo xtask
+  lint docs` passed with the existing 7 stale-vocabulary warnings; and
+  `cargo -q xtask unit` passed build plus `tx-shims` 582/582, `tx-kernel`
+  104/104, `tx-ext4` 9/9, and `tx-scripts` 56/56 host tests. Updated
+  `docs/stage2-documents/time_infra/TX_TIMER_SUBSYSTEM_DESIGN_CN.md` so the
+  timer subsystem design records the new boundary precisely: entry-side
+  registrar/mailbox context is now explicit, while `SignalTarget` routing,
+  current-wheel bridge retirement, and hard `time-layering` ratchet remain the
+  next implementation work.
+
+- 2026-07-10 (ITIMER_REAL poll_due periodic rearm guard registration).
+  Continued Package E timer migration by making
+  `poll_due_itimers_with_post` accept an optional
+  `tx_services::time::DeadlineRegistrar` plus task-mailbox target and register
+  the next periodic `ITIMER_REAL` deadline back into the unified timer
+  registry when those capabilities are present. `rt_sigsuspend` now passes the
+  syscall context registrar/mailbox into this poll path; the kernel entry-side
+  timer poll still passes `None`, so this does not claim entry-side registrar
+  context injection or `SignalTarget` routing. Added a focused RED regression
+  that arms periodic `ITIMER_REAL`, manually fires the original `TimerWheel`
+  entry, calls `poll_due_itimers_with_post`, and expects the next registry
+  deadline to be present; before the fix `wheel.next_deadline_ns()` stayed
+  `None`, after the fix the next `TimerGuard` is registered. Verification:
+  `cargo test -p tx-shims --lib
+  dispatch_itimer_real_poll_due_periodic_rearms_registry_deadline --
+  --nocapture` failed RED before the production change and passed after;
+  `cargo test -p tx-shims --lib time_syscalls -- --nocapture` passed 25/25;
+  `cargo check -p tx-shims` and `cargo check -p tx-kernel` passed with
+  existing warnings; scoped rustfmt passed; `cargo xtask lint invariants
+  time-layering` stayed report-only at 112 findings (raw HAL time
+  trait/callsite 93, raw `TimerWheel` bridge 19); `cargo xtask lint
+  invariants time-wake-retired` stayed at zero retired sites; `cargo xtask
+  lint docs` passed with the existing 7 stale-vocabulary warnings; and
+  `cargo -q xtask unit` passed build plus `tx-shims` 582/582, `tx-kernel`
+  103/103, `tx-ext4` 9/9, and `tx-scripts` 56/56 host tests. Next step:
+  inject an explicit registrar/driver context into entry-side timer polling
+  and then replace the interim task-mailbox target with `SignalTarget` or an
+  equivalent signal route.
+
+- 2026-07-10 (POSIX timer poll_due periodic rearm guard registration).
+  Continued Package E timer migration by making POSIX timer
+  `poll_due_posix_timers_with_post` accept an optional
+  `tx_services::time::DeadlineRegistrar` plus task-mailbox target and register
+  the next periodic deadline back into the unified timer registry when those
+  capabilities are present. The POSIX timer table still stores only semantic
+  state plus `TimerGuard`; `DeadlineRegistrarHandle` remains an operation
+  capability. Added/used a focused RED regression that manually fires the
+  original `TimerWheel` entry and then calls POSIX `poll_due`; before the fix
+  `wheel.next_deadline_ns()` stayed `None`, after the fix the next periodic
+  guard is registered. The real kernel entry path currently passes `None` for
+  the new registrar/mailbox arguments, so this does not claim full entry-side
+  registrar context injection or `SignalTarget` routing yet. Verification:
+  `cargo test -p tx-shims --lib
+  dispatch_posix_timer_poll_due_periodic_rearms_registry_deadline --
+  --nocapture` failed RED before the production change and passed after;
+  `cargo test -p tx-shims --lib posix_timer_dispatch -- --nocapture` passed
+  3/3; `cargo check -p tx-shims` and `cargo check -p tx-kernel` passed with
+  existing warnings; scoped rustfmt passed; `cargo xtask lint invariants
+  time-layering` stayed report-only at 112 findings (raw HAL time
+  trait/callsite 93, raw `TimerWheel` bridge 19); `cargo xtask lint
+  invariants time-wake-retired` stayed at zero retired sites; `cargo xtask
+  lint docs` passed with the existing 7 stale-vocabulary warnings; and
+  `cargo -q xtask unit` passed build plus `tx-shims` 581/581, `tx-kernel`
+  103/103, `tx-ext4` 9/9, and `tx-scripts` 56/56 host tests. Next step:
+  migrate non-boundary itimer `poll_due` rearm and inject an explicit
+  registrar/driver context into entry-side timer polling before replacing the
+  interim task-mailbox target with `SignalTarget` or an equivalent signal
+  route.
+
+- 2026-07-10 (timer subsystem document submodule contract).
+  Expanded `docs/stage2-documents/time_infra/TX_TIMER_SUBSYSTEM_DESIGN_CN.md`
+  with a complete submodule design section for the timer migration. The new
+  section spells out `tx-services::time` facade ownership, clock/realtime
+  mutation, deadline registry semantics, reactor driver and SMP wake routing,
+  RTC/device routing, semantic producer contracts, and the linter/progress
+  control surface. It keeps the current implementation status explicit:
+  facade/clock-read and several object guard-registration slices have landed,
+  while POSIX/itimer signal-target rearm, current-wheel bridge retirement, and
+  `time-layering` ratchet remain open. Verification: scoped
+  `git diff --check` passed; `cargo xtask lint docs` passed with the existing
+  7 stale-vocabulary warnings; `cargo xtask progress validate` passed.
+
+- 2026-07-10 (ITIMER_REAL boundary periodic rearm guard registration).
+  Continued Package E timer migration by making `ITIMER_REAL` syscall-boundary
+  periodic rearm register the next deadline back into the unified timer
+  registry. Added a RED syscall regression that arms a periodic `ITIMER_REAL`
+  with a syscall timer registrar, manually fires the old `TimerWheel` entry,
+  then uses a normal syscall boundary to deliver SIGALRM and rearm; before the
+  fix the table deadline advanced but `wheel.next_deadline_ns()` stayed `None`.
+  The production fix keeps rearm capability on the syscall boundary:
+  `fire_itimer_real_with_post(ctx)` now passes a rearm closure into
+  `fire_itimer_real_inner`, and the periodic branch stores the new
+  `TimerGuard` returned by `register_syscall_timer_deadline(ctx, ...,
+  TimerRole::ItimerReal)`. This does not introduce a service handle field into
+  the timer state and does not claim full `SignalTarget` routing yet.
+  Verification: the new focused regression passed after failing before the
+  fix; `cargo test -p tx-shims --lib time_syscalls -- --nocapture` passed
+  24/24; `cargo check -p tx-shims` and `cargo check -p tx-kernel` passed with
+  existing warnings; scoped rustfmt passed after formatting the touched files;
+  `cargo xtask lint invariants time-layering` stayed report-only at 112
+  findings (raw HAL time trait/callsite 93, raw `TimerWheel` bridge 19);
+  `cargo xtask lint invariants time-wake-retired` stayed at zero retired
+  sites; `cargo xtask lint docs` passed with the existing 7 stale-vocabulary
+  warnings; `cargo xtask progress validate` passed; and `cargo -q xtask unit`
+  passed build plus `tx-shims` 580/580, `tx-kernel` 103/103, `tx-ext4` 9/9,
+  and `tx-scripts` 56/56 host tests. Next step: migrate POSIX timer interval
+  rearm and non-boundary itimer `poll_due` rearm to registrar-backed guards,
+  then replace the task-mailbox interim target with a real `SignalTarget` or
+  equivalent signal route.
+
+- 2026-07-10 (timerfd realtime revalidation guard registration).
+  Continued Package D timer migration by making non-cancel-on-set realtime
+  absolute timerfd revalidation replace the object-owned registry guard when
+  `clock_settime` runs with a syscall timer registrar. Added a RED syscall
+  regression proving that `clock_settime(CLOCK_REALTIME)` changed the
+  `TimerFd` monotonic deadline but left the unified `TimerWheel` deadline at
+  the old value. The production fix threads `Option<&dyn DeadlineRegistrar>`
+  through `TimekeeperIf::set_realtime_ns_with_persistent_and_timerfd_post`,
+  `WallClock::set_realtime_ns_inner`, and `timerfd_clock_was_set_with_post`;
+  `TimerFd::revalidate_realtime_deadline_on_set_with_post` now re-registers a
+  `TimerTarget::WaitSource` guard for the rebased deadline without storing a
+  service handle in the object. Verification: the new focused regression
+  passed after failing before the fix; `cargo test -p tx-shims --lib
+  timerfd_dispatch -- --nocapture` passed 9/9; `cargo check -p tx-shims` and
+  `cargo check -p tx-kernel` passed with existing warnings; scoped rustfmt and
+  whitespace/diff checks passed; `cargo xtask lint invariants time-layering`
+  stayed report-only at 112 findings (raw HAL time trait/callsite 93, raw
+  `TimerWheel` bridge 19); `cargo xtask lint invariants time-wake-retired`
+  stayed at zero retired sites; `cargo xtask lint docs` passed with the
+  existing 7 stale-vocabulary warnings; and `cargo -q xtask unit` passed build
+  plus `tx-shims` 579/579, `tx-kernel` 103/103, `tx-ext4` 9/9, and
+  `tx-scripts` 56/56 host tests. Next step: move POSIX/itimer onto a real
+  signal-target timer route, with optional timerfd cancel-on-set guard cleanup
+  hardening if we decide cancel should drop the old registry guard immediately.
+
+- 2026-07-10 (timerfd periodic rearm guard registration).
+  Continued Package D timer migration by making periodic timerfd read rearm
+  replace the object-owned registry guard when syscall context provides a
+  timer registrar. Added a RED syscall regression proving that after the first
+  periodic timerfd deadline fires through the unified `TimerWheel`, `read(2)`
+  used to return the expiration without registering the next object deadline
+  back into the registry (`wheel.next_deadline_ns() == None`). The production
+  fix keeps `DeadlineRegistrar` as an operation parameter: `sys_timerfd_read`
+  wraps `SyscallCtx::timer_registrar` as a `DeadlineRegistrarHandle` and passes
+  `Option<&dyn DeadlineRegistrar>` into `step_timerfd_read`; `TimerFd` still
+  stores only semantic state plus `TimerGuard`, and rearm replaces the guard
+  slot with a `TimerTarget::WaitSource` deadline for the next interval.
+  Verification: the new focused regression passed after failing before the
+  fix; `cargo test -p tx-shims --lib timerfd_dispatch -- --nocapture` passed
+  8/8; `cargo check -p tx-shims` and `cargo check -p tx-kernel` passed with
+  existing warnings; scoped rustfmt and whitespace/diff checks passed; `cargo
+  xtask lint invariants time-layering` stayed report-only at 112 findings
+  (raw HAL time trait/callsite 93, raw `TimerWheel` bridge 19); `cargo xtask
+  lint invariants time-wake-retired` stayed at zero retired sites; `cargo
+  xtask lint docs` passed with the existing 7 stale-vocabulary warnings; and
+  `cargo -q xtask unit` passed build plus `tx-shims` 578/578, `tx-kernel`
+  103/103, `tx-ext4` 9/9, and `tx-scripts` 56/56 host tests. Next step:
+  handle realtime `clock_settime` timerfd revalidation guard re-registration,
+  then continue to POSIX/itimer signal-target routing.
+
+- 2026-07-10 (timer subsystem design document completion).
+  Expanded `docs/stage2-documents/time_infra/TX_TIMER_SUBSYSTEM_DESIGN_CN.md`
+  from the current migration notes into a fuller timer-subsystem contract.
+  The document now opens with a one-page summary of the migration process,
+  physical module boundaries, and five public time interfaces, and closes with
+  an implementation contract for each producer family. It explicitly records
+  the handle-vs-guard ownership rule, the `DeadlineRegistrar`/`TimerGuard`
+  rearm model, the no-service-handle field rule for semantic objects, file-level
+  lint expectations, and the remaining slices: timerfd interval/realtime guard
+  re-registration, POSIX/itimer signal-target routing, current-wheel bridge
+  retirement, and `time-layering` ratchet. Verification: `cargo xtask lint
+  docs` passed with the existing 7 stale-vocabulary warnings, `cargo xtask
+  progress validate` passed, and scoped whitespace/diff checks passed for the
+  touched docs.
+
+- 2026-07-10 (timerfd object deadline guard registration).
+  Continued Package D timer migration by moving `timerfd_settime` initial
+  arm/disarm onto object-owned timer guards. `TimerFd` now stores an optional
+  `TimerGuard`, `timerfd_settime_with_flags_and_post` accepts an optional
+  `tx_services::time::DeadlineRegistrar` capability, and the syscall arm wraps
+  `SyscallCtx::timer_registrar` as a `DeadlineRegistrarHandle` before calling
+  into the subsystem. Initial timerfd arms register a `TimerTarget::WaitSource`
+  deadline for timerfd readability; disarm drops the stored guard and cancels
+  the registry entry. Added a focused syscall test that first failed with no
+  registry deadline, then passed after the subsystem guard wiring, and now also
+  proves disarm clears the wheel deadline. Verification: `cargo test -p
+  tx-shims --lib timerfd_dispatch -- --nocapture` passed 7/7; `cargo check -p
+  tx-shims` passed with existing warnings; `cargo xtask lint invariants
+  time-layering` passed report-only at 112 findings (raw HAL time
+  trait/callsite 93, raw `TimerWheel` bridge 19); `cargo xtask lint
+  invariants time-wake-retired` still reports zero retired sites; scoped
+  rustfmt check passed; `cargo -q xtask unit` passed build plus `tx-shims`
+  577/577, `tx-kernel` 103/103, `tx-ext4` 9/9, and `tx-scripts` 56/56 host
+  tests. `cargo test -p tx-subsystems --lib timerfd --
+  --nocapture` is still blocked before timerfd tests run by unrelated
+  unresolved imports in `crates/tx-subsystems/src/net/tests.rs` for removed or
+  renamed loopback TCP helpers. The timer subsystem design document now records
+  the Package D arm/disarm checkpoint. Next step: make timerfd periodic
+  interval rearm and realtime `clock_settime` revalidation re-register object
+  guards, then continue to POSIX/itimer `SignalTarget` routing.
+
+- 2026-07-10 (syscall timer producer registrar-backed deadlines).
+  Continued Package E timer migration by removing the remaining raw
+  `P::set_deadline_ns` producer arms from
+  `crates/tx-shims/src/linux_syscall/time.rs` `setitimer` and
+  `crates/tx-shims/src/linux_syscall/posix_timer.rs` `timer_settime`.
+  Interval-timer and POSIX-timer table entries now carry an optional
+  `TimerGuard`; when syscall context has both a task mailbox and timer
+  registrar, the producer arm registers a task-mailbox deadline through
+  `tx_services::time::DeadlineRegistrar` and stores the returned guard.
+  Disarm/delete/rearm paths drop the old guard through normal table
+  replacement/removal. Added an `xtask` regression that rejects raw
+  `P::set_deadline_ns` in the syscall timer producer files, plus focused
+  host tests proving `setitimer` and `timer_settime` populate the unified
+  timer registry when a registrar is injected. Verification:
+  `cargo test -p xtask
+  syscall_timer_producers_use_registrar_backed_deadlines -- --nocapture`
+  failed before production changes and passed after them; `cargo test -p
+  tx-shims --lib time_syscalls -- --nocapture` passed 23/23; `cargo test
+  -p tx-shims --lib posix_timer_dispatch -- --nocapture` passed 2/2;
+  `cargo check -p tx-shims` passed with existing warnings; `cargo xtask
+  lint invariants time-layering` passed report-only and dropped from 114
+  to 112 findings (raw HAL time trait/callsite 95 -> 93, raw `TimerWheel`
+  bridge still 19); `cargo xtask lint invariants time-wake-retired` still
+  reports zero retired sites; scoped rustfmt check passed; `cargo -q xtask
+  unit` passed build plus `tx-shims` 576/576, `tx-kernel` 103/103,
+  `tx-ext4` 9/9, and `tx-scripts` 56/56 host tests. The timer
+  subsystem design document now records this Package E checkpoint. Next
+  step: migrate timerfd object arm/disarm to guard-owned registration, then
+  add a real signal-target timer route so POSIX/itimer interval rearm no
+  longer relies on the entry-side transition path.
+
+- 2026-07-10 (process exit payload-guard split implementation).
+  Implemented the narrow non-RCU process lifecycle optimization from the
+  process data-structure fanout review. `step_exit_group_with_posts` and
+  last-thread `step_process_exit_inner` now use the outer
+  `ProcessIdentity.payload` slot guard only to snapshot the address space and
+  drain fd/thread state; shm detach, socket close, per-thread userspace-exit
+  notification, thread zombification, TID unregister, and large fd/thread drops
+  run after that guard is released. `walk_robust_list` now snapshots the owner
+  process address space and drops the process payload guard before robust-list
+  user-memory reads and futex wake work. This intentionally does not redesign
+  PID namespace lookup, Vec rosters, futex waiter tables, or any RCU
+  publication API. Verification: `git diff --check --` and `rustfmt --check`
+  passed on the touched process/thread-runtime files; a static Ruby
+  lock-boundary assertion passed for `exit_group`, `process_exit`, and
+  robust-list ordering; `cargo check -p tx-subsystems --lib` passed with the
+  existing `net/execution/step_connect.rs` unused-variable warning. Focused
+  `cargo test -p tx-subsystems --lib
+  exit_group_payload_slot_guard_only_detaches_state -- --nocapture` is still
+  blocked before running by unrelated unresolved imports in
+  `crates/tx-subsystems/src/net/tests.rs` for removed/renamed loopback TCP
+  helpers. Next step: leave RCU/index/roster replacement to the dedicated RCU
+  worker; the next non-RCU slice is to reconcile ordinary `step_thread_exit`
+  clear-child-tid / robust-list ordering and measure lock-service deltas under
+  the new split.
+
+- 2026-07-10 (signal wait itimer deadline registrar-backed park).
+  Continued the shims timer migration by removing the raw
+  `P::set_deadline_ns` call from `crates/tx-shims/src/linux_syscall/signal.rs`
+  `rt_sigsuspend`. The loop now keeps the next itimer deadline returned by
+  `poll_due_itimers_with_post` and folds it into the existing registrar-backed
+  `NanosleepOp` park deadline, so signal wait timeout cadence still wakes on
+  the earlier of the 5 ms poll chunk and the pending itimer deadline without
+  direct HAL deadline programming in the syscall body. Added an `xtask`
+  regression test that rejects raw `P::set_deadline_ns` in `signal.rs`.
+  Verification: `cargo test -p xtask
+  signal_wait_paths_use_registrar_backed_deadlines -- --nocapture` failed
+  before production changes and passed after them; `cargo test -p xtask signal
+  -- --nocapture` passed the signal time-layering regression pair; `cargo
+  check -p tx-shims` passed; `cargo test -p tx-shims --lib
+  sigtimedwait_dispatch -- --nocapture` passed 7/7; `cargo xtask lint
+  invariants time-layering` passed report-only and dropped from 115 to 114
+  findings (raw HAL time trait/callsite 96 -> 95, raw `TimerWheel` bridge
+  still 19); `cargo xtask lint invariants time-wake-retired` still reports
+  zero retired sites; `cargo -q xtask unit` passed build plus `tx-shims`,
+  `tx-kernel`, `tx-ext4`, and `tx-scripts` host tests. The timer subsystem
+  design document now records this checkpoint and current lint snapshot. Next step: migrate `time.rs`
+  setitimer and `posix_timer.rs` timer_settime producer deadlines to
+  object-owned `TimerGuard` / `DeadlineRegistrar`.
+
+- 2026-07-10 (thread runtime and trap deadline platform adapter).
+  Continued Package F timer migration by moving the remaining non-network
+  kernel runtime deadline hardware programming in
+  `crates/tx-kernel/src/thread_future.rs` and `crates/tx-kernel/src/trap.rs`
+  from raw `P::set_deadline_ns` / `P::cancel_deadline` calls to
+  `tx_services::time::platform::HalDeadlineTimer<P>`. Added an `xtask`
+  regression test that rejects those raw calls in thread runtime and trap
+  files. This leaves shims timer producers, network-lane reads, vDSO seed
+  generics, and `current_timer_wheel` bridge retirement as the next migration
+  debt. Verification: `cargo test -p xtask
+  thread_future_and_trap_deadline_programming_uses_time_platform_adapter --
+  --nocapture` failed before production changes and passed after them; `cargo
+  test -p xtask deadline_programming_uses_time_platform_adapter -- --nocapture`
+  passed both kernel deadline adapter regression tests; `cargo check -p
+  tx-kernel` passed with existing warnings; `cargo test -p tx-kernel --lib
+  run_thread_future_stays_within_clone_submit_budget -- --nocapture` passed;
+  `cargo test -p tx-kernel --lib
+  boot_smoke_mounts_root_and_dev_and_resolves_console -- --nocapture` passed;
+  `cargo xtask lint invariants time-layering` passed report-only and dropped
+  from 118 to 115 findings (raw HAL time trait/callsite 99 -> 96, raw
+  `TimerWheel` bridge still 19); `cargo xtask lint invariants
+  time-wake-retired` still reports zero retired sites; `cargo -q xtask unit`
+  passed build plus tx-shims, tx-kernel, tx-ext4, and tx-scripts host tests.
+  The timer subsystem design document now records this checkpoint and current
+  lint snapshot. Next step: migrate shims timer producer raw deadline paths to
+  `DeadlineRegistrar` or retire the `current_timer_wheel` bridge.
+
+- 2026-07-10 (process subsystem data-structure fanout review).
+  Completed a read-only fanout review of the current process/thread runtime
+  data structures and likely service-time tails. The durable findings are
+  recorded in
+  `docs/progress/research/2026-07-10-process-ds-fanout-review.md`. Current
+  implementation still uses a single global PID/TID/PGID/SID `BTreeMap`, Vec
+  rosters for children/threads/pgrp/session membership, and flat
+  `ProcessPayload` slots with several paths holding the outer payload-slot
+  guard across heavier work. Highest priority follow-ups: split
+  `exit_group`/`process_exit` payload-guard work, reconcile ordinary
+  `step_thread_exit` clear-child-tid/robust-list ordering, move robust-list
+  user-memory walking out from under process payload ownership, then revisit
+  Vec roster detach/snapshot and the futex exact-waiter global table.
+  Verification: read-only source inspection plus four fanout reader reports.
+  Next step: implement a narrow payload-guard split for `exit_group` first, with
+  focused lock-service counters before and after. Blocker: none for planning;
+  dirty checkout still requires focused staging for implementation.
+
+- 2026-07-10 (tx-observe fanout review).
+  Completed a read-only fanout code review of the `tx-observe` producer ABI,
+  host drain/replay/export tooling, analyzer/cache surface, active Txv3 docs,
+  and progress-memory state. The durable findings are recorded in
+  `docs/progress/research/2026-07-10-tx-observe-fanout-review.md`. Highest
+  priority follow-ups: make `span_begin` reflect dropped begin records, preserve
+  level/name metadata on `span_end`, type the payload construction API instead
+  of accepting arbitrary tag/byte pairs, add the documented reentry guard, add a
+  combined raw-live completeness summary, export counters to Perfetto, keep
+  repairs adjacent to damaged records, and update raw-first/analyze docs.
+  Verification: source/docs/tests inspected; one analyzer reader ran
+  `python3 -m py_compile tools/tx-observe-analyze.py
+  tools/tests/test_tx_observe_analyze.py` and
+  `python3 -m unittest tools.tests.test_tx_observe_analyze` successfully. Next
+  step: implement the producer loss/close-metadata fixes first, then refresh
+  docs and host-tool contracts. Blocker: dirty checkout requires focused staging
+  if any implementation slice follows.
+
+- 2026-07-10 (kernel boot/reactor deadline programming platform adapter).
+  Continued the timer subsystem migration by moving the non-network
+  `crates/tx-kernel/src/init.rs` and `crates/tx-kernel/src/init/exec.rs`
+  deadline hardware programming path from raw `P::set_deadline_ns`,
+  `P::cancel_deadline`, and `P::enable_timer_wakeups` calls to a
+  `CoreInit::<P>::deadline_timer()` helper backed by
+  `tx_services::time::platform::HalDeadlineTimer<P>`. Added an `xtask`
+  regression test that rejects those raw deadline calls in the non-network
+  boot/reactor files. This slice intentionally leaves `init/net.rs` in the
+  network lane and leaves `thread_future.rs`, `trap.rs`, shims timer producer
+  raw deadline paths, and `current_timer_wheel` bridge retirement for later
+  Package E/F work. Verification: `cargo test -p xtask
+  kernel_boot_reactor_deadline_programming_uses_time_platform_adapter --
+  --nocapture` failed before production changes and passed after them; `cargo
+  check -p tx-kernel` passed with existing warnings; `cargo test -p tx-kernel
+  --lib boot_smoke_mounts_root_and_dev_and_resolves_console -- --nocapture`
+  passed; `cargo xtask lint invariants time-layering` passed report-only and
+  dropped from 123 to 118 findings (raw HAL time trait/callsite 104 -> 99, raw
+  `TimerWheel` bridge still 19); `cargo xtask lint invariants
+  time-wake-retired` still reports zero retired sites; `cargo -q xtask unit`
+  passed build plus tx-shims, tx-kernel, tx-ext4, and tx-scripts host tests.
+  The timer subsystem design document now records this checkpoint and current
+  lint snapshot.
+  Next step: continue Package F at `thread_future.rs`/`trap.rs` or start the
+  Package E shims producer deadline-registration migration.
+
+- 2026-07-10 (timer subsystem document boundary and API closeout).
+  Strengthened `docs/stage2-documents/time_infra/TX_TIMER_SUBSYSTEM_DESIGN_CN.md`
+  into the current implementation-facing timer subsystem contract. The
+  document now separates the migration into clock-read, deadline-registration,
+  reactor-driver, and RTC/device lanes; records that the facade and clock-read
+  body migrations are verifiable while producer guard ownership,
+  `current_timer_wheel` retirement, reactor hardware-deadline programming, and
+  hard `time-layering` ratchet remain open; maps module boundaries onto
+  concrete file regions and linter strategies; and clarifies how the five
+  public API families are exposed through trait facades, contextual handles,
+  and `TimerGuard`/`TimerToken` instead of a wide `TimeIf` or object-owned
+  service handle. Verification: `cargo xtask lint docs` passed with the
+  existing stale-vocabulary warnings only; `git diff --check --
+  docs/stage2-documents/time_infra/TX_TIMER_SUBSYSTEM_DESIGN_CN.md` passed.
+  Next step: implement the non-network deadline-programming slice by routing
+  `P::set_deadline_ns` / `P::cancel_deadline` through the time platform/driver
+  boundary, then rerun the focused `time-layering` regression.
+
+- 2026-07-10 (procfs uptime clock facade injection).
+  Continued the timer subsystem migration by moving
+  `crates/tx-kernel/src/init.rs` procfs uptime clock registration from the raw
+  `<P as tx_hal::MonotonicCounterIf>::read_ns` function pointer to the existing
+  `CoreInit::<P>::monotonic_now_ns` helper, keeping procfs's `fn() -> u64`
+  injection shape while routing the read through `timekeeper_clock::<P>()` and
+  the `ClockRead` facade. The kernel boot/reactor `xtask` regression test now
+  also rejects this raw associated-function pointer form. Verification:
+  `cargo test -p xtask
+  kernel_boot_reactor_bodies_use_time_facade_for_monotonic_reads --
+  --nocapture` failed before the migration and passed after it; `cargo check
+  -p tx-kernel` passed; `cargo test -p tx-kernel --lib
+  boot_smoke_mounts_root_and_dev_and_resolves_console -- --nocapture` passed;
+  `cargo xtask lint invariants time-layering` passed report-only and dropped
+  from 124 to 123 findings (raw HAL time trait/callsite 105 -> 104, raw
+  `TimerWheel` bridge still 19); `cargo xtask lint invariants
+  time-wake-retired` still reports zero retired sites. The timer subsystem
+  design document now records this checkpoint and current lint snapshot.
+
+- 2026-07-10 (kernel boot/reactor clock-read facade body migration).
+  Continued the timer subsystem migration by moving non-network boot/reactor
+  monotonic reads in `crates/tx-kernel/src/init.rs` and
+  `crates/tx-kernel/src/init/exec.rs` from raw `P::read_ns()` to a
+  `CoreInit::<P>::monotonic_now_ns()` helper backed by
+  `timekeeper_clock::<P>().monotonic_now_ns()` through the `ClockRead` facade.
+  Added an `xtask` regression test that keeps those boot/reactor bodies from
+  reintroducing raw monotonic reads. This slice intentionally leaves
+  `init/net.rs` in the network lane and leaves `P::set_deadline_ns`,
+  `P::cancel_deadline`, and `current_timer_wheel` for the Package F reactor
+  driver boundary. Verification: `cargo test -p xtask
+  kernel_boot_reactor_bodies_use_time_facade_for_monotonic_reads --
+  --nocapture` failed before the migration and passed after it; `cargo check
+  -p tx-kernel` passed; `cargo test -p tx-kernel --lib
+  boot_smoke_mounts_root_and_dev_and_resolves_console -- --nocapture` passed;
+  `cargo xtask lint invariants time-layering` passed report-only and dropped
+  from 131 to 124 findings (raw HAL time trait/callsite 112 -> 105, raw
+  `TimerWheel` bridge still 19); `cargo xtask lint invariants
+  time-wake-retired` still reports zero retired sites. The timer subsystem
+  design document now records this checkpoint and current lint snapshot.
+
+- 2026-07-10 (ipc/signal wait-timeout clock-read facade body migration).
+  Continued the timer subsystem migration by moving
+  `crates/tx-shims/src/linux_syscall/ipc.rs` `semtimedop` relative-timeout
+  deadline calculation and `crates/tx-shims/src/linux_syscall/signal.rs`
+  sigsuspend/sigtimedwait monotonic reads from raw `P::read_ns()` /
+  `<P as MonotonicCounterIf>::read_ns()` to
+  `timekeeper_clock::<P>().monotonic_now_ns()` through the `ClockRead` facade.
+  Added an `xtask` regression test that keeps these wait-timeout bodies from
+  reintroducing raw monotonic reads. This slice intentionally leaves
+  `signal.rs` `P::set_deadline_ns` as Package E/F deadline-registration driver
+  work. Verification: `cargo test -p xtask
+  ipc_and_signal_wait_timeout_bodies_use_time_facade_for_monotonic_reads --
+  --nocapture` failed before the migration and passed after it; `cargo test -p
+  tx-shims --lib ipc_dispatch -- --nocapture` passed 16/16; `cargo test -p
+  tx-shims --lib sigtimedwait_dispatch -- --nocapture` passed 7/7; `cargo
+  check -p tx-shims` passed; `cargo xtask lint invariants time-layering`
+  passed report-only and dropped from 136 to 131 findings (raw HAL time
+  trait/callsite 117 -> 112, raw `TimerWheel` bridge still 19); `cargo xtask
+  lint invariants time-wake-retired` still reports zero retired sites. The
+  timer subsystem design document now records this checkpoint and current lint
+  snapshot.
+
+- 2026-07-10 (io poll/select clock-read facade body migration).
+  Continued the timer subsystem migration by moving
+  `crates/tx-shims/src/linux_syscall/io.rs` timerfd readiness checks,
+  `sleep_timeout_ns`, ppoll/pselect deadline calculation and deadline checks,
+  TTY VTIME deadline calculation, and pselect wait helpers from raw
+  `P::read_ns()` / `<P as MonotonicCounterIf>::read_ns()` to
+  `timekeeper_clock::<P>().monotonic_now_ns()` through the `ClockRead` facade.
+  Added an `xtask` regression test that keeps `io.rs` body-level raw
+  monotonic reads from returning while leaving the existing platform-generic
+  bounds as tracked Package B/F migration debt. Verification:
+  `cargo test -p xtask io_syscall_timeout_body_uses_time_facade_for_monotonic_reads -- --nocapture`
+  failed before the migration and passed after it; `cargo test -p tx-shims
+  --lib fd_ops_wave3 -- --nocapture` passed 18/18; `cargo test -p tx-shims
+  --lib timerfd_dispatch -- --nocapture` passed 6/6; `cargo check -p
+  tx-shims` passed; `cargo xtask lint invariants time-layering` passed
+  report-only and dropped from 146 to 136 findings (raw HAL time trait/callsite
+  127 -> 117, raw `TimerWheel` bridge still 19); `cargo xtask lint invariants
+  time-wake-retired` still reports zero retired sites. The timer subsystem
+  design document now records this checkpoint and current lint snapshot.
+
+- 2026-07-10 (epoll clock-read facade body migration).
+  Continued the timer subsystem migration by moving
+  `crates/tx-shims/src/linux_syscall/epoll.rs` ready-scan and timeout/deadline
+  monotonic clock reads from direct `P::read_ns()` to
+  `timekeeper_clock::<P>().monotonic_now_ns()` through the `ClockRead` facade.
+  The syscall/helper signatures still carry `P: MonotonicCounterIf +
+  DeadlineTimerIf`; this slice only retires body-level raw reads. Verification:
+  `cargo test -p tx-shims --lib epoll_dispatch` passed 9/9 before and after the
+  migration; `cargo check -p tx-shims` passed; `cargo xtask lint invariants
+  time-layering` passed report-only and dropped from 150 to 146 findings
+  (raw HAL time trait/callsite 131 -> 127, raw `TimerWheel` bridge still 19).
+  The timer subsystem design document now records this checkpoint and current
+  lint snapshot.
+
+- 2026-07-10 (posix timer clock-read facade body migration).
+  Continued the timer subsystem migration by adding focused POSIX timer
+  dispatch coverage and moving `crates/tx-shims/src/linux_syscall/posix_timer.rs`
+  monotonic clock reads from direct `P::read_ns()` to
+  `timekeeper_clock::<P>().monotonic_now_ns()` through the `ClockRead` facade.
+  The slice intentionally leaves `P::set_deadline_ns` in `timer_settime`; that
+  is Package E deadline-registration work and needs `DeadlineRegistrar`, not a
+  clock-read-only patch. The new
+  `crates/tx-shims/src/linux_syscall/tests/posix_timer_dispatch.rs` test covers
+  `timer_create`, `timer_settime`, `timer_gettime`, `timer_getoverrun`, and
+  `timer_delete` over the syscall dispatch path. Verification:
+  `cargo test -p tx-shims --lib posix_timer_dispatch` passed 1/1;
+  `cargo check -p tx-shims` passed; `cargo xtask lint invariants
+  time-layering` passed report-only and dropped from 153 to 150 findings
+  (raw HAL time trait/callsite 134 -> 131, raw `TimerWheel` bridge still 19).
+  The timer subsystem design document now records this checkpoint and current
+  lint snapshot.
+
+- 2026-07-10 (timerfd clock-read facade body migration).
+  Continued the timer subsystem migration by moving the Linux timerfd syscall
+  body's monotonic clock reads in `crates/tx-shims/src/linux_syscall/timerfd.rs`
+  from direct `timekeeper().monotonic_now_ns::<P>()` calls to
+  `timekeeper_clock::<P>().monotonic_now_ns()` through the `ClockRead` facade.
+  Also fixed the current `time.rs` compile break by inlining the same facade
+  read in `sys_times` instead of calling a missing helper. The timerfd syscall
+  signatures still carry `P: MonotonicCounterIf + DeadlineTimerIf`; the
+  `time-layering` report therefore remains at 153 findings rather than
+  decreasing, but the timerfd body no longer performs direct monotonic
+  timekeeper reads. Updated the timer subsystem design document to record this
+  slice and to clarify that this stage proves body migration plus lint
+  non-regression, not generic-bound retirement. Verification:
+  `cargo test -p tx-shims --lib timerfd_dispatch -- --nocapture` passed 6/6;
+  `cargo test -p tx-shims --lib time_syscalls -- --nocapture` passed 22/22;
+  `cargo check -p tx-shims` passed; `cargo xtask lint invariants
+  time-layering` passed report-only with 153 findings.
+
+- 2026-07-10 (timer subsystem complete design document).
+  Expanded `docs/stage2-documents/time_infra/TX_TIMER_SUBSYSTEM_DESIGN_CN.md`
+  from the initial facade/migration sketch into the full timer subsystem
+  implementation design. The document now states the design-vs-implementation
+  completion rule, current migration checkpoint, exact `tx-services::time`
+  facade signatures, module ownership matrix, Package A-H execution order,
+  `TimerGuard` / wait-timeout / SMP wake state machines, interface stability
+  classes, review rules, verification matrix, and v1 deferred feature slots.
+  It also corrects the current `time-layering` report snapshot to 153
+  migration findings after the Linux time syscall clock-read facade slice.
+  This is documentation closeout only; producer migrations, reactor
+  current-wheel retirement, RTC typed route convergence, and hard lint ratchet
+  remain implementation work.
+
+- 2026-07-10 (linux time syscall clock-read facade migration).
+  Migrated the non-network Linux time syscall clock-read path in
+  `crates/tx-shims/src/linux_syscall/time.rs` to the new `ClockRead` facade.
+  `realtime_ns`, `clock_gettime`, `gettimeofday`, `times`, nanosleep remaining
+  time calculations, itimer polling, and adjacent monotonic-now reads now call
+  `timekeeper_clock::<P>().{realtime_now_ns,monotonic_now_ns}` instead of
+  calling `timekeeper().*_now_ns::<P>()` directly. The wrapper functions still
+  carry `P: MonotonicCounterIf` bounds because the broad syscall dispatch is
+  still platform-generic, so `time-layering` remains at 153 report-only
+  findings (134 raw HAL time trait/callsite, 19 raw `TimerWheel` or
+  current-wheel bridge). This is still useful migration progress because the
+  producer body now depends on the facade behavior; the remaining report item
+  is the generic platform binding, not direct clock reads inside the body.
+  Verification: `cargo check -p tx-shims` passed; `cargo test -p tx-shims
+  --lib time_syscalls -- --nocapture` passed 22/22; `cargo xtask lint
+  invariants time-layering` passed in report-only mode; `cargo xtask lint
+  invariants time-wake-retired` still reports zero retired sites.
+
+- 2026-07-10 (timekeeper facade bridge).
+  Wired the new `tx-services::time` facade into the existing wall-clock
+  implementation without introducing a `tx-services -> tx-subsystems`
+  dependency cycle. `tx-subsystems` now depends on `tx-services`, and
+  `wall_clock.rs` exposes `TimekeeperClock<P>` / `timekeeper_clock<P>()` as the
+  platform-bound adapter implementing `ClockRead`, `RealtimeControl`, and
+  `VvarPublisher` over the existing `TimekeeperIf`. The facade maps
+  `RealtimeSetPolicy` to the current writeback policy and surfaces
+  `RealtimeSetPolicy::Required` persistent-clock failures as `TimeError`.
+  Focused tests were added for facade clock reads, realtime mutation,
+  persistent writeback, and VVAR publication. `time-layering` now treats
+  `crates/tx-subsystems/src/wall_clock.rs` as the transitional Timekeeper
+  implementation allowlist so the bridge does not increase migration-debt
+  counts. Verification: `cargo check -p tx-services -p tx-subsystems` passed
+  with the existing unrelated net `guard` warning; `cargo xtask lint
+  invariants time-layering` passed in report-only mode. Attempted
+  `cargo test -p tx-subsystems --lib wall_clock -- --nocapture` is still
+  blocked before wall-clock tests run by existing net test imports of retired
+  TCP loopback helper names, so no subsystem lib-test success is claimed for
+  this slice.
+
+- 2026-07-10 (time service facade and layering lint skeleton).
+  Implemented the first code slice from the timer subsystem design. Replaced
+  the inline `tx_services::time {}` stub with a real `crates/tx-services/src/time/`
+  module tree exposing consumer-split facade traits and types:
+  `ClockRead`, `RealtimeControl`, `VvarPublisher`, `DeadlineRegistrar`,
+  `DeadlineRegistrarHandle`, `TimerRole`, `TimerTarget`, `ReactorTimeDriver`,
+  `RtcDeviceOps`, `ClockId`, `DeadlineNs`, and `TimeError`. The deadline
+  facade wraps the existing wake-substrate `TimerRegistrarHandle` without
+  exposing `TimerWheel`; `time::platform` is now the intended allowlist home
+  for direct HAL time trait calls and RTC typed-device adapters. Added
+  `cargo xtask lint invariants time-layering` as a report-only gate. Its
+  current report lists 188 production migration sites: 169 raw HAL time
+  trait/callsite sites and 19 raw `TimerWheel` or current-wheel bridge sites.
+  Verification: `rustfmt --edition 2021` on touched Rust files passed;
+  `cargo check -p tx-services` passed; `cargo check -p xtask` passed;
+  `cargo xtask lint invariants time-layering` passed in report-only mode;
+  `cargo xtask lint invariants time-wake-retired` still reports zero retired
+  sites. Next step: wire `ClockRead`/`RealtimeControl` to the existing
+  `TimekeeperIf` without creating a `tx-services -> tx-subsystems` dependency
+  cycle, then migrate a small non-network producer to the facade.
+
+- 2026-07-10 (timer subsystem facade and layering design).
+  Added `docs/stage2-documents/time_infra/TX_TIMER_SUBSYSTEM_DESIGN_CN.md` as
+  the timer-subsystem implementation design companion to the broader
+  time/wake documents. The new document summarizes the current migration
+  state, target topology, `tx-services::time` facade layout, consumer-split
+  interfaces (`ClockRead`, `RealtimeControl`, `DeadlineRegistrar`,
+  `ReactorTimeDriver`, `RtcDeviceOps`), handle versus token/guard ownership,
+  producer migration packages, and the proposed `time-layering` invariant
+  lint. The time-infra README now links this document. This is documentation
+  design work only; no Rust migration or linter implementation was changed in
+  this slice. Next step: add the `tx-services::time` facade skeleton and a
+  report-only `time-layering` lint before moving producer code.
+
+- 2026-07-10 (time-stack retired wrapper cleanup).
+  After confirming the time-stack libctest failures were resolved or
+  user-payload-owned, removed two obsolete time-stack remnants: the unused
+  private `REALTIME_EPOCH_BASE_NS` duplicate in the Linux time syscall shim and
+  the legacy no-post `timerfd_settime` convenience wrapper in the timerfd
+  subsystem. Timerfd tests now call `timerfd_settime_with_flags_and_post`
+  explicitly with the direct mailbox post closure, matching the production
+  post-injection path. `TimerWheel` and reactor current-wheel plumbing were
+  audited but not removed because they are still active in reactor wait,
+  runtime, thread future, and agent-token timeout paths. Verification:
+  `cargo check -p tx-subsystems -p tx-shims`, `cargo test -p tx-shims --lib
+  time_syscalls -- --nocapture`, and `cargo test -p tx-shims --lib
+  timerfd_dispatch -- --nocapture` passed. `cargo test -p tx-subsystems --lib
+  timerfd -- --nocapture` is blocked before timerfd tests run by existing net
+  test imports of retired TCP loopback helper names; that is a separate
+  network-test compile cleanup and was not broadened into this slice.
+
+- 2026-07-09 (time/wake non-network retired-interface audit).
+  Honored the current scope restriction that the network stack is excluded from
+  this slice. The non-network time/wake retired-interface audit found no
+  callable active Rust old-interface sites outside
+  `crates/tx-subsystems/src/net/**` and syscall socket paths. Verification:
+  `cargo xtask lint invariants time-wake-retired` passed with zero retired
+  sites; the focused non-network grep for retired producer names over `crates`
+  and `boards` reported only `step_ingest` documentation/test text and the
+  active module re-export of `step_ingest_with_post`, not a callable old
+  wrapper. No network-stack implementation files were changed for this audit.
+  Remaining blockers are outside this scoped pass: any intentionally deferred
+  network-stack lane and the Package H external real-board or firmware-backed
+  RTC witness.
+
+- 2026-07-09 (time/wake implementation-level design detail).
+  Expanded the formal Chinese time/wake design document with implementation
+  detail sections for HAL time capabilities, Timekeeper, Timer Registry,
+  ActiveWait/StepOp timeout handling, WaitSource/TaskMailbox producer
+  publication, owner-aware wake, reactor timer driving, and the RTC typed
+  device route. The new sections include sub-architecture diagrams,
+  upper/lower interfaces, touched adjacent modules, global-to-local
+  traceability, and the minimum implementation contract for future slices. The
+  time-infra README now names these detail sections as part of the preferred
+  implementation/review entry. This is documentation closeout only; it does not
+  close the remaining producer implementation audit or Package H external
+  real-board or firmware-backed RTC witness.
+
+- 2026-07-09 (time/wake net device TX post injection).
+  Retired the old net device TX pending direct readiness wrappers from active
+  Rust. `step_process_device_tx_pending_with_post`,
+  `step_process_device_tx_pending_at_with_post`, and
+  `step_process_device_tx_pending_in_namespace_at_with_post` now carry UDP and
+  raw-ICMP send-space readiness through caller-injected mailbox-ref posts.
+  Namespace runtime and net delegate runtime pass their existing owner-aware
+  post hooks into device TX processing; no-context tests pass explicit direct
+  closures. The `time-wake-retired` linter now rejects the retired device TX
+  direct wrapper names, and a focused netdevice witness proves the injected
+  post closure is used for send-space readiness. Verification: active-Rust grep
+  for the retired exact device TX names over `crates/tx-subsystems/src`,
+  `crates/tx-shims/src`, `crates/tx-kernel/src`, and `boards` returned no
+  hits; touched-file `rustfmt --edition 2021 --check ...` passed; `cargo check
+  -p tx-subsystems -p tx-kernel -q` passed with existing unrelated warnings;
+  `cargo test -p tx-subsystems --lib
+  udp_device_tx_uses_injected_post_for_send_space -- --nocapture
+  --test-threads=1` passed; `cargo test -p tx-subsystems --lib
+  udp_device_tx_busy_keeps_datagram_for_retry -- --nocapture --test-threads=1`
+  passed; `cargo test -p tx-subsystems --lib
+  veth_pair_can_bridge_udp_between_isolated_namespace_socket_tables --
+  --nocapture --test-threads=1` passed; `cargo test -p tx-subsystems --lib
+  bridge_carries_udp_between_two_veth_namespaces -- --nocapture
+  --test-threads=1` passed; `cargo test -p xtask
+  lint_invariants_time_wake -- --nocapture` passed; `cargo xtask lint
+  invariants time-wake-retired` passed with zero retired sites. A mistaken
+  earlier filter `veth_pair_transmits_udp_between_namespaces` ran zero tests
+  and is not counted as evidence. Broader Package G producer audit and Package
+  H external real-board or firmware-backed RTC witness remain open.
+
+- 2026-07-09 (time/wake UDP/ICMP loopback post injection).
+  Retired the old UDP/ICMP loopback direct readiness wrappers from active
+  Rust. `step_process_loopback_udp_with_post`,
+  `step_process_loopback_udp_on_iface_with_post`,
+  `step_send_udp_loopback_kernel_bytes_with_post`,
+  `step_send_udp_loopback_kernel_bytes_on_iface_with_post`,
+  `step_process_loopback_icmp_with_post`, and
+  `step_process_loopback_icmp_on_iface_with_post` now carry socket readiness
+  publication through caller-injected mailbox-ref posts. The loopback pending
+  driver passes the same injected post into TCP, UDP, and ICMP processing, and
+  syscall UDP loopback send/finish paths inject
+  `SyscallCtx::post_mailbox_ref_event`. The `time-wake-retired` linter now
+  rejects the retired UDP/ICMP loopback direct wrapper names, and focused UDP
+  witnesses prove the injected post closure is used for recv readiness.
+  Verification: active-Rust grep for the retired exact UDP/ICMP loopback names
+  over `crates/tx-subsystems/src`, `crates/tx-shims/src`,
+  `crates/tx-kernel/src`, and `boards` returned no hits; touched-file
+  `rustfmt --edition 2021 --check ...` passed; `cargo check -p
+  tx-subsystems -p tx-shims -q` passed with existing unrelated warnings;
+  `cargo test -p tx-subsystems --lib
+  udp_loopback_connected_send_reaches_bound_receiver -- --nocapture
+  --test-threads=1` passed; `cargo test -p tx-subsystems --lib
+  udp_loopback_direct_send_kernel_bytes_reaches_receiver -- --nocapture
+  --test-threads=1` passed; `cargo test -p tx-subsystems --lib
+  loopback_pending_step_drives_udp_connected_datagram -- --nocapture
+  --test-threads=1` passed; `cargo test -p tx-subsystems --lib
+  loopback_pending_step_drives_raw_icmp_echo -- --nocapture --test-threads=1`
+  passed; `cargo test -p tx-shims --lib
+  dispatch_sendmsg_recvmsg_udp_loopback_round_trips_source_addr -- --nocapture
+  --test-threads=1` passed; `cargo test -p tx-shims --lib
+  dispatch_netperf_udp_rr_unconnected_sendto_recvfrom_round_trips --
+  --nocapture --test-threads=1` passed; `cargo test -p tx-shims --lib
+  dispatch_ping_socket_sendto_recvfrom_loopback_echo_reply -- --nocapture
+  --test-threads=1` passed; `cargo test -p xtask
+  lint_invariants_time_wake -- --nocapture` passed; `cargo xtask lint
+  invariants time-wake-retired` passed with zero retired sites. Broader
+  Package G producer audit and Package H external real-board or
+  firmware-backed RTC witness remain open.
+
+- 2026-07-09 (time/wake netlink send post injection).
+  Retired the old netlink route/xfrm/netfilter direct send wrappers from active
+  Rust. `netlink_route_send_with_post`,
+  `netlink_route_send_with_netns_resolver_and_post`,
+  `netlink_route_send_with_netns_resolvers_and_post`,
+  `netlink_xfrm_send_with_post`, and `netlink_netfilter_send_with_post` now
+  carry queued-response readability publication through caller-injected
+  mailbox-ref posts; syscall socket dispatch injects
+  `SyscallCtx::post_mailbox_ref_event`. The `time-wake-retired` linter now
+  rejects the old direct netlink send wrapper names, and a focused rtnetlink
+  witness proves the injected post closure is used for recv readiness.
+  Verification: `cargo check -p tx-subsystems -p tx-shims -q` passed with
+  existing unrelated warnings; `cargo test -p tx-subsystems --lib
+  rtnetlink_send_uses_injected_post_for_recv_readiness -- --nocapture
+  --test-threads=1` passed; `cargo test -p tx-subsystems --lib rtnetlink --
+  --nocapture --test-threads=1` passed 24/24; `cargo test -p tx-shims --lib
+  dispatch_netlink_route_sendto_recvfrom_returns_dump -- --nocapture
+  --test-threads=1` passed; `cargo test -p tx-shims --lib netlink_packet --
+  --nocapture --test-threads=1` passed 23/23; `cargo test -p xtask
+  lint_invariants_time_wake -- --nocapture` passed; `cargo xtask lint
+  invariants time-wake-retired` passed with zero retired sites. Broader
+  Package G producer convergence and Package H external real-board or
+  firmware-backed RTC witness remain open.
+
+- 2026-07-09 (time/wake complete design document).
+  Promoted
+  `docs/stage2-documents/time_infra/TX_TIME_WAKE_DESIGN_REVIEW_CN.md` from a
+  review entry into the formal complete Chinese time/wake design document. The
+  document now states the architecture-vs-implementation completion contract,
+  owner/interface/proof requirements, implementation slice map, PR split
+  order, retired-interface maintenance rules, and final delivery checklist.
+  The time-infra README now names it as the preferred implementation, review,
+  regression, and handoff entry. This is documentation closeout only; full
+  implementation completion still depends on remaining producer proof and the
+  Package H external real-board or firmware-backed RTC witness.
+
+- 2026-07-09 (rust line-count bloat investigation).
+  Fan-out read-only investigation of why the workspace is ~428k Rust lines.
+  Findings: honest first-party production is ~150k (~35%); the rest is tests
+  (~38%), vendored `external/` (~17%, smoltcp+rsext4 — exclude from our
+  metrics), and comments/docs (~10%). Compressible slack is ~15–20% of
+  first-party production, concentrated in net (netlink wire dup, v4/v6 twins,
+  per-protocol dispatch), linux_syscall (StepOp handler tail, dispatch guards),
+  the object-model pattern tax (zone plumbing, IPC triplication, 19 adapter
+  re-export blocks), and test scaffolding. tx-substrate, error plumbing, and
+  derives are NOT bloat sources. Two research notes written:
+  `docs/research/2026-07-09-rust-line-bloat-investigation.md` (overview) and
+  `docs/research/2026-07-09-object-model-pattern-tax.md` (deep dive with a
+  ranked ~2.5–3.2k-line reduction plan). No code changed; findings only.
+  Next step: none committed — if pursued, the `#[derive(ZoneAllocated)]` +
+  `linkme` auto-registration is the highest-leverage single item.
+
+- 2026-07-09 (time/wake net device IRQ post injection).
+  Retired the net device / virtio IRQ direct delegate-kick wrappers from active
+  Rust. `VirtioNetDevice` now exposes `handle_irq_with_post`,
+  `inject_rx_and_fire_poll_with_post_for_test_or_irq`, and
+  `complete_tx_and_fire_poll_with_post_for_test_or_irq`; raw virtio drivers and
+  `NetDeviceOps` now expose `poll_device_and_fire_with_post` /
+  `ack_interrupt_and_fire_with_post`. Tests pass explicit direct closures, and
+  the `time-wake-retired` linter now rejects the old `handle_irq`,
+  `poll_device_and_fire`, `ack_interrupt_and_fire`,
+  `inject_rx_and_fire_poll_for_test_or_irq`, and
+  `complete_tx_and_fire_poll_for_test_or_irq` names in active Rust. Verification:
+  `cargo test -p tx-subsystems --lib virtio_net_device_tests -- --nocapture
+  --test-threads=1` passed 7/7; `cargo test -p tx-kernel
+  fatal_signal_teardown_uses_injected_mailbox_post -- --nocapture
+  --test-threads=1` passed after removing a stale test import of the retired
+  signal helper name; `cargo check -p tx-subsystems -p tx-drivers -p tx-kernel
+  -q` passed with existing unrelated warnings; `cargo test -p xtask
+  lint_invariants_time_wake -- --nocapture` passed; `cargo xtask lint
+  invariants time-wake-retired` passed with zero retired sites. The attempted
+  `cargo test -p tx-kernel boot_net_runtime_delivers_virtio_rx_udp_to_socket`
+  filter ran zero tests in the current harness and was not counted as evidence.
+  Full implementation completion still requires the remaining producer audit and
+  Package H external real-board or firmware-backed RTC witness.
+
+- 2026-07-09 (time/wake net packet event post injection).
+  Moved the net delegate runtime's TCP/UDP/ICMP packet-dispatch readiness path
+  onto the caller-injected mailbox-ref seam. `step_process_network_events_in_namespace_at_with_post`
+  now carries a caller post closure through `NetworkPublish::publish_to_with_post`,
+  `drive_all_net_namespace_runtimes_at_with_post` gives namespace runtime packet
+  processing the same route, and `net_delegate_step_once` injects
+  `NetDelegateDriver::post_net_mailbox_ref_event` for both direct packet source
+  processing and per-namespace device packet processing. No-context wrappers
+  keep explicit direct closures. Verification: `cargo test -p tx-subsystems
+  --lib packet_event_step_uses_injected_post_for_socket_readiness --
+  --nocapture --test-threads=1` passed; `cargo test -p tx-subsystems --lib
+  net_delegate_step_once_rekicks_after_loopback_progress -- --nocapture
+  --test-threads=1` passed; `cargo test -p tx-subsystems --lib net_delegate --
+  --nocapture --test-threads=1` passed 20/20; `cargo check -p tx-subsystems -p
+  tx-kernel -q` passed with existing unrelated warnings; `cargo xtask lint
+  invariants time-wake-retired` passed with zero retired sites. Full
+  implementation completion still requires the broader producer audit and the
+  Package H external real-board or firmware-backed RTC witness.
+
+- 2026-07-09 (time/wake review design completeness pass).
+  Expanded the standalone Chinese review design document
+  `docs/stage2-documents/time_infra/TX_TIME_WAKE_DESIGN_REVIEW_CN.md` with the
+  missing implementation-review material: Linux/POSIX requirement traceability,
+  key timer/wait/task/RTC state machines, target interface blueprint,
+  producer migration catalog, end-to-end test matrix, and mandatory document
+  synchronization rules. This keeps the review entry self-contained for
+  implementation planning and code review. It is a design-document update only;
+  implementation completion still requires per-producer proof, the retired
+  interface gate, and the Package H external real-board or firmware-backed RTC
+  witness.
+
+- 2026-07-09 (time/wake net delegate runtime post injection).
+  Moved the net delegate runtime's loopback TCP readiness path onto the
+  caller-injected mailbox-ref post seam. `NetDelegateDriver` now exposes a
+  narrow post hook, `BootNetDelegateDriver<P>` injects
+  `post_mailbox_ref_event_with_hint_from_current_hart`, and
+  `step_process_loopback_pending_in_namespace_with_post` /
+  `step_process_loopback_tcp_with_post` carry that hook through lower
+  loopback publish targets. No-context tests keep the existing direct fallback
+  through the default trait method. Verification: `cargo test -p
+  tx-subsystems --lib net_delegate_step_once_rekicks_after_loopback_progress
+  -- --nocapture` passed; `cargo test -p tx-subsystems --lib net_delegate --
+  --nocapture --test-threads=1` passed 20/20; `cargo check -p tx-subsystems -p
+  tx-kernel -q` passed with existing unrelated warnings; `cargo xtask lint
+  invariants time-wake-retired` passed with zero retired sites. The parallel
+  `net_delegate` filter is still not good evidence because the tests share a
+  global delegate queue/epoch lock and can poison each other; use the
+  single-thread run for this focused proof. Full implementation completion
+  still requires the broader audit and Package H external real-board or
+  firmware-backed RTC witness.
+
+- 2026-07-09 (time/wake standalone complete design review doc).
+  Added `docs/stage2-documents/time_infra/TX_TIME_WAKE_DESIGN_REVIEW_CN.md`
+  as a standalone formal Chinese review document for the time/wake
+  architecture. It distills the accumulated stage2 design into problem
+  statement, goals/non-goals, global architecture, Linux mapping, module
+  contracts, end-to-end flows, SMP/future-stealing wake rules, data ownership,
+  error semantics, implementation packages, acceptance gates, and the reusable
+  VFS-to-HAL layering template. `README.md` and the cumulative Chinese design
+  now point to it as the preferred review entry. This is design-document work;
+  implementation completion still requires per-producer proof and the Package
+  H external real-board or firmware-backed RTC witness.
+
+- 2026-07-09 (time/wake deliver_posix_signal direct wrapper retirement).
+  Retired the old disposition-aware POSIX signal direct wrapper family from
+  active Rust. `deliver_posix_signal` and `DeliverSignalOp` remain only as
+  `time-wake-retired` lint patterns; active callers use
+  `deliver_posix_signal_with_post` and `DeliverSignalWithPostOp`. POSIX mq
+  send now exposes `step_mq_send_with_posts` so receiver-readiness
+  mailbox-ref publication and `mq_notify` weak signal-mailbox publication are
+  both caller-injected; syscall `mq_timedsend` passes
+  `SyscallCtx::post_mailbox_ref_event` and `SyscallCtx::post_mailbox_event`,
+  while no-context helpers retain explicit direct closures. Verification:
+  strict active-Rust grep for `deliver_posix_signal` / `DeliverSignalOp` over
+  `crates` and `boards` returned no hits, and `cargo xtask lint invariants
+  time-wake-retired` passed with zero retired sites before this progress
+  catch-up. Full implementation completion still requires the broader
+  requirement-by-requirement audit and the external Package H real-board or
+  firmware-backed RTC witness gap remains open.
+
+- 2026-07-09 (time/wake complete design document review edition).
+  Added a formal review-edition complete design section to
+  `docs/stage2-documents/time_infra/TX_TIME_WAKE_DESIGN_CN.md`. New section
+  44 restates the time/wake architecture as a standalone design document:
+  summary, problem statement, goals/non-goals, global architecture, HAL /
+  timekeeper / timer registry / wait-source / RTC module designs, end-to-end
+  control flows, data model, SMP concurrency rules, error semantics,
+  implementation package plan, and acceptance criteria. This is a design-doc
+  delivery update only; it does not claim implementation-complete status or
+  close the remaining Package H external real-board/firmware RTC witness gap.
+
+- 2026-07-09 (time/wake step_kill_pgrp dual-post compile fix).
+  Fixed the process-group signal dual-post migration blocker by moving the
+  internal fanout loops in `step_kill_pgrp_with_posts` and
+  `script_kill_pgrp_with_guard_and_posts` onto private dyn-post helpers. The
+  public `_with_post` / `_with_posts` API shape is unchanged, but the loops no
+  longer recursively reborrow generic `FnMut` parameters and therefore avoid
+  the E0275 recursion-overflow compile failure. Verification so far:
+  `rustfmt --check --edition 2021 --config skip_children=true
+  crates/tx-subsystems/src/signal/mod.rs` passed; `cargo test -p
+  tx-subsystems --lib signal -- --nocapture` passed 103 filtered signal tests;
+  `cargo test -p tx-subsystems --lib process -- --nocapture` passed 148
+  filtered process tests earlier in this slice; `cargo test -p tx-subsystems
+  typed_session_pgrp -- --nocapture` passed the 22 target lib tests and the
+  remaining integration harnesses filtered to zero tests; `cargo check -p
+  tx-subsystems -p tx-shims -p tx-kernel -q` passed with existing unrelated
+  warnings; `cargo xtask lint invariants time-wake-retired` passed with zero
+  retired sites. This restores the step-kill-pgrp retirement slice to a
+  buildable state; broader implementation completion still requires the full
+  requirement-by-requirement audit and the external Package H real-board or
+  firmware-backed RTC witness gap remains open.
+
+- 2026-07-09 (time/wake full design document executable contract).
+  Extended the Chinese complete time/wake design handoff with an executable
+  end-to-end contract section. `TX_TIME_WAKE_DESIGN_CN.md` now closes the path
+  from Linux-visible requirements to Tx control planes, module interface
+  contracts, implementation slice definitions, final acceptance package, and
+  document-maintenance rules. This is still design-document work only: it
+  strengthens the review and implementation contract, but implementation
+  completion still depends on current per-producer proof, the
+  `time-wake-retired` gate, and the external Package H real-board or
+  firmware-backed RTC witness gap.
+
+- 2026-07-09 (time/wake step_kill_pgrp direct wrapper retirement).
+  Retired the bare process-group signal helper and StepOp names from active
+  Rust. `step_kill_pgrp` and `KillPgrpOp` are now part of the
+  `time-wake-retired` gate; process-group signal delivery is exposed through
+  `step_kill_pgrp_with_post` / `step_kill_pgrp_with_posts` and
+  `KillPgrpWithPostOp`. Session-leader hangup cascades and syscall
+  `kill(0, sig)` now use the dual-post process-group route, so signal-task
+  mailbox posts and signalfd/readiness mailbox-ref posts can both be injected
+  by the caller. This improves Package G signal producer retirement evidence;
+  it does not close the external Package H real-board or firmware-backed RTC
+  witness gap.
+
+- 2026-07-09 (time/wake process group-exit design sync).
+  Synchronized the complete time/wake design handoffs with the current
+  process group-exit caller-posting shape. The Chinese and English stage2
+  design documents now state that group-exit paths use
+  `step_exit_group_with_posts` / `step_exit_group_with_signal_with_posts` so
+  signal-task mailbox posts and exit-source mailbox-ref posts are both
+  caller-injected; no-context tests must pass explicit direct closures for
+  both post roles. The design-level regression grep now rejects the retired
+  `step_exit_group` and `step_exit_group_with_signal` names alongside the
+  existing signal/signalfd/process wait retired names. This is a document and
+  review-contract sync; full implementation completion still requires the
+  broader requirement-by-requirement audit and the external Package H
+  real-board or firmware-backed RTC witness gap remains open.
+
+- 2026-07-09 (time/wake complete design document closure).
+  Completed the Chinese time/wake design handoff as a reviewable design
+  document by adding a normative-anchor index and document synchronization
+  rule to `TX_TIME_WAKE_DESIGN_CN.md`. The document now explicitly ties the
+  reader-facing architecture to `TIME_WAKE_v1.md`, Txv3 yield/step invariants,
+  HAL/device docs, the `time-wake-retired` lint, focused tests, QEMU/board
+  witnesses, and progress closeout. This is a design-document closure only:
+  implementation completion still depends on per-producer proof, the retired
+  interface gate, and the external Package H real-board or firmware RTC
+  witness gap.
+
+- 2026-07-09 (time/wake SysV msgctl direct wrapper retirement).
+  Retired the remaining SysV message-control direct wrappers from the Package G
+  IPC row. `step_msgctl` and `step_msgctl_in_ns` were still public no-context
+  wrappers even though `IPC_RMID` publishes sender/receiver abort wakes; callers
+  now use `step_msgctl_with_post` / `step_msgctl_in_ns_with_post` and tests pass
+  explicit direct mailbox-ref post closures. The `time-wake-retired` linter now
+  rejects `step_msgctl` and `step_msgctl_in_ns` in both the SysV msg scoped group
+  and the strict active-Rust old-name residue group. Verification: the new gate
+  first failed with 25 retired sites, then passed after the wrapper removal;
+  strict grep for `step_msgctl(` / `step_msgctl_in_ns(` returned no hits;
+  `cargo test -p tx-subsystems sysv_msg -- --nocapture` passed the six filtered
+  SysV msg lib tests; `cargo test -p xtask lint_invariants_time_wake -- --nocapture`
+  passed. This improves Package G IPC retirement evidence but does not close the
+  external Package H real-board or firmware-backed RTC witness gap.
+
+- 2026-07-09 (time/wake DelegateRegistry old-name residue gate).
+  Tightened the DelegateRegistry retirement slice from callable API removal to
+  active-Rust zero-residue enforcement. The `time-wake-retired` linter's
+  global old-name residue scan now rejects `mark_replied`, `mark_timed_out`,
+  `mark_canceled`, `mark_agent_died`, and `mark_endpoint_died` anywhere under
+  `crates` / `boards`, including comments and test strings; active Rust prose
+  now describes the delegate reply/timeout/cancel/agent-death/endpoint-death
+  transition roles instead of preserving the retired callable names. Verification:
+  strict active-Rust grep for the five retired names returned no hits;
+  `cargo test -p xtask lint_invariants_time_wake -- --nocapture` passed;
+  `cargo xtask lint invariants time-wake-retired` passed with zero retired
+  sites. This improves Package G zero-residue evidence but does not close the
+  external Package H real-board or firmware-backed RTC witness gap.
+
+- 2026-07-09 (time/wake DelegateRegistry direct wrapper retirement).
+  Retired the public delegate token direct transition wrappers from active
+  Rust. `DelegateRegistry` now exposes reply, timeout, cancel, agent-death,
+  and endpoint-death transitions only through the caller-posting
+  `mark_*_with_post` surface; no-context substrate/reactor tests and the
+  `AgentTokenGuard` drop cleanup pass explicit direct mailbox-post closures,
+  while UFFD ioctl reply paths inject `SyscallCtx::post_mailbox_event` so
+  scheduler-context callers can use the owner-aware route. The
+  `time-wake-retired` linter now has a delegate-registry group rejecting old
+  `mark_replied`, `mark_timed_out`, `mark_canceled`, `mark_agent_died`, and
+  `mark_endpoint_died` definitions or calls. Verification: direct method-call
+  grep over `crates`/`boards` now has only doc-comment mentions; function-def
+  grep over `agent.rs` has no hits; `cargo fmt --check -p tx-substrate -p
+  tx-reactor -p tx-subsystems -p tx-shims -p xtask` passed; `cargo check -p
+  tx-substrate -p tx-reactor -p tx-subsystems -p tx-shims -q` passed with the
+  known unrelated `step_connect.rs` and `tx_ext4_bridge.rs` warnings; focused
+  delegate, reactor delegate-timeout, and UFFD tests passed; `cargo test -p
+  xtask lint_invariants_time_wake -- --nocapture` and `cargo xtask lint
+  invariants time-wake-retired` passed with zero retired sites. This improves
+  the Package G retired-interface proof but does not close the external
+  Package H real-board or firmware-backed RTC witness gap.
+
+- 2026-07-09 (time/wake step_kill_process direct wrapper retirement).
+  Retired the bare process-directed signal kill helper name from active Rust
+  and made it part of the `time-wake-retired` mechanical gate. No-context
+  signal, signalfd, eligibility, and interrupt-wake tests now call
+  `step_kill_process_with_post` / `step_kill_process_with_posts` through
+  explicit direct mailbox-post closures instead of importing or documenting a
+  public direct `step_kill_process` wrapper. Active Rust comments and test
+  text were scrubbed so strict old-name residue scanning can reject the bare
+  name everywhere under `crates` and `boards`, and the active plus stage2
+  time/wake design documents now list it with the other retired signal direct
+  wrappers. Verification: strict `rg -n '\bstep_kill_process\b' crates boards
+  --glob '*.rs'` returned no hits; `cargo fmt --check -p tx-subsystems -p
+  tx-shims -p tx-substrate -p xtask` passed; `cargo check -p tx-subsystems -p
+  tx-shims -q` passed with the known unrelated `step_connect.rs` and
+  `tx_ext4_bridge.rs` warnings; `cargo test -p xtask
+  lint_invariants_time_wake -- --nocapture`, `cargo test -p tx-subsystems
+  --test v3_signalfd -- --nocapture`, `cargo test -p tx-subsystems --test
+  v3_signal_interrupt_wake -- --nocapture`, `cargo test -p tx-subsystems
+  --test v3_signal_eligibility -- --nocapture`, `cargo test -p tx-subsystems
+  --test v3_signal_mailbox -- --nocapture`, `cargo xtask lint invariants
+  time-wake-retired`, `cargo xtask lint docs`, and `cargo xtask progress
+  validate` passed. This does not close the remaining external Package H
+  real-board/firmware RTC witness gap.
+
+- 2026-07-09 (boot flow API spine at document top).
+  Reordered the active boot-flow design document around the agreed lightweight
+  Boot API. `BOOT_FLOW_v1.md` now opens with the `boot<P>()` /
+  `boot_main()` shape and uses the step function names as the document spine:
+  `collect_facts`, `init_platform_early`, `init_substrate`, `init_runtime`,
+  `init_semantic_world`, `parse_boot_config`, `mount_kernel_filesystems`,
+  `unpack_initramfs_if_present`, `apply_rootfs_policy`, `bind_init_io`,
+  `select_first_user`, `exec_first_user`, and `run_reactor`. The compile-time
+  use matrix and boot-setup lint policy are now described under
+  `parse_boot_config`, and the Tx/Linux comparison table is organized by Boot
+  API step rather than numbered phases. Verification: `cargo xtask lint docs`
+  passed with the existing seven stale-vocabulary warnings; `cargo xtask
+  progress validate` passed; and scoped `git diff --check` passed.
+
+- 2026-07-09 (time/wake wall_clock raw wrapper contract sync).
+  Synchronized the active and stage2 time/wake design documents with the
+  current `wall_clock` facade shape: public raw `wall_clock::*` runtime
+  wrappers and public `WallClock` are retired active interfaces, while
+  `TimekeeperIf` / `timekeeper()` is the only public semantic clock facade for
+  clock syscalls, VVAR publication, VFS timestamps, timerfd realtime
+  revalidation, and realtime mutation/writeback reporting. The English and
+  Chinese stage2 design handoffs now include the wall-clock raw-wrapper
+  tripwire in their complete-design regression checks, and the Chinese
+  requirement matrix adds the clock-facade anti-fork proof row. Verification:
+  wall-clock raw-wrapper strict grep returned no hits; `cargo test -p xtask
+  lint_invariants_time_wake -- --nocapture` passed; `cargo xtask lint
+  invariants time-wake-retired` passed with `0` retired sites; `cargo xtask
+  lint docs` passed with the existing seven retired-term stale-vocabulary
+  warnings; `cargo xtask progress validate` passed; and scoped `git diff
+  --check` passed. This does not close the remaining external Package H
+  real-board/firmware RTC witness gap.
+
+- 2026-07-09 (time/wake route_gewalt direct wrapper retirement).
+  Retired the remaining bare `route_gewalt` old-name surface from active Rust
+  and made the retirement mechanical. Signal Gewalt delivery now presents only
+  `route_gewalt_with_post` as the callable process-control helper; no-context
+  tests pass an explicit direct weak-mailbox post closure through that helper.
+  Active Rust comments, test names, and assertion messages were rewritten to
+  avoid the retired bare name, and `xtask/src/lint_invariants_time_wake.rs`
+  now rejects `route_gewalt` in both the signal helper group and the global
+  active-Rust old-name residue scan while preserving the negative
+  `route_gewalt_with_post` case. The active and stage2 time/wake design docs
+  now list `route_gewalt` in the human-readable retired-interface tripwires.
+  Verification: strict `rg -n '\broute_gewalt\b' crates boards --glob '*.rs'`
+  returned no hits; `cargo test -p tx-subsystems route_gewalt_with_post --
+  --nocapture` passed the two matching signal tests; `cargo test -p
+  tx-subsystems --test v3_signal_mailbox -- --nocapture` passed; `cargo fmt
+  --check -p tx-subsystems -p tx-kernel -p tx-substrate -p xtask` passed;
+  `cargo test -p xtask lint_invariants_time_wake -- --nocapture` passed;
+  `cargo xtask lint invariants time-wake-retired` passed with `0` retired
+  sites; `cargo xtask lint docs` passed with the existing retired-term
+  warnings; and `cargo xtask progress validate` passed. This slice does not
+  close the remaining external Package H real-board/firmware RTC witness gap.
+
+- 2026-07-09 (time/wake complete design document delivery).
+  Updated the Chinese stage2 time/wake design entry
+  `docs/stage2-documents/time_infra/TX_TIME_WAKE_DESIGN_CN.md` as the
+  complete design handoff for the current architecture. The document now opens
+  with a delivery summary that ties Linux-visible semantics, Tx owner rows,
+  interface/state contracts, producer migration rules, and retired-interface
+  proof gates together, so a reviewer can map a new time/wake feature or bug
+  to a semantic owner, lower interface, upper caller, wake route, no-context
+  fallback, and mechanical audit before touching code. This is a documentation
+  closeout; it does not claim implementation-complete status or close the
+  remaining external Package H real-board/firmware RTC witness gap.
+  Verification: `cargo xtask lint docs` passed with the existing seven
+  retired-term stale-vocabulary warnings, `cargo xtask progress validate`
+  passed, and scoped `git diff --check` passed for the time/wake design and
+  progress files.
+
+- 2026-07-08 (time/wake retired gate process-exit coverage).
+  Tightened the `time-wake-retired` mechanical gate after auditing the
+  Package G process-exit/signalfd row against the linter implementation.
+  `notify_child_zombified_with_post` was already the active process
+  child-zombie wake route, and active Rust had no old
+  `notify_child_zombified` calls, but the retired-name gate only rejected
+  `fire_exit_source`. `xtask/src/lint_invariants_time_wake.rs` now rejects the
+  old `notify_child_zombified` name in both the scoped signalfd/process group
+  and the global active-Rust residue scan, with a unit-test negative case for
+  `_with_post`. The active and stage2 time/wake docs now list the same
+  tripwire. Verification so far: strict `rg -n '\bnotify_child_zombified\b'
+  crates boards --glob '*.rs'` returned no hits; `cargo test -p xtask
+  lint_invariants_time_wake -- --nocapture` passed; and `cargo xtask lint
+  invariants time-wake-retired` passed with `0` retired sites.
+
+- 2026-07-08 (time/wake rv64 QEMU owner-wake witness refresh).
+  Refreshed the local RV64 QEMU Package H evidence after the completion audit.
+  `cargo xtask test smoke --target rv64-qemu --timeout-ms 60000` and
+  `cargo xtask test busybox-boot --target rv64-qemu --timeout-ms 60000` both
+  passed and observed `txkernel:qemu-riscv64-virt:boot:ok` plus
+  `txkernel:qemu-riscv64-virt:reactor:owner-wake:smp:ok`. This closes the
+  local RV64 QEMU owner-wake marker witness for the current tree; it does not
+  close the remaining external Package H blocker for real-board or
+  firmware-backed RTC evidence beyond QEMU/no-RTC profiles.
+
+- 2026-07-08 (time/wake completion audit and focused witness repair).
+  Continued the completion audit against the Package A-H and Package G
+  time/wake plan instead of treating the prior doc sync as sufficient. The
+  audit found two host focused tests whose failures came from parallel test
+  shared state rather than production semantics: `wall_clock` tests shared
+  `TEST_NS`, and `v3_timer_surface` device-callback tests shared
+  `DEVICE_TIMER_FIRES`. Both test groups now serialize access to those test
+  globals with test-local mutexes. Mechanical retirement remains green:
+  strict active-Rust grep for core old time/timer names returned no hits, and
+  `cargo xtask lint invariants time-wake-retired` passed with `0` retired
+  sites. Focused local witnesses passed for Timekeeper, TimerRegistry guard
+  lifecycle and device callbacks, owner-aware mixed/broad wake routing, time
+  syscalls, timerfd cancel/readiness, RTC ioctl/read/poll typed route, devfs
+  RTC event publication, RV64 goldfish RTC, LA64 LS7A RTC, m1dock no-RTC typed
+  unsupported behavior, kernel RTC IRQ publication, stat/statx, and
+  `utimensat` timestamp update. Remaining blocker is still external Package H
+  real-board or firmware-backed RTC evidence; local QEMU/host evidence is
+  present, but this workspace cannot manufacture that hardware-in-loop
+  witness.
+
+- 2026-07-08 (time/wake complete design gate sync).
+  Synchronized the active and stage2 time/wake design documents with the
+  current `time-wake-retired` linter after the final pipe/userfaultfd direct
+  wrapper retirement. `TIME_WAKE_v1.md`, `TX_TIME_WAKE_DESIGN.md`, and
+  `TX_TIME_WAKE_DESIGN_CN.md` now all state that reactor-local
+  `complete`/`arrive`/`ack`, pipe `step_read`/`step_write` plus
+  `ReadOp`/`WriteOp`, and userfaultfd `push_fault_msg` /
+  `fault_script_for_process` direct wrappers are retired; no-context callers
+  must pass explicit direct closures through the same `_with_post` seams. The
+  English stage2 appendix now includes the pipe and userfaultfd grep tripwires
+  alongside the canonical `cargo xtask lint invariants time-wake-retired`
+  gate. Audit result: Package G producer rows match the linter groups for all
+  explicitly retired direct wrapper families; futex, delegate, and RTC rows do
+  not overclaim total direct-path removal and remain modeled as explicit
+  caller-posting or device-state paths. Verification:
+  `cargo xtask lint invariants time-wake-retired` passed with `0` retired
+  sites; `cargo xtask lint docs` passed with the existing seven stale-vocabulary
+  warnings about retired terms; `cargo xtask progress validate` passed; and
+  scoped `git diff --check` passed for the changed time/wake design and
+  progress files.
+
+- 2026-07-08 (time/wake pipe/userfaultfd direct wrapper retirement).
+  Retired the remaining pipe and userfaultfd no-context direct wake wrapper
+  surfaces from active Rust. Pipe now exposes read/write readiness only through
+  `step_read_with_post` / `step_write_with_post`,
+  `ReadWithPostOp` / `WriteWithPostOp`, and
+  `ReadWithHintPostOp` / `WriteWithHintPostOp`; VFS and no-context tests pass
+  explicit direct mailbox-ref closures, while syscall paths select the
+  injected `SyscallCtx::mailbox_ref_post_with_hint` or an explicit direct
+  function at the construction site. Userfaultfd now exposes pending-fault
+  readability through `push_fault_msg_with_post` and
+  `fault_script_for_process_with_post`; `ProcessUfdDispatch` requires a
+  caller-provided post function and `UfdDispatchTarget` no longer carries a
+  hidden `Option` fallback. The `time-wake-retired` gate now rejects the old
+  pipe `step_read` / `step_write` wrappers, `ReadOp` / `WriteOp`, and old
+  userfaultfd `push_fault_msg` / `fault_script_for_process` wrappers plus the
+  old `ProcessUfdDispatch::new` and `fault_post: None/Some` fallback shape.
+  Verification: strict old-name greps returned no active Rust hits;
+  `cargo test -p tx-subsystems --test v3_pipe_waitsource -- --nocapture`,
+  `cargo test -p tx-subsystems --test v3_userfaultfd_e2e -- --nocapture`,
+  `cargo test -p tx-shims --lib
+  dispatch_epoll_pwait_reports_userfaultfd_pending_fault_readable --
+  --nocapture`, `cargo test -p tx-shims --test v3_userfaultfd_ioctl_reply --
+  --nocapture`, `cargo test -p xtask lint_invariants_time_wake --
+  --nocapture`, `cargo fmt --check -p tx-subsystems -p tx-shims -p xtask`,
+  and `cargo xtask lint invariants time-wake-retired` passed. A broader
+  `cargo test -p tx-subsystems --lib pipe -- --nocapture` run still has the
+  pre-existing gift accounting failure
+  `pipe_user_gift_read_copies_bytes_and_releases_gift`; the pipe wait-source
+  target that covers this interface change passed.
+
+- 2026-07-08 (time/wake Chinese complete design finalization).
+  Completed the Chinese time/wake design handoff document as a design-complete
+  artifact, without changing active Rust code. The update to
+  `docs/stage2-documents/time_infra/TX_TIME_WAKE_DESIGN_CN.md` adds the
+  final interface blueprint for HAL, `TimekeeperIf`, `TimerRegistrar` /
+  `TimerRegistry`, wait-source caller-posting, RTC device ops, `SyscallCtx`,
+  and worker injected-post seams; abstracts the reusable VFS-to-HAL layering
+  pattern through typed subsystem ops plus devfs/RNode projection; and records
+  the review posture that this is architecture-complete documentation, not a
+  claim that every implementation or board witness is complete. Verification:
+  `cargo xtask progress validate` passed, `cargo xtask lint docs` passed with
+  the existing retired-term stale-vocabulary warnings, and scoped
+  `git diff --check` passed for the changed docs/progress files.
+
+- 2026-07-07 (time/wake reactor-local direct wrapper retirement).
+  Retired the reactor-local no-context direct coordination wrappers
+  `Completion::complete`, `CountdownCompletion::arrive`, and
+  `SyncRendezvous::ack` from active Rust. Reactor-local coordination now
+  exposes only `complete_with_post`, `arrive_with_post`, and `ack_with_post`;
+  host/no-context tests pass explicit direct mailbox-ref closures, while
+  owner-aware tests continue to inject `Reactor::post_mailbox_ref_event_from_hart`.
+  The `time-wake-retired` gate now rejects old `complete`/`arrive`/`ack`
+  definitions and calls inside `crates/tx-reactor`, scoped narrowly to avoid
+  unrelated protocol ACK methods outside the reactor coordination package.
+  Verification: strict grep over `crates/tx-reactor` found no old method
+  definitions or calls; `cargo test -p tx-reactor --test completion --
+  --nocapture`, `cargo test -p tx-reactor --test sync_coord -- --nocapture`,
+  `cargo fmt --check -p tx-reactor -p xtask`, `cargo test -p xtask
+  lint_invariants_time_wake -- --nocapture`, and `cargo xtask lint
+  invariants time-wake-retired` passed. Remaining completion blocker for the
+  full objective is a final requirement-by-requirement audit against the
+  plan/design retired-interface matrix; no known default no-context wrapper
+  family remains from the explicit audit set.
+
+- 2026-07-07 (time/wake TTY direct ingest wrapper retirement).
+  Retired the TTY no-context direct `step_ingest` wrapper from active Rust.
+  TTY input publication now exposes only `step_ingest_with_post`; hardware
+  poll, pty write, StepOp wrappers, VFS/shim tests, and TTY host tests pass
+  explicit hint-aware direct closures when they do not have scheduler context,
+  while the kernel console path remains on the current-hart injected post
+  route. The `time-wake-retired` gate now rejects old `step_ingest(` function
+  definitions and calls without treating the module filename as an interface.
+  Verification: strict grep over `crates` and `boards` found no
+  `step_ingest(` active Rust calls or definitions; `cargo test -p
+  tx-subsystems --lib tty -- --nocapture`, `cargo test -p tx-subsystems
+  --test v3_tty_waitsource -- --nocapture`, `cargo test -p tx-subsystems
+  --lib vfs -- --nocapture`, `cargo test -p tx-shims --lib
+  dispatch_read_blocks_until_tty_input_then_returns_byte -- --nocapture`,
+  `cargo test -p tx-kernel dispatch_irq_routes_uart_rx_to_tty_deferred_ingest
+  -- --nocapture`, `cargo fmt --check -p tx-kernel -p tx-subsystems -p
+  tx-shims -p xtask`, `cargo test -p xtask lint_invariants_time_wake --
+  --nocapture`, and `cargo xtask lint invariants time-wake-retired` passed.
+  The focused runs still print the known vdso assembler stub, unrelated
+  `step_connect.rs` unused `guard`, `tx_ext4_bridge.rs` unused `Vec`, and
+  tx-kernel test-only dead-code warnings. Remaining explicit no-context
+  wrapper family in this audit lane is reactor-local `complete`/`arrive`/`ack`.
+
+- 2026-07-07 (time/wake SysV sem direct wrapper retirement).
+  Retired the SysV semaphore no-context direct wrappers from active Rust:
+  `step_semop`, `step_semop_v3`, `step_semctl`, `step_semctl_in_ns`, and
+  `step_sem_undo`. SysV sem now exposes the caller-posting seams
+  `step_semop_with_post`, `step_semop_v3_with_post`,
+  `step_semctl_with_post`, `step_semctl_in_ns_with_post`, and
+  `step_sem_undo_with_post`; tests, procfs setup, and the shim-internal
+  `SETALL` metadata query pass explicit direct or `SyscallCtx` mailbox-ref
+  post closures. Process exit paths now route SEM_UNDO changed-source wakes
+  through the existing process `wake_post` closure instead of falling back to
+  a direct mailbox post. The `time-wake-retired` gate now rejects all five old
+  SysV sem wrapper names in active Rust. Verification: strict grep over
+  `crates` and `boards` found no old SysV sem wrapper names; `cargo test -p
+  tx-subsystems --lib sysv_sem -- --nocapture`, `cargo test -p
+  tx-subsystems --lib sysv_sem_undo -- --nocapture`, `cargo test -p tx-fs
+  procfs_sysvipc_files_render_live_sysv_ipc_rows -- --nocapture`, `cargo test
+  -p tx-shims --lib dispatch_sysv_sem -- --nocapture`, `cargo fmt --check -p
+  tx-subsystems -p tx-shims -p tx-fs -p xtask`, `cargo test -p xtask
+  lint_invariants_time_wake -- --nocapture`, and `cargo xtask lint
+  invariants time-wake-retired` passed. The focused runs still print the known
+  vdso assembler stub, unrelated `step_connect.rs` unused `guard`, and
+  `tx_ext4_bridge.rs` unused `Vec` warnings. Remaining explicit no-context
+  wrapper families include TTY `step_ingest` and reactor-local
+  `complete`/`arrive`/`ack`.
+
+- 2026-07-07 (time/wake POSIX mq direct wrapper retirement).
+  Retired the POSIX mq no-context direct send/receive wrappers
+  `step_mq_send` and `step_mq_receive` from active Rust. POSIX mq production
+  syscalls already used `step_mq_send_with_post` /
+  `step_mq_receive_with_post` with `SyscallCtx::post_mailbox_ref_event`; the
+  remaining procfs fdinfo setup now passes an explicit direct mailbox post
+  closure through `step_mq_send_with_post`. The `time-wake-retired` linter now
+  rejects both old POSIX mq names in active Rust. Verification: strict grep
+  over `crates` and `boards` found no `step_mq_send` / `step_mq_receive`
+  hits; `cargo test -p tx-subsystems --lib posix_mq -- --nocapture`, `cargo
+  test -p tx-fs procfs_fdinfo_renders_posix_mq_attributes -- --nocapture`,
+  `cargo test -p tx-shims --lib mq -- --nocapture`, `cargo test -p xtask
+  lint_invariants_time_wake -- --nocapture`, `cargo fmt --check -p
+  tx-subsystems -p tx-fs -p xtask`, and `cargo xtask lint invariants
+  time-wake-retired` passed. The focused tests still print the known vdso
+  assembler stub, `tx-fs` unused `Vec` import, and unrelated
+  `step_connect.rs` unused `guard` warnings.
+
+- 2026-07-07 (time/wake VFS/RNode direct readiness wrapper retirement).
+  Retired the VFS/RNode no-context direct readiness wrappers
+  `fire_read_wait` and `fire_write_wait` from active Rust. RNode readiness now
+  exposes only `fire_read_wait_with_post` / `fire_write_wait_with_post`; the
+  VFS wait-source tests pass an explicit direct mailbox-ref closure through
+  the same helpers, and the `time-wake-retired` linter now rejects both old
+  names in active Rust. Verification: strict grep over `crates` and `boards`
+  found no `fire_read_wait` / `fire_write_wait` hits; `cargo test -p
+  tx-subsystems --test v3_vfs_waitsource -- --nocapture`, `cargo test -p
+  xtask lint_invariants_time_wake -- --nocapture`, `cargo fmt --check -p
+  tx-subsystems -p xtask`, and `cargo xtask lint invariants
+  time-wake-retired` passed. The focused subsystem test still prints the
+  known vdso assembler stub and unrelated `step_connect.rs` unused `guard`
+  warning.
+
+- 2026-07-07 (time/wake eventfd direct wrapper retirement).
+  Retired the eventfd no-context direct read/write wrappers
+  `step_eventfd_read` and `step_eventfd_write` from active Rust. Eventfd
+  production syscalls already injected `SyscallCtx::post_mailbox_ref_event`
+  through `step_eventfd_read_with_post` / `step_eventfd_write_with_post`;
+  subsystem tests and the StepOp wrappers now also use the `_with_post`
+  helpers with an explicit direct closure instead of a public direct wrapper.
+  The `time-wake-retired` linter now rejects both old eventfd names in active
+  Rust. Verification: strict grep over `crates` and `boards` found no
+  `step_eventfd_read` / `step_eventfd_write` hits; `cargo test -p
+  tx-subsystems eventfd -- --nocapture`, `cargo test -p tx-shims eventfd --
+  --nocapture`, `cargo test -p xtask lint_invariants_time_wake --
+  --nocapture`, `cargo fmt --check -p tx-subsystems -p xtask`, and
+  `cargo xtask lint invariants time-wake-retired` passed. The broad filtered
+  package tests still print the known vdso assembler stub, `tx-fs`
+  `tx_ext4_bridge.rs` unused import, and `step_connect.rs` unused `guard`
+  warnings.
+
+- 2026-07-07 (time/wake complete design spec expansion).
+  Expanded the Chinese complete time/wake design document into a fuller
+  implementation-ready spec. The new sections add a requirements traceability
+  matrix, cross-module invariants, key state machines, interface stability and
+  retirement policy, error/unsupported semantics, concurrency and lock-order
+  guidance, an end-to-end test matrix, and an implementation checklist. This is
+  a documentation/specification slice only; it does not change active Rust
+  interfaces or close the standing real-board/firmware RTC evidence blocker.
+
+- 2026-07-07 (time/wake timerfd direct wrapper retirement).
+  Retired the timerfd no-context direct wrappers `timerfd_settime_with_flags`
+  and `timerfd_clock_was_set` from active Rust. The syscall production path was
+  already using `timerfd_settime_with_flags_and_post` and
+  `timerfd_clock_was_set_with_post` through `SyscallCtx::post_mailbox_ref_event`;
+  timerfd host tests now pass explicit direct closures to those `_with_post`
+  helpers instead of calling public direct wrappers. `time-wake-retired` now
+  rejects both old timerfd names in active Rust, and the time/wake design
+  documents' manual grep tripwires include them. Verification so far:
+  strict grep over `crates` and `boards` found no
+  `timerfd_settime_with_flags` / `timerfd_clock_was_set` hits; `cargo test -p
+  tx-subsystems timerfd -- --nocapture`, `cargo test -p tx-shims timerfd --
+  --nocapture`, `cargo test -p xtask lint_invariants_time_wake --
+  --nocapture`, `cargo xtask lint invariants time-wake-retired`, and
+  `cargo fmt --check -p tx-subsystems -p xtask` passed. The focused tests
+  still print the known vdso assembler stub, `tx-fs` unused import, and
+  `step_connect.rs` unused `guard` warnings.
+
+- 2026-07-07 (time/wake socket readiness direct fallback retired).
+  Retired the public `direct_mailbox_post` helper from the network socket
+  readiness surface. Active net code now keeps no reusable direct mailbox
+  fallback helper; no-context callers use explicit `|mailbox, event|
+  mailbox.post(event)` closures through the existing `_with_post` readiness,
+  packet publish, and delegate seams. `time-wake-retired` now rejects
+  `direct_mailbox_post` in the socket/network readiness group and the full
+  active-Rust residue scan. Verification: strict grep over `crates` and
+  `boards` found no `direct_mailbox_post` hits; `cargo check -p tx-subsystems
+  -q`, `cargo test -p xtask lint_invariants_time_wake -- --nocapture`,
+  `cargo xtask lint invariants time-wake-retired`, and `cargo test -p
+  tx-subsystems net -- --nocapture --test-threads=1` passed. A first broad
+  `cargo test -p tx-subsystems net -- --nocapture` run failed because the net
+  tests share an epoch lock under parallel execution: after one `EADDRINUSE`,
+  the remaining failures were `PoisonError`; the single-thread rerun passed
+  all 253 net-filtered lib tests. The check still prints the pre-existing
+  unrelated `step_connect.rs` unused `guard` warning and the vdso assembler
+  stub warning.
+
+- 2026-07-07 (time/wake async-runtime design closure).
+  Expanded the Chinese complete time/wake design document with an explicit
+  async-runtime/reference section for timer management and future stealing.
+  The new section compares Linux-style hrtimer/wakeup, Tokio-like
+  multi-thread executors, dispatcher-based async loops, and embedded
+  executors, then maps their shared split to Tx's `TimerRegistrar`,
+  `TaskMailbox`, `WaitSource`, `ReactorOwnerWakePost`, and scheduler owner
+  re-resolution. It records the linearization point for post-steal wake,
+  rejected alternatives such as timer entries caching a hart, and a checklist
+  for future async producers. Verification: `cargo xtask lint docs` passed
+  with the existing stale-vocabulary warnings, and `git diff --check` passed
+  for the edited design document. No Rust code was changed in this slice.
+
+- 2026-07-07 (time/wake net delegate direct fallback retired).
+  Retired the public `net_delegate_direct_mailbox_post` helper from active
+  Rust. Net delegate no-context producers and tests now pass explicit
+  `|mailbox, event| mailbox.post(event)` closures through
+  `net_delegate_kick_{poll,tick}_with_post`, keeping fallback publication on
+  the same caller-posting helper instead of a reusable direct-post interface.
+  `time-wake-retired` now rejects the old helper name. Verification:
+  strict grep over `crates`/`boards` found no
+  `net_delegate_direct_mailbox_post` hits; `cargo test -p tx-subsystems
+  net_delegate -- --nocapture`, `cargo check -p tx-subsystems -q`,
+  `cargo xtask lint invariants time-wake-retired`, and `cargo fmt --check -p
+  tx-subsystems -p tx-drivers -p xtask` passed. The check still prints the
+  pre-existing unrelated `step_connect.rs` unused `guard` warning.
+
+- 2026-07-07 (time/wake delegate-timeout manual driver retired).
+  Retired the old public `TimerWheel::fire_due_delegate_timeouts` active Rust
+  interface. Delegate timeout tests now drive expiry through
+  `TimerRegistry::fire_due_with` plus a `TimerWakeRouter`, matching the
+  production reactor path; `time-wake-retired` now rejects the old helper name
+  in active `crates`/`boards` Rust. Verification:
+  `cargo test -p tx-substrate --test v3_agent_token_guard_timer --
+  --nocapture`, `cargo test -p tx-reactor --test v3_pr7b_timer_routing --
+  --nocapture`, `cargo test -p tx-reactor --test v3_timer_surface
+  timer_registry_routes_delegate_timeout_tokens_through_router -- --nocapture`,
+  `cargo test -p xtask lint_invariants_time_wake -- --nocapture`,
+  `cargo xtask lint invariants time-wake-retired`, strict retired-name grep
+  over `crates`/`boards`, `cargo fmt --check -p tx-substrate -p tx-reactor -p
+  xtask`, and `cargo xtask lint docs` passed.
+
+- 2026-07-07 (time/wake full retired-name residue gate).
+  Expanded the `time-wake-retired` active-Rust residue scan from the initial
+  high-risk direct-name subset to the full retired-name matrix: core
+  `TimeIf`/`TimerQueue`/`DeadlineFuture` names, old timer queue helpers,
+  signal/itimer wrappers, signalfd/process wrappers, socket/network verbs,
+  network delegate kicks, AIO/io_uring completion wrappers, RTC direct/raw
+  queue names, generic wait-source/page-backed direct notify names, and the
+  old test helper names. A strict grep over `crates` and `boards` for that
+  full matrix returned no hits. Verification: `cargo fmt --check -p xtask`,
+  `cargo test -p xtask lint_invariants_time_wake -- --nocapture`, and
+  `cargo xtask lint invariants time-wake-retired` passed with `0` retired
+  sites.
+
+- 2026-07-07 (time/wake old-name residue gate).
+  Strengthened `cargo xtask lint invariants time-wake-retired` so it now has a
+  second active-Rust residue scan over `crates` and `boards`. The original
+  gate still checks callable old interfaces with comment stripping; the new
+  pass also rejects raw-line mentions of the high-risk retired direct names
+  such as `post_signal`, `notify_v3_source`, `publish_rtc_event`,
+  `push_completion`, `push_cqe`, socket `fire_*`, and the old test helper
+  names. Verification: `cargo fmt --check -p xtask`, `cargo test -p xtask
+  lint_invariants_time_wake -- --nocapture`, strict active-Rust grep, and
+  `cargo xtask lint invariants time-wake-retired` all passed with zero retired
+  sites.
+
+- 2026-07-07 (time/wake old-name residue cleanup).
+  Removed misleading old direct-interface names from active Rust test helpers,
+  comments, and assertion text that were not callable old interfaces but made
+  manual audits noisy. Test helpers named `post_signal_for_test` and
+  `notify_process_signal_direct_for_test` were renamed to direct-post
+  descriptions, and explanatory comments now refer to catchable-signal posting
+  or `_with_post` wrappers rather than retired helper names. A strict active
+  Rust grep over `crates` and `boards` for the retired direct names now returns
+  no hits. Verification: focused signal/substrate/shim/script tests passed,
+  `cargo fmt --check -p tx-substrate -p tx-subsystems -p tx-shims -p
+  tx-scripts` passed, `cargo xtask lint invariants time-wake-retired` stayed at
+  `0` retired sites, and `cargo xtask progress validate` passed.
+
+- 2026-07-07 (time/wake retired-interface coverage audit).
+  Audited the `time-wake-retired` lint coverage against the design retired
+  interface matrix and active Rust. The lint now covers the named old
+  time/timer route, SysV sem direct notify, signalfd/process exit-source
+  direct wrappers, signal/itimer helpers, socket/network readiness verbs,
+  network delegate kicks, AIO/io_uring completion wrappers, RTC direct event
+  publish/raw queue access, generic v3 wait-source direct adapters,
+  page-backed direct notify, and concrete `TimerWheel` adapter imports. A
+  global callable/definition grep over `crates` and `boards` found no old
+  direct definitions or calls outside `_with_post` replacements and test helper
+  names. This tightens the evidence that the remaining gap is external
+  Package H RTC witness, not an unretired active interface.
+
+- 2026-07-07 (time/wake RTC witness audit and external blocker).
+  Refreshed the remaining Package H evidence audit. Current `xtask`
+  targets are `rv64-qemu`, `rv64-m1dock-mock`, and `la64-qemu`; the m1dock
+  profile is documented as a QEMU `virt` runner before real SPI MMIO or
+  hardware-in-loop is available, and no `xtask` flash/JTAG/probe-rs or
+  firmware-backed RTC runner is present in this checkout. Local evidence was
+  refreshed: RV64 QEMU goldfish persistent-clock tests, LA64 LS7A
+  persistent-clock tests, m1dock typed no-RTC tests, devfs RTC event tests,
+  shim RTC tests, and kernel RTC IRQ publication tests all passed. Standing
+  gates also passed: `cargo xtask lint invariants time-wake-retired`
+  reported `0` retired sites, `cargo xtask progress validate` passed, and
+  `cargo xtask lint docs` passed with the existing six retired-term warnings.
+  External blocker recorded: implementation completion cannot produce a
+  real-board or firmware-backed RTC witness from the current workspace until
+  hardware access or a firmware RTC backend/runner is added.
+
+- 2026-07-07 (time/wake complete design evidence sync).
+  Synchronized the complete time/wake design documents with the current
+  owner-aware SMP evidence. `TX_TIME_WAKE_DESIGN_CN.md`,
+  `TX_TIME_WAKE_DESIGN.md`, and `TIME_WAKE_v1.md` now state that RV64 QEMU
+  `smoke` and `busybox-boot` require `:reactor:owner-wake:smp:ok` in addition
+  to `:boot:ok`, while implementation completion still needs a real-board or
+  firmware-backed RTC witness beyond QEMU/no-RTC profiles. This is a design
+  documentation sync only; it does not reopen retired interfaces or change the
+  remaining external evidence boundary.
+
+- 2026-07-07 (rv64 QEMU owner-aware mixed-producer SMP witness).
+  Added a boot-time SMP owner-wake witness before userspace bootstrap. The BSP
+  submits an AP-owned parked reactor task, then from the non-owner hart wakes
+  it sequentially through wait-source publication, timer expiry, and delegate
+  reply. Each producer must route through the owner-aware reactor post path,
+  send a remote reschedule IPI, and let the AP re-poll the task before the next
+  stage advances. `cargo xtask test smoke --target rv64-qemu --timeout-ms
+  60000` and `cargo xtask test busybox-boot --target rv64-qemu --timeout-ms
+  60000` now require both `:boot:ok` and
+  `:reactor:owner-wake:smp:ok`; both passed. Focused host broad producer
+  stress, `cargo check -p tx-kernel -q && cargo check -p xtask -q`,
+  `cargo xtask lint invariants time-wake-retired`, and
+  `cargo xtask lint invariants boot-setup` passed. Remaining time/wake
+  implementation evidence: real-board/firmware RTC witness beyond QEMU/no-RTC
+  profiles.
+
+- 2026-07-07 (rv64 QEMU smoke and busybox boot evidence restored).
+  Restored the default RV64 QEMU smoke sentinel after the production boot path
+  stopped embedding a kernel-owned `/init` fixture. Root cause: `cargo xtask
+  test smoke` still booted `tx.profile=smoke` without initramfs or `init=`,
+  so the Linux-like path correctly skipped rootfs shims and then failed
+  bootstrap exec at missing `/init`. The smoke test lane now builds the
+  minimal `test-init` initramfs, QEMU smoke attaches it, and the cmdline
+  explicitly opts into `init=/tx-test-init tx.test_init=1`, keeping setup in
+  userspace instead of restoring a kernel fallback. Verification:
+  `cargo xtask test smoke --target rv64-qemu --timeout-ms 60000` observed
+  `:rootfs-shims:skip:test-init`, `:bootstrap-exec:path:/tx-test-init`,
+  `:bootstrap-exec:ok`, and `:boot:ok`; `cargo xtask test busybox-boot
+  --target rv64-qemu --timeout-ms 60000` still observed
+  `:rootfs-shims:skip:busybox`, `:bootstrap-exec:ok`, and `:boot:ok`; both
+  serial logs include `:smp:aps:online` and `:reactor:ap-runqueue:ok`.
+  `cargo test -p xtask qemu_smoke_command_captures_serial_without_block_image`
+  and `cargo test -p xtask la64_qemu_command_uses_la464_cpu_and_larger_memory`
+  passed; `cargo fmt --check -p xtask -p tx-kernel`,
+  `cargo xtask lint invariants time-wake-retired`, and
+  `cargo xtask lint invariants boot-setup` passed. Remaining time/wake
+  implementation evidence: real-board/firmware RTC witness and broader
+  QEMU/real-board mixed-producer stress beyond boot sentinels.
+
+- 2026-07-07 (busybox QEMU boot shim blocker closed).
+  Fixed the RV64 QEMU `busybox-boot` blocker that was preventing time/wake
+  SMP evidence collection. Root cause: `BootMode::Busybox` was still treated
+  as `LegacyKernelShims`, so boot populated `/bin/busybox ->
+  /musl/musl/busybox` before unpacking the busybox initramfs; the initramfs
+  regular `/bin/busybox` then collided with the stale symlink and bootstrap
+  exec followed a missing `/musl/musl/busybox` path. `busybox` boot mode now
+  uses `RootfsSetup::LinuxLike`, while OSComp/LTP/Test keep the legacy shim
+  path. Added a boot-plan regression assertion and synchronized the
+  boot-mode shim decision note. Verification: boot-plan focused tests passed,
+  initramfs busybox open witness passed, `cargo fmt --check -p tx-kernel`
+  passed, `cargo xtask test busybox-boot --target rv64-qemu --timeout-ms
+  60000` observed `:rootfs-shims:skip:busybox`, `:bootstrap-exec:ok`, and
+  `:boot:ok`, `cargo xtask lint invariants time-wake-retired` stayed at zero
+  retired sites, `cargo xtask progress validate` passed, `cargo xtask lint
+  docs` passed with the existing stale-vocabulary warnings, and scoped
+  `git diff --check` passed. Remaining time/wake implementation evidence:
+  real-board/firmware RTC witness and broader QEMU/real-board SMP stress are
+  still open.
+
+- 2026-07-07 (time/wake Chinese design document complete-detail pass).
+  Expanded
+  [`TX_TIME_WAKE_DESIGN_CN.md`](../stage2-documents/time_infra/TX_TIME_WAKE_DESIGN_CN.md)
+  from the existing Chinese design closure into the full detailed handoff
+  level: board modeling profiles, timekeeper boot seed/runtime mutation flows,
+  reactor-facing timer-driver interfaces, timer/wait-source convergence,
+  expanded data-structure ownership, Package A-H exit criteria, and an
+  appendix mapping live interfaces to code homes plus retired-interface
+  tripwire commands. This remains a documentation/design completion pass, not
+  implementation completion; real-board/firmware RTC witness and QEMU or
+  real-board SMP stress are still open evidence rows.
+
+- 2026-07-07 (time/wake Chinese design document full closure).
+  Completed the Chinese time/wake design document
+  [`TX_TIME_WAKE_DESIGN_CN.md`](../stage2-documents/time_infra/TX_TIME_WAKE_DESIGN_CN.md)
+  as a standalone implementation-review contract. The update adds a stable
+  complete table of contents, maintainer handoff workflow, remaining Package G
+  producer detailed design, explicit completeness boundaries, and v1 design
+  decisions while preserving `TIME_WAKE_v1.md` as the txdoc-tagged normative
+  contract. This is a documentation/design closure only: implementation
+  completion still requires the existing board/firmware RTC witness and
+  QEMU/real-board SMP stress evidence.
+
+- 2026-07-07 (time/wake broad owner-aware producer stress).
+  Added
+  `broad_owner_aware_producer_stress_routes_remote_wakes` in
+  `crates/tx-reactor/tests/reactor_smoke.rs`. The host test parks independent
+  tasks and wakes them from a non-owner hart through mailbox source events,
+  signal delivery, wait-channel publication, delegate timeout, device
+  wait-source timer callbacks, and device RawQueue timer callbacks. Each path
+  must produce exactly one owner-aware placement and one remote reschedule IPI
+  before the target hart re-polls and completes the task. Verification:
+  focused broad stress passed; adjacent `owner_aware` reactor-smoke group
+  passed; existing sequential mixed-producer witness passed; `cargo check -p
+  tx-reactor -q` passed; and `cargo xtask lint invariants time-wake-retired`
+  remained green. QEMU evidence is still not closed: RV64 `--smp 4`
+  smoke/busybox-boot reached `:smp:aps:online`, `:smp:shootdown:ok`,
+  `:smp:ipi:ok`, and reactor AP-runqueue markers, but both runs trapped before
+  the boot sentinel on current init path lookup (`/init` or `/bin/busybox`
+  `PathNotFound`); LA64 build was blocked by missing local
+  `tools/images/vendor/busybox-loongarch64-musl`. Next: fix or route around
+  the current QEMU init-image blocker before claiming QEMU SMP stress, and
+  still obtain real-board/firmware RTC evidence.
+
+- 2026-07-07 (time/wake board RTC profile witnesses).
+  Added focused m1dock mock no-RTC witnesses in
+  `boards/tx-hal-riscv64-m1dock-mock/src/lib.rs`: persistent-clock read,
+  set-time, set-alarm, clear-alarm, and alarm-IRQ ack now all return typed
+  `PersistentClockError::Unsupported`, and `IrqIf::RTC_IRQ` remains the zero
+  sentinel. Re-ran the existing RV64 QEMU goldfish and LA64 LS7A persistent
+  clock focused tests, plus board crate checks, formatting, and
+  `cargo xtask lint invariants time-wake-retired`. Next: implementation
+  completion still needs a real-board or firmware-backed RTC witness beyond
+  these host/QEMU/no-RTC profiles, plus broader QEMU/real-board SMP stress.
+
+- 2026-07-07 (time/wake Chinese design specification completion).
+  Expanded
+  [`TX_TIME_WAKE_DESIGN_CN.md`](../stage2-documents/time_infra/TX_TIME_WAKE_DESIGN_CN.md)
+  from a complete Chinese design entry into a standalone implementation-review
+  specification. The document now states delivery scope and completion states,
+  then carries the design through concrete code landing edges, Package G
+  producer migration catalog, package exit evidence, end-to-end acceptance
+  scenarios, failure-boundary triage, interface/code ownership maps, and final
+  non-negotiable design contract. Next: implementation completion still needs
+  board/firmware RTC witness evidence and broader QEMU/real-board SMP stress;
+  do not treat the document completion as implementation completion.
+
+- 2026-07-07 (time/wake mixed-producer owner-aware wake witness).
+  Added `mixed_producer_wakes_repeatedly_route_current_owner` in
+  `crates/tx-reactor/tests/reactor_smoke.rs`. The host test parks one task,
+  then wakes it sequentially via wait-source publication, timer expiry, and
+  delegate reply from a non-owner hart. Each step must report one owner-aware
+  placement, one remote reschedule IPI, target-hart queue visibility, and a
+  re-poll before the next producer fires. Verification: focused mixed-producer
+  test passed; adjacent owner-aware reactor-smoke groups passed with
+  `--test-threads=1`; `cargo check -p tx-reactor -q` passed; and
+  `cargo xtask lint invariants time-wake-retired` remained green. Next:
+  implementation completion still needs real-board/firmware RTC witnesses and
+  broader QEMU/real-board SMP stress beyond this host witness.
+
+- 2026-07-07 (time/wake retired-interface invariant gate).
+  Added `cargo xtask lint invariants time-wake-retired`, a scope-aware xtask
+  gate that encodes the retired time/wake active-interface matrix from
+  `TIME_WAKE_v1.md` and `TX_TIME_WAKE_DESIGN.md`. The rule rejects old broad
+  time/timer interfaces, direct signal/itimer/RTC/AIO/socket/net/page-backed
+  wake wrappers, raw RTC event queue access, and concrete TimerWheel adapter
+  imports while allowing the intended `_with_post` replacements. Verification:
+  `cargo fmt -p xtask`; `cargo check -p xtask -q`; and
+  `cargo xtask lint invariants time-wake-retired` passed with zero sites.
+  Next: keep this gate in the completion ladder before claiming the full
+  time/wake implementation complete.
+
+- 2026-07-07 (time/wake Chinese complete design entry).
+  Added
+  [`TX_TIME_WAKE_DESIGN_CN.md`](../stage2-documents/time_infra/TX_TIME_WAKE_DESIGN_CN.md)
+  as the Chinese complete design entry for the time/RTC/timer/wake-routing
+  architecture. It links the active `TIME_WAKE_v1.md` contract, the Linux
+  reference, module owner rows, sub-architecture diagrams, upper/lower
+  interfaces, producer migration rules, and acceptance gates into one
+  implementation-review document. Next: keep using `TIME_WAKE_v1.md` as the
+  normative txdoc contract and use the Chinese document for review and
+  handoff. Blockers remain implementation evidence, not document structure:
+  real-board/firmware RTC witnesses and broader SMP mixed-producer stress.
+
+- 2026-07-07 (Package G page-backed page-ready direct notify retirement).
+  Retired the page-backed adapter-level direct `notify_source` wrapper from
+  active Rust code. Page-ready publication now uses
+  `notify_page_ready_with_post` and adapter `notify_source_with_post`; the
+  existing no-reactor page-cache paths pass an explicit direct mailbox-post
+  closure through that same seam instead of calling `tx_substrate::wake::notify`
+  from the subsystem adapter. Verification: `cargo fmt -p tx-subsystems`;
+  `cargo test -p tx-subsystems page_backed -- --nocapture`; `cargo check -p
+  tx-subsystems -q`; and strict
+  `notify_source\(|tx_substrate::wake::notify\(` audit over page-backed,
+  shims, and kernel active Rust code passed. Existing unrelated warning
+  remains `step_connect.rs` unused `guard`.
+
+- 2026-07-07 (Package G generic v3 wait-source direct adapter retirement).
+  Retired the remaining old direct `notify_v3_source` adapter wrappers from
+  the already-migrated timerfd, pipe, and futex paths. These adapters now keep
+  only caller-posting `_with_post` / limit-with-post v3 publication routes, so
+  no-context callers must pass an explicit direct post closure and
+  scheduler-context callers can route upgraded mailboxes through the owner-aware
+  wake boundary. Verification: `cargo fmt -p tx-subsystems`;
+  `cargo test -p tx-subsystems timerfd -- --nocapture`;
+  `cargo test -p tx-subsystems pipe -- --nocapture`;
+  `cargo test -p tx-subsystems futex -- --nocapture`;
+  `cargo check -p tx-subsystems -q && cargo check -p tx-shims -q`;
+  `cargo fmt --check -p tx-subsystems -p tx-shims`; and strict
+  `pub fn notify_v3_source|\bnotify_v3_source\(` audit across active Rust code
+  passed. Existing unrelated warnings remain `step_connect.rs` unused `guard`
+  and `tx_ext4_bridge.rs` unused `Vec`.
+
+- 2026-07-07 (Package G RTC event-state encapsulation).
+  Encapsulated the RTC event wait queue behind an RTC event-state helper in
+  devfs. The former raw `RTC_EVENT_QUEUE` static is gone; reset, source-id
+  lookup, test queue snapshots, readable clearing, and event publication now
+  route through the helper while preserving `publish_rtc_event_with_post` as
+  the only publication surface. Verification: `cargo test -p tx-fs
+  devfs_rtc_event -- --nocapture`; `cargo test -p tx-shims rtc --
+  --nocapture`; `cargo check -p tx-fs -q && cargo check -p tx-shims -q`;
+  `cargo fmt --check -p tx-fs -p tx-shims`; strict
+  `RTC_EVENT_QUEUE|\.fire\(` audit; and strict `publish_rtc_event` audit
+  passed. Existing unrelated warnings remain `step_connect.rs` unused `guard`
+  and `tx_ext4_bridge.rs` unused `Vec`.
+
+- 2026-07-07 (Package G RTC direct wrapper retirement).
+  Retired the old direct `publish_rtc_event` wrapper from active Rust code.
+  Hardware RTC IRQ already used `publish_rtc_event_with_post`; tests and
+  no-context RTC publication now pass an explicit direct mailbox-ref post
+  closure through that same helper. Verification: `cargo test -p tx-fs
+  devfs_rtc_event -- --nocapture`; `cargo test -p tx-shims rtc --
+  --nocapture`; `cargo check -p tx-fs -q && cargo check -p tx-shims -q`;
+  `cargo fmt --check -p tx-fs -p tx-shims`; and strict
+  `publish_rtc_event` retired-name audit passed. The remaining RTC discovery
+  hits are `RTC_EVENT_QUEUE` state access in devfs, not a direct wrapper.
+
+- 2026-07-07 (Package G catchable signal direct wrapper retirement).
+  Retired the old direct `post_signal` wrapper from active Rust code.
+  Catchable signal tests and no-context callers now use
+  `post_signal_with_post` with an explicit direct mailbox-post closure, while
+  scheduler-context callers continue to inject owner-aware posting through the
+  same seam. Verification: `cargo test -p tx-subsystems --lib
+  signal::tests::delivery -- --nocapture`; `cargo test -p tx-subsystems
+  --test v3_signal_mailbox -- --nocapture`; `cargo test -p tx-subsystems
+  --lib subject_identity_signal_pending_checks_authoritative_pending_state --
+  --nocapture`; `cargo test -p tx-kernel --lib
+  thread_future_sigreturn_recomputes_summary_for_restored_blocked_sigcancel --
+  --nocapture`; `cargo test -p tx-scripts --test drive
+  drive_masked_signal_hint_retries_instead_of_eintr -- --nocapture`;
+  `cargo test -p tx-scripts --test drive
+  drive_sa_restart_signal_hint_retries_instead_of_eintr -- --nocapture`;
+  `cargo test -p tx-scripts --test drive
+  drive_libc_sigcancel_hint_interrupts_even_with_sa_restart -- --nocapture`;
+  `cargo check -p tx-subsystems -q && cargo check -p tx-shims -q &&
+  cargo check -p tx-kernel -q`; `cargo check -p tx-scripts -q`;
+  `cargo fmt --check -p tx-subsystems -p tx-shims -p tx-kernel`;
+  `cargo fmt --check -p tx-scripts`; strict
+  `pub fn post_signal|\bpost_signal\(` audit across `crates boards`; and
+  standing signal direct-wrapper audits passed. The tx-scripts drive test also
+  stopped importing concrete `TimerWheel` through the `tx_scripts` wake
+  adapter. Existing unrelated warnings remain `step_connect.rs` unused
+  `guard`, `tx_ext4_bridge.rs` unused `Vec`, and tx-kernel test-only
+  dead-code warnings.
+
+- 2026-07-07 (Package G signal script delivery direct helper retirement).
+  Retired the old direct `script_deliver_signal` helper name from active Rust
+  code. Process-directed signal delivery now uses
+  `script_deliver_signal_with_post` everywhere; no-context tests pass an
+  explicit direct mailbox-post closure through that same helper instead of
+  keeping a parallel direct wrapper. Verification already passed for this
+  slice before documentation closeout: strict `script_deliver_signal`
+  retired-name audit; `cargo test -p tx-subsystems --lib
+  signal::tests::kill_permission -- --nocapture`; `cargo test -p tx-shims
+  --lib dispatch_tkill -- --nocapture`; and `cargo test -p tx-shims --lib
+  dispatch_tgkill -- --nocapture`. Documentation closeout verification:
+  `cargo xtask progress validate`; `cargo xtask lint docs` (ok, with expected
+  stale-vocabulary warnings for retired terms discussed in active docs);
+  `cargo check -p tx-subsystems -q && cargo check -p tx-shims -q`;
+  `cargo fmt --check -p tx-subsystems -p tx-shims`; strict retired-interface
+  audits for `script_deliver_signal`, time/timer, signalfd/process,
+  direct-helper, signal StepOp wrapper names; and scoped `git diff --check`
+  all passed. Existing unrelated warnings remain `step_connect.rs` unused
+  `guard` and `tx_ext4_bridge.rs` unused `Vec`.
+
+- 2026-07-07 (Package G signal mailbox direct helper retirement).
+  Retired the old internal `post_signal_mailbox` helper name from active Rust
+  code. Signal code now uses `post_signal_mailbox_with_post` everywhere,
+  including no-context paths that pass an explicit direct mailbox-post closure;
+  reactor-aware callers can still inject owner-aware posting through the same
+  seam. Verification: strict `post_signal_mailbox` retired-name audit passed;
+  `cargo test -p tx-subsystems --lib signal::tests::delivery -- --nocapture`;
+  `cargo test -p tx-subsystems --test v3_signal_mailbox -- --nocapture`;
+  `cargo check -p tx-subsystems -q && cargo check -p tx-shims -q`;
+  `cargo fmt --check -p tx-subsystems -p tx-shims`; standing retired
+  time/timer, signalfd/process, direct-helper, and signal StepOp wrapper
+  audits all passed. Existing unrelated warnings remain `step_connect.rs`
+  unused `guard` and `tx_ext4_bridge.rs` unused `Vec`.
+
+- 2026-07-07 (Package G signal StepOp direct wrapper retirement).
+  Retired the old direct signal StepOp wrapper names from active Rust code.
+  Process-directed signal delivery now exposes `KillProcessWithPostOp`, and
+  thread-directed delivery exposes the existing `ThreadKillWithPostOp`; the
+  old `KillProcessOp` / `ThreadKillOp` wrapper names are absent across
+  `crates/tx-subsystems`, `crates/tx-shims`, `crates/tx-kernel`, and subsystem
+  integration tests. The semantic free helpers remain for no-context tests and
+  internal signal semantics; StepOp callers must now choose an explicit post
+  route. Verification: `cargo fmt -p tx-subsystems -p tx-shims`;
+  `cargo test -p tx-subsystems --lib
+  kill_process_with_post_op_uses_injected_post -- --nocapture`;
+  `cargo test -p tx-subsystems --lib
+  thread_runtime::execution::step_op_wraps -- --nocapture`;
+  `cargo check -p tx-subsystems -q && cargo check -p tx-shims -q`;
+  `cargo fmt --check -p tx-subsystems -p tx-shims`; strict
+  `KillProcessOp|ThreadKillOp` retired-name audit; standing retired
+  time/timer, signalfd/process, and direct-helper audits; scoped
+  `git diff --check`; scoped trailing-whitespace scan; `cargo xtask progress
+  validate`; and `cargo xtask lint docs` all passed. Existing unrelated
+  warnings remain `step_connect.rs` unused `guard` and `tx_ext4_bridge.rs`
+  unused `Vec`. Remaining full-goal work still needs broader higher-level
+  producer audits and real-board or firmware-backed RTC witnesses.
+
+- 2026-07-07 (boot setup lint guard).
+  Added `cargo xtask lint invariants boot-setup`, which mechanically rejects
+  new boot cmdline parsing/emission and user-space setup outside the approved
+  startup surfaces. The rule protects `init/boot_args.rs` and
+  `init/boot_plan.rs` as the kernel cmdline/policy boundary, keeps QEMU,
+  shell-test, OSComp, and test-init tooling as the host/test entrypoints, and
+  confines `/etc`/`/tx-ltp` style setup to `/tx-test-init`, image construction,
+  or the explicit legacy shim lane. `BOOT_FLOW_v1.md` now records the lint and
+  the remaining transitional allowances. Verification: `cargo test -p xtask
+  boot_setup_lint -- --nocapture` passed, and `cargo xtask lint invariants
+  boot-setup` passed. `cargo xtask lint invariants all` reached
+  `boot-setup lint: ok` but still failed on pre-existing ratchets
+  (`step-discipline`, `subject-context`, `cred-check`, `legacy-wait-channel`,
+  `notification-boundary`, and `syscall-no-await`). Next: remove the
+  transitional `init/exec.rs` setup allowance once the remaining OSComp/LTP
+  payload command setup is fully owned by `/tx-test-init` or image
+  construction.
+
+- 2026-07-07 (stage2 time/wake design specification closure).
+  Strengthened
+  [`TX_TIME_WAKE_DESIGN.md`](../stage2-documents/time_infra/TX_TIME_WAKE_DESIGN.md)
+  from a complete narrative into an explicit design specification. The new
+  entry section names the review authority, Linux reference, architecture vs
+  implementation state, owner rows for each feature family, and the hard
+  retirement posture for broad `TimeIf`, private timeout queues, HAL-to-devfs
+  shortcuts, syscall-local RTC semantics, and per-subsystem scheduler hooks.
+  Verification: scoped trailing-whitespace scan and `git diff --check`
+  passed; `cargo xtask progress validate` passed. A later docs-lint rerun
+  after `BOOT_FLOW_v1.md` landed passed with the existing stale-vocabulary
+  warning class and `docs lint: ok`. This is documentation-only;
+  implementation completion still requires the Package G and board-evidence
+  proof matrix.
+
+- 2026-07-07 (boot flow design document).
+  Added [`BOOT_FLOW_v1.md`](../design/02_execution/BOOT_FLOW_v1.md), a
+  complete Chinese design document for the txKernel startup path from firmware
+  handoff through HAL, page substrate, semantic mount/device/process setup,
+  `BootArgs`/`BootPlan`, rootfs setup lanes, first userspace exec, test-init
+  handling, and the boot reactor loop. The document compares each major stage
+  against the normal Linux boot path and records the intended direction:
+  Linux-like Alpine/contest boot should leave userspace setup to the image/init,
+  while OSComp/LTP setup belongs in `/tx-test-init`, image overlays, or the
+  temporary legacy compat lane rather than semantic subsystems. Updated
+  `docs/design/INDEX.md` to list the new execution-model document. Verification:
+  `cargo xtask lint docs` passed with the existing stale-vocabulary warning
+  class and `docs lint: ok`; `cargo xtask progress validate` passed; and
+  `git diff --check` passed.
+
+- 2026-07-07 (Package G signalfd/process exit-source direct wrapper retirement).
+  Retired the remaining direct no-context wrapper names from the already
+  migrated signalfd and process exit-source readiness paths. Signalfd now
+  exposes only `SignalFd::notify_with_post` and
+  `notify_process_signal_with_post`; tests that need no-reactor behavior pass
+  an explicit direct mailbox-ref post closure through those helpers. Process
+  exit-source publication now exposes only `fire_exit_source_with_post` /
+  `notify_child_zombified_with_post`; the old `fire_exit_source` wrapper and
+  process-local `notify_v3_source` adapter entry are absent from active Rust
+  code. Verification: strict signalfd/process retired-interface grep audit
+  passed; `cargo test -p tx-subsystems --lib signalfd -- --nocapture`;
+  `cargo test -p tx-subsystems --test v3_signal_mailbox -- --nocapture`;
+  `cargo test -p tx-subsystems --lib process::tests::exit_source --
+  --nocapture`; `cargo test -p tx-subsystems --test v3_exit_wait_source --
+  --nocapture`; `cargo test -p tx-subsystems --test v3_signalfd --
+  --nocapture`; and `cargo check -p tx-subsystems -q` passed with the
+  existing unrelated `step_connect.rs` unused `guard` warning. Remaining
+  implementation convergence still needs real-board or firmware-backed RTC
+  witnesses beyond QEMU profiles and any further higher-level producers with
+  direct active wrappers.
+
+- 2026-07-07 (boot args/plan startup organization).
+  Split boot command-line facts and boot policy into
+  `crates/tx-kernel/src/init/boot_args.rs` and
+  `crates/tx-kernel/src/init/boot_plan.rs`. `init/helpers.rs` now keeps only
+  bootstrap helper utilities, while `init.rs` consumes `RootfsSetup` to choose
+  Linux-like, test-init, or legacy shim rootfs setup and `init/exec.rs`
+  consumes `FirstUserspace` for OSComp/LTP sdcard vs cmdline init. This keeps
+  normal Alpine/contest boot closer to Linux by leaving userspace setup to the
+  image/init, and confines remaining compat shims to an explicit legacy/test
+  startup path. Verification: `cargo fmt -p tx-kernel -p tx-scripts`,
+  `cargo test -p tx-kernel init::boot_ -- --nocapture`, `cargo check -p
+  tx-kernel`, and `cargo -q xtask unit` passed. Existing warnings remain the
+  unrelated `step_connect.rs` unused `guard`, `tx_ext4_bridge.rs` unused
+  `Vec`, and `init/reactor_submit.rs` dead-code warning. Next: run a real
+  Alpine or OSComp QEMU witness when changing guest-visible startup assets or
+  cmdline defaults.
+
+- 2026-07-07 (Package G AIO/io_uring completion mailbox-ref post seam).
+  Advanced AIO and io_uring completion readiness onto the caller-posting
+  shape without adding a `tx-subsystems -> tx-reactor` dependency and without
+  preserving old direct active interfaces. AIO completion publication now uses
+  `AioContext::push_completion_with_post`; AIO worker setup uses
+  `spawn_worker_for_context_with_completion_post` with an `AioCompletionPost`
+  built from `SyscallCtx`. io_uring CQ publication now uses
+  `IoUring::push_cqe_with_post`; SQPOLL worker setup uses
+  `spawn_sqpoll_worker_with_completion_post`; and `sys_io_uring_enter`
+  publishes CQ readiness through the same injected mailbox-ref post route.
+  The old direct `push_completion`, `push_cqe`, direct worker-spawn wrappers,
+  and old completion notify names are absent from active Rust code.
+  Verification: `cargo test -p tx-subsystems --lib
+  push_completion_with_post_uses_injected_mailbox_ref_post -- --nocapture`;
+  `cargo test -p tx-subsystems --lib
+  push_cqe_with_post_uses_injected_mailbox_ref_post -- --nocapture`;
+  `cargo test -p tx-shims --test v3_aio_io_getevents -- --nocapture`;
+  `cargo test -p tx-shims --test v3_io_uring_sqpoll_scaffold --
+  --nocapture`; `cargo test -p tx-shims --lib
+  dispatch_io_uring_enter_drains_in_kernel_submission_ring -- --nocapture`;
+  `cargo check -p tx-subsystems -q && cargo check -p tx-shims -q`;
+  `cargo fmt --check -p tx-subsystems -p tx-shims`; and the strict
+  AIO/io_uring retired-interface grep audit all passed. Existing unrelated
+  warnings remain `step_connect.rs` unused `guard` and `tx_ext4_bridge.rs`
+  unused `Vec`. Blocker: full time/wake implementation convergence still needs
+  real-board or firmware-backed RTC witnesses beyond QEMU profiles and any
+  remaining higher-level producers that still bypass the shared owner-aware
+  post route when scheduler context exists.
+
+- 2026-07-07 (stage2 time/wake complete design handoff).
+  Strengthened
+  [`TX_TIME_WAKE_DESIGN.md`](../stage2-documents/time_infra/TX_TIME_WAKE_DESIGN.md)
+  as the complete stage-2 design handoff by adding an explicit delivery-scope
+  entry point. The document now defines what "complete" means for the design:
+  every known time, RTC, timer, wait-source, device-readiness, and SMP wake
+  feature must have a named owner, legal lower/upper interfaces, a migration
+  package, and acceptance proof. It also distinguishes architecture complete,
+  slice complete, and implementation complete so open rows such as AIO/io_uring
+  and real-board RTC witnesses cannot be mistaken for permission to reintroduce
+  broad interfaces. This is documentation-only; implementation convergence is
+  still gated by the section 23/26 proof matrix.
+
+- 2026-07-07 (stage2 time/wake interface dictionary closure).
+  Extended
+  [`TX_TIME_WAKE_DESIGN.md`](../stage2-documents/time_infra/TX_TIME_WAKE_DESIGN.md)
+  with Appendix A, an implementation-facing interface dictionary and code
+  ownership map. The appendix maps the complete time/wake design to live
+  interface names, primary code homes, legal callers, feature-to-path lookup
+  rows, and design-level retirement audits. This is documentation-only and
+  does not close the implementation-open rows: AIO/io_uring completion
+  readiness, real-board or firmware RTC witnesses beyond QEMU profiles, and
+  any remaining higher-level wake producers.
+
+- 2026-07-07 (Package G network delegate kick mailbox-ref post seam).
+  Advanced network delegate poll/tick kicks onto the caller-posting shape
+  without adding a `tx-subsystems -> tx-reactor` dependency. The delegate queue
+  now exposes `net_delegate_kick_poll_with_post` and
+  `net_delegate_kick_tick_with_post`; the old direct
+  `net_delegate_kick_poll` / `net_delegate_kick_tick` wrappers are absent.
+  Subsystem, tx-drivers, and host-test no-context producers now explicitly pass
+  `net_delegate_direct_mailbox_post`, while the boot network deadline task in
+  `tx-kernel` injects
+  `post_mailbox_ref_event_with_hint_from_current_hart::<P>` with a normal
+  scheduler hint. Focused verification:
+  `cargo test -p tx-subsystems --lib
+  net_delegate_kick_poll_with_post_uses_injected_mailbox_ref_post --
+  --nocapture`; `cargo test -p tx-subsystems --lib
+  net_delegate_kick_tick_with_post_uses_injected_mailbox_ref_post --
+  --nocapture`; `cargo test -p tx-subsystems --lib
+  net_delegate_reactor_timer_adapter_fires_tick_and_drives_retransmit --
+  --nocapture`; and `cargo check -p tx-subsystems -q && cargo check -p
+  tx-drivers -q && cargo check -p tx-kernel -q` passed with existing unrelated
+  warnings. Blocker: full Package G convergence still needs AIO/io_uring and
+  any remaining higher-level producer families.
+
+- 2026-07-07 (stage2 time/wake complete design-document entry).
+  Strengthened
+  [`TX_TIME_WAKE_DESIGN.md`](../stage2-documents/time_infra/TX_TIME_WAKE_DESIGN.md)
+  as a standalone complete design document. The document now opens with a
+  stable complete-contents table covering sections 1-27, plus an explicit
+  current-state snapshot that separates architecture-complete from
+  implementation-partially-complete and names the still-open implementation
+  rows: network delegate kick, AIO/io_uring completion readiness, real-board
+  or firmware-backed RTC witnesses beyond QEMU profiles, and any remaining
+  higher-level producers. This is documentation-only; it does not change the
+  Package G implementation state.
+
+- 2026-07-07 (Package G socket readiness mailbox-ref post seam).
+  Advanced socket readiness publication onto the caller-posting shape without
+  adding a `tx-subsystems -> tx-reactor` dependency. `SocketReadiness` now
+  exposes only `fire_recv_with_post`, `fire_send_with_post`, and
+  `fire_accept_with_post`; the old direct `fire_recv` / `fire_send` /
+  `fire_accept` methods are absent. `NetworkPublish` and
+  `NetworkPublishTarget` now publish only through `_with_post` helpers, so
+  packet, loopback, TCP, UDP, ICMP, SCTP, netdevice, netlink, and host-test
+  no-context paths all choose an explicit mailbox-ref post route. Socket
+  syscall-context producers in the ARP-reply and `fcntl(F_SETFL)` send-space
+  paths inject `SyscallCtx::post_mailbox_ref_event`. Verification:
+  `cargo test -p tx-subsystems --lib
+  network_publish_uses_injected_mailbox_ref_post_for_socket_readiness --
+  --nocapture`; `cargo test -p tx-shims --lib
+  dispatch_fcntl_setfl_socket_uses_syscall_ctx_mailbox_ref_post_for_send_space
+  -- --nocapture`; `cargo check -p tx-subsystems -q && cargo check -p
+  tx-shims -q`; socket readiness direct-interface audit returned no hits;
+  active Rust retired time/wake interface audit returned no hits. Existing
+  unrelated warnings remain `step_connect.rs` unused `guard` and
+  `tx_ext4_bridge.rs` unused `Vec`. Blocker: full Package G convergence still
+  needs the network delegate kick path, AIO/io_uring, and any remaining
+  higher-level producer families.
+
+- 2026-07-07 (Package G RTC/device RawQueue mailbox-ref post seam).
+  Advanced RTC/device readiness onto the shared owner-aware mailbox-ref route
+  without adding a HAL-to-VFS edge or a `tx-subsystems -> tx-reactor`
+  dependency. `publish_rtc_event_with_post` now records RTC pending bits and
+  publishes the RTC RawQueue through a caller-provided mailbox-ref post, while
+  `publish_rtc_event` remains only as the no-context fallback wrapper.
+  Hardware RTC IRQ handling acknowledges the persistent-clock alarm IRQ
+  through HAL and injects the kernel current-hart mailbox-ref post. Emulated
+  RTC alarms now use `DeviceTimerCallback::with_raw_queue_wake`; the timer
+  registry runs the device-state callback first and then asks the reactor
+  timer router to publish each RawQueue subscriber through
+  `ReactorOwnerWakePost`. Verification: `cargo fmt -p tx-substrate -p
+  tx-reactor -p tx-fs -p tx-kernel`; focused RTC/devfs, IRQ, and reactor
+  RawQueue timer tests passed; `cargo check -p tx-substrate -q && cargo check
+  -p tx-reactor -q && cargo check -p tx-fs -q && cargo check -p tx-kernel
+  -q` passed with existing unrelated warnings; `cargo fmt --check -p
+  tx-substrate -p tx-reactor -p tx-fs -p tx-kernel` passed; the active Rust
+  retired time/wake interface audit returned no hits. Blocker: full Package G
+  convergence remains incomplete for socket/network, AIO/io_uring, and
+  remaining higher-level producer families.
+
+- 2026-07-07 (stage2 time/wake complete design contract).
+  Added the final design-contract closure to
+  [`TX_TIME_WAKE_DESIGN.md`](../stage2-documents/time_infra/TX_TIME_WAKE_DESIGN.md).
+  The stage2 document now ends with a concise one-page architecture,
+  non-negotiable boundary table, three-state completion model
+  (architecture complete vs slice complete vs implementation complete),
+  future patch review algorithm, and final acceptance bar for declaring the
+  whole time/wake refactor implementation-complete. This is a
+  documentation-only closure: it does not claim the remaining Package G
+  implementation slices have landed. Verification: scoped `git diff --check`
+  over the touched design/progress files passed; trailing-whitespace scan
+  returned no hits; `cargo xtask progress validate` passed; and `cargo xtask
+  lint docs` passed with the expected retired-term warning class and
+  `docs lint: ok`. Blocker: implementation convergence is still open for
+  socket/network, AIO/io_uring, and any remaining higher-level producer
+  families that do not yet route scheduler-context wakes through the shared
+  owner-aware post path.
+
+- 2026-07-07 (Package G SysV sem mailbox-ref post seam).
+  Advanced SysV semaphore changed-source readiness onto the
+  syscall-context owner-aware mailbox-ref route without adding a
+  `tx-subsystems -> tx-reactor` dependency. SysV sem notification now exposes
+  `notify_changed_with_post`; `step_semop_v3_with_post` /
+  `step_semop_with_post` publish semaphore value-change wakes through an
+  injected mailbox-ref post; `step_semctl_in_ns_with_post` publishes
+  `IPC_RMID`, `SETVAL`, and `SETALL` changed-source wakes through the same
+  seam; `step_sem_undo_with_post` keeps process-exit `SEM_UNDO` adjustments
+  on the same helper; and `sys_semop` / `sys_semtimedop` / `sys_semctl`
+  inject `SyscallCtx` mailbox-ref posting while no-context wrappers delegate
+  through the same helpers with direct posting. Verification: `cargo fmt -p
+  tx-subsystems -p tx-shims`, `cargo test -p tx-subsystems --lib
+  with_post_uses_injected_mailbox_ref_post -- --nocapture`, `cargo test -p
+  tx-shims --lib
+  dispatch_sysv_semop_uses_syscall_ctx_mailbox_ref_post_for_changed_wake --
+  --nocapture`, `cargo test -p tx-shims --lib dispatch_sysv_sem --
+  --nocapture`, `cargo check -p tx-subsystems -q && cargo check -p tx-shims
+  -q`, and `cargo fmt --check -p tx-subsystems -p tx-shims` passed with
+  existing unrelated warnings. The SysV sem old direct notification audit and
+  active Rust retired time/wake interface audit both returned no hits.
+  Blocker: full Package G convergence remains incomplete for
+  socket/network, RTC/device, AIO/io_uring, and higher-level producer
+  families.
+
+- 2026-07-07 (stage2 time/wake remaining-producer complete design).
+  Completed the remaining Package G design detail in
+  [`TX_TIME_WAKE_DESIGN.md`](../stage2-documents/time_infra/TX_TIME_WAKE_DESIGN.md).
+  The document now has a dedicated remaining-producer section covering shared
+  `_with_post` interface shapes, SysV sem, socket/network readiness,
+  RTC/generic device readiness, AIO/io_uring completion readiness, and
+  higher-level signal/syscall producers. Each slice now names the semantic
+  owner, target injected-post interface, legal caller integration,
+  no-context fallback rule, old-route retirement audit, and focused proof
+  gate. This is a documentation-only slice; implementation convergence remains
+  incomplete for socket/network, RTC/device, AIO/io_uring, and some
+  higher-level producer families.
+
+- 2026-07-07 (Package G SysV msg mailbox-ref post seam).
+  Advanced SysV message-queue readiness and removal wakes onto the
+  syscall-context owner-aware mailbox-ref route without adding a
+  `tx-subsystems -> tx-reactor` dependency. SysV msg notification now exposes
+  only `notify_message_available_with_post`,
+  `notify_space_available_with_post`, and `abort_removed_with_post`;
+  `step_msgsnd_with_post` wakes receiver waiters through an injected
+  mailbox-ref post; `step_msgrcv_with_post` wakes sender waiters through the
+  same seam; `step_msgctl_in_ns_with_post` aborts both waiter classes on
+  `IPC_RMID`; and `sys_msgsnd` / `sys_msgrcv` / `sys_msgctl` pass
+  `SyscallCtx::post_mailbox_ref_event` while default no-context wrappers
+  delegate through the same helpers with direct posting. Verification: `cargo
+  fmt -p tx-subsystems -p tx-shims`, `cargo test -p tx-subsystems --lib
+  with_post_uses_injected_mailbox_ref_post -- --nocapture`, `cargo test -p
+  tx-shims --lib dispatch_sysv_msg -- --nocapture`, `cargo check -p
+  tx-subsystems -q && cargo check -p tx-shims -q`, and `cargo fmt --check -p
+  tx-subsystems -p tx-shims` passed with existing unrelated warnings. The
+  SysV msg old direct notification audit and active Rust retired time/wake
+  interface audit both returned no hits. Scoped `git diff --check`,
+  trailing-whitespace scan, `cargo xtask progress validate`, and `cargo xtask
+  lint docs` passed; docs lint reported the expected retired-term warning
+  class and ended with `docs lint: ok`. Blocker: full Package G convergence
+  remains incomplete for socket/network, RTC/device, AIO/io_uring, SysV sem,
+  and higher-level producer families.
+
+- 2026-07-07 (Package G POSIX mq mailbox-ref post seam).
+  Advanced POSIX message-queue send/receive readiness onto the
+  syscall-context owner-aware mailbox-ref route without adding a
+  `tx-subsystems -> tx-reactor` dependency. POSIX mq notification now exposes
+  only `notify_message_available_with_post` /
+  `notify_space_available_with_post`; `step_mq_send_with_post` wakes parked
+  receivers through an injected mailbox-ref post; `step_mq_receive_with_post`
+  wakes parked senders through the same seam; and `sys_mq_timedsend` /
+  `sys_mq_timedreceive` pass `SyscallCtx::post_mailbox_ref_event` while the
+  default no-context wrappers delegate through the same helpers with direct
+  posting. Verification: `cargo fmt -p tx-subsystems -p tx-shims`, `cargo
+  test -p tx-shims dispatch_mq_blocking -- --nocapture`, `cargo check -p
+  tx-subsystems -q && cargo check -p tx-shims -q`, and `cargo fmt --check -p
+  tx-subsystems -p tx-shims` passed with existing unrelated warnings. The
+  POSIX mq old direct notification audit and active Rust retired time/wake
+  interface audit both returned no hits. Scoped `git diff --check`,
+  trailing-whitespace scan, `cargo xtask progress validate`, and `cargo xtask
+  lint docs` passed; docs lint reported the expected retired-term warning
+  class and ended with `docs lint: ok`. Blocker: full Package G convergence
+  remains incomplete for socket/network, RTC/device, AIO/io_uring, SysV
+  msg/sem, and higher-level producer families.
+
+- 2026-07-07 (Package G VFS/RNode mailbox-ref post seam).
+  Advanced per-RNode read/write readiness publication onto the shared
+  caller-posting shape without adding a `tx-subsystems -> tx-reactor`
+  dependency. VFS notification now exposes
+  `notify_readable_with_post` / `notify_writable_with_post`;
+  `RNode::fire_read_wait_with_post` / `fire_write_wait_with_post` keep
+  read/write wait-source ownership in VFS while letting callers inject
+  hint-aware mailbox-ref posting; and the default `fire_read_wait` /
+  `fire_write_wait` wrappers delegate through the same helpers with direct
+  mailbox posting for no-context callers. Verification:
+  `cargo fmt --check -p tx-subsystems`, `cargo test -p tx-subsystems --test
+  v3_vfs_waitsource -- --nocapture`, and `cargo check -p tx-subsystems -q`
+  passed with the existing unrelated `step_connect.rs` unused `guard`
+  warning. The VFS old direct notification audit and active Rust retired
+  time/wake interface audit both returned no hits. Scoped `git diff --check`,
+  trailing-whitespace scan, `cargo xtask progress validate`, and `cargo xtask
+  lint docs` passed; docs lint reported the expected retired-term warning
+  class and ended with `docs lint: ok`. Blocker: full Package G convergence
+  remains incomplete for socket/network, RTC/device, AIO/io_uring/mq/sysv-msg,
+  and higher-level producer families.
+
+- 2026-07-07 (Package G TTY readable mailbox-ref post seam).
+  Advanced TTY input-readable publication onto the shared caller-posting shape
+  without adding a `tx-subsystems -> tx-reactor` dependency. TTY notification
+  now exposes `notify_readable_with_post`; `step_ingest_with_post` keeps
+  line-discipline and input-queue mutation in the TTY subsystem while letting
+  callers inject hint-aware mailbox-ref posting for the readable wait source;
+  the default `step_ingest` wrapper delegates through the same helper with
+  direct mailbox posting for no-context TTY-internal callers; and the
+  production console ingest path in `tx-kernel` injects
+  `post_mailbox_ref_event_with_hint_from_current_hart`. Verification:
+  `cargo fmt -p tx-subsystems -p tx-kernel`, `cargo fmt --check -p
+  tx-subsystems -p tx-kernel`, `cargo test -p tx-subsystems --test
+  v3_tty_waitsource -- --nocapture`, and `cargo check -p tx-subsystems -q &&
+  cargo check -p tx-kernel -q` passed with existing unrelated warnings.
+  Scoped `git diff --check`, trailing-whitespace scan, the active Rust
+  retired time/wake interface audit, the TTY old `notify_readable` audit,
+  `cargo xtask progress validate`, and `cargo xtask lint docs` also passed;
+  docs lint reported the expected retired-term warning class and ended with
+  `docs lint: ok`. Blocker: full Package G convergence remains incomplete for
+  socket/network, RTC/device, AIO/io_uring/mq/sysv-msg, and higher-level
+  producer families.
+
+- 2026-07-07 (Package G userfaultfd pending-fault mailbox-ref post seam).
+  Advanced userfaultfd pending-fault readable publication onto the
+  owner-aware mailbox-ref route without adding a `tx-subsystems -> tx-reactor`
+  dependency. `userfaultfd` notification now exposes only
+  `notify_readable_with_post`; `UserfaultFd::push_fault_msg_with_post` keeps
+  the pending-fault queue in userfaultfd while letting callers inject
+  mailbox-ref posting for the readable wait source; `UfdDispatchTarget`,
+  `ProcessUfdDispatch::new_with_post`, and
+  `AddressSpace::fault_script_for_process_with_post` carry that seam from the
+  VM fault script; and the production thread-future page-fault path injects
+  `post_mailbox_ref_event_with_hint_from_current_hart`. Focused verification:
+  `cargo fmt --check -p tx-subsystems -p tx-kernel`, `cargo test -p
+  tx-subsystems process_fault_push_uses_injected_mailbox_ref_post_for_ufd_readable_wake
+  -- --nocapture`, `cargo test -p tx-subsystems --lib userfaultfd --
+  --nocapture`, `cargo test -p tx-subsystems --test v3_userfaultfd_e2e --
+  --nocapture`, `cargo test -p tx-subsystems --test v3_userfaultfd_fault_path
+  -- --nocapture`, and `cargo check -p tx-subsystems -q && cargo check -p
+  tx-kernel -q` passed with existing unrelated warnings. Scoped
+  `git diff --check`, trailing-whitespace scan, the active Rust retired
+  time/wake interface audit, the userfaultfd old `notify_readable` audit,
+  `cargo xtask progress validate`, and `cargo xtask lint docs` also passed;
+  docs lint reported the expected retired-term warning class and ended with
+  `docs lint: ok`. Blocker: full Package G convergence remains incomplete for
+  VFS/RNode, socket/network, RTC/device, AIO/io_uring/mq/sysv-msg, and
+  higher-level producer families.
+
+- 2026-07-07 (stage2 time/wake complete design document execution guide).
+  Completed the implementation-entry pass for
+  [`TX_TIME_WAKE_DESIGN.md`](../stage2-documents/time_infra/TX_TIME_WAKE_DESIGN.md).
+  The document now opens with a reader map that routes architecture, module,
+  implementation, wake-producer, RTC/devfs, and SMP changes to the right
+  sections/packages; Package G now has a mechanical producer-slice recipe
+  covering semantic-owner classification, caller-posting seams,
+  no-context fallback, owner-aware injection, re-observation, retirement
+  audits, and progress updates; and the design now includes end-to-end
+  acceptance scenarios for clock reads, realtime mutation, sleep, futex/poll,
+  timerfd, signalfd, RTC, VFS timestamps, and post-steal wakes. This is a
+  documentation slice only. Verification: scoped `git diff --check`,
+  trailing-whitespace scan, `cargo xtask progress validate`, and
+  `cargo xtask lint docs` passed; docs lint reported the expected retired-term
+  warning class and ended with `docs lint: ok`. Blocker: full Package G
+  implementation convergence remains incomplete for VFS/RNode,
+  socket/network, RTC/device, AIO/io_uring/mq/sysv-msg, and higher-level
+  producer families.
+
+- 2026-07-07 (Package G signalfd process-signal mailbox-ref post seam).
+  Advanced signalfd's process-signal fanout onto the owner-aware
+  mailbox-ref route without adding a `tx-subsystems -> tx-reactor`
+  dependency. `signalfd` notification now exposes
+  `notify_readable_with_post`; `SignalFd::notify_with_post` and
+  `notify_process_signal_with_post` keep the per-fd pending-signum queue in
+  signalfd while letting callers inject mailbox-ref posting for the readable
+  wait source. Signal delivery now has `step_kill_process_with_posts` and
+  `script_deliver_signal_with_posts`, carrying both the weak-mailbox
+  `SignalDelivered` post and the mailbox-ref signalfd wait-source post; the
+  syscall signal path passes `SyscallCtx::post_mailbox_ref_event` for the
+  signalfd side. Focused verification: `cargo fmt --check -p tx-subsystems -p
+  tx-shims`, `cargo test -p tx-subsystems --test v3_signal_mailbox --
+  --nocapture`, `cargo test -p tx-shims
+  dispatch_tkill_uses_syscall_ctx_mailbox_post -- --nocapture`, `cargo test
+  -p tx-shims dispatch_tgkill_uses_syscall_ctx_mailbox_post -- --nocapture`,
+  and `cargo check -p tx-subsystems -q && cargo check -p tx-shims -q` passed
+  with existing unrelated warnings. Blocker: full Package G convergence
+  remains incomplete for VFS/RNode, socket/network, RTC/device,
+  AIO/io_uring/mq/sysv-msg, and higher-level producer families.
+
+- 2026-07-07 (Package G timerfd realtime clock-set mailbox-ref post seam).
+  Advanced the remaining timerfd realtime mutation producer onto the
+  syscall-context owner-aware mailbox-ref route. `wall_clock` now exposes
+  `set_realtime_ns_with_timerfd_post` and
+  `set_realtime_ns_with_persistent_and_timerfd_post`, and the syscall
+  `clock_settime(CLOCK_REALTIME)` / `settimeofday` path injects
+  `SyscallCtx::post_mailbox_ref_event` through that seam.
+  Timerfd now exposes `timerfd_clock_was_set_with_post` plus
+  cancel-on-set/realtime-deadline revalidation helpers, so accepted system
+  realtime jumps can mark cancel-on-set timers readable or revalidate
+  non-cancel realtime absolute deadlines without importing `tx-reactor` into
+  `tx-subsystems`. Focused verification already observed in this slice:
+  `cargo fmt -p tx-subsystems -p tx-shims`, `cargo fmt --check -p
+  tx-subsystems -p tx-shims`, `cargo test -p tx-shims
+  dispatch_clock_settime_cancel_on_set_uses_syscall_ctx_mailbox_ref_post --
+  --nocapture`, `cargo test -p tx-shims
+  dispatch_timerfd_settime_uses_syscall_ctx_mailbox_ref_post_for_readable_wake
+  -- --nocapture`, and `cargo test -p tx-subsystems timerfd -- --nocapture`
+  passed. Documentation/status sync verification in this pass:
+  `cargo check -p tx-subsystems -q && cargo check -p tx-shims -q` passed with
+  the existing unrelated `step_connect.rs` unused `guard` and
+  `tx_ext4_bridge.rs` unused `Vec` warnings; scoped `git diff --check`
+  passed; trailing-whitespace scan returned no hits; the active Rust
+  retired-interface audits returned no hits; `cargo xtask progress validate`
+  passed; and `cargo xtask lint docs` passed with the expected retired-term
+  warning class. Blocker: full Package G convergence remains incomplete for
+  remaining VFS/RNode, socket/network, RTC/device, async fd/IPC, and
+  higher-level producer families.
+
+- 2026-07-07 (Package G timerfd syscall-context mailbox-ref post seam).
+  Advanced the timerfd syscall-context immediate-readable producer onto the
+  owner-aware mailbox-ref route. Timerfd notification now exposes
+  `notify_readable_with_post`; `timerfd_settime_with_flags_and_post` lets
+  callers inject mailbox-ref posting; and `sys_timerfd_settime` passes
+  `SyscallCtx::post_mailbox_ref_event` when arming an already-expired timer
+  makes the fd readable immediately. `step_timerfd_read` now drains an already
+  accumulated expiration count, fixing the case where a one-shot immediate
+  expiration had already cleared `deadline_ns` before the waiter re-polled.
+  Focused verification: `cargo fmt --check -p tx-subsystems -p tx-shims`,
+  `cargo test -p tx-shims
+  dispatch_timerfd_settime_uses_syscall_ctx_mailbox_ref_post_for_readable_wake
+  -- --nocapture`, `cargo test -p tx-subsystems timerfd -- --nocapture`, and
+  `cargo check -p tx-subsystems -q && cargo check -p tx-shims -q` passed with
+  existing unrelated warnings. This left the realtime `clock_settime` /
+  `settimeofday` to `timerfd_clock_was_set` path as follow-up at the time;
+  the newer timerfd realtime clock-set entry above closes that follow-up.
+  Blocker: full Package G convergence remains incomplete.
+
+- 2026-07-07 (stage2 time/wake complete design document finalization).
+  Expanded the reader-facing
+  [`TX_TIME_WAKE_DESIGN.md`](../stage2-documents/time_infra/TX_TIME_WAKE_DESIGN.md)
+  from a module walkthrough into a full implementation design: added the
+  design thesis that separates clock meaning, deadline mechanics, and runnable
+  placement; added board modeling profiles for SiFive/RISC-V-like,
+  LoongArch/2K-like, QEMU, and no-RTC platforms; added an interface contract
+  summary that names what each layer may and must not mutate; and added
+  Package G/H implementation-plan exits for owner-aware wake producer
+  convergence and board/Linux-parity evidence. This is a documentation slice;
+  Package G implementation convergence remains incomplete. Verification:
+  scoped `git diff --check`, trailing-whitespace scan, active-Rust retired
+  interface audits, `cargo xtask progress validate`, and
+  `cargo xtask lint docs` passed. Docs lint reported the expected
+  retired-term warning class and ended with `docs lint: ok`.
+
+- 2026-07-07 (Package G pipe syscall-context mailbox-ref post seam).
+  Advanced the next ordinary wait-source producer onto the syscall-context
+  owner-aware route. Pipe notification now exposes
+  `notify_readable_with_post` / `notify_writable_with_post`; pipe read/write
+  exposes `step_read_with_post` / `step_write_with_post` plus
+  `ReadWithHintPostOp` / `WriteWithHintPostOp`; and
+  `sys_pipe_read_buffered` / `sys_pipe_write_buffered` pass
+  `SyscallCtx::mailbox_ref_post_with_hint` so reader/writer wait-source
+  publication can route through owner-aware placement when real reactor context
+  exists. The post uses `MailboxSchedulerHint::Normal` because pipe readiness
+  has no futex-style handoff hint. Focused verification:
+  `cargo fmt --check -p tx-subsystems -p tx-shims`, `cargo test -p tx-shims
+  dispatch_pipe_write_uses_syscall_ctx_mailbox_ref_post_for_reader_wake --
+  --nocapture`, `cargo test -p tx-subsystems pipe -- --nocapture`, and
+  `cargo check -p tx-subsystems -q && cargo check -p tx-shims -q` passed with
+  existing unrelated warnings. Next step: continue remaining
+  scheduler-context wait-source producers such as VFS/RNode, socket/network,
+  async fd/IPC, and device readiness. Blocker: full Package G
+  convergence remains incomplete.
+
+- 2026-07-07 (stage2 time/wake wake-producer catalog).
+  Completed the missing implementation-facing catalog in the stage2 time/wake
+  design document. `TX_TIME_WAKE_DESIGN.md` now classifies Package G wake
+  producers by semantic owner, wake identity, scheduler-context seam,
+  no-context fallback, migration priority, and acceptance proof, covering
+  timer, delegate, signal, itimer, process exit-source, futex, eventfd, pipe,
+  VFS/RNode, TTY, socket/network, RTC, async fd/IPC, and reactor-local
+  coordination producers. This is a documentation closeout only; it does not
+  claim Package G implementation convergence is complete. Next step: continue
+  ordinary wait-source producer convergence, starting with pipe if staying on
+  the current slice. Blocker: full Package G implementation work remains
+  incomplete.
+
+- 2026-07-07 (Package G eventfd syscall-context mailbox-ref post seam).
+  Advanced another ordinary wait-source producer onto the syscall-context
+  owner-aware route. Eventfd notification now exposes
+  `notify_readable_with_post` / `notify_writable_with_post`; eventfd step
+  helpers expose `step_eventfd_read_with_post` /
+  `step_eventfd_write_with_post`; and `sys_eventfd_read` /
+  `sys_eventfd_write` inject `SyscallCtx::post_mailbox_ref_event` so
+  readable/writable wait-source publication can route through the shared
+  owner-aware boundary when reactor context exists. The old eventfd-local
+  direct `notify_v3_source` adapter entry is removed; no-context fallback now
+  delegates through the same `_with_post` surface with direct mailbox posting.
+  Focused verification: `cargo fmt --check -p tx-subsystems -p tx-shims`,
+  `cargo test -p tx-shims
+  dispatch_eventfd_write_uses_syscall_ctx_mailbox_ref_post_for_reader_wake --
+  --nocapture`, `cargo test -p tx-subsystems eventfd -- --nocapture`, and
+  `cargo check -p tx-subsystems -q && cargo check -p tx-shims -q` passed with
+  existing unrelated warnings. Next step: continue remaining
+  scheduler-context wait-source producers. Blocker: full Package G
+  convergence remains incomplete.
+
+- 2026-07-07 (Package G futex syscall-context mailbox-ref post seam).
+  Advanced the next ordinary wait-source producer onto the syscall-context
+  owner-aware route. `WaitSource` now has a limit-preserving
+  `notify_limit_emit_with_owner_post` helper; futex notification exposes
+  `notify_exact_limit_with_post`; `step_futex_wake_masked_with_hint_and_post_in`
+  lets callers inject owner-aware mailbox-ref posting; and `sys_futex`
+  `FUTEX_WAKE` / `FUTEX_WAKE_BITSET` now publish exact `SourceFired` events
+  through `SyscallCtx::post_mailbox_ref_event_with_hint`. The real
+  `thread_future` syscall context injects
+  `post_mailbox_ref_event_with_hint_from_current_hart`, preserving futex
+  `WakeHandoff` / lifecycle hints while routing through the shared
+  owner-aware boundary. Focused verification: `cargo fmt --check -p
+  tx-substrate -p tx-subsystems -p tx-shims -p tx-reactor -p tx-kernel`,
+  `cargo test -p tx-shims
+  dispatch_futex_wake_uses_syscall_ctx_mailbox_ref_post_with_hint --
+  --nocapture`, `cargo test -p tx-shims
+  direct_trap_futex_wake_uses_wake_handoff_hint -- --nocapture`,
+  `cargo test -p tx-subsystems --test v3_futex_waitsource -- --nocapture`,
+  `cargo test -p tx-substrate wait_source -- --nocapture`, and `cargo check
+  -p tx-kernel -q && cargo check -p tx-shims -q && cargo check -p
+  tx-subsystems -q && cargo check -p tx-reactor -q && cargo check -p
+  tx-substrate -q` passed with existing unrelated warnings. Next step:
+  continue migrating remaining scheduler-context wait-source producers.
+  Blocker: full Package G convergence remains incomplete.
+
+- 2026-07-07 (time/wake complete design document landing map). Completed the
+  stage2 reader-facing
+  [`TX_TIME_WAKE_DESIGN.md`](../stage2-documents/time_infra/TX_TIME_WAKE_DESIGN.md)
+  with an implementation-facing landing map, legal dependency graph,
+  active-interface retirement audits, package exit evidence, and a completeness
+  boundary that classifies future hardware, timekeeper, timer, wake, RTC,
+  VFS-timestamp, and suspend-aware work by owner. This was a documentation
+  slice only; it does not claim Package G wake-class convergence is complete.
+  Next step: continue ordinary wait-source producer convergence and keep the
+  hard old-interface audits clean. Blocker: broader Package G implementation
+  work remains incomplete.
+
+- 2026-07-07 (Package G process exit-source mailbox-ref post seam). Advanced
+  the first non-reactor-local wait-source producer onto the syscall-context
+  owner-aware route. `SyscallCtx` now carries `mailbox_ref_post` alongside the
+  weak mailbox post; `thread_future` injects
+  `post_mailbox_ref_event_from_current_hart`; process `exit_source` gained
+  `fire_exit_source_with_post` / `notify_child_zombified_with_post`; and
+  `sys_exit_group` now publishes the parent wait-source wake through
+  `SyscallCtx::post_mailbox_ref_event` when reactor context exists. Focused
+  verification: `cargo fmt --check -p tx-subsystems -p tx-shims -p
+  tx-kernel`, `cargo test -p tx-shims
+  dispatch_exit_group_uses_syscall_ctx_mailbox_ref_post_for_parent_exit_source
+  -- --nocapture`, `cargo check -p tx-subsystems -q && cargo check -p
+  tx-shims -q && cargo check -p tx-kernel -q` (existing unrelated warnings),
+  `cargo test -p tx-subsystems --test v3_exit_wait_source -- --nocapture`,
+  `cargo test -p tx-subsystems process::tests::exit_source -- --nocapture`,
+  both active-Rust old-interface audits, `cargo xtask progress validate`, and
+  `cargo xtask lint docs` (expected retired-term warnings) passed. Next step:
+  migrate the remaining real wait-source producers with scheduler context.
+  Blocker: full Package G convergence remains incomplete.
+
+- 2026-07-07 (Package G itimer signal producer post seam). Advanced the active
+  `ITIMER_REAL` signal producer routes onto injected mailbox posting.
+  Syscall-boundary polling and socket wait expiry now call
+  `fire_itimer_real_with_post(ctx)`, which delivers handler-gated `SIGALRM`
+  through `deliver_signal_if_handler_with_post` and
+  `SyscallCtx::post_mailbox_event`; the enter-userspace compatibility frame
+  path is now `maybe_deliver_itimer_signal_with_post(..., post)` and
+  `thread_future` injects `post_mailbox_event_from_current_hart`. The old
+  direct `maybe_deliver_itimer_signal`, `fire_itimer_real`, and
+  `deliver_signal_if_handler` active wrappers are retired. Verification:
+  `cargo fmt --check -p tx-shims -p tx-subsystems -p tx-kernel`,
+  `cargo test -p tx-shims
+  dispatch_itimer_real_boundary_uses_syscall_ctx_mailbox_post -- --nocapture`,
+  `cargo check -p tx-shims -q && cargo check -p tx-kernel -q && cargo check -p
+  tx-subsystems -q` (existing unrelated warnings),
+  `cargo xtask progress validate`, `cargo xtask lint docs` (expected
+  retired-term warnings), scoped `git diff --check`, trailing-whitespace scan,
+  and both active-Rust old-interface audits passed. Next step: finish remaining
+  ordinary wait-source producer convergence. Blocker: full Package G
+  convergence remains incomplete.
+
+- 2026-07-07 (Package G syscall-context signal post seam). Advanced the
+  owner-aware wake convergence for signal producers that already have a real
+  syscall context. `SyscallCtx` now carries an optional mailbox-post function
+  with direct fallback for host/no-reactor contexts; `thread_future` injects
+  `post_mailbox_event_from_current_hart` when building the real syscall
+  context. `script_deliver_signal_with_post` and
+  `ThreadKillWithPostOp` let `pidfd_send_signal`, `tkill`, and `tgkill`
+  preserve existing routing/StepOp structure while publishing signal mailbox
+  events through `SyscallCtx::post_mailbox_event`; socket/pipe/page-backed
+  `SIGPIPE` paths now call `step_kill_process_with_post` through the same
+  seam. Focused tests prove `tkill` and `tgkill` use the injected post.
+  Verification: `cargo fmt --check -p tx-shims -p tx-subsystems -p
+  tx-kernel`, `cargo test -p tx-shims
+  dispatch_tkill_uses_syscall_ctx_mailbox_post -- --nocapture`, `cargo test
+  -p tx-shims dispatch_tgkill_uses_syscall_ctx_mailbox_post -- --nocapture`,
+  `cargo check -p tx-shims -q && cargo check -p tx-kernel -q && cargo check -p
+  tx-subsystems -q` (existing unrelated warnings), `cargo test -p
+  tx-subsystems --test v3_signal_mailbox -- --nocapture`, `cargo test -p
+  tx-kernel fatal_signal_teardown_uses_injected_mailbox_post -- --nocapture`,
+  and the hard old-interface audit over `crates`/`boards` returned no active
+  Rust hits. Next step: handle no-context signal producers such as the legacy
+  itimer frame path, then continue remaining wait-source producer convergence.
+  Blocker: full Package G convergence remains incomplete.
+
+- 2026-07-07 (time/wake complete design document sync). Updated the active
+  [`TIME_WAKE_v1.md`](../design/02_execution/TIME_WAKE_v1.md) contract and the
+  stage2 reader-facing
+  [`TX_TIME_WAKE_DESIGN.md`](../stage2-documents/time_infra/TX_TIME_WAKE_DESIGN.md)
+  so the complete design reflects the current Package G thread-future
+  fatal-signal route: signal-frame reserve/copy failures,
+  `prepare_signal_frame` failures, and bad or failed sigreturn restoration now
+  cross the kernel/BOOT_REACTOR boundary through
+  `post_mailbox_event_from_current_hart` and reach the owner-aware
+  `Reactor::post_mailbox_event_from_hart` path when reactor context exists.
+  Verification already observed in this slice:
+  `cargo test -p tx-kernel fatal_signal_teardown_uses_injected_mailbox_post --
+  --nocapture`, `cargo test -p tx-subsystems --test v3_signal_mailbox --
+  --nocapture`, and `cargo check -p tx-kernel -q && cargo check -p
+  tx-subsystems -q` completed with existing unrelated warnings. Next step:
+  continue Package G convergence for remaining higher-level signal/syscall
+  callers and ordinary wait-source producers. Blocker: full Package G
+  convergence remains incomplete.
+
+- 2026-07-07 (Package G signal process-producer post seams). Advanced
+  signal wake convergence beyond the lower `post_signal_with_post` helper:
+  `thread_runtime::execution::set_thread_zombie_with_post`,
+  `process::execution::step_exit_group_with_post`,
+  `process::execution::step_exit_group_with_signal_with_post`,
+  `signal::step_kill_process_with_post`, and `signal::route_gewalt_with_post`
+  now let caller-owned post operations flow through catchable
+  process-directed signal selection, SIGSTOP/SIGCONT Gewalt fanout, and
+  SIGKILL terminal zombify wake hints without adding a
+  `tx-subsystems -> tx-reactor` dependency. Default no-context wrappers still
+  use the direct best-effort mailbox post. `v3_signal_mailbox` now proves the
+  injected post is invoked for catchable process sends, SIGSTOP fanout, and
+  SIGKILL terminal teardown. Verification: `cargo fmt --check -p
+  tx-subsystems`, `cargo test -p tx-subsystems --test v3_signal_mailbox --
+  --nocapture`, `cargo check -p tx-subsystems -q` (existing unrelated
+  `step_connect.rs` unused-variable warning), and the hard old-interface audit
+  over `crates`/`boards` passed. Next step: thread owner-aware reactor context
+  into higher-level signal callers when available and continue remaining
+  wait-source producer convergence. Blocker: full Package G convergence remains
+  incomplete.
+
+- 2026-07-07 (stage2 time/wake full design blueprint). Strengthened
+  `docs/stage2-documents/time_infra/TX_TIME_WAKE_DESIGN.md` as the complete
+  reader-facing design document by adding a module-by-module blueprint and
+  five end-to-end control planes. The new sections tie the top-level
+  architecture graph to each module's owned state, lower interface, upper
+  interface, adjacent modules, and forbidden shortcuts, then separate read-time,
+  timeout-registration, expiry-driving, wake-placement, and RTC-device paths
+  for review. Next step: keep using this document as the stage2 explanation
+  companion to the active `TIME_WAKE_v1.md` contract while implementation work
+  continues on Package G default signal producers and remaining wait-source
+  convergence. Blocker: no design-document blocker known; implementation
+  convergence remains incomplete.
+
+- 2026-07-06 (Package G reactor-local coordination post seams). Advanced the
+  remaining reactor-owned wait-source producer convergence by adding
+  caller-posting variants to coordination primitives:
+  `Completion::complete_with_post`, `CountdownCompletion::arrive_with_post`,
+  and `SyncRendezvous::ack_with_post`. The existing no-context methods remain
+  as direct-post fallbacks, while scheduler-context callers can now inject
+  `Reactor::post_mailbox_ref_event_from_hart` and route completion/rendezvous
+  wakes through `ReactorOwnerWakePost`, current-owner placement, and remote IPI.
+  Focused cross-hart tests cover counted completion completion, final countdown
+  arrival, and final rendezvous ack. Verification: `cargo fmt --check -p
+  tx-reactor`, `cargo test -p tx-reactor
+  counted_completion_complete_with_post_routes_owner_aware -- --nocapture`,
+  `cargo test -p tx-reactor
+  countdown_completion_arrive_with_post_routes_owner_aware_on_final_arrival --
+  --nocapture`, `cargo test -p tx-reactor
+  final_ack_with_post_routes_owner_aware -- --nocapture`, and `cargo check -p
+  tx-reactor -q` passed. Next step: continue migrating non-reactor-local real
+  wait-source producers that can receive scheduler context, plus default signal
+  producers. Blocker: full Package G convergence remains incomplete.
+
+- 2026-07-06 (Package G wait futures task-mailbox convergence). Advanced the
+  wait-source side of TIME_WAKE Package G. Reactor wait futures and
+  `WaitProtocol::*Timeout` timers now bind to the current task-owned mailbox
+  when the poll context can identify it unambiguously, with standalone host/test
+  fallback preserved. `TaskMailbox::poll_select` lets drivers consume only
+  matching events and drop their own stale source generations without eating
+  unrelated signal/delegate/timer/wait-source mailbox events.
+  `Reactor::post_mailbox_ref_event_from_hart` connects the bus
+  `fire_with_post` seam to `ReactorOwnerWakePost` for already-upgraded
+  subscriber mailboxes, and a cross-hart wait-channel smoke proves
+  `SourceFired` can route through owner-aware scheduler placement and remote
+  IPI. Verification: `cargo fmt --check -p tx-substrate -p tx-reactor`,
+  `cargo test -p tx-substrate
+  poll_select_takes_matching_event_and_preserves_unrelated_events --
+  --nocapture`, `cargo test -p tx-reactor
+  wait_channel_fire_routes_through_owner_aware_post -- --nocapture`,
+  `cargo test -p tx-reactor
+  reactor_declared_channel_uses_timer_registry_for_timeouts -- --nocapture`,
+  `cargo test -p tx-reactor
+  reactor_declared_readiness_channel_uses_timer_registry_for_timeouts --
+  --nocapture`, `cargo test -p tx-reactor
+  wait_channel_wakes_registered_task_from_another_task -- --nocapture`,
+  `cargo test -p tx-reactor wait_event_treats_wake_as_retry_signal_only --
+  --nocapture`, `cargo check -p tx-substrate -q`, `cargo check -p tx-reactor
+  -q`, `cargo check -p tx-subsystems -q` (existing unrelated
+  `step_connect.rs` unused-variable warning), and the hard old-interface audit
+  over `crates`/`boards` passed. Next step: migrate real scheduler-context
+  wait-source producers to injected-post variants and continue default signal
+  producer convergence. Blocker: full Package G convergence remains incomplete.
+
+- 2026-07-06 (test init extraction). Moved the default local OSComp/LTP
+  startup path toward a Tx-owned userspace test init. `tools/test-init/tx-test-init.sh`
+  now owns the basic test-mode userspace setup (`/bin` busybox applets,
+  `/etc/{passwd,group,hosts,services,protocols}`, scratch dirs,
+  `/lib/modules/6.1.0-txkernel`, `/boot/config-6.1.0-txkernel`, and base
+  `/tx-ltp/bin` helpers) and reaps child processes after the suite payload.
+  `xtask image test-init --profile busybox --target ...` builds a separate
+  tiny initramfs containing `/tx-test-init` plus BusyBox; `xtask oscomp qemu`,
+  Makefile OSComp QEMU targets, and the OSComp Python observe/custom helpers
+  now opt into `init=/tx-test-init tx.test_init=1` and pass the OSComp suite
+  command through that init. Kernel rootfs shims are skipped when the test init
+  is requested, but remain as an explicit fallback for old no-initramfs direct
+  boots. Verification: `sh -n tools/test-init/tx-test-init.sh`,
+  `python3 -m py_compile tools/oscomp-custom-run.py tools/oscomp-observe-live.py`,
+  `cargo test -p tx-kernel init::helpers::tests -- --nocapture`, `cargo test
+  -p xtask oscomp_qemu -- --nocapture`, `cargo xtask image test-init --profile
+  busybox --target rv64-qemu`, `python3 -m unittest
+  tools.tests.test_oscomp_custom_run tools.tests.test_oscomp_observe_live`,
+  `make -n oscomp-qemu-rv64 OSCOMP_GROUPS=libctest-musl`,
+  `make -n oscomp-qemu-la64 OSCOMP_GROUPS=libctest-musl`, `cargo check -p
+  tx-kernel`, `cargo check -p xtask`, and `cargo xtask oscomp qemu --target
+  rv64-qemu --boot-suite libctest-musl --dry-run` passed. Next step: continue
+  moving the remaining richer LTP/network helper shims from kernel
+  `rootfs_shims.rs` into the test init or an overlay asset, then run a real
+  QEMU OSComp witness. Blocker: no guest boot witness was run in this slice.
+
+- 2026-07-06 (boot mode script sweep). Swept the remaining startup entrypoints
+  after the boot-mode split so host scripts also select explicit modes instead
+  of relying on kernel-side inference. `xtask shell-test` now accepts
+  `--boot-mode` and emits `tx.boot.mode=<profile-default|override>` for
+  busybox/Alpine command lines; `xtask oscomp qemu --boot-suite` now emits
+  `tx.boot.mode=oscomp tx.oscomp.observe_dump=0 tx.oscomp.groups=...` instead
+  of legacy `tx.oscomp=...`; direct OSComp Makefile runs start with
+  `tx.boot.mode=oscomp`; LTP witness scripts start with `tx.boot.mode=ltp`;
+  and `tools/oscomp-custom-run.py`, `tools/oscomp-observe-live.py`, plus the
+  legacy `tools/shell-tests/qemu-runner.py` now stamp their boot mode
+  explicitly. Updated `docs/progress/decisions/2026-07-06-boot-mode-shim-split.md`
+  with script-level consequences. Verification: red tests first failed for the
+  missing shell-test/oscomp/Python boot-mode wiring, then `cargo test -p xtask`,
+  `python3 -m py_compile tools/oscomp-custom-run.py tools/oscomp-observe-live.py
+  tools/shell-tests/qemu-runner.py`, `python3 -m unittest
+  tools.tests.test_oscomp_custom_run tools.tests.test_oscomp_observe_live`,
+  `make -n demo`, `make -n oscomp-qemu-rv64 OSCOMP_GROUPS=libctest-musl`,
+  `cargo check -p tx-kernel`, `cargo -q xtask unit`, scoped rustfmt, and scoped
+  `git diff --check` passed. Next step: move compat rootfs population into
+  image overlays or a Tx-owned userspace init; no QEMU guest boot witness was
+  run for this sweep.
+
+- 2026-07-06 (boot mode shim split). Split boot startup policy into explicit
+  modes. `crates/tx-kernel/src/init/helpers.rs` now parses `tx.boot.mode=...`
+  ahead of legacy `tx.profile=...` and classifies normal/smoke/Alpine/contest
+  as Linux-like user boots while busybox/OSComp/LTP/test remain compat boots.
+  `CoreInit::init_substrate_if_ready` now runs the rootfs shim population only
+  for compat modes and emits `:rootfs-shims:skip:<mode>` for Linux-like boots;
+  `drive_bootstrap_exec` only enters the OSComp sdcard busybox chain for
+  explicit OSComp/LTP cmdlines instead of inferring it from missing `init=`.
+  `xtask qemu` now exposes `--boot-mode` and defaults all profiles to an
+  explicit `tx.boot.mode=...`, so Alpine can keep the bootstrap shell while
+  delegating user-space setup to the Alpine image. Durable decision:
+  `docs/progress/decisions/2026-07-06-boot-mode-shim-split.md`. Verification:
+  new red tests first failed on the missing boot-mode API, then
+  `cargo test -p tx-kernel init::helpers::tests -- --nocapture`, `cargo test
+  -p tx-kernel --lib`, `cargo test -p xtask qemu -- --nocapture`, `cargo check
+  -p tx-kernel`, `cargo check -p xtask`, scoped `rustfmt --edition 2021
+  --check ...`, and scoped `git diff --check` passed with existing unrelated
+  warnings in `tx-subsystems`/`tx-fs`/`tx-kernel`. Next step: move remaining
+  OSComp/LTP file creation into an image overlay or Tx-owned userspace init
+  instead of kernel tmpfs mutation. Blocker: no QEMU Alpine boot witness was
+  run in this slice.
+
+- 2026-07-06 (Package G bus wait-source caller-post seam). Advanced the
+  remaining wait-source convergence foundation: `RawPort`, `RawQueue`,
+  `DeclaredPort`, and `DeclaredQueue` now expose
+  `fire_with_post` / `try_fire_with_post` variants that preserve existing
+  `SourceFired` event construction while letting callers inject the mailbox
+  post operation. `tx-reactor::wait::{Channel,DeclaredChannel,
+  DeclaredReadinessChannel}` forwards the same injected-post surface, so
+  scheduler-context producers have a lower path for owner-aware
+  `SourceFired` routing instead of being forced through the default direct
+  mailbox post. Added `raw_bus_fire_supports_injected_owner_post` to prove the
+  raw queue/port seam invokes the injected post and still delivers the expected
+  `SourceFired` interests. Verification: `cargo fmt --check -p tx-substrate -p
+  tx-reactor`, `cargo test -p tx-substrate
+  raw_bus_fire_supports_injected_owner_post -- --nocapture`, `cargo check -p
+  tx-substrate -q`, and `cargo check -p tx-reactor -q` passed. Next step:
+  migrate production wait futures / scheduler-context producers onto
+  task-owned mailbox and injected-post routes where feasible. Blocker: full
+  Package G wait-source convergence remains incomplete.
+
+- 2026-07-06 (Package G signal owner-aware seam). Advanced wake convergence for
+  signal delivery without adding a `tx-subsystems` -> `tx-reactor` dependency:
+  `thread_runtime::execution` now exposes
+  `post_signal_mailbox_with_post` and `post_signal_with_post`, keeping signal
+  pending bits, siginfo storage, mask checks, and interrupt-summary mutation in
+  the signal/thread-runtime layer while letting reactor-context callers inject
+  an owner-aware mailbox post. `tx-reactor` now has
+  `Reactor::post_signal_delivered_from_hart` for already-resolved
+  `SignalDelivered` mailbox events, and a cross-hart reactor smoke proves the
+  signal event routes through `ReactorOwnerWakePost` to the current owner with a
+  remote IPI. `v3_signal_mailbox` now covers the injected-post signal seam.
+  Verification: `cargo fmt --check -p tx-subsystems -p tx-reactor`, `cargo
+  test -p tx-reactor signal_delivered_routes_through_owner_aware_post --
+  --nocapture`, `cargo test -p tx-subsystems --test v3_signal_mailbox --
+  --nocapture`, `cargo check -p tx-subsystems -q`, `cargo check -p tx-reactor
+  -q`, and the hard old-interface audit over `crates`/`boards` returned no
+  active Rust hits. Next step: thread reactor/scheduler context into real
+  signal-producing callers where available, then continue remaining
+  wait-source producer convergence. Blocker: full Package G convergence remains
+  incomplete.
+
+- 2026-07-06 (stage2 time/wake complete design pass). Expanded
+  `docs/stage2-documents/time_infra/TX_TIME_WAKE_DESIGN.md` from a module
+  walkthrough into a complete reader-facing design document: added explicit
+  scope, requirements, non-goals, relationship to the active
+  `TIME_WAKE_v1.md` contract, current implementation status, hard retirement
+  audit command, review checklist, and failure-boundary triage table. The
+  document now covers hardware capability split, timekeeper, timer registry,
+  reactor timer driving, owner-aware wake routing, RTC/devfs/RNode boundaries,
+  SMP/future-stealing correctness, implementation packages, validation, and
+  deferred Linux-parity slots. Verification: `cargo xtask progress validate`,
+  `git diff --check -- docs/stage2-documents/time_infra/TX_TIME_WAKE_DESIGN.md`,
+  `cargo xtask lint docs` (ok with expected retired-vocabulary warnings), and
+  the hard old-interface audit over `crates`/`boards` returned no active Rust
+  hits. Next step: use this design companion with the active
+  `TIME_WAKE_v1.md` contract while finishing Package G signal/remaining
+  wait-source convergence. Blocker: implementation convergence remains
+  incomplete; no design-document blocker known.
+
+- 2026-07-06 (Package G delegate terminal owner-aware route). Advanced wake
+  convergence beyond delegate timeout: `DelegateRegistry` now exposes
+  caller-posting variants for reply, cancel, agent-death, and endpoint-death
+  transitions, keeping the registry CAS as the single token-state
+  linearization point while allowing reactor context to inject
+  `ReactorOwnerWakePost`. `Reactor` now provides owner-aware wrappers for
+  delegate reply, cancel, and agent-died transitions; focused smokes prove each
+  can wake a task parked on hart 0 from hart 1 without depending on a captured
+  mailbox waker. Verification: `cargo test -p tx-reactor
+  delegate_reply_routes_through_owner_aware_post -- --nocapture`, `cargo test
+  -p tx-reactor delegate_cancel_routes_through_owner_aware_post --
+  --nocapture`, `cargo test -p tx-reactor
+  delegate_agent_died_routes_through_owner_aware_post -- --nocapture`,
+  `cargo test -p tx-substrate --test v3_pr7b_mailbox_integration --
+  --nocapture`, `cargo test -p tx-substrate --test v3_pr7_delegate_runtime --
+  --nocapture`, `cargo fmt --check -p tx-substrate -p tx-reactor`, `cargo
+  check -p tx-substrate -q`, `cargo check -p tx-reactor -q`, and the hard
+  old-interface audit over `crates`/`boards` passed. Next step: continue
+  Package G convergence for signal wakes and remaining wait-source producers
+  with scheduler context. Blocker: full wake-class convergence remains
+  incomplete.
+
+- 2026-07-06 (Package G device timer wait-source owner-aware route). Advanced
+  the time/wake refactor by closing the `DeviceTimerCallback` wait-source
+  routing gap. `WaitSource` now has a caller-provided
+  `notify_with_owner_post` hook for reactor contexts, and
+  `ReactorOwnerWakePost` implements `TimerWakeRouter::post_source_fired` by
+  resolving the global wait source, publishing delivered `SourceFired` mailbox
+  events, and immediately routing each mailbox owner through scheduler
+  placement / remote IPI. A new reactor smoke proves a device-owned timer
+  callback can wake a task parked on hart 0 from a timer tick on hart 1 without
+  relying on a captured mailbox waker. Verification: `cargo fmt --check -p
+  tx-substrate -p tx-reactor`, `cargo test -p tx-reactor
+  device_callback_can_publish_wait_source_through_timer_router -- --nocapture`,
+  `cargo test -p tx-reactor
+  device_callback_wait_source_routes_through_owner_aware_timer_tick --
+  --nocapture`, `cargo check -p tx-substrate -q`, `cargo check -p tx-reactor
+  -q`, and the hard old-interface audit over `crates`/`boards` passed. Next
+  step: continue Package G convergence for delegate reply/cancel/agent-death,
+  signal wakes, and remaining wait-source producers with scheduler context.
+  Blocker: full wake-class convergence remains incomplete.
+
+- 2026-07-06 (stage2 Tx time/wake design document). Added
+  `docs/stage2-documents/time_infra/TX_TIME_WAKE_DESIGN.md` as the complete
+  stage-2 Tx target design for time, RTC, software timers, reactor wake
+  routing, devfs/RNode boundaries, and SMP post-steal wake correctness. The
+  existing `time_infra/README.md` remains the Linux gold-standard reference and
+  now links to the Tx design companion. Verification: local Markdown link
+  target check over the two `time_infra` documents passed; scoped stale-term
+  grep found only intentional negative-rule/boundary mentions such as retiring
+  `TimeIf` and keeping HAL out of RNode/devfs ownership. Next step: use this
+  stage2 document as the reader-facing design companion to active
+  `TIME_WAKE_v1.md` while finishing Package G wake producer convergence and
+  remaining real-board RTC witnesses. Blocker: no design-document blocker
+  known; implementation convergence remains incomplete.
+
+- 2026-07-06 (Package G delegate timeout owner-aware route). Advanced the
+  time/wake refactor by routing tagged `DelegateTimeout` timer entries through
+  the production reactor tick instead of only the old manual
+  `fire_due_delegate_timeouts` helper. `TimerWakeRouter` now exposes a
+  delegate-timeout callback, `DelegateRegistry::mark_timed_out_with_post`
+  lets reactor context provide the mailbox post operation, and
+  `ReactorOwnerWakePost` converts the resulting `Abort(TimedOut)` event into
+  the same owner-aware scheduler placement / remote IPI path used by timer
+  expiry. Verification: `cargo fmt --check -p tx-substrate -p tx-reactor`,
+  `cargo check -p tx-substrate -q`, `cargo check -p tx-reactor -q`,
+  `cargo test -p tx-reactor
+  timer_registry_routes_delegate_timeout_tokens_through_router -- --nocapture`,
+  `cargo test -p tx-reactor
+  delegate_timeout_routes_through_owner_aware_timer_tick -- --nocapture`,
+  `cargo test -p tx-substrate --test v3_agent_token_guard_timer --
+  --nocapture`, and `cargo test -p tx-reactor --test v3_pr7b_timer_routing --
+  --nocapture` passed. Next step: migrate delegate reply/cancel/agent-death,
+  signal, device, and remaining wait-source producers where reactor context is
+  available. Blocker: full Package G convergence and real-board/firmware RTC
+  witnesses remain incomplete.
+
+- 2026-07-06 (boot userspace hard-embed retirement). Removed the production
+  boot path that baked userspace files into the kernel image: `TX_BUSYBOX` no
+  longer drives `crates/tx-kernel/build.rs` or `busybox_baked`, production
+  `run_bootstrap_exec_for_init` now unpacks initramfs/block-media files and
+  executes the selected init path without falling back to a kernel-embedded
+  `/init`, and the hand-written RV64 `/init` fixture is retained only under
+  `#[cfg(test)]` for host exec smokes. Added a regression smoke that proves
+  boot exec fails when boot media does not supply `/init`, while existing
+  fixture smokes explicitly register the test fixture before `drive_bootstrap_exec`.
+  Verification: the new red test first failed because the old fixture fallback
+  still succeeded; after the change, `cargo test -p tx-kernel
+  boot_smoke_bootstrap_exec`, `cargo test -p tx-kernel
+  boot_smoke_fork_wait_seeds_init_for_clone_at_entry`, `cargo test -p
+  tx-kernel --lib`, `cargo check -p tx-kernel`, and scoped `git diff --check`
+  passed with existing unrelated warnings. Next step: use real `xtask image`
+  initramfs artifacts for QEMU boot witnesses; no blocker for the host-side
+  retirement.
+
+- 2026-07-06 (LA64 LS7A RTC backend). Advanced Package F from
+  `TIME_WAKE_v1.md`: `boards/tx-hal-loongarch64-qemu-virt` now publishes the
+  QEMU LS7A RTC MMIO region at `0x100d_0100`, exposes RTC GSI 67 through
+  `IrqIf::RTC_IRQ`, implements `PersistentClockIf` over LS7A TOY calendar
+  registers, programs `TOYMATCH0` for wake alarms, and masks the external IRQ
+  on alarm clear without disabling the TOY clock. Verification:
+  `cargo fmt --check -p tx-hal-loongarch64-qemu-virt`, `cargo check -p
+  tx-hal-loongarch64-qemu-virt -q`, `cargo test -p
+  tx-hal-loongarch64-qemu-virt ls7a_persistent_clock -- --nocapture`,
+  `cargo test -p tx-hal-loongarch64-qemu-virt
+  qemu_la64_mmio_regions_include_ls7a_rtc -- --nocapture`, and `cargo test -p
+  tx-hal-loongarch64-qemu-virt la64_platform_overrides_rtc_irq_constant --
+  --nocapture` passed. Follow-up verification: `cargo test -p
+  tx-hal-loongarch64-qemu-virt irq -- --nocapture`, `cargo check -p
+  tx-kernel-loongarch64-qemu-virt -q`, `cargo check -p tx-kernel -q`,
+  `cargo xtask progress validate`, `cargo xtask lint docs`, scoped
+  diff/whitespace checks, and the old-interface hard audit passed. Kernel
+  checks still report existing unrelated warnings in net/ext4/reactor-submit.
+  Next step: finish real-board RTC/firmware witnesses beyond QEMU, then
+  continue Package G wake-class convergence. Blocker: full time/wake refactor
+  remains incomplete.
+
+- 2026-07-06 (TIME_WAKE future-stealing design closure). Completed the
+  future/task-stealing semantics in `docs/design/02_execution/TIME_WAKE_v1.md`:
+  the design now explicitly separates movable future continuation state, stable
+  `TaskMailbox` wake identity, and scheduler `current_hart` ownership. Timer,
+  wait-source, delegate, signal, and device producers must retain mailbox
+  identities rather than hart identities, and post-steal wake routing must
+  re-resolve owner through `OwnerAwareWakePost` plus the scheduler
+  lock-and-recheck protocol. Verification: `cargo xtask progress validate`
+  passed, `cargo xtask lint docs` passed with the expected retired-term warning
+  class, scoped whitespace/diff checks over the touched docs passed, and the
+  old-interface hard audit over active Rust returned no matches. Next step: use
+  the completed design to finish Package G producer convergence and add
+  remaining non-RV64 RTC backends. Blocker: implementation remains incomplete.
+
+- 2026-07-06 (RTC hardware IRQ publication). Advanced Package F from
+  `TIME_WAKE_v1.md`: added optional `IrqIf::RTC_IRQ`, exposed RV64 QEMU
+  goldfish RTC as PLIC IRQ 11, added a `PersistentClockIf` hardware IRQ
+  acknowledgement hook, and registered `tx-kernel::rtc_alarm_irq_handler` so a
+  hardware RTC alarm IRQ acknowledges the board backend and publishes
+  `RtcEventMask::ALARM` into the existing devfs RTC pending-event/read/poll
+  path. `install_irq_handlers` pre-initializes the RTC event source before
+  unmasking the IRQ, so the IRQ handler does not allocate or path-walk VFS.
+  Verification: `cargo fmt --check -p tx-hal -p tx-kernel -p
+  tx-hal-riscv64-qemu-virt`, `cargo check -p tx-hal -q`, `cargo check -p
+  tx-kernel -q` with existing unrelated warnings, `cargo test -p tx-kernel
+  rtc_irq_handler_publishes_alarm_event_to_devfs_rtc_state -- --nocapture`,
+  `cargo test -p tx-kernel install_irq_handlers_publishes_table_to_platform --
+  --nocapture`, RV64 goldfish board tests, and old-interface audit passed.
+  Next step: add LA64/real-board RTC or firmware backends, then finish Package
+  G wake-class convergence. Blocker: full time/wake refactor remains
+  incomplete.
+
+- 2026-07-06 (RV64 goldfish RTC backend). Advanced Package F from
+  `TIME_WAKE_v1.md`: `boards/tx-hal-riscv64-qemu-virt` now implements
+  `PersistentClockIf` over the QEMU `google,goldfish-rtc` MMIO block at
+  `0x0010_1000`, with read/set/alarm/clear helpers and PLIC IRQ 11
+  mask/unmask behavior for wake alarms. Focused host tests cover MMIO region
+  exposure, TIME_LOW/TIME_HIGH read ordering, high-then-low writes, alarm
+  programming, and alarm clear. Verification: `cargo fmt --check -p
+  tx-hal-riscv64-qemu-virt`, `cargo check -p tx-hal-riscv64-qemu-virt -q`,
+  `cargo test -p tx-hal-riscv64-qemu-virt goldfish -- --nocapture`, `cargo
+  test -p tx-hal-riscv64-qemu-virt rtc -- --nocapture`, `cargo check -p
+  tx-kernel -q` with existing unrelated warnings, scoped `git diff --check`,
+  and the old-interface hard audit passed. Next step: wire hardware RTC IRQ
+  publication through the kernel IRQ table into `publish_rtc_event`, then add
+  non-RV64 board RTC backends and continue Package G wake convergence. Blocker:
+  full time/wake refactor remains incomplete.
+
+- 2026-07-06 (TIME_WAKE hardware RTC backend design). Completed the
+  board-facing RTC backend and IRQ-publication design in
+  `docs/design/02_execution/TIME_WAKE_v1.md`: RV64 QEMU goldfish RTC,
+  LA64/LS7A-like RTCs, and unsupported real-board cases now have explicit
+  backend profiles, and hardware RTC IRQ publication is routed through
+  kernel-installed IRQ handlers into RTC device pending bits before normal
+  wait-source/owner-aware wake routing. This keeps HAL out of devfs/RNode state
+  while still giving Package F a concrete implementation path. Verification:
+  scoped `git diff --check`, `cargo xtask progress validate`, `cargo xtask
+  lint docs`, and the old-interface hard audit passed. Next step: implement
+  the RV64 goldfish backend and hardware IRQ publisher. Blocker:
+  implementation remains incomplete.
+
+- 2026-07-06 (TIME_WAKE owner-aware post alignment). Updated
+  `docs/design/02_execution/TIME_WAKE_v1.md` to reflect the current Package G
+  implementation slice: `ReactorOwnerWakePost` is the concrete shared
+  owner-aware helper, timer expiry and wake-inbox drain use it, and
+  `Reactor::post_mailbox_event_from_hart` is documented as the approved
+  non-timer entry for producers that already have reactor/scheduler context.
+  The design still marks Package G incomplete until delegate, signal, device
+  readiness, and remaining wait-source producers converge on the same boundary
+  where possible. Verification: scoped `git diff --check` passed,
+  `cargo xtask progress validate` passed, `cargo xtask lint docs` passed with
+  the expected retired-term warning class, and the old-interface hard audit
+  over `crates`/`boards` returned no matches. Next step: finish the remaining
+  Package G producer convergence and Package F real RTC backend/IRQ work.
+  Blocker: implementation remains incomplete; no document blocker known.
+
+- 2026-07-06 (RTC emulated alarm publication). Advanced Package F from
+  `TIME_WAKE_v1.md`: `TimerWheel` now has a generic `DeviceEvent` callback
+  registration for device-owned deadlines, and `/dev/misc/rtc` uses it as the
+  fallback for `RTC_ALM_SET` when `PersistentClockIf::set_wake_alarm_ns`
+  returns unsupported. The callback publishes `RtcEventMask::ALARM` into the
+  existing RTC pending-event/read/poll path rather than waking a task directly.
+  Verification: `cargo fmt --check`, touched crate checks, focused reactor
+  device-callback tests, `cargo test -p tx-fs devfs_rtc -- --nocapture`,
+  `cargo test -p tx-shims dispatch_ioctl_rtc -- --nocapture`,
+  `cargo test -p tx-shims dispatch_read_rtc -- --nocapture`,
+  `cargo test -p tx-shims dispatch_ppoll_rtc_uses_typed_pending_event_readiness -- --nocapture`,
+  and `cargo test -p tx-shims epoll_dispatch -- --nocapture` passed. Next
+  step: add real board RTC/firmware backends plus hardware RTC IRQ publication,
+  then continue Package G owner-aware wake-class convergence. Blocker: full
+  time/wake refactor remains incomplete.
+
+- 2026-07-06 (TIME_WAKE implementation blueprint). Completed the implementation
+  closeout layer in `docs/design/02_execution/TIME_WAKE_v1.md`: added a
+  global-to-local traceability table, data ownership ledger, required
+  implementation order, strict old-interface retirement gate, and module-level
+  acceptance-test matrix. This turns the time/wake design from a set of module
+  contracts into a reviewable implementation blueprint. Verification:
+  `git diff --check` over touched docs passed, `cargo xtask progress validate`
+  passed, `cargo xtask lint docs` passed with the expected retired-term warning
+  class, and the old-interface hard audit over `crates`/`boards` returned no
+  matches. Next step: use the blueprint to finish RTC alarm publication and
+  then Package G owner-aware wake-class convergence. Blocker: implementation
+  remains incomplete; no design-doc blocker known.
+
+- 2026-07-06 (RTC blocking read waits). Advanced Package F from
+  `TIME_WAKE_v1.md`: `read(2)` on the typed `/dev/misc/rtc` char device now
+  distinguishes fd flags in the syscall layer. Blocking fds park on
+  `tx_fs::devfs::rtc_event_wait_token()` and retry after RTC event publication,
+  while nonblocking fds keep returning `EAGAIN` when no event is pending. This
+  keeps device state in `RtcDeviceOps`/devfs and keeps Linux fd semantics in
+  `sys_read`. Verification: new RTC read tests first failed with immediate
+  `EAGAIN`, then passed after the fix; `cargo fmt --check`,
+  `cargo check -p tx-shims -q`, `cargo test -p tx-shims dispatch_read_rtc -- --nocapture`,
+  `cargo test -p tx-fs devfs_rtc -- --nocapture`,
+  `cargo test -p tx-shims dispatch_ioctl_rtc -- --nocapture`,
+  `cargo test -p tx-shims dispatch_ppoll_rtc_uses_typed_pending_event_readiness -- --nocapture`,
+  `cargo test -p tx-shims epoll_dispatch -- --nocapture`, and the old-interface
+  hard audit over `crates`/`boards` returned no matches. Next step: wire real
+  board RTC IRQ or emulated alarm publication into `publish_rtc_event`, then
+  continue Package G owner-aware wake convergence. Blocker: full time/wake
+  refactor remains incomplete.
+
+- 2026-07-06 (Linux time infrastructure reference completion). Completed the
+  navigation layer for
+  `docs/stage2-documents/time_infra/README.md`: added a global Linux module
+  and interface matrix plus end-to-end Linux operation paths so readers can
+  connect clocksource, clockevents, sched_clock, timekeeping, RTC, hrtimer,
+  timer wheel, timerfd, alarmtimer, NTP, vDSO/vvar, namespaces, filesystem
+  timestamps, and suspend/resume before reading each detailed module section.
+  Verification: `git diff --check -- docs/stage2-documents/time_infra/README.md`
+  passed, `cargo xtask progress validate` passed, and `cargo xtask lint docs`
+  passed with the expected retired-term warning class. Next step: use
+  `TIME_WAKE_v1.md` for Tx target implementation and the stage2 reference as
+  the Linux gold-standard reading map. Blocker: no documentation blocker known;
+  implementation work remains separately incomplete.
+
+- 2026-07-06 (RTC read/poll event foundation). Advanced Package F from
+  `TIME_WAKE_v1.md`: `/dev/misc/rtc` now has device-owned pending event bits,
+  a registered RTC event wait token, typed `RtcDeviceOps::poll_events`,
+  `read(2)` consumption of Linux-shaped RTC event records, and typed
+  `ppoll`/`epoll` readiness through `binding.ops.rtc_ops()` rather than
+  name-based RTC dispatch. Verification: `cargo fmt --check`,
+  `cargo check -p tx-subsystems -q`, `cargo check -p tx-fs -q`,
+  `cargo check -p tx-shims -q`, `cargo test -p tx-fs devfs_rtc -- --nocapture`,
+  `cargo test -p tx-shims dispatch_ioctl_rtc -- --nocapture`,
+  `cargo test -p tx-shims dispatch_ppoll_rtc_uses_typed_pending_event_readiness -- --nocapture`,
+  `cargo test -p tx-shims epoll_dispatch -- --nocapture`, and the old-interface
+  hard audit over `crates`/`boards` returned no matches. Next step: wire real
+  board RTC IRQ or emulated alarm publication into `publish_rtc_event`, then
+  continue Package G owner-aware wake convergence. Blocker: full time/wake
+  refactor remains incomplete.
+
+- 2026-07-06 (TIME_WAKE design document finalization). Finalized the
+  `TIME_WAKE_v1.md` design document as a readable implementation contract by
+  adding a top-level Document Map that separates architecture contract,
+  module-level contracts, and migration/proof sections. The document now has an
+  explicit reading path from hardware/timekeeper/timer registry through
+  reactor/wake/SMP/RTC and into package exit evidence. Verification:
+  `git diff --check` over the touched docs passed, `cargo xtask progress
+  validate` passed, `cargo xtask lint docs` passed with the expected retired
+  term warning class, and the old-interface hard audit over `crates`/`boards`
+  returned no matches. Next step: implement remaining Package F RTC
+  event/read/poll semantics and Package G owner-aware wake convergence.
+  Blocker: no document blocker known; implementation remains incomplete.
+
+- 2026-07-06 (Realtime persistent writeback policy). Advanced Package F from
+  `TIME_WAKE_v1.md`: added `RealtimeWritebackPolicy` / `RealtimeSetReport`
+  in `tx_subsystems::wall_clock`, routed `clock_settime(CLOCK_REALTIME)` and
+  `settimeofday` through best-effort `PersistentClockIf::set_realtime_ns`
+  after accepted timekeeper mutation, and updated syscall test platforms to
+  expose the persistent-clock capability boundary. RTC writeback failure is
+  reported in the helper but does not roll back kernel realtime or fail these
+  system-clock syscalls. Verification: `cargo fmt --check`,
+  `cargo test -p tx-subsystems persistent_writeback -- --nocapture`,
+  `cargo test -p tx-shims dispatch_clock_settime -- --nocapture`,
+  `cargo test -p tx-shims dispatch_settimeofday -- --nocapture`,
+  `cargo check -p tx-subsystems -q`, `cargo check -p tx-shims -q`,
+  `cargo check -p tx-kernel -q`, and old-interface hard audit passed. Next
+  step: real board RTC/firmware backend or RTC read/poll wait-source events,
+  then Package G non-timer owner-aware wake convergence. Blocker: full
+  time/wake refactor remains incomplete.
+
+- 2026-07-06 (TIME_WAKE complete design contract). Expanded
+  `docs/design/02_execution/TIME_WAKE_v1.md` into a complete target contract
+  for the remaining time/wake work: added board backend modeling, persistent
+  writeback policy, the owner-aware wake-post primitive, RTC event wait-source
+  semantics, the RTC UAPI completion matrix, tighter Package F/G exit
+  evidence, and replaced the old Open Questions section with closed v1 design
+  decisions plus deferred v2 work. Verification: `cargo xtask progress
+  validate`, `cargo xtask lint docs`, scoped `git diff --check`, and the
+  old-interface hard audit passed. Next step: implement Package F persistent
+  writeback or RTC read/poll wait-source events, then Package G non-timer
+  owner-aware wake convergence. Blocker: implementation remains incomplete; no
+  document blocker known.
+
+- 2026-07-06 (execve StepOp dispatch migration). Migrated the reachable
+  syscall-facing exec path onto the v3 Step interface: `sys_execve` now
+  constructs `tx_scripts::process::exec::ExecScriptOp` and drives it through
+  `drive_oneshot`, while the canonical `exec_script` body remains for bootstrap
+  and tests. Removed the stale disabled `tx-shims` `exec_op.rs` shim targeting
+  an older API, and updated the step-interface audit note. Verification:
+  `cargo fmt --check -p tx-scripts -p tx-shims`, scoped `git diff --check`,
+  `cargo check -p tx-scripts -q`, `cargo check -p tx-shims -q`, `cargo test -p
+  tx-shims execve -- --nocapture`, `cargo xtask lint invariants
+  step-interface`, `cargo xtask lint invariants no-adhoc-drive`, and `cargo
+  xtask lint invariants step-v4-vocabulary` passed. Next step: migrate the
+  remaining stale `clone_op.rs` / `vfs/composite.rs` ad-hoc drive sites and, if
+  exec backends begin yielding, split `ExecScriptOp` into a true yielding
+  multi-step op rather than the current one-shot synchronous wrapper. Blocker:
+  `cargo test -p tx-scripts exec_script -- --nocapture` is still blocked by an
+  unrelated dirty-tree timer API mismatch in `crates/tx-scripts/tests/drive.rs`
+  (`TimerWheel` is no longer re-exported from `adapter::wake`).
+
+- 2026-07-06 (RTC alarm typed route). Advanced Package F from
+  `TIME_WAKE_v1.md`: added typed RTC alarm storage and `PersistentClockIf`
+  wake-alarm callbacks behind `/dev/misc/rtc`, wired `RTC_ALM_READ` and
+  `RTC_ALM_SET` through `RtcDeviceOps`, and added devfs/shim tests proving
+  alarm set/read reach the fake persistent backend. This still does not claim
+  blocking `read(2)` or poll/epoll wake semantics; those remain for the
+  device-wait-source / Package G route. Updated `TIME_WAKE_v1.md` and the RTC
+  persistent-clock progress note. Verification: `cargo fmt --check`,
+  `cargo test -p tx-fs devfs_rtc_ops -- --nocapture`, `cargo test -p tx-shims
+  dispatch_ioctl_rtc -- --nocapture`, touched-crate checks, scoped
+  `git diff --check`, and old-interface hard audit passed. Next step: real
+  board RTC/firmware backend or RTC read/poll wait-source events. Blocker:
+  none for this slice; full time/wake refactor remains incomplete.
+
+- 2026-07-06 (RTC persistent backend route). Advanced Package F from
+  `TIME_WAKE_v1.md`: `/dev/misc/rtc` typed `RtcDeviceOps` no longer returns a
+  fixed fallback timestamp. devfs now installs the statically selected
+  platform's `PersistentClockIf` callback as the RTC backend, `RTC_RD_TIME`
+  reads through that backend, `RTC_SET_TIME` validates `RtcTime` and calls the
+  persistent set-time hook, and unsupported boards now surface
+  `EOPNOTSUPP` instead of a fake clock. Added RTC time roundtrip/invalid-date
+  tests plus devfs and shim ioctl backend tests. Updated `TIME_WAKE_v1.md` and
+  `docs/progress/research/2026-07-06-rtc-persistent-clock-foundation.md`.
+  Verification: `cargo fmt --check`, focused `tx-subsystems`, `tx-fs`, and
+  `tx-shims` RTC tests, touched-crate checks, scoped `git diff --check`, and
+  old-interface hard audit passed. Next step: real board RTC/firmware backend,
+  RTC alarm + poll/read event semantics, then Package G wake-class convergence.
+  Blocker: none for this slice; full time/wake refactor remains incomplete.
+
+- 2026-07-06 (Boot realtime seed wiring). Advanced Package F from
+  `TIME_WAKE_v1.md`: `TxPlatform` now includes `PersistentClockIf`, kernel vDSO
+  bootstrap seeds `TimekeeperIf` from persistent realtime before publishing the
+  initial vvar snapshot, and host `TxPlatform` test stubs carry the unsupported
+  persistent-clock default. Updated `HAL_v1.md`,
+  `TIME_WAKE_v1.md`, and
+  `docs/progress/research/2026-07-06-rtc-persistent-clock-foundation.md`.
+  Verification: `cargo fmt --check`, focused HAL/board/subsystems/shims/kernel
+  checks, focused kernel boot-seed test, `cargo test -p tx-kernel vdso
+  --no-run`, `cargo test -p tx-substrate --no-run`, old-interface hard audit,
+  `cargo xtask progress validate`, and `cargo xtask lint docs` passed. Next
+  step: real RTC/firmware backend plus persistent writeback, alarm, and
+  `/dev/rtc` poll/read events; then Package G wake-class convergence. Blocker:
+  none for this slice; full time/wake refactor remains incomplete.
+
+- 2026-07-06 (TIME_WAKE full design document closure). Completed the missing
+  design-document closure pass for
+  `docs/design/02_execution/TIME_WAKE_v1.md`: added the explicit interface
+  catalog, end-to-end scenario map, time/wake error model, SMP race matrix,
+  and the previously missing Package G wake-class convergence migration
+  section. Updated
+  `docs/progress/research/2026-07-06-time-wake-design-refactor.md`. Next
+  step: use the design as the implementation contract for Package F boot
+  seed/writeback and real RTC/event support, then Package G non-timer wake
+  convergence. Blocker: none for the document; implementation remains
+  incomplete.
+
+- 2026-07-06 (RTC persistent-clock foundation). Advanced Package F from
+  `TIME_WAKE_v1.md`: added `tx_hal::PersistentClockIf`, explicit unsupported
+  board impls, timekeeper realtime seed hooks, typed `RtcDeviceOps` / `RtcTime`
+  in the device layer, devfs RTC typed ops, and routed `RTC_RD_TIME` /
+  `RTC_SET_TIME` through `binding.ops.rtc_ops()` instead of syscall-local RTC
+  semantics. Updated
+  `docs/design/02_execution/TIME_WAKE_v1.md` and added
+  `docs/progress/research/2026-07-06-rtc-persistent-clock-foundation.md`.
+  Verification: focused HAL/board/subsystems/fs/shims/kernel checks, RTC
+  conversion and ioctl tests, and old-interface/stub audit passed. Next step:
+  real RTC backend, boot seed/writeback wiring, persistent `RTC_SET_TIME`,
+  alarm/poll/read events, then Package G wake-class convergence. Blocker: none for this slice;
+  full time/wake refactor remains incomplete.
+
+- 2026-07-06 (TIME_WAKE complete design pass). Expanded
+  `docs/design/02_execution/TIME_WAKE_v1.md` into a fuller implementation
+  contract: added target module map, hardware capability contracts, boot RTC
+  seed and realtime mutation flow, timer guard lifecycle, reactor idle
+  contract, wake-class convergence, RTC ABI layering/current stub retirement,
+  Linux compatibility boundary, and package dependency graph. Updated
+  `docs/progress/research/2026-07-06-time-wake-design-refactor.md`. Next step:
+  implement Package F (`PersistentClockIf`, `RtcDeviceOps`, devfs/ioctl/poll
+  route, boot seed hook) and then finish broader wake-class convergence.
+  Blocker: none for the document; implementation remains incomplete.
+
+- 2026-07-06 (Timer registrar handle slice). Advanced Package C convergence
+  from `TIME_WAKE_v1.md`: added `TimerRegistrarHandle`, changed `ScriptCtx` and
+  `SyscallCtx` to carry `timer_registrar` instead of raw `timer_wheel`, updated
+  `tx_scripts::drive()` so `OnTimer`, wait-source deadlines, and delegate
+  deadlines install through the handle, narrowed `DelegateRegistry::install_request`
+  paired timeout input to the handle, and removed raw `TimerWheel` re-exports
+  from producer-facing `tx-scripts` / `tx-shims` adapters. Updated
+  `docs/design/02_execution/TIME_WAKE_v1.md` and added
+  `docs/progress/research/2026-07-06-timer-registrar-handle.md`. Verification:
+  `cargo fmt --check`, `cargo check -p tx-substrate -q`, `tx-scripts`,
+  `tx-shims`, `tx-kernel`, focused `v3_agent_token_guard_timer`,
+  `v3_pr7b_timer_routing`, `drive_yield_on_wait_source_with_deadline_returns_etimedout`,
+  and `futex_dispatch` tests, old-interface audit, and producer-context raw
+  wheel audit passed; `cargo xtask progress validate`, `cargo xtask lint docs`,
+  and `cargo -q xtask unit` also passed. Next step: continue timerfd/POSIX
+  timer registrar narrowing, owner-aware wake convergence, and Package F RTC
+  route. Blocker: none for this slice; full time/wake architecture remains
+  incomplete.
+
+- 2026-07-06 (Timekeeper facade slice). Completed the Package B facade slice
+  from `TIME_WAKE_v1.md`: `TimekeeperIf` is now the documented semantic time
+  boundary, vDSO/VVAR publication uses `timekeeper()`, timerfd realtime
+  conversion/generation reads use the facade, and Package-B-scoped time syscall
+  plus futex/nanosleep deadline reads no longer import raw `wall_clock` globals
+  or direct platform counter reads. Updated
+  `docs/design/02_execution/TIME_WAKE_v1.md` and added
+  `docs/progress/research/2026-07-06-timekeeper-facade.md`. Verification:
+  `cargo fmt --check`, `cargo check -p tx-subsystems -q`, `cargo check -p
+  tx-shims -q`, `cargo check -p tx-kernel -q`, focused `wall_clock`,
+  `time_syscalls`, `timerfd_dispatch`, and `futex_dispatch` tests, old-interface
+  active Rust audit, raw wall-clock API audit, and scoped `git diff --check`
+  passed; `cargo xtask progress validate`, `cargo xtask lint docs`, and
+  `cargo -q xtask unit` also passed. Next step: Package F RTC/persistent-clock
+  route plus opportunistic narrowing of remaining older direct monotonic reads
+  as timeout helpers move onto registrar-owned waits. Blocker: none for this
+  slice; full time/wake architecture still needs RTC integration and broader
+  wake-class convergence.
+
+- 2026-07-06 (TXFS FsOps step-name migration). Retired the TXFS-facing
+  legacy `FsOps::step_*` method names without changing behavior: the VFS
+  backend trait now exposes `chmod_inode` / `chown_inode` and
+  `read_projected` / `write_projected` plus netns variants, with call sites
+  and TXFS implementations updated across tmpfs, devfs, bdevfs, procfs, and
+  sysfs. `cargo xtask lint invariants step-interface` now reports no
+  `tx-fs` bucket and no TXFS legacy-only files; total production legacy
+  `fn step_*` surfaces dropped from 219 after the exec follow-up to 195.
+  Updated `docs/progress/research/2026-07-06-step-interface-linter-audit.md`.
+  Verification: `cargo fmt --check -p tx-fs -p tx-subsystems -p tx-shims -p
+  tx-kernel -p tx-ext4`, `cargo xtask lint invariants step-interface`,
+  `cargo xtask lint invariants step-v4-vocabulary`, `cargo xtask lint
+  invariants no-adhoc-drive`, and scoped `git diff --check` passed.
+  Attempted `cargo check -p tx-fs -q`, but the current dirty tree fails before
+  TXFS on an unrelated `tx-reactor/src/wait.rs` compile error:
+  `Deadline::new` no longer exists; use `Deadline::from_raw`. Next step:
+  migrate the remaining VFS walker/OpenFile `step_*` functions or fix the
+  dirty `tx-reactor` blocker before running full crate checks. Blocker:
+  focused compile/test verification is blocked by that unrelated reactor
+  error.
+
+- 2026-07-06 (TimerQueue/DeadlineFuture/timer_sleep retired). Completed the
+  Package E retirement slice from `TIME_WAKE_v1.md`: reactor wait timeouts now
+  install `DeadlineAbort` guards in the unified `TimerWheel`, runtime
+  `advance_time_to` / `next_deadline_ns` drive only `TimerRegistry`,
+  `tx_reactor::timer` no longer defines an old timeout future/queue,
+  syscall timeout helpers use `deadline_timer(ctx, deadline)` over
+  `SyscallCtx.timer_wheel`, `tx_subsystems::timer_sleep` is deleted, and
+  `tx-kernel` no longer installs a boot-time timer queue seam. Updated
+  `docs/design/02_execution/TIME_WAKE_v1.md` and added
+  `docs/progress/research/2026-07-06-timerqueue-retirement.md`.
+  Verification: the hard active-Rust audit
+  `rg -n "\bTimeIf\b|TimerQueue|DeadlineFuture|timer_sleep|install_timer_queue|sleep_until_ns|DirectMailboxTimerWakeRouter|\.fire_due\(|timer_queue" crates boards --glob '*.rs'`
+  returned no matches; `cargo fmt --check` passed; `cargo check -p
+  tx-substrate -q`, `tx-reactor`, `tx-subsystems`, `tx-shims`, `tx-kernel`,
+  and `tx-scripts` passed; reactor focused tests passed
+  (`v3_timer_surface` 14/14, `timer_idle` 4/4, `wait_bus` 14/14,
+  `wait_interrupt` 6/6, `completion` 6/6, `reactor_smoke` serial 40/40);
+  `cargo test -p tx-shims --lib -- --test-threads=1` passed 555/555;
+  `cargo test -p tx-scripts
+  drive_yield_on_wait_source_with_deadline_returns_etimedout -- --nocapture`
+  passed; `cargo -q xtask unit` passed (`tx-shims` 555/555, `tx-kernel`
+  91/91, `tx-ext4` 9/9, `tx-scripts` 56/56). Next step: continue semantic
+  convergence above the retired interfaces: route more wake classes through the
+  owner-aware boundary and narrow higher-level raw wheel dependencies. Blocker:
+  none for the named old-interface retirement.
+
+- 2026-07-06 (time/wake design status alignment). Updated
+  `docs/design/02_execution/TIME_WAKE_v1.md` so the implementation-status and
+  current-code tables match the latest timer slice: `TimeIf`,
+  `DirectMailboxTimerWakeRouter`, and `TimerWheel::fire_due` are retired from
+  active Rust, timer expiry now has a reactor-owned scheduler-aware route, and
+  the remaining scope is explicitly limited to `TimerQueue` /
+  `DeadlineFuture` / `timer_sleep` migration plus broader wake-path
+  convergence. Updated
+  `docs/progress/research/2026-07-06-time-wake-design-refactor.md`.
+  Verification: `git diff --check -- docs/design/02_execution/TIME_WAKE_v1.md
+  docs/progress/research/2026-07-06-time-wake-design-refactor.md
+  docs/progress/STATUS.md` passed; `cargo xtask lint docs` passed with the
+  expected retired-term warning class; `cargo xtask progress validate` passed.
+  Next step: migrate active waits and syscall timeout users off `TimerQueue` /
+  `DeadlineFuture` / `timer_sleep`. Blocker: none for the design doc;
+  implementation retirement remains incomplete.
+
+- 2026-07-06 (direct mailbox timer router retired). Removed the direct mailbox
+  timer compatibility route from the active timer facade: deleted
+  `DirectMailboxTimerWakeRouter`, removed the `TimerWheel::fire_due` wrapper,
+  dropped reactor/substrate reexports, and updated the `tx-scripts` drive test
+  to use an explicit local `TimerWakeRouter`. This forces timer expiry callers
+  to provide a router instead of silently posting directly to a mailbox. Updated
+  `docs/progress/research/2026-07-06-timer-registry-facade-progress.md`.
+  Verification: `rg -n "DirectMailboxTimerWakeRouter|\\.fire_due\\(" crates
+  --glob '*.rs'` has no matches; `cargo fmt --check` passed;
+  `cargo check -p tx-substrate -q` and `cargo check -p tx-reactor -q` passed;
+  `cargo test -p tx-reactor --test v3_timer_surface -- --nocapture` passed
+  14/14; `cargo test -p tx-reactor --test reactor_smoke -- --test-threads=1
+  --nocapture` passed 40/40. Attempted
+  `cargo test -p tx-scripts drive_yield_on_wait_source_with_deadline_returns_etimedout
+  -- --nocapture`, but the current dirty tree is blocked before that test by
+  an unrelated `tx-scripts::process::exec::script` compile error:
+  missing `drive_exec_post_commit_ops`. Next step: migrate reactor
+  `wait.rs`, `tx_subsystems::timer_sleep`, and shim timeout callers off
+  `TimerQueue` / `DeadlineFuture`. Blocker: full goal remains incomplete while
+  those legacy names are active.
+
+- 2026-07-06 (scheduler-aware timer wake slice). Implemented the next
+  Package D slice from `TIME_WAKE_v1.md`: `TaskMailbox` now carries a
+  substrate-neutral scheduler owner `(task_index, task_generation)`,
+  `TaskTable` can make a parked owner runnable without relying on a captured
+  `Waker`, and `tx-reactor` now drives `TimerRegistry::fire_due_with` through a
+  reactor-owned `TimerWakeRouter` that posts `TimerFired`, resolves the mailbox
+  owner, calls scheduler placement, and bridges remote wake decisions through
+  `RescheduleSignal`. Added a red/green reactor smoke test proving a timer
+  wheel expiry can wake a parked task that never registered a mailbox waker.
+  Verification: the new focused test first failed with `completed = 0`, then
+  passed; `cargo test -p tx-reactor --test v3_timer_surface -- --nocapture`
+  passed 14/14; `cargo test -p tx-reactor --test reactor_smoke --
+  --test-threads=1 --nocapture` passed 40/40; `cargo check -p tx-substrate -q`,
+  `cargo check -p tx-reactor -q`, `cargo check -p tx-scripts -q`, and
+  `cargo fmt --check` passed. Caveat: default-parallel `reactor_smoke` remains
+  unsuitable because existing tests share per-hart current mailbox slots; a
+  default-parallel run failed in an existing current-slot test, while the same
+  suite passed serially. Next step: migrate active wait/syscall timeout users
+  off `TimerQueue` / `DeadlineFuture` / `timer_sleep`, then retire the direct
+  mailbox compatibility router/reexports. Blocker: full goal remains
+  incomplete while the legacy timer path is active.
+
+- 2026-07-06 (time/wake complete design document). Expanded
+  `docs/design/02_execution/TIME_WAKE_v1.md` into a complete target
+  architecture reference for the time/wake refactor. Added Linux reference
+  mapping, dependency-direction rules, explicit clock semantics, timer
+  registry fire/cancel semantics, mailbox owner binding, cross-hart timer
+  registration and hardware reprogramming policy, and observation points.
+  Corrected the current implementation status so `TimeIf` is recorded as
+  retired from active Rust code while `TimerQueue` / `DeadlineFuture` /
+  `timer_sleep` remain the active legacy retirement scope. Updated
+  `docs/progress/research/2026-07-06-time-wake-design-refactor.md`.
+  Verification: `git diff --check -- docs/design/02_execution/TIME_WAKE_v1.md`
+  passed; `cargo xtask lint docs` passed with the expected stale-vocabulary
+  warning class; `cargo xtask progress validate` passed. Next step: implement
+  mailbox owner mapping plus reactor-owned scheduler-aware `WakeRouter`, then
+  retire the legacy timer path. Blocker: none for documentation; implementation
+  remains incomplete until scheduler-routed timer expiry replaces direct
+  mailbox posting.
+
+- 2026-07-06 (Step interface exec follow-up). Removed the old exec
+  post-commit `fn step_*` helper surface from `process/exec_prep.rs`: the
+  helpers are now private non-step functions, and `exec_script` Phase 7 drives
+  `CloseCloexecFdsOp`, `ResetSignalDispositionsForExecOp`, and
+  `InstallBrkForExecOp` through `drive_oneshot`. Renamed the private
+  `tx-kernel::init` boot-reactor `step_boot_reactor_once*` helpers to
+  `boot_reactor_once*` because they were `step-interface` false positives, not
+  StepOp/StepOutcome surfaces. Updated
+  `docs/progress/research/2026-07-06-step-interface-linter-audit.md`. Current
+  `step-interface` count is 219 legacy `fn step_*` surfaces, 116 StepOp
+  wrappers, 59 legacy-surface files, and 38 legacy-only files. Verification:
+  `cargo test -p tx-scripts exec_script -- --nocapture`, focused
+  `tx-subsystems` exec helper tests, `cargo check -p tx-kernel -q`,
+  `cargo check -p tx-shims -q`, `cargo check -p tx-scripts -q`,
+  focused `cargo fmt --check`, `step-interface`, `step-v4-vocabulary`, and
+  `no-adhoc-drive` passed. Caveat: `sys_execve` still drives the canonical
+  async `exec_script`; fully enabling the disabled `exec_op.rs` StepOp state
+  machine remains a larger migration. Blocker: none for this cleanup slice.
+
+- 2026-07-06 (Step interface linter audit). Added
+  `cargo xtask lint invariants step-interface` as a report-only production Rust
+  survey for the StepOp migration surface. Current checkout reports 225 legacy
+  `fn step_*` surfaces, 116 `impl StepOp` wrappers, 61 files with legacy step
+  surfaces, and 40 legacy files with no StepOp impls. Added
+  `docs/progress/research/2026-07-06-step-interface-linter-audit.md`.
+  Verification: `cargo fmt --check -p xtask`, `cargo test -p xtask
+  lint_invariants_step_interface -- --nocapture`, `cargo xtask lint
+  invariants step-interface`, `cargo xtask lint invariants step-v4-vocabulary`,
+  and `cargo xtask lint invariants no-adhoc-drive` passed. `cargo xtask lint
+  invariants step` still fails on the pre-existing `step-discipline` ratchet:
+  25 missing STEP-4 stage-comment entries over ceiling 5. Next step: use the
+  new report to prioritize legacy-only buckets before turning it into a
+  ratchet. Blocker: none for the survey; StepOp wrapping remains incomplete.
+
+- 2026-07-06 (EBR/Zone legacy interface audit). Audited the live EBR/Zone
+  surface against `EBR_ZONE_INTERFACE_v1.md`, added
+  `cargo xtask lint invariants zone-interface` as a zero-ceiling production
+  Rust ratchet, and updated stale `epoch::pin()` examples in the VM and VFS
+  active design docs to `epoch::guard()`. Added
+  `docs/progress/research/2026-07-06-ebr-zone-legacy-interface-audit.md`.
+  Verification: `cargo xtask lint invariants zone-interface` passed with 0
+  legacy sites, `cargo test -p xtask lint_invariants_zone -- --nocapture`
+  passed 4/4 tests, `cargo fmt --check -p xtask` passed, scoped
+  `git diff --check` passed, and `cargo xtask lint docs` passed with the
+  pre-existing stale-vocabulary warning class. Next step: keep the new
+  `zone-interface` ratchet at zero. Blocker: none.
+
+- 2026-07-06 (timer registry facade progress). Started the Package C/D
+  implementation slice from `TIME_WAKE_v1.md`: added `TimerRegistrar`,
+  `TimerRegistry`, `TimerWakeRouter`, and `DirectMailboxTimerWakeRouter` over
+  `TimerWheel`; re-exported them through substrate/reactor surfaces; updated
+  `Reactor::advance_time_to` and `tx-scripts::drive` timer installs to use the
+  facade traits. Added
+  `docs/progress/research/2026-07-06-timer-registry-facade-progress.md`.
+  Verification: the new v3 timer-surface test first failed on missing facade
+  traits, then `cargo test -p tx-reactor --test v3_timer_surface -- --nocapture`
+  passed 14/14; `cargo fmt --check`, `cargo check -p tx-substrate -q`,
+  `cargo check -p tx-reactor -q`, and `cargo check -p tx-scripts -q` passed.
+  Next step: add mailbox owner mapping and a reactor-owned scheduler-aware
+  wake router, then migrate `timer_sleep` callers off `TimerQueue` /
+  `DeadlineFuture`. Blocker: none, but legacy timer path is still active.
+
+- 2026-07-06 (TimeIf Package A retirement). Implemented the Package A
+  HAL-time split from `docs/design/02_execution/TIME_WAKE_v1.md`:
+  `tx_hal::TimeIf` is removed from active Rust code, `TxPlatform` now names
+  `MonotonicCounterIf + DeadlineTimerIf` directly, all current board impls and
+  fake test platforms are split, and read-only users in `tx-observe` /
+  `tx_subsystems::wall_clock` are narrowed to `MonotonicCounterIf`. Added
+  `docs/progress/research/2026-07-06-timeif-package-a-retirement.md`.
+  Verification: `rg` found no `TimeIf` / `tx_hal::TimeIf` /
+  `TIMEIF_SPLIT_TODO` in `crates` or `boards` Rust sources; `cargo fmt --check`
+  passed; focused `cargo check` passed for `tx-hal`, `tx-observe`,
+  `tx-subsystems`, `tx-kernel --tests`, `tx-shims --tests`,
+  `tx-substrate --tests`, and the three board HAL crates with `--tests`.
+  Next step: implement the timekeeper/timer-registry/wake-router packages and
+  retire `TimerQueue`, `DeadlineFuture`, and `timer_sleep` from active runtime
+  code. Blocker: none for Package A; full goal remains incomplete until the
+  legacy timer path is removed.
+
+- 2026-07-06 (time/wake design refactor). Refactored
+  `docs/design/02_execution/TIME_WAKE_v1.md` from a linear time/timer sketch
+  into an implementation-oriented architecture document: the global graph now
+  routes hardware deadline programming through the reactor timer driver, the
+  document has an ownership matrix and canonical read/register/fire/RTC paths,
+  and the migration plan is split into six evidence-backed packages. Expanded
+  it into the final target-state design with hardware/timekeeper/timer
+  registry/ActiveWait/reactor/WakeRouter/RTC sub-architectures, explicit
+  retirement of `TimeIf`, `TimerQueue`, `DeadlineFuture`, and `timer_sleep`, and
+  readiness checks. Aligned active HAL, device, and observation docs with the
+  new `MonotonicCounterIf` / `DeadlineTimerIf` split. Added
+  `docs/progress/research/2026-07-06-time-wake-design-refactor.md`.
+  Verification: scoped `git diff --check` passed, `cargo xtask lint docs`
+  passed with the expected retired-term warning class, and
+  `cargo xtask progress validate` passed. Next step: implement Package A by
+  splitting `TimeIf` into monotonic-counter and deadline-timer subtraits,
+  migrating callers to narrow bounds, and removing `TimeIf` from active runtime
+  interfaces. Blocker: implementation still needs scheduler-routed mailbox
+  posting before `TimerWheel` can be the only SMP-safe timeout backend.
+
+- 2026-07-05 (time/timer/wake routing design). Added
+  `docs/design/02_execution/TIME_WAKE_v1.md` as the Tx target design for HAL
+  time capability split, wall-clock `TimekeeperIf`, shared timer registry,
+  future active-wait timer guards, reactor timer driving, RTC device route, and
+  SMP-safe wake routing after work stealing. Added the doc to
+  `docs/design/INDEX.md` and recorded the catch-up in
+  `docs/progress/research/2026-07-05-time-wake-routing-design.md`.
+  Verification: scoped `git diff --check` passed, `cargo xtask lint docs`
+  passed with the pre-existing stale-vocabulary warning class, and
+  `cargo xtask progress validate` passed. Next step: split `TimeIf` into
+  monotonic/deadline subtraits, add a `TimekeeperIf` facade, then introduce
+  `WakeRouter` before retiring reactor-local `TimerQueue`. Blocker:
+  implementation still needs the scheduler-routed mailbox post path for
+  SMP-safe timer expiry.
+
+- 2026-07-05 (host non-time test cleanup). Fixed the current non-time host
+  test failures around procfs fd symlink lookup, POSIX mq v3 wake publication,
+  wait4/mq blocked-test mailboxes, CLONE_NEWNS mount namespace copying,
+  sigsuspend mask restoration, socket ioctl dispatch, ICMP datagram-vs-raw
+  receive shape, stat/dev_t expectations, accepted ext4 truncate+fsync surface,
+  clone-return publish handoff naming, finite zero-timeout ppoll probes, TCP
+  loopback test namespace isolation, ICMP peer-runtime receive setup,
+  deliverable-signal predicate coverage, thread-payload prewarm assumptions,
+  hardware TTY winsize defaults, directory `lseek(2)` behavior, weak dcache
+  retention, and VM private-page tests that depended on disabled metrics.
+  Verification: `cargo test -p tx-subsystems --lib -- --test-threads=1
+  --nocapture` passed 1128/1128 with 11 ignored;
+  `cargo test --workspace --exclude tx-kernel-riscv64-qemu-virt --exclude
+  tx-kernel-riscv64-m1dock-mock --exclude tx-kernel-loongarch64-qemu-virt --
+  --test-threads=1` passed; `cargo fmt --check`, `git diff --check`, and
+  `cargo -q xtask unit` passed, including `tx-shims` 555/555, `tx-kernel`
+  91/91, `tx-ext4` 9/9, and `tx-scripts` 56/56.
+  Next step: keep the remaining time-subsystem failures in the separate time
+  lane; no non-time host or fast-unit blocker is currently reproduced by the
+  checked host gates.
+
+- 2026-07-05 (cyclictest Cap panic lifecycle follow-up). Classified the old
+  `cyclictest-glibc` Cap panic as a key/slab lookup miss before `SlotMeta`
+  inspection, so the supported owner remains lifecycle/concurrency above the
+  packed cap meta word rather than a normal retain/generation CAS bug. Added a
+  thread-runtime lifecycle cleanup: `set_thread_zombie` now clears matching
+  current/userspace per-hart `ThreadIdentity` and `ThreadPayload` slots before
+  dropping `ThreadIdentity.payload`, while preserving unrelated hart slots.
+  Added host regressions
+  `thread_exit_clears_matching_current_and_userspace_slots` and
+  `exit_group_clears_matching_current_and_userspace_slots`. A follow-up audit
+  found the normal exit paths (`step_thread_exit`, `step_exit_group`,
+  `step_exit_group_with_signal`, and exec sibling collapse) all route through
+  `set_thread_zombie`. Verification:
+  `cargo test -p tx-subsystems exit_group_clears_matching_current_and_userspace_slots -- --nocapture`,
+  `cargo test -p tx-subsystems thread_runtime -- --nocapture`,
+  `cargo check -p tx-subsystems -q`, `cargo xtask build --target rv64-qemu
+  --release`, `make oscomp-submit-rv64 OSCOMP_SUBMIT=target/oscomp/current-submit`,
+  and fresh-image SMP4
+  `target/oscomp/cyclictest-cap-diagnostic-20260705/cyclictest-glibc-slotpurge.log`,
+  which reached `NO_STRESS_P8 end: success`, `STRESS_P8 end: success`, group
+  END, and `userspace:exited:0` with no `panic`, `zone Cap`, `scause=`, or
+  `sepc=` markers. A second fresh-image run
+  `.../cyclictest-glibc-slotpurge-r2.log` crossed `NO_STRESS_P8 end: success`
+  with no panic/trap markers before host timeout in the stress phase; a third
+  120s run produced no panic/trap markers but timed out before the critical
+  `NO_STRESS_P8` marker, so it is not counted as a strong panic-window witness.
+  After a fresh rebuild and submit refresh, `.../cyclictest-glibc-slotpurge-r4.log`
+  reached `NO_STRESS_P8 end: success`, `STRESS_P8 end: success`, group END,
+  and `userspace:exited:0` with no panic/trap markers.
+  `tools/oscomp-judge.py` still reports 0/4 from latency thresholds; that
+  remains a separate runtime bucket. Caveat: the old panic did not reproduce
+  with typed diagnostics, so the exact stale handle type remains unproven
+  unless it returns. Regression strength: temporarily removing the
+  `clear_thread_slots_for` call made both new slot-cleanup tests fail at the
+  stale current-payload assertion; restoring the call made the same filter pass
+  2/2.
+
+- 2026-07-05 (cyclictest Cap panic focused rerun on current tree). Added
+  typed zone lookup diagnostics to `Cap::{deref,clone,downgrade,ident_ref}`
+  so any future unresolved key panic reports operation, `type_name::<T>()`,
+  raw key decoded as zone/slab/slot, registry reason, and zone slab counts.
+  Rebuilt RV64 release, refreshed `target/oscomp/current-submit`, and ran
+  three fresh-image SMP4 `cyclictest-glibc` witnesses from the
+  `fix-soname-cp` image:
+  `target/oscomp/cyclictest-cap-diagnostic-20260705/cyclictest-glibc-typed.log`
+  reached group END and `userspace:exited:0`;
+  `.../cyclictest-glibc-typed-r2.log` reached `NO_STRESS_P8 end: success`
+  and then host-timed out later in `STRESS_P8`; `.../cyclictest-glibc-typed-r3.log`
+  reached group END and `userspace:exited:0`. Targeted grep found no
+  `panic`, `panicked`, `zone Cap`, `scause=`, or `sepc=` markers in the new
+  logs. Current status: the old Cap lifetime panic is not reproducible on the
+  current tree across the focused witnesses; remaining `cyclictest-glibc`
+  score loss is latency/judge-threshold behavior (`tools/oscomp-judge.py`
+  still reports 0/4), not this Cap panic. Verification also included
+  `cargo check -p tx-substrate -q`, `cargo test -p tx-substrate zone --
+  --nocapture`, `cargo xtask build --target rv64-qemu --release`, and
+  `make oscomp-submit-rv64`.
+
+- 2026-07-05 (SMP4 non-LTP failure-classification completion audit). Re-ran
+  the 41-log judge sweep under `target/oscomp/smp4-nonltp-20260702/` against
+  `external/oscomp-autotest/kernel/judge` and re-grepped failure markers. The
+  existing owner buckets still cover the current artifacts: superseded
+  packaging/judge drift, cyclictest Cap lifetime panic, pthread cancel/futex
+  signal ABI, stat/time floor, fd/rlimit daemon behavior, glibc libc/stdio/
+  parser/locale compatibility, PageBacked/ext4 I/O runtime, pthread lifecycle
+  runtime, and lmbench syscall/fs/fd runtime. Tightened
+  `docs/progress/research/2026-07-02-smp4-nonltp-complete-deductions.md` so
+  the glibc libctest compatibility bucket explicitly names the remaining
+  `crypt`, `pleval`, and `setvbuf_unget` selectors. Verification:
+  judge sweep, targeted failure-marker grep, `git diff --check`, progress
+  validation, and docs lint. Next steps remain the per-bucket focused traces
+  listed in the research note; no new uncategorized failure bucket was found.
+
+- 2026-07-05 (SMP4 non-LTP all-failure audit completed from existing logs).
+  Re-scored all 41 logs under `target/oscomp/smp4-nonltp-20260702/` with
+  `tools/oscomp-judge.py` and expanded
+  `docs/progress/research/2026-07-02-smp4-nonltp-complete-deductions.md`
+  into a full failure audit. Current blockers are now split by owner:
+  `cyclictest-glibc` is a zone `Cap::deref()` key/Keg lookup miss before
+  `SlotMeta` read, not currently supported as a primary packed-meta CAS bug;
+  `libctest-musl` remains `pthread_cancel` plus future inode timestamps;
+  `libctest-glibc` mixes missing `libgcc_s.so.1`, static pthread/futex/signal
+  failures, timestamp drift, fd/rlimit daemon behavior, and glibc libc/locale
+  compatibility; `iozone-*`, `libcbench-musl`, and `lmbench-*` are runtime
+  tail investigations rather than per-case semantic failures. Next step: add
+  typed key diagnostics for cyclictest `NO_STRESS_P8`, package or prove
+  `libgcc_s.so.1` for glibc dynamic cancel, and run focused traces for static
+  pthread cancel, stat time floor, PageBacked I/O, and clone/thread lifecycle.
+  Blocker: the old cyclictest log lacks the failed `Cap<T>` type and raw key.
+
+- 2026-07-05 (cyclictest Cap panic meta-vs-concurrency follow-up). Rechecked
+  the prior
+  `target/oscomp/smp4-nonltp-20260702/fix-soname-cp/cyclictest-glibc.log`
+  against current `zone` and thread-lifecycle code. The panic is still best
+  classified as a key/slab resolvability failure before `SlotMeta` is read:
+  `Cap::deref()` -> `registry::slot_for` -> `Zone::slot_from_key` ->
+  `Keg::slot_from_key` returns `None`. Keg can only lose a key after a slab is
+  unlinked as empty, and slab emptiness follows slot-return/free-bitmap state,
+  not ordinary retain CAS lookup. Updated
+  `docs/progress/research/2026-07-05-cyclictest-cap-panic-audit.md` with the
+  refined classification. Current answer: packed cap meta is not the supported
+  root cause; a stale/unretained Cap-shaped handle or higher-level
+  handoff/exit/preemption race is more likely. Next step: add typed key
+  diagnostics around the failing lookup and rerun only cyclictest glibc
+  `NO_STRESS_P8`. Blocker: old log still lacks `type_name::<T>()` and raw key.
+
+- 2026-07-05 (cyclictest Cap panic classified from prior log). Audited the
+  `target/oscomp/smp4-nonltp-20260702/fix-soname-cp/cyclictest-glibc.log`
+  panic and current zone code without starting a new QEMU run. The failure is
+  a `Cap::deref()` key lookup miss at
+  `crates/tx-substrate/src/zone/cap.rs:349`, not a hardware trap; `fault-decode`
+  reaches `rust_begin_unwind`/`Option::expect` only, so the old log does not
+  identify `T`. Static audit did not support a primary packed-meta CAS bug:
+  retain/generation/state transitions match the design, and Keg/slab trim only
+  unlinks empty slabs after slots are returned. Current classification is a
+  stale or unretained Cap-shaped handle, or a higher-level lifetime/exit/handoff
+  race, with `ThreadPayload`/`ThreadIdentity` the first suspect because
+  `NO_STRESS_P8` creates clone/exit/preemption churn. Added
+  `docs/progress/research/2026-07-05-cyclictest-cap-panic-audit.md`. Next step:
+  add temporary typed key diagnostics to `Cap::{deref,clone,drop}` or
+  `registry::slot_for` and rerun the focused cyclictest glibc selector.
+  Blocker: current artifact lacks `type_name::<T>()` and raw key.
+
+- 2026-07-05 (SMP4 non-time blockers re-triaged from prior logs). Reused the
+  last `target/oscomp/smp4-nonltp-20260702/` logs without starting a new QEMU
+  run and extended
+  `docs/progress/research/2026-07-02-smp4-nonltp-complete-deductions.md` with
+  a non-time issue split. Current non-time blockers are: `cyclictest-glibc`
+  panics in `NO_STRESS_P8` on a stale zone `Cap` deref;
+  `libctest-glibc` still has dynamic pthread cancellation blocked by missing
+  `libgcc_s.so.1`, static pthread cancellation blocked by futex/signal/user-fault
+  behavior, and broader glibc libc/locale/stdio/regex compatibility gaps.
+  `libctest-musl-180.log` is the cleaner musl baseline at 216/220, with
+  remaining failures in the timestamp/time lane. Verification: local judge
+  sweep over the prior logs, targeted `rg` over failure markers, and
+  `cargo xtask fault-decode --target rv64-qemu --serial
+  target/oscomp/smp4-nonltp-20260702/fix-soname-cp/cyclictest-glibc.log
+  --brief`. Next step: focused glibc pthread selector plus syscall trace, and
+  a narrow cap-owner trace for cyclictest `NO_STRESS_P8`. Blocker: no current
+  log identifies the stale `Cap<T>` type.
+
+- 2026-07-03 (Linux time reference remaining modules completed). Completed
+  the remaining detailed-module expansions in
+  `docs/stage2-documents/time_infra/README.md`: `sched_clock`, timer wheel,
+  time discipline/NTP/leap seconds, suspend/resume/wake time, and
+  capability/permission handling now each have Linux-only top-level
+  relationship diagrams, detailed logic, sub-architecture diagrams, interface
+  boundaries, and touched-module lists. The feature checklist and source index
+  remain as summary/reference sections rather than architecture modules.
+  Verification: heading/template coverage grep over the whole document,
+  `git diff --check -- docs/stage2-documents/time_infra/README.md`, and
+  `cargo xtask lint docs` passed with the pre-existing stale-vocabulary warning
+  class only. Next step: use the complete Linux reference to draft a staged
+  local wall-clock/RTC implementation plan. Blocker: none.
+
+- 2026-07-03 (Linux time reference expanded for vDSO, namespaces, and FS
+  timestamps). Extended `docs/stage2-documents/time_infra/README.md` with
+  Linux-only top-level relationship diagrams, detailed logic, interface
+  boundaries, and touched-module lists for vDSO/vvar fast paths, time
+  namespaces, and filesystem timestamp semantics. Verification: scoped content
+  review of the updated sections, `git diff --check -- docs/stage2-documents/time_infra/README.md`,
+  and `cargo xtask lint docs` passed with the pre-existing stale-vocabulary
+  warning class only. Next step: optionally deepen `Time Discipline, NTP, And
+  Leap Seconds`, `Suspend, Resume, And Wake Time`, and permission/capability
+  handling. Blocker: none.
+
+- 2026-07-02 (Linux time reference expanded with top-level and syscall-timer
+  relations). Extended `docs/stage2-documents/time_infra/README.md` to show
+  how the top-level hardware/timekeeper/ABI/timer tree maps into the syscall
+  and timer sub-architecture, then added detailed Linux-only logic and
+  diagrams for `clock_gettime`-family, timeout waits, interval timers, POSIX
+  timers, timerfd, hrtimer, and alarmtimer. Verification: scoped content
+  review of the updated sections, `git diff --check -- docs/stage2-documents/time_infra/README.md`,
+  and `cargo xtask lint docs` passed with the pre-existing stale-vocabulary
+  warning class only. Next step: continue with vDSO/vvar, time namespaces, and
+  filesystem timestamp semantics. Blocker: none.
+
+- 2026-07-02 (Linux time reference expanded for core timekeeping). Extended
+  `docs/stage2-documents/time_infra/README.md` with a detailed Linux-only
+  `Core Timekeeping` section covering boot seeding, realtime/monotonic/boottime
+  derivation, NTP discipline, wall-clock setters, vDSO/vvar publication, and
+  downstream modules touched by the timekeeper. Verification: scoped content
+  review of the updated section, `git diff --check -- docs/stage2-documents/time_infra/README.md`,
+  and `cargo xtask lint docs` passed with the pre-existing stale-vocabulary
+  warning class only. Next step: expand the syscall/timer family and the
+  vDSO/time-namespace sections in the same style. Blocker: none.
+
+- 2026-07-02 (Linux time reference expanded for first three layers). Extended
+  `docs/stage2-documents/time_infra/README.md` with detailed Linux-only
+  coverage for `clocksource`, `clockevents`, and persistent clock/RTC:
+  responsibilities, detailed logic, sub-architecture diagrams, interface
+  boundaries, and touched-module lists. Verification: scoped content review of
+  the updated sections, `git diff --check -- docs/stage2-documents/time_infra/README.md`,
+  and `cargo xtask lint docs` passed with the pre-existing stale-vocabulary
+  warning class only. Next step: expand `core timekeeping` and then the
+  syscall/timer family in the same style. Blocker: none.
+
+- 2026-07-02 (Linux time infrastructure reference added). Created
+  `docs/stage2-documents/time_infra/README.md` as a Linux-only reference for
+  RTC, clocksource/clockevent, core timekeeping, hrtimer/timerfd/POSIX timer,
+  NTP/`adjtimex`, vDSO/vvar, time namespace, and filesystem timestamp
+  surfaces. The document includes a source reading order and links to Linux
+  documentation plus mainline source paths, and intentionally avoids mapping
+  the material onto local architecture choices. Verification: `git diff
+  --check -- docs/stage2-documents/time_infra/README.md`,
+  precise placeholder/project-name grep over the new document, and
+  `cargo xtask lint docs` passed with the pre-existing stale-vocabulary warning
+  class only. Next step: use this reference to derive a staged local RTC and
+  wall-clock plan when implementation planning resumes. Blocker: none for the
+  reference document.
+
+- 2026-07-02 (SMP4 non-LTP complete-run deductions triaged and first fixes).
+  Added
+  `docs/progress/research/2026-07-02-smp4-nonltp-complete-deductions.md` to
+  track every non-LTP SMP4 group that completed but lost points after the SMP4
+  glibc boot and SMP1 `basic-glibc` fixes. Fixed the glibc non-LTP dynamic
+  loader class by copying `lib/libc.so` to `lib/libc.so.6` and `lib/libm.so`
+  to `lib/libm.so.6` before running glibc scripts; this moved
+  `netperf-glibc` from 0/5 to 5/5 and `libctest-glibc` from 86/220 to
+  175/220, and let `iozone-glibc` execute to 11/20 before the 180s timeout.
+  Fixed busybox judge drift by wrapping `busybox_testcode.sh` inside the
+  judged group, normalizing the two `rm ... -f` labels, and reporting the
+  historical `kill 10` case from a live-PID kill smoke; `busybox-musl` and
+  `busybox-glibc` now judge at 55/55. New blockers exposed by the fixes:
+  `cyclictest-glibc` now reaches `NO_STRESS_P8` and panics with
+  `zone Cap key no longer resolves to a live slot`; `libctest-musl` still has
+  pthread-cancel and `stat` timestamp failures; glibc libctest has remaining
+  locale/stdio/stat/pthread/regex semantics. Verification included focused
+  `tx-kernel` host tests, `cargo xtask build --target rv64-qemu`,
+  `cargo xtask oscomp submit --target rv64-qemu --submit
+  target/oscomp/current-submit`, bounded SMP4 QEMU runs under
+  `target/oscomp/smp4-nonltp-20260702/fix-*`, local
+  `tools/oscomp-judge.py`, and `cargo xtask fault-decode --target rv64-qemu
+  --serial .../cyclictest-glibc.log --brief`.
+- 2026-07-02 (SMP1 glibc `openat` after `umount2` fixed). Closed the
+  single-core follow-up left by the SMP4 glibc boot repair: `basic-glibc`
+  previously reached group END but printed `--- Assert Fatal ! ---` in
+  `test_openat` because `mount(tmpfs/ext4)->umount2` removed the process mount
+  namespace entry while leaving the global fallback mount table entry live, so
+  later dirfd-relative `openat(..., O_CREAT)` could still walk through stale
+  mounted state and return `-ENOENT`. Fix: `sys_umount2` now attempts to remove
+  both publication sites and treats the syscall as successful if either table
+  actually removed the mount. Added host regression
+  `dispatch_openat_after_mount_umount_creates_on_uncovered_mountpoint`, which
+  failed red with `Error(2)` at the dirfd-relative create and now passes.
+  Guest evidence:
+  `target/oscomp/custom-run/glibc-smp1-basic-extroot-layout-umountfix-r1.txt`
+  shows `Testing openat`, `open dir fd: 3`, `openat fd: 4`, no Assert Fatal,
+  `#### OS COMP TEST GROUP END basic-glibc ####`, and
+  `userspace:exited:0`; the SMP4 guard run
+  `target/oscomp/custom-run/glibc-smp4-basic-extroot-layout-umountfix-r1.txt`
+  also reaches AP/IPI ok, `openat fd: 4`, group END, and exits 0.
+  Verification: `cargo test -p tx-shims
+  dispatch_openat_after_mount_umount_creates_on_uncovered_mountpoint --
+  --nocapture`, `cargo test -p tx-shims
+  dispatch_openat_dirfd_relative_o_creat_creates_in_directory -- --nocapture`,
+  `cargo xtask build --target rv64-qemu`, `cargo xtask oscomp submit --target
+  rv64-qemu --submit target/oscomp/current-submit`, bounded SMP1/SMP4 QEMU
+  runs above. Next step: continue with broader glibc/LTP selectors only if a
+  fresh guest log names a new failing group; the known single-core
+  `basic-glibc` openat issue is closed.
+- 2026-07-01/02 (SMP4 glibc boot works on nonzero boot hart). Fixed the RV64
+  QEMU SMP/OpenSBI boot path for `basic-glibc` by keeping boot-published facts
+  out of `.bss` and avoiding an unsafe first userspace hart hop. The red
+  witnesses were `target/oscomp/custom-run/glibc-smp4-basic-current.txt`
+  (Boot HART ID 2, ext4 mount, then `BootStaticBag not constructed`) and
+  `target/oscomp/custom-run/glibc-smp4-basic-extroot-layout-cmdline-fixed.txt`
+  (Boot HART ID 1, `oscomp:groups:basic-glibc`, then a later
+  `zone Cap key no longer resolves to a live slot` panic after
+  `userspace:submitted`). Fixes: place `STORED_BOOT_STATIC_BAG` in
+  `.data.boot_static_bag`, place the borrowed boot `CMDLINE` buffer in
+  `.data.boot_static_cmdline`, and submit the initial userspace thread on the
+  current boot hart instead of forcing CPU0 while userspace handoff remains
+  hart-local. The current layout check reports `layout-green: bss
+  0xffffffff80a96000 0xffffffff81370158 checked 2`, with `CMDLINE` at
+  `0xffffffff80a90dc0` and `STORED_BOOT_STATIC_BAG` at
+  `0xffffffff80a94fc8`, both before `__bss_start`. Green guest witnesses:
+  `target/oscomp/custom-run/glibc-smp4-basic-extroot-layout-currenthart-r1.txt`
+  booted with Boot HART ID 2, reached SMP AP/IPI, ext4 mount,
+  `oscomp:groups:basic-glibc`, `#### OS COMP TEST GROUP START basic-glibc ####`,
+  `#### OS COMP TEST GROUP END basic-glibc ####`, and
+  `userspace:exited:0`; `cargo xtask fault-decode --target rv64-qemu --serial
+  ... --all --brief` found no `scause`/`sepc`/`stval` trap lines. SMP1
+  comparison
+  `target/oscomp/custom-run/glibc-smp1-basic-extroot-layout-cmdline-fixed.txt`
+  also reaches group START/END and exits 0. Verification: `cargo test -p
+  tx-kernel
+  initial_userspace_sched_meta_stays_on_current_hart_when_boot_hart_is_nonzero
+  -- --nocapture`, `cargo xtask build --target rv64-qemu`, `cargo xtask oscomp
+  submit --target rv64-qemu --submit target/oscomp/current-submit`, the `nm`
+  layout check above, bounded SMP4 QEMU runs, and scoped `git diff --check`.
+  `cargo xtask progress validate` passed; a `cargo -q xtask unit` attempt was
+  terminated after `cargo test -p tx-shims --lib -- --test-threads=1` stayed
+  silent for several minutes in this dirty checkout. The glibc `openat` case
+  still prints its existing `Assert Fatal` inside the group, so syscall
+  semantics remain a separate follow-up from the multicore boot/panic fix.
+- 2026-06-28 (demo C source now uses pthread create/join). Replaced
+  `tools/demo/sqlite-tcc/sqlite_threads.c` with the pthread hello program used
+  in the live demo: it prints `main: creating pthread`, creates one worker,
+  joins it, and reports return value `13`. Refreshed
+  `tools/demo/sqlite-tcc/README.md` so the interactive flow describes running
+  that pthread program while `run-demo.sh` remains a link-only helper. The
+  shell-test already guards the source copy by grepping
+  `main: creating pthread`; verification passed after reinstalling the demo and
+  rebuilding the Alpine cpio with `timeout 260s target/debug/xtask shell-test
+  --target rv64-qemu --profile alpine --append-cmdline tx.mount.sdcard=0
+  --extra-rv64-ext4
+  target/images/alpine-tcc-dev-root-rv64-qemu-pthread-src-green.ext4 --script
+  tools/shell-tests/alpine-demo-sqlite-tcc.txt`, including
+  `tcc-link-status:0`, `pthread-demo-source-status:0`, and
+  `mnt-tmp-sqlite-status:0`. The temporary ext4 copy was removed after the run.
+- 2026-06-28 (demo setup exposes /mnt/tmp sqlite path). Fixed the demo path
+  mismatch behind `sqlite3 /mnt/tmp/demo.db` failing with "unable to open
+  database file": `setup-tcc.sh` mounted the TCC ext4 at `/mnt/tcc` and created
+  `/mnt/tcc/tmp`, but did not expose `/mnt/tmp`. The setup script now creates
+  `/mnt/tmp -> /mnt/tcc/tmp` and prints `setup-tcc: tmp=/mnt/tmp`; the README
+  uses `/mnt/tmp/demo.db` for the sqlite example. Extended
+  `tools/shell-tests/alpine-demo-sqlite-tcc.txt` to run sqlite against
+  `/mnt/tmp/demo.db`, create/update a row, and expect
+  `mnt-tmp-sqlite:ok` plus `mnt-tmp-sqlite-status:0`. Verification passed with
+  `timeout 260s target/debug/xtask shell-test --target rv64-qemu --profile
+  alpine --append-cmdline tx.mount.sdcard=0 --extra-rv64-ext4
+  target/images/alpine-tcc-dev-root-rv64-qemu-mnttmp-verify.ext4 --script
+  tools/shell-tests/alpine-demo-sqlite-tcc.txt` after reinstalling the demo and
+  rebuilding the Alpine cpio. The canonical ext4 image remained held by an
+  interactive QEMU process (PID 30154), so the final guest check used a fresh
+  copy of it.
+- 2026-06-28 (demo run script reduced to TCC link-only step). Changed
+  `tools/demo/sqlite-tcc/run-demo.sh` so the one-shot demo helper now only
+  runs setup, copies `sqlite_threads.c` into `/tmp`, invokes
+  `tcc /tmp/sqlite_threads.c -o /tmp/sqlite_threads`, and prints
+  `tcc-link-status:0` plus `tcc-linked-bin:/tmp/sqlite_threads`. It no longer
+  executes the linked binary or starts sqlite worker tasks; sqlite remains a
+  separate interactive/demo step. Updated
+  `tools/shell-tests/alpine-demo-sqlite-tcc.txt` to enforce the link-only
+  contract and refreshed `tools/demo/sqlite-tcc/README.md`. Verification:
+  the updated shell-test first failed against the old guest script while it
+  still printed `tcc-demo`, sqlite worker, and count markers instead of
+  `tcc-link-status:0`; after reinstalling the demo into
+  `target/rootfs/alpine-rv64-qemu` and rebuilding the Alpine cpio,
+  `timeout 260s target/debug/xtask shell-test --target rv64-qemu --profile
+  alpine --append-cmdline tx.mount.sdcard=0 --extra-rv64-ext4
+  target/images/alpine-tcc-dev-root-rv64-qemu-linkonly-green.ext4 --script
+  tools/shell-tests/alpine-demo-sqlite-tcc.txt` passed. The canonical TCC ext4
+  image stayed write-locked by an existing interactive QEMU process (PID
+  10399), so the final guest check used a fresh copy of that image.
+- 2026-06-28 (TCC pthread default link fixed in demo ext4 image). Root-caused
+  the guest error `undefined symbol 'fetch_and_add_riscv64'` /
+  `undefined symbol '__rt_exit'` to the hand-synthesized
+  `/usr/lib/tcc/libtcc1.a` in the TCC ext4 image: it incorrectly archived
+  Alpine `tcc-dev`'s `bcheck.o` and `runmain.o`, overriding musl pthread
+  symbols and pulling unresolved TCC bounds-check / `-run` helpers into normal
+  links. Added `tools/demo/sqlite-tcc/prepare-tcc-ext4.sh`, wired it into both
+  `Makefile` and `makefile`, and rebuilt
+  `target/images/alpine-tcc-dev-root-rv64-qemu.ext4` with an empty default
+  `libtcc1.a` placeholder instead of those support objects. Added
+  `tools/shell-tests/alpine-tcc-pthread-link-smoke.txt` as the regression
+  witness. Verification: the new witness first reproduced the exact two
+  undefined symbols, then passed after the image fix with
+  `pthread-link-status:0`, `tcc-pthread-worker`, `tcc-pthread-ret:3`, and
+  `pthread-run-status:0`; `tools/shell-tests/alpine-demo-sqlite-tcc.txt` also
+  passed on the rebuilt image copy. The canonical image was rebuilt, but a
+  pre-existing interactive QEMU process (PID 46432) still held its write lock
+  during verification, so both final guest checks used fresh copies of that
+  image. Next: keep bounds-check / TCC `-run` support separate if we need those
+  modes later; normal `tcc file.c -o file` should not archive `bcheck.o` or
+  `runmain.o`.
+- 2026-06-28 (demo boot cfg prints TxKernel ASCII banner). Added the
+  `tx_demo_boot` cfg to the workspace check-cfg allowlist and taught
+  `make demo` to build the demo kernel with
+  `RUSTFLAGS="--cfg tx_demo_boot"` while preserving any caller-supplied
+  `RUSTFLAGS`. Under that cfg, kernel boot now writes a pure-ASCII TxKernel
+  banner and `txkernel:<board>:demo:boot-banner:ok` before the normal boot
+  sentinels; default builds compile the banner path out. Verification:
+  `cargo test -p tx-kernel demo_boot_banner_is_ascii_and_names_txkernel --
+  --test-threads=1`, `cargo test -p xtask qemu_ -- --test-threads=1`,
+  `make -n demo`, `RUSTFLAGS="--cfg tx_demo_boot" cargo build -p
+  tx-kernel-riscv64-qemu-virt --target riscv64gc-unknown-none-elf`,
+  `RUSTFLAGS="--cfg tx_demo_boot" timeout 120s target/debug/xtask qemu
+  --target rv64-qemu --profile smoke --expect-sentinel --timeout-ms 90000
+  --no-block`, and `rg -n "TxKernel demo boot|demo:boot-banner:ok"
+  target/qemu-rv64-qemu-smoke.serial.log` all passed. Existing unrelated
+  warnings remain in the RV64 HAL, tx-fs, tx-shims, tx-subsystems, and xtask.
+- 2026-06-28 (QEMU tx-observe pthread-minimal1 hot path captured). Ran
+  `cargo xtask observe oscomp-live --test pthread-minimal1 --name
+  observe-hotpath-pthread-minimal1-20260628-0435 --timeout 60 --smp 1`
+  into
+  `target/oscomp/custom-run/observe-hotpath-pthread-minimal1-20260628-0435/`.
+  The guest completed `b_pthread_createjoin_minimal1 (0)` with reported time
+  `20.113573000` and `userspace:exited:0`; live drain captured 283,281 raw
+  records, `complete=true`, and zero lost/overwritten/repair/framing records.
+  Added the research report at
+  `docs/progress/research/2026-06-28-tx-observe-qemu-hotpath-pthread-minimal1.md`.
+  After excluding the outer `sys_wait4` wait window, repeated kernel work ranks
+  as `sys_clone` 2.777s, `sys_munmap` 1.364s, `sys_futex` 1.249s,
+  `sys_rt_sigprocmask` 1.060s, `sys_mmap` 0.944s, and `sys_exit` 0.833s.
+  VM recipe duration counters add `publish.duration_ns=466.436ms` and
+  `reclaim_tree.duration_ns=171.452ms`. Next: rerun with targeted clone,
+  VM map/unmap, futex, lock, and pmap shootdown counters to split the syscall
+  buckets into internal phases.
+- 2026-06-28 (tx-observe demo pipeline report generated). Ran the built-in
+  `cargo xtask observe demo --with-yields` pipeline into
+  `target/observe-demo-20260628-042830/`, then validated, replayed, rendered
+  Perfetto, analyzed, queried SQL, and exported Parquet derived tables. The
+  trace contains 1 hart, 16 slots, 12 records, 0 framing errors, 5 reconstructed
+  spans, and a synthetic `sys_read -> PipeReadOp -> step/yield/resume/step`
+  hierarchy; SQL over `spans` returned `spans=5`, `total_ns=25000`,
+  `max_ns=11000`. Added the report at
+  `docs/progress/research/2026-06-28-tx-observe-demo-report.md`. Existing
+  warnings remain in xtask (`unused BTreeSet`) and tx-trace-daemon dead-code
+  paths. Next: use `observe oscomp-live` or `live-guest-mem` for a real
+  QEMU/OSComp workload report with `runtime.json` completeness/loss counts.
+- 2026-06-28 (interactive sqlite/vi/TCC demo wired to `make demo`). Added
+  a host wrapper in `Makefile`/`makefile`: `make demo` installs
+  `tools/demo/sqlite-tcc/` into `target/rootfs/alpine-rv64-qemu`, rebuilds the
+  Alpine cpio, builds the RV64 kernel, checks
+  `target/images/alpine-tcc-dev-root-rv64-qemu.ext4`, and starts interactive
+  Alpine QEMU with `tx.mount.sdcard=0` plus that ext4 image attached as
+  `/dev/block/vda`. `xtask qemu` now accepts the same demo-shape flags as
+  shell-test, `--append-cmdline` and `--extra-rv64-ext4`, so the Makefile target
+  uses `cargo xtask qemu --profile alpine --interactive` instead of a hand-built
+  QEMU command. The guest demo folder contains `setup-tcc.sh` for idempotent
+  `/mnt/tcc` mount and `/usr`/`/lib` compatibility links, `run-demo.sh` for a
+  one-shot demo, and `sqlite_threads.c` as the TCC/musl compile smoke. The
+  guest one-shot flow compiles/runs the C program (`tcc-demo:
+  sizeof(uint64_t)=8`, return 7), then runs two background sqlite writer
+  processes against `/mnt/tcc/tmp/demo.db` using DELETE-journal transactions and
+  verifies `count:20`, `a:10`, `b:10`, and `PRAGMA integrity_check=ok`.
+  Follow-up work fixed the TCC pthread default-link issue in the demo ext4
+  image; the checked-in sqlite demo still keeps guest C compilation and sqlite
+  concurrency as separate stable steps. Verification passed with
+  `cargo test -p xtask qemu --
+  --nocapture`, `make -n demo`, `cargo xtask qemu ... --dry-run`,
+  `sh -n tools/demo/sqlite-tcc/run-demo.sh`, `cc -fsyntax-only
+  tools/demo/sqlite-tcc/sqlite_threads.c`, rebuilding the Alpine cpio, and
+  `timeout 260s target/debug/xtask shell-test --target rv64-qemu --profile
+  alpine --append-cmdline tx.mount.sdcard=0 --extra-rv64-ext4
+  target/images/alpine-tcc-dev-root-rv64-qemu.ext4 --script
+  tools/shell-tests/alpine-demo-sqlite-tcc.txt` (`shell-test: ok`). Next:
+  decide whether to fold a guest-compiled pthread sqlite writer into the demo
+  or keep sqlite concurrency in the shell workers.
+- 2026-06-28 (normal ext4 mount plus TCC default link smoke passed).
+  Added a kernel cmdline escape hatch, `tx.mount.sdcard=0`, so RV64 Alpine
+  shell tests can attach an ext4 disk without the boot-only `/musl` auto-mount
+  consuming `vda`. Fixed `sys_mount` mount publication by registering the new
+  mount in the global mount table as well as the process mount namespace; before
+  this, `mount -t ext4 /dev/block/vda /mnt/tcc` returned 0 but path walks still
+  saw the empty tmpfs mountpoint. Added `--append-cmdline` to `xtask shell-test`
+  and `tools/shell-tests/alpine-tcc-normal-ext4-mount-default-link-smoke.txt`.
+  Rebuilt `target/images/alpine-tcc-dev-root-rv64-qemu.ext4` from the TCC dev
+  staging tree; later follow-up corrected the `libtcc1.a` placeholder so
+  normal pthread links no longer pull TCC bounds-check support objects.
+  Verification passed with
+  `timeout 260s target/debug/xtask shell-test --target rv64-qemu --profile
+  alpine --append-cmdline tx.mount.sdcard=0 --extra-rv64-ext4
+  target/images/alpine-tcc-dev-root-rv64-qemu.ext4 --script
+  tools/shell-tests/alpine-tcc-normal-ext4-mount-default-link-smoke.txt`: boot
+  omitted `:mount:sdcard:ext4:ok`, `/musl` was absent with
+  `boot-musl-dir-status:1`, userland `mount -t ext4 /dev/block/vda /mnt/tcc`
+  returned `normal-mount-status:0`, `/mnt/tcc/usr/bin/tcc` was
+  visible, TCC default link returned `default-link-status:0`, and the compiled
+  program printed `tcc-normal-mount-linked` with `default-run-status:7`.
+  Remaining boundary: TCC's compiled-in paths are still `/usr`-rooted, so the
+  smoke creates temporary `/usr` compatibility symlinks for a non-root mount.
+- 2026-06-28 (Alpine sqlite3 ext4-backed write and reboot-read probe passed).
+  Probed sqlite writes on a real virtio block-backed ext4 mount instead of
+  tmpfs. Host `mkfs.ext4`/`debugfs` were unavailable, so the run copied the
+  existing `target/images/alpine-tcc-dev-root-rv64-qemu.ext4` to
+  `target/images/alpine-ext4-write-probe-rv64-qemu.ext4`, booted the Alpine
+  sqlite initramfs manually with
+  `virtio-blk-device,drive=txblk0,bus=virtio-mmio-bus.0`, and let boot mount
+  the image at `/musl`. First boot printed `:block:ext4-superblock:ok` and
+  `:mount:sdcard:ext4:ok`; guest `/usr/bin/sqlite3` created
+  `/musl/tmp/tx-ext4-sqlite.db`, ran `CREATE TABLE`, inserted
+  `ext4=write-ok`, selected `ext4-row:ext4=write-ok`, returned
+  `PRAGMA integrity_check` as `ok`, reopened the same DB in-session as
+  `ext4-reopen:write-ok`, and exited with status 0. A second boot using the
+  same ext4 image showed `/musl/tmp/tx-ext4-sqlite.db` still present and
+  selected `ext4-persist:write-ok` with `integrity_check` `ok` and status 0.
+  This proves sqlite file creation/write/read across QEMU boots on the
+  block-backed ext4 image. Remaining unproved surface: crash-recovery
+  durability under abrupt mid-transaction power loss; Alpine shell-test still
+  needs an extra-drive option before this can be checked in as a normal
+  `cargo xtask shell-test` witness.
+- 2026-06-27 (Alpine sqlite3 concurrent WAL writer smoke passed). Added
+  `tools/shell-tests/alpine-sqlite-concurrent-wal-smoke.txt` to push beyond
+  single-process WAL. The witness writes a guest shell script that initializes a
+  WAL database on `/tmp`, then launches two background workers; each worker
+  starts 25 separate `/usr/bin/sqlite3` processes with `PRAGMA busy_timeout=5000`
+  and inserts into the same table/DB while the parent shell waits for both.
+  After rebuilding the Alpine cpio from the minimal `busybox sqlite` rootfs
+  (`TX_ALPINE_ROOTFS=target/rootfs/alpine-rv64-qemu target/debug/xtask image
+  cpio --profile alpine --target rv64-qemu`), verification passed with
+  `TX_ALPINE_ROOTFS=target/rootfs/alpine-rv64-qemu timeout 180s
+  target/debug/xtask shell-test --target rv64-qemu --profile alpine --script
+  tools/shell-tests/alpine-sqlite-concurrent-wal-smoke.txt`: both workers
+  printed done, `worker-status:0:0`, `concurrent-count:50`, `concurrent-a:25`,
+  `concurrent-b:25`, `PRAGMA integrity_check` returned `ok`, and
+  `sqlite-concurrent-status-0` was observed. This proves basic multi-process
+  sqlite3 WAL write contention on tmpfs under the shell's background/wait path;
+  remaining unproved surfaces are block-backed ext4 persistence and
+  crash-recovery durability.
+- 2026-06-27 (Alpine sqlite3 transaction and WAL smokes passed). Added
+  `tools/shell-tests/alpine-sqlite-transaction-smoke.txt` and
+  `tools/shell-tests/alpine-sqlite-wal-smoke.txt` on top of the minimal
+  `TX_ALPINE_PACKAGES='busybox sqlite'` Alpine RV64 image. Verification passed:
+  `TX_ALPINE_ROOTFS=target/rootfs/alpine-rv64-qemu timeout 180s
+  target/debug/xtask shell-test --target rv64-qemu --profile alpine --script
+  tools/shell-tests/alpine-sqlite-transaction-smoke.txt` covered
+  `BEGIN IMMEDIATE`, `SAVEPOINT`, `ROLLBACK TO`, `COMMIT`, a unique/check table,
+  an index, aggregate/order queries, a second table write, reopen, and
+  `PRAGMA integrity_check` (`ok`). `TX_ALPINE_ROOTFS=target/rootfs/alpine-rv64-qemu
+  timeout 180s target/debug/xtask shell-test --target rv64-qemu --profile alpine
+  --script tools/shell-tests/alpine-sqlite-wal-smoke.txt` then entered
+  `journal_mode=WAL`, wrote and updated rows, checkpointed with `0|4|4`, passed
+  `integrity_check`, and reopened with `wal-reopen:two-updated`. This upgrades
+  the sqlite demo from CRUD to single-process transaction/index/WAL operation on
+  tmpfs. Remaining unproved surfaces: concurrent sqlite processes/lock
+  contention, block-backed ext4 persistence, and crash-recovery durability.
+- 2026-06-27 (Alpine sqlite3 file-backed CRUD smoke passed). Added
+  `tools/shell-tests/alpine-sqlite-crud-smoke.txt` and regenerated the minimal
+  Alpine RV64 rootfs/initramfs with `TX_ALPINE_PACKAGES='busybox sqlite'` after
+  the target rootfs had drifted to a larger package set. Verification passed
+  with `TX_ALPINE_ROOTFS=target/rootfs/alpine-rv64-qemu timeout 180s
+  target/debug/xtask shell-test --target rv64-qemu --profile alpine --script
+  tools/shell-tests/alpine-sqlite-crud-smoke.txt`: inside the guest,
+  `/usr/bin/sqlite3` created `/tmp/sqlite-crud-demo.db`, set
+  `journal_mode=DELETE`, disabled mmap via `PRAGMA mmap_size=0`, created table
+  `kv`, inserted two rows, selected `after-insert:2`, updated `b` to `three`,
+  selected `after-update:three`, deleted `a`, selected `after-delete:1`, exited
+  with `sqlite-crud-status-0`, then reopened the same database and selected
+  `final:b=three` with `sqlite-reopen-status-0`. This proves a file-backed
+  sqlite3 CRUD path on tmpfs with mmap disabled; it still does not prove WAL,
+  concurrent locking, persistent block-backed ext4, or full fsync durability.
+- 2026-06-27 (Alpine sqlite3 bare in-memory smoke passed). Rebuilt the
+  minimal Alpine RV64 rootfs with `TX_ALPINE_PACKAGES='busybox sqlite'` and
+  added `tools/shell-tests/alpine-sqlite-memory-smoke.txt` as the smallest
+  sqlite3 demo witness. Verification passed with
+  `TX_ALPINE_ROOTFS=target/rootfs/alpine-rv64-qemu timeout 180s
+  target/debug/xtask shell-test --target rv64-qemu --profile alpine --script
+  tools/shell-tests/alpine-sqlite-memory-smoke.txt`: the guest resolves
+  `/usr/bin/sqlite3`, runs `sqlite3 :memory: 'select 1+2;'`, prints `3`, and
+  exits with `sqlite-memory-status-0`. This proves the dynamic sqlite3 CLI,
+  musl/readline/ncurses dependency path, stdio, and in-memory SQL only. Next:
+  try a file-backed `/tmp/demo.db` smoke to exercise open/pread/pwrite,
+  truncate, fcntl locks, sync, rename/unlink, and mmap-disabled database IO.
+- 2026-06-27 (Alpine TCC lightweight compile, freestanding run, and
+  ext4-backed explicit musl link smokes passed). Added compiler witnesses at
+  `tools/shell-tests/alpine-tcc-compile-smoke.txt` and
+  `tools/shell-tests/alpine-tcc-freestanding-run-smoke.txt`, plus ext4 TCC
+  witnesses at `tools/shell-tests/alpine-tcc-musl-ext4-explicit-crt-smoke.txt`
+  and `tools/shell-tests/alpine-tcc-musl-ext4-default-link-fails.txt`. Rebuilt
+  `target/rootfs/alpine-rv64-tcc-qemu` with only `busybox openrc tcc`; the
+  rootfs is 8.8M and the Alpine cpio is `20940 blocks` / about 10M, avoiding
+  the GCC image's large-initramfs path. Guest verification passed for the
+  object smoke:
+  `timeout 180s cargo xtask shell-test --target rv64-qemu --profile alpine
+  --script tools/shell-tests/alpine-tcc-compile-smoke.txt`; it compiled
+  `/tmp/hello.c` to a non-empty `/tmp/hello.o` and observed
+  `tcc-object-status:0`. Guest verification also passed for the freestanding
+  link-and-exec smoke:
+  `timeout 180s cargo xtask shell-test --target rv64-qemu --profile alpine
+  --script tools/shell-tests/alpine-tcc-freestanding-run-smoke.txt`; it linked
+  a `-nostdlib` `_start` program with TCC, ran it, and observed
+  `tcc-run-status:42`. Prepared
+  `target/images/alpine-tcc-dev-root-rv64-qemu.ext4` from
+  `TX_ALPINE_PACKAGES='busybox openrc tcc musl-dev tcc-dev'` with explicit
+  `mkfs.ext4 -b 4096`; the first 1K-block image reached
+  `:block:ext4-superblock:ok` but failed `:mount:sdcard:ext4:err`, matching the
+  current `tx-ext4` 4K-block pager requirement. Added
+  `--extra-rv64-ext4` to `cargo xtask shell-test` so Alpine can boot the small
+  initramfs while attaching the TCC development rootfs at
+  `virtio-mmio-bus.0`. Verification passed:
+  `timeout 220s cargo xtask shell-test --target rv64-qemu --profile alpine
+  --extra-rv64-ext4 target/images/alpine-tcc-dev-root-rv64-qemu.ext4 --script
+  tools/shell-tests/alpine-tcc-musl-ext4-explicit-crt-smoke.txt`; it observed
+  `:mount:sdcard:ext4:ok`, linked a `stdio` program with explicit
+  `/musl/usr/lib/{crt1.o,crti.o,crtn.o}` plus `-lc`, ran `/tmp/tccmain`, printed
+  `tcc-musl-linked`, and returned `explicit-crt-run-status:7`. The default TCC
+  libc link remains a packaging/search-path gap:
+  `alpine-tcc-musl-ext4-default-link-fails.txt` shows `crt1.o`, `crti.o`,
+  `libtcc1.a`, and `crtn.o` not found under the simple `-B/-I/-L /musl` shape;
+  Alpine's riscv64 `tcc-dev` package does not provide `libtcc1.a`. Details:
+  `docs/progress/research/2026-06-27-alpine-tcc-light-smoke.md`.
+- 2026-06-27 (workspace compile blockers cleared after GCC readiness audit).
+  Fixed the dirty-tree compile blockers that were preventing the `tx-shims`
+  test target and workspace all-target check from compiling: exported the
+  missing Linux constants, added the missing netns mount test root helper,
+  supplied explicit `ShimsTestPmap` type parameters for direct trap helpers,
+  kept `tx-observe::testing` no_std so dev-test features no longer pull `std`
+  into kernel board bins, gated board panic handlers out of test-harness
+  builds, and synchronized the v3 `Errno` closed-catalog test with the current
+  network errno set. Verification passed: `cargo test -p tx-shims --no-run`,
+  the four new `tx-shims` syscall/VFS regression selectors, `cargo test -p
+  tx-observe -- --test-threads=1`, `cargo test -p tx-scripts --test
+  drive_observe -- --test-threads=1`, `rustfmt --edition 2021 --check` over
+  the touched Rust files, `git diff --check --` over the touched files,
+  `cargo xtask progress validate`, and `cargo check --workspace --all-targets`.
+  A default `cargo test -p tx-subsystems
+  unshared_private_installs_allocate_only_leaf_nodes -- --test-threads=1`
+  still fails because that metrics assertion expects
+  `--cfg tx_vm_private_page_metrics`; this is not a compile blocker. Details:
+  `docs/progress/research/2026-06-27-alpine-gcc-readiness.md`.
+- 2026-06-27 (Alpine TTY raw timing, VINTR, and winsize witnesses closed).
+  Closed the three remaining Alpine TTY follow-ups after the controlling-TTY
+  slice. Non-canonical raw reads now share a TTY-owned `VMIN/VTIME` wait plan:
+  poll/select readiness no longer means only "queue has any byte", and the
+  syscall read path waits for `VMIN` or the `VTIME` deadline before returning a
+  short read. The checked-in BusyBox `vi` edit witness remains a single
+  batched `send "iguest-vi-edit-ok\n\e:wq\n"` directive, but shell-test now
+  treats ESC/control bytes inside a `send` as interactive key boundaries rather
+  than one paste burst; that witness passes in QEMU and writes the edited file.
+  VINTR now has both host and guest proof: console RX ingest delivers
+  the TTY deferred signal through the foreground process group, shell
+  job-control setup can move a direct child into a child-led pgrp and bind it
+  via typed `TIOCSPGRP`, and the Alpine witness interrupts `sleep 30` with
+  `^C` before `VINTR_SHOULD_NOT_PRINT`. Initial hardware winsize is now seeded
+  externally through xtask-provided `tx.tty.rows` / `tx.tty.cols` cmdline
+  tokens, using `TX_TTY_ROWS`/`TX_TTY_COLS`, then host `stty size`, then
+  `24 80`; the guest witness with `33x101` shows both `/proc/cmdline` and
+  `stty size` carrying the seeded value. Verification passed:
+  `cargo test -p tx-subsystems
+  noncanonical_vmin_with_vtime_blocks_until_threshold_is_met --
+  --test-threads=1`, `cargo test -p tx-kernel
+  dispatch_irq_vintr_delivers_sigint_to_foreground_pgrp -- --test-threads=1`,
+  `cargo test -p tx-kernel
+  tty_winsize_cmdline_requires_positive_rows_and_cols -- --test-threads=1`,
+  `cargo check -p tx-kernel --lib`, and the three Alpine shell witnesses
+  `tools/shell-tests/alpine-vi-edit-smoke.txt`,
+  `tools/shell-tests/alpine-tty-vintr-focused-probe.txt`, and
+  `tools/shell-tests/alpine-tty-winsize-seeded-smoke.txt` under
+  `TX_TTY_ROWS=33 TX_TTY_COLS=101`. `cargo -q xtask unit` still has unrelated
+  dirty-tree blockers: `tx-shims` lib-test compile errors (`E0283`, `E0425`,
+  `E0432`) and the existing `tx-ext4`
+  `ext4_v3_truncate_surface_enosys_but_fsync_is_accepted` expectation
+  mismatch (`Done(())` vs `Err(ENOSYS)`). Details:
+  `docs/progress/research/2026-06-27-alpine-tty-readiness.md`.
+- 2026-06-27 (Alpine GCC ext4 startup check). The prepared
+  `target/images/alpine-gcc-root-rv64-qemu.ext4` image now has guest-visible
+  startup evidence when attached to RV64 QEMU as
+  `virtio-blk-device,drive=txblk0,bus=virtio-mmio-bus.0`. Without the explicit
+  bus binding, QEMU places the disk on `virtio-mmio-bus.7` while the current
+  RV64 kernel only probes the board `virtio0` MMIO region, so the kernel prints
+  `:devices:block:ok` but only registers the scratch block device and silently
+  skips both `:block:ext4-superblock:*` and `/musl` mounting. With bus0 binding,
+  the guest prints `:block:ext4-superblock:ok` and
+  `:mount:sdcard:ext4:ok`, reaches the Alpine shell, and can list
+  `/musl/usr/bin/gcc` plus GCC `cc1` from the ext4 mount. Executing a static
+  ELF from ext4 is also past the first exec layer: `/musl/bin/tx-bootstrap-busybox`
+  is entered and returns BusyBox's `applet not found` path. The remaining
+  startup blocker is now narrower than storage discovery: both
+  `/musl/usr/bin/gcc --version` and an explicit
+  `/musl/lib/ld-musl-riscv64.so.1 --library-path /musl/lib:/musl/usr/lib
+  /musl/usr/bin/gcc --version` hung without version output before the bounded
+  expect timeouts. Next: instrument the dynamic ELF/load-segment and ext4
+  file-read path for GCC, then wire Alpine QEMU/shell-test support for an
+  explicit root drive instead of relying on manual QEMU commands. Details:
+  `docs/progress/research/2026-06-27-alpine-gcc-readiness.md`.
+- 2026-06-27 (Alpine controlling TTY closure passed guest probe).
+  Completed the eight-phase controlling-TTY implementation slice for Alpine.
+  `/dev/ttyS0` is now the hardware TTY identity, `/dev/console` remains a
+  devfs alias to the same `TtyIdentity`, and path/fd metadata reports Linux
+  device numbers consistently (`ttyS0`/`console` as `4:64`, caller-relative
+  `/dev/tty` as `5:0`). `openat` now performs best-effort controlling-tty
+  acquisition for eligible session leaders unless `O_NOCTTY`/`O_PATH` applies,
+  `/dev/tty` is implemented as a syscall-layer caller-relative special case,
+  TTY `read(2)`/`write(2)` dispatches use process-aware job-control wrappers,
+  and `/proc/self/fd/N` readlink/stat/statx now resolve through the caller fd
+  table so BusyBox/musl `ttyname` can match fd 0 to `/dev/ttyS0`.
+  Verification passed: `cargo check -p tx-shims --lib`, `cargo test -p tx-fs
+  devfs`, `cargo test -p tx-subsystems tty::tests::typed_session_pgrp`,
+  `cargo test -p tx-kernel boot_smoke_init_fds_preopened_to_console --
+  --nocapture`, `cargo xtask build --target rv64-qemu`, and
+  `TX_ALPINE_ROOTFS=target/rootfs/alpine-rv64-qemu timeout 180s cargo xtask
+  shell-test --target rv64-qemu --profile alpine --script
+  /tmp/tx-alpine-tty-complete-probe-v2.shelltest`. The guest probe reached the
+  Alpine shell without `can't access tty; job control turned off`, showed
+  `/dev/ttyS0` and `/dev/console` as `4,64`, `/dev/tty` as `5,0`,
+  `readlink /proc/self/fd/0 -> /dev/ttyS0`, `stat /proc/self/fd/0 -> 4:40`,
+  `echo ... >/dev/tty` success, and `tty -> /dev/ttyS0` with status 0. The
+  `tx-shims` test target still has unrelated pre-existing compile blockers in
+  other modules, so fd-ops tests are covered by source additions plus
+  `cargo check -p tx-shims --lib` until that target is repaired. Remaining TTY
+  work is now outside the controlling-tty slice: raw/non-canonical
+  `VMIN/VTIME` timing for batched BusyBox `vi`, VINTR foreground signal
+  end-to-end proof, and optional host-seeded winsize instead of the current
+  fixed hardware default. Details:
+  `docs/progress/research/2026-06-27-alpine-tty-readiness.md`.
+- 2026-06-27 (Alpine GCC startup readiness investigated). The current blocker
+  is before GCC execution: the full toolchain rootfs exists and contains
+  `/usr/bin/gcc`, `cc1`, `as`, `ld`, `crt1.o`, and `libc.so`, and the witness
+  `tools/shell-tests/alpine-gcc-compile-smoke.txt` is shaped to run
+  `gcc --version`, compile `/tmp/hello.c`, and execute it. Rebuilding the
+  Alpine initramfs from `target/rootfs/alpine-rv64-gcc-qemu` produced a 270M
+  cpio archive with GCC payloads, but boot failed during initramfs unpack with
+  `txkernel:qemu-riscv64-virt:initramfs:fail:materialize_anon`; bootstrap exec
+  then reported `/bin/tx-bootstrap-busybox` as path-not-found and fell back to
+  the baked `/init` fixture. The cpio archive does contain
+  `/bin/tx-bootstrap-busybox`, so the missing path is a consequence of failed
+  unpack, not an image assembly bug. A diagnostic rootfs that removed the large
+  nonessential LTO files (`lto-dump` and `lto1`) shrank to 169M and produced a
+  `342917 blocks` cpio, but reproduced the same `materialize_anon` failure
+  under the default 1G Alpine QEMU profile. Manual 2G QEMU did not bypass the
+  issue: it trapped earlier reading initrd bytes at physical `0xffe00000`,
+  decoded as a load page fault at `core::ptr::read_unaligned`, which points to
+  a separate rv64 direct-map/initrd-placement limit above the current mapped
+  window. Next: avoid eager whole-initramfs-to-tmpfs duplication for large
+  Alpine images or fix the larger-RAM direct-map path, and improve the
+  initramfs sentinel to print the hidden errno (`materialize_anon` maps to
+  `ENOMEM`) before chasing GCC-visible syscall gaps. Follow-up artifact:
+  `target/images/alpine-gcc-root-rv64-qemu.ext4` is now prepared as a 768M
+  ext4 image labeled `TXALPINE`, built from the GCC Alpine rootfs plus
+  `/bin/tx-bootstrap-busybox` and `/bin/sh`; `debugfs` confirmed GCC, `cc1`,
+  and bootstrap shell entries, and `e2fsck -fn` completed all five passes.
+  This image is not wired into the Alpine QEMU boot path yet; existing xtask
+  ext4 generation and drive attachment are busybox-only. Details:
+  `docs/progress/research/2026-06-27-alpine-gcc-readiness.md`.
+- 2026-06-27 (controlling TTY integration implemented for open/devfs/syscall paths).
+  Implemented the first controlling-TTY closure slice from the Alpine TTY
+  audit. Boot now registers the hardware console as `ttyS0` and keeps
+  `/dev/console` as an alias to the same `TtyIdentity`; devfs tests now pin
+  `ttyS0`/`console` lookup, materialization, shared identity, and readdir
+  enumeration. `openat` now recognizes `O_NOCTTY`, attempts Linux-style
+  best-effort controlling-tty acquisition when a session leader opens a TTY
+  without `O_NOCTTY`, and implements caller-relative `/dev/tty` in the syscall
+  shim via the caller session's controlling TTY, returning `ENXIO` when absent.
+  The kernel bootstrap path now also binds init's preopened `/dev/console`
+  fds 0/1/2 as the initial session's controlling TTY; those fds are created
+  outside `sys_openat`, so the open-time helper alone did not cover Alpine's
+  first interactive shell.
+  Real `read(2)`/`write(2)` syscall paths now route TTY-backed fds through the
+  process-aware `ReadForProcessOp` / `WriteForProcessOp` wrappers, so foreground
+  pgrp checks and background `SIGTTIN`/`SIGTTOU` delivery are no longer limited
+  to local TTY unit tests. Added fd-ops openat tests for auto acquisition,
+  `O_NOCTTY`, `/dev/tty` without a controlling terminal, and `/dev/tty` after
+  binding; those are present but the current `tx-shims` test target is blocked
+  by unrelated pre-existing compile errors in other test modules
+  (`ITIMER_REAL`, `NETLINK_XFRM`, `CLONE_NEWNS`, missing
+  `build_mount_api_test_root`, and two generic `TimeIf` annotations).
+  Verification completed: `cargo check -p tx-shims --lib`, `cargo test -p
+  tx-fs devfs`, `cargo test -p tx-subsystems
+  tty::tests::typed_session_pgrp`, `cargo test -p tx-kernel
+  boot_smoke_init_fds_preopened_to_console -- --nocapture`, and
+  `cargo xtask build --target rv64-qemu` passed. Alpine QEMU probes now reach
+  the first shell without `can't access tty; job control turned off`;
+  `/dev/ttyS0` and `/dev/console` are both visible; `/dev/tty` can be opened
+  read-only and read-write through caller-relative resolution after boot
+  controlling-TTY binding. `cargo test -p tx-shims
+  linux_syscall::tests::fd_ops_wave2 --no-run` is blocked by the unrelated
+  test-target errors listed above, and `cargo fmt --check` is blocked by
+  unrelated dirty-tree formatting drift across existing files. Remaining Alpine
+  TTY blockers: BusyBox `tty` still reports `not a tty` despite `/dev/tty`
+  open success, likely in the ttyname/procfs observability path; devfs
+  `O_TRUNC` on character devices is still deferred by request and still makes
+  `echo ... >/dev/tty` return `ENOSYS`; raw/non-canonical `VMIN/VTIME`
+  readiness still needs alignment; QEMU guest-visible winsize source remains
+  unresolved.
+- 2026-06-27 (Alpine procfs scripted sweep closed for current witnesses).
+  Completed the current Alpine procfs/network sweep across the checked-in shell
+  witnesses. The procfs fixes now cover root readdir cursor advancement,
+  `/proc/<pid>/exe` readlink object-id decoding, `/proc/<pid>/ns/net`
+  visibility, Linux-shaped `/proc/net/{tcp,udp,snmp,netlink,dev,route}`,
+  namespace-aware `/proc/net/{arp,tx_neigh,nf_conntrack,tx_nf_rules}` reads,
+  caller-netns writes for `/proc/sys/net/ipv4/ip_forward` and
+  `/proc/net/tx_nf_rules`, and sysfs `/sys/class/net/*` visibility. The final
+  bridge/NAT gap was not procfs rendering itself: raw ICMP was still bypassing
+  connected bridge/veth and gateway routes, so bridge neighbor and Docker-shaped
+  conntrack state never existed for procfs to project. `step_send` now keeps the
+  configured-peer synthetic ICMP fast path for direct configured peers while
+  routing connected-device and gateway paths through the real namespace runtime;
+  `namespace_runtime_container_ping_host_gateway_learns_bridge_neighbor` pins
+  host bridge neighbor projection for `172.17.0.2 dev docker-neigh0`.
+  Verification: `rustfmt --edition 2024 --check
+  crates/tx-subsystems/src/net/execution/step_send.rs
+  crates/tx-subsystems/src/net/tests/bridge_tests.rs
+  crates/tx-subsystems/src/net/namespace.rs
+  crates/tx-subsystems/src/net/rtnetlink.rs
+  crates/tx-subsystems/src/net/tests/rtnetlink_tests.rs
+  crates/tx-fs/src/procfs/mod.rs crates/tx-fs/src/procfs/read.rs`,
+  `git diff --check --` over the scoped procfs/net/script/status files,
+  `cargo test -p tx-fs procfs -- --test-threads=1`, `cargo test -p
+  tx-subsystems namespace_runtime_container_ping_host_gateway_learns_bridge_neighbor
+  -- --test-threads=1`, `cargo test -p tx-subsystems
+  raw_icmpv4_send_to_configured_peer_route_returns_echo_reply --
+  --test-threads=1`, `cargo test -p tx-subsystems
+  namespace_runtime_retries_masqueraded_forward_after_uplink_arp_resolution --
+  --test-threads=1`, and `cargo xtask build --target rv64-qemu` passed.
+  Alpine shell witnesses passed:
+  `alpine-proc-exe-focused-probe.txt` (`N73F_PROC_EXE_SUCCESS`),
+  `alpine-proc-net-sysfs-smoke.txt`,
+  `alpine-network-abi-focused-probe.txt`,
+  `alpine-openrc-networking-focused-probe.txt`,
+  `alpine-netns-veth-bridge-focused-probe.txt` (`N73C_NETNS_CONTROL_SUCCESS`),
+  `alpine-netns-veth-bridge-ping-focused-probe.txt`
+  (`N73D_BRIDGE_PING_SUCCESS`), `alpine-bridge-fdb-visibility-focused-probe.txt`
+  (`N73G_BRIDGE_VISIBILITY_SUCCESS`), and
+  `alpine-docker-nat-data-plane-focused-probe.txt`
+  (`N73E_DOCKER_NAT_DATA_PLANE_SUCCESS`). Next: treat the current checked-in
+  Alpine procfs witnesses as green; remaining risk is unenumerated procfs files
+  outside the current Alpine scripts, plus unrelated Alpine TTY/devfs blockers
+  tracked separately.
+- 2026-06-27 (Alpine Docker-shaped procfs NAT path fixed). Root-caused the
+  remaining `/proc/net/nf_conntrack` empty output in the Alpine Docker NAT
+  probe to the raw ICMP send shortcut, not to procfs rendering: an off-link
+  container ping to `10.0.2.2` saw that the destination address was configured
+  somewhere globally and synthesized an echo reply directly in
+  `step_send_to_kernel_bytes`, so the packet never traversed container veth,
+  docker bridge, host forwarding, MASQUERADE, conntrack, or the namespace-aware
+  `/proc/net/nf_conntrack` projection. `step_send` now preserves the synthetic
+  configured-peer shortcut only when the sender namespace route is direct; if
+  the selected route uses a gateway, the existing raw ICMP queue/device runtime
+  path sends the real packet. Strengthened
+  `namespace_runtime_retries_masqueraded_forward_after_uplink_arp_resolution`
+  so it asserts raw-socket IPv4-header receive length, host MASQUERADE
+  conntrack, and container neighbor learning of `172.17.0.1` rather than
+  off-link `10.0.2.2`. Verification:
+  `cargo test -p tx-subsystems namespace_runtime_retries_masqueraded_forward_after_uplink_arp_resolution -- --test-threads=1`,
+  `cargo test -p tx-subsystems raw_icmpv4_send_to_configured_peer_route_returns_echo_reply -- --test-threads=1`,
+  `cargo test -p tx-subsystems namespace_runtime_alpine_docker_nat_peer_rename_renders_conntrack_procfs -- --test-threads=1`,
+  `cargo test -p tx-subsystems rtnetlink_setlink_netns_pid_can_rename_moved_veth_peer -- --test-threads=1`,
+  `cargo test -p tx-subsystems rtnetlink_newaddr_initial_namespace_uses_host_visible_ifindex_not_eth0 -- --test-threads=1`,
+  `cargo xtask build --target rv64-qemu`,
+  `TX_ALPINE_ROOTFS=target/rootfs/alpine-rv64-qemu timeout 240s cargo xtask shell-test --target rv64-qemu --profile alpine --script tools/shell-tests/alpine-docker-nat-data-plane-focused-probe.txt`,
+  and
+  `TX_ALPINE_ROOTFS=target/rootfs/alpine-rv64-qemu timeout 180s cargo xtask shell-test --target rv64-qemu --profile alpine --script tools/shell-tests/alpine-netns-veth-bridge-ping-focused-probe.txt`
+  passed. Guest evidence: the NAT probe now prints
+  `N73E_DOCKER_NAT_DATA_PLANE_SUCCESS`; `/proc/net/nf_conntrack` contains
+  `icmp masquerade original=172.17.0.2 ... dst=10.0.2.2 translated=10.0.2.15`;
+  the container neighbor table contains `172.17.0.1 dev eth0` instead of a
+  direct `10.0.2.2` entry; the bridge ping probe prints
+  `N73D_BRIDGE_PING_SUCCESS`. Next: continue sweeping the remaining Alpine
+  procfs/network scripts; this closes the known Docker NAT/conntrack procfs
+  blocker but is not a blanket proof that every future `/proc` surface Alpine
+  can touch is implemented.
+- 2026-06-27 (Alpine TTY readiness audit). The Alpine console path is usable
+  for boot, shell prompt I/O, `stty size` (`24 80`), and repeated BusyBox
+  `vi -c q` opens, but it is not a complete interactive TTY yet. The shell
+  still reports `sh: can't access tty; job control turned off`; real
+  `read(2)`/`write(2)` drive VFS TTY arms that call `step_read`/`step_write`
+  rather than process-aware helpers; VINTR dispatch is not proven end-to-end;
+  and `tools/shell-tests/alpine-vi-edit-smoke.txt` still times out after the
+  scripted `ESC :wq` batch while vi remains on screen. Follow-up trap-trace
+  narrowed the edit blocker to raw non-canonical TTY timing: the harness sends
+  the whole insert/ESC/`:wq` batch in one `write_all`, console drain ingests it
+  as queued bytes, `ppoll` reports TTY readability from `TTY_READABLE` alone,
+  and `step_read` does not implement the `VTIME != 0` Linux cases. Splitting
+  insert text, ESC, and `:wq` across sends succeeds because vi's ESC timeout
+  `ppoll` returns `0` before `:wq` arrives. A follow-up `/dev/tty` probe found
+  a separate job-control blocker: guest `tty` reports `not a tty`, `/dev/tty`
+  and `/dev/ttyS0` are absent, and `TIOCGPGRP` returns `-EINVAL` even though
+  fd-0 `TCGETS`/`TCSETS` succeeds. Code-path review shows boot registers only
+  the `console` TTY name/alias, devfs lookup can resolve `ttyS0` through the
+  hardware table but cannot assign it an object id unless it is also an alias,
+  devfs lacks a caller-relative `/dev/tty`, and `openat` does not acquire a
+  controlling terminal for session leaders. A `setsid` + `/dev/console` reopen
+  probe found another independent blocker: `setsid` succeeds and stdin
+  redirection opens `/dev/console`, but stdout redirection uses
+  `openat(..., flags=0x8241)` (`O_WRONLY|O_CREAT|O_TRUNC|O_LARGEFILE`) and
+  fails with `-ENOSYS` because devfs only treats `O_TRUNC` as a no-op for
+  `/dev/null`, not for character devices such as `/dev/console`. A narrower
+  stdin-only `setsid` probe passed and showed the split more clearly:
+  `openat(/dev/console, 0x8000) -> 3`, `dup3(3, 0, 0) -> 0`, `tty` still
+  prints `not a tty`, and `stty size` still reports `24 80`; the syscall trace
+  has successful `TCGETS`/`TIOCGWINSZ` and no `TIOCSCTTY`, so controlling-tty
+  acquisition is missing independently of the `O_TRUNC` redirection failure. A
+  winsize-source code review found that `stty size` is currently reading the
+  TTY payload's hardcoded hardware default (`Winsize::new(24, 80)`), not a QEMU
+  value: xtask and shell-test both use `-display none -serial mon:stdio` plus
+  `console=ttyS0`, rv64 `ConsoleIf` is only legacy SBI byte read/write, and a
+  QEMU virt DTB dump with stdio `rows=40,cols=100` exposed no rows/cols property
+  to the guest. A host-seeded boot cmdline is the smallest current path for
+  dynamic defaults; true QEMU resize/readback would need a new guest-visible
+  side channel such as virtio-console/hvc.
+  Added/updated
+  `docs/progress/research/2026-06-27-alpine-tty-readiness.md`. Verification:
+  `TX_ALPINE_ROOTFS=target/rootfs/alpine-rv64-qemu timeout 180s cargo xtask shell-test --target rv64-qemu --profile alpine --script tools/shell-tests/alpine-vi-reopen-default-winsize-smoke.txt`
+  passed; `TX_ALPINE_ROOTFS=target/rootfs/alpine-rv64-qemu timeout 120s cargo xtask shell-test --target rv64-qemu --profile alpine --script tools/shell-tests/alpine-vi-edit-smoke.txt`
+  reproduced the remaining raw/edit blocker; `/tmp/tx-alpine-vi-split-trace.shelltest`
+  passed as the control, including under a `trap-trace` kernel; `/tmp/tx-alpine-tty-probe.log`
+  captured the `/dev/tty`/`ttyS0` absence and unbound `TIOCGPGRP`;
+  `/tmp/tx-alpine-setsid-console-traptrace-syscalls.txt` captured
+  `setsid -> 2`, `openat(..., 0x8000) -> 3`, `dup3(3, 0, 0) -> 0`,
+  `openat(..., 0x8241) -> -38`; `/tmp/tx-alpine-setsid-stdin-only-syscalls2.txt`
+  captured the stdin-only reopen success without `TIOCSCTTY`; QEMU
+  `-chardev stdio,help` and `dumpdtb` confirmed rows/cols are accepted as host
+  chardev options but not visible through the current guest DTB path. Next:
+  expose Linux-shaped console device nodes, add caller-relative `/dev/tty` plus
+  controlling-tty acquisition, make `O_TRUNC` on devfs character devices a
+  no-op, align TTY `ppoll`/`read` readiness with non-canonical `VMIN/VTIME`,
+  wire process-aware TTY I/O for real syscalls, and decide whether to seed
+  initial winsize from host cmdline parameters or defer resize to a real console
+  device path.
+- 2026-06-27 (Alpine procfs network projections widened and namespace-aware).
+  Extended the Alpine procfs pass beyond `/proc/net/{dev,route,nf_conntrack}`
+  and `/proc/sys/net/ipv4/ip_forward` by wiring `/proc/net/tx_nf_rules` into
+  procfs lookup/meta/readdir/render/write, including `O_TRUNC` no-op support
+  for shell redirection. Procfs projected reads now honor the caller network
+  namespace for `/proc/net/{dev,route,nf_conntrack,tx_neigh,arp,tcp,tx_nf_rules}`
+  and `/proc/sys/net/ipv4/ip_forward`; namespace-aware writes now route
+  `ip_forward` and `tx_nf_rules` to the caller netns instead of always mutating
+  the initial netns. Tightened the Alpine procfs smoke to assert
+  `tx_nf_rules` is listed and readable, and changed the broad Alpine network ABI
+  probe's standalone veth peer from `eth0` to `vethpeer0` because Alpine already
+  exposes a real initial-netns `eth0`. Verification:
+  `cargo fmt -p tx-fs --check`, `cargo test -p tx-fs procfs -- --test-threads=1`,
+  `git diff --check -- crates/tx-fs/src/procfs/mod.rs crates/tx-fs/src/procfs/read.rs tools/shell-tests/alpine-proc-net-sysfs-smoke.txt tools/shell-tests/alpine-network-abi-focused-probe.txt`,
+  `cargo xtask build --target rv64-qemu`,
+  `TX_ALPINE_ROOTFS=target/rootfs/alpine-rv64-qemu timeout 180s cargo xtask shell-test --target rv64-qemu --profile alpine --script tools/shell-tests/alpine-proc-net-sysfs-smoke.txt`,
+  and `TX_ALPINE_ROOTFS=target/rootfs/alpine-rv64-qemu timeout 240s cargo xtask shell-test --target rv64-qemu --profile alpine --script tools/shell-tests/alpine-network-abi-focused-probe.txt`
+  passed. Guest evidence: `/proc/net` lists `tcp`, `udp`, `snmp`, `netlink`,
+  `dev`, `route`, `nf_conntrack`, and `tx_nf_rules`; `tx_nf_rules` renders its
+  header; `ip_forward` changes through `echo 1 > ...`; the broader probe creates
+  `docker0`/`veth0`, observes them via `/proc/net/dev` and `/sys/class/net`,
+  and sees the Alpine `iptables-nft` MASQUERADE rule via `iptables -S` and
+  `nft list ruleset`. Next: continue sweeping remaining Alpine scripts that
+  combine procfs with isolated netns/Docker-shaped data-plane paths; scripts
+  that create a container peer named `eth0` still need either netlink rename
+  support or target-namespace-aware setup rather than host-namespace `eth0`
+  assumptions.
+- 2026-06-27 (Alpine `/proc/net` minimal tables exposed). Continued the
+  procfs Alpine smoke fix by adding read-only `/proc/net/tcp`, `udp`, `snmp`,
+  and `netlink` nodes to procfs lookup/meta/readdir/render. `tcp` delegates to
+  the existing net subsystem TCP socket-table projection; `udp`, `snmp`, and
+  `netlink` expose Linux-shaped empty/minimal text that Alpine/BusyBox tools
+  can parse without claiming unsupported live counters. Added
+  `procfs_net_readdir_and_render_exposes_minimal_linux_tables`. Verification:
+  `cargo test -p tx-fs procfs -- --test-threads=1`, `cargo xtask build
+  --target rv64-qemu`, and
+  `TX_ALPINE_ROOTFS=target/rootfs/alpine-rv64-qemu cargo xtask shell-test
+  --target rv64-qemu --profile alpine --script tools/shell-tests/alpine-proc-net-sysfs-smoke.txt`
+  passed; guest output lists `/proc/net/{arp,if_inet6,netlink,snmp,tcp,tx_neigh,tx_neigh_ctl,udp}`,
+  `cat /proc/net/tcp` includes `local_address`, `cat /proc/net/snmp` includes
+  `Ip:`, `Tcp:`, and `Udp:`, and `/sys/class/net/lo/*` smoke checks still pass.
+- 2026-06-27 (Alpine `/proc` readdir cursor fixed). Root-caused Alpine
+  `ls -la /proc` showing only `.`/`..` to procfs-local `DirCursor` state
+  encoding, not mount namespace registration or `getdents64`: `finish_dots()`
+  preserved `state_byte=0` after `..`, so root `readdir` never entered the
+  `state_byte==2` static-entry branch, and static subdirectory entries then
+  wrote back a relative `fi+1` cursor while readers interpreted `idx` as
+  dot-inclusive absolute. `crates/tx-fs/src/procfs/mod.rs` now advances from
+  `..` to `(state=2, idx=2)` and uses a shared `procfs_entry_cursor()` that
+  returns `(state=2, idx=entry_index+3)` for static procfs directories. Added
+  `procfs_root_readdir_advances_from_dots_to_static_entries`. Verification:
+  `cargo test -p tx-fs procfs -- --test-threads=1`, `cargo xtask build
+  --target rv64-qemu`, and
+  `TX_ALPINE_ROOTFS=target/rootfs/alpine-rv64-qemu cargo xtask shell-test
+  --target rv64-qemu --profile alpine --script target/tmp/alpine-proc-sys-probe.txt`
+  passed; guest output now lists `/proc/{1,3,config,cpuinfo,meminfo,mounts,net,self,sys,sysvipc,uptime}`
+  and `/sys/class`. Remaining blocker: `tools/shell-tests/alpine-proc-net-sysfs-smoke.txt`
+  still fails because current procfs has no `tcp`, `udp`, `snmp`, or `netlink`
+  inode/renderer under `/proc/net`; `/proc/net` now lists the implemented
+  `arp`, `if_inet6`, `tx_neigh`, and `tx_neigh_ctl` entries.
+- 2026-06-27 (thread future run-loop readability split). Refactored
+  `crates/tx-kernel/src/thread_future.rs::run_thread` from one long
+  entry/AST/userspace/trap/syscall/page-fault body into focused private helpers:
+  `poll_entry_timers_and_liveness`, `deliver_entry_signal_handler`,
+  `enter_userspace_once`, `dispatch_userspace_trap`, `dispatch_syscall_trap`,
+  `run_syscall_dispatch`, `dispatch_full_syscall`, `store_syscall_result`, and
+  `handle_page_fault_trap`. The change keeps the existing round-trip markers,
+  SIGCANCEL frame split, syscall handoff budget, and page-fault routing behavior
+  intact while making the top-level loop readable before debugging the remaining
+  interactive TTY `^C`/foreground-session wiring. Verification:
+  `cargo test -p tx-kernel run_thread_future_stays_within_clone_submit_budget -- --nocapture`,
+  `cargo test -p tx-kernel sigcancel_frame_keeps_interrupted_syscall_pc_for_glibc_cancel_check -- --nocapture`,
+  `cargo test -p tx-kernel ordinary_signal_frame_carries_applied_syscall_return -- --nocapture`,
+  and `cargo test -p tx-kernel futex_wake_return_reenters_userspace_without_mailbox_event -- --nocapture`
+  passed. `cargo fmt -p tx-kernel --check` remains polluted by unrelated dirty
+  formatting in `init/exec.rs`, `init/rootfs_shims.rs`, `trap.rs`, and
+  `trap_handoff.rs`; `thread_future.rs` was formatted directly with rustfmt
+  edition 2024. Next: resume the TTY interrupt path investigation, especially
+  controlling-tty/foreground-pgrp wiring and VINTR dispatch from kernel input.
+- 2026-06-27 (Alpine vi reopen fixed via console winsize default). The
+  follow-up interactive symptom was that `vi` could be opened once, but reopening
+  the same file left the cursor in the bottom-right corner and `^C` did not get
+  the user back to the shell. Reproduction showed the boot console reported
+  `TIOCGWINSZ=0x0`, so BusyBox vi fell back to terminal probing
+  (`ESC[999;999H ESC[6n`) and could wedge in the right-bottom probe path; an
+  explicit guest `stty rows 24 cols 80` made repeated vi opens pass. Hardware
+  TTY payloads now default to a 24x80 window size, so `stty size` reports
+  `24 80` immediately and repeated interactive `TERM=vt100 vi /tmp/vi-reopen.txt`
+  followed by `:q!` works twice in one session. Added
+  `tools/shell-tests/alpine-vi-reopen-interactive-smoke.txt`; retained
+  `tools/shell-tests/alpine-vi-edit-smoke.txt` as an exploratory edit/save repro,
+  because batched insert text plus `ESC :wq` still does not return to the shell
+  reliably. Remaining blocker: investigate raw-mode input batching / vi edit
+  command delivery separately; `^C` inside vi is not a dependable shell abort
+  path while vi owns raw-mode input.
+- 2026-06-27 (Alpine interactive vi defaults to single vCPU). The user-reported interactive
+  `vi` panic (`zone Cap key no longer resolves to a live slot`, followed by an instruction
+  page fault at `0x1000`) came from the default Alpine interactive QEMU path still using
+  rv64 `-smp 4`, unlike `shell-test`'s single-vCPU shape. A focused `smp=4` edit-smoke run
+  also produced a VM recipe-tree trap around `TreapRecipeIndex::successor_ref` /
+  `RecipeIndex::commit_map`, so the evidence points at broader SMP/VM recipe instability
+  rather than a BusyBox `vi` syscall or TTY-only failure. `cargo xtask qemu --target rv64-qemu
+  --profile alpine --interactive` now defaults to `-smp 1`, with explicit `--smp N` still
+  available for stress/repro work; `shell-test --smp N` is wired through both sequential and
+  parallel runs. Verification: focused xtask unit tests, Alpine qemu dry-run, and the
+  `alpine-vi-open-smoke.txt` guest script. Remaining blocker: root-cause and fix the SMP
+  VM recipe/cap lifetime path before advertising multi-vCPU Alpine demos as stable.
+- 2026-06-26 (VM tutorial series drafted). Authored a 13-chapter walkthrough of the VM
+  implementation at `docs/tutorials/vm/` (README + ch.0–12 + TECHNICAL_REPORT.md), matching
+  the house style of the existing `vfs/` and `reactor-and-threads/` series. The series teaches
+  traditional VM (MMU/page-tables/TLB/VMAs/CoW/page-cache) beside txKernel's version, with the
+  binding⟂materialization split (ARCH-5) as the spine across three levels (AddressSpace / VmEntry /
+  Frame). Plan grew 11→13 after the user flagged three under-covered areas: pmap HAL boundary
+  (now ch.5: PmapIf, Sv39 walk, no-KPTI high-half, satp, ASID-scoped SMP shootdown), the VM
+  syscall seam (ch.10: tx-shims decode→fast-path→drive→errno), and procfs projection (ch.11:
+  vm/project.rs → render_maps/smaps/status). The series follows the code over the spec and calls
+  out divergences explicitly — chiefly the per-mapping authoritative `PrivatePageSet` (ch.8) vs
+  VM_v1_2 §7.3 "no back-index". Anchors spot-checked against source while writing
+  (address_space/types/recipe/recipe_tree/pmap/resident/range_lock/execution/checks/private/
+  page_backed/project, tx-hal PmapIf, board satp+shootdown, tx-shims vm.rs); all VFS/reactor
+  cross-links verified to resolve. Plan/handoff: `docs/progress/research/2026-06-26-vm-tutorial-plan.md`
+  (status DRAFTED). No code changed; docs only — no build/test run applies. Next step: a full
+  anchor-by-anchor audit and an active-Markdown-link/stale-vocabulary check before publishing.
+- 2026-06-26 (Alpine interactive vi PATH fix). Interactive Alpine boots were reaching the guest shell
+  but the bootstrap environment only exported `PATH=/bin`, so bare `vi` was not found even though the
+  Alpine image contains `/usr/bin/vi -> /bin/busybox`. Alpine bootstrap env now exports
+  `PATH=/bin:/usr/bin:/sbin:/usr/sbin`, while non-Alpine bootstrap keeps the old `/bin` path. Extended
+  `tools/shell-tests/alpine-vi-smoke.txt` to assert `command -v vi` returns `/usr/bin/vi` before running
+  BusyBox vi help. Verification: `cargo test -p tx-kernel init::helpers::tests:: -- --nocapture`,
+  `cargo xtask build --target rv64-qemu`, and
+  `cargo xtask shell-test --target rv64-qemu --profile alpine --script tools/shell-tests/alpine-vi-smoke.txt`
+  passed. Remaining limitation: the shell still prints `sh: can't access tty; job control turned off`;
+  that is a controlling-TTY/session issue, separate from command lookup, and full-screen interactive
+  editing may still be rough until the TTY path grows the missing semantics.
+- 2026-06-26 (Alpine real-userland demo expanded to BusyBox vi). Alpine profile now skips the
+  OSComp sdcard-only `/bin/{busybox,sh,ls} -> /musl/musl/busybox` shebang shims, because Alpine's
+  initramfs supplies real `/bin/busybox` plus applet symlinks and has no `/musl` mount. This fixes
+  the guest-visible `/bin/busybox: not found` / `/usr/bin/vi: not found` failure caused by the
+  earlier shim occupying `/bin/busybox` before initramfs unpack, where the unpacker treats
+  `EEXIST` as "keep existing". Added `tools/shell-tests/alpine-vi-smoke.txt` and a host unpack
+  regression for Alpine-shaped `./bin/busybox` with pre-existing bootstrap `/bin/sh`. Verification:
+  `cargo test -p tx-kernel init::helpers::tests:: -- --nocapture`,
+  `cargo test -p tx-fs unpack_preserves_alpine_busybox_when_bootstrap_sh_preexists -- --nocapture`,
+  `cargo test -p tx-fs unpack_keeps_regular_sibling_after_absolute_symlink_fanout -- --nocapture`,
+  `TX_ALPINE_ROOTFS=target/rootfs/alpine-rv64-qemu cargo xtask image cpio --profile alpine --target rv64-qemu`,
+  `cargo xtask build --target rv64-qemu`,
+  `cargo xtask shell-test --target rv64-qemu --profile alpine --script tools/shell-tests/alpine-vi-smoke.txt`,
+  and `cargo xtask shell-test --target rv64-qemu --profile alpine --script tools/shell-tests/alpine-nft-iptables-smoke.txt`
+  passed. Guest evidence: `/bin/busybox true` returned status 0, `TERM=vt100 /usr/bin/vi --help`
+  printed BusyBox vi usage and returned status 0, and `nftables v1.1.6` / `iptables v1.8.13
+  (nf_tables)` still run. `gcc` remains blocked by image shape, not by a proved syscall failure:
+  a toolchain-bearing Alpine initramfs was about 270 MiB and failed during boot with
+  `:initramfs:fail:materialize_anon`; next step is disk/ext4-backed Alpine or a much smaller
+  compiler payload before claiming in-guest C compilation.
+- 2026-06-26 (real guest userland demo via Alpine profile). `cargo xtask shell-test` now honors
+  `--profile alpine` and boots `target/images/alpine-initramfs-rv64-qemu.cpio` with
+  `init=/bin/tx-bootstrap-busybox`, avoiding the baked `/bin/sh` collision while still passing
+  argv0=`sh` to BusyBox. Alpine image staging now handles existing/dangling symlinks on macOS
+  (`/var/run -> ../run`) and installs the static bootstrap shell at a non-conflicting path; the
+  fetch script no longer requires Bash associative arrays. Verification:
+  `cargo test -p tx-kernel init::helpers::tests:: -- --nocapture`,
+  `cargo test -p xtask shell_test::tests::alpine_profile_uses_alpine_initramfs_and_cmdline -- --nocapture`,
+  `TX_ALPINE_ROOTFS=target/rootfs/alpine-rv64-qemu cargo xtask image cpio --profile alpine --target rv64-qemu`,
+  `cargo xtask build --target rv64-qemu`, and
+  `cargo xtask shell-test --target rv64-qemu --profile alpine --script tools/shell-tests/alpine-nft-iptables-smoke.txt`
+  all passed. Guest evidence: prompt reached, `echo alpine-shell-ok`, `/usr/sbin/nft --version`
+  (`nftables v1.1.6`), `/usr/sbin/iptables --version` (`iptables v1.8.13 (nf_tables)`), and
+  `/usr/sbin/nft list ruleset` all ran inside txKernel. Next: package this as the recommended
+  demo command and add a C-compiler-in-guest lane only after a guest toolchain package/bootstrap path exists.
+- 2026-06-26 (VFS tutorial — function-implementation deepening + ASCII DS graphs). Review round 3: "too
+  thin on DS definition only" + "want ASCII graphs for DS relationships." Deepened the six mechanism/
+  deep-dive chapters (03 FsOps, 04 walker, 05 mount, 07 page cache, 08 special files, 09 blocking/mount)
+  with faithful trimmed function bodies (real control flow + names, error/generic noise elided) and ASCII
+  DS-relationship diagrams: ch.3 added FsOps/FsPageBacking/MountPayload routing graph + faithful tmpfs
+  load_inode_meta (size-from-PageContainer two-lock discipline) and create_inode bodies; ch.4 added walker
+  state-machine graph + faithful lookup→load_meta→materialise→cache-install sequence (per-call NeedIO/
+  ResumeToken) and the symlink relative/absolute splice body; ch.5 added MountIdentity/PayloadBinding/
+  MountPayload two-axis graph + faithful MountPayloadPin acquire/Drop over payload_pin_count; ch.7 added
+  PageContainer→frame↔VmEntry object graph + faithful materialize_file_page (owner/joiner baton, every
+  exit calls finish_file_page_fetch_without_install) and begin_file_page_fetch election; ch.8 added
+  two-level read-dispatch fan-out graph + faithful pipe step_write (PIPE_BUF atomicity guard) and eventfd
+  read/write CAS-loop bodies; ch.9 added wait/wake registry graph + faithful notify_readable (fire_legacy_
+  channel + notify_v3_source seam) / wait_until_readable, faithful bind_mount (new identity over shared
+  payload), and a per-process mount-namespace divergence graph. Verification: documentation only — all
+  newly cited anchors spot-checked and confirmed (tmpfs:323,378; step.rs:152,280; pipe/notification.rs:68;
+  mount:808; eventfd:161; IORequest DirLookup/LoadInodeMeta/MaterialiseRnode in state.rs; pipe ring
+  can_write_atomic/fill_from_slice/available_write_capacity; begin_file_page_fetch/finish_file_page_fetch_
+  without_install); all internal cross-links still resolve; no code changed, no build/test impact. Next:
+  optional permissions/witness chapter; render the ASCII graphs as committed diagram assets if desired.
+- 2026-06-26 (VFS tutorial series expanded — 3 functional deep-dives). Review feedback flagged the first
+  cut as too architecture-heavy / "too thin on kernel logics," so added three chapters to
+  `docs/tutorials/vfs/` between the concept arc and the capstone, and renumbered the capstone 07→10:
+  `07_page-cache-and-mmap.md` (PageContainer/PageContainerKind, demand paging via materialize_page,
+  owner/joiner fetch coalescing, step_range byte loop + ByteProgress partial-progress, grow_size_to,
+  user-buffer copy seam, mmap sharing cache frames with VmEntryBacking::Page, COW, step_fsync writeback),
+  `08_special-files-and-fd-zoo.md` (StructPayload vs non-Rnode OpenFileBacking; pipes ring/EOF/EPIPE/
+  PIPE_BUF; ttys line-discipline + typed OpenFileIoctl; char devices /dev/null|zero|urandom; synthetic
+  fds eventfd/timerfd/signalfd/epoll/pidfd/socketpair; fcntl F_SETFL overrides), and
+  `09_blocking-and-mount-internals.md` (WaitSource/RNodeWaitPoints park-wake, poll/epoll, EINTR
+  dual-subscription; mount propagation/bind/remount, MountNamespace/CLONE_NEWNS/setns, new mount API,
+  boot bringup mount_rootfs_tmpfs→devfs→procfs + initramfs cpio unpack). Updated README (two-arc framing,
+  table 0–10, extended mapping table), Chapter-0 roadmap, all Chapter-7→10 capstone forward-refs, and
+  TECHNICAL_REPORT.md (new §§8–10, case-study→11, reference→12, extended type index). NOT added:
+  permissions/credentials chapter (reviewer deselected). Material sourced from 4 parallel code-exploration
+  sweeps. Verification: documentation only — all internal cross-links resolve (re-checked); report section
+  numbering sequential 1–12; new source anchors spot-checked against the tree (PageContainer/
+  PageContainerKind/materialize_page/step_fsync, pipe/eventfd/timerfd/signalfd/epoll, device.rs,
+  notification.rs VFS_READABLE, mount Propagation/MountApiFile/MountNamespace/bind_mount, init.rs boot
+  mounts, initramfs unpack, nsproxy) — all confirmed; no code changed, no build/test impact. Authoring
+  note updated: `docs/progress/research/2026-06-26-vfs-tutorial-plan.md`. Next: optional permissions/
+  witness chapter if wanted; render diagrams as committed assets; wire `txdoc:` tags on graduation.
+- 2026-06-26 (VFS tutorial series authored). Added a 10-file numbered tutorial under
+  `docs/tutorials/vfs/` (README + parts 0–7 + consolidated TECHNICAL_REPORT.md) explaining the txKernel
+  VFS to readers who know the traditional Unix/Linux VFS. Split-forward emphasis: ch.2
+  (`02_payload-identity-split.md`) is the center of gravity — the identity/capability/payload
+  decomposition, the `Weak → IdentRef → Cap → OperationalEvidence` reference ladder, and four
+  motivations (unlinked-but-open files, force-umount, refcount-free hot-path lookup, monotone race
+  degradation) grounded in real VFS pain. Other chapters: the entity model (`RNode`/`DEntry`/`OpenFile`),
+  the `FsOps`/`FsPageBacking` backend boundary + `StepOutcome` step model + backing gallery
+  (tmpfs/procfs/devfs/ext4-FAT mapped to `RNodeBacking`), the walker state machine, the fully-split
+  `MountIdentity`/`MountPayload` (force-umount via `payload_cap() -> Result<_, Dead>`), the
+  open/read/write data path, and an `open→read→unlink-while-open→read→close` capstone on tmpfs.
+  Pseudocode bodies with accurate DS types; every chapter carries `file:line` anchors. Planning/authoring
+  note: `docs/progress/research/2026-06-26-vfs-tutorial-plan.md`. Verification: documentation only — all
+  internal cross-links resolve; source anchors spot-checked against the tree (sys_openat/sys_read/
+  sys_write, step_read/step_write/step_lseek, FsOps, FsPageBacking, StepOutcome, kernel_step, the driver
+  loop, MountIdentity/MountPayload/payload_cap, all entity defs, tmpfs) — all confirmed on cited lines; no
+  code changed, no build/test impact. Next: optionally render the three diagrams as committed assets
+  (reference hierarchy; walk state machine; unlink-while-open / force-umount lifetime timelines) and wire
+  `txdoc:` tags if the series graduates into `docs/design/05_filesystem/`.
+- 2026-06-26 (reactor + userspace-thread tutorial series authored). Added a 9-file numbered tutorial
+  under `docs/tutorials/reactor-and-threads/` (README + parts 0–8) explaining how txKernel re-expresses
+  traditional synchronous kernel scheduling/trap/syscall mechanisms as Rust futures: async primer, the
+  reactor as a scheduler, `run_thread` as a thread state machine, the trap handoff seam, the
+  `UserspaceRunWait` suspension point, blocking syscalls as `WaitSource`/mailbox futures, IRQ/timer wake
+  paths, signals as wait interruption, and an end-to-end `read()`-on-empty-pipe walkthrough. Code blocks
+  are pseudocode with accurate DS types; every chapter carries verified `file:line` anchors. Planning note:
+  `docs/progress/research/2026-06-26-reactor-thread-future-tutorial-plan.md`. Also added a consolidated
+  single-file `docs/tutorials/reactor-and-threads/TECHNICAL_REPORT.md` (~2.1k lines: abstract, 12 numbered
+  sections, design discussion, type reference, source-anchor index) covering the same material in formal
+  report form. Verification: documentation
+  only — internal cross-links checked (all resolve); no code changed, no build/test impact. Next: optional
+  pass to add the two diagrams as committed assets and to wire `txdoc:` tags if the series graduates into
+  `docs/design/02_execution/`.
+- 2026-06-26 (glibc SIGCANCEL cancellation-frame fix and probe wiring). Updated
+  `crates/tx-kernel/src/thread_future.rs` so glibc SIGCANCEL sees the interrupted syscall PC in the
+  delivered frame while `rt_sigreturn` still restores the resolved pending syscall return. Added
+  focused coverage in `crates/tx-kernel/src/thread_future/tests.rs`, taught
+  `tools/oscomp-custom-run.py` to compile and run `tools/shell-tests/pthread_cond_signal_probe.c`, and
+  registered the probe in `tools/tests/test_oscomp_custom_run.py`. Verification:
+  `python3 -m unittest tools.tests.test_oscomp_custom_run`,
+  `cargo test -p tx-subsystems signal::tests -- --nocapture`,
+  `cargo test -p tx-kernel sigcancel_frame_keeps_interrupted_syscall_pc_for_glibc_cancel_check -- --nocapture`,
+  `cargo test -p tx-kernel sigreturn -- --nocapture`, and
+  `python3 tools/oscomp-custom-run.py --pthread-cond-signal-probe --run --timeout 60 --serial target/oscomp/custom-run/pthread-cond-signal-probe-sigcancel-frame-20260626.txt --data target/oscomp/custom-run/pthread-cond-signal-probe-sigcancel-frame-20260626-data --build-dir target/oscomp/custom-run/build-pthread-cond-signal-probe-sigcancel-frame-20260626 --skip-submit`
+  all passed. Next: rerun the focused `libctest-glibc:static:pthread_cancel_points` selector with this
+  frame split in place and confirm the guest assertion now clears.
+- 2026-06-25 (thread model Linux-surface answer). Added
+  `docs/progress/research/2026-06-25-thread-model-linux-surface.md` to answer the Linux task/thread
+  sweep against the current Tx model: `ProcessIdentity`/`ThreadIdentity` map TGID/TID, `ThreadPayload`
+  owns execution/TLS/signal-mask/clear-child-tid/robust-list state, `ProcessPayload` owns resource and
+  process-directed state. Verification: doc/read-only implementation audit; pending markdown lint. Next:
+  turn the remaining sharp gaps (`Frame { Shared<T> }` clone sharing, queued RT signals, cross-process
+  `tgkill`, non-leader exec, full wait accounting) into design or implementation plans when they become
+  active work.
 - 2026-06-18 (6-suite regression sweep vs main — 0 regressions, 4 lanes, many improvements). User asked to
   regression-test basic/busybox/libctest/libcbench/lmbench/iozone vs main (main "已经测试过了"), on BOTH
   musl AND glibc lanes. Method: per-suite selector boots `tx.oscomp.groups=<suite>-{musl,glibc}` with
@@ -17448,6 +26410,20 @@
   existing Reactor test/API drift that Phase 0 must repair before using focused
   tests as correctness gates.
 
+- 2026-07-14 (tx-time module migration complete).
+  Retired the substrate TimerWheel and reactor legacy dual-fire path. `tx-time`
+  now provides the sole TimerEngine/deadline facade; ReactorTimerDomain owns
+  routing and hardware arm policy, while semantic consumers retain their state.
+  Verification passed: tx-time 27, reactor timer surfaces 3+2, tx-shims 592,
+  devfs 22, both time invariants at zero findings, RV64 full-build, and QEMU
+  smoke boot plus SMP owner-wake sentinels. Deferred network, board RTC,
+  CPU/TAI, and full VDSO work remain out of scope. See
+  `docs/progress/plans/2026-07-13-tx-time-module-migration.json`.
+
+- `docs/progress/research/2026-07-02-smp4-nonltp-complete-deductions.md`
+- `docs/progress/research/2026-06-27-alpine-gcc-readiness.md`
+- `docs/progress/research/2026-06-27-alpine-tty-readiness.md`
+- `docs/progress/research/2026-06-26-vfs-tutorial-plan.md`
 - `docs/progress/research/2026-05-07-interface-drift-audit.md`
 - `docs/progress/research/2026-05-04-vm-pagebacked-midway-checkpoint.md`
 - `docs/progress/research/2026-05-04-vm-pagebacked-gap-update.md`
@@ -17459,3 +26435,136 @@
 - `docs/progress/research/2026-05-01-ast-return-to-user-scout.md`
 - `docs/progress/research/2026-04-30-reactor-third-wave-scout.md`
 - `docs/progress/research/2026-04-30-reactor-third-wave-audit.md`
+- 2026-07-13 (reactor fanout/readers audit). Read-only investigation mapped the
+  current object-owned `WaitSource` fanout, mailbox coalescing, task wake doorbell,
+  owner-aware routing, and userspace rendezvous. The detailed findings are in
+  `docs/progress/research/2026-07-13-reactor-fanout-readers-audit.md`. Focused
+  wait/bus and duplicate-wake tests passed; broader reactor smoke and scheduler
+  suites retain existing dirty-checkout failures. Next step is to type the
+  mailbox post result and measure multi-reader fanout before changing storage.
+- 2026-07-14 (ELF parser and library audit; historical initial snapshot).
+  The exec loader remains a `goblin 0.10.5` adapter with a sound
+  txKernel-owned `ExecImagePlan` boundary, but its current one-window read
+  conflates header, program-header-table, and `PT_INTERP` data. The audit
+  identifies the required pre-migration fixes: staged bounded reads,
+  checked interpreter extraction, static-target `e_machine` validation, and
+  final user-VA-range enforcement. `elf` 0.8.0 is the recommended future
+  parser candidate; `elf_rs` is rejected for unsafe raw casts and missing
+  endian/validation guarantees. Loader tests passed 23/23. Next: decide the
+  dynamic-`PT_INTERP` contract and add the staged-read policy regressions;
+  no parser source or dependency changed. See
+  `docs/progress/research/2026-07-14-elf-parser-library-audit.md`.
+- 2026-07-14 (vDSO time ABI crosswalk).
+  Expanded `docs/design/03_memory-vm/VDSO_TIME_ABI_v1.md` into the active
+  cross-crate vDSO contract: physical/build/user address spaces, PC-relative
+  RV64 VVAR access, permanent-frame to VM special-map transaction, exact
+  boot/hook/exec/auxv order, `tx-vdso` versus `tx-time::vdso` interface ledger,
+  QEMU `rdtime`/SBI timer separation, and libc-to-syscall fallback now have
+  explicit owners and diagrams. Host ELF ABI tests pass 8/8 after normalizing
+  assembler-local `.text` prefix padding. The RV64 guest witness still stops
+  before auxv/direct-call checks because its probe `execve` returns `ENOEXEC`;
+  signal restorer, clock matrix, and SMP reader/writer gates remain open.
+  Verification: `cargo xtask lint docs` passes with the existing seven
+  stale-vocabulary warnings. No runtime behavior changed; next is diagnosing
+  the guest exec failure in `docs/progress/plans/2026-07-14-vdso-migration.json`.
+
+- 2026-07-15 (replaceable elf 0.8 exec loader core complete).
+  Retired `goblin` and its feature workaround from `tx-scripts`; production
+  ELF syntax decoding now uses the replaceable `ElfFileParser` boundary with
+  the `Elf08Parser` adapter. `EXEC_v1` now matches staged header/phdr/interpreter
+  reads, `ElfLoadPolicy`, dynamic second-image layout, and `AT_BASE`/`AT_ENTRY`
+  ownership. Main and interpreter opens now use the process mount namespace,
+  only the declared `PT_INTERP` path is tried, architecture `e_flags` are
+  policy-checked, and RELRO receives the same bounded file-range validation as
+  TLS/DYNAMIC. Permanent loader verification is 70/70, including a
+  deterministic no-panic property corpus over 2048 mutated-fixture and random
+  bounded inputs. A migration-only differential test also matched exact
+  `goblin 0.10.5` across three fixtures for every mapped header/program-header
+  field, then the temporary test backend and dev-dependency were deleted.
+  Follow-up hardening preserves staged-read `ENOMEM` through fallible phdr and
+  `PT_INTERP` buffers, and main/interpreter now share execute-bit plus regular
+  PageBacked candidate checks that accept execute-only files. VFS same-name
+  child publication now returns one canonical DEntry, while each bind mount
+  owns a distinct root DEntry projection over the shared source RNode. Exec now
+  retains the final namespace-resolved Mount for main and interpreter, rejects
+  `MS_NOEXEC` after symlink/mount crossing, and applies `MS_NOSUID` from the
+  final alias mount.
+  Other verification passed: script 33/33, staged reads 6/6, dynamic layout
+  9/9, syscall execve 12/12, `cargo check -p tx-scripts --lib`, and the
+  dependency tree shows `elf v0.8.0` with no `goblin`. The
+  syscall fixture now declares `ShimsTestPmap::USER_TOP`, so it exercises the
+  same platform policy as production. Fresh closeout verification adds
+  `cargo test -p tx-scripts process::exec --lib` (147/147) and a passing
+  workspace `cargo check`. The vDSO `__vdso_rt_sigreturn` path now permits an
+  RW stack, but the full GNU-stack matrix remains open: mapped-vDSO exec must
+  preserve explicit `PT_GNU_STACK PF_X`, while no-vDSO targets still require
+  the executable signal-trampoline fallback. Next: executable lease/ETXTBSY
+  semantics, a yielding exec `StepOp`, that GNU-stack permission closure, then
+  RV64/LA64 static, PIE, musl, and glibc guest witnesses. Blockers are the
+  required PageBacked lease work and retained-continuation/stack-policy work;
+  the plan remains active at
+  `docs/progress/plans/2026-07-14-elf-exec-loader.json`. `cargo xtask progress
+  validate` passes with all 34 progress records valid. The kernel init
+  `TestPlatform` now declares `FULL_USER_V1_TOP`, matching the shims platform
+  policy. TDD re-ran the three bootstrap-exec fixtures from `NotExecutable`
+  RED to GREEN; the saved-SP assertion now checks the ASLR-selected mapping
+  rather than the retired low stack base. `cargo -q xtask unit` passes:
+  tx-shims 599/599, tx-kernel 107/107, tx-ext4 27/27, tx-scripts 147/147.
+  Partial guest evidence is now durable under `target/elf-witness/`: RV64
+  static ET_EXEC passed `tools/shell-tests/busybox-prompt.txt`, and Alpine
+  dynamic PIE with an absolute `PT_INTERP` plus the static-PIE musl loader
+  passed `tools/shell-tests/alpine-vi-open-smoke.txt`; exact artifact types are
+  recorded in `elf-artifact-types.log`. Guest closure remains open. The LA64
+  singular/plural signal-exit API drift has been fixed and the LA64 tx-shims
+  target check passed, but a fresh guest build has not been rerun; it still
+  lacks the vendored LA64 BusyBox and the shared reactor reorganization is
+  currently not buildable. Focused musl LTP `execve01,execve06` emitted no
+  `RUN LTP CASE` because `tx-test-init` could not create `/usr`, `/var`,
+  `/lib`, or `/tx-ltp` (judge `0/0`), while the glibc lane is blocked by an
+  unavailable Docker/Colima daemon. These blocked and `0/0` runs are not
+  counted as passes; exact logs are recorded in the ELF plan and audit.
+
+- 2026-07-15 (Debian in-guest StarryOS readiness gap).
+  Read-only audit: current proof stops at Alpine/musl and a bounded TCC
+  witness; dynamic glibc startup, Debian root-disk boot, in-guest Rust, and
+  nested-QEMU StarryOS are not ready. `cargo xtask syscall-status` reports
+  243/243 locally dispatched RV64 syscall numbers with 82 absent versus Linux
+  v6.17; Alpine QEMU dry-runs accept `--smp 1` and `--smp 8` but both retain
+  fixed 1024 MiB because xtask has no memory override. Next: establish the
+  Debian root-disk and dynamic-loader gates before StarryOS integration. See
+  `docs/progress/research/2026-07-15-debian-starryos-readiness-gap.md`.
+
+- 2026-07-15 (RCU and lock-replacement candidate audit).
+  Expanded the initial owner candidate matrix to include PageContainer's
+  resident index and the full PC-to-I/O-manager path. The live cached-hit path
+  shares one `PageContainerState` lock with L4 `PageService` and L6
+  `BlockQueue` state, so manager extraction and resident publication are one
+  coordinated boundary change: resident reads use a persistent published root,
+  while page/block submission and completion remain manager-owned mutable state
+  machines. The audit also classifies pmap metadata, substrate `Index`, network
+  configuration, process topology, user-namespace maps, userfaultfd ranges,
+  epoll interests, and DEntry cache as direct or conditional candidates; it
+  separates single-binding publication from RCU roots and records false
+  positives that must retain coordination semantics. The accepted replacement
+  model is now canonical in `OBJECT_API_LANES_v1.md`, `PAGE_BACKED_v1.md`,
+  `IO_MANAGER_v1.md`, and v5 `LANE-*`: published roots cannot absorb manager or
+  state-machine ownership; single-binding publication adds no new upper lane;
+  PC resident installation validates generation before publication and removal
+  publication precedes wake/reservation release. VM, PC/I/O, process/FD,
+  IPC/TTY, filesystem/device, and networking readers were integrated and all
+  completed agents were closed. This documentation pass changed no runtime
+  code. Verification: `cargo xtask lint docs` passed with seven existing
+  retired-vocabulary warnings, `cargo xtask progress validate` passed 34/34,
+  and scoped whitespace/txdoc/placeholder checks were clean. Blocker:
+  retire-capacity reservation and `Published<T>` are not implemented. Next
+  step is a staged implementation plan beginning with retire-capacity reservation,
+  `Published<T>`, the recipe pilot, manager extraction, and PC resident
+  publication.
+  See `docs/progress/research/2026-07-15-rcu-lock-replacement-candidate-audit.md`.
+
+- 2026-07-24 (network stack unit-test check after time/RTC migration).
+  No network production change was needed: `cargo test -p tx-subsystems --lib
+  net:: --no-default-features` passes 256/256, covering the network delegate
+  deadline/mailbox path, TCP/UDP loopback, device, veth, rtnetlink, and
+  netfilter modules. Next: use a targeted QEMU witness only when validating
+  guest-visible timer or RTC behavior; the host network unit-test gate is green.
