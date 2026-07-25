@@ -1,0 +1,22 @@
+# alpine-vi-reopen-default-winsize-smoke.txt - reopen BusyBox vi with a usable console size.
+
+wait ":bootstrap-exec:ok" within 60000
+wait "/ # " within 60000
+sleep 500
+
+send "stty size\n"
+expect " " within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "TERM=vt100 vi -c q /tmp/vi-reopen.txt; echo vi-first-status-$?\n"
+expect "vi-first-status-0" within 30000
+expect "/ # " within 30000
+
+sleep 500
+send "TERM=vt100 vi -c q /tmp/vi-reopen.txt; echo vi-second-status-$?\n"
+expect "vi-second-status-0" within 30000
+expect "/ # " within 30000
+
+sleep 500
+quit

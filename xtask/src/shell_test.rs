@@ -33,8 +33,10 @@
 //! wait SUBSTR within MS    ; block until SUBSTR appears in output;
 //!                          ; fail if not seen within MS milliseconds.
 //! sleep MS                 ; unconditional delay (heisenbug-catch).
-//! send "STRING"            ; write STRING to QEMU stdin. Standard
-//!                          ; rust escapes (\n, \r, \t, \\, \").
+//! send "STRING"            ; write STRING to QEMU stdin. Supports
+//!                          ; \n, \r, \t, \e, \0, \xNN, \\, \".
+//!                          ; ESC/control bytes are flushed as keypress
+//!                          ; boundaries instead of a single paste burst.
 //! expect SUBSTR within MS  ; like `wait`, but scoped to output
 //!                          ; produced AFTER the most recent `send`.
 //! quit                     ; close stdin and wait for QEMU to exit
@@ -75,15 +77,23 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::image::busybox_initramfs_name;
+use crate::image::{alpine_initramfs_name, busybox_initramfs_name};
 use crate::target::{Profile, TxTarget};
-use crate::util::{option_value, optional_option_value, resolve_path};
+use crate::util::{
+    append_tty_winsize_cmdline, default_boot_mode_for_profile, option_value, optional_option_value,
+    resolve_path, validate_boot_mode_value,
+};
 use crate::Result;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+const CONTROL_KEY_DELAY: Duration = Duration::from_millis(25);
+const ESC_KEY_DELAY: Duration = Duration::from_millis(500);
 
 pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
     let target = TxTarget::parse(&option_value(&args, "--target")?)?;
+    let profile = Profile::parse(
+        &optional_option_value(&args, "--profile").unwrap_or_else(|| "busybox".to_string()),
+    )?;
     let script_path = optional_option_value(&args, "--script")
         .ok_or_else(|| "missing required --script PATH".to_string())?;
     let script_path = resolve_path(root, PathBuf::from(script_path));
@@ -97,6 +107,26 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
     let list_groups = args.iter().any(|a| a == "--list-groups");
     let keep_going = args.iter().any(|a| a == "--keep-going");
     let parallel = args.iter().any(|a| a == "--parallel");
+    let extra_rv64_ext4 = optional_option_value(&args, "--extra-rv64-ext4")
+        .map(|path| resolve_path(root, PathBuf::from(path)));
+    let boot_mode = optional_option_value(&args, "--boot-mode")
+        .map(|value| validate_boot_mode_value(&value).map(|()| value))
+        .transpose()?;
+    let append_cmdline = optional_option_value(&args, "--append-cmdline");
+    let smp: usize = optional_option_value(&args, "--smp")
+        .map(|s| {
+            s.parse::<usize>()
+                .map_err(|err| format!("invalid --smp value '{s}': {err}"))
+                .and_then(|value| {
+                    if value == 0 {
+                        Err("--smp must be greater than zero".into())
+                    } else {
+                        Ok(value)
+                    }
+                })
+        })
+        .transpose()?
+        .unwrap_or(1);
     let jobs: usize = optional_option_value(&args, "--jobs")
         .and_then(|s| s.parse().ok())
         .unwrap_or(4)
@@ -187,13 +217,27 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
                 let results = Arc::clone(&results_arc);
                 let next = Arc::clone(&next_idx);
                 let root = root.to_path_buf();
+                let extra_rv64_ext4 = extra_rv64_ext4.clone();
+                let boot_mode = boot_mode.clone();
+                let append_cmdline = append_cmdline.clone();
                 thread::spawn(move || loop {
                     let idx = next.fetch_add(1, Ordering::Relaxed);
                     if idx >= groups.len() {
                         break;
                     }
                     let group = &groups[idx];
-                    let (captured, group_err) = run_group_isolated(&root, target, &setup, group);
+                    let run = IsolatedGroupRun {
+                        root: &root,
+                        target,
+                        profile,
+                        smp,
+                        extra_rv64_ext4: extra_rv64_ext4.as_deref(),
+                        boot_mode: boot_mode.as_deref(),
+                        append_cmdline: append_cmdline.as_deref(),
+                        setup: &setup,
+                        group,
+                    };
+                    let (captured, group_err) = run_group_isolated(&run);
                     let result = match group_err {
                         None => Ok(()),
                         Some(err) => {
@@ -230,10 +274,7 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
         });
         let failed_count = ordered.iter().filter(|(_, r)| r.is_err()).count();
         let passed = ordered.len() - failed_count;
-        println!(
-            "shell-test: groups: {} passed, {} failed",
-            passed, failed_count,
-        );
+        println!("shell-test: groups: {passed} passed, {failed_count} failed");
         for (name, result) in &ordered {
             match result {
                 Ok(()) => println!("  ok    {name}"),
@@ -249,7 +290,15 @@ pub(crate) fn shell_test(root: &Path, args: Vec<String>) -> Result<()> {
     }
 
     // ── Sequential mode (default) ───────────────────────────────────────────
-    let qemu_cmd = build_qemu_command(root, target)?;
+    let qemu_cmd = build_qemu_command(
+        root,
+        target,
+        profile,
+        smp,
+        extra_rv64_ext4.as_deref(),
+        append_cmdline.as_deref(),
+        boot_mode.as_deref(),
+    )?;
     println!("shell-test: spawning {}", qemu_cmd.join(" "));
 
     let Some((program, rest)) = qemu_cmd.split_first() else {
@@ -417,12 +466,7 @@ fn run_block(
                 // directives only match output produced AFTER this
                 // send.
                 *script_anchor = buffer.lock().unwrap().len();
-                stdin
-                    .write_all(text.as_bytes())
-                    .map_err(|err| format!("write to qemu stdin: {err}"))?;
-                stdin
-                    .flush()
-                    .map_err(|err| format!("flush qemu stdin: {err}"))?;
+                send_interactive_bytes(stdin, text.as_bytes())?;
             }
             Directive::Expect { needle, timeout } => {
                 if let Err(err) = wait_for(buffer, *script_anchor, needle, *timeout) {
@@ -474,6 +518,46 @@ fn wait_for(
             ));
         }
         thread::sleep(POLL_INTERVAL);
+    }
+}
+
+fn send_interactive_bytes(stdin: &mut impl Write, bytes: &[u8]) -> Result<()> {
+    let mut start = 0usize;
+    for (idx, &byte) in bytes.iter().enumerate() {
+        let delay = key_boundary_delay(byte);
+        if delay.is_none() {
+            continue;
+        }
+        if start < idx {
+            stdin
+                .write_all(&bytes[start..idx])
+                .map_err(|err| format!("write to qemu stdin: {err}"))?;
+        }
+        stdin
+            .write_all(&[byte])
+            .map_err(|err| format!("write to qemu stdin: {err}"))?;
+        stdin
+            .flush()
+            .map_err(|err| format!("flush qemu stdin: {err}"))?;
+        thread::sleep(delay.unwrap());
+        start = idx + 1;
+    }
+    if start < bytes.len() {
+        stdin
+            .write_all(&bytes[start..])
+            .map_err(|err| format!("write to qemu stdin: {err}"))?;
+    }
+    stdin
+        .flush()
+        .map_err(|err| format!("flush qemu stdin: {err}"))?;
+    Ok(())
+}
+
+fn key_boundary_delay(byte: u8) -> Option<Duration> {
+    match byte {
+        0x1b => Some(ESC_KEY_DELAY),
+        0x00..=0x08 | 0x0b..=0x1a | 0x1c..=0x1f | 0x7f => Some(CONTROL_KEY_DELAY),
+        _ => None,
     }
 }
 
@@ -542,7 +626,7 @@ impl Directive {
                 format!("wait {:?} within {} ms", needle, timeout.as_millis())
             }
             Self::Sleep(ms) => format!("sleep {ms} ms"),
-            Self::Send(text) => format!("send {:?}", text),
+            Self::Send(text) => format!("send {text:?}"),
             Self::Expect { needle, timeout } => {
                 format!("expect {:?} within {} ms", needle, timeout.as_millis())
             }
@@ -669,7 +753,7 @@ fn parse_pattern_with_timeout(rest: &str) -> std::result::Result<(String, Durati
 fn parse_quoted(s: &str) -> std::result::Result<String, String> {
     let (parsed, rest) = split_quoted_prefix(s)?;
     if !rest.trim().is_empty() {
-        return Err(format!("trailing garbage after quoted string: {:?}", rest));
+        return Err(format!("trailing garbage after quoted string: {rest:?}"));
     }
     Ok(parsed)
 }
@@ -695,9 +779,21 @@ fn split_quoted_prefix(s: &str) -> std::result::Result<(String, &str), String> {
                     'n' => out.push('\n'),
                     'r' => out.push('\r'),
                     't' => out.push('\t'),
+                    'e' => out.push('\x1b'),
                     '\\' => out.push('\\'),
                     '"' => out.push('"'),
                     '0' => out.push('\0'),
+                    'x' => {
+                        let (_, hi) = chars.next().ok_or_else(|| {
+                            "unterminated hex escape; expected two digits".to_string()
+                        })?;
+                        let (_, lo) = chars.next().ok_or_else(|| {
+                            "unterminated hex escape; expected two digits".to_string()
+                        })?;
+                        let value = hex_byte(hi, lo)
+                            .ok_or_else(|| format!("invalid hex escape '\\x{hi}{lo}'"))?;
+                        out.push(value as char);
+                    }
                     other => return Err(format!("unknown escape '\\{other}'")),
                 }
             }
@@ -705,6 +801,24 @@ fn split_quoted_prefix(s: &str) -> std::result::Result<(String, &str), String> {
         }
     }
     Err("unterminated string literal (no closing '\"')".into())
+}
+
+fn hex_byte(hi: char, lo: char) -> Option<u8> {
+    let hi = hi.to_digit(16)?;
+    let lo = lo.to_digit(16)?;
+    Some(((hi << 4) | lo) as u8)
+}
+
+struct IsolatedGroupRun<'a> {
+    root: &'a Path,
+    target: TxTarget,
+    profile: Profile,
+    smp: usize,
+    extra_rv64_ext4: Option<&'a Path>,
+    boot_mode: Option<&'a str>,
+    append_cmdline: Option<&'a str>,
+    setup: &'a [Directive],
+    group: &'a NamedGroup,
 }
 
 /// Boot an isolated QEMU instance, run the setup block, then run
@@ -717,26 +831,26 @@ fn split_quoted_prefix(s: &str) -> std::result::Result<(String, &str), String> {
 ///
 /// Returns `(output, None)` on success, `(output, Some(msg))` on failure
 /// (both directive failures and harness failures like QEMU spawn errors).
-fn run_group_isolated(
-    root: &Path,
-    target: TxTarget,
-    setup: &[Directive],
-    group: &NamedGroup,
-) -> (String, Option<String>) {
+fn run_group_isolated(run: &IsolatedGroupRun<'_>) -> (String, Option<String>) {
     let buffer: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
-    let group_err = run_group_isolated_inner(root, target, setup, group, Arc::clone(&buffer));
+    let group_err = run_group_isolated_inner(run, Arc::clone(&buffer));
     let captured = buffer.lock().unwrap().clone();
     (captured, group_err)
 }
 
 fn run_group_isolated_inner(
-    root: &Path,
-    target: TxTarget,
-    setup: &[Directive],
-    group: &NamedGroup,
+    run: &IsolatedGroupRun<'_>,
     buffer: Arc<Mutex<String>>,
 ) -> Option<String> {
-    let qemu_cmd = match build_qemu_command(root, target) {
+    let qemu_cmd = match build_qemu_command(
+        run.root,
+        run.target,
+        run.profile,
+        run.smp,
+        run.extra_rv64_ext4,
+        run.append_cmdline,
+        run.boot_mode,
+    ) {
         Ok(c) => c,
         Err(e) => return Some(format!("qemu command: {e}")),
     };
@@ -745,14 +859,14 @@ fn run_group_isolated_inner(
     };
     let mut child = match Command::new(program)
         .args(rest)
-        .current_dir(root)
+        .current_dir(run.root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
     {
         Ok(c) => c,
-        Err(e) => return Some(format!("spawn qemu for {:?}: {e}", group.name)),
+        Err(e) => return Some(format!("spawn qemu for {:?}: {e}", run.group.name)),
     };
 
     let h_out = spawn_reader(&mut child, "stdout", Arc::clone(&buffer), false);
@@ -761,7 +875,7 @@ fn run_group_isolated_inner(
     let mut anchor = 0usize;
 
     let result = (|| -> Option<String> {
-        match run_block(&mut child, &buffer, "setup", setup, &mut anchor, false) {
+        match run_block(&mut child, &buffer, "setup", run.setup, &mut anchor, false) {
             Err(e) => return Some(format!("setup (harness): {e}")),
             Ok(Some(e)) => return Some(format!("setup: {e}")),
             Ok(None) => {}
@@ -769,8 +883,8 @@ fn run_group_isolated_inner(
         match run_block(
             &mut child,
             &buffer,
-            &group.name,
-            &group.directives,
+            &run.group.name,
+            &run.group.directives,
             &mut anchor,
             false,
         ) {
@@ -788,29 +902,44 @@ fn run_group_isolated_inner(
     result
 }
 
-fn build_qemu_command(root: &Path, target: TxTarget) -> Result<Vec<String>> {
+fn build_qemu_command(
+    root: &Path,
+    target: TxTarget,
+    profile: Profile,
+    smp: usize,
+    extra_rv64_ext4: Option<&Path>,
+    append_cmdline: Option<&str>,
+    boot_mode: Option<&str>,
+) -> Result<Vec<String>> {
     // Reuse the existing qemu_command builder by constructing an
     // args list and invoking the same dispatcher path. We can't call
     // the private `qemu_command` directly without exposing it; build
     // the command inline instead, matching the busybox profile +
     // --interactive flag.
     let kernel = target.kernel_path(root);
-    let initramfs = root
-        .join("target")
-        .join("images")
-        .join(busybox_initramfs_name(target));
+    let initramfs_name = match profile {
+        Profile::Busybox => busybox_initramfs_name(target),
+        Profile::Alpine => alpine_initramfs_name(target),
+        Profile::Smoke => {
+            return Err("shell-test supports busybox or alpine profiles, not smoke".into());
+        }
+    };
+    let initramfs = root.join("target").join("images").join(initramfs_name);
     let mut args = vec![
         target.qemu_binary().to_string(),
         "-machine".into(),
         target.qemu_machine().to_string(),
         "-m".into(),
-        match target {
-            TxTarget::La64Qemu => "1152M",
-            TxTarget::Rv64Qemu | TxTarget::Rv64M1DockMock => "256M",
+        match (target, profile) {
+            (TxTarget::La64Qemu, _) => "1152M",
+            (TxTarget::Rv64Qemu, Profile::Alpine) => "1024M",
+            (TxTarget::Rv64Qemu | TxTarget::Rv64M1DockMock, _) => "256M",
         }
         .into(),
         "-smp".into(),
-        "1".into(),
+        smp.to_string(),
+        "-accel".into(),
+        "tcg,thread=multi".into(),
         "-display".into(),
         "none".into(),
         "-serial".into(),
@@ -826,7 +955,163 @@ fn build_qemu_command(root: &Path, target: TxTarget) -> Result<Vec<String>> {
     args.push("-initrd".into());
     args.push(initramfs.display().to_string());
     args.push("-append".into());
-    args.push("tx.profile=busybox console=ttyS0".into());
-    let _ = Profile::Busybox; // documentation: this driver always uses busybox.
+    let boot_mode = boot_mode.unwrap_or_else(|| default_boot_mode_for_profile(profile));
+    let cmdline_base = match profile {
+        Profile::Busybox => format!("tx.profile=busybox tx.boot.mode={boot_mode} console=ttyS0"),
+        Profile::Alpine => {
+            format!("tx.profile=alpine tx.boot.mode={boot_mode} init=/bin/tx-bootstrap-busybox console=ttyS0")
+        }
+        Profile::Smoke => unreachable!("rejected above"),
+    };
+    let cmdline = match append_cmdline {
+        Some(extra) if !extra.trim().is_empty() => format!("{cmdline_base} {}", extra.trim()),
+        _ => cmdline_base,
+    };
+    args.push(append_tty_winsize_cmdline(&cmdline));
+    if let Some(path) = extra_rv64_ext4 {
+        if target != TxTarget::Rv64Qemu {
+            return Err("--extra-rv64-ext4 is only supported for rv64-qemu".into());
+        }
+        args.push("-drive".into());
+        args.push(format!(
+            "file={},format=raw,if=none,id=txblk0",
+            path.display()
+        ));
+        args.push("-device".into());
+        args.push("virtio-blk-device,drive=txblk0,bus=virtio-mmio-bus.0".into());
+    }
     Ok(args)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alpine_profile_uses_alpine_initramfs_and_cmdline() {
+        let root = Path::new("/tmp/tx");
+        let command = build_qemu_command(
+            root,
+            TxTarget::Rv64Qemu,
+            Profile::Alpine,
+            1,
+            None,
+            None,
+            None,
+        )
+        .expect("build qemu command");
+        let rendered = command.join(" ");
+
+        assert!(rendered.contains("alpine-initramfs-rv64-qemu.cpio"));
+        assert!(rendered.contains(
+            "tx.profile=alpine tx.boot.mode=alpine init=/bin/tx-bootstrap-busybox console=ttyS0"
+        ));
+        assert!(rendered.contains("tx.tty.rows="));
+        assert!(rendered.contains("tx.tty.cols="));
+        assert!(rendered.contains("-m 1024M"));
+        assert!(rendered.contains("-smp 1"));
+        assert!(!rendered.contains("busybox-initramfs-rv64-qemu.cpio"));
+    }
+
+    #[test]
+    fn shell_test_qemu_command_honors_smp_override() {
+        let root = Path::new("/tmp/tx");
+        let command = build_qemu_command(
+            root,
+            TxTarget::Rv64Qemu,
+            Profile::Alpine,
+            4,
+            None,
+            None,
+            None,
+        )
+        .expect("build qemu command");
+        assert!(command.join(" ").contains("-smp 4"));
+    }
+
+    #[test]
+    fn shell_test_can_attach_rv64_ext4_drive_on_bus0() {
+        let root = Path::new("/tmp/tx");
+        let image = Path::new("/tmp/tx/target/images/alpine-tcc-dev-root-rv64-qemu.ext4");
+        let command = build_qemu_command(
+            root,
+            TxTarget::Rv64Qemu,
+            Profile::Alpine,
+            1,
+            Some(image),
+            None,
+            None,
+        )
+        .expect("build qemu command");
+        let rendered = command.join(" ");
+
+        assert!(rendered.contains("-drive file=/tmp/tx/target/images/alpine-tcc-dev-root-rv64-qemu.ext4,format=raw,if=none,id=txblk0"));
+        assert!(rendered.contains("-device virtio-blk-device,drive=txblk0,bus=virtio-mmio-bus.0"));
+    }
+
+    #[test]
+    fn shell_test_can_append_kernel_cmdline_tokens() {
+        let root = Path::new("/tmp/tx");
+        let command = build_qemu_command(
+            root,
+            TxTarget::Rv64Qemu,
+            Profile::Alpine,
+            1,
+            None,
+            Some("tx.mount.sdcard=0"),
+            None,
+        )
+        .expect("build qemu command");
+        let rendered = command.join(" ");
+
+        assert!(rendered.contains("tx.mount.sdcard=0"));
+        assert!(rendered.contains("tx.tty.rows="));
+        assert!(rendered.contains("tx.tty.cols="));
+    }
+
+    #[test]
+    fn shell_test_boot_mode_override_replaces_profile_default() {
+        let root = Path::new("/tmp/tx");
+        let command = build_qemu_command(
+            root,
+            TxTarget::Rv64Qemu,
+            Profile::Alpine,
+            1,
+            None,
+            None,
+            Some("contest"),
+        )
+        .expect("build qemu command");
+        let rendered = command.join(" ");
+
+        assert!(rendered.contains("tx.profile=alpine"));
+        assert!(rendered.contains("tx.boot.mode=contest"));
+        assert!(!rendered.contains("tx.boot.mode=alpine"));
+    }
+
+    #[test]
+    fn quoted_send_supports_hex_control_bytes() {
+        let parsed = parse_quoted(r#""a\x03\e""#).expect("parse quoted");
+        assert_eq!(parsed.as_bytes(), &[b'a', 0x03, 0x1b]);
+    }
+
+    #[test]
+    fn send_interactive_bytes_preserves_order_across_escape_boundary() {
+        let mut out = Vec::new();
+
+        send_interactive_bytes(&mut out, b"iabc\n\x1b:wq\n").expect("send bytes");
+
+        assert_eq!(out, b"iabc\n\x1b:wq\n");
+    }
+
+    #[test]
+    fn send_interactive_bytes_waits_after_escape_boundary() {
+        let mut out = Vec::new();
+        let start = Instant::now();
+
+        send_interactive_bytes(&mut out, b"\x1b:wq\n").expect("send bytes");
+
+        assert_eq!(out, b"\x1b:wq\n");
+        assert!(start.elapsed() >= ESC_KEY_DELAY);
+    }
 }

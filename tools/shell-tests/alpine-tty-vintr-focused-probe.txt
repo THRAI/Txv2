@@ -1,0 +1,18 @@
+# alpine-tty-vintr-focused-probe.txt - prove VINTR reaches the foreground process group.
+
+wait ":bootstrap-exec:ok" within 60000
+wait "/ # " within 60000
+sleep 500
+
+send "sleep 30; echo VINTR_SHOULD_NOT_PRINT\n"
+sleep 1000
+send "\x03"
+expect "/ # " within 15000
+
+sleep 500
+send "echo VINTR_AFTER\n"
+expect "VINTR_AFTER" within 10000
+expect "/ # " within 10000
+
+sleep 500
+quit

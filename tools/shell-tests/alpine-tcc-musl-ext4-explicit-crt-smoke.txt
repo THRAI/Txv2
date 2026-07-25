@@ -1,0 +1,31 @@
+# alpine-tcc-musl-ext4-explicit-crt-smoke.txt - link musl with explicit CRT.
+#
+# This bypasses TCC's compiled-in startup-file search path. Alpine's riscv64
+# tcc-dev package provides musl CRT objects but no libtcc1.a, so the test uses
+# -nostdlib and passes the CRT objects directly.
+
+wait ":mount:sdcard:ext4:ok" within 90000
+wait "/ # " within 90000
+sleep 500
+
+send "echo tcc-musl-explicit-crt-start\n"
+expect "tcc-musl-explicit-crt-start" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "printf '#include <stdio.h>\\nint main(void) { puts(\"tcc-musl-linked\"); return 7; }\\n' > /tmp/tccmain.c\n"
+expect "/ # " within 10000
+
+sleep 500
+send "/musl/lib/ld-musl-riscv64.so.1 --library-path /musl/lib:/musl/usr/lib /musl/usr/bin/tcc -nostdlib /musl/usr/lib/crt1.o /musl/usr/lib/crti.o /tmp/tccmain.c /musl/usr/lib/crtn.o -I/musl/usr/include -L/musl/lib -L/musl/usr/lib -lc -o /tmp/tccmain; echo explicit-crt-link-status:$?\n"
+expect "explicit-crt-link-status:0" within 30000
+expect "/ # " within 30000
+
+sleep 500
+send "/tmp/tccmain; echo explicit-crt-run-status:$?\n"
+expect "tcc-musl-linked" within 20000
+expect "explicit-crt-run-status:7" within 20000
+expect "/ # " within 20000
+
+sleep 500
+quit

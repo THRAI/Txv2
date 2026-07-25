@@ -1,0 +1,38 @@
+# alpine-vi-smoke.txt - run Alpine BusyBox vi inside the guest.
+#
+# Build the initramfs with:
+#   TX_ALPINE_ROOTFS=target/rootfs/alpine-rv64-qemu \
+#     cargo xtask image cpio --profile alpine --target rv64-qemu
+#
+# Run with:
+#   cargo xtask shell-test --target rv64-qemu --profile alpine \
+#     --script tools/shell-tests/alpine-vi-smoke.txt
+
+wait ":shebang-shims:skip:alpine" within 60000
+wait ":bootstrap-exec:ok" within 60000
+wait "/ # " within 60000
+sleep 500
+
+send "if test -e /bin/busybox; then echo busybox-exists; else echo busybox-missing; fi\n"
+expect "busybox-exists" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "/bin/busybox true; echo busybox-status-$?\n"
+expect "busybox-status-0" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "command -v vi\n"
+expect "/usr/bin/vi" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "TERM=vt100 /usr/bin/vi --help; echo vi-status-$?\n"
+expect "BusyBox" within 15000
+expect "Usage: vi" within 15000
+expect "vi-status-0" within 15000
+expect "/ # " within 15000
+
+sleep 500
+quit

@@ -3,6 +3,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::target::Profile;
 use crate::Result;
 
 pub(crate) fn resolve_path(root: &Path, path: PathBuf) -> PathBuf {
@@ -75,6 +76,77 @@ pub(crate) fn optional_option_value(args: &[String], name: &str) -> Option<Strin
     args.get(idx + 1).cloned()
 }
 
+pub(crate) fn append_tty_winsize_cmdline(base: &str) -> String {
+    let (rows, cols) = host_tty_winsize();
+    format!("{base} tx.tty.rows={rows} tx.tty.cols={cols}")
+}
+
+pub(crate) fn default_boot_mode_for_profile(profile: Profile) -> &'static str {
+    match profile {
+        Profile::Smoke => "smoke",
+        Profile::Busybox => "busybox",
+        Profile::Alpine => "alpine",
+    }
+}
+
+pub(crate) fn validate_boot_mode_value(value: &str) -> Result<()> {
+    match value {
+        "normal" | "linux" | "linux-like" | "user" | "userland" | "smoke" | "busybox"
+        | "alpine" | "contest" | "competition" | "oscomp" | "ltp" | "test" | "compat" | "shim"
+        | "shims" => Ok(()),
+        other => Err(format!(
+            "invalid --boot-mode '{other}', expected normal|alpine|contest|busybox|oscomp|ltp|test"
+        )),
+    }
+}
+
+fn host_tty_winsize() -> (u16, u16) {
+    if let (Some(rows), Some(cols)) = (
+        env_positive_u16("TX_TTY_ROWS"),
+        env_positive_u16("TX_TTY_COLS"),
+    ) {
+        return (rows, cols);
+    }
+
+    if let Some((rows, cols)) = stty_winsize() {
+        return (rows, cols);
+    }
+
+    (24, 80)
+}
+
+fn env_positive_u16(name: &str) -> Option<u16> {
+    std::env::var(name)
+        .ok()?
+        .parse::<u16>()
+        .ok()
+        .filter(|v| *v != 0)
+}
+
+fn stty_winsize() -> Option<(u16, u16)> {
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg("stty size < /dev/tty")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_stty_size(core::str::from_utf8(&output.stdout).ok()?)
+}
+
+fn parse_stty_size(output: &str) -> Option<(u16, u16)> {
+    let mut parts = output.split_ascii_whitespace();
+    let rows = parts.next()?.parse::<u16>().ok()?;
+    let cols = parts.next()?.parse::<u16>().ok()?;
+    if rows == 0 || cols == 0 || parts.next().is_some() {
+        return None;
+    }
+    Some((rows, cols))
+}
+
 pub(crate) fn run_cmd(root: &Path, program: &str, args: &[&str]) -> Result<()> {
     println!("$ {} {}", program, args.join(" "));
     let status = Command::new(program)
@@ -118,7 +190,7 @@ pub(crate) fn run_cmd_owned_in(cwd: &Path, program: &str, args: &[String]) -> Re
 }
 
 pub(crate) fn run_shell(root: &Path, script: &str) -> Result<()> {
-    println!("$ sh -c {}", script);
+    println!("$ sh -c {script}");
     let status = Command::new("sh")
         .arg("-c")
         .arg(script)
@@ -258,6 +330,27 @@ pub(crate) fn shell_join(args: &[String]) -> String {
         .map(|arg| shell_escape(arg))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{append_tty_winsize_cmdline, parse_stty_size};
+
+    #[test]
+    fn parse_stty_size_accepts_positive_rows_and_cols() {
+        assert_eq!(parse_stty_size("33 101\n"), Some((33, 101)));
+        assert_eq!(parse_stty_size("0 101\n"), None);
+        assert_eq!(parse_stty_size("33\n"), None);
+        assert_eq!(parse_stty_size("33 101 extra\n"), None);
+    }
+
+    #[test]
+    fn append_tty_winsize_cmdline_adds_kernel_tokens() {
+        let rendered = append_tty_winsize_cmdline("tx.profile=alpine console=ttyS0");
+        assert!(rendered.starts_with("tx.profile=alpine console=ttyS0 "));
+        assert!(rendered.contains("tx.tty.rows="));
+        assert!(rendered.contains("tx.tty.cols="));
+    }
 }
 
 pub(crate) fn shell_escape(value: &str) -> String {

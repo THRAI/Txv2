@@ -1,0 +1,61 @@
+# alpine-proc-init-surfaces-focused-probe.txt - Alpine init procfs surfaces.
+#
+# Covers the generic /proc files Alpine OpenRC scripts inspect outside the
+# network-specific /proc/net and /proc/sys/net probes.
+
+wait ":bootstrap-exec:ok" within 60000
+wait "/ # " within 60000
+sleep 500
+
+send "m=N73H; echo ${m}_START\n"
+expect "N73H_START" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "cat /proc/filesystems\n"
+expect "tmpfs" within 10000
+expect "proc" within 10000
+expect "sysfs" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "cat /proc/modules; echo ${m}_MODULES_READ_OK\n"
+expect "N73H_MODULES_READ_OK" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "cat /proc/devices\n"
+expect "Character devices:" within 10000
+expect "Block devices:" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "cat /proc/cgroups\n"
+expect "#subsys_name" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "cat /proc/cmdline\n"
+expect "tx.profile=alpine" within 10000
+expect "console=ttyS0" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "cat /proc/mounts\n"
+expect "/proc proc" within 10000
+expect "/sys sysfs" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "cat /proc/self/mounts\n"
+expect "/proc proc" within 10000
+expect "/sys sysfs" within 10000
+expect "/ # " within 10000
+
+sleep 500
+send "echo ${m}_PROC_INIT_SUCCESS\n"
+expect "N73H_PROC_INIT_SUCCESS" within 10000
+expect "/ # " within 10000
+
+sleep 500
+quit

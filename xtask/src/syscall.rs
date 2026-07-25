@@ -230,7 +230,7 @@ fn locate_handler(handler_dir: &Path, handler: &str) -> Option<(bool, String)> {
             continue;
         };
         // Find `fn <handler>(` or `fn <handler><`.
-        let needle = format!("fn {}", handler);
+        let needle = format!("fn {handler}");
         let Some(pos) = text.find(&needle) else {
             continue;
         };

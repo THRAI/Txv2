@@ -12,6 +12,7 @@ mod full_build;
 mod image;
 mod kernel_user_layouts;
 mod lint;
+mod lint_invariants_api_language;
 mod lint_invariants_checks;
 mod lint_invariants_cred_check;
 mod lint_invariants_drive;
@@ -20,11 +21,15 @@ mod lint_invariants_observe;
 mod lint_invariants_script;
 mod lint_invariants_signal;
 mod lint_invariants_step;
+mod lint_invariants_step_interface;
 mod lint_invariants_step_v3;
 mod lint_invariants_subj;
 mod lint_invariants_syscall;
+mod lint_invariants_time_layering;
+mod lint_invariants_time_wake;
 mod lint_invariants_wait;
 mod lint_invariants_witness;
+mod lint_invariants_zone;
 #[path = "lint_step_guard.rs"]
 mod lint_step_guard;
 mod observe;
@@ -103,11 +108,11 @@ fn print_usage() {
            cargo xtask ci-slow\n\
            cargo xtask check\n\
            cargo xtask build --target rv64-qemu|rv64-m1dock-mock|la64-qemu|all\n\
-           cargo xtask qemu --target rv64-qemu|rv64-m1dock-mock|la64-qemu --profile smoke|busybox [--dry-run] [--expect-sentinel] [--timeout-ms N] [--smp N] [--no-block] [--interactive]\n\
+           cargo xtask qemu --target rv64-qemu|rv64-m1dock-mock|la64-qemu --profile smoke|busybox|alpine [--boot-mode normal|alpine|contest|busybox|oscomp|ltp|test] [--dry-run] [--expect-sentinel] [--timeout-ms N] [--smp N] [--no-block] [--interactive] [--append-cmdline TEXT] [--extra-rv64-ext4 PATH]\n\
            cargo xtask test [smoke|busybox-boot] [--target rv64-qemu] [--timeout-ms N] [--dry-run] [--trap-trace]\n\
            cargo xtask fault-decode --target rv64-qemu [--elf PATH] [--serial PATH [--all] | --scause HEX --sepc HEX --stval HEX | --addr HEX]\n\
            cargo xtask trap-trace --serial PATH [--syscalls | --raw]\n\
-           cargo xtask shell-test --target rv64-qemu --script PATH [--group NAME[,NAME...]] [--list-groups] [--keep-going]\n\
+           cargo xtask shell-test --target rv64-qemu --script PATH [--boot-mode normal|alpine|contest|busybox|oscomp|ltp|test] [--group NAME[,NAME...]] [--list-groups] [--keep-going]\n\
            cargo xtask image cpio --profile busybox [--target rv64-qemu|la64-qemu]\n\
            cargo xtask image ext4 --profile busybox [--target rv64-qemu|la64-qemu] [--size 64M]\n\
            cargo xtask image m1dock-sd --profile busybox [--target rv64-m1dock-mock] [--size 64M]\n\
@@ -125,6 +130,7 @@ fn print_usage() {
            cargo xtask progress claim plan|worktree --id ID --owner NAME --scope PATH [--scope PATH]\n\
            cargo xtask progress close plan|handoff|worktree --id ID --status STATUS\n\
            cargo xtask lint arch|docs|unused|boundary|invariants [rule|all]|kernel-user-layouts|syscall-status\n\
+             invariants rule includes api-language, boot-setup, observe-producer-boundary, time-layering, time-wake-retired, no-adhoc-drive, syscall-no-await, step, and related discipline checks\n\
            cargo xtask boundary-report [--top N] [--json]\n\
            cargo xtask observe-schema check [--schema schema/txobserve.toml]\n\
            cargo xtask syscall-status [<NAME>...] [--regen|--check|--list-missing]\n\

@@ -53,7 +53,7 @@ expect "N73G_BRIDGE_UP" within 15000
 expect "/ # " within 10000
 
 sleep 500
-send "if $IP link add veth0 type veth peer name eth0; then echo ${m}_VETH_CREATED; else echo ${m}_FAIL_VETH_CREATE; fi\n"
+send "if $IP link add veth0 type veth peer name vethpeer0; then echo ${m}_VETH_CREATED; else echo ${m}_FAIL_VETH_CREATE; fi\n"
 expect "N73G_VETH_CREATED" within 15000
 expect "/ # " within 10000
 
@@ -68,7 +68,7 @@ expect "N73G_VETH_UP" within 15000
 expect "/ # " within 10000
 
 sleep 500
-send "if $IP link set eth0 netns $target || /bin/netns-helper netns eth0 $target; then echo ${m}_ETH_MOVED; else echo ${m}_FAIL_ETH_MOVE; fi\n"
+send "if $IP link set vethpeer0 netns $target name eth0 || (/bin/netns-helper netns vethpeer0 $target && /bin/netns-helper exec $target $IP link set vethpeer0 name eth0); then echo ${m}_ETH_MOVED; else echo ${m}_FAIL_ETH_MOVE; fi\n"
 expect "N73G_ETH_MOVED" within 15000
 expect "/ # " within 10000
 

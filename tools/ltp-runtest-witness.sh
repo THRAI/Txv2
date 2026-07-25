@@ -1,7 +1,8 @@
 #!/bin/bash
 # Four-lane official-form witness runner for LTP bin files.
 #
-# Boots one QEMU per lane with `tx.oscomp.groups=ltp-bin:<libc>:<files>`
+# Boots one QEMU per lane with `tx.boot.mode=ltp
+# tx.oscomp.groups=ltp-runtest:<module>:<files>`
 # (the official ltp_testcode.sh no-args shape, see exec.rs), captures the
 # colored serial log, and scores it with the REAL per-lane judge via
 # tools/oscomp-judge.py. Each lane gets its own image copy so lanes can
@@ -26,7 +27,7 @@ run_lane() {
   local arch="${lane%%.*}" libc="${lane##*.}"
   local img="$OUTDIR/sd-$TAG-$lane.img"
   local log="$OUTDIR/$TAG-$lane.log"
-  local cmdline="tx.oscomp.groups=ltp-runtest:${MODULE:-syscalls}:$FILES${EXTRA_CMDLINE:+ $EXTRA_CMDLINE}"
+  local cmdline="tx.boot.mode=ltp tx.oscomp.groups=ltp-runtest:${MODULE:-syscalls}:$FILES${EXTRA_CMDLINE:+ $EXTRA_CMDLINE}"
   cp "target/oscomp/testdata/sdcard-${arch}.img" "$img" || return 1
   if [ "$arch" = rv ]; then
     ( timeout -s KILL "$TMO" qemu-system-riscv64 -machine virt \

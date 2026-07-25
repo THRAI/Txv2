@@ -141,6 +141,7 @@ fn lint_invariants(root: &Path, sub: &str) -> Result<()> {
         "step-v4-vocabulary" => crate::lint_invariants_step_v3::lint_invariants_v4_vocabulary(root),
         "step-no-await" => crate::lint_invariants_step_v3::lint_invariants_step_no_await(root),
         "step-sync-signature" => crate::lint_invariants_step_v3::lint_invariants_step_sync_signature(root),
+        "step-interface" => crate::lint_invariants_step_interface::lint_invariants_step_interface(root),
         "step" => {
             // Convenience: run all four step-related lints
             type LintRule = fn(&Path) -> Result<()>;
@@ -166,8 +167,13 @@ fn lint_invariants(root: &Path, sub: &str) -> Result<()> {
         "checks-purity" => crate::lint_invariants_checks::lint_invariants_checks_purity(root),
         "cred-check" => crate::lint_invariants_cred_check::lint_invariants_cred_check(root),
         "legacy-wait-channel" => crate::lint_invariants_wait::lint_invariants_legacy_wait_channel(root),
+        "zone-interface" => crate::lint_invariants_zone::lint_invariants_zone_interface(root),
+        "api-language" => crate::lint_invariants_api_language::lint_invariants_api_language(root),
         "notification-boundary" => crate::lint_invariants_notification::lint_invariants_notification_boundary(root),
         "observe-producer-boundary" => crate::lint_invariants_observe::lint_invariants_observe_producer_boundary(root),
+        "time-layering" => crate::lint_invariants_time_layering::lint_invariants_time_layering(root),
+        "time-wake-retired" => crate::lint_invariants_time_wake::lint_invariants_time_wake_retired(root),
+        "boot-setup" => lint_invariants_boot_setup(root),
         "step-guard" => crate::lint_step_guard::lint_invariants_step_guard(root),
         "no-adhoc-drive" => crate::lint_invariants_drive::lint_invariants_no_adhoc_drive(root),
         "syscall-adhoc-loop" => crate::lint_invariants_syscall::lint_invariants_syscall_adhoc_loop(root),
@@ -188,8 +194,13 @@ fn lint_invariants(root: &Path, sub: &str) -> Result<()> {
                 ("cred-check", crate::lint_invariants_cred_check::lint_invariants_cred_check),
                 ("step-guard", crate::lint_step_guard::lint_invariants_step_guard),
                 ("legacy-wait-channel", crate::lint_invariants_wait::lint_invariants_legacy_wait_channel),
+                ("zone-interface", crate::lint_invariants_zone::lint_invariants_zone_interface),
+                ("api-language", crate::lint_invariants_api_language::lint_invariants_api_language),
                 ("notification-boundary", crate::lint_invariants_notification::lint_invariants_notification_boundary),
                 ("observe-producer-boundary", crate::lint_invariants_observe::lint_invariants_observe_producer_boundary),
+                ("time-layering", crate::lint_invariants_time_layering::lint_invariants_time_layering),
+                ("time-wake-retired", crate::lint_invariants_time_wake::lint_invariants_time_wake_retired),
+                ("boot-setup", lint_invariants_boot_setup),
                 ("no-adhoc-drive", crate::lint_invariants_drive::lint_invariants_no_adhoc_drive),
                 ("syscall-adhoc-loop", crate::lint_invariants_syscall::lint_invariants_syscall_adhoc_loop),
                 ("syscall-no-await", crate::lint_invariants_syscall::lint_invariants_syscall_no_await),
@@ -209,8 +220,33 @@ fn lint_invariants(root: &Path, sub: &str) -> Result<()> {
             }
         }
         other => Err(format!(
-            "unknown invariants sub-rule '{other}'. Expected: step-discipline, step-v4-vocabulary, step-no-await, step-sync-signature, step, subject-context, witness-scope, signal-publish, script-boundary, checks-purity, cred-check, legacy-wait-channel, notification-boundary, observe-producer-boundary, no-adhoc-drive, syscall-adhoc-loop, syscall-no-await, syscall-ctx-bridge, all"
+            "unknown invariants sub-rule '{other}'. Expected: step-discipline, step-v4-vocabulary, step-no-await, step-sync-signature, step-interface, step, subject-context, witness-scope, signal-publish, script-boundary, checks-purity, cred-check, legacy-wait-channel, zone-interface, api-language, notification-boundary, observe-producer-boundary, time-layering, time-wake-retired, boot-setup, no-adhoc-drive, syscall-adhoc-loop, syscall-no-await, syscall-ctx-bridge, all"
         )),
+    }
+}
+
+fn lint_invariants_boot_setup(root: &Path) -> Result<()> {
+    let files = collect_files(root, &["rs", "py", "sh"]).map_err(|err| err.to_string())?;
+    let mut findings = Vec::new();
+
+    for file in files {
+        let relative = relative(root, &file);
+        let normalized = relative.replace('\\', "/");
+        if is_lint_excluded_path(&normalized) {
+            continue;
+        }
+        let text = fs::read_to_string(&file).map_err(|err| format!("{}: {err}", file.display()))?;
+        findings.extend(lint_boot_setup_text(&normalized, &relative, &text));
+    }
+
+    if findings.is_empty() {
+        println!("boot-setup lint: ok");
+        Ok(())
+    } else {
+        for finding in &findings {
+            eprintln!("{finding}");
+        }
+        Err(format!("boot-setup lint found {} issue(s)", findings.len()))
     }
 }
 
@@ -481,6 +517,135 @@ fn raw_spinmutex_allowed(path: &str) -> bool {
                 | "crates/tx-ext4/src/sync.rs"
                 | "crates/tx-fat/src/sync.rs"
         )
+}
+
+fn boot_cmdline_allowed_path(path: &str) -> bool {
+    matches!(
+        path,
+        "crates/tx-kernel/src/init/boot_args.rs"
+            | "crates/tx-kernel/src/init/boot_plan.rs"
+            | "crates/tx-kernel/src/init/exec.rs"
+            | "crates/tx-kernel/src/init.rs"
+            | "crates/tx-kernel/src/zones.rs"
+            | "xtask/src/qemu.rs"
+            | "xtask/src/shell_test.rs"
+            | "xtask/src/oscomp.rs"
+            | "xtask/src/util.rs"
+            | "xtask/src/test.rs"
+            | "xtask/src/lib.rs"
+            | "xtask/src/lint.rs"
+            | "tools/oscomp-custom-run.py"
+            | "tools/oscomp-observe-live.py"
+            | "tools/ltp-bin-witness.sh"
+            | "tools/ltp-runtest-witness.sh"
+            | "tools/shell-tests/qemu-runner.py"
+            | "tools/test-init/tx-test-init.sh"
+            | "tools/tests/test_oscomp_custom_run.py"
+            | "tools/tests/test_oscomp_observe_live.py"
+    )
+}
+
+fn user_space_boot_setup_allowed_path(path: &str) -> bool {
+    matches!(
+        path,
+        "crates/tx-kernel/src/init/rootfs_shims.rs"
+            // Transitional OSComp/LTP payload command builder. Keep this
+            // explicit so the next migration can delete the allowance when
+            // all judged setup lives in /tx-test-init or image construction.
+            | "crates/tx-kernel/src/init/exec.rs"
+            | "xtask/src/lint.rs"
+            | "tools/test-init/tx-test-init.sh"
+    )
+}
+
+fn lint_boot_setup_text(path: &str, display: &str, text: &str) -> Vec<String> {
+    let mut findings = Vec::new();
+
+    for (idx, line) in text.lines().enumerate() {
+        let line_no = idx + 1;
+        if boot_setup_lint_comment_line(line) {
+            continue;
+        }
+
+        if !boot_cmdline_allowed_path(path) && boot_cmdline_surface(line) {
+            findings.push(format!(
+                "{display}:{line_no}: boot cmdline parsing/emission must stay in init/boot_args.rs, init/boot_plan.rs, approved xtask QEMU entrypoints, or the explicit test-init/OSComp tooling surface"
+            ));
+        }
+
+        if !user_space_boot_setup_allowed_path(path) && user_space_boot_setup_line(line) {
+            findings.push(format!(
+                "{display}:{line_no}: user-space boot setup belongs in tools/test-init/tx-test-init.sh, image construction, or the legacy init/rootfs_shims.rs compatibility lane"
+            ));
+        }
+    }
+
+    findings
+}
+
+fn boot_setup_lint_comment_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("//")
+        || trimmed.starts_with("#")
+        || trimmed.starts_with("*")
+        || trimmed.starts_with("/*")
+}
+
+fn boot_cmdline_surface(line: &str) -> bool {
+    line.contains("boot_info().cmdline")
+        || line.contains("BootInfoIf>::boot_info().cmdline")
+        || line.contains("cmdline_value_str(")
+        || line.contains("cmdline_value::<")
+        || line.contains("strip_prefix(\"tx.")
+        || line.contains("strip_prefix(\"init=")
+        || line.contains("tx.boot.mode=")
+        || line.contains("tx.profile=")
+        || line.contains("tx.oscomp")
+        || line.contains("tx.ltp.")
+        || line.contains("tx.test_init")
+        || line.contains("tx.mount.sdcard")
+        || line.contains("tx.tty.")
+        || line.contains("tx.zone_summary")
+        || line.contains("tx.resource_summary")
+        || line.contains("init=/tx-test-init")
+}
+
+fn user_space_boot_setup_line(line: &str) -> bool {
+    let setup_path = [
+        "/etc/passwd",
+        "/etc/group",
+        "/etc/hosts",
+        "/etc/services",
+        "/etc/protocols",
+        "/etc/dhcpd.conf",
+        "/var/lib/misc",
+        "/var/run/netns",
+        "/tx-ltp/",
+        "/boot/config",
+        "/lib/modules/",
+    ]
+    .iter()
+    .any(|needle| line.contains(needle));
+
+    setup_path && user_space_setup_mutation(line)
+}
+
+fn user_space_setup_mutation(line: &str) -> bool {
+    [
+        "create_file",
+        "write_file",
+        "mkdir",
+        "mkdir_p",
+        "mkdir_or_find",
+        ".mkdir(",
+        "fs_ops.mkdir",
+        "symlink",
+        "link_force",
+        "cat >",
+        "printf",
+    ]
+    .iter()
+    .any(|needle| line.contains(needle))
 }
 
 fn rv64_qemu_boot_static_path(path: &str) -> bool {
@@ -1132,6 +1297,68 @@ fn sym() -> usize {
         assert!(findings
             .iter()
             .all(|finding| !finding.contains("TTY-CTL-1a")));
+    }
+
+    #[test]
+    fn boot_setup_lint_rejects_kernel_cmdline_parsing_outside_boot_args() {
+        let findings = lint_boot_setup_text(
+            "crates/tx-subsystems/src/net/mod.rs",
+            "crates/tx-subsystems/src/net/mod.rs",
+            r#"
+fn bad<P: tx_hal::TxPlatform>() -> bool {
+    let cmdline = <P as tx_hal::BootInfoIf>::boot_info().cmdline.unwrap_or("");
+    cmdline.split_ascii_whitespace().any(|token| token == "tx.boot.mode=alpine")
+}
+"#,
+        );
+
+        assert!(findings
+            .iter()
+            .any(|finding| finding.contains("boot cmdline parsing")));
+    }
+
+    #[test]
+    fn boot_setup_lint_allows_boot_args_cmdline_parsing() {
+        let findings = lint_boot_setup_text(
+            "crates/tx-kernel/src/init/boot_args.rs",
+            "crates/tx-kernel/src/init/boot_args.rs",
+            r#"
+fn mode(cmdline: &str) -> bool {
+    cmdline.split_ascii_whitespace().any(|token| token == "tx.boot.mode=alpine")
+}
+"#,
+        );
+
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn boot_setup_lint_rejects_user_space_setup_outside_shim_or_test_init() {
+        let findings = lint_boot_setup_text(
+            "crates/tx-kernel/src/init.rs",
+            "crates/tx-kernel/src/init.rs",
+            r#"
+fn bad() {
+    create_file("/etc/passwd");
+    create_file("/tx-ltp/bin/sysctl");
+}
+"#,
+        );
+
+        assert!(findings
+            .iter()
+            .any(|finding| finding.contains("user-space boot setup")));
+    }
+
+    #[test]
+    fn boot_setup_lint_allows_test_init_user_space_setup() {
+        let findings = lint_boot_setup_text(
+            "tools/test-init/tx-test-init.sh",
+            "tools/test-init/tx-test-init.sh",
+            "mkdir -p /etc /tx-ltp/bin\ncat > /etc/passwd <<'EOS'\nEOS\n",
+        );
+
+        assert!(findings.is_empty());
     }
 
     #[test]

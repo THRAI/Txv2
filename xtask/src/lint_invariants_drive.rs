@@ -28,6 +28,19 @@ use crate::Result;
 /// StepOutcome dispatch. Measured baseline 2026-05-14.
 const MAX_ADHOC_OUTCOME_FILES: usize = 4; // 3→4: vfs-full-bringup merge added one new ad-hoc-drive file (ext4/bdev-fs wiring)
 
+fn is_outcome_construction(code: &str) -> bool {
+    let trimmed = code.trim_start();
+    let constructor = !trimmed.contains("=>")
+        && (trimmed.starts_with("StepOutcome::Yield")
+            || trimmed.starts_with("StepOutcome::Continue")
+            || trimmed.starts_with("return StepOutcome::Yield")
+            || trimmed.starts_with("return StepOutcome::Continue"));
+
+    constructor
+        || (code.contains("=>")
+            && (code.contains("StepOutcome::Yield") || code.contains("StepOutcome::Continue")))
+}
+
 pub(crate) fn lint_invariants_no_adhoc_drive(root: &Path) -> Result<()> {
     let target_dirs = [
         "crates/tx-kernel",
@@ -145,10 +158,7 @@ pub(crate) fn lint_invariants_no_adhoc_drive(root: &Path) -> Result<()> {
                     } else {
                         trimmed
                     };
-                    let is_construction = code_part.contains("=>")
-                        && (code_part.contains("StepOutcome::Yield")
-                            || code_part.contains("StepOutcome::Continue"));
-                    if is_construction {
+                    if is_outcome_construction(code_part) {
                         continue;
                     }
 
@@ -200,10 +210,9 @@ pub(crate) fn lint_invariants_no_adhoc_drive(root: &Path) -> Result<()> {
         "ok"
     };
     println!(
-        "files with ad-hoc outcome dispatch: {:>4}  (ceiling {})  {}",
-        file_count, MAX_ADHOC_OUTCOME_FILES, status
+        "files with ad-hoc outcome dispatch: {file_count:>4}  (ceiling {MAX_ADHOC_OUTCOME_FILES})  {status}"
     );
-    println!("total ad-hoc outcome sites:         {:>4}", site_count);
+    println!("total ad-hoc outcome sites:         {site_count:>4}");
 
     if !adhoc_files.is_empty() {
         println!();
@@ -228,6 +237,18 @@ pub(crate) fn lint_invariants_no_adhoc_drive(root: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_outcome_construction;
+
+    #[test]
+    fn returned_yield_is_an_outcome_producer_not_a_dispatch() {
+        assert!(is_outcome_construction(
+            "return StepOutcome::Yield(YieldShape::on_wait_source(source, interests));"
+        ));
+    }
 }
 
 /// Approximate check: is this line inside a `#[cfg(test)]` or `mod tests {` block?

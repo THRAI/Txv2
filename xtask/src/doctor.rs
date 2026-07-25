@@ -89,10 +89,7 @@ pub(crate) fn doctor(root: &Path) -> Result<()> {
                     TxTarget::La64Qemu => "tools/images/build-busybox-loongarch64.sh",
                     TxTarget::Rv64M1DockMock => unreachable!("not checked here"),
                 };
-                println!(
-                    "warn: TX_BUSYBOX not set and {} missing; run `{}`",
-                    relpath, help
-                );
+                println!("warn: TX_BUSYBOX not set and {relpath} missing; run `{help}`");
             }
         }
     }
