@@ -50,6 +50,14 @@ pub fn require_fault_publication(
     }
 
     match (entry.backing, materialization.backing) {
+        (VmEntryBacking::None, VmFaultMaterializationBacking::Special(special)) => {
+            if view_matches_entry(entry, &outcome.entry)
+                && outcome.entry.special_backing() == Some(special)
+            {
+                return Ok(());
+            }
+            return Err(VmFaultError::StaleRecipe);
+        }
         (VmEntryBacking::Page { .. }, VmFaultMaterializationBacking::PageBacked) => {
             if outcome.backing_page_index()? != materialization.page_index {
                 return Err(VmFaultError::StaleRecipe);
@@ -72,6 +80,7 @@ fn view_matches_entry(view: VmEntryView<'_>, entry: &VmEntry) -> bool {
         || view.flags != entry.flags
         || view.ufd_registration != entry.ufd_registration
         || view.backing != entry.backing_kind()
+        || view.special != entry.special_backing()
     {
         return false;
     }

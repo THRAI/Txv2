@@ -7,14 +7,20 @@
 //! `open_console_for_init` directly.
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use std::sync::Mutex;
 
 use super::adapter::step_engine::{
     self as step_engine, guard, ByteProgress, Cap, Errno as V3Errno, StepOutcome as V3Outcome,
 };
-use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
+use tx_services::time::{
+    platform::HalRtcDevice, DeadlineDomain, DeadlineNs, DeadlineRegistrarHandle,
+    RtcDeviceOps as TimeRtcDeviceOps, TimeError, TimerRole, TimerTarget, TimerToken,
+};
+use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT, RtcEventMask};
 use tx_subsystems::execution::Guard;
 use tx_subsystems::mount::{DevId, MountOptions, MountPayload, SourceLabel};
 use tx_subsystems::tty::execution::{register_console_alias, register_hardware};
@@ -23,9 +29,122 @@ use tx_subsystems::vfs::{
 };
 
 use super::{
-    open_console_for_init, Devfs, DEVFS_MISC_DIR_OBJECT_ID, DEVFS_ROOT_OBJECT_ID,
-    DEVFS_RTC_OBJECT_ID,
+    install_rtc_backend, open_console_for_init, publish_rtc_event_with_post,
+    reset_rtc_backend_for_test, rtc_event_queue_for_test, rtc_event_source_id, Devfs,
+    DEVFS_MISC_DIR_OBJECT_ID, DEVFS_ROOT_OBJECT_ID, DEVFS_RTC_OBJECT_ID, RTC_CHAR_BINDING,
 };
+
+static RTC_REF_POST_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn counting_rtc_ref_post(
+    mailbox: &tx_substrate::wake::TaskMailbox,
+    event: tx_substrate::wake::MailboxEvent,
+) -> bool {
+    RTC_REF_POST_COUNT.fetch_add(1, Ordering::SeqCst);
+    mailbox.post(event)
+}
+
+fn explicit_rtc_ref_post(
+    mailbox: &tx_substrate::wake::TaskMailbox,
+    event: tx_substrate::wake::MailboxEvent,
+) -> bool {
+    mailbox.post(event)
+}
+
+struct TestDeadlineRoute {
+    token: TimerToken,
+    deadline_ns: DeadlineNs,
+    role: TimerRole,
+    target: TimerTarget,
+}
+
+struct TestDeadlineDomain {
+    next_token: AtomicU64,
+    routes: Mutex<Vec<TestDeadlineRoute>>,
+}
+
+impl TestDeadlineDomain {
+    fn new() -> Self {
+        Self {
+            next_token: AtomicU64::new(1),
+            routes: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn fire_due_with_post<F>(&self, now_ns: u64, mut post: F) -> usize
+    where
+        F: FnMut(&tx_substrate::wake::TaskMailbox, tx_substrate::wake::MailboxEvent) -> bool,
+    {
+        // The timer domain releases route ownership before device code publishes
+        // readiness or wakes subscribers.
+        let due = {
+            let mut routes = self.routes.lock().expect("test deadline routes poisoned");
+            let mut due = Vec::new();
+            let mut pending = Vec::with_capacity(routes.len());
+            for route in routes.drain(..) {
+                if route.deadline_ns.raw() <= now_ns {
+                    due.push(route);
+                } else {
+                    pending.push(route);
+                }
+            }
+            *routes = pending;
+            due
+        };
+
+        let fired = due.len();
+        for route in due {
+            assert_eq!(route.role, TimerRole::RtcAlarm);
+            let TimerTarget::DeviceCallback(callback) = route.target else {
+                panic!("RTC emulation must register a device callback route");
+            };
+            callback.fire();
+            if let Some((queue, interests)) = callback.raw_queue_wake() {
+                let _ = queue.fire_with_post(interests, |mailbox, event| post(mailbox, event));
+            }
+        }
+        fired
+    }
+}
+
+impl DeadlineDomain for TestDeadlineDomain {
+    fn register_deadline(
+        &self,
+        deadline_ns: DeadlineNs,
+        role: TimerRole,
+        target: TimerTarget,
+    ) -> Result<TimerToken, TimeError> {
+        let token = TimerToken::new(self.next_token.fetch_add(1, Ordering::AcqRel));
+        self.routes
+            .lock()
+            .expect("test deadline routes poisoned")
+            .push(TestDeadlineRoute {
+                token,
+                deadline_ns,
+                role,
+                target,
+            });
+        Ok(token)
+    }
+
+    fn cancel_deadline(&self, token: TimerToken) -> bool {
+        let mut routes = self.routes.lock().expect("test deadline routes poisoned");
+        let Some(index) = routes.iter().position(|route| route.token == token) else {
+            return false;
+        };
+        routes.swap_remove(index);
+        true
+    }
+
+    fn rearm_deadline(&self, token: TimerToken, deadline_ns: DeadlineNs) -> bool {
+        let mut routes = self.routes.lock().expect("test deadline routes poisoned");
+        let Some(route) = routes.iter_mut().find(|route| route.token == token) else {
+            return false;
+        };
+        route.deadline_ns = deadline_ns;
+        true
+    }
+}
 
 fn init_tty_zones() {
     // Idempotent: `tx_subsystems::zones::register_all()` calls
@@ -88,7 +207,7 @@ fn install_capturing_console() -> &'static CapturingOps {
         ops: ops_static,
     }));
     let guard = guard();
-    let tty = match register_hardware("console-hw", 0, binding, &guard) {
+    let tty = match register_hardware("ttyS0", 0, binding, &guard) {
         V3Outcome::Done(tty) => tty,
         other => panic!("register_hardware failed: {other:?}"),
     };
@@ -97,6 +216,62 @@ fn install_capturing_console() -> &'static CapturingOps {
         step_engine::StepOutcome::Done(())
     );
     ops_static
+}
+
+struct TestRtcPlatform;
+
+static TEST_RTC_NS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(tx_services::time::DEFAULT_REALTIME_EPOCH_BASE_NS);
+static TEST_RTC_SET_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static TEST_RTC_ALARM_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static TEST_RTC_ALARM_CLEAR_COUNT: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+impl tx_hal::PersistentClockIf for TestRtcPlatform {
+    fn read_realtime_ns() -> Result<u64, tx_hal::PersistentClockError> {
+        Ok(TEST_RTC_NS.load(core::sync::atomic::Ordering::Acquire))
+    }
+
+    fn set_realtime_ns(ns: u64) -> Result<(), tx_hal::PersistentClockError> {
+        TEST_RTC_SET_NS.store(ns, core::sync::atomic::Ordering::Release);
+        TEST_RTC_NS.store(ns, core::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    fn set_wake_alarm_ns(ns: u64) -> Result<(), tx_hal::PersistentClockError> {
+        TEST_RTC_ALARM_NS.store(ns, core::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    fn clear_wake_alarm() -> Result<(), tx_hal::PersistentClockError> {
+        TEST_RTC_ALARM_CLEAR_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        Ok(())
+    }
+}
+
+fn test_rtc_read_time_ns() -> Result<u64, TimeError> {
+    HalRtcDevice::<TestRtcPlatform>::new().read_time_ns()
+}
+
+fn test_rtc_set_time_ns(ns: u64) -> Result<(), TimeError> {
+    HalRtcDevice::<TestRtcPlatform>::new().set_time_ns(ns)
+}
+
+fn test_rtc_set_alarm_ns(ns: u64) -> Result<(), TimeError> {
+    HalRtcDevice::<TestRtcPlatform>::new().set_alarm_ns(ns)
+}
+
+fn test_rtc_clear_alarm() -> Result<(), TimeError> {
+    HalRtcDevice::<TestRtcPlatform>::new().clear_alarm()
+}
+
+fn install_test_rtc_backend() {
+    install_rtc_backend(
+        test_rtc_read_time_ns,
+        test_rtc_set_time_ns,
+        test_rtc_set_alarm_ns,
+        test_rtc_clear_alarm,
+    );
 }
 
 fn devfs_mount_payload() -> Cap<MountPayload> {
@@ -153,6 +328,70 @@ fn devfs_lookup_console_after_register_hardware_returns_tty_rnode() {
     // Lookup result is consistent with the entry's index in the alias
     // snapshot (sanity: the id is non-root, non-zero).
     assert_ne!(obj_id, DEVFS_ROOT_OBJECT_ID);
+}
+
+#[test]
+fn devfs_lookup_ttys0_and_console_share_tty_identity() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_tty_zones();
+
+    let _ops = install_capturing_console();
+
+    let guard = guard();
+    let devfs = Devfs::new();
+    let mount = devfs_mount_payload();
+
+    let console_id =
+        match <Devfs as FsOps>::lookup(&devfs, DEVFS_ROOT_OBJECT_ID, b"console", &guard) {
+            V3Outcome::Done(id) => id,
+            other => panic!("devfs.lookup(console) failed: {other:?}"),
+        };
+    let ttys0_id = match <Devfs as FsOps>::lookup(&devfs, DEVFS_ROOT_OBJECT_ID, b"ttyS0", &guard) {
+        V3Outcome::Done(id) => id,
+        other => panic!("devfs.lookup(ttyS0) failed: {other:?}"),
+    };
+
+    let console_meta = match <Devfs as FsOps>::load_inode_meta(&devfs, console_id, &guard) {
+        V3Outcome::Done(meta) => meta,
+        other => panic!("devfs.load_inode_meta(console) failed: {other:?}"),
+    };
+    let ttys0_meta = match <Devfs as FsOps>::load_inode_meta(&devfs, ttys0_id, &guard) {
+        V3Outcome::Done(meta) => meta,
+        other => panic!("devfs.load_inode_meta(ttyS0) failed: {other:?}"),
+    };
+
+    let console_rnode =
+        match <Devfs as FsOps>::materialise_rnode(&devfs, console_id, console_meta, &mount, &guard)
+        {
+            V3Outcome::Done(rnode) => rnode,
+            other => panic!("devfs.materialise_rnode(console) failed: {other:?}"),
+        };
+    let ttys0_rnode =
+        match <Devfs as FsOps>::materialise_rnode(&devfs, ttys0_id, ttys0_meta, &mount, &guard) {
+            V3Outcome::Done(rnode) => rnode,
+            other => panic!("devfs.materialise_rnode(ttyS0) failed: {other:?}"),
+        };
+
+    let console_tty = match console_rnode.backing() {
+        RNodeBacking::StructBacked {
+            payload: StructPayload::Tty(tty),
+        } => tty.clone(),
+        other => panic!("expected console StructBacked::Tty, got {other:?}"),
+    };
+    let ttys0_tty = match ttys0_rnode.backing() {
+        RNodeBacking::StructBacked {
+            payload: StructPayload::Tty(tty),
+        } => tty.clone(),
+        other => panic!("expected ttyS0 StructBacked::Tty, got {other:?}"),
+    };
+    assert_eq!(console_tty, ttys0_tty);
+
+    let console_devt = super::devt_for_object_id(console_id).expect("console devt");
+    assert_eq!((console_devt.major(), console_devt.minor()), (4, 64));
+    let ttys0_devt = super::devt_for_object_id(ttys0_id).expect("ttyS0 devt");
+    assert_eq!((ttys0_devt.major(), ttys0_devt.minor()), (4, 64));
 }
 
 #[test]
@@ -246,6 +485,226 @@ fn devfs_lookup_misc_rtc_materialises_char_device() {
         } => assert_eq!(binding.name, "rtc"),
         other => panic!("expected StructBacked::CharDevice, got {other:?}"),
     }
+}
+
+#[test]
+fn devfs_rtc_ops_require_installed_persistent_backend() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_tty_zones();
+    reset_rtc_backend_for_test();
+
+    let guard = guard();
+    let rtc_ops = RTC_CHAR_BINDING.ops.rtc_ops().expect("rtc typed ops");
+
+    assert_eq!(
+        rtc_ops.read_time(&guard),
+        Err(tx_subsystems::device::RtcError::Unsupported)
+    );
+}
+
+#[test]
+fn devfs_rtc_ops_route_through_persistent_clock_backend() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_tty_zones();
+    reset_rtc_backend_for_test();
+    TEST_RTC_NS.store(
+        tx_services::time::DEFAULT_REALTIME_EPOCH_BASE_NS,
+        core::sync::atomic::Ordering::Release,
+    );
+    TEST_RTC_SET_NS.store(0, core::sync::atomic::Ordering::Release);
+    TEST_RTC_ALARM_NS.store(0, core::sync::atomic::Ordering::Release);
+    TEST_RTC_ALARM_CLEAR_COUNT.store(0, core::sync::atomic::Ordering::Release);
+    install_test_rtc_backend();
+
+    let guard = guard();
+    let rtc_ops = RTC_CHAR_BINDING.ops.rtc_ops().expect("rtc typed ops");
+    let rtc_time = rtc_ops.read_time(&guard).expect("persistent rtc read");
+    assert_eq!(rtc_time.tm_mday, 23);
+    assert_eq!(rtc_time.tm_mon, 4);
+    assert_eq!(rtc_time.tm_year, 126);
+
+    let updated =
+        tx_subsystems::device::RtcTime::from_unix_seconds(1_800_000_000).expect("updated rtc time");
+    rtc_ops
+        .set_time(updated, &guard)
+        .expect("persistent rtc set");
+    assert_eq!(
+        TEST_RTC_SET_NS.load(core::sync::atomic::Ordering::Acquire),
+        1_800_000_000_000_000_000
+    );
+
+    let alarm_time =
+        tx_subsystems::device::RtcTime::from_unix_seconds(1_800_000_123).expect("alarm time");
+    rtc_ops
+        .set_alarm(
+            tx_subsystems::device::RtcAlarm {
+                time: alarm_time,
+                enabled: true,
+                pending: false,
+            },
+            &guard,
+        )
+        .expect("persistent rtc alarm set");
+    assert_eq!(
+        TEST_RTC_ALARM_NS.load(core::sync::atomic::Ordering::Acquire),
+        1_800_000_123_000_000_000
+    );
+    let alarm = rtc_ops
+        .read_alarm(&guard)
+        .expect("persistent rtc alarm read");
+    assert_eq!(alarm.time, alarm_time);
+    assert!(alarm.enabled);
+    assert!(!alarm.pending);
+
+    reset_rtc_backend_for_test();
+}
+
+#[test]
+fn devfs_rtc_event_readiness_is_pending_state_and_read_consumes_record() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_tty_zones();
+    reset_rtc_backend_for_test();
+    install_test_rtc_backend();
+
+    let guard = guard();
+    let rtc_ops = RTC_CHAR_BINDING.ops.rtc_ops().expect("rtc typed ops");
+    assert_eq!(rtc_ops.poll_events(&guard), Ok(RtcEventMask::empty()));
+
+    publish_rtc_event_with_post(RtcEventMask::ALARM, explicit_rtc_ref_post);
+    assert_eq!(rtc_ops.poll_events(&guard), Ok(RtcEventMask::ALARM));
+    let alarm = rtc_ops.read_alarm(&guard).expect("alarm readable");
+    assert!(alarm.pending);
+
+    let mut record = [0u8; 8];
+    assert_eq!(
+        RTC_CHAR_BINDING.ops.read(&mut record, &guard),
+        V3Outcome::Done(8)
+    );
+    let value = u64::from_ne_bytes(record);
+    assert_ne!(value & 0x80, 0, "rtc read record carries RTC_IRQF");
+    assert_ne!(value & 0x20, 0, "rtc read record carries RTC_AF");
+    assert_eq!(rtc_ops.poll_events(&guard), Ok(RtcEventMask::empty()));
+    let alarm = rtc_ops.read_alarm(&guard).expect("alarm readable");
+    assert!(!alarm.pending);
+
+    assert_eq!(
+        RTC_CHAR_BINDING.ops.read(&mut record, &guard),
+        V3Outcome::Err(V3Errno::EAGAIN)
+    );
+
+    reset_rtc_backend_for_test();
+}
+
+#[test]
+fn devfs_rtc_event_with_post_uses_injected_mailbox_ref_post() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_tty_zones();
+    reset_rtc_backend_for_test();
+    install_test_rtc_backend();
+
+    let _ = rtc_event_source_id();
+    let queue = rtc_event_queue_for_test().expect("rtc event queue should be registered");
+    let mailbox = Arc::new(tx_substrate::wake::TaskMailbox::new());
+    let generation = mailbox.next_generation();
+    let mut subscriber = queue.subscribe(
+        super::RTC_EVENT_READABLE,
+        Arc::downgrade(&mailbox),
+        generation,
+    );
+    RTC_REF_POST_COUNT.store(0, Ordering::SeqCst);
+
+    publish_rtc_event_with_post(RtcEventMask::ALARM, counting_rtc_ref_post);
+
+    assert_eq!(
+        RTC_REF_POST_COUNT.load(Ordering::SeqCst),
+        1,
+        "RTC event publication must use injected mailbox-ref post"
+    );
+    assert!(
+        matches!(
+            mailbox.poll(),
+            Some(tx_substrate::wake::MailboxEvent::SourceFired {
+                generation: fired,
+                source,
+                ..
+            }) if fired == generation
+                && source == tx_substrate::step::WaitSourceId::new(rtc_event_source_id())
+        ),
+        "RTC event publication must wake RTC waiters with the registered source id"
+    );
+
+    subscriber.unsubscribe();
+    reset_rtc_backend_for_test();
+}
+
+#[test]
+fn devfs_rtc_emulated_alarm_uses_domain_device_callback_route() {
+    let _serial = crate::test_support::FS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    init_tty_zones();
+    reset_rtc_backend_for_test();
+
+    let guard = guard();
+    let rtc_ops = RTC_CHAR_BINDING.ops.rtc_ops().expect("rtc typed ops");
+    let domain = Arc::new(TestDeadlineDomain::new());
+    let registrar = DeadlineRegistrarHandle::from_domain(domain.clone());
+    let alarm_time =
+        tx_subsystems::device::RtcTime::from_unix_seconds(1_800_001_000).expect("alarm time");
+
+    rtc_ops
+        .set_alarm_with_emulation(
+            tx_subsystems::device::RtcAlarm {
+                time: alarm_time,
+                enabled: true,
+                pending: false,
+            },
+            &guard,
+            Some(tx_subsystems::device::RtcAlarmEmulation::new(
+                &registrar, 40,
+            )),
+        )
+        .expect("rtc alarm emulation installed");
+
+    let queue = rtc_event_queue_for_test().expect("rtc event queue should be registered");
+    let mailbox = Arc::new(tx_substrate::wake::TaskMailbox::new());
+    let generation = mailbox.next_generation();
+    let mut subscriber = queue.subscribe(
+        super::RTC_EVENT_READABLE,
+        Arc::downgrade(&mailbox),
+        generation,
+    );
+    RTC_REF_POST_COUNT.store(0, Ordering::SeqCst);
+
+    assert_eq!(domain.fire_due_with_post(40, counting_rtc_ref_post), 1);
+
+    assert_eq!(
+        RTC_REF_POST_COUNT.load(Ordering::SeqCst),
+        1,
+        "emulated RTC alarm must use the deadline-domain mailbox-ref post"
+    );
+    assert_eq!(rtc_ops.poll_events(&guard), Ok(RtcEventMask::ALARM));
+    assert!(
+        matches!(
+            mailbox.poll(),
+            Some(tx_substrate::wake::MailboxEvent::SourceFired {
+                generation: fired,
+                ..
+            }) if fired == generation
+        ),
+        "emulated RTC alarm must wake RTC RawQueue subscribers"
+    );
+
+    subscriber.unsubscribe();
+    reset_rtc_backend_for_test();
 }
 
 #[test]
@@ -376,7 +835,7 @@ fn devfs_chmod_returns_erofs() {
     // supported. The override returns EROFS regardless of
     // privilege.
     assert_eq!(
-        FsOps::step_chmod(&devfs, DEVFS_ROOT_OBJECT_ID, 0o700, &cred, &guard),
+        FsOps::chmod_inode(&devfs, DEVFS_ROOT_OBJECT_ID, 0o700, &cred, &guard),
         V3Outcome::err(V3Errno::EROFS)
     );
 }
@@ -393,7 +852,7 @@ fn devfs_chown_returns_erofs() {
     let cred = Credential::root();
 
     assert_eq!(
-        FsOps::step_chown(
+        FsOps::chown_inode(
             &devfs,
             DEVFS_ROOT_OBJECT_ID,
             Some(1000),
@@ -540,9 +999,13 @@ fn devfs_readdir_yields_registered_aliases_and_terminates() {
         }
     }
 
-    // `register_hardware("console-hw", ...)` publishes a `console-hw`
-    // alias; `register_console_alias("console", ...)` publishes a
-    // `console` alias. Both should appear in readdir.
+    // `register_hardware("ttyS0", ...)` publishes the hardware entry;
+    // `register_console_alias("console", ...)` publishes a second alias
+    // for the same TTY. Both should appear in readdir.
+    assert!(
+        names.iter().any(|n| n == b"ttyS0"),
+        "readdir should yield ttyS0; got {names:?}"
+    );
     assert!(
         names.iter().any(|n| n == b"console"),
         "readdir should yield console; got {names:?}"

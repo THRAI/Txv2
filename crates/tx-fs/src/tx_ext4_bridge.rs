@@ -7,15 +7,14 @@
 //! and copying between the frame and the caller's `[u8; 4096]` buffer.
 
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::ptr::NonNull;
 
 use crate::devfs::adapter::step_engine::{
-    epoch, page_allocator, SpinMutex, StepOutcome, ZeroPolicy,
+    borrow_current_guard, guard, page_allocator, SpinMutex, StepOutcome, ZeroPolicy,
 };
+use tx_ext4::planner::Ext4BlockGeometry;
 use tx_ext4_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
 use tx_ext4_format::{Ext4FormatError, Result};
-use tx_ext4::planner::Ext4BlockGeometry;
 use tx_subsystems::device::{self, BlockDevice, BlockDeviceHandle, PhysicalBlockNumber};
 use tx_subsystems::io_manager::block::DeviceKey;
 use tx_subsystems::page_backed::{Frame, PageContainer};
@@ -100,7 +99,7 @@ impl BlockDeviceImage {
         // trigger the EBR no-nesting debug_assert even though the block device
         // ops ignore the guard parameter entirely.  Fall back to a fresh guard
         // when no guard is active.
-        let guard = epoch::borrow_current_guard().unwrap_or_else(epoch::guard);
+        let guard = borrow_current_guard().unwrap_or_else(guard);
         let outcome = self.device.read_blocks(
             PhysicalBlockNumber::new(lba),
             core::slice::from_mut(&mut frame),
@@ -170,7 +169,7 @@ impl BlockImage for BlockDeviceImage {
             core::ptr::copy_nonoverlapping(data.as_ptr(), dst_nn.as_ptr(), BLOCK_SIZE);
         }
 
-        let guard = epoch::borrow_current_guard().unwrap_or_else(epoch::guard);
+        let guard = borrow_current_guard().unwrap_or_else(guard);
         let outcome = self.device.write_blocks(
             PhysicalBlockNumber::new(lba),
             core::slice::from_ref(&frame),

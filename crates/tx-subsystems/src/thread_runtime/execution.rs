@@ -1,18 +1,20 @@
 //! Thread-runtime execution: thread-exit step, signal-mask updates,
 //! and the internal helpers used by the signal shim.
 
+use alloc::sync::Weak as ArcWeak;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use tx_hal::{UserPtr, UserTrapContext};
 
 use crate::thread_runtime::adapter::step_engine::{
     self, Cap, MailboxEvent, OneShotStepOp, OperationalCapExt, PayloadCap, SignalRouting,
+    TaskMailbox,
 };
 
 use crate::futex::step_futex_lifecycle_wake_in;
 use crate::signal::{refresh_deliverable_signal_summary_with_payload, SignalMask, Signum};
 use crate::thread_runtime::structure::{
-    drain_pending_syscall_return, ThreadIdentity, ThreadPayload,
+    clear_thread_slots_for, drain_pending_syscall_return, ThreadIdentity, ThreadPayload,
 };
 // UserAccessIf trait not needed — copy_to_user is inherent on AddressSpace
 
@@ -48,7 +50,7 @@ fn apply_thread_exit_user_cleanup(
 ) {
     // This cleanup can run from a context that already holds an epoch guard
     // (e.g. a fatal signal that tears the process down mid-syscall reaches
-    // `step_exit_group` while the delivering path's guard is still active).
+    // the group-exit transition while the delivering path's guard is still active).
     // Creating a fresh `guard()` there trips the EBR no-nesting assertion, so
     // borrow the active guard when one exists and only open a new one otherwise.
     let guard = crate::thread_runtime::adapter::step_engine::borrow_current_guard()
@@ -138,32 +140,45 @@ fn emit_thread_exit_debug(name: &[u8], value: i64) {
     }
 }
 
-/// Best-effort `MailboxEvent::SignalDelivered` post to a thread
-/// payload's bound mailbox per D9-A.
+/// Build and publish a `MailboxEvent::SignalDelivered` wake hint
+/// through a caller-provided mailbox post operation.
 ///
-/// Silently no-ops when no mailbox is bound (early bring-up) or
-/// when the `Weak::upgrade` fails because the reactor task has
-/// already dropped its `TaskMailbox`. Idempotent — duplicate posts
-/// queue up but the future's poll consults `InterruptSummary`,
-/// which is the truth-bearing path.
-pub(crate) fn post_signal_mailbox(payload: &ThreadPayload, signum: Signum, routing: SignalRouting) {
+/// Signal code owns the semantic decision that a target thread should
+/// observe a signal. The caller owns the wake-delivery mechanism: plain
+/// subsystem paths pass a direct mailbox post, while reactor contexts
+/// can inject owner-aware posting so scheduler placement is resolved
+/// from the current task owner.
+///
+/// Returns `false` when no mailbox is bound. A bound but already-dropped
+/// mailbox is handed to `post`; the injected operation decides whether
+/// `Weak::upgrade` failure is observable or silently skipped.
+pub fn post_signal_mailbox_with_post<F>(
+    payload: &ThreadPayload,
+    signum: Signum,
+    routing: SignalRouting,
+    mut post: F,
+) -> bool
+where
+    F: FnMut(ArcWeak<TaskMailbox>, MailboxEvent),
+{
     let Some(weak) = payload.mailbox_handle() else {
-        return;
+        return false;
     };
-    let Some(mailbox) = weak.upgrade() else {
-        return;
-    };
-    let _ = mailbox.post(MailboxEvent::SignalDelivered {
-        signum: signum.raw() as u32,
-        routing,
-    });
+    post(
+        weak,
+        MailboxEvent::SignalDelivered {
+            signum: signum.raw() as u32,
+            routing,
+        },
+    );
+    true
 }
 
 /// Mark a thread zombie: set its exit status, drop its payload. Does
 /// not touch the parent process's thread list — callers that need
 /// parent-side bookkeeping (e.g. `step_thread_exit`) do that
 /// themselves; callers that already hold the parent payload (e.g.
-/// `process::step_exit_group`) skip it.
+/// group-exit transition) skip it.
 ///
 /// **D9-A.** Before dropping the payload, post a `SignalDelivered`
 /// wake-hint with signum `SIGKILL` and routing `ProcessDirected` to
@@ -172,19 +187,38 @@ pub(crate) fn post_signal_mailbox(payload: &ThreadPayload, signum: Signum, routi
 /// sitting idle until some unrelated channel fires. Silently no-op
 /// when no mailbox is bound (D9-A's early-bring-up invariant). The
 /// summary side of "termination" itself is *not* mutated here —
-/// `step_exit_group_with_signal` is the canonical site for the
+/// the fatal group-exit transition is the canonical site for the
 /// termination bit; D9-A only adds the wake-hint side.
-pub(crate) fn set_thread_zombie(thread: &Cap<ThreadIdentity>, status: i32) {
+pub(crate) fn set_thread_zombie_with_post<F>(thread: &Cap<ThreadIdentity>, status: i32, mut post: F)
+where
+    F: FnMut(ArcWeak<TaskMailbox>, MailboxEvent),
+{
     // Post the wake-hint *before* dropping the payload so the
     // `mailbox` slot is still readable. If the payload is already
     // gone (idempotent double-zombify), `payload.lock()` returns
     // `None` and we skip the post — the future has already had its
     // last chance to observe state.
-    if let Some(payload) = thread.payload.lock().as_ref() {
-        post_signal_mailbox(payload, Signum::SIGKILL, SignalRouting::ProcessDirected);
+    let mut payload_guard = thread.payload.lock();
+    if let Some(payload) = payload_guard.as_ref() {
+        let _ = post_signal_mailbox_with_post(
+            payload,
+            Signum::SIGKILL,
+            SignalRouting::ProcessDirected,
+            &mut post,
+        );
+        clear_thread_slots_for(thread, payload);
     }
     *thread.exit_status.lock() = Some(status);
-    *thread.payload.lock() = None;
+    *payload_guard = None;
+}
+
+pub(crate) fn set_thread_zombie(thread: &Cap<ThreadIdentity>, status: i32) {
+    set_thread_zombie_with_post(thread, status, |weak, event| {
+        let Some(mailbox) = weak.upgrade() else {
+            return;
+        };
+        let _ = mailbox.post(event);
+    });
 }
 
 /// Test-only: mark a thread as a zombie **without** removing it
@@ -205,8 +239,49 @@ pub fn mark_thread_zombie_for_test(thread: &Cap<ThreadIdentity>, status: i32) {
 /// Single-thread exit. Marks the thread zombie, removes it from the
 /// owning process's thread list, and zombifies the process if this was
 /// the last thread.
-pub fn step_thread_exit(thread: Cap<ThreadIdentity>, status: i32) {
-    let mut group_exit_completed = false;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ThreadExitOutcome {
+    Completed,
+    Retry,
+}
+
+pub fn step_thread_exit(thread: Cap<ThreadIdentity>, status: i32) -> ThreadExitOutcome {
+    step_thread_exit_inner(thread, status, || {}, || {})
+}
+
+fn step_thread_exit_inner<H, Z>(
+    thread: Cap<ThreadIdentity>,
+    status: i32,
+    after_lane_check: H,
+    after_zombify: Z,
+) -> ThreadExitOutcome
+where
+    H: FnOnce(),
+    Z: FnOnce(),
+{
+    if thread.is_zombie() {
+        return ThreadExitOutcome::Completed;
+    }
+    let parent = {
+        let guard = crate::thread_runtime::adapter::step_engine::guard();
+        let parent = thread.owner_proc.upgrade(&guard);
+        drop(guard);
+        parent
+    };
+    let exit_permit = if let Some(parent) = parent.as_ref() {
+        let payload_guard = parent.payload.lock();
+        if let Some(payload) = payload_guard.as_ref() {
+            match payload.prepare_thread_exit(thread.tid.0) {
+                Some(permit) => Some(permit),
+                None => return ThreadExitOutcome::Retry,
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    after_lane_check();
     let trace = thread_exit_debug_sample();
     if trace {
         emit_thread_exit_debug(b"debug.thread_exit.enter", thread.tid.0 as i64);
@@ -233,81 +308,80 @@ pub fn step_thread_exit(thread: Cap<ThreadIdentity>, status: i32) {
     // commit
     // publish
     set_thread_zombie(&thread, status);
+    after_zombify();
     if trace {
         emit_thread_exit_debug(b"debug.thread_exit.zombie.after", thread.tid.0 as i64);
     }
 
-    let guard = crate::thread_runtime::adapter::step_engine::guard();
-    let Some(parent) = thread.owner_proc.upgrade(&guard) else {
-        return;
+    let Some(parent) = parent else {
+        return ThreadExitOutcome::Completed;
     };
-    drop(guard);
     if trace {
         emit_thread_exit_debug(b"debug.thread_exit.parent.after", thread.tid.0 as i64);
     }
 
     let payload_guard = parent.payload.lock();
     let Some(payload) = payload_guard.as_ref() else {
-        return;
+        return ThreadExitOutcome::Completed;
     };
 
-    let _removed = crate::process::execution::measure_process_lock_service(
+    let removed = crate::process::execution::measure_process_lock_service(
         b"debug.lock_service.process.payload.thread_exit.threads_detach.duration_ns",
         || payload.threads.detach(&thread),
     );
     if trace {
         emit_thread_exit_debug(b"debug.thread_exit.retain.after", thread.tid.0 as i64);
     }
-    let prev = crate::process::execution::measure_process_lock_service(
-        b"debug.lock_service.process.payload.thread_exit.thread_count.duration_ns",
-        || {
-            payload
-                .thread_count
-                .fetch_sub(1, core::sync::atomic::Ordering::AcqRel)
-        },
-    );
-    let new_count = prev.saturating_sub(1);
+    let new_count = removed.as_ref().and_then(|_| {
+        crate::process::execution::measure_process_lock_service(
+            b"debug.lock_service.process.payload.thread_exit.thread_count.duration_ns",
+            || {
+                payload
+                    .thread_count
+                    .fetch_update(
+                        core::sync::atomic::Ordering::AcqRel,
+                        core::sync::atomic::Ordering::Acquire,
+                        |count| count.checked_sub(1),
+                    )
+                    .map(|previous| previous - 1)
+                    .ok()
+            },
+        )
+    });
+    debug_assert!(removed.is_none() || new_count.is_some());
     if trace {
         emit_thread_exit_debug(b"debug.thread_exit.count.after", thread.tid.0 as i64);
     }
 
-    // GroupExit coordination (PROCESS_v1 §5): if the owning process
-    // has an active group-exit episode (exit_group or multi-threaded
-    // execve), decrement the remaining_threads counter. The
-    // initiating thread is not counted here.
-    crate::process::execution::measure_process_lock_service(
-        b"debug.lock_service.process.payload.thread_exit.group_exit.duration_ns",
-        || {
-            if let Some(ref ge) = *payload.group_exit.lock() {
-                let prev_remaining = ge
-                    .remaining_threads
-                    .fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
-                if prev_remaining == 1 {
-                    group_exit_completed = true;
-                }
-            }
-        },
-    );
-
-    let was_last = new_count == 0;
+    let was_last = new_count == Some(0);
+    if let Some(permit) = exit_permit {
+        let finished = crate::process::execution::measure_process_lock_service(
+            b"debug.lock_service.process.payload.thread_exit.group_exit.duration_ns",
+            || {
+                payload.finish_thread_exit(
+                    permit,
+                    was_last,
+                    crate::process::structure::ExitStatus::Exited(status),
+                )
+            },
+        );
+        debug_assert!(
+            finished,
+            "thread-exit lifecycle permit remains generation-valid"
+        );
+    }
     drop(payload_guard);
 
     if was_last {
         // Thread side carries `i32` per `THREAD_RUNTIME_v1` §7.2;
         // the cascade promotes that to `ExitStatus::Exited` because
         // signal-driven termination doesn't reach this path (it goes
-        // through `step_exit_group_with_signal` which records
+        // through the fatal group-exit transition which records
         // `ExitStatus::Signaled` directly before zombifying threads).
         crate::process::execution::step_process_exit(
             &parent,
             crate::process::structure::ExitStatus::Exited(status),
         );
-    }
-
-    if group_exit_completed {
-        if let Some(payload) = parent.payload.lock().as_ref() {
-            *payload.group_exit.lock() = None;
-        }
     }
 
     // clear_child_tid futex protocol (CLONE_CHILD_CLEARTID).
@@ -351,6 +425,31 @@ pub fn step_thread_exit(thread: Cap<ThreadIdentity>, status: i32) {
     if trace {
         emit_thread_exit_debug(b"debug.thread_exit.end", thread.tid.0 as i64);
     }
+    ThreadExitOutcome::Completed
+}
+
+#[cfg(test)]
+pub(crate) fn step_thread_exit_after_lane_check_for_test<H>(
+    thread: Cap<ThreadIdentity>,
+    status: i32,
+    after_lane_check: H,
+) -> ThreadExitOutcome
+where
+    H: FnOnce(),
+{
+    step_thread_exit_inner(thread, status, after_lane_check, || {})
+}
+
+#[cfg(test)]
+pub(crate) fn step_thread_exit_after_zombify_for_test<Z>(
+    thread: Cap<ThreadIdentity>,
+    status: i32,
+    after_zombify: Z,
+) -> ThreadExitOutcome
+where
+    Z: FnOnce(),
+{
+    step_thread_exit_inner(thread, status, || {}, after_zombify)
 }
 
 fn clear_and_wake_child_tid(
@@ -408,6 +507,7 @@ fn walk_robust_list(thread: &Cap<ThreadIdentity>, head: u64, _offset: u64) {
         return;
     };
     let aspace = payload.aspace_cap();
+    drop(proc_guard);
 
     let Some((first, futex_offset, pending)) =
         crate::process::execution::measure_process_lock_service(
@@ -664,13 +764,21 @@ pub fn step_sigprocmask_with_payload(
     SigprocmaskChange::Replaced { prev, new }
 }
 
-/// Post a single catchable signal to a thread's pending queue.
+/// Post a catchable signal and publish the signal wake hint through a
+/// caller-provided mailbox post operation.
+///
+/// The signal state transition is independent from the wake route: pending
+/// bits, optional siginfo storage, signal-mask check, and interrupt summary
+/// update are committed before the caller-provided mailbox publication step.
+/// No-context tests can pass an explicit direct mailbox-post closure; callers
+/// with reactor/scheduler context should inject an owner-aware post.
+///
 /// No-op if the thread is a zombie.
 ///
 /// **Precondition**: `sig` is *not* a Gewalt signum
 /// (SIGKILL/SIGSTOP/SIGCONT) — those bypass pending queues entirely
 /// per `SIGNAL_v1` §1, §2 Consequence 2 and route through
-/// `signal::route_gewalt` which updates `signal_summary` directly
+/// `signal::route_gewalt_with_post` which updates `signal_summary` directly
 /// without enqueueing.
 ///
 /// Sets `signal_summary.deliverable_signal` when the posted signal
@@ -682,16 +790,19 @@ pub fn step_sigprocmask_with_payload(
 /// posts behave exactly like any other catchable signal at this
 /// layer — the stop intent is materialised by `ast_check` returning
 /// `DefaultStop`, not by a summary bit set here.
-pub fn post_signal(
+pub fn post_signal_with_post<F>(
     thread: &Cap<ThreadIdentity>,
     sig: Signum,
     routing: SignalRouting,
     info: Option<crate::signal::SigInfo>,
-) {
+    mut post: F,
+) where
+    F: FnMut(ArcWeak<TaskMailbox>, MailboxEvent),
+{
     debug_assert!(
         !matches!(sig, Signum::SIGKILL | Signum::SIGSTOP | Signum::SIGCONT),
-        "post_signal must not be called with Gewalt signums (SIGKILL/SIGSTOP/SIGCONT); \
-         use signal::route_gewalt or signal::step_kill_process which dispatches"
+        "post_signal_with_post must not be called with Gewalt signums (SIGKILL/SIGSTOP/SIGCONT); \
+         use signal::route_gewalt_with_post or signal::step_kill_process_with_post which dispatches"
     );
 
     let Ok(payload) = thread.upgrade_operational() else {
@@ -718,7 +829,7 @@ pub fn post_signal(
     // D9-A: post the wake-hint to the thread's mailbox *after* the
     // summary update so a parked future, on re-poll, observes the
     // same summary bit the post advertises.
-    post_signal_mailbox(&payload, sig, routing);
+    let _ = post_signal_mailbox_with_post(&payload, sig, routing, &mut post);
 }
 
 // ---------------------------------------------------------------------------
@@ -821,8 +932,16 @@ impl<I: crate::thread_runtime::adapter::step_engine::SubjectIdentity>
         _ctx: &mut crate::thread_runtime::adapter::step_engine::ScriptCtx<I>,
     ) -> crate::thread_runtime::adapter::step_engine::StepOutcome<Self::Output, Self::Progress>
     {
-        step_thread_exit(self.thread.clone(), self.status);
-        crate::thread_runtime::adapter::step_engine::StepOutcome::Done(())
+        match step_thread_exit(self.thread.clone(), self.status) {
+            ThreadExitOutcome::Completed => {
+                crate::thread_runtime::adapter::step_engine::StepOutcome::Done(())
+            }
+            ThreadExitOutcome::Retry => {
+                crate::thread_runtime::adapter::step_engine::StepOutcome::err(
+                    crate::thread_runtime::adapter::step_engine::Errno::EAGAIN,
+                )
+            }
+        }
     }
 }
 
@@ -856,16 +975,19 @@ impl<I: crate::thread_runtime::adapter::step_engine::SubjectIdentity>
 use crate::process::ProcessIdentity;
 impl OneShotStepOp<ProcessIdentity> for SigprocmaskOp {}
 
-/// StepOp wrapper for [`post_signal`] — per-thread signal delivery
-/// (used by `tkill` and `tgkill`).
-pub struct ThreadKillOp {
+/// StepOp wrapper for per-thread signal delivery with caller-injected
+/// mailbox publication.
+pub struct ThreadKillWithPostOp<F> {
     pub thread: Cap<ThreadIdentity>,
     pub sig: Signum,
     pub info: Option<crate::signal::SigInfo>,
+    pub post: F,
 }
 
-impl<I: crate::thread_runtime::adapter::step_engine::SubjectIdentity>
-    crate::thread_runtime::adapter::step_engine::StepOp<I> for ThreadKillOp
+impl<I, F> crate::thread_runtime::adapter::step_engine::StepOp<I> for ThreadKillWithPostOp<F>
+where
+    I: crate::thread_runtime::adapter::step_engine::SubjectIdentity,
+    F: FnMut(ArcWeak<TaskMailbox>, MailboxEvent),
 {
     type Output = ();
     type Progress = crate::thread_runtime::adapter::step_engine::NoProgress;
@@ -876,20 +998,18 @@ impl<I: crate::thread_runtime::adapter::step_engine::SubjectIdentity>
         (),
         crate::thread_runtime::adapter::step_engine::NoProgress,
     > {
-        // observe — thread Cap + sig validated by post_signal internally
-        // upgrade — N/A
-        // reserve — N/A
-        // commit — post_signal delivers to thread's pending queue
-        // publish — post_signal sends MailboxEvent if mailbox bound
         let routing = SignalRouting::ThreadDirected {
             tid: self.thread.tid.0 as u64,
         };
-        post_signal(&self.thread, self.sig, routing, self.info);
+        post_signal_with_post(&self.thread, self.sig, routing, self.info, &mut self.post);
         crate::thread_runtime::adapter::step_engine::StepOutcome::Done(())
     }
 }
 
-impl OneShotStepOp<ProcessIdentity> for ThreadKillOp {}
+impl<F> OneShotStepOp<ProcessIdentity> for ThreadKillWithPostOp<F> where
+    F: FnMut(ArcWeak<TaskMailbox>, MailboxEvent)
+{
+}
 
 #[cfg(test)]
 mod step_op_wraps {

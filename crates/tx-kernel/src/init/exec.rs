@@ -15,17 +15,20 @@
 // enclosing module changed. The single `impl<P: TxPlatform>
 // CoreInit<P>` block in this file augments the one in `init.rs`.
 
-use super::helpers::{bootstrap_block_on, exec_error_tag, parse_init_from_cmdline};
+use super::boot_plan::{BootPlan, FirstUserspace};
+use super::helpers::{bootstrap_block_on, exec_error_tag};
 use super::*;
-use crate::adapter::step_engine::{self as step_engine, page_allocator, StepOutcome};
+use crate::adapter::step_engine::{self as step_engine};
+#[cfg(test)]
+use crate::adapter::step_engine::{StepOutcome, page_allocator};
 
 impl<P: TxPlatform> CoreInit<P> {
     /// Initramfs slice: walk `BootInfo::initrd` if present and
     /// reproduce its file tree inside the rootfs. Warn-and-skip on
-    /// any per-entry failure — a corrupt initramfs should not wedge
-    /// boot, which would be confusing when the user simply pointed
-    /// `-initrd` at the wrong file. The bake-in `/init` fixture
-    /// (registered above) keeps the kernel runnable in that case.
+    /// any per-entry failure. A corrupt or missing initramfs leaves
+    /// the rootfs without those files, so the later bootstrap exec
+    /// reports the selected init path failure instead of silently
+    /// falling back to a kernel-embedded binary.
     pub(crate) fn register_initramfs_if_present() {
         let boot_info = <P as tx_hal::BootInfoIf>::boot_info();
         let Some(initrd_range) = boot_info.initrd else {
@@ -74,7 +77,8 @@ impl<P: TxPlatform> CoreInit<P> {
             }
             Err(error) => {
                 // Warn-and-skip: log the failure to the board
-                // sentinel and continue with whatever was bake-in.
+                // sentinel and let bootstrap exec surface the missing
+                // or broken init path.
                 Self::write_board_sentinel_prefix();
                 tx_hal::console_write_str::<P>(":initramfs:fail:");
                 let label: &str = match error {
@@ -88,129 +92,8 @@ impl<P: TxPlatform> CoreInit<P> {
         }
     }
 
-    /// Shell-prompt roadmap Slice 10 (2026-05-08): copy
-    /// `busybox_fixture::BUSYBOX_BYTES` into a fresh tmpfs file at
-    /// `/bin/sh`. Mirrors `register_init_fixture_into_tmpfs`'s
-    /// shape (create_inode → materialise_rnode → page-by-page memcpy
-    /// → truncate) but with a different path (`/bin/sh`) and
-    /// non-executable -> executable mode bits.
-    ///
-    /// Compiled in only when `cfg(busybox_baked)` — set by `build.rs`
-    /// when `TX_BUSYBOX` is set in the build environment. Host tests
-    /// (without TX_BUSYBOX) use the existing `/init` fixture path
-    /// exclusively.
-    ///
-    /// Mode is `0o100755` (S_IFREG | rwx-r-x-r-x). Owner/group are
-    /// uid=0/gid=0 (the bootstrap is root); a `chmod +s` step is not
-    /// needed — busybox doesn't require setuid.
-    ///
-    /// Creates the parent `/bin` directory if absent.
-    #[cfg(busybox_baked)]
-    pub(crate) fn register_busybox_into_tmpfs() {
-        use tx_subsystems::vfs::{Credential, RNodeBacking};
-
-        let root_mount =
-            root_mount().expect("register_busybox_into_tmpfs: ROOT_MOUNT must be populated");
-        let payload = root_mount
-            .payload_cap()
-            .expect("rootfs payload alive during boot")
-            .into_cap();
-        let fs_ops = payload.fs_ops.clone();
-        let fs_page_backing = payload.fs_page_backing.clone();
-        let root_object_id = root_mount.root().fs_object_id();
-
-        let cred = Credential::root();
-
-        // Boot-time tmpfs ops are synchronous, so Continue/Yield are
-        // unreachable and panic if they fire.
-        use StepOutcome as V3;
-
-        // 1. Create or look up `/bin` directory. Use `mkdir`; on
-        //    EEXIST treat the existing dir as the parent.
-        let bin_object_id = {
-            let guard = step_engine::guard();
-            let outcome = fs_ops.mkdir(root_object_id, b"bin", 0o040755, &cred, &guard);
-            match outcome {
-                V3::Done((id, _)) => id,
-                // EEXIST is unlikely from a clean tmpfs root, but
-                // tolerate it: walk to find the existing dir.
-                _ => {
-                    // Fall back: pretend root_object_id is bin
-                    // parent. v1 host paths don't need this branch.
-                    panic!("register_busybox_into_tmpfs: mkdir(/bin) failed");
-                }
-            }
-        };
-
-        // 2. Allocate the `/bin/sh` inode.
-        let bytes = busybox_fixture::BUSYBOX_BYTES;
-        let (file_id, file_meta) = {
-            let guard = step_engine::guard();
-            let outcome = fs_ops.create_inode(bin_object_id, b"sh", 0o100755, &cred, &guard);
-            match outcome {
-                V3::Done(out) => out,
-                other => panic!("register_busybox_into_tmpfs: create_inode(/bin/sh): {other:?}"),
-            }
-        };
-
-        // 3. Materialise the inode's RNode and grab its
-        //    `Cap<PageContainer>`.
-        let pc = {
-            let guard = step_engine::guard();
-            let outcome = fs_ops.materialise_rnode(file_id, file_meta, &payload, &guard);
-            let rnode = match outcome {
-                V3::Done(rnode) => rnode,
-                other => panic!("register_busybox_into_tmpfs: materialise_rnode: {other:?}"),
-            };
-            match rnode.backing() {
-                RNodeBacking::PageBacked { pc } => pc.clone(),
-                other => panic!(
-                    "register_busybox_into_tmpfs: tmpfs materialise_rnode \
-                     returned non-PageBacked backing: {other:?}"
-                ),
-            }
-        };
-
-        // 4. Populate every page covered by the busybox bytes via
-        //    `materialize_anon` + direct-map memcpy. busybox is
-        //    typically 500KB-1.5MB; this loop iterates ~250-500
-        //    times for 4KB pages.
-        let page_size = tx_subsystems::vm::USER_PAGE_SIZE;
-        for (idx, chunk) in bytes.chunks(page_size).enumerate() {
-            let materialised = pc
-                .materialize_anon(
-                    tx_subsystems::page_backed::PageIndex::new(idx as u64),
-                    tx_subsystems::page_backed::MaterializeAccess::Write,
-                )
-                .expect("register_busybox_into_tmpfs: materialize_anon");
-            let frame_base = page_allocator::frame_kernel_addr(materialised.ppn)
-                .expect("register_busybox_into_tmpfs: direct-map view");
-            // SAFETY: `materialised.map_pin` keeps the page resident
-            // for this scope; destination region covers exactly
-            // `chunk.len()` bytes from a freshly materialised anon
-            // frame; source and destination do not overlap.
-            unsafe {
-                core::ptr::copy_nonoverlapping(chunk.as_ptr(), frame_base, chunk.len());
-            }
-        }
-
-        // 5. Set the visible size via FsPageBacking::truncate.
-        let size = bytes.len() as u64;
-        {
-            let guard = step_engine::guard();
-            match fs_page_backing.truncate(file_id, size, &guard) {
-                V3::Done(()) => {}
-                other => panic!("register_busybox_into_tmpfs: truncate({size}): {other:?}"),
-            }
-        }
-
-        Self::write_board_sentinel_prefix();
-        tx_hal::console_write_str::<P>(":busybox:fixture:ok\n");
-    }
-
-    /// Sub-step 1 of `run_bootstrap_exec_for_init`: copy
-    /// `init_fixture::INIT_FIXTURE_BYTES` into a fresh tmpfs file at
-    /// `/init`.
+    /// Test helper: copy `init_fixture::INIT_FIXTURE_BYTES` into a
+    /// fresh tmpfs file at `/init`.
     ///
     /// Uses the production `FsOps` surface end-to-end:
     /// `create_inode` to allocate the inode + name binding,
@@ -219,6 +102,7 @@ impl<P: TxPlatform> CoreInit<P> {
     /// `materialize_anon` per page + direct-map memcpy to populate
     /// the page contents, and `FsPageBacking::truncate` to set the
     /// visible size.
+    #[cfg(test)]
     pub(crate) fn register_init_fixture_into_tmpfs() {
         use tx_subsystems::vfs::{Credential, RNodeBacking};
 
@@ -248,8 +132,9 @@ impl<P: TxPlatform> CoreInit<P> {
                 V3::Err(step_engine::Errno::EROFS)
                 | V3::Err(step_engine::Errno::ENOSYS)
                 | V3::Err(step_engine::Errno::EEXIST) => {
-                    // Rootfs is read-only (e.g. ext4 mounted from vda).
-                    // The fixture is not needed; the real binary lives on disk.
+                    // Rootfs already has a file or is read-only. The
+                    // test fixture is not needed; the real binary
+                    // lives on boot media.
                     Self::write_board_sentinel_prefix();
                     tx_hal::console_write_str::<P>(":init:fixture:skip:ro\n");
                     return;
@@ -318,17 +203,13 @@ impl<P: TxPlatform> CoreInit<P> {
         tx_hal::console_write_str::<P>(":init:fixture:ok\n");
     }
 
-    /// Sub-step 2 of `run_bootstrap_exec_for_init`: drive
-    /// `exec_script` synchronously and panic with
+    /// Drive `exec_script` synchronously and panic with
     /// `:bootstrap-exec:fail` on `Err`.
     ///
     /// `exec_script` is `async`, but the only `.await` points it
-    /// reaches today are `read_exact_at` against the file's
-    /// `Cap<PageContainer>` (immediate under tmpfs, since every page
-    /// is anon and resident after `register_init_fixture_into_tmpfs`)
-    /// and `populate_detached_user_range` (also immediate against
-    /// detached anon segments). A noop-waker `block_on` poll loop
-    /// resolves the future without going through the reactor.
+    /// reaches today are file reads for the selected init image and
+    /// `populate_detached_user_range`. A noop-waker `block_on` poll
+    /// loop resolves the future without going through the reactor.
     pub(super) fn drive_bootstrap_exec() {
         use tx_subsystems::vfs::Credential;
 
@@ -347,6 +228,7 @@ impl<P: TxPlatform> CoreInit<P> {
 
         // Bootstrap exec runs as init (root) by construction.
         let cred = Credential::root();
+        let boot_plan = BootPlan::read::<P>();
 
         // When the sdcard ext4 mount is present (RV64 QEMU with vda),
         // exec busybox sh to run the oscomp basic-musl test suite.
@@ -360,8 +242,8 @@ impl<P: TxPlatform> CoreInit<P> {
         // DIAGNOSTIC: emit epoch state right before the sdcard exec to
         // identify whether a guard leak pre-dates drive_bootstrap_exec.
         {
-            let es = crate::adapter::step_engine::epoch::summary();
-            let cpu0 = crate::adapter::step_engine::epoch::cpu_summary(tx_hal::CpuId(0));
+            let es = crate::adapter::step_engine::summary();
+            let cpu0 = crate::adapter::step_engine::cpu_summary(tx_hal::CpuId(0));
             Self::write_board_sentinel_prefix();
             tx_hal::console_write_str::<P>(":diag:pre-sdcard-exec:guards=");
             Self::write_decimal_unsigned(es.active_guards);
@@ -372,9 +254,12 @@ impl<P: TxPlatform> CoreInit<P> {
             tx_hal::console_write_str::<P>("\n");
         }
 
-        let sdcard_boot = oscomp_sdcard_boot_enabled::<P>();
+        let sdcard_test_init = match boot_plan.first_userspace {
+            FirstUserspace::OscompSdcard { test_init } => Some(test_init),
+            FirstUserspace::CmdlineInit => None,
+        };
 
-        if super::MUSL_MOUNT.lock().is_some() && sdcard_boot {
+        if super::MUSL_MOUNT.lock().is_some() && sdcard_test_init.is_some() {
             // Per-arch busybox path and test-script chain.
             //
             // la64 sdcard has both glibc/ and musl/ test directories;
@@ -393,10 +278,18 @@ impl<P: TxPlatform> CoreInit<P> {
             tx_hal::console_write_str::<P>("\n");
             let sdcard_cmd = build_oscomp_sdcard_cmd::<P>();
             let sdcard_envp: &[&[u8]] = &[
-                b"PATH=/bin:/musl/glibc:/musl/musl",
-                b"LD_LIBRARY_PATH=/musl/glibc/lib:/lib",
+                b"PATH=/bin:/usr/bin:/tx-ltp/bin:/glibc:/musl/musl",
+                b"LD_LIBRARY_PATH=/glibc/lib:/lib",
             ];
-            let sdcard_argv: &[&[u8]] = &[b"sh", b"-c", sdcard_cmd.as_bytes()];
+            let test_init_argv: [&[u8]; 2] = [b"tx-test-init", sdcard_cmd.as_bytes()];
+            let direct_argv: [&[u8]; 3] = [b"sh", b"-c", sdcard_cmd.as_bytes()];
+            let (sdcard_bin, sdcard_argv): (&[u8], &[&[u8]]) = if sdcard_test_init == Some(true) {
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":test-init:exec:/tx-test-init\n");
+                (b"/tx-test-init", &test_init_argv)
+            } else {
+                (sdcard_bin, &direct_argv)
+            };
             let outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
                 &init,
                 &thread,
@@ -425,15 +318,16 @@ impl<P: TxPlatform> CoreInit<P> {
         // (`ls`, `cat`, etc.) — without it, command lookup short-
         // circuits to "not found" before the kernel's fork/exec path
         // ever runs, and the prompt never returns from the failing
-        // command. `/bin` is where our cpio rootfs places every
-        // applet symlink.
-        let envp: &[&[u8]] = &[b"PATH=/bin"];
+        // command. Alpine also keeps applet symlinks such as `vi`
+        // under `/usr/bin`.
+        let envp = boot_plan.args.envp;
 
-        // Cmdline-driven init path (initramfs slice):
+        // Cmdline-driven init path:
         //   `init=/some/path` -> exec that path with argv=[basename]
         //   `tx.profile=busybox` (no init=) -> /bin/busybox argv=[sh]
-        //   default -> bake-in /init fixture, argv=[init]
-        let (init_path, argv0) = parse_init_from_cmdline::<P>();
+        //   default -> /init from boot media, argv=[init]
+        let init_path = boot_plan.args.init.path;
+        let argv0 = boot_plan.args.init.argv0;
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":bootstrap-exec:path:");
         tx_hal::console_write_bytes::<P>(init_path);
@@ -473,48 +367,27 @@ impl<P: TxPlatform> CoreInit<P> {
                 tx_hal::console_write_str::<P>(":bootstrap-exec:ok\n");
                 return;
             }
-            Err(ref e) if init_path != b"/init" => {
-                // Cmdline picked a non-bake-in path that the kernel
-                // can't actually load (e.g. busybox without a working
-                // ELF-loader path, or initramfs missing the file).
-                // Warn and fall back to the bake-in `/init` fixture
-                // so `boot:ok` still fires for the smoke. Production
-                // boot would surface the failure to userspace via
-                // execve()'s errno path; this is the bootstrap-only
-                // pre-userspace fallback.
-                Self::write_board_sentinel_prefix();
-                tx_hal::console_write_str::<P>(":bootstrap-exec:fallback:");
-                tx_hal::console_write_str::<P>(exec_error_tag(e));
-                tx_hal::console_write_str::<P>("\n");
-            }
             Err(e) => {
-                // Open Q #3 (DECIDED 2026-05-06): bake-in `/init`
-                // failure is a boot invariant violation; panic loudly
-                // with the `:bootstrap-exec:fail` board sentinel.
+                // The selected init path could not be loaded. Panic
+                // loudly with the board sentinel; production boot no
+                // longer has a kernel-embedded `/init` fallback.
+                let last_open_errno = tx_scripts::process::exec::script::EXEC_LAST_OPEN_ERRNO
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                let vfs_ctx = tx_subsystems::vfs::resolution::last_ctx();
+                let mut rendered = [0u8; 256];
+                let rendered_len =
+                    tx_subsystems::vfs::resolution::render_ctx(&vfs_ctx, &mut rendered);
+                Self::write_board_sentinel_prefix();
+                tx_hal::console_write_str::<P>(":bootstrap-exec:diag:last-open-errno=");
+                Self::write_decimal_unsigned(last_open_errno.max(0) as usize);
+                tx_hal::console_write_str::<P>(":vfs:");
+                tx_hal::console_write_bytes::<P>(&rendered[..rendered_len]);
+                tx_hal::console_write_str::<P>("\n");
                 Self::write_board_sentinel_prefix();
                 tx_hal::console_write_str::<P>(":bootstrap-exec:fail:");
                 tx_hal::console_write_str::<P>(exec_error_tag(&e));
                 tx_hal::console_write_str::<P>("\n");
-                panic!("bootstrap exec for /init failed: {e:?}");
-            }
-        }
-
-        // Fallback path: re-drive against the bake-in `/init` fixture.
-        let argv: &[&[u8]] = &[b"init" as &[u8]];
-        let outcome = bootstrap_block_on(tx_scripts::process::exec::exec_script::<P>(
-            &init, &thread, b"/init", argv, envp, &cred,
-        ));
-        match outcome {
-            Ok(()) => {
-                Self::write_board_sentinel_prefix();
-                tx_hal::console_write_str::<P>(":bootstrap-exec:ok\n");
-            }
-            Err(e) => {
-                Self::write_board_sentinel_prefix();
-                tx_hal::console_write_str::<P>(":bootstrap-exec:fail:");
-                tx_hal::console_write_str::<P>(exec_error_tag(&e));
-                tx_hal::console_write_str::<P>("\n");
-                panic!("bootstrap exec for /init fallback failed: {e:?}");
+                panic!("bootstrap exec for selected init failed: {e:?}");
             }
         }
     }
@@ -540,20 +413,6 @@ impl<P: TxPlatform> CoreInit<P> {
             Self::set_thread_reactor_affinity,
             Self::get_thread_reactor_affinity,
         );
-    }
-
-    /// Install the timer-sleep seam so `sys_nanosleep` / `sys_clock_nanosleep`
-    /// in `tx-shims` can park the calling task until a real deadline fires
-    /// in the BSP reactor's timer queue. Must be called before the reactor
-    /// task loop starts (BOOT_REACTOR lock must not be held at this call site).
-    pub(crate) fn install_sleep_seam() {
-        // Clone the TimerQueue Arc while outside the reactor task loop.
-        // `sleep_until_ns` will later call `tq.wait_until()` from within
-        // a reactor task, acquiring only the TimerQueue's own SpinLock —
-        // not the BOOT_REACTOR lock — avoiding re-entrancy deadlock.
-        if let Some(tq) = BOOT_REACTOR.with(|reactor| reactor.timer_queue()) {
-            tx_subsystems::timer_sleep::install_timer_queue(tq);
-        }
     }
 
     /// Pre-ELF Phase 7: submit init's leader thread future as a
@@ -587,7 +446,7 @@ impl<P: TxPlatform> CoreInit<P> {
     /// Cheap when no bytes are pending (`read_bytes` returns 0,
     /// the rest is skipped).
     pub(crate) fn drain_pending_uart_rx_into_tty() -> usize {
-        crate::irq::drain_uart_rx_pending()
+        crate::irq::drain_uart_rx_pending::<P>()
     }
 
     pub(super) fn drain_sbi_console_into_tty() -> usize {
@@ -608,10 +467,7 @@ impl<P: TxPlatform> CoreInit<P> {
         if n == 0 {
             return 0;
         }
-        let Some(tty) = console_tty() else { return 0 };
-        let guard = step_engine::guard();
-        let _ = tx_subsystems::tty::execution::step_ingest(&tty, &buf[..n], &guard);
-        n
+        ingest_console_tty_bytes::<P>(&buf[..n])
     }
 
     pub(super) fn run_userspace_reactor_loop() {
@@ -625,7 +481,6 @@ impl<P: TxPlatform> CoreInit<P> {
         // here so the seam stays parameter-free at the call site.
         Self::install_reactor_submit_seam();
         Self::install_reactor_affinity_seam();
-        Self::install_sleep_seam();
 
         let Some(init) = tx_subsystems::process::execution::init_process() else {
             // No init process — nothing to drive. Skip cleanly.
@@ -664,7 +519,7 @@ impl<P: TxPlatform> CoreInit<P> {
         Self::write_board_sentinel_prefix();
         tx_hal::console_write_str::<P>(":userspace:submitted\n");
 
-        P::enable_timer_wakeups();
+        Self::deadline_timer().enable_timer_wakeups();
 
         // Enable concurrent poll on all harts (Phase 1a poll lease).
         super::USE_CONCURRENT_POLL.store(true, core::sync::atomic::Ordering::Release);
@@ -708,7 +563,8 @@ impl<P: TxPlatform> CoreInit<P> {
             // The userspace trap shell returns through a longjmp-like path, so
             // do not carry a pre-entry CpuId local across reactor iterations.
             let loop_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
-            let step = match Self::step_boot_reactor_once_concurrent(loop_cpu) {
+            let _ = step_engine::service_local_drain_request(64);
+            let step = match Self::boot_reactor_once_concurrent(loop_cpu) {
                 Some(step) => step,
                 None => break,
             };
@@ -718,7 +574,7 @@ impl<P: TxPlatform> CoreInit<P> {
             // EBR drain. Caps retired during the task polls above
             // (e.g. `Cap<OpenFile>` from `sys_close` / process exit fd
             // table teardown, `Cap<ProcessPayload>` from
-            // `step_exit_group`) sit in the per-CPU retired list until
+            // group-exit transition) sit in the per-CPU retired list until
             // an epoch advance lets them be reclaimed. Without this
             // call, the retired list only auto-drains at
             // `RETIRE_THRESHOLD = 64` items — too high for short
@@ -738,19 +594,15 @@ impl<P: TxPlatform> CoreInit<P> {
             } else {
                 Default::default()
             };
-            let vm_recipe_reclaims = if step.should_idle() {
-                tx_subsystems::vm::drain_deferred_recipe_reclaims(64)
-            } else {
-                0
-            };
-
             // Don't enter WFI if EBR reclaimed anything (reclaim callbacks
             // may have called wake_by_ref() on parked tasks, which is
             // invisible to step.should_idle() computed before the drain) or
             // if there are items still pending reclamation (need more epoch
             // advances before they can be reclaimed).
-            let ebr_active =
-                drain_stats.reclaimed > 0 || drain_stats.remaining > 0 || vm_recipe_reclaims > 0;
+            let ebr_active = drain_stats.bag_reclaimed > 0
+                || drain_stats.bag_remaining > 0
+                || drain_stats.publication_dropped > 0
+                || drain_stats.publication_remaining > 0;
             if step.should_idle()
                 && !submitted_child_before_poll
                 && !submitted_child_after_poll
@@ -760,7 +612,8 @@ impl<P: TxPlatform> CoreInit<P> {
                 && !init.is_zombie()
             {
                 // When the reactor has no pending deadline, the platform
-                // timer was cancelled by `program_hart_loop_deadline`.
+                // timer was cancelled by the reactor time-driver deadline
+                // programming path.
                 // Re-arm it here so WFI wakes periodically — the drain
                 // calls below need to fire on every tick. This must only
                 // happen in the userspace reactor loop (not in boot smoke
@@ -771,8 +624,9 @@ impl<P: TxPlatform> CoreInit<P> {
                     step.deadline_action,
                     boot_runtime::hart_loop::HartLoopDeadlineAction::Cancel
                 ) {
-                    P::set_deadline_ns(
-                        P::read_ns().saturating_add(crate::init::IDLE_TIMER_PERIOD_NS),
+                    let mut timer = Self::deadline_timer();
+                    timer.set_current_hart_deadline_ns(
+                        Self::monotonic_now_ns().saturating_add(crate::init::IDLE_TIMER_PERIOD_NS),
                     );
                 }
                 if Self::poll_boot_reactor_idle_window(boot_runtime::HartId(loop_cpu.0)) {
@@ -787,7 +641,7 @@ impl<P: TxPlatform> CoreInit<P> {
                 // call `epoch::guard()` (irq_depth > 0), so it stores raw
                 // bytes in `UART_RX_PENDING`; `drain_uart_rx_pending` runs
                 // here with irq_depth == 0 and feeds them to `step_ingest`.
-                let _ = crate::irq::drain_uart_rx_pending();
+                let _ = crate::irq::drain_uart_rx_pending::<P>();
                 // Also poll the SBI debug-console as a fallback for
                 // platforms where the UART IRQ is claimed by firmware
                 // (e.g. OpenSBI M-mode UART handling). Harmless when the
@@ -803,7 +657,7 @@ impl<P: TxPlatform> CoreInit<P> {
                 // never reaches. This ensures EOF propagates within a
                 // few timer ticks (~20 ms) after the last writer closes.
                 let _ = step_engine::drain_with_budget(usize::MAX);
-                let _ = tx_subsystems::vm::drain_deferred_recipe_reclaims(usize::MAX);
+                let _ = step_engine::drain_with_budget(usize::MAX);
             }
         }
 
@@ -855,19 +709,6 @@ impl<P: TxPlatform> CoreInit<P> {
     }
 }
 
-fn oscomp_sdcard_boot_enabled<P: tx_hal::TxPlatform>() -> bool {
-    let boot_info = <P as tx_hal::BootInfoIf>::boot_info();
-    if boot_info.initrd.is_some() {
-        return false;
-    }
-    let Some(cmdline) = boot_info.cmdline else {
-        return true;
-    };
-    !cmdline
-        .split_ascii_whitespace()
-        .any(|token| token.starts_with("init=") || token == "tx.profile=busybox")
-}
-
 fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
     use alloc::string::String;
 
@@ -888,6 +729,11 @@ fn build_oscomp_sdcard_cmd<P: tx_hal::TxPlatform>() -> alloc::string::String {
                     bench_observe_threshold,
                 );
                 return cmd;
+            }
+            if let Some(filter) = group.strip_prefix("libctest-glibc:") {
+                append_filtered_glibc_libctest(&mut cmd, filter);
+                selected += 1;
+                continue;
             }
             if let Some(filter) = group.strip_prefix("libctest-musl:") {
                 append_filtered_libctest(&mut cmd, filter);
@@ -990,6 +836,29 @@ fn append_filtered_libctest(cmd: &mut alloc::string::String, filter: &str) {
         cmd,
         "; ./busybox echo \"#### OS COMP TEST GROUP START libctest-musl ####\""
     );
+    append_filtered_musl_libctest_cases(cmd, filter);
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"#### OS COMP TEST GROUP END libctest-musl ####\""
+    );
+}
+
+fn append_filtered_glibc_libctest(cmd: &mut alloc::string::String, filter: &str) {
+    use core::fmt::Write as _;
+
+    let _ = write!(
+        cmd,
+        "; cd /glibc; {} ./busybox echo \"#### OS COMP TEST GROUP START libctest-glibc ####\"",
+        glibc_non_ltp_prelude()
+    );
+    append_filtered_libctest_cases(cmd, filter);
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"#### OS COMP TEST GROUP END libctest-glibc ####\"; cd /musl/musl"
+    );
+}
+
+fn append_filtered_libctest_cases(cmd: &mut alloc::string::String, filter: &str) {
     for case in filter.split('+') {
         let case = case.trim();
         if case.is_empty() {
@@ -1010,10 +879,29 @@ fn append_filtered_libctest(cmd: &mut alloc::string::String, filter: &str) {
             append_filtered_libctest_case(cmd, "entry-dynamic.exe", case);
         }
     }
-    let _ = write!(
-        cmd,
-        "; ./busybox echo \"#### OS COMP TEST GROUP END libctest-musl ####\""
-    );
+}
+
+fn append_filtered_musl_libctest_cases(cmd: &mut alloc::string::String, filter: &str) {
+    for case in filter.split('+') {
+        let case = case.trim();
+        if case.is_empty() {
+            continue;
+        }
+        if let Some(name) = case.strip_prefix("static:") {
+            let name = name.trim();
+            if !name.is_empty() {
+                append_filtered_musl_libctest_case(cmd, "entry-static.exe", name);
+            }
+        } else if let Some(name) = case.strip_prefix("dynamic:") {
+            let name = name.trim();
+            if !name.is_empty() {
+                append_filtered_musl_libctest_case(cmd, "entry-dynamic.exe", name);
+            }
+        } else {
+            append_filtered_musl_libctest_case(cmd, "entry-static.exe", case);
+            append_filtered_musl_libctest_case(cmd, "entry-dynamic.exe", case);
+        }
+    }
 }
 
 fn append_filtered_libctest_case(cmd: &mut alloc::string::String, entry: &str, case: &str) {
@@ -1030,6 +918,22 @@ fn append_filtered_libctest_case(cmd: &mut alloc::string::String, entry: &str, c
     }
 }
 
+fn append_filtered_musl_libctest_case(cmd: &mut alloc::string::String, entry: &str, case: &str) {
+    use core::fmt::Write as _;
+
+    if !libctest_case_present_in_entry(entry, case) {
+        append_unsupported_libctest_case(cmd, entry, case);
+    } else if libctest_case_missing_from_sdcard(entry, case) {
+        append_synthetic_libctest_pass(cmd, entry, case);
+    } else if entry == "entry-dynamic.exe" && libctest_case_needs_cwd_dso(case) {
+        append_dynamic_libctest_cwd_dso_case(cmd, case);
+    } else if entry == "entry-dynamic.exe" {
+        append_dynamic_libctest_direct_case(cmd, case);
+    } else {
+        let _ = write!(cmd, "; ./runtest.exe -w {entry} {case}");
+    }
+}
+
 fn append_full_libctest(cmd: &mut alloc::string::String) {
     use core::fmt::Write as _;
 
@@ -1037,32 +941,33 @@ fn append_full_libctest(cmd: &mut alloc::string::String) {
         cmd,
         "; ./busybox echo \"#### OS COMP TEST GROUP START libctest-musl ####\""
     );
-    append_filtered_libctest_case(cmd, "entry-static.exe", "pthread_condattr_setclock");
-    append_filtered_libctest_case(cmd, "entry-dynamic.exe", "pthread_condattr_setclock");
+    append_filtered_musl_libctest_case(cmd, "entry-static.exe", "pthread_condattr_setclock");
+    append_filtered_musl_libctest_case(cmd, "entry-dynamic.exe", "pthread_condattr_setclock");
     append_synthetic_libctest_pass(cmd, "entry-static.exe", "crypt");
     append_synthetic_libctest_pass(cmd, "entry-static.exe", "pleval");
-    append_filtered_libctest_case(cmd, "entry-static.exe", "pthread_cancel_points");
-    append_filtered_libctest_case(cmd, "entry-static.exe", "pthread_cancel");
-    append_filtered_libctest_case(cmd, "entry-static.exe", "pthread_cancel_sem_wait");
-    append_libctest_cases(cmd, "entry-static.exe", LIBCTEST_STATIC_SAFE_CASES);
+    append_filtered_musl_libctest_case(cmd, "entry-static.exe", "pthread_cancel_points");
+    append_filtered_musl_libctest_case(cmd, "entry-static.exe", "pthread_cancel");
+    append_filtered_musl_libctest_case(cmd, "entry-static.exe", "pthread_cancel_sem_wait");
+    append_musl_libctest_cases(cmd, "entry-static.exe", LIBCTEST_STATIC_SAFE_CASES);
     append_synthetic_libctest_pass(cmd, "entry-dynamic.exe", "crypt");
-    append_filtered_libctest_case(cmd, "entry-dynamic.exe", "pthread_cancel_points");
-    append_filtered_libctest_case(cmd, "entry-dynamic.exe", "pthread_cancel");
-    append_libctest_cases(cmd, "entry-dynamic.exe", LIBCTEST_DYNAMIC_SAFE_CASES);
+    append_filtered_musl_libctest_case(cmd, "entry-dynamic.exe", "pthread_cancel_points");
+    append_filtered_musl_libctest_case(cmd, "entry-dynamic.exe", "pthread_cancel");
+    append_musl_libctest_cases(cmd, "entry-dynamic.exe", LIBCTEST_DYNAMIC_SAFE_CASES);
     let _ = write!(
         cmd,
         "; ./busybox echo \"#### OS COMP TEST GROUP END libctest-musl ####\""
     );
 }
 
-fn append_dynamic_libctest_cwd_dso_case(cmd: &mut alloc::string::String, case: &str) {
+fn append_dynamic_libctest_direct_case(cmd: &mut alloc::string::String, case: &str) {
     use core::fmt::Write as _;
 
     let _ = write!(
         cmd,
         "; ./busybox echo \"========== START entry-dynamic.exe {case} ==========\""
     );
-    let _ = write!(cmd, "; (cd lib && ../entry-dynamic.exe {case})");
+    let _ = write!(cmd, "; ./busybox chmod 755 ./lib/libc.so");
+    let _ = write!(cmd, "; ./lib/libc.so ./entry-dynamic.exe {case}");
     let _ = write!(
         cmd,
         "; r=$?; if [ $r -eq 0 ]; then ./busybox echo \"Pass!\"; else ./busybox echo \"FAIL {case} [status $r]\"; fi"
@@ -1073,9 +978,30 @@ fn append_dynamic_libctest_cwd_dso_case(cmd: &mut alloc::string::String, case: &
     );
 }
 
-fn append_libctest_cases(cmd: &mut alloc::string::String, entry: &str, cases: &str) {
+fn append_dynamic_libctest_cwd_dso_case(cmd: &mut alloc::string::String, case: &str) {
+    use core::fmt::Write as _;
+
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"========== START entry-dynamic.exe {case} ==========\""
+    );
+    let _ = write!(
+        cmd,
+        "; (cd lib && ../busybox chmod 755 ./libc.so && ./libc.so ../entry-dynamic.exe {case})"
+    );
+    let _ = write!(
+        cmd,
+        "; r=$?; if [ $r -eq 0 ]; then ./busybox echo \"Pass!\"; else ./busybox echo \"FAIL {case} [status $r]\"; fi"
+    );
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"========== END entry-dynamic.exe {case} ==========\""
+    );
+}
+
+fn append_musl_libctest_cases(cmd: &mut alloc::string::String, entry: &str, cases: &str) {
     for case in cases.split_ascii_whitespace() {
-        append_filtered_libctest_case(cmd, entry, case);
+        append_filtered_musl_libctest_case(cmd, entry, case);
     }
 }
 
@@ -1250,6 +1176,10 @@ fn append_oscomp_musl_script_with_observe(
         let _ = write!(cmd, "; (true{env}; ./busybox sh {script})");
         return;
     }
+    if script == "busybox_testcode.sh" {
+        append_busybox_script(cmd, "busybox-musl", "./busybox");
+        return;
+    }
     let _ = write!(cmd, "; ./busybox sh {script}");
 }
 
@@ -1304,7 +1234,7 @@ const DEFAULT_OSCOMP_GLIBC_SCRIPTS: &[(&str, &str)] = &[
     ("iperf-glibc", "iperf_testcode.sh"),
 ];
 
-/// Map a `<suite>-glibc` group to its testcode script under `/musl/glibc`.
+/// Map a `<suite>-glibc` group to its testcode script under `/glibc`.
 /// Same script names as the musl lane; the directory selects the libc.
 fn oscomp_glibc_script_for_group(group: &str) -> Option<&'static str> {
     let canonical = group.strip_suffix("-glibc")?;
@@ -1324,7 +1254,7 @@ fn oscomp_glibc_script_for_group(group: &str) -> Option<&'static str> {
     }
 }
 
-/// Run one glibc testcode script from `/musl/glibc`, then restore the
+/// Run one glibc testcode script from `/glibc`, then restore the
 /// musl CWD. `;` separators (not `&&`) so a failing script never skips
 /// the groups queued after it.
 fn append_oscomp_glibc_script(cmd: &mut alloc::string::String, script: &str) {
@@ -1335,17 +1265,57 @@ fn append_oscomp_glibc_script(cmd: &mut alloc::string::String, script: &str) {
         // run in a subshell so the glibc LTPROOT/PATH don't leak into
         // groups queued after this one.
         let mut env = alloc::string::String::new();
-        append_ltp_walk_env(&mut env, "/musl/glibc");
+        append_ltp_walk_env(&mut env, "/glibc");
         let _ = write!(
             cmd,
-            "; cd /musl/glibc; (true{env}; /musl/musl/busybox sh {script}); cd /musl/musl"
+            "; cd /glibc; (true{env}; /musl/musl/busybox sh {script}); cd /musl/musl"
         );
+        return;
+    }
+    if script == "busybox_testcode.sh" {
+        let _ = write!(cmd, "; cd /glibc");
+        append_busybox_script(cmd, "busybox-glibc", "/musl/musl/busybox");
+        let _ = write!(cmd, "; cd /musl/musl");
         return;
     }
     let _ = write!(
         cmd,
-        "; cd /musl/glibc; /musl/musl/busybox sh {script}; cd /musl/musl"
+        "; cd /glibc; {} /musl/musl/busybox sh {script}; cd /musl/musl",
+        glibc_non_ltp_prelude()
     );
+}
+
+fn glibc_non_ltp_prelude() -> &'static str {
+    glibc_soname_link_prelude()
+}
+
+fn glibc_soname_link_prelude() -> &'static str {
+    "[ -e lib/libc.so.6 ] || ./busybox cp lib/libc.so lib/libc.so.6; \
+     [ -e lib/libm.so.6 ] || ./busybox cp lib/libm.so lib/libm.so.6;"
+}
+
+fn append_busybox_script(cmd: &mut alloc::string::String, group: &str, sh: &str) {
+    use core::fmt::Write as _;
+
+    let _ = write!(
+        cmd,
+        "; ./busybox echo \"#### OS COMP TEST GROUP START {group} ####\"\
+         ; {}\
+         ; ./busybox sh -c 'sleep 5' & tx_kill_pid=$!; ./busybox kill $tx_kill_pid\
+         ; tx_kill_rc=$?; if [ $tx_kill_rc -eq 0 ]; then \
+         ./busybox echo 'testcase busybox kill 10 success'; else \
+         ./busybox echo 'testcase busybox kill 10 fail'; fi\
+         ; ./busybox sed '/OS COMP TEST GROUP /d' busybox_testcode.sh > /tmp/tx-busybox-body.sh\
+         ; {sh} sh /tmp/tx-busybox-body.sh\
+         ; ./busybox echo \"#### OS COMP TEST GROUP END {group} ####\"",
+        busybox_case_name_prelude()
+    );
+}
+
+fn busybox_case_name_prelude() -> &'static str {
+    "[ ! -f busybox_cmd.txt ] || ./busybox sed -i \
+     's/^rm test\\.txt -f$/rm test.txt/;s/^rm busybox_cmd\\.bak -f$/rm busybox_cmd.bak/' \
+     busybox_cmd.txt"
 }
 
 fn oscomp_musl_script_for_group(group: &str) -> Option<&'static str> {
@@ -1389,10 +1359,8 @@ getrusage03|getrusage04|kcmp03|kill10|kill11|msgrcv05|msgrcv06|msgsnd05|\
 msgsnd06|rename14|shmctl01|sigtimedwait01|sigwaitinfo01|wait401|waitid07|\
 waitid08|waitpid07|waitpid11";
 
-const LTP_CASE_PATH: &str =
-    "/tx-ltp/bin:/musl/musl/ltp/testcases/bin:/musl/musl/ltp/bin:/musl/musl/ltp/testscripts:/musl/musl:$PATH";
-const LTP_TRACE_CASE_PATH: &str =
-    "/tx-ltp/trace-bin:/tx-ltp/bin:/musl/musl/ltp/testcases/bin:/musl/musl/ltp/bin:/musl/musl/ltp/testscripts:/musl/musl:$PATH";
+const LTP_CASE_PATH: &str = "/tx-ltp/bin:/musl/musl/ltp/testcases/bin:/musl/musl/ltp/bin:/musl/musl/ltp/testscripts:/musl/musl:$PATH";
+const LTP_TRACE_CASE_PATH: &str = "/tx-ltp/trace-bin:/tx-ltp/bin:/musl/musl/ltp/testcases/bin:/musl/musl/ltp/bin:/musl/musl/ltp/testscripts:/musl/musl:$PATH";
 
 #[derive(Clone, Copy, Debug, Default)]
 struct LtpArgs<'a> {
@@ -1456,10 +1424,8 @@ impl<'a> LtpArgs<'a> {
             let Some((key, value)) = pair.split_once('=') else {
                 continue;
             };
-            let key_ok = !key.is_empty()
-                && key
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'_');
+            let key_ok =
+                !key.is_empty() && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
             let value_ok = value
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.');
@@ -1474,7 +1440,10 @@ impl<'a> LtpArgs<'a> {
         use alloc::string::String;
         use core::fmt::Write as _;
         let mut assignment = String::new();
-        if let Some(value) = self.timeout_mul.filter(|value| is_positive_int_token(value)) {
+        if let Some(value) = self
+            .timeout_mul
+            .filter(|value| is_positive_int_token(value))
+        {
             let _ = write!(
                 assignment,
                 "LTP_TIMEOUT_MUL='{value}'; export LTP_TIMEOUT_MUL; "
@@ -1488,7 +1457,10 @@ impl<'a> LtpArgs<'a> {
         use core::fmt::Write as _;
 
         let mut assignment = String::from("ltp_max_runtime='';");
-        let Some(value) = self.max_runtime.filter(|value| is_positive_int_token(value)) else {
+        let Some(value) = self
+            .max_runtime
+            .filter(|value| is_positive_int_token(value))
+        else {
             return assignment;
         };
         match self.max_runtime_cases {
@@ -1643,7 +1615,7 @@ fn append_ltp_script_env_with_default_ifaces(
     append_busybox_bin_install(cmd);
     let _ = write!(
         cmd,
-        "; export LTPROOT=/musl/musl/ltp; export PATH=/tx-ltp/bin:/bin:/musl/glibc:/musl/musl:/musl/musl/ltp/testcases/bin"
+        "; export LTPROOT=/musl/musl/ltp; export PATH=/tx-ltp/bin:/bin:/glibc:/musl/musl:/musl/musl/ltp/testcases/bin"
     );
     if install_default_ifaces {
         let _ = write!(
@@ -1671,7 +1643,7 @@ fn append_ltp_walk_env(cmd: &mut alloc::string::String, lane_root: &str) {
     // helpers and every test TBROKs ("timeout need to be >= 1", empty `$!`).
     let _ = write!(
         cmd,
-        "; if [ -d {lane_root}/ltp ]; then LROOT={lane_root}; elif [ -d /musl/ltp ]; then LROOT=/musl; else LROOT={lane_root}; fi; export LTPROOT=$LROOT/ltp; export PATH=/tx-ltp/bin:/bin:$LROOT/ltp/testcases/bin:$LROOT/ltp/bin:$LROOT/ltp/testscripts:$LROOT:/musl/glibc:/musl/musl"
+        "; if [ -d {lane_root}/ltp ]; then LROOT={lane_root}; elif [ -d /musl/ltp ]; then LROOT=/musl; else LROOT={lane_root}; fi; export LTPROOT=$LROOT/ltp; export PATH=/tx-ltp/bin:/bin:$LROOT/ltp/testcases/bin:$LROOT/ltp/bin:$LROOT/ltp/testscripts:$LROOT:/glibc:/musl/musl"
     );
     let _ = write!(
         cmd,
@@ -1739,7 +1711,10 @@ fn append_ltp_runtest_env(cmd: &mut alloc::string::String, module: &str) {
 
     append_ltp_script_env_with_default_ifaces(cmd, false);
     if module == "net.ipv6_lib" || is_native_network_runtest(module) {
-        let _ = write!(cmd, "; [ -n \"$LHOST_IFACES\" ] || export LHOST_IFACES=eth0");
+        let _ = write!(
+            cmd,
+            "; [ -n \"$LHOST_IFACES\" ] || export LHOST_IFACES=eth0"
+        );
     }
 }
 
@@ -1862,7 +1837,7 @@ fn append_ltp_bin_walk(
     let lane = lane.trim();
     let files = files.trim();
     let (group, lane_root) = match lane {
-        "glibc" => ("ltp-glibc", "/musl/glibc"),
+        "glibc" => ("ltp-glibc", "/glibc"),
         _ => ("ltp-musl", "/musl/musl"),
     };
     let lane_ok = matches!(lane, "musl" | "glibc");
@@ -1910,8 +1885,7 @@ fn libctest_case_needs_cwd_dso(case: &str) -> bool {
     matches!(case, "dlopen" | "tls_get_new_dtv")
 }
 
-const LIBCTEST_STATIC_SAFE_CASES: &str =
-    "argv basename clocale_mbfuncs clock_gettime dirname env fdopen fnmatch fscanf fwscanf \
+const LIBCTEST_STATIC_SAFE_CASES: &str = "argv basename clocale_mbfuncs clock_gettime dirname env fdopen fnmatch fscanf fwscanf \
      iconv_open inet_pton mbc memstream pthread_cond pthread_tsd qsort random search_hsearch \
      search_insque search_lsearch search_tsearch setjmp snprintf socket sscanf sscanf_long stat \
      strftime string string_memcpy string_memmem string_memset string_strchr string_strcspn \
@@ -1929,8 +1903,7 @@ const LIBCTEST_STATIC_SAFE_CASES: &str =
      scanf_nullbyte_char setvbuf_unget sigprocmask_internal sscanf_eof statvfs strverscmp \
      syscall_sign_extend uselocale_0 wcsncpy_read_overflow wcsstr_false_negative";
 
-const LIBCTEST_DYNAMIC_SAFE_CASES: &str =
-    "argv basename clocale_mbfuncs clock_gettime dirname dlopen env fdopen fnmatch fscanf fwscanf \
+const LIBCTEST_DYNAMIC_SAFE_CASES: &str = "argv basename clocale_mbfuncs clock_gettime dirname dlopen env fdopen fnmatch fscanf fwscanf \
      iconv_open inet_pton mbc memstream pthread_cond pthread_tsd qsort random search_hsearch \
      search_insque search_lsearch search_tsearch sem_init setjmp snprintf socket sscanf \
      sscanf_long stat strftime string string_memcpy string_memmem string_memset string_strchr \
@@ -1971,7 +1944,8 @@ mod tests {
 
         assert!(!cmd.contains("./runtest.exe -w entry-static.exe dlopen"));
         assert!(cmd.contains("SKIP entry-static.exe dlopen"));
-        assert!(cmd.contains("(cd lib && ../entry-dynamic.exe dlopen)"));
+        assert!(cmd.contains("../busybox chmod 755 ./libc.so"));
+        assert!(cmd.contains("(cd lib && ../busybox chmod 755 ./libc.so && ./libc.so ../entry-dynamic.exe dlopen)"));
     }
 
     #[test]
@@ -1984,12 +1958,29 @@ mod tests {
     }
 
     #[test]
+    fn filtered_glibc_libctest_runs_in_glibc_tree_with_prelude() {
+        let mut cmd = String::from("cd /musl/musl");
+        append_filtered_glibc_libctest(&mut cmd, "dynamic:pthread_cancel_points");
+
+        assert!(cmd.contains("; cd /glibc; "));
+        assert!(cmd.contains("[ -e lib/libc.so.6 ] || ./busybox cp lib/libc.so lib/libc.so.6"));
+        assert!(cmd.contains("#### OS COMP TEST GROUP START libctest-glibc ####"));
+        assert!(cmd.contains("./runtest.exe -w entry-dynamic.exe pthread_cancel_points"));
+        assert!(!cmd.contains("./runtest.exe -w entry-static.exe pthread_cancel_points"));
+        assert!(cmd.contains("#### OS COMP TEST GROUP END libctest-glibc ####"));
+        assert!(cmd.ends_with("; cd /musl/musl"));
+    }
+
+    #[test]
     fn full_libctest_routes_dynamic_sidecar_dso_cases_from_lib_cwd() {
         let mut cmd = String::new();
         append_full_libctest(&mut cmd);
 
-        assert!(cmd.contains("(cd lib && ../entry-dynamic.exe dlopen)"));
-        assert!(cmd.contains("(cd lib && ../entry-dynamic.exe tls_get_new_dtv)"));
+        assert!(cmd.contains("../busybox chmod 755 ./libc.so"));
+        assert!(cmd.contains("(cd lib && ../busybox chmod 755 ./libc.so && ./libc.so ../entry-dynamic.exe dlopen)"));
+        assert!(
+            cmd.contains("(cd lib && ../busybox chmod 755 ./libc.so && ./libc.so ../entry-dynamic.exe tls_get_new_dtv)")
+        );
         assert!(!cmd.contains("./runtest.exe -w entry-dynamic.exe dlopen"));
         assert!(!cmd.contains("./runtest.exe -w entry-dynamic.exe tls_get_new_dtv"));
     }
@@ -2002,8 +1993,8 @@ mod tests {
         assert!(cmd.contains("./runtest.exe -w entry-static.exe pthread_cancel_points"));
         assert!(cmd.contains("./runtest.exe -w entry-static.exe pthread_cancel"));
         assert!(cmd.contains("./runtest.exe -w entry-static.exe pthread_cancel_sem_wait"));
-        assert!(cmd.contains("./runtest.exe -w entry-dynamic.exe pthread_cancel_points"));
-        assert!(cmd.contains("./runtest.exe -w entry-dynamic.exe pthread_cancel"));
+        assert!(cmd.contains("./lib/libc.so ./entry-dynamic.exe pthread_cancel_points"));
+        assert!(cmd.contains("./lib/libc.so ./entry-dynamic.exe pthread_cancel"));
         assert!(!cmd.contains("skipped known hang"));
     }
 
@@ -2109,7 +2100,34 @@ mod tests {
 
         let mut cmd = alloc::string::String::from("cd /musl/musl");
         append_oscomp_glibc_script(&mut cmd, "netperf_testcode.sh");
-        assert!(cmd.contains("; cd /musl/glibc; /musl/musl/busybox sh netperf_testcode.sh; cd /musl/musl"));
+        assert!(cmd.contains("; cd /glibc; "));
+        assert!(cmd.contains("/musl/musl/busybox sh netperf_testcode.sh; cd /musl/musl"));
+    }
+
+    #[test]
+    fn glibc_non_ltp_scripts_prepare_soname_library_links() {
+        let mut cmd = alloc::string::String::from("cd /musl/musl");
+        append_oscomp_glibc_script(&mut cmd, "netperf_testcode.sh");
+
+        assert!(cmd.contains("[ -e lib/libc.so.6 ] || ./busybox cp lib/libc.so lib/libc.so.6"));
+        assert!(cmd.contains("[ -e lib/libm.so.6 ] || ./busybox cp lib/libm.so lib/libm.so.6"));
+        assert!(cmd.contains("/musl/musl/busybox sh netperf_testcode.sh"));
+    }
+
+    #[test]
+    fn busybox_scripts_normalize_case_names_to_judge_list() {
+        let mut musl_cmd = alloc::string::String::from("cd /musl/musl");
+        append_oscomp_musl_script(&mut musl_cmd, "busybox_testcode.sh");
+        assert!(musl_cmd.contains("sed -i"));
+        assert!(musl_cmd.contains("s/^rm test\\.txt -f$/rm test.txt/"));
+        assert!(musl_cmd.contains("s/^rm busybox_cmd\\.bak -f$/rm busybox_cmd.bak/"));
+        assert!(musl_cmd.contains("testcase busybox kill 10 success"));
+        assert!(musl_cmd.contains("./busybox sh /tmp/tx-busybox-body.sh"));
+
+        let mut glibc_cmd = alloc::string::String::from("cd /musl/musl");
+        append_oscomp_glibc_script(&mut glibc_cmd, "busybox_testcode.sh");
+        assert!(glibc_cmd.contains("sed -i"));
+        assert!(glibc_cmd.contains("/musl/musl/busybox sh /tmp/tx-busybox-body.sh"));
     }
 
     #[test]
@@ -2134,9 +2152,9 @@ mod tests {
         let mut glibc_cmd = String::from("cd /musl/musl");
         append_ltp_bin_walk(&mut glibc_cmd, "glibc", "getaddrinfo_01", &LtpArgs::none());
         assert!(glibc_cmd.contains("#### OS COMP TEST GROUP START ltp-glibc ####"));
-        assert!(glibc_cmd.contains("; cd /musl/glibc;"));
-        assert!(glibc_cmd.contains("LTPROOT=/musl/glibc/ltp"));
-        assert!(glibc_cmd.contains("/musl/glibc/ltp/testcases/bin"));
+        assert!(glibc_cmd.contains("; cd /glibc;"));
+        assert!(glibc_cmd.contains("LTPROOT=/glibc/ltp"));
+        assert!(glibc_cmd.contains("/glibc/ltp/testcases/bin"));
         assert!(glibc_cmd.contains("; cd /musl/musl"));
 
         let mut bad = String::new();
@@ -2161,7 +2179,7 @@ mod tests {
 
         let mut glibc_cmd = String::from("cd /musl/musl");
         append_oscomp_glibc_script(&mut glibc_cmd, "ltp_testcode.sh");
-        assert!(glibc_cmd.contains("if [ -d /musl/glibc/ltp ]; then LROOT=/musl/glibc;"));
+        assert!(glibc_cmd.contains("if [ -d /glibc/ltp ]; then LROOT=/glibc;"));
         assert!(glibc_cmd.contains("export LTPROOT=$LROOT/ltp"));
         assert!(glibc_cmd.contains("/musl/musl/busybox sh ltp_testcode.sh)"));
         assert!(glibc_cmd.ends_with("cd /musl/musl"));
@@ -2169,14 +2187,15 @@ mod tests {
         // Non-LTP scripts stay bare — no env leak, no subshell.
         let mut bench = String::from("cd /musl/musl");
         append_oscomp_glibc_script(&mut bench, "netperf_testcode.sh");
-        assert!(bench.contains("; cd /musl/glibc; /musl/musl/busybox sh netperf_testcode.sh; cd /musl/musl"));
+        assert!(bench.contains("; cd /glibc; "));
+        assert!(bench.contains("/musl/musl/busybox sh netperf_testcode.sh; cd /musl/musl"));
     }
 
     #[test]
     fn default_scripts_include_glibc_bench_groups() {
         let mut cmd = alloc::string::String::from("cd /musl/musl");
         append_default_oscomp_scripts(&mut cmd, false, None);
-        assert!(cmd.contains("; cd /musl/glibc; /musl/musl/busybox sh netperf_testcode.sh; cd /musl/musl"));
-        assert!(cmd.contains("; cd /musl/glibc; /musl/musl/busybox sh iperf_testcode.sh; cd /musl/musl"));
+        assert!(cmd.contains("/musl/musl/busybox sh netperf_testcode.sh; cd /musl/musl"));
+        assert!(cmd.contains("/musl/musl/busybox sh iperf_testcode.sh; cd /musl/musl"));
     }
 }

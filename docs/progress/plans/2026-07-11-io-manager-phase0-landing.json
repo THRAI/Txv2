@@ -1,0 +1,1712 @@
+{
+  "schema": "tx.progress.plan.v1",
+  "id": "2026-07-11-io-manager-phase0-landing",
+  "title": "I/O manager phase-0 landing",
+  "status": "active",
+  "created": "2026-07-11",
+  "updated": "2026-07-12",
+  "owner": "codex",
+  "summary": "Land the first implementation slice for the I/O manager without changing live filesystem semantics: introduce staged request/plan/queue values, PageSlot and RangeReservation scaffolding, focused tests, and a compatibility path that keeps current FsPageBacking implementations valid.",
+  "scope": {
+    "in": [
+      "crates/tx-subsystems/src/io_manager/",
+      "crates/tx-subsystems/src/page_backed/",
+      "crates/tx-subsystems/src/fs_iface/",
+      "crates/tx-subsystems/src/device.rs",
+      "crates/tx-ext4/src/",
+      "future-bdevfs-plan-adapter",
+      "docs/design/05_filesystem/IO_MANAGER_v1.md",
+      "docs/progress/research/2026-07-11-io-manager-implementation-readiness.md",
+      "docs/progress/plans/2026-07-11-io-manager-phase0-landing.json"
+    ],
+    "out": [
+      "full-txarray-rcu-sparse-index-backend",
+      "driver-irq-tag-completion-rewrite",
+      "complex-bfq-kyber-block-scheduler",
+      "ext4-delayed-allocation",
+      "odirect-update-in-place-optimization",
+      "generic-file-data-cache-inside-tx-ext4",
+      "tty-pipe-socket-eventfd-timerfd-signalfd-control-paths"
+    ],
+    "write_sets": [
+      {
+        "owner": "pagebacked-worker",
+        "paths": [
+          "crates/tx-subsystems/src/page_backed/"
+        ],
+        "notes": "Owns PageSlot, RangeReservation, SparseIndex staging, and PageContainer internal synchronization. Must not edit concrete filesystem crates in the same slice."
+      },
+      {
+        "owner": "io-manager-worker",
+        "paths": [
+          "crates/tx-subsystems/src/io_manager/",
+          "crates/tx-subsystems/src/fs_iface/",
+          "crates/tx-subsystems/src/lib.rs"
+        ],
+        "notes": "Owns request, plan, queue, runtime, and service-future skeletons. Must not import tx-ext4 or tx-fs concrete backends."
+      },
+      {
+        "owner": "block-worker",
+        "paths": [
+          "crates/tx-subsystems/src/device.rs",
+          "future-bdevfs-plan-adapter"
+        ],
+        "notes": "Owns Bio/BioPlan mapping experiments for bdev-fs after a later worktree claims crates/tx-fs/src/bdevfs/. Current active network plan claims crates/tx-fs/src/, so phase 0 must not claim that path."
+      },
+      {
+        "owner": "ext4-worker",
+        "paths": [
+          "crates/tx-ext4/src/"
+        ],
+        "notes": "Only starts after BioPlan values are proven through bdev-fs. Keeps ext4 as mapper/journal/backend owner, not a generic file-data cache."
+      },
+      {
+        "owner": "coordinator",
+        "paths": [
+          "docs/progress/plans/2026-07-11-io-manager-phase0-landing.json",
+          "docs/progress/research/2026-07-11-io-manager-implementation-readiness.md"
+        ],
+        "notes": "Owns plan state, readiness updates, verification summaries, and scope arbitration."
+      }
+    ]
+  },
+  "context": {
+    "design_docs": [
+      "docs/design/INDEX.md",
+      "docs/Txv3/INDEX.md",
+      "docs/Txv3/02_INVARIANTS_v5.md",
+      "docs/Txv3/03_STEP_MODEL_v2.md",
+      "docs/Txv3/07_BLAST_RADIUS.md",
+      "docs/design/00_meta-framework/object_model_v2.md",
+      "docs/design/00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md",
+      "docs/design/03_memory-vm/PAGE_BACKED_v1.md",
+      "docs/design/05_filesystem/IO_MANAGER_v1.md",
+      "docs/design/05_filesystem/MOUNT_v1.md",
+      "docs/design/05_filesystem/VFS_CHECKS_V2.1.md",
+      "docs/design/05_filesystem/BDEV_FS.md",
+      "docs/design/05_filesystem/TX_EXT4_PLAN_v1_2.md",
+      "docs/design/06_devices/DEVICE.md"
+    ],
+    "progress_refs": [
+      "docs/progress/STATUS.md",
+      "docs/progress/research/2026-07-11-io-manager-implementation-readiness.md"
+    ],
+    "external_refs": []
+  },
+  "steps": [
+    {
+      "id": "phase0-readiness",
+      "title": "Record canonical gate and first landing order",
+      "status": "complete",
+      "depends_on": [],
+      "paths": [
+        "docs/progress/research/2026-07-11-io-manager-implementation-readiness.md",
+        "docs/progress/plans/2026-07-11-io-manager-phase0-landing.json"
+      ],
+      "verification": [
+        "cargo xtask progress validate",
+        "cargo xtask lint docs",
+        "git diff --check -- docs/progress/research/2026-07-11-io-manager-implementation-readiness.md docs/progress/plans/2026-07-11-io-manager-phase0-landing.json docs/progress/STATUS.md"
+      ],
+      "notes": "This preparation slice records that phase 0 is implementation-ready as compatibility scaffolding. It deliberately does not change live FsPageBacking, BlockDeviceOps, or PageContainer behavior."
+    },
+    {
+      "id": "phase1-value-types",
+      "title": "Add io_manager value types and module skeleton",
+      "status": "complete",
+      "depends_on": [
+        "phase0-readiness"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/io_manager/",
+        "crates/tx-subsystems/src/fs_iface/",
+        "crates/tx-subsystems/src/lib.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-subsystems --lib io_manager -- --nocapture",
+        "cargo check -p tx-subsystems",
+        "git diff --check -- crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface crates/tx-subsystems/src/lib.rs",
+        "rg -n \"tx_ext4|tx-ext4|tx_fs|tx-fs|bdevfs|Ext4|Bdev|FsPageBacking|BlockDeviceOps|materialize_file_page|fetch_page|flush_page\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface crates/tx-subsystems/src/lib.rs"
+      ],
+      "notes": "Complete. Added io_manager::{page,backend,block,runtime} and fs_iface::plan as pure value/queue scaffolding. Tests cover page priority admission, empty/full page queue rejection, neutral backend plan re-export, adjacent LBA merge, queue-depth rejection, and barrier fence dispatch. The only concrete-path strings found by the import scan are compatibility prose in io_manager/mod.rs, not imports or call sites."
+    },
+    {
+      "id": "phase2-page-slot-range",
+      "title": "Add PageSlot and RangeReservation staging modules",
+      "status": "complete",
+      "depends_on": [
+        "phase1-value-types"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/page_backed/slot.rs",
+        "crates/tx-subsystems/src/page_backed/range.rs",
+        "crates/tx-subsystems/src/page_backed/mod.rs",
+        "crates/tx-subsystems/src/page_backed/*tests.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-subsystems --lib page_slot_ -- --nocapture",
+        "cargo test -p tx-subsystems --lib range_reservation_ -- --nocapture",
+        "cargo test -p tx-subsystems --lib page_backed -- --nocapture"
+      ],
+      "notes": "Complete. Added PageSlot as a per-slot locked state machine with Empty, Resident, Fetching, Dirty, Writeback, Error, and PageGeneration tracking. Added RangeReservationTable as an owner-locked interval table for logical page-range semantic exclusion. Tests cover same-page fetch dedup, stale generation completion rejection, dirty/writeback/error transitions, range overlap rejection, shared read admission, and release-before-yield retry. The live PageContainer materialize/fetch/flush path is unchanged."
+    },
+    {
+      "id": "phase3-block-queue",
+      "title": "Add L6 Bio queue semantics over current BlockDeviceHandle",
+      "status": "complete",
+      "depends_on": [
+        "phase1-value-types"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/io_manager/block/",
+        "crates/tx-subsystems/src/device.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-subsystems --lib io_manager::block -- --nocapture",
+        "cargo test -p tx-subsystems --lib io_manager -- --nocapture",
+        "cargo check -p tx-subsystems"
+      ],
+      "notes": "Complete. Extended the staged L6 BlockQueue with front/back adjacent merge, request-tag allocation, tag-to-request completion lookup, QueueDepth completion accounting, and a tagged dispatch path that prevents ordinary I/O from crossing an in-flight barrier/fence. Added a neutral BlockServiceDriver turn that drains dispatchable Bio work under ServiceBudget, returns BlockDispatch values, and re-kicks only while L6 backlog remains immediately dispatchable; it does not know PageIoRequest or concrete driver execution. Added BlockDispatchExecutor, BlockDeviceCompletion, and BlockCompletionSource as the L6/L7 seam: future device executors consume BlockDispatch and report tag/result completions back to BlockTagTable without making io_manager::block import BlockDeviceHandle, BlockDeviceOps, concrete filesystems, or drivers. Existing BlockDeviceHandle and BlockDeviceOps remain unchanged; drivers are still later executors, not part of this control-plane slice."
+    },
+    {
+      "id": "phase4-bdevfs-plan-adapter",
+      "title": "Make bdev-fs produce BioPlan through compatibility adapter",
+      "status": "complete",
+      "depends_on": [
+        "phase1-value-types",
+        "phase3-block-queue"
+      ],
+      "paths": [
+        "crates/tx-fs/src/bdevfs/mod.rs"
+      ],
+      "verification": [
+        "cargo test -p tx-fs --lib bdevfs -- --nocapture",
+        "cargo test -p tx-subsystems --lib io_manager -- --nocapture",
+        "cargo check -p tx-fs",
+        "cargo check -p tx-subsystems",
+        "rustfmt --edition 2024 --check --config skip_children=true crates/tx-fs/src/bdevfs/mod.rs",
+        "git diff --check -- crates/tx-fs/src/bdevfs/mod.rs crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface docs/progress/plans/2026-07-11-io-manager-phase0-landing.json docs/progress/STATUS.md"
+      ],
+      "notes": "Complete. Added bdevfs-owned plan_page_bio and plan_barrier_bio helpers that map a bdev-fs FsObjectId plus page offset to neutral io_manager::block::BioPlan values. The helpers do not submit to the driver and the existing FsPageBacking fetch/flush/fsync path remains the live compatibility executor."
+    },
+    {
+      "id": "phase5-page-service-compat",
+      "title": "Connect PageContainer miss path to staged L4 queue behind compatibility seam",
+      "status": "complete",
+      "depends_on": [
+        "phase2-page-slot-range",
+        "phase4-bdevfs-plan-adapter"
+      ],
+      "paths": [
+        "crates/tx-subsystems/src/page_backed/",
+        "crates/tx-subsystems/src/io_manager/page/"
+      ],
+      "verification": [
+        "cargo test -p tx-subsystems --lib page_admission_ -- --nocapture",
+        "cargo test -p tx-subsystems --lib page_completion_ -- --nocapture",
+        "cargo test -p tx-subsystems --lib io_manager -- --nocapture",
+        "cargo test -p tx-subsystems --lib page_slot_ -- --nocapture",
+        "cargo test -p tx-subsystems --lib page_backed -- --nocapture",
+        "cargo test -p tx-fs --lib bdevfs -- --nocapture",
+        "cargo check -p tx-subsystems"
+      ],
+      "notes": "Complete for the compatibility-seam phase. The staged L4/L6 path now has PageService admission/completion, BackendPlanner IR dispatch, PageSlot generation checks, owned FileIoBlockRuntime, device-layer BlockDeviceHandle dispatch outside PageContainer locks, an aggregate file-I/O service turn, StepOp wrapper, borrowed and owned service task loops, a device-owned PageContainerFileIoServiceRuntime registry, bdevfs registration on newly materialised coherent PageContainers, and kernel init submission of registered owned runtimes into BOOT_REACTOR. Demand misses still fall back to direct FsPageBacking when no backend planner or no installing planned completion path exists; that fallback is the intended compatibility path for this phase. Ext4 planning and full hot-path deletion remain Phase 6+ work."
+    },
+    {
+      "id": "phase6-ext4-planning",
+      "title": "Refactor ext4 fetch/flush toward PageIoPlan/BioPlan",
+      "status": "pending",
+      "depends_on": [
+        "phase4-bdevfs-plan-adapter",
+        "phase5-page-service-compat"
+      ],
+      "paths": [
+        "crates/tx-ext4/src/"
+      ],
+      "verification": [
+        "cargo test -p tx-ext4 --lib -- --nocapture",
+        "cargo check -p tx-ext4"
+      ],
+      "notes": "Ext4 remains the mapping, metadata, and journal backend. Generic file-data readahead stays in L4/PageContainer."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test -p tx-subsystems --lib io_manager -- --nocapture",
+      "status": "passed",
+      "notes": "Passed 6/6 io_manager-focused tests; tx-subsystems emitted the existing net/execution/step_connect.rs unused guard warning."
+    },
+    {
+      "command": "cargo check -p tx-subsystems",
+      "status": "passed",
+      "notes": "Passed with the existing net/execution/step_connect.rs unused guard warning."
+    },
+    {
+      "command": "git diff --check -- crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface crates/tx-subsystems/src/lib.rs",
+      "status": "passed",
+      "notes": "Scoped whitespace check passed for the code slice."
+    },
+    {
+      "command": "rustfmt --edition 2024 --check crates/tx-subsystems/src/io_manager/mod.rs crates/tx-subsystems/src/io_manager/page/mod.rs crates/tx-subsystems/src/io_manager/block/mod.rs crates/tx-subsystems/src/io_manager/runtime/mod.rs crates/tx-subsystems/src/io_manager/backend/mod.rs crates/tx-subsystems/src/io_manager/backend/plan.rs crates/tx-subsystems/src/fs_iface/mod.rs crates/tx-subsystems/src/fs_iface/plan.rs",
+      "status": "passed",
+      "notes": "Scoped rustfmt check passed for the new files. Full lib.rs formatting is currently blocked by unrelated dirty futex tests using the edition-2024 reserved word `gen`."
+    },
+    {
+      "command": "rg -n \"tx_ext4|tx-ext4|tx_fs|tx-fs|bdevfs|Ext4|Bdev|FsPageBacking|BlockDeviceOps|materialize_file_page|fetch_page|flush_page\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface crates/tx-subsystems/src/lib.rs",
+      "status": "passed",
+      "notes": "Only matched compatibility-path prose in io_manager/mod.rs; no concrete filesystem imports or hot-path call sites were added."
+    },
+    {
+      "command": "cargo xtask progress validate",
+      "status": "passed",
+      "notes": "Passed with 30 progress files after the phase-1 status update."
+    },
+    {
+      "command": "cargo xtask lint docs",
+      "status": "passed",
+      "notes": "Passed with the existing 7 stale-vocabulary warnings."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib page_slot_ -- --nocapture",
+      "status": "passed",
+      "notes": "Passed 3/3 PageSlot-focused tests covering same-page fetch deduplication, stale generation completion rejection, and dirty/writeback/error state transitions."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib range_reservation_ -- --nocapture",
+      "status": "passed",
+      "notes": "Passed 3/3 RangeReservation-focused tests covering overlapping exclusive rejection, shared buffered-read overlap, non-overlap admission, and release-before-yield retry."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib page_backed -- --nocapture",
+      "status": "passed",
+      "notes": "Passed 97/97 page_backed-filtered tests after external Cargo target locks cleared; tx-subsystems emitted the existing net/execution/step_connect.rs unused guard warning."
+    },
+    {
+      "command": "cargo xtask progress validate",
+      "status": "passed",
+      "notes": "Passed with 30 progress files after the phase-2 status update."
+    },
+    {
+      "command": "cargo xtask lint docs",
+      "status": "passed",
+      "notes": "Passed with the existing 7 stale-vocabulary warnings."
+    },
+    {
+      "command": "cargo -q xtask unit",
+      "status": "passed",
+      "notes": "Passed build plus host unit tests for tx-shims, tx-kernel, tx-ext4, and tx-scripts."
+    },
+    {
+      "command": "git diff --check -- crates/tx-subsystems/src/page_backed/mod.rs crates/tx-subsystems/src/page_backed/slot.rs crates/tx-subsystems/src/page_backed/range.rs crates/tx-subsystems/src/page_backed/slot_tests.rs crates/tx-subsystems/src/page_backed/range_tests.rs docs/progress/plans/2026-07-11-io-manager-phase0-landing.json docs/progress/STATUS.md",
+      "status": "passed",
+      "notes": "Scoped whitespace check passed for the phase-2 code and progress files."
+    },
+    {
+      "command": "rg -n \"tx_ext4|tx-ext4|tx_fs|tx-fs|bdevfs|Ext4|Bdev|BlockDeviceOps\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface crates/tx-subsystems/src/page_backed/slot.rs crates/tx-subsystems/src/page_backed/range.rs",
+      "status": "passed",
+      "notes": "Only matched compatibility prose in io_manager/mod.rs; slot.rs and range.rs add no concrete backend imports."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib io_manager::block -- --nocapture",
+      "status": "passed",
+      "notes": "Passed 6/6 block-focused tests covering front/back adjacent LBA merge, queue-depth blocking, tag allocation and completion lookup, pre-dispatch barrier drain, and in-flight barrier fence blocking later dispatch."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib io_manager -- --nocapture",
+      "status": "passed",
+      "notes": "Passed 9/9 io_manager-filtered tests after the phase-3 block queue additions; tx-subsystems emitted the existing net/execution/step_connect.rs unused guard warning."
+    },
+    {
+      "command": "cargo check -p tx-subsystems",
+      "status": "passed",
+      "notes": "Passed after phase-3 block queue additions with the existing net/execution/step_connect.rs unused guard warning."
+    },
+    {
+      "command": "rustfmt --edition 2024 --check crates/tx-subsystems/src/io_manager/block/mod.rs",
+      "status": "passed",
+      "notes": "Scoped rustfmt check passed for the phase-3 block queue code."
+    },
+    {
+      "command": "cargo xtask progress validate",
+      "status": "passed",
+      "notes": "Passed with 30 progress files after the phase-3 status update."
+    },
+    {
+      "command": "cargo xtask lint docs",
+      "status": "passed",
+      "notes": "Passed with the existing 7 stale-vocabulary warnings."
+    },
+    {
+      "command": "git diff --check -- crates/tx-subsystems/src/io_manager/block/mod.rs docs/progress/plans/2026-07-11-io-manager-phase0-landing.json docs/progress/STATUS.md",
+      "status": "passed",
+      "notes": "Scoped whitespace check passed for phase-3 block queue and progress files."
+    },
+    {
+      "command": "cargo -q xtask unit",
+      "status": "passed",
+      "notes": "Passed build plus host unit tests for tx-shims 588/588, tx-kernel 104/104, tx-ext4 9/9, and tx-scripts 56/56."
+    },
+    {
+      "command": "rg -n \"tx_ext4|tx-ext4|tx_fs|tx-fs|bdevfs|Ext4|Bdev|FsPageBacking|BlockDeviceOps|BlockDeviceHandle|read_blocks|write_blocks|barrier\\\\(\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface crates/tx-subsystems/src/page_backed/slot.rs crates/tx-subsystems/src/page_backed/range.rs",
+      "status": "passed",
+      "notes": "Only matched compatibility prose in io_manager/mod.rs; the phase-3 block control plane does not import concrete filesystems or call BlockDeviceHandle/BlockDeviceOps."
+    },
+    {
+      "command": "git diff --check -- docs/progress/research/2026-07-11-io-manager-implementation-readiness.md docs/progress/plans/2026-07-11-io-manager-phase0-landing.json docs/progress/STATUS.md",
+      "status": "passed",
+      "notes": "Scoped whitespace check passed for the preparation slice."
+    },
+    {
+      "command": "cargo test -p tx-fs --lib bdevfs -- --nocapture",
+      "status": "passed",
+      "notes": "Passed 2/2 bdevfs-filtered tests, covering the legacy PageBacking read path and the new BioPlan helper mapping from page offset to LBA without driver submission."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib io_manager -- --nocapture",
+      "status": "passed",
+      "notes": "Passed 9/9 io_manager-filtered tests after the bdev-fs adapter slice; tx-subsystems emitted the existing net/execution/step_connect.rs unused guard warning."
+    },
+    {
+      "command": "cargo check -p tx-fs",
+      "status": "passed",
+      "notes": "Passed with existing warnings in tx-subsystems step_connect and tx-fs tx_ext4_bridge."
+    },
+    {
+      "command": "cargo check -p tx-subsystems",
+      "status": "passed",
+      "notes": "Passed with the existing net/execution/step_connect.rs unused guard warning."
+    },
+    {
+      "command": "rustfmt --edition 2024 --check --config skip_children=true crates/tx-fs/src/bdevfs/mod.rs",
+      "status": "passed",
+      "notes": "Scoped bdevfs formatting check passed without recursively formatting unrelated child modules."
+    },
+    {
+      "command": "rg -n \"tx_fs|tx-fs|bdevfs|tx_ext4|tx-ext4|Ext4|Bdev\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface",
+      "status": "passed",
+      "notes": "No matches; io_manager and fs_iface still do not import concrete filesystem backends."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib page_completion_ -- --nocapture",
+      "status": "passed",
+      "notes": "Passed 2/2 new L4 completion tests covering matching-generation read installation and stale-generation rejection before frame publication."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib page_admission_ -- --nocapture",
+      "status": "passed",
+      "notes": "Passed 4/4 new L4 admission tests covering owned demand-read enqueue with generation hint, same-slot join without duplicate request, resident no-op admission, and queue-full rejection without claiming an empty slot."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib io_manager -- --nocapture",
+      "status": "passed",
+      "notes": "Passed 15/15 io_manager-filtered tests after adding io_manager::page::admission and io_manager::page::completion."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib page_slot_ -- --nocapture",
+      "status": "passed",
+      "notes": "Passed 3/3 PageSlot-focused tests, preserving the slot-side generation and dirty/writeback semantics used by the completion helper."
+    },
+    {
+      "command": "cargo check -p tx-subsystems",
+      "status": "passed",
+      "notes": "Passed with the existing net/execution/step_connect.rs unused guard warning after the Phase-5 partial completion helper slice."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib page_service_drive_ -- --nocapture",
+      "status": "passed",
+      "notes": "Passed 3/3 PageService scheduling-shape tests covering Runnable when budget leaves backlog, Sleeping after draining all work, and Sleeping without work."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib page_service_ -- --nocapture",
+      "status": "passed",
+      "notes": "Passed 8/8 PageService-focused tests, including completion-first turns, budget-preserved backlog, waiter routing, and Runnable/Sleeping scheduling state."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib io_manager -- --nocapture",
+      "status": "passed",
+      "notes": "Passed 24/24 io_manager-filtered tests after the PageService scheduling slice."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib page_backed -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 99/99 page_backed-filtered tests, including the L4 shadow queue and route-gated PageReady notify witnesses."
+    },
+    {
+      "command": "cargo check -p tx-subsystems",
+      "status": "passed",
+      "notes": "Passed with the existing net/execution/step_connect.rs unused guard warning."
+    },
+    {
+      "command": "rustfmt --edition 2024 --check --config skip_children=true crates/tx-subsystems/src/io_manager/mod.rs crates/tx-subsystems/src/io_manager/page/service.rs crates/tx-subsystems/src/page_backed/mod.rs crates/tx-subsystems/src/page_backed/core_tests.rs crates/tx-subsystems/src/wait_source.rs",
+      "status": "passed",
+      "notes": "Scoped formatting check passed for the touched PageService/PageBacked files."
+    },
+    {
+      "command": "rg -n \"tx_fs|tx-fs|bdevfs|tx_ext4|tx-ext4|Ext4|Bdev|FsPageBacking|BlockDeviceHandle|read_blocks|write_blocks|barrier\\\\(\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface",
+      "status": "passed",
+      "notes": "Only matched compatibility prose in io_manager/mod.rs; no concrete filesystem or block-device executor calls were added to io_manager/fs_iface."
+    },
+    {
+      "command": "git diff --check -- crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface crates/tx-subsystems/src/page_backed/mod.rs crates/tx-subsystems/src/page_backed/core_tests.rs crates/tx-subsystems/src/wait_source.rs docs/progress/STATUS.md docs/progress/plans/2026-07-11-io-manager-phase0-landing.json",
+      "status": "passed",
+      "notes": "Scoped whitespace check passed for the code and progress files touched by this scheduling slice."
+    },
+    {
+      "command": "cargo xtask progress validate",
+      "status": "passed",
+      "notes": "Passed with 30 progress files after marking the I/O manager landing plan active."
+    },
+    {
+      "command": "cargo xtask lint docs",
+      "status": "passed",
+      "notes": "Passed with the existing 7 stale-vocabulary warnings."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib page_service_ -- --nocapture",
+      "status": "passed",
+      "notes": "Passed 11/11 PageService-focused tests after adding wake-aware submit/completion admission; RED first failed on missing submit_with_wake, push_completion_with_wake, and PageServiceWake."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib io_manager -- --nocapture",
+      "status": "passed",
+      "notes": "Passed 27/27 io_manager-filtered tests after the wake-decision slice."
+    },
+    {
+      "command": "cargo check -p tx-subsystems",
+      "status": "passed",
+      "notes": "Passed with the existing net/execution/step_connect.rs unused guard warning."
+    },
+    {
+      "command": "rustfmt --edition 2024 --check --config skip_children=true crates/tx-subsystems/src/io_manager/page/service.rs",
+      "status": "passed",
+      "notes": "Scoped formatting check passed for the PageService wake-decision code."
+    },
+    {
+      "command": "rg -n \"tx_fs|tx-fs|bdevfs|tx_ext4|tx-ext4|Ext4|Bdev|FsPageBacking|BlockDeviceHandle|read_blocks|write_blocks|barrier\\\\(\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface",
+      "status": "passed",
+      "notes": "Only matched compatibility prose in io_manager/mod.rs; wake-decision modeling did not add concrete filesystem or device executor dependencies."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib page_service_ -- --nocapture",
+      "status": "passed",
+      "notes": "Passed 14/14 PageService-focused tests after adding neutral ServiceKick injection; RED first failed on missing IoServiceKind, ServiceKick, submit_with_kick, and push_completion_with_kick."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib io_manager -- --nocapture",
+      "status": "passed",
+      "notes": "Passed 30/30 io_manager-filtered tests after the runtime kick slice."
+    },
+    {
+      "command": "cargo check -p tx-subsystems",
+      "status": "passed",
+      "notes": "Passed with the existing net/execution/step_connect.rs unused guard warning."
+    },
+    {
+      "command": "rustfmt --edition 2024 --check --config skip_children=true crates/tx-subsystems/src/io_manager/runtime/mod.rs crates/tx-subsystems/src/io_manager/page/service.rs",
+      "status": "passed",
+      "notes": "Scoped formatting check passed for runtime kick and PageService code."
+    },
+    {
+      "command": "rg -n \"tx_fs|tx-fs|bdevfs|tx_ext4|tx-ext4|Ext4|Bdev|FsPageBacking|BlockDeviceHandle|read_blocks|write_blocks|barrier\\\\(\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface",
+      "status": "passed",
+      "notes": "Only matched compatibility prose in io_manager/mod.rs; ServiceKick modeling did not add concrete filesystem or device executor dependencies."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib backend_plan_dispatch -- --nocapture",
+      "status": "passed",
+      "notes": "Passed 3/3 backend-dispatch tests after adding BackendDispatch and dispatch_backend_plan; RED first failed on missing dispatch_backend_plan and BackendDispatch."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib io_manager -- --nocapture",
+      "status": "passed",
+      "notes": "Passed 33/33 io_manager-filtered tests after the L5 backend-dispatch slice."
+    },
+    {
+      "command": "cargo check -p tx-subsystems",
+      "status": "passed",
+      "notes": "Passed with the existing net/execution/step_connect.rs unused guard warning."
+    },
+    {
+      "command": "rustfmt --edition 2024 --check --config skip_children=true crates/tx-subsystems/src/io_manager/backend/plan.rs crates/tx-subsystems/src/fs_iface/plan.rs",
+      "status": "passed",
+      "notes": "Scoped formatting check passed for backend dispatch and neutral plan values."
+    },
+    {
+      "command": "rg -n \"tx_fs|tx-fs|bdevfs|tx_ext4|tx-ext4|Ext4|Bdev|FsPageBacking|BlockDeviceHandle|read_blocks|write_blocks|barrier\\\\(\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface",
+      "status": "passed",
+      "notes": "Only matched compatibility prose in io_manager/mod.rs; backend dispatch did not add concrete filesystem or device executor dependencies."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib service_wake_source -- --nocapture",
+      "status": "passed",
+      "notes": "Passed 2/2 ServiceWakeSource tests after adding io_manager-local service_wake adapter; RED first failed on missing adapter, ServiceWakeSource, and IoServiceKind::mask_bits."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib io_manager -- --nocapture",
+      "status": "passed",
+      "notes": "Passed 35/35 io_manager-filtered tests after binding ServiceKick to mailbox-backed ServiceWakeSource."
+    },
+    {
+      "command": "cargo check -p tx-subsystems",
+      "status": "passed",
+      "notes": "Passed with the existing net/execution/step_connect.rs unused guard warning."
+    },
+    {
+      "command": "rustfmt --edition 2024 --check --config skip_children=true crates/tx-subsystems/src/io_manager/adapter.rs crates/tx-subsystems/src/io_manager/mod.rs crates/tx-subsystems/src/io_manager/runtime/mod.rs",
+      "status": "passed",
+      "notes": "Scoped formatting check passed for the io_manager service-wake adapter and runtime wrapper."
+    },
+    {
+      "command": "rg -n \"tx_substrate|tx_reactor\" crates/tx-subsystems/src/io_manager",
+      "status": "passed",
+      "notes": "Raw substrate references are confined to crates/tx-subsystems/src/io_manager/adapter.rs; no raw reactor references were added."
+    },
+    {
+      "command": "rg -n \"tx_fs|tx-fs|bdevfs|tx_ext4|tx-ext4|Ext4|Bdev|FsPageBacking|BlockDeviceHandle|read_blocks|write_blocks|barrier\\\\(\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface",
+      "status": "passed",
+      "notes": "Only matched compatibility prose in io_manager/mod.rs; service wake source binding did not add concrete filesystem or device executor dependencies."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib page_service_driver_ -- --nocapture",
+      "status": "passed",
+      "notes": "Passed 2/2 PageServiceDriver tests after adding one-turn driver skeleton; RED first failed on missing PageServiceDriver."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib page_service_ -- --nocapture",
+      "status": "passed",
+      "notes": "Passed 16/16 PageService-focused tests after adding the one-turn driver skeleton."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib io_manager -- --nocapture",
+      "status": "passed",
+      "notes": "Passed 37/37 io_manager-filtered tests after adding PageServiceDriver."
+    },
+    {
+      "command": "cargo check -p tx-subsystems",
+      "status": "passed",
+      "notes": "Passed with the existing net/execution/step_connect.rs unused guard warning."
+    },
+    {
+      "command": "rustfmt --edition 2024 --check --config skip_children=true crates/tx-subsystems/src/io_manager/page/service.rs",
+      "status": "passed",
+      "notes": "Scoped formatting check passed for PageServiceDriver."
+    },
+    {
+      "command": "rg -n \"tx_substrate|tx_reactor\" crates/tx-subsystems/src/io_manager",
+      "status": "passed",
+      "notes": "Raw substrate references remain confined to crates/tx-subsystems/src/io_manager/adapter.rs; PageServiceDriver added no raw reactor references."
+    },
+    {
+      "command": "rg -n \"tx_fs|tx-fs|bdevfs|tx_ext4|tx-ext4|Ext4|Bdev|FsPageBacking|BlockDeviceHandle|read_blocks|write_blocks|barrier\\\\(\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface",
+      "status": "passed",
+      "notes": "Only matched compatibility prose in io_manager/mod.rs; PageServiceDriver did not add concrete filesystem or device executor dependencies."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib backend_planner -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 2/2 neutral BackendPlanner seam tests after RED first failed on missing BackendPlanner, BackendPageRequest, FsObjectKey, and plan_backend_request."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib io_manager -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 39/39 io_manager-filtered tests after adding the neutral planner invocation seam."
+    },
+    {
+      "command": "rustfmt --edition 2024 --check --config skip_children=true crates/tx-subsystems/src/io_manager/backend/plan.rs crates/tx-subsystems/src/io_manager/backend/mod.rs crates/tx-subsystems/src/fs_iface/plan.rs crates/tx-subsystems/src/fs_iface/mod.rs",
+      "status": "passed",
+      "notes": "Scoped formatting check passed for the touched backend and fs_iface files."
+    },
+    {
+      "command": "cargo check -p tx-subsystems",
+      "status": "passed",
+      "notes": "Passed with the existing net/execution/step_connect.rs unused guard warning."
+    },
+    {
+      "command": "rg -n \"tx_fs|tx-fs|bdevfs|tx_ext4|tx-ext4|Ext4|Bdev|FsPageBacking|BlockDeviceHandle|read_blocks|write_blocks|barrier\\\\(\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface",
+      "status": "passed",
+      "notes": "Only matched compatibility prose in io_manager/mod.rs; BackendPlanner seam did not add concrete filesystem or device executor dependencies."
+    },
+    {
+      "command": "rg -n \"tx_substrate|tx_reactor\" crates/tx-subsystems/src/io_manager",
+      "status": "passed",
+      "notes": "Raw substrate references remain confined to crates/tx-subsystems/src/io_manager/adapter.rs; no raw reactor references were added."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib mount_payload_hosts_optional_backend_planner -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 1/1 MountPayload planner-hosting test after RED first failed on missing new_cap_with_backend_planner and backend_planner, then exposed the required Send + Sync + 'static BackendPlanner bound."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib mount_payload_default_constructor_keeps_backend_planner_absent -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 1/1 compatibility-constructor test proving old MountPayload::new_cap leaves the planner slot absent."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib mount_payload_ -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 5/5 MountPayload-filtered tests after adding the optional planner slot."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib backend_planner -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 4/4 backend-planner-filtered tests covering both io_manager planner dispatch and MountPayload planner hosting."
+    },
+    {
+      "command": "rustfmt --edition 2024 --check --config skip_children=true crates/tx-subsystems/src/mount/mod.rs crates/tx-subsystems/src/fs_iface/plan.rs",
+      "status": "passed",
+      "notes": "Scoped formatting check passed for MountPayload and BackendPlanner trait updates."
+    },
+    {
+      "command": "cargo check -p tx-subsystems",
+      "status": "passed",
+      "notes": "Passed with the existing net/execution/step_connect.rs unused guard warning."
+    },
+    {
+      "command": "rg -n \"tx_fs|tx-fs|bdevfs|tx_ext4|tx-ext4|Ext4|Bdev|BlockDeviceHandle|read_blocks|write_blocks|barrier\\\\(\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface crates/tx-subsystems/src/mount/mod.rs",
+      "status": "passed",
+      "notes": "Only matched a create_filesystem comment in mount/mod.rs; no concrete filesystem or block-device executor dependencies were added."
+    },
+    {
+      "command": "rg -n \"tx_substrate|tx_reactor\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface crates/tx-subsystems/src/mount/mod.rs",
+      "status": "passed",
+      "notes": "Raw substrate references remain confined to io_manager/adapter.rs plus an existing mount/mod.rs comment; no raw reactor references were added."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib page_service_submission_work_preserves_full_request_metadata -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 1/1 request-preserving PageServiceWork test after RED first failed because the old Submission variant accepted only pc, range, and op."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib page_service_ -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 17/17 PageService-focused tests after changing submission work to carry the full PageIoRequest."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib backend_planner -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 4/4 backend-planner-filtered tests after the PageServiceWork shape change."
+    },
+    {
+      "command": "rustfmt --edition 2024 --check --config skip_children=true crates/tx-subsystems/src/io_manager/page/service.rs",
+      "status": "passed",
+      "notes": "Scoped formatting check passed for PageServiceWork request-preserving shape."
+    },
+    {
+      "command": "cargo check -p tx-subsystems",
+      "status": "passed",
+      "notes": "Passed with the existing net/execution/step_connect.rs unused guard warning."
+    },
+    {
+      "command": "rg -n \"tx_fs|tx-fs|bdevfs|tx_ext4|tx-ext4|Ext4|Bdev|BlockDeviceHandle|read_blocks|write_blocks|barrier\\\\(\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface crates/tx-subsystems/src/mount/mod.rs",
+      "status": "passed",
+      "notes": "Only matched a create_filesystem comment in mount/mod.rs; the PageServiceWork shape change added no concrete filesystem or block-device executor dependencies."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib mount_payload_plans_page_service_submission_through_backend_planner -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 1/1 service-submission-to-MountPayload-planner test after RED first failed on missing plan_backend_page_request."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib mount_payload_ -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 6/6 MountPayload-filtered tests after adding plan_backend_page_request."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib backend_planner -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 5/5 backend-planner-filtered tests after adding BackendPageRequest::from_page_io_request and MountPayload::plan_backend_page_request."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib page_service_ -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 18/18 PageService-focused tests after wiring the MountPayload planner invocation witness."
+    },
+    {
+      "command": "rustfmt --edition 2024 --check --config skip_children=true crates/tx-subsystems/src/mount/mod.rs crates/tx-subsystems/src/fs_iface/plan.rs crates/tx-subsystems/src/io_manager/page/service.rs",
+      "status": "passed",
+      "notes": "Scoped formatting check passed for the planner invocation seam."
+    },
+    {
+      "command": "cargo check -p tx-subsystems",
+      "status": "passed",
+      "notes": "Passed with the existing net/execution/step_connect.rs unused guard warning."
+    },
+    {
+      "command": "rg -n \"tx_fs|tx-fs|bdevfs|tx_ext4|tx-ext4|Ext4|Bdev|BlockDeviceHandle|read_blocks|write_blocks|barrier\\\\(\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface crates/tx-subsystems/src/mount/mod.rs",
+      "status": "passed",
+      "notes": "Only matched a create_filesystem comment in mount/mod.rs; no concrete filesystem or block-device executor dependencies were added."
+    },
+    {
+      "command": "rg -n \"tx_substrate|tx_reactor\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface crates/tx-subsystems/src/mount/mod.rs",
+      "status": "passed",
+      "notes": "Raw substrate references remain confined to io_manager/adapter.rs plus an existing mount/mod.rs comment; no raw reactor references were added."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib page_service_consumes_backend_page_completions_into_l4_queue -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 1/1 backend-dispatch-consumption witness after RED first failed on missing consume_backend_dispatch, PageServiceBackendOutcome, and backend facade re-exports."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib page_service_ -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 21/21 PageService-focused tests after adding BackendDispatch consumption."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib backend_plan_dispatch -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 3/3 backend dispatch tests after exporting BackendDispatch and PageIoCompletionList through the backend facade."
+    },
+    {
+      "command": "cargo test -p tx-subsystems --lib backend_planner -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 5/5 backend planner tests after BackendDispatch consumption remained compatible with the mount-hosted planner seam."
+    },
+    {
+      "command": "timeout 20s cargo test -p tx-subsystems --lib page_service_submission_plans_dispatches_and_queues_page_completion -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 1/1 planner-to-L4-completion helper test; RED first failed on missing consume_backend_submission and PageServiceBackendSubmitOutcome, then the in-turn wake expectation was corrected to AlreadyRunnable."
+    },
+    {
+      "command": "timeout 20s cargo test -p tx-subsystems --lib page_service_submission_feeds_backend_bios_into_l6_block_queue -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 1/1 planner-to-L6 helper test proving SubmitBios is admitted into BlockQueue without driver submission."
+    },
+    {
+      "command": "timeout 60s cargo test -p tx-subsystems --lib page_service_ -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 23/23 PageService-focused tests after adding consume_backend_submission and L6 queue admission."
+    },
+    {
+      "command": "timeout 60s cargo test -p tx-subsystems --lib backend_plan_dispatch -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 3/3 backend dispatch tests after re-exporting dispatch_backend_plan through io_manager::backend."
+    },
+    {
+      "command": "timeout 60s cargo test -p tx-subsystems --lib backend_planner -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 5/5 backend planner tests after the PageService helper consumed neutral BackendPlanner output."
+    },
+    {
+      "command": "rustfmt --edition 2024 --check --config skip_children=true crates/tx-subsystems/src/io_manager/page/service.rs crates/tx-subsystems/src/io_manager/backend/mod.rs",
+      "status": "passed",
+      "notes": "Scoped formatting check passed for the planner-to-L6 helper and backend facade export."
+    },
+    {
+      "command": "cargo check -p tx-subsystems",
+      "status": "passed",
+      "notes": "Passed with the existing net/execution/step_connect.rs unused guard warning."
+    },
+    {
+      "command": "rg -n \"tx_fs|tx-fs|bdevfs|tx_ext4|tx-ext4|Ext4|Bdev|FsPageBacking|BlockDeviceHandle|BlockDeviceOps|read_blocks|write_blocks|barrier\\\\(\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface",
+      "status": "passed",
+      "notes": "Only matched compatibility-path prose in io_manager/mod.rs; no concrete filesystem or block-device executor dependencies were added."
+    },
+    {
+      "command": "rg -n \"tx_substrate|tx_reactor\" crates/tx-subsystems/src/io_manager",
+      "status": "passed",
+      "notes": "Raw substrate references remain confined to io_manager/adapter.rs; no raw reactor references were added."
+    },
+    {
+      "command": "timeout 30s cargo test -p tx-subsystems --lib page_service_driver_plans_submission_and_rekicks_for_queued_completion -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 1/1 service-driver backend-context test proving a drained submission can be planned into an L4 completion and re-kick page service for the queued completion."
+    },
+    {
+      "command": "timeout 30s cargo test -p tx-subsystems --lib page_service_driver_returns_unplanned_submission_for_compatibility_path -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 1/1 compatibility fallback test proving unplanned submissions are returned to the caller instead of being dropped or driver-submitted."
+    },
+    {
+      "command": "timeout 60s cargo test -p tx-subsystems --lib page_service_ -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 25/25 PageService-focused tests after adding PageServiceBackendContext, PageServiceDrivenWork, and PageServiceDriver::drive_once_with_backend."
+    },
+    {
+      "command": "timeout 60s cargo test -p tx-subsystems --lib backend_planner -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 5/5 backend-planner tests after the service-driver context slice."
+    },
+    {
+      "command": "timeout 60s cargo test -p tx-subsystems --lib backend_plan_dispatch -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 3/3 backend-dispatch tests after the service-driver context slice."
+    },
+    {
+      "command": "rustfmt --edition 2024 --check --config skip_children=true crates/tx-subsystems/src/io_manager/page/service.rs crates/tx-subsystems/src/io_manager/backend/mod.rs",
+      "status": "passed",
+      "notes": "Scoped formatting check passed for the service-driver context slice."
+    },
+    {
+      "command": "cargo check -p tx-subsystems",
+      "status": "passed",
+      "notes": "Passed with the existing net/execution/step_connect.rs unused guard warning."
+    },
+    {
+      "command": "rg -n \"tx_fs|tx-fs|bdevfs|tx_ext4|tx-ext4|Ext4|Bdev|FsPageBacking|BlockDeviceHandle|BlockDeviceOps|read_blocks|write_blocks|barrier\\\\(\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface",
+      "status": "passed",
+      "notes": "Only matched compatibility-path prose in io_manager/mod.rs; no concrete filesystem or block-device executor dependencies were added."
+    },
+    {
+      "command": "rg -n \"tx_substrate|tx_reactor\" crates/tx-subsystems/src/io_manager",
+      "status": "passed",
+      "notes": "Raw substrate references remain confined to io_manager/adapter.rs; no raw reactor references were added."
+    },
+    {
+      "command": "timeout 60s cargo test -p tx-subsystems --lib mount_payload_backend_context_drives_page_service_submission -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 1/1 MountPayloadBackendContext driver test after RED first failed on missing MountPayloadBackendContext."
+    },
+    {
+      "command": "timeout 60s cargo test -p tx-subsystems --lib mount_payload_backend_context_returns_none_without_planner -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 1/1 mount compatibility fallback test proving mounts without BackendPlanner return UnplannedSubmission."
+    },
+    {
+      "command": "timeout 90s cargo test -p tx-subsystems --lib mount_payload_ -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 8/8 MountPayload-filtered tests after adding MountPayloadBackendContext."
+    },
+    {
+      "command": "timeout 60s cargo test -p tx-subsystems --lib page_service_ -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 26/26 PageService-filtered tests after the mount-backed context adapter."
+    },
+    {
+      "command": "timeout 60s cargo test -p tx-subsystems --lib backend_planner -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 5/5 backend-planner tests after the mount-backed context adapter."
+    },
+    {
+      "command": "rustfmt --edition 2024 --check --config skip_children=true crates/tx-subsystems/src/mount/mod.rs crates/tx-subsystems/src/io_manager/page/service.rs crates/tx-subsystems/src/io_manager/backend/mod.rs",
+      "status": "passed",
+      "notes": "Scoped formatting check passed for mount, page service, and backend files touched by this adapter slice."
+    },
+    {
+      "command": "cargo check -p tx-subsystems",
+      "status": "passed",
+      "notes": "Passed with the existing net/execution/step_connect.rs unused guard warning."
+    },
+    {
+      "command": "rg -n \"tx_fs|tx-fs|bdevfs|tx_ext4|tx-ext4|Ext4|Bdev|BlockDeviceHandle|BlockDeviceOps|read_blocks|write_blocks|barrier\\\\(\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface crates/tx-subsystems/src/mount/mod.rs",
+      "status": "passed",
+      "notes": "Only matched compatibility prose in io_manager/mod.rs and an existing mount comment; no concrete filesystem or block-device executor dependency was added."
+    },
+    {
+      "command": "rg -n \"tx_substrate|tx_reactor\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface crates/tx-subsystems/src/mount/mod.rs",
+      "status": "passed",
+      "notes": "Raw substrate references remain confined to io_manager/adapter.rs plus an existing mount comment; no raw reactor references were added."
+    },
+    {
+      "command": "timeout 60s cargo test -p tx-subsystems --lib backend_plan_dispatch -- --test-threads=1",
+      "status": "failed",
+      "notes": "Rerun timed out after the test harness started; backend dispatch code was not changed in this slice, and page_service/backend_planner/mount filters passed."
+    },
+    {
+      "command": "timeout 120s cargo test -p tx-subsystems --lib file_page_container_builds_mount_payload_backend_context -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 1/1 PageContainer backend-context bridge test after RED first failed on missing file_backend_context."
+    },
+    {
+      "command": "rustfmt --edition 2024 --check --config skip_children=true crates/tx-subsystems/src/page_backed/mod.rs crates/tx-subsystems/src/page_backed/core_tests.rs crates/tx-subsystems/src/mount/mod.rs crates/tx-subsystems/src/io_manager/page/service.rs",
+      "status": "passed",
+      "notes": "Scoped formatting check passed for the PageContainer backend-context bridge slice."
+    },
+    {
+      "command": "git diff --check -- crates/tx-subsystems/src/page_backed/mod.rs crates/tx-subsystems/src/page_backed/core_tests.rs crates/tx-subsystems/src/mount/mod.rs crates/tx-subsystems/src/io_manager/page/service.rs",
+      "status": "passed",
+      "notes": "Scoped whitespace check passed for code files touched by this slice."
+    },
+    {
+      "command": "rg -n \"tx_fs|tx-fs|bdevfs|tx_ext4|tx-ext4|Ext4|Bdev|BlockDeviceHandle|BlockDeviceOps|read_blocks|write_blocks|barrier\\\\(\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface crates/tx-subsystems/src/mount/mod.rs crates/tx-subsystems/src/page_backed/mod.rs",
+      "status": "passed",
+      "notes": "Only matched compatibility-path comments in io_manager/mod.rs and mount/mod.rs; no concrete filesystem or driver dependency was added."
+    },
+    {
+      "command": "rg -n \"tx_substrate|tx_reactor\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface crates/tx-subsystems/src/mount/mod.rs crates/tx-subsystems/src/page_backed/mod.rs",
+      "status": "passed",
+      "notes": "Raw substrate references remain in existing io_manager adapter and page_backed substrate-facing state; no raw reactor references were added."
+    },
+    {
+      "command": "timeout 60s cargo test -p tx-subsystems --lib non_file_page_container_has_no_backend_context -- --test-threads=1",
+      "status": "failed",
+      "notes": "Timed out after test harness/build-lock churn in the dirty checkout; the positive file-backed context test passed and this fallback path is still covered by static review."
+    },
+    {
+      "command": "timeout 180s cargo check -p tx-subsystems",
+      "status": "failed",
+      "notes": "Timed out during dependency rebuild before reaching tx-subsystems completion; earlier cargo check gates passed before this dirty-checkout rebuild churn."
+    },
+    {
+      "command": "timeout 120s cargo test -p tx-subsystems --lib io_manager -- --nocapture --test-threads=1",
+      "status": "failed",
+      "notes": "Timed out after the test harness started without printing individual results; narrower page_service_, backend_plan_dispatch, and backend_planner filters passed and cover this slice."
+    },
+    {
+      "command": "timeout 240s cargo test -p tx-subsystems --lib page_service_routes_backend_frame_ref_with_completion -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 1/1 frame side-car routing test after RED first failed on missing PageFrameRef, PageCompletion::with_frame_ref, PageIoCompletionList::from_page_completions, PageCompletionRoute.frame, and PageService::push_page_completion."
+    },
+    {
+      "command": "timeout 240s cargo test -p tx-subsystems --lib file_page_service_completion_installs_planned_read_frame -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 1/1 PageBacked planned-read install test proving a frame side-car completion installs into PageContainer and completes the matching PageSlot generation as Resident."
+    },
+    {
+      "command": "timeout 240s cargo test -p tx-subsystems --lib page_service_ -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 30/30 after adding PageIoCompletionEntry side-cars and PageCompletionRoute.frame."
+    },
+    {
+      "command": "timeout 300s cargo check -p tx-subsystems",
+      "status": "passed",
+      "notes": "Passed with the existing net/execution/step_connect.rs unused guard warning after the frame side-car completion slice."
+    },
+    {
+      "command": "cargo -q xtask unit",
+      "status": "skipped",
+      "notes": "Started after focused verification but interrupted after more than four minutes of no output in the very dirty workspace; no pass/fail result was available."
+    },
+    {
+      "command": "timeout 480s cargo test -p tx-subsystems --lib page_service_submission_feeds_backend_bios_into_l6_block_queue -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 1/1 after BlockBiosQueued and MetadataFirstQueued were changed to retain the original PageIoRequest metadata."
+    },
+    {
+      "command": "timeout 480s cargo test -p tx-subsystems --lib page_service_ -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 30/30 after the request-retaining L6 queued-outcome shape change."
+    },
+    {
+      "command": "timeout 480s cargo test -p tx-subsystems --lib io_manager -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 49/49 after the request-retaining L6 queued-outcome shape change."
+    },
+    {
+      "command": "timeout 480s cargo check -p tx-subsystems",
+      "status": "passed",
+      "notes": "Passed with the existing net/execution/step_connect.rs unused guard warning."
+    },
+    {
+      "command": "timeout 240s cargo test -p tx-subsystems --lib block_completion_bridge_ -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 2/2 after RED first failed on missing BlockPageCompletion and BlockPageCompletionError; covers read success with frame and read success without frame rejection."
+    },
+    {
+      "command": "timeout 240s cargo test -p tx-subsystems --lib backend_facade_reexports_block_completion_bridge -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 1/1 after RED first failed because io_manager::backend did not re-export the bridge error type."
+    },
+    {
+      "command": "timeout 480s cargo test -p tx-subsystems --lib io_manager -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 52/52 after adding the neutral L6-to-L4 BlockPageCompletion bridge."
+    },
+    {
+      "command": "timeout 480s cargo check -p tx-subsystems",
+      "status": "passed",
+      "notes": "Passed with the existing net/execution/step_connect.rs unused guard warning after the completion-bridge slice."
+    },
+    {
+      "command": "timeout 240s cargo test -p tx-subsystems --lib page_service_queues_block_page_completion_bridge_output -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 1/1 after RED first failed on missing PageService::push_block_page_completion."
+    },
+    {
+      "command": "timeout 480s cargo test -p tx-subsystems --lib page_service_ -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 31/31 after adding the PageService block-completion ingress."
+    },
+    {
+      "command": "timeout 480s cargo test -p tx-subsystems --lib io_manager -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 53/53 after adding the PageService block-completion ingress."
+    },
+    {
+      "command": "timeout 480s cargo check -p tx-subsystems",
+      "status": "passed",
+      "notes": "Passed with the existing net/execution/step_connect.rs unused guard warning after the PageService block-completion ingress slice."
+    },
+    {
+      "command": "timeout 240s cargo test -p tx-subsystems --lib block_page_request_tracker_ -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 2/2 after RED first failed on missing BlockPageRequestTracker; covers single queued request restoration and merged BlockRequestId fanout."
+    },
+    {
+      "command": "timeout 240s cargo test -p tx-subsystems --lib backend_facade_reexports_block_completion_bridge -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 1/1 after adding BlockPageRequestTracker facade re-export."
+    },
+    {
+      "command": "timeout 480s cargo test -p tx-subsystems --lib io_manager -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 55/55 after adding the neutral BlockPageRequestTracker."
+    },
+    {
+      "command": "timeout 480s cargo check -p tx-subsystems",
+      "status": "passed",
+      "notes": "Passed with the existing net/execution/step_connect.rs unused guard warning after the tracker slice."
+    },
+    {
+      "command": "timeout 240s cargo test -p tx-subsystems --lib page_service_routes_tagged_l6_completion_into_l4_queue -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 1/1 after RED first failed on missing PageService::push_tagged_block_completion; covers BlockTagTable completion, QueueDepth accounting, tracker fan-back, frame resolver, and L4 completion queueing."
+    },
+    {
+      "command": "timeout 480s cargo test -p tx-subsystems --lib page_service_ -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 34/34 after adding the tagged L6 completion ingress helper."
+    },
+    {
+      "command": "timeout 480s cargo test -p tx-subsystems --lib io_manager -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 58/58 after adding the tagged L6 completion ingress helper."
+    },
+    {
+      "command": "timeout 480s cargo check -p tx-subsystems",
+      "status": "passed",
+      "notes": "Passed with the existing net/execution/step_connect.rs unused guard warning after the tagged L6 completion ingress helper."
+    },
+    {
+      "command": "timeout 240s cargo test -p tx-subsystems --lib block_service_ -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 2/2 after RED first failed on missing BlockServiceDriver, BlockServiceStep, and BlockServiceNext; covers budgeted tagged dispatch plus depth-blocked waiting."
+    },
+    {
+      "command": "timeout 240s cargo test -p tx-subsystems --lib io_manager::block -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 8/8 after adding the neutral L6 BlockServiceDriver turn."
+    },
+    {
+      "command": "timeout 480s cargo test -p tx-subsystems --lib io_manager -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 60/60 after adding the neutral L6 BlockServiceDriver turn."
+    },
+    {
+      "command": "timeout 480s cargo check -p tx-subsystems",
+      "status": "passed",
+      "notes": "Passed with the existing net/execution/step_connect.rs unused guard warning after the L6 BlockServiceDriver turn."
+    },
+    {
+      "command": "timeout 240s cargo test -p tx-subsystems --lib block_service_submits_dispatches_to_executor_port -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 1/1 after RED first failed on missing BlockDispatchExecutor; covers handing BlockDispatch values to the neutral L7 executor port."
+    },
+    {
+      "command": "timeout 240s cargo test -p tx-subsystems --lib block_tag_table_completes_polled_device_completion -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 1/1 after RED first failed on missing BlockDeviceCompletion and BlockCompletionSource; covers polled tag/result completion through BlockTagTable with QueueDepth accounting."
+    },
+    {
+      "command": "timeout 480s cargo test -p tx-subsystems --lib io_manager::block -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 10/10 after adding the neutral L6/L7 executor and completion-source seam."
+    },
+    {
+      "command": "timeout 480s cargo test -p tx-subsystems --lib io_manager -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 62/62 after adding the neutral L6/L7 executor and completion-source seam."
+    },
+    {
+      "command": "timeout 480s cargo check -p tx-subsystems",
+      "status": "passed",
+      "notes": "Passed with the existing net/execution/step_connect.rs unused guard warning after restoring the narrow tx-observe l2_producer runtime re-export needed by the current dirty tree."
+    },
+    {
+      "command": "timeout 240s cargo test -p tx-subsystems --lib block_device_dispatch_adapter_ -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 2/2 for the device-side compatibility adapter. BlockDeviceDispatchAdapter stays in device.rs because it uses BlockDeviceHandle, Frame, and Guard; io_manager::block remains neutral."
+    },
+    {
+      "command": "timeout 240s cargo test -p tx-subsystems --lib io_manager::block -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 10/10 after adding the device-side adapter, confirming the neutral L6 block queue/tag/barrier seam still compiles and tests without importing device execution."
+    },
+    {
+      "command": "timeout 480s cargo test -p tx-subsystems --lib io_manager -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 62/62 after adding the device-side adapter; page/backend/block/runtime value and service tests remain green."
+    },
+    {
+      "command": "timeout 480s cargo check -p tx-subsystems",
+      "status": "passed",
+      "notes": "Passed after adding the device-side adapter with the existing net/execution/step_connect.rs unused guard warning."
+    },
+    {
+      "command": "rustfmt --edition 2024 --check --config skip_children=true crates/tx-subsystems/src/device.rs crates/tx-subsystems/src/io_manager/block/mod.rs crates/tx-observe/src/l2_producer/mod.rs crates/tx-observe/src/l2_producer/dump.rs crates/tx-observe/src/l2_producer/runtime.rs",
+      "status": "passed",
+      "notes": "Passed after formatting import-order drift in the touched device and tx-observe files."
+    },
+    {
+      "command": "rg -n \"tx_ext4|tx-ext4|tx_fs|tx-fs|bdevfs|Ext4|Bdev|FsPageBacking|BlockDeviceOps|BlockDeviceHandle|read_blocks|write_blocks|barrier\\\\(\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface",
+      "status": "passed",
+      "notes": "Only matched compatibility prose in io_manager/mod.rs; the adapter did not move BlockDeviceHandle or concrete backend calls into io_manager/fs_iface."
+    },
+    {
+      "command": "rg -n \"tx_substrate::|tx_reactor::\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface",
+      "status": "passed",
+      "notes": "Only matched the existing io_manager/adapter.rs substrate boundary."
+    },
+    {
+      "command": "timeout 240s cargo test -p tx-subsystems --lib block_device_service_turn_routes_read_completion_into_page_service -- --test-threads=1",
+      "status": "passed",
+      "notes": "RED first failed on missing drive_block_device_service_once, then passed 1/1 after adding the device-owned service turn bridge from BlockServiceDriver through BlockDeviceDispatchAdapter into PageService::push_tagged_block_completion."
+    },
+    {
+      "command": "timeout 240s cargo test -p tx-subsystems --lib block_device_ -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 4/4 for BlockDeviceHandle, BlockDeviceDispatchAdapter, and the new block-device service turn bridge."
+    },
+    {
+      "command": "timeout 240s cargo test -p tx-subsystems --lib io_manager::block -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 10/10 after adding the device-owned service turn bridge; io_manager::block remains independent of BlockDeviceHandle."
+    },
+    {
+      "command": "timeout 480s cargo test -p tx-subsystems --lib io_manager -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 62/62 after adding the device-owned service turn bridge."
+    },
+    {
+      "command": "timeout 480s cargo check -p tx-subsystems",
+      "status": "passed",
+      "notes": "Passed after adding the device-owned service turn bridge with the existing net/execution/step_connect.rs unused guard warning."
+    },
+    {
+      "command": "rustfmt --edition 2024 --check --config skip_children=true crates/tx-subsystems/src/device.rs crates/tx-subsystems/src/io_manager/block/mod.rs crates/tx-subsystems/src/io_manager/page/service.rs crates/tx-subsystems/src/io_manager/backend/plan.rs",
+      "status": "passed",
+      "notes": "Scoped formatting check passed after rustfmt normalized device.rs imports and line wrapping."
+    },
+    {
+      "command": "rg -n \"tx_ext4|tx-ext4|tx_fs|tx-fs|bdevfs|Ext4|Bdev|FsPageBacking|BlockDeviceOps|BlockDeviceHandle|read_blocks|write_blocks|barrier\\\\(\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface",
+      "status": "passed",
+      "notes": "Only matched compatibility prose in io_manager/mod.rs; the service turn bridge keeps BlockDeviceHandle and driver calls in device.rs."
+    },
+    {
+      "command": "rg -n \"tx_substrate::|tx_reactor::\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface",
+      "status": "passed",
+      "notes": "Only matched the existing io_manager/adapter.rs substrate boundary."
+    },
+    {
+      "command": "timeout 240s cargo test -p tx-subsystems --lib file_page_service_records_l6_submit_outcomes_for_later_completion -- --test-threads=1",
+      "status": "passed",
+      "notes": "RED first failed on missing drive_file_io_service_once_with_tracker, then passed 1/1 after PageContainer recorded BlockBiosQueued SubmitOutcome values into BlockPageRequestTracker."
+    },
+    {
+      "command": "timeout 480s cargo test -p tx-subsystems --lib page_backed -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 109/109 after adding the tracker-aware PageContainer file service drive."
+    },
+    {
+      "command": "timeout 480s cargo test -p tx-subsystems --lib io_manager -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 62/62 after adding the tracker-aware PageContainer file service drive."
+    },
+    {
+      "command": "timeout 240s cargo test -p tx-subsystems --lib block_device_ -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 4/4 after adding the tracker-aware PageContainer file service drive."
+    },
+    {
+      "command": "timeout 480s cargo check -p tx-subsystems",
+      "status": "passed",
+      "notes": "Passed after adding the tracker-aware PageContainer file service drive with the existing net/execution/step_connect.rs unused guard warning."
+    },
+    {
+      "command": "rustfmt --edition 2024 --check --config skip_children=true crates/tx-subsystems/src/page_backed/mod.rs crates/tx-subsystems/src/page_backed/core_tests.rs crates/tx-subsystems/src/device.rs crates/tx-subsystems/src/io_manager/backend/plan.rs crates/tx-subsystems/src/io_manager/page/service.rs crates/tx-subsystems/src/io_manager/block/mod.rs",
+      "status": "passed",
+      "notes": "Scoped formatting check passed after rustfmt normalized PageBacked edits."
+    },
+    {
+      "command": "rg -n \"tx_ext4|tx-ext4|tx_fs|tx-fs|bdevfs|Ext4|Bdev|FsPageBacking|BlockDeviceOps|BlockDeviceHandle|read_blocks|write_blocks|barrier\\\\(\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface",
+      "status": "passed",
+      "notes": "Only matched compatibility prose in io_manager/mod.rs; tracker-aware PageContainer service drive did not add concrete backend imports to io_manager/fs_iface."
+    },
+    {
+      "command": "rg -n \"tx_substrate::|tx_reactor::\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface",
+      "status": "passed",
+      "notes": "Only matched the existing io_manager/adapter.rs substrate boundary."
+    },
+    {
+      "command": "timeout 240s cargo test -p tx-subsystems --lib file_page_owned_l6_runtime_routes_bio_completion_into_page_slot -- --test-threads=1",
+      "status": "passed",
+      "notes": "RED first failed on missing PageContainer-owned L6 runtime APIs, then passed 1/1 after adding persistent file_block_runtime state plus owned L4/L6 drive methods."
+    },
+    {
+      "command": "timeout 480s cargo test -p tx-subsystems --lib page_backed -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 110/110 after PageContainer-owned L6 runtime and tx-services/test-support dev feature propagation."
+    },
+    {
+      "command": "timeout 480s cargo test -p tx-subsystems --lib io_manager -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 62/62 after PageContainer-owned L6 runtime; io_manager remains neutral."
+    },
+    {
+      "command": "timeout 240s cargo test -p tx-subsystems --lib block_device_ -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 4/4 after PageContainer-owned L6 runtime; existing device-owned bridge remains green."
+    },
+    {
+      "command": "timeout 480s cargo check -p tx-subsystems",
+      "status": "passed",
+      "notes": "Passed with the existing net/execution/step_connect.rs unused guard warning."
+    },
+    {
+      "command": "rustfmt crates/tx-subsystems/src/page_backed/mod.rs crates/tx-subsystems/src/page_backed/core_tests.rs",
+      "status": "passed",
+      "notes": "Scoped formatting applied to the touched PageBacked files."
+    },
+    {
+      "command": "rg -n \"tx_ext4|tx-ext4|tx_fs|tx-fs|bdevfs|Ext4|Bdev|FsPageBacking|BlockDeviceOps|BlockDeviceHandle|read_blocks|write_blocks|barrier\\\\(\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface",
+      "status": "passed",
+      "notes": "Only matched compatibility prose in io_manager/mod.rs; the owned runtime did not move concrete backend or device executor calls into io_manager/fs_iface."
+    },
+    {
+      "command": "rg -n \"tx_substrate::|tx_reactor::\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface",
+      "status": "passed",
+      "notes": "Only matched the existing io_manager/adapter.rs substrate boundary."
+    },
+    {
+      "command": "git diff --check -- crates/tx-subsystems/src/page_backed/mod.rs crates/tx-subsystems/src/page_backed/core_tests.rs crates/tx-subsystems/Cargo.toml crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface",
+      "status": "passed",
+      "notes": "Scoped whitespace check passed before progress-file catch-up."
+    },
+    {
+      "command": "timeout 240s cargo test -p tx-subsystems --lib file_page_materialize_bio_only_plan_yields_without_compat_fetch -- --test-threads=1",
+      "status": "passed",
+      "notes": "RED first failed because Bio-only planner still returned Done via compat fetch, then failed because service completion left in_flight_file_pages live, then passed after owned L6 yield and generation-matched service-completion retirement."
+    },
+    {
+      "command": "timeout 480s cargo test -p tx-subsystems --lib page_backed -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 110/110 after Bio-only planned misses moved from compatibility fetch fallback to owned async L6 yield/completion/retry."
+    },
+    {
+      "command": "timeout 480s cargo test -p tx-subsystems --lib io_manager -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 62/62 after the PageContainer miss-path async slice; io_manager remains neutral."
+    },
+    {
+      "command": "timeout 240s cargo test -p tx-subsystems --lib block_device_ -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 4/4 after the PageContainer miss-path async slice; device bridge remains outside io_manager."
+    },
+    {
+      "command": "timeout 480s cargo check -p tx-subsystems",
+      "status": "passed",
+      "notes": "Passed with the existing net/execution/step_connect.rs unused guard warning."
+    },
+    {
+      "command": "rustfmt crates/tx-subsystems/src/page_backed/mod.rs crates/tx-subsystems/src/page_backed/core_tests.rs crates/tx-services/src/time/mod.rs",
+      "status": "passed",
+      "notes": "Scoped formatting applied to the touched PageBacked and tx-services facade files."
+    },
+    {
+      "command": "rg -n \"tx_ext4|tx-ext4|tx_fs|tx-fs|bdevfs|Ext4|Bdev|FsPageBacking|BlockDeviceOps|BlockDeviceHandle|read_blocks|write_blocks|barrier\\\\(\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface",
+      "status": "passed",
+      "notes": "Only matched compatibility prose in io_manager/mod.rs; the miss-path async slice did not move concrete backend or device executor calls into io_manager/fs_iface."
+    },
+    {
+      "command": "rg -n \"tx_substrate::|tx_reactor::\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface",
+      "status": "passed",
+      "notes": "Only matched the existing io_manager/adapter.rs substrate boundary."
+    },
+    {
+      "command": "git diff --check -- crates/tx-subsystems/src/page_backed/mod.rs crates/tx-subsystems/src/page_backed/core_tests.rs crates/tx-services/src/time/mod.rs crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface",
+      "status": "passed",
+      "notes": "Scoped whitespace check passed before progress-file catch-up."
+    },
+    {
+      "command": "timeout 240s cargo test -p tx-subsystems --lib file_page_bio_only_plan_drives_owned_l6_through_block_device_handle -- --test-threads=1",
+      "status": "passed",
+      "notes": "RED first failed on missing drive_page_container_file_block_device_service_once, then failed because the real device adapter requires a valid BioVec buffer PPN instead of a placeholder key, then passed after adding the device-layer PageContainer bridge and using a valid zero-frame PPN."
+    },
+    {
+      "command": "timeout 480s cargo test -p tx-subsystems --lib page_backed -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 111/111 after connecting the PageContainer-owned L6 runtime to a real BlockDeviceHandle compatibility executor."
+    },
+    {
+      "command": "timeout 480s cargo test -p tx-subsystems --lib io_manager -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 62/62; the device bridge lives outside io_manager and the neutral control plane still has no concrete executor dependency."
+    },
+    {
+      "command": "timeout 240s cargo test -p tx-subsystems --lib block_device_ -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 5/5 including the new PageContainer-to-BlockDeviceHandle service test."
+    },
+    {
+      "command": "timeout 480s cargo check -p tx-subsystems",
+      "status": "passed",
+      "notes": "Passed with the existing net/execution/step_connect.rs unused guard warning."
+    },
+    {
+      "command": "rustfmt --edition 2024 --config skip_children=true crates/tx-subsystems/src/device.rs crates/tx-subsystems/src/page_backed/core_tests.rs",
+      "status": "passed",
+      "notes": "Scoped formatting applied to the touched device and PageBacked test files."
+    },
+    {
+      "command": "rg -n \"tx_ext4|tx-ext4|tx_fs|tx-fs|bdevfs|Ext4|Bdev|FsPageBacking|BlockDeviceOps|BlockDeviceHandle|read_blocks|write_blocks|barrier\\\\(\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface",
+      "status": "passed",
+      "notes": "Only matched compatibility prose in io_manager/mod.rs; the BlockDeviceHandle bridge did not move device executor calls into io_manager/fs_iface."
+    },
+    {
+      "command": "rg -n \"tx_substrate::|tx_reactor::\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface",
+      "status": "passed",
+      "notes": "Only matched the existing io_manager/adapter.rs substrate boundary."
+    },
+    {
+      "command": "timeout 240s cargo test -p tx-subsystems --lib file_page_io_service_turn_plans_dispatches_and_applies_device_completion -- --test-threads=1",
+      "status": "passed",
+      "notes": "RED first failed on missing drive_page_container_file_io_service_once, then passed after adding a device-layer aggregate turn that runs L4 planning, L6/device dispatch/completion, and follow-up L4 completion application."
+    },
+    {
+      "command": "timeout 480s cargo test -p tx-subsystems --lib page_backed -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 112/112 after adding the aggregate PageContainer file I/O service turn."
+    },
+    {
+      "command": "timeout 480s cargo test -p tx-subsystems --lib io_manager -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 62/62; the aggregate service turn remains outside io_manager and does not add concrete executor dependencies there."
+    },
+    {
+      "command": "timeout 240s cargo test -p tx-subsystems --lib block_device_ -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 5/5 after the aggregate service-turn slice."
+    },
+    {
+      "command": "timeout 480s cargo check -p tx-subsystems",
+      "status": "passed",
+      "notes": "Passed with the existing net/execution/step_connect.rs unused guard warning."
+    },
+    {
+      "command": "rustfmt --edition 2024 --config skip_children=true crates/tx-subsystems/src/device.rs crates/tx-subsystems/src/page_backed/core_tests.rs",
+      "status": "passed",
+      "notes": "Scoped formatting applied to the touched device and PageBacked test files."
+    },
+    {
+      "command": "rg -n \"tx_ext4|tx-ext4|tx_fs|tx-fs|bdevfs|Ext4|Bdev|FsPageBacking|BlockDeviceOps|BlockDeviceHandle|read_blocks|write_blocks|barrier\\\\(\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface",
+      "status": "passed",
+      "notes": "Only matched compatibility prose in io_manager/mod.rs; the aggregate turn did not move concrete filesystem or device executor calls into io_manager/fs_iface."
+    },
+    {
+      "command": "rg -n \"tx_substrate::|tx_reactor::\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface",
+      "status": "passed",
+      "notes": "Only matched the existing io_manager/adapter.rs substrate boundary."
+    },
+    {
+      "command": "timeout 240s cargo test -p tx-subsystems --lib file_page_io_service_turn_plans_dispatches_and_applies_device_completion -- --test-threads=1",
+      "status": "passed",
+      "notes": "RED first failed on missing PageContainerFileIoServiceNext and turn.next, then passed after adding the aggregate turn next-state summary."
+    },
+    {
+      "command": "timeout 480s cargo test -p tx-subsystems --lib page_backed -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 112/112 after adding the aggregate file-I/O service-turn next-state summary."
+    },
+    {
+      "command": "timeout 480s cargo test -p tx-subsystems --lib io_manager -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 62/62; io_manager remains neutral and does not see the device-layer next-state wrapper."
+    },
+    {
+      "command": "timeout 240s cargo test -p tx-subsystems --lib block_device_ -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 5/5 after the next-state summary slice."
+    },
+    {
+      "command": "timeout 480s cargo check -p tx-subsystems",
+      "status": "passed",
+      "notes": "Passed with the existing net/execution/step_connect.rs unused guard warning."
+    },
+    {
+      "command": "rustfmt --edition 2024 --config skip_children=true crates/tx-subsystems/src/device.rs crates/tx-subsystems/src/page_backed/core_tests.rs",
+      "status": "passed",
+      "notes": "Scoped formatting applied to the touched device and PageBacked test files."
+    },
+    {
+      "command": "rg -n \"tx_ext4|tx-ext4|tx_fs|tx-fs|bdevfs|Ext4|Bdev|FsPageBacking|BlockDeviceOps|BlockDeviceHandle|read_blocks|write_blocks|barrier\\\\(\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface",
+      "status": "passed",
+      "notes": "Only matched compatibility prose in io_manager/mod.rs; the next-state summary did not move concrete filesystem or device executor calls into io_manager/fs_iface."
+    },
+    {
+      "command": "rg -n \"tx_substrate::|tx_reactor::\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface",
+      "status": "passed",
+      "notes": "Only matched the existing io_manager/adapter.rs substrate boundary."
+    },
+    {
+      "command": "timeout 480s cargo test -p tx-subsystems --lib io_manager -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Fresh closeout run passed 62/62 io_manager-filtered tests; tx-subsystems emitted the existing net/execution/step_connect.rs unused guard warning."
+    },
+    {
+      "command": "timeout 480s cargo test -p tx-subsystems --lib page_backed -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Fresh closeout run passed 112/112 page_backed-filtered tests, including PageSlot, RangeReservation, Bio-only miss, and aggregate file-I/O service-turn coverage."
+    },
+    {
+      "command": "timeout 240s cargo test -p tx-subsystems --lib block_device_ -- --test-threads=1",
+      "status": "passed",
+      "notes": "Fresh closeout run passed 5/5 block-device filtered tests."
+    },
+    {
+      "command": "timeout 480s cargo check -p tx-subsystems",
+      "status": "passed",
+      "notes": "Fresh closeout run passed with the existing net/execution/step_connect.rs unused guard warning."
+    },
+    {
+      "command": "rg -n \"tx_ext4|tx-ext4|tx_fs|tx-fs|bdevfs|Ext4|Bdev|FsPageBacking|BlockDeviceOps|BlockDeviceHandle|read_blocks|write_blocks|barrier\\\\(\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface",
+      "status": "passed",
+      "notes": "Fresh closeout scan only matched compatibility prose in io_manager/mod.rs; concrete filesystem and device executor calls remain outside io_manager/fs_iface."
+    },
+    {
+      "command": "rg -n \"tx_substrate::|tx_reactor::\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface",
+      "status": "passed",
+      "notes": "Fresh closeout scan only matched io_manager/adapter.rs, preserving the raw substrate adapter boundary."
+    },
+    {
+      "command": "timeout 240s cargo test -p tx-subsystems --lib file_page_io_service_op_drives_aggregate_turn_as_step_op -- --test-threads=1",
+      "status": "passed",
+      "notes": "RED first failed on missing device::PageContainerFileIoServiceOp, then passed after adding the StepOp wrapper for the aggregate PageContainer file-I/O service turn."
+    },
+    {
+      "command": "timeout 480s cargo test -p tx-subsystems --lib page_backed -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 113/113 after adding the file-I/O service StepOp seam."
+    },
+    {
+      "command": "timeout 480s cargo test -p tx-subsystems --lib io_manager -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 62/62; the StepOp seam lives in device.rs and does not add concrete dependencies to io_manager."
+    },
+    {
+      "command": "timeout 240s cargo test -p tx-subsystems --lib block_device_ -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 5/5 after adding the file-I/O service StepOp seam."
+    },
+    {
+      "command": "timeout 480s cargo check -p tx-subsystems",
+      "status": "passed",
+      "notes": "Passed with the existing net/execution/step_connect.rs unused guard warning."
+    },
+    {
+      "command": "cargo -q xtask unit",
+      "status": "passed",
+      "notes": "Passed build plus host unit tests for tx-shims 592/592, tx-kernel 104/104, tx-ext4 9/9, and tx-scripts 56/56."
+    },
+    {
+      "command": "cargo xtask lint invariants step-v4-vocabulary",
+      "status": "passed",
+      "notes": "Reported 0 legacy v4 step identifiers."
+    },
+    {
+      "command": "cargo xtask lint invariants step-no-await",
+      "status": "passed",
+      "notes": "Reported 0 await expressions in step bodies."
+    },
+    {
+      "command": "rg -n \"tx_ext4|tx-ext4|tx_fs|tx-fs|bdevfs|Ext4|Bdev|FsPageBacking|BlockDeviceOps|BlockDeviceHandle|read_blocks|write_blocks|barrier\\\\(\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface",
+      "status": "passed",
+      "notes": "Only matched compatibility prose in io_manager/mod.rs; the StepOp wrapper kept concrete device execution in device.rs."
+    },
+    {
+      "command": "rg -n \"tx_substrate::|tx_reactor::\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface",
+      "status": "passed",
+      "notes": "Only matched io_manager/adapter.rs."
+    },
+    {
+      "command": "timeout 240s cargo test -p tx-subsystems --lib file_page_io_service_task_loop_waits_for_service_kick_and_drives_turn -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 1/1, proving the borrowed file-I/O service task loop waits for a ServiceWakeSource kick and drives one aggregate PageContainer file-I/O turn."
+    },
+    {
+      "command": "timeout 480s cargo test -p tx-subsystems --lib page_backed -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 114/114 after adding the borrowed file-I/O service task loop."
+    },
+    {
+      "command": "timeout 480s cargo test -p tx-subsystems --lib io_manager -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 62/62; the borrowed task loop stays in device.rs and does not add concrete filesystem or device imports to io_manager."
+    },
+    {
+      "command": "timeout 240s cargo test -p tx-subsystems --lib block_device_ -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 5/5 after adding the borrowed file-I/O service task loop."
+    },
+    {
+      "command": "timeout 480s cargo check -p tx-subsystems",
+      "status": "passed",
+      "notes": "Passed with the existing net/execution/step_connect.rs unused guard warning."
+    },
+    {
+      "command": "cargo xtask lint invariants step-v4-vocabulary",
+      "status": "passed",
+      "notes": "Reported 0 legacy v4 step identifiers after the borrowed task-loop slice."
+    },
+    {
+      "command": "cargo xtask lint invariants step-no-await",
+      "status": "passed",
+      "notes": "Reported 0 await expressions in step bodies; the service loop is an async task loop, not a StepOp::step body."
+    },
+    {
+      "command": "timeout 900s cargo -q xtask unit",
+      "status": "passed",
+      "notes": "Passed build plus host unit tests for tx-shims 592/592, tx-kernel 104/104, tx-ext4 9/9, and tx-scripts 56/56 after the borrowed service-loop slice."
+    },
+    {
+      "command": "rg -n \"tx_ext4|tx-ext4|tx_fs|tx-fs|bdevfs|Ext4|Bdev|FsPageBacking|BlockDeviceOps|BlockDeviceHandle|read_blocks|write_blocks|barrier\\\\(\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface",
+      "status": "passed",
+      "notes": "Only matched compatibility prose in io_manager/mod.rs; concrete filesystem and device executor calls remain outside io_manager/fs_iface."
+    },
+    {
+      "command": "rg -n \"tx_substrate::|tx_reactor::\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface",
+      "status": "passed",
+      "notes": "Only matched io_manager/adapter.rs."
+    },
+    {
+      "command": "timeout 240s cargo test -p tx-subsystems --lib file_page_io_service_owned_task_loop_holds_runtime_for_static_submission -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 1/1; the test asserts the owned service-loop future is Send + 'static and drives a Bio-only planned miss to completion."
+    },
+    {
+      "command": "timeout 480s cargo test -p tx-subsystems --lib page_backed -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 115/115 after adding the owned file-I/O service runtime seam."
+    },
+    {
+      "command": "timeout 480s cargo test -p tx-subsystems --lib io_manager -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 62/62; the owned runtime seam stays in device.rs and does not add concrete dependencies to io_manager."
+    },
+    {
+      "command": "timeout 240s cargo test -p tx-subsystems --lib block_device_ -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 5/5 after adding the owned file-I/O service runtime seam."
+    },
+    {
+      "command": "timeout 480s cargo check -p tx-subsystems",
+      "status": "passed",
+      "notes": "Passed with the existing net/execution/step_connect.rs unused guard warning."
+    },
+    {
+      "command": "cargo xtask lint invariants step-v4-vocabulary",
+      "status": "passed",
+      "notes": "Reported 0 legacy v4 step identifiers after the owned runtime seam."
+    },
+    {
+      "command": "cargo xtask lint invariants step-no-await",
+      "status": "passed",
+      "notes": "Reported 0 await expressions in StepOp::step bodies after the owned runtime seam."
+    },
+    {
+      "command": "timeout 900s cargo -q xtask unit",
+      "status": "passed",
+      "notes": "Passed build plus host unit tests for tx-shims 592/592, tx-kernel 104/104, tx-ext4 9/9, and tx-scripts 56/56 after the owned runtime seam."
+    },
+    {
+      "command": "rg -n \"tx_ext4|tx-ext4|tx_fs|tx-fs|bdevfs|Ext4|Bdev|FsPageBacking|BlockDeviceOps|BlockDeviceHandle|read_blocks|write_blocks|barrier\\\\(\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface",
+      "status": "passed",
+      "notes": "Only matched compatibility prose in io_manager/mod.rs; concrete execution remains in device.rs or concrete backends."
+    },
+    {
+      "command": "rg -n \"tx_substrate::|tx_reactor::\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface",
+      "status": "passed",
+      "notes": "Only matched io_manager/adapter.rs."
+    },
+    {
+      "command": "timeout 240s cargo test -p tx-subsystems --lib file_io_service_registry_snapshots_owned_runtime_for_reactor_submission -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 1/1 after adding the device-owned PageContainer file-I/O runtime registry."
+    },
+    {
+      "command": "timeout 480s cargo test -p tx-fs --lib materialised_block_device_registers_one_file_io_service_runtime -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 1/1; bdevfs registers exactly one runtime for a newly materialised coherent PageContainer and does not duplicate registration when the coherence index returns the existing PC."
+    },
+    {
+      "command": "timeout 240s cargo test -p tx-kernel --lib boot_init_submits_registered_file_io_service_runtimes -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 1/1; the test exercises the same runtime-iteration helper as production with a counting submit closure so it does not initialize the global boot reactor."
+    },
+    {
+      "command": "timeout 240s cargo test -p tx-kernel --lib reactor_submission_seam_submits_child_thread_smoke -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 1/1 after the file-I/O submission test was changed not to initialize BOOT_REACTOR; this preserves the existing fallback-queueing test precondition."
+    },
+    {
+      "command": "timeout 480s cargo test -p tx-subsystems --lib page_backed -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 115/115 after registry and kernel-init submission wiring."
+    },
+    {
+      "command": "timeout 480s cargo test -p tx-subsystems --lib io_manager -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 62/62 after registry and kernel-init submission wiring."
+    },
+    {
+      "command": "timeout 240s cargo test -p tx-subsystems --lib block_device_ -- --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 5/5 after registry and kernel-init submission wiring."
+    },
+    {
+      "command": "timeout 480s cargo test -p tx-fs --lib bdevfs -- --nocapture --test-threads=1",
+      "status": "passed",
+      "notes": "Passed 3/3, covering BioPlan planning, old bdevfs page backing read path, and runtime registration."
+    },
+    {
+      "command": "timeout 480s cargo check -p tx-subsystems -p tx-fs -p tx-kernel --lib",
+      "status": "passed",
+      "notes": "Passed after registry and kernel-init submission wiring; existing warnings remain in net/execution/step_connect.rs, tx-fs/src/tx_ext4_bridge.rs, and init/reactor_submit.rs."
+    },
+    {
+      "command": "timeout 900s cargo -q xtask unit",
+      "status": "passed",
+      "notes": "Passed after the test-isolation fix: tx-shims 592/592, tx-kernel 105/105, tx-ext4 9/9, and tx-scripts 56/56."
+    },
+    {
+      "command": "rustfmt --edition 2024 --check --config skip_children=true crates/tx-subsystems/src/device.rs crates/tx-fs/src/bdevfs/mod.rs crates/tx-kernel/src/init.rs crates/tx-kernel/src/init/tests.rs",
+      "status": "passed",
+      "notes": "Scoped formatting check passed for the files touched by the registry/submission closeout."
+    },
+    {
+      "command": "git diff --check -- crates/tx-subsystems/src/device.rs crates/tx-fs/src/bdevfs/mod.rs crates/tx-kernel/src/init.rs crates/tx-kernel/src/init/tests.rs crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface docs/progress/STATUS.md docs/progress/plans/2026-07-11-io-manager-phase0-landing.json",
+      "status": "passed",
+      "notes": "Scoped whitespace check passed."
+    },
+    {
+      "command": "cargo xtask lint invariants step-v4-vocabulary",
+      "status": "passed",
+      "notes": "Reported 0 legacy v4 step identifiers after the registry/submission closeout."
+    },
+    {
+      "command": "cargo xtask lint invariants step-no-await",
+      "status": "passed",
+      "notes": "Reported 0 await expressions in StepOp::step bodies after the registry/submission closeout."
+    },
+    {
+      "command": "rg -n \"tx_ext4|tx-ext4|tx_fs|tx-fs|bdevfs|Ext4|Bdev|FsPageBacking|BlockDeviceOps|BlockDeviceHandle|read_blocks|write_blocks|barrier\\\\(\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface",
+      "status": "passed",
+      "notes": "Only matched compatibility prose in io_manager/mod.rs; concrete bdevfs/device registration remains outside io_manager/fs_iface."
+    },
+    {
+      "command": "rg -n \"tx_substrate::|tx_reactor::\" crates/tx-subsystems/src/io_manager crates/tx-subsystems/src/fs_iface",
+      "status": "passed",
+      "notes": "Only matched io_manager/adapter.rs."
+    }
+  ],
+  "risks": [
+    "Current active progress plans have broad write scopes; keep future slices narrowly claimed before editing shared filesystem or device paths.",
+    "Changing FsPageBacking directly would churn every filesystem backend before the neutral plan values are tested.",
+    "Moving to RCU/TxArray before PageSlot generation semantics exist would make completion races harder to prove.",
+    "bdev-fs still keeps the old direct FsPageBacking executor as the compatibility oracle; remove it only after the planned L4/L6 path covers the same behavior.",
+    "Ext4 planning remains a separate Phase 6 claim; do not pull ext4 metadata/journal work into io_manager or bdevfs closeout slices."
+  ],
+  "blockers": [],
+  "handoff": {
+    "needed": false,
+    "path": null
+  }
+}

@@ -14,7 +14,7 @@ use tx_platform_adapter::platform_adapter;
 )]
 pub mod step_engine {
     pub(crate) use crate::sync::SpinMutex;
-    pub use tx_substrate::epoch::{self as epoch, guard, Guard};
+    pub use tx_substrate::epoch::{guard, Guard};
     pub use tx_substrate::page_allocator::{self, ZeroPolicy};
     pub use tx_substrate::step::{
         ByteProgress, Errno, NoProgress, ProcessIdentity, ScriptCtx, StepOp, StepOutcome,

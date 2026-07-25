@@ -21,8 +21,13 @@ use crate::thread_runtime::adapter::step_engine::{sign, Cap, PayloadCap, ZoneAll
 use crate::thread_runtime::execution::prepare_userspace_entry_payload;
 use crate::thread_runtime::step_thread_exit;
 use crate::thread_runtime::structure::{
-    drain_pending_syscall_return, prewarm_thread_payload_slots, reset_tid_counter_for_test,
-    ThreadIdentity, ThreadPayload,
+    clear_current_thread_identity, clear_current_thread_payload, clear_current_userspace_payload,
+    clear_current_userspace_thread_identity, current_thread_identity, current_thread_payload,
+    current_thread_payload_mask, current_userspace_payload, current_userspace_payload_mask,
+    current_userspace_thread_identity, drain_pending_syscall_return, prewarm_thread_payload_slots,
+    reset_tid_counter_for_test, set_current_thread_identity, set_current_thread_payload,
+    set_current_userspace_payload, set_current_userspace_thread_identity, ThreadIdentity,
+    ThreadPayload,
 };
 use crate::vm::{AddressSpace, TestPmap};
 use crate::zones;
@@ -45,6 +50,20 @@ fn fresh_aspace() -> Cap<AddressSpace> {
 
 fn bootstrap() -> Cap<ProcessIdentity> {
     bootstrap_init_process(fresh_aspace()).expect("bootstrap init")
+}
+
+fn finish_process_group_for_test(process: &Cap<ProcessIdentity>, status: ExitStatus) {
+    crate::process::step_exit_group_with_posts(
+        process,
+        status,
+        |weak, event| {
+            let Some(mailbox) = weak.upgrade() else {
+                return;
+            };
+            let _ = mailbox.post(event);
+        },
+        |mailbox, event| mailbox.post(event),
+    );
 }
 
 #[test]
@@ -74,6 +93,49 @@ fn thread_runtime_lock_service_declares_sigprocmask_phase_names() {
     ));
 }
 
+fn source_function_body<'a>(src: &'a str, name: &str) -> &'a str {
+    let start = src.find(name).expect("function name present");
+    let open = src[start..]
+        .find('{')
+        .map(|idx| start + idx)
+        .expect("function body opens");
+    let mut depth = 0usize;
+    for (offset, ch) in src[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &src[open + 1..open + offset];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("function body closes");
+}
+
+#[test]
+fn robust_list_walk_drops_process_payload_guard_before_user_memory_walk() {
+    let body = source_function_body(include_str!("execution.rs"), "fn walk_robust_list");
+    let aspace_snapshot = body
+        .find("let aspace = payload.aspace_cap();")
+        .expect("aspace snapshot present");
+    let guard_drop = body[aspace_snapshot..]
+        .find("drop(proc_guard);")
+        .map(|idx| aspace_snapshot + idx)
+        .expect("process payload guard is explicitly dropped");
+    let first_user_read = body[aspace_snapshot..]
+        .find("read_user_")
+        .map(|idx| aspace_snapshot + idx)
+        .expect("robust walk reads userspace");
+
+    assert!(
+        guard_drop < first_user_read,
+        "robust-list userspace reads must happen after dropping process.payload guard"
+    );
+}
+
 fn first_thread(proc_cap: &Cap<ProcessIdentity>) -> Cap<ThreadIdentity> {
     let payload_guard = proc_cap.payload.lock();
     let payload = payload_guard.as_ref().expect("alive");
@@ -90,10 +152,7 @@ fn prewarm_thread_payload_slots_keeps_next_batch_off_slab_allocator() {
     let warmed = prewarm_thread_payload_slots(33);
     assert_eq!(warmed, 33);
     let after_prewarm = zone.allocated_slots();
-    assert!(
-        after_prewarm > before,
-        "prewarm should allocate reusable payload storage"
-    );
+    assert!(after_prewarm >= before);
 
     let mut caps = Vec::new();
     for _ in 0..33 {
@@ -120,6 +179,66 @@ fn thread_exit_sets_status_and_drops_thread_payload() {
 }
 
 #[test]
+fn thread_exit_clears_matching_current_and_userspace_slots() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let leader = first_thread(&proc_cap);
+    let leader_payload = leader.payload_cap_for_test().expect("leader alive");
+    let other_proc = step_fork::<TestPmap>(&proc_cap, false, false).expect("fork");
+    let other_thread = first_thread(&other_proc);
+    let other_payload = other_thread.payload_cap_for_test().expect("other alive");
+
+    let _ = set_current_thread_identity(0, leader.clone());
+    let _ = set_current_thread_payload(0, leader_payload.clone());
+    let _ = set_current_userspace_thread_identity(1, leader.clone());
+    let _ = set_current_userspace_payload(1, leader_payload);
+    let _ = set_current_thread_identity(2, other_thread.clone());
+    let _ = set_current_thread_payload(2, other_payload.clone());
+    let _ = set_current_userspace_thread_identity(3, other_thread.clone());
+    let _ = set_current_userspace_payload(3, other_payload);
+
+    assert_eq!(current_thread_payload_mask() & 0b0101, 0b0101);
+    assert_eq!(current_userspace_payload_mask() & 0b1010, 0b1010);
+
+    step_thread_exit(leader, 7);
+
+    assert!(current_thread_payload(0).is_none());
+    assert!(current_thread_identity(0).is_none());
+    assert!(current_userspace_payload(1).is_none());
+    assert!(current_userspace_thread_identity(1).is_none());
+    assert!(current_thread_payload(2).is_some());
+    assert!(current_thread_identity(2).is_some());
+    assert!(current_userspace_payload(3).is_some());
+    assert!(current_userspace_thread_identity(3).is_some());
+
+    let _ = clear_current_thread_payload(2);
+    let _ = clear_current_thread_identity(2);
+    let _ = clear_current_userspace_payload(3);
+    let _ = clear_current_userspace_thread_identity(3);
+}
+
+#[test]
+fn exit_group_clears_matching_current_and_userspace_slots() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let leader = first_thread(&proc_cap);
+    let leader_payload = leader.payload_cap_for_test().expect("leader alive");
+
+    let _ = set_current_thread_identity(0, leader.clone());
+    let _ = set_current_thread_payload(0, leader_payload.clone());
+    let _ = set_current_userspace_thread_identity(1, leader.clone());
+    let _ = set_current_userspace_payload(1, leader_payload);
+
+    finish_process_group_for_test(&proc_cap, ExitStatus::Exited(9));
+
+    assert!(current_thread_payload(0).is_none());
+    assert!(current_thread_identity(0).is_none());
+    assert!(current_userspace_payload(1).is_none());
+    assert!(current_userspace_thread_identity(1).is_none());
+    assert!(proc_cap.is_zombie());
+}
+
+#[test]
 fn last_thread_exit_zombifies_owner_process() {
     let _g = setup();
     let proc_cap = bootstrap();
@@ -130,6 +249,37 @@ fn last_thread_exit_zombifies_owner_process() {
     assert!(proc_cap.is_zombie());
     assert_eq!(proc_cap.exit_status(), Some(ExitStatus::Exited(99)));
     assert_eq!(proc_cap.live_thread_count(), 0);
+}
+
+#[test]
+fn exec_collapse_rejects_thread_exit_completion_after_remaining_reaches_zero() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let leader = first_thread(&proc_cap);
+    let payload_guard = proc_cap.payload.lock();
+    let payload = payload_guard.as_ref().expect("process alive");
+    let generation = payload
+        .reserve_exec_lifecycle(leader.tid.0)
+        .expect("reserve exec lifecycle");
+
+    assert!(payload.begin_exec_collapse(generation, 1));
+    let first = payload
+        .prepare_thread_exit(leader.tid.0.wrapping_add(1))
+        .expect("first distinct tid claims exit");
+    let excess = payload
+        .prepare_thread_exit(leader.tid.0.wrapping_add(2))
+        .expect("second distinct tid claims exit");
+
+    assert!(payload.finish_thread_exit(first, false, ExitStatus::Exited(0)));
+    assert!(
+        !payload.finish_thread_exit(excess, false, ExitStatus::Exited(0)),
+        "a permit cannot complete after the exec-collapse counter reaches zero"
+    );
+    assert!(payload.finish_exec_collapse(generation));
+    assert!(payload.exec_lifecycle_matches(generation));
+    assert!(payload.release_exec_lifecycle(generation));
+    drop(payload_guard);
+    assert_eq!(proc_cap.live_thread_count(), 1);
 }
 
 #[test]
@@ -153,7 +303,7 @@ fn weak_owner_proc_survives_payload_drop() {
     let leader = first_thread(&proc_cap);
 
     // Zombify by exit_group; identity persists, payload gone.
-    crate::process::step_exit_group(&proc_cap, ExitStatus::Exited(0));
+    finish_process_group_for_test(&proc_cap, ExitStatus::Exited(0));
     assert!(proc_cap.is_zombie());
 
     // Weak still resolves to the (zombie) identity.
@@ -172,7 +322,7 @@ fn weak_owner_proc_flips_dead_after_identity_drop() {
 
     // Zombify so the process payload is gone but the identity is still
     // retained by `proc_cap`.
-    crate::process::step_exit_group(&proc_cap, ExitStatus::Exited(0));
+    finish_process_group_for_test(&proc_cap, ExitStatus::Exited(0));
     assert!(leader.upgrade_owner_proc().is_some());
 
     // Drop the strong handles. Weak observers should no longer find

@@ -543,74 +543,93 @@ ProcessPolicy is an embedded struct on ProcessPayload, not a separately-allocate
 
 <!-- txdoc:PROCESS-GROUPEXIT-THREAD-GROUP-COLLAPSE-COORDINATION-1 -->
 
-When any thread initiates `exit_group` or `execve` (from a multi-threaded process), all other threads in the group must terminate before the initiator can proceed. This coordination uses `ProcessPayload.group_exit`:
+When any thread initiates `exit_group`, `execve`, or the last-thread exit
+transition, it must exclude the other process-lifecycle commits until its
+authoritative payload mutation finishes. This coordination uses the single
+reusable `ProcessPayload.group_exit` episode lane:
 
 ```rust
-pub struct GroupExit {
-    /// One-shot CAS: transitions from None to Some exactly once per process
-    /// lifetime. After transition, the enclosed GroupExitState is stable;
-    /// subsequent callers observe Some and join the collapse as non-initiators.
-    ///
-    /// Not a `Binding<T>` — `GroupExitState` is not a semantic entity with
-    /// projections or retention. It is transient coordination state, alive
-    /// only during the collapse window. Implementable as an atomic pointer
-    /// with one-shot CAS semantics (substrate provides this as
-    /// `AtomicOneShot<T>` or equivalent; the exact shape is substrate
-    /// implementation detail).
-    pub state: AtomicOneShot<GroupExitState>,
+pub struct GroupExitState {
+    pub status: ExitStatus,
+    pub owner: GroupExitOwner,
+    pub generation: u64,
+    pub initiator_tid: u32,
+    pub remaining_threads: AtomicU32,
+    pub claimed_thread_exits: BTreeSet<u32>,
 }
 
-pub struct GroupExitState {
-    pub status: ExitStatus,                    // exit status if this is an exit_group
-    pub is_exec: bool,                         // initiator wants exec, not exit
-    pub remaining_threads: AtomicU32,          // decrements as non-initiator threads exit
-    pub completion_channel: Channel,           // reactor channel; initiator waits on it
+pub enum GroupExitOwner {
+    Exit,
+    ThreadExit,
+    ExecReserved,
+    ExecCollapsing,
+    ExecAborting,
 }
+
+pub group_exit: SpinMutex<Option<GroupExitState>>;
 ```
 
-Observers never need to upgrade `state` to a Cap — the enclosing `ProcessPayload` already retains it via allocation — so Binding's upgrade-via-CAS machinery is unneeded. A single one-shot atomic suffices. `AtomicOneShot<T>` supports:
-
-- `compare_exchange(None, boxed_state) -> Result<(), ExistingRef>` — one-shot CAS.
-- `load(&guard) -> Option<&T>` — guard-safe read.
-
-The substrate primitive lives in `tx-fnd/atomic-oneshot` (or equivalent); the exact naming is implementation-layer.
+`GroupExitState` is transient coordination state retained by the enclosing
+payload, not a semantic entity and not a `Binding<T>`. `None` means the lane is
+idle. Each successful acquisition installs a fresh generation; releasing or
+finishing the episode returns the slot to `None`, so later clone, exec, or exit
+operations may start a new episode. Callers never keep a raw state reference
+across the lane lock.
 
 ### 5.1 Flow
 
 <!-- txdoc:PROCESS-FLOW-1 -->
 
-**Initiator:**
+**Exec:**
 
-1. Construct a GroupExitState with `status`, `is_exec`, `remaining_threads = thread_count - 1` (the initiator itself is not counted), and a fresh completion_channel.
-2. `group_exit.state.compare_exchange(None, Some(GroupExitState))`.
-3. If CAS succeeds, this thread is the initiator. Proceed to step 4.
-4. If CAS fails: someone else already initiated. This thread is not the initiator; it joins the collapse as a non-initiator (proceeds to step_thread_exit per §7).
-5. For each thread in ProcessPayload.threads (except self), update its `signal_summary.termination = true` and fire its task waker. (Done atomically under a walk of the thread DLL.)
-6. If `remaining_threads == 0` at the start (single-threaded process), skip to step 8.
-7. Wait on completion_channel (reactor wait, `WaitProtocol::Killable`; this wait cannot be interrupted except by the kernel itself terminating the initiator).
-8. Proceed:
-   - If `is_exec`: continue with execve's AS-replacement / fd-close-on-exec / sig-reset phases.
-   - Else (exit_group): this thread is now the last thread. Proceed to step_thread_exit for the initiator, which will trigger step_process_exit.
+1. `ProcessExecPrep::begin` validates that the authoritative identity payload
+   names the retained payload, then installs `ExecReserved` with a fresh
+   generation. Contention returns Retry, mapped to `EAGAIN`.
+2. With clone admission excluded, snapshot siblings and transition the same
+   generation to `ExecCollapsing`.
+3. Each sibling TID may claim one linear `ThreadExitPermit`. Only an actual
+   roster detach decrements `thread_count` and `remaining_threads`; a completed
+   zombie exit is idempotent and a concurrent duplicate claim returns Retry.
+4. If a cross-hart sibling owns a permit that has not completed, exec processes
+   the other siblings, transfers the lane to `ExecAborting`, and returns
+   `EAGAIN` before the point of no return. The last outstanding permit clears
+   the abandoned episode.
+5. Otherwise the lane returns to `ExecReserved` and remains held across the
+   checked address-space swap and final credential commit. Successful final
+   commit releases the generation; pre-PoNR Drop releases an uncommitted
+   reservation.
 
-**Non-initiator thread exits (via site A/B observing termination):**
+**Exit and ordinary thread exit:**
 
-1. Run step_thread_exit normally.
-2. In step_thread_exit's commit phase, after the thread's state is updated but before returning:
-   - If `group_exit.state.load()` is Some: decrement `remaining_threads`.
-   - If the decrement brought it to 0: fire `completion_channel` waker.
+1. `exit_group` installs `Exit` only when the lane is idle. A competing exec,
+   exit, or thread-exit episode returns Retry rather than joining an unrelated
+   collapse.
+2. An ordinary thread exit briefly installs `ThreadExit` from its lane check
+   through zombify, roster detach, and count update. The last-thread case
+   promotes that episode to `Exit` before process payload teardown.
+3. Fatal-signal teardown uses the same `Exit` acquisition. Retry is propagated
+   to AST/page-fault/syscall callers; retrying futures yield cooperatively.
 
 **Clone during collapse:**
 
-Clone(CLONE_THREAD) during an active group_exit is forbidden. Clone's observe phase reads `group_exit.state`; if Some, clone fails with EAGAIN (Linux uses EAGAIN for resource contention). This prevents new threads from joining a dying process.
+Clone(CLONE_THREAD) during an active episode is forbidden. The lane lock covers
+the idle check and roster attach; TID publication happens only after admission.
+Contention fails with EAGAIN and cannot expose a ghost TID.
 
 ### 5.2 Invariants
 
 <!-- txdoc:PROCESS-INVARIANTS-1 -->
 
-- **Single initiator.** The CAS on `state` ensures only one thread initiates a given collapse.
-- **Bounded wait.** Remaining threads are each a running reactor task. Each, on its next delivery site, observes termination and exits. No thread can escape the collapse (short of a kernel bug).
-- **No new threads.** Clone checks `group_exit.state` at commit; denied while collapsing.
-- **Completion fires exactly once.** `remaining_threads` is a monotonic countdown. The thread whose decrement brings it to 0 fires the waker. Subsequent decrements (impossible given no new threads) would be bugs.
+- **Single owner generation.** Exactly one owner controls a live episode.
+- **One permit per TID.** `claimed_thread_exits` makes sibling exit completion
+  linear; permits are non-Clone, non-Copy values consumed by finish.
+- **Count follows topology.** `thread_count` decrements only when roster detach
+  returns the removed thread; checked `remaining_threads` decrement cannot
+  underflow.
+- **No new threads.** Clone admission and attach occur under the episode lock;
+  denied clones publish no TID.
+- **Abandoned collapse drains.** `ExecAborting` is cleared exactly when the last
+  already-issued permit completes; it cannot leak a permanent lane owner.
 
 ### 5.3 Observer behavior during collapse
 
@@ -872,7 +891,8 @@ fn step_clone_thread(
 
 <!-- txdoc:PROCESS-EXECVE-V1-SCOPE-1 -->
 
-v1 supports static ELF binaries executed from the thread-group leader. Dynamic linking (PT_INTERP) and non-leader exec are deferred.
+Exec supports static ELF, PIE, and `PT_INTERP` images from the thread-group
+leader. Non-leader exec remains deferred.
 
 ```rust
 async fn script_execve(path: &str, argv: &[&str], envp: &[&str]) -> Result<!, Errno> {
@@ -881,14 +901,15 @@ async fn script_execve(path: &str, argv: &[&str], envp: &[&str]) -> Result<!, Er
     require_executable(&target, &caller_cred)?;    // cred check (Phase 2 for full: suid, caps)
     let parsed = elf::load_header_and_segments(&target).await?;  // ELF parse
 
-    // Phase B: thread-group collapse (if multi-threaded)
-    if caller_proc.payload.thread_count.load() > 1 {
-        if !caller_is_leader() {
-            return Err(Errno::ENOSYS);  // v1 limitation: only leader may exec
-        }
-        initiate_group_exit_for_exec(caller_proc).await?;
-        // After this returns, caller is the sole thread.
+    // Phase B: acquire the shared process-lifecycle lane and collapse siblings.
+    if !caller_is_leader() {
+        return Err(Errno::ENOSYS);
     }
+    let mut process_prep = ProcessExecPrep::begin(caller_proc, caller_thread)
+        .map_err(|_| Errno::EAGAIN)?;
+    process_prep.collapse_threads(caller_thread)
+        .map_err(|_| Errno::EAGAIN)?;
+    // After this returns, caller is the sole thread and the lane remains held.
 
     // Phase C: POINT OF NO RETURN — begin irreversible mutations
 
@@ -926,7 +947,8 @@ async fn script_execve(path: &str, argv: &[&str], envp: &[&str]) -> Result<!, Er
 **Failure modes:**
 
 - Phase A failures (ENOENT, EACCES, ENOEXEC, etc.) — exec fails cleanly, caller continues.
-- Phase B collapse failure — not possible (collapse cannot fail).
+- Phase B lifecycle contention or an in-flight sibling exit — EAGAIN before
+  address-space mutation; the old image remains runnable.
 - Phase C onward — no rollback. Any failure here terminates the process (SIGBUS or kernel panic depending on the failure point). This is POSIX-acceptable per SUBSYSTEM_ANATOMY §3.7 (point of no return).
 
 ### 7.3 Exit steps
@@ -939,12 +961,14 @@ async fn script_execve(path: &str, argv: &[&str], envp: &[&str]) -> Result<!, Er
 
 Specified in THREAD_RUNTIME_v1 §7.2. This subsection covers process-level concerns.
 
-When step_thread_exit runs, after it has updated thread state:
+When step_thread_exit runs under its linear permit:
 
-1. Decrement `payload.thread_count`.
-2. If the exiting thread is the leader and `thread_count > 0`: record status in `payload.leader_exit_status`.
-3. If `thread_count == 0`: trigger step_process_exit (this was the last thread).
-4. If `group_exit.state` is Some: decrement `remaining_threads`; if reaches 0, fire completion_channel.
+1. Zombify the thread and detach it from the payload roster.
+2. Decrement `payload.thread_count` only if detach returned that thread.
+3. If the exiting thread is the leader and `thread_count > 0`: record status in `payload.leader_exit_status`.
+4. If `thread_count == 0`: promote the episode to `Exit` and trigger step_process_exit.
+5. For an exec-collapse permit, checked-decrement `remaining_threads`; the last
+   `ExecAborting` completion clears the abandoned episode.
 
 Cases:
 - `thread_count > 0` after decrement: thread exit complete; process continues.
@@ -955,38 +979,14 @@ Cases:
 <!-- txdoc:PROCESS-STEP-EXIT-GROUP-1 -->
 
 ```rust
-fn step_exit_group(status: ExitStatus, caller_proc: Cap<ProcessIdentity>) -> StepOutcome<!> {
-    // Phase 1: observe — check if collapse already in progress (CAS check first)
-
-    let collapse_state = GroupExitState {
-        status,
-        is_exec: false,
-        remaining_threads: AtomicU32::new(thread_count - 1),
-        completion_channel: Channel::new(),
-    };
-
-    match caller_proc.payload.group_exit.state.compare_exchange(
-        None,
-        Some(Cap::new(collapse_state)),
-    ) {
-        Ok(_) => {
-            // This thread is initiator. Wake all other threads.
-            wake_all_non_self_threads(caller_proc);
-            // Wait for collapse completion.
-            reactor::wait(completion_channel, MASK_COMPLETE, WaitProtocol::Killable).await;
-            // Now this thread exits too. step_thread_exit (which will be the last).
-            step_thread_exit(caller_thread, status)?;
-            // step_thread_exit will trigger step_process_exit because thread_count==0.
-            unreachable!()
-        }
-        Err(_) => {
-            // Someone else initiated; we join as non-initiator.
-            // Fall through to our own step_thread_exit.
-            let existing_status = caller_proc.payload.group_exit.state.load().status;
-            step_thread_exit(caller_thread, existing_status)?;
-            unreachable!()
-        }
+fn step_exit_group(status: ExitStatus, caller_proc: Cap<ProcessIdentity>) -> ProcessExitOutcome {
+    if !caller_proc.payload.reserve_group_exit(status) {
+        return ProcessExitOutcome::Retry;
     }
+    // Commit under the Exit owner: zombify each live thread exactly once,
+    // detach the payload, record status, and publish exit notifications.
+    commit_group_exit(caller_proc, status);
+    ProcessExitOutcome::Completed
 }
 ```
 

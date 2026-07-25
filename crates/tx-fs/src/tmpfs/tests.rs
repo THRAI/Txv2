@@ -1834,7 +1834,7 @@ fn tmpfs_symlink_payload_uses_shared_target_bytes() {
 }
 
 // ---------------------------------------------------------------------------
-// `step_chmod` / `step_chown` tests (Wave 3 Part 2 of the DAC + setuid
+// `chmod_inode` / `chown_inode` tests (Wave 3 Part 2 of the DAC + setuid
 // slice). Validate the POSIX permission rules tmpfs enforces:
 //
 // - chmod: caller must be the inode owner OR carry `CAP_FOWNER`;
@@ -1871,7 +1871,7 @@ fn tmpfs_chmod_owner_succeeds() {
             other => panic!("create_inode: {other:?}"),
         };
     assert_eq!(
-        <Tmpfs as FsOps>::step_chmod(&*tmpfs, file_id, 0o600, &owner, &guard),
+        <Tmpfs as FsOps>::chmod_inode(&*tmpfs, file_id, 0o600, &owner, &guard),
         StepOutcome::Done(())
     );
 
@@ -1900,7 +1900,7 @@ fn tmpfs_chmod_non_owner_returns_eperm() {
             other => panic!("create_inode: {other:?}"),
         };
     assert_eq!(
-        <Tmpfs as FsOps>::step_chmod(&*tmpfs, file_id, 0o600, &stranger, &guard),
+        <Tmpfs as FsOps>::chmod_inode(&*tmpfs, file_id, 0o600, &stranger, &guard),
         StepOutcome::Err(Errno::EPERM)
     );
 }
@@ -1925,7 +1925,7 @@ fn tmpfs_chmod_with_fowner_cap_succeeds() {
             other => panic!("create_inode: {other:?}"),
         };
     assert_eq!(
-        <Tmpfs as FsOps>::step_chmod(&*tmpfs, file_id, 0o755, &admin, &guard),
+        <Tmpfs as FsOps>::chmod_inode(&*tmpfs, file_id, 0o755, &admin, &guard),
         StepOutcome::Done(())
     );
     let meta = match tmpfs.load_inode_meta(file_id, &guard) {
@@ -1953,7 +1953,7 @@ fn tmpfs_chown_unprivileged_to_self_succeeds() {
 
     // Chown to current uid/gid (no-op-shaped success).
     assert_eq!(
-        <Tmpfs as FsOps>::step_chown(&*tmpfs, file_id, Some(1000), Some(200), &owner, &guard),
+        <Tmpfs as FsOps>::chown_inode(&*tmpfs, file_id, Some(1000), Some(200), &owner, &guard),
         StepOutcome::Done(())
     );
     let meta = match tmpfs.load_inode_meta(file_id, &guard) {
@@ -1983,12 +1983,12 @@ fn tmpfs_chown_unprivileged_to_other_returns_eperm() {
     // Try to chown to a foreign uid; non-privileged callers can only
     // chown to their own uid.
     assert_eq!(
-        <Tmpfs as FsOps>::step_chown(&*tmpfs, file_id, Some(2000), None, &owner, &guard),
+        <Tmpfs as FsOps>::chown_inode(&*tmpfs, file_id, Some(2000), None, &owner, &guard),
         StepOutcome::Err(Errno::EPERM)
     );
     // Same for gid.
     assert_eq!(
-        <Tmpfs as FsOps>::step_chown(&*tmpfs, file_id, None, Some(999), &owner, &guard),
+        <Tmpfs as FsOps>::chown_inode(&*tmpfs, file_id, None, Some(999), &owner, &guard),
         StepOutcome::Err(Errno::EPERM)
     );
 }
@@ -2025,7 +2025,7 @@ fn tmpfs_chown_clears_setuid_bit_for_non_privileged() {
     // Non-privileged owner self-chown clears the setuid + setgid
     // bits. Use the owner cred (no CAP_FOWNER).
     assert_eq!(
-        <Tmpfs as FsOps>::step_chown(&*tmpfs, file_id, Some(1000), Some(200), &owner, &guard),
+        <Tmpfs as FsOps>::chown_inode(&*tmpfs, file_id, Some(1000), Some(200), &owner, &guard),
         StepOutcome::Done(())
     );
     let meta = match tmpfs.load_inode_meta(file_id, &guard) {
@@ -2039,11 +2039,11 @@ fn tmpfs_chown_clears_setuid_bit_for_non_privileged() {
     // callers for executable files: setuid is cleared, and setgid is
     // cleared when the group-execute bit is present.
     assert_eq!(
-        <Tmpfs as FsOps>::step_chmod(&*tmpfs, file_id, S_ISUID | S_ISGID | 0o770, &admin, &guard),
+        <Tmpfs as FsOps>::chmod_inode(&*tmpfs, file_id, S_ISUID | S_ISGID | 0o770, &admin, &guard),
         StepOutcome::Done(())
     );
     assert_eq!(
-        <Tmpfs as FsOps>::step_chown(&*tmpfs, file_id, Some(1000), None, &admin, &guard),
+        <Tmpfs as FsOps>::chown_inode(&*tmpfs, file_id, Some(1000), None, &admin, &guard),
         StepOutcome::Done(())
     );
     let meta = match tmpfs.load_inode_meta(file_id, &guard) {
@@ -2071,7 +2071,7 @@ fn tmpfs_chown_preserves_setgid_without_group_execute() {
     };
 
     assert_eq!(
-        <Tmpfs as FsOps>::step_chown(&*tmpfs, file_id, Some(0), Some(0), &admin, &guard),
+        <Tmpfs as FsOps>::chown_inode(&*tmpfs, file_id, Some(0), Some(0), &admin, &guard),
         StepOutcome::Done(())
     );
     let meta = match tmpfs.load_inode_meta(file_id, &guard) {

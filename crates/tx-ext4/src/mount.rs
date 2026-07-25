@@ -11,13 +11,15 @@ use tx_subsystems::page_backed::FsPageBacking;
 use tx_subsystems::vfs::structure::{FsObjectId, InodeMeta};
 use tx_subsystems::vfs::FsOps;
 
-use crate::journal::{JournalFsyncSource, JournalMutationRuntime, JournalMutationWriteSource, JournalPagePool};
+use crate::journal::{
+    JournalFsyncSource, JournalMutationRuntime, JournalMutationWriteSource, JournalPagePool,
+};
 use crate::planner::{Ext4BlockGeometry, Ext4PlannerBinding};
-use tx_ext4_format::{clean_replayed_journal, replay_journal};
 pub use crate::read_backend::FilePageContainerBinder;
 use crate::read_backend::{
     map_inode_meta, Ext4FsInstance, Ext4PagerMutationPlanSource, EXT4_ROOT_INODE,
 };
+use tx_ext4_format::{clean_replayed_journal, replay_journal};
 
 pub struct MountedExt4<I> {
     backend: Arc<Ext4FsInstance<I>>,
@@ -45,10 +47,7 @@ where
         self.backend.bind_mount_payload(payload);
     }
 
-    pub fn set_file_page_container_binder(
-        &self,
-        binder: Option<Arc<dyn FilePageContainerBinder>>,
-    ) {
+    pub fn set_file_page_container_binder(&self, binder: Option<Arc<dyn FilePageContainerBinder>>) {
         self.backend.set_file_page_container_binder(binder);
     }
 }

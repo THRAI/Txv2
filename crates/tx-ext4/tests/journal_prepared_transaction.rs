@@ -11,9 +11,9 @@ use tx_ext4_format::journal::{
 use tx_ext4_format::mutation::{
     Ext4MutationPlan, FsyncStamp, MetaRole, MetadataBlock, MutationOrigin, SealedDataWrite,
 };
+use tx_ext4_format::pager::JournalGeometry;
 use tx_subsystems::fs_iface::{IoDataLeaseId, IoDataSource, PageFrameRef};
 use tx_subsystems::io_manager::block::{DeviceKey, LbaRange};
-use tx_ext4_format::pager::JournalGeometry;
 
 fn setup() {
     tx_test_support::init_host();

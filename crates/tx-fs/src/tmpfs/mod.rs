@@ -1051,8 +1051,8 @@ impl FsOps for Tmpfs {
     /// in-depth for kernel-internal callers (none today) and the
     /// canonical site if the syscall-arm gate ever changes.
     /// Preserves `S_IFMT` (file kind is immutable through chmod).
-    /// Per the DAC + setuid plan §"FsOps::step_chmod / step_chown".
-    fn step_chmod(
+    /// Per the DAC + setuid plan §"FsOps::chmod_inode / chown_inode".
+    fn chmod_inode(
         &self,
         fs_object_id: FsObjectId,
         new_mode: u16,
@@ -1084,8 +1084,8 @@ impl FsOps for Tmpfs {
     /// consumes). Linux's silent-clear rule always drops `S_ISUID`
     /// and drops `S_ISGID` when the file has group-execute set
     /// (matches LTP `chown02`/`chown03`).
-    /// Per the DAC + setuid plan §"FsOps::step_chmod / step_chown".
-    fn step_chown(
+    /// Per the DAC + setuid plan §"FsOps::chmod_inode / chown_inode".
+    fn chown_inode(
         &self,
         fs_object_id: FsObjectId,
         new_uid: Option<u32>,

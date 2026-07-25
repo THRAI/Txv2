@@ -16,29 +16,29 @@ mod fsync_submission;
 pub mod notification;
 
 use adapter::step_engine::{
-    self as step_engine, AllocError, BitmapPageAllocator, ByteProgress, CachePin, Cap, DeviceFrame,
-    MapPin, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity, Weak, ZeroPolicy, Zone,
-    ZoneAllocated, ZoneError, page_allocator,
+    self as step_engine, page_allocator, AllocError, BitmapPageAllocator, ByteProgress, CachePin,
+    Cap, DeviceFrame, MapPin, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity, Weak,
+    ZeroPolicy, Zone, ZoneAllocated, ZoneError,
 };
 
 use crate::execution::{Errno, Guard};
 use crate::fs_iface::{BackendPlan, FsObjectKey, IoDataLeaseId, IoDataSource, IoDataTarget};
 use crate::io_manager::backend::{
-    BlockPageCompletion, BlockPageRequestTracker, PageFrameRef, dispatch_backend_plan,
+    dispatch_backend_plan, BlockPageCompletion, BlockPageRequestTracker, PageFrameRef,
 };
 use crate::io_manager::block::{
     BlockCompletion, BlockCompletionSource, BlockDispatchExecutor, BlockQueue, BlockRequestId,
     BlockServiceDriver, BlockServiceNext, BlockTagTable, QueueError, SubmitOutcome,
 };
 use crate::io_manager::page::{
-    PageContainerKey, PageGeneration, PageIoCompletionKind, PageIoFlags, PageIoOp, PageIoPriority,
-    PageIoRange, PageIoRequest, PageIoRequestId, PageIoResult,
     service::{
         PageCompletionRoute, PageService, PageServiceBackendContext, PageServiceBackendDriven,
         PageServiceBackendOutcome, PageServiceBackendSubmitOutcome, PageServiceDrivenWork,
         PageServiceNext, PageServiceTaggedBlockCompletionError, PageServiceTurn, PageServiceWork,
         PageWaitInterest, PageWaiter,
     },
+    PageContainerKey, PageGeneration, PageIoCompletionKind, PageIoFlags, PageIoOp, PageIoPriority,
+    PageIoRange, PageIoRequest, PageIoRequestId, PageIoResult,
 };
 use crate::io_manager::runtime::{
     IoServiceKind, QueueDepth, ServiceBudget, ServiceKick, ServiceWakeSource,
@@ -80,8 +80,8 @@ pub use slot::{
 use sparse_index::SparseIndex;
 pub use targeted_read::read_exact_at;
 pub use user_buffer::{
-    ReadToUserOp, WriteFromUserOp, step_read_to_kernel, step_read_to_user, step_write_from_kernel,
-    step_write_from_user,
+    step_read_to_kernel, step_read_to_user, step_write_from_kernel, step_write_from_user,
+    ReadToUserOp, WriteFromUserOp,
 };
 
 #[cfg(test)]
@@ -1814,7 +1814,8 @@ impl PageContainer {
                         let rollback_request = request.clone();
                         let source = self.file_io_source_for_submission(&request);
                         let target = self.file_io_target_for_submission(&request);
-                        let guard = step_engine::guard();
+                        let guard =
+                            step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
                         let plan = match context.prepare_submission_with_source_and_target(
                             &request, &source, &target, &guard,
                         ) {
@@ -2071,7 +2072,12 @@ impl PageContainer {
         route: &PageCompletionRoute,
     ) -> Option<Result<PageSlotSnapshot, PageSlotCompletionError>> {
         if route.completion.kind == PageIoCompletionKind::Noop {
-            if self.state.lock().background_graphs.remove(&route.completion.id) {
+            if self
+                .state
+                .lock()
+                .background_graphs
+                .remove(&route.completion.id)
+            {
                 self.notify_file_background_completion(&route.completion);
                 return None;
             }
@@ -2565,8 +2571,7 @@ impl PageContainer {
         page: PageIndex,
         access: MaterializeAccess,
     ) -> Result<MaterializedPage, PageCacheError> {
-        let guard =
-            adapter::step_engine::epoch::borrow_current_guard().unwrap_or_else(step_engine::guard);
+        let guard = adapter::step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
         self.materialize_page_now(page, access, &guard)
     }
 

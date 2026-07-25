@@ -137,12 +137,16 @@ impl JournalTransactionPlan {
     /// after [`Self::data_graph`] has completed successfully.
     pub fn commit_graph_after_data(&self) -> Result<BackendBioGraph, JournalTransactionPlanError> {
         let mut builder = GraphBuilder::new();
-        let activation_fence = self.activation.as_ref().map(|activation| {
-            let activation = builder.push(activation.clone())?;
-            let fence = builder.push(fence(self.device))?;
-            builder.depends_on(activation, fence);
-            Ok::<_, JournalTransactionPlanError>(fence)
-        }).transpose()?;
+        let activation_fence = self
+            .activation
+            .as_ref()
+            .map(|activation| {
+                let activation = builder.push(activation.clone())?;
+                let fence = builder.push(fence(self.device))?;
+                builder.depends_on(activation, fence);
+                Ok::<_, JournalTransactionPlanError>(fence)
+            })
+            .transpose()?;
         let descriptor = builder.push(self.descriptor.clone())?;
         if let Some(activation_fence) = activation_fence {
             builder.depends_on(activation_fence, descriptor);
@@ -387,7 +391,11 @@ impl JournalPagePool {
     ) -> Result<u64, JournalPagePoolError> {
         let superblock_state_pages = usize::from(has_superblock_state) * 2;
         let pages = owned_data_pages
-            .checked_add(metadata_pages.checked_mul(2).ok_or(JournalPagePoolError::Capacity)?)
+            .checked_add(
+                metadata_pages
+                    .checked_mul(2)
+                    .ok_or(JournalPagePoolError::Capacity)?,
+            )
             .and_then(|pages| pages.checked_add(2))
             .and_then(|pages| pages.checked_add(superblock_state_pages))
             .ok_or(JournalPagePoolError::Capacity)?;
@@ -731,7 +739,9 @@ impl JournalRing {
         sectors_per_block: u64,
         logical: usize,
     ) -> Result<LbaRange, JournalRingError> {
-        let physical = *blocks.get(logical).ok_or(JournalRingError::InvalidGeometry)?;
+        let physical = *blocks
+            .get(logical)
+            .ok_or(JournalRingError::InvalidGeometry)?;
         let start = physical
             .checked_mul(sectors_per_block)
             .ok_or(JournalRingError::LbaOverflow)?;
@@ -955,7 +965,7 @@ impl PreparedJournalTransaction {
         )
         .map_err(PreparedJournalTransactionError::Pool)?;
         pool.ensure_capacity(required_pages)
-        .map_err(PreparedJournalTransactionError::Pool)?;
+            .map_err(PreparedJournalTransactionError::Pool)?;
         let device = mutation.layout.device;
         let mut records = Vec::new();
         let mut data_writes = Vec::new();
@@ -1040,7 +1050,7 @@ impl PreparedJournalTransaction {
         )
         .map_err(PreparedJournalTransactionError::Pool)?;
         pool.ensure_capacity(required_pages)
-        .map_err(PreparedJournalTransactionError::Pool)?;
+            .map_err(PreparedJournalTransactionError::Pool)?;
 
         let device = mutation.layout.device;
         let mut records = Vec::new();
@@ -1481,7 +1491,14 @@ impl JournalMutationRuntime {
         geometry: JournalGeometry,
     ) -> Result<Self, JournalRingError> {
         let sequence = geometry.superblock.sequence;
-        Self::from_geometry_with_sequence(source, pool, device, sectors_per_block, geometry, sequence)
+        Self::from_geometry_with_sequence(
+            source,
+            pool,
+            device,
+            sectors_per_block,
+            geometry,
+            sequence,
+        )
     }
 
     pub fn from_geometry_with_sequence(

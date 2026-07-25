@@ -40,6 +40,7 @@
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 pub mod adapter;
 
@@ -50,6 +51,7 @@ use adapter::step_engine::{
 
 use tx_subsystems::device::{self, BlockDeviceHandle, DevT};
 use tx_subsystems::execution::{Errno, Guard};
+use tx_subsystems::io_manager::block::{BioPlan, BioVec, BlockFlags, BlockOp, DeviceKey, LbaRange};
 use tx_subsystems::mount::{MountPayload, MountPayloadPin};
 use tx_subsystems::page_backed::{reserve_frame_with_reclaim, Frame, FsPageBacking, PageContainer};
 use tx_subsystems::vfs::{
@@ -166,7 +168,7 @@ impl BdevFsMountPayload {
     fn get_or_create_pc(
         &self,
         devt: DevT,
-        reg: &device::BlockDeviceRegistration,
+        reg: &'static device::BlockDeviceRegistration,
         fs_object_id: FsObjectId,
         mount: &Cap<MountPayload>,
         guard: &Guard<'_>,
@@ -192,15 +194,22 @@ impl BdevFsMountPayload {
         )
         .map_err(|_| Errno::ENOMEM)?;
 
-        let mut index = self.coherence.lock();
-        if let Some(weak) = index.get(&devt) {
-            if let Some(cap) = weak.upgrade(guard) {
-                return Ok(cap);
+        {
+            let mut index = self.coherence.lock();
+            if let Some(weak) = index.get(&devt) {
+                if let Some(cap) = weak.upgrade(guard) {
+                    return Ok(cap);
+                }
+                index.remove(&devt);
             }
-            index.remove(&devt);
+
+            index.insert(devt, new_pc.downgrade());
         }
 
-        index.insert(devt, new_pc.downgrade());
+        let _runtime = device::register_page_container_file_io_service(
+            new_pc.clone(),
+            BlockDeviceHandle::whole(reg),
+        );
         Ok(new_pc)
     }
 }
@@ -267,6 +276,64 @@ pub fn block_device_for_object_id(
 ) -> Option<&'static device::BlockDeviceRegistration> {
     let index = entry_index(fs_object_id)?;
     device_by_index(index)
+}
+
+/// Plan a page-sized bdev-fs read/write as a neutral L6 `BioPlan`.
+///
+/// This is a compatibility-side planning helper for the staged I/O manager
+/// migration. It does not submit to `BlockDeviceHandle`; the existing
+/// `FsPageBacking` direct path remains the live executor.
+pub fn plan_page_bio(
+    fs_object_id: FsObjectId,
+    offset: u64,
+    op: BlockOp,
+    buffer_key: u64,
+) -> Result<BioPlan, Errno> {
+    if !matches!(op, BlockOp::Read | BlockOp::Write) {
+        return Err(Errno::EINVAL);
+    }
+
+    let reg = block_device_for_object_id(fs_object_id).ok_or(Errno::ENOENT)?;
+    let block_size = u64::from(reg.ops.block_size());
+    let page_size = tx_subsystems::vm::USER_PAGE_SIZE as u64;
+    if block_size == 0 || page_size == 0 || !page_size.is_multiple_of(block_size) {
+        return Err(Errno::EINVAL);
+    }
+    if !offset.is_multiple_of(page_size) {
+        return Err(Errno::EINVAL);
+    }
+
+    let start_lba = offset / block_size;
+    let handle = BlockDeviceHandle::whole(reg);
+    let device_blocks = handle.len_lba();
+    if start_lba >= device_blocks {
+        return Err(Errno::EINVAL);
+    }
+
+    let blocks_per_page = page_size / block_size;
+    let block_count = core::cmp::min(blocks_per_page, device_blocks - start_lba);
+    Ok(BioPlan::new(
+        DeviceKey::new(reg.devt.raw()),
+        op,
+        LbaRange::new(start_lba, block_count),
+        alloc::vec![BioVec::new(buffer_key, 0, page_size as u32)],
+        BlockFlags::EMPTY,
+    ))
+}
+
+/// Plan a bdev-fs barrier as a neutral L6 `BioPlan`.
+///
+/// The helper intentionally only plans the operation; legacy fsync still calls
+/// `BlockDeviceHandle::barrier` until L6 submission becomes the live path.
+pub fn plan_barrier_bio(fs_object_id: FsObjectId) -> Result<BioPlan, Errno> {
+    let reg = block_device_for_object_id(fs_object_id).ok_or(Errno::ENOENT)?;
+    Ok(BioPlan::new(
+        DeviceKey::new(reg.devt.raw()),
+        BlockOp::Barrier,
+        LbaRange::new(0, 0),
+        Vec::new(),
+        BlockFlags::BARRIER,
+    ))
 }
 
 fn block_device_meta(reg: &device::BlockDeviceRegistration) -> InodeMeta {
@@ -491,7 +558,7 @@ impl FsOps for BdevFsMountPayload {
         StepOutcome::err(Errno::EINVAL.into())
     }
 
-    fn step_chmod(
+    fn chmod_inode(
         &self,
         _fs_object_id: FsObjectId,
         _new_mode: u16,
@@ -501,7 +568,7 @@ impl FsOps for BdevFsMountPayload {
         StepOutcome::err(Errno::EROFS.into())
     }
 
-    fn step_chown(
+    fn chown_inode(
         &self,
         _fs_object_id: FsObjectId,
         _new_uid: Option<u32>,
@@ -951,7 +1018,7 @@ impl FsOps for BdevFs {
         StepOutcome::err(Errno::EINVAL.into())
     }
 
-    fn step_chmod(
+    fn chmod_inode(
         &self,
         _fs_object_id: FsObjectId,
         _new_mode: u16,
@@ -961,7 +1028,7 @@ impl FsOps for BdevFs {
         StepOutcome::err(Errno::EROFS.into())
     }
 
-    fn step_chown(
+    fn chown_inode(
         &self,
         _fs_object_id: FsObjectId,
         _new_uid: Option<u32>,
@@ -1225,6 +1292,7 @@ fn allocate_owned_page() -> Option<
 mod tests {
     use super::*;
     use tx_subsystems::device::{BlockDevice, BlockDeviceOps, PhysicalBlockNumber};
+    use tx_subsystems::io_manager::block::{BioVec, BlockFlags, BlockOp, DeviceKey, LbaRange};
     use tx_subsystems::mount::{DevId, MountOptions, SourceLabel};
     use tx_subsystems::page_backed::{read_exact_at, PageContainerKind};
 
@@ -1347,5 +1415,97 @@ mod tests {
 
         assert_eq!(&bytes[..8], b"bdevfs!\0");
         assert_eq!(u64::from_le_bytes(bytes[8..16].try_into().unwrap()), 0);
+    }
+
+    #[test]
+    fn materialised_block_device_registers_one_file_io_service_runtime() {
+        let _serial = crate::test_support::FS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        init_bdevfs_test();
+        device::reset_page_container_file_io_service_registry_for_test();
+        let guard = step_engine::guard();
+        let bdevfs = Arc::new(BdevFsMountPayload::new());
+        let mount = bdevfs_mount_payload(&bdevfs);
+
+        let fs_object_id = match bdevfs.lookup(BDEVFS_ROOT_ID, b"vdr", &guard) {
+            StepOutcome::Done(id) => id,
+            other => panic!("lookup vdr failed: {other:?}"),
+        };
+        let meta = match bdevfs.load_inode_meta(fs_object_id, &guard) {
+            StepOutcome::Done(meta) => meta,
+            other => panic!("load_inode_meta vdr failed: {other:?}"),
+        };
+
+        let first = match bdevfs.materialise_rnode(fs_object_id, meta, &mount, &guard) {
+            StepOutcome::Done(rnode) => rnode,
+            other => panic!("first materialise_rnode vdr failed: {other:?}"),
+        };
+        assert_eq!(device::page_container_file_io_service_runtime_count(), 1);
+
+        let second = match bdevfs.materialise_rnode(fs_object_id, meta, &mount, &guard) {
+            StepOutcome::Done(rnode) => rnode,
+            other => panic!("second materialise_rnode vdr failed: {other:?}"),
+        };
+        assert_eq!(device::page_container_file_io_service_runtime_count(), 1);
+
+        let RNodeBacking::PageBacked { pc: first_pc } = first.backing() else {
+            panic!("first bdevfs rnode must be page-backed");
+        };
+        let RNodeBacking::PageBacked { pc: second_pc } = second.backing() else {
+            panic!("second bdevfs rnode must be page-backed");
+        };
+        assert_eq!(first_pc.page_count(), second_pc.page_count());
+
+        let snapshot = device::page_container_file_io_service_runtimes_snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].handle().registration().devt, PATTERN_REG.devt);
+        assert_eq!(snapshot[0].handle().start_lba(), 0);
+        assert_eq!(
+            snapshot[0].handle().len_lba(),
+            PATTERN_REG.ops.total_blocks()
+        );
+        assert_eq!(snapshot[0].container().page_count(), first_pc.page_count());
+    }
+
+    #[test]
+    fn bdevfs_plans_page_offsets_as_bioplans_without_touching_driver() {
+        let _serial = crate::test_support::FS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        init_bdevfs_test();
+        let guard = step_engine::guard();
+        let bdevfs = BdevFsMountPayload::new();
+        let fs_object_id = match bdevfs.lookup(BDEVFS_ROOT_ID, b"vdr", &guard) {
+            StepOutcome::Done(id) => id,
+            other => panic!("lookup vdr failed: {other:?}"),
+        };
+
+        let read = plan_page_bio(
+            fs_object_id,
+            tx_subsystems::vm::USER_PAGE_SIZE as u64,
+            BlockOp::Read,
+            0xabc,
+        )
+        .expect("read page should plan to a bio");
+        assert_eq!(read.device, DeviceKey::new(PATTERN_REG.devt.raw()));
+        assert_eq!(read.op, BlockOp::Read);
+        assert_eq!(read.lba, LbaRange::new(1, 1));
+        assert_eq!(
+            read.vecs,
+            alloc::vec![BioVec::new(
+                0xabc,
+                0,
+                tx_subsystems::vm::USER_PAGE_SIZE as u32
+            )]
+        );
+        assert_eq!(read.flags, BlockFlags::EMPTY);
+
+        let barrier = plan_barrier_bio(fs_object_id).expect("barrier should plan");
+        assert_eq!(barrier.device, DeviceKey::new(PATTERN_REG.devt.raw()));
+        assert_eq!(barrier.op, BlockOp::Barrier);
+        assert_eq!(barrier.lba, LbaRange::new(0, 0));
+        assert!(barrier.vecs.is_empty());
+        assert!(barrier.flags.contains(BlockFlags::BARRIER));
     }
 }

@@ -107,10 +107,8 @@ impl BackendPlanner for PreparedSourceRecordingPlanner {
     }
 
     fn plan_page_io(&self, request: BackendPageRequest) -> BackendPlan {
-        self.prepared_before_plan.store(
-            self.prepared_source.lock().is_some(),
-            Ordering::Release,
-        );
+        self.prepared_before_plan
+            .store(self.prepared_source.lock().is_some(), Ordering::Release);
         *self.planned_source.lock() = Some(request.source);
         BackendPlan::Complete(PageCompletionList::default())
     }
@@ -1226,6 +1224,52 @@ fn file_page_container_drives_service_submission_through_mount_planner_without_s
 }
 
 #[test]
+fn file_page_container_drives_service_submission_under_existing_epoch_guard() {
+    let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
+    setup_host_substrate();
+    let guard = step_engine::guard();
+    let fs = Arc::new(RecordingFs::new());
+    let planner = Arc::new(LockCheckingPlanner::new());
+    let pc =
+        file_page_container_with_planner(fs.clone(), fs, FsObjectId::new(89), 4, planner.clone());
+    {
+        let mut state = pc.state.lock();
+        state
+            .file_io_service
+            .submit(
+                pc.io_manager_key(),
+                PageIoRange::new(1, 1),
+                PageIoOp::Read,
+                PageIoPriority::Demand,
+                PageIoFlags::DEMAND,
+                Some(PageGeneration::new(7)),
+            )
+            .expect("staged file service submission");
+    }
+
+    let mut block_queue = BlockQueue::new(4);
+    let driven = pc
+        .drive_file_io_service_once(ServiceBudget::new(1), &mut block_queue, |_| true)
+        .expect("file service drive under existing guard");
+
+    drop(guard);
+    assert_eq!(planner.calls.load(Ordering::Acquire), 1);
+    assert!(
+        !planner.saw_page_container_lock.load(Ordering::Acquire),
+        "backend planning must still run after releasing PageContainer state lock"
+    );
+    assert_eq!(
+        driven.work,
+        alloc::vec![PageServiceDrivenWork::BackendSubmission(
+            PageServiceBackendSubmitOutcome::QueuedPageCompletions {
+                queued: 1,
+                wake: Some(crate::io_manager::page::service::PageServiceWake::Wake),
+            },
+        )]
+    );
+}
+
+#[test]
 fn file_page_service_completion_applies_matching_error_to_pageslot() {
     let _lock = EPOCH_TEST_LOCK.lock().expect("page-backed epoch test lock");
     setup_host_substrate();
@@ -1435,24 +1479,22 @@ fn file_close_writeback_admission_queues_dirty_pages_without_fsync() {
             && source.raw() == 0x7103
             && interests.raw() == IoServiceKind::Page.mask_bits()
     ));
-    assert!(
-        pc.state
-            .lock()
-            .file_io_service
-            .find_submission(
-                pc.io_manager_key(),
-                PageIoRange::new(page.as_u64(), 1),
-                PageIoOp::Writeback,
-            )
-            .is_some()
-    );
-    assert!(
-        pc.state
-            .lock()
-            .file_io_service
-            .find_submission(pc.io_manager_key(), PageIoRange::new(0, 4), PageIoOp::Fsync)
-            .is_none()
-    );
+    assert!(pc
+        .state
+        .lock()
+        .file_io_service
+        .find_submission(
+            pc.io_manager_key(),
+            PageIoRange::new(page.as_u64(), 1),
+            PageIoOp::Writeback,
+        )
+        .is_some());
+    assert!(pc
+        .state
+        .lock()
+        .file_io_service
+        .find_submission(pc.io_manager_key(), PageIoRange::new(0, 4), PageIoOp::Fsync)
+        .is_none());
     assert_eq!(
         pc.file_page_slot_snapshot_for_test(page)
             .expect("slot")
@@ -1753,24 +1795,23 @@ fn file_writeback_prepares_l5_mutation_with_l4_source_before_planning() {
     let fs = Arc::new(RecordingFs::new());
     let planner = Arc::new(PreparedSourceRecordingPlanner::new());
     let backend_planner: Arc<dyn BackendPlanner> = planner.clone();
-    let pc = file_page_container_with_planner(
-        fs.clone(),
-        fs,
-        FsObjectId::new(196),
-        4,
-        backend_planner,
-    );
+    let pc =
+        file_page_container_with_planner(fs.clone(), fs, FsObjectId::new(196), 4, backend_planner);
     let page = PageIndex::new(1);
     let frame = cached_frame_for_test();
     let ppn = frame.ppn;
     {
         let mut state = pc.state.lock();
-        state.pages.install_if_absent(page, frame).expect("seed page");
+        state
+            .pages
+            .install_if_absent(page, frame)
+            .expect("seed page");
         let slot = state.file_page_slots.entry(page).or_default();
         let PageSlotFetch::Owner { generation } = slot.begin_fetch() else {
             panic!("slot fetch owner");
         };
-        slot.complete_fetch(generation, Ok(ppn)).expect("resident slot");
+        slot.complete_fetch(generation, Ok(ppn))
+            .expect("resident slot");
         slot.mark_dirty().expect("dirty slot");
         state.pages.mark_dirty(page).expect("dirty page cache");
     }
@@ -1782,7 +1823,10 @@ fn file_writeback_prepares_l5_mutation_with_l4_source_before_planning() {
         .expect("planner turn");
 
     assert!(planner.prepared_before_plan.load(Ordering::Acquire));
-    assert_eq!(*planner.prepared_source.lock(), *planner.planned_source.lock());
+    assert_eq!(
+        *planner.prepared_source.lock(),
+        *planner.planned_source.lock()
+    );
     assert!(matches!(
         *planner.prepared_source.lock(),
         Some(IoDataSource::PageCache { frame, .. }) if frame.ppn() == ppn
@@ -2468,11 +2512,8 @@ fn file_direct_submission_routes_mapped_bio_through_owned_l6_completion() {
     assert!(pc.attach_file_io_wake_source(Arc::clone(&wake_source)));
     let mailbox = Arc::new(tx_substrate::wake::TaskMailbox::new());
     let generation = mailbox.next_generation();
-    let _subscription = wake_source.subscribe(
-        IoServiceKind::Block,
-        Arc::downgrade(&mailbox),
-        generation,
-    );
+    let _subscription =
+        wake_source.subscribe(IoServiceKind::Block, Arc::downgrade(&mailbox), generation);
 
     pc.enqueue_file_direct_submission(&submission)
         .expect("plan and enqueue mapped direct bio");
@@ -3184,13 +3225,8 @@ fn file_checkpoint_completion_notifies_background_graph_owner_only() {
         page_completions: AtomicUsize::new(0),
         background_completions: SpinMutex::new(Vec::new()),
     });
-    let pc = file_page_container_with_planner(
-        fs.clone(),
-        fs,
-        FsObjectId::new(102),
-        2,
-        planner.clone(),
-    );
+    let pc =
+        file_page_container_with_planner(fs.clone(), fs, FsObjectId::new(102), 2, planner.clone());
     let request = {
         let mut state = pc.state.lock();
         let request = state
@@ -3274,13 +3310,8 @@ fn file_fsync_completion_runs_checkpoint_graph_through_owned_l6() {
         graph: SpinMutex::new(Some(graph)),
         background_completions: SpinMutex::new(Vec::new()),
     });
-    let pc = file_page_container_with_planner(
-        fs.clone(),
-        fs,
-        FsObjectId::new(104),
-        2,
-        planner.clone(),
-    );
+    let pc =
+        file_page_container_with_planner(fs.clone(), fs, FsObjectId::new(104), 2, planner.clone());
     let fsync = pc.submit_file_fsync().expect("submit fsync");
     let route = PageCompletionRoute {
         completion: PageIoCompletion::new(
@@ -3348,10 +3379,8 @@ fn file_background_admission_failure_notifies_planner_after_releasing_state_lock
             _result: Result<(), Errno>,
         ) {
             self.calls.fetch_add(1, Ordering::AcqRel);
-            self.called_under_state_lock.store(
-                page_container_state_lock_held_for_test(),
-                Ordering::Release,
-            );
+            self.called_under_state_lock
+                .store(page_container_state_lock_held_for_test(), Ordering::Release);
         }
     }
 
@@ -3360,13 +3389,8 @@ fn file_background_admission_failure_notifies_planner_after_releasing_state_lock
         calls: AtomicUsize::new(0),
         called_under_state_lock: AtomicBool::new(false),
     });
-    let pc = file_page_container_with_planner(
-        fs.clone(),
-        fs,
-        FsObjectId::new(103),
-        2,
-        planner.clone(),
-    );
+    let pc =
+        file_page_container_with_planner(fs.clone(), fs, FsObjectId::new(103), 2, planner.clone());
     {
         let mut state = pc.state.lock();
         for _ in 0..1024 {
@@ -3399,7 +3423,11 @@ fn file_background_admission_failure_notifies_planner_after_releasing_state_lock
     )
     .expect("valid checkpoint graph");
 
-    pc.queue_file_background_graph(planner.as_ref(), crate::fs_iface::FsObjectKey::new(103), graph);
+    pc.queue_file_background_graph(
+        planner.as_ref(),
+        crate::fs_iface::FsObjectKey::new(103),
+        graph,
+    );
 
     assert_eq!(planner.calls.load(Ordering::Acquire), 1);
     assert!(
@@ -3426,20 +3454,19 @@ fn fsync_op_waits_for_planner_completion_then_consumes_terminal_result() {
         .state
         .lock()
         .file_io_service
-        .find_submission(
-            pc.io_manager_key(),
-            PageIoRange::new(0, 2),
-            PageIoOp::Fsync,
-        )
+        .find_submission(pc.io_manager_key(), PageIoRange::new(0, 2), PageIoOp::Fsync)
         .cloned()
         .expect("queued fsync request");
-    pc.state.lock().file_io_service.push_completion(PageIoCompletion::new(
-        request.id,
-        request.range,
-        PageIoResult::Done,
-        PageGeneration::new(0),
-        PageIoCompletionKind::Noop,
-    ));
+    pc.state
+        .lock()
+        .file_io_service
+        .push_completion(PageIoCompletion::new(
+            request.id,
+            request.range,
+            PageIoResult::Done,
+            PageGeneration::new(0),
+            PageIoCompletionKind::Noop,
+        ));
     let mut block_queue = BlockQueue::new(4);
     pc.drive_file_io_service_once(ServiceBudget::new(1), &mut block_queue, |_| true)
         .expect("completion drive");
@@ -3506,12 +3533,16 @@ fn fsync_op_waits_for_dirty_frontier_before_submitting_fsync() {
     let ppn = frame.ppn;
     let generation = {
         let mut state = pc.state.lock();
-        state.pages.install_if_absent(page, frame).expect("seed page");
+        state
+            .pages
+            .install_if_absent(page, frame)
+            .expect("seed page");
         let slot = state.file_page_slots.entry(page).or_default();
         let PageSlotFetch::Owner { generation } = slot.begin_fetch() else {
             panic!("fetch owner");
         };
-        slot.complete_fetch(generation, Ok(ppn)).expect("resident slot");
+        slot.complete_fetch(generation, Ok(ppn))
+            .expect("resident slot");
         let dirty = slot.mark_dirty().expect("dirty slot");
         state.pages.mark_dirty(page).expect("dirty page cache");
         dirty.generation
@@ -3527,7 +3558,11 @@ fn fsync_op_waits_for_dirty_frontier_before_submitting_fsync() {
         .state
         .lock()
         .file_io_service
-        .find_submission(pc.io_manager_key(), PageIoRange::new(0, 1), PageIoOp::Writeback)
+        .find_submission(
+            pc.io_manager_key(),
+            PageIoRange::new(0, 1),
+            PageIoOp::Writeback,
+        )
         .cloned()
         .expect("writeback precedes fsync");
     assert!(pc
@@ -3536,13 +3571,16 @@ fn fsync_op_waits_for_dirty_frontier_before_submitting_fsync() {
         .file_io_service
         .find_submission(pc.io_manager_key(), PageIoRange::new(0, 2), PageIoOp::Fsync)
         .is_none());
-    pc.state.lock().file_io_service.push_completion(PageIoCompletion::new(
-        writeback.id,
-        writeback.range,
-        PageIoResult::Done,
-        generation,
-        PageIoCompletionKind::WritebackFinished,
-    ));
+    pc.state
+        .lock()
+        .file_io_service
+        .push_completion(PageIoCompletion::new(
+            writeback.id,
+            writeback.range,
+            PageIoResult::Done,
+            generation,
+            PageIoCompletionKind::WritebackFinished,
+        ));
     let mut block_queue = BlockQueue::new(4);
     pc.drive_file_io_service_once(ServiceBudget::new(1), &mut block_queue, |_| true)
         .expect("writeback completion drive");

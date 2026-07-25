@@ -33,15 +33,12 @@ pub mod step_engine {
     pub use tx_substrate::epoch::{borrow_current_guard, drain_with_budget, guard, Guard};
     pub use tx_substrate::step::ProcessIdentity as PlaceholderProcessSubject;
     pub use tx_substrate::step::{
-        drive_oneshot, Errno, NoProgress, OneShotStepOp, ScriptCtx, StepOp, StepOutcome,
-        SubjectIdentity,
+        Errno, NoProgress, OneShotStepOp, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
     };
     pub use tx_substrate::wake::{MailboxEvent, SignalRouting, TaskMailbox};
     pub use tx_substrate::zone::{
-        register_zone_for, reserve_for, sign, sign_for, Cap, CapProducingPolicy, CoLocatedEntity,
-        Dead, Entity, IdentRef, IdentitySlot, IsPayloadPolicy, ObserverNodePolicy,
-        OperationalCapExt, OperationalRefExt, PayloadBinding, PayloadCap, PayloadPolicy,
-        RetainedEntityPolicy, Weak, Zone, ZoneAllocated, ZoneError, ZonePolicy,
+        sign, Cap, Dead, Entity, OperationalCapExt, PayloadCap, PayloadPolicy, SlotKey, Weak, Zone,
+        ZoneAllocated,
     };
 }
 

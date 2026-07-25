@@ -662,10 +662,10 @@ fn ext4_v3_fetch_page_returns_done_frame_for_aligned_offset() {
 }
 
 #[test]
-fn ext4_v3_truncate_surface_enosys_but_fsync_is_accepted() {
-    // Ext4 still does not truncate through the kernel-facing PageBacked
-    // surface, but fsync must not fail OSComp workloads that only need
-    // already-accepted in-memory writes to become sync-visible.
+fn ext4_v3_truncate_and_fsync_surfaces_are_accepted() {
+    // Ext4 now accepts truncate through the kernel-facing PageBacked
+    // surface, and fsync remains a no-op success for already-accepted
+    // in-memory writes.
     let _serial = EXT4_V3_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     init_substrate();
     let fs = open_fs();
@@ -673,7 +673,7 @@ fn ext4_v3_truncate_surface_enosys_but_fsync_is_accepted() {
 
     assert_eq!(
         <Ext4FsInstance<MemImage> as FsPageBacking>::truncate(&*fs, FsObjectId::new(12), 0, &guard,),
-        V3::<(), NoProgress>::err(V3Errno::ENOSYS)
+        V3::<(), NoProgress>::done(())
     );
     assert_eq!(
         <Ext4FsInstance<MemImage> as FsPageBacking>::fsync_file(&*fs, FsObjectId::new(12), &guard),

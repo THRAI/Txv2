@@ -7,21 +7,22 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 pub mod adapter;
 
 use adapter::runtime::{
-    self, Cap, Dead, Entity, IdentitySlot, PayloadBinding, PayloadCap, PayloadPolicy, SpinMutex,
-    Zone, ZoneAllocated, ZoneError,
+    self, Cap, Dead, Entity, IdentitySlot, PayloadBinding, PayloadCap, PayloadPolicy, SlotKey,
+    SpinMutex, Zone, ZoneAllocated, ZoneError,
 };
 
 use crate::device::BlockDevice;
 use crate::execution::Errno;
 use crate::execution::KernelResult;
 use crate::fs_iface::{
-    BackendPageRequest, BackendPlan, BackendPlanResume, BackendPlanner, FsObjectKey, IoDataSource, IoDataTarget,
+    BackendPageRequest, BackendPlan, BackendPlanResume, BackendPlanner, FsObjectKey, IoDataSource,
+    IoDataTarget,
 };
 use crate::io_manager::page::{service::PageServiceBackendContext, PageIoRequest};
 use crate::page_backed::{FsPageBacking, PageContainer};
 use crate::vfs::{
     adapter::step_engine::{Guard, NoProgress, StepOutcome},
-    render_dentry_path, DEntry, FsObjectId, FsOps, InodeMeta, RNode,
+    render_dentry_path, DEntry, FsObjectId, FsOps, InlineName, InodeMeta, RNode,
 };
 
 static MOUNT_IDENTITY_ZONE: Zone<MountIdentity> = Zone::const_new();
@@ -596,8 +597,8 @@ impl Drop for MountPayloadPin {
 #[derive(Debug)]
 pub struct MountIdentity {
     id: MountId,
-    mountpoint: Option<Cap<DEntry>>,
-    root: Cap<RNode>,
+    mountpoint: SpinMutex<Option<Cap<DEntry>>>,
+    root_dentry: Cap<DEntry>,
     parent: Option<Cap<MountIdentity>>,
     payload: PayloadBinding<MountPayload>,
     flags: AtomicU64,
@@ -613,15 +614,15 @@ impl MountIdentity {
     pub fn new(
         id: MountId,
         mountpoint: Option<Cap<DEntry>>,
-        root: Cap<RNode>,
+        root_dentry: Cap<DEntry>,
         parent: Option<Cap<MountIdentity>>,
         payload: PayloadBinding<MountPayload>,
         flags: MountFlags,
     ) -> Self {
         Self {
             id,
-            mountpoint,
-            root,
+            mountpoint: SpinMutex::new(mountpoint),
+            root_dentry,
             parent,
             payload,
             flags: AtomicU64::new(flags.bits()),
@@ -638,20 +639,47 @@ impl MountIdentity {
         payload: Cap<MountPayload>,
         flags: MountFlags,
     ) -> Result<Cap<Self>, ZoneError> {
+        let root_dentry = DEntry::new_cap(InlineName::ROOT, root)?;
+        Self::new_cap_with_root_dentry(id, mountpoint, root_dentry, parent, payload, flags)
+    }
+
+    pub fn new_cap_with_root_dentry(
+        id: MountId,
+        mountpoint: Option<Cap<DEntry>>,
+        root_dentry: Cap<DEntry>,
+        parent: Option<Cap<MountIdentity>>,
+        payload: Cap<MountPayload>,
+        flags: MountFlags,
+    ) -> Result<Cap<Self>, ZoneError> {
         let payload = PayloadBinding::installed(PayloadCap::from_cap(payload));
-        runtime::sign(Self::new(id, mountpoint, root, parent, payload, flags))
+        runtime::sign(Self::new(
+            id,
+            mountpoint,
+            root_dentry,
+            parent,
+            payload,
+            flags,
+        ))
     }
 
     pub const fn id(&self) -> MountId {
         self.id
     }
 
-    pub fn mountpoint(&self) -> Option<&Cap<DEntry>> {
-        self.mountpoint.as_ref()
+    pub fn mountpoint(&self) -> Option<Cap<DEntry>> {
+        self.mountpoint.lock().clone()
+    }
+
+    fn replace_mountpoint(&self, mountpoint: Cap<DEntry>) {
+        *self.mountpoint.lock() = Some(mountpoint);
     }
 
     pub fn root(&self) -> &Cap<RNode> {
-        &self.root
+        self.root_dentry.rnode()
+    }
+
+    pub fn root_dentry(&self) -> &Cap<DEntry> {
+        &self.root_dentry
     }
 
     pub fn parent(&self) -> Option<&Cap<MountIdentity>> {
@@ -707,7 +735,24 @@ impl Entity for MountIdentity {
 #[derive(Debug)]
 pub struct MountNamespace {
     root: Cap<MountIdentity>,
-    mounts: SpinMutex<Vec<MountTableEntry>>,
+    mounts: SpinMutex<Vec<NamespaceMountEntry>>,
+}
+
+#[derive(Debug)]
+struct NamespaceMountEntry {
+    mountpoint_key: SlotKey,
+    mount: IdentitySlot<MountIdentity>,
+}
+
+struct CloneIdentitySnapshot {
+    original_key: SlotKey,
+    mountpoint: Option<Cap<DEntry>>,
+    root_dentry: Cap<DEntry>,
+    parent_key: Option<SlotKey>,
+    payload: Cap<MountPayload>,
+    flags: MountFlags,
+    propagation: Propagation,
+    peer_group: u64,
 }
 
 /// Extract the mount namespace carried by a `/proc/<pid>/ns/mnt` fd, used by
@@ -739,39 +784,51 @@ impl MountNamespace {
         &self.root
     }
 
-    pub fn register_mount(
-        &self,
-        parent_payload: &Cap<MountPayload>,
-        child_fs_object_id: FsObjectId,
-        mount: Cap<MountIdentity>,
-    ) {
-        let ptr = cap_payload_ptr(parent_payload);
-        let mut t = self.mounts.lock();
-        for e in t.iter_mut() {
-            if e.parent_payload_ptr == ptr && e.child_fs_object_id == child_fs_object_id {
-                e.mount = IdentitySlot::from_cap(mount);
-                return;
-            }
-        }
-        t.push(MountTableEntry {
-            parent_payload_ptr: ptr,
-            child_fs_object_id,
+    /// Clone the stable VFS identity for this namespace's root.
+    ///
+    /// `MountIdentity` retains the canonical root `DEntry`; namespace clones
+    /// retain that same identity. Callers must not infer the process root by
+    /// walking cwd parent hints.
+    pub fn root_dentry(&self) -> Cap<DEntry> {
+        self.root.root_dentry().clone()
+    }
+
+    pub fn register_mount(&self, mountpoint: &Cap<DEntry>, mount: Cap<MountIdentity>) {
+        debug_assert_eq!(
+            mount.mountpoint().map(|dentry| dentry.key()),
+            Some(mountpoint.key()),
+            "namespace mountpoint key must match MountIdentity.mountpoint"
+        );
+        self.mounts.lock().push(NamespaceMountEntry {
+            mountpoint_key: mountpoint.key(),
             mount: IdentitySlot::from_cap(mount),
         });
     }
 
-    pub fn mount_for(
-        &self,
-        parent_payload: &Cap<MountPayload>,
-        child_fs_object_id: FsObjectId,
-    ) -> Option<Cap<MountIdentity>> {
-        let ptr = cap_payload_ptr(parent_payload);
-        for e in self.mounts.lock().iter() {
-            if e.parent_payload_ptr == ptr && e.child_fs_object_id == child_fs_object_id {
+    pub fn mount_for(&self, mountpoint: &Cap<DEntry>) -> Option<Cap<MountIdentity>> {
+        let key = mountpoint.key();
+        for e in self.mounts.lock().iter().rev() {
+            if e.mountpoint_key == key {
                 return Some(e.mount.clone_cap());
             }
         }
         None
+    }
+
+    pub fn mount_containing_dentry(&self, dentry: &Cap<DEntry>) -> Option<Cap<MountIdentity>> {
+        let mut root = dentry.clone();
+        while let Some(parent) = root.parent_hint() {
+            root = parent;
+        }
+        if root.key() == self.root.root_dentry().key() {
+            return Some(self.root.clone());
+        }
+        self.mounts
+            .lock()
+            .iter()
+            .rev()
+            .find(|entry| entry.mount.root_dentry().key() == root.key())
+            .map(|entry| entry.mount.clone_cap())
     }
 
     pub fn snapshot_mounts(&self) -> alloc::vec::Vec<MountSnapshot> {
@@ -782,7 +839,7 @@ impl MountNamespace {
             .filter_map(|e| {
                 let m = e.mount.clone_cap();
                 let d = m.mountpoint()?;
-                let path = render_dentry_path(d).unwrap_or_else(|| b"/?".to_vec());
+                let path = render_dentry_path(&d).unwrap_or_else(|| b"/?".to_vec());
                 let p = m.payload_cap().ok()?;
                 Some(MountSnapshot {
                     source: p.source_label,
@@ -794,43 +851,174 @@ impl MountNamespace {
             .collect()
     }
 
-    pub fn umount(&self, target: &Cap<DEntry>, pp: &Cap<MountPayload>) -> Result<(), Errno> {
-        let ptr = cap_payload_ptr(pp);
-        let id = target.rnode().fs_object_id();
-        let target_rnode_cap_addr = cap_raw_addr(target.rnode());
+    pub fn umount(&self, target: &Cap<DEntry>) -> Result<Cap<MountIdentity>, Errno> {
+        let target_key = target.key();
         let mut t = self.mounts.lock();
-        let pos = t
-            .iter()
-            .position(|e| e.parent_payload_ptr == ptr && e.child_fs_object_id == id)
-            .or_else(|| {
-                t.iter().position(|e| {
-                    let root = e.mount.root();
-                    cap_raw_addr(root) == target_rnode_cap_addr || root.fs_object_id() == id
-                })
-            });
+        let pos = t.iter().rposition(|e| {
+            e.mountpoint_key == target_key || e.mount.root_dentry().key() == target_key
+        });
         if let Some(i) = pos {
-            t.remove(i);
-            Ok(())
+            Ok(t.remove(i).mount.clone_cap())
         } else {
             Err(Errno::EINVAL)
         }
     }
 
     pub fn clone_ns(&self) -> Result<Cap<Self>, ZoneError> {
-        let cloned: Vec<MountTableEntry> = self
-            .mounts
-            .lock()
+        self.clone_ns_with_snapshot_hook(|| {})
+    }
+
+    fn clone_ns_with_snapshot_hook<F>(&self, after_snapshot: F) -> Result<Cap<Self>, ZoneError>
+    where
+        F: FnOnce(),
+    {
+        let (rows, originals, root_key) = {
+            let mounts = self.mounts.lock();
+            let mut rows = Vec::new();
+            rows.try_reserve_exact(mounts.len())
+                .map_err(|_| ZoneError::AllocationFailed)?;
+            for entry in mounts.iter() {
+                rows.push((entry.mountpoint_key, entry.mount.clone_cap().key()));
+            }
+
+            // Gather every identity reachable from the namespace rows,
+            // including parent ancestors without their own mountpoint row.
+            let mut identities = Vec::new();
+            identities
+                .try_reserve(rows.len() + 1)
+                .map_err(|_| ZoneError::AllocationFailed)?;
+            identities.push(self.root.clone());
+            for entry in mounts.iter() {
+                let mount = entry.mount.clone_cap();
+                if !identities
+                    .iter()
+                    .any(|existing| existing.key() == mount.key())
+                {
+                    identities.push(mount);
+                }
+            }
+            let mut cursor = 0;
+            while cursor < identities.len() {
+                if let Some(parent) = identities[cursor].parent().cloned() {
+                    if !identities
+                        .iter()
+                        .any(|existing| existing.key() == parent.key())
+                    {
+                        identities
+                            .try_reserve(1)
+                            .map_err(|_| ZoneError::AllocationFailed)?;
+                        identities.push(parent);
+                    }
+                }
+                cursor += 1;
+            }
+
+            // Namespace mutation takes mounts before identity placement. Read
+            // all clone facts under the same order so a concurrent move cannot
+            // pair an old row key with a new mountpoint.
+            let mut originals = Vec::new();
+            originals
+                .try_reserve_exact(identities.len())
+                .map_err(|_| ZoneError::AllocationFailed)?;
+            for identity in identities {
+                let payload = identity
+                    .payload_cap()
+                    .map_err(|_| ZoneError::InvalidState)?
+                    .into_cap();
+                originals.push(CloneIdentitySnapshot {
+                    original_key: identity.key(),
+                    mountpoint: identity.mountpoint(),
+                    root_dentry: identity.root_dentry().clone(),
+                    parent_key: identity.parent().map(Cap::key),
+                    payload,
+                    flags: identity.flags(),
+                    propagation: identity.propagation(),
+                    peer_group: identity.peer_group(),
+                });
+            }
+            (rows, originals, self.root.key())
+        };
+        after_snapshot();
+
+        // Clone in parent-topological order. Identity placement is private to
+        // the new namespace; root DEntries and payload/backing remain shared.
+        let mut remapped: Vec<(SlotKey, Cap<MountIdentity>)> = Vec::new();
+        remapped
+            .try_reserve_exact(originals.len())
+            .map_err(|_| ZoneError::AllocationFailed)?;
+        while remapped.len() < originals.len() {
+            let before = remapped.len();
+            for original in &originals {
+                if remapped
+                    .iter()
+                    .any(|(key, _)| *key == original.original_key)
+                {
+                    continue;
+                }
+                let parent = match original.parent_key {
+                    Some(parent_key) => match remapped
+                        .iter()
+                        .find(|(key, _)| *key == parent_key)
+                        .map(|(_, cloned)| cloned.clone())
+                    {
+                        Some(parent) => Some(parent),
+                        None => continue,
+                    },
+                    None => None,
+                };
+                let cloned = MountIdentity::new_cap_with_root_dentry(
+                    allocate_mount_id(),
+                    original.mountpoint.clone(),
+                    original.root_dentry.clone(),
+                    parent,
+                    original.payload.clone(),
+                    original.flags,
+                )?;
+                cloned.set_propagation(original.propagation);
+                cloned.set_peer_group(original.peer_group);
+                remapped.push((original.original_key, cloned));
+            }
+            if remapped.len() == before {
+                return Err(ZoneError::InvalidState);
+            }
+        }
+
+        let cloned_root = remapped
             .iter()
-            .map(|e| MountTableEntry {
-                parent_payload_ptr: e.parent_payload_ptr,
-                child_fs_object_id: e.child_fs_object_id,
-                mount: e.mount.clone(),
-            })
-            .collect();
+            .find(|(key, _)| *key == root_key)
+            .map(|(_, mount)| mount.clone())
+            .ok_or(ZoneError::InvalidState)?;
+        let mut cloned = Vec::new();
+        cloned
+            .try_reserve_exact(rows.len())
+            .map_err(|_| ZoneError::AllocationFailed)?;
+        for (mountpoint_key, original_key) in rows {
+            let mount = remapped
+                .iter()
+                .find(|(key, _)| *key == original_key)
+                .map(|(_, mount)| mount.clone())
+                .ok_or(ZoneError::InvalidState)?;
+            cloned.push(NamespaceMountEntry {
+                mountpoint_key,
+                mount: IdentitySlot::from_cap(mount),
+            });
+        }
         runtime::sign(Self {
-            root: self.root.clone(),
+            root: cloned_root,
             mounts: SpinMutex::new(cloned),
         })
+    }
+
+    pub fn dotdot_parent_for_mount_root(&self, root: &Cap<DEntry>) -> Option<Cap<DEntry>> {
+        let root_key = root.key();
+        for entry in self.mounts.lock().iter().rev() {
+            let mount = entry.mount.clone_cap();
+            if mount.root_dentry().key() == root_key {
+                let mountpoint = mount.mountpoint()?;
+                return Some(mountpoint.parent_hint().unwrap_or(mountpoint));
+            }
+        }
+        None
     }
 }
 
@@ -910,8 +1098,8 @@ static MOUNT_TABLE: SpinMutex<Vec<MountTableEntry>> = SpinMutex::new(Vec::new())
 ///
 /// The walker (`crate::vfs::walker::step_walk`) consults this table
 /// when materialising a child dentry: a hit causes the walker to
-/// upgrade the registered mount and continue from the mount's root
-/// rnode + a fresh DEntry for it. Cite
+/// upgrade the registered mount and continue from the mount's stable
+/// root DEntry. Cite
 /// `txdoc:MOUNT-STEP-MOUNT-COMMIT-ORDERING-1` for the publication
 /// ordering: register *after* the mount's payload is signed and
 /// before any walk-time observation could miss it.
@@ -956,6 +1144,18 @@ pub fn mount_for(
     None
 }
 
+pub fn dotdot_parent_for_mount_root(root: &Cap<DEntry>) -> Option<Cap<DEntry>> {
+    let root_key = root.key();
+    for entry in MOUNT_TABLE.lock().iter().rev() {
+        let mount = entry.mount.clone_cap();
+        if mount.root_dentry().key() == root_key {
+            let mountpoint = mount.mountpoint()?;
+            return Some(mountpoint.parent_hint().unwrap_or(mountpoint));
+        }
+    }
+    None
+}
+
 // ============================================================================
 // Mount table snapshot (for /proc/mounts)
 // ============================================================================
@@ -982,6 +1182,26 @@ pub struct BindMountOutput {
     pub mount: Cap<MountIdentity>,
 }
 
+fn create_bind_mount_identity(
+    source_dentry: &Cap<DEntry>,
+    target_dentry: Cap<DEntry>,
+    guard: &Guard<'_>,
+) -> Result<Cap<MountIdentity>, crate::execution::Errno> {
+    use crate::execution::Errno;
+
+    let source_payload =
+        crate::vfs::walker::mount_payload_for(source_dentry, guard).ok_or(Errno::ENODEV)?;
+    MountIdentity::new_cap(
+        allocate_mount_id(),
+        Some(target_dentry),
+        source_dentry.rnode().clone(),
+        None,
+        source_payload,
+        MountFlags::empty(),
+    )
+    .map_err(|_| Errno::ENOMEM)
+}
+
 /// Create a bind mount: expose `source` at `target` path.
 ///
 /// The bind mount shares the source filesystem's backend (`FsOps` +
@@ -995,24 +1215,8 @@ pub fn bind_mount(
     target_parent_payload: &Cap<MountPayload>,
     guard: &Guard<'_>,
 ) -> Result<BindMountOutput, crate::execution::Errno> {
-    use crate::execution::Errno;
-
-    let source_payload =
-        crate::vfs::walker::mount_payload_for(&source_dentry, guard).ok_or(Errno::ENODEV)?;
-
-    let source_rnode = source_dentry.rnode().clone();
     let target_fs_object_id = target_dentry.rnode().fs_object_id();
-
-    let mount_id = allocate_mount_id();
-    let mount_cap = MountIdentity::new_cap(
-        mount_id,
-        Some(target_dentry),
-        source_rnode,
-        None,
-        source_payload,
-        MountFlags::empty(),
-    )
-    .map_err(|_| Errno::ENOMEM)?;
+    let mount_cap = create_bind_mount_identity(&source_dentry, target_dentry, guard)?;
 
     register_mount(
         target_parent_payload,
@@ -1023,64 +1227,117 @@ pub fn bind_mount(
     Ok(BindMountOutput { mount: mount_cap })
 }
 
+/// Bind-mount and publish into both the legacy global table and one explicit
+/// mount namespace. Commit lock order is global table then namespace table;
+/// both vectors reserve before either index is changed, so allocation failure
+/// leaves no partial publication.
+pub fn bind_mount_in_namespace(
+    source_dentry: Cap<DEntry>,
+    target_dentry: Cap<DEntry>,
+    target_parent_payload: &Cap<MountPayload>,
+    namespace: &Cap<MountNamespace>,
+    guard: &Guard<'_>,
+) -> Result<BindMountOutput, crate::execution::Errno> {
+    use crate::execution::Errno;
+
+    let target_fs_object_id = target_dentry.rnode().fs_object_id();
+    let target_parent_ptr = cap_payload_ptr(target_parent_payload);
+    let target_key = target_dentry.key();
+    let mount_cap = create_bind_mount_identity(&source_dentry, target_dentry, guard)?;
+
+    let mut global = MOUNT_TABLE.lock();
+    let mut namespaced = namespace.mounts.lock();
+    global.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
+    namespaced.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
+    global.push(MountTableEntry {
+        parent_payload_ptr: target_parent_ptr,
+        child_fs_object_id: target_fs_object_id,
+        mount: IdentitySlot::from_cap(mount_cap.clone()),
+    });
+    namespaced.push(NamespaceMountEntry {
+        mountpoint_key: target_key,
+        mount: IdentitySlot::from_cap(mount_cap.clone()),
+    });
+
+    Ok(BindMountOutput { mount: mount_cap })
+}
+
 /// Relocate an existing mount (`mount --move source target`, MS_MOVE).
 ///
 /// `source_dentry` is the *resolved* source (walker already crossed the
-/// mount, so it's the moved subtree's root rnode). Re-key the same subtree
+/// mount, so it's the moved subtree's stable root DEntry). Re-key the same subtree
 /// under `target` and drop the source registration in one critical section.
 pub fn move_mount(
     source_dentry: &Cap<DEntry>,
     target_dentry: Cap<DEntry>,
     target_parent_payload: &Cap<MountPayload>,
-    guard: &Guard<'_>,
+    _guard: &Guard<'_>,
 ) -> Result<(), crate::execution::Errno> {
     use crate::execution::Errno;
 
-    let source_payload =
-        crate::vfs::walker::mount_payload_for(source_dentry, guard).ok_or(Errno::ENODEV)?;
-    let source_rnode = source_dentry.rnode().clone();
-    let source_rnode_addr = cap_raw_addr(source_dentry.rnode());
-    let source_rnode_id = source_rnode.fs_object_id();
+    let source_root_key = source_dentry.key();
     let target_fs_object_id = target_dentry.rnode().fs_object_id();
     let target_parent_ptr = cap_payload_ptr(target_parent_payload);
-
-    let mount_id = allocate_mount_id();
-    let mount_cap = MountIdentity::new_cap(
-        mount_id,
-        Some(target_dentry),
-        source_rnode,
-        None,
-        source_payload,
-        MountFlags::empty(),
-    )
-    .map_err(|_| Errno::ENOMEM)?;
 
     let mut table = MOUNT_TABLE.lock();
     let src_idx = table
         .iter()
-        .position(|entry| {
-            let root = entry.mount.root();
-            cap_raw_addr(root) == source_rnode_addr || root.fs_object_id() == source_rnode_id
-        })
+        .rposition(|entry| entry.mount.root_dentry().key() == source_root_key)
         .ok_or(Errno::EINVAL)?;
-    table.remove(src_idx);
-    let mut replaced = false;
-    for entry in table.iter_mut() {
-        if entry.parent_payload_ptr == target_parent_ptr
-            && entry.child_fs_object_id == target_fs_object_id
-        {
-            entry.mount = IdentitySlot::from_cap(mount_cap.clone());
-            replaced = true;
-            break;
-        }
+    let mount_cap = table[src_idx].mount.clone_cap();
+    let mut moved = table.remove(src_idx);
+    moved.parent_payload_ptr = target_parent_ptr;
+    moved.child_fs_object_id = target_fs_object_id;
+    mount_cap.replace_mountpoint(target_dentry);
+    table.push(moved);
+    Ok(())
+}
+
+/// Move one mounted identity between mountpoints while preserving its slot,
+/// root projection, parent, flags, propagation, peer group, and payload.
+///
+/// The linearization lock order is global index -> namespace index -> identity
+/// mountpoint slot. The namespace row selects the identity. A matching global
+/// row is migrated only when it carries that same identity; cloned namespaces
+/// intentionally have no legacy-global rows. All validation precedes mutation,
+/// and the commit uses only remove, scalar replacement, and push operations
+/// into vectors whose capacity was freed by the removals, so there is no
+/// fallible step and no rollback window.
+pub fn move_mount_in_namespace(
+    source_dentry: &Cap<DEntry>,
+    target_dentry: Cap<DEntry>,
+    target_parent_payload: &Cap<MountPayload>,
+    namespace: &Cap<MountNamespace>,
+    _guard: &Guard<'_>,
+) -> Result<(), crate::execution::Errno> {
+    use crate::execution::Errno;
+
+    let source_root_key = source_dentry.key();
+    let target_fs_object_id = target_dentry.rnode().fs_object_id();
+    let target_parent_ptr = cap_payload_ptr(target_parent_payload);
+    let target_key = target_dentry.key();
+
+    let mut global = MOUNT_TABLE.lock();
+    let mut namespaced = namespace.mounts.lock();
+    let namespace_idx = namespaced
+        .iter()
+        .rposition(|entry| entry.mount.root_dentry().key() == source_root_key)
+        .ok_or(Errno::EINVAL)?;
+    let mount_cap = namespaced[namespace_idx].mount.clone_cap();
+    let global_idx = global
+        .iter()
+        .rposition(|entry| entry.mount.clone_cap().key() == mount_cap.key());
+
+    let mut namespace_row = namespaced.remove(namespace_idx);
+    namespace_row.mountpoint_key = target_key;
+    mount_cap.replace_mountpoint(target_dentry);
+    if let Some(global_idx) = global_idx {
+        let mut global_row = global.remove(global_idx);
+        global_row.parent_payload_ptr = target_parent_ptr;
+        global_row.child_fs_object_id = target_fs_object_id;
+        global.push(global_row);
     }
-    if !replaced {
-        table.push(MountTableEntry {
-            parent_payload_ptr: target_parent_ptr,
-            child_fs_object_id: target_fs_object_id,
-            mount: IdentitySlot::from_cap(mount_cap),
-        });
-    }
+    namespaced.push(namespace_row);
     Ok(())
 }
 
@@ -1112,8 +1369,7 @@ pub fn umount(
 
     let parent_payload_ptr = cap_payload_ptr(parent_payload);
     let child_fs_object_id = target_dentry.rnode().fs_object_id();
-    let target_rnode_id = target_dentry.rnode().fs_object_id();
-    let target_rnode_cap_addr = cap_raw_addr(target_dentry.rnode());
+    let target_key = target_dentry.key();
 
     let mut table = MOUNT_TABLE.lock();
     // Pop the top (newest) matching mount — `rposition` finds the LAST entry,
@@ -1128,10 +1384,9 @@ pub fn umount(
     // and handed us the mounted FS's root dentry. Scan for an entry
     // whose registered mount has this rnode as its root.
     let pos = pos.or_else(|| {
-        table.iter().rposition(|entry| {
-            let root = entry.mount.root();
-            cap_raw_addr(root) == target_rnode_cap_addr || root.fs_object_id() == target_rnode_id
-        })
+        table
+            .iter()
+            .rposition(|entry| entry.mount.root_dentry().key() == target_key)
     });
 
     match pos {
@@ -1141,6 +1396,23 @@ pub fn umount(
         }
         None => Err(Errno::EINVAL),
     }
+}
+
+/// Remove only the legacy-global row carrying this exact mount identity.
+/// Cloned namespace identities have no global row, so their cleanup is a
+/// successful no-op rather than a root-DEntry-key fallback into another
+/// namespace's mount.
+pub fn umount_identity_exact(mount: &Cap<MountIdentity>) -> bool {
+    let mount_key = mount.key();
+    let mut table = MOUNT_TABLE.lock();
+    let Some(pos) = table
+        .iter()
+        .rposition(|entry| entry.mount.clone_cap().key() == mount_key)
+    else {
+        return false;
+    };
+    table.remove(pos);
+    true
 }
 
 // ============================================================================
@@ -1194,7 +1466,7 @@ pub fn snapshot_mounts() -> alloc::vec::Vec<MountSnapshot> {
         .filter_map(|entry| {
             let mount = entry.mount.clone_cap();
             let dentry = mount.mountpoint()?;
-            let path = render_dentry_path(dentry).unwrap_or_else(|| b"/?".to_vec());
+            let path = render_dentry_path(&dentry).unwrap_or_else(|| b"/?".to_vec());
             let payload = mount.payload_cap().ok()?;
             Some(MountSnapshot {
                 source: payload.source_label,
@@ -1378,12 +1650,12 @@ mod tests {
     };
     use crate::io_manager::block::BlockQueue;
     use crate::io_manager::page::{
-        PageContainerKey, PageGeneration, PageIoCompletionKind, PageIoFlags, PageIoOp,
-        PageIoPriority, PageIoRange, PageIoRequestId, PageIoResult,
         service::{
             PageService, PageServiceBackendSubmitOutcome, PageServiceDrivenWork, PageServiceDriver,
             PageServiceNext, PageServiceTurn, PageServiceWake, PageServiceWork,
         },
+        PageContainerKey, PageGeneration, PageIoCompletionKind, PageIoFlags, PageIoOp,
+        PageIoPriority, PageIoRange, PageIoRequestId, PageIoResult,
     };
     use crate::io_manager::runtime::{IoServiceKind, ServiceBudget, ServiceKick};
     use crate::page_backed::{Frame, PageContainerKind};
@@ -1945,6 +2217,488 @@ mod tests {
         }
 
         assert_eq!(payload.payload_pin_count(), 0);
+    }
+
+    #[test]
+    fn mount_namespace_root_dentry_identity_is_stable_across_clone() {
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        crate::zones::register_all().expect("kernel zones");
+
+        let fs = Arc::new(MockFs);
+        let payload = MountPayload::new_cap(
+            fs.clone() as Arc<dyn FsOps>,
+            fs as Arc<dyn FsPageBacking>,
+            None,
+            DevId::new(31),
+            MountOptions::default(),
+            "mockfs",
+            SourceLabel::Static("stable-root"),
+        )
+        .expect("mount payload");
+        let root = RNode::new_cap_in_mount(
+            FsObjectId::ROOT,
+            InodeMeta::new(InodeKind::Directory, 0o040755),
+            RNodeBacking::Directory,
+            &payload,
+        )
+        .expect("root rnode");
+        let mount = MountIdentity::new_cap(
+            MountId::new(31),
+            None,
+            root,
+            None,
+            payload,
+            MountFlags::empty(),
+        )
+        .expect("mount identity");
+        let namespace = MountNamespace::new_cap(mount.clone()).expect("mount namespace");
+        let cloned = namespace.clone_ns().expect("cloned namespace");
+
+        assert_eq!(mount.root_dentry().key(), namespace.root_dentry().key());
+        assert_eq!(namespace.root_dentry().key(), namespace.root_dentry().key());
+        assert_eq!(namespace.root_dentry().key(), cloned.root_dentry().key());
+    }
+
+    #[test]
+    fn cloned_mount_namespaces_move_independent_identity_trees() {
+        use core::sync::atomic::AtomicBool;
+
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        crate::zones::register_all().expect("kernel zones");
+        reset_mount_table_for_test();
+
+        let fs = Arc::new(MockFs);
+        let payload = MountPayload::new_cap(
+            fs.clone() as Arc<dyn FsOps>,
+            fs as Arc<dyn FsPageBacking>,
+            None,
+            DevId::new(35),
+            MountOptions::default(),
+            "mockfs",
+            SourceLabel::Static("clone-tree"),
+        )
+        .expect("mount payload");
+        let root_rnode = RNode::new_cap_in_mount(
+            FsObjectId::ROOT,
+            InodeMeta::new(InodeKind::Directory, 0o040755),
+            RNodeBacking::Directory,
+            &payload,
+        )
+        .expect("root rnode");
+        let root_dentry = DEntry::new_cap(InlineName::ROOT, root_rnode).expect("root dentry");
+        let root_mount = MountIdentity::new_cap_with_root_dentry(
+            MountId::new(35),
+            None,
+            root_dentry.clone(),
+            None,
+            payload.clone(),
+            MountFlags::empty(),
+        )
+        .expect("root mount");
+        let parent_namespace = MountNamespace::new_cap(root_mount.clone()).expect("parent ns");
+
+        let make_mountpoint = |id: u64, name: &[u8]| {
+            let rnode = RNode::new_cap_in_mount(
+                FsObjectId::new(id),
+                InodeMeta::new(InodeKind::Directory, 0o040755),
+                RNodeBacking::Directory,
+                &payload,
+            )
+            .expect("mountpoint rnode");
+            let mut raw = DEntry::new(InlineName::new(name).expect("mountpoint name"), rnode);
+            raw.set_parent_hint(&root_dentry);
+            crate::vfs::adapter::step_engine::sign(raw).expect("mountpoint dentry")
+        };
+        let old = make_mountpoint(350, b"old");
+        let child_new = make_mountpoint(351, b"child-new");
+        let parent_new = make_mountpoint(352, b"parent-new");
+        root_dentry.cache_child(old.clone());
+        root_dentry.cache_child(child_new.clone());
+        root_dentry.cache_child(parent_new.clone());
+
+        let mounted_root_rnode = RNode::new_cap_in_mount(
+            FsObjectId::new(353),
+            InodeMeta::new(InodeKind::Directory, 0o040755),
+            RNodeBacking::Directory,
+            &payload,
+        )
+        .expect("mounted root rnode");
+        let mounted_root =
+            DEntry::new_cap(InlineName::ROOT, mounted_root_rnode).expect("mounted root dentry");
+        let mounted = MountIdentity::new_cap_with_root_dentry(
+            MountId::new(36),
+            Some(old.clone()),
+            mounted_root.clone(),
+            Some(root_mount.clone()),
+            payload.clone(),
+            MountFlags::NOEXEC,
+        )
+        .expect("mounted identity");
+        mounted.set_propagation(Propagation::Shared);
+        mounted.set_peer_group(88);
+        register_mount(&payload, old.rnode().fs_object_id(), mounted.clone());
+        parent_namespace.register_mount(&old, mounted.clone());
+
+        let child_namespace = parent_namespace.clone_ns().expect("clone namespace");
+        let child_root_mount = child_namespace.root().clone();
+        let child_mounted = child_namespace.mount_for(&old).expect("child mounted row");
+        assert_ne!(child_root_mount.key(), root_mount.key());
+        assert_ne!(child_root_mount.id(), root_mount.id());
+        assert_eq!(
+            child_root_mount.root_dentry().key(),
+            root_mount.root_dentry().key()
+        );
+        assert_ne!(child_mounted.key(), mounted.key());
+        assert_ne!(child_mounted.id(), mounted.id());
+        assert_eq!(
+            child_mounted.root_dentry().key(),
+            mounted.root_dentry().key()
+        );
+        assert_eq!(child_mounted.flags(), mounted.flags());
+        assert_eq!(child_mounted.propagation(), mounted.propagation());
+        assert_eq!(child_mounted.peer_group(), mounted.peer_group());
+        assert_eq!(
+            child_mounted.parent().map(Cap::key),
+            Some(child_root_mount.key())
+        );
+
+        let guard = crate::vfs::adapter::step_engine::guard();
+        move_mount_in_namespace(
+            child_mounted.root_dentry(),
+            child_new.clone(),
+            &payload,
+            &child_namespace,
+            &guard,
+        )
+        .expect("move child namespace mount");
+        drop(guard);
+        assert!(child_namespace.mount_for(&old).is_none());
+        assert_eq!(
+            child_namespace
+                .mount_for(&child_new)
+                .expect("child new row")
+                .key(),
+            child_mounted.key()
+        );
+        assert_eq!(
+            parent_namespace
+                .mount_for(&old)
+                .expect("parent old row")
+                .key(),
+            mounted.key()
+        );
+        assert!(parent_namespace.mount_for(&child_new).is_none());
+        assert_eq!(
+            child_namespace
+                .dotdot_parent_for_mount_root(child_mounted.root_dentry())
+                .expect("child dotdot")
+                .key(),
+            root_dentry.key()
+        );
+        assert_eq!(
+            parent_namespace
+                .dotdot_parent_for_mount_root(mounted.root_dentry())
+                .expect("parent dotdot")
+                .key(),
+            root_dentry.key()
+        );
+        assert_eq!(
+            child_namespace.snapshot_mounts()[0].mountpoint_path,
+            b"/child-new"
+        );
+        assert_eq!(
+            parent_namespace.snapshot_mounts()[0].mountpoint_path,
+            b"/old"
+        );
+        assert_eq!(
+            mount_for(&payload, old.rnode().fs_object_id())
+                .expect("global parent old row")
+                .key(),
+            mounted.key()
+        );
+        assert!(mount_for(&payload, child_new.rnode().fs_object_id()).is_none());
+
+        let guard = crate::vfs::adapter::step_engine::guard();
+        move_mount_in_namespace(
+            mounted.root_dentry(),
+            parent_new.clone(),
+            &payload,
+            &parent_namespace,
+            &guard,
+        )
+        .expect("move parent namespace mount");
+        drop(guard);
+        assert!(parent_namespace.mount_for(&old).is_none());
+        assert_eq!(
+            parent_namespace
+                .mount_for(&parent_new)
+                .expect("parent new row")
+                .key(),
+            mounted.key()
+        );
+        assert_eq!(
+            child_namespace
+                .mount_for(&child_new)
+                .expect("child row remains")
+                .key(),
+            child_mounted.key()
+        );
+        assert!(child_namespace.mount_for(&parent_new).is_none());
+        assert_eq!(
+            child_namespace.snapshot_mounts()[0].mountpoint_path,
+            b"/child-new"
+        );
+        assert_eq!(
+            parent_namespace.snapshot_mounts()[0].mountpoint_path,
+            b"/parent-new"
+        );
+
+        let snapshot_ready = AtomicBool::new(false);
+        let release_clone = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let clone_handle = scope.spawn(|| {
+                parent_namespace
+                    .clone_ns_with_snapshot_hook(|| {
+                        snapshot_ready.store(true, Ordering::Release);
+                        while !release_clone.load(Ordering::Acquire) {
+                            core::hint::spin_loop();
+                        }
+                    })
+                    .expect("concurrent namespace clone")
+            });
+
+            while !snapshot_ready.load(Ordering::Acquire) {
+                core::hint::spin_loop();
+            }
+            let guard = crate::vfs::adapter::step_engine::guard();
+            move_mount_in_namespace(
+                mounted.root_dentry(),
+                old.clone(),
+                &payload,
+                &parent_namespace,
+                &guard,
+            )
+            .expect("move parent after clone snapshot");
+            drop(guard);
+            release_clone.store(true, Ordering::Release);
+
+            let concurrent_clone = clone_handle.join().expect("clone thread");
+            let cloned_before_move = concurrent_clone
+                .mount_for(&parent_new)
+                .expect("clone retains pre-move row");
+            assert_eq!(
+                cloned_before_move
+                    .mountpoint()
+                    .expect("clone placement")
+                    .key(),
+                parent_new.key()
+            );
+            assert!(concurrent_clone.mount_for(&old).is_none());
+        });
+    }
+
+    #[test]
+    fn bind_mounts_create_distinct_root_dentry_projections() {
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        crate::zones::register_all().expect("kernel zones");
+        reset_mount_table_for_test();
+
+        let source_fs = Arc::new(MockFs);
+        let source_payload = MountPayload::new_cap(
+            source_fs.clone() as Arc<dyn FsOps>,
+            source_fs as Arc<dyn FsPageBacking>,
+            None,
+            DevId::new(41),
+            MountOptions::default(),
+            "mockfs",
+            SourceLabel::Static("bind-source"),
+        )
+        .expect("source payload");
+        let source_rnode = RNode::new_cap_in_mount(
+            FsObjectId::new(410),
+            InodeMeta::new(InodeKind::Directory, 0o040755),
+            RNodeBacking::Directory,
+            &source_payload,
+        )
+        .expect("source rnode");
+        let source = DEntry::new_cap(
+            InlineName::new(b"source").expect("source name"),
+            source_rnode,
+        )
+        .expect("source dentry");
+
+        let target_fs = Arc::new(MockFs);
+        let target_payload = MountPayload::new_cap(
+            target_fs.clone() as Arc<dyn FsOps>,
+            target_fs as Arc<dyn FsPageBacking>,
+            None,
+            DevId::new(42),
+            MountOptions::default(),
+            "mockfs",
+            SourceLabel::Static("bind-target"),
+        )
+        .expect("target payload");
+
+        let make_target = |parent_id: u64, target_id: u64, name: &[u8]| {
+            let parent_rnode = RNode::new_cap_in_mount(
+                FsObjectId::new(parent_id),
+                InodeMeta::new(InodeKind::Directory, 0o040755),
+                RNodeBacking::Directory,
+                &target_payload,
+            )
+            .expect("target parent rnode");
+            let parent =
+                DEntry::new_cap(InlineName::ROOT, parent_rnode).expect("target parent dentry");
+            let target_rnode = RNode::new_cap_in_mount(
+                FsObjectId::new(target_id),
+                InodeMeta::new(InodeKind::Directory, 0o040755),
+                RNodeBacking::Directory,
+                &target_payload,
+            )
+            .expect("target rnode");
+            let mut target_raw =
+                DEntry::new(InlineName::new(name).expect("target name"), target_rnode);
+            target_raw.set_parent_hint(&parent);
+            let target = crate::vfs::adapter::step_engine::sign(target_raw).expect("target dentry");
+            (parent, target)
+        };
+        let (first_parent, first_target) = make_target(420, 421, b"first");
+        let (second_parent, second_target) = make_target(430, 431, b"second");
+        let guard = crate::vfs::adapter::step_engine::guard();
+
+        let first = bind_mount(source.clone(), first_target, &target_payload, &guard)
+            .expect("first bind mount")
+            .mount;
+        let second = bind_mount(source.clone(), second_target, &target_payload, &guard)
+            .expect("second bind mount")
+            .mount;
+
+        assert_ne!(first.root_dentry().key(), source.key());
+        assert_ne!(second.root_dentry().key(), source.key());
+        assert_ne!(first.root_dentry().key(), second.root_dentry().key());
+        assert_eq!(first.root_dentry().rnode().key(), source.rnode().key());
+        assert_eq!(second.root_dentry().rnode().key(), source.rnode().key());
+        assert_eq!(
+            dotdot_parent_for_mount_root(first.root_dentry())
+                .expect("first bind dotdot parent")
+                .key(),
+            first_parent.key()
+        );
+        assert_eq!(
+            dotdot_parent_for_mount_root(second.root_dentry())
+                .expect("second bind dotdot parent")
+                .key(),
+            second_parent.key()
+        );
+    }
+
+    #[test]
+    fn mount_namespace_mountpoint_stack_is_lifo_and_umount_restores_lower_mount() {
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        crate::zones::register_all().expect("kernel zones");
+
+        let fs = Arc::new(MockFs);
+        let payload = MountPayload::new_cap(
+            fs.clone() as Arc<dyn FsOps>,
+            fs as Arc<dyn FsPageBacking>,
+            None,
+            DevId::new(32),
+            MountOptions::default(),
+            "mockfs",
+            SourceLabel::Static("stack-parent"),
+        )
+        .expect("parent payload");
+        let parent_root = RNode::new_cap_in_mount(
+            FsObjectId::ROOT,
+            InodeMeta::new(InodeKind::Directory, 0o040755),
+            RNodeBacking::Directory,
+            &payload,
+        )
+        .expect("parent root");
+        let parent_mount = MountIdentity::new_cap(
+            MountId::new(32),
+            None,
+            parent_root,
+            None,
+            payload.clone(),
+            MountFlags::empty(),
+        )
+        .expect("parent mount");
+        let namespace = MountNamespace::new_cap(parent_mount).expect("namespace");
+        let mountpoint_rnode = RNode::new_cap_in_mount(
+            FsObjectId::new(99),
+            InodeMeta::new(InodeKind::Directory, 0o040755),
+            RNodeBacking::Directory,
+            &payload,
+        )
+        .expect("mountpoint rnode");
+        let mountpoint = DEntry::new_cap(
+            InlineName::new(b"stack").expect("mountpoint name"),
+            mountpoint_rnode,
+        )
+        .expect("mountpoint");
+
+        let make_child = |id: u64| {
+            let child_fs = Arc::new(MockFs);
+            let child_payload = MountPayload::new_cap(
+                child_fs.clone() as Arc<dyn FsOps>,
+                child_fs as Arc<dyn FsPageBacking>,
+                None,
+                DevId::new(id as u32),
+                MountOptions::default(),
+                "mockfs",
+                SourceLabel::Static("stack-child"),
+            )
+            .expect("child payload");
+            let child_root = RNode::new_cap_in_mount(
+                FsObjectId::ROOT,
+                InodeMeta::new(InodeKind::Directory, 0o040755),
+                RNodeBacking::Directory,
+                &child_payload,
+            )
+            .expect("child root");
+            MountIdentity::new_cap(
+                MountId::new(id),
+                Some(mountpoint.clone()),
+                child_root,
+                None,
+                child_payload,
+                MountFlags::empty(),
+            )
+            .expect("child mount")
+        };
+        let lower = make_child(33);
+        let upper = make_child(34);
+
+        namespace.register_mount(&mountpoint, lower.clone());
+        namespace.register_mount(&mountpoint, upper.clone());
+        assert_eq!(
+            namespace.mount_for(&mountpoint).expect("upper").id(),
+            upper.id()
+        );
+
+        namespace.umount(&mountpoint).expect("pop upper");
+        assert_eq!(
+            namespace.mount_for(&mountpoint).expect("lower").id(),
+            lower.id()
+        );
+
+        namespace
+            .umount(lower.root_dentry())
+            .expect("pop lower by mounted root");
+        assert!(namespace.mount_for(&mountpoint).is_none());
     }
 
     #[test]

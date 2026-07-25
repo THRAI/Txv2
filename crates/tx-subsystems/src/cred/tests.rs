@@ -6,13 +6,14 @@
 
 use crate::cred::adapter::step_engine::Cap;
 use crate::cred::{
-    step_apply_suid_for_exec, step_setgid, step_setregid, step_setresgid, step_setresuid,
-    step_setreuid, step_setuid, Capability, CapabilitySet, Cred, CredChange, CredSnapshot, Gid,
-    Uid,
+    commit_prepared_exec_cred, prepare_exec_cred, prepare_setid_for_exec, step_apply_suid_for_exec,
+    step_set_capability_sets, step_setgid, step_setregid, step_setresgid, step_setresuid,
+    step_setreuid, step_setuid, Capability, CapabilitySet, Cred, CredChange, CredSnapshot,
+    ExecSetidPolicy, Gid, Uid,
 };
 use crate::process::execution::reset_init_process_for_test;
 use crate::process::structure::{reset_pid_counter_for_test, ProcessIdentity};
-use crate::process::{bootstrap_init_process, step_exit_group, step_fork, ExitStatus};
+use crate::process::{bootstrap_init_process, step_exit_group_with_posts, step_fork, ExitStatus};
 use crate::test_support::EPOCH_TEST_LOCK;
 use crate::thread_runtime::structure::reset_tid_counter_for_test;
 use crate::vfs::structure::{S_ISGID, S_ISUID};
@@ -37,6 +38,20 @@ fn fresh_aspace() -> Cap<AddressSpace> {
 
 fn bootstrap() -> Cap<ProcessIdentity> {
     bootstrap_init_process(fresh_aspace()).expect("bootstrap init")
+}
+
+fn finish_process_group_for_test(process: &Cap<ProcessIdentity>, status: ExitStatus) {
+    step_exit_group_with_posts(
+        process,
+        status,
+        |weak, event| {
+            let Some(mailbox) = weak.upgrade() else {
+                return;
+            };
+            let _ = mailbox.post(event);
+        },
+        |mailbox, event| mailbox.post(event),
+    );
 }
 
 fn cred_of(proc_cap: &Cap<ProcessIdentity>) -> Cred {
@@ -221,7 +236,7 @@ fn setuid_unprivileged_can_swap_among_existing_ids_only() {
 fn setuid_on_zombie_returns_zombie() {
     let _g = setup();
     let proc_cap = bootstrap();
-    step_exit_group(&proc_cap, ExitStatus::Exited(0));
+    finish_process_group_for_test(&proc_cap, ExitStatus::Exited(0));
     let outcome = step_setuid(&proc_cap, Uid(1000));
     assert_eq!(outcome, CredChange::Zombie);
 }
@@ -568,6 +583,201 @@ fn step_apply_suid_for_exec_setuid_bit_sets_euid_and_suid() {
 }
 
 #[test]
+fn prepare_setid_for_exec_does_not_publish_until_commit() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    drop_to(&proc_cap, 1001, 1001, 1001);
+    let before_cap = proc_cap.cred_cap().expect("alive cred cap");
+    let before = *before_cap;
+
+    let prepared = prepare_setid_for_exec(&proc_cap, Uid(1000), Gid(2000), S_ISUID | 0o755)
+        .expect("prepare setid cred");
+
+    assert_eq!(prepared.credential_snapshot().uid, before.uid);
+    assert_eq!(prepared.credential().euid, Uid(1000));
+    assert!(prepared.at_secure());
+    assert_eq!(
+        proc_cap.cred_cap().expect("current cred cap").key(),
+        before_cap.key()
+    );
+    assert_eq!(cred_of(&proc_cap), before);
+
+    let outcome = commit_prepared_exec_cred(prepared).expect("authoritative exec binding");
+    assert!(outcome.at_secure);
+    assert_eq!(outcome.previous_cred, before);
+    assert_ne!(
+        proc_cap.cred_cap().expect("committed cred cap").key(),
+        before_cap.key()
+    );
+    assert_eq!(cred_of(&proc_cap).euid, Uid(1000));
+}
+
+#[test]
+fn exec_cred_reservation_blocks_mutators_until_abort() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let before = cred_of(&proc_cap);
+    let prepared = prepare_setid_for_exec(&proc_cap, Uid(1000), Gid(2000), S_ISUID | 0o755)
+        .expect("prepare setid cred");
+
+    assert_eq!(step_setuid(&proc_cap, Uid(1234)), CredChange::Again);
+    assert_eq!(step_setgid(&proc_cap, Gid(1234)), CredChange::Again);
+    assert_eq!(
+        step_setreuid(&proc_cap, Some(Uid(1234)), Some(Uid(1234))),
+        CredChange::Again
+    );
+    assert_eq!(
+        step_setregid(&proc_cap, Some(Gid(1234)), Some(Gid(1234))),
+        CredChange::Again
+    );
+    assert_eq!(
+        step_setresuid(&proc_cap, Some(Uid(1234)), Some(Uid(1234)), Some(Uid(1234)),),
+        CredChange::Again
+    );
+    assert_eq!(
+        step_setresgid(&proc_cap, Some(Gid(1234)), Some(Gid(1234)), Some(Gid(1234)),),
+        CredChange::Again
+    );
+    assert_eq!(
+        step_set_capability_sets(&proc_cap, CapabilitySet::EMPTY, CapabilitySet::EMPTY),
+        CredChange::Again
+    );
+    assert!(matches!(
+        prepare_setid_for_exec(&proc_cap, Uid(2000), Gid(2000), S_ISUID | 0o755),
+        Err(crate::execution::Errno::EAGAIN)
+    ));
+    assert_eq!(cred_of(&proc_cap), before);
+
+    drop(prepared);
+    assert!(matches!(
+        step_setuid(&proc_cap, Uid(1234)),
+        CredChange::Replaced { .. }
+    ));
+}
+
+#[test]
+fn exec_cred_commit_releases_reservation() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let prepared = prepare_setid_for_exec(&proc_cap, Uid(1000), Gid(2000), S_ISUID | 0o755)
+        .expect("prepare setid cred");
+
+    let outcome = commit_prepared_exec_cred(prepared).expect("authoritative exec binding");
+    assert_eq!(outcome.previous_cred, Cred::root());
+    assert!(matches!(
+        step_setuid(&proc_cap, Uid(1234)),
+        CredChange::Replaced { .. }
+    ));
+}
+
+#[test]
+fn stale_process_binding_rejects_exec_cred_commit_without_mutation() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    drop_to(&proc_cap, 1001, 1001, 1001);
+    let prepared = prepare_setid_for_exec(&proc_cap, Uid(2000), Gid(3000), S_ISUID | 0o755)
+        .expect("prepare setid cred");
+    let detached = proc_cap
+        .payload
+        .lock()
+        .take()
+        .expect("force stale authoritative binding");
+    let before_cap = detached.cred_cap();
+    let before = *before_cap;
+
+    assert!(matches!(
+        commit_prepared_exec_cred(prepared),
+        Err(crate::process::ExecPrepError::Zombie)
+    ));
+    assert_eq!(detached.cred_cap().key(), before_cap.key());
+    assert_eq!(detached.cred(), before);
+}
+
+#[test]
+fn nosuid_exec_holds_reservation_without_preparing_replacement() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    drop_to(&proc_cap, 1001, 1001, 1001);
+    let before_cap = proc_cap.cred_cap().expect("alive cred cap");
+    let before = *before_cap;
+
+    let prepared = prepare_exec_cred(
+        &proc_cap,
+        Uid(1000),
+        Gid(2000),
+        S_ISUID | 0o755,
+        ExecSetidPolicy::Suppress,
+    )
+    .expect("reserve nosuid exec cred");
+
+    assert!(!prepared.has_replacement());
+    assert_eq!(prepared.credential_snapshot(), before);
+    assert!(!prepared.at_secure());
+    assert_eq!(step_setuid(&proc_cap, Uid(1001)), CredChange::Again);
+
+    let outcome = commit_prepared_exec_cred(prepared).expect("authoritative exec binding");
+    assert_eq!(outcome.previous_cred, before);
+    assert_eq!(
+        proc_cap.cred_cap().expect("post-commit cred cap").key(),
+        before_cap.key()
+    );
+}
+
+#[test]
+fn exec_cred_reservation_blocks_group_exit_until_abort() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let prepared = prepare_setid_for_exec(&proc_cap, Uid(1000), Gid(2000), S_ISUID | 0o755)
+        .expect("prepare setid cred");
+
+    finish_process_group_for_test(&proc_cap, ExitStatus::Exited(7));
+
+    assert!(
+        !proc_cap.is_zombie(),
+        "an in-flight exec reservation must prevent payload detach"
+    );
+    drop(prepared);
+    finish_process_group_for_test(&proc_cap, ExitStatus::Exited(7));
+    assert!(proc_cap.is_zombie());
+}
+
+#[test]
+fn concurrent_exec_reservation_makes_group_exit_retry_without_detach() {
+    let _g = setup();
+    let proc_cap = bootstrap();
+    let prepared = prepare_setid_for_exec(&proc_cap, Uid(1000), Gid(2000), S_ISUID | 0o755)
+        .expect("prepare setid cred");
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+    std::thread::scope(|scope| {
+        let process = proc_cap.clone();
+        let worker_barrier = barrier.clone();
+        let exit = scope.spawn(move || {
+            worker_barrier.wait();
+            crate::process::step_exit_group_with_posts(
+                &process,
+                ExitStatus::Exited(9),
+                |weak, event| {
+                    if let Some(mailbox) = weak.upgrade() {
+                        let _ = mailbox.post(event);
+                    }
+                },
+                |mailbox, event| mailbox.post(event),
+            )
+        });
+        barrier.wait();
+        assert_eq!(
+            exit.join().expect("exit worker"),
+            crate::process::ProcessExitOutcome::Retry
+        );
+    });
+
+    assert!(!proc_cap.is_zombie());
+    assert!(proc_cap.payload.lock().is_some());
+    drop(prepared);
+}
+
+#[test]
 fn step_apply_suid_for_exec_setgid_with_group_x_sets_egid_and_sgid() {
     let _g = setup();
     let proc_cap = bootstrap();
@@ -681,13 +891,13 @@ fn cred_snapshot_root_constructor_matches_root_cred() {
 
 #[test]
 fn cred_snapshot_returns_none_for_zombie() {
-    // After step_exit_group reaps the payload, cred_snapshot() must
+    // After group exit reaps the payload, cred_snapshot() must
     // surface `None` so callers can fall back to CredSnapshot::root()
     // (mirroring the cred()/cred_cap() pair already established by
     // PR-9 phase 5 for the AtomicSlot<Cap<Cred>> shape).
     let _g = setup();
     let proc_cap = bootstrap();
-    step_exit_group(&proc_cap, ExitStatus::Exited(0));
+    finish_process_group_for_test(&proc_cap, ExitStatus::Exited(0));
 
     assert!(proc_cap.cred_snapshot().is_none());
 }

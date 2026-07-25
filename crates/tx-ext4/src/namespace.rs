@@ -433,7 +433,7 @@ where
         }
     }
 
-    // `step_chmod`, `step_chown` commit through `serialize_inode_meta`.
+    // `chmod_inode`, `chown_inode` commit through `serialize_inode_meta`.
 }
 
 fn inode_meta_lite(meta: &InodeMeta) -> InodeMetaLite {

@@ -35,12 +35,15 @@ pub mod adapter;
 pub mod checks;
 
 use adapter::step_engine::{
-    self, Cap, CredentialView, Guard, NoProgress, OneShotStepOp, RestrictionStackHandle, ScriptCtx,
-    StepOp, StepOutcome, SubjectIdentity, Zone, ZoneAllocated, ZoneError,
+    self, Cap, CredentialView, Guard, NoProgress, OneShotStepOp, PayloadCap,
+    RestrictionStackHandle, ScriptCtx, StepOp, StepOutcome, SubjectIdentity, Zone, ZoneAllocated,
+    ZoneError,
 };
 
 use crate::execution::Errno;
-use crate::process::structure::{ProcessIdentity, TargetProcCred};
+use crate::process::structure::{
+    ExecCredReservationToken, ProcessIdentity, ProcessPayload, TargetProcCred,
+};
 use crate::signal::Signum;
 use crate::vfs::structure::{S_ISGID, S_ISUID};
 
@@ -215,7 +218,37 @@ unsafe impl ZoneAllocated for Cred {
 /// Returns `ZoneError` only on slab exhaustion; tests reset the slab
 /// at `setup()`.
 pub fn sign_cred(cred: Cred) -> Result<Cap<Cred>, ZoneError> {
+    #[cfg(any(test, feature = "test-support"))]
+    if FAIL_NEXT_CRED_SIGN.swap(false, core::sync::atomic::Ordering::AcqRel) {
+        return Err(ZoneError::AllocationFailed);
+    }
     step_engine::sign(cred)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+static FAIL_NEXT_CRED_SIGN: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Force the next credential zone/sign operation to report allocation failure.
+///
+/// Test-only seam for proving syscall-visible ENOMEM paths without exhausting
+/// the shared host page allocator.
+#[cfg(any(test, feature = "test-support"))]
+pub fn fail_next_cred_sign_for_test() {
+    FAIL_NEXT_CRED_SIGN.store(true, core::sync::atomic::Ordering::Release);
+}
+
+fn with_cred_mutation(
+    target: &Cap<ProcessIdentity>,
+    mutation: impl FnOnce(&ProcessPayload) -> CredChange,
+) -> CredChange {
+    let payload_guard = target.payload.lock();
+    let Some(payload) = payload_guard.as_ref() else {
+        return CredChange::Zombie;
+    };
+    payload
+        .with_unreserved_cred_mutation(|| mutation(payload))
+        .unwrap_or(CredChange::Again)
 }
 
 /// Replace the current process capability masks.
@@ -228,20 +261,18 @@ pub fn step_set_capability_sets(
     effective_caps: CapabilitySet,
     permitted_caps: CapabilitySet,
 ) -> CredChange {
-    let payload_guard = target.payload.lock();
-    let Some(payload) = payload_guard.as_ref() else {
-        return CredChange::Zombie;
-    };
-    let prev_cap = payload.cred_cap();
-    let prev = *prev_cap;
-    let mut new = prev;
-    new.effective_caps = effective_caps;
-    new.permitted_caps = permitted_caps;
-    let Ok(new_cap) = sign_cred(new) else {
-        return CredChange::Zombie;
-    };
-    let _old_cap = payload.replace_cred(new_cap);
-    CredChange::Replaced { prev, new }
+    with_cred_mutation(target, |payload| {
+        let prev_cap = payload.cred_cap();
+        let prev = *prev_cap;
+        let mut new = prev;
+        new.effective_caps = effective_caps;
+        new.permitted_caps = permitted_caps;
+        let Ok(new_cap) = sign_cred(new) else {
+            return CredChange::Zombie;
+        };
+        let _old_cap = payload.replace_cred(new_cap);
+        CredChange::Replaced { prev, new }
+    })
 }
 
 /// PR-9 phase 5 — D5 §7. Mint a placeholder
@@ -384,6 +415,7 @@ impl AsRef<Cred> for CredSnapshot {
 pub enum CredChange {
     Replaced { prev: Cred, new: Cred },
     Zombie,
+    Again,
     PermissionDenied,
 }
 
@@ -399,47 +431,32 @@ pub fn step_setuid(target: &Cap<ProcessIdentity>, new_uid: Uid) -> CredChange {
     // reserve
     // commit
     // publish
-    let payload_guard = target.payload.lock();
-    let Some(payload) = payload_guard.as_ref() else {
-        return CredChange::Zombie;
-    };
-    // PR-9 phase 5 (D5 Path A): load the current cred cap, derive the
-    // new value, sign a fresh cap, and publish via `AtomicSlot::swap`.
-    // The previous cap drops at the end of this function and the slab
-    // entry is EBR-retired once outstanding readers' guards complete.
-    let prev_cap = payload.cred_cap();
-    let prev = *prev_cap;
-    let mut new = prev;
+    with_cred_mutation(target, |payload| {
+        // PR-9 phase 5 (D5 Path A): load the current cred cap, derive the
+        // new value, sign a fresh cap, and publish via `AtomicSlot::swap`.
+        let prev_cap = payload.cred_cap();
+        let prev = *prev_cap;
+        let mut new = prev;
 
-    if prev.is_privileged_for(Capability::SETUID) {
-        new.uid = new_uid;
-        new.euid = new_uid;
-        new.suid = new_uid;
-    } else if new_uid == prev.uid || new_uid == prev.euid || new_uid == prev.suid {
-        // Non-privileged: allowed to swap effective among existing IDs.
-        // `suid` is preserved per Linux semantics.
-        new.euid = new_uid;
-    } else {
-        return CredChange::PermissionDenied;
-    }
-    apply_uid_capability_transition(prev, &mut new);
+        if prev.is_privileged_for(Capability::SETUID) {
+            new.uid = new_uid;
+            new.euid = new_uid;
+            new.suid = new_uid;
+        } else if new_uid == prev.uid || new_uid == prev.euid || new_uid == prev.suid {
+            new.euid = new_uid;
+        } else {
+            return CredChange::PermissionDenied;
+        }
+        apply_uid_capability_transition(prev, &mut new);
 
-    let new_cap = match sign_cred(new) {
-        Ok(cap) => cap,
-        // Slab exhaustion. Today's slab is sized to "one per live
-        // process + a few transient caps in flight" — exhaustion here
-        // is a kernel-wide pressure event, not a per-process bug.
-        // Surface as PermissionDenied (the only error variant a
-        // setuid-family rule produces); a future ENOMEM-bearing
-        // CredChange variant lands when slabs become user-visible.
-        Err(_) => return CredChange::PermissionDenied,
-    };
-    let _old_cap = payload.replace_cred(new_cap);
-    drop(payload_guard);
-    // `_old_cap` drops here, releasing its retain-count on the prior
-    // slab entry; EBR reclaims when concurrent readers' guards exit.
+        let new_cap = match sign_cred(new) {
+            Ok(cap) => cap,
+            Err(_) => return CredChange::PermissionDenied,
+        };
+        let _old_cap = payload.replace_cred(new_cap);
 
-    CredChange::Replaced { prev, new }
+        CredChange::Replaced { prev, new }
+    })
 }
 
 /// `setgid`-family update with the same privilege rules as
@@ -452,32 +469,29 @@ pub fn step_setgid(target: &Cap<ProcessIdentity>, new_gid: Gid) -> CredChange {
     // reserve
     // commit
     // publish
-    let payload_guard = target.payload.lock();
-    let Some(payload) = payload_guard.as_ref() else {
-        return CredChange::Zombie;
-    };
-    let prev_cap = payload.cred_cap();
-    let prev = *prev_cap;
-    let mut new = prev;
+    with_cred_mutation(target, |payload| {
+        let prev_cap = payload.cred_cap();
+        let prev = *prev_cap;
+        let mut new = prev;
 
-    if prev.is_privileged_for(Capability::SETGID) {
-        new.gid = new_gid;
-        new.egid = new_gid;
-        new.sgid = new_gid;
-    } else if new_gid == prev.gid || new_gid == prev.egid || new_gid == prev.sgid {
-        new.egid = new_gid;
-    } else {
-        return CredChange::PermissionDenied;
-    }
+        if prev.is_privileged_for(Capability::SETGID) {
+            new.gid = new_gid;
+            new.egid = new_gid;
+            new.sgid = new_gid;
+        } else if new_gid == prev.gid || new_gid == prev.egid || new_gid == prev.sgid {
+            new.egid = new_gid;
+        } else {
+            return CredChange::PermissionDenied;
+        }
 
-    let new_cap = match sign_cred(new) {
-        Ok(cap) => cap,
-        Err(_) => return CredChange::PermissionDenied,
-    };
-    let _old_cap = payload.replace_cred(new_cap);
-    drop(payload_guard);
+        let new_cap = match sign_cred(new) {
+            Ok(cap) => cap,
+            Err(_) => return CredChange::PermissionDenied,
+        };
+        let _old_cap = payload.replace_cred(new_cap);
 
-    CredChange::Replaced { prev, new }
+        CredChange::Replaced { prev, new }
+    })
 }
 
 /// `setresuid`-family update. `(ruid, euid, suid)` triple, each `None`
@@ -498,54 +512,51 @@ pub fn step_setresuid(
     // reserve
     // commit
     // publish
-    let payload_guard = target.payload.lock();
-    let Some(payload) = payload_guard.as_ref() else {
-        return CredChange::Zombie;
-    };
-    let prev_cap = payload.cred_cap();
-    let prev = *prev_cap;
+    with_cred_mutation(target, |payload| {
+        let prev_cap = payload.cred_cap();
+        let prev = *prev_cap;
 
-    if !prev.is_privileged_for(Capability::SETUID) {
-        let allowed = |candidate: Uid| -> bool {
-            candidate == prev.uid || candidate == prev.euid || candidate == prev.suid
-        };
-        if let Some(r) = ruid {
-            if !allowed(r) {
-                return CredChange::PermissionDenied;
+        if !prev.is_privileged_for(Capability::SETUID) {
+            let allowed = |candidate: Uid| -> bool {
+                candidate == prev.uid || candidate == prev.euid || candidate == prev.suid
+            };
+            if let Some(r) = ruid {
+                if !allowed(r) {
+                    return CredChange::PermissionDenied;
+                }
             }
+            if let Some(e) = euid {
+                if !allowed(e) {
+                    return CredChange::PermissionDenied;
+                }
+            }
+            if let Some(s) = suid {
+                if !allowed(s) {
+                    return CredChange::PermissionDenied;
+                }
+            }
+        }
+
+        let mut new = prev;
+        if let Some(r) = ruid {
+            new.uid = r;
         }
         if let Some(e) = euid {
-            if !allowed(e) {
-                return CredChange::PermissionDenied;
-            }
+            new.euid = e;
         }
         if let Some(s) = suid {
-            if !allowed(s) {
-                return CredChange::PermissionDenied;
-            }
+            new.suid = s;
         }
-    }
+        apply_uid_capability_transition(prev, &mut new);
 
-    let mut new = prev;
-    if let Some(r) = ruid {
-        new.uid = r;
-    }
-    if let Some(e) = euid {
-        new.euid = e;
-    }
-    if let Some(s) = suid {
-        new.suid = s;
-    }
-    apply_uid_capability_transition(prev, &mut new);
+        let new_cap = match sign_cred(new) {
+            Ok(cap) => cap,
+            Err(_) => return CredChange::PermissionDenied,
+        };
+        let _old_cap = payload.replace_cred(new_cap);
 
-    let new_cap = match sign_cred(new) {
-        Ok(cap) => cap,
-        Err(_) => return CredChange::PermissionDenied,
-    };
-    let _old_cap = payload.replace_cred(new_cap);
-    drop(payload_guard);
-
-    CredChange::Replaced { prev, new }
+        CredChange::Replaced { prev, new }
+    })
 }
 
 /// `setresgid`-family analog of [`step_setresuid`]. Same rule applied
@@ -561,53 +572,50 @@ pub fn step_setresgid(
     // reserve
     // commit
     // publish
-    let payload_guard = target.payload.lock();
-    let Some(payload) = payload_guard.as_ref() else {
-        return CredChange::Zombie;
-    };
-    let prev_cap = payload.cred_cap();
-    let prev = *prev_cap;
+    with_cred_mutation(target, |payload| {
+        let prev_cap = payload.cred_cap();
+        let prev = *prev_cap;
 
-    if !prev.is_privileged_for(Capability::SETGID) {
-        let allowed = |candidate: Gid| -> bool {
-            candidate == prev.gid || candidate == prev.egid || candidate == prev.sgid
-        };
-        if let Some(r) = rgid {
-            if !allowed(r) {
-                return CredChange::PermissionDenied;
+        if !prev.is_privileged_for(Capability::SETGID) {
+            let allowed = |candidate: Gid| -> bool {
+                candidate == prev.gid || candidate == prev.egid || candidate == prev.sgid
+            };
+            if let Some(r) = rgid {
+                if !allowed(r) {
+                    return CredChange::PermissionDenied;
+                }
             }
+            if let Some(e) = egid {
+                if !allowed(e) {
+                    return CredChange::PermissionDenied;
+                }
+            }
+            if let Some(s) = sgid {
+                if !allowed(s) {
+                    return CredChange::PermissionDenied;
+                }
+            }
+        }
+
+        let mut new = prev;
+        if let Some(r) = rgid {
+            new.gid = r;
         }
         if let Some(e) = egid {
-            if !allowed(e) {
-                return CredChange::PermissionDenied;
-            }
+            new.egid = e;
         }
         if let Some(s) = sgid {
-            if !allowed(s) {
-                return CredChange::PermissionDenied;
-            }
+            new.sgid = s;
         }
-    }
 
-    let mut new = prev;
-    if let Some(r) = rgid {
-        new.gid = r;
-    }
-    if let Some(e) = egid {
-        new.egid = e;
-    }
-    if let Some(s) = sgid {
-        new.sgid = s;
-    }
+        let new_cap = match sign_cred(new) {
+            Ok(cap) => cap,
+            Err(_) => return CredChange::PermissionDenied,
+        };
+        let _old_cap = payload.replace_cred(new_cap);
 
-    let new_cap = match sign_cred(new) {
-        Ok(cap) => cap,
-        Err(_) => return CredChange::PermissionDenied,
-    };
-    let _old_cap = payload.replace_cred(new_cap);
-    drop(payload_guard);
-
-    CredChange::Replaced { prev, new }
+        CredChange::Replaced { prev, new }
+    })
 }
 
 /// `setreuid`-family update. `(ruid, euid)` pair, each `None` meaning
@@ -628,52 +636,49 @@ pub fn step_setreuid(
     // reserve
     // commit
     // publish
-    let payload_guard = target.payload.lock();
-    let Some(payload) = payload_guard.as_ref() else {
-        return CredChange::Zombie;
-    };
-    let prev_cap = payload.cred_cap();
-    let prev = *prev_cap;
+    with_cred_mutation(target, |payload| {
+        let prev_cap = payload.cred_cap();
+        let prev = *prev_cap;
 
-    if !prev.is_privileged_for(Capability::SETUID) {
-        let allowed = |candidate: Uid| -> bool {
-            candidate == prev.uid || candidate == prev.euid || candidate == prev.suid
-        };
-        if let Some(r) = ruid {
-            if !allowed(r) {
-                return CredChange::PermissionDenied;
+        if !prev.is_privileged_for(Capability::SETUID) {
+            let allowed = |candidate: Uid| -> bool {
+                candidate == prev.uid || candidate == prev.euid || candidate == prev.suid
+            };
+            if let Some(r) = ruid {
+                if !allowed(r) {
+                    return CredChange::PermissionDenied;
+                }
             }
+            if let Some(e) = euid {
+                if !allowed(e) {
+                    return CredChange::PermissionDenied;
+                }
+            }
+        }
+
+        let mut new = prev;
+        if let Some(r) = ruid {
+            new.uid = r;
         }
         if let Some(e) = euid {
-            if !allowed(e) {
-                return CredChange::PermissionDenied;
-            }
+            new.euid = e;
         }
-    }
 
-    let mut new = prev;
-    if let Some(r) = ruid {
-        new.uid = r;
-    }
-    if let Some(e) = euid {
-        new.euid = e;
-    }
+        // Linux quirk: if ruid was set OR the post-call euid differs from
+        // the pre-call real uid, the saved-set is bumped to post-call euid.
+        if ruid.is_some() || new.euid != prev.uid {
+            new.suid = new.euid;
+        }
+        apply_uid_capability_transition(prev, &mut new);
 
-    // Linux quirk: if ruid was set OR the post-call euid differs from
-    // the pre-call real uid, the saved-set is bumped to post-call euid.
-    if ruid.is_some() || new.euid != prev.uid {
-        new.suid = new.euid;
-    }
-    apply_uid_capability_transition(prev, &mut new);
+        let new_cap = match sign_cred(new) {
+            Ok(cap) => cap,
+            Err(_) => return CredChange::PermissionDenied,
+        };
+        let _old_cap = payload.replace_cred(new_cap);
 
-    let new_cap = match sign_cred(new) {
-        Ok(cap) => cap,
-        Err(_) => return CredChange::PermissionDenied,
-    };
-    let _old_cap = payload.replace_cred(new_cap);
-    drop(payload_guard);
-
-    CredChange::Replaced { prev, new }
+        CredChange::Replaced { prev, new }
+    })
 }
 
 /// `setregid`-family analog of [`step_setreuid`]. Same rule applied to
@@ -688,58 +693,54 @@ pub fn step_setregid(
     // reserve
     // commit
     // publish
-    let payload_guard = target.payload.lock();
-    let Some(payload) = payload_guard.as_ref() else {
-        return CredChange::Zombie;
-    };
-    let prev_cap = payload.cred_cap();
-    let prev = *prev_cap;
+    with_cred_mutation(target, |payload| {
+        let prev_cap = payload.cred_cap();
+        let prev = *prev_cap;
 
-    if !prev.is_privileged_for(Capability::SETGID) {
-        let allowed = |candidate: Gid| -> bool {
-            candidate == prev.gid || candidate == prev.egid || candidate == prev.sgid
-        };
-        if let Some(r) = rgid {
-            if !allowed(r) {
-                return CredChange::PermissionDenied;
+        if !prev.is_privileged_for(Capability::SETGID) {
+            let allowed = |candidate: Gid| -> bool {
+                candidate == prev.gid || candidate == prev.egid || candidate == prev.sgid
+            };
+            if let Some(r) = rgid {
+                if !allowed(r) {
+                    return CredChange::PermissionDenied;
+                }
             }
+            if let Some(e) = egid {
+                if !allowed(e) {
+                    return CredChange::PermissionDenied;
+                }
+            }
+        }
+
+        let mut new = prev;
+        if let Some(r) = rgid {
+            new.gid = r;
         }
         if let Some(e) = egid {
-            if !allowed(e) {
-                return CredChange::PermissionDenied;
-            }
+            new.egid = e;
         }
-    }
 
-    let mut new = prev;
-    if let Some(r) = rgid {
-        new.gid = r;
-    }
-    if let Some(e) = egid {
-        new.egid = e;
-    }
+        if rgid.is_some() || new.egid != prev.gid {
+            new.sgid = new.egid;
+        }
 
-    if rgid.is_some() || new.egid != prev.gid {
-        new.sgid = new.egid;
-    }
+        let new_cap = match sign_cred(new) {
+            Ok(cap) => cap,
+            Err(_) => return CredChange::PermissionDenied,
+        };
+        let _old_cap = payload.replace_cred(new_cap);
 
-    let new_cap = match sign_cred(new) {
-        Ok(cap) => cap,
-        Err(_) => return CredChange::PermissionDenied,
-    };
-    let _old_cap = payload.replace_cred(new_cap);
-    drop(payload_guard);
-
-    CredChange::Replaced { prev, new }
+        CredChange::Replaced { prev, new }
+    })
 }
 
 // ----- Exec-time setuid/setgid recompute -----
 
 /// Outcome of [`step_apply_suid_for_exec`].
 ///
-/// Surfaces the post-recompute facts the exec script needs at Phase 5
-/// (for the auxv `AT_SECURE` slot) and the pre-recompute snapshot a
-/// caller can use to roll back if a later pre-PoNR phase fails.
+/// Surfaces facts from a completed credential commit. Pre-PoNR callers use
+/// [`PreparedExecCred`] instead and drop it on failure without publishing.
 ///
 /// Cites: `txdoc:EXEC-3-3-CRED-AUTHORIZES-EXECUTE-COMPUTES-NEW-CREDENTIALS`
 /// and `txdoc:EXEC-12-3-INSTALL-NEW-CREDENTIAL`.
@@ -753,16 +754,197 @@ pub struct ExecCredOutcome {
     /// model file capabilities or `nosuid` mounts, so the effective-id
     /// delta is the only signal.
     pub at_secure: bool,
-    /// Snapshot of the cred BEFORE the recompute. Callers may use this
-    /// to roll back via `step_setresuid` / `step_setresgid` if a later
-    /// pre-PoNR phase fails. Production exec_script does not roll back
-    /// (Linux's exec failure modes between Phase 3.5 and Phase 6 leave
-    /// the new cred installed; see the slice plan's risk #5), but
-    /// tests and future stricter ordering choices may.
+    /// Snapshot of the cred before the committed replacement. This is an
+    /// audit/result fact; pre-PoNR rollback is structural because the prepared
+    /// replacement is not installed until commit.
     pub previous_cred: Cred,
 }
 
-/// Apply the binary's `S_ISUID` / `S_ISGID` mode bits to `target`'s
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecSetidPolicy {
+    Apply,
+    Suppress,
+}
+
+/// Linear exec reservation over one process payload's credential lane.
+pub struct ExecCredReservation {
+    payload: PayloadCap<ProcessPayload>,
+    token: ExecCredReservationToken,
+    active: bool,
+}
+
+impl ExecCredReservation {
+    fn commit(mut self, replacement: Option<Cap<Cred>>) -> Result<Cap<Cred>, ()> {
+        let previous = self
+            .payload
+            .commit_exec_cred_reservation(self.token, replacement);
+        if previous.is_ok() {
+            self.active = false;
+        }
+        previous
+    }
+}
+
+impl Drop for ExecCredReservation {
+    fn drop(&mut self) {
+        if self.active {
+            self.payload.release_exec_cred_reservation(self.token);
+        }
+    }
+}
+
+/// Credential replacement and mutation reservation fully prepared before
+/// exec's point of no return.
+pub struct PreparedExecCred {
+    process_prep: crate::process::ProcessExecPrep,
+    reservation: ExecCredReservation,
+    new_cred: Option<Cap<Cred>>,
+    credential_snapshot: Cred,
+    at_secure: bool,
+}
+
+impl PreparedExecCred {
+    pub const fn credential_snapshot(&self) -> Cred {
+        self.credential_snapshot
+    }
+
+    pub fn credential(&self) -> &Cred {
+        &self.credential_snapshot
+    }
+
+    pub const fn at_secure(&self) -> bool {
+        self.at_secure
+    }
+
+    pub const fn has_replacement(&self) -> bool {
+        self.new_cred.is_some()
+    }
+
+    pub fn process_prep_mut(&mut self) -> &mut crate::process::ProcessExecPrep {
+        &mut self.process_prep
+    }
+}
+
+/// Reserve the credential lane and prepare the optional setid replacement.
+pub fn prepare_exec_cred(
+    target: &Cap<ProcessIdentity>,
+    file_uid: Uid,
+    file_gid: Gid,
+    file_mode: u16,
+    setid_policy: ExecSetidPolicy,
+) -> Result<PreparedExecCred, Errno> {
+    let initiator = target
+        .payload
+        .lock()
+        .as_ref()
+        .and_then(|payload| payload.threads.snapshot().into_iter().next())
+        .ok_or(Errno::ESRCH)?;
+    let process_prep = crate::process::ProcessExecPrep::begin(target, &initiator).map_err(
+        |error| match error {
+            crate::process::ExecPrepError::Again => Errno::EAGAIN,
+            crate::process::ExecPrepError::OutOfMemory => Errno::ENOMEM,
+            crate::process::ExecPrepError::Zombie | crate::process::ExecPrepError::StaleBinding => {
+                Errno::ESRCH
+            }
+        },
+    )?;
+    prepare_exec_cred_in(process_prep, file_uid, file_gid, file_mode, setid_policy)
+}
+
+/// Prepare the credential child reservation under an already-owned process
+/// exec lifecycle episode. Production exec passes its actual calling thread
+/// to `ProcessExecPrep::begin` before reaching this function.
+pub fn prepare_exec_cred_in(
+    process_prep: crate::process::ProcessExecPrep,
+    file_uid: Uid,
+    file_gid: Gid,
+    file_mode: u16,
+    setid_policy: ExecSetidPolicy,
+) -> Result<PreparedExecCred, Errno> {
+    process_prep.validate_binding().map_err(|_| Errno::EAGAIN)?;
+    let payload = process_prep.payload().clone();
+    let (token, prev) = payload.reserve_exec_cred().ok_or(Errno::EAGAIN)?;
+    let reservation = ExecCredReservation {
+        payload,
+        token,
+        active: true,
+    };
+    let mut new = prev;
+
+    let apply_setid = setid_policy == ExecSetidPolicy::Apply;
+    let setuid = apply_setid && (file_mode & S_ISUID) != 0;
+    let setgid = apply_setid && (file_mode & S_ISGID) != 0 && (file_mode & 0o010) != 0;
+
+    if setuid {
+        new.euid = file_uid;
+        new.suid = new.euid;
+    }
+    if setgid {
+        new.egid = file_gid;
+        new.sgid = new.egid;
+    }
+
+    let at_secure = (setuid && new.euid != prev.euid) || (setgid && new.egid != prev.egid);
+    let new_cred = match setid_policy {
+        ExecSetidPolicy::Apply => Some(sign_cred(new).map_err(|_| Errno::ENOMEM)?),
+        ExecSetidPolicy::Suppress => None,
+    };
+
+    Ok(PreparedExecCred {
+        process_prep,
+        reservation,
+        new_cred,
+        credential_snapshot: new,
+        at_secure,
+    })
+}
+
+pub fn prepare_setid_for_exec(
+    target: &Cap<ProcessIdentity>,
+    file_uid: Uid,
+    file_gid: Gid,
+    file_mode: u16,
+) -> Result<PreparedExecCred, Errno> {
+    prepare_exec_cred(
+        target,
+        file_uid,
+        file_gid,
+        file_mode,
+        ExecSetidPolicy::Apply,
+    )
+}
+
+/// Publish a credential whose allocation and computation completed pre-PoNR.
+///
+/// Exec calls this only after replacing the address space. The authoritative
+/// identity binding is checked before the credential token is consumed; a
+/// stale binding returns without mutating the detached payload.
+pub fn commit_prepared_exec_cred(
+    prepared: PreparedExecCred,
+) -> Result<ExecCredOutcome, crate::process::ExecPrepError> {
+    let PreparedExecCred {
+        process_prep,
+        reservation,
+        new_cred,
+        credential_snapshot: _,
+        at_secure,
+    } = prepared;
+    let previous_cred = *process_prep.commit_authoritative(move |authoritative_payload| {
+        if authoritative_payload.key() != reservation.payload.key() {
+            return Err(crate::process::ExecPrepError::StaleBinding);
+        }
+        reservation
+            .commit(new_cred)
+            .map_err(|_| crate::process::ExecPrepError::StaleBinding)
+    })?;
+
+    Ok(ExecCredOutcome {
+        at_secure,
+        previous_cred,
+    })
+}
+
+/// Immediately apply the binary's `S_ISUID` / `S_ISGID` mode bits to `target`'s
 /// effective and saved-set IDs at exec time. Per Linux semantics:
 ///
 /// - If `file_mode & S_ISUID` is set: `cred.euid := file_uid` and
@@ -780,19 +962,10 @@ pub struct ExecCredOutcome {
 ///   the slice does not yet model file capabilities (`xattr`-driven
 ///   `CAP_FILE_CAP_*` discipline lands in a future capabilities slice).
 ///
-/// Returns [`ExecCredOutcome`] carrying the `at_secure` flag (per the
-/// short-form rule documented on the field) and the pre-recompute cred
-/// snapshot. Returns `None` if `target` is a zombie (no payload — cred
-/// unobservable); callers reaching this branch from inside `exec_script`
-/// have already opened the binary on the caller's behalf, so the
-/// process is alive by definition and `None` is purely defensive.
-///
-/// Infallible at runtime under normal conditions. The cred mutation is
-/// a single lock acquisition + bitwise update + fence; the operation
-/// completes before any post-Phase-3.5 fallible call (Phase 4
-/// `build_aspace`, Phase 5 stack-populate). The caller is responsible
-/// for any rollback if a later pre-PoNR phase fails (`previous_cred`
-/// in the outcome supports this).
+/// Compatibility surface for non-transactional callers. It performs
+/// [`prepare_setid_for_exec`] and [`commit_prepared_exec_cred`] back to back,
+/// returning `None` for a zombie or allocation failure. The exec script must
+/// use those two operations separately so all fallible work stays pre-PoNR.
 ///
 /// Cites: `txdoc:EXEC-3-3-CRED-AUTHORIZES-EXECUTE-COMPUTES-NEW-CREDENTIALS`,
 /// `txdoc:EXEC-12-3-INSTALL-NEW-CREDENTIAL`,
@@ -803,52 +976,11 @@ pub fn step_apply_suid_for_exec(
     file_gid: Gid,
     file_mode: u16,
 ) -> Option<ExecCredOutcome> {
-    // observe
-    // upgrade
-    // reserve
-    // commit
-    // publish
-    let payload_guard = target.payload.lock();
-    let payload = payload_guard.as_ref()?;
-    let prev_cap = payload.cred_cap();
-    let prev = *prev_cap;
-    let mut new = prev;
-
-    let setuid = (file_mode & S_ISUID) != 0;
-    // Linux's setgid-on-exec rule honours `S_ISGID` only when at least
-    // one of the group-X bits is also set; `S_ISGID` without group-X
-    // means mandatory locking on Linux file systems that support it.
-    // For exec-time cred recompute the standard meaning is the only
-    // one in scope.
-    let setgid = (file_mode & S_ISGID) != 0 && (file_mode & 0o010) != 0;
-
-    if setuid {
-        new.euid = file_uid;
-        // Saved-set tracks the new effective uid post-exec.
-        new.suid = new.euid;
-    }
-    if setgid {
-        new.egid = file_gid;
-        new.sgid = new.egid;
-    }
-
-    let at_secure = (setuid && new.euid != prev.euid) || (setgid && new.egid != prev.egid);
-
-    // PR-9 phase 5 (D5 Path A): sign the new Cred into a fresh
-    // `Cap<Cred>` and publish via slot swap. `step_apply_suid_for_exec`
-    // is infallible at runtime under normal conditions; slab
-    // exhaustion at this site is a kernel-wide pressure event the
-    // caller must surface — return `None` (the zombie variant of the
-    // outcome shape) defensively so the caller's existing
-    // `expect("alive")` chain remains structurally tight.
-    let new_cap = sign_cred(new).ok()?;
-    let _old_cap = payload.replace_cred(new_cap);
-    drop(payload_guard);
-
-    Some(ExecCredOutcome {
-        at_secure,
-        previous_cred: prev,
-    })
+    let prepared = prepare_setid_for_exec(target, file_uid, file_gid, file_mode).ok()?;
+    Some(
+        commit_prepared_exec_cred(prepared)
+            .expect("fresh exec credential reservation remains authoritative"),
+    )
 }
 
 // ----- Authorization checks -----

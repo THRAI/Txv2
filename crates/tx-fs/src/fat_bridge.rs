@@ -6,7 +6,9 @@
 
 use core::ptr::NonNull;
 
-use crate::devfs::adapter::step_engine::{epoch, page_allocator, StepOutcome, ZeroPolicy};
+use crate::devfs::adapter::step_engine::{
+    borrow_current_guard, guard, page_allocator, StepOutcome, ZeroPolicy,
+};
 use tx_fat_format::pager::{BlockImage, Page4K, BLOCK_SIZE};
 use tx_fat_format::{FatFormatError, Result};
 use tx_subsystems::device::{BlockDevice, PhysicalBlockNumber};
@@ -166,7 +168,7 @@ impl BlockImage for BlockDeviceImage {
         let ppn = run.base();
         let mut frame = Frame::new(ppn);
 
-        let guard = epoch::borrow_current_guard().unwrap_or_else(epoch::guard);
+        let guard = borrow_current_guard().unwrap_or_else(guard);
         let outcome = self.device.read_blocks(
             PhysicalBlockNumber::new(lba),
             core::slice::from_mut(&mut frame),
@@ -212,7 +214,7 @@ impl BlockImage for BlockDeviceImage {
             core::ptr::copy_nonoverlapping(data.as_ptr(), dst_nn.as_ptr(), BLOCK_SIZE);
         }
 
-        let guard = epoch::borrow_current_guard().unwrap_or_else(epoch::guard);
+        let guard = borrow_current_guard().unwrap_or_else(guard);
         let outcome = self.device.write_blocks(
             PhysicalBlockNumber::new(lba),
             core::slice::from_ref(&frame),

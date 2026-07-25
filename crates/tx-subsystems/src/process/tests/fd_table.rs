@@ -6,9 +6,9 @@ use crate::process::execution::CloseOp;
 // Process-side tests for the Wave 2 deliverables:
 // - `ProcessPayload.fd_cloexec` storage (default 0; set/clear round trip).
 // - `step_fork` clones parent's CLOEXEC bits (Linux semantics).
-// - `step_close_cloexec_fds` (P1) closes only marked fds and clears the
-//   bitmap.
-// - `step_install_brk_for_exec` (P3) overwrites both `brk_base` and
+// - `ProcessExecPrep` prepares CLOEXEC closure before PoNR and does not
+//   re-enter the fallible close-plan allocation path during commit.
+// - `InstallBrkForExecOp` (P3) overwrites both `brk_base` and
 //   `current_brk`.
 
 /// Helper: synthesise an `OpenFile` `Cap` over a regular-file RNode so
@@ -39,7 +39,10 @@ fn pipe_payload_of(file: &Cap<crate::vfs::OpenFile>) -> Cap<crate::pipe::PipePay
 fn assert_pipe_read_eof(payload: &Cap<crate::pipe::PipePayload>) {
     let mut buf = [0u8; 4];
     let guard = ebr_guard();
-    let outcome = crate::pipe::step_read(payload, &mut buf, &guard, false);
+    let outcome =
+        crate::pipe::step_read_with_post(payload, &mut buf, &guard, false, |mailbox, event| {
+            mailbox.post(event)
+        });
     drop(guard);
     assert_eq!(outcome, StepOutcome::Done(0));
 }
@@ -47,7 +50,10 @@ fn assert_pipe_read_eof(payload: &Cap<crate::pipe::PipePayload>) {
 fn assert_pipe_read_blocks(payload: &Cap<crate::pipe::PipePayload>) {
     let mut buf = [0u8; 4];
     let guard = ebr_guard();
-    let outcome = crate::pipe::step_read(payload, &mut buf, &guard, false);
+    let outcome =
+        crate::pipe::step_read_with_post(payload, &mut buf, &guard, false, |mailbox, event| {
+            mailbox.post(event)
+        });
     drop(guard);
     assert!(matches!(outcome, StepOutcome::Yield { .. }));
 }
@@ -375,7 +381,7 @@ fn child_exit_drains_inherited_pipe_writer_fd_and_publishes_eof() {
     parent.set_fd(4, None);
     assert_pipe_read_blocks(&payload);
 
-    step_exit_group(&child, ExitStatus::Exited(0));
+    finish_process_group_for_test(&child, ExitStatus::Exited(0));
     assert_pipe_read_eof(&payload);
     parent.set_fd(3, None);
 }
@@ -429,56 +435,98 @@ fn step_fork_clones_fd_cloexec_bits() {
 }
 
 #[test]
-fn step_close_cloexec_fds_closes_marked_fds_clears_others() {
-    use crate::process::exec_prep::step_close_cloexec_fds;
+fn prepared_cloexec_commit_closes_only_the_prevalidated_file() {
     let _g = setup();
-    let proc_cap = bootstrap();
+    let process = bootstrap();
+    let leader = first_thread(&process);
+    let closing = fresh_open_file();
+    let kept = fresh_open_file();
+    process.set_fd(3, Some(closing));
+    process.set_fd(4, Some(kept));
+    process.set_fd_cloexec(3, true);
 
-    // Install three open files at fds 0, 1, 2; mark only fd 1 as
-    // CLOEXEC.
-    proc_cap.set_fd(0, Some(fresh_open_file()));
-    proc_cap.set_fd(1, Some(fresh_open_file()));
-    proc_cap.set_fd(2, Some(fresh_open_file()));
-    proc_cap.set_fd_cloexec(1, true);
+    let old_aspace = process.aspace_cap().expect("old aspace");
+    let replacement = fresh_aspace();
+    let replacement_key = replacement.key();
+    let prep =
+        crate::process::ProcessExecPrep::begin(&process, &leader).expect("reserve exec lifecycle");
+    let close_plan = prep
+        .prepare_cloexec_close()
+        .expect("prepare CLOEXEC close plan");
+    let previous = prep
+        .replace_aspace_and_close_cloexec(replacement, close_plan)
+        .expect("commit address space and CLOEXEC close plan");
 
-    step_close_cloexec_fds(&proc_cap);
-
-    // Only fd 1 should be closed; the others remain.
-    assert!(proc_cap.fd(0).is_some(), "fd 0 was not marked; survives");
-    assert!(
-        proc_cap.fd(1).is_none(),
-        "fd 1 was marked CLOEXEC; should be closed"
+    assert_eq!(previous.key(), old_aspace.key());
+    assert_eq!(
+        process.aspace_cap().expect("new aspace").key(),
+        replacement_key
     );
-    assert!(proc_cap.fd(2).is_some(), "fd 2 was not marked; survives");
+    assert!(process.fd(3).is_none());
+    assert!(process.fd(4).is_some());
+    assert!(!process.fd_cloexec(3));
 }
 
 #[test]
-fn step_close_cloexec_fds_clears_bitmap_after() {
-    use crate::process::exec_prep::step_close_cloexec_fds;
+fn stale_cloexec_plan_rolls_back_before_aspace_swap_and_preserves_reused_fd() {
     let _g = setup();
-    let proc_cap = bootstrap();
+    let process = bootstrap();
+    let leader = first_thread(&process);
+    let original = fresh_open_file();
+    process.set_fd(3, Some(original));
+    process.set_fd_cloexec(3, true);
+    let old_aspace_key = process.aspace_cap().expect("old aspace").key();
 
-    proc_cap.set_fd(2, Some(fresh_open_file()));
-    proc_cap.set_fd_cloexec(2, true);
-    assert!(proc_cap.fd_cloexec(2));
+    let prep =
+        crate::process::ProcessExecPrep::begin(&process, &leader).expect("reserve exec lifecycle");
+    let close_plan = prep
+        .prepare_cloexec_close()
+        .expect("prepare CLOEXEC close plan");
+    let replacement_file = fresh_open_file();
+    let replacement_file_key = replacement_file.key();
+    let _old = process.set_fd(3, Some(replacement_file));
+    process.set_fd_cloexec(3, true);
 
-    step_close_cloexec_fds(&proc_cap);
-
-    // The sweep clears the set wholesale: future fcntl(F_SETFD) calls
-    // start from a clean state.
-    assert!(
-        !proc_cap.fd_cloexec(2),
-        "post-sweep, the CLOEXEC bit must be cleared"
+    assert_eq!(
+        prep.replace_aspace_and_close_cloexec(fresh_aspace(), close_plan)
+            .err(),
+        Some(crate::process::ExecPrepError::Again),
     );
-    assert!(
-        proc_cap.fd_cloexec_snapshot().is_empty(),
-        "post-sweep, the CLOEXEC set must be empty"
+    assert_eq!(
+        process.aspace_cap().expect("unchanged aspace").key(),
+        old_aspace_key
     );
+    assert_eq!(
+        process.fd(3).expect("reused fd survives").key(),
+        replacement_file_key
+    );
+    assert!(process.fd_cloexec(3));
 }
 
 #[test]
-fn step_install_brk_for_exec_resets_both_brk_base_and_current() {
-    use crate::process::exec_prep::step_install_brk_for_exec;
+fn post_prepare_cloexec_plan_allocation_fault_is_not_consumed_by_commit() {
+    let _g = setup();
+    let process = bootstrap();
+    let leader = first_thread(&process);
+    process.set_fd(3, Some(fresh_open_file()));
+    process.set_fd_cloexec(3, true);
+
+    let prep =
+        crate::process::ProcessExecPrep::begin(&process, &leader).expect("reserve exec lifecycle");
+    let close_plan = prep
+        .prepare_cloexec_close()
+        .expect("prepare CLOEXEC close plan");
+    crate::process::exec_prep::fail_next_cloexec_plan_allocation_for_test();
+
+    prep.replace_aspace_and_close_cloexec(fresh_aspace(), close_plan)
+        .expect("commit must not allocate another CLOEXEC plan");
+    assert!(crate::process::exec_prep::cloexec_plan_allocation_fault_pending_for_test());
+    crate::process::exec_prep::clear_cloexec_plan_allocation_fault_for_test();
+}
+
+#[test]
+fn install_brk_for_exec_resets_both_brk_base_and_current() {
+    use crate::process::exec_prep::install_brk_for_exec;
     use crate::process::execution::BOOTSTRAP_BRK_BASE;
     let _g = setup();
     let proc_cap = bootstrap();
@@ -499,7 +547,7 @@ fn step_install_brk_for_exec_resets_both_brk_base_and_current() {
     // Install fresh exec-image brk: both fields rewritten to the
     // same new value (per `txdoc:EXEC-12-4-INSTALL-BRK`).
     let new_brk: u64 = 0xb000_0000;
-    step_install_brk_for_exec(&proc_cap, new_brk);
+    install_brk_for_exec(&proc_cap, new_brk);
 
     assert_eq!(proc_cap.brk_base(), new_brk);
     assert_eq!(proc_cap.current_brk(), new_brk);

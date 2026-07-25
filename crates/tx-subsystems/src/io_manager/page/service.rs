@@ -6,12 +6,12 @@ use alloc::vec::Vec;
 use crate::execution::{Errno, Guard};
 use crate::fs_iface::{IoDataSource, IoDataTarget};
 use crate::io_manager::backend::{
-    BackendBioCompletion, BackendBioGraph, BackendBioNodeId, BackendDispatch, BackendGraphAdvance,
-    BackendGraphScheduler, BackendGraphSchedulerError, BackendPageRequest, BackendPlan,
-    BackendPlanResume, BackendPlanner, BioPlanList, BlockPageCompletion, BlockPageCompletionError,
-    BlockPageRequestTracker, BlockPageRequestTrackerError, FsObjectKey, PageCompletion,
-    PageFrameRef, PageIoCompletionEntry, PagerResumeToken, WaitSourceId, dispatch_backend_plan,
-    plan_backend_request,
+    dispatch_backend_plan, plan_backend_request, BackendBioCompletion, BackendBioGraph,
+    BackendBioNodeId, BackendDispatch, BackendGraphAdvance, BackendGraphScheduler,
+    BackendGraphSchedulerError, BackendPageRequest, BackendPlan, BackendPlanResume, BackendPlanner,
+    BioPlanList, BlockPageCompletion, BlockPageCompletionError, BlockPageRequestTracker,
+    BlockPageRequestTrackerError, FsObjectKey, PageCompletion, PageFrameRef, PageIoCompletionEntry,
+    PagerResumeToken, WaitSourceId,
 };
 use crate::io_manager::block::{
     BlockCompletion, BlockCompletionError, BlockQueue, BlockRequestId, BlockTag, BlockTagTable,
@@ -765,7 +765,9 @@ impl PageService {
                 crate::io_manager::page::PageIoCompletionKind::ReadInstalled
             }
             PageIoOp::Writeback => crate::io_manager::page::PageIoCompletionKind::WritebackFinished,
-            PageIoOp::Fsync | PageIoOp::Checkpoint => crate::io_manager::page::PageIoCompletionKind::Noop,
+            PageIoOp::Fsync | PageIoOp::Checkpoint => {
+                crate::io_manager::page::PageIoCompletionKind::Noop
+            }
         };
         self.completions.push_back(PageIoCompletionEntry::new(
             PageIoCompletion::new(
@@ -885,7 +887,9 @@ impl PageService {
                 crate::io_manager::page::PageIoCompletionKind::ReadInstalled
             }
             PageIoOp::Writeback => crate::io_manager::page::PageIoCompletionKind::WritebackFinished,
-            PageIoOp::Fsync | PageIoOp::Checkpoint => crate::io_manager::page::PageIoCompletionKind::Noop,
+            PageIoOp::Fsync | PageIoOp::Checkpoint => {
+                crate::io_manager::page::PageIoCompletionKind::Noop
+            }
         };
         let result = match result {
             Ok(()) => crate::io_manager::page::PageIoResult::Done,
@@ -1312,12 +1316,10 @@ mod tests {
                     assert_eq!(resumed, page_request);
                     assert_eq!(resume.token, PagerResumeToken::new(91));
                     assert_eq!(resume.completions.len(), 2);
-                    assert!(
-                        resume
-                            .completions
-                            .iter()
-                            .all(|completion| completion.result == Ok(()))
-                    );
+                    assert!(resume
+                        .completions
+                        .iter()
+                        .all(|completion| completion.result == Ok(())));
                 }
                 other => panic!("expected metadata resume, got {other:?}"),
             },
@@ -2024,12 +2026,10 @@ mod tests {
             .expect("root failure");
         assert_eq!(terminal.queued, 1);
         assert_eq!(terminal.block_submitted, 0);
-        assert!(
-            block_queue
-                .pop_dispatchable_tagged(&mut depth, &mut tags)
-                .expect("failed graph must not admit dependents")
-                .is_none()
-        );
+        assert!(block_queue
+            .pop_dispatchable_tagged(&mut depth, &mut tags)
+            .expect("failed graph must not admit dependents")
+            .is_none());
         match service.drain_turn(ServiceBudget::new(1)) {
             PageServiceTurn::Work(mut work) => match work.remove(0) {
                 PageServiceWork::Completion(route) => {

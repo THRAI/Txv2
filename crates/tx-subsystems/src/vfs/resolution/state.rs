@@ -8,7 +8,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use crate::mount::MountNamespace;
+use crate::mount::{MountIdentity, MountNamespace};
 use crate::vfs::adapter::step_engine::Cap;
 use crate::vfs::{DEntry, FsObjectId, InodeMeta, RNode};
 
@@ -80,6 +80,10 @@ pub struct WalkingState {
     pub hop_count: u32,
     /// Namespace root dentry (for absolute symlinks and `..` bound).
     pub mount_root: Cap<DEntry>,
+    /// Mount identity containing `current` for namespace-aware walks.
+    pub current_mount: Option<Cap<MountIdentity>>,
+    /// Namespace root mount restored by absolute symlink substitution.
+    pub mount_root_mount: Option<Cap<MountIdentity>>,
     /// True when the original path ended with `/`.
     pub must_be_directory: bool,
 }
@@ -114,6 +118,7 @@ pub struct PathResolution {
     pub rnode: Cap<RNode>,
     pub fs_object_id: FsObjectId,
     pub meta: InodeMeta,
+    pub mount: Option<Cap<MountIdentity>>,
 }
 
 // ============================================================================
@@ -135,7 +140,7 @@ pub enum KernelStep {
 pub enum IORequest {
     DirLookup {
         fs_object_id: FsObjectId,
-        name: Box<[u8]>,
+        name: Vec<u8>,
     },
     LoadInodeMeta {
         fs_object_id: FsObjectId,
@@ -210,4 +215,76 @@ impl<'g> Default for WalkTrail<'g> {
 pub enum TrailEntry<'g> {
     DEntry(&'g DEntry),
     MountBoundary { was_at: &'g DEntry },
+}
+
+pub(super) fn try_copy_path(bytes: &[u8]) -> Result<Vec<u8>, crate::execution::Errno> {
+    let mut copied = Vec::new();
+    copied
+        .try_reserve_exact(bytes.len())
+        .map_err(|_| crate::execution::Errno::ENOMEM)?;
+    copied.extend_from_slice(bytes);
+    Ok(copied)
+}
+
+pub(super) fn try_join_path(
+    prefix: &[u8],
+    remaining: &[u8],
+) -> Result<Vec<u8>, crate::execution::Errno> {
+    let len = checked_join_path_len(prefix.len(), remaining.len())?;
+    let mut joined = Vec::new();
+    joined
+        .try_reserve_exact(len)
+        .map_err(|_| crate::execution::Errno::ENOMEM)?;
+    joined.extend_from_slice(prefix);
+    if !remaining.is_empty() {
+        joined.push(b'/');
+        joined.extend_from_slice(remaining);
+    }
+    Ok(joined)
+}
+
+fn checked_join_path_len(
+    prefix_len: usize,
+    remaining_len: usize,
+) -> Result<usize, crate::execution::Errno> {
+    let separator = usize::from(remaining_len != 0);
+    prefix_len
+        .checked_add(separator)
+        .and_then(|len| len.checked_add(remaining_len))
+        .ok_or(crate::execution::Errno::ENOMEM)
+}
+
+#[cfg(test)]
+mod allocation_tests {
+    use super::*;
+
+    #[test]
+    fn path_join_capacity_overflow_maps_to_enomem() {
+        assert_eq!(
+            checked_join_path_len(usize::MAX, 1),
+            Err(crate::execution::Errno::ENOMEM)
+        );
+    }
+}
+
+pub(super) fn try_clone_io_request(
+    request: &IORequest,
+) -> Result<IORequest, crate::execution::Errno> {
+    Ok(match request {
+        IORequest::DirLookup { fs_object_id, name } => IORequest::DirLookup {
+            fs_object_id: *fs_object_id,
+            name: try_copy_path(name)?,
+        },
+        IORequest::LoadInodeMeta { fs_object_id } => IORequest::LoadInodeMeta {
+            fs_object_id: *fs_object_id,
+        },
+        IORequest::ReadLink { fs_object_id, meta } => IORequest::ReadLink {
+            fs_object_id: *fs_object_id,
+            meta: *meta,
+        },
+        IORequest::MaterialiseRnode { fs_object_id, meta } => IORequest::MaterialiseRnode {
+            fs_object_id: *fs_object_id,
+            meta: *meta,
+        },
+    })
 }

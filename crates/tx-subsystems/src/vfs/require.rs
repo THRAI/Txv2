@@ -19,10 +19,10 @@ use crate::execution::{Errno, Guard};
 use crate::vfs::adapter::step_engine::Cap;
 
 use super::checks::{DirectoryAtPath, EntityAtPath, ParentAndName};
+use super::resolution::PathResolution;
 use super::resolution::driver;
 use super::resolution::state::{FinalSymlinkPolicy, WalkMode};
 use super::resolution::terminal;
-use super::resolution::PathResolution;
 use super::structure::{Credential, DEntry, InlineName};
 
 /// Resolve `path` relative to `rooted_at` and return a terminal
@@ -118,6 +118,7 @@ pub fn require_parent_and_name<'g>(
             rnode,
             fs_object_id,
             meta,
+            mount: None,
         }
     } else {
         driver::walk_to_completion(

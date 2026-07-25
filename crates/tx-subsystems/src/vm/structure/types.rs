@@ -343,6 +343,7 @@ impl<T: 'static> core::ops::Deref for VmCap<T> {
 pub enum VmBacking {
     None,
     PrivateAnon,
+    Special(VmSpecialBacking),
     Page {
         pc: VmCap<PageContainer>,
         offset: u64,
@@ -354,6 +355,15 @@ pub enum VmEntryBacking {
     None,
     PrivateAnon,
     Page { offset: u64 },
+}
+
+/// Kernel-owned frames mapped into participating user address spaces.
+///
+/// These mappings never enter the private-page/CoW machinery.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VmSpecialBacking {
+    Vvar,
+    VdsoText,
 }
 
 /// Per-VMA userfaultfd registration tag (PR-10 phase 3).
@@ -385,6 +395,7 @@ pub struct UfdRegistration {
 struct VmEntryOwners {
     page: Option<VmCap<PageContainer>>,
     private: Option<VmCap<PrivatePageSet>>,
+    special: Option<VmSpecialBacking>,
 }
 
 #[derive(Debug)]
@@ -444,10 +455,11 @@ impl VmEntry {
     /// Construct a VmEntry without a userfaultfd registration tag and
     /// no private CoW set. Existing callers stay source-compatible.
     pub fn new(range: UserRange, prot: Prot, flags: VmEntryFlags, backing: VmBacking) -> Self {
-        let (backing, page) = match backing {
-            VmBacking::None => (VmEntryBacking::None, None),
-            VmBacking::PrivateAnon => (VmEntryBacking::PrivateAnon, None),
-            VmBacking::Page { pc, offset } => (VmEntryBacking::Page { offset }, Some(pc)),
+        let (backing, page, special) = match backing {
+            VmBacking::None => (VmEntryBacking::None, None, None),
+            VmBacking::PrivateAnon => (VmEntryBacking::PrivateAnon, None, None),
+            VmBacking::Special(special) => (VmEntryBacking::None, None, Some(special)),
+            VmBacking::Page { pc, offset } => (VmEntryBacking::Page { offset }, Some(pc), None),
         };
         Self {
             range,
@@ -458,6 +470,7 @@ impl VmEntry {
             owners: Arc::new(VmEntryOwners {
                 page,
                 private: None,
+                special,
             }),
         }
     }
@@ -481,6 +494,7 @@ impl VmEntry {
         self.owners = Arc::new(VmEntryOwners {
             page: self.owners.page.clone(),
             private: set.map(Into::into),
+            special: self.owners.special,
         });
         self
     }
@@ -498,6 +512,9 @@ impl VmEntry {
     }
 
     pub fn backing(&self) -> VmBacking {
+        if let Some(special) = self.special_backing() {
+            return VmBacking::Special(special);
+        }
         match self.backing {
             VmEntryBacking::None => VmBacking::None,
             VmEntryBacking::PrivateAnon => VmBacking::PrivateAnon,
@@ -535,14 +552,20 @@ impl VmEntry {
         self.owners.private.clone()
     }
 
+    pub fn special_backing(&self) -> Option<VmSpecialBacking> {
+        self.owners.special
+    }
+
     pub fn private_identity(&self) -> Option<u32> {
         self.private().map(Cap::raw)
     }
 
     pub fn same_backing(&self, other: &Self) -> bool {
         match (self.backing, other.backing) {
-            (VmEntryBacking::None, VmEntryBacking::None)
-            | (VmEntryBacking::PrivateAnon, VmEntryBacking::PrivateAnon) => true,
+            (VmEntryBacking::None, VmEntryBacking::None) => {
+                self.owners.special == other.owners.special
+            }
+            (VmEntryBacking::PrivateAnon, VmEntryBacking::PrivateAnon) => true,
             (
                 VmEntryBacking::Page {
                     offset: left_offset,
@@ -699,6 +722,7 @@ impl VmEntry {
             owners: Arc::new(VmEntryOwners {
                 page: self.owners.page.clone(),
                 private,
+                special: self.owners.special,
             }),
         })
     }
@@ -1019,8 +1043,7 @@ impl VmFaultOutcome {
     }
 
     pub fn materialize_pagebacked(&self) -> Result<VmFaultMaterialization, VmFaultError> {
-        let guard =
-            step_engine::epoch_mod::borrow_current_guard().unwrap_or_else(step_engine::guard);
+        let guard = step_engine::borrow_current_guard().unwrap_or_else(step_engine::guard);
         match self.materialize_pagebacked_step(&guard) {
             VmFaultMaterializationStep::Done(materialization) => Ok(materialization),
             VmFaultMaterializationStep::Blocked(_) => Err(VmFaultError::WouldBlock),
@@ -1032,6 +1055,9 @@ impl VmFaultOutcome {
         &self,
         guard: &crate::execution::Guard<'_>,
     ) -> VmFaultMaterializationStep {
+        if let Some(special) = self.entry.special_backing() {
+            return self.materialize_special(special);
+        }
         // SHARED mappings: passthrough materialize from backing — no
         // private-page consult.
         if self.entry.flags.shared {
@@ -1047,6 +1073,41 @@ impl VmFaultOutcome {
         // installs an RO PTE pointing at the backing frame so concurrent
         // readers can share it.
         self.materialize_private(guard)
+    }
+
+    fn materialize_special(&self, special: VmSpecialBacking) -> VmFaultMaterializationStep {
+        if !crate::vdso::vdso_available() {
+            return VmFaultMaterializationStep::Err(VmFaultError::SpecialUnavailable);
+        }
+        let ppn = match special {
+            VmSpecialBacking::Vvar => crate::vdso::vvar_ppn(),
+            VmSpecialBacking::VdsoText => {
+                let offset = (self.page_range.start().as_usize()
+                    - self.entry.range.start().as_usize())
+                    / USER_PAGE_SIZE;
+                let Some(ppn) = crate::vdso::kernel_vdso().frames.get(offset).copied() else {
+                    return VmFaultMaterializationStep::Err(VmFaultError::BackingMismatch);
+                };
+                ppn
+            }
+        };
+        let map_pin = match page_allocator::acquire_map_pin(ppn) {
+            Ok(map_pin) => map_pin,
+            Err(error) => return VmFaultMaterializationStep::Err(page_alloc_error(error)),
+        };
+        VmFaultMaterializationStep::Done(VmFaultMaterialization {
+            backing: VmFaultMaterializationBacking::Special(special),
+            page_index: PageIndex::new(0),
+            page: MaterializedPage {
+                ppn,
+                map_pin: MaterializedPagePin::Allocated(map_pin),
+                newly_installed: false,
+                dirty: false,
+            },
+            publish_prot: self.entry.prot,
+            replace_existing: false,
+            pmap_materialization_deferred: self.pmap_materialization_deferred,
+        })
     }
 
     fn materialize_page_shared(
@@ -1118,6 +1179,9 @@ impl VmFaultOutcome {
                 Ok(page_index) => page_index,
                 Err(error) => return VmFaultMaterializationStep::Err(error),
             },
+            VmFaultMaterializationBacking::Special(_) => {
+                unreachable!("special mappings bypass private CoW")
+            }
         };
         let page_off = match self.private_page_off() {
             Ok(page_off) => page_off,
@@ -1525,6 +1589,7 @@ impl VmFaultOutcome {
 pub enum VmFaultMaterializationBacking {
     PageBacked,
     PrivateAnon,
+    Special(VmSpecialBacking),
 }
 
 #[derive(Debug)]
@@ -1554,6 +1619,7 @@ pub enum VmFaultError {
     BackingOffsetOverflow,
     PageBeyondSize,
     PageCache(PageCacheError),
+    SpecialUnavailable,
     StaleRecipe,
     Pmap(VmPmapError),
 }

@@ -11,7 +11,7 @@
 //! |---|---|
 //! | `OnWaitSource` | `TaskMailbox` + `ActiveWait::matches` (or global Channel registry fallback) |
 //! | `OnAgent` | `DelegateRegistry::install_request` → `TaskMailbox` park → `AgentReplied`/`Abort` |
-//! | `OnTimer` | `TimerWheel::install` → `TaskMailbox` park → timer fire |
+//! | `OnTimer` | `DeadlineRegistrar::register_deadline` → `TaskMailbox` park → timer fire |
 //!
 //! ## Observation
 //!
@@ -27,6 +27,9 @@
 use crate::adapter::delegate_runtime::{
     AbortReason, AgentTokenGuard, DelegateRegistry, TokenDropPolicy,
 };
+use crate::adapter::registered_wait::{
+    install_registered_mailbox_wait, RegisteredMailboxSubscription, RegisteredMailboxWait,
+};
 use crate::adapter::step_engine::{
     AcceptOutcome, AgentCancelPolicy, Deadline, DelegateEndpoint, DelegateRequest, DelegateToken,
     DriveMode, Errno, ResumeOutcome, ScriptCtx, StepOp, StepOutcome, StepProgress, SubjectIdentity,
@@ -34,11 +37,24 @@ use crate::adapter::step_engine::{
 };
 use crate::adapter::wake::lookup_source;
 use crate::adapter::wake::{
-    agent_event_matches, ActiveWait, MailboxEvent, TaskMailbox, TimerGuardRole, TimerWheel,
+    agent_event_matches, ActiveWait, MailboxEvent, MailboxPollAction, SubscriberId, TaskMailbox,
+    WaitSource,
 };
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicBool, Ordering};
 use tx_observe::{EventNameId, HartEmitter, SpanId};
+use tx_time::{DeadlineNs, DeadlineRegistrar, DeadlineRegistrarHandle, TimerRole, TimerTarget};
+
+struct WaitSourceSubscription {
+    source: Arc<WaitSource>,
+    id: SubscriberId,
+}
+
+impl Drop for WaitSourceSubscription {
+    fn drop(&mut self) {
+        self.source.unregister(self.id);
+    }
+}
 
 /// Central `StepOp` driver.
 ///
@@ -54,7 +70,7 @@ use tx_observe::{EventNameId, HartEmitter, SpanId};
 /// * `mode` — closed dispatch mode governing how yield shapes are resolved.
 /// * `mailbox` — optional [`TaskMailbox`] for reactor parking.
 /// * `delegate_registry` — optional [`DelegateRegistry`] for `OnAgent` resolution.
-/// * `timer_wheel` — optional [`TimerWheel`] for `OnTimer` resolution.
+/// * `timer_registrar` — optional [`DeadlineRegistrarHandle`] for `OnTimer` resolution.
 ///
 /// # Returns
 ///
@@ -65,7 +81,7 @@ pub async fn drive<S, I>(
     mode: DriveMode,
     mailbox: Option<&Arc<TaskMailbox>>,
     delegate_registry: Option<&DelegateRegistry>,
-    timer_wheel: Option<&TimerWheel>,
+    timer_registrar: Option<&DeadlineRegistrarHandle>,
 ) -> Result<S::Output, Errno>
 where
     S: StepOp<I>,
@@ -80,8 +96,12 @@ where
     // record links back deterministically without every arm having to
     // thread it through `ScriptCtx`.
     let parent_span = tx_observe::current_parent_span();
-    let drive_span =
-        emit_drive_begin::<S, I>(mode, timer_wheel.is_some(), ctx.task_id_low(), parent_span);
+    let drive_span = emit_drive_begin::<S, I>(
+        mode,
+        timer_registrar.is_some(),
+        ctx.task_id_low(),
+        parent_span,
+    );
     tx_observe::dump_registered_if_requested();
     // Install the L2 drive span as the new "current parent" so nested
     // L3/L4 records attach to it; restored at the end of drive() below.
@@ -146,7 +166,7 @@ where
                             &shape,
                             mailbox,
                             delegate_registry,
-                            timer_wheel,
+                            timer_registrar,
                             ctx.deadline(),
                             interrupt_state,
                         )
@@ -433,7 +453,7 @@ async fn resolve_yield<I: SubjectIdentity>(
     shape: &YieldShape,
     mailbox: Option<&Arc<TaskMailbox>>,
     delegate_registry: Option<&DelegateRegistry>,
-    timer_wheel: Option<&TimerWheel>,
+    timer_registrar: Option<&DeadlineRegistrarHandle>,
     deadline: Option<Deadline>,
     interrupt_state: InterruptView<'_, I>,
 ) -> (ResumeOutcome, u64) {
@@ -443,7 +463,7 @@ async fn resolve_yield<I: SubjectIdentity>(
                 *source,
                 *interests,
                 mailbox,
-                timer_wheel,
+                timer_registrar,
                 deadline,
                 interrupt_state,
             )
@@ -455,7 +475,7 @@ async fn resolve_yield<I: SubjectIdentity>(
                 *source,
                 *interests,
                 mailbox,
-                timer_wheel,
+                timer_registrar,
                 deadline,
                 interrupt_state,
             )
@@ -480,7 +500,7 @@ async fn resolve_yield<I: SubjectIdentity>(
                 *cancel,
                 mailbox,
                 delegate_registry,
-                timer_wheel,
+                timer_registrar,
                 interrupt_state,
             )
             .await;
@@ -488,10 +508,11 @@ async fn resolve_yield<I: SubjectIdentity>(
         }
 
         YieldShape::OnTimer { token, deadline } => {
-            // `OnTimer` parks on the timer wheel via a `TimerToken`; the
-            // wheel's token-id is the matching discriminant on the wire.
+            // `OnTimer` parks through the timer registrar; the
+            // issued token is the matching discriminant on the wire.
             let outcome =
-                resolve_on_timer(*token, *deadline, mailbox, timer_wheel, interrupt_state).await;
+                resolve_on_timer(*token, *deadline, mailbox, timer_registrar, interrupt_state)
+                    .await;
             (outcome, 0)
         }
     }
@@ -505,7 +526,7 @@ async fn resolve_on_wait_source<I: SubjectIdentity>(
     source: crate::adapter::step_engine::WaitSourceId,
     interests: crate::adapter::step_engine::InterestMask,
     mailbox: Option<&Arc<TaskMailbox>>,
-    timer_wheel: Option<&TimerWheel>,
+    timer_registrar: Option<&DeadlineRegistrarHandle>,
     deadline: Option<Deadline>,
     interrupt_state: InterruptView<'_, I>,
 ) -> (ResumeOutcome, u64) {
@@ -513,19 +534,39 @@ async fn resolve_on_wait_source<I: SubjectIdentity>(
         let gen = mbox.next_generation();
         let active = ActiveWait::new(gen, source, interests);
 
+        let raw_wait = install_registered_mailbox_wait(
+            source.raw(),
+            interests.raw(),
+            Arc::downgrade(mbox),
+            gen,
+        );
+        if matches!(raw_wait, Some(RegisteredMailboxWait::Ready)) {
+            return (ResumeOutcome::Retry, gen.raw());
+        }
+        let _raw_subscription: Option<RegisteredMailboxSubscription> = match raw_wait {
+            Some(RegisteredMailboxWait::Pending(subscription)) => Some(subscription),
+            Some(RegisteredMailboxWait::Ready) | None => None,
+        };
+
         // Register this task's mailbox with the object's WaitSource so
         // the object side can wake us when its state changes.  The
-        // registration is scoped to the park; we unregister on wake.
+        // registration is scoped to the park; the guard unregisters on wake
+        // and when this future is cancelled while parked.
         let ws = lookup_source(source);
-        let sub_id = ws
-            .as_ref()
-            .map(|ws| ws.register(Arc::downgrade(mbox), gen, interests));
-        let timeout_guard = match (timer_wheel, deadline) {
-            (Some(tw), Some(deadline)) if deadline != Deadline::NEVER => Some(tw.install_for_task(
-                deadline,
-                TimerGuardRole::PrimarySleep,
-                Arc::downgrade(mbox),
-            )),
+        let _subscription = ws.as_ref().map(|source| WaitSourceSubscription {
+            source: Arc::clone(source),
+            id: source.register(Arc::downgrade(mbox), gen, interests),
+        });
+        let timeout_guard = match (timer_registrar, deadline) {
+            (Some(registrar), Some(deadline)) if deadline != Deadline::NEVER => match registrar
+                .register_deadline(
+                    DeadlineNs::new(deadline.raw()),
+                    TimerRole::DeadlineAbort,
+                    TimerTarget::TaskMailbox(Arc::downgrade(mbox)),
+                ) {
+                Ok(guard) => Some(guard),
+                Err(_) => return (ResumeOutcome::Aborted(AbortReason::TimedOut), gen.raw()),
+            },
             _ => None,
         };
         let timeout_token = timeout_guard.as_ref().map(|guard| guard.token());
@@ -535,7 +576,7 @@ async fn resolve_on_wait_source<I: SubjectIdentity>(
             mbox,
             |event| {
                 if active.matches(event) {
-                    return true;
+                    return MailboxPollAction::Take;
                 }
                 if matches!(
                     (event, timeout_token),
@@ -543,18 +584,24 @@ async fn resolve_on_wait_source<I: SubjectIdentity>(
                         if *fired == expected
                 ) {
                     timed_out.store(true, Ordering::Release);
-                    return true;
+                    return MailboxPollAction::Take;
                 }
-                false
+                match event {
+                    MailboxEvent::SourceFired {
+                        source: fired_source,
+                        generation: fired_generation,
+                        ..
+                    } if *fired_source == active.source
+                        && *fired_generation != active.generation =>
+                    {
+                        MailboxPollAction::Drop
+                    }
+                    _ => MailboxPollAction::Keep,
+                }
             },
             interrupt_state,
         )
         .await;
-
-        // Clean up the WaitSource subscription now that we're awake.
-        if let (Some(ws), Some(id)) = (&ws, sub_id) {
-            ws.unregister(id);
-        }
 
         // D9-A: signal interrupt during blocked wait. The generation we
         // minted is still the right discriminant for the flow id — the
@@ -594,7 +641,7 @@ async fn resolve_on_agent(
     cancel: AgentCancelPolicy,
     mailbox: Option<&Arc<TaskMailbox>>,
     delegate_registry: Option<&DelegateRegistry>,
-    timer_wheel: Option<&TimerWheel>,
+    timer_registrar: Option<&DeadlineRegistrarHandle>,
     interrupt_state: InterruptView<'_, impl SubjectIdentity>,
 ) -> ResumeOutcome {
     let Some(registry) = delegate_registry else {
@@ -612,12 +659,6 @@ async fn resolve_on_agent(
     let drop_policy = TokenDropPolicy::CancelOnDrop;
     let mailbox_weak: Weak<TaskMailbox> = Arc::downgrade(mbox);
 
-    let deadline_opt = if deadline != Deadline::NEVER {
-        timer_wheel.map(|tw| (deadline, tw))
-    } else {
-        None
-    };
-
     // Install the delegate request. The registry mints a DelegateTokenId
     // and records the subscription.
     let _guard: AgentTokenGuard<'_> = registry.install_request(
@@ -626,15 +667,32 @@ async fn resolve_on_agent(
         cancel_policy,
         drop_policy,
         mailbox_weak,
-        deadline_opt,
     );
     // guard holds the token alive; drop cancels if not yet resolved.
 
     // Park on mailbox until the agent replies or the request is aborted.
     let token_id = _guard.id();
+    let _deadline_guard = match (timer_registrar, deadline) {
+        (Some(registrar), deadline) if deadline != Deadline::NEVER => match registrar
+            .register_deadline(
+                DeadlineNs::new(deadline.raw()),
+                TimerRole::DelegateTimeout,
+                TimerTarget::DelegateToken(token_id),
+            ) {
+            Ok(guard) => Some(guard),
+            Err(_) => return ResumeOutcome::Aborted(AbortReason::TimedOut),
+        },
+        _ => None,
+    };
     let wake = await_mailbox_event(
         mbox,
-        move |event| agent_event_matches(event, token_id),
+        move |event| {
+            if agent_event_matches(event, token_id) {
+                MailboxPollAction::Take
+            } else {
+                MailboxPollAction::Keep
+            }
+        },
         interrupt_state,
     )
     .await;
@@ -669,21 +727,18 @@ async fn resolve_on_timer(
     token: crate::adapter::step_engine::TimerId,
     deadline: Deadline,
     mailbox: Option<&Arc<TaskMailbox>>,
-    timer_wheel: Option<&TimerWheel>,
+    timer_registrar: Option<&DeadlineRegistrarHandle>,
     interrupt_state: InterruptView<'_, impl SubjectIdentity>,
 ) -> ResumeOutcome {
-    let Some(tw) = timer_wheel else {
+    let Some(registrar) = timer_registrar else {
         return ResumeOutcome::Retry;
     };
     let Some(mbox) = mailbox else {
         return ResumeOutcome::Retry;
     };
 
-    // PR-8B: Install the timer with a weak mailbox reference so
-    // the reactor's clock tick can post TimerFired on expiry.
-    // `install_for_task` allocates a fresh wheel-internal
-    // `TimerToken` (from the wheel's `next_token` counter) — that
-    // is the token the reactor's `fire_due` posts in
+    // Register through the time facade so the reactor domain owns queue
+    // selection and mailbox routing. The issued opaque token is the one in
     // `MailboxEvent::TimerFired`, so the predicate below must
     // compare against the GUARD'S token, NOT the caller-passed
     // `TimerId` (which is opaque-to-the-wheel and frequently a
@@ -694,7 +749,13 @@ async fn resolve_on_timer(
     // bodies appeared to spin via the unrelated `SignalDelivered`
     // wake path (which doesn't check the token) when the child
     // exited fast, but hung outright when the child was slower.
-    let _guard = tw.install_for_task(deadline, TimerGuardRole::PrimarySleep, Arc::downgrade(mbox));
+    let Ok(_guard) = registrar.register_deadline(
+        DeadlineNs::new(deadline.raw()),
+        TimerRole::PrimarySleep,
+        TimerTarget::TaskMailbox(Arc::downgrade(mbox)),
+    ) else {
+        return ResumeOutcome::Aborted(AbortReason::TimedOut);
+    };
     let timer_token = _guard.token();
 
     // Park on mailbox until the reactor's timer-tick fires the
@@ -702,8 +763,10 @@ async fn resolve_on_timer(
     let wake = await_mailbox_event(
         mbox,
         |event| match event {
-            MailboxEvent::TimerFired { token: fired } => *fired == timer_token,
-            _ => false,
+            MailboxEvent::TimerFired { token: fired } if *fired == timer_token => {
+                MailboxPollAction::Take
+            }
+            _ => MailboxPollAction::Keep,
         },
         interrupt_state,
     )
@@ -746,7 +809,7 @@ async fn await_mailbox_event<F, I>(
     interrupt_state: InterruptView<'_, I>,
 ) -> MailboxWake
 where
-    F: Fn(&MailboxEvent) -> bool,
+    F: Fn(&MailboxEvent) -> MailboxPollAction,
     I: SubjectIdentity,
 {
     use core::future::Future;
@@ -761,24 +824,28 @@ where
 
     impl<'a, F, I> Future for MailboxFuture<'a, F, I>
     where
-        F: Fn(&MailboxEvent) -> bool,
+        F: Fn(&MailboxEvent) -> MailboxPollAction,
         I: SubjectIdentity,
     {
         type Output = MailboxWake;
 
         fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<MailboxWake> {
             self.mailbox.register_waker(cx.waker().clone());
-            while let Some(event) = self.mailbox.poll() {
+            if let Some(event) = self.mailbox.poll_select(|event| {
+                if matches!(event, MailboxEvent::SignalDelivered { .. }) {
+                    MailboxPollAction::Take
+                } else {
+                    (self.predicate)(event)
+                }
+            }) {
                 if matches!(event, MailboxEvent::SignalDelivered { .. }) {
                     self.mailbox.clear_waker();
                     return Poll::Ready(MailboxWake::Signal(
                         self.interrupt_state.classify_signal_wake(),
                     ));
                 }
-                if (self.predicate)(&event) {
-                    self.mailbox.clear_waker();
-                    return Poll::Ready(MailboxWake::Matched);
-                }
+                self.mailbox.clear_waker();
+                return Poll::Ready(MailboxWake::Matched);
             }
             Poll::Pending
         }

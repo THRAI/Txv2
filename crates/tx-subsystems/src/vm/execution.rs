@@ -183,10 +183,10 @@ impl AddressSpace {
     pub async fn fault_script(&self, fault: VmFault) -> Result<PmapPublishOutcome, VmFaultError> {
         // The OnAgent dispatcher slot is empty for the simple
         // entrypoint — callers that want userfaultfd-aware fault
-        // resolution use [`Self::fault_script_for_process`] (PR-10
-        // phase 6 production entrypoint, walks the calling process's
-        // fd-table) or [`Self::fault_script_with_ufd_dispatch`] (test
-        // / non-process callers, supply their own `UfdDispatch`).
+        // resolution use [`Self::fault_script_for_process_with_post`]
+        // (PR-10 phase 6 production entrypoint, walks the calling
+        // process's fd-table) or [`Self::fault_script_with_ufd_dispatch`]
+        // (test / non-process callers, supply their own `UfdDispatch`).
         //
         // This entrypoint preserves the pre-PR-10 fault-only behaviour
         // for callers that never need OnAgent (e.g. kernel-internal
@@ -215,13 +215,17 @@ impl AddressSpace {
     /// through to the page-fault dispatch. The phase-6 e2e canary
     /// test exercises this entrypoint end-to-end without bootstrapping
     /// the trap shell.
-    pub async fn fault_script_for_process(
+    /// Production fault-script entrypoint with caller-provided owner-aware
+    /// userfaultfd readable publication.
+    pub async fn fault_script_for_process_with_post(
         &self,
         fault: VmFault,
         process: &step_engine::Cap<crate::process::ProcessIdentity>,
         mailbox: Weak<TaskMailbox>,
+        post: crate::userfaultfd::MailboxRefPostWithHintFn,
     ) -> Result<PmapPublishOutcome, VmFaultError> {
-        let dispatch = crate::userfaultfd::ProcessUfdDispatch::new(process, mailbox);
+        let dispatch =
+            crate::userfaultfd::ProcessUfdDispatch::new_with_post(process, mailbox, post);
         self.fault_script_with_ufd_dispatch(fault, dispatch).await
     }
 
@@ -233,7 +237,7 @@ impl AddressSpace {
     /// into the per-ufd [`DelegateRegistry`] reachable through
     /// `dispatch`, yields `OnAgent` semantically (the substrate
     /// `await_agent_reply` helper drives the same mailbox plumbing),
-    /// and resumes once the agent thread drives `mark_replied` via
+    /// and resumes once the agent thread drives `delegate reply transition` via
     /// `UFFDIO_COPY` / `UFFDIO_ZEROPAGE` (phase 5).
     ///
     /// **Phase 4 stub semantics.** Actual page-copy from
@@ -262,7 +266,8 @@ impl AddressSpace {
             let outcome = match self.try_fault_script_resolve(page_range, fault)? {
                 FaultScriptResolve::Done(outcome) => outcome,
                 FaultScriptResolve::Wait(token) => {
-                    await_range_lock(token).await;
+                    await_range_lock(self.range_lock.release_endpoint().clone(), token.interest())
+                        .await;
                     continue;
                 }
             };
@@ -298,7 +303,8 @@ impl AddressSpace {
                 }
                 FaultScriptPublish::Wait(token) => {
                     emit_vm_trace(b"debug.vm.fault.script.wait", 1);
-                    await_range_lock(token).await;
+                    await_range_lock(self.range_lock.release_endpoint().clone(), token.interest())
+                        .await;
                     continue;
                 }
             }
@@ -669,7 +675,8 @@ impl AddressSpace {
                     return Ok(VmMapOutcome { range, commit });
                 }
                 MapReserveResult::Blocked(token) => {
-                    await_range_lock(token).await;
+                    await_range_lock(self.range_lock.release_endpoint().clone(), token.interest())
+                        .await;
                     // continue loop to retry
                 }
                 MapReserveResult::Err(error) => return Err(error),
@@ -692,7 +699,8 @@ impl AddressSpace {
                     let Some(token) = crate::vm::notification::wait_token_from_shape(&shape) else {
                         unreachable_acquire_step();
                     };
-                    await_range_lock(token).await;
+                    await_range_lock(self.range_lock.release_endpoint().clone(), token.interest())
+                        .await;
                     continue;
                 }
                 _ => unreachable_acquire_step(),
@@ -721,7 +729,8 @@ impl AddressSpace {
                     let Some(token) = crate::vm::notification::wait_token_from_shape(&shape) else {
                         unreachable_acquire_step();
                     };
-                    await_range_lock(token).await;
+                    await_range_lock(self.range_lock.release_endpoint().clone(), token.interest())
+                        .await;
                     continue;
                 }
                 _ => unreachable_acquire_step(),
@@ -757,7 +766,11 @@ impl AddressSpace {
                             else {
                                 unreachable_acquire_step();
                             };
-                            await_range_lock(token).await;
+                            await_range_lock(
+                                self.range_lock.release_endpoint().clone(),
+                                token.interest(),
+                            )
+                            .await;
                             continue;
                         }
                         _ => unreachable_acquire_step(),
@@ -776,7 +789,11 @@ impl AddressSpace {
                             else {
                                 unreachable_acquire_step();
                             };
-                            await_range_lock(token).await;
+                            await_range_lock(
+                                self.range_lock.release_endpoint().clone(),
+                                token.interest(),
+                            )
+                            .await;
                             continue;
                         }
                         _ => unreachable_acquire_step(),
@@ -879,11 +896,11 @@ impl AddressSpace {
             match self.try_brk(brk_base, current_brk, requested_brk) {
                 Ok(new_brk) => return Ok(new_brk),
                 Err(VmMapError::WouldBlock) => {
-                    let token = WaitToken::new(
-                        self.range_lock.wait_source_id(),
+                    await_range_lock(
+                        self.range_lock.release_endpoint().clone(),
                         crate::vm::RANGE_LOCK_RELEASE_MASK,
-                    );
-                    await_range_lock(token).await;
+                    )
+                    .await;
                 }
                 Err(error) => return Err(error),
             }
@@ -1329,15 +1346,11 @@ impl MapReservation<'_> {
     }
 }
 
-/// Await a `RangeLock` release after the canonical `acquire_step` returned
-/// `StepOutcome::Yield { shape: YieldShape::OnWaitSource { .. } }` (carrying
-/// a `WaitToken`). Resolved through the global wait-source registry; if the
-/// token's channel has been retired the await is a no-op and the caller's
-/// retry loop runs immediately.
-async fn await_range_lock(token: WaitToken) {
-    if let Some(wait) = crate::wait_source::wait_on_token(token) {
-        let _ = wait.await;
-    }
+/// Await a `RangeLock` release after the canonical `acquire_step` returned a
+/// wait token. The async script owns a clone of the object endpoint, so it does
+/// not route through the registered source-id bridge.
+async fn await_range_lock(endpoint: impl tx_substrate::wake::WaitEndpoint, interest: u64) {
+    let _ = crate::wait_source::wait_on_endpoint(&endpoint, interest).await;
 }
 
 /// `RangeLock::acquire_step` only ever produces `V3StepOutcome::Done`
@@ -1378,7 +1391,7 @@ pub trait UfdDispatch {
     /// Resolution context returned by [`Self::resolve`]: the per-ufd
     /// [`DelegateRegistry`] the script installs a request against,
     /// plus a `Weak<TaskMailbox>` pointing at the faulting thread's
-    /// mailbox so the registry's `mark_replied` / `mark_canceled`
+    /// mailbox so the registry's `delegate reply transition` / `delegate cancel transition`
     /// fires the wake event.
     fn resolve(&self, ufd_id: u64) -> Option<UfdDispatchTarget<'_>>;
 }
@@ -1396,19 +1409,24 @@ pub struct UfdDispatchTarget<'a> {
     pub registry: &'a DelegateRegistry,
     /// Mailbox of the faulting task. Stored `Weak` so a dead task
     /// (script frame torn down before the agent replies) doesn't
-    /// pin its mailbox alive — `mark_replied`'s `Weak::upgrade`
+    /// pin its mailbox alive — `delegate reply transition`'s `Weak::upgrade`
     /// failure silently drops the wake event (correct per PR-7B).
     pub mailbox: Weak<TaskMailbox>,
     /// PR-10 phase 5: per-ufd pending-fault-message queue handle.
     /// Set when the dispatcher can also drive the agent-side
     /// `read(uffd_fd, &mut uffd_msg)` arm; `None` keeps the phase-4
     /// path behaving unchanged (no message is enqueued — the
-    /// `mark_replied` path still drives resume via the
+    /// `delegate reply transition` path still drives resume via the
     /// `await_agent_reply` helper, but the agent has no way to
     /// `read()` the fault). Production callers always set this; tests
     /// that want to exercise the OnAgent path *without* the queue
     /// (state-machine isolation) leave it `None`.
     pub fault_pusher: Option<&'a crate::userfaultfd::UserfaultFd>,
+    /// Caller-provided mailbox-ref post operation for the userfaultfd
+    /// readable wait source. Production reactor contexts provide an
+    /// owner-aware scheduler route; no-context tests pass an explicit direct
+    /// helper.
+    pub fault_post: crate::userfaultfd::MailboxRefPostWithHintFn,
 }
 
 /// Null dispatcher: `resolve` returns `None` for every id. Used by
@@ -1430,7 +1448,7 @@ impl UfdDispatch for NullUfdDispatch {
 /// request, await the reply via the `await_agent_reply` helper.
 ///
 /// Returns:
-/// - `Ok(Some(reply))` on a `mark_replied` Applied transition.
+/// - `Ok(Some(reply))` on a `delegate reply transition` Applied transition.
 /// - `Ok(None)` if the dispatcher could not resolve the ufd id
 ///   (graceful fall-through — the fault path materializes normally).
 /// - `Err(WouldBlock)` on agent-died / canceled / timed-out abort
@@ -1460,7 +1478,6 @@ async fn dispatch_ufd_fault<D: UfdDispatch>(
         AgentCancelPolicy::BestEffort,
         TokenDropPolicy::CancelOnDrop,
         target.mailbox.clone(),
-        None,
     );
     let token_id = guard.id();
     // PR-10 phase 5: push the fault message onto the per-ufd pending
@@ -1468,24 +1485,25 @@ async fn dispatch_ufd_fault<D: UfdDispatch>(
     // arm can dequeue and learn the faulting address. Order: push
     // **after** `install_request` returns so `token_id` is stable
     // and the agent's `UFFDIO_COPY` / `_ZEROPAGE` / `_CONTINUE`
-    // reply can resolve token_id → `mark_replied`. `fault_pusher`
+    // reply can resolve token_id → `delegate reply transition`. `fault_pusher`
     // is `None` for state-machine-isolation tests; production
     // dispatchers always supply it.
     if let Some(pusher) = target.fault_pusher {
-        pusher.push_fault_msg(crate::userfaultfd::UffdMsg {
+        let msg = crate::userfaultfd::UffdMsg {
             event: 0x12, // UFFD_EVENT_PAGEFAULT
             fault_addr: fault.addr.0 as u64,
             ufd_thread_id: 0,
             token_id,
-        });
+        };
+        pusher.push_fault_msg_with_post(msg, target.fault_post);
     }
     // Yield OnAgent semantically by parking on the mailbox via the
     // await_agent_reply helper. The helper consumes
     // `AgentReplied`/`Abort` events matching `token_id` and re-posts
     // anything else so the rightful consumer can drain it.
     //
-    // The agent-side mark_replied happens via UFFDIO_COPY / ZEROPAGE
-    // (phase 5). For phase 4 the test drives mark_replied directly
+    // The agent-side delegate reply transition happens via UFFDIO_COPY / ZEROPAGE
+    // (phase 5). For phase 4 the test drives delegate reply transition directly
     // to exercise the plumbing.
     let outcome = crate::vm::adapter::wait_routing::await_agent_reply(
         token_id,
@@ -1524,13 +1542,13 @@ async fn dispatch_ufd_fault<D: UfdDispatch>(
 /// `src_kernel_addr` must be non-null and `len` must be a positive
 /// page-multiple. The agent supplies these via `UFFDIO_COPY`; the
 /// shim layer (`step_uffdio_copy`) is supposed to validate before
-/// `mark_replied`, but we re-check here under the materialize lane to
+/// `delegate reply transition`, but we re-check here under the materialize lane to
 /// keep the substrate's invariants tight (A-15 fresh-epoch re-validation).
 ///
 /// **Safety.** `src_kernel_addr` is a kernel pointer to a buffer the
 /// agent populated via `read(uffd_fd)` → `UFFDIO_COPY`. The substrate
 /// trusts the shim to validate that `src` is kernel-addressable
-/// before `mark_replied`. The destination is the freshly-allocated
+/// before `delegate reply transition`. The destination is the freshly-allocated
 /// frame's kernel direct-map VA; the page is held alive by the
 /// returned [`VmFaultMaterialization`]'s `map_pin` for the duration
 /// of the copy and the subsequent publish.
@@ -1569,7 +1587,7 @@ fn materialize_ufd_copy(
     // SAFETY:
     // - `src_kernel_addr` is a kernel pointer supplied by the agent's
     //   `UFFDIO_COPY` payload. The shim layer validates this is in
-    //   kernel-readable memory before `mark_replied`; A-15 says the
+    //   kernel-readable memory before `delegate reply transition`; A-15 says the
     //   substrate trusts that gating.
     // - `dst_kernel_ptr` points at the freshly-allocated frame's
     //   direct-map VA. The page is held alive by

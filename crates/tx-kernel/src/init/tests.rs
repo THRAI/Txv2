@@ -21,7 +21,7 @@ use std::sync::Mutex;
 use tx_hal::{
     AllocError, Arch, Asid, BootHandoff, BootInfo, BootPlatformIf, BootProtocol, ConsoleIf, CpuId,
     CpuMask, InitIf, ObserverIf, PhysAddr, PlatformConfig, PlatformInfo, PmapError,
-    PmapPermissions, PmapReservation, PmapReserveKind, PmapRoot, PtNode,
+    PmapPermissions, PmapReservation, PmapReserveKind, PmapRoot, PtNode, VirtAddr,
 };
 
 /// Page size used to fabricate distinct test pmap roots. tx-hal
@@ -30,9 +30,11 @@ use tx_hal::{
 /// surface.
 const TEST_PAGE_SIZE: usize = 4096;
 
-use crate::init::{console_tty, dev_mount, dev_shm_mount, root_mount, CoreInit};
+use crate::init::{
+    CoreInit, console_tty, dev_mount, dev_shm_mount, publish_boot_mountpoint_dentry, root_mount,
+};
 
-use crate::adapter::step_engine::{self as step_engine, guard, page_allocator, StepOutcome};
+use crate::adapter::step_engine::{self as step_engine, StepOutcome, guard, page_allocator};
 /// Serialise every test in this module against the rest of tx-kernel's
 /// test set: they all touch the global `INIT_PROCESS` / mount / TTY
 /// slots plus the per-CPU epoch domain (which forbids guard nesting
@@ -49,6 +51,7 @@ struct TestPlatform;
 impl PlatformConfig for TestPlatform {
     const ARCH: Arch = Arch::Riscv64;
     const BOARD: &'static str = "tx-kernel-init-test";
+    const USER_TOP: VirtAddr = VirtAddr(tx_subsystems::vm::FULL_USER_V1_TOP);
 }
 
 impl BootPlatformIf for TestPlatform {
@@ -126,6 +129,57 @@ static USERSPACE_PREEMPT_ON_ENTER: AtomicUsize = AtomicUsize::new(0);
 static TEST_CURRENT_CPU: AtomicUsize = AtomicUsize::new(0);
 static TEST_ONLINE_CPUS: AtomicUsize = AtomicUsize::new(1);
 
+const NEWC_HEADER_LEN: usize = 110;
+
+fn build_test_cpio(entries: &[(&[u8], u32, &[u8])]) -> std::vec::Vec<u8> {
+    let mut buf = std::vec::Vec::new();
+    let mut next_ino: u32 = 1;
+    for (name, mode, data) in entries {
+        emit_cpio_entry(&mut buf, name, *mode, data, next_ino);
+        next_ino = next_ino.wrapping_add(1);
+    }
+    emit_cpio_entry(&mut buf, b"TRAILER!!!", 0, &[], 0);
+    buf
+}
+
+fn emit_cpio_entry(buf: &mut std::vec::Vec<u8>, name: &[u8], mode: u32, data: &[u8], ino: u32) {
+    let header_start = buf.len();
+    buf.extend_from_slice(b"070701");
+    buf.extend_from_slice(&hex8(ino));
+    buf.extend_from_slice(&hex8(mode));
+    buf.extend_from_slice(&hex8(0));
+    buf.extend_from_slice(&hex8(0));
+    buf.extend_from_slice(&hex8(1));
+    buf.extend_from_slice(&hex8(0));
+    buf.extend_from_slice(&hex8(data.len() as u32));
+    buf.extend_from_slice(&hex8(0));
+    buf.extend_from_slice(&hex8(0));
+    buf.extend_from_slice(&hex8(0));
+    buf.extend_from_slice(&hex8(0));
+    buf.extend_from_slice(&hex8((name.len() + 1) as u32));
+    buf.extend_from_slice(&hex8(0));
+    debug_assert_eq!(buf.len() - header_start, NEWC_HEADER_LEN);
+    buf.extend_from_slice(name);
+    buf.push(0);
+    while (buf.len() & 3) != 0 {
+        buf.push(0);
+    }
+    buf.extend_from_slice(data);
+    while (buf.len() & 3) != 0 {
+        buf.push(0);
+    }
+}
+
+fn hex8(value: u32) -> [u8; 8] {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = [0u8; 8];
+    for (idx, slot) in out.iter_mut().enumerate() {
+        let shift = (7 - idx) * 4;
+        *slot = HEX[((value >> shift) & 0xf) as usize];
+    }
+    out
+}
+
 impl tx_hal::TrapIf for TestPlatform {
     /// Inverted-loop simulator: stand in for a real `sret` into
     /// userspace.
@@ -180,18 +234,31 @@ impl tx_hal::TrapIf for TestPlatform {
     }
 }
 impl tx_hal::SignalFrameIf for TestPlatform {}
-impl tx_hal::IrqIf for TestPlatform {}
+unsafe fn restore_test_local_execution(_saved_state: usize) {}
 
-impl tx_hal::TimeIf for TestPlatform {
+impl tx_hal::IrqIf for TestPlatform {
+    fn exclude_local_execution() -> tx_hal::LocalExecutionGuard {
+        unsafe { tx_hal::LocalExecutionGuard::new(0, restore_test_local_execution) }
+    }
+}
+
+impl tx_hal::MonotonicCounterIf for TestPlatform {
     fn read_ns() -> u64 {
         0
     }
-    fn set_deadline_ns(_deadline: u64) {}
-    fn cancel_deadline() {}
+
     fn frequency_hz() -> u64 {
         1_000_000_000
     }
 }
+
+impl tx_hal::DeadlineTimerIf for TestPlatform {
+    fn set_deadline_ns(_deadline: u64) {}
+
+    fn cancel_deadline() {}
+}
+
+impl tx_hal::PersistentClockIf for TestPlatform {}
 
 impl tx_hal::PercpuIf for TestPlatform {}
 impl tx_hal::CacheIf for TestPlatform {}
@@ -279,6 +346,7 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
     crate::init::reset_boot_state_for_test();
     crate::irq::reset_dispatch_table_for_test();
     tx_subsystems::device::reset_block_registry_for_test();
+    tx_subsystems::device::reset_page_container_file_io_service_registry_for_test();
     CONSOLE_CAPTURED_LEN.store(0, Ordering::Release);
     CONSOLE_CAPTURED_BYTES
         .lock()
@@ -316,6 +384,7 @@ fn drive_boot_wiring() {
     // The dispatch table still gets published, exercising the
     // platform-publication path in the boot-wiring smoke.
     CoreInit::<TestPlatform>::install_irq_handlers();
+    CoreInit::<TestPlatform>::init_rtc_device();
     CoreInit::<TestPlatform>::init_block_devices();
     CoreInit::<TestPlatform>::mount_rootfs_from_boot_media();
     CoreInit::<TestPlatform>::mount_devfs_at_dev();
@@ -327,8 +396,106 @@ fn drive_boot_wiring() {
 
 // --- tests --------------------------------------------------------
 
+struct FileIoRuntimeTestBlockDevice;
+
+impl tx_subsystems::device::BlockDeviceOps for FileIoRuntimeTestBlockDevice {
+    fn read_blocks(
+        &self,
+        _block_id: tx_subsystems::device::PhysicalBlockNumber,
+        target: &mut [tx_subsystems::page_backed::Frame],
+        _guard: &tx_subsystems::execution::Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        for frame in target {
+            *frame = tx_subsystems::page_backed::Frame::new(tx_hal::Ppn(0));
+        }
+        StepOutcome::done(())
+    }
+
+    fn write_blocks(
+        &self,
+        _block_id: tx_subsystems::device::PhysicalBlockNumber,
+        _source: &[tx_subsystems::page_backed::Frame],
+        _guard: &tx_subsystems::execution::Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        StepOutcome::done(())
+    }
+
+    fn barrier(
+        &self,
+        _guard: &tx_subsystems::execution::Guard<'_>,
+    ) -> StepOutcome<(), step_engine::NoProgress> {
+        StepOutcome::done(())
+    }
+}
+
+impl tx_subsystems::device::BlockDevice for FileIoRuntimeTestBlockDevice {
+    fn total_blocks(&self) -> u64 {
+        16
+    }
+
+    fn block_size(&self) -> u32 {
+        tx_subsystems::vm::USER_PAGE_SIZE as u32
+    }
+}
+
+static FILE_IO_RUNTIME_TEST_BLOCK_DEVICE: FileIoRuntimeTestBlockDevice =
+    FileIoRuntimeTestBlockDevice;
+static FILE_IO_RUNTIME_TEST_BLOCK_REG: tx_subsystems::device::BlockDeviceRegistration =
+    tx_subsystems::device::BlockDeviceRegistration {
+        devt: tx_subsystems::device::DevT::new(8, 240),
+        name: "file-io-runtime-test",
+        ops: &FILE_IO_RUNTIME_TEST_BLOCK_DEVICE,
+    };
+
 #[test]
-fn initial_userspace_sched_meta_stays_on_cpu0_when_boot_hart_is_nonzero() {
+fn boot_init_submits_registered_file_io_service_runtimes() {
+    let _serial = setup();
+    let pc = tx_subsystems::page_backed::PageContainer::new_cap(
+        tx_subsystems::page_backed::PageContainerKind::Anon {
+            swap_policy: tx_subsystems::page_backed::AnonSwapPolicy::Reclaimable,
+        },
+        1,
+    )
+    .expect("file io runtime test page container");
+    tx_subsystems::device::register_page_container_file_io_service(
+        pc,
+        tx_subsystems::device::BlockDeviceHandle::whole(&FILE_IO_RUNTIME_TEST_BLOCK_REG),
+    );
+
+    assert_eq!(
+        CoreInit::<TestPlatform>::submit_file_io_runtime_tasks_for_test(),
+        1
+    );
+}
+
+#[test]
+fn file_io_runtime_task_submission_owns_one_runtime() {
+    let _serial = setup();
+    let pc = tx_subsystems::page_backed::PageContainer::new_cap(
+        tx_subsystems::page_backed::PageContainerKind::Anon {
+            swap_policy: tx_subsystems::page_backed::AnonSwapPolicy::Reclaimable,
+        },
+        1,
+    )
+    .expect("file io runtime test page container");
+    let runtime = tx_subsystems::device::register_page_container_file_io_service(
+        pc,
+        tx_subsystems::device::BlockDeviceHandle::whole(&FILE_IO_RUNTIME_TEST_BLOCK_REG),
+    );
+    let mut submitted = 0;
+
+    assert!(CoreInit::<TestPlatform>::submit_file_io_runtime_task_with(
+        runtime,
+        |_runtime, _config, _meta| {
+            submitted += 1;
+            true
+        },
+    ));
+    assert_eq!(submitted, 1);
+}
+
+#[test]
+fn initial_userspace_sched_meta_stays_on_current_hart_when_boot_hart_is_nonzero() {
     let _serial = setup();
     TEST_CURRENT_CPU.store(3, Ordering::Release);
     TEST_ONLINE_CPUS.store(0b1111, Ordering::Release);
@@ -337,11 +504,21 @@ fn initial_userspace_sched_meta_stays_on_cpu0_when_boot_hart_is_nonzero() {
 
     assert_eq!(
         meta.affinity,
-        CpuMask::single(CpuId(0)).bits(),
-        "initial userspace remains on the BSP-safe CPU0 path; child threads own AP spread",
+        CpuMask::single(CpuId(3)).bits(),
+        "initial userspace stays on the submit hart until userspace handoff is migration-safe",
     );
     assert!(meta.userspace_thread);
     assert!(!meta.spread_on_submit);
+}
+
+#[test]
+fn demo_boot_banner_is_ascii_and_names_txkernel() {
+    let banner = crate::init::TX_KERNEL_DEMO_BANNER;
+
+    assert!(banner.is_ascii());
+    assert!(banner.contains("TxKernel demo boot"));
+    assert!(banner.starts_with('\n'));
+    assert!(banner.ends_with('\n'));
 }
 
 /// **Downgrade note (per trio plan §"Phase 3b tests"):** end-to-end
@@ -415,7 +592,7 @@ fn boot_smoke_mounts_root_and_dev_and_resolves_console() {
 /// RNode is a `StructBacked { Tty(...) }` for the boot console.
 #[test]
 fn boot_smoke_walker_resolves_dev_console_after_mount_registration() {
-    use tx_subsystems::vfs::{walker, Credential, RNodeBacking, StructPayload};
+    use tx_subsystems::vfs::{Credential, RNodeBacking, StructPayload, walker};
 
     let _serial = setup();
     drive_boot_wiring();
@@ -452,6 +629,91 @@ fn boot_smoke_walker_resolves_dev_console_after_mount_registration() {
     }
 }
 
+#[test]
+fn boot_mountpoints_cross_by_namespace_dentry_identity_without_global_fallback() {
+    use tx_subsystems::vfs::{Credential, walker};
+
+    let _serial = setup();
+    drive_boot_wiring();
+    CoreInit::<TestPlatform>::mount_procfs_at_proc();
+    CoreInit::<TestPlatform>::mount_sysfs_at_sys();
+
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS must be populated post-bootstrap");
+    let namespace = init
+        .mount_namespace_cap()
+        .expect("init mount namespace must be populated");
+    let root = namespace.root_dentry();
+    let cred = Credential::root();
+    let guard = guard();
+    use step_engine::StepOutcome as V3;
+
+    let cases = [
+        (b"/dev".as_slice(), tx_fs::devfs::DEVFS_ROOT_OBJECT_ID),
+        (b"/proc".as_slice(), tx_fs::procfs::PROCFS_ROOT_ID),
+        (b"/sys".as_slice(), tx_fs::sysfs::SYSFS_ROOT_ID),
+        (b"/dev/shm".as_slice(), tx_fs::tmpfs::TMPFS_ROOT_OBJECT_ID),
+        (b"/dev/block".as_slice(), tx_fs::bdevfs::BDEVFS_ROOT_ID),
+    ];
+    for (path, expected_root) in cases {
+        let outcome =
+            walker::step_walk_in_mount_namespace(root.clone(), path, &cred, &namespace, &guard);
+        match outcome {
+            V3::Done(dentry) => assert_eq!(
+                dentry.rnode().fs_object_id(),
+                expected_root,
+                "namespace-only boot mount crossing failed for {:?}",
+                core::str::from_utf8(path).unwrap_or("<non-utf8>")
+            ),
+            other => panic!("namespace-only boot walk failed for {path:?}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn boot_mountpoint_publication_returns_pre_cached_canonical_dentry() {
+    use tx_subsystems::vfs::{DEntry, InlineName, InodeKind, InodeMeta, RNode, RNodeBacking};
+
+    let _serial = setup();
+    let parent_rnode = RNode::new_cap(
+        tx_subsystems::vfs::FsObjectId::new(91_000),
+        InodeMeta::new(InodeKind::Directory, 0o040755),
+        RNodeBacking::Directory,
+    )
+    .expect("parent rnode");
+    let parent = DEntry::new_cap(InlineName::ROOT, parent_rnode).expect("parent dentry");
+    let canonical_rnode = RNode::new_cap(
+        tx_subsystems::vfs::FsObjectId::new(91_001),
+        InodeMeta::new(InodeKind::Directory, 0o040755),
+        RNodeBacking::Directory,
+    )
+    .expect("canonical mountpoint rnode");
+    let mut canonical_raw = DEntry::new(
+        InlineName::new(b"dev").expect("mountpoint name"),
+        canonical_rnode,
+    );
+    canonical_raw.set_parent_hint(&parent);
+    let canonical = step_engine::sign(canonical_raw).expect("canonical mountpoint dentry");
+    assert_eq!(parent.cache_child(canonical.clone()).key(), canonical.key());
+
+    let loser_rnode = RNode::new_cap(
+        tx_subsystems::vfs::FsObjectId::new(91_002),
+        InodeMeta::new(InodeKind::Directory, 0o040755),
+        RNodeBacking::Directory,
+    )
+    .expect("loser mountpoint rnode");
+    let published = publish_boot_mountpoint_dentry(&parent, b"dev", loser_rnode);
+
+    assert_eq!(published.key(), canonical.key());
+    assert_eq!(
+        parent
+            .cached_child(InlineName::new(b"dev").expect("mountpoint name"))
+            .expect("cached mountpoint")
+            .key(),
+        canonical.key()
+    );
+}
+
 /// Post-`mount_bdevfs_at_dev_block`, the VFS walker must resolve
 /// `/dev/block` to the bdev-fs root directory (not the synthetic
 /// devfs stub). On the TestPlatform host, no virtio block device
@@ -461,7 +723,7 @@ fn boot_smoke_walker_resolves_dev_console_after_mount_registration() {
 /// (`docs/design/05_filesystem/BDEV_FS.md` §7.1).
 #[test]
 fn boot_smoke_walker_resolves_dev_block_after_bdevfs_mount() {
-    use tx_subsystems::vfs::{walker, Credential, RNodeBacking};
+    use tx_subsystems::vfs::{Credential, RNodeBacking, walker};
 
     let _serial = setup();
     drive_boot_wiring();
@@ -495,12 +757,91 @@ fn boot_smoke_walker_resolves_dev_block_after_bdevfs_mount() {
     );
 }
 
+#[test]
+fn boot_smoke_initramfs_busybox_is_openable_from_init_root() {
+    use tx_subsystems::vfs::{Credential, OpenFileFlags, RNodeBacking, walker};
+
+    let _serial = setup();
+    drive_boot_wiring();
+
+    let root = root_mount().expect("ROOT_MOUNT must be populated");
+    let archive = build_test_cpio(&[
+        (b"./bin", 0o040755, b""),
+        (b"./bin/sh", 0o120777, b"/bin/busybox"),
+        (b"./bin/busybox", 0o100755, b"busybox-bytes"),
+    ]);
+    let stats = tx_subsystems::initramfs::unpack_into_root_mount(&archive, &root).expect("unpack");
+    assert_eq!(stats.files, 1);
+    assert_eq!(stats.dirs, 1);
+    assert_eq!(stats.symlinks, 1);
+
+    let init = tx_subsystems::process::execution::init_process()
+        .expect("INIT_PROCESS must be populated post-bootstrap");
+    let cwd = init.cwd().expect("init cwd must be bound");
+    let cred = Credential::root();
+    let walk_guard = guard();
+    use step_engine::StepOutcome as V3;
+    let outcome = walker::step_open(
+        cwd.clone(),
+        b"/bin/busybox",
+        OpenFileFlags {
+            read: true,
+            write: false,
+            append: false,
+            cloexec: false,
+            nonblocking: false,
+            packet: false,
+        },
+        0,
+        &cred,
+        &walk_guard,
+    );
+    drop(walk_guard);
+
+    let open = match outcome {
+        V3::Done(file) => file,
+        other => panic!("step_open(/bin/busybox) after initramfs unpack must succeed: {other:?}"),
+    };
+    assert_eq!(open.rnode().meta().size, b"busybox-bytes".len() as u64);
+    assert!(
+        matches!(open.rnode().backing(), RNodeBacking::PageBacked { .. }),
+        "/bin/busybox must materialise as a regular PageBacked file"
+    );
+
+    let symlink_guard = guard();
+    let sh_outcome = walker::step_open(
+        cwd,
+        b"/bin/sh",
+        OpenFileFlags {
+            read: true,
+            write: false,
+            append: false,
+            cloexec: false,
+            nonblocking: false,
+            packet: false,
+        },
+        0,
+        &cred,
+        &symlink_guard,
+    );
+    drop(symlink_guard);
+    let sh_open = match sh_outcome {
+        V3::Done(file) => file,
+        other => panic!("step_open(/bin/sh) must chase sibling symlink to busybox: {other:?}"),
+    };
+    assert_eq!(
+        sh_open.rnode().meta().size,
+        b"busybox-bytes".len() as u64,
+        "/bin/sh symlink must resolve to the busybox regular file"
+    );
+}
+
 /// POSIX shm (`shm_open`) and named semaphores (`sem_open`) are libc
 /// path operations over `/dev/shm`; the kernel side must therefore
 /// publish a tmpfs mount over devfs's synthetic `/dev/shm` directory.
 #[test]
 fn boot_smoke_walker_resolves_dev_shm_to_tmpfs_mount() {
-    use tx_subsystems::vfs::{walker, Credential, RNodeBacking};
+    use tx_subsystems::vfs::{Credential, RNodeBacking, walker};
 
     let _serial = setup();
     drive_boot_wiring();
@@ -541,7 +882,7 @@ fn boot_smoke_walker_resolves_dev_shm_to_tmpfs_mount() {
 
 #[test]
 fn boot_smoke_dev_shm_accepts_posix_shm_and_named_sem_files() {
-    use tx_subsystems::vfs::{walker, Credential, RNodeBacking};
+    use tx_subsystems::vfs::{Credential, RNodeBacking, walker};
 
     let _serial = setup();
     drive_boot_wiring();
@@ -611,8 +952,8 @@ fn boot_smoke_dev_shm_accepts_posix_shm_and_named_sem_files() {
 #[test]
 fn boot_wiring_mounts_writable_tmpfs_at_dev_shm_for_musl_shm_open() {
     use tx_shims::linux_syscall::{
-        dispatch, SyscallCtx, SyscallResult, AT_FDCWD, NR_OPENAT, O_CLOEXEC, O_CREAT, O_NONBLOCK,
-        O_RDWR,
+        AT_FDCWD, NR_OPENAT, O_CLOEXEC, O_CREAT, O_EXCL, O_NOFOLLOW, O_NONBLOCK, O_RDWR,
+        SyscallCtx, SyscallResult, dispatch,
     };
 
     let _serial = setup();
@@ -642,8 +983,7 @@ fn boot_wiring_mounts_writable_tmpfs_at_dev_shm_for_musl_shm_open() {
 
     let path = b"/dev/shm/testshm\0";
     const O_LARGEFILE: u32 = 0o100000;
-    const O_NOFOLLOW: u32 = 0o400000;
-    let flags = O_RDWR | O_CREAT | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW | O_LARGEFILE;
+    let flags = O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW | O_LARGEFILE;
     let req = crate::adapter::boot_runtime::userspace::SyscallRequest::new(
         NR_OPENAT,
         [
@@ -680,6 +1020,13 @@ fn boot_smoke_init_fds_preopened_to_console() {
         assert!(file.flags().read);
         assert!(file.flags().write);
     }
+    assert!(
+        init.pgrp_cap()
+            .session_cap()
+            .controlling_tty_cap()
+            .is_some(),
+        "init's preopened console fds should install a controlling tty"
+    );
 
     // Drive a write through fd 1 — the bytes must reach the
     // platform console (`TestPlatform::write_bytes` increments
@@ -717,6 +1064,10 @@ fn boot_smoke_init_fds_preopened_to_console() {
         cwd_bytes, b"/",
         "init's rendered cwd path is the namespace root"
     );
+    let cwd_binding = init.cwd_binding().expect("init cwd mount binding");
+    let root_mount = root_mount().expect("boot root mount");
+    assert_eq!(cwd_binding.dentry.key(), root_mount.root_dentry().key());
+    assert_eq!(cwd_binding.mount.key(), root_mount.key());
 }
 
 // ---------------------------------------------------------------------------
@@ -735,7 +1086,7 @@ fn boot_smoke_init_fds_preopened_to_console() {
 //     adapter that brackets every poll.
 //   - `tx_shims::linux_syscall::dispatch` — the real syscall
 //     dispatcher (write → `step_write` → tty / devfs walker →
-//     console; exit_group → `step_exit_group` → process zombie).
+//     console; exit_group -> group-exit transition -> process zombie).
 //   - `tx_subsystems::thread_runtime::execution::prepare_userspace_entry_payload`
 //     — Plan B writeback discipline
 //     (`txdoc:THREAD-5-4-THE-TWO-SITE-DISCIPLINE`); the merged
@@ -1136,12 +1487,11 @@ fn block_on<F: core::future::Future>(mut fut: F) -> F::Output {
 }
 
 /// **End-to-end bootstrap-exec smoke (production-paths-up-to-divergence
-/// per the brief's degrade option).** Drives the boot wiring, then
-/// `run_bootstrap_exec_for_init` (which registers the hand-encoded
-/// RV64 ELF fixture into tmpfs and drives `exec_script` via
-/// `block_on`). Asserts the bootstrap front-end seeds the thread's
-/// `saved_user_context` with the fixture's entry-point and atomically
-/// replaces the AddressSpace.
+/// per the brief's degrade option).** Drives the boot wiring, explicitly
+/// registers the hand-encoded RV64 ELF test fixture into tmpfs, then
+/// drives `exec_script` via `block_on`. Asserts the bootstrap front-end
+/// seeds the thread's `saved_user_context` with the fixture's
+/// entry-point and atomically replaces the AddressSpace.
 ///
 /// The full reactor-loop drive (write → exit_group → zombie) is
 /// covered by `boot_smoke_production_userspace_loop_writes_console_then_exits`
@@ -1150,6 +1500,15 @@ fn block_on<F: core::future::Future>(mut fut: F) -> F::Output {
 ///
 /// Cites: `txdoc:EXEC-19-BOOTSTRAP`,
 /// `txdoc:EXEC-11-PHASE-6-ADDRESS-SPACE-VISIBILITY-BOUNDARY`.
+#[test]
+#[should_panic(expected = "bootstrap exec for selected init failed")]
+fn boot_smoke_bootstrap_exec_requires_init_from_rootfs() {
+    let _serial = setup();
+    drive_boot_wiring();
+
+    CoreInit::<TestPlatform>::run_bootstrap_exec_for_init();
+}
+
 #[test]
 fn boot_smoke_bootstrap_exec_seeds_init_user_context_from_fixture() {
     use crate::init::init_fixture::{INIT_FIXTURE_ENTRY_VADDR, INIT_FIXTURE_FILE_SIZE};
@@ -1176,11 +1535,11 @@ fn boot_smoke_bootstrap_exec_seeds_init_user_context_from_fixture() {
         "saved_user_context starts None pre-exec"
     );
 
-    // Drive the bootstrap exec: registers
-    // /init = INIT_FIXTURE_BYTES into tmpfs, then drives
-    // exec_script via block_on. Failure panics with
-    // `:bootstrap-exec:fail` per Open Q #3 DECIDED.
-    CoreInit::<TestPlatform>::run_bootstrap_exec_for_init();
+    // Drive the bootstrap exec against an explicitly registered
+    // test fixture. Production boot expects `/init` or the selected
+    // init path to come from boot media.
+    CoreInit::<TestPlatform>::register_init_fixture_into_tmpfs();
+    CoreInit::<TestPlatform>::drive_bootstrap_exec();
 
     // EXEC-PONR boundary crossed: the AddressSpace has been atomically
     // replaced (different Cap key) and saved_user_context is now
@@ -1199,24 +1558,16 @@ fn boot_smoke_bootstrap_exec_seeds_init_user_context_from_fixture() {
         saved.pc as u64, INIT_FIXTURE_ENTRY_VADDR,
         "saved pc matches fixture's hand-encoded e_entry"
     );
-    // sp lives at regs[2] per RV64 SysV ABI; should be the
-    // 16-byte-aligned initial_sp from build_initial_user_stack.
-    // `exec_script` applies stack-top ASLR (commit 500bf17:
-    // "VDSO + dynamic linking + AUXV completeness + security
-    // hardening"): the effective stack top is
-    // `USER_STACK_TOP_DEFAULT + r` where `r` is a page-aligned
-    // random offset in `[0, 0x80_0000)`. Initial sp lands inside
-    // `[effective_top - USER_STACK_INITIAL_RESERVATION, effective_top]`.
-    use tx_subsystems::vm::scripts::{USER_STACK_INITIAL_RESERVATION, USER_STACK_TOP_DEFAULT};
-    const MAX_STACK_TOP_ASLR_OFFSET: u64 = 0x80_0000;
+    // sp lives at regs[2] per RV64 SysV ABI. The combined layout selects the
+    // stack below the vDSO window from the platform USER_TOP, so assert the
+    // saved pointer is backed by the replacement AddressSpace rather than
+    // duplicating the layout selector's ASLR arithmetic here.
     let sp = saved.regs[2] as u64;
-    let max_top = USER_STACK_TOP_DEFAULT + MAX_STACK_TOP_ASLR_OFFSET;
-    let min_sp = USER_STACK_TOP_DEFAULT - USER_STACK_INITIAL_RESERVATION;
     assert!(
-        sp <= max_top && sp > min_sp,
-        "saved sp {sp:#x} lands inside the ASLR-widened stack \
-         reservation window (USER_STACK_TOP_DEFAULT={USER_STACK_TOP_DEFAULT:#x}, \
-         max_top={max_top:#x}, min_sp={min_sp:#x})"
+        aspace_after
+            .lookup(tx_subsystems::vm::UserVirtAddr::new(sp as usize))
+            .is_some(),
+        "saved sp {sp:#x} must land in the replacement AddressSpace"
     );
     assert_eq!(sp & 0xF, 0, "saved sp is 16-byte aligned per SysV ABI");
 
@@ -1393,10 +1744,11 @@ fn boot_smoke_fork_wait_seeds_init_for_clone_at_entry() {
         "saved_user_context starts None pre-exec"
     );
 
-    // Drive the bootstrap exec: registers /init = INIT_FIXTURE_BYTES
-    // into tmpfs, then drives exec_script via block_on. Failure
-    // panics with `:bootstrap-exec:fail` per Open Q #3 DECIDED.
-    CoreInit::<TestPlatform>::run_bootstrap_exec_for_init();
+    // Drive the bootstrap exec against an explicitly registered
+    // test fixture. Production boot expects `/init` or the selected
+    // init path to come from boot media.
+    CoreInit::<TestPlatform>::register_init_fixture_into_tmpfs();
+    CoreInit::<TestPlatform>::drive_bootstrap_exec();
 
     // EXEC-PONR boundary crossed: aspace atomically replaced.
     let aspace_after = init.aspace_cap().expect("init aspace populated post-exec");
@@ -1457,8 +1809,8 @@ fn boot_smoke_fork_wait_seeds_init_for_clone_at_entry() {
 //
 //   - Production `exec_script::<P>` resolves the path through the
 //     real walker (against a real tmpfs mount populated via the
-//     real `create_inode` / `materialise_rnode` / `step_chmod` /
-//     `step_chown` surfaces).
+//     real `create_inode` / `materialise_rnode` / `chmod_inode` /
+//     `chown_inode` surfaces).
 //   - Phase 1 execute-perm check passes (the file's mode bits and
 //     the caller's effective uid/gid line up).
 //   - Phase 3.5 cred recompute fires: the binary's `S_ISUID` bit
@@ -1487,8 +1839,8 @@ fn boot_smoke_fork_wait_seeds_init_for_clone_at_entry() {
 ///      caps (per `bootstrap_init_process`).
 ///   2. `register_setuid_fixture_into_tmpfs(uid=1000, gid=1000)` —
 ///      creates `/setuid-target` in the rootfs tmpfs, copies the
-///      sibling fixture bytes, then `step_chown`s the file owner
-///      to 1000:1000 and `step_chmod`s the mode to
+///      sibling fixture bytes, then `chown_inode`s the file owner
+///      to 1000:1000 and `chmod_inode`s the mode to
 ///      `S_ISUID | 0o755`. Both mutations run as root (CAP_FOWNER)
 ///      so non-privileged-clears don't fire.
 ///   3. `clear_caps_for_test` + `set_cred_ids_for_test(1001, ...)`
@@ -1677,14 +2029,14 @@ fn boot_smoke_setuid_exec_seeds_post_setuid_euid_and_at_secure() {
 /// (always root in the bootstrap path) — there is no `mode +
 /// uid + gid` overload on the production `create_inode` surface, so
 /// the helper writes the bytes with default owner first, then
-/// `step_chown`s + `step_chmod`s as root (which carries CAP_FOWNER
+/// `chown_inode`s + `chmod_inode`s as root (which carries CAP_FOWNER
 /// after `drive_boot_wiring`). This avoids the silent-clear-S_ISUID
 /// rule that fires on non-privileged chowns.
 ///
-/// Mirrors the production `register_init_fixture_into_tmpfs`
-/// shape; the only differences are (a) the path (`/setuid-target`
-/// vs `/init`) and (b) the post-creation chown + chmod to install
-/// the setuid mode + non-root owner.
+/// Mirrors the test-only `register_init_fixture_into_tmpfs` shape;
+/// the only differences are (a) the path (`/setuid-target` vs `/init`)
+/// and (b) the post-creation chown + chmod to install the setuid mode
+/// + non-root owner.
 fn register_setuid_fixture_into_tmpfs(file_uid: u32, file_gid: u32) {
     use tx_subsystems::vfs::{Credential, RNodeBacking, S_ISUID};
 
@@ -1703,7 +2055,7 @@ fn register_setuid_fixture_into_tmpfs(file_uid: u32, file_gid: u32) {
     // Allocate the inode as root. `0o100755` = S_IFREG | 0755.
     // (We chmod to S_ISUID below; doing it here would still be
     // valid, but splitting create + chmod exercises the slice's
-    // step_chmod path under privileged cred.)
+    // chmod_inode path under privileged cred.)
     let cred = Credential::root();
     let (file_id, file_meta) = {
         let guard = guard();
@@ -1769,10 +2121,10 @@ fn register_setuid_fixture_into_tmpfs(file_uid: u32, file_gid: u32) {
     // and the silent-clear-S_ISUID rule does NOT fire.
     {
         let guard = guard();
-        match fs_ops.step_chown(file_id, Some(file_uid), Some(file_gid), &cred, &guard) {
+        match fs_ops.chown_inode(file_id, Some(file_uid), Some(file_gid), &cred, &guard) {
             StepOutcome::Done(()) => {}
             other => {
-                panic!("register_setuid_fixture: step_chown({file_uid}, {file_gid}): {other:?}")
+                panic!("register_setuid_fixture: chown_inode({file_uid}, {file_gid}): {other:?}")
             }
         }
     }
@@ -1785,9 +2137,9 @@ fn register_setuid_fixture_into_tmpfs(file_uid: u32, file_gid: u32) {
     let new_mode = S_ISUID | 0o755;
     {
         let guard = guard();
-        match fs_ops.step_chmod(file_id, new_mode, &cred, &guard) {
+        match fs_ops.chmod_inode(file_id, new_mode, &cred, &guard) {
             StepOutcome::Done(()) => {}
-            other => panic!("register_setuid_fixture: step_chmod({new_mode:#o}): {other:?}"),
+            other => panic!("register_setuid_fixture: chmod_inode({new_mode:#o}): {other:?}"),
         }
     }
 }

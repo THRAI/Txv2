@@ -49,6 +49,20 @@ pub(super) fn cred_change_to_result(change: CredChange) -> SyscallResult {
         CredChange::Replaced { .. } => SyscallResult::Return(0),
         CredChange::PermissionDenied => SyscallResult::Error(EPERM_VALUE),
         CredChange::Zombie => SyscallResult::Error(ESRCH_VALUE),
+        CredChange::Again => SyscallResult::Error(EAGAIN_VALUE),
+    }
+}
+
+#[cfg(test)]
+mod cred_result_tests {
+    use super::*;
+
+    #[test]
+    fn reserved_credential_mutation_maps_to_eagain() {
+        assert_eq!(
+            cred_change_to_result(CredChange::Again),
+            SyscallResult::Error(crate::linux_syscall::EAGAIN_VALUE)
+        );
     }
 }
 

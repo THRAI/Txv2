@@ -23,7 +23,7 @@ use super::structure::{
     Credential, DirCursor, DirEntry, FsObjectId, InodeKind, InodeMeta, OpenFile, OpenFileBacking,
     OpenFileIoctl, OpenFileIoctlCaller, OpenFileIoctlResult, RNodeBacking, StructPayload,
 };
-use crate::mount::MountPayload;
+use crate::mount::{MountIdentity, MountNamespace, MountPayload};
 
 // === FsOps — emits step_v3 outcomes ==================================
 //
@@ -211,8 +211,8 @@ pub trait FsOps: Send + Sync + 'static {
     }
 
     /// Update the inode's mode bits. Default returns `ENOSYS` (parity
-    /// with [`FsOps::step_chmod`]).
-    fn step_chmod(
+    /// with [`FsOps::chmod_inode`]).
+    fn chmod_inode(
         &self,
         fs_object_id: FsObjectId,
         new_mode: u16,
@@ -229,8 +229,8 @@ pub trait FsOps: Send + Sync + 'static {
     }
 
     /// Update the inode's `(uid, gid)`. Default returns `ENOSYS`
-    /// (parity with [`FsOps::step_chown`]).
-    fn step_chown(
+    /// (parity with [`FsOps::chown_inode`]).
+    fn chown_inode(
         &self,
         fs_object_id: FsObjectId,
         new_uid: Option<u32>,
@@ -250,7 +250,7 @@ pub trait FsOps: Send + Sync + 'static {
     /// Read content from a projected inode (procfs, sysfs, etc.).
     /// Called by `OpenFile::step_read` when `RNodeBacking::Projected`.
     /// Default: `ENOSYS`.
-    fn step_read_projected(
+    fn read_projected(
         &self,
         fs_object_id: FsObjectId,
         offset: u64,
@@ -265,7 +265,7 @@ pub trait FsOps: Send + Sync + 'static {
     /// when a backend has namespace-sensitive projections such as
     /// `/proc/net/*`. Backends without such projections inherit the
     /// legacy projected read behavior.
-    fn step_read_projected_with_netns(
+    fn read_projected_with_netns(
         &self,
         fs_object_id: FsObjectId,
         offset: u64,
@@ -274,13 +274,13 @@ pub trait FsOps: Send + Sync + 'static {
         guard: &Guard<'_>,
     ) -> StepOutcome<u64, NoProgress> {
         let _ = caller_netns;
-        self.step_read_projected(fs_object_id, offset, buf, guard)
+        self.read_projected(fs_object_id, offset, buf, guard)
     }
 
     /// Write content to a projected inode (procfs/sysctl style files).
     /// Called by `OpenFile::step_write` when `RNodeBacking::Projected`.
     /// Default: `ENOSYS`.
-    fn step_write_projected(
+    fn write_projected(
         &self,
         fs_object_id: FsObjectId,
         offset: u64,
@@ -293,7 +293,7 @@ pub trait FsOps: Send + Sync + 'static {
 
     /// Write projected content using the caller's network namespace
     /// when a backend has namespace-sensitive writable projections.
-    fn step_write_projected_with_netns(
+    fn write_projected_with_netns(
         &self,
         fs_object_id: FsObjectId,
         offset: u64,
@@ -302,7 +302,7 @@ pub trait FsOps: Send + Sync + 'static {
         guard: &Guard<'_>,
     ) -> StepOutcome<u64, NoProgress> {
         let _ = caller_netns;
-        self.step_write_projected(fs_object_id, offset, bytes, guard)
+        self.write_projected(fs_object_id, offset, bytes, guard)
     }
 }
 
@@ -384,7 +384,13 @@ impl OpenFile {
                 StructPayload::Pipe {
                     payload,
                     side: crate::pipe::PipeSide::Reader,
-                } => crate::pipe::step_read(payload, out, guard, flags.nonblocking),
+                } => crate::pipe::step_read_with_post(
+                    payload,
+                    out,
+                    guard,
+                    flags.nonblocking,
+                    |mailbox, event| mailbox.post(event),
+                ),
                 // Wrong-side read against a writer-end RNode. The
                 // OpenFileFlags.read=false guard above handles the
                 // common case (writer-end OpenFiles never set read);
@@ -416,7 +422,7 @@ impl OpenFile {
                     .and_then(|mw| mw.upgrade(guard))
                 {
                     Some(mp) => {
-                        match mp.fs_ops().step_read_projected_with_netns(
+                        match mp.fs_ops().read_projected_with_netns(
                             rnode.fs_object_id(),
                             off,
                             out,
@@ -535,7 +541,7 @@ impl OpenFile {
                 return StepOutcome::Done(new_offset_u64);
             }
             RNodeBacking::Symlink { .. } | RNodeBacking::Projected { .. } => {
-                return StepOutcome::Err(Errno::ENOSYS)
+                return StepOutcome::Err(Errno::ENOSYS);
             }
             RNodeBacking::PageBacked { .. } => {
                 // tmpfs/ext4 store FIFO and socket nodes with a
@@ -638,9 +644,14 @@ impl OpenFile {
                 StructPayload::Pipe {
                     payload,
                     side: crate::pipe::PipeSide::Writer,
-                } => {
-                    crate::pipe::step_write(payload, bytes, guard, flags.nonblocking, flags.packet)
-                }
+                } => crate::pipe::step_write_with_post(
+                    payload,
+                    bytes,
+                    guard,
+                    flags.nonblocking,
+                    flags.packet,
+                    |mailbox, event| mailbox.post(event),
+                ),
                 // Wrong-side write against a reader-end RNode.
                 StructPayload::Pipe {
                     side: crate::pipe::PipeSide::Reader,
@@ -675,7 +686,7 @@ impl OpenFile {
                     .and_then(|mw| mw.upgrade(guard))
                 {
                     Some(mp) => {
-                        match mp.fs_ops().step_write_projected_with_netns(
+                        match mp.fs_ops().write_projected_with_netns(
                             rnode.fs_object_id(),
                             off,
                             bytes,
@@ -833,8 +844,7 @@ fn step_tty_ioctl(
 // `step_ioctl`). The wraps therefore hold a `&'a Cap<OpenFile>` and delegate
 // from `step()` through `Cap::deref()` to the method body — semantics are
 // unchanged. The `Cap<OpenFile>` is borrowed (not cloned) so the `Op` shape
-// matches the other wave-3 byte-IO wraps (`pipe::ReadOp`, `tty::execution::
-// step_read::ReadOp`).
+// matches the other wave-3 byte-IO wraps in TTY.
 
 /// `StepOp` wrap of [`OpenFile::step_read`].
 ///
@@ -973,7 +983,10 @@ pub struct OpenFileWriteFromUserOp<'a> {
 impl<'a, I: SubjectIdentity> StepOp<I> for OpenFileWriteFromUserOp<'a> {
     type Output = usize;
     type Progress = ByteProgress;
-    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+    fn step(&mut self, ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        // Path authority is carried by `cred`; retain the enclosing script
+        // subject as the identity boundary for this lower-half transition.
+        let _ = ctx.subject();
         let guard = step_engine::guard();
         let remaining = self.len - self.cursor;
         emit_vfs_trace(b"debug.vfs.write_from_user_op.remaining", remaining as i64);
@@ -1149,6 +1162,207 @@ impl<'a, I: SubjectIdentity> StepOp<I> for InodeStatOp<'a> {
 impl OneShotStepOp for InodeStatOp<'_> {}
 impl OneShotStepOp<crate::process::ProcessIdentity> for InodeStatOp<'_> {}
 
+/// One-shot `FsOps::mkdir` invocation.
+pub struct MkdirOp<'a> {
+    pub fs_ops: &'a Arc<dyn FsOps>,
+    pub parent: FsObjectId,
+    pub name: &'a [u8],
+    pub mode: u16,
+    pub cred: &'a Credential,
+}
+
+impl<I: SubjectIdentity> StepOp<I> for MkdirOp<'_> {
+    type Output = ();
+    type Progress = NoProgress;
+
+    fn step(&mut self, ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let _ = ctx.subject();
+        let guard = step_engine::guard();
+        match self
+            .fs_ops
+            .mkdir(self.parent, self.name, self.mode, self.cred, &guard)
+        {
+            StepOutcome::Done(_) => StepOutcome::Done(()),
+            StepOutcome::Continue { progress } => StepOutcome::Continue { progress },
+            StepOutcome::Yield { progress, shape } => StepOutcome::Yield { progress, shape },
+            StepOutcome::Err(errno) => StepOutcome::Err(errno),
+        }
+    }
+}
+
+impl OneShotStepOp for MkdirOp<'_> {}
+impl OneShotStepOp<crate::process::ProcessIdentity> for MkdirOp<'_> {}
+
+/// `FsOps::create_inode` after the caller has resolved the parent directory.
+///
+/// This op deliberately has no `OneShotStepOp` marker: filesystem backends
+/// may use `Continue` or `Yield` while allocating and publishing an inode.
+pub struct CreateInParentOp<'a> {
+    pub fs_ops: &'a Arc<dyn FsOps>,
+    pub parent: FsObjectId,
+    pub name: &'a [u8],
+    pub mode: u16,
+    pub cred: &'a Credential,
+}
+
+impl<I: SubjectIdentity> StepOp<I> for CreateInParentOp<'_> {
+    type Output = (FsObjectId, InodeMeta);
+    type Progress = NoProgress;
+
+    fn step(&mut self, ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let _ = ctx.subject();
+        let guard = step_engine::guard();
+        self.fs_ops
+            .create_inode(self.parent, self.name, self.mode, self.cred, &guard)
+    }
+}
+
+/// One-shot `FsOps::symlink` invocation.
+pub struct SymlinkOp<'a> {
+    pub fs_ops: &'a Arc<dyn FsOps>,
+    pub parent: FsObjectId,
+    pub name: &'a [u8],
+    pub target: &'a [u8],
+    pub cred: &'a Credential,
+}
+
+impl<I: SubjectIdentity> StepOp<I> for SymlinkOp<'_> {
+    type Output = ();
+    type Progress = NoProgress;
+
+    fn step(&mut self, ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let _ = ctx.subject();
+        let guard = step_engine::guard();
+        match self
+            .fs_ops
+            .symlink(self.parent, self.name, self.target, self.cred, &guard)
+        {
+            StepOutcome::Done(_) => StepOutcome::Done(()),
+            StepOutcome::Continue { progress } => StepOutcome::Continue { progress },
+            StepOutcome::Yield { progress, shape } => StepOutcome::Yield { progress, shape },
+            StepOutcome::Err(errno) => StepOutcome::Err(errno),
+        }
+    }
+}
+
+impl OneShotStepOp for SymlinkOp<'_> {}
+impl OneShotStepOp<crate::process::ProcessIdentity> for SymlinkOp<'_> {}
+
+/// One-shot `FsOps::link` invocation after the syscall has resolved both
+/// source and destination path contexts.
+pub struct LinkInParentOp<'a> {
+    pub fs_ops: &'a Arc<dyn FsOps>,
+    pub parent: FsObjectId,
+    pub name: &'a [u8],
+    pub target: FsObjectId,
+}
+
+impl<I: SubjectIdentity> StepOp<I> for LinkInParentOp<'_> {
+    type Output = ();
+    type Progress = NoProgress;
+
+    fn step(&mut self, ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let _ = ctx.subject();
+        let guard = step_engine::guard();
+        self.fs_ops
+            .link(self.parent, self.name, self.target, &guard)
+    }
+}
+
+impl OneShotStepOp for LinkInParentOp<'_> {}
+impl OneShotStepOp<crate::process::ProcessIdentity> for LinkInParentOp<'_> {}
+
+/// One-shot `FsOps::read_link` invocation after the caller has selected the
+/// symlink inode to inspect.
+pub struct ReadLinkByIdOp<'a> {
+    pub fs_ops: &'a Arc<dyn FsOps>,
+    pub target: FsObjectId,
+}
+
+impl<I: SubjectIdentity> StepOp<I> for ReadLinkByIdOp<'_> {
+    type Output = alloc::boxed::Box<[u8]>;
+    type Progress = NoProgress;
+
+    fn step(&mut self, ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let _ = ctx.subject();
+        let guard = step_engine::guard();
+        self.fs_ops.read_link(self.target, &guard)
+    }
+}
+
+impl OneShotStepOp for ReadLinkByIdOp<'_> {}
+impl OneShotStepOp<crate::process::ProcessIdentity> for ReadLinkByIdOp<'_> {}
+
+/// One-shot `FsOps::lookup` invocation in an already-resolved directory.
+pub struct LookupInParentOp<'a> {
+    pub fs_ops: &'a Arc<dyn FsOps>,
+    pub parent: FsObjectId,
+    pub name: &'a [u8],
+}
+
+impl<I: SubjectIdentity> StepOp<I> for LookupInParentOp<'_> {
+    type Output = FsObjectId;
+    type Progress = NoProgress;
+
+    fn step(&mut self, ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let _ = ctx.subject();
+        let guard = step_engine::guard();
+        self.fs_ops.lookup(self.parent, self.name, &guard)
+    }
+}
+
+impl OneShotStepOp for LookupInParentOp<'_> {}
+impl OneShotStepOp<crate::process::ProcessIdentity> for LookupInParentOp<'_> {}
+
+/// One-shot `FsOps::load_inode_meta` invocation.
+pub struct LoadInodeMetaOp<'a> {
+    pub fs_ops: &'a Arc<dyn FsOps>,
+    pub target: FsObjectId,
+}
+
+impl<I: SubjectIdentity> StepOp<I> for LoadInodeMetaOp<'_> {
+    type Output = InodeMeta;
+    type Progress = NoProgress;
+
+    fn step(&mut self, ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let _ = ctx.subject();
+        let guard = step_engine::guard();
+        self.fs_ops.load_inode_meta(self.target, &guard)
+    }
+}
+
+impl OneShotStepOp for LoadInodeMetaOp<'_> {}
+impl OneShotStepOp<crate::process::ProcessIdentity> for LoadInodeMetaOp<'_> {}
+
+/// One-shot `FsOps::unlink` or `FsOps::rmdir` invocation.
+pub struct UnlinkFromParentOp<'a> {
+    pub fs_ops: &'a Arc<dyn FsOps>,
+    pub parent: FsObjectId,
+    pub name: &'a [u8],
+    pub target: FsObjectId,
+    pub remove_dir: bool,
+}
+
+impl<I: SubjectIdentity> StepOp<I> for UnlinkFromParentOp<'_> {
+    type Output = ();
+    type Progress = NoProgress;
+
+    fn step(&mut self, ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let _ = ctx.subject();
+        let guard = step_engine::guard();
+        if self.remove_dir {
+            self.fs_ops
+                .rmdir(self.parent, self.name, self.target, &guard)
+        } else {
+            self.fs_ops
+                .unlink(self.parent, self.name, self.target, &guard)
+        }
+    }
+}
+
+impl OneShotStepOp for UnlinkFromParentOp<'_> {}
+impl OneShotStepOp<crate::process::ProcessIdentity> for UnlinkFromParentOp<'_> {}
+
 // ── Async VFS StepOp wrappers (may Yield/Continue) ───────────────────
 
 /// `StepOp` wrap of [`super::walker::step_walk`]. Idempotent: each
@@ -1171,6 +1385,461 @@ impl<I: SubjectIdentity> StepOp<I> for PathWalkOp {
     }
 }
 
+/// Create a regular inode below a resolved parent, then re-walk the complete
+/// path so the result carries the mount-aware dentry chain required by open.
+///
+/// The operation owns every value needed across `Continue` / `Yield`; each
+/// poll obtains a fresh epoch guard, so no guard crosses the driver await.
+pub struct CreateThenWalkOp {
+    pub rooted_at: Cap<super::structure::DEntry>,
+    pub parent_path: Vec<u8>,
+    pub path: Vec<u8>,
+    pub basename: Vec<u8>,
+    pub mode: u16,
+    pub cred: super::structure::Credential,
+    parent: Option<Cap<super::structure::DEntry>>,
+    created: bool,
+}
+
+impl CreateThenWalkOp {
+    pub fn new(
+        rooted_at: Cap<super::structure::DEntry>,
+        parent_path: Vec<u8>,
+        path: Vec<u8>,
+        basename: Vec<u8>,
+        mode: u16,
+        cred: super::structure::Credential,
+    ) -> Self {
+        Self {
+            rooted_at,
+            parent_path,
+            path,
+            basename,
+            mode,
+            cred,
+            parent: None,
+            created: false,
+        }
+    }
+}
+
+impl<I: SubjectIdentity> StepOp<I> for CreateThenWalkOp {
+    type Output = Cap<super::structure::DEntry>;
+    type Progress = NoProgress;
+
+    fn step(&mut self, ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let _ = ctx.subject();
+        let guard = step_engine::guard();
+
+        if !self.created {
+            let parent = match self.parent.clone() {
+                Some(parent) => parent,
+                None if self.parent_path.is_empty() => self.rooted_at.clone(),
+                None => match super::walker::step_walk(
+                    self.rooted_at.clone(),
+                    &self.parent_path,
+                    &self.cred,
+                    &guard,
+                ) {
+                    StepOutcome::Done(parent) => parent,
+                    StepOutcome::Err(errno) => return StepOutcome::Err(errno),
+                    StepOutcome::Continue { progress } => {
+                        return StepOutcome::Continue { progress };
+                    }
+                    StepOutcome::Yield { progress, shape } => {
+                        return StepOutcome::Yield { progress, shape };
+                    }
+                },
+            };
+            self.parent = Some(parent.clone());
+
+            let Some(fs_ops) = super::walker::fs_ops_for(&parent, &guard) else {
+                return StepOutcome::Err(Errno::EROFS);
+            };
+            match fs_ops.create_inode(
+                parent.rnode().fs_object_id(),
+                &self.basename,
+                self.mode,
+                &self.cred,
+                &guard,
+            ) {
+                StepOutcome::Done(_) => {
+                    parent.remove_cached_child_by_name(&self.basename);
+                    self.created = true;
+                    return StepOutcome::Continue {
+                        progress: NoProgress,
+                    };
+                }
+                StepOutcome::Err(errno) => return StepOutcome::Err(errno),
+                StepOutcome::Continue { progress } => {
+                    return StepOutcome::Continue { progress };
+                }
+                StepOutcome::Yield { progress, shape } => {
+                    return StepOutcome::Yield { progress, shape };
+                }
+            }
+        }
+
+        super::walker::step_walk(self.rooted_at.clone(), &self.path, &self.cred, &guard)
+    }
+}
+
+/// Namespace-aware variant of [`CreateThenWalkOp`].
+pub struct CreateThenWalkInMountNamespaceOp {
+    pub rooted_at: Cap<super::structure::DEntry>,
+    pub origin_mount: Cap<MountIdentity>,
+    pub mount_namespace: Cap<MountNamespace>,
+    pub parent_path: Vec<u8>,
+    pub path: Vec<u8>,
+    pub basename: Vec<u8>,
+    pub mode: u16,
+    pub cred: super::structure::Credential,
+    parent: Option<Cap<super::structure::DEntry>>,
+    created: bool,
+}
+
+impl CreateThenWalkInMountNamespaceOp {
+    pub fn new(
+        rooted_at: Cap<super::structure::DEntry>,
+        origin_mount: Cap<MountIdentity>,
+        mount_namespace: Cap<MountNamespace>,
+        parent_path: Vec<u8>,
+        path: Vec<u8>,
+        basename: Vec<u8>,
+        mode: u16,
+        cred: super::structure::Credential,
+    ) -> Self {
+        Self {
+            rooted_at,
+            origin_mount,
+            mount_namespace,
+            parent_path,
+            path,
+            basename,
+            mode,
+            cred,
+            parent: None,
+            created: false,
+        }
+    }
+}
+
+impl<I: SubjectIdentity> StepOp<I> for CreateThenWalkInMountNamespaceOp {
+    type Output = super::walker::ResolvedDEntryWithMount;
+    type Progress = NoProgress;
+
+    fn step(&mut self, ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let _ = ctx.subject();
+        let guard = step_engine::guard();
+
+        if !self.created {
+            let parent = match self.parent.clone() {
+                Some(parent) => parent,
+                None if self.parent_path.is_empty() => self.rooted_at.clone(),
+                None => match super::walker::step_walk_in_mount_namespace_with_origin_mount(
+                    self.rooted_at.clone(),
+                    &self.origin_mount,
+                    &self.parent_path,
+                    &self.cred,
+                    &self.mount_namespace,
+                    &guard,
+                ) {
+                    StepOutcome::Done(resolved) => resolved.dentry,
+                    StepOutcome::Err(errno) => return StepOutcome::Err(errno),
+                    StepOutcome::Continue { progress } => {
+                        return StepOutcome::Continue { progress };
+                    }
+                    StepOutcome::Yield { progress, shape } => {
+                        return StepOutcome::Yield { progress, shape };
+                    }
+                },
+            };
+            self.parent = Some(parent.clone());
+
+            let Some(fs_ops) = super::walker::fs_ops_for(&parent, &guard) else {
+                return StepOutcome::Err(Errno::EROFS);
+            };
+            match fs_ops.create_inode(
+                parent.rnode().fs_object_id(),
+                &self.basename,
+                self.mode,
+                &self.cred,
+                &guard,
+            ) {
+                StepOutcome::Done(_) => {
+                    parent.remove_cached_child_by_name(&self.basename);
+                    self.created = true;
+                    return StepOutcome::Continue {
+                        progress: NoProgress,
+                    };
+                }
+                StepOutcome::Err(errno) => return StepOutcome::Err(errno),
+                StepOutcome::Continue { progress } => {
+                    return StepOutcome::Continue { progress };
+                }
+                StepOutcome::Yield { progress, shape } => {
+                    return StepOutcome::Yield { progress, shape };
+                }
+            }
+        }
+
+        super::walker::step_walk_in_mount_namespace_with_origin_mount(
+            self.rooted_at.clone(),
+            &self.origin_mount,
+            &self.path,
+            &self.cred,
+            &self.mount_namespace,
+            &guard,
+        )
+    }
+}
+
+/// Resolve the target of `openat`, creating and re-walking a missing target
+/// when `create_mode` is present. Syscall policy such as `O_DIRECTORY`, DAC,
+/// and FD installation stays with the shim; this op owns only VFS progress.
+pub struct ResolveOpenTargetOp {
+    pub rooted_at: Cap<super::structure::DEntry>,
+    pub path: Vec<u8>,
+    pub cred: super::structure::Credential,
+    pub create_mode: Option<u16>,
+    pub exclusive: bool,
+    create_then_walk: Option<CreateThenWalkOp>,
+}
+
+impl ResolveOpenTargetOp {
+    pub fn new(
+        rooted_at: Cap<super::structure::DEntry>,
+        path: Vec<u8>,
+        cred: super::structure::Credential,
+        create_mode: Option<u16>,
+        exclusive: bool,
+    ) -> Self {
+        Self {
+            rooted_at,
+            path,
+            cred,
+            create_mode,
+            exclusive,
+            create_then_walk: None,
+        }
+    }
+}
+
+impl<I: SubjectIdentity> StepOp<I> for ResolveOpenTargetOp {
+    type Output = Cap<super::structure::DEntry>;
+    type Progress = NoProgress;
+
+    fn step(&mut self, ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let _ = ctx.subject();
+        if let Some(create_then_walk) = self.create_then_walk.as_mut() {
+            return create_then_walk.step(ctx);
+        }
+
+        let guard = step_engine::guard();
+        match super::walker::step_walk(self.rooted_at.clone(), &self.path, &self.cred, &guard) {
+            StepOutcome::Done(_) if self.create_mode.is_some() && self.exclusive => {
+                StepOutcome::Err(Errno::EEXIST)
+            }
+            StepOutcome::Done(dentry) => StepOutcome::Done(dentry),
+            StepOutcome::Err(Errno::ENOENT) if self.create_mode.is_some() => {
+                let split_at = self.path.iter().rposition(|byte| *byte == b'/');
+                let (parent_path, basename) = match split_at {
+                    Some(index) => (&self.path[..index], &self.path[index + 1..]),
+                    None => (b"" as &[u8], self.path.as_slice()),
+                };
+                if basename.is_empty() {
+                    return StepOutcome::Err(Errno::EISDIR);
+                }
+                self.create_then_walk = Some(CreateThenWalkOp::new(
+                    self.rooted_at.clone(),
+                    parent_path.to_vec(),
+                    self.path.clone(),
+                    basename.to_vec(),
+                    self.create_mode.expect("create mode checked"),
+                    self.cred.clone(),
+                ));
+                StepOutcome::Continue {
+                    progress: NoProgress,
+                }
+            }
+            outcome => outcome,
+        }
+    }
+}
+
+/// Namespace-aware variant of [`ResolveOpenTargetOp`].
+pub struct ResolveOpenTargetInMountNamespaceOp {
+    pub rooted_at: Cap<super::structure::DEntry>,
+    pub origin_mount: Cap<MountIdentity>,
+    pub mount_namespace: Cap<MountNamespace>,
+    pub path: Vec<u8>,
+    pub cred: super::structure::Credential,
+    pub create_mode: Option<u16>,
+    pub exclusive: bool,
+    create_then_walk: Option<CreateThenWalkInMountNamespaceOp>,
+}
+
+impl ResolveOpenTargetInMountNamespaceOp {
+    pub fn new(
+        rooted_at: Cap<super::structure::DEntry>,
+        origin_mount: Cap<MountIdentity>,
+        mount_namespace: Cap<MountNamespace>,
+        path: Vec<u8>,
+        cred: super::structure::Credential,
+        create_mode: Option<u16>,
+        exclusive: bool,
+    ) -> Self {
+        Self {
+            rooted_at,
+            origin_mount,
+            mount_namespace,
+            path,
+            cred,
+            create_mode,
+            exclusive,
+            create_then_walk: None,
+        }
+    }
+}
+
+impl<I: SubjectIdentity> StepOp<I> for ResolveOpenTargetInMountNamespaceOp {
+    type Output = super::walker::ResolvedDEntryWithMount;
+    type Progress = NoProgress;
+
+    fn step(&mut self, ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let _ = ctx.subject();
+        if let Some(create_then_walk) = self.create_then_walk.as_mut() {
+            return create_then_walk.step(ctx);
+        }
+
+        let guard = step_engine::guard();
+        match super::walker::step_walk_in_mount_namespace_with_origin_mount(
+            self.rooted_at.clone(),
+            &self.origin_mount,
+            &self.path,
+            &self.cred,
+            &self.mount_namespace,
+            &guard,
+        ) {
+            StepOutcome::Done(_) if self.create_mode.is_some() && self.exclusive => {
+                StepOutcome::Err(Errno::EEXIST)
+            }
+            StepOutcome::Done(resolved) => StepOutcome::Done(resolved),
+            StepOutcome::Err(Errno::ENOENT) if self.create_mode.is_some() => {
+                let split_at = self.path.iter().rposition(|byte| *byte == b'/');
+                let (parent_path, basename) = match split_at {
+                    Some(index) => (&self.path[..index], &self.path[index + 1..]),
+                    None => (b"" as &[u8], self.path.as_slice()),
+                };
+                if basename.is_empty() {
+                    return StepOutcome::Err(Errno::EISDIR);
+                }
+                self.create_then_walk = Some(CreateThenWalkInMountNamespaceOp::new(
+                    self.rooted_at.clone(),
+                    self.origin_mount.clone(),
+                    self.mount_namespace.clone(),
+                    parent_path.to_vec(),
+                    self.path.clone(),
+                    basename.to_vec(),
+                    self.create_mode.expect("create mode checked"),
+                    self.cred.clone(),
+                ));
+                StepOutcome::Continue {
+                    progress: NoProgress,
+                }
+            }
+            StepOutcome::Err(errno) => StepOutcome::Err(errno),
+            StepOutcome::Continue { progress } => StepOutcome::Continue { progress },
+            StepOutcome::Yield { progress, shape } => StepOutcome::Yield { progress, shape },
+        }
+    }
+}
+
+/// Invoke `FsPageBacking::truncate` for a target already resolved by the
+/// syscall's VFS policy. The backing may yield while it writes back or updates
+/// its page-cache state, so this is a full-driver op.
+pub struct TruncateFsObjectOp {
+    pub page_backing: Arc<dyn FsPageBacking>,
+    pub fs_object_id: FsObjectId,
+    pub new_size: u64,
+}
+
+impl<I: SubjectIdentity> StepOp<I> for TruncateFsObjectOp {
+    type Output = ();
+    type Progress = NoProgress;
+
+    fn step(&mut self, ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let _ = ctx.subject();
+        let guard = step_engine::guard();
+        self.page_backing
+            .truncate(self.fs_object_id, self.new_size, &guard)
+    }
+}
+
+/// Namespace-aware walker whose origin mount is part of the result contract.
+///
+/// The current namespace walker resolves synchronously: it returns only
+/// `Done` or `Err`. Keeping that terminal-only contract explicit lets callers
+/// use `drive_oneshot` instead of reimplementing an outcome match in each
+/// syscall arm.
+pub struct WalkInMountNamespaceWithOriginOp {
+    pub rooted_at: Cap<super::structure::DEntry>,
+    pub origin_mount: Cap<MountIdentity>,
+    pub path: Vec<u8>,
+    pub cred: super::structure::Credential,
+    pub mount_namespace: Cap<MountNamespace>,
+}
+
+impl<I: SubjectIdentity> StepOp<I> for WalkInMountNamespaceWithOriginOp {
+    type Output = super::walker::ResolvedDEntryWithMount;
+    type Progress = NoProgress;
+
+    fn step(&mut self, ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let _ = ctx.subject();
+        let guard = step_engine::guard();
+        super::walker::step_walk_in_mount_namespace_with_origin_mount(
+            self.rooted_at.clone(),
+            &self.origin_mount,
+            &self.path,
+            &self.cred,
+            &self.mount_namespace,
+            &guard,
+        )
+    }
+}
+
+impl OneShotStepOp for WalkInMountNamespaceWithOriginOp {}
+impl OneShotStepOp<crate::process::ProcessIdentity> for WalkInMountNamespaceWithOriginOp {}
+
+/// `StepOp` wrap of namespace-aware open.
+pub struct OpenInMountNamespaceOp {
+    pub rooted_at: Cap<super::structure::DEntry>,
+    pub origin_mount: Cap<MountIdentity>,
+    pub mount_namespace: Cap<MountNamespace>,
+    pub path: Vec<u8>,
+    pub flags: super::structure::OpenFileFlags,
+    pub mode: u16,
+    pub cred: super::structure::Credential,
+}
+
+impl<I: SubjectIdentity> StepOp<I> for OpenInMountNamespaceOp {
+    type Output = super::walker::OpenFileWithMount;
+    type Progress = NoProgress;
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let guard = step_engine::guard();
+        super::walker::step_open_in_mount_namespace_with_origin_mount(
+            self.rooted_at.clone(),
+            &self.origin_mount,
+            &self.path,
+            self.flags,
+            self.mode,
+            &self.cred,
+            &self.mount_namespace,
+            &guard,
+        )
+    }
+}
+
 /// `StepOp` wrap of [`super::walker::step_open`]. Composes
 /// [`PathWalkOp`] with `OpenFile::new_cap` and the DAC read/write
 /// permission check.
@@ -1188,6 +1857,60 @@ impl<I: SubjectIdentity> StepOp<I> for OpenOp {
     fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
         let guard = step_engine::guard();
         super::walker::step_open(
+            self.rooted_at.clone(),
+            &self.path,
+            self.flags,
+            self.mode,
+            &self.cred,
+            &guard,
+        )
+    }
+}
+
+/// `StepOp` wrap of namespace-aware nofollow open.
+pub struct OpenNoFollowInMountNamespaceOp {
+    pub rooted_at: Cap<super::structure::DEntry>,
+    pub origin_mount: Cap<MountIdentity>,
+    pub mount_namespace: Cap<MountNamespace>,
+    pub path: Vec<u8>,
+    pub flags: super::structure::OpenFileFlags,
+    pub mode: u16,
+    pub cred: super::structure::Credential,
+}
+
+impl<I: SubjectIdentity> StepOp<I> for OpenNoFollowInMountNamespaceOp {
+    type Output = super::walker::OpenFileWithMount;
+    type Progress = NoProgress;
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let guard = step_engine::guard();
+        super::walker::step_open_nofollow_in_mount_namespace_with_origin_mount(
+            self.rooted_at.clone(),
+            &self.origin_mount,
+            &self.path,
+            self.flags,
+            self.mode,
+            &self.cred,
+            &self.mount_namespace,
+            &guard,
+        )
+    }
+}
+
+/// `StepOp` wrap of [`super::walker::step_open_nofollow`].
+pub struct OpenNoFollowOp {
+    pub rooted_at: Cap<super::structure::DEntry>,
+    pub path: Vec<u8>,
+    pub flags: super::structure::OpenFileFlags,
+    pub mode: u16,
+    pub cred: super::structure::Credential,
+}
+
+impl<I: SubjectIdentity> StepOp<I> for OpenNoFollowOp {
+    type Output = Cap<super::structure::OpenFile>;
+    type Progress = NoProgress;
+    fn step(&mut self, _ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let guard = step_engine::guard();
+        super::walker::step_open_nofollow(
             self.rooted_at.clone(),
             &self.path,
             self.flags,
@@ -1273,8 +1996,8 @@ mod step_op_wraps {
     use crate::test_support::EPOCH_TEST_LOCK;
     use crate::tty::structure::{TtyIdentity, TtyKind, TtyPayload};
     use crate::vfs::adapter::step_engine::{
-        reserve_for, sign_for, Cap, PayloadCap, ProcessIdentity, ScriptCtx, StepOp,
-        StepOutcome as V3,
+        Cap, PayloadCap, ProcessIdentity, ScriptCtx, StepOp, StepOutcome as V3, reserve_for,
+        sign_for,
     };
     use crate::vfs::structure::{
         DEntry, FsObjectId, InlineName, InodeKind, InodeMeta, OpenFile, OpenFileFlags,
@@ -1488,7 +2211,7 @@ mod step_op_wraps {
     }
 
     #[test]
-    fn lseek_op_on_directory_returns_eisdir() {
+    fn lseek_op_on_directory_returns_offset() {
         let _g = setup();
         let file = make_dir_open_file(true);
         let mut op = OpenFileLseekOp {
@@ -1498,8 +2221,8 @@ mod step_op_wraps {
         };
         let mut ctx = ScriptCtx::<ProcessIdentity>::new();
         match op.step(&mut ctx) {
-            V3::Err(e) => assert_eq!(e, Errno::EISDIR),
-            other => panic!("expected Err(EISDIR), got {other:?}"),
+            V3::Done(offset) => assert_eq!(offset, 0),
+            other => panic!("expected Done(0), got {other:?}"),
         }
     }
 
@@ -1569,8 +2292,7 @@ mod step_op_wraps {
         let mut dentry = DEntry::new(iname, rnode);
         dentry.set_parent_hint(parent_dentry);
         let dentry_cap = step_engine::sign(dentry).map_err(|_| Errno::ENOMEM)?;
-        parent_dentry.cache_child(dentry_cap.clone());
-        Ok(dentry_cap)
+        Ok(parent_dentry.cache_child(dentry_cap))
     }
 
     /// Create a regular file under `parent_dentry` and open it.

@@ -76,9 +76,39 @@ pub struct ElfProgramHeader {
     pub p_align: u64,
 }
 
+/// A validated range in the final in-memory image.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ImageRange {
+    /// Virtual address after applying the image load bias.
+    pub vaddr: u64,
+    pub size: u64,
+}
+
+/// Initial-exec TLS bytes described by `PT_TLS`.
+///
+/// The kernel records this template for libc or the userspace interpreter; it
+/// does not allocate a thread pointer or interpret a TLS ABI itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TlsTemplate {
+    /// Virtual address after applying the image load bias.
+    pub vaddr: u64,
+    pub file_offset: u64,
+    pub file_size: u64,
+    pub memory_size: u64,
+    pub align: u64,
+}
+
+/// Executable-stack request derived from `PT_GNU_STACK`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StackRequest {
+    /// False when `PT_GNU_STACK` is absent or does not carry `PF_X`.
+    pub executable_requested: bool,
+}
+
 /// Stable syntax errors returned by ELF parser adapters.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ElfDecodeError {
+    OutOfMemory,
     Truncated,
     BadMagic,
     UnsupportedClass,
@@ -87,4 +117,15 @@ pub enum ElfDecodeError {
     BadEntrySize,
     IntegerOverflow,
     Malformed,
+}
+
+/// Failures while rebasing or composing final userspace ELF ranges.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ElfLayoutError {
+    OutOfMemory,
+    AddressOverflow,
+    InvalidAlignment,
+    UserRange,
+    Overlap,
+    Exhausted,
 }

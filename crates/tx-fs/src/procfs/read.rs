@@ -2,22 +2,32 @@
 
 use crate::procfs::{
     pid_from_cmdline_id, pid_from_fdinfo_id, pid_from_gid_map_id, pid_from_maps_id,
-    pid_from_setgroups_id, pid_from_smaps_id, pid_from_stat_id, pid_from_status_id,
-    pid_from_uid_map_id,
-    KERNEL_CONFIG_TEXT,
-    PROCFS_CONFIG_ID, PROCFS_CPUINFO_ID, PROCFS_MEMINFO_ID, PROCFS_MOUNTS_ID,
-    PROCFS_NET_ARP_ID, PROCFS_NET_IF_INET6_ID, PROCFS_NET_TX_NEIGH_ID,
-    PROCFS_SYS_FS_LEASE_BREAK_TIME_ID, PROCFS_SYS_FS_PIPE_MAX_SIZE_ID,
+    pid_from_mounts_id, pid_from_setgroups_id, pid_from_smaps_id, pid_from_stat_id,
+    pid_from_status_id, pid_from_uid_map_id, KERNEL_CONFIG_TEXT, PROCFS_CGROUPS_ID,
+    PROCFS_CMDLINE_ID, PROCFS_CONFIG_ID, PROCFS_CPUINFO_ID, PROCFS_DEVICES_ID,
+    PROCFS_FILESYSTEMS_ID, PROCFS_MEMINFO_ID, PROCFS_MODULES_ID, PROCFS_MOUNTS_ID,
+    PROCFS_NET_ARP_ID, PROCFS_NET_DEV_ID, PROCFS_NET_IF_INET6_ID, PROCFS_NET_NETLINK_ID,
+    PROCFS_NET_NF_CONNTRACK_ID, PROCFS_NET_ROUTE_ID, PROCFS_NET_SNMP_ID, PROCFS_NET_TCP_ID,
+    PROCFS_NET_TX_NEIGH_ID, PROCFS_NET_UDP_ID, PROCFS_SYSVIPC_MSG_ID, PROCFS_SYSVIPC_SEM_ID,
+    PROCFS_SYSVIPC_SHM_ID, PROCFS_SYS_FS_LEASE_BREAK_TIME_ID, PROCFS_SYS_FS_PIPE_MAX_SIZE_ID,
     PROCFS_SYS_FS_PROTECTED_HARDLINKS_ID, PROCFS_SYS_FS_PROTECTED_SYMLINKS_ID,
-    PROCFS_SYS_KERNEL_PID_MAX_ID, PROCFS_SYS_KERNEL_TAINTED_ID, PROCFS_SYSVIPC_MSG_ID,
-    PROCFS_SYSVIPC_SEM_ID, PROCFS_SYSVIPC_SHM_ID, PROCFS_UPTIME_ID,
+    PROCFS_SYS_KERNEL_PID_MAX_ID, PROCFS_SYS_KERNEL_TAINTED_ID, PROCFS_SYS_NET_IPV4_IP_FORWARD_ID,
+    PROCFS_UPTIME_ID,
 };
 use alloc::format;
 use alloc::string::String;
+use tx_subsystems::net::NetNamespacePayload;
 use tx_subsystems::process::{self, Pid};
 use tx_subsystems::vfs::FsObjectId;
 
 pub fn render(fs_object_id: FsObjectId) -> String {
+    render_with_netns(fs_object_id, None)
+}
+
+pub fn render_with_netns(
+    fs_object_id: FsObjectId,
+    caller_netns: Option<&NetNamespacePayload>,
+) -> String {
     if let Some(pid) = pid_from_status_id(fs_object_id) {
         return render_status(pid);
     }
@@ -26,6 +36,9 @@ pub fn render(fs_object_id: FsObjectId) -> String {
     }
     if let Some(pid) = pid_from_cmdline_id(fs_object_id) {
         return render_cmdline(pid);
+    }
+    if pid_from_mounts_id(fs_object_id).is_some() {
+        return render_mounts();
     }
     if let Some(pid) = pid_from_maps_id(fs_object_id) {
         return render_maps(pid);
@@ -63,6 +76,11 @@ pub fn render(fs_object_id: FsObjectId) -> String {
         PROCFS_UPTIME_ID => render_uptime(),
         PROCFS_MEMINFO_ID => render_meminfo(),
         PROCFS_CONFIG_ID => render_config(),
+        PROCFS_FILESYSTEMS_ID => render_filesystems(),
+        PROCFS_MODULES_ID => String::new(),
+        PROCFS_DEVICES_ID => render_devices(),
+        PROCFS_CGROUPS_ID => render_cgroups(),
+        PROCFS_CMDLINE_ID => render_boot_cmdline(),
         PROCFS_SYS_KERNEL_TAINTED_ID => String::from("0\n"),
         PROCFS_SYS_KERNEL_PID_MAX_ID => String::from("4194304\n"),
         PROCFS_SYS_FS_PIPE_MAX_SIZE_ID => String::from("4096\n"),
@@ -79,19 +97,80 @@ pub fn render(fs_object_id: FsObjectId) -> String {
             super::IGMP_MAX_MSF.load(core::sync::atomic::Ordering::Relaxed)
         ),
         PROCFS_NET_IF_INET6_ID => render_if_inet6(),
-        PROCFS_NET_TX_NEIGH_ID => {
-            let netns = tx_subsystems::net::namespace::initial_net_namespace_payload();
-            tx_subsystems::net::proc_net_neigh_snapshot_text_for_namespace(&netns)
-        }
-        PROCFS_NET_ARP_ID => {
-            let netns = tx_subsystems::net::namespace::initial_net_namespace_payload();
+        PROCFS_NET_TX_NEIGH_ID => with_caller_netns(caller_netns, |netns| {
+            tx_subsystems::net::proc_net_neigh_snapshot_text_for_namespace(netns)
+        }),
+        PROCFS_NET_ARP_ID => with_caller_netns(caller_netns, |netns| {
             tx_subsystems::net::proc_net_arp_snapshot_zero_text(&netns.ether_ifaces_snapshot())
-        }
+        }),
+        PROCFS_NET_DEV_ID => with_caller_netns(caller_netns, |netns| {
+            tx_subsystems::net::proc_net_dev_snapshot_text_for_namespace(netns)
+        }),
+        PROCFS_NET_ROUTE_ID => with_caller_netns(caller_netns, |netns| {
+            tx_subsystems::net::proc_net_route_snapshot_text(netns)
+        }),
+        PROCFS_NET_NF_CONNTRACK_ID => with_caller_netns(caller_netns, |netns| {
+            tx_subsystems::net::proc_net_nf_conntrack_text_for_namespace(netns)
+        }),
+        PROCFS_NET_TCP_ID => tx_subsystems::net::proc_net_tcp_socket_table_text(
+            tx_subsystems::net::AddressFamily::Inet,
+            caller_netns,
+        ),
+        PROCFS_NET_UDP_ID => render_proc_net_udp(),
+        PROCFS_NET_SNMP_ID => render_proc_net_snmp(),
+        PROCFS_NET_NETLINK_ID => render_proc_net_netlink(),
+        super::PROCFS_NET_TX_NF_RULES_ID => with_caller_netns(caller_netns, |netns| {
+            tx_subsystems::net::proc_net_netfilter_rules_text_for_namespace(netns)
+        }),
+        PROCFS_SYS_NET_IPV4_IP_FORWARD_ID => with_caller_netns(caller_netns, |netns| {
+            if netns.ipv4_forwarding_enabled() {
+                String::from("1\n")
+            } else {
+                String::from("0\n")
+            }
+        }),
         PROCFS_SYSVIPC_MSG_ID => render_sysvipc_msg(),
         PROCFS_SYSVIPC_SEM_ID => render_sysvipc_sem(),
         PROCFS_SYSVIPC_SHM_ID => render_sysvipc_shm(),
         _ => String::new(),
     }
+}
+
+fn with_caller_netns(
+    caller_netns: Option<&NetNamespacePayload>,
+    render: impl FnOnce(&NetNamespacePayload) -> String,
+) -> String {
+    if let Some(netns) = caller_netns {
+        render(netns)
+    } else {
+        let netns = tx_subsystems::net::namespace::initial_net_namespace_payload();
+        render(&netns)
+    }
+}
+
+fn render_proc_net_udp() -> String {
+    String::from(
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n",
+    )
+}
+
+fn render_proc_net_snmp() -> String {
+    String::from(
+        "Ip: Forwarding DefaultTTL InReceives InHdrErrors InAddrErrors ForwDatagrams InUnknownProtos InDiscards InDelivers OutRequests OutDiscards OutNoRoutes ReasmTimeout ReasmReqds ReasmOKs ReasmFails FragOKs FragFails FragCreates\n\
+Ip: 2 64 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n\
+Icmp: InMsgs InErrors InCsumErrors InDestUnreachs InTimeExcds InParmProbs InSrcQuenchs InRedirects InEchos InEchoReps InTimestamps InTimestampReps InAddrMasks InAddrMaskReps OutMsgs OutErrors OutRateLimitGlobal OutRateLimitHost OutDestUnreachs OutTimeExcds OutParmProbs OutSrcQuenchs OutRedirects OutEchos OutEchoReps OutTimestamps OutTimestampReps OutAddrMasks OutAddrMaskReps\n\
+Icmp: 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n\
+Tcp: RtoAlgorithm RtoMin RtoMax MaxConn ActiveOpens PassiveOpens AttemptFails EstabResets CurrEstab InSegs OutSegs RetransSegs InErrs OutRsts InCsumErrors\n\
+Tcp: 1 200 120000 -1 0 0 0 0 0 0 0 0 0 0 0\n\
+Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors InCsumErrors IgnoredMulti MemErrors\n\
+Udp: 0 0 0 0 0 0 0 0 0\n",
+    )
+}
+
+fn render_proc_net_netlink() -> String {
+    String::from(
+        "sk               Eth Pid        Groups   Rmem     Wmem     Dump  Locks    Drops    Inode\n",
+    )
 }
 
 /// `/proc/net/if_inet6` — one line per configured IPv6 address in the root net
@@ -165,7 +244,12 @@ fn render_cmdline(pid: Pid) -> String {
 }
 
 fn render_mounts() -> String {
-    String::from("rootfs / rootfs rw 0 0\n")
+    String::from(
+        "rootfs / rootfs rw 0 0\n\
+proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n\
+sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0\n\
+devfs /dev devfs rw,nosuid 0 0\n",
+    )
 }
 
 fn render_cpuinfo() -> String {
@@ -174,12 +258,69 @@ fn render_cpuinfo() -> String {
 
 /// Monotonic-nanosecond reader registered by kernel init (mirrors the
 /// `tx_observe` TS_FN pattern: procfs is not generic over the platform,
-/// so the concrete `TimeIf::read_ns` is injected as a fn pointer).
+/// so the concrete `MonotonicCounterIf::read_ns` is injected as a fn pointer).
 /// 0 (unregistered) renders the previous static "0.00 0.00".
 static UPTIME_NS_FN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 pub fn procfs_register_uptime_clock(f: fn() -> u64) {
     UPTIME_NS_FN.store(f as usize as u64, core::sync::atomic::Ordering::Relaxed);
+}
+
+static BOOT_CMDLINE_PTR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static BOOT_CMDLINE_LEN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+pub fn procfs_register_boot_cmdline(cmdline: Option<&'static str>) {
+    if let Some(cmdline) = cmdline {
+        BOOT_CMDLINE_PTR.store(
+            cmdline.as_ptr() as usize,
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        BOOT_CMDLINE_LEN.store(cmdline.len(), core::sync::atomic::Ordering::Relaxed);
+    } else {
+        BOOT_CMDLINE_PTR.store(0, core::sync::atomic::Ordering::Relaxed);
+        BOOT_CMDLINE_LEN.store(0, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn render_boot_cmdline() -> String {
+    let ptr = BOOT_CMDLINE_PTR.load(core::sync::atomic::Ordering::Relaxed);
+    let len = BOOT_CMDLINE_LEN.load(core::sync::atomic::Ordering::Relaxed);
+    if ptr == 0 || len == 0 {
+        return String::from("\n");
+    }
+    // SAFETY: kernel init registers a `'static` boot cmdline slice.
+    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+    let mut out = String::from_utf8_lossy(bytes).into_owned();
+    out.push('\n');
+    out
+}
+
+fn render_filesystems() -> String {
+    String::from(
+        "nodev\tsysfs\n\
+nodev\tproc\n\
+nodev\tdevtmpfs\n\
+nodev\ttmpfs\n\
+nodev\tdevpts\n\
+nodev\tmqueue\n",
+    )
+}
+
+fn render_devices() -> String {
+    String::from(
+        "Character devices:\n\
+  1 mem\n\
+  4 tty\n\
+  5 /dev/tty\n\
+ 10 misc\n\
+\n\
+Block devices:\n\
+  8 sd\n",
+    )
+}
+
+fn render_cgroups() -> String {
+    String::from("#subsys_name\thierarchy\tnum_cgroups\tenabled\n")
 }
 
 fn render_uptime() -> String {

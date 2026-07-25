@@ -35,13 +35,21 @@
 //!   shape for Phase 3b's `MountIdentity::new_cap`.
 
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub mod adapter;
 
 use adapter::step_engine::{self as step_engine, ByteProgress, Cap, NoProgress, StepOutcome};
-use tx_subsystems::device::{CharDeviceBinding, CharDeviceOps, DevT};
-use tx_subsystems::execution::{Errno, Guard};
+use tx_services::time::{
+    DeadlineNs, DeviceTimerCallback, TimeError, TimerGuard, TimerRole, TimerTarget,
+};
+use tx_substrate::wake::MailboxEvent;
+use tx_substrate::wake::TaskMailbox;
+use tx_subsystems::device::{
+    CharDeviceBinding, CharDeviceOps, DevT, RtcAlarm, RtcAlarmEmulation, RtcDeviceOps,
+    RtcEventMask, RtcTime,
+};
+use tx_subsystems::execution::{Errno, Guard, WaitToken};
 use tx_subsystems::mount::MountPayload;
 use tx_subsystems::page_backed::{Frame, FsPageBacking};
 use tx_subsystems::process;
@@ -208,7 +216,13 @@ pub fn devt_for_object_id(id: FsObjectId) -> Option<DevT> {
     } else if id == DEVFS_RANDOM_OBJECT_ID {
         Some(RANDOM_CHAR_BINDING.devt)
     } else {
-        None
+        let idx = entry_index_from_object_id(id)?;
+        let entries = tty::project::devfs_alias_entries();
+        if let Some(entry) = entries.get(idx) {
+            let (major, minor) = tty::project::devt_major_minor_for_tty(&entry.tty);
+            return Some(DevT::new(major, minor));
+        }
+        static_char_entry_by_combined_index(idx).map(|binding| binding.devt)
     }
 }
 
@@ -253,15 +267,358 @@ static ZERO_CHAR_BINDING: CharDeviceBinding = CharDeviceBinding {
     ops: &ZERO_CHAR_OPS,
 };
 
+type RtcReadTimeFn = fn(&Guard<'_>) -> Result<RtcTime, tx_subsystems::device::RtcError>;
+type RtcSetTimeFn = fn(RtcTime, &Guard<'_>) -> Result<(), tx_subsystems::device::RtcError>;
+type RtcSetAlarmFn = fn(RtcAlarm, &Guard<'_>) -> Result<(), tx_subsystems::device::RtcError>;
+pub type RtcReadTimeNsFn = fn() -> Result<u64, TimeError>;
+pub type RtcSetTimeNsFn = fn(u64) -> Result<(), TimeError>;
+pub type RtcSetAlarmNsFn = fn(u64) -> Result<(), TimeError>;
+pub type RtcClearAlarmFn = fn() -> Result<(), TimeError>;
+
+pub const RTC_EVENT_READABLE: u64 = 0x1;
+
+struct RtcEventQueue {
+    queue: tx_substrate::bus::RawQueue,
+    source_id: u64,
+}
+
+struct RtcEventState {
+    queue: tx_substrate::SpinMutex<Option<RtcEventQueue>>,
+}
+
+impl RtcEventState {
+    const fn new() -> Self {
+        Self {
+            queue: tx_substrate::SpinMutex::new(None),
+        }
+    }
+
+    fn clear_readable(&self) {
+        if let Some(queue) = self.queue.lock().as_ref() {
+            queue.queue.clear(RTC_EVENT_READABLE);
+        }
+    }
+
+    fn ensure_queue(&self) -> (tx_substrate::bus::RawQueue, u64) {
+        let mut slot = self.queue.lock();
+        if slot.is_none() {
+            let queue = tx_substrate::bus::RawQueue::new();
+            let source_id = tx_subsystems::wait_source::register_wait_queue(queue.clone());
+            *slot = Some(RtcEventQueue { queue, source_id });
+        }
+        let queue = slot.as_ref().expect("rtc event queue initialized");
+        (queue.queue.clone(), queue.source_id)
+    }
+
+    #[cfg(test)]
+    fn queue_for_test(&self) -> Option<tx_substrate::bus::RawQueue> {
+        self.queue.lock().as_ref().map(|queue| queue.queue.clone())
+    }
+}
+
+static RTC_READ_TIME_FN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static RTC_SET_TIME_FN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static RTC_SET_ALARM_FN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static RTC_BACKEND_READ_TIME_NS_FN: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static RTC_BACKEND_SET_TIME_NS_FN: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static RTC_BACKEND_SET_ALARM_NS_FN: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static RTC_BACKEND_CLEAR_ALARM_FN: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static RTC_ALARM_NS: AtomicU64 = AtomicU64::new(0);
+static RTC_ALARM_ENABLED: AtomicBool = AtomicBool::new(false);
+static RTC_ALARM_PENDING: AtomicBool = AtomicBool::new(false);
+static RTC_EVENT_PENDING_BITS: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+static RTC_EVENT_COUNT: AtomicU64 = AtomicU64::new(0);
+static RTC_EVENT_STATE: RtcEventState = RtcEventState::new();
+static RTC_ALARM_TIMER_GUARD: tx_substrate::SpinMutex<Option<TimerGuard>> =
+    tx_substrate::SpinMutex::new(None);
+
+pub fn install_rtc_backend(
+    read_time_ns: RtcReadTimeNsFn,
+    set_time_ns: RtcSetTimeNsFn,
+    set_alarm_ns: RtcSetAlarmNsFn,
+    clear_alarm: RtcClearAlarmFn,
+) {
+    RTC_BACKEND_READ_TIME_NS_FN.store(read_time_ns as usize, Ordering::Release);
+    RTC_BACKEND_SET_TIME_NS_FN.store(set_time_ns as usize, Ordering::Release);
+    RTC_BACKEND_SET_ALARM_NS_FN.store(set_alarm_ns as usize, Ordering::Release);
+    RTC_BACKEND_CLEAR_ALARM_FN.store(clear_alarm as usize, Ordering::Release);
+    RTC_READ_TIME_FN.store(typed_rtc_read_time as usize, Ordering::Release);
+    RTC_SET_TIME_FN.store(typed_rtc_set_time as usize, Ordering::Release);
+    RTC_SET_ALARM_FN.store(typed_rtc_set_alarm as usize, Ordering::Release);
+}
+
+pub fn reset_rtc_backend_for_test() {
+    RTC_READ_TIME_FN.store(0, Ordering::Release);
+    RTC_SET_TIME_FN.store(0, Ordering::Release);
+    RTC_SET_ALARM_FN.store(0, Ordering::Release);
+    RTC_BACKEND_READ_TIME_NS_FN.store(0, Ordering::Release);
+    RTC_BACKEND_SET_TIME_NS_FN.store(0, Ordering::Release);
+    RTC_BACKEND_SET_ALARM_NS_FN.store(0, Ordering::Release);
+    RTC_BACKEND_CLEAR_ALARM_FN.store(0, Ordering::Release);
+    RTC_ALARM_NS.store(0, Ordering::Release);
+    RTC_ALARM_ENABLED.store(false, Ordering::Release);
+    RTC_ALARM_PENDING.store(false, Ordering::Release);
+    RTC_EVENT_PENDING_BITS.store(0, Ordering::Release);
+    RTC_EVENT_COUNT.store(0, Ordering::Release);
+    RTC_ALARM_TIMER_GUARD.lock().take();
+    RTC_EVENT_STATE.clear_readable();
+}
+
+pub fn rtc_event_wait_token() -> WaitToken {
+    WaitToken::new(rtc_event_source_id(), RTC_EVENT_READABLE)
+}
+
+fn ensure_rtc_event_queue() -> (tx_substrate::bus::RawQueue, u64) {
+    RTC_EVENT_STATE.ensure_queue()
+}
+
+pub fn rtc_event_source_id() -> u64 {
+    ensure_rtc_event_queue().1
+}
+
+#[cfg(test)]
+pub(crate) fn rtc_event_queue_for_test() -> Option<tx_substrate::bus::RawQueue> {
+    RTC_EVENT_STATE.queue_for_test()
+}
+
+fn record_rtc_event(mask: RtcEventMask) {
+    RTC_EVENT_PENDING_BITS.fetch_or(mask.bits(), Ordering::AcqRel);
+    RTC_EVENT_COUNT.fetch_add(1, Ordering::AcqRel);
+    if mask.contains(RtcEventMask::ALARM) {
+        RTC_ALARM_PENDING.store(true, Ordering::Release);
+    }
+}
+
+pub fn publish_rtc_event_with_post<F>(mask: RtcEventMask, post: F)
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
+    if mask.is_empty() {
+        return;
+    }
+    let mut post = post;
+    record_rtc_event(mask);
+    let (queue, _) = ensure_rtc_event_queue();
+    queue.fire_with_post(RTC_EVENT_READABLE, |mailbox, event| post(mailbox, event));
+}
+
+fn typed_rtc_read_time(_guard: &Guard<'_>) -> Result<RtcTime, tx_subsystems::device::RtcError> {
+    let ptr = RTC_BACKEND_READ_TIME_NS_FN.load(Ordering::Acquire);
+    if ptr == 0 {
+        return Err(tx_subsystems::device::RtcError::Unsupported);
+    }
+    let read_time_ns: RtcReadTimeNsFn = unsafe { core::mem::transmute(ptr) };
+    let ns = read_time_ns().map_err(rtc_error_from_time)?;
+    RtcTime::from_unix_ns(ns)
+}
+
+fn typed_rtc_set_time(
+    time: RtcTime,
+    _guard: &Guard<'_>,
+) -> Result<(), tx_subsystems::device::RtcError> {
+    let ptr = RTC_BACKEND_SET_TIME_NS_FN.load(Ordering::Acquire);
+    if ptr == 0 {
+        return Err(tx_subsystems::device::RtcError::Unsupported);
+    }
+    let set_time_ns: RtcSetTimeNsFn = unsafe { core::mem::transmute(ptr) };
+    let ns = time.to_unix_ns()?;
+    set_time_ns(ns).map_err(rtc_error_from_time)
+}
+
+fn typed_rtc_set_alarm(
+    alarm: RtcAlarm,
+    _guard: &Guard<'_>,
+) -> Result<(), tx_subsystems::device::RtcError> {
+    let ns = alarm.time.to_unix_ns()?;
+    if alarm.enabled {
+        let ptr = RTC_BACKEND_SET_ALARM_NS_FN.load(Ordering::Acquire);
+        if ptr == 0 {
+            return Err(tx_subsystems::device::RtcError::Unsupported);
+        }
+        let set_alarm_ns: RtcSetAlarmNsFn = unsafe { core::mem::transmute(ptr) };
+        set_alarm_ns(ns).map_err(rtc_error_from_time)?;
+    } else {
+        let ptr = RTC_BACKEND_CLEAR_ALARM_FN.load(Ordering::Acquire);
+        if ptr == 0 {
+            return Err(tx_subsystems::device::RtcError::Unsupported);
+        }
+        let clear_alarm: RtcClearAlarmFn = unsafe { core::mem::transmute(ptr) };
+        clear_alarm().map_err(rtc_error_from_time)?;
+    }
+    RTC_ALARM_NS.store(ns, Ordering::Release);
+    RTC_ALARM_ENABLED.store(alarm.enabled, Ordering::Release);
+    RTC_ALARM_PENDING.store(alarm.pending, Ordering::Release);
+    Ok(())
+}
+
+fn rtc_error_from_time(error: TimeError) -> tx_subsystems::device::RtcError {
+    match error {
+        TimeError::Unsupported | TimeError::Unavailable => {
+            tx_subsystems::device::RtcError::Unsupported
+        }
+        TimeError::Invalid => tx_subsystems::device::RtcError::InvalidTime,
+        TimeError::Range => tx_subsystems::device::RtcError::Range,
+        TimeError::Hardware => tx_subsystems::device::RtcError::Hardware,
+    }
+}
+
+fn publish_rtc_alarm_event_from_timer(_payload: u64) {
+    record_rtc_event(RtcEventMask::ALARM);
+}
+
+fn install_emulated_rtc_alarm(
+    alarm: RtcAlarm,
+    emulation: Option<RtcAlarmEmulation<'_>>,
+) -> Result<(), tx_subsystems::device::RtcError> {
+    let ns = alarm.time.to_unix_ns()?;
+    RTC_ALARM_NS.store(ns, Ordering::Release);
+    RTC_ALARM_ENABLED.store(alarm.enabled, Ordering::Release);
+    RTC_ALARM_PENDING.store(alarm.pending, Ordering::Release);
+
+    let mut guard_slot = RTC_ALARM_TIMER_GUARD.lock();
+    guard_slot.take();
+    if alarm.enabled {
+        let emulation = emulation.ok_or(tx_subsystems::device::RtcError::Unsupported)?;
+        let (event_queue, _) = ensure_rtc_event_queue();
+        let guard = emulation
+            .registrar
+            .register_deadline(
+                DeadlineNs::new(emulation.monotonic_deadline_ns),
+                TimerRole::RtcAlarm,
+                TimerTarget::DeviceCallback(
+                    DeviceTimerCallback::new(publish_rtc_alarm_event_from_timer, 0)
+                        .with_raw_queue_wake(event_queue, RTC_EVENT_READABLE),
+                ),
+            )
+            .map_err(|_| tx_subsystems::device::RtcError::Unsupported)?;
+        *guard_slot = Some(guard);
+    }
+    Ok(())
+}
+
 struct RtcCharOps;
 
 impl CharDeviceOps for RtcCharOps {
-    fn read(&self, _out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
-        StepOutcome::done(0)
+    fn read(&self, out: &mut [u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
+        const RTC_IRQF: u64 = 0x80;
+        const RTC_UF: u64 = 0x10;
+        const RTC_AF: u64 = 0x20;
+        const RTC_READ_RECORD_BYTES: usize = core::mem::size_of::<u64>();
+
+        if out.len() < RTC_READ_RECORD_BYTES {
+            return StepOutcome::err(Errno::EINVAL.into());
+        }
+
+        let bits = RTC_EVENT_PENDING_BITS.swap(0, Ordering::AcqRel);
+        let mask = RtcEventMask::from_bits_truncate(bits);
+        if mask.is_empty() {
+            return StepOutcome::err(Errno::EAGAIN.into());
+        }
+
+        let count = RTC_EVENT_COUNT.swap(0, Ordering::AcqRel).max(1);
+        let mut record = (count << 8) | RTC_IRQF;
+        if mask.contains(RtcEventMask::UPDATE) {
+            record |= RTC_UF;
+        }
+        if mask.contains(RtcEventMask::ALARM) {
+            record |= RTC_AF;
+            RTC_ALARM_PENDING.store(false, Ordering::Release);
+        }
+        out[..RTC_READ_RECORD_BYTES].copy_from_slice(&record.to_ne_bytes());
+        if RTC_EVENT_PENDING_BITS.load(Ordering::Acquire) == 0 {
+            RTC_EVENT_STATE.clear_readable();
+        }
+        StepOutcome::done(RTC_READ_RECORD_BYTES)
     }
 
     fn write(&self, _bytes: &[u8], _guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress> {
         StepOutcome::err(Errno::EINVAL.into())
+    }
+
+    fn rtc_ops(&self) -> Option<&dyn RtcDeviceOps> {
+        Some(self)
+    }
+}
+
+impl RtcDeviceOps for RtcCharOps {
+    fn read_time(&self, guard: &Guard<'_>) -> Result<RtcTime, tx_subsystems::device::RtcError> {
+        let ptr = RTC_READ_TIME_FN.load(Ordering::Acquire);
+        if ptr == 0 {
+            return Err(tx_subsystems::device::RtcError::Unsupported);
+        }
+        let read_time: RtcReadTimeFn = unsafe { core::mem::transmute(ptr) };
+        read_time(guard)
+    }
+
+    fn set_time(
+        &self,
+        time: RtcTime,
+        guard: &Guard<'_>,
+    ) -> Result<(), tx_subsystems::device::RtcError> {
+        let ptr = RTC_SET_TIME_FN.load(Ordering::Acquire);
+        if ptr == 0 {
+            return Err(tx_subsystems::device::RtcError::Unsupported);
+        }
+        let set_time: RtcSetTimeFn = unsafe { core::mem::transmute(ptr) };
+        set_time(time, guard)
+    }
+
+    fn read_alarm(&self, _guard: &Guard<'_>) -> Result<RtcAlarm, tx_subsystems::device::RtcError> {
+        if RTC_SET_ALARM_FN.load(Ordering::Acquire) == 0 {
+            return Err(tx_subsystems::device::RtcError::Unsupported);
+        }
+        let ns = RTC_ALARM_NS.load(Ordering::Acquire);
+        let time = RtcTime::from_unix_ns(ns)?;
+        Ok(RtcAlarm {
+            time,
+            enabled: RTC_ALARM_ENABLED.load(Ordering::Acquire),
+            pending: RTC_ALARM_PENDING.load(Ordering::Acquire),
+        })
+    }
+
+    fn set_alarm(
+        &self,
+        alarm: RtcAlarm,
+        guard: &Guard<'_>,
+    ) -> Result<(), tx_subsystems::device::RtcError> {
+        let ptr = RTC_SET_ALARM_FN.load(Ordering::Acquire);
+        if ptr == 0 {
+            return Err(tx_subsystems::device::RtcError::Unsupported);
+        }
+        let set_alarm: RtcSetAlarmFn = unsafe { core::mem::transmute(ptr) };
+        set_alarm(alarm, guard)
+    }
+
+    fn set_alarm_with_emulation(
+        &self,
+        alarm: RtcAlarm,
+        guard: &Guard<'_>,
+        emulation: Option<RtcAlarmEmulation<'_>>,
+    ) -> Result<(), tx_subsystems::device::RtcError> {
+        match self.set_alarm(alarm, guard) {
+            Ok(()) => {
+                RTC_ALARM_TIMER_GUARD.lock().take();
+                Ok(())
+            }
+            Err(tx_subsystems::device::RtcError::Unsupported) => {
+                install_emulated_rtc_alarm(alarm, emulation)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn poll_events(
+        &self,
+        _guard: &Guard<'_>,
+    ) -> Result<RtcEventMask, tx_subsystems::device::RtcError> {
+        Ok(RtcEventMask::from_bits_truncate(
+            RTC_EVENT_PENDING_BITS.load(Ordering::Acquire),
+        ))
     }
 }
 
@@ -1028,7 +1385,7 @@ impl FsOps for Devfs {
         }
     }
 
-    fn step_chmod(
+    fn chmod_inode(
         &self,
         _fs_object_id: FsObjectId,
         _new_mode: u16,
@@ -1040,7 +1397,7 @@ impl FsOps for Devfs {
         StepOutcome::err(Errno::EROFS.into())
     }
 
-    fn step_chown(
+    fn chown_inode(
         &self,
         _fs_object_id: FsObjectId,
         _new_uid: Option<u32>,
@@ -1081,13 +1438,17 @@ impl FsPageBacking for Devfs {
         _new_size: u64,
         _guard: &Guard<'_>,
     ) -> StepOutcome<(), NoProgress> {
-        // `/dev/null` is the bit bucket: truncation is a no-op, matching
-        // Linux where O_TRUNC on a character device is silently ignored.
-        // netserver does `fopen("/dev/null","w")` (O_WRONLY|O_CREAT|O_TRUNC);
-        // returning ENOSYS here made that open fail and broke every netperf
-        // test. Scoped to the null device so other devfs nodes keep ENOSYS.
-        if fs_object_id == DEVFS_NULL_OBJECT_ID {
-            return StepOutcome::done(());
+        // Linux treats O_TRUNC on character devices as a no-op. Devfs only
+        // page-backs projection metadata, so no device content changes here.
+        match <Self as FsOps>::load_inode_meta(self, fs_object_id, _guard) {
+            StepOutcome::Done(meta) if meta.kind() == InodeKind::CharDevice => {
+                return StepOutcome::done(());
+            }
+            StepOutcome::Done(_) => {}
+            StepOutcome::Err(errno) => return StepOutcome::Err(errno),
+            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } => {
+                return StepOutcome::err(Errno::EIO.into());
+            }
         }
         StepOutcome::err(Errno::ENOSYS.into())
     }

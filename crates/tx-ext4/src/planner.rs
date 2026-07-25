@@ -6,8 +6,9 @@ use alloc::vec;
 
 use tx_subsystems::execution::{Errno, Guard};
 use tx_subsystems::fs_iface::{
-    BackendBioGraph, BackendPageCompletion, BackendPageRequest, BackendPlan, BackendPlanner, BioPlanList,
-    IoDataSource, IoDataTarget, PageCompletion, PageCompletionList, PageFrameRef, PagerResumeToken,
+    BackendBioGraph, BackendPageCompletion, BackendPageRequest, BackendPlan, BackendPlanner,
+    BioPlanList, IoDataSource, IoDataTarget, PageCompletion, PageCompletionList, PageFrameRef,
+    PagerResumeToken,
 };
 use tx_subsystems::io_manager::block::{BioPlan, BioVec, BlockFlags, BlockOp, DeviceKey, LbaRange};
 
@@ -941,7 +942,10 @@ mod tests {
         let mut request = request(IoDataTarget::None);
         request.op = tx_subsystems::io_manager::page::PageIoOp::Checkpoint;
 
-        assert_eq!(planner.plan_page_io(request), BackendPlan::Err(Errno::ENOSYS));
+        assert_eq!(
+            planner.plan_page_io(request),
+            BackendPlan::Err(Errno::ENOSYS)
+        );
     }
 
     #[test]
