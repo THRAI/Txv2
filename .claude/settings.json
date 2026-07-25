@@ -16,7 +16,8 @@
   "permissions": {
     "allow": [
       "Bash(readelf *)",
-      "Bash(fc-list *)"
+      "Bash(fc-list *)",
+      "mcp__codegraph__*"
     ]
   }
 }
