@@ -63,6 +63,18 @@ and Zone/slab owners.
 The canonical contract is
 [`MEMORY_IO_ARCHITECTURE_v1.md`](../../design/03_memory-vm/MEMORY_IO_ARCHITECTURE_v1.md).
 
+## Current implementation readiness addendum
+
+The architecture decision is unchanged, but the 2026-07-25 current-checkout
+audit is **Ready: no**. ext4/PageBacked is a staged implementation, not an
+implementation of the complete plan. Five correctness/durability gates precede
+performance work: canonical ext4 file-PC identity and runtime retirement;
+generation-consistent clean reclaim with `PageSlot` as sole dirty authority;
+journal reservation release on every pre-commit abort/error; a multi-page
+fsync-frontier transaction; and atomic namespace mutation through the admitted
+JBD2 graph. See §8 of the canonical contract and
+[`2026-07-25-memory-io-ext4-implementation-readiness.md`](../research/2026-07-25-memory-io-ext4-implementation-readiness.md).
+
 ## Rejected alternatives
 
 - **One VM BufferManager owning allocator and caches:** rejected because it
@@ -92,19 +104,21 @@ The canonical contract is
   execution and preserves the existing `BackendBioGraph` as the sole execution
   DAG. Current `FsPageBacking`, `PageIoPlan`, `BackendPlan`, and `BioPlan` names
   are compatibility vocabulary, not a second target interface family.
-- The first implementation gate is dirty-authority unification and canonical
-  PageContainer identity, followed by multi-page lease/planner extraction and
-  clean-only pressure coordination.
+- The first implementation gate is canonical PageContainer identity plus
+  reclaim/`PageSlot` coherence. Journal abort cleanup, multi-page frontier
+  transactions, and namespace JBD2 atomicity follow before multi-page lease,
+  pure-pager, pressure-coordinator, or performance-policy work.
 - Performance targets are product milestones rather than algorithm contracts:
   first <= 9000 seconds, then <= 7200 seconds on the fixed one-CPU/4-GiB clean
   build witness, with attribution and copy/write-amplification counters.
 
 ## Verification and next step
 
-This decision changes documentation only. `cargo xtask lint docs` passed, with
-the 7 existing active-doc warnings that intentionally discuss retired
-vocabulary. `cargo xtask progress validate` passed for 37 records, and `git
-diff --check` passed. The next step is an implementation-readiness audit and a
-staged plan beginning with `PageSlot` dirty authority and static ratchets. The
-one-CPU, 4-GiB clean-build witness remains blocked on a current complete Tx
-trace and baseline artifact.
+This decision and its readiness addendum change documentation only. The
+original architecture edit passed `cargo xtask lint docs`, `cargo xtask
+progress validate`, and `git diff --check`; current addendum verification is
+recorded in `docs/progress/STATUS.md`. The next implementation entry is P0-A
+and P0-B: canonical file-PC lifecycle plus generation-consistent reclaim with
+`PageSlot` as sole authority. The one-CPU, 4-GiB clean-build witness remains
+blocked on both those correctness gates and a current complete Tx trace and
+baseline artifact.

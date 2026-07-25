@@ -4,6 +4,12 @@
 
 **Status.** v1 (2026-07-25). Canonical cross-layer architecture contract.
 
+**Current implementation readiness.** **Ready: no.** The architecture is the
+target contract; the current ext4/PageBacked integration is a staged
+implementation with Phase 0 correctness and durability blockers listed in
+§8. Passing existing component unit tests does not mean this complete plan is
+implemented.
+
 **Purpose.** Define the joint architecture for file-backed memory, physical
 frame pressure, filesystem layout and transaction planning, and block-I/O
 execution. This document freezes the cross-layer ownership and dependency
@@ -746,6 +752,30 @@ PageBacked segments and lower the layout plan into the Tx I/O graph.
 The current checkout contains useful foundations but does not yet implement
 this complete contract.
 
+### 8.1 Phase 0 implementation blockers
+
+<!-- txdoc:MEMORY-IO-PHASE-0-BLOCKERS-1 -->
+
+These are correctness, lifetime, forward-progress, or durability blockers.
+They precede pure-pager extraction, pressure-policy tuning, and all clean-build
+performance claims.
+
+| ID | Current checkout witness | Why it blocks | Required exit gate |
+|---|---|---|---|
+| P0-A canonical file-PC identity and lifetime | ext4 materialization creates a fresh `PageContainer::new_cap()` for every RNode, bypasses `new_file_cap()` reclaim registration, then the device runtime registry retains a strong PC without a production retire path | one `(mount, fs_object_id)` may have multiple cache/I/O identities and runtime retention can make memory grow across a large build | mount-scoped find-or-create publishes one `Weak<PageContainer>` per object; all ext4 materialization uses it; service registration is idempotent and has an explicit retire path; duplicate-materialization/lifetime tests pass |
+| P0-B reclaim and `PageSlot` coherence | clean sweep removes only the resident-index entry while the corresponding slot can remain `Resident`; dirty/writeback is also duplicated in replacement marks and `PageSlot` | a refetch can be submitted against a stale `Resident` generation and later fail `complete_fetch` with `NotFetching`; marks cannot safely back a provider claim | one owner transition atomically revalidates generation/pins/dirty state, withdraws resident binding, and moves the slot to the nonresident state; `PageSlot` becomes sole dirty authority; clean-reclaim-then-refetch and race tests pass |
+| P0-C journal abort cleanup | data/commit error discards the active transaction, but the ring reservation is taken and completed only after successful checkpoint | the journal ring can retain an active reservation forever and every later mutation receives `Busy` | every pre-commit error/cancellation releases or explicitly aborts transaction leases and ring reservation exactly once; error-then-next-transaction reuse test passes |
+| P0-D multi-page fsync transaction | PageBacked admits dirty frontier pages as separate one-page writebacks; ext4 accepts only `page_count == 1`; the mount journal has one active transaction slot | the first page can occupy the transaction until fsync commit while a later page receives `Busy`, so an ordinary file larger than one page lacks a forward-progress proof | one frontier transaction admits and aggregates all selected page generations, or an equivalent serialized protocol proves progress without losing the frontier; multi-page file fsync, redirty, cancellation, and error tests pass |
+| P0-E namespace JBD2 atomicity | create/unlink/rename still call the mount-global compatibility pager; rename performs destination removal, new-entry insertion, and old-entry removal as separate home mutations | Cargo/rustc namespace operations are neither one atomic ext4 transaction nor on the sole BIO/JBD2 graph path | supported namespace mutations produce one admitted JBD2 graph with rollback/abort ownership; rename power-cut and replay tests prove old-or-new atomic visibility |
+
+P0-A through P0-E are hard gates. A benchmark result obtained while any of
+them remains open may diagnose the staged implementation, but cannot validate
+this architecture or satisfy an ext4 production-readiness claim.
+
+### 8.2 Other current migration seams
+
+<!-- txdoc:MEMORY-IO-OTHER-SEAMS-1 -->
+
 | Current shape | Architectural issue | Target |
 |---|---|---|
 | `PageContainerState` combines resident index, PageSlot table, in-flight fetch, leases, fsync, block runtime and range reservations | one coarse ownership/lock domain | split resident, slot, page-I/O, range and block-runtime owners |
@@ -753,10 +783,11 @@ this complete contract.
 | global weak PageContainer registry and fixed clean sweep | no fairness, persistent cursor or actual-free feedback | ReclaimProvider plus policy/coordinator |
 | only selected callers use `reserve_frame_with_reclaim` | not an allocator-wide slow path | AllocationGateway for managed allocation classes |
 | ext4 compatibility pager uses one mutable pager cell | layout reads share allocation/I/O serialization | immutable snapshots plus short mutation admission |
-| `SealedDataWrite` embeds a 4-KiB payload | ordinary file payload copy | opaque lease slice/key in `FileIoPlan<K>` |
+| `SealedDataWrite` is a copy-capable legacy DTO with an embedded 4-KiB field; the current main writeback planner fills it with a zero placeholder and later binds the retained L4 `IoDataSource` | the type still permits payload copying and cannot express the target opaque lease slice, but the placeholder alone is not evidence of a current normal-path payload copy | opaque lease slice/key in `FileIoPlan<K>`; count copies from measured execution, not DTO capacity |
 | metadata/JBD2 staging uses private pages | stable after-image exists but may be copied twice | FrozenMetadataLease plus explicit encoding-copy accounting |
 | existing `BackendBioGraph`, source/target lease values, and adjacent LBA merge | correct execution foundation | extend in place; do not replace |
 | direct I/O retains user pages with `DmaPin` | correct direct lifetime foundation | preserve as distinct lease variant |
+| no `MemoryPressureCoordinator`, `MemoryPolicy`, `ReclaimProvider`, or allocator-wide `AllocationGateway` is production-reachable | fixed low-watermark clean sweep and one retry cannot prove 4-GiB/no-swap progress | land the control plane only after P0-B makes owner reclaim correct |
 
 The target removes neither compatibility code nor physical modules in one
 step. Each migration phase keeps one authoritative path and a static gate that
@@ -772,13 +803,26 @@ prevents the retired parallel path from remaining production-reachable.
 
 <!-- txdoc:MEMORY-IO-IMPLEMENTATION-FOUNDATION-1 -->
 
-1. Make `PageSlot` the sole dirty/writeback/redirty/completion authority.
-2. Establish canonical `(mount, fs_object_id) -> Weak<PageContainer>` file
-   identity and eliminate duplicate file PCs.
-3. Separate PageContainer resident, slot, page-I/O, range, and block-runtime
+1. Establish canonical `(mount, fs_object_id) -> Weak<PageContainer>` file
+   identity, route ext4 materialization through it, and give file-I/O runtime
+   registration an explicit retire protocol.
+2. Make `PageSlot` the sole dirty/writeback/redirty/completion authority and
+   replace clean index-only removal with a generation-checked owner withdrawal
+   transition. Prove clean-reclaim-then-refetch before registering a provider.
+3. Close journal pre-commit abort/error cleanup so transaction capabilities and
+   ring reservations are released exactly once and the next transaction can
+   reserve space.
+4. Replace per-page transaction admission with one multi-page fsync-frontier
+   transaction, or an equivalently proved serialized protocol.
+5. Route supported create/unlink/rename mutations through one admitted JBD2
+   graph; prove rename old-or-new visibility across crash/replay.
+6. Separate PageContainer resident, slot, page-I/O, range, and block-runtime
    state behind owner-specific handles.
-4. Add static ratchets for forbidden `FrameMeta` dirty/io-locked use and
+7. Add static ratchets for forbidden `FrameMeta` dirty/io-locked use and
    parallel graph/lease vocabularies.
+
+Steps 1-5 are Phase 0 blockers. Do not begin performance-policy tuning or claim
+ext4 implementation readiness before their focused gates pass.
 
 ### 9.2 Data-plane lane
 
@@ -788,7 +832,8 @@ prevents the retired parallel path from remaining production-reachable.
    multi-page `PageDataLease` without changing current callers all at once.
 2. Define pure pager request/`FileIoPlan<K>` value types and place the
    compatibility adapter at the boundary.
-3. Replace ordinary `SealedDataWrite.bytes` with opaque retained lease slices.
+3. Replace the copy-capable `SealedDataWrite.bytes` legacy field/placeholder
+   with opaque retained lease slices.
 4. Extend the existing `BackendBioGraph` with lease slices, barrier domains,
    typed completion, and validation; retain adjacent compatible LBA merging.
 5. Move block queue/runtime state out of PageContainer into the I/O manager.
@@ -805,8 +850,8 @@ prevents the retired parallel path from remaining production-reachable.
 
 1. Add allocator pressure snapshots and allocation-class diagnostics without
    changing allocator ownership.
-2. Introduce `AllocationGateway`, coordinator episode/progress state, and
-   clean file-page `ReclaimProvider`.
+2. After P0-B passes, introduce `AllocationGateway`, coordinator
+   episode/progress state, and clean file-page `ReclaimProvider`.
 3. Replace the global weak-registry sweep with bounded persistent cursors,
    second chance, fairness, and actual-free feedback.
 4. Add background reclaim with one-CPU work budgets and hysteretic watermarks.
@@ -901,6 +946,10 @@ per-page high-volume tracing is enabled only for a focused window.
 
 ### 11.1 Page and reclaim gates
 
+- two materializations of the same `(mount, fs_object_id)` resolve to one
+  canonical PC, and final object retirement unregisters its I/O runtime;
+- clean resident reclaim followed by a read/fault starts a new fetch generation
+  and installs the page without `NotFetching`;
 - dirty -> writeback -> clean and redirty-during-writeback state tests;
 - stale completion and stale reclaim-claim rejection;
 - reclaim versus read/fault/truncate/direct-I/O races;
@@ -923,6 +972,12 @@ per-page high-volume tracing is enabled only for a focused window.
 
 ### 11.3 ext4 durability gates
 
+- data/commit I/O error releases the pre-commit journal reservation and the
+  next transaction reuses the ring;
+- an fsync frontier spanning multiple dirty pages completes as one transaction
+  unit, including redirty and error paths;
+- create/unlink/rename use the admitted JBD2 graph, and rename crash cuts replay
+  to either the complete old name or the complete new name;
 - immutable metadata generation and COW tests;
 - abort before commit and checkpoint after durable commit tests;
 - ordered data-before-commit dependency proof;

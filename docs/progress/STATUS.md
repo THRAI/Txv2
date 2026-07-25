@@ -1,3 +1,29 @@
+- 2026-07-25 (memory/I-O ext4 implementation-readiness correction).
+  Re-audited the canonical dual-plane plan against the current ext4,
+  PageBacked, journal, namespace, and I/O-manager callsites. The architecture
+  remains the target, but current implementation readiness is now explicitly
+  `Ready: no`. Added hard Phase 0 gates for canonical ext4 file-PC identity and
+  runtime retirement, generation-consistent clean reclaim with `PageSlot` as
+  sole dirty authority, journal abort/ring-reservation cleanup, multi-page
+  fsync-frontier transactions, and namespace mutation through one admitted
+  JBD2 graph. Reordered implementation work so these gates precede multi-page
+  lease/pure-pager extraction, pressure coordination, and performance policy.
+  Corrected `SealedDataWrite` wording: it is a copy-capable legacy DTO whose
+  main writeback use is currently a zero placeholder replaced by retained L4
+  `IoDataSource`, not evidence by itself of a normal-path 4-KiB payload copy.
+  No Rust source changed. Verification: `cargo xtask lint docs` passed with the
+  7 existing retired-vocabulary discussion warnings; `cargo xtask progress
+  validate` passed for 37 records; `git diff --check`, scoped placeholder,
+  duplicate-`txdoc`, and blocker-presence scans passed. The review input reports
+  31 tx-ext4 and 147 focused PageBacked tests passing; this documentation pass
+  did not rerun them, and they lack clean-reclaim-refetch, multi-page fsync,
+  error-then-reservation-reuse, and namespace crash-consistency coverage. Next:
+  implement P0-A/P0-B together as the first reviewable correctness slice.
+  Blockers: P0-A through P0-E remain open, and the one-CPU/4-GiB clean-build
+  witness still lacks a current complete Tx trace/baseline artifact. See
+  `docs/design/03_memory-vm/MEMORY_IO_ARCHITECTURE_v1.md` and
+  `docs/progress/research/2026-07-25-memory-io-ext4-implementation-readiness.md`.
+
 - 2026-07-25 (dual-plane architecture aligned with I/O manager).
   Aligned `IO_MANAGER_v1.md` with the canonical memory/file-I/O architecture.
   The memory-pressure coordinator now sends only bounded owner/domain intent to

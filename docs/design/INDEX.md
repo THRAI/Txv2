@@ -74,7 +74,7 @@ How work runs: the step primitive and the runtime that drives it.
 
 <!-- txdoc:INDEX-MEMORY-VM-1 -->
 
-- [`MEMORY_IO_ARCHITECTURE_v1.md`](03_memory-vm/MEMORY_IO_ARCHITECTURE_v1.md) — canonical dual-plane contract for PageBacked file data, pure filesystem layout planning, the existing BIO DAG, global memory pressure, reclaim providers, allocation slow paths, and zero-copy payload I/O.
+- [`MEMORY_IO_ARCHITECTURE_v1.md`](03_memory-vm/MEMORY_IO_ARCHITECTURE_v1.md) — canonical target dual-plane contract for PageBacked file data, pure filesystem layout planning, the existing BIO DAG, global memory pressure, reclaim providers, allocation slow paths, and zero-copy payload I/O; current ext4/PageBacked implementation readiness is `Ready: no`.
 - [`PAGE_BACKED_v1.md`](03_memory-vm/PAGE_BACKED_v1.md) — `PageContainer`, three-variant `RNodeBacking`; unifies files, tmpfs, shm, memfd, anon mmap, MMIO devices.
 - [`VM_v1_2.md`](03_memory-vm/VM_v1_2.md) — `AddressSpace`, `VmEntry`, recipes BTree, `RangeLock`, scripts for mmap/munmap/mprotect/mremap/fault/fork/exec.
 - [`VDSO_TIME_ABI_v1.md`](03_memory-vm/VDSO_TIME_ABI_v1.md) — vDSO time ABI, VVAR publication, special VM mapping, exec auxv, libc fallback, and signal restorer contract.
