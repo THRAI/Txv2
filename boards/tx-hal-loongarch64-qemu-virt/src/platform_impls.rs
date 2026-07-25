@@ -561,6 +561,7 @@ impl FpSimdIf for Platform {
 impl IrqIf for Platform {
     const MAX_IRQ: u32 = QEMU_LA64_GSI_BASE + QEMU_LA64_PCH_PIC_IRQS;
     const UART_IRQ: u32 = QEMU_LA64_UART0_IRQ;
+    const RTC_IRQ: u32 = QEMU_LA64_RTC_IRQ;
 
     fn in_irq_context() -> bool {
         la64_irq_context_depth() != 0
@@ -568,6 +569,10 @@ impl IrqIf for Platform {
 
     fn interrupts_enabled() -> bool {
         read_la64_csr(LA64_CSR_CRMD) & LA64_CRMD_IE != 0
+    }
+
+    fn exclude_local_execution() -> LocalExecutionGuard {
+        exclude_la64_interrupts()
     }
 
     fn claim() -> u32 {
@@ -606,11 +611,56 @@ impl IrqIf for Platform {
         handler(irq)
     }
 }
-impl TimeIf for Platform {
+
+fn exclude_la64_interrupts() -> LocalExecutionGuard {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let mut saved = 0usize;
+        let mask = LA64_CRMD_IE;
+        unsafe {
+            core::arch::asm!(
+                "csrxchg {saved}, {mask}, 0x00",
+                saved = inout(reg) saved,
+                mask = in(reg) mask,
+                options(nostack)
+            );
+            LocalExecutionGuard::new(saved & LA64_CRMD_IE, restore_la64_interrupts)
+        }
+    }
+
+    #[cfg(not(target_arch = "loongarch64"))]
+    unsafe {
+        LocalExecutionGuard::new(0, restore_la64_interrupts)
+    }
+}
+
+unsafe fn restore_la64_interrupts(saved: usize) {
+    #[cfg(target_arch = "loongarch64")]
+    unsafe {
+        let restored = saved & LA64_CRMD_IE;
+        let mask = LA64_CRMD_IE;
+        core::arch::asm!(
+            "csrxchg {restored}, {mask}, 0x00",
+            restored = inout(reg) restored => _,
+            mask = in(reg) mask,
+            options(nostack)
+        );
+    }
+
+    #[cfg(not(target_arch = "loongarch64"))]
+    let _ = saved;
+}
+impl MonotonicCounterIf for Platform {
     fn read_ns() -> u64 {
         tx_hal::time::ticks_to_ns(la64_read_stable_counter(), Self::frequency_hz())
     }
 
+    fn frequency_hz() -> u64 {
+        la64_timebase_frequency_hz()
+    }
+}
+
+impl DeadlineTimerIf for Platform {
     fn set_deadline_ns(deadline: u64) {
         let frequency_hz = Self::frequency_hz();
         if frequency_hz == 0 {
@@ -641,11 +691,86 @@ impl TimeIf for Platform {
         let crmd = read_la64_csr(LA64_CSR_CRMD) | LA64_CRMD_IE;
         write_la64_csr(LA64_CSR_CRMD, crmd);
     }
+}
 
-    fn frequency_hz() -> u64 {
-        la64_timebase_frequency_hz()
+fn ls7a_rtc_ensure_toy_enabled() {
+    let ctrl = ls7a_rtc_read_u32(LS7A_RTC_CTRL);
+    let required = LS7A_RTC_CTRL_EO | LS7A_RTC_CTRL_TOYEN;
+    if ctrl & required != required {
+        ls7a_rtc_write_u32(LS7A_RTC_CTRL, ctrl | required);
     }
 }
+
+#[cfg(target_arch = "loongarch64")]
+fn ls7a_rtc_read_u32(offset: usize) -> u32 {
+    unsafe { ((la64_uncached_virt(QEMU_LA64_RTC_BASE) + offset) as *const u32).read_volatile() }
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn ls7a_rtc_write_u32(offset: usize, value: u32) {
+    unsafe { ((la64_uncached_virt(QEMU_LA64_RTC_BASE) + offset) as *mut u32).write_volatile(value) }
+}
+
+#[cfg(all(not(target_arch = "loongarch64"), not(test)))]
+fn ls7a_rtc_read_u32(_offset: usize) -> u32 {
+    0
+}
+
+#[cfg(all(not(target_arch = "loongarch64"), not(test)))]
+fn ls7a_rtc_write_u32(_offset: usize, _value: u32) {}
+
+#[cfg(all(not(target_arch = "loongarch64"), test))]
+fn ls7a_rtc_read_u32(offset: usize) -> u32 {
+    LA64_HOST_LS7A_RTC_STATE
+        .lock()
+        .expect("host ls7a rtc state")
+        .read_u32(offset)
+}
+
+#[cfg(all(not(target_arch = "loongarch64"), test))]
+fn ls7a_rtc_write_u32(offset: usize, value: u32) {
+    LA64_HOST_LS7A_RTC_STATE
+        .lock()
+        .expect("host ls7a rtc state")
+        .write_u32(offset, value);
+}
+
+impl PersistentClockIf for Platform {
+    fn read_realtime_ns() -> Result<u64, PersistentClockError> {
+        ls7a_rtc_ensure_toy_enabled();
+        let toy0 = ls7a_rtc_read_u32(LS7A_RTC_TOYREAD0);
+        let toy1 = ls7a_rtc_read_u32(LS7A_RTC_TOYREAD1);
+        ls7a_unix_ns_from_toy_registers(toy0, toy1)
+    }
+
+    fn set_realtime_ns(ns: u64) -> Result<(), PersistentClockError> {
+        let (toy0, toy1) = ls7a_toy_registers_from_unix_ns(ns)?;
+        ls7a_rtc_ensure_toy_enabled();
+        ls7a_rtc_write_u32(LS7A_RTC_TOYWRITE1, toy1);
+        ls7a_rtc_write_u32(LS7A_RTC_TOYWRITE0, toy0);
+        Ok(())
+    }
+
+    fn set_wake_alarm_ns(ns: u64) -> Result<(), PersistentClockError> {
+        let toymatch = ls7a_toymatch_from_unix_ns(ns)?;
+        ls7a_rtc_ensure_toy_enabled();
+        ls7a_rtc_write_u32(LS7A_RTC_TOYMATCH0, toymatch);
+        Self::set_priority(QEMU_LA64_RTC_IRQ, 1);
+        Self::unmask(QEMU_LA64_RTC_IRQ);
+        Ok(())
+    }
+
+    fn clear_wake_alarm() -> Result<(), PersistentClockError> {
+        ls7a_rtc_write_u32(LS7A_RTC_TOYMATCH0, 0);
+        Self::mask(QEMU_LA64_RTC_IRQ);
+        Ok(())
+    }
+
+    fn acknowledge_wake_alarm_irq() -> Result<(), PersistentClockError> {
+        Ok(())
+    }
+}
+
 impl PercpuIf for Platform {
     fn current_cpu_id() -> CpuId {
         la64_current_cpu_id()
@@ -719,39 +844,28 @@ impl SmpIf for Platform {
         la64_wait_for_interrupt_once();
     }
 
-    fn pending_ipi(_kind: IpiKind) -> bool {
-        let _ = _kind;
-        boot_smp::pending_ipi()
+    fn pending_ipi(kind: IpiKind) -> bool {
+        boot_smp::pending_ipi(kind)
     }
 
-    fn send_ipi(target: CpuId, _kind: IpiKind) {
-        let _ = _kind;
-        boot_smp::send_ipi(target);
+    fn send_ipi(target: CpuId, kind: IpiKind) {
+        boot_smp::send_ipi(target, kind);
     }
 
     fn broadcast_ipi(mask: CpuMask, kind: IpiKind) {
-        let current = la64_current_cpu_id();
-        let mut bits = mask.bits() & !CpuMask::single(current).bits();
-        while bits != 0 {
-            let cpu = bits.trailing_zeros() as usize;
-            Self::send_ipi(CpuId(cpu), kind);
-            bits &= bits - 1;
-        }
+        boot_smp::broadcast_ipi(mask, kind);
     }
 
-    fn ack_ipi(_kind: IpiKind) {
-        let _ = _kind;
-        boot_smp::ack_ipi();
+    fn ack_ipi(kind: IpiKind) {
+        boot_smp::ack_ipi(kind);
     }
 
-    fn clear_ipi_ack_cpus(_kind: IpiKind, mask: CpuMask) {
-        let _ = _kind;
-        boot_smp::clear_ipi_ack_cpus(mask);
+    fn clear_ipi_ack_cpus(kind: IpiKind, mask: CpuMask) {
+        boot_smp::clear_ipi_ack_cpus(kind, mask);
     }
 
-    fn ipi_ack_cpus(_kind: IpiKind) -> CpuMask {
-        let _ = _kind;
-        boot_smp::ipi_ack_cpus()
+    fn ipi_ack_cpus(kind: IpiKind) -> CpuMask {
+        boot_smp::ipi_ack_cpus(kind)
     }
 }
 

@@ -84,6 +84,46 @@ impl CpuPinGuard {
     }
 }
 
+/// RAII token that masks ordinary interrupt-driven execution on the current CPU.
+///
+/// This guard covers maskable local IRQ admission only. It does not mask NMI-like
+/// events, pin the CPU, or make yielding/migration safe. CPU affinity remains
+/// the responsibility of [`CpuPinGuard`].
+#[derive(Debug)]
+#[must_use]
+pub struct LocalExecutionGuard {
+    restore: unsafe fn(usize),
+    saved_state: usize,
+    _not_send_sync: PhantomData<*mut ()>,
+}
+
+impl LocalExecutionGuard {
+    /// Construct a guard from an already-saved and already-disabled platform
+    /// state.
+    ///
+    /// # Safety
+    ///
+    /// `restore(saved_state)` must restore exactly the maskable local interrupt
+    /// state captured by the matching exclusion operation. The callback runs
+    /// once on the CPU that drops this non-transferable guard. The caller must
+    /// ensure the guard cannot cross a yield or CPU migration point.
+    pub const unsafe fn new(saved_state: usize, restore: unsafe fn(usize)) -> Self {
+        Self {
+            restore,
+            saved_state,
+            _not_send_sync: PhantomData,
+        }
+    }
+}
+
+impl Drop for LocalExecutionGuard {
+    fn drop(&mut self) {
+        unsafe {
+            (self.restore)(self.saved_state);
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BootArg(pub usize);
 
@@ -1145,6 +1185,14 @@ pub trait IrqIf {
     /// §"Open questions #6".
     const UART_IRQ: u32 = 0;
 
+    /// Platform-specific IRQ number for a wake-capable persistent-clock RTC.
+    ///
+    /// Boards without a hardware RTC alarm interrupt keep the `0` sentinel
+    /// default. The generic kernel may use this to register an IRQ handler that
+    /// publishes an RTC device event; HAL itself must not know devfs or RTC
+    /// userspace state.
+    const RTC_IRQ: u32 = 0;
+
     fn in_irq_context() -> bool {
         false
     }
@@ -1152,6 +1200,10 @@ pub trait IrqIf {
     fn interrupts_enabled() -> bool {
         true
     }
+
+    /// Save maskable local interrupt admission and disable it until the returned
+    /// guard is dropped. This does not provide CPU affinity or NMI exclusion.
+    fn exclude_local_execution() -> LocalExecutionGuard;
 
     fn claim() -> u32 {
         0
@@ -1203,19 +1255,64 @@ impl Default for IrqDispatchTable {
     }
 }
 
-pub trait TimeIf {
+/// The instruction or architectural source a vDSO may read without entering
+/// the kernel. `None` keeps the vDSO on its syscall fallback path.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VdsoCounterMode {
+    None = 0,
+    RiscvTime = 1,
+}
+
+/// Static platform facts for a raw counter that can back vDSO time reads.
+///
+/// This is intentionally a value returned by the selected board type rather
+/// than a runtime HAL service. The timekeeper validates eligibility before it
+/// reads the raw counter or publishes a fast-path calibration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VdsoCounterInfo {
+    pub frequency_hz: u64,
+    pub mask: u64,
+    pub stable: bool,
+    pub user_readable: bool,
+    pub mode: VdsoCounterMode,
+}
+
+pub trait MonotonicCounterIf {
     /// Read monotonic nanoseconds since the platform's boot-time epoch.
     ///
     /// Values must be non-decreasing on the current hart and cheap enough for
     /// scheduler/reactor hot paths.
     fn read_ns() -> u64;
 
+    /// Return the hardware timer frequency used for ns/tick conversion.
+    fn frequency_hz() -> u64;
+
+    /// Describe the raw counter for the optional vDSO fast path.
+    ///
+    /// Platforms that do not expose a stable user-readable counter retain the
+    /// default and the vDSO uses its syscall fallback.
+    fn vdso_counter_info() -> Option<VdsoCounterInfo> {
+        None
+    }
+
+    /// Read the same raw counter described by [`Self::vdso_counter_info`].
+    ///
+    /// Callers must only use this after accepting the descriptor. The default
+    /// avoids imposing an architecture-specific counter read on other boards.
+    fn read_vdso_counter() -> u64 {
+        0
+    }
+}
+
+pub trait DeadlineTimerIf {
     /// Program the current hart's timer for an absolute monotonic deadline.
     ///
-    /// `deadline` uses the same nanosecond epoch as `read_ns()`. Platforms
-    /// must not intentionally arm an earlier hardware deadline than requested;
-    /// interrupts may arrive late due to firmware, hardware, or emulator
-    /// latency. A past deadline should fire as soon as the platform can arrange.
+    /// `deadline` uses the same nanosecond epoch as
+    /// `MonotonicCounterIf::read_ns()`. Platforms must not intentionally arm an
+    /// earlier hardware deadline than requested; interrupts may arrive late due
+    /// to firmware, hardware, or emulator latency. A past deadline should fire
+    /// as soon as the platform can arrange.
     fn set_deadline_ns(deadline: u64);
 
     /// Cancel the current hart's pending timer deadline when the platform has
@@ -1225,10 +1322,51 @@ pub trait TimeIf {
     /// Prepare the current hart so a programmed timer deadline can wake or
     /// trap out of the platform idle path.
     fn enable_timer_wakeups() {}
-
-    /// Return the hardware timer frequency used for ns/tick conversion.
-    fn frequency_hz() -> u64;
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PersistentClockError {
+    Unsupported,
+    Invalid,
+    Range,
+    Hardware,
+}
+
+pub trait PersistentClockIf {
+    /// Read persistent realtime in nanoseconds since the Unix epoch.
+    ///
+    /// This is RTC/firmware wall-clock capability, not the hot
+    /// `CLOCK_REALTIME` path. Platforms without persistent wall-clock hardware
+    /// should return [`PersistentClockError::Unsupported`].
+    fn read_realtime_ns() -> Result<u64, PersistentClockError> {
+        Err(PersistentClockError::Unsupported)
+    }
+
+    /// Set persistent realtime in nanoseconds since the Unix epoch.
+    fn set_realtime_ns(_ns: u64) -> Result<(), PersistentClockError> {
+        Err(PersistentClockError::Unsupported)
+    }
+
+    /// Program a persistent-clock wake alarm when the platform supports one.
+    fn set_wake_alarm_ns(_ns: u64) -> Result<(), PersistentClockError> {
+        Err(PersistentClockError::Unsupported)
+    }
+
+    /// Clear a persistent-clock wake alarm when the platform supports one.
+    fn clear_wake_alarm() -> Result<(), PersistentClockError> {
+        Err(PersistentClockError::Unsupported)
+    }
+
+    /// Acknowledge a persistent-clock wake-alarm interrupt after the platform
+    /// IRQ dispatcher has identified the RTC source.
+    ///
+    /// This is a hardware acknowledgement hook. It must not publish devfs
+    /// events, inspect userspace RTC state, or route scheduler wakes.
+    fn acknowledge_wake_alarm_irq() -> Result<(), PersistentClockError> {
+        Ok(())
+    }
+}
+
 pub trait PercpuIf {
     fn current_cpu_id() -> CpuId {
         CpuId(0)
@@ -1300,6 +1438,8 @@ pub enum IpiKind {
     /// hart through a `fence` sequence so that all prior memory
     /// operations are globally visible.
     Membarrier,
+    /// Run deferred cross-CPU maintenance work such as RCU/EBR quiescence.
+    Maintenance,
     Stop,
 }
 
@@ -1395,7 +1535,9 @@ pub trait TxPlatform:
     + TrapIf
     + SignalFrameIf
     + IrqIf
-    + TimeIf
+    + MonotonicCounterIf
+    + DeadlineTimerIf
+    + PersistentClockIf
     + PercpuIf
     + CacheIf
     + DmaIf
@@ -1419,7 +1561,9 @@ impl<T> TxPlatform for T where
         + TrapIf
         + SignalFrameIf
         + IrqIf
-        + TimeIf
+        + MonotonicCounterIf
+        + DeadlineTimerIf
+        + PersistentClockIf
         + PercpuIf
         + CacheIf
         + DmaIf

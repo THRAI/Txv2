@@ -1,7 +1,8 @@
 use tx_hal::{
     AuxvIf, CacheIf, ConsoleIf, CpuId, CpuMask, DmaAddr, DmaDirection, DmaIf, FaultInfo, IpiKind,
-    IrqDispatchTable, IrqHandled, IrqIf, KernelTrapSink, PercpuIf, PhysAddr, SmpIf, TrapAction,
-    TrapClass, TrapFrameMut, TrapFrameSnapshot, TrapIf, TrapPreviousMode, VirtAddr,
+    IrqDispatchTable, IrqHandled, IrqIf, KernelTrapSink, PercpuIf, PersistentClockIf, PhysAddr,
+    SmpIf, TrapAction, TrapClass, TrapFrameMut, TrapFrameSnapshot, TrapIf, TrapPreviousMode,
+    VirtAddr,
 };
 
 use crate::{
@@ -366,6 +367,195 @@ fn plic_dispatch_table_invokes_handler_and_masks_unhandled_irq() {
 }
 
 #[test]
+fn qemu_mmio_regions_include_goldfish_rtc() {
+    let _guard = RV64_HAL_TEST_LOCK.lock().expect("rv64 hal test lock");
+    let regions = crate::boot_static::qemu_mmio_regions();
+    let rtc = regions
+        .iter()
+        .find(|region| region.name == "goldfish-rtc")
+        .expect("goldfish rtc mmio region");
+
+    assert_eq!(rtc.phys.start, PhysAddr(super::GOLDFISH_RTC_PHYS_BASE));
+    assert_eq!(rtc.phys.size, 0x1000);
+    assert_eq!(rtc.virt.start, VirtAddr(0xffff_ffc0_0010_1000));
+    assert_eq!(rtc.virt.size, 0x1000);
+}
+
+#[test]
+#[cfg(not(target_arch = "riscv64"))]
+fn goldfish_persistent_clock_reads_time_low_then_high() {
+    let _guard = RV64_HAL_TEST_LOCK.lock().expect("rv64 hal test lock");
+    let expected = 0x0123_4567_89ab_cdef;
+    {
+        let mut state = super::HOST_GOLDFISH_RTC_STATE
+            .lock()
+            .expect("host goldfish rtc state");
+        state.reset();
+        state.set_time_ns(expected);
+    }
+
+    assert_eq!(
+        <Platform as PersistentClockIf>::read_realtime_ns(),
+        Ok(expected)
+    );
+
+    let state = super::HOST_GOLDFISH_RTC_STATE
+        .lock()
+        .expect("host goldfish rtc state");
+    assert_eq!(
+        state.read_log(),
+        [super::GOLDFISH_RTC_TIME_LOW, super::GOLDFISH_RTC_TIME_HIGH]
+    );
+}
+
+#[test]
+#[cfg(not(target_arch = "riscv64"))]
+fn goldfish_persistent_clock_writes_time_high_then_low() {
+    let _guard = RV64_HAL_TEST_LOCK.lock().expect("rv64 hal test lock");
+    let ns = 0x1111_2222_3333_4444;
+    {
+        let mut state = super::HOST_GOLDFISH_RTC_STATE
+            .lock()
+            .expect("host goldfish rtc state");
+        state.reset();
+    }
+
+    assert_eq!(<Platform as PersistentClockIf>::set_realtime_ns(ns), Ok(()));
+
+    let state = super::HOST_GOLDFISH_RTC_STATE
+        .lock()
+        .expect("host goldfish rtc state");
+    assert_eq!(
+        state.write_log(),
+        [super::GOLDFISH_RTC_TIME_HIGH, super::GOLDFISH_RTC_TIME_LOW]
+    );
+    assert_eq!(state.write_values(), [0x1111_2222, 0x3333_4444]);
+}
+
+#[test]
+#[cfg(not(target_arch = "riscv64"))]
+fn goldfish_persistent_clock_programs_alarm_and_unmasks_irq() {
+    let _guard = RV64_HAL_TEST_LOCK.lock().expect("rv64 hal test lock");
+    let saved_tls = <Platform as PercpuIf>::read_kernel_tls();
+    <Platform as PercpuIf>::install_early_percpu(CpuId(0));
+    super::HOST_PLIC_STATE
+        .lock()
+        .expect("host plic state")
+        .reset();
+    {
+        let mut state = super::HOST_GOLDFISH_RTC_STATE
+            .lock()
+            .expect("host goldfish rtc state");
+        state.reset();
+    }
+
+    let ns = 0xaaaa_bbbb_cccc_dddd;
+    assert_eq!(
+        <Platform as PersistentClockIf>::set_wake_alarm_ns(ns),
+        Ok(())
+    );
+
+    let state = super::HOST_GOLDFISH_RTC_STATE
+        .lock()
+        .expect("host goldfish rtc state");
+    assert_eq!(
+        state.write_log(),
+        [
+            super::GOLDFISH_RTC_ALARM_HIGH,
+            super::GOLDFISH_RTC_ALARM_LOW,
+            super::GOLDFISH_RTC_IRQ_ENABLED
+        ]
+    );
+    assert_eq!(state.write_values(), [0xaaaa_bbbb, 0xcccc_dddd, 1]);
+    drop(state);
+
+    let plic = super::HOST_PLIC_STATE.lock().expect("host plic state");
+    assert_eq!(
+        plic.read_u32(super::plic_priority_offset(super::GOLDFISH_RTC_IRQ)),
+        1
+    );
+    assert_ne!(
+        plic.read_u32(super::plic_enable_word_offset(
+            super::plic_context_for_cpu(CpuId(0)),
+            0
+        )) & (1 << super::GOLDFISH_RTC_IRQ),
+        0
+    );
+
+    <Platform as PercpuIf>::write_kernel_tls(saved_tls);
+}
+
+#[test]
+#[cfg(not(target_arch = "riscv64"))]
+fn goldfish_persistent_clock_clear_alarm_disables_and_clears_pending_irq() {
+    let _guard = RV64_HAL_TEST_LOCK.lock().expect("rv64 hal test lock");
+    let saved_tls = <Platform as PercpuIf>::read_kernel_tls();
+    <Platform as PercpuIf>::install_early_percpu(CpuId(0));
+    super::HOST_PLIC_STATE
+        .lock()
+        .expect("host plic state")
+        .reset();
+    <Platform as IrqIf>::unmask(super::GOLDFISH_RTC_IRQ);
+    {
+        let mut state = super::HOST_GOLDFISH_RTC_STATE
+            .lock()
+            .expect("host goldfish rtc state");
+        state.reset();
+        state.set_alarm_status(true);
+    }
+
+    assert_eq!(<Platform as PersistentClockIf>::clear_wake_alarm(), Ok(()));
+
+    let state = super::HOST_GOLDFISH_RTC_STATE
+        .lock()
+        .expect("host goldfish rtc state");
+    assert_eq!(
+        state.write_log(),
+        [
+            super::GOLDFISH_RTC_IRQ_ENABLED,
+            super::GOLDFISH_RTC_CLEAR_ALARM,
+            super::GOLDFISH_RTC_CLEAR_INTERRUPT
+        ]
+    );
+    assert_eq!(state.write_values(), [0, 1, 1]);
+    drop(state);
+
+    let plic = super::HOST_PLIC_STATE.lock().expect("host plic state");
+    assert_eq!(
+        plic.read_u32(super::plic_enable_word_offset(
+            super::plic_context_for_cpu(CpuId(0)),
+            0
+        )) & (1 << super::GOLDFISH_RTC_IRQ),
+        0
+    );
+
+    <Platform as PercpuIf>::write_kernel_tls(saved_tls);
+}
+
+#[test]
+#[cfg(not(target_arch = "riscv64"))]
+fn goldfish_persistent_clock_acknowledges_alarm_irq_without_disabling_alarm() {
+    let _guard = RV64_HAL_TEST_LOCK.lock().expect("rv64 hal test lock");
+    {
+        let mut state = super::HOST_GOLDFISH_RTC_STATE
+            .lock()
+            .expect("host goldfish rtc state");
+        state.reset();
+    }
+
+    assert_eq!(
+        <Platform as PersistentClockIf>::acknowledge_wake_alarm_irq(),
+        Ok(())
+    );
+
+    let state = super::HOST_GOLDFISH_RTC_STATE
+        .lock()
+        .expect("host goldfish rtc state");
+    assert_eq!(state.write_log(), [super::GOLDFISH_RTC_CLEAR_INTERRUPT]);
+    assert_eq!(state.write_values(), [1]);
+}
+
+#[test]
 fn cache_methods_are_callable_on_qemu_coherent_platform() {
     <Platform as CacheIf>::fence_all();
     <Platform as CacheIf>::fence_i_local();
@@ -378,7 +568,7 @@ fn cache_methods_are_callable_on_qemu_coherent_platform() {
 
 #[test]
 fn dma_identity_mapping_and_sync_are_qemu_coherent() {
-    const { assert!(<Platform as DmaIf>::DMA_COHERENT) };
+    assert!(core::hint::black_box(<Platform as DmaIf>::DMA_COHERENT));
     assert_eq!(
         <Platform as DmaIf>::phys_to_dma(PhysAddr(0x8020_1000)),
         DmaAddr(0x8020_1000)
@@ -687,9 +877,10 @@ fn remote_sfence_targets_are_limited_to_asid_residency() {
 
 #[test]
 fn ipi_ack_observation_can_be_cleared_by_mask() {
+    let _guard = RV64_HAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     <Platform as SmpIf>::clear_ipi_ack_cpus(IpiKind::Reschedule, CpuMask::from_bits(u64::MAX));
-    mark_ipi_ack(CpuId(1));
-    mark_ipi_ack(CpuId(3));
+    mark_ipi_ack(CpuId(1), IpiKind::Reschedule);
+    mark_ipi_ack(CpuId(3), IpiKind::Reschedule);
 
     assert_eq!(
         <Platform as SmpIf>::ipi_ack_cpus(IpiKind::Reschedule).bits(),
@@ -702,6 +893,124 @@ fn ipi_ack_observation_can_be_cleared_by_mask() {
         <Platform as SmpIf>::ipi_ack_cpus(IpiKind::Reschedule).bits(),
         0b1000
     );
+}
+
+#[test]
+#[cfg(not(target_arch = "riscv64"))]
+fn broadcast_self_and_remote_runs_local_membarrier_and_isolates_kind_state() {
+    let _guard = RV64_HAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let saved_tls = <Platform as PercpuIf>::read_kernel_tls();
+    let current = CpuId(0);
+    let remote = CpuId(1);
+    let targets =
+        CpuMask::from_bits(CpuMask::single(current).bits() | CpuMask::single(remote).bits());
+
+    super::reset_ipi_software_state();
+    super::TEST_IPI_TRANSPORT_MASK.store(0, std::sync::atomic::Ordering::Release);
+    super::TEST_LOCAL_MEMBARRIER_ACTIONS.store(0, std::sync::atomic::Ordering::Release);
+    <Platform as PercpuIf>::install_early_percpu(current);
+
+    <Platform as SmpIf>::broadcast_ipi(targets, IpiKind::Membarrier);
+
+    assert_eq!(
+        super::TEST_IPI_TRANSPORT_MASK.load(std::sync::atomic::Ordering::Acquire),
+        CpuMask::single(remote).bits()
+    );
+    assert_eq!(
+        super::TEST_LOCAL_MEMBARRIER_ACTIONS.load(std::sync::atomic::Ordering::Acquire),
+        1
+    );
+    assert_eq!(
+        <Platform as SmpIf>::ipi_ack_cpus(IpiKind::Membarrier),
+        CpuMask::single(current)
+    );
+    assert_eq!(
+        <Platform as SmpIf>::ipi_ack_cpus(IpiKind::Maintenance),
+        CpuMask::EMPTY
+    );
+    assert!(!<Platform as SmpIf>::pending_ipi(IpiKind::Membarrier));
+
+    <Platform as PercpuIf>::install_early_percpu(remote);
+    assert!(<Platform as SmpIf>::pending_ipi(IpiKind::Membarrier));
+    assert!(!<Platform as SmpIf>::pending_ipi(IpiKind::Maintenance));
+    <Platform as SmpIf>::ack_ipi(IpiKind::Membarrier);
+    assert_eq!(
+        <Platform as SmpIf>::ipi_ack_cpus(IpiKind::Membarrier),
+        targets
+    );
+
+    super::reset_ipi_software_state();
+    super::TEST_IPI_TRANSPORT_MASK.store(0, std::sync::atomic::Ordering::Release);
+    super::TEST_LOCAL_MEMBARRIER_ACTIONS.store(0, std::sync::atomic::Ordering::Release);
+    <Platform as PercpuIf>::install_early_percpu(current);
+    <Platform as SmpIf>::broadcast_ipi(targets, IpiKind::Maintenance);
+    assert_eq!(
+        super::TEST_LOCAL_MEMBARRIER_ACTIONS.load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
+    assert_eq!(
+        <Platform as SmpIf>::ipi_ack_cpus(IpiKind::Maintenance),
+        CpuMask::single(current)
+    );
+    assert_eq!(
+        <Platform as SmpIf>::ipi_ack_cpus(IpiKind::Membarrier),
+        CpuMask::EMPTY
+    );
+    <Platform as PercpuIf>::install_early_percpu(remote);
+    assert!(<Platform as SmpIf>::pending_ipi(IpiKind::Maintenance));
+    assert!(!<Platform as SmpIf>::pending_ipi(IpiKind::Membarrier));
+    <Platform as SmpIf>::ack_ipi(IpiKind::Maintenance);
+    assert_eq!(
+        <Platform as SmpIf>::ipi_ack_cpus(IpiKind::Maintenance),
+        targets
+    );
+
+    super::reset_ipi_software_state();
+    <Platform as PercpuIf>::write_kernel_tls(saved_tls);
+}
+
+#[test]
+#[cfg(not(target_arch = "riscv64"))]
+fn ipi_pending_and_ack_state_are_isolated_by_kind() {
+    let _guard = RV64_HAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let saved_tls = <Platform as PercpuIf>::read_kernel_tls();
+    let target = CpuId(1);
+
+    <Platform as SmpIf>::clear_ipi_ack_cpus(IpiKind::Reschedule, CpuMask::from_bits(u64::MAX));
+    <Platform as SmpIf>::clear_ipi_ack_cpus(IpiKind::Maintenance, CpuMask::from_bits(u64::MAX));
+    <Platform as PercpuIf>::install_early_percpu(CpuId(0));
+    <Platform as SmpIf>::send_ipi(target, IpiKind::Reschedule);
+    <Platform as SmpIf>::send_ipi(target, IpiKind::Maintenance);
+    assert!(!<Platform as SmpIf>::pending_ipi(IpiKind::Reschedule));
+    assert!(!<Platform as SmpIf>::pending_ipi(IpiKind::Maintenance));
+
+    <Platform as PercpuIf>::install_early_percpu(target);
+    assert!(<Platform as SmpIf>::pending_ipi(IpiKind::Reschedule));
+    assert!(<Platform as SmpIf>::pending_ipi(IpiKind::Maintenance));
+    assert!(!<Platform as SmpIf>::pending_ipi(IpiKind::TlbShootdown));
+
+    <Platform as SmpIf>::ack_ipi(IpiKind::Reschedule);
+    assert!(!<Platform as SmpIf>::pending_ipi(IpiKind::Reschedule));
+    assert!(<Platform as SmpIf>::pending_ipi(IpiKind::Maintenance));
+    assert_eq!(
+        <Platform as SmpIf>::ipi_ack_cpus(IpiKind::Reschedule),
+        CpuMask::single(target)
+    );
+    assert_eq!(
+        <Platform as SmpIf>::ipi_ack_cpus(IpiKind::Maintenance),
+        CpuMask::EMPTY
+    );
+
+    <Platform as SmpIf>::ack_ipi(IpiKind::Maintenance);
+    assert!(!<Platform as SmpIf>::pending_ipi(IpiKind::Maintenance));
+    assert_eq!(
+        <Platform as SmpIf>::ipi_ack_cpus(IpiKind::Maintenance),
+        CpuMask::single(target)
+    );
+
+    <Platform as SmpIf>::clear_ipi_ack_cpus(IpiKind::Reschedule, CpuMask::from_bits(u64::MAX));
+    <Platform as SmpIf>::clear_ipi_ack_cpus(IpiKind::Maintenance, CpuMask::from_bits(u64::MAX));
+    <Platform as PercpuIf>::write_kernel_tls(saved_tls);
 }
 
 fn test_trap_frame(scause: usize, sepc: usize, stval: usize) -> Rv64TrapFrame {

@@ -117,7 +117,7 @@ struct BootstrapPmapInfoCell(UnsafeCell<Option<BootstrapPmapInfo>>);
 struct CmdlineCell(UnsafeCell<[u8; CMDLINE_CAPACITY]>);
 struct MemoryRegionsCell(UnsafeCell<[MemoryRegion; MAX_MEMORY_REGIONS]>);
 struct PlatformInfoCell(UnsafeCell<PlatformInfo>);
-struct PlatformMmioRegionsCell(UnsafeCell<[MmioRegion; 4]>);
+struct PlatformMmioRegionsCell(UnsafeCell<[MmioRegion; 5]>);
 struct TimebaseFrequencyCell(UnsafeCell<u64>);
 struct PossibleCpuCountCell(UnsafeCell<usize>);
 struct ReservedPageTablesCell(UnsafeCell<[PhysRange; BOOTSTRAP_PMAP_RESERVED_RANGES]>);
@@ -142,6 +142,7 @@ unsafe impl Sync for StoredBootStaticBagCell {}
 
 static BOOT_INFO: BootInfoCell = BootInfoCell(UnsafeCell::new(BootInfo::empty()));
 static BOOTSTRAP_PMAP_INFO: BootstrapPmapInfoCell = BootstrapPmapInfoCell(UnsafeCell::new(None));
+#[cfg_attr(target_arch = "riscv64", link_section = ".data.boot_static_cmdline")]
 static CMDLINE: CmdlineCell = CmdlineCell(UnsafeCell::new([0; CMDLINE_CAPACITY]));
 static MEMORY_REGIONS: MemoryRegionsCell =
     MemoryRegionsCell(UnsafeCell::new([reserved_region(); MAX_MEMORY_REGIONS]));
@@ -153,7 +154,7 @@ static PLATFORM_INFO: PlatformInfoCell = PlatformInfoCell(UnsafeCell::new(Platfo
     possible_cpu_count: 1,
 }));
 static PLATFORM_MMIO_REGIONS: PlatformMmioRegionsCell =
-    PlatformMmioRegionsCell(UnsafeCell::new([empty_mmio_region(); 4]));
+    PlatformMmioRegionsCell(UnsafeCell::new([empty_mmio_region(); 5]));
 static TIMEBASE_FREQUENCY_HZ: TimebaseFrequencyCell =
     TimebaseFrequencyCell(UnsafeCell::new(QEMU_VIRT_FALLBACK_TIMEBASE_HZ));
 static POSSIBLE_CPU_COUNT: PossibleCpuCountCell = PossibleCpuCountCell(UnsafeCell::new(1));
@@ -183,6 +184,11 @@ static KERNEL_ALIAS_L0_TABLES_STORAGE: KernelAliasL0TablesCell = KernelAliasL0Ta
 )]
 static PT_NODE_POOL: PtNodePoolCell =
     PtNodePoolCell(UnsafeCell::new([PageTable([0; 512]); PT_NODE_POOL_ENTRIES]));
+// Keep the boot-static typestate outside `.bss`: on SMP boots QEMU/OpenSBI may
+// choose a non-zero boot hart, and any late low-level BSS clear must not reset
+// the already-published boot facts back to `Uninit`. CMDLINE follows the same
+// rule above because BootInfo stores a borrowed slice into that buffer.
+#[cfg_attr(target_arch = "riscv64", link_section = ".data.boot_static_bag")]
 static STORED_BOOT_STATIC_BAG: StoredBootStaticBagCell =
     StoredBootStaticBagCell(UnsafeCell::new(StoredBootStaticBag::Uninit));
 
@@ -208,8 +214,20 @@ const fn empty_mmio_region() -> MmioRegion {
     }
 }
 
-fn qemu_mmio_regions() -> [MmioRegion; 4] {
+pub(crate) fn qemu_mmio_regions() -> [MmioRegion; 5] {
     [
+        MmioRegion {
+            name: "goldfish-rtc",
+            phys: PhysRange {
+                start: PhysAddr(0x0010_1000),
+                size: 0x1000,
+            },
+            virt: VirtRange {
+                start: VirtAddr(DIRECT_MAP_BASE + 0x0010_1000),
+                size: 0x1000,
+            },
+            flags: MMIO_RW_DEVICE,
+        },
         MmioRegion {
             name: "clint",
             phys: PhysRange {
@@ -570,7 +588,7 @@ impl<State> BootStaticBag<State> {
     }
 
     pub(crate) fn bootstrap_pmap_info_ref(&self) -> Option<&'static BootstrapPmapInfo> {
-        unsafe { (&*BOOTSTRAP_PMAP_INFO.0.get()).as_ref() }
+        unsafe { (*BOOTSTRAP_PMAP_INFO.0.get()).as_ref() }
     }
 
     pub(crate) unsafe fn bootstrap_pmap_info_mut(&self) -> &'static mut Option<BootstrapPmapInfo> {

@@ -418,9 +418,9 @@ pub(crate) fn shootdown_mappings(asid: Asid, invalidations: &[PmapInvalidation])
 }
 
 fn alloc_asid() -> Result<Asid, PmapError> {
-    for word_index in 0..ASID_BITMAP_WORDS {
+    for (word_index, word) in ALLOCATED_ASIDS.iter().enumerate().take(ASID_BITMAP_WORDS) {
         loop {
-            let allocated = ALLOCATED_ASIDS[word_index].load(Ordering::Acquire);
+            let allocated = word.load(Ordering::Acquire);
             let reserved = if word_index == 0 { 1 } else { 0 };
             if allocated | reserved == u64::MAX {
                 break;
@@ -434,7 +434,7 @@ fn alloc_asid() -> Result<Asid, PmapError> {
                 if allocated & bit != 0 {
                     continue;
                 }
-                if ALLOCATED_ASIDS[word_index]
+                if word
                     .compare_exchange(
                         allocated,
                         allocated | bit,

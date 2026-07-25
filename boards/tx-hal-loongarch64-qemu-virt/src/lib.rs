@@ -5,16 +5,17 @@ extern crate std;
 
 use tx_hal::{
     AllocError, Arch, ArchAuxvFacts, Asid, AuxvIf, BootArg, BootHandoff, BootInfo, BootInfoIf,
-    BootPlatformIf, BootProtocol, BootstrapPmapInfo, CacheIf, ConsoleIf, CpuId, CpuMask, DmaIf,
-    EntropyIf, FaultInfo, FpSimdIf, InitIf, IpiKind, IrqDispatchTable, IrqHandled, IrqIf,
-    KernelTrapSink, MemoryRegion, MemoryRegionKind, MmioFlags, MmioRegion, ObserverIf, PercpuIf,
-    PhysAddr, PhysRange, PlatformConfig, PlatformInfo, PlatformInfoIf, PmapError, PmapIf,
-    PmapInvalidation, PmapPermissions, PmapReservation, PmapReservationIntermediates,
-    PmapReserveKind, PmapRoot, PmapUnmapResult, Pod, PowerIf, PtNode, PtNodeAllocator,
-    SavedSignalFrame, SecondaryEntry, SignalFrameIf, SignalFramePlacement, SignalFrameWrite,
-    SignalHandlerRegs, SmpIf, TimeIf, TrapAction, TrapClass, TrapFrameMut, TrapFrameMutVtable,
-    TrapFrameSnapshot, TrapFrameView, TrapIf, TrapPreviousMode, UserFpContext, UserPtr,
-    UserSignalMaskAbi, UserTrapContext, VirtAddr, VirtRange,
+    BootPlatformIf, BootProtocol, BootstrapPmapInfo, CacheIf, ConsoleIf, CpuId, CpuMask,
+    DeadlineTimerIf, DmaIf, EntropyIf, FaultInfo, FpSimdIf, InitIf, IpiKind, IrqDispatchTable,
+    IrqHandled, IrqIf, KernelTrapSink, LocalExecutionGuard, MemoryRegion, MemoryRegionKind,
+    MmioFlags, MmioRegion, MonotonicCounterIf, ObserverIf, PercpuIf, PersistentClockError,
+    PersistentClockIf, PhysAddr, PhysRange, PlatformConfig, PlatformInfo, PlatformInfoIf,
+    PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
+    PmapReservationIntermediates, PmapReserveKind, PmapRoot, PmapUnmapResult, Pod, PowerIf, PtNode,
+    PtNodeAllocator, SavedSignalFrame, SecondaryEntry, SignalFrameIf, SignalFramePlacement,
+    SignalFrameWrite, SignalHandlerRegs, SmpIf, TrapAction, TrapClass, TrapFrameMut,
+    TrapFrameMutVtable, TrapFrameSnapshot, TrapFrameView, TrapIf, TrapPreviousMode, UserFpContext,
+    UserPtr, UserSignalMaskAbi, UserTrapContext, VirtAddr, VirtRange,
 };
 
 pub use boot_args::capture_loongarch64_qemu_boot_args;
@@ -105,12 +106,15 @@ const QEMU_LA64_GSI_BASE: u32 = 64;
 const QEMU_LA64_PCH_PIC_IRQS: u32 = 64;
 #[cfg_attr(not(test), allow(dead_code))]
 const QEMU_LA64_UART0_IRQ: u32 = 66;
+const QEMU_LA64_RTC_IRQ: u32 = QEMU_LA64_GSI_BASE + 3;
 const QEMU_LA64_PCIE_ECAM_BASE: usize = 0x2000_0000;
 const QEMU_LA64_PCIE_ECAM_SIZE: usize = 0x0800_0000;
 const QEMU_LA64_PCIE_MMIO32_BASE: usize = 0x4000_0000;
 const QEMU_LA64_PCIE_MMIO32_SIZE: usize = 0x4000_0000;
 const QEMU_LA64_PCH_MSI_BASE: usize = 0x2ff0_0000;
 const QEMU_LA64_PCH_MSI_SIZE: usize = 0x8;
+const QEMU_LA64_RTC_BASE: usize = 0x100d_0100;
+const QEMU_LA64_RTC_SIZE: usize = 0x100;
 #[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
 const QEMU_LA64_FW_CFG_BASE: usize = 0x1e02_0000;
 const QEMU_LA64_FDT_BASE: usize = 0x0010_0000;
@@ -190,6 +194,7 @@ const LA64_PTE_W: u64 = 1 << 8;
 const LA64_PTE_M: u64 = 1 << 9;
 const LA64_PTE_NR: u64 = 1 << 61;
 const LA64_PTE_NX: u64 = 1 << 62;
+#[cfg(test)]
 const LA64_PTE_RPLV: u64 = 1 << 63;
 const LA64_PRMD_PPLV_MASK: usize = 0x3;
 const LA64_PRMD_PPLV_USER: usize = 0x3;
@@ -217,6 +222,15 @@ const LA64_EIOINTC_COREISR_START: usize = 0x400;
 const LA64_EIOINTC_IRQS: u32 = 256;
 const LA64_PCH_PIC_MASK_START: usize = 0x20;
 const LA64_PCH_PIC_CLEAR_START: usize = 0x80;
+const LS7A_RTC_TOYWRITE0: usize = 0x24;
+const LS7A_RTC_TOYWRITE1: usize = 0x28;
+const LS7A_RTC_TOYREAD0: usize = 0x2c;
+const LS7A_RTC_TOYREAD1: usize = 0x30;
+const LS7A_RTC_TOYMATCH0: usize = 0x34;
+const LS7A_RTC_CTRL: usize = 0x40;
+const LS7A_RTC_CTRL_EO: u32 = 1 << 8;
+const LS7A_RTC_CTRL_TOYEN: u32 = 1 << 11;
+const NANOS_PER_SEC: u64 = 1_000_000_000;
 
 const fn la64_addi_d(rd: u32, rj: u32, imm12: u32) -> u32 {
     0x02c0_0000 | ((imm12 & 0x0fff) << 10) | ((rj & 0x1f) << 5) | (rd & 0x1f)
@@ -226,7 +240,6 @@ static INSTALLED_PT_NODE_ALLOCATOR: AtomicUsize = AtomicUsize::new(0);
 static LA64_TIMEBASE_HZ: AtomicU64 = AtomicU64::new(0);
 static LA64_POSSIBLE_CPU_COUNT: AtomicUsize = AtomicUsize::new(LA64_DEFAULT_POSSIBLE_CPUS);
 static LA64_ONLINE_CPUS: AtomicU64 = AtomicU64::new(1);
-static LA64_IPI_ACKED_CPUS: AtomicU64 = AtomicU64::new(0);
 static LA64_IRQ_CONTEXT_DEPTHS: [AtomicUsize; LA64_MAX_BOOT_CPUS] = [
     AtomicUsize::new(0),
     AtomicUsize::new(0),
@@ -269,6 +282,88 @@ static LA64_HOST_EIOINTC_ENABLE0: AtomicU64 = AtomicU64::new(0);
 static LA64_HOST_EIOINTC_COREISR0: AtomicU64 = AtomicU64::new(0);
 #[cfg(not(target_arch = "loongarch64"))]
 static LA64_HOST_PCH_PIC_MASK: AtomicU64 = AtomicU64::new(u64::MAX);
+
+#[cfg(all(not(target_arch = "loongarch64"), test))]
+struct HostLs7aRtcState {
+    registers: [u32; QEMU_LA64_RTC_SIZE / core::mem::size_of::<u32>()],
+    read_offsets: [usize; 16],
+    read_len: usize,
+    write_offsets: [usize; 16],
+    write_values: [u32; 16],
+    write_len: usize,
+}
+
+#[cfg(all(not(target_arch = "loongarch64"), test))]
+impl HostLs7aRtcState {
+    const fn new() -> Self {
+        Self {
+            registers: [0; QEMU_LA64_RTC_SIZE / core::mem::size_of::<u32>()],
+            read_offsets: [0; 16],
+            read_len: 0,
+            write_offsets: [0; 16],
+            write_values: [0; 16],
+            write_len: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    fn set_toy_time(&mut self, ns: u64) {
+        let (toy0, toy1) = ls7a_toy_registers_from_unix_ns(ns).expect("valid toy time");
+        self.registers[LS7A_RTC_TOYREAD0 / core::mem::size_of::<u32>()] = toy0;
+        self.registers[LS7A_RTC_TOYREAD1 / core::mem::size_of::<u32>()] = toy1;
+    }
+
+    fn read_u32(&mut self, offset: usize) -> u32 {
+        self.record_read(offset);
+        self.registers
+            .get(offset / core::mem::size_of::<u32>())
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn write_u32(&mut self, offset: usize, value: u32) {
+        self.record_write(offset, value);
+        if let Some(register) = self.registers.get_mut(offset / core::mem::size_of::<u32>()) {
+            *register = value;
+        }
+    }
+
+    fn record_read(&mut self, offset: usize) {
+        if let Some(slot) = self.read_offsets.get_mut(self.read_len) {
+            *slot = offset;
+            self.read_len += 1;
+        }
+    }
+
+    fn record_write(&mut self, offset: usize, value: u32) {
+        if let Some(slot) = self.write_offsets.get_mut(self.write_len) {
+            *slot = offset;
+        }
+        if let Some(slot) = self.write_values.get_mut(self.write_len) {
+            *slot = value;
+            self.write_len += 1;
+        }
+    }
+
+    fn read_log(&self) -> &[usize] {
+        &self.read_offsets[..self.read_len]
+    }
+
+    fn write_log(&self) -> &[usize] {
+        &self.write_offsets[..self.write_len]
+    }
+
+    fn write_values(&self) -> &[u32] {
+        &self.write_values[..self.write_len]
+    }
+}
+
+#[cfg(all(not(target_arch = "loongarch64"), test))]
+static LA64_HOST_LS7A_RTC_STATE: std::sync::Mutex<HostLs7aRtcState> =
+    std::sync::Mutex::new(HostLs7aRtcState::new());
 
 #[cfg_attr(not(target_arch = "loongarch64"), allow(dead_code))]
 const LA64_FW_CFG_INITRD_CAPACITY: usize = 8 * 1024 * 1024;
@@ -818,7 +913,153 @@ static MMIO_REGIONS: &[MmioRegion] = &[
             .union(MmioFlags::READ)
             .union(MmioFlags::WRITE),
     },
+    MmioRegion {
+        name: "ls7a-rtc",
+        phys: PhysRange {
+            start: PhysAddr(QEMU_LA64_RTC_BASE),
+            size: QEMU_LA64_RTC_SIZE,
+        },
+        virt: VirtRange {
+            start: VirtAddr(la64_uncached_virt(QEMU_LA64_RTC_BASE)),
+            size: QEMU_LA64_RTC_SIZE,
+        },
+        flags: MmioFlags::DEVICE_NGNRNE
+            .union(MmioFlags::READ)
+            .union(MmioFlags::WRITE),
+    },
 ];
+
+fn ls7a_toy_registers_from_unix_ns(ns: u64) -> Result<(u32, u32), PersistentClockError> {
+    let seconds = ns / NANOS_PER_SEC;
+    let (year, month, day, hour, minute, second) = civil_from_unix_seconds(seconds)?;
+    if !(1900..=2099).contains(&year) {
+        return Err(PersistentClockError::Range);
+    }
+
+    let tm_year = (year - 1900) as u32;
+    let toy0 = ((month as u32) << 26)
+        | ((day as u32) << 21)
+        | ((hour as u32) << 16)
+        | ((minute as u32) << 10)
+        | ((second as u32) << 4);
+    Ok((toy0, tm_year))
+}
+
+fn ls7a_toymatch_from_unix_ns(ns: u64) -> Result<u32, PersistentClockError> {
+    let seconds = ns / NANOS_PER_SEC;
+    let (year, month, day, hour, minute, second) = civil_from_unix_seconds(seconds)?;
+    if !(1900..=2099).contains(&year) {
+        return Err(PersistentClockError::Range);
+    }
+
+    let tm_year = (year - 1900) as u32;
+    Ok(((tm_year & 0x3f) << 26)
+        | ((month as u32) << 22)
+        | ((day as u32) << 17)
+        | ((hour as u32) << 12)
+        | ((minute as u32) << 6)
+        | second as u32)
+}
+
+fn ls7a_unix_ns_from_toy_registers(toy0: u32, toy1: u32) -> Result<u64, PersistentClockError> {
+    let month = ((toy0 >> 26) & 0x3f) as u8;
+    let day = ((toy0 >> 21) & 0x1f) as u8;
+    let hour = ((toy0 >> 16) & 0x1f) as u8;
+    let minute = ((toy0 >> 10) & 0x3f) as u8;
+    let second = ((toy0 >> 4) & 0x3f) as u8;
+    let year = 1900i32
+        .checked_add(toy1 as i32)
+        .ok_or(PersistentClockError::Range)?;
+    unix_ns_from_civil(year, month, day, hour, minute, second)
+}
+
+fn unix_ns_from_civil(
+    year: i32,
+    month: u8,
+    day: u8,
+    hour: u8,
+    minute: u8,
+    second: u8,
+) -> Result<u64, PersistentClockError> {
+    if !(1..=12).contains(&month)
+        || !(1..=days_in_month(year, month)).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return Err(PersistentClockError::Invalid);
+    }
+
+    let days = days_from_civil(year, month as u32, day as u32);
+    if days < 0 {
+        return Err(PersistentClockError::Range);
+    }
+    let seconds = (days as u64)
+        .checked_mul(86_400)
+        .and_then(|base| base.checked_add(u64::from(hour) * 3_600))
+        .and_then(|base| base.checked_add(u64::from(minute) * 60))
+        .and_then(|base| base.checked_add(u64::from(second.min(59))))
+        .ok_or(PersistentClockError::Range)?;
+    seconds
+        .checked_mul(NANOS_PER_SEC)
+        .ok_or(PersistentClockError::Range)
+}
+
+fn civil_from_unix_seconds(
+    seconds: u64,
+) -> Result<(i32, u8, u8, u8, u8, u8), PersistentClockError> {
+    let days = seconds / 86_400;
+    let day_seconds = seconds % 86_400;
+    let (year, month, day) =
+        civil_from_days(i64::try_from(days).map_err(|_| PersistentClockError::Range)?);
+    Ok((
+        year,
+        month as u8,
+        day as u8,
+        (day_seconds / 3_600) as u8,
+        ((day_seconds % 3_600) / 60) as u8,
+        (day_seconds % 60) as u8,
+    ))
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let year = year - i32::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let month = month as i32;
+    let day = day as i32;
+    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    i64::from(era) * 146_097 + i64::from(doe) - 719_468
+}
+
+fn civil_from_days(days_since_unix_epoch: i64) -> (i32, u32, u32) {
+    let z = days_since_unix_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + i64::from(month <= 2);
+    (year as i32, month as u32, day as u32)
+}
+
+fn days_in_month(year: i32, month: u8) -> u8 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
 
 #[repr(C, align(16))]
 #[derive(Clone, Copy)]

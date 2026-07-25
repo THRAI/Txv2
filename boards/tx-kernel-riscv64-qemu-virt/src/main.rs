@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+#[cfg(not(test))]
 use core::panic::PanicInfo;
 use tx_hal::{BootHandoff, KernelMain};
 
@@ -31,6 +32,7 @@ pub extern "C" fn tx_kernel_riscv64_qemu_trap_dispatch(
 }
 
 #[panic_handler]
+#[cfg(not(test))]
 fn panic(info: &PanicInfo<'_>) -> ! {
     use core::fmt::Write;
     struct ConsoleWriter;

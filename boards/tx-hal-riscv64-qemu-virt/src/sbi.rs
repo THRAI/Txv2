@@ -15,6 +15,7 @@ pub(super) fn sbi_console_putchar(byte: u8) {
             "ecall",
             inlateout("a0") byte as usize => _,
             in("a7") 1usize,
+            clobber_abi("C"),
             options(nostack)
         );
     }
@@ -40,6 +41,7 @@ pub(super) fn sbi_console_getchar() -> Option<u8> {
             "ecall",
             lateout("a0") value,
             in("a7") 2usize,
+            clobber_abi("C"),
             options(nostack)
         );
     }
@@ -68,6 +70,7 @@ pub(super) fn sbi_hart_start(hart_id: usize, start_addr: usize, opaque: usize) -
             in("a6") 0usize,
             in("a7") 0x48534dusize,
             lateout("a1") _,
+            clobber_abi("C"),
             options(nostack)
         );
     }
@@ -85,6 +88,7 @@ pub(super) fn sbi_send_ipi(hart_mask: u64, hart_mask_base: usize) -> isize {
             in("a6") 0usize,
             in("a7") 0x735049usize,
             lateout("a1") _,
+            clobber_abi("C"),
             options(nostack)
         );
     }
@@ -102,6 +106,7 @@ pub(super) fn sbi_remote_fence_i(hart_mask: u64, hart_mask_base: usize) -> isize
             in("a6") 0usize,
             in("a7") 0x52464e43usize,
             lateout("a1") _,
+            clobber_abi("C"),
             options(nostack)
         );
     }
@@ -126,6 +131,7 @@ pub(super) fn sbi_remote_sfence_vma(
             in("a6") 1usize,
             in("a7") 0x52464e43usize,
             lateout("a1") _,
+            clobber_abi("C"),
             options(nostack)
         );
     }
@@ -152,6 +158,7 @@ pub(super) fn sbi_remote_sfence_vma_asid(
             in("a6") 2usize,
             in("a7") 0x52464e43usize,
             lateout("a1") _,
+            clobber_abi("C"),
             options(nostack)
         );
     }
@@ -161,6 +168,6 @@ pub(super) fn sbi_remote_sfence_vma_asid(
 #[cfg(target_arch = "riscv64")]
 pub(super) fn sbi_shutdown() {
     unsafe {
-        core::arch::asm!("ecall", in("a7") 8usize, options(nostack));
+        core::arch::asm!("ecall", in("a7") 8usize, clobber_abi("C"), options(nostack));
     }
 }

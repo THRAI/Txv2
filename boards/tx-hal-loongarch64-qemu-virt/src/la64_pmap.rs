@@ -107,9 +107,13 @@ pub(crate) fn la64_kernel_addr_to_phys(addr: usize) -> usize {
 }
 
 pub(crate) fn alloc_la64_asid() -> Result<Asid, PmapError> {
-    for word_index in 0..LA64_ASID_BITMAP_WORDS {
+    for (word_index, word) in LA64_ALLOCATED_ASIDS
+        .iter()
+        .enumerate()
+        .take(LA64_ASID_BITMAP_WORDS)
+    {
         loop {
-            let allocated = LA64_ALLOCATED_ASIDS[word_index].load(Ordering::Acquire);
+            let allocated = word.load(Ordering::Acquire);
             // ASID 0 is reserved (word 0, bit 0).
             let reserved = if word_index == 0 { 1 } else { 0 };
             if allocated | reserved == u64::MAX {
@@ -124,7 +128,7 @@ pub(crate) fn alloc_la64_asid() -> Result<Asid, PmapError> {
                 if allocated & bit != 0 {
                     continue;
                 }
-                if LA64_ALLOCATED_ASIDS[word_index]
+                if word
                     .compare_exchange(
                         allocated,
                         allocated | bit,

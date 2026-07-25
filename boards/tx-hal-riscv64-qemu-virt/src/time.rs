@@ -3,6 +3,18 @@
 // the property.
 pub(crate) const QEMU_VIRT_FALLBACK_TIMEBASE_HZ: u64 = 10_000_000;
 
+/// Describe the QEMU virt architectural time counter for the vDSO contract.
+/// The platform supplies the DTB-derived frequency when boot facts are live.
+pub(crate) const fn vdso_counter_info(frequency_hz: u64) -> tx_hal::VdsoCounterInfo {
+    tx_hal::VdsoCounterInfo {
+        frequency_hz,
+        mask: !0,
+        stable: true,
+        user_readable: cfg!(target_arch = "riscv64"),
+        mode: tx_hal::VdsoCounterMode::RiscvTime,
+    }
+}
+
 pub(crate) fn read_ns(frequency_hz: u64) -> u64 {
     tx_hal::time::ticks_to_ns(read_time_ticks(), frequency_hz)
 }
@@ -32,7 +44,7 @@ pub(crate) fn enable_timer_wakeups() {
 }
 
 #[cfg(target_arch = "riscv64")]
-fn read_time_ticks() -> u64 {
+pub(crate) fn read_time_ticks() -> u64 {
     let ticks: u64;
     unsafe {
         core::arch::asm!("rdtime {ticks}", ticks = out(reg) ticks, options(nomem, nostack));
@@ -41,7 +53,7 @@ fn read_time_ticks() -> u64 {
 }
 
 #[cfg(not(target_arch = "riscv64"))]
-fn read_time_ticks() -> u64 {
+pub(crate) fn read_time_ticks() -> u64 {
     0
 }
 
@@ -62,6 +74,8 @@ fn sbi_set_timer(_deadline_ticks: u64) {}
 
 #[cfg(test)]
 mod tests {
+    use tx_hal::VdsoCounterMode;
+
     use tx_hal::time::{deadline_ns_to_ticks, ticks_to_ns};
 
     #[test]
@@ -76,5 +90,14 @@ mod tests {
         assert_eq!(deadline_ns_to_ticks(999_999_999, 10_000_000), 10_000_000);
         assert_eq!(deadline_ns_to_ticks(1_000_000_000, 10_000_000), 10_000_000);
         assert_eq!(deadline_ns_to_ticks(u64::MAX, u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn qemu_counter_descriptor_only_advertises_user_reads_on_rv64() {
+        let info = super::vdso_counter_info(10_000_000);
+        assert_eq!(info.mode, VdsoCounterMode::RiscvTime);
+        assert!(info.stable);
+        assert_eq!(info.user_readable, cfg!(target_arch = "riscv64"));
+        assert_eq!(info.frequency_hz, 10_000_000);
     }
 }

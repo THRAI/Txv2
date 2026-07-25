@@ -5,7 +5,7 @@ extern crate alloc;
 extern crate std;
 
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 mod boot_static;
 mod boot_trampoline;
@@ -33,16 +33,18 @@ use dtb::parse_boot_info_from_fdt;
 use pmap::topology as pmap_topology;
 use tx_hal::{
     AllocError, Arch, ArchAuxvFacts, Asid, AuxvIf, BootArg, BootHandoff, BootInfo, BootInfoIf,
-    BootPlatformIf, BootProtocol, BootstrapPmapInfo, CacheIf, ConsoleIf, CpuId, CpuMask, DmaAddr,
-    DmaDirection, DmaIf, EntropyIf, InitIf, IpiKind, IrqDispatchTable, IrqHandled, IrqIf,
-    MemoryRegion, MemoryRegionKind, ObserverIf, PercpuIf, PhysAddr, PlatformConfig, PlatformInfo,
-    PlatformInfoIf, PmapError, PmapIf, PmapInvalidation, PmapPermissions, PmapReservation,
-    PmapReserveKind, PmapRoot, PmapUnmapResult, PowerIf, PtNode, PtNodeAllocator, SecondaryEntry,
-    SmpIf, TimeIf, VirtAddr,
+    BootPlatformIf, BootProtocol, BootstrapPmapInfo, CacheIf, ConsoleIf, CpuId, CpuMask,
+    DeadlineTimerIf, DmaAddr, DmaDirection, DmaIf, EntropyIf, InitIf, IpiKind, IrqDispatchTable,
+    IrqHandled, IrqIf, LocalExecutionGuard, MemoryRegion, MemoryRegionKind, MonotonicCounterIf,
+    ObserverIf, PercpuIf, PersistentClockError, PersistentClockIf, PhysAddr, PlatformConfig,
+    PlatformInfo, PlatformInfoIf, PmapError, PmapIf, PmapInvalidation, PmapPermissions,
+    PmapReservation, PmapReserveKind, PmapRoot, PmapUnmapResult, PowerIf, PtNode, PtNodeAllocator,
+    SecondaryEntry, SmpIf, VdsoCounterInfo, VirtAddr,
 };
 
 pub struct Platform;
 
+#[cfg(any(target_arch = "riscv64", test))]
 fn for_each_console_byte_for_sbi(bytes: &[u8], mut emit: impl FnMut(u8)) {
     let mut idx = 0;
     while idx < bytes.len() {
@@ -84,8 +86,31 @@ const PLIC_ENABLE_CONTEXT_STRIDE: usize = 0x80;
 const PLIC_CONTEXT_BASE: usize = 0x20_0000;
 const PLIC_CONTEXT_STRIDE: usize = 0x1000;
 const PLIC_CLAIM_COMPLETE: usize = 0x4;
+#[cfg(any(target_arch = "riscv64", test))]
+const GOLDFISH_RTC_PHYS_BASE: usize = 0x0010_1000;
+#[cfg(target_arch = "riscv64")]
+const GOLDFISH_RTC_BASE: usize = pmap_topology::DIRECT_MAP_BASE + GOLDFISH_RTC_PHYS_BASE;
+const GOLDFISH_RTC_IRQ: u32 = 11;
+const GOLDFISH_RTC_TIME_LOW: usize = 0x00;
+const GOLDFISH_RTC_TIME_HIGH: usize = 0x04;
+const GOLDFISH_RTC_ALARM_LOW: usize = 0x08;
+const GOLDFISH_RTC_ALARM_HIGH: usize = 0x0c;
+const GOLDFISH_RTC_IRQ_ENABLED: usize = 0x10;
+const GOLDFISH_RTC_CLEAR_ALARM: usize = 0x14;
+const GOLDFISH_RTC_ALARM_STATUS: usize = 0x18;
+const GOLDFISH_RTC_CLEAR_INTERRUPT: usize = 0x1c;
 static ONLINE_CPUS: AtomicU64 = AtomicU64::new(0);
-static IPI_ACKED_CPUS: AtomicU64 = AtomicU64::new(0);
+const IPI_KIND_COUNT: usize = 5;
+const IPI_CPU_SLOTS: usize = u64::BITS as usize;
+static IPI_STATE_LOCKS: [AtomicBool; IPI_CPU_SLOTS] =
+    [const { AtomicBool::new(false) }; IPI_CPU_SLOTS];
+static IPI_PENDING_CPUS: [AtomicU64; IPI_KIND_COUNT] =
+    [const { AtomicU64::new(0) }; IPI_KIND_COUNT];
+static IPI_ACKED_CPUS: [AtomicU64; IPI_KIND_COUNT] = [const { AtomicU64::new(0) }; IPI_KIND_COUNT];
+#[cfg(test)]
+static TEST_IPI_TRANSPORT_MASK: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static TEST_LOCAL_MEMBARRIER_ACTIONS: AtomicUsize = AtomicUsize::new(0);
 static ASID_RESIDENCY: [AtomicU64; pmap::ASID_CAPACITY] =
     [const { AtomicU64::new(0) }; pmap::ASID_CAPACITY];
 static FALLBACK_IRQ_DEPTH: AtomicUsize = AtomicUsize::new(0);
@@ -151,13 +176,13 @@ pub struct KernelResumeCtx {
 // asm (`TX_RV64_RCTX_SP`, `TX_RV64_RCTX_RA`, `TX_RV64_RCTX_S0`). The
 // Rust constants below pin the layout from the Rust side so a struct
 // reorder triggers a compile-time mismatch with the static_assert.
-const KERNEL_RESUME_CTX_SP_OFFSET: usize = 0;
-const KERNEL_RESUME_CTX_RA_OFFSET: usize = 8;
-const KERNEL_RESUME_CTX_S0_OFFSET: usize = 16;
+const _KERNEL_RESUME_CTX_SP_OFFSET: usize = 0;
+const _KERNEL_RESUME_CTX_RA_OFFSET: usize = 8;
+const _KERNEL_RESUME_CTX_S0_OFFSET: usize = 16;
 const _: () = assert!(core::mem::size_of::<KernelResumeCtx>() == 14 * 8);
-const _: () = assert!(core::mem::offset_of!(KernelResumeCtx, sp) == KERNEL_RESUME_CTX_SP_OFFSET);
-const _: () = assert!(core::mem::offset_of!(KernelResumeCtx, ra) == KERNEL_RESUME_CTX_RA_OFFSET);
-const _: () = assert!(core::mem::offset_of!(KernelResumeCtx, s) == KERNEL_RESUME_CTX_S0_OFFSET);
+const _: () = assert!(core::mem::offset_of!(KernelResumeCtx, sp) == _KERNEL_RESUME_CTX_SP_OFFSET);
+const _: () = assert!(core::mem::offset_of!(KernelResumeCtx, ra) == _KERNEL_RESUME_CTX_RA_OFFSET);
+const _: () = assert!(core::mem::offset_of!(KernelResumeCtx, s) == _KERNEL_RESUME_CTX_S0_OFFSET);
 
 /// Per-hart cell with `Sync` because the only writer/reader is the
 /// local hart's trap-vector / userspace-entry shim. Cross-hart
@@ -518,6 +543,8 @@ impl IrqIf for Platform {
     /// QEMU `virt` machine's 16550 UART is wired at PLIC IRQ 10.
     /// Source: `qemu/hw/riscv/virt.c::UART0_IRQ`.
     const UART_IRQ: u32 = 10;
+    /// QEMU `virt` machine's goldfish RTC is wired at PLIC IRQ 11.
+    const RTC_IRQ: u32 = GOLDFISH_RTC_IRQ;
 
     fn in_irq_context() -> bool {
         irq_context_depth() != 0
@@ -525,6 +552,10 @@ impl IrqIf for Platform {
 
     fn interrupts_enabled() -> bool {
         supervisor_interrupts_enabled()
+    }
+
+    fn exclude_local_execution() -> LocalExecutionGuard {
+        exclude_supervisor_interrupts()
     }
 
     fn claim() -> u32 {
@@ -584,11 +615,25 @@ impl IrqIf for Platform {
         IrqHandled::Done
     }
 }
-impl TimeIf for Platform {
+impl MonotonicCounterIf for Platform {
     fn read_ns() -> u64 {
         time::read_ns(Self::frequency_hz())
     }
 
+    fn frequency_hz() -> u64 {
+        Self::platform_info().timebase_frequency_hz
+    }
+
+    fn vdso_counter_info() -> Option<VdsoCounterInfo> {
+        Some(time::vdso_counter_info(Self::frequency_hz()))
+    }
+
+    fn read_vdso_counter() -> u64 {
+        time::read_time_ticks()
+    }
+}
+
+impl DeadlineTimerIf for Platform {
     fn set_deadline_ns(deadline: u64) {
         time::set_deadline_ns(deadline, Self::frequency_hz());
     }
@@ -600,11 +645,37 @@ impl TimeIf for Platform {
     fn enable_timer_wakeups() {
         time::enable_timer_wakeups();
     }
+}
 
-    fn frequency_hz() -> u64 {
-        Self::platform_info().timebase_frequency_hz
+impl PersistentClockIf for Platform {
+    fn read_realtime_ns() -> Result<u64, PersistentClockError> {
+        Ok(goldfish_rtc_read_time_ns())
+    }
+
+    fn set_realtime_ns(ns: u64) -> Result<(), PersistentClockError> {
+        goldfish_rtc_write_time_ns(ns);
+        Ok(())
+    }
+
+    fn set_wake_alarm_ns(ns: u64) -> Result<(), PersistentClockError> {
+        goldfish_rtc_program_alarm_ns(ns);
+        Self::set_priority(GOLDFISH_RTC_IRQ, 1);
+        Self::unmask(GOLDFISH_RTC_IRQ);
+        Ok(())
+    }
+
+    fn clear_wake_alarm() -> Result<(), PersistentClockError> {
+        goldfish_rtc_disable_alarm();
+        Self::mask(GOLDFISH_RTC_IRQ);
+        Ok(())
+    }
+
+    fn acknowledge_wake_alarm_irq() -> Result<(), PersistentClockError> {
+        goldfish_rtc_ack_alarm_irq();
+        Ok(())
     }
 }
+
 impl PercpuIf for Platform {
     fn current_cpu_id() -> CpuId {
         current_cpu_id()
@@ -689,7 +760,7 @@ impl SmpIf for Platform {
         let current = current_cpu_id();
         let mut started_mask = CpuMask::EMPTY;
 
-        IPI_ACKED_CPUS.store(0, Ordering::Release);
+        reset_ipi_software_state();
         pmap::install_secondary_identity_bridge();
         for cpu in 0..MAX_BOOT_CPUS {
             let cpu = CpuId(cpu);
@@ -721,8 +792,8 @@ impl SmpIf for Platform {
         core::hint::spin_loop();
     }
 
-    fn pending_ipi(_kind: IpiKind) -> bool {
-        supervisor_software_interrupt_pending()
+    fn pending_ipi(kind: IpiKind) -> bool {
+        ipi_pending_on_cpu(current_cpu_id(), kind)
     }
 
     fn park_this_cpu() -> ! {
@@ -732,28 +803,38 @@ impl SmpIf for Platform {
         }
     }
 
-    fn send_ipi(target: CpuId, _kind: IpiKind) {
+    fn send_ipi(target: CpuId, kind: IpiKind) {
         if target == current_cpu_id() {
             return;
         }
-        send_sbi_ipi(CpuMask::single(target));
+        send_software_ipi(CpuMask::single(target), kind);
     }
 
-    fn broadcast_ipi(mask: CpuMask, _kind: IpiKind) {
-        send_sbi_ipi(mask);
+    fn broadcast_ipi(mask: CpuMask, kind: IpiKind) {
+        let current = current_cpu_id();
+        let current_mask = CpuMask::single(current);
+        let remote_mask = CpuMask::from_bits(mask.bits() & !current_mask.bits());
+        send_software_ipi(remote_mask, kind);
+        if mask.contains(current) {
+            process_local_ipi(current, kind);
+        }
     }
 
-    fn ack_ipi(_kind: IpiKind) {
-        mark_ipi_ack(current_cpu_id());
-        clear_supervisor_software_interrupt();
+    fn ack_ipi(kind: IpiKind) {
+        let cpu = current_cpu_id();
+        let locked = lock_ipi_targets(CpuMask::single(cpu));
+        if acknowledge_ipi_on_cpu(cpu, kind) {
+            clear_supervisor_software_interrupt();
+        }
+        unlock_ipi_targets(locked);
     }
 
-    fn clear_ipi_ack_cpus(_kind: IpiKind, mask: CpuMask) {
-        IPI_ACKED_CPUS.fetch_and(!mask.bits(), Ordering::AcqRel);
+    fn clear_ipi_ack_cpus(kind: IpiKind, mask: CpuMask) {
+        IPI_ACKED_CPUS[ipi_kind_index(kind)].fetch_and(!mask.bits(), Ordering::AcqRel);
     }
 
-    fn ipi_ack_cpus(_kind: IpiKind) -> CpuMask {
-        CpuMask::from_bits(IPI_ACKED_CPUS.load(Ordering::Acquire))
+    fn ipi_ack_cpus(kind: IpiKind) -> CpuMask {
+        CpuMask::from_bits(IPI_ACKED_CPUS[ipi_kind_index(kind)].load(Ordering::Acquire))
     }
 }
 
@@ -829,7 +910,7 @@ const OBS_RING_HARTS: usize = 4;
 struct ObsRingBuf([u8; OBS_RING_BYTES]);
 
 #[no_mangle]
-#[link_section = ".bss.observe_rings"]
+#[cfg_attr(target_arch = "riscv64", link_section = ".bss.observe_rings")]
 static mut TX_OBSERVE_RINGS: [ObsRingBuf; OBS_RING_HARTS] =
     [const { ObsRingBuf([0u8; OBS_RING_BYTES]) }; OBS_RING_HARTS];
 
@@ -1086,6 +1167,45 @@ fn plic_set_enabled(context: usize, irq: u32, enabled: bool) {
     plic_write_u32(offset, next);
 }
 
+fn split_u64(value: u64) -> (u32, u32) {
+    (value as u32, (value >> 32) as u32)
+}
+
+fn join_u64(low: u32, high: u32) -> u64 {
+    u64::from(low) | (u64::from(high) << 32)
+}
+
+fn goldfish_rtc_read_time_ns() -> u64 {
+    let low = goldfish_rtc_read_u32(GOLDFISH_RTC_TIME_LOW);
+    let high = goldfish_rtc_read_u32(GOLDFISH_RTC_TIME_HIGH);
+    join_u64(low, high)
+}
+
+fn goldfish_rtc_write_time_ns(ns: u64) {
+    let (low, high) = split_u64(ns);
+    goldfish_rtc_write_u32(GOLDFISH_RTC_TIME_HIGH, high);
+    goldfish_rtc_write_u32(GOLDFISH_RTC_TIME_LOW, low);
+}
+
+fn goldfish_rtc_program_alarm_ns(ns: u64) {
+    let (low, high) = split_u64(ns);
+    goldfish_rtc_write_u32(GOLDFISH_RTC_ALARM_HIGH, high);
+    goldfish_rtc_write_u32(GOLDFISH_RTC_ALARM_LOW, low);
+    goldfish_rtc_write_u32(GOLDFISH_RTC_IRQ_ENABLED, 1);
+}
+
+fn goldfish_rtc_disable_alarm() {
+    goldfish_rtc_write_u32(GOLDFISH_RTC_IRQ_ENABLED, 0);
+    if goldfish_rtc_read_u32(GOLDFISH_RTC_ALARM_STATUS) != 0 {
+        goldfish_rtc_write_u32(GOLDFISH_RTC_CLEAR_ALARM, 1);
+    }
+    goldfish_rtc_write_u32(GOLDFISH_RTC_CLEAR_INTERRUPT, 1);
+}
+
+fn goldfish_rtc_ack_alarm_irq() {
+    goldfish_rtc_write_u32(GOLDFISH_RTC_CLEAR_INTERRUPT, 1);
+}
+
 #[cfg(target_arch = "riscv64")]
 fn plic_read_u32(offset: usize) -> u32 {
     unsafe { ((PLIC_BASE + offset) as *const u32).read_volatile() }
@@ -1169,6 +1289,40 @@ fn plic_write_u32(offset: usize, value: u32) {
     HOST_PLIC_STATE
         .lock()
         .expect("host plic state")
+        .write_u32(offset, value);
+}
+
+#[cfg(target_arch = "riscv64")]
+fn goldfish_rtc_read_u32(offset: usize) -> u32 {
+    unsafe { ((GOLDFISH_RTC_BASE + offset) as *const u32).read_volatile() }
+}
+
+#[cfg(target_arch = "riscv64")]
+fn goldfish_rtc_write_u32(offset: usize, value: u32) {
+    unsafe { ((GOLDFISH_RTC_BASE + offset) as *mut u32).write_volatile(value) };
+}
+
+#[cfg(all(not(target_arch = "riscv64"), not(test)))]
+fn goldfish_rtc_read_u32(_offset: usize) -> u32 {
+    0
+}
+
+#[cfg(all(not(target_arch = "riscv64"), not(test)))]
+fn goldfish_rtc_write_u32(_offset: usize, _value: u32) {}
+
+#[cfg(all(not(target_arch = "riscv64"), test))]
+fn goldfish_rtc_read_u32(offset: usize) -> u32 {
+    HOST_GOLDFISH_RTC_STATE
+        .lock()
+        .expect("host goldfish rtc state")
+        .read_u32(offset)
+}
+
+#[cfg(all(not(target_arch = "riscv64"), test))]
+fn goldfish_rtc_write_u32(offset: usize, value: u32) {
+    HOST_GOLDFISH_RTC_STATE
+        .lock()
+        .expect("host goldfish rtc state")
         .write_u32(offset, value);
 }
 
@@ -1263,6 +1417,92 @@ impl HostPlicState {
 static HOST_PLIC_STATE: std::sync::Mutex<HostPlicState> =
     std::sync::Mutex::new(HostPlicState::new());
 
+#[cfg(all(not(target_arch = "riscv64"), test))]
+struct HostGoldfishRtcState {
+    registers: [u32; 8],
+    read_offsets: [usize; 16],
+    read_len: usize,
+    write_offsets: [usize; 16],
+    write_values: [u32; 16],
+    write_len: usize,
+}
+
+#[cfg(all(not(target_arch = "riscv64"), test))]
+impl HostGoldfishRtcState {
+    const fn new() -> Self {
+        Self {
+            registers: [0; 8],
+            read_offsets: [0; 16],
+            read_len: 0,
+            write_offsets: [0; 16],
+            write_values: [0; 16],
+            write_len: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    fn set_time_ns(&mut self, ns: u64) {
+        let (low, high) = split_u64(ns);
+        self.registers[GOLDFISH_RTC_TIME_LOW / core::mem::size_of::<u32>()] = low;
+        self.registers[GOLDFISH_RTC_TIME_HIGH / core::mem::size_of::<u32>()] = high;
+    }
+
+    fn set_alarm_status(&mut self, status: bool) {
+        self.registers[GOLDFISH_RTC_ALARM_STATUS / core::mem::size_of::<u32>()] = u32::from(status);
+    }
+
+    fn read_u32(&mut self, offset: usize) -> u32 {
+        self.record_read(offset);
+        self.registers
+            .get(offset / core::mem::size_of::<u32>())
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn write_u32(&mut self, offset: usize, value: u32) {
+        self.record_write(offset, value);
+        if let Some(register) = self.registers.get_mut(offset / core::mem::size_of::<u32>()) {
+            *register = value;
+        }
+    }
+
+    fn record_read(&mut self, offset: usize) {
+        if let Some(slot) = self.read_offsets.get_mut(self.read_len) {
+            *slot = offset;
+            self.read_len += 1;
+        }
+    }
+
+    fn record_write(&mut self, offset: usize, value: u32) {
+        if let Some(slot) = self.write_offsets.get_mut(self.write_len) {
+            *slot = offset;
+        }
+        if let Some(slot) = self.write_values.get_mut(self.write_len) {
+            *slot = value;
+            self.write_len += 1;
+        }
+    }
+
+    fn read_log(&self) -> &[usize] {
+        &self.read_offsets[..self.read_len]
+    }
+
+    fn write_log(&self) -> &[usize] {
+        &self.write_offsets[..self.write_len]
+    }
+
+    fn write_values(&self) -> &[u32] {
+        &self.write_values[..self.write_len]
+    }
+}
+
+#[cfg(all(not(target_arch = "riscv64"), test))]
+static HOST_GOLDFISH_RTC_STATE: std::sync::Mutex<HostGoldfishRtcState> =
+    std::sync::Mutex::new(HostGoldfishRtcState::new());
+
 pub(crate) struct IrqContextGuard {
     depth: &'static AtomicUsize,
 }
@@ -1317,6 +1557,40 @@ fn supervisor_interrupts_enabled() -> bool {
     }
 }
 
+fn exclude_supervisor_interrupts() -> LocalExecutionGuard {
+    #[cfg(target_arch = "riscv64")]
+    {
+        let saved: usize;
+        unsafe {
+            core::arch::asm!(
+                "csrrci {saved}, sstatus, 2",
+                saved = out(reg) saved,
+                options(nostack)
+            );
+            LocalExecutionGuard::new(saved & (1 << 1), restore_supervisor_interrupts)
+        }
+    }
+
+    #[cfg(not(target_arch = "riscv64"))]
+    unsafe {
+        LocalExecutionGuard::new(0, restore_supervisor_interrupts)
+    }
+}
+
+unsafe fn restore_supervisor_interrupts(saved: usize) {
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        if saved & (1 << 1) != 0 {
+            core::arch::asm!("csrsi sstatus, 2", options(nostack));
+        } else {
+            core::arch::asm!("csrci sstatus, 2", options(nostack));
+        }
+    }
+
+    #[cfg(not(target_arch = "riscv64"))]
+    let _ = saved;
+}
+
 fn enable_supervisor_software_interrupts() {
     #[cfg(target_arch = "riscv64")]
     unsafe {
@@ -1331,25 +1605,101 @@ fn enable_supervisor_software_wakeups() {
     }
 }
 
-fn supervisor_software_interrupt_pending() -> bool {
-    #[cfg(target_arch = "riscv64")]
-    {
-        let sip: usize;
-        unsafe {
-            core::arch::asm!("csrr {sip}, sip", sip = out(reg) sip, options(nomem, nostack));
-        }
-        sip & 0x2 != 0
-    }
-
-    #[cfg(not(target_arch = "riscv64"))]
-    {
-        false
+const fn ipi_kind_index(kind: IpiKind) -> usize {
+    match kind {
+        IpiKind::Reschedule => 0,
+        IpiKind::TlbShootdown => 1,
+        IpiKind::Membarrier => 2,
+        IpiKind::Maintenance => 3,
+        IpiKind::Stop => 4,
     }
 }
 
-fn mark_ipi_ack(cpu_id: CpuId) {
+fn lock_ipi_targets(mask: CpuMask) -> u64 {
+    let mut bits = mask.bits();
+    let mut locked = 0;
+    while bits != 0 {
+        let cpu = bits.trailing_zeros() as usize;
+        while IPI_STATE_LOCKS[cpu]
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        let bit = 1u64 << cpu;
+        locked |= bit;
+        bits &= bits - 1;
+    }
+    locked
+}
+
+fn unlock_ipi_targets(mut bits: u64) {
+    while bits != 0 {
+        let cpu = bits.trailing_zeros() as usize;
+        IPI_STATE_LOCKS[cpu].store(false, Ordering::Release);
+        bits &= bits - 1;
+    }
+}
+
+fn send_software_ipi(mask: CpuMask, kind: IpiKind) {
+    let locked = lock_ipi_targets(mask);
+    IPI_PENDING_CPUS[ipi_kind_index(kind)].fetch_or(mask.bits(), Ordering::Release);
+    send_sbi_ipi(mask);
+    unlock_ipi_targets(locked);
+}
+
+fn process_local_ipi(cpu: CpuId, kind: IpiKind) {
+    let _irq_guard = <Platform as IrqIf>::exclude_local_execution();
+    let cpu_mask = CpuMask::single(cpu);
+    let locked = lock_ipi_targets(cpu_mask);
+    IPI_PENDING_CPUS[ipi_kind_index(kind)].fetch_or(cpu_mask.bits(), Ordering::Release);
+    execute_local_ipi_action(kind);
+    if acknowledge_ipi_on_cpu(cpu, kind) {
+        clear_supervisor_software_interrupt();
+    }
+    unlock_ipi_targets(locked);
+}
+
+fn execute_local_ipi_action(kind: IpiKind) {
+    if kind == IpiKind::Membarrier {
+        core::sync::atomic::fence(Ordering::SeqCst);
+        #[cfg(test)]
+        TEST_LOCAL_MEMBARRIER_ACTIONS.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+fn ipi_pending_on_cpu(cpu: CpuId, kind: IpiKind) -> bool {
+    let bit = CpuMask::single(cpu).bits();
+    bit != 0 && IPI_PENDING_CPUS[ipi_kind_index(kind)].load(Ordering::Acquire) & bit != 0
+}
+
+fn any_ipi_pending_on_cpu(cpu: CpuId) -> bool {
+    let bit = CpuMask::single(cpu).bits();
+    bit != 0
+        && IPI_PENDING_CPUS
+            .iter()
+            .any(|pending| pending.load(Ordering::Acquire) & bit != 0)
+}
+
+fn acknowledge_ipi_on_cpu(cpu: CpuId, kind: IpiKind) -> bool {
+    IPI_PENDING_CPUS[ipi_kind_index(kind)]
+        .fetch_and(!CpuMask::single(cpu).bits(), Ordering::AcqRel);
+    mark_ipi_ack(cpu, kind);
+    !any_ipi_pending_on_cpu(cpu)
+}
+
+fn reset_ipi_software_state() {
+    for pending in &IPI_PENDING_CPUS {
+        pending.store(0, Ordering::Release);
+    }
+    for acked in &IPI_ACKED_CPUS {
+        acked.store(0, Ordering::Release);
+    }
+}
+
+fn mark_ipi_ack(cpu_id: CpuId, kind: IpiKind) {
     if cpu_id.0 < u64::BITS as usize {
-        IPI_ACKED_CPUS.fetch_or(1u64 << cpu_id.0, Ordering::AcqRel);
+        IPI_ACKED_CPUS[ipi_kind_index(kind)].fetch_or(1u64 << cpu_id.0, Ordering::AcqRel);
     }
 }
 
@@ -1457,6 +1807,7 @@ fn mark_asid_resident_on_current_cpu(asid: Asid) {
     ASID_RESIDENCY[asid.0 as usize].fetch_or(1u64 << cpu.0, Ordering::AcqRel);
 }
 
+#[cfg(any(target_arch = "riscv64", test))]
 pub(crate) fn clear_current_asid_residency() {
     let asid = current_satp_asid();
     if asid.0 == 0 || (asid.0 as usize) >= ASID_RESIDENCY.len() {
@@ -1482,6 +1833,7 @@ pub(crate) fn clear_asid_residency(asid: Asid) {
     }
 }
 
+#[cfg(any(target_arch = "riscv64", test))]
 fn current_satp_asid() -> Asid {
     #[cfg(target_arch = "riscv64")]
     unsafe {
@@ -1501,6 +1853,9 @@ fn send_sbi_ipi(mask: CpuMask) {
     if mask == 0 {
         return;
     }
+
+    #[cfg(test)]
+    TEST_IPI_TRANSPORT_MASK.fetch_or(mask, Ordering::AcqRel);
 
     #[cfg(target_arch = "riscv64")]
     {

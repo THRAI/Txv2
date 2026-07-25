@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+#[cfg(not(test))]
 use core::panic::PanicInfo;
 use tx_hal::{BootHandoff, KernelMain};
 
@@ -20,6 +21,7 @@ pub extern "C" fn rust_entry(cpu_id: usize, firmware_arg: usize) -> ! {
 }
 
 #[panic_handler]
+#[cfg(not(test))]
 fn panic(_info: &PanicInfo<'_>) -> ! {
     tx_kernel::panic_shutdown::<ActivePlatform>()
 }
