@@ -2,15 +2,17 @@
 
 <!-- txdoc:05-FILESYSTEM-IO-MANAGER-V1 -->
 
-**Status.** v1 (2026-07-11). Draft architecture contract.
+**Status.** v1 (aligned 2026-07-25). Draft architecture contract.
 
-**Purpose.** Specify the txKernel I/O control plane that sits between
-`PageContainer` and device execution. The I/O manager is not a data cache and
-not a concrete filesystem. It owns submission queues, service futures,
-batching, priority, request completion, and block-request scheduling. It keeps
-ordinary file data owned by `PageContainer`, filesystem mapping owned by the
-mounted filesystem instance, and device execution owned by the device/driver
-layer.
+**Purpose.** Specify the txKernel file-I/O execution plane between
+`PageContainer`, filesystem layout lowering, and device execution. The I/O
+manager is not the global memory-pressure control plane, a data cache, or a
+concrete filesystem. It owns submission queues, service futures, bounded
+execution scheduling, graph execution, request completion, and block-request
+dispatch. It keeps ordinary file data owned by `PageContainer`, global
+reclaim/writeback policy owned by `MemoryPressureCoordinator`, filesystem
+layout and transaction semantics owned by the mounted filesystem instance,
+and hardware execution owned by the device/driver layer.
 
 **Audience.** PageBacked, VFS, filesystem, device, and reactor implementers
 working on the cold-file, mmap-fault, iozone, AIO, and block-device throughput
@@ -83,13 +85,16 @@ batch, map, dispatch, and complete the request.
 
 <!-- txdoc:IO-MANAGER-OWNERSHIP-RULE-1 -->
 
-The I/O manager is a control plane. It must not become a second page cache.
+The I/O manager is an execution plane. It must not become either a second page
+cache or a second memory-pressure/writeback policy owner.
 
 | Layer | Owns ordinary file data? | Owns |
 |---|---:|---|
 | `PageContainer` / `PageSlot` | Yes | published resident bindings, frame evidence, dirty/writeback generation state |
-| `PageIoSubmissionManager` | No | `PageIoRequest`s, batches, execution priority, readahead/writeback mechanics, request waiter routing |
-| Concrete filesystem | No, except private metadata | logical-file mapping, metadata cache, allocation/journal order |
+| `MemoryPressureCoordinator` | No | pressure episodes, dirty budgets, bounded reclaim/writeback intent, producer throttle decisions |
+| `PageIoSubmissionManager` | No | `PageIoRequest`s, admitted batches, graph execution, admitted resource-bundle custody, local execution priority, readahead/writeback mechanics, request waiter routing |
+| Pure filesystem pager | No | logical-file layout, allocation proposals, metadata after-images, journal/barrier dependencies |
+| Tx filesystem adapter | No; holds pre-admission resources only | transaction admission, temporary opaque-key binding, `FileIoPlan<K>` lowering, and atomic resource-bundle transfer to L4 |
 | `BlockSubmissionManager` | No | `Bio`, request tags, queue depth, LBA merge, barrier ordering |
 | Driver/HAL | No | DMA mapping, hardware descriptors, IRQ or polling completion |
 
@@ -98,10 +103,13 @@ metadata caches are allowed when they are private to a mounted filesystem and
 do not duplicate ordinary file data. Driver bounce buffers are temporary DMA
 staging objects and must be released after completion.
 
-Global memory pressure and dirty-budget policy are not owned by the I/O
-manager. The memory-pressure coordinator decides when and how much background
-reclaim/writeback to request; L4/L6 provide bounded execution, queue/service
-feedback, and typed completion.
+Global memory pressure, dirty thresholds, victim selection, and producer
+throttling are not owned by the I/O manager. The memory-pressure coordinator
+decides when, from which owner/domain, and how much background work to request.
+PageBacked validates concrete PageSlot generations and signs
+`PageDataLease`s. L4/L6 then provide bounded execution, queue/service feedback,
+and typed completion. Queue saturation may delay execution; it never clears
+dirty state or substitutes for the global dirty budget.
 
 ---
 
@@ -128,20 +136,26 @@ flowchart TB
     RR["RangeReservation"]
     SLOT["PageSlot FSM"]
     DATA["PC-owned frames"]
+    ADM["PageBacked owner admission / settlement"]
     PH["PageIoSubmissionHandle"]
   end
 
-  subgraph IOM["io_manager"]
+  subgraph IOM["io_manager execution plane"]
     PG["PageIoSubmissionManager (L4)"]
-    BP["backend_plan traits and plan values"]
+    GX["BackendBioGraph execution"]
     BLK["BlockSubmissionManager (L6)"]
     RT["service runtime: budget/wait/observe"]
   end
 
-  subgraph FS["concrete filesystem crates"]
-    EXT4["tx-ext4"]
+  subgraph FS["filesystem planning and lowering"]
+    AD["Tx filesystem adapter: pre-admission binding + lowering"]
+    EXT4["pure FileLayoutPlanner"]
     TMP["tmpfs / memfd / shm"]
-    BDEV["bdev-fs"]
+    BDEV["bdev-fs adapter"]
+  end
+
+  subgraph MPC["memory-pressure control plane"]
+    MC["MemoryPressureCoordinator"]
   end
 
   subgraph DEV["device execution"]
@@ -161,16 +175,21 @@ flowchart TB
   PC --> SLOT
   SLOT --> DATA
 
-  SLOT -->|"miss/writeback"| PH --> PG
-  PG --> BP
-  BP --> EXT4
-  BP --> TMP
-  BP --> BDEV
-  EXT4 -->|"BioPlan"| BLK
-  BDEV -->|"BioPlan"| BLK
+  SLOT -->|"miss / owner candidate generation"| ADM
+  ADM -->|"admitted generation + PageDataLease"| PH --> PG
+  PG -->|"request + opaque payload key"| AD
+  AD --> EXT4
+  EXT4 -->|"FileIoPlan K"| AD
+  AD -->|"existing BackendBioGraph"| GX
+  BDEV -->|"existing BackendBioGraph"| GX
+  GX --> BLK
   TMP -->|"memory completion"| PG
   BLK --> HANDLE --> DRV --> HAL
-  HAL --> DRV -->|"completion"| BLK --> PG -->|"generation-checked complete"| SLOT
+  HAL --> DRV -->|"completion"| BLK --> GX --> PG -->|"owned terminal settlement"| ADM
+  ADM -->|"generation-checked PageSlot transition"| SLOT
+  MC -->|"bounded writeback intent / owner domain"| ADM
+  PG -->|"page execution feedback"| MC
+  BLK -->|"queue and service feedback"| MC
 
   OD --> OF --> RR
   RR -->|"flush/wait/invalidate overlapping slots"| SLOT
@@ -206,62 +225,88 @@ PC lock.
 It owns:
 
 - `PageIoRequest`, `PageIoBatch`, and `PageIoCompletion`;
-- demand-read, mmap-fault, writeback, fsync, and readahead priority;
+- execution ordering within demand-read, mmap-fault, writeback, fsync, and
+  readahead classes supplied by request admission;
 - same-page miss deduplication and waiter routing;
 - page-range batching and short plug windows;
-- generic file-data readahead policy;
-- dirty/writeback scan cursors; and
-- completion application through `PageContainer` public APIs.
+- generic file-data readahead pattern detection and optional-request mechanics,
+  bounded by current memory/queue pressure;
+- progress cursors for already-admitted writeback work;
+- custody of the admitted request resource bundle until terminal routing;
+- execution state for the existing `BackendBioGraph`; and
+- construction and delivery of one owned terminal settlement through
+  `PageContainer` public APIs.
 
 It does not own:
 
 - ordinary file-data frames after completion;
+- global dirty thresholds, reclaim victim choice, or writeback quotas;
+- `PageSlot` dirty/writeback generation transitions;
 - filesystem extent or allocation state;
 - block-device queue depth or tags; or
 - driver DMA descriptors.
 
-### 4.2 L5 - backend planning
+### 4.2 L5 - filesystem planning and Tx lowering boundary
 
 <!-- txdoc:IO-MANAGER-L5-BACKEND-PLANNING-1 -->
 
-L5 is an interface layer, not a concrete filesystem module. It translates
-logical page requests into a filesystem-neutral plan. Concrete filesystems
-implement the planner interface.
+L5 is a cross-crate boundary, not an I/O-manager-owned concrete filesystem
+module. The pure filesystem pager implements `FileLayoutPlanner` and returns
+`FileIoPlan<K>`. Before graph admission, a Tx filesystem adapter outside
+`io_manager` temporarily retains the actual `PageDataLease` or direct-I/O
+pins, supplies opaque payload keys, admits transaction capabilities, and
+lowers the pure plan into the existing `BackendBioGraph`.
 
-L5 receives:
+The pure planner receives:
 
-- `FsObjectId` or equivalent mounted-filesystem object identity;
-- logical page ranges and operation type;
-- source frames for writeback or target slots for read;
-- fsync/truncate/fallocate/direct-I/O context; and
-- the current guard/wait context.
+- filesystem/object identity and immutable format inputs;
+- logical file ranges, operation, durability intent, and transaction domain;
+- caller-provided opaque payload keys; and
+- immutable metadata observations or a typed resume token requesting more
+  immutable input.
 
-L5 returns a plan:
+It returns only the canonical pure DTO:
 
 ```rust
-pub enum PageIoPlan {
-    Complete(PageCompletionList),
-    SubmitBios(BioPlanList),
-    MetadataFirst {
-        bios: BioPlanList,
-        resume: PagerResumeToken,
-    },
-    Yield(WaitEndpoint),
-    Err(Errno),
+pub trait FileLayoutPlanner {
+    type PayloadKey: Copy + Eq;
+
+    fn plan(
+        &self,
+        request: FileLayoutRequest<Self::PayloadKey>,
+    ) -> Result<FileIoPlan<Self::PayloadKey>, FileLayoutError>;
 }
 ```
 
+`FileIoPlan<K>` contains file/LBA ranges, holes, allocation proposals,
+metadata after-images, dependencies, barrier domains, and opaque `K`. It
+contains no PPN, `PageFrameRef`, `BioVec`, queue tag, waiter, reactor object,
+PageBacked pointer, lease capability, or Tx completion callback.
+
+The Tx adapter receives the pure plan plus its private key-to-retained-segment
+table. It revalidates mutation preconditions, admits any
+`FrozenMetadataLease`, and lowers data and metadata nodes into the sole
+`BackendBioGraph`. Only this adapter can translate retained segments into
+`PageFrameRef`/`BioVec`; the pure pager cannot. The adapter owns the temporary
+resource bundle only through planning and lowering. Successful graph admission
+atomically transfers that bundle to the L4 graph execution; failed admission
+unwinds it back to PageBacked/direct-I/O ownership.
+
 Examples:
 
-- ext4 maps file pages through inode and extent metadata, returns zero-fill for
-  holes, allocates blocks on writeback, and returns block bios for mapped
-  extents.
+- ext4 maps file pages through inode and extent metadata, reports holes,
+  proposes allocation on writeback, and returns layout/transaction dependencies
+  which `tx-ext4` lowers into graph nodes.
 - tmpfs, memfd, and shm complete from memory and usually do not produce block
   bios.
-- bdev-fs maps page offsets directly to block-device LBA ranges.
+- bdev-fs maps page offsets directly and may lower to the existing graph
+  without an ext4-style pure pager.
 
 Concrete filesystem crates must not be imported by `io_manager`. They
-implement neutral traits consumed through `MountPayload`.
+implement or host neutral planning/adaptation surfaces consumed through the
+mounted filesystem payload. The current `FsPageBacking`, `BackendPlan`,
+`PageIoPlan`, and `BioPlan` paths are compatibility staging vocabulary, not a
+second target interface family.
 
 Filesystem mapping caches may independently use publication when they expose
 immutable mapping facts. In particular, an ext4 mapping/extent root is a strong
@@ -297,14 +342,17 @@ It owns:
 - tag allocation and tag-to-request completion lookup;
 - flush, FUA, and barrier ordering;
 - request timeout and retry policy; and
-- fairness between foreground demand I/O, fsync, writeback, readahead, and raw
-  block-device users.
+- local execution fairness between admitted foreground demand I/O, fsync,
+  writeback, readahead, and raw block-device requests.
 
 The existing `BackendBioGraph` is the sole BIO DAG. It is extended in place
 with retained lease slices, barrier domains, inherited priority, and typed
 completion routes. A second graph type is forbidden. Graph nodes may carry an
 existing PageBacked page-cache source/target or a direct-I/O DMA-pinned
 source/target; the variants retain their distinct lifetime and coherency rules.
+L4 owns graph-level request execution and terminal aggregation; L6 owns only
+ready BIO-node queueing, tags, dispatch, and node completion. L6 does not
+interpret file generations or transaction meaning.
 
 The first production scheduler should be deliberately small: FIFO with
 adjacent merge, read-deadline bias, queue-depth limits, tag completion, and
@@ -355,7 +403,7 @@ Service futures include:
 | Service | Queue owner | Primary wake sources |
 |---|---|---|
 | `kpageiod` | page requests and page completions | demand miss, mmap fault, `readahead`, page completion |
-| `kwriteback` | dirty-page cursors | fsync, dirty thresholds, memory pressure, periodic timer |
+| `kwriteback` | admitted writeback batches and graph progress | fsync frontier; coordinator-issued bounded writeback intent; page/block completion |
 | `kblockiod` | block bios and requests | bio submission, hardware completion, queue-space timer |
 | driver poll/completion service | hardware completion rings | IRQ, polling timer, outstanding request count |
 
@@ -372,6 +420,38 @@ run background maintenance
 sleep only after rechecking queues
 ```
 
+### 5.1 Coordinator work and feedback contract
+
+<!-- txdoc:IO-MANAGER-COORDINATOR-FEEDBACK-1 -->
+
+The coordinator never pushes raw pages, PPNs, owner locks, or callbacks into
+the I/O manager. A background writeback episode has this direction:
+
+```text
+MemoryPlan bounded intent
+  -> PageBacked owner scan + generation-checked admission
+  -> PageDataLease + PageIoRequest
+  -> Tx filesystem adapter pre-admission bundle + BackendBioGraph
+  -> L4 admitted graph + resource-bundle custody -> L6 BIO execution
+  -> L4 owned terminal settlement -> PageBacked generation validation
+  -> PageSlot typed transition
+  -> immutable progress/service feedback -> coordinator
+```
+
+The I/O manager reports facts, not policy decisions: admitted/completed bytes,
+queue delay, service time, graph/node backlog, request-size and SG distributions,
+merge results, queue-depth saturation, retry/timeout/error counts, bounce bytes
+by reason, and terminal completion generations. PageBacked separately reports
+dirty generations cleaned and frames that actually became allocator-free. The
+coordinator combines these receipts on its next `MemoryPolicy` invocation.
+
+PageBacked remains the semantic owner of file data throughout. The adapter has
+temporary custody before graph admission; L4 has custody after admission. L6
+completion alone cannot release a lease. L4 aggregates all participating nodes
+and transfers exactly one owned terminal settlement bundle to PageBacked, which
+performs the final object/range/generation validation before changing
+`PageSlot` state and settling, retrying, or rolling back the bundle.
+
 ---
 
 ## 6. Plugging, priority, and readahead
@@ -387,7 +467,9 @@ Demand requests may use a very short plug window bounded by the current future,
 reactor turn, batch threshold, queue-idle state, or impending yield. Readahead
 and background writeback may wait longer and are cancellable.
 
-Initial priority order:
+The coordinator owns admission quotas and pressure-driven class budgets; the
+I/O manager owns only ordering among already-admitted work. Initial local
+priority order:
 
 1. completion processing;
 2. demand page faults and foreground reads;
@@ -396,18 +478,20 @@ Initial priority order:
 5. readahead;
 6. background writeback.
 
-The first L4 readahead policy is adaptive but conservative:
+The first L4 readahead detector is adaptive but conservative:
 
 ```text
 first miss: demand page plus a small optional window
 sequential hit: grow the window up to a cap
 readahead marker hit: trigger the next asynchronous window
 random access: shrink or disable the window
-memory or queue pressure: drop optional tail
+memory or queue pressure: cancel or drop optional tail
 ```
 
 Readahead installs pages into `PageContainer` only. VM PTE prefault is a
 separate VM policy and must not be implied by file-data readahead.
+Readahead pages remain ordinary PageBacked candidates; L4 does not protect them
+from reclaim or charge them outside the coordinator's pressure accounting.
 
 ---
 
@@ -504,33 +588,36 @@ slots after successful direct writes instead of trying to update them in place.
 
 <!-- txdoc:IO-MANAGER-FILESYSTEM-ISOLATION-1 -->
 
-The I/O manager must not import concrete filesystem crates. The isolation
-boundary is a neutral pager/plan interface hosted by the mounted filesystem
-payload.
+The I/O manager must not import concrete filesystem crates. The target
+isolation boundary is the pure `tx-pager-api` DTO surface plus a Tx filesystem
+adapter hosted by the mounted filesystem payload.
 
 ```mermaid
 flowchart LR
-  VFS["VFS / Mount"] --> IFACE["fs_iface: FsOps + PagePager + Plan"]
-  PB["PageBacked"] --> IFACE
-  IOM["io_manager"] --> IFACE
-  EXT4["tx-ext4"] -.implements.-> IFACE
-  TMP["tmpfs"] -.implements.-> IFACE
-  BDEV["bdev-fs"] -.implements.-> IFACE
+  VFS["VFS / Mount"] --> AD["Tx filesystem adapter"]
+  PB["PageBacked + PageDataLease"] --> AD
+  AD --> API["tx-pager-api: request + FileIoPlan K"]
+  EXT4["pure ext4 pager"] -.implements.-> API
+  AD --> BG["existing BackendBioGraph"]
+  BG --> IOM["io_manager execution"]
+  TMP["tmpfs"] -->|"memory completion"| IOM
+  BDEV["bdev-fs adapter"] --> BG
 ```
 
 The target interface split is:
 
 - `FsOps`: namespace and metadata operations consumed by VFS and Mount.
-- `PagePager` or successor to `FsPageBacking`: page-data planning consumed by
-  PageBacked/I/O manager.
-- `PageIoPlan`/`BioPlan`: neutral intermediate representation between page
-  requests and block requests.
+- `FileLayoutPlanner`: pure range/layout/transaction planning over
+  caller-supplied opaque payload keys.
+- `FileIoPlan<K>`: the sole pure planning DTO.
+- `BackendBioGraph`: the sole Tx block-I/O execution DAG after adapter
+  lowering.
 
 The existing `FsPageBacking::fetch_page` / `flush_page` surface is the current
-staging form. The I/O manager target refactors it into a planning interface so
-that filesystems produce plans and the I/O manager owns asynchronous execution.
-Until that migration lands, existing concrete filesystem implementations remain
-valid staging code.
+staging form. Existing `PageIoPlan`, `BackendPlan`, and `BioPlan` values remain
+valid compatibility code only while callers migrate. They must converge into
+`FileIoPlan<K>` at the pure boundary and the existing `BackendBioGraph` at the
+execution boundary; they are not promoted into parallel target abstractions.
 
 ---
 
@@ -561,8 +648,8 @@ explicitly page-backed.
 
 <!-- txdoc:IO-MANAGER-MODULE-TOPOLOGY-1 -->
 
-The implementation should keep data ownership and control-plane code in
-separate modules:
+The implementation should keep content ownership, planning adaptation, and
+I/O execution in separate modules/crates:
 
 ```text
 crates/tx-subsystems/src/page_backed/
@@ -581,13 +668,12 @@ crates/tx-subsystems/src/io_manager/
         request.rs
         queue.rs
         service.rs
-        readahead.rs
-        writeback.rs
+        readahead.rs       # optional request mechanics, not pressure policy
+        writeback.rs       # execution of admitted batches, not victim policy
         completion.rs
-    backend/
-        traits.rs
-        plan.rs
-        error.rs
+    graph/
+        execution.rs
+        completion.rs
     block/
         bio.rs
         request.rs
@@ -604,17 +690,25 @@ crates/tx-subsystems/src/io_manager/
 
 crates/tx-subsystems/src/fs_iface/
     ops.rs
-    pager.rs
+    pager.rs               # current compatibility bridge
+    plan.rs                # staging values plus BackendBioGraph
+
+crates/tx-pager-api/       # target; may begin module-local
+    request.rs
     plan.rs
+    key.rs
 ```
 
 Concrete filesystems stay outside `io_manager`:
 
 ```text
 crates/tx-ext4/src/
-    mapper.rs
+    adapter.rs             # pre-admission binding, transaction admission, lowering
     metadata_cache.rs
-    page_backend.rs
+
+crates/tx-ext4-pager/      # target; pure layout/transaction planning
+    mapper.rs
+    planner.rs
 
 crates/tx-fs/src/bdevfs/
     backing.rs
@@ -625,6 +719,10 @@ crates/tx-fs/src/bdevfs/
 This topology is a target shape, not a requirement to perform one large
 mechanical move. Behavior-preserving file splits should precede semantic
 changes when a current module is already over the source-size guardrail.
+In the current checkout, compatibility backend code still lives under
+`io_manager/backend/`, `BackendGraphExecution` still lives in
+`io_manager/page/service.rs`, and `BackendBioGraph` is declared in
+`fs_iface/plan.rs`; the tree above does not claim those moves have landed.
 
 ---
 
@@ -632,9 +730,10 @@ changes when a current module is already over the source-size guardrail.
 
 <!-- txdoc:IO-MANAGER-STAGED-MIGRATION-1 -->
 
-1. **Interface seam.** Introduce neutral request/plan types while existing
-   `FsPageBacking` implementations still complete synchronously or as
-   one-page steps.
+1. **Interface seam.** Freeze `PageDataLease`, pure
+   `FileLayoutRequest`/`FileIoPlan<K>`, and the existing `BackendBioGraph` as
+   the only target pipeline. Keep `FsPageBacking`, `PageIoPlan`, `BackendPlan`,
+   and `BioPlan` explicitly compatibility-only.
 2. **PageSlot and range reservation.** Move PC state from a coarse state lock
    toward per-slot state and a separate range-reservation table. A locked
    BTree/SparseIndex backend is acceptable in this stage.
@@ -648,12 +747,13 @@ changes when a current module is already over the source-size guardrail.
    persistent sparse root, unify PageSlot generation/dirty authority, and make
    cached resident reads independent of manager locks.
 6. **Page and block services.** Run `kpageiod`/`kwriteback` and `kblockiod`
-   service futures with demand-page priority, short plugging, same-page
-   deduplication, generation-checked completion, adjacent merge, tags, queue
-   depth, and barrier handling.
-7. **Filesystem planning.** Refactor ext4 and bdev-fs from direct
-   `fetch_page`/`flush_page` device calls to `PageIoPlan` and `BioPlan`
-   production.
+   service futures with coordinator-bounded work admission, demand-page
+   priority, short plugging, same-page deduplication, generation-checked
+   completion, adjacent merge, tags, queue depth, barrier handling, and
+   immutable service feedback.
+7. **Filesystem planning.** Extract pure ext4 `FileLayoutPlanner`; place lease
+   binding, transaction admission, and `FileIoPlan<K>` to `BackendBioGraph`
+   lowering in `tx-ext4`. Migrate bdev-fs directly to graph lowering.
 8. **Readahead and direct I/O.** Implement generic L4 readahead and the
    `O_DIRECT` range-coherency protocol.
 9. **Filesystem mapping publication.** Migrate measured immutable mapping
@@ -674,7 +774,9 @@ Ready to implement first:
 - manager extraction and typed page/block submission handles;
 - retire-capacity reservation and the generic publication primitive;
 - page and block service-future skeletons;
-- completion generation checks; and
+- completion generation checks;
+- manager feedback snapshots/receipts that contain no policy callbacks or
+  owner locks; and
 - focused tests for same-page deduplication, range conflict, direct-write
   invalidation, LBA merge, queue-depth blocking, and barrier ordering.
 
@@ -690,4 +792,6 @@ Deferred until the prerequisites above land:
 
 The first implementation should optimize the currently measured bottleneck:
 breaking the synchronous single-page path. More complex fairness and allocation
-algorithms belong after the request/completion boundary exists.
+algorithms belong after the request/completion boundary exists. I/O manager
+readiness does not by itself prove global writeback/reclaim readiness; that also
+requires the coordinator work/feedback contract and PageBacked owner admission.

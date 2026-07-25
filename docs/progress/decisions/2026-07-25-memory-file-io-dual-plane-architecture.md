@@ -52,6 +52,13 @@ and Zone/slab owners.
    persistent provider cursors and actual allocator-free feedback. Dirty
    writeback, metadata providers and refault-aware policy land only after their
    ownership and generation protocols are executable.
+8. Align `IO_MANAGER_v1` as the file-I/O execution plane. The coordinator sends
+   bounded intent to PageBacked owner admission, never raw pages or direct
+   `PageSlot` mutations. The Tx filesystem adapter has resource custody only
+   during planning/lowering; successful graph admission atomically transfers
+   custody to L4. L6 completes ready BIO nodes but cannot release leases or
+   clean pages. L4 transfers one owned terminal settlement back to PageBacked,
+   which alone validates generations and commits `PageSlot` transitions.
 
 The canonical contract is
 [`MEMORY_IO_ARCHITECTURE_v1.md`](../../design/03_memory-vm/MEMORY_IO_ARCHITECTURE_v1.md).
@@ -81,6 +88,10 @@ The canonical contract is
 - `PAGE_SUBSTRATE_v1`, `PAGE_BACKED_v1`, `IO_MANAGER_v1`, and
   `TX_EXT4_PLAN_v1_2` retain local authority but now point to the umbrella
   contract for cross-layer behavior.
+- `IO_MANAGER_v1` now distinguishes L4 graph/resource custody from L6 BIO-node
+  execution and preserves the existing `BackendBioGraph` as the sole execution
+  DAG. Current `FsPageBacking`, `PageIoPlan`, `BackendPlan`, and `BioPlan` names
+  are compatibility vocabulary, not a second target interface family.
 - The first implementation gate is dirty-authority unification and canonical
   PageContainer identity, followed by multi-page lease/planner extraction and
   clean-only pressure coordination.

@@ -94,7 +94,7 @@ How work runs: the step primitive and the runtime that drives it.
 
 - [`MOUNT_v1.md`](05_filesystem/MOUNT_v1.md) — mount subsystem: mount namespaces, mount tree, mountpoint index, filesystem-instance hosting, mount/umount steps.
 - [`VFS_CHECKS_V2.1.md`](05_filesystem/VFS_CHECKS_V2.1.md) — VFS walker, witness consumption at STEP-4 stage 2, refinement wrappers.
-- [`IO_MANAGER_v1.md`](05_filesystem/IO_MANAGER_v1.md) — I/O control plane between PageContainer, filesystem planning, block submission, and device execution; L4/L5/L6 service-future split, batching, readahead, direct-I/O coherency.
+- [`IO_MANAGER_v1.md`](05_filesystem/IO_MANAGER_v1.md) — file-I/O execution plane between PageContainer, pure filesystem planning/Tx lowering, block submission, and device execution; L4/L5/L6 split, batching, readahead mechanics, direct-I/O coherency, and typed completion.
 - [`BDEV_FS.md`](05_filesystem/BDEV_FS.md) — block-device pseudo-filesystem; bytes ↔ blocks translation over PAGE_BACKED.
 - [`bringup_fs_specs_v_1 (1).md`](<05_filesystem/bringup_fs_specs_v_1 (1).md>) — bringup filesystem specs for tmpfs, initramfs cpio `newc`, and minimal procfs.
 - [`TX_EXT4_PLAN_v1_2.md`](05_filesystem/TX_EXT4_PLAN_v1_2.md) — Tx-native ext4 backend plan: Linux/e2fsprogs authority, Tier 1 controlled production profile, Tier 2 mainstream compatibility, mutation admission, cache and reclaim policy.

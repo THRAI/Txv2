@@ -12,7 +12,8 @@
 - `PageContainerKind` — the three variants (Anon, File, Device).
 - `RNodeBacking` — the three-variant classification of what content an RNode has.
 - The uniform step functions for page-backed RNodes (read, write, mmap, truncate, fsync).
-- The narrow `FsPageBacking` trait for the File variant's dispatch into filesystem code.
+- The current `FsPageBacking` compatibility bridge and its migration to pure
+  `FileLayoutPlanner` plus the Tx filesystem adapter.
 - Cross-variant operations (splice, copy_file_range, sendfile).
 - Reflink and sharing semantics.
 
@@ -30,7 +31,10 @@ This document does *not* cover:
 **Key commitments** (established in prior rounds):
 
 1. **No shadow objects.** COW is expressed via PTE manipulation, not via stacked PageContainers. A MAP_PRIVATE mapping that writes generates a fresh private Frame that is installed in the VmEntry's private-frame tracking, not in the source PageContainer.
-2. **No Pager trait.** Per-variant logic is handled by match-on-kind. The only genuine polymorphism is `FsPageBacking` for filesystem-specific page fetch, which is a narrow trait used only by `PageContainerKind::File`.
+2. **No generic PageContainer Pager trait.** Per-variant content dispatch is
+   match-on-kind. The target filesystem-specific I/O polymorphism is the pure
+   `FileLayoutPlanner` behind a Tx adapter; `FsPageBacking` remains only the
+   current compatibility bridge for `PageContainerKind::File`.
 3. **Eager prefault is preserved.** Syscall scripts prefault user buffers during the observe phase. Step functions do not take kernel-mode page faults on user buffers; they either have the pages materialized and memcpy, or return `Blocked` waiting for materialization.
 4. **No swap.** Anonymous pages are pinned until explicit teardown. The Anon variant has no flush-to-disk path; its `evict` does nothing (the CachePin drop + map_count transitions handle reclamation naturally).
 5. **Stackless coroutines.** Every step function returns `StepOutcome<T>`. Page fetches that need I/O return `Blocked(carrier, mask)`; the script composes a wait; the step retries after wake.
@@ -51,7 +55,7 @@ This document does *not* cover:
 - [`MODULE_MAP_v1.md`](../00_meta-framework/MODULE_MAP_v1.md) §5.1 (vm subsystem), §7 (FS instances).
 - [`OBJECT_API_LANES_v1.md`](../00_meta-framework/OBJECT_API_LANES_v1.md) — owner-private publication, single-binding slots, and the rule that manager/state-machine ownership stays outside published roots.
 - [`MEMORY_IO_ARCHITECTURE_v1.md`](MEMORY_IO_ARCHITECTURE_v1.md) — canonical cross-layer authority for `PageDataLease`, PageSlot dirty state, zero-copy file payload, reclaim providers, and memory-pressure coordination.
-- [`IO_MANAGER_v1.md`](../05_filesystem/IO_MANAGER_v1.md) — target I/O control plane that keeps `PageContainer` as the only long-lived ordinary file-data cache while moving miss/writeback submission, readahead, completion, and block scheduling into service futures.
+- [`IO_MANAGER_v1.md`](../05_filesystem/IO_MANAGER_v1.md) — target file-I/O execution plane that keeps `PageContainer` as the only long-lived ordinary file-data cache while moving admitted request/graph execution, readahead mechanics, completion routing, and block scheduling into service futures.
 
 ### Zone-derived type policy
 <!-- txdoc:PAGE-BACKED-ZONE-DERIVED-TYPE-POLICY -->
@@ -375,8 +379,9 @@ pub enum PageContainerKind {
         swap_policy: AnonSwapPolicy,
     },
 
-    /// File-backed: pages fetched from and (if dirty) written back to a
-    /// filesystem's backing store via FsPageBacking.
+    /// File-backed: PageBacked owns pages and their generations. Filesystem
+    /// layout is planned through FileLayoutPlanner and lowered by the Tx
+    /// adapter; FsPageBacking is the current compatibility bridge.
     /// 
     /// Holds the filesystem-instance reference (to dispatch fs-specific
     /// calls) and the fs-internal identifier (e.g., inode number for ext4,
@@ -419,9 +424,13 @@ pub enum AnonSwapPolicy {
 **tmpfs.** `PageContainerKind::Anon { swap_policy: Persistent }`. Same as anonymous mmap except the PC is attached to an RNode with a path-namespace presence. File operations (read, write, mmap) work uniformly.
 
 **Persistent filesystem (ext4).** `PageContainerKind::File { fs,
-fs_object_id }`. L4 submits misses/writeback and L5 asks `FsPageBacking` for an
-owned `PageIoPlan`. Dirty pages are tracked by PageContainer state; writeback
-is issued periodically or on fsync.
+fs_object_id }`. PageBacked admits concrete PageSlot generations and signs a
+`PageDataLease`; the Tx filesystem adapter invokes pure `FileLayoutPlanner`,
+binds opaque payload keys back to retained segments, and lowers
+`FileIoPlan<K>` into the existing `BackendBioGraph`. `FsPageBacking` and
+`PageIoPlan` remain compatibility staging vocabulary. `PageSlot` owns dirty
+state; the global memory-pressure coordinator owns background dirty budgets,
+while fsync captures a target generation frontier.
 
 **Device framebuffer, DRI.** `PageContainerKind::Device { device, base_ppn, page_count }`. No allocation; the Frames in the PC page index wrap pre-existing device-owned PPNs.
 
@@ -771,45 +780,85 @@ For Device: returns EINVAL.
 ## 6. FsPageBacking
 <!-- txdoc:PAGE-BACKED-6-FSPAGEBACKING -->
 
-The narrow trait for filesystem-specific page-I/O planning. This is the only
-filesystem polymorphism needed for the File variant; L4 owns request/waiter
-state and L6 owns block submission.
+The current live compatibility trait for filesystem-specific page I/O. It
+remains the File variant's per-page step bridge while callers migrate. It is
+not the target pure planner contract: the target is `FileLayoutPlanner` over
+`FileLayoutRequest<K>` / `FileIoPlan<K>`, with a Tx adapter holding resources
+before admission and lowering into the existing `BackendBioGraph`. L4 owns the
+admitted request/resource bundle, waiter and graph-execution state; L6 owns
+ready block submission.
 
 ```rust
 pub trait FsPageBacking {
-    /// Translate one owned L4 request into an owned neutral plan.
-    /// Any guard-scoped metadata observation ends before this result is
-    /// returned to the manager.
-    fn plan_page_io<'g>(
+    fn fetch_page(
         &self,
-        request: &PageIoRequest,
-        guard: &'g Guard,
-    ) -> Result<PageIoPlan, Errno>;
+        fs_object_id: FsObjectId,
+        offset: u64,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<Frame, NoProgress>;
 
-    /// Capability query: does this fs support reflink across to `other`?
-    /// Default: no.
+    fn flush_page(
+        &self,
+        fs_object_id: FsObjectId,
+        offset: u64,
+        frame: &Frame,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress>;
+
+    fn truncate(
+        &self,
+        fs_object_id: FsObjectId,
+        new_size: u64,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress>;
+
+    fn fsync_file(
+        &self,
+        fs_object_id: FsObjectId,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress>;
+
+    fn sync_filesystem(
+        &self,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress>;
+
+    fn fallocate(
+        &self,
+        fs_object_id: FsObjectId,
+        new_size: u64,
+        guard: &Guard<'_>,
+    ) -> StepOutcome<(), NoProgress>;
+
     fn supports_reflink(&self, other: &PageContainer) -> bool {
         false
     }
 }
 ```
 
-Implementations:
+The signatures above summarize the live surface; the source of truth remains
+`page_backed/fs_page_backing.rs`. Current compatibility paths are:
 
-- **tx-ext4 PageBacking:** maps logical page requests to immediate hole/data
-  completions, metadata continuations, or `BioPlan` values. It does not submit
-  the block device directly. `reflink` is false (ext4 does not support
-  reflink).
-- **Future tmpfs-as-fs:** not needed — tmpfs uses Anon variant, not File, so it doesn't participate in this trait.
+- **`FsPageBacking`:** ext4, bdev-fs, tmpfs, and several synthetic filesystems
+  still implement per-page `fetch_page` / `flush_page` and lifecycle methods.
+  Some paths call filesystem/block-device work directly.
+- **`BackendPlanner`:** planner-backed ext4 requests may already use
+  `prepare_page_io` / `plan_page_io` / resume/completion hooks and produce
+  `BackendPlan` or the existing `BackendBioGraph` for L4/L6 execution.
 
-Most filesystems we care about for Linux 2.6 parity are local block-backed. Network filesystems (nfs, cifs, fuse) would add their own impls when we get to them.
+These are two staging paths in the current checkout, not two target interface
+families. They converge by moving format-only decisions into
+`FileLayoutPlanner`, resource/transaction binding into the Tx adapter, and all
+block execution into the existing graph.
 
-**The trait is narrow.** One request-to-plan method plus one capability
-predicate. Demand read, writeback, truncate, and fsync are request kinds, not
-separate wait-bearing filesystem call paths. The returned plan is owned: it
-may contain value plans or a `WaitEndpoint`, but no guard, witness, backend
-lock, `WaitSourceId`, or device queue handle. Read, write, lseek, and ioctl
-remain PageBacked/VFS operations rather than filesystem vtable methods.
+The target planner result is owned and contains no guard, witness, backend lock,
+`WaitSourceId`, device queue handle, or completion callback. Read, write, lseek,
+and ioctl remain PageBacked/VFS operations rather than filesystem vtable
+methods.
+
+No new caller may treat `PageIoPlan`, `BackendPlan`, or `BioPlan` as a second
+target IR. New planning work uses opaque keys and `FileIoPlan<K>`; new
+execution work extends the existing `BackendBioGraph`.
 
 ---
 
@@ -873,7 +922,7 @@ defined by [`MEMORY_IO_ARCHITECTURE_v1.md`](MEMORY_IO_ARCHITECTURE_v1.md).
 | Anon (Reclaimable) | Only if map_count and cache_ref both reach zero | Explicit teardown (munmap, PC drop) |
 | Anon (Persistent, tmpfs) | Only via truncate or PC drop | Explicit |
 | File, clean page | Yes | Drop from PC page index; CachePin decrements; Frame freed if unmapped |
-| File, dirty page | After writeback | Flush via FsPageBacking, then same as clean |
+| File, dirty page | After generation-checked writeback | Admit a bounded PageDataLease batch, plan/lower it into BackendBioGraph, then reclaim only after PageSlot accepts terminal completion |
 | Device | No | Frames are device-owned; not allocator-managed |
 
 Under memory pressure, the reclaim target is almost exclusively **clean file pages**. Dirty file pages require a writeback step first. Anonymous pages cannot be reclaimed (in v1, under no-swap).
@@ -1076,7 +1125,7 @@ The private Frame is tracked per-VmEntry (see the VM subsystem's own data struct
 - **FileOps vtable on Inode.** The per-instance read/write/lseek/mmap/ioctl function pointer table. Now: match on RNodeBacking.
 - **InodeOps vtable on Inode.** The per-fs lookup/create/unlink function pointer table. Now: FsOps on the fs instance (MODULE_MAP §7), not per-Inode.
 - **FileOps injection at open time.** Used by devices to swap FileOps per open. Now: backing variant is fixed at RNode creation; device nodes are Device-variant PageBacked or CharDevice StructBacked from the start.
-- **`address_space_operations` analog.** Linux's per-Inode page-cache operations table. Now: FsPageBacking on the fs instance.
+- **`address_space_operations` analog.** Linux's per-Inode page-cache operations table. Target: PageBacked owner operations plus pure `FileLayoutPlanner` and the Tx adapter; `FsPageBacking` is only the compatibility bridge.
 - **Fake Inodes for anonymous memory.** SYSV shm, POSIX shm, memfd all synthesized Inodes to plug into the FileOps machinery. Now: direct RNode with PageBacked(Anon) backing, no filesystem involved.
 - **Separation between file mmap and anonymous mmap code paths.** Linux has distinct code paths for file-backed vs anonymous mmap, converging late. Now: one step_mmap, one fault handler, two cases (fresh PC for anon, shared PC for file).
 
@@ -1092,7 +1141,12 @@ The private Frame is tracked per-VmEntry (see the VM subsystem's own data struct
 ### 11.3 Net change
 <!-- txdoc:PAGE-BACKED-11-3-NET-CHANGE -->
 
-Lines of code: significantly less. Linux's address_space_operations has ~20 methods per filesystem; FsPageBacking has 4. Per-instance FileOps per Inode (1 KB+): eliminated. The machinery for "what does read do on this file?" collapses from "look up FileOps, maybe injected, vtable-call read" to "match on RNodeBacking, call uniform or subsystem-specific step_read."
+Lines of code: significantly less. Linux's `address_space_operations` has
+roughly 20 methods per filesystem; the compatibility `FsPageBacking` surface is
+narrow, and the target splits pure layout planning from Tx execution adaptation.
+Per-instance FileOps per Inode (1 KB+): eliminated. The machinery for "what
+does read do on this file?" collapses from injected vtables to matching
+`RNodeBacking` and calling uniform or subsystem-specific step functions.
 
 ---
 
@@ -1149,7 +1203,11 @@ The minimal per-char-device vtable. What's the minimum interface? Probably: step
 - **StructBacked** — subsystem-specific payload, per-subsystem step functions.
 - **Projected** — no stored content, view via projection schema.
 
-**PageContainer** is the zone entity for offset-keyed page storage. Three kinds: Anon, File, Device. No Pager trait; dispatch on kind is a match. The only polymorphism is FsPageBacking, a narrow 4-method trait for filesystem-specific fetch/flush.
+**PageContainer** is the zone entity for offset-keyed page storage. Three kinds:
+Anon, File, Device. Content dispatch on kind is a match. For persistent-file
+I/O, the target polymorphic boundary is pure `FileLayoutPlanner` plus a Tx
+adapter that lowers into the existing `BackendBioGraph`; `FsPageBacking` is a
+temporary compatibility bridge.
 
 **Uniform step functions** handle read, write, lseek, mmap, truncate, fsync, fallocate for all PageBacked content. Per-variant behavior is a match inside the uniform code. Struct-backed content routes to subsystem-specific implementations. Projected content invokes projection schemas.
 

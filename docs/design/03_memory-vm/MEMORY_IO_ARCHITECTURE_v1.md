@@ -256,8 +256,9 @@ VM/VFS asks PageBacked for (object, page)
   -> tx-ext4 adapter assigns opaque payload key K
   -> pure pager maps file range to logical/physical ranges
   -> adapter lowers FileIoPlan<K> into existing BackendBioGraph
+  -> graph admission transfers the resource bundle to I/O manager L4
   -> I/O manager DMA-writes into the retained PageBacked target
-  -> typed completion returns (request, page, generation, result)
+  -> L4 returns one owned terminal settlement bundle
   -> PageSlot validates generation and installs Resident or Error
   -> waiter wakes only after owner state publication
 ```
@@ -275,11 +276,13 @@ userspace bytes -> PageBacked resident page
   -> writeback policy selects object/range/generation frontier
   -> PageBacked freezes a PageDataLease over that frontier
   -> ext4 planner maps logical range and proposes allocation/metadata mutation
-  -> ext4 adapter retains data lease and FrozenMetadataLease capabilities
+  -> ext4 adapter temporarily binds data and FrozenMetadataLease capabilities
   -> adapter lowers ordered data, journal commit, and checkpoint dependencies
      into the existing BackendBioGraph
+  -> graph admission transfers the resource bundle to I/O manager L4
   -> I/O manager submits and completes graph nodes
-  -> PageSlot applies generation-checked completion
+  -> L4 returns one owned terminal settlement bundle
+  -> PageSlot applies generation-checked completion and settles resources
 ```
 
 If a page is redirtied while an older generation is in writeback, completion
@@ -323,6 +326,53 @@ completion rules differ. Neither is flattened into an untyped SG list.
 Overlapping direct writes reserve the range, flush or invalidate conflicting
 buffered pages, wait for old mappings/writeback according to the owner
 protocol, submit DMA, then release the reservation after terminal completion.
+
+### 4.5 I/O-manager execution contract
+
+<!-- txdoc:MEMORY-IO-MANAGER-EXECUTION-CONTRACT-1 -->
+
+The I/O manager is the data plane's execution owner, not the global memory
+control plane. The boundary is:
+
+```text
+MemoryPressureCoordinator: when / which owner-domain / bounded amount
+PageBacked: concrete page-generation admission + PageDataLease semantic owner
+filesystem adapter: pre-admission custody, pure layout invocation and lowering
+I/O manager L4: admitted resource custody, graph execution and terminal routing
+I/O manager L6: ready BIO queue, merge, depth, tags, barrier and node completion
+PageBacked: owned terminal settlement + PageSlot validation/transition
+```
+
+L4 may batch adjacent file ranges and maintain progress through an admitted
+writeback batch. It does not choose dirty victims, own dirty thresholds, or
+change PageSlot state directly. L6 may merge adjacent compatible LBA nodes into
+SG requests. It does not cross graph dependencies, barrier/transaction domains,
+devices, operations, incompatible flags, or completion routes. This gives three
+distinct clustering stages: PageBacked range admission, filesystem extent/layout
+coalescing, and L6 physical-LBA merging.
+
+The existing `PageService` is the staging L4 owner: its request queue, graph
+execution map, metadata continuations, waiters, and completion queue move behind
+`PageIoSubmissionManager` rather than into a PageContainer lock. The existing
+`BlockQueue`, depth/tag state, service driver, and completion trackers move
+behind `BlockSubmissionManager`. Neither manager retains ordinary file data
+after terminal request settlement.
+
+PageBacked remains the semantic owner of ordinary file data. The filesystem
+adapter holds the resource bundle only before admission; successful admission
+atomically transfers custody to L4 graph execution, while failed admission
+unwinds to the caller. L6 node completion alone cannot release the lease or
+clean a page. Once every node is terminal, L4 transfers exactly one owned
+settlement bundle containing request, object, range, generation, resources and
+result to PageBacked. PageBacked revalidates it before changing the
+authoritative PageSlot and settling, retrying, or rolling back resources.
+
+The I/O manager returns immutable facts to the control plane: admitted and
+completed bytes, queue delay and service time, graph/BIO backlog, request and SG
+sizes, merge results, queue saturation, retries/timeouts/errors, bounce bytes by
+reason, and terminal generations. It does not return victim choices or mutate a
+`MemoryPlan`. PageBacked separately reports cleaned generations and actual
+allocator-free progress.
 
 ---
 
@@ -678,7 +728,7 @@ immediate large file move.
 | `tx-ext4-format` | ext4/JBD2 encoding, decoding, checksums, disk structures | PageBacked, PPN, BIO, reactor |
 | `tx-pager-api` | pure ranges, layout requests/plans, opaque payload key | PageBacked, ext4 format, PPN, BIO, reactor |
 | `tx-ext4-pager` | extent/layout, allocation proposals, metadata after-images, JBD2 ordering | PageBacked, PPN, `BioVec`, reactor |
-| `tx-ext4` | Tx adapter, transaction admission, lease retention, plan lowering | VFS live nodes, second page cache |
+| `tx-ext4` | Tx adapter, transaction admission, pre-admission resource custody, plan lowering | VFS live nodes, second page cache |
 | PageBacked module/crate | canonical PageContainer, resident data, PageSlot, PageDataLease | ext4 format/layout semantics |
 | I/O manager module/crate | existing BackendBioGraph, queue, merge, DMA, fence, completion | persistent file cache, ext4 mutation authority |
 | memory-pressure service | providers, policy, watermarks, allocation slow path | PPN/free-list mutation, file/FS semantic state |
@@ -912,9 +962,10 @@ Tx uses one ordinary file-data owner and two cooperating planes:
 Data plane:
 PageBacked PageDataLease
   -> ext4 pure layout/transaction plan with opaque payload key
-  -> tx-ext4 lowering into the existing BackendBioGraph
-  -> I/O manager DMA and typed completion
-  -> PageSlot generation commit
+  -> tx-ext4 pre-admission lowering into the existing BackendBioGraph
+  -> L4 admitted resource custody and L6 DMA execution
+  -> L4 owned terminal settlement
+  -> PageBacked PageSlot generation commit and resource settlement
 
 Control plane:
 allocator/owner snapshots

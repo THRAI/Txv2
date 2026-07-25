@@ -1,3 +1,30 @@
+- 2026-07-25 (dual-plane architecture aligned with I/O manager).
+  Aligned `IO_MANAGER_v1.md` with the canonical memory/file-I/O architecture.
+  The memory-pressure coordinator now sends only bounded owner/domain intent to
+  PageBacked admission; it does not choose concrete `PageSlot`s or pass raw
+  pages, PPNs, locks, or callbacks into I/O execution. The Tx filesystem
+  adapter holds leases and transaction resources only before graph admission;
+  admission atomically transfers the resource bundle to L4 graph execution. L6
+  owns ready BIO queueing, merge, depth, tags, barriers, and node completion but
+  cannot release leases or change file generations. L4 returns one owned
+  terminal settlement to PageBacked, which alone validates and commits
+  `PageSlot` transitions. `FsPageBacking`, `PageIoPlan`, `BackendPlan`, and
+  `BioPlan` are now explicitly compatibility vocabulary; the only target path
+  is pure `FileLayoutPlanner` / `FileIoPlan<K>` lowering into the existing
+  `BackendBioGraph`. The target module tree is also distinguished from the
+  current `io_manager/backend/`, `io_manager/page/service.rs`, and
+  `fs_iface/plan.rs` locations. No Rust source changed. Verification: `cargo
+  xtask lint docs` passed with the 7 existing retired-vocabulary discussion
+  warnings; `cargo xtask progress validate` passed for 37 records; scoped stale
+  wording, placeholder, duplicate-`txdoc` and custody scans passed; `git diff
+  --check` passed. Next: turn the aligned boundary into a staged implementation
+  plan beginning with `PageSlot` authority, request resource-bundle admission,
+  and clean-only reclaim. Blocker: the one-CPU, 4-GiB clean-build witness still
+  lacks a current complete Tx trace and baseline artifact. See
+  `docs/design/03_memory-vm/MEMORY_IO_ARCHITECTURE_v1.md`,
+  `docs/design/05_filesystem/IO_MANAGER_v1.md`, and
+  `docs/progress/decisions/2026-07-25-memory-file-io-dual-plane-architecture.md`.
+
 - 2026-07-25 (memory and file-I/O dual-plane architecture).
   Added the canonical umbrella contract that combines a zero-extra-copy
   PageBacked/ext4/I/O-manager data plane with a global allocator-pressure, pure
