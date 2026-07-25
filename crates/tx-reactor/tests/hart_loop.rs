@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use tx_reactor::{
     hart_loop::{
         step_hart_loop, step_hart_loop_at, HartLoopDeadlineAction, HartLoopDecision,
@@ -6,6 +7,7 @@ use tx_reactor::{
     preempt::{PreemptMarkers, PreemptionPoint},
     HartId, NoopRescheduleSignal, RescheduleSignal, RunStats, WakeDispatchReport,
 };
+use tx_services::time::CurrentHartDeadlineTimer;
 
 #[derive(Debug)]
 struct FakeHartRuntime {
@@ -36,6 +38,10 @@ impl HartLoopRuntime for FakeHartRuntime {
         self.timer_wakes
     }
 
+    fn hart_loop_next_deadline_ns(&self) -> Option<u64> {
+        self.next_deadline_ns
+    }
+
     fn drain_hart_loop_wakes<S>(
         &mut self,
         _current_hart: HartId,
@@ -57,9 +63,61 @@ impl HartLoopRuntime for FakeHartRuntime {
     {
         self.stats
     }
+}
 
-    fn hart_loop_next_deadline_ns(&self) -> Option<u64> {
-        self.next_deadline_ns
+struct ChangeAwareDriver {
+    next_deadline_ns: Cell<Option<u64>>,
+    deadline_changed: Cell<bool>,
+}
+
+impl ChangeAwareDriver {
+    fn set_next_deadline_ns(&self, deadline_ns: Option<u64>) {
+        if self.next_deadline_ns.replace(deadline_ns) != deadline_ns {
+            self.deadline_changed.set(true);
+        }
+    }
+}
+
+impl ChangeAwareDriver {
+    fn program_current_hart_deadline(&self, timer: &mut impl CurrentHartDeadlineTimer) {
+        if !self.deadline_changed.replace(false) {
+            return;
+        }
+        match self.next_deadline_ns.get() {
+            Some(deadline_ns) => timer.set_current_hart_deadline_ns(deadline_ns),
+            None => timer.cancel_current_hart_deadline(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct RecordingDeadlineTimer {
+    arms: Vec<u64>,
+    cancels: usize,
+}
+
+impl CurrentHartDeadlineTimer for RecordingDeadlineTimer {
+    fn set_current_hart_deadline_ns(&mut self, deadline_ns: u64) {
+        self.arms.push(deadline_ns);
+    }
+
+    fn cancel_current_hart_deadline(&mut self) {
+        self.cancels += 1;
+    }
+}
+
+#[derive(Default)]
+struct CurrentHartActionRecorder {
+    arms: Vec<(HartId, u64)>,
+    cancels: Vec<HartId>,
+}
+
+impl CurrentHartActionRecorder {
+    fn record(&mut self, hart: HartId, action: HartLoopDeadlineAction) {
+        match action {
+            HartLoopDeadlineAction::Arm { deadline_ns } => self.arms.push((hart, deadline_ns)),
+            HartLoopDeadlineAction::Cancel => self.cancels.push(hart),
+        }
     }
 }
 
@@ -67,6 +125,30 @@ fn need_resched_markers() -> PreemptMarkers {
     let markers = PreemptionPoint::new();
     markers.mark_need_resched();
     markers.consume()
+}
+
+#[test]
+fn deadline_change_programs_current_hart_only_once_per_transition() {
+    let driver = ChangeAwareDriver {
+        next_deadline_ns: Cell::new(None),
+        deadline_changed: Cell::new(false),
+    };
+    let mut timer = RecordingDeadlineTimer::default();
+
+    driver.program_current_hart_deadline(&mut timer);
+    assert!(timer.arms.is_empty());
+    assert_eq!(timer.cancels, 0);
+
+    driver.set_next_deadline_ns(Some(250));
+    driver.program_current_hart_deadline(&mut timer);
+    driver.program_current_hart_deadline(&mut timer);
+    assert_eq!(timer.arms, vec![250]);
+    assert_eq!(timer.cancels, 0);
+
+    driver.set_next_deadline_ns(None);
+    driver.program_current_hart_deadline(&mut timer);
+    assert_eq!(timer.arms, vec![250]);
+    assert_eq!(timer.cancels, 1);
 }
 
 #[test]
@@ -125,6 +207,23 @@ fn pending_timer_deadline_idles_with_arm_request() {
         step.deadline_action,
         HartLoopDeadlineAction::Arm { deadline_ns: 250 }
     );
+}
+
+#[test]
+fn nonzero_hart_arm_action_records_the_passed_hart() {
+    let mut runtime = FakeHartRuntime {
+        next_deadline_ns: Some(250),
+        ..FakeHartRuntime::default()
+    };
+    let hart = HartId(3);
+    let mut signal = NoopRescheduleSignal::new();
+    let step = step_hart_loop_at(&mut runtime, hart, 200, &mut signal);
+    let mut recorder = CurrentHartActionRecorder::default();
+
+    recorder.record(step.hart, step.deadline_action);
+
+    assert_eq!(recorder.arms, vec![(hart, 250)]);
+    assert!(recorder.cancels.is_empty());
 }
 
 #[test]

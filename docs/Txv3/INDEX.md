@@ -22,6 +22,7 @@
 | 06 | [`06_EXECUTION_SCOPE_v1.md`](06_EXECUTION_SCOPE_v1.md) | The `OnBehalfOf<P>` execution scope. Borrow primitive. Abandonment via Killable wait. Resource scoping. Coverage: io_uring SQPOLL, AIO, FUSE helper, network softirq. |
 | 07 | [`07_BLAST_RADIUS.md`](07_BLAST_RADIUS.md) | Migration cost: code volume, surface counts, per-change blast radius, recommended landing order, risk register. |
 | 08 | [`08_SYSV_IPC_v1.md`](08_SYSV_IPC_v1.md) | SysV + POSIX IPC subsystem family (sem / shm / msg) as a worked composition of v3 primitives. Canary doc: a real 30-syscall Linux family lands with zero closed-catalog growth. |
+| 08O | [`08_OBSERVATION_L0_L6_REFACTOR_v0.md`](08_OBSERVATION_L0_L6_REFACTOR_v0.md) | Observation subsystem tightening plan: L0-L6 topology, borrowed organization by layer, boundary rules, enforcement, and staged migration. |
 | 10 | [`10_SCHED_SMP_v1.md`](10_SCHED_SMP_v1.md) | Cross-hart scheduler behavior under SMP: `current_hart`, cross-hart wake protocol, work stealing with lock-and-recheck, IPI rescheduling, lifecycle state machine, boot bringup. The cpuset prerequisite. Supersedes `SCHEDULER_v0 §5.3–5.5`. |
 
 ## 2. Reading orders

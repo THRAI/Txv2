@@ -32,13 +32,13 @@
 //! carrying that same generation is fresh, anything else is stale and
 //! the driver drops it.
 
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use core::task::Waker;
 
 use alloc::collections::VecDeque;
 
 use crate::step::{AbortReason, DelegateTokenId, InterestMask, WaitSourceId};
-use crate::wake::timer::TimerToken;
+use crate::wake::deadline::TimerToken;
 use crate::SpinMutex;
 
 /// Generation counter for a [`TaskMailbox`]'s currently-active wait.
@@ -75,15 +75,15 @@ impl WaitGeneration {
 /// `SI_QUEUE` for process-directed posts produced by `kill(pid,sig)`,
 /// etc.).
 ///
-/// Day-1 callers post `ProcessDirected` from
-/// `step_kill_process`/`route_gewalt` (process-wide / group-wide
-/// fanout) and `ThreadDirected { tid }` from `tgkill`-shaped paths
-/// (only `route_gewalt`'s SIGKILL bypass and `post_signal`'s direct
+/// Day-1 callers post `ProcessDirected` from process-directed kill /
+/// Gewalt routing (process-wide / group-wide fanout) and
+/// `ThreadDirected { tid }` from `tgkill`-shaped paths
+/// (only Gewalt SIGKILL bypass and the catchable-signal
 /// thread post today; the `tid` is the targeted thread's TID for
 /// future siginfo attribution).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SignalRouting {
-    /// `kill(pid, sig)` / `route_gewalt` / group-fanout post: the
+    /// `kill(pid, sig)` / Gewalt routing / group-fanout post: the
     /// signal targets the process as a whole and any eligible thread
     /// may serve.
     ProcessDirected,
@@ -95,7 +95,7 @@ pub enum SignalRouting {
 
 /// Event posted to a [`TaskMailbox`] describing a wake-relevant fact.
 ///
-/// Four variants today:
+/// Wake-event variants today:
 ///
 /// - [`SourceFired`](Self::SourceFired) — a `WaitSource` fired
 ///   (PR-3A/3B). Driver compares the carried generation against
@@ -115,6 +115,10 @@ pub enum SignalRouting {
 ///   `InterruptSummary::termination` / `stop_requested`. The event
 ///   is **not** matched by [`ActiveWait::matches`] — it is a
 ///   wake-hint, not a wait-source-fire. See D9 §4 Option A.
+/// - [`SignalTimerFired`](Self::SignalTimerFired) — a signal-producing timer
+///   deadline expired. It is a wake hint asking the entry path to re-check the
+///   POSIX/itimer tables and perform canonical signal delivery; it does not
+///   itself mean a signal is already pending.
 ///
 /// Per `docs/Txv3/05_DELEGATE_v1.md` §7 the spec calls the
 /// `AgentReplied` / `Abort` variants `WakeHint::AgentReplied` /
@@ -141,7 +145,7 @@ pub enum MailboxEvent {
     /// `ResumeOutcome::WithReply` once the reply payload has been
     /// drained via `DelegateRegistry::take_reply(token_id)`.
     ///
-    /// Posted by `DelegateRegistry::mark_replied` on the
+    /// Posted by the `DelegateRegistry` delegate reply transition on the
     /// `TransitionOutcome::Applied` path. Late writers (any
     /// `LateNoOp`) do **not** post — DTOK-1.
     AgentReplied { token_id: DelegateTokenId },
@@ -151,8 +155,8 @@ pub enum MailboxEvent {
     /// translate to the right errno (`EINTR` / `EOWNERDEAD` /
     /// `ETIMEDOUT` per `05_DELEGATE_v1.md` §7).
     ///
-    /// Posted by `DelegateRegistry::mark_canceled` /
-    /// `mark_agent_died` / `mark_timed_out` on the
+    /// Posted by the `DelegateRegistry` delegate cancel transition /
+    /// `delegate agent-death transition` / `delegate timeout transition` on the
     /// `TransitionOutcome::Applied` path. Late writers (any
     /// `LateNoOp`) do **not** post — DTOK-3.
     Abort {
@@ -176,22 +180,41 @@ pub enum MailboxEvent {
     /// use.
     ///
     /// Posted by:
-    /// - `thread_runtime::execution::post_signal` (catchable
-    ///   per-thread post; `ProcessDirected` when invoked via
-    ///   `step_kill_process`, `ThreadDirected { tid }` when invoked
+    /// - `thread_runtime::execution::post_signal_with_post` (catchable
+    ///   per-thread post; `ProcessDirected` when invoked through
+    ///   process-directed kill, `ThreadDirected { tid }` when invoked
     ///   directly from a tgkill-shaped path).
-    /// - `signal::route_gewalt` (SIGSTOP/SIGCONT per-thread loop).
+    /// - `signal::route_gewalt_with_post` (SIGSTOP/SIGCONT per-thread loop).
     /// - `thread_runtime::execution::set_thread_zombie`
     ///   (terminal-state notification so a parked future observes
     ///   `summary.termination` and resolves to `Killed`/`Interrupted`).
     SignalDelivered { signum: u32, routing: SignalRouting },
-    /// A [`TimerWheel`] entry has expired (PR-8B). The driver matches
+    /// A reactor deadline entry has expired. The driver matches
     /// this against the in-flight `OnTimer` wait's token to resolve
     /// the yield via `ResumeOutcome::TimerExpired`.
     ///
-    /// Posted by [`TimerWheel::fire_due`] when the reactor's clock
-    /// tick advances past the entry's deadline.
+    /// Posted by the reactor deadline domain when its clock tick advances
+    /// past the entry's deadline.
     TimerFired { token: TimerToken },
+    /// A signal-producing reactor deadline entry expired.
+    ///
+    /// This is intentionally distinct from [`SignalDelivered`](Self::SignalDelivered):
+    /// the deadline domain does not own POSIX signal semantics. Consumers should
+    /// use this event to re-run the timer table due scan, which queues the real
+    /// signal through the normal signal subsystem and then posts
+    /// `SignalDelivered` if delivery state changed.
+    SignalTimerFired { token: TimerToken },
+}
+
+/// Action returned by [`TaskMailbox::poll_select`] for each queued event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MailboxPollAction {
+    /// Leave this event queued and continue scanning later events.
+    Keep,
+    /// Remove this event as stale or no longer relevant, then keep scanning.
+    Drop,
+    /// Remove and return this event to the caller.
+    Take,
 }
 
 /// Scheduler-facing priority hint latched by [`TaskMailbox::post`].
@@ -240,6 +263,35 @@ impl MailboxSchedulerHint {
 /// safe fallback because masks are hints, not truth.
 pub const MAILBOX_QUEUE_BOUND: usize = 64;
 
+/// Reactor scheduler owner bound to a task mailbox.
+///
+/// This is intentionally substrate-neutral: the substrate records raw slot
+/// identity and generation, while `tx-reactor` interprets them as `TaskId` and
+/// `TaskGeneration`. Trace fields such as `task_id_low` are not scheduler
+/// authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TaskMailboxSchedulerOwner {
+    task_index: usize,
+    task_generation: u64,
+}
+
+impl TaskMailboxSchedulerOwner {
+    pub const fn new(task_index: usize, task_generation: u64) -> Self {
+        Self {
+            task_index,
+            task_generation,
+        }
+    }
+
+    pub const fn task_index(self) -> usize {
+        self.task_index
+    }
+
+    pub const fn task_generation(self) -> u64 {
+        self.task_generation
+    }
+}
+
 /// Per-reactor-task wake mailbox.
 ///
 /// Owned by a reactor task (in practice via a `Cap<TaskMailbox>`
@@ -275,6 +327,9 @@ pub struct TaskMailbox {
     /// can render per-process ProcessDescriptor tracks parenting
     /// per-thread tracks (OBS-V1 §15.6 sched_switch view).
     process_id_low: u32,
+    scheduler_owner_present: AtomicBool,
+    scheduler_owner_task: AtomicUsize,
+    scheduler_owner_generation: AtomicU64,
     scheduler_hint: AtomicU64,
 }
 
@@ -294,6 +349,9 @@ impl TaskMailbox {
             waker: SpinMutex::new(None),
             task_id_low: 0,
             process_id_low: 0,
+            scheduler_owner_present: AtomicBool::new(false),
+            scheduler_owner_task: AtomicUsize::new(0),
+            scheduler_owner_generation: AtomicU64::new(0),
             scheduler_hint: AtomicU64::new(0),
         }
     }
@@ -323,6 +381,32 @@ impl TaskMailbox {
     pub fn with_process_id(mut self, process_id_low: u32) -> Self {
         self.process_id_low = process_id_low;
         self
+    }
+
+    /// Builder: attach the reactor scheduler owner for this mailbox.
+    ///
+    /// The owner is separate from trace ids. It is the identity the reactor
+    /// uses to turn a mailbox event into runnable scheduler placement.
+    #[must_use]
+    pub fn with_scheduler_owner(self, task_index: usize, task_generation: u64) -> Self {
+        self.scheduler_owner_task
+            .store(task_index, Ordering::Relaxed);
+        self.scheduler_owner_generation
+            .store(task_generation, Ordering::Relaxed);
+        self.scheduler_owner_present.store(true, Ordering::Release);
+        self
+    }
+
+    /// Return the scheduler owner associated with this mailbox, if any.
+    #[inline]
+    pub fn scheduler_owner(&self) -> Option<TaskMailboxSchedulerOwner> {
+        if !self.scheduler_owner_present.load(Ordering::Acquire) {
+            return None;
+        }
+        Some(TaskMailboxSchedulerOwner::new(
+            self.scheduler_owner_task.load(Ordering::Acquire),
+            self.scheduler_owner_generation.load(Ordering::Acquire),
+        ))
     }
 
     /// Low 32 bits of the owning process's trace identity.
@@ -447,7 +531,9 @@ impl TaskMailbox {
 
     const fn default_scheduler_hint(event: MailboxEvent) -> MailboxSchedulerHint {
         match event {
-            MailboxEvent::SignalDelivered { .. } => MailboxSchedulerHint::SignalDelivery,
+            MailboxEvent::SignalDelivered { .. } | MailboxEvent::SignalTimerFired { .. } => {
+                MailboxSchedulerHint::SignalDelivery
+            }
             MailboxEvent::SourceFired { .. }
             | MailboxEvent::AgentReplied { .. }
             | MailboxEvent::Abort { .. }
@@ -479,6 +565,31 @@ impl TaskMailbox {
     /// Drain the next event. Returns `None` if empty.
     pub fn poll(&self) -> Option<MailboxEvent> {
         self.queue.lock().pop_front()
+    }
+
+    /// Drain the first event selected by `classify` while preserving unrelated
+    /// events in queue order.
+    ///
+    /// This supports task-owned mailboxes shared by timer, signal, delegate,
+    /// and wait-source drivers: each driver can take only its own matching
+    /// event and drop its own stale generations without consuming other wake
+    /// payloads.
+    pub fn poll_select<F>(&self, mut classify: F) -> Option<MailboxEvent>
+    where
+        F: FnMut(&MailboxEvent) -> MailboxPollAction,
+    {
+        let mut q = self.queue.lock();
+        let mut index = 0;
+        while index < q.len() {
+            match classify(&q[index]) {
+                MailboxPollAction::Keep => index += 1,
+                MailboxPollAction::Drop => {
+                    let _ = q.remove(index);
+                }
+                MailboxPollAction::Take => return q.remove(index),
+            }
+        }
+        None
     }
 
     /// Number of queued events (for diagnostics; tests).
@@ -566,7 +677,8 @@ impl ActiveWait {
             MailboxEvent::AgentReplied { .. }
             | MailboxEvent::Abort { .. }
             | MailboxEvent::SignalDelivered { .. }
-            | MailboxEvent::TimerFired { .. } => false,
+            | MailboxEvent::TimerFired { .. }
+            | MailboxEvent::SignalTimerFired { .. } => false,
         }
     }
 }
@@ -595,7 +707,8 @@ pub fn agent_event_matches(event: &MailboxEvent, expected: DelegateTokenId) -> b
         MailboxEvent::Abort { token_id, .. } => *token_id == expected,
         MailboxEvent::SourceFired { .. }
         | MailboxEvent::SignalDelivered { .. }
-        | MailboxEvent::TimerFired { .. } => false,
+        | MailboxEvent::TimerFired { .. }
+        | MailboxEvent::SignalTimerFired { .. } => false,
     }
 }
 
@@ -641,6 +754,53 @@ mod tests {
         assert_eq!(mb.len(), 2);
         assert_eq!(mb.poll(), Some(e1));
         assert_eq!(mb.poll(), Some(e2));
+        assert_eq!(mb.poll(), None);
+    }
+
+    #[test]
+    fn poll_select_takes_matching_event_and_preserves_unrelated_events() {
+        let mb = TaskMailbox::new();
+        let signal = MailboxEvent::SignalDelivered {
+            signum: 10,
+            routing: SignalRouting::ProcessDirected,
+        };
+        let stale = MailboxEvent::SourceFired {
+            generation: WaitGeneration::new(1),
+            source: WaitSourceId::new(11),
+            interests: InterestMask::new(0b1),
+        };
+        let ready = MailboxEvent::SourceFired {
+            generation: WaitGeneration::new(2),
+            source: WaitSourceId::new(11),
+            interests: InterestMask::new(0b1),
+        };
+        let timer = MailboxEvent::TimerFired {
+            token: TimerToken::new(9),
+        };
+
+        assert!(mb.post(signal));
+        assert!(mb.post(stale));
+        assert!(mb.post(timer));
+        assert!(mb.post(ready));
+
+        assert_eq!(
+            mb.poll_select(|event| match event {
+                MailboxEvent::SourceFired {
+                    source, generation, ..
+                } if *source == WaitSourceId::new(11) && *generation == WaitGeneration::new(1) => {
+                    MailboxPollAction::Drop
+                }
+                MailboxEvent::SourceFired {
+                    source, generation, ..
+                } if *source == WaitSourceId::new(11) && *generation == WaitGeneration::new(2) => {
+                    MailboxPollAction::Take
+                }
+                _ => MailboxPollAction::Keep,
+            }),
+            Some(ready)
+        );
+        assert_eq!(mb.poll(), Some(signal));
+        assert_eq!(mb.poll(), Some(timer));
         assert_eq!(mb.poll(), None);
     }
 

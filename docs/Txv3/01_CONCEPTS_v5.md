@@ -4,7 +4,7 @@
 
 **Status.** v5 (Txv3 refresh, 2026-05).
 **Supersedes.** `00_meta-framework/CONCEPTS_v4.md`. v5 retains v4's basis claims, planes, and view-layer split, and adds: the seven-layer architecture, the five primitive cells, the upper/lower script split, the ExecutionScope cleavage from YieldShape, the four-variant StepOutcome with closed YieldShape catalog, and the typed `StepOp`/`StepProgress` traits.
-**Companion documents.** `02_INVARIANTS_v5.md` (rules), `03_STEP_MODEL_v2.md` (algebra), `04_SYSCALL_SHAPE_v1.md` (upper/lower split worked examples), `05_DELEGATE_v1.md`, `06_EXECUTION_SCOPE_v1.md`.
+**Companion documents.** `02_INVARIANTS_v5.md` (rules), `03_STEP_MODEL_v2.md` (algebra), `04_SYSCALL_SHAPE_v1.md` (upper/lower split worked examples), `05_DELEGATE_v1.md`, `06_EXECUTION_SCOPE_v1.md`, and [`OBJECT_API_LANES_v1.md`](../design/00_meta-framework/OBJECT_API_LANES_v1.md) (owner/root API factoring).
 
 ---
 
@@ -140,6 +140,20 @@ Both are governed by the publication rule:
 > Every derived materialization must be justified by a currently-valid authoritative binding. Publication of the materialization must revalidate the justifying binding atomically with publication.
 
 Publication is opt-in and declared per transition. Carriers fire after the paired visibility boundary; subscribers re-observe.
+
+#### Owner API lanes
+
+<!-- txdoc:CONCEPTS-V5-OWNER-API-LANES-1 -->
+
+Semantic owner/root objects expose a limited lane language above their private
+storage: `BindingLane` for authoritative bindings, `ProjectionLane` for
+read-only views, and `ReadinessLane` for level state plus object-owned wait
+endpoints. Identity/evidence is the existing role-shaped type language;
+reservation is a binding-change phase; publication/RCU is an owner-private
+backend. The traits are owner implementation contracts; upper callers consume
+concern-specific domain facades rather than broad lane objects. Lanes therefore
+do not add a sixth primitive cell or expose a storage algorithm. The complete
+contract is `OBJECT_API_LANES_v1.md`.
 
 ## 3. Three planes (preserved from v4)
 

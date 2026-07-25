@@ -7,7 +7,7 @@
 //! > Mitigation: Land with explicit test exercising tracee-process
 //! > exit during ptrace stop."
 //!
-//! PR-7 introduced `DelegateRegistry::mark_endpoint_died(marker)`
+//! PR-7 introduced the `DelegateRegistry` delegate endpoint-death transition for `marker`
 //! and W-Y's phase-4 fault-script test exercised the "single
 //! in-flight token aborts" happy path. This file pins the remaining
 //! corner cases the §6 row called out — the cases analogous to:
@@ -18,7 +18,7 @@
 //!
 //! All seven scenarios drive against the substrate-side API only
 //! (`DelegateRegistry::install_request` / `mark_*` /
-//! `mark_endpoint_died` / `take_reply`). The faulting-side
+//! `delegate endpoint-death transition` / `take_reply`). The faulting-side
 //! `await_agent_reply` consumer lives in tx-reactor, which is not a
 //! dep of tx-substrate; we pin the wake-routing contract directly
 //! by asserting the `MailboxEvent::Abort { reason: AgentDied }`
@@ -44,7 +44,7 @@
 //! - `docs/Txv3/07_BLAST_RADIUS.md` §6 risk row "EndpointScope
 //!   abandonment routing edge cases"
 //! - `docs/progress/decisions/2026-05-11-d7-pr-10-userfaultfd-plan.md`
-//!   §3.6 (ufd's use of mark_endpoint_died on fd close)
+//!   §3.6 (ufd's use of delegate endpoint-death transition on fd close)
 
 use std::sync::Arc;
 
@@ -53,6 +53,12 @@ use tx_substrate::step::{
     DelegateState, TokenDropPolicy, TransitionOutcome,
 };
 use tx_substrate::wake::{MailboxEvent, TaskMailbox};
+
+fn direct_delegate_mailbox_post(mailbox: std::sync::Weak<TaskMailbox>, event: MailboxEvent) {
+    if let Some(mailbox) = mailbox.upgrade() {
+        let _ = mailbox.post(event);
+    }
+}
 
 // =========================================================================
 // 1. Process-exit during pending request: the canonical case the
@@ -83,7 +89,8 @@ fn endpoint_process_exit_aborts_single_in_flight_token_with_agent_died() {
 
     // Endpoint process exits. The reactor-side ufd-close arm /
     // ptrace-exit arm calls into this:
-    let transitioned = registry.mark_endpoint_died(endpoint_marker);
+    let transitioned =
+        registry.mark_endpoint_died_with_post(endpoint_marker, direct_delegate_mailbox_post);
     assert_eq!(transitioned, 1, "the in-flight token must abort");
     assert_eq!(registry.state(id), Some(DelegateState::AgentDied));
 
@@ -153,7 +160,8 @@ fn endpoint_death_walks_all_in_flight_tokens_for_that_endpoint() {
         None,
     );
 
-    let transitioned = registry.mark_endpoint_died(endpoint_marker);
+    let transitioned =
+        registry.mark_endpoint_died_with_post(endpoint_marker, direct_delegate_mailbox_post);
     assert_eq!(transitioned, 4, "every in-flight token must transition");
 
     for (guard, mb) in [(&g1, &mb_1), (&g2, &mb_2), (&g3, &mb_3), (&g4, &mb_4)] {
@@ -184,7 +192,7 @@ fn endpoint_death_walks_all_in_flight_tokens_for_that_endpoint() {
 }
 
 // =========================================================================
-// 3. Endpoint death races a concurrent `mark_replied`: exactly one
+// 3. Endpoint death races a concurrent `delegate reply transition`: exactly one
 //    wins (DTOK-3, first-writer-wins). The other reports LateNoOp.
 //    Test both orderings.
 // =========================================================================
@@ -211,16 +219,21 @@ fn mark_replied_wins_then_endpoint_death_is_late_no_op() {
 
     // Agent gets there first.
     assert_eq!(
-        registry.mark_replied(id, DelegateReply::placeholder()),
+        registry.mark_replied_with_post(
+            id,
+            DelegateReply::placeholder(),
+            direct_delegate_mailbox_post
+        ),
         TransitionOutcome::Applied,
     );
     assert_eq!(registry.state(id), Some(DelegateState::Replied));
     assert_eq!(mailbox.len(), 1, "AgentReplied event posted");
 
-    // Endpoint dies — the walk's per-token mark_agent_died observes
+    // Endpoint dies — the walk's per-token delegate agent-death transition observes
     // a Replied slot and returns LateNoOp. The walk's count is the
     // number of *Applied* transitions, so it must be 0 here.
-    let transitioned = registry.mark_endpoint_died(endpoint_marker);
+    let transitioned =
+        registry.mark_endpoint_died_with_post(endpoint_marker, direct_delegate_mailbox_post);
     assert_eq!(
         transitioned, 0,
         "walk skips the already-terminal slot — no double-transition",
@@ -237,7 +250,7 @@ fn mark_replied_wins_then_endpoint_death_is_late_no_op() {
 #[test]
 fn endpoint_death_wins_then_late_mark_replied_is_late_no_op() {
     // Mirror direction (DTOK-1 / DTOK-3): endpoint death CASes the
-    // slot to AgentDied; the agent's in-flight mark_replied loses
+    // slot to AgentDied; the agent's in-flight delegate reply transition loses
     // the race and is rejected as LateNoOp(AgentDied). The reply
     // payload is never installed, and the mailbox observes exactly
     // one event — the AgentDied abort.
@@ -255,14 +268,19 @@ fn endpoint_death_wins_then_late_mark_replied_is_late_no_op() {
     );
     let id = guard.id();
 
-    let transitioned = registry.mark_endpoint_died(endpoint_marker);
+    let transitioned =
+        registry.mark_endpoint_died_with_post(endpoint_marker, direct_delegate_mailbox_post);
     assert_eq!(transitioned, 1);
     assert_eq!(registry.state(id), Some(DelegateState::AgentDied));
     assert_eq!(mailbox.len(), 1);
 
-    // The agent's stale mark_replied — submitted before the agent
+    // The agent's stale delegate reply transition — submitted before the agent
     // observed its own death — loses to the AgentDied CAS.
-    let late = registry.mark_replied(id, DelegateReply::placeholder());
+    let late = registry.mark_replied_with_post(
+        id,
+        DelegateReply::placeholder(),
+        direct_delegate_mailbox_post,
+    );
     assert_eq!(late, TransitionOutcome::LateNoOp(DelegateState::AgentDied));
     // The reply payload was NOT installed; take_reply returns None.
     assert_eq!(registry.take_reply(id), None);
@@ -323,11 +341,15 @@ fn endpoint_death_after_some_tokens_already_terminal_skips_them() {
 
     // Pre-terminate two tokens.
     assert_eq!(
-        registry.mark_replied(g_replied.id(), DelegateReply::placeholder()),
+        registry.mark_replied_with_post(
+            g_replied.id(),
+            DelegateReply::placeholder(),
+            direct_delegate_mailbox_post
+        ),
         TransitionOutcome::Applied,
     );
     assert_eq!(
-        registry.mark_canceled(g_canceled.id()),
+        registry.mark_canceled_with_post(g_canceled.id(), direct_delegate_mailbox_post),
         TransitionOutcome::Applied,
     );
 
@@ -337,7 +359,8 @@ fn endpoint_death_after_some_tokens_already_terminal_skips_them() {
     assert_eq!(mb_live.len(), 0);
 
     // Endpoint dies.
-    let transitioned = registry.mark_endpoint_died(endpoint_marker);
+    let transitioned =
+        registry.mark_endpoint_died_with_post(endpoint_marker, direct_delegate_mailbox_post);
     assert_eq!(
         transitioned, 1,
         "only the live token transitions; the two terminals are skipped",
@@ -377,7 +400,7 @@ fn endpoint_death_after_some_tokens_already_terminal_skips_them() {
 }
 
 // =========================================================================
-// 5. Late mark_replied for an endpoint that already died: this is
+// 5. Late delegate reply transition for an endpoint that already died: this is
 //    the "agent thread was mid-reply when its endpoint died"
 //    case — the subtle one called out in the §6 row. The agent
 //    can't observe its own death synchronously; it submits the
@@ -402,17 +425,21 @@ fn late_mark_replied_for_dead_endpoint_is_late_no_op_and_no_state_change() {
 
     // Endpoint dies first (e.g. process exit handler ran before
     // the agent thread's syscall returned).
-    let n = registry.mark_endpoint_died(endpoint_marker);
+    let n = registry.mark_endpoint_died_with_post(endpoint_marker, direct_delegate_mailbox_post);
     assert_eq!(n, 1);
     let snapshot_state = registry.state(id);
     let snapshot_mailbox_len = mailbox.len();
     assert_eq!(snapshot_state, Some(DelegateState::AgentDied));
     assert_eq!(snapshot_mailbox_len, 1);
 
-    // The agent — unaware its endpoint is gone — calls mark_replied.
+    // The agent — unaware its endpoint is gone — calls delegate reply transition.
     // It MUST return LateNoOp(AgentDied) and MUST NOT change the
     // observable state of the registry or the mailbox.
-    let outcome = registry.mark_replied(id, DelegateReply::placeholder());
+    let outcome = registry.mark_replied_with_post(
+        id,
+        DelegateReply::placeholder(),
+        direct_delegate_mailbox_post,
+    );
     assert_eq!(
         outcome,
         TransitionOutcome::LateNoOp(DelegateState::AgentDied)
@@ -439,7 +466,7 @@ fn late_mark_replied_for_dead_endpoint_is_late_no_op_and_no_state_change() {
 
 // =========================================================================
 // 6. AgentTokenGuard drop after endpoint died: the CancelOnDrop
-//    policy's drop-time mark_canceled CAS observes the existing
+//    policy's drop-time delegate cancel transition CAS observes the existing
 //    AgentDied terminal and is a LateNoOp. No double-transition,
 //    no second mailbox event.
 // =========================================================================
@@ -464,12 +491,12 @@ fn agent_token_guard_drop_after_endpoint_died_is_late_no_op() {
     let id = guard.id();
 
     // Endpoint dies first.
-    let n = registry.mark_endpoint_died(endpoint_marker);
+    let n = registry.mark_endpoint_died_with_post(endpoint_marker, direct_delegate_mailbox_post);
     assert_eq!(n, 1);
     assert_eq!(registry.state(id), Some(DelegateState::AgentDied));
     assert_eq!(mailbox.len(), 1);
 
-    // Now drop the guard. The CancelOnDrop branch's mark_canceled
+    // Now drop the guard. The CancelOnDrop branch's delegate cancel transition
     // CAS hits an already-terminal slot and is a LateNoOp.
     drop(guard);
 
@@ -478,7 +505,7 @@ fn agent_token_guard_drop_after_endpoint_died_is_late_no_op() {
     assert_eq!(registry.state(id), Some(DelegateState::AgentDied));
 
     // Mailbox accounting: still exactly one event (the AgentDied
-    // abort posted by mark_endpoint_died), no second `Canceled`
+    // abort posted by delegate endpoint-death transition), no second `Canceled`
     // abort posted by the drop.
     assert_eq!(
         mailbox.len(),
@@ -496,7 +523,7 @@ fn agent_token_guard_drop_after_endpoint_died_is_late_no_op() {
 }
 
 // =========================================================================
-// 7. DelegateRegistry survives independently: mark_endpoint_died
+// 7. DelegateRegistry survives independently: delegate endpoint-death transition
 //    only walks tokens bound to that endpoint_marker. Other
 //    endpoints' tokens are untouched — both the state and the
 //    bound mailboxes.
@@ -559,7 +586,8 @@ fn endpoint_death_is_scoped_to_matching_endpoint_marker_only() {
     );
 
     // The dying endpoint dies.
-    let transitioned = registry.mark_endpoint_died(marker_dying);
+    let transitioned =
+        registry.mark_endpoint_died_with_post(marker_dying, direct_delegate_mailbox_post);
     assert_eq!(
         transitioned, 1,
         "exactly one token (the dying endpoint's) transitions",
@@ -605,7 +633,11 @@ fn endpoint_death_is_scoped_to_matching_endpoint_marker_only() {
     // Reply to sibling-a's first token; verify the AgentReplied
     // lands and the state machine is fully functional.
     assert_eq!(
-        registry.mark_replied(g_sib_a.id(), DelegateReply::placeholder()),
+        registry.mark_replied_with_post(
+            g_sib_a.id(),
+            DelegateReply::placeholder(),
+            direct_delegate_mailbox_post
+        ),
         TransitionOutcome::Applied,
     );
     assert_eq!(registry.state(g_sib_a.id()), Some(DelegateState::Replied));

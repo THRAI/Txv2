@@ -10,6 +10,9 @@ tx-hal          = { path = "../tx-hal" }
 tx-observe      = { path = "../tx-observe" }
 tx-observe-types = { path = "../tx-observe-types" }
 
+[dev-dependencies]
+static_assertions = "1.1"
+
 [lib]
 path = "src/lib.rs"
 test = false

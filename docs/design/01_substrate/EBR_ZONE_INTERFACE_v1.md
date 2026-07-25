@@ -2,7 +2,10 @@
 
 <!-- txdoc:01-SUBSTRATE-EBR-ZONE-INTERFACE-V1 -->
 
-**Status.** Draft design decision.
+**Status.** Target design decision. The live Rust implementation still uses
+the five-state Zone lifecycle and fixed retired-node pools; the four-state
+intrusive-bag protocol below is the migration contract, not a claim about the
+current implementation.
 
 **Purpose.** Adapt the imported EBR and Zone/Cap implementation sketches
 ([`02_EBR_design.en-US.md`](../../ebr-zone/02_EBR_design.en-US.md),
@@ -88,7 +91,7 @@ This keeps the upper layers aligned with `OBL-*`, `WIT-*`, and `BIF-*`:
 | `ReservedSlot<T>::init` | `zone::sign` | Signing consumes a reservation, writes the value, publishes the slot, and returns `Cap<T>`. |
 | `ReservedSlot<T>` | `ZoneReservation<T>` | Linear reserve token with Drop rollback. |
 | `Cap::get() -> &T` | `Cap<T>` deref / `Cap::ident_ref(&Guard)` | Direct deref is allowed only while a live `Cap` exists. Guarded observation should use `IdentRef`. |
-| `Tombstone` | `SENTINEL_DEAD` / dead slot state | Use sentinel wording for no-upgrade barrier. |
+| `Tombstone` | `Retiring` slot state | The full metadata CAS installs the no-upgrade barrier and intrusive next link together. |
 
 ---
 
@@ -303,7 +306,7 @@ The reference hierarchy remains:
 Weak<T>
     -> observe under Guard
 IdentRef<'g, T>
-    -> upgrade by SENTINEL_DEAD-guarded CAS
+    -> upgrade by Live-state and generation-guarded CAS
 Cap<T>
     -> upgrade payload/contribution
 T::OperationalEvidence
@@ -336,12 +339,29 @@ impl<T> Weak<T> {
 1. Resolve `ZoneKey` through the zone directory while `guard` is held.
 2. If the backing slab/slot is no longer present, return `None`.
 3. Load slot metadata.
-4. Check generation and live/dead state.
+4. Check generation and require `state == Live`.
 5. Produce `IdentRef<'g, T>` only if the slot still names the same live entity.
 
 This differs from the imported design, where weak references increment
 `weak_count` and keep slot reclamation waiting. That behavior conflicts with
 `object_model_v2`: resolution-only evidence must not promise retention.
+
+### 4.1.1 Fixed-Depth Slot Resolution
+<!-- txdoc:EBR-ZONE-LOCK-FREE-SLOT-RESOLUTION-1 -->
+
+`SlotKey -> Slot<T>` resolution is a reader-side substrate operation. The
+target implementation uses a stable fixed-depth slab directory indexed from
+the key's 18-bit slab ID. Resolution performs only a constant number of atomic
+pointer loads, validates the slab ID, and computes the slot address directly.
+It does not acquire the Keg lock and does not walk the partial, full, or empty
+slab lists.
+
+The Keg lock and slab lists remain allocation/reclaim metadata. They may create,
+classify, publish, unpublish, and retire slabs, but they are forbidden from the
+`Weak::observe`, `Cap::deref`, clone, and non-final Drop read paths. A directory
+entry is Release-published before a `SlotKey` escapes and Release-cleared before
+the slab is EBR-retired; guarded readers that observed the old pointer may
+therefore finish before physical slab reuse.
 
 ### 4.2 `IdentRef<'g, T>` Is EBR Observation
 <!-- txdoc:EBR-ZONE-REFERENCE-SEMANTICS-IDENTREF-G-T-IS-EBR-OBSERVATION-1 -->
@@ -350,9 +370,9 @@ This differs from the imported design, where weak references increment
 retention and cannot cross guard, step, thread, or async boundaries.
 
 `IdentRef` may read stable identity fields while the slot is live. Once a slot
-is marked dead, new `IdentRef` construction fails. Existing `IdentRef`s remain
-memory-safe until the guard drops because physical reclamation and destructor
-execution are deferred past epoch quiescence.
+enters `Retiring`, new `IdentRef` construction fails. Existing `IdentRef`s
+remain memory-safe until the guard drops because physical reclamation and
+destructor execution are deferred past epoch quiescence.
 
 ### 4.3 `Cap<T>` Is Identity Retention
 <!-- txdoc:EBR-ZONE-REFERENCE-SEMANTICS-CAP-T-IS-IDENTITY-RETENTION-1 -->
@@ -364,7 +384,6 @@ Upgrade from `IdentRef<'g, T>` uses one metadata CAS that checks:
 
 - generation still matches;
 - state is live;
-- retention has not reached `SENTINEL_DEAD`;
 - retention increment does not overflow.
 
 On success it returns `Cap<T>`. On failure, the operation degrades to clean
@@ -407,37 +426,62 @@ Metadata:
 
 ```text
 generation
-state: Free | Reserved | Live | Dead | Retired
-retain: identity-retention count or SENTINEL_DEAD
+state: Free | Reserved | Live | Retiring
+Live:      retain[31:0] is the identity-retention count
+Retiring:  retain[31:0] is the intrusive next SlotKey
+spare[0]:  Retiring has_next
+spare[1]:  Free generation_exhausted
 ```
 
 No `weak_count`. `Weak<T>` is a stale-tolerant handle, not a lifecycle
 contributor.
 
+`SlotKey` remains the existing compact 32-bit registry key: the upper 8 bits
+encode `ZoneId - 1` and the lower 24 bits encode the zone-local slot ID. The
+target therefore supports at most 256 registered zones and `2^24` logical
+slots per zone. Raw key zero is valid for zone 1 slot 0, so list termination
+must use `has_next`; it cannot reserve zero as a null key. The registry entry
+for each zone also carries a crate-private erased reclaim callback so a mixed
+Zone bag can dispatch destruction from `SlotKey.zone_id()`.
+
 Lifecycle:
 
 ```text
-Free
-  -> Reserved             zone::reserve
-  -> Live                 zone::sign, returns first Cap<T>
-  -> Dead                 last identity retention wins SENTINEL_DEAD CAS
-  -> Retired              enqueue into bounded reclaim queue
-  -> Free + generation++  after epoch quiescence and destructor
+Free -> Reserved             zone::reserve
+Reserved -> Free             reservation Drop rollback
+Reserved -> Live             zone::sign, returns first Cap<T>
+Live -> Live                 clone or non-final Drop changes retain
+Live -> Retiring             final Drop blocks upgrades and links into a CPU bag
+Retiring -> Free             grace, destructor, metadata cleanup, generation++
 ```
 
 The last retention holder does **not** run `T::drop` immediately if guarded
-readers may still hold `IdentRef<'g, T>`. It marks the slot dead and enqueues
-retirement. The reclaim queue runs the destructor only after the epoch-safe
-window. Large destructors split their work under bounded-work reclamation.
+readers may still hold `IdentRef<'g, T>`. Under the epoch module's
+`LocalRetireGuard`, it first CASes `Live(retain = 1)` to
+`Retiring(next = none)`. That CAS is the no-new-observer linearization point.
+It then coherently samples the global epoch through the domain's AcqRel
+read-modify observation, loads that tagged bag's old Zone head, installs the
+intrusive next key and `has_next` in metadata, and publishes the slot as the new
+bag head before releasing the guard. The full metadata CAS resolves races with
+clone or upgrade: either the retention increment wins and final retirement
+retries, or the `Retiring` transition wins and later upgrades fail. Once
+`Retiring` wins, only the local-retire owner may mutate the next bits until the
+bag head is published.
 
-Retire enqueue failure is fail-fast in the five-state design. After
-`Dead -> Retired/Retiring` is claimed, there is no sixth state where the slot
-can safely remain discoverable for a later retry: it is non-upgradeable and not
-allocator-free, but it is also not yet owned by the EBR queue. Therefore the
-zone implementation may run one bounded `epoch::try_drain`/retry to relieve
-transient retired-node pool pressure. If the second enqueue still fails, this is
-a substrate capacity invariant violation and the kernel panics rather than
-silently leaking or reusing the slot.
+There is no stable `Dead` state and no allocation-backed retire descriptor.
+The compound `Live -> Retiring + bag push` transition is infallible once the
+last retention CAS wins. Generation remains unchanged while retiring and is
+incremented only after the epoch-safe destructor completes. Large destructors
+split their work under bounded-work reclamation.
+
+Reclaim clears intrusive next and `has_next` before publishing `Free` with
+Release ordering. If generation is below `u16::MAX`, reclaim increments it and
+returns the slot to the allocator. If generation is already `u16::MAX`, it
+sets `generation_exhausted` and does not return the logically free slot to any
+free list; generation never wraps while an indefinitely retained `Weak<T>` may
+exist. Allocation requires `state == Free && !generation_exhausted`. Retain
+overflow returns the existing typed Zone error without changing metadata;
+retain underflow is a substrate invariant violation.
 
 ### 5.2 `PayloadSlot`
 <!-- txdoc:EBR-ZONE-ZONE-POLICIES-PAYLOADSLOT-1 -->
@@ -533,28 +577,157 @@ upper subsystem chooses a binding obligation; the evidence type does the rest.
 The epoch module owns traversal safety and physical reclamation delay:
 
 ```rust
-pub fn guard() -> Guard;
+pub fn guard() -> Guard<'static>;
+pub fn borrow_current_guard() -> Option<Guard<'static>>;
+pub fn try_drain(budget: DrainBudget) -> DrainStats;
 
-pub(crate) unsafe fn retire(
-    ptr: NonNull<()>,
-    reclaim: unsafe fn(NonNull<()>),
-);
+pub(crate) struct LocalRetireGuard { /* CPU-local exclusion */ }
 
-pub fn try_drain(budget: DrainBudget);
+impl LocalRetireGuard {
+    unsafe fn enqueue_slot_after_barrier(&mut self, key: SlotKey, epoch: u64);
+    unsafe fn enqueue_head_after_barrier(&mut self, head: NonNull<RcuHead>, epoch: u64);
+}
 ```
 
-Implementation may still use:
+`LocalRetireGuard` is crate-private. Acquiring it pins the CPU, excludes local
+preemption and interrupt paths that can retire or drain, serializes the local
+bag writer, and publishes `retire_active = true` with Release ordering. Its
+critical section must not allocate, yield, or invoke reclaim callbacks. Drop
+clears `retire_active` with Release ordering before restoring local execution.
+Zone and publication modules use the two distinct enqueue methods; no tagged
+raw retire API crosses this boundary, and the current `epoch::retire_raw`
+compatibility entry is retired by this migration.
+
+### 7.1 Reader And Advance Ordering
+
+An owned `Guard` is `!Send + !Sync`, pins its CPU, is forbidden in IRQ context,
+and may not nest with another owned Guard on that CPU. Code already inside an
+epoch window may obtain only `borrow_current_guard`; that borrowed value does
+not modify counters and its Drop is a no-op.
+
+Guard entry performs, in order:
+
+1. pin the CPU and reject IRQ or owned nesting;
+2. load the global epoch with Acquire ordering;
+3. publish that value to `local_epoch` with SeqCst ordering;
+4. execute a SeqCst fence before any protected root or slot load.
+
+Owned Guard Drop stores `local_epoch = 0` with Release ordering. These rules
+are part of the target contract and preserve the ordering already used by the
+live EBR implementation.
+
+One epoch-advance attempt performs exactly one increment:
+
+1. Acquire-load the online-membership version and current global epoch `G`;
+2. for every online initialized CPU, Acquire-load `local_epoch` and
+   `retire_active`;
+3. reject advancement when `retire_active` is true or when
+   `local_epoch != 0 && local_epoch < G`;
+4. re-read the membership version and restart if it changed;
+5. CAS `G -> G + 1` with AcqRel success ordering.
+
+The domain membership lock/version serializes BSP/AP admission and CPU
+offline. A retire operation raises `retire_active` before its no-new-reader
+barrier and samples the global epoch after that barrier with an AcqRel atomic
+read-modify operation such as `fetch_add(0)`. The RMW observes the immediately
+preceding epoch value in the atomic modification order rather than a stale
+ordinary load. An advancer that raced before the flag may advance at most once;
+another increment requires a fresh scan and observes the active retire section.
+Therefore every bag tag is no earlier than the operation's no-new-reader
+linearization point.
+
+### 7.2 Per-CPU Bags And Drain
+
+The target implementation uses:
 
 - a global monotonically increasing epoch;
 - per-CPU local epoch state;
-- per-CPU retired lists;
+- three tagged epoch bags per CPU;
+- separate intrusive Zone-slot and generic `RcuHead` lists in each bag;
 - timer-triggered and pressure-triggered drains;
 - CPU pinning inside `Guard`;
 - a two-epoch safe margin.
 
-The public architecture should not require callers to know these mechanics.
-Callers hold `Guard`; zones call `retire`; `retire` records the current epoch
-internally; the timer/allocator invokes `try_drain`.
+The public architecture does not expose these mechanics. Callers hold `Guard`;
+the Zone and publication modules establish their no-new-reader barrier and use
+the corresponding crate-private enqueue method; timer, threshold, idle, and
+pressure paths invoke `try_drain`.
+
+The epoch engine does not expose reader or bag enums. `local_epoch == 0` means
+quiescent and a nonzero value means guarded at that epoch. Bag phase is derived
+from its heads, epoch tag, and the global epoch:
+
+```text
+both heads empty          -> Empty
+bag.epoch == global      -> Open
+bag.epoch + 2 <= global  -> Reclaimable
+otherwise                -> Waiting
+```
+
+Bounded drain acquires `LocalRetireGuard`, removes at most `budget` eligible
+nodes from the two intrusive heads, and updates each bag head so all remainder
+stays owned by the bag. Before each reclaim callback it clears `retire_active`
+and releases local IRQ exclusion while retaining the no-yield CPU-affinity
+witness needed to finish a detached per-CPU compatibility batch. The callback
+is synchronous and must not cross a yield or migration point. It may drop
+another `Cap` and recursively retire into the current open bag without racing a
+remainder overwrite. The drain re-establishes local exclusion before touching
+per-CPU state again. Each removed node is owned solely by the detached reclaim
+batch and its callback executes exactly once.
+
+Remote advance and summary paths never dereference another CPU's mutable bag
+storage. Each owner CPU publishes atomic occupied-epoch and lane-count
+summaries before clearing `retire_active`; remote scans use only those summaries.
+
+Before advancing into an epoch whose ring slot would be reused, every CPU's
+target bag must be empty. Reclaim lag therefore applies epoch backpressure; it
+never turns a completed publication into a fallible retirement. Threshold,
+timer, and idle paths drain the local CPU. If ring reuse is blocked by an online
+CPU, the coordinator sets that CPU's drain request and sends the platform's
+maintenance kick; advancement may stall until the online CPU responds, but no
+node becomes unsafe or loses ownership.
+
+### 7.3 CPU Offline
+
+CPU offline follows one ordered protocol serialized by the domain membership
+lock and version. It does not hold that lock while waiting for quiescence:
+
+1. under the lock, mark the CPU draining, increment the membership version,
+   reject new owned Guards and local-retire admission on that CPU, then release
+   the lock;
+2. wait for `local_epoch == 0`, `retire_active == false`, and pre-existing CPU
+   pins to quiesce;
+3. reacquire the lock, freeze the three bags, and transfer both intrusive heads
+   from every bag to a designated online coordinator; the destination ring slot
+   must be empty or carry the same epoch tag, and transfer merges rather than
+   overwrites its heads;
+4. remove the CPU from the online epoch set, clear its initialized state,
+   increment the membership version again, and release the lock.
+
+The draining marker belongs to existing CPU/domain lifecycle control; it is not
+a new public RCU state language. If no online coordinator remains during final
+shutdown, the domain first proves global quiescence and then synchronously
+drains all bags.
+
+### 7.4 Path Complexity Contract
+<!-- txdoc:EBR-ZONE-PATH-COMPLEXITY-1 -->
+
+The default implementation must preserve these bounds:
+
+| Path | Required bound | Lock rule |
+|---|---:|---|
+| `epoch::guard` and owned Guard Drop | `O(1)` | no spinlock |
+| `SlotKey -> Slot<T>` | fixed-depth `O(1)` | no Keg lock or slab-list walk |
+| `Weak::observe` and `Cap::deref` | `O(1)` plus metadata validation | no allocation/list lock |
+| local retire enqueue | `O(1)` | local exclusion only; no callback, allocation, CPU scan, or drain |
+| local eligible detach | `O(budget)` | callbacks execute after local exclusion |
+| one epoch-advance attempt | `O(online CPUs)` | no per-reader or per-retire scan |
+
+The `O(online CPUs)` grace-period scan is intentional and remains on the
+advance/maintenance path. Physical destruction is proportional to released
+storage but runs after epoch exclusion in bounded node-count batches. CPU
+offline may scan membership and transfer every bag owned by the offlining CPU.
+These costs must not migrate into guarded observation or retire enqueue.
 
 ---
 
@@ -658,7 +831,7 @@ The explicit manifest is deliberately chosen over linker-section collection:
 
 Keep:
 
-- per-CPU epoch state and bounded retired-list draining;
+- per-CPU epoch state and bounded intrusive-bag draining;
 - packed metadata for generation/state/retention CAS;
 - generation-tagged weak handles for ABA prevention;
 - linear zone reservations with Drop rollback;
@@ -671,8 +844,9 @@ Change:
 - `pin()` to `guard()`;
 - `WeakCap<T>` to non-retaining `Weak<T>`;
 - remove `weak_count` from semantic reclamation;
-- replace `strong == 0 && weak == 0 && Tombstone` with
-  `retain == 0 -> SENTINEL_DEAD -> retire`;
+- replace `strong == 0 && weak == 0 && Tombstone` with the compound
+  `Live(retain = 1) -> Retiring(next = none) -> post-barrier epoch sample ->
+  bag push` transition;
 - run destructors after epoch quiescence for EBR-observed slot contents;
 - express split lifetimes with identity/payload zones and obligation evidence,
   not weak retention.
@@ -684,6 +858,28 @@ Reject:
   obligation promises identity stability;
 - immediate `T::drop` before guarded readers have quiesced;
 - out-of-band `reclaim_permitted` flags.
+
+### 10.1 Relationship To Owner Lanes And RCU Publication
+
+<!-- txdoc:EBR-ZONE-OWNER-LANES-RCU-1 -->
+
+[`OBJECT_API_LANES_v1.md`](../00_meta-framework/OBJECT_API_LANES_v1.md)
+defines the semantic owner/root boundary above this interface. Zone and RCU
+publication remain orthogonal beneath that boundary:
+
+- zone gives semantic entities stable identity and role-shaped evidence;
+- authoritative containers store `BindingValue` entries by value, including
+  obligation-derived `Weak`, `Cap`, or operational evidence;
+- `Published<T>` may replace immutable container roots and retire old roots
+  through EBR without giving those roots semantic identity;
+- tree/index nodes are private `ObserverNode` storage and never produce public
+  `Cap<Node>` or `Weak<Node>`;
+- old published snapshots may delay evidence Drop through the grace period,
+  but fresh readers resolve only through the newly published root.
+
+Moving a container to RCU does not require moving its nodes into zone storage.
+Observer-node zones are an optional private allocation/reclamation strategy,
+not an upper API or an RCU prerequisite.
 
 ---
 

@@ -21,9 +21,9 @@ use std::sync::Arc;
 
 use tx_hal::{
     Arch, AuxvIf, BootInfo, BootInfoIf, BootPlatformIf, BootProtocol, CacheIf, ConsoleIf, CpuId,
-    CpuMask, DmaIf, EntropyIf, InitIf, IrqIf, MemoryRegion, ObserverIf, PercpuIf, PhysRange,
-    PlatformConfig, PlatformInfo, PlatformInfoIf, PmapIf, PowerIf, RingDescriptor, SignalFrameIf,
-    SmpIf, TimeIf, TrapIf, VirtAddr,
+    CpuMask, DeadlineTimerIf, DmaIf, EntropyIf, InitIf, IrqIf, MemoryRegion, MonotonicCounterIf,
+    ObserverIf, PercpuIf, PersistentClockIf, PhysRange, PlatformConfig, PlatformInfo,
+    PlatformInfoIf, PmapIf, PowerIf, RingDescriptor, SignalFrameIf, SmpIf, TrapIf, VirtAddr,
 };
 use tx_observe_types::{TxPayloadTag, TxTraceHartRing, TxTraceKind, TxTraceRecord};
 use tx_substrate::{
@@ -93,7 +93,13 @@ impl ConsoleIf for TestPlatform {
 impl PmapIf for TestPlatform {}
 impl TrapIf for TestPlatform {}
 impl SignalFrameIf for TestPlatform {}
-impl IrqIf for TestPlatform {}
+unsafe fn restore_test_local_execution(_saved_state: usize) {}
+
+impl IrqIf for TestPlatform {
+    fn exclude_local_execution() -> tx_hal::LocalExecutionGuard {
+        unsafe { tx_hal::LocalExecutionGuard::new(0, restore_test_local_execution) }
+    }
+}
 impl EntropyIf for TestPlatform {}
 impl CacheIf for TestPlatform {}
 impl DmaIf for TestPlatform {}
@@ -112,16 +118,22 @@ impl PowerIf for TestPlatform {
         }
     }
 }
-impl TimeIf for TestPlatform {
+impl MonotonicCounterIf for TestPlatform {
     fn read_ns() -> u64 {
         TS_COUNTER.fetch_add(1, Ordering::Relaxed) as u64 + 1
     }
-    fn set_deadline_ns(_: u64) {}
-    fn cancel_deadline() {}
+
     fn frequency_hz() -> u64 {
         1_000_000_000
     }
 }
+
+impl DeadlineTimerIf for TestPlatform {
+    fn set_deadline_ns(_: u64) {}
+
+    fn cancel_deadline() {}
+}
+impl PersistentClockIf for TestPlatform {}
 impl PercpuIf for TestPlatform {
     fn current_cpu_id() -> CpuId {
         CpuId(CURRENT_CPU.load(Ordering::Acquire))

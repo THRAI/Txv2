@@ -5,6 +5,7 @@ use core::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
+use crate::adapter::bus_wire::{MailboxEvent, TaskMailbox};
 use crate::wait::{Channel, Mask, WaitOutcome, WaitProtocol};
 
 const DONE: Mask = Mask::from_bits(0x1);
@@ -35,13 +36,16 @@ impl Completion {
         }
     }
 
-    pub fn complete(&self) {
+    pub fn complete_with_post<F>(&self, post: F) -> usize
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+    {
         self.credits
             .fetch_update(Ordering::Release, Ordering::Relaxed, |credits| {
                 credits.checked_add(1)
             })
             .expect("completion credit overflow");
-        self.channel.fire(DONE);
+        self.channel.fire_with_post(DONE, post)
     }
 
     pub fn try_consume(&self) -> bool {
@@ -87,7 +91,10 @@ impl CountdownCompletion {
         }
     }
 
-    pub fn arrive(&self) {
+    pub fn arrive_with_post<F>(&self, post: F) -> usize
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+    {
         let previous = self
             .remaining
             .fetch_update(Ordering::Release, Ordering::Relaxed, |remaining| {
@@ -96,7 +103,9 @@ impl CountdownCompletion {
             .expect("countdown completion underflow");
 
         if previous == 1 {
-            self.channel.fire(DONE);
+            self.channel.fire_with_post(DONE, post)
+        } else {
+            0
         }
     }
 

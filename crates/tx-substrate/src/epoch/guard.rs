@@ -6,7 +6,6 @@
 
 use core::marker::PhantomData;
 
-use super::domain::EpochDomain;
 use super::local::CpuLocalEpochState;
 use tx_hal::{CpuId, CpuPinGuard};
 
@@ -21,8 +20,6 @@ use tx_hal::{CpuId, CpuPinGuard};
 /// to obtain one when a caller already holds a guard but needs to satisfy an
 /// API that requires `&Guard`.
 pub struct Guard<'g> {
-    /// Domain to notify when the guard leaves.
-    domain: &'static EpochDomain,
     /// Current CPU's local epoch slot.
     local: &'static CpuLocalEpochState,
     /// Captured for diagnostics and for callers that need to know where the
@@ -34,25 +31,25 @@ pub struct Guard<'g> {
     _cpu_pin: CpuPinGuard,
     /// When false this guard borrows an existing epoch window; Drop is a no-op.
     owned: bool,
+    pin_accounted: bool,
     _scope: PhantomData<&'g ()>,
     _not_send_sync: PhantomData<*mut ()>,
 }
 
 impl<'g> Guard<'g> {
     pub(crate) fn new(
-        domain: &'static EpochDomain,
         local: &'static CpuLocalEpochState,
         cpu_id: CpuId,
         entered_epoch: u64,
         cpu_pin: CpuPinGuard,
     ) -> Self {
         Self {
-            domain,
             local,
             cpu_id,
             entered_epoch,
             _cpu_pin: cpu_pin,
             owned: true,
+            pin_accounted: true,
             _scope: PhantomData,
             _not_send_sync: PhantomData,
         }
@@ -61,19 +58,18 @@ impl<'g> Guard<'g> {
     /// Create a borrow-mode guard that does not modify epoch counters on
     /// creation or drop.  The caller must already hold a real guard on this CPU.
     pub(crate) fn new_borrowed(
-        domain: &'static EpochDomain,
         local: &'static CpuLocalEpochState,
         cpu_id: CpuId,
         entered_epoch: u64,
         cpu_pin: CpuPinGuard,
     ) -> Self {
         Self {
-            domain,
             local,
             cpu_id,
             entered_epoch,
             _cpu_pin: cpu_pin,
             owned: false,
+            pin_accounted: false,
             _scope: PhantomData,
             _not_send_sync: PhantomData,
         }
@@ -92,7 +88,9 @@ impl Drop for Guard<'_> {
     fn drop(&mut self) {
         if self.owned {
             self.local.leave();
-            self.domain.leave_guard();
+        }
+        if self.pin_accounted {
+            self.local.unpin();
         }
     }
 }

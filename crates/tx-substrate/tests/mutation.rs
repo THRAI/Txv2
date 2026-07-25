@@ -8,7 +8,13 @@ static EPOCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 struct TestPlatform;
 
 impl PercpuIf for TestPlatform {}
-impl IrqIf for TestPlatform {}
+unsafe fn restore_test_local_execution(_saved_state: usize) {}
+
+impl IrqIf for TestPlatform {
+    fn exclude_local_execution() -> tx_hal::LocalExecutionGuard {
+        unsafe { tx_hal::LocalExecutionGuard::new(0, restore_test_local_execution) }
+    }
+}
 impl EntropyIf for TestPlatform {}
 impl SmpIf for TestPlatform {}
 

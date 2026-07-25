@@ -14,8 +14,8 @@
 //! - DTOK-3 reply-vs-timeout race determinism: first writer wins,
 //!   the loser observes `LateNoOp(<winner>)`.
 //! - [`AgentTokenGuard`] drop semantics matrix: `CancelOnDrop`
-//!   triggers `mark_canceled`; `Abandon` is a pure unbind.
-//! - `mark_endpoint_died` walks all tokens with a matching marker
+//!   triggers `delegate cancel transition`; `Abandon` is a pure unbind.
+//! - `delegate endpoint-death transition` walks all tokens with a matching marker
 //!   (DELEGATE-3, DTOK-2).
 //! - [`TokenDropPolicy::from_agent_cancel`] derivation: BestEffort
 //!   / Synchronous → CancelOnDrop; Detached → Abandon.
@@ -29,6 +29,13 @@ use tx_substrate::step::{
     AgentCancelPolicy, DelegateRegistry, DelegateReply, DelegateRequest, DelegateState,
     DelegateTokenId, TokenDropPolicy, TransitionOutcome,
 };
+use tx_substrate::wake::{MailboxEvent, TaskMailbox};
+
+fn direct_delegate_mailbox_post(mailbox: std::sync::Weak<TaskMailbox>, event: MailboxEvent) {
+    if let Some(mailbox) = mailbox.upgrade() {
+        let _ = mailbox.post(event);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // 1. DelegateState catalog and terminal classification.
@@ -153,7 +160,11 @@ fn pending_to_replied_path_installs_reply() {
     );
     let id = guard.id();
 
-    let outcome = registry.mark_replied(id, DelegateReply::placeholder());
+    let outcome = registry.mark_replied_with_post(
+        id,
+        DelegateReply::placeholder(),
+        direct_delegate_mailbox_post,
+    );
     assert_eq!(outcome, TransitionOutcome::Applied);
     assert_eq!(registry.state(id), Some(DelegateState::Replied));
 
@@ -180,7 +191,7 @@ fn pending_to_timed_out_is_legal() {
         None,
     );
     let id = guard.id();
-    let outcome = registry.mark_timed_out(id);
+    let outcome = registry.mark_timed_out_with_post(id, direct_delegate_mailbox_post);
     assert_eq!(outcome, TransitionOutcome::Applied);
     assert_eq!(registry.state(id), Some(DelegateState::TimedOut));
     let _ = guard.forget();
@@ -198,7 +209,7 @@ fn pending_to_canceled_is_legal() {
         None,
     );
     let id = guard.id();
-    let outcome = registry.mark_canceled(id);
+    let outcome = registry.mark_canceled_with_post(id, direct_delegate_mailbox_post);
     assert_eq!(outcome, TransitionOutcome::Applied);
     assert_eq!(registry.state(id), Some(DelegateState::Canceled));
     let _ = guard.forget();
@@ -216,7 +227,7 @@ fn pending_to_agent_died_is_legal() {
         None,
     );
     let id = guard.id();
-    let outcome = registry.mark_agent_died(id);
+    let outcome = registry.mark_agent_died_with_post(id, direct_delegate_mailbox_post);
     assert_eq!(outcome, TransitionOutcome::Applied);
     assert_eq!(registry.state(id), Some(DelegateState::AgentDied));
     let _ = guard.forget();
@@ -243,11 +254,15 @@ fn replied_to_timed_out_is_not_permitted() {
     let id = guard.id();
 
     assert_eq!(
-        registry.mark_replied(id, DelegateReply::placeholder()),
+        registry.mark_replied_with_post(
+            id,
+            DelegateReply::placeholder(),
+            direct_delegate_mailbox_post
+        ),
         TransitionOutcome::Applied
     );
     assert_eq!(
-        registry.mark_timed_out(id),
+        registry.mark_timed_out_with_post(id, direct_delegate_mailbox_post),
         TransitionOutcome::LateNoOp(DelegateState::Replied)
     );
     // State unchanged.
@@ -270,8 +285,15 @@ fn timed_out_blocks_subsequent_reply_as_late() {
     );
     let id = guard.id();
 
-    assert_eq!(registry.mark_timed_out(id), TransitionOutcome::Applied);
-    let outcome = registry.mark_replied(id, DelegateReply::placeholder());
+    assert_eq!(
+        registry.mark_timed_out_with_post(id, direct_delegate_mailbox_post),
+        TransitionOutcome::Applied
+    );
+    let outcome = registry.mark_replied_with_post(
+        id,
+        DelegateReply::placeholder(),
+        direct_delegate_mailbox_post,
+    );
     assert_eq!(
         outcome,
         TransitionOutcome::LateNoOp(DelegateState::TimedOut)
@@ -293,17 +315,24 @@ fn canceled_blocks_subsequent_terminal_transitions() {
         None,
     );
     let id = guard.id();
-    assert_eq!(registry.mark_canceled(id), TransitionOutcome::Applied);
     assert_eq!(
-        registry.mark_replied(id, DelegateReply::placeholder()),
+        registry.mark_canceled_with_post(id, direct_delegate_mailbox_post),
+        TransitionOutcome::Applied
+    );
+    assert_eq!(
+        registry.mark_replied_with_post(
+            id,
+            DelegateReply::placeholder(),
+            direct_delegate_mailbox_post
+        ),
         TransitionOutcome::LateNoOp(DelegateState::Canceled)
     );
     assert_eq!(
-        registry.mark_timed_out(id),
+        registry.mark_timed_out_with_post(id, direct_delegate_mailbox_post),
         TransitionOutcome::LateNoOp(DelegateState::Canceled)
     );
     assert_eq!(
-        registry.mark_agent_died(id),
+        registry.mark_agent_died_with_post(id, direct_delegate_mailbox_post),
         TransitionOutcome::LateNoOp(DelegateState::Canceled)
     );
     let _ = guard.forget();
@@ -321,17 +350,24 @@ fn agent_died_blocks_subsequent_terminal_transitions() {
         None,
     );
     let id = guard.id();
-    assert_eq!(registry.mark_agent_died(id), TransitionOutcome::Applied);
     assert_eq!(
-        registry.mark_replied(id, DelegateReply::placeholder()),
+        registry.mark_agent_died_with_post(id, direct_delegate_mailbox_post),
+        TransitionOutcome::Applied
+    );
+    assert_eq!(
+        registry.mark_replied_with_post(
+            id,
+            DelegateReply::placeholder(),
+            direct_delegate_mailbox_post
+        ),
         TransitionOutcome::LateNoOp(DelegateState::AgentDied)
     );
     assert_eq!(
-        registry.mark_timed_out(id),
+        registry.mark_timed_out_with_post(id, direct_delegate_mailbox_post),
         TransitionOutcome::LateNoOp(DelegateState::AgentDied)
     );
     assert_eq!(
-        registry.mark_canceled(id),
+        registry.mark_canceled_with_post(id, direct_delegate_mailbox_post),
         TransitionOutcome::LateNoOp(DelegateState::AgentDied)
     );
     let _ = guard.forget();
@@ -358,11 +394,15 @@ fn reply_wins_when_reply_fires_first_then_timeout_late() {
     let id = guard.id();
 
     assert_eq!(
-        registry.mark_replied(id, DelegateReply::placeholder()),
+        registry.mark_replied_with_post(
+            id,
+            DelegateReply::placeholder(),
+            direct_delegate_mailbox_post
+        ),
         TransitionOutcome::Applied
     );
     assert_eq!(
-        registry.mark_timed_out(id),
+        registry.mark_timed_out_with_post(id, direct_delegate_mailbox_post),
         TransitionOutcome::LateNoOp(DelegateState::Replied)
     );
     assert_eq!(registry.state(id), Some(DelegateState::Replied));
@@ -385,9 +425,16 @@ fn timeout_wins_when_timeout_fires_first_then_reply_late() {
     );
     let id = guard.id();
 
-    assert_eq!(registry.mark_timed_out(id), TransitionOutcome::Applied);
     assert_eq!(
-        registry.mark_replied(id, DelegateReply::placeholder()),
+        registry.mark_timed_out_with_post(id, direct_delegate_mailbox_post),
+        TransitionOutcome::Applied
+    );
+    assert_eq!(
+        registry.mark_replied_with_post(
+            id,
+            DelegateReply::placeholder(),
+            direct_delegate_mailbox_post
+        ),
         TransitionOutcome::LateNoOp(DelegateState::TimedOut)
     );
     assert_eq!(registry.state(id), Some(DelegateState::TimedOut));
@@ -520,7 +567,11 @@ fn drop_after_terminal_is_no_op() {
     );
     let id = guard.id();
     assert_eq!(
-        registry.mark_replied(id, DelegateReply::placeholder()),
+        registry.mark_replied_with_post(
+            id,
+            DelegateReply::placeholder(),
+            direct_delegate_mailbox_post
+        ),
         TransitionOutcome::Applied
     );
     drop(guard);
@@ -541,7 +592,7 @@ fn forget_suppresses_drop_time_cas() {
     );
     let id = guard.id();
     // forget() returns the raw id and suppresses the drop-time
-    // mark_canceled.
+    // delegate cancel transition.
     let forgotten = guard.forget();
     assert_eq!(forgotten, id);
     assert_eq!(registry.state(id), Some(DelegateState::Pending));
@@ -576,7 +627,7 @@ fn token_drop_policy_from_detached_is_abandon() {
 }
 
 // ---------------------------------------------------------------------------
-// 8. mark_endpoint_died routes to every matching token (DTOK-2).
+// 8. delegate endpoint-death transition routes to every matching token (DTOK-2).
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -609,7 +660,8 @@ fn mark_endpoint_died_walks_all_tokens_with_matching_marker() {
         None,
     );
 
-    let transitioned = registry.mark_endpoint_died(marker_a);
+    let transitioned =
+        registry.mark_endpoint_died_with_post(marker_a, direct_delegate_mailbox_post);
     assert_eq!(transitioned, 2);
 
     assert_eq!(registry.state(g_a1.id()), Some(DelegateState::AgentDied));
@@ -645,11 +697,15 @@ fn mark_endpoint_died_skips_already_terminal_tokens() {
 
     // Pre-terminalize g1 via reply.
     assert_eq!(
-        registry.mark_replied(g1.id(), DelegateReply::placeholder()),
+        registry.mark_replied_with_post(
+            g1.id(),
+            DelegateReply::placeholder(),
+            direct_delegate_mailbox_post
+        ),
         TransitionOutcome::Applied
     );
     // Endpoint death now reaches only g2.
-    let transitioned = registry.mark_endpoint_died(marker);
+    let transitioned = registry.mark_endpoint_died_with_post(marker, direct_delegate_mailbox_post);
     assert_eq!(transitioned, 1);
     assert_eq!(registry.state(g1.id()), Some(DelegateState::Replied));
     assert_eq!(registry.state(g2.id()), Some(DelegateState::AgentDied));
@@ -667,19 +723,23 @@ fn mark_methods_report_unknown_token_for_forged_ids() {
     let forged = DelegateTokenId::new(99999);
     assert_eq!(registry.state(forged), None);
     assert_eq!(
-        registry.mark_replied(forged, DelegateReply::placeholder()),
+        registry.mark_replied_with_post(
+            forged,
+            DelegateReply::placeholder(),
+            direct_delegate_mailbox_post
+        ),
         TransitionOutcome::UnknownToken
     );
     assert_eq!(
-        registry.mark_timed_out(forged),
+        registry.mark_timed_out_with_post(forged, direct_delegate_mailbox_post),
         TransitionOutcome::UnknownToken
     );
     assert_eq!(
-        registry.mark_canceled(forged),
+        registry.mark_canceled_with_post(forged, direct_delegate_mailbox_post),
         TransitionOutcome::UnknownToken
     );
     assert_eq!(
-        registry.mark_agent_died(forged),
+        registry.mark_agent_died_with_post(forged, direct_delegate_mailbox_post),
         TransitionOutcome::UnknownToken
     );
 }

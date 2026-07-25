@@ -1,6 +1,6 @@
 #![allow(deprecated)]
 
-use core::{ptr::NonNull, task::Waker};
+use core::task::Waker;
 use std::{
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -11,17 +11,16 @@ use std::{
 
 use tx_hal::{EntropyIf, IrqIf, PercpuIf, SmpIf};
 use tx_substrate::bus::{
-    retire_wire_owner, DeclaredPort, DeclaredQueue, DeclaredSubscriptionError,
-    DeclaredSubscriptionGraphKey, DeclaredWireError, RawPort, RawQueue, RawSubscriptionError,
-    RawSubscriptionState, RawTrace, RawWireError, StaticRawPort, StaticRawQueue, SubscriptionGraph,
-    SubscriptionGraphError, SubscriptionGraphReady, TraceDeclaration, TracePayload,
-    WireDeclaration, WireDeclarationError, WireEventSet, WireKind, WireOwnerManifest,
-    WireOwnerReclaimError, WireOwnerRetireFence,
+    DeclaredPort, DeclaredQueue, DeclaredSubscriptionError, DeclaredSubscriptionGraphKey,
+    DeclaredWireError, RawPort, RawQueue, RawSubscriptionError, RawSubscriptionState, RawTrace,
+    RawWireError, StaticRawPort, StaticRawQueue, SubscriptionGraph, SubscriptionGraphError,
+    SubscriptionGraphReady, TraceDeclaration, TracePayload, WireDeclaration,
+    WireDeclarationError, WireEventSet, WireKind,
 };
 use tx_substrate::epoch;
+use tx_substrate::wake::mailbox::{MailboxEvent, TaskMailbox};
 
 static EPOCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-static OWNER_RECLAIM_COUNT: AtomicUsize = AtomicUsize::new(0);
 static STATIC_TEST_QUEUE: StaticRawQueue = StaticRawQueue::new();
 static STATIC_TEST_PORT: StaticRawPort = StaticRawPort::new();
 static STATIC_TYPED_QUEUE: StaticRawQueue = StaticRawQueue::new();
@@ -30,56 +29,18 @@ static STATIC_TYPED_PORT: StaticRawPort = StaticRawPort::new();
 struct TestPlatform;
 
 impl PercpuIf for TestPlatform {}
-impl IrqIf for TestPlatform {}
+unsafe fn restore_test_local_execution(_saved_state: usize) {}
+
+impl IrqIf for TestPlatform {
+    fn exclude_local_execution() -> tx_hal::LocalExecutionGuard {
+        unsafe { tx_hal::LocalExecutionGuard::new(0, restore_test_local_execution) }
+    }
+}
 impl EntropyIf for TestPlatform {}
 impl SmpIf for TestPlatform {}
 
 struct CountWake {
     wakes: Arc<AtomicUsize>,
-}
-
-struct ManifestOwner {
-    queue: RawQueue,
-    port: RawPort,
-}
-
-struct MacroManifestOwner {
-    queue: DeclaredQueue<Readiness>,
-    port: DeclaredPort<Lifecycle>,
-}
-
-unsafe impl WireOwnerManifest for ManifestOwner {
-    fn retire_embedded_wires(
-        &self,
-        guard: &epoch::Guard<'_>,
-    ) -> Result<WireOwnerRetireFence, WireOwnerReclaimError> {
-        let mut fence = WireOwnerRetireFence::from_retirement(self.queue.retire(0x1, guard))?;
-        fence.include(self.port.retire(0x2, guard))?;
-        Ok(fence)
-    }
-
-    unsafe fn reclaim_owner(owner: NonNull<Self>) {
-        unsafe {
-            drop(Box::from_raw(owner.as_ptr()));
-        }
-        OWNER_RECLAIM_COUNT.fetch_add(1, Ordering::AcqRel);
-    }
-}
-
-tx_substrate::bus::bus_wire_owner_manifest! {
-    unsafe impl WireOwnerManifest for MacroManifestOwner {
-        reclaim_owner(owner) {
-            unsafe {
-                drop(Box::from_raw(owner.as_ptr()));
-            }
-            OWNER_RECLAIM_COUNT.fetch_add(1, Ordering::AcqRel);
-        }
-
-        wires {
-            queue => retire(Readiness::BROKEN);
-            port => retire(Lifecycle::GONE);
-        }
-    }
 }
 
 impl Wake for CountWake {
@@ -103,13 +64,8 @@ fn reset_epoch() -> std::sync::MutexGuard<'static, ()> {
     unsafe {
         epoch::testing::reset_for_test();
     }
-    OWNER_RECLAIM_COUNT.store(0, Ordering::Release);
     epoch::init_on_bsp::<TestPlatform>().expect("epoch init");
     guard
-}
-
-unsafe fn count_owner_reclaim(_ptr: *mut u8) {
-    OWNER_RECLAIM_COUNT.fetch_add(1, Ordering::AcqRel);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -205,7 +161,6 @@ fn raw_wires_are_send_sync_for_cross_hart_wake_paths() {
     assert_send_sync::<DeclaredSubscriptionGraphKey<Readiness>>();
     assert_send_sync::<TraceDeclaration<ManualTracePayload>>();
     assert_send_sync::<RawTrace<ManualTracePayload>>();
-    assert_send_sync::<WireOwnerRetireFence>();
 }
 
 #[test]
@@ -283,6 +238,59 @@ fn declared_static_queue_and_port_validate_events_over_static_storage() {
     queue.clear(Readiness::HAS_DATA);
     drop(queue_subscription);
     drop(port_subscription);
+}
+
+#[test]
+fn raw_bus_fire_supports_injected_owner_post() {
+    let queue = RawQueue::new();
+    let port = RawPort::new();
+    let queue_mailbox = Arc::new(TaskMailbox::new());
+    let port_mailbox = Arc::new(TaskMailbox::new());
+
+    let _queue_sub = queue.subscribe(
+        0x3,
+        Arc::downgrade(&queue_mailbox),
+        queue_mailbox.next_generation(),
+    );
+    let _port_sub = port.subscribe(
+        0x4,
+        Arc::downgrade(&port_mailbox),
+        port_mailbox.next_generation(),
+    );
+
+    let queue_posts = AtomicUsize::new(0);
+    let port_posts = AtomicUsize::new(0);
+
+    assert_eq!(
+        queue.fire_with_post(0x1, |mailbox, event| {
+            queue_posts.fetch_add(1, Ordering::SeqCst);
+            mailbox.post(event)
+        }),
+        1
+    );
+    assert_eq!(
+        port.fire_with_post(0x4, |mailbox, event| {
+            port_posts.fetch_add(1, Ordering::SeqCst);
+            mailbox.post(event)
+        }),
+        1
+    );
+
+    assert_eq!(queue_posts.load(Ordering::SeqCst), 1);
+    assert_eq!(port_posts.load(Ordering::SeqCst), 1);
+
+    match queue_mailbox.poll().expect("queue event") {
+        MailboxEvent::SourceFired { interests, .. } => {
+            assert_eq!(interests.raw(), 0x1);
+        }
+        other => panic!("expected queue SourceFired, got {other:?}"),
+    }
+    match port_mailbox.poll().expect("port event") {
+        MailboxEvent::SourceFired { interests, .. } => {
+            assert_eq!(interests.raw(), 0x4);
+        }
+        other => panic!("expected port SourceFired, got {other:?}"),
+    }
 }
 
 #[test]
@@ -501,179 +509,6 @@ fn raw_port_silent_retire_drains_without_waking_and_records_epoch() {
     assert_eq!(wakes.load(Ordering::SeqCst), 0);
     assert_eq!(subscription.state(), RawSubscriptionState::Terminal);
     assert!(subscription.take_ready());
-}
-
-#[test]
-fn owner_retire_fence_queues_storage_reclaim_after_embedded_wire_retire() {
-    let _epoch = reset_epoch();
-    let queue = RawQueue::new();
-    let port = RawPort::new();
-    let queue_wakes = Arc::new(AtomicUsize::new(0));
-    let port_wakes = Arc::new(AtomicUsize::new(0));
-    let mut queue_subscription =
-        queue.subscribe_with_waker(0x1, counting_waker(Arc::clone(&queue_wakes)));
-    let mut port_subscription =
-        port.subscribe_with_waker(0x2, counting_waker(Arc::clone(&port_wakes)));
-    let guard = epoch::guard();
-
-    let mut fence =
-        WireOwnerRetireFence::from_retirement(queue.retire(0x1, &guard)).expect("queue fence");
-    fence
-        .include(port.retire(0x2, &guard))
-        .expect("same-guard port fence");
-
-    assert_eq!(fence.wires(), 2);
-    assert_eq!(fence.woken(), 2);
-    assert_eq!(fence.guard_epoch(), guard.entered_epoch());
-    assert_eq!(fence.guard_cpu(), guard.cpu_id());
-    assert_eq!(queue.subscriber_count(), 0);
-    assert_eq!(port.subscriber_count(), 0);
-    assert_eq!(queue_wakes.load(Ordering::SeqCst), 1);
-    assert_eq!(port_wakes.load(Ordering::SeqCst), 1);
-    assert_eq!(queue_subscription.state(), RawSubscriptionState::Terminal);
-    assert_eq!(port_subscription.state(), RawSubscriptionState::Terminal);
-    assert!(queue_subscription.take_ready());
-    assert!(port_subscription.take_ready());
-
-    let reclaim = unsafe {
-        fence
-            .retire_owner_storage(NonNull::<u8>::dangling(), count_owner_reclaim)
-            .expect("owner storage retire")
-    };
-    assert_eq!(reclaim.wires(), 2);
-    assert_eq!(reclaim.woken(), 2);
-    assert_eq!(reclaim.guard_epoch(), guard.entered_epoch());
-    assert_eq!(reclaim.guard_cpu(), guard.cpu_id());
-
-    let blocked = epoch::drain_with_budget(usize::MAX);
-    assert_eq!(blocked.reclaimed, 0);
-    assert_eq!(OWNER_RECLAIM_COUNT.load(Ordering::Acquire), 0);
-
-    drop(guard);
-
-    let drained = epoch::drain_with_budget(usize::MAX);
-    assert_eq!(drained.reclaimed, 1);
-    assert_eq!(OWNER_RECLAIM_COUNT.load(Ordering::Acquire), 1);
-}
-
-#[test]
-fn owner_retire_fence_rejects_repeated_and_mismatched_wire_retirements() {
-    let _epoch = reset_epoch();
-    let queue = RawQueue::new();
-    let port = RawPort::new();
-    let guard = epoch::guard();
-
-    let first = queue.retire_silently(&guard);
-    let repeated = queue.retire_silently(&guard);
-    assert_eq!(
-        WireOwnerRetireFence::from_retirement(repeated),
-        Err(WireOwnerReclaimError::WireAlreadyTerminal)
-    );
-
-    let mut fence = WireOwnerRetireFence::from_retirement(first).expect("first fence");
-    drop(guard);
-    epoch::drain_with_budget(usize::MAX);
-
-    let later_guard = epoch::guard();
-    let later = port.retire_silently(&later_guard);
-    assert_eq!(
-        fence.include(later),
-        Err(WireOwnerReclaimError::GuardMismatch)
-    );
-}
-
-#[test]
-fn typed_owner_manifest_retires_wires_and_queues_typed_reclaim() {
-    let _epoch = reset_epoch();
-    let owner = Box::new(ManifestOwner {
-        queue: RawQueue::new(),
-        port: RawPort::new(),
-    });
-    let owner = NonNull::new(Box::into_raw(owner)).expect("box pointer is non-null");
-    let owner_ref = unsafe { owner.as_ref() };
-    let queue = owner_ref.queue.clone();
-    let port = owner_ref.port.clone();
-    let queue_wakes = Arc::new(AtomicUsize::new(0));
-    let port_wakes = Arc::new(AtomicUsize::new(0));
-    let mut queue_subscription =
-        queue.subscribe_with_waker(0x1, counting_waker(Arc::clone(&queue_wakes)));
-    let mut port_subscription =
-        port.subscribe_with_waker(0x2, counting_waker(Arc::clone(&port_wakes)));
-    let guard = epoch::guard();
-
-    let reclaim = unsafe { retire_wire_owner(owner, &guard) }.expect("typed owner retire");
-
-    assert_eq!(reclaim.wires(), 2);
-    assert_eq!(reclaim.woken(), 2);
-    assert_eq!(reclaim.guard_epoch(), guard.entered_epoch());
-    assert_eq!(reclaim.guard_cpu(), guard.cpu_id());
-    assert_eq!(queue.subscriber_count(), 0);
-    assert_eq!(port.subscriber_count(), 0);
-    assert_eq!(queue_wakes.load(Ordering::SeqCst), 1);
-    assert_eq!(port_wakes.load(Ordering::SeqCst), 1);
-    assert_eq!(queue_subscription.state(), RawSubscriptionState::Terminal);
-    assert_eq!(port_subscription.state(), RawSubscriptionState::Terminal);
-    assert!(queue_subscription.take_ready());
-    assert!(port_subscription.take_ready());
-
-    let blocked = epoch::drain_with_budget(usize::MAX);
-    assert_eq!(blocked.reclaimed, 0);
-    assert_eq!(OWNER_RECLAIM_COUNT.load(Ordering::Acquire), 0);
-
-    drop(guard);
-
-    let drained = epoch::drain_with_budget(usize::MAX);
-    assert_eq!(drained.reclaimed, 1);
-    assert_eq!(OWNER_RECLAIM_COUNT.load(Ordering::Acquire), 1);
-}
-
-#[test]
-fn owner_manifest_macro_retires_declared_wires_and_queues_typed_reclaim() {
-    let _epoch = reset_epoch();
-    let owner = Box::new(MacroManifestOwner {
-        queue: DeclaredQueue::new(WireDeclaration::<Readiness>::queue("macro.owner.queue"))
-            .expect("macro owner queue"),
-        port: DeclaredPort::new(WireDeclaration::<Lifecycle>::port("macro.owner.port"))
-            .expect("macro owner port"),
-    });
-    let owner = NonNull::new(Box::into_raw(owner)).expect("box pointer is non-null");
-    let owner_ref = unsafe { owner.as_ref() };
-    let queue = owner_ref.queue.clone();
-    let port = owner_ref.port.clone();
-    let queue_wakes = Arc::new(AtomicUsize::new(0));
-    let port_wakes = Arc::new(AtomicUsize::new(0));
-    let mut queue_subscription = queue.subscribe_with_waker(
-        Readiness::HAS_DATA,
-        counting_waker(Arc::clone(&queue_wakes)),
-    );
-    let mut port_subscription =
-        port.subscribe_with_waker(Lifecycle::EXITED, counting_waker(Arc::clone(&port_wakes)));
-    let guard = epoch::guard();
-
-    let reclaim = unsafe { retire_wire_owner(owner, &guard) }.expect("macro owner retire");
-
-    assert_eq!(reclaim.wires(), 2);
-    assert_eq!(reclaim.woken(), 2);
-    assert_eq!(reclaim.guard_epoch(), guard.entered_epoch());
-    assert_eq!(reclaim.guard_cpu(), guard.cpu_id());
-    assert_eq!(queue.subscriber_count(), 0);
-    assert_eq!(port.subscriber_count(), 0);
-    assert_eq!(queue_wakes.load(Ordering::SeqCst), 1);
-    assert_eq!(port_wakes.load(Ordering::SeqCst), 1);
-    assert_eq!(queue_subscription.state(), RawSubscriptionState::Terminal);
-    assert_eq!(port_subscription.state(), RawSubscriptionState::Terminal);
-    assert!(queue_subscription.take_ready());
-    assert!(port_subscription.take_ready());
-
-    let blocked = epoch::drain_with_budget(usize::MAX);
-    assert_eq!(blocked.reclaimed, 0);
-    assert_eq!(OWNER_RECLAIM_COUNT.load(Ordering::Acquire), 0);
-
-    drop(guard);
-
-    let drained = epoch::drain_with_budget(usize::MAX);
-    assert_eq!(drained.reclaimed, 1);
-    assert_eq!(OWNER_RECLAIM_COUNT.load(Ordering::Acquire), 1);
 }
 
 #[test]

@@ -25,6 +25,7 @@ pub mod pmap {
 }
 
 pub mod page_allocator;
+mod publication;
 pub mod slab;
 pub mod slot;
 pub mod step;
@@ -33,6 +34,7 @@ pub mod verbs;
 pub mod wake;
 pub mod zone;
 
+pub use publication::{PublishError, PublishReservation, Published};
 pub use slot::AtomicSlot;
 pub use sync::{LockMetricsOff, LockMetricsOn, SpinMutex, SpinMutexGuard};
 
@@ -75,6 +77,10 @@ pub mod testing {
         )
         .expect("test zone runtime init");
         STATE.store(INITIALIZED, Ordering::Release);
+    }
+
+    pub fn fail_next_publication_allocations(count: usize) {
+        crate::publication::fail_next_allocations_for_test(count);
     }
 }
 

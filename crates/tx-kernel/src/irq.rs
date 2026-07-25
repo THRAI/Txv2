@@ -29,11 +29,14 @@
 //! that draining runs with irq_depth=0 and is free to create epoch
 //! guards and call `step_ingest`.
 
-use crate::adapter::step_engine::{self as step_engine, spin_mutex, SpinMutex, StepOutcome};
+use crate::adapter::step_engine::{spin_mutex, SpinMutex};
 use tx_hal::{
-    ConsoleIf, IrqDispatchTable, IrqHandled, IrqHandlerFn, IrqIf, IRQ_DISPATCH_TABLE_SIZE,
+    ConsoleIf, IrqDispatchTable, IrqHandled, IrqHandlerFn, IrqIf, TxPlatform,
+    IRQ_DISPATCH_TABLE_SIZE,
 };
-use tx_subsystems::tty::execution::step_ingest;
+use tx_services::time::{platform::HalRtcDevice, RtcDeviceOps as TimeRtcDeviceOps};
+use tx_substrate::wake::MailboxSchedulerHint;
+use tx_subsystems::device::RtcEventMask;
 
 /// The single global IRQ dispatch table tx-kernel publishes to the
 /// platform. The platform crate stores a raw `&'static
@@ -156,12 +159,39 @@ fn dispatch_table_static() -> &'static IrqDispatchTable {
 /// Install all kernel IRQ handlers and publish the dispatch table to
 /// the platform. One-shot; called from `init.rs` after
 /// `register_console_hardware` has populated the `CONSOLE_TTY` slot.
-pub(crate) fn install_irq_handlers<P: IrqIf + ConsoleIf>() {
-    let irq = <P as IrqIf>::UART_IRQ;
-    register_irq_handler(irq, uart_rx_irq_handler::<P>);
+pub(crate) fn install_irq_handlers<P: TxPlatform>() {
+    let uart_irq = <P as IrqIf>::UART_IRQ;
+    register_irq_handler(uart_irq, uart_rx_irq_handler::<P>);
+    let rtc_irq = <P as IrqIf>::RTC_IRQ;
+    if rtc_irq != 0 {
+        tx_fs::devfs::rtc_event_source_id();
+        register_irq_handler(rtc_irq, rtc_alarm_irq_handler::<P>);
+    }
     <P as IrqIf>::install_dispatch_table(dispatch_table_static());
-    <P as IrqIf>::set_priority(irq, 1);
-    <P as IrqIf>::unmask(irq);
+    <P as IrqIf>::set_priority(uart_irq, 1);
+    <P as IrqIf>::unmask(uart_irq);
+    if rtc_irq != 0 {
+        <P as IrqIf>::set_priority(rtc_irq, 1);
+        <P as IrqIf>::unmask(rtc_irq);
+    }
+}
+
+/// RTC alarm IRQ handler.
+///
+/// The RTC wait queue is initialized during [`install_irq_handlers`], before
+/// the IRQ is unmasked, so this path only publishes pending device bits and
+/// fires the existing wait source. It must not inspect `/dev` paths, open
+/// RNodes, or run ioctl policy.
+pub fn rtc_alarm_irq_handler<P: TxPlatform>(_irq: u32) -> IrqHandled {
+    let _ = HalRtcDevice::<P>::new().acknowledge_alarm_irq();
+    tx_fs::devfs::publish_rtc_event_with_post(RtcEventMask::ALARM, |mailbox, event| {
+        crate::init::post_mailbox_ref_event_with_hint_from_current_hart::<P>(
+            mailbox,
+            event,
+            MailboxSchedulerHint::Normal,
+        )
+    });
+    IrqHandled::Wake
 }
 
 /// UART RX IRQ handler. Drains pending bytes from the platform
@@ -219,7 +249,7 @@ pub fn uart_rx_irq_handler<P: ConsoleIf>(_irq: u32) -> IrqHandled {
 /// wake, this returns 0 — the IRQ-deferred path is only exercised when
 /// the SBI poll buffer fills first. See the 2026-05-13 sizing note on
 /// `drain_sbi_console_into_tty` for why we keep both paths.
-pub(crate) fn drain_uart_rx_pending() -> usize {
+pub(crate) fn drain_uart_rx_pending<P: tx_hal::TxPlatform>() -> usize {
     // Snapshot and clear the pending buffer under the lock, then
     // release before calling step_ingest (which takes its own locks).
     let (bytes, n) = {
@@ -234,15 +264,7 @@ pub(crate) fn drain_uart_rx_pending() -> usize {
         (snapshot, n)
     };
 
-    let Some(tty) = crate::init::console_tty() else {
-        return 0;
-    };
-    let guard = step_engine::guard();
-    use StepOutcome as V3Out;
-    match step_ingest(&tty, &bytes[..n], &guard) {
-        V3Out::Done(_) => n,
-        _ => 0,
-    }
+    crate::init::ingest_console_tty_bytes::<P>(&bytes[..n])
 }
 
 #[cfg(test)]

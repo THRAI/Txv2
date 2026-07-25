@@ -7,14 +7,11 @@
 mod common;
 mod graph;
 mod macros;
-mod owner;
 mod port;
 mod queue;
 mod trace;
 
-pub use crate::{
-    bus_event_set, bus_lifecycle, bus_readiness, bus_tracepoint, bus_wire_owner_manifest,
-};
+pub use crate::{bus_event_set, bus_lifecycle, bus_readiness, bus_tracepoint};
 pub use common::{
     DeclaredSubscriptionError, DeclaredWireError, RawSubscriptionError, RawSubscriptionState,
     RawWireError, WireDeclaration, WireDeclarationError, WireEventSet, WireKind, WireRetirement,
@@ -22,10 +19,6 @@ pub use common::{
 pub use graph::{
     DeclaredSubscriptionGraphKey, SubscriptionGraph, SubscriptionGraphError, SubscriptionGraphKey,
     SubscriptionGraphReady,
-};
-pub use owner::{
-    retire_wire_owner, WireOwnerManifest, WireOwnerReclaimError, WireOwnerReclamation,
-    WireOwnerRetireFence,
 };
 pub use port::{
     DeclaredPort, DeclaredPortSubscription, RawPort, RawPortSubscription, StaticRawPort,

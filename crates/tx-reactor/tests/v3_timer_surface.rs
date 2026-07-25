@@ -1,159 +1,133 @@
-//! PR-8 pin tests: `TimerWheel` / `TimerGuard` / `TimerGuardRole` /
-//! `TimerToken` public surface.
-//!
-//! Per `docs/Txv3/07_BLAST_RADIUS.md` §4 row H and §5.2 PR-8 and
-//! `docs/Txv3/03_STEP_MODEL_v2.md` §2.3, this PR publishes the
-//! role-tagged timer registration surface. These tests pin the
-//! observable shape of that surface so PR-7's `OnAgent` runtime
-//! integration and any future consolidation with the internal
-//! `TimerQueue` keep the published contract stable.
+//! Timer-domain surface pins for the reactor-owned `TimerEngine` route table.
 
-use tx_reactor::adapter::step_engine::Deadline;
-use tx_reactor::{TimerGuard, TimerGuardRole, TimerToken, TimerWheel};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+};
 
-#[test]
-fn timer_token_roundtrips_through_new_and_raw() {
-    let t = TimerToken::new(42);
-    assert_eq!(t.raw(), 42);
-    assert_eq!(t, TimerToken::new(42));
-    assert_ne!(t, TimerToken::new(43));
+use tx_reactor::{MailboxEvent, Reactor, TaskMailbox};
+use tx_services::time::{
+    DeadlineNs, DeadlineRegistrar, DeviceTimerCallback, TimerRole, TimerTarget,
+};
+use tx_substrate::step::{InterestMask, WaitSourceId};
+use tx_substrate::wake::{register_source, unregister_source, WaitSource};
+
+static DEVICE_CALLBACK_FIRES: AtomicU64 = AtomicU64::new(0);
+static DEVICE_CALLBACK_LOCK: Mutex<()> = Mutex::new(());
+
+fn count_device_callback(payload: u64) {
+    DEVICE_CALLBACK_FIRES.fetch_add(payload, Ordering::AcqRel);
 }
 
 #[test]
-fn timer_wheel_starts_empty() {
-    let wheel = TimerWheel::new();
-    assert_eq!(wheel.armed_count(), 0);
-}
+fn reactor_timer_path_has_no_legacy_wheel_or_router_dependency() {
+    let registry = include_str!("../src/deadline_registry.rs");
+    let runtime = include_str!("../src/runtime.rs");
+    let hart_loop = include_str!("../src/hart_loop.rs");
+    let wait = include_str!("../src/wait.rs");
 
-#[test]
-fn timer_wheel_default_matches_new() {
-    let wheel: TimerWheel = TimerWheel::default();
-    assert_eq!(wheel.armed_count(), 0);
-}
-
-#[test]
-fn install_returns_guard_carrying_token_deadline_role() {
-    let wheel = TimerWheel::new();
-    let deadline = Deadline::from_raw(1_000_000);
-    let guard = wheel.install(deadline, TimerGuardRole::PrimarySleep);
-
-    assert_eq!(guard.deadline(), deadline);
-    assert_eq!(guard.role(), TimerGuardRole::PrimarySleep);
-    // Token id is opaque; we only assert it's non-zero (sentinel
-    // reservation) and that the wheel can find it.
-    assert_ne!(guard.token(), TimerToken::new(0));
-    assert_eq!(wheel.armed_count(), 1);
-}
-
-#[test]
-fn three_roles_round_trip_independently() {
-    let wheel = TimerWheel::new();
-    let g_primary = wheel.install(Deadline::from_raw(10), TimerGuardRole::PrimarySleep);
-    let g_abort = wheel.install(Deadline::from_raw(20), TimerGuardRole::DeadlineAbort);
-    let g_delegate = wheel.install(Deadline::from_raw(30), TimerGuardRole::DelegateTimeout);
-
-    assert_eq!(wheel.armed_count(), 3);
-    assert_eq!(g_primary.role(), TimerGuardRole::PrimarySleep);
-    assert_eq!(g_abort.role(), TimerGuardRole::DeadlineAbort);
-    assert_eq!(g_delegate.role(), TimerGuardRole::DelegateTimeout);
-
-    // Tokens are distinct.
-    assert_ne!(g_primary.token(), g_abort.token());
-    assert_ne!(g_abort.token(), g_delegate.token());
-    assert_ne!(g_primary.token(), g_delegate.token());
-}
-
-#[test]
-fn lookup_returns_installed_metadata() {
-    let wheel = TimerWheel::new();
-    let deadline = Deadline::from_raw(777);
-    let guard = wheel.install(deadline, TimerGuardRole::DelegateTimeout);
-    let token = guard.token();
-
-    let found = wheel.lookup(token).expect("token is live");
-    assert_eq!(found.0, deadline);
-    assert_eq!(found.1, TimerGuardRole::DelegateTimeout);
-}
-
-#[test]
-fn lookup_returns_none_for_unissued_token() {
-    let wheel = TimerWheel::new();
-    assert!(wheel.lookup(TimerToken::new(0)).is_none());
-    assert!(wheel.lookup(TimerToken::new(99_999)).is_none());
-}
-
-#[test]
-fn dropping_guard_cancels_registration() {
-    let wheel = TimerWheel::new();
-    let token;
-    {
-        let guard = wheel.install(Deadline::from_raw(5), TimerGuardRole::PrimarySleep);
-        token = guard.token();
-        assert_eq!(wheel.armed_count(), 1);
+    for source in [registry, runtime, hart_loop, wait] {
+        assert!(!source.contains(concat!("Timer", "Wheel")));
+        assert!(!source.contains(concat!("TimerWake", "Router")));
     }
-    assert_eq!(wheel.armed_count(), 0);
-    assert!(wheel.lookup(token).is_none());
 }
 
 #[test]
-fn forget_suppresses_drop_cancel() {
-    let wheel = TimerWheel::new();
-    let guard = wheel.install(Deadline::from_raw(5), TimerGuardRole::PrimarySleep);
-    let token = guard.forget();
+fn deadline_domain_routes_task_signal_wait_source_and_device_callback() {
+    let _serial = DEVICE_CALLBACK_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    DEVICE_CALLBACK_FIRES.store(0, Ordering::Release);
 
-    // forget() returned the raw token and suppressed the drop-cancel.
-    assert_eq!(wheel.armed_count(), 1);
-    assert!(wheel.lookup(token).is_some());
+    let reactor = Reactor::new();
+    let registrar = reactor.deadline_registrar_handle();
+    let task_mailbox = Arc::new(TaskMailbox::new());
+    let signal_mailbox = Arc::new(TaskMailbox::new());
+    let source_mailbox = Arc::new(TaskMailbox::new());
+    let source = Arc::new(WaitSource::new(WaitSourceId::new(0x7E57)));
+    let interests = InterestMask::new(0b100);
+    register_source(Arc::clone(&source));
+    let subscriber = source.register(
+        Arc::downgrade(&source_mailbox),
+        source_mailbox.next_generation(),
+        interests,
+    );
+
+    let _task = registrar
+        .register_deadline(
+            DeadlineNs::new(10),
+            TimerRole::PrimarySleep,
+            TimerTarget::TaskMailbox(Arc::downgrade(&task_mailbox)),
+        )
+        .expect("task deadline registration");
+    let _signal = registrar
+        .register_deadline(
+            DeadlineNs::new(10),
+            TimerRole::ItimerReal,
+            TimerTarget::SignalTarget {
+                mailbox: Arc::downgrade(&signal_mailbox),
+            },
+        )
+        .expect("signal deadline registration");
+    let _source = registrar
+        .register_deadline(
+            DeadlineNs::new(10),
+            TimerRole::PollTimeout,
+            TimerTarget::WaitSource {
+                source: source.id(),
+                interests,
+            },
+        )
+        .expect("wait-source deadline registration");
+    let _device = registrar
+        .register_deadline(
+            DeadlineNs::new(10),
+            TimerRole::DeviceEvent,
+            TimerTarget::DeviceCallback(DeviceTimerCallback::new(count_device_callback, 7)),
+        )
+        .expect("device deadline registration");
+
+    assert_eq!(reactor.next_deadline_ns(), Some(10));
+    assert_eq!(reactor.advance_time_to(9), 0);
+    assert_eq!(reactor.advance_time_to(10), 4);
+    assert!(matches!(
+        task_mailbox.poll(),
+        Some(MailboxEvent::TimerFired { .. })
+    ));
+    assert!(matches!(
+        signal_mailbox.poll(),
+        Some(MailboxEvent::SignalTimerFired { .. })
+    ));
+    assert!(matches!(
+        source_mailbox.poll(),
+        Some(MailboxEvent::SourceFired {
+            source: fired_source,
+            interests: fired_interests,
+            ..
+        }) if fired_source == source.id() && fired_interests == interests
+    ));
+    assert_eq!(DEVICE_CALLBACK_FIRES.load(Ordering::Acquire), 7);
+    assert_eq!(reactor.next_deadline_ns(), None);
+
+    source.unregister(subscriber);
+    unregister_source(source.id());
 }
 
 #[test]
-fn tokens_are_monotonic_and_not_reused_after_cancel() {
-    let wheel = TimerWheel::new();
-    let g1 = wheel.install(Deadline::from_raw(1), TimerGuardRole::PrimarySleep);
-    let t1 = g1.token();
-    drop(g1);
-    let g2 = wheel.install(Deadline::from_raw(2), TimerGuardRole::PrimarySleep);
-    let t2 = g2.token();
+fn dropped_deadline_guard_cancels_the_engine_route() {
+    let reactor = Reactor::new();
+    let registrar = reactor.deadline_registrar_handle();
+    let mailbox = Arc::new(TaskMailbox::new());
+    let guard = registrar
+        .register_deadline(
+            DeadlineNs::new(10),
+            TimerRole::DeadlineAbort,
+            TimerTarget::TaskMailbox(Arc::downgrade(&mailbox)),
+        )
+        .expect("deadline registration");
 
-    // Cancellation does not reuse ids; t2 strictly advances past t1.
-    assert!(t2.raw() > t1.raw(), "token ids must be monotonic");
-}
-
-#[test]
-fn timer_guard_role_is_copy_and_eq() {
-    // Closed catalog: pin Copy / Eq / Debug shape so PR-7 can
-    // destructure with confidence.
-    let r: TimerGuardRole = TimerGuardRole::DeadlineAbort;
-    let r2 = r;
-    assert_eq!(r, r2);
-    let _ = format!("{:?}", r);
-}
-
-#[test]
-fn guard_outlives_clone_of_wheel_handle() {
-    // The wheel uses internal `Arc` sharing; installing on one
-    // handle and dropping the original must keep the registration
-    // observable through the surviving guard's parent reference.
-    let outer = TimerWheel::new();
-    let guard = outer.install(Deadline::from_raw(42), TimerGuardRole::PrimarySleep);
-    let token = guard.token();
-    // Drop the outer handle; the guard's internal Arc keeps the
-    // entry alive.
-    drop(outer);
-    assert_eq!(guard.token(), token);
-    // Drop guard; cancellation runs against the still-shared state.
     drop(guard);
-}
-
-#[test]
-fn timer_guard_is_send_sync_via_static_check() {
-    // Compile-time pin: TimerGuard / TimerWheel are Send + Sync so
-    // they can be threaded into the reactor / mailbox path PR-7
-    // will build. If a future change adds a non-Send field this
-    // test fails to compile.
-    fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<TimerWheel>();
-    assert_send_sync::<TimerGuard>();
-    assert_send_sync::<TimerToken>();
-    assert_send_sync::<TimerGuardRole>();
+    assert_eq!(reactor.next_deadline_ns(), None);
+    assert_eq!(reactor.advance_time_to(10), 0);
+    assert!(mailbox.poll().is_none());
 }

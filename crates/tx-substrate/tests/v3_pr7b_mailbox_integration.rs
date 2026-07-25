@@ -3,10 +3,10 @@
 //! Pins the wake routing that PR-7B layers on top of PR-7's
 //! `DelegateRegistry`:
 //!
-//! - On `mark_replied` → `TransitionOutcome::Applied`, the bound
+//! - On `delegate reply transition` → `TransitionOutcome::Applied`, the bound
 //!   `TaskMailbox` receives
 //!   `MailboxEvent::AgentReplied { token_id }`.
-//! - On `mark_canceled` / `mark_agent_died` / `mark_timed_out`
+//! - On `delegate cancel transition` / `delegate agent-death transition` / `delegate timeout transition`
 //!   → `TransitionOutcome::Applied`, the bound `TaskMailbox`
 //!   receives `MailboxEvent::Abort { token_id, reason }` where
 //!   `reason` matches the terminal state.
@@ -14,8 +14,8 @@
 //!   already been dropped (Weak upgrade fails), the wake event
 //!   is silently dropped — correct behaviour because the script
 //!   frame is gone.
-//! - DTOK-2 wake-routing race: when `mark_replied` and
-//!   `mark_timed_out` race, only one `Applied` wins and only one
+//! - DTOK-2 wake-routing race: when `delegate reply transition` and
+//!   `delegate timeout transition` race, only one `Applied` wins and only one
 //!   `MailboxEvent` is posted. The `LateNoOp` writer drops the
 //!   event.
 //! - `MailboxEvent::AgentReplied` / `MailboxEvent::Abort` are
@@ -35,8 +35,14 @@ use tx_substrate::step::{
 };
 use tx_substrate::wake::{ActiveWait, MailboxEvent, TaskMailbox, WaitGeneration};
 
+fn direct_delegate_mailbox_post(mailbox: std::sync::Weak<TaskMailbox>, event: MailboxEvent) {
+    if let Some(mailbox) = mailbox.upgrade() {
+        let _ = mailbox.post(event);
+    }
+}
+
 // ---------------------------------------------------------------------------
-// 1. mark_replied posts AgentReplied on Applied.
+// 1. delegate reply transition posts AgentReplied on Applied.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -54,7 +60,11 @@ fn mark_replied_posts_agent_replied_to_bound_mailbox() {
     let id = guard.id();
     assert!(mailbox.is_empty());
 
-    let outcome = registry.mark_replied(id, DelegateReply::placeholder());
+    let outcome = registry.mark_replied_with_post(
+        id,
+        DelegateReply::placeholder(),
+        direct_delegate_mailbox_post,
+    );
     assert_eq!(outcome, TransitionOutcome::Applied);
 
     let event = mailbox.poll().expect("mailbox should have one event");
@@ -64,7 +74,7 @@ fn mark_replied_posts_agent_replied_to_bound_mailbox() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. mark_canceled / mark_agent_died / mark_timed_out post Abort.
+// 2. delegate cancel transition / delegate agent-death transition / delegate timeout transition post Abort.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -80,7 +90,10 @@ fn mark_canceled_posts_abort_with_canceled_reason() {
         None,
     );
     let id = guard.id();
-    assert_eq!(registry.mark_canceled(id), TransitionOutcome::Applied);
+    assert_eq!(
+        registry.mark_canceled_with_post(id, direct_delegate_mailbox_post),
+        TransitionOutcome::Applied
+    );
     let event = mailbox.poll().expect("Applied must post");
     assert_eq!(
         event,
@@ -105,7 +118,10 @@ fn mark_agent_died_posts_abort_with_agent_died_reason() {
         None,
     );
     let id = guard.id();
-    assert_eq!(registry.mark_agent_died(id), TransitionOutcome::Applied);
+    assert_eq!(
+        registry.mark_agent_died_with_post(id, direct_delegate_mailbox_post),
+        TransitionOutcome::Applied
+    );
     let event = mailbox.poll().expect("Applied must post");
     assert_eq!(
         event,
@@ -130,7 +146,10 @@ fn mark_timed_out_posts_abort_with_timed_out_reason() {
         None,
     );
     let id = guard.id();
-    assert_eq!(registry.mark_timed_out(id), TransitionOutcome::Applied);
+    assert_eq!(
+        registry.mark_timed_out_with_post(id, direct_delegate_mailbox_post),
+        TransitionOutcome::Applied
+    );
     let event = mailbox.poll().expect("Applied must post");
     assert_eq!(
         event,
@@ -161,19 +180,23 @@ fn late_no_op_does_not_post_a_second_event() {
     let id = guard.id();
     // First writer wins, posts an event.
     assert_eq!(
-        registry.mark_replied(id, DelegateReply::placeholder()),
+        registry.mark_replied_with_post(
+            id,
+            DelegateReply::placeholder(),
+            direct_delegate_mailbox_post
+        ),
         TransitionOutcome::Applied
     );
     assert_eq!(mailbox.len(), 1);
 
     // Late timeout fire: state machine returns LateNoOp(Replied);
     // mailbox queue stays at one event.
-    let late = registry.mark_timed_out(id);
+    let late = registry.mark_timed_out_with_post(id, direct_delegate_mailbox_post);
     assert_eq!(late, TransitionOutcome::LateNoOp(DelegateState::Replied));
     assert_eq!(mailbox.len(), 1);
 
     // Late cancel: same story.
-    let late2 = registry.mark_canceled(id);
+    let late2 = registry.mark_canceled_with_post(id, direct_delegate_mailbox_post);
     assert_eq!(late2, TransitionOutcome::LateNoOp(DelegateState::Replied));
     assert_eq!(mailbox.len(), 1);
     let _ = guard.forget();
@@ -202,8 +225,12 @@ fn dtok_2_reply_then_timeout_only_posts_one_event() {
     );
     let id = guard.id();
 
-    let r1 = registry.mark_replied(id, DelegateReply::placeholder());
-    let r2 = registry.mark_timed_out(id);
+    let r1 = registry.mark_replied_with_post(
+        id,
+        DelegateReply::placeholder(),
+        direct_delegate_mailbox_post,
+    );
+    let r2 = registry.mark_timed_out_with_post(id, direct_delegate_mailbox_post);
 
     // First wrote Replied, second saw it as LateNoOp.
     assert_eq!(r1, TransitionOutcome::Applied);
@@ -231,8 +258,12 @@ fn dtok_2_timeout_then_reply_only_posts_one_event() {
     );
     let id = guard.id();
 
-    let r1 = registry.mark_timed_out(id);
-    let r2 = registry.mark_replied(id, DelegateReply::placeholder());
+    let r1 = registry.mark_timed_out_with_post(id, direct_delegate_mailbox_post);
+    let r2 = registry.mark_replied_with_post(
+        id,
+        DelegateReply::placeholder(),
+        direct_delegate_mailbox_post,
+    );
 
     assert_eq!(r1, TransitionOutcome::Applied);
     assert_eq!(r2, TransitionOutcome::LateNoOp(DelegateState::TimedOut));
@@ -273,7 +304,11 @@ fn weak_upgrade_failure_drops_event_silently() {
 
     // The CAS still applies — registry doesn't know about the
     // dead task — but no panic and no observable side effect.
-    let outcome = registry.mark_replied(id, DelegateReply::placeholder());
+    let outcome = registry.mark_replied_with_post(
+        id,
+        DelegateReply::placeholder(),
+        direct_delegate_mailbox_post,
+    );
     assert_eq!(outcome, TransitionOutcome::Applied);
     assert_eq!(registry.state(id), Some(DelegateState::Replied));
 
@@ -295,7 +330,11 @@ fn never_bound_mailbox_install_with_weak_new_silently_drops() {
         None,
     );
     let id = guard.id();
-    let outcome = registry.mark_replied(id, DelegateReply::placeholder());
+    let outcome = registry.mark_replied_with_post(
+        id,
+        DelegateReply::placeholder(),
+        direct_delegate_mailbox_post,
+    );
     assert_eq!(outcome, TransitionOutcome::Applied);
     // No assertion needed on a mailbox: there is none.
     let _ = guard.forget();
@@ -362,10 +401,17 @@ fn one_mailbox_receives_events_from_many_tokens_in_order() {
     let id2 = g2.id();
 
     assert_eq!(
-        registry.mark_replied(id1, DelegateReply::placeholder()),
+        registry.mark_replied_with_post(
+            id1,
+            DelegateReply::placeholder(),
+            direct_delegate_mailbox_post
+        ),
         TransitionOutcome::Applied
     );
-    assert_eq!(registry.mark_timed_out(id2), TransitionOutcome::Applied);
+    assert_eq!(
+        registry.mark_timed_out_with_post(id2, direct_delegate_mailbox_post),
+        TransitionOutcome::Applied
+    );
 
     assert_eq!(mailbox.len(), 2);
     let e1 = mailbox.poll().unwrap();
@@ -383,7 +429,7 @@ fn one_mailbox_receives_events_from_many_tokens_in_order() {
 }
 
 // ---------------------------------------------------------------------------
-// 8. mark_endpoint_died routes Abort wake to every transitioned token.
+// 8. delegate endpoint-death transition routes Abort wake to every transitioned token.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -409,7 +455,7 @@ fn mark_endpoint_died_routes_abort_to_each_bound_mailbox() {
         None,
     );
 
-    let n = registry.mark_endpoint_died(marker);
+    let n = registry.mark_endpoint_died_with_post(marker, direct_delegate_mailbox_post);
     assert_eq!(n, 2);
 
     assert_eq!(mb_a.len(), 1);
@@ -452,7 +498,7 @@ fn guard_drop_with_cancel_on_drop_posts_abort_canceled() {
             None,
         );
         guard.id()
-        // guard drops here → mark_canceled CAS → MailboxEvent::Abort
+        // guard drops here → delegate cancel transition CAS → MailboxEvent::Abort
     };
 
     assert_eq!(registry.state(id), Some(DelegateState::Canceled));

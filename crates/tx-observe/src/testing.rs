@@ -317,7 +317,13 @@ impl ConsoleIf for SyntheticPlatform {
 impl PmapIf for SyntheticPlatform {}
 impl TrapIf for SyntheticPlatform {}
 impl SignalFrameIf for SyntheticPlatform {}
-impl IrqIf for SyntheticPlatform {}
+unsafe fn restore_synthetic_local_execution(_saved_state: usize) {}
+
+impl IrqIf for SyntheticPlatform {
+    fn exclude_local_execution() -> tx_hal::LocalExecutionGuard {
+        unsafe { tx_hal::LocalExecutionGuard::new(0, restore_synthetic_local_execution) }
+    }
+}
 impl EntropyIf for SyntheticPlatform {}
 impl CacheIf for SyntheticPlatform {}
 impl DmaIf for SyntheticPlatform {}

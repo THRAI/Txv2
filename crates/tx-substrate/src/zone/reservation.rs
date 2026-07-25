@@ -87,7 +87,7 @@ pub fn reserve<T: 'static>(zone: &'static Zone<T>) -> Result<ZoneReservation<T>,
     let meta = unsafe { slot.as_ref().meta() };
     loop {
         let cur = meta.load(Ordering::Acquire);
-        if cur.state() != SlotState::Free || cur.retain() != 0 {
+        if cur.state() != SlotState::Free || cur.retain() != 0 || cur.generation_exhausted() {
             zone.return_slot(slot);
             return Err(ZoneError::InvalidState);
         }

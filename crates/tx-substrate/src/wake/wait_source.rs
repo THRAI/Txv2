@@ -34,7 +34,7 @@
 //! changes.
 
 use alloc::collections::BTreeMap;
-use alloc::sync::Weak;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -42,8 +42,6 @@ use crate::step::{InterestMask, WaitSourceId};
 use crate::SpinMutex;
 
 use crate::wake::mailbox::{MailboxEvent, MailboxSchedulerHint, TaskMailbox, WaitGeneration};
-
-use tx_observe_types::{PayloadWaitSourceNotify, TxTraceLevel};
 
 /// Per-subscriber bookkeeping. The mailbox handle is `Weak` so a
 /// `WaitSource` does not retain dead tasks; `notify` skips and
@@ -75,7 +73,6 @@ impl SubscriberId {
 }
 
 /// Object-owned wait publication point.
-///
 /// Each semantic object that may have blocked operations retrying on
 /// state transition owns one `WaitSource`. Subscribers register via
 /// [`Self::register`]; state transitions call [`Self::notify`] to
@@ -212,6 +209,52 @@ impl WaitSource {
         posted
     }
 
+    /// Fire `mask` with an explicit caller-provided mailbox post operation.
+    ///
+    /// This is the owner-aware routing hook used by reactor contexts that can
+    /// both publish `SourceFired` and immediately route the mailbox owner
+    /// through scheduler placement. Plain semantic producers should keep using
+    /// [`Self::notify`] / [`Self::notify_with_hint`].
+    pub fn notify_with_owner_post<F>(
+        &self,
+        mask: InterestMask,
+        hint: MailboxSchedulerHint,
+        mut post: F,
+    ) -> usize
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent, MailboxSchedulerHint) -> bool,
+    {
+        self.pending_mask.fetch_or(mask.raw(), Ordering::AcqRel);
+        let deliveries = {
+            let mut subs = self.subscribers.lock();
+            let mut deliveries = Vec::new();
+            subs.retain(|sub| {
+                let Some(mailbox) = sub.mailbox.upgrade() else {
+                    return false;
+                };
+                let overlap = sub.interests.raw() & mask.raw();
+                if overlap != 0 {
+                    deliveries.push((mailbox, sub.generation, InterestMask::new(overlap)));
+                }
+                true
+            });
+            deliveries
+        };
+
+        let mut posted = 0usize;
+        for (mailbox, generation, interests) in deliveries {
+            let evt = MailboxEvent::SourceFired {
+                generation,
+                source: self.id,
+                interests,
+            };
+            if post(&mailbox, evt, hint) {
+                posted += 1;
+            }
+        }
+        posted
+    }
+
     /// Fire `mask` on this source, posting to at most `limit` live
     /// matching subscribers. If no live subscriber receives the event,
     /// keep the mask pending so a waiter that already published the
@@ -303,6 +346,72 @@ impl WaitSource {
             }
             true
         });
+        if posted == 0 {
+            self.pending_mask.fetch_or(mask.raw(), Ordering::AcqRel);
+        }
+        posted
+    }
+
+    /// Fire `mask` with an explicit caller-provided mailbox post operation,
+    /// posting to at most `limit` live matching subscribers and emitting one
+    /// observation record per delivered mailbox event.
+    ///
+    /// This is the owner-aware companion to [`Self::notify_limit_emit_with_hint`]:
+    /// substrate owns subscriber selection and observation, while callers with
+    /// scheduler context can route each already-upgraded mailbox through their
+    /// owner-aware post boundary.
+    pub fn notify_limit_emit_with_owner_post<F>(
+        &self,
+        mask: InterestMask,
+        limit: usize,
+        hint: MailboxSchedulerHint,
+        mut post: F,
+    ) -> usize
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent, MailboxSchedulerHint) -> bool,
+    {
+        if limit == 0 || mask.raw() == 0 {
+            return 0;
+        }
+
+        let deliveries = {
+            let mut subs = self.subscribers.lock();
+            let mut deliveries = Vec::new();
+            subs.retain(|sub| {
+                let Some(mailbox) = sub.mailbox.upgrade() else {
+                    return false;
+                };
+                let overlap = sub.interests.raw() & mask.raw();
+                if overlap != 0 {
+                    deliveries.push((mailbox, sub.generation, InterestMask::new(overlap)));
+                }
+                true
+            });
+            deliveries
+        };
+
+        let mut posted = 0usize;
+        for (mailbox, generation, interests) in deliveries {
+            if posted >= limit {
+                break;
+            }
+            let evt = MailboxEvent::SourceFired {
+                generation,
+                source: self.id,
+                interests,
+            };
+            if post(&mailbox, evt, hint) {
+                posted += 1;
+                if let Some(em) = tx_observe::current() {
+                    em.wait_source_notify(
+                        self.id.raw() as u32,
+                        interests.raw() as u32,
+                        mailbox.task_id_low(),
+                        generation.raw() as u32,
+                    );
+                }
+            }
+        }
         if posted == 0 {
             self.pending_mask.fetch_or(mask.raw(), Ordering::AcqRel);
         }
@@ -412,8 +521,6 @@ impl WaitSource {
 // task mailbox before parking.
 // ---------------------------------------------------------------------------
 
-use alloc::sync::Arc;
-
 /// Global registry mapping [`WaitSourceId`] → [`WaitSource`].
 ///
 /// Indexed sparsely by `WaitSourceId::raw()`. Notification source ids are
@@ -426,6 +533,30 @@ static REGISTRY: SpinMutex<BTreeMap<u64, Arc<WaitSource>>> = SpinMutex::new(BTre
 pub struct RegistrySummary {
     pub slots: usize,
     pub live: usize,
+}
+
+/// Object-owned wait endpoint exposed to wait drivers.
+///
+/// This is the narrow language above mailbox delivery: semantic objects own
+/// their [`WaitSource`], while drivers consume only an endpoint reference and
+/// an `InterestMask`. Domain-specific readiness names stay on the owning
+/// object as accessors such as `read_endpoint()` or `exit_endpoint()`.
+pub trait WaitEndpoint {
+    /// Stable source id used in `YieldShape::OnWaitSource` and mailbox events.
+    fn source_id(&self) -> WaitSourceId;
+
+    /// Strong source handle used to prepare mailbox registrations.
+    fn source(&self) -> Arc<WaitSource>;
+}
+
+impl WaitEndpoint for Arc<WaitSource> {
+    fn source_id(&self) -> WaitSourceId {
+        self.id()
+    }
+
+    fn source(&self) -> Arc<WaitSource> {
+        Arc::clone(self)
+    }
 }
 
 /// Register a source in the global registry so the driver can find it
@@ -561,6 +692,18 @@ mod tests {
 
     fn mb() -> Arc<TaskMailbox> {
         Arc::new(TaskMailbox::new())
+    }
+
+    #[test]
+    fn arc_wait_source_is_wait_endpoint() {
+        let src = Arc::new(WaitSource::new(WaitSourceId::new(77)));
+        register_source(Arc::clone(&src));
+
+        let endpoint: &dyn WaitEndpoint = &src;
+        assert_eq!(endpoint.source_id(), WaitSourceId::new(77));
+        assert_eq!(endpoint.source().id(), WaitSourceId::new(77));
+
+        unregister_source(WaitSourceId::new(77));
     }
 
     #[test]

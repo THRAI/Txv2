@@ -41,11 +41,11 @@ pub mod bus_wire {
         DeclaredWireError, RawPort, RawPortSubscription, RawQueue, WireDeclaration,
         WireDeclarationError, WireEventSet,
     };
-    pub use tx_substrate::step::DelegateRegistry;
+    pub use tx_substrate::step::{Deadline, DelegateRegistry, InterestMask, WaitSourceId};
     pub use tx_substrate::wake::mailbox;
-    pub use tx_substrate::wake::timer::{TimerGuard, TimerGuardRole, TimerToken, TimerWheel};
+    pub use tx_substrate::wake::mailbox::{ActiveWait, MailboxPollAction};
     pub use tx_substrate::wake::wait_source;
-    pub use tx_substrate::wake::{agent_event_matches, MailboxEvent, TaskMailbox};
+    pub use tx_substrate::wake::{agent_event_matches, MailboxEvent, SignalRouting, TaskMailbox};
 
     // Re-export the bus DSL macros so test code can declare lifecycle
     // and readiness wire-protocols via `bus_wire::bus_lifecycle! { ... }`

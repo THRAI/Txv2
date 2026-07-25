@@ -26,8 +26,12 @@ use tx_hal::{
 };
 
 use crate::init::{console_tty, CoreInit};
-use crate::irq::{handler_for, install_irq_handlers, register_irq_handler, uart_rx_irq_handler};
+use crate::irq::{
+    handler_for, install_irq_handlers, register_irq_handler, rtc_alarm_irq_handler,
+    uart_rx_irq_handler,
+};
 use crate::test_serialise::KERNEL_TEST_LOCK as IRQ_TEST_LOCK;
+use tx_subsystems::signal::Signum;
 
 const TEST_PAGE_SIZE: usize = 4096;
 
@@ -51,6 +55,9 @@ static IRQ_TEST_LAST_PRIORITY: AtomicU32 = AtomicU32::new(0);
 
 /// Records that `unmask` was called for the UART IRQ.
 static IRQ_TEST_UART_UNMASKED: AtomicBool = AtomicBool::new(false);
+
+/// Records that `unmask` was called for the RTC IRQ.
+static IRQ_TEST_RTC_UNMASKED: AtomicBool = AtomicBool::new(false);
 
 fn drain_rx_queue(buf: &mut [u8]) -> usize {
     let mut queue = IRQ_TEST_RX_QUEUE.lock().expect("rx queue lock");
@@ -109,11 +116,18 @@ impl ConsoleIf for IrqTestPlatform {
 impl tx_hal::TrapIf for IrqTestPlatform {}
 impl tx_hal::SignalFrameIf for IrqTestPlatform {}
 
+unsafe fn restore_test_local_execution(_saved_state: usize) {}
+
 impl IrqIf for IrqTestPlatform {
     /// Pick a non-zero IRQ so the test isn't accidentally aliased to
     /// the IRQ-0 sentinel that `KernelTrapDispatcher::on_external_irq`
     /// short-circuits on.
     const UART_IRQ: u32 = 7;
+    const RTC_IRQ: u32 = 8;
+
+    fn exclude_local_execution() -> tx_hal::LocalExecutionGuard {
+        unsafe { tx_hal::LocalExecutionGuard::new(0, restore_test_local_execution) }
+    }
 
     fn install_dispatch_table(table: &'static IrqDispatchTable) {
         IRQ_TEST_INSTALLED_TABLE_PTR
@@ -128,19 +142,29 @@ impl IrqIf for IrqTestPlatform {
         if irq == <Self as IrqIf>::UART_IRQ {
             IRQ_TEST_UART_UNMASKED.store(true, Ordering::Release);
         }
+        if irq == <Self as IrqIf>::RTC_IRQ {
+            IRQ_TEST_RTC_UNMASKED.store(true, Ordering::Release);
+        }
     }
 }
 
-impl tx_hal::TimeIf for IrqTestPlatform {
+impl tx_hal::MonotonicCounterIf for IrqTestPlatform {
     fn read_ns() -> u64 {
         0
     }
-    fn set_deadline_ns(_deadline: u64) {}
-    fn cancel_deadline() {}
+
     fn frequency_hz() -> u64 {
         1_000_000_000
     }
 }
+
+impl tx_hal::DeadlineTimerIf for IrqTestPlatform {
+    fn set_deadline_ns(_deadline: u64) {}
+
+    fn cancel_deadline() {}
+}
+
+impl tx_hal::PersistentClockIf for IrqTestPlatform {}
 
 impl tx_hal::PercpuIf for IrqTestPlatform {}
 impl tx_hal::CacheIf for IrqTestPlatform {}
@@ -217,6 +241,8 @@ fn setup() -> std::sync::MutexGuard<'static, ()> {
     IRQ_TEST_INSTALLED_TABLE_PTR.store(0, Ordering::Release);
     IRQ_TEST_LAST_PRIORITY.store(0, Ordering::Release);
     IRQ_TEST_UART_UNMASKED.store(false, Ordering::Release);
+    IRQ_TEST_RTC_UNMASKED.store(false, Ordering::Release);
+    tx_fs::devfs::reset_rtc_backend_for_test();
     guard
 }
 
@@ -224,6 +250,16 @@ fn bootstrap_init_for_irq_test() {
     let aspace = tx_subsystems::vm::AddressSpace::new_cap_for_platform::<IrqTestPlatform>()
         .expect("test aspace");
     let _init = tx_subsystems::process::bootstrap_init_process(aspace).expect("bootstrap init");
+}
+
+fn init_has_pending_sigint() -> bool {
+    let init = tx_subsystems::process::execution::init_process().expect("init process");
+    let leader = init.nth_thread(0).expect("init leader thread");
+    leader
+        .payload_cap()
+        .expect("leader payload")
+        .pending()
+        .is_pending(Signum::SIGINT)
 }
 
 // ---------------------------------------------------------------------------
@@ -295,6 +331,44 @@ fn install_irq_handlers_publishes_table_to_platform() {
         IRQ_TEST_UART_UNMASKED.load(Ordering::Acquire),
         "UART IRQ should be unmasked so console input wakes the reactor",
     );
+
+    let installed = handler_for(<IrqTestPlatform as IrqIf>::RTC_IRQ).expect("RTC handler");
+    assert_eq!(
+        (installed as *const ()),
+        (rtc_alarm_irq_handler::<IrqTestPlatform> as *const ()),
+        "RTC_IRQ slot should hold the canonical RTC alarm handler",
+    );
+    assert!(
+        IRQ_TEST_RTC_UNMASKED.load(Ordering::Acquire),
+        "RTC IRQ should be unmasked after its event source is initialized",
+    );
+}
+
+#[test]
+fn rtc_irq_handler_publishes_alarm_event_to_devfs_rtc_state() {
+    let _setup = setup();
+    bootstrap_init_for_irq_test();
+    CoreInit::<IrqTestPlatform>::register_console_hardware();
+    install_irq_handlers::<IrqTestPlatform>();
+
+    let guard = tx_subsystems::tty::adapter::step_engine::guard();
+    let rtc_ops = tx_fs::devfs::RTC_CHAR_BINDING
+        .ops
+        .rtc_ops()
+        .expect("rtc ops");
+    assert_eq!(
+        rtc_ops.poll_events(&guard),
+        Ok(tx_subsystems::device::RtcEventMask::empty())
+    );
+
+    assert_eq!(
+        rtc_alarm_irq_handler::<IrqTestPlatform>(<IrqTestPlatform as IrqIf>::RTC_IRQ),
+        IrqHandled::Wake
+    );
+    assert_eq!(
+        rtc_ops.poll_events(&guard),
+        Ok(tx_subsystems::device::RtcEventMask::ALARM)
+    );
 }
 
 /// End-to-end IRQ → TTY ingest path: with the UART RX handler
@@ -305,7 +379,7 @@ fn install_irq_handlers_publishes_table_to_platform() {
 /// TTY ingest must run later in normal kernel context, where creating
 /// an epoch guard is legal.
 #[test]
-fn dispatch_irq_routes_uart_rx_to_tty_step_ingest() {
+fn dispatch_irq_routes_uart_rx_to_tty_deferred_ingest() {
     let _setup = setup();
     bootstrap_init_for_irq_test();
     CoreInit::<IrqTestPlatform>::register_console_hardware();
@@ -368,5 +442,38 @@ fn dispatch_irq_routes_uart_rx_to_tty_step_ingest() {
     assert_eq!(
         snapshot, b"X\n",
         "step_ingest should have queued the committed line into the input queue",
+    );
+}
+
+#[test]
+fn dispatch_irq_vintr_delivers_sigint_to_foreground_pgrp() {
+    let _setup = setup();
+    bootstrap_init_for_irq_test();
+    CoreInit::<IrqTestPlatform>::register_console_hardware();
+    install_irq_handlers::<IrqTestPlatform>();
+
+    let init = tx_subsystems::process::execution::init_process().expect("init process");
+    let tty = console_tty().expect("CONSOLE_TTY populated by register_console_hardware");
+    let guard = tx_subsystems::tty::adapter::step_engine::guard();
+    assert!(matches!(
+        tx_subsystems::tty::execution::step_ioctl_tiocsctty_for_process(&tty, &init, &guard),
+        tx_subsystems::tty::adapter::step_engine::StepOutcome::Done(_)
+    ));
+    drop(guard);
+
+    {
+        let mut queue = IRQ_TEST_RX_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        queue.push(0x03);
+    }
+
+    let handled = uart_rx_irq_handler::<IrqTestPlatform>(<IrqTestPlatform as IrqIf>::UART_IRQ);
+    assert_eq!(handled, IrqHandled::Wake);
+    assert_eq!(
+        CoreInit::<IrqTestPlatform>::drain_pending_uart_rx_into_tty(),
+        1
+    );
+    assert!(
+        init_has_pending_sigint(),
+        "VINTR through the hardware console drain must post SIGINT to the foreground pgrp"
     );
 }
