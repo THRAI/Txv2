@@ -3,7 +3,7 @@ use tx_substrate::zone::Cap;
 
 use crate::execution::{Errno, Guard};
 use crate::net::checks::require::require_socket_write_target;
-use crate::net::delegate::net_delegate_kick_poll;
+use crate::net::delegate::net_delegate_kick_poll_with_post;
 use crate::net::execution::{socket_send_wait_token, yield_bytes_on_token, ByteStepOutcome};
 use crate::net::namespace::{net_namespace_payloads_snapshot, NetNamespacePayload};
 use crate::net::protocol::{
@@ -63,7 +63,7 @@ pub fn step_send(
 
     if reserve.bytes == 0 {
         if reserve.needs_poll_kick {
-            net_delegate_kick_poll();
+            net_delegate_kick_poll_with_post(|mailbox, event| mailbox.post(event));
         }
         socket.readiness.clear_send(SendWireSet::SPACE);
         return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
@@ -74,7 +74,7 @@ pub fn step_send(
     }
 
     if !flags.contains(SendRecvFlags::MSG_MORE) || reserve.needs_poll_kick {
-        net_delegate_kick_poll();
+        net_delegate_kick_poll_with_post(|mailbox, event| mailbox.post(event));
     }
     StepOutcome::Done(reserve.bytes)
 }
@@ -137,7 +137,7 @@ pub fn step_send_kernel_bytes(
 
     if reserve.bytes == 0 {
         if reserve.needs_poll_kick {
-            net_delegate_kick_poll();
+            net_delegate_kick_poll_with_post(|mailbox, event| mailbox.post(event));
         }
         socket.readiness.clear_send(SendWireSet::SPACE);
         return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
@@ -148,7 +148,7 @@ pub fn step_send_kernel_bytes(
     }
 
     if !flags.contains(SendRecvFlags::MSG_MORE) || reserve.needs_poll_kick {
-        net_delegate_kick_poll();
+        net_delegate_kick_poll_with_post(|mailbox, event| mailbox.post(event));
     }
     StepOutcome::Done(reserve.bytes)
 }
@@ -252,7 +252,11 @@ pub fn step_send_to_kernel_bytes_with_poll_kick(
             if destination.family != AddressFamily::Inet {
                 return StepOutcome::Err(Errno::EAFNOSUPPORT);
             }
-            if !destination.is_loopback() && !destination.is_unspecified() {
+            if !destination.is_loopback()
+                && !destination.is_unspecified()
+                && !raw_icmpv4_route_uses_gateway(&payload, destination.addr)
+                && !raw_icmpv4_route_uses_device(&payload, destination.addr)
+            {
                 return send_configured_icmpv4_echo(&payload, destination.addr, bytes, guard);
             }
         }
@@ -287,7 +291,7 @@ pub fn step_send_to_kernel_bytes_with_poll_kick(
 
     if reserve.bytes == 0 {
         if kick_poll && reserve.needs_poll_kick {
-            net_delegate_kick_poll();
+            net_delegate_kick_poll_with_post(|mailbox, event| mailbox.post(event));
         }
         socket.readiness.clear_send(SendWireSet::SPACE);
         return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
@@ -298,7 +302,7 @@ pub fn step_send_to_kernel_bytes_with_poll_kick(
     }
 
     if kick_poll && (!flags.contains(SendRecvFlags::MSG_MORE) || reserve.needs_poll_kick) {
-        net_delegate_kick_poll();
+        net_delegate_kick_poll_with_post(|mailbox, event| mailbox.post(event));
     }
     StepOutcome::Done(reserve.bytes)
 }
@@ -420,7 +424,8 @@ fn send_tcp_stream_bytes(
         return StepOutcome::Err(Errno::EPIPE);
     };
     if became_readable {
-        peer.readiness.fire_recv(RecvWireSet::HAS_DATA);
+        peer.readiness
+            .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| mailbox.post(event));
     }
     StepOutcome::Done(bytes.len())
 }
@@ -463,7 +468,9 @@ fn send_unix_datagram_to_peer_raw(
         return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
     };
     if became_readable {
-        target.readiness.fire_recv(RecvWireSet::HAS_DATA);
+        target
+            .readiness
+            .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| mailbox.post(event));
     }
     StepOutcome::Done(bytes.len())
 }
@@ -496,7 +503,9 @@ fn send_unix_datagram_to_path(
         return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
     };
     if became_readable {
-        target.readiness.fire_recv(RecvWireSet::HAS_DATA);
+        target
+            .readiness
+            .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| mailbox.post(event));
     }
     StepOutcome::Done(bytes.len())
 }
@@ -540,7 +549,9 @@ fn send_rds_packet(
         return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
     };
     if became_readable {
-        target.readiness.fire_recv(RecvWireSet::HAS_DATA);
+        target
+            .readiness
+            .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| mailbox.post(event));
     }
     StepOutcome::Done(bytes.len())
 }
@@ -628,7 +639,9 @@ fn deliver_icmpv4_reply_to_table(
             continue;
         }
         if target_payload.record_icmp_recv_echo_reply(reply.clone()) {
-            target.readiness.fire_recv(RecvWireSet::HAS_DATA);
+            target
+                .readiness
+                .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| mailbox.post(event));
         }
     }
 }
@@ -707,7 +720,7 @@ fn send_configured_icmpv6_echo(
         Icmpv6Event::EchoRequest(request) => request,
         Icmpv6Event::Malformed => return StepOutcome::Err(Errno::EINVAL),
         Icmpv6Event::EchoReply(_) | Icmpv6Event::Unsupported => {
-            return StepOutcome::Err(Errno::EOPNOTSUPP)
+            return StepOutcome::Err(Errno::EOPNOTSUPP);
         }
     };
     learn_configured_icmpv6_neighbor(payload, src_addr, dst_addr);
@@ -792,7 +805,9 @@ fn deliver_raw_ipv6_packet_to_table(
             continue;
         }
         if target_payload.record_raw_ipv6_packet(packet.clone()) {
-            target.readiness.fire_recv(RecvWireSet::HAS_DATA);
+            target
+                .readiness
+                .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| mailbox.post(event));
         }
     }
 }
@@ -883,6 +898,20 @@ fn preferred_ipv4_source_for(
             })
             .and_then(|link| link.ipv4_addr)
     })
+}
+
+fn raw_icmpv4_route_uses_gateway(payload: &SocketPayload, dst: Ipv4Address) -> bool {
+    payload
+        .net_namespace()
+        .best_ipv4_route(dst)
+        .is_some_and(|route| route.next_hop != dst)
+}
+
+fn raw_icmpv4_route_uses_device(payload: &SocketPayload, dst: Ipv4Address) -> bool {
+    payload
+        .net_namespace()
+        .best_ipv4_route(dst)
+        .is_some_and(|route| route.kind == crate::net::NetNamespaceRouteKind::Connected)
 }
 
 /// Auto-create an ARP/neighbor entry for the pinged IPv4 dst (mirrors
@@ -976,7 +1005,8 @@ fn send_unix_stream_bytes(
         return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
     };
     if became_readable {
-        peer.readiness.fire_recv(RecvWireSet::HAS_DATA);
+        peer.readiness
+            .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| mailbox.post(event));
     }
     StepOutcome::Done(bytes.len())
 }
@@ -1005,11 +1035,18 @@ fn send_sctp_stream_bytes(
                 if peer_payload.shutdown_rd() {
                     return StepOutcome::Done(bytes.len());
                 }
-                if let Some(became_readable) =
-                    peer_payload.record_sctp_message(bytes.to_vec(), false, stream, ppid, Some(local))
-                {
+                if let Some(became_readable) = peer_payload.record_sctp_message(
+                    bytes.to_vec(),
+                    false,
+                    stream,
+                    ppid,
+                    Some(local),
+                ) {
                     if became_readable {
-                        peer.readiness.fire_recv(RecvWireSet::HAS_DATA);
+                        peer.readiness
+                            .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| {
+                                mailbox.post(event)
+                            });
                     }
                     return StepOutcome::Done(bytes.len());
                 }
@@ -1041,7 +1078,8 @@ fn send_sctp_stream_bytes(
         return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
     };
     if became_readable {
-        peer.readiness.fire_recv(RecvWireSet::HAS_DATA);
+        peer.readiness
+            .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| mailbox.post(event));
     }
     StepOutcome::Done(bytes.len())
 }
@@ -1160,13 +1198,20 @@ pub fn step_send_sctp_seqpacket(
                     send_assoc_id,
                     last,
                 );
-                if payload.record_sctp_message(failed, true, 0, 0, None).is_some() {
+                if payload
+                    .record_sctp_message(failed, true, 0, 0, None)
+                    .is_some()
+                {
                     fired = true;
                 }
                 offset = end;
             }
             if fired {
-                socket.readiness.fire_recv(RecvWireSet::HAS_DATA);
+                socket
+                    .readiness
+                    .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| {
+                        mailbox.post(event)
+                    });
             }
         }
         return StepOutcome::Done(bytes.len());
@@ -1200,7 +1245,11 @@ pub fn step_send_sctp_seqpacket(
                 return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
             };
             if became_readable {
-                peeled.readiness.fire_recv(RecvWireSet::HAS_DATA);
+                peeled
+                    .readiness
+                    .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| {
+                        mailbox.post(event)
+                    });
             }
             return StepOutcome::Done(bytes.len());
         }
@@ -1233,7 +1282,8 @@ pub fn step_send_sctp_seqpacket(
         return yield_bytes_on_token(ByteProgress::EMPTY, socket_send_wait_token(socket));
     };
     if became_readable {
-        peer.readiness.fire_recv(RecvWireSet::HAS_DATA);
+        peer.readiness
+            .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| mailbox.post(event));
     }
 
     // SCTP_AUTOCLOSE: a 1-to-many association closes after `autoclose` idle
@@ -1248,7 +1298,11 @@ pub fn step_send_sctp_seqpacket(
                 .record_sctp_message(bytes, true, 0, 0, Some(dst))
                 .is_some()
             {
-                socket.readiness.fire_recv(RecvWireSet::HAS_DATA);
+                socket
+                    .readiness
+                    .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| {
+                        mailbox.post(event)
+                    });
             }
         }
         let peer_assoc_id = peer_payload.sctp_assoc_id_for_peer(source).unwrap_or(0);
@@ -1259,7 +1313,10 @@ pub fn step_send_sctp_seqpacket(
                 .record_sctp_message(bytes, true, 0, 0, Some(source))
                 .is_some()
             {
-                peer.readiness.fire_recv(RecvWireSet::HAS_DATA);
+                peer.readiness
+                    .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| {
+                        mailbox.post(event)
+                    });
             }
         }
         payload.sctp_remove_assoc(my_assoc_id);

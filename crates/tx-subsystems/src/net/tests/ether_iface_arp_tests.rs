@@ -151,7 +151,7 @@ fn ether_iface_arp_miss_sends_request_and_keeps_udp_datagram() {
 
     let driver = ether_driver(iface);
     let guard = tx_substrate::epoch::guard();
-    crate::net::delegate::net_delegate_kick_poll();
+    crate::net::delegate::net_delegate_kick_poll_with_post(|mailbox, event| mailbox.post(event));
     let outcome = net_delegate_step_once(&driver, &guard);
 
     assert!(outcome.poll_seen);
@@ -185,7 +185,7 @@ fn ether_iface_arp_miss_sends_request_and_keeps_udp_datagram() {
         remote_mac,
         smoltcp::time::Instant::from_millis(1),
     );
-    crate::net::delegate::net_delegate_kick_poll();
+    crate::net::delegate::net_delegate_kick_poll_with_post(|mailbox, event| mailbox.post(event));
     let drain = net_delegate_step_once(&driver, &guard);
     assert!(drain.device_tx.udp_packets >= 1);
     assert_eq!(
@@ -213,7 +213,7 @@ fn ether_iface_arp_reply_learns_cache_and_udp_retry_uses_peer_mac() {
 
     let driver = ether_driver(iface);
     let guard = tx_substrate::epoch::guard();
-    crate::net::delegate::net_delegate_kick_poll();
+    crate::net::delegate::net_delegate_kick_poll_with_post(|mailbox, event| mailbox.post(event));
     let first = net_delegate_step_once(&driver, &guard);
     assert!(first.device_tx.udp_resolution_pending >= 1);
     assert!(first.arp_flush.sent >= 1);
@@ -221,7 +221,7 @@ fn ether_iface_arp_reply_learns_cache_and_udp_retry_uses_peer_mac() {
     device.ops.push_rx(RxFrame::new(arp_reply_frame(
         local_ip, local_mac, remote_ip, remote_mac,
     )));
-    crate::net::delegate::net_delegate_kick_poll();
+    crate::net::delegate::net_delegate_kick_poll_with_post(|mailbox, event| mailbox.post(event));
     let retry = net_delegate_step_once(&driver, &guard);
 
     assert!(retry.poll_seen);

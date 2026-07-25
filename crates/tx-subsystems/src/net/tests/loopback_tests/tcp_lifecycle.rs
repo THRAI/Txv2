@@ -490,6 +490,7 @@ fn tcp_recv_kicks_loopback_after_freeing_peer_window() {
     let _lock = crate::test_support::EPOCH_TEST_LOCK
         .lock()
         .expect("net epoch test lock");
+    crate::net::reset_initial_net_namespace_for_test();
     loopback_iface().clear_for_test_or_bootstrap();
     let guard = tx_substrate::epoch::guard();
     let mut listener_options = SocketOptionSet::default_tcp();
@@ -610,7 +611,9 @@ fn tcp_pollout_ignores_stale_send_space_wake_when_full() {
         step_send_kernel_bytes(&client, b"hello", SendRecvFlags::empty(), &guard),
         StepOutcome::Done(5)
     );
-    client.readiness.fire_send(SendWireSet::SPACE);
+    client
+        .readiness
+        .fire_send_with_post(SendWireSet::SPACE, |mailbox, event| mailbox.post(event));
 
     assert!(matches!(
         step_poll_ready(&client, &guard),

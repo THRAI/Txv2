@@ -7,6 +7,7 @@ use crate::net::protocol::{LoopbackIface, PollContext, UDP_IPV4_MAX_PAYLOAD_BYTE
 use crate::net::structure::{
     IpEndpoint, SendRecvFlags, SendWireSet, SocketIdentity, SocketProtocol, UdpInner,
 };
+use tx_substrate::wake::mailbox::{MailboxEvent, TaskMailbox};
 
 use super::step_send::send_flags_error;
 use super::{socket_send_wait_token, yield_bytes_on_token, ByteStepOutcome};
@@ -21,25 +22,39 @@ pub struct LoopbackUdpTransferOutcome {
     pub peer_wake_fired: bool,
 }
 
-pub fn step_process_loopback_udp(
+pub fn step_process_loopback_udp_with_post<F>(
     source: &Cap<SocketIdentity>,
     budget: usize,
     guard: &Guard<'_>,
-) -> StepOutcome<LoopbackUdpTransferOutcome> {
+    post: F,
+) -> StepOutcome<LoopbackUdpTransferOutcome>
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     // observe
     // upgrade
     // reserve
     // commit
     // publish
-    step_process_loopback_udp_on_iface(source, budget, initial_loopback_iface(), guard)
+    step_process_loopback_udp_on_iface_with_post::<F>(
+        source,
+        budget,
+        initial_loopback_iface(),
+        guard,
+        post,
+    )
 }
 
-pub fn step_process_loopback_udp_on_iface(
+pub fn step_process_loopback_udp_on_iface_with_post<F>(
     source: &Cap<SocketIdentity>,
     budget: usize,
     iface: &LoopbackIface,
     guard: &Guard<'_>,
-) -> StepOutcome<LoopbackUdpTransferOutcome> {
+    mut post: F,
+) -> StepOutcome<LoopbackUdpTransferOutcome>
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     // observe
     // upgrade
     // reserve
@@ -60,7 +75,7 @@ pub fn step_process_loopback_udp_on_iface(
             for publish in outcome.publishes {
                 source_wake_fired |= publish.publish.send_has_space;
                 peer_wake_fired |= publish.publish.recv_has_data;
-                publish.publish();
+                publish.publish_with_post(&mut post);
             }
             return StepOutcome::Done(LoopbackUdpTransferOutcome {
                 tx_packets: outcome.tx_packets,
@@ -78,14 +93,14 @@ pub fn step_process_loopback_udp_on_iface(
 
     if let Some(publish) = ctx.poll_udp_egress_one(source, iface, guard) {
         source_wake_fired = publish.publish.send_has_space;
-        publish.publish();
+        publish.publish_with_post(&mut post);
     }
 
     let ingress = ctx.poll_udp_ingress(iface, guard, budget);
     let mut peer_wake_fired = false;
     for publish in ingress.publishes {
         peer_wake_fired |= publish.publish.recv_has_data;
-        publish.publish();
+        publish.publish_with_post(&mut post);
     }
 
     StepOutcome::Done(LoopbackUdpTransferOutcome {
@@ -98,36 +113,45 @@ pub fn step_process_loopback_udp_on_iface(
     })
 }
 
-pub fn step_send_udp_loopback_kernel_bytes(
+pub fn step_send_udp_loopback_kernel_bytes_with_post<F>(
     socket: &Cap<SocketIdentity>,
     dst: Option<IpEndpoint>,
     bytes: &[u8],
     flags: SendRecvFlags,
     guard: &Guard<'_>,
-) -> ByteStepOutcome<usize> {
+    post: F,
+) -> ByteStepOutcome<usize>
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     // observe
     // upgrade
     // reserve
     // commit
     // publish
-    step_send_udp_loopback_kernel_bytes_on_iface(
+    step_send_udp_loopback_kernel_bytes_on_iface_with_post::<F>(
         socket,
         dst,
         bytes,
         flags,
         initial_loopback_iface(),
         guard,
+        post,
     )
 }
 
-pub fn step_send_udp_loopback_kernel_bytes_on_iface(
+pub fn step_send_udp_loopback_kernel_bytes_on_iface_with_post<F>(
     socket: &Cap<SocketIdentity>,
     dst: Option<IpEndpoint>,
     bytes: &[u8],
     flags: SendRecvFlags,
     iface: &LoopbackIface,
     guard: &Guard<'_>,
-) -> ByteStepOutcome<usize> {
+    mut post: F,
+) -> ByteStepOutcome<usize>
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     // observe
     // upgrade
     // reserve
@@ -210,10 +234,12 @@ pub fn step_send_udp_loopback_kernel_bytes_on_iface(
     if target_payload.record_recv_payload(source, drain.datagram.dst, drain.datagram.payload) {
         target
             .readiness
-            .fire_recv(crate::net::structure::RecvWireSet::HAS_DATA);
+            .fire_recv_with_post(crate::net::structure::RecvWireSet::HAS_DATA, &mut post);
     }
     if drain.became_available {
-        socket.readiness.fire_send(SendWireSet::SPACE);
+        socket
+            .readiness
+            .fire_send_with_post(SendWireSet::SPACE, &mut post);
     }
     tx_substrate::step::StepOutcome::Done(reserve.bytes)
 }

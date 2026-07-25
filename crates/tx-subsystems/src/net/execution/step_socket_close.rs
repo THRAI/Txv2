@@ -9,7 +9,7 @@ use crate::net::structure::{
     SocketProtocol, TcpState, UdpInner, UnixDatagramState, UnixStreamState,
 };
 
-use super::step_tcp_loopback::step_tcp_loopback_transfer;
+use super::step_tcp_loopback::step_tcp_loopback_transfer_with_post;
 
 const TCP_CLOSE_FLUSH_PASSES: usize = 8;
 
@@ -154,9 +154,17 @@ pub fn step_socket_close(
         raw_udp.close();
     }
     let payload_taken = socket.take_payload().is_some();
-    let recv_woken = peer_recv_woken + socket.readiness.fire_recv(RecvWireSet::BROKEN);
-    let send_woken = peer_send_woken + socket.readiness.fire_send(SendWireSet::BROKEN);
-    let accept_woken = socket.readiness.fire_accept(AcceptWireSet::BROKEN);
+    let recv_woken = peer_recv_woken
+        + socket
+            .readiness
+            .fire_recv_with_post(RecvWireSet::BROKEN, |mailbox, event| mailbox.post(event));
+    let send_woken = peer_send_woken
+        + socket
+            .readiness
+            .fire_send_with_post(SendWireSet::BROKEN, |mailbox, event| mailbox.post(event));
+    let accept_woken = socket
+        .readiness
+        .fire_accept_with_post(AcceptWireSet::BROKEN, |mailbox, event| mailbox.post(event));
 
     StepOutcome::Done(SocketCloseOutcome {
         payload_taken,
@@ -189,10 +197,13 @@ fn flush_tcp_tx_before_close(socket: &Cap<SocketIdentity>, guard: &Guard<'_>) ->
             break;
         }
 
-        let moved = match step_tcp_loopback_transfer(socket, queued, guard) {
-            StepOutcome::Done(outcome) => outcome.bytes_moved,
-            StepOutcome::Continue { .. } | StepOutcome::Yield { .. } | StepOutcome::Err(_) => 0,
-        };
+        let moved =
+            match step_tcp_loopback_transfer_with_post(socket, queued, guard, |mailbox, event| {
+                mailbox.post(event)
+            }) {
+                StepOutcome::Done(outcome) => outcome.bytes_moved,
+                StepOutcome::Continue { .. } | StepOutcome::Yield { .. } | StepOutcome::Err(_) => 0,
+            };
         if moved == 0 {
             break;
         }
@@ -215,8 +226,12 @@ fn mark_tcp_peer_closed(peer: &Cap<SocketIdentity>) -> PeerCloseWakes {
         raw_tcp.mark_recv_closed_by_peer();
     }
     payload.refresh_io_from_raw();
-    let recv_woken = peer.readiness.fire_recv(RecvWireSet::BROKEN);
-    let send_woken = peer.readiness.fire_send(SendWireSet::BROKEN);
+    let recv_woken = peer
+        .readiness
+        .fire_recv_with_post(RecvWireSet::BROKEN, |mailbox, event| mailbox.post(event));
+    let send_woken = peer
+        .readiness
+        .fire_send_with_post(SendWireSet::BROKEN, |mailbox, event| mailbox.post(event));
     PeerCloseWakes {
         recv_woken,
         send_woken,
@@ -238,8 +253,12 @@ fn lookup_tcp_peer_connection(
 }
 
 fn mark_sctp_peer_closed(peer: &Cap<SocketIdentity>) -> PeerCloseWakes {
-    let recv_woken = peer.readiness.fire_recv(RecvWireSet::BROKEN);
-    let send_woken = peer.readiness.fire_send(SendWireSet::BROKEN);
+    let recv_woken = peer
+        .readiness
+        .fire_recv_with_post(RecvWireSet::BROKEN, |mailbox, event| mailbox.post(event));
+    let send_woken = peer
+        .readiness
+        .fire_send_with_post(SendWireSet::BROKEN, |mailbox, event| mailbox.post(event));
     PeerCloseWakes {
         recv_woken,
         send_woken,
@@ -339,7 +358,8 @@ fn notify_sctp_peer_assoc_closed(
             .is_some();
     }
     if fired {
-        peer.readiness.fire_recv(RecvWireSet::HAS_DATA)
+        peer.readiness
+            .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| mailbox.post(event))
     } else {
         0
     }
@@ -388,7 +408,8 @@ fn enqueue_sctp_shutdown_event(peer: &Cap<SocketIdentity>) {
         .record_sctp_message(bytes, true, 0, 0, None)
         .is_some()
     {
-        peer.readiness.fire_recv(RecvWireSet::HAS_DATA);
+        peer.readiness
+            .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| mailbox.post(event));
     }
 }
 
@@ -473,6 +494,8 @@ fn withdraw_rds_bound_if_owner(
 }
 
 fn mark_unix_peer_broken(peer: &Cap<SocketIdentity>) {
-    peer.readiness.fire_recv(RecvWireSet::BROKEN);
-    peer.readiness.fire_send(SendWireSet::BROKEN);
+    peer.readiness
+        .fire_recv_with_post(RecvWireSet::BROKEN, |mailbox, event| mailbox.post(event));
+    peer.readiness
+        .fire_send_with_post(SendWireSet::BROKEN, |mailbox, event| mailbox.post(event));
 }

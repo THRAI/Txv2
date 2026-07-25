@@ -1,10 +1,7 @@
-//! PR-3D-1 (D2/D4): pipe-readiness `WaitSource` integration tests.
+//! PR-3D-1: pipe-readiness endpoint integration tests.
 //!
-//! Pin the new task-mailbox-based wake path that runs in parallel
-//! with the legacy `RawPort`+`Waker` path on pipe. The legacy path is
-//! exercised by `crates/tx-subsystems/src/pipe.rs::tests` and by the
-//! tx-shims `sys_pipe2`/`sys_read`/`sys_write` suites; this file
-//! pins the new path so PR-3D-2..4 reviewers see what a migrated
+//! Pin the task-mailbox-based wake path on pipe. This file pins the
+//! endpoint/source path so PR-3D-2..4 reviewers see what a migrated
 //! consumer looks like end-to-end.
 //!
 //! Invariants pinned:
@@ -28,9 +25,8 @@
 //! 5. **zero-byte-edge-cases**. A `step_read` with `out.len() == 0`
 //!    must not fire the writer source (no actual drain). A
 //!    `step_write` with `bytes.len() == 0` must not fire the
-//!    reader source. Mirrors the legacy `Channel` behaviour so
-//!    PR-3D-1 doesn't drift apart from the surface tx-shims still
-//!    consumes.
+//!    reader source. This keeps zero-byte operations from fabricating
+//!    readiness publication.
 //! 6. **generation-stamped**. The posted event carries the same
 //!    `WaitGeneration` the registration captured, so a driver
 //!    matching against `ActiveWait::matches` resolves to "fresh."
@@ -39,14 +35,14 @@ extern crate alloc;
 
 use alloc::sync::Arc;
 
+use tx_substrate::wake::{WaitGeneration, WaitRegistrationGuard};
 use tx_subsystems::pipe::adapter::step_engine::{
     guard as ebr_guard, Cap, InterestMask, StepOp, StepOutcome, WaitSourceId,
 };
-use tx_subsystems::pipe::adapter::wait_routing::{
-    MailboxEvent, TaskMailbox, WaitGeneration, WaitRegistrationGuard, WaitSource,
-};
+use tx_subsystems::pipe::adapter::wait_routing::{MailboxEvent, TaskMailbox, WaitSource};
 use tx_subsystems::pipe::{
-    step_pipe2, step_read, step_write, PipeFlags, PipePayload, PIPE_READABLE, PIPE_WRITABLE,
+    step_pipe2, step_read_with_post, step_write_with_post, PipeFlags, PipePayload, PIPE_READABLE,
+    PIPE_WRITABLE,
 };
 use tx_subsystems::process::adapter::step_engine::ScriptCtx;
 use tx_subsystems::process::structure::ProcessIdentity;
@@ -214,7 +210,9 @@ fn blocked_reader_on_empty_ring_is_woken_when_writer_pushes_bytes() {
 
     // Writer-side step pushes bytes -> reader source notifies.
     let guard = ebr_guard();
-    let outcome = step_write(&payload, b"x", &guard, false, false);
+    let outcome = step_write_with_post(&payload, b"x", &guard, false, false, |mailbox, event| {
+        mailbox.post(event)
+    });
     drop(guard);
     assert_eq!(outcome, StepOutcome::Done(1));
 
@@ -242,7 +240,9 @@ fn blocked_writer_on_full_ring_is_woken_when_reader_drains_bytes() {
     // Fill the pipe exactly to its current capacity so the writer is blocked.
     let big = alloc::vec![b'x'; payload.pipe_size_bytes()];
     let guard = ebr_guard();
-    let filled = step_write(&payload, &big, &guard, false, false);
+    let filled = step_write_with_post(&payload, &big, &guard, false, false, |mailbox, event| {
+        mailbox.post(event)
+    });
     assert_eq!(filled, StepOutcome::Done(big.len()));
     drop(guard);
 
@@ -253,7 +253,9 @@ fn blocked_writer_on_full_ring_is_woken_when_reader_drains_bytes() {
     // Reader-side drain -> writer source notifies.
     let mut buf = [0u8; 8];
     let guard = ebr_guard();
-    let outcome = step_read(&payload, &mut buf, &guard, false);
+    let outcome = step_read_with_post(&payload, &mut buf, &guard, false, |mailbox, event| {
+        mailbox.post(event)
+    });
     drop(guard);
     match outcome {
         StepOutcome::Done(n) => assert!(n > 0, "expected drained bytes"),
@@ -348,7 +350,9 @@ fn step_write_empty_bytes_does_not_fire_reader_wait_source() {
     let (_guard_reg, _gen) = register(payload.reader_wait_source(), &mailbox, PIPE_READABLE);
 
     let guard = ebr_guard();
-    let outcome = step_write(&payload, &[], &guard, false, false);
+    let outcome = step_write_with_post(&payload, &[], &guard, false, false, |mailbox, event| {
+        mailbox.post(event)
+    });
     drop(guard);
     assert_eq!(outcome, StepOutcome::Done(0));
 
@@ -371,7 +375,9 @@ fn step_read_empty_buf_does_not_fire_writer_wait_source() {
 
     // Seed the ring so the reader path would otherwise drain.
     let guard = ebr_guard();
-    let _ = step_write(&payload, b"hi", &guard, false, false);
+    let _ = step_write_with_post(&payload, b"hi", &guard, false, false, |mailbox, event| {
+        mailbox.post(event)
+    });
     drop(guard);
 
     // Drain any side-effect SourceFired the seeding step posted to a
@@ -383,7 +389,9 @@ fn step_read_empty_buf_does_not_fire_writer_wait_source() {
 
     let mut empty: [u8; 0] = [];
     let guard = ebr_guard();
-    let outcome = step_read(&payload, &mut empty, &guard, false);
+    let outcome = step_read_with_post(&payload, &mut empty, &guard, false, |mailbox, event| {
+        mailbox.post(event)
+    });
     drop(guard);
     assert_eq!(outcome, StepOutcome::Done(0));
 
@@ -421,7 +429,9 @@ fn waitsource_notify_stamps_caller_generation_on_event() {
     );
 
     let guard = ebr_guard();
-    let _ = step_write(&payload, b"x", &guard, false, false);
+    let _ = step_write_with_post(&payload, b"x", &guard, false, false, |mailbox, event| {
+        mailbox.post(event)
+    });
     drop(guard);
 
     let evt = mailbox.poll().expect("event should be queued");
@@ -437,40 +447,32 @@ fn waitsource_notify_stamps_caller_generation_on_event() {
     tx_test_support::drain_to_quiescence();
 }
 
-// === Coexistence pin (D2): both paths fire on the same transition =====
+// === Readiness publication pin =========================================
 
 #[test]
-fn write_fires_both_legacy_channel_and_new_wait_source() {
+fn write_fires_reader_wait_source() {
     let _setup = setup();
     let (reader, writer) = step_pipe2(PipeFlags::default()).expect("step_pipe2");
     let payload = payload_of(&reader);
     let mailbox = Arc::new(TaskMailbox::new());
 
-    // The new path receiver.
+    // The endpoint/source receiver.
     let (_guard_reg, gen) = register(payload.reader_wait_source(), &mailbox, PIPE_READABLE);
 
-    // We don't directly observe the legacy `Channel.fire(...)` here —
-    // the legacy path is tested in `src/pipe.rs::tests` — but we
-    // *do* assert that registering against the new source doesn't
-    // suppress fire-time behaviour on the legacy side. The shared
-    // `step_write` call below is the legacy + new dual-fire site;
-    // if D2 coexistence regresses, the legacy `Channel` would still
-    // fire but a missing `WaitSource::notify` would leave the
-    // mailbox empty. The next assertion catches that.
+    // The shared `step_write` call below is the readability publication site.
+    // A missing `WaitSource::notify` would leave the mailbox empty.
     let guard = ebr_guard();
-    let outcome = step_write(&payload, b"x", &guard, false, false);
+    let outcome = step_write_with_post(&payload, b"x", &guard, false, false, |mailbox, event| {
+        mailbox.post(event)
+    });
     drop(guard);
     assert_eq!(outcome, StepOutcome::Done(1));
 
-    assert_eq!(mailbox.len(), 1, "new path must have posted one event");
+    assert_eq!(mailbox.len(), 1, "reader source must have posted one event");
     let _ = mailbox.poll(); // consume; gen-check covered above
     let _ = gen;
 
-    // Pipe still has a live writer; the legacy `Channel.fire`
-    // happened on the same step_write call and is independently
-    // covered by `crates/tx-subsystems/src/pipe.rs`'s test suite.
-    // The point of this test is the *additivity* of D2: we added a
-    // path, didn't move existing semantics.
+    // Pipe still has a live writer; this test only pins readiness publication.
 
     drop(reader);
     drop(writer);

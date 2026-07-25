@@ -4,9 +4,15 @@
 //! A timerfd is an fd that becomes readable when a timer expires.
 //! Subsystem dispatch lives in `tx_subsystems::timerfd`.
 
+use core::marker::PhantomData;
+use tx_services::time::{
+    timekeeper, timekeeper_clock, ClockRead, DeadlineRegistrar, DeadlineRegistrarHandle,
+    TimekeeperClock, TimekeeperIf,
+};
 use tx_subsystems::execution::Errno;
 use tx_subsystems::timerfd::{
-    step_timerfd_read, timerfd_settime_with_flags, ItimerSpec, TimerFd, ITIMERSPEC_BYTES,
+    step_timerfd_read, timerfd_deadline_fired_with_post, timerfd_settime_with_flags_and_post,
+    ItimerSpec, TimerFd, ITIMERSPEC_BYTES,
 };
 use tx_subsystems::vfs::structure::OpenFileFlags;
 use tx_subsystems::vfs::OpenFile;
@@ -17,10 +23,50 @@ use super::numbers::{
 };
 use super::{
     bootstrap_copy_to_user, bootstrap_read_user, bootstrap_write_user, errno_to_i32,
-    next_stdio_fd_below_nofile, SyscallCtx, SyscallResult, EAGAIN_VALUE, EBADF_VALUE, EINVAL_VALUE,
-    ENOMEM_VALUE,
+    next_stdio_fd_below_nofile, SyscallCtx, SyscallResult, EBADF_VALUE, EINVAL_VALUE, ENOMEM_VALUE,
 };
-use crate::adapter::step_engine::{self as step_engine, InterestMask, WaitSourceId};
+use crate::adapter::step_engine::{
+    self as step_engine, ByteProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
+};
+
+struct TimerfdReadOp<'a, P, F>
+where
+    TimekeeperClock<P>: ClockRead,
+    F: FnMut(&tx_substrate::wake::TaskMailbox, tx_substrate::wake::MailboxEvent) -> bool,
+{
+    tfd: &'a TimerFd,
+    out: &'a mut [u8; 8],
+    nonblocking: bool,
+    timer_registrar: Option<DeadlineRegistrarHandle>,
+    post: F,
+    _platform: PhantomData<fn() -> P>,
+}
+
+impl<P, F, I> StepOp<I> for TimerfdReadOp<'_, P, F>
+where
+    TimekeeperClock<P>: ClockRead,
+    F: FnMut(&tx_substrate::wake::TaskMailbox, tx_substrate::wake::MailboxEvent) -> bool,
+    I: SubjectIdentity,
+{
+    type Output = usize;
+    type Progress = ByteProgress;
+
+    fn step(&mut self, ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let _ = ctx.subject();
+        let now_ns = timekeeper_clock::<P>().monotonic_now_ns();
+        // A deadline delivery is only a wait-source hint. Reconcile it in the
+        // timerfd owner before draining its expiration count.
+        let _ = timerfd_deadline_fired_with_post(
+            self.tfd,
+            now_ns,
+            self.timer_registrar
+                .as_ref()
+                .map(|registrar| registrar as &dyn DeadlineRegistrar),
+            &mut self.post,
+        );
+        step_timerfd_read(self.tfd, self.out, self.nonblocking)
+    }
+}
 
 // === timerfd_create ===================================================
 
@@ -103,13 +149,16 @@ pub(super) fn sys_timerfd_create<'a>(
 /// - `Return(0)` on success.
 /// - `Error(EBADF)` if `fd` doesn't name a timerfd.
 /// - `Error(EFAULT)` if `new_value` or `old_value` pointer is bad.
-pub(super) fn sys_timerfd_settime<'a, P: super::TimeIf>(
+pub(super) fn sys_timerfd_settime<'a, P>(
     fd: u32,
     flags: u32,
     new_value_ptr: u64,
     old_value_ptr: u64,
     ctx: &SyscallCtx<'a>,
-) -> SyscallResult {
+) -> SyscallResult
+where
+    TimekeeperClock<P>: ClockRead,
+{
     let file = match ctx.process.fd(fd) {
         Some(f) => f,
         None => return SyscallResult::Error(EBADF_VALUE),
@@ -135,13 +184,17 @@ pub(super) fn sys_timerfd_settime<'a, P: super::TimeIf>(
         return SyscallResult::Error(EINVAL_VALUE);
     };
 
-    let now_ns = P::read_ns();
-    let generation = tx_subsystems::wall_clock::generation();
+    let now_ns = timekeeper_clock::<P>().monotonic_now_ns();
+    let generation = timekeeper().realtime_generation();
+    let timer_registrar = ctx
+        .timer_registrar
+        .as_ref()
+        .map(|registrar| registrar as &dyn DeadlineRegistrar);
 
     // Read old_value if requested (before mutating).
     let old_spec = if old_value_ptr != 0 {
         let mut old = ItimerSpec::default();
-        timerfd_settime_with_flags(
+        timerfd_settime_with_flags_and_post(
             tfd_cap,
             abstime,
             now_ns,
@@ -149,10 +202,22 @@ pub(super) fn sys_timerfd_settime<'a, P: super::TimeIf>(
             Some(&mut old),
             flags,
             generation,
+            timer_registrar,
+            |mailbox, event| ctx.post_mailbox_ref_event(mailbox, event),
         );
         Some(old)
     } else {
-        timerfd_settime_with_flags(tfd_cap, abstime, now_ns, new_value, None, flags, generation);
+        timerfd_settime_with_flags_and_post(
+            tfd_cap,
+            abstime,
+            now_ns,
+            new_value,
+            None,
+            flags,
+            generation,
+            timer_registrar,
+            |mailbox, event| ctx.post_mailbox_ref_event(mailbox, event),
+        );
         None
     };
 
@@ -180,11 +245,14 @@ pub(super) fn sys_timerfd_settime<'a, P: super::TimeIf>(
 /// - `Return(0)` on success.
 /// - `Error(EBADF)` if `fd` doesn't name a timerfd.
 /// - `Error(EFAULT)` if `curr_value` pointer is bad.
-pub(super) fn sys_timerfd_gettime<'a, P: super::TimeIf>(
+pub(super) fn sys_timerfd_gettime<'a, P>(
     fd: u32,
     curr_value_ptr: u64,
     ctx: &SyscallCtx<'a>,
-) -> SyscallResult {
+) -> SyscallResult
+where
+    TimekeeperClock<P>: ClockRead,
+{
     let file = match ctx.process.fd(fd) {
         Some(f) => f,
         None => return SyscallResult::Error(EBADF_VALUE),
@@ -196,7 +264,7 @@ pub(super) fn sys_timerfd_gettime<'a, P: super::TimeIf>(
 
     let spec = ItimerSpec {
         it_interval_ns: tfd_cap.interval_ns(),
-        it_value_ns: tfd_cap.remaining_value_ns(P::read_ns()),
+        it_value_ns: tfd_cap.remaining_value_ns(timekeeper_clock::<P>().monotonic_now_ns()),
     };
     let bytes = spec.to_bytes();
     if let Err(errno) =
@@ -217,13 +285,16 @@ pub(super) fn sys_timerfd_gettime<'a, P: super::TimeIf>(
 /// - `Error(EINVAL)` if `len < 8`.
 /// - `Error(EAGAIN)` if no expirations and fd is non-blocking.
 /// - Parks on the timerfd's wait source (via nanosleep-style deadline
-///   wait backed by the reactor's timer queue) otherwise.
-pub(super) async fn sys_timerfd_read<P: super::TimeIf>(
+///   wait backed by the shared timer registry) otherwise.
+pub(super) async fn sys_timerfd_read<P>(
     file: &OpenFile,
     buf_ptr: u64,
     len: usize,
     ctx: &SyscallCtx<'_>,
-) -> SyscallResult {
+) -> SyscallResult
+where
+    TimekeeperClock<P>: ClockRead,
+{
     let tfd_cap = match file.timerfd() {
         Some(cap) => cap,
         None => return SyscallResult::Error(EBADF_VALUE),
@@ -237,73 +308,44 @@ pub(super) async fn sys_timerfd_read<P: super::TimeIf>(
     }
 
     let nonblocking = file.flags().nonblocking;
-    loop {
-        let now_ns = P::read_ns();
-        let mut staging = [0u8; 8];
-        let outcome = step_timerfd_read(tfd_cap, now_ns, &mut staging, nonblocking);
-        use step_engine::{StepOutcome as V3Out, YieldShape};
-        match outcome {
-            V3Out::Done(n) => {
-                if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, buf_ptr, &staging[..n]) {
-                    return SyscallResult::error_from(errno);
-                }
-                return SyscallResult::Return(n as i64);
-            }
-            V3Out::Err(v3errno) => {
-                let errno: Errno = v3errno.into();
-                if errno == Errno::EAGAIN {
-                    return SyscallResult::Error(EAGAIN_VALUE);
-                }
+    let mut staging = [0u8; 8];
+    let mut script_ctx = super::build_subject_script_ctx(ctx);
+    let mailbox = script_ctx
+        .mailbox()
+        .cloned()
+        .unwrap_or_else(|| alloc::sync::Arc::new(tx_substrate::wake::TaskMailbox::new()));
+    let timer_registrar = script_ctx.timer_registrar().cloned();
+    let delegate_registry = script_ctx.delegate_registry().cloned();
+    let op = TimerfdReadOp::<P, _> {
+        tfd: &tfd_cap,
+        out: &mut staging,
+        nonblocking,
+        timer_registrar: timer_registrar.clone(),
+        post: |mailbox, event| ctx.post_mailbox_ref_event(mailbox, event),
+        _platform: PhantomData,
+    };
+    match tx_scripts::drive(
+        op,
+        &mut script_ctx,
+        if nonblocking {
+            step_engine::DriveMode::Nonblocking
+        } else {
+            step_engine::DriveMode::Waiting
+        },
+        Some(&mailbox),
+        delegate_registry.as_deref(),
+        timer_registrar.as_ref(),
+    )
+    .await
+    {
+        Ok(read) => {
+            if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, buf_ptr, &staging[..read]) {
                 return SyscallResult::error_from(errno);
             }
-            V3Out::Yield {
-                shape:
-                    YieldShape::OnWaitSource {
-                        source: carrier,
-                        interests,
-                    },
-                ..
-            } => {
-                let deadline = tfd_cap.deadline_ns();
-                wait_for_timerfd_wake(ctx, deadline, now_ns, carrier, interests).await;
-            }
-            V3Out::Continue { .. } | V3Out::Yield { .. } => {
-                return SyscallResult::error_from(Errno::EIO);
-            }
+            SyscallResult::Return(read as i64)
         }
+        Err(errno) => SyscallResult::error_from(errno.into()),
     }
-}
-
-async fn wait_for_timerfd_wake(
-    ctx: &SyscallCtx<'_>,
-    deadline: u64,
-    now_ns: u64,
-    source: WaitSourceId,
-    interests: InterestMask,
-) {
-    let Some(timer_future) = (deadline > now_ns)
-        .then(|| tx_subsystems::timer_sleep::sleep_until_ns(deadline))
-        .flatten()
-    else {
-        super::await_wait_source(ctx, source, interests).await;
-        return;
-    };
-
-    let source_future = super::await_wait_source(ctx, source, interests);
-    let mut timer_future = core::pin::pin!(timer_future);
-    let mut source_future = core::pin::pin!(source_future);
-
-    use core::future::{poll_fn, Future};
-    use core::task::Poll;
-
-    poll_fn(|cx| {
-        if timer_future.as_mut().poll(cx).is_ready() || source_future.as_mut().poll(cx).is_ready() {
-            Poll::Ready(())
-        } else {
-            Poll::Pending
-        }
-    })
-    .await;
 }
 
 /// Silence unused-import warnings.

@@ -4,7 +4,8 @@
 //! or written (adds to the counter).  Subsystem dispatch lives in
 //! `tx_subsystems::eventfd`.
 
-use tx_subsystems::eventfd::{step_eventfd_read, step_eventfd_write, EventFd, EFD_SEMAPHORE};
+use alloc::sync::Arc;
+use tx_subsystems::eventfd::{EventFd, EventfdReadOp, EventfdWriteOp, EFD_SEMAPHORE};
 use tx_subsystems::execution::Errno;
 use tx_subsystems::vfs::structure::OpenFileFlags;
 use tx_subsystems::vfs::OpenFile;
@@ -108,39 +109,42 @@ pub(super) async fn sys_eventfd_read(
         return SyscallResult::Error(EINVAL_VALUE);
     }
 
+    let mut staging = [0u8; 8];
+    let mut script_ctx = super::build_subject_script_ctx(ctx);
+    let mailbox = script_ctx
+        .mailbox()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(tx_substrate::wake::TaskMailbox::new()));
+    let timer_registrar = script_ctx.timer_registrar().cloned();
+    let delegate_registry = script_ctx.delegate_registry().cloned();
     let nonblocking = file.flags().nonblocking;
-    loop {
-        let mut staging = [0u8; 8];
-        let outcome = step_eventfd_read(efd_cap, &mut staging, nonblocking);
-        use step_engine::{StepOutcome as V3Out, YieldShape};
-        match outcome {
-            V3Out::Done(n) => {
-                if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, buf_ptr, &staging[..n]) {
-                    return SyscallResult::error_from(errno);
-                }
-                return SyscallResult::Return(n as i64);
-            }
-            V3Out::Err(v3errno) => {
-                let errno: Errno = v3errno.into();
-                if errno == Errno::EAGAIN {
-                    return SyscallResult::Error(EAGAIN_VALUE);
-                }
+    let op = EventfdReadOp {
+        efd: efd_cap,
+        out: &mut staging,
+        nonblocking,
+        post: |mailbox, event| ctx.post_mailbox_ref_event(mailbox, event),
+    };
+    match tx_scripts::drive(
+        op,
+        &mut script_ctx,
+        if nonblocking {
+            step_engine::DriveMode::Nonblocking
+        } else {
+            step_engine::DriveMode::Waiting
+        },
+        Some(&mailbox),
+        delegate_registry.as_deref(),
+        timer_registrar.as_ref(),
+    )
+    .await
+    {
+        Ok(n) => {
+            if let Err(errno) = bootstrap_copy_to_user(&ctx.aspace, buf_ptr, &staging[..n]) {
                 return SyscallResult::error_from(errno);
             }
-            V3Out::Yield {
-                shape:
-                    YieldShape::OnWaitSource {
-                        source: carrier,
-                        interests,
-                    },
-                ..
-            } => {
-                super::await_wait_source(ctx, carrier, interests).await;
-            }
-            V3Out::Continue { .. } | V3Out::Yield { .. } => {
-                return SyscallResult::error_from(Errno::EIO);
-            }
+            SyscallResult::Return(n as i64)
         }
+        Err(errno) => SyscallResult::error_from(errno.into()),
     }
 }
 
@@ -174,36 +178,36 @@ pub(super) async fn sys_eventfd_write(
         Err(errno) => return SyscallResult::error_from(errno),
     };
 
+    let mut script_ctx = super::build_subject_script_ctx(ctx);
+    let mailbox = script_ctx
+        .mailbox()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(tx_substrate::wake::TaskMailbox::new()));
+    let timer_registrar = script_ctx.timer_registrar().cloned();
+    let delegate_registry = script_ctx.delegate_registry().cloned();
     let nonblocking = file.flags().nonblocking;
-    loop {
-        let outcome = step_eventfd_write(efd_cap, val, nonblocking);
-        use step_engine::{StepOutcome as V3Out, YieldShape};
-        match outcome {
-            V3Out::Done(()) => {
-                // Linux convention: write to eventfd always returns 8.
-                return SyscallResult::Return(8);
-            }
-            V3Out::Err(v3errno) => {
-                let errno: Errno = v3errno.into();
-                if errno == Errno::EAGAIN {
-                    return SyscallResult::Error(EAGAIN_VALUE);
-                }
-                return SyscallResult::error_from(errno);
-            }
-            V3Out::Yield {
-                shape:
-                    YieldShape::OnWaitSource {
-                        source: carrier,
-                        interests,
-                    },
-                ..
-            } => {
-                super::await_wait_source(ctx, carrier, interests).await;
-            }
-            V3Out::Continue { .. } | V3Out::Yield { .. } => {
-                return SyscallResult::error_from(Errno::EIO);
-            }
-        }
+    let op = EventfdWriteOp {
+        efd: efd_cap,
+        val,
+        nonblocking,
+        post: |mailbox, event| ctx.post_mailbox_ref_event(mailbox, event),
+    };
+    match tx_scripts::drive(
+        op,
+        &mut script_ctx,
+        if nonblocking {
+            step_engine::DriveMode::Nonblocking
+        } else {
+            step_engine::DriveMode::Waiting
+        },
+        Some(&mailbox),
+        delegate_registry.as_deref(),
+        timer_registrar.as_ref(),
+    )
+    .await
+    {
+        Ok(()) => SyscallResult::Return(8),
+        Err(errno) => SyscallResult::error_from(errno.into()),
     }
 }
 

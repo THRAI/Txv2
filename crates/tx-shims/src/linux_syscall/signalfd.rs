@@ -3,7 +3,7 @@
 //! Spec:
 //! - `docs/progress/decisions/2026-05-11-d9-signal-wake-migration.md`
 //!   §6 (Option C follow-up: signalfd as a per-process subscription
-//!   driven from `step_kill_process` after the thread-eligibility
+//!   driven from the process-directed kill helper after the thread-eligibility
 //!   post)
 //! - `man 2 signalfd`, `man 2 signalfd4`
 //!
@@ -22,15 +22,15 @@
 
 use super::build_subject_script_ctx;
 use tx_subsystems::execution::Errno;
-use tx_subsystems::signalfd::ops::SignalfdCreateOp;
-use tx_subsystems::signalfd::{signalfd_read, SignalFd, SIGNALFD_SIGINFO_SIZE};
+use tx_subsystems::signalfd::ops::{SignalfdCreateOp, SignalfdReadOp};
+use tx_subsystems::signalfd::{SignalFd, SIGNALFD_SIGINFO_SIZE};
 use tx_subsystems::vfs::structure::OpenFileFlags;
 use tx_subsystems::vfs::OpenFile;
 
 use super::numbers::{O_CLOEXEC, O_NONBLOCK, SFD_CLOEXEC, SFD_NONBLOCK};
 use super::{
     bootstrap_read_user, errno_to_i32, next_stdio_fd_below_nofile, SyscallCtx, SyscallResult,
-    EAGAIN_VALUE, EBADF_VALUE, EINVAL_VALUE, ENOMEM_VALUE,
+    EBADF_VALUE, EINVAL_VALUE, ENOMEM_VALUE,
 };
 use crate::adapter::step_engine::{self as step_engine};
 
@@ -172,47 +172,42 @@ pub(super) async fn sys_signalfd_read(
     }
 
     let nonblocking = file.flags().nonblocking;
-    loop {
-        let outcome = {
-            let mut staging = [0u8; SIGNALFD_SIGINFO_SIZE];
-            let result = signalfd_read(sfd_cap, &mut staging, nonblocking);
-            (result, staging)
-        };
-        use step_engine::{StepOutcome as V3Out, YieldShape};
-        match outcome.0 {
-            V3Out::Done(read) => {
-                if read == 0 {
-                    return SyscallResult::Return(0);
-                }
-                if let Err(errno) =
-                    super::bootstrap_copy_to_user(&ctx.aspace, buf_ptr, &outcome.1[..read])
-                {
-                    return SyscallResult::error_from(errno);
-                }
-                return SyscallResult::Return(read as i64);
-            }
-            V3Out::Err(v3errno) => {
-                let errno: Errno = v3errno.into();
-                if errno == Errno::EAGAIN {
-                    return SyscallResult::Error(EAGAIN_VALUE);
-                }
+    let mut staging = [0u8; SIGNALFD_SIGINFO_SIZE];
+    let mut script_ctx = build_subject_script_ctx(ctx);
+    let mailbox = script_ctx
+        .mailbox()
+        .cloned()
+        .unwrap_or_else(|| alloc::sync::Arc::new(tx_substrate::wake::TaskMailbox::new()));
+    let timer_registrar = script_ctx.timer_registrar().cloned();
+    let delegate_registry = script_ctx.delegate_registry().cloned();
+    let op = SignalfdReadOp {
+        sfd: &sfd_cap,
+        out: &mut staging,
+        nonblocking,
+    };
+    match tx_scripts::drive(
+        op,
+        &mut script_ctx,
+        if nonblocking {
+            step_engine::DriveMode::Nonblocking
+        } else {
+            step_engine::DriveMode::Waiting
+        },
+        Some(&mailbox),
+        delegate_registry.as_deref(),
+        timer_registrar.as_ref(),
+    )
+    .await
+    {
+        Ok(read) => {
+            if let Err(errno) =
+                super::bootstrap_copy_to_user(&ctx.aspace, buf_ptr, &staging[..read])
+            {
                 return SyscallResult::error_from(errno);
             }
-            V3Out::Yield {
-                shape:
-                    YieldShape::OnWaitSource {
-                        source: carrier,
-                        interests,
-                    },
-                ..
-            } => {
-                super::await_wait_source(ctx, carrier, interests).await;
-                // Re-poll on next loop iteration.
-            }
-            V3Out::Continue { .. } | V3Out::Yield { .. } => {
-                return SyscallResult::error_from(Errno::EIO);
-            }
+            SyscallResult::Return(read as i64)
         }
+        Err(errno) => SyscallResult::error_from(errno.into()),
     }
 }
 

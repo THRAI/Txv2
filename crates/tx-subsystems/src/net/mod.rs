@@ -14,6 +14,7 @@ pub mod facade;
 pub mod namespace;
 pub mod netfilter;
 pub mod nfnetlink;
+pub mod notification;
 pub mod packet;
 pub mod project;
 pub mod protocol;
@@ -41,17 +42,20 @@ pub use execution::{
     socket_accept_wait_token, socket_open_file_from_identity, socket_recv_wait_token,
     socket_send_wait_token, socket_urgent_wait_token, step_accept, step_bind, step_connect,
     step_flush_pending_arp, step_listen, step_poll_ready, step_poll_wait_token,
-    step_process_device_tx_pending, step_process_device_tx_pending_at,
-    step_process_device_tx_pending_in_namespace_at, step_process_loopback_pending_in_namespace,
-    step_process_loopback_udp, step_process_network_events, step_process_network_events_at,
-    step_process_network_events_in_namespace_at, step_process_network_tick,
+    step_process_device_tx_pending_at_with_post,
+    step_process_device_tx_pending_in_namespace_at_with_post,
+    step_process_device_tx_pending_with_post, step_process_loopback_pending_in_namespace,
+    step_process_loopback_udp_with_post, step_process_network_events,
+    step_process_network_events_at, step_process_network_events_in_namespace_at,
+    step_process_network_events_in_namespace_at_with_post, step_process_network_tick,
     step_process_network_tick_in_namespace, step_process_network_tick_loopback,
     step_process_network_tick_loopback_in_namespace, step_recv_kernel_bytes, step_sctp_peeloff,
     step_sctp_shutdown_assoc, step_send_kernel_bytes, step_send_sctp_message,
     step_send_sctp_seqpacket, step_send_to_kernel_bytes, step_send_to_kernel_bytes_with_poll_kick,
-    step_send_to_unix_path_kernel_bytes, step_send_udp_loopback_kernel_bytes, step_shutdown,
-    step_socket_close, step_socket_create, step_socket_create_in_namespace, step_socket_open_file,
-    step_socket_open_file_in_namespace, step_tcp_loopback_handshake, step_tcp_loopback_transfer,
+    step_send_to_unix_path_kernel_bytes, step_send_udp_loopback_kernel_bytes_with_post,
+    step_shutdown, step_socket_close, step_socket_create, step_socket_create_in_namespace,
+    step_socket_open_file, step_socket_open_file_in_namespace,
+    step_tcp_loopback_handshake_with_post, step_tcp_loopback_transfer_with_post,
     step_unix_socketpair_connect, ArpFlushOutcome, DeviceTxBudget, DeviceTxOutcome,
     LoopbackTcpConnectOutcome, LoopbackTcpTransferOutcome, NetworkBacklogTickOutcome,
     NetworkStepOutcome, ShutdownOutcome, SocketCloseOutcome, SocketOpenFileOutput,
@@ -98,8 +102,8 @@ pub use netfilter::{
     NetfilterVerdict,
 };
 pub use nfnetlink::{
-    netlink_netfilter_recv, netlink_netfilter_send, netlink_xfrm_recv, netlink_xfrm_send,
-    nfnetlink_handle_request, nfnetlink_handle_request_in_namespace,
+    netlink_netfilter_recv, netlink_netfilter_send_with_post, netlink_xfrm_recv,
+    netlink_xfrm_send_with_post, nfnetlink_handle_request, nfnetlink_handle_request_in_namespace,
     nfnetlink_handle_request_in_namespace_with_cred, nfnetlink_handle_request_with_cred,
     NetlinkNetfilterState, RawNetlinkNetfilterSocket, NETLINK_NETFILTER, NETLINK_XFRM,
     NFNL_MSG_BATCH_BEGIN, NFNL_MSG_BATCH_END, NFNL_SUBSYS_NFTABLES, NFPROTO_IPV4, NFT_MSG_DELCHAIN,
@@ -125,13 +129,13 @@ pub use protocol::{
 };
 pub use rtnetlink::{
     create_vlan_link, netlink_route_recv, netlink_route_recv_available, netlink_route_recv_packet,
-    netlink_route_send, netlink_route_send_with_netns_resolver,
-    netlink_route_send_with_netns_resolvers, rtnetlink_handle_request,
-    rtnetlink_handle_request_with_netns_resolver, rtnetlink_handle_request_with_netns_resolvers,
-    NetlinkRouteState, RawNetlinkRouteSocket, AF_NETLINK, NETLINK_ROUTE, NLMSG_DONE, NLMSG_ERROR,
-    NLM_F_ACK, NLM_F_DUMP, NLM_F_MULTI, NLM_F_REQUEST, RTM_DELLINK, RTM_DELROUTE, RTM_GETADDR,
-    RTM_GETLINK, RTM_GETNEIGH, RTM_GETROUTE, RTM_NEWADDR, RTM_NEWLINK, RTM_NEWNEIGH, RTM_NEWROUTE,
-    RTM_SETLINK,
+    netlink_route_send_with_netns_resolver_and_post,
+    netlink_route_send_with_netns_resolvers_and_post, netlink_route_send_with_post,
+    rtnetlink_handle_request, rtnetlink_handle_request_with_netns_resolver,
+    rtnetlink_handle_request_with_netns_resolvers, NetlinkRouteState, RawNetlinkRouteSocket,
+    AF_NETLINK, NETLINK_ROUTE, NLMSG_DONE, NLMSG_ERROR, NLM_F_ACK, NLM_F_DUMP, NLM_F_MULTI,
+    NLM_F_REQUEST, RTM_DELLINK, RTM_DELROUTE, RTM_GETADDR, RTM_GETLINK, RTM_GETNEIGH, RTM_GETROUTE,
+    RTM_NEWADDR, RTM_NEWLINK, RTM_NEWNEIGH, RTM_NEWROUTE, RTM_SETLINK,
 };
 pub use structure::{
     AcceptWireSet, AddressFamily, ConnectionKey, InitialSocketTableProxy, IpAddress, IpEndpoint,

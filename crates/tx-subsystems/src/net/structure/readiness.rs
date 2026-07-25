@@ -1,4 +1,5 @@
 use tx_substrate::bus::{RawPort, RawQueue};
+use tx_substrate::wake::mailbox::{MailboxEvent, TaskMailbox};
 
 tx_substrate::bus::bus_readiness! {
     pub struct RecvWireSet {
@@ -42,24 +43,33 @@ impl SocketReadiness {
         }
     }
 
-    pub fn fire_recv(&self, set: RecvWireSet) -> usize {
-        self.recv_wq.fire(set.bits())
+    pub fn fire_recv_with_post<F>(&self, set: RecvWireSet, post: F) -> usize
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+    {
+        self.recv_wq.fire_with_post(set.bits(), post)
     }
 
     pub fn clear_recv(&self, set: RecvWireSet) {
         self.recv_wq.clear(set.bits());
     }
 
-    pub fn fire_send(&self, set: SendWireSet) -> usize {
-        self.send_wq.fire(set.bits())
+    pub fn fire_send_with_post<F>(&self, set: SendWireSet, post: F) -> usize
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+    {
+        self.send_wq.fire_with_post(set.bits(), post)
     }
 
     pub fn clear_send(&self, set: SendWireSet) {
         self.send_wq.clear(set.bits());
     }
 
-    pub fn fire_accept(&self, set: AcceptWireSet) -> usize {
-        self.accept_wq.fire(set.bits())
+    pub fn fire_accept_with_post<F>(&self, set: AcceptWireSet, post: F) -> usize
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+    {
+        self.accept_wq.fire_with_post(set.bits(), post)
     }
 
     pub fn clear_accept(&self, set: AcceptWireSet) {

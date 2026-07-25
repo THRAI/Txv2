@@ -4,21 +4,23 @@ use core::cell::Cell;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetFrame, EthernetProtocol, Ipv4Packet};
+use tx_substrate::wake::mailbox::{MailboxEvent, TaskMailbox};
 use tx_substrate::zone::{
     self, register_zone_for, Cap, Dead, Entity, PayloadCap, PayloadPolicy, Zone, ZoneAllocated,
     ZoneError,
 };
 
+use crate::device::DevT;
 use crate::execution::{Errno, Guard, StepOutcome};
 use crate::net::admin::NetAdminAuthority;
-use crate::device::DevT;
 use crate::net::device::{
     net_device_registry_len, net_device_snapshot, BridgeForwardOutcome, BridgeSnapshot,
     EthernetAddress, NetDeviceKind, NetDeviceRegistration,
 };
 use crate::net::execution::{
-    step_flush_pending_arp, step_process_device_tx_pending_in_namespace_at,
-    step_process_network_events_in_namespace_at, ArpFlushOutcome, DeviceTxBudget, DeviceTxOutcome,
+    step_flush_pending_arp, step_process_device_tx_pending_in_namespace_at_with_post,
+    step_process_network_events_in_namespace_at_with_post, ArpFlushOutcome, DeviceTxBudget,
+    DeviceTxOutcome,
 };
 use crate::net::netfilter::{
     apply_postrouting_nat_ipv4_in_namespace, apply_prerouting_nat_ipv4_in_namespace,
@@ -205,12 +207,19 @@ pub struct NetNamespaceRouteDecision {
 #[derive(Clone, Copy)]
 struct NetNamespaceDeviceLink {
     registration: &'static NetDeviceRegistration,
+    name_override: Option<&'static str>,
     ipv4_addr: Option<Ipv4Address>,
     ipv4_prefix_len: Option<u8>,
     ipv6_addr: Option<Ipv6Address>,
     ipv6_prefix_len: Option<u8>,
     mtu: Option<u16>,
     is_up: bool,
+}
+
+impl NetNamespaceDeviceLink {
+    fn name(&self) -> &'static str {
+        self.name_override.unwrap_or(self.registration.name)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -321,10 +330,7 @@ impl Drop for NetNamespacePayload {
             // are no double-frees of committed entries.
             unsafe {
                 core::ptr::drop_in_place(ptr);
-                alloc::alloc::dealloc(
-                    ptr as *mut u8,
-                    core::alloc::Layout::new::<SocketTable>(),
-                );
+                alloc::alloc::dealloc(ptr as *mut u8, core::alloc::Layout::new::<SocketTable>());
             }
         }
     }
@@ -485,6 +491,50 @@ impl NetNamespacePayload {
         target.attach_device_link_inner(link)
     }
 
+    pub fn set_device_name_by_ifindex(
+        &self,
+        _authority: NetAdminAuthority,
+        ifindex: u32,
+        name: &'static str,
+    ) -> Result<(), Errno> {
+        if ifindex == 1 {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        let registration = self.find_device_by_ifindex(ifindex).ok_or(Errno::ENODEV)?;
+        if self.has_device_name_conflict(name, Some(registration.devt)) {
+            return Err(Errno::EEXIST);
+        }
+        let old_name = self.name_for_device(registration);
+        {
+            let mut devices = self.namespace_devices.lock();
+            if let Some(link) = devices
+                .iter_mut()
+                .find(|link| link.registration.devt == registration.devt)
+            {
+                link.name_override = Some(name);
+            } else {
+                devices.push(NetNamespaceDeviceLink {
+                    registration,
+                    name_override: Some(name),
+                    ipv4_addr: None,
+                    ipv4_prefix_len: None,
+                    ipv6_addr: None,
+                    ipv6_prefix_len: None,
+                    mtu: None,
+                    is_up: true,
+                });
+            }
+        }
+        for route in self.routes.lock().iter_mut() {
+            if route.oif_name == Some(old_name) {
+                route.oif_name = Some(name);
+            }
+        }
+        self.forget_connected_route_suppressions_for_oif(old_name);
+        self.invalidate_link_snapshot_cache();
+        Ok(())
+    }
+
     pub fn detach_device_from_bridges_by_ifindex(
         &self,
         authority: NetAdminAuthority,
@@ -546,6 +596,7 @@ impl NetNamespacePayload {
 
         self.attach_device_link_inner(NetNamespaceDeviceLink {
             registration,
+            name_override: None,
             ipv4_addr,
             ipv4_prefix_len: ipv4_addr.map(|_| 32),
             ipv6_addr: None,
@@ -574,9 +625,23 @@ impl NetNamespacePayload {
         }
 
         self.namespace_devices.lock().iter().any(|link| {
-            link.registration.name == registration.name
-                || link.registration.devt == registration.devt
+            link.name() == registration.name || link.registration.devt == registration.devt
         })
+    }
+
+    fn has_device_name_conflict(&self, name: &str, except_devt: Option<DevT>) -> bool {
+        if self.host_devices_visible
+            && net_device_snapshot()
+                .into_iter()
+                .any(|reg| Some(reg.devt) != except_devt && reg.name == name)
+        {
+            return true;
+        }
+
+        self.namespace_devices
+            .lock()
+            .iter()
+            .any(|link| Some(link.registration.devt) != except_devt && link.name() == name)
     }
 
     pub fn link_snapshot(&self) -> Vec<NetNamespaceLinkInfo> {
@@ -597,6 +662,7 @@ impl NetNamespacePayload {
 
         let mut links = Vec::new();
         let devices = self.device_snapshot();
+        let device_links = self.namespace_devices.lock().clone();
         let bridges = bridge_snapshot_from_devices(&devices);
         let loopback_override = *self.loopback_ipv4_override.lock();
         let (loopback_addr, loopback_prefix_len) =
@@ -620,15 +686,23 @@ impl NetNamespacePayload {
         });
 
         for (next_ifindex, reg) in (2..).zip(devices) {
-            let ipv4_addr = self.ipv4_for_device(reg);
-            let ipv4_prefix_len = self.ipv4_prefix_len_for_device(reg);
-            let ipv6_addr = self.ipv6_for_device(reg);
-            let ipv6_prefix_len = self.ipv6_prefix_len_for_device(reg);
+            let link = device_links
+                .iter()
+                .find(|link| link.registration.devt == reg.devt);
+            let name = link.map(NetNamespaceDeviceLink::name).unwrap_or(reg.name);
+            let ipv4_addr = link.and_then(|link| link.ipv4_addr);
+            let ipv4_prefix_len = link.and_then(|link| link.ipv4_prefix_len);
+            let ipv6_addr = link.and_then(|link| link.ipv6_addr);
+            let ipv6_prefix_len = link.and_then(|link| link.ipv6_prefix_len);
+            let mtu = link
+                .and_then(|link| link.mtu)
+                .unwrap_or_else(|| reg.ops.mtu());
+            let is_up = link.is_none_or(|link| link.is_up);
             links.push(NetNamespaceLinkInfo {
                 ifindex: next_ifindex,
-                name: reg.name,
+                name,
                 kind: reg.ops.device_kind(),
-                mtu: self.mtu_for_device(reg),
+                mtu,
                 mac: Some(reg.ops.mac_addr()),
                 ipv4_addr,
                 ipv4_prefix_len,
@@ -636,7 +710,7 @@ impl NetNamespacePayload {
                 ipv6_prefix_len,
                 master: bridge_master_for(reg.name, &bridges),
                 is_loopback: false,
-                is_up: self.is_device_up(reg),
+                is_up,
             });
         }
 
@@ -734,7 +808,7 @@ impl NetNamespacePayload {
         for link in links.iter() {
             if devices
                 .iter()
-                .any(|reg| reg.name == link.registration.name || reg.devt == link.registration.devt)
+                .any(|reg| reg.name == link.name() || reg.devt == link.registration.devt)
             {
                 continue;
             }
@@ -987,9 +1061,21 @@ impl NetNamespacePayload {
     }
 
     pub fn find_device_by_name(&self, name: &str) -> Option<&'static NetDeviceRegistration> {
-        self.device_snapshot()
-            .into_iter()
-            .find(|registration| registration.name == name)
+        if let Some(registration) = self
+            .namespace_devices
+            .lock()
+            .iter()
+            .find(|link| link.name() == name)
+            .map(|link| link.registration)
+        {
+            return Some(registration);
+        }
+        if self.host_devices_visible {
+            return net_device_snapshot()
+                .into_iter()
+                .find(|registration| registration.name == name);
+        }
+        None
     }
 
     pub fn find_device_by_ifindex(&self, ifindex: u32) -> Option<&'static NetDeviceRegistration> {
@@ -1090,6 +1176,7 @@ impl NetNamespacePayload {
         }
         devices.push(NetNamespaceDeviceLink {
             registration,
+            name_override: None,
             ipv4_addr: None,
             ipv4_prefix_len: None,
             ipv6_addr: None,
@@ -1127,6 +1214,7 @@ impl NetNamespacePayload {
         }
         devices.push(NetNamespaceDeviceLink {
             registration,
+            name_override: None,
             ipv4_addr: None,
             ipv4_prefix_len: None,
             ipv6_addr: None,
@@ -1165,6 +1253,7 @@ impl NetNamespacePayload {
         }
         devices.push(NetNamespaceDeviceLink {
             registration,
+            name_override: None,
             ipv4_addr,
             ipv4_prefix_len,
             ipv6_addr: None,
@@ -1455,6 +1544,7 @@ impl NetNamespacePayload {
         }
         devices.push(NetNamespaceDeviceLink {
             registration,
+            name_override: None,
             ipv4_addr: None,
             ipv4_prefix_len: None,
             ipv6_addr,
@@ -1570,17 +1660,6 @@ impl NetNamespacePayload {
             .and_then(|link| link.ipv4_addr)
     }
 
-    fn ipv4_prefix_len_for_device(
-        &self,
-        registration: &'static NetDeviceRegistration,
-    ) -> Option<u8> {
-        self.namespace_devices
-            .lock()
-            .iter()
-            .find(|link| link.registration.devt == registration.devt)
-            .and_then(|link| link.ipv4_prefix_len)
-    }
-
     fn ipv6_for_device(&self, registration: &'static NetDeviceRegistration) -> Option<Ipv6Address> {
         self.namespace_devices
             .lock()
@@ -1589,24 +1668,13 @@ impl NetNamespacePayload {
             .and_then(|link| link.ipv6_addr)
     }
 
-    fn ipv6_prefix_len_for_device(
-        &self,
-        registration: &'static NetDeviceRegistration,
-    ) -> Option<u8> {
+    fn name_for_device(&self, registration: &'static NetDeviceRegistration) -> &'static str {
         self.namespace_devices
             .lock()
             .iter()
             .find(|link| link.registration.devt == registration.devt)
-            .and_then(|link| link.ipv6_prefix_len)
-    }
-
-    fn mtu_for_device(&self, registration: &'static NetDeviceRegistration) -> u16 {
-        self.namespace_devices
-            .lock()
-            .iter()
-            .find(|link| link.registration.devt == registration.devt)
-            .and_then(|link| link.mtu)
-            .unwrap_or_else(|| registration.ops.mtu())
+            .map(NetNamespaceDeviceLink::name)
+            .unwrap_or(registration.name)
     }
 
     fn is_device_up(&self, registration: &'static NetDeviceRegistration) -> bool {
@@ -1674,7 +1742,7 @@ impl NetNamespacePayload {
                 registration.ops.mtu(),
             ),
             registration.ops.mac_addr(),
-            registration.name,
+            link.name,
         )));
 
         if let Some(entry) = runtime
@@ -1796,10 +1864,23 @@ pub fn drive_all_net_namespace_runtimes_at(
     now: Instant,
     guard: &Guard<'_>,
 ) -> NetNamespaceRuntimeOutcome {
+    drive_all_net_namespace_runtimes_at_with_post(now, guard, |mailbox, event| mailbox.post(event))
+}
+
+pub fn drive_all_net_namespace_runtimes_at_with_post<F>(
+    now: Instant,
+    guard: &Guard<'_>,
+    mut post: F,
+) -> NetNamespaceRuntimeOutcome
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     let namespaces = NET_NAMESPACE_RUNTIME_LIST.lock().clone();
     let mut outcome = NetNamespaceRuntimeOutcome::default();
     for namespace in namespaces {
-        outcome.merge(drive_net_namespace_runtime_at(namespace, now, guard));
+        outcome.merge(drive_net_namespace_runtime_at_with_post(
+            namespace, now, guard, &mut post,
+        ));
     }
     outcome
 }
@@ -1809,6 +1890,20 @@ pub fn drive_net_namespace_runtime_at(
     now: Instant,
     guard: &Guard<'_>,
 ) -> NetNamespaceRuntimeOutcome {
+    drive_net_namespace_runtime_at_with_post(net_namespace, now, guard, |mailbox, event| {
+        mailbox.post(event)
+    })
+}
+
+pub fn drive_net_namespace_runtime_at_with_post<F>(
+    net_namespace: PayloadCap<NetNamespacePayload>,
+    now: Instant,
+    guard: &Guard<'_>,
+    mut post: F,
+) -> NetNamespaceRuntimeOutcome
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     let mut outcome = NetNamespaceRuntimeOutcome {
         namespaces_seen: 1,
         ..NetNamespaceRuntimeOutcome::default()
@@ -1820,9 +1915,13 @@ pub fn drive_net_namespace_runtime_at(
         outcome.ifaces_seen += 1;
 
         let source = NamespaceEtherPacketSource::new(&net_namespace, iface);
-        if let StepOutcome::Done(events) =
-            step_process_network_events_in_namespace_at(&source, net_namespace.clone(), now, guard)
-        {
+        if let StepOutcome::Done(events) = step_process_network_events_in_namespace_at_with_post(
+            &source,
+            net_namespace.clone(),
+            now,
+            guard,
+            &mut post,
+        ) {
             outcome.packets_seen += events.packets_seen;
             outcome.sockets_touched += events.sockets_touched;
             outcome.wakes_fired += events.wakes_fired;
@@ -1830,13 +1929,16 @@ pub fn drive_net_namespace_runtime_at(
         outcome.merge_forwarding(source.forwarding_outcome());
 
         let sink = EtherPacketTxSink { iface };
-        if let StepOutcome::Done(device_tx) = step_process_device_tx_pending_in_namespace_at(
-            &sink,
-            net_namespace.clone(),
-            now,
-            DeviceTxBudget::default(),
-            guard,
-        ) {
+        if let StepOutcome::Done(device_tx) =
+            step_process_device_tx_pending_in_namespace_at_with_post(
+                &sink,
+                net_namespace.clone(),
+                now,
+                DeviceTxBudget::default(),
+                guard,
+                &mut post,
+            )
+        {
             outcome.merge_device_tx(device_tx);
         }
 

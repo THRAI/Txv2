@@ -52,6 +52,105 @@ fn udp_packet_event_sets_recv_readiness() {
 }
 
 #[test]
+fn packet_event_step_uses_injected_post_for_socket_readiness() {
+    let _lock = setup();
+    let guard = tx_substrate::epoch::guard();
+    let udp = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Udp,
+        SocketOptionSet::default_udp(),
+    )
+    .expect("udp socket");
+    let local = endpoint(40_131);
+    let remote = endpoint(50_131);
+    assert_eq!(
+        step_bind(
+            &udp,
+            KernelSockAddr::V4(SockAddrIn::new(local.port, local.addr)),
+            &guard,
+        ),
+        StepOutcome::Done(())
+    );
+    let recv_mailbox = alloc::sync::Arc::new(TaskMailbox::new());
+    let recv_generation = recv_mailbox.next_generation();
+    let _subscription = udp.readiness.recv_wq.subscribe(
+        RecvWireSet::HAS_DATA.bits(),
+        alloc::sync::Arc::downgrade(&recv_mailbox),
+        recv_generation,
+    );
+    let source = ScriptedPacketSource::new(std::vec![PacketDispatch::Udp(
+        UdpPacketEvent::with_payload_len(remote, local, 64),
+    )]);
+    let mut injected_posts = 0usize;
+
+    let outcome = match step_process_network_events_in_namespace_at_with_post(
+        &source,
+        crate::net::initial_net_namespace_payload(),
+        smoltcp::time::Instant::ZERO,
+        &guard,
+        |mailbox, event| {
+            injected_posts += 1;
+            mailbox.post(event)
+        },
+    ) {
+        StepOutcome::Done(outcome) => outcome,
+        _ => panic!("network step should complete"),
+    };
+
+    assert_eq!(outcome.packets_seen, 1);
+    assert_eq!(outcome.sockets_touched, 1);
+    assert_eq!(outcome.wakes_fired, 1);
+    assert_eq!(injected_posts, 1);
+}
+
+#[test]
+fn network_publish_uses_injected_mailbox_ref_post_for_socket_readiness() {
+    let _lock = setup();
+    let socket = registry::create_socket_for_test_or_bootstrap(
+        SocketKind::Tcp,
+        SocketOptionSet::default_tcp(),
+    )
+    .expect("socket");
+    let recv_mailbox = alloc::sync::Arc::new(TaskMailbox::new());
+    let send_mailbox = alloc::sync::Arc::new(TaskMailbox::new());
+    let urgent_mailbox = alloc::sync::Arc::new(TaskMailbox::new());
+    let recv_generation = recv_mailbox.next_generation();
+    let send_generation = send_mailbox.next_generation();
+    let urgent_generation = urgent_mailbox.next_generation();
+    let _recv = socket.readiness.recv_wq.subscribe(
+        RecvWireSet::HAS_DATA.bits(),
+        alloc::sync::Arc::downgrade(&recv_mailbox),
+        recv_generation,
+    );
+    let _send = socket.readiness.send_wq.subscribe(
+        SendWireSet::SPACE.bits(),
+        alloc::sync::Arc::downgrade(&send_mailbox),
+        send_generation,
+    );
+    let _urgent = socket.urgent_port.subscribe(
+        UrgentEvent::URGENT.bits(),
+        alloc::sync::Arc::downgrade(&urgent_mailbox),
+        urgent_generation,
+    );
+    let publish = NetworkPublish {
+        recv_has_data: true,
+        send_has_space: true,
+        urgent: true,
+        ..NetworkPublish::none()
+    };
+    let mut injected_posts = 0usize;
+
+    let wakes = publish.publish_to_with_post(&socket, |mailbox, event| {
+        injected_posts += 1;
+        mailbox.post(event)
+    });
+
+    assert_eq!(wakes, 3);
+    assert_eq!(injected_posts, 3);
+    assert!(socket.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() != 0);
+    assert!(socket.readiness.send_wq.peek() & SendWireSet::SPACE.bits() != 0);
+}
+
+#[test]
 fn smoltcp_demux_rejects_empty_frame_as_malformed() {
     let frame = RxFrame::new(std::vec::Vec::new());
 
@@ -182,8 +281,10 @@ fn tcp_packet_event_sets_connection_readiness_and_urgent_port() {
         step_accept(&listener, &guard),
         StepOutcome::Done(_)
     ));
+    let token = socket_urgent_wait_token(&tcp);
     let mut urgent_future =
-        crate::wait_source::wait_on_token(socket_urgent_wait_token(&tcp)).expect("urgent future");
+        crate::wait_source::wait_on_registered_source_id(token.source_id(), token.interest())
+            .expect("urgent future");
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
     assert!(matches!(

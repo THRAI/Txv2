@@ -1,3 +1,4 @@
+use tx_substrate::wake::mailbox::{MailboxEvent, TaskMailbox};
 use tx_substrate::zone::Cap;
 
 use crate::execution::{Errno, Guard, StepOutcome};
@@ -37,23 +38,43 @@ pub struct LoopbackTcpTransferOutcome {
     pub peer_wake_fired: bool,
 }
 
-pub fn step_tcp_loopback_handshake(
+pub fn step_tcp_loopback_handshake_with_post<F>(
     client: &Cap<SocketIdentity>,
     guard: &Guard<'_>,
-) -> StepOutcome<LoopbackTcpConnectOutcome> {
+    post: F,
+) -> StepOutcome<LoopbackTcpConnectOutcome>
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     // observe
     // upgrade
     // reserve
     // commit
     // publish
-    step_tcp_loopback_handshake_on_iface(client, initial_loopback_iface(), guard)
+    step_tcp_loopback_handshake_on_iface_with_post::<F>(
+        client,
+        initial_loopback_iface(),
+        guard,
+        post,
+    )
 }
 
-pub fn step_tcp_loopback_handshake_on_iface(
+pub fn step_tcp_loopback_handshake(
+    client: &Cap<SocketIdentity>,
+    guard: &Guard<'_>,
+) -> StepOutcome<LoopbackTcpConnectOutcome> {
+    step_tcp_loopback_handshake_with_post(client, guard, |mailbox, event| mailbox.post(event))
+}
+
+pub fn step_tcp_loopback_handshake_on_iface_with_post<F>(
     client: &Cap<SocketIdentity>,
     iface: &LoopbackIface,
     guard: &Guard<'_>,
-) -> StepOutcome<LoopbackTcpConnectOutcome> {
+    mut post: F,
+) -> StepOutcome<LoopbackTcpConnectOutcome>
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     // observe
     // upgrade
     // reserve
@@ -109,7 +130,7 @@ pub fn step_tcp_loopback_handshake_on_iface(
 
     let wakes_fired = publish_targets
         .into_iter()
-        .map(|target| target.publish())
+        .map(|target| target.publish_with_post(&mut post))
         .sum();
 
     StepOutcome::Done(LoopbackTcpConnectOutcome {
@@ -119,25 +140,59 @@ pub fn step_tcp_loopback_handshake_on_iface(
     })
 }
 
-pub fn step_tcp_loopback_transfer(
+pub fn step_tcp_loopback_handshake_on_iface(
+    client: &Cap<SocketIdentity>,
+    iface: &LoopbackIface,
+    guard: &Guard<'_>,
+) -> StepOutcome<LoopbackTcpConnectOutcome> {
+    step_tcp_loopback_handshake_on_iface_with_post(client, iface, guard, |mailbox, event| {
+        mailbox.post(event)
+    })
+}
+
+pub fn step_tcp_loopback_transfer_with_post<F>(
     source: &Cap<SocketIdentity>,
     max_bytes: usize,
     guard: &Guard<'_>,
-) -> StepOutcome<LoopbackTcpTransferOutcome> {
+    post: F,
+) -> StepOutcome<LoopbackTcpTransferOutcome>
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     // observe
     // upgrade
     // reserve
     // commit
     // publish
-    step_process_loopback_tcp(source, max_bytes, initial_loopback_iface(), guard)
+    step_process_loopback_tcp_with_post::<F>(
+        source,
+        max_bytes,
+        initial_loopback_iface(),
+        guard,
+        post,
+    )
 }
 
-pub fn step_process_loopback_tcp(
+pub fn step_tcp_loopback_transfer(
+    source: &Cap<SocketIdentity>,
+    max_bytes: usize,
+    guard: &Guard<'_>,
+) -> StepOutcome<LoopbackTcpTransferOutcome> {
+    step_tcp_loopback_transfer_with_post(source, max_bytes, guard, |mailbox, event| {
+        mailbox.post(event)
+    })
+}
+
+pub fn step_process_loopback_tcp_with_post<F>(
     source: &Cap<SocketIdentity>,
     max_bytes: usize,
     iface: &LoopbackIface,
     guard: &Guard<'_>,
-) -> StepOutcome<LoopbackTcpTransferOutcome> {
+    mut post: F,
+) -> StepOutcome<LoopbackTcpTransferOutcome>
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     // observe
     // upgrade
     // reserve
@@ -233,7 +288,7 @@ pub fn step_process_loopback_tcp(
         .unwrap_or(false);
     publish_targets.extend(send_space_publish_for_drain(source, source_wake_fired));
     for target in publish_targets {
-        target.publish();
+        target.publish_with_post(&mut post);
     }
     let stats = ctx.poll_ingress_to_socket(iface, source, guard, 0);
 
@@ -248,6 +303,17 @@ pub fn step_process_loopback_tcp(
         peer_send_broken,
         source_wake_fired,
         peer_wake_fired,
+    })
+}
+
+pub fn step_process_loopback_tcp(
+    source: &Cap<SocketIdentity>,
+    max_bytes: usize,
+    iface: &LoopbackIface,
+    guard: &Guard<'_>,
+) -> StepOutcome<LoopbackTcpTransferOutcome> {
+    step_process_loopback_tcp_with_post(source, max_bytes, iface, guard, |mailbox, event| {
+        mailbox.post(event)
     })
 }
 

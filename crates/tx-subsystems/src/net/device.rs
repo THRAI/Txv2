@@ -7,6 +7,7 @@ use crate::device::DevT;
 use crate::execution::{Errno, Guard, StepOutcome};
 use crate::net::admin::NetAdminAuthority;
 use crate::net::packet::{PacketTxReadiness, RxFrame};
+use tx_substrate::wake::mailbox::{MailboxEvent, TaskMailbox};
 
 mod bridge;
 mod dummy;
@@ -109,7 +110,10 @@ pub trait NetDeviceOps: Send + Sync + 'static {
 
     fn enable_interrupts(&self) {}
 
-    fn ack_interrupt_and_fire(&self) -> NetDeviceIrqOutcome {
+    fn ack_interrupt_and_fire_with_post(
+        &self,
+        _post: &mut dyn FnMut(&TaskMailbox, MailboxEvent) -> bool,
+    ) -> NetDeviceIrqOutcome {
         NetDeviceIrqOutcome::default()
     }
 }

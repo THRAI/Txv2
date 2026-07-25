@@ -9,10 +9,13 @@ use core::marker::PhantomData;
 
 use smoltcp::time::Instant;
 use tx_hal::TxPlatform;
+use tx_services::time::{timekeeper_clock, ClockRead};
+use tx_substrate::wake::mailbox::{MailboxEvent, MailboxSchedulerHint, TaskMailbox};
 use tx_substrate::SpinMutex;
 use tx_subsystems::net::delegate::{
-    net_delegate_kick_tick, net_delegate_task_loop_owned_with_deadline_hook, NetDelegateDriver,
-    NetDelegateSupervisor, NetDelegateTaskConfig, NetDelegateTimerArm, NetDelegateTimerWake,
+    net_delegate_kick_tick_with_post, net_delegate_task_loop_owned_with_deadline_hook,
+    NetDelegateDriver, NetDelegateSupervisor, NetDelegateTaskConfig, NetDelegateTimerArm,
+    NetDelegateTimerWake,
 };
 #[cfg(test)]
 use tx_subsystems::net::device::VIRTIO_NET0_DEVICE;
@@ -225,7 +228,7 @@ impl<P: TxPlatform> BootNetDelegateDriver<P> {
 
 impl<P: TxPlatform> NetDelegateDriver for BootNetDelegateDriver<P> {
     fn now(&self) -> Instant {
-        let micros = P::read_ns() / 1_000;
+        let micros = timekeeper_clock::<P>().monotonic_now_ns() / 1_000;
         Instant::from_micros(micros.min(i64::MAX as u64) as i64)
     }
 
@@ -251,6 +254,15 @@ impl<P: TxPlatform> NetDelegateDriver for BootNetDelegateDriver<P> {
 
     fn loopback_budget(&self) -> LoopbackPollBudget {
         LoopbackPollBudget::default()
+    }
+
+    fn post_net_mailbox_ref_event(
+        &self,
+        mailbox: &TaskMailbox,
+        event: MailboxEvent,
+        hint: MailboxSchedulerHint,
+    ) -> bool {
+        crate::init::post_mailbox_ref_event_with_hint_from_current_hart::<P>(mailbox, event, hint)
     }
 }
 
@@ -321,7 +333,7 @@ impl<P: TxPlatform> CoreInit<P> {
         let current_cpu = <P as tx_hal::SmpIf>::current_cpu_id();
         BOOT_REACTOR.with(|reactor| {
             reactor.submit_task_with_meta(
-                boot_net_deadline_task(runtime),
+                boot_net_deadline_task::<P>(runtime),
                 tx_reactor::InitialSchedMeta::kernel()
                     .with_affinity(tx_hal::CpuMask::single(current_cpu).bits()),
             )
@@ -333,7 +345,7 @@ impl<P: TxPlatform> CoreInit<P> {
             return Some(runtime);
         }
 
-        let now_ns = P::read_ns();
+        let now_ns = timekeeper_clock::<P>().monotonic_now_ns();
         let smoltcp_now = instant_from_ns(now_ns);
         let runtime = BOOT_REACTOR.with(|reactor| {
             let runtime: &'static BootNetRuntime = Box::leak(Box::new(BootNetRuntime::new(
@@ -365,7 +377,7 @@ fn instant_from_ns(ns: u64) -> Instant {
     Instant::from_micros(micros.min(i64::MAX as u64) as i64)
 }
 
-async fn boot_net_deadline_task(runtime: &'static BootNetRuntime) {
+async fn boot_net_deadline_task<P: TxPlatform>(runtime: &'static BootNetRuntime) {
     loop {
         let Some(arm) = runtime.current_deadline_arm() else {
             let _ = runtime.deadline_channel.wait(DEADLINE_UPDATED).await;
@@ -389,7 +401,13 @@ async fn boot_net_deadline_task(runtime: &'static BootNetRuntime) {
                     tick_fired: true,
                 };
                 if runtime.consume_timer_wake(wake) {
-                    net_delegate_kick_tick();
+                    net_delegate_kick_tick_with_post(|mailbox, event| {
+                        crate::init::post_mailbox_ref_event_with_hint_from_current_hart::<P>(
+                            mailbox,
+                            event,
+                            MailboxSchedulerHint::Normal,
+                        )
+                    });
                 }
             }
             tx_reactor::wait::WaitOutcome::Ready

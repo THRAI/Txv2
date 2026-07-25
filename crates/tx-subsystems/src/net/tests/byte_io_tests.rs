@@ -103,7 +103,8 @@ fn step_send_kernel_bytes_records_tx_bytes_and_clears_when_full() {
     let udp = registry::create_socket_for_test_or_bootstrap(SocketKind::Udp, options)
         .expect("udp socket");
     assert_eq!(step_bind(&udp, inet(40_139), &guard), StepOutcome::Done(()));
-    udp.readiness.fire_send(SendWireSet::SPACE);
+    udp.readiness
+        .fire_send_with_post(SendWireSet::SPACE, |mailbox, event| mailbox.post(event));
 
     assert_eq!(
         step_send_kernel_bytes(&udp, &[1, 2, 3, 4], SendRecvFlags::empty(), &guard),

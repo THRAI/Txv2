@@ -163,7 +163,7 @@ fn net_delegate_poll_drains_mock_device_rx_to_socket() {
         tx_sink: None,
     };
     let guard = tx_substrate::epoch::guard();
-    crate::net::delegate::net_delegate_kick_poll();
+    crate::net::delegate::net_delegate_kick_poll_with_post(|mailbox, event| mailbox.post(event));
     let outcome = net_delegate_step_once(&driver, &guard);
 
     assert!(outcome.poll_seen);
@@ -260,6 +260,76 @@ fn net_delegate_poll_transmits_socket_udp_to_mock_device() {
 }
 
 #[test]
+fn udp_device_tx_uses_injected_post_for_send_space() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    clear_delegate_queue();
+
+    let device = leak_mock_device();
+    let registration = leak_registration(device, 35);
+    let adapter = SmoltcpAdapter::new(SmoltcpAdapterConfig {
+        local_mac: device.mac_addr(),
+        local_ipv4: Ipv4Address::LOOPBACK,
+        mtu: device.mtu(),
+    });
+    let mut options = SocketOptionSet::default_udp();
+    options.socket.send_buf_size = 5;
+    let guard = tx_substrate::epoch::guard();
+    let client = registry::create_socket_for_test_or_bootstrap(SocketKind::Udp, options)
+        .expect("client socket");
+    assert_eq!(
+        step_bind(&client, inet(50_235), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        step_connect(&client, inet(40_235), &guard),
+        StepOutcome::Done(())
+    );
+    assert_eq!(
+        step_send_kernel_bytes(&client, b"hello", SendRecvFlags::empty(), &guard),
+        StepOutcome::Done(5)
+    );
+    let send_mailbox = alloc::sync::Arc::new(TaskMailbox::new());
+    let send_generation = send_mailbox.next_generation();
+    let _subscription = client.readiness.send_wq.subscribe(
+        SendWireSet::SPACE.bits(),
+        alloc::sync::Arc::downgrade(&send_mailbox),
+        send_generation,
+    );
+    let tx_sink = SmoltcpPacketTxSink {
+        adapter: &adapter,
+        device: registration,
+    };
+    let mut injected_posts = 0usize;
+
+    let StepOutcome::Done(tx) = step_process_device_tx_pending_in_namespace_at_with_post(
+        &tx_sink,
+        crate::net::initial_net_namespace_payload(),
+        smoltcp::time::Instant::ZERO,
+        DeviceTxBudget {
+            tcp_connecting: 0,
+            tcp_connected: 0,
+            udp_bound: 1,
+            raw_icmp: 0,
+        },
+        &guard,
+        |mailbox, event| {
+            injected_posts += 1;
+            mailbox.post(event)
+        },
+    ) else {
+        panic!("device tx step should complete");
+    };
+
+    assert_eq!(tx.udp_packets, 1);
+    assert_eq!(tx.wakes_fired, 1);
+    assert_eq!(injected_posts, 1);
+    assert!(client.readiness.send_wq.peek() & SendWireSet::SPACE.bits() != 0);
+}
+
+#[test]
 fn udp_device_tx_busy_keeps_datagram_for_retry() {
     init_zones();
     let _lock = crate::test_support::EPOCH_TEST_LOCK
@@ -302,7 +372,7 @@ fn udp_device_tx_busy_keeps_datagram_for_retry() {
     let guard = tx_substrate::epoch::guard();
 
     device.set_tx_ready(false);
-    crate::net::delegate::net_delegate_kick_poll();
+    crate::net::delegate::net_delegate_kick_poll_with_post(|mailbox, event| mailbox.post(event));
     let busy = net_delegate_step_once(&driver, &guard);
     assert!(busy.poll_seen);
     assert!(busy.device_tx.udp_busy >= 1);
@@ -318,7 +388,7 @@ fn udp_device_tx_busy_keeps_datagram_for_retry() {
     );
 
     device.set_tx_ready(true);
-    crate::net::delegate::net_delegate_kick_poll();
+    crate::net::delegate::net_delegate_kick_poll_with_post(|mailbox, event| mailbox.post(event));
     let retry = net_delegate_step_once(&driver, &guard);
     assert!(retry.poll_seen);
     assert!(retry.device_tx.udp_attempted >= 1);
@@ -396,7 +466,7 @@ fn udp_device_tx_failed_keeps_datagram_and_counts_error() {
     );
 
     device.set_fail_tx(false);
-    crate::net::delegate::net_delegate_kick_poll();
+    crate::net::delegate::net_delegate_kick_poll_with_post(|mailbox, event| mailbox.post(event));
     let retry = net_delegate_step_once(&driver, &guard);
     assert!(retry.device_tx.udp_packets >= 1);
     assert!(tx_frames_contain_udp(

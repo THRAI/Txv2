@@ -2,17 +2,144 @@
 #![cfg_attr(test, allow(unused_imports))]
 use super::*;
 
+use alloc::{
+    sync::{Arc, Weak as ArcWeak},
+    vec::Vec,
+};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
 use crate::linux_syscall::{
     CLOCK_MONOTONIC, CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME, CLOCK_THREAD_CPUTIME_ID,
-    NR_CLOCK_GETTIME, NR_CLOCK_NANOSLEEP, NR_CLOCK_SETTIME, NR_GETITIMER, NR_GETTIMEOFDAY,
-    NR_NANOSLEEP, NR_SETITIMER, NR_SETTIMEOFDAY, NR_TIMES, TIMER_ABSTIME, TIMES_NS_PER_TICK,
+    NR_CLOCK_GETTIME, NR_CLOCK_NANOSLEEP, NR_CLOCK_SETTIME, NR_GETITIMER, NR_GETPID,
+    NR_GETTIMEOFDAY, NR_NANOSLEEP, NR_SETITIMER, NR_SETTIMEOFDAY, NR_TIMES, TIMER_ABSTIME,
+    TIMES_NS_PER_TICK,
 };
+use tx_services::time::{
+    DeadlineDomain, DeadlineNs, DeadlineRegistrarHandle, TimeError, TimerRole, TimerTarget,
+    TimerToken,
+};
+use tx_substrate::wake::{MailboxEvent, TaskMailbox};
 use tx_subsystems::cred::{step_setresuid, Uid};
+use tx_subsystems::signal::{SigDisposition, Signum};
 
 const E_INVAL: i32 = 22;
 const E_FAULT: i32 = 14;
 const E_PERM: i32 = 1;
 const OSCOMP_IMAGE_TIMESTAMP_FLOOR_SEC: i64 = 1_779_473_960;
+static ITIMER_SIGNAL_POST_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn counting_itimer_post(mailbox: ArcWeak<TaskMailbox>, event: MailboxEvent) {
+    ITIMER_SIGNAL_POST_COUNT.fetch_add(1, Ordering::SeqCst);
+    if let Some(mailbox) = mailbox.upgrade() {
+        let _ = mailbox.post(event);
+    }
+}
+
+struct RecordedDeadline {
+    token: TimerToken,
+    deadline: DeadlineNs,
+    role: TimerRole,
+    target: TimerTarget,
+}
+
+#[derive(Default)]
+struct DeadlineDomainTestDouble {
+    next_token: AtomicU64,
+    deadlines: std::sync::Mutex<Vec<RecordedDeadline>>,
+}
+
+impl DeadlineDomainTestDouble {
+    fn next_deadline(&self) -> Option<u64> {
+        self.deadlines
+            .lock()
+            .expect("deadline domain lock")
+            .iter()
+            .map(|deadline| deadline.deadline.raw())
+            .min()
+    }
+
+    fn fire_due(&self, now_ns: u64) -> usize {
+        let due = {
+            let mut deadlines = self.deadlines.lock().expect("deadline domain lock");
+            let mut due = Vec::new();
+            let mut index = 0;
+            while index < deadlines.len() {
+                if deadlines[index].deadline.raw() <= now_ns {
+                    due.push(deadlines.swap_remove(index));
+                } else {
+                    index += 1;
+                }
+            }
+            due
+        };
+
+        for deadline in &due {
+            match &deadline.target {
+                TimerTarget::TaskMailbox(mailbox) => {
+                    if let Some(mailbox) = mailbox.upgrade() {
+                        let _ = mailbox.post(MailboxEvent::TimerFired {
+                            token: deadline.token,
+                        });
+                    }
+                }
+                TimerTarget::SignalTarget { mailbox } => {
+                    if let Some(mailbox) = mailbox.upgrade() {
+                        let _ = mailbox.post(MailboxEvent::SignalTimerFired {
+                            token: deadline.token,
+                        });
+                    }
+                }
+                _ => panic!("time syscall tests only fire mailbox-backed deadlines"),
+            }
+        }
+        due.len()
+    }
+}
+
+impl DeadlineDomain for DeadlineDomainTestDouble {
+    fn register_deadline(
+        &self,
+        deadline: DeadlineNs,
+        role: TimerRole,
+        target: TimerTarget,
+    ) -> Result<TimerToken, TimeError> {
+        let token = TimerToken::new(self.next_token.fetch_add(1, Ordering::AcqRel) + 1);
+        self.deadlines
+            .lock()
+            .expect("deadline domain lock")
+            .push(RecordedDeadline {
+                token,
+                deadline,
+                role,
+                target,
+            });
+        Ok(token)
+    }
+
+    fn cancel_deadline(&self, token: TimerToken) -> bool {
+        let mut deadlines = self.deadlines.lock().expect("deadline domain lock");
+        let Some(index) = deadlines
+            .iter()
+            .position(|deadline| deadline.token == token)
+        else {
+            return false;
+        };
+        deadlines.swap_remove(index);
+        true
+    }
+
+    fn rearm_deadline(&self, token: TimerToken, deadline: DeadlineNs) -> bool {
+        let mut deadlines = self.deadlines.lock().expect("deadline domain lock");
+        let Some(existing) = deadlines
+            .iter_mut()
+            .find(|existing| existing.token == token)
+        else {
+            return false;
+        };
+        existing.deadline = deadline;
+        true
+    }
+}
 
 /// Mirror of `TimespecLayout` for test-side decoding. The
 /// production layout is private to `mod.rs`, so the tests
@@ -206,6 +333,356 @@ fn dispatch_setitimer_and_getitimer_round_trip_real_timer() {
 }
 
 #[test]
+fn dispatch_setitimer_registers_deadline_with_syscall_timer_registrar() {
+    const ITIMER_REAL: u64 = 0;
+
+    let (_setup, proc_cap, thread) = time_setup();
+    let domain = Arc::new(DeadlineDomainTestDouble::default());
+    let ctx = make_ctx(proc_cap, thread)
+        .with_mailbox(Arc::new(TaskMailbox::new()))
+        .with_timer_registrar(DeadlineRegistrarHandle::from_domain(domain.clone()));
+    let new_timer = TestItimerval {
+        it_interval: TestTimeval::default(),
+        it_value: TestTimeval {
+            tv_sec: 1,
+            tv_usec: 0,
+        },
+    };
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_SETITIMER,
+            [
+                ITIMER_REAL,
+                &new_timer as *const TestItimerval as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+
+    assert_eq!(result, SyscallResult::Return(0));
+    assert!(
+        domain.next_deadline().is_some(),
+        "setitimer should register its producer deadline in the unified timer registry"
+    );
+}
+
+#[test]
+fn dispatch_itimer_real_boundary_uses_syscall_ctx_mailbox_post() {
+    const ITIMER_REAL: u64 = 0;
+
+    let (_setup, proc_cap, thread) = time_setup();
+    let mailbox = Arc::new(TaskMailbox::new());
+    thread
+        .payload_cap()
+        .expect("thread payload alive")
+        .bind_mailbox(Arc::downgrade(&mailbox));
+    let _ = tx_subsystems::signal::step_sigaction(
+        &proc_cap,
+        Signum::new(14).expect("SIGALRM"),
+        SigDisposition::Handler(0xCAFE),
+    );
+    ITIMER_SIGNAL_POST_COUNT.store(0, Ordering::SeqCst);
+    let ctx = make_ctx(proc_cap, thread).with_mailbox_post(counting_itimer_post);
+    let new_timer = TestItimerval {
+        it_interval: TestTimeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+        it_value: TestTimeval {
+            tv_sec: 0,
+            tv_usec: 1,
+        },
+    };
+
+    let set = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_SETITIMER,
+            [
+                ITIMER_REAL,
+                &new_timer as *const TestItimerval as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(set, SyscallResult::Return(0));
+    for _ in 0..1_100 {
+        let _ = <ShimsTestPmap as tx_hal::MonotonicCounterIf>::read_ns();
+    }
+
+    let boundary = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_GETPID, [0; 6]),
+        &ctx,
+    ));
+
+    assert_eq!(boundary, SyscallResult::Return(ctx.process.pid.0 as i64));
+    assert_eq!(
+        ITIMER_SIGNAL_POST_COUNT.load(Ordering::SeqCst),
+        1,
+        "ITIMER_REAL boundary delivery should use SyscallCtx mailbox post"
+    );
+}
+
+#[test]
+fn dispatch_itimer_real_periodic_boundary_rearms_registry_deadline() {
+    const ITIMER_REAL: u64 = 0;
+
+    let (_setup, proc_cap, thread) = time_setup();
+    let mailbox = Arc::new(TaskMailbox::new());
+    let domain = Arc::new(DeadlineDomainTestDouble::default());
+    thread
+        .payload_cap()
+        .expect("thread payload alive")
+        .bind_mailbox(Arc::downgrade(&mailbox));
+    let _ = tx_subsystems::signal::step_sigaction(
+        &proc_cap,
+        Signum::new(14).expect("SIGALRM"),
+        SigDisposition::Handler(0xCAFE),
+    );
+    ITIMER_SIGNAL_POST_COUNT.store(0, Ordering::SeqCst);
+    let ctx = make_ctx(proc_cap, thread)
+        .with_mailbox(mailbox)
+        .with_mailbox_post(counting_itimer_post)
+        .with_timer_registrar(DeadlineRegistrarHandle::from_domain(domain.clone()));
+    let new_timer = TestItimerval {
+        it_interval: TestTimeval {
+            tv_sec: 0,
+            tv_usec: 2,
+        },
+        it_value: TestTimeval {
+            tv_sec: 0,
+            tv_usec: 1,
+        },
+    };
+
+    let set = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_SETITIMER,
+            [
+                ITIMER_REAL,
+                &new_timer as *const TestItimerval as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(set, SyscallResult::Return(0));
+    let first_deadline = domain
+        .next_deadline()
+        .expect("periodic ITIMER_REAL should register first deadline");
+
+    super::SHIMS_TEST_NS_COUNTER.store(first_deadline + 1, core::sync::atomic::Ordering::Release);
+    assert_eq!(domain.fire_due(first_deadline + 1), 1);
+    assert_eq!(
+        domain.next_deadline(),
+        None,
+        "manual fire removes the old ITIMER_REAL registry entry before syscall-boundary rearm"
+    );
+
+    let boundary = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(NR_GETPID, [0; 6]),
+        &ctx,
+    ));
+
+    assert_eq!(boundary, SyscallResult::Return(ctx.process.pid.0 as i64));
+    assert_eq!(
+        ITIMER_SIGNAL_POST_COUNT.load(Ordering::SeqCst),
+        1,
+        "ITIMER_REAL boundary delivery should still deliver SIGALRM"
+    );
+    assert!(
+        domain.next_deadline().is_some(),
+        "periodic ITIMER_REAL boundary rearm should register the next deadline in the unified timer registry"
+    );
+}
+
+#[test]
+fn dispatch_itimer_real_poll_due_periodic_rearms_registry_deadline() {
+    const ITIMER_REAL: u64 = 0;
+
+    let (_setup, proc_cap, thread) = time_setup();
+    let mailbox = Arc::new(TaskMailbox::new());
+    let domain = Arc::new(DeadlineDomainTestDouble::default());
+    thread
+        .payload_cap()
+        .expect("thread payload alive")
+        .bind_mailbox(Arc::downgrade(&mailbox));
+    let _ = tx_subsystems::signal::step_sigaction(
+        &proc_cap,
+        Signum::new(14).expect("SIGALRM"),
+        SigDisposition::Handler(0xCAFE),
+    );
+    ITIMER_SIGNAL_POST_COUNT.store(0, Ordering::SeqCst);
+    let ctx = make_ctx(proc_cap.clone(), thread)
+        .with_mailbox(mailbox)
+        .with_mailbox_post(counting_itimer_post)
+        .with_timer_registrar(DeadlineRegistrarHandle::from_domain(domain.clone()));
+    let new_timer = TestItimerval {
+        it_interval: TestTimeval {
+            tv_sec: 0,
+            tv_usec: 2,
+        },
+        it_value: TestTimeval {
+            tv_sec: 0,
+            tv_usec: 1,
+        },
+    };
+
+    let set = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_SETITIMER,
+            [
+                ITIMER_REAL,
+                &new_timer as *const TestItimerval as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(set, SyscallResult::Return(0));
+    let first_deadline = domain
+        .next_deadline()
+        .expect("periodic ITIMER_REAL should register first deadline");
+
+    super::SHIMS_TEST_NS_COUNTER.store(first_deadline + 1, core::sync::atomic::Ordering::Release);
+    assert_eq!(domain.fire_due(first_deadline + 1), 1);
+    assert_eq!(
+        domain.next_deadline(),
+        None,
+        "manual fire removes the old ITIMER_REAL registry entry before poll_due rearm"
+    );
+
+    let registrar = ctx.timer_registrar.as_ref().unwrap().clone();
+    let timer_mailbox = ctx
+        .mailbox
+        .as_ref()
+        .map(Arc::downgrade)
+        .expect("test context should carry a timer mailbox");
+    let next_deadline = crate::linux_syscall::poll_due_itimers_with_post::<ShimsTestPmap, _>(
+        &proc_cap,
+        Some(&registrar),
+        Some(timer_mailbox),
+        |mailbox, event| {
+            counting_itimer_post(mailbox, event);
+        },
+    );
+
+    assert!(next_deadline.is_some());
+    assert_eq!(
+        ITIMER_SIGNAL_POST_COUNT.load(Ordering::SeqCst),
+        1,
+        "ITIMER_REAL poll_due delivery should still deliver SIGALRM"
+    );
+    assert!(
+        domain.next_deadline().is_some(),
+        "periodic ITIMER_REAL poll_due rearm should register the next deadline in the unified timer registry"
+    );
+}
+
+#[test]
+fn dispatch_itimer_real_signal_timer_hint_waits_for_due_scan() {
+    const ITIMER_REAL: u64 = 0;
+
+    let (_setup, proc_cap, thread) = time_setup();
+    let mailbox = Arc::new(TaskMailbox::new());
+    let domain = Arc::new(DeadlineDomainTestDouble::default());
+    thread
+        .payload_cap()
+        .expect("thread payload alive")
+        .bind_mailbox(Arc::downgrade(&mailbox));
+    let _ = tx_subsystems::signal::step_sigaction(
+        &proc_cap,
+        Signum::new(14).expect("SIGALRM"),
+        SigDisposition::Handler(0xCAFE),
+    );
+    ITIMER_SIGNAL_POST_COUNT.store(0, Ordering::SeqCst);
+    let ctx = make_ctx(proc_cap.clone(), thread)
+        .with_mailbox(Arc::clone(&mailbox))
+        .with_mailbox_post(counting_itimer_post)
+        .with_timer_registrar(DeadlineRegistrarHandle::from_domain(domain.clone()));
+    let new_timer = TestItimerval {
+        it_interval: TestTimeval {
+            tv_sec: 0,
+            tv_usec: 2,
+        },
+        it_value: TestTimeval {
+            tv_sec: 0,
+            tv_usec: 1,
+        },
+    };
+
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(
+            SyscallRequest::new(
+                NR_SETITIMER,
+                [
+                    ITIMER_REAL,
+                    &new_timer as *const TestItimerval as u64,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            &ctx,
+        )),
+        SyscallResult::Return(0)
+    );
+    let first_deadline = domain
+        .next_deadline()
+        .expect("ITIMER_REAL should register first signal timer deadline");
+
+    super::SHIMS_TEST_NS_COUNTER.store(first_deadline + 1, core::sync::atomic::Ordering::Release);
+    assert_eq!(domain.fire_due(first_deadline + 1), 1);
+    assert_eq!(
+        ITIMER_SIGNAL_POST_COUNT.load(Ordering::SeqCst),
+        0,
+        "SignalTimerFired is only a wake hint; it must not deliver SIGALRM before due scan"
+    );
+    assert_eq!(
+        mailbox.len(),
+        1,
+        "timer registry fire should enqueue a SignalTimerFired hint",
+    );
+
+    let registrar = ctx.timer_registrar.as_ref().unwrap().clone();
+    let timer_mailbox = ctx
+        .mailbox
+        .as_ref()
+        .map(Arc::downgrade)
+        .expect("test context should carry a timer mailbox");
+    let next_deadline = crate::linux_syscall::poll_due_itimers_with_post::<ShimsTestPmap, _>(
+        &proc_cap,
+        Some(&registrar),
+        Some(timer_mailbox),
+        |mailbox, event| {
+            counting_itimer_post(mailbox, event);
+        },
+    );
+
+    assert!(next_deadline.is_some());
+    assert_eq!(
+        ITIMER_SIGNAL_POST_COUNT.load(Ordering::SeqCst),
+        1,
+        "due scan should deliver SIGALRM through the normal signal post path"
+    );
+}
+
+#[test]
 fn dispatch_gettimeofday_realtime_is_not_before_oscomp_image_timestamps() {
     let (_setup, proc_cap, thread) = time_setup();
     let ctx = make_ctx(proc_cap, thread);
@@ -281,6 +758,14 @@ fn dispatch_clock_settime_updates_realtime_without_moving_monotonic() {
         &ctx,
     ));
     assert_eq!(result, SyscallResult::Return(0));
+    let expected_rt_ns = (new_rt.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(new_rt.tv_nsec as u64);
+    assert_eq!(
+        SHIMS_TEST_RTC_SET_NS.load(core::sync::atomic::Ordering::Acquire),
+        expected_rt_ns,
+        "clock_settime should attempt best-effort persistent writeback"
+    );
 
     let mut rt = TestTimespec::default();
     let result = block_on(dispatch::<ShimsTestPmap>(
@@ -345,6 +830,14 @@ fn dispatch_settimeofday_updates_gettimeofday_realtime() {
         &ctx,
     ));
     assert_eq!(result, SyscallResult::Return(0));
+    let expected_rt_ns = (tv.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add((tv.tv_usec as u64).saturating_mul(1_000));
+    assert_eq!(
+        SHIMS_TEST_RTC_SET_NS.load(core::sync::atomic::Ordering::Acquire),
+        expected_rt_ns,
+        "settimeofday should attempt best-effort persistent writeback"
+    );
 
     let mut out = TestTimeval::default();
     let result = block_on(dispatch::<ShimsTestPmap>(
@@ -357,6 +850,61 @@ fn dispatch_settimeofday_updates_gettimeofday_realtime() {
     assert_eq!(result, SyscallResult::Return(0));
     assert_eq!(out.tv_sec, tv.tv_sec);
     assert!(out.tv_usec >= tv.tv_usec);
+}
+
+#[test]
+fn dispatch_clock_settime_ignores_persistent_writeback_failure_after_timekeeper_update() {
+    let (_setup, proc_cap, thread) = time_setup();
+    let ctx = make_ctx(proc_cap, thread);
+    SHIMS_TEST_RTC_SET_FAIL.store(true, core::sync::atomic::Ordering::Release);
+    let new_rt = TestTimespec {
+        tv_sec: 1_800_000_020,
+        tv_nsec: 222_333_444,
+    };
+
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_CLOCK_SETTIME,
+            [
+                CLOCK_REALTIME as u64,
+                &new_rt as *const TestTimespec as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(
+        result,
+        SyscallResult::Return(0),
+        "best-effort RTC writeback failure must not fail accepted system time mutation"
+    );
+    assert_eq!(
+        SHIMS_TEST_RTC_SET_NS.load(core::sync::atomic::Ordering::Acquire),
+        0,
+        "failing fake persistent clock must not record a successful RTC write"
+    );
+
+    let mut rt = TestTimespec::default();
+    let result = block_on(dispatch::<ShimsTestPmap>(
+        SyscallRequest::new(
+            NR_CLOCK_GETTIME,
+            [
+                CLOCK_REALTIME as u64,
+                &mut rt as *mut TestTimespec as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+        ),
+        &ctx,
+    ));
+    assert_eq!(result, SyscallResult::Return(0));
+    assert_eq!(rt.tv_sec, new_rt.tv_sec);
+    assert!(rt.tv_nsec >= new_rt.tv_nsec);
 }
 
 #[test]
@@ -502,6 +1050,50 @@ fn dispatch_nanosleep_nonzero_duration_returns_zero_without_reactor() {
     let req = SyscallRequest::new(NR_NANOSLEEP, [req_uaddr, 0, 0, 0, 0, 0]);
     let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
     assert_eq!(result, SyscallResult::Return(0));
+}
+
+#[test]
+fn dispatch_nanosleep_positive_duration_uses_unified_timer_registry() {
+    let (_setup, proc_cap, thread) = time_setup();
+    let mailbox = Arc::new(TaskMailbox::new());
+    let domain = Arc::new(DeadlineDomainTestDouble::default());
+    let ctx = make_ctx(proc_cap, thread)
+        .with_mailbox(Arc::clone(&mailbox))
+        .with_timer_registrar(DeadlineRegistrarHandle::from_domain(domain.clone()));
+    let req_ts = TestTimespec {
+        tv_sec: 0,
+        tv_nsec: 1_000_000,
+    };
+    let req_uaddr = &req_ts as *const TestTimespec as u64;
+    let req = SyscallRequest::new(NR_NANOSLEEP, [req_uaddr, 0, 0, 0, 0, 0]);
+    let waker = Waker::noop().clone();
+    let mut cx = Context::from_waker(&waker);
+    let fut = dispatch::<ShimsTestPmap>(req, &ctx);
+    let mut pinned = Box::pin(fut);
+
+    let mut deadline = None;
+    for _ in 0..4 {
+        let poll = pinned.as_mut().poll(&mut cx);
+        assert!(
+            matches!(poll, Poll::Pending),
+            "positive nanosleep should park on the unified timer before expiry; got {poll:?}"
+        );
+        deadline = domain.next_deadline();
+        if deadline.is_some() {
+            break;
+        }
+    }
+    let deadline = deadline.expect("positive nanosleep should register a PrimarySleep timer");
+
+    assert_eq!(domain.fire_due(deadline), 1);
+
+    for _ in 0..16 {
+        if let Poll::Ready(result) = pinned.as_mut().poll(&mut cx) {
+            assert_eq!(result, SyscallResult::Return(0));
+            return;
+        }
+    }
+    panic!("nanosleep did not resolve after unified timer expiry");
 }
 
 /// `nanosleep((-1, 0), _)` returns `-EINVAL` — negative tv_sec is

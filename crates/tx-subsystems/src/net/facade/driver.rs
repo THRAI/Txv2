@@ -1,7 +1,7 @@
 use crate::execution::{Errno, Guard, StepOutcome};
 use crate::net::facade::{socket_connect_facade, SocketConnectCapability};
+use crate::net::notification::registered_wait_for_yield;
 use tx_reactor::wait::WaitProtocol;
-use tx_substrate::step::YieldShape;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SocketFacadeDriveMode {
@@ -37,21 +37,10 @@ pub async fn drive_socket_connect_waiting(
             StepOutcome::Err(errno) => return StepOutcome::Err(errno),
             StepOutcome::Continue { .. } => {}
             StepOutcome::Yield { shape, .. } => {
-                if let Some(future) = wait_on_yield_shape(shape) {
+                if let Some(future) = registered_wait_for_yield(shape) {
                     let _ = future.await;
                 }
             }
         }
-    }
-}
-
-fn wait_on_yield_shape(shape: YieldShape) -> Option<crate::wait_source::RegisteredWaitFuture> {
-    match shape {
-        YieldShape::OnWaitSource { source, interests }
-        | YieldShape::OnEdge { source, interests } => {
-            let token = crate::execution::WaitToken::new(source.raw(), interests.raw());
-            crate::wait_source::wait_on_token(token)
-        }
-        YieldShape::OnAgent { .. } | YieldShape::OnTimer { .. } => None,
     }
 }

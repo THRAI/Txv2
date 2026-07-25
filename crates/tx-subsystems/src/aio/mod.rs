@@ -31,9 +31,10 @@
 //! 8. A per-context iocb-dispatch counter ([`AioContext::dispatched`])
 //!    — incremented for every iocb the worker body consumes; phase 3+
 //!    couples the increment to a real completion-event push.
-//! 9. The worker spawn helper [`spawn_worker_for_context`] which
-//!    constructs the worker future (the borrow's body wrapped in
-//!    `with_on_behalf_of`).
+//! 9. The worker spawn helper
+//!    [`spawn_worker_for_context_with_completion_post`] which constructs
+//!    the worker future (the borrow's body wrapped in
+//!    `with_on_behalf_of`) and receives an explicit completion-post seam.
 //!
 //! # Phase 3+4+5 additions (this revision)
 //!
@@ -47,15 +48,16 @@
 //!     push fires so `sys_io_getevents` blocked on `min_nr` can wake
 //!     and re-check the queue.
 //! 13. An [`IocbDispatcher`] callback parameter on
-//!     [`spawn_worker_for_context`] — the syscall arm injects a
+//!     [`spawn_worker_for_context_with_completion_post`] — the syscall arm injects a
 //!     concrete closure that resolves `aio_fildes` against P's fd
 //!     table and copies bytes through P's address space. The body's
 //!     dispatch step is generic over `I` but the closure is concrete
 //!     over `ProcessIdentity`, so the AIO subsystem stays generic
 //!     while the dispatch path resolves through the principal's
 //!     real fd table / aspace.
-//! 14. [`AioContext::push_completion`] / [`AioContext::pop_completion`]
-//!     for the worker-side push and the `sys_io_getevents` drain.
+//! 14. [`AioContext::push_completion_with_post`] /
+//!     [`AioContext::pop_completion`] for the worker-side push and the
+//!     `sys_io_getevents` drain.
 //!
 //! # Linux-divergence note
 //!
@@ -105,6 +107,7 @@ use adapter::step_engine::{
     sign, with_on_behalf_of, AbortSignal, CancelReason, Cap, OnBehalfOfAbort, ScriptCtx, SpinMutex,
     SubjectContext, SubjectIdentity, WaitSource, Zone, ZoneAllocated, ZoneError,
 };
+use adapter::wait_routing::{MailboxEvent, TaskMailbox};
 
 // === iocb opcodes ====================================================
 //
@@ -345,7 +348,7 @@ pub struct AioContext {
     /// shared regions matures; the kernel-side queue is the smallest
     /// viable shape that preserves the io_getevents semantics.
     completion_queue: SpinMutex<VecDeque<IoEvent>>,
-    /// Wait source notified on every `push_completion`. Blocked
+    /// Wait source notified on every `push_completion_with_post`. Blocked
     /// `sys_io_getevents` waiters park on this carrier; the push wakes
     /// them so they can re-check the queue.
     events_available: Arc<WaitSource>,
@@ -378,18 +381,24 @@ impl AioContext {
     /// W-Q's phase 0 template.
     pub fn with_nr_events(nr_events: u32) -> Self {
         let wait_points = notification::new_wait_points();
+        let iocb_arrived_id =
+            tx_substrate::wake::WaitEndpoint::source_id(wait_points.iocb_arrived_endpoint()).raw();
+        let events_available_id =
+            tx_substrate::wake::WaitEndpoint::source_id(wait_points.events_available_endpoint())
+                .raw();
+        let (_, iocb_arrived, _, events_available) = wait_points.into_parts();
         Self {
             context_id: allocate_context_id(),
             nr_events,
             _pad: 0,
             submit_queue: SpinMutex::new(VecDeque::new()),
-            iocb_arrived: wait_points.iocb_arrived,
-            iocb_arrived_id: wait_points.iocb_arrived_id,
+            iocb_arrived,
+            iocb_arrived_id,
             worker_abort: Arc::new(AbortSignal::new()),
             dispatched: AtomicU64::new(0),
             completion_queue: SpinMutex::new(VecDeque::new()),
-            events_available: wait_points.events_available,
-            events_available_id: wait_points.events_available_id,
+            events_available,
+            events_available_id,
         }
     }
 
@@ -442,8 +451,13 @@ impl AioContext {
     /// (`reader_wait_source` / `writer_wait_source`). Future-PR-3D
     /// callers register against this source via
     /// `WaitSource::prepare(...).install_if(...)`.
-    pub fn iocb_arrived_source(&self) -> &Arc<WaitSource> {
+    fn iocb_arrived_source(&self) -> &Arc<WaitSource> {
         &self.iocb_arrived
+    }
+
+    /// Iocb-arrival endpoint exposed to wait drivers.
+    pub fn iocb_arrived_endpoint(&self) -> &Arc<WaitSource> {
+        self.iocb_arrived_source()
     }
 
     /// Number of iocbs the worker body has dequeued + "dispatched"
@@ -513,22 +527,30 @@ impl AioContext {
     /// Wait-source id paired with [`Self::events_available`]. Stable
     /// for the lifetime of the cap. `sys_io_getevents` parks on this
     /// when `min_nr` is not yet satisfied; the worker's
-    /// `push_completion` notify wakes the parked syscall.
+    /// `push_completion_with_post` notify wakes the parked syscall.
     pub const fn events_available_id(&self) -> u64 {
         self.events_available_id
     }
 
     /// Borrow the events-available wait source.
-    pub fn events_available_source(&self) -> &Arc<WaitSource> {
+    fn events_available_source(&self) -> &Arc<WaitSource> {
         &self.events_available
+    }
+
+    /// Completion-availability endpoint exposed to wait drivers.
+    pub fn events_available_endpoint(&self) -> &Arc<WaitSource> {
+        self.events_available_source()
     }
 
     /// Push a completion onto the per-context queue and notify any
     /// `sys_io_getevents` parked on `events_available`. Called by the
     /// worker body after each iocb dispatch.
-    pub fn push_completion(&self, event: IoEvent) {
+    pub fn push_completion_with_post<F>(&self, event: IoEvent, post: F)
+    where
+        F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+    {
         self.completion_queue.lock().push_back(event);
-        notification::notify_events_available(&self.events_available);
+        notification::notify_events_available_with_post(&self.events_available, post);
     }
 
     /// Pop one completion event off the queue, if any. Used by
@@ -602,7 +624,7 @@ pub(crate) fn register_zones() -> Result<(), ZoneError> {
 /// and closes over the concrete principal `Cap<ProcessIdentity>` /
 /// `Cap<AddressSpace>` needed to resolve `aio_fildes` against P's fd
 /// table and copy bytes through P's address space. Keeping the
-/// callback boxed lets `spawn_worker_for_context` stay generic over
+/// callback boxed lets `spawn_worker_for_context_with_completion_post` stay generic over
 /// `I: SubjectIdentity` (matching the `with_on_behalf_of` framework
 /// surface) while the dispatch site is concrete.
 ///
@@ -611,6 +633,8 @@ pub(crate) fn register_zones() -> Result<(), ZoneError> {
 /// `Send + Sync + 'static` so the future containing the callback is
 /// itself `Send + 'static` (matching `AioWorkerFuture`'s bound).
 pub type IocbDispatcher = Arc<dyn Fn(&Iocb) -> IoEvent + Send + Sync + 'static>;
+pub type AioCompletionPost =
+    Arc<dyn Fn(&TaskMailbox, MailboxEvent) -> bool + Send + Sync + 'static>;
 
 /// Default dispatcher: every iocb completes with `-EINVAL` (i.e. the
 /// kernel rejects the op). Used by the framework / unit tests that
@@ -645,11 +669,12 @@ pub fn default_einval_dispatcher() -> IocbDispatcher {
 /// The dispatcher callback closes over the principal's concrete fd
 /// table + aspace so the worker can resolve `aio_fildes` and copy
 /// user bytes; see [`IocbDispatcher`].
-pub fn spawn_worker_for_context<I>(
+pub fn spawn_worker_for_context_with_completion_post<I>(
     aio_cap: Cap<AioContext>,
     owner_principal: Cap<I>,
     owner_subject: SubjectContext<I>,
     dispatcher: IocbDispatcher,
+    completion_post: AioCompletionPost,
 ) -> AioWorkerFuture
 where
     I: SubjectIdentity + Send + Sync,
@@ -666,6 +691,7 @@ where
     let helper = async move {
         let aio_cap_inner = aio_cap_for_body;
         let dispatcher_inner = dispatcher;
+        let completion_post_inner = completion_post;
         let helper_result = with_on_behalf_of(
             owner_principal,
             &owner_subject,
@@ -678,7 +704,9 @@ where
                 loop {
                     if let Some(iocb) = aio_cap_inner.pop_iocb() {
                         let event = dispatcher_inner(&iocb);
-                        aio_cap_inner.push_completion(event);
+                        aio_cap_inner.push_completion_with_post(event, |mailbox, event| {
+                            completion_post_inner(mailbox, event)
+                        });
                         aio_cap_inner.dispatched.fetch_add(1, Ordering::AcqRel);
                         continue;
                     }
@@ -706,13 +734,13 @@ where
     }
 }
 
-/// Erased worker future returned by [`spawn_worker_for_context`]. The
-/// concrete shape is `with_on_behalf_of(...) -> impl Future<Output=...>`
-/// wrapped in a [`WorkerOuter`] race against the context's
-/// `worker_abort` signal — phase 2 returns a hand-rolled future so the
-/// syscall arm / test harness can spawn / poll it. Production code
-/// (phase 3+) will submit this future to the reactor via the
-/// boot-reactor seam.
+/// Erased worker future returned by
+/// [`spawn_worker_for_context_with_completion_post`]. The concrete shape is
+/// `with_on_behalf_of(...) -> impl Future<Output=...>` wrapped in a
+/// [`WorkerOuter`] race against the context's `worker_abort` signal — phase 2
+/// returns a hand-rolled future so the syscall arm / test harness can spawn /
+/// poll it. Production code (phase 3+) will submit this future to the reactor
+/// via the boot-reactor seam.
 pub struct AioWorkerFuture {
     /// Inner state machine.
     inner: AioWorkerState,
@@ -918,8 +946,12 @@ mod tests {
     fn push_completion_then_pop_returns_fifo() {
         let _g = setup();
         let ctx = AioContext::new_cap().expect("cap");
-        ctx.push_completion(IoEvent::new(0xAAA, 0, 4, 0));
-        ctx.push_completion(IoEvent::new(0xBBB, 0, 8, 0));
+        ctx.push_completion_with_post(IoEvent::new(0xAAA, 0, 4, 0), |mailbox, event| {
+            mailbox.post(event)
+        });
+        ctx.push_completion_with_post(IoEvent::new(0xBBB, 0, 8, 0), |mailbox, event| {
+            mailbox.post(event)
+        });
         assert_eq!(ctx.completion_len(), 2);
         let a = ctx.pop_completion().expect("first");
         let b = ctx.pop_completion().expect("second");
@@ -929,11 +961,67 @@ mod tests {
     }
 
     #[test]
+    fn push_completion_with_post_uses_injected_mailbox_ref_post() {
+        let _g = setup();
+        let ctx = AioContext::new_cap().expect("cap");
+        let mailbox = Arc::new(TaskMailbox::new());
+        let generation = mailbox.next_generation();
+        let _sub = ctx
+            .events_available_endpoint()
+            .prepare(
+                Arc::downgrade(&mailbox),
+                generation,
+                crate::aio::adapter::step_engine::InterestMask::new(EVENTS_AVAILABLE_MASK),
+            )
+            .install();
+        let source = ctx.events_available_id();
+        let mut injected_posts = 0usize;
+
+        ctx.push_completion_with_post(IoEvent::new(0xCAFE, 0, 1, 0), |mailbox, event| {
+            injected_posts += 1;
+            mailbox.post(event)
+        });
+
+        assert_eq!(ctx.completion_len(), 1);
+        assert_eq!(injected_posts, 1);
+        match mailbox.poll().expect("completion source fired") {
+            MailboxEvent::SourceFired {
+                generation: seen_generation,
+                source: seen_source,
+                interests,
+            } => {
+                assert_eq!(seen_generation, generation);
+                assert_eq!(seen_source.raw(), source);
+                assert_eq!(interests.raw(), EVENTS_AVAILABLE_MASK);
+            }
+            other => panic!("expected completion SourceFired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wait_endpoints_match_context_wait_source_ids() {
+        let _g = setup();
+        let ctx = AioContext::new_cap().expect("cap");
+
+        assert_eq!(
+            tx_substrate::wake::WaitEndpoint::source_id(ctx.iocb_arrived_endpoint()).raw(),
+            ctx.iocb_arrived_id()
+        );
+        assert_eq!(
+            tx_substrate::wake::WaitEndpoint::source_id(ctx.events_available_endpoint()).raw(),
+            ctx.events_available_id()
+        );
+    }
+
+    #[test]
     fn drain_completions_caps_at_max() {
         let _g = setup();
         let ctx = AioContext::new_cap().expect("cap");
         for i in 0..5 {
-            ctx.push_completion(IoEvent::new(i as u64, 0, i as i64, 0));
+            ctx.push_completion_with_post(
+                IoEvent::new(i as u64, 0, i as i64, 0),
+                |mailbox, event| mailbox.post(event),
+            );
         }
         let first_two = ctx.drain_completions(2);
         assert_eq!(first_two.len(), 2);

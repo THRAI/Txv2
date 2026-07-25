@@ -215,6 +215,15 @@ impl RawIcmpSocket {
     }
 
     pub fn recv_len(&self, len: usize, peek: bool) -> Option<(usize, bool)> {
+        self.recv_len_with_ipv4_header(len, peek, true)
+    }
+
+    pub fn recv_len_with_ipv4_header(
+        &self,
+        len: usize,
+        peek: bool,
+        include_ipv4_header: bool,
+    ) -> Option<(usize, bool)> {
         if len == 0 {
             return Some((0, false));
         }
@@ -222,7 +231,12 @@ impl RawIcmpSocket {
         {
             let mut rx = self.rx_queue.lock();
             if let Some(packet) = rx.front() {
-                let bytes = core::cmp::min(icmpv4_echo_raw_packet_len(packet), len);
+                let packet_len = if include_ipv4_header {
+                    icmpv4_echo_raw_packet_len(packet)
+                } else {
+                    icmpv4_echo_message_len(packet)
+                };
+                let bytes = core::cmp::min(packet_len, len);
                 if !peek {
                     let _ = rx.pop_front();
                 }
@@ -246,6 +260,15 @@ impl RawIcmpSocket {
     }
 
     pub fn recv_bytes(&self, out: &mut [u8], peek: bool) -> Option<RawIcmpRecvDrain> {
+        self.recv_bytes_with_ipv4_header(out, peek, true)
+    }
+
+    pub fn recv_bytes_with_ipv4_header(
+        &self,
+        out: &mut [u8],
+        peek: bool,
+        include_ipv4_header: bool,
+    ) -> Option<RawIcmpRecvDrain> {
         if out.is_empty() {
             return Some(RawIcmpRecvDrain {
                 bytes: 0,
@@ -259,8 +282,11 @@ impl RawIcmpSocket {
         {
             let mut rx = self.rx_queue.lock();
             if let Some(packet) = rx.front() {
-                let raw_packet = build_icmpv4_echo_reply(packet);
-                let packet_bytes = raw_packet.as_bytes();
+                let packet_bytes = if include_ipv4_header {
+                    build_icmpv4_echo_reply(packet).as_bytes().to_vec()
+                } else {
+                    build_icmpv4_echo_reply_message(packet)
+                };
                 let bytes = core::cmp::min(packet_bytes.len(), out.len());
                 out[..bytes].copy_from_slice(&packet_bytes[..bytes]);
                 let source = packet.src;

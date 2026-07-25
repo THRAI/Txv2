@@ -80,6 +80,7 @@ pub const AF_INET6: u16 = 10;
 pub const AF_NETLINK: u16 = 16;
 pub const AF_PACKET: u16 = 17;
 pub const NETLINK_ROUTE: i32 = 0;
+pub const NETLINK_XFRM: i32 = 6;
 pub const NETLINK_NETFILTER: i32 = 12;
 pub const SOL_NETLINK: i32 = 270;
 pub const SOL_PACKET: i32 = 263;
@@ -176,7 +177,7 @@ pub const NR_EXIT: u64 = 93;
 /// `personality(persona)`. Linux RV64 generic ABI `__NR_personality = 92`.
 pub const NR_PERSONALITY: u64 = 92;
 /// `exit_group(status)`. Linux generic ABI `__NR_exit_group`. Routes
-/// through `step_exit_group` per `PROCESS_v1` §7.3.2.
+/// through the group-exit transition per `PROCESS_v1` §7.3.2.
 pub const NR_EXIT_GROUP: u64 = 94;
 /// `getpid()`. Linux generic ABI `__NR_getpid`.
 pub const NR_GETPID: u64 = 172;
@@ -235,12 +236,13 @@ pub const NR_INOTIFY_RM_WATCH: u64 = 28;
 /// `execve(path, argv, envp)`. Linux generic ABI `__NR_execve` = 221.
 ///
 /// Wave 4 (Phase 6 of the ELF-loader plan) wires the syscall arm to
-/// `tx_scripts::process::exec::exec_script`. On `Ok(())` the dispatch
-/// returns `SyscallResult::ExecCommitted` — the thread future MUST NOT
-/// drain `pending_syscall_return` for this iteration (the new image's
+/// `tx_scripts::process::exec::ExecScriptOp` and drives it through
+/// `drive_oneshot`. On `Ok(())` the dispatch returns
+/// `SyscallResult::ExecCommitted` — the thread future MUST NOT drain
+/// `pending_syscall_return` for this iteration (the new image's
 /// `_start` expects fresh GPRs; the previous trap frame's `a0` is
-/// discarded). On `Err(_)` the standard `ExecError → -errno` mapping
-/// applies (cite: `txdoc:EXEC-12-1-INSTALL-USER-TRAP-CONTEXT`).
+/// discarded). On `Err(_)` the standard step `Errno` mapping applies
+/// (cite: `txdoc:EXEC-12-1-INSTALL-USER-TRAP-CONTEXT`).
 pub const NR_EXECVE: u64 = 221;
 /// `getgroups(gidsetsize, grouplist)`. Linux RV64 generic ABI
 /// `__NR_getgroups = 158`. txKernel v1 does not model supplementary
@@ -308,6 +310,9 @@ pub const O_CREAT: u32 = 0o100;
 /// `-EEXIST` if the target file already exists. The combination is the
 /// canonical lock-file primitive.
 pub const O_EXCL: u32 = 0o200;
+/// `openat(2)` flag bit: do not acquire a controlling terminal when
+/// opening a terminal device.
+pub const O_NOCTTY: u32 = 0o400;
 /// `openat(2)` flag bit: truncate the file to size 0 on open. Wave 2
 /// supports it for tmpfs-backed regular files via the in-scope
 /// `FsPageBacking::truncate` hook; backends without truncate support
@@ -321,6 +326,9 @@ pub const O_APPEND: u32 = 0o2000;
 /// Linux returns `ENOTDIR` when the terminal component exists but is not
 /// a directory.
 pub const O_DIRECTORY: u32 = 0o200000;
+/// `openat(2)` flag bit: fail with `ELOOP` when the final path
+/// component is a symlink.
+pub const O_NOFOLLOW: u32 = 0o400000;
 /// Internal bit used by Linux to form `O_TMPFILE`. The public
 /// `O_TMPFILE` value intentionally includes `O_DIRECTORY`, so openat
 /// must recognize it before applying ordinary O_DIRECTORY handling.
@@ -389,8 +397,8 @@ pub const NR_CLOSE: u64 = 57;
 /// **SIGPIPE delivery.** Q2 DECIDED 2026-05-07: `OpenFile::step_write`
 /// returns `Err(EPIPE)` when all readers have closed. The
 /// `sys_write` arm intercepts `Errno::EPIPE` and dispatches SIGPIPE
-/// to the calling process via `signal::step_kill_process` before
-/// returning `-EPIPE` to userspace. The pipe module itself has no
+/// to the calling process via the process-directed kill helper before returning
+/// `-EPIPE` to userspace. The pipe module itself has no
 /// process Cap and so cannot deliver the signal.
 pub const NR_PIPE2: u64 = 59;
 /// `O_DIRECT` flag bit (`0o40000`). For `pipe2`, this means Linux
@@ -517,6 +525,8 @@ pub const NR_SET_TID_ADDRESS: u64 = 96;
 pub const NR_GETITIMER: u64 = 102;
 /// `setitimer(which, new_value, old_value)`. Linux RV64 generic ABI.
 pub const NR_SETITIMER: u64 = 103;
+/// `ITIMER_REAL` selector for getitimer/setitimer.
+pub const ITIMER_REAL: u32 = 0;
 
 /// `set_robust_list(head, len)`. Linux generic ABI
 /// `__NR_set_robust_list`. Wave 2 ships a stub-success arm that
@@ -565,9 +575,8 @@ pub const NR_SCHED_RR_GET_INTERVAL: u64 = 127;
 /// Wave 3 of the fork/clone/wait4 slice ships the blocking variant —
 /// when no zombie matches and `WNOHANG` is unset, the arm parks on the
 /// caller's per-process `exit_source` carrier (registered at payload
-/// sign time per Wave 1) via
-/// [`tx_subsystems::wait_source::wait_on_token`], waking when any
-/// child of this process zombifies. See
+/// sign time per Wave 1) via the registered wait-source resolver,
+/// waking when any child of this process zombifies. See
 /// `txdoc:PROCESS-WAIT-FAMILY-1`.
 pub const NR_WAIT4: u64 = 260;
 
@@ -646,7 +655,7 @@ pub const NR_GETEGID: u64 = 177;
 // Wave 4 Part 4 of the DAC + setuid slice — file-mode syscall arms
 // (`fchmod`, `fchmodat`, `fchmodat2`, `fchown`, `fchownat`,
 // `faccessat`, `faccessat2`). Each wraps the
-// `FsOps::step_chmod` / `step_chown` trait method Wave 3 Part 2 landed
+// `FsOps::chmod_inode` / `chown_inode` trait method Wave 3 Part 2 landed
 // (tmpfs has the real impl; devfs returns EROFS) plus a walker-side
 // `access(2)` predicate over the inode meta. Only the `AT_FDCWD`
 // dirfd shape is supported in this slice — real dirfd-relative
@@ -669,13 +678,13 @@ pub const NR_FACCESSAT: u64 = 48;
 /// authorization and FsOps mutation path as `fchmodat`.
 pub const NR_FCHMOD: u64 = 52;
 /// `fchmodat(dirfd, path, mode, flags)`. Linux RV64 generic ABI
-/// `__NR_fchmodat = 53`. Wraps `FsOps::step_chmod` (Wave 3 Part 2).
+/// `__NR_fchmodat = 53`. Wraps `FsOps::chmod_inode` (Wave 3 Part 2).
 /// `flags` (`AT_SYMLINK_NOFOLLOW`) is accepted but ignored — the slice
 /// doesn't follow symlinks at chmod time anyway. LTP cluster:
 /// `fchmodat01..02`.
 pub const NR_FCHMODAT: u64 = 53;
 /// `fchownat(dirfd, path, uid, gid, flags)`. Linux RV64 generic ABI
-/// `__NR_fchownat = 54`. Wraps `FsOps::step_chown` (Wave 3 Part 2).
+/// `__NR_fchownat = 54`. Wraps `FsOps::chown_inode` (Wave 3 Part 2).
 /// Each of `uid` / `gid` decodes the `(u32) -1 == u32::MAX` "leave
 /// unchanged" sentinel to `Option::None` (same convention as
 /// `setre{u,g}id` / `setres{u,g}id`). LTP cluster: `fchownat01..02`.
@@ -958,7 +967,7 @@ pub const FUTEX_CMD_MASK: u32 = !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
 //
 // Numbers verified against Linux's RV64 generic ABI
 // (`include/uapi/asm-generic/unistd.h`). All arms read the platform
-// monotonic clock via `<P as TimeIf>::read_ns()`. Day-1 clock-id
+// monotonic clock via `<P as MonotonicCounterIf>::read_ns()`. Day-1 clock-id
 // surface aliases all four POSIX clocks to the platform monotonic
 // (CLOCK_REALTIME has no boot-time RTC offset yet; CPU-time clocks
 // have no per-process accounting yet — both are TODOs documented at
@@ -1012,7 +1021,7 @@ pub const NR_SETTIMEOFDAY: u64 = 170;
 /// offset yet (`TODO(phase-rtc)`).
 pub const CLOCK_REALTIME: u32 = 0;
 /// `clock_gettime` clock id: `CLOCK_MONOTONIC = 1`. Maps directly to
-/// `<P as TimeIf>::read_ns()`.
+/// `<P as MonotonicCounterIf>::read_ns()`.
 pub const CLOCK_MONOTONIC: u32 = 1;
 /// `clock_gettime` clock id: `CLOCK_PROCESS_CPUTIME_ID = 2`. Day-1
 /// surface aliases this to the platform monotonic clock — no
@@ -1337,9 +1346,9 @@ pub const DT_SOCK: u8 = 12;
 // `docs/progress/plans/2026-05-07-shell-prompt-roadmap.md` Slice 7.
 // ---------------------------------------------------------------------
 
-/// `kill(pid, sig)`. Linux RV64 generic ABI `__NR_kill = 129`. Routes
-/// through `tx_subsystems::signal::step_kill_process` after resolving
-/// the target via the init-rooted process tree walk
+/// `kill(pid, sig)`. Linux RV64 generic ABI `__NR_kill = 129`. Routes through
+/// the signal process-directed kill helper after resolving the target via the
+/// init-rooted process tree walk
 /// (`process::execution::process_by_pid`).
 ///
 /// Slice 7 v1 surface: only `pid > 0` is supported. Negative / zero
@@ -2113,7 +2122,6 @@ pub const MEMBARRIER_SUPPORTED_MASK: u64 = MEMBARRIER_CMD_QUERY
 // syscall surface; SIOCGIF* live with the ioctl block above.
 // ---------------------------------------------------------------------------
 
-
 /// `IPPROTO_ICMPV6` — ICMPv6.
 pub const IPPROTO_ICMPV6: i32 = 58;
 
@@ -2151,8 +2159,6 @@ pub const IPV6_RECVTCLASS: i32 = 66;
 /// `IPV6_TCLASS` — ancillary/sticky traffic class.
 pub const IPV6_TCLASS: i32 = 67;
 
-
-
 // Socket-option *names* (the `optname` arg to set/getsockopt), grouped by level.
 // CRITICAL: these MUST be defined — the set/getsockopt dispatch matches on
 // `(level, OPTNAME)`; an undefined OPTNAME silently becomes an irrefutable
@@ -2173,7 +2179,6 @@ pub const IP_MULTICAST_LOOP: i32 = 34;
 pub const IP_ADD_MEMBERSHIP: i32 = 35;
 pub const IP_DROP_MEMBERSHIP: i32 = 36;
 pub const ICMP6_FILTER: i32 = 1;
-
 
 // IPPROTO_SCTP options.
 pub const SCTP_RTOINFO: i32 = 0;
@@ -2197,11 +2202,6 @@ pub const SCTP_GET_PEER_ADDRS: i32 = 108;
 pub const SCTP_GET_LOCAL_ADDRS: i32 = 109;
 pub const SCTP_SOCKOPT_CONNECTX: i32 = 110;
 pub const SCTP_SOCKOPT_CONNECTX3: i32 = 111;
-
-
-
-
-
 
 pub const IPV6_CHECKSUM: i32 = 7;
 pub const IPV6_UNICAST_HOPS: i32 = 16;

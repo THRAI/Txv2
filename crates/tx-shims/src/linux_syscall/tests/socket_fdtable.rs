@@ -37,6 +37,7 @@ use tx_subsystems::net::{
     VETH_DEFAULT_MTU,
 };
 use tx_subsystems::vfs::structure::{RNodeBacking, StructPayload};
+use tx_subsystems::vfs::FdReadyMask;
 
 const SOCK_STREAM: u64 = 1;
 const SOCK_DGRAM: u64 = 2;

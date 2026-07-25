@@ -10,14 +10,24 @@ use tx_subsystems::vfs::{
 };
 
 use crate::linux_syscall::{
-    NR_IOCTL, TCGETS, TCSETS, TIOCGPGRP, TIOCGWINSZ, TIOCNOTTY, TIOCSCTTY, TIOCSPGRP, TIOCSWINSZ,
+    NR_IOCTL, NR_PPOLL, TCGETS, TCSETS, TIOCGPGRP, TIOCGWINSZ, TIOCNOTTY, TIOCSCTTY, TIOCSPGRP,
+    TIOCSWINSZ,
+};
+use tx_services::time::{
+    DeadlineDomain, DeadlineNs, DeadlineRegistrarHandle, DeviceTimerCallback, TimeError,
+    TimerTarget, TimerToken,
 };
 
 const E_BADF: i32 = 9;
 const E_FAULT: i32 = 14;
 const E_INVAL: i32 = 22;
 const E_NOTTY: i32 = 25;
+const E_OPNOTSUPP: i32 = 95;
+const POLLIN: i16 = 0x0001;
+const RTC_ALM_SET: u32 = 0x4024_7007;
+const RTC_ALM_READ: u32 = 0x8024_7008;
 const RTC_RD_TIME: u32 = 0x8024_7009;
+const RTC_SET_TIME: u32 = 0x4024_700a;
 
 fn ioctl_setup() -> TestSetup {
     setup()
@@ -202,6 +212,11 @@ fn dispatch_ioctl_tiocgwinsz_on_tty_writes_winsize() {
 #[test]
 fn dispatch_ioctl_rtc_rd_time_on_rtc_char_device_writes_rtc_time() {
     let _setup = ioctl_setup();
+    install_shims_test_rtc_backend();
+    SHIMS_TEST_RTC_NS.store(
+        tx_services::time::DEFAULT_REALTIME_EPOCH_BASE_NS,
+        core::sync::atomic::Ordering::Release,
+    );
     let (proc_cap, thread) = fresh_proc_thread();
     let rnode = RNode::new_cap(
         FsObjectId::new(0x6465_7805),
@@ -237,6 +252,348 @@ fn dispatch_ioctl_rtc_rd_time_on_rtc_char_device_writes_rtc_time() {
     assert_eq!(i32::from_le_bytes(out[12..16].try_into().unwrap()), 23);
     assert_eq!(i32::from_le_bytes(out[16..20].try_into().unwrap()), 4);
     assert_eq!(i32::from_le_bytes(out[20..24].try_into().unwrap()), 126);
+}
+
+#[test]
+fn dispatch_ioctl_rtc_set_time_on_rtc_char_device_reaches_typed_ops() {
+    let _setup = ioctl_setup();
+    install_shims_test_rtc_backend();
+    let (proc_cap, thread) = fresh_proc_thread();
+    let rnode = RNode::new_cap(
+        FsObjectId::new(0x6465_7805),
+        InodeMeta::new(InodeKind::CharDevice, 0o020644),
+        RNodeBacking::StructBacked {
+            payload: StructPayload::CharDevice(&tx_fs::devfs::RTC_CHAR_BINDING),
+        },
+    )
+    .expect("rtc rnode");
+    let file = OpenFile::new_cap(
+        rnode,
+        OpenFileFlags {
+            read: true,
+            write: true,
+            append: false,
+            cloexec: false,
+            nonblocking: false,
+            packet: false,
+        },
+    )
+    .expect("rtc open file");
+    proc_cap.set_fd(3, Some(file));
+    let ctx = make_ctx(proc_cap, thread);
+
+    let mut time =
+        tx_subsystems::device::RtcTime::from_unix_seconds(1_800_000_000).expect("rtc time");
+    let req = SyscallRequest::new(
+        NR_IOCTL,
+        [
+            3,
+            RTC_SET_TIME as u64,
+            &mut time as *mut tx_subsystems::device::RtcTime as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+
+    let result = block_on(dispatch::<ShimsTestPmap>(req, &ctx));
+    assert_eq!(result, SyscallResult::Return(0));
+    assert_eq!(
+        SHIMS_TEST_RTC_SET_NS.load(core::sync::atomic::Ordering::Acquire),
+        1_800_000_000_000_000_000
+    );
+}
+
+#[test]
+fn dispatch_ioctl_rtc_alarm_read_set_reaches_typed_ops() {
+    let _setup = ioctl_setup();
+    install_shims_test_rtc_backend();
+    let (proc_cap, thread) = fresh_proc_thread();
+    let rnode = RNode::new_cap(
+        FsObjectId::new(0x6465_7805),
+        InodeMeta::new(InodeKind::CharDevice, 0o020644),
+        RNodeBacking::StructBacked {
+            payload: StructPayload::CharDevice(&tx_fs::devfs::RTC_CHAR_BINDING),
+        },
+    )
+    .expect("rtc rnode");
+    let file = OpenFile::new_cap(
+        rnode,
+        OpenFileFlags {
+            read: true,
+            write: true,
+            append: false,
+            cloexec: false,
+            nonblocking: false,
+            packet: false,
+        },
+    )
+    .expect("rtc open file");
+    proc_cap.set_fd(3, Some(file));
+    let ctx = make_ctx(proc_cap, thread);
+
+    let mut alarm =
+        tx_subsystems::device::RtcTime::from_unix_seconds(1_800_000_123).expect("alarm time");
+    let set_req = SyscallRequest::new(
+        NR_IOCTL,
+        [
+            3,
+            RTC_ALM_SET as u64,
+            &mut alarm as *mut tx_subsystems::device::RtcTime as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(set_req, &ctx)),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        SHIMS_TEST_RTC_ALARM_NS.load(core::sync::atomic::Ordering::Acquire),
+        1_800_000_123_000_000_000
+    );
+
+    let mut readback = tx_subsystems::device::RtcTime::from_unix_seconds(0).expect("epoch");
+    let read_req = SyscallRequest::new(
+        NR_IOCTL,
+        [
+            3,
+            RTC_ALM_READ as u64,
+            &mut readback as *mut tx_subsystems::device::RtcTime as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(read_req, &ctx)),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(readback, alarm);
+}
+
+#[derive(Default)]
+struct RtcDeadlineDomain {
+    registration: std::sync::Mutex<Option<RtcDeadlineRegistration>>,
+}
+
+struct RtcDeadlineRegistration {
+    deadline_ns: u64,
+    callback: DeviceTimerCallback,
+    token: TimerToken,
+}
+
+impl RtcDeadlineDomain {
+    fn fire_due(&self, now_ns: u64) -> usize {
+        let registration = {
+            let mut registration = self.registration.lock().unwrap();
+            let due = registration
+                .as_ref()
+                .is_some_and(|entry| entry.deadline_ns <= now_ns);
+            due.then(|| registration.take().expect("registration was checked"))
+        };
+        let Some(registration) = registration else {
+            return 0;
+        };
+        registration.callback.fire();
+        1
+    }
+}
+
+impl DeadlineDomain for RtcDeadlineDomain {
+    fn register_deadline(
+        &self,
+        deadline_ns: DeadlineNs,
+        _role: tx_services::time::TimerRole,
+        target: TimerTarget,
+    ) -> Result<TimerToken, TimeError> {
+        let TimerTarget::DeviceCallback(callback) = target else {
+            panic!("RTC alarm must use a device-callback deadline");
+        };
+        let token = TimerToken::new(0xA1C1);
+        *self.registration.lock().unwrap() = Some(RtcDeadlineRegistration {
+            deadline_ns: deadline_ns.raw(),
+            callback,
+            token,
+        });
+        Ok(token)
+    }
+
+    fn cancel_deadline(&self, token: TimerToken) -> bool {
+        let mut registration = self.registration.lock().unwrap();
+        if registration
+            .as_ref()
+            .is_some_and(|entry| entry.token == token)
+        {
+            registration.take();
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[test]
+fn dispatch_ioctl_rtc_alarm_set_emulates_event_when_hardware_alarm_is_unsupported() {
+    let _setup = ioctl_setup();
+    tx_fs::devfs::reset_rtc_backend_for_test();
+    install_shims_test_rtc_backend();
+    SHIMS_TEST_RTC_ALARM_UNSUPPORTED.store(true, core::sync::atomic::Ordering::Release);
+    let (proc_cap, thread) = fresh_proc_thread();
+    let rnode = RNode::new_cap(
+        FsObjectId::new(0x6465_7805),
+        InodeMeta::new(InodeKind::CharDevice, 0o020644),
+        RNodeBacking::StructBacked {
+            payload: StructPayload::CharDevice(&tx_fs::devfs::RTC_CHAR_BINDING),
+        },
+    )
+    .expect("rtc rnode");
+    let file = OpenFile::new_cap(
+        rnode,
+        OpenFileFlags {
+            read: true,
+            write: true,
+            append: false,
+            cloexec: false,
+            nonblocking: false,
+            packet: false,
+        },
+    )
+    .expect("rtc open file");
+    proc_cap.set_fd(3, Some(file));
+    let domain = std::sync::Arc::new(RtcDeadlineDomain::default());
+    let ctx = make_ctx(proc_cap, thread)
+        .with_timer_registrar(DeadlineRegistrarHandle::from_domain(domain.clone()));
+
+    let mut alarm = tx_subsystems::device::RtcTime::from_unix_seconds(
+        ((tx_services::time::DEFAULT_REALTIME_EPOCH_BASE_NS + 10_000_000_000) / 1_000_000_000)
+            as i64,
+    )
+    .expect("alarm time");
+    let set_req = SyscallRequest::new(
+        NR_IOCTL,
+        [
+            3,
+            RTC_ALM_SET as u64,
+            &mut alarm as *mut tx_subsystems::device::RtcTime as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(set_req, &ctx)),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(
+        SHIMS_TEST_RTC_ALARM_NS.load(core::sync::atomic::Ordering::Acquire),
+        0,
+        "unsupported hardware alarm path should not pretend a wake alarm was programmed"
+    );
+    let guard = guard();
+    let rtc_ops = tx_fs::devfs::RTC_CHAR_BINDING
+        .ops
+        .rtc_ops()
+        .expect("rtc ops");
+    assert_eq!(
+        rtc_ops.poll_events(&guard),
+        Ok(tx_subsystems::device::RtcEventMask::empty())
+    );
+
+    assert_eq!(domain.fire_due(9_999_999_999), 0);
+    assert_eq!(
+        rtc_ops.poll_events(&guard),
+        Ok(tx_subsystems::device::RtcEventMask::empty())
+    );
+    assert_eq!(domain.fire_due(10_000_000_000), 1);
+    assert_eq!(
+        rtc_ops.poll_events(&guard),
+        Ok(tx_subsystems::device::RtcEventMask::ALARM)
+    );
+}
+
+#[test]
+fn dispatch_ppoll_rtc_uses_typed_pending_event_readiness() {
+    let _setup = ioctl_setup();
+    tx_fs::devfs::reset_rtc_backend_for_test();
+    install_shims_test_rtc_backend();
+    let (proc_cap, thread) = fresh_proc_thread();
+    let rnode = RNode::new_cap(
+        FsObjectId::new(0x6465_7805),
+        InodeMeta::new(InodeKind::CharDevice, 0o020644),
+        RNodeBacking::StructBacked {
+            payload: StructPayload::CharDevice(&tx_fs::devfs::RTC_CHAR_BINDING),
+        },
+    )
+    .expect("rtc rnode");
+    let file = OpenFile::new_cap(
+        rnode,
+        OpenFileFlags {
+            read: true,
+            write: false,
+            append: false,
+            cloexec: false,
+            nonblocking: false,
+            packet: false,
+        },
+    )
+    .expect("rtc open file");
+    proc_cap.set_fd(3, Some(file));
+    let ctx = make_ctx(proc_cap, thread);
+
+    let timeout = [0u64, 0u64];
+    let mut pollfd = [0u8; 8];
+    pollfd[0..4].copy_from_slice(&(3i32).to_le_bytes());
+    pollfd[4..6].copy_from_slice(&POLLIN.to_le_bytes());
+    let req = SyscallRequest::new(
+        NR_PPOLL,
+        [
+            pollfd.as_mut_ptr() as u64,
+            1,
+            timeout.as_ptr() as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(req, &ctx)),
+        SyscallResult::Return(0)
+    );
+    assert_eq!(i16::from_le_bytes(pollfd[6..8].try_into().unwrap()), 0);
+
+    tx_fs::devfs::publish_rtc_event_with_post(
+        tx_subsystems::device::RtcEventMask::ALARM,
+        |mailbox, event| mailbox.post(event),
+    );
+    pollfd[6..8].copy_from_slice(&0i16.to_le_bytes());
+    let req = SyscallRequest::new(
+        NR_PPOLL,
+        [
+            pollfd.as_mut_ptr() as u64,
+            1,
+            timeout.as_ptr() as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+
+    assert_eq!(
+        block_on(dispatch::<ShimsTestPmap>(req, &ctx)),
+        SyscallResult::Return(1)
+    );
+    assert_ne!(
+        i16::from_le_bytes(pollfd[6..8].try_into().unwrap()) & POLLIN,
+        0
+    );
+
+    tx_fs::devfs::reset_rtc_backend_for_test();
 }
 
 /// `ioctl(tty_fd, TIOCSWINSZ, &new)` returns 0 and the next

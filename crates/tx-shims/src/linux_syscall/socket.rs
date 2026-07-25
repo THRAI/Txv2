@@ -7,26 +7,28 @@
 
 use super::*;
 
+use tx_services::time::{ClockRead, TimekeeperClock};
 use tx_substrate::step::{NoProgress, StepOutcome, YieldShape};
 use tx_subsystems::net::protocol::loopback_iface;
 use tx_subsystems::net::{
     net_namespace_payload_from_file, net_namespace_payloads_snapshot, netlink_netfilter_recv,
-    netlink_netfilter_send, netlink_route_recv, netlink_route_recv_packet,
-    netlink_route_send_with_netns_resolvers, netlink_xfrm_recv, netlink_xfrm_send, require_net_raw,
-    socket_open_file_from_identity, step_accept, step_bind, step_connect, step_listen,
-    step_poll_ready, step_poll_wait_token, step_process_loopback_udp, step_recv_kernel_bytes,
-    step_sctp_peeloff, step_sctp_shutdown_assoc, step_send_sctp_message, step_send_sctp_seqpacket,
+    netlink_netfilter_send_with_post, netlink_route_recv, netlink_route_recv_packet,
+    netlink_route_send_with_netns_resolvers_and_post, netlink_xfrm_recv,
+    netlink_xfrm_send_with_post, require_net_raw, socket_open_file_from_identity, step_accept,
+    step_bind, step_connect, step_listen, step_poll_ready, step_poll_wait_token,
+    step_process_loopback_udp_with_post, step_recv_kernel_bytes, step_sctp_peeloff,
+    step_sctp_shutdown_assoc, step_send_sctp_message, step_send_sctp_seqpacket,
     step_send_to_kernel_bytes, step_send_to_unix_path_kernel_bytes,
-    step_send_udp_loopback_kernel_bytes, step_shutdown, step_socket_close,
-    step_socket_open_file_in_namespace, step_tcp_loopback_handshake, step_tcp_loopback_transfer,
-    step_unix_socketpair_connect, AddressFamily, ConnectionKey, IpEndpoint, Ipv4Address,
-    Ipv4MulticastGroup, Ipv6Address, KernelSockAddr, LingerOption, NetNamespacePayload, PollMask,
-    RecvWireSet, SendRecvFlags, SockAddrIn, SockAddrIn6, SockAddrLl, SockShutdownCmd,
-    SocketHandleFlags, SocketIdentity, SocketKind, SocketOperationalEvidence, SocketProtocol,
-    SocketType, TcpState, TcpTlsUlpState, UdpInner, UnixDatagramState, UnixPeerCred,
-    UnixSocketPath, UnixStreamState, ValidSocketType, VIRTIO_NET_DEFAULT_MTU,
+    step_send_udp_loopback_kernel_bytes_with_post, step_shutdown, step_socket_close,
+    step_socket_open_file_in_namespace, step_tcp_loopback_handshake_with_post,
+    step_tcp_loopback_transfer_with_post, step_unix_socketpair_connect, AddressFamily,
+    ConnectionKey, IpEndpoint, Ipv4Address, Ipv4MulticastGroup, Ipv6Address, KernelSockAddr,
+    LingerOption, NetNamespacePayload, PollMask, RecvWireSet, SendRecvFlags, SockAddrIn,
+    SockAddrIn6, SockAddrLl, SockShutdownCmd, SocketHandleFlags, SocketIdentity, SocketKind,
+    SocketOperationalEvidence, SocketProtocol, SocketType, TcpState, TcpTlsUlpState, UdpInner,
+    UnixDatagramState, UnixPeerCred, UnixSocketPath, UnixStreamState, ValidSocketType,
+    VIRTIO_NET_DEFAULT_MTU,
 };
-use tx_subsystems::signal::step_kill_process;
 use tx_subsystems::vfs::structure::OpenFileBacking;
 use tx_subsystems::vm::UserAccessKind;
 use tx_subsystems::wait_source;
@@ -312,25 +314,37 @@ pub(super) fn sys_listen<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallRes
     step_unit_result(outcome)
 }
 
-pub(super) fn sys_accept<'a, P: TimeIf + 'a>(
+pub(super) fn sys_accept<'a, P: 'a>(
     args: [u64; 6],
     ctx: &'a SyscallCtx<'a>,
-) -> impl core::future::Future<Output = SyscallResult> + 'a {
+) -> impl core::future::Future<Output = SyscallResult> + 'a
+where
+    TimekeeperClock<P>: ClockRead,
+{
     accept_entry::<P>(args, ctx)
 }
 
-async fn accept_entry<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+async fn accept_entry<'a, P>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
+where
+    TimekeeperClock<P>: ClockRead,
+{
     accept_impl::<P>(args[0] as i32, args[1], args[2], 0, ctx).await
 }
 
-pub(super) fn sys_accept4<'a, P: TimeIf + 'a>(
+pub(super) fn sys_accept4<'a, P: 'a>(
     args: [u64; 6],
     ctx: &'a SyscallCtx<'a>,
-) -> impl core::future::Future<Output = SyscallResult> + 'a {
+) -> impl core::future::Future<Output = SyscallResult> + 'a
+where
+    TimekeeperClock<P>: ClockRead,
+{
     accept4_entry::<P>(args, ctx)
 }
 
-async fn accept4_entry<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+async fn accept4_entry<'a, P>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
+where
+    TimekeeperClock<P>: ClockRead,
+{
     let flags = args[3] as u32;
     if flags & !ACCEPT4_KNOWN_FLAGS != 0 {
         return SyscallResult::Error(EINVAL_VALUE);
@@ -338,13 +352,16 @@ async fn accept4_entry<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
     accept_impl::<P>(args[0] as i32, args[1], args[2], flags, ctx).await
 }
 
-async fn accept_impl<'a, P: TimeIf>(
+async fn accept_impl<'a, P>(
     fd: i32,
     addr_ptr: u64,
     addrlen_ptr: u64,
     flags: u32,
     ctx: &SyscallCtx<'a>,
-) -> SyscallResult {
+) -> SyscallResult
+where
+    TimekeeperClock<P>: ClockRead,
+{
     let (file, listener) = match resolve_socket_fd(ctx, fd) {
         Ok(pair) => pair,
         Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
@@ -704,15 +721,24 @@ fn dispatch_netlink_send(
         process.net_namespace()
     };
     match socket.kind {
-        SocketKind::NetlinkRoute => netlink_route_send_with_netns_resolvers(
+        SocketKind::NetlinkRoute => netlink_route_send_with_netns_resolvers_and_post(
             socket,
             bytes,
             ctx.cred(),
             &mut resolve_netns_fd,
             &mut resolve_netns_pid,
+            |mailbox, event| ctx.post_mailbox_ref_event(mailbox, event),
         ),
-        SocketKind::NetlinkXfrm => netlink_xfrm_send(socket, bytes, ctx.cred()),
-        SocketKind::NetlinkNetfilter => netlink_netfilter_send(socket, bytes, ctx.cred()),
+        SocketKind::NetlinkXfrm => {
+            netlink_xfrm_send_with_post(socket, bytes, ctx.cred(), |mailbox, event| {
+                ctx.post_mailbox_ref_event(mailbox, event)
+            })
+        }
+        SocketKind::NetlinkNetfilter => {
+            netlink_netfilter_send_with_post(socket, bytes, ctx.cred(), |mailbox, event| {
+                ctx.post_mailbox_ref_event(mailbox, event)
+            })
+        }
         _ => unreachable!(),
     }
 }
@@ -791,7 +817,7 @@ async fn sendto_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult 
         if let Err(errno) = bootstrap_copy_from_user(&ctx.aspace, &mut bytes, args[1]) {
             return SyscallResult::Error(errno_to_i32(errno));
         }
-        maybe_queue_packet_arp_reply(&socket, &payload, &netns, sockaddr, &bytes);
+        maybe_queue_packet_arp_reply(ctx, &socket, &payload, &netns, sockaddr, &bytes);
         return SyscallResult::Return(len as i64);
     }
 
@@ -869,7 +895,14 @@ async fn sendto_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult 
         loop {
             let outcome = {
                 let guard = tx_substrate::epoch::guard();
-                step_send_udp_loopback_kernel_bytes(&socket, dst, &bytes, flags, &guard)
+                step_send_udp_loopback_kernel_bytes_with_post(
+                    &socket,
+                    dst,
+                    &bytes,
+                    flags,
+                    &guard,
+                    |mailbox, event| ctx.post_mailbox_ref_event(mailbox, event),
+                )
             };
             match outcome {
                 StepOutcome::Done(sent) => {
@@ -923,7 +956,7 @@ async fn sendto_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult 
             StepOutcome::Done(sent) => {
                 total += sent;
                 if sent == 0 || sent >= remaining.len() {
-                    finish_sendto_progress(&socket, sent, flags).await;
+                    finish_sendto_progress(ctx, &socket, sent, flags).await;
                     return SyscallResult::Return(total as i64);
                 }
                 remaining = &remaining[sent..];
@@ -932,7 +965,7 @@ async fn sendto_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult 
                 let sent = progress.bytes();
                 total += sent;
                 if sent == 0 || sent >= remaining.len() {
-                    finish_sendto_progress(&socket, sent, flags).await;
+                    finish_sendto_progress(ctx, &socket, sent, flags).await;
                     return SyscallResult::Return(total as i64);
                 }
                 remaining = &remaining[sent..];
@@ -941,12 +974,12 @@ async fn sendto_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult 
                 let sent = progress.bytes();
                 total += sent;
                 if sent >= remaining.len() {
-                    finish_sendto_progress(&socket, sent, flags).await;
+                    finish_sendto_progress(ctx, &socket, sent, flags).await;
                     return SyscallResult::Return(total as i64);
                 }
                 remaining = &remaining[sent..];
                 if total > 0 {
-                    finish_sendto_progress(&socket, total, flags).await;
+                    finish_sendto_progress(ctx, &socket, total, flags).await;
                     return SyscallResult::Return(total as i64);
                 }
                 if flags.is_nonblocking() {
@@ -960,7 +993,7 @@ async fn sendto_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult 
             }
             StepOutcome::Err(errno) => {
                 if total > 0 {
-                    finish_sendto_progress(&socket, total, flags).await;
+                    finish_sendto_progress(ctx, &socket, total, flags).await;
                     return SyscallResult::Return(total as i64);
                 }
                 maybe_raise_sigpipe(ctx, errno, flags);
@@ -970,14 +1003,20 @@ async fn sendto_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult 
     }
 }
 
-pub(super) fn sys_recvfrom<'a, P: TimeIf + 'a>(
+pub(super) fn sys_recvfrom<'a, P: 'a>(
     args: [u64; 6],
     ctx: &'a SyscallCtx<'a>,
-) -> impl core::future::Future<Output = SyscallResult> + 'a {
+) -> impl core::future::Future<Output = SyscallResult> + 'a
+where
+    TimekeeperClock<P>: ClockRead,
+{
     recvfrom_impl::<P>(args, ctx)
 }
 
-async fn recvfrom_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+async fn recvfrom_impl<'a, P>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
+where
+    TimekeeperClock<P>: ClockRead,
+{
     let (file, socket) = match resolve_socket_fd(ctx, args[0] as i32) {
         Ok(pair) => pair,
         Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
@@ -1091,7 +1130,10 @@ async fn recvfrom_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
                 let Some(wait_token) = wait_token else {
                     return SyscallResult::Error(EIO_VALUE);
                 };
-                let Some(future) = wait_source::wait_on_token(wait_token) else {
+                let Some(future) = wait_source::wait_on_registered_source_id(
+                    wait_token.source_id(),
+                    wait_token.interest(),
+                ) else {
                     return SyscallResult::Error(EIO_VALUE);
                 };
                 if matches!(
@@ -1178,6 +1220,7 @@ async fn recvfrom_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> S
 }
 
 fn maybe_queue_packet_arp_reply(
+    ctx: &SyscallCtx<'_>,
     socket: &Cap<SocketIdentity>,
     payload: &SocketOperationalEvidence,
     netns: &NetNamespacePayload,
@@ -1236,7 +1279,11 @@ fn maybe_queue_packet_arp_reply(
         target_mac.len() as u8,
     );
     if payload.record_packet_frame(source, reply).unwrap_or(false) {
-        socket.readiness.fire_recv(RecvWireSet::HAS_DATA);
+        socket
+            .readiness
+            .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| {
+                ctx.post_mailbox_ref_event(mailbox, event)
+            });
     }
 }
 
@@ -1570,11 +1617,9 @@ async fn sendmsg_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
         let info = sctp_info.unwrap_or_default();
         // SCTP_DISABLE_FRAGMENTS: a message larger than the association
         // fragmentation point is rejected with EMSGSIZE rather than split.
-        let (disable_frag, maxseg) = socket
-            .acquire_operational()
-            .map_or((false, 0u32), |p| {
-                p.with_options(|o| (o.sctp.disable_fragments, o.sctp.maxseg))
-            });
+        let (disable_frag, maxseg) = socket.acquire_operational().map_or((false, 0u32), |p| {
+            p.with_options(|o| (o.sctp.disable_fragments, o.sctp.maxseg))
+        });
         if disable_frag {
             let frag_point = if maxseg != 0 {
                 maxseg as usize
@@ -1609,12 +1654,12 @@ async fn sendmsg_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
             };
             match outcome {
                 StepOutcome::Done(sent) => {
-                    finish_sendto_progress(&socket, sent, flags).await;
+                    finish_sendto_progress(ctx, &socket, sent, flags).await;
                     return SyscallResult::Return(sent as i64);
                 }
                 StepOutcome::Continue { progress } => {
                     let sent = progress.bytes();
-                    finish_sendto_progress(&socket, sent, flags).await;
+                    finish_sendto_progress(ctx, &socket, sent, flags).await;
                     return SyscallResult::Return(sent as i64);
                 }
                 StepOutcome::Yield { shape, .. } => {
@@ -1647,7 +1692,7 @@ async fn sendmsg_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
             StepOutcome::Done(sent) => {
                 total += sent;
                 if sent == 0 || sent >= remaining.len() {
-                    finish_sendto_progress(&socket, sent, flags).await;
+                    finish_sendto_progress(ctx, &socket, sent, flags).await;
                     return SyscallResult::Return(total as i64);
                 }
                 remaining = &remaining[sent..];
@@ -1656,7 +1701,7 @@ async fn sendmsg_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
                 let sent = progress.bytes();
                 total += sent;
                 if sent == 0 || sent >= remaining.len() {
-                    finish_sendto_progress(&socket, sent, flags).await;
+                    finish_sendto_progress(ctx, &socket, sent, flags).await;
                     return SyscallResult::Return(total as i64);
                 }
                 remaining = &remaining[sent..];
@@ -1665,12 +1710,12 @@ async fn sendmsg_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
                 let sent = progress.bytes();
                 total += sent;
                 if sent >= remaining.len() {
-                    finish_sendto_progress(&socket, sent, flags).await;
+                    finish_sendto_progress(ctx, &socket, sent, flags).await;
                     return SyscallResult::Return(total as i64);
                 }
                 remaining = &remaining[sent..];
                 if total > 0 {
-                    finish_sendto_progress(&socket, total, flags).await;
+                    finish_sendto_progress(ctx, &socket, total, flags).await;
                     return SyscallResult::Return(total as i64);
                 }
                 if flags.is_nonblocking() {
@@ -1684,7 +1729,7 @@ async fn sendmsg_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
             }
             StepOutcome::Err(errno) => {
                 if total > 0 {
-                    finish_sendto_progress(&socket, total, flags).await;
+                    finish_sendto_progress(ctx, &socket, total, flags).await;
                     return SyscallResult::Return(total as i64);
                 }
                 maybe_raise_sigpipe(ctx, errno, flags);
@@ -1824,14 +1869,20 @@ fn validate_iovec_read_ranges<'a>(ctx: &SyscallCtx<'a>, iovecs: &[UserIovec]) ->
     Ok(())
 }
 
-pub(super) fn sys_recvmsg<'a, P: TimeIf + 'a>(
+pub(super) fn sys_recvmsg<'a, P: 'a>(
     args: [u64; 6],
     ctx: &'a SyscallCtx<'a>,
-) -> impl core::future::Future<Output = SyscallResult> + 'a {
+) -> impl core::future::Future<Output = SyscallResult> + 'a
+where
+    TimekeeperClock<P>: ClockRead,
+{
     recvmsg_impl::<P>(args, ctx)
 }
 
-async fn recvmsg_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+async fn recvmsg_impl<'a, P>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
+where
+    TimekeeperClock<P>: ClockRead,
+{
     let (file, socket) = match resolve_socket_fd(ctx, args[0] as i32) {
         Ok(pair) => pair,
         Err(errno) => return SyscallResult::Error(errno_to_i32(errno)),
@@ -2066,14 +2117,20 @@ async fn sendmmsg_impl<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResul
     SyscallResult::Return(sent_messages as i64)
 }
 
-pub(super) fn sys_recvmmsg<'a, P: TimeIf + 'a>(
+pub(super) fn sys_recvmmsg<'a, P: 'a>(
     args: [u64; 6],
     ctx: &'a SyscallCtx<'a>,
-) -> impl core::future::Future<Output = SyscallResult> + 'a {
+) -> impl core::future::Future<Output = SyscallResult> + 'a
+where
+    TimekeeperClock<P>: ClockRead,
+{
     recvmmsg_impl::<P>(args, ctx)
 }
 
-async fn recvmmsg_impl<'a, P: TimeIf>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult {
+async fn recvmmsg_impl<'a, P>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> SyscallResult
+where
+    TimekeeperClock<P>: ClockRead,
+{
     if let Err(errno) = resolve_socket_fd(ctx, args[0] as i32) {
         return SyscallResult::Error(errno_to_i32(errno));
     }
@@ -2586,8 +2643,10 @@ pub(super) fn sys_setsockopt<'a>(args: [u64; 6], ctx: &SyscallCtx<'a>) -> Syscal
                 return SyscallResult::Error(errno_to_i32(errno));
             }
             let assoc_id = u32::from_le_bytes([buf[28], buf[29], buf[30], buf[31]]);
-            let is_seqpacket = payload.with_options(|o| o.socket.sock_type == SocketType::SeqPacket);
-            if is_seqpacket && assoc_id != 0 && payload.sctp_peer_addr_by_assoc(assoc_id).is_none() {
+            let is_seqpacket =
+                payload.with_options(|o| o.socket.sock_type == SocketType::SeqPacket);
+            if is_seqpacket && assoc_id != 0 && payload.sctp_peer_addr_by_assoc(assoc_id).is_none()
+            {
                 return SyscallResult::Error(errno_to_i32(Errno::EINVAL));
             }
             payload.with_options_mut(|opts| opts.sctp.default_send_param = buf);
@@ -3765,8 +3824,11 @@ fn parse_arpreq_device(bytes: &[u8; ARPREQ_BYTES]) -> Result<Option<&str>, i32> 
 fn parse_arpreq_ethernet_addr(
     bytes: &[u8; ARPREQ_BYTES],
 ) -> Result<tx_subsystems::net::EthernetAddress, i32> {
-    let family =
-        u16::from_le_bytes(bytes[ARPREQ_HA_OFFSET..ARPREQ_HA_OFFSET + 2].try_into().unwrap());
+    let family = u16::from_le_bytes(
+        bytes[ARPREQ_HA_OFFSET..ARPREQ_HA_OFFSET + 2]
+            .try_into()
+            .unwrap(),
+    );
     if family != 0 && family != ARPHRD_ETHER {
         return Err(EINVAL_VALUE);
     }
@@ -4284,9 +4346,7 @@ pub(super) fn sys_socket_ioctl<'a>(request: u32, argp: u64, ctx: &SyscallCtx<'a>
             let value: [u8; 4] = match request {
                 SIOCGIFADDR => addr.octets(),
                 SIOCGIFNETMASK => mask.to_be_bytes(),
-                SIOCGIFBRDADDR => {
-                    (u32::from_be_bytes(addr.octets()) | !mask).to_be_bytes()
-                }
+                SIOCGIFBRDADDR => (u32::from_be_bytes(addr.octets()) | !mask).to_be_bytes(),
                 _ => unreachable!(),
             };
             // sockaddr_in image in ifr_addr: family, zero port, addr.
@@ -4356,8 +4416,7 @@ pub(super) fn sys_socket_ioctl<'a>(request: u32, argp: u64, ctx: &SyscallCtx<'a>
                         return SyscallResult::Error(EINVAL_VALUE);
                     };
                     if let Some(label) = alias_label {
-                        let Some((addr, _)) = netns.ipv4_extra_by_label(link.ifindex, label)
-                        else {
+                        let Some((addr, _)) = netns.ipv4_extra_by_label(link.ifindex, label) else {
                             return SyscallResult::Error(errno_to_i32(Errno::EADDRNOTAVAIL));
                         };
                         return match netns.add_device_ipv4_addr_by_ifindex(

@@ -99,7 +99,7 @@ fn raw_icmp_send_accepts_busybox_pattern_echo_code() {
         other => panic!("unexpected socket create outcome: {other:?}"),
     };
     let src = Ipv4Address::LOOPBACK;
-    let dst = Ipv4Address::new([10, 0, 0, 1]);
+    let dst = Ipv4Address::LOOPBACK;
     let mut payload = std::vec![0xaa; 16];
     payload[0] = 8;
     payload[2..4].copy_from_slice(&0u16.to_be_bytes());
@@ -254,10 +254,18 @@ fn raw_icmpv4_send_to_configured_peer_route_returns_echo_reply() {
     );
 
     let mut out = [0u8; 128];
-    let recv = match step_recv_kernel_bytes(&raw, &mut out, SendRecvFlags::empty(), &guard) {
-        StepOutcome::Done(recv) => recv,
-        other => panic!("expected icmpv4 echo reply, got {other:?}"),
-    };
+    let mut recv = None;
+    for _ in 0..64 {
+        let _ =
+            crate::net::drive_all_net_namespace_runtimes_at(smoltcp::time::Instant::ZERO, &guard);
+        if let StepOutcome::Done(done) =
+            step_recv_kernel_bytes(&raw, &mut out, SendRecvFlags::empty(), &guard)
+        {
+            recv = Some(done);
+            break;
+        }
+    }
+    let recv = recv.expect("expected icmpv4 echo reply");
     assert_eq!(
         parse_icmpv4_from_ipv4_bytes(&out[..recv.bytes]),
         Icmpv4Event::EchoReply(request.reply_packet())
@@ -341,10 +349,18 @@ fn raw_icmpv4_echo_still_replies_after_local_addr_change_churn() {
         StepOutcome::Done(request_bytes.len())
     );
     let mut out = [0u8; 128];
-    let recv = match step_recv_kernel_bytes(&raw, &mut out, SendRecvFlags::empty(), &guard) {
-        StepOutcome::Done(recv) => recv,
-        other => panic!("expected pre-churn echo reply, got {other:?}"),
-    };
+    let mut recv = None;
+    for _ in 0..64 {
+        let _ =
+            crate::net::drive_all_net_namespace_runtimes_at(smoltcp::time::Instant::ZERO, &guard);
+        if let StepOutcome::Done(done) =
+            step_recv_kernel_bytes(&raw, &mut out, SendRecvFlags::empty(), &guard)
+        {
+            recv = Some(done);
+            break;
+        }
+    }
+    let recv = recv.expect("expected pre-churn echo reply");
     assert_eq!(
         parse_icmpv4_from_ipv4_bytes(&out[..recv.bytes]),
         Icmpv4Event::EchoReply(request.reply_packet())
@@ -359,6 +375,11 @@ fn raw_icmpv4_echo_still_replies_after_local_addr_change_churn() {
             .set_device_ipv4_addr_by_ifindex(auth, 2, Some(churned), Some(24))
             .expect("churn local ipv4");
     }
+    remote_ns.ether_ifaces_snapshot()[0].install_arp_for_test_or_bootstrap(
+        churned,
+        pair.left.ops.mac_addr(),
+        smoltcp::time::Instant::from_secs(60),
+    );
 
     // Final connectivity check from the new address.
     let request = Icmpv4EchoPacket {
@@ -380,10 +401,18 @@ fn raw_icmpv4_echo_still_replies_after_local_addr_change_churn() {
         StepOutcome::Done(request_bytes.len())
     );
     let mut out = [0u8; 128];
-    let recv = match step_recv_kernel_bytes(&raw, &mut out, SendRecvFlags::empty(), &guard) {
-        StepOutcome::Done(recv) => recv,
-        other => panic!("expected post-churn echo reply, got {other:?}"),
-    };
+    let mut recv = None;
+    for _ in 0..64 {
+        let _ =
+            crate::net::drive_all_net_namespace_runtimes_at(smoltcp::time::Instant::ZERO, &guard);
+        if let StepOutcome::Done(done) =
+            step_recv_kernel_bytes(&raw, &mut out, SendRecvFlags::empty(), &guard)
+        {
+            recv = Some(done);
+            break;
+        }
+    }
+    let recv = recv.expect("expected post-churn echo reply");
     assert_eq!(
         parse_icmpv4_from_ipv4_bytes(&out[..recv.bytes]),
         Icmpv4Event::EchoReply(request.reply_packet())

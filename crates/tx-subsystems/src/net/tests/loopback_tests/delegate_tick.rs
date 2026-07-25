@@ -1,4 +1,101 @@
 use super::*;
+use tx_substrate::wake::MailboxEvent;
+
+#[test]
+fn net_delegate_kick_poll_with_post_uses_injected_mailbox_ref_post() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    crate::net::delegate::net_delegate_clear(
+        crate::net::delegate::DelegateWireSet::POLL | crate::net::delegate::DelegateWireSet::TICK,
+    );
+    let mailbox = alloc::sync::Arc::new(TaskMailbox::new());
+    let generation = mailbox.next_generation();
+    let _sub = crate::net::delegate::net_delegate_queue().subscribe(
+        crate::net::delegate::DelegateWireSet::POLL.bits(),
+        alloc::sync::Arc::downgrade(&mailbox),
+        generation,
+    );
+    let source = crate::net::delegate::net_delegate_queue().source_id();
+    let mut injected_posts = 0usize;
+
+    let wakes = crate::net::delegate::net_delegate_kick_poll_with_post(|mailbox, event| {
+        injected_posts += 1;
+        mailbox.post(event)
+    });
+
+    assert_eq!(wakes, 1);
+    assert_eq!(injected_posts, 1);
+    assert!(
+        crate::net::delegate::net_delegate_queue().peek()
+            & crate::net::delegate::DelegateWireSet::POLL.bits()
+            != 0
+    );
+    match mailbox.poll().expect("source fired") {
+        MailboxEvent::SourceFired {
+            generation: seen_generation,
+            source: seen_source,
+            interests,
+        } => {
+            assert_eq!(seen_generation, generation);
+            assert_eq!(seen_source, source);
+            assert_eq!(
+                interests.raw(),
+                crate::net::delegate::DelegateWireSet::POLL.bits()
+            );
+        }
+        other => panic!("expected delegate SourceFired, got {other:?}"),
+    }
+}
+
+#[test]
+fn net_delegate_kick_tick_with_post_uses_injected_mailbox_ref_post() {
+    init_zones();
+    let _lock = crate::test_support::EPOCH_TEST_LOCK
+        .lock()
+        .expect("net epoch test lock");
+    crate::net::delegate::net_delegate_clear(
+        crate::net::delegate::DelegateWireSet::POLL | crate::net::delegate::DelegateWireSet::TICK,
+    );
+    let mailbox = alloc::sync::Arc::new(TaskMailbox::new());
+    let generation = mailbox.next_generation();
+    let _sub = crate::net::delegate::net_delegate_queue().subscribe(
+        crate::net::delegate::DelegateWireSet::TICK.bits(),
+        alloc::sync::Arc::downgrade(&mailbox),
+        generation,
+    );
+    let source = crate::net::delegate::net_delegate_queue().source_id();
+    let mut injected_posts = 0usize;
+
+    let wakes = crate::net::delegate::net_delegate_kick_tick_with_post(|mailbox, event| {
+        injected_posts += 1;
+        mailbox.post(event)
+    });
+
+    assert_eq!(wakes, 1);
+    assert_eq!(injected_posts, 1);
+    assert!(
+        crate::net::delegate::net_delegate_queue().peek()
+            & crate::net::delegate::DelegateWireSet::TICK.bits()
+            != 0
+    );
+    match mailbox.poll().expect("source fired") {
+        MailboxEvent::SourceFired {
+            generation: seen_generation,
+            source: seen_source,
+            interests,
+        } => {
+            assert_eq!(seen_generation, generation);
+            assert_eq!(seen_source, source);
+            assert_eq!(
+                interests.raw(),
+                crate::net::delegate::DelegateWireSet::TICK.bits()
+            );
+        }
+        other => panic!("expected delegate SourceFired, got {other:?}"),
+    }
+}
 
 #[test]
 fn net_delegate_step_once_processes_poll_packet_source() {
@@ -33,7 +130,7 @@ fn net_delegate_step_once_processes_poll_packet_source() {
     crate::net::delegate::net_delegate_clear(
         crate::net::delegate::DelegateWireSet::POLL | crate::net::delegate::DelegateWireSet::TICK,
     );
-    crate::net::delegate::net_delegate_kick_poll();
+    crate::net::delegate::net_delegate_kick_poll_with_post(|mailbox, event| mailbox.post(event));
 
     let outcome = net_delegate_step_once(&driver, &guard);
 
@@ -87,7 +184,7 @@ fn net_delegate_step_once_processes_tick_backlog_retransmit() {
     crate::net::delegate::net_delegate_clear(
         crate::net::delegate::DelegateWireSet::POLL | crate::net::delegate::DelegateWireSet::TICK,
     );
-    crate::net::delegate::net_delegate_kick_tick();
+    crate::net::delegate::net_delegate_kick_tick_with_post(|mailbox, event| mailbox.post(event));
 
     let outcome = net_delegate_step_once(&driver, &guard);
 
@@ -135,7 +232,7 @@ fn net_delegate_step_once_rekicks_after_loopback_progress() {
     crate::net::delegate::net_delegate_clear(
         crate::net::delegate::DelegateWireSet::POLL | crate::net::delegate::DelegateWireSet::TICK,
     );
-    crate::net::delegate::net_delegate_kick_poll();
+    crate::net::delegate::net_delegate_kick_poll_with_post(|mailbox, event| mailbox.post(event));
 
     let outcome = net_delegate_step_once(&driver, &guard);
 
@@ -209,10 +306,10 @@ fn net_delegate_reactor_timer_adapter_fires_tick_and_drives_retransmit() {
         crate::net::delegate::DelegateWireSet::POLL | crate::net::delegate::DelegateWireSet::TICK,
     );
     let reactor = Reactor::new();
-    let timer_channel = reactor.channel();
+    let timer_registrar = reactor.deadline_registrar_handle();
     reactor.submit(async move {
         assert_eq!(
-            net_delegate_wait_tick_deadline(timer_channel, deadline_ns).await,
+            net_delegate_wait_tick_deadline(&timer_registrar, deadline_ns).await,
             WaitOutcome::TimedOut
         );
     });
@@ -287,7 +384,7 @@ fn net_delegate_task_loop_waits_for_poll_and_processes_bounded_steps() {
     let mut cx = Context::from_waker(&waker);
 
     assert!(matches!(task.as_mut().poll(&mut cx), Poll::Pending));
-    crate::net::delegate::net_delegate_kick_poll();
+    crate::net::delegate::net_delegate_kick_poll_with_post(|mailbox, event| mailbox.post(event));
     let report = match task.as_mut().poll(&mut cx) {
         Poll::Ready(report) => report,
         Poll::Pending => panic!("delegate task should finish after one ready step"),
@@ -356,7 +453,7 @@ fn net_delegate_task_loop_reports_deadline_refresh_from_tick() {
     let mut cx = Context::from_waker(&waker);
 
     assert!(matches!(task.as_mut().poll(&mut cx), Poll::Pending));
-    crate::net::delegate::net_delegate_kick_tick();
+    crate::net::delegate::net_delegate_kick_tick_with_post(|mailbox, event| mailbox.post(event));
     let report = match task.as_mut().poll(&mut cx) {
         Poll::Ready(report) => report,
         Poll::Pending => panic!("delegate task should finish after one tick"),

@@ -1,4 +1,5 @@
 use smoltcp::time::Instant;
+use tx_substrate::wake::mailbox::{MailboxEvent, TaskMailbox};
 use tx_substrate::zone::PayloadCap;
 
 use crate::execution::{Guard, StepOutcome};
@@ -50,11 +51,12 @@ pub fn step_process_network_events(
     // reserve
     // commit
     // publish
-    step_process_network_events_in_namespace_at(
+    step_process_network_events_in_namespace_at_with_post(
         source,
         initial_net_namespace_payload(),
         Instant::ZERO,
         guard,
+        |mailbox: &TaskMailbox, event: MailboxEvent| mailbox.post(event),
     )
 }
 
@@ -68,7 +70,13 @@ pub fn step_process_network_events_at(
     // reserve
     // commit
     // publish
-    step_process_network_events_in_namespace_at(source, initial_net_namespace_payload(), now, guard)
+    step_process_network_events_in_namespace_at_with_post(
+        source,
+        initial_net_namespace_payload(),
+        now,
+        guard,
+        |mailbox: &TaskMailbox, event: MailboxEvent| mailbox.post(event),
+    )
 }
 
 pub fn step_process_network_events_in_namespace_at(
@@ -77,6 +85,25 @@ pub fn step_process_network_events_in_namespace_at(
     now: Instant,
     guard: &Guard<'_>,
 ) -> StepOutcome<NetworkStepOutcome> {
+    step_process_network_events_in_namespace_at_with_post(
+        source,
+        net_namespace,
+        now,
+        guard,
+        |mailbox: &TaskMailbox, event: MailboxEvent| mailbox.post(event),
+    )
+}
+
+pub fn step_process_network_events_in_namespace_at_with_post<F>(
+    source: &dyn PacketSource,
+    net_namespace: PayloadCap<NetNamespacePayload>,
+    now: Instant,
+    guard: &Guard<'_>,
+    mut post: F,
+) -> StepOutcome<NetworkStepOutcome>
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     // observe
     // upgrade
     // reserve
@@ -97,19 +124,22 @@ pub fn step_process_network_events_in_namespace_at(
                     process_tcp_event(table, &net_namespace, event, guard)
                 {
                     outcome.sockets_touched += 1;
-                    outcome.wakes_fired += publish.publish_to(&socket);
+                    outcome.wakes_fired += publish
+                        .publish_to_with_post(&socket, |mailbox, event| post(mailbox, event));
                 }
             }
             PacketDispatch::Udp(event) => {
                 if let Some((socket, publish)) = process_udp_event(table, event, guard) {
                     outcome.sockets_touched += 1;
-                    outcome.wakes_fired += publish.publish_to(&socket);
+                    outcome.wakes_fired += publish
+                        .publish_to_with_post(&socket, |mailbox, event| post(mailbox, event));
                 }
             }
             PacketDispatch::Icmp(event) => {
                 if let Some((socket, publish)) = process_icmp_event(table, event, guard) {
                     outcome.sockets_touched += 1;
-                    outcome.wakes_fired += publish.publish_to(&socket);
+                    outcome.wakes_fired += publish
+                        .publish_to_with_post(&socket, |mailbox, event| post(mailbox, event));
                 }
             }
             PacketDispatch::Unsupported | PacketDispatch::Malformed => {}

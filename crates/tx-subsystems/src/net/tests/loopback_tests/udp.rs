@@ -112,8 +112,25 @@ fn udp_loopback_connected_send_reaches_bound_receiver() {
         step_send_kernel_bytes(&client, b"hello", SendRecvFlags::empty(), &guard),
         StepOutcome::Done(5)
     );
+    let recv_mailbox = alloc::sync::Arc::new(TaskMailbox::new());
+    let recv_generation = recv_mailbox.next_generation();
+    let _subscription = server.readiness.recv_wq.subscribe(
+        RecvWireSet::HAS_DATA.bits(),
+        alloc::sync::Arc::downgrade(&recv_mailbox),
+        recv_generation,
+    );
+    let mut injected_posts = 0usize;
 
-    let transfer = match step_process_loopback_udp_on_iface(&client, 8, &iface, &guard) {
+    let transfer = match step_process_loopback_udp_on_iface_with_post(
+        &client,
+        8,
+        &iface,
+        &guard,
+        |mailbox, event| {
+            injected_posts += 1;
+            mailbox.post(event)
+        },
+    ) {
         StepOutcome::Done(outcome) => outcome,
         _ => panic!("unexpected udp loopback outcome"),
     };
@@ -122,6 +139,7 @@ fn udp_loopback_connected_send_reaches_bound_receiver() {
     assert_eq!(transfer.packets_seen, 1);
     assert_eq!(transfer.bytes_moved, 5);
     assert!(transfer.peer_wake_fired);
+    assert_eq!(injected_posts, 1);
     assert_eq!(iface.pending_packets(), 0);
     assert!(server.readiness.recv_wq.peek() & RecvWireSet::HAS_DATA.bits() != 0);
     assert_eq!(
@@ -181,7 +199,13 @@ fn udp_loopback_sendto_reaches_wildcard_bound_receiver() {
         StepOutcome::Done(1)
     );
 
-    let transfer = match step_process_loopback_udp_on_iface(&client, 8, &iface, &guard) {
+    let transfer = match step_process_loopback_udp_on_iface_with_post(
+        &client,
+        8,
+        &iface,
+        &guard,
+        |mailbox, event| mailbox.post(event),
+    ) {
         StepOutcome::Done(outcome) => outcome,
         _ => panic!("unexpected udp loopback outcome"),
     };
@@ -237,7 +261,13 @@ fn udp_loopback_wildcard_server_reply_reaches_connected_client() {
         StepOutcome::Done(4)
     );
 
-    let client_to_server = match step_process_loopback_udp_on_iface(&client, 8, &iface, &guard) {
+    let client_to_server = match step_process_loopback_udp_on_iface_with_post(
+        &client,
+        8,
+        &iface,
+        &guard,
+        |mailbox, event| mailbox.post(event),
+    ) {
         StepOutcome::Done(outcome) => outcome,
         _ => panic!("unexpected client udp loopback outcome"),
     };
@@ -268,7 +298,13 @@ fn udp_loopback_wildcard_server_reply_reaches_connected_client() {
         StepOutcome::Done(4)
     );
 
-    let server_to_client = match step_process_loopback_udp_on_iface(&server, 8, &iface, &guard) {
+    let server_to_client = match step_process_loopback_udp_on_iface_with_post(
+        &server,
+        8,
+        &iface,
+        &guard,
+        |mailbox, event| mailbox.post(event),
+    ) {
         StepOutcome::Done(outcome) => outcome,
         _ => panic!("unexpected server udp loopback outcome"),
     };
@@ -326,12 +362,13 @@ fn udp_loopback_netperf_rr_ephemeral_collision_shape() {
         StepOutcome::Done(())
     );
     assert_eq!(
-        step_send_udp_loopback_kernel_bytes(
+        step_send_udp_loopback_kernel_bytes_with_post(
             &client,
             None,
             b"hello",
             SendRecvFlags::empty(),
             &guard,
+            |mailbox, event| mailbox.post(event),
         ),
         StepOutcome::Done(5)
     );
@@ -396,7 +433,13 @@ fn udp_loopback_inline_send_can_defer_delegate_poll_kick() {
         0
     );
 
-    let transfer = match step_process_loopback_udp_on_iface(&client, 8, &iface, &guard) {
+    let transfer = match step_process_loopback_udp_on_iface_with_post(
+        &client,
+        8,
+        &iface,
+        &guard,
+        |mailbox, event| mailbox.post(event),
+    ) {
         StepOutcome::Done(outcome) => outcome,
         _ => panic!("unexpected udp loopback outcome"),
     };
@@ -427,16 +470,29 @@ fn udp_loopback_direct_send_kernel_bytes_reaches_receiver() {
         step_bind(&client, inet(50_207), &guard),
         StepOutcome::Done(())
     );
+    let recv_mailbox = alloc::sync::Arc::new(TaskMailbox::new());
+    let recv_generation = recv_mailbox.next_generation();
+    let _subscription = server.readiness.recv_wq.subscribe(
+        RecvWireSet::HAS_DATA.bits(),
+        alloc::sync::Arc::downgrade(&recv_mailbox),
+        recv_generation,
+    );
+    let mut injected_posts = 0usize;
     assert_eq!(
-        step_send_udp_loopback_kernel_bytes(
+        step_send_udp_loopback_kernel_bytes_with_post(
             &client,
             Some(endpoint(40_207)),
             b"x",
             SendRecvFlags::empty(),
             &guard,
+            |mailbox, event| {
+                injected_posts += 1;
+                mailbox.post(event)
+            },
         ),
         StepOutcome::Done(1)
     );
+    assert_eq!(injected_posts, 1);
     assert_eq!(
         crate::net::delegate::net_delegate_queue().peek()
             & crate::net::delegate::DelegateWireSet::POLL.bits(),
@@ -477,12 +533,13 @@ fn udp_loopback_msg_more_defers_until_uncork_send() {
         StepOutcome::Done(())
     );
     assert_eq!(
-        step_send_udp_loopback_kernel_bytes(
+        step_send_udp_loopback_kernel_bytes_with_post(
             &client,
             Some(endpoint(40_208)),
             b"hello",
             SendRecvFlags::MSG_MORE,
             &guard,
+            |mailbox, event| mailbox.post(event),
         ),
         StepOutcome::Done(5)
     );
@@ -496,12 +553,13 @@ fn udp_loopback_msg_more_defers_until_uncork_send() {
     );
 
     assert_eq!(
-        step_send_udp_loopback_kernel_bytes(
+        step_send_udp_loopback_kernel_bytes_with_post(
             &client,
             Some(endpoint(40_208)),
             b"!",
             SendRecvFlags::empty(),
             &guard,
+            |mailbox, event| mailbox.post(event),
         ),
         StepOutcome::Done(1)
     );

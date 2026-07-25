@@ -1,5 +1,7 @@
 use super::*;
 
+use tx_services::time::{timekeeper_clock, ClockRead, TimekeeperClock};
+
 pub(super) fn connect_sockaddr_for_local_stack(
     kind: SocketKind,
     remote: KernelSockAddr,
@@ -198,7 +200,9 @@ pub(super) fn drive_tcp_loopback_after_connect(
         return Ok(false);
     }
     let guard = tx_substrate::epoch::guard();
-    match step_tcp_loopback_handshake(socket, &guard) {
+    match step_tcp_loopback_handshake_with_post(socket, &guard, |mailbox, event| {
+        mailbox.post(event)
+    }) {
         StepOutcome::Done(_) => Ok(true),
         StepOutcome::Err(Errno::EOPNOTSUPP) => Ok(false),
         StepOutcome::Err(errno) => Err(errno),
@@ -310,16 +314,25 @@ pub(super) fn drive_tcp_loopback_after_sendto(socket: &Cap<SocketIdentity>, writ
         return;
     }
     let guard = tx_substrate::epoch::guard();
-    let _ = step_tcp_loopback_transfer(socket, written, &guard);
+    let _ = step_tcp_loopback_transfer_with_post(socket, written, &guard, |mailbox, event| {
+        mailbox.post(event)
+    });
     socket
         .readiness
         .clear_send(tx_subsystems::net::structure::SendWireSet::SPACE);
 }
 
-pub(super) fn drive_udp_loopback_after_sendto(
+pub(super) fn drive_udp_loopback_after_sendto_with_post<F>(
     socket: &Cap<SocketIdentity>,
     written: usize,
-) -> bool {
+    post: F,
+) -> bool
+where
+    F: FnMut(
+        &tx_substrate::wake::mailbox::TaskMailbox,
+        tx_substrate::wake::mailbox::MailboxEvent,
+    ) -> bool,
+{
     if written == 0 {
         return false;
     }
@@ -334,14 +347,24 @@ pub(super) fn drive_udp_loopback_after_sendto(
     }
     let guard = tx_substrate::epoch::guard();
     matches!(
-        step_process_loopback_udp(socket, 8, &guard),
+        step_process_loopback_udp_with_post(socket, 8, &guard, post),
         StepOutcome::Done(outcome) if outcome.bytes_moved > 0 || outcome.tx_packets > 0
     )
 }
 
-pub(super) fn drive_loopback_after_sendto(socket: &Cap<SocketIdentity>, written: usize) -> bool {
+pub(super) fn drive_loopback_after_sendto_with_post<F>(
+    socket: &Cap<SocketIdentity>,
+    written: usize,
+    post: F,
+) -> bool
+where
+    F: FnMut(
+        &tx_substrate::wake::mailbox::TaskMailbox,
+        tx_substrate::wake::mailbox::MailboxEvent,
+    ) -> bool,
+{
     drive_tcp_loopback_after_sendto(socket, written);
-    drive_udp_loopback_after_sendto(socket, written)
+    drive_udp_loopback_after_sendto_with_post(socket, written, post)
 }
 
 pub(super) async fn yield_after_sendto_if_needed(socket: &Cap<SocketIdentity>) {
@@ -351,6 +374,7 @@ pub(super) async fn yield_after_sendto_if_needed(socket: &Cap<SocketIdentity>) {
 }
 
 pub(super) async fn finish_sendto_progress(
+    ctx: &SyscallCtx<'_>,
     socket: &Cap<SocketIdentity>,
     written: usize,
     flags: SendRecvFlags,
@@ -358,7 +382,9 @@ pub(super) async fn finish_sendto_progress(
     if flags.contains(SendRecvFlags::MSG_MORE) {
         return;
     }
-    let _ = drive_loopback_after_sendto(socket, written);
+    let _ = drive_loopback_after_sendto_with_post(socket, written, |mailbox, event| {
+        ctx.post_mailbox_ref_event(mailbox, event)
+    });
     yield_after_sendto_if_needed(socket).await;
 }
 
@@ -1704,8 +1730,7 @@ pub(super) fn wait_on_yield_shape(shape: YieldShape) -> Option<wait_source::Regi
     match shape {
         YieldShape::OnWaitSource { source, interests }
         | YieldShape::OnEdge { source, interests } => {
-            let token = tx_subsystems::execution::WaitToken::new(source.raw(), interests.raw());
-            wait_source::wait_on_token(token)
+            wait_source::wait_on_registered_source_id(source.raw(), interests.raw())
         }
         YieldShape::OnAgent { .. } | YieldShape::OnTimer { .. } => None,
     }
@@ -1717,10 +1742,13 @@ pub(super) enum SocketWaitWake {
     ItimerExpired,
 }
 
-pub(super) async fn wait_on_socket_or_itimer<P: TimeIf>(
+pub(super) async fn wait_on_socket_or_itimer<P>(
     mut socket_future: wait_source::RegisteredWaitFuture,
     ctx: &SyscallCtx<'_>,
-) -> SocketWaitWake {
+) -> SocketWaitWake
+where
+    TimekeeperClock<P>: ClockRead,
+{
     let pid = ctx.process.pid.0;
     // Linux never parks a task in a slow syscall while a signal that would be
     // delivered is already pending — the syscall aborts with EINTR and the AST
@@ -1738,11 +1766,11 @@ pub(super) async fn wait_on_socket_or_itimer<P: TimeIf>(
         let _ = socket_future.await;
         return SocketWaitWake::SocketReady;
     };
-    if <P as TimeIf>::read_ns() >= deadline_ns {
-        super::time::fire_itimer_real::<P>(pid);
+    if timekeeper_clock::<P>().monotonic_now_ns() >= deadline_ns {
+        super::time::fire_itimer_real_with_post::<P>(ctx);
         return SocketWaitWake::ItimerExpired;
     }
-    let Some(mut timer_future) = tx_subsystems::timer_sleep::sleep_until_ns(deadline_ns) else {
+    let Some(mut timer_future) = super::deadline_timer(ctx, deadline_ns) else {
         let _ = socket_future.await;
         return SocketWaitWake::SocketReady;
     };
@@ -1758,7 +1786,7 @@ pub(super) async fn wait_on_socket_or_itimer<P: TimeIf>(
     })
     .await;
     if wake == SocketWaitWake::ItimerExpired {
-        super::time::fire_itimer_real::<P>(pid);
+        super::time::fire_itimer_real_with_post::<P>(ctx);
     }
     wake
 }
@@ -1775,6 +1803,11 @@ pub(super) fn recv_special_flags_errno(flags: SendRecvFlags) -> Option<i32> {
 
 pub(super) fn maybe_raise_sigpipe<'a>(ctx: &SyscallCtx<'a>, errno: Errno, flags: SendRecvFlags) {
     if errno == Errno::EPIPE && !flags.contains(SendRecvFlags::MSG_NOSIGNAL) {
-        let _ = step_kill_process(&ctx.process, Signum::SIGPIPE, None);
+        let _ = tx_subsystems::signal::step_kill_process_with_post(
+            &ctx.process,
+            Signum::SIGPIPE,
+            None,
+            |mailbox, event| ctx.post_mailbox_event(mailbox, event),
+        );
     }
 }

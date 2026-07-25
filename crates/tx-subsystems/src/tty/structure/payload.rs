@@ -22,6 +22,7 @@ use crate::tty::ldisc::on_termios_changed;
 use crate::tty::ldisc::state::LdiscState;
 use crate::tty::structure::ring::TtyRing;
 use crate::tty::structure::termios::Termios;
+use crate::tty::structure::winsize::Winsize;
 
 use super::identity::TtyIdentity;
 use crate::tty::adapter::step_engine::AtomicSlot;
@@ -42,6 +43,7 @@ pub const INPUT_CAP: usize = 1024;
 pub const OUTPUT_CAP: usize = 1024;
 
 const INGEST_LINEARIZER_CAP: usize = 4;
+pub const DEFAULT_HARDWARE_WINSIZE: Winsize = Winsize::new(24, 80);
 
 // ---------------------------------------------------------------------------
 // TtyTransport
@@ -257,13 +259,21 @@ impl TtyPayload {
 
     /// Construct a payload for a hardware-backed TTY with cooked defaults.
     pub fn new_hardware(binding: &'static CharDeviceBinding) -> Self {
+        Self::new_hardware_with_winsize(binding, DEFAULT_HARDWARE_WINSIZE)
+    }
+
+    /// Construct a hardware-backed TTY with an externally seeded window size.
+    pub fn new_hardware_with_winsize(
+        binding: &'static CharDeviceBinding,
+        winsize: Winsize,
+    ) -> Self {
         Self {
             termios: {
                 let slot = AtomicSlot::empty();
                 slot.store(Some(Termios::default_cooked()));
                 slot
             },
-            window_size: AtomicU64::new(0),
+            window_size: AtomicU64::new(winsize.to_u64()),
             ldisc_state: UnsafeCell::new(LdiscState::new()),
             input_queue: SpinMutex::new(TtyRing::new()),
             eof_pending: AtomicBool::new(false),
@@ -361,6 +371,19 @@ mod tests {
         assert!(
             payload.with_termios(|t| t.c_lflag & ISIG != 0),
             "default hardware TTY must have ISIG"
+        );
+    }
+
+    #[test]
+    fn hardware_payload_starts_with_console_winsize() {
+        let payload = TtyPayload::new_hardware(&NOOP_BINDING);
+        assert_eq!(
+            Winsize::from_u64(
+                payload
+                    .window_size
+                    .load(core::sync::atomic::Ordering::Acquire)
+            ),
+            Winsize::new(24, 80)
         );
     }
 }

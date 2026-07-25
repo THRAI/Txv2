@@ -3,14 +3,14 @@
 //! These wrap the signalfd subsystem's free functions as `StepOp`
 //! impls so the reactor can drive them through its central
 //! `drive()` loop.  Mirrors the pattern established by
-//! `KillProcessOp` / `KillPgrpOp` in `signal/mod.rs`.
+//! `KillProcessWithPostOp` / `KillPgrpWithPostOp` in `signal/mod.rs`.
 
 use crate::process::structure::ProcessIdentity;
 use crate::signal::adapter::step_engine::{
-    NoProgress, OneShotStepOp, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
+    ByteProgress, NoProgress, OneShotStepOp, ScriptCtx, StepOp, StepOutcome, SubjectIdentity,
 };
 use crate::signalfd::adapter::step_engine::{Cap, ZoneError};
-use crate::signalfd::{signalfd_create, SignalFd};
+use crate::signalfd::{signalfd_create, signalfd_read, SignalFd, SIGNALFD_SIGINFO_SIZE};
 
 /// StepOp wrapper for [`signalfd_create`].
 pub struct SignalfdCreateOp {
@@ -34,3 +34,19 @@ impl<I: SubjectIdentity> StepOp<I> for SignalfdCreateOp {
 }
 
 impl<I: SubjectIdentity> OneShotStepOp<I> for SignalfdCreateOp {}
+
+pub struct SignalfdReadOp<'a> {
+    pub sfd: &'a SignalFd,
+    pub out: &'a mut [u8; SIGNALFD_SIGINFO_SIZE],
+    pub nonblocking: bool,
+}
+
+impl<I: SubjectIdentity> StepOp<I> for SignalfdReadOp<'_> {
+    type Output = usize;
+    type Progress = ByteProgress;
+
+    fn step(&mut self, ctx: &mut ScriptCtx<I>) -> StepOutcome<Self::Output, Self::Progress> {
+        let _ = ctx.subject();
+        signalfd_read(self.sfd, self.out, self.nonblocking)
+    }
+}

@@ -2,7 +2,7 @@ use tx_substrate::zone::{Cap, PayloadCap};
 
 use crate::execution::{Errno, Guard, StepOutcome, WaitToken};
 use crate::net::checks::require::require_socket_connect_target;
-use crate::net::delegate::net_delegate_kick_poll;
+use crate::net::delegate::net_delegate_kick_poll_with_post;
 use crate::net::execution::step_bind::table_error_to_errno;
 use crate::net::execution::yield_on_token;
 use crate::net::namespace::{net_namespace_payloads_snapshot, NetNamespacePayload};
@@ -102,7 +102,7 @@ pub fn step_connect(
 
     if blocked {
         if advanced {
-            net_delegate_kick_poll();
+            net_delegate_kick_poll_with_post(|mailbox, event| mailbox.post(event));
         }
         if let Some(outcome) = try_tcp_local_namespace_connect(socket, &payload, guard) {
             return outcome;
@@ -113,7 +113,7 @@ pub fn step_connect(
         );
         yield_on_token(wait)
     } else {
-        net_delegate_kick_poll();
+        net_delegate_kick_poll_with_post(|mailbox, event| mailbox.post(event));
         StepOutcome::Done(())
     }
 }
@@ -199,9 +199,15 @@ fn try_tcp_local_namespace_connect(
             remote: listener_local,
         });
     });
-    socket.readiness.fire_send(SendWireSet::SPACE);
+    socket
+        .readiness
+        .fire_send_with_post(SendWireSet::SPACE, |mailbox, event| mailbox.post(event));
     if accept_became_ready {
-        listener.readiness.fire_accept(AcceptWireSet::HAS_PENDING);
+        listener
+            .readiness
+            .fire_accept_with_post(AcceptWireSet::HAS_PENDING, |mailbox, event| {
+                mailbox.post(event)
+            });
     }
     Some(StepOutcome::Done(()))
 }
@@ -401,7 +407,11 @@ fn connect_unix_stream(
         unix_peer: local,
     };
     if listener_payload.enqueue_accept_entry(entry).is_some() {
-        listener.readiness.fire_accept(AcceptWireSet::HAS_PENDING);
+        listener
+            .readiness
+            .fire_accept_with_post(AcceptWireSet::HAS_PENDING, |mailbox, event| {
+                mailbox.post(event)
+            });
         StepOutcome::Done(())
     } else {
         let _ = table.withdraw_unix_stream_peer(socket.raw());
@@ -493,7 +503,9 @@ fn step_sctp_connect(
             .sctp_ensure_assoc(local)
             .map_or(0, |(id, _)| id);
         enqueue_sctp_comm_up(&listener, Some(local), server_assoc_id);
-        listener.readiness.fire_recv(RecvWireSet::HAS_DATA);
+        listener
+            .readiness
+            .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| mailbox.post(event));
         enqueue_sctp_comm_up(socket, Some(listener_local), client_assoc_id);
         return StepOutcome::Done(());
     }
@@ -537,7 +549,11 @@ fn step_sctp_connect(
         let _ = table.withdraw_sctp_connection(ConnectionKey::new(listener_local, local));
         return StepOutcome::Err(Errno::ECONNREFUSED);
     }
-    listener.readiness.fire_accept(AcceptWireSet::HAS_PENDING);
+    listener
+        .readiness
+        .fire_accept_with_post(AcceptWireSet::HAS_PENDING, |mailbox, event| {
+            mailbox.post(event)
+        });
 
     payload.with_protocol_mut(|protocol| {
         *protocol = SocketProtocol::Sctp(TcpState::Connected {
@@ -650,9 +666,10 @@ pub(crate) fn enqueue_sctp_comm_up(
         .record_sctp_message(bytes, true, 0, 0, peer)
         .is_some()
     {
-        socket
-            .readiness
-            .fire_recv(crate::net::structure::RecvWireSet::HAS_DATA);
+        socket.readiness.fire_recv_with_post(
+            crate::net::structure::RecvWireSet::HAS_DATA,
+            |mailbox, event| mailbox.post(event),
+        );
     }
 }
 

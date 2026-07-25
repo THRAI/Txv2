@@ -6,10 +6,11 @@ use crate::execution::{Guard, StepOutcome};
 use crate::net::namespace::{initial_net_namespace_payload, NetNamespacePayload};
 use crate::net::protocol::LoopbackIface;
 use crate::net::structure::{Ipv4Address, SocketIdentity, SocketProtocol, TcpState, UdpInner};
+use tx_substrate::wake::mailbox::{MailboxEvent, TaskMailbox};
 
 use super::{
-    step_process_loopback_icmp_on_iface, step_process_loopback_tcp,
-    step_process_loopback_udp_on_iface, step_tcp_loopback_handshake_on_iface,
+    step_process_loopback_icmp_on_iface_with_post, step_process_loopback_tcp_with_post,
+    step_process_loopback_udp_on_iface_with_post, step_tcp_loopback_handshake_on_iface_with_post,
 };
 
 pub const LOOPBACK_POLL_BUDGET_DEFAULT: LoopbackPollBudget = LoopbackPollBudget {
@@ -114,6 +115,27 @@ pub fn step_process_loopback_pending_in_namespace(
     budget: LoopbackPollBudget,
     guard: &Guard<'_>,
 ) -> StepOutcome<LoopbackPendingOutcome> {
+    step_process_loopback_pending_in_namespace_with_post(
+        _now,
+        net_namespace,
+        iface,
+        budget,
+        guard,
+        |mailbox, event| mailbox.post(event),
+    )
+}
+
+pub fn step_process_loopback_pending_in_namespace_with_post<F>(
+    _now: Instant,
+    net_namespace: PayloadCap<NetNamespacePayload>,
+    iface: &LoopbackIface,
+    budget: LoopbackPollBudget,
+    guard: &Guard<'_>,
+    mut post: F,
+) -> StepOutcome<LoopbackPendingOutcome>
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     // observe
     // upgrade
     // reserve
@@ -129,7 +151,7 @@ pub fn step_process_loopback_pending_in_namespace(
         .take(budget.tcp_connecting)
     {
         outcome.tcp_connect_attempted += 1;
-        match step_tcp_loopback_handshake_on_iface(&socket, iface, guard) {
+        match step_tcp_loopback_handshake_on_iface_with_post(&socket, iface, guard, &mut post) {
             StepOutcome::Done(connect) => {
                 outcome.tcp_connected += 1;
                 outcome.tx_packets += connect.handshake.tx_packets;
@@ -158,7 +180,13 @@ pub fn step_process_loopback_pending_in_namespace(
         }
 
         outcome.tcp_transfer_attempted += 1;
-        match step_process_loopback_tcp(&socket, budget.tcp_transfer_bytes, iface, guard) {
+        match step_process_loopback_tcp_with_post(
+            &socket,
+            budget.tcp_transfer_bytes,
+            iface,
+            guard,
+            &mut post,
+        ) {
             StepOutcome::Done(transfer) => {
                 outcome.tcp_bytes_moved += transfer.bytes_moved;
                 outcome.tx_packets += transfer.tx_packets;
@@ -193,7 +221,13 @@ pub fn step_process_loopback_pending_in_namespace(
         }
 
         outcome.udp_transfer_attempted += 1;
-        match step_process_loopback_udp_on_iface(&socket, budget.packet_budget, iface, guard) {
+        match step_process_loopback_udp_on_iface_with_post(
+            &socket,
+            budget.packet_budget,
+            iface,
+            guard,
+            &mut post,
+        ) {
             StepOutcome::Done(transfer) => {
                 outcome.udp_bytes_moved += transfer.bytes_moved;
                 outcome.tx_packets += transfer.tx_packets;
@@ -223,7 +257,13 @@ pub fn step_process_loopback_pending_in_namespace(
         }
 
         outcome.icmp_transfer_attempted += 1;
-        match step_process_loopback_icmp_on_iface(&socket, budget.packet_budget, iface, guard) {
+        match step_process_loopback_icmp_on_iface_with_post(
+            &socket,
+            budget.packet_budget,
+            iface,
+            guard,
+            &mut post,
+        ) {
             StepOutcome::Done(transfer) => {
                 outcome.icmp_bytes_moved += transfer.bytes_moved;
                 outcome.tx_packets += transfer.tx_packets;

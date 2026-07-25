@@ -9,6 +9,7 @@ use crate::net::protocol::build_icmpv4_echo_request;
 use crate::net::structure::{
     IpEndpoint, Ipv4Address, SendWireSet, SocketIdentity, SocketProtocol, TcpState, UdpInner,
 };
+use tx_substrate::wake::mailbox::{MailboxEvent, TaskMailbox};
 
 pub const DEVICE_TX_BUDGET_DEFAULT: DeviceTxBudget = DeviceTxBudget {
     tcp_connecting: 16,
@@ -76,52 +77,66 @@ impl DeviceTxOutcome {
     }
 }
 
-pub fn step_process_device_tx_pending(
+pub fn step_process_device_tx_pending_with_post<F>(
     sink: &dyn PacketTxSink,
     budget: DeviceTxBudget,
     guard: &Guard<'_>,
-) -> StepOutcome<DeviceTxOutcome> {
+    post: F,
+) -> StepOutcome<DeviceTxOutcome>
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     // observe
     // upgrade
     // reserve
     // commit
     // publish
-    step_process_device_tx_pending_in_namespace_at(
+    step_process_device_tx_pending_in_namespace_at_with_post::<F>(
         sink,
         initial_net_namespace_payload(),
         Instant::ZERO,
         budget,
         guard,
+        post,
     )
 }
 
-pub fn step_process_device_tx_pending_at(
+pub fn step_process_device_tx_pending_at_with_post<F>(
     sink: &dyn PacketTxSink,
     now: Instant,
     budget: DeviceTxBudget,
     guard: &Guard<'_>,
-) -> StepOutcome<DeviceTxOutcome> {
+    post: F,
+) -> StepOutcome<DeviceTxOutcome>
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     // observe
     // upgrade
     // reserve
     // commit
     // publish
-    step_process_device_tx_pending_in_namespace_at(
+    step_process_device_tx_pending_in_namespace_at_with_post::<F>(
         sink,
         initial_net_namespace_payload(),
         now,
         budget,
         guard,
+        post,
     )
 }
 
-pub fn step_process_device_tx_pending_in_namespace_at(
+pub fn step_process_device_tx_pending_in_namespace_at_with_post<F>(
     sink: &dyn PacketTxSink,
     net_namespace: PayloadCap<NetNamespacePayload>,
     now: Instant,
     budget: DeviceTxBudget,
     guard: &Guard<'_>,
-) -> StepOutcome<DeviceTxOutcome> {
+    mut post: F,
+) -> StepOutcome<DeviceTxOutcome>
+where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     // observe
     // upgrade
     // reserve
@@ -167,7 +182,7 @@ pub fn step_process_device_tx_pending_in_namespace_at(
         if outcome.udp_attempted >= budget.udp_bound {
             break;
         }
-        process_udp_tx_socket(&socket, sink, now, guard, &mut outcome);
+        process_udp_tx_socket(&socket, sink, now, guard, &mut outcome, &mut post);
     }
 
     let mut raw_icmp_seen = Vec::new();
@@ -182,7 +197,7 @@ pub fn step_process_device_tx_pending_in_namespace_at(
         if outcome.raw_icmp_attempted >= budget.raw_icmp {
             break;
         }
-        process_raw_icmp_tx_socket(&socket, sink, now, guard, &mut outcome);
+        process_raw_icmp_tx_socket(&socket, sink, now, guard, &mut outcome, &mut post);
     }
 
     StepOutcome::Done(outcome)
@@ -231,13 +246,16 @@ fn process_tcp_tx_socket(
     }
 }
 
-fn process_udp_tx_socket(
+fn process_udp_tx_socket<F>(
     socket: &Cap<SocketIdentity>,
     sink: &dyn PacketTxSink,
     now: Instant,
     guard: &Guard<'_>,
     outcome: &mut DeviceTxOutcome,
-) {
+    post: &mut F,
+) where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     let Some(payload) = socket.acquire_operational() else {
         return;
     };
@@ -266,7 +284,9 @@ fn process_udp_tx_socket(
             outcome.tx_bytes += frame_len;
             outcome.sockets_touched += 1;
             if drain.became_available {
-                outcome.wakes_fired += socket.readiness.fire_send(SendWireSet::SPACE);
+                outcome.wakes_fired += socket
+                    .readiness
+                    .fire_send_with_post(SendWireSet::SPACE, post);
             }
         }
         PacketTxResult::Busy => {
@@ -281,13 +301,16 @@ fn process_udp_tx_socket(
     }
 }
 
-fn process_raw_icmp_tx_socket(
+fn process_raw_icmp_tx_socket<F>(
     socket: &Cap<SocketIdentity>,
     sink: &dyn PacketTxSink,
     now: Instant,
     guard: &Guard<'_>,
     outcome: &mut DeviceTxOutcome,
-) {
+    post: &mut F,
+) where
+    F: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     let Some(payload) = socket.acquire_operational() else {
         return;
     };
@@ -318,7 +341,9 @@ fn process_raw_icmp_tx_socket(
             outcome.tx_bytes += frame_len;
             outcome.sockets_touched += 1;
             if drain.became_available {
-                outcome.wakes_fired += socket.readiness.fire_send(SendWireSet::SPACE);
+                outcome.wakes_fired += socket
+                    .readiness
+                    .fire_send_with_post(SendWireSet::SPACE, post);
             }
         }
         PacketTxResult::Busy => {

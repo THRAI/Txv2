@@ -14,7 +14,8 @@ fn step_recv_consumes_available_bytes_and_clears_when_empty() {
     .expect("tcp socket");
     let payload = tcp.acquire_operational().expect("payload");
     assert!(payload.record_recv_payload(endpoint(50_135), endpoint(40_135), std::vec![0u8; 128]));
-    tcp.readiness.fire_recv(RecvWireSet::HAS_DATA);
+    tcp.readiness
+        .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| mailbox.post(event));
 
     assert_eq!(
         step_recv(&tcp, 64, SendRecvFlags::empty(), &guard),
@@ -69,7 +70,8 @@ fn step_recv_broken_without_buffered_data_returns_eof() {
         SocketOptionSet::default_tcp(),
     )
     .expect("tcp socket");
-    tcp.readiness.fire_recv(RecvWireSet::BROKEN);
+    tcp.readiness
+        .fire_recv_with_post(RecvWireSet::BROKEN, |mailbox, event| mailbox.post(event));
 
     assert_eq!(
         step_recv(&tcp, 32, SendRecvFlags::empty(), &guard),
@@ -91,7 +93,8 @@ fn step_recv_peek_does_not_consume_or_clear() {
     .expect("tcp socket");
     let payload = tcp.acquire_operational().expect("payload");
     assert!(payload.record_recv_payload(endpoint(50_136), endpoint(40_136), std::vec![0u8; 16]));
-    tcp.readiness.fire_recv(RecvWireSet::HAS_DATA);
+    tcp.readiness
+        .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| mailbox.post(event));
 
     assert_eq!(
         step_recv(&tcp, 8, SendRecvFlags::MSG_PEEK, &guard),
@@ -115,7 +118,8 @@ fn step_recv_errqueue_without_error_returns_eagain() {
     .expect("tcp socket");
     let payload = tcp.acquire_operational().expect("payload");
     assert!(payload.record_recv_payload(endpoint(50_137), endpoint(40_137), std::vec![0u8; 16]));
-    tcp.readiness.fire_recv(RecvWireSet::HAS_DATA);
+    tcp.readiness
+        .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| mailbox.post(event));
 
     assert_eq!(
         step_recv(&tcp, 8, SendRecvFlags::MSG_ERRQUEUE, &guard),
@@ -137,7 +141,8 @@ fn step_send_consumes_space_and_clears_when_full() {
         .expect("udp socket");
     assert_eq!(step_bind(&udp, inet(40_136), &guard), StepOutcome::Done(()));
     let payload = udp.acquire_operational().expect("payload");
-    udp.readiness.fire_send(SendWireSet::SPACE);
+    udp.readiness
+        .fire_send_with_post(SendWireSet::SPACE, |mailbox, event| mailbox.post(event));
 
     assert_eq!(
         step_send(&udp, 32, SendRecvFlags::empty(), &guard),
@@ -235,12 +240,13 @@ fn step_send_udp_loopback_oob_is_not_supported() {
     assert_eq!(step_bind(&udp, inet(40_206), &guard), StepOutcome::Done(()));
 
     assert_eq!(
-        step_send_udp_loopback_kernel_bytes(
+        step_send_udp_loopback_kernel_bytes_with_post(
             &udp,
             Some(endpoint(50_206)),
             b"x",
             SendRecvFlags::MSG_OOB,
-            &guard
+            &guard,
+            |mailbox, event| mailbox.post(event),
         ),
         StepOutcome::Err(Errno::EOPNOTSUPP)
     );

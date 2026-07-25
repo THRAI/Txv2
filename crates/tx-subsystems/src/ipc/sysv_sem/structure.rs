@@ -1,7 +1,7 @@
 //! SysV semaphore — identity, payload, and SEM_UNDO types.
 //!
 //! `SemArrayIdentity`: key, semid, cred, nsems, perm.
-//! `SemArrayPayload`: per-sem values, changed_seq, wake channel.
+//! `SemArrayPayload`: per-sem values, changed_seq, wake source.
 //!
 //! Day-1 single-namespace: a global `SEM_TABLE` maps semid → Cap.
 
@@ -13,7 +13,7 @@ use crate::ipc::sysv_shm::structure::IpcPerm;
 use crate::process::adapter::step_engine::{
     Cap, PayloadCap, SpinMutex, Zone, ZoneAllocated, ZoneError,
 };
-use crate::process::adapter::wait_routing::{self, Channel};
+use crate::process::adapter::wait_routing::{self, WaitSource};
 use crate::process::nsproxy::SysvKey;
 
 // ---------------------------------------------------------------------------
@@ -86,15 +86,20 @@ pub struct SemArrayPayload {
     pub values: SpinMutex<Vec<SemValue>>,
     /// Monotonic counter bumped on every semop that changes any value.
     pub changed_seq: AtomicU64,
-    /// Wake channel fired when any sem value changes.
-    pub changed_channel: Channel,
     pub changed_source_id: u64,
-    pub changed_source: alloc::sync::Arc<crate::process::adapter::wait_routing::WaitSource>,
+    pub changed_source: alloc::sync::Arc<WaitSource>,
+}
+
+impl SemArrayPayload {
+    /// Endpoint fired when any semaphore value in the array changes.
+    pub fn changed_endpoint(&self) -> &alloc::sync::Arc<WaitSource> {
+        &self.changed_source
+    }
 }
 
 impl Drop for SemArrayPayload {
     fn drop(&mut self) {
-        crate::wait_source::release_wait_channel(self.changed_source_id);
+        crate::wait_source::release_wait_source(self.changed_source_id);
         wait_routing::unregister_source(self.changed_source_id);
     }
 }
@@ -157,8 +162,8 @@ pub(crate) fn register_sem(
     use crate::process::adapter::step_engine::sign;
     let semid = NEXT_SEMID.fetch_add(1, Ordering::Relaxed);
 
-    let (changed_channel, changed_source_id, changed_source) =
-        crate::ipc::sysv_sem::notification::new_changed_channel();
+    let (changed_source_id, changed_source) =
+        crate::ipc::sysv_sem::notification::new_changed_source();
 
     let identity = sign(SemArrayIdentity {
         key,
@@ -176,7 +181,6 @@ pub(crate) fn register_sem(
     let payload = sign(SemArrayPayload {
         values: SpinMutex::new(alloc::vec![SemValue::default(); nsems as usize]),
         changed_seq: AtomicU64::new(0),
-        changed_channel,
         changed_source_id,
         changed_source,
     })?;

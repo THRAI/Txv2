@@ -26,6 +26,7 @@ use crate::io_manager::runtime::{
     IoServiceKind, QueueDepth, ServiceBudget, ServiceKick, ServiceWakeSource,
 };
 use crate::page_backed::{FileBlockServiceTurn, Frame, PageContainer};
+use tx_services::time::DeadlineRegistrar;
 
 const MAX_STATIC_BLOCK_DEVICES: usize = 16;
 const FILE_IO_SERVICE_SOURCE_ID_BASE: u64 = 0x7200;
@@ -64,9 +65,238 @@ impl PhysicalBlockNumber {
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RtcTime {
+    pub tm_sec: i32,
+    pub tm_min: i32,
+    pub tm_hour: i32,
+    pub tm_mday: i32,
+    pub tm_mon: i32,
+    pub tm_year: i32,
+    pub tm_wday: i32,
+    pub tm_yday: i32,
+    pub tm_isdst: i32,
+}
+
+impl RtcTime {
+    pub fn from_unix_ns(ns: u64) -> Result<Self, RtcError> {
+        let seconds = ns / 1_000_000_000;
+        if seconds > i64::MAX as u64 {
+            return Err(RtcError::Range);
+        }
+        Self::from_unix_seconds(seconds as i64)
+    }
+
+    pub fn from_unix_seconds(seconds: i64) -> Result<Self, RtcError> {
+        let days = seconds.div_euclid(86_400);
+        let rem = seconds.rem_euclid(86_400);
+        let (year, month, day) = civil_from_days(days).ok_or(RtcError::Range)?;
+        let tm_yday = day_of_year(year, month, day) as i32;
+        Ok(Self {
+            tm_sec: (rem % 60) as i32,
+            tm_min: ((rem / 60) % 60) as i32,
+            tm_hour: (rem / 3_600) as i32,
+            tm_mday: day as i32,
+            tm_mon: month as i32 - 1,
+            tm_year: year - 1900,
+            tm_wday: (days + 4).rem_euclid(7) as i32,
+            tm_yday,
+            tm_isdst: 0,
+        })
+    }
+
+    pub fn to_unix_ns(self) -> Result<u64, RtcError> {
+        let year = self.tm_year.checked_add(1900).ok_or(RtcError::Range)?;
+        let month = self.tm_mon.checked_add(1).ok_or(RtcError::InvalidTime)?;
+        if !(1..=12).contains(&month)
+            || !(1..=31).contains(&self.tm_mday)
+            || !(0..=23).contains(&self.tm_hour)
+            || !(0..=59).contains(&self.tm_min)
+            || !(0..=59).contains(&self.tm_sec)
+        {
+            return Err(RtcError::InvalidTime);
+        }
+        let month = month as u32;
+        let day = self.tm_mday as u32;
+        let days = days_from_civil(year, month, day).ok_or(RtcError::Range)?;
+        let roundtrip = civil_from_days(days).ok_or(RtcError::Range)?;
+        if roundtrip != (year, month, day) {
+            return Err(RtcError::InvalidTime);
+        }
+        if days < 0 {
+            return Err(RtcError::Range);
+        }
+        let day_seconds = (self.tm_hour as i64)
+            .checked_mul(3_600)
+            .and_then(|v| v.checked_add((self.tm_min as i64) * 60))
+            .and_then(|v| v.checked_add(self.tm_sec as i64))
+            .ok_or(RtcError::Range)?;
+        let seconds = days
+            .checked_mul(86_400)
+            .and_then(|v| v.checked_add(day_seconds))
+            .ok_or(RtcError::Range)?;
+        let seconds = u64::try_from(seconds).map_err(|_| RtcError::Range)?;
+        seconds.checked_mul(1_000_000_000).ok_or(RtcError::Range)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RtcAlarm {
+    pub time: RtcTime,
+    pub enabled: bool,
+    pub pending: bool,
+}
+
+#[derive(Clone, Copy)]
+pub struct RtcAlarmEmulation<'a> {
+    pub registrar: &'a dyn DeadlineRegistrar,
+    pub monotonic_deadline_ns: u64,
+}
+
+impl<'a> RtcAlarmEmulation<'a> {
+    pub fn new(registrar: &'a dyn DeadlineRegistrar, monotonic_deadline_ns: u64) -> Self {
+        Self {
+            registrar,
+            monotonic_deadline_ns,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RtcEventMask(u32);
+
+impl RtcEventMask {
+    pub const UPDATE: Self = Self(1 << 0);
+    pub const ALARM: Self = Self(1 << 1);
+
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    pub const fn from_bits_truncate(bits: u32) -> Self {
+        Self(bits & (Self::UPDATE.bits() | Self::ALARM.bits()))
+    }
+
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    pub const fn contains(self, other: Self) -> bool {
+        (self.0 & other.0) == other.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RtcError {
+    Unsupported,
+    InvalidTime,
+    Range,
+    Hardware,
+}
+
+impl From<RtcError> for Errno {
+    fn from(value: RtcError) -> Self {
+        match value {
+            RtcError::Unsupported => Errno::EOPNOTSUPP,
+            RtcError::InvalidTime | RtcError::Range => Errno::EINVAL,
+            RtcError::Hardware => Errno::ENODEV,
+        }
+    }
+}
+
+pub trait RtcDeviceOps: Send + Sync + 'static {
+    fn read_time(&self, _guard: &Guard<'_>) -> Result<RtcTime, RtcError> {
+        Err(RtcError::Unsupported)
+    }
+
+    fn set_time(&self, _time: RtcTime, _guard: &Guard<'_>) -> Result<(), RtcError> {
+        Err(RtcError::Unsupported)
+    }
+
+    fn read_alarm(&self, _guard: &Guard<'_>) -> Result<RtcAlarm, RtcError> {
+        Err(RtcError::Unsupported)
+    }
+
+    fn set_alarm(&self, _alarm: RtcAlarm, _guard: &Guard<'_>) -> Result<(), RtcError> {
+        Err(RtcError::Unsupported)
+    }
+
+    fn set_alarm_with_emulation(
+        &self,
+        alarm: RtcAlarm,
+        guard: &Guard<'_>,
+        _emulation: Option<RtcAlarmEmulation<'_>>,
+    ) -> Result<(), RtcError> {
+        self.set_alarm(alarm, guard)
+    }
+
+    fn poll_events(&self, _guard: &Guard<'_>) -> Result<RtcEventMask, RtcError> {
+        Ok(RtcEventMask::empty())
+    }
+}
+
 pub trait CharDeviceOps: Send + Sync + 'static {
     fn read(&self, out: &mut [u8], guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress>;
     fn write(&self, bytes: &[u8], guard: &Guard<'_>) -> StepOutcome<usize, ByteProgress>;
+
+    fn rtc_ops(&self) -> Option<&dyn RtcDeviceOps> {
+        None
+    }
+}
+
+fn civil_from_days(days: i64) -> Option<(i32, u32, u32)> {
+    let z = days.checked_add(719_468)?;
+    let era = if z >= 0 { z } else { z - 146_096 }.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + if month <= 2 { 1 } else { 0 };
+    if year < i32::MIN as i64 || year > i32::MAX as i64 {
+        return None;
+    }
+    Some((year as i32, month as u32, day as u32))
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> Option<i64> {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let year = year as i64 - if month <= 2 { 1 } else { 0 };
+    let era = if year >= 0 { year } else { year - 399 }.div_euclid(400);
+    let yoe = year - era * 400;
+    let month = month as i64;
+    let day = day as i64;
+    let mp = month + if month > 2 { -3 } else { 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era.checked_mul(146_097)?
+        .checked_add(doe)?
+        .checked_sub(719_468)
+}
+
+fn day_of_year(year: i32, month: u32, day: u32) -> u32 {
+    const COMMON: [u32; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+    const LEAP: [u32; 12] = [0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335];
+    let idx = month.saturating_sub(1) as usize;
+    let base = if is_leap_year(year) {
+        LEAP.get(idx).copied().unwrap_or(0)
+    } else {
+        COMMON.get(idx).copied().unwrap_or(0)
+    };
+    base + day.saturating_sub(1)
+}
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
 }
 
 #[derive(Clone, Copy)]
@@ -862,10 +1092,25 @@ pub fn reset_page_container_file_io_service_registry_for_test() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::io_manager::backend::{BlockPageRequestTracker, PageFrameRef};
+    use crate::io_manager::block::{
+        Bio, BioPlan, BioVec, BlockCompletionSource, BlockDispatch, BlockFlags, BlockOp,
+        BlockQueue, BlockRequestId, BlockTag, DeviceKey, LbaRange, SubmitOutcome,
+    };
+    use crate::io_manager::page::service::{PageService, PageServiceTurn, PageServiceWork};
+    use crate::io_manager::page::{
+        PageContainerKey, PageGeneration, PageIoFlags, PageIoOp, PageIoPriority, PageIoRange,
+        PageIoRequest, PageIoRequestId,
+    };
+    use crate::io_manager::runtime::{QueueDepth, ServiceBudget};
     use crate::page_backed::{AnonSwapPolicy, PageContainerKind};
+    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use tx_hal::Ppn;
+    use tx_services::time::DEFAULT_REALTIME_EPOCH_BASE_NS;
 
     struct RecordingBlockDevice;
+    static LAST_READ_BLOCK: AtomicU64 = AtomicU64::new(u64::MAX);
+    static BARRIER_COUNT: AtomicUsize = AtomicUsize::new(0);
 
     impl BlockDeviceOps for RecordingBlockDevice {
         fn read_blocks(
@@ -874,6 +1119,7 @@ mod tests {
             target: &mut [Frame],
             _guard: &Guard<'_>,
         ) -> StepOutcome<(), NoProgress> {
+            LAST_READ_BLOCK.store(block_id.as_u64(), Ordering::SeqCst);
             target[0] = Frame::new(Ppn(block_id.as_u64() as usize));
             StepOutcome::done(())
         }
@@ -888,6 +1134,7 @@ mod tests {
         }
 
         fn barrier(&self, _guard: &Guard<'_>) -> StepOutcome<(), NoProgress> {
+            BARRIER_COUNT.fetch_add(1, Ordering::SeqCst);
             StepOutcome::done(())
         }
     }
@@ -1058,12 +1305,187 @@ mod tests {
         assert_eq!(spawner.0.load(Ordering::Acquire), 2);
         assert_eq!(submit_pending_file_io_service_runtimes(), 0);
         assert_eq!(
-            install_file_io_service_runtime_spawner(Arc::new(CountingSpawner(AtomicUsize::new(
-                0,
-            )))),
+            install_file_io_service_runtime_spawner(Arc::new(CountingSpawner(
+                AtomicUsize::new(0,)
+            ))),
             None
         );
 
         reset_page_container_file_io_service_registry_for_test();
+    }
+
+    #[test]
+    fn block_device_dispatch_adapter_executes_read_dispatch_and_polls_completion() {
+        use crate::adapter::step_engine::guard;
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        LAST_READ_BLOCK.store(u64::MAX, Ordering::SeqCst);
+        let guard = guard();
+        let handle = BlockDeviceHandle::partition(&BLOCK_REG, 32, 16);
+        let mut adapter = BlockDeviceDispatchAdapter::new(handle, &guard);
+        let dispatch = BlockDispatch {
+            tag: BlockTag::new(7),
+            bio: Bio {
+                id: BlockRequestId::new(3),
+                plan: BioPlan::new(
+                    DeviceKey::new(BLOCK_REG.devt.raw()),
+                    BlockOp::Read,
+                    LbaRange::new(2, 8),
+                    alloc::vec![BioVec::new(0, 0, 4096)],
+                    BlockFlags::EMPTY,
+                ),
+            },
+        };
+
+        adapter.submit(&dispatch);
+        let completion = adapter.poll_completion().expect("completion");
+
+        assert_eq!(completion.tag, BlockTag::new(7));
+        assert_eq!(completion.result, Ok(()));
+        assert_eq!(LAST_READ_BLOCK.load(Ordering::SeqCst), 34);
+        assert_eq!(adapter.poll_completion(), None);
+    }
+
+    #[test]
+    fn block_device_dispatch_adapter_executes_barrier_dispatch() {
+        use crate::adapter::step_engine::guard;
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        BARRIER_COUNT.store(0, Ordering::SeqCst);
+        let guard = guard();
+        let handle = BlockDeviceHandle::whole(&BLOCK_REG);
+        let mut adapter = BlockDeviceDispatchAdapter::new(handle, &guard);
+        let dispatch = BlockDispatch {
+            tag: BlockTag::new(8),
+            bio: Bio {
+                id: BlockRequestId::new(4),
+                plan: BioPlan::new(
+                    DeviceKey::new(BLOCK_REG.devt.raw()),
+                    BlockOp::Barrier,
+                    LbaRange::new(0, 0),
+                    alloc::vec::Vec::new(),
+                    BlockFlags::BARRIER,
+                ),
+            },
+        };
+
+        adapter.submit(&dispatch);
+        let completion = adapter.poll_completion().expect("completion");
+
+        assert_eq!(completion.tag, BlockTag::new(8));
+        assert_eq!(completion.result, Ok(()));
+        assert_eq!(BARRIER_COUNT.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn block_device_service_turn_routes_read_completion_into_page_service() {
+        use crate::adapter::step_engine::guard;
+        tx_test_support::init_host();
+        let _lock = crate::test_support::EPOCH_TEST_LOCK
+            .lock()
+            .expect("epoch test lock");
+        LAST_READ_BLOCK.store(u64::MAX, Ordering::SeqCst);
+
+        let request = PageIoRequest::new(
+            PageIoRequestId::new(55),
+            PageContainerKey::new(9),
+            PageIoRange::new(6, 1),
+            PageIoOp::Read,
+            PageIoPriority::Demand,
+            PageIoFlags::DEMAND,
+            Some(PageGeneration::new(77)),
+        );
+        let mut block_queue = BlockQueue::new(4);
+        let submit = block_queue
+            .submit(BioPlan::new(
+                DeviceKey::new(BLOCK_REG.devt.raw()),
+                BlockOp::Read,
+                LbaRange::new(2, 1),
+                alloc::vec![BioVec::new(123, 0, 4096)],
+                BlockFlags::EMPTY,
+            ))
+            .expect("queue read bio");
+        assert_eq!(submit, SubmitOutcome::Queued(BlockRequestId::new(1)));
+
+        let mut tracker = BlockPageRequestTracker::new();
+        tracker.record_submit_outcomes(request, &[submit]);
+        let mut page_service = PageService::new(4);
+        let mut block_driver =
+            crate::io_manager::block::BlockServiceDriver::new(ServiceBudget::new(1));
+        let mut depth = QueueDepth::new(1);
+        let mut tags = crate::io_manager::block::BlockTagTable::new();
+        let guard = guard();
+        let handle = BlockDeviceHandle::partition(&BLOCK_REG, 32, 16);
+
+        let turn = drive_block_device_service_once(
+            handle,
+            &guard,
+            &mut block_driver,
+            &mut block_queue,
+            &mut depth,
+            &mut tags,
+            &mut tracker,
+            &mut page_service,
+            |_| false,
+        )
+        .expect("service turn");
+
+        assert_eq!(turn.dispatched, 1);
+        assert_eq!(turn.device_completions, 1);
+        assert_eq!(turn.page_completions, 1);
+        assert_eq!(LAST_READ_BLOCK.load(Ordering::SeqCst), 34);
+        assert_eq!(depth.in_flight(), 0);
+        assert!(tags.is_empty());
+        assert!(tracker.is_empty());
+
+        match page_service.drain_turn(ServiceBudget::new(1)) {
+            PageServiceTurn::Work(mut items) => match items.remove(0) {
+                PageServiceWork::Completion(route) => {
+                    assert_eq!(route.completion.id, PageIoRequestId::new(55));
+                    assert_eq!(route.completion.generation, PageGeneration::new(77));
+                    assert_eq!(route.frame, Some(PageFrameRef::new(Ppn(123))));
+                }
+                other => panic!("expected page completion, got {other:?}"),
+            },
+            other => panic!("expected page work, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rtc_time_converts_default_realtime_epoch() {
+        let rtc = RtcTime::from_unix_ns(DEFAULT_REALTIME_EPOCH_BASE_NS)
+            .expect("default realtime epoch should be representable");
+
+        assert_eq!(rtc.tm_sec, 0);
+        assert_eq!(rtc.tm_min, 0);
+        assert_eq!(rtc.tm_hour, 0);
+        assert_eq!(rtc.tm_mday, 23);
+        assert_eq!(rtc.tm_mon, 4);
+        assert_eq!(rtc.tm_year, 126);
+        assert_eq!(rtc.tm_isdst, 0);
+        assert_eq!(
+            rtc.to_unix_ns().expect("rtc converts back to unix ns"),
+            DEFAULT_REALTIME_EPOCH_BASE_NS
+        );
+    }
+
+    #[test]
+    fn rtc_time_rejects_invalid_calendar_values() {
+        let mut invalid = RtcTime::from_unix_seconds(0).expect("epoch converts");
+        invalid.tm_mon = 12;
+        assert_eq!(invalid.to_unix_ns(), Err(RtcError::InvalidTime));
+
+        invalid = RtcTime::from_unix_seconds(0).expect("epoch converts");
+        invalid.tm_year = 69;
+        assert_eq!(invalid.to_unix_ns(), Err(RtcError::Range));
+
+        invalid = RtcTime::from_unix_seconds(0).expect("epoch converts");
+        invalid.tm_mday = 31;
+        invalid.tm_mon = 1;
+        assert_eq!(invalid.to_unix_ns(), Err(RtcError::InvalidTime));
     }
 }

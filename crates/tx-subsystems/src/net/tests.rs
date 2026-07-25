@@ -3,7 +3,7 @@ use super::structure::{
     Ipv4MulticastGroup, Ipv6Address, KernelSockAddr, PollMask, ProtocolNumber, RawIcmpState,
     RecvWireSet, SendRecvFlags, SendWireSet, SockAddrIn, SockAddrIn6, SockShutdownCmd,
     SocketIdentity, SocketKind, SocketOptionSet, SocketProtocol, SocketType, TcpState,
-    TcpTlsUlpState, UdpInner, ValidSocketType,
+    TcpTlsUlpState, UdpInner, UrgentEvent, ValidSocketType,
 };
 use crate::execution::{Errno, WaitToken};
 use crate::net::checks::require::{
@@ -27,14 +27,15 @@ use crate::net::device::{
 use crate::net::execution::{
     socket_accept_wait_token, socket_recv_wait_token, socket_send_wait_token,
     socket_urgent_wait_token, step_accept, step_bind, step_connect, step_listen, step_poll_ready,
-    step_process_device_tx_pending_in_namespace_at, step_process_loopback_pending,
+    step_process_device_tx_pending_in_namespace_at_with_post, step_process_loopback_pending,
     step_process_loopback_pending_zero, step_process_loopback_tcp,
-    step_process_loopback_udp_on_iface, step_process_network_events,
+    step_process_loopback_udp_on_iface_with_post, step_process_network_events,
     step_process_network_events_at, step_process_network_events_in_namespace_at,
-    step_process_network_tick, step_process_network_tick_loopback, step_recv,
-    step_recv_kernel_bytes, step_send, step_send_kernel_bytes, step_send_to_kernel_bytes,
-    step_send_to_kernel_bytes_with_poll_kick, step_send_udp_loopback_kernel_bytes, step_shutdown,
-    step_socket_close, step_socket_create, step_tcp_backlog_cleanup, step_tcp_close_staging,
+    step_process_network_events_in_namespace_at_with_post, step_process_network_tick,
+    step_process_network_tick_loopback, step_recv, step_recv_kernel_bytes, step_send,
+    step_send_kernel_bytes, step_send_to_kernel_bytes, step_send_to_kernel_bytes_with_poll_kick,
+    step_send_udp_loopback_kernel_bytes_with_post, step_shutdown, step_socket_close,
+    step_socket_create, step_tcp_backlog_cleanup, step_tcp_close_staging,
     step_tcp_connection_cleanup, step_tcp_loopback_handshake, step_tcp_loopback_handshake_on_iface,
     step_tcp_loopback_transfer, DeviceTxBudget, LoopbackPollBudget, NET_EVENT_BUDGET,
     TCP_BACKLOG_RETRANSMIT_BACKOFF_MILLIS, TCP_BACKLOG_TIMEOUT_STAGING_MILLIS,
@@ -44,8 +45,9 @@ use crate::net::facade::{
     SocketBindOps,
 };
 use crate::net::packet::{
-    demux_rx_frame_with_smoltcp, LoopbackIpPacket, PacketDispatch, PacketSource, PacketTxReadiness,
-    PacketTxResult, PacketTxSink, RxFrame, TcpPacketEvent, TcpPacketFlags, UdpPacketEvent,
+    demux_rx_frame_with_smoltcp, LoopbackIpPacket, NetworkPublish, PacketDispatch, PacketSource,
+    PacketTxReadiness, PacketTxResult, PacketTxSink, RxFrame, TcpPacketEvent, TcpPacketFlags,
+    UdpPacketEvent,
 };
 use crate::net::protocol::{
     build_icmpv4_echo_request_message, decide_ipv4_route, loopback_iface, ArpSnapshotState,
@@ -69,6 +71,7 @@ use core::ptr::null;
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use tx_reactor::{wait::WaitOutcome, Reactor};
 use tx_substrate::step::{NoProgress, StepOutcome, YieldShape};
+use tx_substrate::wake::mailbox::TaskMailbox;
 
 mod bridge_tests;
 mod byte_io_tests;

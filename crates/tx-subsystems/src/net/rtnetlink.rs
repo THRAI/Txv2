@@ -14,6 +14,7 @@ use core::str;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use smoltcp::time::Instant;
+use tx_substrate::wake::mailbox::{MailboxEvent, TaskMailbox};
 use tx_substrate::zone::{Cap, PayloadCap};
 
 use crate::cred::Cred;
@@ -269,51 +270,61 @@ impl RawNetlinkRouteSocket {
     }
 }
 
-pub fn netlink_route_send(
+pub fn netlink_route_send_with_post<P>(
     socket: &Cap<SocketIdentity>,
     bytes: &[u8],
     cred: Cred,
-) -> Result<usize, Errno> {
+    post: P,
+) -> Result<usize, Errno>
+where
+    P: FnMut(&TaskMailbox, MailboxEvent) -> bool,
+{
     let mut no_netns_fd = |_fd: i32| None;
     let mut no_netns_pid = |_pid: u32| None;
-    netlink_route_send_with_netns_resolvers(
+    netlink_route_send_with_netns_resolvers_and_post(
         socket,
         bytes,
         cred,
         &mut no_netns_fd,
         &mut no_netns_pid,
+        post,
     )
 }
 
-pub fn netlink_route_send_with_netns_resolver<F>(
+pub fn netlink_route_send_with_netns_resolver_and_post<F, P>(
     socket: &Cap<SocketIdentity>,
     bytes: &[u8],
     cred: Cred,
     resolve_netns_fd: &mut F,
+    post: P,
 ) -> Result<usize, Errno>
 where
     F: FnMut(i32) -> Option<PayloadCap<NetNamespacePayload>>,
+    P: FnMut(&TaskMailbox, MailboxEvent) -> bool,
 {
     let mut no_netns_pid = |_pid: u32| None;
-    netlink_route_send_with_netns_resolvers(
+    netlink_route_send_with_netns_resolvers_and_post(
         socket,
         bytes,
         cred,
         resolve_netns_fd,
         &mut no_netns_pid,
+        post,
     )
 }
 
-pub fn netlink_route_send_with_netns_resolvers<F, G>(
+pub fn netlink_route_send_with_netns_resolvers_and_post<F, G, P>(
     socket: &Cap<SocketIdentity>,
     bytes: &[u8],
     cred: Cred,
     resolve_netns_fd: &mut F,
     resolve_netns_pid: &mut G,
+    mut post: P,
 ) -> Result<usize, Errno>
 where
     F: FnMut(i32) -> Option<PayloadCap<NetNamespacePayload>>,
     G: FnMut(u32) -> Option<PayloadCap<NetNamespacePayload>>,
+    P: FnMut(&TaskMailbox, MailboxEvent) -> bool,
 {
     if socket.kind != SocketKind::NetlinkRoute {
         return Err(Errno::EOPNOTSUPP);
@@ -325,7 +336,9 @@ where
 
     if try_queue_fast_dump(raw, &payload.net_namespace(), bytes) {
         payload.refresh_io_from_raw();
-        socket.readiness.fire_recv(RecvWireSet::HAS_DATA);
+        socket
+            .readiness
+            .fire_recv_with_post(RecvWireSet::HAS_DATA, &mut post);
         return Ok(bytes.len());
     }
 
@@ -350,7 +363,9 @@ where
     }
     payload.refresh_io_from_raw();
     if !raw.is_empty() {
-        socket.readiness.fire_recv(RecvWireSet::HAS_DATA);
+        socket
+            .readiness
+            .fire_recv_with_post(RecvWireSet::HAS_DATA, &mut post);
     }
     Ok(bytes.len())
 }
@@ -776,7 +791,15 @@ fn build_getaddr_dump_template(netns: &NetNamespacePayload) -> Vec<u8> {
         append_addr_messages(&mut out, 0, 0, NLM_F_MULTI, link, AF_UNSPEC);
     }
     let mut extra_messages = Vec::new();
-    append_extra_addr_messages(&mut extra_messages, 0, 0, NLM_F_MULTI, netns, &links, AF_UNSPEC);
+    append_extra_addr_messages(
+        &mut extra_messages,
+        0,
+        0,
+        NLM_F_MULTI,
+        netns,
+        &links,
+        AF_UNSPEC,
+    );
     for message in extra_messages {
         out.extend_from_slice(&message);
     }
@@ -894,6 +917,10 @@ where
     let auth = require_net_admin(cred)?;
 
     let target = link_target_from_info_or_attrs(netns, &info, &info.attrs)?;
+    let rename_to = attr_string(&info.attrs, IFLA_IFNAME);
+    if let Some(name) = rename_to {
+        validate_ifname(name)?;
+    }
 
     if info.change & IFF_UP != 0 {
         netns.set_device_up_by_ifindex(auth, target.ifindex, info.flags & IFF_UP != 0)?;
@@ -927,6 +954,8 @@ where
         }
     }
 
+    let mut moved_to: Option<PayloadCap<NetNamespacePayload>> = None;
+
     if let Some(netns_fd_attr) = attr_by_kind(&info.attrs, IFLA_NET_NS_FD) {
         if netns_fd_attr.payload.len() < 4 {
             return Err(Errno::EINVAL);
@@ -937,6 +966,7 @@ where
         }
         let target_netns = resolve_netns_fd(fd).ok_or(Errno::EBADF)?;
         netns.move_device_to_namespace_by_ifindex(auth, target.ifindex, &target_netns)?;
+        moved_to = Some(target_netns);
     }
 
     if let Some(netns_pid_attr) = attr_by_kind(&info.attrs, IFLA_NET_NS_PID) {
@@ -949,6 +979,22 @@ where
         }
         let target_netns = resolve_netns_pid(pid as u32).ok_or(Errno::ESRCH)?;
         netns.move_device_to_namespace_by_ifindex(auth, target.ifindex, &target_netns)?;
+        moved_to = Some(target_netns);
+    }
+
+    if let Some(name) = rename_to {
+        let name = leak_ifname(name);
+        if let Some(target_netns) = moved_to {
+            if let Some(moved) = target_netns
+                .link_snapshot()
+                .into_iter()
+                .find(|link| link.name == target.name)
+            {
+                target_netns.set_device_name_by_ifindex(auth, moved.ifindex, name)?;
+            }
+        } else if name != target.name {
+            netns.set_device_name_by_ifindex(auth, target.ifindex, name)?;
+        }
     }
 
     Ok(())

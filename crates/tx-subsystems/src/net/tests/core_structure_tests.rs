@@ -576,7 +576,9 @@ fn socket_readiness_has_independent_queues() {
     assert_eq!(identity.readiness.send_wq.peek(), 0);
     assert_eq!(identity.readiness.accept_wq.peek(), 0);
 
-    identity.readiness.fire_recv(RecvWireSet::HAS_DATA);
+    identity
+        .readiness
+        .fire_recv_with_post(RecvWireSet::HAS_DATA, |mailbox, event| mailbox.post(event));
 
     assert_eq!(
         identity.readiness.recv_wq.peek(),
@@ -627,12 +629,14 @@ fn net_delegate_queue_registers_rawqueue_and_wakes_on_poll() {
     assert!(crate::wait_source::lookup_wait_queue(token.source_id()).is_some());
     assert_eq!(token.interest(), bits.bits());
 
-    let mut future = crate::wait_source::wait_on_token(token).expect("delegate wait future");
+    let mut future =
+        crate::wait_source::wait_on_registered_source_id(token.source_id(), token.interest())
+            .expect("delegate wait future");
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
 
     assert!(matches!(Pin::new(&mut future).poll(&mut cx), Poll::Pending));
-    crate::net::delegate::net_delegate_kick_poll();
+    crate::net::delegate::net_delegate_kick_poll_with_post(|mailbox, event| mailbox.post(event));
     assert!(matches!(
         Pin::new(&mut future).poll(&mut cx),
         Poll::Ready(WaitOutcome::Ready)

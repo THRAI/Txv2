@@ -4,17 +4,57 @@
 //! See the parent `mod.rs` dispatch doc for the two-site discipline and
 //! the `txdoc:THREAD-5-4-THE-TWO-SITE-DISCIPLINE` anchor.
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak as ArcWeak};
+use core::ops::{Deref, DerefMut};
 
 use crate::adapter::step_engine::Cap;
 use tx_substrate::step::DelegateRegistry;
-use tx_substrate::wake::mailbox::TaskMailbox;
-use tx_substrate::wake::timer::TimerWheel;
+use tx_substrate::wake::mailbox::{MailboxEvent, MailboxSchedulerHint, TaskMailbox};
 use tx_subsystems::cred::{Cred, CredSnapshot};
 use tx_subsystems::process::ProcessIdentity;
 use tx_subsystems::thread_runtime::ThreadIdentity;
 use tx_subsystems::vfs::structure::Credential;
 use tx_subsystems::vm::AddressSpace;
+use tx_time::DeadlineRegistrarHandle;
+
+pub type MailboxPostFn = fn(ArcWeak<TaskMailbox>, MailboxEvent);
+pub type MailboxRefPostFn = fn(&TaskMailbox, MailboxEvent) -> bool;
+pub type MailboxRefPostWithHintFn = fn(&TaskMailbox, MailboxEvent, MailboxSchedulerHint) -> bool;
+
+/// Script context plus the time capability supplied by the syscall boundary.
+///
+/// `ScriptCtx` belongs to the substrate step vocabulary and cannot depend on
+/// `tx-time`. Keeping the capability in this shim-local wrapper prevents the
+/// retired substrate timer registrar from leaking back into script driving.
+pub struct SubjectScriptCtx {
+    inner: crate::KernelScriptCtx,
+    timer_registrar: Option<DeadlineRegistrarHandle>,
+}
+
+impl SubjectScriptCtx {
+    pub fn timer_registrar(&self) -> Option<&DeadlineRegistrarHandle> {
+        self.timer_registrar.as_ref()
+    }
+
+    pub fn with_deadline(mut self, deadline: tx_substrate::step::Deadline) -> Self {
+        self.inner = self.inner.with_deadline(deadline);
+        self
+    }
+}
+
+impl Deref for SubjectScriptCtx {
+    type Target = crate::KernelScriptCtx;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl DerefMut for SubjectScriptCtx {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
 
 pub struct SyscallCtx<'a> {
     pub process: Cap<ProcessIdentity>,
@@ -22,8 +62,17 @@ pub struct SyscallCtx<'a> {
     pub aspace: Cap<AddressSpace>,
     /// Per-task mailbox for yield resolution (drive-taskmb).
     pub mailbox: Option<Arc<TaskMailbox>>,
-    /// Reactor timer wheel for OnTimer yield resolution (drive-taskmb).
-    pub timer_wheel: Option<TimerWheel>,
+    /// Optional owner-aware mailbox post operation supplied by the
+    /// kernel thread runtime when syscall dispatch has reactor context.
+    pub mailbox_post: Option<MailboxPostFn>,
+    /// Optional owner-aware post operation for wait-source and bus producer
+    /// paths that have already upgraded the subscriber mailbox.
+    pub mailbox_ref_post: Option<MailboxRefPostFn>,
+    /// Optional owner-aware post operation that also preserves the
+    /// producer-provided scheduler hint.
+    pub mailbox_ref_post_with_hint: Option<MailboxRefPostWithHintFn>,
+    /// Time-service deadline registrar for timer-yield resolution.
+    pub timer_registrar: Option<DeadlineRegistrarHandle>,
     /// Reactor delegate registry for OnAgent yield resolution
     /// (drive-taskmb).
     pub delegate_registry: Option<Arc<DelegateRegistry>>,
@@ -87,7 +136,10 @@ impl<'a> SyscallCtx<'a> {
             thread,
             aspace,
             mailbox: None,
-            timer_wheel: None,
+            mailbox_post: None,
+            mailbox_ref_post: None,
+            mailbox_ref_post_with_hint: None,
+            timer_registrar: None,
             delegate_registry: None,
             cred_snapshot,
             _lifetime: core::marker::PhantomData,
@@ -100,10 +152,72 @@ impl<'a> SyscallCtx<'a> {
         self
     }
 
-    /// Attach the reactor timer wheel for OnTimer yield resolution
-    /// (drive-taskmb).
-    pub fn with_timer_wheel(mut self, wheel: TimerWheel) -> Self {
-        self.timer_wheel = Some(wheel);
+    /// Attach the owner-aware mailbox post operation for signal and
+    /// wake-producing syscall paths. Test and bootstrap contexts leave
+    /// this unset and use the direct mailbox fallback.
+    pub fn with_mailbox_post(mut self, post: MailboxPostFn) -> Self {
+        self.mailbox_post = Some(post);
+        self
+    }
+
+    /// Attach the owner-aware mailbox-ref post operation for wait-source and
+    /// bus producer paths whose delivery loop already upgraded the mailbox.
+    pub fn with_mailbox_ref_post(mut self, post: MailboxRefPostFn) -> Self {
+        self.mailbox_ref_post = Some(post);
+        self
+    }
+
+    /// Attach the owner-aware mailbox-ref post operation for producers that
+    /// carry an explicit scheduler hint.
+    pub fn with_mailbox_ref_post_with_hint(mut self, post: MailboxRefPostWithHintFn) -> Self {
+        self.mailbox_ref_post_with_hint = Some(post);
+        self
+    }
+
+    /// Publish a mailbox event through the injected owner-aware route
+    /// when available, falling back to direct best-effort posting for
+    /// host tests and no-reactor bootstrap contexts.
+    pub fn post_mailbox_event(&self, mailbox: ArcWeak<TaskMailbox>, event: MailboxEvent) {
+        if let Some(post) = self.mailbox_post {
+            post(mailbox, event);
+            return;
+        }
+        let Some(mailbox) = mailbox.upgrade() else {
+            return;
+        };
+        let _ = mailbox.post(event);
+    }
+
+    /// Publish through the injected owner-aware route for already-upgraded
+    /// mailboxes, falling back to direct best-effort posting for tests and
+    /// no-reactor bootstrap contexts.
+    pub fn post_mailbox_ref_event(&self, mailbox: &TaskMailbox, event: MailboxEvent) -> bool {
+        self.post_mailbox_ref_event_with_hint(mailbox, event, MailboxSchedulerHint::Normal)
+    }
+
+    /// Publish through the injected owner-aware route for already-upgraded
+    /// mailboxes while preserving the producer's scheduler hint.
+    pub fn post_mailbox_ref_event_with_hint(
+        &self,
+        mailbox: &TaskMailbox,
+        event: MailboxEvent,
+        hint: MailboxSchedulerHint,
+    ) -> bool {
+        if let Some(post) = self.mailbox_ref_post_with_hint {
+            return post(mailbox, event, hint);
+        }
+        if let Some(post) = self.mailbox_ref_post {
+            return post(mailbox, event);
+        }
+        mailbox.post_with_scheduler_hint(event, hint)
+    }
+
+    /// Attach the time-service deadline registrar for timer-yield resolution.
+    pub fn with_timer_registrar<R>(mut self, registrar: R) -> Self
+    where
+        R: Into<DeadlineRegistrarHandle>,
+    {
+        self.timer_registrar = Some(registrar.into());
         self
     }
 
@@ -202,7 +316,7 @@ impl<'a> SyscallCtx<'a> {
 /// path; for now the conservative-panic matches today's
 /// `expect("zone slab has capacity")` discipline elsewhere in this
 /// module.
-pub fn build_subject_script_ctx(ctx: &SyscallCtx<'_>) -> crate::KernelScriptCtx {
+pub fn build_subject_script_ctx(ctx: &SyscallCtx<'_>) -> SubjectScriptCtx {
     let cred_cap = ctx.cred_cap();
     let restrictions_cap = tx_subsystems::cred::placeholder_restrictions_cap()
         .expect("placeholder restrictions zone has capacity per syscall entry");
@@ -216,11 +330,11 @@ pub fn build_subject_script_ctx(ctx: &SyscallCtx<'_>) -> crate::KernelScriptCtx 
     if let Some(ref mailbox) = ctx.mailbox {
         script_ctx = script_ctx.with_mailbox(Arc::clone(mailbox));
     }
-    if let Some(ref tw) = ctx.timer_wheel {
-        script_ctx = script_ctx.with_timer_wheel(tw.clone());
-    }
     if let Some(ref dr) = ctx.delegate_registry {
         script_ctx = script_ctx.with_delegate_registry(Arc::clone(dr));
     }
-    script_ctx
+    SubjectScriptCtx {
+        inner: script_ctx,
+        timer_registrar: ctx.timer_registrar.clone(),
+    }
 }

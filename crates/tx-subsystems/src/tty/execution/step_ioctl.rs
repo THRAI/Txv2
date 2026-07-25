@@ -5,7 +5,8 @@ use core::sync::atomic::Ordering;
 #[cfg(test)]
 use crate::tty::adapter::step_engine::ByteProgress;
 use crate::tty::adapter::step_engine::{
-    self as step_engine, Cap, NoProgress, ScriptCtx, StepOp, StepOutcome, SubjectIdentity, Weak,
+    self as step_engine, Cap, NoProgress, OneShotStepOp, ScriptCtx, StepOp, StepOutcome,
+    SubjectIdentity, Weak,
 };
 
 use crate::execution::{Errno, Guard};
@@ -683,6 +684,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for IoctlTiocscttyOp<'a> {
         step_ioctl_tiocsctty(self.tty, self.caller, &__guard)
     }
 }
+impl OneShotStepOp<crate::process::ProcessIdentity> for IoctlTiocscttyOp<'_> {}
 
 /// `StepOp` wrap of [`step_ioctl_tiocsctty_for_process`].
 #[allow(dead_code)] // txdoc:pr2-step-op-scaffold
@@ -699,6 +701,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for IoctlTiocscttyForProcessOp<'a> {
         step_ioctl_tiocsctty_for_process(self.tty, self.caller, &__guard)
     }
 }
+impl OneShotStepOp<crate::process::ProcessIdentity> for IoctlTiocscttyForProcessOp<'_> {}
 
 /// `StepOp` wrap of [`step_ioctl_tiocnotty`].
 #[allow(dead_code)] // txdoc:pr2-step-op-scaffold
@@ -715,6 +718,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for IoctlTiocnottyOp<'a> {
         step_ioctl_tiocnotty(self.tty, self.caller, &__guard)
     }
 }
+impl OneShotStepOp<crate::process::ProcessIdentity> for IoctlTiocnottyOp<'_> {}
 
 /// `StepOp` wrap of [`step_ioctl_tiocnotty_for_process`].
 #[allow(dead_code)] // txdoc:pr2-step-op-scaffold
@@ -731,6 +735,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for IoctlTiocnottyForProcessOp<'a> {
         step_ioctl_tiocnotty_for_process(self.tty, self.caller, &__guard)
     }
 }
+impl OneShotStepOp<crate::process::ProcessIdentity> for IoctlTiocnottyForProcessOp<'_> {}
 
 /// `StepOp` wrap of [`step_ioctl_tiocspgrp`].
 #[allow(dead_code)] // txdoc:pr2-step-op-scaffold
@@ -748,6 +753,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for IoctlTiocspgrpOp<'a> {
         step_ioctl_tiocspgrp(self.tty, self.caller, self.new_pgrp, &__guard)
     }
 }
+impl OneShotStepOp<crate::process::ProcessIdentity> for IoctlTiocspgrpOp<'_> {}
 
 /// `StepOp` wrap of [`step_ioctl_tiocspgrp_for_process`].
 #[allow(dead_code)] // txdoc:pr2-step-op-scaffold
@@ -765,6 +771,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for IoctlTiocspgrpForProcessOp<'a> {
         step_ioctl_tiocspgrp_for_process(self.tty, self.caller, self.new_pgrp, &__guard)
     }
 }
+impl OneShotStepOp<crate::process::ProcessIdentity> for IoctlTiocspgrpForProcessOp<'_> {}
 
 /// `StepOp` wrap of [`step_ioctl_tiocgpgrp`].
 #[allow(dead_code)] // txdoc:pr2-step-op-scaffold
@@ -780,6 +787,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for IoctlTiocgpgrpOp<'a> {
         step_ioctl_tiocgpgrp(self.tty, &__guard)
     }
 }
+impl OneShotStepOp<crate::process::ProcessIdentity> for IoctlTiocgpgrpOp<'_> {}
 
 /// `StepOp` wrap of [`step_ioctl_tiocgwinsz`].
 #[allow(dead_code)] // txdoc:pr2-step-op-scaffold
@@ -795,6 +803,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for IoctlTiocgwinszOp<'a> {
         step_ioctl_tiocgwinsz(self.tty, &__guard)
     }
 }
+impl OneShotStepOp<crate::process::ProcessIdentity> for IoctlTiocgwinszOp<'_> {}
 
 /// `StepOp` wrap of [`step_ioctl_tiocswinsz`].
 #[allow(dead_code)] // txdoc:pr2-step-op-scaffold
@@ -811,6 +820,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for IoctlTiocswinszOp<'a> {
         step_ioctl_tiocswinsz(self.tty, self.winsize, &__guard)
     }
 }
+impl OneShotStepOp<crate::process::ProcessIdentity> for IoctlTiocswinszOp<'_> {}
 
 /// `StepOp` wrap of [`step_ioctl_tcgets`].
 #[allow(dead_code)] // txdoc:pr2-step-op-scaffold
@@ -826,6 +836,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for IoctlTcgetsOp<'a> {
         step_ioctl_tcgets(self.tty, &__guard)
     }
 }
+impl OneShotStepOp<crate::process::ProcessIdentity> for IoctlTcgetsOp<'_> {}
 
 /// `StepOp` wrap of [`step_ioctl_tcsets`].
 #[allow(dead_code)] // txdoc:pr2-step-op-scaffold
@@ -842,6 +853,7 @@ impl<'a, I: SubjectIdentity> StepOp<I> for IoctlTcsetsOp<'a> {
         step_ioctl_tcsets(self.tty, self.new_termios, &__guard)
     }
 }
+impl OneShotStepOp<crate::process::ProcessIdentity> for IoctlTcsetsOp<'_> {}
 
 #[cfg(test)]
 mod step_op_wraps {

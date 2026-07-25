@@ -21,6 +21,13 @@ const EPOLLOUT: u32 = 0x004;
 const F_GETFL_CMD: i32 = 3;
 const MQ_PRIO_MAX: u64 = 32768;
 
+static MQ_REF_POST_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+fn counting_mq_ref_post(mailbox: &TaskMailbox, event: MailboxEvent) -> bool {
+    MQ_REF_POST_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    mailbox.post(event)
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct TestSigeventPrefix {
@@ -719,7 +726,8 @@ fn dispatch_mq_notify_registration_is_queue_wide_across_descriptors() {
 #[test]
 fn dispatch_mq_notify_does_not_fire_while_blocked_receiver_consumes_message() {
     let (_setup, proc_cap, thread) = mq_setup();
-    let ctx = make_ctx(proc_cap.clone(), thread.clone());
+    let ctx = make_ctx(proc_cap.clone(), thread.clone())
+        .with_mailbox(alloc::sync::Arc::new(TaskMailbox::new()));
     let name = b"tx-mq-notify-blocked-recv\0";
     let attr = MqAttrLayout {
         mq_maxmsg: 4,
@@ -917,7 +925,10 @@ fn dispatch_mq_raw_read_write_fail_cleanly_and_maxmsg_is_enforced() {
 #[test]
 fn dispatch_mq_blocking_receive_parks_until_send_wakes_queue() {
     let (_setup, proc_cap, thread) = mq_setup();
-    let ctx = make_ctx(proc_cap, thread);
+    MQ_REF_POST_COUNT.store(0, core::sync::atomic::Ordering::Release);
+    let ctx = make_ctx(proc_cap, thread)
+        .with_mailbox(alloc::sync::Arc::new(TaskMailbox::new()))
+        .with_mailbox_ref_post(counting_mq_ref_post);
     let name = b"tx-mq-blocking-recv\0";
     let attr = MqAttrLayout {
         mq_maxmsg: 2,
@@ -964,6 +975,11 @@ fn dispatch_mq_blocking_receive_parks_until_send_wakes_queue() {
         )),
         SyscallResult::Return(0)
     );
+    assert_eq!(
+        MQ_REF_POST_COUNT.load(core::sync::atomic::Ordering::Acquire),
+        1,
+        "mq_send should wake the parked receiver through SyscallCtx"
+    );
 
     for _ in 0..256 {
         if let Poll::Ready(result) = pinned.as_mut().poll(&mut cx) {
@@ -979,7 +995,10 @@ fn dispatch_mq_blocking_receive_parks_until_send_wakes_queue() {
 #[test]
 fn dispatch_mq_blocking_send_parks_until_receive_makes_space() {
     let (_setup, proc_cap, thread) = mq_setup();
-    let ctx = make_ctx(proc_cap, thread);
+    MQ_REF_POST_COUNT.store(0, core::sync::atomic::Ordering::Release);
+    let ctx = make_ctx(proc_cap, thread)
+        .with_mailbox(alloc::sync::Arc::new(TaskMailbox::new()))
+        .with_mailbox_ref_post(counting_mq_ref_post);
     let name = b"tx-mq-blocking-send\0";
     let attr = MqAttrLayout {
         mq_maxmsg: 1,
@@ -1052,6 +1071,11 @@ fn dispatch_mq_blocking_send_parks_until_receive_makes_space() {
         SyscallResult::Return(first_msg.len() as i64)
     );
     assert_eq!(&out[..first_msg.len()], &first_msg);
+    assert_eq!(
+        MQ_REF_POST_COUNT.load(core::sync::atomic::Ordering::Acquire),
+        1,
+        "mq_receive should wake the parked sender through SyscallCtx"
+    );
 
     for _ in 0..256 {
         if let Poll::Ready(result) = pinned_send.as_mut().poll(&mut cx) {
