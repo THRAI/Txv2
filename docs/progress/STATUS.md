@@ -1,3 +1,24 @@
+- 2026-07-25 (memory and file-I/O dual-plane architecture).
+  Added the canonical umbrella contract that combines a zero-extra-copy
+  PageBacked/ext4/I/O-manager data plane with a global allocator-pressure, pure
+  policy, owner-provider and managed-allocation control plane. The contract
+  freezes four behavioral interfaces (`FileLayoutPlanner`, `ReclaimProvider`,
+  `MemoryPolicy`, `AllocationGateway`), two core immutable values
+  (`PageDataLease`, existing `BackendBioGraph`), and ext4-internal
+  `FrozenMetadataLease`. `PageSlot` is now the sole ordinary file-page
+  dirty/writeback generation authority; `FrameMeta` retains physical lifecycle
+  only. Component docs and reading orders were aligned, removing the old
+  ext4-private raw-frame CLOCK and synchronous allocation/writeback recursion.
+  No Rust source changed. Verification: `cargo xtask lint docs` passed with
+  the 7 existing retired-vocabulary discussion warnings; `cargo xtask progress
+  validate` passed for 37 records; `git diff --check` passed. Next: write a
+  staged implementation plan starting with dirty-authority unification,
+  canonical file PageContainer identity and clean-only
+  `ReclaimProvider`/`AllocationGateway`. Blocker: the one-CPU, 4-GiB clean-build
+  witness still lacks a current complete Tx trace and baseline artifact. See
+  `docs/design/03_memory-vm/MEMORY_IO_ARCHITECTURE_v1.md` and
+  `docs/progress/decisions/2026-07-25-memory-file-io-dual-plane-architecture.md`.
+
 - 2026-07-25 (dirty workspace staged commit cleanup).
   Summarized and landed the large shared-worktree dirty state as reviewable
   staged commits on `codex/test-remote-network`: agent/test workspace

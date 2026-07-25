@@ -18,6 +18,7 @@ paths.
 
 **Companion documents.**
 
+- [`MEMORY_IO_ARCHITECTURE_v1.md`](../03_memory-vm/MEMORY_IO_ARCHITECTURE_v1.md) - canonical dual-plane ownership, `PageDataLease`, pure layout planning, zero-copy payload, memory pressure, and allocation slow-path contract.
 - [`PAGE_BACKED_v1.md`](../03_memory-vm/PAGE_BACKED_v1.md) - `PageContainer`
   as the page-indexed content owner.
 - [`OBJECT_API_LANES_v1.md`](../00_meta-framework/OBJECT_API_LANES_v1.md) -
@@ -87,7 +88,7 @@ The I/O manager is a control plane. It must not become a second page cache.
 | Layer | Owns ordinary file data? | Owns |
 |---|---:|---|
 | `PageContainer` / `PageSlot` | Yes | published resident bindings, frame evidence, dirty/writeback generation state |
-| `PageIoSubmissionManager` | No | `PageIoRequest`s, batches, priority, readahead/writeback policy, request waiter routing |
+| `PageIoSubmissionManager` | No | `PageIoRequest`s, batches, execution priority, readahead/writeback mechanics, request waiter routing |
 | Concrete filesystem | No, except private metadata | logical-file mapping, metadata cache, allocation/journal order |
 | `BlockSubmissionManager` | No | `Bio`, request tags, queue depth, LBA merge, barrier ordering |
 | Driver/HAL | No | DMA mapping, hardware descriptors, IRQ or polling completion |
@@ -96,6 +97,11 @@ The only long-lived ordinary file-data cache is the `PageContainer`. Filesystem
 metadata caches are allowed when they are private to a mounted filesystem and
 do not duplicate ordinary file data. Driver bounce buffers are temporary DMA
 staging objects and must be released after completion.
+
+Global memory pressure and dirty-budget policy are not owned by the I/O
+manager. The memory-pressure coordinator decides when and how much background
+reclaim/writeback to request; L4/L6 provide bounded execution, queue/service
+feedback, and typed completion.
 
 ---
 
@@ -294,6 +300,12 @@ It owns:
 - fairness between foreground demand I/O, fsync, writeback, readahead, and raw
   block-device users.
 
+The existing `BackendBioGraph` is the sole BIO DAG. It is extended in place
+with retained lease slices, barrier domains, inherited priority, and typed
+completion routes. A second graph type is forbidden. Graph nodes may carry an
+existing PageBacked page-cache source/target or a direct-I/O DMA-pinned
+source/target; the variants retain their distinct lifetime and coherency rules.
+
 The first production scheduler should be deliberately small: FIFO with
 adjacent merge, read-deadline bias, queue-depth limits, tag completion, and
 strict barrier fences. More complex BFQ/Kyber-like policies are later
@@ -421,6 +433,7 @@ seam to remove, not the target synchronization model.
 | `RangeReservation` | range semantic exclusion | locked interval table | optimized range lock |
 | `PageIoSubmissionManager` | L4 requests, completions, graphs, request waiters | `PageService` embedded under PC state | dedicated single-owner/service state behind typed handle |
 | `BlockSubmissionManager` | L6 queue, depth, tags, trackers | `BlockQueue` runtime embedded under PC state | dedicated single-owner/service state behind typed handle |
+| `PageDataLease` | multi-page payload lifetime and PageSlot generations | staged one-page `PageLease` plus `IoDataSource`/`IoDataTarget` | PageBacked-issued immutable multi-page capability lowered into existing graph nodes |
 
 Resident read hit target:
 

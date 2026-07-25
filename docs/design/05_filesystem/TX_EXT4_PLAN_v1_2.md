@@ -29,6 +29,7 @@ a git submodule for algorithm study; no rsext4 code is used at runtime.
 
 **Companion documents.**
 
+- [`MEMORY_IO_ARCHITECTURE_v1.md`](../03_memory-vm/MEMORY_IO_ARCHITECTURE_v1.md) — canonical dual-plane file-I/O and global memory-pressure architecture; it supersedes this plan's older global `FrameMeta` CLOCK and dirty-authority prose.
 - [`VFS_CHECKS_V2.1.md`](VFS_CHECKS_V2.1.md) and [`MOUNT_v1.md`](MOUNT_v1.md) — VFS ownership boundary, `FsOps` and `FsPageBacking` consumer side.
 - [`PAGE_BACKED_v1.md`](../03_memory-vm/PAGE_BACKED_v1.md) — `FsPageBacking` trait, `PageContainer` model.
 - [`VM_v1_2.md`](../03_memory-vm/VM_v1_2.md) — fault handler and `FsPageBacking::fetch_page` integration.
@@ -115,7 +116,10 @@ resolved through VFS/PageBacked.
 
 <!-- txdoc:TX-EXT4-PLAN-CACHE-RECLAIM-POLICY-1 -->
 
-This section locks in the v1 reclaim policy for VFS- and filesystem-adjacent caches, closing the open question left in `PAGE_BACKED_v1.md §12.1` for v1 scope. Cache tiers are introduced phase-by-phase.
+This section classifies ext4/VFS caches and their owner-side reclaim
+eligibility. Global policy, watermarks, provider arbitration, allocation retry,
+and file-page replacement algorithms are owned by
+[`MEMORY_IO_ARCHITECTURE_v1.md`](../03_memory-vm/MEMORY_IO_ARCHITECTURE_v1.md).
 
 **Caches in scope.**
 
@@ -130,53 +134,46 @@ This section locks in the v1 reclaim policy for VFS- and filesystem-adjacent cac
 | Slab (kernel heap) | Kernel allocations backing Box/Vec/etc | Simple free-on-empty; no per-CPU cache in v1 |
 | Journal transactions | Pre-commit buffered metadata mutations | Bounded by journal size; commit releases |
 
-**v1 policy by phase.**
+**Provider policy by phase.**
 
-- **Phase 1 (read-only mount).** No reclaim. ENOMEM on frame allocation fails cleanly up the stack. Clean file pages accumulate without eviction; acceptable because read-only workloads are bounded and bring-up doesn't need reclaim correctness.
-
-- **Phase 2 (write working set).** Pressure-driven CLOCK reclaim for file pages only:
-  - Each `FrameMeta` gains a `used` bit (we have space in the existing packed layout).
-  - `step_read`/`step_write` / fault handler set `used` when touching a frame.
-  - On `alloc_frame` failure, the caller triggers a reclaim pass: CLOCK sweep over `FrameMeta` array; a candidate frame is `cache_ref == 1 ∧ map_count == 0 ∧ !flags.dirty ∧ !used`. Candidates are dropped from their PC page index and freed. If `used`, the bit is cleared and the sweep moves on.
-  - One pass is bounded; if it frees nothing, the caller returns ENOMEM.
-  - Anon PCs never produce candidates (cache_ref represents pinning, not caching).
-  - Metadata PCs never produce candidates (marked with a per-PC `no_reclaim` flag).
-  - Dirty pages never produce candidates (must be written first; writeback comes phase 4).
-
-  The CLOCK hand is a per-mount or per-NUMA-node cursor (v1: one global cursor; refine later).
-
-- **Phase 2 (dentry cache reclaim).** Dentries follow the same Tier-2 shape: each DEntry has a `used` bit set on walker traversal, cleared on reclaim sweep. Candidates are `cache_ref == 1 ∧ !used ∧ !negative_dentry_in_active_use`. Reclaim pass triggers when the dentry zone exceeds a high-water mark (configurable; default = 75% of zone capacity). Note that dentries pinned by active walkers (via witness IdentRefs under an epoch guard) are not candidates by construction — `cache_ref > 1` excludes them.
-
-- **Phase 4 (journal).** Periodic writeback for dirty file pages, implemented as a reactor-spawned task. Parameters:
-  - Timer-driven sweep every 5 seconds OR when dirty-byte count exceeds 10% of total memory, whichever first.
-  - Sweep is bounded (process at most N pages per pass; N configurable, default 1024) to avoid long latency tails.
-  - Dirty metadata pages are not flushed by this daemon — they go through journal commit.
-  - `fsync` short-circuits the timer: synchronous walk of the target PC's dirty frames + force-commit any in-flight transaction containing them.
+- **Phase 1.** File-page and ext4 metadata state may remain pinned while the
+  read-only bring-up profile is bounded. Allocation exhaustion fails cleanly.
+- **Phase 2.** PageBacked registers clean file pages through its global
+  `ReclaimProvider`; ext4 does not sweep `FrameMeta` or own the CLOCK hand. VFS
+  registers dentry/RNode caches through owner adapters.
+- **Phase 4.** Dirty ordinary file pages remain PageSlot-owned and enter the
+  global writeback control loop. ext4 supplies layout, immutable metadata
+  after-images, journal admission and ordering. Dirty metadata is never evicted
+  as an ordinary clean file page.
+- **Later measured stage.** ext4 may register bounded metadata caches only once
+  `FrozenMetadataLease`, transaction-safe claim rules, and refault/cost
+  accounting are executable.
 
 **Explicit non-policies (v1).**
 
 - **No swap.** Anon PCs are pinned until explicit teardown. This has been a standing commitment (`PAGE_SUBSTRATE_v1.md` §8).
-- **No metadata PC eviction.** Metadata is small (tens of MB for typical ext4 sizes); pinning it keeps tx-ext4 hot paths fast. Revisit if profiling shows pressure.
+- **No metadata PC eviction in the first control-plane stage.** Revisit only
+  through an ext4-owned provider after transaction-safe claim semantics land.
 - **No per-CPU slab caches.** Slab returns frames to the frame allocator when a slab is fully free; no high-water mark.
-- **No reverse-mapping machinery.** Reclaim is purely forward (start from FrameMeta, check PC membership); no walking from frame to mappers. This is what `map_count == 0` in the candidate predicate buys us — it tells us no mapper holds the frame without needing to find who.
-- **No per-mount reclaim priority.** All file-page PCs compete on equal terms for memory.
+- **No reverse-mapping machinery in v1.** Owners validate typed mapping/pin
+  facts at claim time; policy does not walk raw frames back into semantic
+  objects.
+- **No ext4-private global reclaim priority.** Provider arbitration belongs to
+  the memory-pressure coordinator.
 - **No dentry-cache periodic pruning.** Reclaim is on-demand at high-water only.
-
-**Soft targets (not blockers for v1).**
-
-- Reclaim sweep latency under 1ms for the CLOCK hand on a 64GB-frame system (bounded scan, cache-friendly access).
-- Writeback daemon pause under 10ms per sweep window.
-- No allocation failure under steady-state workloads within 80% of memory.
 
 **Cross-reference and closure.**
 
-This supersedes the "deferred to a reclaim-specific doc" language in `PAGE_BACKED_v1.md §12.1` *for v1 scope*. A future `RECLAIM.md` may refine this with per-CPU accounting, reverse-mapping, and NUMA-aware cursors. Scope creep is explicitly rejected for v1: we ship with CLOCK + timer-driven writeback + pinned metadata, and nothing more.
+The global contract now lives in `MEMORY_IO_ARCHITECTURE_v1.md`. This plan
+retains only ext4 cache classification and transaction-safe owner behavior.
 
 **What this buys us.**
 
 - Memory pressure produces graceful degradation instead of ENOMEM under any reasonable load.
-- No LRU list overhead (CLOCK needs one bit per frame, no linked-list maintenance).
-- Reclaim is fully synchronous under pressure (no background daemon required for correctness; writeback daemon in phase 4 is a latency optimization, not a correctness primitive).
+- Replacement algorithms can evolve without importing ext4 semantics into the
+  allocator or policy layer.
+- Background and direct work remain bounded, with actual allocator-free and
+  refault feedback.
 - Matches the no-swap discipline: memory pressure affects only reclaimable pages (clean file, evictable dentry), never anon.
 
 ### 1.5 Compatibility authority
@@ -350,15 +347,14 @@ This section specifies the exact types tx-ext4 implements and consumes. These ar
 
 tx-ext4 may import from these crates only:
 
-| Crate | Types permitted |
+| Dependency surface | Types permitted |
 |---|---|
 | `tx-fnd::types` | `Errno`, `PageSize`, numeric newtypes |
 | `tx-fnd::step` | `StepOutcome<T>`, `Guard`, `Channel`, `Mask`, `Blocked`, `Done`, `Advanced` |
 | `tx-fnd::sync` | `AtomicU64`, `AtomicU32` (for superblock mirror counters) |
 | `tx-fnd::block` | `BlockDevice` trait, `PhysicalBlockNumber`, `BlockReadReq`, `BlockWriteReq` |
-| `tx-vm::frame` | `Frame`, `Cap<Frame>`, `FrameMeta` access for dirty/io-locked bits |
-| `tx-vm::page_container` | `Cap<PageContainer>`, `PageContainer` (as opaque), `step_read`, `step_write` against PCs |
-| `tx-vm::page_backed` | `FsPageBacking` trait (implemented by tx-ext4) |
+| PageBacked compatibility surface | `PageDataLease`/staged `PageLease`, opaque object/range keys, and current `FsPageBacking` bridge while migration is active; this may remain module-local before extraction |
+| `tx-pager-api` | range/layout values, `FileLayoutPlanner`, `FileIoPlan<K>`, and opaque payload keys only; this may remain module-local before crate extraction |
 | `tx-vfs::fs_ops` | `FsOps` trait (implemented by tx-ext4), `InodeMeta`, `DirEntry`, `DirCursor`, `Credential`, `FsObjectId` |
 | `tx-vfs::mount` | `MountId`, `MountInitContext` (for mount bringup handshake) |
 
@@ -370,13 +366,18 @@ tx-ext4 may import from these crates only:
 - `tx-vfs::walker` — no walker state types.
 - `tx-proc::*` — no process/thread entities.
 
-The asymmetry: tx-ext4 depends on VM (for PCs/Frames) but not on VFS live-node types. VFS depends on tx-ext4's trait implementations but constructs all RNode state itself.
+The asymmetry: the kernel-facing `tx-ext4` adapter may consume PageBacked
+capabilities, but the pure pager never imports PageBacked, PPN, `BioVec`,
+reactor, or VFS live-node types. VFS constructs all RNode state itself.
 
 ### 3.2 `FsPageBacking` — trait implemented by tx-ext4
 
 <!-- txdoc:TX-EXT4-PLAN-FSPAGEBACKING-TRAIT-IMPLEMENTED-TX-EXT4-1 -->
 
-Defined in `tx-vm::page_backed`; this is tx-ext4's byte-pager role. The trait was sketched in [`PAGE_BACKED_v1.md`](../03_memory-vm/PAGE_BACKED_v1.md) §6; the definitive async signatures tx-ext4 implements:
+Defined in `tx-vm::page_backed`; this is the current compatibility bridge. It
+remains valid during compatible migration, but the target splits pure
+`FileLayoutPlanner` planning from the Tx adapter that retains PageDataLease and
+lowers `FileIoPlan<K>` into the existing `BackendBioGraph`.
 
 ```rust
 pub trait FsPageBacking: Send + Sync + 'static {

@@ -50,6 +50,7 @@ This document does *not* cover:
 - [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) — STEP-4, OBL-*, BIF-*.
 - [`MODULE_MAP_v1.md`](../00_meta-framework/MODULE_MAP_v1.md) §5.1 (vm subsystem), §7 (FS instances).
 - [`OBJECT_API_LANES_v1.md`](../00_meta-framework/OBJECT_API_LANES_v1.md) — owner-private publication, single-binding slots, and the rule that manager/state-machine ownership stays outside published roots.
+- [`MEMORY_IO_ARCHITECTURE_v1.md`](MEMORY_IO_ARCHITECTURE_v1.md) — canonical cross-layer authority for `PageDataLease`, PageSlot dirty state, zero-copy file payload, reclaim providers, and memory-pressure coordination.
 - [`IO_MANAGER_v1.md`](../05_filesystem/IO_MANAGER_v1.md) — target I/O control plane that keeps `PageContainer` as the only long-lived ordinary file-data cache while moving miss/writeback submission, readahead, completion, and block scheduling into service futures.
 
 ### Zone-derived type policy
@@ -352,7 +353,10 @@ truncate, hole punch, reclaim, or explicit invalidation.
 
 **Size.** Governs the legal offset range for this PC. Truncate-down invalidates pages beyond the new size; truncate-up extends the valid range (pages are not pre-materialized). Atomic reads let concurrent readers observe size without a lock.
 
-**Flags.** Coarse-grained hints for writeback and reclaim schedulers. Not authoritative state; per-page dirty/io-locked flags on FrameMeta are the ground truth.
+**Flags.** Coarse-grained replacement hints such as referenced, no-reclaim,
+age, and queue membership. They are not authoritative state. `PageSlot` is the
+sole authority for fetching, dirty, writeback, redirty, error, and completion
+generation; `FrameMeta` retains only physical-lifecycle and role evidence.
 
 ### 3.2 PageContainerKind
 <!-- txdoc:PAGE-BACKED-3-2-PAGECONTAINERKIND -->
@@ -653,7 +657,9 @@ withdrew the page first, the reservation rolls back and the caller re-observes.
 Write is symmetric to read, with three additions:
 
 1. **Extending size.** If offset + len exceeds PC.size, size is bumped via CAS. For Device variant, writes beyond size return EINVAL.
-2. **Dirty tracking.** Written pages have FrameMeta.flags.dirty set. For File variant, this marks the page for writeback. For Anon variant, dirty has no meaning (no writeback target).
+2. **Dirty tracking.** A File write advances the authoritative `PageSlot`
+   generation and transitions it to Dirty. Redirty during writeback remains a
+   PageSlot transition. Anonymous content has no backing writeback state.
 3. **Copy-on-write for shared pages.** If the target offset currently holds a Frame that is shared (cache_ref > 1, indicating reflink), the write must allocate a new Frame, copy the shared content, install the new Frame. This is reflink-induced CoW; see §7.
 
 Other than that, step_write mirrors step_read in shape.
@@ -854,7 +860,10 @@ There is no `PageContainer::reflink_into(other_pc, src_range, dst_range)` primit
 ## 8. Reclaim under memory pressure
 <!-- txdoc:PAGE-BACKED-8-RECLAIM-UNDER-MEMORY-PRESSURE -->
 
-Under no-swap, reclaim options are limited. This section describes what's available; the actual reclaim policy (when to reclaim, which PC's pages to pick) is a separate concern deferred to a future doc.
+Under no-swap, reclaim options are limited. This section describes PageBacked's
+owner-side eligibility and withdrawal mechanics. Global trigger, provider
+arbitration, algorithm selection, writeback pressure, and allocation retry are
+defined by [`MEMORY_IO_ARCHITECTURE_v1.md`](MEMORY_IO_ARCHITECTURE_v1.md).
 
 ### 8.1 What can be reclaimed
 <!-- txdoc:PAGE-BACKED-8-1-WHAT-CAN-BE-RECLAIMED -->
@@ -872,25 +881,17 @@ Under memory pressure, the reclaim target is almost exclusively **clean file pag
 ### 8.2 Reclaim trigger
 <!-- txdoc:PAGE-BACKED-8-2-RECLAIM-TRIGGER -->
 
-Reclaim is synchronous: an `alloc_frame` failure triggers the allocation path to request reclaim.
+PageBacked implements a `ReclaimProvider` adapter. It exports bounded snapshots
+and stable candidate IDs, then revalidates a selected candidate through
+`try_claim`. A clean file page may be claimed only if its binding generation,
+PageSlot classification, mapping/pin facts, and no-reclaim state still permit
+withdrawal. Dirty pages are routed through a separate writeback episode; the
+allocation slow path never recursively performs synchronous filesystem I/O.
 
-```rust
-fn alloc_frame_with_reclaim() -> Option<PPN> {
-    if let Some(ppn) = alloc_frame() { return Some(ppn); }
-    
-    // Try to reclaim clean file pages.
-    reclaim::reclaim_clean_file_pages(CLEAN_RECLAIM_BUDGET);
-    
-    if let Some(ppn) = alloc_frame() { return Some(ppn); }
-    
-    // Try harder: writeback-then-reclaim dirty pages.
-    reclaim::writeback_and_reclaim(DIRTY_RECLAIM_BUDGET);
-    
-    alloc_frame()  // final attempt; None if still out
-}
-```
-
-The reclaimer walks a global list of PC-owned pages (LRU-like, approximated by a per-PC dirty list and global age counters), picks candidates, invalidates their page-index entries, potentially issues writeback.
+The first policy uses persistent second-chance cursors and clean-only reclaim.
+Later ghost/refault or generational policy consumes the same provider contract.
+PageBacked reports separately: candidates scanned, bindings withdrawn, role
+pins released, and physical frames actually returned to the allocator.
 
 ### 8.3 Reclaim vs concurrent access
 <!-- txdoc:PAGE-BACKED-8-3-RECLAIM-VS-CONCURRENT-ACCESS -->
@@ -1169,4 +1170,5 @@ The model unifies file-like things at the substrate level without forcing pipes,
 - [`02_INVARIANTS_v5.md`](../../Txv3/02_INVARIANTS_v5.md) — STEP-4, OBL-*, BIF-*.
 - [`MODULE_MAP_v1.md`](../00_meta-framework/MODULE_MAP_v1.md) §5.1 (vm subsystem), §6.1 (vfs subsystem), §7 (FS instances), §8 (scripts).
 - [`SUBSYSTEM_ANATOMY_v2_1.md`](../00_meta-framework/SUBSYSTEM_ANATOMY_v2_1.md) — four-module layout; PageContainer and RNodeBacking structural content lives in vm and vfs subsystems' structure/ modules.
+- [`MEMORY_IO_ARCHITECTURE_v1.md`](MEMORY_IO_ARCHITECTURE_v1.md) — umbrella ownership, data/control planes, `PageDataLease`, PageSlot authority, and reclaim-provider contract.
 - Linux kernel source for reference: `include/linux/fs.h` (file_operations, inode_operations, address_space_operations — the things this spec replaces).
